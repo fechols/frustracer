@@ -23,8 +23,8 @@ use stats::Stats;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
-const W: usize = 1024;
-const H: usize = 768;
+const W: usize = 1920;
+const H: usize = 1080;
 const MAX_SAMPLES: u32 = 1024;
 /// Frame budget for dynamic-resolution mode: 60 FPS minus resolve/present
 /// headroom. Not a per-tile deadline: a log4-proportional controller turns the
