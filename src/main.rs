@@ -1,6 +1,13 @@
 mod bvh;
 mod camera;
+mod dlss;
 mod frustum;
+// The presentation stack (D3D12 + Streamline) is Windows-only; everything
+// headless (--check, --check-dlss) stays cross-platform.
+#[cfg(windows)]
+mod gpu;
+#[cfg(windows)]
+mod input;
 mod overlay;
 mod render;
 mod scene;
@@ -10,7 +17,6 @@ mod temporal;
 
 use camera::Camera;
 use glam::Vec3A;
-use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 use render::FrameCtx;
 use shade::Quality;
 use stats::Stats;
@@ -20,13 +26,13 @@ use std::time::{Duration, Instant};
 const W: usize = 1024;
 const H: usize = 768;
 const MAX_SAMPLES: u32 = 1024;
-/// Frame budget for dynamic-resolution mode: 60 FPS minus resolve/present
+/// Frame budget for dynamic-resolution mode: 30 FPS minus resolve/present
 /// headroom. Not a per-tile deadline: a log4-proportional controller turns the
 /// previous frame's time against this target into a uniform quadtree depth cap
 /// for the next frame; tiles reaching the cap unresolved become single
 /// flat-shaded quads. Cost roughly quadruples per level, so
 /// log4(budget/elapsed) reads "levels of headroom" directly.
-const RENDER_BUDGET: Duration = Duration::from_millis(14);
+const RENDER_BUDGET: Duration = Duration::from_millis(30);
 /// Controller gain on the log4 error.
 const DEPTH_GAIN: f32 = 0.6;
 /// Max upward step per frame — creep up (>= 3 frames per level)...
@@ -34,15 +40,54 @@ const STEP_UP_MAX: f32 = 0.4;
 /// ...but drop more than a full level in one step after a blown frame.
 const STEP_DOWN_MAX: f32 = 1.5;
 
+/// CLI options beyond the OBJ path / --check.
+pub struct Opts {
+    /// Want DLSS (default on; auto-falls back when unsupported).
+    pub dlss: bool,
+    /// D3D12 debug layer + Streamline verbose logging.
+    pub gpu_debug: bool,
+    /// Directory holding sl.interposer.dll + plugins (M3+).
+    pub sl_path: String,
+}
+
 fn main() {
     let mut obj: Option<String> = None;
     let mut check = false;
-    for a in std::env::args().skip(1) {
+    let mut opts = Opts {
+        dlss: true,
+        gpu_debug: false,
+        sl_path: std::env::var("FRUSTRACER_SL_PATH").unwrap_or_else(|_| {
+            concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\streamline-sdk\bin\x64").to_string()
+        }),
+    };
+    let mut check_dlss = false;
+    let mut dlss_dump = false;
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
         match a.as_str() {
             "--check" => check = true,
+            "--check-dlss" => check_dlss = true,
+            "--dlss-dump" => {
+                check_dlss = true;
+                dlss_dump = true;
+            }
+            "--dlss" => opts.dlss = true,
+            "--no-dlss" => opts.dlss = false,
+            "--gpu-debug" => opts.gpu_debug = true,
+            "--sl-path" => {
+                opts.sl_path = args.next().unwrap_or_else(|| {
+                    eprintln!("--sl-path needs a directory argument");
+                    std::process::exit(2);
+                })
+            }
             "--help" | "-h" => {
-                eprintln!("usage: frustracer [model.obj] [--check]");
-                eprintln!("  --check  headless: verify hybrid vs reference, benchmark, write check.png");
+                eprintln!("usage: frustracer [model.obj] [--check] [--check-dlss] [--dlss-dump] [--no-dlss] [--gpu-debug] [--sl-path <dir>]");
+                eprintln!("  --check       headless: verify hybrid vs reference, benchmark, write check.png");
+                eprintln!("  --check-dlss  headless: G-buffer MV/depth/matrix self-test (no GPU needed)");
+                eprintln!("  --dlss-dump   --check-dlss plus G-buffer PNG dumps (albedo/normal/misc/mv)");
+                eprintln!("  --no-dlss     skip Streamline/DLSS; plain D3D12 presentation");
+                eprintln!("  --gpu-debug   D3D12 debug layer + verbose Streamline logging");
+                eprintln!("  --sl-path     Streamline DLL directory (default: SDKs\\streamline-sdk\\bin\\x64)");
                 return;
             }
             _ => obj = Some(a),
@@ -67,7 +112,104 @@ fn main() {
         let code = run_check(&scene, &bvh);
         std::process::exit(code);
     }
-    run_window(&scene, &bvh);
+    if check_dlss {
+        let code = run_check_dlss(&scene, &bvh, dlss_dump);
+        std::process::exit(code);
+    }
+    #[cfg(windows)]
+    run_window(&scene, &bvh, &opts);
+    #[cfg(not(windows))]
+    {
+        let _ = &opts;
+        eprintln!("the interactive window requires Windows (D3D12 + DLSS); use --check / --check-dlss");
+        std::process::exit(2);
+    }
+}
+
+/// Headless DLSS G-buffer verification: renders two DLSS-style frames (a
+/// small forward dolly apart — the same move `--check` T2 uses), then checks
+/// motion vectors, depth, and the camera matrices jointly by reconstructing
+/// world positions through both frames. No GPU or Streamline involved — this
+/// validates the CPU capture before/without the denoiser.
+fn run_check_dlss(scene: &scene::Scene, bvh: &bvh::Bvh, dump: bool) -> i32 {
+    let (rw, rh) = (800usize, 600usize);
+    let (near, far) = dlss::near_far(scene.diag);
+    let q = Quality { shadow_samples: 1, ao_samples: 1, reflections: true };
+    let stats = Stats::default();
+    let accum: Vec<AtomicU32> = (0..rw * rh * 3).map(|_| AtomicU32::new(0)).collect();
+    let info: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
+    let tbuf: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
+
+    // Halton structural checks: known prefixes, offsets in [-0.5, 0.5).
+    let mut halton_ok = true;
+    for (i, base, want) in [(1u32, 2u32, 0.5f32), (2, 2, 0.25), (3, 2, 0.75), (1, 3, 1.0 / 3.0), (2, 3, 2.0 / 3.0)] {
+        let got = dlss::halton(i, base);
+        if (got - want).abs() > 1e-6 {
+            eprintln!("halton({i},{base}) = {got}, want {want}");
+            halton_ok = false;
+        }
+    }
+    for idx in 0..64 {
+        let (ox, oy) = dlss::jitter_for(idx);
+        if !(-0.5..0.5).contains(&ox) || !(-0.5..0.5).contains(&oy) {
+            eprintln!("jitter_for({idx}) = ({ox},{oy}) out of [-0.5,0.5)");
+            halton_ok = false;
+        }
+    }
+    eprintln!("halton/jitter checks: {}", if halton_ok { "OK" } else { "FAIL" });
+
+    // Frame A at the default camera; frame B a 0.02·diag forward dolly later,
+    // with A as its previous frame. Zero jitter so samples sit on pixel
+    // centers — the reconstruction in the self-test assumes centers.
+    let cam0 = default_camera();
+    let basis_a = cam0.basis(rw, rh);
+    let ga = dlss::GBufs::new(rw, rh);
+    let gb = dlss::GBufs::new(rw, rh);
+    let render_dlss_frame = |g: &dlss::GBufs, basis: camera::CamBasis, prev: Option<camera::CamBasis>, frame: u32| {
+        let ctx = FrameCtx {
+            scene,
+            bvh,
+            cam: basis,
+            q,
+            frame,
+            jitter: false,
+            rw,
+            rh,
+            accum: &accum,
+            info: &info,
+            tbuf: &tbuf,
+            stats: &stats,
+            sun: render::sun_dir(scene),
+            tcache_cur: None,
+            tcache_prev: None,
+            accumulate: false,
+            gbuf: Some(g),
+            prev_cam: prev,
+            frame_jitter: Some((0.0, 0.0)),
+        };
+        render::render_frame(&ctx, true);
+    };
+    render_dlss_frame(&ga, basis_a, None, 0);
+
+    let mut cam_b = cam0;
+    cam_b.pos += cam0.forward() * (0.02 * scene.diag);
+    let basis_b = cam_b.basis(rw, rh);
+    render_dlss_frame(&gb, basis_b, Some(basis_a), 1);
+
+    let mats_b = dlss::cam_matrices(&cam_b, rw, rh, near, far);
+    let mv_ok = dlss::mv_selftest(&ga, &basis_a, &gb, &basis_b, &mats_b, scene.diag, far);
+
+    if dump {
+        dlss::dump_gbufs(&gb, "dlss_gbuf", far);
+    }
+
+    if halton_ok && mv_ok {
+        eprintln!("DLSS CHECK PASSED");
+        0
+    } else {
+        eprintln!("DLSS CHECK FAILED");
+        1
+    }
 }
 
 fn default_camera() -> Camera {
@@ -130,6 +272,10 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh) -> i32 {
             sun: render::sun_dir(scene),
             tcache_cur: None,
             tcache_prev: None,
+            accumulate: true,
+            gbuf: None,
+            prev_cam: None,
+            frame_jitter: None,
         };
         let t = Instant::now();
         for _ in 0..BENCH_FRAMES {
@@ -167,6 +313,10 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh) -> i32 {
             sun: render::sun_dir(scene),
             tcache_cur: None,
             tcache_prev: None,
+            accumulate: true,
+            gbuf: None,
+            prev_cam: None,
+            frame_jitter: None,
         };
         let t = Instant::now();
         render::render_frame_capped(&ctx, cap);
@@ -200,6 +350,10 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh) -> i32 {
             sun: render::sun_dir(scene),
             tcache_cur: Some(&tcache),
             tcache_prev: None,
+            accumulate: true,
+            gbuf: None,
+            prev_cam: None,
+            frame_jitter: None,
         };
         render::render_frame(&ctx, true);
     }
@@ -285,6 +439,10 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh) -> i32 {
             sun: render::sun_dir(scene),
             tcache_cur: None,
             tcache_prev: prev,
+            accumulate: true,
+            gbuf: None,
+            prev_cam: None,
+            frame_jitter: None,
         };
         let t = Instant::now();
         render::render_frame(&ctx, true);
@@ -308,14 +466,44 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh) -> i32 {
     }
 }
 
-fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh) {
-    let mut window = Window::new(
-        "frustracer — R: hybrid/plain  T: dynamic-res  O: overlay  1-3: quality  C: verify  P: screenshot",
-        W,
-        H,
-        WindowOptions::default(),
+/// Extract the Win32 HWND from the SDL2 window for swapchain creation.
+#[cfg(windows)]
+fn sdl_hwnd(window: &sdl2::video::Window) -> windows::Win32::Foundation::HWND {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let handle = window.window_handle().expect("window handle").as_raw();
+    match handle {
+        RawWindowHandle::Win32(h) => {
+            windows::Win32::Foundation::HWND(h.hwnd.get() as *mut core::ffi::c_void)
+        }
+        _ => unreachable!("non-Win32 window handle on Windows"),
+    }
+}
+
+#[cfg(windows)]
+fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts) {
+    let sdl = sdl2::init().expect("SDL init failed");
+    let video = sdl.video().expect("SDL video failed");
+    let mut window = video
+        .window(
+            "frustracer — R: hybrid/plain  T: dynamic-res  O: overlay  B: gpu-tonemap  1-3: quality  C: verify  P: screenshot",
+            W as u32,
+            H as u32,
+        )
+        .position_centered()
+        .build()
+        .expect("failed to open window");
+    let mut inp = input::Input::new(&sdl).expect("SDL event pump failed");
+    let mut gpu = gpu::GpuContext::new(
+        sdl_hwnd(&window),
+        W as u32,
+        H as u32,
+        &gpu::GpuOptions {
+            dlss: opts.dlss,
+            sl_dir: opts.sl_path.clone(),
+            debug: opts.gpu_debug,
+        },
     )
-    .expect("failed to open window");
+    .expect("GPU init failed");
 
     let mut cam = default_camera();
     let accum: Vec<AtomicU32> = (0..W * H * 3).map(|_| AtomicU32::new(0)).collect();
@@ -336,9 +524,22 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh) {
     let mut hybrid = true;
     let mut dynamic = true;
     let mut overlay_on = false;
+    let mut gpu_tonemap = false;
     let mut preset = 2u32;
-    let mut prev_mouse: Option<(f32, f32)> = None;
     let mut prev_rw = W;
+
+    // DLSS Ray Reconstruction state. In DLSS mode every frame is a fresh
+    // 1-spp full-res hybrid frame and RR is the only temporal integrator:
+    // no CPU accumulation, no half-res moving mode, no depth-cap budget.
+    let mut dlss_on = gpu.dlss_ready();
+    let gbufs = dlss::GBufs::new(W, H);
+    let mut dlss_idx: u32 = 0;
+    let mut dlss_prev: Option<dlss::DlssPrev> = None;
+    let mut dlss_reset = true;
+    let (dlss_near, dlss_far) = dlss::near_far(scene.diag);
+    if dlss_on {
+        eprintln!("dlss: Ray Reconstruction ON (G toggles)");
+    }
     let mut prev_budget = false;
     // Depth cap that fully resolves the screen (tiles reach LEAF_TILE): 7 at 1024.
     let depth_full: f32 = ((W.max(H) as f32) / render::LEAF_TILE as f32).log2().ceil();
@@ -353,28 +554,55 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh) {
     let mut last_ms = 0.0f64;
     let mut shot = 0u32;
 
-    while window.is_open() && !window.is_key_down(Key::Escape) {
+    loop {
         let now = Instant::now();
         let dt = (now - last).as_secs_f32().min(0.1);
         last = now;
 
-        let moved = handle_input(&window, &mut cam, dt, scene.diag, &mut prev_mouse);
-        if window.is_key_pressed(Key::R, KeyRepeat::No) {
+        let edges = inp.poll();
+        if edges.quit {
+            break;
+        }
+        let moved = inp.apply_movement(&mut cam, dt, scene.diag);
+        if edges.toggle_hybrid {
             hybrid = !hybrid;
             frame = 0;
+            dlss_reset = true; // noise statistics change across the toggle
         }
-        if window.is_key_pressed(Key::T, KeyRepeat::No) {
-            dynamic = !dynamic;
-            frame = 0;
-        }
-        if window.is_key_pressed(Key::O, KeyRepeat::No) {
-            overlay_on = !overlay_on;
-        }
-        for (k, p) in [(Key::Key1, 1), (Key::Key2, 2), (Key::Key3, 3)] {
-            if window.is_key_pressed(k, KeyRepeat::No) {
-                preset = p;
+        if edges.toggle_dynamic {
+            if dlss_on {
+                eprintln!("dynamic-res is a no-op in DLSS mode (fixed render resolution)");
+            } else {
+                dynamic = !dynamic;
                 frame = 0;
             }
+        }
+        if edges.toggle_overlay {
+            if dlss_on {
+                eprintln!("overlay unavailable in DLSS mode (lives in the CPU resolve)");
+            } else {
+                overlay_on = !overlay_on;
+            }
+        }
+        if edges.toggle_gpu_tone {
+            gpu_tonemap = !gpu_tonemap;
+            eprintln!("tonemap: {}", if gpu_tonemap { "GPU" } else { "CPU" });
+        }
+        if edges.toggle_dlss {
+            if gpu.dlss_ready() {
+                dlss_on = !dlss_on;
+                frame = 0;
+                dlss_reset = true;
+                dlss_prev = None;
+                eprintln!("dlss: Ray Reconstruction {}", if dlss_on { "ON" } else { "OFF" });
+            } else {
+                eprintln!("dlss: not available");
+            }
+        }
+        if let Some(p) = edges.quality {
+            preset = p;
+            frame = 0;
+            dlss_reset = true;
         }
         if moved {
             frame = 0;
@@ -382,9 +610,11 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh) {
 
         // Cheap while moving, converge while still. Dynamic-res mode keeps
         // full resolution buffers and full quality — the estimated depth cap
-        // floats the effective resolution instead.
-        let use_budget = moved && hybrid && dynamic;
-        let (rw, rh) = if moved && !use_budget { (W / 2, H / 2) } else { (W, H) };
+        // floats the effective resolution instead. DLSS mode forces full-res
+        // uncapped every frame (RR requires a fixed render resolution and
+        // clean per-pixel G-buffers) with frame-stationary quality.
+        let use_budget = moved && hybrid && dynamic && !dlss_on;
+        let (rw, rh) = if !dlss_on && moved && !use_budget { (W / 2, H / 2) } else { (W, H) };
         if rw != prev_rw {
             frame = 0;
             prev_rw = rw;
@@ -394,9 +624,16 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh) {
             prev_budget = use_budget;
         }
         let base_q = Quality::preset(preset);
-        let q = if moved && !use_budget { base_q.while_moving() } else { base_q };
+        let q = if dlss_on {
+            // Fixed cheap preset: RR wants frame-stationary noise statistics.
+            Quality { shadow_samples: 1, ao_samples: 1, reflections: true }
+        } else if moved && !use_budget {
+            base_q.while_moving()
+        } else {
+            base_q
+        };
 
-        if frame < MAX_SAMPLES {
+        if dlss_on || frame < MAX_SAMPLES {
             stats.clear();
             let basis = cam.basis(rw, rh);
             // Budget (moving) frames are full-res, so the cache stays live
@@ -416,8 +653,8 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh) {
                 bvh,
                 cam: basis,
                 q,
-                frame,
-                jitter: frame > 0,
+                frame: if dlss_on { dlss_idx } else { frame },
+                jitter: !dlss_on && frame > 0,
                 rw,
                 rh,
                 accum: &accum,
@@ -427,6 +664,10 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh) {
                 sun: render::sun_dir(scene),
                 tcache_cur,
                 tcache_prev,
+                accumulate: !dlss_on,
+                gbuf: if dlss_on { Some(&gbufs) } else { None },
+                prev_cam: if dlss_on { dlss_prev.as_ref().map(|p| p.basis) } else { None },
+                frame_jitter: if dlss_on { Some(dlss::jitter_for(dlss_idx)) } else { None },
             };
             let t = Instant::now();
             if use_budget {
@@ -460,28 +701,83 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh) {
             std::thread::sleep(Duration::from_millis(8)); // converged — idle
         }
 
-        render::resolve(
-            &accum,
-            &info,
-            frame.max(1),
-            overlay_on && hybrid,
-            &mut present,
-            rw,
-            rh,
-            W,
-            H,
-        );
-        window
-            .update_with_buffer(&present, W, H)
-            .expect("window update failed");
+        // GPU tonemap consumes the raw HDR accumulation directly, but only
+        // for full-res frames without the overlay — half-res upscale and the
+        // overlay composite live in the CPU resolve.
+        let use_gpu_tone = gpu_tonemap && rw == W && !(overlay_on && hybrid);
+        if dlss_on {
+            // DLSS-RR: hand the 1-spp radiance + G-buffers to the denoiser;
+            // it outputs denoised HDR which the GPU tonemap presents.
+            let mats = dlss::cam_matrices(&cam, W, H, dlss_near, dlss_far);
+            let fc = dlss::frame_constants(
+                &cam,
+                &mats,
+                dlss_prev.as_ref().map(|p| &p.mats),
+                dlss::jitter_for(dlss_idx),
+                dlss_reset,
+                dlss_near,
+                dlss_far,
+                W,
+                H,
+            );
+            match gpu.present_rr(&accum, &gbufs, &fc, dlss_idx) {
+                Ok(()) => {
+                    dlss_prev = Some(dlss::DlssPrev { basis: cam.basis(W, H), mats });
+                    dlss_reset = false;
+                    dlss_idx = dlss_idx.wrapping_add(1);
+                }
+                Err(e) => {
+                    // A Streamline failure (e.g. out of VRAM) shouldn't kill
+                    // the app: the aborted frame never reached the GPU, so
+                    // fall back to the CPU pipeline; the next loop iteration
+                    // presents normally. G retries.
+                    eprintln!("dlss: present failed ({e}); Ray Reconstruction disabled (G to retry)");
+                    dlss_on = false;
+                    dlss_prev = None;
+                    dlss_reset = true;
+                    frame = 0;
+                }
+            }
+        } else if use_gpu_tone {
+            gpu.present_hdr(&accum, frame.max(1)).expect("GPU present failed");
+        } else {
+            render::resolve(
+                &accum,
+                &info,
+                frame.max(1),
+                overlay_on && hybrid,
+                &mut present,
+                rw,
+                rh,
+                W,
+                H,
+            );
+            gpu.present_cpu(&present).expect("GPU present failed");
+        }
 
-        if window.is_key_pressed(Key::P, KeyRepeat::No) {
+        if edges.screenshot {
+            if dlss_on {
+                // The denoised image exists only on the GPU — read the RR
+                // output back and tonemap it (same curve, 1 spp). On failure
+                // fall back to a fresh CPU resolve of the noisy input.
+                match gpu.read_rr_output() {
+                    Ok(px) => present.copy_from_slice(&px),
+                    Err(e) => {
+                        eprintln!("screenshot: RR readback failed ({e}); saving noisy 1-spp resolve");
+                        render::resolve(&accum, &info, 1, false, &mut present, rw, rh, W, H);
+                    }
+                }
+            } else if use_gpu_tone {
+                // The present buffer is stale in GPU-tonemap mode; resolve
+                // fresh for the screenshot.
+                render::resolve(&accum, &info, frame.max(1), false, &mut present, rw, rh, W, H);
+            }
             let name = format!("screenshot_{shot}.png");
             save_png(&name, &present, W, H);
             eprintln!("saved {name}");
             shot += 1;
         }
-        if window.is_key_pressed(Key::C, KeyRepeat::No) {
+        if edges.verify {
             eprintln!("verifying current view...");
             let vstats = Stats::default();
             // Cache-free on purpose: an independent ground-truth oracle.
@@ -505,18 +801,25 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh) {
             } else {
                 String::new()
             };
-            window.set_title(&format!(
-                "frustracer | {}{} | {}x{} | {:.1} ms | {} spp | quality {}{}{}{}",
+            let _ = window.set_title(&format!(
+                "frustracer | {}{} | {}x{} | {:.1} ms | {} | quality {}{}{}{}{}",
                 if hybrid { "hybrid" } else { "plain" },
-                if hybrid && dynamic { "+dyn" } else { "" },
+                if dlss_on {
+                    " + DLSS-RR"
+                } else if hybrid && dynamic {
+                    "+dyn"
+                } else {
+                    ""
+                },
                 rw,
                 rh,
                 last_ms,
-                frame.min(MAX_SAMPLES),
+                if dlss_on { "1 spp".to_string() } else { format!("{} spp", frame.min(MAX_SAMPLES)) },
                 preset,
                 coarse,
+                if use_gpu_tone && !dlss_on { " | gpu-tone" } else { "" },
                 if overlay_on { " | overlay" } else { "" },
-                if frame >= MAX_SAMPLES { " | converged" } else { "" },
+                if !dlss_on && frame >= MAX_SAMPLES { " | converged" } else { "" },
             ));
         }
         if (now - last_stats).as_secs_f64() > 1.0 && frame <= MAX_SAMPLES && frame > 0 {
@@ -529,62 +832,6 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh) {
             );
         }
     }
-}
-
-fn handle_input(
-    window: &Window,
-    cam: &mut Camera,
-    dt: f32,
-    diag: f32,
-    prev_mouse: &mut Option<(f32, f32)>,
-) -> bool {
-    let mut moved = false;
-
-    let mut speed = diag * 0.25 * dt;
-    if window.is_key_down(Key::LeftShift) || window.is_key_down(Key::RightShift) {
-        speed *= 4.0;
-    }
-    let f = cam.forward();
-    let r = f.cross(Vec3A::Y).normalize();
-    let mut delta = Vec3A::ZERO;
-    if window.is_key_down(Key::W) {
-        delta += f;
-    }
-    if window.is_key_down(Key::S) {
-        delta -= f;
-    }
-    if window.is_key_down(Key::D) {
-        delta += r;
-    }
-    if window.is_key_down(Key::A) {
-        delta -= r;
-    }
-    if window.is_key_down(Key::E) || window.is_key_down(Key::Space) {
-        delta += Vec3A::Y;
-    }
-    if window.is_key_down(Key::Q) {
-        delta -= Vec3A::Y;
-    }
-    if delta != Vec3A::ZERO {
-        cam.pos += delta.normalize() * speed;
-        moved = true;
-    }
-
-    // Hold left mouse to look.
-    let mpos = window.get_mouse_pos(MouseMode::Pass);
-    if window.get_mouse_down(MouseButton::Left) {
-        if let (Some((x, y)), Some((px, py))) = (mpos, *prev_mouse) {
-            let (dx, dy) = (x - px, y - py);
-            if dx != 0.0 || dy != 0.0 {
-                cam.yaw += dx * 0.004;
-                cam.pitch = (cam.pitch - dy * 0.004).clamp(-1.5, 1.5);
-                moved = true;
-            }
-        }
-    }
-    *prev_mouse = mpos;
-
-    moved
 }
 
 fn save_png(name: &str, present: &[u32], w: usize, h: usize) {

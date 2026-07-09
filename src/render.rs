@@ -1,5 +1,6 @@
 use crate::bvh::{Bvh, Ray};
 use crate::camera::CamBasis;
+use crate::dlss;
 use crate::frustum::{self, MAX_CUT};
 use crate::overlay::{self, KIND_COARSE, KIND_LEAF, KIND_SKY};
 use crate::scene::Scene;
@@ -42,13 +43,27 @@ pub struct FrameCtx<'a> {
     /// consulted before each tile's bound query for a t_start head start.
     /// Must be exactly the last full-res hybrid frame (see main.rs wiring).
     pub tcache_prev: Option<(&'a TemporalCache, CamBasis)>,
+    /// false => `splat` always stores (every frame is a fresh 1-spp frame;
+    /// DLSS-RR is the temporal integrator). `frame` still advances so the
+    /// per-pixel RNG decorrelates across frames — pinning frame to 0 would
+    /// freeze the noise pattern, which the denoiser would treat as signal.
+    pub accumulate: bool,
+    /// DLSS G-buffers, written at the primary-hit fill sites. None (all
+    /// legacy paths) costs one never-taken branch per pixel.
+    pub gbuf: Option<&'a dlss::GBufs>,
+    /// Previous frame's camera basis for motion vectors (independent of the
+    /// temporal cache's tprev_basis — different contract).
+    pub prev_cam: Option<CamBasis>,
+    /// Frame-uniform sub-pixel jitter offset in [-0.5, 0.5) (DLSS mode);
+    /// None => the legacy per-pixel rng jitter controlled by `jitter`.
+    pub frame_jitter: Option<(f32, f32)>,
 }
 
 impl FrameCtx<'_> {
     #[inline(always)]
     fn splat(&self, x: usize, y: usize, c: Vec3A) {
         let i = (y * self.rw + x) * 3;
-        if self.frame == 0 {
+        if self.frame == 0 || !self.accumulate {
             self.accum[i].store(c.x.to_bits(), Relaxed);
             self.accum[i + 1].store(c.y.to_bits(), Relaxed);
             self.accum[i + 2].store(c.z.to_bits(), Relaxed);
@@ -266,6 +281,77 @@ fn shade_tile(
     ctx.stats.add(&ls);
 }
 
+/// G-buffer write for a primary hit at continuous sample position (fx, fy).
+/// The motion vector reprojects the exact hit point through the previous
+/// frame's basis: `project` takes a direction relative to that origin, and
+/// the result is "current + mv = previous" in pixels, y-down. Jitter never
+/// enters any projection (both bases are jitter-free and the hit point lies
+/// on the jittered ray by construction), so this MV is unjittered.
+fn write_gbuf_hit(
+    ctx: &FrameCtx,
+    x: usize,
+    y: usize,
+    fx: f32,
+    fy: f32,
+    dir: Vec3A,
+    t: f32,
+    prim: &shade::PrimarySurface,
+) {
+    let Some(g) = ctx.gbuf else { return };
+    let (_, far) = dlss::near_far(ctx.scene.diag);
+    let mv = match &ctx.prev_cam {
+        Some(prev) => {
+            let p = ctx.cam.origin + dir * t;
+            match prev.project(p - prev.origin) {
+                Some((px, py)) => (px - fx, py - fy),
+                None => (0.0, 0.0), // behind the old image plane: disocclusion
+            }
+        }
+        None => (0.0, 0.0),
+    };
+    g.write(
+        x,
+        y,
+        &dlss::GPixel {
+            normal: prim.n,
+            rough: 1.0 - prim.reflectivity,
+            diff_alb: prim.albedo * (1.0 - prim.reflectivity),
+            spec_alb: prim.reflectivity,
+            view_z: t * dir.dot(ctx.cam.forward()),
+            mv,
+            spec_hit_t: if prim.spec_t.is_infinite() { far } else { prim.spec_t },
+        },
+    );
+}
+
+/// G-buffer write for a sky/miss pixel: depth = far (finite, f16-safe), MV =
+/// direction-only reprojection (exact for an environment at infinity — zero
+/// under pure translation, the pan vector under rotation).
+fn write_gbuf_sky(ctx: &FrameCtx, x: usize, y: usize, fx: f32, fy: f32, dir: Vec3A) {
+    let Some(g) = ctx.gbuf else { return };
+    let (_, far) = dlss::near_far(ctx.scene.diag);
+    let mv = match &ctx.prev_cam {
+        Some(prev) => match prev.project(dir) {
+            Some((px, py)) => (px - fx, py - fy),
+            None => (0.0, 0.0),
+        },
+        None => (0.0, 0.0),
+    };
+    g.write(
+        x,
+        y,
+        &dlss::GPixel {
+            normal: -dir,
+            rough: 1.0,
+            diff_alb: Vec3A::ONE,
+            spec_alb: 0.0,
+            view_z: far,
+            mv,
+            spec_hit_t: 0.0,
+        },
+    );
+}
+
 fn shade_pixel(
     ctx: &FrameCtx,
     x: usize,
@@ -281,8 +367,21 @@ fn shade_pixel(
         .wrapping_add((y as u64).wrapping_mul(0xC2B2AE3D27D4EB4F))
         .wrapping_add(ctx.frame as u64);
     let mut rng = fastrand::Rng::with_seed(seed);
-    let (jx, jy) = if ctx.jitter { (rng.f32(), rng.f32()) } else { (0.5, 0.5) };
-    let dir = ctx.cam.ray_dir(x as f32 + jx, y as f32 + jy);
+    // DLSS mode: one frame-uniform low-discrepancy offset for every pixel
+    // (the denoiser is told this exact offset). Legacy: per-pixel rng.
+    // Either way the sample stays in [x, x+1) — the invariant leaf rays need.
+    let (jx, jy) = match ctx.frame_jitter {
+        Some((ox, oy)) => (0.5 + ox, 0.5 + oy),
+        None => {
+            if ctx.jitter {
+                (rng.f32(), rng.f32())
+            } else {
+                (0.5, 0.5)
+            }
+        }
+    };
+    let (fx, fy) = (x as f32 + jx, y as f32 + jy);
+    let dir = ctx.cam.ray_dir(fx, fy);
     let ray = Ray::new(ctx.cam.origin, dir);
     ls.primary_rays += 1;
     let hit = match cut {
@@ -298,6 +397,7 @@ fn shade_pixel(
                 ls.skip_ratio_micro += (t_start / hit.t * 1e6) as u64;
             }
             ls.skip_ratio_count += 1;
+            let mut prim = shade::PrimarySurface::default();
             let c = shade::shade(
                 ctx.scene,
                 ctx.bvh,
@@ -309,12 +409,15 @@ fn shade_pixel(
                 0,
                 &mut ls.secondary_rays,
                 &mut ls.ray_nodes,
+                if ctx.gbuf.is_some() { Some(&mut prim) } else { None },
             );
             ctx.splat(x, y, c);
+            write_gbuf_hit(ctx, x, y, fx, fy, dir, hit.t, &prim);
         }
         None => {
             ctx.store_meta(x, y, f32::INFINITY, depth, kind);
             ctx.splat(x, y, shade::sky(dir, ctx.sun));
+            write_gbuf_sky(ctx, x, y, fx, fy, dir);
         }
     }
 }
@@ -355,6 +458,7 @@ fn flat_fill(
         .wrapping_add(ctx.frame as u64);
     let mut rng = fastrand::Rng::with_seed(seed);
     ls.primary_rays += 1;
+    let mut prim = shade::PrimarySurface::default();
     let (c, thit) = match ctx.bvh.intersect_multi(ctx.scene, &ray, t_start, f32::INFINITY, cut, &mut ls.ray_nodes) {
         Some(hit) => {
             let c = shade::shade(
@@ -368,6 +472,7 @@ fn flat_fill(
                 0,
                 &mut ls.secondary_rays,
                 &mut ls.ray_nodes,
+                if ctx.gbuf.is_some() { Some(&mut prim) } else { None },
             );
             (c, hit.t)
         }
@@ -379,6 +484,16 @@ fn flat_fill(
         for x in x0..x1 {
             ctx.store_meta(x, y, thit, depth, KIND_COARSE);
             ctx.splat(x, y, c);
+            // Shared center-ray surface for the whole quad, but per-pixel
+            // sample position — the write helpers subtract (fx, fy), so the
+            // camera-motion part of the MV stays per-pixel-correct even in
+            // coarse quads.
+            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
+            if thit.is_finite() {
+                write_gbuf_hit(ctx, x, y, fx, fy, dir, thit, &prim);
+            } else {
+                write_gbuf_sky(ctx, x, y, fx, fy, dir);
+            }
         }
     }
 }
@@ -390,9 +505,11 @@ fn fill_sky(ctx: &FrameCtx, x0: usize, y0: usize, x1: usize, y1: usize, depth: u
     ls.sky_pixels = ((x1 - x0) * (y1 - y0)) as u64;
     for y in y0..y1 {
         for x in x0..x1 {
-            let dir = ctx.cam.ray_dir(x as f32 + 0.5, y as f32 + 0.5);
+            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
+            let dir = ctx.cam.ray_dir(fx, fy);
             ctx.store_meta(x, y, f32::INFINITY, depth, KIND_SKY);
             ctx.splat(x, y, shade::sky(dir, ctx.sun));
+            write_gbuf_sky(ctx, x, y, fx, fy, dir);
         }
     }
     ctx.stats.add(&ls);
@@ -498,6 +615,10 @@ pub fn verify(
         sun: sun_dir(scene),
         tcache_cur: None,
         tcache_prev: temporal_prev,
+        accumulate: true,
+        gbuf: None,
+        prev_cam: None,
+        frame_jitter: None,
     };
     match max_depth {
         Some(d) => render_frame_capped(&ctx, d),

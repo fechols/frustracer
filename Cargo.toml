@@ -6,10 +6,29 @@ edition = "2024"
 [dependencies]
 glam = "0.30"
 rayon = "1.10"
-minifb = "0.27"
 tobj = "4"
 image = "0.25"
 fastrand = "2"
+
+# The interactive presentation stack (SDL2 window + D3D12 + Streamline) is
+# Windows-only; headless --check/--check-dlss build everywhere without it.
+[target.'cfg(windows)'.dependencies]
+sdl2 = { version = "0.38", features = ["bundled", "static-link", "raw-window-handle"] }
+raw-window-handle = "0.6"
+half = "2"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_System_Threading",
+    "Win32_Security",
+] }
+
+[build-dependencies]
+cc = "1"
 
 [profile.release]
 lto = "thin"

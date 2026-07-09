@@ -31,6 +31,23 @@ impl Quality {
 
 const AMBIENT: Vec3A = Vec3A::new(0.14, 0.17, 0.23);
 
+/// Primary-hit surface data captured for the DLSS-RR G-buffers. Filled by
+/// `shade` only when the caller passes `Some` — and the caller passes `Some`
+/// only for primary rays; the recursive reflection call always passes `None`,
+/// which is what structurally guarantees secondaries can never write it.
+#[derive(Default, Clone, Copy)]
+pub struct PrimarySurface {
+    /// The exact world-space normal used for shading (post face-flip).
+    pub n: Vec3A,
+    /// Raw material albedo (the diffuse/specular split happens at the
+    /// G-buffer write site).
+    pub albedo: Vec3A,
+    pub reflectivity: f32,
+    /// Mirror-reflection ray hit t; INFINITY when the reflection ray missed;
+    /// 0.0 when no reflection was traced.
+    pub spec_t: f32,
+}
+
 pub fn sky(d: Vec3A, sun: Vec3A) -> Vec3A {
     let t = (d.y * 0.7 + 0.3).clamp(0.0, 1.0);
     let horizon = Vec3A::new(0.72, 0.82, 0.95);
@@ -53,6 +70,7 @@ pub fn shade(
     depth: u32,
     rays: &mut u64,
     visits: &mut u64,
+    mut prim: Option<&mut PrimarySurface>,
 ) -> Vec3A {
     let [i0, i1, i2] = scene.indices[hit.tri as usize];
     let w = 1.0 - hit.u - hit.v;
@@ -70,6 +88,9 @@ pub fn shade(
     }
     let p = ray.o + ray.d * hit.t + n * scene.eps;
     let mat = &scene.materials[scene.tri_mat[hit.tri as usize] as usize];
+    if let Some(prim) = prim.as_deref_mut() {
+        *prim = PrimarySurface { n, albedo: mat.albedo, reflectivity: mat.reflectivity, spec_t: 0.0 };
+    }
 
     // Direct light: N samples on the area light.
     let mut direct = Vec3A::ZERO;
@@ -121,8 +142,20 @@ pub fn shade(
         let rray = Ray::new(p, rdir);
         *rays += 1;
         let rcol = match bvh.intersect(scene, &rray, 0.0, f32::INFINITY, visits) {
-            Some(rh) => shade(scene, bvh, &rray, &rh, q, rng, sun, depth + 1, rays, visits),
-            None => sky(rdir, sun),
+            Some(rh) => {
+                if let Some(prim) = prim.as_deref_mut() {
+                    prim.spec_t = rh.t;
+                }
+                // The recursive call gets None: only the primary surface is
+                // ever captured.
+                shade(scene, bvh, &rray, &rh, q, rng, sun, depth + 1, rays, visits, None)
+            }
+            None => {
+                if let Some(prim) = prim.as_deref_mut() {
+                    prim.spec_t = f32::INFINITY;
+                }
+                sky(rdir, sun)
+            }
         };
         color = color.lerp(rcol, mat.reflectivity);
     }

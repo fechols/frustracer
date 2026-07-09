@@ -63,12 +63,27 @@ the idiomatic safe shared buffer.
 ## Running
 
 ```
-cargo run --release              # procedural scene (boxes, spheres, mirror)
-cargo run --release -- model.obj # load an OBJ (auto-fitted onto the ground)
-cargo run --release -- --check   # headless: verify vs reference, benchmark, write check.png
+cargo run --release                   # procedural scene (boxes, spheres, mirror)
+cargo run --release -- model.obj      # load an OBJ (auto-fitted onto the ground)
+cargo run --release -- --check        # headless: verify vs reference, benchmark, write check.png
+cargo run --release -- --check-dlss   # headless: DLSS G-buffer MV/depth/matrix self-test
+cargo run --release -- --no-dlss      # skip Streamline; native D3D12 presentation
 ```
 
 Debug builds are ~10× too slow to judge anything — always use `--release`.
+
+### DLSS Ray Reconstruction setup (optional)
+
+The renderer can hand its 1-spp frames to NVIDIA's DLSS Ray Reconstruction
+denoiser (RTX GPU required). Only the MIT-licensed Streamline headers and
+docs are vendored in `SDKs/streamline-sdk` — the runtime DLLs are
+license-restricted and are **not** in this repo. To enable DLSS, download
+the Streamline SDK 2.12.0 release zip from
+<https://github.com/NVIDIA-RTX/Streamline/releases> and extract it over
+`SDKs/streamline-sdk` so that `SDKs/streamline-sdk/bin/x64/sl.interposer.dll`
+exists (or point `--sl-path` / `FRUSTRACER_SL_PATH` at any directory holding
+the DLLs). Without the DLLs the app logs a note and runs with native D3D12
+presentation; building never needs them.
 
 ### Controls
 
@@ -79,15 +94,17 @@ Debug builds are ~10× too slow to judge anything — always use `--release`.
 | **R** | toggle hybrid frustum-tracer vs plain per-pixel (A/B benchmark) |
 | **T** | toggle dynamic resolution vs fixed half-res while moving |
 | **O** | quadtree debug overlay: subdivision-depth heatmap + tile borders |
+| **G** | toggle DLSS Ray Reconstruction (when available) |
+| **B** | toggle GPU vs CPU tonemap (non-DLSS mode) |
 | **1 / 2 / 3** | quality presets (shadow/AO samples, reflections) |
 | **C** | verify current view against the reference (prints counters) |
-| **P** | screenshot |
+| **P** | screenshot (in DLSS mode: reads the denoised output back from the GPU) |
 | Esc | quit |
 
-## Dynamic resolution (60 FPS target)
+## Dynamic resolution (30 FPS target)
 
-While the camera moves, each frame targets a time budget (~14 ms render +
-resolve/present headroom ≈ 60 FPS). The budget is not a per-tile deadline:
+While the camera moves, each frame targets a time budget (~30 ms render +
+resolve/present headroom ≈ 30 FPS). The budget is not a per-tile deadline:
 a controller converts the *previous* frame's measured time into a **uniform
 quadtree depth cap** for the next frame, and the same depth-first recursion as
 the normal driver runs everywhere to that cap. Tiles reaching it unresolved

@@ -59,6 +59,13 @@ pub struct CamBasis {
 }
 
 impl CamBasis {
+    /// Unit forward axis — needed by the DLSS G-buffer capture to convert
+    /// Euclidean hit t to linear view-space Z (t * dot(dir, forward)).
+    #[inline(always)]
+    pub fn forward(&self) -> Vec3A {
+        self.forward
+    }
+
     /// Normalized ray direction through the continuous image point (fx, fy),
     /// fx ∈ [0, w], fy ∈ [0, h] (pixel-grid coordinates, y down).
     #[inline(always)]
