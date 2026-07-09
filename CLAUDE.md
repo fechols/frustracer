@@ -1,0 +1,44 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this is
+
+A "frustracer" — a frustum-tracer. The screen is a quadtree: each tile's frustum is traced against a BVH for a conservative nearest-possible-hit distance; on contact the tile splits into 4 children that inherit that distance as their ray `tmin` **and a node cut** (the parent's surviving BVH nodes, refined by `frustum::refine_cut`), bottoming out at 8×8 tiles of per-pixel rays seeded from the cut (`Bvh::intersect_multi`). Tiles whose frustum hits nothing are filled with sky (zero rays). While the camera moves, the same depth-first recursion runs to a **uniform depth cap** estimated each frame from the previous frame's time against a ~14 ms budget; tiles reaching the cap unresolved are flat-filled (dynamic resolution). See README.md for the algorithm write-up.
+
+## Commands
+
+```
+cargo build --release
+cargo run --release                   # interactive window, procedural scene
+cargo run --release -- model.obj      # load an OBJ (auto-fitted onto ground plane)
+cargo run --release -- --check        # headless: verify + benchmark + write check.png
+```
+
+There are no unit tests. **`--check` is the test suite**: it renders a hybrid frame at **full depth and again through the depth-capped driver**, re-traces every pixel with a tmin=0 reference ray, and exits nonzero unless the `false-sky` and `tmin-overshoot` counters are exactly 0. In the capped pass, coarse (flat-filled) pixels are excluded from every counter but must be > 0 — proof the capped path ran (deterministic; no wall clock involved). It then warms a temporal cache with one frame and verifies four consumer passes the same way (static replay, forward dolly, dolly capped, dolly+yaw), asserting the temporal path demonstrably fired where that is structural (static: seeds and sky-tiles > 0; dolly: seeds > 0). Run it after any change to `frustum.rs`, `bvh.rs`, `render.rs`, `camera.rs`, or `temporal.rs`. It also A/B benchmarks hybrid vs plain per-pixel with node/ray counters and smoke-tests depth-capped dynamic frames at several caps.
+
+Always benchmark in `--release`; debug builds are ~10× too slow to judge anything (but one debug `--check` run arms the `debug_assert`s in the cut logic). In the interactive window, **R** toggles hybrid vs the brute-force reference, **T** toggles dynamic resolution vs fixed half-res while moving, **O** shows the quadtree overlay, **C** runs verification on the current view.
+
+## Correctness invariants (the bug class to guard)
+
+The whole design hinges on the inherited-distance bound in `src/frustum.rs::nearest_geometry_distance`:
+
+- Distances are **Euclidean from the shared camera origin**, and all ray directions are **normalized**, so distance == ray parameter t. If either side of that breaks (e.g., unnormalized dirs), children start past real geometry and pixels silently show sky.
+- The region proven empty by a parent is frustum ∩ **ball**(origin, t_start) — a spherical bound. Never reintroduce a planar near clip: a node may be skipped only when `max_dist(origin, aabb) <= t_start`, and candidates are clamped up to `t_start`.
+- Tile frustums are built through the tile's **continuous pixel-grid edges** (`CamBasis::tile_frustum`), not pixel centers, so jittered accumulation samples stay inside their tile.
+- Secondary rays (shadow/AO/reflection in `shade.rs`) must **never** see the tile's inherited tmin — it is a primary-frustum property only.
+- Frustum-vs-AABB culling may only err toward "intersecting" (false positives cost efficiency, never correctness). Degenerate side planes become zero normals, which never cull.
+- A "blocked" query (no distance progress, typically the huge ground-plane AABB) must still **subdivide** — children's smaller frustums can exclude the blocker; that is how sky tiles emerge. Stopping on blocked was tried and was 8× slower (kills parallelism and sky fills).
+- `refine_cut` may drop a node from the cut only by the frustum test or the proven-empty-ball test (`max_dist <= tc` — safe because tmin only grows down the quadtree and hit acceptance is strictly `t > tmin`). **Never add distance-to-best pruning to the cut**: a far node can be the nearest thing in a sibling's frustum; pruning it surfaces as false sky. `d >= best` belongs to the bound query (`visit`) only.
+- Cut capacity: `refine_cut` keeps `out_len + work_len <= MAX_CUT` so a surviving node always has a slot — out of budget means an internal node is emitted coarsely, never dropped. The cut handed to children must only ever be `refine_cut` output.
+- Leaf tiles use the inherited cut without re-culling; this is sound because jitter is in [0,1) on pixel coords and quadrant splits exactly partition the parent rect, so every leaf ray stays inside every ancestor frustum. `intersect_multi` is for primary rays in quadtree leaves only — secondary rays, plain mode, and verify's reference rays stay on `intersect`.
+- **Temporal cache** (`src/temporal.rs`, static scenes only): every entry is a standalone world-space claim "frustum ∩ ball(origin, tc) empty" — `+INF` claims the *whole* cone, valid only as the composition of a `None` query with the inherited ball claim. Entries built on temporal seeds stay standalone because every cross-frame hop only shrinks (δ subtraction, 1e-4). Reuse under motion goes through the **segment decomposition** in `temporal::lookup`: `[0, t_start]` is the tile's own inherited claim, `[t_start, seed]` is a pure direction-containment test with *both* λ tilts (`λ_min = δ/seed`, `λ_max = δ_safe/t_start`) — no apex condition (the translation dir is the screen center = a cell corner at every depth; naive frustum-in-frustum never fires) and no untilted corners (they are the s→∞ limit the segment never reaches; testing them reintroduces exact-zero shared-plane rejections). `contains_dirs` must keep strict positive margins, and a zero normal REJECTS there (opposite polarity to culling). The old-path descent in `lookup` must replay `trace_tile`'s exact midpoint splits and quadrant numbering (TL=0 TR=1 BL=2 BR=3). The prev buffer must be exactly the last full-res hybrid frame with the basis it traced with — invalidate on resolution change or any non-participating frame. Temporal data flows only through the primary-path `t_start`; secondary rays and the cut rules are untouched. Temporal sky reuse is structurally a static-camera win (a same-position old sky cell can't cover the translated tail); don't "fix" a moving-frame sky count of 0.
+
+## Architecture notes
+
+- `render.rs` has one depth-first driver: `trace_tile` (per-tile step `tile_step`: bound query over the inherited cut, then `refine_cut` for the children) recurses via nested `rayon::join` (tiles ≤ 32 px go sequential; ≤ 8×8 = `LEAF_TILE` shade per-pixel) with a `max_depth` cap checked **after** the leaf check, so a cap at or past the leaf depth is bit-identical to uncapped. `render_frame_capped` is dynamic resolution: at the cap, unresolved tiles flat-fill (one center ray through the inherited cut/`t_start`, splatted across the quad, `KIND_COARSE`); `MIN_BUDGET_DEPTH` floors the cap. The cap is uniform across the screen — that is what makes depth-first safe here (a wall-clock deadline would refine one corner and starve the rest, which is why the old driver was breadth-first); it also keeps cuts on the recursion stack, hot in cache. No clock is read in the driver: `main.rs` estimates next frame's cap from `last_ms` with a log4-proportional controller on a fractional accumulator (`depth_est`, clamped `[MIN_BUDGET_DEPTH, depth_full]`, slow-up/fast-down, deadband above 60% budget), updated only after budget frames. Trade-off: a hard cut to dense geometry can blow one frame before the controller reacts.
+- Buffers (`accum`, `tbuf`, `info`) are `&[AtomicU32]` with relaxed ops — safe because each pixel is written by exactly one task per frame. `frame == 0` **stores** instead of adds; that implicit clear is how accumulation resets (camera move, mode/quality change) work — there is no explicit buffer clear anywhere. `main.rs` also resets `frame` on the budget↔normal transition so accumulation never adds onto a flat-quad frame.
+- `accum` holds f32 bit-patterns of linear RGB; `resolve()` averages by sample count, tonemaps, upscales (the fixed half-res moving mode renders into a prefix of the full-res buffer; dynamic-res mode stays full-size), and blends the overlay.
+- `tbuf` (per-pixel primary-hit t) exists solely for `render::verify`; `info` (depth|kind) feeds the overlay and verify's sky classification.
+- Stats are batched into `stats::LocalStats` per tile and flushed once — never `fetch_add` per node visit or per ray.
+- Epsilons are scale-relative to `Scene::diag` (set in `SceneBuilder::finish`); OBJ scenes are auto-fitted to diagonal 10 so the same camera/light/epsilon constants work for any model.

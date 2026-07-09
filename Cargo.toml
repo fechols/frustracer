@@ -1,0 +1,16 @@
+[package]
+name = "frustracer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+glam = "0.30"
+rayon = "1.10"
+minifb = "0.27"
+tobj = "4"
+image = "0.25"
+fastrand = "2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
