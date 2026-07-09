@@ -1,1 +1,22 @@
 /target
+check.png
+screenshot_*.png
+dlss_gbuf_*.png
+
+# Streamline SDK: only the MIT-licensed headers and markdown docs are
+# committed (what NVIDIA publishes in their public GitHub repo). The runtime
+# DLLs (NGX/SL binaries) are license-restricted — no public redistribution
+# outside an application — and must be downloaded from the Streamline
+# releases page; see README. sl_nvperf.h is under the proprietary NSight
+# Perf SDK license and is excluded with the binaries.
+/SDKs/*
+!/SDKs/streamline-sdk/
+/SDKs/streamline-sdk/*
+!/SDKs/streamline-sdk/include/
+/SDKs/streamline-sdk/include/sl_nvperf.h
+!/SDKs/streamline-sdk/docs/
+/SDKs/streamline-sdk/docs/*
+!/SDKs/streamline-sdk/docs/*.md
+!/SDKs/streamline-sdk/license.txt
+!/SDKs/streamline-sdk/README.md
+!/SDKs/streamline-sdk/3rd-party-licenses.md
