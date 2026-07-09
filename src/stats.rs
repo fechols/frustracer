@@ -28,7 +28,7 @@ pub struct Stats {
     pub temporal_seeds: AtomicU64,
     /// Tiles sky-filled straight from the temporal cache (zero BVH work).
     pub temporal_sky_tiles: AtomicU64,
-    /// Containment candidates evaluated by the temporal walk (its cost).
+    /// Cells visited by the temporal region-min query (its cost).
     pub temporal_tests: AtomicU64,
 }
 
@@ -161,7 +161,7 @@ impl Stats {
         let tsky = self.temporal_sky_tiles.load(Relaxed);
         let ttests = self.temporal_tests.load(Relaxed);
         format!(
-            "tiles {tiles} | fr-queries {fq} (blocked {blocked}) | cut mean {cut_mean:.1} (ovf {ovf}) | nodes: frustum {fnodes} + ray {rnodes} = {} | rays: {prim} prim + {sec} sec | sky-px (0 rays) {sky} | coarse-px {coarse} | temporal: seeds {tseeds} sky {tsky} tests {ttests} | mean t_start/t_hit {skip:.2}",
+            "tiles {tiles} | fr-queries {fq} (blocked {blocked}) | cut mean {cut_mean:.1} (ovf {ovf}) | nodes: frustum {fnodes} + ray {rnodes} = {} | rays: {prim} prim + {sec} sec | sky-px (0 rays) {sky} | coarse-px {coarse} | temporal: seeds {tseeds} sky {tsky} cells {ttests} | mean t_start/t_hit {skip:.2}",
             fnodes + rnodes
         )
     }

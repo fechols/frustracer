@@ -211,7 +211,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh) -> i32 {
         let sky = stats.temporal_sky_tiles.load(Relaxed);
         let tests = stats.temporal_tests.load(Relaxed);
         eprintln!(
-            "verify temporal {label} ({} px): false-sky {} | tmin-overshoot {} | hybrid-extra {} | max rel t err {:.2e} | seeds {seeds} sky-tiles {sky} tests {tests} coarse px {}",
+            "verify temporal {label} ({} px): false-sky {} | tmin-overshoot {} | hybrid-extra {} | max rel t err {:.2e} | seeds {seeds} sky-tiles {sky} cells {tests} coarse px {}",
             rep.pixels, rep.false_sky, rep.overshoot, rep.hybrid_extra, rep.max_rel_err, rep.coarse
         );
         let mut ok = rep.ok();
@@ -233,31 +233,46 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh) -> i32 {
     // must come from the cache and at least one node must seed.
     temporal_pass("static", &cam, None, true, true);
     // T2: pure forward dolly. Seeds must fire (the root, at minimum: its
-    // segment is provably inside the old root under an interior translation).
-    // Sky reuse is NOT asserted — a same-position old sky cell genuinely
-    // cannot cover the translated tile's infinite tail (it exits through
-    // their shared plane), and shallower old cells aren't sky; temporal sky
-    // is structurally a static-camera win.
+    // extreme dirs are the old corners ± fp on the old screen boundary plus
+    // the focus of expansion). Sky is NOT asserted: at this δ the λ_max tilt
+    // drags every sky tile's query box toward the FOE, across the sky
+    // boundary into finite cells — expected, not a regression.
     let mut cam_b = cam0;
     cam_b.pos += cam0.forward() * (0.02 * scene.diag);
     let basis_b = cam_b.basis(rw, rh);
     temporal_pass("dolly", &basis_b, None, true, false);
-    // T3: the same dolly through the depth-capped driver.
-    temporal_pass("dolly capped d=4", &basis_b, Some(4), false, false);
-    // T4: translate + rotate — containment legitimately fires sparsely under
-    // rotation, so only correctness is asserted.
+    // T3: the same dolly through the depth-capped driver (the root's seed is
+    // cap-independent).
+    temporal_pass("dolly capped d=4", &basis_b, Some(4), true, false);
+    // T4: translate + rotate — the root leaves the old screen and this
+    // scene's finite bound landscape is single-valued (the ground AABB blocks
+    // everything at one distance), so only correctness is asserted.
     let mut cam_c = cam_b;
     cam_c.yaw += 0.05;
     temporal_pass("dolly+yaw", &cam_c.basis(rw, rh), None, false, false);
+    // T5: pure rotation — the region-min query's structural win: δ = 0, the
+    // old proven-empty balls are unchanged in world space, and panned-into
+    // sky tiles overlap only old sky cells → free. Seeds are NOT asserted:
+    // with a single-valued finite landscape, min == inherited everywhere.
+    let mut cam_y = cam0;
+    cam_y.yaw += 0.05;
+    let basis_y = cam_y.basis(rw, rh);
+    temporal_pass("yaw", &basis_y, None, false, true);
 
-    // Informational A/B: the same static frame cold vs seeded (this is the
-    // accumulation-frame path). Not gated — the win is scene-dependent.
-    for (label, prev) in [("cold", None), ("warm", Some((&tcache, cam)))] {
+    // Informational A/B: static (the accumulation-frame path) and pure yaw
+    // (the rotation path), each cold vs seeded. Not gated — the win is
+    // scene-dependent.
+    for (label, basis, prev) in [
+        ("static cold", cam, None),
+        ("static warm", cam, Some((&tcache, cam))),
+        ("yaw cold   ", basis_y, None),
+        ("yaw warm   ", basis_y, Some((&tcache, cam))),
+    ] {
         stats.clear();
         let ctx = FrameCtx {
             scene,
             bvh,
-            cam,
+            cam: basis,
             q,
             frame: 0,
             jitter: false,
@@ -274,7 +289,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh) -> i32 {
         let t = Instant::now();
         render::render_frame(&ctx, true);
         eprintln!(
-            "temporal A/B {label}: {:5.1} ms | frustum nodes {} | queries {} | temporal: seeds {} sky {} tests {}",
+            "temporal A/B {label}: {:5.1} ms | frustum nodes {} | queries {} | temporal: seeds {} sky {} cells {}",
             t.elapsed().as_secs_f64() * 1000.0,
             stats.frustum_nodes.load(Relaxed),
             stats.frustum_queries.load(Relaxed),

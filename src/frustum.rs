@@ -24,37 +24,6 @@ impl TileFrustum {
         TileFrustum { origin, normals }
     }
 
-    /// Conservative direction containment: true only if the conic hull of
-    /// `dirs` provably lies inside this frustum's cone — equivalently, every
-    /// point `origin + (positive combination of dirs)` is inside the frustum
-    /// (all planes pass through `origin`). Used by the temporal cache: the
-    /// caller reduces "this ray segment is inside the old frustum" to a pure
-    /// direction test (see `temporal::lookup` for the decomposition).
-    ///
-    /// `dirs` must be normalized: the strict 1e-5 margin is an *angular*
-    /// margin, and it is load-bearing — a tile shares boundary planes with its
-    /// parent and with same-position tiles, where these dots are exact zeros
-    /// that must reject; it also absorbs the ~1e-7 error of normal
-    /// construction and dir normalization.
-    ///
-    /// A zero normal REJECTS here — the opposite polarity to `aabb_outside`,
-    /// where a zero normal must never cull. Culling errs toward "intersecting";
-    /// containment errs toward "not contained". Don't "fix" either direction.
-    #[inline]
-    pub fn contains_dirs(&self, dirs: &[Vec3A]) -> bool {
-        for n in &self.normals {
-            if *n == Vec3A::ZERO {
-                return false;
-            }
-            for d in dirs {
-                if n.dot(*d) < 1e-5 {
-                    return false;
-                }
-            }
-        }
-        true
-    }
-
     /// Conservative: true only if the box is fully outside some side plane.
     /// False positives (box outside but not past a single plane) cost
     /// efficiency, never correctness.

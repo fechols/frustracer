@@ -5,26 +5,50 @@
 //! geometry (sky nodes prove their whole semi-infinite cone empty). With a
 //! static scene those proofs outlive the frame, so we cache one distance per
 //! node plus the frame's `CamBasis` and, next frame, harvest a `t_start` head
-//! start for each tile from an enclosing old frustum — pure cone geometry,
-//! no BVH traversal.
+//! start for each tile — pure projective geometry, no BVH traversal.
 //!
 //! Every entry is a *standalone* world-space claim: "no geometry on any
 //! frustum ray at parameter <= value" ≡ "frustum ∩ ball(origin, value) empty"
 //! (a frustum is the union of its apex rays). That holds even for entries that
 //! were themselves built on a temporal seed — each cross-frame hop only
-//! shrinks the claim (δ subtraction, 1e-4 shrink), never grows it, so error
-//! cannot accumulate in the unsafe direction.
+//! shrinks the claim, never grows it, so error cannot accumulate in the
+//! unsafe direction.
+//!
+//! The old quadtree PARTITIONS the direction sphere (within the old root
+//! cone) into frontier cells — the deepest non-NaN entry over each screen
+//! region. The consumer query is a *region min*: find every old cell the new
+//! tile's (tilt-widened) direction cone overlaps and take the minimum claim.
+//! This is what lets rotation reuse the cache: a panned tile straddling four
+//! old cells gets the min of four same-depth-quality bounds, where a
+//! containment-in-one-cell test (the v1 design) got nothing.
 
 use crate::camera::CamBasis;
 use crate::render::LEAF_TILE;
 use crate::stats::LocalStats;
+use glam::Vec3A;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
-/// How many old ancestor levels the containment walk tries per tile. A tile
-/// shares boundary planes with its parent (exact-zero dots, rejected by the
-/// strict margin), so translation passes typically land 2–3 levels up; deeper
-/// walks are dominated by what the tile already inherited from its parent.
-pub const WALK_MAX: u32 = 4;
+/// Outward padding (px) on the query bbox before selecting overlapped cells.
+/// Errs inclusive — extra cells only lower the min — and covers projection /
+/// bbox fp error (~1e-4 px) with two orders of margin.
+const PAD_Q: f32 = 0.5;
+
+/// Screen-acceptance tolerance (px): an extreme direction projecting farther
+/// than this outside the old screen means part of the tile's tail is covered
+/// by NO old claim → no reuse. Polarity is the OPPOSITE of PAD_Q: accepting
+/// too much is unsound. Must stay well below the producer's `aabb_outside`
+/// outward slack (~6e-3 px at this scale — old claims extend that far past
+/// the exact cone) and above projection round-trip noise (~4e-4 px). It is
+/// load-bearing: under pure forward dolly the new corner dirs are
+/// bit-identical to the old ones and project exactly onto the old screen
+/// boundary, so a strict test would reject the root — the biggest seed.
+const ACCEPT_PAD: f32 = 1e-3;
+
+/// Cells a single region-min query may visit. Degenerate queries (tiny
+/// t_start → huge tilt → near-screen-sized bbox) hit this and give up.
+/// Exceeding the budget must surface as "no reuse", NEVER as Sky — an
+/// unfinished scan's running min is not a valid claim.
+const VISIT_BUDGET: u32 = 128;
 
 /// One frame's quadtree bounds: a flat linear quadtree of f32 bit patterns.
 /// NaN = node not evaluated this frame, +INF = sky (whole cone empty),
@@ -33,13 +57,19 @@ pub const WALK_MAX: u32 = 4;
 /// Written with relaxed atomics — each node is written by exactly one rayon
 /// task per frame and read only on the *next* frame, across the thread-pool
 /// join (same happens-before argument as the accum buffer).
+///
+/// Frontier invariants the region-min query depends on (writer side):
+/// entries are stored BEFORE recursing into children, sky stores return
+/// without recursing, and the buffer is cleared before every producing frame
+/// — so a NaN entry implies its whole subtree is NaN (the parent is the
+/// frontier there), and a +INF entry has an all-NaN subtree.
 pub struct TemporalCache {
     nodes: Vec<AtomicU32>,
     /// offsets[d] = (4^d − 1) / 3, the start of level d.
     offsets: Vec<usize>,
     /// Deepest cached level (inclusive) — the deepest depth `tile_step` can
     /// run at for this resolution.
-    max_depth: u32,
+    pub max_depth: u32,
 }
 
 impl TemporalCache {
@@ -95,45 +125,36 @@ pub enum Seed {
 /// (rect, depth, path), whose rays already carry the inherited `t_start`.
 ///
 /// Identical basis (static camera): the same node's entry applies verbatim —
-/// same frustum, same origin, no shrink, no geometry. This is what makes
-/// accumulation frames cheap; under motion same-depth containment can never
-/// pass (shared boundary planes give exact-zero dots).
+/// same frustum, same origin, no shrink, no geometry. A NaN entry (below an
+/// old sky or depth-capped node) falls through to the general query, which
+/// finds the covering frontier ancestor.
 ///
 /// Moving camera — the segment decomposition. A new-ray point p(s) = o₁ + s·d
 /// must be proven empty for every s in (0, seed]:
 /// - s ≤ t_start is covered by the tile's own inherited claim
 ///   (F_new ∩ ball(o₁, t_start) is empty — a standalone claim of this frame).
-/// - s in [t_start, seed] is covered by the OLD node's claim if p is inside
-///   the old frustum and ball. Relative to the old origin,
-///   p − o₀ = s·(d + λ·t̂) with λ = δ/s ranging over [δ/seed, δ/t_start], so
-///   all such points lie in the conic hull of the 8 directions
-///   {dⱼ + λ_min·t̂, dⱼ + λ_max·t̂} over the 4 tile corners (bilinear in
-///   (λ, corner weights) — extremes at the parameter-box corners). A pure
-///   direction test, no apex condition. The ball part is
-///   |p − o₀| ≤ s + δ ≤ t₀, giving seed = (t₀ − δ)·(1 − 1e-4).
+/// - s in [t_start, seed]: relative to the old origin the point's direction
+///   is ∝ d + λ·t̂ with λ = δ/s ∈ (0, λ_max], λ_max = δ_safe/t_start — inside
+///   the conic hull of {corners} ∪ {corners + λ_max·t̂} (t_start == 0 makes
+///   λ_max = ∞, i.e. t̂ itself). No apex condition exists (requiring the new
+///   apex inside one old cone would demand the translation direction inside
+///   it — for a forward dolly that is the screen center, a cell corner at
+///   every depth, so nothing would ever pass).
 ///
-/// Both bounds of λ matter (found empirically by the --check dolly pass):
-/// - No apex condition: naive frustum-in-frustum containment requires the
-///   translation direction inside the old node's view cone — for a forward
-///   dolly that is the exact screen center, which is the quadtree's root
-///   split corner and lies on cell boundaries at EVERY depth, so nothing
-///   would ever pass.
-/// - λ_min > 0, not 0: the raw corner dirs are the s → ∞ limit, which the
-///   segment never reaches (it ends at seed). Testing them reintroduces
-///   exact-zero dots on every plane the tile shares with an old cell —
-///   e.g. the old root genuinely contains the dolly-translated root segment,
-///   and only the λ_min-tilted test can prove it. Sky candidates have no ball
-///   bound (seed = ∞), so λ_min = 0 falls out naturally for them.
-/// - t_start = 0 (the root): the segment starts at the apex, λ_max = ∞ —
-///   degenerates to testing t̂ itself alongside the λ_min-tilted corners.
+/// Coverage query: `CamBasis::project` of a positive combination of
+/// directions is an exact CONVEX combination of their projections (weights
+/// αᵢ(dᵢ·forward) — a gnomonic-projection identity; also scale-invariant, so
+/// the tilted dirs need no normalization). Hence projecting just the extreme
+/// dirs and padding their bbox conservatively covers the projection of every
+/// segment direction. Every old frontier cell whose rect intersects that box
+/// contributes its claim to the min m; each segment point then lies in some
+/// contributing cell's cone with |p − o₀| ≤ s + δ ≤ m ≤ its tc — inside its
+/// proven cone∩ball. All contributions +INF ⇒ the whole tail is inside
+/// fully-empty cones ⇒ Sky.
 ///
-/// The walk tests old nodes along the reprojected point's quadtree path from
-/// the tile's own depth upward (an old *deeper* cell is angularly smaller and
-/// can never contain the tile). First pass wins: tc is monotone nondecreasing
-/// with depth along the old chain and containment is upward-closed, so the
-/// deepest pass is the best available bound. Finite candidates whose seed
-/// cannot beat the inherited t_start are skipped without a test — in
-/// blocked-dominated scenes that is most of them.
+/// seed = (m − δ_safe)·(1 − 1e-4) for δ > 0 (the shrink protects only the δ
+/// subtraction); for δ = 0 the origins are bitwise equal and the claim
+/// transfers exactly: seed = m, no shrink — same as the verbatim path.
 pub fn lookup(
     prev: &TemporalCache,
     prev_cam: &CamBasis,
@@ -151,56 +172,16 @@ pub fn lookup(
 ) -> Seed {
     if prev_cam == cam {
         let t = prev.load(depth, path);
-        if t.is_nan() {
-            return Seed::None;
+        if !t.is_nan() {
+            return if t == f32::INFINITY { Seed::Sky } else { Seed::T(t) };
         }
-        return if t == f32::INFINITY { Seed::Sky } else { Seed::T(t) };
+        // NaN: below an old sky/capped node — the general query below finds
+        // the covering frontier ancestor (δ = 0 → exact transfer).
     }
 
-    // Reproject the tile's center direction into the old camera's screen.
-    let dc = cam.ray_dir((x0 + x1) as f32 * 0.5, (y0 + y1) as f32 * 0.5);
-    let (fx, fy) = match prev_cam.project(dc) {
-        Some(p) => p,
-        None => return Seed::None,
-    };
-    if fx < 0.0 || fx >= rw as f32 || fy < 0.0 || fy >= rh as f32 {
-        return Seed::None; // center left the old view — nothing can contain us
-    }
-
-    // Old-tree path containing (fx, fy) down to this tile's depth. This
-    // replays trace_tile's integer midpoint splits exactly (`xm = x0 + w/2`,
-    // quadrants TL=0 TR=1 BL=2 BR=3) and MUST stay in lockstep with them:
-    // only then does a cached path map back to the identical rect — and, with
-    // the cached basis, the bit-identical frustum — it was traced with.
-    let lo = depth.saturating_sub(WALK_MAX);
-    let mut paths = [0u32; 16];
-    let mut rects = [(0usize, 0usize, 0usize, 0usize); 16];
-    debug_assert!((depth as usize) < paths.len());
-    let (mut ox0, mut oy0, mut ox1, mut oy1) = (0usize, 0usize, rw, rh);
-    let mut opath = 0u32;
-    rects[0] = (ox0, oy0, ox1, oy1);
-    for k in 1..=depth {
-        let xm = ox0 + (ox1 - ox0) / 2;
-        let ym = oy0 + (oy1 - oy0) / 2;
-        let qx = (fx >= xm as f32) as u32;
-        let qy = (fy >= ym as f32) as u32;
-        if qx == 0 { ox1 = xm } else { ox0 = xm }
-        if qy == 0 { oy1 = ym } else { oy0 = ym }
-        opath = (opath << 2) | (qy << 1) | qx;
-        if k >= lo {
-            paths[k as usize] = opath;
-            rects[k as usize] = (ox0, oy0, ox1, oy1);
-        }
-    }
-
-    // Corner dirs of the new tile — same construction tile_frustum uses, so
-    // the cone we test is exactly the cone the tile traces. When the camera
-    // translated, each candidate tests the tilted copies from the segment
-    // decomposition (see the doc comment); pure rotation (δ = 0) needs the
-    // corners only. δ is inflated for its own f32 rounding (relative — both
-    // origins are the exact values their frames traced with); using the
-    // inflated value for λ_max and the plain value for λ_min only widens the
-    // tested cone, which is the safe direction.
+    // Extreme directions of the segment's direction hull, projected into the
+    // old screen. Corners use the same construction as tile_frustum — that
+    // identity is what makes the coverage exact.
     let corners = [
         cam.ray_dir(x0 as f32, y0 as f32),
         cam.ray_dir(x1 as f32, y0 as f32),
@@ -208,60 +189,155 @@ pub fn lookup(
         cam.ray_dir(x0 as f32, y1 as f32),
     ];
     let delta = (cam.origin - prev_cam.origin).length();
+    // Inflate δ for its own f32 rounding (relative — both origins are the
+    // exact values their frames traced with). Using the inflated value for
+    // λ_max only widens the tested hull: the safe direction.
     let delta_safe = delta + 1e-5 * delta;
-    let t_hat = if delta > 0.0 {
-        (cam.origin - prev_cam.origin) * (1.0 / delta)
+    let mut dirs = [Vec3A::ZERO; 8];
+    dirs[..4].copy_from_slice(&corners);
+    let ndirs = if delta > 0.0 {
+        let t_hat = (cam.origin - prev_cam.origin) * (1.0 / delta);
+        if t_start > 0.0 {
+            let lmax = delta_safe / t_start;
+            for j in 0..4 {
+                dirs[4 + j] = corners[j] + t_hat * lmax; // unnormalized: project is scale-invariant
+            }
+            8
+        } else {
+            dirs[4] = t_hat; // λ_max = ∞ — the segment starts at the apex
+            5
+        }
     } else {
-        glam::Vec3A::ZERO
+        4
     };
 
-    for k in (lo..=depth).rev() {
-        let t_old = prev.load(k, paths[k as usize]);
-        if t_old.is_nan() {
-            continue; // below an old sky/capped node — keep climbing
-        }
-        let seed = if t_old == f32::INFINITY {
-            f32::INFINITY
-        } else {
-            ((t_old - delta_safe) * (1.0 - 1e-4)).max(0.0)
+    let (mut bx0, mut by0, mut bx1, mut by1) = (f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for d in &dirs[..ndirs] {
+        let (fx, fy) = match prev_cam.project(*d) {
+            Some(p) => p,
+            None => return Seed::None, // behind the old image plane
         };
-        if seed <= t_start {
-            continue; // can't beat the inherited bound — not worth a test
+        if fx < -ACCEPT_PAD || fx > rw as f32 + ACCEPT_PAD || fy < -ACCEPT_PAD || fy > rh as f32 + ACCEPT_PAD {
+            return Seed::None; // part of the tail has no old claim
         }
-        let mut dirs = [glam::Vec3A::ZERO; 8];
-        let ndirs = if delta > 0.0 {
-            let lmin = delta / seed; // 0 for sky — its claim has no far end
-            for j in 0..4 {
-                dirs[j] = (corners[j] + t_hat * lmin).normalize();
-            }
-            if t_start > 0.0 {
-                let lmax = delta_safe / t_start;
-                for j in 0..4 {
-                    dirs[4 + j] = (corners[j] + t_hat * lmax).normalize();
-                }
-                8
-            } else {
-                // Segment starts at the apex: λ_max = ∞ is t̂ itself.
-                dirs[4] = t_hat;
-                5
-            }
-        } else {
-            dirs[..4].copy_from_slice(&corners);
-            4
-        };
-        let (rx0, ry0, rx1, ry1) = rects[k as usize];
-        let f_old = prev_cam.tile_frustum(rx0, ry0, rx1, ry1);
+        bx0 = bx0.min(fx);
+        by0 = by0.min(fy);
+        bx1 = bx1.max(fx);
+        by1 = by1.max(fy);
+    }
+    // Pad outward (inclusive-erring, sound), clamp to the screen for
+    // traversal only — cells tile exactly [0,rw]×[0,rh].
+    let q = (
+        (bx0 - PAD_Q).max(0.0),
+        (by0 - PAD_Q).max(0.0),
+        (bx1 + PAD_Q).min(rw as f32),
+        (by1 + PAD_Q).min(rh as f32),
+    );
+
+    let root_t = prev.load(0, 0);
+    if root_t.is_nan() {
+        // Never "contribute nothing": an empty min would read +INF = false
+        // sky. (Unreachable for a validly-produced prev buffer.)
+        return Seed::None;
+    }
+    // Exact usefulness threshold: m <= bail ⇔ seed <= t_start. Once the
+    // running min crosses it, neither a useful seed nor Sky is possible.
+    let bail = if delta > 0.0 { t_start / (1.0 - 1e-4) + delta_safe } else { t_start };
+    // Descend at most one level past the tile's own depth: an ancestor's
+    // claim is always valid for its whole region (tc is monotone
+    // nondecreasing down the old chain), so any cap is sound — deeper is
+    // only tighter. Measured: +2 resolved no additional sky in the check
+    // scene (the limiter is the real sky-boundary geometry, not frontier
+    // resolution) and cost ~3% more cells.
+    let cap = (depth + 1).min(prev.max_depth);
+    let mut budget = VISIT_BUDGET;
+    ls.temporal_tests += 1; // the root load
+    let m = match region_min(prev, root_t, 0, 0, (0, 0, rw, rh), q, cap, bail, &mut budget, ls) {
+        Some(m) => m,
+        None => return Seed::None, // budget blown: unfinished scan, no claim
+    };
+    if m == f32::INFINITY {
+        // Every overlapped old cone is fully empty (each a None query
+        // composed with its inherited ball claim) — so is our whole tail.
+        // The [0, t_start] prefix is the inherited claim's, as always.
+        return Seed::Sky;
+    }
+    let seed = if delta > 0.0 { (m - delta_safe) * (1.0 - 1e-4) } else { m };
+    if seed > t_start { Seed::T(seed) } else { Seed::None }
+}
+
+/// Min claim over the old cells intersecting query box `q`, descending from
+/// the cell (depth, path) with (non-NaN) entry `t` and rect `rect`.
+/// Returns None only when the visit budget is exhausted — an unfinished
+/// scan's running min must never be used (it could surface as false Sky).
+/// An early return at `m <= bail` is fine: the true min is even smaller and
+/// both map to "no useful seed".
+///
+/// The child rect arithmetic replays `trace_tile`'s integer midpoint splits
+/// exactly (`xm = x0 + w/2`, quadrants TL=0 TR=1 BL=2 BR=3) and MUST stay in
+/// lockstep with them: only then does a cached path map back to the identical
+/// rect — and, with the cached basis, the bit-identical frustum — it was
+/// traced with.
+#[allow(clippy::too_many_arguments)]
+fn region_min(
+    prev: &TemporalCache,
+    t: f32,
+    depth: u32,
+    path: u32,
+    rect: (usize, usize, usize, usize),
+    q: (f32, f32, f32, f32),
+    cap: u32,
+    bail: f32,
+    budget: &mut u32,
+    ls: &mut LocalStats,
+) -> Option<f32> {
+    if t == f32::INFINITY || depth >= cap {
+        // Sky frontier (subtree provably all-NaN) or the descent cap: this
+        // cell's own claim stands for its whole region.
+        return Some(t);
+    }
+    let (x0, y0, x1, y1) = rect;
+    let xm = x0 + (x1 - x0) / 2;
+    let ym = y0 + (y1 - y0) / 2;
+    let children = [
+        (0u32, (x0, y0, xm, ym)),
+        (1u32, (xm, y0, x1, ym)),
+        (2u32, (x0, ym, xm, y1)),
+        (3u32, (xm, ym, x1, y1)),
+    ];
+    let mut m = f32::INFINITY;
+    let mut contributed = false;
+    for (quad, cr) in children {
+        if cr.0 >= cr.2 || cr.1 >= cr.3 {
+            continue; // empty rect (degenerate 1-px split) covers nothing
+        }
+        // Closed overlap test: a query point on a shared edge belongs to both
+        // closed cell cones, and both must contribute.
+        if (cr.0 as f32) > q.2 || (cr.2 as f32) < q.0 || (cr.1 as f32) > q.3 || (cr.3 as f32) < q.1 {
+            continue;
+        }
+        if *budget == 0 {
+            return None;
+        }
+        *budget -= 1;
         ls.temporal_tests += 1;
-        if f_old.contains_dirs(&dirs[..ndirs]) {
-            if t_old == f32::INFINITY {
-                // Old node proved its whole cone empty (query None composed
-                // with its inherited ball claim): every tested segment point
-                // is inside that cone at *some* distance — all empty. The
-                // [0, t_start] prefix is the inherited claim's, as always.
-                return Seed::Sky;
-            }
-            return Seed::T(seed);
+        let ct = prev.load(depth + 1, (path << 2) | quad);
+        // NaN child: never evaluated, so THIS cell is the frontier there and
+        // its claim covers the child's region (store-before-recurse — see
+        // TemporalCache doc).
+        let cm = if ct.is_nan() {
+            t
+        } else {
+            region_min(prev, ct, depth + 1, (path << 2) | quad, cr, q, cap, bail, budget, ls)?
+        };
+        contributed = true;
+        m = m.min(cm);
+        if m <= bail {
+            return Some(m); // true min only smaller; still "no useful seed"
         }
     }
-    Seed::None
+    // Children exactly partition rect, so a nonempty rect ∩ q always has an
+    // overlapping child — an uncontributed min would be a false +INF.
+    debug_assert!(contributed, "region_min: no child overlapped a nonempty query");
+    if contributed { Some(m) } else { None }
 }
