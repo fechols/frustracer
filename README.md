@@ -65,6 +65,7 @@ the idiomatic safe shared buffer.
 ```
 cargo run --release                   # procedural scene (boxes, spheres, marble bunny, gold teapot)
 cargo run --release -- model.obj      # load an OBJ (auto-fitted onto the ground)
+cargo run --release -- --stress 5000  # perf test: field of n objects (boxes/spheres/bunnies/teapots)
 cargo run --release -- --check        # headless: verify vs reference, benchmark, write check.png
 cargo run --release -- --check-dlss   # headless: DLSS G-buffer MV/depth/matrix self-test
 cargo run --release -- --no-dlss      # skip Streamline; native D3D12 presentation

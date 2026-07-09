@@ -62,6 +62,7 @@ fn main() {
     };
     let mut check_dlss = false;
     let mut dlss_dump = false;
+    let mut stress: Option<usize> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -80,8 +81,20 @@ fn main() {
                     std::process::exit(2);
                 })
             }
+            "--stress" => {
+                stress = Some(
+                    args.next()
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .filter(|&n| n > 0)
+                        .unwrap_or_else(|| {
+                            eprintln!("--stress needs an object count, e.g. --stress 5000");
+                            std::process::exit(2);
+                        }),
+                )
+            }
             "--help" | "-h" => {
-                eprintln!("usage: frustracer [model.obj] [--check] [--check-dlss] [--dlss-dump] [--no-dlss] [--gpu-debug] [--sl-path <dir>]");
+                eprintln!("usage: frustracer [model.obj] [--stress <n>] [--check] [--check-dlss] [--dlss-dump] [--no-dlss] [--gpu-debug] [--sl-path <dir>]");
+                eprintln!("  --stress <n>  procedural stress field of n objects (perf test; composes with --check)");
                 eprintln!("  --check       headless: verify hybrid vs reference, benchmark, write check.png");
                 eprintln!("  --check-dlss  headless: G-buffer MV/depth/matrix self-test (no GPU needed)");
                 eprintln!("  --dlss-dump   --check-dlss plus G-buffer PNG dumps (albedo/normal/misc/mv)");
@@ -94,10 +107,23 @@ fn main() {
         }
     }
 
+    if obj.is_some() && stress.is_some() {
+        eprintln!("--stress and an OBJ path are mutually exclusive — pick one scene source");
+        std::process::exit(2);
+    }
+
     eprintln!("frustracer — loading scene...");
-    let scene = match &obj {
-        Some(p) => scene::load_obj_scene(p),
-        None => scene::procedural_scene(),
+    let scene = match (&obj, stress) {
+        (Some(p), _) => scene::load_obj_scene(p),
+        (None, Some(n)) => scene::stress_scene(n),
+        (None, None) => scene::procedural_scene(),
+    };
+    // The stress field keeps the default look direction but pulls the camera
+    // back/up to overlook the field; /8 (not the field half-extent itself)
+    // trades the nearest rows off the bottom of the frame for less sky.
+    let cam0 = match stress {
+        Some(n) => scaled_camera((scene::stress_field_half(n) / 8.0).max(1.0)),
+        None => default_camera(),
     };
     let t0 = Instant::now();
     let bvh = bvh::Bvh::build(&scene);
@@ -109,18 +135,18 @@ fn main() {
     );
 
     if check {
-        let code = run_check(&scene, &bvh);
+        let code = run_check(&scene, &bvh, cam0, stress.is_none());
         std::process::exit(code);
     }
     if check_dlss {
-        let code = run_check_dlss(&scene, &bvh, dlss_dump);
+        let code = run_check_dlss(&scene, &bvh, cam0, dlss_dump);
         std::process::exit(code);
     }
     #[cfg(windows)]
-    run_window(&scene, &bvh, &opts);
+    run_window(&scene, &bvh, &opts, cam0);
     #[cfg(not(windows))]
     {
-        let _ = &opts;
+        let _ = (&opts, cam0);
         eprintln!("the interactive window requires Windows (D3D12 + DLSS); use --check / --check-dlss");
         std::process::exit(2);
     }
@@ -131,7 +157,7 @@ fn main() {
 /// motion vectors, depth, and the camera matrices jointly by reconstructing
 /// world positions through both frames. No GPU or Streamline involved — this
 /// validates the CPU capture before/without the denoiser.
-fn run_check_dlss(scene: &scene::Scene, bvh: &bvh::Bvh, dump: bool) -> i32 {
+fn run_check_dlss(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, dump: bool) -> i32 {
     let (rw, rh) = (800usize, 600usize);
     let (near, far) = dlss::near_far(scene.diag);
     let q = Quality { shadow_samples: 1, ao_samples: 1, reflections: true };
@@ -158,10 +184,9 @@ fn run_check_dlss(scene: &scene::Scene, bvh: &bvh::Bvh, dump: bool) -> i32 {
     }
     eprintln!("halton/jitter checks: {}", if halton_ok { "OK" } else { "FAIL" });
 
-    // Frame A at the default camera; frame B a 0.02·diag forward dolly later,
+    // Frame A at the given camera; frame B a 0.02·diag forward dolly later,
     // with A as its previous frame. Zero jitter so samples sit on pixel
     // centers — the reconstruction in the self-test assumes centers.
-    let cam0 = default_camera();
     let basis_a = cam0.basis(rw, rh);
     let ga = dlss::GBufs::new(rw, rh);
     let gb = dlss::GBufs::new(rw, rh);
@@ -213,18 +238,27 @@ fn run_check_dlss(scene: &scene::Scene, bvh: &bvh::Bvh, dump: bool) -> i32 {
 }
 
 fn default_camera() -> Camera {
+    scaled_camera(1.0)
+}
+
+/// The default view pushed back along its own look direction: eye and target
+/// scale by `k`, so a `k`-times-wider scene gets the same framing.
+fn scaled_camera(k: f32) -> Camera {
     Camera::look_at(
-        Vec3A::new(11.0, 6.5, 13.0),
-        Vec3A::new(0.0, 1.2, 0.0),
+        Vec3A::new(11.0, 6.5, 13.0) * k,
+        Vec3A::new(0.0, 1.2 * k, 0.0),
         55f32.to_radians(),
     )
 }
 
 /// Headless end-to-end check: correctness counters (must be 0), an A/B
-/// benchmark of hybrid vs plain, and a rendered check.png.
-fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh) -> i32 {
+/// benchmark of hybrid vs plain, and a rendered check.png. `structural`
+/// additionally gates the scene-topology assertions (coarse pixels at fixed
+/// caps, temporal seeds/sky-tiles firing) — they are tuned to the default
+/// procedural scene; a `--stress` scene keeps only the scene-agnostic
+/// zero-counter invariants.
+fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: bool) -> i32 {
     let (rw, rh) = (800usize, 600usize);
-    let cam0 = default_camera();
     let cam = cam0.basis(rw, rh);
     let q = Quality::preset(2);
     let stats = Stats::default();
@@ -244,8 +278,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh) -> i32 {
         "verify capped d=4 ({} px): false-sky {} | tmin-overshoot {} | hybrid-extra {} | max rel t err {:.2e} | coarse px {}",
         rep_c.pixels, rep_c.false_sky, rep_c.overshoot, rep_c.hybrid_extra, rep_c.max_rel_err, rep_c.coarse
     );
-    let capped_ok = rep_c.ok() && rep_c.coarse > 0;
-    if rep_c.coarse == 0 {
+    let capped_ok = rep_c.ok() && (!structural || rep_c.coarse > 0);
+    if structural && rep_c.coarse == 0 {
         eprintln!("verify capped d=4: expected coarse pixels, found none — capped path not exercised");
     }
 
@@ -369,15 +403,15 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh) -> i32 {
             rep.pixels, rep.false_sky, rep.overshoot, rep.hybrid_extra, rep.max_rel_err, rep.coarse
         );
         let mut ok = rep.ok();
-        if want_seeds && seeds == 0 {
+        if structural && want_seeds && seeds == 0 {
             eprintln!("verify temporal {label}: expected temporal seeds > 0 — the path didn't fire");
             ok = false;
         }
-        if want_sky && sky == 0 {
+        if structural && want_sky && sky == 0 {
             eprintln!("verify temporal {label}: expected temporal sky-tiles > 0 — the sky path didn't fire");
             ok = false;
         }
-        if max_depth.is_some() && rep.coarse == 0 {
+        if structural && max_depth.is_some() && rep.coarse == 0 {
             eprintln!("verify temporal {label}: expected coarse pixels, found none — capped path not exercised");
             ok = false;
         }
@@ -480,7 +514,7 @@ fn sdl_hwnd(window: &sdl2::video::Window) -> windows::Win32::Foundation::HWND {
 }
 
 #[cfg(windows)]
-fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts) {
+fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     let sdl = sdl2::init().expect("SDL init failed");
     let video = sdl.video().expect("SDL video failed");
     let mut window = video
@@ -505,7 +539,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts) {
     )
     .expect("GPU init failed");
 
-    let mut cam = default_camera();
+    let mut cam = cam0;
     let accum: Vec<AtomicU32> = (0..W * H * 3).map(|_| AtomicU32::new(0)).collect();
     let info: Vec<AtomicU32> = (0..W * H).map(|_| AtomicU32::new(0)).collect();
     let tbuf: Vec<AtomicU32> = (0..W * H).map(|_| AtomicU32::new(0)).collect();

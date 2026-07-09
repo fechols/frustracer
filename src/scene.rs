@@ -294,6 +294,126 @@ pub fn procedural_scene() -> Scene {
     b.finish(default_light())
 }
 
+/// Grid pitch of the stress field (world units between object centers).
+const STRESS_SPACING: f32 = 2.2;
+
+/// Half-extent of the `--stress n` object field on x/z. Exported so `main.rs`
+/// can frame the camera without duplicating the grid math.
+pub fn stress_field_half(n: usize) -> f32 {
+    let side = (n as f32).sqrt().ceil().max(1.0);
+    side * STRESS_SPACING * 0.5
+}
+
+/// Performance stress field: exactly `n` objects on a jittered grid — mostly
+/// boxes and low-poly spheres, plus evenly spread marble bunnies and steel
+/// teapots (capped at 256 mesh instances: there is no instancing, every mesh
+/// is duplicated geometry). Deterministic — same sin-hash idiom as
+/// `procedural_scene`, no RNG — so `--check --stress n` is reproducible.
+pub fn stress_scene(n: usize) -> Scene {
+    let mut b = SceneBuilder::new();
+    let side = (n as f32).sqrt().ceil().max(1.0) as usize;
+    let fh = stress_field_half(n);
+
+    let ground = b.material(Vec3A::new(0.42, 0.46, 0.40), 0.55, 0.0);
+    let s = fh + 6.0;
+    b.quad(
+        Vec3A::new(-s, 0.0, -s),
+        Vec3A::new(-s, 0.0, s),
+        Vec3A::new(s, 0.0, s),
+        Vec3A::new(s, 0.0, -s),
+        ground,
+    );
+
+    let palette = [
+        Vec3A::new(0.85, 0.30, 0.25),
+        Vec3A::new(0.90, 0.65, 0.20),
+        Vec3A::new(0.30, 0.60, 0.85),
+        Vec3A::new(0.45, 0.75, 0.35),
+        Vec3A::new(0.75, 0.45, 0.80),
+    ];
+    // Shared materials up-front (one per look, not one per object).
+    let rough: Vec<u32> = palette.iter().map(|&c| b.material(c, 0.90, 0.0)).collect();
+    let glossy: Vec<u32> = palette.iter().map(|&c| b.material(c, 0.30, 0.0)).collect();
+    let mirror = b.material(Vec3A::new(0.95, 0.95, 0.95), 0.05, 1.0);
+    let marble = b.material_kind(
+        Vec3A::new(0.93, 0.92, 0.90),
+        0.35,
+        0.0,
+        0.0,
+        MatKind::Marble { scale: 2.4 },
+    );
+    let steel = b.material_kind(Vec3A::new(0.97, 0.96, 0.93), 0.30, 1.0, 0.8, MatKind::Diffuse);
+
+    // Meshes go on an even stride so the cap never starves part of the field.
+    let mesh_target = (n / 50).min(256);
+    let mesh_stride = if mesh_target > 0 { n.div_ceil(mesh_target) } else { usize::MAX };
+    let bunny = embedded_obj(include_bytes!("../assets/bunny.obj"));
+    let teapot = embedded_obj(include_bytes!("../assets/teapot.obj"));
+
+    // Deterministic hash-ish variation, same idiom as `procedural_scene`.
+    let hv = |i: usize, k: f32| (((i as f32 + 1.0) * k).sin() * 43758.5453).fract().abs();
+
+    let (mut boxes, mut spheres, mut bunnies, mut teapots) = (0usize, 0usize, 0usize, 0usize);
+    for i in 0..n {
+        let (gx, gz) = (i % side, i / side);
+        let (h1, h2, h3) = (hv(i, 12.9898), hv(i, 78.2330), hv(i, 39.4250));
+        let x = (gx as f32 - (side as f32 - 1.0) * 0.5) * STRESS_SPACING + (h2 - 0.5) * 0.7;
+        let z = (gz as f32 - (side as f32 - 1.0) * 0.5) * STRESS_SPACING + (h3 - 0.5) * 0.7;
+
+        if mesh_stride != usize::MAX && i % mesh_stride == mesh_stride / 2 {
+            if (bunnies + teapots) % 2 == 0 {
+                add_obj_models(&mut b, &bunny, |_| marble, 2.5, Vec3A::new(x, 0.0, z));
+                bunnies += 1;
+            } else {
+                add_obj_models(&mut b, &teapot, |_| steel, 2.5, Vec3A::new(x, 0.0, z));
+                teapots += 1;
+            }
+            continue;
+        }
+
+        let mat = if h3 > 0.97 {
+            mirror
+        } else if h3 > 0.94 {
+            marble
+        } else if h1 > 0.82 {
+            glossy[(gx + 2 * gz) % 5]
+        } else {
+            rough[(gx + 2 * gz) % 5]
+        };
+        if h2 < 0.65 {
+            let h = 0.5 + 2.2 * h1;
+            let half = 0.4 + 0.5 * h3;
+            b.add_box(Vec3A::new(x, h * 0.5, z), Vec3A::new(half, h * 0.5, half), mat);
+            boxes += 1;
+        } else {
+            let r = 0.35 + 0.45 * h1;
+            b.add_sphere(Vec3A::new(x, r, z), r, mat, 10, 5);
+            spheres += 1;
+        }
+    }
+
+    // The default light, pushed out and brightened to cover the field
+    // (1/d² falloff → color scales with k²). Direction is preserved, so
+    // `render::sun_dir` (light.center normalized) is unchanged.
+    let k = (fh / 6.0).max(1.0);
+    let base = default_light();
+    let light = AreaLight {
+        center: base.center * k,
+        u: base.u * k,
+        v: base.v * k,
+        color: base.color * (k * k),
+    };
+
+    let scene = b.finish(light);
+    eprintln!(
+        "stress scene: {n} objects ({boxes} boxes, {spheres} spheres, {bunnies} bunnies, {teapots} teapots) | {} tris | field {:.0}x{:.0}",
+        scene.tri_count(),
+        fh * 2.0,
+        fh * 2.0
+    );
+    scene
+}
+
 /// Load an OBJ, auto-fit it (centered on x/z, resting on y=0, diagonal = 10),
 /// and drop it onto the standard ground plane + light.
 pub fn load_obj_scene(path: &str) -> Scene {
