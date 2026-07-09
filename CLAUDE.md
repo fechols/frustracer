@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A "frustracer" — a frustum-tracer. The screen is a quadtree: each tile's frustum is traced against a BVH for a conservative nearest-possible-hit distance; on contact the tile splits into 4 children that inherit that distance as their ray `tmin` **and a node cut** (the parent's surviving BVH nodes, refined by `frustum::refine_cut`), bottoming out at 8×8 tiles of per-pixel rays seeded from the cut (`Bvh::intersect_multi`). Tiles whose frustum hits nothing are filled with sky (zero rays). While the camera moves, the same depth-first recursion runs to a **uniform depth cap** estimated each frame from the previous frame's time against a ~30 ms budget; tiles reaching the cap unresolved are flat-filled (dynamic resolution). See README.md for the algorithm write-up.
+A "frustracer" — a frustum-tracer. The screen is a quadtree: each tile's frustum is traced against a BVH for a conservative nearest-possible-hit distance; on contact the tile splits into 4 children that inherit that distance as their ray `tmin` **and a node cut** (the parent's surviving BVH nodes, refined by `frustum::refine_cut`), bottoming out at 8×8 tiles of per-pixel rays seeded from the cut (`Bvh::intersect_multi`). Tiles whose frustum hits nothing are filled with sky (zero rays). While the camera moves, the same depth-first recursion runs to a **uniform depth cap** estimated each frame from the previous frame's time against a ~15 ms budget; tiles reaching the cap unresolved are flat-filled (dynamic resolution). See README.md for the algorithm write-up.
 
 ## Commands
 

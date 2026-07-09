@@ -26,13 +26,13 @@ use std::time::{Duration, Instant};
 const W: usize = 1024;
 const H: usize = 768;
 const MAX_SAMPLES: u32 = 1024;
-/// Frame budget for dynamic-resolution mode: 30 FPS minus resolve/present
+/// Frame budget for dynamic-resolution mode: 60 FPS minus resolve/present
 /// headroom. Not a per-tile deadline: a log4-proportional controller turns the
 /// previous frame's time against this target into a uniform quadtree depth cap
 /// for the next frame; tiles reaching the cap unresolved become single
 /// flat-shaded quads. Cost roughly quadruples per level, so
 /// log4(budget/elapsed) reads "levels of headroom" directly.
-const RENDER_BUDGET: Duration = Duration::from_millis(30);
+const RENDER_BUDGET: Duration = Duration::from_millis(15);
 /// Controller gain on the log4 error.
 const DEPTH_GAIN: f32 = 0.6;
 /// Max upward step per frame — creep up (>= 3 frames per level)...

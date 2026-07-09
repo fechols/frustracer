@@ -1,8 +1,29 @@
 use glam::Vec3A;
+use std::collections::HashMap;
 
+/// How a material derives its albedo. Reflection behavior is fully described
+/// by the metallic/roughness/anisotropy parameters (the old `Metal` variant is
+/// subsumed by Fresnel: F0 = lerp(0.04, albedo, metallic)).
+#[derive(Clone, Copy, PartialEq)]
+pub enum MatKind {
+    /// Constant albedo.
+    Diffuse,
+    /// Procedural marble: albedo from world-space fBm veining (`shade::marble`);
+    /// `scale` is the feature frequency in world units.
+    Marble { scale: f32 },
+}
+
+/// Metallic/roughness PBR material (GGX microfacet; see `shade.rs`).
 pub struct Material {
     pub albedo: Vec3A,
-    pub reflectivity: f32,
+    /// Perceptual roughness; the GGX code squares it (α = roughness²).
+    pub roughness: f32,
+    /// 0 = dielectric (F0 = 0.04), 1 = metal (F0 = albedo, no diffuse).
+    pub metallic: f32,
+    /// 0 = isotropic; > 0 stretches the GGX lobe along the tangent
+    /// (circumferential around world-up — a lathe-spun / brushed finish).
+    pub anisotropy: f32,
+    pub kind: MatKind,
 }
 
 /// Rectangular area light: `center ± u ± v`, radiant intensity `color` (falls off 1/d²).
@@ -52,8 +73,19 @@ impl SceneBuilder {
         }
     }
 
-    pub fn material(&mut self, albedo: Vec3A, reflectivity: f32) -> u32 {
-        self.materials.push(Material { albedo, reflectivity });
+    pub fn material(&mut self, albedo: Vec3A, roughness: f32, metallic: f32) -> u32 {
+        self.material_kind(albedo, roughness, metallic, 0.0, MatKind::Diffuse)
+    }
+
+    pub fn material_kind(
+        &mut self,
+        albedo: Vec3A,
+        roughness: f32,
+        metallic: f32,
+        anisotropy: f32,
+        kind: MatKind,
+    ) -> u32 {
+        self.materials.push(Material { albedo, roughness, metallic, anisotropy, kind });
         (self.materials.len() - 1) as u32
     }
 
@@ -127,7 +159,16 @@ impl SceneBuilder {
         mat: u32,
     ) {
         if normals.len() != positions.len() {
-            normals = vec![Vec3A::ZERO; positions.len()];
+            // Accumulate by *position*, not index: patch-tessellated meshes
+            // (the Utah teapot) duplicate the vertices along patch borders,
+            // and per-index averaging would leave a one-sided normal on each
+            // side of every seam. Exact-bit keys suffice — duplicates come
+            // from identical source text. (+0.0 normalized so -0.0 welds.)
+            let key = |p: Vec3A| {
+                let q = |f: f32| if f == 0.0 { 0u32 } else { f.to_bits() };
+                [q(p.x), q(p.y), q(p.z)]
+            };
+            let mut acc: HashMap<[u32; 3], Vec3A> = HashMap::new();
             for tri in indices {
                 let [a, b, c] = *tri;
                 let (pa, pb, pc) = (
@@ -136,13 +177,16 @@ impl SceneBuilder {
                     positions[c as usize],
                 );
                 let face_n = (pb - pa).cross(pc - pa); // area-weighted (unnormalized)
-                normals[a as usize] += face_n;
-                normals[b as usize] += face_n;
-                normals[c as usize] += face_n;
+                for p in [pa, pb, pc] {
+                    *acc.entry(key(p)).or_insert(Vec3A::ZERO) += face_n;
+                }
             }
-            for n in &mut normals {
-                *n = n.normalize_or_zero();
-            }
+            // Unreferenced vertices (no triangle) fall back to zero — shade()
+            // substitutes the face normal for zero normals anyway.
+            normals = positions
+                .iter()
+                .map(|p| acc.get(&key(*p)).copied().unwrap_or(Vec3A::ZERO).normalize_or_zero())
+                .collect();
         }
         let base = self.positions.len() as u32;
         self.positions.extend_from_slice(&positions);
@@ -184,11 +228,13 @@ fn default_light() -> AreaLight {
     }
 }
 
-/// Ground plane + a grid of boxes + three spheres. Deterministic, ~7k triangles.
+/// Ground plane + a grid of boxes + three spheres + a marble Stanford Bunny
+/// and a stainless Utah teapot (both embedded in the binary). Deterministic,
+/// ~83k triangles.
 pub fn procedural_scene() -> Scene {
     let mut b = SceneBuilder::new();
 
-    let ground = b.material(Vec3A::new(0.42, 0.46, 0.40), 0.08);
+    let ground = b.material(Vec3A::new(0.42, 0.46, 0.40), 0.55, 0.0);
     let s = 60.0;
     b.quad(
         Vec3A::new(-s, 0.0, -s),
@@ -215,18 +261,35 @@ pub fn procedural_scene() -> Scene {
             let h = 0.5 + 2.2 * fr;
             let x = (gx as f32 - 2.0) * 2.5;
             let z = (gz as f32 - 2.0) * 2.5;
-            let refl = if fr > 0.82 { 0.30 } else { 0.0 };
-            let mat = b.material(palette[((gx + 2 * gz) % 5) as usize], refl);
+            let rough = if fr > 0.82 { 0.30 } else { 0.90 };
+            let mat = b.material(palette[((gx + 2 * gz) % 5) as usize], rough, 0.0);
             b.add_box(Vec3A::new(x, h * 0.5, z), Vec3A::new(0.8, h * 0.5, 0.8), mat);
         }
     }
 
-    let mirror = b.material(Vec3A::new(0.95, 0.95, 0.95), 0.85);
+    let mirror = b.material(Vec3A::new(0.95, 0.95, 0.95), 0.05, 1.0);
     b.add_sphere(Vec3A::new(-7.5, 1.5, 2.0), 1.5, mirror, 40, 20);
-    let red = b.material(Vec3A::new(0.85, 0.15, 0.12), 0.0);
+    let red = b.material(Vec3A::new(0.85, 0.15, 0.12), 0.85, 0.0);
     b.add_sphere(Vec3A::new(7.0, 1.2, -1.0), 1.2, red, 36, 18);
-    let glossy = b.material(Vec3A::new(0.20, 0.35, 0.80), 0.30);
+    let glossy = b.material(Vec3A::new(0.20, 0.35, 0.80), 0.25, 0.0);
     b.add_sphere(Vec3A::new(2.0, 0.9, 7.5), 0.9, glossy, 32, 16);
+
+    // Marble Stanford Bunny, front of the grid (grid ends at |x|,|z| = 5.8).
+    let marble = b.material_kind(
+        Vec3A::new(0.93, 0.92, 0.90),
+        0.35,
+        0.0,
+        0.0,
+        MatKind::Marble { scale: 2.4 },
+    );
+    let bunny = embedded_obj(include_bytes!("../assets/bunny.obj"));
+    add_obj_models(&mut b, &bunny, |_| marble, 3.5, Vec3A::new(5.5, 0.0, 6.5));
+
+    // Brushed-stainless Utah teapot, right of the grid near the red sphere:
+    // metal, moderate roughness, strongly anisotropic (lathe-spun finish).
+    let steel = b.material_kind(Vec3A::new(0.97, 0.96, 0.93), 0.30, 1.0, 0.8, MatKind::Diffuse);
+    let teapot = embedded_obj(include_bytes!("../assets/teapot.obj"));
+    add_obj_models(&mut b, &teapot, |_| steel, 3.0, Vec3A::new(7.5, 0.0, 3.5));
 
     b.finish(default_light())
 }
@@ -246,7 +309,7 @@ pub fn load_obj_scene(path: &str) -> Scene {
     let obj_mats = materials_res.unwrap_or_default();
 
     let mut b = SceneBuilder::new();
-    let ground = b.material(Vec3A::new(0.42, 0.46, 0.40), 0.08);
+    let ground = b.material(Vec3A::new(0.42, 0.46, 0.40), 0.55, 0.0);
     let s = 60.0;
     b.quad(
         Vec3A::new(-s, 0.0, -s),
@@ -256,30 +319,55 @@ pub fn load_obj_scene(path: &str) -> Scene {
         ground,
     );
 
-    let default_mat = b.material(Vec3A::new(0.70, 0.70, 0.72), 0.0);
+    let default_mat = b.material(Vec3A::new(0.70, 0.70, 0.72), 0.8, 0.0);
     let mat_map: Vec<u32> = obj_mats
         .iter()
         .map(|m| {
             let kd = m.diffuse.unwrap_or([0.7, 0.7, 0.7]);
-            b.material(Vec3A::from_array(kd), 0.0)
+            b.material(Vec3A::from_array(kd), 0.8, 0.0)
         })
         .collect();
 
+    add_obj_models(
+        &mut b,
+        &models,
+        |mesh| {
+            mesh.material_id
+                .and_then(|id| mat_map.get(id).copied())
+                .unwrap_or(default_mat)
+        },
+        10.0,
+        Vec3A::ZERO,
+    );
+
+    b.finish(default_light())
+}
+
+/// Fit `models` to a bounding diagonal of `target_diag` — centered on x/z,
+/// resting on y = 0 — translate by `offset`, and add every mesh to the
+/// builder. `mat_for` picks the material id per mesh.
+fn add_obj_models(
+    b: &mut SceneBuilder,
+    models: &[tobj::Model],
+    mat_for: impl Fn(&tobj::Mesh) -> u32,
+    target_diag: f32,
+    offset: Vec3A,
+) {
     // Pass 1: model bounds for the fit transform.
     let mut mn = Vec3A::splat(f32::INFINITY);
     let mut mx = Vec3A::splat(f32::NEG_INFINITY);
-    for m in &models {
+    for m in models {
         for p in m.mesh.positions.chunks_exact(3) {
             let v = Vec3A::new(p[0], p[1], p[2]);
             mn = mn.min(v);
             mx = mx.max(v);
         }
     }
-    let scale = 10.0 / (mx - mn).length().max(1e-6);
+    let scale = target_diag / (mx - mn).length().max(1e-6);
     let center = (mn + mx) * 0.5;
-    let xform = |p: Vec3A| (p - Vec3A::new(center.x, mn.y, center.z)) * scale;
+    let xform = |p: Vec3A| (p - Vec3A::new(center.x, mn.y, center.z)) * scale + offset;
 
-    for m in &models {
+    for m in models {
         let mesh = &m.mesh;
         let positions: Vec<Vec3A> = mesh
             .positions
@@ -296,12 +384,22 @@ pub fn load_obj_scene(path: &str) -> Scene {
             .chunks_exact(3)
             .map(|i| [i[0], i[1], i[2]])
             .collect();
-        let mat = mesh
-            .material_id
-            .and_then(|id| mat_map.get(id).copied())
-            .unwrap_or(default_mat);
-        b.add_mesh(positions, normals, &indices, mat);
+        b.add_mesh(positions, normals, &indices, mat_for(mesh));
     }
+}
 
-    b.finish(default_light())
+/// Parse an OBJ embedded in the binary (no MTL: the loader closure returns
+/// empty materials).
+fn embedded_obj(bytes: &[u8]) -> Vec<tobj::Model> {
+    let (models, _) = tobj::load_obj_buf(
+        &mut &bytes[..],
+        &tobj::LoadOptions {
+            triangulate: true,
+            single_index: true,
+            ..Default::default()
+        },
+        |_| Ok((Vec::new(), Default::default())),
+    )
+    .expect("embedded OBJ is valid");
+    models
 }

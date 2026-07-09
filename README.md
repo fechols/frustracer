@@ -63,7 +63,7 @@ the idiomatic safe shared buffer.
 ## Running
 
 ```
-cargo run --release                   # procedural scene (boxes, spheres, mirror)
+cargo run --release                   # procedural scene (boxes, spheres, marble bunny, gold teapot)
 cargo run --release -- model.obj      # load an OBJ (auto-fitted onto the ground)
 cargo run --release -- --check        # headless: verify vs reference, benchmark, write check.png
 cargo run --release -- --check-dlss   # headless: DLSS G-buffer MV/depth/matrix self-test
@@ -101,10 +101,10 @@ presentation; building never needs them.
 | **P** | screenshot (in DLSS mode: reads the denoised output back from the GPU) |
 | Esc | quit |
 
-## Dynamic resolution (30 FPS target)
+## Dynamic resolution (60 FPS target)
 
-While the camera moves, each frame targets a time budget (~30 ms render +
-resolve/present headroom ≈ 30 FPS). The budget is not a per-tile deadline:
+While the camera moves, each frame targets a time budget (~15 ms render +
+resolve/present headroom ≈ 60 FPS). The budget is not a per-tile deadline:
 a controller converts the *previous* frame's measured time into a **uniform
 quadtree depth cap** for the next frame, and the same depth-first recursion as
 the normal driver runs everywhere to that cap. Tiles reaching it unresolved

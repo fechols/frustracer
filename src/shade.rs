@@ -1,5 +1,5 @@
 use crate::bvh::{Bvh, Hit, Ray};
-use crate::scene::Scene;
+use crate::scene::{MatKind, Scene};
 use glam::Vec3A;
 
 #[derive(Clone, Copy)]
@@ -42,9 +42,11 @@ pub struct PrimarySurface {
     /// Raw material albedo (the diffuse/specular split happens at the
     /// G-buffer write site).
     pub albedo: Vec3A,
-    pub reflectivity: f32,
-    /// Mirror-reflection ray hit t; INFINITY when the reflection ray missed;
-    /// 0.0 when no reflection was traced.
+    /// Perceptual roughness and metalness, straight from the material.
+    pub roughness: f32,
+    pub metallic: f32,
+    /// Specular-reflection ray hit t; INFINITY when the reflection ray
+    /// missed; 0.0 when no reflection was traced.
     pub spec_t: f32,
 }
 
@@ -88,12 +90,57 @@ pub fn shade(
     }
     let p = ray.o + ray.d * hit.t + n * scene.eps;
     let mat = &scene.materials[scene.tri_mat[hit.tri as usize] as usize];
+    // Effective albedo: constant, except marble which is evaluated at the
+    // world-space hit point (models are static, so world space is stable).
+    let albedo = match mat.kind {
+        MatKind::Marble { scale } => marble(ray.o + ray.d * hit.t, scale),
+        _ => mat.albedo,
+    };
     if let Some(prim) = prim.as_deref_mut() {
-        *prim = PrimarySurface { n, albedo: mat.albedo, reflectivity: mat.reflectivity, spec_t: 0.0 };
+        *prim = PrimarySurface {
+            n,
+            albedo,
+            roughness: mat.roughness,
+            metallic: mat.metallic,
+            spec_t: 0.0,
+        };
     }
 
-    // Direct light: N samples on the area light.
-    let mut direct = Vec3A::ZERO;
+    // Metallic/roughness lobes: F0 = 4% dielectric base lerped to albedo for
+    // metals; the diffuse lobe fades out as metalness rises.
+    let f0 = Vec3A::splat(0.04).lerp(albedo, mat.metallic);
+    let kd = albedo * (1.0 - mat.metallic);
+    // Tangent frame for the microfacet lobes. Anisotropic materials brush
+    // circumferentially around world-up (a lathe-spun body); the onb fallback
+    // covers the poles and all isotropic materials (frame arbitrary there).
+    let (t1, t2) = if mat.anisotropy > 0.0 {
+        let t = Vec3A::Y.cross(n);
+        if t.length_squared() > 1e-8 {
+            let t = t.normalize();
+            (t, n.cross(t))
+        } else {
+            onb(n)
+        }
+    } else {
+        onb(n)
+    };
+    let to_local = |w: Vec3A| Vec3A::new(w.dot(t1), w.dot(t2), w.dot(n));
+    let (ax, ay) = ggx_alphas(mat.roughness, mat.anisotropy);
+    let v = -ray.d;
+    let vl = {
+        let mut l = to_local(v);
+        l.z = l.z.max(1e-4); // face-flip guarantees n·v >= 0; guard grazing
+        l
+    };
+    let lambda_v = ggx_lambda(vl, ax, ay);
+
+    // Direct light: N samples on the area light, Lambert diffuse +
+    // Cook-Torrance GGX specular per sample. The renderer's convention omits
+    // Lambert's 1/π (the light intensity absorbs it), so the specular term
+    // carries the compensating π — the diffuse:specular ratio stays physical
+    // without retuning scene brightness.
+    let mut direct_d = Vec3A::ZERO;
+    let mut direct_s = Vec3A::ZERO;
     for _ in 0..q.shadow_samples {
         let lp = scene.light.center
             + scene.light.u * (rng.f32() * 2.0 - 1.0)
@@ -108,11 +155,22 @@ pub fn shade(
         }
         *rays += 1;
         if !bvh.occluded(scene, &Ray::new(p, wi), 0.0, dist - scene.eps, visits) {
-            direct += scene.light.color * (ndl / dist2);
+            let li = scene.light.color * (ndl / dist2);
+            direct_d += li;
+            let h = (wi + v).normalize_or_zero();
+            let hl = to_local(h);
+            if hl.z > 0.0 {
+                let d = ggx_ndf(hl, ax, ay);
+                let g2 = 1.0 / (1.0 + lambda_v + ggx_lambda(to_local(wi), ax, ay));
+                let f = schlick(f0, wi.dot(h).max(0.0));
+                // li carries ndl; D·G2·F/(4·nv·nl)·nl leaves /(4·nv).
+                direct_s += li * f * (std::f32::consts::PI * d * g2 / (4.0 * vl.z * ndl));
+            }
         }
     }
     if q.shadow_samples > 0 {
-        direct /= q.shadow_samples as f32;
+        direct_d /= q.shadow_samples as f32;
+        direct_s /= q.shadow_samples as f32;
     }
 
     // Ambient occlusion: short cosine-hemisphere rays.
@@ -134,33 +192,149 @@ pub fn shade(
         ao = open as f32 / q.ao_samples as f32;
     }
 
-    let mut color = mat.albedo * (direct + AMBIENT * ao);
+    // Ambient stays diffuse-only; metals get their environment from the
+    // specular bounce ray below.
+    let mut color = kd * (direct_d + AMBIENT * ao) + direct_s;
 
-    // One reflection bounce.
-    if q.reflections && mat.reflectivity > 0.0 && depth == 0 {
-        let rdir = (ray.d - n * (2.0 * ray.d.dot(n))).normalize();
-        let rray = Ray::new(p, rdir);
-        *rays += 1;
-        let rcol = match bvh.intersect(scene, &rray, 0.0, f32::INFINITY, visits) {
-            Some(rh) => {
-                if let Some(prim) = prim.as_deref_mut() {
-                    prim.spec_t = rh.t;
-                }
-                // The recursive call gets None: only the primary surface is
-                // ever captured.
-                shade(scene, bvh, &rray, &rh, q, rng, sun, depth + 1, rays, visits, None)
-            }
-            None => {
-                if let Some(prim) = prim.as_deref_mut() {
-                    prim.spec_t = f32::INFINITY;
-                }
-                sky(rdir, sun)
-            }
+    // One specular bounce: a single direction importance-sampled from the
+    // anisotropic GGX VNDF (Heitz 2018), so glossy surfaces see a blurred
+    // environment that accumulation / DLSS-RR converges. Throughput is
+    // F·G2/G1 (≤ 1 per channel — no fireflies possible). roughness → 0
+    // degenerates to the old exact mirror. The gate skips near-Lambertian
+    // dielectrics whose specular contribution wouldn't justify a ray.
+    if q.reflections && depth == 0 && (mat.metallic > 0.04 || mat.roughness < 0.45) {
+        let vh = Vec3A::new(ax * vl.x, ay * vl.y, vl.z).normalize();
+        let lensq = vh.x * vh.x + vh.y * vh.y;
+        let b1 = if lensq > 0.0 {
+            Vec3A::new(-vh.y, vh.x, 0.0) / lensq.sqrt()
+        } else {
+            Vec3A::X
         };
-        color = color.lerp(rcol, mat.reflectivity);
+        let b2 = vh.cross(b1);
+        let r = rng.f32().sqrt();
+        let phi = std::f32::consts::TAU * rng.f32();
+        let p1 = r * phi.cos();
+        let mut p2 = r * phi.sin();
+        let s = 0.5 * (1.0 + vh.z);
+        p2 = (1.0 - s) * (1.0 - p1 * p1).max(0.0).sqrt() + s * p2;
+        let nh = b1 * p1 + b2 * p2 + vh * (1.0 - p1 * p1 - p2 * p2).max(0.0).sqrt();
+        let hl = Vec3A::new(ax * nh.x, ay * nh.y, nh.z.max(1e-6)).normalize();
+        let h = t1 * hl.x + t2 * hl.y + n * hl.z;
+        let rdir = (2.0 * v.dot(h) * h - v).normalize();
+        // Below-horizon samples are dropped (spec_t stays 0.0 = "no
+        // reflection traced"), slightly darkening instead of biasing up.
+        if rdir.dot(n) > 0.0 {
+            let g2_over_g1 = (1.0 + lambda_v)
+                / (1.0 + lambda_v + ggx_lambda(to_local(rdir), ax, ay));
+            let tput = schlick(f0, v.dot(h).max(0.0)) * g2_over_g1;
+            let rray = Ray::new(p, rdir);
+            *rays += 1;
+            let rcol = match bvh.intersect(scene, &rray, 0.0, f32::INFINITY, visits) {
+                Some(rh) => {
+                    if let Some(prim) = prim.as_deref_mut() {
+                        prim.spec_t = rh.t;
+                    }
+                    // The recursive call gets None: only the primary surface
+                    // is ever captured.
+                    shade(scene, bvh, &rray, &rh, q, rng, sun, depth + 1, rays, visits, None)
+                }
+                None => {
+                    if let Some(prim) = prim.as_deref_mut() {
+                        prim.spec_t = f32::INFINITY;
+                    }
+                    sky(rdir, sun)
+                }
+            };
+            color += tput * rcol;
+        }
     }
 
     color
+}
+
+/// GGX α from perceptual roughness + Disney-style anisotropy split. The
+/// floor keeps the NDF finite for near-mirror materials.
+#[inline(always)]
+fn ggx_alphas(roughness: f32, anisotropy: f32) -> (f32, f32) {
+    const MIN_ALPHA: f32 = 5e-3;
+    let alpha = roughness * roughness;
+    let aspect = (1.0 - 0.9 * anisotropy).sqrt();
+    ((alpha / aspect).max(MIN_ALPHA), (alpha * aspect).max(MIN_ALPHA))
+}
+
+/// Smith Λ for anisotropic GGX; `w` is in tangent space with w.z > 0.
+/// G1 = 1/(1+Λ), height-correlated G2 = 1/(1+Λv+Λl).
+#[inline(always)]
+fn ggx_lambda(w: Vec3A, ax: f32, ay: f32) -> f32 {
+    let t = ((ax * w.x) * (ax * w.x) + (ay * w.y) * (ay * w.y)) / (w.z * w.z);
+    ((1.0 + t).sqrt() - 1.0) * 0.5
+}
+
+/// Anisotropic GGX NDF; `h` is the half vector in tangent space.
+#[inline(always)]
+fn ggx_ndf(h: Vec3A, ax: f32, ay: f32) -> f32 {
+    let hx = h.x / ax;
+    let hy = h.y / ay;
+    let d = hx * hx + hy * hy + h.z * h.z;
+    1.0 / (std::f32::consts::PI * ax * ay * d * d)
+}
+
+/// Schlick Fresnel.
+#[inline(always)]
+fn schlick(f0: Vec3A, cos: f32) -> Vec3A {
+    f0 + (Vec3A::ONE - f0) * (1.0 - cos).clamp(0.0, 1.0).powi(5)
+}
+
+/// Procedural marble: white base cut by thin dark veins where a
+/// turbulence-perturbed sine crosses zero. Deterministic (hash-based value
+/// noise), evaluated in world space; `scale` sets the feature frequency.
+fn marble(p: Vec3A, scale: f32) -> Vec3A {
+    const BASE: Vec3A = Vec3A::new(0.93, 0.92, 0.90);
+    const VEIN: Vec3A = Vec3A::new(0.10, 0.11, 0.15);
+    let q = p * scale;
+    let s = (q.x + 0.7 * q.y + 5.0 * fbm(q)).sin();
+    // Smoothstep over a narrow band around the zero crossing: full VEIN
+    // below the inner edge, full BASE above the outer, so the surface reads
+    // as white stone cut by crisp dark lines instead of a gray gradient.
+    let t = ((s.abs() - 0.04) / 0.18).clamp(0.0, 1.0);
+    VEIN.lerp(BASE, t * t * (3.0 - 2.0 * t))
+}
+
+fn fbm(mut p: Vec3A) -> f32 {
+    let mut amp = 0.5;
+    let mut sum = 0.0;
+    for _ in 0..5 {
+        sum += amp * vnoise(p);
+        p *= 2.02;
+        amp *= 0.5;
+    }
+    sum
+}
+
+/// Trilinearly interpolated hash-lattice value noise in [0,1).
+fn vnoise(p: Vec3A) -> f32 {
+    let f = p.floor();
+    let (ix, iy, iz) = (f.x as i32, f.y as i32, f.z as i32);
+    let t = p - f;
+    let s = t * t * (Vec3A::splat(3.0) - 2.0 * t);
+    let c = |dx, dy, dz| hash3(ix + dx, iy + dy, iz + dz);
+    let l = |a: f32, b: f32, t: f32| a + (b - a) * t;
+    let x00 = l(c(0, 0, 0), c(1, 0, 0), s.x);
+    let x10 = l(c(0, 1, 0), c(1, 1, 0), s.x);
+    let x01 = l(c(0, 0, 1), c(1, 0, 1), s.x);
+    let x11 = l(c(0, 1, 1), c(1, 1, 1), s.x);
+    l(l(x00, x10, s.y), l(x01, x11, s.y), s.z)
+}
+
+#[inline(always)]
+fn hash3(x: i32, y: i32, z: i32) -> f32 {
+    let mut h = (x as u32).wrapping_mul(0x8da6_b343)
+        ^ (y as u32).wrapping_mul(0xd816_3841)
+        ^ (z as u32).wrapping_mul(0xcb1a_b31f);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0x9e37_79b1);
+    h ^= h >> 16;
+    (h & 0x00ff_ffff) as f32 / 16_777_216.0
 }
 
 /// Branchless-ish orthonormal basis around n (Duff et al.).

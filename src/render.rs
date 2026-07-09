@@ -314,9 +314,12 @@ fn write_gbuf_hit(
         y,
         &dlss::GPixel {
             normal: prim.n,
-            rough: 1.0 - prim.reflectivity,
-            diff_alb: prim.albedo * (1.0 - prim.reflectivity),
-            spec_alb: prim.reflectivity,
+            rough: prim.roughness,
+            diff_alb: prim.albedo * (1.0 - prim.metallic),
+            spec_alb: {
+                let f0 = Vec3A::splat(0.04).lerp(prim.albedo, prim.metallic);
+                (f0.x + f0.y + f0.z) / 3.0
+            },
             view_z: t * dir.dot(ctx.cam.forward()),
             mv,
             spec_hit_t: if prim.spec_t.is_infinite() { far } else { prim.spec_t },

@@ -13,11 +13,11 @@ use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 pub struct GPixel {
     /// World-space shading normal (the exact normal used for shading).
     pub normal: Vec3A,
-    /// Linear roughness (1 = diffuse; see the material mapping in render.rs).
+    /// Linear roughness (the material's perceptual roughness; 1 = diffuse).
     pub rough: f32,
-    /// Diffuse albedo = mat.albedo * (1 - reflectivity), linear.
+    /// Diffuse albedo = mat.albedo * (1 - metallic), linear.
     pub diff_alb: Vec3A,
-    /// Specular albedo (achromatic mirror weight = reflectivity).
+    /// Specular albedo (achromatic: mean of F0 = lerp(0.04, albedo, metallic)).
     pub spec_alb: f32,
     /// Linear view-space Z (t * dot(dir, forward)), NOT Euclidean t.
     /// Sky pixels store `far` (finite — survives f16 textures).
