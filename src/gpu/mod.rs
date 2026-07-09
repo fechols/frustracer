@@ -128,11 +128,13 @@ impl GpuContext {
             D3d::with_queue(&factory, device, queue, hwnd, w, h)?
         };
 
-        // M3 checkpoint: query DLSS-RR's optimal settings so the log shows
-        // the denoiser is reachable end-to-end (device set, plugin loaded).
-        if let Some(s) = &sl {
+        // Query DLSS-RR's optimal Quality-mode render resolution — this is
+        // authoritative: the CPU renders at (rrw, rrh) and RR upscales +
+        // denoises to the window size. A failed or degenerate query falls
+        // back to DLAA (render == output), the pre-upscaling behavior.
+        let (rrw, rrh) = if let Some(s) = &sl {
             let opt = streamline::SlShimDlssdOptions {
-                mode: streamline_sys::DLSS_MODE_DLAA,
+                mode: streamline_sys::DLSS_MODE_MAX_QUALITY,
                 output_width: w,
                 output_height: h,
                 preset: streamline_sys::DLSSD_PRESET_E,
@@ -142,21 +144,33 @@ impl GpuContext {
                 view_to_world: [0.0; 16],
             };
             match s.dlssd_optimal_settings(&opt) {
-                Ok(o) => eprintln!(
-                    "dlss: RR DLAA {}x{} -> render {}x{} (range {}x{}..{}x{})",
-                    w, h, o.render_width, o.render_height,
-                    o.render_width_min, o.render_height_min,
-                    o.render_width_max, o.render_height_max,
-                ),
-                Err(e) => eprintln!("dlss: optimal-settings query failed — {e}"),
+                Ok(o) if o.render_width > 0 && o.render_height > 0 => {
+                    eprintln!(
+                        "dlss: RR Quality {}x{} -> render {}x{} (range {}x{}..{}x{})",
+                        w, h, o.render_width, o.render_height,
+                        o.render_width_min, o.render_height_min,
+                        o.render_width_max, o.render_height_max,
+                    );
+                    (o.render_width, o.render_height)
+                }
+                Ok(_) => {
+                    eprintln!("dlss: optimal-settings degenerate — falling back to DLAA at native res");
+                    (w, h)
+                }
+                Err(e) => {
+                    eprintln!("dlss: optimal-settings query failed ({e}) — falling back to DLAA at native res");
+                    (w, h)
+                }
             }
-        }
+        } else {
+            (w, h)
+        };
 
         let passes = tonemap::Passes::new(&d3d.device)?;
         let blit = upload::BlitUpload::new(&d3d, w, h)?;
         let hdr = upload::HdrUpload::new(&d3d, w, h)?;
         let rr_res = if sl.is_some() {
-            let r = rr::RrResources::new(&d3d, w, h)?;
+            let r = rr::RrResources::new(&d3d, rrw, rrh, w, h)?;
             passes.create_srv(
                 &d3d.device,
                 &r.output,
@@ -198,6 +212,12 @@ impl GpuContext {
         self.sl.is_some() && self.rr.is_some()
     }
 
+    /// The render resolution DLSS mode must trace at (SL's Quality-mode
+    /// optimal size; == window size when the query fell back to DLAA).
+    pub fn rr_render_res(&self) -> Option<(u32, u32)> {
+        self.rr.as_ref().map(|r| (r.rw, r.rh))
+    }
+
     /// M4: DLSS Ray Reconstruction — upload the 1-spp radiance + G-buffers,
     /// run slEvaluateFeature, tonemap the denoised HDR output, present.
     pub fn present_rr(
@@ -210,6 +230,14 @@ impl GpuContext {
         let (Some(sl), Some(rr)) = (&self.sl, &self.rr) else {
             return Err("DLSS-RR not initialized".into());
         };
+        // Release-build cover for record_upload's dimension debug_assert:
+        // a frame traced at the wrong resolution must not reach SL.
+        if (fc.rw as u32, fc.rh as u32) != (rr.rw, rr.rh) {
+            return Err(format!(
+                "DLSS-RR frame is {}x{}, expected render res {}x{}",
+                fc.rw, fc.rh, rr.rw, rr.rh
+            ));
+        }
         let slot = self.d3d.begin_frame()?;
         rr.record_upload(&self.d3d, slot, accum, g);
         unsafe {
@@ -228,7 +256,7 @@ impl GpuContext {
         let sl_seq = || -> Result<()> {
             let token = sl.new_frame_token(frame_idx)?;
             sl.set_constants(token, 0, &shim_constants(fc))?;
-            sl.dlssd_set_options(0, &shim_options(fc))?;
+            sl.dlssd_set_options(0, &shim_options(fc, rr.ow, rr.oh))?;
             sl.tag_resources(token, 0, &rr.tags(), list_raw)?;
             sl.evaluate(streamline_sys::FEATURE_DLSS_RR, token, 0, list_raw)?;
             Ok(())
@@ -403,11 +431,18 @@ fn shim_constants(fc: &dlss::FrameConstants) -> streamline::SlShimConstants {
     }
 }
 
-fn shim_options(fc: &dlss::FrameConstants) -> streamline::SlShimDlssdOptions {
+fn shim_options(fc: &dlss::FrameConstants, ow: u32, oh: u32) -> streamline::SlShimDlssdOptions {
     streamline::SlShimDlssdOptions {
-        mode: streamline_sys::DLSS_MODE_DLAA,
-        output_width: fc.rw as u32,
-        output_height: fc.rh as u32,
+        // Render res == output res only when the optimal-settings query fell
+        // back to native; otherwise the frame was traced at the Quality-mode
+        // render size and RR upscales.
+        mode: if (fc.rw as u32, fc.rh as u32) == (ow, oh) {
+            streamline_sys::DLSS_MODE_DLAA
+        } else {
+            streamline_sys::DLSS_MODE_MAX_QUALITY
+        },
+        output_width: ow,
+        output_height: oh,
         // Preset E = the latest transformer model (sl_dlss_d.h:38); fall
         // back to DLSSD_PRESET_D / _DEFAULT if E misbehaves.
         preset: streamline_sys::DLSSD_PRESET_E,

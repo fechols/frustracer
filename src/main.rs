@@ -158,13 +158,9 @@ fn main() {
 /// world positions through both frames. No GPU or Streamline involved — this
 /// validates the CPU capture before/without the denoiser.
 fn run_check_dlss(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, dump: bool) -> i32 {
-    let (rw, rh) = (800usize, 600usize);
     let (near, far) = dlss::near_far(scene.diag);
     let q = Quality { shadow_samples: 1, ao_samples: 1, reflections: true };
     let stats = Stats::default();
-    let accum: Vec<AtomicU32> = (0..rw * rh * 3).map(|_| AtomicU32::new(0)).collect();
-    let info: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
-    let tbuf: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
 
     // Halton structural checks: known prefixes, offsets in [-0.5, 0.5).
     let mut halton_ok = true;
@@ -186,49 +182,62 @@ fn run_check_dlss(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, dump: bool
 
     // Frame A at the given camera; frame B a 0.02·diag forward dolly later,
     // with A as its previous frame. Zero jitter so samples sit on pixel
-    // centers — the reconstruction in the self-test assumes centers.
-    let basis_a = cam0.basis(rw, rh);
-    let ga = dlss::GBufs::new(rw, rh);
-    let gb = dlss::GBufs::new(rw, rh);
-    let render_dlss_frame = |g: &dlss::GBufs, basis: camera::CamBasis, prev: Option<camera::CamBasis>, frame: u32| {
-        let ctx = FrameCtx {
-            scene,
-            bvh,
-            cam: basis,
-            q,
-            frame,
-            jitter: false,
-            rw,
-            rh,
-            accum: &accum,
-            info: &info,
-            tbuf: &tbuf,
-            stats: &stats,
-            sun: render::sun_dir(scene),
-            tcache_cur: None,
-            tcache_prev: None,
-            accumulate: false,
-            gbuf: Some(g),
-            prev_cam: prev,
-            frame_jitter: Some((0.0, 0.0)),
+    // centers — the reconstruction in the self-test assumes centers. Run
+    // once at the native test res and once at the Quality-mode render res
+    // stand-in (odd width — also exercises odd-dim quadtree splits), since
+    // the interactive DLSS path now traces at a sub-native resolution.
+    let mv_pass = |rw: usize, rh: usize, dump: bool| -> bool {
+        eprintln!("MV/depth/matrix self-test at {rw}x{rh}:");
+        let accum: Vec<AtomicU32> = (0..rw * rh * 3).map(|_| AtomicU32::new(0)).collect();
+        let info: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
+        let tbuf: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
+        let basis_a = cam0.basis(rw, rh);
+        let ga = dlss::GBufs::new(rw, rh);
+        let gb = dlss::GBufs::new(rw, rh);
+        let render_dlss_frame = |g: &dlss::GBufs, basis: camera::CamBasis, prev: Option<camera::CamBasis>, frame: u32| {
+            let ctx = FrameCtx {
+                scene,
+                bvh,
+                cam: basis,
+                q,
+                frame,
+                jitter: false,
+                rw,
+                rh,
+                accum: &accum,
+                info: &info,
+                tbuf: &tbuf,
+                stats: &stats,
+                sun: render::sun_dir(scene),
+                tcache_cur: None,
+                tcache_prev: None,
+                accumulate: false,
+                gbuf: Some(g),
+                prev_cam: prev,
+                frame_jitter: Some((0.0, 0.0)),
+            };
+            render::render_frame(&ctx, true);
         };
-        render::render_frame(&ctx, true);
+        render_dlss_frame(&ga, basis_a, None, 0);
+
+        let mut cam_b = cam0;
+        cam_b.pos += cam0.forward() * (0.02 * scene.diag);
+        let basis_b = cam_b.basis(rw, rh);
+        render_dlss_frame(&gb, basis_b, Some(basis_a), 1);
+
+        let mats_b = dlss::cam_matrices(&cam_b, rw, rh, near, far);
+        let ok = dlss::mv_selftest(&ga, &basis_a, &gb, &basis_b, &mats_b, scene.diag, far);
+
+        if dump {
+            dlss::dump_gbufs(&gb, "dlss_gbuf", far);
+        }
+        ok
     };
-    render_dlss_frame(&ga, basis_a, None, 0);
+    let mv_native_ok = mv_pass(800, 600, dump);
+    let (qw, qh) = dlss::headless_render_res(800, 600);
+    let mv_quality_ok = mv_pass(qw, qh, false);
 
-    let mut cam_b = cam0;
-    cam_b.pos += cam0.forward() * (0.02 * scene.diag);
-    let basis_b = cam_b.basis(rw, rh);
-    render_dlss_frame(&gb, basis_b, Some(basis_a), 1);
-
-    let mats_b = dlss::cam_matrices(&cam_b, rw, rh, near, far);
-    let mv_ok = dlss::mv_selftest(&ga, &basis_a, &gb, &basis_b, &mats_b, scene.diag, far);
-
-    if dump {
-        dlss::dump_gbufs(&gb, "dlss_gbuf", far);
-    }
-
-    if halton_ok && mv_ok {
+    if halton_ok && mv_native_ok && mv_quality_ok {
         eprintln!("DLSS CHECK PASSED");
         0
     } else {
@@ -515,6 +524,9 @@ fn sdl_hwnd(window: &sdl2::video::Window) -> windows::Win32::Foundation::HWND {
 
 #[cfg(windows)]
 fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
+    // Opt into per-monitor DPI awareness so Windows doesn't stretch the window
+    // on scaled displays — W×H stays W×H physical pixels, matching the swapchain.
+    sdl2::hint::set("SDL_WINDOWS_DPI_AWARENESS", "permonitorv2");
     let sdl = sdl2::init().expect("SDL init failed");
     let video = sdl.video().expect("SDL video failed");
     let mut window = video
@@ -553,6 +565,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     let mut tcur = 0usize;
     let mut tprev_ok = false;
     let mut tprev_basis = cam.basis(W, H); // placeholder until tprev_ok
+    let mut tprev_res = (0usize, 0usize); // resolution the prev cache was traced at
 
     let mut frame: u32 = 0;
     let mut hybrid = true;
@@ -563,10 +576,13 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     let mut prev_rw = W;
 
     // DLSS Ray Reconstruction state. In DLSS mode every frame is a fresh
-    // 1-spp full-res hybrid frame and RR is the only temporal integrator:
+    // 1-spp hybrid frame at RR's Quality-mode render resolution (RR upscales
+    // + denoises to the window size) and RR is the only temporal integrator:
     // no CPU accumulation, no half-res moving mode, no depth-cap budget.
     let mut dlss_on = gpu.dlss_ready();
-    let gbufs = dlss::GBufs::new(W, H);
+    let (drw, drh) =
+        gpu.rr_render_res().map(|(a, b)| (a as usize, b as usize)).unwrap_or((W, H));
+    let gbufs = dlss::GBufs::new(drw, drh);
     let mut dlss_idx: u32 = 0;
     let mut dlss_prev: Option<dlss::DlssPrev> = None;
     let mut dlss_reset = true;
@@ -585,6 +601,11 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     let mut last = Instant::now();
     let mut last_title = Instant::now();
     let mut last_stats = Instant::now();
+    // Presented-frames-per-second, recomputed once per second (frame ms in
+    // the title is render time only; this is the actual present rate).
+    let mut fps = 0.0f64;
+    let mut fps_frames = 0u32;
+    let mut fps_t = Instant::now();
     let mut last_ms = 0.0f64;
     let mut shot = 0u32;
 
@@ -644,11 +665,17 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
 
         // Cheap while moving, converge while still. Dynamic-res mode keeps
         // full resolution buffers and full quality — the estimated depth cap
-        // floats the effective resolution instead. DLSS mode forces full-res
-        // uncapped every frame (RR requires a fixed render resolution and
-        // clean per-pixel G-buffers) with frame-stationary quality.
+        // floats the effective resolution instead. DLSS mode traces every
+        // frame uncapped at RR's fixed render resolution (RR requires clean
+        // per-pixel G-buffers) with frame-stationary quality.
         let use_budget = moved && hybrid && dynamic && !dlss_on;
-        let (rw, rh) = if !dlss_on && moved && !use_budget { (W / 2, H / 2) } else { (W, H) };
+        let (rw, rh) = if dlss_on {
+            (drw, drh)
+        } else if moved && !use_budget {
+            (W / 2, H / 2)
+        } else {
+            (W, H)
+        };
         if rw != prev_rw {
             frame = 0;
             prev_rw = rw;
@@ -671,13 +698,20 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
             stats.clear();
             let basis = cam.basis(rw, rh);
             // Budget (moving) frames are full-res, so the cache stays live
-            // through motion and across the moving→static transition.
-            let temporal_on = hybrid && rw == W;
+            // through motion and across the moving→static transition. In
+            // DLSS mode "full participation res" is RR's render resolution;
+            // the tprev_res check drops the cache whenever the resolution
+            // changes (e.g. the G toggle), per the temporal invariant.
+            let temporal_on = hybrid && (rw, rh) == if dlss_on { (drw, drh) } else { (W, H) };
             let (tcache_cur, tcache_prev) = if temporal_on {
                 tcaches[tcur].clear();
                 (
                     Some(&tcaches[tcur]),
-                    if tprev_ok { Some((&tcaches[tcur ^ 1], tprev_basis)) } else { None },
+                    if tprev_ok && tprev_res == (rw, rh) {
+                        Some((&tcaches[tcur ^ 1], tprev_basis))
+                    } else {
+                        None
+                    },
                 )
             } else {
                 (None, None)
@@ -712,6 +746,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
             last_ms = t.elapsed().as_secs_f64() * 1000.0;
             if temporal_on {
                 tprev_basis = basis;
+                tprev_res = (rw, rh);
                 tprev_ok = true;
                 tcur ^= 1;
             } else {
@@ -742,7 +777,9 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
         if dlss_on {
             // DLSS-RR: hand the 1-spp radiance + G-buffers to the denoiser;
             // it outputs denoised HDR which the GPU tonemap presents.
-            let mats = dlss::cam_matrices(&cam, W, H, dlss_near, dlss_far);
+            // Everything SL sees — matrices, jitter, MVs, mvec_scale — lives
+            // in render-res pixel space; only the RR output is window-sized.
+            let mats = dlss::cam_matrices(&cam, rw, rh, dlss_near, dlss_far);
             let fc = dlss::frame_constants(
                 &cam,
                 &mats,
@@ -751,12 +788,12 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 dlss_reset,
                 dlss_near,
                 dlss_far,
-                W,
-                H,
+                rw,
+                rh,
             );
             match gpu.present_rr(&accum, &gbufs, &fc, dlss_idx) {
                 Ok(()) => {
-                    dlss_prev = Some(dlss::DlssPrev { basis: cam.basis(W, H), mats });
+                    dlss_prev = Some(dlss::DlssPrev { basis: cam.basis(rw, rh), mats });
                     dlss_reset = false;
                     dlss_idx = dlss_idx.wrapping_add(1);
                 }
@@ -787,6 +824,12 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 H,
             );
             gpu.present_cpu(&present).expect("GPU present failed");
+        }
+        fps_frames += 1;
+        if (now - fps_t).as_secs_f64() >= 1.0 {
+            fps = fps_frames as f64 / (now - fps_t).as_secs_f64();
+            fps_frames = 0;
+            fps_t = now;
         }
 
         if edges.screenshot {
@@ -836,14 +879,16 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 String::new()
             };
             let _ = window.set_title(&format!(
-                "frustracer | {}{} | {}x{} | {:.1} ms | {} | quality {}{}{}{}{}",
+                "frustracer | {:.0} fps | {}{}{} | {}x{} | {:.1} ms | {} | quality {}{}{}{}{}",
+                fps,
                 if hybrid { "hybrid" } else { "plain" },
+                if !dlss_on && hybrid && dynamic { "+dyn" } else { "" },
                 if dlss_on {
-                    " + DLSS-RR"
-                } else if hybrid && dynamic {
-                    "+dyn"
+                    // Native render res means the optimal-settings query fell
+                    // back to DLAA; anything smaller is Quality mode.
+                    if (drw, drh) == (W, H) { " | DLSS: DLAA + RR" } else { " | DLSS: Quality + RR" }
                 } else {
-                    ""
+                    " | DLSS: off"
                 },
                 rw,
                 rh,

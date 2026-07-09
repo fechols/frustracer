@@ -1,7 +1,9 @@
 //! DLSS Ray Reconstruction resources: one texture per SL buffer tag, a
 //! single persistently-mapped upload ring (per-frame slots), the CPU→GPU
 //! conversion loops, and the ResourceTag table handed to Streamline each
-//! frame. Render res == output res in v1 (DLAA).
+//! frame. Input planes live at the render resolution, the output at the
+//! window resolution — SL infers the upscale ratio from the texture dims
+//! (fixed quality mode; sl::Extent tagging is only for dynamic resolution).
 
 use super::d3d12::{
     aligned_pitch, committed_tex, footprint, loc_footprint, loc_subresource, transition, D3d,
@@ -24,8 +26,10 @@ struct Plane {
 }
 
 pub struct RrResources {
-    pub w: u32,
-    pub h: u32,
+    pub rw: u32, // render res (input planes)
+    pub rh: u32,
+    pub ow: u32, // output res (RR output)
+    pub oh: u32,
     planes: [Plane; 7], // upload order: color, normal_rough, depth, mvec, albedo, spec_albedo, spec_hit
     pub output: ID3D12Resource, // RGBA16F UAV, written by RR, read by the tonemap
     upload: UploadBuffer,
@@ -41,7 +45,7 @@ const P_SPEC_ALBEDO: usize = 5;
 const P_SPEC_HIT: usize = 6;
 
 impl RrResources {
-    pub fn new(d3d: &D3d, w: u32, h: u32) -> Result<Self> {
+    pub fn new(d3d: &D3d, rw: u32, rh: u32, ow: u32, oh: u32) -> Result<Self> {
         let specs: [(DXGI_FORMAT, usize); 7] = [
             (DXGI_FORMAT_R16G16B16A16_FLOAT, 8), // noisy color
             (DXGI_FORMAT_R16G16B16A16_FLOAT, 8), // normal.xyz + roughness.w (packed mode)
@@ -56,27 +60,27 @@ impl RrResources {
         for (format, bpp) in specs {
             let tex = committed_tex(
                 &d3d.device,
-                w,
-                h,
+                rw,
+                rh,
                 format,
                 D3D12_RESOURCE_FLAG_NONE,
                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
             )?;
             planes.push(Plane { tex, format, bpp, offset });
-            offset += aligned_pitch(w as usize * bpp) * h as usize;
+            offset += aligned_pitch(rw as usize * bpp) * rh as usize;
         }
         let slot_stride = offset;
         let upload = UploadBuffer::new(&d3d.device, slot_stride * FRAMES_IN_FLIGHT)?;
         let output = committed_tex(
             &d3d.device,
-            w,
-            h,
+            ow,
+            oh,
             DXGI_FORMAT_R16G16B16A16_FLOAT,
             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
         )?;
         let planes: [Plane; 7] = planes.try_into().map_err(|_| "plane count".to_string())?;
-        Ok(Self { w, h, planes, output, upload, slot_stride })
+        Ok(Self { rw, rh, ow, oh, planes, output, upload, slot_stride })
     }
 
     /// Convert the CPU frame into the slot's upload memory (rayon, disjoint
@@ -84,7 +88,7 @@ impl RrResources {
     /// NON_PIXEL_SHADER_RESOURCE between frames — exactly the state they are
     /// tagged with, which manual hooking requires to be correct at *use*.
     pub fn record_upload(&self, d3d: &D3d, slot: usize, accum: &[AtomicU32], g: &GBufs) {
-        let (w, h) = (self.w as usize, self.h as usize);
+        let (w, h) = (self.rw as usize, self.rh as usize);
         debug_assert_eq!((g.rw, g.rh), (w, h));
         let base = slot * self.slot_stride;
 
@@ -214,7 +218,7 @@ impl RrResources {
             .collect();
         unsafe { d3d.list.ResourceBarrier(&to_copy) };
         for p in &self.planes {
-            let fp = footprint(p.format, self.w, self.h, p.bpp, (base + p.offset) as u64);
+            let fp = footprint(p.format, self.rw, self.rh, p.bpp, (base + p.offset) as u64);
             unsafe {
                 d3d.list.CopyTextureRegion(
                     &loc_subresource(&p.tex),

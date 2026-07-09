@@ -97,8 +97,8 @@ pub fn halton(mut index: u32, base: u32) -> f32 {
     r
 }
 
-/// Streamline guidance: phase length ≈ 8·(upscale ratio)²; 32 covers DLAA
-/// through Performance comfortably. Retune if the RR mode changes.
+/// Streamline guidance: phase length ≈ 8·(upscale ratio)²; Quality mode
+/// needs 8·1.5² = 18, so 32 covers DLAA through Quality with headroom.
 pub const JITTER_PHASE: u32 = 32;
 
 /// Frame-uniform sub-pixel jitter offset in [-0.5, 0.5): the SAME offset is
@@ -118,6 +118,14 @@ pub fn jitter_for(frame_idx: u32) -> (f32, f32) {
 /// plane (~170 for the procedural scene), not just the model.
 pub fn near_far(diag: f32) -> (f32, f32) {
     (1e-3 * diag, 2.0 * diag)
+}
+
+/// Deterministic stand-in for SL's Quality-mode optimal render resolution in
+/// headless runs (no interposer to query): exact 2/3, floored. The
+/// interactive path never uses this — it takes the size
+/// slDLSSDGetOptimalSettings returns.
+pub fn headless_render_res(w: usize, h: usize) -> (usize, usize) {
+    (w * 2 / 3, h * 2 / 3)
 }
 
 /// View + projection matrices built from the *exact* construction
