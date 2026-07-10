@@ -581,32 +581,168 @@ fn run_check_xess(
             eprintln!("controller climbed inside the deadband");
             pass = false;
         }
-        // Step limiter: first target adopts; the dwell holds against both
-        // growth and non-emergency sheds; an emergency may bypass only to
-        // SHED; dwell expiry adopts the current target in one jump.
-        let mut lim = xess::StepLimiter::new();
-        if lim.apply((1280, 720), false) != (1280, 720) {
+        // Step limiter, snap parity (ramp = 0 is the pre-ramp behavior):
+        // first target adopts; the dwell holds against both growth and
+        // non-emergency sheds; an emergency may bypass only to SHED; dwell
+        // expiry adopts the current target in one decision.
+        let out = (1920usize, 1080usize);
+        let (rmin, rmax) = ((640usize, 360usize), (1920usize, 1080usize));
+        let mut lim = xess::StepLimiter::new(0);
+        if lim.apply((1280, 720), false, out, rmin, rmax) != (1280, 720) {
             eprintln!("step limiter: first apply did not adopt");
             pass = false;
         }
-        if lim.apply((1216, 684), false) != (1280, 720) {
+        if lim.apply((1216, 684), false, out, rmin, rmax) != (1280, 720) {
             eprintln!("step limiter: dwell did not hold a shed");
             pass = false;
         }
-        if lim.apply((1408, 792), true) != (1280, 720) {
+        if lim.apply((1408, 792), true, out, rmin, rmax) != (1280, 720) {
             eprintln!("step limiter: emergency bypassed for GROWTH");
             pass = false;
         }
-        if lim.apply((960, 540), true) != (960, 540) {
+        if lim.apply((960, 540), true, out, rmin, rmax) != (960, 540) {
             eprintln!("step limiter: emergency shed did not bypass");
             pass = false;
         }
         let mut adopted = (0, 0);
         for _ in 0..=xess::STEP_DWELL {
-            adopted = lim.apply((1152, 648), false);
+            adopted = lim.apply((1152, 648), false, out, rmin, rmax);
         }
         if adopted != (1152, 648) {
             eprintln!("step limiter: dwell expiry did not adopt");
+            pass = false;
+        }
+        // Ramped limiter: an adoption starts a lerp from the previous
+        // endpoint — intermediates are weakly monotone in height, in-range,
+        // exact-aspect via width_for_height, and land exactly on the
+        // endpoint; the dwell is not re-armed mid-ramp; an emergency shed
+        // compares against the ramp's CURRENT output and snaps.
+        let mut lim = xess::StepLimiter::new(xess::RAMP_FRAMES);
+        lim.apply((1280, 720), false, out, rmin, rmax);
+        if lim.ramping() {
+            eprintln!("ramp: first adoption started a ramp");
+            pass = false;
+        }
+        let mut cur = (0usize, 0usize);
+        for _ in 0..xess::STEP_DWELL {
+            cur = lim.apply((960, 540), false, out, rmin, rmax);
+        }
+        if cur != (1280, 720) || !lim.ramping() || lim.endpoint() != (960, 540) {
+            eprintln!("ramp: adoption frame did not hold the old endpoint (got {cur:?})");
+            pass = false;
+        }
+        // Walk the down-ramp while feeding a DIFFERENT non-emergency target
+        // every frame — none may adopt (the dwell holds mid-ramp).
+        let mut last_h = 720usize;
+        let mut end = (0usize, 0usize);
+        for i in 1..=xess::RAMP_FRAMES {
+            let (rw2, rh2) = lim.apply((1152, 648), false, out, rmin, rmax);
+            if rh2 > last_h {
+                eprintln!("ramp: height not monotone at frame {i} ({last_h} -> {rh2})");
+                pass = false;
+            }
+            last_h = rh2;
+            if rh2 < rmin.1 || rh2 > rmax.1 || rw2 < rmin.0 || rw2 > rmax.0 {
+                eprintln!("ramp: intermediate {rw2}x{rh2} out of range");
+                pass = false;
+            }
+            if rw2 != xess::width_for_height(rh2, out, rmin.0, rmax.0) {
+                eprintln!("ramp: intermediate width {rw2} off the exact aspect at h {rh2}");
+                pass = false;
+            }
+            end = (rw2, rh2);
+        }
+        if end != (960, 540) {
+            eprintln!("ramp: did not land exactly on the endpoint (got {end:?})");
+            pass = false;
+        }
+        if lim.endpoint() != (960, 540) {
+            eprintln!("ramp: a mid-ramp target re-armed the dwell / adopted");
+            pass = false;
+        }
+        // Dwell re-arms at adoption: the same target adopts exactly at
+        // STEP_DWELL frames since the last adoption, and the new ramp
+        // departs from the PREVIOUS endpoint (from = completed endpoint).
+        let mut held = true;
+        for _ in 0..(xess::STEP_DWELL - xess::RAMP_FRAMES) {
+            if lim.apply((1152, 648), false, out, rmin, rmax) != (960, 540) {
+                held = false;
+            }
+        }
+        if !held || lim.endpoint() != (1152, 648) {
+            eprintln!(
+                "ramp: post-ramp dwell wrong (held {held}, endpoint {:?})",
+                lim.endpoint()
+            );
+            pass = false;
+        }
+        let (_, h1) = lim.apply((1152, 648), false, out, rmin, rmax);
+        if !(540 < h1 && h1 < 648) {
+            eprintln!("ramp: new ramp did not depart the previous endpoint (h {h1})");
+            pass = false;
+        }
+        // Emergency growth guard vs the CURRENT output: mid up-ramp, a shed
+        // target below the endpoint but above the ramp's current output must
+        // NOT adopt (it would grow resolution on a blown frame). The warm-up
+        // is derived from RAMP_FRAMES (aim ~t = 1/3) and the premise is
+        // asserted explicitly so a constant change fails loudly with the
+        // real reason instead of a misleading gate failure.
+        let warm = (xess::RAMP_FRAMES / 3).max(1);
+        let mut cur = (0usize, 0usize);
+        for _ in 0..warm {
+            cur = lim.apply((1152, 648), false, out, rmin, rmax);
+        }
+        let step = (648 - 540) / xess::RAMP_FRAMES as usize; // px height / frame
+        if !lim.ramping() || cur.1 + step >= 612 {
+            eprintln!(
+                "ramp: growth-guard premise broken (cur {cur:?}, ramping {}) — retune the gate",
+                lim.ramping()
+            );
+            pass = false;
+        }
+        let r = lim.apply((1116, 612), true, out, rmin, rmax);
+        if lim.endpoint() != (1152, 648) || r.1 >= 612 {
+            eprintln!(
+                "ramp: emergency grew above the current output (r {r:?}, endpoint {:?})",
+                lim.endpoint()
+            );
+            pass = false;
+        }
+        // Emergency shed below the current output snaps, cancelling the ramp.
+        let r = lim.apply((768, 432), true, out, rmin, rmax);
+        if r != (768, 432) || lim.ramping() {
+            eprintln!("ramp: emergency shed mid-ramp did not snap (r {r:?})");
+            pass = false;
+        }
+        if lim.apply((768, 432), false, out, rmin, rmax) != (768, 432) {
+            eprintln!("ramp: post-snap output unstable");
+            pass = false;
+        }
+        // Emergency with the target already the in-flight down-ramp endpoint
+        // must fast-forward the ramp (snap to the endpoint) instead of
+        // descending through up to RAMP_FRAMES more blown frames.
+        let mut lim = xess::StepLimiter::new(xess::RAMP_FRAMES);
+        lim.apply((1280, 720), false, out, rmin, rmax);
+        for _ in 0..xess::STEP_DWELL {
+            lim.apply((960, 540), false, out, rmin, rmax); // last apply adopts
+        }
+        if !lim.ramping() || lim.endpoint() != (960, 540) {
+            eprintln!("ramp: fast-forward setup did not start a down-ramp");
+            pass = false;
+        }
+        let r = lim.apply((960, 540), true, out, rmin, rmax);
+        if r != (960, 540) || lim.ramping() {
+            eprintln!("ramp: emergency at the down-ramp endpoint did not fast-forward (r {r:?})");
+            pass = false;
+        }
+        // The mirror case must NOT snap: mid UP-ramp, an emergency whose
+        // target equals the (higher) endpoint would grow resolution.
+        for _ in 0..xess::STEP_DWELL {
+            lim.apply((1280, 720), false, out, rmin, rmax); // last apply adopts
+        }
+        let up = lim.apply((1280, 720), true, out, rmin, rmax);
+        if xess::RAMP_FRAMES > 1 && up.1 >= 720 {
+            eprintln!("ramp: emergency at an up-ramp endpoint snapped upward (r {up:?})");
             pass = false;
         }
         eprintln!("scale controller + step limiter: {}", if pass { "OK" } else { "FAIL" });
@@ -2062,6 +2198,33 @@ fn sdl_hwnd(window: &sdl2::video::Window) -> windows::Win32::Foundation::HWND {
     }
 }
 
+/// Adoption-only DRS logging: one line per adopted endpoint (ramp
+/// intermediates land silently), tracked via the caller's last-logged
+/// endpoint. `(0, 0)` marks "nothing logged yet" — the first adoption of a
+/// session is silent.
+#[cfg(windows)]
+fn log_drs_adoption(path: &str, lim: &xess::StepLimiter, last_ep: &mut (usize, usize)) {
+    let ep = lim.endpoint();
+    if ep == *last_ep {
+        return;
+    }
+    if last_ep.0 != 0 {
+        if lim.ramping() {
+            eprintln!(
+                "{path}: drs {}x{} -> {}x{} (ramp {} frames)",
+                last_ep.0,
+                last_ep.1,
+                ep.0,
+                ep.1,
+                xess::RAMP_FRAMES
+            );
+        } else {
+            eprintln!("{path}: drs shed -> {}x{}", ep.0, ep.1);
+        }
+    }
+    *last_ep = ep;
+}
+
 #[cfg(windows)]
 fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     // Opt into per-monitor DPI awareness so Windows doesn't stretch the window
@@ -2154,9 +2317,14 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     let mut dlss_prev: Option<dlss::DlssPrev> = None;
     let mut dlss_reset = true;
     // Applied-step rate limiters, one per DRS path: bound how often the
-    // upscalers take a history hit (see xess::StepLimiter).
-    let mut dlss_lim = xess::StepLimiter::new();
-    let mut xess_lim = xess::StepLimiter::new();
+    // upscalers take a history hit, and ramp each adopted step over
+    // RAMP_FRAMES instead of snapping (see xess::StepLimiter).
+    let mut dlss_lim = xess::StepLimiter::new(xess::RAMP_FRAMES);
+    let mut xess_lim = xess::StepLimiter::new(xess::RAMP_FRAMES);
+    // Last logged endpoints — adoption-only DRS logging (a ramp would
+    // otherwise print every intermediate res).
+    let mut dlss_ep = (0usize, 0usize);
+    let mut xess_ep = (0usize, 0usize);
     // FRUSTRACER_STAB=1: numeric stability meter — every 15th upscaled frame
     // is read back and diffed against the previous capture; a static camera
     // on a converged pipeline trends to ~0, temporal instability ("dancing")
@@ -2398,7 +2566,8 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 dlss_prev = None;
                 // Fresh limiter: a re-enabled session adopts the controller's
                 // target immediately instead of dwelling on the stale res.
-                dlss_lim = xess::StepLimiter::new();
+                dlss_lim = xess::StepLimiter::new(xess::RAMP_FRAMES);
+                dlss_ep = (0, 0);
                 if dlss_on && oidn_on {
                     oidn_on = false;
                     eprintln!("oidn: OFF (DLSS enabled)");
@@ -2423,7 +2592,8 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 xess_prev = None;
                 // Fresh limiter: a re-enabled session adopts the controller's
                 // target immediately instead of dwelling on the stale res.
-                xess_lim = xess::StepLimiter::new();
+                xess_lim = xess::StepLimiter::new(xess::RAMP_FRAMES);
+                xess_ep = (0, 0);
                 if xess_on && dlss_on {
                     dlss_on = false;
                     dlss_prev = None;
@@ -2599,13 +2769,12 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
             // step limiter bounding how often RR takes a history hit.
             RenderMode::Dlss if dlss_drs => {
                 let (_, min, max) = dlss_range.unwrap();
-                let target = xess::quantize_res(
-                    dlss_ctl.as_ref().unwrap().scale(),
-                    (W, H),
-                    (min.0 as usize, min.1 as usize),
-                    (max.0 as usize, max.1 as usize),
-                );
-                dlss_lim.apply(target, blown)
+                let (mn, mx) = ((min.0 as usize, min.1 as usize), (max.0 as usize, max.1 as usize));
+                let target =
+                    xess::quantize_res(dlss_ctl.as_ref().unwrap().scale(), (W, H), mn, mx);
+                let r = dlss_lim.apply(target, blown, (W, H), mn, mx);
+                log_drs_adoption("dlss", &dlss_lim, &mut dlss_ep);
+                r
             }
             RenderMode::Dlss => (drw, drh),
             RenderMode::Xess => {
@@ -2613,13 +2782,12 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 // controller's estimate quantized into the SDK's input range.
                 // Every frame is a full-depth per-pixel trace at this size.
                 let (_, min, max) = xess_range.unwrap();
-                let target = xess::quantize_res(
-                    xess_ctl.as_ref().unwrap().scale(),
-                    (W, H),
-                    (min.0 as usize, min.1 as usize),
-                    (max.0 as usize, max.1 as usize),
-                );
-                xess_lim.apply(target, blown)
+                let (mn, mx) = ((min.0 as usize, min.1 as usize), (max.0 as usize, max.1 as usize));
+                let target =
+                    xess::quantize_res(xess_ctl.as_ref().unwrap().scale(), (W, H), mn, mx);
+                let r = xess_lim.apply(target, blown, (W, H), mn, mx);
+                log_drs_adoption("xess", &xess_lim, &mut xess_ep);
+                r
             }
             // OIDN mode never drops to half-res: the G-buffers are full-res
             // and a half-res frame renders into a prefix with a different
@@ -2629,16 +2797,19 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
             RenderMode::Plain => (W, H),
         };
         if rw != prev_rw {
+            // Fires on every distinct-res ramp frame by design — harmless in
+            // the upscaler modes (accumulate = false, free-running RNG index,
+            // no CPU accumulation runs).
             frame = 0;
             prev_rw = rw;
         }
         if xess_on {
             // Keep the render-res G-buffers on this frame's resolution. On a
-            // res step (rare — the quantization is the hysteresis) the
-            // buffers are reinterpreted in place and the previous frame's MV
-            // basis is dropped: its pixel grid no longer matches, and XeSS's
-            // history is reset with it (the temporal cache drops itself via
-            // tprev_res).
+            // res change (per-frame during a ramp, otherwise rare) the
+            // buffers are reinterpreted in place; the prev camera, the MV
+            // contract, and XeSS's accumulation all survive the change (see
+            // the inner comment) — only the temporal cache drops, via
+            // tprev_res.
             if xess_gbufs.is_none() {
                 let (_, _, max) = xess_range.unwrap();
                 xess_gbufs = Some(dlss::GBufs::new(max.0 as usize, max.1 as usize));
@@ -2651,9 +2822,9 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 // correct across the step, and XeSS's DRS carries its
                 // accumulation across extent changes by design. (Resetting
                 // here was the "dancing": every step wiped the history and
-                // the image re-converged patchily.)
+                // the image re-converged patchily.) Adoptions are logged at
+                // the limiter; ramp intermediates land here silently.
                 g.set_res(rw, rh);
-                eprintln!("xess: drs step -> {rw}x{rh}");
             }
         }
         if mode == RenderMode::Dlss && (gbufs.rw, gbufs.rh) != (rw, rh) {
@@ -2667,7 +2838,6 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 p.basis = p.cam.basis(rw, rh);
                 p.mats = dlss::cam_matrices(&p.cam, rw, rh, dlss_near, dlss_far);
             }
-            eprintln!("dlss: drs step -> {rw}x{rh}");
         }
         if use_budget != prev_budget {
             frame = 0; // budget frames hold coarse fills — never accumulate onto them
@@ -2963,17 +3133,17 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 // OFF / PRE placements: the GPU tonemap present path. The
                 // pre-pass is resolution-agile — set_res rebinds the filter
                 // on a res step (cheap; the weights stay loaded), and the
-                // reprojected history reallocates (a fresh history is an
-                // invalidated one; XeSS's own accumulation hides the blip).
+                // reprojected history reinterprets in place within its
+                // window-res capacity, invalidating itself (a fresh history
+                // is an invalidated one; XeSS's own accumulation hides the
+                // blip). Both run per distinct-res frame during a DRS ramp.
                 let denoised = if xess_oidn == XessOidn::Pre {
                     let octx = oidn_ctx.as_mut().expect("xess_oidn without context");
                     let t_pre = Instant::now();
                     let result = octx.set_res(rw, rh).and_then(|()| {
                         if oidn_temporal {
                             let hist = oidn_hist.as_mut().expect("xess_oidn without history");
-                            if hist.res() != (rw, rh) {
-                                *hist = reproject::History::new(rw, rh);
-                            }
+                            hist.set_res(rw, rh);
                             let t0 = Instant::now();
                             last_hist = hist.update(
                                 &basis,
@@ -3048,9 +3218,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 let result = octx.set_res(W, H).and_then(|()| {
                     if oidn_t {
                         let hist = oidn_hist.as_mut().expect("oidn_on without history");
-                        if hist.res() != (W, H) {
-                            *hist = reproject::History::new(W, H);
-                        }
+                        hist.set_res(W, H);
                         let t0 = Instant::now();
                         last_hist =
                             hist.update(&basis, &accum, og, &info, dlss_far, MAX_SAMPLES as f32);

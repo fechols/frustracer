@@ -188,22 +188,30 @@ pub fn clip_depth_to_view_z(d: f32, near: f32, far: f32) -> f32 {
 /// exact-integer widths on every step.
 pub const RES_STEP: usize = 36;
 
+/// Round-half-up width from the exact window aspect (XeSS requires the input
+/// aspect to match the output), clamped into the queried range. The single
+/// width source shared by `quantize_res` and `StepLimiter`'s ramp
+/// intermediates — one formula, so a ramp's final frame reproduces the
+/// quantized endpoint width bit-exactly.
+pub fn width_for_height(rh: usize, out: (usize, usize), min_w: usize, max_w: usize) -> usize {
+    let (ow, oh) = out;
+    ((rh * ow + oh / 2) / oh).clamp(min_w.max(1), max_w.max(1))
+}
+
 /// Map a linear scale estimate to a concrete (rw, rh): quantize the height
-/// to RES_STEP, derive the width from the window aspect (XeSS requires the
-/// input aspect to match the output), clamp both into the queried [min, max]
-/// range. Clamps override the quantum — the range bounds are hard.
+/// to RES_STEP, derive the width from the window aspect, clamp both into the
+/// queried [min, max] range. Clamps override the quantum — the range bounds
+/// are hard.
 pub fn quantize_res(
     scale: f32,
     out: (usize, usize),
     min: (usize, usize),
     max: (usize, usize),
 ) -> (usize, usize) {
-    let (ow, oh) = out;
+    let (_, oh) = out;
     let rh_raw = (scale * oh as f32).round() as usize;
     let rh = (rh_raw / RES_STEP * RES_STEP).clamp(min.1.max(RES_STEP), max.1.max(RES_STEP));
-    // Round-half-up width from the exact window aspect.
-    let rw = ((rh * ow + oh / 2) / oh).clamp(min.0.max(1), max.0.max(1));
-    (rw, rh)
+    (width_for_height(rh, out, min.0, max.0), rh)
 }
 
 /// Log2-scale proportional controller, the `depth_est` design transplanted
@@ -249,6 +257,16 @@ impl ScaleCtl {
 /// Minimum frames between APPLIED resolution steps (~1.5 s at 60 fps).
 pub const STEP_DWELL: u32 = 90;
 
+/// Frames over which an adopted step is ramped from the previous endpoint
+/// (~0.4 s at 60 fps); 0 = snap. Intermediates are exact-aspect,
+/// range-clamped, and need no RES_STEP quantum; rounded heights repeat, so
+/// the temporal cache is dropped on at most |Δh| distinct-res frames per
+/// ramp, not on every ramp frame. Must stay below STEP_DWELL so a ramp
+/// always completes before the next adoption can fire — `from` is then
+/// always a completed, quantized endpoint.
+pub const RAMP_FRAMES: u32 = 24;
+const _: () = assert!(RAMP_FRAMES < STEP_DWELL);
+
 /// Rate-limits applied resolution changes for both DRS paths. Every applied
 /// step costs upscaler history quality (RR re-initializes its denoiser on an
 /// input-res change; XeSS rescales its accumulation), and the controller's
@@ -257,38 +275,93 @@ pub const STEP_DWELL: u32 = 90;
 /// hits in quick succession, which presents as patchy re-convergence noise
 /// ("dancing"). A new target is adopted only after STEP_DWELL frames at the
 /// current res; when the dwell expires the CURRENT target is adopted in one
-/// multi-quantum jump (one history hit instead of five). The only bypass is
-/// an emergency shed on a badly blown frame — growing never bypasses.
+/// multi-quantum decision (one history hit instead of five). The only bypass
+/// is an emergency shed on a badly blown frame — growing never bypasses.
+///
+/// An adoption is a decision, not a jump: with a nonzero `ramp` the output
+/// resolution lerps from the previous endpoint to the adopted one over
+/// `ramp` frames instead of snapping (the sharpness pop of a multi-quantum
+/// jump, spread thin). Only the height lerps; the width is derived from the
+/// window aspect each frame via `width_for_height`. An emergency shed still
+/// snaps — it exists to relieve a blown frame NOW — and cancels any ramp in
+/// flight, including fast-forwarding a down-ramp whose endpoint is already
+/// the target.
 pub struct StepLimiter {
+    /// Adopted endpoint — always a `quantize_res` result.
     applied: (usize, usize),
+    /// Ramp start: the previously adopted endpoint (== `applied` when idle).
+    from: (usize, usize),
+    /// Frames since the last adoption — the dwell counter AND the ramp phase.
     since: u32,
+    /// Configured ramp length; 0 = snap.
+    ramp: u32,
 }
 
 impl StepLimiter {
-    pub fn new() -> Self {
-        Self { applied: (0, 0), since: 0 }
+    pub fn new(ramp: u32) -> Self {
+        Self { applied: (0, 0), from: (0, 0), since: 0, ramp }
     }
 
-    pub fn apply(&mut self, target: (usize, usize), emergency_shed: bool) -> (usize, usize) {
+    /// The adopted endpoint (where any in-flight ramp is headed).
+    pub fn endpoint(&self) -> (usize, usize) {
+        self.applied
+    }
+
+    /// True while a ramp is in flight (this frame's output != the endpoint).
+    pub fn ramping(&self) -> bool {
+        self.ramp != 0 && self.from != self.applied && self.since < self.ramp
+    }
+
+    pub fn apply(
+        &mut self,
+        target: (usize, usize),
+        emergency_shed: bool,
+        out: (usize, usize),
+        min: (usize, usize),
+        max: (usize, usize),
+    ) -> (usize, usize) {
         if self.applied.0 == 0 {
-            self.applied = target; // first frame adopts unconditionally
+            // First frame adopts unconditionally, without a ramp.
+            self.applied = target;
+            self.from = target;
             self.since = 0;
             return self.applied;
         }
         self.since = self.since.saturating_add(1);
-        if target != self.applied
-            && (self.since >= STEP_DWELL || (emergency_shed && target.1 < self.applied.1))
-        {
+        // The shed gate must see the ramp's CURRENT output, not the endpoint:
+        // mid up-ramp, a shed target below the endpoint but above the current
+        // output would otherwise GROW resolution on a blown frame. It is
+        // deliberately NOT gated on `target != applied`: mid down-ramp with
+        // the target already the endpoint, a blown frame must fast-forward
+        // the ramp (snap to the endpoint), not keep descending slowly.
+        let cur = self.output(out, min, max);
+        if emergency_shed && target.1 < cur.1 {
+            self.applied = target; // snap, cancelling any ramp in flight
+            self.from = target;
+            self.since = 0;
+        } else if target != self.applied && self.since >= STEP_DWELL {
+            self.from = self.applied; // ramp departs the completed endpoint
             self.applied = target;
             self.since = 0;
         }
-        self.applied
+        self.output(out, min, max)
     }
-}
 
-impl Default for StepLimiter {
-    fn default() -> Self {
-        Self::new()
+    /// The resolution THIS frame renders at: the applied endpoint, or a
+    /// height-lerped intermediate while a ramp is in flight. Linear in
+    /// height (monotone under rounding, endpoint exact at t = 1); the width
+    /// is derived per frame, never lerped — an independently lerped width
+    /// can drift off the exact window aspect, which XeSS rejects.
+    fn output(&self, out: (usize, usize), min: (usize, usize), max: (usize, usize)) -> (usize, usize) {
+        if self.ramp == 0 || self.from == self.applied || self.since >= self.ramp {
+            return self.applied;
+        }
+        let t = self.since as f32 / self.ramp as f32;
+        let rh = (self.from.1 as f32 + (self.applied.1 as f32 - self.from.1 as f32) * t).round()
+            as usize;
+        // Endpoints are already range-clamped; the height clamp is defensive.
+        let rh = rh.clamp(min.1.max(1), max.1.max(1));
+        (width_for_height(rh, out, min.0, max.0), rh)
     }
 }
 

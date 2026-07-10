@@ -96,9 +96,12 @@ impl UpdateStats {
 pub struct History {
     w: usize,
     h: usize,
-    color: Vec<f32>,    // w*h*3 EMA history, front (read)
+    /// Pixel capacity fixed at construction; `set_res` reinterprets within it
+    /// (the `GBufs::set_res` pattern — no per-step realloc).
+    cap: usize,
+    color: Vec<f32>,    // cap*3 EMA history, front (read); current res prefix
     color_bk: Vec<f32>, // back (write) — the update is a gather, so ping-pong
-    len: Vec<f32>,      // w*h effective sample count in the stored history
+    len: Vec<f32>,      // cap effective sample count in the stored history
     len_bk: Vec<f32>,
     /// 1 where the last update's fetch succeeded (accepted or coarse_kept).
     /// Written every update; consumed by the check gates.
@@ -117,6 +120,7 @@ impl History {
         Self {
             w,
             h,
+            cap: w * h,
             color: vec![0.0; w * h * 3],
             color_bk: vec![0.0; w * h * 3],
             len: vec![0.0; w * h],
@@ -134,27 +138,38 @@ impl History {
         self.prev_basis = None;
     }
 
-    /// The current history image (linear HDR, 3 floats/px) — the OIDN input.
-    pub fn color(&self) -> &[f32] {
-        &self.color
+    /// Reinterpret the buffers at a new resolution within capacity, without
+    /// reallocating — a res change invalidates by definition (reprojection
+    /// across a res change would mix pixel grids), so the stale contents are
+    /// never read. Called per distinct-res frame during a DRS ramp in XeSS
+    /// mode; a realloc here was a ~77 MB hit per ramp frame.
+    pub fn set_res(&mut self, w: usize, h: usize) {
+        assert!(w * h <= self.cap, "History::set_res beyond capacity");
+        if (w, h) != (self.w, self.h) {
+            self.w = w;
+            self.h = h;
+            self.invalidate();
+        }
     }
 
-    /// The resolution this history was allocated at. XeSS mode reallocates
-    /// the history when the dynamic render res steps (a fresh history is
-    /// also an invalidated one — reprojection across a res change would mix
-    /// pixel grids).
+    /// The current history image (linear HDR, 3 floats/px) — the OIDN input.
+    pub fn color(&self) -> &[f32] {
+        &self.color[..self.w * self.h * 3]
+    }
+
+    /// The resolution the history currently holds (see `set_res`).
     pub fn res(&self) -> (usize, usize) {
         (self.w, self.h)
     }
 
     /// Effective per-pixel sample counts (check gates).
     pub fn sample_counts(&self) -> &[f32] {
-        &self.len
+        &self.len[..self.w * self.h]
     }
 
     /// Last update's per-pixel fetch-succeeded mask (check gates).
     pub fn mask(&self) -> &[u8] {
-        &self.mask
+        &self.mask[..self.w * self.h]
     }
 
     /// Fold one fresh frame into the history. `accum` holds the frame's
@@ -182,7 +197,9 @@ impl History {
         let prev = self.prev_basis.unwrap_or(*cam); // read only when have_prev
         let fwd = cam.forward();
         let sky_z = SKY_DEPTH_FRAC * far;
-        let (color, len, prev_depth) = (&self.color[..], &self.len[..], &self.prev_depth[..]);
+        // Current-res prefixes: the vecs are capacity-sized (see set_res).
+        let (color, len, prev_depth) =
+            (&self.color[..w * h * 3], &self.len[..w * h], &self.prev_depth[..w * h]);
 
         // Bilinear history fetch at continuous pixel coords with per-tap
         // validity (in-bounds, sky<->sky / geom<->geom, relative view-Z
@@ -224,11 +241,10 @@ impl History {
             if sw < W_MIN { None } else { Some((c / sw, l / sw)) }
         };
 
-        let mut stats = self
-            .color_bk
+        let mut stats = self.color_bk[..w * h * 3]
             .par_chunks_mut(w * 3)
-            .zip(self.len_bk.par_chunks_mut(w))
-            .zip(self.mask.par_chunks_mut(w))
+            .zip(self.len_bk[..w * h].par_chunks_mut(w))
+            .zip(self.mask[..w * h].par_chunks_mut(w))
             .enumerate()
             .map(|(y, ((crow, lrow), mrow))| {
                 let mut s = UpdateStats::default();
@@ -313,7 +329,7 @@ impl History {
 
         std::mem::swap(&mut self.color, &mut self.color_bk);
         std::mem::swap(&mut self.len, &mut self.len_bk);
-        self.prev_depth.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        self.prev_depth[..w * h].par_chunks_mut(w).enumerate().for_each(|(y, row)| {
             for (x, v) in row.iter_mut().enumerate() {
                 *v = f32::from_bits(g.depth[y * w + x].load(Relaxed));
             }
@@ -532,6 +548,57 @@ pub fn self_test() -> Result<(), String> {
         return Err("coarse reset: flat color not taken at L = 1".into());
     }
     check_l_accounting(&hist, &s7, "coarse reset")?;
+
+    // 7. set_res: reinterpret within capacity — the accessor lengths track
+    //    the current res (not capacity), any res CHANGE invalidates (the
+    //    next update all-resets), and a same-res set_res keeps the history.
+    info[coarse_i].store(0, Relaxed); // undo section 6's coarse texel
+    let mut hist = History::new(N, N);
+    fill_accum(1.0);
+    hist.update(&basis0, &accum, &g, &info, far, 1024.0);
+    fill_accum(101.0);
+    hist.update(&basis0, &accum, &g, &info, far, 1024.0); // L = 2 everywhere
+    hist.set_res(N, N); // no-op: same res must NOT invalidate
+    let s8 = hist.update(&basis0, &accum, &g, &info, far, 1024.0);
+    if !s8.identity || s8.rejected != 0 {
+        return Err("set_res: same-res set_res invalidated the history".into());
+    }
+    let m = N / 2;
+    hist.set_res(m, m);
+    if hist.res() != (m, m)
+        || hist.color().len() != m * m * 3
+        || hist.sample_counts().len() != m * m
+        || hist.mask().len() != m * m
+    {
+        return Err("set_res: accessor lengths did not track the res".into());
+    }
+    let g2 = GBufs::new(m, m);
+    for d in &g2.depth {
+        d.store(z0.to_bits(), Relaxed);
+    }
+    let info2 = alloc_atomic(m * m);
+    let accum2 = alloc_atomic(m * m * 3);
+    for (i, a) in accum2.iter().enumerate() {
+        a.store((7.0 + i as f32).to_bits(), Relaxed);
+    }
+    let s9 = hist.update(&cam0.basis(m, m), &accum2, &g2, &info2, far, 1024.0);
+    if s9.identity || s9.rejected != (m * m) as u64 {
+        return Err(format!(
+            "set_res: shrink did not invalidate (identity {}, rejected {})",
+            s9.identity, s9.rejected
+        ));
+    }
+    if hist.sample_counts().iter().any(|&l| l != 1.0) {
+        return Err("set_res: post-shrink L != 1".into());
+    }
+    hist.set_res(N, N); // back up within capacity: also a res change
+    let s10 = hist.update(&basis0, &accum, &g, &info, far, 1024.0);
+    if s10.identity || s10.rejected != (N * N) as u64 {
+        return Err(format!(
+            "set_res: grow-back did not invalidate (identity {}, rejected {})",
+            s10.identity, s10.rejected
+        ));
+    }
 
     Ok(())
 }
