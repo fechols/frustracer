@@ -21,9 +21,11 @@ pub struct Stats {
     pub cut_len_sum: AtomicU64,
     /// Cut refinements that ran out of budget and emitted an internal node.
     pub cut_overflows: AtomicU64,
-    /// Tiles flat-filled at the depth cap, and their pixels.
+    /// Tiles sparse-filled at the depth cap, and their flooded (non-sample) pixels.
     pub coarse_tiles: AtomicU64,
     pub coarse_pixels: AtomicU64,
+    /// Real point samples shot inside sparse-filled tiles (one per cell).
+    pub coarse_samples: AtomicU64,
     /// Tiles whose t_start was raised by a previous-frame temporal seed.
     pub temporal_seeds: AtomicU64,
     /// Tiles sky-filled straight from the temporal cache (zero BVH work).
@@ -44,6 +46,19 @@ pub struct Stats {
     pub shaft_nodes: AtomicU64,
     /// Shadow rays skipped because the shaft proved the subrect unoccluded.
     pub shaft_rays_skipped: AtomicU64,
+    /// Adaptive-rate cells (XeSS mode): shared-visibility, per-pixel, and
+    /// supersampled tiers; edge pixels that didn't form a full cell.
+    pub adapt_coarse: AtomicU64,
+    pub adapt_base: AtomicU64,
+    pub adapt_hot: AtomicU64,
+    pub adapt_partial_px: AtomicU64,
+    /// Second full samples shot in HOT cells (4 per hot cell).
+    pub adapt_topup: AtomicU64,
+    /// Coherent cells that fell back to per-pixel rays on fractional
+    /// (penumbral) shared visibility.
+    pub adapt_penumbra: AtomicU64,
+    /// Shadow/AO rays skipped by applying a shared VisRecord.
+    pub adapt_rays_saved: AtomicU64,
 }
 
 #[derive(Default)]
@@ -63,6 +78,7 @@ pub struct LocalStats {
     pub cut_overflows: u64,
     pub coarse_tiles: u64,
     pub coarse_pixels: u64,
+    pub coarse_samples: u64,
     pub temporal_seeds: u64,
     pub temporal_sky_tiles: u64,
     pub temporal_tests: u64,
@@ -74,6 +90,13 @@ pub struct LocalStats {
     pub shaft_queries: u64,
     pub shaft_nodes: u64,
     pub shaft_rays_skipped: u64,
+    pub adapt_coarse: u64,
+    pub adapt_base: u64,
+    pub adapt_hot: u64,
+    pub adapt_partial_px: u64,
+    pub adapt_topup: u64,
+    pub adapt_penumbra: u64,
+    pub adapt_rays_saved: u64,
 }
 
 impl LocalStats {
@@ -95,6 +118,7 @@ impl LocalStats {
         self.cut_overflows += o.cut_overflows;
         self.coarse_tiles += o.coarse_tiles;
         self.coarse_pixels += o.coarse_pixels;
+        self.coarse_samples += o.coarse_samples;
         self.temporal_seeds += o.temporal_seeds;
         self.temporal_sky_tiles += o.temporal_sky_tiles;
         self.temporal_tests += o.temporal_tests;
@@ -106,6 +130,13 @@ impl LocalStats {
         self.shaft_queries += o.shaft_queries;
         self.shaft_nodes += o.shaft_nodes;
         self.shaft_rays_skipped += o.shaft_rays_skipped;
+        self.adapt_coarse += o.adapt_coarse;
+        self.adapt_base += o.adapt_base;
+        self.adapt_hot += o.adapt_hot;
+        self.adapt_partial_px += o.adapt_partial_px;
+        self.adapt_topup += o.adapt_topup;
+        self.adapt_penumbra += o.adapt_penumbra;
+        self.adapt_rays_saved += o.adapt_rays_saved;
     }
 }
 
@@ -126,6 +157,7 @@ impl Stats {
         self.cut_overflows.store(0, Relaxed);
         self.coarse_tiles.store(0, Relaxed);
         self.coarse_pixels.store(0, Relaxed);
+        self.coarse_samples.store(0, Relaxed);
         self.temporal_seeds.store(0, Relaxed);
         self.temporal_sky_tiles.store(0, Relaxed);
         self.temporal_tests.store(0, Relaxed);
@@ -137,6 +169,13 @@ impl Stats {
         self.shaft_queries.store(0, Relaxed);
         self.shaft_nodes.store(0, Relaxed);
         self.shaft_rays_skipped.store(0, Relaxed);
+        self.adapt_coarse.store(0, Relaxed);
+        self.adapt_base.store(0, Relaxed);
+        self.adapt_hot.store(0, Relaxed);
+        self.adapt_partial_px.store(0, Relaxed);
+        self.adapt_topup.store(0, Relaxed);
+        self.adapt_penumbra.store(0, Relaxed);
+        self.adapt_rays_saved.store(0, Relaxed);
     }
 
     pub fn add(&self, l: &LocalStats) {
@@ -185,6 +224,9 @@ impl Stats {
         if l.coarse_pixels > 0 {
             self.coarse_pixels.fetch_add(l.coarse_pixels, Relaxed);
         }
+        if l.coarse_samples > 0 {
+            self.coarse_samples.fetch_add(l.coarse_samples, Relaxed);
+        }
         if l.temporal_seeds > 0 {
             self.temporal_seeds.fetch_add(l.temporal_seeds, Relaxed);
         }
@@ -218,6 +260,27 @@ impl Stats {
         if l.shaft_rays_skipped > 0 {
             self.shaft_rays_skipped.fetch_add(l.shaft_rays_skipped, Relaxed);
         }
+        if l.adapt_coarse > 0 {
+            self.adapt_coarse.fetch_add(l.adapt_coarse, Relaxed);
+        }
+        if l.adapt_base > 0 {
+            self.adapt_base.fetch_add(l.adapt_base, Relaxed);
+        }
+        if l.adapt_hot > 0 {
+            self.adapt_hot.fetch_add(l.adapt_hot, Relaxed);
+        }
+        if l.adapt_partial_px > 0 {
+            self.adapt_partial_px.fetch_add(l.adapt_partial_px, Relaxed);
+        }
+        if l.adapt_topup > 0 {
+            self.adapt_topup.fetch_add(l.adapt_topup, Relaxed);
+        }
+        if l.adapt_penumbra > 0 {
+            self.adapt_penumbra.fetch_add(l.adapt_penumbra, Relaxed);
+        }
+        if l.adapt_rays_saved > 0 {
+            self.adapt_rays_saved.fetch_add(l.adapt_rays_saved, Relaxed);
+        }
     }
 
     pub fn summary_line(&self) -> String {
@@ -244,6 +307,7 @@ impl Stats {
         };
         let ovf = self.cut_overflows.load(Relaxed);
         let coarse = self.coarse_pixels.load(Relaxed);
+        let csmp = self.coarse_samples.load(Relaxed);
         let tseeds = self.temporal_seeds.load(Relaxed);
         let tsky = self.temporal_sky_tiles.load(Relaxed);
         let ttests = self.temporal_tests.load(Relaxed);
@@ -270,8 +334,22 @@ impl Stats {
         } else {
             String::new()
         };
+        let ac = self.adapt_coarse.load(Relaxed);
+        let ab = self.adapt_base.load(Relaxed);
+        let ah = self.adapt_hot.load(Relaxed);
+        let adapt = if ac + ab + ah > 0 {
+            format!(
+                " | adapt: {ac}c/{ab}b/{ah}h (+{} edge-px) topup {} saved {} penumbra {}",
+                self.adapt_partial_px.load(Relaxed),
+                self.adapt_topup.load(Relaxed),
+                self.adapt_rays_saved.load(Relaxed),
+                self.adapt_penumbra.load(Relaxed),
+            )
+        } else {
+            String::new()
+        };
         format!(
-            "tiles {tiles} | fr-queries {fq} (blocked {blocked}) | cut mean {cut_mean:.1} (ovf {ovf}) | nodes: frustum {fnodes} + ray {rnodes} = {} | rays: {prim} prim + {sec} sec | sky-px (0 rays) {sky} | coarse-px {coarse} | temporal: seeds {tseeds} sky {tsky} cells {ttests} | mean t_start/t_hit {skip:.2}{hemi}{shaft}",
+            "tiles {tiles} | fr-queries {fq} (blocked {blocked}) | cut mean {cut_mean:.1} (ovf {ovf}) | nodes: frustum {fnodes} + ray {rnodes} = {} | rays: {prim} prim + {sec} sec | sky-px (0 rays) {sky} | coarse-px {coarse} (smp {csmp}) | temporal: seeds {tseeds} sky {tsky} cells {ttests} | mean t_start/t_hit {skip:.2}{hemi}{shaft}{adapt}",
             fnodes + rnodes
         )
     }

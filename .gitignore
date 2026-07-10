@@ -2,6 +2,8 @@
 check.png
 screenshot_*.png
 dlss_gbuf_*.png
+oidn_*.png
+xess_gbuf_*.png
 
 # Streamline SDK: only the MIT-licensed headers and markdown docs are
 # committed (what NVIDIA publishes in their public GitHub repo). The runtime

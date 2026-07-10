@@ -1,4 +1,4 @@
-use crate::bvh::{Bvh, Ray};
+use crate::bvh::{Bvh, Hit, Ray};
 use crate::camera::CamBasis;
 use crate::dlss;
 use crate::frustum::{self, MAX_CUT};
@@ -57,6 +57,11 @@ pub struct FrameCtx<'a> {
     /// Frame-uniform sub-pixel jitter offset in [-0.5, 0.5) (DLSS mode);
     /// None => the legacy per-pixel rng jitter controlled by `jitter`.
     pub frame_jitter: Option<(f32, f32)>,
+    /// Adaptive shading rate (XeSS mode only): leaf tiles shade in 2×2 cells
+    /// that share visibility rays where coherent and supersample where noisy.
+    /// Visibility stays per-pixel regardless — tbuf/G-buffers are identical
+    /// to a non-adaptive frame; only radiance sampling changes.
+    pub adaptive: bool,
 }
 
 impl FrameCtx<'_> {
@@ -147,7 +152,8 @@ fn tile_step(
 /// The frustracer core: trace the tile's frustum until it could hit geometry,
 /// then split into 4 quadrants that inherit the proven-empty distance and the
 /// refined node cut. Tiles that reach `max_depth` unresolved (not sky, not
-/// leaf) become one flat-shaded quad; `u32::MAX` means uncapped.
+/// leaf) are sparse-filled (real point samples + cell-flood fallback);
+/// `u32::MAX` means uncapped.
 fn trace_tile(
     ctx: &FrameCtx,
     x0: usize,
@@ -169,12 +175,12 @@ fn trace_tile(
         return;
     }
     // After the leaf check, so a cap >= the leaf depth is exactly uncapped.
-    // Flat-fill uses the inherited cut and t_start — same as the split would.
+    // Sparse-fill uses the inherited cut and t_start — same as the split would.
     // No temporal probe or store here: the inherited t_start already carries
     // the parent's (possibly seeded) tc, and its cache entry covers this tile.
     if depth >= max_depth {
         let mut ls = LocalStats::default();
-        flat_fill(ctx, x0, y0, x1, y1, t_start, depth, cut_in, &mut ls);
+        sparse_fill(ctx, x0, y0, x1, y1, t_start, depth, cut_in, &mut ls);
         ctx.stats.add(&ls);
         return;
     }
@@ -268,12 +274,176 @@ fn shade_tile(
     cut: &[u32],
 ) {
     let mut ls = LocalStats::default();
-    for y in y0..y1 {
-        for x in x0..x1 {
-            shade_pixel(ctx, x, y, t_start, depth, kind, Some(cut), &mut ls);
+    if ctx.adaptive {
+        let mut cy = y0;
+        while cy < y1 {
+            let cy1 = (cy + ADAPT_CELL).min(y1);
+            let mut cx = x0;
+            while cx < x1 {
+                let cx1 = (cx + ADAPT_CELL).min(x1);
+                shade_cell(ctx, cx, cy, cx1, cy1, t_start, depth, kind, cut, &mut ls);
+                cx = cx1;
+            }
+            cy = cy1;
+        }
+    } else {
+        for y in y0..y1 {
+            for x in x0..x1 {
+                shade_pixel(ctx, x, y, t_start, depth, kind, Some(cut), &mut ls);
+            }
         }
     }
     ctx.stats.add(&ls);
+}
+
+/// Adaptive shading rate (XeSS mode): cell side length. 2×2 keeps the
+/// coherence guarantee tight and the shared-origin shift sub-pixel.
+pub const ADAPT_CELL: usize = 2;
+/// Geometric coherence vs the representative: relative Euclidean-t gap and
+/// interpolated-normal agreement under which a pixel may reuse the rep's
+/// visibility record (same material is also required — exact, via tri_mat).
+const COH_DT: f32 = 0.02;
+const COH_NDOT: f32 = 0.95;
+/// Relative luminance spread (max-min over cell mean) above which the cell
+/// takes a second full sample per pixel.
+const HOT_SPREAD: f32 = 0.35;
+
+/// One adaptive 2×2 cell: per-pixel visibility ALWAYS (four real primary
+/// rays with the tile's inherited cut/t_start — tbuf and every G-buffer
+/// guide are identical to a non-adaptive frame), adaptive shading effort:
+/// - COARSE: coherent pixels reuse the representative's shadow/AO rays
+///   (`VisCtl::Apply`), re-applying their own N·L/albedo/specular. Requires
+///   uniform captured visibility — fractional means penumbra, where each
+///   pixel pays its own rays (the self-declassifier).
+/// - HOT: high in-cell luminance spread ⇒ one extra full sample per pixel
+///   at its own in-pixel position, averaged locally, no meta/G-buffer writes.
+/// Every pixel splats exactly once, at the end.
+#[allow(clippy::too_many_arguments)]
+fn shade_cell(
+    ctx: &FrameCtx,
+    cx: usize,
+    cy: usize,
+    cx1: usize,
+    cy1: usize,
+    t_start: f32,
+    depth: u32,
+    kind: u32,
+    cut: &[u32],
+    ls: &mut LocalStats,
+) {
+    if (cx1 - cx, cy1 - cy) != (ADAPT_CELL, ADAPT_CELL) {
+        // Odd-edge remainder: nothing to share within, plain per-pixel.
+        for y in cy..cy1 {
+            for x in cx..cx1 {
+                shade_pixel(ctx, x, y, t_start, depth, kind, Some(cut), ls);
+                ls.adapt_partial_px += 1;
+            }
+        }
+        return;
+    }
+    let coords = [(cx, cy), (cx + 1, cy), (cx, cy + 1), (cx + 1, cy + 1)];
+    // Visibility phase first: classification below reads real hits.
+    let mut tr: [Traced; 4] =
+        coords.map(|(x, y)| trace_primary(ctx, x, y, t_start, Some(cut), ls, 0));
+    // Surface points once per pixel: the coherence test and shade() consume
+    // the same (p, n) — recomputing per shaded pixel was a wasted triangle
+    // fetch + interpolation in the hottest adaptive loop.
+    let sp: [Option<(Vec3A, Vec3A)>; 4] = std::array::from_fn(|i| {
+        tr[i].hit.map(|h| shade::surface_point(ctx.scene, &tr[i].ray, &h))
+    });
+    // Rotate the representative per frame (and stagger across cells) so the
+    // shared-ray-origin bias averages out temporally.
+    let rep = (ctx.frame as usize + cx / ADAPT_CELL + cy / ADAPT_CELL) & 3;
+
+    let mut vis = shade::VisRecord::default();
+    let mut out = [Vec3A::ZERO; 4];
+    let (rx, ry) = coords[rep];
+    out[rep] = shade_traced(
+        ctx,
+        rx,
+        ry,
+        t_start,
+        depth,
+        kind,
+        &mut tr[rep],
+        sp[rep],
+        ls,
+        true,
+        false,
+        shade::VisCtl::Capture(&mut vis),
+    )
+    .c;
+
+    // Rep hit data for the coherence test (borrow tr[rep] read-only now).
+    let rep_hit = tr[rep].hit;
+    let rep_n = sp[rep].map(|(_, n)| n);
+    let mut applied = 0u32;
+    for i in 0..4 {
+        if i == rep {
+            continue;
+        }
+        let (x, y) = coords[i];
+        let coherent = match (&rep_hit, &tr[i].hit) {
+            (Some(rh), Some(ih)) => {
+                ctx.scene.tri_mat[rh.tri as usize] == ctx.scene.tri_mat[ih.tri as usize]
+                    && (ih.t - rh.t).abs() < COH_DT * rh.t.max(1e-6)
+                    && sp[i].unwrap().1.dot(rep_n.unwrap()) > COH_NDOT
+            }
+            _ => false,
+        };
+        let v = if coherent && vis.uniform {
+            applied += 1;
+            shade::VisCtl::Apply(&vis)
+        } else {
+            if coherent {
+                ls.adapt_penumbra += 1;
+            }
+            shade::VisCtl::Off
+        };
+        out[i] =
+            shade_traced(ctx, x, y, t_start, depth, kind, &mut tr[i], sp[i], ls, true, false, v)
+                .c;
+    }
+
+    // HOT: in-cell luminance spread — shading noise or an in-cell edge;
+    // either earns a second full sample per pixel (footprint supersampling).
+    let lum = |c: Vec3A| 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;
+    let l = out.map(lum);
+    let (lmin, lmax) = l.iter().fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
+    let mean = (l[0] + l[1] + l[2] + l[3]) * 0.25;
+    if lmax - lmin > HOT_SPREAD * (mean + 1e-3) {
+        ls.adapt_hot += 1;
+        for i in 0..4 {
+            let (x, y) = coords[i];
+            let mut t2 = trace_primary(ctx, x, y, t_start, Some(cut), ls, TOPUP_SALT);
+            // The top-up traces its own salted ray — its hit differs from the
+            // first sample's, so no precomputed surface point applies.
+            let s2 = shade_traced(
+                ctx,
+                x,
+                y,
+                t_start,
+                depth,
+                kind,
+                &mut t2,
+                None,
+                ls,
+                false,
+                false,
+                shade::VisCtl::Off,
+            );
+            out[i] = (out[i] + s2.c) * 0.5;
+            ls.adapt_topup += 1;
+        }
+    } else if applied == 3 {
+        ls.adapt_coarse += 1;
+    } else {
+        ls.adapt_base += 1;
+    }
+    for i in 0..4 {
+        let (x, y) = coords[i];
+        ctx.splat(x, y, out[i]);
+    }
 }
 
 /// G-buffer write for a primary hit at continuous sample position (fx, fy).
@@ -350,31 +520,67 @@ fn write_gbuf_sky(ctx: &FrameCtx, x: usize, y: usize, fx: f32, fy: f32, dir: Vec
     );
 }
 
-fn shade_pixel(
+/// The traced result of one `shade_pixel` sample — returned so `sparse_fill`
+/// can reuse a cell's sample as that cell's fallback fill.
+struct Sample {
+    c: Vec3A,
+    /// Euclidean hit distance (== ray t, unit dir); INFINITY on sky.
+    t: f32,
+    dir: Vec3A,
+    /// Primary-surface capture; default when the ray missed (unused — sky
+    /// pixels take `write_gbuf_sky`) or when `ctx.gbuf` is None.
+    prim: shade::PrimarySurface,
+}
+
+/// A traced-but-not-yet-shaded primary sample: `trace_primary`'s output,
+/// `shade_traced`'s input. The adaptive cells trace all four pixels first so
+/// coherence classification reads real hits, never guesses.
+struct Traced {
+    fx: f32,
+    fy: f32,
+    dir: Vec3A,
+    ray: Ray,
+    hit: Option<Hit>,
+    /// Shading RNG, positioned exactly where the fused path would have it.
+    rng: fastrand::Rng,
+}
+
+/// Mixed into the HOT top-up sample's seed so its in-pixel position and
+/// shading stream decorrelate from the cell's first samples.
+const TOPUP_SALT: u64 = 0x517C_C1B7_2722_0A95;
+
+fn trace_primary(
     ctx: &FrameCtx,
     x: usize,
     y: usize,
     t_start: f32,
-    depth: u32,
-    kind: u32,
     cut: Option<&[u32]>,
     ls: &mut LocalStats,
-) {
+    salt: u64,
+) -> Traced {
     let seed = (x as u64)
         .wrapping_mul(0x9E3779B97F4A7C15)
         .wrapping_add((y as u64).wrapping_mul(0xC2B2AE3D27D4EB4F))
-        .wrapping_add(ctx.frame as u64);
+        .wrapping_add(ctx.frame as u64)
+        .wrapping_add(salt);
     let mut rng = fastrand::Rng::with_seed(seed);
     // DLSS mode: one frame-uniform low-discrepancy offset for every pixel
     // (the denoiser is told this exact offset). Legacy: per-pixel rng.
     // Either way the sample stays in [x, x+1) — the invariant leaf rays need.
-    let (jx, jy) = match ctx.frame_jitter {
-        Some((ox, oy)) => (0.5 + ox, 0.5 + oy),
-        None => {
-            if ctx.jitter {
-                (rng.f32(), rng.f32())
-            } else {
-                (0.5, 0.5)
+    // A salted (HOT top-up) sample takes its own random in-pixel position —
+    // footprint supersampling; the reported frame jitter stays tied to the
+    // cell's first samples, which are the only ones that write meta/G-buffers.
+    let (jx, jy) = if salt != 0 {
+        (rng.f32(), rng.f32())
+    } else {
+        match ctx.frame_jitter {
+            Some((ox, oy)) => (0.5 + ox, 0.5 + oy),
+            None => {
+                if ctx.jitter {
+                    (rng.f32(), rng.f32())
+                } else {
+                    (0.5, 0.5)
+                }
             }
         }
     };
@@ -388,35 +594,89 @@ fn shade_pixel(
         // Plain reference path: full traversal from the root.
         None => ctx.bvh.intersect(ctx.scene, &ray, t_start, f32::INFINITY, &mut ls.ray_nodes),
     };
-    match hit {
+    Traced { fx, fy, dir, ray, hit, rng }
+}
+
+/// Shade a traced sample. `primary` gates every per-pixel side channel
+/// (tbuf/info meta, G-buffers, skip-ratio stats) — true for the pixel's
+/// first sample, false for HOT top-ups so the guides stay tied to the
+/// reported frame jitter. `do_splat` false lets the adaptive cell average
+/// locally and splat once (two splats would break both accum semantics).
+#[allow(clippy::too_many_arguments)]
+fn shade_traced(
+    ctx: &FrameCtx,
+    x: usize,
+    y: usize,
+    t_start: f32,
+    depth: u32,
+    kind: u32,
+    tr: &mut Traced,
+    sp: Option<(Vec3A, Vec3A)>,
+    ls: &mut LocalStats,
+    primary: bool,
+    do_splat: bool,
+    vis: shade::VisCtl,
+) -> Sample {
+    match tr.hit {
         Some(hit) => {
-            ctx.store_meta(x, y, hit.t, depth, kind);
-            if t_start > 0.0 {
-                ls.skip_ratio_micro += (t_start / hit.t * 1e6) as u64;
+            if primary {
+                ctx.store_meta(x, y, hit.t, depth, kind);
+                if t_start > 0.0 {
+                    ls.skip_ratio_micro += (t_start / hit.t * 1e6) as u64;
+                }
+                ls.skip_ratio_count += 1;
             }
-            ls.skip_ratio_count += 1;
             let mut prim = shade::PrimarySurface::default();
             let c = shade::shade(
                 ctx.scene,
                 ctx.bvh,
-                &ray,
+                &tr.ray,
                 &hit,
+                sp,
                 &ctx.q,
-                &mut rng,
+                &mut tr.rng,
                 ctx.sun,
                 0,
                 ls,
-                if ctx.gbuf.is_some() { Some(&mut prim) } else { None },
+                if primary && ctx.gbuf.is_some() { Some(&mut prim) } else { None },
+                vis,
             );
-            ctx.splat(x, y, c);
-            write_gbuf_hit(ctx, x, y, fx, fy, dir, hit.t, &prim);
+            if do_splat {
+                ctx.splat(x, y, c);
+            }
+            if primary {
+                write_gbuf_hit(ctx, x, y, tr.fx, tr.fy, tr.dir, hit.t, &prim);
+            }
+            Sample { c, t: hit.t, dir: tr.dir, prim }
         }
         None => {
-            ctx.store_meta(x, y, f32::INFINITY, depth, kind);
-            ctx.splat(x, y, shade::sky(dir, ctx.sun));
-            write_gbuf_sky(ctx, x, y, fx, fy, dir);
+            if primary {
+                ctx.store_meta(x, y, f32::INFINITY, depth, kind);
+            }
+            let c = shade::sky(tr.dir, ctx.sun);
+            if do_splat {
+                ctx.splat(x, y, c);
+            }
+            if primary {
+                write_gbuf_sky(ctx, x, y, tr.fx, tr.fy, tr.dir);
+            }
+            Sample { c, t: f32::INFINITY, dir: tr.dir, prim: shade::PrimarySurface::default() }
         }
     }
+}
+
+fn shade_pixel(
+    ctx: &FrameCtx,
+    x: usize,
+    y: usize,
+    t_start: f32,
+    depth: u32,
+    kind: u32,
+    cut: Option<&[u32]>,
+    ls: &mut LocalStats,
+) -> Sample {
+    let mut tr = trace_primary(ctx, x, y, t_start, cut, ls, 0);
+    shade_traced(ctx, x, y, t_start, depth, kind, &mut tr, None, ls, true, true, shade::VisCtl::Off)
 }
 
 /// The depth cap never flat-fills tiles shallower than this (a bad estimate
@@ -425,7 +685,7 @@ pub const MIN_BUDGET_DEPTH: u32 = 2;
 
 /// Depth-capped dynamic resolution: the same depth-first recursion as
 /// `render_frame`, but every screen area stops at a uniform `max_depth` and
-/// unresolved tiles there become one flat-shaded quad each. The caller (the
+/// unresolved tiles there are sparse-filled. The caller (the
 /// frame-budget controller in main.rs) estimates `max_depth` from the previous
 /// frame's time — no wall clock is read here, so the frame is deterministic
 /// for a given cap. A cap at or beyond the leaf depth is bit-identical to
@@ -434,9 +694,22 @@ pub fn render_frame_capped(ctx: &FrameCtx, max_depth: u32) {
     trace_tile(ctx, 0, 0, ctx.rw, ctx.rh, 0.0, 0, 0, &[0], max_depth.max(MIN_BUDGET_DEPTH));
 }
 
-/// Depth cap reached: this quad becomes one "pixel" — the color of a single
-/// representative ray through its center, starting at the inherited distance.
-fn flat_fill(
+/// Side length of the sparse-fill sample grid: each capped quad shoots one
+/// real point sample per SAMPLE_CELL×SAMPLE_CELL cell (~0.4% of full-res
+/// rays at typical caps). Denser de-blocks faster but costs budget-frame
+/// time — the depth controller absorbs it by lowering the cap.
+pub const SAMPLE_CELL: usize = 16;
+
+/// Depth cap reached: fill the quad from real point samples instead of one
+/// flat quad ("a pixel is not a little square"). Each SAMPLE_CELL cell traces
+/// one full `shade_pixel` sample at a per-frame random pixel — stored as
+/// KIND_LEAF with exact t and G-buffer, sound because every pixel of a capped
+/// tile lies inside the tile frustum, so the inherited cut and `t_start`
+/// apply (the leaf-tile argument). The rest of the cell floods with that
+/// sample's result as the KIND_COARSE fallback, consumed only where the
+/// reprojection history has nothing better (reproject.rs keeps history over
+/// coarse pixels at blend weight 0).
+fn sparse_fill(
     ctx: &FrameCtx,
     x0: usize,
     y0: usize,
@@ -447,50 +720,46 @@ fn flat_fill(
     cut: &[u32],
     ls: &mut LocalStats,
 ) {
-    let dir = ctx.cam.ray_dir((x0 + x1) as f32 * 0.5, (y0 + y1) as f32 * 0.5);
-    let ray = Ray::new(ctx.cam.origin, dir);
+    // Sample-position RNG: per-quad, per-frame (the old flat-fill seed recipe).
     let seed = (x0 as u64)
         .wrapping_mul(0x9E3779B97F4A7C15)
         .wrapping_add((y0 as u64).wrapping_mul(0xC2B2AE3D27D4EB4F))
         .wrapping_add(ctx.frame as u64);
     let mut rng = fastrand::Rng::with_seed(seed);
-    ls.primary_rays += 1;
-    let mut prim = shade::PrimarySurface::default();
-    let (c, thit) = match ctx.bvh.intersect_multi(ctx.scene, &ray, t_start, f32::INFINITY, cut, &mut ls.ray_nodes) {
-        Some(hit) => {
-            let c = shade::shade(
-                ctx.scene,
-                ctx.bvh,
-                &ray,
-                &hit,
-                &ctx.q,
-                &mut rng,
-                ctx.sun,
-                0,
-                ls,
-                if ctx.gbuf.is_some() { Some(&mut prim) } else { None },
-            );
-            (c, hit.t)
-        }
-        None => (shade::sky(dir, ctx.sun), f32::INFINITY),
-    };
     ls.coarse_tiles += 1;
-    ls.coarse_pixels += ((x1 - x0) * (y1 - y0)) as u64;
-    for y in y0..y1 {
-        for x in x0..x1 {
-            ctx.store_meta(x, y, thit, depth, KIND_COARSE);
-            ctx.splat(x, y, c);
-            // Shared center-ray surface for the whole quad, but per-pixel
-            // sample position — the write helpers subtract (fx, fy), so the
-            // camera-motion part of the MV stays per-pixel-correct even in
-            // coarse quads.
-            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
-            if thit.is_finite() {
-                write_gbuf_hit(ctx, x, y, fx, fy, dir, thit, &prim);
-            } else {
-                write_gbuf_sky(ctx, x, y, fx, fy, dir);
+    let mut cy = y0;
+    while cy < y1 {
+        let cy1 = (cy + SAMPLE_CELL).min(y1);
+        let mut cx = x0;
+        while cx < x1 {
+            let cx1 = (cx + SAMPLE_CELL).min(x1);
+            let sx = cx + rng.usize(..cx1 - cx);
+            let sy = cy + rng.usize(..cy1 - cy);
+            let s = shade_pixel(ctx, sx, sy, t_start, depth, KIND_LEAF, Some(cut), ls);
+            ls.coarse_samples += 1;
+            ls.coarse_pixels += ((cx1 - cx) * (cy1 - cy) - 1) as u64;
+            for y in cy..cy1 {
+                for x in cx..cx1 {
+                    if x == sx && y == sy {
+                        continue;
+                    }
+                    ctx.store_meta(x, y, s.t, depth, KIND_COARSE);
+                    ctx.splat(x, y, s.c);
+                    // Shared in-cell sample surface, per-pixel sample position
+                    // — the write helpers subtract (fx, fy), so the camera-
+                    // motion part of the MV stays per-pixel-correct even in
+                    // coarse cells.
+                    let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
+                    if s.t.is_finite() {
+                        write_gbuf_hit(ctx, x, y, fx, fy, s.dir, s.t, &s.prim);
+                    } else {
+                        write_gbuf_sky(ctx, x, y, fx, fy, s.dir);
+                    }
+                }
             }
+            cx = cx1;
         }
+        cy = cy1;
     }
 }
 
@@ -535,22 +804,61 @@ pub fn resolve(
                 f32::from_bits(accum[i + 1].load(Relaxed)),
                 f32::from_bits(accum[i + 2].load(Relaxed)),
             ) * inv;
-            // soft rolloff + gamma
-            let mut c = (Vec3A::ONE - (-c).exp()).powf(1.0 / 2.2);
-            if overlay_on {
-                let pi = info[sy * rw + sx].load(Relaxed);
-                let (tint, alpha) = overlay::tint(pi);
-                c = c.lerp(tint, alpha);
-                let right = if sx + 1 < rw { info[sy * rw + sx + 1].load(Relaxed) } else { pi };
-                let down = if sy + 1 < rh { info[(sy + 1) * rw + sx].load(Relaxed) } else { pi };
-                if right != pi || down != pi {
-                    c *= 0.25; // tile border
-                }
-            }
-            let c = (c.clamp(Vec3A::ZERO, Vec3A::ONE) * 255.0 + 0.5).floor();
-            *out = ((c.x as u32) << 16) | ((c.y as u32) << 8) | c.z as u32;
+            *out = present_px(c, info, overlay_on, sx, sy, rw, rh);
         }
     });
+}
+
+/// `resolve` for an already-averaged linear HDR buffer (3 floats/px) — the
+/// OIDN output path. Same tonemap curve, overlay composite, and upscale.
+pub fn resolve_hdr(
+    hdr: &[f32],
+    info: &[AtomicU32],
+    overlay_on: bool,
+    present: &mut [u32],
+    rw: usize,
+    rh: usize,
+    ww: usize,
+    wh: usize,
+) {
+    present.par_chunks_mut(ww).enumerate().for_each(|(wy, row)| {
+        let sy = (wy * rh / wh).min(rh - 1);
+        for (wx, out) in row.iter_mut().enumerate() {
+            let sx = (wx * rw / ww).min(rw - 1);
+            let i = (sy * rw + sx) * 3;
+            let c = Vec3A::new(hdr[i], hdr[i + 1], hdr[i + 2]);
+            *out = present_px(c, info, overlay_on, sx, sy, rw, rh);
+        }
+    });
+}
+
+/// Tonemap one averaged linear-RGB pixel (soft rolloff + gamma), blend the
+/// debug overlay, and pack to 0x00RRGGBB — the single CPU-side source of the
+/// presentation curve, shared by `resolve` and `resolve_hdr`.
+#[inline]
+fn present_px(
+    c: Vec3A,
+    info: &[AtomicU32],
+    overlay_on: bool,
+    sx: usize,
+    sy: usize,
+    rw: usize,
+    rh: usize,
+) -> u32 {
+    // soft rolloff + gamma
+    let mut c = (Vec3A::ONE - (-c).exp()).powf(1.0 / 2.2);
+    if overlay_on {
+        let pi = info[sy * rw + sx].load(Relaxed);
+        let (tint, alpha) = overlay::tint(pi);
+        c = c.lerp(tint, alpha);
+        let right = if sx + 1 < rw { info[sy * rw + sx + 1].load(Relaxed) } else { pi };
+        let down = if sy + 1 < rh { info[(sy + 1) * rw + sx].load(Relaxed) } else { pi };
+        if right != pi || down != pi {
+            c *= 0.25; // tile border
+        }
+    }
+    let c = (c.clamp(Vec3A::ZERO, Vec3A::ONE) * 255.0 + 0.5).floor();
+    ((c.x as u32) << 16) | ((c.y as u32) << 8) | c.z as u32
 }
 
 pub struct VerifyReport {
@@ -562,9 +870,10 @@ pub struct VerifyReport {
     pub overshoot: u64,
     /// Hybrid hit where reference missed (should be impossible).
     pub hybrid_extra: u64,
-    /// Pixels flat-filled by the depth cap — excluded from every counter above
-    /// (a coarse quad holds one splatted center-ray t and may straddle
-    /// sky/geometry), counted so callers can assert the capped path ran.
+    /// Pixels cell-flooded by the depth cap — excluded from every counter
+    /// above (a coarse pixel holds its cell sample's splatted t and may
+    /// straddle sky/geometry), counted so callers can assert the capped path
+    /// ran. Sparse-fill sample pixels are KIND_LEAF and are verified.
     pub coarse: u64,
     pub max_rel_err: f32,
 }
@@ -579,8 +888,9 @@ impl VerifyReport {
 /// pixel's primary-hit t against a tmin=0 reference ray. Detects the
 /// spherical-vs-planar near-bound bug class (and now cut-dropping bugs)
 /// directly. `max_depth` renders through the depth-capped driver instead of
-/// the uncapped one; coarse (flat-filled) pixels are skipped by the comparison
-/// but counted, so all non-coarse pixels must still verify exactly.
+/// the uncapped one; coarse (cell-flooded) pixels are skipped by the
+/// comparison but counted, so all non-coarse pixels — including sparse-fill
+/// sample pixels — must still verify exactly.
 pub fn verify(
     scene: &Scene,
     bvh: &Bvh,
@@ -615,6 +925,7 @@ pub fn verify(
         gbuf: None,
         prev_cam: None,
         frame_jitter: None,
+        adaptive: false,
     };
     match max_depth {
         Some(d) => render_frame_capped(&ctx, d),
@@ -634,8 +945,10 @@ pub fn verify(
             };
             let mut visits = 0u64;
             for x in 0..rw {
-                // A coarse quad carries its center ray's t on every pixel and
-                // may straddle sky/geometry — exclude it from all counters.
+                // A coarse (cell-flooded) pixel carries its cell sample's t
+                // and may straddle sky/geometry — exclude it from all
+                // counters. Sparse-fill sample pixels are KIND_LEAF and ARE
+                // gated: real rays with exact t.
                 if overlay::info_kind(info[y * rw + x].load(Relaxed)) == KIND_COARSE {
                     rep.coarse += 1;
                     continue;

@@ -6,6 +6,7 @@
 
 use crate::camera::{CamBasis, Camera};
 use glam::{Mat4, Vec3, Vec3A, Vec4};
+use rayon::prelude::*;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
 /// One pixel's worth of G-buffer data, computed once and stored via
@@ -63,6 +64,45 @@ impl GBufs {
             mvec: alloc(rw * rh * 2),
             spec_hit_t: alloc(rw * rh),
         }
+    }
+
+    /// Nearest-upscale the OIDN guide planes — diffuse albedo, specular
+    /// albedo, normal+roughness: exactly the fields `oidn::run_filter`
+    /// reads — from `src` into this buffer's resolution. The post-upscale
+    /// denoise path runs OIDN at window res while the frame's G-buffers
+    /// live at render res; the guides follow the same nearest mapping
+    /// `render::resolve` uses for color, so guide texels stay bit-equal to
+    /// their source texels (gated by --check-xess).
+    pub fn upscale_guides_from(&self, src: &GBufs) {
+        let (dw, dh) = (self.rw, self.rh);
+        let (sw, sh) = (src.rw, src.rh);
+        (0..dh).into_par_iter().for_each(|y| {
+            let sy = (y * sh / dh).min(sh - 1);
+            for x in 0..dw {
+                let sx = (x * sw / dw).min(sw - 1);
+                let si = sy * sw + sx;
+                let di = y * dw + x;
+                for k in 0..3 {
+                    self.diff_alb[di * 3 + k]
+                        .store(src.diff_alb[si * 3 + k].load(Relaxed), Relaxed);
+                }
+                self.spec_alb[di].store(src.spec_alb[si].load(Relaxed), Relaxed);
+                for k in 0..4 {
+                    self.normal_rough[di * 4 + k]
+                        .store(src.normal_rough[si * 4 + k].load(Relaxed), Relaxed);
+                }
+            }
+        });
+    }
+
+    /// Reinterpret the buffers at a different logical resolution within the
+    /// construction capacity — XeSS mode's dynamic render res. Contents are
+    /// stale until the next frame writes every pixel, which every XeSS frame
+    /// does (full-depth trace: hit and sky fill sites both write).
+    pub fn set_res(&mut self, rw: usize, rh: usize) {
+        assert!(rw * rh * 4 <= self.normal_rough.len(), "GBufs::set_res beyond capacity");
+        self.rw = rw;
+        self.rh = rh;
     }
 
     #[inline(always)]

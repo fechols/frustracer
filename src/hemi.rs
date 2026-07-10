@@ -400,12 +400,14 @@ fn leaf_rays(
                     cx.bvh,
                     &ray,
                     &h,
+                    None,
                     &BOUNCE_Q,
                     rng,
                     g.sun,
                     g.depth + 1,
                     ls,
                     None,
+                    shade::VisCtl::Off,
                 ),
             };
             acc.ray += l * weight;

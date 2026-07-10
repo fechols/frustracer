@@ -214,6 +214,23 @@ impl D3d {
         Ok(())
     }
 
+    /// Close, execute, signal, and BLOCK until the GPU finishes — a frame
+    /// submission without a Present, for work whose output the CPU reads
+    /// back immediately (the post-upscale denoise path). The slot's fence
+    /// bookkeeping matches `end_frame`, so the frame ring stays consistent
+    /// and the caller's Map of a readback buffer is safe on return.
+    pub fn submit_and_wait(&mut self, slot: usize) -> Result<()> {
+        unsafe { self.list.Close() }.map_err(|e| format!("list Close: {e}"))?;
+        let lists = [Some(self.list.cast::<ID3D12CommandList>().unwrap())];
+        unsafe { self.queue.ExecuteCommandLists(&lists) };
+        let v = self.next_fence;
+        self.next_fence += 1;
+        unsafe { self.queue.Signal(&self.fence, v) }.map_err(|e| format!("queue Signal: {e}"))?;
+        self.slots[slot].fence_value = v;
+        self.frame_index += 1;
+        self.wait_for_fence(v)
+    }
+
     pub fn wait_idle(&mut self) -> Result<()> {
         let v = self.next_fence;
         self.next_fence += 1;

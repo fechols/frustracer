@@ -54,6 +54,7 @@ impl Ray {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct Hit {
     pub t: f32,
     pub tri: u32,

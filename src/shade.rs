@@ -87,6 +87,66 @@ pub struct PrimarySurface {
     pub spec_t: f32,
 }
 
+/// Capacity of a `VisRecord` (the presets top out at 4 shadow samples).
+pub const VIS_MAX: usize = 8;
+
+/// Captured view-independent visibility of one shading point: the light
+/// sample points with their occlusion results, plus the sampled-AO scalar.
+/// The adaptive 2×2 cells (render.rs, XeSS mode) trace this once at a
+/// representative pixel and re-apply it across the cell — sharing the RAYS
+/// only; every view-dependent term (N·L, albedo, GGX specular, the
+/// reflection bounce) stays per-pixel.
+#[derive(Clone, Copy)]
+pub struct VisRecord {
+    /// Light sample offsets (su, sv) in [-1,1]² — Apply pixels shade toward
+    /// the SAME light points, so the only approximation is the shadow-ray
+    /// origin shift within the cell (sub-pixel in world scale).
+    pub light_uv: [(f32, f32); VIS_MAX],
+    /// Occlusion per light sample. Below-horizon capture samples record
+    /// occluded AND poison `uniform`: that occlusion was never traced (the
+    /// rep's own N·L rejected it), so it must not be replayed onto a
+    /// neighbor whose horizon differs — the terminator is a declassify
+    /// signal exactly like penumbra.
+    pub occluded: [bool; VIS_MAX],
+    pub n_light: u32,
+    /// Sampled-AO open fraction.
+    pub ao: f32,
+    /// Every light sample agreed (all lit / all blocked) and every one was
+    /// actually traced — sharing is then near-exact. Fractional visibility
+    /// means penumbra, a below-horizon sample means the terminator; both
+    /// make the cell fall back to per-pixel rays (fractional visibility is
+    /// only meaningful with >= 2 samples; one sample is trivially uniform).
+    pub uniform: bool,
+    /// Any capture sample fell below the rep's horizon (untraced occlusion).
+    pub below_horizon: bool,
+}
+
+impl Default for VisRecord {
+    fn default() -> Self {
+        Self {
+            light_uv: [(0.0, 0.0); VIS_MAX],
+            occluded: [false; VIS_MAX],
+            n_light: 0,
+            ao: 1.0,
+            uniform: false,
+            below_horizon: false,
+        }
+    }
+}
+
+/// How `shade` treats the view-independent visibility rays (shadow + AO).
+/// Off is the pre-adaptive behavior, bit-for-bit. Only the sampled paths
+/// consult this — the frustum-bounce tiers (fb.*) never run under
+/// Capture/Apply (adaptive is XeSS-mode-only, where fb is OFF).
+pub enum VisCtl<'a> {
+    Off,
+    /// Trace normally, recording light UVs + occlusion + AO into the target.
+    Capture(&'a mut VisRecord),
+    /// Skip the occlusion/AO rays; reuse the record's results toward the
+    /// same light points with this pixel's own geometry.
+    Apply(&'a VisRecord),
+}
+
 /// Interpolated, face-flipped shading normal at a hit and the eps-offset
 /// point secondary rays start from — shared by `shade` and the hemisphere
 /// integrator's verification probes (they must agree exactly).
@@ -130,19 +190,32 @@ pub fn sky(d: Vec3A, sun: Vec3A) -> Vec3A {
 /// Whitted-style shading. Secondary rays (shadow / AO / reflection) always use
 /// tmin ≈ 0 — the quadtree's inherited tmin is a primary-frustum property and
 /// must never leak in here.
+#[allow(clippy::too_many_arguments)]
 pub fn shade(
     scene: &Scene,
     bvh: &Bvh,
     ray: &Ray,
     hit: &Hit,
+    sp: Option<(Vec3A, Vec3A)>,
     q: &Quality,
     rng: &mut fastrand::Rng,
     sun: Vec3A,
     depth: u32,
     ls: &mut LocalStats,
     mut prim: Option<&mut PrimarySurface>,
+    mut vis: VisCtl,
 ) -> Vec3A {
-    let (p, n) = surface_point(scene, ray, hit);
+    // Capture/Apply only exist for the sampled shadow/AO paths; the
+    // frustum-bounce tiers would silently bypass the record.
+    debug_assert!(
+        matches!(vis, VisCtl::Off) || (!q.fb.shadows && !q.fb.ao && !q.fb.gi),
+        "VisCtl requires the sampled shadow/AO paths (fb OFF)"
+    );
+    debug_assert!(q.shadow_samples as usize <= VIS_MAX);
+    // `sp` is the caller's precomputed surface_point(scene, ray, hit) — the
+    // adaptive cell already evaluated it for the coherence test and must not
+    // pay the triangle fetch + interpolation twice per pixel.
+    let (p, n) = sp.unwrap_or_else(|| surface_point(scene, ray, hit));
     let mat = &scene.materials[scene.tri_mat[hit.tri as usize] as usize];
     // Effective albedo: constant, except marble which is evaluated at the
     // world-space hit point (models are static, so world space is stable).
@@ -201,8 +274,24 @@ pub fn shade(
     // its own apex-relative tmin. Built lazily: a light fully behind the
     // surface never pays for a shaft.
     let mut shaft: Option<crate::shaft::Shaft> = None;
-    for _ in 0..q.shadow_samples {
-        let (su, sv) = (rng.f32() * 2.0 - 1.0, rng.f32() * 2.0 - 1.0);
+    // Under Apply the loop runs over the record's samples (the SAME light
+    // points its capture drew); Capture/Off draw fresh points from the rng.
+    let n_shadow = match &vis {
+        VisCtl::Apply(r) => r.n_light,
+        _ => q.shadow_samples,
+    };
+    for si in 0..n_shadow as usize {
+        let (su, sv) = match &vis {
+            VisCtl::Apply(r) => {
+                // Burn the two draws Capture made for this sample — the rng
+                // stream must stay aligned with a non-adaptive frame or the
+                // GGX reflection draws below diverge (the spec_t / G-buffer
+                // bit-identity contract).
+                let _ = (rng.f32(), rng.f32());
+                r.light_uv[si]
+            }
+            _ => (rng.f32() * 2.0 - 1.0, rng.f32() * 2.0 - 1.0),
+        };
         let lp = scene.light.center + scene.light.u * su + scene.light.v * sv;
         let lv = lp - p;
         let dist2 = lv.length_squared();
@@ -210,33 +299,54 @@ pub fn shade(
         let wi = lv / dist;
         let ndl = n.dot(wi);
         if ndl <= 0.0 {
+            // Below the rep's horizon: no ray was traced, so this "occluded"
+            // is a claim about the rep's normal, not the scene. Mark the
+            // record so `uniform` fails and the cell declassifies — replaying
+            // it onto a neighbor whose own N·L is positive would zero direct
+            // light the neighbor actually receives (terminator darkening).
+            if let VisCtl::Capture(r) = &mut vis {
+                r.light_uv[si] = (su, sv);
+                r.occluded[si] = true;
+                r.below_horizon = true;
+            }
             continue;
         }
-        let occluded = if q.fb.shadows {
-            if shaft.is_none() {
-                shaft = Some(crate::shaft::build(scene, bvh, p, n, ls));
+        let occluded = match &vis {
+            VisCtl::Apply(r) => {
+                ls.adapt_rays_saved += 1;
+                r.occluded[si]
             }
-            match shaft.as_ref().unwrap().classify(su, sv) {
-                crate::shaft::Class::Lit => {
-                    ls.shaft_rays_skipped += 1;
-                    false
+            _ if q.fb.shadows => {
+                if shaft.is_none() {
+                    shaft = Some(crate::shaft::build(scene, bvh, p, n, ls));
                 }
-                crate::shaft::Class::Test { tmin, cut } => {
-                    ls.secondary_rays += 1;
-                    bvh.occluded_multi(
-                        scene,
-                        &Ray::new(p, wi),
-                        tmin,
-                        dist - scene.eps,
-                        cut,
-                        &mut ls.ray_nodes,
-                    )
+                match shaft.as_ref().unwrap().classify(su, sv) {
+                    crate::shaft::Class::Lit => {
+                        ls.shaft_rays_skipped += 1;
+                        false
+                    }
+                    crate::shaft::Class::Test { tmin, cut } => {
+                        ls.secondary_rays += 1;
+                        bvh.occluded_multi(
+                            scene,
+                            &Ray::new(p, wi),
+                            tmin,
+                            dist - scene.eps,
+                            cut,
+                            &mut ls.ray_nodes,
+                        )
+                    }
                 }
             }
-        } else {
-            ls.secondary_rays += 1;
-            bvh.occluded(scene, &Ray::new(p, wi), 0.0, dist - scene.eps, &mut ls.ray_nodes)
+            _ => {
+                ls.secondary_rays += 1;
+                bvh.occluded(scene, &Ray::new(p, wi), 0.0, dist - scene.eps, &mut ls.ray_nodes)
+            }
         };
+        if let VisCtl::Capture(r) = &mut vis {
+            r.light_uv[si] = (su, sv);
+            r.occluded[si] = occluded;
+        }
         if !occluded {
             let li = scene.light.color * (ndl / dist2);
             direct_d += li;
@@ -251,9 +361,15 @@ pub fn shade(
             }
         }
     }
-    if q.shadow_samples > 0 {
-        direct_d /= q.shadow_samples as f32;
-        direct_s /= q.shadow_samples as f32;
+    if n_shadow > 0 {
+        direct_d /= n_shadow as f32;
+        direct_s /= n_shadow as f32;
+    }
+    if let VisCtl::Capture(r) = &mut vis {
+        r.n_light = n_shadow;
+        let k = n_shadow as usize;
+        r.uniform = k == 0
+            || (!r.below_horizon && r.occluded[..k].iter().all(|&o| o == r.occluded[0]));
     }
 
     // Diffuse ambient term. Three tiers, all through the hemisphere's OWN
@@ -284,19 +400,40 @@ pub fn shade(
                 ls,
             );
         } else if q.ao_samples > 0 {
-            let (t1, t2) = onb(n);
-            let mut open = 0u32;
-            for _ in 0..q.ao_samples {
-                let r1 = rng.f32();
-                let r2 = rng.f32();
-                let dir = cosine_dir(n, t1, t2, r1, r2);
-                ls.secondary_rays += 1;
-                if !bvh.occluded(scene, &Ray::new(p, dir), 0.0, scene.ao_radius, &mut ls.ray_nodes)
-                {
-                    open += 1;
+            if let VisCtl::Apply(r) = &vis {
+                // AO is low-frequency: the shared scalar is reused outright
+                // (unlike shadows there is no uniformity gate — a fractional
+                // AO is its normal state, not a penumbra signal). Burn the
+                // capture path's draws to keep the rng stream aligned (the
+                // spec_t bit-identity contract, as in the shadow loop).
+                ao = r.ao;
+                for _ in 0..q.ao_samples {
+                    let _ = (rng.f32(), rng.f32());
+                }
+                ls.adapt_rays_saved += q.ao_samples as u64;
+            } else {
+                let (t1, t2) = onb(n);
+                let mut open = 0u32;
+                for _ in 0..q.ao_samples {
+                    let r1 = rng.f32();
+                    let r2 = rng.f32();
+                    let dir = cosine_dir(n, t1, t2, r1, r2);
+                    ls.secondary_rays += 1;
+                    if !bvh.occluded(
+                        scene,
+                        &Ray::new(p, dir),
+                        0.0,
+                        scene.ao_radius,
+                        &mut ls.ray_nodes,
+                    ) {
+                        open += 1;
+                    }
+                }
+                ao = open as f32 / q.ao_samples as f32;
+                if let VisCtl::Capture(r) = &mut vis {
+                    r.ao = ao;
                 }
             }
-            ao = open as f32 / q.ao_samples as f32;
         }
         AMBIENT * ao
     };
@@ -350,7 +487,7 @@ pub fn shade(
                     // otherwise every glossy pixel would pay a second full
                     // hemisphere integration (and shaft build) at depth 1.
                     let rq = Quality { fb: FrustumBounce::OFF, ..*q };
-                    shade(scene, bvh, &rray, &rh, &rq, rng, sun, depth + 1, ls, None)
+                    shade(scene, bvh, &rray, &rh, None, &rq, rng, sun, depth + 1, ls, None, VisCtl::Off)
                 }
                 None => {
                     if let Some(prim) = prim.as_deref_mut() {

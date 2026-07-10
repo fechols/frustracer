@@ -3,8 +3,9 @@ use glam::Vec3A;
 pub const KIND_LEAF: u32 = 0;
 pub const KIND_SKY: u32 = 1;
 pub const KIND_BLOCKED: u32 = 2;
-/// Depth-cap flat fill: the tile reached the frame-budget depth cap and shows
-/// the color of one representative ray (dynamic resolution).
+/// Depth-cap sparse fill, flooded pixel: the tile reached the frame-budget
+/// depth cap and this pixel shows its cell's point sample (dynamic
+/// resolution). The sample pixels themselves are KIND_LEAF.
 pub const KIND_COARSE: u32 = 3;
 
 pub fn pack_info(depth: u32, kind: u32) -> u32 {

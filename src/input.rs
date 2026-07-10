@@ -17,6 +17,9 @@ pub struct Edges {
     pub toggle_overlay: bool,  // O
     pub toggle_gpu_tone: bool, // B
     pub toggle_dlss: bool,     // G
+    pub toggle_xess: bool,     // X (XeSS-SR dynamic-res upscaling)
+    pub toggle_oidn: bool,     // N (Open Image Denoise)
+    pub toggle_temporal: bool, // M (OIDN temporal reprojection)
     pub toggle_bounce: bool,   // H (hemisphere frustum bounces)
     pub verify: bool,          // C
     pub screenshot: bool,      // P
@@ -47,6 +50,9 @@ impl Input {
                     Keycode::O => e.toggle_overlay = true,
                     Keycode::B => e.toggle_gpu_tone = true,
                     Keycode::G => e.toggle_dlss = true,
+                    Keycode::X => e.toggle_xess = true,
+                    Keycode::N => e.toggle_oidn = true,
+                    Keycode::M => e.toggle_temporal = true,
                     Keycode::H => e.toggle_bounce = true,
                     Keycode::C => e.verify = true,
                     Keycode::P => e.screenshot = true,

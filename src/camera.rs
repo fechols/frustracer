@@ -70,9 +70,19 @@ impl CamBasis {
     /// fx ∈ [0, w], fy ∈ [0, h] (pixel-grid coordinates, y down).
     #[inline(always)]
     pub fn ray_dir(&self, fx: f32, fy: f32) -> Vec3A {
+        self.ray_dir_unnorm(fx, fy).normalize()
+    }
+
+    /// `ray_dir` without the normalization, for consumers whose math is
+    /// scale-invariant in the direction: `project` is a pure ratio of dots,
+    /// and `origin + d·(z / d·forward)` cancels the length. Skips the
+    /// per-pixel sqrt — the tracer itself must keep `ray_dir` (distance ==
+    /// ray parameter t requires unit directions; see CLAUDE.md invariants).
+    #[inline(always)]
+    pub fn ray_dir_unnorm(&self, fx: f32, fy: f32) -> Vec3A {
         let ndx = fx * self.inv_w * 2.0 - 1.0;
         let ndy = 1.0 - fy * self.inv_h * 2.0;
-        (self.forward + self.right * ndx + self.up * ndy).normalize()
+        self.forward + self.right * ndx + self.up * ndy
     }
 
     /// Inverse of `ray_dir`: the continuous image point a world direction
