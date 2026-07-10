@@ -214,6 +214,21 @@ pub fn quantize_res(
     (width_for_height(rh, out, min.0, max.0), rh)
 }
 
+/// --lock-res argument -> fixed render scale (both upscaler paths consume it
+/// through `quantize_res`, which range-clamps). Named presets are the
+/// standard DLSS ratios; a bare number is accepted as a ratio in (0, 1] —
+/// the filter also rejects NaN.
+pub fn lock_scale(arg: &str) -> Option<f32> {
+    match arg {
+        "quality" => Some(2.0 / 3.0),
+        "balanced" => Some(0.58),
+        "performance" => Some(0.5),
+        "ultra-performance" => Some(1.0 / 3.0),
+        "native" => Some(1.0),
+        s => s.parse::<f32>().ok().filter(|r| *r > 0.0 && *r <= 1.0),
+    }
+}
+
 /// Log2-scale proportional controller, the `depth_est` design transplanted
 /// from quadtree-depth units to resolution-scale units: cost ~ area ~
 /// scale^2, so levels-of-headroom in scale space = 0.5*log2(budget/elapsed).

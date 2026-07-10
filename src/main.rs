@@ -93,6 +93,11 @@ pub struct Opts {
     /// uniform per-pixel shading — visibility is per-pixel either way, only
     /// the 2×2-cell shadow/AO sharing and HOT top-ups are disabled).
     pub adaptive: bool,
+    /// Lock the DLSS/XeSS render resolution to this fixed scale of the
+    /// window (default the DLSS-Quality 2/3; `--lock-res dynamic` -> None =
+    /// the step-wise dynamic-resolution controller). CLI-only, no runtime
+    /// toggle — T prints the locked note.
+    pub lock_scale: Option<f32>,
 }
 
 /// OIDN placement in XeSS mode (N cycles off → pre → post). Pre denoises the
@@ -148,6 +153,7 @@ fn main() {
         oidn_post: false,
         xess_autoexposure: false,
         adaptive: true,
+        lock_scale: xess::lock_scale("quality"),
     };
     let mut check_dlss = false;
     let mut dlss_dump = false;
@@ -222,6 +228,22 @@ fn main() {
                     }
                 }
             }
+            "--lock-res" => {
+                opts.lock_scale = match args.next().as_deref() {
+                    Some("dynamic") => None,
+                    Some(s) => match xess::lock_scale(s) {
+                        Some(r) => Some(r),
+                        None => {
+                            eprintln!("--lock-res needs quality|balanced|performance|ultra-performance|native|dynamic or a ratio in (0, 1]");
+                            std::process::exit(2);
+                        }
+                    },
+                    None => {
+                        eprintln!("--lock-res needs quality|balanced|performance|ultra-performance|native|dynamic or a ratio in (0, 1]");
+                        std::process::exit(2);
+                    }
+                }
+            }
             "--oidn-no-clean-aux" => opts.oidn_clean_aux = false,
             "--gpu-debug" => opts.gpu_debug = true,
             "--sl-path" => {
@@ -242,7 +264,7 @@ fn main() {
                 )
             }
             "--help" | "-h" => {
-                eprintln!("usage: frustracer [model.obj] [--stress <n>] [--check] [--check-dlss] [--dlss-dump] [--no-dlss] [--check-oidn] [--oidn-dump] [--oidn] [--check-xess] [--xess-dump] [--xess] [--gpu-debug] [--sl-path <dir>] [--oidn-path <dir>] [--oidn-device <d>] [--xess-path <dir>]");
+                eprintln!("usage: frustracer [model.obj] [--stress <n>] [--check] [--check-dlss] [--dlss-dump] [--no-dlss] [--check-oidn] [--oidn-dump] [--oidn] [--check-xess] [--xess-dump] [--xess] [--lock-res <r>] [--gpu-debug] [--sl-path <dir>] [--oidn-path <dir>] [--oidn-device <d>] [--xess-path <dir>]");
                 eprintln!("  --stress <n>  procedural stress field of n objects (perf test; composes with --check)");
                 eprintln!("  --check       headless: verify hybrid vs reference, benchmark, write check.png");
                 eprintln!("  --check-dlss  headless: G-buffer MV/depth/matrix self-test (no GPU needed)");
@@ -264,6 +286,8 @@ fn main() {
                 eprintln!("  --xess-autoexposure  let XeSS compute exposure internally (A/B lever)");
                 eprintln!("  --no-adaptive disable the adaptive shading rate in XeSS mode (uniform per-pixel shading;");
                 eprintln!("                visibility is per-pixel either way)");
+                eprintln!("  --lock-res    DLSS/XeSS render res: quality|balanced|performance|ultra-performance|native,");
+                eprintln!("                a ratio in (0, 1], or dynamic (the step-wise DRS controller); default quality (2/3)");
                 eprintln!("  --xess-path   XeSS DLL directory (default: SDKs\\XeSS-SDK\\bin)");
                 eprintln!("  --gpu-debug   D3D12 debug layer + verbose Streamline logging");
                 eprintln!("  --sl-path     Streamline DLL directory (default: SDKs\\streamline-sdk\\bin\\x64)");
@@ -538,6 +562,37 @@ fn run_check_xess(
             }
         }
         eprintln!("quantize_res: {}", if pass { "OK" } else { "FAIL" });
+        all_ok &= pass;
+    }
+
+    // 2b. --lock-res argument mapping (presets, bare ratios, rejections)
+    // and the quality preset's quantization at 1080p (exact 2/3).
+    {
+        let mut pass = true;
+        for (a, want) in [
+            ("quality", Some(2.0f32 / 3.0)),
+            ("balanced", Some(0.58)),
+            ("performance", Some(0.5)),
+            ("ultra-performance", Some(1.0 / 3.0)),
+            ("native", Some(1.0)),
+            ("0.75", Some(0.75)),
+            ("0", None),
+            ("1.5", None),
+            ("-0.5", None),
+            ("NaN", None),
+            ("bogus", None),
+        ] {
+            if xess::lock_scale(a) != want {
+                eprintln!("lock_scale({a}) != {want:?}");
+                pass = false;
+            }
+        }
+        let q = xess::quantize_res(2.0 / 3.0, (1920, 1080), (640, 360), (1920, 1080));
+        if q != (1280, 720) {
+            eprintln!("quality lock at 1080p = {q:?}, want (1280, 720)");
+            pass = false;
+        }
+        eprintln!("lock-res map: {}", if pass { "OK" } else { "FAIL" });
         all_ok &= pass;
     }
 
@@ -2289,8 +2344,6 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     // + denoises to the window size) and RR is the only temporal integrator:
     // no CPU accumulation, no half-res moving mode, no depth-cap budget.
     let mut dlss_on = gpu.dlss_ready();
-    let (drw, drh) =
-        gpu.rr_render_res().map(|(a, b)| (a as usize, b as usize)).unwrap_or((W, H));
     // Step-wise DRS (shares xess::ScaleCtl / quantize_res — pure controller
     // math common to both upscalers). Steps are made RARE (the quantization
     // plus the StepLimiter dwell is the hysteresis) because RR re-initializes
@@ -2298,9 +2351,23 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     // change, not a scene change: the res-step block below does NOT reset
     // (no dlss_reset, no prev drop; history survives via the extent tags).
     // A degenerate reported range (min == max) means the driver offers no
-    // DRS — fixed res, no controller.
+    // DRS — fixed res, no controller. --lock-res (default quality = 2/3)
+    // pins a fixed res inside the range instead; `--lock-res dynamic` opts
+    // back into the controller.
     let dlss_range = gpu.rr_res_range();
-    let dlss_drs = dlss_range.map(|(_, min, max)| min != max).unwrap_or(false);
+    let (drw, drh) = match (opts.lock_scale, dlss_range) {
+        (Some(r), Some((_, min, max))) if min != max => xess::quantize_res(
+            r,
+            (W, H),
+            (min.0 as usize, min.1 as usize),
+            (max.0 as usize, max.1 as usize),
+        ),
+        // No usable range: the lock can't be honored — keep the SDK
+        // optimal / DLAA fallback (warned about at the startup print).
+        _ => gpu.rr_render_res().map(|(a, b)| (a as usize, b as usize)).unwrap_or((W, H)),
+    };
+    let dlss_drs = opts.lock_scale.is_none()
+        && dlss_range.map(|(_, min, max)| min != max).unwrap_or(false);
     let mut dlss_ctl = dlss_range.filter(|_| dlss_drs).map(|(_, min, max)| {
         let start_h = (H * 2 / 3).clamp(min.1 as usize, max.1 as usize);
         xess::ScaleCtl::new(start_h, min.1 as usize, max.1 as usize, H)
@@ -2337,9 +2404,20 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
         eprintln!(
             "dlss: Ray Reconstruction ON (G toggles), dynamic resolution {}",
             if dlss_drs {
-                "ON (step-wise; history survives steps)"
+                "ON (step-wise; history survives steps)".to_string()
+            } else if opts.lock_scale.is_some() {
+                if dlss_range.map(|(_, min, max)| min != max).unwrap_or(false) {
+                    format!(
+                        "LOCKED at {}x{} ({}%, --lock-res; `--lock-res dynamic` re-enables)",
+                        drw,
+                        drh,
+                        (drh * 100 + H / 2) / H
+                    )
+                } else {
+                    format!("unavailable (no render-res range) — --lock-res not honorable, keeping {}x{}", drw, drh)
+                }
             } else {
-                "unavailable (degenerate range) — fixed render res"
+                "unavailable (degenerate range) — fixed render res".to_string()
             }
         );
     }
@@ -2358,7 +2436,20 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     // grid no longer matches.
     let mut xess_on = gpu.xess_ready();
     let xess_range = gpu.xess_res_range(); // (optimal, min, max)
-    let mut xess_ctl = xess_range.map(|(_, min, max)| {
+    // --lock-res (default quality): one fixed render res for the whole
+    // session — the ScaleCtl/StepLimiter pair is never built/consulted.
+    // quantize_res clamps the requested scale into the SDK range.
+    let xess_lock = opts.lock_scale.and_then(|r| {
+        xess_range.map(|(_, min, max)| {
+            xess::quantize_res(
+                r,
+                (W, H),
+                (min.0 as usize, min.1 as usize),
+                (max.0 as usize, max.1 as usize),
+            )
+        })
+    });
+    let mut xess_ctl = xess_range.filter(|_| xess_lock.is_none()).map(|(_, min, max)| {
         // Start at ~2/3 scale (the DLSS-Quality neighborhood), not the SDK's
         // "optimal" — with the ULTRA_PERFORMANCE init that widens the range,
         // optimal is the 1/3-scale floor and would open blurry. The
@@ -2378,7 +2469,16 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     let mut xess_oidn = XessOidn::Off;
     let mut xess_hdr: Vec<f32> = Vec::new();
     if xess_on {
-        eprintln!("xess: dynamic super-resolution ON (X toggles; N cycles OIDN off/pre/post)");
+        if let Some((lw, lh)) = xess_lock {
+            eprintln!(
+                "xess: super-resolution ON, render res LOCKED at {}x{} ({}%, --lock-res; `--lock-res dynamic` re-enables DRS; X toggles; N cycles OIDN off/pre/post)",
+                lw,
+                lh,
+                (lh * 100 + H / 2) / H
+            );
+        } else {
+            eprintln!("xess: dynamic super-resolution ON (X toggles; N cycles OIDN off/pre/post)");
+        }
         if !opts.adaptive {
             eprintln!("xess: adaptive shading rate OFF (--no-adaptive; uniform per-pixel shading)");
         }
@@ -2521,7 +2621,13 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
             dlss_reset = true; // noise statistics change across the toggle
         }
         if edges.toggle_dynamic {
-            if dlss_on {
+            if (dlss_on || xess_on) && opts.lock_scale.is_some() {
+                let (lw, lh) = if dlss_on { (drw, drh) } else { xess_lock.unwrap_or((drw, drh)) };
+                eprintln!(
+                    "render res locked at {}x{} by --lock-res (CLI-only; restart with `--lock-res dynamic` for DRS)",
+                    lw, lh
+                );
+            } else if dlss_on {
                 eprintln!(
                     "dynamic-res in DLSS mode is {}",
                     if dlss_drs {
@@ -2777,6 +2883,8 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 r
             }
             RenderMode::Dlss => (drw, drh),
+            // --lock-res: one fixed res, controller/limiter bypassed.
+            RenderMode::Xess if xess_lock.is_some() => xess_lock.unwrap(),
             RenderMode::Xess => {
                 // XeSS mode: dynamic resolution, no block filling — the scale
                 // controller's estimate quantized into the SDK's input range.
@@ -3397,16 +3505,20 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 if dlss_on {
                     if dlss_drs {
                         format!(" | DLSS: dyn {}% + RR", rh * 100 / H)
+                    } else if opts.lock_scale.is_some() && (drw, drh) != (W, H) {
+                        format!(" | DLSS: lock {}% + RR", rh * 100 / H)
                     } else if (drw, drh) == (W, H) {
                         // Native render res means the optimal-settings query
-                        // fell back to DLAA; anything smaller is Quality mode.
+                        // fell back to DLAA (or a native lock); anything
+                        // smaller is Quality mode.
                         " | DLSS: DLAA + RR".to_string()
                     } else {
                         " | DLSS: Quality + RR".to_string()
                     }
                 } else if xess_on {
                     format!(
-                        " | XeSS: dyn {}%{}",
+                        " | XeSS: {} {}%{}",
+                        if xess_lock.is_some() { "lock" } else { "dyn" },
                         rh * 100 / H,
                         match (xess_oidn, oidn_ctx.as_ref()) {
                             (XessOidn::Pre, Some(c)) =>
@@ -3456,10 +3568,16 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 if hybrid { "hybrid" } else { "plain" },
                 last_ms,
                 stats.summary_line(),
-                if xess_on || (dlss_on && dlss_drs) {
+                if xess_on || (dlss_on && (dlss_drs || opts.lock_scale.is_some())) {
                     format!(
                         " | {} {}x{} ({}%)",
-                        if xess_on { "xess" } else { "dlss-drs" },
+                        if xess_on {
+                            "xess"
+                        } else if dlss_drs {
+                            "dlss-drs"
+                        } else {
+                            "dlss-lock"
+                        },
                         rw,
                         rh,
                         rh * 100 / H
