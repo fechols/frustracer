@@ -1,30 +1,67 @@
 use crate::bvh::{Bvh, Hit, Ray};
 use crate::scene::{MatKind, Scene};
+use crate::stats::LocalStats;
 use glam::Vec3A;
+
+/// Which bounce effects run through the hemisphere/shaft frustum integrators
+/// instead of the sampled loops. `depth` is the hemisphere subdivision budget
+/// (4^depth leaf cells). All-off reproduces the sampled path bit-for-bit.
+#[derive(Clone, Copy, PartialEq)]
+pub struct FrustumBounce {
+    pub ao: bool,
+    pub gi: bool,
+    pub shadows: bool,
+    pub depth: u32,
+}
+
+impl FrustumBounce {
+    pub const OFF: FrustumBounce = FrustumBounce { ao: false, gi: false, shadows: false, depth: 0 };
+}
 
 #[derive(Clone, Copy)]
 pub struct Quality {
     pub shadow_samples: u32,
     pub ao_samples: u32,
     pub reflections: bool,
+    pub fb: FrustumBounce,
 }
 
 impl Quality {
     pub fn preset(i: u32) -> Quality {
+        // Hemisphere budgets scale with the preset (16/64/256 leaf cells);
+        // the fb flags themselves are toggled at the call site (H key /
+        // --check sections), not by the preset.
         match i {
-            1 => Quality { shadow_samples: 1, ao_samples: 0, reflections: false },
-            3 => Quality { shadow_samples: 4, ao_samples: 4, reflections: true },
-            _ => Quality { shadow_samples: 2, ao_samples: 2, reflections: true },
+            1 => Quality {
+                shadow_samples: 1,
+                ao_samples: 0,
+                reflections: false,
+                fb: FrustumBounce { depth: 2, ..FrustumBounce::OFF },
+            },
+            3 => Quality {
+                shadow_samples: 4,
+                ao_samples: 4,
+                reflections: true,
+                fb: FrustumBounce { depth: 4, ..FrustumBounce::OFF },
+            },
+            _ => Quality {
+                shadow_samples: 2,
+                ao_samples: 2,
+                reflections: true,
+                fb: FrustumBounce { depth: 3, ..FrustumBounce::OFF },
+            },
         }
     }
 
     /// Cheap variant used while the camera is moving; accumulation converges
-    /// the full quality once the camera is still.
+    /// the full quality once the camera is still. Frustum bounces stay off
+    /// here — they are a still-frame quality feature (v1).
     pub fn while_moving(&self) -> Quality {
         Quality {
             shadow_samples: 1,
             ao_samples: 0,
             reflections: self.reflections,
+            fb: FrustumBounce::OFF,
         }
     }
 }
@@ -50,6 +87,38 @@ pub struct PrimarySurface {
     pub spec_t: f32,
 }
 
+/// Interpolated, face-flipped shading normal at a hit and the eps-offset
+/// point secondary rays start from — shared by `shade` and the hemisphere
+/// integrator's verification probes (they must agree exactly).
+pub fn surface_point(scene: &Scene, ray: &Ray, hit: &Hit) -> (Vec3A, Vec3A) {
+    let [i0, i1, i2] = scene.indices[hit.tri as usize];
+    let w = 1.0 - hit.u - hit.v;
+    let mut n = (scene.normals[i0 as usize] * w
+        + scene.normals[i1 as usize] * hit.u
+        + scene.normals[i2 as usize] * hit.v)
+        .normalize_or_zero();
+    if n == Vec3A::ZERO {
+        let e1 = scene.positions[i1 as usize] - scene.positions[i0 as usize];
+        let e2 = scene.positions[i2 as usize] - scene.positions[i0 as usize];
+        n = e1.cross(e2).normalize_or_zero();
+    }
+    if n.dot(ray.d) > 0.0 {
+        n = -n;
+    }
+    (ray.o + ray.d * hit.t + n * scene.eps, n)
+}
+
+/// Cosine-weighted hemisphere direction from two uniform draws in a
+/// right-handed tangent frame — THE construction shared by the sampled-AO
+/// loop and `--check`'s A/B reference estimators (the gates compare
+/// like-for-like only while every site draws identically).
+#[inline(always)]
+pub(crate) fn cosine_dir(n: Vec3A, t1: Vec3A, t2: Vec3A, r1: f32, r2: f32) -> Vec3A {
+    let phi = std::f32::consts::TAU * r1;
+    let sq = r2.sqrt();
+    t1 * (phi.cos() * sq) + t2 * (phi.sin() * sq) + n * (1.0 - r2).sqrt()
+}
+
 pub fn sky(d: Vec3A, sun: Vec3A) -> Vec3A {
     let t = (d.y * 0.7 + 0.3).clamp(0.0, 1.0);
     let horizon = Vec3A::new(0.72, 0.82, 0.95);
@@ -70,25 +139,10 @@ pub fn shade(
     rng: &mut fastrand::Rng,
     sun: Vec3A,
     depth: u32,
-    rays: &mut u64,
-    visits: &mut u64,
+    ls: &mut LocalStats,
     mut prim: Option<&mut PrimarySurface>,
 ) -> Vec3A {
-    let [i0, i1, i2] = scene.indices[hit.tri as usize];
-    let w = 1.0 - hit.u - hit.v;
-    let mut n = (scene.normals[i0 as usize] * w
-        + scene.normals[i1 as usize] * hit.u
-        + scene.normals[i2 as usize] * hit.v)
-        .normalize_or_zero();
-    if n == Vec3A::ZERO {
-        let e1 = scene.positions[i1 as usize] - scene.positions[i0 as usize];
-        let e2 = scene.positions[i2 as usize] - scene.positions[i0 as usize];
-        n = e1.cross(e2).normalize_or_zero();
-    }
-    if n.dot(ray.d) > 0.0 {
-        n = -n;
-    }
-    let p = ray.o + ray.d * hit.t + n * scene.eps;
+    let (p, n) = surface_point(scene, ray, hit);
     let mat = &scene.materials[scene.tri_mat[hit.tri as usize] as usize];
     // Effective albedo: constant, except marble which is evaluated at the
     // world-space hit point (models are static, so world space is stable).
@@ -141,10 +195,15 @@ pub fn shade(
     // without retuning scene brightness.
     let mut direct_d = Vec3A::ZERO;
     let mut direct_s = Vec3A::ZERO;
+    // Light-shaft culling (fb.shadows): identical sampling and integrand —
+    // the shaft only removes occlusion rays for samples in subrects proven
+    // unoccluded, and seeds the remaining (penumbra) rays from its cut with
+    // its own apex-relative tmin. Built lazily: a light fully behind the
+    // surface never pays for a shaft.
+    let mut shaft: Option<crate::shaft::Shaft> = None;
     for _ in 0..q.shadow_samples {
-        let lp = scene.light.center
-            + scene.light.u * (rng.f32() * 2.0 - 1.0)
-            + scene.light.v * (rng.f32() * 2.0 - 1.0);
+        let (su, sv) = (rng.f32() * 2.0 - 1.0, rng.f32() * 2.0 - 1.0);
+        let lp = scene.light.center + scene.light.u * su + scene.light.v * sv;
         let lv = lp - p;
         let dist2 = lv.length_squared();
         let dist = dist2.sqrt();
@@ -153,8 +212,32 @@ pub fn shade(
         if ndl <= 0.0 {
             continue;
         }
-        *rays += 1;
-        if !bvh.occluded(scene, &Ray::new(p, wi), 0.0, dist - scene.eps, visits) {
+        let occluded = if q.fb.shadows {
+            if shaft.is_none() {
+                shaft = Some(crate::shaft::build(scene, bvh, p, n, ls));
+            }
+            match shaft.as_ref().unwrap().classify(su, sv) {
+                crate::shaft::Class::Lit => {
+                    ls.shaft_rays_skipped += 1;
+                    false
+                }
+                crate::shaft::Class::Test { tmin, cut } => {
+                    ls.secondary_rays += 1;
+                    bvh.occluded_multi(
+                        scene,
+                        &Ray::new(p, wi),
+                        tmin,
+                        dist - scene.eps,
+                        cut,
+                        &mut ls.ray_nodes,
+                    )
+                }
+            }
+        } else {
+            ls.secondary_rays += 1;
+            bvh.occluded(scene, &Ray::new(p, wi), 0.0, dist - scene.eps, &mut ls.ray_nodes)
+        };
+        if !occluded {
             let li = scene.light.color * (ndl / dist2);
             direct_d += li;
             let h = (wi + v).normalize_or_zero();
@@ -173,28 +256,54 @@ pub fn shade(
         direct_s /= q.shadow_samples as f32;
     }
 
-    // Ambient occlusion: short cosine-hemisphere rays.
-    let mut ao = 1.0;
-    if q.ao_samples > 0 {
+    // Diffuse ambient term. Three tiers, all through the hemisphere's OWN
+    // apex-relative tmin chain when frustum-dispatched (the primary tile's
+    // tmin is never involved):
+    // - fb.gi: real sky+bounce irradiance/π over the hemisphere (subsumes AO —
+    //   occluders contribute their radiance instead of darkening a constant).
+    // - fb.ao: the AMBIENT constant modulated by frustum-dispatched AO.
+    // - neither: the AMBIENT constant modulated by sampled AO.
+    let ambient = if q.fb.gi {
         let (t1, t2) = onb(n);
-        let mut open = 0u32;
-        for _ in 0..q.ao_samples {
-            let r1 = rng.f32();
-            let r2 = rng.f32();
-            let phi = std::f32::consts::TAU * r1;
-            let sq = r2.sqrt();
-            let dir = t1 * (phi.cos() * sq) + t2 * (phi.sin() * sq) + n * (1.0 - r2).sqrt();
-            *rays += 1;
-            if !bvh.occluded(scene, &Ray::new(p, dir), 0.0, scene.ao_radius, visits) {
-                open += 1;
+        crate::hemi::gi(scene, bvh, p, n, t1, t2, q.fb.depth, sun, depth, rng, None, ls)
+    } else {
+        let mut ao = 1.0;
+        if q.fb.ao {
+            let (t1, t2) = onb(n);
+            ao = crate::hemi::ao(
+                scene,
+                bvh,
+                p,
+                n,
+                t1,
+                t2,
+                q.fb.depth,
+                scene.ao_radius,
+                rng,
+                None,
+                ls,
+            );
+        } else if q.ao_samples > 0 {
+            let (t1, t2) = onb(n);
+            let mut open = 0u32;
+            for _ in 0..q.ao_samples {
+                let r1 = rng.f32();
+                let r2 = rng.f32();
+                let dir = cosine_dir(n, t1, t2, r1, r2);
+                ls.secondary_rays += 1;
+                if !bvh.occluded(scene, &Ray::new(p, dir), 0.0, scene.ao_radius, &mut ls.ray_nodes)
+                {
+                    open += 1;
+                }
             }
+            ao = open as f32 / q.ao_samples as f32;
         }
-        ao = open as f32 / q.ao_samples as f32;
-    }
+        AMBIENT * ao
+    };
 
     // Ambient stays diffuse-only; metals get their environment from the
     // specular bounce ray below.
-    let mut color = kd * (direct_d + AMBIENT * ao) + direct_s;
+    let mut color = kd * (direct_d + ambient) + direct_s;
 
     // One specular bounce: a single direction importance-sampled from the
     // anisotropic GGX VNDF (Heitz 2018), so glossy surfaces see a blurred
@@ -228,15 +337,20 @@ pub fn shade(
                 / (1.0 + lambda_v + ggx_lambda(to_local(rdir), ax, ay));
             let tput = schlick(f0, v.dot(h).max(0.0)) * g2_over_g1;
             let rray = Ray::new(p, rdir);
-            *rays += 1;
-            let rcol = match bvh.intersect(scene, &rray, 0.0, f32::INFINITY, visits) {
+            ls.secondary_rays += 1;
+            let rcol = match bvh.intersect(scene, &rray, 0.0, f32::INFINITY, &mut ls.ray_nodes) {
                 Some(rh) => {
                     if let Some(prim) = prim.as_deref_mut() {
                         prim.spec_t = rh.t;
                     }
                     // The recursive call gets None: only the primary surface
-                    // is ever captured.
-                    shade(scene, bvh, &rray, &rh, q, rng, sun, depth + 1, rays, visits, None)
+                    // is ever captured. Frustum bounces don't recurse: the
+                    // reflected hit shades with fb off (the sampled ambient
+                    // path), mirroring hemi's recursion-free leaf policy —
+                    // otherwise every glossy pixel would pay a second full
+                    // hemisphere integration (and shaft build) at depth 1.
+                    let rq = Quality { fb: FrustumBounce::OFF, ..*q };
+                    shade(scene, bvh, &rray, &rh, &rq, rng, sun, depth + 1, ls, None)
                 }
                 None => {
                     if let Some(prim) = prim.as_deref_mut() {
@@ -337,9 +451,11 @@ fn hash3(x: i32, y: i32, z: i32) -> f32 {
     (h & 0x00ff_ffff) as f32 / 16_777_216.0
 }
 
-/// Branchless-ish orthonormal basis around n (Duff et al.).
+/// Branchless-ish orthonormal basis around n (Duff et al.). Right-handed:
+/// t1 × t2 = n — the hemisphere integrator's octant orientation relies on it
+/// (asserted by sphcell::self_test).
 #[inline(always)]
-fn onb(n: Vec3A) -> (Vec3A, Vec3A) {
+pub(crate) fn onb(n: Vec3A) -> (Vec3A, Vec3A) {
     let s = if n.z >= 0.0 { 1.0 } else { -1.0 };
     let a = -1.0 / (s + n.z);
     let b = n.x * n.y * a;

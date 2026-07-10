@@ -17,6 +17,7 @@ pub struct Edges {
     pub toggle_overlay: bool,  // O
     pub toggle_gpu_tone: bool, // B
     pub toggle_dlss: bool,     // G
+    pub toggle_bounce: bool,   // H (hemisphere frustum bounces)
     pub verify: bool,          // C
     pub screenshot: bool,      // P
     pub quality: Option<u32>,  // 1/2/3
@@ -46,6 +47,7 @@ impl Input {
                     Keycode::O => e.toggle_overlay = true,
                     Keycode::B => e.toggle_gpu_tone = true,
                     Keycode::G => e.toggle_dlss = true,
+                    Keycode::H => e.toggle_bounce = true,
                     Keycode::C => e.verify = true,
                     Keycode::P => e.screenshot = true,
                     Keycode::Num1 | Keycode::Kp1 => e.quality = Some(1),

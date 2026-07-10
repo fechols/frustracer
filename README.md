@@ -52,6 +52,69 @@ depth and again through the depth-capped driver (coarse flat-filled pixels are
 excluded from the comparison but must exist, so the capped path is provably
 exercised).
 
+## Hemisphere bounces: the same idea, aimed at the light integral
+
+Secondary lighting is an integral of incoming light over the hemisphere above
+each shading point — and the same divide-and-conquer that drives the screen
+quadtree can dispatch that search (**H** cycles it: off → AO → GI →
+GI + shadow shafts; still frames only).
+
+The hemisphere is a quadtree too, but built from **spherical triangles**
+instead of squares: the root is the tangent half-space (a 1-plane frustum),
+level 1 is 4 spherical octants, and deeper levels split each triangle through
+its great-circle edge midpoints. Great-circle edges are exactly planes through
+the apex, so every cell *is* a `TileFrustum` (3 planes + unused slots), the
+midpoint children exactly partition their parent (which is what makes
+inherited `tmin` + node cuts sound, the same argument as pixel quadrants), and
+each cell has a closed-form cosine-weighted area (Lambert's formula — an
+octant is exactly π/4). The apex is the shading point; the hemisphere runs its
+own tmin chain from its own apex — the primary tile's `tmin` never leaks in.
+
+Each cell runs the familiar step: bound query over the inherited cut, then
+
+- **proven empty** → the cell's contribution is *analytic*: exact projected
+  solid angle for AO, `sky() ×` exact PSA for GI (with pure-math refinement
+  near the sun's glow lobe — an empty parent proves all children empty, so
+  refining costs sky evaluations only). Zero rays, zero variance.
+- **query cutoff reached** → one stratified ray per sub-cell (uniform inside
+  the spherical triangle, Arvo '95), seeded from the inherited cut with the
+  inherited `tmin` — the hemisphere analog of `LEAF_TILE`: one bound query
+  amortizes over 4 rays, because an occlusion ray is ~10 node visits and a
+  bound query on a dense cut costs more.
+- otherwise → refine the cut, split 4-way, recurse (blocked cells subdivide,
+  never stop — same rule as the screen).
+
+AO additionally clamps every query to the AO radius (`None` then means "open
+within the radius", never "sky") and drops cut nodes entirely beyond it —
+sound only because every consumer ray's `tmax` is clamped the same way.
+
+Verification mirrors the primary gates: every claimed-empty cell is re-tested
+with reference rays through its interior (**false-empty = 0**), every leaf
+ray is re-traced with `tmin = 0` (**tmin-overshoot = 0**), cut-seeded
+traversal must agree with the full tree, and the accounted projected solid
+angle per point must total π. On top of that, `--check` A/Bs the integrator
+against high-sample cosine references: AO within 0.02 mean absolute error and
+bias-free (the estimator is unbiased — the leaf samples are uniform in their
+cells); GI within 5% mean relative against a reference implementing the same
+one-bounce policy.
+
+The measured economics are honest rather than triumphant: a hemi-GI frame
+costs ~40-60× a plain hybrid frame at 64 cells/point on the dense default
+scene — but it is *converged* immediately where the sampled path needs
+hundreds of accumulation frames, and open scenes adapt (most of the
+hemisphere resolves analytically at octant scale).
+
+**Shadow shafts** apply the same machinery to the area light: a frustum from
+the shading point through the light's corners (clipped by the tangent plane —
+without that 5th plane the own surface's AABB hugs the apex and nothing is
+ever proven lit), subdivided once on ambiguity. Samples landing in a subrect
+proven empty skip their occlusion ray outright — same sampling, same
+estimator, identical image; 75% of shadow rays vanish on the default scene.
+The candid result: at 2–4 shadow samples/point the culling query costs more
+than the rays it saves (~3× net slower), so shafts are off by default — the
+technique needs cross-point claim sharing (the temporal cache's δ-subtraction
+transfer, future work) before it pays.
+
 ## Parallelism
 
 Rayon's work-stealing pool is the "task list + pool of listener threads":
@@ -96,6 +159,7 @@ presentation; building never needs them.
 | **T** | toggle dynamic resolution vs fixed half-res while moving |
 | **O** | quadtree debug overlay: subdivision-depth heatmap + tile borders |
 | **G** | toggle DLSS Ray Reconstruction (when available) |
+| **H** | hemisphere frustum bounces: off → AO → GI → GI + shadow shafts (still frames) |
 | **B** | toggle GPU vs CPU tonemap (non-DLSS mode) |
 | **1 / 2 / 3** | quality presets (shadow/AO samples, reflections) |
 | **C** | verify current view against the reference (prints counters) |

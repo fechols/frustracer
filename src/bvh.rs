@@ -320,12 +320,46 @@ impl Bvh {
         tmax: f32,
         visits: &mut u64,
     ) -> bool {
-        let mut stack = [0u32; 64];
-        let mut sp = 0usize;
-        let mut node_idx = 0u32;
         if !slab_t(&self.nodes[0].aabb, ray, tmin, tmax).is_finite() {
             return false;
         }
+        self.occluded_from(scene, ray, tmin, tmax, 0, visits)
+    }
+
+    /// Any hit in (tmin, tmax) with traversal seeded from a node cut — the
+    /// occlusion analog of `intersect_multi`, for hemisphere/shaft bounce rays
+    /// that own a cut (their OWN apex-relative cut, never a primary tile's).
+    pub fn occluded_multi(
+        &self,
+        scene: &Scene,
+        ray: &Ray,
+        tmin: f32,
+        tmax: f32,
+        roots: &[u32],
+        visits: &mut u64,
+    ) -> bool {
+        for &r in roots {
+            if slab_t(&self.nodes[r as usize].aabb, ray, tmin, tmax).is_finite()
+                && self.occluded_from(scene, ray, tmin, tmax, r, visits)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn occluded_from(
+        &self,
+        scene: &Scene,
+        ray: &Ray,
+        tmin: f32,
+        tmax: f32,
+        start: u32,
+        visits: &mut u64,
+    ) -> bool {
+        let mut stack = [0u32; 64];
+        let mut sp = 0usize;
+        let mut node_idx = start;
         loop {
             let node = &self.nodes[node_idx as usize];
             *visits += 1;

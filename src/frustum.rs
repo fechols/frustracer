@@ -1,19 +1,34 @@
 use crate::bvh::{Aabb, Bvh};
 use glam::Vec3A;
 
-/// A screen-tile frustum: apex at the camera origin, 4 side planes through the
-/// origin (so a plane is fully described by its inward-pointing normal).
+/// A frustum with its apex at `origin` and up to 5 side planes through the
+/// apex (so a plane is fully described by its inward-pointing normal; zero
+/// normals never cull). Screen tiles use 4 planes; hemisphere cells 1 or 3;
+/// light shafts 4 + a tangent-plane clip.
 pub struct TileFrustum {
     pub origin: Vec3A,
-    normals: [Vec3A; 4],
+    normals: [Vec3A; 5],
+    /// Planes actually in use — the tail of `normals` is zero and a zero
+    /// normal never culls, so skipping it is pure savings in the plane-test
+    /// loop (the hottest loop in the tracer).
+    n_planes: usize,
 }
 
 impl TileFrustum {
     /// `corners` are the (normalized) ray directions through the tile's
     /// continuous image-plane corners, in perimeter order.
     pub fn new(origin: Vec3A, corners: [Vec3A; 4]) -> Self {
+        Self::with_clip(origin, corners, Vec3A::ZERO)
+    }
+
+    /// A 4-corner cone additionally clipped by the through-apex plane with
+    /// inward normal `clip` (the light-shaft case: `clip` = the surface
+    /// normal, excluding the own surface exactly — sound because only
+    /// samples with `wi·n > 0` ever consult the shaft, and their segments
+    /// lie wholly in the clip half-space).
+    pub fn with_clip(origin: Vec3A, corners: [Vec3A; 4], clip: Vec3A) -> Self {
         let center = corners[0] + corners[1] + corners[2] + corners[3];
-        let mut normals = [Vec3A::ZERO; 4];
+        let mut normals = [Vec3A::ZERO; 5];
         for i in 0..4 {
             let n = corners[i].cross(corners[(i + 1) % 4]);
             let n = if n.dot(center) < 0.0 { -n } else { n };
@@ -21,7 +36,44 @@ impl TileFrustum {
             // test below never culls, which is the safe direction.
             normals[i] = n.normalize_or_zero();
         }
-        TileFrustum { origin, normals }
+        normals[4] = clip;
+        let n_planes = if clip == Vec3A::ZERO { 4 } else { 5 };
+        TileFrustum { origin, normals, n_planes }
+    }
+
+    /// Hemisphere "root frustum" for the bounce integrator: one plane through
+    /// the apex with inward normal `n` (the surface tangent plane), the rest
+    /// zero (which never cull). The hemisphere analog of the whole-screen
+    /// root — the apex is a shading point, not the camera.
+    pub fn half_space(origin: Vec3A, n: Vec3A) -> Self {
+        let mut normals = [Vec3A::ZERO; 5];
+        normals[0] = n;
+        TileFrustum { origin, normals, n_planes: 1 }
+    }
+
+    /// Spherical-triangle cell (a hemisphere-quadtree tile): the cell's edges
+    /// are great-circle arcs, so its boundary is exactly three planes through
+    /// the apex + zero planes. Orientation is fixed by the vertex sum, the
+    /// same trick as `new` — a positive combination of the vertices lies
+    /// strictly inside any sub-hemisphere cell, so the sign fix always picks
+    /// the inward normal.
+    pub fn tri_cell(origin: Vec3A, a: Vec3A, b: Vec3A, c: Vec3A) -> Self {
+        let center = a + b + c;
+        let mut normals = [Vec3A::ZERO; 5];
+        for (i, (u, v)) in [(a, b), (b, c), (c, a)].into_iter().enumerate() {
+            let n = u.cross(v);
+            let n = if n.dot(center) < 0.0 { -n } else { n };
+            normals[i] = n.normalize_or_zero();
+        }
+        TileFrustum { origin, normals, n_planes: 3 }
+    }
+
+    /// Inclusive direction-containment against the active planes (`slack`
+    /// in the units of the unit normals). Exposed so `sphcell::self_test`
+    /// validates samples against the REAL cell construction the integrator
+    /// queries with, not a hand-rebuilt copy of it.
+    pub fn contains_dir(&self, d: Vec3A, slack: f32) -> bool {
+        self.normals[..self.n_planes].iter().all(|n| d.dot(*n) >= -slack)
     }
 
     /// Conservative: true only if the box is fully outside some side plane.
@@ -29,7 +81,7 @@ impl TileFrustum {
     /// efficiency, never correctness.
     #[inline]
     fn aabb_outside(&self, aabb: &Aabb) -> bool {
-        for n in &self.normals {
+        for n in &self.normals[..self.n_planes] {
             // positive vertex: the box corner farthest along the plane normal
             let pv = Vec3A::select(n.cmpge(Vec3A::ZERO), aabb.max, aabb.min);
             let rel = pv - self.origin;
@@ -79,17 +131,51 @@ pub fn nearest_geometry_distance(
     roots: &[u32],
     visits: &mut u64,
 ) -> Option<f32> {
-    let mut best = f32::INFINITY;
+    nearest_geometry_distance_within(bvh, f, t_start, f32::INFINITY, roots, visits)
+}
+
+/// `nearest_geometry_distance` clamped to a max distance of interest: only
+/// geometry strictly closer than `t_limit` is reported. `None` means
+/// "frustum ∩ (ball(t_limit) \ ball(t_start)) is empty" — it says NOTHING
+/// beyond `t_limit`, so a `None` may only be consumed as "open within
+/// t_limit" (AO, light shafts), never as sky. A `Some(t)` is still a valid
+/// lower bound for ALL frustum geometry beyond t_start (nodes are pruned only
+/// at `d >= best >= t`), so it remains a sound child tc. The `d >= best`
+/// prune in `visit` does the early-out — seeding `best = t_limit` is the
+/// entire mechanism.
+pub fn nearest_geometry_distance_within(
+    bvh: &Bvh,
+    f: &TileFrustum,
+    t_start: f32,
+    t_limit: f32,
+    roots: &[u32],
+    visits: &mut u64,
+) -> Option<f32> {
+    let mut best = t_limit;
     for &r in roots {
         visit(bvh, f, t_start, r, &mut best, visits);
     }
-    best.is_finite().then_some(best)
+    (best < t_limit).then_some(best)
 }
 
 /// Budget for a tile's inherited BVH node cut. Correctness never depends on
 /// it: an exhausted budget emits internal nodes coarsely (MAX_CUT = 1 would
 /// degenerate to re-descending from the root, exactly the pre-cut behavior).
 pub const MAX_CUT: usize = 64;
+
+/// The advance/slack rule shared by every inherited-tmin chain (screen tiles,
+/// hemisphere cells, shaft subrects): a bound `t` advances the inherited
+/// `t_start` only past fp slack (relative 1e-4, floored by the scene-scaled
+/// `eps`), and an advanced claim is shaved by the same relative slack so the
+/// strict `t > tmin` hit acceptance keeps room. Monotone — the result never
+/// drops below `t_start`. Returns `(advanced, tc)`; blocked (unadvanced)
+/// consumers must still subdivide.
+#[inline]
+pub fn advance_tc(t: f32, t_start: f32, eps: f32) -> (bool, f32) {
+    let advanced = t > t_start + (t_start * 1e-4).max(eps);
+    let tc = if advanced { (t * (1.0 - 1e-4)).max(t_start) } else { t_start };
+    (advanced, tc)
+}
 
 /// Refine a parent tile's node cut into this tile's cut.
 ///
@@ -99,34 +185,47 @@ pub const MAX_CUT: usize = 64;
 ///   jittered leaf rays are contained in it), or
 /// - `max_dist(origin, aabb) <= t_ball`: every point of the node is at
 ///   Euclidean distance <= t_ball, tmin only grows down the quadtree, and ray
-///   hit acceptance is strictly `t > tmin` — no descendant ray can hit it.
+///   hit acceptance is strictly `t > tmin` — no descendant ray can hit it, or
+/// - `dist(origin, aabb) >= t_far`: every point of the node is at distance
+///   >= t_far. Sound ONLY under the clamped-consumer contract: every bound
+///   query on this cut is `_within(t_limit <= t_far)` and every ray on it
+///   uses `tmax <= t_far` (hit acceptance is strictly `t < tmax`). The
+///   primary path passes `t_far = INFINITY`, which never drops; the
+///   hemisphere AO path passes its ao_radius.
 ///
 /// NO distance-to-best pruning here, ever. The `d >= best` prune belongs to
 /// the bound query only: a far node can still be the nearest thing inside a
 /// descendant's smaller frustum, and pruning it from the cut would surface as
 /// false sky. The cut handed to children must only ever come from here.
 ///
-/// Iterative work stack with the invariant `out_len + work_len <= MAX_CUT`,
-/// so a surviving node always has a slot: internal nodes split into their two
+/// Iterative work stack with the invariant `out_len + work_len <= N`, so a
+/// surviving node always has a slot: internal nodes split into their two
 /// children only while the budget allows, otherwise they are emitted coarsely
-/// (never dropped).
-pub fn refine_cut(
+/// (never dropped). Generic over the cut capacity so each caller owns its
+/// budget constant (screen tiles MAX_CUT, hemisphere HEMI_CUT, shafts
+/// SHAFT_CUT — all 64 today; larger hemisphere budgets were measured slower,
+/// see hemi.rs). Overflow only coarsens a cut, it never affects correctness.
+pub fn refine_cut<const N: usize>(
     bvh: &Bvh,
     f: &TileFrustum,
     t_ball: f32,
+    t_far: f32,
     parent_cut: &[u32],
-    out: &mut [u32; MAX_CUT],
+    out: &mut [u32; N],
     visits: &mut u64,
     overflows: &mut u64,
 ) -> usize {
     if bvh.tri_idx.is_empty() {
         return 0; // the n == 0 root has count == 0 and would parse as internal
     }
-    let mut work = [0u32; MAX_CUT];
-    debug_assert!(parent_cut.len() <= MAX_CUT);
-    let mut wlen = parent_cut.len().min(MAX_CUT);
+    let mut work = [0u32; N];
+    debug_assert!(parent_cut.len() <= N);
+    let mut wlen = parent_cut.len().min(N);
     work[..wlen].copy_from_slice(&parent_cut[..wlen]);
     let mut olen = 0usize;
+    // The primary path passes t_far = INFINITY; skip the per-node distance
+    // (a sqrt) when the comparison is statically dead.
+    let has_far = t_far.is_finite();
     while wlen > 0 {
         wlen -= 1;
         let idx = work[wlen];
@@ -138,7 +237,10 @@ pub fn refine_cut(
         if point_aabb_max_dist(f.origin, &node.aabb) <= t_ball {
             continue; // entirely inside the proven-empty ball
         }
-        if node.count == 0 && olen + wlen + 2 <= MAX_CUT {
+        if has_far && point_aabb_dist(f.origin, &node.aabb) >= t_far {
+            continue; // entirely beyond the consumers' tmax clamp
+        }
+        if node.count == 0 && olen + wlen + 2 <= N {
             work[wlen] = node.left_first;
             work[wlen + 1] = node.left_first + 1;
             wlen += 2;

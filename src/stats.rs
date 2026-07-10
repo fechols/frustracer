@@ -30,6 +30,20 @@ pub struct Stats {
     pub temporal_sky_tiles: AtomicU64,
     /// Cells visited by the temporal region-min query (its cost).
     pub temporal_tests: AtomicU64,
+    /// Shading points that ran the hemisphere frustum integrator.
+    pub hemi_points: AtomicU64,
+    /// Hemisphere-cell bound queries (+ refines) and their BVH node visits.
+    pub hemi_queries: AtomicU64,
+    pub hemi_nodes: AtomicU64,
+    /// Cells resolved analytically (proven empty/open — zero rays).
+    pub hemi_cells_empty: AtomicU64,
+    /// Budget-depth cells that shot their one stratified ray.
+    pub hemi_leaf_rays: AtomicU64,
+    /// Light-shaft subrect bound queries and their node visits.
+    pub shaft_queries: AtomicU64,
+    pub shaft_nodes: AtomicU64,
+    /// Shadow rays skipped because the shaft proved the subrect unoccluded.
+    pub shaft_rays_skipped: AtomicU64,
 }
 
 #[derive(Default)]
@@ -52,6 +66,47 @@ pub struct LocalStats {
     pub temporal_seeds: u64,
     pub temporal_sky_tiles: u64,
     pub temporal_tests: u64,
+    pub hemi_points: u64,
+    pub hemi_queries: u64,
+    pub hemi_nodes: u64,
+    pub hemi_cells_empty: u64,
+    pub hemi_leaf_rays: u64,
+    pub shaft_queries: u64,
+    pub shaft_nodes: u64,
+    pub shaft_rays_skipped: u64,
+}
+
+impl LocalStats {
+    /// Fold another batch in — used by the parallel `--check` probe sweeps,
+    /// which keep per-probe LocalStats and reduce them sequentially.
+    pub fn merge(&mut self, o: &LocalStats) {
+        self.frustum_queries += o.frustum_queries;
+        self.frustum_nodes += o.frustum_nodes;
+        self.ray_nodes += o.ray_nodes;
+        self.primary_rays += o.primary_rays;
+        self.secondary_rays += o.secondary_rays;
+        self.sky_pixels += o.sky_pixels;
+        self.sky_tiles += o.sky_tiles;
+        self.blocked_queries += o.blocked_queries;
+        self.tiles += o.tiles;
+        self.skip_ratio_micro += o.skip_ratio_micro;
+        self.skip_ratio_count += o.skip_ratio_count;
+        self.cut_len_sum += o.cut_len_sum;
+        self.cut_overflows += o.cut_overflows;
+        self.coarse_tiles += o.coarse_tiles;
+        self.coarse_pixels += o.coarse_pixels;
+        self.temporal_seeds += o.temporal_seeds;
+        self.temporal_sky_tiles += o.temporal_sky_tiles;
+        self.temporal_tests += o.temporal_tests;
+        self.hemi_points += o.hemi_points;
+        self.hemi_queries += o.hemi_queries;
+        self.hemi_nodes += o.hemi_nodes;
+        self.hemi_cells_empty += o.hemi_cells_empty;
+        self.hemi_leaf_rays += o.hemi_leaf_rays;
+        self.shaft_queries += o.shaft_queries;
+        self.shaft_nodes += o.shaft_nodes;
+        self.shaft_rays_skipped += o.shaft_rays_skipped;
+    }
 }
 
 impl Stats {
@@ -74,6 +129,14 @@ impl Stats {
         self.temporal_seeds.store(0, Relaxed);
         self.temporal_sky_tiles.store(0, Relaxed);
         self.temporal_tests.store(0, Relaxed);
+        self.hemi_points.store(0, Relaxed);
+        self.hemi_queries.store(0, Relaxed);
+        self.hemi_nodes.store(0, Relaxed);
+        self.hemi_cells_empty.store(0, Relaxed);
+        self.hemi_leaf_rays.store(0, Relaxed);
+        self.shaft_queries.store(0, Relaxed);
+        self.shaft_nodes.store(0, Relaxed);
+        self.shaft_rays_skipped.store(0, Relaxed);
     }
 
     pub fn add(&self, l: &LocalStats) {
@@ -131,6 +194,30 @@ impl Stats {
         if l.temporal_tests > 0 {
             self.temporal_tests.fetch_add(l.temporal_tests, Relaxed);
         }
+        if l.hemi_points > 0 {
+            self.hemi_points.fetch_add(l.hemi_points, Relaxed);
+        }
+        if l.hemi_queries > 0 {
+            self.hemi_queries.fetch_add(l.hemi_queries, Relaxed);
+        }
+        if l.hemi_nodes > 0 {
+            self.hemi_nodes.fetch_add(l.hemi_nodes, Relaxed);
+        }
+        if l.hemi_cells_empty > 0 {
+            self.hemi_cells_empty.fetch_add(l.hemi_cells_empty, Relaxed);
+        }
+        if l.hemi_leaf_rays > 0 {
+            self.hemi_leaf_rays.fetch_add(l.hemi_leaf_rays, Relaxed);
+        }
+        if l.shaft_queries > 0 {
+            self.shaft_queries.fetch_add(l.shaft_queries, Relaxed);
+        }
+        if l.shaft_nodes > 0 {
+            self.shaft_nodes.fetch_add(l.shaft_nodes, Relaxed);
+        }
+        if l.shaft_rays_skipped > 0 {
+            self.shaft_rays_skipped.fetch_add(l.shaft_rays_skipped, Relaxed);
+        }
     }
 
     pub fn summary_line(&self) -> String {
@@ -160,8 +247,31 @@ impl Stats {
         let tseeds = self.temporal_seeds.load(Relaxed);
         let tsky = self.temporal_sky_tiles.load(Relaxed);
         let ttests = self.temporal_tests.load(Relaxed);
+        // Bounce-integrator segments only appear when those paths ran.
+        let hp = self.hemi_points.load(Relaxed);
+        let hemi = if hp > 0 {
+            format!(
+                " | hemi: pts {hp} q {} empty {} rays {} nodes {}",
+                self.hemi_queries.load(Relaxed),
+                self.hemi_cells_empty.load(Relaxed),
+                self.hemi_leaf_rays.load(Relaxed),
+                self.hemi_nodes.load(Relaxed),
+            )
+        } else {
+            String::new()
+        };
+        let sq = self.shaft_queries.load(Relaxed);
+        let shaft = if sq > 0 {
+            format!(
+                " | shaft: q {sq} skip {} nodes {}",
+                self.shaft_rays_skipped.load(Relaxed),
+                self.shaft_nodes.load(Relaxed),
+            )
+        } else {
+            String::new()
+        };
         format!(
-            "tiles {tiles} | fr-queries {fq} (blocked {blocked}) | cut mean {cut_mean:.1} (ovf {ovf}) | nodes: frustum {fnodes} + ray {rnodes} = {} | rays: {prim} prim + {sec} sec | sky-px (0 rays) {sky} | coarse-px {coarse} | temporal: seeds {tseeds} sky {tsky} cells {ttests} | mean t_start/t_hit {skip:.2}",
+            "tiles {tiles} | fr-queries {fq} (blocked {blocked}) | cut mean {cut_mean:.1} (ovf {ovf}) | nodes: frustum {fnodes} + ray {rnodes} = {} | rays: {prim} prim + {sec} sec | sky-px (0 rays) {sky} | coarse-px {coarse} | temporal: seeds {tseeds} sky {tsky} cells {ttests} | mean t_start/t_hit {skip:.2}{hemi}{shaft}",
             fnodes + rnodes
         )
     }

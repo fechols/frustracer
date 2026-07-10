@@ -126,7 +126,7 @@ fn tile_step(
     let step = match result {
         None => TileStep::Sky,
         Some(t_safe) => {
-            let advanced = t_safe > t_start + (t_start * 1e-4).max(ctx.scene.eps);
+            let (advanced, tc) = frustum::advance_tc(t_safe, t_start, ctx.scene.eps);
             if !advanced {
                 // Blocked at the inherited distance (typically a large flat
                 // AABB like the ground). Still subdivide: children's smaller
@@ -134,13 +134,8 @@ fn tile_step(
                 // how sky tiles emerge. Worst case is bounded by the leaf cutoff.
                 ls.blocked_queries += 1;
             }
-            let tc = if advanced {
-                (t_safe * (1.0 - 1e-4)).max(t_start)
-            } else {
-                t_start
-            };
             let mut cut = [0u32; MAX_CUT];
-            let len = frustum::refine_cut(ctx.bvh, &f, tc, cut_in, &mut cut, &mut visits, &mut ls.cut_overflows);
+            let len = frustum::refine_cut(ctx.bvh, &f, tc, f32::INFINITY, cut_in, &mut cut, &mut visits, &mut ls.cut_overflows);
             ls.cut_len_sum += len as u64;
             TileStep::Split { tc, cut, len }
         }
@@ -410,8 +405,7 @@ fn shade_pixel(
                 &mut rng,
                 ctx.sun,
                 0,
-                &mut ls.secondary_rays,
-                &mut ls.ray_nodes,
+                ls,
                 if ctx.gbuf.is_some() { Some(&mut prim) } else { None },
             );
             ctx.splat(x, y, c);
@@ -473,8 +467,7 @@ fn flat_fill(
                 &mut rng,
                 ctx.sun,
                 0,
-                &mut ls.secondary_rays,
-                &mut ls.ray_nodes,
+                ls,
                 if ctx.gbuf.is_some() { Some(&mut prim) } else { None },
             );
             (c, hit.t)

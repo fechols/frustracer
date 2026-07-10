@@ -2,6 +2,7 @@ mod bvh;
 mod camera;
 mod dlss;
 mod frustum;
+mod hemi;
 // The presentation stack (D3D12 + Streamline) is Windows-only; everything
 // headless (--check, --check-dlss) stays cross-platform.
 #[cfg(windows)]
@@ -12,11 +13,14 @@ mod overlay;
 mod render;
 mod scene;
 mod shade;
+mod shaft;
+mod sphcell;
 mod stats;
 mod temporal;
 
 use camera::Camera;
 use glam::Vec3A;
+use rayon::prelude::*;
 use render::FrameCtx;
 use shade::Quality;
 use stats::Stats;
@@ -159,7 +163,12 @@ fn main() {
 /// validates the CPU capture before/without the denoiser.
 fn run_check_dlss(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, dump: bool) -> i32 {
     let (near, far) = dlss::near_far(scene.diag);
-    let q = Quality { shadow_samples: 1, ao_samples: 1, reflections: true };
+    let q = Quality {
+        shadow_samples: 1,
+        ao_samples: 1,
+        reflections: true,
+        fb: shade::FrustumBounce::OFF,
+    };
     let stats = Stats::default();
 
     // Halton structural checks: known prefixes, offsets in [-0.5, 0.5).
@@ -260,6 +269,53 @@ fn scaled_camera(k: f32) -> Camera {
     )
 }
 
+/// One deterministic probe for the bounce-integrator check sections: a
+/// primary-hit surface point (with its shading normal) on the check camera.
+struct Probe {
+    x: usize,
+    y: usize,
+    p: Vec3A,
+    n: Vec3A,
+}
+
+/// The deterministic probe sweep shared by the hemi-AO, hemi-GI, and shaft
+/// check sections — every section MUST run on this exact set (the A/B gates
+/// compare like-for-like only because integrator and reference share points).
+fn collect_probes(
+    scene: &scene::Scene,
+    bvh: &bvh::Bvh,
+    cam: &camera::CamBasis,
+    rw: usize,
+    rh: usize,
+) -> Vec<Probe> {
+    let mut vis = 0u64;
+    let mut probes = Vec::new();
+    for y in 0..rh {
+        for x in 0..rw {
+            if (x * 7 + y * 13) % 397 != 0 {
+                continue;
+            }
+            let dir = cam.ray_dir(x as f32 + 0.5, y as f32 + 0.5);
+            let ray = bvh::Ray::new(cam.origin, dir);
+            let Some(hit) = bvh.intersect(scene, &ray, 0.0, f32::INFINITY, &mut vis) else {
+                continue;
+            };
+            let (p, n) = shade::surface_point(scene, &ray, &hit);
+            probes.push(Probe { x, y, p, n });
+        }
+    }
+    probes
+}
+
+/// Per-pixel deterministic RNG seed for the probe sweeps (`s` salts the
+/// stratified repeats and separates integrator from reference streams).
+fn px_seed(x: usize, y: usize, s: u64) -> u64 {
+    (x as u64)
+        .wrapping_mul(0x9E3779B97F4A7C15)
+        .wrapping_add((y as u64).wrapping_mul(0xC2B2AE3D27D4EB4F))
+        .wrapping_add(s)
+}
+
 /// Headless end-to-end check: correctness counters (must be 0), an A/B
 /// benchmark of hybrid vs plain, and a rendered check.png. `structural`
 /// additionally gates the scene-topology assertions (coarse pixels at fixed
@@ -271,6 +327,20 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     let cam = cam0.basis(rw, rh);
     let q = Quality::preset(2);
     let stats = Stats::default();
+
+    // Spherical-cell math self-test — closed-form identities the hemisphere
+    // bounce integrator is built on (Ω/PSA anchors, exact partition,
+    // in-cell sampling).
+    let sph_ok = match sphcell::self_test() {
+        Ok(()) => {
+            eprintln!("sphcell self-test: OK");
+            true
+        }
+        Err(e) => {
+            eprintln!("sphcell self-test: FAIL — {e}");
+            false
+        }
+    };
 
     let rep = render::verify(scene, bvh, &cam, q, rw, rh, &stats, None, None);
     eprintln!(
@@ -292,18 +362,334 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         eprintln!("verify capped d=4: expected coarse pixels, found none — capped path not exercised");
     }
 
+    // Hemisphere frustum AO: soundness gates (reference rays re-validate
+    // every empty-cell claim and leaf-ray tmin on a deterministic probe set —
+    // the false-sky / tmin-overshoot analogs) plus an A/B error measurement
+    // against high-sample cosine AO at the same surface points. The
+    // integrator is unbiased, so the signed mean is a bias detector.
+    let probes = collect_probes(scene, bvh, &cam, rw, rh);
+    let hemi_ok = {
+        const SEEDS: u64 = 8; // hemi AO averaged over stratified frames
+        const REF_SAMPLES: u32 = 1024;
+        // Per-probe work is independent (per-pixel seeds); results are
+        // collected in probe order and folded sequentially, so the sweep is
+        // deterministic and parallel.
+        let results: Vec<_> = probes
+            .par_iter()
+            .map(|pr| {
+                let mut hv = hemi::VerifyCounters::default();
+                let mut ls = stats::LocalStats::default();
+                let mut vis = 0u64;
+                let (t1, t2) = shade::onb(pr.n);
+                let mut ao_h = 0.0;
+                for s in 0..SEEDS {
+                    let mut rng = fastrand::Rng::with_seed(px_seed(pr.x, pr.y, s));
+                    ao_h += hemi::ao(
+                        scene,
+                        bvh,
+                        pr.p,
+                        pr.n,
+                        t1,
+                        t2,
+                        q.fb.depth,
+                        scene.ao_radius,
+                        &mut rng,
+                        if s == 0 { Some(&mut hv) } else { None },
+                        &mut ls,
+                    );
+                }
+                let ao_h = ao_h / SEEDS as f32;
+                // Reference: cosine-sampled AO, the same construction shade()
+                // uses, from the same eps-offset point.
+                let mut rng = fastrand::Rng::with_seed(px_seed(pr.x, pr.y, 0xA0));
+                let mut open = 0u32;
+                for _ in 0..REF_SAMPLES {
+                    let r1 = rng.f32();
+                    let r2 = rng.f32();
+                    let d = shade::cosine_dir(pr.n, t1, t2, r1, r2);
+                    if !bvh.occluded(scene, &bvh::Ray::new(pr.p, d), 0.0, scene.ao_radius, &mut vis)
+                    {
+                        open += 1;
+                    }
+                }
+                let ao_r = open as f32 / REF_SAMPLES as f32;
+                ((ao_h - ao_r) as f64, hv, ls)
+            })
+            .collect();
+        let mut hv = hemi::VerifyCounters::default();
+        let mut ls = stats::LocalStats::default();
+        let (mut sum_abs, mut sum_signed, mut worst) = (0f64, 0f64, 0f32);
+        for (d, phv, pls) in &results {
+            hv.merge(phv);
+            ls.merge(pls);
+            sum_abs += d.abs();
+            sum_signed += *d;
+            worst = worst.max(d.abs() as f32);
+        }
+        let nprobes = results.len() as u64;
+        let mean_abs = sum_abs / nprobes.max(1) as f64;
+        let mean_signed = sum_signed / nprobes.max(1) as f64;
+        eprintln!(
+            "hemi AO ({nprobes} probes, depth {}): psa-viol {} | false-empty {} | tmin-overshoot {} | cut-miss {} | max psa err {:.2e}",
+            q.fb.depth, hv.psa_violations, hv.false_empty, hv.tmin_overshoot, hv.cut_miss, hv.max_psa_err
+        );
+        eprintln!(
+            "hemi AO vs {REF_SAMPLES}-sample cosine: mean |Δ| {mean_abs:.4} (limit 0.02) | mean Δ {mean_signed:+.4} (limit ±0.005) | worst {worst:.3} | per point: {:.1} queries, {:.1} rays, {:.1} cells empty",
+            ls.hemi_queries as f64 / ls.hemi_points.max(1) as f64,
+            ls.hemi_leaf_rays as f64 / ls.hemi_points.max(1) as f64,
+            ls.hemi_cells_empty as f64 / ls.hemi_points.max(1) as f64,
+        );
+        let mut ok = hv.ok() && mean_abs < 0.02 && mean_signed.abs() < 0.005;
+        if structural && (ls.hemi_cells_empty == 0 || ls.hemi_leaf_rays == 0) {
+            eprintln!("hemi AO: expected both empty cells and leaf rays > 0 — a path didn't fire");
+            ok = false;
+        }
+        ok
+    };
+
+    // Hemisphere frustum GI: the same soundness gates (with t_limit = ∞, so
+    // empty-cell claims are true sky claims) plus an A/B against a
+    // cosine-sampled reference implementing the SAME depth-1 bounce policy
+    // (hemi::BOUNCE_Q) — the comparison isolates integrator error from policy
+    // error. Luminance-relative gate; the signed mean detects bias.
+    let gi_ok = {
+        let sun = render::sun_dir(scene);
+        const SEEDS: u64 = 8;
+        const REF_SAMPLES: u32 = 512;
+        let lum = |c: Vec3A| c.dot(Vec3A::new(0.2126, 0.7152, 0.0722));
+        // Same probe set and parallel/sequential-fold structure as hemi AO.
+        let results: Vec<_> = probes
+            .par_iter()
+            .map(|pr| {
+                let mut hv = hemi::VerifyCounters::default();
+                let mut ls = stats::LocalStats::default();
+                let mut vis = 0u64;
+                let (t1, t2) = shade::onb(pr.n);
+                let mut e_h = Vec3A::ZERO;
+                for s in 0..SEEDS {
+                    let mut rng = fastrand::Rng::with_seed(px_seed(pr.x, pr.y, s));
+                    e_h += hemi::gi(
+                        scene,
+                        bvh,
+                        pr.p,
+                        pr.n,
+                        t1,
+                        t2,
+                        q.fb.depth,
+                        sun,
+                        0,
+                        &mut rng,
+                        if s == 0 { Some(&mut hv) } else { None },
+                        &mut ls,
+                    );
+                }
+                let e_h = e_h / SEEDS as f32;
+                // Reference: cosine-sampled hemisphere, identical depth-1
+                // policy (miss → sky, hit → shade at BOUNCE_Q, depth 1).
+                let mut rng = fastrand::Rng::with_seed(px_seed(pr.x, pr.y, 0xE0));
+                let mut lsr = stats::LocalStats::default();
+                let mut e_r = Vec3A::ZERO;
+                for _ in 0..REF_SAMPLES {
+                    let r1 = rng.f32();
+                    let r2 = rng.f32();
+                    let d = shade::cosine_dir(pr.n, t1, t2, r1, r2);
+                    let bray = bvh::Ray::new(pr.p, d);
+                    e_r += match bvh.intersect(scene, &bray, 0.0, f32::INFINITY, &mut vis) {
+                        None => shade::sky(d, sun),
+                        Some(h) => shade::shade(
+                            scene,
+                            bvh,
+                            &bray,
+                            &h,
+                            &hemi::BOUNCE_Q,
+                            &mut rng,
+                            sun,
+                            1,
+                            &mut lsr,
+                            None,
+                        ),
+                    };
+                }
+                let e_r = e_r / REF_SAMPLES as f32;
+                let rel = ((lum(e_h) - lum(e_r)) / lum(e_r).max(0.05)) as f64;
+                (rel, hv, ls)
+            })
+            .collect();
+        let mut hv = hemi::VerifyCounters::default();
+        let mut ls = stats::LocalStats::default();
+        let (mut sum_rel, mut sum_signed, mut worst) = (0f64, 0f64, 0f32);
+        for (rel, phv, pls) in &results {
+            hv.merge(phv);
+            ls.merge(pls);
+            sum_rel += rel.abs();
+            sum_signed += *rel;
+            worst = worst.max(rel.abs() as f32);
+        }
+        let nprobes = results.len() as u64;
+        let mean_rel = sum_rel / nprobes.max(1) as f64;
+        let mean_signed = sum_signed / nprobes.max(1) as f64;
+        eprintln!(
+            "hemi GI ({nprobes} probes, depth {}): psa-viol {} | false-empty {} | tmin-overshoot {} | cut-miss {} | max psa err {:.2e}",
+            q.fb.depth, hv.psa_violations, hv.false_empty, hv.tmin_overshoot, hv.cut_miss, hv.max_psa_err
+        );
+        eprintln!(
+            "hemi GI vs {REF_SAMPLES}-sample cosine (same depth-1 policy): mean rel {mean_rel:.4} (limit 0.05) | signed {mean_signed:+.4} (limit ±0.01) | worst {worst:.3} | per point: {:.1} queries, {:.1} rays, {:.1} cells empty",
+            ls.hemi_queries as f64 / ls.hemi_points.max(1) as f64,
+            ls.hemi_leaf_rays as f64 / ls.hemi_points.max(1) as f64,
+            ls.hemi_cells_empty as f64 / ls.hemi_points.max(1) as f64,
+        );
+        let mut ok = hv.ok() && mean_rel < 0.05 && mean_signed.abs() < 0.01;
+        if structural && (ls.hemi_cells_empty == 0 || ls.hemi_leaf_rays == 0) {
+            eprintln!("hemi GI: expected both empty cells and leaf rays > 0 — a path didn't fire");
+            ok = false;
+        }
+        ok
+    };
+
+    // Light-shaft shadow culling: proven-lit subrect claims re-validated by
+    // reference occlusion rays (corners + center of each lit leaf), sample
+    // classification re-checked against full-tree occlusion (exact-match —
+    // the shaft must never change a shadow result, only skip proven rays),
+    // and the leaf rects must exactly tile the light's param square.
+    let shaft_ok = {
+        // Same probe set and parallel/sequential-fold structure as hemi AO.
+        let results: Vec<_> = probes
+            .par_iter()
+            .map(|pr| {
+                let mut ls = stats::LocalStats::default();
+                let mut vis = 0u64;
+                let (mut false_lit, mut mismatch, mut area_bad) = (0u64, 0u64, 0u64);
+                let (mut samples, mut skipped) = (0u64, 0u64);
+                let (p, n) = (pr.p, pr.n);
+                let s = shaft::build(scene, bvh, p, n, &mut ls);
+                let mut area = 0.0f32;
+                for l in s.leaves() {
+                    area += (l.r[2] - l.r[0]) * (l.r[3] - l.r[1]);
+                    if l.lit {
+                        // Corners + center of the lit subrect must be reachable.
+                        let pts = [
+                            (l.r[0], l.r[1]),
+                            (l.r[2], l.r[1]),
+                            (l.r[2], l.r[3]),
+                            (l.r[0], l.r[3]),
+                            ((l.r[0] + l.r[2]) * 0.5, (l.r[1] + l.r[3]) * 0.5),
+                        ];
+                        for (su, sv) in pts {
+                            let lp = scene.light.center + scene.light.u * su + scene.light.v * sv;
+                            let lv = lp - p;
+                            let dist = lv.length();
+                            let wi = lv / dist;
+                            // The shaft claim covers the tangent upper
+                            // half-space only — exactly the samples shade
+                            // ever consults it for (ndl > 0).
+                            if wi.dot(n) <= 0.0 {
+                                continue;
+                            }
+                            if bvh.occluded(
+                                scene,
+                                &bvh::Ray::new(p, wi),
+                                0.0,
+                                dist - scene.eps,
+                                &mut vis,
+                            ) {
+                                false_lit += 1;
+                            }
+                        }
+                    }
+                }
+                if (area - 4.0).abs() > 1e-4 {
+                    area_bad += 1;
+                }
+                // Deterministic sample sweep: the shaft-classified occlusion
+                // result must equal the full-tree result for every sample.
+                let mut rng = fastrand::Rng::with_seed(
+                    (pr.x as u64).wrapping_mul(31).wrapping_add(pr.y as u64),
+                );
+                for _ in 0..16 {
+                    let (su, sv) = (rng.f32() * 2.0 - 1.0, rng.f32() * 2.0 - 1.0);
+                    let lp = scene.light.center + scene.light.u * su + scene.light.v * sv;
+                    let lv = lp - p;
+                    let dist = lv.length();
+                    let wi = lv / dist;
+                    if wi.dot(n) <= 0.0 {
+                        continue; // shade never consults the shaft below the horizon
+                    }
+                    let full = bvh.occluded(
+                        scene,
+                        &bvh::Ray::new(p, wi),
+                        0.0,
+                        dist - scene.eps,
+                        &mut vis,
+                    );
+                    samples += 1;
+                    let got = match s.classify(su, sv) {
+                        shaft::Class::Lit => {
+                            skipped += 1;
+                            false
+                        }
+                        shaft::Class::Test { tmin, cut } => bvh.occluded_multi(
+                            scene,
+                            &bvh::Ray::new(p, wi),
+                            tmin,
+                            dist - scene.eps,
+                            cut,
+                            &mut vis,
+                        ),
+                    };
+                    if got != full {
+                        mismatch += 1;
+                    }
+                }
+                (false_lit, mismatch, area_bad, samples, skipped, ls)
+            })
+            .collect();
+        let mut ls = stats::LocalStats::default();
+        let (mut false_lit, mut mismatch, mut area_bad) = (0u64, 0u64, 0u64);
+        let (mut samples, mut skipped) = (0u64, 0u64);
+        for (fl, mm, ab, sa, sk, pls) in &results {
+            false_lit += fl;
+            mismatch += mm;
+            area_bad += ab;
+            samples += sa;
+            skipped += sk;
+            ls.merge(pls);
+        }
+        let nprobes = results.len() as u64;
+        eprintln!(
+            "shaft shadows ({nprobes} probes): false-lit {false_lit} | class mismatch {mismatch} | area-bad {area_bad} | rays skipped {skipped}/{samples} ({:.0}%) | {:.1} queries/point",
+            skipped as f64 * 100.0 / samples.max(1) as f64,
+            ls.shaft_queries as f64 / nprobes.max(1) as f64,
+        );
+        let mut ok = false_lit == 0 && mismatch == 0 && area_bad == 0;
+        if structural && skipped == 0 {
+            eprintln!("shaft shadows: expected skipped rays > 0 — the lit path didn't fire");
+            ok = false;
+        }
+        ok
+    };
+
     let accum: Vec<AtomicU32> = (0..rw * rh * 3).map(|_| AtomicU32::new(0)).collect();
     let info: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
     let tbuf: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
 
     const BENCH_FRAMES: u32 = 8;
-    for (label, hybrid) in [("hybrid", true), ("plain ", false)] {
+    for (label, hybrid, hemi_ao, hemi_gi, shafts) in [
+        ("hybrid ", true, false, false, false),
+        ("hemi-ao", true, true, false, false),
+        ("hemi-gi", true, false, true, false),
+        ("shafts ", true, false, false, true),
+        ("plain  ", false, false, false, false),
+    ] {
         stats.clear();
+        let mut bq = q;
+        bq.fb.ao = hemi_ao;
+        bq.fb.gi = hemi_gi;
+        bq.fb.shadows = shafts;
         let ctx = FrameCtx {
             scene,
             bvh,
             cam,
-            q,
+            q: bq,
             frame: 0,
             jitter: false,
             rw,
@@ -326,14 +712,19 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
         let ms = t.elapsed().as_secs_f64() * 1000.0 / BENCH_FRAMES as f64;
         eprintln!("{label}: {ms:6.1} ms/frame | per {BENCH_FRAMES} frames: {}", stats.summary_line());
-        if hybrid {
-            // Save the hybrid image while its buffers are fresh.
+        // Save the plain-hybrid and hemi-GI images while their buffers are
+        // fresh (frame stays 0, so accum holds exactly the last frame).
+        if hybrid && !hemi_ao && !hemi_gi && !shafts {
             let mut present = vec![0u32; rw * rh];
             render::resolve(&accum, &info, 1, false, &mut present, rw, rh, rw, rh);
             save_png("check.png", &present, rw, rh);
+        } else if hemi_gi {
+            let mut present = vec![0u32; rw * rh];
+            render::resolve(&accum, &info, 1, false, &mut present, rw, rh, rw, rh);
+            save_png("check_gi.png", &present, rw, rh);
         }
     }
-    eprintln!("wrote check.png");
+    eprintln!("wrote check.png + check_gi.png");
 
     // Smoke-test dynamic resolution: one depth-capped frame per plausible cap
     // must complete; coarse coverage shrinks monotonically-ish as the cap
@@ -500,11 +891,11 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         );
     }
 
-    if rep.ok() && capped_ok && temporal_ok {
+    if sph_ok && hemi_ok && gi_ok && shaft_ok && rep.ok() && capped_ok && temporal_ok {
         eprintln!("CHECK PASSED");
         0
     } else {
-        eprintln!("CHECK FAILED: hybrid image diverges from reference");
+        eprintln!("CHECK FAILED");
         1
     }
 }
@@ -531,7 +922,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     let video = sdl.video().expect("SDL video failed");
     let mut window = video
         .window(
-            "frustracer — R: hybrid/plain  T: dynamic-res  O: overlay  B: gpu-tonemap  1-3: quality  C: verify  P: screenshot",
+            "frustracer — R: hybrid/plain  T: dynamic-res  O: overlay  B: gpu-tonemap  H: hemi-bounce  1-3: quality  C: verify  P: screenshot",
             W as u32,
             H as u32,
         )
@@ -572,6 +963,9 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     let mut dynamic = true;
     let mut overlay_on = false;
     let mut gpu_tonemap = false;
+    // Hemisphere frustum bounces (H cycles off → AO → GI): still-frame
+    // quality — moving/DLSS frames keep the sampled path.
+    let mut bounce_mode = 0u32;
     let mut preset = 2u32;
     let mut prev_rw = W;
 
@@ -643,6 +1037,15 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
             gpu_tonemap = !gpu_tonemap;
             eprintln!("tonemap: {}", if gpu_tonemap { "GPU" } else { "CPU" });
         }
+        if edges.toggle_bounce {
+            bounce_mode = (bounce_mode + 1) % 4;
+            frame = 0;
+            eprintln!(
+                "hemisphere frustum bounces: {}",
+                ["OFF", "AO (still frames)", "GI (still frames)", "GI + shadow shafts (still frames)"]
+                    [bounce_mode as usize]
+            );
+        }
         if edges.toggle_dlss {
             if gpu.dlss_ready() {
                 dlss_on = !dlss_on;
@@ -685,14 +1088,24 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
             prev_budget = use_budget;
         }
         let base_q = Quality::preset(preset);
-        let q = if dlss_on {
+        let mut q = if dlss_on {
             // Fixed cheap preset: RR wants frame-stationary noise statistics.
-            Quality { shadow_samples: 1, ao_samples: 1, reflections: true }
+            Quality {
+                shadow_samples: 1,
+                ao_samples: 1,
+                reflections: true,
+                fb: shade::FrustumBounce::OFF,
+            }
         } else if moved && !use_budget {
             base_q.while_moving()
         } else {
             base_q
         };
+        if !dlss_on && !moved {
+            q.fb.ao = bounce_mode == 1;
+            q.fb.gi = bounce_mode >= 2;
+            q.fb.shadows = bounce_mode == 3;
+        }
 
         if dlss_on || frame < MAX_SAMPLES {
             stats.clear();
@@ -879,7 +1292,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 String::new()
             };
             let _ = window.set_title(&format!(
-                "frustracer | {:.0} fps | {}{}{} | {}x{} | {:.1} ms | {} | quality {}{}{}{}{}",
+                "frustracer | {:.0} fps | {}{}{} | {}x{} | {:.1} ms | {} | quality {}{}{}{}{}{}",
                 fps,
                 if hybrid { "hybrid" } else { "plain" },
                 if !dlss_on && hybrid && dynamic { "+dyn" } else { "" },
@@ -896,6 +1309,11 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 if dlss_on { "1 spp".to_string() } else { format!("{} spp", frame.min(MAX_SAMPLES)) },
                 preset,
                 coarse,
+                if dlss_on {
+                    ""
+                } else {
+                    ["", " | hemi-AO", " | hemi-GI", " | hemi-GI+shafts"][bounce_mode as usize]
+                },
                 if use_gpu_tone && !dlss_on { " | gpu-tone" } else { "" },
                 if overlay_on { " | overlay" } else { "" },
                 if !dlss_on && frame >= MAX_SAMPLES { " | converged" } else { "" },
