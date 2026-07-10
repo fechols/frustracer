@@ -35,13 +35,24 @@ pub const JITTER_SIGN: f32 = 1.0;
 /// input-res pixels; flip both signs here if motion smears directionally.
 pub const VELOCITY_SCALE: (f32, f32) = (1.0, 1.0);
 
-/// Init flags (xess_init_flags_t bitmask). 0 = HDR color, low-res pixel MVs
-/// without jitter, non-inverted depth — matching what we feed: our MVs are
+/// xess_init_flags_t::XESS_INIT_FLAG_INVERTED_DEPTH (xess.h): the depth
+/// buffer is reversed-Z (near = 1, far = 0).
+pub const XESS_INIT_FLAG_INVERTED_DEPTH: u32 = 1 << 1;
+
+/// xess_init_flags_t::XESS_INIT_FLAG_ENABLE_AUTOEXPOSURE (xess.h): XeSS
+/// computes exposure internally; the per-frame `exposure_scale` scalar and
+/// exposure texture are ignored.
+pub const XESS_INIT_FLAG_ENABLE_AUTOEXPOSURE: u32 = 1 << 8;
+
+/// Init flags (xess_init_flags_t bitmask): HDR color, low-res pixel MVs
+/// without jitter, reversed-Z depth — matching what we feed: our MVs are
 /// analytic reprojections of the exact hit point (no raster jitter baked in,
-/// the same contract as SL's mvec_jittered = 0), depth is [0,1] LH clip
-/// depth, and the color is linear HDR scaled by the per-frame
-/// `exposure_scale` scalar (1.0).
-pub const INIT_FLAGS: u32 = 0;
+/// the same contract as SL's mvec_jittered = 0), depth is reversed-Z [0,1]
+/// clip depth (near = 1, sky/far = exactly 0 — reversed-Z is the encoding
+/// fp32 keeps the most precision in, which is why the SDK flags it), and the
+/// color is linear HDR scaled by the per-frame `exposure_scale` scalar (1.0).
+/// `--xess-autoexposure` ORs in ENABLE_AUTOEXPOSURE at init (A/B lever).
+pub const INIT_FLAGS: u32 = XESS_INIT_FLAG_INVERTED_DEPTH;
 
 /// xess_quality_settings_t::XESS_QUALITY_SETTING_ULTRA_PERFORMANCE. The
 /// init-time setting fixes the LOWER end of the dynamic input range —
@@ -148,20 +159,22 @@ pub fn result_name(r: i32) -> &'static str {
 // ---------------------------------------------------------------------------
 // Depth encoding: the tracer stores linear view-Z (t * dot(dir, forward),
 // sky = far — dlss::GPixel::view_z); XeSS expects a [0,1] depth buffer. This
-// is the standard LH perspective depth for the same near/far the matrices
-// use (dlss::near_far): d = far*(z - near) / (z*(far - near)). Monotone in
-// z, d(near) = 0, d(far) = 1 — sky lands exactly on 1.
+// is reversed-Z perspective depth (INIT_FLAGS carries INVERTED_DEPTH) for
+// the same near/far the matrices use (dlss::near_far):
+// d = near*(far - z) / (z*(far - near)). Monotone decreasing in z,
+// d(near) = 1, d(far) = 0 — the zero numerator puts sky exactly on 0, so
+// the sentinel cannot drift.
 // ---------------------------------------------------------------------------
 
 #[inline(always)]
 pub fn view_z_to_clip_depth(view_z: f32, near: f32, far: f32) -> f32 {
     let z = view_z.max(near);
-    ((far * (z - near)) / (z * (far - near))).clamp(0.0, 1.0)
+    ((near * (far - z)) / (z * (far - near))).clamp(0.0, 1.0)
 }
 
 /// Inverse of `view_z_to_clip_depth` (self-test roundtrip only).
 pub fn clip_depth_to_view_z(d: f32, near: f32, far: f32) -> f32 {
-    (far * near) / (far - d * (far - near))
+    (near * far) / (near + d * (far - near))
 }
 
 // ---------------------------------------------------------------------------
@@ -358,10 +371,14 @@ mod loader {
         /// `device` (a raw ID3D12Device*) for `out` output resolution at
         /// QUALITY_SETTING. Returns the context plus the (optimal, min, max)
         /// input resolutions — the dynamic range every frame must stay in.
+        /// `autoexposure` ORs XESS_INIT_FLAG_ENABLE_AUTOEXPOSURE into
+        /// INIT_FLAGS (the flag values/polarity story stays single-sourced
+        /// at the top of this file; only the runtime bool travels in).
         pub fn new(
             dll_dir: &str,
             device: *mut c_void,
             out: (u32, u32),
+            autoexposure: bool,
         ) -> Result<(Self, Xess2D, Xess2D, Xess2D), String> {
             // Absolute path: ALTERED_SEARCH_PATH only helps absolute paths.
             let dir = std::fs::canonicalize(dll_dir)
@@ -415,7 +432,8 @@ mod loader {
             let params = XessD3d12InitParams {
                 output_resolution: out2d,
                 quality_setting: QUALITY_SETTING,
-                init_flags: INIT_FLAGS,
+                init_flags: INIT_FLAGS
+                    | if autoexposure { XESS_INIT_FLAG_ENABLE_AUTOEXPOSURE } else { 0 },
                 creation_node_mask: 0,
                 visible_node_mask: 0,
                 temp_buffer_heap: std::ptr::null_mut(),

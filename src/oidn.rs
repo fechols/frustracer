@@ -39,7 +39,9 @@ const DEVICE_SYCL: i32 = 2;
 const DEVICE_CUDA: i32 = 3;
 const DEVICE_HIP: i32 = 4;
 const FORMAT_FLOAT3: i32 = 3;
-const QUALITY_BALANCED: i32 = 5;
+pub const QUALITY_FAST: i32 = 4;
+pub const QUALITY_BALANCED: i32 = 5;
+pub const QUALITY_HIGH: i32 = 6;
 
 /// The resolved OIDN C entry points (all cdecl, undecorated x64 exports).
 struct Api {
@@ -141,7 +143,17 @@ impl OidnContext {
     /// the buffer/staging capacity; `set_res` can later rebind the filter at
     /// any resolution that fits (XeSS mode's dynamic render res). The filter
     /// commit loads the network weights — the expensive one-time step.
-    pub fn new(dll_dir: &str, w: usize, h: usize, device_type: i32) -> Result<Self, String> {
+    /// `quality` is one of the `QUALITY_*` consts; `clean_aux` declares the
+    /// albedo/normal guides noise-free (true here by construction — they are
+    /// deterministic primary-hit values, not Monte Carlo estimates).
+    pub fn new(
+        dll_dir: &str,
+        w: usize,
+        h: usize,
+        device_type: i32,
+        quality: i32,
+        clean_aux: bool,
+    ) -> Result<Self, String> {
         // LOAD_WITH_ALTERED_SEARCH_PATH only alters the search for absolute
         // paths — make a relative --oidn-path absolute (best-effort: a
         // missing directory keeps the original string so the load error
@@ -234,7 +246,8 @@ impl OidnContext {
         }
         unsafe {
             (api.set_filter_bool)(filter, c"hdr".as_ptr(), true);
-            (api.set_filter_int)(filter, c"quality".as_ptr(), QUALITY_BALANCED);
+            (api.set_filter_bool)(filter, c"cleanAux".as_ptr(), clean_aux);
+            (api.set_filter_int)(filter, c"quality".as_ptr(), quality);
             (api.commit_filter)(filter);
         }
         if let Err(e) = device_error(&api, dev, "filter commit") {
@@ -356,14 +369,14 @@ impl OidnContext {
         let n = self.w * self.h * 3;
         let load = |a: &AtomicU32| f32::from_bits(a.load(Relaxed));
         // First-hit albedo per the OIDN guidance: diffuse color plus the
-        // (achromatic) specular reflectivity, clamped to [0,1]. Sky pixels
+        // (RGB F0) specular reflectivity, clamped to [0,1]. Sky pixels
         // already carry diff_alb = 1.
         self.staging_albedo[..n].par_chunks_mut(w * 3).enumerate().for_each(|(y, row)| {
             for (x, px) in row.chunks_exact_mut(3).enumerate() {
                 let i = y * w + x;
-                let spec = load(&g.spec_alb[i]);
                 for k in 0..3 {
-                    px[k] = (load(&g.diff_alb[i * 3 + k]) + spec).clamp(0.0, 1.0);
+                    px[k] = (load(&g.diff_alb[i * 3 + k]) + load(&g.spec_alb[i * 3 + k]))
+                        .clamp(0.0, 1.0);
                 }
             }
         });

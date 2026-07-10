@@ -35,6 +35,9 @@ pub struct GpuOptions {
     pub xess: bool,
     /// Directory holding libxess.dll.
     pub xess_dir: String,
+    /// OR XESS_INIT_FLAG_ENABLE_AUTOEXPOSURE into the XeSS init flags
+    /// (--xess-autoexposure; A/B lever, default off).
+    pub xess_autoexposure: bool,
     /// D3D12 debug layer + DXGI debug factory + verbose SL logging.
     pub debug: bool,
 }
@@ -240,7 +243,12 @@ impl GpuContext {
         // allocated once at the range MAX; every frame uploads and names its
         // own sub-rect (dynamic resolution).
         let xess_state = if opts.xess && sl.is_none() {
-            match crate::xess::Xess::new(&opts.xess_dir, d3d.device.as_raw(), (w, h)) {
+            match crate::xess::Xess::new(
+                &opts.xess_dir,
+                d3d.device.as_raw(),
+                (w, h),
+                opts.xess_autoexposure,
+            ) {
                 Ok((ctx, opt, min, max)) => {
                     eprintln!(
                         "xess: {}x{} -> optimal {}x{} (range {}x{}..{}x{})",
@@ -381,6 +389,8 @@ impl GpuContext {
             output_texture: x.res.output.as_raw(),
             jitter_offset_x: crate::xess::JITTER_SIGN * jitter.0,
             jitter_offset_y: crate::xess::JITTER_SIGN * jitter.1,
+            // With ENABLE_AUTOEXPOSURE the SDK computes exposure internally
+            // and ignores both the scalar and the (null) texture.
             exposure_scale: 1.0,
             reset_history: reset as u32,
             input_width: rw as u32,

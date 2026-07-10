@@ -206,8 +206,8 @@ impl XessResources {
                 }
             });
 
-        // Linear view-Z -> [0,1] LH clip depth (xess::view_z_to_clip_depth is
-        // the single source; sky's view_z = far lands exactly on 1).
+        // Linear view-Z -> [0,1] reversed-Z clip depth (xess::view_z_to_clip_depth
+        // is the single source; sky's view_z = far lands exactly on 0).
         plane_mem(&self.planes[P_DEPTH])
             .par_chunks_mut(aligned_pitch(w * 4))
             .take(rh)

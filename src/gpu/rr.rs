@@ -193,7 +193,7 @@ impl RrResources {
                 }
             });
 
-        // Diffuse albedo (linear RGBA8) and specular albedo (achromatic).
+        // Diffuse albedo (linear RGBA8) and specular albedo (RGB F0).
         plane_mem(&self.planes[P_ALBEDO])
             .par_chunks_mut(aligned_pitch(w * 4))
             .take(h)
@@ -213,10 +213,10 @@ impl RrResources {
             .enumerate()
             .for_each(|(y, row)| {
                 for x in 0..w {
-                    let s = to_unorm8(load(&g.spec_alb, y * w + x));
-                    row[x * 4] = s;
-                    row[x * 4 + 1] = s;
-                    row[x * 4 + 2] = s;
+                    let i = (y * w + x) * 3;
+                    row[x * 4] = to_unorm8(load(&g.spec_alb, i));
+                    row[x * 4 + 1] = to_unorm8(load(&g.spec_alb, i + 1));
+                    row[x * 4 + 2] = to_unorm8(load(&g.spec_alb, i + 2));
                     row[x * 4 + 3] = 255;
                 }
             });

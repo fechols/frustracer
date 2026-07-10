@@ -67,6 +67,13 @@ pub struct Opts {
     pub oidn_path: String,
     /// OIDN device type (oidn.h OIDNDeviceType; 0 = auto-pick fastest).
     pub oidn_device: i32,
+    /// OIDN RT-filter quality (`oidn::QUALITY_*`; default balanced — HIGH is
+    /// documented for final frames, the flag lets stills opt in).
+    pub oidn_quality: i32,
+    /// Declare the OIDN albedo/normal guides noise-free (default on — they
+    /// are deterministic primary-hit values; --oidn-no-clean-aux is the
+    /// empirical escape hatch, same policy as the sign/flag constants).
+    pub oidn_clean_aux: bool,
     /// OIDN temporal reprojection history (M toggles at runtime; default on —
     /// off means the plain accumulation-average mode that shimmers while
     /// moving).
@@ -79,6 +86,9 @@ pub struct Opts {
     /// Start XeSS mode with the OIDN denoise placed AFTER the upscale
     /// (requires --xess; N cycles placement at runtime).
     pub oidn_post: bool,
+    /// XeSS internal autoexposure (XESS_INIT_FLAG_ENABLE_AUTOEXPOSURE;
+    /// default off — A/B lever, init-time only).
+    pub xess_autoexposure: bool,
     /// Adaptive shading rate on XeSS frames (default on; --no-adaptive forces
     /// uniform per-pixel shading — visibility is per-pixel either way, only
     /// the 2×2-cell shadow/AO sharing and HOT top-ups are disabled).
@@ -128,12 +138,15 @@ fn main() {
             concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\oidn.x64.windows\bin").to_string()
         }),
         oidn_device: 0,
+        oidn_quality: oidn::QUALITY_BALANCED,
+        oidn_clean_aux: true,
         oidn_temporal: true,
         xess: false,
         xess_path: std::env::var("FRUSTRACER_XESS_PATH").unwrap_or_else(|_| {
             concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\XeSS-SDK\bin").to_string()
         }),
         oidn_post: false,
+        xess_autoexposure: false,
         adaptive: true,
     };
     let mut check_dlss = false;
@@ -170,6 +183,7 @@ fn main() {
             "--xess" => opts.xess = true,
             "--no-xess" => opts.xess = false,
             "--oidn-post" => opts.oidn_post = true,
+            "--xess-autoexposure" => opts.xess_autoexposure = true,
             "--no-adaptive" => opts.adaptive = false,
             "--xess-path" => {
                 opts.xess_path = args.next().unwrap_or_else(|| {
@@ -197,6 +211,18 @@ fn main() {
                     }
                 }
             }
+            "--oidn-quality" => {
+                opts.oidn_quality = match args.next().as_deref() {
+                    Some("fast") => oidn::QUALITY_FAST,
+                    Some("balanced") => oidn::QUALITY_BALANCED,
+                    Some("high") => oidn::QUALITY_HIGH,
+                    _ => {
+                        eprintln!("--oidn-quality needs one of: fast balanced high");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "--oidn-no-clean-aux" => opts.oidn_clean_aux = false,
             "--gpu-debug" => opts.gpu_debug = true,
             "--sl-path" => {
                 opts.sl_path = args.next().unwrap_or_else(|| {
@@ -220,7 +246,7 @@ fn main() {
                 eprintln!("  --stress <n>  procedural stress field of n objects (perf test; composes with --check)");
                 eprintln!("  --check       headless: verify hybrid vs reference, benchmark, write check.png");
                 eprintln!("  --check-dlss  headless: G-buffer MV/depth/matrix self-test (no GPU needed)");
-                eprintln!("  --dlss-dump   --check-dlss plus G-buffer PNG dumps (albedo/normal/misc/mv)");
+                eprintln!("  --dlss-dump   --check-dlss plus G-buffer PNG dumps (albedo/spec_albedo/normal/misc/mv)");
                 eprintln!("  --no-dlss     skip Streamline/DLSS; plain D3D12 presentation");
                 eprintln!("  --check-oidn  headless: OIDN denoise self-test (needs the OIDN DLLs)");
                 eprintln!("  --oidn-dump   --check-oidn plus before/after/G-buffer PNG dumps");
@@ -228,11 +254,14 @@ fn main() {
                 eprintln!("  --oidn-no-temporal  start OIDN without the temporal reprojection history (M toggles)");
                 eprintln!("  --oidn-path   OIDN DLL directory (default: SDKs\\oidn.x64.windows\\bin)");
                 eprintln!("  --oidn-device OIDN device: default|cpu|sycl|cuda|hip");
+                eprintln!("  --oidn-quality OIDN RT-filter quality: fast|balanced|high (default balanced)");
+                eprintln!("  --oidn-no-clean-aux  don't declare the albedo/normal guides noise-free (A/B lever)");
                 eprintln!("  --check-xess  headless: XeSS dynamic-res contract self-test (no GPU or DLL needed)");
                 eprintln!("  --xess-dump   --check-xess plus G-buffer PNG dumps");
                 eprintln!("  --xess        start with XeSS-SR dynamic-res upscaling (X toggles; implies DLSS off;");
                 eprintln!("                N cycles the OIDN denoise: off -> pre-upscale -> post-upscale)");
                 eprintln!("  --oidn-post   start XeSS mode with OIDN placed AFTER the upscale (requires --xess)");
+                eprintln!("  --xess-autoexposure  let XeSS compute exposure internally (A/B lever)");
                 eprintln!("  --no-adaptive disable the adaptive shading rate in XeSS mode (uniform per-pixel shading;");
                 eprintln!("                visibility is per-pixel either way)");
                 eprintln!("  --xess-path   XeSS DLL directory (default: SDKs\\XeSS-SDK\\bin)");
@@ -453,16 +482,17 @@ fn run_check_xess(
     let (near, far) = dlss::near_far(scene.diag);
     let mut all_ok = true;
 
-    // 1. Depth encoding: monotone, roundtrips, exact endpoints.
+    // 1. Depth encoding (reversed-Z): monotone decreasing, roundtrips,
+    // exact endpoints.
     {
         let mut pass = true;
-        let mut prev_d = -1.0f32;
+        let mut prev_d = 2.0f32;
         for i in 0..=256 {
             let z = near + (far - near) * (i as f32 / 256.0);
             let d = xess::view_z_to_clip_depth(z, near, far);
             let z2 = xess::clip_depth_to_view_z(d, near, far);
-            if d < prev_d {
-                eprintln!("depth encoding not monotone at z={z}");
+            if d > prev_d {
+                eprintln!("depth encoding not monotone decreasing at z={z}");
                 pass = false;
             }
             if (z2 - z).abs() > 1e-3 * z {
@@ -471,12 +501,12 @@ fn run_check_xess(
             }
             prev_d = d;
         }
-        if xess::view_z_to_clip_depth(near, near, far) != 0.0 {
-            eprintln!("depth(near) != 0");
+        if xess::view_z_to_clip_depth(near, near, far) != 1.0 {
+            eprintln!("depth(near) != 1");
             pass = false;
         }
-        if (xess::view_z_to_clip_depth(far, near, far) - 1.0).abs() > 1e-6 {
-            eprintln!("depth(far) != 1 (sky sentinel would drift)");
+        if xess::view_z_to_clip_depth(far, near, far) != 0.0 {
+            eprintln!("depth(far) != 0 (sky sentinel would drift)");
             pass = false;
         }
         eprintln!("depth encoding: {}", if pass { "OK" } else { "FAIL" });
@@ -596,7 +626,9 @@ fn run_check_xess(
             for k in 0..3 {
                 src.diff_alb[i * 3 + k].store((i * 3 + k) as u32, Relaxed);
             }
-            src.spec_alb[i].store(0x5000_0000 + i as u32, Relaxed);
+            for k in 0..3 {
+                src.spec_alb[i * 3 + k].store(0x5000_0000 + (i * 3 + k) as u32, Relaxed);
+            }
             for k in 0..4 {
                 src.normal_rough[i * 4 + k].store(0x6000_0000 + (i * 4 + k) as u32, Relaxed);
             }
@@ -615,8 +647,12 @@ fn run_check_xess(
                             return false;
                         }
                     }
-                    if dst.spec_alb[di].load(Relaxed) != src.spec_alb[si].load(Relaxed) {
-                        return false;
+                    for k in 0..3 {
+                        if dst.spec_alb[di * 3 + k].load(Relaxed)
+                            != src.spec_alb[si * 3 + k].load(Relaxed)
+                        {
+                            return false;
+                        }
                     }
                     for k in 0..4 {
                         if dst.normal_rough[di * 4 + k].load(Relaxed)
@@ -835,7 +871,14 @@ fn run_check_oidn(
     structural: bool,
 ) -> i32 {
     let (rw, rh) = (800usize, 600usize);
-    let mut octx = match oidn::OidnContext::new(&opts.oidn_path, rw, rh, opts.oidn_device) {
+    let mut octx = match oidn::OidnContext::new(
+        &opts.oidn_path,
+        rw,
+        rh,
+        opts.oidn_device,
+        opts.oidn_quality,
+        opts.oidn_clean_aux,
+    ) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("{e}");
@@ -2045,6 +2088,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
             sl_dir: opts.sl_path.clone(),
             xess: opts.xess,
             xess_dir: opts.xess_path.clone(),
+            xess_autoexposure: opts.xess_autoexposure,
             debug: opts.gpu_debug,
         },
     )
@@ -2180,7 +2224,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     // (default) renders fresh 1-spp frames and folds them into a reprojected
     // EMA history (reproject.rs) that is the sole accumulator and denoiser
     // input; plain denoises the accumulation average and shimmers while
-    // moving. Context, W×H G-buffers (~100 MB) and history (~77 MB) are
+    // moving. Context, W×H G-buffers (~116 MB) and history (~77 MB) are
     // lazily created on first enable; a failed init is remembered and not
     // retried per keypress.
     let mut oidn_on = false;
@@ -2216,7 +2260,14 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 &[opts.oidn_device]
             };
             for &d in devices {
-                match oidn::OidnContext::new(&opts.oidn_path, W, H, d) {
+                match oidn::OidnContext::new(
+                    &opts.oidn_path,
+                    W,
+                    H,
+                    d,
+                    opts.oidn_quality,
+                    opts.oidn_clean_aux,
+                ) {
                     Ok(c) => {
                         eprintln!("oidn: ready on {} device", c.device_desc);
                         *oidn_ctx = Some(c);

@@ -481,10 +481,7 @@ fn write_gbuf_hit(
             normal: prim.n,
             rough: prim.roughness,
             diff_alb: prim.albedo * (1.0 - prim.metallic),
-            spec_alb: {
-                let f0 = Vec3A::splat(0.04).lerp(prim.albedo, prim.metallic);
-                (f0.x + f0.y + f0.z) / 3.0
-            },
+            spec_alb: Vec3A::splat(0.04).lerp(prim.albedo, prim.metallic),
             view_z: t * dir.dot(ctx.cam.forward()),
             mv,
             spec_hit_t: if prim.spec_t.is_infinite() { far } else { prim.spec_t },
@@ -512,7 +509,7 @@ fn write_gbuf_sky(ctx: &FrameCtx, x: usize, y: usize, fx: f32, fy: f32, dir: Vec
             normal: -dir,
             rough: 1.0,
             diff_alb: Vec3A::ONE,
-            spec_alb: 0.0,
+            spec_alb: Vec3A::ZERO,
             view_z: far,
             mv,
             spec_hit_t: 0.0,

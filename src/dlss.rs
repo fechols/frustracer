@@ -18,8 +18,8 @@ pub struct GPixel {
     pub rough: f32,
     /// Diffuse albedo = mat.albedo * (1 - metallic), linear.
     pub diff_alb: Vec3A,
-    /// Specular albedo (achromatic: mean of F0 = lerp(0.04, albedo, metallic)).
-    pub spec_alb: f32,
+    /// Specular albedo: full RGB F0 = lerp(0.04, albedo, metallic), linear.
+    pub spec_alb: Vec3A,
     /// Linear view-space Z (t * dot(dir, forward)), NOT Euclidean t.
     /// Sky pixels store `far` (finite — survives f16 textures).
     pub view_z: f32,
@@ -41,7 +41,7 @@ pub struct GBufs {
     pub normal_rough: Vec<AtomicU32>,
     /// 3/px linear diffuse albedo.
     pub diff_alb: Vec<AtomicU32>,
-    /// 1/px achromatic specular albedo.
+    /// 3/px RGB specular albedo (F0).
     pub spec_alb: Vec<AtomicU32>,
     /// 1/px linear view-space Z.
     pub depth: Vec<AtomicU32>,
@@ -59,7 +59,7 @@ impl GBufs {
             rh,
             normal_rough: alloc(rw * rh * 4),
             diff_alb: alloc(rw * rh * 3),
-            spec_alb: alloc(rw * rh),
+            spec_alb: alloc(rw * rh * 3),
             depth: alloc(rw * rh),
             mvec: alloc(rw * rh * 2),
             spec_hit_t: alloc(rw * rh),
@@ -86,7 +86,10 @@ impl GBufs {
                     self.diff_alb[di * 3 + k]
                         .store(src.diff_alb[si * 3 + k].load(Relaxed), Relaxed);
                 }
-                self.spec_alb[di].store(src.spec_alb[si].load(Relaxed), Relaxed);
+                for k in 0..3 {
+                    self.spec_alb[di * 3 + k]
+                        .store(src.spec_alb[si * 3 + k].load(Relaxed), Relaxed);
+                }
                 for k in 0..4 {
                     self.normal_rough[di * 4 + k]
                         .store(src.normal_rough[si * 4 + k].load(Relaxed), Relaxed);
@@ -116,7 +119,9 @@ impl GBufs {
         s(&self.diff_alb[i * 3], p.diff_alb.x);
         s(&self.diff_alb[i * 3 + 1], p.diff_alb.y);
         s(&self.diff_alb[i * 3 + 2], p.diff_alb.z);
-        s(&self.spec_alb[i], p.spec_alb);
+        s(&self.spec_alb[i * 3], p.spec_alb.x);
+        s(&self.spec_alb[i * 3 + 1], p.spec_alb.y);
+        s(&self.spec_alb[i * 3 + 2], p.spec_alb.z);
         s(&self.depth[i], p.view_z);
         s(&self.mvec[i * 2], p.mv.0);
         s(&self.mvec[i * 2 + 1], p.mv.1);
@@ -286,14 +291,16 @@ pub fn frame_constants(
     }
 }
 
-/// Debug: dump the G-buffers as PNGs (albedo/normal/roughness/depth/MV/spec)
-/// so the capture can be eyeballed before the GPU side even runs.
+/// Debug: dump the G-buffers as PNGs (albedo/spec-albedo/normal/roughness/
+/// depth/MV/spec-hit) so the capture can be eyeballed before the GPU side
+/// even runs.
 pub fn dump_gbufs(g: &GBufs, prefix: &str, far: f32) {
     let (rw, rh) = (g.rw, g.rh);
     let load = |a: &AtomicU32| f32::from_bits(a.load(Relaxed));
     let to8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
 
     let mut alb = Vec::with_capacity(rw * rh * 3);
+    let mut spec = Vec::with_capacity(rw * rh * 3);
     let mut nrm = Vec::with_capacity(rw * rh * 3);
     let mut misc = Vec::with_capacity(rw * rh * 3); // r=rough, g=depth/far, b=spec_hit/far
     let mut mv = Vec::with_capacity(rw * rh * 3);
@@ -301,6 +308,7 @@ pub fn dump_gbufs(g: &GBufs, prefix: &str, far: f32) {
         for k in 0..3 {
             // linear -> rough sRGB for visibility
             alb.push(to8(load(&g.diff_alb[i * 3 + k]).powf(1.0 / 2.2)));
+            spec.push(to8(load(&g.spec_alb[i * 3 + k]).powf(1.0 / 2.2)));
             nrm.push(to8(load(&g.normal_rough[i * 4 + k]) * 0.5 + 0.5));
         }
         misc.push(to8(load(&g.normal_rough[i * 4 + 3])));
@@ -310,7 +318,9 @@ pub fn dump_gbufs(g: &GBufs, prefix: &str, far: f32) {
         mv.push(to8(load(&g.mvec[i * 2 + 1]) / 32.0 + 0.5));
         mv.push(128);
     }
-    for (name, data) in [("albedo", &alb), ("normal", &nrm), ("misc", &misc), ("mv", &mv)] {
+    for (name, data) in
+        [("albedo", &alb), ("spec_albedo", &spec), ("normal", &nrm), ("misc", &misc), ("mv", &mv)]
+    {
         let path = format!("{prefix}_{name}.png");
         if let Err(e) =
             image::save_buffer(&path, data, rw as u32, rh as u32, image::ColorType::Rgb8)
