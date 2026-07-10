@@ -98,6 +98,12 @@ pub struct Opts {
     /// the step-wise dynamic-resolution controller). CLI-only, no runtime
     /// toggle — T prints the locked note.
     pub lock_scale: Option<f32>,
+    /// GPU-resident tracing (--gpu): the whole quadtree + shading runs in
+    /// D3D12 compute with DXR RayQuery rays. Requires the DXC DLL drop and
+    /// RT tier 1.1; falls back to the CPU path with a loud line otherwise.
+    pub gpu: bool,
+    /// Directory holding dxcompiler.dll + dxil.dll.
+    pub dxc_path: String,
 }
 
 /// OIDN placement in XeSS mode (N cycles off → pre → post). Pre denoises the
@@ -154,6 +160,10 @@ fn main() {
         xess_autoexposure: false,
         adaptive: true,
         lock_scale: xess::lock_scale("quality"),
+        gpu: false,
+        dxc_path: std::env::var("FRUSTRACER_DXC_PATH").unwrap_or_else(|_| {
+            concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\dxc\bin\x64").to_string()
+        }),
     };
     let mut check_dlss = false;
     let mut dlss_dump = false;
@@ -161,6 +171,7 @@ fn main() {
     let mut oidn_dump = false;
     let mut check_xess = false;
     let mut xess_dump = false;
+    let mut check_gpu = false;
     let mut stress: Option<usize> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -245,6 +256,14 @@ fn main() {
                 }
             }
             "--oidn-no-clean-aux" => opts.oidn_clean_aux = false,
+            "--gpu" => opts.gpu = true,
+            "--check-gpu" => check_gpu = true,
+            "--dxc-path" => {
+                opts.dxc_path = args.next().unwrap_or_else(|| {
+                    eprintln!("--dxc-path needs a directory argument");
+                    std::process::exit(2);
+                })
+            }
             "--gpu-debug" => opts.gpu_debug = true,
             "--sl-path" => {
                 opts.sl_path = args.next().unwrap_or_else(|| {
@@ -280,6 +299,10 @@ fn main() {
                 eprintln!("  --oidn-no-clean-aux  don't declare the albedo/normal guides noise-free (A/B lever)");
                 eprintln!("  --check-xess  headless: XeSS dynamic-res contract self-test (no GPU or DLL needed)");
                 eprintln!("  --xess-dump   --check-xess plus G-buffer PNG dumps");
+                eprintln!("  --gpu         GPU-resident tracing: quadtree + shading in D3D12 compute with DXR");
+                eprintln!("                RayQuery rays (needs the DXC DLLs and RT tier 1.1; falls back to CPU)");
+                eprintln!("  --check-gpu   headless: GPU tracer gate suite (needs a D3D12 GPU + the DXC DLLs)");
+                eprintln!("  --dxc-path    DXC DLL directory (default: SDKs\\dxc\\bin\\x64)");
                 eprintln!("  --xess        start with XeSS-SR dynamic-res upscaling (X toggles; implies DLSS off;");
                 eprintln!("                N cycles the OIDN denoise: off -> pre-upscale -> post-upscale)");
                 eprintln!("  --oidn-post   start XeSS mode with OIDN placed AFTER the upscale (requires --xess)");
@@ -306,6 +329,18 @@ fn main() {
         // Streamline's manual-hooking proxies never coexist with it.
         opts.dlss = false;
         eprintln!("xess: --xess implies --no-dlss (native D3D12 pipeline)");
+    }
+    if opts.gpu {
+        // v1 GPU-resident tracing presents plain (GPU-born G-buffers +
+        // DLSS/XeSS composition are a later milestone) and wants the native,
+        // non-proxied device.
+        if opts.dlss || opts.xess || opts.oidn || opts.oidn_post {
+            eprintln!("gpu: --gpu presents plain in v1 — DLSS/XeSS/OIDN off for this session");
+        }
+        opts.dlss = false;
+        opts.xess = false;
+        opts.oidn = false;
+        opts.oidn_post = false;
     }
 
     eprintln!("frustracer — loading scene...");
@@ -344,6 +379,18 @@ fn main() {
         let code = run_check_xess(&scene, &bvh, cam0, xess_dump, stress.is_none());
         std::process::exit(code);
     }
+    if check_gpu {
+        #[cfg(windows)]
+        {
+            let code = run_check_gpu(&scene, &bvh, cam0, &opts, stress.is_none());
+            std::process::exit(code);
+        }
+        #[cfg(not(windows))]
+        {
+            eprintln!("--check-gpu requires Windows (D3D12)");
+            std::process::exit(2);
+        }
+    }
     if check_oidn {
         #[cfg(windows)]
         {
@@ -367,6 +414,829 @@ fn main() {
         eprintln!("the interactive window requires Windows (D3D12 + DLSS); use --check / --check-dlss");
         std::process::exit(2);
     }
+}
+
+/// Headless GPU-tracer gate suite (M1: toolchain + dispatch plumbing).
+/// Unlike --check/--check-dlss/--check-xess this needs real hardware: a
+/// D3D12 device with RT tier 1.1 and the DXC DLL drop. Exit codes: 0 = all
+/// gates pass, 1 = a gate failed, 2 = environment (no DLLs / no support).
+#[cfg(windows)]
+fn run_check_gpu(
+    scene: &scene::Scene,
+    bvh: &bvh::Bvh,
+    cam0: Camera,
+    opts: &Opts,
+    must_fire: bool,
+) -> i32 {
+    let dxc = match gpu::dxc::Dxc::load(&opts.dxc_path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("check-gpu: {e}");
+            return 2;
+        }
+    };
+    let mut hg = match gpu::trace::HeadlessGpu::new(opts.gpu_debug) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("check-gpu: device creation failed: {e}");
+            return 2;
+        }
+    };
+    eprintln!("check-gpu: adapter \"{}\"", hg.adapter_name);
+    let caps = match gpu::trace::require_caps(&hg.device) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("check-gpu: {e}");
+            return 2;
+        }
+    };
+    eprintln!(
+        "check-gpu: RT tier {}.{}, shader model {}.{}",
+        caps.rt_tier / 10,
+        caps.rt_tier % 10,
+        caps.shader_model >> 4,
+        caps.shader_model & 0xf
+    );
+    if let Err(e) = gpu::trace::smoke_test(&mut hg, &dxc, opts.gpu_debug) {
+        eprintln!("check-gpu: FAIL {e}");
+        return 1;
+    }
+    println!("check-gpu: dispatch plumbing OK (seed -> prep-args -> ExecuteIndirect -> readback)");
+
+    // --- M2: the vanilla GPU reference tracer vs the CPU plain reference ---
+    // Exact-zero gates are GPU-vs-GPU only (M3+); CPU-vs-GPU is statistical —
+    // hardware watertight triangle intersection differs from moller_trumbore
+    // at edges/grazing, and the RNG streams differ by design.
+    let (gw, gh) = (800usize, 600usize);
+    let mut tg = match gpu::trace::TraceGpu::new(
+        &hg.device,
+        &dxc,
+        scene,
+        bvh,
+        gw as u32,
+        gh as u32,
+        opts.gpu_debug,
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("check-gpu: FAIL TraceGpu init: {e}");
+            return 1;
+        }
+    };
+    {
+        let mut rec = Ok(());
+        if let Err(e) = hg.run(|l| rec = tg.scene.record_upload(l)) {
+            eprintln!("check-gpu: FAIL scene upload submit: {e}");
+            return 1;
+        }
+        if let Err(e) = rec {
+            eprintln!("check-gpu: FAIL scene upload: {e}");
+            return 1;
+        }
+        tg.scene.free_staging();
+    }
+    eprintln!("check-gpu: scene uploaded, BLAS/TLAS built ({} tris)", scene.tri_count());
+
+    let q = Quality::preset(2);
+    let basis = cam0.basis(gw, gh);
+    let ua = windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    let read_f32 = |hg: &mut gpu::trace::HeadlessGpu, res, n: usize| -> Result<Vec<f32>, String> {
+        let b = hg.read_buffer(res, ua, n * 4)?;
+        Ok(b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
+    };
+
+    // CPU counterpart: the plain per-pixel reference (hybrid = false).
+    let stats = Stats::default();
+    let accum: Vec<AtomicU32> = (0..gw * gh * 3).map(|_| AtomicU32::new(0)).collect();
+    let info: Vec<AtomicU32> = (0..gw * gh).map(|_| AtomicU32::new(0)).collect();
+    let tbuf: Vec<AtomicU32> = (0..gw * gh).map(|_| AtomicU32::new(0)).collect();
+    let cpu_frame = |frame: u32| {
+        let ctx = FrameCtx {
+            scene,
+            bvh,
+            cam: basis,
+            q,
+            frame,
+            jitter: frame > 0,
+            rw: gw,
+            rh: gh,
+            accum: &accum,
+            info: &info,
+            tbuf: &tbuf,
+            stats: &stats,
+            sun: render::sun_dir(scene),
+            tcache_cur: None,
+            tcache_prev: None,
+            accumulate: true,
+            gbuf: None,
+            prev_cam: None,
+            frame_jitter: None,
+            adaptive: false,
+        };
+        render::render_frame(&ctx, false);
+    };
+    let gpu_frame = |hg: &mut gpu::trace::HeadlessGpu,
+                     tg: &gpu::trace::TraceGpu,
+                     frame: u32|
+     -> Result<(), String> {
+        tg.write_cb(0, &gpu::trace::FrameParams {
+            cam: basis,
+            frame,
+            accumulate: true,
+            jitter: frame > 0,
+            frame_jitter: None,
+            q,
+            verify: false,
+        });
+        hg.run(|l| tg.record_reference(l, 0))
+    };
+
+    // T1: one unjittered frame each — primary-visibility compare (t + kind).
+    if let Err(e) = gpu_frame(&mut hg, &tg, 0) {
+        eprintln!("check-gpu: FAIL reference dispatch: {e}");
+        return 1;
+    }
+    let gpu_t = match read_f32(&mut hg, &tg.tbuf, gw * gh) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("check-gpu: FAIL tbuf readback: {e}");
+            return 1;
+        }
+    };
+    cpu_frame(0);
+    let px = gw * gh;
+    let mut class_mismatch = 0usize;
+    let mut t_viol = 0usize;
+    let mut max_rel = 0.0f32;
+    for i in 0..px {
+        let ct = f32::from_bits(tbuf[i].load(Relaxed));
+        let gt = gpu_t[i];
+        match (ct.is_finite(), gt.is_finite()) {
+            (true, true) => {
+                let rel = (ct - gt).abs() / ct.max(1e-6);
+                max_rel = max_rel.max(rel);
+                if rel > 1e-3 {
+                    t_viol += 1;
+                }
+            }
+            (false, false) => {}
+            _ => class_mismatch += 1,
+        }
+    }
+    let mut ok = true;
+    eprintln!(
+        "check-gpu: reference visibility ({px} px): class-mismatch {class_mismatch} | rel-t > 1e-3: {t_viol} | max rel t err {max_rel:.2e}"
+    );
+    if class_mismatch as f64 > px as f64 * 5e-4 {
+        eprintln!("check-gpu: FAIL hit/sky classification mismatch above 0.05% (two-intersector edge disagreement should be far rarer)");
+        ok = false;
+    }
+    if t_viol as f64 > px as f64 * 1e-4 {
+        eprintln!("check-gpu: FAIL primary-t disagreement above 0.01% of pixels");
+        ok = false;
+    }
+
+    // T2: 64-frame jittered accumulation both sides — radiance A/B.
+    // Different RNG streams; only the converged means are comparable.
+    const AB_FRAMES: u32 = 64;
+    for f in 0..AB_FRAMES {
+        if let Err(e) = gpu_frame(&mut hg, &tg, f) {
+            eprintln!("check-gpu: FAIL accumulation frame {f}: {e}");
+            return 1;
+        }
+    }
+    for f in 0..AB_FRAMES {
+        cpu_frame(f);
+    }
+    let gpu_acc = match read_f32(&mut hg, &tg.accum, px * 3) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("check-gpu: FAIL accum readback: {e}");
+            return 1;
+        }
+    };
+    let inv = 1.0 / AB_FRAMES as f32;
+    let mut sum_c = [0.0f64; 3];
+    let mut sum_g = [0.0f64; 3];
+    let mut sum_abs = 0.0f64;
+    for i in 0..px * 3 {
+        let c = f32::from_bits(accum[i].load(Relaxed)) * inv;
+        let g = gpu_acc[i] * inv;
+        sum_c[i % 3] += c as f64;
+        sum_g[i % 3] += g as f64;
+        sum_abs += (c - g).abs() as f64;
+    }
+    let mut mean_rel = 0.0f64;
+    for ch in 0..3 {
+        let rel = (sum_c[ch] - sum_g[ch]).abs() / sum_c[ch].max(1e-9);
+        mean_rel = mean_rel.max(rel);
+    }
+    eprintln!(
+        "check-gpu: radiance A/B over {AB_FRAMES} frames: per-channel mean rel diff {:.3}% | mean abs px diff {:.4}",
+        mean_rel * 100.0,
+        sum_abs / (px * 3) as f64
+    );
+    if mean_rel > 0.02 {
+        eprintln!("check-gpu: FAIL converged radiance means differ by more than 2%");
+        ok = false;
+    }
+
+    // T3: the resolve pass (accum -> RGBA16F, the tonemap PS's input) —
+    // texel == accum/samples within f16 precision. This is the present
+    // chain's only compute link, verified headlessly.
+    {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        };
+        if let Err(e) = hg.run(|l| tg.record_resolve(l, 0, AB_FRAMES)) {
+            eprintln!("check-gpu: FAIL resolve dispatch: {e}");
+            return 1;
+        }
+        let pitch = gpu::d3d12::aligned_pitch(gw * 8);
+        let rb = match gpu::d3d12::ReadbackBuffer::new(&hg.device, pitch * gh) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("check-gpu: FAIL readback alloc: {e}");
+                return 1;
+            }
+        };
+        let fp = gpu::d3d12::footprint(
+            windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+            gw as u32,
+            gh as u32,
+            8,
+            0,
+        );
+        let hdr = tg.hdr.clone();
+        if let Err(e) = hg.run(|l| unsafe {
+            l.ResourceBarrier(&[gpu::d3d12::transition(
+                &hdr,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            l.CopyTextureRegion(
+                &gpu::d3d12::loc_footprint(&rb.resource, fp),
+                0,
+                0,
+                0,
+                &gpu::d3d12::loc_subresource(&hdr),
+                None,
+            );
+            l.ResourceBarrier(&[gpu::d3d12::transition(
+                &hdr,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            )]);
+        }) {
+            eprintln!("check-gpu: FAIL hdr readback: {e}");
+            return 1;
+        }
+        let mut ptr = std::ptr::null_mut();
+        if let Err(e) = unsafe { rb.resource.Map(0, None, Some(&mut ptr)) } {
+            eprintln!("check-gpu: FAIL hdr Map: {e}");
+            return 1;
+        }
+        let mut resolve_viol = 0usize;
+        for y in 0..gh {
+            let row: &[[half::f16; 4]] = unsafe {
+                std::slice::from_raw_parts((ptr as *const u8).add(y * pitch) as *const _, gw)
+            };
+            for (x, px_v) in row.iter().enumerate() {
+                let i3 = (y * gw + x) * 3;
+                for ch in 0..3 {
+                    let want = gpu_acc[i3 + ch] * inv;
+                    let got = f32::from(px_v[ch]);
+                    // f16 has ~3 decimal digits; the divide adds one ulp.
+                    if (want - got).abs() > want.abs().max(1.0) * 2e-3 {
+                        resolve_viol += 1;
+                    }
+                }
+            }
+        }
+        unsafe { rb.resource.Unmap(0, None) };
+        eprintln!("check-gpu: resolve pass: {resolve_viol} texels off accum/samples (f16 tolerance)");
+        if resolve_viol > 0 {
+            eprintln!("check-gpu: FAIL resolve output disagrees with the accumulation");
+            ok = false;
+        }
+    }
+
+    // --- M3/M4: the wavefront quadtree vs the on-GPU reference -------------
+    // Same intersector on both sides, same seeds, same shading code — these
+    // are the transplanted exact-zero gates from the CPU --check.
+    let read_u32 = |hg: &mut gpu::trace::HeadlessGpu, res, n: usize| -> Result<Vec<u32>, String> {
+        let b = hg.read_buffer(res, ua, n * 4)?;
+        Ok(b.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect())
+    };
+
+    // One unjittered wavefront frame with the coverage sentinel flooded.
+    let wf_params = gpu::trace::FrameParams {
+        cam: basis,
+        frame: 0,
+        accumulate: true,
+        jitter: false,
+        frame_jitter: None,
+        q,
+        verify: false,
+    };
+    tg.write_cb(0, &wf_params);
+    if let Err(e) = hg.run(|l| tg.record_wavefront(l, 0, &wf_params, true)) {
+        eprintln!("check-gpu: FAIL wavefront dispatch: {e}");
+        return 1;
+    }
+    let (wave_t, wave_info, wave_acc, ctrs) = match (
+        read_f32(&mut hg, &tg.tbuf, px),
+        read_u32(&mut hg, &tg.info, px),
+        read_f32(&mut hg, &tg.accum, px * 3),
+        read_u32(&mut hg, &tg.counters, 16),
+    ) {
+        (Ok(a), Ok(b), Ok(c), Ok(d)) => (a, b, c, d),
+        _ => {
+            eprintln!("check-gpu: FAIL wavefront readback");
+            return 1;
+        }
+    };
+    let (n_leaf, n_sky) =
+        (ctrs[gpu::trace::CTR_LEAF as usize] as usize, ctrs[gpu::trace::CTR_SKY as usize] as usize);
+
+    // Queue accounting: leaf + sky rects partition the screen exactly, both
+    // tile queues drained, zero overflows.
+    let rect_px = |xy0: u32, xy1: u32| -> u64 {
+        let (x0, y0) = (xy0 & 0xffff, xy0 >> 16);
+        let (x1, y1) = (xy1 & 0xffff, xy1 >> 16);
+        (x1 - x0) as u64 * (y1 - y0) as u64
+    };
+    let leaf_recs = match read_u32(&mut hg, &tg.qleaf, n_leaf.min(tg.cap_leaf as usize) * 4) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("check-gpu: FAIL leaf queue readback: {e}");
+            return 1;
+        }
+    };
+    let sky_recs = match read_u32(&mut hg, &tg.qsky, n_sky.min(tg.cap_sky as usize) * 4) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("check-gpu: FAIL sky queue readback: {e}");
+            return 1;
+        }
+    };
+    // Clamped bounds: on overflow the counters keep incrementing past the
+    // record writes, and the point is to reach the CTR_OVERFLOW FAIL line
+    // below with a diagnostic, not to die on an out-of-bounds index here.
+    let mut covered: u64 = 0;
+    for r in 0..n_leaf.min(leaf_recs.len() / 4) {
+        covered += rect_px(leaf_recs[r * 4], leaf_recs[r * 4 + 1]);
+    }
+    for r in 0..n_sky.min(sky_recs.len() / 4) {
+        covered += rect_px(sky_recs[r * 4], sky_recs[r * 4 + 1]);
+    }
+    let sentinels = wave_info.iter().filter(|&&i| i == 0xffff_ffff).count();
+    let tiles_left = ctrs[gpu::trace::CTR_TILE_A as usize].max(ctrs[gpu::trace::CTR_TILE_B as usize]);
+    // The last level consumed one tile queue and must have appended nothing.
+    let dangling = if tg.depth_full % 2 == 0 {
+        ctrs[gpu::trace::CTR_TILE_A as usize]
+    } else {
+        ctrs[gpu::trace::CTR_TILE_B as usize]
+    };
+    let _ = tiles_left;
+    eprintln!(
+        "check-gpu: wavefront frame: leaves {n_leaf} | sky-tiles {n_sky} | splits {} | blocked {} | cuts {} (fallback {}) | overflow {}",
+        ctrs[gpu::trace::CTR_SPLIT as usize],
+        ctrs[gpu::trace::CTR_BLOCKED as usize],
+        ctrs[gpu::trace::CTR_CUT as usize],
+        ctrs[gpu::trace::CTR_CUT_FALLBACK as usize],
+        ctrs[gpu::trace::CTR_OVERFLOW as usize],
+    );
+    if ctrs[gpu::trace::CTR_OVERFLOW as usize] != 0 {
+        eprintln!("check-gpu: FAIL queue overflow (queues are sized to the structural worst case)");
+        ok = false;
+    }
+    if dangling != 0 {
+        eprintln!("check-gpu: FAIL {dangling} tile records left after the last level (depth accounting)");
+        ok = false;
+    }
+    if covered != px as u64 {
+        eprintln!("check-gpu: FAIL leaf+sky rects cover {covered} px, screen has {px}");
+        ok = false;
+    }
+    if sentinels != 0 {
+        eprintln!("check-gpu: FAIL {sentinels} px never written (exactly-once coverage)");
+        ok = false;
+    }
+
+    // Reference frame with identical constants -> exact-zero pixel gates.
+    if let Err(e) = gpu_frame(&mut hg, &tg, 0) {
+        eprintln!("check-gpu: FAIL reference re-run: {e}");
+        return 1;
+    }
+    let (ref_t, ref_acc) =
+        match (read_f32(&mut hg, &tg.tbuf, px), read_f32(&mut hg, &tg.accum, px * 3)) {
+            (Ok(a), Ok(b)) => (a, b),
+            _ => {
+                eprintln!("check-gpu: FAIL reference readback");
+                return 1;
+            }
+        };
+    let mut false_sky = 0usize;
+    let mut overshoot = 0usize;
+    let mut hybrid_extra = 0usize;
+    let mut max_rel_t = 0.0f32;
+    for i in 0..px {
+        let (rt, wt) = (ref_t[i], wave_t[i]);
+        match (rt.is_finite(), wt.is_finite()) {
+            (true, true) => {
+                let rel = (wt - rt) / rt.max(1e-6);
+                max_rel_t = max_rel_t.max(rel.abs());
+                if rel > 1e-4 {
+                    overshoot += 1; // wavefront started past real geometry
+                }
+            }
+            (true, false) => false_sky += 1,
+            (false, true) => hybrid_extra += 1,
+            (false, false) => {}
+        }
+    }
+    // Same-seed same-shading image A/B: identical hits => identical RNG
+    // streams => near-identical color (cross-kernel compilation fp only).
+    let mut img_sum = 0.0f64;
+    let mut img_max = 0.0f32;
+    for i in 0..px * 3 {
+        let d = (wave_acc[i] - ref_acc[i]).abs();
+        img_sum += d as f64;
+        img_max = img_max.max(d);
+    }
+    let img_mean = img_sum / (px * 3) as f64;
+    eprintln!(
+        "check-gpu: wavefront vs reference ({px} px): false-sky {false_sky} | tmin-overshoot {overshoot} | hybrid-extra {hybrid_extra} | max rel t err {max_rel_t:.2e} | same-seed image mean |d| {img_mean:.2e} max {img_max:.2e}"
+    );
+    if false_sky != 0 || overshoot != 0 || hybrid_extra != 0 {
+        eprintln!("check-gpu: FAIL wavefront visibility gates (the inherited-tmin bug class)");
+        ok = false;
+    }
+    if img_mean > 1e-5 || img_max > 1e-2 {
+        eprintln!("check-gpu: FAIL same-seed wavefront/reference images diverge");
+        ok = false;
+    }
+    if must_fire {
+        // Structural must-fires, default scene only (mirrors --check).
+        if n_sky == 0 || n_leaf == 0 || ctrs[gpu::trace::CTR_BLOCKED as usize] == 0 {
+            eprintln!("check-gpu: FAIL structural must-fires (sky/leaf/blocked all expected > 0 on the default scene)");
+            ok = false;
+        }
+    }
+
+    // --- M5: the hemisphere AO/GI wavefront on a deterministic probe set ---
+    // Probes are CPU-generated (center rays, surface_point) so both sides
+    // integrate at the exact same (o, n). The exact-zero claim gates run on
+    // the GPU (FLAG_VERIFY: false-empty / tmin-overshoot re-validated with
+    // RayQuery reference rays, PSA accounting in H.w, sampled cut-bound);
+    // the A/Bs compare against CPU cosine-sampled references (statistical —
+    // different RNG streams by design).
+    let mut probes: Vec<(Vec3A, Vec3A)> = Vec::new();
+    {
+        let mut vls = stats::LocalStats::default();
+        let mut y = 7usize;
+        while y < gh && probes.len() < 512 {
+            let mut x = 11usize;
+            while x < gw && probes.len() < 512 {
+                let ray = bvh::Ray::new(basis.origin, basis.ray_dir(x as f32 + 0.5, y as f32 + 0.5));
+                if let Some(h) = bvh.intersect(scene, &ray, 0.0, f32::INFINITY, &mut vls.ray_nodes) {
+                    probes.push(shade::surface_point(scene, &ray, &h));
+                }
+                x += 53;
+            }
+            y += 41;
+        }
+    }
+    eprintln!("check-gpu: hemi probe set: {} points", probes.len());
+    let mut hemi_ok = true;
+    for (mode_name, fb) in [
+        ("AO", shade::FrustumBounce { ao: true, gi: false, shadows: false, depth: 3 }),
+        ("GI", shade::FrustumBounce { ao: false, gi: true, shadows: false, depth: 3 }),
+    ] {
+        // Multi-seed estimate (the CB frame seeds the Arvo draws), matching
+        // the CPU suite's A/B. The verify/stat counters ACCUMULATE across
+        // seeds (cs_seed_probes keeps them on the clear=false passes), so
+        // the exact-zero gates observe every seed's rays, not just the
+        // last seed's; PSA totals SEEDS·pi.
+        const SEEDS: u32 = 8;
+        let hq = Quality { fb, ..q };
+        for s in 0..SEEDS {
+            tg.write_cb(0, &gpu::trace::FrameParams {
+                cam: basis,
+                frame: s,
+                accumulate: true,
+                jitter: false,
+                frame_jitter: None,
+                q: hq,
+                verify: true,
+            });
+            if let Err(e) = tg.run_hemi_probes(&mut hg, 0, &probes, fb.depth, s == 0) {
+                eprintln!("check-gpu: FAIL hemi {mode_name} probes: {e}");
+                return 1;
+            }
+        }
+        let h = match read_u32(&mut hg, &tg.hbuf, probes.len() * 4) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("check-gpu: FAIL hbuf readback: {e}");
+                return 1;
+            }
+        };
+        let vctrs = match read_u32(&mut hg, &tg.counters, gpu::trace::CTR_COUNT as usize) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("check-gpu: FAIL counters readback: {e}");
+                return 1;
+            }
+        };
+        const FIXED: f64 = 262144.0;
+        let seeds_f = SEEDS as f64;
+        let mut psa_viol = 0usize;
+        let mut max_psa_err = 0.0f64;
+        for i in 0..probes.len() {
+            let acc = h[i * 4 + 3] as f64 / FIXED / seeds_f;
+            let err = (acc - std::f64::consts::PI).abs();
+            max_psa_err = max_psa_err.max(err);
+            if err > 1e-3 {
+                psa_viol += 1;
+            }
+        }
+        let (fe, tm) = (
+            vctrs[gpu::trace::CTR_V_FALSE_EMPTY as usize],
+            vctrs[gpu::trace::CTR_V_TMIN as usize],
+        );
+        eprintln!(
+            "check-gpu: hemi {mode_name} gates ({} probes): psa-viol {psa_viol} (max err {max_psa_err:.2e}) | false-empty {fe} | tmin-overshoot {tm} | empty-cells {} | leaf-rays {}",
+            probes.len(),
+            vctrs[gpu::trace::CTR_HEMI_EMPTY as usize],
+            vctrs[gpu::trace::CTR_HEMI_RAYS as usize],
+        );
+        if psa_viol != 0 || fe != 0 || tm != 0 {
+            eprintln!("check-gpu: FAIL hemi {mode_name} exact-zero gates");
+            hemi_ok = false;
+        }
+        if must_fire
+            && (vctrs[gpu::trace::CTR_HEMI_EMPTY as usize] == 0
+                || vctrs[gpu::trace::CTR_HEMI_RAYS as usize] == 0)
+        {
+            eprintln!("check-gpu: FAIL hemi {mode_name} must-fires (empty cells and leaf rays both expected > 0)");
+            hemi_ok = false;
+        }
+
+        // A/B vs a CPU cosine-sampled reference at the same points. AO also
+        // gates the SIGNED mean (the estimator is unbiased); GI runs the
+        // same depth-1 BOUNCE_Q policy as the GPU leaf rays.
+        const REF_N: u32 = 4096;
+        let mut rng = fastrand::Rng::with_seed(0x1234_5678);
+        let mut vls = stats::LocalStats::default();
+        if mode_name == "AO" {
+            let mut sum_abs = 0.0f64;
+            let mut sum_signed = 0.0f64;
+            for (i, &(o, n)) in probes.iter().enumerate() {
+                let gpu_ao = h[i * 4] as f64 / FIXED / seeds_f / std::f64::consts::PI;
+                let (t1, t2) = shade::onb(n);
+                let mut open = 0u32;
+                for _ in 0..REF_N {
+                    let d = shade::cosine_dir(n, t1, t2, rng.f32(), rng.f32());
+                    if !bvh.occluded(scene, &bvh::Ray::new(o, d), 0.0, scene.ao_radius, &mut vls.ray_nodes) {
+                        open += 1;
+                    }
+                }
+                let cpu_ao = open as f64 / REF_N as f64;
+                sum_abs += (gpu_ao - cpu_ao).abs();
+                sum_signed += gpu_ao - cpu_ao;
+            }
+            let mean_abs = sum_abs / probes.len() as f64;
+            let mean_signed = sum_signed / probes.len() as f64;
+            eprintln!(
+                "check-gpu: hemi AO A/B vs {REF_N}-sample cosine reference: mean |d| {mean_abs:.4} | signed mean {mean_signed:+.4}"
+            );
+            if mean_abs >= 0.02 || mean_signed.abs() >= 0.005 {
+                eprintln!("check-gpu: FAIL hemi AO A/B (bias or error above the CPU-suite tolerances)");
+                hemi_ok = false;
+            }
+        } else {
+            let mut sum_rel = 0.0f64;
+            let sun = render::sun_dir(scene);
+            for (i, &(o, n)) in probes.iter().enumerate() {
+                let gpu_gi = Vec3A::new(
+                    h[i * 4] as f32 / FIXED as f32,
+                    h[i * 4 + 1] as f32 / FIXED as f32,
+                    h[i * 4 + 2] as f32 / FIXED as f32,
+                ) / SEEDS as f32
+                    / std::f32::consts::PI;
+                let (t1, t2) = shade::onb(n);
+                let mut sum = Vec3A::ZERO;
+                for _ in 0..REF_N {
+                    let d = shade::cosine_dir(n, t1, t2, rng.f32(), rng.f32());
+                    let ray = bvh::Ray::new(o, d);
+                    sum += match bvh.intersect(scene, &ray, 0.0, f32::INFINITY, &mut vls.ray_nodes) {
+                        None => shade::sky(d, sun),
+                        Some(hh) => shade::shade(
+                            scene,
+                            bvh,
+                            &ray,
+                            &hh,
+                            None,
+                            &hemi::BOUNCE_Q,
+                            &mut rng,
+                            sun,
+                            1,
+                            &mut vls,
+                            None,
+                            shade::VisCtl::Off,
+                        ),
+                    };
+                }
+                let cpu_gi = sum / REF_N as f32;
+                let rel = (gpu_gi - cpu_gi).length() as f64 / cpu_gi.length().max(1e-6) as f64;
+                sum_rel += rel;
+            }
+            let mean_rel = sum_rel / probes.len() as f64;
+            eprintln!(
+                "check-gpu: hemi GI A/B vs {REF_N}-sample BOUNCE_Q reference: mean rel {:.2}%",
+                mean_rel * 100.0
+            );
+            if mean_rel >= 0.05 {
+                eprintln!("check-gpu: FAIL hemi GI A/B (above the CPU-suite 5% tolerance)");
+                hemi_ok = false;
+            }
+        }
+    }
+    if !hemi_ok {
+        ok = false;
+    }
+
+    // Frame-level hemi: one full wavefront frame with GI on — the leaf pass
+    // must append exactly one point per hit pixel, the batch loop must drain
+    // them, and compose must produce finite radiance everywhere.
+    {
+        let hq = Quality {
+            fb: shade::FrustumBounce { ao: false, gi: true, shadows: false, depth: 2 },
+            ..q
+        };
+        let p = gpu::trace::FrameParams {
+            cam: basis,
+            frame: 0,
+            accumulate: true,
+            jitter: false,
+            frame_jitter: None,
+            q: hq,
+            verify: false,
+        };
+        tg.write_cb(0, &p);
+        if let Err(e) = hg.run(|l| tg.record_wavefront(l, 0, &p, false)) {
+            eprintln!("check-gpu: FAIL hemi frame dispatch: {e}");
+            return 1;
+        }
+        let (acc, t_w, ctrs2) = match (
+            read_f32(&mut hg, &tg.accum, px * 3),
+            read_f32(&mut hg, &tg.tbuf, px),
+            read_u32(&mut hg, &tg.counters, gpu::trace::CTR_COUNT as usize),
+        ) {
+            (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+            _ => {
+                eprintln!("check-gpu: FAIL hemi frame readback");
+                return 1;
+            }
+        };
+        let hits = t_w.iter().filter(|t| t.is_finite()).count();
+        let pts = ctrs2[gpu::trace::CTR_HEMI_PT as usize] as usize;
+        let nonfinite = acc.iter().filter(|v| !v.is_finite()).count();
+        eprintln!(
+            "check-gpu: hemi GI frame: hit-px {hits} | hemi-points {pts} | hemi-rays {} | overflow {} | non-finite {nonfinite}",
+            ctrs2[gpu::trace::CTR_HEMI_RAYS as usize],
+            ctrs2[gpu::trace::CTR_OVERFLOW as usize],
+        );
+        if pts != hits {
+            eprintln!("check-gpu: FAIL hemi point count != hit pixels (leaf-pass append accounting)");
+            ok = false;
+        }
+        if ctrs2[gpu::trace::CTR_OVERFLOW as usize] != 0 || nonfinite != 0 {
+            eprintln!("check-gpu: FAIL hemi frame overflow/non-finite");
+            ok = false;
+        }
+    }
+
+    if !ok {
+        eprintln!("GPU CHECK FAILED");
+        return 1;
+    }
+
+    // --- Bench: full 1920x1080, GPU hybrid vs GPU vanilla vs CPU hybrid ---
+    // Wall-clock around synchronous submits (includes per-frame sync — the
+    // interactive loop pays the same). Correctness gates above are the
+    // point; this is the speedometer.
+    drop(tg);
+    let (bw, bh) = (1920usize, 1080usize);
+    let mut btg = match gpu::trace::TraceGpu::new(
+        &hg.device,
+        &dxc,
+        scene,
+        bvh,
+        bw as u32,
+        bh as u32,
+        opts.gpu_debug,
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("check-gpu: bench TraceGpu init failed ({e}); skipping bench");
+            println!("check-gpu: wavefront quadtree + hemi AO/GI OK");
+            return 0;
+        }
+    };
+    {
+        let mut rec = Ok(());
+        if hg.run(|l| rec = btg.scene.record_upload(l)).is_err() || rec.is_err() {
+            eprintln!("check-gpu: bench scene upload failed; skipping bench");
+            println!("check-gpu: wavefront quadtree + hemi AO/GI OK");
+            return 0;
+        }
+        btg.scene.free_staging();
+    }
+    let bbasis = cam0.basis(bw, bh);
+    let mut bench = |label: &str, hybrid: bool, fb: shade::FrustumBounce| {
+        let bq = Quality { fb, ..q };
+        let n = 60u32;
+        // Warm once (PSO/cache effects), then time.
+        for warm in 0..2u32 {
+            let p = gpu::trace::FrameParams {
+                cam: bbasis,
+                frame: warm,
+                accumulate: true,
+                jitter: warm > 0,
+                frame_jitter: None,
+                q: bq,
+                verify: false,
+            };
+            btg.write_cb(0, &p);
+            let _ = hg.run(|l| btg.record_frame(l, 0, &p, hybrid));
+        }
+        let t0 = Instant::now();
+        for f in 0..n {
+            let p = gpu::trace::FrameParams {
+                cam: bbasis,
+                frame: f,
+                accumulate: true,
+                jitter: f > 0,
+                frame_jitter: None,
+                q: bq,
+                verify: false,
+            };
+            btg.write_cb(0, &p);
+            let _ = hg.run(|l| btg.record_frame(l, 0, &p, hybrid));
+        }
+        let ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
+        eprintln!("check-gpu: bench {bw}x{bh} {label}: {ms:6.2} ms/frame");
+    };
+    let fb_off = shade::FrustumBounce::OFF;
+    bench("gpu hybrid          ", true, fb_off);
+    bench("gpu plain reference ", false, fb_off);
+    bench(
+        "gpu hybrid + hemi-gi",
+        true,
+        shade::FrustumBounce { ao: false, gi: true, shadows: false, depth: 3 },
+    );
+    {
+        // CPU hybrid at the same resolution/quality for scale.
+        let stats2 = Stats::default();
+        let accum2: Vec<AtomicU32> = (0..bw * bh * 3).map(|_| AtomicU32::new(0)).collect();
+        let info2: Vec<AtomicU32> = (0..bw * bh).map(|_| AtomicU32::new(0)).collect();
+        let tbuf2: Vec<AtomicU32> = (0..bw * bh).map(|_| AtomicU32::new(0)).collect();
+        let mut cpu_ms = 0.0;
+        for f in 0..8u32 {
+            let ctx = FrameCtx {
+                scene,
+                bvh,
+                cam: bbasis,
+                q,
+                frame: f,
+                jitter: f > 0,
+                rw: bw,
+                rh: bh,
+                accum: &accum2,
+                info: &info2,
+                tbuf: &tbuf2,
+                stats: &stats2,
+                sun: render::sun_dir(scene),
+                tcache_cur: None,
+                tcache_prev: None,
+                accumulate: true,
+                gbuf: None,
+                prev_cam: None,
+                frame_jitter: None,
+                adaptive: false,
+            };
+            let t0 = Instant::now();
+            render::render_frame(&ctx, true);
+            cpu_ms += t0.elapsed().as_secs_f64() * 1000.0;
+        }
+        eprintln!("check-gpu: bench {bw}x{bh} cpu hybrid          : {:6.2} ms/frame", cpu_ms / 8.0);
+    }
+
+    println!("check-gpu: wavefront quadtree + hemi AO/GI OK");
+    0
 }
 
 /// Headless DLSS G-buffer verification: renders two DLSS-style frames (a
@@ -2312,6 +3182,23 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     )
     .expect("GPU init failed");
 
+    // --gpu: bring up the GPU-resident tracer (DXC compile, scene upload,
+    // BLAS/TLAS). Any failure — missing DLLs, no RT tier — falls back to the
+    // CPU renderer with the reason on stderr.
+    let gpu_trace = opts.gpu
+        && match gpu::dxc::Dxc::load(&opts.dxc_path)
+            .and_then(|dxc| gpu.init_trace(&dxc, scene, bvh, opts.gpu_debug))
+        {
+            Ok(()) => {
+                eprintln!("gpu: GPU-resident tracer active ({W}x{H}, DXR RayQuery)");
+                true
+            }
+            Err(e) => {
+                eprintln!("gpu: falling back to CPU tracing — {e}");
+                false
+            }
+        };
+
     let mut cam = cam0;
     let accum: Vec<AtomicU32> = (0..W * H * 3).map(|_| AtomicU32::new(0)).collect();
     let info: Vec<AtomicU32> = (0..W * H).map(|_| AtomicU32::new(0)).collect();
@@ -2615,6 +3502,107 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
             break;
         }
         let moved = inp.apply_movement(&mut cam, dt, scene.diag);
+
+        // GPU-resident tracing (--gpu): a self-contained arm — every frame is
+        // traced, resolved, tonemapped, and presented on the GPU; the CPU's
+        // only jobs are input, the frame counter, and 192 bytes of constants.
+        // The CPU mode machinery below (budget frames, OIDN/DLSS/XeSS,
+        // overlay) deliberately doesn't run.
+        if gpu_trace {
+            if let Some(p) = edges.quality {
+                preset = p;
+                frame = 0;
+                eprintln!("quality preset {preset}");
+            }
+            if edges.toggle_hybrid {
+                hybrid = !hybrid;
+                frame = 0;
+                eprintln!("gpu: {}", if hybrid { "hybrid (wavefront quadtree)" } else { "plain (per-pixel reference)" });
+            }
+            if edges.toggle_bounce {
+                bounce_mode = (bounce_mode + 1) % 3; // no shafts tier on GPU (v1)
+                frame = 0;
+                eprintln!(
+                    "gpu: hemisphere frustum bounces: {}",
+                    ["OFF", "AO (still frames)", "GI (still frames)"][bounce_mode as usize]
+                );
+            }
+            if moved {
+                frame = 0;
+            }
+            let base_q = Quality::preset(preset);
+            // C key first: verify clobbers accum/tbuf/info, so the frame
+            // presented below must be a frame-0 store — handling it after
+            // the present would let the next frame ADD onto the verify image.
+            if edges.verify {
+                eprintln!("gpu: verifying current view (wavefront vs reference, on-GPU)...");
+                match gpu.verify_trace(&cam.basis(W, H), base_q) {
+                    Ok(report) => eprintln!("{report}"),
+                    Err(e) => eprintln!("gpu: verify failed to run: {e}"),
+                }
+                frame = 0;
+            }
+            let mut q = if moved { base_q.while_moving() } else { base_q };
+            if !moved && hybrid {
+                // Hemi tiers are a still-frame, wavefront-path feature (the
+                // reference kernel keeps the sampled-ambient path).
+                q.fb.ao = bounce_mode == 1;
+                q.fb.gi = bounce_mode == 2;
+            }
+            let p = gpu::trace::FrameParams {
+                cam: cam.basis(W, H),
+                frame,
+                accumulate: true,
+                jitter: frame > 0,
+                frame_jitter: None,
+                q,
+                verify: false,
+            };
+            if frame < MAX_SAMPLES {
+                if let Err(e) = gpu.present_trace(&p, frame + 1, hybrid) {
+                    eprintln!("gpu: present failed: {e}");
+                }
+                // Moving frames stay at frame 0: every one is a fresh store,
+                // and the first still frame then re-stores at full quality
+                // instead of adding onto a while_moving()-quality sample #0.
+                if !moved {
+                    frame += 1;
+                }
+            } else if let Err(e) = gpu.present_hold() {
+                // Converged: re-present the resolved image without tracing.
+                // Re-adding the pinned-seed sample while resolve divides by
+                // the pinned count would brighten the image without bound.
+                eprintln!("gpu: present failed: {e}");
+            }
+            if edges.screenshot {
+                match gpu.read_trace_output() {
+                    Ok(px) => {
+                        let name = format!("screenshot_{shot}.png");
+                        save_png(&name, &px, W, H);
+                        eprintln!("saved {name}");
+                        shot += 1;
+                    }
+                    Err(e) => eprintln!("screenshot: GPU readback failed ({e})"),
+                }
+            }
+            fps_frames += 1;
+            if (now - fps_t).as_secs_f64() >= 0.5 {
+                fps = fps_frames as f64 / (now - fps_t).as_secs_f64();
+                fps_frames = 0;
+                fps_t = now;
+                let _ = window.set_title(&format!(
+                    "frustracer | {:.0} fps | GPU {} | {}x{} | quality {} | {} spp{}",
+                    fps,
+                    if hybrid { "hybrid" } else { "plain" },
+                    W,
+                    H,
+                    preset,
+                    frame.min(MAX_SAMPLES),
+                    if frame >= MAX_SAMPLES { " | converged" } else { "" },
+                ));
+            }
+            continue;
+        }
         if edges.toggle_hybrid {
             hybrid = !hybrid;
             frame = 0;

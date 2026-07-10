@@ -66,6 +66,14 @@ impl CamBasis {
         self.forward
     }
 
+    /// Raw basis fields for the GPU tracer's frame constants: (origin,
+    /// forward, right, up, inv_w, inv_h). The HLSL ray_dir in
+    /// gpu/shaders/trace_common.hlsli mirrors `ray_dir` above term for term —
+    /// these are its inputs, pre-scaled exactly as the CPU uses them.
+    pub fn gpu_fields(&self) -> (Vec3A, Vec3A, Vec3A, Vec3A, f32, f32) {
+        (self.origin, self.forward, self.right, self.up, self.inv_w, self.inv_h)
+    }
+
     /// Normalized ray direction through the continuous image point (fx, fy),
     /// fx ∈ [0, w], fy ∈ [0, h] (pixel-grid coordinates, y down).
     #[inline(always)]

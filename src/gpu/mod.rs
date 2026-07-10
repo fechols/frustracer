@@ -9,10 +9,12 @@
 
 pub mod adapter;
 pub mod d3d12;
+pub mod dxc;
 pub mod rr;
 pub mod streamline;
 pub mod streamline_sys;
 pub mod tonemap;
+pub mod trace;
 pub mod upload;
 pub mod xr;
 
@@ -62,6 +64,10 @@ pub struct GpuContext {
     passes: tonemap::Passes,
     blit: upload::BlitUpload,
     hdr: upload::HdrUpload,
+    /// The GPU-resident tracer (--gpu): quadtree + shading in compute with
+    /// RayQuery rays. Lives on whatever device the queue runs on (v1 forces
+    /// the native pipeline — main.rs disables DLSS/XeSS/OIDN under --gpu).
+    trace: Option<trace::TraceGpu>,
     rr: Option<rr::RrResources>,
     /// XeSS-SR (native pipeline only; never coexists with `sl`). Explicitly
     /// torn down by GpuContext::drop after a queue drain — xessDestroyContext
@@ -296,11 +302,178 @@ impl GpuContext {
             passes,
             blit,
             hdr,
+            trace: None,
             rr: rr_res,
             xess: xess_state,
             adapter_name: pick.name,
             adapter_is_nvidia: pick.is_nvidia,
         })
+    }
+
+    /// Bring up the GPU-resident tracer: capability gates, kernel compiles,
+    /// scene upload + BLAS/TLAS build (synchronous, one-time), HDR SRV wire-up.
+    pub fn init_trace(
+        &mut self,
+        dxc: &dxc::Dxc,
+        scene: &crate::scene::Scene,
+        bvh: &crate::bvh::Bvh,
+        debug: bool,
+    ) -> Result<()> {
+        let mut tg = trace::TraceGpu::new(
+            &self.d3d.device,
+            dxc,
+            scene,
+            bvh,
+            self.d3d.width,
+            self.d3d.height,
+            debug,
+        )?;
+        let mut rec = Ok(());
+        self.d3d.run_once(|l| rec = tg.scene.record_upload(l))?;
+        rec?;
+        tg.scene.free_staging();
+        self.passes.create_srv(
+            &self.d3d.device,
+            &tg.hdr,
+            windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+            tonemap::SRV_SLOT_GPU,
+        );
+        self.trace = Some(tg);
+        Ok(())
+    }
+
+    pub fn trace_ready(&self) -> bool {
+        self.trace.is_some()
+    }
+
+    /// One fully GPU-resident frame: constants -> trace (wavefront quadtree,
+    /// or the vanilla reference when `hybrid` is false — the R-key A/B) ->
+    /// resolve -> tonemap -> present. `samples` divides the accumulation.
+    pub fn present_trace(&mut self, p: &trace::FrameParams, samples: u32, hybrid: bool) -> Result<()> {
+        let Some(tg) = &self.trace else {
+            return Err("GPU tracer not initialized".into());
+        };
+        let slot = self.d3d.begin_frame()?;
+        tg.write_cb(slot, p);
+        tg.record_frame(&self.d3d.list, slot, p, hybrid);
+        tg.record_resolve(&self.d3d.list, slot, samples);
+        self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_GPU, 1.0);
+        self.d3d.end_frame(slot)
+    }
+
+    /// Re-present the last resolved frame without tracing or accumulating —
+    /// the converged-idle path (re-adding a pinned-seed sample while resolve
+    /// divides by a pinned count would brighten the image without bound).
+    /// `record_resolve` leaves hdr in PIXEL_SHADER_RESOURCE, so the tonemap
+    /// blit is all that's needed.
+    pub fn present_hold(&mut self) -> Result<()> {
+        if self.trace.is_none() {
+            return Err("GPU tracer not initialized".into());
+        }
+        let slot = self.d3d.begin_frame()?;
+        self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_GPU, 1.0);
+        self.d3d.end_frame(slot)
+    }
+
+    /// Screenshot path for GPU-trace mode (the image exists only on the GPU).
+    pub fn read_trace_output(&mut self) -> Result<Vec<u32>> {
+        let Some(tg) = &self.trace else {
+            return Err("GPU tracer not initialized".into());
+        };
+        let output = tg.hdr.clone();
+        self.read_hdr_output(output)
+    }
+
+    fn read_trace_buffer(&mut self, res: &ID3D12Resource, size: usize) -> Result<Vec<u8>> {
+        let rb = d3d12::ReadbackBuffer::new(&self.d3d.device, size)?;
+        let src = res.clone();
+        self.d3d.run_once(|list| unsafe {
+            let ua = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            list.ResourceBarrier(&[transition(&src, ua, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            list.CopyBufferRegion(&rb.resource, 0, &src, 0, size as u64);
+            list.ResourceBarrier(&[transition(&src, D3D12_RESOURCE_STATE_COPY_SOURCE, ua)]);
+        })?;
+        let mut ptr = std::ptr::null_mut();
+        unsafe { rb.resource.Map(0, None, Some(&mut ptr)) }.map_err(|e| format!("Map: {e}"))?;
+        let out = unsafe { std::slice::from_raw_parts(ptr as *const u8, size) }.to_vec();
+        unsafe { rb.resource.Unmap(0, None) };
+        Ok(out)
+    }
+
+    /// C key in GPU mode: the on-GPU analog of render::verify — trace the
+    /// current view unjittered through both the wavefront quadtree and the
+    /// vanilla reference, compare per pixel (same intersector both sides —
+    /// the exact-zero gates), and report. Clobbers accum/tbuf/info; the
+    /// caller resets the accumulation.
+    pub fn verify_trace(&mut self, cam: &crate::camera::CamBasis, q: crate::shade::Quality) -> Result<String> {
+        let (tbuf, info, counters, px) = {
+            let Some(tg) = &self.trace else {
+                return Err("GPU tracer not initialized".into());
+            };
+            (tg.tbuf.clone(), tg.info.clone(), tg.counters.clone(), (tg.rw * tg.rh) as usize)
+        };
+        let p = trace::FrameParams {
+            cam: *cam,
+            frame: 0,
+            accumulate: true,
+            jitter: false,
+            frame_jitter: None,
+            q: crate::shade::Quality { fb: crate::shade::FrustumBounce::OFF, ..q },
+            verify: false,
+        };
+        {
+            // Field-split borrow: run_once needs d3d mutably, the recorder
+            // reads the tracer.
+            let d3d = &mut self.d3d;
+            let tg = self.trace.as_ref().unwrap();
+            // Drain the queue BEFORE touching CB slot 0: a presented frame
+            // still in flight may be reading it (run_once waits idle too,
+            // but only after this write would have raced it).
+            d3d.wait_idle()?;
+            tg.write_cb(0, &p);
+            d3d.run_once(|l| tg.record_wavefront(l, 0, &p, true))?;
+        }
+        let wave_t = self.read_trace_buffer(&tbuf, px * 4)?;
+        let wave_info = self.read_trace_buffer(&info, px * 4)?;
+        let ctrs = self.read_trace_buffer(&counters, trace::CTR_COUNT as usize * 4)?;
+        {
+            let d3d = &mut self.d3d;
+            let tg = self.trace.as_ref().unwrap();
+            d3d.run_once(|l| tg.record_reference(l, 0))?;
+        }
+        let ref_t = self.read_trace_buffer(&tbuf, px * 4)?;
+
+        let f = |b: &[u8], i: usize| f32::from_le_bytes(b[i * 4..][..4].try_into().unwrap());
+        let u = |b: &[u8], i: usize| u32::from_le_bytes(b[i * 4..][..4].try_into().unwrap());
+        let (mut false_sky, mut overshoot, mut extra, mut sentinel) = (0u64, 0u64, 0u64, 0u64);
+        let mut max_rel = 0.0f32;
+        for i in 0..px {
+            if u(&wave_info, i) == 0xffff_ffff {
+                sentinel += 1;
+            }
+            let (rt, wt) = (f(&ref_t, i), f(&wave_t, i));
+            match (rt.is_finite(), wt.is_finite()) {
+                (true, true) => {
+                    let rel = (wt - rt) / rt.max(1e-6);
+                    max_rel = max_rel.max(rel.abs());
+                    if rel > 1e-4 {
+                        overshoot += 1;
+                    }
+                }
+                (true, false) => false_sky += 1,
+                (false, true) => extra += 1,
+                _ => {}
+            }
+        }
+        let ok = false_sky == 0 && overshoot == 0 && extra == 0 && sentinel == 0;
+        Ok(format!(
+            "gpu verify ({px} px): false-sky {false_sky} | tmin-overshoot {overshoot} | hybrid-extra {extra} | unwritten {sentinel} | max rel t err {max_rel:.2e} | tiles: {} splits, {} sky, {} leaves, {} blocked -> {}",
+            u(&ctrs, trace::CTR_SPLIT as usize),
+            u(&ctrs, trace::CTR_SKY as usize),
+            u(&ctrs, trace::CTR_LEAF as usize),
+            u(&ctrs, trace::CTR_BLOCKED as usize),
+            if ok { "OK" } else { "FAILED" },
+        ))
     }
 
     /// Streamline live => RR evaluate is available (M4).

@@ -21,6 +21,9 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D12",
     "Win32_Graphics_Direct3D_Fxc",
+    # Interface types + CLSIDs only — DxcCreateInstance is resolved at runtime
+    # via GetProcAddress (gpu/dxc.rs) so nothing imports dxcompiler.dll.
+    "Win32_Graphics_Direct3D_Dxc",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_System_Threading",

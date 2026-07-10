@@ -292,6 +292,24 @@ pub fn transition(
     }
 }
 
+/// UAV barrier: all UAV writes before it complete before any UAV access
+/// after it. `None` = global (covers every UAV) — the trace pipeline's
+/// between-dispatch fence, cheaper to reason about than per-resource lists.
+pub fn uav_barrier(res: Option<&ID3D12Resource>) -> D3D12_RESOURCE_BARRIER {
+    D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                pResource: match res {
+                    Some(r) => unsafe { std::mem::transmute_copy(r) },
+                    None => ManuallyDrop::new(None),
+                },
+            }),
+        },
+    }
+}
+
 /// Copy location for a texture subresource — either side of a
 /// CopyTextureRegion (upload dst, readback src).
 pub fn loc_subresource(res: &ID3D12Resource) -> D3D12_TEXTURE_COPY_LOCATION {
@@ -355,6 +373,31 @@ pub fn buffer_desc(size: u64) -> D3D12_RESOURCE_DESC {
         Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
         Flags: D3D12_RESOURCE_FLAG_NONE,
     }
+}
+
+/// Default-heap buffer with explicit flags/state — the trace pipeline's
+/// UAV queues, pools, and per-pixel planes.
+pub fn committed_buffer(
+    device: &ID3D12Device,
+    size: u64,
+    flags: D3D12_RESOURCE_FLAGS,
+    initial: D3D12_RESOURCE_STATES,
+) -> Result<ID3D12Resource> {
+    let mut desc = buffer_desc(size);
+    desc.Flags = flags;
+    let mut res: Option<ID3D12Resource> = None;
+    unsafe {
+        device.CreateCommittedResource(
+            &default_heap(),
+            D3D12_HEAP_FLAG_NONE,
+            &desc,
+            initial,
+            None,
+            &mut res,
+        )
+    }
+    .map_err(|e| format!("CreateCommittedResource(buffer {size}B): {e}"))?;
+    Ok(res.unwrap())
 }
 
 pub fn committed_tex(

@@ -26,6 +26,8 @@ pub const SRV_SLOT_BLIT: u32 = 0;
 pub const SRV_SLOT_HDR: u32 = 1;
 pub const SRV_SLOT_RR: u32 = 2;
 pub const SRV_SLOT_XESS: u32 = 3;
+/// The GPU-resident tracer's resolved HDR output (gpu/trace.rs).
+pub const SRV_SLOT_GPU: u32 = 4;
 /// Room for the DLSS-RR output SRV and future debug views.
 const SRV_HEAP_CAPACITY: u32 = 8;
 
