@@ -281,8 +281,19 @@ int32_t slshim_tag_resources(void* token, uint32_t viewport, const SlShimResourc
     sl::ResourceTag rt[SLSHIM_MAX_TAGS];
     for (uint32_t i = 0; i < n; ++i) {
         res[i] = sl::Resource(sl::ResourceType::eTex2d, tags[i].resource, tags[i].state);
-        rt[i] = sl::ResourceTag(&res[i], static_cast<sl::BufferType>(tags[i].buffer_type),
-                                static_cast<sl::ResourceLifecycle>(tags[i].lifecycle));
+        // Dynamic resolution: a nonzero extent names the active sub-rect of
+        // the (max-size) resource. Zero extent = whole resource — SL's own
+        // null convention, and the pre-DRS behavior. The Extent is copied
+        // by value into the tag by the ctor, so a stack temporary is fine.
+        if (tags[i].extent_width != 0 && tags[i].extent_height != 0) {
+            sl::Extent ext{tags[i].extent_top, tags[i].extent_left, tags[i].extent_width,
+                           tags[i].extent_height};
+            rt[i] = sl::ResourceTag(&res[i], static_cast<sl::BufferType>(tags[i].buffer_type),
+                                    static_cast<sl::ResourceLifecycle>(tags[i].lifecycle), &ext);
+        } else {
+            rt[i] = sl::ResourceTag(&res[i], static_cast<sl::BufferType>(tags[i].buffer_type),
+                                    static_cast<sl::ResourceLifecycle>(tags[i].lifecycle));
+        }
     }
     return to_i32(p_slSetTagForFrame(*static_cast<sl::FrameToken*>(token),
                                      sl::ViewportHandle(viewport), rt, n,

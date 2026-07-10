@@ -148,11 +148,12 @@ impl GpuContext {
             D3d::with_queue(&factory, device, queue, hwnd, w, h)?
         };
 
-        // Query DLSS-RR's optimal Quality-mode render resolution — this is
-        // authoritative: the CPU renders at (rrw, rrh) and RR upscales +
-        // denoises to the window size. A failed or degenerate query falls
-        // back to DLAA (render == output), the pre-upscaling behavior.
-        let (rrw, rrh) = if let Some(s) = &sl {
+        // Query DLSS-RR's optimal Quality-mode render resolution and its
+        // dynamic range — the CPU renders inside [min, max] and RR upscales
+        // + denoises to the window size (step-wise DRS via sl::Extent tags).
+        // A failed or degenerate query falls back to DLAA (opt == min ==
+        // max == output), which main.rs reads as "DRS off, fixed res".
+        let (rr_opt, rr_min, rr_max) = if let Some(s) = &sl {
             let opt = streamline::SlShimDlssdOptions {
                 mode: streamline_sys::DLSS_MODE_MAX_QUALITY,
                 output_width: w,
@@ -171,26 +172,45 @@ impl GpuContext {
                         o.render_width_min, o.render_height_min,
                         o.render_width_max, o.render_height_max,
                     );
-                    (o.render_width, o.render_height)
+                    // Malformed halves of the range collapse to the optimal
+                    // size — never invent a range the driver didn't report.
+                    let po = (o.render_width, o.render_height);
+                    let pmin = if o.render_width_min > 0
+                        && o.render_height_min > 0
+                        && o.render_width_min <= o.render_width
+                        && o.render_height_min <= o.render_height
+                    {
+                        (o.render_width_min, o.render_height_min)
+                    } else {
+                        po
+                    };
+                    let pmax = if o.render_width_max >= o.render_width
+                        && o.render_height_max >= o.render_height
+                    {
+                        (o.render_width_max, o.render_height_max)
+                    } else {
+                        po
+                    };
+                    (po, pmin, pmax)
                 }
                 Ok(_) => {
                     eprintln!("dlss: optimal-settings degenerate — falling back to DLAA at native res");
-                    (w, h)
+                    ((w, h), (w, h), (w, h))
                 }
                 Err(e) => {
                     eprintln!("dlss: optimal-settings query failed ({e}) — falling back to DLAA at native res");
-                    (w, h)
+                    ((w, h), (w, h), (w, h))
                 }
             }
         } else {
-            (w, h)
+            ((w, h), (w, h), (w, h))
         };
 
         let passes = tonemap::Passes::new(&d3d.device)?;
         let blit = upload::BlitUpload::new(&d3d, w, h)?;
         let hdr = upload::HdrUpload::new(&d3d, w, h)?;
         let rr_res = if sl.is_some() {
-            let r = rr::RrResources::new(&d3d, rrw, rrh, w, h)?;
+            let r = rr::RrResources::new(&d3d, rr_opt, rr_min, rr_max, w, h)?;
             passes.create_srv(
                 &d3d.device,
                 &r.output,
@@ -280,10 +300,18 @@ impl GpuContext {
         self.sl.is_some() && self.rr.is_some()
     }
 
-    /// The render resolution DLSS mode must trace at (SL's Quality-mode
-    /// optimal size; == window size when the query fell back to DLAA).
+    /// The optimal render resolution for DLSS mode (SL's Quality-mode
+    /// optimal size; == window size when the query fell back to DLAA) —
+    /// the fixed fallback when the DRS range is degenerate.
     pub fn rr_render_res(&self) -> Option<(u32, u32)> {
-        self.rr.as_ref().map(|r| (r.rw, r.rh))
+        self.rr.as_ref().map(|r| r.opt)
+    }
+
+    /// DLSS-RR input-resolution range: (optimal, min, max) — the same shape
+    /// as `xess_res_range`, feeding the shared DRS controller. min == max
+    /// means the driver reported no dynamic range (DRS off).
+    pub fn rr_res_range(&self) -> Option<((u32, u32), (u32, u32), (u32, u32))> {
+        self.rr.as_ref().map(|r| (r.opt, r.min, r.max))
     }
 
     /// XeSS live => the dynamic-res upscale path is available.
@@ -447,16 +475,18 @@ impl GpuContext {
         let (Some(sl), Some(rr)) = (&self.sl, &self.rr) else {
             return Err("DLSS-RR not initialized".into());
         };
-        // Release-build cover for record_upload's dimension debug_assert:
-        // a frame traced at the wrong resolution must not reach SL.
-        if (fc.rw as u32, fc.rh as u32) != (rr.rw, rr.rh) {
+        // Release-build cover for record_upload's dimension debug_asserts:
+        // a frame outside the queried DRS range (or beyond plane capacity)
+        // must not reach SL.
+        let (rw, rh) = (fc.rw as u32, fc.rh as u32);
+        if rw < rr.min.0 || rh < rr.min.1 || rw > rr.max.0 || rh > rr.max.1 {
             return Err(format!(
-                "DLSS-RR frame is {}x{}, expected render res {}x{}",
-                fc.rw, fc.rh, rr.rw, rr.rh
+                "DLSS-RR frame {}x{} outside render range {}x{}..{}x{}",
+                rw, rh, rr.min.0, rr.min.1, rr.max.0, rr.max.1
             ));
         }
         let slot = self.d3d.begin_frame()?;
-        rr.record_upload(&self.d3d, slot, accum, g);
+        rr.record_upload(&self.d3d, slot, accum, g, fc.rw, fc.rh);
         unsafe {
             self.d3d.list.ResourceBarrier(&[transition(
                 &rr.output,
@@ -474,7 +504,7 @@ impl GpuContext {
             let token = sl.new_frame_token(frame_idx)?;
             sl.set_constants(token, 0, &shim_constants(fc))?;
             sl.dlssd_set_options(0, &shim_options(fc, rr.ow, rr.oh))?;
-            sl.tag_resources(token, 0, &rr.tags(), list_raw)?;
+            sl.tag_resources(token, 0, &rr.tags(fc.rw, fc.rh), list_raw)?;
             sl.evaluate(streamline_sys::FEATURE_DLSS_RR, token, 0, list_raw)?;
             Ok(())
         };

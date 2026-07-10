@@ -233,6 +233,52 @@ impl ScaleCtl {
     }
 }
 
+/// Minimum frames between APPLIED resolution steps (~1.5 s at 60 fps).
+pub const STEP_DWELL: u32 = 90;
+
+/// Rate-limits applied resolution changes for both DRS paths. Every applied
+/// step costs upscaler history quality (RR re-initializes its denoiser on an
+/// input-res change; XeSS rescales its accumulation), and the controller's
+/// slow climb after a shed would otherwise cross each RES_STEP quantum as
+/// its own step — one shed-then-recover excursion firing several history
+/// hits in quick succession, which presents as patchy re-convergence noise
+/// ("dancing"). A new target is adopted only after STEP_DWELL frames at the
+/// current res; when the dwell expires the CURRENT target is adopted in one
+/// multi-quantum jump (one history hit instead of five). The only bypass is
+/// an emergency shed on a badly blown frame — growing never bypasses.
+pub struct StepLimiter {
+    applied: (usize, usize),
+    since: u32,
+}
+
+impl StepLimiter {
+    pub fn new() -> Self {
+        Self { applied: (0, 0), since: 0 }
+    }
+
+    pub fn apply(&mut self, target: (usize, usize), emergency_shed: bool) -> (usize, usize) {
+        if self.applied.0 == 0 {
+            self.applied = target; // first frame adopts unconditionally
+            self.since = 0;
+            return self.applied;
+        }
+        self.since = self.since.saturating_add(1);
+        if target != self.applied
+            && (self.since >= STEP_DWELL || (emergency_shed && target.1 < self.applied.1))
+        {
+            self.applied = target;
+            self.since = 0;
+        }
+        self.applied
+    }
+}
+
+impl Default for StepLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Runtime loader + safe-ish wrapper (Windows-only, interactive path only).
 // ---------------------------------------------------------------------------

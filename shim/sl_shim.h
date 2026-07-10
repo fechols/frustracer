@@ -103,6 +103,13 @@ typedef struct SlShimResourceTag {
     uint32_t state;       // D3D12_RESOURCE_STATES at the time SL uses it
     uint32_t buffer_type; // sl::kBufferType*
     uint32_t lifecycle;   // sl::ResourceLifecycle
+    // Active sub-rect of the resource (sl::Extent) — dynamic resolution.
+    // All-zero means "whole resource" (SL's own null-extent convention),
+    // preserving the pre-DRS behavior.
+    uint32_t extent_top;
+    uint32_t extent_left;
+    uint32_t extent_width;
+    uint32_t extent_height;
 } SlShimResourceTag;
 
 #define SLSHIM_MAX_TAGS 16

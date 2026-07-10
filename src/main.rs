@@ -79,6 +79,10 @@ pub struct Opts {
     /// Start XeSS mode with the OIDN denoise placed AFTER the upscale
     /// (requires --xess; N cycles placement at runtime).
     pub oidn_post: bool,
+    /// Adaptive shading rate on XeSS frames (default on; --no-adaptive forces
+    /// uniform per-pixel shading — visibility is per-pixel either way, only
+    /// the 2×2-cell shadow/AO sharing and HOT top-ups are disabled).
+    pub adaptive: bool,
 }
 
 /// OIDN placement in XeSS mode (N cycles off → pre → post). Pre denoises the
@@ -130,6 +134,7 @@ fn main() {
             concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\XeSS-SDK\bin").to_string()
         }),
         oidn_post: false,
+        adaptive: true,
     };
     let mut check_dlss = false;
     let mut dlss_dump = false;
@@ -165,6 +170,7 @@ fn main() {
             "--xess" => opts.xess = true,
             "--no-xess" => opts.xess = false,
             "--oidn-post" => opts.oidn_post = true,
+            "--no-adaptive" => opts.adaptive = false,
             "--xess-path" => {
                 opts.xess_path = args.next().unwrap_or_else(|| {
                     eprintln!("--xess-path needs a directory argument");
@@ -227,6 +233,8 @@ fn main() {
                 eprintln!("  --xess        start with XeSS-SR dynamic-res upscaling (X toggles; implies DLSS off;");
                 eprintln!("                N cycles the OIDN denoise: off -> pre-upscale -> post-upscale)");
                 eprintln!("  --oidn-post   start XeSS mode with OIDN placed AFTER the upscale (requires --xess)");
+                eprintln!("  --no-adaptive disable the adaptive shading rate in XeSS mode (uniform per-pixel shading;");
+                eprintln!("                visibility is per-pixel either way)");
                 eprintln!("  --xess-path   XeSS DLL directory (default: SDKs\\XeSS-SDK\\bin)");
                 eprintln!("  --gpu-debug   D3D12 debug layer + verbose Streamline logging");
                 eprintln!("  --sl-path     Streamline DLL directory (default: SDKs\\streamline-sdk\\bin\\x64)");
@@ -340,8 +348,13 @@ fn run_check_dlss(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, dump: bool
     let mv_native_ok = mv_check_at(scene, bvh, cam0, 800, 600, if dump { Some("dlss_gbuf") } else { None });
     let (qw, qh) = dlss::headless_render_res(800, 600);
     let mv_quality_ok = mv_check_at(scene, bvh, cam0, qw, qh, None);
+    // Step-wise DRS: an arbitrary quantized size inside a typical RR range —
+    // the varying-res MV/depth/matrix contract (the extent tagging itself is
+    // SL-side and validated interactively; headless stays SL-free).
+    let (dw, dh) = xess::quantize_res(0.55, (800, 600), (266, 200), (800, 600));
+    let mv_drs_ok = mv_check_at(scene, bvh, cam0, dw, dh, None);
 
-    if halton_ok && mv_native_ok && mv_quality_ok {
+    if halton_ok && mv_native_ok && mv_quality_ok && mv_drs_ok {
         eprintln!("DLSS CHECK PASSED");
         0
     } else {
@@ -538,7 +551,35 @@ fn run_check_xess(
             eprintln!("controller climbed inside the deadband");
             pass = false;
         }
-        eprintln!("scale controller: {}", if pass { "OK" } else { "FAIL" });
+        // Step limiter: first target adopts; the dwell holds against both
+        // growth and non-emergency sheds; an emergency may bypass only to
+        // SHED; dwell expiry adopts the current target in one jump.
+        let mut lim = xess::StepLimiter::new();
+        if lim.apply((1280, 720), false) != (1280, 720) {
+            eprintln!("step limiter: first apply did not adopt");
+            pass = false;
+        }
+        if lim.apply((1216, 684), false) != (1280, 720) {
+            eprintln!("step limiter: dwell did not hold a shed");
+            pass = false;
+        }
+        if lim.apply((1408, 792), true) != (1280, 720) {
+            eprintln!("step limiter: emergency bypassed for GROWTH");
+            pass = false;
+        }
+        if lim.apply((960, 540), true) != (960, 540) {
+            eprintln!("step limiter: emergency shed did not bypass");
+            pass = false;
+        }
+        let mut adopted = (0, 0);
+        for _ in 0..=xess::STEP_DWELL {
+            adopted = lim.apply((1152, 648), false);
+        }
+        if adopted != (1152, 648) {
+            eprintln!("step limiter: dwell expiry did not adopt");
+            pass = false;
+        }
+        eprintln!("scale controller + step limiter: {}", if pass { "OK" } else { "FAIL" });
         all_ok &= pass;
     }
 
@@ -2043,13 +2084,52 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     let mut dlss_on = gpu.dlss_ready();
     let (drw, drh) =
         gpu.rr_render_res().map(|(a, b)| (a as usize, b as usize)).unwrap_or((W, H));
-    let gbufs = dlss::GBufs::new(drw, drh);
+    // Step-wise DRS (shares xess::ScaleCtl / quantize_res — pure controller
+    // math common to both upscalers). Steps are made RARE (the quantization
+    // plus the StepLimiter dwell is the hysteresis) because RR re-initializes
+    // its internal denoiser on an input-res change — but a step is a scale
+    // change, not a scene change: the res-step block below does NOT reset
+    // (no dlss_reset, no prev drop; history survives via the extent tags).
+    // A degenerate reported range (min == max) means the driver offers no
+    // DRS — fixed res, no controller.
+    let dlss_range = gpu.rr_res_range();
+    let dlss_drs = dlss_range.map(|(_, min, max)| min != max).unwrap_or(false);
+    let mut dlss_ctl = dlss_range.filter(|_| dlss_drs).map(|(_, min, max)| {
+        let start_h = (H * 2 / 3).clamp(min.1 as usize, max.1 as usize);
+        xess::ScaleCtl::new(start_h, min.1 as usize, max.1 as usize, H)
+    });
+    // G-buffer capacity = the range max; reinterpreted per step via set_res.
+    let mut gbufs = {
+        let (gw, gh) = dlss_range
+            .map(|(_, _, max)| (max.0 as usize, max.1 as usize))
+            .unwrap_or((drw, drh));
+        dlss::GBufs::new(gw.max(drw), gh.max(drh))
+    };
+    gbufs.set_res(drw, drh); // fixed-res default until the controller speaks
     let mut dlss_idx: u32 = 0;
     let mut dlss_prev: Option<dlss::DlssPrev> = None;
     let mut dlss_reset = true;
+    // Applied-step rate limiters, one per DRS path: bound how often the
+    // upscalers take a history hit (see xess::StepLimiter).
+    let mut dlss_lim = xess::StepLimiter::new();
+    let mut xess_lim = xess::StepLimiter::new();
+    // FRUSTRACER_STAB=1: numeric stability meter — every 15th upscaled frame
+    // is read back and diffed against the previous capture; a static camera
+    // on a converged pipeline trends to ~0, temporal instability ("dancing")
+    // shows as a persistently high mean.
+    let stab_on = std::env::var("FRUSTRACER_STAB").is_ok();
+    let mut stab_prev: Option<Vec<u32>> = None;
+    let mut stab_n = 0u32;
     let (dlss_near, dlss_far) = dlss::near_far(scene.diag);
     if dlss_on {
-        eprintln!("dlss: Ray Reconstruction ON (G toggles)");
+        eprintln!(
+            "dlss: Ray Reconstruction ON (G toggles), dynamic resolution {}",
+            if dlss_drs {
+                "ON (step-wise; history survives steps)"
+            } else {
+                "unavailable (degenerate range) — fixed render res"
+            }
+        );
     }
 
     // XeSS-SR state (--xess sessions; X toggles). The all-in "a pixel is a
@@ -2076,7 +2156,10 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     });
     let mut xess_gbufs: Option<dlss::GBufs> = None; // capacity = range max, lazily allocated
     let mut xess_idx: u32 = 0;
-    let mut xess_prev: Option<camera::CamBasis> = None;
+    // The previous frame's CAMERA (not basis): the MV basis is derived at
+    // each frame's own resolution, so it stays correct across DRS steps
+    // without dropping history.
+    let mut xess_prev: Option<Camera> = None;
     let mut xess_reset = true;
     // OIDN placement in XeSS mode (independent of the plain-mode `oidn_on`);
     // xess_hdr is the post-placement's window-res readback staging.
@@ -2084,6 +2167,9 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     let mut xess_hdr: Vec<f32> = Vec::new();
     if xess_on {
         eprintln!("xess: dynamic super-resolution ON (X toggles; N cycles OIDN off/pre/post)");
+        if !opts.adaptive {
+            eprintln!("xess: adaptive shading rate OFF (--no-adaptive; uniform per-pixel shading)");
+        }
     }
 
     // OIDN state — the secondary denoiser (N toggles, mutually exclusive
@@ -2217,7 +2303,14 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
         }
         if edges.toggle_dynamic {
             if dlss_on {
-                eprintln!("dynamic-res is a no-op in DLSS mode (fixed render resolution)");
+                eprintln!(
+                    "dynamic-res in DLSS mode is {}",
+                    if dlss_drs {
+                        "always on (the scale controller drives it, step-wise)"
+                    } else {
+                        "unavailable (driver reported no DRS range)"
+                    }
+                );
             } else if xess_on {
                 eprintln!("dynamic-res is always on in XeSS mode (the scale controller drives it)");
             } else {
@@ -2252,6 +2345,9 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 frame = 0;
                 dlss_reset = true;
                 dlss_prev = None;
+                // Fresh limiter: a re-enabled session adopts the controller's
+                // target immediately instead of dwelling on the stale res.
+                dlss_lim = xess::StepLimiter::new();
                 if dlss_on && oidn_on {
                     oidn_on = false;
                     eprintln!("oidn: OFF (DLSS enabled)");
@@ -2274,6 +2370,9 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 frame = 0;
                 xess_reset = true;
                 xess_prev = None;
+                // Fresh limiter: a re-enabled session adopts the controller's
+                // target immediately instead of dwelling on the stale res.
+                xess_lim = xess::StepLimiter::new();
                 if xess_on && dlss_on {
                     dlss_on = false;
                     dlss_prev = None;
@@ -2440,19 +2539,36 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
         // frame uncapped at RR's fixed render resolution (RR requires clean
         // per-pixel G-buffers) with frame-stationary quality.
         let use_budget = moved && hybrid && dynamic && !upscaled;
+        // Emergency-shed predicate for the step limiters: a badly blown
+        // previous frame may bypass the dwell (shed only, never grow).
+        let blown = last_ms as f32 > 1.5 * RENDER_BUDGET.as_secs_f32() * 1000.0;
         let (rw, rh) = match mode {
+            // Step-wise DRS when the driver reported a range; the fixed
+            // optimal res otherwise. Same controller math as XeSS, with the
+            // step limiter bounding how often RR takes a history hit.
+            RenderMode::Dlss if dlss_drs => {
+                let (_, min, max) = dlss_range.unwrap();
+                let target = xess::quantize_res(
+                    dlss_ctl.as_ref().unwrap().scale(),
+                    (W, H),
+                    (min.0 as usize, min.1 as usize),
+                    (max.0 as usize, max.1 as usize),
+                );
+                dlss_lim.apply(target, blown)
+            }
             RenderMode::Dlss => (drw, drh),
             RenderMode::Xess => {
                 // XeSS mode: dynamic resolution, no block filling — the scale
                 // controller's estimate quantized into the SDK's input range.
                 // Every frame is a full-depth per-pixel trace at this size.
                 let (_, min, max) = xess_range.unwrap();
-                xess::quantize_res(
+                let target = xess::quantize_res(
                     xess_ctl.as_ref().unwrap().scale(),
                     (W, H),
                     (min.0 as usize, min.1 as usize),
                     (max.0 as usize, max.1 as usize),
-                )
+                );
+                xess_lim.apply(target, blown)
             }
             // OIDN mode never drops to half-res: the G-buffers are full-res
             // and a half-res frame renders into a prefix with a different
@@ -2478,10 +2594,29 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
             }
             let g = xess_gbufs.as_mut().unwrap();
             if (g.rw, g.rh) != (rw, rh) {
+                // A step is a scale change, not a scene change: no
+                // reset_history, no prev drop — the MV basis is derived from
+                // the prev CAMERA at each frame's own res, so it stays
+                // correct across the step, and XeSS's DRS carries its
+                // accumulation across extent changes by design. (Resetting
+                // here was the "dancing": every step wiped the history and
+                // the image re-converged patchily.)
                 g.set_res(rw, rh);
-                xess_prev = None;
-                xess_reset = true;
+                eprintln!("xess: drs step -> {rw}x{rh}");
             }
+        }
+        if mode == RenderMode::Dlss && (gbufs.rw, gbufs.rh) != (rw, rh) {
+            // Same contract for RR: rebuild the previous frame's basis and
+            // matrices at the NEW resolution (same pose, new pixel mapping)
+            // so MVs land in current-res pixels; history survives via the
+            // extents. The temporal cache still drops itself via tprev_res —
+            // that one is a correctness contract, not a quality choice.
+            gbufs.set_res(rw, rh);
+            if let Some(p) = &mut dlss_prev {
+                p.basis = p.cam.basis(rw, rh);
+                p.mats = dlss::cam_matrices(&p.cam, rw, rh, dlss_near, dlss_far);
+            }
+            eprintln!("dlss: drs step -> {rw}x{rh}");
         }
         if use_budget != prev_budget {
             frame = 0; // budget frames hold coarse fills — never accumulate onto them
@@ -2530,8 +2665,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
             // the producer/consumer contract holds; the tprev_res check
             // below drops the prev cache across any res step.
             let temporal_on = hybrid
-                && (mode == RenderMode::Xess
-                    || (rw, rh) == if mode == RenderMode::Dlss { (drw, drh) } else { (W, H) });
+                && (upscaled || (rw, rh) == (W, H));
             let (tcache_cur, tcache_prev) = if temporal_on {
                 tcaches[tcur].clear();
                 (
@@ -2581,7 +2715,9 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 },
                 prev_cam: match mode {
                     RenderMode::Dlss => dlss_prev.as_ref().map(|p| p.basis),
-                    RenderMode::Xess => xess_prev,
+                    // Basis derived at THIS frame's res — correct across
+                    // DRS steps by construction.
+                    RenderMode::Xess => xess_prev.map(|c| c.basis(rw, rh)),
                     _ => None,
                 },
                 frame_jitter: match mode {
@@ -2589,10 +2725,16 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                     RenderMode::Xess => Some(dlss::jitter_for(xess_idx)),
                     _ => None,
                 },
-                // Adaptive shading rate rides only on XeSS frames — the
-                // upscaler's temporal accumulation is what launders the
-                // spatially varying sampling.
-                adaptive: mode == RenderMode::Xess,
+                // Adaptive shading rate: XeSS only — its temporal
+                // accumulation launders the spatially varying sampling. On
+                // RR the 2×2-correlated shadow noise and per-frame cell
+                // reclassification presented as patchy "dancing" (RR's
+                // network preserves block-correlated noise as structure
+                // instead of integrating it). Revisit with an RR-friendly
+                // classifier before re-enabling. --no-adaptive forces
+                // uniform per-pixel shading (visibility is per-pixel
+                // either way).
+                adaptive: mode == RenderMode::Xess && opts.adaptive,
             };
             let t = Instant::now();
             if use_budget {
@@ -2638,6 +2780,13 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                     );
                 }
             }
+            if mode == RenderMode::Dlss {
+                // Same controller, DLSS flavor. RR has no CPU pre-pass, so
+                // the trace time alone is the area-proportional cost.
+                if let Some(ctl) = &mut dlss_ctl {
+                    ctl.update(last_ms as f32, RENDER_BUDGET.as_secs_f32() * 1000.0);
+                }
+            }
             frame += 1;
             oidn_seq = oidn_seq.wrapping_add(1);
         } else {
@@ -2668,7 +2817,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
             );
             match gpu.present_rr(&accum, &gbufs, &fc, dlss_idx) {
                 Ok(()) => {
-                    dlss_prev = Some(dlss::DlssPrev { basis: cam.basis(rw, rh), mats });
+                    dlss_prev = Some(dlss::DlssPrev { basis: cam.basis(rw, rh), mats, cam });
                     dlss_reset = false;
                     dlss_idx = dlss_idx.wrapping_add(1);
                 }
@@ -2719,7 +2868,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                     &mut xess_hdr,
                 ) {
                     Ok(()) => {
-                        xess_prev = Some(basis);
+                        xess_prev = Some(cam);
                         xess_reset = false;
                         xess_idx = xess_idx.wrapping_add(1);
                         let octx = oidn_ctx.as_mut().expect("xess_oidn without context");
@@ -2817,7 +2966,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 };
                 match gpu.present_xess(&color, xg, rw, rh, jit, xess_reset, dlss_near, dlss_far) {
                     Ok(()) => {
-                        xess_prev = Some(basis);
+                        xess_prev = Some(cam);
                         xess_reset = false;
                         xess_idx = xess_idx.wrapping_add(1);
                     }
@@ -2924,6 +3073,39 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
             );
             gpu.present_cpu(&present).expect("GPU present failed");
         }
+        // Stability meter (FRUSTRACER_STAB=1): quantifies temporal
+        // instability of the upscaled output — hold the camera still and a
+        // healthy pipeline trends toward ~0; "dancing" holds a high mean.
+        // Reads back the GPU output synchronously; diagnostics only.
+        if stab_on && upscaled && rendered {
+            stab_n = stab_n.wrapping_add(1);
+            if stab_n % 15 == 0 {
+                let cap = if dlss_on { gpu.read_rr_output() } else { gpu.read_xess_output() };
+                if let Ok(px) = cap {
+                    if let Some(prev) = &stab_prev {
+                        if prev.len() == px.len() {
+                            let sum: u64 = px
+                                .iter()
+                                .zip(prev)
+                                .map(|(a, b)| {
+                                    let d = |s: u32| {
+                                        ((a >> s) & 0xff).abs_diff((b >> s) & 0xff) as u64
+                                    };
+                                    d(16) + d(8) + d(0)
+                                })
+                                .sum();
+                            eprintln!(
+                                "stab: mean |Δ| {:.2}/255 over 15 frames (window-res output; render {}x{})",
+                                sum as f64 / (px.len() * 3) as f64,
+                                rw,
+                                rh
+                            );
+                        }
+                    }
+                    stab_prev = Some(px);
+                }
+            }
+        }
         fps_frames += 1;
         if (now - fps_t).as_secs_f64() >= 1.0 {
             fps = fps_frames as f64 / (now - fps_t).as_secs_f64();
@@ -2994,10 +3176,15 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 if hybrid { "hybrid" } else { "plain" },
                 if !dlss_on && !xess_on && hybrid && dynamic { "+dyn" } else { "" },
                 if dlss_on {
-                    // Native render res means the optimal-settings query fell
-                    // back to DLAA; anything smaller is Quality mode.
-                    (if (drw, drh) == (W, H) { " | DLSS: DLAA + RR" } else { " | DLSS: Quality + RR" })
-                        .to_string()
+                    if dlss_drs {
+                        format!(" | DLSS: dyn {}% + RR", rh * 100 / H)
+                    } else if (drw, drh) == (W, H) {
+                        // Native render res means the optimal-settings query
+                        // fell back to DLAA; anything smaller is Quality mode.
+                        " | DLSS: DLAA + RR".to_string()
+                    } else {
+                        " | DLSS: Quality + RR".to_string()
+                    }
                 } else if xess_on {
                     format!(
                         " | XeSS: dyn {}%{}",
@@ -3050,8 +3237,14 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 if hybrid { "hybrid" } else { "plain" },
                 last_ms,
                 stats.summary_line(),
-                if xess_on {
-                    format!(" | xess {}x{} ({}%)", rw, rh, rh * 100 / H)
+                if xess_on || (dlss_on && dlss_drs) {
+                    format!(
+                        " | {} {}x{} ({}%)",
+                        if xess_on { "xess" } else { "dlss-drs" },
+                        rw,
+                        rh,
+                        rh * 100 / H
+                    )
                 } else {
                     String::new()
                 },

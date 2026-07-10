@@ -137,9 +137,12 @@ pub fn halton(mut index: u32, base: u32) -> f32 {
     r
 }
 
-/// Streamline guidance: phase length ≈ 8·(upscale ratio)²; Quality mode
-/// needs 8·1.5² = 18, so 32 covers DLAA through Quality with headroom.
-pub const JITTER_PHASE: u32 = 32;
+/// Streamline guidance: phase length ≈ 8·(upscale ratio)². Both DRS paths
+/// (DLSS-RR and XeSS) can shed to a 3× ratio at their range floor, which
+/// needs 8·3² = 72; a longer phase is benign at shallow ratios (finer
+/// coverage, slower cycle), a too-short one causes convergence artifacts
+/// when the controller parks deep.
+pub const JITTER_PHASE: u32 = 72;
 
 /// Frame-uniform sub-pixel jitter offset in [-0.5, 0.5): the SAME offset is
 /// applied to every pixel of the frame (index 0 of the Halton sequence is
@@ -202,10 +205,15 @@ pub fn cam_matrices(cam: &Camera, rw: usize, rh: usize, near: f32, far: f32) -> 
 /// SEPARATE from the temporal cache's `tprev_basis` on purpose: that one has
 /// its own contract ("the exact basis of the last cache-producing frame") and
 /// is deliberately dropped on non-participating frames. Two variables, two
-/// contracts.
+/// contracts. Carries the previous `Camera` so a DRS step can rebuild the
+/// basis/matrices at the NEW resolution — the pose is unchanged, only the
+/// pixel mapping, which is what keeps MVs in current-res pixels across a
+/// step (dropping prev instead would false-flag whole-frame motion or force
+/// a history reset).
 pub struct DlssPrev {
     pub basis: CamBasis,
     pub mats: CamMatrices,
+    pub cam: Camera,
 }
 
 /// Everything the denoiser needs per frame besides the buffers themselves.

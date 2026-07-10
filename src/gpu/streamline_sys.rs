@@ -77,6 +77,13 @@ pub struct SlShimResourceTag {
     pub state: u32,
     pub buffer_type: u32,
     pub lifecycle: u32,
+    /// Active sub-rect (sl::Extent) for dynamic resolution. All-zero means
+    /// "whole resource" — SL's own null-extent convention, so pre-DRS call
+    /// sites need no flag.
+    pub extent_top: u32,
+    pub extent_left: u32,
+    pub extent_width: u32,
+    pub extent_height: u32,
 }
 
 // sl::Feature ids (sl_core_types.h)
