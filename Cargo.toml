@@ -9,6 +9,14 @@ rayon = "1.10"
 tobj = "4"
 image = "0.25"
 fastrand = "2"
+# CPU profiler (Tracy). Off by default — without `--features tracy` this dep
+# is not even compiled and every prof:: hook is an inert no-op. The crate
+# version pairs 1:1 with a Tracy server (GUI) protocol version — see the
+# Profiling section in CLAUDE.md before bumping either side.
+tracy-client = { version = "0.17.6", optional = true, default-features = false, features = ["enable", "broadcast"] }
+
+[features]
+tracy = ["dep:tracy-client"]
 
 # The interactive presentation stack (SDL2 window + D3D12 + Streamline) is
 # Windows-only; headless --check/--check-dlss build everywhere without it.
@@ -37,3 +45,6 @@ cc = "1"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+# Line tables so samplers (Tracy sampling, PIX timing captures, WPA) can
+# symbolize release frames; no runtime cost.
+debug = "line-tables-only"

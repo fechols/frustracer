@@ -10,6 +10,7 @@
 pub mod adapter;
 pub mod d3d12;
 pub mod dxc;
+pub mod pix;
 pub mod rr;
 pub mod streamline;
 pub mod streamline_sys;
@@ -85,6 +86,28 @@ pub struct GpuContext {
     /// requirement, and what makes Frame Generation possible later).
     /// Declared LAST so slShutdown runs after every proxy is released.
     sl: Option<streamline::SlContext>,
+}
+
+/// The per-frame Streamline sequence shared by the CPU-fed (`present_rr`) and
+/// GPU-fed (`present_trace_rr`) RR paths: token -> constants -> options (the
+/// world<->view matrices feed the SpecularHitDistance path, so they refresh
+/// every frame) -> tags -> evaluate. Same token + viewport 0 throughout; the
+/// jitter sign reported to SL is settled inside shim_constants, nowhere else.
+fn rr_sl_sequence(
+    sl: &streamline::SlContext,
+    rr: &rr::RrResources,
+    list: &ID3D12GraphicsCommandList,
+    fc: &dlss::FrameConstants,
+    frame_idx: u32,
+) -> Result<()> {
+    let _ev = pix::scope(list, c"rr-eval");
+    let list_raw = list.as_raw();
+    let token = sl.new_frame_token(frame_idx)?;
+    sl.set_constants(token, 0, &shim_constants(fc))?;
+    sl.dlssd_set_options(0, &shim_options(fc, rr.ow, rr.oh))?;
+    sl.tag_resources(token, 0, &rr.tags(fc.rw, fc.rh), list_raw)?;
+    sl.evaluate(streamline_sys::FEATURE_DLSS_RR, token, 0, list_raw)?;
+    Ok(())
 }
 
 impl GpuContext {
@@ -395,6 +418,7 @@ impl GpuContext {
     /// or the vanilla reference when `hybrid` is false — the R-key A/B) ->
     /// resolve -> tonemap -> present. `samples` divides the accumulation.
     pub fn present_trace(&mut self, p: &trace::FrameParams, samples: u32, hybrid: bool) -> Result<()> {
+        crate::zone!("present-trace");
         let Some(tg) = &self.trace else {
             return Err("GPU tracer not initialized".into());
         };
@@ -433,6 +457,7 @@ impl GpuContext {
         jitter: (f32, f32),
         reset: bool,
     ) -> Result<()> {
+        crate::zone!("present-trace-xess");
         if self.trace.is_none() || self.xess.is_none() {
             return Err("GPU tracer + XeSS not both initialized".into());
         }
@@ -483,9 +508,12 @@ impl GpuContext {
                 descriptor_heap: std::ptr::null_mut(),
                 descriptor_heap_offset: 0,
             };
-            if let Err(e) = x.ctx.execute(d3d.list.as_raw(), &params) {
-                d3d.abort_frame();
-                return Err(e);
+            {
+                let _ev = pix::scope(&d3d.list, c"xess-eval");
+                if let Err(e) = x.ctx.execute(d3d.list.as_raw(), &params) {
+                    d3d.abort_frame();
+                    return Err(e);
+                }
             }
             unsafe {
                 d3d.list.ResourceBarrier(&[transition(
@@ -709,11 +737,14 @@ impl GpuContext {
             descriptor_heap: std::ptr::null_mut(),
             descriptor_heap_offset: 0,
         };
-        if let Err(e) = x.ctx.execute(self.d3d.list.as_raw(), &params) {
-            // Nothing executed on the GPU yet — abandon the recorded frame so
-            // the caller can fall back to the CPU present path.
-            self.d3d.abort_frame();
-            return Err(e);
+        {
+            let _ev = pix::scope(&self.d3d.list, c"xess-eval");
+            if let Err(e) = x.ctx.execute(self.d3d.list.as_raw(), &params) {
+                // Nothing executed on the GPU yet — abandon the recorded
+                // frame so the caller can fall back to the CPU present path.
+                self.d3d.abort_frame();
+                return Err(e);
+            }
         }
         Ok(slot)
     }
@@ -736,6 +767,7 @@ impl GpuContext {
         near: f32,
         far: f32,
     ) -> Result<()> {
+        crate::zone!("present-xess");
         let slot = self.record_xess_dispatch(color, g, rw, rh, jitter, reset, near, far)?;
         let x = self.xess.as_ref().unwrap();
         unsafe {
@@ -771,6 +803,7 @@ impl GpuContext {
         far: f32,
         out: &mut [f32],
     ) -> Result<()> {
+        crate::zone!("xess-readback");
         let slot = self.record_xess_dispatch(color, g, rw, rh, jitter, reset, near, far)?;
         let x = self.xess.as_ref().unwrap();
         if let Err(e) = x.res.record_readback(&self.d3d) {
@@ -790,6 +823,7 @@ impl GpuContext {
         fc: &dlss::FrameConstants,
         frame_idx: u32,
     ) -> Result<()> {
+        crate::zone!("present-rr");
         let (Some(sl), Some(rr)) = (&self.sl, &self.rr) else {
             return Err("DLSS-RR not initialized".into());
         };
@@ -816,20 +850,7 @@ impl GpuContext {
             )]);
         }
 
-        // Per-frame Streamline sequence: token -> constants -> options (the
-        // world<->view matrices feed the SpecularHitDistance path, so they
-        // refresh every frame) -> tags -> evaluate. Same token + viewport 0
-        // throughout.
-        let list_raw = self.d3d.list.as_raw();
-        let sl_seq = || -> Result<()> {
-            let token = sl.new_frame_token(frame_idx)?;
-            sl.set_constants(token, 0, &shim_constants(fc))?;
-            sl.dlssd_set_options(0, &shim_options(fc, rr.ow, rr.oh))?;
-            sl.tag_resources(token, 0, &rr.tags(fc.rw, fc.rh), list_raw)?;
-            sl.evaluate(streamline_sys::FEATURE_DLSS_RR, token, 0, list_raw)?;
-            Ok(())
-        };
-        if let Err(e) = sl_seq() {
+        if let Err(e) = rr_sl_sequence(sl, rr, &self.d3d.list, fc, frame_idx) {
             // Abandon the recorded-but-unexecuted frame: nothing reached the
             // GPU, so tracked resource states are unchanged, and closing the
             // list lets the next present's begin_frame Reset it. The caller
@@ -866,6 +887,7 @@ impl GpuContext {
         fc: &dlss::FrameConstants,
         frame_idx: u32,
     ) -> Result<()> {
+        crate::zone!("present-trace-rr");
         if self.trace.is_none() || self.sl.is_none() || self.rr.is_none() {
             return Err("GPU tracer + DLSS-RR not both initialized".into());
         }
@@ -900,19 +922,7 @@ impl GpuContext {
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 )]);
             }
-            // The per-frame SL sequence, verbatim from present_rr: token ->
-            // constants -> options -> tags -> evaluate. The jitter sign
-            // reported to SL is settled inside shim_constants, nowhere else.
-            let list_raw = d3d.list.as_raw();
-            let sl_seq = || -> Result<()> {
-                let token = sl.new_frame_token(frame_idx)?;
-                sl.set_constants(token, 0, &shim_constants(fc))?;
-                sl.dlssd_set_options(0, &shim_options(fc, rr.ow, rr.oh))?;
-                sl.tag_resources(token, 0, &rr.tags(fc.rw, fc.rh), list_raw)?;
-                sl.evaluate(streamline_sys::FEATURE_DLSS_RR, token, 0, list_raw)?;
-                Ok(())
-            };
-            if let Err(e) = sl_seq() {
+            if let Err(e) = rr_sl_sequence(sl, rr, &d3d.list, fc, frame_idx) {
                 d3d.abort_frame();
                 return Err(e);
             }
@@ -1011,6 +1021,7 @@ impl GpuContext {
 
     /// M1: present the CPU-tonemapped u32 0RGB frame.
     pub fn present_cpu(&mut self, pixels: &[u32]) -> Result<()> {
+        crate::zone!("present-cpu");
         let slot = self.d3d.begin_frame()?;
         self.blit.record(&self.d3d, slot, pixels);
         self.fullscreen_to_backbuffer(false, tonemap::SRV_SLOT_BLIT, 1.0);
@@ -1019,6 +1030,7 @@ impl GpuContext {
 
     /// M2: present the raw linear-HDR accumulation with the GPU tonemap.
     pub fn present_hdr(&mut self, accum: &[AtomicU32], samples: u32) -> Result<()> {
+        crate::zone!("present-hdr");
         let slot = self.d3d.begin_frame()?;
         self.hdr.record(&self.d3d, slot, accum);
         self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_HDR, 1.0 / samples.max(1) as f32);

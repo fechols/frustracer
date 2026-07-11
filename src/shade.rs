@@ -53,6 +53,20 @@ impl Quality {
         }
     }
 
+    /// The pinned upscaler quality: every DLSS/XeSS/GPU-upscaler frame is a
+    /// fresh 1-spp frame (1 shadow / 1 AO / reflections, fb OFF —
+    /// frame-stationary noise for the temporal integrator to launder);
+    /// presets don't apply. Single-sourced so the contract can't drift
+    /// between the present arms, --spin, and the check gates.
+    pub fn upscaler_1spp() -> Quality {
+        Quality {
+            shadow_samples: 1,
+            ao_samples: 1,
+            reflections: true,
+            fb: FrustumBounce::OFF,
+        }
+    }
+
     /// Cheap variant used while the camera is moving; accumulation converges
     /// the full quality once the camera is still. Frustum bounces stay off
     /// here — they are a still-frame quality feature (v1).

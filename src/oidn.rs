@@ -364,6 +364,7 @@ impl OidnContext {
     /// `staging_color`, which the caller just filled (the accumulation-divide
     /// path — already-final HDR skips the staging copy entirely).
     fn run_filter(&mut self, color: Option<&[f32]>, g: &GBufs, t0: Instant) -> Result<&[f32], String> {
+        crate::zone!("oidn-filter");
         assert_eq!((g.rw, g.rh), (self.w, self.h), "gbuf/filter resolution mismatch");
         let w = self.w;
         let n = self.w * self.h * 3;

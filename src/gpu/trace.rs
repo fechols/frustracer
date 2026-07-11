@@ -1412,6 +1412,7 @@ impl TraceGpu {
     /// Record the vanilla full-screen reference trace (M2; also the on-GPU
     /// reference for the wavefront gates). Ends with a global UAV barrier.
     pub fn record_reference(&self, list: &ID3D12GraphicsCommandList, slot: usize) {
+        let _ev = super::pix::scope(list, c"reference");
         unsafe {
             self.bind_common(list, slot);
             list.SetPipelineState(&self.pso_reference);
@@ -1464,6 +1465,7 @@ impl TraceGpu {
         clear_sentinel: bool,
     ) {
         let fb_mode = fb_mode_of(&p.q);
+        let _ev = super::pix::scope(list, c"wavefront");
         unsafe {
             self.bind_common(list, slot);
             // Seed sees level 0's queue arrangement (qin = A).
@@ -1485,6 +1487,7 @@ impl TraceGpu {
             list.ResourceBarrier(&[uav_barrier(None)]);
 
             for d in 0..self.depth_full {
+                let _ev = super::pix::scope_fmt(list, format_args!("level {d}"));
                 let (in_ctr, out_ctr) = if d % 2 == 0 {
                     (CTR_TILE_A, CTR_TILE_B)
                 } else {
@@ -1513,19 +1516,22 @@ impl TraceGpu {
             }
 
             // Leaf + sky fills (disjoint pixels — no barrier between them).
-            list.SetPipelineState(&self.pso_prep);
-            self.push(list, [CTR_LEAF, NO_RESET, 1, ARG_LEAF]);
-            list.Dispatch(1, 1, 1);
-            self.push(list, [CTR_SKY, NO_RESET, 1, ARG_SKY]);
-            list.Dispatch(1, 1, 1);
-            self.args_to_indirect(list);
-            list.SetPipelineState(&self.pso_leaf);
-            self.push(list, [CTR_LEAF, 0, 0, 0]);
-            list.ExecuteIndirect(&self.cmd_sig, 1, &self.args, ARG_LEAF as u64 * 12, None, 0);
-            list.SetPipelineState(&self.pso_sky);
-            self.push(list, [CTR_SKY, 0, 0, 0]);
-            list.ExecuteIndirect(&self.cmd_sig, 1, &self.args, ARG_SKY as u64 * 12, None, 0);
-            self.args_to_uav(list);
+            {
+                let _ev = super::pix::scope(list, c"leaf+sky");
+                list.SetPipelineState(&self.pso_prep);
+                self.push(list, [CTR_LEAF, NO_RESET, 1, ARG_LEAF]);
+                list.Dispatch(1, 1, 1);
+                self.push(list, [CTR_SKY, NO_RESET, 1, ARG_SKY]);
+                list.Dispatch(1, 1, 1);
+                self.args_to_indirect(list);
+                list.SetPipelineState(&self.pso_leaf);
+                self.push(list, [CTR_LEAF, 0, 0, 0]);
+                list.ExecuteIndirect(&self.cmd_sig, 1, &self.args, ARG_LEAF as u64 * 12, None, 0);
+                list.SetPipelineState(&self.pso_sky);
+                self.push(list, [CTR_SKY, 0, 0, 0]);
+                list.ExecuteIndirect(&self.cmd_sig, 1, &self.args, ARG_SKY as u64 * 12, None, 0);
+                self.args_to_uav(list);
+            }
 
             if fb_mode > 0 {
                 // Every hit pixel appended a shading point; batch over the
@@ -1542,6 +1548,7 @@ impl TraceGpu {
     /// statically recorded batch count; batches past the GPU-side count
     /// dispatch zero groups. Caller must have bind_common'd already.
     fn record_hemi(&self, list: &ID3D12GraphicsCommandList, max_points: u32, fb_depth: u32) {
+        let _ev = super::pix::scope(list, c"hemi");
         let n_batches = max_points.div_ceil(HEMI_BATCH);
         let levels = fb_depth.clamp(2, HEMI_MAX_DEPTH) - 1;
         unsafe {
@@ -1613,6 +1620,7 @@ impl TraceGpu {
 
     /// partial + ambW * ambient(H) -> accum (store-or-add): the single splat.
     fn record_compose(&self, list: &ID3D12GraphicsCommandList) {
+        let _ev = super::pix::scope(list, c"compose");
         unsafe {
             let groups = (self.rw * self.rh).div_ceil(256);
             list.SetPipelineState(&self.pso_compose);
@@ -1762,6 +1770,7 @@ impl TraceGpu {
             FeedKind::Rr => self.pso_feed_rr.as_ref(),
         }
         .ok_or("feed PSO missing (TraceGpu built without gbuf)")?;
+        let _ev = super::pix::scope(list, c"feed");
         unsafe {
             let npsr = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
             let ua = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
@@ -1784,6 +1793,7 @@ impl TraceGpu {
     /// accum -> HDR texture at 1/samples; leaves hdr in PIXEL_SHADER_RESOURCE
     /// for the tonemap PS.
     pub fn record_resolve(&self, list: &ID3D12GraphicsCommandList, slot: usize, samples: u32) {
+        let _ev = super::pix::scope(list, c"resolve");
         unsafe {
             list.ResourceBarrier(&[transition(
                 &self.hdr,

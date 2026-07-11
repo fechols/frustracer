@@ -21,8 +21,17 @@
 //! This is what lets rotation reuse the cache: a panned tile straddling four
 //! old cells gets the min of four same-depth-quality bounds, where a
 //! containment-in-one-cell test (the v1 design) got nothing.
+//!
+//! The consumer holds a RING of previous caches (newest first, each with its
+//! own basis), because claims never go stale in a static scene — a region
+//! that pans off the newest screen and back still has claims in an older
+//! entry. `lookup` retries older entries only on misses whose cause is
+//! pose-specific (off-screen, behind-plane, blown budget); a completed
+//! not-useful min stops the scan — it is pinned by real geometry that no
+//! older cache can claim past.
 
 use crate::camera::CamBasis;
+use crate::frustum::MAX_CUT;
 use crate::render::LEAF_TILE;
 use crate::stats::LocalStats;
 use glam::Vec3A;
@@ -111,14 +120,224 @@ impl TemporalCache {
     }
 }
 
+/// Maximum consecutive adoption hops before a node is forced back onto a
+/// real bound query (which re-extends the claim and re-anchors the cut at
+/// age 0). Claims shrink by δ per hop and adopted cuts inherit the previous
+/// pose's culling, so unbounded chains decay quality — never correctness.
+/// Must stay < 7: age 7 would collide with CutStore's u32::MAX sentinel.
+const MAX_ADOPT_AGE: u32 = 3;
+
+/// Cut-arena budget in u32 per terminal-count unit (see `CutStore::new`).
+const CUT_ARENA_PER_TERMINAL: usize = 8;
+
+/// One producing frame's refined node cuts: for each Split quadtree node,
+/// the exact `refine_cut` output it handed its children — a per-cone PVS of
+/// every BVH subtree with geometry inside that cone (frustum-outside drops
+/// are pure geometry, proven-empty-ball drops contain nothing inside the
+/// cone, and the primary far-clamp is INFINITY, which never drops). Paired
+/// with exactly one TemporalCache generation and consumed only from the
+/// ring's NEWEST entry: a consumer whose direction hull is contained in the
+/// node's cone may skip its bound query and re-refine this cut instead.
+///
+/// Same relaxed-atomic discipline as TemporalCache: each slot written by one
+/// task per frame, read only on a later frame across the pool join.
+pub struct CutStore {
+    /// One packed word per linear-quadtree slot (TemporalCache's offsets
+    /// layout): off:23 | (len−1):6 | age:3. u32::MAX = nothing stored —
+    /// unreachable as a real value because age 7 is never written.
+    idx: Vec<AtomicU32>,
+    arena: Vec<AtomicU32>,
+    top: AtomicU32,
+    offsets: Vec<usize>,
+    pub max_depth: u32,
+}
+
+impl CutStore {
+    pub fn new(rw: usize, rh: usize) -> Self {
+        // Mirror TemporalCache's depth/offsets exactly — a cut is stored at
+        // the same (depth, path) key as its node's claim.
+        let max_depth = ((rw.max(rh) as f32) / LEAF_TILE as f32).log2().ceil() as u32;
+        let mut offsets = Vec::with_capacity(max_depth as usize + 2);
+        let mut total = 0usize;
+        for d in 0..=max_depth + 1 {
+            offsets.push(total);
+            total += 1usize << (2 * d);
+        }
+        // Arena budget: Split nodes number < terminals (branching ≥ 2), and
+        // terminals ≤ ceil(rw/4)·ceil(rh/4) (replay.rs's bound); the mean cut
+        // is ~10 on the default scene. Overflow stores nothing — the
+        // consumer just misses one adoption; counted, never wrong. The off
+        // field's 23 bits address 8M u32 — covers 4K with headroom.
+        let arena_len = rw.div_ceil(4) * rh.div_ceil(4) * CUT_ARENA_PER_TERMINAL;
+        debug_assert!(arena_len < (1 << 23));
+        CutStore {
+            idx: (0..total).map(|_| AtomicU32::new(u32::MAX)).collect(),
+            arena: (0..arena_len).map(|_| AtomicU32::new(0)).collect(),
+            top: AtomicU32::new(0),
+            offsets,
+            max_depth,
+        }
+    }
+
+    /// Reset for a new producing frame.
+    pub fn clear(&self) {
+        for n in &self.idx {
+            n.store(u32::MAX, Relaxed);
+        }
+        self.top.store(0, Relaxed);
+    }
+
+    /// Store a node's refine_cut output. Returns false when the arena is
+    /// full (nothing stored — the caller counts it).
+    pub fn store(&self, depth: u32, path: u32, cut: &[u32], age: u32) -> bool {
+        debug_assert!(!cut.is_empty() && cut.len() <= MAX_CUT && age < 7);
+        if depth > self.max_depth {
+            return true;
+        }
+        let off = self.top.fetch_add(cut.len() as u32, Relaxed) as usize;
+        if off + cut.len() > self.arena.len() {
+            return false;
+        }
+        for (k, &v) in cut.iter().enumerate() {
+            self.arena[off + k].store(v, Relaxed);
+        }
+        let packed = ((off as u32) << 9) | (((cut.len() - 1) as u32) << 3) | age;
+        self.idx[self.offsets[depth as usize] + path as usize].store(packed, Relaxed);
+        true
+    }
+
+    /// (arena offset, cut length, adoption-chain age) for a stored node.
+    fn load(&self, depth: u32, path: u32) -> Option<(u32, u32, u32)> {
+        if depth > self.max_depth {
+            return None;
+        }
+        let v = self.idx[self.offsets[depth as usize] + path as usize].load(Relaxed);
+        if v == u32::MAX {
+            return None;
+        }
+        Some((v >> 9, ((v >> 3) & 63) + 1, v & 7))
+    }
+
+    /// Copy a stored cut into the caller's stack buffer; returns its length.
+    pub fn copy_cut(&self, off: u32, len: u32, out: &mut [u32; MAX_CUT]) -> usize {
+        copy_cut_from(&self.arena, off, len, out)
+    }
+}
+
+/// Copy a cut out of a bump-allocated atomic arena into the caller's stack
+/// buffer; returns its length. Shared by `CutStore` and `replay::ReplayCache`
+/// — the two cut arenas — so bounds handling lives in one place.
+pub fn copy_cut_from(arena: &[AtomicU32], off: u32, len: u32, out: &mut [u32; MAX_CUT]) -> usize {
+    let (off, len) = (off as usize, len as usize);
+    debug_assert!(len <= MAX_CUT && off + len <= arena.len());
+    for k in 0..len {
+        out[k] = arena[off + k].load(Relaxed);
+    }
+    len
+}
+
 /// The result of a temporal probe for one tile.
 pub enum Seed {
     /// Nothing usable — trace exactly as before.
     None,
     /// Proven-empty distance: raise the tile's t_start to this (if larger).
     T(f32),
+    /// The newest cache's region-min COMPLETED at a finite value: real
+    /// geometry pins the cone at ~m, so this tile's bound query cannot
+    /// meaningfully advance (the "blocked" regime, the most common tile
+    /// outcome) — SKIP it. Raise t_start to `t` if larger and refine the
+    /// tile's own inherited cut at that distance; no old data is consumed by
+    /// the refine, so no containment condition exists — the skip is sound
+    /// unconditionally and the min is merely the predictor of when it is
+    /// profitable. `age` chains the skips so MAX_ADOPT_AGE forces a real
+    /// query before the un-advanced claims decay (each hop shrinks by δ).
+    Skip { t: f32, age: u32 },
+    /// Identical basis only: the node's OWN old cut is exactly valid (same
+    /// cone) — skip the bound query AND refine from the stored cut
+    /// (`CutStore::copy_cut(off, len)`), which is already this node's
+    /// tightness rather than its parent's.
+    TCut { t: f32, off: u32, len: u32, age: u32 },
     /// The tile's whole frustum is proven empty — fill sky, zero BVH work.
     Sky,
+}
+
+/// One cache's answer, with the *reason* for a miss — the ring wrapper's
+/// retry policy keys on it.
+enum Probe {
+    Sky,
+    T(f32),
+    Skip { t: f32, age: u32 },
+    TCut { t: f32, off: u32, len: u32, age: u32 },
+    Miss(Miss),
+}
+
+enum Miss {
+    /// An extreme direction projects behind the old image plane.
+    BehindPlane,
+    /// An extreme lands off the old screen — part of the tail has no claim
+    /// in THIS cache; an older cache with a different pose may cover it.
+    OffScreen,
+    /// Region-min visit budget blown (unfinished scan — no claim). A
+    /// different pose shapes a different query region; retrying is cheap
+    /// and bounded at ring-len × VISIT_BUDGET.
+    Budget,
+    /// The min completed but `seed <= t_start`. The min is pinned by real
+    /// nearest geometry along these directions — an older cache faces the
+    /// same geometry and cannot claim past it. The ring must STOP here.
+    NotUseful,
+    /// Unreachable for a validly-produced buffer; skip the entry.
+    NanRoot,
+}
+
+/// Probe a ring of previous-frame caches (newest first, each paired with the
+/// exact basis it was traced with) for the tile's head start. First useful
+/// answer wins; misses retry older entries per the `Miss` policy. Every
+/// entry is a standalone world-space claim (static scene — age cannot stale
+/// it), and each probe is the complete, independent segment-decomposition
+/// query below, so "None, never Sky" survives the retries untouched.
+#[allow(clippy::too_many_arguments)]
+pub fn lookup(
+    ring: &[(&TemporalCache, CamBasis)],
+    cuts: Option<&CutStore>,
+    cam: &CamBasis,
+    rw: usize,
+    rh: usize,
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+    t_start: f32,
+    depth: u32,
+    path: u32,
+    ls: &mut LocalStats,
+) -> Seed {
+    for (age, (prev, prev_cam)) in ring.iter().enumerate() {
+        let hit = |ls: &mut LocalStats| {
+            if age > 0 {
+                ls.temporal_ring_hits += 1;
+                ls.temporal_ring_age_sum += age as u64;
+            }
+        };
+        // Cut adoption consults only the NEWEST entry: older poses have
+        // larger δ (their hulls rarely stay contained) and strictly staler
+        // cuts, and the CutStore is paired with the newest cache generation.
+        let entry_cuts = if age == 0 { cuts } else { None };
+        match probe_one(prev, prev_cam, cam, entry_cuts, rw, rh, x0, y0, x1, y1, t_start, depth, path, ls) {
+            Probe::Sky => {
+                hit(ls);
+                return Seed::Sky;
+            }
+            Probe::T(t) => {
+                hit(ls);
+                return Seed::T(t);
+            }
+            Probe::Skip { t, age } => return Seed::Skip { t, age },
+            Probe::TCut { t, off, len, age } => return Seed::TCut { t, off, len, age },
+            Probe::Miss(Miss::NotUseful) => return Seed::None,
+            Probe::Miss(_) => {}
+        }
+    }
+    Seed::None
 }
 
 /// Probe the previous frame's cache for a head start for the tile at
@@ -155,10 +374,12 @@ pub enum Seed {
 /// seed = (m − δ_safe)·(1 − 1e-4) for δ > 0 (the shrink protects only the δ
 /// subtraction); for δ = 0 the origins are bitwise equal and the claim
 /// transfers exactly: seed = m, no shrink — same as the verbatim path.
-pub fn lookup(
+#[allow(clippy::too_many_arguments)]
+fn probe_one(
     prev: &TemporalCache,
     prev_cam: &CamBasis,
     cam: &CamBasis,
+    cuts: Option<&CutStore>,
     rw: usize,
     rh: usize,
     x0: usize,
@@ -169,11 +390,26 @@ pub fn lookup(
     depth: u32,
     path: u32,
     ls: &mut LocalStats,
-) -> Seed {
+) -> Probe {
     if prev_cam == cam {
         let t = prev.load(depth, path);
         if !t.is_nan() {
-            return if t == f32::INFINITY { Seed::Sky } else { Seed::T(t) };
+            if t == f32::INFINITY {
+                return Probe::Sky;
+            }
+            // Identical basis ⇒ identical cone: the node's OWN old cut is
+            // exactly valid here — the strongest adoption (age-gated so a
+            // chain still re-queries).
+            if let Some(cs) = cuts {
+                match cs.load(depth, path) {
+                    Some((off, len, age)) if age < MAX_ADOPT_AGE => {
+                        return Probe::TCut { t, off, len, age };
+                    }
+                    Some(_) => ls.temporal_adopt_requery += 1,
+                    None => {}
+                }
+            }
+            return Probe::T(t);
         }
         // NaN: below an old sky/capped node — the general query below finds
         // the covering frontier ancestor (δ = 0 → exact transfer).
@@ -215,10 +451,10 @@ pub fn lookup(
     for d in &dirs[..ndirs] {
         let (fx, fy) = match prev_cam.project(*d) {
             Some(p) => p,
-            None => return Seed::None, // behind the old image plane
+            None => return Probe::Miss(Miss::BehindPlane), // behind the old image plane
         };
         if fx < -ACCEPT_PAD || fx > rw as f32 + ACCEPT_PAD || fy < -ACCEPT_PAD || fy > rh as f32 + ACCEPT_PAD {
-            return Seed::None; // part of the tail has no old claim
+            return Probe::Miss(Miss::OffScreen); // part of the tail has no old claim
         }
         bx0 = bx0.min(fx);
         by0 = by0.min(fy);
@@ -238,7 +474,7 @@ pub fn lookup(
     if root_t.is_nan() {
         // Never "contribute nothing": an empty min would read +INF = false
         // sky. (Unreachable for a validly-produced prev buffer.)
-        return Seed::None;
+        return Probe::Miss(Miss::NanRoot);
     }
     // Exact usefulness threshold: m <= bail ⇔ seed <= t_start. Once the
     // running min crosses it, neither a useful seed nor Sky is possible.
@@ -254,16 +490,34 @@ pub fn lookup(
     ls.temporal_tests += 1; // the root load
     let m = match region_min(prev, root_t, 0, 0, (0, 0, rw, rh), q, cap, bail, &mut budget, ls) {
         Some(m) => m,
-        None => return Seed::None, // budget blown: unfinished scan, no claim
+        None => return Probe::Miss(Miss::Budget), // blown: unfinished scan, no claim
     };
     if m == f32::INFINITY {
         // Every overlapped old cone is fully empty (each a None query
         // composed with its inherited ball claim) — so is our whole tail.
         // The [0, t_start] prefix is the inherited claim's, as always.
-        return Seed::Sky;
+        return Probe::Sky;
     }
     let seed = if delta > 0.0 { (m - delta_safe) * (1.0 - 1e-4) } else { m };
-    if seed > t_start { Seed::T(seed) } else { Seed::None }
+    // A COMPLETED finite min predicts the bound query is pinned by real
+    // geometry at ~m and cannot meaningfully advance — skip it (Seed::Skip:
+    // the tile refines its own inherited cut at max(seed, t_start); nothing
+    // old is consumed, so the skip needs no further condition). The age
+    // ledger is keyed by the tile's OWN (depth, path) against the previous
+    // frame's store — both frames share the same rect layout, so the key
+    // tracks this screen region's requery cadence; it governs efficiency
+    // decay only, never correctness. Age-capped (or ledger-less) tiles fall
+    // back to the plain seed / not-useful outcome and run the real query.
+    if let Some(cs) = cuts {
+        match cs.load(depth, path) {
+            Some((_, _, age)) if age >= MAX_ADOPT_AGE => ls.temporal_adopt_requery += 1,
+            found => {
+                let age = found.map_or(0, |(_, _, a)| a);
+                return Probe::Skip { t: seed.max(t_start), age };
+            }
+        }
+    }
+    if seed > t_start { Probe::T(seed) } else { Probe::Miss(Miss::NotUseful) }
 }
 
 /// Min claim over the old cells intersecting query box `q`, descending from

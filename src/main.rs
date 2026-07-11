@@ -21,6 +21,8 @@ mod shade;
 mod shaft;
 mod sphcell;
 mod stats;
+mod prof;
+mod replay;
 mod temporal;
 // The loader half is Windows-only (LoadLibrary); the FFI structs, depth
 // encoding, and the dynamic-res controller are pure and feed --check-xess.
@@ -98,12 +100,30 @@ pub struct Opts {
     /// step-wise dynamic-resolution controller). CLI-only, no runtime
     /// toggle — T prints the locked note.
     pub lock_scale: Option<f32>,
+    /// Master A/B lever (--no-temporal): disable ALL previous-frame quadtree
+    /// reuse — no temporal cache produced or consumed, no claim ring, no cut
+    /// store, no structure replay. Every frame proves its empty space from
+    /// scratch. Default on.
+    pub temporal: bool,
+    /// A/B lever (--no-replay): keep temporal seeding but disable the
+    /// static-frame structure replay (and its recording). Default on.
+    pub replay: bool,
+    /// A/B lever (--no-adopt): keep temporal seeding but disable the
+    /// query skip / cut adoption (and CutStore production). Default on.
+    pub adopt: bool,
     /// GPU-resident tracing (--gpu): the whole quadtree + shading runs in
     /// D3D12 compute with DXR RayQuery rays. Requires the DXC DLL drop and
     /// RT tier 1.1; falls back to the CPU path with a loud line otherwise.
     pub gpu: bool,
     /// Directory holding dxcompiler.dll + dxil.dll.
     pub dxc_path: String,
+    /// PIX Begin/End events on the D3D12 command lists (--pix-markers;
+    /// default off so unprofiled sessions stay byte-identical). Needs
+    /// WinPixEventRuntime.dll under --pix-path; missing DLL = loud line,
+    /// markers stay off.
+    pub pix_markers: bool,
+    /// Directory holding WinPixEventRuntime.dll.
+    pub pix_path: String,
 }
 
 /// OIDN placement in XeSS mode (N cycles off → pre → post). Pre denoises the
@@ -136,6 +156,7 @@ enum RenderMode {
 }
 
 fn main() {
+    prof::init(); // before any zone can fire; inert without --features tracy
     let mut obj: Option<String> = None;
     let mut check = false;
     let mut opts = Opts {
@@ -160,9 +181,16 @@ fn main() {
         xess_autoexposure: false,
         adaptive: true,
         lock_scale: xess::lock_scale("native"),
+        temporal: true,
+        replay: true,
+        adopt: true,
         gpu: false,
         dxc_path: std::env::var("FRUSTRACER_DXC_PATH").unwrap_or_else(|_| {
             concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\dxc\bin\x64").to_string()
+        }),
+        pix_markers: false,
+        pix_path: std::env::var("FRUSTRACER_PIX_PATH").unwrap_or_else(|_| {
+            concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\pix\bin\x64").to_string()
         }),
     };
     let mut check_dlss = false;
@@ -173,6 +201,8 @@ fn main() {
     let mut xess_dump = false;
     let mut check_gpu = false;
     let mut stress: Option<usize> = None;
+    let mut spin: Option<String> = None;
+    let mut spin_frames = 2000u32;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -202,6 +232,31 @@ fn main() {
             "--oidn-post" => opts.oidn_post = true,
             "--xess-autoexposure" => opts.xess_autoexposure = true,
             "--no-adaptive" => opts.adaptive = false,
+            "--no-temporal" => opts.temporal = false,
+            "--no-replay" => opts.replay = false,
+            "--no-adopt" => opts.adopt = false,
+            "--spin" => {
+                spin = Some(args.next().unwrap_or_else(|| {
+                    eprintln!("--spin needs a workload: still | path");
+                    std::process::exit(2);
+                }));
+            }
+            "--spin-frames" => {
+                spin_frames = args
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| {
+                        eprintln!("--spin-frames needs a frame count");
+                        std::process::exit(2);
+                    });
+            }
+            "--pix-markers" => opts.pix_markers = true,
+            "--pix-path" => {
+                opts.pix_path = args.next().unwrap_or_else(|| {
+                    eprintln!("--pix-path needs a directory argument");
+                    std::process::exit(2);
+                });
+            }
             "--xess-path" => {
                 opts.xess_path = args.next().unwrap_or_else(|| {
                     eprintln!("--xess-path needs a directory argument");
@@ -341,6 +396,9 @@ fn main() {
         opts.oidn_post = false;
     }
 
+    // PIX command-list markers: opt-in, runtime-loaded; inert otherwise.
+    gpu::pix::init(&opts.pix_path, opts.pix_markers);
+
     eprintln!("frustracer — loading scene...");
     let scene = match (&obj, stress) {
         (Some(p), _) => scene::load_obj_scene(p),
@@ -363,6 +421,10 @@ fn main() {
         t0.elapsed().as_secs_f64() * 1000.0
     );
 
+    if let Some(mode) = &spin {
+        let code = run_spin(&scene, &bvh, cam0, mode, spin_frames, &opts);
+        std::process::exit(code);
+    }
     if check {
         let code = run_check(&scene, &bvh, cam0, stress.is_none());
         std::process::exit(code);
@@ -525,12 +587,15 @@ fn run_check_gpu(
             stats: &stats,
             sun: render::sun_dir(scene),
             tcache_cur: None,
-            tcache_prev: None,
+            tcache_prev: &[],
             accumulate: true,
             gbuf: None,
             prev_cam: None,
             frame_jitter: None,
             adaptive: false,
+            replay_rec: None,
+            cut_cur: None,
+            cut_prev: None,
         };
         render::render_frame(&ctx, false);
     };
@@ -1154,12 +1219,7 @@ fn run_check_gpu(
             ptg.scene.free_staging();
         }
         let (near, far) = dlss::near_far(scene.diag);
-        let uq = Quality {
-            shadow_samples: 1,
-            ao_samples: 1,
-            reflections: true,
-            fb: shade::FrustumBounce::OFF,
-        };
+        let uq = Quality::upscaler_1spp();
         // One fresh 1-spp wavefront frame at the upscaler contract
         // (accumulate off, frame-uniform zero jitter), pack read back into a
         // CPU GBufs so the CPU gate consumes it unmodified. Returns the pack
@@ -1697,12 +1757,15 @@ fn run_check_gpu(
                 stats: &stats2,
                 sun: render::sun_dir(scene),
                 tcache_cur: None,
-                tcache_prev: None,
+                tcache_prev: &[],
                 accumulate: true,
                 gbuf: None,
                 prev_cam: None,
                 frame_jitter: None,
                 adaptive: false,
+                replay_rec: None,
+                cut_cur: None,
+                cut_prev: None,
             };
             let t0 = Instant::now();
             render::render_frame(&ctx, true);
@@ -1808,12 +1871,15 @@ fn mv_check_at(
                 stats: &stats,
                 sun: render::sun_dir(scene),
                 tcache_cur: None,
-                tcache_prev: None,
+                tcache_prev: &[],
                 accumulate: false,
                 gbuf: Some(g),
                 prev_cam: prev,
                 frame_jitter: Some((0.0, 0.0)),
                 adaptive: false,
+                replay_rec: None,
+                cut_cur: None,
+                cut_prev: None,
             };
             render::render_frame(&ctx, true);
         };
@@ -2261,12 +2327,15 @@ fn run_check_xess(
                     stats,
                     sun: render::sun_dir(scene),
                     tcache_cur: None,
-                    tcache_prev: None,
+                    tcache_prev: &[],
                     accumulate: true,
                     gbuf: Some(&g),
                     prev_cam: None,
                     frame_jitter: Some(dlss::jitter_for(f)),
                     adaptive,
+                    replay_rec: None,
+                    cut_cur: None,
+                    cut_prev: None,
                 };
                 render::render_frame(&ctx, true);
             }
@@ -2451,12 +2520,15 @@ fn run_check_oidn(
             stats: &stats,
             sun: render::sun_dir(scene),
             tcache_cur: None,
-            tcache_prev: None,
+            tcache_prev: &[],
             accumulate: true,
             gbuf: Some(&g),
             prev_cam: None,
             frame_jitter: None,
             adaptive: false,
+            replay_rec: None,
+            cut_cur: None,
+            cut_prev: None,
         };
         render::render_frame(&ctx, true);
     };
@@ -2594,12 +2666,15 @@ fn run_check_oidn(
             stats: &stats,
             sun: render::sun_dir(scene),
             tcache_cur: None,
-            tcache_prev: None,
+            tcache_prev: &[],
             accumulate: false,
             gbuf: Some(&g),
             prev_cam: None,
             frame_jitter: None,
             adaptive: false,
+            replay_rec: None,
+            cut_cur: None,
+            cut_prev: None,
         };
         match cap {
             Some(d) => render::render_frame_capped(&ctx, d),
@@ -2777,12 +2852,15 @@ fn run_check_oidn(
                 stats: &stats,
                 sun: render::sun_dir(scene),
                 tcache_cur: None,
-                tcache_prev: None,
+                tcache_prev: &[],
                 accumulate: true,
                 gbuf: Some(&g),
                 prev_cam: None,
                 frame_jitter: None,
                 adaptive: false,
+                replay_rec: None,
+                cut_cur: None,
+                cut_prev: None,
             };
             render::render_frame(&ctx, true);
         }
@@ -2972,6 +3050,298 @@ fn px_seed(x: usize, y: usize, s: u64) -> u64 {
         .wrapping_add(s)
 }
 
+/// Centripetal-free (uniform) Catmull-Rom through p1..p2 at t ∈ [0, 1).
+fn catmull_rom(p0: Vec3A, p1: Vec3A, p2: Vec3A, p3: Vec3A, t: f32) -> Vec3A {
+    ((p1 * 2.0)
+        + (p2 - p0) * t
+        + (p0 * 2.0 - p1 * 5.0 + p2 * 4.0 - p3) * (t * t)
+        + (p1 * 3.0 - p0 - p2 * 3.0 + p3) * (t * t * t))
+        * 0.5
+}
+
+/// Frames per full lap of the benchmark path.
+const SPIN_LAP: f32 = 600.0;
+
+/// Deterministic benchmark camera: a CLOSED-loop Catmull-Rom spline keyed
+/// relative to cam0 (offsets in units of scene.diag along cam0's
+/// forward/right/world-up, plus yaw/pitch offsets). The pose is a pure
+/// function of the frame index — no wall clock — so runs are bit-repeatable
+/// and A/B-comparable. The loop mixes dolly, strafe, climb, and yaw sweeps
+/// and returns near its start each lap, so every temporal regime (seeds,
+/// query skips, off-screen ring retries, pan-back) is exercised per lap.
+fn spin_path_pose(cam0: &Camera, diag: f32, frame: u32) -> Camera {
+    // (fwd, right, up) offsets /diag, yaw offset, pitch offset.
+    const KEYS: [([f32; 3], f32, f32); 6] = [
+        ([0.00, 0.00, 0.00], 0.00, 0.00),
+        ([0.08, 0.03, 0.01], 0.10, -0.03),
+        ([0.12, -0.02, 0.03], -0.15, 0.02),
+        ([0.05, -0.09, 0.02], -0.35, 0.05),
+        ([-0.02, -0.04, 0.04], -0.10, 0.08),
+        ([-0.01, 0.02, 0.01], 0.05, 0.02),
+    ];
+    let n = KEYS.len() as isize;
+    let fwd = cam0.forward();
+    let right = fwd.cross(Vec3A::Y).normalize();
+    let t = frame as f32 * (KEYS.len() as f32 / SPIN_LAP);
+    let seg = t.floor() as isize;
+    let u = t.fract();
+    let key = |i: isize| {
+        let (o, yw, pt) = KEYS[((seg + i).rem_euclid(n)) as usize];
+        (
+            (fwd * o[0] + right * o[1] + Vec3A::Y * o[2]) * diag,
+            Vec3A::new(yw, pt, 0.0),
+        )
+    };
+    let (p0, a0) = key(-1);
+    let (p1, a1) = key(0);
+    let (p2, a2) = key(1);
+    let (p3, a3) = key(2);
+    let pos = catmull_rom(p0, p1, p2, p3, u);
+    let ang = catmull_rom(a0, a1, a2, a3, u);
+    Camera {
+        pos: cam0.pos + pos,
+        yaw: cam0.yaw + ang.x,
+        pitch: cam0.pitch + ang.y,
+        fov_y: cam0.fov_y,
+    }
+}
+
+/// Ring depth: the last TRING producing frames' caches stay consultable.
+const TRING: usize = 3;
+
+/// The temporal claim ring's per-frame state machine — the last `TRING`
+/// producing frames' caches (+ the basis each traced with, newest first;
+/// older entries answer regions that panned off the newest screen and back —
+/// a claim never goes stale in a static scene, only wrong-basis/wrong-res
+/// pairing could hurt, so each entry carries its basis and the whole ring
+/// drops on a res change), plus the cut stores double-buffered in lockstep:
+/// cur is produced this frame, prev pairs with ring[0] — the SAME frame,
+/// same basis, by construction (producing frames update both, replay frames
+/// freeze both, res changes / non-participating frames drop both).
+///
+/// Shared by the interactive loop and --spin so the benchmark can never
+/// drift from the pipeline it claims to measure: `begin` before the render
+/// hands out the borrows FrameCtx needs, `end` after it rotates (producing
+/// frame) or drops (non-participating frame) the ring. Replay frames call
+/// neither — the ring freezes, per the temporal contract.
+struct TemporalRing {
+    /// TRING + 1 buffers so a victim always exists outside the ring.
+    caches: Vec<temporal::TemporalCache>,
+    cutstores: [temporal::CutStore; 2],
+    ring: Vec<(usize, camera::CamBasis)>,
+    /// Res the ring's claims were traced at.
+    res: (usize, usize),
+    cut_cur_i: usize,
+    cut_prev_ok: bool,
+    victim: usize,
+}
+
+impl TemporalRing {
+    fn new(rw: usize, rh: usize) -> Self {
+        TemporalRing {
+            caches: (0..TRING + 1).map(|_| temporal::TemporalCache::new(rw, rh)).collect(),
+            cutstores: [temporal::CutStore::new(rw, rh), temporal::CutStore::new(rw, rh)],
+            ring: Vec::new(),
+            res: (0, 0),
+            cut_cur_i: 0,
+            cut_prev_ok: false,
+            victim: usize::MAX,
+        }
+    }
+
+    /// Producing-frame setup: drop all entries on a res change (claims are
+    /// consumed at the res they were traced at — the documented contract),
+    /// pick a victim buffer outside the ring and clear it, clear the current
+    /// cut store, and hand out the borrows FrameCtx needs — the current
+    /// cache, the ring (newest first), and the (cur, prev) cut pair (prev
+    /// only when the last frame produced one and the ring is nonempty).
+    #[allow(clippy::type_complexity)]
+    fn begin(
+        &mut self,
+        temporal_on: bool,
+        adopt: bool,
+        rw: usize,
+        rh: usize,
+    ) -> (
+        Option<&temporal::TemporalCache>,
+        Vec<(&temporal::TemporalCache, camera::CamBasis)>,
+        Option<&temporal::CutStore>,
+        Option<&temporal::CutStore>,
+    ) {
+        if !temporal_on {
+            return (None, Vec::new(), None, None);
+        }
+        zone!("temporal-admin"); // MB-scale cache clear + ring build
+        if self.res != (rw, rh) {
+            self.ring.clear();
+            self.cut_prev_ok = false;
+            self.res = (rw, rh);
+        }
+        self.victim =
+            (0..self.caches.len()).find(|i| !self.ring.iter().any(|(j, _)| j == i)).unwrap();
+        self.caches[self.victim].clear();
+        let (cut_cur, cut_prev) = if adopt {
+            zone!("cutstore-clear");
+            self.cutstores[self.cut_cur_i].clear();
+            (
+                Some(&self.cutstores[self.cut_cur_i]),
+                if self.cut_prev_ok && !self.ring.is_empty() {
+                    Some(&self.cutstores[self.cut_cur_i ^ 1])
+                } else {
+                    None
+                },
+            )
+        } else {
+            (None, None)
+        };
+        let mut tprev = Vec::with_capacity(self.ring.len());
+        for &(i, b) in &self.ring {
+            tprev.push((&self.caches[i], b));
+        }
+        (Some(&self.caches[self.victim]), tprev, cut_cur, cut_prev)
+    }
+
+    /// Post-render bookkeeping for a NON-replay frame. Producing frame: the
+    /// victim becomes the newest ring entry (the oldest rotates out and
+    /// becomes the next frame's victim) and the cut store flips in lockstep
+    /// so prev always pairs with ring[0] — only a produced store may pair.
+    /// Non-participating frame (plain / half-res): the ring drops wholesale
+    /// — the old `tprev_ok = false` contract.
+    fn end(&mut self, temporal_on: bool, adopt: bool, basis: camera::CamBasis) {
+        if temporal_on {
+            self.ring.insert(0, (self.victim, basis));
+            self.ring.truncate(TRING);
+            self.cut_prev_ok = adopt;
+            self.cut_cur_i ^= 1;
+        } else {
+            self.ring.clear();
+            self.cut_prev_ok = false;
+        }
+    }
+}
+
+/// Headless deterministic workload driver (--spin still|path): replicates
+/// the interactive frame contract — the replay/trace arm split, temporal
+/// ring rotation, cut-store pairing, recording gate — at the interactive
+/// native res with the 1-spp upscaler quality and free-running Halton
+/// jitter, but with no window, no denoiser, and no wall-clock dependence in
+/// the workload. Composes with --no-temporal/--no-replay/--no-adopt, which
+/// makes it both the profiling target (attach Tracy or a sampler) and the
+/// reproducible benchmark for caching A/Bs. Prints a mean-ms summary
+/// (warmup excluded) and the per-phase counters.
+fn run_spin(
+    scene: &scene::Scene,
+    bvh: &bvh::Bvh,
+    cam0: Camera,
+    mode: &str,
+    frames: u32,
+    opts: &Opts,
+) -> i32 {
+    let moving = match mode {
+        "still" => false,
+        "path" => true,
+        _ => {
+            eprintln!("--spin: unknown workload {mode} (use still | path)");
+            return 2;
+        }
+    };
+    if opts.gpu {
+        eprintln!("--spin: drives the CPU renderer only; ignoring --gpu");
+    }
+    let (rw, rh) = (W, H);
+    let q = Quality::upscaler_1spp();
+    let stats = Stats::default();
+    let accum: Vec<AtomicU32> = (0..rw * rh * 3).map(|_| AtomicU32::new(0)).collect();
+    let info: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
+    let tbuf: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
+    let mut tr = TemporalRing::new(rw, rh);
+    let replay_cache = replay::ReplayCache::new(rw, rh);
+    let mut replay_key: Option<camera::CamBasis> = None;
+
+    eprintln!(
+        "spin {mode}: {frames} frames at {rw}x{rh}, 1-spp quality | temporal {} replay {} adopt {} | pid {}",
+        opts.temporal, opts.replay, opts.adopt, std::process::id()
+    );
+    const WARMUP: u32 = 20;
+    let mut total_ms = 0.0f64;
+    let mut peak_ms = 0.0f64;
+    let mut replay_frames = 0u64;
+    let mut window = Instant::now();
+    for idx in 0..frames {
+        let cam = if moving { spin_path_pose(&cam0, scene.diag, idx) } else { cam0 };
+        let basis = cam.basis(rw, rh);
+        let can_replay =
+            opts.temporal && opts.replay && replay_key.as_ref().is_some_and(|b| *b == basis);
+        let record = opts.temporal && opts.replay && !can_replay;
+        if record {
+            replay_cache.begin(rw, rh);
+        }
+        let temporal_on = opts.temporal && !can_replay;
+        let (tcache_cur, tprev_vec, cut_cur, cut_prev) =
+            tr.begin(temporal_on, opts.adopt, rw, rh);
+        let ctx = FrameCtx {
+            scene,
+            bvh,
+            cam: basis,
+            q,
+            frame: idx,
+            jitter: false,
+            rw,
+            rh,
+            accum: &accum,
+            info: &info,
+            tbuf: &tbuf,
+            stats: &stats,
+            sun: render::sun_dir(scene),
+            tcache_cur,
+            tcache_prev: &tprev_vec,
+            accumulate: false,
+            gbuf: None,
+            prev_cam: None,
+            frame_jitter: Some(dlss::jitter_for(idx)),
+            adaptive: false,
+            replay_rec: if record { Some(&replay_cache) } else { None },
+            cut_cur,
+            cut_prev,
+        };
+        let t = Instant::now();
+        if can_replay {
+            render::render_frame_replay(&ctx, &replay_cache);
+            replay_frames += 1;
+        } else {
+            render::render_frame(&ctx, true);
+        }
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        prof::frame_mark();
+        if !can_replay {
+            tr.end(temporal_on, opts.adopt, basis);
+            replay_key = if record && replay_cache.valid() { Some(basis) } else { None };
+        }
+        if idx >= WARMUP {
+            total_ms += ms;
+            peak_ms = peak_ms.max(ms);
+        }
+        if (idx + 1) % 200 == 0 {
+            eprintln!(
+                "spin {mode} [{:4}]: {:6.2} ms/frame over the last 200 | {}",
+                idx + 1,
+                window.elapsed().as_secs_f64() * 1000.0 / 200.0,
+                stats.summary_line()
+            );
+            stats.clear();
+            window = Instant::now();
+        }
+    }
+    let timed = frames.saturating_sub(WARMUP).max(1) as f64;
+    eprintln!(
+        "spin {mode} summary: {:.2} ms/frame mean (peak {:.2}) over {} timed frames | replay frames {replay_frames}",
+        total_ms / timed,
+        peak_ms,
+        timed as u64,
+    );
+    0
+}
+
 /// Headless end-to-end check: correctness counters (must be 0), an A/B
 /// benchmark of hybrid vs plain, and a rendered check.png. `structural`
 /// additionally gates the scene-topology assertions (coarse pixels at fixed
@@ -3013,7 +3383,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
     };
 
-    let rep = render::verify(scene, bvh, &cam, q, rw, rh, &stats, None, None);
+    let rep = render::verify(scene, bvh, &cam, q, rw, rh, &stats, None, &[], None);
     eprintln!(
         "verify full-depth ({} px): false-sky {} | tmin-overshoot {} | hybrid-extra {} | max rel t err {:.2e}",
         rep.pixels, rep.false_sky, rep.overshoot, rep.hybrid_extra, rep.max_rel_err
@@ -3025,7 +3395,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     // must still match the reference exactly, and both coarse pixels and
     // samples must exist (deterministic — no wall clock involved).
     let smp0 = stats.coarse_samples.load(Relaxed);
-    let rep_c = render::verify(scene, bvh, &cam, q, rw, rh, &stats, Some(4), None);
+    let rep_c = render::verify(scene, bvh, &cam, q, rw, rh, &stats, Some(4), &[], None);
     let smp_c = stats.coarse_samples.load(Relaxed) - smp0;
     eprintln!(
         "verify capped d=4 ({} px): false-sky {} | tmin-overshoot {} | hybrid-extra {} | max rel t err {:.2e} | coarse px {} samples {}",
@@ -3382,12 +3752,15 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             stats: &stats,
             sun: render::sun_dir(scene),
             tcache_cur: None,
-            tcache_prev: None,
+            tcache_prev: &[],
             accumulate: true,
             gbuf: None,
             prev_cam: None,
             frame_jitter: None,
             adaptive: false,
+            replay_rec: None,
+            cut_cur: None,
+            cut_prev: None,
         };
         let t = Instant::now();
         for _ in 0..BENCH_FRAMES {
@@ -3429,12 +3802,15 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             stats: &stats,
             sun: render::sun_dir(scene),
             tcache_cur: None,
-            tcache_prev: None,
+            tcache_prev: &[],
             accumulate: true,
             gbuf: None,
             prev_cam: None,
             frame_jitter: None,
             adaptive: false,
+            replay_rec: None,
+            cut_cur: None,
+            cut_prev: None,
         };
         let t = Instant::now();
         render::render_frame_capped(&ctx, cap);
@@ -3451,6 +3827,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     // reference-ray treatment, so a bad seed surfaces as false-sky/overshoot.
     // All deterministic — no wall clock.
     let tcache = temporal::TemporalCache::new(rw, rh);
+    let cuts_a = temporal::CutStore::new(rw, rh);
     {
         let ctx = FrameCtx {
             scene,
@@ -3467,24 +3844,31 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             stats: &stats,
             sun: render::sun_dir(scene),
             tcache_cur: Some(&tcache),
-            tcache_prev: None,
+            tcache_prev: &[],
+            // Produced in lockstep with the claim cache: the T passes below
+            // consume it with adoption on, so every adopted cut faces the
+            // per-pixel reference re-trace.
             accumulate: true,
             gbuf: None,
             prev_cam: None,
             frame_jitter: None,
             adaptive: false,
+            replay_rec: None,
+            cut_cur: Some(&cuts_a),
+            cut_prev: None,
         };
         render::render_frame(&ctx, true);
     }
     let mut temporal_ok = true;
-    let mut temporal_pass = |label: &str, basis: &camera::CamBasis, max_depth: Option<u32>, want_seeds: bool, want_sky: bool| {
+    let mut temporal_pass = |label: &str, basis: &camera::CamBasis, max_depth: Option<u32>, want_seeds: bool, want_sky: bool, want_adopts: bool| {
         stats.clear();
-        let rep = render::verify(scene, bvh, basis, q, rw, rh, &stats, max_depth, Some((&tcache, cam)));
+        let rep = render::verify(scene, bvh, basis, q, rw, rh, &stats, max_depth, &[(&tcache, cam)], Some(&cuts_a));
         let seeds = stats.temporal_seeds.load(Relaxed);
         let sky = stats.temporal_sky_tiles.load(Relaxed);
         let tests = stats.temporal_tests.load(Relaxed);
+        let adopts = stats.temporal_cut_adopts.load(Relaxed);
         eprintln!(
-            "verify temporal {label} ({} px): false-sky {} | tmin-overshoot {} | hybrid-extra {} | max rel t err {:.2e} | seeds {seeds} sky-tiles {sky} cells {tests} coarse px {}",
+            "verify temporal {label} ({} px): false-sky {} | tmin-overshoot {} | hybrid-extra {} | max rel t err {:.2e} | seeds {seeds} sky-tiles {sky} cells {tests} adopts {adopts} coarse px {}",
             rep.pixels, rep.false_sky, rep.overshoot, rep.hybrid_extra, rep.max_rel_err, rep.coarse
         );
         let mut ok = rep.ok();
@@ -3496,6 +3880,10 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             eprintln!("verify temporal {label}: expected temporal sky-tiles > 0 — the sky path didn't fire");
             ok = false;
         }
+        if structural && want_adopts && adopts == 0 {
+            eprintln!("verify temporal {label}: expected cut adoptions > 0 — the adoption path didn't fire");
+            ok = false;
+        }
         if structural && max_depth.is_some() && rep.coarse == 0 {
             eprintln!("verify temporal {label}: expected coarse pixels, found none — capped path not exercised");
             ok = false;
@@ -3503,8 +3891,9 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         temporal_ok &= ok;
     };
     // T1: identical basis — the static-accumulation fast path. Every sky tile
-    // must come from the cache and at least one node must seed.
-    temporal_pass("static", &cam, None, true, true);
+    // must come from the cache, at least one node must seed, and the verbatim
+    // cut-adoption arm must fire (identical cone ⇒ own old cut valid).
+    temporal_pass("static", &cam, None, true, true, true);
     // T2: pure forward dolly. Seeds must fire (the root, at minimum: its
     // extreme dirs are the old corners ± fp on the old screen boundary plus
     // the focus of expansion). Sky is NOT asserted: at this δ the λ_max tilt
@@ -3513,16 +3902,18 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     let mut cam_b = cam0;
     cam_b.pos += cam0.forward() * (0.02 * scene.diag);
     let basis_b = cam_b.basis(rw, rh);
-    temporal_pass("dolly", &basis_b, None, true, false);
+    // Under motion adoption must also fire (the blocked-regime cut-only
+    // adoption: tilt-widened hulls land in ancestor cells).
+    temporal_pass("dolly", &basis_b, None, true, false, true);
     // T3: the same dolly through the depth-capped driver (the root's seed is
     // cap-independent).
-    temporal_pass("dolly capped d=4", &basis_b, Some(4), true, false);
+    temporal_pass("dolly capped d=4", &basis_b, Some(4), true, false, false);
     // T4: translate + rotate — the root leaves the old screen and this
     // scene's finite bound landscape is single-valued (the ground AABB blocks
     // everything at one distance), so only correctness is asserted.
     let mut cam_c = cam_b;
     cam_c.yaw += 0.05;
-    temporal_pass("dolly+yaw", &cam_c.basis(rw, rh), None, false, false);
+    temporal_pass("dolly+yaw", &cam_c.basis(rw, rh), None, false, false, false);
     // T5: pure rotation — the region-min query's structural win: δ = 0, the
     // old proven-empty balls are unchanged in world space, and panned-into
     // sky tiles overlap only old sky cells → free. Seeds are NOT asserted:
@@ -3530,16 +3921,17 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     let mut cam_y = cam0;
     cam_y.yaw += 0.05;
     let basis_y = cam_y.basis(rw, rh);
-    temporal_pass("yaw", &basis_y, None, false, true);
+    temporal_pass("yaw", &basis_y, None, false, true, false);
 
     // Informational A/B: static (the accumulation-frame path) and pure yaw
     // (the rotation path), each cold vs seeded. Not gated — the win is
     // scene-dependent.
+    let warm = [(&tcache, cam)];
     for (label, basis, prev) in [
-        ("static cold", cam, None),
-        ("static warm", cam, Some((&tcache, cam))),
-        ("yaw cold   ", basis_y, None),
-        ("yaw warm   ", basis_y, Some((&tcache, cam))),
+        ("static cold", cam, &warm[..0]),
+        ("static warm", cam, &warm[..]),
+        ("yaw cold   ", basis_y, &warm[..0]),
+        ("yaw warm   ", basis_y, &warm[..]),
     ] {
         stats.clear();
         let ctx = FrameCtx {
@@ -3563,6 +3955,9 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             prev_cam: None,
             frame_jitter: None,
             adaptive: false,
+            replay_rec: None,
+            cut_cur: None,
+            cut_prev: None,
         };
         let t = Instant::now();
         render::render_frame(&ctx, true);
@@ -3577,7 +3972,482 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         );
     }
 
-    if sph_ok && reproj_ok && hemi_ok && gi_ok && shaft_ok && rep.ok() && capped_ok && temporal_ok {
+    // Structure replay (replay.rs): record one producing frame, then prove a
+    // replay is indistinguishable from a fresh trace — tbuf, info, AND accum
+    // bit-identical — first on the recording frame itself (frame 0,
+    // unjittered) and then on a warm jittered frame 1 through the interactive
+    // wiring shape (which also proves the terminal structure is stable under
+    // a warm identical-basis re-trace, the property the interactive replay
+    // relies on). Plus exact terminal pixel accounting, must-fire counts, and
+    // a post-replay dolly verify against the untouched producer cache (the
+    // frozen-prev contract). All deterministic.
+    let mut replay_ok = true;
+    {
+        let rcache = replay::ReplayCache::new(rw, rh);
+        let tcache_p = temporal::TemporalCache::new(rw, rh);
+        let warm_p = [(&tcache_p, cam)];
+        let alloc3 = || (0..rw * rh * 3).map(|_| AtomicU32::new(0)).collect::<Vec<_>>();
+        let alloc1 = || (0..rw * rh).map(|_| AtomicU32::new(0)).collect::<Vec<_>>();
+        let bits_differ = |a: &[AtomicU32], b: &[AtomicU32]| {
+            a.iter().zip(b).filter(|(x, y)| x.load(Relaxed) != y.load(Relaxed)).count()
+        };
+        let (accum_p, info_p, tbuf_p) = (alloc3(), alloc1(), alloc1());
+        rcache.begin(rw, rh);
+        {
+            let ctx = FrameCtx {
+                scene,
+                bvh,
+                cam,
+                q,
+                frame: 0,
+                jitter: false,
+                rw,
+                rh,
+                accum: &accum_p,
+                info: &info_p,
+                tbuf: &tbuf_p,
+                stats: &stats,
+                sun: render::sun_dir(scene),
+                tcache_cur: Some(&tcache_p),
+                tcache_prev: &[],
+                accumulate: true,
+                gbuf: None,
+                prev_cam: None,
+                frame_jitter: None,
+                adaptive: false,
+                replay_rec: Some(&rcache),
+                cut_cur: None,
+                cut_prev: None,
+            };
+            render::render_frame(&ctx, true);
+        }
+        let (nl, ns) = rcache.counts();
+        let (leaf_px, sky_px) = rcache.accounting();
+        eprintln!(
+            "replay record: valid {} | leaves {nl} ({leaf_px} px) + sky {ns} ({sky_px} px) = {} px (screen {} px)",
+            rcache.valid(),
+            leaf_px + sky_px,
+            (rw * rh) as u64,
+        );
+        if !rcache.valid() || leaf_px + sky_px != (rw * rh) as u64 {
+            eprintln!("replay record: invalid recording or terminals don't partition the screen");
+            replay_ok = false;
+        }
+        if structural && (nl == 0 || ns == 0) {
+            eprintln!("replay record: expected both leaves and sky terminals > 0 — a path didn't fire");
+            replay_ok = false;
+        }
+        // Same-seed replay of frame 0 vs the recording frame itself.
+        let (accum_r, info_r, tbuf_r) = (alloc3(), alloc1(), alloc1());
+        {
+            let ctx = FrameCtx {
+                scene,
+                bvh,
+                cam,
+                q,
+                frame: 0,
+                jitter: false,
+                rw,
+                rh,
+                accum: &accum_r,
+                info: &info_r,
+                tbuf: &tbuf_r,
+                stats: &stats,
+                sun: render::sun_dir(scene),
+                tcache_cur: None,
+                tcache_prev: &[],
+                accumulate: true,
+                gbuf: None,
+                prev_cam: None,
+                frame_jitter: None,
+                adaptive: false,
+                replay_rec: None,
+                cut_cur: None,
+                cut_prev: None,
+            };
+            render::render_frame_replay(&ctx, &rcache);
+        }
+        let (dt, di, da) = (
+            bits_differ(&tbuf_p, &tbuf_r),
+            bits_differ(&info_p, &info_r),
+            bits_differ(&accum_p, &accum_r),
+        );
+        eprintln!("replay bit-identity (frame 0): tbuf {dt} | info {di} | accum {da} px differ");
+        if dt + di + da > 0 {
+            replay_ok = false;
+        }
+        // Warm frame 1 (the interactive shape: jittered, consuming the
+        // producer cache) traced fresh vs replayed from frame 0's structure.
+        // Both accumulate onto zeroed buffers, so accum stays comparable.
+        let (accum_f, info_f, tbuf_f) = (alloc3(), alloc1(), alloc1());
+        let (accum_r1, info_r1, tbuf_r1) = (alloc3(), alloc1(), alloc1());
+        for (bufs, fresh) in [((&accum_f, &info_f, &tbuf_f), true), ((&accum_r1, &info_r1, &tbuf_r1), false)] {
+            let ctx = FrameCtx {
+                scene,
+                bvh,
+                cam,
+                q,
+                frame: 1,
+                jitter: true,
+                rw,
+                rh,
+                accum: bufs.0,
+                info: bufs.1,
+                tbuf: bufs.2,
+                stats: &stats,
+                sun: render::sun_dir(scene),
+                tcache_cur: None,
+                tcache_prev: if fresh { &warm_p[..] } else { &warm_p[..0] },
+                accumulate: true,
+                gbuf: None,
+                prev_cam: None,
+                frame_jitter: None,
+                adaptive: false,
+                replay_rec: None,
+                cut_cur: None,
+                cut_prev: None,
+            };
+            if fresh {
+                render::render_frame(&ctx, true);
+            } else {
+                render::render_frame_replay(&ctx, &rcache);
+            }
+        }
+        let (dt1, di1, da1) = (
+            bits_differ(&tbuf_f, &tbuf_r1),
+            bits_differ(&info_f, &info_r1),
+            bits_differ(&accum_f, &accum_r1),
+        );
+        eprintln!("replay bit-identity (warm frame 1): tbuf {dt1} | info {di1} | accum {da1} px differ");
+        if dt1 + di1 + da1 > 0 {
+            replay_ok = false;
+        }
+        // Frozen-prev contract: replays wrote nothing, so the producer cache
+        // must still seed a moving consumer exactly as if they hadn't run.
+        stats.clear();
+        let rep_d = render::verify(scene, bvh, &basis_b, q, rw, rh, &stats, None, &[(&tcache_p, cam)], None);
+        let seeds_d = stats.temporal_seeds.load(Relaxed);
+        eprintln!(
+            "replay frozen-prev dolly: false-sky {} | tmin-overshoot {} | hybrid-extra {} | seeds {seeds_d}",
+            rep_d.false_sky, rep_d.overshoot, rep_d.hybrid_extra,
+        );
+        if !rep_d.ok() || (structural && seeds_d == 0) {
+            eprintln!("replay frozen-prev dolly: gates failed — replay perturbed the temporal contract");
+            replay_ok = false;
+        }
+        // A/B: what a still frame costs cold, cold while recording (the
+        // producer overhead), warm (seeded queries), and replayed (zero
+        // queries). Informational — the win is the point.
+        for (label, warm, do_replay, do_record) in [
+            ("static cold    ", false, false, false),
+            ("static cold+rec", false, false, true),
+            ("static warm    ", true, false, false),
+            ("static replay  ", false, true, false),
+        ] {
+            stats.clear();
+            let ctx = FrameCtx {
+                scene,
+                bvh,
+                cam,
+                q,
+                frame: 0,
+                jitter: false,
+                rw,
+                rh,
+                accum: &accum_p,
+                info: &info_p,
+                tbuf: &tbuf_p,
+                stats: &stats,
+                sun: render::sun_dir(scene),
+                tcache_cur: None,
+                tcache_prev: if warm { &warm_p[..] } else { &warm_p[..0] },
+                accumulate: true,
+                gbuf: None,
+                prev_cam: None,
+                frame_jitter: None,
+                adaptive: false,
+                replay_rec: if do_record { Some(&rcache) } else { None },
+                cut_cur: None,
+                cut_prev: None,
+            };
+            let t = Instant::now();
+            for _ in 0..BENCH_FRAMES {
+                if do_replay {
+                    render::render_frame_replay(&ctx, &rcache);
+                } else {
+                    if do_record {
+                        rcache.begin(rw, rh); // per-frame reset is part of the cost
+                    }
+                    render::render_frame(&ctx, true);
+                }
+            }
+            eprintln!(
+                "replay A/B {label}: {:5.1} ms | frustum queries {} nodes {} | replay: leaves {} sky {}",
+                t.elapsed().as_secs_f64() * 1000.0 / BENCH_FRAMES as f64,
+                stats.frustum_queries.load(Relaxed),
+                stats.frustum_nodes.load(Relaxed),
+                stats.replay_leaf_tiles.load(Relaxed),
+                stats.replay_sky_tiles.load(Relaxed),
+            );
+        }
+    }
+
+    // Temporal claim ring: claims are standalone world-space facts, so a
+    // region that pans off the newest cache's screen and back is answered by
+    // an older ring entry. Produce cache B far off to the side (consuming
+    // [A], which also exercises production on a warm ring), then verify near
+    // A's pose with ring [B, A]: on the pan-back side the query extremes
+    // project off B's screen (an OffScreen miss) and A answers — and every
+    // consumed claim still passes the per-pixel reference re-trace.
+    let mut ring_ok = true;
+    {
+        let mut cam_far = cam0;
+        cam_far.yaw += 0.35;
+        let basis_far = cam_far.basis(rw, rh);
+        let tc_b = temporal::TemporalCache::new(rw, rh);
+        {
+            let warm_a = [(&tcache, cam)];
+            let ctx = FrameCtx {
+                scene,
+                bvh,
+                cam: basis_far,
+                q,
+                frame: 0,
+                jitter: false,
+                rw,
+                rh,
+                accum: &accum,
+                info: &info,
+                tbuf: &tbuf,
+                stats: &stats,
+                sun: render::sun_dir(scene),
+                tcache_cur: Some(&tc_b),
+                tcache_prev: &warm_a,
+                accumulate: true,
+                gbuf: None,
+                prev_cam: None,
+                frame_jitter: None,
+                adaptive: false,
+                replay_rec: None,
+                cut_cur: None,
+                cut_prev: None,
+            };
+            render::render_frame(&ctx, true);
+        }
+        // Exact pan-back (bit-equal to A's basis): tiles that project off
+        // B's screen retry A and take its verbatim identical-basis path —
+        // the structural must-fire. The near-pose pass below (not bit-equal)
+        // exercises the general-query retry and is gated on correctness
+        // only: whether an older general query beats "not useful" is
+        // scene-landscape-dependent, exactly like T5's seed count.
+        let ring = [(&tc_b, basis_far), (&tcache, cam)];
+        stats.clear();
+        let rep_r = render::verify(scene, bvh, &cam, q, rw, rh, &stats, None, &ring, None);
+        let hits = stats.temporal_ring_hits.load(Relaxed);
+        let seeds = stats.temporal_seeds.load(Relaxed);
+        let sky = stats.temporal_sky_tiles.load(Relaxed);
+        eprintln!(
+            "verify temporal ring pan-back exact: false-sky {} | tmin-overshoot {} | hybrid-extra {} | ring hits {hits} | seeds {seeds} sky-tiles {sky}",
+            rep_r.false_sky, rep_r.overshoot, rep_r.hybrid_extra,
+        );
+        ring_ok &= rep_r.ok();
+        if structural && hits == 0 {
+            eprintln!("verify temporal ring pan-back exact: expected ring hits > 0 — the ring path didn't fire");
+            ring_ok = false;
+        }
+        let mut cam_back = cam0;
+        cam_back.yaw += 0.002;
+        stats.clear();
+        let rep_n = render::verify(scene, bvh, &cam_back.basis(rw, rh), q, rw, rh, &stats, None, &ring, None);
+        eprintln!(
+            "verify temporal ring pan-back near: false-sky {} | tmin-overshoot {} | hybrid-extra {} | ring hits {} | seeds {} sky-tiles {}",
+            rep_n.false_sky,
+            rep_n.overshoot,
+            rep_n.hybrid_extra,
+            stats.temporal_ring_hits.load(Relaxed),
+            stats.temporal_seeds.load(Relaxed),
+            stats.temporal_sky_tiles.load(Relaxed),
+        );
+        ring_ok &= rep_n.ok();
+    }
+
+    // Cut-adoption multi-hop chain: 4 consecutive dolly steps, each frame
+    // producing (claims, cuts) while consuming the previous pair with
+    // adoption on, each consumer re-verified against the pair it consumed
+    // (per-pixel reference rays — a stale or too-small chained cut surfaces
+    // as overshoot/false-sky). MAX_ADOPT_AGE = 3, so by step 4 age-capped
+    // nodes must appear and force requeries — the decay control must-fire.
+    let mut adopt_ok = true;
+    {
+        let chain_tc = [temporal::TemporalCache::new(rw, rh), temporal::TemporalCache::new(rw, rh)];
+        let chain_cs = [temporal::CutStore::new(rw, rh), temporal::CutStore::new(rw, rh)];
+        let mut chain_cam = cam0;
+        let mut prev_basis = cam;
+        {
+            // Step 0: cold producer at cam0.
+            let ctx = FrameCtx {
+                scene,
+                bvh,
+                cam,
+                q,
+                frame: 0,
+                jitter: false,
+                rw,
+                rh,
+                accum: &accum,
+                info: &info,
+                tbuf: &tbuf,
+                stats: &stats,
+                sun: render::sun_dir(scene),
+                tcache_cur: Some(&chain_tc[0]),
+                tcache_prev: &[],
+                accumulate: true,
+                gbuf: None,
+                prev_cam: None,
+                frame_jitter: None,
+                adaptive: false,
+                replay_rec: None,
+                cut_cur: Some(&chain_cs[0]),
+                cut_prev: None,
+            };
+            render::render_frame(&ctx, true);
+        }
+        let (mut adopts_total, mut requery_total) = (0u64, 0u64);
+        for step in 1..=4usize {
+            let (pi, ci) = ((step + 1) & 1, step & 1);
+            chain_cam.pos += chain_cam.forward() * (0.01 * scene.diag);
+            let basis_s = chain_cam.basis(rw, rh);
+            chain_tc[ci].clear();
+            chain_cs[ci].clear();
+            stats.clear();
+            {
+                let prev_ring = [(&chain_tc[pi], prev_basis)];
+                let ctx = FrameCtx {
+                    scene,
+                    bvh,
+                    cam: basis_s,
+                    q,
+                    frame: 0,
+                    jitter: false,
+                    rw,
+                    rh,
+                    accum: &accum,
+                    info: &info,
+                    tbuf: &tbuf,
+                    stats: &stats,
+                    sun: render::sun_dir(scene),
+                    tcache_cur: Some(&chain_tc[ci]),
+                    tcache_prev: &prev_ring,
+                    accumulate: true,
+                    gbuf: None,
+                    prev_cam: None,
+                    frame_jitter: None,
+                    adaptive: false,
+                    replay_rec: None,
+                    cut_cur: Some(&chain_cs[ci]),
+                    cut_prev: Some(&chain_cs[pi]),
+                };
+                render::render_frame(&ctx, true);
+            }
+            let a = stats.temporal_cut_adopts.load(Relaxed);
+            let r = stats.temporal_adopt_requery.load(Relaxed);
+            let af = stats.temporal_cut_arena_full.load(Relaxed);
+            adopts_total += a;
+            requery_total += r;
+            stats.clear();
+            let prev_ring = [(&chain_tc[pi], prev_basis)];
+            let rep_s = render::verify(scene, bvh, &basis_s, q, rw, rh, &stats, None, &prev_ring, Some(&chain_cs[pi]));
+            eprintln!(
+                "adopt chain step {step}: adopts {a} requery {r} arena-full {af} | verify false-sky {} | tmin-overshoot {} | hybrid-extra {}",
+                rep_s.false_sky, rep_s.overshoot, rep_s.hybrid_extra,
+            );
+            adopt_ok &= rep_s.ok();
+            prev_basis = basis_s;
+        }
+        if structural && adopts_total == 0 {
+            eprintln!("adopt chain: expected adoptions > 0 across the chain — the path didn't fire");
+            adopt_ok = false;
+        }
+        if structural && requery_total == 0 {
+            eprintln!("adopt chain: expected age-capped requeries > 0 by step 4 — decay control didn't fire");
+            adopt_ok = false;
+        }
+
+        // A/B + KILL CRITERION (the shafts / specular-cone precedent): warm
+        // dolly frames with adoption off vs on. If adopt-on is not
+        // measurably faster on BOTH the default scene and --stress 5000, C
+        // does not merge — skipped bound queries must beat the containment
+        // walk plus the (possibly coarser) adopted-cut refine.
+        // The 1-spp rows are the workload the skip targets: DLSS/XeSS motion
+        // frames trace full-depth at 1 shadow / 1 AO sample, where the
+        // quadtree is a large share of the frame; the preset-q rows show the
+        // heavy-shading dilution for context.
+        let q1 = Quality { shadow_samples: 1, ao_samples: 1, reflections: true, fb: shade::FrustumBounce::OFF };
+        for (label, bq, cuts_opt) in [
+            ("dolly warm q2 (adopt off) ", q, None),
+            ("dolly warm q2 (adopt on)  ", q, Some(&cuts_a)),
+            ("dolly warm 1spp (adopt off)", q1, None),
+            ("dolly warm 1spp (adopt on) ", q1, Some(&cuts_a)),
+        ] {
+            stats.clear();
+            let ctx = FrameCtx {
+                scene,
+                bvh,
+                cam: basis_b,
+                q: bq,
+                frame: 0,
+                jitter: false,
+                rw,
+                rh,
+                accum: &accum,
+                info: &info,
+                tbuf: &tbuf,
+                stats: &stats,
+                sun: render::sun_dir(scene),
+                tcache_cur: None,
+                tcache_prev: &warm,
+                accumulate: true,
+                gbuf: None,
+                prev_cam: None,
+                frame_jitter: None,
+                adaptive: false,
+                replay_rec: None,
+                cut_cur: None,
+                cut_prev: cuts_opt,
+            };
+            // More frames than the other benches: the effect competes with
+            // run-to-run noise at this frame time, and the kill criterion
+            // hangs on the delta.
+            const ADOPT_BENCH_FRAMES: u32 = 24;
+            let t = Instant::now();
+            for _ in 0..ADOPT_BENCH_FRAMES {
+                render::render_frame(&ctx, true);
+            }
+            eprintln!(
+                "adopt A/B {label}: {:5.2} ms | frustum queries {} (blocked {}) nodes {} | ray nodes {} | adopts {} sky {}",
+                t.elapsed().as_secs_f64() * 1000.0 / ADOPT_BENCH_FRAMES as f64,
+                stats.frustum_queries.load(Relaxed) / ADOPT_BENCH_FRAMES as u64,
+                stats.blocked_queries.load(Relaxed) / ADOPT_BENCH_FRAMES as u64,
+                stats.frustum_nodes.load(Relaxed) / ADOPT_BENCH_FRAMES as u64,
+                stats.ray_nodes.load(Relaxed) / ADOPT_BENCH_FRAMES as u64,
+                stats.temporal_cut_adopts.load(Relaxed) / ADOPT_BENCH_FRAMES as u64,
+                stats.temporal_adopt_sky.load(Relaxed) / ADOPT_BENCH_FRAMES as u64,
+            );
+        }
+    }
+
+    if sph_ok
+        && reproj_ok
+        && hemi_ok
+        && gi_ok
+        && shaft_ok
+        && rep.ok()
+        && capped_ok
+        && temporal_ok
+        && replay_ok
+        && ring_ok
+        && adopt_ok
+    {
         eprintln!("CHECK PASSED");
         0
     } else {
@@ -3664,15 +4534,16 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     let tbuf: Vec<AtomicU32> = (0..W * H).map(|_| AtomicU32::new(0)).collect();
     let mut present = vec![0u32; W * H];
     let stats = Stats::default();
-    // Temporal cache pair: cur is filled by this frame, prev (last full-res
-    // hybrid frame + the exact basis it traced with) seeds it. Half-res and
-    // plain frames don't participate and drop prev — a cache from any older
-    // frame or another resolution is never consulted.
-    let tcaches = [temporal::TemporalCache::new(W, H), temporal::TemporalCache::new(W, H)];
-    let mut tcur = 0usize;
-    let mut tprev_ok = false;
-    let mut tprev_basis = cam.basis(W, H); // placeholder until tprev_ok
-    let mut tprev_res = (0usize, 0usize); // resolution the prev cache was traced at
+    // Temporal claim ring + lockstep cut stores: see TemporalRing. Half-res
+    // and plain frames don't participate and drop the ring — a cache from
+    // any older frame or another resolution is never consulted.
+    let mut tr = TemporalRing::new(W, H);
+    // Static-frame structure replay (replay.rs): `replay_key` describes the
+    // immediately preceding rendered frame's recorded terminal structure, or
+    // None. A frame either records and sets it, replays and leaves it, or
+    // does neither and clears it; idle (converged) frames don't touch it.
+    let replay_cache = replay::ReplayCache::new(W, H);
+    let mut replay_key: Option<(camera::CamBasis, (usize, usize))> = None;
 
     let mut frame: u32 = 0;
     let mut hybrid = true;
@@ -4169,18 +5040,13 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 frame = 0;
                 gpu_reset = true;
             }
-            if gpu_up == GpuUp::Xess {
-                // The upscaler contract (the CPU XeSS arm's): every frame is
-                // a fresh jittered 1-spp full-depth frame at the locked
-                // render res; XeSS is the only temporal integrator. The
-                // quality is pinned (1 shadow / 1 AO / reflections, fb OFF —
-                // frame-stationary noise for the TAA); presets don't apply.
-                let q = Quality {
-                    shadow_samples: 1,
-                    ao_samples: 1,
-                    reflections: true,
-                    fb: shade::FrustumBounce::OFF,
-                };
+            if gpu_up != GpuUp::Plain {
+                // The upscaler contract (the CPU arms'): every frame is a
+                // fresh jittered 1-spp full-depth frame at the locked render
+                // res; the upscaler is the only temporal integrator. One
+                // camera pose feeds every consumer — the shader MVs
+                // (prev_cam basis) and, in RR mode, fc's prev matrices — so
+                // they can never disagree.
                 let jit = dlss::jitter_for(gpu_up_idx);
                 let p = gpu::trace::FrameParams {
                     cam: cam.basis(grw, grh),
@@ -4189,68 +5055,41 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                     jitter: false,
                     frame_jitter: Some(jit),
                     prev_cam: gpu_prev_cam.map(|c| c.basis(grw, grh)),
-                    q,
+                    q: Quality::upscaler_1spp(),
                     verify: false,
                 };
-                match gpu.present_trace_xess(&p, hybrid, jit, gpu_reset) {
+                let presented = if gpu_up == GpuUp::Xess {
+                    gpu.present_trace_xess(&p, hybrid, jit, gpu_reset)
+                } else {
+                    // The prev matrices are recomputed from the stored
+                    // camera (pure math, fixed res: identical to last
+                    // frame's).
+                    let mats = dlss::cam_matrices(&cam, grw, grh, dlss_near, dlss_far);
+                    let prev_mats = gpu_prev_cam
+                        .map(|c| dlss::cam_matrices(&c, grw, grh, dlss_near, dlss_far));
+                    let fc = dlss::frame_constants(
+                        &cam,
+                        &mats,
+                        prev_mats.as_ref(),
+                        jit,
+                        gpu_reset,
+                        dlss_near,
+                        dlss_far,
+                        grw,
+                        grh,
+                    );
+                    gpu.present_trace_rr(&p, hybrid, &fc, gpu_up_idx)
+                };
+                match presented {
                     Ok(()) => {
                         gpu_prev_cam = Some(cam);
                         gpu_reset = false;
                         gpu_up_idx = gpu_up_idx.wrapping_add(1);
                     }
                     Err(e) => {
-                        eprintln!("gpu: XeSS present failed ({e}); presenting plain (X to retry)");
-                        gpu_up = GpuUp::Plain;
-                        frame = 0;
-                    }
-                }
-            } else if gpu_up == GpuUp::Rr {
-                // The DLSS contract (the CPU RR arm's): fresh jittered 1-spp
-                // frames at the locked render res; RR upscales + denoises to
-                // the window. One camera pose feeds both consumers — the
-                // shader MVs (prev_cam basis) and fc's prev matrices — so
-                // they can never disagree. The prev matrices are recomputed
-                // from the stored camera (pure math, fixed res: identical to
-                // last frame's).
-                let q = Quality {
-                    shadow_samples: 1,
-                    ao_samples: 1,
-                    reflections: true,
-                    fb: shade::FrustumBounce::OFF,
-                };
-                let jit = dlss::jitter_for(gpu_up_idx);
-                let p = gpu::trace::FrameParams {
-                    cam: cam.basis(grw, grh),
-                    frame: gpu_up_idx,
-                    accumulate: false,
-                    jitter: false,
-                    frame_jitter: Some(jit),
-                    prev_cam: gpu_prev_cam.map(|c| c.basis(grw, grh)),
-                    q,
-                    verify: false,
-                };
-                let mats = dlss::cam_matrices(&cam, grw, grh, dlss_near, dlss_far);
-                let prev_mats =
-                    gpu_prev_cam.map(|c| dlss::cam_matrices(&c, grw, grh, dlss_near, dlss_far));
-                let fc = dlss::frame_constants(
-                    &cam,
-                    &mats,
-                    prev_mats.as_ref(),
-                    jit,
-                    gpu_reset,
-                    dlss_near,
-                    dlss_far,
-                    grw,
-                    grh,
-                );
-                match gpu.present_trace_rr(&p, hybrid, &fc, gpu_up_idx) {
-                    Ok(()) => {
-                        gpu_prev_cam = Some(cam);
-                        gpu_reset = false;
-                        gpu_up_idx = gpu_up_idx.wrapping_add(1);
-                    }
-                    Err(e) => {
-                        eprintln!("gpu: DLSS-RR present failed ({e}); presenting plain (G to retry)");
+                        let (name, key) =
+                            if gpu_up == GpuUp::Xess { ("XeSS", 'X') } else { ("DLSS-RR", 'G') };
+                        eprintln!("gpu: {name} present failed ({e}); presenting plain ({key} to retry)");
                         gpu_up = GpuUp::Plain;
                         frame = 0;
                     }
@@ -4744,6 +5583,33 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
         let basis = cam.basis(rw, rh);
         if rendered {
             stats.clear();
+            // Static-frame structure replay: bit-equal basis at the same res,
+            // and the previous rendered frame recorded a full-depth uncapped
+            // hybrid structure — re-shade it with zero frustum queries
+            // (replay.rs). Camera motion, res steps, budget frames, and plain
+            // mode all miss or clear the key; quality/denoiser toggles do NOT
+            // (the structure is a function of scene/BVH/basis/res only —
+            // shading params come from this frame's ctx). Everything temporal
+            // is FROZEN across replay frames: no cache clear, no rotation, so
+            // tcache_prev stays the last PRODUCING frame and motion resume
+            // consults exactly the last traced quadtree.
+            let can_replay = opts.temporal
+                && opts.replay
+                && hybrid
+                && !use_budget
+                && replay_key.is_some_and(|(b, r)| b == basis && r == (rw, rh));
+            // Record whenever this frame's structure could seed a replay next
+            // frame (full-depth uncapped hybrid at a recordable res).
+            let record = opts.temporal
+                && opts.replay
+                && !can_replay
+                && hybrid
+                && !use_budget
+                && rw <= W
+                && rh <= H;
+            if record {
+                replay_cache.begin(rw, rh);
+            }
             // Budget (moving) frames are full-res, so the cache stays live
             // through motion and across the moving→static transition. In
             // DLSS mode "full participation res" is RR's render resolution;
@@ -4753,21 +5619,12 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
             // every frame is a full-depth hybrid frame at one fixed res, so
             // the producer/consumer contract holds; the tprev_res check
             // below drops the prev cache across any res step.
-            let temporal_on = hybrid
+            let temporal_on = opts.temporal
+                && !can_replay
+                && hybrid
                 && (upscaled || (rw, rh) == (W, H));
-            let (tcache_cur, tcache_prev) = if temporal_on {
-                tcaches[tcur].clear();
-                (
-                    Some(&tcaches[tcur]),
-                    if tprev_ok && tprev_res == (rw, rh) {
-                        Some((&tcaches[tcur ^ 1], tprev_basis))
-                    } else {
-                        None
-                    },
-                )
-            } else {
-                (None, None)
-            };
+            let (tcache_cur, tprev_vec, cut_cur, cut_prev) =
+                tr.begin(temporal_on, opts.adopt, rw, rh);
             let ctx = FrameCtx {
                 scene,
                 bvh,
@@ -4793,7 +5650,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 stats: &stats,
                 sun: render::sun_dir(scene),
                 tcache_cur,
-                tcache_prev,
+                tcache_prev: &tprev_vec,
                 accumulate: !upscaled && !oidn_t,
                 gbuf: match mode {
                     RenderMode::Dlss => Some(&gbufs),
@@ -4824,21 +5681,28 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 // uniform per-pixel shading (visibility is per-pixel
                 // either way).
                 adaptive: mode == RenderMode::Xess && opts.adaptive,
+                replay_rec: if record { Some(&replay_cache) } else { None },
+                cut_cur,
+                cut_prev,
             };
             let t = Instant::now();
-            if use_budget {
+            if can_replay {
+                render::render_frame_replay(&ctx, &replay_cache);
+            } else if use_budget {
                 render::render_frame_capped(&ctx, depth_est.floor() as u32);
             } else {
                 render::render_frame(&ctx, hybrid);
             }
             last_ms = t.elapsed().as_secs_f64() * 1000.0;
-            if temporal_on {
-                tprev_basis = basis;
-                tprev_res = (rw, rh);
-                tprev_ok = true;
-                tcur ^= 1;
-            } else {
-                tprev_ok = false;
+            if !can_replay {
+                tr.end(temporal_on, opts.adopt, basis);
+                // A recorded, unpoisoned structure seeds next frame's replay;
+                // anything else (plain, budget, overflow) clears the key.
+                replay_key = if record && replay_cache.valid() {
+                    Some((basis, (rw, rh)))
+                } else {
+                    None
+                };
             }
             if use_budget {
                 // Update the cap estimate from this frame only — non-budget
@@ -5193,6 +6057,13 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 }
             }
         }
+        // Tracy frame boundary + per-frame plots (all presents are done).
+        prof::frame_mark();
+        plot!("frame ms", last_ms);
+        plot!("fr-queries", stats.frustum_queries.load(Relaxed));
+        plot!("adopts", stats.temporal_cut_adopts.load(Relaxed));
+        plot!("replay leaves", stats.replay_leaf_tiles.load(Relaxed));
+        plot!("render h", rh);
         fps_frames += 1;
         if (now - fps_t).as_secs_f64() >= 1.0 {
             fps = fps_frames as f64 / (now - fps_t).as_secs_f64();
@@ -5237,7 +6108,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
             eprintln!("verifying current view...");
             let vstats = Stats::default();
             // Cache-free on purpose: an independent ground-truth oracle.
-            let rep = render::verify(scene, bvh, &cam.basis(W, H), base_q, W, H, &vstats, None, None);
+            let rep = render::verify(scene, bvh, &cam.basis(W, H), base_q, W, H, &vstats, None, &[], None);
             eprintln!(
                 "verify ({} px): false-sky {} | tmin-overshoot {} | hybrid-extra {} | max rel t err {:.2e} -> {}",
                 rep.pixels,

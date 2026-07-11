@@ -9,8 +9,8 @@
 //! the window resolution with its own full extent.
 
 use super::d3d12::{
-    aligned_pitch, committed_tex, footprint, loc_footprint, loc_subresource, transition, D3d,
-    Result, UploadBuffer, FRAMES_IN_FLIGHT,
+    aligned_pitch, committed_tex, footprint, get_or_try_init, loc_footprint, loc_subresource,
+    transition, D3d, Result, UploadBuffer, FRAMES_IN_FLIGHT,
 };
 use super::streamline_sys as sl;
 use crate::dlss::GBufs;
@@ -122,14 +122,11 @@ impl RrResources {
         })
     }
 
-    /// The upload ring, allocated on first use (interior mutability so the
-    /// recording path keeps `&self`).
+    /// The upload ring, allocated on first use.
     fn upload_buf(&self) -> Result<&UploadBuffer> {
-        if self.upload.get().is_none() {
-            let buf = UploadBuffer::new(&self.device, self.slot_stride * FRAMES_IN_FLIGHT)?;
-            let _ = self.upload.set(buf);
-        }
-        Ok(self.upload.get().unwrap())
+        get_or_try_init(&self.upload, || {
+            UploadBuffer::new(&self.device, self.slot_stride * FRAMES_IN_FLIGHT)
+        })
     }
 
     /// The input planes as (resource, format) in the FEED register order
@@ -163,6 +160,8 @@ impl RrResources {
         rw: usize,
         rh: usize,
     ) -> Result<()> {
+        crate::zone!("rr-upload");
+        let _ev = super::pix::scope(&d3d.list, c"rr-upload");
         let upload = self.upload_buf()?;
         let (w, h) = (rw, rh);
         debug_assert_eq!((g.rw, g.rh), (w, h));

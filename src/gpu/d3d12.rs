@@ -22,6 +22,20 @@ pub const SWAPCHAIN_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
 
 pub type Result<T> = std::result::Result<T, String>;
 
+/// Fallible `OnceLock` get-or-init for lazily allocated GPU buffers
+/// (interior mutability so recording paths keep `&self`). Two racing
+/// initializers may both construct; the loser's value is dropped by the
+/// discarded `set` — benign, both then return the winner's buffer.
+pub fn get_or_try_init<T>(
+    lock: &std::sync::OnceLock<T>,
+    init: impl FnOnce() -> Result<T>,
+) -> Result<&T> {
+    if lock.get().is_none() {
+        let _ = lock.set(init()?);
+    }
+    Ok(lock.get().unwrap())
+}
+
 fn err<T>(ctx: &str, e: windows::core::Error) -> Result<T> {
     Err(format!("{ctx}: {e}"))
 }
@@ -220,6 +234,7 @@ impl D3d {
     /// bookkeeping matches `end_frame`, so the frame ring stays consistent
     /// and the caller's Map of a readback buffer is safe on return.
     pub fn submit_and_wait(&mut self, slot: usize) -> Result<()> {
+        crate::zone!("gpu-wait");
         unsafe { self.list.Close() }.map_err(|e| format!("list Close: {e}"))?;
         let lists = [Some(self.list.cast::<ID3D12CommandList>().unwrap())];
         unsafe { self.queue.ExecuteCommandLists(&lists) };

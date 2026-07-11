@@ -8,8 +8,8 @@
 //! resolution as the SDK intends it, no reallocation on a res step.
 
 use super::d3d12::{
-    aligned_pitch, committed_tex, footprint, loc_footprint, loc_subresource, transition, D3d,
-    ReadbackBuffer, Result, UploadBuffer, FRAMES_IN_FLIGHT,
+    aligned_pitch, committed_tex, footprint, get_or_try_init, loc_footprint, loc_subresource,
+    transition, D3d, ReadbackBuffer, Result, UploadBuffer, FRAMES_IN_FLIGHT,
 };
 use crate::dlss::GBufs;
 use crate::xess;
@@ -113,14 +113,11 @@ impl XessResources {
         })
     }
 
-    /// The upload ring, allocated on first use (interior mutability so the
-    /// recording path keeps `&self`).
+    /// The upload ring, allocated on first use.
     fn upload_buf(&self) -> Result<&UploadBuffer> {
-        if self.upload.get().is_none() {
-            let buf = UploadBuffer::new(&self.device, self.slot_stride * FRAMES_IN_FLIGHT)?;
-            let _ = self.upload.set(buf);
-        }
-        Ok(self.upload.get().unwrap())
+        get_or_try_init(&self.upload, || {
+            UploadBuffer::new(&self.device, self.slot_stride * FRAMES_IN_FLIGHT)
+        })
     }
 
     /// The input planes as (resource, format) in (color, mvec, depth) order —
@@ -138,14 +135,12 @@ impl XessResources {
     /// HDR on the CPU (post-upscale denoise) instead of a backbuffer pass.
     /// Leaves `output` in PIXEL_SHADER_RESOURCE, its rest state.
     pub fn record_readback(&self, d3d: &D3d) -> Result<()> {
-        if self.readback.get().is_none() {
-            let buf = ReadbackBuffer::new(
+        let readback = get_or_try_init(&self.readback, || {
+            ReadbackBuffer::new(
                 &self.device,
                 aligned_pitch(self.ow as usize * 8) * self.oh as usize,
-            )?;
-            let _ = self.readback.set(buf);
-        }
-        let readback = self.readback.get().unwrap();
+            )
+        })?;
         unsafe {
             d3d.list.ResourceBarrier(&[transition(
                 &self.output,
@@ -211,6 +206,8 @@ impl XessResources {
         near: f32,
         far: f32,
     ) -> Result<()> {
+        crate::zone!("xess-upload");
+        let _ev = super::pix::scope(&d3d.list, c"xess-upload");
         let upload = self.upload_buf()?;
         debug_assert_eq!((g.rw, g.rh), (rw, rh));
         debug_assert!(rw <= self.max_w as usize && rh <= self.max_h as usize);

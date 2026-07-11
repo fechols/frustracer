@@ -32,6 +32,20 @@ pub struct Stats {
     pub temporal_sky_tiles: AtomicU64,
     /// Cells visited by the temporal region-min query (its cost).
     pub temporal_tests: AtomicU64,
+    /// Tiles answered by a ring entry OTHER than the newest cache (pan-back
+    /// reuse), and the sum of those entries' ages (mean = sum / hits).
+    pub temporal_ring_hits: AtomicU64,
+    pub temporal_ring_age_sum: AtomicU64,
+    /// Tiles that adopted an old node's cut and skipped their bound query;
+    /// of those, the ones whose re-refine emptied — a free sky proof.
+    pub temporal_cut_adopts: AtomicU64,
+    pub temporal_adopt_sky: AtomicU64,
+    /// Age-capped candidates skipped by the containment search (the node is
+    /// forced back onto a real query before its cut may chain on).
+    pub temporal_adopt_requery: AtomicU64,
+    /// Split nodes whose cut could not be stored (arena full) — consumers
+    /// just miss those adoptions.
+    pub temporal_cut_arena_full: AtomicU64,
     /// Shading points that ran the hemisphere frustum integrator.
     pub hemi_points: AtomicU64,
     /// Hemisphere-cell bound queries (+ refines) and their BVH node visits.
@@ -59,6 +73,10 @@ pub struct Stats {
     pub adapt_penumbra: AtomicU64,
     /// Shadow/AO rays skipped by applying a shared VisRecord.
     pub adapt_rays_saved: AtomicU64,
+    /// Structure-replay frames: leaf/sky terminals re-shaded from the
+    /// recorded quadtree (zero frustum queries — see replay.rs).
+    pub replay_leaf_tiles: AtomicU64,
+    pub replay_sky_tiles: AtomicU64,
 }
 
 #[derive(Default)]
@@ -82,6 +100,12 @@ pub struct LocalStats {
     pub temporal_seeds: u64,
     pub temporal_sky_tiles: u64,
     pub temporal_tests: u64,
+    pub temporal_ring_hits: u64,
+    pub temporal_ring_age_sum: u64,
+    pub temporal_cut_adopts: u64,
+    pub temporal_adopt_sky: u64,
+    pub temporal_adopt_requery: u64,
+    pub temporal_cut_arena_full: u64,
     pub hemi_points: u64,
     pub hemi_queries: u64,
     pub hemi_nodes: u64,
@@ -97,6 +121,8 @@ pub struct LocalStats {
     pub adapt_topup: u64,
     pub adapt_penumbra: u64,
     pub adapt_rays_saved: u64,
+    pub replay_leaf_tiles: u64,
+    pub replay_sky_tiles: u64,
 }
 
 impl LocalStats {
@@ -122,6 +148,12 @@ impl LocalStats {
         self.temporal_seeds += o.temporal_seeds;
         self.temporal_sky_tiles += o.temporal_sky_tiles;
         self.temporal_tests += o.temporal_tests;
+        self.temporal_ring_hits += o.temporal_ring_hits;
+        self.temporal_ring_age_sum += o.temporal_ring_age_sum;
+        self.temporal_cut_adopts += o.temporal_cut_adopts;
+        self.temporal_adopt_sky += o.temporal_adopt_sky;
+        self.temporal_adopt_requery += o.temporal_adopt_requery;
+        self.temporal_cut_arena_full += o.temporal_cut_arena_full;
         self.hemi_points += o.hemi_points;
         self.hemi_queries += o.hemi_queries;
         self.hemi_nodes += o.hemi_nodes;
@@ -137,6 +169,8 @@ impl LocalStats {
         self.adapt_topup += o.adapt_topup;
         self.adapt_penumbra += o.adapt_penumbra;
         self.adapt_rays_saved += o.adapt_rays_saved;
+        self.replay_leaf_tiles += o.replay_leaf_tiles;
+        self.replay_sky_tiles += o.replay_sky_tiles;
     }
 }
 
@@ -161,6 +195,12 @@ impl Stats {
         self.temporal_seeds.store(0, Relaxed);
         self.temporal_sky_tiles.store(0, Relaxed);
         self.temporal_tests.store(0, Relaxed);
+        self.temporal_ring_hits.store(0, Relaxed);
+        self.temporal_ring_age_sum.store(0, Relaxed);
+        self.temporal_cut_adopts.store(0, Relaxed);
+        self.temporal_adopt_sky.store(0, Relaxed);
+        self.temporal_adopt_requery.store(0, Relaxed);
+        self.temporal_cut_arena_full.store(0, Relaxed);
         self.hemi_points.store(0, Relaxed);
         self.hemi_queries.store(0, Relaxed);
         self.hemi_nodes.store(0, Relaxed);
@@ -176,6 +216,8 @@ impl Stats {
         self.adapt_topup.store(0, Relaxed);
         self.adapt_penumbra.store(0, Relaxed);
         self.adapt_rays_saved.store(0, Relaxed);
+        self.replay_leaf_tiles.store(0, Relaxed);
+        self.replay_sky_tiles.store(0, Relaxed);
     }
 
     pub fn add(&self, l: &LocalStats) {
@@ -236,6 +278,24 @@ impl Stats {
         if l.temporal_tests > 0 {
             self.temporal_tests.fetch_add(l.temporal_tests, Relaxed);
         }
+        if l.temporal_ring_hits > 0 {
+            self.temporal_ring_hits.fetch_add(l.temporal_ring_hits, Relaxed);
+        }
+        if l.temporal_ring_age_sum > 0 {
+            self.temporal_ring_age_sum.fetch_add(l.temporal_ring_age_sum, Relaxed);
+        }
+        if l.temporal_cut_adopts > 0 {
+            self.temporal_cut_adopts.fetch_add(l.temporal_cut_adopts, Relaxed);
+        }
+        if l.temporal_adopt_sky > 0 {
+            self.temporal_adopt_sky.fetch_add(l.temporal_adopt_sky, Relaxed);
+        }
+        if l.temporal_adopt_requery > 0 {
+            self.temporal_adopt_requery.fetch_add(l.temporal_adopt_requery, Relaxed);
+        }
+        if l.temporal_cut_arena_full > 0 {
+            self.temporal_cut_arena_full.fetch_add(l.temporal_cut_arena_full, Relaxed);
+        }
         if l.hemi_points > 0 {
             self.hemi_points.fetch_add(l.hemi_points, Relaxed);
         }
@@ -280,6 +340,12 @@ impl Stats {
         }
         if l.adapt_rays_saved > 0 {
             self.adapt_rays_saved.fetch_add(l.adapt_rays_saved, Relaxed);
+        }
+        if l.replay_leaf_tiles > 0 {
+            self.replay_leaf_tiles.fetch_add(l.replay_leaf_tiles, Relaxed);
+        }
+        if l.replay_sky_tiles > 0 {
+            self.replay_sky_tiles.fetch_add(l.replay_sky_tiles, Relaxed);
         }
     }
 
@@ -334,6 +400,33 @@ impl Stats {
         } else {
             String::new()
         };
+        let adopts = self.temporal_cut_adopts.load(Relaxed);
+        let adopt = if adopts > 0 {
+            format!(
+                " | adopt: {adopts} sky {} requery {} arena-full {}",
+                self.temporal_adopt_sky.load(Relaxed),
+                self.temporal_adopt_requery.load(Relaxed),
+                self.temporal_cut_arena_full.load(Relaxed),
+            )
+        } else {
+            String::new()
+        };
+        let rhits = self.temporal_ring_hits.load(Relaxed);
+        let tring = if rhits > 0 {
+            format!(
+                " | tring: hits {rhits} mean-age {:.1}",
+                self.temporal_ring_age_sum.load(Relaxed) as f64 / rhits as f64
+            )
+        } else {
+            String::new()
+        };
+        let rl = self.replay_leaf_tiles.load(Relaxed);
+        let rs = self.replay_sky_tiles.load(Relaxed);
+        let replay = if rl + rs > 0 {
+            format!(" | replay: leaves {rl} sky {rs}")
+        } else {
+            String::new()
+        };
         let ac = self.adapt_coarse.load(Relaxed);
         let ab = self.adapt_base.load(Relaxed);
         let ah = self.adapt_hot.load(Relaxed);
@@ -349,7 +442,7 @@ impl Stats {
             String::new()
         };
         format!(
-            "tiles {tiles} | fr-queries {fq} (blocked {blocked}) | cut mean {cut_mean:.1} (ovf {ovf}) | nodes: frustum {fnodes} + ray {rnodes} = {} | rays: {prim} prim + {sec} sec | sky-px (0 rays) {sky} | coarse-px {coarse} (smp {csmp}) | temporal: seeds {tseeds} sky {tsky} cells {ttests} | mean t_start/t_hit {skip:.2}{hemi}{shaft}{adapt}",
+            "tiles {tiles} | fr-queries {fq} (blocked {blocked}) | cut mean {cut_mean:.1} (ovf {ovf}) | nodes: frustum {fnodes} + ray {rnodes} = {} | rays: {prim} prim + {sec} sec | sky-px (0 rays) {sky} | coarse-px {coarse} (smp {csmp}) | temporal: seeds {tseeds} sky {tsky} cells {ttests} | mean t_start/t_hit {skip:.2}{adopt}{tring}{replay}{hemi}{shaft}{adapt}",
             fnodes + rnodes
         )
     }

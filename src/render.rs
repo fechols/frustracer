@@ -3,6 +3,7 @@ use crate::camera::CamBasis;
 use crate::dlss;
 use crate::frustum::{self, MAX_CUT};
 use crate::overlay::{self, KIND_COARSE, KIND_LEAF, KIND_SKY};
+use crate::replay;
 use crate::scene::Scene;
 use crate::shade::{self, Quality};
 use crate::stats::{LocalStats, Stats};
@@ -39,10 +40,13 @@ pub struct FrameCtx<'a> {
     pub sun: Vec3A,
     /// This frame's temporal cache to fill (per-node tc / sky markers).
     pub tcache_cur: Option<&'a TemporalCache>,
-    /// The previous frame's cache and the exact basis it was traced with —
-    /// consulted before each tile's bound query for a t_start head start.
-    /// Must be exactly the last full-res hybrid frame (see main.rs wiring).
-    pub tcache_prev: Option<(&'a TemporalCache, CamBasis)>,
+    /// Ring of previous frames' caches, NEWEST FIRST, each paired with the
+    /// exact basis it was traced with — consulted before each tile's bound
+    /// query for a t_start head start (older entries answer regions that
+    /// panned off the newest screen and back). Empty slice = no reuse. The
+    /// newest entry must be the last producing full-res hybrid frame (see
+    /// main.rs wiring).
+    pub tcache_prev: &'a [(&'a TemporalCache, CamBasis)],
     /// false => `splat` always stores (every frame is a fresh 1-spp frame;
     /// DLSS-RR is the temporal integrator). `frame` still advances so the
     /// per-pixel RNG decorrelates across frames — pinning frame to 0 would
@@ -62,6 +66,20 @@ pub struct FrameCtx<'a> {
     /// Visibility stays per-pixel regardless — tbuf/G-buffers are identical
     /// to a non-adaptive frame; only radiance sampling changes.
     pub adaptive: bool,
+    /// Structure recorder for static-frame replay: Some only on full-depth
+    /// uncapped hybrid frames (main.rs gates it). trace_tile records every
+    /// terminal (leaf rect + inherited t_start + cut, sky rect) so a later
+    /// bit-equal-basis frame can `render_frame_replay` with zero queries.
+    pub replay_rec: Option<&'a replay::ReplayCache>,
+    /// This frame's cut store to fill (each Split node's refine_cut output),
+    /// produced in lockstep with `tcache_cur`.
+    pub cut_cur: Option<&'a temporal::CutStore>,
+    /// The previous PRODUCING frame's cut store — must pair with the newest
+    /// `tcache_prev` ring entry (same frame, same basis). Some = cut
+    /// adoption on: a tile whose direction hull is contained in an old
+    /// node's cone skips its bound query and re-refines that node's cut.
+    /// None is the kill switch (distance seeds still work).
+    pub cut_prev: Option<&'a temporal::CutStore>,
 }
 
 impl FrameCtx<'_> {
@@ -90,8 +108,10 @@ impl FrameCtx<'_> {
 
 pub fn render_frame(ctx: &FrameCtx, hybrid: bool) {
     if hybrid {
+        crate::zone!("trace-full");
         trace_tile(ctx, 0, 0, ctx.rw, ctx.rh, 0.0, 0, 0, &[0], u32::MAX);
     } else {
+        crate::zone!("trace-plain");
         // Plain per-pixel reference: the ground truth and the A/B baseline.
         (0..ctx.rh).into_par_iter().for_each(|y| {
             let mut ls = LocalStats::default();
@@ -171,6 +191,9 @@ fn trace_tile(
     }
     let (w, h) = (x1 - x0, y1 - y0);
     if w <= LEAF_TILE && h <= LEAF_TILE {
+        if let Some(rec) = ctx.replay_rec {
+            rec.push_leaf(x0, y0, x1, y1, t_start, depth, cut_in);
+        }
         shade_tile(ctx, x0, y0, x1, y1, t_start, depth, KIND_LEAF, cut_in);
         return;
     }
@@ -179,6 +202,12 @@ fn trace_tile(
     // No temporal probe or store here: the inherited t_start already carries
     // the parent's (possibly seeded) tc, and its cache entry covers this tile.
     if depth >= max_depth {
+        // Recording is gated on uncapped frames, so this arm is structurally
+        // unreachable while recording — poison defensively (a capped terminal
+        // has no replayable record; replaying around it would drop pixels).
+        if let Some(rec) = ctx.replay_rec {
+            rec.poison();
+        }
         let mut ls = LocalStats::default();
         sparse_fill(ctx, x0, y0, x1, y1, t_start, depth, cut_in, &mut ls);
         ctx.stats.add(&ls);
@@ -190,12 +219,18 @@ fn trace_tile(
     // frame's quadtree before touching the BVH. Only the primary-path t_start
     // is affected — secondary rays never see it.
     let mut t0 = t_start;
-    if let Some((prev, prev_cam)) = &ctx.tcache_prev {
-        match temporal::lookup(prev, prev_cam, &ctx.cam, ctx.rw, ctx.rh, x0, y0, x1, y1, t_start, depth, path, &mut ls) {
+    // (verbatim old cut to refine instead of cut_in, skip-chain age) — Some
+    // means the bound query is skipped this tile.
+    let mut adopted: Option<(Option<(u32, u32)>, u32)> = None;
+    if !ctx.tcache_prev.is_empty() {
+        match temporal::lookup(ctx.tcache_prev, ctx.cut_prev, &ctx.cam, ctx.rw, ctx.rh, x0, y0, x1, y1, t_start, depth, path, &mut ls) {
             temporal::Seed::Sky => {
                 // The whole frustum was proven empty last frame; still true.
                 if let Some(cur) = ctx.tcache_cur {
                     cur.store(depth, path, f32::INFINITY);
+                }
+                if let Some(rec) = ctx.replay_rec {
+                    rec.push_sky(x0, y0, x1, y1, depth);
                 }
                 ls.temporal_sky_tiles += 1;
                 ctx.stats.add(&ls);
@@ -208,16 +243,48 @@ fn trace_tile(
                     t0 = t;
                 }
             }
+            temporal::Seed::Skip { t, age } => {
+                // The completed old min predicts this tile's bound query is
+                // pinned by real geometry (the blocked regime) — skip it and
+                // refine the tile's own inherited cut at t. Nothing old is
+                // consumed by the refine; the prediction only chooses when
+                // skipping is profitable.
+                if t > t0 {
+                    ls.temporal_seeds += 1;
+                    t0 = t;
+                }
+                adopted = Some((None, age));
+            }
+            temporal::Seed::TCut { t, off, len, age } => {
+                // Identical basis: the node's own old cut is exactly valid —
+                // skip the query and refine from it (already this node's
+                // tightness, not the parent's).
+                if t > t0 {
+                    ls.temporal_seeds += 1;
+                    t0 = t;
+                }
+                adopted = Some((Some((off, len)), age));
+            }
             temporal::Seed::None => {}
         }
     }
-    match tile_step(ctx, x0, y0, x1, y1, t0, cut_in, &mut ls) {
+    // Skipping tiles run only refine_cut; `cut_age` chains the skip count so
+    // temporal.rs's MAX_ADOPT_AGE forces a real query before the
+    // un-advanced claims decay.
+    let (step, cut_age) = match adopted {
+        Some((old, age)) => (adopt_step(ctx, x0, y0, x1, y1, t0, old, cut_in, &mut ls), age + 1),
+        None => (tile_step(ctx, x0, y0, x1, y1, t0, cut_in, &mut ls), 0),
+    };
+    match step {
         TileStep::Sky => {
             // Composed claim: nothing outside ball(origin, t0) by this query,
             // nothing inside it by the inherited/seeded claim — the whole
             // cone is empty, which is what +INF asserts to the next frame.
             if let Some(cur) = ctx.tcache_cur {
                 cur.store(depth, path, f32::INFINITY);
+            }
+            if let Some(rec) = ctx.replay_rec {
+                rec.push_sky(x0, y0, x1, y1, depth);
             }
             ctx.stats.add(&ls);
             fill_sky(ctx, x0, y0, x1, y1, depth);
@@ -226,9 +293,19 @@ fn trace_tile(
             if let Some(cur) = ctx.tcache_cur {
                 cur.store(depth, path, tc);
             }
+            if let Some(ccur) = ctx.cut_cur {
+                // Store-before-recurse, like the claim above. An adopted
+                // node's re-refined cut is a valid standalone (claim, PVS)
+                // pair for THIS frustum, so chained adoption stays sound —
+                // the age caps its quality decay, not its correctness.
+                if len > 0 && !ccur.store(depth, path, &cut[..len], cut_age) {
+                    ls.temporal_cut_arena_full += 1;
+                }
+            }
             ctx.stats.add(&ls);
             // A Some bound with an empty cut should be impossible (the nearest
-            // leaf survives the tc ball-cull); never degrade toward sky.
+            // leaf survives the tc ball-cull); never degrade toward sky. (An
+            // adopted refine CAN empty — adopt_step maps that to Sky, a proof.)
             debug_assert!(len > 0, "refine_cut emptied a non-sky tile");
             let child: &[u32] = if len > 0 { &cut[..len] } else { cut_in };
             let xm = x0 + w / 2;
@@ -259,6 +336,53 @@ fn trace_tile(
                 trace_tile(ctx, xm, ym, x1, y1, tc, d, p | 3, child, max_depth);
             }
         }
+    }
+}
+
+/// Temporal query skip (`Seed::Skip` / `Seed::TCut`): the previous frame
+/// predicts this tile's bound query cannot meaningfully advance, so only
+/// `refine_cut` runs — against the tile's own inherited cut (always valid —
+/// nothing old is consumed), or, on an identical basis, against the node's
+/// own stored old cut (`old`, exactly valid for the identical cone and
+/// already node-tight). Children only ever receive refine_cut output, so
+/// staleness cannot accumulate; cost is bounded by the cut size, no
+/// root-ward traversal. An emptied refine is a sky PROOF, not the
+/// debug_assert bug case: frustum ∖ ball had no surviving subtree, and
+/// ball(origin, t0) is empty by the inherited/seeded claim — the whole cone
+/// is empty.
+fn adopt_step(
+    ctx: &FrameCtx,
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+    t0: f32,
+    old: Option<(u32, u32)>,
+    cut_in: &[u32],
+    ls: &mut LocalStats,
+) -> TileStep {
+    let f = ctx.cam.tile_frustum(x0, y0, x1, y1);
+    let mut buf = [0u32; MAX_CUT];
+    let input: &[u32] = match old {
+        Some((off, len)) => {
+            let cs = ctx.cut_prev.expect("Seed::TCut without a cut store");
+            let n = cs.copy_cut(off, len, &mut buf);
+            &buf[..n]
+        }
+        None => cut_in,
+    };
+    ls.tiles += 1;
+    ls.temporal_cut_adopts += 1;
+    let mut visits = 0u64;
+    let mut cut = [0u32; MAX_CUT];
+    let out = frustum::refine_cut(ctx.bvh, &f, t0, f32::INFINITY, input, &mut cut, &mut visits, &mut ls.cut_overflows);
+    ls.frustum_nodes += visits;
+    if out == 0 {
+        ls.temporal_adopt_sky += 1;
+        TileStep::Sky
+    } else {
+        ls.cut_len_sum += out as u64;
+        TileStep::Split { tc: t0, cut, len: out }
     }
 }
 
@@ -688,6 +812,7 @@ pub const MIN_BUDGET_DEPTH: u32 = 2;
 /// for a given cap. A cap at or beyond the leaf depth is bit-identical to
 /// `render_frame(ctx, true)` (same code path, the cap never fires).
 pub fn render_frame_capped(ctx: &FrameCtx, max_depth: u32) {
+    crate::zone!("trace-capped");
     trace_tile(ctx, 0, 0, ctx.rw, ctx.rh, 0.0, 0, 0, &[0], max_depth.max(MIN_BUDGET_DEPTH));
 }
 
@@ -765,6 +890,13 @@ fn fill_sky(ctx: &FrameCtx, x0: usize, y0: usize, x1: usize, y1: usize, depth: u
     let mut ls = LocalStats::default();
     ls.sky_tiles = 1;
     ls.sky_pixels = ((x1 - x0) * (y1 - y0)) as u64;
+    fill_sky_rows(ctx, x0, y0, x1, y1, depth);
+    ctx.stats.add(&ls);
+}
+
+/// The per-pixel body of `fill_sky`, stats-free so the replay driver can fan
+/// a large sky rect out across row bands without double-counting the tile.
+fn fill_sky_rows(ctx: &FrameCtx, x0: usize, y0: usize, x1: usize, y1: usize, depth: u32) {
     for y in y0..y1 {
         for x in x0..x1 {
             let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
@@ -774,6 +906,51 @@ fn fill_sky(ctx: &FrameCtx, x0: usize, y0: usize, x1: usize, y1: usize, depth: u
             write_gbuf_sky(ctx, x, y, fx, fy, dir);
         }
     }
+}
+
+/// Rows per parallel band when replaying a large sky rect (a depth-1 sky node
+/// can span a quarter screen — one sequential fill would serialize the tail).
+const REPLAY_SKY_BAND: usize = 16;
+
+/// Re-shade a recorded terminal structure (see replay.rs). Sound ONLY when
+/// `ctx.cam` is bit-equal to the recording frame's basis at the same
+/// (rw, rh): the leaf cut / t_start inheritance arguments are per-frustum,
+/// and bit-equality is what makes the frusta identical — the caller enforces
+/// it (main.rs `replay_key`). Everything shading consumes per frame (quality,
+/// frame index, jitter, G-buffers, prev_cam) comes from the fresh `ctx`, so a
+/// replayed frame advances RNG/jitter exactly like a traced one; `--check`
+/// gates same-seed bit-identity of tbuf/info/accum against a fresh trace.
+pub fn render_frame_replay(ctx: &FrameCtx, rc: &replay::ReplayCache) {
+    crate::zone!("replay");
+    debug_assert!(rc.valid(), "replaying a poisoned recording");
+    let (nl, ns) = rc.counts();
+    (0..nl as usize).into_par_iter().for_each(|i| {
+        let r = rc.leaf(i);
+        let mut cut = [0u32; MAX_CUT];
+        let len = rc.copy_cut(r.cut_off, r.cut_len, &mut cut);
+        shade_tile(ctx, r.x0, r.y0, r.x1, r.y1, r.t_start, r.depth, KIND_LEAF, &cut[..len]);
+    });
+    (0..ns as usize).into_par_iter().for_each(|i| {
+        let r = rc.sky(i);
+        let mut ls = LocalStats::default();
+        ls.sky_tiles = 1;
+        ls.sky_pixels = ((r.x1 - r.x0) * (r.y1 - r.y0)) as u64;
+        ctx.stats.add(&ls);
+        let rows = r.y1 - r.y0;
+        if rows > REPLAY_SKY_BAND {
+            let bands = rows.div_ceil(REPLAY_SKY_BAND);
+            (0..bands).into_par_iter().for_each(|b| {
+                let by0 = r.y0 + b * REPLAY_SKY_BAND;
+                let by1 = (by0 + REPLAY_SKY_BAND).min(r.y1);
+                fill_sky_rows(ctx, r.x0, by0, r.x1, by1, r.depth);
+            });
+        } else {
+            fill_sky_rows(ctx, r.x0, r.y0, r.x1, r.y1, r.depth);
+        }
+    });
+    let mut ls = LocalStats::default();
+    ls.replay_leaf_tiles = nl as u64;
+    ls.replay_sky_tiles = ns as u64;
     ctx.stats.add(&ls);
 }
 
@@ -790,6 +967,7 @@ pub fn resolve(
     ww: usize,
     wh: usize,
 ) {
+    crate::zone!("resolve");
     let inv = 1.0 / samples.max(1) as f32;
     present.par_chunks_mut(ww).enumerate().for_each(|(wy, row)| {
         let sy = (wy * rh / wh).min(rh - 1);
@@ -818,6 +996,7 @@ pub fn resolve_hdr(
     ww: usize,
     wh: usize,
 ) {
+    crate::zone!("resolve-hdr");
     present.par_chunks_mut(ww).enumerate().for_each(|(wy, row)| {
         let sy = (wy * rh / wh).min(rh - 1);
         for (wx, out) in row.iter_mut().enumerate() {
@@ -897,8 +1076,10 @@ pub fn verify(
     rh: usize,
     stats: &Stats,
     max_depth: Option<u32>,
-    temporal_prev: Option<(&TemporalCache, CamBasis)>,
+    temporal_prev: &[(&TemporalCache, CamBasis)],
+    temporal_cuts: Option<&temporal::CutStore>,
 ) -> VerifyReport {
+    crate::zone!("verify");
     let accum: Vec<AtomicU32> = (0..rw * rh * 3).map(|_| AtomicU32::new(0)).collect();
     let info: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
     let tbuf: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
@@ -923,6 +1104,9 @@ pub fn verify(
         prev_cam: None,
         frame_jitter: None,
         adaptive: false,
+        replay_rec: None,
+        cut_cur: None,
+        cut_prev: temporal_cuts,
     };
     match max_depth {
         Some(d) => render_frame_capped(&ctx, d),

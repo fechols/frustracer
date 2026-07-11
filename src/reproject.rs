@@ -186,6 +186,7 @@ impl History {
         far: f32,
         still_cap: f32,
     ) -> UpdateStats {
+        crate::zone!("oidn-history");
         let (w, h) = (self.w, self.h);
         assert_eq!((g.rw, g.rh), (w, h), "gbuf/history resolution mismatch");
         assert_eq!(accum.len(), w * h * 3);
