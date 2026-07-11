@@ -94,8 +94,8 @@ pub struct Opts {
     /// the 2×2-cell shadow/AO sharing and HOT top-ups are disabled).
     pub adaptive: bool,
     /// Lock the DLSS/XeSS render resolution to this fixed scale of the
-    /// window (default the DLSS-Quality 2/3; `--lock-res dynamic` -> None =
-    /// the step-wise dynamic-resolution controller). CLI-only, no runtime
+    /// window (default native 1.0; `--lock-res dynamic` -> None = the
+    /// step-wise dynamic-resolution controller). CLI-only, no runtime
     /// toggle — T prints the locked note.
     pub lock_scale: Option<f32>,
     /// GPU-resident tracing (--gpu): the whole quadtree + shading runs in
@@ -159,7 +159,7 @@ fn main() {
         oidn_post: false,
         xess_autoexposure: false,
         adaptive: true,
-        lock_scale: xess::lock_scale("quality"),
+        lock_scale: xess::lock_scale("native"),
         gpu: false,
         dxc_path: std::env::var("FRUSTRACER_DXC_PATH").unwrap_or_else(|_| {
             concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\dxc\bin\x64").to_string()
@@ -310,7 +310,7 @@ fn main() {
                 eprintln!("  --no-adaptive disable the adaptive shading rate in XeSS mode (uniform per-pixel shading;");
                 eprintln!("                visibility is per-pixel either way)");
                 eprintln!("  --lock-res    DLSS/XeSS render res: quality|balanced|performance|ultra-performance|native,");
-                eprintln!("                a ratio in (0, 1], or dynamic (the step-wise DRS controller); default quality (2/3)");
+                eprintln!("                a ratio in (0, 1], or dynamic (the step-wise DRS controller); default native (100%)");
                 eprintln!("  --xess-path   XeSS DLL directory (default: SDKs\\XeSS-SDK\\bin)");
                 eprintln!("  --gpu-debug   D3D12 debug layer + verbose Streamline logging");
                 eprintln!("  --sl-path     Streamline DLL directory (default: SDKs\\streamline-sdk\\bin\\x64)");
@@ -3697,7 +3697,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     // change, not a scene change: the res-step block below does NOT reset
     // (no dlss_reset, no prev drop; history survives via the extent tags).
     // A degenerate reported range (min == max) means the driver offers no
-    // DRS — fixed res, no controller. --lock-res (default quality = 2/3)
+    // DRS — fixed res, no controller. --lock-res (default native = 1.0)
     // pins a fixed res inside the range instead; `--lock-res dynamic` opts
     // back into the controller.
     let dlss_range = gpu.rr_res_range();
@@ -3788,7 +3788,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     // grid no longer matches.
     let mut xess_on = gpu.xess_ready();
     let xess_range = gpu.xess_res_range(); // (optimal, min, max)
-    // --lock-res (default quality): one fixed render res for the whole
+    // --lock-res (default native): one fixed render res for the whole
     // session — the ScaleCtl/StepLimiter pair is never built/consulted.
     // quantize_res clamps the requested scale into the SDK range.
     let xess_lock = opts.lock_scale.and_then(|r| {
@@ -3850,7 +3850,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     // BLAS/TLAS, and — in upscaler sessions — the feed wiring). The session
     // sub-mode mirrors the CPU defaults: DLSS-RR when supported, XeSS with
     // --xess, plain with --no-dlss. The render resolution is LOCKED for the
-    // session (from --lock-res, default quality = 2/3, quantized into the
+    // session (from --lock-res, default native = 1.0, quantized into the
     // upscaler's range) — the tracer's buffers are sized to it once; there
     // is no DRS on the GPU path. Any init failure falls back to the CPU
     // renderer with the reason on stderr. With Streamline live the tracer's
@@ -3867,12 +3867,12 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     let (mut grw, mut grh) = (W, H);
     if opts.gpu {
         // Session sub-mode + locked trace res. `--lock-res dynamic` can't be
-        // honored here (no DRS on the GPU path): lock at quality instead.
+        // honored here (no DRS on the GPU path): lock at the native default.
         let lock = opts.lock_scale.unwrap_or_else(|| {
             if dlss_on || xess_on {
-                eprintln!("gpu: dynamic render res is unsupported under --gpu; locking at quality (2/3)");
+                eprintln!("gpu: dynamic render res is unsupported under --gpu; locking at native (100%)");
             }
-            2.0 / 3.0
+            1.0
         });
         if dlss_on {
             gpu_up = GpuUp::Rr;
