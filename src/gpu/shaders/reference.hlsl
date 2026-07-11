@@ -24,18 +24,21 @@ void cs_reference(uint3 id : SV_DispatchThreadID) {
     }
     float3 dir = ray_dir(float(id.x) + jx, float(id.y) + jy);
 
+    uint pi = id.y * rw + id.x;
     HitInfo hit;
     float3 c;
     float t;
+    PrimSurf ps;
     if (trace_closest(cam_origin.xyz, dir, 0.0, FLT_MAX, hit)) {
-        c = shade_full(cam_origin.xyz, dir, hit, rng);
+        c = shade_full(cam_origin.xyz, dir, hit, rng, ps);
         t = hit.t;
+        gbuf_write_hit(pi, float(id.x) + jx, float(id.y) + jy, dir, hit.t, ps);
     } else {
         c = sky_color(dir);
         t = INF;
+        gbuf_write_sky(pi, float(id.x) + jx, float(id.y) + jy, dir);
     }
 
-    uint pi = id.y * rw + id.x;
     uint i3 = pi * 3u;
     // splat: frame 0 (or non-accumulating) stores — the implicit clear.
     if (frame == 0u || (flags & FLAG_ACCUM) == 0u) {

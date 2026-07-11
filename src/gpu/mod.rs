@@ -219,7 +219,7 @@ impl GpuContext {
         let blit = upload::BlitUpload::new(&d3d, w, h)?;
         let hdr = upload::HdrUpload::new(&d3d, w, h)?;
         let rr_res = if sl.is_some() {
-            let r = rr::RrResources::new(&d3d, rr_opt, rr_min, rr_max, w, h)?;
+            let r = rr::RrResources::new(&d3d.device, rr_opt, rr_min, rr_max, w, h)?;
             passes.create_srv(
                 &d3d.device,
                 &r.output,
@@ -260,7 +260,7 @@ impl GpuContext {
                         "xess: {}x{} -> optimal {}x{} (range {}x{}..{}x{})",
                         w, h, opt.x, opt.y, min.x, min.y, max.x, max.y,
                     );
-                    match xr::XessResources::new(&d3d, max.x, max.y, w, h) {
+                    match xr::XessResources::new(&d3d.device, max.x, max.y, w, h) {
                         Ok(r) => {
                             passes.create_srv(
                                 &d3d.device,
@@ -312,22 +312,67 @@ impl GpuContext {
 
     /// Bring up the GPU-resident tracer: capability gates, kernel compiles,
     /// scene upload + BLAS/TLAS build (synchronous, one-time), HDR SRV wire-up.
+    /// `(rw, rh)` is the session's fixed trace resolution (the locked render
+    /// res in upscaler sessions, the window size otherwise); `gbuf` sizes the
+    /// G-buffer pack (full-size iff an upscaler will consume it).
     pub fn init_trace(
         &mut self,
         dxc: &dxc::Dxc,
         scene: &crate::scene::Scene,
         bvh: &crate::bvh::Bvh,
+        rw: u32,
+        rh: u32,
+        gbuf: bool,
         debug: bool,
     ) -> Result<()> {
-        let mut tg = trace::TraceGpu::new(
-            &self.d3d.device,
-            dxc,
-            scene,
-            bvh,
-            self.d3d.width,
-            self.d3d.height,
-            debug,
-        )?;
+        let mut tg = trace::TraceGpu::new(&self.d3d.device, dxc, scene, bvh, rw, rh, gbuf, debug)?;
+        // Upscaler sessions: wire the live upscaler's input planes as feed
+        // targets — the feed kernel writes them directly, no CPU upload. The
+        // trace res was quantize_res-clamped by the caller, but the range is
+        // the SDK's contract: re-check here so a drift fails loudly at init.
+        if gbuf {
+            if let Some(rr) = &self.rr {
+                if rw < rr.min.0 || rh < rr.min.1 || rw > rr.max.0 || rh > rr.max.1 {
+                    return Err(format!(
+                        "trace res {}x{} outside DLSS-RR render range {}x{}..{}x{}",
+                        rw, rh, rr.min.0, rr.min.1, rr.max.0, rr.max.1
+                    ));
+                }
+                let pl = rr.plane_resources();
+                tg.wire_feed(
+                    &self.d3d.device,
+                    trace::FeedKind::Rr,
+                    &[
+                        (trace::FEED_COLOR, pl[0].0, pl[0].1),
+                        (trace::FEED_NR, pl[1].0, pl[1].1),
+                        (trace::FEED_DEPTH, pl[2].0, pl[2].1),
+                        (trace::FEED_MVEC, pl[3].0, pl[3].1),
+                        (trace::FEED_ALB, pl[4].0, pl[4].1),
+                        (trace::FEED_SPEC, pl[5].0, pl[5].1),
+                        (trace::FEED_SPECHIT, pl[6].0, pl[6].1),
+                    ],
+                )?;
+            } else if let Some(x) = &self.xess {
+                if rw < x.min.0 || rh < x.min.1 || rw > x.max.0 || rh > x.max.1 {
+                    return Err(format!(
+                        "trace res {}x{} outside XeSS input range {}x{}..{}x{}",
+                        rw, rh, x.min.0, x.min.1, x.max.0, x.max.1
+                    ));
+                }
+                let pl = x.res.plane_resources();
+                tg.wire_feed(
+                    &self.d3d.device,
+                    trace::FeedKind::Xess,
+                    &[
+                        (trace::FEED_COLOR, pl[0].0, pl[0].1),
+                        (trace::FEED_MVEC, pl[1].0, pl[1].1),
+                        (trace::FEED_DEPTH, pl[2].0, pl[2].1),
+                    ],
+                )?;
+            } else {
+                return Err("gbuf session with no live upscaler".into());
+            }
+        }
         let mut rec = Ok(());
         self.d3d.run_once(|l| rec = tg.scene.record_upload(l))?;
         rec?;
@@ -375,8 +420,91 @@ impl GpuContext {
         self.d3d.end_frame(slot)
     }
 
+    /// XeSS-SR fed by the GPU-resident tracer (`--gpu --xess`): one command
+    /// list = trace (wavefront or reference) -> feed (pack -> input planes,
+    /// on-GPU — the CPU upload of the xr.rs path does not exist here) ->
+    /// XeSS upscale -> tonemap(SRV_SLOT_XESS) -> present. `jitter` is the
+    /// renderer's sample offset; xess::JITTER_SIGN settles the reported sign,
+    /// nowhere else.
+    pub fn present_trace_xess(
+        &mut self,
+        p: &trace::FrameParams,
+        hybrid: bool,
+        jitter: (f32, f32),
+        reset: bool,
+    ) -> Result<()> {
+        if self.trace.is_none() || self.xess.is_none() {
+            return Err("GPU tracer + XeSS not both initialized".into());
+        }
+        let slot = self.d3d.begin_frame()?;
+        {
+            // Field-split borrows: the recorder reads the tracer, abort needs
+            // d3d mutably.
+            let d3d = &mut self.d3d;
+            let tg = self.trace.as_ref().unwrap();
+            tg.write_cb(slot, p);
+            tg.record_frame(&d3d.list, slot, p, hybrid);
+            if let Err(e) = tg.record_feed(&d3d.list, slot) {
+                d3d.abort_frame();
+                return Err(e);
+            }
+        }
+        {
+            let d3d = &mut self.d3d;
+            let tg = self.trace.as_ref().unwrap();
+            let x = self.xess.as_ref().unwrap();
+            unsafe {
+                d3d.list.ResourceBarrier(&[transition(
+                    &x.res.output,
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+            }
+            let (c, m, d) = x.res.input_ptrs();
+            let params = crate::xess::XessD3d12ExecuteParams {
+                color_texture: c,
+                velocity_texture: m,
+                depth_texture: d,
+                exposure_scale_texture: std::ptr::null_mut(),
+                responsive_pixel_mask_texture: std::ptr::null_mut(),
+                output_texture: x.res.output.as_raw(),
+                jitter_offset_x: crate::xess::JITTER_SIGN * jitter.0,
+                jitter_offset_y: crate::xess::JITTER_SIGN * jitter.1,
+                exposure_scale: 1.0,
+                reset_history: reset as u32,
+                input_width: tg.rw,
+                input_height: tg.rh,
+                input_color_base: Default::default(),
+                input_motion_vector_base: Default::default(),
+                input_depth_base: Default::default(),
+                input_responsive_mask_base: Default::default(),
+                reserved0: Default::default(),
+                output_color_base: Default::default(),
+                descriptor_heap: std::ptr::null_mut(),
+                descriptor_heap_offset: 0,
+            };
+            if let Err(e) = x.ctx.execute(d3d.list.as_raw(), &params) {
+                d3d.abort_frame();
+                return Err(e);
+            }
+            unsafe {
+                d3d.list.ResourceBarrier(&[transition(
+                    &x.res.output,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                )]);
+            }
+        }
+        // The tonemap pass re-binds root sig/PSO/heaps/viewport from scratch,
+        // restoring whatever list state the XeSS dispatch left behind.
+        self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_XESS, 1.0);
+        self.d3d.end_frame(slot)
+    }
+
     /// Screenshot path for GPU-trace mode (the image exists only on the GPU).
-    pub fn read_trace_output(&mut self) -> Result<Vec<u32>> {
+    /// Returns (pixels, w, h) — the tracer's hdr is render-res in upscaler
+    /// sessions.
+    pub fn read_trace_output(&mut self) -> Result<(Vec<u32>, usize, usize)> {
         let Some(tg) = &self.trace else {
             return Err("GPU tracer not initialized".into());
         };
@@ -418,6 +546,7 @@ impl GpuContext {
             accumulate: true,
             jitter: false,
             frame_jitter: None,
+            prev_cam: None,
             q: crate::shade::Quality { fb: crate::shade::FrustumBounce::OFF, ..q },
             verify: false,
         };
@@ -543,7 +672,10 @@ impl GpuContext {
             ));
         }
         let slot = self.d3d.begin_frame()?;
-        x.res.record_upload(&self.d3d, slot, color, g, rw, rh, near, far);
+        if let Err(e) = x.res.record_upload(&self.d3d, slot, color, g, rw, rh, near, far) {
+            self.d3d.abort_frame();
+            return Err(e);
+        }
         unsafe {
             self.d3d.list.ResourceBarrier(&[transition(
                 &x.res.output,
@@ -641,7 +773,10 @@ impl GpuContext {
     ) -> Result<()> {
         let slot = self.record_xess_dispatch(color, g, rw, rh, jitter, reset, near, far)?;
         let x = self.xess.as_ref().unwrap();
-        x.res.record_readback(&self.d3d);
+        if let Err(e) = x.res.record_readback(&self.d3d) {
+            self.d3d.abort_frame();
+            return Err(e);
+        }
         self.d3d.submit_and_wait(slot)?;
         x.res.read_back(out)
     }
@@ -669,7 +804,10 @@ impl GpuContext {
             ));
         }
         let slot = self.d3d.begin_frame()?;
-        rr.record_upload(&self.d3d, slot, accum, g, fc.rw, fc.rh);
+        if let Err(e) = rr.record_upload(&self.d3d, slot, accum, g, fc.rw, fc.rh) {
+            self.d3d.abort_frame();
+            return Err(e);
+        }
         unsafe {
             self.d3d.list.ResourceBarrier(&[transition(
                 &rr.output,
@@ -714,6 +852,85 @@ impl GpuContext {
         self.d3d.end_frame(slot)
     }
 
+    /// DLSS-RR fed by the GPU-resident tracer (`--gpu` default): one command
+    /// list = trace -> feed (pack -> the 7 SL input planes, on-GPU — the CPU
+    /// upload of present_rr does not exist here) -> the SL sequence (token,
+    /// constants, options, tags, evaluate) -> tonemap(SRV_SLOT_RR) ->
+    /// present. The whole list executes on the SL PROXY queue (validated in
+    /// M7); the feed's back-transitions leave the planes in
+    /// NON_PIXEL_SHADER_RESOURCE, exactly what rr.tags declares at evaluate.
+    pub fn present_trace_rr(
+        &mut self,
+        p: &trace::FrameParams,
+        hybrid: bool,
+        fc: &dlss::FrameConstants,
+        frame_idx: u32,
+    ) -> Result<()> {
+        if self.trace.is_none() || self.sl.is_none() || self.rr.is_none() {
+            return Err("GPU tracer + DLSS-RR not both initialized".into());
+        }
+        let slot = self.d3d.begin_frame()?;
+        {
+            let d3d = &mut self.d3d;
+            let tg = self.trace.as_ref().unwrap();
+            // The session res is fixed and range-checked at init; fc must
+            // agree (it drives the extent tags SL derives the ratio from).
+            if (fc.rw as u32, fc.rh as u32) != (tg.rw, tg.rh) {
+                d3d.abort_frame();
+                return Err(format!(
+                    "frame constants {}x{} != trace res {}x{}",
+                    fc.rw, fc.rh, tg.rw, tg.rh
+                ));
+            }
+            tg.write_cb(slot, p);
+            tg.record_frame(&d3d.list, slot, p, hybrid);
+            if let Err(e) = tg.record_feed(&d3d.list, slot) {
+                d3d.abort_frame();
+                return Err(e);
+            }
+        }
+        {
+            let d3d = &mut self.d3d;
+            let sl = self.sl.as_ref().unwrap();
+            let rr = self.rr.as_ref().unwrap();
+            unsafe {
+                d3d.list.ResourceBarrier(&[transition(
+                    &rr.output,
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+            }
+            // The per-frame SL sequence, verbatim from present_rr: token ->
+            // constants -> options -> tags -> evaluate. The jitter sign
+            // reported to SL is settled inside shim_constants, nowhere else.
+            let list_raw = d3d.list.as_raw();
+            let sl_seq = || -> Result<()> {
+                let token = sl.new_frame_token(frame_idx)?;
+                sl.set_constants(token, 0, &shim_constants(fc))?;
+                sl.dlssd_set_options(0, &shim_options(fc, rr.ow, rr.oh))?;
+                sl.tag_resources(token, 0, &rr.tags(fc.rw, fc.rh), list_raw)?;
+                sl.evaluate(streamline_sys::FEATURE_DLSS_RR, token, 0, list_raw)?;
+                Ok(())
+            };
+            if let Err(e) = sl_seq() {
+                d3d.abort_frame();
+                return Err(e);
+            }
+            unsafe {
+                d3d.list.ResourceBarrier(&[transition(
+                    &rr.output,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                )]);
+            }
+        }
+        // The tonemap pass re-binds root sig/PSO/heaps/viewport from scratch —
+        // the post-evaluate state restore eDisableCLStateTracking makes the
+        // host's responsibility.
+        self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_RR, 1.0);
+        self.d3d.end_frame(slot)
+    }
+
     /// Read back the denoised RR output and tonemap it on the CPU with the
     /// same curve as `render::resolve` at 1 spp. Screenshots in DLSS mode
     /// need this — the denoised image exists only in GPU memory. Synchronous
@@ -723,7 +940,7 @@ impl GpuContext {
             return Err("DLSS-RR not initialized".into());
         };
         let output = rr.output.clone();
-        self.read_hdr_output(output)
+        Ok(self.read_hdr_output(output)?.0)
     }
 
     /// XeSS twin of `read_rr_output`: the upscaled image exists only on the
@@ -733,11 +950,15 @@ impl GpuContext {
             return Err("XeSS not initialized".into());
         };
         let output = x.res.output.clone();
-        self.read_hdr_output(output)
+        Ok(self.read_hdr_output(output)?.0)
     }
 
-    fn read_hdr_output(&mut self, output: ID3D12Resource) -> Result<Vec<u32>> {
-        let (w, h) = (self.d3d.width as usize, self.d3d.height as usize);
+    /// Dims come from the texture itself — the tracer's hdr is RENDER-res in
+    /// upscaler sessions, window-res otherwise; rr/xess outputs are always
+    /// window-res.
+    fn read_hdr_output(&mut self, output: ID3D12Resource) -> Result<(Vec<u32>, usize, usize)> {
+        let desc = unsafe { output.GetDesc() };
+        let (w, h) = (desc.Width as usize, desc.Height as usize);
         let pitch = d3d12::aligned_pitch(w * 8);
         let rb = d3d12::ReadbackBuffer::new(&self.d3d.device, pitch * h)?;
         let fp = d3d12::footprint(
@@ -785,7 +1006,7 @@ impl GpuContext {
             }
         }
         unsafe { rb.resource.Unmap(0, None) };
-        Ok(out)
+        Ok((out, w, h))
     }
 
     /// M1: present the CPU-tonemapped u32 0RGB frame.

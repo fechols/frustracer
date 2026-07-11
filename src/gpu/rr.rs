@@ -1,7 +1,8 @@
 //! DLSS Ray Reconstruction resources: one texture per SL buffer tag, a
-//! single persistently-mapped upload ring (per-frame slots), the CPU→GPU
-//! conversion loops, and the ResourceTag table handed to Streamline each
-//! frame. Input planes are allocated once at the optimal-settings query's
+//! single persistently-mapped upload ring (per-frame slots, allocated
+//! lazily on first CPU upload — --gpu feed sessions write the planes in
+//! place and never pay for it), the CPU→GPU conversion loops, and the
+//! ResourceTag table handed to Streamline each frame. Input planes are allocated once at the optimal-settings query's
 //! range MAX; every frame uploads (and tags, via sl::Extent) only the
 //! top-left `rw×rh` sub-rect — step-wise dynamic resolution, the same
 //! allocate-max/name-a-sub-rect pattern as gpu/xr.rs. The output stays at
@@ -42,7 +43,11 @@ pub struct RrResources {
     pub max: (u32, u32),
     planes: [Plane; 7], // upload order: color, normal_rough, depth, mvec, albedo, spec_albedo, spec_hit
     pub output: ID3D12Resource, // RGBA16F UAV, written by RR, read by the tonemap
-    upload: UploadBuffer,
+    /// CPU-upload ring, lazily allocated on first `record_upload` — a --gpu
+    /// feed session never touches it (the feed kernel writes the planes in
+    /// place), so its slot_stride × FRAMES_IN_FLIGHT bytes stay uncommitted.
+    upload: std::sync::OnceLock<UploadBuffer>,
+    device: ID3D12Device,
     slot_stride: usize,
 }
 
@@ -56,7 +61,7 @@ const P_SPEC_HIT: usize = 6;
 
 impl RrResources {
     pub fn new(
-        d3d: &D3d,
+        device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
         opt: (u32, u32),
         min: (u32, u32),
         max: (u32, u32),
@@ -76,21 +81,24 @@ impl RrResources {
         let mut offset = 0usize;
         let mut planes = Vec::with_capacity(7);
         for (format, bpp) in specs {
+            // ALLOW_UNORDERED_ACCESS: the --gpu feed kernel writes these
+            // planes directly (the CPU path keeps the upload copies — the
+            // rest state stays NON_PIXEL_SHADER_RESOURCE either way, which is
+            // what the SL tags declare at evaluate).
             let tex = committed_tex(
-                &d3d.device,
+                device,
                 max_w,
                 max_h,
                 format,
-                D3D12_RESOURCE_FLAG_NONE,
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
             )?;
             planes.push(Plane { tex, format, bpp, offset });
             offset += aligned_pitch(max_w as usize * bpp) * max_h as usize;
         }
         let slot_stride = offset;
-        let upload = UploadBuffer::new(&d3d.device, slot_stride * FRAMES_IN_FLIGHT)?;
         let output = committed_tex(
-            &d3d.device,
+            device,
             ow,
             oh,
             DXGI_FORMAT_R16G16B16A16_FLOAT,
@@ -98,7 +106,45 @@ impl RrResources {
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
         )?;
         let planes: [Plane; 7] = planes.try_into().map_err(|_| "plane count".to_string())?;
-        Ok(Self { max_w, max_h, ow, oh, opt, min, max, planes, output, upload, slot_stride })
+        Ok(Self {
+            max_w,
+            max_h,
+            ow,
+            oh,
+            opt,
+            min,
+            max,
+            planes,
+            output,
+            upload: std::sync::OnceLock::new(),
+            device: device.clone(),
+            slot_stride,
+        })
+    }
+
+    /// The upload ring, allocated on first use (interior mutability so the
+    /// recording path keeps `&self`).
+    fn upload_buf(&self) -> Result<&UploadBuffer> {
+        if self.upload.get().is_none() {
+            let buf = UploadBuffer::new(&self.device, self.slot_stride * FRAMES_IN_FLIGHT)?;
+            let _ = self.upload.set(buf);
+        }
+        Ok(self.upload.get().unwrap())
+    }
+
+    /// The input planes as (resource, format) in the FEED register order
+    /// (color, normal_rough, depth, mvec, albedo, spec_albedo, spec_hit —
+    /// u16..u22) — the --gpu feed path's wiring/barrier handle.
+    pub fn plane_resources(&self) -> [(&ID3D12Resource, DXGI_FORMAT); 7] {
+        [
+            (&self.planes[P_COLOR].tex, self.planes[P_COLOR].format),
+            (&self.planes[P_NORMAL_ROUGH].tex, self.planes[P_NORMAL_ROUGH].format),
+            (&self.planes[P_DEPTH].tex, self.planes[P_DEPTH].format),
+            (&self.planes[P_MVEC].tex, self.planes[P_MVEC].format),
+            (&self.planes[P_ALBEDO].tex, self.planes[P_ALBEDO].format),
+            (&self.planes[P_SPEC_ALBEDO].tex, self.planes[P_SPEC_ALBEDO].format),
+            (&self.planes[P_SPEC_HIT].tex, self.planes[P_SPEC_HIT].format),
+        ]
     }
 
     /// Convert the CPU frame's `rw×rh` sub-rect into the slot's upload
@@ -116,7 +162,8 @@ impl RrResources {
         g: &GBufs,
         rw: usize,
         rh: usize,
-    ) {
+    ) -> Result<()> {
+        let upload = self.upload_buf()?;
         let (w, h) = (rw, rh);
         debug_assert_eq!((g.rw, g.rh), (w, h));
         debug_assert!(w <= self.max_w as usize && h <= self.max_h as usize);
@@ -125,7 +172,7 @@ impl RrResources {
         let plane_mem = |p: &Plane| -> &mut [u8] {
             let pitch = aligned_pitch(w * p.bpp);
             unsafe {
-                std::slice::from_raw_parts_mut(self.upload.ptr.add(base + p.offset), pitch * h)
+                std::slice::from_raw_parts_mut(upload.ptr.add(base + p.offset), pitch * h)
             }
         };
         let load = |b: &[AtomicU32], i: usize| f32::from_bits(b[i].load(Relaxed));
@@ -255,7 +302,7 @@ impl RrResources {
                     0,
                     0,
                     0,
-                    &loc_footprint(&self.upload.resource, fp),
+                    &loc_footprint(&upload.resource, fp),
                     None,
                 )
             };
@@ -272,6 +319,7 @@ impl RrResources {
             })
             .collect();
         unsafe { d3d.list.ResourceBarrier(&to_srv) };
+        Ok(())
     }
 
     /// The full tag table for slEvaluateFeature(DLSS-RR). States must be the

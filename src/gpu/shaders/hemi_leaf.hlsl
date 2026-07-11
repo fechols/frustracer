@@ -54,7 +54,8 @@ void cs_hemi_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
         HitInfo h;
         if (trace_closest(pt.o, d, tc, FLT_MAX, h)) {
             float3 w3, o3, n3;
-            float3 l = shade_split(pt.o, d, h, rng, 1u, 0u, false, false, w3, o3, n3);
+            PrimSurf ps_unused; // bounce rays never capture (secondary-ray rule)
+            float3 l = shade_split(pt.o, d, h, rng, 1u, 0u, false, false, w3, o3, n3, ps_unused);
             hemi_add3(pt.pixel, l * weight);
         } else {
             hemi_add3(pt.pixel, sky_color(d) * weight);

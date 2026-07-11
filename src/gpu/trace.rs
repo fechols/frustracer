@@ -36,6 +36,20 @@ pub const NUM_UAVS: u32 = 14;
 pub const RP_SRV0: u32 = RP_UAV0 + NUM_UAVS;
 pub const NUM_SRVS: u32 = 8;
 pub const RP_TEX: u32 = RP_SRV0 + NUM_SRVS;
+// The G-buffer pack root UAV (register u15), appended AFTER the table so the
+// established param indices never renumber. 53/64 root-signature DWORDs.
+pub const RP_GBUF: u32 = RP_TEX + 1;
+/// Upscaler feed-target texture UAVs: registers u16..u22, riding the u14
+/// descriptor table as a second range at heap slots 1..7 (0 DWORDs extra).
+/// The register/type layout is shared by both feed kernels (feed.hlsl).
+pub const NUM_FEED: u32 = 7;
+pub const FEED_COLOR: u32 = 16; // RGBA16F (both upscalers)
+pub const FEED_NR: u32 = 17; // RGBA16F normal+rough (RR)
+pub const FEED_DEPTH: u32 = 18; // R32F (both; encoding differs per kernel)
+pub const FEED_MVEC: u32 = 19; // RG16F (both)
+pub const FEED_ALB: u32 = 20; // RGBA8 diffuse albedo (RR)
+pub const FEED_SPEC: u32 = 21; // RGBA8 specular albedo (RR)
+pub const FEED_SPECHIT: u32 = 22; // R16F spec hit distance (RR)
 
 // SRV register assignments (t0..t7) — shared across every kernel; a kernel
 // declares only what it reads, DXC strips the rest.
@@ -106,7 +120,7 @@ pub const HEMI_BATCH: u32 = 16384;
 /// Max fb.depth the hemi queue sizing supports (presets top out at 4).
 const HEMI_MAX_DEPTH: u32 = 4;
 
-const CB_STRIDE: usize = 256; // root-CBV alignment
+const CB_STRIDE: usize = 512; // root-CBV alignment (FrameCb is 304 bytes)
 
 /// Quadtree depth to the leaf frontier: smallest D with
 /// max(rw, rh) / 2^D <= LEAF_TILE (temporal.rs uses the same formula).
@@ -136,6 +150,7 @@ const LEAF_HLSL: &str = include_str!("shaders/leaf.hlsl");
 const HEMI_WAVE_HLSL: &str = include_str!("shaders/hemi_wave.hlsl");
 const HEMI_LEAF_HLSL: &str = include_str!("shaders/hemi_leaf.hlsl");
 const COMPOSE_HLSL: &str = include_str!("shaders/compose.hlsl");
+const FEED_HLSL: &str = include_str!("shaders/feed.hlsl");
 
 /// What the GPU tracer requires, queried once. RayQuery in compute needs
 /// RaytracingTier 1.1 AND shader model 6.5; missing either is a clean
@@ -246,22 +261,43 @@ pub fn create_root_signature(device: &ID3D12Device) -> Result<ID3D12RootSignatur
             ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
         });
     }
-    // The one descriptor table: u8 = the typed RGBA16F output texture
-    // (resolve pass only). `ranges` must outlive serialization below.
-    let ranges = [D3D12_DESCRIPTOR_RANGE {
-        RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
-        NumDescriptors: 1,
-        BaseShaderRegister: NUM_UAVS,
-        RegisterSpace: 0,
-        OffsetInDescriptorsFromTableStart: 0,
-    }];
+    // The one descriptor table (1 DWORD total, both ranges): u14 = the typed
+    // RGBA16F output texture (resolve pass), u16..u22 = the upscaler feed
+    // targets (heap slots 1..7; wire_feed builds the descriptors, null
+    // elsewhere — RS 1.0 descriptors are volatile, only accessed slots must
+    // be valid). u15 is skipped: it's the RP_GBUF root UAV.
+    // `ranges` must outlive serialization below.
+    let ranges = [
+        D3D12_DESCRIPTOR_RANGE {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+            NumDescriptors: 1,
+            BaseShaderRegister: NUM_UAVS,
+            RegisterSpace: 0,
+            OffsetInDescriptorsFromTableStart: 0,
+        },
+        D3D12_DESCRIPTOR_RANGE {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+            NumDescriptors: NUM_FEED,
+            BaseShaderRegister: NUM_UAVS + 2,
+            RegisterSpace: 0,
+            OffsetInDescriptorsFromTableStart: 1,
+        },
+    ];
     params.push(D3D12_ROOT_PARAMETER {
         ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
         Anonymous: D3D12_ROOT_PARAMETER_0 {
             DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
-                NumDescriptorRanges: 1,
+                NumDescriptorRanges: 2,
                 pDescriptorRanges: ranges.as_ptr(),
             },
+        },
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+    });
+    // RP_GBUF: the G-buffer pack (u15), appended last (see the const note).
+    params.push(D3D12_ROOT_PARAMETER {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+        Anonymous: D3D12_ROOT_PARAMETER_0 {
+            Descriptor: D3D12_ROOT_DESCRIPTOR { ShaderRegister: NUM_UAVS + 1, RegisterSpace: 0 },
         },
         ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
     });
@@ -810,8 +846,13 @@ pub const FLAG_ACCUM: u32 = 1;
 pub const FLAG_JITTER: u32 = 2;
 pub const FLAG_FRAME_JITTER: u32 = 4;
 pub const FLAG_VERIFY: u32 = 8;
+/// G-buffer pack writes on. Set ONLY when the pack is full-size (upscaler
+/// sessions) — root UAVs have no bounds check and the plain-session pack is
+/// a 64-byte dummy, so this flag is memory safety, not an optimization.
+pub const FLAG_GBUF: u32 = 16;
+pub const FLAG_HAS_PREV: u32 = 32;
 
-/// Mirror of `cbuffer Frame` in trace_common.hlsli (192 bytes, 16-aligned
+/// Mirror of `cbuffer Frame` in trace_common.hlsli (304 bytes, 16-aligned
 /// rows — float3s ride in float4 slots with scalars packed in .w).
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -848,7 +889,16 @@ struct FrameCb {
     cap_hemi_leaf: u32,
     cap_hemi_cut: u32,
     _pad3: u32,
+    // Previous frame's camera basis for G-buffer MVs; near/far ride the w
+    // slots of the last two rows (scene-static, from dlss::near_far).
+    prev_origin: [f32; 4],  // xyz; w = prev inv_w
+    prev_forward: [f32; 4], // xyz; w = prev inv_h
+    prev_right: [f32; 4],   // xyz; w = near
+    prev_up: [f32; 4],      // xyz; w = far
 }
+// The HLSL cbuffer is hand-mirrored across 7 concatenated compile units —
+// a size drift here corrupts every field after the drift point.
+const _: () = assert!(std::mem::size_of::<FrameCb>() == 304);
 
 /// Everything that varies per frame, CPU-side.
 pub struct FrameParams {
@@ -857,9 +907,20 @@ pub struct FrameParams {
     pub accumulate: bool,
     pub jitter: bool,
     pub frame_jitter: Option<(f32, f32)>,
+    /// Previous frame's camera basis for G-buffer motion vectors (upscaler
+    /// sessions; None = mv (0,0), consumed as disocclusion).
+    pub prev_cam: Option<CamBasis>,
     pub q: Quality,
     /// Check builds: hemi claim re-validation + PSA accounting on the GPU.
     pub verify: bool,
+}
+
+/// Which upscaler the feed pass targets — selects the kernel (and thereby
+/// the plane set and the u18 depth encoding).
+#[derive(Clone, Copy, PartialEq)]
+pub enum FeedKind {
+    Xess,
+    Rr,
 }
 
 /// 0 = off, 1 = AO, 2 = GI (GI subsumes AO, mirroring shade.rs's tiering).
@@ -891,6 +952,11 @@ pub struct TraceGpu {
     pso_hemi_cell: ID3D12PipelineState,
     pso_hemi_leaf: ID3D12PipelineState,
     pso_compose: ID3D12PipelineState,
+    pso_feed_xess: Option<ID3D12PipelineState>,
+    pso_feed_rr: Option<ID3D12PipelineState>,
+    /// The wired upscaler feed targets (wire_feed): plane resources cloned
+    /// for record_feed's barriers, plus which feed kernel consumes them.
+    feed: Option<(FeedKind, Vec<ID3D12Resource>)>,
     pub scene: SceneGpu,
     /// Per-pixel planes, CPU-layout parity (accum = 3 f32/px, tbuf = f32/px,
     /// info = u32/px) so readback compares are direct memcmp-shaped.
@@ -919,6 +985,11 @@ pub struct TraceGpu {
     /// RGBA16F resolve target; rests in PIXEL_SHADER_RESOURCE between frames
     /// (the tonemap PS reads it via SRV_SLOT_GPU).
     pub hdr: ID3D12Resource,
+    /// The G-buffer pack (GBufPx, 64 B/px) — full-size in upscaler sessions,
+    /// a 64-byte dummy otherwise (`gbuf_full` gates FLAG_GBUF, which is what
+    /// keeps the write helpers from scribbling past the dummy).
+    pub gbuf: ID3D12Resource,
+    gbuf_full: bool,
     uav_heap: ID3D12DescriptorHeap,
     frame_cb: d3d12::UploadBuffer,
     cb_base: FrameCb,
@@ -938,6 +1009,7 @@ impl TraceGpu {
         bvh: &Bvh,
         rw: u32,
         rh: u32,
+        gbuf_full: bool,
         debug: bool,
     ) -> Result<Self> {
         require_caps(device)?;
@@ -958,6 +1030,7 @@ impl TraceGpu {
             [TRACE_COMMON_HLSLI, CTR_HLSLI, HEMI_HLSLI, RT_HLSLI, SHADE_HLSLI, HEMI_LEAF_HLSL]
                 .join("\n");
         let compose_src = [TRACE_COMMON_HLSLI, CTR_HLSLI, QUEUES_HLSLI, COMPOSE_HLSL].join("\n");
+        let feed_src = [TRACE_COMMON_HLSLI, FEED_HLSL].join("\n");
         let mut pso = |src: &str, entry: &str, what: &str| -> Result<ID3D12PipelineState> {
             compute_pso(device, &root_sig, &dxc.compile(src, entry, "cs_6_5", what, debug)?, what)
         };
@@ -976,6 +1049,16 @@ impl TraceGpu {
         let pso_hemi_cell = pso(&hemi_wave_src, "cs_hemi_cell", "hemi_cell")?;
         let pso_hemi_leaf = pso(&hemi_leaf_src, "cs_hemi_leaf", "hemi_leaf")?;
         let pso_compose = pso(&compose_src, "cs_compose", "compose")?;
+        // Feed kernels exist only when the pack is full-size (an upscaler
+        // session); plain sessions never record a feed.
+        let (pso_feed_xess, pso_feed_rr) = if gbuf_full {
+            (
+                Some(pso(&feed_src, "cs_feed_xess", "feed_xess")?),
+                Some(pso(&feed_src, "cs_feed_rr", "feed_rr")?),
+            )
+        } else {
+            (None, None)
+        };
 
         let scene_gpu = SceneGpu::new(device, scene, bvh)?;
 
@@ -1034,10 +1117,17 @@ impl TraceGpu {
             uaf,
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
         )?;
+        // The G-buffer pack: dlss::GBufs interleaved on the GPU. Full-size
+        // only in upscaler sessions — plain sessions bind a 64-byte dummy
+        // and never set FLAG_GBUF (root UAVs have no bounds check).
+        let gbuf = committed_buffer(device, if gbuf_full { px * 64 } else { 64 }, uaf, ua)?;
+        // Slot 0 = hdr (u14, resolve); slots 1..7 = the upscaler feed targets
+        // (u16..u22), wired per session by wire_feed — null until then (RS 1.0
+        // descriptors are volatile; only accessed slots must be valid).
         let uav_heap: ID3D12DescriptorHeap = unsafe {
             device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                NumDescriptors: 1,
+                NumDescriptors: 1 + NUM_FEED,
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                 ..Default::default()
             })
@@ -1081,12 +1171,15 @@ impl TraceGpu {
             (&hq_leaf, "trace.hemi_leaf_queue"),
             (&hemi_cut, "trace.hemi_cut_pool"),
             (&hdr, "trace.hdr"),
+            (&gbuf, "trace.gbuf_pack"),
         ] {
             name(res, n);
         }
 
-        // Scene-static CB fields, prefilled once.
+        // Scene-static CB fields, prefilled once. near/far ride the prev
+        // block's w slots (dlss::near_far — the G-buffer sky depth source).
         let sun = crate::render::sun_dir(scene);
+        let (near, far) = crate::dlss::near_far(scene.diag);
         let v4 = |v: Vec3A, w: f32| [v.x, v.y, v.z, w];
         let cb_base = FrameCb {
             cam_origin: [0.0; 4],
@@ -1121,6 +1214,10 @@ impl TraceGpu {
             cap_hemi_leaf: cap_hemi_cell as u32,
             cap_hemi_cut: cap_hemi_cut as u32,
             _pad3: 0,
+            prev_origin: [0.0; 4],
+            prev_forward: [0.0; 4],
+            prev_right: [0.0, 0.0, 0.0, near],
+            prev_up: [0.0, 0.0, 0.0, far],
         };
 
         Ok(Self {
@@ -1141,6 +1238,9 @@ impl TraceGpu {
             pso_hemi_cell,
             pso_hemi_leaf,
             pso_compose,
+            pso_feed_xess,
+            pso_feed_rr,
+            feed: None,
             scene: scene_gpu,
             accum,
             tbuf,
@@ -1161,6 +1261,8 @@ impl TraceGpu {
             hq_leaf,
             hemi_cut,
             hdr,
+            gbuf,
+            gbuf_full,
             uav_heap,
             frame_cb,
             cb_base,
@@ -1184,7 +1286,9 @@ impl TraceGpu {
         cb.flags = (p.accumulate as u32 * FLAG_ACCUM)
             | (p.jitter as u32 * FLAG_JITTER)
             | (p.frame_jitter.is_some() as u32 * FLAG_FRAME_JITTER)
-            | (p.verify as u32 * FLAG_VERIFY);
+            | (p.verify as u32 * FLAG_VERIFY)
+            | (self.gbuf_full as u32 * FLAG_GBUF)
+            | (p.prev_cam.is_some() as u32 * FLAG_HAS_PREV);
         cb.shadow_samples = p.q.shadow_samples;
         cb.ao_samples = p.q.ao_samples;
         cb.reflections = p.q.reflections as u32;
@@ -1194,6 +1298,15 @@ impl TraceGpu {
         };
         cb.fb_mode = fb_mode_of(&p.q);
         cb.fb_depth = p.q.fb.depth.clamp(1, HEMI_MAX_DEPTH);
+        if let Some(pc) = &p.prev_cam {
+            // The near/far riding the w slots of the last two rows come from
+            // cb_base and must survive the overwrite.
+            let (po, pf, pr, pu, piw, pih) = pc.gpu_fields();
+            cb.prev_origin = [po.x, po.y, po.z, piw];
+            cb.prev_forward = [pf.x, pf.y, pf.z, pih];
+            cb.prev_right = [pr.x, pr.y, pr.z, cb.prev_right[3]];
+            cb.prev_up = [pu.x, pu.y, pu.z, cb.prev_up[3]];
+        }
         unsafe {
             std::ptr::copy_nonoverlapping(
                 &cb as *const FrameCb as *const u8,
@@ -1259,6 +1372,7 @@ impl TraceGpu {
                 RP_UAV0 + UAV_HEMI_PTS,
                 self.hemi_pts.GetGPUVirtualAddress(),
             );
+            list.SetComputeRootUnorderedAccessView(RP_GBUF, self.gbuf.GetGPUVirtualAddress());
             let s = &self.scene;
             list.SetComputeRootShaderResourceView(
                 RP_SRV0 + SRV_BVH_NODES,
@@ -1570,6 +1684,101 @@ impl TraceGpu {
             list.ResourceBarrier(&[uav_barrier(None)]);
             self.record_hemi(list, n, fb_depth);
         })
+    }
+
+    /// Wire the upscaler feed targets into the descriptor heap (slots 1..7 =
+    /// registers u16..u22) and remember them for record_feed's barriers.
+    /// `targets` = (shader register, plane, format). Gated on typed-UAV-store
+    /// support per format (optional in D3D12) — an Err here means the caller
+    /// falls back to plain presentation, loudly.
+    pub fn wire_feed(
+        &mut self,
+        device: &ID3D12Device,
+        kind: FeedKind,
+        targets: &[(u32, &ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT)],
+    ) -> Result<()> {
+        for &(reg, _, format) in targets {
+            let mut fs = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: format, ..Default::default() };
+            unsafe {
+                device.CheckFeatureSupport(
+                    D3D12_FEATURE_FORMAT_SUPPORT,
+                    &mut fs as *mut _ as *mut _,
+                    std::mem::size_of::<D3D12_FEATURE_DATA_FORMAT_SUPPORT>() as u32,
+                )
+            }
+            .map_err(|e| format!("CheckFeatureSupport(format {}): {e}", format.0))?;
+            if fs.Support2.0 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0 == 0 {
+                return Err(format!(
+                    "feed target u{reg}: format {} lacks typed UAV store on this device",
+                    format.0
+                ));
+            }
+        }
+        let inc = unsafe {
+            device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+        } as usize;
+        let base = unsafe { self.uav_heap.GetCPUDescriptorHandleForHeapStart() };
+        let mut planes = Vec::with_capacity(targets.len());
+        for &(reg, res, format) in targets {
+            // A register outside the feed range would silently overwrite the
+            // hdr descriptor (slot 0) or write past the heap end — descriptor
+            // writes have no bounds check of their own, so gate in release.
+            if !(NUM_UAVS + 2..NUM_UAVS + 2 + NUM_FEED).contains(&reg) {
+                return Err(format!("feed target u{reg} outside u16..u22"));
+            }
+            let slot = (reg - (NUM_UAVS + 1)) as usize; // u16 -> heap slot 1
+            let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: format,
+                ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+                ..Default::default()
+            };
+            unsafe {
+                device.CreateUnorderedAccessView(
+                    res,
+                    None,
+                    Some(&desc),
+                    D3D12_CPU_DESCRIPTOR_HANDLE { ptr: base.ptr + slot * inc },
+                )
+            };
+            planes.push(res.clone());
+        }
+        self.feed = Some((kind, planes));
+        Ok(())
+    }
+
+    /// Fan the pack + accum out into the wired upscaler input planes — the
+    /// GPU-resident replacement for rr/xr::record_upload. Record AFTER
+    /// record_frame on the same list (its trailing global UAV barrier fences
+    /// the pack/accum writes). The planes transition NPSR -> UAV -> NPSR; the
+    /// back-transition is both the write->read sync and what keeps the
+    /// upscalers' state-at-use contracts truthful (RR's tags and XeSS's
+    /// bindings both declare NON_PIXEL_SHADER_RESOURCE).
+    pub fn record_feed(&self, list: &ID3D12GraphicsCommandList, slot: usize) -> Result<()> {
+        let Some((kind, planes)) = &self.feed else {
+            return Err("feed targets not wired".into());
+        };
+        let pso = match kind {
+            FeedKind::Xess => self.pso_feed_xess.as_ref(),
+            FeedKind::Rr => self.pso_feed_rr.as_ref(),
+        }
+        .ok_or("feed PSO missing (TraceGpu built without gbuf)")?;
+        unsafe {
+            let npsr = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            let ua = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            let to_uav: Vec<_> = planes.iter().map(|p| transition(p, npsr, ua)).collect();
+            list.ResourceBarrier(&to_uav);
+            self.bind_common(list, slot);
+            list.SetDescriptorHeaps(&[Some(self.uav_heap.clone())]);
+            list.SetComputeRootDescriptorTable(
+                RP_TEX,
+                self.uav_heap.GetGPUDescriptorHandleForHeapStart(),
+            );
+            list.SetPipelineState(pso);
+            list.Dispatch(self.rw.div_ceil(8), self.rh.div_ceil(8), 1);
+            let back: Vec<_> = planes.iter().map(|p| transition(p, ua, npsr)).collect();
+            list.ResourceBarrier(&back);
+        }
+        Ok(())
     }
 
     /// accum -> HDR texture at 1/samples; leaves hdr in PIXEL_SHADER_RESOURCE

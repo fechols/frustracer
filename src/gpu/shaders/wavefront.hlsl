@@ -229,5 +229,8 @@ void cs_sky(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
         ambw[i3 + 2u] = 0.0;
         tbuf[pi] = INF;
         info[pi] = pack_info(rec.depth, KIND_SKY);
+        // Pixel centers, matching the CPU sky-tile flood (leaf-tile sky
+        // pixels get the jittered position in leaf.hlsl instead).
+        gbuf_write_sky(pi, float(x) + 0.5, float(y) + 0.5, dir);
     }
 }

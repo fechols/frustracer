@@ -1,6 +1,7 @@
 //! XeSS-SR resources: three input planes (color, motion vectors, depth), a
-//! window-res output UAV, and the persistently-mapped upload ring — the
-//! `rr.rs` structure minus Streamline. The defining difference from DLSS-RR:
+//! window-res output UAV, and the persistently-mapped upload ring (lazily
+//! allocated — --gpu feed sessions never touch it) — the `rr.rs` structure
+//! minus Streamline. The defining difference from DLSS-RR:
 //! the input planes are allocated once at the *maximum* input resolution the
 //! range query allows, and every frame uploads (and XeSS reads, via
 //! `input_width/height`) only the top-left `rw×rh` sub-rect — dynamic
@@ -40,12 +41,18 @@ pub struct XessResources {
     oh: u32,
     planes: [Plane; 3], // color, mvec, depth
     pub output: ID3D12Resource, // RGBA16F UAV, written by XeSS, read by the tonemap
-    upload: UploadBuffer,
+    /// CPU-upload ring, lazily allocated on first `record_upload` — a --gpu
+    /// feed session never touches it (the feed kernel writes the planes in
+    /// place), so its slot_stride × FRAMES_IN_FLIGHT bytes stay uncommitted.
+    upload: std::sync::OnceLock<UploadBuffer>,
+    device: ID3D12Device,
     slot_stride: usize,
     /// Persistent window-res staging for the post-upscale denoise path —
     /// the upscaled HDR is pulled back to the CPU every frame there, so the
     /// buffer must not be a per-call allocation like the screenshot one.
-    readback: ReadbackBuffer,
+    /// Lazily allocated on first `record_readback` (only the OIDN-post
+    /// sub-mode ever reaches it).
+    readback: std::sync::OnceLock<ReadbackBuffer>,
 }
 
 const P_COLOR: usize = 0;
@@ -53,7 +60,13 @@ const P_MVEC: usize = 1;
 const P_DEPTH: usize = 2;
 
 impl XessResources {
-    pub fn new(d3d: &D3d, max_w: u32, max_h: u32, ow: u32, oh: u32) -> Result<Self> {
+    pub fn new(
+        device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+        max_w: u32,
+        max_h: u32,
+        ow: u32,
+        oh: u32,
+    ) -> Result<Self> {
         let specs: [(DXGI_FORMAT, usize); 3] = [
             (DXGI_FORMAT_R16G16B16A16_FLOAT, 8), // linear HDR color (1-spp or denoised)
             (DXGI_FORMAT_R16G16_FLOAT, 4),       // motion vectors (input-res pixels)
@@ -62,21 +75,23 @@ impl XessResources {
         let mut offset = 0usize;
         let mut planes = Vec::with_capacity(3);
         for (format, bpp) in specs {
+            // ALLOW_UNORDERED_ACCESS: the --gpu feed kernel writes these
+            // planes directly (the CPU path keeps using the upload copies —
+            // the rest state stays NON_PIXEL_SHADER_RESOURCE either way).
             let tex = committed_tex(
-                &d3d.device,
+                device,
                 max_w,
                 max_h,
                 format,
-                D3D12_RESOURCE_FLAG_NONE,
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
             )?;
             planes.push(Plane { tex, format, bpp, offset });
             offset += aligned_pitch(max_w as usize * bpp) * max_h as usize;
         }
         let slot_stride = offset;
-        let upload = UploadBuffer::new(&d3d.device, slot_stride * FRAMES_IN_FLIGHT)?;
         let output = committed_tex(
-            &d3d.device,
+            device,
             ow,
             oh,
             DXGI_FORMAT_R16G16B16A16_FLOAT,
@@ -84,16 +99,53 @@ impl XessResources {
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
         )?;
         let planes: [Plane; 3] = planes.try_into().map_err(|_| "plane count".to_string())?;
-        let readback =
-            ReadbackBuffer::new(&d3d.device, aligned_pitch(ow as usize * 8) * oh as usize)?;
-        Ok(Self { max_w, max_h, ow, oh, planes, output, upload, slot_stride, readback })
+        Ok(Self {
+            max_w,
+            max_h,
+            ow,
+            oh,
+            planes,
+            output,
+            upload: std::sync::OnceLock::new(),
+            device: device.clone(),
+            slot_stride,
+            readback: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// The upload ring, allocated on first use (interior mutability so the
+    /// recording path keeps `&self`).
+    fn upload_buf(&self) -> Result<&UploadBuffer> {
+        if self.upload.get().is_none() {
+            let buf = UploadBuffer::new(&self.device, self.slot_stride * FRAMES_IN_FLIGHT)?;
+            let _ = self.upload.set(buf);
+        }
+        Ok(self.upload.get().unwrap())
+    }
+
+    /// The input planes as (resource, format) in (color, mvec, depth) order —
+    /// the --gpu feed path's wiring/barrier handle.
+    pub fn plane_resources(&self) -> [(&ID3D12Resource, DXGI_FORMAT); 3] {
+        [
+            (&self.planes[P_COLOR].tex, self.planes[P_COLOR].format),
+            (&self.planes[P_MVEC].tex, self.planes[P_MVEC].format),
+            (&self.planes[P_DEPTH].tex, self.planes[P_DEPTH].format),
+        ]
     }
 
     /// Copy the window-res output into the persistent readback buffer —
     /// recorded after the XeSS dispatch when the caller wants the upscaled
     /// HDR on the CPU (post-upscale denoise) instead of a backbuffer pass.
     /// Leaves `output` in PIXEL_SHADER_RESOURCE, its rest state.
-    pub fn record_readback(&self, d3d: &D3d) {
+    pub fn record_readback(&self, d3d: &D3d) -> Result<()> {
+        if self.readback.get().is_none() {
+            let buf = ReadbackBuffer::new(
+                &self.device,
+                aligned_pitch(self.ow as usize * 8) * self.oh as usize,
+            )?;
+            let _ = self.readback.set(buf);
+        }
+        let readback = self.readback.get().unwrap();
         unsafe {
             d3d.list.ResourceBarrier(&[transition(
                 &self.output,
@@ -102,7 +154,7 @@ impl XessResources {
             )]);
             let fp = footprint(DXGI_FORMAT_R16G16B16A16_FLOAT, self.ow, self.oh, 8, 0);
             d3d.list.CopyTextureRegion(
-                &loc_footprint(&self.readback.resource, fp),
+                &loc_footprint(&readback.resource, fp),
                 0,
                 0,
                 0,
@@ -115,17 +167,19 @@ impl XessResources {
                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
             )]);
         }
+        Ok(())
     }
 
     /// Map the readback buffer and expand its RGBA16F rows into linear-RGB
     /// f32 triples. Only valid after the submission that recorded
     /// `record_readback` completed (D3d::submit_and_wait).
     pub fn read_back(&self, out: &mut [f32]) -> Result<()> {
+        let readback = self.readback.get().ok_or("read_back before record_readback")?;
         let (w, h) = (self.ow as usize, self.oh as usize);
         assert_eq!(out.len(), w * h * 3);
         let pitch = aligned_pitch(w * 8);
         let mut ptr = std::ptr::null_mut();
-        unsafe { self.readback.resource.Map(0, None, Some(&mut ptr)) }
+        unsafe { readback.resource.Map(0, None, Some(&mut ptr)) }
             .map_err(|e| format!("readback Map: {e}"))?;
         let base = ptr as usize; // usize crosses the rayon closure; rows are disjoint
         out.par_chunks_mut(w * 3).take(h).enumerate().for_each(|(y, row)| {
@@ -138,7 +192,7 @@ impl XessResources {
                 row[x * 3 + 2] = f32::from(px[2]);
             }
         });
-        unsafe { self.readback.resource.Unmap(0, None) };
+        unsafe { readback.resource.Unmap(0, None) };
         Ok(())
     }
 
@@ -156,7 +210,8 @@ impl XessResources {
         rh: usize,
         near: f32,
         far: f32,
-    ) {
+    ) -> Result<()> {
+        let upload = self.upload_buf()?;
         debug_assert_eq!((g.rw, g.rh), (rw, rh));
         debug_assert!(rw <= self.max_w as usize && rh <= self.max_h as usize);
         let base = slot * self.slot_stride;
@@ -165,7 +220,7 @@ impl XessResources {
         let plane_mem = |p: &Plane| -> &mut [u8] {
             let pitch = aligned_pitch(w * p.bpp);
             unsafe {
-                std::slice::from_raw_parts_mut(self.upload.ptr.add(base + p.offset), pitch * rh)
+                std::slice::from_raw_parts_mut(upload.ptr.add(base + p.offset), pitch * rh)
             }
         };
         let load = |b: &[AtomicU32], i: usize| f32::from_bits(b[i].load(Relaxed));
@@ -242,7 +297,7 @@ impl XessResources {
                     0,
                     0,
                     0,
-                    &loc_footprint(&self.upload.resource, fp),
+                    &loc_footprint(&upload.resource, fp),
                     None,
                 )
             };
@@ -259,6 +314,7 @@ impl XessResources {
             })
             .collect();
         unsafe { d3d.list.ResourceBarrier(&to_srv) };
+        Ok(())
     }
 
     /// Raw resource pointers for the execute params (color, mvec, depth).

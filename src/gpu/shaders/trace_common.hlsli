@@ -27,6 +27,11 @@
 #define FLAG_JITTER       2u   // per-pixel rng jitter (legacy accumulation)
 #define FLAG_FRAME_JITTER 4u   // frame-uniform jitter from frame_jitter (DLSS/XeSS)
 #define FLAG_VERIFY       8u   // check builds: hemi claim re-validation + PSA accounting
+#define FLAG_GBUF         16u  // G-buffer pack writes on (upscaler sessions ONLY —
+                               // the pack buffer is a 64-byte dummy otherwise and
+                               // root UAVs have no bounds check: this gate is
+                               // memory safety, not an optimization)
+#define FLAG_HAS_PREV     32u  // the prev_* rows carry last frame's camera basis
 
 cbuffer Frame : register(b0) {
     float4 cam_origin;   // xyz; w = inv_w
@@ -51,10 +56,19 @@ cbuffer Frame : register(b0) {
     uint fb_mode; uint fb_depth; uint hemi_batch; uint cap_hemi_pt;
     // Hemi per-batch queue capacities (batch-bounded, cannot overflow).
     uint cap_hemi_cell; uint cap_hemi_leaf; uint cap_hemi_cut; uint _pad3;
+    // Previous frame's camera basis for G-buffer motion vectors (upscaler
+    // sessions; zeroed with FLAG_HAS_PREV clear when there is no prev frame).
+    // The scene-static near/far planes (dlss::near_far) ride the w slots.
+    float4 prev_origin;  // xyz; w = prev inv_w
+    float4 prev_forward; // xyz (unit); w = prev inv_h
+    float4 prev_right;   // xyz pre-scaled; w = NEAR
+    float4 prev_up;      // xyz pre-scaled; w = FAR
 }
 
 #define SCENE_EPS  (light_center.w)
 #define AO_RADIUS  (light_u.w)
+#define CAM_NEAR   (prev_right.w)
+#define CAM_FAR    (prev_up.w)
 
 uint pack_info(uint depth, uint kind) { return (depth & 0xffu) | (kind << 8); }
 
@@ -104,6 +118,74 @@ float3 sky_color(float3 d) {
 float3 normalize_or_zero(float3 v) {
     float l2 = dot(v, v);
     return l2 > 1e-30 ? v * rsqrt(l2) : float3(0.0, 0.0, 0.0);
+}
+
+// --- G-buffer pack (upscaler sessions; dlss.rs::GPixel on the GPU) ------------
+
+// Primary-hit surface capture — the shade.rs::PrimarySurface mirror. spec_t:
+// reflection-ray hit t, INF when the reflection missed, 0 when none was traced.
+struct PrimSurf {
+    float3 n;      // shading normal, post face-flip
+    float rough;
+    float3 albedo; // raw material albedo (diffuse/specular split at the write)
+    float metallic;
+    float spec_t;
+};
+
+// dlss::GBufs re-hosted as one interleaved plane; the feed kernels fan it out
+// into the upscalers' input textures. 64 B/px.
+struct GBufPx {
+    float4 nr;    // normal.xyz, roughness
+    float4 alb_z; // diff_alb.xyz = albedo*(1-metallic), view_z = t*dot(dir, forward)
+    float4 spec;  // spec_alb.xyz = lerp(0.04, albedo, metallic) (RGB F0), spec_hit_t
+    float4 mv;    // motion vector in render-res pixels (y-down, current -> previous); zw = 0
+};
+RWStructuredBuffer<GBufPx> gbuf : register(u15);
+
+// camera.rs::CamBasis::project against the PREVIOUS basis: the continuous
+// image point a world direction passes through, y-down pixels. ok = false
+// means at/behind the old image plane — consumed as mv (0,0) (disocclusion).
+float2 project_prev(float3 d, out bool ok) {
+    float df = dot(d, prev_forward.xyz);
+    ok = df > 0.0;
+    if (!ok) return float2(0.0, 0.0);
+    float ndx = dot(d, prev_right.xyz) / (dot(prev_right.xyz, prev_right.xyz) * df);
+    float ndy = dot(d, prev_up.xyz) / (dot(prev_up.xyz, prev_up.xyz) * df);
+    return float2((ndx + 1.0) * 0.5 / prev_origin.w, (1.0 - ndy) * 0.5 / prev_forward.w);
+}
+
+float2 gbuf_mv(float3 d, float fx, float fy) {
+    if ((flags & FLAG_HAS_PREV) == 0u) return float2(0.0, 0.0);
+    bool ok;
+    float2 p = project_prev(d, ok);
+    return ok ? p - float2(fx, fy) : float2(0.0, 0.0);
+}
+
+// render.rs::write_gbuf_hit. (fx, fy) is the jittered sample position — the
+// MV is unjittered by construction (both bases are jitter-free and the hit
+// point lies on the jittered ray).
+void gbuf_write_hit(uint pi, float fx, float fy, float3 dir, float t, PrimSurf ps) {
+    if ((flags & FLAG_GBUF) == 0u) return;
+    GBufPx g;
+    g.nr = float4(ps.n, ps.rough);
+    g.alb_z = float4(ps.albedo * (1.0 - ps.metallic), t * dot(dir, cam_forward.xyz));
+    float3 spec_alb = lerp(float3(0.04, 0.04, 0.04), ps.albedo, ps.metallic);
+    g.spec = float4(spec_alb, isinf(ps.spec_t) ? CAM_FAR : ps.spec_t);
+    float3 hit_rel = cam_origin.xyz + dir * t - prev_origin.xyz;
+    g.mv = float4(gbuf_mv(hit_rel, fx, fy), 0.0, 0.0);
+    gbuf[pi] = g;
+}
+
+// render.rs::write_gbuf_sky: depth = far (finite, f16-safe); MV = direction-
+// only reprojection (exact for an environment at infinity).
+void gbuf_write_sky(uint pi, float fx, float fy, float3 dir) {
+    if ((flags & FLAG_GBUF) == 0u) return;
+    GBufPx g;
+    g.nr = float4(-dir, 1.0);
+    g.alb_z = float4(1.0, 1.0, 1.0, CAM_FAR);
+    g.spec = float4(0.0, 0.0, 0.0, 0.0);
+    g.mv = float4(gbuf_mv(dir, fx, fy), 0.0, 0.0);
+    gbuf[pi] = g;
 }
 
 // shade.rs::AMBIENT — also consumed by the compose pass (hemi AO mode).

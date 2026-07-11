@@ -135,12 +135,17 @@ void surface_point(float3 ro, float3 rd, HitInfo hit, out float3 p, out float3 n
 // omitted — no AO draws — and amb_w = kd, (amb_o, amb_n) = the surface point
 // are returned for the hemi wavefront; the reflected hit (lap 1) always
 // shades its own sampled ambient (the CPU forces fb OFF at depth 1).
+// `prim` is the PRIMARY surface capture (shade.rs::PrimarySurface, lap 0
+// only) for the G-buffer pack — a pure copy of already-computed values, so
+// exposing it adds NO rng draws (the same-seed A/B gates rely on that).
 float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                    uint n_shadow, uint n_ao, bool refl, bool split_ambient,
-                   out float3 amb_w, out float3 amb_o, out float3 amb_n) {
+                   out float3 amb_w, out float3 amb_o, out float3 amb_n,
+                   out PrimSurf prim) {
     amb_w = 0.0;
     amb_o = 0.0;
     amb_n = 0.0;
+    prim = (PrimSurf)0;
     float3 total = 0.0;
     float3 tput = 1.0;
     [loop] for (uint lap = 0u; lap < 2u; ++lap) {
@@ -148,6 +153,14 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
         surface_point(ro, rd, hit, p, n);
         Mat mat = materials[tri_mat[hit.tri]];
         float3 albedo = mat.kind == MAT_MARBLE ? marble(ro + rd * hit.t, mat.scale) : mat.albedo;
+        if (lap == 0u) {
+            // shade.rs:226-233 — spec_t stays 0 unless the lap-0 reflection
+            // below traces (hit t / INF on miss, shade.rs:481/:494).
+            prim.n = n;
+            prim.rough = mat.roughness;
+            prim.albedo = albedo;
+            prim.metallic = mat.metallic;
+        }
 
         float3 f0 = lerp(float3(0.04, 0.04, 0.04), albedo, mat.metallic);
         float3 kd = albedo * (1.0 - mat.metallic);
@@ -254,9 +267,11 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
         tput *= schlick(f0, max(dot(v, h), 0.0)) * g2_over_g1;
         HitInfo rh;
         if (!trace_closest(p, rdir, 0.0, FLT_MAX, rh)) {
+            prim.spec_t = INF; // reflection missed (shade.rs:494)
             total += tput * sky_color(rdir);
             break;
         }
+        prim.spec_t = rh.t; // lap 0 only — the loop breaks before a lap-1 trace
         ro = p;
         rd = rdir;
         hit = rh;
@@ -267,8 +282,8 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
 }
 
 // The plain (non-hemi) entry: quality straight from the frame constants.
-float3 shade_full(float3 ro, float3 rd, HitInfo hit, inout uint rng) {
+float3 shade_full(float3 ro, float3 rd, HitInfo hit, inout uint rng, out PrimSurf prim) {
     float3 w, o, n;
     return shade_split(ro, rd, hit, rng, shadow_samples, ao_samples, reflections != 0u,
-                       false, w, o, n);
+                       false, w, o, n, prim);
 }

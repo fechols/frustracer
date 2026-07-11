@@ -42,13 +42,14 @@ void cs_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     float3 c;
     float3 aw = 0.0;
     float t;
+    PrimSurf ps;
     if (trace_closest(cam_origin.xyz, dir, rec.t_start, FLT_MAX, hit)) {
         if (fb_mode > 0u) {
             // Hemi mode: shade everything except the primary ambient; hand
             // the surface point to the hemisphere wavefront.
             float3 o_h, n_h;
             c = shade_split(cam_origin.xyz, dir, hit, rng, shadow_samples, ao_samples,
-                            reflections != 0u, true, aw, o_h, n_h);
+                            reflections != 0u, true, aw, o_h, n_h, ps);
             uint s;
             InterlockedAdd(counters[CTR_HEMI_PT], 1, s);
             if (s < cap_hemi_pt) {
@@ -62,12 +63,14 @@ void cs_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
                 InterlockedAdd(counters[CTR_OVERFLOW], 1, s);
             }
         } else {
-            c = shade_full(cam_origin.xyz, dir, hit, rng);
+            c = shade_full(cam_origin.xyz, dir, hit, rng, ps);
         }
         t = hit.t;
+        gbuf_write_hit(pi, float(x) + jx, float(y) + jy, dir, hit.t, ps);
     } else {
         c = sky_color(dir);
         t = INF;
+        gbuf_write_sky(pi, float(x) + jx, float(y) + jy, dir);
     }
 
     uint i3 = pi * 3u;
