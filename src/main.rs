@@ -546,8 +546,14 @@ fn main() {
         let code = run_spin(&scene, &bvh, cam0, mode, spin_frames, &opts);
         std::process::exit(code);
     }
+    // Must-fire structural gates are tuned to the default scene's topology —
+    // skipped for --stress AND loaded OBJ scenes (a real scene can lack the
+    // required features outright: a skyless view can't fire sky-tiles, and a
+    // dense one legitimately overflows the replay recording arena). The
+    // scene-agnostic zero-counter gates always run.
+    let structural = stress.is_none() && obj.is_none();
     if check {
-        let code = run_check(&scene, &bvh, cam0, stress.is_none());
+        let code = run_check(&scene, &bvh, cam0, structural);
         std::process::exit(code);
     }
     if check_dlss {
@@ -555,15 +561,13 @@ fn main() {
         std::process::exit(code);
     }
     if check_xess {
-        // Must-fire structural gates are tuned to the default scene's
-        // topology — skipped under --stress, mirroring run_check.
-        let code = run_check_xess(&scene, &bvh, cam0, xess_dump, stress.is_none());
+        let code = run_check_xess(&scene, &bvh, cam0, xess_dump, structural);
         std::process::exit(code);
     }
     if check_gpu {
         #[cfg(windows)]
         {
-            let code = run_check_gpu(&scene, &bvh, cam0, &opts, stress.is_none());
+            let code = run_check_gpu(&scene, &bvh, cam0, &opts, structural);
             std::process::exit(code);
         }
         #[cfg(not(windows))]
@@ -575,9 +579,7 @@ fn main() {
     if check_nppd {
         #[cfg(windows)]
         {
-            // Must-fire structural gates are tuned to the default scene's
-            // topology — skipped under --stress, mirroring run_check.
-            let code = run_check_nppd(&scene, &bvh, cam0, &opts, nppd_dump, stress.is_none());
+            let code = run_check_nppd(&scene, &bvh, cam0, &opts, nppd_dump, structural);
             std::process::exit(code);
         }
         #[cfg(not(windows))]
@@ -590,9 +592,7 @@ fn main() {
     if check_oidn {
         #[cfg(windows)]
         {
-            // Must-fire structural gates are tuned to the default scene's
-            // topology — skipped under --stress, mirroring run_check.
-            let code = run_check_oidn(&scene, &bvh, cam0, &opts, oidn_dump, stress.is_none());
+            let code = run_check_oidn(&scene, &bvh, cam0, &opts, oidn_dump, structural);
             std::process::exit(code);
         }
         #[cfg(not(windows))]
@@ -4899,8 +4899,15 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             ok = false;
         }
         if !rcache.valid() {
-            eprintln!("hemi share: fb-ao recording frame poisoned — replay coverage not provable");
-            ok = false;
+            // The contract's lost-replay state (arena overflow): production
+            // never replays a poisoned frame. Only the default scene must
+            // record validly — a dense OBJ scene overflows legitimately.
+            if structural {
+                eprintln!("hemi share: fb-ao recording frame poisoned — replay coverage not provable");
+                ok = false;
+            } else {
+                eprintln!("hemi share: fb-ao recording poisoned (arena overflow) — replay gate skipped");
+            }
         } else {
             stats.clear();
             render::render_frame_replay(&ctx, &rcache);
@@ -5174,9 +5181,22 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             leaf_px + sky_px,
             (rw * rh) as u64,
         );
-        if !rcache.valid() || leaf_px + sky_px != (rw * rh) as u64 {
-            eprintln!("replay record: invalid recording or terminals don't partition the screen");
+        if rcache.valid() && leaf_px + sky_px != (rw * rh) as u64 {
+            eprintln!("replay record: terminals don't partition the screen");
             replay_ok = false;
+        }
+        if !rcache.valid() {
+            // A poisoned recording (arena overflow) is the contract's
+            // lost-replay state: production clears `replay_key` via
+            // `valid()` and traces fresh, so there is nothing to
+            // replay-gate. The default scene must record validly; a dense
+            // OBJ scene can overflow legitimately.
+            if structural {
+                eprintln!("replay record: recording poisoned on the default scene");
+                replay_ok = false;
+            } else {
+                eprintln!("replay record: poisoned (arena overflow) — replay gates skipped (production traces fresh)");
+            }
         }
         if structural && (nl == 0 || ns == 0) {
             eprintln!("replay record: expected both leaves and sky terminals > 0 — a path didn't fire");
@@ -5184,7 +5204,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
         // Same-seed replay of frame 0 vs the recording frame itself.
         let (accum_r, info_r, tbuf_r) = (alloc3(), alloc1(), alloc1());
-        {
+        if rcache.valid() {
             let ctx = FrameCtx {
                 scene,
                 bvh,
@@ -5212,15 +5232,15 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 cut_prev: None,
             };
             render::render_frame_replay(&ctx, &rcache);
-        }
-        let (dt, di, da) = (
-            bits_differ(&tbuf_p, &tbuf_r),
-            bits_differ(&info_p, &info_r),
-            bits_differ(&accum_p, &accum_r),
-        );
-        eprintln!("replay bit-identity (frame 0): tbuf {dt} | info {di} | accum {da} px differ");
-        if dt + di + da > 0 {
-            replay_ok = false;
+            let (dt, di, da) = (
+                bits_differ(&tbuf_p, &tbuf_r),
+                bits_differ(&info_p, &info_r),
+                bits_differ(&accum_p, &accum_r),
+            );
+            eprintln!("replay bit-identity (frame 0): tbuf {dt} | info {di} | accum {da} px differ");
+            if dt + di + da > 0 {
+                replay_ok = false;
+            }
         }
         // Warm frame 1 (the interactive shape: jittered, consuming the
         // producer cache) traced fresh vs replayed from frame 0's structure.
@@ -5228,6 +5248,9 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         let (accum_f, info_f, tbuf_f) = (alloc3(), alloc1(), alloc1());
         let (accum_r1, info_r1, tbuf_r1) = (alloc3(), alloc1(), alloc1());
         for (bufs, fresh) in [((&accum_f, &info_f, &tbuf_f), true), ((&accum_r1, &info_r1, &tbuf_r1), false)] {
+            if !fresh && !rcache.valid() {
+                continue;
+            }
             let ctx = FrameCtx {
                 scene,
                 bvh,
@@ -5260,14 +5283,16 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 render::render_frame_replay(&ctx, &rcache);
             }
         }
-        let (dt1, di1, da1) = (
-            bits_differ(&tbuf_f, &tbuf_r1),
-            bits_differ(&info_f, &info_r1),
-            bits_differ(&accum_f, &accum_r1),
-        );
-        eprintln!("replay bit-identity (warm frame 1): tbuf {dt1} | info {di1} | accum {da1} px differ");
-        if dt1 + di1 + da1 > 0 {
-            replay_ok = false;
+        if rcache.valid() {
+            let (dt1, di1, da1) = (
+                bits_differ(&tbuf_f, &tbuf_r1),
+                bits_differ(&info_f, &info_r1),
+                bits_differ(&accum_f, &accum_r1),
+            );
+            eprintln!("replay bit-identity (warm frame 1): tbuf {dt1} | info {di1} | accum {da1} px differ");
+            if dt1 + di1 + da1 > 0 {
+                replay_ok = false;
+            }
         }
         // Frozen-prev contract: replays wrote nothing, so the producer cache
         // must still seed a moving consumer exactly as if they hadn't run.
@@ -5291,6 +5316,9 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             ("static warm    ", true, false, false),
             ("static replay  ", false, true, false),
         ] {
+            if do_replay && !rcache.valid() {
+                continue; // nothing to replay — production traces fresh
+            }
             stats.clear();
             let ctx = FrameCtx {
                 scene,
