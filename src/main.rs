@@ -2231,18 +2231,20 @@ fn run_check_xess(
         let mut pass = true;
         let (sw, sh) = (64usize, 36usize);
         let src = dlss::GBufs::new(sw, sh);
-        // Distinct u16 bit patterns per plane (the guides store f16 words);
-        // max index is 9215, so the 0x5000/0x6000 plane tags keep every
-        // element unique across planes without overflow.
+        // Distinct u16 bit patterns per plane (the guides store f16 words):
+        // diff_alb 0..6912, spec_alb 0x4000+.. tops out at 23295 < 0x7000,
+        // normal_rough 0x7000+.. (max index 9215) tops out at 37887 — the
+        // ranges are disjoint, so every element is unique across planes and
+        // a cross-plane wiring swap cannot alias.
         for i in 0..sw * sh {
             for k in 0..3 {
                 src.diff_alb[i * 3 + k].store((i * 3 + k) as u16, Relaxed);
             }
             for k in 0..3 {
-                src.spec_alb[i * 3 + k].store(0x5000 + (i * 3 + k) as u16, Relaxed);
+                src.spec_alb[i * 3 + k].store(0x4000 + (i * 3 + k) as u16, Relaxed);
             }
             for k in 0..4 {
-                src.normal_rough[i * 4 + k].store(0x6000 + (i * 4 + k) as u16, Relaxed);
+                src.normal_rough[i * 4 + k].store(0x7000 + (i * 4 + k) as u16, Relaxed);
             }
         }
         let check = |dst: &dlss::GBufs| -> bool {

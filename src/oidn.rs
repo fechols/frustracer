@@ -49,10 +49,13 @@ const FORMAT_HALF3: i32 = 259;
 /// linear-RGB value above f16::MAX (65504) would narrow to +Inf, which can
 /// propagate through the filter to a non-finite output (the --check-oidn
 /// finite gate) and the tonemap. Guides ([0,1] albedo, unit normals) never
-/// need it.
+/// need it. Deliberately a `>` compare, not `f32::min` — min(NaN, c)
+/// returns c, which would launder an upstream NaN into 65504 and hide it
+/// from the finite gate; NaN fails the compare and passes through.
 #[inline(always)]
 fn narrow_hdr(v: f32) -> f16 {
-    f16::from_f32(v.min(f16::MAX.to_f32_const()))
+    let max = f16::MAX.to_f32_const();
+    f16::from_f32(if v > max { max } else { v })
 }
 pub const QUALITY_FAST: i32 = 4;
 pub const QUALITY_BALANCED: i32 = 5;
