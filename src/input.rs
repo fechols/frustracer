@@ -77,8 +77,11 @@ impl Input {
         let down = |sc: Scancode| ks.is_scancode_pressed(sc);
 
         let mut speed = diag * 0.25 * dt;
-        if down(Scancode::LShift) || down(Scancode::RShift) {
+        if down(Scancode::LCtrl) || down(Scancode::RCtrl) {
             speed *= 4.0;
+        }
+        if down(Scancode::LShift) || down(Scancode::RShift) {
+            speed /= 8.0;
         }
         let f = cam.forward();
         let r = f.cross(Vec3A::Y).normalize();
