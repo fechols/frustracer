@@ -13,6 +13,9 @@ mod input;
 // CPU/GPU-agnostic but the SDK drop and load path here are Windows-only.
 #[cfg(windows)]
 mod oidn;
+// The ORT loader half is Windows-only (LoadLibrary + DirectML); the padding,
+// NCHW packing, and temporal-warp math are pure and feed --check.
+mod nppd;
 mod overlay;
 mod render;
 mod reproject;
@@ -80,6 +83,16 @@ pub struct Opts {
     /// off means the plain accumulation-average mode that shimmers while
     /// moving).
     pub oidn_temporal: bool,
+    /// Start with NPPD neural denoising on (J toggles; mutually exclusive
+    /// with DLSS/OIDN/XeSS — NPPD is its own recurrent temporal integrator).
+    pub nppd: bool,
+    /// Directory holding onnxruntime.dll (+ DirectML.dll).
+    pub nppd_path: String,
+    /// The exported NPPD ONNX graph (tools/nppd-export/export.py).
+    pub nppd_model: String,
+    /// NPPD execution provider: None = DirectML then CPU fallback,
+    /// Some(-1) = CPU forced, Some(n) = DirectML adapter n forced.
+    pub nppd_device: Option<i32>,
     /// Start with XeSS-SR dynamic-resolution upscaling (X toggles; implies
     /// DLSS off — the XeSS context lives on the native, non-SL pipeline).
     pub xess: bool,
@@ -96,7 +109,7 @@ pub struct Opts {
     /// the 2×2-cell shadow/AO sharing and HOT top-ups are disabled).
     pub adaptive: bool,
     /// Lock the DLSS/XeSS render resolution to this fixed scale of the
-    /// window (default native 1.0; `--lock-res dynamic` -> None = the
+    /// window (default quality 2/3; `--lock-res dynamic` -> None = the
     /// step-wise dynamic-resolution controller). CLI-only, no runtime
     /// toggle — T prints the locked note.
     pub lock_scale: Option<f32>,
@@ -111,6 +124,10 @@ pub struct Opts {
     /// A/B lever (--no-adopt): keep temporal seeding but disable the
     /// query skip / cut adoption (and CutStore production). Default on.
     pub adopt: bool,
+    /// A/B lever (--no-hemi-share): disable the shared hemisphere capture
+    /// in fb (H) frames — every shading point runs its own bounce tree.
+    /// Default on.
+    pub hemi_share: bool,
     /// GPU-resident tracing (--gpu): the whole quadtree + shading runs in
     /// D3D12 compute with DXR RayQuery rays. Requires the DXC DLL drop and
     /// RT tier 1.1; falls back to the CPU path with a loud line otherwise.
@@ -152,6 +169,12 @@ enum RenderMode {
     /// (fresh 1-spp frames on a free-running rng index). Both sub-modes
     /// fill the window-res OIDN G-buffers.
     Oidn { temporal: bool },
+    /// NPPD neural denoising: fresh 1-spp full-res frames on a free-running
+    /// rng index; the network's own recurrent state (warped in Rust) is the
+    /// sole temporal integrator — no CPU accumulation, no History, no budget
+    /// frames. Fills its own window-res G-buffers with `prev_cam` set (the
+    /// state warp consumes real motion vectors).
+    Nppd,
     Plain,
 }
 
@@ -173,6 +196,14 @@ fn main() {
         oidn_quality: oidn::QUALITY_BALANCED,
         oidn_clean_aux: true,
         oidn_temporal: true,
+        nppd: false,
+        nppd_path: std::env::var("FRUSTRACER_ORT_PATH").unwrap_or_else(|_| {
+            concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\onnxruntime\bin").to_string()
+        }),
+        nppd_model: std::env::var("FRUSTRACER_NPPD_MODEL").unwrap_or_else(|_| {
+            concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\nppd\nppd_small.onnx").to_string()
+        }),
+        nppd_device: None,
         xess: false,
         xess_path: std::env::var("FRUSTRACER_XESS_PATH").unwrap_or_else(|_| {
             concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\XeSS-SDK\bin").to_string()
@@ -180,10 +211,11 @@ fn main() {
         oidn_post: false,
         xess_autoexposure: false,
         adaptive: true,
-        lock_scale: xess::lock_scale("native"),
+        lock_scale: xess::lock_scale("quality"),
         temporal: true,
         replay: true,
         adopt: true,
+        hemi_share: true,
         gpu: false,
         dxc_path: std::env::var("FRUSTRACER_DXC_PATH").unwrap_or_else(|_| {
             concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\dxc\bin\x64").to_string()
@@ -199,6 +231,9 @@ fn main() {
     let mut oidn_dump = false;
     let mut check_xess = false;
     let mut xess_dump = false;
+    let mut check_nppd = false;
+    let mut nppd_dump = false;
+    let mut no_xess_explicit = false;
     let mut check_gpu = false;
     let mut stress: Option<usize> = None;
     let mut spin: Option<String> = None;
@@ -222,19 +257,60 @@ fn main() {
             "--oidn" => opts.oidn = true,
             "--no-oidn" => opts.oidn = false,
             "--oidn-no-temporal" => opts.oidn_temporal = false,
+            "--check-nppd" => check_nppd = true,
+            "--nppd-dump" => {
+                check_nppd = true;
+                nppd_dump = true;
+            }
+            "--nppd" => opts.nppd = true,
+            "--no-nppd" => opts.nppd = false,
+            "--nppd-path" => {
+                opts.nppd_path = args.next().unwrap_or_else(|| {
+                    eprintln!("--nppd-path needs a directory argument");
+                    std::process::exit(2);
+                })
+            }
+            "--nppd-model" => {
+                opts.nppd_model = args.next().unwrap_or_else(|| {
+                    eprintln!("--nppd-model needs an .onnx path argument");
+                    std::process::exit(2);
+                })
+            }
+            "--nppd-device" => {
+                opts.nppd_device = match args.next().as_deref() {
+                    Some("auto") => None,
+                    Some("cpu") => Some(-1),
+                    Some(s) if s == "dml" => Some(0),
+                    Some(s) if s.starts_with("dml:") => match s[4..].parse::<i32>() {
+                        Ok(n) if n >= 0 => Some(n),
+                        _ => {
+                            eprintln!("--nppd-device dml:<n> needs a non-negative adapter index");
+                            std::process::exit(2);
+                        }
+                    },
+                    _ => {
+                        eprintln!("--nppd-device needs one of: auto cpu dml dml:<n>");
+                        std::process::exit(2);
+                    }
+                }
+            }
             "--check-xess" => check_xess = true,
             "--xess-dump" => {
                 check_xess = true;
                 xess_dump = true;
             }
             "--xess" => opts.xess = true,
-            "--no-xess" => opts.xess = false,
+            "--no-xess" => {
+                opts.xess = false;
+                no_xess_explicit = true;
+            }
             "--oidn-post" => opts.oidn_post = true,
             "--xess-autoexposure" => opts.xess_autoexposure = true,
             "--no-adaptive" => opts.adaptive = false,
             "--no-temporal" => opts.temporal = false,
             "--no-replay" => opts.replay = false,
             "--no-adopt" => opts.adopt = false,
+            "--no-hemi-share" => opts.hemi_share = false,
             "--spin" => {
                 spin = Some(args.next().unwrap_or_else(|| {
                     eprintln!("--spin needs a workload: still | path");
@@ -352,6 +428,14 @@ fn main() {
                 eprintln!("  --oidn-device OIDN device: default|cpu|sycl|cuda|hip");
                 eprintln!("  --oidn-quality OIDN RT-filter quality: fast|balanced|high (default balanced)");
                 eprintln!("  --oidn-no-clean-aux  don't declare the albedo/normal guides noise-free (A/B lever)");
+                eprintln!("  --nppd        NPPD neural denoising (J toggles; needs onnxruntime.dll + an exported");
+                eprintln!("                model — see tools/nppd-export). Implies --xess: NPPD denoises at the");
+                eprintln!("                render res before the upscale; --no-xess keeps the standalone window-res mode");
+                eprintln!("  --check-nppd  headless: NPPD denoise self-test (needs onnxruntime.dll + the model)");
+                eprintln!("  --nppd-dump   --check-nppd plus before/after PNG dumps");
+                eprintln!("  --nppd-path   ONNX Runtime DLL directory (default: SDKs\\onnxruntime\\bin)");
+                eprintln!("  --nppd-model  exported NPPD .onnx (default: SDKs\\nppd\\nppd_small.onnx)");
+                eprintln!("  --nppd-device NPPD execution provider: auto|cpu|dml|dml:<n> (default auto = DML then CPU)");
                 eprintln!("  --check-xess  headless: XeSS dynamic-res contract self-test (no GPU or DLL needed)");
                 eprintln!("  --xess-dump   --check-xess plus G-buffer PNG dumps");
                 eprintln!("  --gpu         GPU-resident tracing: quadtree + shading in D3D12 compute with DXR");
@@ -364,8 +448,10 @@ fn main() {
                 eprintln!("  --xess-autoexposure  let XeSS compute exposure internally (A/B lever)");
                 eprintln!("  --no-adaptive disable the adaptive shading rate in XeSS mode (uniform per-pixel shading;");
                 eprintln!("                visibility is per-pixel either way)");
+                eprintln!("  --no-hemi-share  disable the shared hemisphere capture in fb (H) frames — every");
+                eprintln!("                shading point runs its own bounce tree (A/B lever)");
                 eprintln!("  --lock-res    DLSS/XeSS render res: quality|balanced|performance|ultra-performance|native,");
-                eprintln!("                a ratio in (0, 1], or dynamic (the step-wise DRS controller); default native (100%)");
+                eprintln!("                a ratio in (0, 1], or dynamic (the step-wise DRS controller); default quality (2/3)");
                 eprintln!("  --xess-path   XeSS DLL directory (default: SDKs\\XeSS-SDK\\bin)");
                 eprintln!("  --gpu-debug   D3D12 debug layer + verbose Streamline logging");
                 eprintln!("  --sl-path     Streamline DLL directory (default: SDKs\\streamline-sdk\\bin\\x64)");
@@ -378,6 +464,15 @@ fn main() {
     if obj.is_some() && stress.is_some() {
         eprintln!("--stress and an OBJ path are mutually exclusive — pick one scene source");
         std::process::exit(2);
+    }
+    if opts.nppd && !opts.xess && !no_xess_explicit {
+        // The default NPPD experience is the XeSS composition: trace at the
+        // --lock-res scale (default quality 2/3), NPPD denoises at that
+        // render res, XeSS upscales to the window. Standalone window-res
+        // NPPD remains the automatic fallback when the XeSS DLL is missing,
+        // or explicitly via --nppd --no-xess.
+        opts.xess = true;
+        eprintln!("nppd: --nppd implies --xess (pre-upscale denoise at the render res; --no-xess opts out)");
     }
     if opts.xess && opts.dlss {
         // The XeSS context needs the native (non-proxied) device/queue —
@@ -394,6 +489,14 @@ fn main() {
         }
         opts.oidn = false;
         opts.oidn_post = false;
+        if opts.nppd && !opts.xess {
+            // The GPU NPPD stage rides the XeSS composition only (RR is
+            // itself a denoiser — the same exclusion as the CPU paths).
+            // Phase-C's implication normally sets --xess; only an explicit
+            // --no-xess lands here.
+            eprintln!("gpu: NPPD under --gpu needs the XeSS composition; ignoring");
+            opts.nppd = false;
+        }
     }
 
     // PIX command-list markers: opt-in, runtime-loaded; inert otherwise.
@@ -448,6 +551,21 @@ fn main() {
         #[cfg(not(windows))]
         {
             eprintln!("--check-gpu requires Windows (D3D12)");
+            std::process::exit(2);
+        }
+    }
+    if check_nppd {
+        #[cfg(windows)]
+        {
+            // Must-fire structural gates are tuned to the default scene's
+            // topology — skipped under --stress, mirroring run_check.
+            let code = run_check_nppd(&scene, &bvh, cam0, &opts, nppd_dump, stress.is_none());
+            std::process::exit(code);
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = nppd_dump;
+            eprintln!("--check-nppd requires Windows (the ONNX Runtime drop is Win64-only here)");
             std::process::exit(2);
         }
     }
@@ -536,6 +654,7 @@ fn run_check_gpu(
         gw as u32,
         gh as u32,
         false, // no pack: the M7-M9 gbuf/feed gates build their own tracer
+        false,
         opts.gpu_debug,
     ) {
         Ok(t) => t,
@@ -593,6 +712,7 @@ fn run_check_gpu(
             prev_cam: None,
             frame_jitter: None,
             adaptive: false,
+            hemi_share: false,
             replay_rec: None,
             cut_cur: None,
             cut_prev: None,
@@ -1113,6 +1233,7 @@ fn run_check_gpu(
                             &mut vls,
                             None,
                             shade::VisCtl::Off,
+                            None,
                         ),
                     };
                 }
@@ -1202,6 +1323,7 @@ fn run_check_gpu(
             pw as u32,
             ph as u32,
             true,
+            true, // + the NPPD staging buffers/kernels (M10 gates them)
             opts.gpu_debug,
         ) {
             Ok(t) => t,
@@ -1364,7 +1486,7 @@ fn run_check_gpu(
                 return 1;
             }
             let mut feed_rec = Ok(());
-            if let Err(e) = hg.run(|l| feed_rec = ptg.record_feed(l, 0)) {
+            if let Err(e) = hg.run(|l| feed_rec = ptg.record_feed(l, 0, false)) {
                 eprintln!("check-gpu: FAIL feed dispatch submit: {e}");
                 return 1;
             }
@@ -1556,7 +1678,7 @@ fn run_check_gpu(
                 return 1;
             }
             let mut rr_rec = Ok(());
-            if let Err(e) = hg.run(|l| rr_rec = ptg.record_feed(l, 0)) {
+            if let Err(e) = hg.run(|l| rr_rec = ptg.record_feed(l, 0, false)) {
                 eprintln!("check-gpu: FAIL RR feed dispatch submit: {e}");
                 return 1;
             }
@@ -1655,6 +1777,307 @@ fn run_check_gpu(
                 eprintln!("check-gpu: FAIL RR feed gates");
                 ok = false;
             }
+
+            // --- M10: the NPPD GPU staging kernels + DML interop ---
+            // The pack/warp kernels are term-for-term ports of
+            // nppd::pack_inputs / nppd::warp_temporal — gate them against the
+            // CPU oracles running on the SAME readback inputs (gb2 = frame
+            // B's pack, accum_bytes = its 1-spp store). DLL-free: the kernels
+            // are plain compute. The end-to-end interop gate (ORT executing
+            // on hg's queue over these buffers) runs only when the runtime
+            // DLLs + the exported model exist.
+            {
+                let (npw, nph) = nppd::pad_dims(pw, ph);
+                let npp = npw * nph;
+                let accum_at: Vec<AtomicU32> = accum_bytes
+                    .chunks_exact(4)
+                    .map(|c| AtomicU32::new(u32::from_le_bytes(c.try_into().unwrap())))
+                    .collect();
+                let nres = ptg.nppd.as_ref().expect("M7 tracer built with nppd");
+                let (nfr, nst, nwp, nout) = (
+                    nres.frame.clone(),
+                    nres.state.clone(),
+                    nres.warped.clone(),
+                    nres.out.clone(),
+                );
+
+                // Pack + zero (state_valid = false). CB slot 0 still holds
+                // frame B's constants.
+                let mut pre = Ok(());
+                if hg.run(|l| pre = ptg.record_nppd_pre(l, 0, false)).is_err() || pre.is_err() {
+                    eprintln!("check-gpu: FAIL nppd staging dispatch: {pre:?}");
+                    return 1;
+                }
+                let readf = |hg: &mut gpu::trace::HeadlessGpu,
+                             res: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+                             n: usize|
+                 -> Result<Vec<f32>, String> {
+                    let b = hg.read_buffer(res, ua, n * 4)?;
+                    Ok(b.chunks_exact(4)
+                        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                        .collect())
+                };
+                let gpu_frame = match readf(&mut hg, &nfr, nppd::CH_FRAME * npp) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("check-gpu: FAIL nppd frame readback: {e}");
+                        return 1;
+                    }
+                };
+                let gpu_warped0 = match readf(&mut hg, &nwp, nppd::C_T * npp) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("check-gpu: FAIL nppd warped readback: {e}");
+                        return 1;
+                    }
+                };
+                let mut cpu_frame = vec![0.0f32; nppd::CH_FRAME * npp];
+                nppd::pack_inputs(&accum_at, &gb2, &basis_b, far, npw, nph, &mut cpu_frame);
+                // ch0 (log-depth: ray_dir + divide + log — transcendental
+                // slop) and ch1-3 (normal rotation: normalize slop) get small
+                // absolute tolerances; ch4-9 are pure copies of the same
+                // readback values — BIT-equal. Sky ch0 must be exactly 0 on
+                // both sides.
+                let (mut p_d, mut p_n, mut p_c, mut p_sky, mut sky_n) =
+                    (0usize, 0usize, 0usize, 0usize, 0usize);
+                let mut max_d = 0.0f32;
+                for i in 0..npp {
+                    let (x, y) = (i % npw, i / npw);
+                    let si = y.min(ph - 1) * pw + x.min(pw - 1);
+                    let d = (gpu_frame[i] - cpu_frame[i]).abs();
+                    max_d = max_d.max(d);
+                    if !tb2[si].is_finite() {
+                        sky_n += 1;
+                        if gpu_frame[i].to_bits() != 0 || cpu_frame[i].to_bits() != 0 {
+                            p_sky += 1;
+                        }
+                    } else if d > 1e-4 {
+                        p_d += 1;
+                    }
+                    for c in 1..4 {
+                        if (gpu_frame[c * npp + i] - cpu_frame[c * npp + i]).abs() > 1e-5 {
+                            p_n += 1;
+                        }
+                    }
+                    for c in 4..10 {
+                        if gpu_frame[c * npp + i].to_bits() != cpu_frame[c * npp + i].to_bits() {
+                            p_c += 1;
+                        }
+                    }
+                }
+                let zero_bad = gpu_warped0.iter().filter(|v| v.to_bits() != 0).count();
+                eprintln!(
+                    "check-gpu: nppd pack ({pw}x{ph} -> {npw}x{nph}): depth>1e-4 {p_d} (max {max_d:.2e}) | sky-not-0 {p_sky} (sky px {sky_n}) | normal>1e-5 {p_n} | copy-not-bit-equal {p_c} | zeroed-warped-nonzero {zero_bad}"
+                );
+                if p_d != 0 || p_sky != 0 || p_n != 0 || p_c != 0 || zero_bad != 0 {
+                    eprintln!("check-gpu: FAIL nppd pack/zero gates");
+                    ok = false;
+                }
+                if must_fire && sky_n == 0 {
+                    eprintln!("check-gpu: FAIL nppd sky gate vacuous");
+                    ok = false;
+                }
+
+                // Warp gate: a deterministic synthetic state uploaded into
+                // the state buffer, warped by frame B's REAL motion vectors,
+                // vs the CPU warp on identical inputs. Interior <= 1e-6
+                // (bilinear fp order is mirrored); padded border bit-zero.
+                let mut cpu_state = vec![0.0f32; nppd::C_T * npp];
+                for c in 0..nppd::C_T {
+                    for y in 0..nph {
+                        for x in 0..npw {
+                            cpu_state[c * npp + y * npw + x] =
+                                ((x * 7 + y * 13 + c * 29) % 101) as f32 / 101.0;
+                        }
+                    }
+                }
+                let up = match gpu::d3d12::UploadBuffer::new(&hg.device, cpu_state.len() * 4) {
+                    Ok(u) => u,
+                    Err(e) => {
+                        eprintln!("check-gpu: FAIL nppd state upload alloc: {e}");
+                        return 1;
+                    }
+                };
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        cpu_state.as_ptr() as *const u8,
+                        up.ptr,
+                        cpu_state.len() * 4,
+                    );
+                }
+                let upload_ok = hg.run(|l| unsafe {
+                    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_COPY_DEST;
+                    l.ResourceBarrier(&[transition(&nst, ua, D3D12_RESOURCE_STATE_COPY_DEST)]);
+                    l.CopyBufferRegion(&nst, 0, &up.resource, 0, (cpu_state.len() * 4) as u64);
+                    l.ResourceBarrier(&[transition(&nst, D3D12_RESOURCE_STATE_COPY_DEST, ua)]);
+                });
+                if upload_ok.is_err() {
+                    eprintln!("check-gpu: FAIL nppd state upload");
+                    return 1;
+                }
+                let mut pre = Ok(());
+                if hg.run(|l| pre = ptg.record_nppd_pre(l, 0, true)).is_err() || pre.is_err() {
+                    eprintln!("check-gpu: FAIL nppd warp dispatch: {pre:?}");
+                    return 1;
+                }
+                let gpu_warped = match readf(&mut hg, &nwp, nppd::C_T * npp) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("check-gpu: FAIL nppd warped readback: {e}");
+                        return 1;
+                    }
+                };
+                let mut cpu_warped = vec![0.0f32; nppd::C_T * npp];
+                nppd::warp_temporal(
+                    &cpu_state,
+                    &gb2.mvec,
+                    nppd::C_T,
+                    pw,
+                    ph,
+                    npw,
+                    nph,
+                    &mut cpu_warped,
+                );
+                let (mut w_bad, mut w_border) = (0usize, 0usize);
+                let mut w_max = 0.0f32;
+                for c in 0..nppd::C_T {
+                    for y in 0..nph {
+                        for x in 0..npw {
+                            let i = c * npp + y * npw + x;
+                            if x >= pw || y >= ph {
+                                if gpu_warped[i].to_bits() != 0 {
+                                    w_border += 1;
+                                }
+                            } else {
+                                let d = (gpu_warped[i] - cpu_warped[i]).abs();
+                                w_max = w_max.max(d);
+                                if d > 1e-6 {
+                                    w_bad += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                eprintln!(
+                    "check-gpu: nppd warp: interior>1e-6 {w_bad} (max {w_max:.2e}) | border-nonzero {w_border}"
+                );
+                if w_bad != 0 || w_border != 0 {
+                    eprintln!("check-gpu: FAIL nppd warp gates");
+                    ok = false;
+                }
+
+                // End-to-end DML interop: ORT on hg's queue over these exact
+                // buffers vs the CPU-staged NppdContext on the same model —
+                // identical logical inputs (the pack gates above bound the
+                // input drift), so the outputs must agree closely. Runs only
+                // when the DLLs + model exist; one loud skip line otherwise.
+                let have_ort =
+                    std::path::Path::new(&opts.nppd_path).join("onnxruntime.dll").exists();
+                let have_model = std::path::Path::new(&opts.nppd_model).exists();
+                if have_ort && have_model {
+                    // Back to the reset path (zeroed warped input) so both
+                    // sides run the same one-step-from-reset contract.
+                    let mut pre = Ok(());
+                    if hg.run(|l| pre = ptg.record_nppd_pre(l, 0, false)).is_err() || pre.is_err()
+                    {
+                        eprintln!("check-gpu: FAIL nppd e2e staging: {pre:?}");
+                        return 1;
+                    }
+                    use windows::core::Interface;
+                    let ng = nppd::NppdGpu::new(
+                        &opts.nppd_path,
+                        &opts.nppd_model,
+                        hg.device.as_raw(),
+                        hg.queue.as_raw(),
+                        pw,
+                        ph,
+                        nfr.as_raw(),
+                        nwp.as_raw(),
+                        nout.as_raw(),
+                        nst.as_raw(),
+                    );
+                    let e2e = ng.and_then(|mut ng| {
+                        let t0 = Instant::now();
+                        ng.run()?;
+                        ng.sync_outputs()?;
+                        let first_ms = t0.elapsed().as_secs_f64() * 1e3;
+                        let t0 = Instant::now();
+                        let n_time = 5;
+                        for _ in 0..n_time {
+                            ng.run()?;
+                            ng.sync_outputs()?;
+                        }
+                        let per_ms = t0.elapsed().as_secs_f64() * 1e3 / n_time as f64;
+                        Ok((ng, first_ms, per_ms))
+                    });
+                    match e2e {
+                        Ok((_ng, first_ms, per_ms)) => {
+                            let gpu_out = match readf(&mut hg, &nout, 3 * npp) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    eprintln!("check-gpu: FAIL nppd out readback: {e}");
+                                    return 1;
+                                }
+                            };
+                            let gpu_state = match readf(&mut hg, &nst, nppd::C_T * npp) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    eprintln!("check-gpu: FAIL nppd state readback: {e}");
+                                    return 1;
+                                }
+                            };
+                            let mut gpu_inter = vec![0.0f32; pw * ph * 3];
+                            nppd::crop_to_interleaved(&gpu_out, npw, nph, pw, ph, &mut gpu_inter);
+                            let cpu_ref = nppd::NppdContext::new(
+                                &opts.nppd_path,
+                                &opts.nppd_model,
+                                pw,
+                                ph,
+                                nppd::NppdDevice::Auto,
+                            )
+                            .and_then(|mut c| {
+                                c.denoise(&accum_at, &gb2, &basis_b, far).map(<[f32]>::to_vec)
+                            });
+                            match cpu_ref {
+                                Ok(cpu_out) => {
+                                    let mut num = 0.0f64;
+                                    let mut den = 0.0f64;
+                                    let mut nonfinite = 0usize;
+                                    for (a, b) in gpu_inter.iter().zip(&cpu_out) {
+                                        if !a.is_finite() {
+                                            nonfinite += 1;
+                                        }
+                                        num += (a - b).abs() as f64;
+                                        den += b.abs() as f64;
+                                    }
+                                    let rel = num / den.max(1e-12);
+                                    let state_nz =
+                                        gpu_state.iter().any(|v| *v != 0.0 && v.is_finite());
+                                    eprintln!(
+                                        "check-gpu: nppd e2e (DML interop): mean rel vs CPU-staged {rel:.2e} | non-finite {nonfinite} | state-advanced {state_nz} | {per_ms:.1} ms/run (first {first_ms:.0} ms)"
+                                    );
+                                    if rel > 1e-2 || nonfinite != 0 || !state_nz {
+                                        eprintln!("check-gpu: FAIL nppd e2e interop gates");
+                                        ok = false;
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("check-gpu: FAIL nppd CPU reference: {e}");
+                                    ok = false;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("check-gpu: FAIL nppd e2e interop init/run: {e}");
+                            ok = false;
+                        }
+                    }
+                } else {
+                    eprintln!(
+                        "check-gpu: nppd e2e interop SKIPPED (onnxruntime.dll present: {have_ort}, model present: {have_model})"
+                    );
+                }
+            }
         }
     }
 
@@ -1677,6 +2100,7 @@ fn run_check_gpu(
         bw as u32,
         bh as u32,
         false, // bench frames don't consume the pack
+        false,
         opts.gpu_debug,
     ) {
         Ok(t) => t,
@@ -1769,6 +2193,7 @@ fn run_check_gpu(
                 prev_cam: None,
                 frame_jitter: None,
                 adaptive: false,
+                hemi_share: false,
                 replay_rec: None,
                 cut_cur: None,
                 cut_prev: None,
@@ -1883,6 +2308,7 @@ fn mv_check_at(
                 prev_cam: prev,
                 frame_jitter: Some((0.0, 0.0)),
                 adaptive: false,
+                hemi_share: false,
                 replay_rec: None,
                 cut_cur: None,
                 cut_prev: None,
@@ -2344,6 +2770,7 @@ fn run_check_xess(
                     prev_cam: None,
                     frame_jitter: Some(dlss::jitter_for(f)),
                     adaptive,
+                    hemi_share: false,
                     replay_rec: None,
                     cut_cur: None,
                     cut_prev: None,
@@ -2493,6 +2920,259 @@ fn run_check_xess(
 /// Unlike --check/--check-dlss this needs the (license-clean, gitignored)
 /// OIDN runtime DLLs on disk.
 #[cfg(windows)]
+/// The NPPD gate suite (--check-nppd): needs onnxruntime.dll and an exported
+/// model on disk — the only NPPD check with external dependencies (the pure
+/// staging math runs under --check via nppd::self_test, repeated here as G0).
+/// Renders fresh 1-spp frames through the exact interactive NPPD contract
+/// (accumulate = false, jitter = true, free-running seq, prev_cam set from
+/// the previous frame) and gates one recurrent step at a time: frame 0 from
+/// a reset state (output finite, ≠ input, smoother than input, mean
+/// preserved, state populated), frame 1 static (recurrence engaged: the
+/// identity-warped state must not roughen the output — structural, default
+/// scene only), frame 2 under a small dolly with real motion vectors (state
+/// advances, gates hold), then a reset_temporal + re-denoise (the reset path).
+/// A --random-init plumbing export passes session/run wiring but fails the
+/// quality gates by design — gate against the real pretrained export.
+#[cfg(windows)]
+fn run_check_nppd(
+    scene: &scene::Scene,
+    bvh: &bvh::Bvh,
+    cam0: Camera,
+    opts: &Opts,
+    dump: bool,
+    structural: bool,
+) -> i32 {
+    let (rw, rh) = (800usize, 600usize);
+    let mut ok = true;
+
+    // G0: the closed-form staging self-test also runs here so --check-nppd
+    // is self-contained (it is the check that owns nppd.rs).
+    match nppd::self_test() {
+        Ok(()) => eprintln!("nppd self-test: OK"),
+        Err(e) => {
+            eprintln!("nppd self-test: FAIL — {e}");
+            ok = false;
+        }
+    }
+
+    let dev = match opts.nppd_device {
+        None => nppd::NppdDevice::Auto,
+        Some(-1) => nppd::NppdDevice::Cpu,
+        Some(n) => nppd::NppdDevice::Dml(n),
+    };
+    let mut nctx = match nppd::NppdContext::new(&opts.nppd_path, &opts.nppd_model, rw, rh, dev) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{e}");
+            eprintln!(
+                "onnxruntime.dll expected at {} (--nppd-path / FRUSTRACER_ORT_PATH); \
+                 model at {} (--nppd-model / FRUSTRACER_NPPD_MODEL — \
+                 tools/nppd-export/export.py produces it)",
+                opts.nppd_path, opts.nppd_model
+            );
+            return 1;
+        }
+    };
+
+    // The interactive NPPD quality contract: fixed cheap 1-spp preset.
+    let q = Quality {
+        shadow_samples: 1,
+        ao_samples: 1,
+        reflections: true,
+        fb: shade::FrustumBounce::OFF,
+    };
+    let stats = Stats::default();
+    let accum: Vec<AtomicU32> = (0..rw * rh * 3).map(|_| AtomicU32::new(0)).collect();
+    let info: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
+    let tbuf: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
+    let g = dlss::GBufs::new(rw, rh);
+    let (_, far) = dlss::near_far(scene.diag);
+    let render_fresh = |basis: &camera::CamBasis, seq: u32, prev: Option<camera::CamBasis>| {
+        let ctx = FrameCtx {
+            scene,
+            bvh,
+            cam: *basis,
+            q,
+            frame: seq,
+            jitter: true,
+            rw,
+            rh,
+            accum: &accum,
+            info: &info,
+            tbuf: &tbuf,
+            stats: &stats,
+            sun: render::sun_dir(scene),
+            tcache_cur: None,
+            tcache_prev: &[],
+            accumulate: false,
+            gbuf: Some(&g),
+            prev_cam: prev,
+            frame_jitter: None,
+            adaptive: false,
+            hemi_share: false, // inert: the NPPD contract pins fb OFF
+            replay_rec: None,
+            cut_cur: None,
+            cut_prev: None,
+        };
+        render::render_frame(&ctx, true);
+    };
+    let load = |a: &AtomicU32| f32::from_bits(a.load(Relaxed));
+    let lum = |b: &[f32], x: usize, y: usize| {
+        let i = (y * rw + x) * 3;
+        0.2126 * b[i] + 0.7152 * b[i + 1] + 0.0722 * b[i + 2]
+    };
+    let roughness = |b: &[f32]| -> f64 {
+        let mut s = 0.0f64;
+        for y in 1..rh - 1 {
+            for x in 1..rw - 1 {
+                let l = 4.0 * lum(b, x, y)
+                    - lum(b, x - 1, y)
+                    - lum(b, x + 1, y)
+                    - lum(b, x, y - 1)
+                    - lum(b, x, y + 1);
+                s += l.abs() as f64;
+            }
+        }
+        s / ((rw - 2) * (rh - 2)) as f64
+    };
+    let mean = |b: &[f32]| b.iter().map(|&v| v as f64).sum::<f64>() / b.len() as f64;
+    // Shared output gates: finite, ≠ input, smoother than the 1-spp input,
+    // mean-value preserved within 2×.
+    let gate_output = |out: &[f32], input: &[f32], what: &str, ms: f64, ok: &mut bool| -> (f64, f64) {
+        if !out.iter().all(|v| v.is_finite()) {
+            eprintln!("nppd {what}: output contains non-finite values");
+            *ok = false;
+        }
+        let max_diff = input.iter().zip(out).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        if max_diff <= 1e-6 {
+            eprintln!("nppd {what}: output identical to input (max diff {max_diff:.2e})");
+            *ok = false;
+        }
+        let (r_in, r_out) = (roughness(input), roughness(out));
+        let ratio = mean(out) / mean(input).max(1e-9);
+        eprintln!(
+            "nppd {what}: mean |laplacian| {r_in:.4} -> {r_out:.4} | mean ratio {ratio:.3} | {ms:.1} ms"
+        );
+        if r_out >= r_in {
+            eprintln!("nppd {what}: output not smoother than input");
+            *ok = false;
+        }
+        if !(0.5..=2.0).contains(&ratio) {
+            eprintln!("nppd {what}: mean value ratio {ratio:.3} outside [0.5, 2.0]");
+            *ok = false;
+        }
+        (r_in, r_out)
+    };
+
+    // G1: frame 0 from a reset state.
+    let basis = cam0.basis(rw, rh);
+    render_fresh(&basis, 0, None);
+    let input0: Vec<f32> = accum.iter().map(load).collect();
+    if nctx.temporal_valid() {
+        eprintln!("nppd: state valid before the first denoise");
+        ok = false;
+    }
+    let out0 = match nctx.denoise(&accum, &g, &basis, far) {
+        Ok(o) => o.to_vec(),
+        Err(e) => {
+            eprintln!("{e}");
+            eprintln!("NPPD CHECK FAILED");
+            return 1;
+        }
+    };
+    let (_, r_out0) = gate_output(&out0, &input0, "frame 0 (reset)", nctx.last_ms, &mut ok);
+    if !nctx.temporal_valid() {
+        eprintln!("nppd: state not marked valid after a denoise");
+        ok = false;
+    }
+    if nctx.state().iter().all(|&v| v == 0.0) {
+        eprintln!("nppd: recurrent state is all-zero after a denoise");
+        ok = false;
+    }
+
+    // G2: frame 1 static — the identity-warped state feeds the second step;
+    // recurrence must not roughen the output (structural: on the default
+    // scene the temporal blend demonstrably engages and smooths further).
+    render_fresh(&basis, 1, Some(basis));
+    let input1: Vec<f32> = accum.iter().map(load).collect();
+    let state0: Vec<f32> = nctx.state().to_vec();
+    let out1 = match nctx.denoise(&accum, &g, &basis, far) {
+        Ok(o) => o.to_vec(),
+        Err(e) => {
+            eprintln!("{e}");
+            eprintln!("NPPD CHECK FAILED");
+            return 1;
+        }
+    };
+    let (_, r_out1) = gate_output(&out1, &input1, "frame 1 (static)", nctx.last_ms, &mut ok);
+    if nctx.state() == &state0[..] {
+        eprintln!("nppd: recurrent state did not advance across a step");
+        ok = false;
+    }
+    if structural && r_out1 > r_out0 * 1.05 {
+        eprintln!(
+            "nppd static recurrence: frame-1 |laplacian| {r_out1:.4} > frame-0 {r_out0:.4} — temporal accumulation didn't engage"
+        );
+        ok = false;
+    }
+
+    // G3: frame 2 under a small forward dolly (the --check constant) with
+    // prev_cam set — real motion vectors drive the state warp.
+    let mut cam_b = cam0;
+    cam_b.pos += cam0.forward() * (0.02 * scene.diag);
+    let basis_b = cam_b.basis(rw, rh);
+    render_fresh(&basis_b, 2, Some(basis));
+    let input2: Vec<f32> = accum.iter().map(load).collect();
+    let out2 = match nctx.denoise(&accum, &g, &basis_b, far) {
+        Ok(o) => o.to_vec(),
+        Err(e) => {
+            eprintln!("{e}");
+            eprintln!("NPPD CHECK FAILED");
+            return 1;
+        }
+    };
+    gate_output(&out2, &input2, "frame 2 (dolly)", nctx.last_ms, &mut ok);
+
+    // G4: reset + re-denoise — the reset path is exercised end to end.
+    nctx.reset_temporal();
+    if nctx.temporal_valid() {
+        eprintln!("nppd: reset_temporal did not invalidate the state");
+        ok = false;
+    }
+    render_fresh(&basis_b, 3, None);
+    match nctx.denoise(&accum, &g, &basis_b, far) {
+        Ok(o) => {
+            if !o.iter().all(|v| v.is_finite()) {
+                eprintln!("nppd: post-reset denoise produced non-finite values");
+                ok = false;
+            }
+            eprintln!("nppd: post-reset denoise {:.1} ms", nctx.last_ms);
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            ok = false;
+        }
+    }
+
+    if dump {
+        let mut present = vec![0u32; rw * rh];
+        for (name, data) in [("nppd_before", &input0), ("nppd_after", &out0), ("nppd_dolly", &out2)]
+        {
+            render::resolve_hdr(data, &info, false, &mut present, rw, rh, rw, rh);
+            save_png(&format!("{name}.png"), &present, rw, rh);
+            eprintln!("wrote {name}.png");
+        }
+    }
+
+    if ok {
+        eprintln!("NPPD CHECK PASSED");
+        0
+    } else {
+        eprintln!("NPPD CHECK FAILED");
+        1
+    }
+}
+
 fn run_check_oidn(
     scene: &scene::Scene,
     bvh: &bvh::Bvh,
@@ -2551,6 +3231,7 @@ fn run_check_oidn(
             prev_cam: None,
             frame_jitter: None,
             adaptive: false,
+            hemi_share: false,
             replay_rec: None,
             cut_cur: None,
             cut_prev: None,
@@ -2697,6 +3378,7 @@ fn run_check_oidn(
             prev_cam: None,
             frame_jitter: None,
             adaptive: false,
+            hemi_share: false,
             replay_rec: None,
             cut_cur: None,
             cut_prev: None,
@@ -2884,6 +3566,7 @@ fn run_check_oidn(
                 prev_cam: None,
                 frame_jitter: None,
                 adaptive: false,
+                hemi_share: false,
                 replay_rec: None,
                 cut_cur: None,
                 cut_prev: None,
@@ -3326,6 +4009,7 @@ fn run_spin(
             prev_cam: None,
             frame_jitter: Some(dlss::jitter_for(idx)),
             adaptive: false,
+            hemi_share: false,
             replay_rec: if record { Some(&replay_cache) } else { None },
             cut_cur,
             cut_prev,
@@ -3409,6 +4093,20 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
     };
 
+    // NPPD staging math self-test — closed-form gates the neural-denoiser
+    // path is built on (pad table, NCHW pack/crop bit-identity, warp
+    // identity/shift/midpoint/zeros-outside, MV-sign convention).
+    let nppd_ok = match nppd::self_test() {
+        Ok(()) => {
+            eprintln!("nppd self-test: OK");
+            true
+        }
+        Err(e) => {
+            eprintln!("nppd self-test: FAIL — {e}");
+            false
+        }
+    };
+
     let rep = render::verify(scene, bvh, &cam, q, rw, rh, &stats, None, &[], None);
     eprintln!(
         "verify full-depth ({} px): false-sky {} | tmin-overshoot {} | hybrid-extra {} | max rel t err {:.2e}",
@@ -3469,6 +4167,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                         t2,
                         q.fb.depth,
                         scene.ao_radius,
+                        None,
                         &mut rng,
                         if s == 0 { Some(&mut hv) } else { None },
                         &mut ls,
@@ -3554,6 +4253,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                         q.fb.depth,
                         sun,
                         0,
+                        None,
                         &mut rng,
                         if s == 0 { Some(&mut hv) } else { None },
                         &mut ls,
@@ -3585,6 +4285,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                             &mut lsr,
                             None,
                             shade::VisCtl::Off,
+                            None,
                         ),
                     };
                 }
@@ -3620,6 +4321,286 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         if structural && (ls.hemi_cells_empty == 0 || ls.hemi_leaf_rays == 0) {
             eprintln!("hemi GI: expected both empty cells and leaf rays > 0 — a path didn't fire");
             ok = false;
+        }
+        ok
+    };
+
+    // Hemi sharing: one padded tree capture per coherent 2×2 group, consumed
+    // by every member from its own apex (see hemi::share_capture). Gates: the
+    // transplanted exact-zero soundness counters run PER MEMBER — a member
+    // re-validates the rep's Open claim, every leaf-ray tmin, and every cut
+    // traversal at ITS OWN origin (false-empty / tmin-overshoot / cut-miss /
+    // PSA) — plus shared-vs-unshared A/Bs on independent seed sets: both arms
+    // estimate the same integral, so a nonzero mean difference is exactly the
+    // bias a sharing soundness hole would introduce.
+    let mut hemi_share_ok = {
+        const SEEDS: u64 = 8;
+        let sun = render::sun_dir(scene);
+        let lum = |c: Vec3A| 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;
+        // 2×2 groups anchored at each probe pixel, kept under the renderer's
+        // exact predicate: same triangle, bit-equal shading normal, measured
+        // η/δ qualifiers (hemi::SHARE_*). Center rays, like collect_probes.
+        struct GProbe {
+            x: usize,
+            y: usize,
+            pts: [(Vec3A, Vec3A); 4],
+            delta: f32,
+            eta: f32,
+        }
+        let mut groups: Vec<GProbe> = Vec::new();
+        // Probes that pass same-tri + bit-equal-normal but fail the η/δ
+        // qualifiers — must-fired below (default scene: 61, from grazing-angle
+        // ground-plane probes) so the qualifier branch can't rot into dead
+        // code; skipped under --stress like every topology-tuned assertion.
+        let mut qual_reject = 0u64;
+        {
+            let mut vis = 0u64;
+            for pr in &probes {
+                if pr.x + 1 >= rw || pr.y + 1 >= rh {
+                    continue;
+                }
+                let mut pts = [(Vec3A::ZERO, Vec3A::ZERO); 4];
+                let mut tri = [u32::MAX; 4];
+                let mut all_hit = true;
+                for (i, (dx, dy)) in [(0usize, 0usize), (1, 0), (0, 1), (1, 1)].into_iter().enumerate()
+                {
+                    let dir = cam.ray_dir((pr.x + dx) as f32 + 0.5, (pr.y + dy) as f32 + 0.5);
+                    let ray = bvh::Ray::new(cam.origin, dir);
+                    match bvh.intersect(scene, &ray, 0.0, f32::INFINITY, &mut vis) {
+                        Some(h) => {
+                            pts[i] = shade::surface_point(scene, &ray, &h);
+                            tri[i] = h.tri;
+                        }
+                        None => {
+                            all_hit = false;
+                            break;
+                        }
+                    }
+                }
+                if !all_hit
+                    || tri.iter().any(|&t| t != tri[0])
+                    || pts.iter().any(|&(_, n)| n != pts[0].1)
+                {
+                    continue;
+                }
+                let (rp, rn) = pts[0];
+                let (mut delta, mut eta) = (0.0f32, 0.0f32);
+                for &(p, _) in &pts[1..] {
+                    let d = p - rp;
+                    delta = delta.max(d.length());
+                    eta = eta.max(rn.dot(d).abs());
+                }
+                if eta > scene.eps * hemi::SHARE_ETA_FRAC
+                    || delta > scene.ao_radius * hemi::SHARE_DELTA_FRAC
+                {
+                    qual_reject += 1;
+                    continue;
+                }
+                groups.push(GProbe { x: pr.x, y: pr.y, pts, delta, eta });
+            }
+        }
+        let results: Vec<_> = groups
+            .par_iter()
+            .map(|g| {
+                let mut hv = hemi::VerifyCounters::default();
+                let mut ls = stats::LocalStats::default();
+                let (rp, rn) = g.pts[0];
+                let (t1r, t2r) = shade::onb(rn);
+                // record_empties: Apply's verify arm re-validates every
+                // folded empty claim from EACH member's apex.
+                let mut ao_share = hemi::HemiShare::new();
+                ao_share.record_empties = true;
+                hemi::share_capture(
+                    scene,
+                    bvh,
+                    rp,
+                    rn,
+                    t1r,
+                    t2r,
+                    q.fb.depth,
+                    scene.ao_radius,
+                    g.delta,
+                    g.eta,
+                    None,
+                    &mut ao_share,
+                    &mut ls,
+                );
+                let mut gi_share = hemi::HemiShare::new();
+                gi_share.record_empties = true;
+                hemi::share_capture(
+                    scene,
+                    bvh,
+                    rp,
+                    rn,
+                    t1r,
+                    t2r,
+                    q.fb.depth,
+                    f32::INFINITY,
+                    g.delta,
+                    g.eta,
+                    Some(sun),
+                    &mut gi_share,
+                    &mut ls,
+                );
+                // Poison at a preset depth is a record-capacity bug — report
+                // it through the gate (a poisoned record must never be
+                // consumed, so this group's A/B is skipped).
+                if ao_share.poisoned || gi_share.poisoned {
+                    return (0.0, 0.0, hv, ls, true);
+                }
+                let (mut d_ao, mut d_gi) = (0f64, 0f64);
+                for (i, &(p, n)) in g.pts.iter().enumerate() {
+                    let (t1, t2) = shade::onb(n);
+                    let (x, y) = (g.x + (i & 1), g.y + (i >> 1));
+                    // PAIRED same-seed arms: both draw the identical rng
+                    // stream, so every ray the two trees have in common
+                    // cancels exactly in the difference — GI's heavy-tailed
+                    // fireflies included (an unpaired construction was tried
+                    // and measured the baseline estimator's skew, not the
+                    // sharing: identical +2.4% with sharing disabled in both
+                    // arms). The residual is purely the sharing-induced
+                    // delta, and an unbiased sharing keeps its mean at 0.
+                    let (mut aos, mut aou) = (0.0f32, 0.0f32);
+                    let (mut gis, mut giu) = (Vec3A::ZERO, Vec3A::ZERO);
+                    for s in 0..SEEDS {
+                        let mut rng = fastrand::Rng::with_seed(px_seed(x, y, s));
+                        aos += hemi::ao(
+                            scene,
+                            bvh,
+                            p,
+                            n,
+                            t1,
+                            t2,
+                            q.fb.depth,
+                            scene.ao_radius,
+                            Some(&ao_share),
+                            &mut rng,
+                            if s == 0 { Some(&mut hv) } else { None },
+                            &mut ls,
+                        );
+                        let mut rng = fastrand::Rng::with_seed(px_seed(x, y, s));
+                        aou += hemi::ao(
+                            scene,
+                            bvh,
+                            p,
+                            n,
+                            t1,
+                            t2,
+                            q.fb.depth,
+                            scene.ao_radius,
+                            None,
+                            &mut rng,
+                            None,
+                            &mut ls,
+                        );
+                        let mut rng = fastrand::Rng::with_seed(px_seed(x, y, 0x80 + s));
+                        gis += hemi::gi(
+                            scene,
+                            bvh,
+                            p,
+                            n,
+                            t1,
+                            t2,
+                            q.fb.depth,
+                            sun,
+                            0,
+                            Some(&gi_share),
+                            &mut rng,
+                            if s == 0 { Some(&mut hv) } else { None },
+                            &mut ls,
+                        );
+                        let mut rng = fastrand::Rng::with_seed(px_seed(x, y, 0x80 + s));
+                        giu += hemi::gi(
+                            scene,
+                            bvh,
+                            p,
+                            n,
+                            t1,
+                            t2,
+                            q.fb.depth,
+                            sun,
+                            0,
+                            None,
+                            &mut rng,
+                            None,
+                            &mut ls,
+                        );
+                    }
+                    d_ao += ((aos - aou) / SEEDS as f32) as f64;
+                    let (l_s, l_u) = (lum(gis / SEEDS as f32), lum(giu / SEEDS as f32));
+                    d_gi += ((l_s - l_u) / l_u.max(0.05)) as f64;
+                }
+                (d_ao / 4.0, d_gi / 4.0, hv, ls, false)
+            })
+            .collect();
+        let mut hv = hemi::VerifyCounters::default();
+        let mut ls = stats::LocalStats::default();
+        let (mut sum_ao, mut sum_gi, mut worst) = (0f64, 0f64, 0f64);
+        let mut n_poisoned = 0u64;
+        for (da, dg, phv, pls, poisoned) in &results {
+            hv.merge(phv);
+            ls.merge(pls);
+            sum_ao += da;
+            sum_gi += dg;
+            worst = worst.max(da.abs()).max(dg.abs());
+            n_poisoned += *poisoned as u64;
+        }
+        let ng = results.len() as f64;
+        let (mean_ao, mean_gi) = (sum_ao / ng.max(1.0), sum_gi / ng.max(1.0));
+        eprintln!(
+            "hemi share ({} groups of 4, {} qual-rejected): psa-viol {} | false-empty {} | tmin-overshoot {} | cut-miss {} | max psa err {:.2e}",
+            results.len(), qual_reject, hv.psa_violations, hv.false_empty, hv.tmin_overshoot, hv.cut_miss, hv.max_psa_err
+        );
+        eprintln!(
+            "hemi share paired A/B vs unshared (same seeds, per member): AO Δ {mean_ao:+.4} (limit ±0.005) | GI rel Δ {mean_gi:+.4} (limit ±0.01) | worst {worst:.3} | shared pts {} | share q/pt {:.2}",
+            ls.hemi_share_points,
+            ls.hemi_queries as f64 / ls.hemi_points.max(1) as f64,
+        );
+        let mut ok = hv.ok() && mean_ao.abs() < 0.005 && mean_gi.abs() < 0.01;
+        if n_poisoned > 0 {
+            eprintln!("hemi share: {n_poisoned} captures poisoned at preset depth (record capacity bug)");
+            ok = false;
+        }
+        if structural && (results.is_empty() || ls.hemi_share_points == 0) {
+            eprintln!("hemi share: expected qualifying probe groups and shared points > 0 — the path didn't fire");
+            ok = false;
+        }
+        if structural && qual_reject == 0 {
+            eprintln!("hemi share: expected η/δ qualifier rejections > 0 — the qualifier branch didn't fire");
+            ok = false;
+        }
+        // Guard must-fire: a capture past FB_DEPTH_CAP must poison (and so
+        // fall back per-pixel). At any legal depth the capacity math makes
+        // record overflow unreachable (≤ 4^(FB_DEPTH_CAP−1) leaves, ≤ 21 cut
+        // slots), so the depth guard is the one live poison producer — this
+        // keeps it from rotting into dead code.
+        if let Some(g) = groups.first() {
+            let (rp, rn) = g.pts[0];
+            let (t1, t2) = shade::onb(rn);
+            let mut deep = hemi::HemiShare::new();
+            let mut dls = stats::LocalStats::default();
+            hemi::share_capture(
+                scene,
+                bvh,
+                rp,
+                rn,
+                t1,
+                t2,
+                hemi::FB_DEPTH_CAP + 1,
+                scene.ao_radius,
+                g.delta,
+                g.eta,
+                None,
+                &mut deep,
+                &mut dls,
+            );
+            if !deep.poisoned {
+                eprintln!(
+                    "hemi share: a depth-{} capture did not poison — the FB_DEPTH_CAP guard is dead",
+                    hemi::FB_DEPTH_CAP + 1
+                );
+                ok = false;
+            }
         }
         ok
     };
@@ -3751,12 +4732,17 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     let tbuf: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
 
     const BENCH_FRAMES: u32 = 8;
-    for (label, hybrid, hemi_ao, hemi_gi, shafts) in [
-        ("hybrid ", true, false, false, false),
-        ("hemi-ao", true, true, false, false),
-        ("hemi-gi", true, false, true, false),
-        ("shafts ", true, false, false, true),
-        ("plain  ", false, false, false, false),
+    // (hemi_queries, share groups, share fallback) per row, for the
+    // hemi-share must-fires below (share-on must run strictly fewer queries).
+    let mut share_rows: Vec<(&str, bool, u64, u64, u64)> = Vec::new();
+    for (label, hybrid, hemi_ao, hemi_gi, shafts, share) in [
+        ("hybrid ", true, false, false, false, false),
+        ("hemi-ao (share off)", true, true, false, false, false),
+        ("hemi-ao (share on) ", true, true, false, false, true),
+        ("hemi-gi (share off)", true, false, true, false, false),
+        ("hemi-gi (share on) ", true, false, true, false, true),
+        ("shafts ", true, false, false, true, false),
+        ("plain  ", false, false, false, false, false),
     ] {
         stats.clear();
         let mut bq = q;
@@ -3784,6 +4770,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             prev_cam: None,
             frame_jitter: None,
             adaptive: false,
+            hemi_share: share,
             replay_rec: None,
             cut_cur: None,
             cut_prev: None,
@@ -3794,19 +4781,129 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
         let ms = t.elapsed().as_secs_f64() * 1000.0 / BENCH_FRAMES as f64;
         eprintln!("{label}: {ms:6.1} ms/frame | per {BENCH_FRAMES} frames: {}", stats.summary_line());
+        if hemi_ao || hemi_gi {
+            share_rows.push((
+                label,
+                share,
+                stats.hemi_queries.load(Relaxed),
+                stats.hemi_share_groups.load(Relaxed),
+                stats.hemi_share_fallback.load(Relaxed),
+            ));
+        }
         // Save the plain-hybrid and hemi-GI images while their buffers are
         // fresh (frame stays 0, so accum holds exactly the last frame).
         if hybrid && !hemi_ao && !hemi_gi && !shafts {
             let mut present = vec![0u32; rw * rh];
             render::resolve(&accum, &info, 1, false, &mut present, rw, rh, rw, rh);
             save_png("check.png", &present, rw, rh);
-        } else if hemi_gi {
+        } else if hemi_gi && !share {
             let mut present = vec![0u32; rw * rh];
             render::resolve(&accum, &info, 1, false, &mut present, rw, rh, rw, rh);
             save_png("check_gi.png", &present, rw, rh);
         }
     }
     eprintln!("wrote check.png + check_gi.png");
+    // Hemi-share frame must-fires (KILL CRITERION rides the printed ms above,
+    // the shafts/adopt precedent: if share-on is not measurably faster on
+    // both the default scene and --stress 5000, the feature does not merge):
+    // share-on frames must form groups, must still fall back somewhere
+    // (curved geometry — proof the predicate rejects), and must run strictly
+    // fewer hemi queries than their share-off twin.
+    for pair in share_rows.chunks(2) {
+        let [(l0, s0, q0, _, _), (l1, s1, q1, g1, f1)] = pair else { continue };
+        debug_assert!(!s0 && *s1, "share rows must alternate off/on");
+        if structural {
+            if *g1 == 0 || *f1 == 0 {
+                eprintln!("hemi share bench {l1}: expected groups and fallbacks > 0 (groups {g1}, fallback {f1})");
+                hemi_share_ok = false;
+            }
+            if q1 >= q0 {
+                eprintln!("hemi share bench: {l1} ran {q1} hemi queries, not fewer than {l0}'s {q0}");
+                hemi_share_ok = false;
+            }
+        }
+    }
+    // Hemi-share frame gates: (a) determinism — two same-seed share-on fb
+    // frames must be bit-identical (group formation and capture are pure
+    // functions of the frame inputs); (b) structure-replay coverage — the
+    // existing replay bit-identity gates run fb-OFF and prove nothing about
+    // the share cell loop, so one fb-ao trace/replay pair is gated here, with
+    // groups > 0 on both arms as the anti-vacuity check.
+    {
+        let snap = || -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+            (
+                accum.iter().map(|a| a.load(Relaxed)).collect(),
+                info.iter().map(|a| a.load(Relaxed)).collect(),
+                tbuf.iter().map(|a| a.load(Relaxed)).collect(),
+            )
+        };
+        let mut bq = q;
+        bq.fb.ao = true;
+        let rcache = replay::ReplayCache::new(rw, rh);
+        rcache.begin(rw, rh);
+        let ctx_rec = FrameCtx {
+            scene,
+            bvh,
+            cam,
+            q: bq,
+            frame: 0,
+            jitter: false,
+            rw,
+            rh,
+            accum: &accum,
+            info: &info,
+            tbuf: &tbuf,
+            stats: &stats,
+            sun: render::sun_dir(scene),
+            tcache_cur: None,
+            tcache_prev: &[],
+            accumulate: true,
+            gbuf: None,
+            prev_cam: None,
+            frame_jitter: None,
+            adaptive: false,
+            hemi_share: true,
+            replay_rec: Some(&rcache),
+            cut_cur: None,
+            cut_prev: None,
+        };
+        stats.clear();
+        render::render_frame(&ctx_rec, true);
+        let groups_a = stats.hemi_share_groups.load(Relaxed);
+        let a = snap();
+        let ctx = FrameCtx { replay_rec: None, ..ctx_rec };
+        stats.clear();
+        render::render_frame(&ctx, true);
+        let b = snap();
+        let mut ok = true;
+        if a != b {
+            eprintln!("hemi share: two same-seed share-on frames differ — nondeterministic grouping");
+            ok = false;
+        }
+        if !rcache.valid() {
+            eprintln!("hemi share: fb-ao recording frame poisoned — replay coverage not provable");
+            ok = false;
+        } else {
+            stats.clear();
+            render::render_frame_replay(&ctx, &rcache);
+            let groups_c = stats.hemi_share_groups.load(Relaxed);
+            let c = snap();
+            if a != c {
+                eprintln!("hemi share: fb-ao replay is not bit-identical to its trace");
+                ok = false;
+            }
+            if structural && (groups_a == 0 || groups_c == 0) {
+                eprintln!("hemi share: replay gate vacuous (trace groups {groups_a}, replay groups {groups_c})");
+                ok = false;
+            }
+        }
+        eprintln!(
+            "hemi share frame gates: determinism {} | fb-ao replay bit-identity {} (groups {groups_a})",
+            if a == b { "OK" } else { "FAIL" },
+            if ok { "OK" } else { "FAIL" },
+        );
+        hemi_share_ok &= ok;
+    }
 
     // Smoke-test dynamic resolution: one depth-capped frame per plausible cap
     // must complete; coarse coverage shrinks monotonically-ish as the cap
@@ -3834,6 +4931,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             prev_cam: None,
             frame_jitter: None,
             adaptive: false,
+            hemi_share: false,
             replay_rec: None,
             cut_cur: None,
             cut_prev: None,
@@ -3879,6 +4977,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             prev_cam: None,
             frame_jitter: None,
             adaptive: false,
+            hemi_share: false,
             replay_rec: None,
             cut_cur: Some(&cuts_a),
             cut_prev: None,
@@ -3981,6 +5080,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             prev_cam: None,
             frame_jitter: None,
             adaptive: false,
+            hemi_share: false,
             replay_rec: None,
             cut_cur: None,
             cut_prev: None,
@@ -4041,6 +5141,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 prev_cam: None,
                 frame_jitter: None,
                 adaptive: false,
+                hemi_share: false,
                 replay_rec: Some(&rcache),
                 cut_cur: None,
                 cut_prev: None,
@@ -4087,6 +5188,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 prev_cam: None,
                 frame_jitter: None,
                 adaptive: false,
+                hemi_share: false,
                 replay_rec: None,
                 cut_cur: None,
                 cut_prev: None,
@@ -4129,6 +5231,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 prev_cam: None,
                 frame_jitter: None,
                 adaptive: false,
+                hemi_share: false,
                 replay_rec: None,
                 cut_cur: None,
                 cut_prev: None,
@@ -4192,6 +5295,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 prev_cam: None,
                 frame_jitter: None,
                 adaptive: false,
+                hemi_share: false,
                 replay_rec: if do_record { Some(&rcache) } else { None },
                 cut_cur: None,
                 cut_prev: None,
@@ -4254,6 +5358,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 prev_cam: None,
                 frame_jitter: None,
                 adaptive: false,
+                hemi_share: false,
                 replay_rec: None,
                 cut_cur: None,
                 cut_prev: None,
@@ -4332,6 +5437,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 prev_cam: None,
                 frame_jitter: None,
                 adaptive: false,
+                hemi_share: false,
                 replay_rec: None,
                 cut_cur: Some(&chain_cs[0]),
                 cut_prev: None,
@@ -4369,6 +5475,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                     prev_cam: None,
                     frame_jitter: None,
                     adaptive: false,
+                    hemi_share: false,
                     replay_rec: None,
                     cut_cur: Some(&chain_cs[ci]),
                     cut_prev: Some(&chain_cs[pi]),
@@ -4437,6 +5544,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 prev_cam: None,
                 frame_jitter: None,
                 adaptive: false,
+                hemi_share: false,
                 replay_rec: None,
                 cut_cur: None,
                 cut_prev: cuts_opt,
@@ -4464,8 +5572,10 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
 
     if sph_ok
         && reproj_ok
+        && nppd_ok
         && hemi_ok
         && gi_ok
+        && hemi_share_ok
         && shaft_ok
         && rep.ok()
         && capped_ok
@@ -4594,7 +5704,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     // change, not a scene change: the res-step block below does NOT reset
     // (no dlss_reset, no prev drop; history survives via the extent tags).
     // A degenerate reported range (min == max) means the driver offers no
-    // DRS — fixed res, no controller. --lock-res (default native = 1.0)
+    // DRS — fixed res, no controller. --lock-res (default quality = 2/3)
     // pins a fixed res inside the range instead; `--lock-res dynamic` opts
     // back into the controller.
     let dlss_range = gpu.rr_res_range();
@@ -4685,7 +5795,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     // grid no longer matches.
     let mut xess_on = gpu.xess_ready();
     let xess_range = gpu.xess_res_range(); // (optimal, min, max)
-    // --lock-res (default native): one fixed render res for the whole
+    // --lock-res (default quality): one fixed render res for the whole
     // session — the ScaleCtl/StepLimiter pair is never built/consulted.
     // quantize_res clamps the requested scale into the SDK range.
     let xess_lock = opts.lock_scale.and_then(|r| {
@@ -4747,7 +5857,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     // BLAS/TLAS, and — in upscaler sessions — the feed wiring). The session
     // sub-mode mirrors the CPU defaults: DLSS-RR when supported, XeSS with
     // --xess, plain with --no-dlss. The render resolution is LOCKED for the
-    // session (from --lock-res, default native = 1.0, quantized into the
+    // session (from --lock-res, default quality = 2/3, quantized into the
     // upscaler's range) — the tracer's buffers are sized to it once; there
     // is no DRS on the GPU path. Any init failure falls back to the CPU
     // renderer with the reason on stderr. With Streamline live the tracer's
@@ -4764,12 +5874,12 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     let (mut grw, mut grh) = (W, H);
     if opts.gpu {
         // Session sub-mode + locked trace res. `--lock-res dynamic` can't be
-        // honored here (no DRS on the GPU path): lock at the native default.
+        // honored here (no DRS on the GPU path): lock at the quality default.
         let lock = opts.lock_scale.unwrap_or_else(|| {
             if dlss_on || xess_on {
-                eprintln!("gpu: dynamic render res is unsupported under --gpu; locking at native (100%)");
+                eprintln!("gpu: dynamic render res is unsupported under --gpu; locking at quality (2/3)");
             }
-            1.0
+            2.0 / 3.0
         });
         if dlss_on {
             gpu_up = GpuUp::Rr;
@@ -4802,6 +5912,8 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 grw as u32,
                 grh as u32,
                 gpu_up != GpuUp::Plain,
+                (gpu_up == GpuUp::Xess && opts.nppd)
+                    .then_some((opts.nppd_path.as_str(), opts.nppd_model.as_str())),
                 opts.gpu_debug,
             )
         }) {
@@ -4839,6 +5951,13 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     // init-time).
     let gpu_xess_avail = gpu_trace && gpu_up == GpuUp::Xess;
     let gpu_rr_avail = gpu_trace && gpu_up == GpuUp::Rr;
+    // GPU-resident NPPD (wired at init in --gpu --nppd XeSS sessions; J
+    // toggles the pre-upscale slot, mirroring the CPU xess_nppd contract).
+    let gpu_nppd_avail = gpu_trace && gpu.nppd_gpu_ready();
+    let mut gpu_nppd_on = gpu_nppd_avail;
+    if gpu_nppd_avail {
+        eprintln!("gpu: NPPD pre-upscale denoise ON (J toggles)");
+    }
 
     // OIDN state — the secondary denoiser (N toggles, mutually exclusive
     // with DLSS). It keeps the normal render loop (temporal cache, budget
@@ -4942,6 +6061,116 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
             oidn_failed = true;
         }
     }
+
+    // NPPD state — the neural denoiser (J toggles, mutually exclusive with
+    // DLSS/OIDN/XeSS). It keeps the normal render loop at forced full-res
+    // with fresh 1-spp frames (accumulate off, free-running nppd_seq) and
+    // runs the recurrent network per frame: the state is backward-warped by
+    // this frame's motion vectors (so prev_cam is set — the first
+    // CPU-denoiser mode that needs it), the 10-channel stack packed from
+    // accum + the G-buffers, and the ONNX session executed via DirectML (CPU
+    // EP fallback). Context (~800 MB staging at 1080p — the 38-channel
+    // recurrent state dominates) and W×H G-buffers are lazily created on
+    // first enable; a failed init is remembered and not retried per keypress.
+    // nppd_prev is its own prev-camera contract (dlss_prev/xess_prev
+    // precedent), cleared on toggle, set only after a rendered NPPD frame.
+    let mut nppd_on = false;
+    // XeSS composition: NPPD as the pre-upscale denoiser at the (locked)
+    // render res — the slot OIDN's Pre placement occupies, mutually
+    // exclusive with it (J toggles; N cycling to pre/post turns this off).
+    // Under --lock-res dynamic every DRS step invalidates the recurrent
+    // state and re-specializes the DML graph — noted loudly, not forbidden.
+    let mut xess_nppd = false;
+    let mut nppd_ctx: Option<nppd::NppdContext> = None;
+    let mut nppd_gbufs: Option<dlss::GBufs> = None;
+    let mut nppd_prev: Option<Camera> = None;
+    let mut nppd_seq: u32 = 0;
+    let mut nppd_failed = false;
+    let nppd_drs_note = |lock: Option<f32>| {
+        if lock.is_none() {
+            eprintln!(
+                "nppd: --lock-res dynamic steps the render res — each step resets the \
+                 recurrent state and re-specializes the graph (a fixed --lock-res avoids it)"
+            );
+        }
+    };
+    // `want_gbufs`: the standalone mode fills its own window-res G-buffers;
+    // the XeSS composition reads xess_gbufs at render res and must not
+    // commit the ~116 MB window-res set. `(iw, ih)` is the res the FIRST
+    // denoise will run at — the session's frozen dims (opening anywhere else
+    // costs an immediate DML session rebuild, hundreds of ms); capacity is
+    // always window-res, so a later set_res (X-off standalone J, dynamic-DRS
+    // steps) stays within bounds.
+    let nppd_try_enable = |nppd_ctx: &mut Option<nppd::NppdContext>,
+                           nppd_gbufs: &mut Option<dlss::GBufs>,
+                           want_gbufs: bool,
+                           (iw, ih): (usize, usize)| {
+        if nppd_ctx.is_none() {
+            let dev = match opts.nppd_device {
+                None => nppd::NppdDevice::Auto,
+                Some(-1) => nppd::NppdDevice::Cpu,
+                Some(n) => nppd::NppdDevice::Dml(n),
+            };
+            match nppd::NppdContext::with_capacity(
+                &opts.nppd_path,
+                &opts.nppd_model,
+                iw,
+                ih,
+                W,
+                H,
+                dev,
+            ) {
+                Ok(c) => *nppd_ctx = Some(c),
+                Err(e) => {
+                    eprintln!("{e}");
+                    eprintln!(
+                        "nppd: DLLs expected at {} (--nppd-path / FRUSTRACER_ORT_PATH), \
+                         model at {} (--nppd-model / FRUSTRACER_NPPD_MODEL — \
+                         tools/nppd-export/export.py produces it)",
+                        opts.nppd_path, opts.nppd_model
+                    );
+                }
+            }
+        }
+        if want_gbufs && nppd_ctx.is_some() && nppd_gbufs.is_none() {
+            *nppd_gbufs = Some(dlss::GBufs::new(W, H));
+        }
+        nppd_ctx.is_some()
+    };
+    if opts.nppd && !gpu_trace {
+        // (Under --gpu the NPPD stage is GPU-resident — nppd_gpu in
+        // GpuContext, wired by init_trace; the CPU context never builds.)
+        if xess_on {
+            // XeSS session: --nppd lands the pre-upscale placement (the
+            // NPPD context works at the render res; the window-res gbufs
+            // stay unallocated — XeSS mode fills xess_gbufs).
+            if nppd_try_enable(&mut nppd_ctx, &mut nppd_gbufs, false, xess_lock.unwrap_or((W, H)))
+            {
+                xess_nppd = true;
+                if xess_oidn != XessOidn::Off {
+                    xess_oidn = XessOidn::Off;
+                    eprintln!("oidn: OFF (--nppd takes the XeSS pre-denoise slot)");
+                }
+                nppd_drs_note(opts.lock_scale);
+                eprintln!("nppd: PRE-upscale denoise ON (J toggles)");
+            } else {
+                nppd_failed = true;
+            }
+        } else if nppd_try_enable(&mut nppd_ctx, &mut nppd_gbufs, true, (W, H)) {
+            nppd_on = true;
+            if dlss_on {
+                dlss_on = false;
+                eprintln!("dlss: Ray Reconstruction OFF (--nppd; G re-enables)");
+            }
+            if oidn_on {
+                oidn_on = false;
+                eprintln!("oidn: OFF (--nppd; N re-enables)");
+            }
+            eprintln!("nppd: neural denoising ON (J toggles)");
+        } else {
+            nppd_failed = true;
+        }
+    }
     let mut prev_budget = false;
     // Depth cap that fully resolves the screen (tiles reach LEAF_TILE): 7 at 1024.
     let depth_full: f32 = ((W.max(H) as f32) / render::LEAF_TILE as f32).log2().ceil();
@@ -5034,6 +6263,25 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                     );
                 }
             }
+            if edges.toggle_nppd {
+                if gpu_nppd_avail {
+                    if gpu_up == GpuUp::Xess {
+                        gpu_nppd_on = !gpu_nppd_on;
+                        frame = 0;
+                        // Noise statistics change; the recurrent state resets
+                        // via nppd_state_valid (J-off frames clear it).
+                        gpu_reset = true;
+                        eprintln!(
+                            "gpu: NPPD pre-upscale denoise {}",
+                            if gpu_nppd_on { "ON" } else { "OFF" }
+                        );
+                    } else {
+                        eprintln!("gpu: NPPD rides the XeSS composition (X back on first)");
+                    }
+                } else {
+                    eprintln!("gpu: NPPD not wired in this session (start with --gpu --nppd)");
+                }
+            }
             // CPU-renderer-only keys: consume the edges with a note instead
             // of silently swallowing them (CLAUDE.md: "T/O/N/M print notes").
             if edges.toggle_dynamic {
@@ -5085,7 +6333,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                     verify: false,
                 };
                 let presented = if gpu_up == GpuUp::Xess {
-                    gpu.present_trace_xess(&p, hybrid, jit, gpu_reset)
+                    gpu.present_trace_xess(&p, hybrid, jit, gpu_reset, gpu_nppd_on)
                 } else {
                     // The prev matrices are recomputed from the stored
                     // camera (pure math, fixed res: identical to last
@@ -5113,10 +6361,18 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                         gpu_up_idx = gpu_up_idx.wrapping_add(1);
                     }
                     Err(e) => {
-                        let (name, key) =
-                            if gpu_up == GpuUp::Xess { ("XeSS", 'X') } else { ("DLSS-RR", 'G') };
-                        eprintln!("gpu: {name} present failed ({e}); presenting plain ({key} to retry)");
-                        gpu_up = GpuUp::Plain;
+                        if gpu_up == GpuUp::Xess && gpu_nppd_on {
+                            // Shed the NPPD stage first — XeSS itself may be
+                            // fine (the run/split path is NPPD-only).
+                            eprintln!("gpu: NPPD present failed ({e}); NPPD OFF (J to retry)");
+                            gpu_nppd_on = false;
+                            gpu_reset = true;
+                        } else {
+                            let (name, key) =
+                                if gpu_up == GpuUp::Xess { ("XeSS", 'X') } else { ("DLSS-RR", 'G') };
+                            eprintln!("gpu: {name} present failed ({e}); presenting plain ({key} to retry)");
+                            gpu_up = GpuUp::Plain;
+                        }
                         frame = 0;
                     }
                 }
@@ -5218,7 +6474,14 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 let mode = match gpu_up {
                     GpuUp::Plain => format!("{}x{}", grw, grh),
                     GpuUp::Rr => format!("RR {}x{} -> {}x{}", grw, grh, W, H),
-                    GpuUp::Xess => format!("XeSS {}x{} -> {}x{}", grw, grh, W, H),
+                    GpuUp::Xess => format!(
+                        "XeSS{} {}x{} -> {}x{}",
+                        if gpu_nppd_on { "+NPPD(pre)" } else { "" },
+                        grw,
+                        grh,
+                        W,
+                        H
+                    ),
                 };
                 let spp = if gpu_up == GpuUp::Plain {
                     format!(
@@ -5303,6 +6566,11 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                     oidn_on = false;
                     eprintln!("oidn: OFF (DLSS enabled)");
                 }
+                if dlss_on && nppd_on {
+                    nppd_on = false;
+                    nppd_prev = None;
+                    eprintln!("nppd: OFF (DLSS enabled)");
+                }
                 if dlss_on && xess_on {
                     // Structurally unreachable (XeSS sessions never init SL),
                     // kept for the day both live on one pipeline.
@@ -5338,6 +6606,11 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                     oidn_on = false;
                     eprintln!("oidn: OFF (XeSS enabled; N cycles the XeSS placement)");
                 }
+                if xess_on && nppd_on {
+                    nppd_on = false;
+                    nppd_prev = None;
+                    eprintln!("nppd: OFF (XeSS enabled)");
+                }
                 eprintln!(
                     "xess: {}",
                     if xess_on {
@@ -5371,6 +6644,10 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 } else if oidn_try_enable(&mut oidn_ctx, &mut oidn_gbufs, &mut oidn_hist) {
                     xess_oidn = next;
                     frame = 0;
+                    if xess_nppd {
+                        xess_nppd = false;
+                        eprintln!("nppd: OFF (OIDN takes the XeSS pre-denoise slot)");
+                    }
                     eprintln!(
                         "oidn: {} the XeSS upscale (N cycles off → pre → post)",
                         if next == XessOidn::Pre {
@@ -5397,6 +6674,11 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                     dlss_reset = true;
                     eprintln!("dlss: Ray Reconstruction OFF (OIDN enabled)");
                 }
+                if nppd_on {
+                    nppd_on = false;
+                    nppd_prev = None;
+                    eprintln!("nppd: OFF (OIDN enabled)");
+                }
                 eprintln!(
                     "oidn: ON{}, temporal reprojection {} (M toggles)",
                     if xess_on { " (XeSS pre-denoise at the dynamic render res)" } else { "" },
@@ -5404,6 +6686,74 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 );
             } else {
                 oidn_failed = true;
+            }
+        }
+        if edges.toggle_nppd {
+            if xess_on {
+                // XeSS mode: J toggles the NPPD pre-upscale placement
+                // (mutually exclusive with the OIDN N-cycle's pre/post).
+                if xess_nppd {
+                    xess_nppd = false;
+                    frame = 0;
+                    eprintln!("nppd: OFF (raw XeSS input)");
+                } else if nppd_failed {
+                    eprintln!(
+                        "nppd: unavailable (earlier init failed; restart with --nppd-path/--nppd-model to retry)"
+                    );
+                } else if nppd_try_enable(
+                    &mut nppd_ctx,
+                    &mut nppd_gbufs,
+                    false,
+                    xess_lock.unwrap_or((W, H)),
+                ) {
+                    xess_nppd = true;
+                    frame = 0;
+                    if xess_oidn != XessOidn::Off {
+                        xess_oidn = XessOidn::Off;
+                        eprintln!("oidn: OFF (NPPD takes the XeSS pre-denoise slot)");
+                    }
+                    nppd_drs_note(opts.lock_scale);
+                    let c = nppd_ctx.as_ref().unwrap();
+                    eprintln!(
+                        "nppd: PRE-upscale denoise ON ({} | onnxruntime {})",
+                        c.device_desc, c.ort_version
+                    );
+                } else {
+                    nppd_failed = true;
+                }
+            } else if nppd_on {
+                nppd_on = false;
+                nppd_prev = None;
+                frame = 0;
+                eprintln!("nppd: OFF");
+            } else if nppd_failed {
+                eprintln!(
+                    "nppd: unavailable (earlier init failed; restart with --nppd-path/--nppd-model to retry)"
+                );
+            } else if nppd_try_enable(&mut nppd_ctx, &mut nppd_gbufs, true, (W, H)) {
+                nppd_on = true;
+                nppd_prev = None;
+                frame = 0;
+                if dlss_on {
+                    dlss_on = false;
+                    dlss_prev = None;
+                    dlss_reset = true;
+                    eprintln!("dlss: Ray Reconstruction OFF (NPPD enabled)");
+                }
+                if xess_on {
+                    xess_on = false;
+                    xess_prev = None;
+                    xess_reset = true;
+                    eprintln!("xess: OFF (NPPD enabled)");
+                }
+                if oidn_on {
+                    oidn_on = false;
+                    eprintln!("oidn: OFF (NPPD enabled)");
+                }
+                let c = nppd_ctx.as_ref().unwrap();
+                eprintln!("nppd: neural denoising ON ({} | onnxruntime {})", c.device_desc, c.ort_version);
+            } else {
+                nppd_failed = true;
             }
         }
         // True only when M actually flipped oidn_temporal (not the Post/no-op
@@ -5443,6 +6793,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
             || edges.quality.is_some()
             || edges.toggle_xess
             || edges.toggle_oidn
+            || edges.toggle_nppd
             || temporal_flipped
         {
             xess_reset = true;
@@ -5463,10 +6814,17 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
             || edges.toggle_oidn
             || edges.toggle_dlss
             || edges.toggle_xess
+            || edges.toggle_nppd
             || temporal_flipped;
         if hist_stale {
             if let Some(h) = &mut oidn_hist {
                 h.invalidate();
+            }
+            // The NPPD recurrent state follows the same staleness predicate —
+            // any shading/mode-semantics change, never camera motion
+            // (surviving motion is exactly what the warped state is for).
+            if let Some(c) = &mut nppd_ctx {
+                c.reset_temporal();
             }
         }
 
@@ -5478,19 +6836,27 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
             RenderMode::Xess
         } else if oidn_on {
             RenderMode::Oidn { temporal: oidn_temporal }
+        } else if nppd_on {
+            RenderMode::Nppd
         } else {
             RenderMode::Plain
         };
         // DLSS/XeSS: an upscaler owns temporal integration — fresh 1-spp
         // frames, fixed cheap preset, no budget path, no CPU accumulation.
         let upscaled = matches!(mode, RenderMode::Dlss | RenderMode::Xess);
+        // `neural` extends the same frame contract to NPPD (a denoiser, not
+        // an upscaler — it presents through the CPU path at window res, but
+        // its recurrent network owns temporal integration exactly like RR:
+        // fresh 1-spp frames, fixed cheap preset, no budget frames, no CPU
+        // accumulation, never idle).
+        let neural = upscaled || mode == RenderMode::Nppd;
 
         // Cheap while moving, converge while still. Dynamic-res mode keeps
         // full resolution buffers and full quality — the estimated depth cap
         // floats the effective resolution instead. DLSS mode traces every
         // frame uncapped at RR's fixed render resolution (RR requires clean
         // per-pixel G-buffers) with frame-stationary quality.
-        let use_budget = moved && hybrid && dynamic && !upscaled;
+        let use_budget = moved && hybrid && dynamic && !neural;
         // Emergency-shed predicate for the step limiters: a badly blown
         // previous frame may bypass the dwell (shed only, never grow).
         let blown = last_ms as f32 > 1.5 * RENDER_BUDGET.as_secs_f32() * 1000.0;
@@ -5526,6 +6892,9 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
             // and a half-res frame renders into a prefix with a different
             // stride. Budget (dynamic-res) frames are full-res and fine.
             RenderMode::Oidn { .. } => (W, H),
+            // NPPD: fixed window res — the session's staging and the
+            // recurrent state are laid out for it (no budget frames either).
+            RenderMode::Nppd => (W, H),
             RenderMode::Plain if moved && !use_budget => (W / 2, H / 2),
             RenderMode::Plain => (W, H),
         };
@@ -5577,7 +6946,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
             prev_budget = use_budget;
         }
         let base_q = Quality::preset(preset);
-        let mut q = if upscaled {
+        let mut q = if neural {
             // Fixed cheap preset: the temporal denoisers/upscalers want
             // frame-stationary noise statistics.
             Quality {
@@ -5591,7 +6960,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
         } else {
             base_q
         };
-        if !upscaled && !moved {
+        if !neural && !moved {
             q.fb.ao = bounce_mode == 1;
             q.fb.gi = bounce_mode >= 2;
             q.fb.shadows = bounce_mode == 3;
@@ -5600,10 +6969,11 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
         // Temporal-OIDN mode renders fresh 1-spp frames (the DLSS pattern);
         // the reprojected history in the present chain is the accumulator.
         let oidn_t = mode == RenderMode::Oidn { temporal: true };
-        // DLSS and XeSS modes never idle: fresh jittered 1-spp frames are
-        // what their temporal accumulators integrate — super-resolution in
-        // XeSS's case, which converges while "still" instead of on the CPU.
-        let rendered = upscaled || frame < MAX_SAMPLES;
+        // DLSS, XeSS, and NPPD modes never idle: fresh jittered 1-spp frames
+        // are what their temporal accumulators integrate — super-resolution
+        // in XeSS's case, which converges while "still" instead of on the
+        // CPU; NPPD's recurrent state wants a steady stream.
+        let rendered = neural || frame < MAX_SAMPLES;
         // Hoisted out of the render arm: the OIDN present branch needs the
         // exact basis this frame traced with for the history update.
         let basis = cam.basis(rw, rh);
@@ -5661,13 +7031,14 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                     RenderMode::Xess => xess_idx, // free-running, the dlss_idx pattern
                     // free-running: decorrelates the RNG while `frame` is pinned
                     RenderMode::Oidn { temporal: true } => oidn_seq,
+                    RenderMode::Nppd => nppd_seq,
                     _ => frame,
                 },
                 // DLSS/XeSS ignore `jitter` (frame_jitter wins in
-                // trace_primary); temporal OIDN always jitters its fresh
-                // 1-spp frames; the accumulating modes jitter after the
-                // first (pilot) sample.
-                jitter: oidn_t || (!upscaled && frame > 0),
+                // trace_primary); temporal OIDN and NPPD always jitter their
+                // fresh 1-spp frames; the accumulating modes jitter after
+                // the first (pilot) sample.
+                jitter: oidn_t || mode == RenderMode::Nppd || (!upscaled && frame > 0),
                 rw,
                 rh,
                 accum: &accum,
@@ -5677,12 +7048,13 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 sun: render::sun_dir(scene),
                 tcache_cur,
                 tcache_prev: &tprev_vec,
-                accumulate: !upscaled && !oidn_t,
+                accumulate: !neural && !oidn_t,
                 gbuf: match mode {
                     RenderMode::Dlss => Some(&gbufs),
                     RenderMode::Xess => xess_gbufs.as_ref(),
                     // Both OIDN sub-modes fill the window-res G-buffers.
                     RenderMode::Oidn { .. } => oidn_gbufs.as_ref(),
+                    RenderMode::Nppd => nppd_gbufs.as_ref(),
                     RenderMode::Plain => None,
                 },
                 prev_cam: match mode {
@@ -5690,6 +7062,8 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                     // Basis derived at THIS frame's res — correct across
                     // DRS steps by construction.
                     RenderMode::Xess => xess_prev.map(|c| c.basis(rw, rh)),
+                    // Window res always — the state warp consumes these MVs.
+                    RenderMode::Nppd => nppd_prev.map(|c| c.basis(rw, rh)),
                     _ => None,
                 },
                 frame_jitter: match mode {
@@ -5707,6 +7081,10 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 // uniform per-pixel shading (visibility is per-pixel
                 // either way).
                 adaptive: mode == RenderMode::Xess && opts.adaptive,
+                // Hemi sharing only ever fires on fb frames (still,
+                // non-upscaled — the shade_tile branch checks q.fb);
+                // --no-hemi-share is the per-session kill switch.
+                hemi_share: opts.hemi_share,
                 replay_rec: if record { Some(&replay_cache) } else { None },
                 cut_cur,
                 cut_prev,
@@ -5768,6 +7146,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
             }
             frame += 1;
             oidn_seq = oidn_seq.wrapping_add(1);
+            nppd_seq = nppd_seq.wrapping_add(1);
         } else {
             std::thread::sleep(Duration::from_millis(8)); // converged — idle
         }
@@ -5776,7 +7155,8 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
         // for full-res frames without the overlay — half-res upscale and the
         // overlay composite live in the CPU resolve. OIDN mode presents its
         // denoised output through the CPU path, so it excludes the GPU tonemap.
-        let use_gpu_tone = gpu_tonemap && !oidn_on && rw == W && !(overlay_on && hybrid);
+        let use_gpu_tone =
+            gpu_tonemap && !oidn_on && !nppd_on && rw == W && !(overlay_on && hybrid);
         if dlss_on {
             // DLSS-RR: hand the 1-spp radiance + G-buffers to the denoiser;
             // it outputs denoised HDR which the GPU tonemap presents.
@@ -5895,7 +7275,38 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 // window-res capacity, invalidating itself (a fresh history
                 // is an invalidated one; XeSS's own accumulation hides the
                 // blip). Both run per distinct-res frame during a DRS ramp.
-                let denoised = if xess_oidn == XessOidn::Pre {
+                // Which pre-denoiser fed this frame, if any (borrow-friendly
+                // tag; the actual output slices are re-borrowed below).
+                enum Pre {
+                    Oidn,
+                    Nppd,
+                }
+                let denoised = if xess_nppd {
+                    // NPPD pre-denoise at the render res: one recurrent step
+                    // on the 1-spp frame — the state warp reads xess_gbufs'
+                    // motion vectors (the same xess_prev contract the
+                    // upscaler consumes). set_res is a no-op at a locked res;
+                    // under dynamic DRS each step invalidates the state (the
+                    // startup note).
+                    let nctx = nppd_ctx.as_mut().expect("xess_nppd without context");
+                    let t_pre = Instant::now();
+                    let result = nctx
+                        .set_res(rw, rh)
+                        .and_then(|()| nctx.denoise(&accum[..n], xg, &basis, dlss_far).map(drop));
+                    pre_ms = t_pre.elapsed().as_secs_f64() * 1000.0;
+                    match result {
+                        Ok(()) => Some(Pre::Nppd),
+                        Err(e) => {
+                            eprintln!("nppd: pre-denoise failed ({e}); raw XeSS input (J to retry)");
+                            xess_nppd = false;
+                            pre_ms = 0.0;
+                            // Statistics flip denoised→raw mid-stream: the
+                            // upscaler must not integrate across it.
+                            xess_reset = true;
+                            None
+                        }
+                    }
+                } else if xess_oidn == XessOidn::Pre {
                     let octx = oidn_ctx.as_mut().expect("xess_oidn without context");
                     let t_pre = Instant::now();
                     let result = octx.set_res(rw, rh).and_then(|()| {
@@ -5921,7 +7332,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                     });
                     pre_ms = t_pre.elapsed().as_secs_f64() * 1000.0;
                     match result {
-                        Ok(()) => Some(()),
+                        Ok(()) => Some(Pre::Oidn),
                         Err(e) => {
                             eprintln!("oidn: pre-denoise failed ({e}); raw XeSS input (N to retry)");
                             xess_oidn = XessOidn::Off;
@@ -5940,7 +7351,12 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                     None
                 };
                 let color = match denoised {
-                    Some(()) => gpu::xr::ColorSrc::Hdr(oidn_ctx.as_ref().unwrap().last_output()),
+                    Some(Pre::Oidn) => {
+                        gpu::xr::ColorSrc::Hdr(oidn_ctx.as_ref().unwrap().last_output())
+                    }
+                    Some(Pre::Nppd) => {
+                        gpu::xr::ColorSrc::Hdr(nppd_ctx.as_ref().unwrap().last_output())
+                    }
                     None => gpu::xr::ColorSrc::Accum(&accum[..n]),
                 };
                 match gpu.present_xess(&color, xg, rw, rh, jit, xess_reset, dlss_near, dlss_far) {
@@ -6032,6 +7448,57 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                     W,
                     H,
                 );
+            }
+            gpu.present_cpu(&present).expect("GPU present failed");
+        } else if nppd_on {
+            // NPPD: one recurrent network step on the CPU-resolve path — the
+            // state is warped by this frame's motion vectors, the 1-spp frame
+            // + G-buffers packed, the graph run (DirectML or CPU EP), and the
+            // denoised HDR tonemapped into the present buffer. The output is
+            // never written back into accum; the mode never idles (`rendered`
+            // is unconditional), so no re-present arm exists.
+            let nctx = nppd_ctx.as_mut().expect("nppd_on without context");
+            if rendered {
+                let ng = nppd_gbufs.as_ref().expect("nppd_on without gbufs");
+                let result = nctx
+                    .set_res(W, H)
+                    .and_then(|()| nctx.denoise(&accum, ng, &basis, dlss_far).map(drop));
+                match result {
+                    Ok(()) => {
+                        render::resolve_hdr(
+                            nctx.last_output(),
+                            &info,
+                            overlay_on && hybrid,
+                            &mut present,
+                            W,
+                            H,
+                            W,
+                            H,
+                        );
+                        // The MV contract: prev is the camera of the last
+                        // frame the recurrent state actually saw.
+                        nppd_prev = Some(cam);
+                    }
+                    Err(e) => {
+                        eprintln!("nppd: denoise failed ({e}); OFF (J to retry)");
+                        nppd_on = false;
+                        nppd_prev = None;
+                        // accum holds one 1-spp frame, not a sum: resolve it
+                        // as 1 sample and restart accumulation cleanly.
+                        frame = 0;
+                        render::resolve(
+                            &accum,
+                            &info,
+                            1,
+                            overlay_on && hybrid,
+                            &mut present,
+                            rw,
+                            rh,
+                            W,
+                            H,
+                        );
+                    }
+                }
             }
             gpu.present_cpu(&present).expect("GPU present failed");
         } else if use_gpu_tone {
@@ -6177,12 +7644,20 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                         " | XeSS: {} {}%{}",
                         if xess_lock.is_some() { "lock" } else { "dyn" },
                         rh * 100 / H,
-                        match (xess_oidn, oidn_ctx.as_ref()) {
-                            (XessOidn::Pre, Some(c)) =>
-                                format!(" +OIDN(pre) {} {:.1} ms", c.device_desc, c.last_ms),
-                            (XessOidn::Post, Some(c)) =>
-                                format!(" +OIDN(post) {} {:.1} ms", c.device_desc, c.last_ms),
-                            _ => String::new(),
+                        if xess_nppd {
+                            match nppd_ctx.as_ref() {
+                                Some(c) =>
+                                    format!(" +NPPD(pre) {} {:.1} ms", c.device_desc, c.last_ms),
+                                None => String::new(),
+                            }
+                        } else {
+                            match (xess_oidn, oidn_ctx.as_ref()) {
+                                (XessOidn::Pre, Some(c)) =>
+                                    format!(" +OIDN(pre) {} {:.1} ms", c.device_desc, c.last_ms),
+                                (XessOidn::Post, Some(c)) =>
+                                    format!(" +OIDN(post) {} {:.1} ms", c.device_desc, c.last_ms),
+                                _ => String::new(),
+                            }
                         }
                     )
                 } else if oidn_on {
@@ -6195,27 +7670,36 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                         ),
                         None => " | OIDN".to_string(),
                     }
+                } else if nppd_on {
+                    match nppd_ctx.as_ref() {
+                        Some(c) => format!(" | NPPD: {} {:.1} ms", c.device_desc, c.last_ms),
+                        None => " | NPPD".to_string(),
+                    }
                 } else {
                     " | DLSS: off".to_string()
                 },
                 rw,
                 rh,
                 last_ms,
-                if dlss_on || xess_on {
+                if dlss_on || xess_on || nppd_on {
                     "1 spp".to_string()
                 } else {
                     format!("{} spp", frame.min(MAX_SAMPLES))
                 },
                 preset,
                 coarse,
-                if dlss_on || xess_on {
+                if dlss_on || xess_on || nppd_on {
                     ""
                 } else {
                     ["", " | hemi-AO", " | hemi-GI", " | hemi-GI+shafts"][bounce_mode as usize]
                 },
                 if use_gpu_tone && !dlss_on && !xess_on { " | gpu-tone" } else { "" },
                 if overlay_on { " | overlay" } else { "" },
-                if !dlss_on && !xess_on && frame >= MAX_SAMPLES { " | converged" } else { "" },
+                if !dlss_on && !xess_on && !nppd_on && frame >= MAX_SAMPLES {
+                    " | converged"
+                } else {
+                    ""
+                },
             ));
         }
         if (now - last_stats).as_secs_f64() > 1.0 && frame <= MAX_SAMPLES && frame > 0 {

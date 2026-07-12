@@ -55,6 +55,12 @@ pub struct Stats {
     pub hemi_cells_empty: AtomicU64,
     /// Budget-depth cells that shot their one stratified ray.
     pub hemi_leaf_rays: AtomicU64,
+    /// Hemi sharing (one root capture per coherent 2×2 group): groups
+    /// captured, points integrated from a shared seed (rep included), and fb
+    /// points that failed the group predicate and ran their own root.
+    pub hemi_share_groups: AtomicU64,
+    pub hemi_share_points: AtomicU64,
+    pub hemi_share_fallback: AtomicU64,
     /// Light-shaft subrect bound queries and their node visits.
     pub shaft_queries: AtomicU64,
     pub shaft_nodes: AtomicU64,
@@ -111,6 +117,9 @@ pub struct LocalStats {
     pub hemi_nodes: u64,
     pub hemi_cells_empty: u64,
     pub hemi_leaf_rays: u64,
+    pub hemi_share_groups: u64,
+    pub hemi_share_points: u64,
+    pub hemi_share_fallback: u64,
     pub shaft_queries: u64,
     pub shaft_nodes: u64,
     pub shaft_rays_skipped: u64,
@@ -159,6 +168,9 @@ impl LocalStats {
         self.hemi_nodes += o.hemi_nodes;
         self.hemi_cells_empty += o.hemi_cells_empty;
         self.hemi_leaf_rays += o.hemi_leaf_rays;
+        self.hemi_share_groups += o.hemi_share_groups;
+        self.hemi_share_points += o.hemi_share_points;
+        self.hemi_share_fallback += o.hemi_share_fallback;
         self.shaft_queries += o.shaft_queries;
         self.shaft_nodes += o.shaft_nodes;
         self.shaft_rays_skipped += o.shaft_rays_skipped;
@@ -206,6 +218,9 @@ impl Stats {
         self.hemi_nodes.store(0, Relaxed);
         self.hemi_cells_empty.store(0, Relaxed);
         self.hemi_leaf_rays.store(0, Relaxed);
+        self.hemi_share_groups.store(0, Relaxed);
+        self.hemi_share_points.store(0, Relaxed);
+        self.hemi_share_fallback.store(0, Relaxed);
         self.shaft_queries.store(0, Relaxed);
         self.shaft_nodes.store(0, Relaxed);
         self.shaft_rays_skipped.store(0, Relaxed);
@@ -311,6 +326,15 @@ impl Stats {
         if l.hemi_leaf_rays > 0 {
             self.hemi_leaf_rays.fetch_add(l.hemi_leaf_rays, Relaxed);
         }
+        if l.hemi_share_groups > 0 {
+            self.hemi_share_groups.fetch_add(l.hemi_share_groups, Relaxed);
+        }
+        if l.hemi_share_points > 0 {
+            self.hemi_share_points.fetch_add(l.hemi_share_points, Relaxed);
+        }
+        if l.hemi_share_fallback > 0 {
+            self.hemi_share_fallback.fetch_add(l.hemi_share_fallback, Relaxed);
+        }
         if l.shaft_queries > 0 {
             self.shaft_queries.fetch_add(l.shaft_queries, Relaxed);
         }
@@ -390,6 +414,16 @@ impl Stats {
         } else {
             String::new()
         };
+        let shg = self.hemi_share_groups.load(Relaxed);
+        let share = if shg > 0 {
+            format!(
+                " | hemi-share: groups {shg} pts {} fallback {}",
+                self.hemi_share_points.load(Relaxed),
+                self.hemi_share_fallback.load(Relaxed),
+            )
+        } else {
+            String::new()
+        };
         let sq = self.shaft_queries.load(Relaxed);
         let shaft = if sq > 0 {
             format!(
@@ -442,7 +476,7 @@ impl Stats {
             String::new()
         };
         format!(
-            "tiles {tiles} | fr-queries {fq} (blocked {blocked}) | cut mean {cut_mean:.1} (ovf {ovf}) | nodes: frustum {fnodes} + ray {rnodes} = {} | rays: {prim} prim + {sec} sec | sky-px (0 rays) {sky} | coarse-px {coarse} (smp {csmp}) | temporal: seeds {tseeds} sky {tsky} cells {ttests} | mean t_start/t_hit {skip:.2}{adopt}{tring}{replay}{hemi}{shaft}{adapt}",
+            "tiles {tiles} | fr-queries {fq} (blocked {blocked}) | cut mean {cut_mean:.1} (ovf {ovf}) | nodes: frustum {fnodes} + ray {rnodes} = {} | rays: {prim} prim + {sec} sec | sky-px (0 rays) {sky} | coarse-px {coarse} (smp {csmp}) | temporal: seeds {tseeds} sky {tsky} cells {ttests} | mean t_start/t_hit {skip:.2}{adopt}{tring}{replay}{hemi}{share}{shaft}{adapt}",
             fnodes + rnodes
         )
     }

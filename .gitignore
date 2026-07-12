@@ -3,7 +3,17 @@ check.png
 screenshot_*.png
 dlss_gbuf_*.png
 oidn_*.png
+nppd_*.png
 xess_gbuf_*.png
+# ONNX Runtime session-profiling dumps (--check-nppd experiments)
+onnxruntime_profile*.json
+__pycache__/
+
+# NPPD export workspace: the pinned upstream clone export.py makes for
+# itself. The checkpoints and exported .onnx live in the already-ignored
+# SDKs/nppd/ (the pretrained weights carry no license grant — never commit
+# them or their derivatives; see tools/nppd-export/README.md).
+/tools/nppd-export/nppd-upstream/
 
 # Streamline SDK: only the MIT-licensed headers and markdown docs are
 # committed (what NVIDIA publishes in their public GitHub repo). The runtime

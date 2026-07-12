@@ -45,6 +45,16 @@ void cs_feed_xess(uint3 id : SV_DispatchThreadID) {
     feed_depth[id.xy] = view_z_to_clip_depth(g.alb_z.w, CAM_NEAR, CAM_FAR);
 }
 
+// NPPD pre-denoise frames (--gpu --nppd): the color plane comes from
+// cs_nppd_out (nppd.hlsl) instead — this writes only the guide planes.
+[numthreads(8, 8, 1)]
+void cs_feed_xess_dm(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= rw || id.y >= rh) return;
+    GBufPx g = gbuf[id.y * rw + id.x];
+    feed_mvec[id.xy] = g.mv.xy;
+    feed_depth[id.xy] = view_z_to_clip_depth(g.alb_z.w, CAM_NEAR, CAM_FAR);
+}
+
 [numthreads(8, 8, 1)]
 void cs_feed_rr(uint3 id : SV_DispatchThreadID) {
     if (id.x >= rw || id.y >= rh) return;

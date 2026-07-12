@@ -74,6 +74,14 @@ pub struct GpuContext {
     /// torn down by GpuContext::drop after a queue drain — xessDestroyContext
     /// requires completed command lists and a live device.
     xess: Option<XessState>,
+    /// GPU-resident NPPD (`--gpu --nppd`, XeSS sessions only): ONNX Runtime
+    /// executing on `d3d.queue` with the tracer's NppdRes buffers bound as
+    /// tensors. Dropped before `trace`'s resources it wraps is fine — the
+    /// wrap AddRefs, and onnxruntime.dll is never unloaded.
+    nppd_gpu: Option<crate::nppd::NppdGpu>,
+    /// Whether the recurrent state carries history (false forces the next
+    /// NPPD frame to zero the warped-state input — a reset).
+    nppd_state_valid: bool,
     /// Kept alive for the app lifetime: the hooked CreateCommandQueue /
     /// CreateSwapChain entry points live on these (Frame Gen will need them
     /// again), and dropping them to refcount 0 destroys the SL wrappers.
@@ -328,6 +336,8 @@ impl GpuContext {
             trace: None,
             rr: rr_res,
             xess: xess_state,
+            nppd_gpu: None,
+            nppd_state_valid: false,
             adapter_name: pick.name,
             adapter_is_nvidia: pick.is_nvidia,
         })
@@ -338,6 +348,10 @@ impl GpuContext {
     /// `(rw, rh)` is the session's fixed trace resolution (the locked render
     /// res in upscaler sessions, the window size otherwise); `gbuf` sizes the
     /// G-buffer pack (full-size iff an upscaler will consume it).
+    /// `nppd` (XeSS sessions only): `(dll_dir, model_path)` for the
+    /// GPU-resident NPPD pre-denoise stage — its init failure is a loud line
+    /// + plain GPU-XeSS, never a session failure.
+    #[allow(clippy::too_many_arguments)]
     pub fn init_trace(
         &mut self,
         dxc: &dxc::Dxc,
@@ -346,9 +360,20 @@ impl GpuContext {
         rw: u32,
         rh: u32,
         gbuf: bool,
+        nppd: Option<(&str, &str)>,
         debug: bool,
     ) -> Result<()> {
-        let mut tg = trace::TraceGpu::new(&self.d3d.device, dxc, scene, bvh, rw, rh, gbuf, debug)?;
+        let mut tg = trace::TraceGpu::new(
+            &self.d3d.device,
+            dxc,
+            scene,
+            bvh,
+            rw,
+            rh,
+            gbuf,
+            nppd.is_some(),
+            debug,
+        )?;
         // Upscaler sessions: wire the live upscaler's input planes as feed
         // targets — the feed kernel writes them directly, no CPU upload. The
         // trace res was quantize_res-clamped by the caller, but the range is
@@ -400,6 +425,41 @@ impl GpuContext {
         self.d3d.run_once(|l| rec = tg.scene.record_upload(l))?;
         rec?;
         tg.scene.free_staging();
+        // GPU-resident NPPD: ORT session on OUR device/queue, tensors bound
+        // over the NppdRes buffers. XeSS-only (RR is itself a denoiser — the
+        // same exclusion as the CPU paths); a failure keeps the session
+        // running plain and frees the ~340 MB staging.
+        if let Some((dir, model)) = nppd {
+            if self.xess.is_none() {
+                return Err("NPPD composition requires the XeSS session".into());
+            }
+            let built = tg.nppd.as_ref().ok_or("NPPD staging missing".to_string()).and_then(
+                |n| {
+                    crate::nppd::NppdGpu::new(
+                        dir,
+                        model,
+                        self.d3d.device.as_raw(),
+                        self.d3d.queue.as_raw(),
+                        rw as usize,
+                        rh as usize,
+                        n.frame.as_raw(),
+                        n.warped.as_raw(),
+                        n.out.as_raw(),
+                        n.state.as_raw(),
+                    )
+                },
+            );
+            match built {
+                Ok(g) => {
+                    self.nppd_gpu = Some(g);
+                    self.nppd_state_valid = false;
+                }
+                Err(e) => {
+                    eprintln!("nppd-gpu: unavailable ({e}); running plain GPU-XeSS");
+                    tg.nppd = None;
+                }
+            }
+        }
         self.passes.create_srv(
             &self.d3d.device,
             &tg.hdr,
@@ -412,6 +472,12 @@ impl GpuContext {
 
     pub fn trace_ready(&self) -> bool {
         self.trace.is_some()
+    }
+
+    /// Whether the GPU-resident NPPD stage came up (`--gpu --nppd`; the J
+    /// toggle is only honored when this is true — wiring is init-time).
+    pub fn nppd_gpu_ready(&self) -> bool {
+        self.nppd_gpu.is_some()
     }
 
     /// One fully GPU-resident frame: constants -> trace (wavefront quadtree,
@@ -444,23 +510,29 @@ impl GpuContext {
         self.d3d.end_frame(slot)
     }
 
-    /// XeSS-SR fed by the GPU-resident tracer (`--gpu --xess`): one command
-    /// list = trace (wavefront or reference) -> feed (pack -> input planes,
-    /// on-GPU — the CPU upload of the xr.rs path does not exist here) ->
-    /// XeSS upscale -> tonemap(SRV_SLOT_XESS) -> present. `jitter` is the
-    /// renderer's sample offset; xess::JITTER_SIGN settles the reported sign,
-    /// nowhere else.
+    /// XeSS-SR fed by the GPU-resident tracer (`--gpu --xess`): trace
+    /// (wavefront or reference) -> feed (pack -> input planes, on-GPU — the
+    /// CPU upload of the xr.rs path does not exist here) -> XeSS upscale ->
+    /// tonemap(SRV_SLOT_XESS) -> present. `jitter` is the renderer's sample
+    /// offset; xess::JITTER_SIGN settles the reported sign, nowhere else.
+    /// With `nppd` (and the stage built), the frame SPLITS around the
+    /// inference: list A = trace + NPPD staging (pack + warp), submitted
+    /// without a Present; ORT's DML work lands on the same queue behind it;
+    /// list B = feed(guides) + denoised-color crop + XeSS + tonemap +
+    /// the one Present. Queue order is the only synchronization.
     pub fn present_trace_xess(
         &mut self,
         p: &trace::FrameParams,
         hybrid: bool,
         jitter: (f32, f32),
         reset: bool,
+        nppd: bool,
     ) -> Result<()> {
         crate::zone!("present-trace-xess");
         if self.trace.is_none() || self.xess.is_none() {
             return Err("GPU tracer + XeSS not both initialized".into());
         }
+        let nppd_on = nppd && self.nppd_gpu.is_some();
         let slot = self.d3d.begin_frame()?;
         {
             // Field-split borrows: the recorder reads the tracer, abort needs
@@ -469,10 +541,30 @@ impl GpuContext {
             let tg = self.trace.as_ref().unwrap();
             tg.write_cb(slot, p);
             tg.record_frame(&d3d.list, slot, p, hybrid);
-            if let Err(e) = tg.record_feed(&d3d.list, slot) {
+            if nppd_on {
+                // A reset frame zeroes the warped-state input instead of
+                // warping (the graph rewrites the state buffer either way).
+                let state_valid = self.nppd_state_valid && !reset;
+                if let Err(e) = tg.record_nppd_pre(&d3d.list, slot, state_valid) {
+                    d3d.abort_frame();
+                    return Err(e);
+                }
+                d3d.split_frame(slot)?;
+                if let Err(e) = self.nppd_gpu.as_mut().unwrap().run() {
+                    d3d.abort_frame();
+                    return Err(e);
+                }
+                self.nppd_state_valid = true;
+            }
+            if let Err(e) = tg.record_feed(&d3d.list, slot, nppd_on) {
                 d3d.abort_frame();
                 return Err(e);
             }
+        }
+        if !nppd_on {
+            // J-off (or a run failure upstream): the next NPPD frame starts
+            // from a reset state.
+            self.nppd_state_valid = false;
         }
         {
             let d3d = &mut self.d3d;
@@ -906,7 +998,7 @@ impl GpuContext {
             }
             tg.write_cb(slot, p);
             tg.record_frame(&d3d.list, slot, p, hybrid);
-            if let Err(e) = tg.record_feed(&d3d.list, slot) {
+            if let Err(e) = tg.record_feed(&d3d.list, slot, false) {
                 d3d.abort_frame();
                 return Err(e);
             }

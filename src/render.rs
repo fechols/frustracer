@@ -66,6 +66,13 @@ pub struct FrameCtx<'a> {
     /// Visibility stays per-pixel regardless — tbuf/G-buffers are identical
     /// to a non-adaptive frame; only radiance sampling changes.
     pub adaptive: bool,
+    /// Hemi sharing (fb frames only; --no-hemi-share is the kill switch):
+    /// leaf tiles shade in 2×2 cells whose coherent pixels (same triangle,
+    /// bit-equal normal, measured apex-spread qualifiers) capture ONE padded
+    /// hemisphere tree at the representative (`hemi::share_capture`) and all
+    /// consume its record — folded analytic empties plus per-leaf (tc, cut)
+    /// seeds. Visibility stays per-pixel; every pixel shoots its own rays.
+    pub hemi_share: bool,
     /// Structure recorder for static-frame replay: Some only on full-depth
     /// uncapped hybrid frames (main.rs gates it). trace_tile records every
     /// terminal (leaf rect + inherited t_start + cut, sky rect) so a later
@@ -398,6 +405,9 @@ fn shade_tile(
     cut: &[u32],
 ) {
     let mut ls = LocalStats::default();
+    // adaptive (XeSS) and fb never co-occur (fb is pinned OFF on upscaler
+    // frames), so the two cell loops can share the branch without a tiebreak.
+    debug_assert!(!(ctx.adaptive && (ctx.q.fb.ao || ctx.q.fb.gi)));
     if ctx.adaptive {
         let mut cy = y0;
         while cy < y1 {
@@ -410,6 +420,21 @@ fn shade_tile(
             }
             cy = cy1;
         }
+    } else if ctx.hemi_share && (ctx.q.fb.ao || ctx.q.fb.gi) {
+        // One record buffer per tile, re-captured per group — a fresh ~10 KB
+        // HemiShare per 2×2 group would spend real frame time on zeroing.
+        let mut hrec = crate::hemi::HemiShare::new();
+        let mut cy = y0;
+        while cy < y1 {
+            let cy1 = (cy + ADAPT_CELL).min(y1);
+            let mut cx = x0;
+            while cx < x1 {
+                let cx1 = (cx + ADAPT_CELL).min(x1);
+                shade_hemi_cell(ctx, cx, cy, cx1, cy1, t_start, depth, kind, cut, &mut hrec, &mut ls);
+                cx = cx1;
+            }
+            cy = cy1;
+        }
     } else {
         for y in y0..y1 {
             for x in x0..x1 {
@@ -418,6 +443,122 @@ fn shade_tile(
         }
     }
     ctx.stats.add(&ls);
+}
+
+/// One hemi-share 2×2 cell (fb still frames): per-pixel visibility ALWAYS
+/// (four real primary rays with the tile's inherited cut/t_start — tbuf and
+/// meta identical to a non-shared frame), then ONE padded hemisphere tree
+/// captured at the representative when all four hits land on the same
+/// triangle with bit-equal shading normals (⇒ bit-identical hemisphere
+/// partitions) and the measured η/δ qualifiers pass. Every member — rep
+/// included — consumes the record with its own fresh rays; failures (and
+/// poisoned captures) shade per-pixel.
+#[allow(clippy::too_many_arguments)]
+fn shade_hemi_cell(
+    ctx: &FrameCtx,
+    cx: usize,
+    cy: usize,
+    cx1: usize,
+    cy1: usize,
+    t_start: f32,
+    depth: u32,
+    kind: u32,
+    cut: &[u32],
+    rec: &mut crate::hemi::HemiShare,
+    ls: &mut LocalStats,
+) {
+    if (cx1 - cx, cy1 - cy) != (ADAPT_CELL, ADAPT_CELL) {
+        // Odd-edge remainder: nothing to share within, plain per-pixel.
+        for y in cy..cy1 {
+            for x in cx..cx1 {
+                shade_pixel(ctx, x, y, t_start, depth, kind, Some(cut), ls);
+            }
+        }
+        return;
+    }
+    let coords = [(cx, cy), (cx + 1, cy), (cx, cy + 1), (cx + 1, cy + 1)];
+    // Visibility phase first: the group predicate reads real hits.
+    let mut tr: [Traced; 4] =
+        coords.map(|(x, y)| trace_primary(ctx, x, y, t_start, Some(cut), ls, 0));
+    let sp: [Option<(Vec3A, Vec3A)>; 4] = std::array::from_fn(|i| {
+        tr[i].hit.map(|h| shade::surface_point(ctx.scene, &tr[i].ray, &h))
+    });
+    // Rotate the representative per frame (the shade_cell precedent) so the
+    // shared-apex claim shrink averages out temporally.
+    let rep = (ctx.frame as usize + cx / ADAPT_CELL + cy / ADAPT_CELL) & 3;
+
+    // Group predicate: same triangle + bit-equal shading normal (the
+    // load-bearing half — it makes every member's onb(n) partition
+    // bit-identical to the rep's, so per-member PSA still accounts to π),
+    // then the measured spread qualifiers.
+    let mut shared = false;
+    if let (Some(rh), Some((rp, rn))) = (&tr[rep].hit, sp[rep]) {
+        let mut delta = 0.0f32;
+        let mut eta = 0.0f32;
+        let mut ok = true;
+        for i in 0..4 {
+            if i == rep {
+                continue;
+            }
+            match (&tr[i].hit, sp[i]) {
+                (Some(ih), Some((ip, inn))) if ih.tri == rh.tri && inn == rn => {
+                    let d = ip - rp;
+                    eta = eta.max(rn.dot(d).abs());
+                    delta = delta.max(d.length());
+                }
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok
+            && eta <= ctx.scene.eps * crate::hemi::SHARE_ETA_FRAC
+            && delta <= ctx.scene.ao_radius * crate::hemi::SHARE_DELTA_FRAC
+        {
+            let (t1, t2) = shade::onb(rn);
+            crate::hemi::share_capture(
+                ctx.scene,
+                ctx.bvh,
+                rp,
+                rn,
+                t1,
+                t2,
+                ctx.q.fb.depth,
+                if ctx.q.fb.gi { f32::INFINITY } else { ctx.scene.ao_radius },
+                delta,
+                eta,
+                ctx.q.fb.gi.then_some(ctx.sun),
+                rec,
+                ls,
+            );
+            shared = !rec.poisoned;
+            if shared {
+                ls.hemi_share_groups += 1;
+            }
+        }
+    }
+    for i in 0..4 {
+        let (x, y) = coords[i];
+        if !shared && tr[i].hit.is_some() {
+            ls.hemi_share_fallback += 1;
+        }
+        shade_traced(
+            ctx,
+            x,
+            y,
+            t_start,
+            depth,
+            kind,
+            &mut tr[i],
+            sp[i],
+            ls,
+            true,
+            true,
+            shade::VisCtl::Off,
+            if shared { Some(&*rec) } else { None },
+        );
+    }
 }
 
 /// Adaptive shading rate (XeSS mode): cell side length. 2×2 keeps the
@@ -495,6 +636,7 @@ fn shade_cell(
         true,
         false,
         shade::VisCtl::Capture(&mut vis),
+        None,
     )
     .c;
 
@@ -524,9 +666,10 @@ fn shade_cell(
             }
             shade::VisCtl::Off
         };
-        out[i] =
-            shade_traced(ctx, x, y, t_start, depth, kind, &mut tr[i], sp[i], ls, true, false, v)
-                .c;
+        out[i] = shade_traced(
+            ctx, x, y, t_start, depth, kind, &mut tr[i], sp[i], ls, true, false, v, None,
+        )
+        .c;
     }
 
     // HOT: in-cell luminance spread — shading noise or an in-cell edge;
@@ -555,6 +698,7 @@ fn shade_cell(
                 false,
                 false,
                 shade::VisCtl::Off,
+                None,
             );
             out[i] = (out[i] + s2.c) * 0.5;
             ls.adapt_topup += 1;
@@ -737,6 +881,7 @@ fn shade_traced(
     primary: bool,
     do_splat: bool,
     vis: shade::VisCtl,
+    hemi_share: Option<&crate::hemi::HemiShare>,
 ) -> Sample {
     match tr.hit {
         Some(hit) => {
@@ -761,6 +906,7 @@ fn shade_traced(
                 ls,
                 if primary && ctx.gbuf.is_some() { Some(&mut prim) } else { None },
                 vis,
+                hemi_share,
             );
             if do_splat {
                 ctx.splat(x, y, c);
@@ -797,7 +943,21 @@ fn shade_pixel(
     ls: &mut LocalStats,
 ) -> Sample {
     let mut tr = trace_primary(ctx, x, y, t_start, cut, ls, 0);
-    shade_traced(ctx, x, y, t_start, depth, kind, &mut tr, None, ls, true, true, shade::VisCtl::Off)
+    shade_traced(
+        ctx,
+        x,
+        y,
+        t_start,
+        depth,
+        kind,
+        &mut tr,
+        None,
+        ls,
+        true,
+        true,
+        shade::VisCtl::Off,
+        None,
+    )
 }
 
 /// The depth cap never flat-fills tiles shallower than this (a bad estimate
@@ -1104,6 +1264,7 @@ pub fn verify(
         prev_cam: None,
         frame_jitter: None,
         adaptive: false,
+        hemi_share: false,
         replay_rec: None,
         cut_cur: None,
         cut_prev: temporal_cuts,
