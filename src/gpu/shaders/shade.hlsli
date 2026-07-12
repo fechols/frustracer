@@ -169,7 +169,8 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
         }
 
         float3 f0 = lerp(float3(0.04, 0.04, 0.04), albedo, mat.metallic);
-        float3 kd = albedo * (1.0 - mat.metallic);
+        // 0.157 = Charlie peak directional albedo (shade.rs energy comp).
+        float3 kd = albedo * (1.0 - mat.metallic) * (1.0 - 0.157 * mat.sheen);
 
         // Tangent frame: anisotropic materials brush circumferentially
         // around world-up; onb covers poles and isotropic.
@@ -190,11 +191,14 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
         float3 v = -rd;
         float3 vl = float3(dot(v, t1), dot(v, t2), max(dot(v, n), 1e-4));
         float lambda_v = ggx_lambda(vl, ax, ay);
+        // Charlie-sheen inverse alpha, hoisted like the CPU.
+        float sheen_inv_a = 1.0 / clamp(mat.roughness, 0.07, 1.0);
 
         // Direct light: N area-light samples, Lambert (1/pi omitted by
         // convention) + Cook-Torrance GGX with the compensating pi.
         float3 direct_d = 0.0;
         float3 direct_s = 0.0;
+        float3 direct_t = 0.0; // thin-surface back transmission (foliage)
         for (uint si = 0u; si < n_shadow; ++si) {
             float su = rng_next(rng) * 2.0 - 1.0;
             float sv = rng_next(rng) * 2.0 - 1.0;
@@ -204,7 +208,18 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
             float dist = sqrt(dist2);
             float3 wi = lv / dist;
             float ndl = dot(n, wi);
-            if (ndl <= 0.0) continue;
+            if (ndl <= 0.0) {
+                // shade.rs translucency arm: a back-lit leaf receives the
+                // light through itself; the occlusion ray starts on the
+                // transmitted side (p - 2*eps*n = hit - n*eps). The rng
+                // draws above already happened — order matches the CPU.
+                if (mat.translucency > 0.0 && ndl < 0.0) {
+                    if (!occluded_q(p - n * (2.0 * SCENE_EPS), wi, 0.0, dist - SCENE_EPS)) {
+                        direct_t += light_color.xyz * ((-ndl) / dist2);
+                    }
+                }
+                continue;
+            }
             if (!occluded_q(p, wi, 0.0, dist - SCENE_EPS)) {
                 float3 li = light_color.xyz * (ndl / dist2);
                 direct_d += li;
@@ -216,19 +231,32 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                     float g2 = 1.0 / (1.0 + lambda_v + ggx_lambda(wil, ax, ay));
                     float3 f = schlick(f0, max(dot(wi, h), 0.0));
                     direct_s += li * f * (PI * dn * g2 / (4.0 * vl.z * ndl));
+                    if (mat.sheen > 0.0) {
+                        // Charlie NDF + Ashikhmin visibility (shade.rs).
+                        float sin2 = max(1.0 - hl.z * hl.z, 0.0);
+                        float d_c = (2.0 + sheen_inv_a) * pow(sin2, sheen_inv_a * 0.5) / TAU;
+                        float v_ash = 1.0 / max(4.0 * (ndl + vl.z - ndl * vl.z), 1e-4);
+                        direct_s += li * (PI * mat.sheen * d_c * v_ash);
+                    }
                 }
             }
         }
         if (n_shadow > 0u) {
             direct_d /= float(n_shadow);
             direct_s /= float(n_shadow);
+            direct_t /= float(n_shadow);
         }
+        // Diffuse budget split, front vs transmitted (ambient front-only —
+        // shade.rs composition). GPU transmission is NOT ported: glass keeps
+        // its full diffuse here (the SceneGpu init note flags it), so no
+        // (1 - transmission) factor.
+        float3 diffuse_d = direct_d * (1.0 - mat.translucency) + direct_t * mat.translucency;
 
         if (split_ambient && lap == 0u) {
             // Hemi mode: the primary ambient is integrated by the hemisphere
             // wavefront (compose applies amb_w * ambient later). No AO draws
             // here — the CPU's sampled loop is skipped the same way.
-            total += tput * (kd * direct_d + direct_s);
+            total += tput * (kd * diffuse_d + direct_s);
             amb_w = tput * kd;
             amb_o = p;
             amb_n = n;
@@ -246,7 +274,7 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                 }
                 ao = float(open) / float(n_ao);
             }
-            total += tput * (kd * (direct_d + AMBIENT * ao) + direct_s);
+            total += tput * (kd * (diffuse_d + AMBIENT * ao) + direct_s);
         }
 
         // One specular bounce (lap 0 only): GGX VNDF importance sample
