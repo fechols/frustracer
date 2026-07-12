@@ -18,6 +18,7 @@
 //! which needs no recommit.
 
 use crate::dlss::GBufs;
+use half::f16;
 use rayon::prelude::*;
 use std::ffi::{c_char, c_void, CStr};
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
@@ -38,7 +39,21 @@ const DEVICE_CPU: i32 = 1;
 const DEVICE_SYCL: i32 = 2;
 const DEVICE_CUDA: i32 = 3;
 const DEVICE_HIP: i32 = 4;
-const FORMAT_FLOAT3: i32 = 3;
+// All four filter images are half-precision (SDKs oidn.h: OIDN_FORMAT_HALF =
+// 257, HALF3 = 259): the color input is 1-spp noise or an EMA average, the
+// guides come from f16 G-buffer storage, and the network runs in reduced
+// precision internally anyway — halves the staging and device-transfer bytes.
+const FORMAT_HALF3: i32 = 259;
+
+/// Narrow HDR radiance to f16 for the color image. The clamp matters: a
+/// linear-RGB value above f16::MAX (65504) would narrow to +Inf, which can
+/// propagate through the filter to a non-finite output (the --check-oidn
+/// finite gate) and the tonemap. Guides ([0,1] albedo, unit normals) never
+/// need it.
+#[inline(always)]
+fn narrow_hdr(v: f32) -> f16 {
+    f16::from_f32(v.min(f16::MAX.to_f32_const()))
+}
 pub const QUALITY_FAST: i32 = 4;
 pub const QUALITY_BALANCED: i32 = 5;
 pub const QUALITY_HIGH: i32 = 6;
@@ -111,10 +126,13 @@ pub struct OidnContext {
     max_h: usize,
     w: usize,
     h: usize,
-    staging_color: Vec<f32>,
-    staging_albedo: Vec<f32>,
-    staging_normal: Vec<f32>,
-    staging_out: Vec<f32>,
+    staging_color: Vec<f16>,
+    staging_albedo: Vec<f16>,
+    staging_normal: Vec<f16>,
+    staging_out: Vec<f16>,
+    /// The denoised output widened back to f32 — the seam that keeps
+    /// `render::resolve_hdr` (shared with the f32 producers) unchanged.
+    out_f32: Vec<f32>,
     /// "cpu" / "cuda" / ... — the device OIDN actually picked.
     pub device_desc: &'static str,
     /// Wall time of the last `denoise` (staging + transfer + filter).
@@ -215,7 +233,7 @@ impl OidnContext {
             _ => "unknown",
         };
 
-        let bytes = w * h * 3 * size_of::<f32>();
+        let bytes = w * h * 3 * size_of::<f16>();
         let cleanup = |api: &Api, bufs: &[OIDNBuffer], filter: OIDNFilter| {
             for &b in bufs {
                 if !b.is_null() {
@@ -242,7 +260,7 @@ impl OidnContext {
                 return Err(e.err().unwrap_or_else(|| "oidn: buffer allocation failed".into()));
             }
             bufs[i] = b;
-            unsafe { (api.set_filter_image)(filter, name.as_ptr(), b, FORMAT_FLOAT3, w, h, 0, 0, 0) };
+            unsafe { (api.set_filter_image)(filter, name.as_ptr(), b, FORMAT_HALF3, w, h, 0, 0, 0) };
         }
         unsafe {
             (api.set_filter_bool)(filter, c"hdr".as_ptr(), true);
@@ -267,10 +285,11 @@ impl OidnContext {
             max_h: h,
             w,
             h,
-            staging_color: vec![0.0; w * h * 3],
-            staging_albedo: vec![0.0; w * h * 3],
-            staging_normal: vec![0.0; w * h * 3],
-            staging_out: vec![0.0; w * h * 3],
+            staging_color: vec![f16::ZERO; w * h * 3],
+            staging_albedo: vec![f16::ZERO; w * h * 3],
+            staging_normal: vec![f16::ZERO; w * h * 3],
+            staging_out: vec![f16::ZERO; w * h * 3],
+            out_f32: vec![0.0; w * h * 3],
             device_desc,
             last_ms: 0.0,
         })
@@ -302,7 +321,7 @@ impl OidnContext {
                     self.filter,
                     name.as_ptr(),
                     buf,
-                    FORMAT_FLOAT3,
+                    FORMAT_HALF3,
                     w,
                     h,
                     0,
@@ -344,7 +363,7 @@ impl OidnContext {
         let w = self.w;
         self.staging_color[..n].par_chunks_mut(w * 3).enumerate().for_each(|(y, row)| {
             for (k, v) in row.iter_mut().enumerate() {
-                *v = f32::from_bits(accum[y * w * 3 + k].load(Relaxed)) * inv;
+                *v = narrow_hdr(f32::from_bits(accum[y * w * 3 + k].load(Relaxed)) * inv);
             }
         });
         self.run_filter(None, g, t0)
@@ -360,48 +379,56 @@ impl OidnContext {
 
     /// Shared tail of the `denoise*` entry points: stage albedo/normal from
     /// `g`, write the three input buffers, execute the filter, read back.
-    /// `color` is the HDR input to upload directly; `None` uploads
-    /// `staging_color`, which the caller just filled (the accumulation-divide
-    /// path — already-final HDR skips the staging copy entirely).
+    /// `color` is an f32 HDR input to narrow into `staging_color`; `None`
+    /// means the caller just filled it (the accumulation-divide path).
     fn run_filter(&mut self, color: Option<&[f32]>, g: &GBufs, t0: Instant) -> Result<&[f32], String> {
         crate::zone!("oidn-filter");
         assert_eq!((g.rw, g.rh), (self.w, self.h), "gbuf/filter resolution mismatch");
         let w = self.w;
         let n = self.w * self.h * 3;
-        let load = crate::dlss::ld16; // the guide planes store f16 bits
+        if let Some(c) = color {
+            assert_eq!(c.len(), n);
+            self.staging_color[..n]
+                .par_iter_mut()
+                .zip(c.par_iter())
+                .for_each(|(d, &v)| *d = narrow_hdr(v));
+        }
         // First-hit albedo per the OIDN guidance: diffuse color plus the
         // (RGB F0) specular reflectivity, clamped to [0,1]. Sky pixels
-        // already carry diff_alb = 1.
+        // already carry diff_alb = 1. Recomputed in f32 (the add + clamp
+        // can't be a bit copy), then narrowed — values are in [0,1].
+        let load = crate::dlss::ld16; // the guide planes store f16 bits
         self.staging_albedo[..n].par_chunks_mut(w * 3).enumerate().for_each(|(y, row)| {
             for (x, px) in row.chunks_exact_mut(3).enumerate() {
                 let i = y * w + x;
                 for k in 0..3 {
-                    px[k] = (load(&g.diff_alb[i * 3 + k]) + load(&g.spec_alb[i * 3 + k]))
-                        .clamp(0.0, 1.0);
+                    px[k] = f16::from_f32(
+                        (load(&g.diff_alb[i * 3 + k]) + load(&g.spec_alb[i * 3 + k]))
+                            .clamp(0.0, 1.0),
+                    );
                 }
             }
         });
         // World-space normal (OIDN accepts any frame as long as it is
-        // consistent); repack float4 (xyz + roughness) → float3.
+        // consistent); repack float4 (xyz + roughness) → float3 — a raw
+        // bit copy now that the plane stores f16.
         self.staging_normal[..n].par_chunks_mut(w * 3).enumerate().for_each(|(y, row)| {
             for (x, px) in row.chunks_exact_mut(3).enumerate() {
                 let i = y * w + x;
                 for k in 0..3 {
-                    px[k] = load(&g.normal_rough[i * 4 + k]);
+                    px[k] = f16::from_bits(g.normal_rough[i * 4 + k].load(Relaxed));
                 }
             }
         });
 
-        let color_ptr = match color {
-            Some(c) => {
-                assert_eq!(c.len(), n);
-                c.as_ptr()
-            }
-            None => self.staging_color.as_ptr(),
-        };
-        let bytes = n * size_of::<f32>();
+        let bytes = n * size_of::<f16>();
         unsafe {
-            (self.api.write_buffer)(self.buf_color, 0, bytes, color_ptr.cast());
+            (self.api.write_buffer)(
+                self.buf_color,
+                0,
+                bytes,
+                self.staging_color.as_ptr().cast(),
+            );
             (self.api.write_buffer)(self.buf_albedo, 0, bytes, self.staging_albedo.as_ptr().cast());
             (self.api.write_buffer)(self.buf_normal, 0, bytes, self.staging_normal.as_ptr().cast());
             // Blocks until the filter (and the writes queued before it) finish.
@@ -412,15 +439,21 @@ impl OidnContext {
             (self.api.read_buffer)(self.buf_out, 0, bytes, self.staging_out.as_mut_ptr().cast());
         }
         device_error(&self.api, self.dev, "readback")?;
+        // Widen for the f32 consumers (resolve_hdr, the history-free XeSS
+        // post path) — the seam that keeps their signatures unchanged.
+        self.out_f32[..n]
+            .par_iter_mut()
+            .zip(self.staging_out[..n].par_iter())
+            .for_each(|(d, &v)| *d = v.to_f32());
         self.last_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        Ok(&self.staging_out[..n])
+        Ok(&self.out_f32[..n])
     }
 
     /// The most recent denoised output (valid after any successful
     /// `denoise` at the current resolution) — lets the caller re-composite
     /// the overlay without re-running the filter.
     pub fn last_output(&self) -> &[f32] {
-        &self.staging_out[..self.w * self.h * 3]
+        &self.out_f32[..self.w * self.h * 3]
     }
 }
 
