@@ -218,12 +218,19 @@ pub fn shade(
     ls: &mut LocalStats,
     mut prim: Option<&mut PrimarySurface>,
     mut vis: VisCtl,
+    hemi_share: Option<&crate::hemi::HemiShare>,
 ) -> Vec3A {
     // Capture/Apply only exist for the sampled shadow/AO paths; the
     // frustum-bounce tiers would silently bypass the record.
     debug_assert!(
         matches!(vis, VisCtl::Off) || (!q.fb.shadows && !q.fb.ao && !q.fb.gi),
         "VisCtl requires the sampled shadow/AO paths (fb OFF)"
+    );
+    // A shared hemisphere root only means something to the fb tiers (fb
+    // already implies VisCtl::Off above — the two records never mix).
+    debug_assert!(
+        hemi_share.is_none() || q.fb.ao || q.fb.gi,
+        "hemi_share requires a frustum-bounce tier (fb.ao or fb.gi)"
     );
     debug_assert!(q.shadow_samples as usize <= VIS_MAX);
     // `sp` is the caller's precomputed surface_point(scene, ray, hit) — the
@@ -395,7 +402,7 @@ pub fn shade(
     // - neither: the AMBIENT constant modulated by sampled AO.
     let ambient = if q.fb.gi {
         let (t1, t2) = onb(n);
-        crate::hemi::gi(scene, bvh, p, n, t1, t2, q.fb.depth, sun, depth, rng, None, ls)
+        crate::hemi::gi(scene, bvh, p, n, t1, t2, q.fb.depth, sun, depth, hemi_share, rng, None, ls)
     } else {
         let mut ao = 1.0;
         if q.fb.ao {
@@ -409,6 +416,7 @@ pub fn shade(
                 t2,
                 q.fb.depth,
                 scene.ao_radius,
+                hemi_share,
                 rng,
                 None,
                 ls,
@@ -501,7 +509,7 @@ pub fn shade(
                     // otherwise every glossy pixel would pay a second full
                     // hemisphere integration (and shaft build) at depth 1.
                     let rq = Quality { fb: FrustumBounce::OFF, ..*q };
-                    shade(scene, bvh, &rray, &rh, None, &rq, rng, sun, depth + 1, ls, None, VisCtl::Off)
+                    shade(scene, bvh, &rray, &rh, None, &rq, rng, sun, depth + 1, ls, None, VisCtl::Off, None)
                 }
                 None => {
                     if let Some(prim) = prim.as_deref_mut() {

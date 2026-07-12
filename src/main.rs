@@ -111,6 +111,10 @@ pub struct Opts {
     /// A/B lever (--no-adopt): keep temporal seeding but disable the
     /// query skip / cut adoption (and CutStore production). Default on.
     pub adopt: bool,
+    /// A/B lever (--no-hemi-share): disable the shared hemisphere capture
+    /// in fb (H) frames — every shading point runs its own bounce tree.
+    /// Default on.
+    pub hemi_share: bool,
     /// GPU-resident tracing (--gpu): the whole quadtree + shading runs in
     /// D3D12 compute with DXR RayQuery rays. Requires the DXC DLL drop and
     /// RT tier 1.1; falls back to the CPU path with a loud line otherwise.
@@ -184,6 +188,7 @@ fn main() {
         temporal: true,
         replay: true,
         adopt: true,
+        hemi_share: true,
         gpu: false,
         dxc_path: std::env::var("FRUSTRACER_DXC_PATH").unwrap_or_else(|_| {
             concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\dxc\bin\x64").to_string()
@@ -235,6 +240,7 @@ fn main() {
             "--no-temporal" => opts.temporal = false,
             "--no-replay" => opts.replay = false,
             "--no-adopt" => opts.adopt = false,
+            "--no-hemi-share" => opts.hemi_share = false,
             "--spin" => {
                 spin = Some(args.next().unwrap_or_else(|| {
                     eprintln!("--spin needs a workload: still | path");
@@ -364,6 +370,8 @@ fn main() {
                 eprintln!("  --xess-autoexposure  let XeSS compute exposure internally (A/B lever)");
                 eprintln!("  --no-adaptive disable the adaptive shading rate in XeSS mode (uniform per-pixel shading;");
                 eprintln!("                visibility is per-pixel either way)");
+                eprintln!("  --no-hemi-share  disable the shared hemisphere capture in fb (H) frames — every");
+                eprintln!("                shading point runs its own bounce tree (A/B lever)");
                 eprintln!("  --lock-res    DLSS/XeSS render res: quality|balanced|performance|ultra-performance|native,");
                 eprintln!("                a ratio in (0, 1], or dynamic (the step-wise DRS controller); default native (100%)");
                 eprintln!("  --xess-path   XeSS DLL directory (default: SDKs\\XeSS-SDK\\bin)");
@@ -593,6 +601,7 @@ fn run_check_gpu(
             prev_cam: None,
             frame_jitter: None,
             adaptive: false,
+            hemi_share: false,
             replay_rec: None,
             cut_cur: None,
             cut_prev: None,
@@ -1113,6 +1122,7 @@ fn run_check_gpu(
                             &mut vls,
                             None,
                             shade::VisCtl::Off,
+                            None,
                         ),
                     };
                 }
@@ -1763,6 +1773,7 @@ fn run_check_gpu(
                 prev_cam: None,
                 frame_jitter: None,
                 adaptive: false,
+                hemi_share: false,
                 replay_rec: None,
                 cut_cur: None,
                 cut_prev: None,
@@ -1877,6 +1888,7 @@ fn mv_check_at(
                 prev_cam: prev,
                 frame_jitter: Some((0.0, 0.0)),
                 adaptive: false,
+                hemi_share: false,
                 replay_rec: None,
                 cut_cur: None,
                 cut_prev: None,
@@ -2333,6 +2345,7 @@ fn run_check_xess(
                     prev_cam: None,
                     frame_jitter: Some(dlss::jitter_for(f)),
                     adaptive,
+                    hemi_share: false,
                     replay_rec: None,
                     cut_cur: None,
                     cut_prev: None,
@@ -2526,6 +2539,7 @@ fn run_check_oidn(
             prev_cam: None,
             frame_jitter: None,
             adaptive: false,
+            hemi_share: false,
             replay_rec: None,
             cut_cur: None,
             cut_prev: None,
@@ -2672,6 +2686,7 @@ fn run_check_oidn(
             prev_cam: None,
             frame_jitter: None,
             adaptive: false,
+            hemi_share: false,
             replay_rec: None,
             cut_cur: None,
             cut_prev: None,
@@ -2858,6 +2873,7 @@ fn run_check_oidn(
                 prev_cam: None,
                 frame_jitter: None,
                 adaptive: false,
+                hemi_share: false,
                 replay_rec: None,
                 cut_cur: None,
                 cut_prev: None,
@@ -3300,6 +3316,7 @@ fn run_spin(
             prev_cam: None,
             frame_jitter: Some(dlss::jitter_for(idx)),
             adaptive: false,
+            hemi_share: false,
             replay_rec: if record { Some(&replay_cache) } else { None },
             cut_cur,
             cut_prev,
@@ -3443,6 +3460,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                         t2,
                         q.fb.depth,
                         scene.ao_radius,
+                        None,
                         &mut rng,
                         if s == 0 { Some(&mut hv) } else { None },
                         &mut ls,
@@ -3528,6 +3546,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                         q.fb.depth,
                         sun,
                         0,
+                        None,
                         &mut rng,
                         if s == 0 { Some(&mut hv) } else { None },
                         &mut ls,
@@ -3559,6 +3578,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                             &mut lsr,
                             None,
                             shade::VisCtl::Off,
+                            None,
                         ),
                     };
                 }
@@ -3594,6 +3614,286 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         if structural && (ls.hemi_cells_empty == 0 || ls.hemi_leaf_rays == 0) {
             eprintln!("hemi GI: expected both empty cells and leaf rays > 0 — a path didn't fire");
             ok = false;
+        }
+        ok
+    };
+
+    // Hemi sharing: one padded tree capture per coherent 2×2 group, consumed
+    // by every member from its own apex (see hemi::share_capture). Gates: the
+    // transplanted exact-zero soundness counters run PER MEMBER — a member
+    // re-validates the rep's Open claim, every leaf-ray tmin, and every cut
+    // traversal at ITS OWN origin (false-empty / tmin-overshoot / cut-miss /
+    // PSA) — plus shared-vs-unshared A/Bs on independent seed sets: both arms
+    // estimate the same integral, so a nonzero mean difference is exactly the
+    // bias a sharing soundness hole would introduce.
+    let mut hemi_share_ok = {
+        const SEEDS: u64 = 8;
+        let sun = render::sun_dir(scene);
+        let lum = |c: Vec3A| 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;
+        // 2×2 groups anchored at each probe pixel, kept under the renderer's
+        // exact predicate: same triangle, bit-equal shading normal, measured
+        // η/δ qualifiers (hemi::SHARE_*). Center rays, like collect_probes.
+        struct GProbe {
+            x: usize,
+            y: usize,
+            pts: [(Vec3A, Vec3A); 4],
+            delta: f32,
+            eta: f32,
+        }
+        let mut groups: Vec<GProbe> = Vec::new();
+        // Probes that pass same-tri + bit-equal-normal but fail the η/δ
+        // qualifiers — must-fired below (default scene: 61, from grazing-angle
+        // ground-plane probes) so the qualifier branch can't rot into dead
+        // code; skipped under --stress like every topology-tuned assertion.
+        let mut qual_reject = 0u64;
+        {
+            let mut vis = 0u64;
+            for pr in &probes {
+                if pr.x + 1 >= rw || pr.y + 1 >= rh {
+                    continue;
+                }
+                let mut pts = [(Vec3A::ZERO, Vec3A::ZERO); 4];
+                let mut tri = [u32::MAX; 4];
+                let mut all_hit = true;
+                for (i, (dx, dy)) in [(0usize, 0usize), (1, 0), (0, 1), (1, 1)].into_iter().enumerate()
+                {
+                    let dir = cam.ray_dir((pr.x + dx) as f32 + 0.5, (pr.y + dy) as f32 + 0.5);
+                    let ray = bvh::Ray::new(cam.origin, dir);
+                    match bvh.intersect(scene, &ray, 0.0, f32::INFINITY, &mut vis) {
+                        Some(h) => {
+                            pts[i] = shade::surface_point(scene, &ray, &h);
+                            tri[i] = h.tri;
+                        }
+                        None => {
+                            all_hit = false;
+                            break;
+                        }
+                    }
+                }
+                if !all_hit
+                    || tri.iter().any(|&t| t != tri[0])
+                    || pts.iter().any(|&(_, n)| n != pts[0].1)
+                {
+                    continue;
+                }
+                let (rp, rn) = pts[0];
+                let (mut delta, mut eta) = (0.0f32, 0.0f32);
+                for &(p, _) in &pts[1..] {
+                    let d = p - rp;
+                    delta = delta.max(d.length());
+                    eta = eta.max(rn.dot(d).abs());
+                }
+                if eta > scene.eps * hemi::SHARE_ETA_FRAC
+                    || delta > scene.ao_radius * hemi::SHARE_DELTA_FRAC
+                {
+                    qual_reject += 1;
+                    continue;
+                }
+                groups.push(GProbe { x: pr.x, y: pr.y, pts, delta, eta });
+            }
+        }
+        let results: Vec<_> = groups
+            .par_iter()
+            .map(|g| {
+                let mut hv = hemi::VerifyCounters::default();
+                let mut ls = stats::LocalStats::default();
+                let (rp, rn) = g.pts[0];
+                let (t1r, t2r) = shade::onb(rn);
+                // record_empties: Apply's verify arm re-validates every
+                // folded empty claim from EACH member's apex.
+                let mut ao_share = hemi::HemiShare::new();
+                ao_share.record_empties = true;
+                hemi::share_capture(
+                    scene,
+                    bvh,
+                    rp,
+                    rn,
+                    t1r,
+                    t2r,
+                    q.fb.depth,
+                    scene.ao_radius,
+                    g.delta,
+                    g.eta,
+                    None,
+                    &mut ao_share,
+                    &mut ls,
+                );
+                let mut gi_share = hemi::HemiShare::new();
+                gi_share.record_empties = true;
+                hemi::share_capture(
+                    scene,
+                    bvh,
+                    rp,
+                    rn,
+                    t1r,
+                    t2r,
+                    q.fb.depth,
+                    f32::INFINITY,
+                    g.delta,
+                    g.eta,
+                    Some(sun),
+                    &mut gi_share,
+                    &mut ls,
+                );
+                // Poison at a preset depth is a record-capacity bug — report
+                // it through the gate (a poisoned record must never be
+                // consumed, so this group's A/B is skipped).
+                if ao_share.poisoned || gi_share.poisoned {
+                    return (0.0, 0.0, hv, ls, true);
+                }
+                let (mut d_ao, mut d_gi) = (0f64, 0f64);
+                for (i, &(p, n)) in g.pts.iter().enumerate() {
+                    let (t1, t2) = shade::onb(n);
+                    let (x, y) = (g.x + (i & 1), g.y + (i >> 1));
+                    // PAIRED same-seed arms: both draw the identical rng
+                    // stream, so every ray the two trees have in common
+                    // cancels exactly in the difference — GI's heavy-tailed
+                    // fireflies included (an unpaired construction was tried
+                    // and measured the baseline estimator's skew, not the
+                    // sharing: identical +2.4% with sharing disabled in both
+                    // arms). The residual is purely the sharing-induced
+                    // delta, and an unbiased sharing keeps its mean at 0.
+                    let (mut aos, mut aou) = (0.0f32, 0.0f32);
+                    let (mut gis, mut giu) = (Vec3A::ZERO, Vec3A::ZERO);
+                    for s in 0..SEEDS {
+                        let mut rng = fastrand::Rng::with_seed(px_seed(x, y, s));
+                        aos += hemi::ao(
+                            scene,
+                            bvh,
+                            p,
+                            n,
+                            t1,
+                            t2,
+                            q.fb.depth,
+                            scene.ao_radius,
+                            Some(&ao_share),
+                            &mut rng,
+                            if s == 0 { Some(&mut hv) } else { None },
+                            &mut ls,
+                        );
+                        let mut rng = fastrand::Rng::with_seed(px_seed(x, y, s));
+                        aou += hemi::ao(
+                            scene,
+                            bvh,
+                            p,
+                            n,
+                            t1,
+                            t2,
+                            q.fb.depth,
+                            scene.ao_radius,
+                            None,
+                            &mut rng,
+                            None,
+                            &mut ls,
+                        );
+                        let mut rng = fastrand::Rng::with_seed(px_seed(x, y, 0x80 + s));
+                        gis += hemi::gi(
+                            scene,
+                            bvh,
+                            p,
+                            n,
+                            t1,
+                            t2,
+                            q.fb.depth,
+                            sun,
+                            0,
+                            Some(&gi_share),
+                            &mut rng,
+                            if s == 0 { Some(&mut hv) } else { None },
+                            &mut ls,
+                        );
+                        let mut rng = fastrand::Rng::with_seed(px_seed(x, y, 0x80 + s));
+                        giu += hemi::gi(
+                            scene,
+                            bvh,
+                            p,
+                            n,
+                            t1,
+                            t2,
+                            q.fb.depth,
+                            sun,
+                            0,
+                            None,
+                            &mut rng,
+                            None,
+                            &mut ls,
+                        );
+                    }
+                    d_ao += ((aos - aou) / SEEDS as f32) as f64;
+                    let (l_s, l_u) = (lum(gis / SEEDS as f32), lum(giu / SEEDS as f32));
+                    d_gi += ((l_s - l_u) / l_u.max(0.05)) as f64;
+                }
+                (d_ao / 4.0, d_gi / 4.0, hv, ls, false)
+            })
+            .collect();
+        let mut hv = hemi::VerifyCounters::default();
+        let mut ls = stats::LocalStats::default();
+        let (mut sum_ao, mut sum_gi, mut worst) = (0f64, 0f64, 0f64);
+        let mut n_poisoned = 0u64;
+        for (da, dg, phv, pls, poisoned) in &results {
+            hv.merge(phv);
+            ls.merge(pls);
+            sum_ao += da;
+            sum_gi += dg;
+            worst = worst.max(da.abs()).max(dg.abs());
+            n_poisoned += *poisoned as u64;
+        }
+        let ng = results.len() as f64;
+        let (mean_ao, mean_gi) = (sum_ao / ng.max(1.0), sum_gi / ng.max(1.0));
+        eprintln!(
+            "hemi share ({} groups of 4, {} qual-rejected): psa-viol {} | false-empty {} | tmin-overshoot {} | cut-miss {} | max psa err {:.2e}",
+            results.len(), qual_reject, hv.psa_violations, hv.false_empty, hv.tmin_overshoot, hv.cut_miss, hv.max_psa_err
+        );
+        eprintln!(
+            "hemi share paired A/B vs unshared (same seeds, per member): AO Δ {mean_ao:+.4} (limit ±0.005) | GI rel Δ {mean_gi:+.4} (limit ±0.01) | worst {worst:.3} | shared pts {} | share q/pt {:.2}",
+            ls.hemi_share_points,
+            ls.hemi_queries as f64 / ls.hemi_points.max(1) as f64,
+        );
+        let mut ok = hv.ok() && mean_ao.abs() < 0.005 && mean_gi.abs() < 0.01;
+        if n_poisoned > 0 {
+            eprintln!("hemi share: {n_poisoned} captures poisoned at preset depth (record capacity bug)");
+            ok = false;
+        }
+        if structural && (results.is_empty() || ls.hemi_share_points == 0) {
+            eprintln!("hemi share: expected qualifying probe groups and shared points > 0 — the path didn't fire");
+            ok = false;
+        }
+        if structural && qual_reject == 0 {
+            eprintln!("hemi share: expected η/δ qualifier rejections > 0 — the qualifier branch didn't fire");
+            ok = false;
+        }
+        // Guard must-fire: a capture past FB_DEPTH_CAP must poison (and so
+        // fall back per-pixel). At any legal depth the capacity math makes
+        // record overflow unreachable (≤ 4^(FB_DEPTH_CAP−1) leaves, ≤ 21 cut
+        // slots), so the depth guard is the one live poison producer — this
+        // keeps it from rotting into dead code.
+        if let Some(g) = groups.first() {
+            let (rp, rn) = g.pts[0];
+            let (t1, t2) = shade::onb(rn);
+            let mut deep = hemi::HemiShare::new();
+            let mut dls = stats::LocalStats::default();
+            hemi::share_capture(
+                scene,
+                bvh,
+                rp,
+                rn,
+                t1,
+                t2,
+                hemi::FB_DEPTH_CAP + 1,
+                scene.ao_radius,
+                g.delta,
+                g.eta,
+                None,
+                &mut deep,
+                &mut dls,
+            );
+            if !deep.poisoned {
+                eprintln!(
+                    "hemi share: a depth-{} capture did not poison — the FB_DEPTH_CAP guard is dead",
+                    hemi::FB_DEPTH_CAP + 1
+                );
+                ok = false;
+            }
         }
         ok
     };
@@ -3725,12 +4025,17 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     let tbuf: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
 
     const BENCH_FRAMES: u32 = 8;
-    for (label, hybrid, hemi_ao, hemi_gi, shafts) in [
-        ("hybrid ", true, false, false, false),
-        ("hemi-ao", true, true, false, false),
-        ("hemi-gi", true, false, true, false),
-        ("shafts ", true, false, false, true),
-        ("plain  ", false, false, false, false),
+    // (hemi_queries, share groups, share fallback) per row, for the
+    // hemi-share must-fires below (share-on must run strictly fewer queries).
+    let mut share_rows: Vec<(&str, bool, u64, u64, u64)> = Vec::new();
+    for (label, hybrid, hemi_ao, hemi_gi, shafts, share) in [
+        ("hybrid ", true, false, false, false, false),
+        ("hemi-ao (share off)", true, true, false, false, false),
+        ("hemi-ao (share on) ", true, true, false, false, true),
+        ("hemi-gi (share off)", true, false, true, false, false),
+        ("hemi-gi (share on) ", true, false, true, false, true),
+        ("shafts ", true, false, false, true, false),
+        ("plain  ", false, false, false, false, false),
     ] {
         stats.clear();
         let mut bq = q;
@@ -3758,6 +4063,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             prev_cam: None,
             frame_jitter: None,
             adaptive: false,
+            hemi_share: share,
             replay_rec: None,
             cut_cur: None,
             cut_prev: None,
@@ -3768,19 +4074,129 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
         let ms = t.elapsed().as_secs_f64() * 1000.0 / BENCH_FRAMES as f64;
         eprintln!("{label}: {ms:6.1} ms/frame | per {BENCH_FRAMES} frames: {}", stats.summary_line());
+        if hemi_ao || hemi_gi {
+            share_rows.push((
+                label,
+                share,
+                stats.hemi_queries.load(Relaxed),
+                stats.hemi_share_groups.load(Relaxed),
+                stats.hemi_share_fallback.load(Relaxed),
+            ));
+        }
         // Save the plain-hybrid and hemi-GI images while their buffers are
         // fresh (frame stays 0, so accum holds exactly the last frame).
         if hybrid && !hemi_ao && !hemi_gi && !shafts {
             let mut present = vec![0u32; rw * rh];
             render::resolve(&accum, &info, 1, false, &mut present, rw, rh, rw, rh);
             save_png("check.png", &present, rw, rh);
-        } else if hemi_gi {
+        } else if hemi_gi && !share {
             let mut present = vec![0u32; rw * rh];
             render::resolve(&accum, &info, 1, false, &mut present, rw, rh, rw, rh);
             save_png("check_gi.png", &present, rw, rh);
         }
     }
     eprintln!("wrote check.png + check_gi.png");
+    // Hemi-share frame must-fires (KILL CRITERION rides the printed ms above,
+    // the shafts/adopt precedent: if share-on is not measurably faster on
+    // both the default scene and --stress 5000, the feature does not merge):
+    // share-on frames must form groups, must still fall back somewhere
+    // (curved geometry — proof the predicate rejects), and must run strictly
+    // fewer hemi queries than their share-off twin.
+    for pair in share_rows.chunks(2) {
+        let [(l0, s0, q0, _, _), (l1, s1, q1, g1, f1)] = pair else { continue };
+        debug_assert!(!s0 && *s1, "share rows must alternate off/on");
+        if structural {
+            if *g1 == 0 || *f1 == 0 {
+                eprintln!("hemi share bench {l1}: expected groups and fallbacks > 0 (groups {g1}, fallback {f1})");
+                hemi_share_ok = false;
+            }
+            if q1 >= q0 {
+                eprintln!("hemi share bench: {l1} ran {q1} hemi queries, not fewer than {l0}'s {q0}");
+                hemi_share_ok = false;
+            }
+        }
+    }
+    // Hemi-share frame gates: (a) determinism — two same-seed share-on fb
+    // frames must be bit-identical (group formation and capture are pure
+    // functions of the frame inputs); (b) structure-replay coverage — the
+    // existing replay bit-identity gates run fb-OFF and prove nothing about
+    // the share cell loop, so one fb-ao trace/replay pair is gated here, with
+    // groups > 0 on both arms as the anti-vacuity check.
+    {
+        let snap = || -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+            (
+                accum.iter().map(|a| a.load(Relaxed)).collect(),
+                info.iter().map(|a| a.load(Relaxed)).collect(),
+                tbuf.iter().map(|a| a.load(Relaxed)).collect(),
+            )
+        };
+        let mut bq = q;
+        bq.fb.ao = true;
+        let rcache = replay::ReplayCache::new(rw, rh);
+        rcache.begin(rw, rh);
+        let ctx_rec = FrameCtx {
+            scene,
+            bvh,
+            cam,
+            q: bq,
+            frame: 0,
+            jitter: false,
+            rw,
+            rh,
+            accum: &accum,
+            info: &info,
+            tbuf: &tbuf,
+            stats: &stats,
+            sun: render::sun_dir(scene),
+            tcache_cur: None,
+            tcache_prev: &[],
+            accumulate: true,
+            gbuf: None,
+            prev_cam: None,
+            frame_jitter: None,
+            adaptive: false,
+            hemi_share: true,
+            replay_rec: Some(&rcache),
+            cut_cur: None,
+            cut_prev: None,
+        };
+        stats.clear();
+        render::render_frame(&ctx_rec, true);
+        let groups_a = stats.hemi_share_groups.load(Relaxed);
+        let a = snap();
+        let ctx = FrameCtx { replay_rec: None, ..ctx_rec };
+        stats.clear();
+        render::render_frame(&ctx, true);
+        let b = snap();
+        let mut ok = true;
+        if a != b {
+            eprintln!("hemi share: two same-seed share-on frames differ — nondeterministic grouping");
+            ok = false;
+        }
+        if !rcache.valid() {
+            eprintln!("hemi share: fb-ao recording frame poisoned — replay coverage not provable");
+            ok = false;
+        } else {
+            stats.clear();
+            render::render_frame_replay(&ctx, &rcache);
+            let groups_c = stats.hemi_share_groups.load(Relaxed);
+            let c = snap();
+            if a != c {
+                eprintln!("hemi share: fb-ao replay is not bit-identical to its trace");
+                ok = false;
+            }
+            if structural && (groups_a == 0 || groups_c == 0) {
+                eprintln!("hemi share: replay gate vacuous (trace groups {groups_a}, replay groups {groups_c})");
+                ok = false;
+            }
+        }
+        eprintln!(
+            "hemi share frame gates: determinism {} | fb-ao replay bit-identity {} (groups {groups_a})",
+            if a == b { "OK" } else { "FAIL" },
+            if ok { "OK" } else { "FAIL" },
+        );
+        hemi_share_ok &= ok;
+    }
 
     // Smoke-test dynamic resolution: one depth-capped frame per plausible cap
     // must complete; coarse coverage shrinks monotonically-ish as the cap
@@ -3808,6 +4224,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             prev_cam: None,
             frame_jitter: None,
             adaptive: false,
+            hemi_share: false,
             replay_rec: None,
             cut_cur: None,
             cut_prev: None,
@@ -3853,6 +4270,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             prev_cam: None,
             frame_jitter: None,
             adaptive: false,
+            hemi_share: false,
             replay_rec: None,
             cut_cur: Some(&cuts_a),
             cut_prev: None,
@@ -3955,6 +4373,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             prev_cam: None,
             frame_jitter: None,
             adaptive: false,
+            hemi_share: false,
             replay_rec: None,
             cut_cur: None,
             cut_prev: None,
@@ -4015,6 +4434,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 prev_cam: None,
                 frame_jitter: None,
                 adaptive: false,
+                hemi_share: false,
                 replay_rec: Some(&rcache),
                 cut_cur: None,
                 cut_prev: None,
@@ -4061,6 +4481,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 prev_cam: None,
                 frame_jitter: None,
                 adaptive: false,
+                hemi_share: false,
                 replay_rec: None,
                 cut_cur: None,
                 cut_prev: None,
@@ -4103,6 +4524,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 prev_cam: None,
                 frame_jitter: None,
                 adaptive: false,
+                hemi_share: false,
                 replay_rec: None,
                 cut_cur: None,
                 cut_prev: None,
@@ -4166,6 +4588,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 prev_cam: None,
                 frame_jitter: None,
                 adaptive: false,
+                hemi_share: false,
                 replay_rec: if do_record { Some(&rcache) } else { None },
                 cut_cur: None,
                 cut_prev: None,
@@ -4228,6 +4651,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 prev_cam: None,
                 frame_jitter: None,
                 adaptive: false,
+                hemi_share: false,
                 replay_rec: None,
                 cut_cur: None,
                 cut_prev: None,
@@ -4306,6 +4730,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 prev_cam: None,
                 frame_jitter: None,
                 adaptive: false,
+                hemi_share: false,
                 replay_rec: None,
                 cut_cur: Some(&chain_cs[0]),
                 cut_prev: None,
@@ -4343,6 +4768,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                     prev_cam: None,
                     frame_jitter: None,
                     adaptive: false,
+                    hemi_share: false,
                     replay_rec: None,
                     cut_cur: Some(&chain_cs[ci]),
                     cut_prev: Some(&chain_cs[pi]),
@@ -4411,6 +4837,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 prev_cam: None,
                 frame_jitter: None,
                 adaptive: false,
+                hemi_share: false,
                 replay_rec: None,
                 cut_cur: None,
                 cut_prev: cuts_opt,
@@ -4440,6 +4867,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         && reproj_ok
         && hemi_ok
         && gi_ok
+        && hemi_share_ok
         && shaft_ok
         && rep.ok()
         && capped_ok
@@ -5681,6 +6109,10 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 // uniform per-pixel shading (visibility is per-pixel
                 // either way).
                 adaptive: mode == RenderMode::Xess && opts.adaptive,
+                // Hemi sharing only ever fires on fb frames (still,
+                // non-upscaled — the shade_tile branch checks q.fb);
+                // --no-hemi-share is the per-session kill switch.
+                hemi_share: opts.hemi_share,
                 replay_rec: if record { Some(&replay_cache) } else { None },
                 cut_cur,
                 cut_prev,
