@@ -34,7 +34,7 @@ use rayon::prelude::*;
 use render::FrameCtx;
 use shade::Quality;
 use stats::Stats;
-use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU16, AtomicU32, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 const W: usize = 1920;
@@ -1480,8 +1480,10 @@ fn run_check_gpu(
                 for ch in 0..2usize {
                     let got16 =
                         u16::from_le_bytes(mvec_bytes[i * 4 + ch * 2..][..2].try_into().unwrap());
-                    let expect16 =
-                        half::f16::from_f32(loadf(&gb2.mvec, i * 2 + ch)).to_bits();
+                    // MV storage is f16 bits — the expected texture value IS
+                    // the stored word (both sides rounded the same pack f32
+                    // once); 1 ulp of typed-store latitude stays.
+                    let expect16 = gb2.mvec[i * 2 + ch].load(Relaxed);
                     if (mono16(got16) - mono16(expect16)).unsigned_abs() > 1 {
                         mv_ulp_bad += 1;
                     }
@@ -1603,8 +1605,8 @@ fn run_check_gpu(
                 for ch in 0..2usize {
                     let got16 =
                         u16::from_le_bytes(rr_mvec[i * 4 + ch * 2..][..2].try_into().unwrap());
-                    let expect16 =
-                        half::f16::from_f32(loadf(&gb2.mvec, i * 2 + ch)).to_bits();
+                    // f16 storage: the expected bits ARE the stored word.
+                    let expect16 = gb2.mvec[i * 2 + ch].load(Relaxed);
                     if (mono16(got16) - mono16(expect16)).unsigned_abs() > 1 {
                         rmv_bad += 1;
                     }
@@ -1617,32 +1619,36 @@ fn run_check_gpu(
                     if (mono16(got16) - mono16(expect16)).unsigned_abs() > 1 {
                         rc_bad += 1;
                     }
-                    // RGBA8 albedo/spec-albedo vs the CPU encode, <= 1 LSB.
+                    // RGBA8 albedo/spec-albedo vs the CPU encode. <= 2 LSB:
+                    // the CPU reference is now double-rounded (pack f32 ->
+                    // f16 storage -> unorm8) while the GPU feed converts the
+                    // pack f32 to unorm8 directly — the f16 hop can move a
+                    // value across a *.5 rounding boundary (1 LSB), on top
+                    // of the typed store's own 0.6-ULP latitude (1 LSB).
                     let a = rr_alb[i * 4 + ch];
-                    let ea = to_unorm8(loadf(&gb2.diff_alb, i * 3 + ch));
+                    let ea = to_unorm8(dlss::ld16(&gb2.diff_alb[i * 3 + ch]));
                     let s = rr_spec[i * 4 + ch];
-                    let es = to_unorm8(loadf(&gb2.spec_alb, i * 3 + ch));
-                    if a.abs_diff(ea) > 1 || s.abs_diff(es) > 1 {
+                    let es = to_unorm8(dlss::ld16(&gb2.spec_alb[i * 3 + ch]));
+                    if a.abs_diff(ea) > 2 || s.abs_diff(es) > 2 {
                         ralb_bad += 1;
                     }
                 }
                 for ch in 0..4usize {
                     let got16 =
                         u16::from_le_bytes(rr_nr[i * 8 + ch * 2..][..2].try_into().unwrap());
-                    let expect16 =
-                        half::f16::from_f32(loadf(&gb2.normal_rough, i * 4 + ch)).to_bits();
+                    let expect16 = gb2.normal_rough[i * 4 + ch].load(Relaxed);
                     if (mono16(got16) - mono16(expect16)).unsigned_abs() > 1 {
                         rnr_bad += 1;
                     }
                 }
                 let got16 = u16::from_le_bytes(rr_spechit[i * 2..][..2].try_into().unwrap());
-                let expect16 = half::f16::from_f32(loadf(&gb2.spec_hit_t, i)).to_bits();
+                let expect16 = gb2.spec_hit_t[i].load(Relaxed);
                 if (mono16(got16) - mono16(expect16)).unsigned_abs() > 1 {
                     rsh_bad += 1;
                 }
             }
             eprintln!(
-                "check-gpu: rr feed ({pw}x{ph}): depth-not-bit-equal {rd_bad} | mvec-ulp>1 {rmv_bad} | color-ulp>1 {rc_bad} | nr-ulp>1 {rnr_bad} | alb-lsb>1 {ralb_bad} | spechit-ulp>1 {rsh_bad}"
+                "check-gpu: rr feed ({pw}x{ph}): depth-not-bit-equal {rd_bad} | mvec-ulp>1 {rmv_bad} | color-ulp>1 {rc_bad} | nr-ulp>1 {rnr_bad} | alb-lsb>2 {ralb_bad} | spechit-ulp>1 {rsh_bad}"
             );
             if rd_bad != 0 || rmv_bad != 0 || rc_bad != 0 || rnr_bad != 0 || ralb_bad != 0 || rsh_bad != 0
             {
@@ -2225,15 +2231,18 @@ fn run_check_xess(
         let mut pass = true;
         let (sw, sh) = (64usize, 36usize);
         let src = dlss::GBufs::new(sw, sh);
+        // Distinct u16 bit patterns per plane (the guides store f16 words);
+        // max index is 9215, so the 0x5000/0x6000 plane tags keep every
+        // element unique across planes without overflow.
         for i in 0..sw * sh {
             for k in 0..3 {
-                src.diff_alb[i * 3 + k].store((i * 3 + k) as u32, Relaxed);
+                src.diff_alb[i * 3 + k].store((i * 3 + k) as u16, Relaxed);
             }
             for k in 0..3 {
-                src.spec_alb[i * 3 + k].store(0x5000_0000 + (i * 3 + k) as u32, Relaxed);
+                src.spec_alb[i * 3 + k].store(0x5000 + (i * 3 + k) as u16, Relaxed);
             }
             for k in 0..4 {
-                src.normal_rough[i * 4 + k].store(0x6000_0000 + (i * 4 + k) as u32, Relaxed);
+                src.normal_rough[i * 4 + k].store(0x6000 + (i * 4 + k) as u16, Relaxed);
             }
         }
         let check = |dst: &dlss::GBufs| -> bool {
@@ -2364,15 +2373,17 @@ fn run_check_xess(
         // spec_hit_t, the only rng-dependent plane (Apply burns the draws it
         // skips precisely so the GGX reflection sample stays aligned). This
         // holds per frame; the last frame's buffers are what's compared.
-        let planes: [(&str, &[AtomicU32], &[AtomicU32]); 6] = [
+        // (Identical f32 inputs narrow to identical f16 bits, so the gate's
+        // meaning is unchanged by the f16 storage; depth is the one f32
+        // plane and gets the same compare on u32 words.)
+        let planes16: [(&str, &[AtomicU16], &[AtomicU16]); 5] = [
             ("normal_rough", &g_a.normal_rough, &g_b.normal_rough),
             ("diff_alb", &g_a.diff_alb, &g_b.diff_alb),
             ("spec_alb", &g_a.spec_alb, &g_b.spec_alb),
-            ("depth", &g_a.depth, &g_b.depth),
             ("mvec", &g_a.mvec, &g_b.mvec),
             ("spec_hit_t", &g_a.spec_hit_t, &g_b.spec_hit_t),
         ];
-        for (name, pa, pb) in planes {
+        for (name, pa, pb) in planes16 {
             let gm = pa
                 .iter()
                 .zip(pb)
@@ -2380,6 +2391,18 @@ fn run_check_xess(
                 .count();
             if gm != 0 {
                 eprintln!("adaptive G-buffer bit-identity: {name}: {gm} texels differ -> FAIL");
+                all_ok = false;
+            }
+        }
+        {
+            let gm = g_a
+                .depth
+                .iter()
+                .zip(&g_b.depth)
+                .filter(|(a, b)| a.load(Relaxed) != b.load(Relaxed))
+                .count();
+            if gm != 0 {
+                eprintln!("adaptive G-buffer bit-identity: depth: {gm} texels differ -> FAIL");
                 all_ok = false;
             }
         }
@@ -2763,7 +2786,8 @@ fn run_check_oidn(
     // floods the history with flat quads wherever it was disoccluded.
     let hist_dolly: Vec<f32> = if dump { hist.color().to_vec() } else { Vec::new() };
     let depth_b: Vec<f32> = g.depth.iter().map(load).collect();
-    let rough_b: Vec<f32> = (0..rw * rh).map(|i| load(&g.normal_rough[i * 4 + 3])).collect();
+    let rough_b: Vec<f32> =
+        (0..rw * rh).map(|i| dlss::ld16(&g.normal_rough[i * 4 + 3])).collect();
     let rej_frac = st_b.rejected as f64 / (rw * rh) as f64;
     eprintln!(
         "reproject dolly: accepted {} ({} sky) rejected {} ({:.2}%) | L {:.0}..{:.0} | update {upd_ms:.2} ms",

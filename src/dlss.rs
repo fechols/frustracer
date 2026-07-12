@@ -6,8 +6,24 @@
 
 use crate::camera::{CamBasis, Camera};
 use glam::{Mat4, Vec3, Vec3A, Vec4};
+use half::f16;
 use rayon::prelude::*;
-use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU16, AtomicU32, Ordering::Relaxed};
+
+/// Load an f16-bit-pattern atomic as f32. The G-buffer planes (except depth)
+/// store f16 — every consumer widens through here so the conversion has one
+/// home; never hand-roll `f16::from_bits` at a call site.
+#[inline(always)]
+pub fn ld16(a: &AtomicU16) -> f32 {
+    f16::from_bits(a.load(Relaxed)).to_f32()
+}
+
+/// Store an f32 into an f16-bit-pattern atomic (round-to-nearest-even). The
+/// single narrowing point for CPU-rendered G-buffer writes.
+#[inline(always)]
+pub fn st16(a: &AtomicU16, v: f32) {
+    a.store(f16::from_f32(v).to_bits(), Relaxed)
+}
 
 /// One pixel's worth of G-buffer data, computed once and stored via
 /// `GBufs::write`.
@@ -30,37 +46,43 @@ pub struct GPixel {
     pub spec_hit_t: f32,
 }
 
-/// Per-pixel G-buffers in the same `Vec<AtomicU32>` f32-bit-pattern layout as
-/// the accumulation buffer — writes are tile-disjoint, so relaxed stores are
-/// race-free for exactly the same reason (render.rs:30).
+/// Per-pixel G-buffers as atomic bit patterns — writes are tile-disjoint, so
+/// relaxed stores are race-free for exactly the same reason as the
+/// accumulation buffer (render.rs:30). Every plane except `depth` stores f16
+/// bits (`ld16`/`st16`): the GPU wire is already f16/unorm8 for those planes
+/// (rr.rs/xr.rs formats) and the check gates compare at ≤ 1 f16 ulp, so the
+/// narrowing just moves from upload time into storage. `depth` stays f32 —
+/// its wire format is R32_FLOAT on both upscalers, reprojection and the XeSS
+/// sky-encodes-exactly-0.0 contract read it, and the RR feed gate is
+/// bit-equal f32.
 pub struct GBufs {
     pub rw: usize,
     pub rh: usize,
     /// 4/px: world normal xyz + roughness w (packed to match the
     /// kBufferTypeNormalRoughness texture layout).
-    pub normal_rough: Vec<AtomicU32>,
+    pub normal_rough: Vec<AtomicU16>,
     /// 3/px linear diffuse albedo.
-    pub diff_alb: Vec<AtomicU32>,
+    pub diff_alb: Vec<AtomicU16>,
     /// 3/px RGB specular albedo (F0).
-    pub spec_alb: Vec<AtomicU32>,
-    /// 1/px linear view-space Z.
+    pub spec_alb: Vec<AtomicU16>,
+    /// 1/px linear view-space Z (f32 bits — see the struct doc).
     pub depth: Vec<AtomicU32>,
     /// 2/px motion vector (pixels, y-down, current -> previous).
-    pub mvec: Vec<AtomicU32>,
+    pub mvec: Vec<AtomicU16>,
     /// 1/px specular hit distance.
-    pub spec_hit_t: Vec<AtomicU32>,
+    pub spec_hit_t: Vec<AtomicU16>,
 }
 
 impl GBufs {
     pub fn new(rw: usize, rh: usize) -> Self {
-        let alloc = |n: usize| (0..n).map(|_| AtomicU32::new(0)).collect();
+        let alloc = |n: usize| (0..n).map(|_| AtomicU16::new(0)).collect();
         Self {
             rw,
             rh,
             normal_rough: alloc(rw * rh * 4),
             diff_alb: alloc(rw * rh * 3),
             spec_alb: alloc(rw * rh * 3),
-            depth: alloc(rw * rh),
+            depth: (0..rw * rh).map(|_| AtomicU32::new(0)).collect(),
             mvec: alloc(rw * rh * 2),
             spec_hit_t: alloc(rw * rh),
         }
@@ -111,21 +133,20 @@ impl GBufs {
     #[inline(always)]
     pub fn write(&self, x: usize, y: usize, p: &GPixel) {
         let i = y * self.rw + x;
-        let s = |a: &AtomicU32, v: f32| a.store(v.to_bits(), Relaxed);
-        s(&self.normal_rough[i * 4], p.normal.x);
-        s(&self.normal_rough[i * 4 + 1], p.normal.y);
-        s(&self.normal_rough[i * 4 + 2], p.normal.z);
-        s(&self.normal_rough[i * 4 + 3], p.rough);
-        s(&self.diff_alb[i * 3], p.diff_alb.x);
-        s(&self.diff_alb[i * 3 + 1], p.diff_alb.y);
-        s(&self.diff_alb[i * 3 + 2], p.diff_alb.z);
-        s(&self.spec_alb[i * 3], p.spec_alb.x);
-        s(&self.spec_alb[i * 3 + 1], p.spec_alb.y);
-        s(&self.spec_alb[i * 3 + 2], p.spec_alb.z);
-        s(&self.depth[i], p.view_z);
-        s(&self.mvec[i * 2], p.mv.0);
-        s(&self.mvec[i * 2 + 1], p.mv.1);
-        s(&self.spec_hit_t[i], p.spec_hit_t);
+        st16(&self.normal_rough[i * 4], p.normal.x);
+        st16(&self.normal_rough[i * 4 + 1], p.normal.y);
+        st16(&self.normal_rough[i * 4 + 2], p.normal.z);
+        st16(&self.normal_rough[i * 4 + 3], p.rough);
+        st16(&self.diff_alb[i * 3], p.diff_alb.x);
+        st16(&self.diff_alb[i * 3 + 1], p.diff_alb.y);
+        st16(&self.diff_alb[i * 3 + 2], p.diff_alb.z);
+        st16(&self.spec_alb[i * 3], p.spec_alb.x);
+        st16(&self.spec_alb[i * 3 + 1], p.spec_alb.y);
+        st16(&self.spec_alb[i * 3 + 2], p.spec_alb.z);
+        self.depth[i].store(p.view_z.to_bits(), Relaxed);
+        st16(&self.mvec[i * 2], p.mv.0);
+        st16(&self.mvec[i * 2 + 1], p.mv.1);
+        st16(&self.spec_hit_t[i], p.spec_hit_t);
     }
 }
 
@@ -296,7 +317,7 @@ pub fn frame_constants(
 /// even runs.
 pub fn dump_gbufs(g: &GBufs, prefix: &str, far: f32) {
     let (rw, rh) = (g.rw, g.rh);
-    let load = |a: &AtomicU32| f32::from_bits(a.load(Relaxed));
+    let load = ld16;
     let to8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
 
     let mut alb = Vec::with_capacity(rw * rh * 3);
@@ -312,7 +333,7 @@ pub fn dump_gbufs(g: &GBufs, prefix: &str, far: f32) {
             nrm.push(to8(load(&g.normal_rough[i * 4 + k]) * 0.5 + 0.5));
         }
         misc.push(to8(load(&g.normal_rough[i * 4 + 3])));
-        misc.push(to8(load(&g.depth[i]) / far));
+        misc.push(to8(f32::from_bits(g.depth[i].load(Relaxed)) / far));
         misc.push(to8(load(&g.spec_hit_t[i]) / far));
         mv.push(to8(load(&g.mvec[i * 2]) / 32.0 + 0.5));
         mv.push(to8(load(&g.mvec[i * 2 + 1]) / 32.0 + 0.5));
@@ -351,6 +372,8 @@ pub fn mv_selftest(
     far: f32,
 ) -> bool {
     let (rw, rh) = (gb.rw, gb.rh);
+    // Depth is f32 bits; the MV plane is f16 (its quantization error is
+    // ≤ ~0.001 px for typical few-pixel MVs — far inside the geometric gates).
     let load = |buf: &[AtomicU32], i: usize| f32::from_bits(buf[i].load(Relaxed));
     // Reconstruct the world point of a pixel from its stored view-Z: the ray
     // through the (center) sample position scaled so its view-Z matches.
@@ -370,7 +393,7 @@ pub fn mv_selftest(
             }
             let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
             let pb = reconstruct(basis_b, fx, fy, zb);
-            let (mx, my) = (load(&gb.mvec, i * 2), load(&gb.mvec, i * 2 + 1));
+            let (mx, my) = (ld16(&gb.mvec[i * 2]), ld16(&gb.mvec[i * 2 + 1]));
             let (px, py) = (fx + mx, fy + my);
             let (ax, ay) = (px as usize, py as usize);
             if px < 0.5 || py < 0.5 || ax + 1 >= rw || ay + 1 >= rh {

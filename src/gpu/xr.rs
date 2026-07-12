@@ -243,7 +243,7 @@ impl XessResources {
                 }
             });
 
-        // Motion vectors: 2 × f32 (input-res pixels) -> RG16F.
+        // Motion vectors (input-res pixels): f16 storage -> RG16F, bit copy.
         plane_mem(&self.planes[P_MVEC])
             .par_chunks_mut(aligned_pitch(w * 4))
             .take(rh)
@@ -253,8 +253,8 @@ impl XessResources {
                     unsafe { std::slice::from_raw_parts_mut(row.as_mut_ptr() as *mut _, w) };
                 for (x, p) in px.iter_mut().enumerate() {
                     let i = (y * w + x) * 2;
-                    p[0] = f16::from_f32(load(&g.mvec, i));
-                    p[1] = f16::from_f32(load(&g.mvec, i + 1));
+                    p[0] = f16::from_bits(g.mvec[i].load(Relaxed));
+                    p[1] = f16::from_bits(g.mvec[i + 1].load(Relaxed));
                 }
             });
 

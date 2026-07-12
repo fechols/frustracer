@@ -13,10 +13,10 @@ use super::d3d12::{
     transition, D3d, Result, UploadBuffer, FRAMES_IN_FLIGHT,
 };
 use super::streamline_sys as sl;
-use crate::dlss::GBufs;
+use crate::dlss::{ld16, GBufs};
 use half::f16;
 use rayon::prelude::*;
-use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU16, AtomicU32, Ordering::Relaxed};
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -175,6 +175,8 @@ impl RrResources {
             }
         };
         let load = |b: &[AtomicU32], i: usize| f32::from_bits(b[i].load(Relaxed));
+        // f16-stored planes go to their f16 textures as raw bit copies.
+        let bits16 = |b: &[AtomicU16], i: usize| f16::from_bits(b[i].load(Relaxed));
         let to_unorm8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
 
         // Noisy HDR color: accum under store semantics (3 × f32) -> RGBA16F.
@@ -195,6 +197,7 @@ impl RrResources {
             });
 
         // World normal + roughness, packed (normalRoughnessMode = ePacked).
+        // Storage is already f16 — a straight bit copy.
         plane_mem(&self.planes[P_NORMAL_ROUGH])
             .par_chunks_mut(aligned_pitch(w * 8))
             .take(h)
@@ -204,10 +207,10 @@ impl RrResources {
                     unsafe { std::slice::from_raw_parts_mut(row.as_mut_ptr() as *mut _, w) };
                 for (x, p) in px.iter_mut().enumerate() {
                     let i = (y * w + x) * 4;
-                    p[0] = f16::from_f32(load(&g.normal_rough, i));
-                    p[1] = f16::from_f32(load(&g.normal_rough, i + 1));
-                    p[2] = f16::from_f32(load(&g.normal_rough, i + 2));
-                    p[3] = f16::from_f32(load(&g.normal_rough, i + 3));
+                    p[0] = bits16(&g.normal_rough, i);
+                    p[1] = bits16(&g.normal_rough, i + 1);
+                    p[2] = bits16(&g.normal_rough, i + 2);
+                    p[3] = bits16(&g.normal_rough, i + 3);
                 }
             });
 
@@ -224,7 +227,7 @@ impl RrResources {
                 }
             });
 
-        // Motion vectors: 2 × f32 (pixels) -> RG16F.
+        // Motion vectors (pixels): f16 storage -> RG16F, bit copy.
         plane_mem(&self.planes[P_MVEC])
             .par_chunks_mut(aligned_pitch(w * 4))
             .take(h)
@@ -234,8 +237,8 @@ impl RrResources {
                     unsafe { std::slice::from_raw_parts_mut(row.as_mut_ptr() as *mut _, w) };
                 for (x, p) in px.iter_mut().enumerate() {
                     let i = (y * w + x) * 2;
-                    p[0] = f16::from_f32(load(&g.mvec, i));
-                    p[1] = f16::from_f32(load(&g.mvec, i + 1));
+                    p[0] = bits16(&g.mvec, i);
+                    p[1] = bits16(&g.mvec, i + 1);
                 }
             });
 
@@ -247,9 +250,9 @@ impl RrResources {
             .for_each(|(y, row)| {
                 for x in 0..w {
                     let i = (y * w + x) * 3;
-                    row[x * 4] = to_unorm8(load(&g.diff_alb, i));
-                    row[x * 4 + 1] = to_unorm8(load(&g.diff_alb, i + 1));
-                    row[x * 4 + 2] = to_unorm8(load(&g.diff_alb, i + 2));
+                    row[x * 4] = to_unorm8(ld16(&g.diff_alb[i]));
+                    row[x * 4 + 1] = to_unorm8(ld16(&g.diff_alb[i + 1]));
+                    row[x * 4 + 2] = to_unorm8(ld16(&g.diff_alb[i + 2]));
                     row[x * 4 + 3] = 255;
                 }
             });
@@ -260,14 +263,14 @@ impl RrResources {
             .for_each(|(y, row)| {
                 for x in 0..w {
                     let i = (y * w + x) * 3;
-                    row[x * 4] = to_unorm8(load(&g.spec_alb, i));
-                    row[x * 4 + 1] = to_unorm8(load(&g.spec_alb, i + 1));
-                    row[x * 4 + 2] = to_unorm8(load(&g.spec_alb, i + 2));
+                    row[x * 4] = to_unorm8(ld16(&g.spec_alb[i]));
+                    row[x * 4 + 1] = to_unorm8(ld16(&g.spec_alb[i + 1]));
+                    row[x * 4 + 2] = to_unorm8(ld16(&g.spec_alb[i + 2]));
                     row[x * 4 + 3] = 255;
                 }
             });
 
-        // Specular hit distance -> R16F.
+        // Specular hit distance: f16 storage -> R16F, bit copy.
         plane_mem(&self.planes[P_SPEC_HIT])
             .par_chunks_mut(aligned_pitch(w * 2))
             .take(h)
@@ -276,7 +279,7 @@ impl RrResources {
                 let px: &mut [f16] =
                     unsafe { std::slice::from_raw_parts_mut(row.as_mut_ptr() as *mut _, w) };
                 for (x, p) in px.iter_mut().enumerate() {
-                    *p = f16::from_f32(load(&g.spec_hit_t, y * w + x));
+                    *p = bits16(&g.spec_hit_t, y * w + x);
                 }
             });
 

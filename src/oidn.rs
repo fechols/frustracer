@@ -368,7 +368,7 @@ impl OidnContext {
         assert_eq!((g.rw, g.rh), (self.w, self.h), "gbuf/filter resolution mismatch");
         let w = self.w;
         let n = self.w * self.h * 3;
-        let load = |a: &AtomicU32| f32::from_bits(a.load(Relaxed));
+        let load = crate::dlss::ld16; // the guide planes store f16 bits
         // First-hit albedo per the OIDN guidance: diffuse color plus the
         // (RGB F0) specular reflectivity, clamped to [0,1]. Sky pixels
         // already carry diff_alb = 1.
