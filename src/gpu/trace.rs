@@ -160,7 +160,7 @@ const LEAF_HLSL: &str = include_str!("shaders/leaf.hlsl");
 const HEMI_WAVE_HLSL: &str = include_str!("shaders/hemi_wave.hlsl");
 const HEMI_LEAF_HLSL: &str = include_str!("shaders/hemi_leaf.hlsl");
 const COMPOSE_HLSL: &str = include_str!("shaders/compose.hlsl");
-const FEED_HLSL: &str = include_str!("shaders/feed.hlsl");
+pub(crate) const FEED_HLSL: &str = include_str!("shaders/feed.hlsl");
 const NPPD_HLSL: &str = include_str!("shaders/nppd.hlsl");
 
 /// What the GPU tracer requires, queried once. RayQuery in compute needs
@@ -1849,52 +1849,7 @@ impl TraceGpu {
         kind: FeedKind,
         targets: &[(u32, &ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT)],
     ) -> Result<()> {
-        for &(reg, _, format) in targets {
-            let mut fs = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: format, ..Default::default() };
-            unsafe {
-                device.CheckFeatureSupport(
-                    D3D12_FEATURE_FORMAT_SUPPORT,
-                    &mut fs as *mut _ as *mut _,
-                    std::mem::size_of::<D3D12_FEATURE_DATA_FORMAT_SUPPORT>() as u32,
-                )
-            }
-            .map_err(|e| format!("CheckFeatureSupport(format {}): {e}", format.0))?;
-            if fs.Support2.0 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0 == 0 {
-                return Err(format!(
-                    "feed target u{reg}: format {} lacks typed UAV store on this device",
-                    format.0
-                ));
-            }
-        }
-        let inc = unsafe {
-            device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
-        } as usize;
-        let base = unsafe { self.uav_heap.GetCPUDescriptorHandleForHeapStart() };
-        let mut planes = Vec::with_capacity(targets.len());
-        for &(reg, res, format) in targets {
-            // A register outside the feed range would silently overwrite the
-            // hdr descriptor (slot 0) or write past the heap end — descriptor
-            // writes have no bounds check of their own, so gate in release.
-            if !(NUM_UAVS + 2..NUM_UAVS + 2 + NUM_FEED).contains(&reg) {
-                return Err(format!("feed target u{reg} outside u16..u22"));
-            }
-            let slot = (reg - (NUM_UAVS + 1)) as usize; // u16 -> heap slot 1
-            let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
-                Format: format,
-                ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
-                ..Default::default()
-            };
-            unsafe {
-                device.CreateUnorderedAccessView(
-                    res,
-                    None,
-                    Some(&desc),
-                    D3D12_CPU_DESCRIPTOR_HANDLE { ptr: base.ptr + slot * inc },
-                )
-            };
-            planes.push(res.clone());
-        }
-        self.feed = Some((kind, planes));
+        self.feed = Some((kind, wire_feed_targets(device, &self.uav_heap, targets)?));
         Ok(())
     }
 
@@ -1933,27 +1888,16 @@ impl TraceGpu {
             (FeedKind::Rr, _) => self.pso_feed_rr.as_ref(),
         }
         .ok_or("feed PSO missing (TraceGpu built without gbuf)")?;
-        let _ev = super::pix::scope(list, c"feed");
-        unsafe {
-            let npsr = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-            let ua = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-            let to_uav: Vec<_> = planes.iter().map(|p| transition(p, npsr, ua)).collect();
-            list.ResourceBarrier(&to_uav);
-            self.bind_common(list, slot);
-            list.SetDescriptorHeaps(&[Some(self.uav_heap.clone())]);
-            list.SetComputeRootDescriptorTable(
-                RP_TEX,
-                self.uav_heap.GetGPUDescriptorHandleForHeapStart(),
-            );
-            list.SetPipelineState(pso);
-            list.Dispatch(self.rw.div_ceil(8), self.rh.div_ceil(8), 1);
-            if let Some(n) = nppd {
-                list.SetPipelineState(&n.pso_out);
-                list.Dispatch(self.rw.div_ceil(8), self.rh.div_ceil(8), 1);
-            }
-            let back: Vec<_> = planes.iter().map(|p| transition(p, ua, npsr)).collect();
-            list.ResourceBarrier(&back);
-        }
+        record_feed_dispatch(
+            list,
+            &self.uav_heap,
+            pso,
+            nppd.map(|n| &n.pso_out),
+            planes,
+            self.rw,
+            self.rh,
+            &|| unsafe { self.bind_common(list, slot) },
+        );
         Ok(())
     }
 
@@ -2008,5 +1952,102 @@ impl TraceGpu {
                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
             )]);
         }
+    }
+}
+
+/// Owner-independent half of `wire_feed`: gate every target format on typed
+/// UAV store support (optional in D3D12), bounds-check the registers into
+/// the feed range, and write the TEXTURE2D UAV descriptors into `uav_heap`
+/// at slot reg - 15 (u16 -> slot 1, after the resolve target at slot 0).
+/// Returns the plane list the record-side barriers need. Shared by TraceGpu
+/// and DxrGpu — both bind the same root layout, so the heap contract is
+/// identical.
+pub(crate) fn wire_feed_targets(
+    device: &ID3D12Device,
+    uav_heap: &ID3D12DescriptorHeap,
+    targets: &[(u32, &ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT)],
+) -> Result<Vec<ID3D12Resource>> {
+    for &(reg, _, format) in targets {
+        let mut fs = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: format, ..Default::default() };
+        unsafe {
+            device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                &mut fs as *mut _ as *mut _,
+                std::mem::size_of::<D3D12_FEATURE_DATA_FORMAT_SUPPORT>() as u32,
+            )
+        }
+        .map_err(|e| format!("CheckFeatureSupport(format {}): {e}", format.0))?;
+        if fs.Support2.0 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0 == 0 {
+            return Err(format!(
+                "feed target u{reg}: format {} lacks typed UAV store on this device",
+                format.0
+            ));
+        }
+    }
+    let inc =
+        unsafe { device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) }
+            as usize;
+    let base = unsafe { uav_heap.GetCPUDescriptorHandleForHeapStart() };
+    let mut planes = Vec::with_capacity(targets.len());
+    for &(reg, res, format) in targets {
+        // A register outside the feed range would silently overwrite the
+        // hdr descriptor (slot 0) or write past the heap end — descriptor
+        // writes have no bounds check of their own, so gate in release.
+        if !(NUM_UAVS + 2..NUM_UAVS + 2 + NUM_FEED).contains(&reg) {
+            return Err(format!("feed target u{reg} outside u16..u22"));
+        }
+        let slot = (reg - (NUM_UAVS + 1)) as usize; // u16 -> heap slot 1
+        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        unsafe {
+            device.CreateUnorderedAccessView(
+                res,
+                None,
+                Some(&desc),
+                D3D12_CPU_DESCRIPTOR_HANDLE { ptr: base.ptr + slot * inc },
+            )
+        };
+        planes.push(res.clone());
+    }
+    Ok(planes)
+}
+
+/// Owner-independent half of `record_feed`: NPSR -> UAV transitions, the
+/// owner's root binds (`bind` — invoked after the transitions, must set the
+/// root signature + common roots), the descriptor table, the feed dispatch
+/// (+ an optional second dispatch writing disjoint planes inside the same
+/// barrier window — TraceGpu's NPPD color crop), and the NPSR
+/// back-transitions that double as the write->read sync and the upscalers'
+/// state-at-use contract.
+pub(crate) fn record_feed_dispatch(
+    list: &ID3D12GraphicsCommandList,
+    uav_heap: &ID3D12DescriptorHeap,
+    pso: &ID3D12PipelineState,
+    extra_pso: Option<&ID3D12PipelineState>,
+    planes: &[ID3D12Resource],
+    rw: u32,
+    rh: u32,
+    bind: &dyn Fn(),
+) {
+    let _ev = super::pix::scope(list, c"feed");
+    unsafe {
+        let npsr = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        let ua = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        let to_uav: Vec<_> = planes.iter().map(|p| transition(p, npsr, ua)).collect();
+        list.ResourceBarrier(&to_uav);
+        bind();
+        list.SetDescriptorHeaps(&[Some(uav_heap.clone())]);
+        list.SetComputeRootDescriptorTable(RP_TEX, uav_heap.GetGPUDescriptorHandleForHeapStart());
+        list.SetPipelineState(pso);
+        list.Dispatch(rw.div_ceil(8), rh.div_ceil(8), 1);
+        if let Some(p2) = extra_pso {
+            list.SetPipelineState(p2);
+            list.Dispatch(rw.div_ceil(8), rh.div_ceil(8), 1);
+        }
+        let back: Vec<_> = planes.iter().map(|p| transition(p, ua, npsr)).collect();
+        list.ResourceBarrier(&back);
     }
 }
