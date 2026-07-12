@@ -35,10 +35,10 @@
 //! by `--check-nppd` (needs the DLLs + an exported model).
 
 use crate::camera::CamBasis;
-use crate::dlss::GBufs;
+use crate::dlss::{ld16, GBufs};
 use glam::Vec3A;
 use rayon::prelude::*;
-use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU16, AtomicU32, Ordering::Relaxed};
 
 /// Temporal state channels: previous color (3) + output (3) + feature (32) —
 /// upstream `Model.temporal_init` (model.py:164).
@@ -131,9 +131,9 @@ pub fn pack_inputs(
                 }
                 1..=3 => {
                     let n = Vec3A::new(
-                        load(&g.normal_rough[i * 4]),
-                        load(&g.normal_rough[i * 4 + 1]),
-                        load(&g.normal_rough[i * 4 + 2]),
+                        ld16(&g.normal_rough[i * 4]),
+                        ld16(&g.normal_rough[i * 4 + 1]),
+                        ld16(&g.normal_rough[i * 4 + 2]),
                     );
                     match c {
                         1 => n.dot(fwd),
@@ -141,7 +141,7 @@ pub fn pack_inputs(
                         _ => n.dot(up),
                     }
                 }
-                4..=6 => load(&g.diff_alb[i * 3 + (c - 4)]),
+                4..=6 => ld16(&g.diff_alb[i * 3 + (c - 4)]),
                 _ => f32::from_bits(accum[i * 3 + (c - 7)].load(Relaxed)),
             };
         }
@@ -159,7 +159,7 @@ pub fn pack_inputs(
 /// rewritten — zeros in the border, so a stale ping-pong buffer never leaks.
 pub fn warp_temporal(
     prev: &[f32],
-    mvec: &[AtomicU32],
+    mvec: &[AtomicU16],
     c_t: usize,
     w: usize,
     h: usize,
@@ -183,8 +183,8 @@ pub fn warp_temporal(
                 continue;
             }
             let i = y * w + x;
-            let px = x as f32 + MV_SIGN.0 * load(&mvec[i * 2]);
-            let py = y as f32 + MV_SIGN.1 * load(&mvec[i * 2 + 1]);
+            let px = x as f32 + MV_SIGN.0 * ld16(&mvec[i * 2]);
+            let py = y as f32 + MV_SIGN.1 * ld16(&mvec[i * 2 + 1]);
             let (x0, y0) = (px.floor(), py.floor());
             let (fx, fy) = (px - x0, py - y0);
             let (x0, y0) = (x0 as i64, y0 as i64);
@@ -269,15 +269,22 @@ pub fn self_test() -> Result<(), String> {
             g.depth[i].store(z.to_bits(), Relaxed);
             let n = normal(x, y);
             for (k, nk) in [n.x, n.y, n.z].into_iter().enumerate() {
-                g.normal_rough[i * 4 + k].store(nk.to_bits(), Relaxed);
+                crate::dlss::st16(&g.normal_rough[i * 4 + k], nk);
             }
             for k in 0..3 {
-                g.diff_alb[i * 3 + k].store(val(4 + k, x, y).to_bits(), Relaxed);
+                crate::dlss::st16(&g.diff_alb[i * 3 + k], val(4 + k, x, y));
                 accum[i * 3 + k].store(val(7 + k, x, y).to_bits(), Relaxed);
             }
-            g.normal_rough[i * 4 + 3].store(999.0f32.to_bits(), Relaxed); // roughness: must NOT be packed
+            crate::dlss::st16(&g.normal_rough[i * 4 + 3], 999.0); // roughness: must NOT be packed
         }
     }
+    // The normal/albedo planes store f16 bits, so the oracle must quantize
+    // the same way the packer's `ld16` widening does (accum stays f32-exact).
+    let q16 = |v: f32| half::f16::from_f32(v).to_f32();
+    let n16 = |x: usize, y: usize| {
+        let n = normal(x, y);
+        Vec3A::new(q16(n.x), q16(n.y), q16(n.z))
+    };
     let mut stack = vec![f32::NAN; CH_FRAME * pw * ph];
     pack_inputs(&accum, &g, &basis, far, pw, ph, &mut stack);
     for c in 0..CH_FRAME {
@@ -297,9 +304,10 @@ pub fn self_test() -> Result<(), String> {
                             (1.0 + dir.dot(fwd) / view_z(sx, sy)).ln()
                         }
                     }
-                    1 => normal(sx, sy).dot(fwd),
-                    2 => normal(sx, sy).dot(right),
-                    3 => normal(sx, sy).dot(up),
+                    1 => n16(sx, sy).dot(fwd),
+                    2 => n16(sx, sy).dot(right),
+                    3 => n16(sx, sy).dot(up),
+                    4..=6 => q16(val(c, sx, sy)),
                     _ => val(c, sx, sy),
                 };
                 if (got - want).abs() > 1e-6 {
@@ -314,7 +322,7 @@ pub fn self_test() -> Result<(), String> {
     // land entirely in the camera-up channel.
     g.depth[2 * w + 2].store(1.0f32.to_bits(), Relaxed);
     for (k, nk) in [0.0f32, 1.0, 0.0].into_iter().enumerate() {
-        g.normal_rough[(2 * w + 2) * 4 + k].store(nk.to_bits(), Relaxed);
+        crate::dlss::st16(&g.normal_rough[(2 * w + 2) * 4 + k], nk);
     }
     pack_inputs(&accum, &g, &basis, far, pw, ph, &mut stack);
     let center = 2 * pw + 2;
@@ -363,9 +371,10 @@ pub fn self_test() -> Result<(), String> {
             }
         }
     }
-    let mv = |dx: f32, dy: f32| -> Vec<AtomicU32> {
+    // f16 bits, the `GBufs::mvec` storage; every test mv value is f16-exact.
+    let mv = |dx: f32, dy: f32| -> Vec<AtomicU16> {
         (0..w * h * 2)
-            .map(|i| AtomicU32::new(if i % 2 == 0 { dx } else { dy }.to_bits()))
+            .map(|i| AtomicU16::new(half::f16::from_f32(if i % 2 == 0 { dx } else { dy }).to_bits()))
             .collect()
     };
     let mut out = vec![f32::NAN; c_t * pw * ph];
