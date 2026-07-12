@@ -262,7 +262,10 @@ pub fn shade(
     // Metallic/roughness lobes: F0 = 4% dielectric base lerped to albedo for
     // metals; the diffuse lobe fades out as metalness rises.
     let f0 = Vec3A::splat(0.04).lerp(albedo, mat.metallic);
-    let kd = albedo * (1.0 - mat.metallic);
+    // The sheen factor keeps fabric energy-conserving: 0.157 is the Charlie
+    // lobe's peak directional albedo (Estevez-Kulla), so diffuse gives back
+    // what the sheen adds.
+    let kd = albedo * (1.0 - mat.metallic) * (1.0 - 0.157 * mat.sheen);
     // Tangent frame for the microfacet lobes. Anisotropic materials brush
     // circumferentially around world-up (a lathe-spun body); the onb fallback
     // covers the poles and all isotropic materials (frame arbitrary there).
@@ -286,6 +289,9 @@ pub fn shade(
         l
     };
     let lambda_v = ggx_lambda(vl, ax, ay);
+    // Charlie-sheen inverse alpha, hoisted out of the light loop (fabric
+    // reuses the material roughness as sheen roughness).
+    let sheen_inv_a = 1.0 / mat.roughness.clamp(0.07, 1.0);
 
     // Direct light: N samples on the area light, Lambert diffuse +
     // Cook-Torrance GGX specular per sample. The renderer's convention omits
@@ -384,6 +390,18 @@ pub fn shade(
                 let f = schlick(f0, wi.dot(h).max(0.0));
                 // li carries ndl; D·G2·F/(4·nv·nl)·nl leaves /(4·nv).
                 direct_s += li * f * (std::f32::consts::PI * d * g2 / (4.0 * vl.z * ndl));
+                if mat.sheen > 0.0 {
+                    // Retro-reflective fabric rim: Charlie NDF + Ashikhmin
+                    // visibility (the glTF KHR_materials_sheen pair), white,
+                    // direct light only. Pure ALU on values already in
+                    // scope — no rng, no rays. The π compensates the
+                    // renderer's dropped Lambert 1/π like the GGX term.
+                    let sin2 = (1.0 - hl.z * hl.z).max(0.0);
+                    let d_c = (2.0 + sheen_inv_a) * sin2.powf(sheen_inv_a * 0.5)
+                        / std::f32::consts::TAU;
+                    let v_ash = 1.0 / (4.0 * (ndl + vl.z - ndl * vl.z)).max(1e-4);
+                    direct_s += li * (std::f32::consts::PI * mat.sheen * d_c * v_ash);
+                }
             }
         }
     }
