@@ -30,10 +30,12 @@ pub const SRV_SLOT_XESS: u32 = 3;
 pub const SRV_SLOT_GPU: u32 = 4;
 /// The DXR pipeline's resolved HDR output (gpu/dxr.rs).
 pub const SRV_SLOT_DXR: u32 = 5;
+/// The FSR4 upscaled output (gpu/ffx_rr.rs).
+pub const SRV_SLOT_FSR: u32 = 6;
 /// Room for the DLSS-RR output SRV and future debug views.
 const SRV_HEAP_CAPACITY: u32 = 8;
 
-fn compile(src: &str, entry: PCSTR, target: PCSTR, what: &str) -> Result<ID3DBlob> {
+pub(super) fn compile(src: &str, entry: PCSTR, target: PCSTR, what: &str) -> Result<ID3DBlob> {
     let mut blob: Option<ID3DBlob> = None;
     let mut errs: Option<ID3DBlob> = None;
     let hr = unsafe {

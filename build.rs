@@ -15,5 +15,22 @@ fn main() {
             .include("SDKs/streamline-sdk/include")
             .file("shim/sl_shim.cpp")
             .compile("sl_shim");
+
+        // FidelityFX FFI shim: same doctrine as the SL shim — the ffx-api
+        // structs (pNext chains, FfxApiResource descriptions) are built inside
+        // one C++ TU against the vendored MIT headers; the loader DLL is
+        // LoadLibraryExW'd at runtime, so nothing links FFX and headless
+        // `--check*` runs never touch it. ffx_shim.cpp reaches the vendored
+        // headers by relative path, so no .include() is needed beyond rerun
+        // tracking.
+        println!("cargo:rerun-if-changed=shim/ffx_shim.cpp");
+        println!("cargo:rerun-if-changed=shim/ffx_shim.h");
+        println!("cargo:rerun-if-changed=SDKs/fidelityfx-sdk");
+        cc::Build::new()
+            .cpp(true)
+            .std("c++17")
+            .flag("/EHsc")
+            .file("shim/ffx_shim.cpp")
+            .compile("ffx_shim");
     }
 }

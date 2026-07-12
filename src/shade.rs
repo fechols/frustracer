@@ -99,6 +99,16 @@ pub struct PrimarySurface {
     /// Specular-reflection ray hit t; INFINITY when the reflection ray
     /// missed; 0.0 when no reflection was traced.
     pub spec_t: f32,
+    /// Shadowed direct light, split by lobe, AFTER the sample average —
+    /// exactly the two addends of `color = kd*(direct_d + ambient) +
+    /// direct_s`. `direct_d` is albedo-free (kd multiplies it later), i.e.
+    /// already the demodulated diffuse radiance FSR Ray Regeneration wants;
+    /// `direct_s` includes the per-sample Fresnel. Everything else the pixel
+    /// shows (kd*ambient, the reflection bounce) is reconstructed at the
+    /// G-buffer write site as the exact residual `color - kd*direct_d -
+    /// direct_s`-style remainder, so capture changes no shading math.
+    pub direct_d: Vec3A,
+    pub direct_s: Vec3A,
 }
 
 /// Capacity of a `VisRecord` (the presets top out at 4 shadow samples).
@@ -256,6 +266,8 @@ pub fn shade(
             roughness: mat.roughness,
             metallic: mat.metallic,
             spec_t: 0.0,
+            direct_d: Vec3A::ZERO,
+            direct_s: Vec3A::ZERO,
         };
     }
 
@@ -444,6 +456,10 @@ pub fn shade(
         direct_d /= n_shadow as f32;
         direct_s /= n_shadow as f32;
         direct_t /= n_shadow as f32;
+    }
+    if let Some(prim) = prim.as_deref_mut() {
+        prim.direct_d = direct_d;
+        prim.direct_s = direct_s;
     }
     if let VisCtl::Capture(r) = &mut vis {
         r.n_light = n_shadow;

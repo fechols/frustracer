@@ -46,6 +46,11 @@ void raygen() {
     }
     tbuf[pi] = p.t;
     info[pi] = pack_info(0u, KIND_LEAF);
+    // Sky G-buffer capture (FLAG_GBUF-gated inside the helper — plain
+    // sessions are bit-untouched, and no rng draw is consumed). The hit
+    // half lives in chs_shade, where the PrimSurf is.
+    if (isinf(p.t))
+        gbuf_write_sky(pi, float(id.x) + jx, float(id.y) + jy, dir);
 }
 
 [shader("closesthit")]
@@ -58,6 +63,23 @@ void chs_shade(inout RayPayload p, in BuiltInTriangleIntersectionAttributes a) {
     PrimSurf ps;
     p.color = shade_full(WorldRayOrigin(), WorldRayDirection(), h, p.rng, ps);
     p.t = h.t;
+    // G-buffer capture: a pure copy of already-computed values, zero rng
+    // draws, FLAG_GBUF-gated inside the helper. chs_shade fires exactly
+    // once per pixel structurally (the reflection ray routes to HgHit, the
+    // occlusion ray to the null record). The (fx, fy) sample position is
+    // recomputed from the frame-uniform jitter — upscaler frames always run
+    // FLAG_FRAME_JITTER; on FLAG_JITTER (rng-drawn, plain accumulation)
+    // frames the offset here is the pixel center, which is harmless: (fx,
+    // fy) feeds only gbuf_mv, and those frames run with prev_cam unset, so
+    // the MV is (0,0) regardless.
+    uint2 id = DispatchRaysIndex().xy;
+    float jx = 0.5, jy = 0.5;
+    if (flags & FLAG_FRAME_JITTER) {
+        jx = 0.5 + frame_jitter.x;
+        jy = 0.5 + frame_jitter.y;
+    }
+    gbuf_write_hit(id.y * rw + id.x, float(id.x) + jx, float(id.y) + jy,
+                   WorldRayDirection(), h.t, ps);
 }
 
 [shader("closesthit")]

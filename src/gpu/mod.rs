@@ -11,6 +11,9 @@ pub mod adapter;
 pub mod d3d12;
 pub mod dxc;
 pub mod dxr;
+pub mod ffx;
+pub mod ffx_rr;
+pub mod ffx_sys;
 pub mod pix;
 pub mod rr;
 pub mod streamline;
@@ -39,6 +42,12 @@ pub struct GpuOptions {
     pub xess: bool,
     /// Directory holding libxess.dll.
     pub xess_dir: String,
+    /// Attempt FSR Ray Regeneration + FSR4 (native pipeline like XeSS;
+    /// main.rs forces dlss off and rejects --xess when this is set). Also
+    /// flips the adapter preference to AMD.
+    pub fsr: bool,
+    /// Directory holding amd_fidelityfx_loader_dx12.dll + provider DLLs.
+    pub ffx_dir: String,
     /// OR XESS_INIT_FLAG_ENABLE_AUTOEXPOSURE into the XeSS init flags
     /// (--xess-autoexposure; A/B lever, default off).
     pub xess_autoexposure: bool,
@@ -51,6 +60,19 @@ pub struct GpuOptions {
 struct XessState {
     ctx: crate::xess::Xess,
     res: xr::XessResources,
+    opt: (u32, u32),
+    min: (u32, u32),
+    max: (u32, u32),
+}
+
+/// Live FSR contexts (Ray Regeneration denoiser + FSR4 upscaler, both on the
+/// native device) + the plane/composite resources and the dynamic
+/// input-resolution range: seed from the Quality-mode query, floor from
+/// UltraPerformance, max = the window (both ffx contexts take a per-dispatch
+/// renderSize, so no reallocation ever happens on a res step).
+struct FsrState {
+    ctx: ffx::FfxContext,
+    res: ffx_rr::FsrResources,
     opt: (u32, u32),
     min: (u32, u32),
     max: (u32, u32),
@@ -78,6 +100,11 @@ pub struct GpuContext {
     /// torn down by GpuContext::drop after a queue drain — xessDestroyContext
     /// requires completed command lists and a live device.
     xess: Option<XessState>,
+    /// FSR (native pipeline only; never coexists with `sl` or `xess`). Same
+    /// teardown discipline: ffxDestroyContext needs completed lists and a
+    /// live device, so GpuContext::drop drains the queue and drops this
+    /// explicitly.
+    fsr: Option<FsrState>,
     /// GPU-resident NPPD (`--gpu --nppd`, XeSS sessions only): ONNX Runtime
     /// executing on `d3d.queue` with the tracer's NppdRes buffers bound as
     /// tensors. Dropped before `trace`'s resources it wraps is fine — the
@@ -146,7 +173,8 @@ impl GpuContext {
 
         let factory =
             adapter::create_factory(opts.debug).map_err(|e| format!("CreateDXGIFactory2: {e}"))?;
-        let pick = adapter::pick(&factory, false)?;
+        let prefer = if opts.fsr { adapter::Prefer::Amd } else { adapter::Prefer::Nvidia };
+        let pick = adapter::pick(&factory, prefer)?;
         eprintln!("gpu: using adapter \"{}\"", pick.name);
         if sl.is_some() && !pick.is_nvidia {
             eprintln!("dlss: disabled — no NVIDIA adapter");
@@ -329,6 +357,35 @@ impl GpuContext {
             None
         };
 
+        // FSR (Ray Regeneration + FSR4) — native pipeline like XeSS; the ffx
+        // contexts are created on the real device and dispatches record into
+        // our command list (no interposer/proxies anywhere). The version
+        // enumeration is the support probe: Ray Regeneration reports no
+        // provider off RDNA4, which degrades to the plain path with a log
+        // line, the same shape as DLSS on a non-NVIDIA adapter.
+        let fsr_state = if opts.fsr && sl.is_none() {
+            match Self::init_fsr(&opts.ffx_dir, &d3d.device, w, h, opts.debug) {
+                Ok(s) => {
+                    passes.create_srv(
+                        &d3d.device,
+                        &s.res.upscaled,
+                        windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+                        tonemap::SRV_SLOT_FSR,
+                    );
+                    Some(s)
+                }
+                Err(e) => {
+                    eprintln!("fsr: disabled — {e}");
+                    None
+                }
+            }
+        } else {
+            if opts.fsr {
+                eprintln!("fsr: disabled — cannot coexist with Streamline (use --fsr, which implies --no-dlss)");
+            }
+            None
+        };
+
         Ok(Self {
             sl,
             _proxy_device: proxy_device,
@@ -341,11 +398,113 @@ impl GpuContext {
             dxr: None,
             rr: rr_res,
             xess: xess_state,
+            fsr: fsr_state,
             nppd_gpu: None,
             nppd_state_valid: false,
             adapter_name: pick.name,
             adapter_is_nvidia: pick.is_nvidia,
         })
+    }
+
+    /// Bring up the two ffx contexts + resources. Split out of `new` so every
+    /// failure funnels into one "fsr: disabled" fallback.
+    fn init_fsr(
+        ffx_dir: &str,
+        device: &ID3D12Device,
+        w: u32,
+        h: u32,
+        debug: bool,
+    ) -> Result<FsrState> {
+        let mut ctx = ffx::FfxContext::load(ffx_dir)?;
+        let den = ctx.versions(false, device)?;
+        if den.is_empty() {
+            return Err("Ray Regeneration reports no provider on this adapter (RDNA4 required)".into());
+        }
+        for (id, name) in &den {
+            eprintln!("fsr: denoiser provider {name} (id {id:#x})");
+        }
+        let ups = ctx.versions(true, device)?;
+        if ups.is_empty() {
+            return Err("FSR upscaler reports no provider on this adapter".into());
+        }
+        for (id, name) in &ups {
+            eprintln!("fsr: upscaler provider {name} (id {id:#x})");
+        }
+        // Dynamic-resolution range: max = the window itself (the controller
+        // creeps to native while still); both contexts take maxRenderSize =
+        // window and a per-dispatch renderSize.
+        ctx.create_denoiser(device, (w, h))?;
+        ctx.create_upscaler(device, (w, h), (w, h), debug)?;
+        let q = |mode: u32, ratio: f32| -> (u32, u32) {
+            ctx.upscaler_render_res((w, h), mode).unwrap_or_else(|e| {
+                let f = crate::fsr::fallback_render_res((w as usize, h as usize), ratio);
+                eprintln!("fsr: render-res query failed ({e}); using ratio fallback");
+                (f.0 as u32, f.1 as u32)
+            })
+        };
+        let opt = q(ffx_sys::QUALITY_MODE_QUALITY, crate::fsr::RATIO_QUALITY);
+        let min = q(ffx_sys::QUALITY_MODE_ULTRA_PERFORMANCE, crate::fsr::RATIO_ULTRA_PERFORMANCE);
+        eprintln!(
+            "fsr: {}x{} -> seed {}x{} (range {}x{}..{}x{})",
+            w, h, opt.0, opt.1, min.0, min.1, w, h,
+        );
+        let res = ffx_rr::FsrResources::new(device, w, h, w, h)?;
+        Ok(FsrState { ctx, res, opt, min, max: (w, h) })
+    }
+
+    /// Wire the session's live upscaler input planes as feed targets on a
+    /// GPU tracer (`wire` = TraceGpu's or DxrGpu's `wire_feed`). The trace
+    /// res was quantize_res-clamped by the caller, but the range is the
+    /// SDK's contract: re-check here so a drift fails loudly at init. A gbuf
+    /// session with no live upscaler is a wiring bug, not a fallback.
+    fn wire_session_feed(
+        &self,
+        rw: u32,
+        rh: u32,
+        mut wire: impl FnMut(
+            trace::FeedKind,
+            &[(u32, &ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT)],
+        ) -> Result<()>,
+    ) -> Result<()> {
+        if let Some(rr) = &self.rr {
+            if rw < rr.min.0 || rh < rr.min.1 || rw > rr.max.0 || rh > rr.max.1 {
+                return Err(format!(
+                    "trace res {}x{} outside DLSS-RR render range {}x{}..{}x{}",
+                    rw, rh, rr.min.0, rr.min.1, rr.max.0, rr.max.1
+                ));
+            }
+            let pl = rr.plane_resources();
+            wire(
+                trace::FeedKind::Rr,
+                &[
+                    (trace::FEED_COLOR, pl[0].0, pl[0].1),
+                    (trace::FEED_NR, pl[1].0, pl[1].1),
+                    (trace::FEED_DEPTH, pl[2].0, pl[2].1),
+                    (trace::FEED_MVEC, pl[3].0, pl[3].1),
+                    (trace::FEED_ALB, pl[4].0, pl[4].1),
+                    (trace::FEED_SPEC, pl[5].0, pl[5].1),
+                    (trace::FEED_SPECHIT, pl[6].0, pl[6].1),
+                ],
+            )
+        } else if let Some(x) = &self.xess {
+            if rw < x.min.0 || rh < x.min.1 || rw > x.max.0 || rh > x.max.1 {
+                return Err(format!(
+                    "trace res {}x{} outside XeSS input range {}x{}..{}x{}",
+                    rw, rh, x.min.0, x.min.1, x.max.0, x.max.1
+                ));
+            }
+            let pl = x.res.plane_resources();
+            wire(
+                trace::FeedKind::Xess,
+                &[
+                    (trace::FEED_COLOR, pl[0].0, pl[0].1),
+                    (trace::FEED_MVEC, pl[1].0, pl[1].1),
+                    (trace::FEED_DEPTH, pl[2].0, pl[2].1),
+                ],
+            )
+        } else {
+            Err("gbuf session with no live upscaler".into())
+        }
     }
 
     /// Bring up the GPU-resident tracer: capability gates, kernel compiles,
@@ -380,51 +539,10 @@ impl GpuContext {
             debug,
         )?;
         // Upscaler sessions: wire the live upscaler's input planes as feed
-        // targets — the feed kernel writes them directly, no CPU upload. The
-        // trace res was quantize_res-clamped by the caller, but the range is
-        // the SDK's contract: re-check here so a drift fails loudly at init.
+        // targets — the feed kernel writes them directly, no CPU upload.
         if gbuf {
-            if let Some(rr) = &self.rr {
-                if rw < rr.min.0 || rh < rr.min.1 || rw > rr.max.0 || rh > rr.max.1 {
-                    return Err(format!(
-                        "trace res {}x{} outside DLSS-RR render range {}x{}..{}x{}",
-                        rw, rh, rr.min.0, rr.min.1, rr.max.0, rr.max.1
-                    ));
-                }
-                let pl = rr.plane_resources();
-                tg.wire_feed(
-                    &self.d3d.device,
-                    trace::FeedKind::Rr,
-                    &[
-                        (trace::FEED_COLOR, pl[0].0, pl[0].1),
-                        (trace::FEED_NR, pl[1].0, pl[1].1),
-                        (trace::FEED_DEPTH, pl[2].0, pl[2].1),
-                        (trace::FEED_MVEC, pl[3].0, pl[3].1),
-                        (trace::FEED_ALB, pl[4].0, pl[4].1),
-                        (trace::FEED_SPEC, pl[5].0, pl[5].1),
-                        (trace::FEED_SPECHIT, pl[6].0, pl[6].1),
-                    ],
-                )?;
-            } else if let Some(x) = &self.xess {
-                if rw < x.min.0 || rh < x.min.1 || rw > x.max.0 || rh > x.max.1 {
-                    return Err(format!(
-                        "trace res {}x{} outside XeSS input range {}x{}..{}x{}",
-                        rw, rh, x.min.0, x.min.1, x.max.0, x.max.1
-                    ));
-                }
-                let pl = x.res.plane_resources();
-                tg.wire_feed(
-                    &self.d3d.device,
-                    trace::FeedKind::Xess,
-                    &[
-                        (trace::FEED_COLOR, pl[0].0, pl[0].1),
-                        (trace::FEED_MVEC, pl[1].0, pl[1].1),
-                        (trace::FEED_DEPTH, pl[2].0, pl[2].1),
-                    ],
-                )?;
-            } else {
-                return Err("gbuf session with no live upscaler".into());
-            }
+            let dev = self.d3d.device.clone();
+            self.wire_session_feed(rw, rh, |kind, targets| tg.wire_feed(&dev, kind, targets))?;
         }
         let mut rec = Ok(());
         self.d3d.run_once(|l| rec = tg.scene.record_upload(l))?;
@@ -480,27 +598,28 @@ impl GpuContext {
     }
 
     /// Build the DXR DispatchRays pipeline (the F key / --dxr). Idempotent —
-    /// a live pipeline is kept. Window-res; scene buffers + BLAS/TLAS build
+    /// a live pipeline is kept. `(rw, rh)` is the session's fixed DXR trace
+    /// resolution (the locked render res when `gbuf` composes with the wired
+    /// upscaler, the window size otherwise); scene buffers + BLAS/TLAS build
     /// once here (the scene is static, --stress included).
     pub fn init_dxr(
         &mut self,
         dxc: &dxc::Dxc,
         scene: &crate::scene::Scene,
         bvh: &crate::bvh::Bvh,
+        rw: u32,
+        rh: u32,
+        gbuf: bool,
         debug: bool,
     ) -> Result<()> {
         if self.dxr.is_some() {
             return Ok(());
         }
-        let mut d = dxr::DxrGpu::new(
-            &self.d3d.device,
-            dxc,
-            scene,
-            bvh,
-            self.d3d.width,
-            self.d3d.height,
-            debug,
-        )?;
+        let mut d = dxr::DxrGpu::new(&self.d3d.device, dxc, scene, bvh, rw, rh, gbuf, debug)?;
+        if gbuf {
+            let dev = self.d3d.device.clone();
+            self.wire_session_feed(rw, rh, |kind, targets| d.wire_feed(&dev, kind, targets))?;
+        }
         let mut rec = Ok(());
         self.d3d.run_once(|l| rec = d.scene.record_upload(l))?;
         rec?;
@@ -552,6 +671,159 @@ impl GpuContext {
         };
         let output = d.hdr.clone();
         self.read_hdr_output(output)
+    }
+
+    /// DLSS-RR fed by the DXR pipeline (the `--dxr` default in a DLSS
+    /// session): one command list = DispatchRays -> feed (pack -> the 7 SL
+    /// input planes) -> the SL sequence -> tonemap(SRV_SLOT_RR) -> present.
+    /// The whole list executes on the session queue, which IS the SL proxy
+    /// queue whenever RR is live — the present_trace_rr contract verbatim;
+    /// record_frame's trailing global UAV barrier fences the pack + accum
+    /// for the feed.
+    pub fn present_dxr_rr(
+        &mut self,
+        p: &trace::FrameParams,
+        fc: &dlss::FrameConstants,
+        frame_idx: u32,
+    ) -> Result<()> {
+        crate::zone!("present-dxr-rr");
+        if self.dxr.is_none() || self.sl.is_none() || self.rr.is_none() {
+            return Err("DXR pipeline + DLSS-RR not both initialized".into());
+        }
+        let slot = self.d3d.begin_frame()?;
+        {
+            let d3d = &mut self.d3d;
+            let d = self.dxr.as_ref().unwrap();
+            // The session res is fixed at init; fc must agree (it drives the
+            // extent tags SL derives the ratio from).
+            if (fc.rw as u32, fc.rh as u32) != (d.rw, d.rh) {
+                d3d.abort_frame();
+                return Err(format!(
+                    "frame constants {}x{} != DXR res {}x{}",
+                    fc.rw, fc.rh, d.rw, d.rh
+                ));
+            }
+            d.write_cb(slot, p);
+            if let Err(e) = d.record_frame(&d3d.list, slot) {
+                d3d.abort_frame();
+                return Err(e);
+            }
+            if let Err(e) = d.record_feed(&d3d.list, slot) {
+                d3d.abort_frame();
+                return Err(e);
+            }
+        }
+        {
+            let d3d = &mut self.d3d;
+            let sl = self.sl.as_ref().unwrap();
+            let rr = self.rr.as_ref().unwrap();
+            unsafe {
+                d3d.list.ResourceBarrier(&[transition(
+                    &rr.output,
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+            }
+            if let Err(e) = rr_sl_sequence(sl, rr, &d3d.list, fc, frame_idx) {
+                d3d.abort_frame();
+                return Err(e);
+            }
+            unsafe {
+                d3d.list.ResourceBarrier(&[transition(
+                    &rr.output,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                )]);
+            }
+        }
+        // The tonemap pass re-binds root sig/PSO/heaps/viewport from scratch —
+        // the post-evaluate state restore eDisableCLStateTracking makes the
+        // host's responsibility.
+        self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_RR, 1.0);
+        self.d3d.end_frame(slot)
+    }
+
+    /// XeSS-SR fed by the DXR pipeline (`--dxr --xess`): DispatchRays ->
+    /// feed -> XeSS upscale -> tonemap(SRV_SLOT_XESS) -> present — the
+    /// present_trace_xess chain minus the NPPD split (NPPD stays a
+    /// wavefront-session composition).
+    pub fn present_dxr_xess(
+        &mut self,
+        p: &trace::FrameParams,
+        jitter: (f32, f32),
+        reset: bool,
+    ) -> Result<()> {
+        crate::zone!("present-dxr-xess");
+        if self.dxr.is_none() || self.xess.is_none() {
+            return Err("DXR pipeline + XeSS not both initialized".into());
+        }
+        let slot = self.d3d.begin_frame()?;
+        {
+            let d3d = &mut self.d3d;
+            let d = self.dxr.as_ref().unwrap();
+            d.write_cb(slot, p);
+            if let Err(e) = d.record_frame(&d3d.list, slot) {
+                d3d.abort_frame();
+                return Err(e);
+            }
+            if let Err(e) = d.record_feed(&d3d.list, slot) {
+                d3d.abort_frame();
+                return Err(e);
+            }
+        }
+        {
+            let d3d = &mut self.d3d;
+            let d = self.dxr.as_ref().unwrap();
+            let x = self.xess.as_ref().unwrap();
+            unsafe {
+                d3d.list.ResourceBarrier(&[transition(
+                    &x.res.output,
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+            }
+            let (c, m, dep) = x.res.input_ptrs();
+            let params = crate::xess::XessD3d12ExecuteParams {
+                color_texture: c,
+                velocity_texture: m,
+                depth_texture: dep,
+                exposure_scale_texture: std::ptr::null_mut(),
+                responsive_pixel_mask_texture: std::ptr::null_mut(),
+                output_texture: x.res.output.as_raw(),
+                jitter_offset_x: crate::xess::JITTER_SIGN * jitter.0,
+                jitter_offset_y: crate::xess::JITTER_SIGN * jitter.1,
+                exposure_scale: 1.0,
+                reset_history: reset as u32,
+                input_width: d.rw,
+                input_height: d.rh,
+                input_color_base: Default::default(),
+                input_motion_vector_base: Default::default(),
+                input_depth_base: Default::default(),
+                input_responsive_mask_base: Default::default(),
+                reserved0: Default::default(),
+                output_color_base: Default::default(),
+                descriptor_heap: std::ptr::null_mut(),
+                descriptor_heap_offset: 0,
+            };
+            {
+                let _ev = pix::scope(&d3d.list, c"xess-eval");
+                if let Err(e) = x.ctx.execute(d3d.list.as_raw(), &params) {
+                    d3d.abort_frame();
+                    return Err(e);
+                }
+            }
+            unsafe {
+                d3d.list.ResourceBarrier(&[transition(
+                    &x.res.output,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                )]);
+            }
+        }
+        // The tonemap pass re-binds root sig/PSO/heaps/viewport from scratch,
+        // restoring whatever list state the XeSS dispatch left behind.
+        self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_XESS, 1.0);
+        self.d3d.end_frame(slot)
     }
 
     /// Whether the GPU-resident NPPD stage came up (`--gpu --nppd`; the J
@@ -833,6 +1105,167 @@ impl GpuContext {
     /// must trace inside [min, max]; the controller starts at optimal.
     pub fn xess_res_range(&self) -> Option<((u32, u32), (u32, u32), (u32, u32))> {
         self.xess.as_ref().map(|x| (x.opt, x.min, x.max))
+    }
+
+    /// FSR live => Ray Regeneration + FSR4 upscale are available.
+    pub fn fsr_ready(&self) -> bool {
+        self.fsr.is_some()
+    }
+
+    /// FSR input-resolution range: (seed, min, max) — the same shape as
+    /// `xess_res_range`, feeding the shared DRS controller.
+    pub fn fsr_res_range(&self) -> Option<((u32, u32), (u32, u32), (u32, u32))> {
+        self.fsr.as_ref().map(|f| (f.opt, f.min, f.max))
+    }
+
+    /// FSR mode: upload the G-buffer + signal sub-rects, Ray Regeneration
+    /// denoise (two chained signal dispatches), remodulation composite, FSR4
+    /// upscale to the window-res output, tonemap, present. Everything both
+    /// ffx dispatches see is in render-res space (their `renderSize` names
+    /// this frame's sub-rect); only the upscaled output is window-sized.
+    /// `prev_pos` is the previous frame's camera position (the denoiser's
+    /// cameraPositionDelta); `frame_ms` feeds the upscaler's frameTimeDelta.
+    pub fn present_fsr(
+        &mut self,
+        g: &dlss::GBufs,
+        f: &crate::fsr::FsrBufs,
+        fc: &dlss::FrameConstants,
+        prev_pos: Option<glam::Vec3A>,
+        frame_idx: u32,
+        frame_ms: f32,
+    ) -> Result<()> {
+        crate::zone!("present-fsr");
+        let Some(fs) = &self.fsr else {
+            return Err("FSR not initialized".into());
+        };
+        // Release-build cover for record_upload's dimension debug_asserts.
+        let (rw, rh) = (fc.rw as u32, fc.rh as u32);
+        if (g.rw, g.rh) != (fc.rw, fc.rh) || (f.rw, f.rh) != (fc.rw, fc.rh) {
+            return Err(format!(
+                "FSR frame is {}x{}, buffers {}x{} / {}x{}",
+                fc.rw, fc.rh, g.rw, g.rh, f.rw, f.rh
+            ));
+        }
+        if rw < fs.min.0 || rh < fs.min.1 || rw > fs.max.0 || rh > fs.max.1 {
+            return Err(format!(
+                "FSR frame {}x{} outside render range {}x{}..{}x{}",
+                rw, rh, fs.min.0, fs.min.1, fs.max.0, fs.max.1
+            ));
+        }
+        let (near, far) = (fc.near, fc.far);
+        let slot = self.d3d.begin_frame()?;
+        if let Err(e) = fs.res.record_upload(&self.d3d, slot, g, f, fc.rw, fc.rh, near, far) {
+            self.d3d.abort_frame();
+            return Err(e);
+        }
+
+        // Ray Regeneration: signals in UAV state, one ffxDispatch with the
+        // common desc + both signal descs chained (built in the shim).
+        fs.res.barrier_denoise_begin(&self.d3d.list);
+        let (depth_lin, mvec, normals, spec_alb, diff_alb, dd_in, dd_out, ds_in, ds_out) =
+            fs.res.denoise_res();
+        let dd_desc = ffx::FfxShimDenoiseDesc {
+            cmdlist: self.d3d.list.as_raw(),
+            linear_depth: depth_lin,
+            motion_vectors: mvec,
+            normals,
+            specular_albedo: spec_alb,
+            diffuse_albedo: diff_alb,
+            dd_in,
+            dd_out,
+            ds_in,
+            ds_out,
+            // Our MV plane is already PreviousUV - CurrentUV with the depth
+            // delta in B (converted at upload) — the header's unit scale.
+            mv_scale: [1.0, 1.0, 1.0],
+            // fc.jitter is the renderer's sample offset in pixels; the ffx
+            // polarity knob is fsr::JITTER_SIGN, nowhere else.
+            jitter: [crate::fsr::JITTER_SIGN * fc.jitter.0, crate::fsr::JITTER_SIGN * fc.jitter.1],
+            cam_pos_delta: match prev_pos {
+                Some(p) => v3(p - fc.pos),
+                None => [0.0; 3],
+            },
+            // FfxApiMatrix4x4 is row-major storage with ROW-vector
+            // convention; per its own compatibility table, glam's
+            // column-major/column-vector matrices memcpy DIRECTLY — the
+            // deliberate contrast with SL's row_major() transpose.
+            view: fc.world_to_view.to_cols_array(),
+            projection: fc.view_to_clip.to_cols_array(),
+            depth_bounds_min: near,
+            depth_bounds_max: far,
+            render_w: rw,
+            render_h: rh,
+            frame_index: frame_idx,
+            reset: fc.reset as i32,
+            non_gamma_albedo: 0, // albedos are sqrt-encoded (fsr.rs wire)
+        };
+        {
+            let _ev = pix::scope(&self.d3d.list, c"fsr-denoise");
+            if let Err(e) = fs.ctx.denoise(&dd_desc) {
+                self.d3d.abort_frame();
+                return Err(e);
+            }
+        }
+        fs.res.barrier_denoise_end(&self.d3d.list);
+
+        // Remodulate (binds from scratch — the post-ffx state restore).
+        fs.res.record_composite(&self.d3d.list, rw, rh);
+
+        // FSR4 upscale: composite -> window-res output.
+        fs.res.barrier_upscale_begin(&self.d3d.list);
+        let (color, depth_clip, mvec, output) = fs.res.upscale_res();
+        let up_desc = ffx::FfxShimUpscaleDesc {
+            cmdlist: self.d3d.list.as_raw(),
+            color,
+            depth: depth_clip,
+            motion_vectors: mvec,
+            output,
+            jitter: [crate::fsr::JITTER_SIGN * fc.jitter.0, crate::fsr::JITTER_SIGN * fc.jitter.1],
+            // The shared MV plane holds UV-deltas; this scale hands FSR
+            // pixel-space MVs (polarity knob: fsr::UPSCALE_MV_SIGN).
+            mv_scale: [
+                crate::fsr::UPSCALE_MV_SIGN.0 * rw as f32,
+                crate::fsr::UPSCALE_MV_SIGN.1 * rh as f32,
+            ],
+            render_w: rw,
+            render_h: rh,
+            out_w: fs.max.0,
+            out_h: fs.max.1,
+            enable_sharpening: 0,
+            sharpness: 0.0,
+            frame_time_delta_ms: frame_ms.clamp(0.1, 200.0),
+            pre_exposure: 1.0,
+            reset: fc.reset as i32,
+            cam_near: near,
+            cam_far: far,
+            cam_fovy: fc.fov_y,
+            view_space_to_meters: 1.0,
+            flags: 0,
+        };
+        {
+            let _ev = pix::scope(&self.d3d.list, c"fsr-upscale");
+            if let Err(e) = fs.ctx.upscale(&up_desc) {
+                self.d3d.abort_frame();
+                return Err(e);
+            }
+        }
+        fs.res.barrier_upscale_end(&self.d3d.list);
+
+        // The tonemap pass re-binds root sig/PSO/heaps/viewport from scratch,
+        // restoring whatever list state the ffx dispatches left behind.
+        self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_FSR, 1.0);
+        self.d3d.end_frame(slot)
+    }
+
+    /// FSR twin of `read_rr_output`: the denoised+upscaled image exists only
+    /// on the GPU; screenshots in FSR mode read it back through the same
+    /// path.
+    pub fn read_fsr_output(&mut self) -> Result<Vec<u32>> {
+        let Some(fs) = &self.fsr else {
+            return Err("FSR not initialized".into());
+        };
+        let output = fs.res.upscaled.clone();
+        Ok(self.read_hdr_output(output)?.0)
     }
 
     /// Shared front half of the XeSS paths: validate, begin the frame,
@@ -1241,12 +1674,14 @@ impl GpuContext {
 
 impl Drop for GpuContext {
     fn drop(&mut self) {
-        // xessDestroyContext requires all pending command lists complete and
-        // a live device: drain the queue, then drop the XeSS context here —
-        // before the field-order teardown releases the swapchain/device.
-        if self.xess.is_some() {
+        // xessDestroyContext / ffxDestroyContext require all pending command
+        // lists complete and a live device: drain the queue, then drop the
+        // contexts here — before the field-order teardown releases the
+        // swapchain/device.
+        if self.xess.is_some() || self.fsr.is_some() {
             let _ = self.d3d.wait_idle();
             self.xess = None;
+            self.fsr = None;
         }
     }
 }

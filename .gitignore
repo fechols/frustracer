@@ -35,3 +35,16 @@ __pycache__/
 !/SDKs/streamline-sdk/license.txt
 !/SDKs/streamline-sdk/README.md
 !/SDKs/streamline-sdk/3rd-party-licenses.md
+
+# FidelityFX SDK: only the MIT-licensed ffx-api / denoiser / upscaler headers
+# are committed (vendored from GPUOpen-LibrariesAndSDKs/FidelityFX-SDK @
+# v2.3.0; every file carries the MIT block). The signed runtime DLLs come from
+# the FidelityFX-Samples-v2.3.0-prebuilt.zip release asset extracted at
+# SDKs/FidelityFX-Samples-prebuilt (default --ffx-path points into it) and
+# stay ignored with the rest of SDKs/*.
+!/SDKs/fidelityfx-sdk/
+/SDKs/fidelityfx-sdk/*
+!/SDKs/fidelityfx-sdk/api/
+!/SDKs/fidelityfx-sdk/denoisers/
+!/SDKs/fidelityfx-sdk/upscalers/
+!/SDKs/fidelityfx-sdk/README.md
