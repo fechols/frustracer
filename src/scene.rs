@@ -28,6 +28,15 @@ pub struct Material {
     /// 0 = isotropic; > 0 stretches the GGX lobe along the tangent
     /// (circumferential around world-up — a lathe-spun / brushed finish).
     pub anisotropy: f32,
+    /// 0 = none; retro-reflective Charlie-sheen intensity (fabric/carpet).
+    pub sheen: f32,
+    /// 0 = opaque; thin-surface diffuse transmission fraction (foliage —
+    /// back-lit leaves glow through).
+    pub translucency: f32,
+    /// 0 = opaque; thin-pane Fresnel-split transmission (glassware). The
+    /// transmitted light is tinted by albedo — dark MTL glass Kd must be
+    /// lifted toward white by the classifier or glass renders near-black.
+    pub transmission: f32,
     pub kind: MatKind,
 }
 
@@ -119,7 +128,23 @@ impl SceneBuilder {
         anisotropy: f32,
         kind: MatKind,
     ) -> u32 {
-        self.materials.push(Material { albedo, roughness, metallic, anisotropy, kind });
+        self.material_full(Material {
+            albedo,
+            roughness,
+            metallic,
+            anisotropy,
+            sheen: 0.0,
+            translucency: 0.0,
+            transmission: 0.0,
+            kind,
+        })
+    }
+
+    /// Full-control material push — the OBJ classifier's entry point (the
+    /// shorthands above zero the new lobe fields, which is the structural
+    /// guarantee that procedural/stress scenes never exercise them).
+    pub fn material_full(&mut self, m: Material) -> u32 {
+        self.materials.push(m);
         (self.materials.len() - 1) as u32
     }
 
