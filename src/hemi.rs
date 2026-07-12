@@ -42,7 +42,304 @@ use std::f32::consts::PI;
 /// budgets represent dense neighborhoods more precisely but make every query
 /// and ray pay per-root costs — measured slower both ways. Correctness never
 /// depends on the value (overflow emits coarsely, never drops).
-const HEMI_CUT: usize = 64;
+pub const HEMI_CUT: usize = 64;
+
+/// Hemi-share group qualifiers, both applied to spreads MEASURED from the fp
+/// apexes (coplanarity is never assumed — hit points carry möller-trumbore
+/// fp error off the true triangle plane):
+/// - out-of-plane spread η must stay well below eps or the padded root plane
+///   re-admits the own surface (which sits at −eps below it) — the
+///   blocked-everywhere collapse. eps/4 leaves the exclusion a healthy margin
+///   over `aabb_outside`'s slab-scale slack (~eps/10).
+/// - total spread δ caps at ao_radius/8: a grazing-angle group on a long thin
+///   triangle can span many pixel footprints, and pads that large degrade the
+///   capture toward all-blocked — per-pixel is cheaper there.
+pub const SHARE_ETA_FRAC: f32 = 0.25;
+pub const SHARE_DELTA_FRAC: f32 = 0.125;
+
+/// Shared-hemisphere record capacities. Query-leaves occur at exactly
+/// depth = max_depth − 1 (the LEAF_LEVELS cutoff), so ≤ 4^(FB_DEPTH_CAP−1)
+/// leaves; cuts are pushed once per refine on the internal spine
+/// (1 + 4 + 16 at the cap). Deeper fb.depth poisons the capture — the group
+/// falls back per-pixel, coarser never wrong.
+pub const FB_DEPTH_CAP: u32 = 4;
+const REC_LEAVES: usize = 64;
+const REC_CUTS: usize = 24;
+
+/// One recorded query-leaf: the spherical-triangle cell, its inherited empty
+/// claim `tc` (from the REP's apex — members consume `tc − delta`), and an
+/// index into the record's deduped cut slots (siblings share their parent's
+/// cut verbatim).
+#[derive(Clone, Copy)]
+struct LeafCell {
+    a: Vec3A,
+    b: Vec3A,
+    c: Vec3A,
+    tc: f32,
+    cut: u16,
+}
+
+const LEAF_ZERO: LeafCell =
+    LeafCell { a: Vec3A::ZERO, b: Vec3A::ZERO, c: Vec3A::ZERO, tc: 0.0, cut: 0 };
+
+#[derive(Clone, Copy)]
+struct CutSlot {
+    nodes: [u32; HEMI_CUT],
+    len: u16,
+}
+
+const CUT_ZERO: CutSlot = CutSlot { nodes: [0; HEMI_CUT], len: 0 };
+
+/// One coherent group's shared hemisphere capture: the rep's whole padded
+/// quadtree, reduced to what consumers need. Empty cells are NOT stored per
+/// cell — their analytic values (PSA / ∫sky·cos) are pure functions of
+/// group-invariant inputs (bit-equal n, shared sun), so capture folds them
+/// into `open_mass` once and every member adds it verbatim. Query-leaves
+/// store (cell, tc, cut) so each member shoots its OWN stratified rays from
+/// its own apex with `tmin = max(0, tc − delta)` — sharing amortizes the
+/// bound queries, never the samples.
+///
+/// Allocate once per tile and re-`capture` per group: `reset` only rewinds
+/// the counters (a fresh ~10 KB zeroing per 2×2 group would cost real frame
+/// time at ~50k groups/frame).
+pub struct HemiShare {
+    pub delta: f32,
+    /// Whole padded hemisphere proven open within the capture t_limit — the
+    /// member fast path (AO: π; GI: analytic sky), no leaves recorded.
+    pub open: bool,
+    /// Capture bailed (fb.depth over the record cap, or slot overflow —
+    /// structurally impossible at preset depths). Consumers must fall back.
+    pub poisoned: bool,
+    /// True if captured under GI (sky radiance folded); consumers assert the
+    /// mode matches — an AO record's `open_mass` is a PSA, not radiance.
+    gi_mode: bool,
+    open_mass: Vec3A,
+    open_psa: f32,
+    n_leaves: u16,
+    n_cuts: u16,
+    leaves: [LeafCell; REC_LEAVES],
+    cuts: [CutSlot; REC_CUTS],
+    /// Verify-only (the check harness): keep every empty cell so Apply can
+    /// re-validate the rep's claims with reference rays from EACH member's
+    /// apex. Never set on the render path (Vec::new never allocates).
+    pub record_empties: bool,
+    pub empties: Vec<[Vec3A; 3]>,
+}
+
+impl HemiShare {
+    pub fn new() -> Self {
+        HemiShare {
+            delta: 0.0,
+            open: false,
+            poisoned: false,
+            gi_mode: false,
+            open_mass: Vec3A::ZERO,
+            open_psa: 0.0,
+            n_leaves: 0,
+            n_cuts: 0,
+            leaves: [LEAF_ZERO; REC_LEAVES],
+            cuts: [CUT_ZERO; REC_CUTS],
+            record_empties: false,
+            empties: Vec::new(),
+        }
+    }
+
+    fn reset(&mut self, delta: f32, gi_mode: bool) {
+        self.delta = delta;
+        self.open = false;
+        self.poisoned = false;
+        self.gi_mode = gi_mode;
+        self.open_mass = Vec3A::ZERO;
+        self.open_psa = 0.0;
+        self.n_leaves = 0;
+        self.n_cuts = 0;
+        self.empties.clear();
+    }
+
+    fn push_cut(&mut self, cut: &[u32]) -> Option<u16> {
+        if self.n_cuts as usize == REC_CUTS {
+            return None;
+        }
+        let i = self.n_cuts;
+        let slot = &mut self.cuts[i as usize];
+        slot.nodes[..cut.len()].copy_from_slice(cut);
+        slot.len = cut.len() as u16;
+        self.n_cuts += 1;
+        Some(i)
+    }
+}
+
+impl Default for HemiShare {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Capture the shared hemisphere at the group rep's apex `o` with normal `n`
+/// into `rec`. Every frustum is padded for the group: cell planes by
+/// `pad_k = delta·|in-plane(n_k)| + eta·|n_k·n|`, the root by `eta` alone —
+/// pads are derived from spreads MEASURED on the fp apexes, and the caller's
+/// qualifiers keep `eta ≪ eps` (own-surface exclusion) and `delta` small
+/// (pad blowup). AO passes `t_limit = ao_radius` and the capture queries at
+/// `ao_radius + delta` so a member's claims cover exactly its own radius;
+/// `sun` Some = GI mode (t_limit ∞), folding analytic sky per empty cell.
+/// Consumes no rng; costs one tree of bound queries + refines per GROUP.
+#[allow(clippy::too_many_arguments)]
+pub fn share_capture(
+    scene: &Scene,
+    bvh: &Bvh,
+    o: Vec3A,
+    n: Vec3A,
+    t1: Vec3A,
+    t2: Vec3A,
+    max_depth: u32,
+    t_limit: f32,
+    delta: f32,
+    eta: f32,
+    sun: Option<Vec3A>,
+    rec: &mut HemiShare,
+    ls: &mut LocalStats,
+) {
+    rec.reset(delta, sun.is_some());
+    let max_depth = max_depth.max(1);
+    if max_depth > FB_DEPTH_CAP {
+        rec.poisoned = true;
+        return;
+    }
+    let cx = Cx {
+        scene,
+        bvh,
+        o,
+        n,
+        max_depth,
+        t_limit: if t_limit.is_finite() { t_limit + delta } else { t_limit },
+        gi: sun.map(|s| Gi { sun: s, depth: 0 }),
+    };
+    let root = TileFrustum::half_space_padded(o, n, eta);
+    ls.hemi_queries += 1;
+    let bound = frustum::nearest_geometry_distance_within(
+        bvh,
+        &root,
+        0.0,
+        cx.t_limit,
+        &[0],
+        &mut ls.hemi_nodes,
+    );
+    let Some(t) = bound else {
+        rec.open = true;
+        return;
+    };
+    let (_, tc) = frustum::advance_tc(t, 0.0, scene.eps);
+    let mut cut = [0u32; HEMI_CUT];
+    let len = frustum::refine_cut(
+        bvh,
+        &root,
+        tc,
+        cx.t_limit,
+        &[0],
+        &mut cut,
+        &mut ls.hemi_nodes,
+        &mut ls.cut_overflows,
+    );
+    debug_assert!(len > 0, "padded hemisphere root refine emptied a non-open cut");
+    let child: &[u32] = if len > 0 { &cut[..len] } else { &[0] };
+    let Some(cut_idx) = rec.push_cut(child) else {
+        rec.poisoned = true;
+        return;
+    };
+    for [a, b, c] in sphcell::octants(n, t1, t2) {
+        capture_cell(&cx, a, b, c, 1, tc, cut_idx, delta, eta, rec, ls);
+        if rec.poisoned {
+            return;
+        }
+    }
+}
+
+/// `cell()`'s recursion, recording terminals instead of consuming them.
+/// Frustums are the padded twins; everything else (advance/slack, blocked
+/// cells subdivide, LEAF_LEVELS cutoff) is verbatim.
+#[allow(clippy::too_many_arguments)]
+fn capture_cell(
+    cx: &Cx,
+    a: Vec3A,
+    b: Vec3A,
+    c: Vec3A,
+    depth: u32,
+    t_start: f32,
+    cut_idx: u16,
+    delta: f32,
+    eta: f32,
+    rec: &mut HemiShare,
+    ls: &mut LocalStats,
+) {
+    let f = TileFrustum::tri_cell_padded(cx.o, a, b, c, delta, eta, cx.n);
+    let cut_in = &rec.cuts[cut_idx as usize];
+    ls.hemi_queries += 1;
+    let bound = frustum::nearest_geometry_distance_within(
+        cx.bvh,
+        &f,
+        t_start,
+        cx.t_limit,
+        &cut_in.nodes[..cut_in.len as usize],
+        &mut ls.hemi_nodes,
+    );
+    let Some(t) = bound else {
+        // Empty for the whole group: fold the analytic mass once. The values
+        // are bit-identical per member (pure functions of the shared n/sun).
+        ls.hemi_cells_empty += 1;
+        match cx.gi {
+            None => rec.open_mass.x += sphcell::psa(a, b, c, cx.n),
+            Some(g) => {
+                rec.open_mass += sky_cell(cx.n, g.sun, a, b, c, 5u32.saturating_sub(depth))
+            }
+        }
+        rec.open_psa += sphcell::psa(a, b, c, cx.n);
+        if rec.record_empties {
+            rec.empties.push([a, b, c]);
+        }
+        return;
+    };
+    let (_, tc) = frustum::advance_tc(t, t_start, cx.scene.eps);
+    if depth + LEAF_LEVELS >= cx.max_depth {
+        if rec.n_leaves as usize == REC_LEAVES {
+            rec.poisoned = true;
+            return;
+        }
+        rec.leaves[rec.n_leaves as usize] = LeafCell { a, b, c, tc, cut: cut_idx };
+        rec.n_leaves += 1;
+        return;
+    }
+    let mut cut = [0u32; HEMI_CUT];
+    let len = frustum::refine_cut(
+        cx.bvh,
+        &f,
+        tc,
+        cx.t_limit,
+        &rec.cuts[cut_idx as usize].nodes[..rec.cuts[cut_idx as usize].len as usize],
+        &mut cut,
+        &mut ls.hemi_nodes,
+        &mut ls.cut_overflows,
+    );
+    debug_assert!(len > 0, "padded refine_cut emptied a non-open hemisphere cell");
+    let child_idx = if len > 0 {
+        match rec.push_cut(&cut[..len]) {
+            Some(i) => i,
+            None => {
+                rec.poisoned = true;
+                return;
+            }
+        }
+    } else {
+        cut_idx
+    };
+    let (mab, mbc, mca) = sphcell::midpoints(a, b, c);
+    for [ca, cb, cc] in [[a, mab, mca], [mab, b, mbc], [mca, mbc, c], [mab, mbc, mca]] {
+        capture_cell(cx, ca, cb, cc, depth + 1, tc, child_idx, delta, eta, rec, ls);
+        if rec.poisoned {
+            return;
+        }
+    }
+}
 
 /// Query-tree cutoff, the hemisphere analog of LEAF_TILE: cells this many
 /// levels above the ray budget stop querying and distribute one stratified
@@ -144,6 +441,7 @@ pub fn ao(
     t2: Vec3A,
     max_depth: u32,
     t_limit: f32,
+    share: Option<&HemiShare>,
     rng: &mut fastrand::Rng,
     verify: Option<&mut VerifyCounters>,
     ls: &mut LocalStats,
@@ -153,7 +451,7 @@ pub fn ao(
     // so the sum can exceed π; truncating only that high tail would bias the
     // estimator low (the --check signed-mean gate exists to catch bias).
     // Every term is ≥ 0, so no lower clamp is needed either.
-    integrate(&cx, t1, t2, rng, verify, ls).x / PI
+    integrate(&cx, t1, t2, share, rng, verify, ls).x / PI
 }
 
 /// Cosine-weighted incoming radiance over the hemisphere, divided by π — the
@@ -173,6 +471,7 @@ pub fn gi(
     max_depth: u32,
     sun: Vec3A,
     depth: u32,
+    share: Option<&HemiShare>,
     rng: &mut fastrand::Rng,
     verify: Option<&mut VerifyCounters>,
     ls: &mut LocalStats,
@@ -186,20 +485,74 @@ pub fn gi(
         t_limit: f32::INFINITY,
         gi: Some(Gi { sun, depth }),
     };
-    (integrate(&cx, t1, t2, rng, verify, ls) / PI).max(Vec3A::ZERO)
+    (integrate(&cx, t1, t2, share, rng, verify, ls) / PI).max(Vec3A::ZERO)
 }
 
 fn integrate(
     cx: &Cx,
     t1: Vec3A,
     t2: Vec3A,
+    share: Option<&HemiShare>,
     rng: &mut fastrand::Rng,
     mut verify: Option<&mut VerifyCounters>,
     ls: &mut LocalStats,
 ) -> Vec3A {
     ls.hemi_points += 1;
     let mut acc = Acc::default();
-    // Root: the tangent half-space, queried over the whole BVH.
+    // The shared group capture when one exists (hemi sharing): this point
+    // runs ZERO bound queries — analytic mass is folded from the record and
+    // every query-leaf shoots this member's own fresh rays with the claim
+    // shrunk by delta. Otherwise the tangent half-space is queried over the
+    // whole BVH as always.
+    if let Some(sh) = share {
+        ls.hemi_share_points += 1;
+        debug_assert!(!sh.poisoned, "a poisoned hemi share must not be consumed");
+        debug_assert!(
+            sh.gi_mode == cx.gi.is_some(),
+            "hemi share record mode mismatch (AO record consumed by GI or vice versa)"
+        );
+        if sh.open {
+            // The rep's padded claim covers this apex: whole hemisphere open
+            // within the (already delta-widened) capture limit.
+            ls.hemi_cells_empty += 1;
+            open_hemisphere(cx, t1, t2, &mut acc, verify.as_deref_mut(), ls);
+        } else {
+            acc.open += sh.open_mass;
+            if let Some(v) = verify.as_deref_mut() {
+                // Re-validate the rep's folded empty claims from THIS apex
+                // (the harness captures with record_empties).
+                acc.accounted += sh.open_psa;
+                for e in &sh.empties {
+                    check_empty(cx, *e, v, ls);
+                }
+            }
+            // Every recorded leaf sits at the same depth max(1, max_depth −
+            // LEAF_LEVELS) (capture_cell's recursion is uniform), so the
+            // sub-cell budget the unshared path would use there is
+            // min(LEAF_LEVELS, max_depth − 1) — a bare LEAF_LEVELS would
+            // silently 4× the ray count at max_depth = 1 (no preset reaches
+            // it, but the estimator shape must match the unshared twin).
+            let levels = cx.max_depth.saturating_sub(1).min(LEAF_LEVELS);
+            for l in &sh.leaves[..sh.n_leaves as usize] {
+                let cut = &sh.cuts[l.cut as usize];
+                let t_start = (l.tc - sh.delta).max(0.0);
+                leaf_rays(
+                    cx,
+                    l.a,
+                    l.b,
+                    l.c,
+                    levels,
+                    t_start,
+                    &cut.nodes[..cut.len as usize],
+                    rng,
+                    &mut verify,
+                    ls,
+                    &mut acc,
+                );
+            }
+        }
+        return finish(&mut acc, verify);
+    }
     let root = TileFrustum::half_space(cx.o, cx.n);
     ls.hemi_queries += 1;
     let bound = frustum::nearest_geometry_distance_within(
@@ -214,20 +567,7 @@ fn integrate(
         None => {
             // The whole hemisphere is open within t_limit — one query, done.
             ls.hemi_cells_empty += 1;
-            if let Some(v) = verify.as_deref_mut() {
-                acc.accounted = PI;
-                for [a, b, c] in sphcell::octants(cx.n, t1, t2) {
-                    check_empty(cx, [a, b, c], v, ls);
-                }
-            }
-            match cx.gi {
-                None => acc.open.x = PI,
-                Some(g) => {
-                    for [a, b, c] in sphcell::octants(cx.n, t1, t2) {
-                        acc.open += sky_cell(cx.n, g.sun, a, b, c, 4);
-                    }
-                }
-            }
+            open_hemisphere(cx, t1, t2, &mut acc, verify.as_deref_mut(), ls);
         }
         Some(t) => {
             // Advance + refine exactly like tile_step, then recurse into the
@@ -251,6 +591,38 @@ fn integrate(
             }
         }
     }
+    finish(&mut acc, verify)
+}
+
+/// Whole-hemisphere-open resolution shared by the root query's `None` and a
+/// shared `RootSeed::Open`: analytic PSA/sky over the octants, re-verified
+/// from THIS apex (a member validates the rep's claim at its own origin).
+fn open_hemisphere(
+    cx: &Cx,
+    t1: Vec3A,
+    t2: Vec3A,
+    acc: &mut Acc,
+    verify: Option<&mut VerifyCounters>,
+    ls: &mut LocalStats,
+) {
+    if let Some(v) = verify {
+        acc.accounted = PI;
+        for [a, b, c] in sphcell::octants(cx.n, t1, t2) {
+            check_empty(cx, [a, b, c], v, ls);
+        }
+    }
+    match cx.gi {
+        None => acc.open.x = PI,
+        Some(g) => {
+            for [a, b, c] in sphcell::octants(cx.n, t1, t2) {
+                acc.open += sky_cell(cx.n, g.sun, a, b, c, 4);
+            }
+        }
+    }
+}
+
+/// PSA accounting + the integrator's return value.
+fn finish(acc: &mut Acc, verify: Option<&mut VerifyCounters>) -> Vec3A {
     if let Some(v) = verify {
         v.points += 1;
         let err = (acc.accounted - PI).abs();
@@ -408,6 +780,7 @@ fn leaf_rays(
                     ls,
                     None,
                     shade::VisCtl::Off,
+                    None,
                 ),
             };
             acc.ray += l * weight;

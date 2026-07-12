@@ -8,6 +8,12 @@ use glam::Vec3A;
 pub struct TileFrustum {
     pub origin: Vec3A,
     normals: [Vec3A; 5],
+    /// Per-plane outward relaxation in world units (zero on every non-shared
+    /// path). A padded plane admits every point within `pads[k]` of the true
+    /// half-space — how a frustum built at one apex stays conservative for a
+    /// group of nearby apexes (hemi sharing): erring inclusive costs
+    /// efficiency, never correctness.
+    pads: [f32; 5],
     /// Planes actually in use — the tail of `normals` is zero and a zero
     /// normal never culls, so skipping it is pure savings in the plane-test
     /// loop (the hottest loop in the tracer).
@@ -38,7 +44,7 @@ impl TileFrustum {
         }
         normals[4] = clip;
         let n_planes = if clip == Vec3A::ZERO { 4 } else { 5 };
-        TileFrustum { origin, normals, n_planes }
+        TileFrustum { origin, normals, pads: [0.0; 5], n_planes }
     }
 
     /// Hemisphere "root frustum" for the bounce integrator: one plane through
@@ -48,7 +54,18 @@ impl TileFrustum {
     pub fn half_space(origin: Vec3A, n: Vec3A) -> Self {
         let mut normals = [Vec3A::ZERO; 5];
         normals[0] = n;
-        TileFrustum { origin, normals, n_planes: 1 }
+        TileFrustum { origin, normals, pads: [0.0; 5], n_planes: 1 }
+    }
+
+    /// `half_space` relaxed outward by `pad` — the shared-hemisphere root.
+    /// `pad` must be the group's measured out-of-plane apex spread η (fp hit
+    /// points are NOT exactly coplanar), and the caller must keep η ≪ eps or
+    /// the own surface (at −eps below the plane) re-enters the claims — the
+    /// blocked-everywhere collapse. Enforced by the group qualifier, not here.
+    pub fn half_space_padded(origin: Vec3A, n: Vec3A, pad: f32) -> Self {
+        let mut f = Self::half_space(origin, n);
+        f.pads[0] = pad;
+        f
     }
 
     /// Spherical-triangle cell (a hemisphere-quadtree tile): the cell's edges
@@ -65,7 +82,34 @@ impl TileFrustum {
             let n = if n.dot(center) < 0.0 { -n } else { n };
             normals[i] = n.normalize_or_zero();
         }
-        TileFrustum { origin, normals, n_planes: 3 }
+        TileFrustum { origin, normals, pads: [0.0; 5], n_planes: 3 }
+    }
+
+    /// `tri_cell` for a shared-apex group: every plane k is relaxed by
+    /// `pad_k = d_par·|n_k − (n_k·axis)axis| + eta·|n_k·axis|`, where the
+    /// group's apexes lie within `d_par` of this apex along the plane through
+    /// it with normal `axis` and within `eta` across it (both MEASURED from
+    /// the fp apexes — coplanarity is never assumed). Any ray from any group
+    /// apex through a direction inside the unpadded cell then stays inside
+    /// the padded cone: its points x satisfy n_k·(x − origin) ≥ −pad_k
+    /// (|n_k·Δ| ≤ pad_k for every group displacement Δ; n_k·d ≥ −(sample fp),
+    /// absorbed by the plane test's distance-growing slack).
+    pub fn tri_cell_padded(
+        origin: Vec3A,
+        a: Vec3A,
+        b: Vec3A,
+        c: Vec3A,
+        d_par: f32,
+        eta: f32,
+        axis: Vec3A,
+    ) -> Self {
+        let mut f = Self::tri_cell(origin, a, b, c);
+        for i in 0..3 {
+            let along = f.normals[i].dot(axis);
+            let in_plane = (f.normals[i] - along * axis).length();
+            f.pads[i] = d_par * in_plane + eta * along.abs();
+        }
+        f
     }
 
     /// Inclusive direction-containment against the active planes (`slack`
@@ -81,13 +125,14 @@ impl TileFrustum {
     /// efficiency, never correctness.
     #[inline]
     fn aabb_outside(&self, aabb: &Aabb) -> bool {
-        for n in &self.normals[..self.n_planes] {
+        for (n, pad) in self.normals[..self.n_planes].iter().zip(&self.pads) {
             // positive vertex: the box corner farthest along the plane normal
             let pv = Vec3A::select(n.cmpge(Vec3A::ZERO), aabb.max, aabb.min);
             let rel = pv - self.origin;
-            // eps pushes the plane outward slightly (fp slack, safe direction)
+            // eps pushes the plane outward slightly (fp slack, safe direction);
+            // pad relaxes it further for shared-apex frustums (zero elsewhere)
             let eps = 1e-5 * (1.0 + rel.abs().max_element());
-            if n.dot(rel) < -eps {
+            if n.dot(rel) < -eps - pad {
                 return true;
             }
         }
