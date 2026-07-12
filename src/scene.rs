@@ -543,23 +543,62 @@ pub fn load_obj_scene(path: &str) -> Scene {
         tex_ids.insert(p, id);
     }
 
+    let mut class_counts = vec![0u32; crate::matclass::NAMES.len()];
     let mat_map: Vec<u32> = obj_mats
         .iter()
         .map(|m| {
-            let kd = Vec3A::from_array(m.diffuse.unwrap_or([0.7, 0.7, 0.7]));
+            let mut kd = Vec3A::from_array(m.diffuse.unwrap_or([0.7, 0.7, 0.7]));
             let tex = m
                 .diffuse_texture
                 .as_ref()
                 .and_then(|t| tex_ids.get(&obj_dir.join(t.replace('\\', "/"))).copied());
-            match tex {
+            // Classify by texture filename stem (the MTL's only reliable
+            // signal — see matclass.rs), falling back to the material name
+            // and the Ns/illum heuristic for the untextured glassware.
+            let stem = m.diffuse_texture.as_ref().map(|t| {
+                let t = t.replace('\\', "/");
+                let file = t.rsplit('/').next().unwrap_or(&t);
+                file.split('.').next().unwrap_or(file).to_ascii_lowercase()
+            });
+            let (class, pbr) =
+                crate::matclass::classify(stem.as_deref(), &m.name, m.shininess, m.illumination_model);
+            class_counts[class] += 1;
+            if pbr.transmission > 0.0 {
+                // Transmitted light is tinted by albedo and San Miguel's
+                // glass Kd is 0.1-0.2 dark — lift toward white or glass
+                // renders near-black.
+                kd = Vec3A::ONE.lerp(kd, 0.2);
+            }
+            let kind = match tex {
                 // The texture REPLACES Kd (exporters set Kd = 1 alongside
                 // map_Kd; multiplying would double-darken). Kd stays as the
                 // flat fallback for paths without texture support (GPU).
-                Some(tex) => b.material_kind(kd, 0.8, 0.0, 0.0, MatKind::Textured { tex }),
-                None => b.material(kd, 0.8, 0.0),
-            }
+                Some(tex) => MatKind::Textured { tex },
+                None => MatKind::Diffuse,
+            };
+            b.material_full(Material {
+                albedo: kd,
+                roughness: pbr.roughness,
+                metallic: pbr.metallic,
+                anisotropy: 0.0,
+                sheen: pbr.sheen,
+                translucency: pbr.translucency,
+                transmission: pbr.transmission,
+                kind,
+            })
         })
         .collect();
+    if !obj_mats.is_empty() {
+        let mut parts: Vec<(usize, u32)> = class_counts.iter().copied().enumerate().collect();
+        parts.sort_by_key(|&(i, n)| (std::cmp::Reverse(n), i));
+        let body = parts
+            .iter()
+            .filter(|&&(i, n)| n > 0 || crate::matclass::NAMES[i] == "default")
+            .map(|&(i, n)| format!("{} {}", crate::matclass::NAMES[i], n))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        eprintln!("obj materials: {} -> {}", obj_mats.len(), body);
+    }
 
     add_obj_models(
         &mut b,

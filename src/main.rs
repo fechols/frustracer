@@ -9,6 +9,7 @@ mod hemi;
 mod gpu;
 #[cfg(windows)]
 mod input;
+mod matclass;
 // OIDN loads its DLLs through the Win32 loader; the denoiser itself is
 // CPU/GPU-agnostic but the SDK drop and load path here are Windows-only.
 #[cfg(windows)]
@@ -4511,6 +4512,20 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
     };
 
+    // Material-classifier self-test — deterministic spot checks over the
+    // real San Miguel naming patterns (keyword precedence, whole-token
+    // safety, the name/Ns/illum fallback tiers).
+    let matclass_ok = match matclass::self_test() {
+        Ok(()) => {
+            eprintln!("matclass self-test: OK");
+            true
+        }
+        Err(e) => {
+            eprintln!("matclass self-test: FAIL — {e}");
+            false
+        }
+    };
+
     let rep = render::verify(scene, bvh, &cam, q, rw, rh, &stats, None, &[], None);
     eprintln!(
         "verify full-depth ({} px): false-sky {} | tmin-overshoot {} | hybrid-extra {} | max rel t err {:.2e}",
@@ -6018,6 +6033,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     if sph_ok
         && reproj_ok
         && nppd_ok
+        && matclass_ok
         && hemi_ok
         && gi_ok
         && hemi_share_ok
