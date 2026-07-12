@@ -572,6 +572,8 @@ struct GpuBvhNode {
 }
 
 /// scene.rs::Material packed for StructuredBuffer<Mat> (shade.hlsli).
+/// 48 B — the HLSL `Mat` mirrors this field-for-field; a stride skew reads
+/// garbage, so the two must move in the same commit.
 #[repr(C)]
 struct GpuMat {
     albedo: [f32; 3],
@@ -580,6 +582,13 @@ struct GpuMat {
     anisotropy: f32,
     kind: u32, // 0 = diffuse, 1 = marble
     scale: f32,
+    sheen: f32,
+    translucency: f32,
+    /// Read only by the deferral note today — GPU transmission is not yet
+    /// ported (the DXR RTPSO's MaxTraceRecursionDepth = 2 can't host the
+    /// refraction chain either); transmissive materials shade opaque.
+    transmission: f32,
+    _pad: f32,
 }
 
 fn as_bytes<T>(v: &[T]) -> &[u8] {
@@ -676,6 +685,10 @@ impl SceneGpu {
                     MatKind::Marble { scale } => scale,
                     _ => 0.0,
                 },
+                sheen: m.sheen,
+                translucency: m.translucency,
+                transmission: m.transmission,
+                _pad: 0.0,
             })
             .collect();
         let n_tex = scene
@@ -685,6 +698,10 @@ impl SceneGpu {
             .count();
         if n_tex > 0 {
             eprintln!("gpu: {n_tex} textured materials render with flat MTL albedo (GPU textures not yet ported)");
+        }
+        let n_trans = scene.materials.iter().filter(|m| m.transmission > 0.0).count();
+        if n_trans > 0 {
+            eprintln!("gpu: {n_trans} transmissive materials render opaque (GPU transmission not yet ported)");
         }
 
         let srv = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;

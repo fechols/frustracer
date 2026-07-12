@@ -23,6 +23,8 @@ StructuredBuffer<uint>   tri_mat   : register(t5);
 #define MAT_DIFFUSE 0u
 #define MAT_MARBLE  1u
 
+// Mirrors trace.rs::GpuMat field-for-field (48 B) — a stride skew reads
+// garbage; the two must move in the same commit.
 struct Mat {
     float3 albedo;
     float roughness;
@@ -30,6 +32,10 @@ struct Mat {
     float anisotropy;
     uint kind;
     float scale; // marble feature frequency
+    float sheen;
+    float translucency;
+    float transmission; // not consumed: GPU transmission not yet ported
+    float _pad;
 };
 StructuredBuffer<Mat> materials : register(t6);
 
