@@ -10,6 +10,7 @@
 pub mod adapter;
 pub mod d3d12;
 pub mod dxc;
+pub mod dxr;
 pub mod ffx;
 pub mod ffx_rr;
 pub mod ffx_sys;
@@ -91,6 +92,9 @@ pub struct GpuContext {
     /// RayQuery rays. Lives on whatever device the queue runs on (v1 forces
     /// the native pipeline — main.rs disables DLSS/XeSS/OIDN under --gpu).
     trace: Option<trace::TraceGpu>,
+    /// The DXR DispatchRays pipeline (the F key): lazily built on first
+    /// enable, window-res, plain presentation via SRV_SLOT_DXR.
+    dxr: Option<dxr::DxrGpu>,
     rr: Option<rr::RrResources>,
     /// XeSS-SR (native pipeline only; never coexists with `sl`). Explicitly
     /// torn down by GpuContext::drop after a queue drain — xessDestroyContext
@@ -391,6 +395,7 @@ impl GpuContext {
             blit,
             hdr,
             trace: None,
+            dxr: None,
             rr: rr_res,
             xess: xess_state,
             fsr: fsr_state,
@@ -576,6 +581,81 @@ impl GpuContext {
 
     pub fn trace_ready(&self) -> bool {
         self.trace.is_some()
+    }
+
+    /// Build the DXR DispatchRays pipeline (the F key / --dxr). Idempotent —
+    /// a live pipeline is kept. Window-res; scene buffers + BLAS/TLAS build
+    /// once here (the scene is static, --stress included).
+    pub fn init_dxr(
+        &mut self,
+        dxc: &dxc::Dxc,
+        scene: &crate::scene::Scene,
+        bvh: &crate::bvh::Bvh,
+        debug: bool,
+    ) -> Result<()> {
+        if self.dxr.is_some() {
+            return Ok(());
+        }
+        let mut d = dxr::DxrGpu::new(
+            &self.d3d.device,
+            dxc,
+            scene,
+            bvh,
+            self.d3d.width,
+            self.d3d.height,
+            debug,
+        )?;
+        let mut rec = Ok(());
+        self.d3d.run_once(|l| rec = d.scene.record_upload(l))?;
+        rec?;
+        d.scene.free_staging();
+        self.passes.create_srv(
+            &self.d3d.device,
+            &d.hdr,
+            windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+            tonemap::SRV_SLOT_DXR,
+        );
+        self.dxr = Some(d);
+        Ok(())
+    }
+
+    /// One DXR frame: constants -> DispatchRays -> resolve -> tonemap ->
+    /// present. `samples` divides the accumulation (the present_trace shape).
+    pub fn present_dxr(&mut self, p: &trace::FrameParams, samples: u32) -> Result<()> {
+        crate::zone!("present-dxr");
+        let Some(d) = &self.dxr else {
+            return Err("DXR pipeline not initialized".into());
+        };
+        let slot = self.d3d.begin_frame()?;
+        d.write_cb(slot, p);
+        if let Err(e) = d.record_frame(&self.d3d.list, slot) {
+            self.d3d.abort_frame();
+            return Err(e);
+        }
+        d.record_resolve(&self.d3d.list, slot, samples);
+        self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_DXR, 1.0);
+        self.d3d.end_frame(slot)
+    }
+
+    /// Re-present the last resolved DXR frame without tracing — the
+    /// converged-idle path (present_hold's contract: record_resolve left hdr
+    /// in PIXEL_SHADER_RESOURCE).
+    pub fn present_dxr_hold(&mut self) -> Result<()> {
+        if self.dxr.is_none() {
+            return Err("DXR pipeline not initialized".into());
+        }
+        let slot = self.d3d.begin_frame()?;
+        self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_DXR, 1.0);
+        self.d3d.end_frame(slot)
+    }
+
+    /// Screenshot path for DXR mode (the image exists only on the GPU).
+    pub fn read_dxr_output(&mut self) -> Result<(Vec<u32>, usize, usize)> {
+        let Some(d) = &self.dxr else {
+            return Err("DXR pipeline not initialized".into());
+        };
+        let output = d.hdr.clone();
+        self.read_hdr_output(output)
     }
 
     /// Whether the GPU-resident NPPD stage came up (`--gpu --nppd`; the J

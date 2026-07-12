@@ -91,6 +91,13 @@ pub struct FrameCtx<'a> {
     /// node's cone skips its bound query and re-refines that node's cut.
     /// None is the kill switch (distance seeds still work).
     pub cut_prev: Option<&'a temporal::CutStore>,
+    /// A/B/C lever (--discard-seeds): run every temporal lookup at full cost
+    /// (ring retries included, cells counted) but consume NOTHING — no sky
+    /// fill, no t_start seed, no query skip. Trace results are then identical
+    /// to --no-temporal while still paying lookup + cache/cut production, so
+    /// wall-clock differences isolate the machinery's cost from its benefit:
+    /// (this − --no-temporal) = pure cost, (default − this) = gross benefit.
+    pub discard_seeds: bool,
 }
 
 impl FrameCtx<'_> {
@@ -234,7 +241,12 @@ fn trace_tile(
     // means the bound query is skipped this tile.
     let mut adopted: Option<(Option<(u32, u32)>, u32)> = None;
     if !ctx.tcache_prev.is_empty() {
-        match temporal::lookup(ctx.tcache_prev, ctx.cut_prev, &ctx.cam, ctx.rw, ctx.rh, x0, y0, x1, y1, t_start, depth, path, &mut ls) {
+        let seed = temporal::lookup(ctx.tcache_prev, ctx.cut_prev, &ctx.cam, ctx.rw, ctx.rh, x0, y0, x1, y1, t_start, depth, path, &mut ls);
+        // --discard-seeds: the lookup ran at full cost (cells counted above),
+        // but nothing may be consumed — the trace below must be identical to
+        // a --no-temporal frame for the A/B/C differencing to mean anything.
+        let seed = if ctx.discard_seeds { temporal::Seed::None } else { seed };
+        match seed {
             temporal::Seed::Sky => {
                 // The whole frustum was proven empty last frame; still true.
                 if let Some(cur) = ctx.tcache_cur {
@@ -1301,6 +1313,7 @@ pub fn verify(
         replay_rec: None,
         cut_cur: None,
         cut_prev: temporal_cuts,
+        discard_seeds: false,
     };
     match max_depth {
         Some(d) => render_frame_capped(&ctx, d),

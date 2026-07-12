@@ -29,6 +29,39 @@ RWTexture2D<float4> nppd_feed_color : register(u16); // the XeSS color plane
 // nppd::pad_dims — round up to the /32 padding quantum.
 uint pad32(uint v) { return (v + 31u) & ~31u; }
 
+// f32 -> f16 -> f32 round-trip with round-to-nearest-even, mirroring the CPU
+// G-buffer storage narrowing (dlss.rs st16/ld16: every plane except depth
+// holds f16 bits). The GPU-born pack keeps full f32, so quantizing at these
+// reads is what keeps cs_nppd_pack/cs_nppd_warp term-for-term with
+// nppd::pack_inputs/warp_temporal, whose GBufs loads are f16 — check-gpu M10
+// gates the parity bit-exactly. Not the f32tof16 intrinsic: the legacy DXIL
+// op truncates (RTZ) while st16 rounds to nearest even.
+float q16(float v) {
+    uint x = asuint(v);
+    uint s = (x >> 16u) & 0x8000u;
+    x &= 0x7FFFFFFFu;
+    uint h;
+    if (x >= 0x47800000u) {            // >= 2^16: overflow -> inf; keep nan
+        h = x > 0x7F800000u ? 0x7E00u : 0x7C00u;
+    } else if (x >= 0x38800000u) {     // f16 normal range [2^-14, 2^16)
+        h = (((x >> 23u) - 112u) << 10u) | ((x >> 13u) & 0x3FFu);
+        uint rem = x & 0x1FFFu;
+        // RTNE; a mantissa carry may bump the exponent, [65520, 65536)
+        // correctly lands on inf.
+        if (rem > 0x1000u || (rem == 0x1000u && (h & 1u) != 0u)) h += 1u;
+    } else if (x >= 0x33000000u) {     // f16 subnormal range [2^-25, 2^-14)
+        uint shift = 126u - (x >> 23u); // 14..24
+        uint m = (x & 0x7FFFFFu) | 0x800000u;
+        h = m >> shift;
+        uint rem = m & ((1u << shift) - 1u);
+        uint halfb = 1u << (shift - 1u);
+        if (rem > halfb || (rem == halfb && (h & 1u) != 0u)) h += 1u;
+    } else {                           // < 2^-25 underflows to signed zero
+        h = 0u;
+    }
+    return f16tof32(s | h);
+}
+
 // nppd::pack_inputs: one thread per PADDED pixel; the border replicates the
 // edge texel (clamped source coords — a zero border would be a synthetic
 // edge the U-Net denoises against). ch0 is ln(1 + 1/d) of the EUCLIDEAN
@@ -58,13 +91,17 @@ void cs_nppd_pack(uint3 id : SV_DispatchThreadID) {
     float3 f = cam_forward.xyz;
     float3 r = normalize(cross(f, float3(0.0, 1.0, 0.0)));
     float3 u = cross(r, f);
-    nppd_frame[o + pp]      = dot(g.nr.xyz, f);
-    nppd_frame[o + 2u * pp] = dot(g.nr.xyz, r);
-    nppd_frame[o + 3u * pp] = dot(g.nr.xyz, u);
+    // q16: the CPU reads these planes through ld16 (f16 storage) — see the
+    // helper's contract note. view_z (ch0 above) and accum (ch7-9 below)
+    // stay full f32 on both sides.
+    float3 n = float3(q16(g.nr.x), q16(g.nr.y), q16(g.nr.z));
+    nppd_frame[o + pp]      = dot(n, f);
+    nppd_frame[o + 2u * pp] = dot(n, r);
+    nppd_frame[o + 3u * pp] = dot(n, u);
 
-    nppd_frame[o + 4u * pp] = g.alb_z.x;
-    nppd_frame[o + 5u * pp] = g.alb_z.y;
-    nppd_frame[o + 6u * pp] = g.alb_z.z;
+    nppd_frame[o + 4u * pp] = q16(g.alb_z.x);
+    nppd_frame[o + 5u * pp] = q16(g.alb_z.y);
+    nppd_frame[o + 6u * pp] = q16(g.alb_z.z);
 
     uint i3 = si * 3u;
     nppd_frame[o + 7u * pp] = accum[i3];
@@ -88,8 +125,9 @@ void cs_nppd_warp(uint3 id : SV_DispatchThreadID) {
         return;
     }
     GBufPx g = gbuf[id.y * rw + id.x];
-    float px = float(id.x) + g.mv.x;
-    float py = float(id.y) + g.mv.y;
+    // q16: warp_temporal fetches the offset through ld16 (f16 mvec plane).
+    float px = float(id.x) + q16(g.mv.x);
+    float py = float(id.y) + q16(g.mv.y);
     float x0f = floor(px), y0f = floor(py);
     float fx = px - x0f, fy = py - y0f;
     int x0 = int(x0f), y0 = int(y0f);

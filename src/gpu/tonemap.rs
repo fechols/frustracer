@@ -28,8 +28,10 @@ pub const SRV_SLOT_RR: u32 = 2;
 pub const SRV_SLOT_XESS: u32 = 3;
 /// The GPU-resident tracer's resolved HDR output (gpu/trace.rs).
 pub const SRV_SLOT_GPU: u32 = 4;
+/// The DXR pipeline's resolved HDR output (gpu/dxr.rs).
+pub const SRV_SLOT_DXR: u32 = 5;
 /// The FSR4 upscaled output (gpu/ffx_rr.rs).
-pub const SRV_SLOT_FSR: u32 = 5;
+pub const SRV_SLOT_FSR: u32 = 6;
 /// Room for the DLSS-RR output SRV and future debug views.
 const SRV_HEAP_CAPACITY: u32 = 8;
 
