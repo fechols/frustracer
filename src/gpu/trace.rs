@@ -128,7 +128,7 @@ pub const HEMI_BATCH: u32 = 16384;
 /// Max fb.depth the hemi queue sizing supports (presets top out at 4).
 const HEMI_MAX_DEPTH: u32 = 4;
 
-const CB_STRIDE: usize = 512; // root-CBV alignment (FrameCb is 304 bytes)
+pub(crate) const CB_STRIDE: usize = 512; // root-CBV alignment (FrameCb is 304 bytes)
 
 /// Quadtree depth to the leaf frontier: smallest D with
 /// max(rw, rh) / 2^D <= LEAF_TILE (temporal.rs uses the same formula).
@@ -144,15 +144,17 @@ pub fn depth_full(rw: u32, rh: u32) -> u32 {
 }
 
 const SMOKE_HLSL: &str = include_str!("shaders/smoke.hlsl");
-const TRACE_COMMON_HLSLI: &str = include_str!("shaders/trace_common.hlsli");
+// pub(crate): gpu/dxr.rs pastes the same prelude/shading/resolve sources
+// into its DXR library (the kernels are single-sourced on disk).
+pub(crate) const TRACE_COMMON_HLSLI: &str = include_str!("shaders/trace_common.hlsli");
 const CTR_HLSLI: &str = include_str!("shaders/ctr.hlsli");
 const QUEUES_HLSLI: &str = include_str!("shaders/queues.hlsli");
 const FRUSTUM_HLSLI: &str = include_str!("shaders/frustum.hlsli");
 const RT_HLSLI: &str = include_str!("shaders/rt.hlsli");
-const SHADE_HLSLI: &str = include_str!("shaders/shade.hlsli");
+pub(crate) const SHADE_HLSLI: &str = include_str!("shaders/shade.hlsli");
 const HEMI_HLSLI: &str = include_str!("shaders/hemi.hlsli");
 const REFERENCE_HLSL: &str = include_str!("shaders/reference.hlsl");
-const RESOLVE_HLSL: &str = include_str!("shaders/resolve.hlsl");
+pub(crate) const RESOLVE_HLSL: &str = include_str!("shaders/resolve.hlsl");
 const WAVEFRONT_HLSL: &str = include_str!("shaders/wavefront.hlsl");
 const LEAF_HLSL: &str = include_str!("shaders/leaf.hlsl");
 const HEMI_WAVE_HLSL: &str = include_str!("shaders/hemi_wave.hlsl");
@@ -878,9 +880,12 @@ pub const FLAG_HAS_PREV: u32 = 32;
 
 /// Mirror of `cbuffer Frame` in trace_common.hlsli (304 bytes, 16-aligned
 /// rows — float3s ride in float4 slots with scalars packed in .w).
+/// pub(crate): gpu/dxr.rs shares the layout (its lib pastes the same
+/// trace_common.hlsli); fields stay module-private — outside constructors go
+/// through `FrameCb::base`/`with_frame`.
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct FrameCb {
+pub(crate) struct FrameCb {
     cam_origin: [f32; 4],
     cam_forward: [f32; 4],
     cam_right: [f32; 4],
@@ -923,6 +928,103 @@ struct FrameCb {
 // The HLSL cbuffer is hand-mirrored across 7 concatenated compile units —
 // a size drift here corrupts every field after the drift point.
 const _: () = assert!(std::mem::size_of::<FrameCb>() == 304);
+
+impl FrameCb {
+    /// The scene-static base: sun/light/eps/ao_radius, near/far riding the
+    /// prev rows' w slots, rw/rh. Queue capacities zero — the wavefront
+    /// tracer overwrites its own; the DXR pipeline never reads them.
+    pub(crate) fn base(scene: &Scene, rw: u32, rh: u32) -> FrameCb {
+        let sun = crate::render::sun_dir(scene);
+        let (near, far) = crate::dlss::near_far(scene.diag);
+        let v4 = |v: Vec3A, w: f32| [v.x, v.y, v.z, w];
+        FrameCb {
+            cam_origin: [0.0; 4],
+            cam_forward: [0.0; 4],
+            cam_right: [0.0; 4],
+            cam_up: [0.0; 4],
+            sun: v4(sun, 0.0),
+            light_center: v4(scene.light.center, scene.eps),
+            light_u: v4(scene.light.u, scene.ao_radius),
+            light_v: v4(scene.light.v, 0.0),
+            light_color: v4(scene.light.color, 0.0),
+            rw,
+            rh,
+            frame: 0,
+            flags: 0,
+            shadow_samples: 0,
+            ao_samples: 0,
+            reflections: 0,
+            _pad0: 0,
+            frame_jitter: [0.0, 0.0],
+            _pad1: 0.0,
+            _pad2: 0.0,
+            cap_tile: 0,
+            cap_leaf: 0,
+            cap_sky: 0,
+            cap_cut: 0,
+            fb_mode: 0,
+            fb_depth: 2,
+            hemi_batch: HEMI_BATCH,
+            cap_hemi_pt: rw * rh,
+            cap_hemi_cell: 0,
+            cap_hemi_leaf: 0,
+            cap_hemi_cut: 0,
+            _pad3: 0,
+            prev_origin: [0.0; 4],
+            prev_forward: [0.0; 4],
+            prev_right: [0.0, 0.0, 0.0, near],
+            prev_up: [0.0, 0.0, 0.0, far],
+        }
+    }
+
+    /// The per-frame fields folded onto the static base — the single source
+    /// for the FrameParams -> cbuffer mapping (both dispatch flavors).
+    pub(crate) fn with_frame(&self, p: &FrameParams, gbuf_full: bool) -> FrameCb {
+        let (origin, forward, right, up, inv_w, inv_h) = p.cam.gpu_fields();
+        let mut cb = *self;
+        cb.cam_origin = [origin.x, origin.y, origin.z, inv_w];
+        cb.cam_forward = [forward.x, forward.y, forward.z, inv_h];
+        cb.cam_right = [right.x, right.y, right.z, 0.0];
+        cb.cam_up = [up.x, up.y, up.z, 0.0];
+        cb.frame = p.frame;
+        cb.flags = (p.accumulate as u32 * FLAG_ACCUM)
+            | (p.jitter as u32 * FLAG_JITTER)
+            | (p.frame_jitter.is_some() as u32 * FLAG_FRAME_JITTER)
+            | (p.verify as u32 * FLAG_VERIFY)
+            | (gbuf_full as u32 * FLAG_GBUF)
+            | (p.prev_cam.is_some() as u32 * FLAG_HAS_PREV);
+        cb.shadow_samples = p.q.shadow_samples;
+        cb.ao_samples = p.q.ao_samples;
+        cb.reflections = p.q.reflections as u32;
+        cb.frame_jitter = match p.frame_jitter {
+            Some((x, y)) => [x, y],
+            None => [0.0, 0.0],
+        };
+        cb.fb_mode = fb_mode_of(&p.q);
+        cb.fb_depth = p.q.fb.depth.clamp(1, HEMI_MAX_DEPTH);
+        if let Some(pc) = &p.prev_cam {
+            // The near/far riding the w slots of the last two rows come from
+            // the base and must survive the overwrite.
+            let (po, pf, pr, pu, piw, pih) = pc.gpu_fields();
+            cb.prev_origin = [po.x, po.y, po.z, piw];
+            cb.prev_forward = [pf.x, pf.y, pf.z, pih];
+            cb.prev_right = [pr.x, pr.y, pr.z, cb.prev_right[3]];
+            cb.prev_up = [pu.x, pu.y, pu.z, cb.prev_up[3]];
+        }
+        cb
+    }
+
+    /// Copy into a persistently-mapped CB ring slot.
+    pub(crate) fn store(&self, ptr: *mut u8) {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self as *const FrameCb as *const u8,
+                ptr,
+                std::mem::size_of::<FrameCb>(),
+            )
+        };
+    }
+}
 
 /// Everything that varies per frame, CPU-side.
 pub struct FrameParams {
@@ -1078,7 +1180,7 @@ impl TraceGpu {
                 .join("\n");
         let compose_src = [TRACE_COMMON_HLSLI, CTR_HLSLI, QUEUES_HLSLI, COMPOSE_HLSL].join("\n");
         let feed_src = [TRACE_COMMON_HLSLI, FEED_HLSL].join("\n");
-        let mut pso = |src: &str, entry: &str, what: &str| -> Result<ID3D12PipelineState> {
+        let pso = |src: &str, entry: &str, what: &str| -> Result<ID3D12PipelineState> {
             compute_pso(device, &root_sig, &dxc.compile(src, entry, "cs_6_5", what, debug)?, what)
         };
         let pso_reference = pso(&reference_src, "cs_reference", "reference")?;
@@ -1266,49 +1368,17 @@ impl TraceGpu {
             name(&n2.out, "trace.nppd_out");
         }
 
-        // Scene-static CB fields, prefilled once. near/far ride the prev
-        // block's w slots (dlss::near_far — the G-buffer sky depth source).
-        let sun = crate::render::sun_dir(scene);
-        let (near, far) = crate::dlss::near_far(scene.diag);
-        let v4 = |v: Vec3A, w: f32| [v.x, v.y, v.z, w];
-        let cb_base = FrameCb {
-            cam_origin: [0.0; 4],
-            cam_forward: [0.0; 4],
-            cam_right: [0.0; 4],
-            cam_up: [0.0; 4],
-            sun: v4(sun, 0.0),
-            light_center: v4(scene.light.center, scene.eps),
-            light_u: v4(scene.light.u, scene.ao_radius),
-            light_v: v4(scene.light.v, 0.0),
-            light_color: v4(scene.light.color, 0.0),
-            rw,
-            rh,
-            frame: 0,
-            flags: 0,
-            shadow_samples: 0,
-            ao_samples: 0,
-            reflections: 0,
-            _pad0: 0,
-            frame_jitter: [0.0, 0.0],
-            _pad1: 0.0,
-            _pad2: 0.0,
-            cap_tile: cap_tile as u32,
-            cap_leaf: cap_leaf as u32,
-            cap_sky: cap_sky as u32,
-            cap_cut: cap_cut as u32,
-            fb_mode: 0,
-            fb_depth: 2,
-            hemi_batch: HEMI_BATCH,
-            cap_hemi_pt: rw * rh,
-            cap_hemi_cell: cap_hemi_cell as u32,
-            cap_hemi_leaf: cap_hemi_cell as u32,
-            cap_hemi_cut: cap_hemi_cut as u32,
-            _pad3: 0,
-            prev_origin: [0.0; 4],
-            prev_forward: [0.0; 4],
-            prev_right: [0.0, 0.0, 0.0, near],
-            prev_up: [0.0, 0.0, 0.0, far],
-        };
+        // Scene-static CB fields, prefilled once (near/far ride the prev
+        // block's w slots — dlss::near_far, the G-buffer sky depth source),
+        // plus this tracer's queue capacities.
+        let mut cb_base = FrameCb::base(scene, rw, rh);
+        cb_base.cap_tile = cap_tile as u32;
+        cb_base.cap_leaf = cap_leaf as u32;
+        cb_base.cap_sky = cap_sky as u32;
+        cb_base.cap_cut = cap_cut as u32;
+        cb_base.cap_hemi_cell = cap_hemi_cell as u32;
+        cb_base.cap_hemi_leaf = cap_hemi_cell as u32;
+        cb_base.cap_hemi_cut = cap_hemi_cut as u32;
 
         Ok(Self {
             root_sig,
@@ -1367,44 +1437,9 @@ impl TraceGpu {
 
     /// Write this frame's constants into the given ring slot.
     pub fn write_cb(&self, slot: usize, p: &FrameParams) {
-        let (origin, forward, right, up, inv_w, inv_h) = p.cam.gpu_fields();
-        let mut cb = self.cb_base;
-        cb.cam_origin = [origin.x, origin.y, origin.z, inv_w];
-        cb.cam_forward = [forward.x, forward.y, forward.z, inv_h];
-        cb.cam_right = [right.x, right.y, right.z, 0.0];
-        cb.cam_up = [up.x, up.y, up.z, 0.0];
-        cb.frame = p.frame;
-        cb.flags = (p.accumulate as u32 * FLAG_ACCUM)
-            | (p.jitter as u32 * FLAG_JITTER)
-            | (p.frame_jitter.is_some() as u32 * FLAG_FRAME_JITTER)
-            | (p.verify as u32 * FLAG_VERIFY)
-            | (self.gbuf_full as u32 * FLAG_GBUF)
-            | (p.prev_cam.is_some() as u32 * FLAG_HAS_PREV);
-        cb.shadow_samples = p.q.shadow_samples;
-        cb.ao_samples = p.q.ao_samples;
-        cb.reflections = p.q.reflections as u32;
-        cb.frame_jitter = match p.frame_jitter {
-            Some((x, y)) => [x, y],
-            None => [0.0, 0.0],
-        };
-        cb.fb_mode = fb_mode_of(&p.q);
-        cb.fb_depth = p.q.fb.depth.clamp(1, HEMI_MAX_DEPTH);
-        if let Some(pc) = &p.prev_cam {
-            // The near/far riding the w slots of the last two rows come from
-            // cb_base and must survive the overwrite.
-            let (po, pf, pr, pu, piw, pih) = pc.gpu_fields();
-            cb.prev_origin = [po.x, po.y, po.z, piw];
-            cb.prev_forward = [pf.x, pf.y, pf.z, pih];
-            cb.prev_right = [pr.x, pr.y, pr.z, cb.prev_right[3]];
-            cb.prev_up = [pu.x, pu.y, pu.z, cb.prev_up[3]];
-        }
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                &cb as *const FrameCb as *const u8,
-                self.frame_cb.ptr.add(slot * CB_STRIDE),
-                std::mem::size_of::<FrameCb>(),
-            )
-        };
+        self.cb_base
+            .with_frame(p, self.gbuf_full)
+            .store(unsafe { self.frame_cb.ptr.add(slot * CB_STRIDE) });
     }
 
     /// Bind the shared root signature + everything every kernel might read.
