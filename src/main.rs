@@ -2984,6 +2984,7 @@ fn run_check_nppd(
             prev_cam: prev,
             frame_jitter: None,
             adaptive: false,
+            hemi_share: false, // inert: the NPPD contract pins fb OFF
             replay_rec: None,
             cut_cur: None,
             cut_prev: None,
