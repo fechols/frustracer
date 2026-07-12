@@ -300,6 +300,9 @@ pub fn shade(
     // without retuning scene brightness.
     let mut direct_d = Vec3A::ZERO;
     let mut direct_s = Vec3A::ZERO;
+    // Thin-surface diffuse transmission (foliage): light arriving from BEHIND
+    // the surface, gathered in the ndl <= 0 arm below.
+    let mut direct_t = Vec3A::ZERO;
     // Light-shaft culling (fb.shadows): identical sampling and integrand —
     // the shaft only removes occlusion rays for samples in subrects proven
     // unoccluded, and seeds the remaining (penumbra) rays from its cut with
@@ -340,6 +343,38 @@ pub fn shade(
                 r.light_uv[si] = (su, sv);
                 r.occluded[si] = true;
                 r.below_horizon = true;
+            }
+            // Thin-surface transmission: a back-lit translucent surface
+            // (leaves) receives the light through itself. The occlusion ray
+            // starts on the TRANSMITTED side (p is hit + n·eps, so -2·eps
+            // lands at hit - n·eps — the exact mirror of the front
+            // convention; the ray departs the leaf's plane on the side it
+            // starts on and never re-crosses its own triangle). Plain
+            // `occluded`: no cut exists for this apex, and the shaft's
+            // tangent-plane clip makes `classify` valid only for wi·n > 0.
+            // Consumes no rng draws — stream alignment is untouched.
+            if mat.translucency > 0.0 && ndl < 0.0 {
+                let back_occluded = match &vis {
+                    // The rep's traced bit is segment occlusion between the
+                    // same two points — normal-independent within 2·eps.
+                    VisCtl::Apply(r) => {
+                        ls.adapt_rays_saved += 1;
+                        r.occluded[si]
+                    }
+                    _ => {
+                        ls.secondary_rays += 1;
+                        bvh.occluded(
+                            scene,
+                            &Ray::new(p - n * (2.0 * scene.eps), wi),
+                            0.0,
+                            dist - scene.eps,
+                            &mut ls.ray_nodes,
+                        )
+                    }
+                };
+                if !back_occluded {
+                    direct_t += scene.light.color * ((-ndl) / dist2);
+                }
             }
             continue;
         }
@@ -408,6 +443,7 @@ pub fn shade(
     if n_shadow > 0 {
         direct_d /= n_shadow as f32;
         direct_s /= n_shadow as f32;
+        direct_t /= n_shadow as f32;
     }
     if let VisCtl::Capture(r) = &mut vis {
         r.n_light = n_shadow;
@@ -484,8 +520,12 @@ pub fn shade(
     };
 
     // Ambient stays diffuse-only; metals get their environment from the
-    // specular bounce ray below.
-    let mut color = kd * (direct_d + ambient) + direct_s;
+    // specular bounce ray below. Translucency splits the diffuse budget
+    // between the front Lambert term and the transmitted back term
+    // (energy-conserving; ambient stays front-only). kd is the sampled
+    // textured albedo, so back-lit leaves glow in their own colors.
+    let tl = mat.translucency;
+    let mut color = kd * (direct_d * (1.0 - tl) + direct_t * tl + ambient) + direct_s;
 
     // One specular bounce: a single direction importance-sampled from the
     // anisotropic GGX VNDF (Heitz 2018), so glossy surfaces see a blurred
