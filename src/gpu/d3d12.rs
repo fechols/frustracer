@@ -246,6 +246,30 @@ impl D3d {
         self.wait_for_fence(v)
     }
 
+    /// Close + execute the list MID-frame — no Present, no fence wait — then
+    /// reset it on the same slot's allocator and keep recording. Sound: an
+    /// allocator may back multiple closed lists (only the allocator reset in
+    /// `begin_frame` needs the fence), and the GPU consumes the submissions
+    /// in queue order — single-queue FIFO is the synchronization. For work
+    /// that must be ON the queue before an external submitter (ONNX
+    /// Runtime's DML EP in the NPPD composition) appends its own.
+    /// The slot's fence IS advanced past the executed half: `abort_frame`
+    /// leaves the fence untouched, so without this a post-split error would
+    /// let the next `begin_frame` reset the allocator under the still-running
+    /// submission. On the success path `end_frame` overwrites it with a later
+    /// value — the Signal is pure error-path insurance, never waited on here.
+    pub fn split_frame(&mut self, slot: usize) -> Result<()> {
+        unsafe { self.list.Close() }.map_err(|e| format!("split Close: {e}"))?;
+        let lists = [Some(self.list.cast::<ID3D12CommandList>().unwrap())];
+        unsafe { self.queue.ExecuteCommandLists(&lists) };
+        let v = self.next_fence;
+        self.next_fence += 1;
+        unsafe { self.queue.Signal(&self.fence, v) }.map_err(|e| format!("queue Signal: {e}"))?;
+        self.slots[slot].fence_value = v;
+        unsafe { self.list.Reset(&self.slots[slot].allocator, None) }
+            .map_err(|e| format!("split list Reset: {e}"))
+    }
+
     pub fn wait_idle(&mut self) -> Result<()> {
         let v = self.next_fence;
         self.next_fence += 1;

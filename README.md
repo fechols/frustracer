@@ -132,6 +132,11 @@ cargo run --release -- --stress 5000  # perf test: field of n objects (boxes/sph
 cargo run --release -- --check        # headless: verify vs reference, benchmark, write check.png
 cargo run --release -- --check-dlss   # headless: DLSS G-buffer MV/depth/matrix self-test
 cargo run --release -- --no-dlss      # skip Streamline; native D3D12 presentation
+cargo run --release -- --nppd         # NPPD neural denoising before an XeSS upscale (needs
+                                      # onnxruntime.dll + an exported model — see
+                                      # tools/nppd-export/README.md; --no-xess = standalone)
+cargo run --release -- --gpu --nppd   # the same composition GPU-resident: ONNX Runtime executes
+                                      # on the tracer's own D3D12 queue, zero per-frame CPU traffic
 ```
 
 Debug builds are ~10× too slow to judge anything — always use `--release`.
@@ -149,6 +154,23 @@ exists (or point `--sl-path` / `FRUSTRACER_SL_PATH` at any directory holding
 the DLLs). Without the DLLs the app logs a note and runs with native D3D12
 presentation; building never needs them.
 
+### NPPD neural denoising setup (optional)
+
+The renderer can also run NPPD (*Neural Partitioning Pyramids for Denoising
+Monte Carlo Renderings*, Bálint et al., SIGGRAPH 2023) as a vendor-neutral
+neural denoiser through ONNX Runtime + DirectML (any D3D12 GPU — NVIDIA, AMD,
+or Intel; CPU fallback). Nothing ships in this repo: drop `onnxruntime.dll`
+from the [Microsoft.ML.OnnxRuntime.DirectML NuGet](https://www.nuget.org/packages/Microsoft.ML.OnnxRuntime.DirectML)
+(≥ 1.22) and `DirectML.dll` from [Microsoft.AI.DirectML](https://www.nuget.org/packages/Microsoft.AI.DirectML)
+(≥ 1.15) into `SDKs/onnxruntime/bin`, then export the pretrained model with
+`tools/nppd-export/export.py --fp16` (see its README — the upstream weights
+carry no explicit license, so neither the checkpoint nor the exported `.onnx`
+may be committed). Run with `--nppd` or toggle with **J**. By default `--nppd`
+composes with XeSS: the frame is traced at 2/3 resolution, NPPD denoises at
+that resolution, and XeSS upscales to the window; under `--gpu` the whole
+stage is GPU-resident (ONNX Runtime executes on the tracer's queue with the
+staging buffers bound directly as tensors — no per-frame CPU traffic).
+
 ### Controls
 
 | Input | Action |
@@ -159,6 +181,7 @@ presentation; building never needs them.
 | **T** | toggle dynamic resolution vs fixed half-res while moving |
 | **O** | quadtree debug overlay: subdivision-depth heatmap + tile borders |
 | **G** | toggle DLSS Ray Reconstruction (when available) |
+| **J** | toggle NPPD neural denoising (in XeSS mode: the pre-upscale slot) |
 | **H** | hemisphere frustum bounces: off → AO → GI → GI + shadow shafts (still frames) |
 | **B** | toggle GPU vs CPU tonemap (non-DLSS mode) |
 | **1 / 2 / 3** | quality presets (shadow/AO samples, reflections) |

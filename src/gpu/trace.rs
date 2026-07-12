@@ -50,6 +50,14 @@ pub const FEED_MVEC: u32 = 19; // RG16F (both)
 pub const FEED_ALB: u32 = 20; // RGBA8 diffuse albedo (RR)
 pub const FEED_SPEC: u32 = 21; // RGBA8 specular albedo (RR)
 pub const FEED_SPECHIT: u32 = 22; // R16F spec hit distance (RR)
+// GPU-resident NPPD staging (the --gpu --nppd composition): four raw-buffer
+// root UAVs at u23..u26, appended after RP_GBUF so nothing renumbers
+// (61/64 root-signature DWORDs). Bound only when the session built them.
+pub const RP_NPPD_FRAME: u32 = RP_GBUF + 1;
+pub const RP_NPPD_STATE: u32 = RP_GBUF + 2;
+pub const RP_NPPD_WARPED: u32 = RP_GBUF + 3;
+pub const RP_NPPD_OUT: u32 = RP_GBUF + 4;
+pub const NPPD_REG_BASE: u32 = NUM_UAVS + 2 + NUM_FEED; // u23
 
 // SRV register assignments (t0..t7) — shared across every kernel; a kernel
 // declares only what it reads, DXC strips the rest.
@@ -151,6 +159,7 @@ const HEMI_WAVE_HLSL: &str = include_str!("shaders/hemi_wave.hlsl");
 const HEMI_LEAF_HLSL: &str = include_str!("shaders/hemi_leaf.hlsl");
 const COMPOSE_HLSL: &str = include_str!("shaders/compose.hlsl");
 const FEED_HLSL: &str = include_str!("shaders/feed.hlsl");
+const NPPD_HLSL: &str = include_str!("shaders/nppd.hlsl");
 
 /// What the GPU tracer requires, queried once. RayQuery in compute needs
 /// RaytracingTier 1.1 AND shader model 6.5; missing either is a clean
@@ -301,6 +310,21 @@ pub fn create_root_signature(device: &ID3D12Device) -> Result<ID3D12RootSignatur
         },
         ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
     });
+    // RP_NPPD_*: the NPPD staging buffers (u23..u26), appended after RP_GBUF
+    // for the same no-renumber reason; bound only in NPPD sessions (unbound
+    // root UAVs are fine as long as no dispatched kernel touches them).
+    for i in 0..4 {
+        params.push(D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                Descriptor: D3D12_ROOT_DESCRIPTOR {
+                    ShaderRegister: NPPD_REG_BASE + i,
+                    RegisterSpace: 0,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        });
+    }
     let desc = D3D12_ROOT_SIGNATURE_DESC {
         NumParameters: params.len() as u32,
         pParameters: params.as_ptr(),
@@ -934,6 +958,25 @@ fn fb_mode_of(q: &Quality) -> u32 {
     }
 }
 
+/// GPU-resident NPPD staging: the four NCHW fp32 plane buffers (at the
+/// /32-padded dims — `nppd::pad_dims`) that `nppd::NppdGpu` binds as ORT
+/// tensors, plus the nppd.hlsl kernels that fill/consume them. Default-heap
+/// raw buffers, ALLOW_UNORDERED_ACCESS, resting in UNORDERED_ACCESS — the
+/// DML binding contract; they never transition.
+pub struct NppdRes {
+    pub frame: ID3D12Resource,
+    pub state: ID3D12Resource,
+    pub warped: ID3D12Resource,
+    pub out: ID3D12Resource,
+    pub pw: u32,
+    pub ph: u32,
+    pso_pack: ID3D12PipelineState,
+    pso_warp: ID3D12PipelineState,
+    pso_zero: ID3D12PipelineState,
+    pso_out: ID3D12PipelineState,
+    pso_feed_dm: ID3D12PipelineState,
+}
+
 pub struct TraceGpu {
     pub root_sig: ID3D12RootSignature,
     pub cmd_sig: ID3D12CommandSignature,
@@ -957,6 +1000,9 @@ pub struct TraceGpu {
     /// The wired upscaler feed targets (wire_feed): plane resources cloned
     /// for record_feed's barriers, plus which feed kernel consumes them.
     feed: Option<(FeedKind, Vec<ID3D12Resource>)>,
+    /// GPU-resident NPPD staging (the --gpu --nppd composition) — buffers
+    /// nppd::NppdGpu wraps as ORT tensors, plus the staging kernels.
+    pub nppd: Option<NppdRes>,
     pub scene: SceneGpu,
     /// Per-pixel planes, CPU-layout parity (accum = 3 f32/px, tbuf = f32/px,
     /// info = u32/px) so readback compares are direct memcmp-shaped.
@@ -1010,6 +1056,7 @@ impl TraceGpu {
         rw: u32,
         rh: u32,
         gbuf_full: bool,
+        nppd: bool,
         debug: bool,
     ) -> Result<Self> {
         require_caps(device)?;
@@ -1058,6 +1105,19 @@ impl TraceGpu {
             )
         } else {
             (None, None)
+        };
+        // NPPD staging kernels: only in --gpu --nppd (XeSS) sessions.
+        let nppd_psos = if gbuf_full && nppd {
+            let nppd_src = [TRACE_COMMON_HLSLI, NPPD_HLSL].join("\n");
+            Some((
+                pso(&nppd_src, "cs_nppd_pack", "nppd_pack")?,
+                pso(&nppd_src, "cs_nppd_warp", "nppd_warp")?,
+                pso(&nppd_src, "cs_nppd_zero", "nppd_zero")?,
+                pso(&nppd_src, "cs_nppd_out", "nppd_out")?,
+                pso(&feed_src, "cs_feed_xess_dm", "feed_xess_dm")?,
+            ))
+        } else {
+            None
         };
 
         let scene_gpu = SceneGpu::new(device, scene, bvh)?;
@@ -1121,6 +1181,30 @@ impl TraceGpu {
         // only in upscaler sessions — plain sessions bind a 64-byte dummy
         // and never set FLAG_GBUF (root UAVs have no bounds check).
         let gbuf = committed_buffer(device, if gbuf_full { px * 64 } else { 64 }, uaf, ua)?;
+        // NPPD plane buffers at the /32-padded dims (~340 MB at 1080p/quality
+        // — the recurrent state dominates, same as the CPU path's staging).
+        let nppd_res = match nppd_psos {
+            Some((pso_pack, pso_warp, pso_zero, pso_out, pso_feed_dm)) => {
+                let (pw, ph) = crate::nppd::pad_dims(rw as usize, rh as usize);
+                let ppx = pw as u64 * ph as u64;
+                let ct = crate::nppd::C_T as u64;
+                let ch = crate::nppd::CH_FRAME as u64;
+                Some(NppdRes {
+                    frame: committed_buffer(device, ppx * 4 * ch, uaf, ua)?,
+                    state: committed_buffer(device, ppx * 4 * ct, uaf, ua)?,
+                    warped: committed_buffer(device, ppx * 4 * ct, uaf, ua)?,
+                    out: committed_buffer(device, ppx * 4 * 3, uaf, ua)?,
+                    pw: pw as u32,
+                    ph: ph as u32,
+                    pso_pack,
+                    pso_warp,
+                    pso_zero,
+                    pso_out,
+                    pso_feed_dm,
+                })
+            }
+            None => None,
+        };
         // Slot 0 = hdr (u14, resolve); slots 1..7 = the upscaler feed targets
         // (u16..u22), wired per session by wire_feed — null until then (RS 1.0
         // descriptors are volatile; only accessed slots must be valid).
@@ -1174,6 +1258,12 @@ impl TraceGpu {
             (&gbuf, "trace.gbuf_pack"),
         ] {
             name(res, n);
+        }
+        if let Some(n2) = &nppd_res {
+            name(&n2.frame, "trace.nppd_frame");
+            name(&n2.state, "trace.nppd_state");
+            name(&n2.warped, "trace.nppd_warped");
+            name(&n2.out, "trace.nppd_out");
         }
 
         // Scene-static CB fields, prefilled once. near/far ride the prev
@@ -1241,6 +1331,7 @@ impl TraceGpu {
             pso_feed_xess,
             pso_feed_rr,
             feed: None,
+            nppd: nppd_res,
             scene: scene_gpu,
             accum,
             tbuf,
@@ -1373,6 +1464,24 @@ impl TraceGpu {
                 self.hemi_pts.GetGPUVirtualAddress(),
             );
             list.SetComputeRootUnorderedAccessView(RP_GBUF, self.gbuf.GetGPUVirtualAddress());
+            if let Some(n) = &self.nppd {
+                list.SetComputeRootUnorderedAccessView(
+                    RP_NPPD_FRAME,
+                    n.frame.GetGPUVirtualAddress(),
+                );
+                list.SetComputeRootUnorderedAccessView(
+                    RP_NPPD_STATE,
+                    n.state.GetGPUVirtualAddress(),
+                );
+                list.SetComputeRootUnorderedAccessView(
+                    RP_NPPD_WARPED,
+                    n.warped.GetGPUVirtualAddress(),
+                );
+                list.SetComputeRootUnorderedAccessView(
+                    RP_NPPD_OUT,
+                    n.out.GetGPUVirtualAddress(),
+                );
+            }
             let s = &self.scene;
             list.SetComputeRootShaderResourceView(
                 RP_SRV0 + SRV_BVH_NODES,
@@ -1761,13 +1870,32 @@ impl TraceGpu {
     /// back-transition is both the write->read sync and what keeps the
     /// upscalers' state-at-use contracts truthful (RR's tags and XeSS's
     /// bindings both declare NON_PIXEL_SHADER_RESOURCE).
-    pub fn record_feed(&self, list: &ID3D12GraphicsCommandList, slot: usize) -> Result<()> {
+    /// `nppd_color = true` (NPPD frames only): the guide planes come from the
+    /// depth+mvec feed variant and the color plane from `cs_nppd_out` (the
+    /// denoised planar buffer ORT wrote in an earlier submission on the same
+    /// queue) — two dispatches writing disjoint planes inside one barrier
+    /// window.
+    pub fn record_feed(
+        &self,
+        list: &ID3D12GraphicsCommandList,
+        slot: usize,
+        nppd_color: bool,
+    ) -> Result<()> {
         let Some((kind, planes)) = &self.feed else {
             return Err("feed targets not wired".into());
         };
-        let pso = match kind {
-            FeedKind::Xess => self.pso_feed_xess.as_ref(),
-            FeedKind::Rr => self.pso_feed_rr.as_ref(),
+        let nppd = if nppd_color {
+            if !matches!(kind, FeedKind::Xess) {
+                return Err("NPPD feed composition is XeSS-only".into());
+            }
+            Some(self.nppd.as_ref().ok_or("NPPD staging not built")?)
+        } else {
+            None
+        };
+        let pso = match (kind, nppd) {
+            (FeedKind::Xess, Some(n)) => Some(&n.pso_feed_dm),
+            (FeedKind::Xess, None) => self.pso_feed_xess.as_ref(),
+            (FeedKind::Rr, _) => self.pso_feed_rr.as_ref(),
         }
         .ok_or("feed PSO missing (TraceGpu built without gbuf)")?;
         let _ev = super::pix::scope(list, c"feed");
@@ -1784,8 +1912,37 @@ impl TraceGpu {
             );
             list.SetPipelineState(pso);
             list.Dispatch(self.rw.div_ceil(8), self.rh.div_ceil(8), 1);
+            if let Some(n) = nppd {
+                list.SetPipelineState(&n.pso_out);
+                list.Dispatch(self.rw.div_ceil(8), self.rh.div_ceil(8), 1);
+            }
             let back: Vec<_> = planes.iter().map(|p| transition(p, ua, npsr)).collect();
             list.ResourceBarrier(&back);
+        }
+        Ok(())
+    }
+
+    /// NPPD pre-inference staging: pack the G-buffer + 1-spp radiance into
+    /// the NCHW frame buffer and backward-warp the recurrent state (or zero
+    /// the warped buffer when `state_valid` is false — a reset). Record AFTER
+    /// `record_frame` on the same list (its trailing global UAV barrier
+    /// fences the pack/accum writes); the three kernels touch pairwise-
+    /// disjoint buffers, so no barriers in between. The caller must SUBMIT
+    /// this list before `NppdGpu::run()` — single-queue order is the sync.
+    pub fn record_nppd_pre(
+        &self,
+        list: &ID3D12GraphicsCommandList,
+        slot: usize,
+        state_valid: bool,
+    ) -> Result<()> {
+        let n = self.nppd.as_ref().ok_or("NPPD staging not built")?;
+        let _ev = super::pix::scope(list, c"nppd-stage");
+        unsafe {
+            self.bind_common(list, slot);
+            list.SetPipelineState(&n.pso_pack);
+            list.Dispatch(n.pw / 8, n.ph / 8, 1);
+            list.SetPipelineState(if state_valid { &n.pso_warp } else { &n.pso_zero });
+            list.Dispatch(n.pw / 8, n.ph / 8, 1);
         }
         Ok(())
     }
