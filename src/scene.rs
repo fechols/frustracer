@@ -13,8 +13,9 @@ pub enum MatKind {
     /// `scale` is the feature frequency in world units.
     Marble { scale: f32 },
     /// Albedo sampled from `Scene::textures[tex]` at the hit's interpolated
-    /// UV. The material's flat `albedo` stays as the fallback (the GPU path
-    /// shades with it until textures land there).
+    /// UV, on the CPU (`shade.rs`) and both GPU paths (`shade.hlsli` through
+    /// the space1 texture table). The material's flat `albedo` stays as the
+    /// untextured fallback.
     Textured { tex: u32 },
 }
 
@@ -486,15 +487,47 @@ pub fn stress_scene(n: usize) -> Scene {
 
 /// Load an OBJ, auto-fit it (centered on x/z, resting on y=0, diagonal = 10),
 /// and drop it onto the standard ground plane + light.
+///
+/// `.obj.zst` is decoded transparently (the committed scene data lives in git
+/// LFS zstd-compressed — OBJ is ASCII text; see .gitattributes), and a bare
+/// `.obj` argument falls back to its `.zst` sibling when only that exists, so
+/// the documented `model.obj` commands keep working on a fresh checkout.
 pub fn load_obj_scene(path: &str) -> Scene {
-    let (models, materials_res) = tobj::load_obj(
-        path,
-        &tobj::LoadOptions {
-            triangulate: true,
-            single_index: true,
-            ..Default::default()
-        },
-    )
+    let path = &{
+        let mut p = path.to_string();
+        if !std::path::Path::new(&p).exists() {
+            let zst = format!("{p}.zst");
+            if std::path::Path::new(&zst).exists() {
+                p = zst;
+            }
+        }
+        p
+    };
+    let opts = tobj::LoadOptions {
+        triangulate: true,
+        single_index: true,
+        ..Default::default()
+    };
+    let (models, materials_res) = if path.ends_with(".zst") {
+        // Decode to memory, then parse the buffer; MTL references inside the
+        // OBJ resolve relative to the OBJ's directory, exactly like
+        // tobj::load_obj does (the .mtl files are small and stay plain text).
+        let dir = std::path::Path::new(path)
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf();
+        std::fs::File::open(path)
+            .map_err(|_| tobj::LoadError::OpenFileFailed)
+            .and_then(|f| {
+                zstd::stream::decode_all(std::io::BufReader::new(f))
+                    .map_err(|_| tobj::LoadError::ReadError)
+            })
+            .and_then(|text| {
+                tobj::load_obj_buf(&mut &text[..], &opts, |mtl| tobj::load_mtl(dir.join(mtl)))
+            })
+    } else {
+        tobj::load_obj(path, &opts)
+    }
     .unwrap_or_else(|e| panic!("failed to load OBJ '{path}': {e}"));
     let obj_mats = materials_res.unwrap_or_default();
 
