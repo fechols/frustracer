@@ -27,6 +27,7 @@ mod stats;
 mod prof;
 mod replay;
 mod temporal;
+mod texture;
 // The loader half is Windows-only (LoadLibrary); the FFI structs, depth
 // encoding, and the dynamic-res controller are pure and feed --check-xess.
 mod xess;
@@ -236,6 +237,7 @@ fn main() {
     let mut no_xess_explicit = false;
     let mut check_gpu = false;
     let mut stress: Option<usize> = None;
+    let mut cam_override: Option<Camera> = None;
     let mut spin: Option<String> = None;
     let mut spin_frames = 2000u32;
     let mut args = std::env::args().skip(1);
@@ -413,9 +415,25 @@ fn main() {
                         }),
                 )
             }
+            "--cam" => {
+                let parts: Vec<f32> = args
+                    .next()
+                    .map(|s| s.split(',').filter_map(|v| v.trim().parse().ok()).collect())
+                    .unwrap_or_default();
+                if parts.len() != 6 {
+                    eprintln!("--cam needs ex,ey,ez,tx,ty,tz (6 numbers), e.g. --cam 4,2,4,0,1,0");
+                    std::process::exit(2);
+                }
+                cam_override = Some(Camera::look_at(
+                    Vec3A::new(parts[0], parts[1], parts[2]),
+                    Vec3A::new(parts[3], parts[4], parts[5]),
+                    55f32.to_radians(),
+                ));
+            }
             "--help" | "-h" => {
                 eprintln!("usage: frustracer [model.obj] [--stress <n>] [--check] [--check-dlss] [--dlss-dump] [--no-dlss] [--check-oidn] [--oidn-dump] [--oidn] [--check-xess] [--xess-dump] [--xess] [--lock-res <r>] [--gpu-debug] [--sl-path <dir>] [--oidn-path <dir>] [--oidn-device <d>] [--xess-path <dir>]");
                 eprintln!("  --stress <n>  procedural stress field of n objects (perf test; composes with --check)");
+                eprintln!("  --cam <e,t>   start camera: ex,ey,ez,tx,ty,tz (reproducible benchmark viewpoints)");
                 eprintln!("  --check       headless: verify hybrid vs reference, benchmark, write check.png");
                 eprintln!("  --check-dlss  headless: G-buffer MV/depth/matrix self-test (no GPU needed)");
                 eprintln!("  --dlss-dump   --check-dlss plus G-buffer PNG dumps (albedo/spec_albedo/normal/misc/mv)");
@@ -511,10 +529,10 @@ fn main() {
     // The stress field keeps the default look direction but pulls the camera
     // back/up to overlook the field; /8 (not the field half-extent itself)
     // trades the nearest rows off the bottom of the frame for less sky.
-    let cam0 = match stress {
+    let cam0 = cam_override.unwrap_or_else(|| match stress {
         Some(n) => scaled_camera((scene::stress_field_half(n) / 8.0).max(1.0)),
         None => default_camera(),
-    };
+    });
     let t0 = Instant::now();
     let bvh = bvh::Bvh::build(&scene);
     eprintln!(

@@ -1,4 +1,5 @@
-use glam::Vec3A;
+use crate::texture::Texture;
+use glam::{Vec2, Vec3A};
 use std::collections::HashMap;
 
 /// How a material derives its albedo. Reflection behavior is fully described
@@ -11,6 +12,10 @@ pub enum MatKind {
     /// Procedural marble: albedo from world-space fBm veining (`shade::marble`);
     /// `scale` is the feature frequency in world units.
     Marble { scale: f32 },
+    /// Albedo sampled from `Scene::textures[tex]` at the hit's interpolated
+    /// UV. The material's flat `albedo` stays as the fallback (the GPU path
+    /// shades with it until textures land there).
+    Textured { tex: u32 },
 }
 
 /// Metallic/roughness PBR material (GGX microfacet; see `shade.rs`).
@@ -37,9 +42,17 @@ pub struct AreaLight {
 pub struct Scene {
     pub positions: Vec<Vec3A>,
     pub normals: Vec<Vec3A>,
+    /// Per-vertex UVs, parallel to `positions` (zeros where a mesh has none —
+    /// sound because the OBJ loader uses `single_index`, one unified stream).
+    pub texcoords: Vec<Vec2>,
     pub indices: Vec<[u32; 3]>,
     pub tri_mat: Vec<u32>,
     pub materials: Vec<Material>,
+    pub textures: Vec<Texture>,
+    /// Any texture is alpha-masked — the intersector's one-bool gate for the
+    /// alpha-cutout path (false on the procedural/stress scenes, keeping the
+    /// hot loop untouched there).
+    pub any_alpha: bool,
     pub light: AreaLight,
     /// Bounding diagonal — the scale reference for all epsilons.
     pub diag: f32,
@@ -52,14 +65,28 @@ impl Scene {
     pub fn tri_count(&self) -> usize {
         self.indices.len()
     }
+
+    /// Interpolate triangle `tri`'s UV at barycentrics (u, v) — hit.u/hit.v
+    /// from the intersector. Lives here (not shade.rs) so the BVH's
+    /// alpha-cutout test can share it without a bvh → shade dependency.
+    #[inline]
+    pub fn tri_uv(&self, tri: u32, u: f32, v: f32) -> Vec2 {
+        let [i0, i1, i2] = self.indices[tri as usize];
+        let w = 1.0 - u - v;
+        self.texcoords[i0 as usize] * w
+            + self.texcoords[i1 as usize] * u
+            + self.texcoords[i2 as usize] * v
+    }
 }
 
 pub struct SceneBuilder {
     positions: Vec<Vec3A>,
     normals: Vec<Vec3A>,
+    texcoords: Vec<Vec2>,
     indices: Vec<[u32; 3]>,
     tri_mat: Vec<u32>,
     materials: Vec<Material>,
+    textures: Vec<Texture>,
 }
 
 impl SceneBuilder {
@@ -67,10 +94,17 @@ impl SceneBuilder {
         Self {
             positions: Vec::new(),
             normals: Vec::new(),
+            texcoords: Vec::new(),
             indices: Vec::new(),
             tri_mat: Vec::new(),
             materials: Vec::new(),
+            textures: Vec::new(),
         }
+    }
+
+    pub fn add_texture(&mut self, tex: Texture) -> u32 {
+        self.textures.push(tex);
+        (self.textures.len() - 1) as u32
     }
 
     pub fn material(&mut self, albedo: Vec3A, roughness: f32, metallic: f32) -> u32 {
@@ -94,6 +128,7 @@ impl SceneBuilder {
         let base = self.positions.len() as u32;
         self.positions.extend_from_slice(&p);
         self.normals.extend_from_slice(&n);
+        self.texcoords.extend_from_slice(&[Vec2::ZERO; 3]);
         self.indices.push([base, base + 1, base + 2]);
         self.tri_mat.push(mat);
     }
@@ -150,11 +185,13 @@ impl SceneBuilder {
     }
 
     /// Push a shared-vertex mesh (used by the OBJ path). `normals` may be empty →
-    /// smooth normals are computed from area-weighted face normals.
+    /// smooth normals are computed from area-weighted face normals. `texcoords`
+    /// may be empty → zeros (untextured mesh).
     pub fn add_mesh(
         &mut self,
         positions: Vec<Vec3A>,
         mut normals: Vec<Vec3A>,
+        mut texcoords: Vec<Vec2>,
         indices: &[[u32; 3]],
         mat: u32,
     ) {
@@ -188,9 +225,13 @@ impl SceneBuilder {
                 .map(|p| acc.get(&key(*p)).copied().unwrap_or(Vec3A::ZERO).normalize_or_zero())
                 .collect();
         }
+        if texcoords.len() != positions.len() {
+            texcoords = vec![Vec2::ZERO; positions.len()];
+        }
         let base = self.positions.len() as u32;
         self.positions.extend_from_slice(&positions);
         self.normals.extend_from_slice(&normals);
+        self.texcoords.extend_from_slice(&texcoords);
         for tri in indices {
             self.indices.push([tri[0] + base, tri[1] + base, tri[2] + base]);
             self.tri_mat.push(mat);
@@ -205,12 +246,16 @@ impl SceneBuilder {
             mx = mx.max(*p);
         }
         let diag = (mx - mn).length().max(1e-3);
+        let any_alpha = self.textures.iter().any(|t| t.alpha_masked);
         Scene {
             positions: self.positions,
             normals: self.normals,
+            texcoords: self.texcoords,
             indices: self.indices,
             tri_mat: self.tri_mat,
             materials: self.materials,
+            textures: self.textures,
+            any_alpha,
             light,
             diag,
             eps: 1e-4 * diag,
@@ -440,11 +485,54 @@ pub fn load_obj_scene(path: &str) -> Scene {
     );
 
     let default_mat = b.material(Vec3A::new(0.70, 0.70, 0.72), 0.8, 0.0);
+
+    // Decode every referenced diffuse map once (deduped by resolved path, in
+    // parallel — San Miguel references hundreds of PNGs). MTL paths are
+    // relative to the OBJ's directory and often use backslashes.
+    let obj_dir = std::path::Path::new(path).parent().unwrap_or(std::path::Path::new("."));
+    let tex_paths: Vec<std::path::PathBuf> = {
+        let mut seen = std::collections::HashSet::new();
+        obj_mats
+            .iter()
+            .filter_map(|m| m.diffuse_texture.as_ref())
+            .map(|t| obj_dir.join(t.replace('\\', "/")))
+            .filter(|p| seen.insert(p.clone()))
+            .collect()
+    };
+    let decoded: HashMap<std::path::PathBuf, Texture> = {
+        use rayon::prelude::*;
+        tex_paths
+            .par_iter()
+            .filter_map(|p| match image::open(p) {
+                Ok(img) => Some((p.clone(), Texture::from_image(img))),
+                Err(e) => {
+                    eprintln!("warning: texture '{}' failed to load ({e}); using flat Kd", p.display());
+                    None
+                }
+            })
+            .collect()
+    };
+    let mut tex_ids: HashMap<std::path::PathBuf, u32> = HashMap::new();
+    for (p, t) in decoded {
+        let id = b.add_texture(t);
+        tex_ids.insert(p, id);
+    }
+
     let mat_map: Vec<u32> = obj_mats
         .iter()
         .map(|m| {
-            let kd = m.diffuse.unwrap_or([0.7, 0.7, 0.7]);
-            b.material(Vec3A::from_array(kd), 0.8, 0.0)
+            let kd = Vec3A::from_array(m.diffuse.unwrap_or([0.7, 0.7, 0.7]));
+            let tex = m
+                .diffuse_texture
+                .as_ref()
+                .and_then(|t| tex_ids.get(&obj_dir.join(t.replace('\\', "/"))).copied());
+            match tex {
+                // The texture REPLACES Kd (exporters set Kd = 1 alongside
+                // map_Kd; multiplying would double-darken). Kd stays as the
+                // flat fallback for paths without texture support (GPU).
+                Some(tex) => b.material_kind(kd, 0.8, 0.0, 0.0, MatKind::Textured { tex }),
+                None => b.material(kd, 0.8, 0.0),
+            }
         })
         .collect();
 
@@ -499,12 +587,19 @@ fn add_obj_models(
             .chunks_exact(3)
             .map(|n| Vec3A::new(n[0], n[1], n[2]).normalize_or_zero())
             .collect();
+        // V is flipped once here (OBJ UVs are bottom-left origin, decoded
+        // images top-left) so texture sampling needs no per-lookup flip.
+        let texcoords: Vec<Vec2> = mesh
+            .texcoords
+            .chunks_exact(2)
+            .map(|t| Vec2::new(t[0], 1.0 - t[1]))
+            .collect();
         let indices: Vec<[u32; 3]> = mesh
             .indices
             .chunks_exact(3)
             .map(|i| [i[0], i[1], i[2]])
             .collect();
-        b.add_mesh(positions, normals, &indices, mat_for(mesh));
+        b.add_mesh(positions, normals, texcoords, &indices, mat_for(mesh));
     }
 }
 

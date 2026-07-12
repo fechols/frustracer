@@ -299,6 +299,9 @@ impl Bvh {
                 if dnear.is_finite() {
                     node_idx = near;
                     if dfar.is_finite() {
+                        // SAH depth stays well under 64 even at 10M-tri scenes
+                        // (~45-50 expected); assert in debug rather than UB.
+                        debug_assert!(sp < stack.len(), "BVH traversal stack overflow");
                         stack[sp] = far;
                         sp += 1;
                     }
@@ -377,6 +380,7 @@ impl Bvh {
                 let l = node.left_first;
                 if slab_t(&self.nodes[l as usize].aabb, ray, tmin, tmax).is_finite() {
                     if slab_t(&self.nodes[l as usize + 1].aabb, ray, tmin, tmax).is_finite() {
+                        debug_assert!(sp < stack.len(), "BVH traversal stack overflow");
                         stack[sp] = l + 1;
                         sp += 1;
                     }
@@ -430,5 +434,31 @@ fn moller_trumbore(scene: &Scene, tri: u32, ray: &Ray) -> Option<(f32, f32, f32)
         return None;
     }
     let t = e2.dot(q) * inv;
-    if t > 0.0 { Some((t, u, v)) } else { None }
+    if t <= 0.0 {
+        return None;
+    }
+    // Alpha cutout: a candidate on an alpha-masked textured triangle is
+    // REJECTED (not accepted-and-continued) where the mask says transparent —
+    // `intersect_from` keeps tmax unshrunk and walks on to the true nearest
+    // opaque hit; `occluded_from` keeps searching. Every ray type (hybrid,
+    // verify reference, shadow, AO, hemi, shaft) funnels through here, so the
+    // exact-zero gates stay like-for-like. The frustum bound queries still
+    // treat masked triangles as solid AABBs — sound, because rejection only
+    // removes hits: the true nearest hit moves FARTHER, so a conservative
+    // lower bound stays a lower bound (inherited tmin never overshoots, and
+    // hemi cells become at most less provably-empty, never falsely empty).
+    if scene.any_alpha {
+        if let crate::scene::MatKind::Textured { tex } =
+            scene.materials[scene.tri_mat[tri as usize] as usize].kind
+        {
+            let tx = &scene.textures[tex as usize];
+            if tx.alpha_masked {
+                let uv = scene.tri_uv(tri, u, v);
+                if tx.alpha_nearest(uv.x, uv.y) < 128 {
+                    return None;
+                }
+            }
+        }
+    }
+    Some((t, u, v))
 }

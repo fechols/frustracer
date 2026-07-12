@@ -1,4 +1,7 @@
 /target
+# Downloaded benchmark scenes (San Miguel etc.) — large, third-party-licensed;
+# see the "Real scenes" section in CLAUDE.md for sources.
+/scenes/
 check.png
 screenshot_*.png
 dlss_gbuf_*.png

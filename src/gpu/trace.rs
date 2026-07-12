@@ -666,6 +666,9 @@ impl SceneGpu {
                 kind: match m.kind {
                     MatKind::Diffuse => 0,
                     MatKind::Marble { .. } => 1,
+                    // GPU textures are a later phase: shade with the flat
+                    // MTL Kd fallback (the init note below flags it once).
+                    MatKind::Textured { .. } => 0,
                 },
                 scale: match m.kind {
                     MatKind::Marble { scale } => scale,
@@ -673,6 +676,14 @@ impl SceneGpu {
                 },
             })
             .collect();
+        let n_tex = scene
+            .materials
+            .iter()
+            .filter(|m| matches!(m.kind, MatKind::Textured { .. }))
+            .count();
+        if n_tex > 0 {
+            eprintln!("gpu: {n_tex} textured materials render with flat MTL albedo (GPU textures not yet ported)");
+        }
 
         let srv = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         let mut uploads = Vec::new();

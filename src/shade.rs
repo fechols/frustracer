@@ -239,9 +239,14 @@ pub fn shade(
     let (p, n) = sp.unwrap_or_else(|| surface_point(scene, ray, hit));
     let mat = &scene.materials[scene.tri_mat[hit.tri as usize] as usize];
     // Effective albedo: constant, except marble which is evaluated at the
-    // world-space hit point (models are static, so world space is stable).
+    // world-space hit point (models are static, so world space is stable)
+    // and textures, sampled at the hit's interpolated UV.
     let albedo = match mat.kind {
         MatKind::Marble { scale } => marble(ray.o + ray.d * hit.t, scale),
+        MatKind::Textured { tex } => {
+            let uv = scene.tri_uv(hit.tri, hit.u, hit.v);
+            scene.textures[tex as usize].sample_bilinear(uv.x, uv.y)
+        }
         _ => mat.albedo,
     };
     if let Some(prim) = prim.as_deref_mut() {
