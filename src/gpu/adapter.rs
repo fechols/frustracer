@@ -1,12 +1,23 @@
 //! DXGI adapter selection. This machine has three GPUs (Intel Arc, NVIDIA
-//! RTX, AMD iGPU); DLSS requires the NVIDIA adapter specifically, so we
-//! enumerate explicitly instead of trusting adapter 0.
+//! RTX, AMD iGPU); DLSS requires the NVIDIA adapter and FSR Ray Regeneration
+//! an AMD (RDNA4) one, so we enumerate explicitly with a vendor preference
+//! instead of trusting adapter 0.
 
 use windows::core::Result;
 use windows::Win32::Foundation::LUID;
 use windows::Win32::Graphics::Dxgi::*;
 
 const VENDOR_NVIDIA: u32 = 0x10DE;
+const VENDOR_AMD: u32 = 0x1002;
+
+/// Which vendor's best-VRAM adapter to prefer (never a hard requirement —
+/// the caller's feature-support probe is the real gate; a wrong-vendor pick
+/// just reports unsupported and falls back to the plain path).
+#[derive(Clone, Copy, PartialEq)]
+pub enum Prefer {
+    Nvidia,
+    Amd,
+}
 
 pub struct AdapterPick {
     pub adapter: IDXGIAdapter4,
@@ -20,12 +31,15 @@ fn desc_name(desc: &DXGI_ADAPTER_DESC3) -> String {
     String::from_utf16_lossy(&desc.Description[..len])
 }
 
-/// Pick the NVIDIA adapter with the most VRAM; fall back to the first
-/// hardware adapter (high-performance order) when `require_nvidia` is off.
-pub fn pick(factory: &IDXGIFactory6, require_nvidia: bool) -> std::result::Result<AdapterPick, String> {
+/// Pick the preferred vendor's adapter with the most VRAM; fall back to the
+/// first hardware adapter (high-performance order).
+pub fn pick(factory: &IDXGIFactory6, prefer: Prefer) -> std::result::Result<AdapterPick, String> {
+    let want = match prefer {
+        Prefer::Nvidia => VENDOR_NVIDIA,
+        Prefer::Amd => VENDOR_AMD,
+    };
     let mut best: Option<(IDXGIAdapter4, DXGI_ADAPTER_DESC3)> = None;
     let mut fallback: Option<(IDXGIAdapter4, DXGI_ADAPTER_DESC3)> = None;
-    let mut listing = String::new();
     for i in 0.. {
         let adapter: IDXGIAdapter4 = match unsafe {
             factory.EnumAdapterByGpuPreference(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)
@@ -37,17 +51,10 @@ pub fn pick(factory: &IDXGIFactory6, require_nvidia: bool) -> std::result::Resul
         if (desc.Flags & DXGI_ADAPTER_FLAG3_SOFTWARE) != DXGI_ADAPTER_FLAG3_NONE {
             continue;
         }
-        listing.push_str(&format!(
-            "  adapter {}: {} (vendor {:#06x}, {} MB)\n",
-            i,
-            desc_name(&desc),
-            desc.VendorId,
-            desc.DedicatedVideoMemory / (1024 * 1024)
-        ));
         if fallback.is_none() {
             fallback = Some((adapter.clone(), desc));
         }
-        if desc.VendorId == VENDOR_NVIDIA
+        if desc.VendorId == want
             && best
                 .as_ref()
                 .is_none_or(|(_, b)| desc.DedicatedVideoMemory > b.DedicatedVideoMemory)
@@ -55,17 +62,18 @@ pub fn pick(factory: &IDXGIFactory6, require_nvidia: bool) -> std::result::Resul
             best = Some((adapter, desc));
         }
     }
-    let picked = match (best, fallback, require_nvidia) {
-        (Some(p), _, _) => p,
-        (None, _, true) => {
-            return Err(format!("no NVIDIA adapter found (required for DLSS); adapters:\n{listing}"))
-        }
-        (None, Some(p), false) => p,
-        (None, None, _) => return Err("no hardware DXGI adapter found".into()),
+    let picked = match (best, fallback) {
+        (Some(p), _) => p,
+        (None, Some(p)) => p,
+        (None, None) => return Err("no hardware DXGI adapter found".into()),
     };
     let name = desc_name(&picked.1);
-    let is_nvidia = picked.1.VendorId == VENDOR_NVIDIA;
-    Ok(AdapterPick { adapter: picked.0, luid: picked.1.AdapterLuid, name, is_nvidia })
+    Ok(AdapterPick {
+        adapter: picked.0,
+        luid: picked.1.AdapterLuid,
+        name,
+        is_nvidia: picked.1.VendorId == VENDOR_NVIDIA,
+    })
 }
 
 pub fn create_factory(debug: bool) -> Result<IDXGIFactory6> {

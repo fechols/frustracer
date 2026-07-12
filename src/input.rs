@@ -18,6 +18,7 @@ pub struct Edges {
     pub toggle_gpu_tone: bool, // B
     pub toggle_dlss: bool,     // G
     pub toggle_xess: bool,     // X (XeSS-SR dynamic-res upscaling)
+    pub toggle_fsr: bool,      // F (FSR Ray Regeneration + FSR4)
     pub toggle_oidn: bool,     // N (Open Image Denoise)
     pub toggle_nppd: bool,     // J (NPPD neural denoiser)
     pub toggle_temporal: bool, // M (OIDN temporal reprojection)
@@ -52,6 +53,7 @@ impl Input {
                     Keycode::B => e.toggle_gpu_tone = true,
                     Keycode::G => e.toggle_dlss = true,
                     Keycode::X => e.toggle_xess = true,
+                    Keycode::F => e.toggle_fsr = true,
                     Keycode::N => e.toggle_oidn = true,
                     Keycode::J => e.toggle_nppd = true,
                     Keycode::M => e.toggle_temporal = true,

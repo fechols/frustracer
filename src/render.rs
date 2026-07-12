@@ -55,6 +55,10 @@ pub struct FrameCtx<'a> {
     /// DLSS G-buffers, written at the primary-hit fill sites. None (all
     /// legacy paths) costs one never-taken branch per pixel.
     pub gbuf: Option<&'a dlss::GBufs>,
+    /// FSR Ray Regeneration signal buffers (FSR mode only), written at the
+    /// same fill sites — requires `gbuf` to also be Some (the split reads
+    /// `PrimarySurface`, which is only captured when `gbuf` is on).
+    pub fsr_buf: Option<&'a crate::fsr::FsrBufs>,
     /// Previous frame's camera basis for motion vectors (independent of the
     /// temporal cache's tprev_basis — different contract).
     pub prev_cam: Option<CamBasis>,
@@ -729,17 +733,16 @@ fn write_gbuf_hit(
     dir: Vec3A,
     t: f32,
     prim: &shade::PrimarySurface,
+    c: Vec3A,
 ) {
     let Some(g) = ctx.gbuf else { return };
     let (_, far) = dlss::near_far(ctx.scene.diag);
+    let p = ctx.cam.origin + dir * t;
     let mv = match &ctx.prev_cam {
-        Some(prev) => {
-            let p = ctx.cam.origin + dir * t;
-            match prev.project(p - prev.origin) {
-                Some((px, py)) => (px - fx, py - fy),
-                None => (0.0, 0.0), // behind the old image plane: disocclusion
-            }
-        }
+        Some(prev) => match prev.project(p - prev.origin) {
+            Some((px, py)) => (px - fx, py - fy),
+            None => (0.0, 0.0), // behind the old image plane: disocclusion
+        },
         None => (0.0, 0.0),
     };
     g.write(
@@ -755,6 +758,25 @@ fn write_gbuf_hit(
             spec_hit_t: if prim.spec_t.is_infinite() { far } else { prim.spec_t },
         },
     );
+    if let Some(f) = ctx.fsr_buf {
+        // Previous-frame linear view-Z of the SAME hit point — the denoiser
+        // MV's B channel is prev_z - cur_z. No previous camera degrades to
+        // "no depth motion"; a point behind the old image plane keeps its
+        // true (negative) prev view-Z — the large delta marks the
+        // disocclusion for history rejection (RG is (0,0) there, above).
+        let prev_z = match &ctx.prev_cam {
+            Some(prev) => (p - prev.origin).dot(prev.forward()),
+            None => t * dir.dot(ctx.cam.forward()),
+        };
+        let sig = crate::fsr::split_signals(
+            c,
+            prim.direct_d,
+            prim.direct_s,
+            prim.albedo * (1.0 - prim.metallic),
+            Vec3A::splat(0.04).lerp(prim.albedo, prim.metallic),
+        );
+        f.write(x, y, &sig, prev_z);
+    }
 }
 
 /// G-buffer write for a sky/miss pixel: depth = far (finite, f16-safe), MV =
@@ -783,6 +805,16 @@ fn write_gbuf_sky(ctx: &FrameCtx, x: usize, y: usize, fx: f32, fy: f32, dir: Vec
             spec_hit_t: 0.0,
         },
     );
+    if let Some(f) = ctx.fsr_buf {
+        // Sky: both signals zero, residual = the sky color itself (albedos
+        // don't matter — 0 * anything), prev_z = far so the depth delta is 0.
+        let sig = crate::fsr::Signals {
+            dd: Vec3A::ZERO,
+            ds: Vec3A::ZERO,
+            residual: shade::sky(dir, ctx.sun),
+        };
+        f.write(x, y, &sig, far);
+    }
 }
 
 /// The traced result of one `shade_pixel` sample — returned so `sparse_fill`
@@ -912,7 +944,7 @@ fn shade_traced(
                 ctx.splat(x, y, c);
             }
             if primary {
-                write_gbuf_hit(ctx, x, y, tr.fx, tr.fy, tr.dir, hit.t, &prim);
+                write_gbuf_hit(ctx, x, y, tr.fx, tr.fy, tr.dir, hit.t, &prim, c);
             }
             Sample { c, t: hit.t, dir: tr.dir, prim }
         }
@@ -1033,7 +1065,7 @@ fn sparse_fill(
                     // coarse cells.
                     let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
                     if s.t.is_finite() {
-                        write_gbuf_hit(ctx, x, y, fx, fy, s.dir, s.t, &s.prim);
+                        write_gbuf_hit(ctx, x, y, fx, fy, s.dir, s.t, &s.prim, s.c);
                     } else {
                         write_gbuf_sky(ctx, x, y, fx, fy, s.dir);
                     }
@@ -1261,6 +1293,7 @@ pub fn verify(
         tcache_prev: temporal_prev,
         accumulate: true,
         gbuf: None,
+        fsr_buf: None,
         prev_cam: None,
         frame_jitter: None,
         adaptive: false,
