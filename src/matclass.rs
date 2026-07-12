@@ -152,7 +152,11 @@ const CLASSES: &[ClassDef] = &[
             Tok("seca"),
             Tok("caballo"),
         ],
-        pbr: Pbr { translucency: 0.5, ..opaque(0.55, 0.0) },
+        // 0.3 ≈ measured leaf transmittance (chlorophyll passes ~20-30% in
+        // the visible band). 0.5 was tried: visually fine, but the brighter
+        // back-lit canopy makes single-probe fireflies in the unpaired GI
+        // signed A/B ~40% larger for no physical gain.
+        pbr: Pbr { translucency: 0.3, ..opaque(0.55, 0.0) },
     },
 ];
 
@@ -276,7 +280,7 @@ pub fn self_test() -> Result<(), String> {
         return Err(format!("fabric: sheen {} transmission {}", f.sheen, f.transmission));
     }
     let (_, l) = classify(Some("bs01lef"), "material_3", Some(16.0), Some(2));
-    if l.translucency != 0.5 || l.roughness < 0.45 {
+    if l.translucency != 0.3 || l.roughness < 0.45 {
         return Err(format!("foliage: translucency {} roughness {}", l.translucency, l.roughness));
     }
     Ok(())
