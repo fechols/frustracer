@@ -49,6 +49,12 @@ cargo run --release -- --no-replay    # A/B lever: temporal seeding stays, stati
                                       # replay (and its recording) off
 cargo run --release -- --no-adopt     # A/B lever: temporal seeding stays, query skip / cut
                                       # adoption (and CutStore production) off
+cargo run --release -- --discard-seeds  # A/B/C lever: the whole temporal pipeline runs (lookups,
+                                        # ring retries, cache + cut production) but nothing is
+                                        # consumed — frames trace exactly like --no-temporal while
+                                        # paying the machinery's cost. With --spin, wall-clock
+                                        # differences isolate cost from benefit: (this −
+                                        # --no-temporal) = pure cost, (default − this) = benefit
 cargo run --release -- --no-hemi-share  # A/B lever: disable the shared hemisphere capture in fb (H)
                                         # frames — every shading point runs its own bounce tree
 cargo run --release -- --lock-res dynamic  # step-wise dynamic render resolution (DLSS-RR and XeSS)

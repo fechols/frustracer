@@ -124,6 +124,13 @@ pub struct Opts {
     /// A/B lever (--no-adopt): keep temporal seeding but disable the
     /// query skip / cut adoption (and CutStore production). Default on.
     pub adopt: bool,
+    /// A/B/C lever (--discard-seeds): run the whole temporal pipeline —
+    /// lookups, ring retries, cache + cut-store production — but consume
+    /// nothing, so every frame traces exactly like --no-temporal while
+    /// paying the machinery's full cost. With --spin this isolates cost
+    /// from benefit as wall-clock differences: (this − --no-temporal) =
+    /// pure cost, (default − this) = gross benefit. Default off.
+    pub discard_seeds: bool,
     /// A/B lever (--no-hemi-share): disable the shared hemisphere capture
     /// in fb (H) frames — every shading point runs its own bounce tree.
     /// Default on.
@@ -215,6 +222,7 @@ fn main() {
         temporal: true,
         replay: true,
         adopt: true,
+        discard_seeds: false,
         hemi_share: true,
         gpu: false,
         dxc_path: std::env::var("FRUSTRACER_DXC_PATH").unwrap_or_else(|_| {
@@ -310,6 +318,7 @@ fn main() {
             "--no-temporal" => opts.temporal = false,
             "--no-replay" => opts.replay = false,
             "--no-adopt" => opts.adopt = false,
+            "--discard-seeds" => opts.discard_seeds = true,
             "--no-hemi-share" => opts.hemi_share = false,
             "--spin" => {
                 spin = Some(args.next().unwrap_or_else(|| {
@@ -716,6 +725,7 @@ fn run_check_gpu(
             replay_rec: None,
             cut_cur: None,
             cut_prev: None,
+            discard_seeds: false,
         };
         render::render_frame(&ctx, false);
     };
@@ -2197,6 +2207,7 @@ fn run_check_gpu(
                 replay_rec: None,
                 cut_cur: None,
                 cut_prev: None,
+                discard_seeds: false,
             };
             let t0 = Instant::now();
             render::render_frame(&ctx, true);
@@ -2312,6 +2323,7 @@ fn mv_check_at(
                 replay_rec: None,
                 cut_cur: None,
                 cut_prev: None,
+                discard_seeds: false,
             };
             render::render_frame(&ctx, true);
         };
@@ -2774,6 +2786,7 @@ fn run_check_xess(
                     replay_rec: None,
                     cut_cur: None,
                     cut_prev: None,
+                    discard_seeds: false,
                 };
                 render::render_frame(&ctx, true);
             }
@@ -3013,6 +3026,7 @@ fn run_check_nppd(
             replay_rec: None,
             cut_cur: None,
             cut_prev: None,
+            discard_seeds: false,
         };
         render::render_frame(&ctx, true);
     };
@@ -3235,6 +3249,7 @@ fn run_check_oidn(
             replay_rec: None,
             cut_cur: None,
             cut_prev: None,
+            discard_seeds: false,
         };
         render::render_frame(&ctx, true);
     };
@@ -3382,6 +3397,7 @@ fn run_check_oidn(
             replay_rec: None,
             cut_cur: None,
             cut_prev: None,
+            discard_seeds: false,
         };
         match cap {
             Some(d) => render::render_frame_capped(&ctx, d),
@@ -3570,6 +3586,7 @@ fn run_check_oidn(
                 replay_rec: None,
                 cut_cur: None,
                 cut_prev: None,
+                discard_seeds: false,
             };
             render::render_frame(&ctx, true);
         }
@@ -3968,8 +3985,8 @@ fn run_spin(
     let mut replay_key: Option<camera::CamBasis> = None;
 
     eprintln!(
-        "spin {mode}: {frames} frames at {rw}x{rh}, 1-spp quality | temporal {} replay {} adopt {} | pid {}",
-        opts.temporal, opts.replay, opts.adopt, std::process::id()
+        "spin {mode}: {frames} frames at {rw}x{rh}, 1-spp quality | temporal {} replay {} adopt {} discard {} | pid {}",
+        opts.temporal, opts.replay, opts.adopt, opts.discard_seeds, std::process::id()
     );
     const WARMUP: u32 = 20;
     let mut total_ms = 0.0f64;
@@ -4013,6 +4030,7 @@ fn run_spin(
             replay_rec: if record { Some(&replay_cache) } else { None },
             cut_cur,
             cut_prev,
+            discard_seeds: opts.discard_seeds,
         };
         let t = Instant::now();
         if can_replay {
@@ -4774,6 +4792,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             replay_rec: None,
             cut_cur: None,
             cut_prev: None,
+            discard_seeds: false,
         };
         let t = Instant::now();
         for _ in 0..BENCH_FRAMES {
@@ -4866,6 +4885,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             replay_rec: Some(&rcache),
             cut_cur: None,
             cut_prev: None,
+            discard_seeds: false,
         };
         stats.clear();
         render::render_frame(&ctx_rec, true);
@@ -4935,6 +4955,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             replay_rec: None,
             cut_cur: None,
             cut_prev: None,
+            discard_seeds: false,
         };
         let t = Instant::now();
         render::render_frame_capped(&ctx, cap);
@@ -4981,6 +5002,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             replay_rec: None,
             cut_cur: Some(&cuts_a),
             cut_prev: None,
+            discard_seeds: false,
         };
         render::render_frame(&ctx, true);
     }
@@ -5084,6 +5106,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             replay_rec: None,
             cut_cur: None,
             cut_prev: None,
+            discard_seeds: false,
         };
         let t = Instant::now();
         render::render_frame(&ctx, true);
@@ -5145,6 +5168,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 replay_rec: Some(&rcache),
                 cut_cur: None,
                 cut_prev: None,
+                discard_seeds: false,
             };
             render::render_frame(&ctx, true);
         }
@@ -5192,6 +5216,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 replay_rec: None,
                 cut_cur: None,
                 cut_prev: None,
+                discard_seeds: false,
             };
             render::render_frame_replay(&ctx, &rcache);
         }
@@ -5235,6 +5260,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 replay_rec: None,
                 cut_cur: None,
                 cut_prev: None,
+                discard_seeds: false,
             };
             if fresh {
                 render::render_frame(&ctx, true);
@@ -5299,6 +5325,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 replay_rec: if do_record { Some(&rcache) } else { None },
                 cut_cur: None,
                 cut_prev: None,
+                discard_seeds: false,
             };
             let t = Instant::now();
             for _ in 0..BENCH_FRAMES {
@@ -5362,6 +5389,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 replay_rec: None,
                 cut_cur: None,
                 cut_prev: None,
+                discard_seeds: false,
             };
             render::render_frame(&ctx, true);
         }
@@ -5441,6 +5469,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 replay_rec: None,
                 cut_cur: Some(&chain_cs[0]),
                 cut_prev: None,
+                discard_seeds: false,
             };
             render::render_frame(&ctx, true);
         }
@@ -5479,6 +5508,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                     replay_rec: None,
                     cut_cur: Some(&chain_cs[ci]),
                     cut_prev: Some(&chain_cs[pi]),
+                    discard_seeds: false,
                 };
                 render::render_frame(&ctx, true);
             }
@@ -5548,6 +5578,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 replay_rec: None,
                 cut_cur: None,
                 cut_prev: cuts_opt,
+                discard_seeds: false,
             };
             // More frames than the other benches: the effect competes with
             // run-to-run noise at this frame time, and the kill criterion
@@ -7088,6 +7119,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 replay_rec: if record { Some(&replay_cache) } else { None },
                 cut_cur,
                 cut_prev,
+                discard_seeds: opts.discard_seeds,
             };
             let t = Instant::now();
             if can_replay {
