@@ -524,8 +524,14 @@ pub fn shade(
     // between the front Lambert term and the transmitted back term
     // (energy-conserving; ambient stays front-only). kd is the sampled
     // textured albedo, so back-lit leaves glow in their own colors.
+    // Transmissive glass has (almost) no diffuse response — the transmitted
+    // scene replaces it (the refraction block below); the GGX highlight
+    // stays unscaled.
     let tl = mat.translucency;
-    let mut color = kd * (direct_d * (1.0 - tl) + direct_t * tl + ambient) + direct_s;
+    let mut color = kd
+        * (1.0 - mat.transmission)
+        * (direct_d * (1.0 - tl) + direct_t * tl + ambient)
+        + direct_s;
 
     // One specular bounce: a single direction importance-sampled from the
     // anisotropic GGX VNDF (Heitz 2018), so glossy surfaces see a blurred
@@ -585,8 +591,78 @@ pub fn shade(
         }
     }
 
+    // Glass transmission: a Snell-refracted continuation ray per interface,
+    // shading-only — visibility is untouched (glass still HITS; the frustum
+    // bounds, inherited tmin, and every temporal claim stay exact). Placed
+    // after the VNDF block so no existing rng draw moves; this block draws
+    // none itself (both branch directions are pure functions of the hit, so
+    // replay/same-seed bit-identity and VisCtl burn accounting hold). The
+    // Fresnel-REFLECTED fraction at depth 0 is the VNDF bounce above (glass
+    // passes its gate via roughness < 0.45); at interior interfaces it is
+    // dropped — dimming, never gaining. Total internal reflection continues
+    // the chain as an internal mirror bounce instead of losing the energy
+    // (dead-black rims otherwise).
+    if q.reflections && mat.transmission > 0.0 && depth < TRANS_MAX_DEPTH {
+        // Entering or exiting? Re-derive the pre-flip normal orientation
+        // (surface_point returns only the viewer-facing normal; transmissive
+        // pixels are rare enough that the refetch beats widening its
+        // contract everywhere).
+        let [i0, i1, i2] = scene.indices[hit.tri as usize];
+        let w = 1.0 - hit.u - hit.v;
+        let mut n_raw = (scene.normals[i0 as usize] * w
+            + scene.normals[i1 as usize] * hit.u
+            + scene.normals[i2 as usize] * hit.v)
+            .normalize_or_zero();
+        if n_raw == Vec3A::ZERO {
+            let e1 = scene.positions[i1 as usize] - scene.positions[i0 as usize];
+            let e2 = scene.positions[i2 as usize] - scene.positions[i0 as usize];
+            n_raw = e1.cross(e2).normalize_or_zero();
+        }
+        let entering = n_raw.dot(n) >= 0.0; // the viewer-flip didn't fire
+        let eta = if entering { 1.0 / GLASS_IOR } else { GLASS_IOR };
+        let cos_i = vl.z;
+        let k = 1.0 - eta * eta * (1.0 - cos_i * cos_i);
+        let hit_p = ray.o + ray.d * hit.t;
+        let (tdir, torig, tput) = if k >= 0.0 {
+            // Exact unpolarized dielectric Fresnel (not Schlick — it must
+            // reach 1 as k -> 0 or the TIR handoff pops).
+            let cos_t = k.sqrt();
+            let rs = (eta * cos_i - cos_t) / (eta * cos_i + cos_t);
+            let rp = (cos_i - eta * cos_t) / (cos_i + eta * cos_t);
+            let fr = 0.5 * (rs * rs + rp * rp);
+            let td = (ray.d * eta + n * (eta * cos_i - cos_t)).normalize();
+            (td, hit_p - n * scene.eps, mat.transmission * (1.0 - fr))
+        } else {
+            // TIR: mirror about n, staying on the incident side.
+            (ray.d + n * (2.0 * cos_i), hit_p + n * scene.eps, mat.transmission)
+        };
+        if tput > 1e-3 {
+            let tray = Ray::new(torig, tdir);
+            ls.secondary_rays += 1;
+            let rq = Quality { fb: FrustumBounce::OFF, ..*q };
+            let tcol =
+                match bvh.intersect(scene, &tray, 0.0, f32::INFINITY, &mut ls.ray_nodes) {
+                    Some(th) => shade(
+                        scene, bvh, &tray, &th, None, &rq, rng, sun, depth + 1, ls, None,
+                        VisCtl::Off, None,
+                    ),
+                    None => sky(tdir, sun),
+                };
+            // Tinted by albedo — the classifier lifts dark MTL glass Kd
+            // toward white so this doesn't go black.
+            color += albedo * (tput * tcol);
+        }
+    }
+
     color
 }
+
+/// Fixed glassware IOR — thin-tumbler transmission needs no per-material
+/// value; the classifier's `transmission` scalar carries all the variation.
+const GLASS_IOR: f32 = 1.5;
+/// Interface budget for the refraction chain: front/back walls of a
+/// two-walled tumbler with no TIR detour. Past it, glass shades opaque.
+const TRANS_MAX_DEPTH: u32 = 4;
 
 /// GGX α from perceptual roughness + Disney-style anisotropy split. The
 /// floor keeps the NDF finite for near-mirror materials.
