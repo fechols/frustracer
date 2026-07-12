@@ -1,7 +1,12 @@
 /target
-# Downloaded benchmark scenes (San Miguel etc.) — large, third-party-licensed;
-# see the "Real scenes" section in CLAUDE.md for sources.
-/scenes/
+# Benchmark scenes (San Miguel etc., CC-licensed — keep the archive's license
+# txt next to the data) live in git LFS (see .gitattributes), with the OBJs
+# stored zstd-compressed (.obj.zst — the loader decodes transparently). The
+# original download archives and any locally decompressed plain .obj stay
+# untracked. Sources: "Real scenes" in CLAUDE.md.
+/scenes/*.zip
+/scenes/**/*.zip
+/scenes/**/*.obj
 check.png
 screenshot_*.png
 dlss_gbuf_*.png

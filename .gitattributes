@@ -1,0 +1,8 @@
+# Benchmark scene data (see "Real scenes" in CLAUDE.md) — large binaries in LFS.
+# OBJs are committed zstd-compressed (.obj.zst, ~6x — OBJ is ASCII text; the
+# loader decodes transparently); the plain-.obj pattern stays as a guard so an
+# accidental re-add of an uncompressed mesh can't bloat plain git history.
+# Scoped to scenes/ so the repo-root check*.png verification images stay plain git.
+scenes/**/*.zst filter=lfs diff=lfs merge=lfs -text
+scenes/**/*.obj filter=lfs diff=lfs merge=lfs -text
+scenes/**/*.png filter=lfs diff=lfs merge=lfs -text
