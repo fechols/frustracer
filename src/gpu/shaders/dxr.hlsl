@@ -30,7 +30,7 @@ void raygen() {
     p.color = float3(0.0, 0.0, 0.0);
     p.t = INF;
     p.rng = rng;
-    TraceRay(tlas, RAY_FLAG_FORCE_OPAQUE, 0xffu, 0u, 0u, 0u, r, p);
+    TraceRay(tlas, OPAQUE_RF, 0xffu, 0u, 0u, 0u, r, p);
 
     uint pi = id.y * rw + id.x;
     uint i3 = pi * 3u;
@@ -105,3 +105,30 @@ void miss_shadow(inout ShadowPayload p) {
 void miss_hit(inout HitPayload p) {
     p.t = -1.0;
 }
+
+#ifdef ALPHA_CUTOUT
+// Alpha-cutout any-hit shaders (alpha-masked scenes only; the BLAS drops
+// OPAQUE and the OPAQUE_RF ray flags drop FORCE_OPAQUE so these run). One
+// per payload type — a hit group's any-hit must share its ray's payload —
+// all three deferring to the SAME trace_common.hlsli::alpha_cutout the
+// RayQuery candidate loops use, so both intersectors agree bit-for-bit.
+// IgnoreHit() == moller_trumbore returning None: the candidate is removed,
+// traversal continues, TMax stays unshrunk.
+[shader("anyhit")]
+void ah_shade(inout RayPayload p, in BuiltInTriangleIntersectionAttributes a) {
+    if (alpha_cutout(PrimitiveIndex(), a.barycentrics.x, a.barycentrics.y))
+        IgnoreHit();
+}
+
+[shader("anyhit")]
+void ah_hit(inout HitPayload p, in BuiltInTriangleIntersectionAttributes a) {
+    if (alpha_cutout(PrimitiveIndex(), a.barycentrics.x, a.barycentrics.y))
+        IgnoreHit();
+}
+
+[shader("anyhit")]
+void ah_shadow(inout ShadowPayload p, in BuiltInTriangleIntersectionAttributes a) {
+    if (alpha_cutout(PrimitiveIndex(), a.barycentrics.x, a.barycentrics.y))
+        IgnoreHit();
+}
+#endif // ALPHA_CUTOUT

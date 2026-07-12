@@ -21,7 +21,13 @@
 #define CTR_HEMI_RAYS    15u // stat: hemi leaf rays
 #define CTR_V_FALSE_EMPTY 16u // verify: empty-cell claims contradicted by rays
 #define CTR_V_TMIN        17u // verify: leaf-ray tmin skipped real geometry
+#define CTR_ALPHA_REJ     18u // stat: alpha-cutout candidate rejections (ALPHA_CUTOUT scenes)
 #define CTR_COUNT        24u
+
+// Compile units that paste this file bind `counters` — rt.hlsli's cutout
+// loop keys its stat increment on this (the reference kernel and the DXR
+// library never declare the buffer and must not touch the slot).
+#define HAVE_COUNTERS 1
 
 RWStructuredBuffer<uint>  counters : register(u3);
 RWStructuredBuffer<uint3> args     : register(u4);

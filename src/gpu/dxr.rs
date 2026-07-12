@@ -13,14 +13,16 @@
 //!
 //! SBT layout (rt_dxr.hlsli mirrors the indices — keep in lockstep):
 //!   raygen @ 0    | miss @ 64: [radiance, shadow, hit_info]
-//!   hit groups @ 192: [HgShade, HgHit, null (occlusion)]
+//!   hit groups @ 192: [HgShade, HgHit, null (occlusion; the any-hit-only
+//!   HgOcclude instead on alpha-masked scenes — see ALPHA_CUTOUT)]
 
 use super::d3d12::{self, committed_buffer, transition, uav_barrier, Result};
 use super::dxc::Dxc;
 use super::trace::{
-    self, FrameCb, FrameParams, SceneGpu, CB_STRIDE, RP_FRAME_CBV, RP_GBUF, RP_PUSH, RP_SRV0,
-    RP_TEX, RP_UAV0, SRV_INDICES, SRV_MATERIALS, SRV_NORMALS, SRV_POSITIONS, SRV_TLAS,
-    SRV_TRI_MAT, UAV_ACCUM, UAV_INFO, UAV_TBUF,
+    self, FrameCb, FrameParams, SceneGpu, CB_STRIDE, RP_FRAME_CBV, RP_GBUF, RP_PUSH,
+    RP_SCENE_TEX, RP_SRV0, RP_TEX, RP_UAV0, SRV_INDICES, SRV_MATERIALS, SRV_NORMALS,
+    SRV_POSITIONS, SRV_TLAS, SRV_TRI_MAT, TEX_HEAP_BASE, TEX_TABLE_BUFS, UAV_ACCUM, UAV_INFO,
+    UAV_TBUF,
 };
 use crate::bvh::Bvh;
 use crate::scene::Scene;
@@ -86,6 +88,8 @@ pub struct DxrGpu {
     /// (the tonemap PS reads it via SRV_SLOT_DXR).
     pub hdr: ID3D12Resource,
     uav_heap: ID3D12DescriptorHeap,
+    /// GPU handle of the RP_SCENE_TEX table (heap slot TEX_HEAP_BASE).
+    tex_table: D3D12_GPU_DESCRIPTOR_HANDLE,
     /// Upscaler feed kernels (compiled only when `gbuf_full`; both kinds so
     /// --check-dxr can rewire between them like --check-gpu does) and the
     /// wired planes record_feed barriers over.
@@ -114,8 +118,18 @@ impl DxrGpu {
             device.cast().map_err(|e| format!("ID3D12Device5: {e}"))?;
         let root_sig = trace::create_root_signature(device)?;
 
-        let lib_src =
-            [trace::TRACE_COMMON_HLSLI, RT_DXR_HLSLI, trace::SHADE_HLSLI, DXR_HLSL].join("\n");
+        // Alpha-masked scenes compile the ah_* any-hit shaders + non-opaque
+        // ray flags in (trace.rs::alpha_defs — the same per-scene predicate
+        // that drops OPAQUE from the BLAS); opaque scenes compile verbatim.
+        let any_alpha = scene.any_alpha;
+        let lib_src = [
+            trace::alpha_defs(scene),
+            trace::TRACE_COMMON_HLSLI,
+            RT_DXR_HLSLI,
+            trace::SHADE_HLSLI,
+            DXR_HLSL,
+        ]
+        .join("\n");
         let dxil = dxc.compile(&lib_src, "", "lib_6_3", "dxr library", debug)?;
         let resolve_src = [trace::TRACE_COMMON_HLSLI, trace::RESOLVE_HLSL].join("\n");
         let pso_resolve = trace::compute_pso(
@@ -149,8 +163,12 @@ impl DxrGpu {
         let wname = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
         let hg_shade_name = wname("HgShade");
         let hg_hit_name = wname("HgHit");
+        let hg_occlude_name = wname("HgOcclude");
         let chs_shade_name = wname("chs_shade");
         let chs_hit_name = wname("chs_hit");
+        let ah_shade_name = wname("ah_shade");
+        let ah_hit_name = wname("ah_hit");
+        let ah_shadow_name = wname("ah_shadow");
 
         let lib_desc = D3D12_DXIL_LIBRARY_DESC {
             DXILLibrary: D3D12_SHADER_BYTECODE {
@@ -161,15 +179,33 @@ impl DxrGpu {
             NumExports: 0,
             pExports: std::ptr::null_mut(),
         };
-        let hit_group = |export: &Vec<u16>, chs: &Vec<u16>| D3D12_HIT_GROUP_DESC {
+        // ALPHA_CUTOUT scenes attach the cutout any-hit to every hit group;
+        // HgOcclude carries ONLY an any-hit (legal — SKIP_CLOSEST_HIT skips
+        // just that stage, any-hit still runs during traversal: the standard
+        // alpha-tested-shadow pattern, and the untouched-payload = occluded
+        // convention holds: all-rejected => miss_shadow writes 0).
+        let ahs = |name: &Vec<u16>| {
+            if any_alpha { PCWSTR(name.as_ptr()) } else { PCWSTR::null() }
+        };
+        let hit_group = |export: &Vec<u16>, chs: PCWSTR, ah: PCWSTR| D3D12_HIT_GROUP_DESC {
             HitGroupExport: PCWSTR(export.as_ptr()),
             Type: D3D12_HIT_GROUP_TYPE_TRIANGLES,
-            AnyHitShaderImport: PCWSTR::null(),
-            ClosestHitShaderImport: PCWSTR(chs.as_ptr()),
+            AnyHitShaderImport: ah,
+            ClosestHitShaderImport: chs,
             IntersectionShaderImport: PCWSTR::null(),
         };
-        let hg_shade = hit_group(&hg_shade_name, &chs_shade_name);
-        let hg_hit = hit_group(&hg_hit_name, &chs_hit_name);
+        let hg_shade = hit_group(
+            &hg_shade_name,
+            PCWSTR(chs_shade_name.as_ptr()),
+            ahs(&ah_shade_name),
+        );
+        let hg_hit =
+            hit_group(&hg_hit_name, PCWSTR(chs_hit_name.as_ptr()), ahs(&ah_hit_name));
+        let hg_occlude = hit_group(
+            &hg_occlude_name,
+            PCWSTR::null(),
+            PCWSTR(ah_shadow_name.as_ptr()),
+        );
         // RayPayload {float3 + float + uint} = 20 B is the largest payload;
         // triangle barycentrics = 8 B.
         let shader_cfg = D3D12_RAYTRACING_SHADER_CONFIG {
@@ -186,7 +222,7 @@ impl DxrGpu {
         let sub = |t: D3D12_STATE_SUBOBJECT_TYPE, p: *const std::ffi::c_void| {
             D3D12_STATE_SUBOBJECT { Type: t, pDesc: p }
         };
-        let subobjects = [
+        let mut subobjects = vec![
             sub(D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY, &lib_desc as *const _ as *const _),
             sub(D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hg_shade as *const _ as *const _),
             sub(D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hg_hit as *const _ as *const _),
@@ -200,6 +236,14 @@ impl DxrGpu {
             ),
             sub(D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE, &grs as *const _ as *const _),
         ];
+        // HgOcclude imports ah_shadow, which only exports under ALPHA_CUTOUT
+        // — the subobject exists exactly when the library exports it.
+        if any_alpha {
+            subobjects.push(sub(
+                D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP,
+                &hg_occlude as *const _ as *const _,
+            ));
+        }
         let so_desc = D3D12_STATE_OBJECT_DESC {
             Type: D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE,
             NumSubobjects: subobjects.len() as u32,
@@ -231,7 +275,12 @@ impl DxrGpu {
         put(SBT_MISS + 2 * IDENT, ident("miss_hit")?);
         put(SBT_HIT, ident("HgShade")?);
         put(SBT_HIT + IDENT, ident("HgHit")?);
-        // Hit group 2 (occlusion rays) stays the zeroed null record.
+        // Hit group 2 (occlusion rays): the zeroed null record on opaque
+        // scenes (SKIP_CLOSEST_HIT + FORCE_OPAQUE never run a shader from
+        // it); the any-hit-only HgOcclude on alpha-masked scenes.
+        if any_alpha {
+            put(SBT_HIT + 2 * IDENT, ident("HgOcclude")?);
+        }
 
         let scene_gpu = SceneGpu::new(device, scene, bvh)?;
 
@@ -251,12 +300,14 @@ impl DxrGpu {
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
         )?;
         // Slot 0 = hdr (the resolve target), slots 1..7 = the feed planes
-        // (wired later); 8 descriptors unconditionally — the layout is the
-        // tracer's, and empty slots are never referenced without a wire.
+        // (wired later), slots TEX_HEAP_BASE.. = the RP_SCENE_TEX scene
+        // table — the tracer's heap layout exactly.
         let uav_heap: ID3D12DescriptorHeap = unsafe {
             device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                NumDescriptors: 1 + trace::NUM_FEED,
+                NumDescriptors: TEX_HEAP_BASE
+                    + TEX_TABLE_BUFS
+                    + scene_gpu.textures.len() as u32,
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                 ..Default::default()
             })
@@ -269,6 +320,16 @@ impl DxrGpu {
                 None,
                 uav_heap.GetCPUDescriptorHandleForHeapStart(),
             )
+        };
+        scene_gpu.write_scene_descriptors(device, &uav_heap, TEX_HEAP_BASE);
+        let tex_table = D3D12_GPU_DESCRIPTOR_HANDLE {
+            ptr: unsafe { uav_heap.GetGPUDescriptorHandleForHeapStart() }.ptr
+                + TEX_HEAP_BASE as u64
+                    * unsafe {
+                        device.GetDescriptorHandleIncrementSize(
+                            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        )
+                    } as u64,
         };
         let frame_cb = d3d12::UploadBuffer::new(device, CB_STRIDE * d3d12::FRAMES_IN_FLIGHT)?;
 
@@ -295,6 +356,7 @@ impl DxrGpu {
             gbuf_full,
             hdr,
             uav_heap,
+            tex_table,
             pso_feed_xess,
             pso_feed_rr,
             feed: None,
@@ -390,6 +452,10 @@ impl DxrGpu {
                 RP_SRV0 + SRV_TLAS,
                 s.tlas.GetGPUVirtualAddress(),
             );
+            // The scene-texture table (t0..t3 + texs[] in space1) — heap
+            // before table, same as the tracer's bind_common.
+            list.SetDescriptorHeaps(&[Some(self.uav_heap.clone())]);
+            list.SetComputeRootDescriptorTable(RP_SCENE_TEX, self.tex_table);
         }
     }
 

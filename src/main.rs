@@ -1164,6 +1164,11 @@ fn run_check_dxr(
             eprintln!("check-dxr: FAIL gbuf sky gate vacuous (no sky pixels on the default scene)");
             ok = false;
         }
+        // Textured scenes: the pack's albedo plane vs a CPU render (the
+        // guide-chain proof; the check-gpu M7 twin).
+        if !albedo_ab_check(scene, bvh, cam0, &ga, &ta, pw, ph, "dxr") {
+            ok = false;
+        }
 
         // --- T5: the XeSS feed over the DXR pack (frame B, still resident) ---
         {
@@ -1951,7 +1956,7 @@ fn run_check_gpu(
         read_f32(&mut hg, &tg.tbuf, px),
         read_u32(&mut hg, &tg.info, px),
         read_f32(&mut hg, &tg.accum, px * 3),
-        read_u32(&mut hg, &tg.counters, 16),
+        read_u32(&mut hg, &tg.counters, gpu::trace::CTR_COUNT as usize),
     ) {
         (Ok(a), Ok(b), Ok(c), Ok(d)) => (a, b, c, d),
         _ => {
@@ -2012,6 +2017,24 @@ fn run_check_gpu(
     );
     if ctrs[gpu::trace::CTR_OVERFLOW as usize] != 0 {
         eprintln!("check-gpu: FAIL queue overflow (queues are sized to the structural worst case)");
+        ok = false;
+    }
+    // Alpha-cutout anti-vacuity: an alpha-masked scene's wavefront frame
+    // must actually reject candidates, or the cutout path is dead code
+    // (scene-derived, independent of `structural`). Caveat: a custom --cam
+    // pose whose view contains no masked geometry would trip this — the
+    // CLAUDE.md canopy-caveat class; the default OBJ poses see foliage.
+    let alpha_rej = ctrs[gpu::trace::CTR_ALPHA_REJ as usize];
+    if scene.any_alpha {
+        eprintln!("check-gpu: alpha-cutout rejections: {alpha_rej}");
+        if alpha_rej == 0 {
+            eprintln!("check-gpu: FAIL alpha-masked scene rejected 0 candidates (cutout must fire)");
+            ok = false;
+        }
+    } else if alpha_rej != 0 {
+        eprintln!(
+            "check-gpu: FAIL {alpha_rej} alpha rejections on an opaque scene (ALPHA_CUTOUT must be compiled out)"
+        );
         ok = false;
     }
     if dangling != 0 {
@@ -2439,6 +2462,11 @@ fn run_check_gpu(
         // n_sky must-fire; --stress skips).
         if must_fire && skies == 0 {
             eprintln!("check-gpu: FAIL gbuf sky gate vacuous (no sky pixels on the default scene)");
+            ok = false;
+        }
+        // Textured scenes: the pack's albedo plane vs a CPU render (the
+        // guide-chain proof — RR/XeSS/FSR/NPPD all read this plane).
+        if !albedo_ab_check(scene, bvh, cam0, &ga, &ta, pw, ph, "gpu") {
             ok = false;
         }
 
@@ -3480,6 +3508,125 @@ fn run_check_dlss(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, dump: bool
 /// centers — the reconstruction in the self-test assumes centers. Shared by
 /// --check-dlss (the fixed DLSS-style resolutions) and --check-xess (a sweep
 /// of dynamic render resolutions).
+/// Textured-albedo A/B (check-gpu M7 / check-dxr T4, textured scenes only):
+/// the GPU pack's diffuse-albedo plane vs a CPU `GBufs` render at the same
+/// pose/contract, compared over class-matched hit pixels. Gates: mean |d|
+/// per channel <= 0.02 (hardware sRGB decode + bilinear filter vs the CPU
+/// LUT — precision slack, not a semantic gap) and > 64 distinct GPU albedo
+/// values (a flat-Kd regression collapses to one value per material and
+/// cannot pass). Also prints the pose's transmissive-hit pixel count (a
+/// center-ray re-trace) — the per-pose glass anti-vacuity signal, unGated
+/// because it is pose-dependent. Returns gate pass; opaque untextured
+/// scenes return true silently.
+#[cfg(windows)]
+fn albedo_ab_check(
+    scene: &scene::Scene,
+    bvh: &bvh::Bvh,
+    cam0: Camera,
+    gpu_g: &dlss::GBufs,
+    gpu_t: &[f32],
+    pw: usize,
+    ph: usize,
+    tag: &str,
+) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if scene.textures.is_empty() {
+        return true;
+    }
+    let q = Quality::upscaler_1spp();
+    let stats = Stats::default();
+    let accum: Vec<AtomicU32> = (0..pw * ph * 3).map(|_| AtomicU32::new(0)).collect();
+    let info: Vec<AtomicU32> = (0..pw * ph).map(|_| AtomicU32::new(0)).collect();
+    let tbuf: Vec<AtomicU32> = (0..pw * ph).map(|_| AtomicU32::new(0)).collect();
+    let basis = cam0.basis(pw, ph);
+    let cg = dlss::GBufs::new(pw, ph);
+    let ctx = FrameCtx {
+        scene,
+        bvh,
+        cam: basis,
+        q,
+        frame: 0,
+        jitter: false,
+        rw: pw,
+        rh: ph,
+        accum: &accum,
+        info: &info,
+        tbuf: &tbuf,
+        stats: &stats,
+        sun: render::sun_dir(scene),
+        tcache_cur: None,
+        tcache_prev: &[],
+        accumulate: false,
+        gbuf: Some(&cg),
+        fsr_buf: None,
+        prev_cam: None,
+        frame_jitter: Some((0.0, 0.0)),
+        adaptive: false,
+        hemi_share: false,
+        replay_rec: None,
+        cut_cur: None,
+        cut_prev: None,
+        discard_seeds: false,
+    };
+    render::render_frame(&ctx, true);
+
+    let mut n = 0usize;
+    let mut sum = [0.0f64; 3];
+    let mut distinct = std::collections::HashSet::new();
+    for i in 0..pw * ph {
+        let cpu_hit = f32::from_bits(tbuf[i].load(Relaxed)).is_finite();
+        if !cpu_hit || !gpu_t[i].is_finite() {
+            continue;
+        }
+        n += 1;
+        let mut key = [0u16; 3];
+        for c in 0..3 {
+            let a = dlss::ld16(&gpu_g.diff_alb[i * 3 + c]);
+            let b = dlss::ld16(&cg.diff_alb[i * 3 + c]);
+            sum[c] += (a - b).abs() as f64;
+            key[c] = gpu_g.diff_alb[i * 3 + c].load(Relaxed);
+        }
+        distinct.insert(key);
+    }
+    // Per-pose glass presence: center-ray re-trace (the GBufs don't store
+    // the hit tri). Printed, not gated — a pose can legitimately see none.
+    let glass_px: usize = (0..ph)
+        .into_par_iter()
+        .map(|y| {
+            let mut stats = stats::LocalStats::default();
+            let mut count = 0usize;
+            for x in 0..pw {
+                let ray = bvh::Ray::new(
+                    basis.origin,
+                    basis.ray_dir(x as f32 + 0.5, y as f32 + 0.5),
+                );
+                if let Some(h) = bvh.intersect(scene, &ray, 0.0, f32::INFINITY, &mut stats.ray_nodes)
+                {
+                    if scene.materials[scene.tri_mat[h.tri as usize] as usize].transmission > 0.0 {
+                        count += 1;
+                    }
+                }
+            }
+            count
+        })
+        .sum();
+    let mean = |c: usize| if n > 0 { sum[c] / n as f64 } else { 0.0 };
+    eprintln!(
+        "check-{tag}: albedo A/B ({pw}x{ph}): mean |d| {:.4}/{:.4}/{:.4} over {n} px | distinct GPU albedos {} | glass px {glass_px}",
+        mean(0), mean(1), mean(2), distinct.len(),
+    );
+    let mut pass = true;
+    if mean(0) > 0.02 || mean(1) > 0.02 || mean(2) > 0.02 {
+        eprintln!("check-{tag}: FAIL textured albedo off the CPU render (flat-Kd regression?)");
+        pass = false;
+    }
+    if distinct.len() <= 64 {
+        eprintln!("check-{tag}: FAIL <= 64 distinct GPU albedo values (textures not sampled)");
+        pass = false;
+    }
+    pass
+}
+
 fn mv_check_at(
     scene: &scene::Scene,
     bvh: &bvh::Bvh,

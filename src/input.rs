@@ -82,7 +82,7 @@ impl Input {
 
         let mut speed = diag * 0.25 * dt;
         if down(Scancode::LCtrl) || down(Scancode::RCtrl) {
-            speed *= 4.0;
+            speed /= 16.0;
         }
         if down(Scancode::LShift) || down(Scancode::RShift) {
             speed /= 8.0;
