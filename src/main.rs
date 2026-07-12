@@ -125,6 +125,13 @@ pub struct Opts {
     /// A/B lever (--no-adopt): keep temporal seeding but disable the
     /// query skip / cut adoption (and CutStore production). Default on.
     pub adopt: bool,
+    /// A/B/C lever (--discard-seeds): run the whole temporal pipeline —
+    /// lookups, ring retries, cache + cut-store production — but consume
+    /// nothing, so every frame traces exactly like --no-temporal while
+    /// paying the machinery's full cost. With --spin this isolates cost
+    /// from benefit as wall-clock differences: (this − --no-temporal) =
+    /// pure cost, (default − this) = gross benefit. Default off.
+    pub discard_seeds: bool,
     /// A/B lever (--no-hemi-share): disable the shared hemisphere capture
     /// in fb (H) frames — every shading point runs its own bounce tree.
     /// Default on.
@@ -133,6 +140,10 @@ pub struct Opts {
     /// D3D12 compute with DXR RayQuery rays. Requires the DXC DLL drop and
     /// RT tier 1.1; falls back to the CPU path with a loud line otherwise.
     pub gpu: bool,
+    /// Start with the DXR DispatchRays pipeline on (--dxr; the F key
+    /// toggles it live against the CPU tracer). Requires the DXC DLL drop
+    /// and RT tier 1.0; falls back to the CPU path with a loud line.
+    pub dxr: bool,
     /// Directory holding dxcompiler.dll + dxil.dll.
     pub dxc_path: String,
     /// PIX Begin/End events on the D3D12 command lists (--pix-markers;
@@ -216,8 +227,10 @@ fn main() {
         temporal: true,
         replay: true,
         adopt: true,
+        discard_seeds: false,
         hemi_share: true,
         gpu: false,
+        dxr: false,
         dxc_path: std::env::var("FRUSTRACER_DXC_PATH").unwrap_or_else(|_| {
             concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\dxc\bin\x64").to_string()
         }),
@@ -236,6 +249,7 @@ fn main() {
     let mut nppd_dump = false;
     let mut no_xess_explicit = false;
     let mut check_gpu = false;
+    let mut check_dxr = false;
     let mut stress: Option<usize> = None;
     let mut cam_override: Option<Camera> = None;
     let mut spin: Option<String> = None;
@@ -312,6 +326,7 @@ fn main() {
             "--no-temporal" => opts.temporal = false,
             "--no-replay" => opts.replay = false,
             "--no-adopt" => opts.adopt = false,
+            "--discard-seeds" => opts.discard_seeds = true,
             "--no-hemi-share" => opts.hemi_share = false,
             "--spin" => {
                 spin = Some(args.next().unwrap_or_else(|| {
@@ -391,6 +406,8 @@ fn main() {
             "--oidn-no-clean-aux" => opts.oidn_clean_aux = false,
             "--gpu" => opts.gpu = true,
             "--check-gpu" => check_gpu = true,
+            "--dxr" => opts.dxr = true,
+            "--check-dxr" => check_dxr = true,
             "--dxc-path" => {
                 opts.dxc_path = args.next().unwrap_or_else(|| {
                     eprintln!("--dxc-path needs a directory argument");
@@ -459,6 +476,9 @@ fn main() {
                 eprintln!("  --gpu         GPU-resident tracing: quadtree + shading in D3D12 compute with DXR");
                 eprintln!("                RayQuery rays (needs the DXC DLLs and RT tier 1.1; falls back to CPU)");
                 eprintln!("  --check-gpu   headless: GPU tracer gate suite (needs a D3D12 GPU + the DXC DLLs)");
+                eprintln!("  --dxr         start on the DXR DispatchRays pipeline (F toggles it against the CPU");
+                eprintln!("                tracer live; needs the DXC DLLs and RT tier 1.0; falls back to CPU)");
+                eprintln!("  --check-dxr   headless: DXR pipeline gate suite (needs a D3D12 RT GPU + the DXC DLLs)");
                 eprintln!("  --dxc-path    DXC DLL directory (default: SDKs\\dxc\\bin\\x64)");
                 eprintln!("  --xess        start with XeSS-SR dynamic-res upscaling (X toggles; implies DLSS off;");
                 eprintln!("                N cycles the OIDN denoise: off -> pre-upscale -> post-upscale)");
@@ -514,6 +534,12 @@ fn main() {
             // --no-xess lands here.
             eprintln!("gpu: NPPD under --gpu needs the XeSS composition; ignoring");
             opts.nppd = false;
+        }
+        if opts.dxr {
+            // The DXR pipeline is a CPU-session peer mode; --gpu is its own
+            // self-contained session.
+            eprintln!("gpu: --dxr is a CPU-session mode, unavailable under --gpu; ignoring");
+            opts.dxr = false;
         }
     }
 
@@ -576,6 +602,18 @@ fn main() {
             std::process::exit(2);
         }
     }
+    if check_dxr {
+        #[cfg(windows)]
+        {
+            let code = run_check_dxr(&scene, &bvh, cam0, &opts, stress.is_none());
+            std::process::exit(code);
+        }
+        #[cfg(not(windows))]
+        {
+            eprintln!("--check-dxr requires Windows (D3D12)");
+            std::process::exit(2);
+        }
+    }
     if check_nppd {
         #[cfg(windows)]
         {
@@ -609,6 +647,345 @@ fn main() {
         let _ = (&opts, cam0);
         eprintln!("the interactive window requires Windows (D3D12 + DLSS); use --check / --check-dlss");
         std::process::exit(2);
+    }
+}
+
+/// Headless DXR-pipeline gate suite (--check-dxr). Needs real hardware (RT
+/// tier 1.0) + the DXC DLLs, like --check-gpu. The DXR library pastes the
+/// SAME shade.hlsli as the compute tracer, so the gates mirror the
+/// --check-gpu reference gates: primary visibility vs the CPU plain
+/// reference (statistical — hardware watertight intersection differs from
+/// moller_trumbore at edges, and the RNG streams differ by design), a
+/// 64-frame converged radiance A/B, and the resolve link the tonemap reads.
+/// Exit codes: 0 = pass, 1 = a gate failed, 2 = environment.
+#[cfg(windows)]
+fn run_check_dxr(
+    scene: &scene::Scene,
+    bvh: &bvh::Bvh,
+    cam0: Camera,
+    opts: &Opts,
+    must_fire: bool,
+) -> i32 {
+    let dxc = match gpu::dxc::Dxc::load(&opts.dxc_path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("check-dxr: {e}");
+            return 2;
+        }
+    };
+    let mut hg = match gpu::trace::HeadlessGpu::new(opts.gpu_debug) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("check-dxr: device creation failed: {e}");
+            return 2;
+        }
+    };
+    eprintln!("check-dxr: adapter \"{}\"", hg.adapter_name);
+    if let Err(e) = gpu::dxr::require_caps(&hg.device) {
+        eprintln!("check-dxr: {e}");
+        return 2;
+    }
+    let caps = gpu::trace::query_caps(&hg.device).unwrap();
+    eprintln!(
+        "check-dxr: RT tier {}.{}, shader model {}.{}",
+        caps.rt_tier / 10,
+        caps.rt_tier % 10,
+        caps.shader_model >> 4,
+        caps.shader_model & 0xf
+    );
+
+    let (gw, gh) = (800usize, 600usize);
+    let mut dg = match gpu::dxr::DxrGpu::new(
+        &hg.device,
+        &dxc,
+        scene,
+        bvh,
+        gw as u32,
+        gh as u32,
+        opts.gpu_debug,
+    ) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("check-dxr: FAIL DxrGpu init (RTPSO/SBT): {e}");
+            return 1;
+        }
+    };
+    {
+        let mut rec = Ok(());
+        if let Err(e) = hg.run(|l| rec = dg.scene.record_upload(l)) {
+            eprintln!("check-dxr: FAIL scene upload submit: {e}");
+            return 1;
+        }
+        if let Err(e) = rec {
+            eprintln!("check-dxr: FAIL scene upload: {e}");
+            return 1;
+        }
+        dg.scene.free_staging();
+    }
+    eprintln!(
+        "check-dxr: RTPSO + SBT built, scene uploaded, BLAS/TLAS built ({} tris)",
+        scene.tri_count()
+    );
+
+    let q = Quality::preset(2);
+    let basis = cam0.basis(gw, gh);
+    let ua = windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    let read_f32 = |hg: &mut gpu::trace::HeadlessGpu, res, n: usize| -> Result<Vec<f32>, String> {
+        let b = hg.read_buffer(res, ua, n * 4)?;
+        Ok(b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
+    };
+
+    // CPU counterpart: the plain per-pixel reference (hybrid = false).
+    let stats = Stats::default();
+    let accum: Vec<AtomicU32> = (0..gw * gh * 3).map(|_| AtomicU32::new(0)).collect();
+    let info: Vec<AtomicU32> = (0..gw * gh).map(|_| AtomicU32::new(0)).collect();
+    let tbuf: Vec<AtomicU32> = (0..gw * gh).map(|_| AtomicU32::new(0)).collect();
+    let cpu_frame = |frame: u32| {
+        let ctx = FrameCtx {
+            scene,
+            bvh,
+            cam: basis,
+            q,
+            frame,
+            jitter: frame > 0,
+            rw: gw,
+            rh: gh,
+            accum: &accum,
+            info: &info,
+            tbuf: &tbuf,
+            stats: &stats,
+            sun: render::sun_dir(scene),
+            tcache_cur: None,
+            tcache_prev: &[],
+            accumulate: true,
+            gbuf: None,
+            prev_cam: None,
+            frame_jitter: None,
+            adaptive: false,
+            hemi_share: false,
+            replay_rec: None,
+            cut_cur: None,
+            cut_prev: None,
+            discard_seeds: false,
+        };
+        render::render_frame(&ctx, false);
+    };
+    let gpu_frame = |hg: &mut gpu::trace::HeadlessGpu,
+                     dg: &gpu::dxr::DxrGpu,
+                     frame: u32|
+     -> Result<(), String> {
+        dg.write_cb(
+            0,
+            &gpu::trace::FrameParams {
+                cam: basis,
+                frame,
+                accumulate: true,
+                jitter: frame > 0,
+                frame_jitter: None,
+                prev_cam: None,
+                q,
+                verify: false,
+            },
+        );
+        let mut rec = Ok(());
+        hg.run(|l| rec = dg.record_frame(l, 0))?;
+        rec
+    };
+
+    // T1: one unjittered DispatchRays frame vs the CPU reference — primary
+    // visibility (t + hit/sky classification), plus the must-fire halves.
+    if let Err(e) = gpu_frame(&mut hg, &dg, 0) {
+        eprintln!("check-dxr: FAIL DispatchRays: {e}");
+        return 1;
+    }
+    let gpu_t = match read_f32(&mut hg, &dg.tbuf, gw * gh) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("check-dxr: FAIL tbuf readback: {e}");
+            return 1;
+        }
+    };
+    cpu_frame(0);
+    let px = gw * gh;
+    let mut class_mismatch = 0usize;
+    let mut t_viol = 0usize;
+    let mut max_rel = 0.0f32;
+    let (mut n_hit, mut n_sky) = (0usize, 0usize);
+    for i in 0..px {
+        let ct = f32::from_bits(tbuf[i].load(Relaxed));
+        let gt = gpu_t[i];
+        if gt.is_finite() {
+            n_hit += 1;
+        } else {
+            n_sky += 1;
+        }
+        match (ct.is_finite(), gt.is_finite()) {
+            (true, true) => {
+                let rel = (ct - gt).abs() / ct.max(1e-6);
+                max_rel = max_rel.max(rel);
+                if rel > 1e-3 {
+                    t_viol += 1;
+                }
+            }
+            (false, false) => {}
+            _ => class_mismatch += 1,
+        }
+    }
+    let mut ok = true;
+    eprintln!(
+        "check-dxr: primary visibility ({px} px): hit {n_hit} | sky {n_sky} | class-mismatch {class_mismatch} | rel-t > 1e-3: {t_viol} | max rel t err {max_rel:.2e}"
+    );
+    if class_mismatch as f64 > px as f64 * 5e-4 {
+        eprintln!("check-dxr: FAIL hit/sky classification mismatch above 0.05%");
+        ok = false;
+    }
+    if t_viol as f64 > px as f64 * 1e-4 {
+        eprintln!("check-dxr: FAIL primary-t disagreement above 0.01% of pixels");
+        ok = false;
+    }
+    if must_fire && (n_hit == 0 || n_sky == 0) {
+        eprintln!("check-dxr: FAIL must-fire: the default view sees both geometry and sky");
+        ok = false;
+    }
+
+    // T2: 64-frame jittered accumulation both sides — converged radiance
+    // A/B (different RNG streams; only the means are comparable). Also the
+    // finiteness gate over the raw HDR sums.
+    const AB_FRAMES: u32 = 64;
+    for f in 0..AB_FRAMES {
+        if let Err(e) = gpu_frame(&mut hg, &dg, f) {
+            eprintln!("check-dxr: FAIL accumulation frame {f}: {e}");
+            return 1;
+        }
+    }
+    for f in 0..AB_FRAMES {
+        cpu_frame(f);
+    }
+    let gpu_acc = match read_f32(&mut hg, &dg.accum, px * 3) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("check-dxr: FAIL accum readback: {e}");
+            return 1;
+        }
+    };
+    let inv = 1.0 / AB_FRAMES as f32;
+    let mut sum_c = [0.0f64; 3];
+    let mut sum_g = [0.0f64; 3];
+    let mut sum_abs = 0.0f64;
+    let mut nonfinite = 0usize;
+    for i in 0..px * 3 {
+        let c = f32::from_bits(accum[i].load(Relaxed)) * inv;
+        let g = gpu_acc[i] * inv;
+        if !g.is_finite() || g < 0.0 {
+            nonfinite += 1;
+        }
+        sum_c[i % 3] += c as f64;
+        sum_g[i % 3] += g as f64;
+        sum_abs += (c - g).abs() as f64;
+    }
+    let mut mean_rel = 0.0f64;
+    for ch in 0..3 {
+        let rel = (sum_c[ch] - sum_g[ch]).abs() / sum_c[ch].max(1e-9);
+        mean_rel = mean_rel.max(rel);
+    }
+    eprintln!(
+        "check-dxr: radiance A/B over {AB_FRAMES} frames: per-channel mean rel diff {:.3}% | mean abs px diff {:.4} | non-finite {nonfinite}",
+        mean_rel * 100.0,
+        sum_abs / (px * 3) as f64
+    );
+    if nonfinite > 0 {
+        eprintln!("check-dxr: FAIL non-finite or negative HDR samples");
+        ok = false;
+    }
+    if mean_rel > 0.02 {
+        eprintln!("check-dxr: FAIL converged radiance means differ by more than 2%");
+        ok = false;
+    }
+
+    // T3: the resolve pass (accum -> RGBA16F, the tonemap PS's input) —
+    // texel == accum/samples within f16 precision; the present chain's only
+    // compute link, verified headlessly.
+    {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        };
+        if let Err(e) = hg.run(|l| dg.record_resolve(l, 0, AB_FRAMES)) {
+            eprintln!("check-dxr: FAIL resolve dispatch: {e}");
+            return 1;
+        }
+        let pitch = gpu::d3d12::aligned_pitch(gw * 8);
+        let rb = match gpu::d3d12::ReadbackBuffer::new(&hg.device, pitch * gh) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("check-dxr: FAIL readback alloc: {e}");
+                return 1;
+            }
+        };
+        let fp = gpu::d3d12::footprint(
+            windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+            gw as u32,
+            gh as u32,
+            8,
+            0,
+        );
+        let hdr = dg.hdr.clone();
+        if let Err(e) = hg.run(|l| unsafe {
+            l.ResourceBarrier(&[gpu::d3d12::transition(
+                &hdr,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            l.CopyTextureRegion(
+                &gpu::d3d12::loc_footprint(&rb.resource, fp),
+                0,
+                0,
+                0,
+                &gpu::d3d12::loc_subresource(&hdr),
+                None,
+            );
+            l.ResourceBarrier(&[gpu::d3d12::transition(
+                &hdr,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            )]);
+        }) {
+            eprintln!("check-dxr: FAIL hdr readback: {e}");
+            return 1;
+        }
+        let mut ptr = std::ptr::null_mut();
+        if let Err(e) = unsafe { rb.resource.Map(0, None, Some(&mut ptr)) } {
+            eprintln!("check-dxr: FAIL hdr Map: {e}");
+            return 1;
+        }
+        let mut resolve_viol = 0usize;
+        for y in 0..gh {
+            let row: &[[half::f16; 4]] = unsafe {
+                std::slice::from_raw_parts((ptr as *const u8).add(y * pitch) as *const _, gw)
+            };
+            for (x, px_v) in row.iter().enumerate() {
+                let i3 = (y * gw + x) * 3;
+                for ch in 0..3 {
+                    let want = gpu_acc[i3 + ch] * inv;
+                    let got = f32::from(px_v[ch]);
+                    if (want - got).abs() > want.abs().max(1.0) * 2e-3 {
+                        resolve_viol += 1;
+                    }
+                }
+            }
+        }
+        unsafe { rb.resource.Unmap(0, None) };
+        eprintln!("check-dxr: resolve pass: {resolve_viol} texels off accum/samples (f16 tolerance)");
+        if resolve_viol > 0 {
+            eprintln!("check-dxr: FAIL resolve output disagrees with the accumulation");
+            ok = false;
+        }
+    }
+
+    if ok {
+        println!("check-dxr: PASS (DispatchRays pipeline vs the CPU plain reference)");
+        0
+    } else {
+        1
     }
 }
 
@@ -734,6 +1111,7 @@ fn run_check_gpu(
             replay_rec: None,
             cut_cur: None,
             cut_prev: None,
+            discard_seeds: false,
         };
         render::render_frame(&ctx, false);
     };
@@ -2215,6 +2593,7 @@ fn run_check_gpu(
                 replay_rec: None,
                 cut_cur: None,
                 cut_prev: None,
+                discard_seeds: false,
             };
             let t0 = Instant::now();
             render::render_frame(&ctx, true);
@@ -2330,6 +2709,7 @@ fn mv_check_at(
                 replay_rec: None,
                 cut_cur: None,
                 cut_prev: None,
+                discard_seeds: false,
             };
             render::render_frame(&ctx, true);
         };
@@ -2792,6 +3172,7 @@ fn run_check_xess(
                     replay_rec: None,
                     cut_cur: None,
                     cut_prev: None,
+                    discard_seeds: false,
                 };
                 render::render_frame(&ctx, true);
             }
@@ -3031,6 +3412,7 @@ fn run_check_nppd(
             replay_rec: None,
             cut_cur: None,
             cut_prev: None,
+            discard_seeds: false,
         };
         render::render_frame(&ctx, true);
     };
@@ -3253,6 +3635,7 @@ fn run_check_oidn(
             replay_rec: None,
             cut_cur: None,
             cut_prev: None,
+            discard_seeds: false,
         };
         render::render_frame(&ctx, true);
     };
@@ -3400,6 +3783,7 @@ fn run_check_oidn(
             replay_rec: None,
             cut_cur: None,
             cut_prev: None,
+            discard_seeds: false,
         };
         match cap {
             Some(d) => render::render_frame_capped(&ctx, d),
@@ -3588,6 +3972,7 @@ fn run_check_oidn(
                 replay_rec: None,
                 cut_cur: None,
                 cut_prev: None,
+                discard_seeds: false,
             };
             render::render_frame(&ctx, true);
         }
@@ -3986,8 +4371,8 @@ fn run_spin(
     let mut replay_key: Option<camera::CamBasis> = None;
 
     eprintln!(
-        "spin {mode}: {frames} frames at {rw}x{rh}, 1-spp quality | temporal {} replay {} adopt {} | pid {}",
-        opts.temporal, opts.replay, opts.adopt, std::process::id()
+        "spin {mode}: {frames} frames at {rw}x{rh}, 1-spp quality | temporal {} replay {} adopt {} discard {} | pid {}",
+        opts.temporal, opts.replay, opts.adopt, opts.discard_seeds, std::process::id()
     );
     const WARMUP: u32 = 20;
     let mut total_ms = 0.0f64;
@@ -4031,6 +4416,7 @@ fn run_spin(
             replay_rec: if record { Some(&replay_cache) } else { None },
             cut_cur,
             cut_prev,
+            discard_seeds: opts.discard_seeds,
         };
         let t = Instant::now();
         if can_replay {
@@ -4792,6 +5178,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             replay_rec: None,
             cut_cur: None,
             cut_prev: None,
+            discard_seeds: false,
         };
         let t = Instant::now();
         for _ in 0..BENCH_FRAMES {
@@ -4884,6 +5271,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             replay_rec: Some(&rcache),
             cut_cur: None,
             cut_prev: None,
+            discard_seeds: false,
         };
         stats.clear();
         render::render_frame(&ctx_rec, true);
@@ -4960,6 +5348,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             replay_rec: None,
             cut_cur: None,
             cut_prev: None,
+            discard_seeds: false,
         };
         let t = Instant::now();
         render::render_frame_capped(&ctx, cap);
@@ -5006,6 +5395,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             replay_rec: None,
             cut_cur: Some(&cuts_a),
             cut_prev: None,
+            discard_seeds: false,
         };
         render::render_frame(&ctx, true);
     }
@@ -5109,6 +5499,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             replay_rec: None,
             cut_cur: None,
             cut_prev: None,
+            discard_seeds: false,
         };
         let t = Instant::now();
         render::render_frame(&ctx, true);
@@ -5170,6 +5561,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 replay_rec: Some(&rcache),
                 cut_cur: None,
                 cut_prev: None,
+                discard_seeds: false,
             };
             render::render_frame(&ctx, true);
         }
@@ -5230,6 +5622,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 replay_rec: None,
                 cut_cur: None,
                 cut_prev: None,
+                discard_seeds: false,
             };
             render::render_frame_replay(&ctx, &rcache);
             let (dt, di, da) = (
@@ -5276,6 +5669,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 replay_rec: None,
                 cut_cur: None,
                 cut_prev: None,
+                discard_seeds: false,
             };
             if fresh {
                 render::render_frame(&ctx, true);
@@ -5345,6 +5739,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 replay_rec: if do_record { Some(&rcache) } else { None },
                 cut_cur: None,
                 cut_prev: None,
+                discard_seeds: false,
             };
             let t = Instant::now();
             for _ in 0..BENCH_FRAMES {
@@ -5408,6 +5803,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 replay_rec: None,
                 cut_cur: None,
                 cut_prev: None,
+                discard_seeds: false,
             };
             render::render_frame(&ctx, true);
         }
@@ -5487,6 +5883,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 replay_rec: None,
                 cut_cur: Some(&chain_cs[0]),
                 cut_prev: None,
+                discard_seeds: false,
             };
             render::render_frame(&ctx, true);
         }
@@ -5525,6 +5922,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                     replay_rec: None,
                     cut_cur: Some(&chain_cs[ci]),
                     cut_prev: Some(&chain_cs[pi]),
+                    discard_seeds: false,
                 };
                 render::render_frame(&ctx, true);
             }
@@ -5594,6 +5992,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 replay_rec: None,
                 cut_cur: None,
                 cut_prev: cuts_opt,
+                discard_seeds: false,
             };
             // More frames than the other benches: the effect competes with
             // run-to-run noise at this frame time, and the kill criterion
@@ -6217,6 +6616,46 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
             nppd_failed = true;
         }
     }
+    // DXR pipeline state — the by-the-book DispatchRays mode (F toggles it
+    // against the CPU tracer live; mutually exclusive with DLSS/OIDN/XeSS/
+    // NPPD; unavailable under --gpu, which is its own session). Lazily
+    // built on first enable — DXC load, RTPSO compile, scene + BLAS/TLAS
+    // upload, all once; a failed init is remembered and not retried per
+    // keypress. Frame semantics mirror the --gpu plain sub-mode.
+    let mut dxr_on = false;
+    let mut dxr_failed = false;
+    if opts.dxr && !gpu_trace {
+        match gpu::dxc::Dxc::load(&opts.dxc_path)
+            .and_then(|dxc| gpu.init_dxr(&dxc, scene, bvh, opts.gpu_debug))
+        {
+            Ok(()) => {
+                dxr_on = true;
+                if dlss_on {
+                    dlss_on = false;
+                    eprintln!("dlss: Ray Reconstruction OFF (--dxr; G re-enables)");
+                }
+                if xess_on {
+                    xess_on = false;
+                    xess_prev = None;
+                    eprintln!("xess: OFF (--dxr; X re-enables)");
+                }
+                if oidn_on {
+                    oidn_on = false;
+                    eprintln!("oidn: OFF (--dxr; N re-enables)");
+                }
+                if nppd_on {
+                    nppd_on = false;
+                    nppd_prev = None;
+                    eprintln!("nppd: OFF (--dxr; J re-enables)");
+                }
+                eprintln!("dxr: DispatchRays pipeline ON at {W}x{H} (F toggles CPU <-> DXR)");
+            }
+            Err(e) => {
+                eprintln!("dxr: falling back to CPU tracing — {e}");
+                dxr_failed = true;
+            }
+        }
+    }
     let mut prev_budget = false;
     // Depth cap that fully resolves the screen (tiles reach LEAF_TILE): 7 at 1024.
     let depth_full: f32 = ((W.max(H) as f32) / render::LEAF_TILE as f32).log2().ceil();
@@ -6341,6 +6780,9 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
             }
             if edges.toggle_temporal {
                 eprintln!("gpu: the OIDN reprojection history is CPU-only; unavailable under --gpu");
+            }
+            if edges.toggle_dxr {
+                eprintln!("gpu: the DXR DispatchRays pipeline is a CPU-session mode; unavailable under --gpu");
             }
             if moved {
                 frame = 0;
@@ -6624,6 +7066,10 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                     xess_prev = None;
                     eprintln!("xess: OFF (DLSS enabled)");
                 }
+                if dlss_on && dxr_on {
+                    dxr_on = false;
+                    eprintln!("dxr: OFF (DLSS enabled)");
+                }
                 eprintln!("dlss: Ray Reconstruction {}", if dlss_on { "ON" } else { "OFF" });
             } else {
                 eprintln!("dlss: not available");
@@ -6656,6 +7102,10 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                     nppd_on = false;
                     nppd_prev = None;
                     eprintln!("nppd: OFF (XeSS enabled)");
+                }
+                if xess_on && dxr_on {
+                    dxr_on = false;
+                    eprintln!("dxr: OFF (XeSS enabled)");
                 }
                 eprintln!(
                     "xess: {}",
@@ -6724,6 +7174,10 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                     nppd_on = false;
                     nppd_prev = None;
                     eprintln!("nppd: OFF (OIDN enabled)");
+                }
+                if dxr_on {
+                    dxr_on = false;
+                    eprintln!("dxr: OFF (OIDN enabled)");
                 }
                 eprintln!(
                     "oidn: ON{}, temporal reprojection {} (M toggles)",
@@ -6796,10 +7250,58 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                     oidn_on = false;
                     eprintln!("oidn: OFF (NPPD enabled)");
                 }
+                if dxr_on {
+                    dxr_on = false;
+                    eprintln!("dxr: OFF (NPPD enabled)");
+                }
                 let c = nppd_ctx.as_ref().unwrap();
                 eprintln!("nppd: neural denoising ON ({} | onnxruntime {})", c.device_desc, c.ort_version);
             } else {
                 nppd_failed = true;
+            }
+        }
+        if edges.toggle_dxr {
+            if dxr_on {
+                dxr_on = false;
+                frame = 0;
+                eprintln!("dxr: OFF (CPU tracing)");
+            } else if dxr_failed {
+                eprintln!("dxr: unavailable (earlier init failed; restart with --dxc-path to retry)");
+            } else {
+                match gpu::dxc::Dxc::load(&opts.dxc_path)
+                    .and_then(|dxc| gpu.init_dxr(&dxc, scene, bvh, opts.gpu_debug))
+                {
+                    Ok(()) => {
+                        dxr_on = true;
+                        frame = 0;
+                        if dlss_on {
+                            dlss_on = false;
+                            dlss_prev = None;
+                            dlss_reset = true;
+                            eprintln!("dlss: Ray Reconstruction OFF (DXR enabled)");
+                        }
+                        if xess_on {
+                            xess_on = false;
+                            xess_prev = None;
+                            xess_reset = true;
+                            eprintln!("xess: OFF (DXR enabled)");
+                        }
+                        if oidn_on {
+                            oidn_on = false;
+                            eprintln!("oidn: OFF (DXR enabled)");
+                        }
+                        if nppd_on {
+                            nppd_on = false;
+                            nppd_prev = None;
+                            eprintln!("nppd: OFF (DXR enabled)");
+                        }
+                        eprintln!("dxr: DispatchRays pipeline ON (F toggles CPU <-> DXR)");
+                    }
+                    Err(e) => {
+                        eprintln!("dxr: unavailable — {e}");
+                        dxr_failed = true;
+                    }
+                }
             }
         }
         // True only when M actually flipped oidn_temporal (not the Post/no-op
@@ -6840,6 +7342,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
             || edges.toggle_xess
             || edges.toggle_oidn
             || edges.toggle_nppd
+            || edges.toggle_dxr
             || temporal_flipped
         {
             xess_reset = true;
@@ -6861,6 +7364,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
             || edges.toggle_dlss
             || edges.toggle_xess
             || edges.toggle_nppd
+            || edges.toggle_dxr
             || temporal_flipped;
         if hist_stale {
             if let Some(h) = &mut oidn_hist {
@@ -6872,6 +7376,87 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
             if let Some(c) = &mut nppd_ctx {
                 c.reset_temporal();
             }
+        }
+
+        // DXR mode: a self-contained arm — the frame is traced by
+        // DispatchRays, resolved, tonemapped, and presented on the GPU; the
+        // CPU render machinery below (budget frames, temporal ring, the
+        // denoiser modes) deliberately doesn't run. Frame semantics mirror
+        // the --gpu plain sub-mode: while_moving quality with `frame`
+        // pinned at 0 (every moving frame is a fresh store), accumulate +
+        // converge when still, re-present the resolved image when converged.
+        if dxr_on {
+            let basis = cam.basis(W, H);
+            // The temporal ring must not survive non-participating frames:
+            // F-off resumes CPU tracing against whatever it still holds.
+            tr.end(false, false, basis);
+            if edges.verify {
+                eprintln!("dxr: C verify is a CPU-tracer feature; --check-dxr gates this pipeline");
+            }
+            let base_q = Quality::preset(preset);
+            // Hemi (H) tiers are CPU/wavefront features; the DXR closest-hit
+            // keeps the sampled-ambient path, so fb stays OFF here.
+            let q = if moved { base_q.while_moving() } else { base_q };
+            let p = gpu::trace::FrameParams {
+                cam: basis,
+                frame,
+                accumulate: true,
+                jitter: frame > 0,
+                frame_jitter: None,
+                prev_cam: None,
+                q,
+                verify: false,
+            };
+            let t = Instant::now();
+            if frame < MAX_SAMPLES {
+                match gpu.present_dxr(&p, frame + 1) {
+                    Ok(()) => {
+                        last_ms = t.elapsed().as_secs_f64() * 1000.0;
+                        // Moving frames stay at frame 0: every one is a fresh
+                        // store, and the first still frame re-stores at full
+                        // quality instead of adding onto a while_moving()
+                        // sample #0.
+                        if !moved {
+                            frame += 1;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("dxr: present failed ({e}); DXR OFF (F to retry)");
+                        dxr_on = false;
+                        frame = 0;
+                    }
+                }
+            } else if let Err(e) = gpu.present_dxr_hold() {
+                eprintln!("dxr: present failed: {e}");
+            }
+            if edges.screenshot {
+                match gpu.read_dxr_output() {
+                    Ok((px, sw, sh)) => {
+                        let name = format!("screenshot_{shot}.png");
+                        save_png(&name, &px, sw, sh);
+                        eprintln!("saved {name}");
+                        shot += 1;
+                    }
+                    Err(e) => eprintln!("screenshot: GPU readback failed ({e})"),
+                }
+            }
+            fps_frames += 1;
+            if (now - fps_t).as_secs_f64() >= 0.5 {
+                fps = fps_frames as f64 / (now - fps_t).as_secs_f64();
+                fps_frames = 0;
+                fps_t = now;
+                let _ = window.set_title(&format!(
+                    "frustracer | {:.0} fps | {:.1} ms | DXR {}x{} | quality {} | {} spp{}",
+                    fps,
+                    last_ms,
+                    W,
+                    H,
+                    preset,
+                    frame.min(MAX_SAMPLES),
+                    if frame >= MAX_SAMPLES { " | converged" } else { "" },
+                ));
+            }
+            continue;
         }
 
         // All toggle handlers have run: resolve this frame's mode once.
@@ -7134,6 +7719,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 replay_rec: if record { Some(&replay_cache) } else { None },
                 cut_cur,
                 cut_prev,
+                discard_seeds: opts.discard_seeds,
             };
             let t = Instant::now();
             if can_replay {

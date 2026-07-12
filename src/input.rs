@@ -20,6 +20,7 @@ pub struct Edges {
     pub toggle_xess: bool,     // X (XeSS-SR dynamic-res upscaling)
     pub toggle_oidn: bool,     // N (Open Image Denoise)
     pub toggle_nppd: bool,     // J (NPPD neural denoiser)
+    pub toggle_dxr: bool,      // F (DXR DispatchRays pipeline)
     pub toggle_temporal: bool, // M (OIDN temporal reprojection)
     pub toggle_bounce: bool,   // H (hemisphere frustum bounces)
     pub verify: bool,          // C
@@ -54,6 +55,7 @@ impl Input {
                     Keycode::X => e.toggle_xess = true,
                     Keycode::N => e.toggle_oidn = true,
                     Keycode::J => e.toggle_nppd = true,
+                    Keycode::F => e.toggle_dxr = true,
                     Keycode::M => e.toggle_temporal = true,
                     Keycode::H => e.toggle_bounce = true,
                     Keycode::C => e.verify = true,

@@ -79,6 +79,8 @@ impl Dxc {
     }
 
     /// Compile HLSL source to DXIL. `what` names the kernel in errors.
+    /// An empty `entry` omits -E — required for lib_* targets (a DXR library
+    /// exports every [shader("...")] entry; naming one is a compile error).
     pub fn compile(
         &self,
         src: &str,
@@ -88,14 +90,15 @@ impl Dxc {
         debug: bool,
     ) -> Result<Vec<u8>> {
         let mut args: Vec<String> = vec![
-            "-E".into(),
-            entry.into(),
             "-T".into(),
             target.into(),
             // HLSL 2021 semantics; kernels are written against it.
             "-HV".into(),
             "2021".into(),
         ];
+        if !entry.is_empty() {
+            args.extend(["-E".into(), entry.into()]);
+        }
         if debug {
             // Unoptimized + embedded debug info for PIX shader debugging.
             args.extend(["-Od".into(), "-Zi".into(), "-Qembed_debug".into()]);
