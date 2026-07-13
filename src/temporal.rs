@@ -35,7 +35,7 @@ use crate::frustum::MAX_CUT;
 use crate::render::LEAF_TILE;
 use crate::stats::LocalStats;
 use glam::Vec3A;
-use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 
 /// Outward padding (px) on the query bbox before selecting overlapped cells.
 /// Errs inclusive — extra cells only lower the min — and covers projection /
@@ -124,7 +124,7 @@ impl TemporalCache {
 /// real bound query (which re-extends the claim and re-anchors the cut at
 /// age 0). Claims shrink by δ per hop and adopted cuts inherit the previous
 /// pose's culling, so unbounded chains decay quality — never correctness.
-/// Must stay < 7: age 7 would collide with CutStore's u32::MAX sentinel.
+/// Must stay < 7: age 7 would collide with CutStore's u64::MAX sentinel.
 const MAX_ADOPT_AGE: u32 = 3;
 
 /// Cut-arena budget in u32 per terminal-count unit (see `CutStore::new`).
@@ -143,9 +143,13 @@ const CUT_ARENA_PER_TERMINAL: usize = 8;
 /// task per frame, read only on a later frame across the pool join.
 pub struct CutStore {
     /// One packed word per linear-quadtree slot (TemporalCache's offsets
-    /// layout): off:23 | (len−1):6 | age:3. u32::MAX = nothing stored —
-    /// unreachable as a real value because age 7 is never written.
-    idx: Vec<AtomicU32>,
+    /// layout): off:32 | (len−1):6 | age:3. u64::MAX = nothing stored —
+    /// unreachable as a real value because age 7 is never written. The
+    /// 32-bit off field covers any arena `top` (an AtomicU32) can address —
+    /// resolution can never outgrow the packing (a 23-bit off was tried and
+    /// silently truncated past ~16.8M window pixels: adopted tiles refined
+    /// OTHER nodes' cuts and false-skied — the 8K corruption bug).
+    idx: Vec<AtomicU64>,
     arena: Vec<AtomicU32>,
     top: AtomicU32,
     offsets: Vec<usize>,
@@ -166,12 +170,13 @@ impl CutStore {
         // Arena budget: Split nodes number < terminals (branching ≥ 2), and
         // terminals ≤ ceil(rw/4)·ceil(rh/4) (replay.rs's bound); the mean cut
         // is ~10 on the default scene. Overflow stores nothing — the
-        // consumer just misses one adoption; counted, never wrong. The off
-        // field's 23 bits address 8M u32 — covers 4K with headroom.
+        // consumer just misses one adoption; counted, never wrong. `top` is
+        // an AtomicU32 and the packed off field holds all 32 of its bits, so
+        // the only hard cap is the bump cursor's own width.
         let arena_len = rw.div_ceil(4) * rh.div_ceil(4) * CUT_ARENA_PER_TERMINAL;
-        debug_assert!(arena_len < (1 << 23));
+        assert!(arena_len <= u32::MAX as usize, "cut arena exceeds the u32 bump cursor");
         CutStore {
-            idx: (0..total).map(|_| AtomicU32::new(u32::MAX)).collect(),
+            idx: (0..total).map(|_| AtomicU64::new(u64::MAX)).collect(),
             arena: (0..arena_len).map(|_| AtomicU32::new(0)).collect(),
             top: AtomicU32::new(0),
             offsets,
@@ -182,7 +187,7 @@ impl CutStore {
     /// Reset for a new producing frame.
     pub fn clear(&self) {
         for n in &self.idx {
-            n.store(u32::MAX, Relaxed);
+            n.store(u64::MAX, Relaxed);
         }
         self.top.store(0, Relaxed);
     }
@@ -201,7 +206,7 @@ impl CutStore {
         for (k, &v) in cut.iter().enumerate() {
             self.arena[off + k].store(v, Relaxed);
         }
-        let packed = ((off as u32) << 9) | (((cut.len() - 1) as u32) << 3) | age;
+        let packed = ((off as u64) << 9) | (((cut.len() - 1) as u64) << 3) | age as u64;
         self.idx[self.offsets[depth as usize] + path as usize].store(packed, Relaxed);
         true
     }
@@ -212,10 +217,10 @@ impl CutStore {
             return None;
         }
         let v = self.idx[self.offsets[depth as usize] + path as usize].load(Relaxed);
-        if v == u32::MAX {
+        if v == u64::MAX {
             return None;
         }
-        Some((v >> 9, ((v >> 3) & 63) + 1, v & 7))
+        Some(((v >> 9) as u32, ((v >> 3) & 63) as u32 + 1, (v & 7) as u32))
     }
 
     /// Copy a stored cut into the caller's stack buffer; returns its length.
