@@ -17,10 +17,12 @@
 
 RWStructuredBuffer<float> accum : register(u0); // rw*rh*3 linear HDR (1-spp store)
 
-RWStructuredBuffer<float> nppd_frame  : register(u23);
-RWStructuredBuffer<float> nppd_state  : register(u24);
-RWStructuredBuffer<float> nppd_warped : register(u25);
-RWStructuredBuffer<float> nppd_out    : register(u26);
+// Registers = trace.rs::NPPD_REG_BASE.. (NUM_UAVS + 2 + NUM_FEED) — keep the
+// literals in lockstep when the feed range grows.
+RWStructuredBuffer<float> nppd_frame  : register(u26);
+RWStructuredBuffer<float> nppd_state  : register(u27);
+RWStructuredBuffer<float> nppd_warped : register(u28);
+RWStructuredBuffer<float> nppd_out    : register(u29);
 
 RWTexture2D<float4> nppd_feed_color : register(u16); // the XeSS color plane
 
@@ -36,31 +38,7 @@ uint pad32(uint v) { return (v + 31u) & ~31u; }
 // nppd::pack_inputs/warp_temporal, whose GBufs loads are f16 — check-gpu M10
 // gates the parity bit-exactly. Not the f32tof16 intrinsic: the legacy DXIL
 // op truncates (RTZ) while st16 rounds to nearest even.
-float q16(float v) {
-    uint x = asuint(v);
-    uint s = (x >> 16u) & 0x8000u;
-    x &= 0x7FFFFFFFu;
-    uint h;
-    if (x >= 0x47800000u) {            // >= 2^16: overflow -> inf; keep nan
-        h = x > 0x7F800000u ? 0x7E00u : 0x7C00u;
-    } else if (x >= 0x38800000u) {     // f16 normal range [2^-14, 2^16)
-        h = (((x >> 23u) - 112u) << 10u) | ((x >> 13u) & 0x3FFu);
-        uint rem = x & 0x1FFFu;
-        // RTNE; a mantissa carry may bump the exponent, [65520, 65536)
-        // correctly lands on inf.
-        if (rem > 0x1000u || (rem == 0x1000u && (h & 1u) != 0u)) h += 1u;
-    } else if (x >= 0x33000000u) {     // f16 subnormal range [2^-25, 2^-14)
-        uint shift = 126u - (x >> 23u); // 14..24
-        uint m = (x & 0x7FFFFFu) | 0x800000u;
-        h = m >> shift;
-        uint rem = m & ((1u << shift) - 1u);
-        uint halfb = 1u << (shift - 1u);
-        if (rem > halfb || (rem == halfb && (h & 1u) != 0u)) h += 1u;
-    } else {                           // < 2^-25 underflows to signed zero
-        h = 0u;
-    }
-    return f16tof32(s | h);
-}
+float q16(float v) { return f16tof32(f16bits_rtne(v)); } // helper lives in trace_common.hlsli
 
 // nppd::pack_inputs: one thread per PADDED pixel; the border replicates the
 // edge texel (clamped source coords — a zero border would be a synthetic

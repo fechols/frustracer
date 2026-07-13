@@ -32,6 +32,10 @@
                                // root UAVs have no bounds check: this gate is
                                // memory safety, not an optimization)
 #define FLAG_HAS_PREV     32u  // the prev_* rows carry last frame's camera basis
+#define FLAG_FSR_SIG      64u  // FSR-RR sessions: demodulated direct-light
+                               // signals in GBufPx.sig + the prev-camera
+                               // view-Z in mv.z (zeros otherwise — RR/XeSS
+                               // sessions keep their pack bytes unchanged)
 
 cbuffer Frame : register(b0) {
     float4 cam_origin;   // xyz; w = inv_w
@@ -124,23 +128,83 @@ float3 normalize_or_zero(float3 v) {
 
 // Primary-hit surface capture — the shade.rs::PrimarySurface mirror. spec_t:
 // reflection-ray hit t, INF when the reflection missed, 0 when none was traced.
+// direct_d/direct_s are the post-average direct-light lobes (lap 0 only; the
+// two addends of color = kd*(direct_d + ambient) + direct_s) — assignment-only
+// copies, zero rng draws, so the same-seed bit-identity gates hold.
 struct PrimSurf {
     float3 n;      // shading normal, post face-flip
     float rough;
     float3 albedo; // raw material albedo (diffuse/specular split at the write)
     float metallic;
     float spec_t;
+    float3 direct_d; // albedo-free direct diffuse (kd multiplies later)
+    float3 direct_s; // direct specular incl. per-sample Fresnel
 };
 
 // dlss::GBufs re-hosted as one interleaved plane; the feed kernels fan it out
-// into the upscalers' input textures. 64 B/px.
+// into the upscalers' input textures. 80 B/px (GBUF_STRIDE in trace.rs —
+// keep in lockstep).
 struct GBufPx {
     float4 nr;    // normal.xyz, roughness
     float4 alb_z; // diff_alb.xyz = albedo*(1-metallic), view_z = t*dot(dir, forward)
     float4 spec;  // spec_alb.xyz = lerp(0.04, albedo, metallic) (RGB F0), spec_hit_t
-    float4 mv;    // motion vector in render-res pixels (y-down, current -> previous); zw = 0
+    float4 mv;    // xy = motion vector in render-res pixels (y-down, current ->
+                  // previous); z = prev-camera linear view-Z of the SAME hit
+                  // point (FLAG_FSR_SIG — the denoiser MV's B channel differences
+                  // it against alb_z.w; sky stores CAM_FAR so the delta is 0);
+                  // else 0. w = 0.
+    uint4 sig;    // f16x2 packs (dd.x|dd.y, dd.z|ds.x, ds.y|ds.z, 0) of the
+                  // DEMODULATED FSR-RR signals — fsr::split_signals' twin,
+                  // f16 IS the wire precision. FLAG_FSR_SIG; else 0.
 };
 RWStructuredBuffer<GBufPx> gbuf : register(u15);
+
+// f32 -> f16 bits with round-to-nearest-even — NOT the f32tof16 intrinsic
+// (the legacy DXIL op truncates). The CPU twin is half::f16::from_f32;
+// nppd.hlsl's q16 round-trip and the sig packing below both build on it.
+uint f16bits_rtne(float v) {
+    uint x = asuint(v);
+    uint s = (x >> 16u) & 0x8000u;
+    x &= 0x7FFFFFFFu;
+    uint h;
+    if (x >= 0x47800000u) {            // >= 2^16: overflow -> inf; keep nan
+        h = x > 0x7F800000u ? 0x7E00u : 0x7C00u;
+    } else if (x >= 0x38800000u) {     // f16 normal range [2^-14, 2^16)
+        h = (((x >> 23u) - 112u) << 10u) | ((x >> 13u) & 0x3FFu);
+        uint rem = x & 0x1FFFu;
+        // RTNE; a mantissa carry may bump the exponent, [65520, 65536)
+        // correctly lands on inf.
+        if (rem > 0x1000u || (rem == 0x1000u && (h & 1u) != 0u)) h += 1u;
+    } else if (x >= 0x33000000u) {     // f16 subnormal range [2^-25, 2^-14)
+        uint shift = 126u - (x >> 23u); // 14..24
+        uint m = (x & 0x7FFFFFu) | 0x800000u;
+        h = m >> shift;
+        uint rem = m & ((1u << shift) - 1u);
+        uint halfb = 1u << (shift - 1u);
+        if (rem > halfb || (rem == halfb && (h & 1u) != 0u)) h += 1u;
+    } else {                           // < 2^-25 underflows to signed zero
+        h = 0u;
+    }
+    return s | h;
+}
+
+// fsr::f16_sat's twin: saturate into the finite f16 range (an inf on a signal
+// plane turns the residual remainder into inf*0 = NaN downstream).
+uint f16bits_sat(float v) { return f16bits_rtne(clamp(v, -65504.0, 65504.0)); }
+
+uint pack_h2(float lo, float hi) { return f16bits_sat(lo) | (f16bits_sat(hi) << 16u); }
+
+// fsr's GPU wire chain for the sqrt-encoded RGBA8 albedo planes: one explicit
+// 8-bit quantization (fsr::sqrt_wire — the GPU pack stores f32, so unlike the
+// CPU's albedo_wire there is no leading f16 rounding). Used identically at
+// the sig demodulation here, the feed's residual, and the composite decode —
+// consistency of those three sites IS the composite identity.
+float sqrt_enc8(float v) { return floor(sqrt(saturate(v)) * 255.0 + 0.5) / 255.0; }
+float sqrt_wire(float v) {
+    float enc = sqrt_enc8(v);
+    return enc * enc;
+}
+float3 sqrt_wire3(float3 v) { return float3(sqrt_wire(v.x), sqrt_wire(v.y), sqrt_wire(v.z)); }
 
 // camera.rs::CamBasis::project against the PREVIOUS basis: the continuous
 // image point a world direction passes through, y-down pixels. ok = false
@@ -173,11 +237,26 @@ void gbuf_write_hit(uint pi, float fx, float fy, float3 dir, float t, PrimSurf p
     g.spec = float4(spec_alb, isinf(ps.spec_t) ? CAM_FAR : ps.spec_t);
     float3 hit_rel = cam_origin.xyz + dir * t - prev_origin.xyz;
     g.mv = float4(gbuf_mv(hit_rel, fx, fy), 0.0, 0.0);
+    g.sig = uint4(0u, 0u, 0u, 0u);
+    if (flags & FLAG_FSR_SIG) {
+        // render.rs's fsr_buf fill: prev-camera linear view-Z of the SAME
+        // hit point (no prev camera degrades to "no depth motion"); the
+        // demodulation divides direct_s by the un-floored WIRE F0 —
+        // fsr::split_signals with sqrt_wire in place of albedo_wire (the
+        // pack stores f32; the wire quantization happens exactly once).
+        g.mv.z = (flags & FLAG_HAS_PREV) ? dot(hit_rel, prev_forward.xyz) : g.alb_z.w;
+        float3 sf0w = sqrt_wire3(spec_alb);
+        float3 dd = ps.direct_d;
+        float3 ds = ps.direct_s / max(sf0w, float3(1e-4, 1e-4, 1e-4));
+        g.sig = uint4(pack_h2(dd.x, dd.y), pack_h2(dd.z, ds.x), pack_h2(ds.y, ds.z), 0u);
+    }
     gbuf[pi] = g;
 }
 
 // render.rs::write_gbuf_sky: depth = far (finite, f16-safe); MV = direction-
-// only reprojection (exact for an environment at infinity).
+// only reprojection (exact for an environment at infinity). FSR sessions:
+// sig = 0 (residual = the sky color itself downstream) and prev-Z = far so
+// the depth delta is exactly 0 — the sky contract --check-fsr pins.
 void gbuf_write_sky(uint pi, float fx, float fy, float3 dir) {
     if ((flags & FLAG_GBUF) == 0u) return;
     GBufPx g;
@@ -185,6 +264,10 @@ void gbuf_write_sky(uint pi, float fx, float fy, float3 dir) {
     g.alb_z = float4(1.0, 1.0, 1.0, CAM_FAR);
     g.spec = float4(0.0, 0.0, 0.0, 0.0);
     g.mv = float4(gbuf_mv(dir, fx, fy), 0.0, 0.0);
+    g.sig = uint4(0u, 0u, 0u, 0u);
+    if (flags & FLAG_FSR_SIG) {
+        g.mv.z = CAM_FAR;
+    }
     gbuf[pi] = g;
 }
 

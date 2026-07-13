@@ -352,6 +352,13 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
             direct_s /= float(n_shadow);
             direct_t /= float(n_shadow);
         }
+        if (lap == 0u) {
+            // shade.rs's post-average lobe export (the FSR-RR signal split
+            // demodulates these at the G-buffer write) — pure copies, zero
+            // rng draws.
+            prim.direct_d = direct_d;
+            prim.direct_s = direct_s;
+        }
         // Diffuse budget split, front vs transmitted (ambient front-only —
         // shade.rs composition). Transmissive glass has (almost) no diffuse
         // response — the transmitted scene replaces it (the chain below);

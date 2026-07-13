@@ -38,6 +38,9 @@ mod prof;
 mod replay;
 mod temporal;
 mod texture;
+// Pure chain-resolution data for the always-on temporal-upscaler fallback
+// (DLSS-RR → FSR4-RR → XeSS → FSR3); the real probes live in GpuContext::new.
+mod upchain;
 // The loader half is Windows-only (LoadLibrary); the FFI structs, depth
 // encoding, and the dynamic-res controller are pure and feed --check-xess.
 mod xess;
@@ -70,8 +73,11 @@ const STEP_DOWN_MAX: f32 = 1.5;
 
 /// CLI options beyond the OBJ path / --check.
 pub struct Opts {
-    /// Want DLSS (default on; auto-falls back when unsupported).
-    pub dlss: bool,
+    /// The temporal-upscaler fallback chain: which levels of
+    /// DLSS-RR → FSR4-RR → XeSS → FSR3 may be probed (first supported level
+    /// wins; upscaling is always on unless --no-upscale empties the chain).
+    /// `--<x>` force-starts the chain at that level, `--no-<x>` skips it.
+    pub chain: upchain::UpChain,
     /// D3D12 debug layer + Streamline verbose logging.
     pub gpu_debug: bool,
     /// Directory holding sl.interposer.dll + plugins (M3+).
@@ -104,20 +110,8 @@ pub struct Opts {
     /// NPPD execution provider: None = DirectML then CPU fallback,
     /// Some(-1) = CPU forced, Some(n) = DirectML adapter n forced.
     pub nppd_device: Option<i32>,
-    /// Start with XeSS-SR dynamic-resolution upscaling (X toggles; implies
-    /// DLSS off — the XeSS context lives on the native, non-SL pipeline).
-    pub xess: bool,
     /// Directory holding libxess.dll.
     pub xess_path: String,
-    /// Start with FSR dynamic-res upscaling (K toggles; implies DLSS off —
-    /// the ffx contexts live on the native pipeline — and is mutually
-    /// exclusive with XeSS: one upscaler owns the frame). FSR4 + Ray
-    /// Regeneration on RDNA4; FSR 3.1 upscale-only elsewhere (log line);
-    /// no usable provider at all falls back to the plain path.
-    pub fsr: bool,
-    /// Force the FSR 3.1 provider even where FSR4+RR is available (--fsr3;
-    /// implies --fsr; the A/B lever — fails loudly if no 3.1 provider).
-    pub fsr3: bool,
     /// Directory holding amd_fidelityfx_loader_dx12.dll + the provider DLLs.
     pub ffx_path: String,
     /// Explicit GPU adapter vendor preference (--prefer-nvidia /
@@ -167,9 +161,10 @@ pub struct Opts {
     /// D3D12 compute with DXR RayQuery rays. Requires the DXC DLL drop and
     /// RT tier 1.1; falls back to the CPU path with a loud line otherwise.
     pub gpu: bool,
-    /// Start with the DXR DispatchRays pipeline on (--dxr; the F key
-    /// toggles it live against the CPU tracer). Requires the DXC DLL drop
-    /// and RT tier 1.0; falls back to the CPU path with a loud line.
+    /// The DXR DispatchRays pipeline as the session's render mode (default
+    /// ON — the F key toggles it live against the CPU tracer; --no-dxr opts
+    /// back into the CPU renderer). Requires the DXC DLL drop and RT tier
+    /// 1.0; falls back to the CPU path with a loud line.
     pub dxr: bool,
     /// Directory holding dxcompiler.dll + dxil.dll.
     pub dxc_path: String,
@@ -231,7 +226,7 @@ fn main() {
     let mut obj: Option<String> = None;
     let mut check = false;
     let mut opts = Opts {
-        dlss: true,
+        chain: upchain::UpChain::ALL,
         gpu_debug: false,
         sl_path: std::env::var("FRUSTRACER_SL_PATH").unwrap_or_else(|_| {
             concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\streamline-sdk\bin\x64").to_string()
@@ -252,12 +247,9 @@ fn main() {
             concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\nppd\nppd_small.onnx").to_string()
         }),
         nppd_device: None,
-        xess: false,
         xess_path: std::env::var("FRUSTRACER_XESS_PATH").unwrap_or_else(|_| {
             concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\XeSS-SDK\bin").to_string()
         }),
-        fsr: false,
-        fsr3: false,
         ffx_path: std::env::var("FRUSTRACER_FFX_PATH").unwrap_or_else(|_| {
             concat!(
                 env!("CARGO_MANIFEST_DIR"),
@@ -276,7 +268,7 @@ fn main() {
         discard_seeds: false,
         hemi_share: true,
         gpu: false,
-        dxr: false,
+        dxr: true,
         dxc_path: std::env::var("FRUSTRACER_DXC_PATH").unwrap_or_else(|_| {
             concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\dxc\bin\x64").to_string()
         }),
@@ -296,6 +288,13 @@ fn main() {
     let mut check_nppd = false;
     let mut nppd_dump = false;
     let mut no_xess_explicit = false;
+    // --fsr/--fsr3 passed: flips the default adapter preference to AMD.
+    let mut fsr_forced = false;
+    // --dxr passed explicitly (it is the default): gates the --gpu notice.
+    let mut dxr_explicit = false;
+    // --no-upscale passed: distinguishes the quiet explicit plain path from
+    // the loud chain-exhausted fallback.
+    let mut no_upscale = false;
     let mut check_gpu = false;
     let mut check_dxr = false;
     let mut stress: Option<usize> = None;
@@ -312,8 +311,12 @@ fn main() {
                 check_dlss = true;
                 dlss_dump = true;
             }
-            "--dlss" => opts.dlss = true,
-            "--no-dlss" => opts.dlss = false,
+            "--dlss" => opts.chain.force(upchain::UpLevel::Dlss),
+            "--no-dlss" => opts.chain.skip(upchain::UpLevel::Dlss),
+            "--no-upscale" => {
+                opts.chain = upchain::UpChain::NONE;
+                no_upscale = true;
+            }
             "--check-oidn" => check_oidn = true,
             "--oidn-dump" => {
                 check_oidn = true;
@@ -364,20 +367,23 @@ fn main() {
                 check_xess = true;
                 xess_dump = true;
             }
-            "--xess" => opts.xess = true,
+            "--xess" => opts.chain.force(upchain::UpLevel::Xess),
             "--no-xess" => {
-                opts.xess = false;
+                opts.chain.skip(upchain::UpLevel::Xess);
                 no_xess_explicit = true;
             }
             "--check-fsr" => check_fsr = true,
-            "--fsr" => opts.fsr = true,
+            "--fsr" => {
+                opts.chain.force(upchain::UpLevel::Fsr4);
+                fsr_forced = true;
+            }
             "--fsr3" => {
-                opts.fsr = true;
-                opts.fsr3 = true;
+                opts.chain.force(upchain::UpLevel::Fsr3);
+                fsr_forced = true;
             }
             "--no-fsr" => {
-                opts.fsr = false;
-                opts.fsr3 = false;
+                opts.chain.skip(upchain::UpLevel::Fsr4);
+                opts.chain.skip(upchain::UpLevel::Fsr3);
             }
             "--ffx-path" => {
                 opts.ffx_path = args.next().unwrap_or_else(|| {
@@ -473,7 +479,11 @@ fn main() {
             "--oidn-no-clean-aux" => opts.oidn_clean_aux = false,
             "--gpu" => opts.gpu = true,
             "--check-gpu" => check_gpu = true,
-            "--dxr" => opts.dxr = true,
+            "--dxr" => {
+                opts.dxr = true;
+                dxr_explicit = true;
+            }
+            "--no-dxr" => opts.dxr = false,
             "--check-dxr" => check_dxr = true,
             "--dxc-path" => {
                 opts.dxc_path = args.next().unwrap_or_else(|| {
@@ -543,7 +553,10 @@ fn main() {
                 eprintln!("  --check       headless: verify hybrid vs reference, benchmark, write check.png");
                 eprintln!("  --check-dlss  headless: G-buffer MV/depth/matrix self-test (no GPU needed)");
                 eprintln!("  --dlss-dump   --check-dlss plus G-buffer PNG dumps (albedo/spec_albedo/normal/misc/mv)");
-                eprintln!("  --no-dlss     skip Streamline/DLSS; plain D3D12 presentation");
+                eprintln!("  --no-dlss     skip the DLSS-RR level of the upscaler chain (falls to FSR4/XeSS/FSR3);");
+                eprintln!("                the chain DLSS-RR -> FSR4-RR -> XeSS -> FSR3 is always on — the first");
+                eprintln!("                supported level wins; --<x> force-starts the chain at that level");
+                eprintln!("  --no-upscale  plain presentation: no temporal upscaler at all (benchmark escape)");
                 eprintln!("  --check-oidn  headless: OIDN denoise self-test (needs the OIDN DLLs)");
                 eprintln!("  --oidn-dump   --check-oidn plus before/after/G-buffer PNG dumps");
                 eprintln!("  --oidn        start with OIDN denoising on (N toggles; implies DLSS off)");
@@ -563,18 +576,20 @@ fn main() {
                 eprintln!("  --check-xess  headless: XeSS dynamic-res contract self-test (no GPU or DLL needed)");
                 eprintln!("  --xess-dump   --check-xess plus G-buffer PNG dumps");
                 eprintln!("  --check-fsr   headless: FSR signal-split/encoding/MV contract self-test (no GPU or DLL)");
-                eprintln!("  --fsr         start with FSR dynamic-res upscaling (K toggles; implies DLSS off):");
-                eprintln!("                FSR4 + Ray Regeneration on RDNA4, FSR 3.1 upscale-only elsewhere");
-                eprintln!("  --fsr3        force the FSR 3.1 provider even where FSR4 exists (A/B lever)");
+                eprintln!("  --fsr         force-start the upscaler chain at FSR4 + Ray Regeneration (K toggles;");
+                eprintln!("                RDNA4 only — elsewhere the chain falls to XeSS then FSR 3.1)");
+                eprintln!("  --fsr3        force-start the chain at the FSR 3.1 upscale-only level (A/B lever)");
                 eprintln!("  --ffx-path    FidelityFX DLL directory (default: the FidelityFX-Samples-prebuilt drop)");
                 eprintln!("  --gpu         GPU-resident tracing: quadtree + shading in D3D12 compute with DXR");
                 eprintln!("                RayQuery rays (needs the DXC DLLs and RT tier 1.1; falls back to CPU)");
                 eprintln!("  --check-gpu   headless: GPU tracer gate suite (needs a D3D12 GPU + the DXC DLLs)");
-                eprintln!("  --dxr         start on the DXR DispatchRays pipeline (F toggles it against the CPU");
-                eprintln!("                tracer live; needs the DXC DLLs and RT tier 1.0; falls back to CPU)");
+                eprintln!("  --dxr         the DXR DispatchRays pipeline — the DEFAULT render mode (F toggles it");
+                eprintln!("                against the CPU tracer live; needs the DXC DLLs and RT tier 1.0;");
+                eprintln!("                falls back to CPU with a loud line)");
+                eprintln!("  --no-dxr      opt back into the CPU frustum-tracer as the render mode");
                 eprintln!("  --check-dxr   headless: DXR pipeline gate suite (needs a D3D12 RT GPU + the DXC DLLs)");
                 eprintln!("  --dxc-path    DXC DLL directory (default: SDKs\\dxc\\bin\\x64)");
-                eprintln!("  --xess        start with XeSS-SR dynamic-res upscaling (X toggles; implies DLSS off;");
+                eprintln!("  --xess        force-start the upscaler chain at XeSS-SR (X toggles;");
                 eprintln!("                N cycles the OIDN denoise: off -> pre-upscale -> post-upscale)");
                 eprintln!("  --oidn-post   start XeSS mode with OIDN placed AFTER the upscale (requires --xess)");
                 eprintln!("  --xess-autoexposure  let XeSS compute exposure internally (A/B lever)");
@@ -605,42 +620,29 @@ fn main() {
         eprintln!("--tile needs a loaded model to replicate — pass an OBJ path");
         std::process::exit(2);
     }
-    if opts.nppd && !opts.xess && !no_xess_explicit {
+    if opts.nppd && !no_xess_explicit && !no_upscale && (opts.chain.dlss || opts.chain.fsr4) {
         // The default NPPD experience is the XeSS composition: trace at the
         // --lock-res scale (default quality 2/3), NPPD denoises at that
         // render res, XeSS upscales to the window. Standalone window-res
         // NPPD remains the automatic fallback when the XeSS DLL is missing,
         // or explicitly via --nppd --no-xess.
-        opts.xess = true;
-        eprintln!("nppd: --nppd implies --xess (pre-upscale denoise at the render res; --no-xess opts out)");
+        opts.chain.force(upchain::UpLevel::Xess);
+        eprintln!("nppd: --nppd starts the upscaler chain at XeSS (pre-upscale denoise at the render res; --no-xess opts out)");
     }
-    if opts.xess && opts.dlss {
-        // The XeSS context needs the native (non-proxied) device/queue —
-        // Streamline's manual-hooking proxies never coexist with it.
-        opts.dlss = false;
-        eprintln!("xess: --xess implies --no-dlss (native D3D12 pipeline)");
+    if fsr_forced && (opts.nppd || opts.oidn || opts.oidn_post) {
+        eprintln!("fsr: the FSR present arm owns the frame; ignoring OIDN/NPPD flags");
+        opts.nppd = false;
+        opts.oidn = false;
+        opts.oidn_post = false;
     }
-    if opts.fsr {
-        if opts.xess {
-            eprintln!("--fsr and --xess are mutually exclusive — one upscaler owns the frame");
-            std::process::exit(2);
-        }
-        if opts.dlss {
-            // Same native-pipeline requirement as XeSS.
-            opts.dlss = false;
-            eprintln!("fsr: --fsr implies --no-dlss (native D3D12 pipeline)");
-        }
-        if opts.gpu {
-            eprintln!("fsr: the FSR path is CPU-fed in v1; ignoring --fsr under --gpu");
-            opts.fsr = false;
-            opts.fsr3 = false;
-        }
-        if opts.nppd || opts.oidn || opts.oidn_post {
-            eprintln!("fsr: the FSR present arm owns the frame; ignoring OIDN/NPPD flags");
-            opts.nppd = false;
-            opts.oidn = false;
-            opts.oidn_post = false;
-        }
+    // Adapter preference default: AMD when FSR was explicitly requested
+    // (--fsr/--fsr3), NVIDIA otherwise. An explicit --prefer-* always wins;
+    // the chain then probes whatever adapter got picked.
+    if opts.prefer.is_none() && fsr_forced {
+        opts.prefer = Some(gpu::adapter::Prefer::Amd);
+    }
+    if no_upscale {
+        eprintln!("upscale: OFF (--no-upscale; plain presentation)");
     }
     if opts.gpu {
         // DLSS-RR and XeSS compose with --gpu (the tracer feeds them GPU-born
@@ -651,20 +653,31 @@ fn main() {
         }
         opts.oidn = false;
         opts.oidn_post = false;
-        if opts.nppd && !opts.xess {
+        if opts.nppd && !opts.chain.xess {
             // The GPU NPPD stage rides the XeSS composition only (RR is
             // itself a denoiser — the same exclusion as the CPU paths).
-            // Phase-C's implication normally sets --xess; only an explicit
+            // Phase-C's implication normally forces XeSS; only an explicit
             // --no-xess lands here.
             eprintln!("gpu: NPPD under --gpu needs the XeSS composition; ignoring");
             opts.nppd = false;
         }
         if opts.dxr {
             // The DXR pipeline is a CPU-session peer mode; --gpu is its own
-            // self-contained session.
-            eprintln!("gpu: --dxr is a CPU-session mode, unavailable under --gpu; ignoring");
+            // self-contained session. --dxr is the default, so only an
+            // explicit request earns the notice.
+            if dxr_explicit {
+                eprintln!("gpu: --dxr is a CPU-session mode, unavailable under --gpu; ignoring");
+            }
             opts.dxr = false;
         }
+    }
+    if opts.dxr && !dxr_explicit && !opts.gpu && (opts.oidn || opts.oidn_post || opts.nppd) {
+        // OIDN and (CPU-side) NPPD denoise frames the CPU renderer produces —
+        // they cannot run under the DXR arm, which would silently switch them
+        // back off at init. Asking for one opts out of the DXR default; an
+        // explicit --dxr still wins (and F toggles either way live).
+        eprintln!("dxr: OIDN/NPPD are CPU-renderer denoisers — staying on the CPU tracer (--dxr forces the pipeline; F toggles live)");
+        opts.dxr = false;
     }
 
     // PIX command-list markers: opt-in, runtime-loaded; inert otherwise.
@@ -1220,7 +1233,7 @@ fn run_check_dxr(
             let mut rec = Ok(());
             hg.run(|l| rec = dg2.record_frame(l, 0))?;
             rec?;
-            let bytes = hg.read_buffer(&dg2.gbuf, ua, pw * ph * 64)?;
+            let bytes = hg.read_buffer(&dg2.gbuf, ua, pw * ph * gpu::trace::GBUF_STRIDE as usize)?;
             let tb = hg.read_buffer(&dg2.tbuf, ua, pw * ph * 4)?;
             let t: Vec<f32> =
                 tb.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
@@ -1359,6 +1372,73 @@ fn run_check_dxr(
                 ok = false;
             }
 
+            // --- T5b: the FSR3 feed over the same pack (FeedKind::Fsr3 ->
+            // cs_feed_xess into the FSR 3.1 planes), gated identically.
+            {
+                let fres = match gpu::ffx_up::Fsr3Resources::new(
+                    &hg.device,
+                    pw as u32,
+                    ph as u32,
+                    pw as u32,
+                    ph as u32,
+                ) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        eprintln!("check-dxr: FAIL feed Fsr3Resources: {e}");
+                        return 1;
+                    }
+                };
+                let fpl = fres.plane_resources();
+                if let Err(e) = dg2.wire_feed(
+                    &hg.device,
+                    gpu::trace::FeedKind::Fsr3,
+                    &[
+                        (gpu::trace::FEED_COLOR, fpl[0].0, fpl[0].1),
+                        (gpu::trace::FEED_MVEC, fpl[1].0, fpl[1].1),
+                        (gpu::trace::FEED_DEPTH, fpl[2].0, fpl[2].1),
+                    ],
+                ) {
+                    eprintln!("check-dxr: FAIL FSR3 feed wiring: {e}");
+                    return 1;
+                }
+                let mut f_rec = Ok(());
+                if let Err(e) = hg.run(|l| f_rec = dg2.record_feed(l, 0)) {
+                    eprintln!("check-dxr: FAIL FSR3 feed dispatch submit: {e}");
+                    return 1;
+                }
+                if let Err(e) = f_rec {
+                    eprintln!("check-dxr: FAIL FSR3 feed dispatch: {e}");
+                    return 1;
+                }
+                let (f_depth, f_mvec, f_color) = match (
+                    read_feed_tex(&mut hg, fpl[2].0, fpl[2].1, 4, pw, ph),
+                    read_feed_tex(&mut hg, fpl[1].0, fpl[1].1, 4, pw, ph),
+                    read_feed_tex(&mut hg, fpl[0].0, fpl[0].1, 8, pw, ph),
+                ) {
+                    (Ok(d), Ok(m), Ok(c)) => (d, m, c),
+                    _ => {
+                        eprintln!("check-dxr: FAIL FSR3 feed plane readback");
+                        return 1;
+                    }
+                };
+                if !gate_xess_feed(
+                    "check-dxr fsr3",
+                    pw,
+                    ph,
+                    &f_depth,
+                    &f_mvec,
+                    &f_color,
+                    &accum_bytes,
+                    &gb2,
+                    &tb2,
+                    near,
+                    far,
+                    must_fire,
+                ) {
+                    ok = false;
+                }
+            }
+
             // --- T6: the RR feed over the same pack, every plane gated ---
             let rres = match gpu::rr::RrResources::new(
                 &hg.device,
@@ -1424,6 +1504,133 @@ fn run_check_dxr(
             ) else {
                 return 1;
             };
+            // --- T6b: the FSR4-RR feed. Wiring FeedKind::FsrRr arms
+            // FLAG_FSR_SIG, so frame B is RE-TRACED with the same params:
+            // accum must come back BIT-IDENTICAL, and the nine planes gate
+            // against oracles from the armed pack's readback.
+            {
+                let fres = match gpu::ffx_rr::FsrResources::new(
+                    &hg.device,
+                    pw as u32,
+                    ph as u32,
+                    pw as u32,
+                    ph as u32,
+                ) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        eprintln!("check-dxr: FAIL feed FsrResources: {e}");
+                        return 1;
+                    }
+                };
+                let fpl = fres.plane_resources();
+                if let Err(e) = dg2.wire_feed(
+                    &hg.device,
+                    gpu::trace::FeedKind::FsrRr,
+                    &[
+                        (gpu::trace::FEED_SPECHIT, fpl[0].0, fpl[0].1),
+                        (gpu::trace::FEED_DEPTH, fpl[1].0, fpl[1].1),
+                        (gpu::trace::FEED_FSR_MVEC, fpl[2].0, fpl[2].1),
+                        (gpu::trace::FEED_NR, fpl[3].0, fpl[3].1),
+                        (gpu::trace::FEED_ALB, fpl[4].0, fpl[4].1),
+                        (gpu::trace::FEED_SPEC, fpl[5].0, fpl[5].1),
+                        (gpu::trace::FEED_FSR_DD, fpl[6].0, fpl[6].1),
+                        (gpu::trace::FEED_FSR_DS, fpl[7].0, fpl[7].1),
+                        (gpu::trace::FEED_COLOR, fpl[8].0, fpl[8].1),
+                    ],
+                ) {
+                    eprintln!("check-dxr: FAIL FSR4-RR feed wiring: {e}");
+                    return 1;
+                }
+                let p = gpu::trace::FrameParams {
+                    cam: basis_b,
+                    frame: 1,
+                    accumulate: false,
+                    jitter: false,
+                    frame_jitter: Some((0.0, 0.0)),
+                    prev_cam: Some(basis_a),
+                    q: uq,
+                    verify: false,
+                };
+                dg2.write_cb(0, &p);
+                let mut rec = Ok(());
+                if hg.run(|l| rec = dg2.record_frame(l, 0)).is_err() || rec.is_err() {
+                    eprintln!("check-dxr: FAIL FSR4-RR re-trace");
+                    return 1;
+                }
+                let (pack2, accum2) = match (
+                    hg.read_buffer(&dg2.gbuf, ua, pw * ph * gpu::trace::GBUF_STRIDE as usize),
+                    hg.read_buffer(&dg2.accum, ua, pw * ph * 12),
+                ) {
+                    (Ok(a), Ok(b)) => (a, b),
+                    _ => {
+                        eprintln!("check-dxr: FAIL FSR4-RR pack/accum readback");
+                        return 1;
+                    }
+                };
+                if accum2 != accum_bytes {
+                    eprintln!(
+                        "check-dxr: FAIL FSR-sig on/off accum not bit-identical (the sig capture changed shading)"
+                    );
+                    ok = false;
+                }
+                let mut f_rec = Ok(());
+                if let Err(e) = hg.run(|l| f_rec = dg2.record_feed(l, 0)) {
+                    eprintln!("check-dxr: FAIL FSR4-RR feed dispatch submit: {e}");
+                    return 1;
+                }
+                if let Err(e) = f_rec {
+                    eprintln!("check-dxr: FAIL FSR4-RR feed dispatch: {e}");
+                    return 1;
+                }
+                let mut read_plane = |idx: usize, bpp: usize, what: &str| -> Option<Vec<u8>> {
+                    match read_feed_tex(&mut hg, fpl[idx].0, fpl[idx].1, bpp, pw, ph) {
+                        Ok(v) => Some(v),
+                        Err(e) => {
+                            eprintln!("check-dxr: FAIL FSR4-RR {what} plane readback: {e}");
+                            None
+                        }
+                    }
+                };
+                let (Some(f_dlin), Some(f_dclip), Some(f_mvec), Some(f_nrm)) = (
+                    read_plane(0, 4, "depth_lin"),
+                    read_plane(1, 4, "depth_clip"),
+                    read_plane(2, 8, "mvec"),
+                    read_plane(3, 4, "normals"),
+                ) else {
+                    return 1;
+                };
+                let (Some(f_alb), Some(f_spec), Some(f_dd), Some(f_ds), Some(f_res)) = (
+                    read_plane(4, 4, "diff_alb"),
+                    read_plane(5, 4, "spec_alb"),
+                    read_plane(6, 8, "dd"),
+                    read_plane(7, 8, "ds"),
+                    read_plane(8, 8, "residual"),
+                ) else {
+                    return 1;
+                };
+                if !gate_fsr_rr_feed(
+                    "check-dxr",
+                    pw,
+                    ph,
+                    &f_dlin,
+                    &f_dclip,
+                    &f_mvec,
+                    &f_nrm,
+                    &f_alb,
+                    &f_spec,
+                    &f_dd,
+                    &f_ds,
+                    &f_res,
+                    &pack2,
+                    &accum2,
+                    near,
+                    far,
+                    must_fire,
+                ) {
+                    ok = false;
+                }
+            }
+
             if !gate_rr_feed(
                 "check-dxr",
                 pw,
@@ -1451,16 +1658,19 @@ fn run_check_dxr(
     }
 }
 
-/// Unpack a GPU `GBufPx` pack readback (64 B/px, 16 f32 lanes: nr | alb+z |
-/// spec | mv) into a CPU `dlss::GBufs` so the existing CPU gates
-/// (`dlss::mv_selftest`) consume it unmodified. Shared by --check-gpu (M7)
-/// and --check-dxr (T4).
+/// Unpack a GPU `GBufPx` pack readback (GBUF_STRIDE = 80 B/px, 20 lanes:
+/// nr | alb+z | spec | mv | sig) into a CPU `dlss::GBufs` so the existing
+/// CPU gates (`dlss::mv_selftest`) consume it unmodified — the four sig
+/// lanes and mv.zw are FSR-RR extras the GBufs shape doesn't carry (their
+/// own gates read the raw bytes). Shared by --check-gpu (M7) and
+/// --check-dxr (T4).
 #[cfg(windows)]
 fn unpack_gbuf_bytes(bytes: &[u8], pw: usize, ph: usize) -> dlss::GBufs {
     let f = |i: usize| f32::from_le_bytes(bytes[i * 4..][..4].try_into().unwrap());
     let g = dlss::GBufs::new(pw, ph);
+    let lanes = gpu::trace::GBUF_STRIDE as usize / 4;
     for i in 0..pw * ph {
-        let b = i * 16;
+        let b = i * lanes;
         g.write(
             i % pw,
             i / pw,
@@ -1699,6 +1909,208 @@ fn gate_rr_feed(
     );
     if rd_bad != 0 || rmv_bad != 0 || rc_bad != 0 || rnr_bad != 0 || ralb_bad != 0 || rsh_bad != 0 {
         eprintln!("{tag}: FAIL RR feed gates");
+        return false;
+    }
+    true
+}
+
+/// The FSR4-RR feed gates over a pack traced WITH the FsrRr wiring
+/// (FLAG_FSR_SIG armed): all nine planes vs CPU oracles computed from the
+/// raw 80-B pack readback + accum. dd/ds are gated BIT-EQUAL to the pack's
+/// sig f16 halves (pure widen), the linear-depth plane bit-equal to view-Z
+/// (DEPTH_SIGN = 1 passthrough), clip depth at the XeSS 4-ulp bound with
+/// sky bit-equal 0.0, the albedos at <= 1 LSB against the single explicit
+/// sqrt quantization (`fsr::sqrt_encode8` of the pack f32 — no f16 hop
+/// here, unlike gate_rr_feed's 2-LSB double-rounding allowance), the
+/// residual against the exact f32 remainder, and the sky contract (sig == 0,
+/// prev-Z == far bit-equal => mvec B exactly 0).
+///
+/// The residual is the one plane whose tolerance is NOT an ulp count of its
+/// own value: it is a near-**cancellation** (`color − dd⊗kd − ds⊗f0` — the
+/// two products are the same magnitude as the color), so the f32 arithmetic
+/// slop is bounded by the CANCELLED terms, not by the tiny result. Gating it
+/// at 1 f16 ulp of the remainder makes the limit shrink toward zero exactly
+/// where the error doesn't — a lit pixel whose residual lands near 0 then
+/// fails on ordinary f32 rounding. The bound below is absolute: a few f32
+/// ulps of the largest cancelled term plus the residual's own f16 storage
+/// step. (Both sides evaluate the SAME expression on the SAME inputs — the
+/// wire factors come from the stored plane bytes — so this only forgives
+/// rounding, never a wiring or formula error, which moves the residual by
+/// the size of a whole term.)
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn gate_fsr_rr_feed(
+    tag: &str,
+    pw: usize,
+    ph: usize,
+    depth_lin: &[u8],
+    depth_clip: &[u8],
+    mvec: &[u8],
+    normals: &[u8],
+    alb: &[u8],
+    spec: &[u8],
+    dd: &[u8],
+    ds: &[u8],
+    residual: &[u8],
+    pack: &[u8],
+    accum_bytes: &[u8],
+    near: f32,
+    far: f32,
+    must_fire: bool,
+) -> bool {
+    let lanes = gpu::trace::GBUF_STRIDE as usize / 4;
+    let lane_f = |i: usize, l: usize| {
+        f32::from_le_bytes(pack[(i * lanes + l) * 4..][..4].try_into().unwrap())
+    };
+    let lane_u = |i: usize, l: usize| {
+        u32::from_le_bytes(pack[(i * lanes + l) * 4..][..4].try_into().unwrap())
+    };
+    let accf = |i: usize| f32::from_le_bytes(accum_bytes[i * 4..][..4].try_into().unwrap());
+    let h16 = |bytes: &[u8], off: usize| u16::from_le_bytes(bytes[off..][..2].try_into().unwrap());
+    let (mut dl_bad, mut dc_bad, mut dc_sky_bad, mut dc_sky_n) = (0usize, 0usize, 0usize, 0usize);
+    let (mut mv_bad, mut nrm_bad, mut alb_bad, mut sig_bad) = (0usize, 0usize, 0usize, 0usize);
+    let (mut res_bad, mut sky_sig_bad, mut sig_fired) = (0usize, 0usize, 0usize);
+    let mut max_dc_ulp = 0u32;
+    // Worst margin among the channels that needed the cancellation escape
+    // (negative = inside tolerance); -inf when none did.
+    let mut worst_res = f32::NEG_INFINITY;
+    for i in 0..pw * ph {
+        let view_z = lane_f(i, 7);
+        let sky = view_z.to_bits() == far.to_bits();
+        // Linear depth: R32F passthrough (DEPTH_SIGN = 1), bit-equal.
+        if u32::from_le_bytes(depth_lin[i * 4..][..4].try_into().unwrap()) != view_z.to_bits() {
+            dl_bad += 1;
+        }
+        // Clip depth: the XeSS encode bounds.
+        let got_dc = f32::from_le_bytes(depth_clip[i * 4..][..4].try_into().unwrap());
+        if sky {
+            dc_sky_n += 1;
+            if got_dc.to_bits() != 0 {
+                dc_sky_bad += 1;
+            }
+        } else {
+            let d = got_dc.to_bits().abs_diff(xess::view_z_to_clip_depth(view_z, near, far).to_bits());
+            max_dc_ulp = max_dc_ulp.max(d);
+            if d > 4 {
+                dc_bad += 1;
+            }
+        }
+        // MVs: RG = pixel MV / render dims, B = prev_z - view_z, all f16.
+        let (mvx, mvy, prev_z) = (lane_f(i, 12), lane_f(i, 13), lane_f(i, 14));
+        let expect = [mvx / pw as f32, mvy / ph as f32, prev_z - view_z];
+        for (ch, e) in expect.iter().enumerate() {
+            let got16 = h16(mvec, i * 8 + ch * 2);
+            let expect16 = half::f16::from_f32(*e).to_bits();
+            if (mono16(got16) - mono16(expect16)).unsigned_abs() > 1 {
+                mv_bad += 1;
+            }
+        }
+        if sky && h16(mvec, i * 8 + 4) != 0 {
+            // Sky prev-Z is far bit-equal, so the depth delta is exactly 0.
+            mv_bad += 1;
+        }
+        // Normals: RGB10A2 — oct RG + rough B at <= 1 LSB, A == 0.
+        let got_n = u32::from_le_bytes(normals[i * 4..][..4].try_into().unwrap());
+        let n = Vec3A::new(lane_f(i, 0), lane_f(i, 1), lane_f(i, 2));
+        let (eu, ev) = fsr::oct_encode(n);
+        let q10 = |v: f32| (v.clamp(0.0, 1.0) * 1023.0 + 0.5) as u32;
+        let l10 = |w: u32, s: u32| (w >> s) & 0x3ff;
+        if l10(got_n, 0).abs_diff(q10(eu)) > 1
+            || l10(got_n, 10).abs_diff(q10(ev)) > 1
+            || l10(got_n, 20).abs_diff(q10(lane_f(i, 3))) > 1
+            || (got_n >> 30) != 0
+        {
+            nrm_bad += 1;
+        }
+        // Signals: the planes are pure widens of the pack's sig f16 halves.
+        let sig = [lane_u(i, 16), lane_u(i, 17), lane_u(i, 18)];
+        let dd16 = [sig[0] as u16, (sig[0] >> 16) as u16, sig[1] as u16];
+        let ds16 = [(sig[1] >> 16) as u16, sig[2] as u16, (sig[2] >> 16) as u16];
+        for ch in 0..3 {
+            if h16(dd, i * 8 + ch * 2) != dd16[ch] || h16(ds, i * 8 + ch * 2) != ds16[ch] {
+                sig_bad += 1;
+            }
+        }
+        if sky {
+            if sig != [0, 0, 0] || prev_z.to_bits() != far.to_bits() {
+                sky_sig_bad += 1;
+            }
+        } else if sig != [0, 0, 0] {
+            sig_fired += 1;
+        }
+        // Albedos: ONE explicit sqrt quantization of the pack f32 — <= 1 LSB
+        // vs the CPU encode (GPU sqrt has 1-ulp latitude, unlike Rust's
+        // correctly-rounded sqrt). The residual oracle below therefore takes
+        // its wire factors from the PLANE BYTES the GPU actually stored
+        // ((n/255)^2 — bit-identical to the kernel's own enc*enc), not from
+        // a recompute that could land on the other side of a rounding
+        // boundary.
+        let mut wire = [Vec3A::ZERO; 2];
+        for (k, (plane, base)) in [(alb, 4usize), (spec, 8usize)].into_iter().enumerate() {
+            for ch in 0..3 {
+                let v = lane_f(i, base + ch);
+                let b = plane[i * 4 + ch];
+                if b.abs_diff(fsr::sqrt_encode8(v)) > 1 {
+                    alb_bad += 1;
+                }
+                let enc = b as f32 / 255.0;
+                wire[k][ch] = enc * enc;
+            }
+        }
+        // Residual: the exact f32 remainder (same expression, same order as
+        // the kernel) through the RGBA16F store.
+        let ddf = Vec3A::new(
+            half::f16::from_bits(dd16[0]).to_f32(),
+            half::f16::from_bits(dd16[1]).to_f32(),
+            half::f16::from_bits(dd16[2]).to_f32(),
+        );
+        let dsf = Vec3A::new(
+            half::f16::from_bits(ds16[0]).to_f32(),
+            half::f16::from_bits(ds16[1]).to_f32(),
+            half::f16::from_bits(ds16[2]).to_f32(),
+        );
+        for ch in 0..3 {
+            let color = accf(i * 3 + ch);
+            let (t_dd, t_ds) = (ddf[ch] * wire[0][ch], dsf[ch] * wire[1][ch]);
+            let e = color - t_dd - t_ds;
+            let got16 = h16(residual, i * 8 + ch * 2);
+            if (mono16(got16) - mono16(fsr::f16_sat(e).to_bits())).unsigned_abs() <= 1 {
+                continue; // the ordinary storage tolerance, like every other plane
+            }
+            // Beyond 1 ulp: forgive ONLY what the cancellation explains. The
+            // GPU's f32 remainder may differ from `e` by a few ulps of the
+            // largest CANCELLED term (a magnitude the tiny result knows
+            // nothing about), and its own f16 store rounds by half an ulp of
+            // what it holds. Anything past that is a real defect — a wiring
+            // or formula error moves the residual by the size of a whole term.
+            let got = half::f16::from_bits(got16).to_f32();
+            let cancelled = color.abs().max(t_dd.abs()).max(t_ds.abs());
+            let tol = 8.0 * f32::EPSILON * cancelled + (got.abs() * 4.9e-4).max(3.0e-8);
+            let err = (got - e).abs();
+            worst_res = worst_res.max(err - tol);
+            if err > tol {
+                res_bad += 1;
+            }
+        }
+    }
+    eprintln!(
+        "{tag}: fsr-rr feed ({pw}x{ph}): depth-lin-not-bit-equal {dl_bad} | clip-ulp>4 {dc_bad} (max {max_dc_ulp}) | sky-not-0.0 {dc_sky_bad} (sky px {dc_sky_n}) | mvec-ulp>1 {mv_bad} | normals-lsb>1 {nrm_bad} | alb-lsb>1 {alb_bad} | sig-not-bit-equal {sig_bad} | residual-over-tol {res_bad} (worst margin {worst_res:.2e}) | sky-sig-bad {sky_sig_bad} | sig-fired {sig_fired}"
+    );
+    if dl_bad != 0
+        || dc_bad != 0
+        || dc_sky_bad != 0
+        || mv_bad != 0
+        || nrm_bad != 0
+        || alb_bad != 0
+        || sig_bad != 0
+        || res_bad != 0
+        || sky_sig_bad != 0
+    {
+        eprintln!("{tag}: FAIL FSR4-RR feed gates");
+        return false;
+    }
+    if must_fire && (dc_sky_n == 0 || sig_fired == 0) {
+        eprintln!("{tag}: FAIL FSR4-RR feed gates vacuous (no sky / no armed sig on the default scene)");
         return false;
     }
     true
@@ -2507,7 +2919,7 @@ fn run_check_gpu(
             };
             ptg.write_cb(0, &p);
             hg.run(|l| ptg.record_wavefront(l, 0, &p, false))?;
-            let bytes = hg.read_buffer(&ptg.gbuf, ua, pw * ph * 64)?;
+            let bytes = hg.read_buffer(&ptg.gbuf, ua, pw * ph * gpu::trace::GBUF_STRIDE as usize)?;
             let tb = hg.read_buffer(&ptg.tbuf, ua, pw * ph * 4)?;
             let t: Vec<f32> =
                 tb.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
@@ -2667,6 +3079,75 @@ fn run_check_gpu(
                 ok = false;
             }
 
+            // --- M8b: the FSR3 feed — the same kernel/encodes as the XeSS
+            // trio (FeedKind::Fsr3 -> cs_feed_xess), rewired over the FSR
+            // 3.1 flavor's UAV-capable planes and gated identically, so a
+            // wiring-order swap in the FSR arm cannot pass the suite.
+            {
+                let fres = match gpu::ffx_up::Fsr3Resources::new(
+                    &hg.device,
+                    pw as u32,
+                    ph as u32,
+                    pw as u32,
+                    ph as u32,
+                ) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        eprintln!("check-gpu: FAIL feed Fsr3Resources: {e}");
+                        return 1;
+                    }
+                };
+                let fpl = fres.plane_resources();
+                if let Err(e) = ptg.wire_feed(
+                    &hg.device,
+                    gpu::trace::FeedKind::Fsr3,
+                    &[
+                        (gpu::trace::FEED_COLOR, fpl[0].0, fpl[0].1),
+                        (gpu::trace::FEED_MVEC, fpl[1].0, fpl[1].1),
+                        (gpu::trace::FEED_DEPTH, fpl[2].0, fpl[2].1),
+                    ],
+                ) {
+                    eprintln!("check-gpu: FAIL FSR3 feed wiring: {e}");
+                    return 1;
+                }
+                let mut f_rec = Ok(());
+                if let Err(e) = hg.run(|l| f_rec = ptg.record_feed(l, 0, false)) {
+                    eprintln!("check-gpu: FAIL FSR3 feed dispatch submit: {e}");
+                    return 1;
+                }
+                if let Err(e) = f_rec {
+                    eprintln!("check-gpu: FAIL FSR3 feed dispatch: {e}");
+                    return 1;
+                }
+                let (f_depth, f_mvec, f_color) = match (
+                    read_feed_tex(&mut hg, fpl[2].0, fpl[2].1, 4, pw, ph),
+                    read_feed_tex(&mut hg, fpl[1].0, fpl[1].1, 4, pw, ph),
+                    read_feed_tex(&mut hg, fpl[0].0, fpl[0].1, 8, pw, ph),
+                ) {
+                    (Ok(d), Ok(m), Ok(c)) => (d, m, c),
+                    _ => {
+                        eprintln!("check-gpu: FAIL FSR3 feed plane readback");
+                        return 1;
+                    }
+                };
+                if !gate_xess_feed(
+                    "check-gpu fsr3",
+                    pw,
+                    ph,
+                    &f_depth,
+                    &f_mvec,
+                    &f_color,
+                    &accum_bytes,
+                    &gb2,
+                    &tb2,
+                    near,
+                    far,
+                    must_fire,
+                ) {
+                    ok = false;
+                }
+            }
+
             // --- M9: the RR feed kernel — depth plumbing gate ---
             // Rewire the same tracer to a headless RrResources' 7 planes,
             // re-run the feed, and gate the linear-depth plane BIT-EQUAL to
@@ -2754,6 +3235,133 @@ fn run_check_gpu(
                 &gb2,
             ) {
                 ok = false;
+            }
+
+            // --- M9b: the FSR4-RR feed. Wiring FeedKind::FsrRr arms
+            // FLAG_FSR_SIG, so frame B is RE-TRACED with the same params:
+            // accum must come back BIT-IDENTICAL (the sig capture is
+            // assignment-only, zero rng draws), and the nine planes gate
+            // against oracles from the armed pack's readback.
+            {
+                let fres = match gpu::ffx_rr::FsrResources::new(
+                    &hg.device,
+                    pw as u32,
+                    ph as u32,
+                    pw as u32,
+                    ph as u32,
+                ) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        eprintln!("check-gpu: FAIL feed FsrResources: {e}");
+                        return 1;
+                    }
+                };
+                let fpl = fres.plane_resources();
+                if let Err(e) = ptg.wire_feed(
+                    &hg.device,
+                    gpu::trace::FeedKind::FsrRr,
+                    &[
+                        (gpu::trace::FEED_SPECHIT, fpl[0].0, fpl[0].1),
+                        (gpu::trace::FEED_DEPTH, fpl[1].0, fpl[1].1),
+                        (gpu::trace::FEED_FSR_MVEC, fpl[2].0, fpl[2].1),
+                        (gpu::trace::FEED_NR, fpl[3].0, fpl[3].1),
+                        (gpu::trace::FEED_ALB, fpl[4].0, fpl[4].1),
+                        (gpu::trace::FEED_SPEC, fpl[5].0, fpl[5].1),
+                        (gpu::trace::FEED_FSR_DD, fpl[6].0, fpl[6].1),
+                        (gpu::trace::FEED_FSR_DS, fpl[7].0, fpl[7].1),
+                        (gpu::trace::FEED_COLOR, fpl[8].0, fpl[8].1),
+                    ],
+                ) {
+                    eprintln!("check-gpu: FAIL FSR4-RR feed wiring: {e}");
+                    return 1;
+                }
+                let p = gpu::trace::FrameParams {
+                    cam: basis_b,
+                    frame: 1,
+                    accumulate: false,
+                    jitter: false,
+                    frame_jitter: Some((0.0, 0.0)),
+                    prev_cam: Some(basis_a),
+                    q: uq,
+                    verify: false,
+                };
+                ptg.write_cb(0, &p);
+                if let Err(e) = hg.run(|l| ptg.record_wavefront(l, 0, &p, false)) {
+                    eprintln!("check-gpu: FAIL FSR4-RR re-trace: {e}");
+                    return 1;
+                }
+                let (pack2, accum2) = match (
+                    hg.read_buffer(&ptg.gbuf, ua, pw * ph * gpu::trace::GBUF_STRIDE as usize),
+                    hg.read_buffer(&ptg.accum, ua, pw * ph * 12),
+                ) {
+                    (Ok(a), Ok(b)) => (a, b),
+                    _ => {
+                        eprintln!("check-gpu: FAIL FSR4-RR pack/accum readback");
+                        return 1;
+                    }
+                };
+                if accum2 != accum_bytes {
+                    eprintln!(
+                        "check-gpu: FAIL FSR-sig on/off accum not bit-identical (the sig capture changed shading)"
+                    );
+                    ok = false;
+                }
+                let mut f_rec = Ok(());
+                if let Err(e) = hg.run(|l| f_rec = ptg.record_feed(l, 0, false)) {
+                    eprintln!("check-gpu: FAIL FSR4-RR feed dispatch submit: {e}");
+                    return 1;
+                }
+                if let Err(e) = f_rec {
+                    eprintln!("check-gpu: FAIL FSR4-RR feed dispatch: {e}");
+                    return 1;
+                }
+                let mut read_plane = |idx: usize, bpp: usize, what: &str| -> Option<Vec<u8>> {
+                    match read_feed_tex(&mut hg, fpl[idx].0, fpl[idx].1, bpp, pw, ph) {
+                        Ok(v) => Some(v),
+                        Err(e) => {
+                            eprintln!("check-gpu: FAIL FSR4-RR {what} plane readback: {e}");
+                            None
+                        }
+                    }
+                };
+                let (Some(f_dlin), Some(f_dclip), Some(f_mvec), Some(f_nrm)) = (
+                    read_plane(0, 4, "depth_lin"),
+                    read_plane(1, 4, "depth_clip"),
+                    read_plane(2, 8, "mvec"),
+                    read_plane(3, 4, "normals"),
+                ) else {
+                    return 1;
+                };
+                let (Some(f_alb), Some(f_spec), Some(f_dd), Some(f_ds), Some(f_res)) = (
+                    read_plane(4, 4, "diff_alb"),
+                    read_plane(5, 4, "spec_alb"),
+                    read_plane(6, 8, "dd"),
+                    read_plane(7, 8, "ds"),
+                    read_plane(8, 8, "residual"),
+                ) else {
+                    return 1;
+                };
+                if !gate_fsr_rr_feed(
+                    "check-gpu",
+                    pw,
+                    ph,
+                    &f_dlin,
+                    &f_dclip,
+                    &f_mvec,
+                    &f_nrm,
+                    &f_alb,
+                    &f_spec,
+                    &f_dd,
+                    &f_ds,
+                    &f_res,
+                    &pack2,
+                    &accum2,
+                    near,
+                    far,
+                    must_fire,
+                ) {
+                    ok = false;
+                }
             }
 
             // --- M10: the NPPD GPU staging kernels + DML interop ---
@@ -3258,6 +3866,36 @@ fn run_check_fsr(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera) -> i32 {
             }
         }
         eprintln!("sqrt-albedo wire: {}", if pass { "OK" } else { "FAIL" });
+        all_ok &= pass;
+    }
+
+    // 2b. The GPU pack's wire twin (`sqrt_wire`, no leading f16 rounding —
+    // the pack stores f32): same bounds, idempotence, exact endpoints, and
+    // agreement with `albedo_wire` on already-f16 values (the CPU oracle for
+    // the GPU FSR-RR feed gates relies on both properties).
+    {
+        let mut pass = true;
+        for i in 0..=4096 {
+            let v = i as f32 / 4096.0;
+            let w = fsr::sqrt_wire(v);
+            if (w - v).abs() > 1.2e-2 || (v < 0.01 && (w - v).abs() > 8e-4) {
+                eprintln!("sqrt_wire({v}) = {w}");
+                pass = false;
+            }
+            if fsr::sqrt_wire(w) != w {
+                eprintln!("sqrt_wire not idempotent at {v}");
+                pass = false;
+            }
+            if fsr::albedo_wire(fsr::q16(v)) != fsr::sqrt_wire(fsr::q16(v)) {
+                eprintln!("sqrt_wire disagrees with albedo_wire on the f16 value of {v}");
+                pass = false;
+            }
+        }
+        if fsr::sqrt_wire(0.0) != 0.0 || fsr::sqrt_wire(1.0) != 1.0 {
+            eprintln!("sqrt_wire endpoints off");
+            pass = false;
+        }
+        eprintln!("sqrt-wire (GPU pack twin): {}", if pass { "OK" } else { "FAIL" });
         all_ok &= pass;
     }
 
@@ -5684,6 +6322,19 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
     };
 
+    // Upscaler-chain self-test — the DLSS→FSR4→XeSS→FSR3 resolution order and
+    // the force/skip flag algebra, with availability injected (DLL-free).
+    let upchain_ok = match upchain::self_test() {
+        Ok(()) => {
+            eprintln!("upchain self-test: OK");
+            true
+        }
+        Err(e) => {
+            eprintln!("upchain self-test: FAIL — {e}");
+            false
+        }
+    };
+
     // glTF loader self-test — an in-code GLB exercises node flattening, the
     // mirrored-winding flip, u16 index widening, and the factor mapping.
     let gltf_ok = match gltf_loader::self_test() {
@@ -7234,6 +7885,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         ("nppd", nppd_ok),
         ("matclass", matclass_ok),
         ("tangent", tangent_ok),
+        ("upchain", upchain_ok),
         ("gltf", gltf_ok),
         ("hemi-ao", hemi_ok),
         ("hemi-gi", gi_ok),
@@ -7298,12 +7950,17 @@ fn log_drs_adoption(path: &str, lim: &xess::StepLimiter, last_ep: &mut (usize, u
 
 /// The GPU arm's upscaler sub-mode (--gpu and the DXR pipeline share it):
 /// which wired upscaler composes on the tracer, or plain presentation.
+/// `Fsr4` = Ray Regeneration + FSR4 fed on-GPU (the nine-plane feed);
+/// `Fsr3` = the FSR 3.1 upscale-only chain level. K toggles either against
+/// plain, mirroring G/X.
 #[cfg(windows)]
 #[derive(Clone, Copy, PartialEq)]
 enum GpuUp {
     Plain,
     Rr,
     Xess,
+    Fsr4,
+    Fsr3,
 }
 
 /// A session's exit reason: quit the app, or rebuild everything at a new
@@ -7374,13 +8031,10 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     let mut inp = input::Input::new(&sdl).expect("SDL event pump failed");
     // Hoisted so GpuContext::new and every resize_output share one value.
     let gopts = gpu::GpuOptions {
-        dlss: opts.dlss,
+        chain: opts.chain,
         sl_dir: opts.sl_path.clone(),
-        xess: opts.xess,
         xess_dir: opts.xess_path.clone(),
         xess_autoexposure: opts.xess_autoexposure,
-        fsr: opts.fsr,
-        fsr3: opts.fsr3,
         ffx_dir: opts.ffx_path.clone(),
         prefer: opts.prefer,
         debug: opts.gpu_debug,
@@ -7717,7 +8371,7 @@ fn session(
         // Session sub-mode + locked trace res. `--lock-res dynamic` can't be
         // honored here (no DRS on the GPU path): lock at the quality default.
         let lock = opts.lock_scale.unwrap_or_else(|| {
-            if dlss_on || xess_on {
+            if dlss_on || xess_on || fsr_on {
                 eprintln!("gpu: dynamic render res is unsupported under --gpu; locking at quality (2/3)");
             }
             2.0 / 3.0
@@ -7729,6 +8383,14 @@ fn session(
         } else if xess_on {
             gpu_up = GpuUp::Xess;
             (grw, grh) = locked_render_res(lock, xess_range, (w, h), (w, h), true);
+        } else if fsr_on {
+            // Both FSR chain levels compose on-GPU: FSR4-RR via the
+            // nine-plane feed, FSR3 via the XeSS trio.
+            gpu_up = match gpu.fsr_flavor() {
+                Some(fsr::Flavor::Fsr4Rr) => GpuUp::Fsr4,
+                _ => GpuUp::Fsr3,
+            };
+            (grw, grh) = locked_render_res(lock, fsr_range, (w, h), (w, h), true);
         }
         gpu_trace = match gpu::dxc::Dxc::load(&opts.dxc_path).and_then(|dxc| {
             gpu.init_trace(
@@ -7750,6 +8412,8 @@ fn session(
                         GpuUp::Plain => "".to_string(),
                         GpuUp::Rr => format!(" -> DLSS-RR {w}x{h}"),
                         GpuUp::Xess => format!(" -> XeSS-SR {w}x{h}"),
+                        GpuUp::Fsr4 => format!(" -> FSR4-RR {w}x{h}"),
+                        GpuUp::Fsr3 => format!(" -> FSR3 {w}x{h}"),
                     }
                 );
                 true
@@ -7772,11 +8436,14 @@ fn session(
     let mut gpu_up_idx: u32 = 0;
     let mut gpu_prev_cam: Option<Camera> = None;
     let mut gpu_reset = true;
-    // Whether this session wired an upscaler feed at init (the G/X toggles
+    // Whether this session wired an upscaler feed at init (the G/X/K toggles
     // can only move between Plain and a WIRED upscaler — wiring is
     // init-time).
     let gpu_xess_avail = gpu_trace && gpu_up == GpuUp::Xess;
     let gpu_rr_avail = gpu_trace && gpu_up == GpuUp::Rr;
+    // The wired FSR kind (captured before the plain-toggle restore below —
+    // the K toggle moves between Plain and exactly this).
+    let gpu_fsr_kind = (gpu_trace && matches!(gpu_up, GpuUp::Fsr4 | GpuUp::Fsr3)).then_some(gpu_up);
     // GPU-resident NPPD (wired at init in --gpu --nppd XeSS sessions; J
     // toggles the pre-upscale slot, mirroring the CPU xess_nppd contract).
     let gpu_nppd_avail = gpu_trace && gpu.nppd_gpu_ready();
@@ -7818,6 +8485,9 @@ fn session(
     // creep to the range max while total frame time blows the budget.
     let mut pre_ms = 0.0f64;
     let mut oidn_failed = p0.map_or(false, |p| p.oidn_failed);
+    // "XeSS session" for the SYCL-avoidance pick below: XeSS is the chain
+    // level that got wired (libxess.dll is live in-process).
+    let xess_wired = gpu.xess_ready();
     let oidn_try_enable =|oidn_ctx: &mut Option<oidn::OidnContext>,
                            oidn_gbufs: &mut Option<dlss::GBufs>,
                            oidn_hist: &mut Option<reproject::History>| {
@@ -7828,7 +8498,7 @@ fn session(
             // (observed: OIDN 2.5 SYCL + XeSS SDK 2.0.2). Auto in a XeSS
             // session means CUDA then CPU; an explicit --oidn-device is
             // honored as given.
-            let devices: &[i32] = if opts.xess && opts.oidn_device == 0 {
+            let devices: &[i32] = if xess_wired && opts.oidn_device == 0 {
                 &[3, 1] // cuda, cpu
             } else {
                 &[opts.oidn_device]
@@ -7882,6 +8552,13 @@ fn session(
                 if dlss_on {
                     dlss_on = false;
                     eprintln!("dlss: Ray Reconstruction OFF (--oidn; G re-enables)");
+                }
+                if fsr_on {
+                    // The chain can wire FSR in an --oidn session; the FSR
+                    // present arm owns the frame, so it yields (K re-enables).
+                    fsr_on = false;
+                    fsr_prev = None;
+                    eprintln!("fsr: OFF (--oidn; K re-enables)");
                 }
                 eprintln!(
                     "oidn: denoising ON, temporal reprojection {} (N / M toggle)",
@@ -7993,6 +8670,12 @@ fn session(
                 dlss_on = false;
                 eprintln!("dlss: Ray Reconstruction OFF (--nppd; G re-enables)");
             }
+            if fsr_on {
+                // Same yield as OIDN's: the chain can wire FSR here.
+                fsr_on = false;
+                fsr_prev = None;
+                eprintln!("fsr: OFF (--nppd; K re-enables)");
+            }
             if oidn_on {
                 oidn_on = false;
                 eprintln!("oidn: OFF (--nppd; N re-enables)");
@@ -8022,6 +8705,10 @@ fn session(
     // off without unwiring the session.
     let dxr_rr_avail = gpu.dlss_ready();
     let dxr_xess_avail = gpu.xess_ready();
+    // Both FSR kinds compose on the DXR pipeline: FSR3 via the XeSS feed
+    // trio, FSR4-RR via the nine-plane feed.
+    let dxr_fsr3_avail = gpu.fsr_flavor() == Some(fsr::Flavor::Fsr3);
+    let dxr_fsr4_avail = gpu.fsr_flavor() == Some(fsr::Flavor::Fsr4Rr);
     // The DXR trace res: locked into the wired upscaler's range (the --gpu
     // contract — DxrGpu's buffers are sized once, no DRS), window-res when
     // plain. Computed once so the eager --dxr init and the lazy F init
@@ -8030,6 +8717,8 @@ fn session(
         locked_render_res(opts.lock_scale.unwrap_or(2.0 / 3.0), dlss_range, (w, h), (drw, drh), false)
     } else if dxr_xess_avail {
         locked_render_res(opts.lock_scale.unwrap_or(2.0 / 3.0), xess_range, (w, h), (w, h), true)
+    } else if dxr_fsr3_avail || dxr_fsr4_avail {
+        locked_render_res(opts.lock_scale.unwrap_or(2.0 / 3.0), fsr_range, (w, h), (w, h), true)
     } else {
         (w, h)
     };
@@ -8042,7 +8731,7 @@ fn session(
     let mut dxr_prev_cam: Option<Camera> = None;
     let mut dxr_reset = true;
     if want_dxr && !dxr_failed && !gpu_trace {
-        let compose = dxr_rr_avail || dxr_xess_avail;
+        let compose = dxr_rr_avail || dxr_xess_avail || dxr_fsr3_avail || dxr_fsr4_avail;
         if compose && opts.lock_scale.is_none() {
             eprintln!("dxr: dynamic render res is unsupported on the DXR pipeline; locking at quality (2/3)");
         }
@@ -8055,16 +8744,21 @@ fn session(
                     GpuUp::Rr
                 } else if dxr_xess_avail {
                     GpuUp::Xess
+                } else if dxr_fsr4_avail {
+                    GpuUp::Fsr4
+                } else if dxr_fsr3_avail {
+                    GpuUp::Fsr3
                 } else {
                     GpuUp::Plain
                 };
-                // Restore the user's plain toggle (G/X inside the DXR arm).
+                // Restore the user's plain toggle (G/X/K inside the DXR arm).
                 if p0.map_or(false, |p| p.dxr_up_plain) {
                     dxr_up = GpuUp::Plain;
                 }
                 // The CPU-side denoisers can't run under the DXR arm; the
-                // CPU upscalers stay WIRED — the DXR arm presents through
-                // the same session contexts, and F-off resumes them intact.
+                // CPU upscalers stay WIRED (fsr_on included — every FSR kind
+                // composes) — the DXR arm presents through the same session
+                // contexts, and F-off resumes them intact.
                 if oidn_on {
                     oidn_on = false;
                     eprintln!("oidn: OFF (--dxr; N re-enables)");
@@ -8074,16 +8768,13 @@ fn session(
                     nppd_prev = None;
                     eprintln!("nppd: OFF (--dxr; J re-enables)");
                 }
-                if fsr_on {
-                    fsr_on = false;
-                    fsr_prev = None;
-                    eprintln!("fsr: OFF (--dxr; K re-enables)");
-                }
                 eprintln!(
                     "dxr: DispatchRays pipeline ON at {dxw}x{dxh}{} (F toggles CPU <-> DXR)",
                     match dxr_up {
                         GpuUp::Rr => format!(" -> DLSS-RR {w}x{h} (G toggles plain)"),
                         GpuUp::Xess => format!(" -> XeSS-SR {w}x{h} (X toggles plain)"),
+                        GpuUp::Fsr4 => format!(" -> FSR4-RR {w}x{h} (K toggles plain)"),
+                        GpuUp::Fsr3 => format!(" -> FSR3 {w}x{h} (K toggles plain)"),
                         GpuUp::Plain => String::new(),
                     }
                 );
@@ -8222,6 +8913,21 @@ fn session(
                     eprintln!("gpu: DLSS-RR not wired in this session");
                 }
             }
+            if edges.toggle_fsr {
+                if let Some(kind) = gpu_fsr_kind {
+                    gpu_up = if gpu_up == kind { GpuUp::Plain } else { kind };
+                    frame = 0;
+                    gpu_reset = true;
+                    gpu_prev_cam = None;
+                    eprintln!(
+                        "gpu: {} {}",
+                        if kind == GpuUp::Fsr4 { "FSR4-RR" } else { "FSR3" },
+                        if gpu_up == kind { "ON" } else { "OFF (plain present)" }
+                    );
+                } else {
+                    eprintln!("gpu: FSR not wired in this session");
+                }
+            }
             if edges.toggle_bounce {
                 if gpu_up != GpuUp::Plain {
                     eprintln!("gpu: hemi bounces unavailable in the upscaler sub-mode (still-frame feature)");
@@ -8288,6 +8994,7 @@ fn session(
                 frame = 0;
                 gpu_reset = true;
             }
+            let t = Instant::now();
             if gpu_up != GpuUp::Plain {
                 // The upscaler contract (the CPU arms'): every frame is a
                 // fresh jittered 1-spp full-depth frame at the locked render
@@ -8326,10 +9033,25 @@ fn session(
                         grw,
                         grh,
                     );
-                    gpu.present_trace_rr(&p, hybrid, &fc, gpu_up_idx)
+                    match gpu_up {
+                        // frameTimeDelta is the PREVIOUS frame's render time
+                        // (the DXR arm's contract); the desc clamps it into
+                        // [0.1, 200].
+                        GpuUp::Fsr3 => gpu.present_trace_fsr3(&p, hybrid, &fc, last_ms as f32),
+                        GpuUp::Fsr4 => gpu.present_trace_fsr_rr(
+                            &p,
+                            hybrid,
+                            &fc,
+                            gpu_prev_cam.map(|c| c.pos),
+                            gpu_up_idx,
+                            last_ms as f32,
+                        ),
+                        _ => gpu.present_trace_rr(&p, hybrid, &fc, gpu_up_idx),
+                    }
                 };
                 match presented {
                     Ok(()) => {
+                        last_ms = t.elapsed().as_secs_f64() * 1000.0;
                         gpu_prev_cam = Some(cam);
                         gpu_reset = false;
                         gpu_up_idx = gpu_up_idx.wrapping_add(1);
@@ -8342,8 +9064,12 @@ fn session(
                             gpu_nppd_on = false;
                             gpu_reset = true;
                         } else {
-                            let (name, key) =
-                                if gpu_up == GpuUp::Xess { ("XeSS", 'X') } else { ("DLSS-RR", 'G') };
+                            let (name, key) = match gpu_up {
+                                GpuUp::Xess => ("XeSS", 'X'),
+                                GpuUp::Fsr3 => ("FSR3", 'K'),
+                                GpuUp::Fsr4 => ("FSR4-RR", 'K'),
+                                _ => ("DLSS-RR", 'G'),
+                            };
                             eprintln!("gpu: {name} present failed ({e}); presenting plain ({key} to retry)");
                             gpu_up = GpuUp::Plain;
                         }
@@ -8396,6 +9122,7 @@ fn session(
                 if stab_n % 15 == 0 {
                     let cap = match gpu_up {
                         GpuUp::Xess => gpu.read_xess_output(),
+                        GpuUp::Fsr3 | GpuUp::Fsr4 => gpu.read_fsr_output(),
                         _ => gpu.read_rr_output(),
                     };
                     if let Ok(px) = cap {
@@ -8428,6 +9155,7 @@ fn session(
                 let cap = match gpu_up {
                     GpuUp::Xess => gpu.read_xess_output().map(|px| (px, w, h)),
                     GpuUp::Rr => gpu.read_rr_output().map(|px| (px, w, h)),
+                    GpuUp::Fsr3 | GpuUp::Fsr4 => gpu.read_fsr_output().map(|px| (px, w, h)),
                     GpuUp::Plain => gpu.read_trace_output(),
                 };
                 match cap {
@@ -8448,6 +9176,8 @@ fn session(
                 let mode = match gpu_up {
                     GpuUp::Plain => format!("{}x{}", grw, grh),
                     GpuUp::Rr => format!("RR {}x{} -> {}x{}", grw, grh, w, h),
+                    GpuUp::Fsr4 => format!("FSR4-RR {}x{} -> {}x{}", grw, grh, w, h),
+                    GpuUp::Fsr3 => format!("FSR3 {}x{} -> {}x{}", grw, grh, w, h),
                     GpuUp::Xess => format!(
                         "XeSS{} {}x{} -> {}x{}",
                         if gpu_nppd_on { "+NPPD(pre)" } else { "" },
@@ -8578,7 +9308,7 @@ fn session(
                 }
                 eprintln!("dlss: Ray Reconstruction {}", if dlss_on { "ON" } else { "OFF" });
             } else {
-                eprintln!("dlss: not available");
+                eprintln!("dlss: not wired in this session (the chain selected another level; restart with --dlss)");
             }
         }
         if edges.toggle_xess {
@@ -8636,11 +9366,33 @@ fn session(
                     }
                 );
             } else {
-                eprintln!("xess: not available (start with --xess and the SDK DLL on disk)");
+                eprintln!("xess: not wired in this session (restart with --xess and the SDK DLL on disk)");
             }
         }
         if edges.toggle_fsr {
-            if gpu.fsr_ready() {
+            if dxr_on {
+                // The K twin of the DXR-mode G/X toggles: wired-FSR <-> plain.
+                let kind = if dxr_fsr4_avail {
+                    Some(GpuUp::Fsr4)
+                } else if dxr_fsr3_avail {
+                    Some(GpuUp::Fsr3)
+                } else {
+                    None
+                };
+                if let Some(kind) = kind {
+                    dxr_up = if dxr_up == kind { GpuUp::Plain } else { kind };
+                    frame = 0;
+                    dxr_reset = true;
+                    dxr_prev_cam = None;
+                    eprintln!(
+                        "dxr: {} {}",
+                        if kind == GpuUp::Fsr4 { "FSR4-RR" } else { "FSR3" },
+                        if dxr_up == kind { "ON" } else { "OFF (plain present)" }
+                    );
+                } else {
+                    eprintln!("dxr: FSR not wired in this session");
+                }
+            } else if gpu.fsr_ready() {
                 fsr_on = !fsr_on;
                 frame = 0;
                 fsr_reset = true;
@@ -8649,17 +9401,27 @@ fn session(
                 // target immediately instead of dwelling on the stale res.
                 fsr_lim = xess::StepLimiter::new(xess::RAMP_FRAMES);
                 fsr_ep = (0, 0);
-                // DLSS/XeSS never coexist with a live FSR session (native
-                // pipeline, flag-parse exclusion) — no cross-disable needed;
-                // OIDN/NPPD were cleared at startup for --fsr runs. DXR is
-                // toggleable live, so it does need the cross-disable.
+                // DLSS/XeSS never coexist with a live FSR session (one wired
+                // upscaler per session) — no cross-disable needed. OIDN/NPPD
+                // and DXR are toggleable live, so they do need it (the chain
+                // can wire FSR in an --oidn/--nppd session where the startup
+                // yield ran the other way).
                 if fsr_on && dxr_on {
                     dxr_on = false;
                     eprintln!("dxr: OFF (FSR enabled)");
                 }
+                if fsr_on && oidn_on {
+                    oidn_on = false;
+                    eprintln!("oidn: OFF (FSR enabled; N re-enables)");
+                }
+                if fsr_on && nppd_on {
+                    nppd_on = false;
+                    nppd_prev = None;
+                    eprintln!("nppd: OFF (FSR enabled; J re-enables)");
+                }
                 eprintln!("fsr: {} {}", fsr_label, if fsr_on { "ON" } else { "OFF" });
             } else {
-                eprintln!("fsr: not available (start with --fsr and the FidelityFX DLLs on disk)");
+                eprintln!("fsr: not wired in this session (restart with --fsr/--fsr3 and the FidelityFX DLLs on disk)");
             }
         }
         if edges.toggle_oidn {
@@ -8818,11 +9580,13 @@ fn session(
                 dlss_reset = true;
                 xess_prev = None;
                 xess_reset = true;
+                fsr_prev = None;
+                fsr_reset = true;
                 eprintln!("dxr: OFF (CPU tracing)");
             } else if dxr_failed {
                 eprintln!("dxr: unavailable (earlier init failed; restart with --dxc-path to retry)");
             } else {
-                let compose = dxr_rr_avail || dxr_xess_avail;
+                let compose = dxr_rr_avail || dxr_xess_avail || dxr_fsr3_avail || dxr_fsr4_avail;
                 if compose && opts.lock_scale.is_none() {
                     eprintln!("dxr: dynamic render res is unsupported on the DXR pipeline; locking at quality (2/3)");
                 }
@@ -8833,18 +9597,23 @@ fn session(
                         dxr_on = true;
                         frame = 0;
                         // Every F enable restores the session default
-                        // sub-mode (a G/X plain-toggle doesn't outlive it).
+                        // sub-mode (a G/X/K plain-toggle doesn't outlive it).
                         dxr_up = if dxr_rr_avail {
                             GpuUp::Rr
                         } else if dxr_xess_avail {
                             GpuUp::Xess
+                        } else if dxr_fsr4_avail {
+                            GpuUp::Fsr4
+                        } else if dxr_fsr3_avail {
+                            GpuUp::Fsr3
                         } else {
                             GpuUp::Plain
                         };
                         dxr_reset = true;
                         dxr_prev_cam = None;
                         // CPU-side denoisers can't run under the DXR arm;
-                        // the CPU upscalers stay wired — the arm presents
+                        // the CPU upscalers stay wired (fsr_on included —
+                        // every FSR kind composes) — the arm presents
                         // through the same session contexts, and F-off
                         // resumes them intact.
                         if oidn_on {
@@ -8856,17 +9625,13 @@ fn session(
                             nppd_prev = None;
                             eprintln!("nppd: OFF (DXR enabled)");
                         }
-                        if fsr_on {
-                            fsr_on = false;
-                            fsr_prev = None;
-                            fsr_reset = true;
-                            eprintln!("fsr: OFF (DXR enabled; K re-enables)");
-                        }
                         eprintln!(
                             "dxr: DispatchRays pipeline ON at {dxw}x{dxh}{} (F toggles CPU <-> DXR)",
                             match dxr_up {
                                 GpuUp::Rr => format!(" -> DLSS-RR {w}x{h} (G toggles plain)"),
                                 GpuUp::Xess => format!(" -> XeSS-SR {w}x{h} (X toggles plain)"),
+                                GpuUp::Fsr4 => format!(" -> FSR4-RR {w}x{h} (K toggles plain)"),
+                                GpuUp::Fsr3 => format!(" -> FSR3 {w}x{h} (K toggles plain)"),
                                 GpuUp::Plain => String::new(),
                             }
                         );
@@ -9022,7 +9787,17 @@ fn session(
                         dxw,
                         dxh,
                     );
-                    gpu.present_dxr_rr(&p, &fc, dxr_up_idx)
+                    match dxr_up {
+                        GpuUp::Fsr3 => gpu.present_dxr_fsr3(&p, &fc, last_ms as f32),
+                        GpuUp::Fsr4 => gpu.present_dxr_fsr_rr(
+                            &p,
+                            &fc,
+                            dxr_prev_cam.map(|c| c.pos),
+                            dxr_up_idx,
+                            last_ms as f32,
+                        ),
+                        _ => gpu.present_dxr_rr(&p, &fc, dxr_up_idx),
+                    }
                 };
                 match presented {
                     Ok(()) => {
@@ -9032,8 +9807,12 @@ fn session(
                         dxr_up_idx = dxr_up_idx.wrapping_add(1);
                     }
                     Err(e) => {
-                        let (name, key) =
-                            if dxr_up == GpuUp::Xess { ("XeSS", 'X') } else { ("DLSS-RR", 'G') };
+                        let (name, key) = match dxr_up {
+                            GpuUp::Xess => ("XeSS", 'X'),
+                            GpuUp::Fsr3 => ("FSR3", 'K'),
+                            GpuUp::Fsr4 => ("FSR4-RR", 'K'),
+                            _ => ("DLSS-RR", 'G'),
+                        };
                         eprintln!("dxr: {name} present failed ({e}); presenting plain ({key} to retry)");
                         dxr_up = GpuUp::Plain;
                         frame = 0;
@@ -9090,6 +9869,7 @@ fn session(
                 if stab_n % 15 == 0 {
                     let cap = match dxr_up {
                         GpuUp::Xess => gpu.read_xess_output(),
+                        GpuUp::Fsr3 | GpuUp::Fsr4 => gpu.read_fsr_output(),
                         _ => gpu.read_rr_output(),
                     };
                     if let Ok(px) = cap {
@@ -9122,6 +9902,7 @@ fn session(
                 let grab = match dxr_up {
                     GpuUp::Rr => gpu.read_rr_output().map(|px| (px, w, h)),
                     GpuUp::Xess => gpu.read_xess_output().map(|px| (px, w, h)),
+                    GpuUp::Fsr3 | GpuUp::Fsr4 => gpu.read_fsr_output().map(|px| (px, w, h)),
                     GpuUp::Plain => gpu.read_dxr_output(),
                 };
                 match grab {
@@ -9142,6 +9923,8 @@ fn session(
                 let sub = match dxr_up {
                     GpuUp::Rr => format!("DXR {dxw}x{dxh} -> DLSS-RR {w}x{h}"),
                     GpuUp::Xess => format!("DXR {dxw}x{dxh} -> XeSS {w}x{h}"),
+                    GpuUp::Fsr4 => format!("DXR {dxw}x{dxh} -> FSR4-RR {w}x{h}"),
+                    GpuUp::Fsr3 => format!("DXR {dxw}x{dxh} -> FSR3 {w}x{h}"),
                     GpuUp::Plain => format!(
                         "DXR {}x{} | quality {} | {} spp{}",
                         dxw,
