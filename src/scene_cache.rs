@@ -28,7 +28,7 @@ use glam::{Vec2, Vec3A};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
-pub const CACHE_VERSION: u32 = 3; // v3: per-texture stat keys in the tex table
+pub const CACHE_VERSION: u32 = 4; // v4: .webp sibling texture resolution
 const MAGIC: [u8; 8] = *b"FRSCACH\x01";
 
 /// Fixed on-disk material, `MatKind` flattened into (kind, param) — Marble
@@ -281,9 +281,20 @@ pub fn try_load(src_path: &str) -> Option<(Scene, Bvh)> {
     // alpha_masked so material tex ids never shift.
     let textures: Vec<Texture> = {
         use rayon::prelude::*;
-        tex_meta
+        // Largest-first (LPT) scheduling via an index permutation, scattered
+        // back so texture ids never shift (see the scene.rs decode note —
+        // WebP's slower per-file decode makes the big-file tail dominate).
+        let mut order: Vec<usize> = (0..tex_meta.len()).collect();
+        order.sort_by_key(|&i| {
+            std::cmp::Reverse(
+                std::fs::metadata(&tex_meta[i].0).map_or(0, |m| m.len()),
+            )
+        });
+        let mut pairs: Vec<(usize, Texture)> = order
             .par_iter()
-            .map(|(path, masked, srgb)| match image::open(path) {
+            .with_max_len(1)
+            .map(|&i| (i, &tex_meta[i]))
+            .map(|(i, (path, masked, srgb))| (i, match image::open(path) {
                 Ok(img) => {
                     let mut t = Texture::from_image(img, *srgb);
                     // The loader's role-gating (e.g. an emissive-only color
@@ -308,8 +319,10 @@ pub fn try_load(src_path: &str) -> Option<(Scene, Bvh)> {
                         source: path.clone(),
                     }
                 }
-            })
-            .collect()
+            }))
+            .collect();
+        pairs.sort_unstable_by_key(|&(i, _)| i);
+        pairs.into_iter().map(|(_, t)| t).collect()
     };
 
     let nodes: Vec<BvhNode> = disk_nodes

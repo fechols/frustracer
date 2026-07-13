@@ -670,6 +670,23 @@ pub fn resolve_scene_path(path: &str) -> String {
     p
 }
 
+/// The texture flavor of the `.zst` sibling convention: MTL/glTF manifests
+/// keep referencing `foo.png`, but committed scenes store textures as
+/// LOSSLESS `foo.webp` (~30% smaller than PNG; decoded RGBA is bit-identical
+/// — encode with `exact` so RGB under A==0 texels survives, `sample_bilinear`
+/// blends them at cutout edges). When the referenced file is absent and a
+/// `.webp` sibling exists, resolve to the sibling; an existing file always
+/// wins verbatim, so plain-PNG scenes load unchanged.
+pub fn resolve_texture_path(p: std::path::PathBuf) -> std::path::PathBuf {
+    if !p.exists() {
+        let w = p.with_extension("webp");
+        if w.exists() {
+            return w;
+        }
+    }
+    p
+}
+
 /// Parse an MTL map-statement value: consumes a leading `-bm <s>` option
 /// (bump multiplier — the only option we honor; others are skipped token by
 /// token) and returns (path, bm). The LAST whitespace token is taken as the
@@ -749,7 +766,10 @@ pub fn load_obj_scene(path: &str) -> Scene {
     // (and must never arm the alpha-cutout pipeline). MTL paths are relative
     // to the OBJ's directory and often use backslashes.
     let obj_dir = std::path::Path::new(path).parent().unwrap_or(std::path::Path::new("."));
-    let resolve = |t: &str| obj_dir.join(t.replace('\\', "/"));
+    // resolve_texture_path here means dedup keys, tex ids, Texture::source,
+    // and the scene cache's stat keys all carry the path that actually
+    // exists on disk (.webp sibling for committed scenes).
+    let resolve = |t: &str| resolve_texture_path(obj_dir.join(t.replace('\\', "/")));
     struct TexReq {
         path: std::path::PathBuf,
         srgb: bool,
@@ -809,7 +829,19 @@ pub fn load_obj_scene(path: &str) -> Scene {
     }
     let mut decoded: HashMap<(std::path::PathBuf, bool), Texture> = {
         use rayon::prelude::*;
-        reqs.par_iter()
+        // Largest-first (LPT) scheduling with per-item tasks: WebP lossless
+        // decodes slower than PNG per file, so load time is dominated by the
+        // TAIL — the last big 4K maps decoding alone. Starting the biggest
+        // files first fills the stragglers with small ones. Output is a
+        // HashMap and ids are assigned later in MTL order, so scheduling
+        // order never shifts texture ids.
+        let mut by_size: Vec<&TexReq> = reqs.iter().collect();
+        by_size.sort_by_key(|r| {
+            std::cmp::Reverse(std::fs::metadata(&r.path).map_or(0, |m| m.len()))
+        });
+        by_size
+            .par_iter()
+            .with_max_len(1)
             .filter_map(|r| match image::open(&r.path) {
                 Ok(img) => {
                     Some(((r.path.clone(), r.srgb), Texture::from_image(img, r.srgb)))

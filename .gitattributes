@@ -6,6 +6,10 @@
 scenes/**/*.zst filter=lfs diff=lfs merge=lfs -text
 scenes/**/*.obj filter=lfs diff=lfs merge=lfs -text
 scenes/**/*.png filter=lfs diff=lfs merge=lfs -text
+# Textures are committed as LOSSLESS WebP (~30% under PNG; the loader falls
+# back foo.png -> foo.webp when the manifest-referenced PNG is absent). The
+# png pattern above stays as the accidental-re-add guard.
+scenes/**/*.webp filter=lfs diff=lfs merge=lfs -text
 # glTF scene data (Khronos/Intel Sponza, Bistro, ... — see "Real scenes"):
 # GLB containers, external buffer blobs, and JPEG textures (glTF scenes often
 # ship JPEGs where the OBJ archive uses PNG).
