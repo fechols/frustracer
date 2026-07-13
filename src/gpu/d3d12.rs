@@ -373,6 +373,30 @@ impl D3d {
     }
 }
 
+/// One-off blocking submission — the seam `SceneGpu`'s chunked scene upload
+/// streams through, implemented by both harnesses (`HeadlessGpu` for the
+/// check suites, `D3d` for interactive sessions). Each call records,
+/// executes, and BLOCKS until the GPU finishes, which is what lets one
+/// staging ring be reused across calls instead of committing a full second
+/// copy of the scene in upload heaps.
+pub trait Submit {
+    fn run_list(
+        &mut self,
+        f: &mut dyn FnMut(&ID3D12GraphicsCommandList) -> Result<()>,
+    ) -> Result<()>;
+}
+
+impl Submit for D3d {
+    fn run_list(
+        &mut self,
+        f: &mut dyn FnMut(&ID3D12GraphicsCommandList) -> Result<()>,
+    ) -> Result<()> {
+        let mut rec = Ok(());
+        self.run_once(|l| rec = f(l))?;
+        rec
+    }
+}
+
 impl Drop for D3d {
     fn drop(&mut self) {
         let _ = self.wait_idle();

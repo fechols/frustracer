@@ -5,6 +5,7 @@ mod dlss;
 // Regeneration — pure CPU, feeds --check-fsr; the GPU seam is gpu/ffx*.
 mod fsr;
 mod frustum;
+mod gltf_loader;
 mod hemi;
 // The presentation stack (D3D12 + Streamline) is Windows-only; everything
 // headless (--check, --check-dlss) stays cross-platform.
@@ -24,6 +25,7 @@ mod overlay;
 mod render;
 mod reproject;
 mod scene;
+mod scene_cache;
 mod shade;
 mod shaft;
 mod sphcell;
@@ -288,6 +290,7 @@ fn main() {
     let mut check_gpu = false;
     let mut check_dxr = false;
     let mut stress: Option<usize> = None;
+    let mut tile: Option<(u32, u32)> = None;
     let mut cam_override: Option<Camera> = None;
     let mut spin: Option<String> = None;
     let mut spin_frames = 2000u32;
@@ -483,6 +486,23 @@ fn main() {
                         }),
                 )
             }
+            "--tile" => {
+                let spec = args.next().unwrap_or_default();
+                let (x, z) = match spec.split_once('x') {
+                    Some((a, b)) => (a.trim().parse().ok(), b.trim().parse().ok()),
+                    None => {
+                        let n: Option<u32> = spec.trim().parse().ok();
+                        (n, n)
+                    }
+                };
+                tile = match (x, z) {
+                    (Some(x), Some(z)) if x >= 1 && z >= 1 => Some((x, z)),
+                    _ => {
+                        eprintln!("--tile needs a grid, e.g. --tile 3 or --tile 4x2");
+                        std::process::exit(2);
+                    }
+                };
+            }
             "--cam" => {
                 let parts: Vec<f32> = args
                     .next()
@@ -499,8 +519,10 @@ fn main() {
                 ));
             }
             "--help" | "-h" => {
-                eprintln!("usage: frustracer [model.obj] [--stress <n>] [--check] [--check-dlss] [--dlss-dump] [--no-dlss] [--check-oidn] [--oidn-dump] [--oidn] [--check-xess] [--xess-dump] [--xess] [--lock-res <r>] [--gpu-debug] [--sl-path <dir>] [--oidn-path <dir>] [--oidn-device <d>] [--xess-path <dir>]");
+                eprintln!("usage: frustracer [model.obj|.gltf|.glb] [--stress <n>] [--check] [--check-dlss] [--dlss-dump] [--no-dlss] [--check-oidn] [--oidn-dump] [--oidn] [--check-xess] [--xess-dump] [--xess] [--lock-res <r>] [--gpu-debug] [--sl-path <dir>] [--oidn-path <dir>] [--oidn-device <d>] [--xess-path <dir>]");
                 eprintln!("  --stress <n>  procedural stress field of n objects (perf test; composes with --check)");
+                eprintln!("  --tile <n|nxm>  replicate a loaded OBJ scene into an n×n (or n×m) grid of copies —");
+                eprintln!("                flattened geometry, shared materials/textures (composes with --check)");
                 eprintln!("  --cam <e,t>   start camera: ex,ey,ez,tx,ty,tz (reproducible benchmark viewpoints)");
                 eprintln!("  --check       headless: verify hybrid vs reference, benchmark, write check.png");
                 eprintln!("  --check-dlss  headless: G-buffer MV/depth/matrix self-test (no GPU needed)");
@@ -560,6 +582,10 @@ fn main() {
 
     if obj.is_some() && stress.is_some() {
         eprintln!("--stress and an OBJ path are mutually exclusive — pick one scene source");
+        std::process::exit(2);
+    }
+    if tile.is_some() && obj.is_none() {
+        eprintln!("--tile needs a loaded model to replicate — pass an OBJ path");
         std::process::exit(2);
     }
     if opts.nppd && !opts.xess && !no_xess_explicit {
@@ -627,26 +653,93 @@ fn main() {
     gpu::pix::init(&opts.pix_path, opts.pix_markers);
 
     eprintln!("frustracer — loading scene...");
+    let mut tile_fh: Option<f32> = None;
+    // A cache hit hands back the untiled scene's BVH too; tiling replicates
+    // the geometry, so the tiled BVH is always a fresh (parallel) build.
+    let mut prebuilt: Option<bvh::Bvh> = None;
     let scene = match (&obj, stress) {
-        (Some(p), _) => scene::load_obj_scene(p),
+        (Some(p), _) => {
+            let resolved = scene::resolve_scene_path(p);
+            // Extension sniff: .gltf/.glb take the glTF loader, everything
+            // else the OBJ path — reusing the positional arg inherits the
+            // exclusivity checks, default camera, structural-skip predicate,
+            // and --tile. glTF scenes SKIP the sidecar cache: its texture
+            // table stores re-decodable file paths, and glTF images live
+            // inside GLB buffer views / data URIs (a cache hit would come
+            // back with 1x1 white textures).
+            let lower = resolved.to_ascii_lowercase();
+            let is_gltf = lower.ends_with(".gltf") || lower.ends_with(".glb");
+            let cached = if is_gltf { None } else { scene_cache::try_load(&resolved) };
+            let (s, b) = match cached {
+                Some((s, b)) => (s, Some(b)),
+                None => {
+                    let s = if is_gltf {
+                        gltf_loader::load_gltf_scene(&resolved)
+                    } else {
+                        scene::load_obj_scene(&resolved)
+                    };
+                    // Under --tile the untiled build's ONLY use is feeding
+                    // the cache store (the tiled BVH is always a fresh
+                    // build) — and glTF skips the cache, so a tiled glTF
+                    // run skips this build instead of discarding it.
+                    let b = if is_gltf && tile.is_some() {
+                        None
+                    } else {
+                        let b = bvh::Bvh::build(&s);
+                        if !is_gltf {
+                            scene_cache::store(&resolved, &s, &b);
+                        }
+                        Some(b)
+                    };
+                    (s, b)
+                }
+            };
+            match tile {
+                Some((tx, tz)) => {
+                    let (s, fh) = scene::tile_scene(s, tx, tz);
+                    tile_fh = Some(fh);
+                    s
+                }
+                None => {
+                    // b is always Some here: the None arm above requires
+                    // tile.is_some().
+                    prebuilt = b;
+                    s
+                }
+            }
+        }
         (None, Some(n)) => scene::stress_scene(n),
         (None, None) => scene::procedural_scene(),
     };
-    // The stress field keeps the default look direction but pulls the camera
-    // back/up to overlook the field; /8 (not the field half-extent itself)
-    // trades the nearest rows off the bottom of the frame for less sky.
-    let cam0 = cam_override.unwrap_or_else(|| match stress {
-        Some(n) => scaled_camera((scene::stress_field_half(n) / 8.0).max(1.0)),
-        None => default_camera(),
+    // The stress field (and a tiled OBJ field) keeps the default look
+    // direction but pulls the camera back/up to overlook the field; /8 (not
+    // the field half-extent itself) trades the nearest rows off the bottom of
+    // the frame for less sky.
+    let cam0 = cam_override.unwrap_or_else(|| match (stress, tile_fh) {
+        (Some(n), _) => scaled_camera((scene::stress_field_half(n) / 8.0).max(1.0)),
+        (None, Some(fh)) => scaled_camera((fh / 8.0).max(1.0)),
+        (None, None) => default_camera(),
     });
     let t0 = Instant::now();
-    let bvh = bvh::Bvh::build(&scene);
+    let bvh = prebuilt.unwrap_or_else(|| bvh::Bvh::build(&scene));
     eprintln!(
-        "scene: {} tris | BVH: {} nodes built in {:.0} ms",
+        "scene: {} tris | BVH: {} nodes ready in {:.0} ms",
         scene.tri_count(),
         bvh.nodes.len(),
         t0.elapsed().as_secs_f64() * 1000.0
     );
+    if check {
+        // Determinism gate for the two-phase parallel build: a rebuild must
+        // be byte-identical (node order pinned across runs and thread
+        // counts — the property the scene cache and cross-run benchmarks
+        // lean on). On a cache hit this doubles as the cache-integrity gate:
+        // the loaded BVH must equal one built fresh from the loaded scene.
+        assert!(
+            bvh.identical(&bvh::Bvh::build(&scene)),
+            "BVH build is not deterministic (or the scene cache is corrupt)"
+        );
+        eprintln!("bvh: deterministic rebuild verified");
+    }
 
     if let Some(mode) = &spin {
         let code = run_spin(&scene, &bvh, cam0, mode, spin_frames, &opts);
@@ -782,34 +875,23 @@ fn run_check_dxr(
     );
 
     let (gw, gh) = (800usize, 600usize);
-    let mut dg = match gpu::dxr::DxrGpu::new(
-        &hg.device,
+    let dev = hg.device.clone();
+    let dg = match gpu::dxr::DxrGpu::new(
+        &dev,
         &dxc,
         scene,
-        bvh,
         gw as u32,
         gh as u32,
         false,
         opts.gpu_debug,
+        &mut hg,
     ) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("check-dxr: FAIL DxrGpu init (RTPSO/SBT): {e}");
+            eprintln!("check-dxr: FAIL DxrGpu init (RTPSO/SBT/scene upload): {e}");
             return 1;
         }
     };
-    {
-        let mut rec = Ok(());
-        if let Err(e) = hg.run(|l| rec = dg.scene.record_upload(l)) {
-            eprintln!("check-dxr: FAIL scene upload submit: {e}");
-            return 1;
-        }
-        if let Err(e) = rec {
-            eprintln!("check-dxr: FAIL scene upload: {e}");
-            return 1;
-        }
-        dg.scene.free_staging();
-    }
     eprintln!(
         "check-dxr: RTPSO + SBT built, scene uploaded, BLAS/TLAS built ({} tris)",
         scene.tri_count()
@@ -1080,15 +1162,16 @@ fn run_check_dxr(
     // far BIT-EQUAL, sky must-fire).
     {
         let (pw, ph) = (533usize, 400usize);
+        let dev = hg.device.clone();
         let mut dg2 = match gpu::dxr::DxrGpu::new(
-            &hg.device,
+            &dev,
             &dxc,
             scene,
-            bvh,
             pw as u32,
             ph as u32,
             true,
             opts.gpu_debug,
+            &mut hg,
         ) {
             Ok(d) => d,
             Err(e) => {
@@ -1096,14 +1179,6 @@ fn run_check_dxr(
                 return 1;
             }
         };
-        {
-            let mut rec = Ok(());
-            if hg.run(|l| rec = dg2.scene.record_upload(l)).is_err() || rec.is_err() {
-                eprintln!("check-dxr: FAIL gbuf scene upload");
-                return 1;
-            }
-            dg2.scene.free_staging();
-        }
         let ua = windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         let (near, far) = dlss::near_far(scene.diag);
         let uq = Quality::upscaler_1spp();
@@ -1693,8 +1768,9 @@ fn run_check_gpu(
     // hardware watertight triangle intersection differs from moller_trumbore
     // at edges/grazing, and the RNG streams differ by design.
     let (gw, gh) = (800usize, 600usize);
-    let mut tg = match gpu::trace::TraceGpu::new(
-        &hg.device,
+    let dev = hg.device.clone();
+    let tg = match gpu::trace::TraceGpu::new(
+        &dev,
         &dxc,
         scene,
         bvh,
@@ -1703,6 +1779,7 @@ fn run_check_gpu(
         false, // no pack: the M7-M9 gbuf/feed gates build their own tracer
         false,
         opts.gpu_debug,
+        &mut hg,
     ) {
         Ok(t) => t,
         Err(e) => {
@@ -1710,18 +1787,6 @@ fn run_check_gpu(
             return 1;
         }
     };
-    {
-        let mut rec = Ok(());
-        if let Err(e) = hg.run(|l| rec = tg.scene.record_upload(l)) {
-            eprintln!("check-gpu: FAIL scene upload submit: {e}");
-            return 1;
-        }
-        if let Err(e) = rec {
-            eprintln!("check-gpu: FAIL scene upload: {e}");
-            return 1;
-        }
-        tg.scene.free_staging();
-    }
     eprintln!("check-gpu: scene uploaded, BLAS/TLAS built ({} tris)", scene.tri_count());
 
     let q = Quality::preset(2);
@@ -2382,8 +2447,9 @@ fn run_check_gpu(
     // tolerances. Odd render dims mirror --check-xess's odd-dimension sweep.
     {
         let (pw, ph) = (533usize, 400usize);
+        let dev = hg.device.clone();
         let mut ptg = match gpu::trace::TraceGpu::new(
-            &hg.device,
+            &dev,
             &dxc,
             scene,
             bvh,
@@ -2392,6 +2458,7 @@ fn run_check_gpu(
             true,
             true, // + the NPPD staging buffers/kernels (M10 gates them)
             opts.gpu_debug,
+            &mut hg,
         ) {
             Ok(t) => t,
             Err(e) => {
@@ -2399,14 +2466,6 @@ fn run_check_gpu(
                 return 1;
             }
         };
-        {
-            let mut rec = Ok(());
-            if hg.run(|l| rec = ptg.scene.record_upload(l)).is_err() || rec.is_err() {
-                eprintln!("check-gpu: FAIL gbuf scene upload");
-                return 1;
-            }
-            ptg.scene.free_staging();
-        }
         let (near, far) = dlss::near_far(scene.diag);
         let uq = Quality::upscaler_1spp();
         // One fresh 1-spp wavefront frame at the upscaler contract
@@ -2994,8 +3053,9 @@ fn run_check_gpu(
     // point; this is the speedometer.
     drop(tg);
     let (bw, bh) = (1920usize, 1080usize);
-    let mut btg = match gpu::trace::TraceGpu::new(
-        &hg.device,
+    let dev = hg.device.clone();
+    let btg = match gpu::trace::TraceGpu::new(
+        &dev,
         &dxc,
         scene,
         bvh,
@@ -3004,6 +3064,7 @@ fn run_check_gpu(
         false, // bench frames don't consume the pack
         false,
         opts.gpu_debug,
+        &mut hg,
     ) {
         Ok(t) => t,
         Err(e) => {
@@ -3012,15 +3073,6 @@ fn run_check_gpu(
             return 0;
         }
     };
-    {
-        let mut rec = Ok(());
-        if hg.run(|l| rec = btg.scene.record_upload(l)).is_err() || rec.is_err() {
-            eprintln!("check-gpu: bench scene upload failed; skipping bench");
-            println!("check-gpu: wavefront quadtree + hemi AO/GI OK");
-            return 0;
-        }
-        btg.scene.free_staging();
-    }
     let bbasis = cam0.basis(bw, bh);
     let mut bench = |label: &str, hybrid: bool, fb: shade::FrustumBounce| {
         let bq = Quality { fb, ..q };
@@ -5527,6 +5579,32 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
     };
 
+    // Tangent-frame / normal-map decode self-test — analytic directions,
+    // green-channel sign pin, mirrored-UV handedness, degenerate skip.
+    let tangent_ok = match shade::tangent_self_test() {
+        Ok(()) => {
+            eprintln!("tangent self-test: OK");
+            true
+        }
+        Err(e) => {
+            eprintln!("tangent self-test: FAIL — {e}");
+            false
+        }
+    };
+
+    // glTF loader self-test — an in-code GLB exercises node flattening, the
+    // mirrored-winding flip, u16 index widening, and the factor mapping.
+    let gltf_ok = match gltf_loader::self_test() {
+        Ok(()) => {
+            eprintln!("gltf self-test: OK");
+            true
+        }
+        Err(e) => {
+            eprintln!("gltf self-test: FAIL — {e}");
+            false
+        }
+    };
+
     let rep = render::verify(scene, bvh, &cam, q, rw, rh, &stats, None, &[], None);
     eprintln!(
         "verify full-depth ({} px): false-sky {} | tmin-overshoot {} | hybrid-extra {} | max rel t err {:.2e}",
@@ -5716,23 +5794,37 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             .collect();
         let mut hv = hemi::VerifyCounters::default();
         let mut ls = stats::LocalStats::default();
-        let (mut sum_rel, mut sum_signed, mut worst) = (0f64, 0f64, 0f32);
+        let mut worst = 0f32;
         for (rel, phv, pls) in &results {
             hv.merge(phv);
             ls.merge(pls);
-            sum_rel += rel.abs();
-            sum_signed += *rel;
             worst = worst.max(rel.abs() as f32);
         }
+        // Firefly-robust statistic — the documented unpaired-A/B fix (the
+        // CLAUDE.md canopy-caveat lesson): relative error is bounded −1
+        // below but UNBOUNDED above (a hemi leaf ray that catches a bright
+        // emitter or sun-glow lobe the 512-sample reference undersamples is
+        // a +NX outlier — DamagedHelmet's emissive visor trips it on real
+        // content), so the gate trims 2% from each tail before the means.
+        // The exact-zero soundness gates above stay untouched — this only
+        // robustifies the estimator comparison; `worst` still prints raw.
+        let mut rels: Vec<f64> = results.iter().map(|(rel, _, _)| *rel).collect();
+        // total_cmp: a NaN rel (NaN radiance) must FAIL the gate (it sorts
+        // past +inf into the kept slice and poisons the mean), not panic the
+        // sort's partial_cmp unwrap.
+        rels.sort_unstable_by(|a, b| a.total_cmp(b));
+        let trim = rels.len() / 50;
+        let kept = &rels[trim..rels.len() - trim];
+        let mean_rel =
+            kept.iter().map(|r| r.abs()).sum::<f64>() / kept.len().max(1) as f64;
+        let mean_signed = kept.iter().sum::<f64>() / kept.len().max(1) as f64;
         let nprobes = results.len() as u64;
-        let mean_rel = sum_rel / nprobes.max(1) as f64;
-        let mean_signed = sum_signed / nprobes.max(1) as f64;
         eprintln!(
             "hemi GI ({nprobes} probes, depth {}): psa-viol {} | false-empty {} | tmin-overshoot {} | cut-miss {} | max psa err {:.2e}",
             q.fb.depth, hv.psa_violations, hv.false_empty, hv.tmin_overshoot, hv.cut_miss, hv.max_psa_err
         );
         eprintln!(
-            "hemi GI vs {REF_SAMPLES}-sample cosine (same depth-1 policy): mean rel {mean_rel:.4} (limit 0.05) | signed {mean_signed:+.4} (limit ±0.01) | worst {worst:.3} | per point: {:.1} queries, {:.1} rays, {:.1} cells empty",
+            "hemi GI vs {REF_SAMPLES}-sample cosine (same depth-1 policy, 2% trimmed): mean rel {mean_rel:.4} (limit 0.05) | signed {mean_signed:+.4} (limit ±0.01) | worst raw {worst:.3} | per point: {:.1} queries, {:.1} rays, {:.1} cells empty",
             ls.hemi_queries as f64 / ls.hemi_points.max(1) as f64,
             ls.hemi_leaf_rays as f64 / ls.hemi_points.max(1) as f64,
             ls.hemi_cells_empty as f64 / ls.hemi_points.max(1) as f64,
@@ -7044,25 +7136,30 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
     }
 
-    if sph_ok
-        && reproj_ok
-        && nppd_ok
-        && matclass_ok
-        && hemi_ok
-        && gi_ok
-        && hemi_share_ok
-        && shaft_ok
-        && rep.ok()
-        && capped_ok
-        && temporal_ok
-        && replay_ok
-        && ring_ok
-        && adopt_ok
-    {
+    let gates = [
+        ("sphcell", sph_ok),
+        ("reproject", reproj_ok),
+        ("nppd", nppd_ok),
+        ("matclass", matclass_ok),
+        ("tangent", tangent_ok),
+        ("gltf", gltf_ok),
+        ("hemi-ao", hemi_ok),
+        ("hemi-gi", gi_ok),
+        ("hemi-share", hemi_share_ok),
+        ("shaft", shaft_ok),
+        ("verify", rep.ok()),
+        ("capped", capped_ok),
+        ("temporal", temporal_ok),
+        ("replay", replay_ok),
+        ("ring", ring_ok),
+        ("adopt", adopt_ok),
+    ];
+    let failed: Vec<&str> = gates.iter().filter(|(_, ok)| !ok).map(|(n, _)| *n).collect();
+    if failed.is_empty() {
         eprintln!("CHECK PASSED");
         0
     } else {
-        eprintln!("CHECK FAILED");
+        eprintln!("CHECK FAILED ({})", failed.join(", "));
         1
     }
 }

@@ -213,7 +213,8 @@ StructuredBuffer<uint>   uv_tri_mat : register(t2, space1); // material per tri
 // Per-material cutout map: tex + 1 when textured AND alpha_masked, else 0
 // (the bvh.rs::moller_trumbore gate chain folded to one fetch).
 StructuredBuffer<uint>   mat_cutout : register(t3, space1);
-// R8G8B8A8_UNORM_SRGB, 1 mip each (CPU-bilinear parity; no mip chain).
+// R8G8B8A8 (_SRGB for color maps, _UNORM for linear-data normal/rough-metal
+// maps — Texture::srgb), 1 mip each (CPU-bilinear parity; no mip chain).
 Texture2D<float4>        texs[]     : register(t4, space1);
 // Static: bilinear, repeat wrap, mip 0 — texture.rs::sample_bilinear in
 // hardware (sRGB decode per texel via the SRGB SRV format, texel centers at

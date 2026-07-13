@@ -11,6 +11,21 @@ tobj = "4"
 # (.obj.zst — OBJ is ASCII, ~5x); the loader decodes them transparently.
 zstd = "0.13"
 image = "0.25"
+# glTF 2.0 loader (src/gltf_loader.rs). `import` resolves buffers (GLB bin
+# chunk, external .bin, base64 URIs) — images are deliberately decoded by our
+# own rayon pipeline through texture.rs, NOT gltf's serial import_images.
+# No KHR_materials_sheen feature exists in 1.4 — sheen reads raw extension
+# JSON via `extensions`.
+gltf = { version = "1.4", default-features = false, features = [
+    "import",
+    "utils",
+    "names",
+    "extensions",
+    "KHR_materials_transmission",
+    "KHR_materials_ior",
+    "KHR_materials_emissive_strength",
+    "KHR_materials_unlit",
+] }
 fastrand = "2"
 # f16 bit-pattern storage for the CPU G-buffer planes (dlss.rs ld16/st16) —
 # a base dependency, not windows-only: headless --check reads them too.

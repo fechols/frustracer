@@ -635,8 +635,9 @@ impl GpuContext {
         nppd: Option<(&str, &str)>,
         debug: bool,
     ) -> Result<()> {
+        let dev = self.d3d.device.clone();
         let mut tg = trace::TraceGpu::new(
-            &self.d3d.device,
+            &dev,
             dxc,
             scene,
             bvh,
@@ -645,17 +646,13 @@ impl GpuContext {
             gbuf,
             nppd.is_some(),
             debug,
+            &mut self.d3d,
         )?;
         // Upscaler sessions: wire the live upscaler's input planes as feed
         // targets — the feed kernel writes them directly, no CPU upload.
         if gbuf {
-            let dev = self.d3d.device.clone();
             self.wire_session_feed(rw, rh, |kind, targets| tg.wire_feed(&dev, kind, targets))?;
         }
-        let mut rec = Ok(());
-        self.d3d.run_once(|l| rec = tg.scene.record_upload(l))?;
-        rec?;
-        tg.scene.free_staging();
         // GPU-resident NPPD: ORT session on OUR device/queue, tensors bound
         // over the NppdRes buffers. XeSS-only (RR is itself a denoiser — the
         // same exclusion as the CPU paths); a failure keeps the session
@@ -714,7 +711,9 @@ impl GpuContext {
         &mut self,
         dxc: &dxc::Dxc,
         scene: &crate::scene::Scene,
-        bvh: &crate::bvh::Bvh,
+        // Unused since the DXR pipeline stopped uploading the software BVH
+        // (SceneGpu sw_bvh: None); kept so the call sites stay uniform.
+        _bvh: &crate::bvh::Bvh,
         rw: u32,
         rh: u32,
         gbuf: bool,
@@ -723,15 +722,11 @@ impl GpuContext {
         if self.dxr.is_some() {
             return Ok(());
         }
-        let mut d = dxr::DxrGpu::new(&self.d3d.device, dxc, scene, bvh, rw, rh, gbuf, debug)?;
+        let dev = self.d3d.device.clone();
+        let mut d = dxr::DxrGpu::new(&dev, dxc, scene, rw, rh, gbuf, debug, &mut self.d3d)?;
         if gbuf {
-            let dev = self.d3d.device.clone();
             self.wire_session_feed(rw, rh, |kind, targets| d.wire_feed(&dev, kind, targets))?;
         }
-        let mut rec = Ok(());
-        self.d3d.run_once(|l| rec = d.scene.record_upload(l))?;
-        rec?;
-        d.scene.free_staging();
         self.passes.create_srv(
             &self.d3d.device,
             &d.hdr,

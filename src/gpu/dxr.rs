@@ -24,7 +24,6 @@ use super::trace::{
     SRV_POSITIONS, SRV_TLAS, SRV_TRI_MAT, TEX_HEAP_BASE, TEX_TABLE_BUFS, UAV_ACCUM, UAV_INFO,
     UAV_TBUF,
 };
-use crate::bvh::Bvh;
 use crate::scene::Scene;
 use windows::core::{Interface, PCWSTR};
 use windows::Win32::Graphics::Direct3D12::*;
@@ -107,11 +106,11 @@ impl DxrGpu {
         device: &ID3D12Device,
         dxc: &Dxc,
         scene: &Scene,
-        bvh: &Bvh,
         rw: u32,
         rh: u32,
         gbuf_full: bool,
         debug: bool,
+        submit: &mut dyn d3d12::Submit,
     ) -> Result<Self> {
         require_caps(device)?;
         let device5: ID3D12Device5 =
@@ -282,7 +281,10 @@ impl DxrGpu {
             put(SBT_HIT + 2 * IDENT, ident("HgOcclude")?);
         }
 
-        let scene_gpu = SceneGpu::new(device, scene, bvh)?;
+        // sw_bvh None: the DXR pipeline never binds the software BVH (see
+        // bind_common — t0/t1 stay unset), so its ~32 B/node upload is
+        // skipped entirely (~2.3 GB at 100M tris).
+        let scene_gpu = SceneGpu::new_uploaded(device, scene, None, submit)?;
 
         let uaf = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         let ua = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;

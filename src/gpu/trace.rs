@@ -557,6 +557,17 @@ impl HeadlessGpu {
     }
 }
 
+impl d3d12::Submit for HeadlessGpu {
+    fn run_list(
+        &mut self,
+        f: &mut dyn FnMut(&ID3D12GraphicsCommandList) -> Result<()>,
+    ) -> Result<()> {
+        let mut rec = Ok(());
+        self.run(|l| rec = f(l))?;
+        rec
+    }
+}
+
 impl Drop for HeadlessGpu {
     fn drop(&mut self) {
         // Drain before releasing (the run() calls already block, but be safe
@@ -654,6 +665,7 @@ pub fn smoke_test(hg: &mut HeadlessGpu, dxc: &Dxc, debug: bool) -> Result<()> {
 
 /// bvh.rs::BvhNode packed to 32 bytes for StructuredBuffer<BvhNode>.
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct GpuBvhNode {
     mn: [f32; 3],
     left_first: u32,
@@ -662,9 +674,10 @@ struct GpuBvhNode {
 }
 
 /// scene.rs::Material packed for StructuredBuffer<Mat> (shade.hlsli).
-/// 48 B — the HLSL `Mat` mirrors this field-for-field; a stride skew reads
+/// 80 B — the HLSL `Mat` mirrors this field-for-field; a stride skew reads
 /// garbage, so the two must move in the same commit.
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct GpuMat {
     albedo: [f32; 3],
     roughness: f32,
@@ -677,36 +690,80 @@ struct GpuMat {
     transmission: f32,
     /// `Scene::textures` index for MAT_TEXTURED (the space1 `texs[]` slot).
     tex: u32,
+    emissive: [f32; 3],
+    normal_tex: u32, // NO_TEX sentinel = HLSL TEX_NONE
+    rough_tex: u32,
+    metal_tex: u32,
+    emissive_tex: u32,
+    normal_scale: f32,
 }
 
-fn as_bytes<T>(v: &[T]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+/// Bytes of reusable staging streamed per blocking submit — bounds the
+/// upload's transient commit to one chunk instead of a full second copy of
+/// every scene stream (which at 100M tris was ~7 GB of upload heaps ON TOP of
+/// ~7 GB of repack Vecs).
+const STAGE_CHUNK: usize = 256 << 20;
+
+/// Steady-state byte total of the scene's buffer streams (excludes textures
+/// and acceleration structures) — sizes the staging ring and the init report.
+fn scene_stream_bytes(scene: &Scene, sw_bvh: Option<&Bvh>) -> usize {
+    let v = scene.positions.len();
+    let t = scene.indices.len();
+    let m = scene.materials.len();
+    let bvh = sw_bvh
+        .map_or(0, |b| b.nodes.len() * size_of::<GpuBvhNode>() + b.tri_idx.len() * 4);
+    bvh + v * (12 + 12 + 8) + t * (12 + 4) + m * (size_of::<GpuMat>() + 4)
 }
 
-/// One pending default-heap upload: staging src, dest, size, post-copy state.
-struct PendingUpload {
-    src: d3d12::UploadBuffer,
-    dst: ID3D12Resource,
-    size: usize,
+/// Stream `src` into a new default-heap buffer through `ring`, `map`ping each
+/// element into the mapped staging pointer chunk-by-chunk (identity for
+/// layout-compatible streams, a repack for Vec3A→float3 / BvhNode→GpuBvhNode).
+/// Each chunk is one blocking `Submit::run_list`; the final chunk's list also
+/// records the COPY_DEST→`after` transition. Empty streams get a 4-byte dummy
+/// created directly in `after`.
+fn stream_buffer<T: Copy, U: Copy>(
+    device: &ID3D12Device,
+    sub: &mut dyn d3d12::Submit,
+    ring: &d3d12::UploadBuffer,
+    src: &[T],
+    map: impl Fn(&T) -> U,
     after: D3D12_RESOURCE_STATES,
-}
-
-/// One pending Texture2D upload: row-pitched staging src + placed footprint.
-struct PendingTexUpload {
-    src: d3d12::UploadBuffer,
-    dst: ID3D12Resource,
-    footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
-}
-
-struct SceneStaging {
-    uploads: Vec<PendingUpload>,
-    tex_uploads: Vec<PendingTexUpload>,
-    scratch: ID3D12Resource,
-    /// TLAS instance descs live in an upload buffer for the build's duration.
-    _instance: d3d12::UploadBuffer,
-    instance_va: u64,
-    blas_scratch_size: u64,
-    tlas_scratch_size: u64,
+) -> Result<ID3D12Resource> {
+    if src.is_empty() {
+        return committed_buffer(device, 4, D3D12_RESOURCE_FLAG_NONE, after);
+    }
+    let total = std::mem::size_of::<U>() * src.len();
+    let dst = committed_buffer(
+        device,
+        total as u64,
+        D3D12_RESOURCE_FLAG_NONE,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+    )?;
+    let per = (ring.size / std::mem::size_of::<U>()).max(1);
+    let mut e = 0usize;
+    while e < src.len() {
+        let n = per.min(src.len() - e);
+        unsafe {
+            let out = std::slice::from_raw_parts_mut(ring.ptr as *mut U, n);
+            for (o, s) in out.iter_mut().zip(&src[e..e + n]) {
+                *o = map(s);
+            }
+        }
+        let off = (e * std::mem::size_of::<U>()) as u64;
+        let bytes = (n * std::mem::size_of::<U>()) as u64;
+        let last = e + n == src.len();
+        sub.run_list(&mut |l| {
+            unsafe { l.CopyBufferRegion(&dst, off, &ring.resource, 0, bytes) };
+            if last {
+                unsafe {
+                    l.ResourceBarrier(&[transition(&dst, D3D12_RESOURCE_STATE_COPY_DEST, after)])
+                };
+            }
+            Ok(())
+        })?;
+        e += n;
+    }
+    Ok(dst)
 }
 
 pub struct SceneGpu {
@@ -717,6 +774,10 @@ pub struct SceneGpu {
     pub indices: ID3D12Resource,
     pub tri_mat: ID3D12Resource,
     pub materials: ID3D12Resource,
+    /// Never read, but MUST be held: the TLAS instance desc bakes only the
+    /// (compacted) BLAS's GPU VA — dropping this resource would free the
+    /// memory the TLAS points into.
+    #[allow(dead_code)]
     pub blas: ID3D12Resource,
     pub tlas: ID3D12Resource,
     /// `Scene::texcoords` as float2 per vertex (parallel to positions; zeros
@@ -726,54 +787,95 @@ pub struct SceneGpu {
     /// its texture has masked texels, else 0 (mirrors the bvh.rs cutout
     /// gates: MatKind::Textured -> Texture::alpha_masked).
     pub mat_cutout: ID3D12Resource,
-    /// One R8G8B8A8_UNORM_SRGB Texture2D per `Scene::textures` entry, 1 mip
-    /// (the CPU samples bilinear with no mip chain — parity over aliasing).
+    /// One RGBA8 Texture2D per `Scene::textures` entry, 1 mip (the CPU
+    /// samples bilinear with no mip chain — parity over aliasing); _SRGB for
+    /// color textures, _UNORM for linear-data maps (Texture::srgb).
     pub textures: Vec<ID3D12Resource>,
-    pub any_alpha: bool,
     n_verts: u32,
     n_tris: u32,
     n_mats: u32,
-    staging: Option<SceneStaging>,
-}
-
-fn upload_pair(
-    device: &ID3D12Device,
-    bytes: &[u8],
-    after: D3D12_RESOURCE_STATES,
-) -> Result<(ID3D12Resource, PendingUpload)> {
-    let size = bytes.len().max(4);
-    let dst = committed_buffer(
-        device,
-        size as u64,
-        D3D12_RESOURCE_FLAG_NONE,
-        D3D12_RESOURCE_STATE_COPY_DEST,
-    )?;
-    let src = d3d12::UploadBuffer::new(device, size)?;
-    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), src.ptr, bytes.len()) };
-    let pending = PendingUpload { src, dst: dst.clone(), size, after };
-    Ok((dst, pending))
 }
 
 impl SceneGpu {
-    pub fn new(device: &ID3D12Device, scene: &Scene, bvh: &Bvh) -> Result<Self> {
+    /// Create AND upload the scene in one call: every stream chunks through
+    /// one reusable `STAGE_CHUNK` staging ring (blocking submits via `sub`),
+    /// then the BLAS + TLAS build rides a final submit — scratch and staging
+    /// are gone by the time this returns, so peak commit is
+    /// steady-state + one chunk, not steady-state × 2. `sw_bvh: None` is the
+    /// DXR-only session: the software BVH (frustum kernels' tree) is never
+    /// bound there, so `bvh_nodes`/`tri_idx` become 4-byte dummies (~2.3 GB
+    /// saved at 100M tris).
+    pub fn new_uploaded(
+        device: &ID3D12Device,
+        scene: &Scene,
+        sw_bvh: Option<&Bvh>,
+        sub: &mut dyn d3d12::Submit,
+    ) -> Result<Self> {
         let device5: ID3D12Device5 = device
             .cast()
             .map_err(|e| format!("ID3D12Device5 (require_caps should have gated): {e}"))?;
 
-        // --- pack CPU-side data ---
-        let nodes: Vec<GpuBvhNode> = bvh
-            .nodes
+        let srv = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        // The texture band loop below needs at least ONE full aligned row in
+        // the ring (`scene_stream_bytes` deliberately excludes textures, and
+        // its geometry-only size can undershoot a wide texture's pitch on a
+        // small mesh — the band `.max(1)` would then overrun the mapping).
+        let max_tex_pitch = scene
+            .textures
             .iter()
-            .map(|n| GpuBvhNode {
-                mn: [n.aabb.min.x, n.aabb.min.y, n.aabb.min.z],
-                left_first: n.left_first,
-                mx: [n.aabb.max.x, n.aabb.max.y, n.aabb.max.z],
-                count: n.count,
-            })
-            .collect();
-        let positions: Vec<[f32; 3]> = scene.positions.iter().map(|p| [p.x, p.y, p.z]).collect();
-        let normals: Vec<[f32; 3]> = scene.normals.iter().map(|n| [n.x, n.y, n.z]).collect();
-        let indices: Vec<u32> = scene.indices.iter().flatten().copied().collect();
+            .map(|t| d3d12::aligned_pitch(t.w as usize * 4))
+            .max()
+            .unwrap_or(0);
+        let ring = d3d12::UploadBuffer::new(
+            device,
+            STAGE_CHUNK
+                .min(scene_stream_bytes(scene, sw_bvh).max(4096))
+                .max(max_tex_pitch),
+        )?;
+
+        let (bvh_nodes, tri_idx) = match sw_bvh {
+            Some(bvh) => (
+                stream_buffer(
+                    device,
+                    sub,
+                    &ring,
+                    &bvh.nodes,
+                    |n| GpuBvhNode {
+                        mn: [n.aabb.min.x, n.aabb.min.y, n.aabb.min.z],
+                        left_first: n.left_first,
+                        mx: [n.aabb.max.x, n.aabb.max.y, n.aabb.max.z],
+                        count: n.count,
+                    },
+                    srv,
+                )?,
+                stream_buffer(device, sub, &ring, &bvh.tri_idx, |t| *t, srv)?,
+            ),
+            None => (
+                committed_buffer(device, 4, D3D12_RESOURCE_FLAG_NONE, srv)?,
+                committed_buffer(device, 4, D3D12_RESOURCE_FLAG_NONE, srv)?,
+            ),
+        };
+        let positions_b = stream_buffer(
+            device,
+            sub,
+            &ring,
+            &scene.positions,
+            |p| [p.x, p.y, p.z],
+            srv,
+        )?;
+        let normals_b =
+            stream_buffer(device, sub, &ring, &scene.normals, |n| [n.x, n.y, n.z], srv)?;
+        // [u32;3] tris flatten to the u32 index stream by layout.
+        let indices_b = stream_buffer(device, sub, &ring, &scene.indices, |t| *t, srv)?;
+        let tri_mat = stream_buffer(device, sub, &ring, &scene.tri_mat, |t| *t, srv)?;
+        let texcoords_b = stream_buffer(
+            device,
+            sub,
+            &ring,
+            &scene.texcoords,
+            |t| [t.x, t.y],
+            srv,
+        )?;
         let materials: Vec<GpuMat> = scene
             .materials
             .iter()
@@ -798,11 +900,16 @@ impl SceneGpu {
                     MatKind::Textured { tex } => tex,
                     _ => 0,
                 },
+                emissive: [m.emissive.x, m.emissive.y, m.emissive.z],
+                normal_tex: m.normal_tex,
+                rough_tex: m.rough_tex,
+                metal_tex: m.metal_tex,
+                emissive_tex: m.emissive_tex,
+                normal_scale: m.normal_scale,
             })
             .collect();
-        // Per-vertex UV stream (float2, parallel to positions) + the
-        // per-material cutout map the alpha_cutout helper consumes.
-        let texcoords: Vec<[f32; 2]> = scene.texcoords.iter().map(|t| [t.x, t.y]).collect();
+        let materials_b = stream_buffer(device, sub, &ring, &materials, |m| *m, srv)?;
+        // Per-material cutout map the alpha_cutout helper consumes.
         let mat_cutout: Vec<u32> = scene
             .materials
             .iter()
@@ -811,6 +918,7 @@ impl SceneGpu {
                 _ => 0,
             })
             .collect();
+        let mat_cutout_b = stream_buffer(device, sub, &ring, &mat_cutout, |m| *m, srv)?;
         if !scene.textures.is_empty() {
             let mb = scene.textures.iter().map(|t| t.w as u64 * t.h as u64 * 4).sum::<u64>()
                 >> 20;
@@ -822,59 +930,69 @@ impl SceneGpu {
             );
         }
 
-        let srv = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-        let mut uploads = Vec::new();
-        let mut up = |bytes: &[u8]| -> Result<ID3D12Resource> {
-            let (dst, p) = upload_pair(device, bytes, srv)?;
-            uploads.push(p);
-            Ok(dst)
-        };
-        let bvh_nodes = up(as_bytes(&nodes))?;
-        let tri_idx = up(as_bytes(&bvh.tri_idx))?;
-        let positions_b = up(as_bytes(&positions))?;
-        let normals_b = up(as_bytes(&normals))?;
-        let indices_b = up(as_bytes(&indices))?;
-        let tri_mat = up(as_bytes(&scene.tri_mat))?;
-        let materials_b = up(as_bytes(&materials))?;
-        let texcoords_b = up(as_bytes(&texcoords))?;
-        let mat_cutout_b = up(as_bytes(&mat_cutout))?;
-
-        // Scene textures: RGBA8 sRGB Texture2Ds, texels uploaded raw (row 0
-        // = v0, the V flip is baked at OBJ load) through row-pitched staging.
-        // Transient staging ~= texture bytes (San Miguel ~1 GB) — freed with
-        // the rest by free_staging; an OOM here surfaces as the loud CPU
-        // fallback.
-        let mut tex_uploads = Vec::new();
+        // Scene textures: RGBA8 Texture2Ds — _SRGB for color textures (the
+        // per-texel decode of texture.rs::sample_bilinear in hardware) and
+        // plain _UNORM for linear-data maps (normal / rough-metal; the CPU
+        // samples those via sample_bilinear_linear). Texels upload raw (row
+        // 0 = v0, the V flip is baked at OBJ load) in row bands through the
+        // same staging ring — no per-texture staging commit.
         let mut textures_v = Vec::new();
         for t in &scene.textures {
+            let fmt = if t.srgb {
+                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+            } else {
+                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM
+            };
             let dst = d3d12::committed_tex(
                 device,
                 t.w,
                 t.h,
-                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+                fmt,
                 D3D12_RESOURCE_FLAG_NONE,
                 D3D12_RESOURCE_STATE_COPY_DEST,
             )?;
             let pitch = d3d12::aligned_pitch(t.w as usize * 4);
-            let src = d3d12::UploadBuffer::new(device, pitch * t.h as usize)?;
-            for y in 0..t.h as usize {
-                let row = &t.texels[y * t.w as usize..(y + 1) * t.w as usize];
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        row.as_ptr() as *const u8,
-                        src.ptr.add(y * pitch),
-                        t.w as usize * 4,
-                    )
-                };
+            let band = (ring.size / pitch).max(1).min(t.h as usize);
+            let mut y0 = 0usize;
+            while y0 < t.h as usize {
+                let rows = band.min(t.h as usize - y0);
+                for r in 0..rows {
+                    let y = y0 + r;
+                    let row = &t.texels[y * t.w as usize..(y + 1) * t.w as usize];
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            row.as_ptr() as *const u8,
+                            ring.ptr.add(r * pitch),
+                            t.w as usize * 4,
+                        )
+                    };
+                }
+                let fp = d3d12::footprint(fmt, t.w, rows as u32, 4, 0);
+                let last = y0 + rows == t.h as usize;
+                sub.run_list(&mut |l| {
+                    unsafe {
+                        l.CopyTextureRegion(
+                            &d3d12::loc_subresource(&dst),
+                            0,
+                            y0 as u32,
+                            0,
+                            &d3d12::loc_footprint(&ring.resource, fp),
+                            None,
+                        )
+                    };
+                    if last {
+                        unsafe {
+                            l.ResourceBarrier(&[transition(
+                                &dst,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                            )])
+                        };
+                    }
+                    Ok(())
+                })?;
+                y0 += rows;
             }
-            let footprint = d3d12::footprint(
-                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
-                t.w,
-                t.h,
-                4,
-                0,
-            );
-            tex_uploads.push(PendingTexUpload { src, dst: dst.clone(), footprint });
             textures_v.push(dst);
         }
 
@@ -882,9 +1000,15 @@ impl SceneGpu {
         let n_verts = scene.positions.len() as u32;
         let n_tris = scene.indices.len() as u32;
         let geom = geometry_desc(&positions_b, &indices_b, n_verts, n_tris, scene.any_alpha);
+        // ALLOW_COMPACTION: the build lands in a worst-case-sized buffer,
+        // then a compact copy (~40-50% smaller in practice) replaces it and
+        // the original drops before this function returns — the compacted
+        // size is what buys DXR headroom on 100M-tri scenes.
+        let blas_flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE
+            | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_COMPACTION;
         let blas_inputs = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
             Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL,
-            Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE,
+            Flags: blas_flags,
             NumDescs: 1,
             DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
             Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
@@ -911,16 +1035,81 @@ impl SceneGpu {
 
         let uaf = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         let as_state = D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE;
-        let blas =
-            committed_buffer(device, blas_info.ResultDataMaxSizeInBytes, uaf, as_state)?;
         let tlas =
             committed_buffer(device, tlas_info.ResultDataMaxSizeInBytes, uaf, as_state)?;
+        // The worst-case-sized build target, scratch, and the TLAS instance
+        // desc all live only to the end of this function — peak commit is
+        // steady-state (compacted BLAS) + one worst-case BLAS + scratch.
+        let blas_full =
+            committed_buffer(device, blas_info.ResultDataMaxSizeInBytes, uaf, as_state)?;
         let scratch = committed_buffer(
             device,
             blas_info.ScratchDataSizeInBytes.max(tlas_info.ScratchDataSizeInBytes),
             uaf,
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         )?;
+
+        // Submit 1: BLAS build, emitting the compacted size (a u64 written to
+        // a tiny UAV buffer, copied to readback in the same list — the
+        // blocking submit doubles as the fence).
+        let csize_buf =
+            committed_buffer(device, 8, uaf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)?;
+        let csize_rb = d3d12::ReadbackBuffer::new(device, 8)?;
+        sub.run_list(&mut |list| {
+            let list4: ID3D12GraphicsCommandList4 =
+                list.cast().map_err(|e| format!("ID3D12GraphicsCommandList4: {e}"))?;
+            let blas_desc = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
+                DestAccelerationStructureData: unsafe { blas_full.GetGPUVirtualAddress() },
+                Inputs: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
+                    Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL,
+                    Flags: blas_flags,
+                    NumDescs: 1,
+                    DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
+                    Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+                        pGeometryDescs: &geom,
+                    },
+                },
+                SourceAccelerationStructureData: 0,
+                ScratchAccelerationStructureData: unsafe { scratch.GetGPUVirtualAddress() },
+            };
+            let postbuild = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC {
+                DestBuffer: unsafe { csize_buf.GetGPUVirtualAddress() },
+                InfoType:
+                    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_COMPACTED_SIZE,
+            };
+            unsafe { list4.BuildRaytracingAccelerationStructure(&blas_desc, Some(&[postbuild])) };
+            unsafe {
+                list.ResourceBarrier(&[
+                    uav_barrier(None),
+                    transition(
+                        &csize_buf,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    ),
+                ])
+            };
+            unsafe { list.CopyBufferRegion(&csize_rb.resource, 0, &csize_buf, 0, 8) };
+            Ok(())
+        })?;
+        let compacted_size = {
+            let mut ptr = std::ptr::null_mut();
+            unsafe { csize_rb.resource.Map(0, None, Some(&mut ptr)) }
+                .map_err(|e| format!("compacted-size Map: {e}"))?;
+            let v = unsafe { (ptr as *const u64).read_unaligned() };
+            unsafe { csize_rb.resource.Unmap(0, None) };
+            v
+        };
+
+        // Submit 2: compact copy into an exact-size buffer, then the TLAS
+        // build against the COMPACTED BLAS. A degenerate reported size keeps
+        // the full build (never wrong, just bigger).
+        let use_compact =
+            compacted_size > 0 && compacted_size < blas_info.ResultDataMaxSizeInBytes;
+        let blas = if use_compact {
+            committed_buffer(device, compacted_size, uaf, as_state)?
+        } else {
+            blas_full.clone()
+        };
 
         // Identity-instance TLAS: InstanceID 0, mask 0xff, contribution 0,
         // no flags (geometry is OPAQUE; two-sidedness comes from tracing
@@ -943,6 +1132,59 @@ impl SceneGpu {
         };
         let instance_va = unsafe { instance.resource.GetGPUVirtualAddress() };
 
+        sub.run_list(&mut |list| {
+            let list4: ID3D12GraphicsCommandList4 =
+                list.cast().map_err(|e| format!("ID3D12GraphicsCommandList4: {e}"))?;
+            if use_compact {
+                unsafe {
+                    list4.CopyRaytracingAccelerationStructure(
+                        blas.GetGPUVirtualAddress(),
+                        blas_full.GetGPUVirtualAddress(),
+                        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_COMPACT,
+                    )
+                };
+                unsafe { list.ResourceBarrier(&[uav_barrier(None)]) };
+            }
+            let tlas_desc = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
+                DestAccelerationStructureData: unsafe { tlas.GetGPUVirtualAddress() },
+                Inputs: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
+                    Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL,
+                    Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE,
+                    NumDescs: 1,
+                    DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
+                    Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+                        InstanceDescs: instance_va,
+                    },
+                },
+                SourceAccelerationStructureData: 0,
+                ScratchAccelerationStructureData: unsafe { scratch.GetGPUVirtualAddress() },
+            };
+            unsafe { list4.BuildRaytracingAccelerationStructure(&tlas_desc, None) };
+            unsafe { list.ResourceBarrier(&[uav_barrier(None)]) };
+            Ok(())
+        })?;
+        drop(instance);
+        drop(scratch);
+        drop(blas_full);
+        drop(ring);
+
+        eprintln!(
+            "gpu scene: streams {} MB | blas {} MB{} | transient scratch {} MB (freed){}",
+            scene_stream_bytes(scene, sw_bvh) >> 20,
+            if use_compact { compacted_size } else { blas_info.ResultDataMaxSizeInBytes } >> 20,
+            if use_compact {
+                format!(" (compacted from {})", blas_info.ResultDataMaxSizeInBytes >> 20)
+            } else {
+                String::new()
+            },
+            blas_info.ScratchDataSizeInBytes.max(tlas_info.ScratchDataSizeInBytes) >> 20,
+            match adapter::vram_info(device) {
+                Some((usage, budget)) =>
+                    format!(" | vram {} / {} MB", usage >> 20, budget >> 20),
+                None => String::new(),
+            }
+        );
+
         Ok(Self {
             bvh_nodes,
             tri_idx,
@@ -956,100 +1198,10 @@ impl SceneGpu {
             texcoords: texcoords_b,
             mat_cutout: mat_cutout_b,
             textures: textures_v,
-            any_alpha: scene.any_alpha,
             n_verts,
             n_tris,
             n_mats: scene.materials.len() as u32,
-            staging: Some(SceneStaging {
-                uploads,
-                tex_uploads,
-                scratch,
-                _instance: instance,
-                instance_va,
-                blas_scratch_size: blas_info.ScratchDataSizeInBytes,
-                tlas_scratch_size: tlas_info.ScratchDataSizeInBytes,
-            }),
         })
-    }
-
-    /// Record the one-time init: buffer copies, transitions, BLAS + TLAS
-    /// builds. Call once, execute, then `free_staging`.
-    pub fn record_upload(&self, list: &ID3D12GraphicsCommandList) -> Result<()> {
-        let st = self.staging.as_ref().ok_or("scene staging already freed")?;
-        let list4: ID3D12GraphicsCommandList4 =
-            list.cast().map_err(|e| format!("ID3D12GraphicsCommandList4: {e}"))?;
-        let mut barriers = Vec::new();
-        for u in &st.uploads {
-            unsafe { list.CopyBufferRegion(&u.dst, 0, &u.src.resource, 0, u.size as u64) };
-            barriers.push(transition(&u.dst, D3D12_RESOURCE_STATE_COPY_DEST, u.after));
-        }
-        for u in &st.tex_uploads {
-            unsafe {
-                list.CopyTextureRegion(
-                    &d3d12::loc_subresource(&u.dst),
-                    0,
-                    0,
-                    0,
-                    &d3d12::loc_footprint(&u.src.resource, u.footprint),
-                    None,
-                )
-            };
-            barriers.push(transition(
-                &u.dst,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-            ));
-        }
-        unsafe { list.ResourceBarrier(&barriers) };
-
-        let geom = geometry_desc(
-            &self.positions,
-            &self.indices,
-            self.n_verts,
-            self.n_tris,
-            self.any_alpha,
-        );
-        let scratch_va = unsafe { st.scratch.GetGPUVirtualAddress() };
-        let _ = (st.blas_scratch_size, st.tlas_scratch_size);
-        let blas_desc = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
-            DestAccelerationStructureData: unsafe { self.blas.GetGPUVirtualAddress() },
-            Inputs: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
-                Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL,
-                Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE,
-                NumDescs: 1,
-                DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
-                Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
-                    pGeometryDescs: &geom,
-                },
-            },
-            SourceAccelerationStructureData: 0,
-            ScratchAccelerationStructureData: scratch_va,
-        };
-        unsafe { list4.BuildRaytracingAccelerationStructure(&blas_desc, None) };
-        // The TLAS build reads the BLAS; scratch is also reused.
-        unsafe { list.ResourceBarrier(&[uav_barrier(None)]) };
-        let tlas_desc = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
-            DestAccelerationStructureData: unsafe { self.tlas.GetGPUVirtualAddress() },
-            Inputs: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
-                Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL,
-                Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE,
-                NumDescs: 1,
-                DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
-                Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
-                    InstanceDescs: st.instance_va,
-                },
-            },
-            SourceAccelerationStructureData: 0,
-            ScratchAccelerationStructureData: scratch_va,
-        };
-        unsafe { list4.BuildRaytracingAccelerationStructure(&tlas_desc, None) };
-        unsafe { list.ResourceBarrier(&[uav_barrier(None)]) };
-        Ok(())
-    }
-
-    /// Drop the staging buffers + scratch after the upload list executed.
-    pub fn free_staging(&mut self) {
-        self.staging = None;
     }
 
     /// Write the RP_SCENE_TEX table's descriptors into `heap` at slots
@@ -1091,7 +1243,9 @@ impl SceneGpu {
         buf_srv(&self.mat_cutout, 4, self.n_mats, 3);
         for (i, tex) in self.textures.iter().enumerate() {
             let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
-                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+                // The resource's own creation format: _SRGB for color
+                // textures, _UNORM for linear-data maps.
+                Format: unsafe { tex.GetDesc() }.Format,
                 ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
                 Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
                 Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
@@ -1455,6 +1609,7 @@ impl TraceGpu {
         gbuf_full: bool,
         nppd: bool,
         debug: bool,
+        sub: &mut dyn d3d12::Submit,
     ) -> Result<Self> {
         require_caps(device)?;
         let root_sig = create_root_signature(device)?;
@@ -1531,7 +1686,7 @@ impl TraceGpu {
             None
         };
 
-        let scene_gpu = SceneGpu::new(device, scene, bvh)?;
+        let scene_gpu = SceneGpu::new_uploaded(device, scene, Some(bvh), sub)?;
 
         let uaf = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         let ua = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;

@@ -7,6 +7,10 @@
 /scenes/*.zip
 /scenes/**/*.zip
 /scenes/**/*.obj
+# Scene+BVH sidecar caches (src/scene_cache.rs) — per-machine derived
+# artifacts, rebuilt on any source/version change. Never commit or LFS them.
+*.fcache
+*.fcache.*
 check.png
 screenshot_*.png
 dlss_gbuf_*.png

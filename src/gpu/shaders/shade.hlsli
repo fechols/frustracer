@@ -30,7 +30,10 @@ StructuredBuffer<uint>   tri_mat   : register(t5);
 #define MAT_MARBLE   1u
 #define MAT_TEXTURED 2u
 
-// Mirrors trace.rs::GpuMat field-for-field (48 B) — a stride skew reads
+// scene.rs::NO_TEX — "no map" sentinel for the texture-index fields.
+#define TEX_NONE 0xffffffffu
+
+// Mirrors trace.rs::GpuMat field-for-field (80 B) — a stride skew reads
 // garbage; the two must move in the same commit.
 struct Mat {
     float3 albedo;
@@ -43,6 +46,12 @@ struct Mat {
     float translucency;
     float transmission;
     uint tex; // Scene::textures index (MAT_TEXTURED: the space1 texs[] slot)
+    float3 emissive;   // Ke; added at every lap, outside the kd*(1-transmission) factor
+    uint normal_tex;   // tangent-space normal map (TEX_NONE = none; UNORM SRV)
+    uint rough_tex;    // roughness map, samples .g (glTF channel convention)
+    uint metal_tex;    // metallic map, samples .b
+    uint emissive_tex; // emissive map (sRGB SRV)
+    float normal_scale;
 };
 StructuredBuffer<Mat> materials : register(t6);
 
@@ -144,6 +153,38 @@ void surface_point(float3 ro, float3 rd, HitInfo hit, out float3 p, out float3 n
     p = ro + rd * hit.t + n * SCENE_EPS;
 }
 
+// shade.rs::perturb_normal — tangent-space normal mapping with the tangent
+// derived on the fly from the triangle's positions + UVs (zero storage),
+// Gram-Schmidt vs n, bitangent handedness from the UV winding. Degenerate
+// UVs/tangent or a past-horizon perturbation degrade to n. The green channel
+// is negated (shade.rs::NORMAL_MAP_Y_SIGN): the loader V-flips at load, so
+// OpenGL-convention (+Y up) maps point against our +v rows.
+#define NORMAL_MAP_Y_SIGN (-1.0)
+float3 perturb_normal(HitInfo hit, float3 n, Mat mat, float2 uv) {
+    uint3 idx = uint3(indices[hit.tri * 3u], indices[hit.tri * 3u + 1u],
+                      indices[hit.tri * 3u + 2u]);
+    float3 p0 = positions[idx.x];
+    float3 e1 = positions[idx.y] - p0;
+    float3 e2 = positions[idx.z] - p0;
+    float2 t0 = uv_buf[idx.x];
+    float2 d1 = uv_buf[idx.y] - t0;
+    float2 d2 = uv_buf[idx.z] - t0;
+    float det = d1.x * d2.y - d2.x * d1.y;
+    if (abs(det) < 1e-12) return n;
+    float3 t = normalize_or_zero((e1 * d2.y - e2 * d1.y) / det - n * dot(n, (e1 * d2.y - e2 * d1.y) / det));
+    if (all(t == float3(0.0, 0.0, 0.0))) return n;
+    float3 b_raw = (e2 * d1.x - e1 * d2.x) / det;
+    float3 bx = cross(n, t);
+    float3 b = bx * (dot(bx, b_raw) >= 0.0 ? 1.0 : -1.0);
+    float3 s = texs[NonUniformResourceIndex(mat.normal_tex)].SampleLevel(samp_lin, uv, 0.0).rgb;
+    float3 tn = float3((s.x * 2.0 - 1.0) * mat.normal_scale,
+                       (s.y * 2.0 - 1.0) * mat.normal_scale * NORMAL_MAP_Y_SIGN,
+                       max(s.z * 2.0 - 1.0, 0.05));
+    float3 outn = normalize_or_zero(t * tn.x + b * tn.y + n * tn.z);
+    if (all(outn == float3(0.0, 0.0, 0.0)) || dot(outn, n) <= 0.0) return n;
+    return outn;
+}
+
 // --- The shade() port ----------------------------------------------------------
 
 // Whitted shading of a committed primary hit, reflection bounce included.
@@ -193,40 +234,69 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
           : mat.kind == MAT_TEXTURED ? texs[NonUniformResourceIndex(mat.tex)]
                 .SampleLevel(samp_lin, tri_uv(hit.tri, hit.u, hit.v), 0.0).rgb
           : mat.albedo;
+        // Map-driven material terms — the shade.rs block, ZERO rng draws
+        // (materials with every map at TEX_NONE run bit-identically to the
+        // pre-map kernel; the same-seed wavefront-vs-reference gates rely on
+        // that). Linear maps ride UNORM SRVs (no sRGB decode).
+        float2 map_uv = float2(0.0, 0.0);
+        if (mat.normal_tex != TEX_NONE || mat.rough_tex != TEX_NONE ||
+            mat.metal_tex != TEX_NONE || mat.emissive_tex != TEX_NONE) {
+            map_uv = tri_uv(hit.tri, hit.u, hit.v);
+        }
+        float rough_eff = mat.roughness;
+        float metal_eff = mat.metallic;
+        if (mat.rough_tex != TEX_NONE) {
+            rough_eff = clamp(rough_eff * texs[NonUniformResourceIndex(mat.rough_tex)]
+                                              .SampleLevel(samp_lin, map_uv, 0.0).g,
+                              0.02, 1.0);
+        }
+        if (mat.metal_tex != TEX_NONE) {
+            metal_eff = clamp(metal_eff * texs[NonUniformResourceIndex(mat.metal_tex)]
+                                              .SampleLevel(samp_lin, map_uv, 0.0).b,
+                              0.0, 1.0);
+        }
+        // Shading normal n_s (n_s == n when unmapped): the BRDF frame, N·L,
+        // and the guide use it; n keeps the ray offsets, the translucency
+        // back ray, the hemi handoff, and the glass chain — the shade.rs
+        // n_g/n_s split.
+        float3 n_s = n;
+        if (mat.normal_tex != TEX_NONE) n_s = perturb_normal(hit, n, mat, map_uv);
         if (lap == 0u) {
-            // shade.rs:226-233 — spec_t stays 0 unless the lap-0 reflection
-            // below traces (hit t / INF on miss, shade.rs:481/:494).
-            prim.n = n;
-            prim.rough = mat.roughness;
+            // shade.rs — spec_t stays 0 unless the lap-0 reflection below
+            // traces (hit t / INF on miss).
+            prim.n = n_s;
+            prim.rough = rough_eff;
             prim.albedo = albedo;
-            prim.metallic = mat.metallic;
+            prim.metallic = metal_eff;
         }
 
-        float3 f0 = lerp(float3(0.04, 0.04, 0.04), albedo, mat.metallic);
+        float3 f0 = lerp(float3(0.04, 0.04, 0.04), albedo, metal_eff);
         // 0.157 = Charlie peak directional albedo (shade.rs energy comp).
-        float3 kd = albedo * (1.0 - mat.metallic) * (1.0 - 0.157 * mat.sheen);
+        float3 kd = albedo * (1.0 - metal_eff) * (1.0 - 0.157 * mat.sheen);
 
-        // Tangent frame: anisotropic materials brush circumferentially
-        // around world-up; onb covers poles and isotropic.
+        // Tangent frame on the SHADING normal: anisotropic materials brush
+        // circumferentially around world-up; onb covers poles and isotropic.
         float3 t1, t2;
         if (mat.anisotropy > 0.0) {
-            float3 t = cross(float3(0.0, 1.0, 0.0), n);
+            float3 t = cross(float3(0.0, 1.0, 0.0), n_s);
             if (dot(t, t) > 1e-8) {
                 t1 = normalize(t);
-                t2 = cross(n, t1);
+                t2 = cross(n_s, t1);
             } else {
-                onb(n, t1, t2);
+                onb(n_s, t1, t2);
             }
         } else {
-            onb(n, t1, t2);
+            onb(n_s, t1, t2);
         }
         float ax, ay;
-        ggx_alphas(mat.roughness, mat.anisotropy, ax, ay);
+        ggx_alphas(rough_eff, mat.anisotropy, ax, ay);
         float3 v = -rd;
-        float3 vl = float3(dot(v, t1), dot(v, t2), max(dot(v, n), 1e-4));
+        // The face-flip guarantees n·v >= 0 for the GEOMETRIC normal; a
+        // perturbed n_s can dip below — the grazing guard covers both.
+        float3 vl = float3(dot(v, t1), dot(v, t2), max(dot(v, n_s), 1e-4));
         float lambda_v = ggx_lambda(vl, ax, ay);
         // Charlie-sheen inverse alpha, hoisted like the CPU.
-        float sheen_inv_a = 1.0 / clamp(mat.roughness, 0.07, 1.0);
+        float sheen_inv_a = 1.0 / clamp(rough_eff, 0.07, 1.0);
 
         // Direct light: N area-light samples, Lambert (1/pi omitted by
         // convention) + Cook-Torrance GGX with the compensating pi.
@@ -241,7 +311,9 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
             float dist2 = dot(lv, lv);
             float dist = sqrt(dist2);
             float3 wi = lv / dist;
-            float ndl = dot(n, wi);
+            // N·L against the SHADING normal; the shadow/translucency ray
+            // geometry stays on the geometric n (shade.rs).
+            float ndl = dot(n_s, wi);
             if (ndl <= 0.0) {
                 // shade.rs translucency arm: a back-lit leaf receives the
                 // light through itself; the occlusion ray starts on the
@@ -258,10 +330,10 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                 float3 li = light_color.xyz * (ndl / dist2);
                 direct_d += li;
                 float3 h = normalize_or_zero(wi + v);
-                float3 hl = float3(dot(h, t1), dot(h, t2), dot(h, n));
+                float3 hl = float3(dot(h, t1), dot(h, t2), dot(h, n_s));
                 if (hl.z > 0.0) {
                     float dn = ggx_ndf(hl, ax, ay);
-                    float3 wil = float3(dot(wi, t1), dot(wi, t2), dot(wi, n));
+                    float3 wil = float3(dot(wi, t1), dot(wi, t2), dot(wi, n_s));
                     float g2 = 1.0 / (1.0 + lambda_v + ggx_lambda(wil, ax, ay));
                     float3 f = schlick(f0, max(dot(wi, h), 0.0));
                     direct_s += li * f * (PI * dn * g2 / (4.0 * vl.z * ndl));
@@ -316,6 +388,18 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
             total += tput * (kd * kt * (diffuse_d + AMBIENT * ao) + direct_s);
         }
 
+        // Emitted radiance — additive per lap, OUTSIDE the kd*kt factor, so
+        // emitters appear in reflections and through glass (shade.rs). The
+        // guard keeps emissive-free materials bit-identical.
+        if (any(mat.emissive != 0.0) || mat.emissive_tex != TEX_NONE) {
+            float3 emis = mat.emissive;
+            if (mat.emissive_tex != TEX_NONE) {
+                emis *= texs[NonUniformResourceIndex(mat.emissive_tex)]
+                            .SampleLevel(samp_lin, map_uv, 0.0).rgb;
+            }
+            total += tput * emis;
+        }
+
         // Continuation bookkeeping: at most one of the two branches below
         // becomes `next`; the root's second branch (transmission behind a
         // traced reflection) goes to the stash.
@@ -341,13 +425,15 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
             p2 = (1.0 - s) * sqrt(max(1.0 - p1 * p1, 0.0)) + s * p2;
             float3 nh = b1 * p1 + b2 * p2 + vh * sqrt(max(1.0 - p1 * p1 - p2 * p2, 0.0));
             float3 hl = normalize(float3(ax * nh.x, ay * nh.y, max(nh.z, 1e-6)));
-            float3 h = t1 * hl.x + t2 * hl.y + n * hl.z;
+            float3 h = t1 * hl.x + t2 * hl.y + n_s * hl.z;
             float3 rdir = normalize(2.0 * dot(v, h) * h - v);
             // Below-horizon samples are dropped (slight darkening, no upward
             // bias; spec_t stays 0.0 = "no reflection traced") — but the
-            // transmission branch below still runs, like the CPU.
-            if (dot(rdir, n) > 0.0) {
-                float3 rdl = float3(dot(rdir, t1), dot(rdir, t2), dot(rdir, n));
+            // transmission branch below still runs, like the CPU. BOTH
+            // horizons: n_s (the lobe's frame) and the geometric n (a
+            // perturbed lobe must not fire a ray that re-enters the surface).
+            if (dot(rdir, n_s) > 0.0 && dot(rdir, n) > 0.0) {
+                float3 rdl = float3(dot(rdir, t1), dot(rdir, t2), dot(rdir, n_s));
                 float g2_over_g1 =
                     (1.0 + lambda_v) / (1.0 + lambda_v + ggx_lambda(rdl, ax, ay));
                 float3 rtput = tput * schlick(f0, max(dot(v, h), 0.0)) * g2_over_g1;
@@ -390,7 +476,10 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
             }
             bool entering = dot(n_raw, n) >= 0.0; // the viewer-flip didn't fire
             float eta = entering ? 1.0 / GLASS_IOR : GLASS_IOR;
-            float cos_i = vl.z;
+            // The refraction chain stays on the GEOMETRIC normal (shade.rs);
+            // v·n with the same grazing guard is bit-identical to the old
+            // n-frame vl.z when no normal map is present.
+            float cos_i = max(dot(v, n), 1e-4);
             float k = 1.0 - eta * eta * (1.0 - cos_i * cos_i);
             float3 hit_p = ro + rd * hit.t;
             float3 tdir, torig;
