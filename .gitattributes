@@ -14,3 +14,9 @@ scenes/**/*.bin filter=lfs diff=lfs merge=lfs -text
 scenes/**/*.jpg filter=lfs diff=lfs merge=lfs -text
 scenes/**/*.jpeg filter=lfs diff=lfs merge=lfs -text
 scenes/**/*.gltf filter=lfs diff=lfs merge=lfs -text
+# Environment maps and any straggler binary texture formats a scene drop might
+# carry — LFS guards so nothing binary reaches plain git history by accident.
+scenes/**/*.hdr filter=lfs diff=lfs merge=lfs -text
+scenes/**/*.exr filter=lfs diff=lfs merge=lfs -text
+scenes/**/*.tga filter=lfs diff=lfs merge=lfs -text
+scenes/**/*.dds filter=lfs diff=lfs merge=lfs -text
