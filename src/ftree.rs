@@ -30,6 +30,13 @@ pub const WIDTH: usize = 8;
 /// Terminal-slot marker in `child`; empty-slot marker in `bnode`.
 const INVALID: u32 = u32::MAX;
 
+/// Traversal stack bound for the ITERATIVE consumers (the HLSL port; the CPU
+/// visit recurses natively). Wide depth is ~binary/3: the 90M-tri tiled build
+/// measures binary depth 53 ⇒ wide ~19; 32 covers far past the binary
+/// TRAV_STACK = 96 scale. Asserted at build like TRAV_STACK — never "fix" an
+/// overflow by dropping entries (a dropped subtree is a false-sky bug).
+pub const FT_STACK: usize = 32;
+
 /// 8 child slots, boxes in SoA so the per-slot tests compile to lane math.
 /// 256 B = 4 cache lines.
 #[repr(C)]
@@ -93,7 +100,29 @@ impl FTree {
                 t.root_len += 1;
             }
         }
+        let depth = t.max_depth();
+        assert!(depth <= FT_STACK, "ftree depth {depth} exceeds the {FT_STACK}-entry traversal stack");
         t
+    }
+
+    /// Max wide-node depth (root = 1), iterative — the FT_STACK assert's input,
+    /// run once at build like `Bvh::max_depth`.
+    pub fn max_depth(&self) -> usize {
+        if self.nodes.is_empty() {
+            return 0;
+        }
+        let mut work: Vec<(u32, usize)> = vec![(0, 1)];
+        let mut deepest = 0usize;
+        while let Some((n, d)) = work.pop() {
+            deepest = deepest.max(d);
+            let nd = &self.nodes[n as usize];
+            for s in 0..WIDTH {
+                if nd.child[s] != INVALID {
+                    work.push((nd.child[s], d + 1));
+                }
+            }
+        }
+        deepest
     }
 
     /// Build the wide node covering binary node `b` (leaf or internal); returns
