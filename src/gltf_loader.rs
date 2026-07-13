@@ -58,9 +58,72 @@ pub fn load_gltf_scene(path: &str) -> Scene {
         .unwrap_or(std::path::Path::new("."))
         .to_path_buf();
     let doc = gltf.document;
-    let buffers = gltf::import_buffers(&doc, Some(&base_dir), gltf.blob)
+    let buffers = resolve_buffers(&doc, &base_dir, gltf.blob)
         .unwrap_or_else(|e| panic!("failed to resolve glTF buffers for '{path}': {e}"));
     build_scene(&doc, &buffers, &base_dir, true)
+}
+
+/// Resolve the document's buffers like `gltf::import_buffers`, plus the
+/// engine's `.zst` sibling convention: an external buffer URI whose file is
+/// absent falls back to `<file>.zst` and decodes transparently. Raw glTF
+/// vertex/index buffers zstd ~2-3x (measured: Intel Sponza 133.5 -> 60.7 MB),
+/// unlike the already-deflated PNG/JPG textures — so committed scenes carry
+/// `.bin.zst` while a plain `.bin` next to the `.gltf` still loads verbatim.
+fn resolve_buffers(
+    doc: &gltf::Document,
+    base_dir: &std::path::Path,
+    mut blob: Option<Vec<u8>>,
+) -> Result<Vec<gltf::buffer::Data>, String> {
+    let mut out = Vec::new();
+    for b in doc.buffers() {
+        let mut data = match b.source() {
+            gltf::buffer::Source::Bin => blob
+                .take()
+                .ok_or_else(|| "GLB buffer without a bin chunk".to_string())?,
+            gltf::buffer::Source::Uri(uri) => {
+                if let Some(rest) = uri.strip_prefix("data:") {
+                    let b64 = rest
+                        .split_once(',')
+                        .map(|(_, b)| b)
+                        .ok_or_else(|| format!("malformed buffer data URI in buffer {}", b.index()))?;
+                    base64_decode(b64)
+                        .ok_or_else(|| format!("bad base64 in buffer {} data URI", b.index()))?
+                } else {
+                    let p = base_dir.join(uri.replace("%20", " "));
+                    if p.exists() {
+                        std::fs::read(&p).map_err(|e| format!("read {}: {e}", p.display()))?
+                    } else {
+                        let mut z = p.as_os_str().to_owned();
+                        z.push(".zst");
+                        let z = std::path::PathBuf::from(z);
+                        let f = std::fs::File::open(&z).map_err(|e| {
+                            format!(
+                                "buffer '{uri}': neither {} nor {} readable ({e})",
+                                p.display(),
+                                z.display()
+                            )
+                        })?;
+                        zstd::stream::decode_all(std::io::BufReader::new(f))
+                            .map_err(|e| format!("zstd decode {}: {e}", z.display()))?
+                    }
+                }
+            }
+        };
+        if data.len() < b.length() {
+            return Err(format!(
+                "buffer {} shorter than declared ({} < {})",
+                b.index(),
+                data.len(),
+                b.length()
+            ));
+        }
+        // import_buffers pads to 4-byte multiples; accessor math relies on it.
+        while data.len() % 4 != 0 {
+            data.push(0);
+        }
+        out.push(gltf::buffer::Data(data));
+    }
+    Ok(out)
 }
 
 /// The loader body, shared with `self_test` (which passes decode_images =
@@ -490,7 +553,7 @@ pub fn self_test() -> Result<(), String> {
     let gltf =
         gltf::Gltf::from_slice(&glb).map_err(|e| format!("self-test GLB parse: {e}"))?;
     let doc = gltf.document;
-    let buffers = gltf::import_buffers(&doc, None, gltf.blob)
+    let buffers = resolve_buffers(&doc, std::path::Path::new("."), gltf.blob)
         .map_err(|e| format!("self-test buffers: {e}"))?;
     let sc = build_scene(&doc, &buffers, std::path::Path::new("."), false);
 
@@ -529,6 +592,47 @@ pub fn self_test() -> Result<(), String> {
     let vn = sc.normals[sc.indices[2][0] as usize];
     if vn.z <= 0.9 {
         return Err(format!("welded normal fallback wrong: {vn:?}"));
+    }
+
+    // .bin.zst sibling fallback (resolve_buffers): a minimal external-buffer
+    // glTF whose buffer exists ONLY as a zstd sibling must load — this is the
+    // committed-scene shape (Sponza .bins are stored compressed).
+    {
+        let dir = std::env::temp_dir()
+            .join(format!("frustracer-gltf-zst-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).map_err(|e| format!("zst-test tmpdir: {e}"))?;
+        let tri: [f32; 9] = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+        let mut bin = Vec::with_capacity(36);
+        for v in tri {
+            bin.extend_from_slice(&v.to_le_bytes());
+        }
+        let z = zstd::stream::encode_all(&bin[..], 3)
+            .map_err(|e| format!("zst-test encode: {e}"))?;
+        std::fs::write(dir.join("tri.bin.zst"), z)
+            .map_err(|e| format!("zst-test write bin: {e}"))?;
+        let json = r#"{"asset":{"version":"2.0"},
+"buffers":[{"uri":"tri.bin","byteLength":36}],
+"bufferViews":[{"buffer":0,"byteOffset":0,"byteLength":36}],
+"accessors":[{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3","min":[0,0,0],"max":[1,1,0]}],
+"meshes":[{"primitives":[{"attributes":{"POSITION":0}}]}],
+"nodes":[{"mesh":0}],
+"scenes":[{"nodes":[0]}],
+"scene":0}"#;
+        std::fs::write(dir.join("tri.gltf"), json)
+            .map_err(|e| format!("zst-test write gltf: {e}"))?;
+        let g = gltf::Gltf::open(dir.join("tri.gltf"))
+            .map_err(|e| format!("zst-test open: {e}"))?;
+        let bufs = resolve_buffers(&g.document, &dir, g.blob)
+            .map_err(|e| format!("zst-test resolve: {e}"))?;
+        let zsc = build_scene(&g.document, &bufs, &dir, false);
+        let _ = std::fs::remove_dir_all(&dir);
+        // Ground quad (2) + the one decompressed triangle.
+        if zsc.tri_count() != 3 {
+            return Err(format!(
+                "zst sibling fallback: expected 3 tris, got {}",
+                zsc.tri_count()
+            ));
+        }
     }
     Ok(())
 }
