@@ -127,7 +127,11 @@ impl FrameCtx<'_> {
 pub fn render_frame(ctx: &FrameCtx, hybrid: bool) {
     if hybrid {
         crate::zone!("trace-full");
-        trace_tile(ctx, 0, 0, ctx.rw, ctx.rh, 0.0, 0, 0, &[0], u32::MAX);
+        // Whole-tree root cut in the session's live id space (binary `[0]` or
+        // the wide root slots) — every cut below is refine output in the same
+        // space, translated back to binary ids only where a ray seeds.
+        let root = crate::ftree::Accel::for_tiles(ctx.bvh).root_cut();
+        trace_tile(ctx, 0, 0, ctx.rw, ctx.rh, 0.0, 0, 0, root, u32::MAX);
     } else {
         crate::zone!("trace-plain");
         // Plain per-pixel reference: the ground truth and the A/B baseline.
@@ -162,10 +166,14 @@ fn tile_step(
     ls: &mut LocalStats,
 ) -> TileStep {
     let f = ctx.cam.tile_frustum(x0, y0, x1, y1);
+    // The frustum structure: the 8-wide tree by default (the GPU tile
+    // kernels' measured-win regime, transplanted), binary under the
+    // --no-ftree(-tiles) levers. `visits` counts whichever tree's nodes.
+    let accel = crate::ftree::Accel::for_tiles(ctx.bvh);
     let mut visits = 0u64;
     ls.tiles += 1;
     ls.frustum_queries += 1;
-    let result = frustum::nearest_geometry_distance(ctx.bvh, &f, t_start, cut_in, &mut visits);
+    let result = accel.nearest_within(&f, t_start, f32::INFINITY, cut_in, &mut visits);
     let step = match result {
         None => TileStep::Sky,
         Some(t_safe) => {
@@ -178,7 +186,7 @@ fn tile_step(
                 ls.blocked_queries += 1;
             }
             let mut cut = [0u32; MAX_CUT];
-            let len = frustum::refine_cut(ctx.bvh, &f, tc, f32::INFINITY, cut_in, &mut cut, &mut visits, &mut ls.cut_overflows);
+            let len = accel.refine_cut(&f, tc, f32::INFINITY, cut_in, &mut cut, &mut visits, &mut ls.cut_overflows);
             ls.cut_len_sum += len as u64;
             TileStep::Split { tc, cut, len }
         }
@@ -398,7 +406,10 @@ fn adopt_step(
     ls.temporal_cut_adopts += 1;
     let mut visits = 0u64;
     let mut cut = [0u32; MAX_CUT];
-    let out = frustum::refine_cut(ctx.bvh, &f, t0, f32::INFINITY, input, &mut cut, &mut visits, &mut ls.cut_overflows);
+    // Same structure as tile_step — an adopted cut (this node's own previous
+    // refine output) is in the same id space, both levers being startup-set.
+    let accel = crate::ftree::Accel::for_tiles(ctx.bvh);
+    let out = accel.refine_cut(&f, t0, f32::INFINITY, input, &mut cut, &mut visits, &mut ls.cut_overflows);
     ls.frustum_nodes += visits;
     if out == 0 {
         ls.temporal_adopt_sky += 1;
@@ -421,6 +432,13 @@ fn shade_tile(
     cut: &[u32],
 ) {
     let mut ls = LocalStats::default();
+    // The inherited cut arrives in the frustum structure's id space (wide
+    // slot-refs by default). Primary rays seed from BINARY nodes, so map it
+    // ONCE per leaf tile — identity when the tile path runs binary. Every
+    // consumer below (per-pixel, adaptive cells, hemi-share cells, HOT
+    // top-ups, replayed leaves) sees only the translated roots.
+    let mut rbuf = [0u32; MAX_CUT];
+    let cut = crate::ftree::Accel::for_tiles(ctx.bvh).ray_roots(cut, &mut rbuf);
     // adaptive (XeSS) and fb never co-occur (fb is pinned OFF on upscaler
     // frames), so the two cell loops can share the branch without a tiebreak.
     debug_assert!(!(ctx.adaptive && (ctx.q.fb.ao || ctx.q.fb.gi)));
@@ -1017,7 +1035,8 @@ pub const MIN_BUDGET_DEPTH: u32 = 2;
 /// `render_frame(ctx, true)` (same code path, the cap never fires).
 pub fn render_frame_capped(ctx: &FrameCtx, max_depth: u32) {
     crate::zone!("trace-capped");
-    trace_tile(ctx, 0, 0, ctx.rw, ctx.rh, 0.0, 0, 0, &[0], max_depth.max(MIN_BUDGET_DEPTH));
+    let root = crate::ftree::Accel::for_tiles(ctx.bvh).root_cut();
+    trace_tile(ctx, 0, 0, ctx.rw, ctx.rh, 0.0, 0, 0, root, max_depth.max(MIN_BUDGET_DEPTH));
 }
 
 /// Side length of the sparse-fill sample grid: each capped quad shoots one
@@ -1046,6 +1065,10 @@ fn sparse_fill(
     cut: &[u32],
     ls: &mut LocalStats,
 ) {
+    // Slot-ref cut -> binary ray roots, once per capped tile (the shade_tile
+    // convention — sparse samples are ordinary cut-seeded primary rays).
+    let mut rbuf = [0u32; MAX_CUT];
+    let cut = crate::ftree::Accel::for_tiles(ctx.bvh).ray_roots(cut, &mut rbuf);
     // Sample-position RNG: per-quad, per-frame (the old flat-fill seed recipe).
     let seed = (x0 as u64)
         .wrapping_mul(0x9E3779B97F4A7C15)

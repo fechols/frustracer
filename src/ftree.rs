@@ -19,8 +19,10 @@
 //!
 //! Cut entries are SLOT REFERENCES, `(node << 3) | slot` — one entry = one box
 //! = one binary node. `to_bvh_roots` maps a cut back to binary node ids for
-//! the (optional) cut-seeded ray path; hemi leaf rays are root-first by
-//! default, so the map is off the hot path.
+//! the cut-seeded ray paths: primary leaf tiles translate ONCE per tile
+//! (shade_tile/sparse_fill — cut-seeded primary rays are a measured win and
+//! stay on), hemi leaf rays are root-first by default so their map is off the
+//! hot path.
 
 use crate::bvh::{Aabb, Bvh};
 use crate::frustum::TileFrustum;
@@ -407,27 +409,42 @@ impl FTree {
     }
 }
 
-/// The session's wide tree, built LAZILY on the first hemi bound query and
-/// read by `Accel::of` at every hemi entry. A process-global for the same
-/// reason the `CUT_SEED_*` levers are: exactly one scene+BVH is live per
-/// process (resize re-enters `session()` around the same borrow; `--check`'s
-/// determinism rebuild is compared, never queried), and the experiment phase
-/// should not thread a field through 25 `FrameCtx` literals — promotion into
-/// `FrameCtx` happens with the tile-recursion wiring.
+/// The session's wide tree, built LAZILY on the first bound query (the first
+/// hybrid tile step or hemi entry) and read by `Accel::of`/`Accel::for_tiles`.
+/// A process-global for the same reason the `CUT_SEED_*` levers are: exactly
+/// one scene+BVH is live per process (resize re-enters `session()` around the
+/// same borrow; `--check`'s determinism rebuild is compared, never queried),
+/// so per-site `Accel::of` calls — two relaxed loads + a OnceLock get, noise
+/// against a bound query — beat threading a field through 25 `FrameCtx`
+/// literals.
 ///
-/// Lazy because only fb (H) frames consume it: an eager build would charge
-/// every session the collapse (26-42 ms on multi-million-node trees) and the
-/// memory (~256 B per ~7 binary internals — ~1.5 GB at the 90M-tri tiled
-/// scale) for a mode most sessions never enter. The first fb frame pays the
+/// Lazy so GPU-tracer sessions (which build their own local FTree for upload
+/// and drop it) and `--no-*` sessions never pay the collapse (26-42 ms on
+/// multi-million-node trees) or the memory (~256 B per ~7 binary internals —
+/// ~1.5 GB at the 90M-tri tiled scale). The first consuming frame pays the
 /// build once, inside whichever rayon task gets there first (OnceLock blocks
-/// the racers — a one-time hitch, measured tens of ms on real scenes).
+/// the racers — a one-time hitch). Cut ids stay in one space per session
+/// because `installed` always get_or_inits: from the first tile step onward
+/// every producer and consumer (temporal CutStore, replay records) sees the
+/// same Some/None answer.
 static INSTALLED: std::sync::OnceLock<&'static FTree> = std::sync::OnceLock::new();
 
-/// Kill switch (`--no-ftree`): hemi bound queries fall back to the binary
+/// Kill switch (`--no-ftree`): ALL bound queries fall back to the binary
 /// BVH — the A/B lever for the two-tree split. Default on: measured -15/-17%
 /// on the hemi-ao rows and -4/-8% on hemi-gi across the default scene and San
 /// Miguel, with the self-test pinning bit-identical bounds.
 pub static FTREE_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Per-consumer lever (`--ftree-tiles` enables): the primary TILE recursion
+/// (tile_step/adopt_step bound queries + refines) on the wide tree, cuts
+/// translated to binary ray roots once per leaf tile. Default OFF — unlike
+/// the GPU tile kernels (−23%), CPU tiles measured wall-NEUTRAL on San Miguel
+/// and ~10% slower on the stress field's no-temporal regime: fat cuts (mean
+/// ~66) of singleton slot-refs fetch a 256 B node to test one slot, and the
+/// short descents never amortize it — the short-query lesson again. Counted
+/// frustum nodes DO drop (−21..45%), so the quantized-box layout re-measures
+/// this. Hemi keeps its own default via `Accel::of`; `--no-ftree` kills both.
+pub static FTREE_TILES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn installed(bvh: &Bvh) -> Option<&'static FTree> {
     if !FTREE_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
@@ -436,7 +453,18 @@ fn installed(bvh: &Bvh) -> Option<&'static FTree> {
     // Leak-once: the tree lives to process exit. Sound because exactly one
     // BVH is live per process (see above) — the first caller's `bvh` IS the
     // session tree every later caller holds.
-    Some(INSTALLED.get_or_init(|| Box::leak(Box::new(FTree::build(bvh)))))
+    Some(INSTALLED.get_or_init(|| {
+        let t0 = std::time::Instant::now();
+        let t = Box::leak(Box::new(FTree::build(bvh)));
+        eprintln!(
+            "ftree: {} wide nodes ({:.1} MB) from {} binary in {:.0} ms",
+            t.nodes.len(),
+            t.bytes() as f32 / (1024.0 * 1024.0),
+            bvh.nodes.len(),
+            t0.elapsed().as_secs_f32() * 1e3,
+        );
+        t
+    }))
 }
 
 /// The two-tree dispatch handle threaded through the hemi integrator: `bvh`
@@ -455,6 +483,19 @@ impl<'a> Accel<'a> {
     #[inline]
     pub fn of(bvh: &'a Bvh) -> Accel<'a> {
         Accel { bvh, ft: installed(bvh) }
+    }
+
+    /// The TILE-path handle (`tile_step`/`adopt_step`/the leaf-tile cut
+    /// translation): `of` gated by the `FTREE_TILES` lever, so tiles and hemi
+    /// A/B independently. Every site in one frame agrees (both levers are
+    /// set once at startup; `installed` is monotonic-Some).
+    #[inline]
+    pub fn for_tiles(bvh: &'a Bvh) -> Accel<'a> {
+        if FTREE_TILES.load(std::sync::atomic::Ordering::Relaxed) {
+            Accel::of(bvh)
+        } else {
+            Accel { bvh, ft: None }
+        }
     }
 
     /// The whole-tree cut in whichever id space is live: binary `[0]` or the

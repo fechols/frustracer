@@ -207,12 +207,19 @@ pub struct Opts {
     /// than a hardcode so the axis change and the C_trav change stay separately
     /// attributable — they landed together.
     pub split_axes: usize,
-    /// A/B lever (--no-ftree disables): route hemi bound queries through the
+    /// A/B lever (--no-ftree disables): route ALL bound queries through the
     /// 8-wide frustum tree lazily collapsed from the ray BVH (ftree.rs) — the
-    /// two-tree split's first consumer. Rays always stay on the binary BVH.
+    /// two-tree split. Rays always stay on the binary BVH.
     /// Default on: -15/-17% hemi-ao, -4/-8% hemi-gi (default scene + San
     /// Miguel), bounds bit-identical per the self-test.
     pub ftree: bool,
+    /// Per-consumer A/B lever (--ftree-tiles): the primary tile recursion
+    /// (tile_step/adopt_step bound queries + refines) on the wide tree, cuts
+    /// translated to binary ray roots once per leaf tile. Default OFF —
+    /// measured wall-neutral on San Miguel, ~10% slower on stress no-temporal
+    /// (see ftree::FTREE_TILES). Hemi keeps its own wiring; --no-ftree kills
+    /// both; --check verifies the wired path regardless (the wide-tiles gate).
+    pub ftree_tiles: bool,
     /// GPU-resident tracing (--gpu): the whole quadtree + shading runs in
     /// D3D12 compute with DXR RayQuery rays. Requires the DXC DLL drop and
     /// RT tier 1.1; falls back to the CPU path with a loud line otherwise.
@@ -338,6 +345,7 @@ fn main() {
         max_leaf: 8,
         split_axes: 3,
         ftree: true,
+        ftree_tiles: false,
         gpu: false,
         dxr: true,
         dxc_path: std::env::var("FRUSTRACER_DXC_PATH").unwrap_or_else(|_| {
@@ -494,6 +502,8 @@ fn main() {
             }
             "--ftree" => opts.ftree = true,
             "--no-ftree" => opts.ftree = false,
+            "--ftree-tiles" => opts.ftree_tiles = true,
+            "--no-ftree-tiles" => opts.ftree_tiles = false,
             "--bvh-axes" => {
                 opts.split_axes = args
                     .next()
@@ -831,7 +841,13 @@ fn main() {
     bvh::set_split_axes(opts.split_axes);
     if !opts.ftree {
         ftree::FTREE_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
-        eprintln!("ftree: --no-ftree — hemi bound queries stay on the binary BVH");
+        eprintln!("ftree: --no-ftree — all bound queries stay on the binary BVH");
+    }
+    // Tile recursion on the wide tree is opt-in (default off — the static's
+    // own default already matches, so only the opt-in stores).
+    if opts.ftree_tiles {
+        ftree::FTREE_TILES.store(true, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("ftree: --ftree-tiles — the tile recursion runs on the 8-wide frustum tree");
     }
 
     eprintln!("frustracer — loading scene...");
@@ -6573,6 +6589,23 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         "verify full-depth ({} px): false-sky {} | tmin-overshoot {} | hybrid-extra {} | max rel t err {:.2e}",
         rep.pixels, rep.false_sky, rep.overshoot, rep.hybrid_extra, rep.max_rel_err
     );
+    // The wide-TILE wiring (tile_step/adopt_step dispatch, wide root_cut
+    // seeding, the once-per-leaf-tile slot-ref -> binary ray-root translation)
+    // defaults OFF — measured wall-neutral on San Miguel and ~10% SLOWER on
+    // the stress field's fat-cut/short-descent regime (the GPU-hemi lesson on
+    // CPU tiles; --ftree-tiles re-enables, the quantized-box work re-measures).
+    // So --check forces it ON for one full verify pass: the reference re-trace
+    // gates false-sky/tmin-overshoot through the whole translated path, which
+    // would otherwise rot while the lever is off. Restored so every later
+    // gate and bench row measures the session default.
+    let tiles_session = ftree::FTREE_TILES.load(Relaxed);
+    ftree::FTREE_TILES.store(true, Relaxed);
+    let rep_wt = render::verify(scene, bvh, &cam, q, rw, rh, &stats, None, &[], None);
+    ftree::FTREE_TILES.store(tiles_session, Relaxed);
+    eprintln!(
+        "verify wide-tiles ({} px): false-sky {} | tmin-overshoot {} | hybrid-extra {} | max rel t err {:.2e}",
+        rep_wt.pixels, rep_wt.false_sky, rep_wt.overshoot, rep_wt.hybrid_extra, rep_wt.max_rel_err
+    );
     // The capped driver is the uncapped one with an extra depth check (a cap
     // past the leaf depth is bit-identical by construction), so verify it at a
     // cap that actually sparse-fills: every non-coarse pixel — including the
@@ -8124,6 +8157,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         ("hemi-share", hemi_share_ok),
         ("shaft", shaft_ok),
         ("verify", rep.ok()),
+        ("wide-tiles", rep_wt.ok()),
         ("capped", capped_ok),
         ("temporal", temporal_ok),
         ("replay", replay_ok),
