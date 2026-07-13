@@ -638,3 +638,37 @@ pub fn footprint(
         },
     }
 }
+
+/// Placed footprint of a BLOCK-COMPRESSED region (BC7 — 4×4 texels per 16-byte
+/// block). The plain `footprint` above cannot express this: its pitch is
+/// `w · bytes_per_px`, and a BC row is `ceil(w/4) · 16` bytes regardless of
+/// what a "byte per texel" would mean.
+///
+/// `w`/`h` stay in TEXELS (that is what D3D12_SUBRESOURCE_FOOTPRINT wants for
+/// BC formats). The debug layer requires them to be multiples of 4 UNLESS they
+/// equal the resource's own dimensions — callers pass the full texture width
+/// and a band height that is a whole number of block rows except on the last
+/// band, which reaches `h` exactly, so both cases are legal. The matching
+/// `CopyTextureRegion` DstY must likewise be a multiple of 4 (whole block rows).
+pub fn footprint_block(
+    format: DXGI_FORMAT,
+    w: u32,
+    h: u32,
+    offset: u64,
+) -> D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+        Offset: offset,
+        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+            Format: format,
+            Width: w,
+            Height: h,
+            Depth: 1,
+            RowPitch: block_pitch(w) as u32,
+        },
+    }
+}
+
+/// Aligned bytes of one BC7 block ROW (4 texel rows) of a `w`-texel-wide image.
+pub fn block_pitch(w: u32) -> usize {
+    aligned_pitch(crate::bc7::blocks(w) as usize * crate::bc7::BLOCK_BYTES)
+}

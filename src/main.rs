@@ -1,3 +1,7 @@
+// BC7 block compression of OPAQUE scene textures (--bc7) — GPU upload only;
+// the CPU renderer keeps sampling the exact RGBA8 texels. Alpha-masked cutout
+// textures are deliberately excluded (see the module note).
+mod bc7;
 mod bvh;
 mod camera;
 mod dlss;
@@ -80,6 +84,13 @@ pub struct Opts {
     pub chain: upchain::UpChain,
     /// D3D12 debug layer + Streamline verbose logging.
     pub gpu_debug: bool,
+    /// Block-compress the OPAQUE scene textures to BC7 at load (8 bpp vs 32),
+    /// GPU upload only — the CPU renderer keeps sampling the exact RGBA8
+    /// texels, so this moves the GPU-vs-CPU statistical gates (albedo A/B,
+    /// T2 radiance) and nothing else. Alpha-masked cutout textures are never
+    /// compressed (src/bc7.rs). Off by default: an A/B lever, and the encode
+    /// is paid on every load (there is deliberately no BC7 disk cache).
+    pub bc7: Option<bc7::Quality>,
     /// Directory holding sl.interposer.dll + plugins (M3+).
     pub sl_path: String,
     /// Start with OIDN denoising on (N toggles at runtime; default off —
@@ -228,6 +239,7 @@ fn main() {
     let mut opts = Opts {
         chain: upchain::UpChain::ALL,
         gpu_debug: false,
+        bc7: None,
         sl_path: std::env::var("FRUSTRACER_SL_PATH").unwrap_or_else(|_| {
             concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\streamline-sdk\bin\x64").to_string()
         }),
@@ -501,6 +513,19 @@ fn main() {
             "--prefer-intel" => opts.prefer = Some(gpu::adapter::Prefer::Intel),
             "--prefer-amd" => opts.prefer = Some(gpu::adapter::Prefer::Amd),
             "--gpu-debug" => opts.gpu_debug = true,
+            // --bc7 alone = the `fast` profile; --bc7-quality overrides (and
+            // implies --bc7, so the order of the two flags doesn't matter).
+            "--bc7" => opts.bc7 = opts.bc7.or(Some(bc7::Quality::Fast)),
+            "--bc7-quality" => {
+                let q = args.next().unwrap_or_else(|| {
+                    eprintln!("--bc7-quality needs ultrafast|fast|basic|slow");
+                    std::process::exit(2);
+                });
+                opts.bc7 = Some(bc7::Quality::parse(&q).unwrap_or_else(|| {
+                    eprintln!("--bc7-quality: unknown profile '{q}' (ultrafast|fast|basic|slow)");
+                    std::process::exit(2);
+                }));
+            }
             "--sl-path" => {
                 opts.sl_path = args.next().unwrap_or_else(|| {
                     eprintln!("--sl-path needs a directory argument");
@@ -563,6 +588,10 @@ fn main() {
                 eprintln!("                the chain DLSS-RR -> FSR4-RR -> XeSS -> FSR3 is always on — the first");
                 eprintln!("                supported level wins; --<x> force-starts the chain at that level");
                 eprintln!("  --no-upscale  plain presentation: no temporal upscaler at all (benchmark escape)");
+                eprintln!("  --bc7         block-compress the OPAQUE scene textures to BC7 at load (8 bpp vs 32;");
+                eprintln!("                GPU upload only — alpha-masked cutout textures stay exact RGBA8).");
+                eprintln!("                No disk cache: the encode runs every load. --bc7-quality <p> sets the");
+                eprintln!("                ISPC profile: ultrafast|fast|basic|slow (default fast)");
                 eprintln!("  --check-oidn  headless: OIDN denoise self-test (needs the OIDN DLLs)");
                 eprintln!("  --oidn-dump   --check-oidn plus before/after/G-buffer PNG dumps");
                 eprintln!("  --oidn        start with OIDN denoising on (N toggles; implies DLSS off)");
@@ -921,6 +950,7 @@ fn run_check_dxr(
         gh as u32,
         false,
         opts.gpu_debug,
+        opts.bc7,
         &mut hg,
     ) {
         Ok(d) => d,
@@ -1208,6 +1238,7 @@ fn run_check_dxr(
             ph as u32,
             true,
             opts.gpu_debug,
+            opts.bc7,
             &mut hg,
         ) {
             Ok(d) => d,
@@ -2215,6 +2246,7 @@ fn run_check_gpu(
         false, // no pack: the M7-M9 gbuf/feed gates build their own tracer
         false,
         opts.gpu_debug,
+        opts.bc7,
         &mut hg,
     ) {
         Ok(t) => t,
@@ -2894,6 +2926,7 @@ fn run_check_gpu(
             true,
             true, // + the NPPD staging buffers/kernels (M10 gates them)
             opts.gpu_debug,
+            opts.bc7,
             &mut hg,
         ) {
             Ok(t) => t,
@@ -2990,6 +3023,34 @@ fn run_check_gpu(
         // guide-chain proof — RR/XeSS/FSR/NPPD all read this plane).
         if !albedo_ab_check(scene, bvh, cam0, &ga, &ta, pw, ph, "gpu") {
             ok = false;
+        }
+
+        // --- M11: --bc7 encode fidelity (GPU decode vs the CPU RGBA8 source).
+        // Only meaningful with the flag on: it measures the ENCODER, per
+        // texel, through the spec-bit-exact hardware decoder — the number the
+        // statistical albedo/radiance gates can't give. The 25 dB limit is a
+        // WIRING gate, not a quality bar: a pitch/footprint/format error
+        // lands ~10-20 dB, while the worst honest texture measured 31.7 dB at
+        // `fast` (San Miguel) — 25 separates the two without false-failing a
+        // hard texture at `ultrafast`.
+        if let Some(bq) = opts.bc7 {
+            match gpu::trace::bc7_fidelity(scene, bq, &mut hg) {
+                Ok(Some(f)) => {
+                    eprintln!(
+                        "check-gpu: bc7 fidelity: {} textures | mean |d| {:.3} LSB | max {} | worst PSNR {:.1} dB (limit 25)",
+                        f.textures, f.mean_abs, f.max_abs, f.worst_psnr
+                    );
+                    if f.worst_psnr < 25.0 {
+                        eprintln!("check-gpu: FAIL bc7 fidelity below 25 dB (encode/upload wiring?)");
+                        ok = false;
+                    }
+                }
+                Ok(None) => eprintln!("check-gpu: bc7 fidelity skipped (no compressible textures)"),
+                Err(e) => {
+                    eprintln!("check-gpu: FAIL bc7 fidelity: {e}");
+                    ok = false;
+                }
+            }
         }
 
         // --- M8: the XeSS feed kernel — depth-encode + mvec plumbing gates ---
@@ -3696,6 +3757,7 @@ fn run_check_gpu(
         false, // bench frames don't consume the pack
         false,
         opts.gpu_debug,
+        opts.bc7,
         &mut hg,
     ) {
         Ok(t) => t,
@@ -6354,6 +6416,21 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
     };
 
+    // BC7 self-test — the STRUCTURAL half of --bc7 (block counts, the
+    // mandatory edge-replicate pad, the cutout carve-out predicate, encode
+    // determinism). Fidelity needs a decoder we don't have on the CPU, so it
+    // is measured on the GPU by --check-gpu's M11 instead.
+    let bc7_ok = match bc7::self_test() {
+        Ok(()) => {
+            eprintln!("bc7 self-test: OK");
+            true
+        }
+        Err(e) => {
+            eprintln!("bc7 self-test: FAIL — {e}");
+            false
+        }
+    };
+
     let rep = render::verify(scene, bvh, &cam, q, rw, rh, &stats, None, &[], None);
     eprintln!(
         "verify full-depth ({} px): false-sky {} | tmin-overshoot {} | hybrid-extra {} | max rel t err {:.2e}",
@@ -7893,6 +7970,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         ("tangent", tangent_ok),
         ("upchain", upchain_ok),
         ("gltf", gltf_ok),
+        ("bc7", bc7_ok),
         ("hemi-ao", hemi_ok),
         ("hemi-gi", gi_ok),
         ("hemi-share", hemi_share_ok),
@@ -8409,6 +8487,7 @@ fn session(
                 (gpu_up == GpuUp::Xess && opts.nppd)
                     .then_some((opts.nppd_path.as_str(), opts.nppd_model.as_str())),
                 opts.gpu_debug,
+                opts.bc7,
             )
         }) {
             Ok(()) => {
@@ -8742,7 +8821,7 @@ fn session(
             eprintln!("dxr: dynamic render res is unsupported on the DXR pipeline; locking at quality (2/3)");
         }
         match gpu::dxc::Dxc::load(&opts.dxc_path).and_then(|dxc| {
-            gpu.init_dxr(&dxc, scene, bvh, dxw as u32, dxh as u32, compose, opts.gpu_debug)
+            gpu.init_dxr(&dxc, scene, bvh, dxw as u32, dxh as u32, compose, opts.gpu_debug, opts.bc7)
         }) {
             Ok(()) => {
                 dxr_on = true;
@@ -9597,7 +9676,7 @@ fn session(
                     eprintln!("dxr: dynamic render res is unsupported on the DXR pipeline; locking at quality (2/3)");
                 }
                 match gpu::dxc::Dxc::load(&opts.dxc_path).and_then(|dxc| {
-                    gpu.init_dxr(&dxc, scene, bvh, dxw as u32, dxh as u32, compose, opts.gpu_debug)
+                    gpu.init_dxr(&dxc, scene, bvh, dxw as u32, dxh as u32, compose, opts.gpu_debug, opts.bc7)
                 }) {
                     Ok(()) => {
                         dxr_on = true;

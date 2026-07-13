@@ -30,6 +30,12 @@ fastrand = "2"
 # f16 bit-pattern storage for the CPU G-buffer planes (dlss.rs ld16/st16) —
 # a base dependency, not windows-only: headless --check reads them too.
 half = "2"
+# BC7 block compression of OPAQUE scene textures at load (src/bc7.rs, --bc7).
+# Intel's ISPC texture compressor: an ordinary static crate dep — it ships
+# prebuilt ISPC binaries, so no ISPC toolchain and no runtime DLL, which is
+# what keeps every --check* DLL-free (unlike the SDKs/ LoadLibrary policy).
+# A base dependency, not windows-only: bc7::self_test runs under --check.
+intel_tex_2 = "0.5"
 # CPU profiler (Tracy). Off by default — without `--features tracy` this dep
 # is not even compiled and every prof:: hook is an inert no-op. The crate
 # version pairs 1:1 with a Tracy server (GUI) protocol version — see the
