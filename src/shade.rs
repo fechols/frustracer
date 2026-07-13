@@ -1,5 +1,5 @@
 use crate::bvh::{Bvh, Hit, Ray};
-use crate::scene::{MatKind, Scene};
+use crate::scene::{MatKind, Scene, NO_TEX};
 use crate::stats::LocalStats;
 use glam::Vec3A;
 
@@ -249,17 +249,60 @@ pub fn shade(
     let (p, n) = sp.unwrap_or_else(|| surface_point(scene, ray, hit));
     let mat = &scene.materials[scene.tri_mat[hit.tri as usize] as usize];
     // Effective albedo: constant, except marble which is evaluated at the
-    // world-space hit point (models are static, so world space is stable).
+    // world-space hit point (models are static, so world space is stable)
+    // and textures, sampled at the hit's interpolated UV.
     let albedo = match mat.kind {
         MatKind::Marble { scale } => marble(ray.o + ray.d * hit.t, scale),
+        MatKind::Textured { tex } => {
+            let uv = scene.tri_uv(hit.tri, hit.u, hit.v);
+            scene.textures[tex as usize].sample_bilinear(uv.x, uv.y)
+        }
         _ => mat.albedo,
+    };
+    // Map-driven material terms — all pure ALU on the hit's UV, ZERO rng
+    // draws (materials with every map at NO_TEX shade bit-identically to
+    // before the map fields existed — the structural guarantee, and what
+    // keeps replay/same-seed/VisCtl burn accounting intact).
+    let map_uv = if mat.normal_tex != NO_TEX
+        || mat.rough_tex != NO_TEX
+        || mat.metal_tex != NO_TEX
+        || mat.emissive_tex != NO_TEX
+    {
+        Some(scene.tri_uv(hit.tri, hit.u, hit.v))
+    } else {
+        None
+    };
+    // Effective roughness/metallic = flat factor × map sample (glTF
+    // semantics; roughness = .g, metallic = .b). The clamps live INSIDE the
+    // map branch so unmapped materials keep their exact flat values.
+    let mut rough_eff = mat.roughness;
+    let mut metal_eff = mat.metallic;
+    if let Some(uv) = map_uv {
+        if mat.rough_tex != NO_TEX {
+            let s = scene.textures[mat.rough_tex as usize].sample_bilinear_linear(uv.x, uv.y);
+            rough_eff = (rough_eff * s.y).clamp(0.02, 1.0);
+        }
+        if mat.metal_tex != NO_TEX {
+            let s = scene.textures[mat.metal_tex as usize].sample_bilinear_linear(uv.x, uv.y);
+            metal_eff = (metal_eff * s.z).clamp(0.0, 1.0);
+        }
+    }
+    // Shading normal n_s: the geometric n perturbed by the tangent-space
+    // normal map; n_s ≡ n when unmapped (structural bit-identity). n keeps
+    // every visibility-adjacent use — the eps-offset p, the translucency
+    // back ray, the ENTIRE hemi tier (a perturbed apex normal can put the
+    // own triangle inside the "open" hemisphere ⇒ false-empty), and the
+    // glass chain. n_s feeds the BRDF frame, N·L, and the G-buffer guide.
+    let n_s = match (mat.normal_tex != NO_TEX, map_uv) {
+        (true, Some(uv)) => perturb_normal(scene, hit, n, mat, uv),
+        _ => n,
     };
     if let Some(prim) = prim.as_deref_mut() {
         *prim = PrimarySurface {
-            n,
+            n: n_s,
             albedo,
-            roughness: mat.roughness,
-            metallic: mat.metallic,
+            roughness: rough_eff,
+            metallic: metal_eff,
             spec_t: 0.0,
             direct_d: Vec3A::ZERO,
             direct_s: Vec3A::ZERO,
@@ -268,31 +311,40 @@ pub fn shade(
 
     // Metallic/roughness lobes: F0 = 4% dielectric base lerped to albedo for
     // metals; the diffuse lobe fades out as metalness rises.
-    let f0 = Vec3A::splat(0.04).lerp(albedo, mat.metallic);
-    let kd = albedo * (1.0 - mat.metallic);
-    // Tangent frame for the microfacet lobes. Anisotropic materials brush
-    // circumferentially around world-up (a lathe-spun body); the onb fallback
-    // covers the poles and all isotropic materials (frame arbitrary there).
+    let f0 = Vec3A::splat(0.04).lerp(albedo, metal_eff);
+    // The sheen factor keeps fabric energy-conserving: 0.157 is the Charlie
+    // lobe's peak directional albedo (Estevez-Kulla), so diffuse gives back
+    // what the sheen adds.
+    let kd = albedo * (1.0 - metal_eff) * (1.0 - 0.157 * mat.sheen);
+    // Tangent frame for the microfacet lobes, built on the SHADING normal.
+    // Anisotropic materials brush circumferentially around world-up (a
+    // lathe-spun body); the onb fallback covers the poles and all isotropic
+    // materials (frame arbitrary there).
     let (t1, t2) = if mat.anisotropy > 0.0 {
-        let t = Vec3A::Y.cross(n);
+        let t = Vec3A::Y.cross(n_s);
         if t.length_squared() > 1e-8 {
             let t = t.normalize();
-            (t, n.cross(t))
+            (t, n_s.cross(t))
         } else {
-            onb(n)
+            onb(n_s)
         }
     } else {
-        onb(n)
+        onb(n_s)
     };
-    let to_local = |w: Vec3A| Vec3A::new(w.dot(t1), w.dot(t2), w.dot(n));
-    let (ax, ay) = ggx_alphas(mat.roughness, mat.anisotropy);
+    let to_local = |w: Vec3A| Vec3A::new(w.dot(t1), w.dot(t2), w.dot(n_s));
+    let (ax, ay) = ggx_alphas(rough_eff, mat.anisotropy);
     let v = -ray.d;
     let vl = {
         let mut l = to_local(v);
-        l.z = l.z.max(1e-4); // face-flip guarantees n·v >= 0; guard grazing
+        // The face-flip guarantees n·v >= 0 for the GEOMETRIC normal; a
+        // perturbed n_s can dip below — the same grazing guard covers both.
+        l.z = l.z.max(1e-4);
         l
     };
     let lambda_v = ggx_lambda(vl, ax, ay);
+    // Charlie-sheen inverse alpha, hoisted out of the light loop (fabric
+    // reuses the material roughness as sheen roughness).
+    let sheen_inv_a = 1.0 / rough_eff.clamp(0.07, 1.0);
 
     // Direct light: N samples on the area light, Lambert diffuse +
     // Cook-Torrance GGX specular per sample. The renderer's convention omits
@@ -301,6 +353,9 @@ pub fn shade(
     // without retuning scene brightness.
     let mut direct_d = Vec3A::ZERO;
     let mut direct_s = Vec3A::ZERO;
+    // Thin-surface diffuse transmission (foliage): light arriving from BEHIND
+    // the surface, gathered in the ndl <= 0 arm below.
+    let mut direct_t = Vec3A::ZERO;
     // Light-shaft culling (fb.shadows): identical sampling and integrand —
     // the shaft only removes occlusion rays for samples in subrects proven
     // unoccluded, and seeds the remaining (penumbra) rays from its cut with
@@ -330,7 +385,9 @@ pub fn shade(
         let dist2 = lv.length_squared();
         let dist = dist2.sqrt();
         let wi = lv / dist;
-        let ndl = n.dot(wi);
+        // N·L against the SHADING normal (n_s ≡ n when unmapped); the
+        // shadow/translucency ray geometry below stays on the geometric n.
+        let ndl = n_s.dot(wi);
         if ndl <= 0.0 {
             // Below the rep's horizon: no ray was traced, so this "occluded"
             // is a claim about the rep's normal, not the scene. Mark the
@@ -341,6 +398,38 @@ pub fn shade(
                 r.light_uv[si] = (su, sv);
                 r.occluded[si] = true;
                 r.below_horizon = true;
+            }
+            // Thin-surface transmission: a back-lit translucent surface
+            // (leaves) receives the light through itself. The occlusion ray
+            // starts on the TRANSMITTED side (p is hit + n·eps, so -2·eps
+            // lands at hit - n·eps — the exact mirror of the front
+            // convention; the ray departs the leaf's plane on the side it
+            // starts on and never re-crosses its own triangle). Plain
+            // `occluded`: no cut exists for this apex, and the shaft's
+            // tangent-plane clip makes `classify` valid only for wi·n > 0.
+            // Consumes no rng draws — stream alignment is untouched.
+            if mat.translucency > 0.0 && ndl < 0.0 {
+                let back_occluded = match &vis {
+                    // The rep's traced bit is segment occlusion between the
+                    // same two points — normal-independent within 2·eps.
+                    VisCtl::Apply(r) => {
+                        ls.adapt_rays_saved += 1;
+                        r.occluded[si]
+                    }
+                    _ => {
+                        ls.secondary_rays += 1;
+                        bvh.occluded(
+                            scene,
+                            &Ray::new(p - n * (2.0 * scene.eps), wi),
+                            0.0,
+                            dist - scene.eps,
+                            &mut ls.ray_nodes,
+                        )
+                    }
+                };
+                if !back_occluded {
+                    direct_t += scene.light.color * ((-ndl) / dist2);
+                }
             }
             continue;
         }
@@ -391,12 +480,25 @@ pub fn shade(
                 let f = schlick(f0, wi.dot(h).max(0.0));
                 // li carries ndl; D·G2·F/(4·nv·nl)·nl leaves /(4·nv).
                 direct_s += li * f * (std::f32::consts::PI * d * g2 / (4.0 * vl.z * ndl));
+                if mat.sheen > 0.0 {
+                    // Retro-reflective fabric rim: Charlie NDF + Ashikhmin
+                    // visibility (the glTF KHR_materials_sheen pair), white,
+                    // direct light only. Pure ALU on values already in
+                    // scope — no rng, no rays. The π compensates the
+                    // renderer's dropped Lambert 1/π like the GGX term.
+                    let sin2 = (1.0 - hl.z * hl.z).max(0.0);
+                    let d_c = (2.0 + sheen_inv_a) * sin2.powf(sheen_inv_a * 0.5)
+                        / std::f32::consts::TAU;
+                    let v_ash = 1.0 / (4.0 * (ndl + vl.z - ndl * vl.z)).max(1e-4);
+                    direct_s += li * (std::f32::consts::PI * mat.sheen * d_c * v_ash);
+                }
             }
         }
     }
     if n_shadow > 0 {
         direct_d /= n_shadow as f32;
         direct_s /= n_shadow as f32;
+        direct_t /= n_shadow as f32;
     }
     if let Some(prim) = prim.as_deref_mut() {
         prim.direct_d = direct_d;
@@ -477,8 +579,34 @@ pub fn shade(
     };
 
     // Ambient stays diffuse-only; metals get their environment from the
-    // specular bounce ray below.
-    let mut color = kd * (direct_d + ambient) + direct_s;
+    // specular bounce ray below. Translucency splits the diffuse budget
+    // between the front Lambert term and the transmitted back term
+    // (energy-conserving; ambient stays front-only). kd is the sampled
+    // textured albedo, so back-lit leaves glow in their own colors.
+    // Transmissive glass has (almost) no diffuse response — the transmitted
+    // scene replaces it (the refraction block below); the GGX highlight
+    // stays unscaled.
+    let tl = mat.translucency;
+    let mut color = kd
+        * (1.0 - mat.transmission)
+        * (direct_d * (1.0 - tl) + direct_t * tl + ambient)
+        + direct_s;
+
+    // Emitted radiance — additive, OUTSIDE the kd·(1−transmission) factor,
+    // at every depth (so emitters appear in reflections and through glass).
+    // Guarded, not an unconditional `+ ZERO`: -0.0 + 0.0 = +0.0 would break
+    // the default-material bit-identity contract. Emitters do NOT light
+    // other surfaces — only the analytic area light + sky do.
+    if mat.emissive != Vec3A::ZERO || mat.emissive_tex != NO_TEX {
+        let e = match (mat.emissive_tex != NO_TEX, map_uv) {
+            (true, Some(uv)) => {
+                mat.emissive
+                    * scene.textures[mat.emissive_tex as usize].sample_bilinear(uv.x, uv.y)
+            }
+            _ => mat.emissive,
+        };
+        color += e;
+    }
 
     // One specular bounce: a single direction importance-sampled from the
     // anisotropic GGX VNDF (Heitz 2018), so glossy surfaces see a blurred
@@ -503,11 +631,15 @@ pub fn shade(
         p2 = (1.0 - s) * (1.0 - p1 * p1).max(0.0).sqrt() + s * p2;
         let nh = b1 * p1 + b2 * p2 + vh * (1.0 - p1 * p1 - p2 * p2).max(0.0).sqrt();
         let hl = Vec3A::new(ax * nh.x, ay * nh.y, nh.z.max(1e-6)).normalize();
-        let h = t1 * hl.x + t2 * hl.y + n * hl.z;
+        let h = t1 * hl.x + t2 * hl.y + n_s * hl.z;
         let rdir = (2.0 * v.dot(h) * h - v).normalize();
         // Below-horizon samples are dropped (spec_t stays 0.0 = "no
         // reflection traced"), slightly darkening instead of biasing up.
-        if rdir.dot(n) > 0.0 {
+        // BOTH horizons: n_s (the sampled lobe's own frame) and the
+        // geometric n — a perturbed lobe must not fire a ray that starts at
+        // hit + eps·n but immediately re-enters the surface. Degenerates to
+        // the old single test when n_s ≡ n.
+        if rdir.dot(n_s) > 0.0 && rdir.dot(n) > 0.0 {
             let g2_over_g1 = (1.0 + lambda_v)
                 / (1.0 + lambda_v + ggx_lambda(to_local(rdir), ax, ay));
             let tput = schlick(f0, v.dot(h).max(0.0)) * g2_over_g1;
@@ -538,7 +670,226 @@ pub fn shade(
         }
     }
 
+    // Glass transmission: a Snell-refracted continuation ray per interface,
+    // shading-only — visibility is untouched (glass still HITS; the frustum
+    // bounds, inherited tmin, and every temporal claim stay exact). Placed
+    // after the VNDF block so no existing rng draw moves; this block draws
+    // none itself (both branch directions are pure functions of the hit, so
+    // replay/same-seed bit-identity and VisCtl burn accounting hold). The
+    // Fresnel-REFLECTED fraction at depth 0 is the VNDF bounce above (glass
+    // passes its gate via roughness < 0.45); at interior interfaces it is
+    // dropped — dimming, never gaining. Total internal reflection continues
+    // the chain as an internal mirror bounce instead of losing the energy
+    // (dead-black rims otherwise).
+    if q.reflections && mat.transmission > 0.0 && depth < TRANS_MAX_DEPTH {
+        // Entering or exiting? Re-derive the pre-flip normal orientation
+        // (surface_point returns only the viewer-facing normal; transmissive
+        // pixels are rare enough that the refetch beats widening its
+        // contract everywhere).
+        let [i0, i1, i2] = scene.indices[hit.tri as usize];
+        let w = 1.0 - hit.u - hit.v;
+        let mut n_raw = (scene.normals[i0 as usize] * w
+            + scene.normals[i1 as usize] * hit.u
+            + scene.normals[i2 as usize] * hit.v)
+            .normalize_or_zero();
+        if n_raw == Vec3A::ZERO {
+            let e1 = scene.positions[i1 as usize] - scene.positions[i0 as usize];
+            let e2 = scene.positions[i2 as usize] - scene.positions[i0 as usize];
+            n_raw = e1.cross(e2).normalize_or_zero();
+        }
+        let entering = n_raw.dot(n) >= 0.0; // the viewer-flip didn't fire
+        let eta = if entering { 1.0 / GLASS_IOR } else { GLASS_IOR };
+        // The refraction chain stays on the GEOMETRIC normal (normal-mapped
+        // glass is out of scope; a perturbed Snell axis would bend rays into
+        // the surface). v·n with the same grazing guard is bit-identical to
+        // the old n-frame vl.z.
+        let cos_i = v.dot(n).max(1e-4);
+        let k = 1.0 - eta * eta * (1.0 - cos_i * cos_i);
+        let hit_p = ray.o + ray.d * hit.t;
+        let (tdir, torig, tput) = if k >= 0.0 {
+            // Exact unpolarized dielectric Fresnel (not Schlick — it must
+            // reach 1 as k -> 0 or the TIR handoff pops).
+            let cos_t = k.sqrt();
+            let rs = (eta * cos_i - cos_t) / (eta * cos_i + cos_t);
+            let rp = (cos_i - eta * cos_t) / (cos_i + eta * cos_t);
+            let fr = 0.5 * (rs * rs + rp * rp);
+            let td = (ray.d * eta + n * (eta * cos_i - cos_t)).normalize();
+            (td, hit_p - n * scene.eps, mat.transmission * (1.0 - fr))
+        } else {
+            // TIR: mirror about n, staying on the incident side.
+            (ray.d + n * (2.0 * cos_i), hit_p + n * scene.eps, mat.transmission)
+        };
+        if tput > 1e-3 {
+            let tray = Ray::new(torig, tdir);
+            ls.secondary_rays += 1;
+            let rq = Quality { fb: FrustumBounce::OFF, ..*q };
+            let tcol =
+                match bvh.intersect(scene, &tray, 0.0, f32::INFINITY, &mut ls.ray_nodes) {
+                    Some(th) => shade(
+                        scene, bvh, &tray, &th, None, &rq, rng, sun, depth + 1, ls, None,
+                        VisCtl::Off, None,
+                    ),
+                    None => sky(tdir, sun),
+                };
+            // Tinted by albedo — the classifier lifts dark MTL glass Kd
+            // toward white so this doesn't go black.
+            color += albedo * (tput * tcol);
+        }
+    }
+
     color
+}
+
+/// Fixed glassware IOR — thin-tumbler transmission needs no per-material
+/// value; the classifier's `transmission` scalar carries all the variation.
+const GLASS_IOR: f32 = 1.5;
+/// Interface budget for the refraction chain: front/back walls of a
+/// two-walled tumbler with no TIR detour. Past it, glass shades opaque.
+const TRANS_MAX_DEPTH: u32 = 4;
+
+/// Tangent-space normal-map perturbation of the geometric normal `n`. The
+/// tangent comes from the triangle's positions + UVs ON THE FLY (zero
+/// storage at 100M tris; per-triangle tangents facet at UV seams — accepted,
+/// the interpolated geometric normal stays smooth), Gram-Schmidt-
+/// orthogonalized against n; the bitangent's handedness comes from the UV
+/// winding. Degenerate UVs, a degenerate projected tangent, or a
+/// perturbation past the geometric horizon all degrade to `n` — coarser,
+/// never wrong. The decoded green channel is NEGATED (`NORMAL_MAP_Y_SIGN`):
+/// the loader V-flips at load (image row 0 = v 0), so an OpenGL-convention
+/// (+Y up) map's y axis points against our +v rows — pinned by
+/// `tangent_self_test` and settled visually on San Miguel's railings.
+pub const NORMAL_MAP_Y_SIGN: f32 = -1.0;
+
+fn perturb_normal(
+    scene: &Scene,
+    hit: &Hit,
+    n: Vec3A,
+    mat: &crate::scene::Material,
+    uv: glam::Vec2,
+) -> Vec3A {
+    let [i0, i1, i2] = scene.indices[hit.tri as usize];
+    let p0 = scene.positions[i0 as usize];
+    let e1 = scene.positions[i1 as usize] - p0;
+    let e2 = scene.positions[i2 as usize] - p0;
+    let t0 = scene.texcoords[i0 as usize];
+    let d1 = scene.texcoords[i1 as usize] - t0;
+    let d2 = scene.texcoords[i2 as usize] - t0;
+    let det = d1.x * d2.y - d2.x * d1.y;
+    if det.abs() < 1e-12 {
+        return n;
+    }
+    let t_raw = (e1 * d2.y - e2 * d1.y) / det;
+    let t = (t_raw - n * n.dot(t_raw)).normalize_or_zero();
+    if t == Vec3A::ZERO {
+        return n;
+    }
+    // Bitangent: cross(n, t) signed to agree with the UV-derived bitangent
+    // direction — mirrored UVs flip the frame's handedness exactly.
+    let b_raw = (e2 * d1.x - e1 * d2.x) / det;
+    let b = n.cross(t) * n.cross(t).dot(b_raw).signum();
+    let s = scene.textures[mat.normal_tex as usize].sample_bilinear_linear(uv.x, uv.y);
+    let tn = Vec3A::new(
+        (s.x * 2.0 - 1.0) * mat.normal_scale,
+        (s.y * 2.0 - 1.0) * mat.normal_scale * NORMAL_MAP_Y_SIGN,
+        (s.z * 2.0 - 1.0).max(0.05),
+    );
+    let out = (t * tn.x + b * tn.y + n * tn.z).normalize_or_zero();
+    if out == Vec3A::ZERO || out.dot(n) <= 0.0 { n } else { out }
+}
+
+/// Pure self-test for the on-the-fly tangent frame + normal-map decode (run
+/// by `--check` beside `matclass::self_test`): analytic tangent directions on
+/// a canonical triangle, the flat-map near-identity, the green-channel sign
+/// pin, mirrored-UV handedness, and the degenerate-UV skip.
+pub fn tangent_self_test() -> Result<(), String> {
+    use crate::scene::{AreaLight, Material, Scene};
+    use crate::texture::Texture;
+    let tri_scene = |texcoords: [glam::Vec2; 3], texel: [u8; 4]| -> Scene {
+        let mut sc = Scene {
+            positions: vec![Vec3A::ZERO, Vec3A::X, Vec3A::Y],
+            normals: vec![Vec3A::Z; 3],
+            texcoords: texcoords.to_vec(),
+            indices: vec![[0, 1, 2]],
+            tri_mat: vec![0],
+            materials: vec![Material {
+                albedo: Vec3A::ONE,
+                roughness: 0.8,
+                metallic: 0.0,
+                anisotropy: 0.0,
+                sheen: 0.0,
+                translucency: 0.0,
+                transmission: 0.0,
+                emissive: Vec3A::ZERO,
+                normal_tex: 0,
+                normal_scale: 1.0,
+                rough_tex: NO_TEX,
+                metal_tex: NO_TEX,
+                emissive_tex: NO_TEX,
+                kind: MatKind::Diffuse,
+            }],
+            textures: vec![Texture {
+                w: 1,
+                h: 1,
+                texels: vec![texel],
+                alpha_masked: false,
+                srgb: false,
+                source: String::new(),
+            }],
+            any_alpha: false,
+            light: AreaLight {
+                center: Vec3A::Y,
+                u: Vec3A::X,
+                v: Vec3A::Z,
+                color: Vec3A::ONE,
+            },
+            diag: 1.0,
+            eps: 1e-4,
+            ao_radius: 0.03,
+        };
+        crate::scene::finalize_scalars(&mut sc);
+        sc
+    };
+    let hit = Hit { t: 1.0, tri: 0, u: 0.25, v: 0.25 };
+    let uv0 = [glam::Vec2::new(0.0, 0.0), glam::Vec2::new(1.0, 0.0), glam::Vec2::new(0.0, 1.0)];
+    let perturb = |sc: &Scene| {
+        let uv = sc.tri_uv(0, hit.u, hit.v);
+        perturb_normal(sc, &hit, Vec3A::Z, &sc.materials[0], uv)
+    };
+
+    // Flat map (128,128,255): near-identity (128/255 isn't exactly 0.5 — the
+    // no-map case is the bit-identical one; the flat MAP is merely close).
+    let sc = tri_scene(uv0, [128, 128, 255, 255]);
+    if perturb(&sc).dot(Vec3A::Z) < 0.999 {
+        return Err("flat normal map should be a near-identity perturbation".into());
+    }
+    // Red = +x in tangent space: UVs align u with +X, so the normal tilts
+    // toward +X and stays above the horizon.
+    let sc = tri_scene(uv0, [255, 128, 128, 255]);
+    let out = perturb(&sc);
+    if out.x < 0.5 || out.z <= 0.0 {
+        return Err(format!("+x tangent tilt wrong: {out:?}"));
+    }
+    // Green-channel sign pin (NORMAL_MAP_Y_SIGN): +green tilts toward -Y in
+    // our V-flipped storage. A sign regression flips every embossing.
+    let sc = tri_scene(uv0, [128, 255, 128, 255]);
+    let out = perturb(&sc);
+    if out.y * NORMAL_MAP_Y_SIGN < 0.5 * NORMAL_MAP_Y_SIGN.abs() && out.y > -0.5 {
+        return Err(format!("green-channel sign pin failed: {out:?}"));
+    }
+    // Mirrored UVs (u negated): the tangent flips with the UV winding.
+    let uvm = [glam::Vec2::new(0.0, 0.0), glam::Vec2::new(-1.0, 0.0), glam::Vec2::new(0.0, 1.0)];
+    let sc = tri_scene(uvm, [255, 128, 128, 255]);
+    let out = perturb(&sc);
+    if out.x > -0.5 {
+        return Err(format!("mirrored-UV handedness wrong: {out:?}"));
+    }
+    // Degenerate UVs: skip — the geometric normal comes back exactly.
+    let uvz = [glam::Vec2::ZERO; 3];
+    let sc = tri_scene(uvz, [255, 128, 128, 255]);
+    if perturb(&sc) != Vec3A::Z {
+        return Err("degenerate UVs must skip the perturbation".into());
+    }
+    Ok(())
 }
 
 /// GGX α from perceptual roughness + Disney-style anisotropy split. The

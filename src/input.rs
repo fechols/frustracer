@@ -27,6 +27,11 @@ pub struct Edges {
     pub verify: bool,          // C
     pub screenshot: bool,      // P
     pub quality: Option<u32>,  // 1/2/3
+    pub toggle_fullscreen: bool, // F11 (borderless desktop fullscreen)
+    /// Newest window client size from this frame's SizeChanged events
+    /// (maximize, restore, fullscreen, drag — the last event in the drain
+    /// wins). The consumer debounces and commits via `drawable_size()`.
+    pub size_changed: Option<(u32, u32)>,
 }
 
 pub struct Input {
@@ -65,8 +70,12 @@ impl Input {
                     Keycode::Num1 | Keycode::Kp1 => e.quality = Some(1),
                     Keycode::Num2 | Keycode::Kp2 => e.quality = Some(2),
                     Keycode::Num3 | Keycode::Kp3 => e.quality = Some(3),
+                    Keycode::F11 => e.toggle_fullscreen = true,
                     _ => {}
                 },
+                Event::Window {
+                    win_event: sdl2::event::WindowEvent::SizeChanged(w, h), ..
+                } => e.size_changed = Some((w.max(0) as u32, h.max(0) as u32)),
                 _ => {}
             }
         }
@@ -81,8 +90,11 @@ impl Input {
         let down = |sc: Scancode| ks.is_scancode_pressed(sc);
 
         let mut speed = diag * 0.25 * dt;
+        if down(Scancode::LCtrl) || down(Scancode::RCtrl) {
+            speed /= 16.0;
+        }
         if down(Scancode::LShift) || down(Scancode::RShift) {
-            speed *= 4.0;
+            speed /= 8.0;
         }
         let f = cam.forward();
         let r = f.cross(Vec3A::Y).normalize();

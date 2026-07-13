@@ -13,16 +13,17 @@
 //!
 //! SBT layout (rt_dxr.hlsli mirrors the indices — keep in lockstep):
 //!   raygen @ 0    | miss @ 64: [radiance, shadow, hit_info]
-//!   hit groups @ 192: [HgShade, HgHit, null (occlusion)]
+//!   hit groups @ 192: [HgShade, HgHit, null (occlusion; the any-hit-only
+//!   HgOcclude instead on alpha-masked scenes — see ALPHA_CUTOUT)]
 
 use super::d3d12::{self, committed_buffer, transition, uav_barrier, Result};
 use super::dxc::Dxc;
 use super::trace::{
-    self, FrameCb, FrameParams, SceneGpu, CB_STRIDE, RP_FRAME_CBV, RP_GBUF, RP_PUSH, RP_SRV0,
-    RP_TEX, RP_UAV0, SRV_INDICES, SRV_MATERIALS, SRV_NORMALS, SRV_POSITIONS, SRV_TLAS,
-    SRV_TRI_MAT, UAV_ACCUM, UAV_INFO, UAV_TBUF,
+    self, FrameCb, FrameParams, SceneGpu, CB_STRIDE, RP_FRAME_CBV, RP_GBUF, RP_PUSH,
+    RP_SCENE_TEX, RP_SRV0, RP_TEX, RP_UAV0, SRV_INDICES, SRV_MATERIALS, SRV_NORMALS,
+    SRV_POSITIONS, SRV_TLAS, SRV_TRI_MAT, TEX_HEAP_BASE, TEX_TABLE_BUFS, UAV_ACCUM, UAV_INFO,
+    UAV_TBUF,
 };
-use crate::bvh::Bvh;
 use crate::scene::Scene;
 use windows::core::{Interface, PCWSTR};
 use windows::Win32::Graphics::Direct3D12::*;
@@ -75,13 +76,25 @@ pub struct DxrGpu {
     pub accum: ID3D12Resource,
     pub tbuf: ID3D12Resource,
     pub info: ID3D12Resource,
-    /// 64-byte dummy at RP_GBUF: FLAG_GBUF is never set in this mode (plain
-    /// presentation only), but the root parameter wants a valid address.
-    gbuf_dummy: ID3D12Resource,
+    /// The G-buffer pack at RP_GBUF: 64 B/px `GBufPx` when the session
+    /// composes with an upscaler (`gbuf_full`), a 64-byte dummy otherwise —
+    /// FLAG_GBUF is clear then, but root-descriptor UAVs have no bounds
+    /// check, so the plain-mode dummy is memory safety, not an optimization
+    /// (the trace.rs precedent).
+    pub gbuf: ID3D12Resource,
+    gbuf_full: bool,
     /// RGBA16F resolve target; rests in PIXEL_SHADER_RESOURCE between frames
     /// (the tonemap PS reads it via SRV_SLOT_DXR).
     pub hdr: ID3D12Resource,
     uav_heap: ID3D12DescriptorHeap,
+    /// GPU handle of the RP_SCENE_TEX table (heap slot TEX_HEAP_BASE).
+    tex_table: D3D12_GPU_DESCRIPTOR_HANDLE,
+    /// Upscaler feed kernels (compiled only when `gbuf_full`; both kinds so
+    /// --check-dxr can rewire between them like --check-gpu does) and the
+    /// wired planes record_feed barriers over.
+    pso_feed_xess: Option<ID3D12PipelineState>,
+    pso_feed_rr: Option<ID3D12PipelineState>,
+    feed: Option<(trace::FeedKind, Vec<ID3D12Resource>)>,
     frame_cb: d3d12::UploadBuffer,
     cb_base: FrameCb,
     pub rw: u32,
@@ -93,18 +106,29 @@ impl DxrGpu {
         device: &ID3D12Device,
         dxc: &Dxc,
         scene: &Scene,
-        bvh: &Bvh,
         rw: u32,
         rh: u32,
+        gbuf_full: bool,
         debug: bool,
+        submit: &mut dyn d3d12::Submit,
     ) -> Result<Self> {
         require_caps(device)?;
         let device5: ID3D12Device5 =
             device.cast().map_err(|e| format!("ID3D12Device5: {e}"))?;
         let root_sig = trace::create_root_signature(device)?;
 
-        let lib_src =
-            [trace::TRACE_COMMON_HLSLI, RT_DXR_HLSLI, trace::SHADE_HLSLI, DXR_HLSL].join("\n");
+        // Alpha-masked scenes compile the ah_* any-hit shaders + non-opaque
+        // ray flags in (trace.rs::alpha_defs — the same per-scene predicate
+        // that drops OPAQUE from the BLAS); opaque scenes compile verbatim.
+        let any_alpha = scene.any_alpha;
+        let lib_src = [
+            trace::alpha_defs(scene),
+            trace::TRACE_COMMON_HLSLI,
+            RT_DXR_HLSLI,
+            trace::SHADE_HLSLI,
+            DXR_HLSL,
+        ]
+        .join("\n");
         let dxil = dxc.compile(&lib_src, "", "lib_6_3", "dxr library", debug)?;
         let resolve_src = [trace::TRACE_COMMON_HLSLI, trace::RESOLVE_HLSL].join("\n");
         let pso_resolve = trace::compute_pso(
@@ -113,14 +137,37 @@ impl DxrGpu {
             &dxc.compile(&resolve_src, "cs_resolve", "cs_6_3", "dxr resolve", debug)?,
             "dxr resolve",
         )?;
+        // Upscaler sessions: the same feed kernels the wavefront runs, at
+        // this pipeline's cs_6_3 cap floor (feed.hlsl needs nothing newer).
+        let (pso_feed_xess, pso_feed_rr) = if gbuf_full {
+            let feed_src = [trace::TRACE_COMMON_HLSLI, trace::FEED_HLSL].join("\n");
+            let pso = |entry: &str, name: &str| -> Result<ID3D12PipelineState> {
+                trace::compute_pso(
+                    device,
+                    &root_sig,
+                    &dxc.compile(&feed_src, entry, "cs_6_3", name, debug)?,
+                    name,
+                )
+            };
+            (
+                Some(pso("cs_feed_xess", "dxr feed_xess")?),
+                Some(pso("cs_feed_rr", "dxr feed_rr")?),
+            )
+        } else {
+            (None, None)
+        };
 
         // --- RTPSO. Every pDesc payload (and every name string) lives in a
         // local that outlives CreateStateObject.
         let wname = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
         let hg_shade_name = wname("HgShade");
         let hg_hit_name = wname("HgHit");
+        let hg_occlude_name = wname("HgOcclude");
         let chs_shade_name = wname("chs_shade");
         let chs_hit_name = wname("chs_hit");
+        let ah_shade_name = wname("ah_shade");
+        let ah_hit_name = wname("ah_hit");
+        let ah_shadow_name = wname("ah_shadow");
 
         let lib_desc = D3D12_DXIL_LIBRARY_DESC {
             DXILLibrary: D3D12_SHADER_BYTECODE {
@@ -131,15 +178,33 @@ impl DxrGpu {
             NumExports: 0,
             pExports: std::ptr::null_mut(),
         };
-        let hit_group = |export: &Vec<u16>, chs: &Vec<u16>| D3D12_HIT_GROUP_DESC {
+        // ALPHA_CUTOUT scenes attach the cutout any-hit to every hit group;
+        // HgOcclude carries ONLY an any-hit (legal — SKIP_CLOSEST_HIT skips
+        // just that stage, any-hit still runs during traversal: the standard
+        // alpha-tested-shadow pattern, and the untouched-payload = occluded
+        // convention holds: all-rejected => miss_shadow writes 0).
+        let ahs = |name: &Vec<u16>| {
+            if any_alpha { PCWSTR(name.as_ptr()) } else { PCWSTR::null() }
+        };
+        let hit_group = |export: &Vec<u16>, chs: PCWSTR, ah: PCWSTR| D3D12_HIT_GROUP_DESC {
             HitGroupExport: PCWSTR(export.as_ptr()),
             Type: D3D12_HIT_GROUP_TYPE_TRIANGLES,
-            AnyHitShaderImport: PCWSTR::null(),
-            ClosestHitShaderImport: PCWSTR(chs.as_ptr()),
+            AnyHitShaderImport: ah,
+            ClosestHitShaderImport: chs,
             IntersectionShaderImport: PCWSTR::null(),
         };
-        let hg_shade = hit_group(&hg_shade_name, &chs_shade_name);
-        let hg_hit = hit_group(&hg_hit_name, &chs_hit_name);
+        let hg_shade = hit_group(
+            &hg_shade_name,
+            PCWSTR(chs_shade_name.as_ptr()),
+            ahs(&ah_shade_name),
+        );
+        let hg_hit =
+            hit_group(&hg_hit_name, PCWSTR(chs_hit_name.as_ptr()), ahs(&ah_hit_name));
+        let hg_occlude = hit_group(
+            &hg_occlude_name,
+            PCWSTR::null(),
+            PCWSTR(ah_shadow_name.as_ptr()),
+        );
         // RayPayload {float3 + float + uint} = 20 B is the largest payload;
         // triangle barycentrics = 8 B.
         let shader_cfg = D3D12_RAYTRACING_SHADER_CONFIG {
@@ -156,7 +221,7 @@ impl DxrGpu {
         let sub = |t: D3D12_STATE_SUBOBJECT_TYPE, p: *const std::ffi::c_void| {
             D3D12_STATE_SUBOBJECT { Type: t, pDesc: p }
         };
-        let subobjects = [
+        let mut subobjects = vec![
             sub(D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY, &lib_desc as *const _ as *const _),
             sub(D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hg_shade as *const _ as *const _),
             sub(D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hg_hit as *const _ as *const _),
@@ -170,6 +235,14 @@ impl DxrGpu {
             ),
             sub(D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE, &grs as *const _ as *const _),
         ];
+        // HgOcclude imports ah_shadow, which only exports under ALPHA_CUTOUT
+        // — the subobject exists exactly when the library exports it.
+        if any_alpha {
+            subobjects.push(sub(
+                D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP,
+                &hg_occlude as *const _ as *const _,
+            ));
+        }
         let so_desc = D3D12_STATE_OBJECT_DESC {
             Type: D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE,
             NumSubobjects: subobjects.len() as u32,
@@ -201,9 +274,17 @@ impl DxrGpu {
         put(SBT_MISS + 2 * IDENT, ident("miss_hit")?);
         put(SBT_HIT, ident("HgShade")?);
         put(SBT_HIT + IDENT, ident("HgHit")?);
-        // Hit group 2 (occlusion rays) stays the zeroed null record.
+        // Hit group 2 (occlusion rays): the zeroed null record on opaque
+        // scenes (SKIP_CLOSEST_HIT + FORCE_OPAQUE never run a shader from
+        // it); the any-hit-only HgOcclude on alpha-masked scenes.
+        if any_alpha {
+            put(SBT_HIT + 2 * IDENT, ident("HgOcclude")?);
+        }
 
-        let scene_gpu = SceneGpu::new(device, scene, bvh)?;
+        // sw_bvh None: the DXR pipeline never binds the software BVH (see
+        // bind_common — t0/t1 stay unset), so its ~32 B/node upload is
+        // skipped entirely (~2.3 GB at 100M tris).
+        let scene_gpu = SceneGpu::new_uploaded(device, scene, None, submit)?;
 
         let uaf = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         let ua = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
@@ -211,7 +292,7 @@ impl DxrGpu {
         let accum = committed_buffer(device, px * 12, uaf, ua)?;
         let tbuf = committed_buffer(device, px * 4, uaf, ua)?;
         let info = committed_buffer(device, px * 4, uaf, ua)?;
-        let gbuf_dummy = committed_buffer(device, 64, uaf, ua)?;
+        let gbuf = committed_buffer(device, if gbuf_full { px * 64 } else { 64 }, uaf, ua)?;
         let hdr = d3d12::committed_tex(
             device,
             rw,
@@ -220,10 +301,15 @@ impl DxrGpu {
             uaf,
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
         )?;
+        // Slot 0 = hdr (the resolve target), slots 1..7 = the feed planes
+        // (wired later), slots TEX_HEAP_BASE.. = the RP_SCENE_TEX scene
+        // table — the tracer's heap layout exactly.
         let uav_heap: ID3D12DescriptorHeap = unsafe {
             device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                NumDescriptors: 1,
+                NumDescriptors: TEX_HEAP_BASE
+                    + TEX_TABLE_BUFS
+                    + scene_gpu.textures.len() as u32,
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                 ..Default::default()
             })
@@ -237,6 +323,16 @@ impl DxrGpu {
                 uav_heap.GetCPUDescriptorHandleForHeapStart(),
             )
         };
+        scene_gpu.write_scene_descriptors(device, &uav_heap, TEX_HEAP_BASE);
+        let tex_table = D3D12_GPU_DESCRIPTOR_HANDLE {
+            ptr: unsafe { uav_heap.GetGPUDescriptorHandleForHeapStart() }.ptr
+                + TEX_HEAP_BASE as u64
+                    * unsafe {
+                        device.GetDescriptorHandleIncrementSize(
+                            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        )
+                    } as u64,
+        };
         let frame_cb = d3d12::UploadBuffer::new(device, CB_STRIDE * d3d12::FRAMES_IN_FLIGHT)?;
 
         let name = |res: &ID3D12Resource, n: &str| {
@@ -247,7 +343,7 @@ impl DxrGpu {
         name(&tbuf, "dxr.tbuf");
         name(&info, "dxr.info");
         name(&hdr, "dxr.hdr");
-        name(&gbuf_dummy, "dxr.gbuf_dummy");
+        name(&gbuf, if gbuf_full { "dxr.gbuf" } else { "dxr.gbuf_dummy" });
 
         Ok(Self {
             root_sig,
@@ -258,9 +354,14 @@ impl DxrGpu {
             accum,
             tbuf,
             info,
-            gbuf_dummy,
+            gbuf,
+            gbuf_full,
             hdr,
             uav_heap,
+            tex_table,
+            pso_feed_xess,
+            pso_feed_rr,
+            feed: None,
             frame_cb,
             cb_base: FrameCb::base(scene, rw, rh),
             rw,
@@ -270,8 +371,39 @@ impl DxrGpu {
 
     pub fn write_cb(&self, slot: usize, p: &FrameParams) {
         self.cb_base
-            .with_frame(p, false)
+            .with_frame(p, self.gbuf_full)
             .store(unsafe { self.frame_cb.ptr.add(slot * CB_STRIDE) });
+    }
+
+    /// Wire the upscaler feed targets (registers u16..u22) into this
+    /// pipeline's descriptor heap — the DXR twin of TraceGpu::wire_feed,
+    /// same heap layout, same typed-store gate.
+    pub fn wire_feed(
+        &mut self,
+        device: &ID3D12Device,
+        kind: trace::FeedKind,
+        targets: &[(u32, &ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT)],
+    ) -> Result<()> {
+        self.feed = Some((kind, trace::wire_feed_targets(device, &self.uav_heap, targets)?));
+        Ok(())
+    }
+
+    /// Fan the pack + accum out into the wired upscaler input planes. Record
+    /// AFTER record_frame on the same list (its trailing global UAV barrier
+    /// fences the pack/accum writes).
+    pub fn record_feed(&self, list: &ID3D12GraphicsCommandList, slot: usize) -> Result<()> {
+        let Some((kind, planes)) = &self.feed else {
+            return Err("feed targets not wired".into());
+        };
+        let pso = match kind {
+            trace::FeedKind::Xess => self.pso_feed_xess.as_ref(),
+            trace::FeedKind::Rr => self.pso_feed_rr.as_ref(),
+        }
+        .ok_or("feed PSO missing (DxrGpu built without gbuf)")?;
+        trace::record_feed_dispatch(list, &self.uav_heap, pso, None, planes, self.rw, self.rh, &|| unsafe {
+            self.bind_common(list, slot)
+        });
+        Ok(())
     }
 
     /// The DXR subset of the shared root layout. t0/t1 (software BVH) and the
@@ -296,7 +428,7 @@ impl DxrGpu {
                 RP_UAV0 + UAV_INFO,
                 self.info.GetGPUVirtualAddress(),
             );
-            list.SetComputeRootUnorderedAccessView(RP_GBUF, self.gbuf_dummy.GetGPUVirtualAddress());
+            list.SetComputeRootUnorderedAccessView(RP_GBUF, self.gbuf.GetGPUVirtualAddress());
             let s = &self.scene;
             list.SetComputeRootShaderResourceView(
                 RP_SRV0 + SRV_POSITIONS,
@@ -322,6 +454,10 @@ impl DxrGpu {
                 RP_SRV0 + SRV_TLAS,
                 s.tlas.GetGPUVirtualAddress(),
             );
+            // The scene-texture table (t0..t3 + texs[] in space1) — heap
+            // before table, same as the tracer's bind_common.
+            list.SetDescriptorHeaps(&[Some(self.uav_heap.clone())]);
+            list.SetComputeRootDescriptorTable(RP_SCENE_TEX, self.tex_table);
         }
     }
 

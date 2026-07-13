@@ -1,4 +1,16 @@
 /target
+# Benchmark scenes (San Miguel etc., CC-licensed — keep the archive's license
+# txt next to the data) live in git LFS (see .gitattributes), with the OBJs
+# stored zstd-compressed (.obj.zst — the loader decodes transparently). The
+# original download archives and any locally decompressed plain .obj stay
+# untracked. Sources: "Real scenes" in CLAUDE.md.
+/scenes/*.zip
+/scenes/**/*.zip
+/scenes/**/*.obj
+# Scene+BVH sidecar caches (src/scene_cache.rs) — per-machine derived
+# artifacts, rebuilt on any source/version change. Never commit or LFS them.
+*.fcache
+*.fcache.*
 check.png
 screenshot_*.png
 dlss_gbuf_*.png

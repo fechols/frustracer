@@ -200,3 +200,56 @@ void onb(float3 n, out float3 t1, out float3 t2) {
     t1 = float3(1.0 + s * n.x * n.x * a, s * b, -s * n.x);
     t2 = float3(b, s + n.y * n.y * a, -n.y);
 }
+
+// --- Scene textures + UV stream (space1; the RP_SCENE_TEX table) --------------
+// Self-contained here (NOT on shade.hlsli's declarations) because the cutout
+// test runs inside the trace primitives — hemi_wave.hlsl calls occluded_q
+// without pasting shade.hlsli. uv_indices/uv_tri_mat are second descriptors
+// over the same indices/tri_mat resources as the t4/t5 space0 root SRVs.
+
+StructuredBuffer<float2> uv_buf     : register(t0, space1); // Scene::texcoords
+StructuredBuffer<uint>   uv_indices : register(t1, space1); // flat, 3 per tri
+StructuredBuffer<uint>   uv_tri_mat : register(t2, space1); // material per tri
+// Per-material cutout map: tex + 1 when textured AND alpha_masked, else 0
+// (the bvh.rs::moller_trumbore gate chain folded to one fetch).
+StructuredBuffer<uint>   mat_cutout : register(t3, space1);
+// R8G8B8A8 (_SRGB for color maps, _UNORM for linear-data normal/rough-metal
+// maps — Texture::srgb), 1 mip each (CPU-bilinear parity; no mip chain).
+Texture2D<float4>        texs[]     : register(t4, space1);
+// Static: bilinear, repeat wrap, mip 0 — texture.rs::sample_bilinear in
+// hardware (sRGB decode per texel via the SRGB SRV format, texel centers at
+// i + 0.5). The cutout test below deliberately uses .Load instead.
+SamplerState             samp_lin   : register(s0, space1);
+
+// texture.rs::wrap — repeat into [0,1], non-finite collapses to 0 (fp can
+// round c - floor(c) up to exactly 1.0 for c just below an integer; the
+// consumer's min(w-1) clamp absorbs it, same as the CPU).
+float uv_wrap(float c) {
+    float f = c - floor(c);
+    return isfinite(f) ? f : 0.0;
+}
+
+// scene.rs::tri_uv — barycentric UV interpolation at a hit.
+float2 tri_uv(uint tri, float u, float v) {
+    uint i0 = uv_indices[tri * 3u];
+    uint i1 = uv_indices[tri * 3u + 1u];
+    uint i2 = uv_indices[tri * 3u + 2u];
+    return uv_buf[i0] * (1.0 - u - v) + uv_buf[i1] * u + uv_buf[i2] * v;
+}
+
+// bvh.rs::moller_trumbore's alpha-cutout test: true = reject the candidate.
+// texture.rs::alpha_nearest mirrored in ALU over a .Load (not a sampler), so
+// the RayQuery candidate loop and the DXR any-hit agree bit-for-bit with each
+// other; `.a` of an SRGB SRV is linear per D3D spec, and alpha*255 < 127.5
+// reproduces the CPU's `u8 < 128` through the UNORM n/255 representation.
+bool alpha_cutout(uint tri, float u, float v) {
+    uint cm = mat_cutout[uv_tri_mat[tri]];
+    if (cm == 0u) return false;
+    float2 uv = tri_uv(tri, u, v);
+    uint ti = NonUniformResourceIndex(cm - 1u);
+    uint w, h;
+    texs[ti].GetDimensions(w, h);
+    uint x = min(uint(uv_wrap(uv.x) * float(w)), w - 1u);
+    uint y = min(uint(uv_wrap(uv.y) * float(h)), h - 1u);
+    return texs[ti].Load(int3(int(x), int(y), 0)).a * 255.0 < 127.5;
+}

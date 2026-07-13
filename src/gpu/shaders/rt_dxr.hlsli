@@ -6,8 +6,21 @@
 //
 // SBT contract (mirrored by the byte layout in gpu/dxr.rs — keep in
 // lockstep):
-//   hit groups: 0 = HgShade (chs_shade), 1 = HgHit (chs_hit), 2 = null
+//   hit groups: 0 = HgShade (chs_shade), 1 = HgHit (chs_hit),
+//               2 = null (opaque scenes) / HgOcclude (any-hit only,
+//                   ALPHA_CUTOUT scenes)
 //   miss:       0 = miss_radiance, 1 = miss_shadow, 2 = miss_hit
+//
+// ALPHA_CUTOUT (per-scene, trace.rs::alpha_defs): the BLAS drops OPAQUE and
+// every TraceRay drops FORCE_OPAQUE so the ah_* any-hit shaders (dxr.hlsl)
+// run the shared alpha_cutout test; opaque scenes compile the FORCE_OPAQUE
+// flags verbatim and keep the null occlusion record.
+
+#ifdef ALPHA_CUTOUT
+#define OPAQUE_RF RAY_FLAG_NONE
+#else
+#define OPAQUE_RF RAY_FLAG_FORCE_OPAQUE
+#endif
 
 RaytracingAccelerationStructure tlas : register(t7);
 
@@ -48,14 +61,14 @@ bool trace_closest(float3 o, float3 d, float tmin, float tmax, out HitInfo h) {
     r.Origin = o; r.Direction = d; r.TMin = tmin; r.TMax = tmax;
     HitPayload p;
     p.t = -1.0; p.tri = 0u; p.u = 0.0; p.v = 0.0;
-    TraceRay(tlas, RAY_FLAG_FORCE_OPAQUE, 0xffu, 1u, 0u, 2u, r, p);
+    TraceRay(tlas, OPAQUE_RF, 0xffu, 1u, 0u, 2u, r, p);
     h.t = max(p.t, 0.0); h.tri = p.tri; h.u = p.u; h.v = p.v;
     return p.t >= 0.0;
 }
 
-// rt.hlsli::occluded_q. Hit group 2 is a null SBT record and the closest-hit
-// stage is skipped anyway — only miss_shadow can run, so an untouched
-// payload IS the hit answer.
+// rt.hlsli::occluded_q. The closest-hit stage is skipped — only miss_shadow
+// (and, in ALPHA_CUTOUT scenes, HgOcclude's any-hit rejecting masked
+// candidates) can run, so an untouched payload IS the hit answer.
 bool occluded_q(float3 o, float3 d, float tmin, float tmax) {
     if (tmax <= tmin) return false;
     RayDesc r;
@@ -63,7 +76,7 @@ bool occluded_q(float3 o, float3 d, float tmin, float tmax) {
     ShadowPayload p;
     p.hit = 1u;
     TraceRay(tlas,
-             RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
+             OPAQUE_RF | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
                  RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
              0xffu, 2u, 0u, 1u, r, p);
     return p.hit != 0u;

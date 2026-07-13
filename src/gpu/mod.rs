@@ -44,9 +44,10 @@ pub struct GpuOptions {
     /// Directory holding libxess.dll.
     pub xess_dir: String,
     /// Attempt FSR (native pipeline like XeSS; main.rs forces dlss off and
-    /// rejects --xess when this is set). Also flips the adapter preference
-    /// to AMD. FSR4 + Ray Regeneration where the RR provider enumerates
-    /// (RDNA4); FSR 3.1 upscale-only elsewhere, with a log line.
+    /// rejects --xess when this is set). Also flips the default adapter
+    /// preference to AMD (an explicit `prefer` wins). FSR4 + Ray
+    /// Regeneration where the RR provider enumerates (RDNA4); FSR 3.1
+    /// upscale-only elsewhere, with a log line.
     pub fsr: bool,
     /// Force the FSR 3.1 provider even where FSR4+RR is available
     /// (--fsr3; the A/B lever). Fails loudly when no 3.1 provider is
@@ -54,11 +55,21 @@ pub struct GpuOptions {
     pub fsr3: bool,
     /// Directory holding amd_fidelityfx_loader_dx12.dll + provider DLLs.
     pub ffx_dir: String,
+    /// Explicit adapter vendor preference (--prefer-nvidia / --prefer-intel /
+    /// --prefer-amd). None = the mode default: AMD when fsr is set, NVIDIA
+    /// otherwise. A preference, not a requirement — the per-feature support
+    /// probes still gate, so a pick without DLSS/FSR support just logs and
+    /// falls back to the plain path.
+    pub prefer: Option<adapter::Prefer>,
     /// OR XESS_INIT_FLAG_ENABLE_AUTOEXPOSURE into the XeSS init flags
     /// (--xess-autoexposure; A/B lever, default off).
     pub xess_autoexposure: bool,
     /// D3D12 debug layer + DXGI debug factory + verbose SL logging.
     pub debug: bool,
+    /// Present at sync interval 1 (default). `--no-vsync` clears it for
+    /// uncapped benchmark presentation (tearing swapchain when DXGI
+    /// supports it).
+    pub vsync: bool,
 }
 
 /// A live XeSS-SR context + its resource set and the queried input-resolution
@@ -205,7 +216,11 @@ impl GpuContext {
 
         let factory =
             adapter::create_factory(opts.debug).map_err(|e| format!("CreateDXGIFactory2: {e}"))?;
-        let prefer = if opts.fsr { adapter::Prefer::Amd } else { adapter::Prefer::Nvidia };
+        let prefer = opts.prefer.unwrap_or(if opts.fsr {
+            adapter::Prefer::Amd
+        } else {
+            adapter::Prefer::Nvidia
+        });
         let pick = adapter::pick(&factory, prefer)?;
         eprintln!("gpu: using adapter \"{}\"", pick.name);
         if sl.is_some() && !pick.is_nvidia {
@@ -232,7 +247,7 @@ impl GpuContext {
             let pdev: ID3D12Device = s.upgrade(&device)?;
             let queue = d3d12::create_queue(&pdev)?;
             let pfac: IDXGIFactory6 = s.upgrade(&factory)?;
-            let d3d = D3d::with_queue(&pfac, device, queue, hwnd, w, h)?;
+            let d3d = D3d::with_queue(&pfac, device, queue, hwnd, w, h, opts.vsync)?;
             // The swapchain we hold MUST be the SL proxy — every present has
             // to route through presentCommon under manual hooking. A proxy
             // resolves to a distinct native interface; verify loudly.
@@ -249,66 +264,10 @@ impl GpuContext {
             d3d
         } else {
             let queue = d3d12::create_queue(&device)?;
-            D3d::with_queue(&factory, device, queue, hwnd, w, h)?
+            D3d::with_queue(&factory, device, queue, hwnd, w, h, opts.vsync)?
         };
 
-        // Query DLSS-RR's optimal Quality-mode render resolution and its
-        // dynamic range — the CPU renders inside [min, max] and RR upscales
-        // + denoises to the window size (step-wise DRS via sl::Extent tags).
-        // A failed or degenerate query falls back to DLAA (opt == min ==
-        // max == output), which main.rs reads as "DRS off, fixed res".
-        let (rr_opt, rr_min, rr_max) = if let Some(s) = &sl {
-            let opt = streamline::SlShimDlssdOptions {
-                mode: streamline_sys::DLSS_MODE_MAX_QUALITY,
-                output_width: w,
-                output_height: h,
-                preset: streamline_sys::DLSSD_PRESET_E,
-                normal_roughness_packed: 1,
-                use_camera_matrices: 0,
-                world_to_view: [0.0; 16],
-                view_to_world: [0.0; 16],
-            };
-            match s.dlssd_optimal_settings(&opt) {
-                Ok(o) if o.render_width > 0 && o.render_height > 0 => {
-                    eprintln!(
-                        "dlss: RR Quality {}x{} -> render {}x{} (range {}x{}..{}x{})",
-                        w, h, o.render_width, o.render_height,
-                        o.render_width_min, o.render_height_min,
-                        o.render_width_max, o.render_height_max,
-                    );
-                    // Malformed halves of the range collapse to the optimal
-                    // size — never invent a range the driver didn't report.
-                    let po = (o.render_width, o.render_height);
-                    let pmin = if o.render_width_min > 0
-                        && o.render_height_min > 0
-                        && o.render_width_min <= o.render_width
-                        && o.render_height_min <= o.render_height
-                    {
-                        (o.render_width_min, o.render_height_min)
-                    } else {
-                        po
-                    };
-                    let pmax = if o.render_width_max >= o.render_width
-                        && o.render_height_max >= o.render_height
-                    {
-                        (o.render_width_max, o.render_height_max)
-                    } else {
-                        po
-                    };
-                    (po, pmin, pmax)
-                }
-                Ok(_) => {
-                    eprintln!("dlss: optimal-settings degenerate — falling back to DLAA at native res");
-                    ((w, h), (w, h), (w, h))
-                }
-                Err(e) => {
-                    eprintln!("dlss: optimal-settings query failed ({e}) — falling back to DLAA at native res");
-                    ((w, h), (w, h), (w, h))
-                }
-            }
-        } else {
-            ((w, h), (w, h), (w, h))
-        };
+        let (rr_opt, rr_min, rr_max) = Self::query_rr_res(sl.as_ref(), w, h);
 
         let passes = tonemap::Passes::new(&d3d.device)?;
         let blit = upload::BlitUpload::new(&d3d, w, h)?;
@@ -344,38 +303,15 @@ impl GpuContext {
         // allocated once at the range MAX; every frame uploads and names its
         // own sub-rect (dynamic resolution).
         let xess_state = if opts.xess && sl.is_none() {
-            match crate::xess::Xess::new(
-                &opts.xess_dir,
-                d3d.device.as_raw(),
-                (w, h),
-                opts.xess_autoexposure,
-            ) {
-                Ok((ctx, opt, min, max)) => {
-                    eprintln!(
-                        "xess: {}x{} -> optimal {}x{} (range {}x{}..{}x{})",
-                        w, h, opt.x, opt.y, min.x, min.y, max.x, max.y,
+            match Self::init_xess(&opts.xess_dir, &d3d.device, w, h, opts.xess_autoexposure) {
+                Ok(s) => {
+                    passes.create_srv(
+                        &d3d.device,
+                        &s.res.output,
+                        windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+                        tonemap::SRV_SLOT_XESS,
                     );
-                    match xr::XessResources::new(&d3d.device, max.x, max.y, w, h) {
-                        Ok(r) => {
-                            passes.create_srv(
-                                &d3d.device,
-                                &r.output,
-                                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
-                                tonemap::SRV_SLOT_XESS,
-                            );
-                            Some(XessState {
-                                ctx,
-                                res: r,
-                                opt: (opt.x, opt.y),
-                                min: (min.x, min.y),
-                                max: (max.x, max.y),
-                            })
-                        }
-                        Err(e) => {
-                            eprintln!("xess: disabled — resource allocation failed: {e}");
-                            None
-                        }
-                    }
+                    Some(s)
                 }
                 Err(e) => {
                     eprintln!("xess: disabled — {e}");
@@ -438,6 +374,178 @@ impl GpuContext {
             adapter_name: pick.name,
             adapter_is_nvidia: pick.is_nvidia,
         })
+    }
+
+    /// Query DLSS-RR's optimal Quality-mode render resolution and its
+    /// dynamic range for an output size — the CPU renders inside [min, max]
+    /// and RR upscales + denoises to the window size (step-wise DRS via
+    /// sl::Extent tags). A failed or degenerate query falls back to DLAA
+    /// (opt == min == max == output), which main.rs reads as "DRS off,
+    /// fixed res". Re-callable — a window resize re-queries at the new
+    /// output size.
+    #[allow(clippy::type_complexity)]
+    fn query_rr_res(
+        sl: Option<&streamline::SlContext>,
+        w: u32,
+        h: u32,
+    ) -> ((u32, u32), (u32, u32), (u32, u32)) {
+        let Some(s) = sl else {
+            return ((w, h), (w, h), (w, h));
+        };
+        let opt = streamline::SlShimDlssdOptions {
+            mode: streamline_sys::DLSS_MODE_MAX_QUALITY,
+            output_width: w,
+            output_height: h,
+            preset: streamline_sys::DLSSD_PRESET_E,
+            normal_roughness_packed: 1,
+            use_camera_matrices: 0,
+            world_to_view: [0.0; 16],
+            view_to_world: [0.0; 16],
+        };
+        match s.dlssd_optimal_settings(&opt) {
+            Ok(o) if o.render_width > 0 && o.render_height > 0 => {
+                eprintln!(
+                    "dlss: RR Quality {}x{} -> render {}x{} (range {}x{}..{}x{})",
+                    w, h, o.render_width, o.render_height,
+                    o.render_width_min, o.render_height_min,
+                    o.render_width_max, o.render_height_max,
+                );
+                // Malformed halves of the range collapse to the optimal
+                // size — never invent a range the driver didn't report.
+                let po = (o.render_width, o.render_height);
+                let pmin = if o.render_width_min > 0
+                    && o.render_height_min > 0
+                    && o.render_width_min <= o.render_width
+                    && o.render_height_min <= o.render_height
+                {
+                    (o.render_width_min, o.render_height_min)
+                } else {
+                    po
+                };
+                let pmax = if o.render_width_max >= o.render_width
+                    && o.render_height_max >= o.render_height
+                {
+                    (o.render_width_max, o.render_height_max)
+                } else {
+                    po
+                };
+                (po, pmin, pmax)
+            }
+            Ok(_) => {
+                eprintln!("dlss: optimal-settings degenerate — falling back to DLAA at native res");
+                ((w, h), (w, h), (w, h))
+            }
+            Err(e) => {
+                eprintln!("dlss: optimal-settings query failed ({e}) — falling back to DLAA at native res");
+                ((w, h), (w, h), (w, h))
+            }
+        }
+    }
+
+    /// Bring up the XeSS context + resource set for an output size. Split
+    /// out of `new` (the init_fsr shape) so every failure funnels into one
+    /// "xess: disabled" fallback and a window resize can rebuild it.
+    fn init_xess(
+        xess_dir: &str,
+        device: &ID3D12Device,
+        w: u32,
+        h: u32,
+        autoexposure: bool,
+    ) -> Result<XessState> {
+        let (ctx, opt, min, max) =
+            crate::xess::Xess::new(xess_dir, device.as_raw(), (w, h), autoexposure)?;
+        eprintln!(
+            "xess: {}x{} -> optimal {}x{} (range {}x{}..{}x{})",
+            w, h, opt.x, opt.y, min.x, min.y, max.x, max.y,
+        );
+        let r = xr::XessResources::new(device, max.x, max.y, w, h)
+            .map_err(|e| format!("resource allocation failed: {e}"))?;
+        Ok(XessState {
+            ctx,
+            res: r,
+            opt: (opt.x, opt.y),
+            min: (min.x, min.y),
+            max: (max.x, max.y),
+        })
+    }
+
+    /// Rebuild every window-size-dependent field at a new client size — the
+    /// GPU half of a live window resize. The context itself (device, queue,
+    /// PSOs, SL interposer + proxies) survives: ResizeBuffers on the SL
+    /// proxy swapchain is the documented resize pattern, whereas a full SL
+    /// shutdown/re-init in-process is unvalidated. The tracer pipelines and
+    /// upscaler contexts are torn down here and rebuilt by the caller's
+    /// session re-entry (init_trace / init_dxr at the re-derived locked
+    /// render res), which is also why the upscaler planes are recreated
+    /// FIRST — wire_session_feed needs them live.
+    pub fn resize_output(&mut self, w: u32, h: u32, opts: &GpuOptions) -> Result<()> {
+        // Everything below drops live GPU resources; drain first (the
+        // GpuContext::drop discipline — xess/ffx destroy-context require
+        // completed command lists, ResizeBuffers requires zero outstanding
+        // backbuffer refs).
+        self.d3d.wait_idle()?;
+        self.trace = None;
+        self.dxr = None;
+        self.nppd_gpu = None;
+        self.nppd_state_valid = false;
+        self.xess = None;
+        self.fsr = None;
+        self.rr = None;
+        self.d3d.resize(w, h)?;
+        self.blit = upload::BlitUpload::new(&self.d3d, w, h)?;
+        self.hdr = upload::HdrUpload::new(&self.d3d, w, h)?;
+        self.passes.create_srv(
+            &self.d3d.device,
+            &self.blit.texture,
+            d3d12::SWAPCHAIN_FORMAT,
+            tonemap::SRV_SLOT_BLIT,
+        );
+        self.passes.create_srv(
+            &self.d3d.device,
+            &self.hdr.texture,
+            windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+            tonemap::SRV_SLOT_HDR,
+        );
+        if self.sl.is_some() {
+            let (opt, min, max) = Self::query_rr_res(self.sl.as_ref(), w, h);
+            let r = rr::RrResources::new(&self.d3d.device, opt, min, max, w, h)?;
+            self.passes.create_srv(
+                &self.d3d.device,
+                &r.output,
+                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+                tonemap::SRV_SLOT_RR,
+            );
+            self.rr = Some(r);
+        }
+        if opts.xess && self.sl.is_none() {
+            match Self::init_xess(&opts.xess_dir, &self.d3d.device, w, h, opts.xess_autoexposure) {
+                Ok(s) => {
+                    self.passes.create_srv(
+                        &self.d3d.device,
+                        &s.res.output,
+                        windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+                        tonemap::SRV_SLOT_XESS,
+                    );
+                    self.xess = Some(s);
+                }
+                Err(e) => eprintln!("xess: disabled after resize — {e}"),
+            }
+        }
+        if opts.fsr && self.sl.is_none() {
+            match Self::init_fsr(&opts.ffx_dir, &self.d3d.device, w, h, opts.debug, opts.fsr3) {
+                Ok(s) => {
+                    self.passes.create_srv(
+                        &self.d3d.device,
+                        s.res.upscaled(),
+                        windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+                        tonemap::SRV_SLOT_FSR,
+                    );
+                    self.fsr = Some(s);
+                }
+                Err(e) => eprintln!("fsr: disabled after resize — {e}"),
+            }
+        }
+        Ok(())
     }
 
     /// Bring up the ffx context(s) + the flavor's resources. Split out of
@@ -542,6 +650,61 @@ impl GpuContext {
         Ok(FsrState { ctx, res, opt, min, max: (w, h) })
     }
 
+    /// Wire the session's live upscaler input planes as feed targets on a
+    /// GPU tracer (`wire` = TraceGpu's or DxrGpu's `wire_feed`). The trace
+    /// res was quantize_res-clamped by the caller, but the range is the
+    /// SDK's contract: re-check here so a drift fails loudly at init. A gbuf
+    /// session with no live upscaler is a wiring bug, not a fallback.
+    fn wire_session_feed(
+        &self,
+        rw: u32,
+        rh: u32,
+        mut wire: impl FnMut(
+            trace::FeedKind,
+            &[(u32, &ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT)],
+        ) -> Result<()>,
+    ) -> Result<()> {
+        if let Some(rr) = &self.rr {
+            if rw < rr.min.0 || rh < rr.min.1 || rw > rr.max.0 || rh > rr.max.1 {
+                return Err(format!(
+                    "trace res {}x{} outside DLSS-RR render range {}x{}..{}x{}",
+                    rw, rh, rr.min.0, rr.min.1, rr.max.0, rr.max.1
+                ));
+            }
+            let pl = rr.plane_resources();
+            wire(
+                trace::FeedKind::Rr,
+                &[
+                    (trace::FEED_COLOR, pl[0].0, pl[0].1),
+                    (trace::FEED_NR, pl[1].0, pl[1].1),
+                    (trace::FEED_DEPTH, pl[2].0, pl[2].1),
+                    (trace::FEED_MVEC, pl[3].0, pl[3].1),
+                    (trace::FEED_ALB, pl[4].0, pl[4].1),
+                    (trace::FEED_SPEC, pl[5].0, pl[5].1),
+                    (trace::FEED_SPECHIT, pl[6].0, pl[6].1),
+                ],
+            )
+        } else if let Some(x) = &self.xess {
+            if rw < x.min.0 || rh < x.min.1 || rw > x.max.0 || rh > x.max.1 {
+                return Err(format!(
+                    "trace res {}x{} outside XeSS input range {}x{}..{}x{}",
+                    rw, rh, x.min.0, x.min.1, x.max.0, x.max.1
+                ));
+            }
+            let pl = x.res.plane_resources();
+            wire(
+                trace::FeedKind::Xess,
+                &[
+                    (trace::FEED_COLOR, pl[0].0, pl[0].1),
+                    (trace::FEED_MVEC, pl[1].0, pl[1].1),
+                    (trace::FEED_DEPTH, pl[2].0, pl[2].1),
+                ],
+            )
+        } else {
+            Err("gbuf session with no live upscaler".into())
+        }
+    }
+
     /// Bring up the GPU-resident tracer: capability gates, kernel compiles,
     /// scene upload + BLAS/TLAS build (synchronous, one-time), HDR SRV wire-up.
     /// `(rw, rh)` is the session's fixed trace resolution (the locked render
@@ -562,8 +725,9 @@ impl GpuContext {
         nppd: Option<(&str, &str)>,
         debug: bool,
     ) -> Result<()> {
+        let dev = self.d3d.device.clone();
         let mut tg = trace::TraceGpu::new(
-            &self.d3d.device,
+            &dev,
             dxc,
             scene,
             bvh,
@@ -572,58 +736,13 @@ impl GpuContext {
             gbuf,
             nppd.is_some(),
             debug,
+            &mut self.d3d,
         )?;
         // Upscaler sessions: wire the live upscaler's input planes as feed
-        // targets — the feed kernel writes them directly, no CPU upload. The
-        // trace res was quantize_res-clamped by the caller, but the range is
-        // the SDK's contract: re-check here so a drift fails loudly at init.
+        // targets — the feed kernel writes them directly, no CPU upload.
         if gbuf {
-            if let Some(rr) = &self.rr {
-                if rw < rr.min.0 || rh < rr.min.1 || rw > rr.max.0 || rh > rr.max.1 {
-                    return Err(format!(
-                        "trace res {}x{} outside DLSS-RR render range {}x{}..{}x{}",
-                        rw, rh, rr.min.0, rr.min.1, rr.max.0, rr.max.1
-                    ));
-                }
-                let pl = rr.plane_resources();
-                tg.wire_feed(
-                    &self.d3d.device,
-                    trace::FeedKind::Rr,
-                    &[
-                        (trace::FEED_COLOR, pl[0].0, pl[0].1),
-                        (trace::FEED_NR, pl[1].0, pl[1].1),
-                        (trace::FEED_DEPTH, pl[2].0, pl[2].1),
-                        (trace::FEED_MVEC, pl[3].0, pl[3].1),
-                        (trace::FEED_ALB, pl[4].0, pl[4].1),
-                        (trace::FEED_SPEC, pl[5].0, pl[5].1),
-                        (trace::FEED_SPECHIT, pl[6].0, pl[6].1),
-                    ],
-                )?;
-            } else if let Some(x) = &self.xess {
-                if rw < x.min.0 || rh < x.min.1 || rw > x.max.0 || rh > x.max.1 {
-                    return Err(format!(
-                        "trace res {}x{} outside XeSS input range {}x{}..{}x{}",
-                        rw, rh, x.min.0, x.min.1, x.max.0, x.max.1
-                    ));
-                }
-                let pl = x.res.plane_resources();
-                tg.wire_feed(
-                    &self.d3d.device,
-                    trace::FeedKind::Xess,
-                    &[
-                        (trace::FEED_COLOR, pl[0].0, pl[0].1),
-                        (trace::FEED_MVEC, pl[1].0, pl[1].1),
-                        (trace::FEED_DEPTH, pl[2].0, pl[2].1),
-                    ],
-                )?;
-            } else {
-                return Err("gbuf session with no live upscaler".into());
-            }
+            self.wire_session_feed(rw, rh, |kind, targets| tg.wire_feed(&dev, kind, targets))?;
         }
-        let mut rec = Ok(());
-        self.d3d.run_once(|l| rec = tg.scene.record_upload(l))?;
-        rec?;
-        tg.scene.free_staging();
         // GPU-resident NPPD: ORT session on OUR device/queue, tensors bound
         // over the NppdRes buffers. XeSS-only (RR is itself a denoiser — the
         // same exclusion as the CPU paths); a failure keeps the session
@@ -674,31 +793,30 @@ impl GpuContext {
     }
 
     /// Build the DXR DispatchRays pipeline (the F key / --dxr). Idempotent —
-    /// a live pipeline is kept. Window-res; scene buffers + BLAS/TLAS build
+    /// a live pipeline is kept. `(rw, rh)` is the session's fixed DXR trace
+    /// resolution (the locked render res when `gbuf` composes with the wired
+    /// upscaler, the window size otherwise); scene buffers + BLAS/TLAS build
     /// once here (the scene is static, --stress included).
     pub fn init_dxr(
         &mut self,
         dxc: &dxc::Dxc,
         scene: &crate::scene::Scene,
-        bvh: &crate::bvh::Bvh,
+        // Unused since the DXR pipeline stopped uploading the software BVH
+        // (SceneGpu sw_bvh: None); kept so the call sites stay uniform.
+        _bvh: &crate::bvh::Bvh,
+        rw: u32,
+        rh: u32,
+        gbuf: bool,
         debug: bool,
     ) -> Result<()> {
         if self.dxr.is_some() {
             return Ok(());
         }
-        let mut d = dxr::DxrGpu::new(
-            &self.d3d.device,
-            dxc,
-            scene,
-            bvh,
-            self.d3d.width,
-            self.d3d.height,
-            debug,
-        )?;
-        let mut rec = Ok(());
-        self.d3d.run_once(|l| rec = d.scene.record_upload(l))?;
-        rec?;
-        d.scene.free_staging();
+        let dev = self.d3d.device.clone();
+        let mut d = dxr::DxrGpu::new(&dev, dxc, scene, rw, rh, gbuf, debug, &mut self.d3d)?;
+        if gbuf {
+            self.wire_session_feed(rw, rh, |kind, targets| d.wire_feed(&dev, kind, targets))?;
+        }
         self.passes.create_srv(
             &self.d3d.device,
             &d.hdr,
@@ -746,6 +864,159 @@ impl GpuContext {
         };
         let output = d.hdr.clone();
         self.read_hdr_output(output)
+    }
+
+    /// DLSS-RR fed by the DXR pipeline (the `--dxr` default in a DLSS
+    /// session): one command list = DispatchRays -> feed (pack -> the 7 SL
+    /// input planes) -> the SL sequence -> tonemap(SRV_SLOT_RR) -> present.
+    /// The whole list executes on the session queue, which IS the SL proxy
+    /// queue whenever RR is live — the present_trace_rr contract verbatim;
+    /// record_frame's trailing global UAV barrier fences the pack + accum
+    /// for the feed.
+    pub fn present_dxr_rr(
+        &mut self,
+        p: &trace::FrameParams,
+        fc: &dlss::FrameConstants,
+        frame_idx: u32,
+    ) -> Result<()> {
+        crate::zone!("present-dxr-rr");
+        if self.dxr.is_none() || self.sl.is_none() || self.rr.is_none() {
+            return Err("DXR pipeline + DLSS-RR not both initialized".into());
+        }
+        let slot = self.d3d.begin_frame()?;
+        {
+            let d3d = &mut self.d3d;
+            let d = self.dxr.as_ref().unwrap();
+            // The session res is fixed at init; fc must agree (it drives the
+            // extent tags SL derives the ratio from).
+            if (fc.rw as u32, fc.rh as u32) != (d.rw, d.rh) {
+                d3d.abort_frame();
+                return Err(format!(
+                    "frame constants {}x{} != DXR res {}x{}",
+                    fc.rw, fc.rh, d.rw, d.rh
+                ));
+            }
+            d.write_cb(slot, p);
+            if let Err(e) = d.record_frame(&d3d.list, slot) {
+                d3d.abort_frame();
+                return Err(e);
+            }
+            if let Err(e) = d.record_feed(&d3d.list, slot) {
+                d3d.abort_frame();
+                return Err(e);
+            }
+        }
+        {
+            let d3d = &mut self.d3d;
+            let sl = self.sl.as_ref().unwrap();
+            let rr = self.rr.as_ref().unwrap();
+            unsafe {
+                d3d.list.ResourceBarrier(&[transition(
+                    &rr.output,
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+            }
+            if let Err(e) = rr_sl_sequence(sl, rr, &d3d.list, fc, frame_idx) {
+                d3d.abort_frame();
+                return Err(e);
+            }
+            unsafe {
+                d3d.list.ResourceBarrier(&[transition(
+                    &rr.output,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                )]);
+            }
+        }
+        // The tonemap pass re-binds root sig/PSO/heaps/viewport from scratch —
+        // the post-evaluate state restore eDisableCLStateTracking makes the
+        // host's responsibility.
+        self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_RR, 1.0);
+        self.d3d.end_frame(slot)
+    }
+
+    /// XeSS-SR fed by the DXR pipeline (`--dxr --xess`): DispatchRays ->
+    /// feed -> XeSS upscale -> tonemap(SRV_SLOT_XESS) -> present — the
+    /// present_trace_xess chain minus the NPPD split (NPPD stays a
+    /// wavefront-session composition).
+    pub fn present_dxr_xess(
+        &mut self,
+        p: &trace::FrameParams,
+        jitter: (f32, f32),
+        reset: bool,
+    ) -> Result<()> {
+        crate::zone!("present-dxr-xess");
+        if self.dxr.is_none() || self.xess.is_none() {
+            return Err("DXR pipeline + XeSS not both initialized".into());
+        }
+        let slot = self.d3d.begin_frame()?;
+        {
+            let d3d = &mut self.d3d;
+            let d = self.dxr.as_ref().unwrap();
+            d.write_cb(slot, p);
+            if let Err(e) = d.record_frame(&d3d.list, slot) {
+                d3d.abort_frame();
+                return Err(e);
+            }
+            if let Err(e) = d.record_feed(&d3d.list, slot) {
+                d3d.abort_frame();
+                return Err(e);
+            }
+        }
+        {
+            let d3d = &mut self.d3d;
+            let d = self.dxr.as_ref().unwrap();
+            let x = self.xess.as_ref().unwrap();
+            unsafe {
+                d3d.list.ResourceBarrier(&[transition(
+                    &x.res.output,
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+            }
+            let (c, m, dep) = x.res.input_ptrs();
+            let params = crate::xess::XessD3d12ExecuteParams {
+                color_texture: c,
+                velocity_texture: m,
+                depth_texture: dep,
+                exposure_scale_texture: std::ptr::null_mut(),
+                responsive_pixel_mask_texture: std::ptr::null_mut(),
+                output_texture: x.res.output.as_raw(),
+                jitter_offset_x: crate::xess::JITTER_SIGN * jitter.0,
+                jitter_offset_y: crate::xess::JITTER_SIGN * jitter.1,
+                exposure_scale: 1.0,
+                reset_history: reset as u32,
+                input_width: d.rw,
+                input_height: d.rh,
+                input_color_base: Default::default(),
+                input_motion_vector_base: Default::default(),
+                input_depth_base: Default::default(),
+                input_responsive_mask_base: Default::default(),
+                reserved0: Default::default(),
+                output_color_base: Default::default(),
+                descriptor_heap: std::ptr::null_mut(),
+                descriptor_heap_offset: 0,
+            };
+            {
+                let _ev = pix::scope(&d3d.list, c"xess-eval");
+                if let Err(e) = x.ctx.execute(d3d.list.as_raw(), &params) {
+                    d3d.abort_frame();
+                    return Err(e);
+                }
+            }
+            unsafe {
+                d3d.list.ResourceBarrier(&[transition(
+                    &x.res.output,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                )]);
+            }
+        }
+        // The tonemap pass re-binds root sig/PSO/heaps/viewport from scratch,
+        // restoring whatever list state the XeSS dispatch left behind.
+        self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_XESS, 1.0);
+        self.d3d.end_frame(slot)
     }
 
     /// Whether the GPU-resident NPPD stage came up (`--gpu --nppd`; the J

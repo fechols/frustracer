@@ -3,12 +3,13 @@
 //! an AMD (RDNA4) one, so we enumerate explicitly with a vendor preference
 //! instead of trusting adapter 0.
 
-use windows::core::Result;
+use windows::core::{Interface, Result};
 use windows::Win32::Foundation::LUID;
 use windows::Win32::Graphics::Dxgi::*;
 
 const VENDOR_NVIDIA: u32 = 0x10DE;
 const VENDOR_AMD: u32 = 0x1002;
+const VENDOR_INTEL: u32 = 0x8086;
 
 /// Which vendor's best-VRAM adapter to prefer (never a hard requirement —
 /// the caller's feature-support probe is the real gate; a wrong-vendor pick
@@ -17,6 +18,7 @@ const VENDOR_AMD: u32 = 0x1002;
 pub enum Prefer {
     Nvidia,
     Amd,
+    Intel,
 }
 
 pub struct AdapterPick {
@@ -37,6 +39,7 @@ pub fn pick(factory: &IDXGIFactory6, prefer: Prefer) -> std::result::Result<Adap
     let want = match prefer {
         Prefer::Nvidia => VENDOR_NVIDIA,
         Prefer::Amd => VENDOR_AMD,
+        Prefer::Intel => VENDOR_INTEL,
     };
     let mut best: Option<(IDXGIAdapter4, DXGI_ADAPTER_DESC3)> = None;
     let mut fallback: Option<(IDXGIAdapter4, DXGI_ADAPTER_DESC3)> = None;
@@ -79,4 +82,20 @@ pub fn pick(factory: &IDXGIFactory6, prefer: Prefer) -> std::result::Result<Adap
 pub fn create_factory(debug: bool) -> Result<IDXGIFactory6> {
     let flags = if debug { DXGI_CREATE_FACTORY_DEBUG } else { DXGI_CREATE_FACTORY_FLAGS(0) };
     unsafe { CreateDXGIFactory2(flags) }
+}
+
+/// (current usage, budget) of the device's adapter's LOCAL memory segment —
+/// the scene-upload diagnostic: WDDM demotes over-budget commits silently
+/// (10-100× slowdown, no error), so init prints where it landed. Best-effort:
+/// None on any failure.
+pub fn vram_info(
+    device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+) -> Option<(u64, u64)> {
+    let factory: IDXGIFactory4 = create_factory(false).ok()?.cast().ok()?;
+    let luid = unsafe { device.GetAdapterLuid() };
+    let adapter: IDXGIAdapter3 = unsafe { factory.EnumAdapterByLuid(luid) }.ok()?;
+    let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+    unsafe { adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut info) }
+        .ok()?;
+    Some((info.CurrentUsage, info.Budget))
 }

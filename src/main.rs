@@ -5,6 +5,7 @@ mod dlss;
 // Regeneration — pure CPU, feeds --check-fsr; the GPU seam is gpu/ffx*.
 mod fsr;
 mod frustum;
+mod gltf_loader;
 mod hemi;
 // The presentation stack (D3D12 + Streamline) is Windows-only; everything
 // headless (--check, --check-dlss) stays cross-platform.
@@ -12,6 +13,7 @@ mod hemi;
 mod gpu;
 #[cfg(windows)]
 mod input;
+mod matclass;
 // OIDN loads its DLLs through the Win32 loader; the denoiser itself is
 // CPU/GPU-agnostic but the SDK drop and load path here are Windows-only.
 #[cfg(windows)]
@@ -23,6 +25,7 @@ mod overlay;
 mod render;
 mod reproject;
 mod scene;
+mod scene_cache;
 mod shade;
 mod shaft;
 mod sphcell;
@@ -30,6 +33,7 @@ mod stats;
 mod prof;
 mod replay;
 mod temporal;
+mod texture;
 // The loader half is Windows-only (LoadLibrary); the FFI structs, depth
 // encoding, and the dynamic-res controller are pure and feed --check-xess.
 mod xess;
@@ -112,6 +116,12 @@ pub struct Opts {
     pub fsr3: bool,
     /// Directory holding amd_fidelityfx_loader_dx12.dll + the provider DLLs.
     pub ffx_path: String,
+    /// Explicit GPU adapter vendor preference (--prefer-nvidia /
+    /// --prefer-intel / --prefer-amd). None = the mode default (AMD for
+    /// --fsr, NVIDIA otherwise). A preference, not a requirement: the
+    /// feature-support probes still gate, so e.g. DLSS on a non-NVIDIA pick
+    /// logs and falls back rather than erroring.
+    pub prefer: Option<gpu::adapter::Prefer>,
     /// Start XeSS mode with the OIDN denoise placed AFTER the upscale
     /// (requires --xess; N cycles placement at runtime).
     pub oidn_post: bool,
@@ -166,6 +176,10 @@ pub struct Opts {
     pub pix_markers: bool,
     /// Directory holding WinPixEventRuntime.dll.
     pub pix_path: String,
+    /// V-sync'd presentation (default on). `--no-vsync` presents at sync
+    /// interval 0 on a tearing swapchain so interactive frame times measure
+    /// the renderer, not the monitor refresh.
+    pub vsync: bool,
 }
 
 /// OIDN placement in XeSS mode (N cycles off → pre → post). Pre denoises the
@@ -247,6 +261,7 @@ fn main() {
             )
             .to_string()
         }),
+        prefer: None,
         oidn_post: false,
         xess_autoexposure: false,
         adaptive: true,
@@ -265,6 +280,7 @@ fn main() {
         pix_path: std::env::var("FRUSTRACER_PIX_PATH").unwrap_or_else(|_| {
             concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\pix\bin\x64").to_string()
         }),
+        vsync: true,
     };
     let mut check_dlss = false;
     let mut dlss_dump = false;
@@ -279,6 +295,8 @@ fn main() {
     let mut check_gpu = false;
     let mut check_dxr = false;
     let mut stress: Option<usize> = None;
+    let mut tile: Option<(u32, u32)> = None;
+    let mut cam_override: Option<Camera> = None;
     let mut spin: Option<String> = None;
     let mut spin_frames = 2000u32;
     let mut args = std::env::args().skip(1);
@@ -386,6 +404,8 @@ fn main() {
                         std::process::exit(2);
                     });
             }
+            "--no-vsync" => opts.vsync = false,
+            "--vsync" => opts.vsync = true,
             "--pix-markers" => opts.pix_markers = true,
             "--pix-path" => {
                 opts.pix_path = args.next().unwrap_or_else(|| {
@@ -457,6 +477,9 @@ fn main() {
                     std::process::exit(2);
                 })
             }
+            "--prefer-nvidia" => opts.prefer = Some(gpu::adapter::Prefer::Nvidia),
+            "--prefer-intel" => opts.prefer = Some(gpu::adapter::Prefer::Intel),
+            "--prefer-amd" => opts.prefer = Some(gpu::adapter::Prefer::Amd),
             "--gpu-debug" => opts.gpu_debug = true,
             "--sl-path" => {
                 opts.sl_path = args.next().unwrap_or_else(|| {
@@ -475,9 +498,44 @@ fn main() {
                         }),
                 )
             }
+            "--tile" => {
+                let spec = args.next().unwrap_or_default();
+                let (x, z) = match spec.split_once('x') {
+                    Some((a, b)) => (a.trim().parse().ok(), b.trim().parse().ok()),
+                    None => {
+                        let n: Option<u32> = spec.trim().parse().ok();
+                        (n, n)
+                    }
+                };
+                tile = match (x, z) {
+                    (Some(x), Some(z)) if x >= 1 && z >= 1 => Some((x, z)),
+                    _ => {
+                        eprintln!("--tile needs a grid, e.g. --tile 3 or --tile 4x2");
+                        std::process::exit(2);
+                    }
+                };
+            }
+            "--cam" => {
+                let parts: Vec<f32> = args
+                    .next()
+                    .map(|s| s.split(',').filter_map(|v| v.trim().parse().ok()).collect())
+                    .unwrap_or_default();
+                if parts.len() != 6 {
+                    eprintln!("--cam needs ex,ey,ez,tx,ty,tz (6 numbers), e.g. --cam 4,2,4,0,1,0");
+                    std::process::exit(2);
+                }
+                cam_override = Some(Camera::look_at(
+                    Vec3A::new(parts[0], parts[1], parts[2]),
+                    Vec3A::new(parts[3], parts[4], parts[5]),
+                    55f32.to_radians(),
+                ));
+            }
             "--help" | "-h" => {
-                eprintln!("usage: frustracer [model.obj] [--stress <n>] [--check] [--check-dlss] [--dlss-dump] [--no-dlss] [--check-oidn] [--oidn-dump] [--oidn] [--check-xess] [--xess-dump] [--xess] [--lock-res <r>] [--gpu-debug] [--sl-path <dir>] [--oidn-path <dir>] [--oidn-device <d>] [--xess-path <dir>]");
+                eprintln!("usage: frustracer [model.obj|.gltf|.glb] [--stress <n>] [--check] [--check-dlss] [--dlss-dump] [--no-dlss] [--check-oidn] [--oidn-dump] [--oidn] [--check-xess] [--xess-dump] [--xess] [--lock-res <r>] [--gpu-debug] [--sl-path <dir>] [--oidn-path <dir>] [--oidn-device <d>] [--xess-path <dir>]");
                 eprintln!("  --stress <n>  procedural stress field of n objects (perf test; composes with --check)");
+                eprintln!("  --tile <n|nxm>  replicate a loaded OBJ scene into an n×n (or n×m) grid of copies —");
+                eprintln!("                flattened geometry, shared materials/textures (composes with --check)");
+                eprintln!("  --cam <e,t>   start camera: ex,ey,ez,tx,ty,tz (reproducible benchmark viewpoints)");
                 eprintln!("  --check       headless: verify hybrid vs reference, benchmark, write check.png");
                 eprintln!("  --check-dlss  headless: G-buffer MV/depth/matrix self-test (no GPU needed)");
                 eprintln!("  --dlss-dump   --check-dlss plus G-buffer PNG dumps (albedo/spec_albedo/normal/misc/mv)");
@@ -523,6 +581,10 @@ fn main() {
                 eprintln!("  --lock-res    DLSS/XeSS render res: quality|balanced|performance|ultra-performance|native,");
                 eprintln!("                a ratio in (0, 1], or dynamic (the step-wise DRS controller); default quality (2/3)");
                 eprintln!("  --xess-path   XeSS DLL directory (default: SDKs\\XeSS-SDK\\bin)");
+                eprintln!("  --prefer-nvidia | --prefer-intel | --prefer-amd");
+                eprintln!("                pick that vendor's adapter for the D3D12 device (default NVIDIA, or AMD");
+                eprintln!("                with --fsr; a preference, not a requirement — features the picked GPU");
+                eprintln!("                can't support fall back with a log line)");
                 eprintln!("  --gpu-debug   D3D12 debug layer + verbose Streamline logging");
                 eprintln!("  --sl-path     Streamline DLL directory (default: SDKs\\streamline-sdk\\bin\\x64)");
                 return;
@@ -533,6 +595,10 @@ fn main() {
 
     if obj.is_some() && stress.is_some() {
         eprintln!("--stress and an OBJ path are mutually exclusive — pick one scene source");
+        std::process::exit(2);
+    }
+    if tile.is_some() && obj.is_none() {
+        eprintln!("--tile needs a loaded model to replicate — pass an OBJ path");
         std::process::exit(2);
     }
     if opts.nppd && !opts.xess && !no_xess_explicit {
@@ -601,33 +667,106 @@ fn main() {
     gpu::pix::init(&opts.pix_path, opts.pix_markers);
 
     eprintln!("frustracer — loading scene...");
+    let mut tile_fh: Option<f32> = None;
+    // A cache hit hands back the untiled scene's BVH too; tiling replicates
+    // the geometry, so the tiled BVH is always a fresh (parallel) build.
+    let mut prebuilt: Option<bvh::Bvh> = None;
     let scene = match (&obj, stress) {
-        (Some(p), _) => scene::load_obj_scene(p),
+        (Some(p), _) => {
+            let resolved = scene::resolve_scene_path(p);
+            // Extension sniff: .gltf/.glb take the glTF loader, everything
+            // else the OBJ path — reusing the positional arg inherits the
+            // exclusivity checks, default camera, structural-skip predicate,
+            // and --tile. glTF scenes SKIP the sidecar cache: its texture
+            // table stores re-decodable file paths, and glTF images live
+            // inside GLB buffer views / data URIs (a cache hit would come
+            // back with 1x1 white textures).
+            let lower = resolved.to_ascii_lowercase();
+            let is_gltf = lower.ends_with(".gltf") || lower.ends_with(".glb");
+            let cached = if is_gltf { None } else { scene_cache::try_load(&resolved) };
+            let (s, b) = match cached {
+                Some((s, b)) => (s, Some(b)),
+                None => {
+                    let s = if is_gltf {
+                        gltf_loader::load_gltf_scene(&resolved)
+                    } else {
+                        scene::load_obj_scene(&resolved)
+                    };
+                    // Under --tile the untiled build's ONLY use is feeding
+                    // the cache store (the tiled BVH is always a fresh
+                    // build) — and glTF skips the cache, so a tiled glTF
+                    // run skips this build instead of discarding it.
+                    let b = if is_gltf && tile.is_some() {
+                        None
+                    } else {
+                        let b = bvh::Bvh::build(&s);
+                        if !is_gltf {
+                            scene_cache::store(&resolved, &s, &b);
+                        }
+                        Some(b)
+                    };
+                    (s, b)
+                }
+            };
+            match tile {
+                Some((tx, tz)) => {
+                    let (s, fh) = scene::tile_scene(s, tx, tz);
+                    tile_fh = Some(fh);
+                    s
+                }
+                None => {
+                    // b is always Some here: the None arm above requires
+                    // tile.is_some().
+                    prebuilt = b;
+                    s
+                }
+            }
+        }
         (None, Some(n)) => scene::stress_scene(n),
         (None, None) => scene::procedural_scene(),
     };
-    // The stress field keeps the default look direction but pulls the camera
-    // back/up to overlook the field; /8 (not the field half-extent itself)
-    // trades the nearest rows off the bottom of the frame for less sky.
-    let cam0 = match stress {
-        Some(n) => scaled_camera((scene::stress_field_half(n) / 8.0).max(1.0)),
-        None => default_camera(),
-    };
+    // The stress field (and a tiled OBJ field) keeps the default look
+    // direction but pulls the camera back/up to overlook the field; /8 (not
+    // the field half-extent itself) trades the nearest rows off the bottom of
+    // the frame for less sky.
+    let cam0 = cam_override.unwrap_or_else(|| match (stress, tile_fh) {
+        (Some(n), _) => scaled_camera((scene::stress_field_half(n) / 8.0).max(1.0)),
+        (None, Some(fh)) => scaled_camera((fh / 8.0).max(1.0)),
+        (None, None) => default_camera(),
+    });
     let t0 = Instant::now();
-    let bvh = bvh::Bvh::build(&scene);
+    let bvh = prebuilt.unwrap_or_else(|| bvh::Bvh::build(&scene));
     eprintln!(
-        "scene: {} tris | BVH: {} nodes built in {:.0} ms",
+        "scene: {} tris | BVH: {} nodes ready in {:.0} ms",
         scene.tri_count(),
         bvh.nodes.len(),
         t0.elapsed().as_secs_f64() * 1000.0
     );
+    if check {
+        // Determinism gate for the two-phase parallel build: a rebuild must
+        // be byte-identical (node order pinned across runs and thread
+        // counts — the property the scene cache and cross-run benchmarks
+        // lean on). On a cache hit this doubles as the cache-integrity gate:
+        // the loaded BVH must equal one built fresh from the loaded scene.
+        assert!(
+            bvh.identical(&bvh::Bvh::build(&scene)),
+            "BVH build is not deterministic (or the scene cache is corrupt)"
+        );
+        eprintln!("bvh: deterministic rebuild verified");
+    }
 
     if let Some(mode) = &spin {
         let code = run_spin(&scene, &bvh, cam0, mode, spin_frames, &opts);
         std::process::exit(code);
     }
+    // Must-fire structural gates are tuned to the default scene's topology —
+    // skipped for --stress AND loaded OBJ scenes (a real scene can lack the
+    // required features outright: a skyless view can't fire sky-tiles, and a
+    // dense one legitimately overflows the replay recording arena). The
+    // scene-agnostic zero-counter gates always run.
+    let structural = stress.is_none() && obj.is_none();
     if check {
-        let code = run_check(&scene, &bvh, cam0, stress.is_none());
+        let code = run_check(&scene, &bvh, cam0, structural);
         std::process::exit(code);
     }
     if check_dlss {
@@ -635,9 +774,7 @@ fn main() {
         std::process::exit(code);
     }
     if check_xess {
-        // Must-fire structural gates are tuned to the default scene's
-        // topology — skipped under --stress, mirroring run_check.
-        let code = run_check_xess(&scene, &bvh, cam0, xess_dump, stress.is_none());
+        let code = run_check_xess(&scene, &bvh, cam0, xess_dump, structural);
         std::process::exit(code);
     }
     if check_fsr {
@@ -647,7 +784,7 @@ fn main() {
     if check_gpu {
         #[cfg(windows)]
         {
-            let code = run_check_gpu(&scene, &bvh, cam0, &opts, stress.is_none());
+            let code = run_check_gpu(&scene, &bvh, cam0, &opts, structural);
             std::process::exit(code);
         }
         #[cfg(not(windows))]
@@ -671,9 +808,7 @@ fn main() {
     if check_nppd {
         #[cfg(windows)]
         {
-            // Must-fire structural gates are tuned to the default scene's
-            // topology — skipped under --stress, mirroring run_check.
-            let code = run_check_nppd(&scene, &bvh, cam0, &opts, nppd_dump, stress.is_none());
+            let code = run_check_nppd(&scene, &bvh, cam0, &opts, nppd_dump, structural);
             std::process::exit(code);
         }
         #[cfg(not(windows))]
@@ -686,9 +821,7 @@ fn main() {
     if check_oidn {
         #[cfg(windows)]
         {
-            // Must-fire structural gates are tuned to the default scene's
-            // topology — skipped under --stress, mirroring run_check.
-            let code = run_check_oidn(&scene, &bvh, cam0, &opts, oidn_dump, stress.is_none());
+            let code = run_check_oidn(&scene, &bvh, cam0, &opts, oidn_dump, structural);
             std::process::exit(code);
         }
         #[cfg(not(windows))]
@@ -731,7 +864,10 @@ fn run_check_dxr(
             return 2;
         }
     };
-    let mut hg = match gpu::trace::HeadlessGpu::new(opts.gpu_debug) {
+    let mut hg = match gpu::trace::HeadlessGpu::new(
+        opts.gpu_debug,
+        opts.prefer.unwrap_or(gpu::adapter::Prefer::Nvidia),
+    ) {
         Ok(h) => h,
         Err(e) => {
             eprintln!("check-dxr: device creation failed: {e}");
@@ -753,33 +889,23 @@ fn run_check_dxr(
     );
 
     let (gw, gh) = (800usize, 600usize);
-    let mut dg = match gpu::dxr::DxrGpu::new(
-        &hg.device,
+    let dev = hg.device.clone();
+    let dg = match gpu::dxr::DxrGpu::new(
+        &dev,
         &dxc,
         scene,
-        bvh,
         gw as u32,
         gh as u32,
+        false,
         opts.gpu_debug,
+        &mut hg,
     ) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("check-dxr: FAIL DxrGpu init (RTPSO/SBT): {e}");
+            eprintln!("check-dxr: FAIL DxrGpu init (RTPSO/SBT/scene upload): {e}");
             return 1;
         }
     };
-    {
-        let mut rec = Ok(());
-        if let Err(e) = hg.run(|l| rec = dg.scene.record_upload(l)) {
-            eprintln!("check-dxr: FAIL scene upload submit: {e}");
-            return 1;
-        }
-        if let Err(e) = rec {
-            eprintln!("check-dxr: FAIL scene upload: {e}");
-            return 1;
-        }
-        dg.scene.free_staging();
-    }
     eprintln!(
         "check-dxr: RTPSO + SBT built, scene uploaded, BLAS/TLAS built ({} tris)",
         scene.tri_count()
@@ -1040,11 +1166,564 @@ fn run_check_dxr(
         }
     }
 
+    // --- T4: the G-buffer pack under the upscaler contract ---
+    // A second pipeline with the full pack (gbuf_full), at odd dims like
+    // --check-gpu's M7: frame A (no prev), a 0.02*diag forward dolly, frame B
+    // (prev = basis A) — both fresh 1-spp DispatchRays frames with zero
+    // frame-uniform jitter. The pack is read back, unpacked into CPU GBufs,
+    // and gated by the EXACT existing dlss::mv_selftest — zero new
+    // tolerances — plus structural coverage (every px view-z > 0, sky depth
+    // far BIT-EQUAL, sky must-fire).
+    {
+        let (pw, ph) = (533usize, 400usize);
+        let dev = hg.device.clone();
+        let mut dg2 = match gpu::dxr::DxrGpu::new(
+            &dev,
+            &dxc,
+            scene,
+            pw as u32,
+            ph as u32,
+            true,
+            opts.gpu_debug,
+            &mut hg,
+        ) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("check-dxr: FAIL gbuf DxrGpu init: {e}");
+                return 1;
+            }
+        };
+        let ua = windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        let (near, far) = dlss::near_far(scene.diag);
+        let uq = Quality::upscaler_1spp();
+        let dxr_gbuf_frame = |hg: &mut gpu::trace::HeadlessGpu,
+                              dg2: &gpu::dxr::DxrGpu,
+                              basis: camera::CamBasis,
+                              prev: Option<camera::CamBasis>,
+                              frame: u32|
+         -> Result<(dlss::GBufs, Vec<f32>), String> {
+            let p = gpu::trace::FrameParams {
+                cam: basis,
+                frame,
+                accumulate: false,
+                jitter: false,
+                frame_jitter: Some((0.0, 0.0)),
+                prev_cam: prev,
+                q: uq,
+                verify: false,
+            };
+            dg2.write_cb(0, &p);
+            let mut rec = Ok(());
+            hg.run(|l| rec = dg2.record_frame(l, 0))?;
+            rec?;
+            let bytes = hg.read_buffer(&dg2.gbuf, ua, pw * ph * 64)?;
+            let tb = hg.read_buffer(&dg2.tbuf, ua, pw * ph * 4)?;
+            let t: Vec<f32> =
+                tb.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+            Ok((unpack_gbuf_bytes(&bytes, pw, ph), t))
+        };
+        let basis_a = cam0.basis(pw, ph);
+        let mut cam_b = cam0;
+        cam_b.pos += cam0.forward() * (0.02 * scene.diag);
+        let basis_b = cam_b.basis(pw, ph);
+        let (ga, ta) = match dxr_gbuf_frame(&mut hg, &dg2, basis_a, None, 0) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("check-dxr: FAIL gbuf frame A: {e}");
+                return 1;
+            }
+        };
+        let (gb2, tb2) = match dxr_gbuf_frame(&mut hg, &dg2, basis_b, Some(basis_a), 1) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("check-dxr: FAIL gbuf frame B: {e}");
+                return 1;
+            }
+        };
+        let loadz = |g: &dlss::GBufs, i: usize| {
+            f32::from_bits(g.depth[i].load(std::sync::atomic::Ordering::Relaxed))
+        };
+        let (mut bad_z, mut sky_off, mut skies) = (0usize, 0usize, 0usize);
+        for i in 0..pw * ph {
+            let z = loadz(&ga, i);
+            if !(z > 0.0) {
+                bad_z += 1;
+            }
+            if !ta[i].is_finite() {
+                skies += 1;
+                if z.to_bits() != far.to_bits() {
+                    sky_off += 1;
+                }
+            }
+        }
+        let mv_ok = dlss::mv_selftest(
+            &ga,
+            &basis_a,
+            &gb2,
+            &basis_b,
+            &dlss::cam_matrices(&cam_b, pw, ph, near, far),
+            scene.diag,
+            far,
+        );
+        eprintln!(
+            "check-dxr: gbuf pack ({pw}x{ph}): view-z<=0 {bad_z} | sky-depth-off {sky_off} (sky px {skies}) | mv/depth/matrix {}",
+            if mv_ok { "OK" } else { "FAIL" },
+        );
+        if !mv_ok || bad_z != 0 || sky_off != 0 {
+            eprintln!("check-dxr: FAIL DXR G-buffer pack gates");
+            ok = false;
+        }
+        if must_fire && skies == 0 {
+            eprintln!("check-dxr: FAIL gbuf sky gate vacuous (no sky pixels on the default scene)");
+            ok = false;
+        }
+        // Textured scenes: the pack's albedo plane vs a CPU render (the
+        // guide-chain proof; the check-gpu M7 twin).
+        if !albedo_ab_check(scene, bvh, cam0, &ga, &ta, pw, ph, "dxr") {
+            ok = false;
+        }
+
+        // --- T5: the XeSS feed over the DXR pack (frame B, still resident) ---
+        {
+            let xres = match gpu::xr::XessResources::new(
+                &hg.device,
+                pw as u32,
+                ph as u32,
+                pw as u32,
+                ph as u32,
+            ) {
+                Ok(x) => x,
+                Err(e) => {
+                    eprintln!("check-dxr: FAIL feed XessResources: {e}");
+                    return 1;
+                }
+            };
+            let pl = xres.plane_resources();
+            if let Err(e) = dg2.wire_feed(
+                &hg.device,
+                gpu::trace::FeedKind::Xess,
+                &[
+                    (gpu::trace::FEED_COLOR, pl[0].0, pl[0].1),
+                    (gpu::trace::FEED_MVEC, pl[1].0, pl[1].1),
+                    (gpu::trace::FEED_DEPTH, pl[2].0, pl[2].1),
+                ],
+            ) {
+                eprintln!("check-dxr: FAIL feed wiring: {e}");
+                return 1;
+            }
+            let mut feed_rec = Ok(());
+            if let Err(e) = hg.run(|l| feed_rec = dg2.record_feed(l, 0)) {
+                eprintln!("check-dxr: FAIL feed dispatch submit: {e}");
+                return 1;
+            }
+            if let Err(e) = feed_rec {
+                eprintln!("check-dxr: FAIL feed dispatch: {e}");
+                return 1;
+            }
+            let (depth_bytes, mvec_bytes, color_bytes) = match (
+                read_feed_tex(&mut hg, pl[2].0, pl[2].1, 4, pw, ph),
+                read_feed_tex(&mut hg, pl[1].0, pl[1].1, 4, pw, ph),
+                read_feed_tex(&mut hg, pl[0].0, pl[0].1, 8, pw, ph),
+            ) {
+                (Ok(d), Ok(m), Ok(c)) => (d, m, c),
+                _ => {
+                    eprintln!("check-dxr: FAIL feed plane readback");
+                    return 1;
+                }
+            };
+            let accum_bytes = match hg.read_buffer(&dg2.accum, ua, pw * ph * 12) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("check-dxr: FAIL accum readback: {e}");
+                    return 1;
+                }
+            };
+            if !gate_xess_feed(
+                "check-dxr",
+                pw,
+                ph,
+                &depth_bytes,
+                &mvec_bytes,
+                &color_bytes,
+                &accum_bytes,
+                &gb2,
+                &tb2,
+                near,
+                far,
+                must_fire,
+            ) {
+                ok = false;
+            }
+
+            // --- T6: the RR feed over the same pack, every plane gated ---
+            let rres = match gpu::rr::RrResources::new(
+                &hg.device,
+                (pw as u32, ph as u32),
+                (pw as u32, ph as u32),
+                (pw as u32, ph as u32),
+                pw as u32,
+                ph as u32,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("check-dxr: FAIL feed RrResources: {e}");
+                    return 1;
+                }
+            };
+            let rpl = rres.plane_resources();
+            if let Err(e) = dg2.wire_feed(
+                &hg.device,
+                gpu::trace::FeedKind::Rr,
+                &[
+                    (gpu::trace::FEED_COLOR, rpl[0].0, rpl[0].1),
+                    (gpu::trace::FEED_NR, rpl[1].0, rpl[1].1),
+                    (gpu::trace::FEED_DEPTH, rpl[2].0, rpl[2].1),
+                    (gpu::trace::FEED_MVEC, rpl[3].0, rpl[3].1),
+                    (gpu::trace::FEED_ALB, rpl[4].0, rpl[4].1),
+                    (gpu::trace::FEED_SPEC, rpl[5].0, rpl[5].1),
+                    (gpu::trace::FEED_SPECHIT, rpl[6].0, rpl[6].1),
+                ],
+            ) {
+                eprintln!("check-dxr: FAIL RR feed wiring: {e}");
+                return 1;
+            }
+            let mut rr_rec = Ok(());
+            if let Err(e) = hg.run(|l| rr_rec = dg2.record_feed(l, 0)) {
+                eprintln!("check-dxr: FAIL RR feed dispatch submit: {e}");
+                return 1;
+            }
+            if let Err(e) = rr_rec {
+                eprintln!("check-dxr: FAIL RR feed dispatch: {e}");
+                return 1;
+            }
+            let mut read_plane = |idx: usize, bpp: usize, what: &str| -> Option<Vec<u8>> {
+                match read_feed_tex(&mut hg, rpl[idx].0, rpl[idx].1, bpp, pw, ph) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        eprintln!("check-dxr: FAIL RR {what} plane readback: {e}");
+                        None
+                    }
+                }
+            };
+            let (Some(rr_color), Some(rr_nr), Some(rr_depth), Some(rr_mvec)) = (
+                read_plane(0, 8, "color"),
+                read_plane(1, 8, "normal_rough"),
+                read_plane(2, 4, "depth"),
+                read_plane(3, 4, "mvec"),
+            ) else {
+                return 1;
+            };
+            let (Some(rr_alb), Some(rr_spec), Some(rr_spechit)) = (
+                read_plane(4, 4, "albedo"),
+                read_plane(5, 4, "spec_albedo"),
+                read_plane(6, 2, "spec_hit"),
+            ) else {
+                return 1;
+            };
+            if !gate_rr_feed(
+                "check-dxr",
+                pw,
+                ph,
+                &rr_color,
+                &rr_nr,
+                &rr_depth,
+                &rr_mvec,
+                &rr_alb,
+                &rr_spec,
+                &rr_spechit,
+                &accum_bytes,
+                &gb2,
+            ) {
+                ok = false;
+            }
+        }
+    }
+
     if ok {
         println!("check-dxr: PASS (DispatchRays pipeline vs the CPU plain reference)");
         0
     } else {
         1
+    }
+}
+
+/// Unpack a GPU `GBufPx` pack readback (64 B/px, 16 f32 lanes: nr | alb+z |
+/// spec | mv) into a CPU `dlss::GBufs` so the existing CPU gates
+/// (`dlss::mv_selftest`) consume it unmodified. Shared by --check-gpu (M7)
+/// and --check-dxr (T4).
+#[cfg(windows)]
+fn unpack_gbuf_bytes(bytes: &[u8], pw: usize, ph: usize) -> dlss::GBufs {
+    let f = |i: usize| f32::from_le_bytes(bytes[i * 4..][..4].try_into().unwrap());
+    let g = dlss::GBufs::new(pw, ph);
+    for i in 0..pw * ph {
+        let b = i * 16;
+        g.write(
+            i % pw,
+            i / pw,
+            &dlss::GPixel {
+                normal: Vec3A::new(f(b), f(b + 1), f(b + 2)),
+                rough: f(b + 3),
+                diff_alb: Vec3A::new(f(b + 4), f(b + 5), f(b + 6)),
+                view_z: f(b + 7),
+                spec_alb: Vec3A::new(f(b + 8), f(b + 9), f(b + 10)),
+                spec_hit_t: f(b + 11),
+                mv: (f(b + 12), f(b + 13)),
+            },
+        );
+    }
+    g
+}
+
+/// Row-packed feed-plane readback (footprint pitch is 256-aligned); the
+/// plane rests in NON_PIXEL_SHADER_RESOURCE around the copy.
+#[cfg(windows)]
+fn read_feed_tex(
+    hg: &mut gpu::trace::HeadlessGpu,
+    tex: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    fmt: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+    bpp: usize,
+    pw: usize,
+    ph: usize,
+) -> Result<Vec<u8>, String> {
+    use gpu::d3d12::{aligned_pitch, footprint, loc_footprint, loc_subresource, transition, ReadbackBuffer};
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+    };
+    let pitch = aligned_pitch(pw * bpp);
+    let rb = ReadbackBuffer::new(&hg.device, pitch * ph)?;
+    hg.run(|l| unsafe {
+        let npsr = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        l.ResourceBarrier(&[transition(tex, npsr, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+        let fp = footprint(fmt, pw as u32, ph as u32, bpp, 0);
+        l.CopyTextureRegion(
+            &loc_footprint(&rb.resource, fp),
+            0,
+            0,
+            0,
+            &loc_subresource(tex),
+            None,
+        );
+        l.ResourceBarrier(&[transition(tex, D3D12_RESOURCE_STATE_COPY_SOURCE, npsr)]);
+    })?;
+    let mut ptr = std::ptr::null_mut();
+    unsafe { rb.resource.Map(0, None, Some(&mut ptr)) }.map_err(|e| format!("Map: {e}"))?;
+    let mut out = vec![0u8; pw * bpp * ph];
+    for y in 0..ph {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                (ptr as *const u8).add(y * pitch),
+                out.as_mut_ptr().add(y * pw * bpp),
+                pw * bpp,
+            );
+        }
+    }
+    unsafe { rb.resource.Unmap(0, None) };
+    Ok(out)
+}
+
+/// f16 bit pattern -> monotone integer (ulp distances work across the sign,
+/// unlike raw bits).
+#[cfg(windows)]
+fn mono16(b: u16) -> i32 {
+    if b & 0x8000 != 0 { -((b & 0x7fff) as i32) } else { b as i32 }
+}
+
+/// The XeSS feed gates: the depth plane vs `xess::view_z_to_clip_depth` of
+/// the pack's view-Z (hits <= 4 f32 ulp — D3D's fp32 divide is ~2.5 ulp even
+/// under `precise`; sky BIT-EQUAL 0.0 + anti-vacuity), the mvec plane vs the
+/// pack within 1 f16 ulp, the color plane vs the 1-spp accum store within
+/// 1 f16 ulp (alpha a constant 1.0). `tag` prefixes the report lines.
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn gate_xess_feed(
+    tag: &str,
+    pw: usize,
+    ph: usize,
+    depth_bytes: &[u8],
+    mvec_bytes: &[u8],
+    color_bytes: &[u8],
+    accum_bytes: &[u8],
+    gb2: &dlss::GBufs,
+    tb2: &[f32],
+    near: f32,
+    far: f32,
+    must_fire: bool,
+) -> bool {
+    let accf = |i: usize| f32::from_le_bytes(accum_bytes[i * 4..][..4].try_into().unwrap());
+    let mut ok = true;
+    let (mut d_ulp_bad, mut d_sky_bad, mut mv_ulp_bad) = (0usize, 0usize, 0usize);
+    let mut c_ulp_bad = 0usize;
+    let mut d_sky_n = 0usize;
+    let mut max_d_ulp = 0u32;
+    for i in 0..pw * ph {
+        let z = f32::from_bits(gb2.depth[i].load(Relaxed));
+        let got = f32::from_le_bytes(depth_bytes[i * 4..][..4].try_into().unwrap());
+        if !tb2[i].is_finite() {
+            // Sky: the encode must land EXACTLY on 0.0.
+            d_sky_n += 1;
+            if got.to_bits() != 0 {
+                d_sky_bad += 1;
+            }
+        } else {
+            let expect = xess::view_z_to_clip_depth(z, near, far);
+            let d = got.to_bits().abs_diff(expect.to_bits());
+            max_d_ulp = max_d_ulp.max(d);
+            // 4 ulp: division is the one op HLSL doesn't round like IEEE.
+            // Formula drift, wrong near/far, or a lost `precise` all blow
+            // past this by orders of magnitude; sky stays gated bit-equal.
+            if d > 4 {
+                d_ulp_bad += 1;
+            }
+        }
+        for ch in 0..2usize {
+            let got16 = u16::from_le_bytes(mvec_bytes[i * 4 + ch * 2..][..2].try_into().unwrap());
+            // MV storage is f16 bits — the expected texture value IS the
+            // stored word (both sides rounded the same pack f32 once);
+            // 1 ulp of typed-store latitude stays.
+            let expect16 = gb2.mvec[i * 2 + ch].load(Relaxed);
+            if (mono16(got16) - mono16(expect16)).unsigned_abs() > 1 {
+                mv_ulp_bad += 1;
+            }
+        }
+        // Color: accum's 1-spp store -> RGBA16F (typed-store RTNE matches
+        // half's, 1 ulp headroom like mvec; alpha is a constant 1.0).
+        for ch in 0..3usize {
+            let got16 = u16::from_le_bytes(color_bytes[i * 8 + ch * 2..][..2].try_into().unwrap());
+            let expect16 = half::f16::from_f32(accf(i * 3 + ch)).to_bits();
+            if (mono16(got16) - mono16(expect16)).unsigned_abs() > 1 {
+                c_ulp_bad += 1;
+            }
+        }
+        if u16::from_le_bytes(color_bytes[i * 8 + 6..][..2].try_into().unwrap())
+            != half::f16::ONE.to_bits()
+        {
+            c_ulp_bad += 1;
+        }
+    }
+    eprintln!(
+        "{tag}: xess feed ({pw}x{ph}): depth-ulp>4 {d_ulp_bad} (max {max_d_ulp}) | sky-not-0.0 {d_sky_bad} (sky px {d_sky_n}) | mvec-ulp>1 {mv_ulp_bad} | color-ulp>1 {c_ulp_bad}"
+    );
+    if d_ulp_bad != 0 || d_sky_bad != 0 || mv_ulp_bad != 0 || c_ulp_bad != 0 {
+        eprintln!("{tag}: FAIL XeSS feed gates");
+        ok = false;
+    }
+    // Anti-vacuity for the exact-zero sky encode (--stress skips).
+    if must_fire && d_sky_n == 0 {
+        eprintln!("{tag}: FAIL xess feed sky gate vacuous (no sky pixels on the default scene)");
+        ok = false;
+    }
+    ok
+}
+
+/// The RR feed gates: the linear-depth plane BIT-EQUAL to the pack's view-Z
+/// (R32F passthrough — no arithmetic, so no ulp allowance), every other
+/// plane at its storage tolerance (f16 ulp / <= 2 UNORM LSB) so a
+/// plane-order swap in either wiring table cannot pass the suite. Plane
+/// byte slices in RR plane order (color, nr, depth, mvec, alb, spec,
+/// spechit). `tag` prefixes the report lines.
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn gate_rr_feed(
+    tag: &str,
+    pw: usize,
+    ph: usize,
+    rr_color: &[u8],
+    rr_nr: &[u8],
+    rr_depth: &[u8],
+    rr_mvec: &[u8],
+    rr_alb: &[u8],
+    rr_spec: &[u8],
+    rr_spechit: &[u8],
+    accum_bytes: &[u8],
+    gb2: &dlss::GBufs,
+) -> bool {
+    let accf = |i: usize| f32::from_le_bytes(accum_bytes[i * 4..][..4].try_into().unwrap());
+    // The CPU upload's UNORM encode; the hardware typed store rounds RTNE
+    // with the spec's 0.6-ULP latitude — gate at <= 1 LSB (+1 for the f16
+    // hop, below).
+    let to_unorm8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+    let (mut rd_bad, mut rmv_bad) = (0usize, 0usize);
+    let (mut rc_bad, mut rnr_bad, mut ralb_bad, mut rsh_bad) = (0usize, 0usize, 0usize, 0usize);
+    for i in 0..pw * ph {
+        let got = u32::from_le_bytes(rr_depth[i * 4..][..4].try_into().unwrap());
+        if got != gb2.depth[i].load(Relaxed) {
+            rd_bad += 1;
+        }
+        for ch in 0..2usize {
+            let got16 = u16::from_le_bytes(rr_mvec[i * 4 + ch * 2..][..2].try_into().unwrap());
+            // f16 storage: the expected bits ARE the stored word.
+            let expect16 = gb2.mvec[i * 2 + ch].load(Relaxed);
+            if (mono16(got16) - mono16(expect16)).unsigned_abs() > 1 {
+                rmv_bad += 1;
+            }
+        }
+        for ch in 0..3usize {
+            let got16 = u16::from_le_bytes(rr_color[i * 8 + ch * 2..][..2].try_into().unwrap());
+            let expect16 = half::f16::from_f32(accf(i * 3 + ch)).to_bits();
+            if (mono16(got16) - mono16(expect16)).unsigned_abs() > 1 {
+                rc_bad += 1;
+            }
+            // RGBA8 albedo/spec-albedo vs the CPU encode. <= 2 LSB: the CPU
+            // reference is double-rounded (pack f32 -> f16 storage ->
+            // unorm8) while the GPU feed converts the pack f32 to unorm8
+            // directly — the f16 hop can move a value across a *.5 rounding
+            // boundary (1 LSB), on top of the typed store's own 0.6-ULP
+            // latitude (1 LSB).
+            let a = rr_alb[i * 4 + ch];
+            let ea = to_unorm8(dlss::ld16(&gb2.diff_alb[i * 3 + ch]));
+            let s = rr_spec[i * 4 + ch];
+            let es = to_unorm8(dlss::ld16(&gb2.spec_alb[i * 3 + ch]));
+            if a.abs_diff(ea) > 2 || s.abs_diff(es) > 2 {
+                ralb_bad += 1;
+            }
+        }
+        for ch in 0..4usize {
+            let got16 = u16::from_le_bytes(rr_nr[i * 8 + ch * 2..][..2].try_into().unwrap());
+            let expect16 = gb2.normal_rough[i * 4 + ch].load(Relaxed);
+            if (mono16(got16) - mono16(expect16)).unsigned_abs() > 1 {
+                rnr_bad += 1;
+            }
+        }
+        let got16 = u16::from_le_bytes(rr_spechit[i * 2..][..2].try_into().unwrap());
+        let expect16 = gb2.spec_hit_t[i].load(Relaxed);
+        if (mono16(got16) - mono16(expect16)).unsigned_abs() > 1 {
+            rsh_bad += 1;
+        }
+    }
+    eprintln!(
+        "{tag}: rr feed ({pw}x{ph}): depth-not-bit-equal {rd_bad} | mvec-ulp>1 {rmv_bad} | color-ulp>1 {rc_bad} | nr-ulp>1 {rnr_bad} | alb-lsb>2 {ralb_bad} | spechit-ulp>1 {rsh_bad}"
+    );
+    if rd_bad != 0 || rmv_bad != 0 || rc_bad != 0 || rnr_bad != 0 || ralb_bad != 0 || rsh_bad != 0 {
+        eprintln!("{tag}: FAIL RR feed gates");
+        return false;
+    }
+    true
+}
+
+/// The locked per-session render resolution for a GPU-driven upscaler
+/// composition (`--gpu` and `--dxr` — no DRS on either path): quantize the
+/// resolved `--lock-res` scale into the wired upscaler's queried input
+/// range. `fallback` answers a missing range — and, for RR
+/// (`quantize_degenerate = false`), a degenerate opt == min == max range
+/// too (the SDK's "DRS off" signal; the fallback is the optimal/DLAA res).
+/// XeSS's queried range is always real, so its arm quantizes whenever the
+/// query succeeded (`quantize_degenerate = true`).
+#[cfg(windows)]
+fn locked_render_res(
+    lock: f32,
+    range: Option<((u32, u32), (u32, u32), (u32, u32))>,
+    win: (usize, usize),
+    fallback: (usize, usize),
+    quantize_degenerate: bool,
+) -> (usize, usize) {
+    match range {
+        Some((_, min, max)) if quantize_degenerate || min != max => xess::quantize_res(
+            lock,
+            win,
+            (min.0 as usize, min.1 as usize),
+            (max.0 as usize, max.1 as usize),
+        ),
+        _ => fallback,
     }
 }
 
@@ -1067,7 +1746,10 @@ fn run_check_gpu(
             return 2;
         }
     };
-    let mut hg = match gpu::trace::HeadlessGpu::new(opts.gpu_debug) {
+    let mut hg = match gpu::trace::HeadlessGpu::new(
+        opts.gpu_debug,
+        opts.prefer.unwrap_or(gpu::adapter::Prefer::Nvidia),
+    ) {
         Ok(h) => h,
         Err(e) => {
             eprintln!("check-gpu: device creation failed: {e}");
@@ -1100,8 +1782,9 @@ fn run_check_gpu(
     // hardware watertight triangle intersection differs from moller_trumbore
     // at edges/grazing, and the RNG streams differ by design.
     let (gw, gh) = (800usize, 600usize);
-    let mut tg = match gpu::trace::TraceGpu::new(
-        &hg.device,
+    let dev = hg.device.clone();
+    let tg = match gpu::trace::TraceGpu::new(
+        &dev,
         &dxc,
         scene,
         bvh,
@@ -1110,6 +1793,7 @@ fn run_check_gpu(
         false, // no pack: the M7-M9 gbuf/feed gates build their own tracer
         false,
         opts.gpu_debug,
+        &mut hg,
     ) {
         Ok(t) => t,
         Err(e) => {
@@ -1117,18 +1801,6 @@ fn run_check_gpu(
             return 1;
         }
     };
-    {
-        let mut rec = Ok(());
-        if let Err(e) = hg.run(|l| rec = tg.scene.record_upload(l)) {
-            eprintln!("check-gpu: FAIL scene upload submit: {e}");
-            return 1;
-        }
-        if let Err(e) = rec {
-            eprintln!("check-gpu: FAIL scene upload: {e}");
-            return 1;
-        }
-        tg.scene.free_staging();
-    }
     eprintln!("check-gpu: scene uploaded, BLAS/TLAS built ({} tris)", scene.tri_count());
 
     let q = Quality::preset(2);
@@ -1390,7 +2062,7 @@ fn run_check_gpu(
         read_f32(&mut hg, &tg.tbuf, px),
         read_u32(&mut hg, &tg.info, px),
         read_f32(&mut hg, &tg.accum, px * 3),
-        read_u32(&mut hg, &tg.counters, 16),
+        read_u32(&mut hg, &tg.counters, gpu::trace::CTR_COUNT as usize),
     ) {
         (Ok(a), Ok(b), Ok(c), Ok(d)) => (a, b, c, d),
         _ => {
@@ -1451,6 +2123,24 @@ fn run_check_gpu(
     );
     if ctrs[gpu::trace::CTR_OVERFLOW as usize] != 0 {
         eprintln!("check-gpu: FAIL queue overflow (queues are sized to the structural worst case)");
+        ok = false;
+    }
+    // Alpha-cutout anti-vacuity: an alpha-masked scene's wavefront frame
+    // must actually reject candidates, or the cutout path is dead code
+    // (scene-derived, independent of `structural`). Caveat: a custom --cam
+    // pose whose view contains no masked geometry would trip this — the
+    // CLAUDE.md canopy-caveat class; the default OBJ poses see foliage.
+    let alpha_rej = ctrs[gpu::trace::CTR_ALPHA_REJ as usize];
+    if scene.any_alpha {
+        eprintln!("check-gpu: alpha-cutout rejections: {alpha_rej}");
+        if alpha_rej == 0 {
+            eprintln!("check-gpu: FAIL alpha-masked scene rejected 0 candidates (cutout must fire)");
+            ok = false;
+        }
+    } else if alpha_rej != 0 {
+        eprintln!(
+            "check-gpu: FAIL {alpha_rej} alpha rejections on an opaque scene (ALPHA_CUTOUT must be compiled out)"
+        );
         ok = false;
     }
     if dangling != 0 {
@@ -1771,8 +2461,9 @@ fn run_check_gpu(
     // tolerances. Odd render dims mirror --check-xess's odd-dimension sweep.
     {
         let (pw, ph) = (533usize, 400usize);
+        let dev = hg.device.clone();
         let mut ptg = match gpu::trace::TraceGpu::new(
-            &hg.device,
+            &dev,
             &dxc,
             scene,
             bvh,
@@ -1781,6 +2472,7 @@ fn run_check_gpu(
             true,
             true, // + the NPPD staging buffers/kernels (M10 gates them)
             opts.gpu_debug,
+            &mut hg,
         ) {
             Ok(t) => t,
             Err(e) => {
@@ -1788,14 +2480,6 @@ fn run_check_gpu(
                 return 1;
             }
         };
-        {
-            let mut rec = Ok(());
-            if hg.run(|l| rec = ptg.scene.record_upload(l)).is_err() || rec.is_err() {
-                eprintln!("check-gpu: FAIL gbuf scene upload");
-                return 1;
-            }
-            ptg.scene.free_staging();
-        }
         let (near, far) = dlss::near_far(scene.diag);
         let uq = Quality::upscaler_1spp();
         // One fresh 1-spp wavefront frame at the upscaler contract
@@ -1823,25 +2507,7 @@ fn run_check_gpu(
             let tb = hg.read_buffer(&ptg.tbuf, ua, pw * ph * 4)?;
             let t: Vec<f32> =
                 tb.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
-            let f = |i: usize| f32::from_le_bytes(bytes[i * 4..][..4].try_into().unwrap());
-            let g = dlss::GBufs::new(pw, ph);
-            for i in 0..pw * ph {
-                let b = i * 16; // 16 f32 per GBufPx (nr | alb_z | spec | mv)
-                g.write(
-                    i % pw,
-                    i / pw,
-                    &dlss::GPixel {
-                        normal: Vec3A::new(f(b), f(b + 1), f(b + 2)),
-                        rough: f(b + 3),
-                        diff_alb: Vec3A::new(f(b + 4), f(b + 5), f(b + 6)),
-                        view_z: f(b + 7),
-                        spec_alb: Vec3A::new(f(b + 8), f(b + 9), f(b + 10)),
-                        spec_hit_t: f(b + 11),
-                        mv: (f(b + 12), f(b + 13)),
-                    },
-                );
-            }
-            Ok((g, t))
+            Ok((unpack_gbuf_bytes(&bytes, pw, ph), t))
         };
         let basis_a = cam0.basis(pw, ph);
         let mut cam_b = cam0;
@@ -1898,6 +2564,11 @@ fn run_check_gpu(
             eprintln!("check-gpu: FAIL gbuf sky gate vacuous (no sky pixels on the default scene)");
             ok = false;
         }
+        // Textured scenes: the pack's albedo plane vs a CPU render (the
+        // guide-chain proof — RR/XeSS/FSR/NPPD all read this plane).
+        if !albedo_ab_check(scene, bvh, cam0, &ga, &ta, pw, ph, "gpu") {
+            ok = false;
+        }
 
         // --- M8: the XeSS feed kernel — depth-encode + mvec plumbing gates ---
         // Wire a headless XessResources' planes as feed targets, run the feed
@@ -1908,13 +2579,6 @@ fn run_check_gpu(
         // exact-zero numerator), the mvec plane vs the pack's mv within
         // 1 f16 ulp (plumbing + f16-rounding proof).
         {
-            use gpu::d3d12::{
-                aligned_pitch, footprint, loc_footprint, loc_subresource, transition,
-                ReadbackBuffer,
-            };
-            use windows::Win32::Graphics::Direct3D12::{
-                D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-            };
             let xres = match gpu::xr::XessResources::new(
                 &hg.device,
                 pw as u32,
@@ -1950,59 +2614,21 @@ fn run_check_gpu(
                 eprintln!("check-gpu: FAIL feed dispatch: {e}");
                 return 1;
             }
-            // Row-packed texture readback (footprint pitch is 256-aligned).
-            let read_tex = |hg: &mut gpu::trace::HeadlessGpu,
-                                tex: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
-                                fmt,
-                                bpp: usize|
-             -> Result<Vec<u8>, String> {
-                let pitch = aligned_pitch(pw * bpp);
-                let rb = ReadbackBuffer::new(&hg.device, pitch * ph)?;
-                hg.run(|l| unsafe {
-                    let npsr = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-                    l.ResourceBarrier(&[transition(tex, npsr, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
-                    let fp = footprint(fmt, pw as u32, ph as u32, bpp, 0);
-                    l.CopyTextureRegion(
-                        &loc_footprint(&rb.resource, fp),
-                        0,
-                        0,
-                        0,
-                        &loc_subresource(tex),
-                        None,
-                    );
-                    l.ResourceBarrier(&[transition(tex, D3D12_RESOURCE_STATE_COPY_SOURCE, npsr)]);
-                })?;
-                let mut ptr = std::ptr::null_mut();
-                unsafe { rb.resource.Map(0, None, Some(&mut ptr)) }
-                    .map_err(|e| format!("Map: {e}"))?;
-                let mut out = vec![0u8; pw * bpp * ph];
-                for y in 0..ph {
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            (ptr as *const u8).add(y * pitch),
-                            out.as_mut_ptr().add(y * pw * bpp),
-                            pw * bpp,
-                        );
-                    }
-                }
-                unsafe { rb.resource.Unmap(0, None) };
-                Ok(out)
-            };
-            let depth_bytes = match read_tex(&mut hg, pl[2].0, pl[2].1, 4) {
+            let depth_bytes = match read_feed_tex(&mut hg, pl[2].0, pl[2].1, 4, pw, ph) {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!("check-gpu: FAIL depth plane readback: {e}");
                     return 1;
                 }
             };
-            let mvec_bytes = match read_tex(&mut hg, pl[1].0, pl[1].1, 4) {
+            let mvec_bytes = match read_feed_tex(&mut hg, pl[1].0, pl[1].1, 4, pw, ph) {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!("check-gpu: FAIL mvec plane readback: {e}");
                     return 1;
                 }
             };
-            let color_bytes = match read_tex(&mut hg, pl[0].0, pl[0].1, 8) {
+            let color_bytes = match read_feed_tex(&mut hg, pl[0].0, pl[0].1, 8, pw, ph) {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!("check-gpu: FAIL color plane readback: {e}");
@@ -2020,80 +2646,20 @@ fn run_check_gpu(
                     return 1;
                 }
             };
-            let accf = |i: usize| {
-                f32::from_le_bytes(accum_bytes[i * 4..][..4].try_into().unwrap())
-            };
-            // f16 bit pattern -> monotone integer (ulp distances work across
-            // the sign, unlike raw bits).
-            let mono16 = |b: u16| -> i32 {
-                if b & 0x8000 != 0 { -((b & 0x7fff) as i32) } else { b as i32 }
-            };
-            let loadf = |g: &[AtomicU32], i: usize| f32::from_bits(g[i].load(Relaxed));
-            let (mut d_ulp_bad, mut d_sky_bad, mut mv_ulp_bad) = (0usize, 0usize, 0usize);
-            let mut c_ulp_bad = 0usize;
-            let mut d_sky_n = 0usize;
-            let mut max_d_ulp = 0u32;
-            for i in 0..pw * ph {
-                let z = loadf(&gb2.depth, i);
-                let got = f32::from_le_bytes(depth_bytes[i * 4..][..4].try_into().unwrap());
-                if !tb2[i].is_finite() {
-                    // Sky: the encode must land EXACTLY on 0.0.
-                    d_sky_n += 1;
-                    if got.to_bits() != 0 {
-                        d_sky_bad += 1;
-                    }
-                } else {
-                    let expect = xess::view_z_to_clip_depth(z, near, far);
-                    let d = got.to_bits().abs_diff(expect.to_bits());
-                    max_d_ulp = max_d_ulp.max(d);
-                    // 4 ulp: D3D's fp32 divide is ~2.5 ulp even under
-                    // `precise` (observed max 2 on NVIDIA) — division is the
-                    // one op HLSL doesn't round like IEEE. Formula drift,
-                    // wrong near/far, or a lost `precise` all blow past this
-                    // by orders of magnitude; sky stays gated bit-equal.
-                    if d > 4 {
-                        d_ulp_bad += 1;
-                    }
-                }
-                for ch in 0..2usize {
-                    let got16 =
-                        u16::from_le_bytes(mvec_bytes[i * 4 + ch * 2..][..2].try_into().unwrap());
-                    // MV storage is f16 bits — the expected texture value IS
-                    // the stored word (both sides rounded the same pack f32
-                    // once); 1 ulp of typed-store latitude stays.
-                    let expect16 = gb2.mvec[i * 2 + ch].load(Relaxed);
-                    if (mono16(got16) - mono16(expect16)).unsigned_abs() > 1 {
-                        mv_ulp_bad += 1;
-                    }
-                }
-                // Color: accum's 1-spp store -> RGBA16F (typed-store RTNE
-                // matches half's, 1 ulp headroom like mvec; alpha is a
-                // constant 1.0).
-                for ch in 0..3usize {
-                    let got16 = u16::from_le_bytes(
-                        color_bytes[i * 8 + ch * 2..][..2].try_into().unwrap(),
-                    );
-                    let expect16 = half::f16::from_f32(accf(i * 3 + ch)).to_bits();
-                    if (mono16(got16) - mono16(expect16)).unsigned_abs() > 1 {
-                        c_ulp_bad += 1;
-                    }
-                }
-                if u16::from_le_bytes(color_bytes[i * 8 + 6..][..2].try_into().unwrap())
-                    != half::f16::ONE.to_bits()
-                {
-                    c_ulp_bad += 1;
-                }
-            }
-            eprintln!(
-                "check-gpu: xess feed ({pw}x{ph}): depth-ulp>4 {d_ulp_bad} (max {max_d_ulp}) | sky-not-0.0 {d_sky_bad} (sky px {d_sky_n}) | mvec-ulp>1 {mv_ulp_bad} | color-ulp>1 {c_ulp_bad}"
-            );
-            if d_ulp_bad != 0 || d_sky_bad != 0 || mv_ulp_bad != 0 || c_ulp_bad != 0 {
-                eprintln!("check-gpu: FAIL XeSS feed gates");
-                ok = false;
-            }
-            // Anti-vacuity for the exact-zero sky encode (--stress skips).
-            if must_fire && d_sky_n == 0 {
-                eprintln!("check-gpu: FAIL xess feed sky gate vacuous (no sky pixels on the default scene)");
+            if !gate_xess_feed(
+                "check-gpu",
+                pw,
+                ph,
+                &depth_bytes,
+                &mvec_bytes,
+                &color_bytes,
+                &accum_bytes,
+                &gb2,
+                &tb2,
+                near,
+                far,
+                must_fire,
+            ) {
                 ok = false;
             }
 
@@ -2146,7 +2712,7 @@ fn run_check_gpu(
             // albedo(4), spec_albedo(5), spec_hit(6) — every plane gated, so
             // an order swap in either wiring table cannot pass the suite.
             let mut read_plane = |idx: usize, bpp: usize, what: &str| -> Option<Vec<u8>> {
-                match read_tex(&mut hg, rpl[idx].0, rpl[idx].1, bpp) {
+                match read_feed_tex(&mut hg, rpl[idx].0, rpl[idx].1, bpp, pw, ph) {
                     Ok(v) => Some(v),
                     Err(e) => {
                         eprintln!("check-gpu: FAIL RR {what} plane readback: {e}");
@@ -2169,68 +2735,20 @@ fn run_check_gpu(
             ) else {
                 return 1;
             };
-            // The CPU upload's UNORM encode; the hardware typed store rounds
-            // RTNE with the spec's 0.6-ULP latitude — gate at <= 1 LSB.
-            let to_unorm8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-            let (mut rd_bad, mut rmv_bad) = (0usize, 0usize);
-            let (mut rc_bad, mut rnr_bad, mut ralb_bad, mut rsh_bad) =
-                (0usize, 0usize, 0usize, 0usize);
-            for i in 0..pw * ph {
-                let got = u32::from_le_bytes(rr_depth[i * 4..][..4].try_into().unwrap());
-                if got != gb2.depth[i].load(Relaxed) {
-                    rd_bad += 1;
-                }
-                for ch in 0..2usize {
-                    let got16 =
-                        u16::from_le_bytes(rr_mvec[i * 4 + ch * 2..][..2].try_into().unwrap());
-                    // f16 storage: the expected bits ARE the stored word.
-                    let expect16 = gb2.mvec[i * 2 + ch].load(Relaxed);
-                    if (mono16(got16) - mono16(expect16)).unsigned_abs() > 1 {
-                        rmv_bad += 1;
-                    }
-                }
-                for ch in 0..3usize {
-                    let got16 = u16::from_le_bytes(
-                        rr_color[i * 8 + ch * 2..][..2].try_into().unwrap(),
-                    );
-                    let expect16 = half::f16::from_f32(accf(i * 3 + ch)).to_bits();
-                    if (mono16(got16) - mono16(expect16)).unsigned_abs() > 1 {
-                        rc_bad += 1;
-                    }
-                    // RGBA8 albedo/spec-albedo vs the CPU encode. <= 2 LSB:
-                    // the CPU reference is now double-rounded (pack f32 ->
-                    // f16 storage -> unorm8) while the GPU feed converts the
-                    // pack f32 to unorm8 directly — the f16 hop can move a
-                    // value across a *.5 rounding boundary (1 LSB), on top
-                    // of the typed store's own 0.6-ULP latitude (1 LSB).
-                    let a = rr_alb[i * 4 + ch];
-                    let ea = to_unorm8(dlss::ld16(&gb2.diff_alb[i * 3 + ch]));
-                    let s = rr_spec[i * 4 + ch];
-                    let es = to_unorm8(dlss::ld16(&gb2.spec_alb[i * 3 + ch]));
-                    if a.abs_diff(ea) > 2 || s.abs_diff(es) > 2 {
-                        ralb_bad += 1;
-                    }
-                }
-                for ch in 0..4usize {
-                    let got16 =
-                        u16::from_le_bytes(rr_nr[i * 8 + ch * 2..][..2].try_into().unwrap());
-                    let expect16 = gb2.normal_rough[i * 4 + ch].load(Relaxed);
-                    if (mono16(got16) - mono16(expect16)).unsigned_abs() > 1 {
-                        rnr_bad += 1;
-                    }
-                }
-                let got16 = u16::from_le_bytes(rr_spechit[i * 2..][..2].try_into().unwrap());
-                let expect16 = gb2.spec_hit_t[i].load(Relaxed);
-                if (mono16(got16) - mono16(expect16)).unsigned_abs() > 1 {
-                    rsh_bad += 1;
-                }
-            }
-            eprintln!(
-                "check-gpu: rr feed ({pw}x{ph}): depth-not-bit-equal {rd_bad} | mvec-ulp>1 {rmv_bad} | color-ulp>1 {rc_bad} | nr-ulp>1 {rnr_bad} | alb-lsb>2 {ralb_bad} | spechit-ulp>1 {rsh_bad}"
-            );
-            if rd_bad != 0 || rmv_bad != 0 || rc_bad != 0 || rnr_bad != 0 || ralb_bad != 0 || rsh_bad != 0
-            {
-                eprintln!("check-gpu: FAIL RR feed gates");
+            if !gate_rr_feed(
+                "check-gpu",
+                pw,
+                ph,
+                &rr_color,
+                &rr_nr,
+                &rr_depth,
+                &rr_mvec,
+                &rr_alb,
+                &rr_spec,
+                &rr_spechit,
+                &accum_bytes,
+                &gb2,
+            ) {
                 ok = false;
             }
 
@@ -2243,6 +2761,7 @@ fn run_check_gpu(
             // on hg's queue over these buffers) runs only when the runtime
             // DLLs + the exported model exist.
             {
+                use gpu::d3d12::transition;
                 let (npw, nph) = nppd::pad_dims(pw, ph);
                 let npp = npw * nph;
                 let accum_at: Vec<AtomicU32> = accum_bytes
@@ -2548,8 +3067,9 @@ fn run_check_gpu(
     // point; this is the speedometer.
     drop(tg);
     let (bw, bh) = (1920usize, 1080usize);
-    let mut btg = match gpu::trace::TraceGpu::new(
-        &hg.device,
+    let dev = hg.device.clone();
+    let btg = match gpu::trace::TraceGpu::new(
+        &dev,
         &dxc,
         scene,
         bvh,
@@ -2558,6 +3078,7 @@ fn run_check_gpu(
         false, // bench frames don't consume the pack
         false,
         opts.gpu_debug,
+        &mut hg,
     ) {
         Ok(t) => t,
         Err(e) => {
@@ -2566,15 +3087,6 @@ fn run_check_gpu(
             return 0;
         }
     };
-    {
-        let mut rec = Ok(());
-        if hg.run(|l| rec = btg.scene.record_upload(l)).is_err() || rec.is_err() {
-            eprintln!("check-gpu: bench scene upload failed; skipping bench");
-            println!("check-gpu: wavefront quadtree + hemi AO/GI OK");
-            return 0;
-        }
-        btg.scene.free_staging();
-    }
     let bbasis = cam0.basis(bw, bh);
     let mut bench = |label: &str, hybrid: bool, fb: shade::FrustumBounce| {
         let bq = Quality { fb, ..q };
@@ -3163,6 +3675,125 @@ fn run_check_dlss(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, dump: bool
 /// centers — the reconstruction in the self-test assumes centers. Shared by
 /// --check-dlss (the fixed DLSS-style resolutions) and --check-xess (a sweep
 /// of dynamic render resolutions).
+/// Textured-albedo A/B (check-gpu M7 / check-dxr T4, textured scenes only):
+/// the GPU pack's diffuse-albedo plane vs a CPU `GBufs` render at the same
+/// pose/contract, compared over class-matched hit pixels. Gates: mean |d|
+/// per channel <= 0.02 (hardware sRGB decode + bilinear filter vs the CPU
+/// LUT — precision slack, not a semantic gap) and > 64 distinct GPU albedo
+/// values (a flat-Kd regression collapses to one value per material and
+/// cannot pass). Also prints the pose's transmissive-hit pixel count (a
+/// center-ray re-trace) — the per-pose glass anti-vacuity signal, unGated
+/// because it is pose-dependent. Returns gate pass; opaque untextured
+/// scenes return true silently.
+#[cfg(windows)]
+fn albedo_ab_check(
+    scene: &scene::Scene,
+    bvh: &bvh::Bvh,
+    cam0: Camera,
+    gpu_g: &dlss::GBufs,
+    gpu_t: &[f32],
+    pw: usize,
+    ph: usize,
+    tag: &str,
+) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if scene.textures.is_empty() {
+        return true;
+    }
+    let q = Quality::upscaler_1spp();
+    let stats = Stats::default();
+    let accum: Vec<AtomicU32> = (0..pw * ph * 3).map(|_| AtomicU32::new(0)).collect();
+    let info: Vec<AtomicU32> = (0..pw * ph).map(|_| AtomicU32::new(0)).collect();
+    let tbuf: Vec<AtomicU32> = (0..pw * ph).map(|_| AtomicU32::new(0)).collect();
+    let basis = cam0.basis(pw, ph);
+    let cg = dlss::GBufs::new(pw, ph);
+    let ctx = FrameCtx {
+        scene,
+        bvh,
+        cam: basis,
+        q,
+        frame: 0,
+        jitter: false,
+        rw: pw,
+        rh: ph,
+        accum: &accum,
+        info: &info,
+        tbuf: &tbuf,
+        stats: &stats,
+        sun: render::sun_dir(scene),
+        tcache_cur: None,
+        tcache_prev: &[],
+        accumulate: false,
+        gbuf: Some(&cg),
+        fsr_buf: None,
+        prev_cam: None,
+        frame_jitter: Some((0.0, 0.0)),
+        adaptive: false,
+        hemi_share: false,
+        replay_rec: None,
+        cut_cur: None,
+        cut_prev: None,
+        discard_seeds: false,
+    };
+    render::render_frame(&ctx, true);
+
+    let mut n = 0usize;
+    let mut sum = [0.0f64; 3];
+    let mut distinct = std::collections::HashSet::new();
+    for i in 0..pw * ph {
+        let cpu_hit = f32::from_bits(tbuf[i].load(Relaxed)).is_finite();
+        if !cpu_hit || !gpu_t[i].is_finite() {
+            continue;
+        }
+        n += 1;
+        let mut key = [0u16; 3];
+        for c in 0..3 {
+            let a = dlss::ld16(&gpu_g.diff_alb[i * 3 + c]);
+            let b = dlss::ld16(&cg.diff_alb[i * 3 + c]);
+            sum[c] += (a - b).abs() as f64;
+            key[c] = gpu_g.diff_alb[i * 3 + c].load(Relaxed);
+        }
+        distinct.insert(key);
+    }
+    // Per-pose glass presence: center-ray re-trace (the GBufs don't store
+    // the hit tri). Printed, not gated — a pose can legitimately see none.
+    let glass_px: usize = (0..ph)
+        .into_par_iter()
+        .map(|y| {
+            let mut stats = stats::LocalStats::default();
+            let mut count = 0usize;
+            for x in 0..pw {
+                let ray = bvh::Ray::new(
+                    basis.origin,
+                    basis.ray_dir(x as f32 + 0.5, y as f32 + 0.5),
+                );
+                if let Some(h) = bvh.intersect(scene, &ray, 0.0, f32::INFINITY, &mut stats.ray_nodes)
+                {
+                    if scene.materials[scene.tri_mat[h.tri as usize] as usize].transmission > 0.0 {
+                        count += 1;
+                    }
+                }
+            }
+            count
+        })
+        .sum();
+    let mean = |c: usize| if n > 0 { sum[c] / n as f64 } else { 0.0 };
+    eprintln!(
+        "check-{tag}: albedo A/B ({pw}x{ph}): mean |d| {:.4}/{:.4}/{:.4} over {n} px | distinct GPU albedos {} | glass px {glass_px}",
+        mean(0), mean(1), mean(2), distinct.len(),
+    );
+    let mut pass = true;
+    if mean(0) > 0.02 || mean(1) > 0.02 || mean(2) > 0.02 {
+        eprintln!("check-{tag}: FAIL textured albedo off the CPU render (flat-Kd regression?)");
+        pass = false;
+    }
+    if distinct.len() <= 64 {
+        eprintln!("check-{tag}: FAIL <= 64 distinct GPU albedo values (textures not sampled)");
+        pass = false;
+    }
+    pass
+}
+
 fn mv_check_at(
     scene: &scene::Scene,
     bvh: &bvh::Bvh,
@@ -5022,6 +5653,46 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
     };
 
+    // Material-classifier self-test — deterministic spot checks over the
+    // real San Miguel naming patterns (keyword precedence, whole-token
+    // safety, the name/Ns/illum fallback tiers).
+    let matclass_ok = match matclass::self_test() {
+        Ok(()) => {
+            eprintln!("matclass self-test: OK");
+            true
+        }
+        Err(e) => {
+            eprintln!("matclass self-test: FAIL — {e}");
+            false
+        }
+    };
+
+    // Tangent-frame / normal-map decode self-test — analytic directions,
+    // green-channel sign pin, mirrored-UV handedness, degenerate skip.
+    let tangent_ok = match shade::tangent_self_test() {
+        Ok(()) => {
+            eprintln!("tangent self-test: OK");
+            true
+        }
+        Err(e) => {
+            eprintln!("tangent self-test: FAIL — {e}");
+            false
+        }
+    };
+
+    // glTF loader self-test — an in-code GLB exercises node flattening, the
+    // mirrored-winding flip, u16 index widening, and the factor mapping.
+    let gltf_ok = match gltf_loader::self_test() {
+        Ok(()) => {
+            eprintln!("gltf self-test: OK");
+            true
+        }
+        Err(e) => {
+            eprintln!("gltf self-test: FAIL — {e}");
+            false
+        }
+    };
+
     let rep = render::verify(scene, bvh, &cam, q, rw, rh, &stats, None, &[], None);
     eprintln!(
         "verify full-depth ({} px): false-sky {} | tmin-overshoot {} | hybrid-extra {} | max rel t err {:.2e}",
@@ -5211,23 +5882,37 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             .collect();
         let mut hv = hemi::VerifyCounters::default();
         let mut ls = stats::LocalStats::default();
-        let (mut sum_rel, mut sum_signed, mut worst) = (0f64, 0f64, 0f32);
+        let mut worst = 0f32;
         for (rel, phv, pls) in &results {
             hv.merge(phv);
             ls.merge(pls);
-            sum_rel += rel.abs();
-            sum_signed += *rel;
             worst = worst.max(rel.abs() as f32);
         }
+        // Firefly-robust statistic — the documented unpaired-A/B fix (the
+        // CLAUDE.md canopy-caveat lesson): relative error is bounded −1
+        // below but UNBOUNDED above (a hemi leaf ray that catches a bright
+        // emitter or sun-glow lobe the 512-sample reference undersamples is
+        // a +NX outlier — DamagedHelmet's emissive visor trips it on real
+        // content), so the gate trims 2% from each tail before the means.
+        // The exact-zero soundness gates above stay untouched — this only
+        // robustifies the estimator comparison; `worst` still prints raw.
+        let mut rels: Vec<f64> = results.iter().map(|(rel, _, _)| *rel).collect();
+        // total_cmp: a NaN rel (NaN radiance) must FAIL the gate (it sorts
+        // past +inf into the kept slice and poisons the mean), not panic the
+        // sort's partial_cmp unwrap.
+        rels.sort_unstable_by(|a, b| a.total_cmp(b));
+        let trim = rels.len() / 50;
+        let kept = &rels[trim..rels.len() - trim];
+        let mean_rel =
+            kept.iter().map(|r| r.abs()).sum::<f64>() / kept.len().max(1) as f64;
+        let mean_signed = kept.iter().sum::<f64>() / kept.len().max(1) as f64;
         let nprobes = results.len() as u64;
-        let mean_rel = sum_rel / nprobes.max(1) as f64;
-        let mean_signed = sum_signed / nprobes.max(1) as f64;
         eprintln!(
             "hemi GI ({nprobes} probes, depth {}): psa-viol {} | false-empty {} | tmin-overshoot {} | cut-miss {} | max psa err {:.2e}",
             q.fb.depth, hv.psa_violations, hv.false_empty, hv.tmin_overshoot, hv.cut_miss, hv.max_psa_err
         );
         eprintln!(
-            "hemi GI vs {REF_SAMPLES}-sample cosine (same depth-1 policy): mean rel {mean_rel:.4} (limit 0.05) | signed {mean_signed:+.4} (limit ±0.01) | worst {worst:.3} | per point: {:.1} queries, {:.1} rays, {:.1} cells empty",
+            "hemi GI vs {REF_SAMPLES}-sample cosine (same depth-1 policy, 2% trimmed): mean rel {mean_rel:.4} (limit 0.05) | signed {mean_signed:+.4} (limit ±0.01) | worst raw {worst:.3} | per point: {:.1} queries, {:.1} rays, {:.1} cells empty",
             ls.hemi_queries as f64 / ls.hemi_points.max(1) as f64,
             ls.hemi_leaf_rays as f64 / ls.hemi_points.max(1) as f64,
             ls.hemi_cells_empty as f64 / ls.hemi_points.max(1) as f64,
@@ -5800,8 +6485,15 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             ok = false;
         }
         if !rcache.valid() {
-            eprintln!("hemi share: fb-ao recording frame poisoned — replay coverage not provable");
-            ok = false;
+            // The contract's lost-replay state (arena overflow): production
+            // never replays a poisoned frame. Only the default scene must
+            // record validly — a dense OBJ scene overflows legitimately.
+            if structural {
+                eprintln!("hemi share: fb-ao recording frame poisoned — replay coverage not provable");
+                ok = false;
+            } else {
+                eprintln!("hemi share: fb-ao recording poisoned (arena overflow) — replay gate skipped");
+            }
         } else {
             stats.clear();
             render::render_frame_replay(&ctx, &rcache);
@@ -6083,9 +6775,22 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             leaf_px + sky_px,
             (rw * rh) as u64,
         );
-        if !rcache.valid() || leaf_px + sky_px != (rw * rh) as u64 {
-            eprintln!("replay record: invalid recording or terminals don't partition the screen");
+        if rcache.valid() && leaf_px + sky_px != (rw * rh) as u64 {
+            eprintln!("replay record: terminals don't partition the screen");
             replay_ok = false;
+        }
+        if !rcache.valid() {
+            // A poisoned recording (arena overflow) is the contract's
+            // lost-replay state: production clears `replay_key` via
+            // `valid()` and traces fresh, so there is nothing to
+            // replay-gate. The default scene must record validly; a dense
+            // OBJ scene can overflow legitimately.
+            if structural {
+                eprintln!("replay record: recording poisoned on the default scene");
+                replay_ok = false;
+            } else {
+                eprintln!("replay record: poisoned (arena overflow) — replay gates skipped (production traces fresh)");
+            }
         }
         if structural && (nl == 0 || ns == 0) {
             eprintln!("replay record: expected both leaves and sky terminals > 0 — a path didn't fire");
@@ -6093,7 +6798,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
         // Same-seed replay of frame 0 vs the recording frame itself.
         let (accum_r, info_r, tbuf_r) = (alloc3(), alloc1(), alloc1());
-        {
+        if rcache.valid() {
             let ctx = FrameCtx {
                 scene,
                 bvh,
@@ -6123,15 +6828,15 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 discard_seeds: false,
             };
             render::render_frame_replay(&ctx, &rcache);
-        }
-        let (dt, di, da) = (
-            bits_differ(&tbuf_p, &tbuf_r),
-            bits_differ(&info_p, &info_r),
-            bits_differ(&accum_p, &accum_r),
-        );
-        eprintln!("replay bit-identity (frame 0): tbuf {dt} | info {di} | accum {da} px differ");
-        if dt + di + da > 0 {
-            replay_ok = false;
+            let (dt, di, da) = (
+                bits_differ(&tbuf_p, &tbuf_r),
+                bits_differ(&info_p, &info_r),
+                bits_differ(&accum_p, &accum_r),
+            );
+            eprintln!("replay bit-identity (frame 0): tbuf {dt} | info {di} | accum {da} px differ");
+            if dt + di + da > 0 {
+                replay_ok = false;
+            }
         }
         // Warm frame 1 (the interactive shape: jittered, consuming the
         // producer cache) traced fresh vs replayed from frame 0's structure.
@@ -6139,6 +6844,9 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         let (accum_f, info_f, tbuf_f) = (alloc3(), alloc1(), alloc1());
         let (accum_r1, info_r1, tbuf_r1) = (alloc3(), alloc1(), alloc1());
         for (bufs, fresh) in [((&accum_f, &info_f, &tbuf_f), true), ((&accum_r1, &info_r1, &tbuf_r1), false)] {
+            if !fresh && !rcache.valid() {
+                continue;
+            }
             let ctx = FrameCtx {
                 scene,
                 bvh,
@@ -6173,14 +6881,16 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 render::render_frame_replay(&ctx, &rcache);
             }
         }
-        let (dt1, di1, da1) = (
-            bits_differ(&tbuf_f, &tbuf_r1),
-            bits_differ(&info_f, &info_r1),
-            bits_differ(&accum_f, &accum_r1),
-        );
-        eprintln!("replay bit-identity (warm frame 1): tbuf {dt1} | info {di1} | accum {da1} px differ");
-        if dt1 + di1 + da1 > 0 {
-            replay_ok = false;
+        if rcache.valid() {
+            let (dt1, di1, da1) = (
+                bits_differ(&tbuf_f, &tbuf_r1),
+                bits_differ(&info_f, &info_r1),
+                bits_differ(&accum_f, &accum_r1),
+            );
+            eprintln!("replay bit-identity (warm frame 1): tbuf {dt1} | info {di1} | accum {da1} px differ");
+            if dt1 + di1 + da1 > 0 {
+                replay_ok = false;
+            }
         }
         // Frozen-prev contract: replays wrote nothing, so the producer cache
         // must still seed a moving consumer exactly as if they hadn't run.
@@ -6204,6 +6914,9 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             ("static warm    ", true, false, false),
             ("static replay  ", false, true, false),
         ] {
+            if do_replay && !rcache.valid() {
+                continue; // nothing to replay — production traces fresh
+            }
             stats.clear();
             let ctx = FrameCtx {
                 scene,
@@ -6511,24 +7224,30 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
     }
 
-    if sph_ok
-        && reproj_ok
-        && nppd_ok
-        && hemi_ok
-        && gi_ok
-        && hemi_share_ok
-        && shaft_ok
-        && rep.ok()
-        && capped_ok
-        && temporal_ok
-        && replay_ok
-        && ring_ok
-        && adopt_ok
-    {
+    let gates = [
+        ("sphcell", sph_ok),
+        ("reproject", reproj_ok),
+        ("nppd", nppd_ok),
+        ("matclass", matclass_ok),
+        ("tangent", tangent_ok),
+        ("gltf", gltf_ok),
+        ("hemi-ao", hemi_ok),
+        ("hemi-gi", gi_ok),
+        ("hemi-share", hemi_share_ok),
+        ("shaft", shaft_ok),
+        ("verify", rep.ok()),
+        ("capped", capped_ok),
+        ("temporal", temporal_ok),
+        ("replay", replay_ok),
+        ("ring", ring_ok),
+        ("adopt", adopt_ok),
+    ];
+    let failed: Vec<&str> = gates.iter().filter(|(_, ok)| !ok).map(|(n, _)| *n).collect();
+    if failed.is_empty() {
         eprintln!("CHECK PASSED");
         0
     } else {
-        eprintln!("CHECK FAILED");
+        eprintln!("CHECK FAILED ({})", failed.join(", "));
         1
     }
 }
@@ -6573,6 +7292,62 @@ fn log_drs_adoption(path: &str, lim: &xess::StepLimiter, last_ep: &mut (usize, u
     *last_ep = ep;
 }
 
+/// The GPU arm's upscaler sub-mode (--gpu and the DXR pipeline share it):
+/// which wired upscaler composes on the tracer, or plain presentation.
+#[cfg(windows)]
+#[derive(Clone, Copy, PartialEq)]
+enum GpuUp {
+    Plain,
+    Rr,
+    Xess,
+}
+
+/// A session's exit reason: quit the app, or rebuild everything at a new
+/// window client size (maximize / F11 fullscreen / drag-resize settled).
+#[cfg(windows)]
+enum SessionEnd {
+    Quit,
+    Resize(u32, u32),
+}
+
+/// User-visible state that survives a window-resize session restart: camera
+/// pose, mode toggles, denoiser intents, counters. Everything else — every
+/// buffer, controller, history, and upscaler context — intentionally
+/// rebuilds at the new size by re-entering the session init code (which is
+/// the same code that already handles every mode/fallback at any (w, h)).
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+struct Persist {
+    cam: Camera,
+    hybrid: bool,
+    dynamic: bool,
+    overlay_on: bool,
+    gpu_tonemap: bool,
+    bounce_mode: u32,
+    preset: u32,
+    dlss_on: bool,
+    xess_on: bool,
+    fsr_on: bool,
+    oidn_on: bool,
+    oidn_temporal: bool,
+    xess_oidn: XessOidn,
+    nppd_on: bool,
+    xess_nppd: bool,
+    dxr_on: bool,
+    /// The user toggled the DXR / --gpu arm to plain presentation (G/X
+    /// inside the arm); the wired upscaler itself is re-derived at re-entry.
+    dxr_up_plain: bool,
+    gpu_up_plain: bool,
+    gpu_nppd_on: bool,
+    /// Failed-init latches: a missing DLL stays missing across a resize —
+    /// don't retry per re-entry.
+    oidn_failed: bool,
+    nppd_failed: bool,
+    dxr_failed: bool,
+    shot: u32,
+    depth_est: f32,
+}
+
 #[cfg(windows)]
 fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     // Opt into per-monitor DPI awareness so Windows doesn't stretch the window
@@ -6587,60 +7362,112 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
             H as u32,
         )
         .position_centered()
+        .resizable() // enables the maximize button + drag borders
         .build()
         .expect("failed to open window");
     let mut inp = input::Input::new(&sdl).expect("SDL event pump failed");
-    let mut gpu = gpu::GpuContext::new(
-        sdl_hwnd(&window),
-        W as u32,
-        H as u32,
-        &gpu::GpuOptions {
-            dlss: opts.dlss,
-            sl_dir: opts.sl_path.clone(),
-            xess: opts.xess,
-            xess_dir: opts.xess_path.clone(),
-            xess_autoexposure: opts.xess_autoexposure,
-            fsr: opts.fsr,
-            fsr3: opts.fsr3,
-            ffx_dir: opts.ffx_path.clone(),
-            debug: opts.gpu_debug,
-        },
-    )
-    .expect("GPU init failed");
+    // Hoisted so GpuContext::new and every resize_output share one value.
+    let gopts = gpu::GpuOptions {
+        dlss: opts.dlss,
+        sl_dir: opts.sl_path.clone(),
+        xess: opts.xess,
+        xess_dir: opts.xess_path.clone(),
+        xess_autoexposure: opts.xess_autoexposure,
+        fsr: opts.fsr,
+        fsr3: opts.fsr3,
+        ffx_dir: opts.ffx_path.clone(),
+        prefer: opts.prefer,
+        debug: opts.gpu_debug,
+        vsync: opts.vsync,
+    };
+    let mut gpu = gpu::GpuContext::new(sdl_hwnd(&window), W as u32, H as u32, &gopts)
+        .expect("GPU init failed");
 
-    let mut cam = cam0;
-    let accum: Vec<AtomicU32> = (0..W * H * 3).map(|_| AtomicU32::new(0)).collect();
-    let info: Vec<AtomicU32> = (0..W * H).map(|_| AtomicU32::new(0)).collect();
-    let tbuf: Vec<AtomicU32> = (0..W * H).map(|_| AtomicU32::new(0)).collect();
-    let mut present = vec![0u32; W * H];
+    // A window resize exits the session and re-enters it at the new client
+    // size: the session init code IS the rebuild path (every buffer,
+    // controller, history, and tracer pipeline re-derives from (w, h) —
+    // including the upscalers' render-res ranges, so a --lock-res scale
+    // stays the same PERCENTAGE of the new window). The GpuContext itself
+    // survives via resize_output; user-visible state crosses over in
+    // Persist.
+    let (mut w, mut h) = (W, H);
+    let mut persist: Option<Persist> = None;
+    loop {
+        match session(scene, bvh, opts, cam0, &mut window, &mut inp, &mut gpu, &mut persist, w, h)
+        {
+            SessionEnd::Quit => break,
+            SessionEnd::Resize(nw, nh) => {
+                if let Err(e) = gpu.resize_output(nw, nh, &gopts) {
+                    eprintln!("resize: rebuild at {nw}x{nh} failed ({e}); exiting");
+                    break;
+                }
+                (w, h) = (nw as usize, nh as usize);
+                eprintln!("window: resized to {nw}x{nh}");
+            }
+        }
+    }
+}
+
+/// One renderer session at a fixed window size (w, h): everything sized
+/// from the window lives in here and rebuilds when a resize re-enters.
+/// Seeds user-visible state from `persist` (subsequent entries) or the CLI
+/// flags (first entry), and writes it back on every exit.
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn session(
+    scene: &scene::Scene,
+    bvh: &bvh::Bvh,
+    opts: &Opts,
+    cam0: Camera,
+    window: &mut sdl2::video::Window,
+    inp: &mut input::Input,
+    gpu: &mut gpu::GpuContext,
+    persist: &mut Option<Persist>,
+    w: usize,
+    h: usize,
+) -> SessionEnd {
+    let p0: Option<Persist> = *persist;
+    // Denoiser/pipeline intents: first entry from the CLI flags, re-entries
+    // from the persisted runtime state (the CLI branches below double as the
+    // restore path — they rebuild the contexts at the new size).
+    let want_oidn = p0.map_or(opts.oidn, |p| p.oidn_on || p.xess_oidn == XessOidn::Pre);
+    let want_oidn_post = p0.map_or(opts.oidn_post, |p| p.xess_oidn == XessOidn::Post);
+    let want_nppd = p0.map_or(opts.nppd, |p| p.nppd_on || p.xess_nppd);
+    let want_dxr = p0.map_or(opts.dxr, |p| p.dxr_on);
+
+    let mut cam = p0.map_or(cam0, |p| p.cam);
+    let accum: Vec<AtomicU32> = (0..w * h * 3).map(|_| AtomicU32::new(0)).collect();
+    let info: Vec<AtomicU32> = (0..w * h).map(|_| AtomicU32::new(0)).collect();
+    let tbuf: Vec<AtomicU32> = (0..w * h).map(|_| AtomicU32::new(0)).collect();
+    let mut present = vec![0u32; w * h];
     let stats = Stats::default();
     // Temporal claim ring + lockstep cut stores: see TemporalRing. Half-res
     // and plain frames don't participate and drop the ring — a cache from
     // any older frame or another resolution is never consulted.
-    let mut tr = TemporalRing::new(W, H);
+    let mut tr = TemporalRing::new(w, h);
     // Static-frame structure replay (replay.rs): `replay_key` describes the
     // immediately preceding rendered frame's recorded terminal structure, or
     // None. A frame either records and sets it, replays and leaves it, or
     // does neither and clears it; idle (converged) frames don't touch it.
-    let replay_cache = replay::ReplayCache::new(W, H);
+    let replay_cache = replay::ReplayCache::new(w, h);
     let mut replay_key: Option<(camera::CamBasis, (usize, usize))> = None;
 
     let mut frame: u32 = 0;
-    let mut hybrid = true;
-    let mut dynamic = true;
-    let mut overlay_on = false;
-    let mut gpu_tonemap = false;
+    let mut hybrid = p0.map_or(true, |p| p.hybrid);
+    let mut dynamic = p0.map_or(true, |p| p.dynamic);
+    let mut overlay_on = p0.map_or(false, |p| p.overlay_on);
+    let mut gpu_tonemap = p0.map_or(false, |p| p.gpu_tonemap);
     // Hemisphere frustum bounces (H cycles off → AO → GI): still-frame
     // quality — moving/DLSS frames keep the sampled path.
-    let mut bounce_mode = 0u32;
-    let mut preset = 2u32;
-    let mut prev_rw = W;
+    let mut bounce_mode = p0.map_or(0u32, |p| p.bounce_mode);
+    let mut preset = p0.map_or(2u32, |p| p.preset);
+    let mut prev_rw = w;
 
     // DLSS Ray Reconstruction state. In DLSS mode every frame is a fresh
     // 1-spp hybrid frame at RR's Quality-mode render resolution (RR upscales
     // + denoises to the window size) and RR is the only temporal integrator:
     // no CPU accumulation, no half-res moving mode, no depth-cap budget.
-    let mut dlss_on = gpu.dlss_ready();
+    let mut dlss_on = p0.map_or(gpu.dlss_ready(), |p| p.dlss_on && gpu.dlss_ready());
     // Step-wise DRS (shares xess::ScaleCtl / quantize_res — pure controller
     // math common to both upscalers). Steps are made RARE (the quantization
     // plus the StepLimiter dwell is the hysteresis) because RR re-initializes
@@ -6655,19 +7482,19 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     let (drw, drh) = match (opts.lock_scale, dlss_range) {
         (Some(r), Some((_, min, max))) if min != max => xess::quantize_res(
             r,
-            (W, H),
+            (w, h),
             (min.0 as usize, min.1 as usize),
             (max.0 as usize, max.1 as usize),
         ),
         // No usable range: the lock can't be honored — keep the SDK
         // optimal / DLAA fallback (warned about at the startup print).
-        _ => gpu.rr_render_res().map(|(a, b)| (a as usize, b as usize)).unwrap_or((W, H)),
+        _ => gpu.rr_render_res().map(|(a, b)| (a as usize, b as usize)).unwrap_or((w, h)),
     };
     let dlss_drs = opts.lock_scale.is_none()
         && dlss_range.map(|(_, min, max)| min != max).unwrap_or(false);
     let mut dlss_ctl = dlss_range.filter(|_| dlss_drs).map(|(_, min, max)| {
-        let start_h = (H * 2 / 3).clamp(min.1 as usize, max.1 as usize);
-        xess::ScaleCtl::new(start_h, min.1 as usize, max.1 as usize, H)
+        let start_h = (h * 2 / 3).clamp(min.1 as usize, max.1 as usize);
+        xess::ScaleCtl::new(start_h, min.1 as usize, max.1 as usize, h)
     });
     // G-buffer capacity = the range max; reinterpreted per step via set_res.
     let mut gbufs = {
@@ -6712,7 +7539,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                         "LOCKED at {}x{} ({}%, --lock-res{})",
                         drw,
                         drh,
-                        (drh * 100 + H / 2) / H,
+                        (drh * 100 + h / 2) / h,
                         // No DRS under --gpu — don't advertise re-enabling it.
                         if opts.gpu { "" } else { "; `--lock-res dynamic` re-enables" }
                     )
@@ -6737,7 +7564,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     // on a res step (GBufs::set_res), and `xess_prev` is its own MV-basis
     // contract — dropped on any res step, since the previous frame's pixel
     // grid no longer matches.
-    let mut xess_on = gpu.xess_ready();
+    let mut xess_on = p0.map_or(gpu.xess_ready(), |p| p.xess_on && gpu.xess_ready());
     let xess_range = gpu.xess_res_range(); // (optimal, min, max)
     // --lock-res (default quality): one fixed render res for the whole
     // session — the ScaleCtl/StepLimiter pair is never built/consulted.
@@ -6746,7 +7573,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
         xess_range.map(|(_, min, max)| {
             xess::quantize_res(
                 r,
-                (W, H),
+                (w, h),
                 (min.0 as usize, min.1 as usize),
                 (max.0 as usize, max.1 as usize),
             )
@@ -6757,8 +7584,8 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
         // "optimal" — with the ULTRA_PERFORMANCE init that widens the range,
         // optimal is the 1/3-scale floor and would open blurry. The
         // controller corrects from here either way.
-        let start_h = (H * 2 / 3).clamp(min.1 as usize, max.1 as usize);
-        xess::ScaleCtl::new(start_h, min.1 as usize, max.1 as usize, H)
+        let start_h = (h * 2 / 3).clamp(min.1 as usize, max.1 as usize);
+        xess::ScaleCtl::new(start_h, min.1 as usize, max.1 as usize, h)
     });
     let mut xess_gbufs: Option<dlss::GBufs> = None; // capacity = range max, lazily allocated
     let mut xess_idx: u32 = 0;
@@ -6777,7 +7604,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 "xess: super-resolution ON, render res LOCKED at {}x{} ({}%, --lock-res; X toggles{})",
                 lw,
                 lh,
-                (lh * 100 + H / 2) / H,
+                (lh * 100 + h / 2) / h,
                 // No DRS and no OIDN composition under --gpu.
                 if opts.gpu {
                     ""
@@ -6804,7 +7631,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     // contract (basis re-derived at each frame's res, so MVs survive DRS
     // steps); `fsr_bufs` carries the demodulated signals + residual and is
     // reinterpreted in place on a step exactly like the G-buffers.
-    let mut fsr_on = gpu.fsr_ready();
+    let mut fsr_on = p0.map_or(gpu.fsr_ready(), |p| p.fsr_on && gpu.fsr_ready());
     // Which FSR pipeline initialized: FSR4 + Ray Regeneration (RDNA4) or
     // FSR 3.1 upscale-only (everything else / --fsr3). The flavor is fixed
     // for the session — K toggles it against plain, never across flavors.
@@ -6819,7 +7646,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
         fsr_range.map(|(_, min, max)| {
             xess::quantize_res(
                 r,
-                (W, H),
+                (w, h),
                 (min.0 as usize, min.1 as usize),
                 (max.0 as usize, max.1 as usize),
             )
@@ -6830,7 +7657,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
         // unlike XeSS there is no widened-range "optimal" pitfall, so the
         // queried seed is used as-is. The controller corrects from here.
         let start_h = (opt.1 as usize).clamp(min.1 as usize, max.1 as usize);
-        xess::ScaleCtl::new(start_h, min.1 as usize, max.1 as usize, H)
+        xess::ScaleCtl::new(start_h, min.1 as usize, max.1 as usize, h)
     });
     let mut fsr_lim = xess::StepLimiter::new(xess::RAMP_FRAMES);
     let mut fsr_ep = (0usize, 0usize);
@@ -6846,7 +7673,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 fsr_label,
                 lw,
                 lh,
-                (lh * 100 + H / 2) / H,
+                (lh * 100 + h / 2) / h,
             );
         } else {
             eprintln!("fsr: {fsr_label} dynamic super-resolution ON (K toggles)");
@@ -6863,15 +7690,9 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     // renderer with the reason on stderr. With Streamline live the tracer's
     // whole workload (ExecuteIndirect + DXR + AS builds) executes on the SL
     // PROXY queue — validated in M7.
-    #[derive(Clone, Copy, PartialEq)]
-    enum GpuUp {
-        Plain,
-        Rr,
-        Xess,
-    }
     let mut gpu_up = GpuUp::Plain;
     let mut gpu_trace = false;
-    let (mut grw, mut grh) = (W, H);
+    let (mut grw, mut grh) = (w, h);
     if opts.gpu {
         // Session sub-mode + locked trace res. `--lock-res dynamic` can't be
         // honored here (no DRS on the GPU path): lock at the quality default.
@@ -6883,26 +7704,11 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
         });
         if dlss_on {
             gpu_up = GpuUp::Rr;
-            (grw, grh) = match dlss_range {
-                Some((_, min, max)) if min != max => xess::quantize_res(
-                    lock,
-                    (W, H),
-                    (min.0 as usize, min.1 as usize),
-                    (max.0 as usize, max.1 as usize),
-                ),
-                _ => (drw, drh), // degenerate range: the SDK optimal/DLAA res
-            };
+            // Degenerate range: the SDK optimal/DLAA res.
+            (grw, grh) = locked_render_res(lock, dlss_range, (w, h), (drw, drh), false);
         } else if xess_on {
             gpu_up = GpuUp::Xess;
-            (grw, grh) = match xess_range {
-                Some((_, min, max)) => xess::quantize_res(
-                    lock,
-                    (W, H),
-                    (min.0 as usize, min.1 as usize),
-                    (max.0 as usize, max.1 as usize),
-                ),
-                None => (W, H),
-            };
+            (grw, grh) = locked_render_res(lock, xess_range, (w, h), (w, h), true);
         }
         gpu_trace = match gpu::dxc::Dxc::load(&opts.dxc_path).and_then(|dxc| {
             gpu.init_trace(
@@ -6922,8 +7728,8 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                     "gpu: GPU-resident tracer active ({grw}x{grh}, DXR RayQuery{})",
                     match gpu_up {
                         GpuUp::Plain => "".to_string(),
-                        GpuUp::Rr => format!(" -> DLSS-RR {W}x{H}"),
-                        GpuUp::Xess => format!(" -> XeSS-SR {W}x{H}"),
+                        GpuUp::Rr => format!(" -> DLSS-RR {w}x{h}"),
+                        GpuUp::Xess => format!(" -> XeSS-SR {w}x{h}"),
                     }
                 );
                 true
@@ -6931,7 +7737,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
             Err(e) => {
                 eprintln!("gpu: falling back to CPU tracing — {e}");
                 gpu_up = GpuUp::Plain;
-                (grw, grh) = (W, H);
+                (grw, grh) = (w, h);
                 false
             }
         };
@@ -6954,9 +7760,14 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     // GPU-resident NPPD (wired at init in --gpu --nppd XeSS sessions; J
     // toggles the pre-upscale slot, mirroring the CPU xess_nppd contract).
     let gpu_nppd_avail = gpu_trace && gpu.nppd_gpu_ready();
-    let mut gpu_nppd_on = gpu_nppd_avail;
+    let mut gpu_nppd_on = p0.map_or(gpu_nppd_avail, |p| p.gpu_nppd_on && gpu_nppd_avail);
     if gpu_nppd_avail {
         eprintln!("gpu: NPPD pre-upscale denoise ON (J toggles)");
+    }
+    // Restore the user's plain-presentation toggle (G/X inside the --gpu
+    // arm) — AFTER the avail flags, so the session's wiring is untouched.
+    if p0.map_or(false, |p| p.gpu_up_plain) && gpu_trace {
+        gpu_up = GpuUp::Plain;
     }
 
     // OIDN state — the secondary denoiser (N toggles, mutually exclusive
@@ -6967,11 +7778,11 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     // (default) renders fresh 1-spp frames and folds them into a reprojected
     // EMA history (reproject.rs) that is the sole accumulator and denoiser
     // input; plain denoises the accumulation average and shimmers while
-    // moving. Context, W×H G-buffers (~116 MB) and history (~77 MB) are
+    // moving. Context, w×h G-buffers (~116 MB) and history (~77 MB) are
     // lazily created on first enable; a failed init is remembered and not
     // retried per keypress.
     let mut oidn_on = false;
-    let mut oidn_temporal = opts.oidn_temporal;
+    let mut oidn_temporal = p0.map_or(opts.oidn_temporal, |p| p.oidn_temporal);
     let mut oidn_ctx: Option<oidn::OidnContext> = None;
     let mut oidn_gbufs: Option<dlss::GBufs> = None;
     let mut oidn_hist: Option<reproject::History> = None;
@@ -6986,8 +7797,8 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     // controller must see it or a slow OIDN device (e.g. CPU) lets the scale
     // creep to the range max while total frame time blows the budget.
     let mut pre_ms = 0.0f64;
-    let mut oidn_failed = false;
-    let oidn_try_enable = |oidn_ctx: &mut Option<oidn::OidnContext>,
+    let mut oidn_failed = p0.map_or(false, |p| p.oidn_failed);
+    let oidn_try_enable =|oidn_ctx: &mut Option<oidn::OidnContext>,
                            oidn_gbufs: &mut Option<dlss::GBufs>,
                            oidn_hist: &mut Option<reproject::History>| {
         if oidn_ctx.is_none() {
@@ -7005,8 +7816,8 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
             for &d in devices {
                 match oidn::OidnContext::new(
                     &opts.oidn_path,
-                    W,
-                    H,
+                    w,
+                    h,
                     d,
                     opts.oidn_quality,
                     opts.oidn_clean_aux,
@@ -7027,24 +7838,24 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
             }
         }
         if oidn_ctx.is_some() && oidn_gbufs.is_none() {
-            *oidn_gbufs = Some(dlss::GBufs::new(W, H));
+            *oidn_gbufs = Some(dlss::GBufs::new(w, h));
         }
         if oidn_ctx.is_some() && oidn_hist.is_none() {
-            *oidn_hist = Some(reproject::History::new(W, H));
+            *oidn_hist = Some(reproject::History::new(w, h));
         }
         oidn_ctx.is_some()
     };
-    if opts.oidn || opts.oidn_post {
+    if (want_oidn || want_oidn_post) && !oidn_failed {
         if oidn_try_enable(&mut oidn_ctx, &mut oidn_gbufs, &mut oidn_hist) {
             if xess_on {
                 // XeSS sessions: --oidn = pre-upscale placement, --oidn-post
                 // = post-upscale; the plain-mode oidn_on stays independent.
-                xess_oidn = if opts.oidn_post { XessOidn::Post } else { XessOidn::Pre };
+                xess_oidn = if want_oidn_post { XessOidn::Post } else { XessOidn::Pre };
                 eprintln!(
                     "oidn: {}-upscale denoise ON (N cycles off/pre/post)",
-                    if opts.oidn_post { "POST" } else { "PRE" }
+                    if want_oidn_post { "POST" } else { "PRE" }
                 );
-            } else if opts.oidn_post {
+            } else if want_oidn_post {
                 eprintln!("oidn: --oidn-post requires a live --xess session; ignoring");
             } else {
                 oidn_on = true;
@@ -7070,7 +7881,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     // CPU-denoiser mode that needs it), the 10-channel stack packed from
     // accum + the G-buffers, and the ONNX session executed via DirectML (CPU
     // EP fallback). Context (~800 MB staging at 1080p — the 38-channel
-    // recurrent state dominates) and W×H G-buffers are lazily created on
+    // recurrent state dominates) and w×h G-buffers are lazily created on
     // first enable; a failed init is remembered and not retried per keypress.
     // nppd_prev is its own prev-camera contract (dlss_prev/xess_prev
     // precedent), cleared on toggle, set only after a rendered NPPD frame.
@@ -7085,7 +7896,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     let mut nppd_gbufs: Option<dlss::GBufs> = None;
     let mut nppd_prev: Option<Camera> = None;
     let mut nppd_seq: u32 = 0;
-    let mut nppd_failed = false;
+    let mut nppd_failed = p0.map_or(false, |p| p.nppd_failed);
     let nppd_drs_note = |lock: Option<f32>| {
         if lock.is_none() {
             eprintln!(
@@ -7116,8 +7927,8 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 &opts.nppd_model,
                 iw,
                 ih,
-                W,
-                H,
+                w,
+                h,
                 dev,
             ) {
                 Ok(c) => *nppd_ctx = Some(c),
@@ -7133,18 +7944,18 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
             }
         }
         if want_gbufs && nppd_ctx.is_some() && nppd_gbufs.is_none() {
-            *nppd_gbufs = Some(dlss::GBufs::new(W, H));
+            *nppd_gbufs = Some(dlss::GBufs::new(w, h));
         }
         nppd_ctx.is_some()
     };
-    if opts.nppd && !gpu_trace {
+    if want_nppd && !nppd_failed && !gpu_trace {
         // (Under --gpu the NPPD stage is GPU-resident — nppd_gpu in
         // GpuContext, wired by init_trace; the CPU context never builds.)
         if xess_on {
             // XeSS session: --nppd lands the pre-upscale placement (the
             // NPPD context works at the render res; the window-res gbufs
             // stay unallocated — XeSS mode fills xess_gbufs).
-            if nppd_try_enable(&mut nppd_ctx, &mut nppd_gbufs, false, xess_lock.unwrap_or((W, H)))
+            if nppd_try_enable(&mut nppd_ctx, &mut nppd_gbufs, false, xess_lock.unwrap_or((w, h)))
             {
                 xess_nppd = true;
                 if xess_oidn != XessOidn::Off {
@@ -7156,7 +7967,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
             } else {
                 nppd_failed = true;
             }
-        } else if nppd_try_enable(&mut nppd_ctx, &mut nppd_gbufs, true, (W, H)) {
+        } else if nppd_try_enable(&mut nppd_ctx, &mut nppd_gbufs, true, (w, h)) {
             nppd_on = true;
             if dlss_on {
                 dlss_on = false;
@@ -7172,28 +7983,68 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
         }
     }
     // DXR pipeline state — the by-the-book DispatchRays mode (F toggles it
-    // against the CPU tracer live; mutually exclusive with DLSS/OIDN/XeSS/
-    // NPPD; unavailable under --gpu, which is its own session). Lazily
-    // built on first enable — DXC load, RTPSO compile, scene + BLAS/TLAS
-    // upload, all once; a failed init is remembered and not retried per
-    // keypress. Frame semantics mirror the --gpu plain sub-mode.
+    // against the CPU tracer live; unavailable under --gpu, which is its
+    // own session). By default it COMPOSES with the session's wired
+    // upscaler exactly like --gpu: DXR-fed DLSS-RR in an SL session,
+    // DXR-fed XeSS in a XeSS session, plain otherwise (--no-dlss / FSR / no
+    // support). Inside the mode G/X toggle wired-upscaler <-> plain; the
+    // CPU-side denoisers (OIDN/NPPD) and the rival FSR presenter stay
+    // mutually exclusive. Lazily built on first enable — DXC load, RTPSO
+    // compile, scene + BLAS/TLAS upload, feed wiring, all once; a failed
+    // init is remembered and not retried per keypress. Plain sub-mode frame
+    // semantics mirror the --gpu plain sub-mode.
     let mut dxr_on = false;
-    let mut dxr_failed = false;
-    if opts.dxr && !gpu_trace {
-        match gpu::dxc::Dxc::load(&opts.dxc_path)
-            .and_then(|dxc| gpu.init_dxr(&dxc, scene, bvh, opts.gpu_debug))
-        {
+    let mut dxr_failed = p0.map_or(false, |p| p.dxr_failed);
+    // Availability = the session's WIRING (an SL session's queue is the
+    // proxy queue; a XeSS session's context lives on the native device) —
+    // the --gpu rule: you can't toggle into an upscaler the session didn't
+    // wire. dlss_on/xess_on are the CPU arm's live flags and may be toggled
+    // off without unwiring the session.
+    let dxr_rr_avail = gpu.dlss_ready();
+    let dxr_xess_avail = gpu.xess_ready();
+    // The DXR trace res: locked into the wired upscaler's range (the --gpu
+    // contract — DxrGpu's buffers are sized once, no DRS), window-res when
+    // plain. Computed once so the eager --dxr init and the lazy F init
+    // build the pipeline at the same res.
+    let (dxw, dxh) = if dxr_rr_avail {
+        locked_render_res(opts.lock_scale.unwrap_or(2.0 / 3.0), dlss_range, (w, h), (drw, drh), false)
+    } else if dxr_xess_avail {
+        locked_render_res(opts.lock_scale.unwrap_or(2.0 / 3.0), xess_range, (w, h), (w, h), true)
+    } else {
+        (w, h)
+    };
+    // Upscaler sub-mode per-frame state, the gpu_up_* contract: free-running
+    // frame index, the previous frame's camera (its own MV state, like
+    // dlss_prev/gpu_prev_cam), the history-reset latch (discontinuities,
+    // never motion), and the sub-mode itself (set at each F enable).
+    let mut dxr_up = GpuUp::Plain;
+    let mut dxr_up_idx: u32 = 0;
+    let mut dxr_prev_cam: Option<Camera> = None;
+    let mut dxr_reset = true;
+    if want_dxr && !dxr_failed && !gpu_trace {
+        let compose = dxr_rr_avail || dxr_xess_avail;
+        if compose && opts.lock_scale.is_none() {
+            eprintln!("dxr: dynamic render res is unsupported on the DXR pipeline; locking at quality (2/3)");
+        }
+        match gpu::dxc::Dxc::load(&opts.dxc_path).and_then(|dxc| {
+            gpu.init_dxr(&dxc, scene, bvh, dxw as u32, dxh as u32, compose, opts.gpu_debug)
+        }) {
             Ok(()) => {
                 dxr_on = true;
-                if dlss_on {
-                    dlss_on = false;
-                    eprintln!("dlss: Ray Reconstruction OFF (--dxr; G re-enables)");
+                dxr_up = if dxr_rr_avail {
+                    GpuUp::Rr
+                } else if dxr_xess_avail {
+                    GpuUp::Xess
+                } else {
+                    GpuUp::Plain
+                };
+                // Restore the user's plain toggle (G/X inside the DXR arm).
+                if p0.map_or(false, |p| p.dxr_up_plain) {
+                    dxr_up = GpuUp::Plain;
                 }
-                if xess_on {
-                    xess_on = false;
-                    xess_prev = None;
-                    eprintln!("xess: OFF (--dxr; X re-enables)");
-                }
+                // The CPU-side denoisers can't run under the DXR arm; the
+                // CPU upscalers stay WIRED — the DXR arm presents through
+                // the same session contexts, and F-off resumes them intact.
                 if oidn_on {
                     oidn_on = false;
                     eprintln!("oidn: OFF (--dxr; N re-enables)");
@@ -7208,7 +8059,14 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                     fsr_prev = None;
                     eprintln!("fsr: OFF (--dxr; K re-enables)");
                 }
-                eprintln!("dxr: DispatchRays pipeline ON at {W}x{H} (F toggles CPU <-> DXR)");
+                eprintln!(
+                    "dxr: DispatchRays pipeline ON at {dxw}x{dxh}{} (F toggles CPU <-> DXR)",
+                    match dxr_up {
+                        GpuUp::Rr => format!(" -> DLSS-RR {w}x{h} (G toggles plain)"),
+                        GpuUp::Xess => format!(" -> XeSS-SR {w}x{h} (X toggles plain)"),
+                        GpuUp::Plain => String::new(),
+                    }
+                );
             }
             Err(e) => {
                 eprintln!("dxr: falling back to CPU tracing — {e}");
@@ -7218,12 +8076,14 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     }
     let mut prev_budget = false;
     // Depth cap that fully resolves the screen (tiles reach LEAF_TILE): 7 at 1024.
-    let depth_full: f32 = ((W.max(H) as f32) / render::LEAF_TILE as f32).log2().ceil();
+    let depth_full: f32 = ((w.max(h) as f32) / render::LEAF_TILE as f32).log2().ceil();
     // Fractional depth-cap estimate for budget frames. Mid-range prior: one
     // slightly-coarse first frame beats a hitch. Deliberately not reset when
     // the camera stops — the last value is the best prior for the same
     // neighborhood, and the controller corrects within a frame on resume.
-    let mut depth_est: f32 = 4.0;
+    // A resize re-entry keeps the last estimate — cost scales with area,
+    // but the controller corrects within a frame either way.
+    let mut depth_est: f32 = p0.map_or(4.0, |p| p.depth_est);
     let mut last = Instant::now();
     let mut last_title = Instant::now();
     let mut last_stats = Instant::now();
@@ -7233,16 +8093,51 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     let mut fps_frames = 0u32;
     let mut fps_t = Instant::now();
     let mut last_ms = 0.0f64;
-    let mut shot = 0u32;
+    let mut shot = p0.map_or(0u32, |p| p.shot);
+    // Debounced window-resize commit: SizeChanged events (a stream during a
+    // drag, one for maximize/F11) arm the timer; the session exits for a
+    // rebuild only once the size has been quiet for RESIZE_SETTLE_MS.
+    // Until then frames keep presenting into the old-size swapchain and
+    // DWM stretches them (DXGI_SCALING_STRETCH) — momentarily soft, never
+    // broken. A minimized window reports a 0 dimension and never commits.
+    const RESIZE_SETTLE_MS: u128 = 250;
+    let mut pending_resize: Option<Instant> = None;
 
-    loop {
+    let end = loop {
         let now = Instant::now();
         let dt = (now - last).as_secs_f32().min(0.1);
         last = now;
 
         let edges = inp.poll();
         if edges.quit {
-            break;
+            break SessionEnd::Quit;
+        }
+        if edges.toggle_fullscreen {
+            // Borderless desktop fullscreen (F11) — the resulting
+            // SizeChanged flows through the same debounce below.
+            let to = if window.fullscreen_state() == sdl2::video::FullscreenType::Off {
+                sdl2::video::FullscreenType::Desktop
+            } else {
+                sdl2::video::FullscreenType::Off
+            };
+            if let Err(e) = window.set_fullscreen(to) {
+                eprintln!("fullscreen: {e}");
+            }
+        }
+        if edges.size_changed.is_some() {
+            pending_resize = Some(now);
+        }
+        if let Some(t0) = pending_resize {
+            if (now - t0).as_millis() >= RESIZE_SETTLE_MS {
+                pending_resize = None;
+                // drawable_size at settle time is authoritative (physical
+                // pixels — the permonitorv2 DPI hint makes logical equal
+                // physical).
+                let (dw, dh) = window.drawable_size();
+                if dw > 0 && dh > 0 && (dw as usize, dh as usize) != (w, h) {
+                    break SessionEnd::Resize(dw, dh);
+                }
+            }
         }
         let moved = inp.apply_movement(&mut cam, dt, scene.diag);
 
@@ -7500,8 +8395,8 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 // window-res output; plain: the tracer's hdr (render-res in
                 // an upscaler SESSION — dims come back with the pixels).
                 let cap = match gpu_up {
-                    GpuUp::Xess => gpu.read_xess_output().map(|px| (px, W, H)),
-                    GpuUp::Rr => gpu.read_rr_output().map(|px| (px, W, H)),
+                    GpuUp::Xess => gpu.read_xess_output().map(|px| (px, w, h)),
+                    GpuUp::Rr => gpu.read_rr_output().map(|px| (px, w, h)),
                     GpuUp::Plain => gpu.read_trace_output(),
                 };
                 match cap {
@@ -7521,14 +8416,14 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 fps_t = now;
                 let mode = match gpu_up {
                     GpuUp::Plain => format!("{}x{}", grw, grh),
-                    GpuUp::Rr => format!("RR {}x{} -> {}x{}", grw, grh, W, H),
+                    GpuUp::Rr => format!("RR {}x{} -> {}x{}", grw, grh, w, h),
                     GpuUp::Xess => format!(
                         "XeSS{} {}x{} -> {}x{}",
                         if gpu_nppd_on { "+NPPD(pre)" } else { "" },
                         grw,
                         grh,
-                        W,
-                        H
+                        w,
+                        h
                     ),
                 };
                 let spp = if gpu_up == GpuUp::Plain {
@@ -7609,7 +8504,23 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
             );
         }
         if edges.toggle_dlss {
-            if gpu.dlss_ready() {
+            if dxr_on {
+                // Inside DXR mode G toggles the wired upscaler vs plain
+                // DXR — the --gpu G semantics; the CPU DLSS state is
+                // untouched (F-off resumes it).
+                if dxr_rr_avail {
+                    dxr_up = if dxr_up == GpuUp::Rr { GpuUp::Plain } else { GpuUp::Rr };
+                    frame = 0;
+                    dxr_reset = true;
+                    dxr_prev_cam = None;
+                    eprintln!(
+                        "dxr: DLSS-RR {}",
+                        if dxr_up == GpuUp::Rr { "ON" } else { "OFF (plain present)" }
+                    );
+                } else {
+                    eprintln!("dxr: DLSS-RR not wired in this session");
+                }
+            } else if gpu.dlss_ready() {
                 dlss_on = !dlss_on;
                 frame = 0;
                 dlss_reset = true;
@@ -7634,17 +8545,27 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                     xess_prev = None;
                     eprintln!("xess: OFF (DLSS enabled)");
                 }
-                if dlss_on && dxr_on {
-                    dxr_on = false;
-                    eprintln!("dxr: OFF (DLSS enabled)");
-                }
                 eprintln!("dlss: Ray Reconstruction {}", if dlss_on { "ON" } else { "OFF" });
             } else {
                 eprintln!("dlss: not available");
             }
         }
         if edges.toggle_xess {
-            if gpu.xess_ready() {
+            if dxr_on {
+                // The X twin of the DXR-mode G toggle.
+                if dxr_xess_avail {
+                    dxr_up = if dxr_up == GpuUp::Xess { GpuUp::Plain } else { GpuUp::Xess };
+                    frame = 0;
+                    dxr_reset = true;
+                    dxr_prev_cam = None;
+                    eprintln!(
+                        "dxr: XeSS {}",
+                        if dxr_up == GpuUp::Xess { "ON" } else { "OFF (plain present)" }
+                    );
+                } else {
+                    eprintln!("dxr: XeSS not wired in this session");
+                }
+            } else if gpu.xess_ready() {
                 xess_on = !xess_on;
                 frame = 0;
                 xess_reset = true;
@@ -7670,10 +8591,6 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                     nppd_on = false;
                     nppd_prev = None;
                     eprintln!("nppd: OFF (XeSS enabled)");
-                }
-                if xess_on && dxr_on {
-                    dxr_on = false;
-                    eprintln!("dxr: OFF (XeSS enabled)");
                 }
                 eprintln!(
                     "xess: {}",
@@ -7715,7 +8632,11 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
             }
         }
         if edges.toggle_oidn {
-            if fsr_on {
+            if dxr_on {
+                // CPU-side denoisers never run under the DXR arm — refuse
+                // instead of silently mutating latent CPU-mode state.
+                eprintln!("oidn: a CPU-mode denoiser — unavailable under the DXR pipeline (F toggles DXR off first)");
+            } else if fsr_on {
                 // Enabling plain-mode OIDN under a live FSR present arm would
                 // only allocate its window-res G-buffers and lie in the logs
                 // (the FSR arm wins the mode arbitration) — refuse instead.
@@ -7771,10 +8692,6 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                     nppd_prev = None;
                     eprintln!("nppd: OFF (OIDN enabled)");
                 }
-                if dxr_on {
-                    dxr_on = false;
-                    eprintln!("dxr: OFF (OIDN enabled)");
-                }
                 eprintln!(
                     "oidn: ON{}, temporal reprojection {} (M toggles)",
                     if xess_on { " (XeSS pre-denoise at the dynamic render res)" } else { "" },
@@ -7785,7 +8702,10 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
             }
         }
         if edges.toggle_nppd {
-            if fsr_on {
+            if dxr_on {
+                // Same refusal as N: CPU-mode denoisers don't run here.
+                eprintln!("nppd: a CPU-mode denoiser — unavailable under the DXR pipeline (F toggles DXR off first)");
+            } else if fsr_on {
                 // Same refusal as N: the FSR arm wins the mode arbitration
                 // (flavor-neutral — the 3.1 flavor has no denoiser at all).
                 eprintln!("nppd: the FSR present arm owns the frame (K toggles FSR off first)");
@@ -7804,7 +8724,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                     &mut nppd_ctx,
                     &mut nppd_gbufs,
                     false,
-                    xess_lock.unwrap_or((W, H)),
+                    xess_lock.unwrap_or((w, h)),
                 ) {
                     xess_nppd = true;
                     frame = 0;
@@ -7830,7 +8750,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 eprintln!(
                     "nppd: unavailable (earlier init failed; restart with --nppd-path/--nppd-model to retry)"
                 );
-            } else if nppd_try_enable(&mut nppd_ctx, &mut nppd_gbufs, true, (W, H)) {
+            } else if nppd_try_enable(&mut nppd_ctx, &mut nppd_gbufs, true, (w, h)) {
                 nppd_on = true;
                 nppd_prev = None;
                 frame = 0;
@@ -7850,10 +8770,6 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                     oidn_on = false;
                     eprintln!("oidn: OFF (NPPD enabled)");
                 }
-                if dxr_on {
-                    dxr_on = false;
-                    eprintln!("dxr: OFF (NPPD enabled)");
-                }
                 let c = nppd_ctx.as_ref().unwrap();
                 eprintln!("nppd: neural denoising ON ({} | onnxruntime {})", c.device_desc, c.ort_version);
             } else {
@@ -7864,28 +8780,42 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
             if dxr_on {
                 dxr_on = false;
                 frame = 0;
+                // The CPU upscalers resume with their own contracts; their
+                // histories just watched DXR frames at a different res —
+                // declare the discontinuity (harmless when they're off).
+                dlss_prev = None;
+                dlss_reset = true;
+                xess_prev = None;
+                xess_reset = true;
                 eprintln!("dxr: OFF (CPU tracing)");
             } else if dxr_failed {
                 eprintln!("dxr: unavailable (earlier init failed; restart with --dxc-path to retry)");
             } else {
-                match gpu::dxc::Dxc::load(&opts.dxc_path)
-                    .and_then(|dxc| gpu.init_dxr(&dxc, scene, bvh, opts.gpu_debug))
-                {
+                let compose = dxr_rr_avail || dxr_xess_avail;
+                if compose && opts.lock_scale.is_none() {
+                    eprintln!("dxr: dynamic render res is unsupported on the DXR pipeline; locking at quality (2/3)");
+                }
+                match gpu::dxc::Dxc::load(&opts.dxc_path).and_then(|dxc| {
+                    gpu.init_dxr(&dxc, scene, bvh, dxw as u32, dxh as u32, compose, opts.gpu_debug)
+                }) {
                     Ok(()) => {
                         dxr_on = true;
                         frame = 0;
-                        if dlss_on {
-                            dlss_on = false;
-                            dlss_prev = None;
-                            dlss_reset = true;
-                            eprintln!("dlss: Ray Reconstruction OFF (DXR enabled)");
-                        }
-                        if xess_on {
-                            xess_on = false;
-                            xess_prev = None;
-                            xess_reset = true;
-                            eprintln!("xess: OFF (DXR enabled)");
-                        }
+                        // Every F enable restores the session default
+                        // sub-mode (a G/X plain-toggle doesn't outlive it).
+                        dxr_up = if dxr_rr_avail {
+                            GpuUp::Rr
+                        } else if dxr_xess_avail {
+                            GpuUp::Xess
+                        } else {
+                            GpuUp::Plain
+                        };
+                        dxr_reset = true;
+                        dxr_prev_cam = None;
+                        // CPU-side denoisers can't run under the DXR arm;
+                        // the CPU upscalers stay wired — the arm presents
+                        // through the same session contexts, and F-off
+                        // resumes them intact.
                         if oidn_on {
                             oidn_on = false;
                             eprintln!("oidn: OFF (DXR enabled)");
@@ -7901,7 +8831,14 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                             fsr_reset = true;
                             eprintln!("fsr: OFF (DXR enabled; K re-enables)");
                         }
-                        eprintln!("dxr: DispatchRays pipeline ON (F toggles CPU <-> DXR)");
+                        eprintln!(
+                            "dxr: DispatchRays pipeline ON at {dxw}x{dxh}{} (F toggles CPU <-> DXR)",
+                            match dxr_up {
+                                GpuUp::Rr => format!(" -> DLSS-RR {w}x{h} (G toggles plain)"),
+                                GpuUp::Xess => format!(" -> XeSS-SR {w}x{h} (X toggles plain)"),
+                                GpuUp::Plain => String::new(),
+                            }
+                        );
                     }
                     Err(e) => {
                         eprintln!("dxr: unavailable — {e}");
@@ -7997,58 +8934,166 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
         }
 
         // DXR mode: a self-contained arm — the frame is traced by
-        // DispatchRays, resolved, tonemapped, and presented on the GPU; the
-        // CPU render machinery below (budget frames, temporal ring, the
-        // denoiser modes) deliberately doesn't run. Frame semantics mirror
-        // the --gpu plain sub-mode: while_moving quality with `frame`
-        // pinned at 0 (every moving frame is a fresh store), accumulate +
-        // converge when still, re-present the resolved image when converged.
+        // DispatchRays and presented on the GPU; the CPU render machinery
+        // below (budget frames, temporal ring, the denoiser modes)
+        // deliberately doesn't run. In an upscaler sub-mode (the session
+        // default when RR/XeSS is wired) the frame follows the --gpu
+        // upscaler contract: a fresh jittered 1-spp DispatchRays frame at
+        // the locked render res, fed to the upscaler on the same list, ONE
+        // camera pose for every consumer, never idle. Plain sub-mode
+        // mirrors the --gpu plain sub-mode: while_moving quality with
+        // `frame` pinned at 0, accumulate + converge when still, re-present
+        // the resolved image when converged.
         if dxr_on {
-            let basis = cam.basis(W, H);
+            let basis = cam.basis(w, h);
             // The temporal ring must not survive non-participating frames:
             // F-off resumes CPU tracing against whatever it still holds.
             tr.end(false, false, basis);
             if edges.verify {
                 eprintln!("dxr: C verify is a CPU-tracer feature; --check-dxr gates this pipeline");
             }
-            let base_q = Quality::preset(preset);
-            // Hemi (H) tiers are CPU/wavefront features; the DXR closest-hit
-            // keeps the sampled-ambient path, so fb stays OFF here.
-            let q = if moved { base_q.while_moving() } else { base_q };
-            let p = gpu::trace::FrameParams {
-                cam: basis,
-                frame,
-                accumulate: true,
-                jitter: frame > 0,
-                frame_jitter: None,
-                prev_cam: None,
-                q,
-                verify: false,
-            };
             let t = Instant::now();
-            if frame < MAX_SAMPLES {
-                match gpu.present_dxr(&p, frame + 1) {
+            if dxr_up != GpuUp::Plain {
+                if edges.quality.is_some() {
+                    // The generic handler already reset `frame`; the noise
+                    // statistics change, so declare the discontinuity.
+                    dxr_reset = true;
+                    eprintln!("dxr: quality pinned at the 1-spp upscaler preset (plain DXR honors 1-3)");
+                }
+                let jit = dlss::jitter_for(dxr_up_idx);
+                let p = gpu::trace::FrameParams {
+                    cam: cam.basis(dxw, dxh),
+                    frame: dxr_up_idx,
+                    accumulate: false,
+                    jitter: false,
+                    frame_jitter: Some(jit),
+                    prev_cam: dxr_prev_cam.map(|c| c.basis(dxw, dxh)),
+                    q: Quality::upscaler_1spp(),
+                    verify: false,
+                };
+                let presented = if dxr_up == GpuUp::Xess {
+                    gpu.present_dxr_xess(&p, jit, dxr_reset)
+                } else {
+                    // The prev matrices are recomputed from the stored
+                    // camera (pure math, fixed res: identical to last
+                    // frame's).
+                    let mats = dlss::cam_matrices(&cam, dxw, dxh, dlss_near, dlss_far);
+                    let prev_mats =
+                        dxr_prev_cam.map(|c| dlss::cam_matrices(&c, dxw, dxh, dlss_near, dlss_far));
+                    let fc = dlss::frame_constants(
+                        &cam,
+                        &mats,
+                        prev_mats.as_ref(),
+                        jit,
+                        dxr_reset,
+                        dlss_near,
+                        dlss_far,
+                        dxw,
+                        dxh,
+                    );
+                    gpu.present_dxr_rr(&p, &fc, dxr_up_idx)
+                };
+                match presented {
                     Ok(()) => {
                         last_ms = t.elapsed().as_secs_f64() * 1000.0;
-                        // Moving frames stay at frame 0: every one is a fresh
-                        // store, and the first still frame re-stores at full
-                        // quality instead of adding onto a while_moving()
-                        // sample #0.
-                        if !moved {
-                            frame += 1;
-                        }
+                        dxr_prev_cam = Some(cam);
+                        dxr_reset = false;
+                        dxr_up_idx = dxr_up_idx.wrapping_add(1);
                     }
                     Err(e) => {
-                        eprintln!("dxr: present failed ({e}); DXR OFF (F to retry)");
-                        dxr_on = false;
+                        let (name, key) =
+                            if dxr_up == GpuUp::Xess { ("XeSS", 'X') } else { ("DLSS-RR", 'G') };
+                        eprintln!("dxr: {name} present failed ({e}); presenting plain ({key} to retry)");
+                        dxr_up = GpuUp::Plain;
                         frame = 0;
                     }
                 }
-            } else if let Err(e) = gpu.present_dxr_hold() {
-                eprintln!("dxr: present failed: {e}");
+            } else {
+                let base_q = Quality::preset(preset);
+                // Hemi (H) tiers are CPU/wavefront features; the DXR
+                // closest-hit keeps the sampled-ambient path, so fb stays
+                // OFF here.
+                let q = if moved { base_q.while_moving() } else { base_q };
+                // The basis is the SESSION trace res (DxrGpu's buffers and
+                // DispatchRays dims are sized to it) — dxw x dxh, NOT the
+                // window: a composed session toggled plain via G/X still
+                // traces at the locked render res.
+                let p = gpu::trace::FrameParams {
+                    cam: cam.basis(dxw, dxh),
+                    frame,
+                    accumulate: true,
+                    jitter: frame > 0,
+                    frame_jitter: None,
+                    prev_cam: None,
+                    q,
+                    verify: false,
+                };
+                if frame < MAX_SAMPLES {
+                    match gpu.present_dxr(&p, frame + 1) {
+                        Ok(()) => {
+                            last_ms = t.elapsed().as_secs_f64() * 1000.0;
+                            // Moving frames stay at frame 0: every one is a
+                            // fresh store, and the first still frame
+                            // re-stores at full quality instead of adding
+                            // onto a while_moving() sample #0.
+                            if !moved {
+                                frame += 1;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("dxr: present failed ({e}); DXR OFF (F to retry)");
+                            dxr_on = false;
+                            frame = 0;
+                        }
+                    }
+                } else if let Err(e) = gpu.present_dxr_hold() {
+                    eprintln!("dxr: present failed: {e}");
+                }
+            }
+            // Stability meter (FRUSTRACER_STAB=1): the numeric dancing
+            // detector — same meter as the --gpu and CPU upscaler arms;
+            // healthy statics match their baselines (RR ≈ 0.14/255,
+            // XeSS ≈ 1.0/255).
+            if stab_on && dxr_up != GpuUp::Plain {
+                stab_n = stab_n.wrapping_add(1);
+                if stab_n % 15 == 0 {
+                    let cap = match dxr_up {
+                        GpuUp::Xess => gpu.read_xess_output(),
+                        _ => gpu.read_rr_output(),
+                    };
+                    if let Ok(px) = cap {
+                        if let Some(prev) = &stab_prev {
+                            if prev.len() == px.len() {
+                                let sum: u64 = px
+                                    .iter()
+                                    .zip(prev)
+                                    .map(|(a, b)| {
+                                        let d = |s: u32| {
+                                            ((a >> s) & 0xff).abs_diff((b >> s) & 0xff) as u64
+                                        };
+                                        d(16) + d(8) + d(0)
+                                    })
+                                    .sum();
+                                eprintln!(
+                                    "stab: mean |Δ| {:.2}/255 over 15 frames (window-res output; render {dxw}x{dxh})",
+                                    sum as f64 / (px.len() * 3) as f64,
+                                );
+                            }
+                        }
+                        stab_prev = Some(px);
+                    }
+                }
             }
             if edges.screenshot {
-                match gpu.read_dxr_output() {
+                // Upscaler sub-modes save the window-res upscaled output;
+                // plain saves the render-res hdr at its own dims — the
+                // --gpu P behavior.
+                let grab = match dxr_up {
+                    GpuUp::Rr => gpu.read_rr_output().map(|px| (px, w, h)),
+                    GpuUp::Xess => gpu.read_xess_output().map(|px| (px, w, h)),
+                    GpuUp::Plain => gpu.read_dxr_output(),
+                };
+                match grab {
                     Ok((px, sw, sh)) => {
                         let name = format!("screenshot_{shot}.png");
                         save_png(&name, &px, sw, sh);
@@ -8063,16 +9108,20 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 fps = fps_frames as f64 / (now - fps_t).as_secs_f64();
                 fps_frames = 0;
                 fps_t = now;
-                let _ = window.set_title(&format!(
-                    "frustracer | {:.0} fps | {:.1} ms | DXR {}x{} | quality {} | {} spp{}",
-                    fps,
-                    last_ms,
-                    W,
-                    H,
-                    preset,
-                    frame.min(MAX_SAMPLES),
-                    if frame >= MAX_SAMPLES { " | converged" } else { "" },
-                ));
+                let sub = match dxr_up {
+                    GpuUp::Rr => format!("DXR {dxw}x{dxh} -> DLSS-RR {w}x{h}"),
+                    GpuUp::Xess => format!("DXR {dxw}x{dxh} -> XeSS {w}x{h}"),
+                    GpuUp::Plain => format!(
+                        "DXR {}x{} | quality {} | {} spp{}",
+                        dxw,
+                        dxh,
+                        preset,
+                        frame.min(MAX_SAMPLES),
+                        if frame >= MAX_SAMPLES { " | converged" } else { "" },
+                    ),
+                };
+                let _ =
+                    window.set_title(&format!("frustracer | {fps:.0} fps | {last_ms:.1} ms | {sub}"));
             }
             continue;
         }
@@ -8119,8 +9168,8 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 let (_, min, max) = dlss_range.unwrap();
                 let (mn, mx) = ((min.0 as usize, min.1 as usize), (max.0 as usize, max.1 as usize));
                 let target =
-                    xess::quantize_res(dlss_ctl.as_ref().unwrap().scale(), (W, H), mn, mx);
-                let r = dlss_lim.apply(target, blown, (W, H), mn, mx);
+                    xess::quantize_res(dlss_ctl.as_ref().unwrap().scale(), (w, h), mn, mx);
+                let r = dlss_lim.apply(target, blown, (w, h), mn, mx);
                 log_drs_adoption("dlss", &dlss_lim, &mut dlss_ep);
                 r
             }
@@ -8136,8 +9185,8 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 let (_, min, max) = fsr_range.unwrap();
                 let (mn, mx) = ((min.0 as usize, min.1 as usize), (max.0 as usize, max.1 as usize));
                 let target =
-                    xess::quantize_res(fsr_ctl.as_ref().unwrap().scale(), (W, H), mn, mx);
-                let r = fsr_lim.apply(target, blown, (W, H), mn, mx);
+                    xess::quantize_res(fsr_ctl.as_ref().unwrap().scale(), (w, h), mn, mx);
+                let r = fsr_lim.apply(target, blown, (w, h), mn, mx);
                 log_drs_adoption("fsr", &fsr_lim, &mut fsr_ep);
                 r
             }
@@ -8149,20 +9198,20 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 let (_, min, max) = xess_range.unwrap();
                 let (mn, mx) = ((min.0 as usize, min.1 as usize), (max.0 as usize, max.1 as usize));
                 let target =
-                    xess::quantize_res(xess_ctl.as_ref().unwrap().scale(), (W, H), mn, mx);
-                let r = xess_lim.apply(target, blown, (W, H), mn, mx);
+                    xess::quantize_res(xess_ctl.as_ref().unwrap().scale(), (w, h), mn, mx);
+                let r = xess_lim.apply(target, blown, (w, h), mn, mx);
                 log_drs_adoption("xess", &xess_lim, &mut xess_ep);
                 r
             }
             // OIDN mode never drops to half-res: the G-buffers are full-res
             // and a half-res frame renders into a prefix with a different
             // stride. Budget (dynamic-res) frames are full-res and fine.
-            RenderMode::Oidn { .. } => (W, H),
+            RenderMode::Oidn { .. } => (w, h),
             // NPPD: fixed window res — the session's staging and the
             // recurrent state are laid out for it (no budget frames either).
-            RenderMode::Nppd => (W, H),
-            RenderMode::Plain if moved && !use_budget => (W / 2, H / 2),
-            RenderMode::Plain => (W, H),
+            RenderMode::Nppd => (w, h),
+            RenderMode::Plain if moved && !use_budget => (w / 2, h / 2),
+            RenderMode::Plain => (w, h),
         };
         if rw != prev_rw {
             // Fires on every distinct-res ramp frame by design — harmless in
@@ -8296,8 +9345,8 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 && !can_replay
                 && hybrid
                 && !use_budget
-                && rw <= W
-                && rh <= H;
+                && rw <= w
+                && rh <= h;
             if record {
                 replay_cache.begin(rw, rh);
             }
@@ -8313,7 +9362,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
             let temporal_on = opts.temporal
                 && !can_replay
                 && hybrid
-                && (upscaled || (rw, rh) == (W, H));
+                && (upscaled || (rw, rh) == (w, h));
             let (tcache_cur, tprev_vec, cut_cur, cut_prev) =
                 tr.begin(temporal_on, opts.adopt, rw, rh);
             let ctx = FrameCtx {
@@ -8467,7 +9516,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
         // overlay composite live in the CPU resolve. OIDN mode presents its
         // denoised output through the CPU path, so it excludes the GPU tonemap.
         let use_gpu_tone =
-            gpu_tonemap && !oidn_on && !nppd_on && rw == W && !(overlay_on && hybrid);
+            gpu_tonemap && !oidn_on && !nppd_on && rw == w && !(overlay_on && hybrid);
         if dlss_on {
             // DLSS-RR: hand the 1-spp radiance + G-buffers to the denoiser;
             // it outputs denoised HDR which the GPU tonemap presents.
@@ -8569,8 +9618,8 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 // proportional) — shedding render resolution wouldn't reduce
                 // it, so the scale controller must not see it.
                 pre_ms = 0.0;
-                if xess_hdr.len() != W * H * 3 {
-                    xess_hdr.resize(W * H * 3, 0.0);
+                if xess_hdr.len() != w * h * 3 {
+                    xess_hdr.resize(w * h * 3, 0.0);
                 }
                 match gpu.upscale_xess_to_cpu(
                     &gpu::xr::ColorSrc::Accum(&accum[..n]),
@@ -8591,7 +9640,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                         let og = oidn_gbufs.as_ref().expect("xess_oidn without gbufs");
                         og.upscale_guides_from(xg);
                         let result = octx
-                            .set_res(W, H)
+                            .set_res(w, h)
                             .and_then(|()| octx.denoise_hdr(&xess_hdr, og).map(drop));
                         match result {
                             Ok(()) => render::resolve_hdr(
@@ -8599,10 +9648,10 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                                 &info,
                                 false,
                                 &mut present,
-                                W,
-                                H,
-                                W,
-                                H,
+                                w,
+                                h,
+                                w,
+                                h,
                             ),
                             Err(e) => {
                                 eprintln!(
@@ -8610,7 +9659,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                                 );
                                 xess_oidn = XessOidn::Off;
                                 render::resolve_hdr(
-                                    &xess_hdr, &info, false, &mut present, W, H, W, H,
+                                    &xess_hdr, &info, false, &mut present, w, h, w, h,
                                 );
                             }
                         }
@@ -8746,10 +9795,10 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 let og = oidn_gbufs.as_ref().expect("oidn_on without gbufs");
                 // Returning from XeSS mode leaves the filter/history bound at
                 // a render res — rebind at window res (no-op otherwise).
-                let result = octx.set_res(W, H).and_then(|()| {
+                let result = octx.set_res(w, h).and_then(|()| {
                     if oidn_t {
                         let hist = oidn_hist.as_mut().expect("oidn_on without history");
-                        hist.set_res(W, H);
+                        hist.set_res(w, h);
                         let t0 = Instant::now();
                         last_hist =
                             hist.update(&basis, &accum, og, &info, dlss_far, MAX_SAMPLES as f32);
@@ -8765,10 +9814,10 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                         &info,
                         overlay_on && hybrid,
                         &mut present,
-                        W,
-                        H,
-                        W,
-                        H,
+                        w,
+                        h,
+                        w,
+                        h,
                     ),
                     Err(e) => {
                         eprintln!("oidn: denoise failed ({e}); OFF (N to retry)");
@@ -8789,8 +9838,8 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                             &mut present,
                             rw,
                             rh,
-                            W,
-                            H,
+                            w,
+                            h,
                         );
                     }
                 }
@@ -8800,10 +9849,10 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                     &info,
                     overlay_on && hybrid,
                     &mut present,
-                    W,
-                    H,
-                    W,
-                    H,
+                    w,
+                    h,
+                    w,
+                    h,
                 );
             }
             gpu.present_cpu(&present).expect("GPU present failed");
@@ -8818,7 +9867,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
             if rendered {
                 let ng = nppd_gbufs.as_ref().expect("nppd_on without gbufs");
                 let result = nctx
-                    .set_res(W, H)
+                    .set_res(w, h)
                     .and_then(|()| nctx.denoise(&accum, ng, &basis, dlss_far).map(drop));
                 match result {
                     Ok(()) => {
@@ -8827,10 +9876,10 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                             &info,
                             overlay_on && hybrid,
                             &mut present,
-                            W,
-                            H,
-                            W,
-                            H,
+                            w,
+                            h,
+                            w,
+                            h,
                         );
                         // The MV contract: prev is the camera of the last
                         // frame the recurrent state actually saw.
@@ -8851,8 +9900,8 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                             &mut present,
                             rw,
                             rh,
-                            W,
-                            H,
+                            w,
+                            h,
                         );
                     }
                 }
@@ -8869,8 +9918,8 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 &mut present,
                 rw,
                 rh,
-                W,
-                H,
+                w,
+                h,
             );
             gpu.present_cpu(&present).expect("GPU present failed");
         }
@@ -8936,7 +9985,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                     Ok(px) => present.copy_from_slice(&px),
                     Err(e) => {
                         eprintln!("screenshot: RR readback failed ({e}); saving noisy 1-spp resolve");
-                        render::resolve(&accum, &info, 1, false, &mut present, rw, rh, W, H);
+                        render::resolve(&accum, &info, 1, false, &mut present, rw, rh, w, h);
                     }
                 }
             } else if fsr_on {
@@ -8946,7 +9995,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                     Ok(px) => present.copy_from_slice(&px),
                     Err(e) => {
                         eprintln!("screenshot: FSR readback failed ({e}); saving noisy 1-spp resolve");
-                        render::resolve(&accum, &info, 1, false, &mut present, rw, rh, W, H);
+                        render::resolve(&accum, &info, 1, false, &mut present, rw, rh, w, h);
                     }
                 }
             } else if xess_on && xess_oidn != XessOidn::Post {
@@ -8957,16 +10006,16 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                     Ok(px) => present.copy_from_slice(&px),
                     Err(e) => {
                         eprintln!("screenshot: XeSS readback failed ({e}); saving noisy 1-spp resolve");
-                        render::resolve(&accum, &info, 1, false, &mut present, rw, rh, W, H);
+                        render::resolve(&accum, &info, 1, false, &mut present, rw, rh, w, h);
                     }
                 }
             } else if use_gpu_tone {
                 // The present buffer is stale in GPU-tonemap mode; resolve
                 // fresh for the screenshot.
-                render::resolve(&accum, &info, frame.max(1), false, &mut present, rw, rh, W, H);
+                render::resolve(&accum, &info, frame.max(1), false, &mut present, rw, rh, w, h);
             }
             let name = format!("screenshot_{shot}.png");
-            save_png(&name, &present, W, H);
+            save_png(&name, &present, w, h);
             eprintln!("saved {name}");
             shot += 1;
         }
@@ -8974,7 +10023,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
             eprintln!("verifying current view...");
             let vstats = Stats::default();
             // Cache-free on purpose: an independent ground-truth oracle.
-            let rep = render::verify(scene, bvh, &cam.basis(W, H), base_q, W, H, &vstats, None, &[], None);
+            let rep = render::verify(scene, bvh, &cam.basis(w, h), base_q, w, h, &vstats, None, &[], None);
             eprintln!(
                 "verify ({} px): false-sky {} | tmin-overshoot {} | hybrid-extra {} | max rel t err {:.2e} -> {}",
                 rep.pixels,
@@ -9001,10 +10050,10 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 if !dlss_on && !fsr_on && !xess_on && hybrid && dynamic { "+dyn" } else { "" },
                 if dlss_on {
                     if dlss_drs {
-                        format!(" | DLSS: dyn {}% + RR", rh * 100 / H)
-                    } else if opts.lock_scale.is_some() && (drw, drh) != (W, H) {
-                        format!(" | DLSS: lock {}% + RR", rh * 100 / H)
-                    } else if (drw, drh) == (W, H) {
+                        format!(" | DLSS: dyn {}% + RR", rh * 100 / h)
+                    } else if opts.lock_scale.is_some() && (drw, drh) != (w, h) {
+                        format!(" | DLSS: lock {}% + RR", rh * 100 / h)
+                    } else if (drw, drh) == (w, h) {
                         // Native render res means the optimal-settings query
                         // fell back to DLAA (or a native lock); anything
                         // smaller is Quality mode.
@@ -9017,14 +10066,14 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                         " | {}: {} {}%{}",
                         fsr_hud,
                         if fsr_lock.is_some() { "lock" } else { "dyn" },
-                        rh * 100 / H,
+                        rh * 100 / h,
                         fsr_hud_sfx,
                     )
                 } else if xess_on {
                     format!(
                         " | XeSS: {} {}%{}",
                         if xess_lock.is_some() { "lock" } else { "dyn" },
-                        rh * 100 / H,
+                        rh * 100 / h,
                         if xess_nppd {
                             match nppd_ctx.as_ref() {
                                 Some(c) =>
@@ -9104,7 +10153,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                         },
                         rw,
                         rh,
-                        rh * 100 / H
+                        rh * 100 / h
                     )
                 } else {
                     String::new()
@@ -9125,7 +10174,37 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 }
             );
         }
-    }
+    };
+
+    // Carry user-visible state into the next session (resize re-entry) or
+    // just record it on quit — cheap either way.
+    *persist = Some(Persist {
+        cam,
+        hybrid,
+        dynamic,
+        overlay_on,
+        gpu_tonemap,
+        bounce_mode,
+        preset,
+        dlss_on,
+        xess_on,
+        fsr_on,
+        oidn_on,
+        oidn_temporal,
+        xess_oidn,
+        nppd_on,
+        xess_nppd,
+        dxr_on,
+        dxr_up_plain: dxr_up == GpuUp::Plain,
+        gpu_up_plain: gpu_up == GpuUp::Plain,
+        gpu_nppd_on,
+        oidn_failed,
+        nppd_failed,
+        dxr_failed,
+        shot,
+        depth_est,
+    });
+    end
 }
 
 fn save_png(name: &str, present: &[u32], w: usize, h: usize) {

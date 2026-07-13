@@ -14,6 +14,10 @@
 //!   param 18                table          u8 = the RGBA16F HDR output
 //!                                          (typed texture UAVs can't be root
 //!                                          descriptors — the one exception)
+//!   param RP_SCENE_TEX      table          t0..t3 space1 + Texture2D[] at
+//!                                          t4.. space1 (scene textures; the
+//!                                          only other exception — texture
+//!                                          SRVs can't be root descriptors)
 
 use super::adapter;
 use super::d3d12::{self, committed_buffer, transition, uav_barrier, Result};
@@ -58,6 +62,19 @@ pub const RP_NPPD_STATE: u32 = RP_GBUF + 2;
 pub const RP_NPPD_WARPED: u32 = RP_GBUF + 3;
 pub const RP_NPPD_OUT: u32 = RP_GBUF + 4;
 pub const NPPD_REG_BASE: u32 = NUM_UAVS + 2 + NUM_FEED; // u23
+/// Scene textures + UV stream: one SRV descriptor table in register space1
+/// (collision-free with every space0 register above), appended after the
+/// NPPD params so nothing renumbers (62/64 root-signature DWORDs). Range 0 =
+/// t0..t3 space1 (texcoords, indices alias, tri_mat alias, mat_cutout);
+/// range 1 = t4.. space1, UNBOUNDED — the per-scene Texture2D array (must be
+/// the table's last range). Descriptors live in the same shader-visible heap
+/// as the u14/feed slots (only one CBV_SRV_UAV heap is bindable at a time),
+/// starting at slot TEX_HEAP_BASE.
+pub const RP_SCENE_TEX: u32 = RP_NPPD_OUT + 1;
+/// First heap slot of the scene-texture table (after hdr + the feed range).
+pub const TEX_HEAP_BASE: u32 = 1 + NUM_FEED;
+/// Buffer-SRV descriptors preceding the Texture2D array in the table.
+pub const TEX_TABLE_BUFS: u32 = 4;
 
 // SRV register assignments (t0..t7) — shared across every kernel; a kernel
 // declares only what it reads, DXC strips the rest.
@@ -108,6 +125,7 @@ pub const CTR_HEMI_EMPTY: u32 = 14;
 pub const CTR_HEMI_RAYS: u32 = 15;
 pub const CTR_V_FALSE_EMPTY: u32 = 16;
 pub const CTR_V_TMIN: u32 = 17;
+pub const CTR_ALPHA_REJ: u32 = 18;
 pub const CTR_COUNT: u32 = 24;
 
 // Indirect-args buffer slots: level d at slot d (depth_full <= 11 asserted
@@ -160,7 +178,7 @@ const LEAF_HLSL: &str = include_str!("shaders/leaf.hlsl");
 const HEMI_WAVE_HLSL: &str = include_str!("shaders/hemi_wave.hlsl");
 const HEMI_LEAF_HLSL: &str = include_str!("shaders/hemi_leaf.hlsl");
 const COMPOSE_HLSL: &str = include_str!("shaders/compose.hlsl");
-const FEED_HLSL: &str = include_str!("shaders/feed.hlsl");
+pub(crate) const FEED_HLSL: &str = include_str!("shaders/feed.hlsl");
 const NPPD_HLSL: &str = include_str!("shaders/nppd.hlsl");
 
 /// What the GPU tracer requires, queried once. RayQuery in compute needs
@@ -169,6 +187,7 @@ const NPPD_HLSL: &str = include_str!("shaders/nppd.hlsl");
 pub struct Caps {
     pub rt_tier: i32,
     pub shader_model: i32,
+    pub binding_tier: i32,
 }
 
 pub fn query_caps(device: &ID3D12Device) -> Result<Caps> {
@@ -203,7 +222,23 @@ pub fn query_caps(device: &ID3D12Device) -> Result<Caps> {
         }
         .map_err(|e| format!("CheckFeatureSupport(SHADER_MODEL): {e}"))?;
     }
-    Ok(Caps { rt_tier: o5.RaytracingTier.0, shader_model: sm.HighestShaderModel.0 })
+    // Resource binding tier: the root signature's unbounded scene-texture
+    // SRV range needs tier 2+ (tier 3 on all RT-capable hardware in
+    // practice — belt-and-braces with the loud-fallback story).
+    let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+    unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS,
+            &mut o as *mut _ as *mut _,
+            std::mem::size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS>() as u32,
+        )
+    }
+    .map_err(|e| format!("CheckFeatureSupport(OPTIONS): {e}"))?;
+    Ok(Caps {
+        rt_tier: o5.RaytracingTier.0,
+        shader_model: sm.HighestShaderModel.0,
+        binding_tier: o.ResourceBindingTier.0,
+    })
 }
 
 /// Errors with the specific missing capability (the message main.rs surfaces
@@ -225,6 +260,12 @@ pub fn require_caps(device: &ID3D12Device) -> Result<Caps> {
     }
     if device.cast::<ID3D12Device5>().is_err() {
         missing.push("ID3D12Device5 (acceleration-structure builds)".into());
+    }
+    if caps.binding_tier < D3D12_RESOURCE_BINDING_TIER_2.0 {
+        missing.push(format!(
+            "resource binding tier 2 (unbounded texture table) — device reports tier {}",
+            caps.binding_tier
+        ));
     }
     if missing.is_empty() {
         Ok(caps)
@@ -327,11 +368,60 @@ pub fn create_root_signature(device: &ID3D12Device) -> Result<ID3D12RootSignatur
             ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
         });
     }
+    // RP_SCENE_TEX: scene textures + UV stream, all in space1 (see the const
+    // note). The Texture2D range is unbounded (NumDescriptors u32::MAX, legal
+    // as the last range) — the heap slice is sized per scene at init.
+    // `tex_ranges` must outlive serialization below.
+    let tex_ranges = [
+        D3D12_DESCRIPTOR_RANGE {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+            NumDescriptors: TEX_TABLE_BUFS,
+            BaseShaderRegister: 0,
+            RegisterSpace: 1,
+            OffsetInDescriptorsFromTableStart: 0,
+        },
+        D3D12_DESCRIPTOR_RANGE {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+            NumDescriptors: u32::MAX,
+            BaseShaderRegister: TEX_TABLE_BUFS,
+            RegisterSpace: 1,
+            OffsetInDescriptorsFromTableStart: TEX_TABLE_BUFS,
+        },
+    ];
+    params.push(D3D12_ROOT_PARAMETER {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+        Anonymous: D3D12_ROOT_PARAMETER_0 {
+            DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                NumDescriptorRanges: 2,
+                pDescriptorRanges: tex_ranges.as_ptr(),
+            },
+        },
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+    });
+    // The one static sampler (0 root-signature DWORDs): bilinear, repeat
+    // wrap, no mips — the GPU mirror of texture.rs::sample_bilinear. The
+    // alpha-cutout test deliberately uses .Load, not a sampler (see
+    // trace_common.hlsli::alpha_cutout).
+    let samplers = [D3D12_STATIC_SAMPLER_DESC {
+        Filter: D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT,
+        AddressU: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+        AddressV: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+        AddressW: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+        MipLODBias: 0.0,
+        MaxAnisotropy: 0,
+        ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
+        BorderColor: D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK,
+        MinLOD: 0.0,
+        MaxLOD: 0.0,
+        ShaderRegister: 0,
+        RegisterSpace: 1,
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+    }];
     let desc = D3D12_ROOT_SIGNATURE_DESC {
         NumParameters: params.len() as u32,
         pParameters: params.as_ptr(),
-        NumStaticSamplers: 0,
-        pStaticSamplers: std::ptr::null(),
+        NumStaticSamplers: 1,
+        pStaticSamplers: samplers.as_ptr(),
         Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
     };
     let mut blob = None;
@@ -403,9 +493,9 @@ pub struct HeadlessGpu {
 }
 
 impl HeadlessGpu {
-    pub fn new(debug: bool) -> Result<Self> {
+    pub fn new(debug: bool, prefer: adapter::Prefer) -> Result<Self> {
         let factory = adapter::create_factory(debug).map_err(|e| format!("factory: {e}"))?;
-        let pick = adapter::pick(&factory, adapter::Prefer::Nvidia)?;
+        let pick = adapter::pick(&factory, prefer)?;
         let device = d3d12::create_device(&pick.adapter, debug)?;
         let queue = d3d12::create_queue(&device)?;
         let alloc: ID3D12CommandAllocator =
@@ -464,6 +554,17 @@ impl HeadlessGpu {
         let out = unsafe { std::slice::from_raw_parts(ptr as *const u8, size) }.to_vec();
         unsafe { rb.resource.Unmap(0, None) };
         Ok(out)
+    }
+}
+
+impl d3d12::Submit for HeadlessGpu {
+    fn run_list(
+        &mut self,
+        f: &mut dyn FnMut(&ID3D12GraphicsCommandList) -> Result<()>,
+    ) -> Result<()> {
+        let mut rec = Ok(());
+        self.run(|l| rec = f(l))?;
+        rec
     }
 }
 
@@ -564,6 +665,7 @@ pub fn smoke_test(hg: &mut HeadlessGpu, dxc: &Dxc, debug: bool) -> Result<()> {
 
 /// bvh.rs::BvhNode packed to 32 bytes for StructuredBuffer<BvhNode>.
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct GpuBvhNode {
     mn: [f32; 3],
     left_first: u32,
@@ -572,36 +674,96 @@ struct GpuBvhNode {
 }
 
 /// scene.rs::Material packed for StructuredBuffer<Mat> (shade.hlsli).
+/// 80 B — the HLSL `Mat` mirrors this field-for-field; a stride skew reads
+/// garbage, so the two must move in the same commit.
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct GpuMat {
     albedo: [f32; 3],
     roughness: f32,
     metallic: f32,
     anisotropy: f32,
-    kind: u32, // 0 = diffuse, 1 = marble
+    kind: u32, // 0 = diffuse, 1 = marble, 2 = textured
     scale: f32,
+    sheen: f32,
+    translucency: f32,
+    transmission: f32,
+    /// `Scene::textures` index for MAT_TEXTURED (the space1 `texs[]` slot).
+    tex: u32,
+    emissive: [f32; 3],
+    normal_tex: u32, // NO_TEX sentinel = HLSL TEX_NONE
+    rough_tex: u32,
+    metal_tex: u32,
+    emissive_tex: u32,
+    normal_scale: f32,
 }
 
-fn as_bytes<T>(v: &[T]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+/// Bytes of reusable staging streamed per blocking submit — bounds the
+/// upload's transient commit to one chunk instead of a full second copy of
+/// every scene stream (which at 100M tris was ~7 GB of upload heaps ON TOP of
+/// ~7 GB of repack Vecs).
+const STAGE_CHUNK: usize = 256 << 20;
+
+/// Steady-state byte total of the scene's buffer streams (excludes textures
+/// and acceleration structures) — sizes the staging ring and the init report.
+fn scene_stream_bytes(scene: &Scene, sw_bvh: Option<&Bvh>) -> usize {
+    let v = scene.positions.len();
+    let t = scene.indices.len();
+    let m = scene.materials.len();
+    let bvh = sw_bvh
+        .map_or(0, |b| b.nodes.len() * size_of::<GpuBvhNode>() + b.tri_idx.len() * 4);
+    bvh + v * (12 + 12 + 8) + t * (12 + 4) + m * (size_of::<GpuMat>() + 4)
 }
 
-/// One pending default-heap upload: staging src, dest, size, post-copy state.
-struct PendingUpload {
-    src: d3d12::UploadBuffer,
-    dst: ID3D12Resource,
-    size: usize,
+/// Stream `src` into a new default-heap buffer through `ring`, `map`ping each
+/// element into the mapped staging pointer chunk-by-chunk (identity for
+/// layout-compatible streams, a repack for Vec3A→float3 / BvhNode→GpuBvhNode).
+/// Each chunk is one blocking `Submit::run_list`; the final chunk's list also
+/// records the COPY_DEST→`after` transition. Empty streams get a 4-byte dummy
+/// created directly in `after`.
+fn stream_buffer<T: Copy, U: Copy>(
+    device: &ID3D12Device,
+    sub: &mut dyn d3d12::Submit,
+    ring: &d3d12::UploadBuffer,
+    src: &[T],
+    map: impl Fn(&T) -> U,
     after: D3D12_RESOURCE_STATES,
-}
-
-struct SceneStaging {
-    uploads: Vec<PendingUpload>,
-    scratch: ID3D12Resource,
-    /// TLAS instance descs live in an upload buffer for the build's duration.
-    _instance: d3d12::UploadBuffer,
-    instance_va: u64,
-    blas_scratch_size: u64,
-    tlas_scratch_size: u64,
+) -> Result<ID3D12Resource> {
+    if src.is_empty() {
+        return committed_buffer(device, 4, D3D12_RESOURCE_FLAG_NONE, after);
+    }
+    let total = std::mem::size_of::<U>() * src.len();
+    let dst = committed_buffer(
+        device,
+        total as u64,
+        D3D12_RESOURCE_FLAG_NONE,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+    )?;
+    let per = (ring.size / std::mem::size_of::<U>()).max(1);
+    let mut e = 0usize;
+    while e < src.len() {
+        let n = per.min(src.len() - e);
+        unsafe {
+            let out = std::slice::from_raw_parts_mut(ring.ptr as *mut U, n);
+            for (o, s) in out.iter_mut().zip(&src[e..e + n]) {
+                *o = map(s);
+            }
+        }
+        let off = (e * std::mem::size_of::<U>()) as u64;
+        let bytes = (n * std::mem::size_of::<U>()) as u64;
+        let last = e + n == src.len();
+        sub.run_list(&mut |l| {
+            unsafe { l.CopyBufferRegion(&dst, off, &ring.resource, 0, bytes) };
+            if last {
+                unsafe {
+                    l.ResourceBarrier(&[transition(&dst, D3D12_RESOURCE_STATE_COPY_DEST, after)])
+                };
+            }
+            Ok(())
+        })?;
+        e += n;
+    }
+    Ok(dst)
 }
 
 pub struct SceneGpu {
@@ -612,51 +774,108 @@ pub struct SceneGpu {
     pub indices: ID3D12Resource,
     pub tri_mat: ID3D12Resource,
     pub materials: ID3D12Resource,
+    /// Never read, but MUST be held: the TLAS instance desc bakes only the
+    /// (compacted) BLAS's GPU VA — dropping this resource would free the
+    /// memory the TLAS points into.
+    #[allow(dead_code)]
     pub blas: ID3D12Resource,
     pub tlas: ID3D12Resource,
+    /// `Scene::texcoords` as float2 per vertex (parallel to positions; zeros
+    /// on procedural scenes — 4 dummy bytes, never read there).
+    pub texcoords: ID3D12Resource,
+    /// Per-material cutout map: `tex + 1` when the material is textured AND
+    /// its texture has masked texels, else 0 (mirrors the bvh.rs cutout
+    /// gates: MatKind::Textured -> Texture::alpha_masked).
+    pub mat_cutout: ID3D12Resource,
+    /// One RGBA8 Texture2D per `Scene::textures` entry, 1 mip (the CPU
+    /// samples bilinear with no mip chain — parity over aliasing); _SRGB for
+    /// color textures, _UNORM for linear-data maps (Texture::srgb).
+    pub textures: Vec<ID3D12Resource>,
     n_verts: u32,
     n_tris: u32,
-    staging: Option<SceneStaging>,
-}
-
-fn upload_pair(
-    device: &ID3D12Device,
-    bytes: &[u8],
-    after: D3D12_RESOURCE_STATES,
-) -> Result<(ID3D12Resource, PendingUpload)> {
-    let size = bytes.len().max(4);
-    let dst = committed_buffer(
-        device,
-        size as u64,
-        D3D12_RESOURCE_FLAG_NONE,
-        D3D12_RESOURCE_STATE_COPY_DEST,
-    )?;
-    let src = d3d12::UploadBuffer::new(device, size)?;
-    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), src.ptr, bytes.len()) };
-    let pending = PendingUpload { src, dst: dst.clone(), size, after };
-    Ok((dst, pending))
+    n_mats: u32,
 }
 
 impl SceneGpu {
-    pub fn new(device: &ID3D12Device, scene: &Scene, bvh: &Bvh) -> Result<Self> {
+    /// Create AND upload the scene in one call: every stream chunks through
+    /// one reusable `STAGE_CHUNK` staging ring (blocking submits via `sub`),
+    /// then the BLAS + TLAS build rides a final submit — scratch and staging
+    /// are gone by the time this returns, so peak commit is
+    /// steady-state + one chunk, not steady-state × 2. `sw_bvh: None` is the
+    /// DXR-only session: the software BVH (frustum kernels' tree) is never
+    /// bound there, so `bvh_nodes`/`tri_idx` become 4-byte dummies (~2.3 GB
+    /// saved at 100M tris).
+    pub fn new_uploaded(
+        device: &ID3D12Device,
+        scene: &Scene,
+        sw_bvh: Option<&Bvh>,
+        sub: &mut dyn d3d12::Submit,
+    ) -> Result<Self> {
         let device5: ID3D12Device5 = device
             .cast()
             .map_err(|e| format!("ID3D12Device5 (require_caps should have gated): {e}"))?;
 
-        // --- pack CPU-side data ---
-        let nodes: Vec<GpuBvhNode> = bvh
-            .nodes
+        let srv = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        // The texture band loop below needs at least ONE full aligned row in
+        // the ring (`scene_stream_bytes` deliberately excludes textures, and
+        // its geometry-only size can undershoot a wide texture's pitch on a
+        // small mesh — the band `.max(1)` would then overrun the mapping).
+        let max_tex_pitch = scene
+            .textures
             .iter()
-            .map(|n| GpuBvhNode {
-                mn: [n.aabb.min.x, n.aabb.min.y, n.aabb.min.z],
-                left_first: n.left_first,
-                mx: [n.aabb.max.x, n.aabb.max.y, n.aabb.max.z],
-                count: n.count,
-            })
-            .collect();
-        let positions: Vec<[f32; 3]> = scene.positions.iter().map(|p| [p.x, p.y, p.z]).collect();
-        let normals: Vec<[f32; 3]> = scene.normals.iter().map(|n| [n.x, n.y, n.z]).collect();
-        let indices: Vec<u32> = scene.indices.iter().flatten().copied().collect();
+            .map(|t| d3d12::aligned_pitch(t.w as usize * 4))
+            .max()
+            .unwrap_or(0);
+        let ring = d3d12::UploadBuffer::new(
+            device,
+            STAGE_CHUNK
+                .min(scene_stream_bytes(scene, sw_bvh).max(4096))
+                .max(max_tex_pitch),
+        )?;
+
+        let (bvh_nodes, tri_idx) = match sw_bvh {
+            Some(bvh) => (
+                stream_buffer(
+                    device,
+                    sub,
+                    &ring,
+                    &bvh.nodes,
+                    |n| GpuBvhNode {
+                        mn: [n.aabb.min.x, n.aabb.min.y, n.aabb.min.z],
+                        left_first: n.left_first,
+                        mx: [n.aabb.max.x, n.aabb.max.y, n.aabb.max.z],
+                        count: n.count,
+                    },
+                    srv,
+                )?,
+                stream_buffer(device, sub, &ring, &bvh.tri_idx, |t| *t, srv)?,
+            ),
+            None => (
+                committed_buffer(device, 4, D3D12_RESOURCE_FLAG_NONE, srv)?,
+                committed_buffer(device, 4, D3D12_RESOURCE_FLAG_NONE, srv)?,
+            ),
+        };
+        let positions_b = stream_buffer(
+            device,
+            sub,
+            &ring,
+            &scene.positions,
+            |p| [p.x, p.y, p.z],
+            srv,
+        )?;
+        let normals_b =
+            stream_buffer(device, sub, &ring, &scene.normals, |n| [n.x, n.y, n.z], srv)?;
+        // [u32;3] tris flatten to the u32 index stream by layout.
+        let indices_b = stream_buffer(device, sub, &ring, &scene.indices, |t| *t, srv)?;
+        let tri_mat = stream_buffer(device, sub, &ring, &scene.tri_mat, |t| *t, srv)?;
+        let texcoords_b = stream_buffer(
+            device,
+            sub,
+            &ring,
+            &scene.texcoords,
+            |t| [t.x, t.y],
+            srv,
+        )?;
         let materials: Vec<GpuMat> = scene
             .materials
             .iter()
@@ -668,36 +887,128 @@ impl SceneGpu {
                 kind: match m.kind {
                     MatKind::Diffuse => 0,
                     MatKind::Marble { .. } => 1,
+                    MatKind::Textured { .. } => 2,
                 },
                 scale: match m.kind {
                     MatKind::Marble { scale } => scale,
                     _ => 0.0,
                 },
+                sheen: m.sheen,
+                translucency: m.translucency,
+                transmission: m.transmission,
+                tex: match m.kind {
+                    MatKind::Textured { tex } => tex,
+                    _ => 0,
+                },
+                emissive: [m.emissive.x, m.emissive.y, m.emissive.z],
+                normal_tex: m.normal_tex,
+                rough_tex: m.rough_tex,
+                metal_tex: m.metal_tex,
+                emissive_tex: m.emissive_tex,
+                normal_scale: m.normal_scale,
             })
             .collect();
+        let materials_b = stream_buffer(device, sub, &ring, &materials, |m| *m, srv)?;
+        // Per-material cutout map the alpha_cutout helper consumes.
+        let mat_cutout: Vec<u32> = scene
+            .materials
+            .iter()
+            .map(|m| match m.kind {
+                MatKind::Textured { tex } if scene.textures[tex as usize].alpha_masked => tex + 1,
+                _ => 0,
+            })
+            .collect();
+        let mat_cutout_b = stream_buffer(device, sub, &ring, &mat_cutout, |m| *m, srv)?;
+        if !scene.textures.is_empty() {
+            let mb = scene.textures.iter().map(|t| t.w as u64 * t.h as u64 * 4).sum::<u64>()
+                >> 20;
+            eprintln!(
+                "gpu: {} textures uploaded ({} MB{})",
+                scene.textures.len(),
+                mb,
+                if scene.any_alpha { ", alpha cutout on" } else { "" }
+            );
+        }
 
-        let srv = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-        let mut uploads = Vec::new();
-        let mut up = |bytes: &[u8]| -> Result<ID3D12Resource> {
-            let (dst, p) = upload_pair(device, bytes, srv)?;
-            uploads.push(p);
-            Ok(dst)
-        };
-        let bvh_nodes = up(as_bytes(&nodes))?;
-        let tri_idx = up(as_bytes(&bvh.tri_idx))?;
-        let positions_b = up(as_bytes(&positions))?;
-        let normals_b = up(as_bytes(&normals))?;
-        let indices_b = up(as_bytes(&indices))?;
-        let tri_mat = up(as_bytes(&scene.tri_mat))?;
-        let materials_b = up(as_bytes(&materials))?;
+        // Scene textures: RGBA8 Texture2Ds — _SRGB for color textures (the
+        // per-texel decode of texture.rs::sample_bilinear in hardware) and
+        // plain _UNORM for linear-data maps (normal / rough-metal; the CPU
+        // samples those via sample_bilinear_linear). Texels upload raw (row
+        // 0 = v0, the V flip is baked at OBJ load) in row bands through the
+        // same staging ring — no per-texture staging commit.
+        let mut textures_v = Vec::new();
+        for t in &scene.textures {
+            let fmt = if t.srgb {
+                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+            } else {
+                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM
+            };
+            let dst = d3d12::committed_tex(
+                device,
+                t.w,
+                t.h,
+                fmt,
+                D3D12_RESOURCE_FLAG_NONE,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            )?;
+            let pitch = d3d12::aligned_pitch(t.w as usize * 4);
+            let band = (ring.size / pitch).max(1).min(t.h as usize);
+            let mut y0 = 0usize;
+            while y0 < t.h as usize {
+                let rows = band.min(t.h as usize - y0);
+                for r in 0..rows {
+                    let y = y0 + r;
+                    let row = &t.texels[y * t.w as usize..(y + 1) * t.w as usize];
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            row.as_ptr() as *const u8,
+                            ring.ptr.add(r * pitch),
+                            t.w as usize * 4,
+                        )
+                    };
+                }
+                let fp = d3d12::footprint(fmt, t.w, rows as u32, 4, 0);
+                let last = y0 + rows == t.h as usize;
+                sub.run_list(&mut |l| {
+                    unsafe {
+                        l.CopyTextureRegion(
+                            &d3d12::loc_subresource(&dst),
+                            0,
+                            y0 as u32,
+                            0,
+                            &d3d12::loc_footprint(&ring.resource, fp),
+                            None,
+                        )
+                    };
+                    if last {
+                        unsafe {
+                            l.ResourceBarrier(&[transition(
+                                &dst,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                            )])
+                        };
+                    }
+                    Ok(())
+                })?;
+                y0 += rows;
+            }
+            textures_v.push(dst);
+        }
 
         // --- acceleration-structure sizing ---
         let n_verts = scene.positions.len() as u32;
         let n_tris = scene.indices.len() as u32;
-        let geom = geometry_desc(&positions_b, &indices_b, n_verts, n_tris);
+        let geom = geometry_desc(&positions_b, &indices_b, n_verts, n_tris, scene.any_alpha);
+        // ALLOW_COMPACTION: the build lands in a worst-case-sized buffer,
+        // then a compact copy (~40-50% smaller in practice) replaces it and
+        // the original drops before this function returns — the compacted
+        // size is what buys DXR headroom on 100M-tri scenes.
+        let blas_flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE
+            | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_COMPACTION;
         let blas_inputs = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
             Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL,
-            Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE,
+            Flags: blas_flags,
             NumDescs: 1,
             DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
             Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
@@ -724,16 +1035,81 @@ impl SceneGpu {
 
         let uaf = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         let as_state = D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE;
-        let blas =
-            committed_buffer(device, blas_info.ResultDataMaxSizeInBytes, uaf, as_state)?;
         let tlas =
             committed_buffer(device, tlas_info.ResultDataMaxSizeInBytes, uaf, as_state)?;
+        // The worst-case-sized build target, scratch, and the TLAS instance
+        // desc all live only to the end of this function — peak commit is
+        // steady-state (compacted BLAS) + one worst-case BLAS + scratch.
+        let blas_full =
+            committed_buffer(device, blas_info.ResultDataMaxSizeInBytes, uaf, as_state)?;
         let scratch = committed_buffer(
             device,
             blas_info.ScratchDataSizeInBytes.max(tlas_info.ScratchDataSizeInBytes),
             uaf,
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         )?;
+
+        // Submit 1: BLAS build, emitting the compacted size (a u64 written to
+        // a tiny UAV buffer, copied to readback in the same list — the
+        // blocking submit doubles as the fence).
+        let csize_buf =
+            committed_buffer(device, 8, uaf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)?;
+        let csize_rb = d3d12::ReadbackBuffer::new(device, 8)?;
+        sub.run_list(&mut |list| {
+            let list4: ID3D12GraphicsCommandList4 =
+                list.cast().map_err(|e| format!("ID3D12GraphicsCommandList4: {e}"))?;
+            let blas_desc = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
+                DestAccelerationStructureData: unsafe { blas_full.GetGPUVirtualAddress() },
+                Inputs: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
+                    Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL,
+                    Flags: blas_flags,
+                    NumDescs: 1,
+                    DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
+                    Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+                        pGeometryDescs: &geom,
+                    },
+                },
+                SourceAccelerationStructureData: 0,
+                ScratchAccelerationStructureData: unsafe { scratch.GetGPUVirtualAddress() },
+            };
+            let postbuild = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC {
+                DestBuffer: unsafe { csize_buf.GetGPUVirtualAddress() },
+                InfoType:
+                    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_COMPACTED_SIZE,
+            };
+            unsafe { list4.BuildRaytracingAccelerationStructure(&blas_desc, Some(&[postbuild])) };
+            unsafe {
+                list.ResourceBarrier(&[
+                    uav_barrier(None),
+                    transition(
+                        &csize_buf,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    ),
+                ])
+            };
+            unsafe { list.CopyBufferRegion(&csize_rb.resource, 0, &csize_buf, 0, 8) };
+            Ok(())
+        })?;
+        let compacted_size = {
+            let mut ptr = std::ptr::null_mut();
+            unsafe { csize_rb.resource.Map(0, None, Some(&mut ptr)) }
+                .map_err(|e| format!("compacted-size Map: {e}"))?;
+            let v = unsafe { (ptr as *const u64).read_unaligned() };
+            unsafe { csize_rb.resource.Unmap(0, None) };
+            v
+        };
+
+        // Submit 2: compact copy into an exact-size buffer, then the TLAS
+        // build against the COMPACTED BLAS. A degenerate reported size keeps
+        // the full build (never wrong, just bigger).
+        let use_compact =
+            compacted_size > 0 && compacted_size < blas_info.ResultDataMaxSizeInBytes;
+        let blas = if use_compact {
+            committed_buffer(device, compacted_size, uaf, as_state)?
+        } else {
+            blas_full.clone()
+        };
 
         // Identity-instance TLAS: InstanceID 0, mask 0xff, contribution 0,
         // no flags (geometry is OPAQUE; two-sidedness comes from tracing
@@ -756,6 +1132,59 @@ impl SceneGpu {
         };
         let instance_va = unsafe { instance.resource.GetGPUVirtualAddress() };
 
+        sub.run_list(&mut |list| {
+            let list4: ID3D12GraphicsCommandList4 =
+                list.cast().map_err(|e| format!("ID3D12GraphicsCommandList4: {e}"))?;
+            if use_compact {
+                unsafe {
+                    list4.CopyRaytracingAccelerationStructure(
+                        blas.GetGPUVirtualAddress(),
+                        blas_full.GetGPUVirtualAddress(),
+                        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_COMPACT,
+                    )
+                };
+                unsafe { list.ResourceBarrier(&[uav_barrier(None)]) };
+            }
+            let tlas_desc = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
+                DestAccelerationStructureData: unsafe { tlas.GetGPUVirtualAddress() },
+                Inputs: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
+                    Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL,
+                    Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE,
+                    NumDescs: 1,
+                    DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
+                    Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+                        InstanceDescs: instance_va,
+                    },
+                },
+                SourceAccelerationStructureData: 0,
+                ScratchAccelerationStructureData: unsafe { scratch.GetGPUVirtualAddress() },
+            };
+            unsafe { list4.BuildRaytracingAccelerationStructure(&tlas_desc, None) };
+            unsafe { list.ResourceBarrier(&[uav_barrier(None)]) };
+            Ok(())
+        })?;
+        drop(instance);
+        drop(scratch);
+        drop(blas_full);
+        drop(ring);
+
+        eprintln!(
+            "gpu scene: streams {} MB | blas {} MB{} | transient scratch {} MB (freed){}",
+            scene_stream_bytes(scene, sw_bvh) >> 20,
+            if use_compact { compacted_size } else { blas_info.ResultDataMaxSizeInBytes } >> 20,
+            if use_compact {
+                format!(" (compacted from {})", blas_info.ResultDataMaxSizeInBytes >> 20)
+            } else {
+                String::new()
+            },
+            blas_info.ScratchDataSizeInBytes.max(tlas_info.ScratchDataSizeInBytes) >> 20,
+            match adapter::vram_info(device) {
+                Some((usage, budget)) =>
+                    format!(" | vram {} / {} MB", usage >> 20, budget >> 20),
+                None => String::new(),
+            }
+        );
+
         Ok(Self {
             bvh_nodes,
             tri_idx,
@@ -766,75 +1195,84 @@ impl SceneGpu {
             materials: materials_b,
             blas,
             tlas,
+            texcoords: texcoords_b,
+            mat_cutout: mat_cutout_b,
+            textures: textures_v,
             n_verts,
             n_tris,
-            staging: Some(SceneStaging {
-                uploads,
-                scratch,
-                _instance: instance,
-                instance_va,
-                blas_scratch_size: blas_info.ScratchDataSizeInBytes,
-                tlas_scratch_size: tlas_info.ScratchDataSizeInBytes,
-            }),
+            n_mats: scene.materials.len() as u32,
         })
     }
 
-    /// Record the one-time init: buffer copies, transitions, BLAS + TLAS
-    /// builds. Call once, execute, then `free_staging`.
-    pub fn record_upload(&self, list: &ID3D12GraphicsCommandList) -> Result<()> {
-        let st = self.staging.as_ref().ok_or("scene staging already freed")?;
-        let list4: ID3D12GraphicsCommandList4 =
-            list.cast().map_err(|e| format!("ID3D12GraphicsCommandList4: {e}"))?;
-        let mut barriers = Vec::new();
-        for u in &st.uploads {
-            unsafe { list.CopyBufferRegion(&u.dst, 0, &u.src.resource, 0, u.size as u64) };
-            barriers.push(transition(&u.dst, D3D12_RESOURCE_STATE_COPY_DEST, u.after));
+    /// Write the RP_SCENE_TEX table's descriptors into `heap` at slots
+    /// `base..`: 4 buffer SRVs (texcoords, indices, tri_mat, mat_cutout —
+    /// t0..t3 space1) then one Texture2D SRV per scene texture (t4.. space1).
+    /// The heap must be sized `base + TEX_TABLE_BUFS + textures.len()`.
+    pub fn write_scene_descriptors(
+        &self,
+        device: &ID3D12Device,
+        heap: &ID3D12DescriptorHeap,
+        base: u32,
+    ) {
+        let inc = unsafe {
+            device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+        };
+        let start = unsafe { heap.GetCPUDescriptorHandleForHeapStart() };
+        let slot = |i: u32| D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: start.ptr + ((base + i) as usize * inc as usize),
+        };
+        let buf_srv = |res: &ID3D12Resource, stride: u32, elems: u32, at: u32| {
+            let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN,
+                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_SRV {
+                        FirstElement: 0,
+                        NumElements: elems.max(1),
+                        StructureByteStride: stride,
+                        Flags: D3D12_BUFFER_SRV_FLAG_NONE,
+                    },
+                },
+            };
+            unsafe { device.CreateShaderResourceView(res, Some(&desc), slot(at)) };
+        };
+        buf_srv(&self.texcoords, 8, self.n_verts, 0);
+        buf_srv(&self.indices, 4, self.n_tris * 3, 1);
+        buf_srv(&self.tri_mat, 4, self.n_tris, 2);
+        buf_srv(&self.mat_cutout, 4, self.n_mats, 3);
+        for (i, tex) in self.textures.iter().enumerate() {
+            let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                // The resource's own creation format: _SRGB for color
+                // textures, _UNORM for linear-data maps.
+                Format: unsafe { tex.GetDesc() }.Format,
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2D: D3D12_TEX2D_SRV {
+                        MostDetailedMip: 0,
+                        MipLevels: 1,
+                        PlaneSlice: 0,
+                        ResourceMinLODClamp: 0.0,
+                    },
+                },
+            };
+            unsafe {
+                device.CreateShaderResourceView(
+                    tex,
+                    Some(&desc),
+                    slot(TEX_TABLE_BUFS + i as u32),
+                )
+            };
         }
-        unsafe { list.ResourceBarrier(&barriers) };
-
-        let geom = geometry_desc(&self.positions, &self.indices, self.n_verts, self.n_tris);
-        let scratch_va = unsafe { st.scratch.GetGPUVirtualAddress() };
-        let _ = (st.blas_scratch_size, st.tlas_scratch_size);
-        let blas_desc = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
-            DestAccelerationStructureData: unsafe { self.blas.GetGPUVirtualAddress() },
-            Inputs: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
-                Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL,
-                Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE,
-                NumDescs: 1,
-                DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
-                Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
-                    pGeometryDescs: &geom,
-                },
-            },
-            SourceAccelerationStructureData: 0,
-            ScratchAccelerationStructureData: scratch_va,
-        };
-        unsafe { list4.BuildRaytracingAccelerationStructure(&blas_desc, None) };
-        // The TLAS build reads the BLAS; scratch is also reused.
-        unsafe { list.ResourceBarrier(&[uav_barrier(None)]) };
-        let tlas_desc = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
-            DestAccelerationStructureData: unsafe { self.tlas.GetGPUVirtualAddress() },
-            Inputs: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
-                Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL,
-                Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE,
-                NumDescs: 1,
-                DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
-                Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
-                    InstanceDescs: st.instance_va,
-                },
-            },
-            SourceAccelerationStructureData: 0,
-            ScratchAccelerationStructureData: scratch_va,
-        };
-        unsafe { list4.BuildRaytracingAccelerationStructure(&tlas_desc, None) };
-        unsafe { list.ResourceBarrier(&[uav_barrier(None)]) };
-        Ok(())
     }
+}
 
-    /// Drop the staging buffers + scratch after the upload list executed.
-    pub fn free_staging(&mut self) {
-        self.staging = None;
-    }
+/// Per-scene HLSL prelude: alpha-masked scenes compile the cutout candidate
+/// loops / any-hit shaders in; opaque scenes compile byte-identical sources
+/// to the pre-cutout tracer. Shared with dxr.rs (the DXR library concat).
+pub(crate) fn alpha_defs(scene: &Scene) -> &'static str {
+    if scene.any_alpha { "#define ALPHA_CUTOUT 1" } else { "" }
 }
 
 fn geometry_desc(
@@ -842,11 +1280,19 @@ fn geometry_desc(
     indices: &ID3D12Resource,
     n_verts: u32,
     n_tris: u32,
+    any_alpha: bool,
 ) -> D3D12_RAYTRACING_GEOMETRY_DESC {
     D3D12_RAYTRACING_GEOMETRY_DESC {
         Type: D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES,
-        // OPAQUE == the kernels' FORCE_OPAQUE assumption (no any-hit ever).
-        Flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE,
+        // OPAQUE == the kernels' FORCE_OPAQUE assumption (no any-hit ever) —
+        // the per-scene fast path. Alpha-masked scenes build with NONE so
+        // candidates surface to the ALPHA_CUTOUT candidate loops / any-hit
+        // shaders (compiled in under the same per-scene predicate).
+        Flags: if any_alpha {
+            D3D12_RAYTRACING_GEOMETRY_FLAG_NONE
+        } else {
+            D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE
+        },
         Anonymous: D3D12_RAYTRACING_GEOMETRY_DESC_0 {
             Triangles: D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC {
                 Transform3x4: 0,
@@ -1139,6 +1585,9 @@ pub struct TraceGpu {
     pub gbuf: ID3D12Resource,
     gbuf_full: bool,
     uav_heap: ID3D12DescriptorHeap,
+    /// GPU handle of the RP_SCENE_TEX table's first descriptor (heap slot
+    /// TEX_HEAP_BASE) — bound by bind_common for every trace dispatch.
+    tex_table: D3D12_GPU_DESCRIPTOR_HANDLE,
     frame_cb: d3d12::UploadBuffer,
     cb_base: FrameCb,
     pub rw: u32,
@@ -1160,23 +1609,38 @@ impl TraceGpu {
         gbuf_full: bool,
         nppd: bool,
         debug: bool,
+        sub: &mut dyn d3d12::Submit,
     ) -> Result<Self> {
         require_caps(device)?;
         let root_sig = create_root_signature(device)?;
         let cmd_sig = create_dispatch_signature(device)?;
 
-        let reference_src = [TRACE_COMMON_HLSLI, RT_HLSLI, SHADE_HLSLI, REFERENCE_HLSL].join("\n");
+        // Alpha-masked scenes compile the cutout candidate loops into the
+        // trace primitives (rt.hlsli); opaque scenes compile the FORCE_OPAQUE
+        // originals verbatim (modulo a leading blank line) — procedural/
+        // stress sessions are structurally untouched (the bit gates rely on
+        // that).
+        let defs = alpha_defs(scene);
+        let reference_src =
+            [defs, TRACE_COMMON_HLSLI, RT_HLSLI, SHADE_HLSLI, REFERENCE_HLSL].join("\n");
         let resolve_src = [TRACE_COMMON_HLSLI, RESOLVE_HLSL].join("\n");
         let wavefront_src =
             [TRACE_COMMON_HLSLI, CTR_HLSLI, QUEUES_HLSLI, FRUSTUM_HLSLI, WAVEFRONT_HLSL].join("\n");
         let leaf_src =
-            [TRACE_COMMON_HLSLI, CTR_HLSLI, QUEUES_HLSLI, RT_HLSLI, SHADE_HLSLI, LEAF_HLSL]
+            [defs, TRACE_COMMON_HLSLI, CTR_HLSLI, QUEUES_HLSLI, RT_HLSLI, SHADE_HLSLI, LEAF_HLSL]
                 .join("\n");
-        let hemi_wave_src =
-            [TRACE_COMMON_HLSLI, CTR_HLSLI, HEMI_HLSLI, FRUSTUM_HLSLI, RT_HLSLI, HEMI_WAVE_HLSL]
-                .join("\n");
+        let hemi_wave_src = [
+            defs,
+            TRACE_COMMON_HLSLI,
+            CTR_HLSLI,
+            HEMI_HLSLI,
+            FRUSTUM_HLSLI,
+            RT_HLSLI,
+            HEMI_WAVE_HLSL,
+        ]
+        .join("\n");
         let hemi_leaf_src =
-            [TRACE_COMMON_HLSLI, CTR_HLSLI, HEMI_HLSLI, RT_HLSLI, SHADE_HLSLI, HEMI_LEAF_HLSL]
+            [defs, TRACE_COMMON_HLSLI, CTR_HLSLI, HEMI_HLSLI, RT_HLSLI, SHADE_HLSLI, HEMI_LEAF_HLSL]
                 .join("\n");
         let compose_src = [TRACE_COMMON_HLSLI, CTR_HLSLI, QUEUES_HLSLI, COMPOSE_HLSL].join("\n");
         let feed_src = [TRACE_COMMON_HLSLI, FEED_HLSL].join("\n");
@@ -1222,7 +1686,7 @@ impl TraceGpu {
             None
         };
 
-        let scene_gpu = SceneGpu::new(device, scene, bvh)?;
+        let scene_gpu = SceneGpu::new_uploaded(device, scene, Some(bvh), sub)?;
 
         let uaf = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         let ua = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
@@ -1309,11 +1773,16 @@ impl TraceGpu {
         };
         // Slot 0 = hdr (u14, resolve); slots 1..7 = the upscaler feed targets
         // (u16..u22), wired per session by wire_feed — null until then (RS 1.0
-        // descriptors are volatile; only accessed slots must be valid).
+        // descriptors are volatile; only accessed slots must be valid); slots
+        // TEX_HEAP_BASE.. = the RP_SCENE_TEX scene table (4 buffer SRVs + one
+        // Texture2D per scene texture — same heap by necessity: only one
+        // CBV_SRV_UAV heap can be bound at a time).
         let uav_heap: ID3D12DescriptorHeap = unsafe {
             device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                NumDescriptors: 1 + NUM_FEED,
+                NumDescriptors: TEX_HEAP_BASE
+                    + TEX_TABLE_BUFS
+                    + scene_gpu.textures.len() as u32,
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                 ..Default::default()
             })
@@ -1326,6 +1795,16 @@ impl TraceGpu {
                 None,
                 uav_heap.GetCPUDescriptorHandleForHeapStart(),
             )
+        };
+        scene_gpu.write_scene_descriptors(device, &uav_heap, TEX_HEAP_BASE);
+        let tex_table = D3D12_GPU_DESCRIPTOR_HANDLE {
+            ptr: unsafe { uav_heap.GetGPUDescriptorHandleForHeapStart() }.ptr
+                + TEX_HEAP_BASE as u64
+                    * unsafe {
+                        device.GetDescriptorHandleIncrementSize(
+                            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        )
+                    } as u64,
         };
 
         let frame_cb =
@@ -1425,6 +1904,7 @@ impl TraceGpu {
             gbuf,
             gbuf_full,
             uav_heap,
+            tex_table,
             frame_cb,
             cb_base,
             rw,
@@ -1550,6 +2030,11 @@ impl TraceGpu {
                 RP_SRV0 + SRV_TLAS,
                 s.tlas.GetGPUVirtualAddress(),
             );
+            // The scene-texture table (t0..t3 + texs[] in space1). The heap
+            // must be set before the table; resolve/feed re-setting the same
+            // heap later is redundant-but-legal.
+            list.SetDescriptorHeaps(&[Some(self.uav_heap.clone())]);
+            list.SetComputeRootDescriptorTable(RP_SCENE_TEX, self.tex_table);
         }
     }
 
@@ -1849,52 +2334,7 @@ impl TraceGpu {
         kind: FeedKind,
         targets: &[(u32, &ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT)],
     ) -> Result<()> {
-        for &(reg, _, format) in targets {
-            let mut fs = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: format, ..Default::default() };
-            unsafe {
-                device.CheckFeatureSupport(
-                    D3D12_FEATURE_FORMAT_SUPPORT,
-                    &mut fs as *mut _ as *mut _,
-                    std::mem::size_of::<D3D12_FEATURE_DATA_FORMAT_SUPPORT>() as u32,
-                )
-            }
-            .map_err(|e| format!("CheckFeatureSupport(format {}): {e}", format.0))?;
-            if fs.Support2.0 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0 == 0 {
-                return Err(format!(
-                    "feed target u{reg}: format {} lacks typed UAV store on this device",
-                    format.0
-                ));
-            }
-        }
-        let inc = unsafe {
-            device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
-        } as usize;
-        let base = unsafe { self.uav_heap.GetCPUDescriptorHandleForHeapStart() };
-        let mut planes = Vec::with_capacity(targets.len());
-        for &(reg, res, format) in targets {
-            // A register outside the feed range would silently overwrite the
-            // hdr descriptor (slot 0) or write past the heap end — descriptor
-            // writes have no bounds check of their own, so gate in release.
-            if !(NUM_UAVS + 2..NUM_UAVS + 2 + NUM_FEED).contains(&reg) {
-                return Err(format!("feed target u{reg} outside u16..u22"));
-            }
-            let slot = (reg - (NUM_UAVS + 1)) as usize; // u16 -> heap slot 1
-            let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
-                Format: format,
-                ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
-                ..Default::default()
-            };
-            unsafe {
-                device.CreateUnorderedAccessView(
-                    res,
-                    None,
-                    Some(&desc),
-                    D3D12_CPU_DESCRIPTOR_HANDLE { ptr: base.ptr + slot * inc },
-                )
-            };
-            planes.push(res.clone());
-        }
-        self.feed = Some((kind, planes));
+        self.feed = Some((kind, wire_feed_targets(device, &self.uav_heap, targets)?));
         Ok(())
     }
 
@@ -1933,27 +2373,16 @@ impl TraceGpu {
             (FeedKind::Rr, _) => self.pso_feed_rr.as_ref(),
         }
         .ok_or("feed PSO missing (TraceGpu built without gbuf)")?;
-        let _ev = super::pix::scope(list, c"feed");
-        unsafe {
-            let npsr = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-            let ua = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-            let to_uav: Vec<_> = planes.iter().map(|p| transition(p, npsr, ua)).collect();
-            list.ResourceBarrier(&to_uav);
-            self.bind_common(list, slot);
-            list.SetDescriptorHeaps(&[Some(self.uav_heap.clone())]);
-            list.SetComputeRootDescriptorTable(
-                RP_TEX,
-                self.uav_heap.GetGPUDescriptorHandleForHeapStart(),
-            );
-            list.SetPipelineState(pso);
-            list.Dispatch(self.rw.div_ceil(8), self.rh.div_ceil(8), 1);
-            if let Some(n) = nppd {
-                list.SetPipelineState(&n.pso_out);
-                list.Dispatch(self.rw.div_ceil(8), self.rh.div_ceil(8), 1);
-            }
-            let back: Vec<_> = planes.iter().map(|p| transition(p, ua, npsr)).collect();
-            list.ResourceBarrier(&back);
-        }
+        record_feed_dispatch(
+            list,
+            &self.uav_heap,
+            pso,
+            nppd.map(|n| &n.pso_out),
+            planes,
+            self.rw,
+            self.rh,
+            &|| unsafe { self.bind_common(list, slot) },
+        );
         Ok(())
     }
 
@@ -2008,5 +2437,102 @@ impl TraceGpu {
                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
             )]);
         }
+    }
+}
+
+/// Owner-independent half of `wire_feed`: gate every target format on typed
+/// UAV store support (optional in D3D12), bounds-check the registers into
+/// the feed range, and write the TEXTURE2D UAV descriptors into `uav_heap`
+/// at slot reg - 15 (u16 -> slot 1, after the resolve target at slot 0).
+/// Returns the plane list the record-side barriers need. Shared by TraceGpu
+/// and DxrGpu — both bind the same root layout, so the heap contract is
+/// identical.
+pub(crate) fn wire_feed_targets(
+    device: &ID3D12Device,
+    uav_heap: &ID3D12DescriptorHeap,
+    targets: &[(u32, &ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT)],
+) -> Result<Vec<ID3D12Resource>> {
+    for &(reg, _, format) in targets {
+        let mut fs = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: format, ..Default::default() };
+        unsafe {
+            device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                &mut fs as *mut _ as *mut _,
+                std::mem::size_of::<D3D12_FEATURE_DATA_FORMAT_SUPPORT>() as u32,
+            )
+        }
+        .map_err(|e| format!("CheckFeatureSupport(format {}): {e}", format.0))?;
+        if fs.Support2.0 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0 == 0 {
+            return Err(format!(
+                "feed target u{reg}: format {} lacks typed UAV store on this device",
+                format.0
+            ));
+        }
+    }
+    let inc =
+        unsafe { device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) }
+            as usize;
+    let base = unsafe { uav_heap.GetCPUDescriptorHandleForHeapStart() };
+    let mut planes = Vec::with_capacity(targets.len());
+    for &(reg, res, format) in targets {
+        // A register outside the feed range would silently overwrite the
+        // hdr descriptor (slot 0) or write past the heap end — descriptor
+        // writes have no bounds check of their own, so gate in release.
+        if !(NUM_UAVS + 2..NUM_UAVS + 2 + NUM_FEED).contains(&reg) {
+            return Err(format!("feed target u{reg} outside u16..u22"));
+        }
+        let slot = (reg - (NUM_UAVS + 1)) as usize; // u16 -> heap slot 1
+        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        unsafe {
+            device.CreateUnorderedAccessView(
+                res,
+                None,
+                Some(&desc),
+                D3D12_CPU_DESCRIPTOR_HANDLE { ptr: base.ptr + slot * inc },
+            )
+        };
+        planes.push(res.clone());
+    }
+    Ok(planes)
+}
+
+/// Owner-independent half of `record_feed`: NPSR -> UAV transitions, the
+/// owner's root binds (`bind` — invoked after the transitions, must set the
+/// root signature + common roots), the descriptor table, the feed dispatch
+/// (+ an optional second dispatch writing disjoint planes inside the same
+/// barrier window — TraceGpu's NPPD color crop), and the NPSR
+/// back-transitions that double as the write->read sync and the upscalers'
+/// state-at-use contract.
+pub(crate) fn record_feed_dispatch(
+    list: &ID3D12GraphicsCommandList,
+    uav_heap: &ID3D12DescriptorHeap,
+    pso: &ID3D12PipelineState,
+    extra_pso: Option<&ID3D12PipelineState>,
+    planes: &[ID3D12Resource],
+    rw: u32,
+    rh: u32,
+    bind: &dyn Fn(),
+) {
+    let _ev = super::pix::scope(list, c"feed");
+    unsafe {
+        let npsr = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        let ua = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        let to_uav: Vec<_> = planes.iter().map(|p| transition(p, npsr, ua)).collect();
+        list.ResourceBarrier(&to_uav);
+        bind();
+        list.SetDescriptorHeaps(&[Some(uav_heap.clone())]);
+        list.SetComputeRootDescriptorTable(RP_TEX, uav_heap.GetGPUDescriptorHandleForHeapStart());
+        list.SetPipelineState(pso);
+        list.Dispatch(rw.div_ceil(8), rh.div_ceil(8), 1);
+        if let Some(p2) = extra_pso {
+            list.SetPipelineState(p2);
+            list.Dispatch(rw.div_ceil(8), rh.div_ceil(8), 1);
+        }
+        let back: Vec<_> = planes.iter().map(|p| transition(p, ua, npsr)).collect();
+        list.ResourceBarrier(&back);
     }
 }
