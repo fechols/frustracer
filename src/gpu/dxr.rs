@@ -284,10 +284,11 @@ impl DxrGpu {
             put(SBT_HIT + 2 * IDENT, ident("HgOcclude")?);
         }
 
-        // sw_bvh None: the DXR pipeline never binds the software BVH (see
+        // SwAccel::None: the DXR pipeline never binds the software BVH (see
         // bind_common — t0/t1 stay unset), so its ~32 B/node upload is
         // skipped entirely (~2.3 GB at 100M tris).
-        let scene_gpu = SceneGpu::new_uploaded(device, scene, None, submit, bc7_q)?;
+        let scene_gpu =
+            SceneGpu::new_uploaded(device, scene, crate::gpu::trace::SwAccel::None, submit, bc7_q)?;
 
         let uaf = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         let ua = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;

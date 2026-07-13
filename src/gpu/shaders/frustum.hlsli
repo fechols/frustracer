@@ -15,6 +15,11 @@
 // counts differ). The same per-lane slab is reused by refine_cut's work
 // stack — the two phases never overlap in time.
 
+// Under FTREE (ftree.hlsli, pasted after this file) t0 binds the 8-wide
+// frustum tree instead and the wide bodies replace bound_query/refine_cut
+// under the same signatures; the TF type, the plane/distance helpers and the
+// per-lane stack slab below stay shared.
+#ifndef FTREE
 struct BvhNode {
     float3 mn;
     uint left_first; // count == 0: children at left_first, left_first+1
@@ -22,6 +27,7 @@ struct BvhNode {
     uint count;      // > 0: leaf over tri_idx[left_first..+count]
 };
 StructuredBuffer<BvhNode> bvh_nodes : register(t0);
+#endif
 
 #define LANE_STACK 64u
 groupshared uint g_stack[32 * LANE_STACK];
@@ -105,6 +111,7 @@ float point_aabb_max_dist(float3 p, float3 mn, float3 mx) {
     return length(v);
 }
 
+#ifndef FTREE
 uint cut_node(uint slot, uint i) {
     return slot == ROOT_CUT_SLOT ? 0u : cut_pool[slot * 64u + i];
 }
@@ -192,3 +199,4 @@ uint refine_cut(TF f, float t_ball, float t_far, uint parent_slot, uint parent_l
     }
     return olen;
 }
+#endif // !FTREE

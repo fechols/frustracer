@@ -38,8 +38,11 @@ const INVALID: u32 = u32::MAX;
 pub const FT_STACK: usize = 32;
 
 /// 8 child slots, boxes in SoA so the per-slot tests compile to lane math.
-/// 256 B = 4 cache lines.
+/// 256 B = 4 cache lines, no padding — uploaded VERBATIM to the GPU (the
+/// HLSL FtNode in ftree.hlsli mirrors this layout field-for-field; keep them
+/// in lockstep).
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct FNode {
     min_x: [f32; WIDTH],
     min_y: [f32; WIDTH],

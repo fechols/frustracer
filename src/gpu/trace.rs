@@ -174,6 +174,10 @@ pub(crate) const TRACE_COMMON_HLSLI: &str = include_str!("shaders/trace_common.h
 const CTR_HLSLI: &str = include_str!("shaders/ctr.hlsli");
 const QUEUES_HLSLI: &str = include_str!("shaders/queues.hlsli");
 const FRUSTUM_HLSLI: &str = include_str!("shaders/frustum.hlsli");
+// The 8-wide frustum tree's bound_query/refine_cut, `#ifdef FTREE`-guarded —
+// pasted right after FRUSTUM_HLSLI (whose binary halves are `#ifndef FTREE`);
+// the ftree_defs prelude picks the structure per session.
+const FTREE_HLSLI: &str = include_str!("shaders/ftree.hlsli");
 const RT_HLSLI: &str = include_str!("shaders/rt.hlsli");
 pub(crate) const SHADE_HLSLI: &str = include_str!("shaders/shade.hlsli");
 const HEMI_HLSLI: &str = include_str!("shaders/hemi.hlsli");
@@ -710,14 +714,34 @@ struct GpuMat {
 /// ~7 GB of repack Vecs).
 const STAGE_CHUNK: usize = 256 << 20;
 
+/// Which software acceleration structure(s) ride t0 for the FRUSTUM queries
+/// (their only consumer — every actual ray is DXR RayQuery). `Bvh` = the
+/// binary tree alone; `Both` = binary PLUS the 8-wide frustum tree — the
+/// per-consumer split ON the GPU: the tile kernels compile `#define FTREE`
+/// and bind the wide tree at t0 (long queries, wide wins big), while
+/// `record_hemi` rebinds the binary tree for the hemi kernels (hemi bound
+/// queries terminate in ~10 visits — a binary pop is 1 box test where a wide
+/// pop is always 8, and the wide tree measured +35% there). `None` =
+/// DXR-only, dummies.
+#[derive(Clone, Copy)]
+pub enum SwAccel<'a> {
+    Bvh(&'a Bvh),
+    Both(&'a Bvh, &'a crate::ftree::FTree),
+    None,
+}
+
 /// Steady-state byte total of the scene's buffer streams (excludes textures
 /// and acceleration structures) — sizes the staging ring and the init report.
-fn scene_stream_bytes(scene: &Scene, sw_bvh: Option<&Bvh>) -> usize {
+fn scene_stream_bytes(scene: &Scene, sw_bvh: SwAccel) -> usize {
     let v = scene.positions.len();
     let t = scene.indices.len();
     let m = scene.materials.len();
-    let bvh = sw_bvh
-        .map_or(0, |b| b.nodes.len() * size_of::<GpuBvhNode>() + b.tri_idx.len() * 4);
+    let bin = |b: &Bvh| b.nodes.len() * size_of::<GpuBvhNode>() + b.tri_idx.len() * 4;
+    let bvh = match sw_bvh {
+        SwAccel::Bvh(b) => bin(b),
+        SwAccel::Both(b, ft) => bin(b) + ft.bytes(),
+        SwAccel::None => 0,
+    };
     bvh + v * (12 + 12 + 8) + t * (12 + 4) + m * (size_of::<GpuMat>() + 4)
 }
 
@@ -775,6 +799,10 @@ fn stream_buffer<T: Copy, U: Copy>(
 pub struct SceneGpu {
     pub bvh_nodes: ID3D12Resource,
     pub tri_idx: ID3D12Resource,
+    /// The 8-wide frustum tree (SwAccel::Both sessions): bound at t0 by the
+    /// TILE dispatches in place of `bvh_nodes`; the hemi dispatches rebind
+    /// the binary tree (record_hemi) — the per-consumer split on the GPU.
+    pub ftree_nodes: Option<ID3D12Resource>,
     pub positions: ID3D12Resource,
     pub normals: ID3D12Resource,
     pub indices: ID3D12Resource,
@@ -817,7 +845,7 @@ impl SceneGpu {
     pub fn new_uploaded(
         device: &ID3D12Device,
         scene: &Scene,
-        sw_bvh: Option<&Bvh>,
+        sw_bvh: SwAccel,
         sub: &mut dyn d3d12::Submit,
         bc7_q: Option<bc7::Quality>,
     ) -> Result<Self> {
@@ -852,8 +880,8 @@ impl SceneGpu {
                 .max(max_tex_pitch),
         )?;
 
-        let (bvh_nodes, tri_idx) = match sw_bvh {
-            Some(bvh) => (
+        let up_bin = |sub: &mut dyn d3d12::Submit, bvh: &Bvh| -> Result<(ID3D12Resource, ID3D12Resource)> {
+            Ok((
                 stream_buffer(
                     device,
                     sub,
@@ -868,10 +896,26 @@ impl SceneGpu {
                     srv,
                 )?,
                 stream_buffer(device, sub, &ring, &bvh.tri_idx, |t| *t, srv)?,
-            ),
-            None => (
+            ))
+        };
+        let (bvh_nodes, tri_idx, ftree_nodes) = match sw_bvh {
+            SwAccel::Bvh(bvh) => {
+                let (n, t) = up_bin(sub, bvh)?;
+                (n, t, None)
+            }
+            // The per-consumer split: BOTH structures upload — the tile
+            // kernels bind the wide tree at t0 (bind_common), the hemi
+            // kernels the binary one (record_hemi's rebind). The FNode
+            // array uploads verbatim (repr(C), the HLSL FtNode mirror).
+            SwAccel::Both(bvh, ft) => {
+                let (n, t) = up_bin(sub, bvh)?;
+                let f = stream_buffer(device, sub, &ring, &ft.nodes, |n| *n, srv)?;
+                (n, t, Some(f))
+            }
+            SwAccel::None => (
                 committed_buffer(device, 4, D3D12_RESOURCE_FLAG_NONE, srv)?,
                 committed_buffer(device, 4, D3D12_RESOURCE_FLAG_NONE, srv)?,
+                None,
             ),
         };
         let positions_b = stream_buffer(
@@ -1306,6 +1350,7 @@ impl SceneGpu {
         Ok(Self {
             bvh_nodes,
             tri_idx,
+            ftree_nodes,
             positions: positions_b,
             normals: normals_b,
             indices: indices_b,
@@ -1758,14 +1803,33 @@ impl TraceGpu {
         // stress sessions are structurally untouched (the bit gates rely on
         // that).
         let defs = alpha_defs(scene);
+        // The session's frustum structure: `#define FTREE` swaps frustum.hlsli's
+        // binary bound_query/refine_cut for ftree.hlsli's wide bodies (same
+        // signatures — the call sites don't know), and the FNode array uploads
+        // at t0 in place of the binary nodes. --no-ftree keeps the binary path.
+        let ftree_on = crate::ftree::FTREE_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
+        let ft_defs = if ftree_on { "#define FTREE 1" } else { "" };
         let reference_src =
             [defs, TRACE_COMMON_HLSLI, RT_HLSLI, SHADE_HLSLI, REFERENCE_HLSL].join("\n");
         let resolve_src = [TRACE_COMMON_HLSLI, RESOLVE_HLSL].join("\n");
-        let wavefront_src =
-            [TRACE_COMMON_HLSLI, CTR_HLSLI, QUEUES_HLSLI, FRUSTUM_HLSLI, WAVEFRONT_HLSL].join("\n");
+        let wavefront_src = [
+            ft_defs,
+            TRACE_COMMON_HLSLI,
+            CTR_HLSLI,
+            QUEUES_HLSLI,
+            FRUSTUM_HLSLI,
+            FTREE_HLSLI,
+            WAVEFRONT_HLSL,
+        ]
+        .join("\n");
         let leaf_src =
             [defs, TRACE_COMMON_HLSLI, CTR_HLSLI, QUEUES_HLSLI, RT_HLSLI, SHADE_HLSLI, LEAF_HLSL]
                 .join("\n");
+        // Hemi kernels stay on the BINARY tree deliberately (no ft_defs):
+        // hemi bound queries terminate in ~10 visits, where a wide pop's
+        // unconditional 8 slot tests lose to the binary pop's 1 — measured
+        // +35% ms on the hemi-gi bench with the wide tree, against -54% on
+        // the tile path. record_hemi rebinds the binary buffer at t0.
         let hemi_wave_src = [
             defs,
             TRACE_COMMON_HLSLI,
@@ -1824,7 +1888,25 @@ impl TraceGpu {
             None
         };
 
-        let scene_gpu = SceneGpu::new_uploaded(device, scene, Some(bvh), sub, bc7_q)?;
+        // Built here, uploaded, dropped — the GPU session needs no CPU copy
+        // (CPU hemi has its own lazy global; a --gpu session never runs it).
+        let ft = ftree_on.then(|| {
+            let t0 = std::time::Instant::now();
+            let ft = crate::ftree::FTree::build(bvh);
+            eprintln!(
+                "gpu ftree: {} wide nodes ({} MB) collapsed in {:.0} ms (tile kernels bind it at t0; hemi stays binary)",
+                ft.nodes.len(),
+                ft.bytes() >> 20,
+                t0.elapsed().as_secs_f64() * 1000.0
+            );
+            ft
+        });
+        let sw = match &ft {
+            Some(t) => SwAccel::Both(bvh, t),
+            None => SwAccel::Bvh(bvh),
+        };
+        let scene_gpu = SceneGpu::new_uploaded(device, scene, sw, sub, bc7_q)?;
+        drop(ft);
 
         let uaf = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         let ua = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
@@ -2143,9 +2225,13 @@ impl TraceGpu {
                 );
             }
             let s = &self.scene;
+            // Tile dispatches consume the wide frustum tree at t0 when the
+            // session carries one (`#define FTREE` matched at kernel-assembly
+            // time); record_hemi rebinds the binary tree for the hemi phase.
+            let t0 = s.ftree_nodes.as_ref().unwrap_or(&s.bvh_nodes);
             list.SetComputeRootShaderResourceView(
                 RP_SRV0 + SRV_BVH_NODES,
-                s.bvh_nodes.GetGPUVirtualAddress(),
+                t0.GetGPUVirtualAddress(),
             );
             list.SetComputeRootShaderResourceView(
                 RP_SRV0 + SRV_TRI_IDX,
@@ -2327,7 +2413,14 @@ impl TraceGpu {
         let levels = fb_depth.clamp(2, HEMI_MAX_DEPTH) - 1;
         unsafe {
             // Hemi buffer arrangement: u7 = hemi leaf queue, u9 = hemi cut
-            // pool (the primary qleaf/cut_pool are done for this frame).
+            // pool (the primary qleaf/cut_pool are done for this frame) —
+            // and t0 back to the BINARY tree: the hemi kernels compile the
+            // binary bound_query (short queries lose on the wide tree; see
+            // SwAccel), while bind_common bound the wide one for the tiles.
+            list.SetComputeRootShaderResourceView(
+                RP_SRV0 + SRV_BVH_NODES,
+                self.scene.bvh_nodes.GetGPUVirtualAddress(),
+            );
             list.SetComputeRootUnorderedAccessView(
                 RP_UAV0 + UAV_QLEAF,
                 self.hq_leaf.GetGPUVirtualAddress(),
