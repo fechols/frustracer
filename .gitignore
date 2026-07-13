@@ -7,6 +7,15 @@
 /scenes/*.zip
 /scenes/**/*.zip
 /scenes/**/*.obj
+# Alternate source formats some archives bundle (Intel Sponza ships FBX/MAX/
+# USD next to the glTF) — the engine never loads them; they stay in the
+# untracked download zips. Ignored so `git add scenes` can't commit gigabytes
+# of unusable sources.
+/scenes/**/*.fbx
+/scenes/**/*.max
+/scenes/**/*.usda
+/scenes/**/*.usd
+/scenes/**/*.usdc
 # Scene+BVH sidecar caches (src/scene_cache.rs) — per-machine derived
 # artifacts, rebuilt on any source/version change. Never commit or LFS them.
 *.fcache
