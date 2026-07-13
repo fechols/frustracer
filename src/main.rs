@@ -162,7 +162,7 @@ pub struct Opts {
     /// RT tier 1.1; falls back to the CPU path with a loud line otherwise.
     pub gpu: bool,
     /// The DXR DispatchRays pipeline as the session's render mode (default
-    /// ON — the F key toggles it live against the CPU tracer; --no-dxr opts
+    /// ON — the F key toggles it live against the CPU tracer; --cpu opts
     /// back into the CPU renderer). Requires the DXC DLL drop and RT tier
     /// 1.0; falls back to the CPU path with a loud line.
     pub dxr: bool,
@@ -483,7 +483,13 @@ fn main() {
                 opts.dxr = true;
                 dxr_explicit = true;
             }
-            "--no-dxr" => opts.dxr = false,
+            // The CPU frustum-tracer as the render mode: it is what both GPU
+            // modes are peers of, so --cpu clears both. Later flags win (a
+            // trailing --gpu/--dxr re-selects), matching the chain's algebra.
+            "--cpu" => {
+                opts.dxr = false;
+                opts.gpu = false;
+            }
             "--check-dxr" => check_dxr = true,
             "--dxc-path" => {
                 opts.dxc_path = args.next().unwrap_or_else(|| {
@@ -586,7 +592,7 @@ fn main() {
                 eprintln!("  --dxr         the DXR DispatchRays pipeline — the DEFAULT render mode (F toggles it");
                 eprintln!("                against the CPU tracer live; needs the DXC DLLs and RT tier 1.0;");
                 eprintln!("                falls back to CPU with a loud line)");
-                eprintln!("  --no-dxr      opt back into the CPU frustum-tracer as the render mode");
+                eprintln!("  --cpu         the CPU frustum-tracer as the render mode (opts out of --dxr/--gpu)");
                 eprintln!("  --check-dxr   headless: DXR pipeline gate suite (needs a D3D12 RT GPU + the DXC DLLs)");
                 eprintln!("  --dxc-path    DXC DLL directory (default: SDKs\\dxc\\bin\\x64)");
                 eprintln!("  --xess        force-start the upscaler chain at XeSS-SR (X toggles;");
