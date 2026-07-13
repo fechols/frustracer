@@ -29,8 +29,9 @@
 //!   within t_limit" and is consumed only as that — never as sky. GI mode
 //!   uses t_limit = ∞, where `None` genuinely means sky.
 
-use crate::bvh::{Bvh, Ray};
+use crate::bvh::Ray;
 use crate::frustum::{self, TileFrustum};
+use crate::ftree::Accel;
 use crate::scene::Scene;
 use crate::shade;
 use crate::sphcell;
@@ -187,7 +188,7 @@ impl Default for HemiShare {
 #[allow(clippy::too_many_arguments)]
 pub fn share_capture(
     scene: &Scene,
-    bvh: &Bvh,
+    accel: Accel,
     o: Vec3A,
     n: Vec3A,
     t1: Vec3A,
@@ -208,7 +209,7 @@ pub fn share_capture(
     }
     let cx = Cx {
         scene,
-        bvh,
+        accel,
         o,
         n,
         max_depth,
@@ -217,32 +218,25 @@ pub fn share_capture(
     };
     let root = TileFrustum::half_space_padded(o, n, eta);
     ls.hemi_queries += 1;
-    let bound = frustum::nearest_geometry_distance_within(
-        bvh,
-        &root,
-        0.0,
-        cx.t_limit,
-        &[0],
-        &mut ls.hemi_nodes,
-    );
+    let bound =
+        accel.nearest_within(&root, 0.0, cx.t_limit, accel.root_cut(), &mut ls.hemi_nodes);
     let Some(t) = bound else {
         rec.open = true;
         return;
     };
     let (_, tc) = frustum::advance_tc(t, 0.0, scene.eps);
     let mut cut = [0u32; HEMI_CUT];
-    let len = frustum::refine_cut(
-        bvh,
+    let len = accel.refine_cut(
         &root,
         tc,
         cx.t_limit,
-        &[0],
+        accel.root_cut(),
         &mut cut,
         &mut ls.hemi_nodes,
         &mut ls.cut_overflows,
     );
     debug_assert!(len > 0, "padded hemisphere root refine emptied a non-open cut");
-    let child: &[u32] = if len > 0 { &cut[..len] } else { &[0] };
+    let child: &[u32] = if len > 0 { &cut[..len] } else { accel.root_cut() };
     let Some(cut_idx) = rec.push_cut(child) else {
         rec.poisoned = true;
         return;
@@ -275,8 +269,7 @@ fn capture_cell(
     let f = TileFrustum::tri_cell_padded(cx.o, a, b, c, delta, eta, cx.n);
     let cut_in = &rec.cuts[cut_idx as usize];
     ls.hemi_queries += 1;
-    let bound = frustum::nearest_geometry_distance_within(
-        cx.bvh,
+    let bound = cx.accel.nearest_within(
         &f,
         t_start,
         cx.t_limit,
@@ -310,8 +303,7 @@ fn capture_cell(
         return;
     }
     let mut cut = [0u32; HEMI_CUT];
-    let len = frustum::refine_cut(
-        cx.bvh,
+    let len = cx.accel.refine_cut(
         &f,
         tc,
         cx.t_limit,
@@ -419,7 +411,9 @@ struct Gi {
 
 struct Cx<'a> {
     scene: &'a Scene,
-    bvh: &'a Bvh,
+    /// Rays go to `accel.bvh` (always); bound queries dispatch to the wide
+    /// frustum tree when one is wired — the two-tree split.
+    accel: Accel<'a>,
     o: Vec3A,
     n: Vec3A,
     max_depth: u32,
@@ -434,7 +428,7 @@ struct Cx<'a> {
 #[allow(clippy::too_many_arguments)]
 pub fn ao(
     scene: &Scene,
-    bvh: &Bvh,
+    accel: Accel,
     o: Vec3A,
     n: Vec3A,
     t1: Vec3A,
@@ -446,7 +440,7 @@ pub fn ao(
     verify: Option<&mut VerifyCounters>,
     ls: &mut LocalStats,
 ) -> f32 {
-    let cx = Cx { scene, bvh, o, n, max_depth: max_depth.max(1), t_limit, gi: None };
+    let cx = Cx { scene, accel, o, n, max_depth: max_depth.max(1), t_limit, gi: None };
     // No upper clamp: a leaf sample's V·cosθ·Ω can overshoot its cell's PSA,
     // so the sum can exceed π; truncating only that high tail would bias the
     // estimator low (the --check signed-mean gate exists to catch bias).
@@ -463,7 +457,7 @@ pub fn ao(
 #[allow(clippy::too_many_arguments)]
 pub fn gi(
     scene: &Scene,
-    bvh: &Bvh,
+    accel: Accel,
     o: Vec3A,
     n: Vec3A,
     t1: Vec3A,
@@ -478,7 +472,7 @@ pub fn gi(
 ) -> Vec3A {
     let cx = Cx {
         scene,
-        bvh,
+        accel,
         o,
         n,
         max_depth: max_depth.max(1),
@@ -555,12 +549,11 @@ fn integrate(
     }
     let root = TileFrustum::half_space(cx.o, cx.n);
     ls.hemi_queries += 1;
-    let bound = frustum::nearest_geometry_distance_within(
-        cx.bvh,
+    let bound = cx.accel.nearest_within(
         &root,
         0.0,
         cx.t_limit,
-        &[0],
+        cx.accel.root_cut(),
         &mut ls.hemi_nodes,
     );
     match bound {
@@ -574,18 +567,17 @@ fn integrate(
             // 4 octants (depth 1; leaves land at depth == max_depth).
             let (_, tc) = frustum::advance_tc(t, 0.0, cx.scene.eps);
             let mut cut = [0u32; HEMI_CUT];
-            let len = frustum::refine_cut(
-                cx.bvh,
+            let len = cx.accel.refine_cut(
                 &root,
                 tc,
                 cx.t_limit,
-                &[0],
+                cx.accel.root_cut(),
                 &mut cut,
                 &mut ls.hemi_nodes,
                 &mut ls.cut_overflows,
             );
             debug_assert!(len > 0, "hemisphere root refine emptied a non-open cut");
-            let child: &[u32] = if len > 0 { &cut[..len] } else { &[0] };
+            let child: &[u32] = if len > 0 { &cut[..len] } else { cx.accel.root_cut() };
             for [a, b, c] in sphcell::octants(cx.n, t1, t2) {
                 cell(cx, a, b, c, 1, tc, child, rng, &mut verify, ls, &mut acc);
             }
@@ -652,14 +644,8 @@ fn cell(
 ) {
     let f = TileFrustum::tri_cell(cx.o, a, b, c);
     ls.hemi_queries += 1;
-    let bound = frustum::nearest_geometry_distance_within(
-        cx.bvh,
-        &f,
-        t_start,
-        cx.t_limit,
-        cut_in,
-        &mut ls.hemi_nodes,
-    );
+    let bound =
+        cx.accel.nearest_within(&f, t_start, cx.t_limit, cut_in, &mut ls.hemi_nodes);
     let Some(t) = bound else {
         ls.hemi_cells_empty += 1;
         match cx.gi {
@@ -685,8 +671,7 @@ fn cell(
         return;
     }
     let mut cut = [0u32; HEMI_CUT];
-    let len = frustum::refine_cut(
-        cx.bvh,
+    let len = cx.accel.refine_cut(
         &f,
         tc,
         cx.t_limit,
@@ -734,28 +719,49 @@ fn leaf_rays(
     ls.secondary_rays += 1;
     match cx.gi {
         None => {
-            let occ =
-                cx.bvh.occluded_multi(cx.scene, &ray, tc, cx.t_limit, cut, &mut ls.ray_nodes);
+            // Cut-seed only when it pays. A hemi cut sits pinned at HEMI_CUT (64),
+            // so seeding from it is 64 scattered coarse roots against one coherent
+            // root descent — measured 3-10% slower. The cut still drives the bound
+            // QUERIES; this is only about how the leaf RAY traverses. Same tmin
+            // either way, so the tmin-overshoot / cut-miss gates are unaffected.
+            // Under the wide tree the cut is slot-refs and must translate to
+            // binary roots first (ray_roots) — rays only ever walk the ray BVH.
+            let occ = if crate::bvh::cut_seed_hemi() {
+                let mut buf = [0u32; HEMI_CUT];
+                let roots = cx.accel.ray_roots(cut, &mut buf);
+                cx.accel.bvh.occluded_multi(cx.scene, &ray, tc, cx.t_limit, roots, &mut ls.ray_nodes)
+            } else {
+                cx.accel.bvh.occluded(cx.scene, &ray, tc, cx.t_limit, &mut ls.ray_nodes)
+            };
             if !occ {
                 acc.ray.x += weight;
             }
             if let Some(v) = verify.as_deref_mut() {
                 acc.accounted += sphcell::psa(a, b, c, cx.n);
                 verify_leaf_ray(cx, &ray, tc, v, ls);
-                if occ != cx.bvh.occluded(cx.scene, &ray, tc, cx.t_limit, &mut ls.ray_nodes) {
+                if occ != cx.accel.bvh.occluded(cx.scene, &ray, tc, cx.t_limit, &mut ls.ray_nodes)
+                {
                     v.cut_miss += 1;
                 }
             }
         }
         Some(g) => {
-            let hit =
-                cx.bvh
-                    .intersect_multi(cx.scene, &ray, tc, f32::INFINITY, cut, &mut ls.ray_nodes);
+            let hit = if crate::bvh::cut_seed_hemi() {
+                let mut buf = [0u32; HEMI_CUT];
+                let roots = cx.accel.ray_roots(cut, &mut buf);
+                cx.accel
+                    .bvh
+                    .intersect_multi(cx.scene, &ray, tc, f32::INFINITY, roots, &mut ls.ray_nodes)
+            } else {
+                cx.accel
+                    .bvh
+                    .intersect(cx.scene, &ray, tc, f32::INFINITY, &mut ls.ray_nodes)
+            };
             if let Some(v) = verify.as_deref_mut() {
                 acc.accounted += sphcell::psa(a, b, c, cx.n);
                 verify_leaf_ray(cx, &ray, tc, v, ls);
                 let full =
-                    cx.bvh.intersect(cx.scene, &ray, tc, f32::INFINITY, &mut ls.ray_nodes);
+                    cx.accel.bvh.intersect(cx.scene, &ray, tc, f32::INFINITY, &mut ls.ray_nodes);
                 let miss = match (&hit, &full) {
                     (Some(h), Some(f)) => (h.t - f.t).abs() > 1e-3 * f.t,
                     (None, None) => false,
@@ -769,7 +775,7 @@ fn leaf_rays(
                 None => shade::sky(d, g.sun),
                 Some(h) => shade::shade(
                     cx.scene,
-                    cx.bvh,
+                    cx.accel.bvh,
                     &ray,
                     &h,
                     None,
@@ -791,7 +797,7 @@ fn leaf_rays(
 /// tmin soundness gate: a tmin=0 reference ray must not hit strictly inside
 /// the claimed-empty ball.
 fn verify_leaf_ray(cx: &Cx, ray: &Ray, tc: f32, v: &mut VerifyCounters, ls: &mut LocalStats) {
-    if let Some(h) = cx.bvh.intersect(cx.scene, ray, 0.0, f32::INFINITY, &mut ls.ray_nodes) {
+    if let Some(h) = cx.accel.bvh.intersect(cx.scene, ray, 0.0, f32::INFINITY, &mut ls.ray_nodes) {
         if h.t < tc * (1.0 - 1e-3) {
             v.tmin_overshoot += 1;
         }
@@ -837,7 +843,7 @@ fn check_empty(cx: &Cx, [a, b, c]: [Vec3A; 3], v: &mut VerifyCounters, ls: &mut 
     let tmax = if cx.t_limit.is_finite() { cx.t_limit * (1.0 - 1e-3) } else { f32::INFINITY };
     for w in GRID {
         let d = (a * w[0] + b * w[1] + c * w[2]).normalize();
-        if cx.bvh.occluded(cx.scene, &Ray::new(cx.o, d), 0.0, tmax, &mut ls.ray_nodes) {
+        if cx.accel.bvh.occluded(cx.scene, &Ray::new(cx.o, d), 0.0, tmax, &mut ls.ray_nodes) {
             v.false_empty += 1;
         }
     }

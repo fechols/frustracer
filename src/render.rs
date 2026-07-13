@@ -535,7 +535,7 @@ fn shade_hemi_cell(
             let (t1, t2) = shade::onb(rn);
             crate::hemi::share_capture(
                 ctx.scene,
-                ctx.bvh,
+                crate::ftree::Accel::of(ctx.bvh),
                 rp,
                 rn,
                 t1,

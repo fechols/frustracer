@@ -520,14 +520,15 @@ pub fn shade(
     // - neither: the AMBIENT constant modulated by sampled AO.
     let ambient = if q.fb.gi {
         let (t1, t2) = onb(n);
-        crate::hemi::gi(scene, bvh, p, n, t1, t2, q.fb.depth, sun, depth, hemi_share, rng, None, ls)
+        let accel = crate::ftree::Accel::of(bvh);
+        crate::hemi::gi(scene, accel, p, n, t1, t2, q.fb.depth, sun, depth, hemi_share, rng, None, ls)
     } else {
         let mut ao = 1.0;
         if q.fb.ao {
             let (t1, t2) = onb(n);
             ao = crate::hemi::ao(
                 scene,
-                bvh,
+                crate::ftree::Accel::of(bvh),
                 p,
                 n,
                 t1,

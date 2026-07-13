@@ -1,6 +1,51 @@
 use crate::scene::Scene;
 use glam::Vec3A;
 use rayon::prelude::*;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+
+/// A/B lever (`--no-cut-rays`): when off, cut-SEEDED rays traverse from the root
+/// instead of from the tile's node cut. The inherited `tmin` (the tile's proven
+/// `t_start`) is untouched — it is a scalar, not a node reference — so this
+/// isolates exactly what the CUT itself is worth to the ray path, separately
+/// from what the inherited distance bound is worth.
+///
+/// That is the question that decides whether the frustum structure and the ray
+/// BVH can be *separate trees*: a cut built over one tree cannot index another.
+/// On the GPU the cut already seeds nothing (every ray is a driver DXR
+/// RayQuery), so the answer there is already zero; this measures the CPU.
+///
+/// Semantics are identical either way — the root covers every node any cut can
+/// contain, and hemi's own verify oracle already uses this exact root fallback
+/// as the reference for its `cut_miss` gate. Only node visits differ.
+pub static CUT_SEED_RAYS: AtomicBool = AtomicBool::new(true);
+
+#[inline]
+fn cut_seed_rays() -> bool {
+    CUT_SEED_RAYS.load(Ordering::Relaxed)
+}
+
+/// Per-consumer companion to `CUT_SEED_RAYS` (`--cut-hemi` re-enables), because
+/// the two consumers disagree and the global lever conflates them.
+///
+/// The PRIMARY path's cuts are short (mean ~18) and seeding from them is worth
+/// ~10% on procedural scenes. The HEMI path's cuts sit pinned at the `HEMI_CUT`
+/// capacity of 64 (hence its enormous `cut_overflows`), and seeding a bounce ray
+/// from 64 scattered coarse roots measured 3-10% SLOWER than one coherent
+/// descent from the root — on BOTH the historical tree and the M2 (3-axis,
+/// c_trav=3) tree, so it is the scatter, not the array size. The same economics
+/// are already recorded in `hemi.rs` ("an occlusion ray is ~10 node visits; a
+/// bound query on a dense cut is more"). DEFAULT OFF since that re-measure.
+///
+/// Read by hemi.rs at its leaf-ray sites; the cut still drives the bound
+/// QUERIES either way, and `--check`'s probe gates force this ON so the
+/// cut-miss gate keeps exercising the cut machinery. Sound for the same reason
+/// as `CUT_SEED_RAYS`: the root covers every node any cut can hold.
+pub static CUT_SEED_HEMI: AtomicBool = AtomicBool::new(false);
+
+#[inline]
+pub fn cut_seed_hemi() -> bool {
+    CUT_SEED_HEMI.load(Ordering::Relaxed)
+}
 
 #[derive(Clone, Copy)]
 pub struct Aabb {
@@ -24,7 +69,7 @@ impl Aabb {
         self.max = self.max.max(b.max);
     }
 
-    fn area(&self) -> f32 {
+    pub(crate) fn area(&self) -> f32 {
         let e = (self.max - self.min).max(Vec3A::ZERO);
         2.0 * (e.x * e.y + e.y * e.z + e.z * e.x)
     }
@@ -66,6 +111,79 @@ pub struct Hit {
 
 const BINS: usize = 12;
 const MAX_LEAF: usize = 8;
+
+/// SAH traversal cost, as a ratio to the intersection cost (`C_isect` is fixed
+/// at 1 — only the ratio is meaningful). Settable once, before the build, by
+/// `--bvh-ctrav` / `--bvh-maxleaf`; the build stays deterministic for any fixed
+/// setting, which is what `Bvh::identical` requires.
+///
+/// **This term is what lets the leaf test fire at all.** The SAH comparison is
+///
+/// ```text
+///   split = C_trav*A_P + C_isect*(A_L*N_L + A_R*N_R)      vs
+///   leaf  =              C_isect*(A_P*N)
+/// ```
+///
+/// (both sides multiplied through by A_P, cancelling the 1/A_P normalization).
+/// With `C_trav = 0` — which is what the original code computed — the split cost
+/// is *unconditionally* <= the leaf cost, because `A_L, A_R <= A_P` and
+/// `N_L + N_R = N`. Splitting was charged nothing, so the leaf test could never
+/// win, `MAX_LEAF` was dead on the main path, and every subtree recursed to the
+/// hard `count <= 2` floor. Measured result: ~1.2 nodes per triangle on both the
+/// default scene (90,201 nodes / 79,741 tris) and San Miguel low-poly (6,842,553
+/// / 5,617,453) — roughly 4x the nodes a properly terminated tree builds, and a
+/// 328 MB node array on San Miguel where ~80 MB would do.
+static C_TRAV_BITS: AtomicU32 = AtomicU32::new(0x4040_0000); // 3.0f32
+static MAX_LEAF_N: AtomicUsize = AtomicUsize::new(MAX_LEAF);
+
+/// How many axes the binned SAH searches (`--bvh-axes`). 1 = the historical
+/// build (widest centroid axis only); 3 = all axes, global best. Kept as an A/B
+/// knob rather than hardcoded so the axis change and the `C_trav` change can be
+/// attributed separately — they landed together and 3-axis alone looked like the
+/// larger effect on San Miguel — and it was: 3-axis is a -33% ray-node win,
+/// while `C_trav` is speed-neutral and buys memory instead.
+static SPLIT_AXES: AtomicUsize = AtomicUsize::new(3);
+
+/// Reference C_trav for the `quality()` SAH readout, so trees built at DIFFERENT
+/// C_trav are still comparable on one scale. (Scoring each tree at its own build
+/// C_trav makes the number rise with C_trav by construction and compare nothing.)
+pub const SAH_REF_C_TRAV: f32 = 1.0;
+
+pub fn set_c_trav(v: f32) {
+    C_TRAV_BITS.store(v.to_bits(), Ordering::Relaxed);
+}
+
+pub fn set_max_leaf(v: usize) {
+    MAX_LEAF_N.store(v, Ordering::Relaxed);
+}
+
+pub fn set_split_axes(v: usize) {
+    SPLIT_AXES.store(v.clamp(1, 3), Ordering::Relaxed);
+}
+
+#[inline]
+fn c_trav() -> f32 {
+    f32::from_bits(C_TRAV_BITS.load(Ordering::Relaxed))
+}
+
+#[inline]
+fn max_leaf() -> usize {
+    MAX_LEAF_N.load(Ordering::Relaxed)
+}
+
+#[inline]
+fn split_axes() -> usize {
+    SPLIT_AXES.load(Ordering::Relaxed)
+}
+
+/// Identity of the build PARAMETERS, for the scene-cache key. The sidecar stores
+/// a BUILT tree, so a cache written at one (c_trav, max_leaf) must never be served
+/// to a session asking for another — otherwise a parameter sweep silently
+/// benchmarks the same cached tree every time. Distinct from `CACHE_VERSION`,
+/// which versions the on-disk FORMAT.
+pub fn build_key() -> u64 {
+    ((c_trav().to_bits() as u64) << 32) | ((max_leaf() as u64) << 8) | split_axes() as u64
+}
 /// Traversal stack capacity. Both traversal loops push at most one entry per
 /// level, so the required stack is exactly the tree depth; `Bvh::build`
 /// hard-asserts `max_depth() <= TRAV_STACK` once, which keeps the hot loops
@@ -74,6 +192,53 @@ const MAX_LEAF: usize = 8;
 /// breaks the frustum/temporal lower-bound contracts). SAH depth is ~45-50 at
 /// 10M tris and grows ~2 levels per 4x tris; 96 covers 100M+ with margin.
 const TRAV_STACK: usize = 96;
+
+/// Build-quality readout — the A/B currency for any builder change. `leaf_hist[i]`
+/// counts leaves holding exactly `i` triangles (the last bucket is saturating);
+/// bucket 1-2 dominating is the signature of a missing traversal cost (see
+/// `C_TRAV_BITS`).
+#[derive(Default, Clone)]
+pub struct BvhQuality {
+    pub nodes: usize,
+    pub internal: usize,
+    pub leaves: usize,
+    pub tri_refs: usize,
+    pub mean_leaf: f32,
+    pub max_depth: usize,
+    pub sah: f32,
+    /// SUM_internal A(n)/A(root) — SAH's predicted internal-node visits per
+    /// uniform random ray. Compare against the measured `ray_nodes` counter.
+    pub node_term: f32,
+    /// SUM_leaf N(n)*A(n)/A(root) — SAH's predicted triangle tests per ray.
+    pub tri_term: f32,
+    pub bytes: usize,
+    pub leaf_hist: [usize; 17],
+}
+
+impl BvhQuality {
+    pub fn line(&self, tris: usize) -> String {
+        let h: Vec<String> = (1..=8).map(|i| format!("{}", self.leaf_hist[i])).collect();
+        format!(
+            "nodes {} ({:.2}/tri, {:.0} MB) | leaves {} mean {:.2} tris | depth {} | SAH@1 {:.1} (nodes {:.2} + tris {:.2}) | leaf-hist[1..8] {}",
+            self.nodes,
+            self.nodes as f32 / tris.max(1) as f32,
+            self.bytes as f32 / (1024.0 * 1024.0),
+            self.leaves,
+            self.mean_leaf,
+            self.max_depth,
+            self.sah,
+            self.node_term,
+            self.tri_term,
+            h.join(",")
+        )
+    }
+}
+
+/// Scratch capacity for `intersect_multi`'s front-to-back root sort. Matches the
+/// cut capacity every `refine_cut` caller uses (`frustum::MAX_CUT`, `hemi::HEMI_CUT`,
+/// `shaft::SHAFT_CUT` — all 64), so the sorted path takes every root in practice;
+/// a longer cut falls through to the unsorted tail loop rather than dropping a root.
+const ROOT_SORT: usize = 64;
 
 /// Subtree handed to phase 2 of the build: `nodes[node_i]` still holds its
 /// (first, count) leaf-form range over `tri_idx` until the stitch replaces it.
@@ -202,6 +367,52 @@ impl Bvh {
             })
     }
 
+    /// Tree quality, for A/B-ing builders. `sah` is the classic expected-cost
+    /// SAH under the same (C_trav, C_isect=1) the builder used:
+    ///
+    /// ```text
+    ///   SAH = C_trav * SUM_internal A(n)/A(root) + SUM_leaf N(n) * A(n)/A(root)
+    /// ```
+    ///
+    /// Note this is the RAY consumer's cost model. It is deliberately not the
+    /// frustum bound query's — that one never dereferences a triangle, so its
+    /// cost is node count and box tightness, not surface-area-weighted triangle
+    /// tests. Do not tune the frustum side against this number.
+    pub fn quality(&self, c_trav: f32) -> BvhQuality {
+        let root_area = self.nodes[0].aabb.area().max(1e-20);
+        let mut q = BvhQuality {
+            nodes: self.nodes.len(),
+            bytes: self.nodes.len() * std::mem::size_of::<BvhNode>()
+                + self.tri_idx.len() * 4,
+            ..Default::default()
+        };
+        // Split the two SAH terms. `node_term` = SUM_internal A(n)/A(root) is the
+        // model's PREDICTED internal-node visits per random ray; it is the number
+        // to hold against the measured `ray_nodes` counter when asking whether
+        // SAH predicts this renderer at all.
+        let mut node_term = 0.0f64;
+        let mut tri_term = 0.0f64;
+        for n in &self.nodes {
+            let p = (n.aabb.area() / root_area) as f64;
+            if n.count == 0 {
+                q.internal += 1;
+                node_term += p;
+            } else {
+                q.leaves += 1;
+                q.tri_refs += n.count as usize;
+                tri_term += n.count as f64 * p;
+                let b = (n.count as usize).min(q.leaf_hist.len() - 1);
+                q.leaf_hist[b] += 1;
+            }
+        }
+        q.node_term = node_term as f32;
+        q.tri_term = tri_term as f32;
+        q.sah = (c_trav as f64 * node_term + tri_term) as f32;
+        q.mean_leaf = q.tri_refs as f32 / q.leaves.max(1) as f32;
+        q.max_depth = self.max_depth();
+        q
+    }
+
     /// Max node depth (root = 1). Iterative — O(nodes), run once at build so
     /// the traversal loops can stay branch-free (see TRAV_STACK).
     pub fn max_depth(&self) -> usize {
@@ -237,9 +448,17 @@ impl Bvh {
 
     /// Closest hit in (tmin, tmax) with traversal seeded from a tile's node
     /// cut instead of the root — primary rays inside a quadtree leaf tile skip
-    /// the top of the tree the tile's ancestors already culled. Each root is
-    /// slab-tested against the shrinking tmax, so an early hit prunes the
-    /// remaining roots. Secondary rays and reference rays use `intersect`.
+    /// the top of the tree the tile's ancestors already culled. Secondary rays
+    /// and reference rays use `intersect`.
+    ///
+    /// Roots are traversed FRONT-TO-BACK, by slab entry distance. `intersect_from`
+    /// already orders its two children near-first for the same reason: the first
+    /// hit sets `tmax`, and every later slab test prunes against it. Walking the
+    /// roots in cut-ARRAY order throws that away — a far root can land the first
+    /// hit, leaving `tmax` loose so the remaining roots cannot be pruned. Measured
+    /// on San Miguel that inverted the cut's whole value (it cost 5.4% instead of
+    /// saving); the effect is largest on dense scenes, and alpha cutout amplifies
+    /// it because a masked rejection does not shrink `tmax` at all.
     pub fn intersect_multi(
         &self,
         scene: &Scene,
@@ -249,8 +468,30 @@ impl Bvh {
         roots: &[u32],
         visits: &mut u64,
     ) -> Option<Hit> {
+        if !cut_seed_rays() {
+            return self.intersect(scene, ray, tmin, tmax, visits);
+        }
         let mut best: Option<Hit> = None;
-        for &r in roots {
+
+        // refine_cut caps every cut at its capacity N (64 for all three callers),
+        // so the sorted path takes every root in practice. The tail loop below is
+        // the soundness backstop: dropping a root would drop geometry -> false sky.
+        let n = roots.len().min(ROOT_SORT);
+        let mut ord = [(f32::INFINITY, 0u32); ROOT_SORT];
+        for (slot, &r) in ord[..n].iter_mut().zip(&roots[..n]) {
+            *slot = (slab_t(&self.nodes[r as usize].aabb, ray, tmin, tmax), r);
+        }
+        ord[..n].sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+        for &(d, r) in &ord[..n] {
+            // Ascending order: once a root's entry is at or beyond the CURRENT
+            // tmax, every remaining root is too. (`slab_t` returns +inf on a miss,
+            // so misses sort last and end the loop here.)
+            if !(d < tmax) {
+                break;
+            }
+            self.intersect_from(scene, ray, tmin, &mut tmax, r, &mut best, visits);
+        }
+        for &r in &roots[n..] {
             if slab_t(&self.nodes[r as usize].aabb, ray, tmin, tmax).is_finite() {
                 self.intersect_from(scene, ray, tmin, &mut tmax, r, &mut best, visits);
             }
@@ -268,7 +509,13 @@ impl Bvh {
         best: &mut Option<Hit>,
         visits: &mut u64,
     ) {
-        let mut stack = [0u32; TRAV_STACK];
+        // The stack carries each deferred far child's ENTRY DISTANCE alongside its
+        // index. A node pushed when tmax was loose is often already beaten by the
+        // time it is popped — a closer hit has since shrunk tmax — and re-descending
+        // it costs its whole subtree. Storing only the index (the original) meant
+        // that node's own AABB was never re-tested on pop, so the kill had to be
+        // rediscovered one level down, per child, for the entire subtree.
+        let mut stack = [(0u32, 0.0f32); TRAV_STACK];
         let mut sp = 0usize;
         let mut node_idx = start;
         loop {
@@ -284,11 +531,18 @@ impl Bvh {
                         }
                     }
                 }
-                if sp == 0 {
-                    break;
+                // Pop the nearest deferred node that tmax has not already killed.
+                loop {
+                    if sp == 0 {
+                        return;
+                    }
+                    sp -= 1;
+                    let (idx, d) = stack[sp];
+                    if d < *tmax {
+                        node_idx = idx;
+                        break;
+                    }
                 }
-                sp -= 1;
-                node_idx = stack[sp];
             } else {
                 let l = node.left_first;
                 let dl = slab_t(&self.nodes[l as usize].aabb, ray, tmin, *tmax);
@@ -304,14 +558,21 @@ impl Bvh {
                         // Capacity is guaranteed by build's max_depth assert;
                         // the debug_assert stays as belt-and-braces.
                         debug_assert!(sp < stack.len(), "BVH traversal stack overflow");
-                        stack[sp] = far;
+                        stack[sp] = (far, dfar);
                         sp += 1;
                     }
-                } else if sp > 0 {
-                    sp -= 1;
-                    node_idx = stack[sp];
                 } else {
-                    break;
+                    loop {
+                        if sp == 0 {
+                            return;
+                        }
+                        sp -= 1;
+                        let (idx, d) = stack[sp];
+                        if d < *tmax {
+                            node_idx = idx;
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -344,6 +605,9 @@ impl Bvh {
         roots: &[u32],
         visits: &mut u64,
     ) -> bool {
+        if !cut_seed_rays() {
+            return self.occluded(scene, ray, tmin, tmax, visits);
+        }
         for &r in roots {
             if slab_t(&self.nodes[r as usize].aabb, ray, tmin, tmax).is_finite()
                 && self.occluded_from(scene, ray, tmin, tmax, r, visits)
@@ -470,19 +734,42 @@ fn subdivide_range(
     }
 
     let ext = cbounds.max - cbounds.min;
-    let axis = if ext.x >= ext.y && ext.x >= ext.z {
+    let parent_area = bounds.area();
+    let leaf_cost = parent_area * count as f32;
+    let c_trav = c_trav();
+    let max_leaf = max_leaf();
+
+    // Binned SAH over ALL THREE axes — the winner is the global (axis, bin)
+    // minimum. Binning only the widest centroid axis is cheaper but leaves
+    // quality on the table, and the build is a once-per-scene, cached cost.
+    //
+    // Ties break toward the lowest axis then the lowest bin (strict `<`), which
+    // is what keeps the node order a pure function of the geometry — the
+    // `Bvh::identical` byte-determinism contract.
+    let mut best_cost = f32::INFINITY;
+    let mut best_axis = usize::MAX;
+    let mut best_bin = 0usize;
+    let mut best_k = 0.0f32;
+    let mut best_cmin = 0.0f32;
+
+    // 1-axis mode reproduces the historical search: the widest centroid axis only.
+    let widest = if ext.x >= ext.y && ext.x >= ext.z {
         0
     } else if ext.y >= ext.z {
         1
     } else {
         2
     };
-    let cmin = cbounds.min[axis];
-    let cext = ext[axis];
+    let all = [0usize, 1, 2];
+    let one = [widest];
+    let axes: &[usize] = if split_axes() == 1 { &one } else { &all };
 
-    let mut split_at = usize::MAX;
-    if cext > 1e-8 {
-        // Binned SAH.
+    for &axis in axes {
+        let cmin = cbounds.min[axis];
+        let cext = ext[axis];
+        if cext <= 1e-8 {
+            continue; // degenerate on this axis (e.g. identical centroids)
+        }
         let mut bin_bounds = [Aabb::EMPTY; BINS];
         let mut bin_count = [0usize; BINS];
         let k = BINS as f32 * (1.0 - 1e-6) / cext;
@@ -502,8 +789,6 @@ fn subdivide_range(
             right_area[i] = acc.area();
             right_count[i] = cnt;
         }
-        let mut best_cost = f32::INFINITY;
-        let mut best_bin = 0;
         acc = Aabb::EMPTY;
         cnt = 0;
         for i in 0..BINS - 1 {
@@ -512,40 +797,59 @@ fn subdivide_range(
             if cnt == 0 || right_count[i + 1] == 0 {
                 continue;
             }
-            let cost = acc.area() * cnt as f32 + right_area[i + 1] * right_count[i + 1] as f32;
+            // C_trav*A_P + C_isect*(A_L*N_L + A_R*N_R), C_isect == 1. The
+            // C_trav*A_P term is the whole point: without it the leaf test at
+            // the bottom can never win (see C_TRAV_BITS).
+            let cost = c_trav * parent_area
+                + acc.area() * cnt as f32
+                + right_area[i + 1] * right_count[i + 1] as f32;
             if cost < best_cost {
                 best_cost = cost;
+                best_axis = axis;
                 best_bin = i;
-            }
-        }
-        let leaf_cost = bounds.area() * count as f32;
-        if best_cost.is_finite() && (best_cost < leaf_cost || count > MAX_LEAF) {
-            // In-place partition by bin threshold.
-            let mut i = first;
-            let mut j = first + count - 1;
-            while i <= j {
-                let b = ((centroids[tri_idx[i] as usize][axis] - cmin) * k) as usize;
-                if b <= best_bin {
-                    i += 1;
-                } else {
-                    tri_idx.swap(i, j);
-                    if j == 0 {
-                        break;
-                    }
-                    j -= 1;
-                }
-            }
-            if i > first && i < first + count {
-                split_at = i;
+                best_k = k;
+                best_cmin = cmin;
             }
         }
     }
 
+    let mut split_at = usize::MAX;
+    if best_axis != usize::MAX && (best_cost < leaf_cost || count > max_leaf) {
+        // In-place partition by bin threshold on the winning axis.
+        let (axis, k, cmin) = (best_axis, best_k, best_cmin);
+        let mut i = first;
+        let mut j = first + count - 1;
+        while i <= j {
+            let b = ((centroids[tri_idx[i] as usize][axis] - cmin) * k) as usize;
+            if b <= best_bin {
+                i += 1;
+            } else {
+                tri_idx.swap(i, j);
+                if j == 0 {
+                    break;
+                }
+                j -= 1;
+            }
+        }
+        if i > first && i < first + count {
+            split_at = i;
+        }
+    }
+
     if split_at == usize::MAX {
-        if count <= MAX_LEAF {
+        if count <= max_leaf {
             return; // leaf
         }
-        // Degenerate SAH (e.g., identical centroids) — median split.
+        // Degenerate SAH (e.g., identical centroids) — median split on the
+        // widest centroid axis. Phase 1 relies on a too-big node ALWAYS
+        // splitting, so this arm must stay unconditional above max_leaf.
+        let axis = if ext.x >= ext.y && ext.x >= ext.z {
+            0
+        } else if ext.y >= ext.z {
+            1
+        } else {
+            2
+        };
         tri_idx[first..first + count].sort_unstable_by(|&a, &b| {
             centroids[a as usize][axis]
                 .partial_cmp(&centroids[b as usize][axis])

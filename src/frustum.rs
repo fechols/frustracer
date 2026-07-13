@@ -120,11 +120,20 @@ impl TileFrustum {
         self.normals[..self.n_planes].iter().all(|n| d.dot(*n) >= -slack)
     }
 
+    /// Active (normal, pad) pairs, for consumers that test many boxes per
+    /// plane instead of many planes per box (ftree's 8-slot lane loop).
+    #[inline]
+    pub(crate) fn for_planes(&self, mut f: impl FnMut(Vec3A, f32)) {
+        for (n, pad) in self.normals[..self.n_planes].iter().zip(&self.pads) {
+            f(*n, *pad);
+        }
+    }
+
     /// Conservative: true only if the box is fully outside some side plane.
     /// False positives (box outside but not past a single plane) cost
     /// efficiency, never correctness.
     #[inline]
-    fn aabb_outside(&self, aabb: &Aabb) -> bool {
+    pub(crate) fn aabb_outside(&self, aabb: &Aabb) -> bool {
         for (n, pad) in self.normals[..self.n_planes].iter().zip(&self.pads) {
             // positive vertex: the box corner farthest along the plane normal
             let pv = Vec3A::select(n.cmpge(Vec3A::ZERO), aabb.max, aabb.min);

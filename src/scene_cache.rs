@@ -28,7 +28,7 @@ use glam::{Vec2, Vec3A};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
-pub const CACHE_VERSION: u32 = 3; // v3: per-texture stat keys in the tex table
+pub const CACHE_VERSION: u32 = 4; // v4: 3-axis binned SAH + C_trav; build_key in the header
 const MAGIC: [u8; 8] = *b"FRSCACH\x01";
 
 /// Fixed on-disk material, `MatKind` flattened into (kind, param) — Marble
@@ -163,6 +163,10 @@ pub fn try_load(src_path: &str) -> Option<(Scene, Bvh)> {
     let mut magic = [0u8; 8];
     r.read_exact(&mut magic).ok()?;
     if magic != MAGIC || read_u32(&mut r).ok()? != CACHE_VERSION {
+        return None;
+    }
+    // Build parameters are part of the key: the sidecar holds a BUILT tree.
+    if read_u64(&mut r).ok()? != crate::bvh::build_key() {
         return None;
     }
     let (src_size, src_mtime) = stat_key(src);
@@ -366,6 +370,12 @@ pub fn store(src_path: &str, scene: &Scene, bvh: &Bvh) {
         let mut w = BufWriter::new(std::fs::File::create(&tmp)?);
         w.write_all(&MAGIC)?;
         write_u32(&mut w, CACHE_VERSION)?;
+        // The sidecar stores the BUILT tree, so it must also key on the build
+        // PARAMETERS — a cache written at one (c_trav, max_leaf) must never be
+        // served to a session asking for another, or the sweep silently
+        // benchmarks the same tree every time. Distinct from CACHE_VERSION,
+        // which versions the format.
+        write_u64(&mut w, crate::bvh::build_key())?;
         let (src_size, src_mtime) = stat_key(src);
         let (mtl_size, mtl_mtime) = stat_key(&mtl_sibling(src));
         write_u64(&mut w, src_size)?;

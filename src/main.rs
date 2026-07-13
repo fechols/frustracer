@@ -5,6 +5,7 @@ mod dlss;
 // Regeneration — pure CPU, feeds --check-fsr; the GPU seam is gpu/ffx*.
 mod fsr;
 mod frustum;
+mod ftree;
 mod gltf_loader;
 mod hemi;
 // The presentation stack (D3D12 + Streamline) is Windows-only; everything
@@ -157,6 +158,50 @@ pub struct Opts {
     /// in fb (H) frames — every shading point runs its own bounce tree.
     /// Default on.
     pub hemi_share: bool,
+    /// A/B lever (--no-cut-rays): cut-SEEDED rays (primary leaf-tile, hemi
+    /// leaf, shaft) traverse from the BVH root instead of from their node
+    /// cut. The inherited t_start is UNAFFECTED — it is a scalar, not a node
+    /// reference — so this isolates what the CUT is worth to the ray path
+    /// from what the inherited distance bound is worth. That is the question
+    /// that decides whether the frustum structure and the ray BVH can be
+    /// separate trees (a cut over one tree cannot index another). On the GPU
+    /// the cut already seeds nothing, so the answer there is already zero.
+    /// Default on.
+    pub cut_rays: bool,
+    /// A/B lever (--cut-hemi re-enables, --no-cut-hemi is the default): HEMI
+    /// leaf rays traverse from the root instead of from their bounce cut.
+    /// Split out from --no-cut-rays because the two consumers disagree: the
+    /// primary path's cuts are short (~18) and seeding pays ~10%, while a hemi
+    /// cut sits pinned at HEMI_CUT (64) and seeding from it measured 3-10%
+    /// SLOWER than a root descent on both the historical and the M2 tree. The
+    /// cut still drives the bound QUERIES either way, and --check's probe
+    /// gates force seeding ON so cut-miss keeps exercising the machinery.
+    /// Default off.
+    pub cut_hemi: bool,
+    /// SAH traversal cost as a ratio to the intersection cost (--bvh-ctrav;
+    /// C_isect is fixed at 1, only the ratio means anything). 0.0 reproduces
+    /// the historical COST FUNCTION: with no traversal charge the leaf test can
+    /// never fire (split cost is unconditionally <= leaf cost) and every subtree
+    /// recurses to the count<=2 floor, which is why the trees came out at ~1.2
+    /// nodes/tri. It does NOT reproduce the historical TREE, because the sweep
+    /// also bins all three axes where the original binned only the widest.
+    /// Default 0.0 pending the sweep; see bvh::C_TRAV_BITS.
+    pub c_trav: f32,
+    /// Hard ceiling on triangles per leaf (--bvh-maxleaf). Above this a node
+    /// splits regardless of what SAH says — phase 1 of the parallel build
+    /// relies on a too-big node always splitting.
+    pub max_leaf: usize,
+    /// Axes the binned SAH searches (--bvh-axes 1|3). 1 = the historical build
+    /// (widest centroid axis only); 3 = all axes, global best. A knob rather
+    /// than a hardcode so the axis change and the C_trav change stay separately
+    /// attributable — they landed together.
+    pub split_axes: usize,
+    /// A/B lever (--no-ftree disables): route hemi bound queries through the
+    /// 8-wide frustum tree lazily collapsed from the ray BVH (ftree.rs) — the
+    /// two-tree split's first consumer. Rays always stay on the binary BVH.
+    /// Default on: -15/-17% hemi-ao, -4/-8% hemi-gi (default scene + San
+    /// Miguel), bounds bit-identical per the self-test.
+    pub ftree: bool,
     /// GPU-resident tracing (--gpu): the whole quadtree + shading runs in
     /// D3D12 compute with DXR RayQuery rays. Requires the DXC DLL drop and
     /// RT tier 1.1; falls back to the CPU path with a loud line otherwise.
@@ -267,6 +312,20 @@ fn main() {
         adopt: true,
         discard_seeds: false,
         hemi_share: true,
+        cut_rays: true,
+        cut_hemi: false,
+        // M2 defaults, measured (spin path, 250 frames, vs the historical
+        // axes=1 / c_trav=0 build):
+        //   San Miguel 22.39 -> 18.45 ms (-17.6%), 328 -> 133 MB (-59%)
+        //   stress 5000 34.07 -> 29.0  ms (-15%),  220 ->  99 MB (-55%)
+        //   default     flat (its 4 MB tree fits in cache either way)
+        // 3-axis carries the SPEED (it is a -33% ray-node win); c_trav carries
+        // the MEMORY (speed-neutral). Set --bvh-axes 1 --bvh-ctrav 0 to recover
+        // the historical build.
+        c_trav: 3.0,
+        max_leaf: 8,
+        split_axes: 3,
+        ftree: true,
         gpu: false,
         dxr: true,
         dxc_path: std::env::var("FRUSTRACER_DXC_PATH").unwrap_or_else(|_| {
@@ -399,6 +458,40 @@ fn main() {
             "--no-adopt" => opts.adopt = false,
             "--discard-seeds" => opts.discard_seeds = true,
             "--no-hemi-share" => opts.hemi_share = false,
+            "--no-cut-rays" => opts.cut_rays = false,
+            "--no-cut-hemi" => opts.cut_hemi = false,
+            "--cut-hemi" => opts.cut_hemi = true,
+            "--bvh-ctrav" => {
+                opts.c_trav = args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(|| {
+                        eprintln!("--bvh-ctrav needs a number (SAH traversal/intersection cost ratio)");
+                        std::process::exit(2);
+                    });
+            }
+            "--bvh-maxleaf" => {
+                opts.max_leaf = args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .filter(|&n: &usize| n >= 2)
+                    .unwrap_or_else(|| {
+                        eprintln!("--bvh-maxleaf needs an integer >= 2");
+                        std::process::exit(2);
+                    });
+            }
+            "--ftree" => opts.ftree = true,
+            "--no-ftree" => opts.ftree = false,
+            "--bvh-axes" => {
+                opts.split_axes = args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .filter(|&n: &usize| n == 1 || n == 3)
+                    .unwrap_or_else(|| {
+                        eprintln!("--bvh-axes needs 1 (widest centroid axis) or 3 (all axes)");
+                        std::process::exit(2);
+                    });
+            }
             "--spin" => {
                 spin = Some(args.next().unwrap_or_else(|| {
                     eprintln!("--spin needs a workload: still | path");
@@ -689,6 +782,29 @@ fn main() {
     // PIX command-list markers: opt-in, runtime-loaded; inert otherwise.
     gpu::pix::init(&opts.pix_path, opts.pix_markers);
 
+    // A/B lever: --no-cut-rays sends cut-seeded rays down the root traversal
+    // instead. Every ray consumer funnels through intersect_multi/occluded_multi,
+    // so setting the flag once here covers primary, hemi and shaft at a stroke.
+    if !opts.cut_rays {
+        bvh::CUT_SEED_RAYS.store(false, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("bvh: --no-cut-rays — cut-seeded rays traverse from the root (inherited t_start unchanged)");
+    }
+    // Hemi leaf rays go root-first by default (the M1/M2 measurement); the
+    // static's own default already matches, so only the opt-in stores.
+    if opts.cut_hemi {
+        bvh::CUT_SEED_HEMI.store(true, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("bvh: --cut-hemi — hemi leaf rays seed from their bounce cut (the pre-M2 behavior)");
+    }
+    // Must land before ANY Bvh::build (the loader's cold-miss build included)
+    // and before the scene cache is probed — build_key() is part of its key.
+    bvh::set_c_trav(opts.c_trav);
+    bvh::set_max_leaf(opts.max_leaf);
+    bvh::set_split_axes(opts.split_axes);
+    if !opts.ftree {
+        ftree::FTREE_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("ftree: --no-ftree — hemi bound queries stay on the binary BVH");
+    }
+
     eprintln!("frustracer — loading scene...");
     let mut tile_fh: Option<f32> = None;
     // A cache hit hands back the untiled scene's BVH too; tiling replicates
@@ -764,6 +880,15 @@ fn main() {
         scene.tri_count(),
         bvh.nodes.len(),
         t0.elapsed().as_secs_f64() * 1000.0
+    );
+    // SAH is always scored at the fixed reference C_trav so trees built at
+    // different C_trav stay comparable on one scale.
+    eprintln!(
+        "bvh quality (c_trav {} axes {} maxleaf {}): {}",
+        opts.c_trav,
+        opts.split_axes,
+        opts.max_leaf,
+        bvh.quality(bvh::SAH_REF_C_TRAV).line(scene.tri_count())
     );
     if check {
         // Determinism gate for the two-phase parallel build: a rebuild must
@@ -6272,6 +6397,18 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
     };
 
+    // Wide frustum tree: structural audit (every slot box == its binary node's
+    // box) + bound-equivalence sweep vs the binary query + cut translation.
+    // Runs on every --check regardless of --ftree — it builds its own tree —
+    // so the structure can't rot while the lever is off.
+    let ftree_ok = match ftree::self_test(scene, bvh) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("ftree self-test: FAIL — {e}");
+            false
+        }
+    };
+
     // Reprojection-history math self-test — closed-form gates the OIDN
     // temporal mode is built on (projection roundtrip, static replay = exact
     // running mean, analytic strafe, behind-plane/depth rejection, coarse
@@ -6388,6 +6525,14 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     // the false-sky / tmin-overshoot analogs) plus an A/B error measurement
     // against high-sample cosine AO at the same surface points. The
     // integrator is unbiased, so the signed mean is a bias detector.
+    // The hemi probe gates exist to validate the CUT MACHINERY — cut-miss
+    // re-traces every cut-seeded leaf ray against a root-traversal reference,
+    // which is vacuous if the leaf rays themselves go root-first. So the probe
+    // gates force cut-seeded rays regardless of the session default (root-first
+    // since the M2 re-measure: 3-10% faster in every fb mode, both trees).
+    // Restored before the bench table, which must measure the defaults.
+    let cut_hemi_session = bvh::CUT_SEED_HEMI.load(Relaxed);
+    bvh::CUT_SEED_HEMI.store(true, Relaxed);
     let probes = collect_probes(scene, bvh, &cam, rw, rh);
     let hemi_ok = {
         const SEEDS: u64 = 8; // hemi AO averaged over stratified frames
@@ -6407,7 +6552,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                     let mut rng = fastrand::Rng::with_seed(px_seed(pr.x, pr.y, s));
                     ao_h += hemi::ao(
                         scene,
-                        bvh,
+                        ftree::Accel::of(bvh),
                         pr.p,
                         pr.n,
                         t1,
@@ -6492,7 +6637,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                     let mut rng = fastrand::Rng::with_seed(px_seed(pr.x, pr.y, s));
                     e_h += hemi::gi(
                         scene,
-                        bvh,
+                        ftree::Accel::of(bvh),
                         pr.p,
                         pr.n,
                         t1,
@@ -6673,7 +6818,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 ao_share.record_empties = true;
                 hemi::share_capture(
                     scene,
-                    bvh,
+                    ftree::Accel::of(bvh),
                     rp,
                     rn,
                     t1r,
@@ -6690,7 +6835,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 gi_share.record_empties = true;
                 hemi::share_capture(
                     scene,
-                    bvh,
+                    ftree::Accel::of(bvh),
                     rp,
                     rn,
                     t1r,
@@ -6727,7 +6872,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                         let mut rng = fastrand::Rng::with_seed(px_seed(x, y, s));
                         aos += hemi::ao(
                             scene,
-                            bvh,
+                            ftree::Accel::of(bvh),
                             p,
                             n,
                             t1,
@@ -6742,7 +6887,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                         let mut rng = fastrand::Rng::with_seed(px_seed(x, y, s));
                         aou += hemi::ao(
                             scene,
-                            bvh,
+                            ftree::Accel::of(bvh),
                             p,
                             n,
                             t1,
@@ -6757,7 +6902,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                         let mut rng = fastrand::Rng::with_seed(px_seed(x, y, 0x80 + s));
                         gis += hemi::gi(
                             scene,
-                            bvh,
+                            ftree::Accel::of(bvh),
                             p,
                             n,
                             t1,
@@ -6773,7 +6918,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                         let mut rng = fastrand::Rng::with_seed(px_seed(x, y, 0x80 + s));
                         giu += hemi::gi(
                             scene,
-                            bvh,
+                            ftree::Accel::of(bvh),
                             p,
                             n,
                             t1,
@@ -6842,7 +6987,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             let mut dls = stats::LocalStats::default();
             hemi::share_capture(
                 scene,
-                bvh,
+                ftree::Accel::of(bvh),
                 rp,
                 rn,
                 t1,
@@ -6987,6 +7132,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
         ok
     };
+    // Probe gates done — the bench rows below measure the session defaults.
+    bvh::CUT_SEED_HEMI.store(cut_hemi_session, Relaxed);
 
     let accum: Vec<AtomicU32> = (0..rw * rh * 3).map(|_| AtomicU32::new(0)).collect();
     let info: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
@@ -7887,6 +8034,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
 
     let gates = [
         ("sphcell", sph_ok),
+        ("ftree", ftree_ok),
         ("reproject", reproj_ok),
         ("nppd", nppd_ok),
         ("matclass", matclass_ok),
