@@ -58,6 +58,12 @@ pub struct GPixel {
 pub struct GBufs {
     pub rw: usize,
     pub rh: usize,
+    /// True when only `mvec` + `depth` are ever consumed (the FSR 3.1
+    /// upscale-only session): the four guide/denoiser planes are zero-length
+    /// and `write` skips their encodes — the same flavor gate that skips
+    /// `FsrBufs`, saving ~22 B/px of stores + f16 ALU per frame and ~3/4 of
+    /// the allocation.
+    slim: bool,
     /// 4/px: world normal xyz + roughness w (packed to match the
     /// kBufferTypeNormalRoughness texture layout).
     pub normal_rough: Vec<AtomicU16>,
@@ -75,16 +81,27 @@ pub struct GBufs {
 
 impl GBufs {
     pub fn new(rw: usize, rh: usize) -> Self {
+        Self::sized(rw, rh, false)
+    }
+
+    /// The mvec+depth-only variant (see the `slim` field doc).
+    pub fn new_slim(rw: usize, rh: usize) -> Self {
+        Self::sized(rw, rh, true)
+    }
+
+    fn sized(rw: usize, rh: usize, slim: bool) -> Self {
         let alloc = |n: usize| (0..n).map(|_| AtomicU16::new(0)).collect();
+        let guide = |n: usize| alloc(if slim { 0 } else { n });
         Self {
             rw,
             rh,
-            normal_rough: alloc(rw * rh * 4),
-            diff_alb: alloc(rw * rh * 3),
-            spec_alb: alloc(rw * rh * 3),
+            slim,
+            normal_rough: guide(rw * rh * 4),
+            diff_alb: guide(rw * rh * 3),
+            spec_alb: guide(rw * rh * 3),
             depth: (0..rw * rh).map(|_| AtomicU32::new(0)).collect(),
             mvec: alloc(rw * rh * 2),
-            spec_hit_t: alloc(rw * rh),
+            spec_hit_t: guide(rw * rh),
         }
     }
 
@@ -96,6 +113,7 @@ impl GBufs {
     /// `render::resolve` uses for color, so guide texels stay bit-equal to
     /// their source texels (gated by --check-xess).
     pub fn upscale_guides_from(&self, src: &GBufs) {
+        debug_assert!(!self.slim && !src.slim, "guide planes absent on a slim GBufs");
         let (dw, dh) = (self.rw, self.rh);
         let (sw, sh) = (src.rw, src.rh);
         (0..dh).into_par_iter().for_each(|y| {
@@ -125,7 +143,8 @@ impl GBufs {
     /// stale until the next frame writes every pixel, which every XeSS frame
     /// does (full-depth trace: hit and sky fill sites both write).
     pub fn set_res(&mut self, rw: usize, rh: usize) {
-        assert!(rw * rh * 4 <= self.normal_rough.len(), "GBufs::set_res beyond capacity");
+        // mvec is allocated in every variant (slim keeps only mvec + depth).
+        assert!(rw * rh * 2 <= self.mvec.len(), "GBufs::set_res beyond capacity");
         self.rw = rw;
         self.rh = rh;
     }
@@ -133,20 +152,22 @@ impl GBufs {
     #[inline(always)]
     pub fn write(&self, x: usize, y: usize, p: &GPixel) {
         let i = y * self.rw + x;
-        st16(&self.normal_rough[i * 4], p.normal.x);
-        st16(&self.normal_rough[i * 4 + 1], p.normal.y);
-        st16(&self.normal_rough[i * 4 + 2], p.normal.z);
-        st16(&self.normal_rough[i * 4 + 3], p.rough);
-        st16(&self.diff_alb[i * 3], p.diff_alb.x);
-        st16(&self.diff_alb[i * 3 + 1], p.diff_alb.y);
-        st16(&self.diff_alb[i * 3 + 2], p.diff_alb.z);
-        st16(&self.spec_alb[i * 3], p.spec_alb.x);
-        st16(&self.spec_alb[i * 3 + 1], p.spec_alb.y);
-        st16(&self.spec_alb[i * 3 + 2], p.spec_alb.z);
+        if !self.slim {
+            st16(&self.normal_rough[i * 4], p.normal.x);
+            st16(&self.normal_rough[i * 4 + 1], p.normal.y);
+            st16(&self.normal_rough[i * 4 + 2], p.normal.z);
+            st16(&self.normal_rough[i * 4 + 3], p.rough);
+            st16(&self.diff_alb[i * 3], p.diff_alb.x);
+            st16(&self.diff_alb[i * 3 + 1], p.diff_alb.y);
+            st16(&self.diff_alb[i * 3 + 2], p.diff_alb.z);
+            st16(&self.spec_alb[i * 3], p.spec_alb.x);
+            st16(&self.spec_alb[i * 3 + 1], p.spec_alb.y);
+            st16(&self.spec_alb[i * 3 + 2], p.spec_alb.z);
+            st16(&self.spec_hit_t[i], p.spec_hit_t);
+        }
         self.depth[i].store(p.view_z.to_bits(), Relaxed);
         st16(&self.mvec[i * 2], p.mv.0);
         st16(&self.mvec[i * 2 + 1], p.mv.1);
-        st16(&self.spec_hit_t[i], p.spec_hit_t);
     }
 }
 

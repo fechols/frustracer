@@ -14,6 +14,7 @@ pub mod dxr;
 pub mod ffx;
 pub mod ffx_rr;
 pub mod ffx_sys;
+pub mod ffx_up;
 pub mod pix;
 pub mod rr;
 pub mod streamline;
@@ -42,10 +43,15 @@ pub struct GpuOptions {
     pub xess: bool,
     /// Directory holding libxess.dll.
     pub xess_dir: String,
-    /// Attempt FSR Ray Regeneration + FSR4 (native pipeline like XeSS;
-    /// main.rs forces dlss off and rejects --xess when this is set). Also
-    /// flips the adapter preference to AMD.
+    /// Attempt FSR (native pipeline like XeSS; main.rs forces dlss off and
+    /// rejects --xess when this is set). Also flips the adapter preference
+    /// to AMD. FSR4 + Ray Regeneration where the RR provider enumerates
+    /// (RDNA4); FSR 3.1 upscale-only elsewhere, with a log line.
     pub fsr: bool,
+    /// Force the FSR 3.1 provider even where FSR4+RR is available
+    /// (--fsr3; the A/B lever). Fails loudly when no 3.1 provider is
+    /// enumerated rather than silently un-forcing.
+    pub fsr3: bool,
     /// Directory holding amd_fidelityfx_loader_dx12.dll + provider DLLs.
     pub ffx_dir: String,
     /// OR XESS_INIT_FLAG_ENABLE_AUTOEXPOSURE into the XeSS init flags
@@ -65,14 +71,40 @@ struct XessState {
     max: (u32, u32),
 }
 
-/// Live FSR contexts (Ray Regeneration denoiser + FSR4 upscaler, both on the
-/// native device) + the plane/composite resources and the dynamic
-/// input-resolution range: seed from the Quality-mode query, floor from
-/// UltraPerformance, max = the window (both ffx contexts take a per-dispatch
-/// renderSize, so no reallocation ever happens on a res step).
+/// The flavor's resource set: the full Ray Regeneration plane/composite
+/// machinery, or the three-plane upscale-only set — a 3.1 session must not
+/// commit RR's nine planes + signal UAVs.
+enum FsrRes {
+    Rr(ffx_rr::FsrResources),
+    Up(ffx_up::Fsr3Resources),
+}
+
+impl FsrRes {
+    fn upscaled(&self) -> &ID3D12Resource {
+        match self {
+            FsrRes::Rr(r) => &r.upscaled,
+            FsrRes::Up(r) => &r.upscaled,
+        }
+    }
+
+    /// The variant IS the flavor — derived, so the two can never disagree.
+    fn flavor(&self) -> crate::fsr::Flavor {
+        match self {
+            FsrRes::Rr(_) => crate::fsr::Flavor::Fsr4Rr,
+            FsrRes::Up(_) => crate::fsr::Flavor::Fsr3,
+        }
+    }
+}
+
+/// Live FSR contexts on the native device + the flavor's resources and the
+/// dynamic input-resolution range: seed from the Quality-mode query, floor
+/// from UltraPerformance, max = the window (every ffx context takes a
+/// per-dispatch renderSize, so no reallocation ever happens on a res step).
+/// `Fsr4Rr` = Ray Regeneration denoiser + FSR4 upscaler; `Fsr3` = the 3.1
+/// upscaler alone (`fsr::pick_version` chose the provider at init).
 struct FsrState {
     ctx: ffx::FfxContext,
-    res: ffx_rr::FsrResources,
+    res: FsrRes,
     opt: (u32, u32),
     min: (u32, u32),
     max: (u32, u32),
@@ -357,18 +389,20 @@ impl GpuContext {
             None
         };
 
-        // FSR (Ray Regeneration + FSR4) — native pipeline like XeSS; the ffx
-        // contexts are created on the real device and dispatches record into
-        // our command list (no interposer/proxies anywhere). The version
-        // enumeration is the support probe: Ray Regeneration reports no
-        // provider off RDNA4, which degrades to the plain path with a log
-        // line, the same shape as DLSS on a non-NVIDIA adapter.
+        // FSR — native pipeline like XeSS; the ffx contexts are created on
+        // the real device and dispatches record into our command list (no
+        // interposer/proxies anywhere). The version enumeration is the
+        // support probe: Ray Regeneration reports no provider off RDNA4,
+        // which degrades to the FSR 3.1 upscale-only flavor (the same
+        // ffx-api effect, provider chosen via ffxOverrideVersion); no
+        // usable upscaler provider at all degrades to the plain path with
+        // a log line, the same shape as DLSS on a non-NVIDIA adapter.
         let fsr_state = if opts.fsr && sl.is_none() {
-            match Self::init_fsr(&opts.ffx_dir, &d3d.device, w, h, opts.debug) {
+            match Self::init_fsr(&opts.ffx_dir, &d3d.device, w, h, opts.debug, opts.fsr3) {
                 Ok(s) => {
                     passes.create_srv(
                         &d3d.device,
-                        &s.res.upscaled,
+                        s.res.upscaled(),
                         windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
                         tonemap::SRV_SLOT_FSR,
                     );
@@ -406,35 +440,88 @@ impl GpuContext {
         })
     }
 
-    /// Bring up the two ffx contexts + resources. Split out of `new` so every
-    /// failure funnels into one "fsr: disabled" fallback.
+    /// Bring up the ffx context(s) + the flavor's resources. Split out of
+    /// `new` so every failure funnels into one "fsr: disabled" fallback.
+    /// `force_fsr3` is the --fsr3 lever.
     fn init_fsr(
         ffx_dir: &str,
         device: &ID3D12Device,
         w: u32,
         h: u32,
         debug: bool,
+        force_fsr3: bool,
     ) -> Result<FsrState> {
         let mut ctx = ffx::FfxContext::load(ffx_dir)?;
-        let den = ctx.versions(false, device)?;
-        if den.is_empty() {
-            return Err("Ray Regeneration reports no provider on this adapter (RDNA4 required)".into());
-        }
+        // Ray Regeneration probe. A probe *error* degrades exactly like an
+        // empty enumeration — on non-RDNA4 adapters the denoiser query may
+        // fail outright rather than report zero providers, and either way
+        // the answer is "no RR here", not "no FSR here".
+        let den = if force_fsr3 {
+            Vec::new()
+        } else {
+            match ctx.versions(false, device) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("fsr: denoiser probe failed ({e}); treating as no provider");
+                    Vec::new()
+                }
+            }
+        };
         for (id, name) in &den {
             eprintln!("fsr: denoiser provider {name} (id {id:#x})");
         }
-        let ups = ctx.versions(true, device)?;
-        if ups.is_empty() {
-            return Err("FSR upscaler reports no provider on this adapter".into());
-        }
+        let ups = match ctx.versions(true, device) {
+            Ok(v) if !v.is_empty() => v,
+            bad => {
+                // Diagnose before failing: a null-device enumeration lists
+                // what the loader could load from disk, separating "provider
+                // DLLs missing/unloadable" from "adapter rejected by every
+                // provider".
+                match ctx.versions_any(true) {
+                    Ok(all) if !all.is_empty() => {
+                        for (id, name) in &all {
+                            eprintln!("fsr: provider on disk (device-independent): {name} (id {id:#x})");
+                        }
+                        eprintln!("fsr: providers loaded but none supports this adapter/device");
+                    }
+                    Ok(_) => eprintln!("fsr: loader found NO provider DLLs next to itself (check --ffx-path)"),
+                    Err(e) => eprintln!("fsr: device-independent enumeration also failed ({e})"),
+                }
+                return Err(match bad {
+                    Ok(_) => "FSR upscaler reports no provider on this adapter".into(),
+                    Err(e) => e,
+                });
+            }
+        };
         for (id, name) in &ups {
             eprintln!("fsr: upscaler provider {name} (id {id:#x})");
         }
+        let Some((vid, flavor)) = crate::fsr::pick_version(&ups, !den.is_empty(), force_fsr3) else {
+            return Err(if force_fsr3 {
+                "--fsr3 forced but no FSR 3.x provider enumerated (see the provider list above)".into()
+            } else {
+                "no usable FSR provider enumerated (see the provider list above)".into()
+            });
+        };
+        match flavor {
+            crate::fsr::Flavor::Fsr4Rr => {}
+            crate::fsr::Flavor::Fsr3 if force_fsr3 => {
+                eprintln!("fsr: --fsr3 — forcing the FSR 3.1 provider (id {vid:#x})");
+            }
+            crate::fsr::Flavor::Fsr3 => {
+                eprintln!(
+                    "fsr: no Ray Regeneration provider on this adapter — FSR 3.1 upscale-only \
+                     (an RDNA4 GPU unlocks FSR4 + Ray Regeneration)"
+                );
+            }
+        }
         // Dynamic-resolution range: max = the window itself (the controller
-        // creeps to native while still); both contexts take maxRenderSize =
+        // creeps to native while still); every context takes maxRenderSize =
         // window and a per-dispatch renderSize.
-        ctx.create_denoiser(device, (w, h))?;
-        ctx.create_upscaler(device, (w, h), (w, h), debug)?;
+        if flavor == crate::fsr::Flavor::Fsr4Rr {
+            ctx.create_denoiser(device, (w, h))?;
+        }
+        ctx.create_upscaler(device, (w, h), (w, h), debug, vid)?;
         let q = |mode: u32, ratio: f32| -> (u32, u32) {
             ctx.upscaler_render_res((w, h), mode).unwrap_or_else(|e| {
                 let f = crate::fsr::fallback_render_res((w as usize, h as usize), ratio);
@@ -448,7 +535,10 @@ impl GpuContext {
             "fsr: {}x{} -> seed {}x{} (range {}x{}..{}x{})",
             w, h, opt.0, opt.1, min.0, min.1, w, h,
         );
-        let res = ffx_rr::FsrResources::new(device, w, h, w, h)?;
+        let res = match flavor {
+            crate::fsr::Flavor::Fsr4Rr => FsrRes::Rr(ffx_rr::FsrResources::new(device, w, h, w, h)?),
+            crate::fsr::Flavor::Fsr3 => FsrRes::Up(ffx_up::Fsr3Resources::new(device, w, h, w, h)?),
+        };
         Ok(FsrState { ctx, res, opt, min, max: (w, h) })
     }
 
@@ -939,9 +1029,17 @@ impl GpuContext {
         self.xess.as_ref().map(|x| (x.opt, x.min, x.max))
     }
 
-    /// FSR live => Ray Regeneration + FSR4 upscale are available.
+    /// FSR live => a working upscale chain exists (which flavor is
+    /// `fsr_flavor`'s answer).
     pub fn fsr_ready(&self) -> bool {
         self.fsr.is_some()
+    }
+
+    /// Which FSR pipeline this session initialized: `Fsr4Rr` (Ray
+    /// Regeneration + FSR4) or `Fsr3` (3.1 upscale-only). None when FSR
+    /// never came up.
+    pub fn fsr_flavor(&self) -> Option<crate::fsr::Flavor> {
+        self.fsr.as_ref().map(|f| f.res.flavor())
     }
 
     /// FSR input-resolution range: (seed, min, max) — the same shape as
@@ -970,6 +1068,9 @@ impl GpuContext {
         let Some(fs) = &self.fsr else {
             return Err("FSR not initialized".into());
         };
+        let FsrRes::Rr(res) = &fs.res else {
+            return Err("present_fsr on an FSR 3.1 session (present_fsr3 owns that frame)".into());
+        };
         // Release-build cover for record_upload's dimension debug_asserts.
         let (rw, rh) = (fc.rw as u32, fc.rh as u32);
         if (g.rw, g.rh) != (fc.rw, fc.rh) || (f.rw, f.rh) != (fc.rw, fc.rh) {
@@ -986,16 +1087,16 @@ impl GpuContext {
         }
         let (near, far) = (fc.near, fc.far);
         let slot = self.d3d.begin_frame()?;
-        if let Err(e) = fs.res.record_upload(&self.d3d, slot, g, f, fc.rw, fc.rh, near, far) {
+        if let Err(e) = res.record_upload(&self.d3d, slot, g, f, fc.rw, fc.rh, near, far) {
             self.d3d.abort_frame();
             return Err(e);
         }
 
         // Ray Regeneration: signals in UAV state, one ffxDispatch with the
         // common desc + both signal descs chained (built in the shim).
-        fs.res.barrier_denoise_begin(&self.d3d.list);
+        res.barrier_denoise_begin(&self.d3d.list);
         let (depth_lin, mvec, normals, spec_alb, diff_alb, dd_in, dd_out, ds_in, ds_out) =
-            fs.res.denoise_res();
+            res.denoise_res();
         let dd_desc = ffx::FfxShimDenoiseDesc {
             cmdlist: self.d3d.list.as_raw(),
             linear_depth: depth_lin,
@@ -1038,42 +1139,26 @@ impl GpuContext {
                 return Err(e);
             }
         }
-        fs.res.barrier_denoise_end(&self.d3d.list);
+        res.barrier_denoise_end(&self.d3d.list);
 
         // Remodulate (binds from scratch — the post-ffx state restore).
-        fs.res.record_composite(&self.d3d.list, rw, rh);
+        res.record_composite(&self.d3d.list, rw, rh);
 
-        // FSR4 upscale: composite -> window-res output.
-        fs.res.barrier_upscale_begin(&self.d3d.list);
-        let (color, depth_clip, mvec, output) = fs.res.upscale_res();
-        let up_desc = ffx::FfxShimUpscaleDesc {
-            cmdlist: self.d3d.list.as_raw(),
-            color,
-            depth: depth_clip,
-            motion_vectors: mvec,
-            output,
-            jitter: [crate::fsr::JITTER_SIGN * fc.jitter.0, crate::fsr::JITTER_SIGN * fc.jitter.1],
-            // The shared MV plane holds UV-deltas; this scale hands FSR
-            // pixel-space MVs (polarity knob: fsr::UPSCALE_MV_SIGN).
-            mv_scale: [
+        // FSR4 upscale: composite -> window-res output. The shared MV plane
+        // holds UV-deltas here, so the scale multiplies the render dims back
+        // in to hand FSR pixel-space MVs (polarity knob: fsr::UPSCALE_MV_SIGN).
+        res.barrier_upscale_begin(&self.d3d.list);
+        let up_desc = Self::fsr_upscale_desc(
+            self.d3d.list.as_raw(),
+            res.upscale_res(),
+            fc,
+            fs.max,
+            frame_ms,
+            [
                 crate::fsr::UPSCALE_MV_SIGN.0 * rw as f32,
                 crate::fsr::UPSCALE_MV_SIGN.1 * rh as f32,
             ],
-            render_w: rw,
-            render_h: rh,
-            out_w: fs.max.0,
-            out_h: fs.max.1,
-            enable_sharpening: 0,
-            sharpness: 0.0,
-            frame_time_delta_ms: frame_ms.clamp(0.1, 200.0),
-            pre_exposure: 1.0,
-            reset: fc.reset as i32,
-            cam_near: near,
-            cam_far: far,
-            cam_fovy: fc.fov_y,
-            view_space_to_meters: 1.0,
-            flags: 0,
-        };
+        );
         {
             let _ev = pix::scope(&self.d3d.list, c"fsr-upscale");
             if let Err(e) = fs.ctx.upscale(&up_desc) {
@@ -1081,10 +1166,125 @@ impl GpuContext {
                 return Err(e);
             }
         }
-        fs.res.barrier_upscale_end(&self.d3d.list);
+        res.barrier_upscale_end(&self.d3d.list);
 
         // The tonemap pass re-binds root sig/PSO/heaps/viewport from scratch,
         // restoring whatever list state the ffx dispatches left behind.
+        self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_FSR, 1.0);
+        self.d3d.end_frame(slot)
+    }
+
+    /// The FSR upscale dispatch desc, shared by both flavors — every field
+    /// is flavor-identical except `mv_scale` (the RR flavor's plane holds
+    /// UV-deltas and multiplies the render dims back in; the FSR3 plane
+    /// already holds pixel MVs and passes the bare signs).
+    fn fsr_upscale_desc(
+        cmdlist: *mut std::ffi::c_void,
+        res: (ffx_sys::FfxShimRes, ffx_sys::FfxShimRes, ffx_sys::FfxShimRes, ffx_sys::FfxShimRes),
+        fc: &dlss::FrameConstants,
+        out: (u32, u32),
+        frame_ms: f32,
+        mv_scale: [f32; 2],
+    ) -> ffx::FfxShimUpscaleDesc {
+        let (color, depth_clip, mvec, output) = res;
+        ffx::FfxShimUpscaleDesc {
+            cmdlist,
+            color,
+            depth: depth_clip,
+            motion_vectors: mvec,
+            output,
+            // fc.jitter is the renderer's sample offset in pixels; the ffx
+            // polarity knob is fsr::JITTER_SIGN, nowhere else.
+            jitter: [crate::fsr::JITTER_SIGN * fc.jitter.0, crate::fsr::JITTER_SIGN * fc.jitter.1],
+            mv_scale,
+            render_w: fc.rw as u32,
+            render_h: fc.rh as u32,
+            out_w: out.0,
+            out_h: out.1,
+            enable_sharpening: 0,
+            sharpness: 0.0,
+            frame_time_delta_ms: frame_ms.clamp(0.1, 200.0),
+            pre_exposure: 1.0,
+            reset: fc.reset as i32,
+            cam_near: fc.near,
+            cam_far: fc.far,
+            cam_fovy: fc.fov_y,
+            view_space_to_meters: 1.0,
+            flags: 0,
+        }
+    }
+
+    /// FSR 3.1 mode: upload the three standard temporal-upscaler inputs
+    /// (this frame's 1-spp HDR shade from `accum`, pixel-space MVs, clip
+    /// depth), one FSR 3.1 upscale dispatch to the window-res output,
+    /// tonemap, present. No denoiser anywhere — XeSS-shaped, with the full
+    /// temporal input set (jitter, frameTimeDelta, camera params, reset)
+    /// on the dispatch. Everything the dispatch sees is in render-res
+    /// space; only the upscaled output is window-sized.
+    pub fn present_fsr3(
+        &mut self,
+        accum: &[AtomicU32],
+        g: &dlss::GBufs,
+        fc: &dlss::FrameConstants,
+        frame_ms: f32,
+    ) -> Result<()> {
+        crate::zone!("present-fsr");
+        let Some(fs) = &self.fsr else {
+            return Err("FSR not initialized".into());
+        };
+        let FsrRes::Up(res) = &fs.res else {
+            return Err("present_fsr3 on an FSR4+RR session (present_fsr owns that frame)".into());
+        };
+        // Release-build cover for record_upload's dimension debug_asserts.
+        let (rw, rh) = (fc.rw as u32, fc.rh as u32);
+        if (g.rw, g.rh) != (fc.rw, fc.rh) {
+            return Err(format!(
+                "FSR3 frame is {}x{}, G-buffers {}x{}",
+                fc.rw, fc.rh, g.rw, g.rh
+            ));
+        }
+        if accum.len() < fc.rw * fc.rh * 3 {
+            return Err(format!(
+                "FSR3 frame {}x{} exceeds the accum prefix ({} px)",
+                fc.rw,
+                fc.rh,
+                accum.len() / 3
+            ));
+        }
+        if rw < fs.min.0 || rh < fs.min.1 || rw > fs.max.0 || rh > fs.max.1 {
+            return Err(format!(
+                "FSR3 frame {}x{} outside render range {}x{}..{}x{}",
+                rw, rh, fs.min.0, fs.min.1, fs.max.0, fs.max.1
+            ));
+        }
+        let slot = self.d3d.begin_frame()?;
+        if let Err(e) = res.record_upload(&self.d3d, slot, accum, g, fc.rw, fc.rh, fc.near, fc.far) {
+            self.d3d.abort_frame();
+            return Err(e);
+        }
+
+        // FSR 3.1 upscale: the plane already holds pixel-space MVs, so the
+        // scale is the bare polarity signs.
+        res.barrier_upscale_begin(&self.d3d.list);
+        let up_desc = Self::fsr_upscale_desc(
+            self.d3d.list.as_raw(),
+            res.upscale_res(),
+            fc,
+            fs.max,
+            frame_ms,
+            [crate::fsr::UPSCALE_MV_SIGN.0, crate::fsr::UPSCALE_MV_SIGN.1],
+        );
+        {
+            let _ev = pix::scope(&self.d3d.list, c"fsr-upscale");
+            if let Err(e) = fs.ctx.upscale(&up_desc) {
+                self.d3d.abort_frame();
+                return Err(e);
+            }
+        }
+        res.barrier_upscale_end(&self.d3d.list);
+
+        // The tonemap pass re-binds root sig/PSO/heaps/viewport from scratch,
+        // restoring whatever list state the ffx dispatch left behind.
         self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_FSR, 1.0);
         self.d3d.end_frame(slot)
     }
@@ -1096,7 +1296,7 @@ impl GpuContext {
         let Some(fs) = &self.fsr else {
             return Err("FSR not initialized".into());
         };
-        let output = fs.res.upscaled.clone();
+        let output = fs.res.upscaled().clone();
         Ok(self.read_hdr_output(output)?.0)
     }
 

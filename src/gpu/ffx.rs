@@ -87,7 +87,18 @@ impl FfxContext {
     /// Enumerate provider versions for one effect on `device`. An empty list
     /// means the effect is unsupported there (Ray Regeneration: no RDNA4).
     pub fn versions(&self, upscaler: bool, device: &ID3D12Device) -> Result<Vec<Version>, String> {
-        let dev = device.as_raw();
+        self.versions_raw(upscaler, device.as_raw())
+    }
+
+    /// The same enumeration with a NULL device: the loader then lists every
+    /// provider it could load from disk, with no device-support filter — the
+    /// failure-path diagnostic that separates "provider DLLs missing or
+    /// unloadable" from "this adapter rejected by every provider".
+    pub fn versions_any(&self, upscaler: bool) -> Result<Vec<Version>, String> {
+        self.versions_raw(upscaler, std::ptr::null_mut())
+    }
+
+    fn versions_raw(&self, upscaler: bool, dev: *mut std::ffi::c_void) -> Result<Vec<Version>, String> {
         let mut count: u64 = 0;
         let r = unsafe {
             sys::ffxshim_query_versions(upscaler as i32, dev, &mut count, std::ptr::null_mut(), std::ptr::null_mut())
@@ -146,16 +157,21 @@ impl FfxContext {
         Ok(())
     }
 
-    /// Create the FSR4 upscaler context: HDR linear input, dynamic input
+    /// Create the FSR upscaler context: HDR linear input, dynamic input
     /// resolution, fixed presentation size `out`. DEPTH_INVERTED because the
     /// depth plane reuses `xess::view_z_to_clip_depth` (reversed-Z: near→1,
     /// far→0 — the same single-source encoder --check-xess gates).
+    /// `version_id` selects the provider (`fsr::pick_version`): 0 = the
+    /// loader default with the compile-time API pin (FSR4, today's path
+    /// bit-for-bit), nonzero = ffxOverrideVersion to that enumerated id
+    /// (the FSR 3.1 flavor).
     pub fn create_upscaler(
         &mut self,
         device: &ID3D12Device,
         max_render: (u32, u32),
         out: (u32, u32),
         debug_checking: bool,
+        version_id: u64,
     ) -> Result<(), String> {
         debug_assert!(self.upscaler.is_null());
         let mut flags = sys::UPSCALE_HDR | sys::UPSCALE_DYNAMIC_RESOLUTION | sys::UPSCALE_DEPTH_INVERTED;
@@ -164,7 +180,16 @@ impl FfxContext {
         }
         let mut ctx = std::ptr::null_mut();
         let r = unsafe {
-            sys::ffxshim_create_upscaler(device.as_raw(), max_render.0, max_render.1, out.0, out.1, flags, 0, &mut ctx)
+            sys::ffxshim_create_upscaler(
+                device.as_raw(),
+                max_render.0,
+                max_render.1,
+                out.0,
+                out.1,
+                flags,
+                version_id,
+                &mut ctx,
+            )
         };
         if r != sys::FFX_OK {
             return Err(format!("ffx upscaler create failed: {}", result_str(r)));

@@ -7,6 +7,7 @@
 #include <windows.h>
 #include <d3d12.h>
 #include <cstring>
+#include <string>
 
 #include "../SDKs/fidelityfx-sdk/api/include/ffx_api.h"
 #include "../SDKs/fidelityfx-sdk/api/include/ffx_api_types.h"
@@ -46,8 +47,35 @@ extern "C" {
 int32_t ffxshim_load(const wchar_t* loader_dll_path) {
     if (!loader_dll_path) return FFXSHIM_ERR_BAD_ARG;
     if (g_api.dll) return FFX_API_RETURN_OK; // idempotent
-    // DLL_LOAD_DIR: the loader resolves the provider DLLs (denoiser/upscaler)
-    // relative to its own location, not the process CWD.
+    // Preload the provider DLLs by ABSOLUTE path from the loader's directory
+    // (the OIDN precedent: LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR only covers the
+    // loader's STATIC imports — its runtime LoadLibrary("amd_fidelityfx_
+    // <provider>_dx12.dll") calls search the process default order, which
+    // does NOT include the loader's own directory, and every provider then
+    // silently fails to resolve = NO_PROVIDER for every effect. A module
+    // already loaded resolves by name from the module list, so preloading
+    // makes the loader's name-based lookups land). Providers are globbed
+    // rather than hardcoded so a drop that adds or renames a provider DLL
+    // keeps resolving, and paths are dynamic std::wstring — a deep checkout
+    // must never MAX_PATH-truncate into silent no-op preloads.
+    {
+        std::wstring dir(loader_dll_path);
+        const size_t slash = dir.find_last_of(L"\\/");
+        if (slash != std::wstring::npos) {
+            const std::wstring loader_name = dir.substr(slash + 1);
+            dir.resize(slash + 1);
+            WIN32_FIND_DATAW fd;
+            HANDLE find = FindFirstFileW((dir + L"amd_fidelityfx_*_dx12.dll").c_str(), &fd);
+            if (find != INVALID_HANDLE_VALUE) {
+                do {
+                    if (_wcsicmp(fd.cFileName, loader_name.c_str()) == 0) continue;
+                    LoadLibraryExW((dir + fd.cFileName).c_str(), nullptr,
+                                   LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+                } while (FindNextFileW(find, &fd));
+                FindClose(find);
+            }
+        }
+    }
     HMODULE dll = LoadLibraryExW(loader_dll_path, nullptr,
                                  LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
     if (!dll) return FFXSHIM_ERR_LOAD_LIBRARY;
@@ -148,19 +176,24 @@ int32_t ffxshim_create_upscaler(void* device, uint32_t max_render_w, uint32_t ma
     backend.device      = static_cast<ID3D12Device*>(device);
     desc.header.pNext   = &backend.header;
 
-    // Pin the API version we were compiled against (the header provides an
-    // explicit desc for this, unlike the denoiser whose create desc carries
-    // the version inline).
+    // Version chaining — the two descs are mutually exclusive. With no
+    // override, pin the API version we were compiled against (the header
+    // provides an explicit desc for this, unlike the denoiser whose create
+    // desc carries the version inline): the pin guards the *default-provider*
+    // choice against a future loader substituting a different major. An
+    // explicit override IS an exact provider choice already, and the pin desc
+    // (which names 4.x) is one a 3.1 provider may reject — so an overridden
+    // create chains ffxOverrideVersion alone.
     ffxCreateContextDescUpscaleVersion apiver{};
-    apiver.header.type  = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE_VERSION;
-    apiver.version      = FFX_UPSCALER_VERSION;
-    backend.header.pNext = &apiver.header;
-
     ffxOverrideVersion ver{};
     if (version_id != 0) {
         ver.header.type    = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
         ver.versionId      = version_id;
-        apiver.header.pNext = &ver.header;
+        backend.header.pNext = &ver.header;
+    } else {
+        apiver.header.type  = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE_VERSION;
+        apiver.version      = FFX_UPSCALER_VERSION;
+        backend.header.pNext = &apiver.header;
     }
 
     ffxContext ctx = nullptr;

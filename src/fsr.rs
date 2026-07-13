@@ -284,3 +284,91 @@ pub fn fallback_render_res(out: (usize, usize), ratio: f32) -> (usize, usize) {
         ((out.1 as f32 / ratio) as usize).max(1),
     )
 }
+
+// ---------------------------------------------------------------------------
+// Provider selection (pure; gated by --check-fsr). FSR3.1 and FSR4 are the
+// SAME ffx-api effect — the provider is a per-context version choice
+// (ffxOverrideVersion), so "FSR3 support" is a pick over the enumeration
+// ffxQueryDescGetVersions returns, not a different SDK.
+// ---------------------------------------------------------------------------
+
+/// Which FSR pipeline a session runs. `Fsr4Rr` is the full decoupled-signal
+/// path (Ray Regeneration denoise -> composite -> FSR4 upscale, RDNA4 only);
+/// `Fsr3` is upscale-only on the FSR 3.1 provider — no denoiser context, no
+/// signal split, cross-vendor.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Flavor {
+    Fsr4Rr,
+    Fsr3,
+}
+
+impl Flavor {
+    /// The log/toggle display name. Single-sourced: every message site reads
+    /// these instead of re-deriving the pair (a hardcoded title-bar "FSR4"
+    /// shipped wrong for FSR3 sessions once).
+    pub fn label(self) -> &'static str {
+        match self {
+            Flavor::Fsr4Rr => "Ray Regeneration + FSR4",
+            Flavor::Fsr3 => "FSR 3.1 upscale-only",
+        }
+    }
+
+    /// The title-bar short form + its denoiser suffix.
+    pub fn hud(self) -> (&'static str, &'static str) {
+        match self {
+            Flavor::Fsr4Rr => ("FSR4", " + RayRegen"),
+            Flavor::Fsr3 => ("FSR3", ""),
+        }
+    }
+}
+
+/// Every "major.minor.patch" triple in a provider display name, in order (the
+/// names are not a documented contract — "FSR 3.1.5", "FidelityFX FSR 3.1.5"
+/// and a bare "3.1.5" all parse, and a name embedding a second version, e.g.
+/// "AMD 24.10.1 FSR 3.1.5", yields both so the pick can key on the right
+/// major instead of whichever triple happens to come first; init prints every
+/// (id, name) so a mismatch on new hardware is diagnosable in one run).
+pub fn parse_provider_versions(name: &str) -> Vec<(u32, u32, u32)> {
+    name.split_whitespace()
+        .filter_map(|tok| {
+            let tok = tok.trim_start_matches(|c: char| !c.is_ascii_digit());
+            let mut it = tok.split('.').map(|p| {
+                let end = p.find(|c: char| !c.is_ascii_digit()).unwrap_or(p.len());
+                p[..end].parse::<u32>().ok()
+            });
+            match (it.next(), it.next(), it.next()) {
+                (Some(Some(a)), Some(Some(b)), Some(Some(c))) => Some((a, b, c)),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// Choose the upscaler provider for a session. `upscalers` is the
+/// versions(true) enumeration (non-empty — init errors out before this on an
+/// empty one); `rr_available` says whether the Ray Regeneration (denoiser)
+/// enumeration was non-empty; `force_fsr3` is the --fsr3 lever. Returns
+/// (version_id, flavor) where version_id 0 means "no ffxOverrideVersion
+/// chained" — the provider default, the original FSR4 create path
+/// bit-for-bit.
+///
+/// - forced: the highest 3.x provider, or None (forced-but-absent fails
+///   loudly at init — never silently un-force).
+/// - RR available: (0, Fsr4Rr). The RR provider is itself the RDNA4/FSR4
+///   signal and id 0 needs no name at all, so this is deliberately NOT gated
+///   on parsing a 4.x display name (the names are not a contract; a driver
+///   renaming its FSR4 provider must not silently downgrade the session to
+///   3.1). If the default create still fails, init falls back loudly.
+/// - otherwise: the highest 3.x provider or None. FSR2 is never picked.
+pub fn pick_version(upscalers: &[(u64, String)], rr_available: bool, force_fsr3: bool) -> Option<(u64, Flavor)> {
+    if !force_fsr3 && rr_available {
+        return Some((0, Flavor::Fsr4Rr));
+    }
+    upscalers
+        .iter()
+        .filter_map(|(id, name)| {
+            parse_provider_versions(name).into_iter().filter(|v| v.0 == 3).max().map(|v| (*id, v))
+        })
+        .max_by_key(|&(_, v)| v)
+        .map(|(id, _)| (id, Flavor::Fsr3))
+}

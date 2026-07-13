@@ -101,11 +101,15 @@ pub struct Opts {
     pub xess: bool,
     /// Directory holding libxess.dll.
     pub xess_path: String,
-    /// Start with FSR Ray Regeneration + FSR4 dynamic-res upscaling (K
-    /// toggles; implies DLSS off — the ffx contexts live on the native
-    /// pipeline — and is mutually exclusive with XeSS: one upscaler owns the
-    /// frame). Requires RDNA4; auto-falls back with a log line elsewhere.
+    /// Start with FSR dynamic-res upscaling (K toggles; implies DLSS off —
+    /// the ffx contexts live on the native pipeline — and is mutually
+    /// exclusive with XeSS: one upscaler owns the frame). FSR4 + Ray
+    /// Regeneration on RDNA4; FSR 3.1 upscale-only elsewhere (log line);
+    /// no usable provider at all falls back to the plain path.
     pub fsr: bool,
+    /// Force the FSR 3.1 provider even where FSR4+RR is available (--fsr3;
+    /// implies --fsr; the A/B lever — fails loudly if no 3.1 provider).
+    pub fsr3: bool,
     /// Directory holding amd_fidelityfx_loader_dx12.dll + the provider DLLs.
     pub ffx_path: String,
     /// Start XeSS mode with the OIDN denoise placed AFTER the upscale
@@ -235,6 +239,7 @@ fn main() {
             concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\XeSS-SDK\bin").to_string()
         }),
         fsr: false,
+        fsr3: false,
         ffx_path: std::env::var("FRUSTRACER_FFX_PATH").unwrap_or_else(|_| {
             concat!(
                 env!("CARGO_MANIFEST_DIR"),
@@ -344,7 +349,14 @@ fn main() {
             }
             "--check-fsr" => check_fsr = true,
             "--fsr" => opts.fsr = true,
-            "--no-fsr" => opts.fsr = false,
+            "--fsr3" => {
+                opts.fsr = true;
+                opts.fsr3 = true;
+            }
+            "--no-fsr" => {
+                opts.fsr = false;
+                opts.fsr3 = false;
+            }
             "--ffx-path" => {
                 opts.ffx_path = args.next().unwrap_or_else(|| {
                     eprintln!("--ffx-path needs a directory argument");
@@ -489,8 +501,9 @@ fn main() {
                 eprintln!("  --check-xess  headless: XeSS dynamic-res contract self-test (no GPU or DLL needed)");
                 eprintln!("  --xess-dump   --check-xess plus G-buffer PNG dumps");
                 eprintln!("  --check-fsr   headless: FSR signal-split/encoding/MV contract self-test (no GPU or DLL)");
-                eprintln!("  --fsr         start with FSR Ray Regeneration + FSR4 dynamic-res upscaling (K toggles;");
-                eprintln!("                implies DLSS off; requires an RDNA4 GPU — falls back with a log line)");
+                eprintln!("  --fsr         start with FSR dynamic-res upscaling (K toggles; implies DLSS off):");
+                eprintln!("                FSR4 + Ray Regeneration on RDNA4, FSR 3.1 upscale-only elsewhere");
+                eprintln!("  --fsr3        force the FSR 3.1 provider even where FSR4 exists (A/B lever)");
                 eprintln!("  --ffx-path    FidelityFX DLL directory (default: the FidelityFX-Samples-prebuilt drop)");
                 eprintln!("  --gpu         GPU-resident tracing: quadtree + shading in D3D12 compute with DXR");
                 eprintln!("                RayQuery rays (needs the DXC DLLs and RT tier 1.1; falls back to CPU)");
@@ -550,9 +563,10 @@ fn main() {
         if opts.gpu {
             eprintln!("fsr: the FSR path is CPU-fed in v1; ignoring --fsr under --gpu");
             opts.fsr = false;
+            opts.fsr3 = false;
         }
         if opts.nppd || opts.oidn || opts.oidn_post {
-            eprintln!("fsr: Ray Regeneration is the denoiser in FSR mode; ignoring OIDN/NPPD flags");
+            eprintln!("fsr: the FSR present arm owns the frame; ignoring OIDN/NPPD flags");
             opts.nppd = false;
             opts.oidn = false;
             opts.oidn_post = false;
@@ -2815,7 +2829,81 @@ fn run_check_fsr(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera) -> i32 {
         all_ok &= pass;
     }
 
-    // 6. Rendered-frame gates at a native and an odd dynamic res (odd dims
+    // 6. Provider pick (pure): the fsr::pick_version rules that decide the
+    // session flavor at init — the FSR4-default / FSR3.1-fallback / --fsr3
+    // force triangle, plus name-parse robustness. Ids are arbitrary but
+    // distinct; only names carry meaning (matching the live enumeration).
+    {
+        use fsr::Flavor::{Fsr3, Fsr4Rr};
+        let mut pass = true;
+        let list = |names: &[&str]| -> Vec<(u64, String)> {
+            names.iter().enumerate().map(|(i, n)| (0x100 + i as u64, n.to_string())).collect()
+        };
+        let all3 = list(&["FSR 4.1.1", "FSR 3.1.5", "FSR 2.3.4"]);
+        let id_315 = all3[1].0;
+        let mut case = |desc: &str, got: Option<(u64, fsr::Flavor)>, want: Option<(u64, fsr::Flavor)>| {
+            if got != want {
+                eprintln!("pick_version {desc}: got {got:?}, want {want:?}");
+                pass = false;
+            }
+        };
+        // RR available takes the FSR4 default (id 0 = no override — the
+        // original create path bit-for-bit) REGARDLESS of what the upscaler
+        // names parse to: the RR provider is itself the RDNA4/FSR4 signal
+        // and the display names are not a contract (a renamed FSR4 provider
+        // must not silently downgrade the session). No RR or --fsr3 takes
+        // the 3.1.5 provider.
+        case("all, rr", fsr::pick_version(&all3, true, false), Some((0, Fsr4Rr)));
+        case("all, rr, forced", fsr::pick_version(&all3, true, true), Some((id_315, Fsr3)));
+        case("all, no rr", fsr::pick_version(&all3, false, false), Some((id_315, Fsr3)));
+        // Only 3.1 listed: highest patch wins whenever the pick reaches the
+        // 3.x scan; with RR available (and not forced) the RR signal still
+        // wins even though no 4.x name parses — see above.
+        let only3 = list(&["FSR 3.1.4", "FSR 3.1.5"]);
+        let id_hi = only3[1].0;
+        for force in [false, true] {
+            case(
+                &format!("only-3.1 no-rr force={force}"),
+                fsr::pick_version(&only3, false, force),
+                Some((id_hi, Fsr3)),
+            );
+        }
+        case("only-3.1, rr", fsr::pick_version(&only3, true, false), Some((0, Fsr4Rr)));
+        case("only-3.1, rr, forced", fsr::pick_version(&only3, true, true), Some((id_hi, Fsr3)));
+        case("unparseable, rr", fsr::pick_version(&list(&["FSR4"]), true, false), Some((0, Fsr4Rr)));
+        // No pickable provider: only-4.x without RR, FSR2-only, empty, and
+        // forced-but-absent must all yield None (init fails loudly — the
+        // fallback is never FSR2 and a forced --fsr3 never silently
+        // un-forces).
+        let only4 = list(&["FSR 4.1.1"]);
+        case("only-4.x, no rr", fsr::pick_version(&only4, false, false), None);
+        case("only-4.x, forced", fsr::pick_version(&only4, true, true), None);
+        case("fsr2-only", fsr::pick_version(&list(&["FSR 2.3.4"]), false, false), None);
+        case("empty, no rr", fsr::pick_version(&[], false, false), None);
+        // Name-parse robustness: prefixed and bare forms, non-version names
+        // ignored, and a second embedded version (SDK/driver build) must not
+        // shadow the FSR triple.
+        let odd = list(&["FidelityFX FSR 3.1.5", "3.1.4", "experimental"]);
+        case("odd names", fsr::pick_version(&odd, false, false), Some((odd[0].0, Fsr3)));
+        let multi = list(&["AMD 24.10.1 FSR 3.1.5"]);
+        case("multi-triple", fsr::pick_version(&multi, false, false), Some((multi[0].0, Fsr3)));
+        if fsr::parse_provider_versions("FidelityFX FSR 3.1.5") != vec![(3, 1, 5)] {
+            eprintln!("parse_provider_versions prefixed form wrong");
+            pass = false;
+        }
+        if fsr::parse_provider_versions("AMD 24.10.1 FSR 3.1.5") != vec![(24, 10, 1), (3, 1, 5)] {
+            eprintln!("parse_provider_versions multi-triple form wrong");
+            pass = false;
+        }
+        if !fsr::parse_provider_versions("no digits here").is_empty() {
+            eprintln!("parse_provider_versions accepted a non-version");
+            pass = false;
+        }
+        eprintln!("provider pick: {}", if pass { "OK" } else { "FAIL" });
+        all_ok &= pass;
+    }
+
+    // 7. Rendered-frame gates at a native and an odd dynamic res (odd dims
     // also exercise the quadtree's odd splits with the capture on).
     for (rw, rh) in [(800usize, 600usize), (531, 399)] {
         all_ok &= fsr_frame_check(scene, bvh, cam0, rw, rh, far);
@@ -6513,6 +6601,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
             xess_dir: opts.xess_path.clone(),
             xess_autoexposure: opts.xess_autoexposure,
             fsr: opts.fsr,
+            fsr3: opts.fsr3,
             ffx_dir: opts.ffx_path.clone(),
             debug: opts.gpu_debug,
         },
@@ -6716,6 +6805,15 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     // steps); `fsr_bufs` carries the demodulated signals + residual and is
     // reinterpreted in place on a step exactly like the G-buffers.
     let mut fsr_on = gpu.fsr_ready();
+    // Which FSR pipeline initialized: FSR4 + Ray Regeneration (RDNA4) or
+    // FSR 3.1 upscale-only (everything else / --fsr3). The flavor is fixed
+    // for the session — K toggles it against plain, never across flavors.
+    // Display strings come from fsr::Flavor::label/hud, never re-derived
+    // per site (a hardcoded title-bar "FSR4" shipped wrong once).
+    let fsr_flavor = gpu.fsr_flavor();
+    let fsr_rr = fsr_flavor == Some(fsr::Flavor::Fsr4Rr);
+    let fsr_label = fsr_flavor.map_or("FSR", fsr::Flavor::label);
+    let (fsr_hud, fsr_hud_sfx) = fsr_flavor.map_or(("FSR", ""), fsr::Flavor::hud);
     let fsr_range = gpu.fsr_res_range(); // (seed, min, max)
     let fsr_lock = opts.lock_scale.and_then(|r| {
         fsr_range.map(|(_, min, max)| {
@@ -6744,13 +6842,14 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     if fsr_on {
         if let Some((lw, lh)) = fsr_lock {
             eprintln!(
-                "fsr: Ray Regeneration + FSR4 ON, render res LOCKED at {}x{} ({}%, --lock-res; K toggles; `--lock-res dynamic` re-enables DRS)",
+                "fsr: {} ON, render res LOCKED at {}x{} ({}%, --lock-res; K toggles; `--lock-res dynamic` re-enables DRS)",
+                fsr_label,
                 lw,
                 lh,
                 (lh * 100 + H / 2) / H,
             );
         } else {
-            eprintln!("fsr: Ray Regeneration + FSR4 dynamic super-resolution ON (K toggles)");
+            eprintln!("fsr: {fsr_label} dynamic super-resolution ON (K toggles)");
         }
     }
 
@@ -7610,9 +7709,9 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                     dxr_on = false;
                     eprintln!("dxr: OFF (FSR enabled)");
                 }
-                eprintln!("fsr: Ray Regeneration + FSR4 {}", if fsr_on { "ON" } else { "OFF" });
+                eprintln!("fsr: {} {}", fsr_label, if fsr_on { "ON" } else { "OFF" });
             } else {
-                eprintln!("fsr: not available (start with --fsr on an RDNA4 GPU with the FidelityFX DLLs on disk)");
+                eprintln!("fsr: not available (start with --fsr and the FidelityFX DLLs on disk)");
             }
         }
         if edges.toggle_oidn {
@@ -7620,7 +7719,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 // Enabling plain-mode OIDN under a live FSR present arm would
                 // only allocate its window-res G-buffers and lie in the logs
                 // (the FSR arm wins the mode arbitration) — refuse instead.
-                eprintln!("oidn: Ray Regeneration is the denoiser in FSR mode (K toggles FSR off first)");
+                eprintln!("oidn: the FSR present arm owns the frame (K toggles FSR off first)");
             } else if xess_on {
                 // XeSS mode: N cycles the OIDN placement (off → pre → post).
                 let next = match xess_oidn {
@@ -7687,8 +7786,9 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
         }
         if edges.toggle_nppd {
             if fsr_on {
-                // Same refusal as N: Ray Regeneration owns denoising here.
-                eprintln!("nppd: unavailable in FSR mode — Ray Regeneration is the denoiser (K toggles FSR off first)");
+                // Same refusal as N: the FSR arm wins the mode arbitration
+                // (flavor-neutral — the 3.1 flavor has no denoiser at all).
+                eprintln!("nppd: the FSR present arm owns the frame (K toggles FSR off first)");
             } else if xess_on {
                 // XeSS mode: J toggles the NPPD pre-upscale placement
                 // (mutually exclusive with the OIDN N-cycle's pre/post).
@@ -8102,14 +8202,26 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
             // change by design, and the temporal cache drops via tprev_res.
             if fsr_gbufs.is_none() {
                 let (_, _, max) = fsr_range.unwrap();
-                fsr_gbufs = Some(dlss::GBufs::new(max.0 as usize, max.1 as usize));
-                fsr_bufs = Some(fsr::FsrBufs::new(max.0 as usize, max.1 as usize));
+                // The 3.1 flavor consumes only mvec + depth (ffx_up uploads
+                // exactly those; no denoiser to feed) — the slim variant
+                // skips the guide planes' allocation AND their per-pixel
+                // encodes at the fill sites. Signal planes are likewise
+                // RR-only (~52 B/px skipped).
+                fsr_gbufs = Some(if fsr_rr {
+                    dlss::GBufs::new(max.0 as usize, max.1 as usize)
+                } else {
+                    dlss::GBufs::new_slim(max.0 as usize, max.1 as usize)
+                });
+                if fsr_rr {
+                    fsr_bufs = Some(fsr::FsrBufs::new(max.0 as usize, max.1 as usize));
+                }
             }
             let g = fsr_gbufs.as_mut().unwrap();
-            let f = fsr_bufs.as_mut().unwrap();
             if (g.rw, g.rh) != (rw, rh) {
                 g.set_res(rw, rh);
-                f.set_res(rw, rh);
+                if let Some(f) = fsr_bufs.as_mut() {
+                    f.set_res(rw, rh);
+                }
             }
         }
         if mode == RenderMode::Dlss && (gbufs.rw, gbufs.rh) != (rw, rh) {
@@ -8392,13 +8504,15 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 }
             }
         } else if fsr_on {
-            // FSR: hand the G-buffers + demodulated signals to Ray
-            // Regeneration (denoise) -> composite (remodulate) -> FSR4
-            // (upscale to the window). Everything both ffx dispatches see is
-            // in render-res space; only the upscaled output is window-sized.
-            // The denoised/upscaled output is never written back into accum.
+            // FSR4+RR flavor: hand the G-buffers + demodulated signals to
+            // Ray Regeneration (denoise) -> composite (remodulate) -> FSR4
+            // (upscale to the window). FSR 3.1 flavor: the frame's 1-spp
+            // HDR shade (accum) + MVs + depth -> one FSR 3.1 upscale
+            // dispatch, no denoiser anywhere. Either way everything the ffx
+            // dispatches see is in render-res space; only the upscaled
+            // output is window-sized, and it is never written back into
+            // accum.
             let fg = fsr_gbufs.as_ref().expect("fsr_on without gbufs");
-            let fb = fsr_bufs.as_ref().expect("fsr_on without signal bufs");
             let mats = dlss::cam_matrices(&cam, rw, rh, dlss_near, dlss_far);
             let prev_mats = fsr_prev.map(|c| dlss::cam_matrices(&c, rw, rh, dlss_near, dlss_far));
             let fc = dlss::frame_constants(
@@ -8412,7 +8526,13 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 rw,
                 rh,
             );
-            match gpu.present_fsr(fg, fb, &fc, fsr_prev.map(|c| c.pos), fsr_idx, last_ms as f32) {
+            let presented = if fsr_rr {
+                let fb = fsr_bufs.as_ref().expect("fsr_on without signal bufs");
+                gpu.present_fsr(fg, fb, &fc, fsr_prev.map(|c| c.pos), fsr_idx, last_ms as f32)
+            } else {
+                gpu.present_fsr3(&accum, fg, &fc, last_ms as f32)
+            };
+            match presented {
                 Ok(()) => {
                     fsr_prev = Some(cam);
                     fsr_reset = false;
@@ -8421,7 +8541,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 Err(e) => {
                     // An ffx failure shouldn't kill the app: the aborted
                     // frame never reached the GPU — fall back to the plain
-                    // pipeline; F retries.
+                    // pipeline; K retries.
                     eprintln!("fsr: present failed ({e}); FSR disabled (K to retry)");
                     fsr_on = false;
                     fsr_prev = None;
@@ -8761,7 +8881,13 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
         if stab_on && upscaled && rendered {
             stab_n = stab_n.wrapping_add(1);
             if stab_n % 15 == 0 {
-                let cap = if dlss_on { gpu.read_rr_output() } else { gpu.read_xess_output() };
+                let cap = if dlss_on {
+                    gpu.read_rr_output()
+                } else if fsr_on {
+                    gpu.read_fsr_output()
+                } else {
+                    gpu.read_xess_output()
+                };
                 if let Ok(px) = cap {
                     if let Some(prev) = &stab_prev {
                         if prev.len() == px.len() {
@@ -8888,9 +9014,11 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                     }
                 } else if fsr_on {
                     format!(
-                        " | FSR4: {} {}% + RayRegen",
+                        " | {}: {} {}%{}",
+                        fsr_hud,
                         if fsr_lock.is_some() { "lock" } else { "dyn" },
                         rh * 100 / H,
+                        fsr_hud_sfx,
                     )
                 } else if xess_on {
                     format!(
