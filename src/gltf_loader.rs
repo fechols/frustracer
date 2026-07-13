@@ -202,43 +202,75 @@ fn build_scene(
     wanted.sort_unstable(); // deterministic ids (roles is a HashMap)
     let decoded: Vec<Option<Texture>> = {
         use rayon::prelude::*;
-        wanted
-            .par_iter()
-            .map(|&(img, srgb)| {
-                let image = doc.images().nth(img)?;
-                let bytes: Vec<u8> = match image.source() {
-                    gltf::image::Source::View { view, .. } => {
-                        let d = &buffers[view.buffer().index()].0;
-                        d[view.offset()..view.offset() + view.length()].to_vec()
-                    }
-                    gltf::image::Source::Uri { uri, .. } => {
-                        if let Some(data) = uri.strip_prefix("data:") {
-                            let b64 = data.split_once(",").map(|(_, b)| b)?;
-                            base64_decode(b64)?
-                        } else {
-                            let p = base_dir.join(uri.replace("%20", " "));
-                            match std::fs::read(&p) {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    eprintln!(
-                                        "warning: glTF image '{}' failed to read ({e})",
-                                        p.display()
-                                    );
-                                    return None;
-                                }
-                            }
-                        }
-                    }
-                };
-                match image::load_from_memory(&bytes) {
-                    Ok(img_d) => Some(Texture::from_image(img_d, srgb)),
-                    Err(e) => {
-                        eprintln!("warning: glTF image {img} failed to decode ({e})");
-                        None
+        // Largest-first (LPT) scheduling, mirroring the OBJ decode: sort an
+        // index PERMUTATION and scatter results back by original index —
+        // `wanted` order defines texture ids and must not shift.
+        let approx_size = |img: usize| -> u64 {
+            doc.images().nth(img).map_or(0, |image| match image.source() {
+                gltf::image::Source::View { view, .. } => view.length() as u64,
+                gltf::image::Source::Uri { uri, .. } => {
+                    if uri.starts_with("data:") {
+                        uri.len() as u64
+                    } else {
+                        let p = crate::scene::resolve_texture_path(
+                            base_dir.join(uri.replace("%20", " ")),
+                        );
+                        std::fs::metadata(&p).map_or(0, |m| m.len())
                     }
                 }
             })
-            .collect()
+        };
+        let mut order: Vec<usize> = (0..wanted.len()).collect();
+        order.sort_by_key(|&i| std::cmp::Reverse(approx_size(wanted[i].0)));
+        let mut pairs: Vec<(usize, Option<Texture>)> = order
+            .par_iter()
+            .with_max_len(1)
+            .map(|&wi| {
+                let (img, srgb) = wanted[wi];
+                let tex = (|| {
+                    let image = doc.images().nth(img)?;
+                    let bytes: Vec<u8> = match image.source() {
+                        gltf::image::Source::View { view, .. } => {
+                            let d = &buffers[view.buffer().index()].0;
+                            d[view.offset()..view.offset() + view.length()].to_vec()
+                        }
+                        gltf::image::Source::Uri { uri, .. } => {
+                            if let Some(data) = uri.strip_prefix("data:") {
+                                let b64 = data.split_once(",").map(|(_, b)| b)?;
+                                base64_decode(b64)?
+                            } else {
+                                // .webp sibling fallback — committed scenes
+                                // store textures compressed while the glTF
+                                // JSON keeps its .png URIs.
+                                let p = crate::scene::resolve_texture_path(
+                                    base_dir.join(uri.replace("%20", " ")),
+                                );
+                                match std::fs::read(&p) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        eprintln!(
+                                            "warning: glTF image '{}' failed to read ({e})",
+                                            p.display()
+                                        );
+                                        return None;
+                                    }
+                                }
+                            }
+                        }
+                    };
+                    match image::load_from_memory(&bytes) {
+                        Ok(img_d) => Some(Texture::from_image(img_d, srgb)),
+                        Err(e) => {
+                            eprintln!("warning: glTF image {img} failed to decode ({e})");
+                            None
+                        }
+                    }
+                })();
+                (wi, tex)
+            })
+            .collect();
+        pairs.sort_unstable_by_key(|&(wi, _)| wi);
+        pairs.into_iter().map(|(_, t)| t).collect()
     };
     let mut tex_ids: HashMap<(usize, bool), u32> = HashMap::new();
     for (&(img, srgb), tex) in wanted.iter().zip(decoded) {
@@ -610,11 +642,25 @@ pub fn self_test() -> Result<(), String> {
             .map_err(|e| format!("zst-test encode: {e}"))?;
         std::fs::write(dir.join("tri.bin.zst"), z)
             .map_err(|e| format!("zst-test write bin: {e}"))?;
+        // The material's baseColorTexture URI says tex.png; only tex.webp
+        // exists — the resolve_texture_path sibling fallback must find it
+        // (the committed-scene shape: manifests keep .png names, disk holds
+        // lossless WebP).
+        let px = image::RgbaImage::from_pixel(2, 2, image::Rgba([200, 30, 30, 255]));
+        let mut webp_bytes: Vec<u8> = Vec::new();
+        image::codecs::webp::WebPEncoder::new_lossless(&mut webp_bytes)
+            .encode(px.as_raw(), 2, 2, image::ExtendedColorType::Rgba8)
+            .map_err(|e| format!("webp-test encode: {e}"))?;
+        std::fs::write(dir.join("tex.webp"), webp_bytes)
+            .map_err(|e| format!("webp-test write: {e}"))?;
         let json = r#"{"asset":{"version":"2.0"},
 "buffers":[{"uri":"tri.bin","byteLength":36}],
 "bufferViews":[{"buffer":0,"byteOffset":0,"byteLength":36}],
 "accessors":[{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3","min":[0,0,0],"max":[1,1,0]}],
-"meshes":[{"primitives":[{"attributes":{"POSITION":0}}]}],
+"images":[{"uri":"tex.png"}],
+"textures":[{"source":0}],
+"materials":[{"pbrMetallicRoughness":{"baseColorTexture":{"index":0}}}],
+"meshes":[{"primitives":[{"attributes":{"POSITION":0},"material":0}]}],
 "nodes":[{"mesh":0}],
 "scenes":[{"nodes":[0]}],
 "scene":0}"#;
@@ -631,6 +677,13 @@ pub fn self_test() -> Result<(), String> {
             return Err(format!(
                 "zst sibling fallback: expected 3 tris, got {}",
                 zsc.tri_count()
+            ));
+        }
+        if zsc.textures.len() != 1 || zsc.textures[0].texels[0] != [200, 30, 30, 255] {
+            return Err(format!(
+                "webp sibling fallback: expected 1 texture with the exact texel, got {} texture(s), first texel {:?}",
+                zsc.textures.len(),
+                zsc.textures.first().map(|t| t.texels[0])
             ));
         }
     }

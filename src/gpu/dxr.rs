@@ -111,6 +111,7 @@ impl DxrGpu {
         rh: u32,
         gbuf_full: bool,
         debug: bool,
+        bc7_q: Option<crate::bc7::Quality>,
         submit: &mut dyn d3d12::Submit,
     ) -> Result<Self> {
         require_caps(device)?;
@@ -286,7 +287,7 @@ impl DxrGpu {
         // sw_bvh None: the DXR pipeline never binds the software BVH (see
         // bind_common — t0/t1 stay unset), so its ~32 B/node upload is
         // skipped entirely (~2.3 GB at 100M tris).
-        let scene_gpu = SceneGpu::new_uploaded(device, scene, None, submit)?;
+        let scene_gpu = SceneGpu::new_uploaded(device, scene, None, submit, bc7_q)?;
 
         let uaf = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         let ua = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;

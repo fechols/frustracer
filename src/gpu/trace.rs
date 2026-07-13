@@ -22,6 +22,7 @@
 use super::adapter;
 use super::d3d12::{self, committed_buffer, transition, uav_barrier, Result};
 use super::dxc::Dxc;
+use crate::bc7;
 use crate::bvh::Bvh;
 use crate::camera::CamBasis;
 use crate::scene::{MatKind, Scene};
@@ -810,11 +811,15 @@ impl SceneGpu {
     /// DXR-only session: the software BVH (frustum kernels' tree) is never
     /// bound there, so `bvh_nodes`/`tri_idx` become 4-byte dummies (~2.3 GB
     /// saved at 100M tris).
+    /// `bc7_q`: block-compress the OPAQUE scene textures at this ISPC quality
+    /// before upload (`--bc7`; `None` = today's RGBA8 everywhere). Alpha-masked
+    /// cutout textures stay RGBA8 either way — see src/bc7.rs.
     pub fn new_uploaded(
         device: &ID3D12Device,
         scene: &Scene,
         sw_bvh: Option<&Bvh>,
         sub: &mut dyn d3d12::Submit,
+        bc7_q: Option<bc7::Quality>,
     ) -> Result<Self> {
         let device5: ID3D12Device5 = device
             .cast()
@@ -825,10 +830,19 @@ impl SceneGpu {
         // the ring (`scene_stream_bytes` deliberately excludes textures, and
         // its geometry-only size can undershoot a wide texture's pitch on a
         // small mesh — the band `.max(1)` would then overrun the mapping).
+        // A BC7 texture's "row" is a 4-texel-tall BLOCK row, so its pitch is
+        // the block pitch, not w*4 — mispredicting this here is exactly the
+        // overrun the comment above warns about.
         let max_tex_pitch = scene
             .textures
             .iter()
-            .map(|t| d3d12::aligned_pitch(t.w as usize * 4))
+            .map(|t| {
+                if bc7_q.is_some() && bc7::should_compress(t) {
+                    d3d12::block_pitch(t.w)
+                } else {
+                    d3d12::aligned_pitch(t.w as usize * 4)
+                }
+            })
             .max()
             .unwrap_or(0);
         let ring = d3d12::UploadBuffer::new(
@@ -924,14 +938,76 @@ impl SceneGpu {
             })
             .collect();
         let mat_cutout_b = stream_buffer(device, sub, &ring, &mat_cutout, |m| *m, srv)?;
+        // --bc7: block-compress the OPAQUE 4-aligned textures before
+        // uploading them (8 bpp vs 32 — Intel Sponza's set is 4.6 GB of VRAM
+        // as RGBA8). Alpha-masked cutout textures are EXCLUDED and stay
+        // RGBA8: the intersector `.Load()`s their alpha per texel against a
+        // hard `< 128` threshold, and BC7 quantizes alpha across it (a .Load
+        // on a BC SRV returns the DECODED — lossy — texel).
+        // `bc7::should_compress`'s masked arm is the same predicate as
+        // `mat_cutout` below — see src/bc7.rs for why that agreement IS the
+        // soundness argument.
+        //
+        // There is deliberately no BC7 disk cache: the encode runs every load.
+        // Largest-first (LPT) scheduling for the same reason the DECODE sites
+        // sort (scene.rs / scene_cache.rs) — cost is ~linear in texels, so the
+        // few 4K maps would otherwise dominate the tail while the rest idle.
+        // Results scatter back by texture id, which must never shift.
+        let mut bc7_blocks: Vec<Option<Vec<u8>>> = scene.textures.iter().map(|_| None).collect();
+        let mut enc_ms = 0.0f64;
+        let mut enc_texels = 0u64;
+        if let Some(q) = bc7_q {
+            use rayon::prelude::*;
+            let t0 = std::time::Instant::now();
+            let mut order: Vec<usize> = (0..scene.textures.len())
+                .filter(|&i| bc7::should_compress(&scene.textures[i]))
+                .collect();
+            order.sort_by_key(|&i| {
+                std::cmp::Reverse(scene.textures[i].w as u64 * scene.textures[i].h as u64)
+            });
+            enc_texels =
+                order.iter().map(|&i| scene.textures[i].w as u64 * scene.textures[i].h as u64).sum();
+            let done: Vec<(usize, Vec<u8>)> = order
+                .par_iter()
+                .map(|&i| (i, bc7::encode_opaque(&scene.textures[i], q)))
+                .collect();
+            for (i, blocks) in done {
+                bc7_blocks[i] = Some(blocks);
+            }
+            enc_ms = t0.elapsed().as_secs_f64() * 1e3;
+        }
+
         if !scene.textures.is_empty() {
-            let mb = scene.textures.iter().map(|t| t.w as u64 * t.h as u64 * 4).sum::<u64>()
-                >> 20;
+            let raw = scene.textures.iter().map(|t| t.w as u64 * t.h as u64 * 4).sum::<u64>();
+            let live = scene
+                .textures
+                .iter()
+                .enumerate()
+                .map(|(i, t)| match &bc7_blocks[i] {
+                    Some(b) => b.len() as u64,
+                    None => t.w as u64 * t.h as u64 * 4,
+                })
+                .sum::<u64>();
+            let n_bc7 = bc7_blocks.iter().filter(|b| b.is_some()).count();
+            let bc7_note = if n_bc7 > 0 {
+                // Mtexel/s is the "is a load-time encode real-time?" number.
+                format!(
+                    ", {} BC7 + {} RGBA8, was {} MB | bc7 encode {:.0} ms ({:.0} Mtexel/s)",
+                    n_bc7,
+                    scene.textures.len() - n_bc7,
+                    raw >> 20,
+                    enc_ms,
+                    enc_texels as f64 / 1e6 / (enc_ms / 1e3).max(1e-9),
+                )
+            } else {
+                String::new()
+            };
             eprintln!(
-                "gpu: {} textures uploaded ({} MB{})",
+                "gpu: {} textures uploaded ({} MB{}{})",
                 scene.textures.len(),
-                mb,
-                if scene.any_alpha { ", alpha cutout on" } else { "" }
+                live >> 20,
+                if scene.any_alpha { ", alpha cutout on" } else { "" },
+                bc7_note,
             );
         }
 
@@ -940,13 +1016,32 @@ impl SceneGpu {
         // plain _UNORM for linear-data maps (normal / rough-metal; the CPU
         // samples those via sample_bilinear_linear). Texels upload raw (row
         // 0 = v0, the V flip is baked at OBJ load) in row bands through the
-        // same staging ring — no per-texture staging commit.
+        // same staging ring — no per-texture staging commit. Under --bc7 the
+        // opaque ones instead upload as BC7 (same _SRGB/_UNORM role split),
+        // staged in 4-texel-tall BLOCK rows; the blocks are dropped as we go,
+        // so steady-state RAM is unchanged.
         let mut textures_v = Vec::new();
-        for t in &scene.textures {
-            let fmt = if t.srgb {
-                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
-            } else {
-                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM
+        for (i, t) in scene.textures.iter().enumerate() {
+            let (fmt, pitch, src_pitch, rows_total, row_h) = match &bc7_blocks[i] {
+                // A BC7 "row" is a block row: 4 texel rows in ceil(w/4)*16 B.
+                Some(_) => (
+                    bc7::dxgi_format(t),
+                    d3d12::block_pitch(t.w),
+                    bc7::blocks(t.w) as usize * bc7::BLOCK_BYTES,
+                    bc7::blocks(t.h) as usize,
+                    bc7::BLOCK as usize,
+                ),
+                None => (
+                    if t.srgb {
+                        windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+                    } else {
+                        windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM
+                    },
+                    d3d12::aligned_pitch(t.w as usize * 4),
+                    t.w as usize * 4,
+                    t.h as usize,
+                    1,
+                ),
             };
             let dst = d3d12::committed_tex(
                 device,
@@ -956,24 +1051,39 @@ impl SceneGpu {
                 D3D12_RESOURCE_FLAG_NONE,
                 D3D12_RESOURCE_STATE_COPY_DEST,
             )?;
-            let pitch = d3d12::aligned_pitch(t.w as usize * 4);
-            let band = (ring.size / pitch).max(1).min(t.h as usize);
-            let mut y0 = 0usize;
-            while y0 < t.h as usize {
-                let rows = band.min(t.h as usize - y0);
+            let band = (ring.size / pitch).max(1).min(rows_total);
+            let mut r0 = 0usize;
+            while r0 < rows_total {
+                let rows = band.min(rows_total - r0);
                 for r in 0..rows {
-                    let y = y0 + r;
-                    let row = &t.texels[y * t.w as usize..(y + 1) * t.w as usize];
+                    let src: &[u8] = match &bc7_blocks[i] {
+                        Some(b) => &b[(r0 + r) * src_pitch..(r0 + r + 1) * src_pitch],
+                        None => {
+                            let y = r0 + r;
+                            let row = &t.texels[y * t.w as usize..(y + 1) * t.w as usize];
+                            row.as_flattened()
+                        }
+                    };
                     unsafe {
                         std::ptr::copy_nonoverlapping(
-                            row.as_ptr() as *const u8,
+                            src.as_ptr(),
                             ring.ptr.add(r * pitch),
-                            t.w as usize * 4,
+                            src_pitch,
                         )
                     };
                 }
-                let fp = d3d12::footprint(fmt, t.w, rows as u32, 4, 0);
-                let last = y0 + rows == t.h as usize;
+                // The dst y offset and the footprint height are always in
+                // TEXELS. For BC7 both are whole block rows (DstY a multiple
+                // of 4, as the debug layer requires) except the final band,
+                // which runs to `t.h` exactly — the bottom edge of the
+                // resource, the other form the layer accepts.
+                let y0 = r0 * row_h;
+                let h_tex = (rows * row_h).min(t.h as usize - y0) as u32;
+                let fp = match &bc7_blocks[i] {
+                    Some(_) => d3d12::footprint_block(fmt, t.w, h_tex, 0),
+                    None => d3d12::footprint(fmt, t.w, h_tex, 4, 0),
+                };
+                let last = r0 + rows == rows_total;
                 sub.run_list(&mut |l| {
                     unsafe {
                         l.CopyTextureRegion(
@@ -996,8 +1106,11 @@ impl SceneGpu {
                     }
                     Ok(())
                 })?;
-                y0 += rows;
+                r0 += rows;
             }
+            // The blocks are on the GPU now — drop them so peak RAM carries at
+            // most the BC7 set (~0.25x the RGBA8 texels), never a second copy.
+            bc7_blocks[i] = None;
             textures_v.push(dst);
         }
 
@@ -1632,6 +1745,7 @@ impl TraceGpu {
         gbuf_full: bool,
         nppd: bool,
         debug: bool,
+        bc7_q: Option<bc7::Quality>,
         sub: &mut dyn d3d12::Submit,
     ) -> Result<Self> {
         require_caps(device)?;
@@ -1710,7 +1824,7 @@ impl TraceGpu {
             None
         };
 
-        let scene_gpu = SceneGpu::new_uploaded(device, scene, Some(bvh), sub)?;
+        let scene_gpu = SceneGpu::new_uploaded(device, scene, Some(bvh), sub, bc7_q)?;
 
         let uaf = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         let ua = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
@@ -2572,4 +2686,270 @@ pub(crate) fn record_feed_dispatch(
         let back: Vec<_> = planes.iter().map(|p| transition(p, ua, npsr)).collect();
         list.ResourceBarrier(&back);
     }
+}
+
+// ---------------------------------------------------------------------------
+// M11 (--bc7): encode fidelity, measured on the GPU.
+
+/// The whole M11 kernel: `.Load` one texel of the BC7 SRV (legal on BC —
+/// returns the hardware-decoded value) and store it back as packed RGBA8.
+/// BC7 DECODE is required by the D3D spec to be bit-exact, so
+/// `round(load * 255)` recovers the decoder's exact 8-bit values — the diff
+/// against the CPU source texels then measures the ENCODER's loss and
+/// nothing else.
+const BC7_READ_HLSL: &str = r#"
+Texture2D<float4> src : register(t0);
+RWByteAddressBuffer dst : register(u0);
+cbuffer C : register(b0) { uint W; uint H; }
+[numthreads(8, 8, 1)]
+void cs_bc7_read(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= W || id.y >= H) return;
+    uint4 q = (uint4)round(saturate(src.Load(int3(int(id.x), int(id.y), 0))) * 255.0);
+    dst.Store((id.y * W + id.x) * 4u, q.x | (q.y << 8u) | (q.z << 16u) | (q.w << 24u));
+}
+"#;
+
+pub struct Bc7Fidelity {
+    pub textures: usize,
+    /// Mean |decoded − source| per RGB channel sample, in 8-bit LSB.
+    pub mean_abs: f64,
+    /// Worst single-channel diff, LSB.
+    pub max_abs: u32,
+    /// Worst per-texture RGB PSNR, dB.
+    pub worst_psnr: f64,
+}
+
+/// Re-encode every compressible texture (deterministic — `bc7::self_test`
+/// pins it, so these blocks ARE the session's), upload each as a plain
+/// `BC7_UNORM` Texture2D (deliberately never `_SRGB`: the kernel must read
+/// raw code values, not the transfer function), GPU-decode it back with
+/// `BC7_READ_HLSL`, and diff against the CPU RGBA8 source.
+///
+/// RGB only: nothing ever samples a compressed texture's alpha (the cutout
+/// path reads only the alpha-masked RGBA8 set, and shade.hlsli consumes
+/// .rgb/.g/.b), and "opaque" merely means every alpha ≥ 250 — a 252 would
+/// quantize and show up here as false loss.
+///
+/// `Ok(None)` = nothing compressible (untextured scene, or every texture
+/// masked/odd-dim).
+pub fn bc7_fidelity(
+    scene: &Scene,
+    q: bc7::Quality,
+    hg: &mut HeadlessGpu,
+) -> Result<Option<Bc7Fidelity>> {
+    use super::d3d12::Submit;
+    let ids: Vec<usize> =
+        (0..scene.textures.len()).filter(|&i| bc7::should_compress(&scene.textures[i])).collect();
+    if ids.is_empty() {
+        return Ok(None);
+    }
+    let device = hg.device.clone();
+
+    // The session's exact blocks, re-encoded (LPT largest-first, the upload
+    // path's scheduling).
+    let blocks_by_id: Vec<(usize, Vec<u8>)> = {
+        use rayon::prelude::*;
+        let mut order = ids.clone();
+        order.sort_by_key(|&i| {
+            std::cmp::Reverse(scene.textures[i].w as u64 * scene.textures[i].h as u64)
+        });
+        order.par_iter().map(|&i| (i, bc7::encode_opaque(&scene.textures[i], q))).collect()
+    };
+
+    // Root signature: [0] table of one SRV (t0), [1] root UAV (u0),
+    // [2] two root constants (b0: W, H).
+    let ranges = [D3D12_DESCRIPTOR_RANGE {
+        RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+        NumDescriptors: 1,
+        BaseShaderRegister: 0,
+        ..Default::default()
+    }];
+    let params = [
+        D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                    NumDescriptorRanges: ranges.len() as u32,
+                    pDescriptorRanges: ranges.as_ptr(),
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        },
+        D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                Descriptor: D3D12_ROOT_DESCRIPTOR { ShaderRegister: 0, RegisterSpace: 0 },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        },
+        D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                Constants: D3D12_ROOT_CONSTANTS {
+                    ShaderRegister: 0,
+                    RegisterSpace: 0,
+                    Num32BitValues: 2,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        },
+    ];
+    let sig_desc = D3D12_ROOT_SIGNATURE_DESC {
+        NumParameters: params.len() as u32,
+        pParameters: params.as_ptr(),
+        ..Default::default()
+    };
+    let mut blob = None;
+    unsafe { D3D12SerializeRootSignature(&sig_desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, None) }
+        .map_err(|e| format!("bc7 fidelity root sig serialize: {e}"))?;
+    let blob = blob.unwrap();
+    let root: ID3D12RootSignature = unsafe {
+        device.CreateRootSignature(
+            0,
+            std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()),
+        )
+    }
+    .map_err(|e| format!("bc7 fidelity root sig: {e}"))?;
+    let cs = super::tonemap::compile(
+        BC7_READ_HLSL,
+        windows::core::s!("cs_bc7_read"),
+        windows::core::s!("cs_5_0"),
+        "bc7_read",
+    )?;
+    let pso: ID3D12PipelineState = unsafe {
+        device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::transmute_copy(&root),
+            CS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: cs.GetBufferPointer(),
+                BytecodeLength: cs.GetBufferSize(),
+            },
+            ..Default::default()
+        })
+    }
+    .map_err(|e| format!("bc7 fidelity PSO: {e}"))?;
+    let heap: ID3D12DescriptorHeap = unsafe {
+        device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            NumDescriptors: 1,
+            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+            ..Default::default()
+        })
+    }
+    .map_err(|e| format!("bc7 fidelity heap: {e}"))?;
+
+    // One staging pair reused across textures (the blocking submits fence it).
+    let max_stage = ids
+        .iter()
+        .map(|&i| {
+            let t = &scene.textures[i];
+            d3d12::block_pitch(t.w) * bc7::blocks(t.h) as usize
+        })
+        .max()
+        .unwrap();
+    let max_out = ids
+        .iter()
+        .map(|&i| scene.textures[i].w as u64 * scene.textures[i].h as u64 * 4)
+        .max()
+        .unwrap();
+    let stage = d3d12::UploadBuffer::new(&device, max_stage)?;
+    let out = committed_buffer(
+        &device,
+        max_out,
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+    )?;
+
+    let (mut sum_abs, mut n_samples, mut max_abs, mut worst_psnr) = (0f64, 0u64, 0u32, f64::MAX);
+    for (i, enc) in &blocks_by_id {
+        let t = &scene.textures[*i];
+        let fmt = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_BC7_UNORM;
+        let tex = d3d12::committed_tex(
+            &device,
+            t.w,
+            t.h,
+            fmt,
+            D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        )?;
+        let src_pitch = bc7::blocks(t.w) as usize * bc7::BLOCK_BYTES;
+        let pitch = d3d12::block_pitch(t.w);
+        for r in 0..bc7::blocks(t.h) as usize {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    enc[r * src_pitch..].as_ptr(),
+                    stage.ptr.add(r * pitch),
+                    src_pitch,
+                )
+            };
+        }
+        let fp = d3d12::footprint_block(fmt, t.w, t.h, 0);
+        hg.run_list(&mut |l| {
+            unsafe {
+                l.CopyTextureRegion(
+                    &d3d12::loc_subresource(&tex),
+                    0,
+                    0,
+                    0,
+                    &d3d12::loc_footprint(&stage.resource, fp),
+                    None,
+                );
+                l.ResourceBarrier(&[transition(
+                    &tex,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                )]);
+            }
+            Ok(())
+        })?;
+        unsafe {
+            device.CreateShaderResourceView(
+                &tex,
+                Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
+                    Format: fmt,
+                    ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                        Texture2D: D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() },
+                    },
+                }),
+                heap.GetCPUDescriptorHandleForHeapStart(),
+            )
+        };
+        hg.run_list(&mut |l| {
+            unsafe {
+                l.SetDescriptorHeaps(&[Some(heap.clone())]);
+                l.SetComputeRootSignature(&root);
+                l.SetPipelineState(&pso);
+                l.SetComputeRootDescriptorTable(0, heap.GetGPUDescriptorHandleForHeapStart());
+                l.SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
+                l.SetComputeRoot32BitConstants(2, 2, [t.w, t.h].as_ptr() as *const _, 0);
+                l.Dispatch(t.w.div_ceil(8), t.h.div_ceil(8), 1);
+            }
+            Ok(())
+        })?;
+        let dec = hg.read_buffer(
+            &out,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            (t.w * t.h) as usize * 4,
+        )?;
+        let mut sq = 0f64;
+        for (px, src) in t.texels.iter().enumerate() {
+            for c in 0..3 {
+                let d = dec[px * 4 + c].abs_diff(src[c]) as u32;
+                sum_abs += d as f64;
+                sq += (d as f64) * (d as f64);
+                max_abs = max_abs.max(d);
+            }
+            n_samples += 3;
+        }
+        let mse = sq / (t.texels.len() as f64 * 3.0);
+        let psnr = if mse > 0.0 { 10.0 * (255.0f64 * 255.0 / mse).log10() } else { 99.0 };
+        worst_psnr = worst_psnr.min(psnr);
+    }
+    Ok(Some(Bc7Fidelity {
+        textures: blocks_by_id.len(),
+        mean_abs: sum_abs / n_samples as f64,
+        max_abs,
+        worst_psnr,
+    }))
 }

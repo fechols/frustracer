@@ -777,6 +777,7 @@ impl GpuContext {
         gbuf: bool,
         nppd: Option<(&str, &str)>,
         debug: bool,
+        bc7_q: Option<crate::bc7::Quality>,
     ) -> Result<()> {
         let dev = self.d3d.device.clone();
         let mut tg = trace::TraceGpu::new(
@@ -789,6 +790,7 @@ impl GpuContext {
             gbuf,
             nppd.is_some(),
             debug,
+            bc7_q,
             &mut self.d3d,
         )?;
         // Upscaler sessions: wire the live upscaler's input planes as feed
@@ -861,12 +863,13 @@ impl GpuContext {
         rh: u32,
         gbuf: bool,
         debug: bool,
+        bc7_q: Option<crate::bc7::Quality>,
     ) -> Result<()> {
         if self.dxr.is_some() {
             return Ok(());
         }
         let dev = self.d3d.device.clone();
-        let mut d = dxr::DxrGpu::new(&dev, dxc, scene, rw, rh, gbuf, debug, &mut self.d3d)?;
+        let mut d = dxr::DxrGpu::new(&dev, dxc, scene, rw, rh, gbuf, debug, bc7_q, &mut self.d3d)?;
         if gbuf {
             self.wire_session_feed(rw, rh, |kind, targets| d.wire_feed(&dev, kind, targets))?;
         }
