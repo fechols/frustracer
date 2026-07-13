@@ -44,15 +44,26 @@ pub struct GpuOptions {
     pub xess_dir: String,
     /// Attempt FSR Ray Regeneration + FSR4 (native pipeline like XeSS;
     /// main.rs forces dlss off and rejects --xess when this is set). Also
-    /// flips the adapter preference to AMD.
+    /// flips the default adapter preference to AMD (an explicit `prefer`
+    /// wins).
     pub fsr: bool,
     /// Directory holding amd_fidelityfx_loader_dx12.dll + provider DLLs.
     pub ffx_dir: String,
+    /// Explicit adapter vendor preference (--prefer-nvidia / --prefer-intel /
+    /// --prefer-amd). None = the mode default: AMD when fsr is set, NVIDIA
+    /// otherwise. A preference, not a requirement — the per-feature support
+    /// probes still gate, so a pick without DLSS/FSR support just logs and
+    /// falls back to the plain path.
+    pub prefer: Option<adapter::Prefer>,
     /// OR XESS_INIT_FLAG_ENABLE_AUTOEXPOSURE into the XeSS init flags
     /// (--xess-autoexposure; A/B lever, default off).
     pub xess_autoexposure: bool,
     /// D3D12 debug layer + DXGI debug factory + verbose SL logging.
     pub debug: bool,
+    /// Present at sync interval 1 (default). `--no-vsync` clears it for
+    /// uncapped benchmark presentation (tearing swapchain when DXGI
+    /// supports it).
+    pub vsync: bool,
 }
 
 /// A live XeSS-SR context + its resource set and the queried input-resolution
@@ -173,7 +184,11 @@ impl GpuContext {
 
         let factory =
             adapter::create_factory(opts.debug).map_err(|e| format!("CreateDXGIFactory2: {e}"))?;
-        let prefer = if opts.fsr { adapter::Prefer::Amd } else { adapter::Prefer::Nvidia };
+        let prefer = opts.prefer.unwrap_or(if opts.fsr {
+            adapter::Prefer::Amd
+        } else {
+            adapter::Prefer::Nvidia
+        });
         let pick = adapter::pick(&factory, prefer)?;
         eprintln!("gpu: using adapter \"{}\"", pick.name);
         if sl.is_some() && !pick.is_nvidia {
@@ -200,7 +215,7 @@ impl GpuContext {
             let pdev: ID3D12Device = s.upgrade(&device)?;
             let queue = d3d12::create_queue(&pdev)?;
             let pfac: IDXGIFactory6 = s.upgrade(&factory)?;
-            let d3d = D3d::with_queue(&pfac, device, queue, hwnd, w, h)?;
+            let d3d = D3d::with_queue(&pfac, device, queue, hwnd, w, h, opts.vsync)?;
             // The swapchain we hold MUST be the SL proxy — every present has
             // to route through presentCommon under manual hooking. A proxy
             // resolves to a distinct native interface; verify loudly.
@@ -217,66 +232,10 @@ impl GpuContext {
             d3d
         } else {
             let queue = d3d12::create_queue(&device)?;
-            D3d::with_queue(&factory, device, queue, hwnd, w, h)?
+            D3d::with_queue(&factory, device, queue, hwnd, w, h, opts.vsync)?
         };
 
-        // Query DLSS-RR's optimal Quality-mode render resolution and its
-        // dynamic range — the CPU renders inside [min, max] and RR upscales
-        // + denoises to the window size (step-wise DRS via sl::Extent tags).
-        // A failed or degenerate query falls back to DLAA (opt == min ==
-        // max == output), which main.rs reads as "DRS off, fixed res".
-        let (rr_opt, rr_min, rr_max) = if let Some(s) = &sl {
-            let opt = streamline::SlShimDlssdOptions {
-                mode: streamline_sys::DLSS_MODE_MAX_QUALITY,
-                output_width: w,
-                output_height: h,
-                preset: streamline_sys::DLSSD_PRESET_E,
-                normal_roughness_packed: 1,
-                use_camera_matrices: 0,
-                world_to_view: [0.0; 16],
-                view_to_world: [0.0; 16],
-            };
-            match s.dlssd_optimal_settings(&opt) {
-                Ok(o) if o.render_width > 0 && o.render_height > 0 => {
-                    eprintln!(
-                        "dlss: RR Quality {}x{} -> render {}x{} (range {}x{}..{}x{})",
-                        w, h, o.render_width, o.render_height,
-                        o.render_width_min, o.render_height_min,
-                        o.render_width_max, o.render_height_max,
-                    );
-                    // Malformed halves of the range collapse to the optimal
-                    // size — never invent a range the driver didn't report.
-                    let po = (o.render_width, o.render_height);
-                    let pmin = if o.render_width_min > 0
-                        && o.render_height_min > 0
-                        && o.render_width_min <= o.render_width
-                        && o.render_height_min <= o.render_height
-                    {
-                        (o.render_width_min, o.render_height_min)
-                    } else {
-                        po
-                    };
-                    let pmax = if o.render_width_max >= o.render_width
-                        && o.render_height_max >= o.render_height
-                    {
-                        (o.render_width_max, o.render_height_max)
-                    } else {
-                        po
-                    };
-                    (po, pmin, pmax)
-                }
-                Ok(_) => {
-                    eprintln!("dlss: optimal-settings degenerate — falling back to DLAA at native res");
-                    ((w, h), (w, h), (w, h))
-                }
-                Err(e) => {
-                    eprintln!("dlss: optimal-settings query failed ({e}) — falling back to DLAA at native res");
-                    ((w, h), (w, h), (w, h))
-                }
-            }
-        } else {
-            ((w, h), (w, h), (w, h))
-        };
+        let (rr_opt, rr_min, rr_max) = Self::query_rr_res(sl.as_ref(), w, h);
 
         let passes = tonemap::Passes::new(&d3d.device)?;
         let blit = upload::BlitUpload::new(&d3d, w, h)?;
@@ -312,38 +271,15 @@ impl GpuContext {
         // allocated once at the range MAX; every frame uploads and names its
         // own sub-rect (dynamic resolution).
         let xess_state = if opts.xess && sl.is_none() {
-            match crate::xess::Xess::new(
-                &opts.xess_dir,
-                d3d.device.as_raw(),
-                (w, h),
-                opts.xess_autoexposure,
-            ) {
-                Ok((ctx, opt, min, max)) => {
-                    eprintln!(
-                        "xess: {}x{} -> optimal {}x{} (range {}x{}..{}x{})",
-                        w, h, opt.x, opt.y, min.x, min.y, max.x, max.y,
+            match Self::init_xess(&opts.xess_dir, &d3d.device, w, h, opts.xess_autoexposure) {
+                Ok(s) => {
+                    passes.create_srv(
+                        &d3d.device,
+                        &s.res.output,
+                        windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+                        tonemap::SRV_SLOT_XESS,
                     );
-                    match xr::XessResources::new(&d3d.device, max.x, max.y, w, h) {
-                        Ok(r) => {
-                            passes.create_srv(
-                                &d3d.device,
-                                &r.output,
-                                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
-                                tonemap::SRV_SLOT_XESS,
-                            );
-                            Some(XessState {
-                                ctx,
-                                res: r,
-                                opt: (opt.x, opt.y),
-                                min: (min.x, min.y),
-                                max: (max.x, max.y),
-                            })
-                        }
-                        Err(e) => {
-                            eprintln!("xess: disabled — resource allocation failed: {e}");
-                            None
-                        }
-                    }
+                    Some(s)
                 }
                 Err(e) => {
                     eprintln!("xess: disabled — {e}");
@@ -404,6 +340,178 @@ impl GpuContext {
             adapter_name: pick.name,
             adapter_is_nvidia: pick.is_nvidia,
         })
+    }
+
+    /// Query DLSS-RR's optimal Quality-mode render resolution and its
+    /// dynamic range for an output size — the CPU renders inside [min, max]
+    /// and RR upscales + denoises to the window size (step-wise DRS via
+    /// sl::Extent tags). A failed or degenerate query falls back to DLAA
+    /// (opt == min == max == output), which main.rs reads as "DRS off,
+    /// fixed res". Re-callable — a window resize re-queries at the new
+    /// output size.
+    #[allow(clippy::type_complexity)]
+    fn query_rr_res(
+        sl: Option<&streamline::SlContext>,
+        w: u32,
+        h: u32,
+    ) -> ((u32, u32), (u32, u32), (u32, u32)) {
+        let Some(s) = sl else {
+            return ((w, h), (w, h), (w, h));
+        };
+        let opt = streamline::SlShimDlssdOptions {
+            mode: streamline_sys::DLSS_MODE_MAX_QUALITY,
+            output_width: w,
+            output_height: h,
+            preset: streamline_sys::DLSSD_PRESET_E,
+            normal_roughness_packed: 1,
+            use_camera_matrices: 0,
+            world_to_view: [0.0; 16],
+            view_to_world: [0.0; 16],
+        };
+        match s.dlssd_optimal_settings(&opt) {
+            Ok(o) if o.render_width > 0 && o.render_height > 0 => {
+                eprintln!(
+                    "dlss: RR Quality {}x{} -> render {}x{} (range {}x{}..{}x{})",
+                    w, h, o.render_width, o.render_height,
+                    o.render_width_min, o.render_height_min,
+                    o.render_width_max, o.render_height_max,
+                );
+                // Malformed halves of the range collapse to the optimal
+                // size — never invent a range the driver didn't report.
+                let po = (o.render_width, o.render_height);
+                let pmin = if o.render_width_min > 0
+                    && o.render_height_min > 0
+                    && o.render_width_min <= o.render_width
+                    && o.render_height_min <= o.render_height
+                {
+                    (o.render_width_min, o.render_height_min)
+                } else {
+                    po
+                };
+                let pmax = if o.render_width_max >= o.render_width
+                    && o.render_height_max >= o.render_height
+                {
+                    (o.render_width_max, o.render_height_max)
+                } else {
+                    po
+                };
+                (po, pmin, pmax)
+            }
+            Ok(_) => {
+                eprintln!("dlss: optimal-settings degenerate — falling back to DLAA at native res");
+                ((w, h), (w, h), (w, h))
+            }
+            Err(e) => {
+                eprintln!("dlss: optimal-settings query failed ({e}) — falling back to DLAA at native res");
+                ((w, h), (w, h), (w, h))
+            }
+        }
+    }
+
+    /// Bring up the XeSS context + resource set for an output size. Split
+    /// out of `new` (the init_fsr shape) so every failure funnels into one
+    /// "xess: disabled" fallback and a window resize can rebuild it.
+    fn init_xess(
+        xess_dir: &str,
+        device: &ID3D12Device,
+        w: u32,
+        h: u32,
+        autoexposure: bool,
+    ) -> Result<XessState> {
+        let (ctx, opt, min, max) =
+            crate::xess::Xess::new(xess_dir, device.as_raw(), (w, h), autoexposure)?;
+        eprintln!(
+            "xess: {}x{} -> optimal {}x{} (range {}x{}..{}x{})",
+            w, h, opt.x, opt.y, min.x, min.y, max.x, max.y,
+        );
+        let r = xr::XessResources::new(device, max.x, max.y, w, h)
+            .map_err(|e| format!("resource allocation failed: {e}"))?;
+        Ok(XessState {
+            ctx,
+            res: r,
+            opt: (opt.x, opt.y),
+            min: (min.x, min.y),
+            max: (max.x, max.y),
+        })
+    }
+
+    /// Rebuild every window-size-dependent field at a new client size — the
+    /// GPU half of a live window resize. The context itself (device, queue,
+    /// PSOs, SL interposer + proxies) survives: ResizeBuffers on the SL
+    /// proxy swapchain is the documented resize pattern, whereas a full SL
+    /// shutdown/re-init in-process is unvalidated. The tracer pipelines and
+    /// upscaler contexts are torn down here and rebuilt by the caller's
+    /// session re-entry (init_trace / init_dxr at the re-derived locked
+    /// render res), which is also why the upscaler planes are recreated
+    /// FIRST — wire_session_feed needs them live.
+    pub fn resize_output(&mut self, w: u32, h: u32, opts: &GpuOptions) -> Result<()> {
+        // Everything below drops live GPU resources; drain first (the
+        // GpuContext::drop discipline — xess/ffx destroy-context require
+        // completed command lists, ResizeBuffers requires zero outstanding
+        // backbuffer refs).
+        self.d3d.wait_idle()?;
+        self.trace = None;
+        self.dxr = None;
+        self.nppd_gpu = None;
+        self.nppd_state_valid = false;
+        self.xess = None;
+        self.fsr = None;
+        self.rr = None;
+        self.d3d.resize(w, h)?;
+        self.blit = upload::BlitUpload::new(&self.d3d, w, h)?;
+        self.hdr = upload::HdrUpload::new(&self.d3d, w, h)?;
+        self.passes.create_srv(
+            &self.d3d.device,
+            &self.blit.texture,
+            d3d12::SWAPCHAIN_FORMAT,
+            tonemap::SRV_SLOT_BLIT,
+        );
+        self.passes.create_srv(
+            &self.d3d.device,
+            &self.hdr.texture,
+            windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+            tonemap::SRV_SLOT_HDR,
+        );
+        if self.sl.is_some() {
+            let (opt, min, max) = Self::query_rr_res(self.sl.as_ref(), w, h);
+            let r = rr::RrResources::new(&self.d3d.device, opt, min, max, w, h)?;
+            self.passes.create_srv(
+                &self.d3d.device,
+                &r.output,
+                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+                tonemap::SRV_SLOT_RR,
+            );
+            self.rr = Some(r);
+        }
+        if opts.xess && self.sl.is_none() {
+            match Self::init_xess(&opts.xess_dir, &self.d3d.device, w, h, opts.xess_autoexposure) {
+                Ok(s) => {
+                    self.passes.create_srv(
+                        &self.d3d.device,
+                        &s.res.output,
+                        windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+                        tonemap::SRV_SLOT_XESS,
+                    );
+                    self.xess = Some(s);
+                }
+                Err(e) => eprintln!("xess: disabled after resize — {e}"),
+            }
+        }
+        if opts.fsr && self.sl.is_none() {
+            match Self::init_fsr(&opts.ffx_dir, &self.d3d.device, w, h, opts.debug) {
+                Ok(s) => {
+                    self.passes.create_srv(
+                        &self.d3d.device,
+                        &s.res.upscaled,
+                        windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+                        tonemap::SRV_SLOT_FSR,
+                    );
+                    self.fsr = Some(s);
+                }
+                Err(e) => eprintln!("fsr: disabled after resize — {e}"),
+            }
+        }
+        Ok(())
     }
 
     /// Bring up the two ffx contexts + resources. Split out of `new` so every

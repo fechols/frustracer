@@ -63,6 +63,12 @@ pub struct D3d {
     pub frame_index: usize,
     pub width: u32,
     pub height: u32,
+    /// Present sync interval (1 = v-sync, 0 = uncapped for benchmarking).
+    sync_interval: u32,
+    /// DXGI_PRESENT_ALLOW_TEARING when the swapchain was created with the
+    /// tearing flag (required together — the flag is only legal on such a
+    /// swapchain, and only with sync interval 0 in windowed mode).
+    present_flags: DXGI_PRESENT,
 }
 
 /// Create the native D3D12 device on the picked adapter (debug layer first —
@@ -107,7 +113,34 @@ impl D3d {
         hwnd: HWND,
         width: u32,
         height: u32,
+        vsync: bool,
     ) -> Result<Self> {
+        // Uncapped presentation needs DXGI tearing support (windowed flip
+        // model otherwise paces on the compositor even at sync interval 0),
+        // and the Present flag is only legal on a swapchain created with the
+        // matching creation flag.
+        let tearing = !vsync && {
+            let mut sup = windows::core::BOOL(0);
+            unsafe {
+                factory.CheckFeatureSupport(
+                    DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+                    &mut sup as *mut _ as *mut core::ffi::c_void,
+                    std::mem::size_of::<windows::core::BOOL>() as u32,
+                )
+            }
+            .is_ok()
+                && sup.as_bool()
+        };
+        if !vsync {
+            if tearing {
+                eprintln!("present: v-sync off (tearing swapchain, uncapped frame rate)");
+            } else {
+                eprintln!(
+                    "present: v-sync off requested but DXGI tearing is unsupported — \
+                     presenting at sync interval 0 (the compositor may still pace frames)"
+                );
+            }
+        }
         let sc_desc = DXGI_SWAP_CHAIN_DESC1 {
             Width: width,
             Height: height,
@@ -116,6 +149,7 @@ impl D3d {
             BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
             BufferCount: BACKBUFFERS,
             SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+            Flags: if tearing { DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0 as u32 } else { 0 },
             ..Default::default()
         };
         let sc1: IDXGISwapChain1 = unsafe {
@@ -181,12 +215,49 @@ impl D3d {
             frame_index: 0,
             width,
             height,
+            sync_interval: if vsync { 1 } else { 0 },
+            present_flags: if tearing { DXGI_PRESENT_ALLOW_TEARING } else { DXGI_PRESENT(0) },
         })
     }
 
     pub fn rtv_handle(&self, backbuffer: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
         let start = unsafe { self.rtv_heap.GetCPUDescriptorHandleForHeapStart() };
         D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start.ptr + (backbuffer * self.rtv_size) as usize }
+    }
+
+    /// Resize the swapchain to a new client size. Drains the GPU, releases
+    /// the backbuffer refs (DXGI requires zero outstanding references — the
+    /// `backbuffers` Vec is their sole holder), ResizeBuffers with the SAME
+    /// creation flags (a tearing swapchain must keep the tearing flag or the
+    /// call fails), and recreates the RTVs in place (the heap holds a fixed
+    /// BACKBUFFERS descriptors — overwritten, never reallocated).
+    /// `frame_index` needs no reset: it is only the frames-in-flight slot
+    /// counter; the backbuffer index is queried fresh at every present.
+    /// Works through the Streamline proxy swapchain too — ResizeBuffers is
+    /// an SL hook and the manual-hooking guide's documented resize pattern.
+    pub fn resize(&mut self, w: u32, h: u32) -> Result<()> {
+        self.wait_idle()?;
+        self.backbuffers.clear();
+        let flags = if self.present_flags == DXGI_PRESENT_ALLOW_TEARING {
+            DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING
+        } else {
+            DXGI_SWAP_CHAIN_FLAG(0)
+        };
+        unsafe { self.swapchain.ResizeBuffers(BACKBUFFERS, w, h, SWAPCHAIN_FORMAT, flags) }
+            .map_err(|e| format!("ResizeBuffers({w}x{h}): {e}"))?;
+        let rtv0 = unsafe { self.rtv_heap.GetCPUDescriptorHandleForHeapStart() };
+        for i in 0..BACKBUFFERS {
+            let buf: ID3D12Resource = unsafe { self.swapchain.GetBuffer(i) }
+                .map_err(|e| format!("resize GetBuffer({i}): {e}"))?;
+            let handle = D3D12_CPU_DESCRIPTOR_HANDLE {
+                ptr: rtv0.ptr + (i * self.rtv_size) as usize,
+            };
+            unsafe { self.device.CreateRenderTargetView(&buf, None, handle) };
+            self.backbuffers.push(buf);
+        }
+        self.width = w;
+        self.height = h;
+        Ok(())
     }
 
     fn wait_for_fence(&self, value: u64) -> Result<()> {
@@ -217,7 +288,7 @@ impl D3d {
         unsafe { self.list.Close() }.map_err(|e| format!("list Close: {e}"))?;
         let lists = [Some(self.list.cast::<ID3D12CommandList>().unwrap())];
         unsafe { self.queue.ExecuteCommandLists(&lists) };
-        unsafe { self.swapchain.Present(1, DXGI_PRESENT(0)) }
+        unsafe { self.swapchain.Present(self.sync_interval, self.present_flags) }
             .ok()
             .map_err(|e| format!("Present: {e}"))?;
         let v = self.next_fence;

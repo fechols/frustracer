@@ -493,9 +493,9 @@ pub struct HeadlessGpu {
 }
 
 impl HeadlessGpu {
-    pub fn new(debug: bool) -> Result<Self> {
+    pub fn new(debug: bool, prefer: adapter::Prefer) -> Result<Self> {
         let factory = adapter::create_factory(debug).map_err(|e| format!("factory: {e}"))?;
-        let pick = adapter::pick(&factory, adapter::Prefer::Nvidia)?;
+        let pick = adapter::pick(&factory, prefer)?;
         let device = d3d12::create_device(&pick.adapter, debug)?;
         let queue = d3d12::create_queue(&device)?;
         let alloc: ID3D12CommandAllocator =

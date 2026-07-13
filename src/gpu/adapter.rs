@@ -9,6 +9,7 @@ use windows::Win32::Graphics::Dxgi::*;
 
 const VENDOR_NVIDIA: u32 = 0x10DE;
 const VENDOR_AMD: u32 = 0x1002;
+const VENDOR_INTEL: u32 = 0x8086;
 
 /// Which vendor's best-VRAM adapter to prefer (never a hard requirement —
 /// the caller's feature-support probe is the real gate; a wrong-vendor pick
@@ -17,6 +18,7 @@ const VENDOR_AMD: u32 = 0x1002;
 pub enum Prefer {
     Nvidia,
     Amd,
+    Intel,
 }
 
 pub struct AdapterPick {
@@ -37,6 +39,7 @@ pub fn pick(factory: &IDXGIFactory6, prefer: Prefer) -> std::result::Result<Adap
     let want = match prefer {
         Prefer::Nvidia => VENDOR_NVIDIA,
         Prefer::Amd => VENDOR_AMD,
+        Prefer::Intel => VENDOR_INTEL,
     };
     let mut best: Option<(IDXGIAdapter4, DXGI_ADAPTER_DESC3)> = None;
     let mut fallback: Option<(IDXGIAdapter4, DXGI_ADAPTER_DESC3)> = None;
