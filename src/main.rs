@@ -13,6 +13,10 @@ mod hemi;
 mod gpu;
 #[cfg(windows)]
 mod input;
+// 500 Hz wall-clock input integrator thread (keyboard/mouse/XInput -> the
+// shared camera); Win32-only by nature, like the window it serves.
+#[cfg(windows)]
+mod flycam;
 mod matclass;
 // OIDN loads its DLLs through the Win32 loader; the denoiser itself is
 // CPU/GPU-agnostic but the SDK drop and load path here are Windows-only.
@@ -7310,15 +7314,17 @@ enum SessionEnd {
     Resize(u32, u32),
 }
 
-/// User-visible state that survives a window-resize session restart: camera
-/// pose, mode toggles, denoiser intents, counters. Everything else — every
-/// buffer, controller, history, and upscaler context — intentionally
-/// rebuilds at the new size by re-entering the session init code (which is
-/// the same code that already handles every mode/fallback at any (w, h)).
+/// User-visible state that survives a window-resize session restart: mode
+/// toggles, denoiser intents, counters. The camera pose is NOT here — the
+/// flycam integrator thread owns it for the whole app lifetime (it keeps
+/// flying through the rebuild) and the next session just snapshots it.
+/// Everything else — every buffer, controller, history, and upscaler
+/// context — intentionally rebuilds at the new size by re-entering the
+/// session init code (which is the same code that already handles every
+/// mode/fallback at any (w, h)).
 #[cfg(windows)]
 #[derive(Clone, Copy)]
 struct Persist {
-    cam: Camera,
     hybrid: bool,
     dynamic: bool,
     overlay_on: bool,
@@ -7382,6 +7388,11 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     };
     let mut gpu = gpu::GpuContext::new(sdl_hwnd(&window), W as u32, H as u32, &gopts)
         .expect("GPU init failed");
+    // The 500 Hz integrator owns the camera pose for the whole app lifetime
+    // (spawned here, not per session, so it keeps integrating across resize
+    // rebuilds — re-entry continuity is automatic). Sessions only snapshot.
+    let fly =
+        flycam::FlyCam::spawn(sdl_hwnd(&window).0 as isize, cam0, scene.diag);
 
     // A window resize exits the session and re-enters it at the new client
     // size: the session init code IS the rebuild path (every buffer,
@@ -7393,7 +7404,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     let (mut w, mut h) = (W, H);
     let mut persist: Option<Persist> = None;
     loop {
-        match session(scene, bvh, opts, cam0, &mut window, &mut inp, &mut gpu, &mut persist, w, h)
+        match session(scene, bvh, opts, &fly, &mut window, &mut inp, &mut gpu, &mut persist, w, h)
         {
             SessionEnd::Quit => break,
             SessionEnd::Resize(nw, nh) => {
@@ -7418,7 +7429,7 @@ fn session(
     scene: &scene::Scene,
     bvh: &bvh::Bvh,
     opts: &Opts,
-    cam0: Camera,
+    fly: &flycam::FlyCam,
     window: &mut sdl2::video::Window,
     inp: &mut input::Input,
     gpu: &mut gpu::GpuContext,
@@ -7435,7 +7446,10 @@ fn session(
     let want_nppd = p0.map_or(opts.nppd, |p| p.nppd_on || p.xess_nppd);
     let want_dxr = p0.map_or(opts.dxr, |p| p.dxr_on);
 
-    let mut cam = p0.map_or(cam0, |p| p.cam);
+    // The integrator thread owns the pose (it kept flying through any resize
+    // rebuild); the session works exclusively on per-iteration snapshots.
+    let mut cam = fly.snapshot();
+    let mut prev_snap = cam;
     let accum: Vec<AtomicU32> = (0..w * h * 3).map(|_| AtomicU32::new(0)).collect();
     let info: Vec<AtomicU32> = (0..w * h).map(|_| AtomicU32::new(0)).collect();
     let tbuf: Vec<AtomicU32> = (0..w * h).map(|_| AtomicU32::new(0)).collect();
@@ -8084,7 +8098,6 @@ fn session(
     // A resize re-entry keeps the last estimate — cost scales with area,
     // but the controller corrects within a frame either way.
     let mut depth_est: f32 = p0.map_or(4.0, |p| p.depth_est);
-    let mut last = Instant::now();
     let mut last_title = Instant::now();
     let mut last_stats = Instant::now();
     // Presented-frames-per-second, recomputed once per second (frame ms in
@@ -8105,8 +8118,6 @@ fn session(
 
     let end = loop {
         let now = Instant::now();
-        let dt = (now - last).as_secs_f32().min(0.1);
-        last = now;
 
         let edges = inp.poll();
         if edges.quit {
@@ -8139,7 +8150,14 @@ fn session(
                 }
             }
         }
-        let moved = inp.apply_movement(&mut cam, dt, scene.diag);
+        // One pose snapshot per iteration: everything this frame does (trace,
+        // MVs, prev-camera captures, verify) reads this copy, so trace pose ==
+        // MV pose == prev-capture pose even while the integrator keeps
+        // flying. `moved` = the integrator wrote between frames (bit compare;
+        // taps shorter than a frame land as exactly one moved frame).
+        cam = fly.snapshot();
+        let moved = cam != prev_snap;
+        prev_snap = cam;
 
         // GPU-resident tracing (--gpu): a self-contained arm — every frame is
         // traced (and in upscaler sub-modes fed + upscaled), tonemapped, and
@@ -10179,7 +10197,6 @@ fn session(
     // Carry user-visible state into the next session (resize re-entry) or
     // just record it on quit — cheap either way.
     *persist = Some(Persist {
-        cam,
         hybrid,
         dynamic,
         overlay_on,

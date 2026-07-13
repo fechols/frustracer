@@ -1,7 +1,11 @@
 use crate::frustum::TileFrustum;
 use glam::Vec3A;
 
-#[derive(Clone, Copy)]
+// PartialEq: bitwise field equality, same rationale as CamBasis below — no
+// camera math produces NaN, and successive `FlyCam::snapshot`s of an
+// unwritten shared camera are bit-identical copies, so `!=` detects "the
+// integrator thread wrote something" exactly (the `moved` signal).
+#[derive(Clone, Copy, PartialEq)]
 pub struct Camera {
     pub pos: Vec3A,
     pub yaw: f32,
