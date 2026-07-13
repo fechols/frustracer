@@ -84,12 +84,16 @@ impl FsrResources {
         let mut offset = 0usize;
         let mut planes = Vec::with_capacity(N_PLANES);
         for (format, bpp) in specs {
+            // ALLOW_UNORDERED_ACCESS: GPU-fed sessions write these planes
+            // directly from the cs_feed_fsr_rr kernel (typed UAV stores) —
+            // the xr.rs precedent. The CPU upload path is unaffected; the
+            // rest state stays NON_PIXEL_SHADER_RESOURCE either way.
             let tex = committed_tex(
                 device,
                 max_w,
                 max_h,
                 format,
-                D3D12_RESOURCE_FLAG_NONE,
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
             )?;
             planes.push(Plane { tex, format, bpp, offset });
@@ -441,6 +445,26 @@ impl FsrResources {
             .collect();
         unsafe { d3d.list.ResourceBarrier(&to_srv) };
         Ok(())
+    }
+
+    /// The nine input planes as GPU feed targets for `cs_feed_fsr_rr`, in
+    /// upload-plane order (depth_lin, depth_clip, mvec, normals, diff_alb,
+    /// spec_alb, dd_in, ds_in, residual) — `wire_session_feed` maps them to
+    /// the FEED_* registers explicitly, and the check suites' rewire gates
+    /// pin the mapping.
+    pub fn plane_resources(&self) -> [(&ID3D12Resource, DXGI_FORMAT); N_PLANES] {
+        [
+            P_DEPTH_LIN,
+            P_DEPTH_CLIP,
+            P_MVEC,
+            P_NORMALS,
+            P_DIFF_ALB,
+            P_SPEC_ALB,
+            P_DD_IN,
+            P_DS_IN,
+            P_RESIDUAL,
+        ]
+        .map(|p| (&self.planes[p].tex, self.planes[p].format))
     }
 
     fn shim(res: &ID3D12Resource, state: u32) -> FfxShimRes {

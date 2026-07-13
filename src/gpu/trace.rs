@@ -43,25 +43,30 @@ pub const RP_TEX: u32 = RP_SRV0 + NUM_SRVS;
 // The G-buffer pack root UAV (register u15), appended AFTER the table so the
 // established param indices never renumber. 53/64 root-signature DWORDs.
 pub const RP_GBUF: u32 = RP_TEX + 1;
-/// Upscaler feed-target texture UAVs: registers u16..u22, riding the u14
-/// descriptor table as a second range at heap slots 1..7 (0 DWORDs extra).
-/// The register/type layout is shared by both feed kernels (feed.hlsl).
-pub const NUM_FEED: u32 = 7;
-pub const FEED_COLOR: u32 = 16; // RGBA16F (both upscalers)
-pub const FEED_NR: u32 = 17; // RGBA16F normal+rough (RR)
-pub const FEED_DEPTH: u32 = 18; // R32F (both; encoding differs per kernel)
-pub const FEED_MVEC: u32 = 19; // RG16F (both)
-pub const FEED_ALB: u32 = 20; // RGBA8 diffuse albedo (RR)
-pub const FEED_SPEC: u32 = 21; // RGBA8 specular albedo (RR)
-pub const FEED_SPECHIT: u32 = 22; // R16F spec hit distance (RR)
+/// Upscaler feed-target texture UAVs: registers u16..u25, riding the u14
+/// descriptor table as a second range at heap slots 1..10 (0 DWORDs extra).
+/// The register/type layout is shared by every feed kernel (feed.hlsl); a
+/// register's VALUE/format may differ per kernel, the HLSL type never does.
+pub const NUM_FEED: u32 = 10;
+pub const FEED_COLOR: u32 = 16; // RGBA16F (RR/XeSS); RGBA16F residual (FSR-RR)
+pub const FEED_NR: u32 = 17; // RGBA16F normal+rough (RR); RGB10A2 oct-normals (FSR-RR)
+pub const FEED_DEPTH: u32 = 18; // R32F (all; encoding differs per kernel)
+pub const FEED_MVEC: u32 = 19; // RG16F (RR/XeSS)
+pub const FEED_ALB: u32 = 20; // RGBA8 diffuse albedo (RR; sqrt-encoded FSR-RR)
+pub const FEED_SPEC: u32 = 21; // RGBA8 specular albedo (RR; sqrt-encoded FSR-RR)
+pub const FEED_SPECHIT: u32 = 22; // R16F spec hit distance (RR); R32F linear depth (FSR-RR)
+pub const FEED_FSR_MVEC: u32 = 23; // RGBA16F FSR-RR mvec (UV-delta RG + depth-delta B)
+pub const FEED_FSR_DD: u32 = 24; // RGBA16F FSR-RR demodulated direct diffuse
+pub const FEED_FSR_DS: u32 = 25; // RGBA16F FSR-RR demodulated direct specular
 // GPU-resident NPPD staging (the --gpu --nppd composition): four raw-buffer
-// root UAVs at u23..u26, appended after RP_GBUF so nothing renumbers
-// (61/64 root-signature DWORDs). Bound only when the session built them.
+// root UAVs at u26..u29 (nppd.hlsl's literals — lockstep), appended after
+// RP_GBUF so nothing renumbers (61/64 root-signature DWORDs). Bound only
+// when the session built them.
 pub const RP_NPPD_FRAME: u32 = RP_GBUF + 1;
 pub const RP_NPPD_STATE: u32 = RP_GBUF + 2;
 pub const RP_NPPD_WARPED: u32 = RP_GBUF + 3;
 pub const RP_NPPD_OUT: u32 = RP_GBUF + 4;
-pub const NPPD_REG_BASE: u32 = NUM_UAVS + 2 + NUM_FEED; // u23
+pub const NPPD_REG_BASE: u32 = NUM_UAVS + 2 + NUM_FEED; // u26
 /// Scene textures + UV stream: one SRV descriptor table in register space1
 /// (collision-free with every space0 register above), appended after the
 /// NPPD params so nothing renumbers (62/64 root-signature DWORDs). Range 0 =
@@ -1320,9 +1325,18 @@ pub const FLAG_FRAME_JITTER: u32 = 4;
 pub const FLAG_VERIFY: u32 = 8;
 /// G-buffer pack writes on. Set ONLY when the pack is full-size (upscaler
 /// sessions) — root UAVs have no bounds check and the plain-session pack is
-/// a 64-byte dummy, so this flag is memory safety, not an optimization.
+/// a GBUF_STRIDE-byte dummy, so this flag is memory safety, not an
+/// optimization.
 pub const FLAG_GBUF: u32 = 16;
 pub const FLAG_HAS_PREV: u32 = 32;
+/// FSR-RR sessions: the pack additionally carries the demodulated
+/// direct-light signals (GBufPx.sig) and the prev-camera view-Z (mv.z);
+/// zeros under every other wiring — RR/XeSS packs stay byte-identical.
+pub const FLAG_FSR_SIG: u32 = 64;
+
+/// GBufPx stride in bytes — lockstep with trace_common.hlsli's struct
+/// (nr | alb_z | spec | mv | sig = 4 float4 + 1 uint4).
+pub const GBUF_STRIDE: u64 = 80;
 
 /// Mirror of `cbuffer Frame` in trace_common.hlsli (304 bytes, 16-aligned
 /// rows — float3s ride in float4 slots with scalars packed in .w).
@@ -1425,7 +1439,7 @@ impl FrameCb {
 
     /// The per-frame fields folded onto the static base — the single source
     /// for the FrameParams -> cbuffer mapping (both dispatch flavors).
-    pub(crate) fn with_frame(&self, p: &FrameParams, gbuf_full: bool) -> FrameCb {
+    pub(crate) fn with_frame(&self, p: &FrameParams, gbuf_full: bool, fsr_sig: bool) -> FrameCb {
         let (origin, forward, right, up, inv_w, inv_h) = p.cam.gpu_fields();
         let mut cb = *self;
         cb.cam_origin = [origin.x, origin.y, origin.z, inv_w];
@@ -1438,7 +1452,8 @@ impl FrameCb {
             | (p.frame_jitter.is_some() as u32 * FLAG_FRAME_JITTER)
             | (p.verify as u32 * FLAG_VERIFY)
             | (gbuf_full as u32 * FLAG_GBUF)
-            | (p.prev_cam.is_some() as u32 * FLAG_HAS_PREV);
+            | (p.prev_cam.is_some() as u32 * FLAG_HAS_PREV)
+            | ((gbuf_full && fsr_sig) as u32 * FLAG_FSR_SIG);
         cb.shadow_samples = p.q.shadow_samples;
         cb.ao_samples = p.q.ao_samples;
         cb.reflections = p.q.reflections as u32;
@@ -1488,11 +1503,18 @@ pub struct FrameParams {
 }
 
 /// Which upscaler the feed pass targets — selects the kernel (and thereby
-/// the plane set and the u18 depth encoding).
+/// the plane set and the u18 depth encoding). `Fsr3` is the XeSS feed over
+/// FSR 3.1's planes: same three targets, same formats, same reversed-Z
+/// depth encode — it compiles to `cs_feed_xess` and exists as its own kind
+/// only so the wiring is explicit (and the NPPD composition stays
+/// XeSS-only). `FsrRr` is the nine-plane Ray Regeneration + FSR4 feed
+/// (`cs_feed_fsr_rr`) — the only kind that arms FLAG_FSR_SIG.
 #[derive(Clone, Copy, PartialEq)]
 pub enum FeedKind {
     Xess,
     Rr,
+    Fsr3,
+    FsrRr,
 }
 
 /// 0 = off, 1 = AO, 2 = GI (GI subsumes AO, mirroring shade.rs's tiering).
@@ -1545,6 +1567,7 @@ pub struct TraceGpu {
     pso_compose: ID3D12PipelineState,
     pso_feed_xess: Option<ID3D12PipelineState>,
     pso_feed_rr: Option<ID3D12PipelineState>,
+    pso_feed_fsr_rr: Option<ID3D12PipelineState>,
     /// The wired upscaler feed targets (wire_feed): plane resources cloned
     /// for record_feed's barriers, plus which feed kernel consumes them.
     feed: Option<(FeedKind, Vec<ID3D12Resource>)>,
@@ -1664,13 +1687,14 @@ impl TraceGpu {
         let pso_compose = pso(&compose_src, "cs_compose", "compose")?;
         // Feed kernels exist only when the pack is full-size (an upscaler
         // session); plain sessions never record a feed.
-        let (pso_feed_xess, pso_feed_rr) = if gbuf_full {
+        let (pso_feed_xess, pso_feed_rr, pso_feed_fsr_rr) = if gbuf_full {
             (
                 Some(pso(&feed_src, "cs_feed_xess", "feed_xess")?),
                 Some(pso(&feed_src, "cs_feed_rr", "feed_rr")?),
+                Some(pso(&feed_src, "cs_feed_fsr_rr", "feed_fsr_rr")?),
             )
         } else {
-            (None, None)
+            (None, None, None)
         };
         // NPPD staging kernels: only in --gpu --nppd (XeSS) sessions.
         let nppd_psos = if gbuf_full && nppd {
@@ -1744,9 +1768,10 @@ impl TraceGpu {
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
         )?;
         // The G-buffer pack: dlss::GBufs interleaved on the GPU. Full-size
-        // only in upscaler sessions — plain sessions bind a 64-byte dummy
-        // and never set FLAG_GBUF (root UAVs have no bounds check).
-        let gbuf = committed_buffer(device, if gbuf_full { px * 64 } else { 64 }, uaf, ua)?;
+        // only in upscaler sessions — plain sessions bind a stride-sized
+        // dummy and never set FLAG_GBUF (root UAVs have no bounds check).
+        let gbuf =
+            committed_buffer(device, if gbuf_full { px * GBUF_STRIDE } else { GBUF_STRIDE }, uaf, ua)?;
         // NPPD plane buffers at the /32-padded dims (~340 MB at 1080p/quality
         // — the recurrent state dominates, same as the CPU path's staging).
         let nppd_res = match nppd_psos {
@@ -1879,6 +1904,7 @@ impl TraceGpu {
             pso_compose,
             pso_feed_xess,
             pso_feed_rr,
+            pso_feed_fsr_rr,
             feed: None,
             nppd: nppd_res,
             scene: scene_gpu,
@@ -1918,8 +1944,13 @@ impl TraceGpu {
     /// Write this frame's constants into the given ring slot.
     pub fn write_cb(&self, slot: usize, p: &FrameParams) {
         self.cb_base
-            .with_frame(p, self.gbuf_full)
+            .with_frame(p, self.gbuf_full, self.fsr_sig())
             .store(unsafe { self.frame_cb.ptr.add(slot * CB_STRIDE) });
+    }
+
+    /// Whether the wired feed consumes the pack's FSR signal lanes.
+    fn fsr_sig(&self) -> bool {
+        matches!(&self.feed, Some((FeedKind::FsrRr, _)))
     }
 
     /// Bind the shared root signature + everything every kernel might read.
@@ -2369,8 +2400,14 @@ impl TraceGpu {
         };
         let pso = match (kind, nppd) {
             (FeedKind::Xess, Some(n)) => Some(&n.pso_feed_dm),
-            (FeedKind::Xess, None) => self.pso_feed_xess.as_ref(),
+            // Fsr3/FsrRr can't carry nppd: the guard above already rejected
+            // non-XeSS NPPD composition.
+            (FeedKind::Xess | FeedKind::Fsr3, None) => self.pso_feed_xess.as_ref(),
+            (FeedKind::Fsr3 | FeedKind::FsrRr, Some(_)) => {
+                unreachable!("nppd guard rejected non-XeSS")
+            }
             (FeedKind::Rr, _) => self.pso_feed_rr.as_ref(),
+            (FeedKind::FsrRr, None) => self.pso_feed_fsr_rr.as_ref(),
         }
         .ok_or("feed PSO missing (TraceGpu built without gbuf)")?;
         record_feed_dispatch(

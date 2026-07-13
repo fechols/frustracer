@@ -126,12 +126,17 @@ the idiomatic safe shared buffer.
 ## Running
 
 ```
-cargo run --release                   # procedural scene (boxes, spheres, marble bunny, gold teapot)
+cargo run --release                   # procedural scene (boxes, spheres, marble bunny, gold teapot);
+                                      # the DXR DispatchRays pipeline + the first supported upscaler
 cargo run --release -- model.obj      # load an OBJ (auto-fitted onto the ground)
 cargo run --release -- --stress 5000  # perf test: field of n objects (boxes/spheres/bunnies/teapots)
 cargo run --release -- --check        # headless: verify vs reference, benchmark, write check.png
 cargo run --release -- --check-dlss   # headless: DLSS G-buffer MV/depth/matrix self-test
-cargo run --release -- --no-dlss      # skip Streamline; native D3D12 presentation
+cargo run --release -- --cpu          # the CPU frustum-tracer as the render mode (opts out of --dxr/--gpu)
+cargo run --release -- --no-dlss      # skip the DLSS-RR level of the always-on upscaler chain
+                                      # (DLSS-RR -> FSR4-RR -> XeSS -> FSR3; the first supported
+                                      # level wins, and --<x> force-starts the chain at level x)
+cargo run --release -- --no-upscale   # plain presentation: no temporal upscaler at all
 cargo run --release -- --nppd         # NPPD neural denoising before an XeSS upscale (needs
                                       # onnxruntime.dll + an exported model — see
                                       # tools/nppd-export/README.md; --no-xess = standalone)

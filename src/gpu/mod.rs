@@ -33,33 +33,24 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::IDXGIFactory6;
 
 pub struct GpuOptions {
-    /// Attempt DLSS via Streamline (falls back to a native pipeline with a
-    /// log line when the SDK/adapter/driver doesn't support it).
-    pub dlss: bool,
+    /// The temporal-upscaler fallback chain: which levels of
+    /// DLSS-RR → FSR4-RR → XeSS → FSR3 to probe, in that fixed order — the
+    /// first level whose support probe passes is wired for the session
+    /// (exactly one upscaler per session: DLSS decides the SL-proxy-vs-native
+    /// device split up front, and the native levels are first-hit-wins).
+    /// Every level exhausted = plain presentation with a loud line.
+    pub chain: crate::upchain::UpChain,
     /// Directory holding sl.interposer.dll and the SL plugins.
     pub sl_dir: String,
-    /// Attempt XeSS-SR (requires the native, non-Streamline pipeline —
-    /// main.rs forces dlss off when this is set).
-    pub xess: bool,
     /// Directory holding libxess.dll.
     pub xess_dir: String,
-    /// Attempt FSR (native pipeline like XeSS; main.rs forces dlss off and
-    /// rejects --xess when this is set). Also flips the default adapter
-    /// preference to AMD (an explicit `prefer` wins). FSR4 + Ray
-    /// Regeneration where the RR provider enumerates (RDNA4); FSR 3.1
-    /// upscale-only elsewhere, with a log line.
-    pub fsr: bool,
-    /// Force the FSR 3.1 provider even where FSR4+RR is available
-    /// (--fsr3; the A/B lever). Fails loudly when no 3.1 provider is
-    /// enumerated rather than silently un-forcing.
-    pub fsr3: bool,
     /// Directory holding amd_fidelityfx_loader_dx12.dll + provider DLLs.
     pub ffx_dir: String,
     /// Explicit adapter vendor preference (--prefer-nvidia / --prefer-intel /
-    /// --prefer-amd). None = the mode default: AMD when fsr is set, NVIDIA
-    /// otherwise. A preference, not a requirement — the per-feature support
-    /// probes still gate, so a pick without DLSS/FSR support just logs and
-    /// falls back to the plain path.
+    /// --prefer-amd). None = NVIDIA (main.rs flips the default to AMD when
+    /// FSR was explicitly forced). A preference, not a requirement — the
+    /// per-level support probes still gate, so a pick without DLSS/FSR
+    /// support just falls through the chain.
     pub prefer: Option<adapter::Prefer>,
     /// OR XESS_INIT_FLAG_ENABLE_AUTOEXPOSURE into the XeSS init flags
     /// (--xess-autoexposure; A/B lever, default off).
@@ -70,6 +61,18 @@ pub struct GpuOptions {
     /// uncapped benchmark presentation (tearing swapchain when DXGI
     /// supports it).
     pub vsync: bool,
+}
+
+/// Which chain level a session actually wired — derived from the live state
+/// (the Options can never disagree with reality). `Plain` = nothing wired
+/// (--no-upscale or chain exhausted).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WiredUpscaler {
+    Rr,
+    Fsr4,
+    Xess,
+    Fsr3,
+    Plain,
 }
 
 /// A live XeSS-SR context + its resource set and the queried input-resolution
@@ -194,8 +197,11 @@ fn rr_sl_sequence(
 
 impl GpuContext {
     pub fn new(hwnd: HWND, w: u32, h: u32, opts: &GpuOptions) -> Result<Self> {
-        // Streamline must initialize before any DXGI factory exists.
-        let mut sl = if opts.dlss {
+        // Chain level 1 (DLSS-RR). Streamline must initialize before any
+        // DXGI factory exists — which is why DLSS is structurally the top of
+        // the chain: it decides the SL-proxy-vs-native device split before
+        // anything else can be probed.
+        let mut sl = if opts.chain.dlss {
             match streamline::SlContext::init(
                 &opts.sl_dir,
                 &[streamline_sys::FEATURE_DLSS_RR],
@@ -206,7 +212,7 @@ impl GpuContext {
                     Some(s)
                 }
                 Err(e) => {
-                    eprintln!("dlss: disabled — {e}");
+                    eprintln!("dlss: level unavailable ({e}) — falling through the chain");
                     None
                 }
             }
@@ -216,20 +222,16 @@ impl GpuContext {
 
         let factory =
             adapter::create_factory(opts.debug).map_err(|e| format!("CreateDXGIFactory2: {e}"))?;
-        let prefer = opts.prefer.unwrap_or(if opts.fsr {
-            adapter::Prefer::Amd
-        } else {
-            adapter::Prefer::Nvidia
-        });
+        let prefer = opts.prefer.unwrap_or(adapter::Prefer::Nvidia);
         let pick = adapter::pick(&factory, prefer)?;
         eprintln!("gpu: using adapter \"{}\"", pick.name);
         if sl.is_some() && !pick.is_nvidia {
-            eprintln!("dlss: disabled — no NVIDIA adapter");
+            eprintln!("dlss: level unavailable (no NVIDIA adapter) — falling through the chain");
             sl = None;
         }
         if let Some(s) = &sl {
             if let Err(e) = s.is_feature_supported(streamline_sys::FEATURE_DLSS_RR, pick.luid) {
-                eprintln!("dlss: Ray Reconstruction not supported on this adapter — {e}");
+                eprintln!("dlss: level unavailable (Ray Reconstruction unsupported: {e}) — falling through the chain");
                 sl = None;
             }
         }
@@ -297,64 +299,63 @@ impl GpuContext {
             tonemap::SRV_SLOT_HDR,
         );
 
-        // XeSS-SR lives on the native pipeline only — its context is created
-        // on the real device, and it never coexists with the SL proxies
-        // (main.rs forces dlss off for --xess sessions). Input planes are
-        // allocated once at the range MAX; every frame uploads and names its
-        // own sub-rect (dynamic resolution).
-        let xess_state = if opts.xess && sl.is_none() {
-            match Self::init_xess(&opts.xess_dir, &d3d.device, w, h, opts.xess_autoexposure) {
-                Ok(s) => {
-                    passes.create_srv(
-                        &d3d.device,
-                        &s.res.output,
-                        windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
-                        tonemap::SRV_SLOT_XESS,
-                    );
-                    Some(s)
-                }
-                Err(e) => {
-                    eprintln!("xess: disabled — {e}");
-                    None
-                }
-            }
-        } else {
-            if opts.xess {
-                eprintln!("xess: disabled — cannot coexist with Streamline (use --xess, which implies --no-dlss)");
-            }
-            None
-        };
-
-        // FSR — native pipeline like XeSS; the ffx contexts are created on
-        // the real device and dispatches record into our command list (no
-        // interposer/proxies anywhere). The version enumeration is the
-        // support probe: Ray Regeneration reports no provider off RDNA4,
-        // which degrades to the FSR 3.1 upscale-only flavor (the same
-        // ffx-api effect, provider chosen via ffxOverrideVersion); no
-        // usable upscaler provider at all degrades to the plain path with
-        // a log line, the same shape as DLSS on a non-NVIDIA adapter.
-        let fsr_state = if opts.fsr && sl.is_none() {
-            match Self::init_fsr(&opts.ffx_dir, &d3d.device, w, h, opts.debug, opts.fsr3) {
-                Ok(s) => {
-                    passes.create_srv(
-                        &d3d.device,
-                        s.res.upscaled(),
-                        windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
-                        tonemap::SRV_SLOT_FSR,
-                    );
-                    Some(s)
-                }
-                Err(e) => {
-                    eprintln!("fsr: disabled — {e}");
-                    None
+        // Native chain levels (2-4), probed only when DLSS didn't win —
+        // XeSS and the ffx contexts are created on the real device and
+        // never coexist with the SL proxies. First hit wins; every failure
+        // is one loud fall-through line. FSR4-RR and FSR3 are the SAME
+        // ffx-api effect probed as two chain levels: level 2 requires the
+        // Ray Regeneration provider (RDNA4), level 4 is the cross-vendor
+        // FSR 3.1 upscale-only flavor (provider via ffxOverrideVersion).
+        let mut xess_state: Option<XessState> = None;
+        let mut fsr_state: Option<FsrState> = None;
+        if sl.is_none() {
+            let wire_fsr = |s: FsrState| {
+                passes.create_srv(
+                    &d3d.device,
+                    s.res.upscaled(),
+                    windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+                    tonemap::SRV_SLOT_FSR,
+                );
+                s
+            };
+            if opts.chain.fsr4 {
+                match Self::init_fsr(&opts.ffx_dir, &d3d.device, w, h, opts.debug, crate::fsr::Flavor::Fsr4Rr) {
+                    Ok(s) => fsr_state = Some(wire_fsr(s)),
+                    Err(e) => eprintln!("fsr4: level unavailable ({e}) — falling through the chain"),
                 }
             }
-        } else {
-            if opts.fsr {
-                eprintln!("fsr: disabled — cannot coexist with Streamline (use --fsr, which implies --no-dlss)");
+            if fsr_state.is_none() && opts.chain.xess {
+                // Input planes are allocated once at the range MAX; every
+                // frame uploads and names its own sub-rect (dynamic res).
+                match Self::init_xess(&opts.xess_dir, &d3d.device, w, h, opts.xess_autoexposure) {
+                    Ok(s) => {
+                        passes.create_srv(
+                            &d3d.device,
+                            &s.res.output,
+                            windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+                            tonemap::SRV_SLOT_XESS,
+                        );
+                        xess_state = Some(s);
+                    }
+                    Err(e) => eprintln!("xess: level unavailable ({e}) — falling through the chain"),
+                }
             }
-            None
-        };
+            if fsr_state.is_none() && xess_state.is_none() && opts.chain.fsr3 {
+                match Self::init_fsr(&opts.ffx_dir, &d3d.device, w, h, opts.debug, crate::fsr::Flavor::Fsr3) {
+                    Ok(s) => fsr_state = Some(wire_fsr(s)),
+                    Err(e) => eprintln!("fsr3: level unavailable ({e})"),
+                }
+            }
+            if fsr_state.is_none()
+                && xess_state.is_none()
+                && opts.chain != crate::upchain::UpChain::NONE
+            {
+                eprintln!(
+                    "upscale: NO temporal upscaler available — chain exhausted \
+                     (dlss -> fsr4 -> xess -> fsr3); PLAIN presentation"
+                );
+            }
+        }
 
         Ok(Self {
             sl,
@@ -479,6 +480,10 @@ impl GpuContext {
     /// render res), which is also why the upscaler planes are recreated
     /// FIRST — wire_session_feed needs them live.
     pub fn resize_output(&mut self, w: u32, h: u32, opts: &GpuOptions) -> Result<()> {
+        // Rebuild WHAT WAS WIRED, never re-probe the chain — a resize must
+        // not switch upscalers mid-session (captured before the teardown
+        // below clears the state it derives from).
+        let wired = self.wired();
         // Everything below drops live GPU resources; drain first (the
         // GpuContext::drop discipline — xess/ffx destroy-context require
         // completed command lists, ResizeBuffers requires zero outstanding
@@ -517,54 +522,65 @@ impl GpuContext {
             );
             self.rr = Some(r);
         }
-        if opts.xess && self.sl.is_none() {
-            match Self::init_xess(&opts.xess_dir, &self.d3d.device, w, h, opts.xess_autoexposure) {
-                Ok(s) => {
-                    self.passes.create_srv(
-                        &self.d3d.device,
-                        &s.res.output,
-                        windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
-                        tonemap::SRV_SLOT_XESS,
-                    );
-                    self.xess = Some(s);
+        match wired {
+            WiredUpscaler::Xess => {
+                match Self::init_xess(&opts.xess_dir, &self.d3d.device, w, h, opts.xess_autoexposure) {
+                    Ok(s) => {
+                        self.passes.create_srv(
+                            &self.d3d.device,
+                            &s.res.output,
+                            windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+                            tonemap::SRV_SLOT_XESS,
+                        );
+                        self.xess = Some(s);
+                    }
+                    Err(e) => eprintln!("xess: disabled after resize — {e}"),
                 }
-                Err(e) => eprintln!("xess: disabled after resize — {e}"),
             }
-        }
-        if opts.fsr && self.sl.is_none() {
-            match Self::init_fsr(&opts.ffx_dir, &self.d3d.device, w, h, opts.debug, opts.fsr3) {
-                Ok(s) => {
-                    self.passes.create_srv(
-                        &self.d3d.device,
-                        s.res.upscaled(),
-                        windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
-                        tonemap::SRV_SLOT_FSR,
-                    );
-                    self.fsr = Some(s);
+            WiredUpscaler::Fsr4 | WiredUpscaler::Fsr3 => {
+                let flavor = if wired == WiredUpscaler::Fsr4 {
+                    crate::fsr::Flavor::Fsr4Rr
+                } else {
+                    crate::fsr::Flavor::Fsr3
+                };
+                match Self::init_fsr(&opts.ffx_dir, &self.d3d.device, w, h, opts.debug, flavor) {
+                    Ok(s) => {
+                        self.passes.create_srv(
+                            &self.d3d.device,
+                            s.res.upscaled(),
+                            windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+                            tonemap::SRV_SLOT_FSR,
+                        );
+                        self.fsr = Some(s);
+                    }
+                    Err(e) => eprintln!("fsr: disabled after resize — {e}"),
                 }
-                Err(e) => eprintln!("fsr: disabled after resize — {e}"),
             }
+            // Rr rebuilds through the sl block above; Plain has nothing.
+            WiredUpscaler::Rr | WiredUpscaler::Plain => {}
         }
         Ok(())
     }
 
-    /// Bring up the ffx context(s) + the flavor's resources. Split out of
-    /// `new` so every failure funnels into one "fsr: disabled" fallback.
-    /// `force_fsr3` is the --fsr3 lever.
+    /// Bring up the ffx context(s) + the requested flavor's resources. Split
+    /// out of `new` so every failure funnels into one fall-through line.
+    /// `flavor` is the chain level being probed: `Fsr4Rr` requires the Ray
+    /// Regeneration provider (RDNA4) and errs without it; `Fsr3` never
+    /// consults the denoiser enumeration (--fsr3 and the chain's last level).
     fn init_fsr(
         ffx_dir: &str,
         device: &ID3D12Device,
         w: u32,
         h: u32,
         debug: bool,
-        force_fsr3: bool,
+        flavor: crate::fsr::Flavor,
     ) -> Result<FsrState> {
         let mut ctx = ffx::FfxContext::load(ffx_dir)?;
         // Ray Regeneration probe. A probe *error* degrades exactly like an
         // empty enumeration — on non-RDNA4 adapters the denoiser query may
         // fail outright rather than report zero providers, and either way
         // the answer is "no RR here", not "no FSR here".
-        let den = if force_fsr3 {
+        let den = if flavor == crate::fsr::Flavor::Fsr3 {
             Vec::new()
         } else {
             match ctx.versions(false, device) {
@@ -577,6 +593,11 @@ impl GpuContext {
         };
         for (id, name) in &den {
             eprintln!("fsr: denoiser provider {name} (id {id:#x})");
+        }
+        if flavor == crate::fsr::Flavor::Fsr4Rr && den.is_empty() {
+            return Err(
+                "no Ray Regeneration provider on this adapter (RDNA4 required)".into(),
+            );
         }
         let ups = match ctx.versions(true, device) {
             Ok(v) if !v.is_empty() => v,
@@ -604,24 +625,15 @@ impl GpuContext {
         for (id, name) in &ups {
             eprintln!("fsr: upscaler provider {name} (id {id:#x})");
         }
-        let Some((vid, flavor)) = crate::fsr::pick_version(&ups, !den.is_empty(), force_fsr3) else {
-            return Err(if force_fsr3 {
-                "--fsr3 forced but no FSR 3.x provider enumerated (see the provider list above)".into()
-            } else {
-                "no usable FSR provider enumerated (see the provider list above)".into()
-            });
+        let fsr3 = flavor == crate::fsr::Flavor::Fsr3;
+        let Some((vid, picked)) = crate::fsr::pick_version(&ups, !den.is_empty(), fsr3) else {
+            return Err("no FSR 3.x upscaler provider enumerated (see the provider list above)".into());
         };
-        match flavor {
-            crate::fsr::Flavor::Fsr4Rr => {}
-            crate::fsr::Flavor::Fsr3 if force_fsr3 => {
-                eprintln!("fsr: --fsr3 — forcing the FSR 3.1 provider (id {vid:#x})");
-            }
-            crate::fsr::Flavor::Fsr3 => {
-                eprintln!(
-                    "fsr: no Ray Regeneration provider on this adapter — FSR 3.1 upscale-only \
-                     (an RDNA4 GPU unlocks FSR4 + Ray Regeneration)"
-                );
-            }
+        // The pick can only disagree with the request through a logic bug —
+        // Fsr4Rr requires the RR enumeration (gated above) and fsr3 forces.
+        debug_assert_eq!(picked, flavor);
+        if fsr3 {
+            eprintln!("fsr: FSR 3.1 upscale-only provider (id {vid:#x})");
         }
         // Dynamic-resolution range: max = the window itself (the controller
         // creeps to native while still); every context takes maxRenderSize =
@@ -700,6 +712,47 @@ impl GpuContext {
                     (trace::FEED_DEPTH, pl[2].0, pl[2].1),
                 ],
             )
+        } else if let Some(fs) = &self.fsr {
+            if rw < fs.min.0 || rh < fs.min.1 || rw > fs.max.0 || rh > fs.max.1 {
+                return Err(format!(
+                    "trace res {}x{} outside FSR render range {}x{}..{}x{}",
+                    rw, rh, fs.min.0, fs.min.1, fs.max.0, fs.max.1
+                ));
+            }
+            match &fs.res {
+                FsrRes::Up(res) => {
+                    let pl = res.plane_resources();
+                    wire(
+                        trace::FeedKind::Fsr3,
+                        &[
+                            (trace::FEED_COLOR, pl[0].0, pl[0].1),
+                            (trace::FEED_MVEC, pl[1].0, pl[1].1),
+                            (trace::FEED_DEPTH, pl[2].0, pl[2].1),
+                        ],
+                    )
+                }
+                FsrRes::Rr(res) => {
+                    // cs_feed_fsr_rr's register/plane mapping (feed.hlsl —
+                    // keep in lockstep; plane_resources returns upload order:
+                    // depth_lin, depth_clip, mvec, normals, diff_alb,
+                    // spec_alb, dd_in, ds_in, residual).
+                    let pl = res.plane_resources();
+                    wire(
+                        trace::FeedKind::FsrRr,
+                        &[
+                            (trace::FEED_SPECHIT, pl[0].0, pl[0].1), // R32F linear depth
+                            (trace::FEED_DEPTH, pl[1].0, pl[1].1),   // R32F clip depth
+                            (trace::FEED_FSR_MVEC, pl[2].0, pl[2].1),
+                            (trace::FEED_NR, pl[3].0, pl[3].1), // RGB10A2 oct-normals
+                            (trace::FEED_ALB, pl[4].0, pl[4].1),
+                            (trace::FEED_SPEC, pl[5].0, pl[5].1),
+                            (trace::FEED_FSR_DD, pl[6].0, pl[6].1),
+                            (trace::FEED_FSR_DS, pl[7].0, pl[7].1),
+                            (trace::FEED_COLOR, pl[8].0, pl[8].1), // RGBA16F residual
+                        ],
+                    )
+                }
+            }
         } else {
             Err("gbuf session with no live upscaler".into())
         }
@@ -1019,6 +1072,58 @@ impl GpuContext {
         self.d3d.end_frame(slot)
     }
 
+    /// FSR 3.1 fed by the DXR pipeline: DispatchRays -> feed (pack -> the 3
+    /// upscaler input planes, on-GPU) -> one FSR 3.1 upscale dispatch ->
+    /// tonemap(SRV_SLOT_FSR) -> present. The XeSS-chain shape — FSR3's
+    /// input set IS the XeSS trio — with the ffx dispatch in the middle;
+    /// never an SL session (the chain wires FSR only on the native device).
+    pub fn present_dxr_fsr3(
+        &mut self,
+        p: &trace::FrameParams,
+        fc: &dlss::FrameConstants,
+        frame_ms: f32,
+    ) -> Result<()> {
+        crate::zone!("present-dxr-fsr3");
+        if self.dxr.is_none() || self.fsr.is_none() {
+            return Err("DXR pipeline + FSR not both initialized".into());
+        }
+        debug_assert!(self.sl.is_none());
+        let slot = self.d3d.begin_frame()?;
+        {
+            let d3d = &mut self.d3d;
+            let d = self.dxr.as_ref().unwrap();
+            // The session res is fixed at init; fc must agree (it names the
+            // upscale dispatch's renderSize sub-rect).
+            if (fc.rw as u32, fc.rh as u32) != (d.rw, d.rh) {
+                d3d.abort_frame();
+                return Err(format!(
+                    "frame constants {}x{} != DXR res {}x{}",
+                    fc.rw, fc.rh, d.rw, d.rh
+                ));
+            }
+            d.write_cb(slot, p);
+            if let Err(e) = d.record_frame(&d3d.list, slot) {
+                d3d.abort_frame();
+                return Err(e);
+            }
+            if let Err(e) = d.record_feed(&d3d.list, slot) {
+                d3d.abort_frame();
+                return Err(e);
+            }
+        }
+        {
+            let fs = self.fsr.as_ref().unwrap();
+            if let Err(e) = Self::record_fsr3_upscale(fs, &self.d3d, fc, frame_ms) {
+                self.d3d.abort_frame();
+                return Err(e);
+            }
+        }
+        // The tonemap pass re-binds root sig/PSO/heaps/viewport from scratch,
+        // restoring whatever list state the ffx dispatch left behind.
+        self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_FSR, 1.0);
+        self.d3d.end_frame(slot)
+    }
+
     /// Whether the GPU-resident NPPD stage came up (`--gpu --nppd`; the J
     /// toggle is only honored when this is true — wiring is init-time).
     pub fn nppd_gpu_ready(&self) -> bool {
@@ -1166,6 +1271,53 @@ impl GpuContext {
         self.d3d.end_frame(slot)
     }
 
+    /// FSR 3.1 fed by the GPU-resident tracer (`--gpu` with FSR3 wired):
+    /// trace (wavefront or reference) -> feed (pack -> the 3 input planes,
+    /// on-GPU) -> one FSR 3.1 upscale dispatch -> tonemap(SRV_SLOT_FSR) ->
+    /// present. present_trace_xess minus the NPPD composition (XeSS-only).
+    pub fn present_trace_fsr3(
+        &mut self,
+        p: &trace::FrameParams,
+        hybrid: bool,
+        fc: &dlss::FrameConstants,
+        frame_ms: f32,
+    ) -> Result<()> {
+        crate::zone!("present-trace-fsr3");
+        if self.trace.is_none() || self.fsr.is_none() {
+            return Err("GPU tracer + FSR not both initialized".into());
+        }
+        debug_assert!(self.sl.is_none());
+        let slot = self.d3d.begin_frame()?;
+        {
+            let d3d = &mut self.d3d;
+            let tg = self.trace.as_ref().unwrap();
+            if (fc.rw as u32, fc.rh as u32) != (tg.rw, tg.rh) {
+                d3d.abort_frame();
+                return Err(format!(
+                    "frame constants {}x{} != trace res {}x{}",
+                    fc.rw, fc.rh, tg.rw, tg.rh
+                ));
+            }
+            tg.write_cb(slot, p);
+            tg.record_frame(&d3d.list, slot, p, hybrid);
+            if let Err(e) = tg.record_feed(&d3d.list, slot, false) {
+                d3d.abort_frame();
+                return Err(e);
+            }
+        }
+        {
+            let fs = self.fsr.as_ref().unwrap();
+            if let Err(e) = Self::record_fsr3_upscale(fs, &self.d3d, fc, frame_ms) {
+                self.d3d.abort_frame();
+                return Err(e);
+            }
+        }
+        // The tonemap pass re-binds root sig/PSO/heaps/viewport from scratch,
+        // restoring whatever list state the ffx dispatch left behind.
+        self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_FSR, 1.0);
+        self.d3d.end_frame(slot)
+    }
+
     /// Screenshot path for GPU-trace mode (the image exists only on the GPU).
     /// Returns (pixels, w, h) — the tracer's hdr is render-res in upscaler
     /// sessions.
@@ -1275,6 +1427,24 @@ impl GpuContext {
         self.sl.is_some() && self.rr.is_some()
     }
 
+    /// Which chain level this session wired — derived from the live state
+    /// (at most one upscaler exists per session by the probe's construction),
+    /// so it can never disagree with the contexts actually held.
+    pub fn wired(&self) -> WiredUpscaler {
+        if self.dlss_ready() {
+            WiredUpscaler::Rr
+        } else if let Some(f) = &self.fsr {
+            match f.res.flavor() {
+                crate::fsr::Flavor::Fsr4Rr => WiredUpscaler::Fsr4,
+                crate::fsr::Flavor::Fsr3 => WiredUpscaler::Fsr3,
+            }
+        } else if self.xess.is_some() {
+            WiredUpscaler::Xess
+        } else {
+            WiredUpscaler::Plain
+        }
+    }
+
     /// The optimal render resolution for DLSS mode (SL's Quality-mode
     /// optimal size; == window size when the query fell back to DLAA) —
     /// the fixed fallback when the DRS range is degenerate.
@@ -1363,13 +1533,50 @@ impl GpuContext {
             return Err(e);
         }
 
+        if let Err(e) = Self::record_fsr_rr_sequence(fs, &self.d3d, fc, prev_pos, frame_idx, frame_ms) {
+            self.d3d.abort_frame();
+            return Err(e);
+        }
+
+        // The tonemap pass re-binds root sig/PSO/heaps/viewport from scratch,
+        // restoring whatever list state the ffx dispatches left behind.
+        self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_FSR, 1.0);
+        self.d3d.end_frame(slot)
+    }
+
+    /// The Ray Regeneration + FSR4 middle shared by the CPU-fed
+    /// (`present_fsr`) and GPU-fed (`present_trace_fsr_rr`/
+    /// `present_dxr_fsr_rr`) chains: denoise (one chained ffxDispatch) ->
+    /// remodulation composite -> FSR4 upscale, with all barriers. Inputs are
+    /// whatever filled the nine planes (CPU sub-rect upload or the
+    /// cs_feed_fsr_rr kernel — both leave them resting in
+    /// NON_PIXEL_SHADER_RESOURCE). The caller owns the open frame (and
+    /// aborts it on Err).
+    fn record_fsr_rr_sequence(
+        fs: &FsrState,
+        d3d: &D3d,
+        fc: &dlss::FrameConstants,
+        prev_pos: Option<glam::Vec3A>,
+        frame_idx: u32,
+        frame_ms: f32,
+    ) -> Result<()> {
+        let FsrRes::Rr(res) = &fs.res else {
+            return Err("FSR4-RR sequence on an FSR 3.1 session".into());
+        };
+        let (rw, rh) = (fc.rw as u32, fc.rh as u32);
+        if rw < fs.min.0 || rh < fs.min.1 || rw > fs.max.0 || rh > fs.max.1 {
+            return Err(format!(
+                "FSR frame {}x{} outside render range {}x{}..{}x{}",
+                rw, rh, fs.min.0, fs.min.1, fs.max.0, fs.max.1
+            ));
+        }
         // Ray Regeneration: signals in UAV state, one ffxDispatch with the
         // common desc + both signal descs chained (built in the shim).
-        res.barrier_denoise_begin(&self.d3d.list);
+        res.barrier_denoise_begin(&d3d.list);
         let (depth_lin, mvec, normals, spec_alb, diff_alb, dd_in, dd_out, ds_in, ds_out) =
             res.denoise_res();
         let dd_desc = ffx::FfxShimDenoiseDesc {
-            cmdlist: self.d3d.list.as_raw(),
+            cmdlist: d3d.list.as_raw(),
             linear_depth: depth_lin,
             motion_vectors: mvec,
             normals,
@@ -1380,7 +1587,8 @@ impl GpuContext {
             ds_in,
             ds_out,
             // Our MV plane is already PreviousUV - CurrentUV with the depth
-            // delta in B (converted at upload) — the header's unit scale.
+            // delta in B (converted at the fill site) — the header's unit
+            // scale.
             mv_scale: [1.0, 1.0, 1.0],
             // fc.jitter is the renderer's sample offset in pixels; the ffx
             // polarity knob is fsr::JITTER_SIGN, nowhere else.
@@ -1395,8 +1603,8 @@ impl GpuContext {
             // deliberate contrast with SL's row_major() transpose.
             view: fc.world_to_view.to_cols_array(),
             projection: fc.view_to_clip.to_cols_array(),
-            depth_bounds_min: near,
-            depth_bounds_max: far,
+            depth_bounds_min: fc.near,
+            depth_bounds_max: fc.far,
             render_w: rw,
             render_h: rh,
             frame_index: frame_idx,
@@ -1404,23 +1612,20 @@ impl GpuContext {
             non_gamma_albedo: 0, // albedos are sqrt-encoded (fsr.rs wire)
         };
         {
-            let _ev = pix::scope(&self.d3d.list, c"fsr-denoise");
-            if let Err(e) = fs.ctx.denoise(&dd_desc) {
-                self.d3d.abort_frame();
-                return Err(e);
-            }
+            let _ev = pix::scope(&d3d.list, c"fsr-denoise");
+            fs.ctx.denoise(&dd_desc)?;
         }
-        res.barrier_denoise_end(&self.d3d.list);
+        res.barrier_denoise_end(&d3d.list);
 
         // Remodulate (binds from scratch — the post-ffx state restore).
-        res.record_composite(&self.d3d.list, rw, rh);
+        res.record_composite(&d3d.list, rw, rh);
 
         // FSR4 upscale: composite -> window-res output. The shared MV plane
         // holds UV-deltas here, so the scale multiplies the render dims back
         // in to hand FSR pixel-space MVs (polarity knob: fsr::UPSCALE_MV_SIGN).
-        res.barrier_upscale_begin(&self.d3d.list);
+        res.barrier_upscale_begin(&d3d.list);
         let up_desc = Self::fsr_upscale_desc(
-            self.d3d.list.as_raw(),
+            d3d.list.as_raw(),
             res.upscale_res(),
             fc,
             fs.max,
@@ -1431,16 +1636,106 @@ impl GpuContext {
             ],
         );
         {
-            let _ev = pix::scope(&self.d3d.list, c"fsr-upscale");
-            if let Err(e) = fs.ctx.upscale(&up_desc) {
+            let _ev = pix::scope(&d3d.list, c"fsr-upscale");
+            fs.ctx.upscale(&up_desc)?;
+        }
+        res.barrier_upscale_end(&d3d.list);
+        Ok(())
+    }
+
+    /// Ray Regeneration + FSR4 fed by the GPU-resident tracer: trace -> feed
+    /// (pack + sig -> the nine FSR planes, on-GPU) -> denoise -> composite ->
+    /// upscale -> tonemap(SRV_SLOT_FSR) -> present. Never an SL session.
+    pub fn present_trace_fsr_rr(
+        &mut self,
+        p: &trace::FrameParams,
+        hybrid: bool,
+        fc: &dlss::FrameConstants,
+        prev_pos: Option<glam::Vec3A>,
+        frame_idx: u32,
+        frame_ms: f32,
+    ) -> Result<()> {
+        crate::zone!("present-trace-fsr-rr");
+        if self.trace.is_none() || self.fsr.is_none() {
+            return Err("GPU tracer + FSR not both initialized".into());
+        }
+        debug_assert!(self.sl.is_none());
+        let slot = self.d3d.begin_frame()?;
+        {
+            let d3d = &mut self.d3d;
+            let tg = self.trace.as_ref().unwrap();
+            if (fc.rw as u32, fc.rh as u32) != (tg.rw, tg.rh) {
+                d3d.abort_frame();
+                return Err(format!(
+                    "frame constants {}x{} != trace res {}x{}",
+                    fc.rw, fc.rh, tg.rw, tg.rh
+                ));
+            }
+            tg.write_cb(slot, p);
+            tg.record_frame(&d3d.list, slot, p, hybrid);
+            if let Err(e) = tg.record_feed(&d3d.list, slot, false) {
+                d3d.abort_frame();
+                return Err(e);
+            }
+        }
+        {
+            let fs = self.fsr.as_ref().unwrap();
+            if let Err(e) =
+                Self::record_fsr_rr_sequence(fs, &self.d3d, fc, prev_pos, frame_idx, frame_ms)
+            {
                 self.d3d.abort_frame();
                 return Err(e);
             }
         }
-        res.barrier_upscale_end(&self.d3d.list);
+        self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_FSR, 1.0);
+        self.d3d.end_frame(slot)
+    }
 
-        // The tonemap pass re-binds root sig/PSO/heaps/viewport from scratch,
-        // restoring whatever list state the ffx dispatches left behind.
+    /// Ray Regeneration + FSR4 fed by the DXR pipeline — the
+    /// `present_dxr_fsr3` shape with the full denoise sequence in the middle.
+    pub fn present_dxr_fsr_rr(
+        &mut self,
+        p: &trace::FrameParams,
+        fc: &dlss::FrameConstants,
+        prev_pos: Option<glam::Vec3A>,
+        frame_idx: u32,
+        frame_ms: f32,
+    ) -> Result<()> {
+        crate::zone!("present-dxr-fsr-rr");
+        if self.dxr.is_none() || self.fsr.is_none() {
+            return Err("DXR pipeline + FSR not both initialized".into());
+        }
+        debug_assert!(self.sl.is_none());
+        let slot = self.d3d.begin_frame()?;
+        {
+            let d3d = &mut self.d3d;
+            let d = self.dxr.as_ref().unwrap();
+            if (fc.rw as u32, fc.rh as u32) != (d.rw, d.rh) {
+                d3d.abort_frame();
+                return Err(format!(
+                    "frame constants {}x{} != DXR res {}x{}",
+                    fc.rw, fc.rh, d.rw, d.rh
+                ));
+            }
+            d.write_cb(slot, p);
+            if let Err(e) = d.record_frame(&d3d.list, slot) {
+                d3d.abort_frame();
+                return Err(e);
+            }
+            if let Err(e) = d.record_feed(&d3d.list, slot) {
+                d3d.abort_frame();
+                return Err(e);
+            }
+        }
+        {
+            let fs = self.fsr.as_ref().unwrap();
+            if let Err(e) =
+                Self::record_fsr_rr_sequence(fs, &self.d3d, fc, prev_pos, frame_idx, frame_ms)
+            {
+                self.d3d.abort_frame();
+                return Err(e);
+            }
+        }
         self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_FSR, 1.0);
         self.d3d.end_frame(slot)
     }
@@ -1534,11 +1829,42 @@ impl GpuContext {
             return Err(e);
         }
 
-        // FSR 3.1 upscale: the plane already holds pixel-space MVs, so the
-        // scale is the bare polarity signs.
-        res.barrier_upscale_begin(&self.d3d.list);
+        if let Err(e) = Self::record_fsr3_upscale(fs, &self.d3d, fc, frame_ms) {
+            self.d3d.abort_frame();
+            return Err(e);
+        }
+
+        // The tonemap pass re-binds root sig/PSO/heaps/viewport from scratch,
+        // restoring whatever list state the ffx dispatch left behind.
+        self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_FSR, 1.0);
+        self.d3d.end_frame(slot)
+    }
+
+    /// The FSR 3.1 upscale middle shared by the CPU-fed (`present_fsr3`) and
+    /// GPU-fed (`present_trace_fsr3`/`present_dxr_fsr3`) chains: barriers +
+    /// one upscale dispatch of the render-res sub-rect to the window-res
+    /// output. The plane already holds pixel-space MVs, so the scale is the
+    /// bare polarity signs. The caller owns the open frame (and aborts it on
+    /// Err).
+    fn record_fsr3_upscale(
+        fs: &FsrState,
+        d3d: &D3d,
+        fc: &dlss::FrameConstants,
+        frame_ms: f32,
+    ) -> Result<()> {
+        let FsrRes::Up(res) = &fs.res else {
+            return Err("FSR3 upscale on an FSR4+RR session".into());
+        };
+        let (rw, rh) = (fc.rw as u32, fc.rh as u32);
+        if rw < fs.min.0 || rh < fs.min.1 || rw > fs.max.0 || rh > fs.max.1 {
+            return Err(format!(
+                "FSR3 frame {}x{} outside render range {}x{}..{}x{}",
+                rw, rh, fs.min.0, fs.min.1, fs.max.0, fs.max.1
+            ));
+        }
+        res.barrier_upscale_begin(&d3d.list);
         let up_desc = Self::fsr_upscale_desc(
-            self.d3d.list.as_raw(),
+            d3d.list.as_raw(),
             res.upscale_res(),
             fc,
             fs.max,
@@ -1546,18 +1872,11 @@ impl GpuContext {
             [crate::fsr::UPSCALE_MV_SIGN.0, crate::fsr::UPSCALE_MV_SIGN.1],
         );
         {
-            let _ev = pix::scope(&self.d3d.list, c"fsr-upscale");
-            if let Err(e) = fs.ctx.upscale(&up_desc) {
-                self.d3d.abort_frame();
-                return Err(e);
-            }
+            let _ev = pix::scope(&d3d.list, c"fsr-upscale");
+            fs.ctx.upscale(&up_desc)?;
         }
-        res.barrier_upscale_end(&self.d3d.list);
-
-        // The tonemap pass re-binds root sig/PSO/heaps/viewport from scratch,
-        // restoring whatever list state the ffx dispatch left behind.
-        self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_FSR, 1.0);
-        self.d3d.end_frame(slot)
+        res.barrier_upscale_end(&d3d.list);
+        Ok(())
     }
 
     /// FSR twin of `read_rr_output`: the denoised+upscaled image exists only

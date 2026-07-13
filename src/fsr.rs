@@ -105,6 +105,23 @@ pub fn albedo_wire3(v: Vec3A) -> Vec3A {
     Vec3A::new(albedo_wire(v.x), albedo_wire(v.y), albedo_wire(v.z))
 }
 
+/// The GPU pack's wire chain for the sqrt-encoded RGBA8 albedo planes: ONE
+/// explicit 8-bit quantization of the raw f32. Unlike `albedo_wire` there is
+/// no leading f16 rounding — the GPU G-buffer pack stores f32, so the wire
+/// quantization happens exactly once, at the feed. The HLSL twin is
+/// trace_common.hlsli's `sqrt_wire`, used identically at the pack's sig
+/// demodulation, the feed's residual, and the composite decode; the GPU
+/// FSR-RR feed gates use this over the pack readback as their oracle.
+#[inline(always)]
+pub fn sqrt_wire(v: f32) -> f32 {
+    sqrt_decode8(sqrt_encode8(v))
+}
+
+#[inline(always)]
+pub fn sqrt_wire3(v: Vec3A) -> Vec3A {
+    Vec3A::new(sqrt_wire(v.x), sqrt_wire(v.y), sqrt_wire(v.z))
+}
+
 #[inline(always)]
 fn sign_nonzero(v: f32) -> f32 {
     if v >= 0.0 { 1.0 } else { -1.0 }

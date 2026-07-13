@@ -89,11 +89,12 @@ pub struct DxrGpu {
     uav_heap: ID3D12DescriptorHeap,
     /// GPU handle of the RP_SCENE_TEX table (heap slot TEX_HEAP_BASE).
     tex_table: D3D12_GPU_DESCRIPTOR_HANDLE,
-    /// Upscaler feed kernels (compiled only when `gbuf_full`; both kinds so
+    /// Upscaler feed kernels (compiled only when `gbuf_full`; every kind so
     /// --check-dxr can rewire between them like --check-gpu does) and the
     /// wired planes record_feed barriers over.
     pso_feed_xess: Option<ID3D12PipelineState>,
     pso_feed_rr: Option<ID3D12PipelineState>,
+    pso_feed_fsr_rr: Option<ID3D12PipelineState>,
     feed: Option<(trace::FeedKind, Vec<ID3D12Resource>)>,
     frame_cb: d3d12::UploadBuffer,
     cb_base: FrameCb,
@@ -139,7 +140,7 @@ impl DxrGpu {
         )?;
         // Upscaler sessions: the same feed kernels the wavefront runs, at
         // this pipeline's cs_6_3 cap floor (feed.hlsl needs nothing newer).
-        let (pso_feed_xess, pso_feed_rr) = if gbuf_full {
+        let (pso_feed_xess, pso_feed_rr, pso_feed_fsr_rr) = if gbuf_full {
             let feed_src = [trace::TRACE_COMMON_HLSLI, trace::FEED_HLSL].join("\n");
             let pso = |entry: &str, name: &str| -> Result<ID3D12PipelineState> {
                 trace::compute_pso(
@@ -152,9 +153,10 @@ impl DxrGpu {
             (
                 Some(pso("cs_feed_xess", "dxr feed_xess")?),
                 Some(pso("cs_feed_rr", "dxr feed_rr")?),
+                Some(pso("cs_feed_fsr_rr", "dxr feed_fsr_rr")?),
             )
         } else {
-            (None, None)
+            (None, None, None)
         };
 
         // --- RTPSO. Every pDesc payload (and every name string) lives in a
@@ -292,7 +294,12 @@ impl DxrGpu {
         let accum = committed_buffer(device, px * 12, uaf, ua)?;
         let tbuf = committed_buffer(device, px * 4, uaf, ua)?;
         let info = committed_buffer(device, px * 4, uaf, ua)?;
-        let gbuf = committed_buffer(device, if gbuf_full { px * 64 } else { 64 }, uaf, ua)?;
+        let gbuf = committed_buffer(
+            device,
+            if gbuf_full { px * trace::GBUF_STRIDE } else { trace::GBUF_STRIDE },
+            uaf,
+            ua,
+        )?;
         let hdr = d3d12::committed_tex(
             device,
             rw,
@@ -361,6 +368,7 @@ impl DxrGpu {
             tex_table,
             pso_feed_xess,
             pso_feed_rr,
+            pso_feed_fsr_rr,
             feed: None,
             frame_cb,
             cb_base: FrameCb::base(scene, rw, rh),
@@ -370,8 +378,9 @@ impl DxrGpu {
     }
 
     pub fn write_cb(&self, slot: usize, p: &FrameParams) {
+        let fsr_sig = matches!(&self.feed, Some((trace::FeedKind::FsrRr, _)));
         self.cb_base
-            .with_frame(p, self.gbuf_full)
+            .with_frame(p, self.gbuf_full, fsr_sig)
             .store(unsafe { self.frame_cb.ptr.add(slot * CB_STRIDE) });
     }
 
@@ -396,8 +405,10 @@ impl DxrGpu {
             return Err("feed targets not wired".into());
         };
         let pso = match kind {
-            trace::FeedKind::Xess => self.pso_feed_xess.as_ref(),
+            // Fsr3 IS the XeSS feed (same planes, formats, depth encode).
+            trace::FeedKind::Xess | trace::FeedKind::Fsr3 => self.pso_feed_xess.as_ref(),
             trace::FeedKind::Rr => self.pso_feed_rr.as_ref(),
+            trace::FeedKind::FsrRr => self.pso_feed_fsr_rr.as_ref(),
         }
         .ok_or("feed PSO missing (DxrGpu built without gbuf)")?;
         trace::record_feed_dispatch(list, &self.uav_heap, pso, None, planes, self.rw, self.rh, &|| unsafe {

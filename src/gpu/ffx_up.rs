@@ -63,12 +63,16 @@ impl Fsr3Resources {
         let mut offset = 0usize;
         let mut planes = Vec::with_capacity(N_PLANES);
         for (format, bpp) in specs {
+            // ALLOW_UNORDERED_ACCESS: the GPU-fed sessions' feed kernel
+            // writes these planes directly (typed UAV stores) — the xr.rs
+            // precedent. The CPU upload path is unaffected; the rest state
+            // stays NON_PIXEL_SHADER_RESOURCE either way.
             let tex = committed_tex(
                 device,
                 max_w,
                 max_h,
                 format,
-                D3D12_RESOURCE_FLAG_NONE,
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
             )?;
             planes.push(Plane { tex, format, bpp, offset });
@@ -225,6 +229,18 @@ impl Fsr3Resources {
 
     fn shim(res: &ID3D12Resource, state: u32) -> FfxShimRes {
         FfxShimRes { resource: res.as_raw(), state }
+    }
+
+    /// The input planes as GPU feed targets, in the XeSS wiring order
+    /// (color, mvec, depth) — the FSR3 feed IS the XeSS feed: same plane
+    /// set, same formats, same depth encode, so `FeedKind::Fsr3` runs
+    /// `cs_feed_xess` into these.
+    pub fn plane_resources(&self) -> [(&ID3D12Resource, DXGI_FORMAT); N_PLANES] {
+        [
+            (&self.planes[P_COLOR].tex, self.planes[P_COLOR].format),
+            (&self.planes[P_MVEC].tex, self.planes[P_MVEC].format),
+            (&self.planes[P_DEPTH].tex, self.planes[P_DEPTH].format),
+        ]
     }
 
     /// The upscale dispatch's resource references in (color, depth, mvec,
