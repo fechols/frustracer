@@ -7389,8 +7389,12 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     let mut gpu = gpu::GpuContext::new(sdl_hwnd(&window), W as u32, H as u32, &gopts)
         .expect("GPU init failed");
     // The 500 Hz integrator owns the camera pose for the whole app lifetime
-    // (spawned here, not per session, so it keeps integrating across resize
-    // rebuilds — re-entry continuity is automatic). Sessions only snapshot.
+    // (spawned here, not per session, so the pose survives resize rebuilds —
+    // re-entry continuity is automatic). Sessions only snapshot. It spawns
+    // PAUSED and each session resumes it once its frame loop is live: a long
+    // FRAME must integrate (the whole point), but a rebuild presents nothing,
+    // and flying through a seconds-long BLAS build with W held is flying
+    // blind.
     let fly =
         flycam::FlyCam::spawn(sdl_hwnd(&window).0 as isize, cam0, scene.diag);
 
@@ -7408,6 +7412,8 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
         {
             SessionEnd::Quit => break,
             SessionEnd::Resize(nw, nh) => {
+                // No frames from here until the next session's loop starts.
+                fly.pause();
                 if let Err(e) = gpu.resize_output(nw, nh, &gopts) {
                     eprintln!("resize: rebuild at {nw}x{nh} failed ({e}); exiting");
                     break;
@@ -8115,6 +8121,13 @@ fn session(
     // broken. A minimized window reports a 0 dimension and never commits.
     const RESIZE_SETTLE_MS: u128 = 250;
     let mut pending_resize: Option<Instant> = None;
+
+    // Init is done and frames start now, so the integrator may fly again (it
+    // spawned paused, and a resize re-entry paused it). Everything above this
+    // line — kernel compile, scene upload, BLAS build — presented nothing.
+    // No baseline re-sync is needed: a paused span integrates nothing, so the
+    // pose `prev_snap` captured at init is still the shared camera's pose.
+    fly.resume();
 
     let end = loop {
         let now = Instant::now();

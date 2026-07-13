@@ -31,11 +31,13 @@ use windows::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE, HWND, POINT
 use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
 use windows::Win32::System::Threading::{
-    CreateWaitableTimerExW, SetWaitableTimer, WaitForSingleObject,
-    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, INFINITE, TIMER_ALL_ACCESS,
+    CreateWaitableTimerExW, GetCurrentThread, SetThreadPriority, SetWaitableTimer,
+    WaitForSingleObject, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, INFINITE,
+    THREAD_PRIORITY_ABOVE_NORMAL, TIMER_ALL_ACCESS,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, MapVirtualKeyW, MAPVK_VSC_TO_VK_EX, VK_CONTROL, VK_LBUTTON, VK_SHIFT,
+    GetAsyncKeyState, MapVirtualKeyW, MAPVK_VSC_TO_VK_EX, VK_CONTROL, VK_LBUTTON, VK_RBUTTON,
+    VK_SHIFT,
 };
 use windows::Win32::UI::Input::XboxController::{
     XInputGetState, XINPUT_GAMEPAD_LEFT_SHOULDER, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE,
@@ -43,7 +45,8 @@ use windows::Win32::UI::Input::XboxController::{
     XINPUT_GAMEPAD_TRIGGER_THRESHOLD, XINPUT_STATE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, GetCursorPos, GetForegroundWindow, WindowFromPoint,
+    GetClientRect, GetCursorPos, GetForegroundWindow, GetSystemMetrics, WindowFromPoint,
+    SM_SWAPBUTTON,
 };
 
 /// Integrator tick period. 2 ms = 500 Hz. Total displacement is exact at any
@@ -67,14 +70,26 @@ pub struct FlyCam {
 struct Shared {
     cam: Mutex<Camera>,
     stop: AtomicBool,
+    /// Integration gate. A LONG FRAME must still integrate — that is the
+    /// whole feature. But a session rebuild (resize / F11 re-entry: kernel
+    /// compile + scene upload + BLAS build, seconds on a big scene) presents
+    /// no frames at all, so flying through it is flying blind, with nothing
+    /// on screen to correct against. `run_window` pauses across the rebuild
+    /// and `session` resumes once its frame loop is actually running; the
+    /// thread spawns paused so the first session's init is covered too.
+    paused: AtomicBool,
 }
 
 impl FlyCam {
-    /// Spawn the integrator for the session window. `hwnd` rides as isize
-    /// because windows::HWND is a raw pointer and not Send; the thread only
-    /// ever compares it / hands it to read-only queries.
+    /// Spawn the integrator for the session window, PAUSED (see `resume`).
+    /// `hwnd` rides as isize because windows::HWND is a raw pointer and not
+    /// Send; the thread only ever compares it / hands it to read-only queries.
     pub fn spawn(hwnd: isize, cam0: Camera, diag: f32) -> Self {
-        let shared = Arc::new(Shared { cam: Mutex::new(cam0), stop: AtomicBool::new(false) });
+        let shared = Arc::new(Shared {
+            cam: Mutex::new(cam0),
+            stop: AtomicBool::new(false),
+            paused: AtomicBool::new(true),
+        });
         let s2 = shared.clone();
         let handle = std::thread::Builder::new()
             .name("flycam".into())
@@ -87,6 +102,19 @@ impl FlyCam {
     /// use only the returned snapshot for the whole iteration.
     pub fn snapshot(&self) -> Camera {
         *self.shared.cam.lock().unwrap()
+    }
+
+    /// Stop/start integrating. Paused ticks keep advancing the integrator's
+    /// dt clock, so resuming costs one tick of motion — never the whole
+    /// paused span dumped into one step. Held keys during a pause are simply
+    /// not integrated (the camera stays bit-untouched, so a paused span never
+    /// invalidates replay either).
+    pub fn pause(&self) {
+        self.shared.paused.store(true, Relaxed);
+    }
+
+    pub fn resume(&self) {
+        self.shared.paused.store(false, Relaxed);
     }
 
     /// Write-through for teleports/resets. Nothing calls it today; it exists
@@ -277,8 +305,27 @@ fn drag_may_start(hwnd: HWND, pt: POINT) -> bool {
 }
 
 fn integrate_loop(shared: &Shared, hwnd: isize, diag: f32) {
+    // Above the rayon workers. The renderer saturates every core at normal
+    // priority for the whole trace, and this thread needs ~10 us every 2 ms.
+    // A starved tick never loses displacement (dt is measured, so the total
+    // is exact regardless) — it coarsens the SAMPLING at key/stick
+    // transitions, which is precisely what the 500 Hz rate buys. Best-effort:
+    // a failure here costs granularity, not correctness.
+    unsafe {
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    }
+
     let ticker = Ticker::new();
     let keys = Keys::new();
+    // Windows swaps the mouse buttons at the MESSAGE layer, but
+    // GetAsyncKeyState reports the PHYSICAL button — so for a swapped-button
+    // (left-handed) user the primary button is VK_RBUTTON. SDL's
+    // `mouse_state().left()` was the logical primary, so reading VK_LBUTTON
+    // unconditionally would have moved drag-look to their non-primary button.
+    // Resolved once, like the key layout.
+    let look_btn = unsafe {
+        if GetSystemMetrics(SM_SWAPBUTTON) != 0 { VK_RBUTTON.0 } else { VK_LBUTTON.0 }
+    };
     let hwnd = HWND(hwnd as *mut core::ffi::c_void);
     let mut last = Instant::now();
     let mut drag: Option<(i32, i32)> = None;
@@ -290,13 +337,17 @@ fn integrate_loop(shared: &Shared, hwnd: isize, diag: f32) {
             break;
         }
         let now = Instant::now();
-        // Same suspend/hitch clamp the old per-frame dt had.
+        // Same suspend/hitch clamp the old per-frame dt had. Note this runs
+        // BEFORE both gates below, so a paused/unfocused span advances the
+        // clock instead of accumulating into the first tick after it.
         let dt = (now - last).as_secs_f32().min(0.1);
         last = now;
 
         // Focus gate: GetAsyncKeyState/XInput are global — only act when our
         // window is foreground, and drop any latched drag on focus loss.
-        if unsafe { GetForegroundWindow() } != hwnd {
+        // Pause gate: no frames are being presented (session rebuild), so
+        // integrating would fly the camera blind. Both drop the drag.
+        if shared.paused.load(Relaxed) || unsafe { GetForegroundWindow() } != hwnd {
             drag = None;
             continue;
         }
@@ -309,7 +360,7 @@ fn integrate_loop(shared: &Shared, hwnd: isize, diag: f32) {
         // 0.004 rad/px feel is unchanged).
         let (mut dx, mut dy) = (0.0f32, 0.0f32);
         let mut pt = POINT::default();
-        if unsafe { GetCursorPos(&mut pt) }.is_err() || !down(VK_LBUTTON.0) {
+        if unsafe { GetCursorPos(&mut pt) }.is_err() || !down(look_btn) {
             drag = None;
         } else if let Some((px, py)) = drag {
             (dx, dy) = ((pt.x - px) as f32, (pt.y - py) as f32);
