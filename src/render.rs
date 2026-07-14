@@ -784,6 +784,8 @@ fn write_gbuf_hit(
             c,
             prim.direct_d,
             prim.direct_s,
+            prim.ao,
+            prim.ind_s,
             prim.albedo * (1.0 - prim.metallic),
             Vec3A::splat(0.04).lerp(prim.albedo, prim.metallic),
         );
@@ -818,11 +820,16 @@ fn write_gbuf_sky(ctx: &FrameCtx, x: usize, y: usize, fx: f32, fy: f32, dir: Vec
         },
     );
     if let Some(f) = ctx.fsr_buf {
-        // Sky: both signals zero, residual = the sky color itself (albedos
-        // don't matter — 0 * anything), prev_z = far so the depth delta is 0.
+        // Sky: every signal zero (AO included — nothing is shaded here, so
+        // the composite must add nothing; the denoiser's depth bounds pass
+        // sky texels through anyway), residual = the sky color itself
+        // (albedos don't matter — 0 * anything), prev_z = far so the depth
+        // delta is 0.
         let sig = crate::fsr::Signals {
             dd: Vec3A::ZERO,
             ds: Vec3A::ZERO,
+            ao: 0.0,
+            is: Vec3A::ZERO,
             residual: shade::sky(dir, ctx.sun),
         };
         f.write(x, y, &sig, far);

@@ -139,15 +139,18 @@ struct PrimSurf {
     float spec_t;
     float3 direct_d; // albedo-free direct diffuse (kd multiplies later)
     float3 direct_s; // direct specular incl. per-sample Fresnel
+    float ao;        // AO open fraction, the `ambient = AMBIENT * ao` factor
+    float3 ind_s;    // the reflection bounce's whole contribution to color
 };
 
 // dlss::GBufs re-hosted as one interleaved plane; the feed kernels fan it out
-// into the upscalers' input textures. 80 B/px (GBUF_STRIDE in trace.rs —
+// into the upscalers' input textures. 88 B/px (GBUF_STRIDE in trace.rs —
 // keep in lockstep).
 struct GBufPx {
     float4 nr;    // normal.xyz, roughness
     float4 alb_z; // diff_alb.xyz = albedo*(1-metallic), view_z = t*dot(dir, forward)
     float4 spec;  // spec_alb.xyz = lerp(0.04, albedo, metallic) (RGB F0), spec_hit_t
+                  // (also the INDIRECT_SPECULAR signal's ray-hit-distance channel)
     float4 mv;    // xy = motion vector in render-res pixels (y-down, current ->
                   // previous); z = prev-camera linear view-Z of the SAME hit
                   // point (FLAG_FSR_SIG — the denoiser MV's B channel differences
@@ -156,6 +159,8 @@ struct GBufPx {
     uint4 sig;    // f16x2 packs (dd.x|dd.y, dd.z|ds.x, ds.y|ds.z, 0) of the
                   // DEMODULATED FSR-RR signals — fsr::split_signals' twin,
                   // f16 IS the wire precision. FLAG_FSR_SIG; else 0.
+    uint2 sig2;   // the other two FSR-RR signals, same f16x2 packing:
+                  // (ao|is.x, is.y|is.z). FLAG_FSR_SIG; else 0.
 };
 RWStructuredBuffer<GBufPx> gbuf : register(u15);
 
@@ -238,17 +243,21 @@ void gbuf_write_hit(uint pi, float fx, float fy, float3 dir, float t, PrimSurf p
     float3 hit_rel = cam_origin.xyz + dir * t - prev_origin.xyz;
     g.mv = float4(gbuf_mv(hit_rel, fx, fy), 0.0, 0.0);
     g.sig = uint4(0u, 0u, 0u, 0u);
+    g.sig2 = uint2(0u, 0u);
     if (flags & FLAG_FSR_SIG) {
         // render.rs's fsr_buf fill: prev-camera linear view-Z of the SAME
         // hit point (no prev camera degrades to "no depth motion"); the
-        // demodulation divides direct_s by the un-floored WIRE F0 —
+        // demodulation divides direct_s / ind_s by the un-floored WIRE F0 —
         // fsr::split_signals with sqrt_wire in place of albedo_wire (the
         // pack stores f32; the wire quantization happens exactly once).
         g.mv.z = (flags & FLAG_HAS_PREV) ? dot(hit_rel, prev_forward.xyz) : g.alb_z.w;
         float3 sf0w = sqrt_wire3(spec_alb);
+        float3 f0_floor = max(sf0w, float3(1e-4, 1e-4, 1e-4));
         float3 dd = ps.direct_d;
-        float3 ds = ps.direct_s / max(sf0w, float3(1e-4, 1e-4, 1e-4));
+        float3 ds = ps.direct_s / f0_floor;
+        float3 is = ps.ind_s / f0_floor;
         g.sig = uint4(pack_h2(dd.x, dd.y), pack_h2(dd.z, ds.x), pack_h2(ds.y, ds.z), 0u);
+        g.sig2 = uint2(pack_h2(ps.ao, is.x), pack_h2(is.y, is.z));
     }
     gbuf[pi] = g;
 }
@@ -265,6 +274,7 @@ void gbuf_write_sky(uint pi, float fx, float fy, float3 dir) {
     g.spec = float4(0.0, 0.0, 0.0, 0.0);
     g.mv = float4(gbuf_mv(dir, fx, fy), 0.0, 0.0);
     g.sig = uint4(0u, 0u, 0u, 0u);
+    g.sig2 = uint2(0u, 0u);
     if (flags & FLAG_FSR_SIG) {
         g.mv.z = CAM_FAR;
     }

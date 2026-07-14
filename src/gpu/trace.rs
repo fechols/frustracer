@@ -44,11 +44,11 @@ pub const RP_TEX: u32 = RP_SRV0 + NUM_SRVS;
 // The G-buffer pack root UAV (register u15), appended AFTER the table so the
 // established param indices never renumber. 53/64 root-signature DWORDs.
 pub const RP_GBUF: u32 = RP_TEX + 1;
-/// Upscaler feed-target texture UAVs: registers u16..u25, riding the u14
-/// descriptor table as a second range at heap slots 1..10 (0 DWORDs extra).
+/// Upscaler feed-target texture UAVs: registers u16..u27, riding the u14
+/// descriptor table as a second range at heap slots 1..12 (0 DWORDs extra).
 /// The register/type layout is shared by every feed kernel (feed.hlsl); a
 /// register's VALUE/format may differ per kernel, the HLSL type never does.
-pub const NUM_FEED: u32 = 10;
+pub const NUM_FEED: u32 = 12;
 pub const FEED_COLOR: u32 = 16; // RGBA16F (RR/XeSS); RGBA16F residual (FSR-RR)
 pub const FEED_NR: u32 = 17; // RGBA16F normal+rough (RR); RGB10A2 oct-normals (FSR-RR)
 pub const FEED_DEPTH: u32 = 18; // R32F (all; encoding differs per kernel)
@@ -59,8 +59,10 @@ pub const FEED_SPECHIT: u32 = 22; // R16F spec hit distance (RR); R32F linear de
 pub const FEED_FSR_MVEC: u32 = 23; // RGBA16F FSR-RR mvec (UV-delta RG + depth-delta B)
 pub const FEED_FSR_DD: u32 = 24; // RGBA16F FSR-RR demodulated direct diffuse
 pub const FEED_FSR_DS: u32 = 25; // RGBA16F FSR-RR demodulated direct specular
+pub const FEED_FSR_AO: u32 = 26; // R16F FSR-RR ambient-occlusion open fraction
+pub const FEED_FSR_IS: u32 = 27; // RGBA16F FSR-RR indirect specular (A = hit t)
 // GPU-resident NPPD staging (the --gpu --nppd composition): four raw-buffer
-// root UAVs at u26..u29 (nppd.hlsl's literals — lockstep), appended after
+// root UAVs at u28..u31 (nppd.hlsl's literals — lockstep), appended after
 // RP_GBUF so nothing renumbers (61/64 root-signature DWORDs). Bound only
 // when the session built them.
 pub const RP_NPPD_FRAME: u32 = RP_GBUF + 1;
@@ -363,7 +365,7 @@ pub fn create_root_signature(device: &ID3D12Device) -> Result<ID3D12RootSignatur
         },
         ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
     });
-    // RP_NPPD_*: the NPPD staging buffers (u23..u26), appended after RP_GBUF
+    // RP_NPPD_*: the NPPD staging buffers (u28..u31), appended after RP_GBUF
     // for the same no-renumber reason; bound only in NPPD sessions (unbound
     // root UAVs are fine as long as no dispatched kernel touches them).
     for i in 0..4 {
@@ -1493,8 +1495,8 @@ pub const FLAG_HAS_PREV: u32 = 32;
 pub const FLAG_FSR_SIG: u32 = 64;
 
 /// GBufPx stride in bytes — lockstep with trace_common.hlsli's struct
-/// (nr | alb_z | spec | mv | sig = 4 float4 + 1 uint4).
-pub const GBUF_STRIDE: u64 = 80;
+/// (nr | alb_z | spec | mv | sig | sig2 = 4 float4 + 1 uint4 + 1 uint2).
+pub const GBUF_STRIDE: u64 = 88;
 
 /// Mirror of `cbuffer Frame` in trace_common.hlsli (304 bytes, 16-aligned
 /// rows — float3s ride in float4 slots with scalars packed in .w).

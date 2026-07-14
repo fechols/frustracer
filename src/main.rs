@@ -126,6 +126,18 @@ pub struct Opts {
     pub xess_path: String,
     /// Directory holding amd_fidelityfx_loader_dx12.dll + the provider DLLs.
     pub ffx_path: String,
+    /// `--fsr4`: the FSR4 + Ray Regeneration level is REQUIRED, not merely
+    /// force-started. `--fsr` falls through to XeSS/FSR3 when the Ray
+    /// Regeneration provider is absent (no RDNA4, wrong adapter); this makes
+    /// that a hard error instead — the one place in the codebase where an
+    /// unsupported feature is not a loud-line fallback, because the flag's
+    /// whole point is to be told.
+    pub fsr4_required: bool,
+    /// Ray Regeneration tuning overrides (`--fsr-max-radiance` &c). All-None
+    /// by default: a flagless session configures nothing and runs the
+    /// provider's own constants. A/B levers for dialing in cleanliness —
+    /// `max_radiance` is the firefly clamp.
+    pub fsr_tune: fsr::DenoiseTuning,
     /// Explicit GPU adapter vendor preference (--prefer-nvidia /
     /// --prefer-intel / --prefer-amd). None = the mode default (AMD for
     /// --fsr, NVIDIA otherwise). A preference, not a requirement: the
@@ -145,8 +157,17 @@ pub struct Opts {
     /// Lock the DLSS/XeSS render resolution to this fixed scale of the
     /// window (default quality 2/3; `--lock-res dynamic` -> None = the
     /// step-wise dynamic-resolution controller). CLI-only, no runtime
-    /// toggle — T prints the locked note.
+    /// toggle — T prints the locked note. This is the CPU RENDERER's scale;
+    /// the GPU tracers read `gpu_lock_scale`.
     pub lock_scale: Option<f32>,
+    /// The GPU render modes' (`--gpu`, `--dxr`) counterpart of `lock_scale`:
+    /// they trace at NATIVE (100%) by default while the CPU renderer defaults
+    /// to quality (2/3) — the CPU tracer needs the pixel discount, the GPU
+    /// ones don't. The two are one flag: an explicit `--lock-res` sets BOTH,
+    /// so a session that asks for a scale gets that scale in whichever arm it
+    /// renders (F toggles between them; the res discontinuity is already a
+    /// history-reset latch).
+    pub gpu_lock_scale: Option<f32>,
     /// Master A/B lever (--no-temporal): disable ALL previous-frame quadtree
     /// reuse — no temporal cache produced or consumed, no claim ring, no cut
     /// store, no structure replay. Every frame proves its empty space from
@@ -314,11 +335,14 @@ fn main() {
             )
             .to_string()
         }),
+        fsr4_required: false,
+        fsr_tune: fsr::DenoiseTuning::default(),
         prefer: None,
         oidn_post: false,
         xess_autoexposure: false,
         adaptive: true,
         lock_scale: xess::lock_scale("quality"),
+        gpu_lock_scale: xess::lock_scale("native"),
         temporal: true,
         replay: true,
         adopt: true,
@@ -448,6 +472,18 @@ fn main() {
                 opts.chain.force(upchain::UpLevel::Fsr4);
                 fsr_forced = true;
             }
+            // --fsr4 IS --fsr, minus the fall-through: the level becomes a
+            // REQUIREMENT. Everywhere else in this codebase an unsupported
+            // feature is a loud line + a working fallback; here the user
+            // asked to be told, so a failed FSR4 probe exits(2) with the two
+            // things worth trying (--fsr3, --prefer-amd). Enforced in
+            // run_window against the session's actual wiring, so it can never
+            // disagree with what got wired.
+            "--fsr4" => {
+                opts.chain.force(upchain::UpLevel::Fsr4);
+                fsr_forced = true;
+                opts.fsr4_required = true;
+            }
             "--fsr3" => {
                 opts.chain.force(upchain::UpLevel::Fsr3);
                 fsr_forced = true;
@@ -566,6 +602,8 @@ fn main() {
                 }
             }
             "--lock-res" => {
+                // One flag, both scales: an explicit request overrides the
+                // per-mode defaults (CPU quality, GPU native) in every arm.
                 opts.lock_scale = match args.next().as_deref() {
                     Some("dynamic") => None,
                     Some(s) => match xess::lock_scale(s) {
@@ -579,6 +617,33 @@ fn main() {
                         eprintln!("--lock-res needs quality|balanced|performance|ultra-performance|native|dynamic or a ratio in (0, 1]");
                         std::process::exit(2);
                     }
+                };
+                opts.gpu_lock_scale = opts.lock_scale;
+            }
+            // Ray Regeneration tuning overrides (FfxApiConfigureDenoiserKey).
+            // Absent = the provider's own default, so a flagless session is
+            // unchanged; each is an A/B lever on denoiser cleanliness.
+            "--fsr-max-radiance"
+            | "--fsr-stability-bias"
+            | "--fsr-radiance-clip-k"
+            | "--fsr-disocclusion-threshold"
+            | "--fsr-normal-strength"
+            | "--fsr-kernel-relaxation" => {
+                let v: f32 = args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(|| {
+                        eprintln!("{a} needs a float argument");
+                        std::process::exit(2);
+                    });
+                let t = &mut opts.fsr_tune;
+                match a.as_str() {
+                    "--fsr-max-radiance" => t.max_radiance = Some(v),
+                    "--fsr-stability-bias" => t.stability_bias = Some(v),
+                    "--fsr-radiance-clip-k" => t.radiance_clip_k = Some(v),
+                    "--fsr-disocclusion-threshold" => t.disocclusion_threshold = Some(v),
+                    "--fsr-normal-strength" => t.normal_strength = Some(v),
+                    _ => t.kernel_relaxation = Some(v),
                 }
             }
             "--oidn-no-clean-aux" => opts.oidn_clean_aux = false,
@@ -706,6 +771,8 @@ fn main() {
                 eprintln!("  --check-fsr   headless: FSR signal-split/encoding/MV contract self-test (no GPU or DLL)");
                 eprintln!("  --fsr         force-start the upscaler chain at FSR4 + Ray Regeneration (K toggles;");
                 eprintln!("                RDNA4 only — elsewhere the chain falls to XeSS then FSR 3.1)");
+                eprintln!("  --fsr4        --fsr, but REQUIRED: exit(2) instead of falling through when FSR4 +");
+                eprintln!("                Ray Regeneration is unavailable (suggests --fsr3 / --prefer-amd)");
                 eprintln!("  --fsr3        force-start the chain at the FSR 3.1 upscale-only level (A/B lever)");
                 eprintln!("  --ffx-path    FidelityFX DLL directory (default: the FidelityFX-Samples-prebuilt drop)");
                 eprintln!("  --gpu         GPU-resident tracing: quadtree + shading in D3D12 compute with DXR");
@@ -762,6 +829,15 @@ fn main() {
         opts.nppd = false;
         opts.oidn = false;
         opts.oidn_post = false;
+    }
+    // --fsr4 requires the level it forces, so a flag that removed it from the
+    // chain (--no-fsr / --no-upscale / a later --xess|--fsr3|--nppd force —
+    // --nppd force-starts at XeSS) leaves nothing to require. Say which shape
+    // of failure this is: the level was never probed, so "unavailable" would
+    // be a lie.
+    if opts.fsr4_required && !opts.chain.fsr4 {
+        eprintln!("--fsr4: the FSR4 level was knocked out of the upscaler chain by another flag (--no-fsr / --no-upscale / a later --xess, --fsr3 or --nppd) — nothing left to require");
+        std::process::exit(2);
     }
     // Adapter preference default: AMD when FSR was explicitly requested
     // (--fsr/--fsr3), NVIDIA otherwise. An explicit --prefer-* always wins;
@@ -955,7 +1031,7 @@ fn main() {
         std::process::exit(code);
     }
     if check_fsr {
-        let code = run_check_fsr(&scene, &bvh, cam0);
+        let code = run_check_fsr(&scene, &bvh, cam0, structural);
         std::process::exit(code);
     }
     if check_gpu {
@@ -1698,6 +1774,8 @@ fn run_check_dxr(
                         (gpu::trace::FEED_FSR_DD, fpl[6].0, fpl[6].1),
                         (gpu::trace::FEED_FSR_DS, fpl[7].0, fpl[7].1),
                         (gpu::trace::FEED_COLOR, fpl[8].0, fpl[8].1),
+                        (gpu::trace::FEED_FSR_AO, fpl[9].0, fpl[9].1),
+                        (gpu::trace::FEED_FSR_IS, fpl[10].0, fpl[10].1),
                     ],
                 ) {
                     eprintln!("check-dxr: FAIL FSR4-RR feed wiring: {e}");
@@ -1770,6 +1848,11 @@ fn run_check_dxr(
                 ) else {
                     return 1;
                 };
+                let (Some(f_ao), Some(f_is)) =
+                    (read_plane(9, 2, "ao"), read_plane(10, 8, "indirect_spec"))
+                else {
+                    return 1;
+                };
                 if !gate_fsr_rr_feed(
                     "check-dxr",
                     pw,
@@ -1783,10 +1866,31 @@ fn run_check_dxr(
                     &f_dd,
                     &f_ds,
                     &f_res,
+                    &f_ao,
+                    &f_is,
                     &pack2,
                     &accum2,
                     near,
                     far,
+                    must_fire,
+                ) {
+                    ok = false;
+                }
+                // The planes the GPU just wrote are the composite's inputs —
+                // gate the remodulation kernel on them while they are live.
+                if !gate_fsr_composite(
+                    "check-dxr",
+                    &mut hg,
+                    &fres,
+                    pw,
+                    ph,
+                    &f_alb,
+                    &f_spec,
+                    &f_dd,
+                    &f_ds,
+                    &f_ao,
+                    &f_is,
+                    &f_res,
                     must_fire,
                 ) {
                     ok = false;
@@ -1820,11 +1924,11 @@ fn run_check_dxr(
     }
 }
 
-/// Unpack a GPU `GBufPx` pack readback (GBUF_STRIDE = 80 B/px, 20 lanes:
-/// nr | alb+z | spec | mv | sig) into a CPU `dlss::GBufs` so the existing
-/// CPU gates (`dlss::mv_selftest`) consume it unmodified — the four sig
-/// lanes and mv.zw are FSR-RR extras the GBufs shape doesn't carry (their
-/// own gates read the raw bytes). Shared by --check-gpu (M7) and
+/// Unpack a GPU `GBufPx` pack readback (GBUF_STRIDE = 88 B/px, 22 lanes:
+/// nr | alb+z | spec | mv | sig | sig2) into a CPU `dlss::GBufs` so the
+/// existing CPU gates (`dlss::mv_selftest`) consume it unmodified — the six
+/// sig/sig2 lanes and mv.zw are FSR-RR extras the GBufs shape doesn't carry
+/// (their own gates read the raw bytes). Shared by --check-gpu (M7) and
 /// --check-dxr (T4).
 #[cfg(windows)]
 fn unpack_gbuf_bytes(bytes: &[u8], pw: usize, ph: usize) -> dlss::GBufs {
@@ -2077,9 +2181,11 @@ fn gate_rr_feed(
 }
 
 /// The FSR4-RR feed gates over a pack traced WITH the FsrRr wiring
-/// (FLAG_FSR_SIG armed): all nine planes vs CPU oracles computed from the
-/// raw 80-B pack readback + accum. dd/ds are gated BIT-EQUAL to the pack's
-/// sig f16 halves (pure widen), the linear-depth plane bit-equal to view-Z
+/// (FLAG_FSR_SIG armed): all eleven planes vs CPU oracles computed from the
+/// raw 88-B pack readback + accum. dd/ds/ao/indirect-spec are gated BIT-EQUAL
+/// to the pack's sig/sig2 f16 halves (pure widen — the indirect-specular
+/// plane's A channel likewise against the spec_hit_t lane), the linear-depth
+/// plane bit-equal to view-Z
 /// (DEPTH_SIGN = 1 passthrough), clip depth at the XeSS 4-ulp bound with
 /// sky bit-equal 0.0, the albedos at <= 1 LSB against the single explicit
 /// sqrt quantization (`fsr::sqrt_encode8` of the pack f32 — no f16 hop
@@ -2088,8 +2194,9 @@ fn gate_rr_feed(
 /// prev-Z == far bit-equal => mvec B exactly 0).
 ///
 /// The residual is the one plane whose tolerance is NOT an ulp count of its
-/// own value: it is a near-**cancellation** (`color − dd⊗kd − ds⊗f0` — the
-/// two products are the same magnitude as the color), so the f32 arithmetic
+/// own value: it is a near-**cancellation** (`color − dd⊗kd − ds⊗f0 −
+/// ao·AMBIENT⊗kd − is⊗f0` — the products are the same magnitude as the
+/// color), so the f32 arithmetic
 /// slop is bounded by the CANCELLED terms, not by the tiny result. Gating it
 /// at 1 f16 ulp of the remainder makes the limit shrink toward zero exactly
 /// where the error doesn't — a lit pixel whose residual lands near 0 then
@@ -2114,6 +2221,8 @@ fn gate_fsr_rr_feed(
     dd: &[u8],
     ds: &[u8],
     residual: &[u8],
+    ao: &[u8],
+    ind_s: &[u8],
     pack: &[u8],
     accum_bytes: &[u8],
     near: f32,
@@ -2132,7 +2241,10 @@ fn gate_fsr_rr_feed(
     let (mut dl_bad, mut dc_bad, mut dc_sky_bad, mut dc_sky_n) = (0usize, 0usize, 0usize, 0usize);
     let (mut mv_bad, mut nrm_bad, mut alb_bad, mut sig_bad) = (0usize, 0usize, 0usize, 0usize);
     let (mut res_bad, mut sky_sig_bad, mut sig_fired) = (0usize, 0usize, 0usize);
+    let (mut ao_fired, mut is_fired) = (0usize, 0usize);
+    let (mut dd_bad, mut ds_bad, mut is_bad, mut ao_bad, mut ish_bad) = (0, 0, 0, 0, 0usize);
     let mut max_dc_ulp = 0u32;
+    let mut max_ish_ulp = 0u32;
     // Worst margin among the channels that needed the cancellation escape
     // (negative = inside tolerance); -inf when none did.
     let mut worst_res = f32::NEG_INFINITY;
@@ -2184,21 +2296,62 @@ fn gate_fsr_rr_feed(
         {
             nrm_bad += 1;
         }
-        // Signals: the planes are pure widens of the pack's sig f16 halves.
+        // Signals: the planes are pure widens of the pack's sig/sig2 f16
+        // halves. sig = (dd.x|dd.y, dd.z|ds.x, ds.y|ds.z, 0); sig2 =
+        // (ao|is.x, is.y|is.z).
         let sig = [lane_u(i, 16), lane_u(i, 17), lane_u(i, 18)];
+        let sig2 = [lane_u(i, 20), lane_u(i, 21)];
         let dd16 = [sig[0] as u16, (sig[0] >> 16) as u16, sig[1] as u16];
         let ds16 = [(sig[1] >> 16) as u16, sig[2] as u16, (sig[2] >> 16) as u16];
+        let ao16 = sig2[0] as u16;
+        let is16 = [(sig2[0] >> 16) as u16, sig2[1] as u16, (sig2[1] >> 16) as u16];
         for ch in 0..3 {
-            if h16(dd, i * 8 + ch * 2) != dd16[ch] || h16(ds, i * 8 + ch * 2) != ds16[ch] {
-                sig_bad += 1;
+            if h16(dd, i * 8 + ch * 2) != dd16[ch] {
+                dd_bad += 1;
+            }
+            if h16(ds, i * 8 + ch * 2) != ds16[ch] {
+                ds_bad += 1;
+            }
+            if h16(ind_s, i * 8 + ch * 2) != is16[ch] {
+                is_bad += 1;
             }
         }
+        // AO: R16F, one half per pixel. The indirect-specular plane's A
+        // channel carries the reflection ray's hit distance — the pack's
+        // spec_hit_t lane, through the same f16 store.
+        if h16(ao, i * 2) != ao16 {
+            ao_bad += 1;
+        }
+        // The A channel is the reflection ray's hit distance — the same f32
+        // through the same typed f16 store gate_rr_feed's spec-hit plane
+        // takes, and at the same 1-ulp tolerance (a typed UAV store to a
+        // FLOAT16 format has rounding latitude the CPU's from_f32 does not).
+        {
+            let got = h16(ind_s, i * 8 + 6);
+            let want = half::f16::from_f32(lane_f(i, 11)).to_bits();
+            let d = (mono16(got) - mono16(want)).unsigned_abs();
+            max_ish_ulp = max_ish_ulp.max(d);
+            if d > 1 {
+                ish_bad += 1;
+            }
+        }
+        sig_bad = dd_bad + ds_bad + is_bad + ao_bad + ish_bad;
         if sky {
-            if sig != [0, 0, 0] || prev_z.to_bits() != far.to_bits() {
+            if sig != [0, 0, 0] || sig2 != [0, 0] || prev_z.to_bits() != far.to_bits() {
                 sky_sig_bad += 1;
             }
-        } else if sig != [0, 0, 0] {
-            sig_fired += 1;
+        } else {
+            if sig != [0, 0, 0] {
+                sig_fired += 1;
+            }
+            // AO fires when the ray was occluded (binary at the 1-sample
+            // preset), indirect specular when the reflection gate traced.
+            if half::f16::from_bits(ao16).to_f32() < 1.0 {
+                ao_fired += 1;
+            }
+            if is16 != [0, 0, 0] {
+                is_fired += 1;
+            }
         }
         // Albedos: ONE explicit sqrt quantization of the pack f32 — <= 1 LSB
         // vs the CPU encode (GPU sqrt has 1-ulp latitude, unlike Rust's
@@ -2231,10 +2384,21 @@ fn gate_fsr_rr_feed(
             half::f16::from_bits(ds16[1]).to_f32(),
             half::f16::from_bits(ds16[2]).to_f32(),
         );
+        let isf = Vec3A::new(
+            half::f16::from_bits(is16[0]).to_f32(),
+            half::f16::from_bits(is16[1]).to_f32(),
+            half::f16::from_bits(is16[2]).to_f32(),
+        );
+        let aof = half::f16::from_bits(ao16).to_f32();
         for ch in 0..3 {
             let color = accf(i * 3 + ch);
-            let (t_dd, t_ds) = (ddf[ch] * wire[0][ch], dsf[ch] * wire[1][ch]);
-            let e = color - t_dd - t_ds;
+            // Every remodulated term, in the kernel's order (feed.hlsl's
+            // cs_feed_fsr_rr — and fsr::split_signals' before it).
+            let t_dd = ddf[ch] * wire[0][ch];
+            let t_ds = dsf[ch] * wire[1][ch];
+            let t_ao = aof * shade::AMBIENT[ch] * wire[0][ch];
+            let t_is = isf[ch] * wire[1][ch];
+            let e = color - t_dd - t_ds - t_ao - t_is;
             let got16 = h16(residual, i * 8 + ch * 2);
             if (mono16(got16) - mono16(fsr::f16_sat(e).to_bits())).unsigned_abs() <= 1 {
                 continue; // the ordinary storage tolerance, like every other plane
@@ -2245,8 +2409,15 @@ fn gate_fsr_rr_feed(
             // nothing about), and its own f16 store rounds by half an ulp of
             // what it holds. Anything past that is a real defect — a wiring
             // or formula error moves the residual by the size of a whole term.
+            // Every subtracted term is a cancelled magnitude, so all four
+            // enter the bound.
             let got = half::f16::from_bits(got16).to_f32();
-            let cancelled = color.abs().max(t_dd.abs()).max(t_ds.abs());
+            let cancelled = color
+                .abs()
+                .max(t_dd.abs())
+                .max(t_ds.abs())
+                .max(t_ao.abs())
+                .max(t_is.abs());
             let tol = 8.0 * f32::EPSILON * cancelled + (got.abs() * 4.9e-4).max(3.0e-8);
             let err = (got - e).abs();
             worst_res = worst_res.max(err - tol);
@@ -2256,7 +2427,7 @@ fn gate_fsr_rr_feed(
         }
     }
     eprintln!(
-        "{tag}: fsr-rr feed ({pw}x{ph}): depth-lin-not-bit-equal {dl_bad} | clip-ulp>4 {dc_bad} (max {max_dc_ulp}) | sky-not-0.0 {dc_sky_bad} (sky px {dc_sky_n}) | mvec-ulp>1 {mv_bad} | normals-lsb>1 {nrm_bad} | alb-lsb>1 {alb_bad} | sig-not-bit-equal {sig_bad} | residual-over-tol {res_bad} (worst margin {worst_res:.2e}) | sky-sig-bad {sky_sig_bad} | sig-fired {sig_fired}"
+        "{tag}: fsr-rr feed ({pw}x{ph}): depth-lin-not-bit-equal {dl_bad} | clip-ulp>4 {dc_bad} (max {max_dc_ulp}) | sky-not-0.0 {dc_sky_bad} (sky px {dc_sky_n}) | mvec-ulp>1 {mv_bad} | normals-lsb>1 {nrm_bad} | alb-lsb>1 {alb_bad} | sig-not-bit-equal {sig_bad} (dd {dd_bad} ds {ds_bad} is {is_bad} ao {ao_bad} | is-hit-t-ulp>1 {ish_bad} max {max_ish_ulp}) | residual-over-tol {res_bad} (worst margin {worst_res:.2e}) | sky-sig-bad {sky_sig_bad} | fired: sig {sig_fired} ao {ao_fired} ind-spec {is_fired}"
     );
     if dl_bad != 0
         || dc_bad != 0
@@ -2271,8 +2442,121 @@ fn gate_fsr_rr_feed(
         eprintln!("{tag}: FAIL FSR4-RR feed gates");
         return false;
     }
-    if must_fire && (dc_sky_n == 0 || sig_fired == 0) {
-        eprintln!("{tag}: FAIL FSR4-RR feed gates vacuous (no sky / no armed sig on the default scene)");
+    if must_fire && (dc_sky_n == 0 || sig_fired == 0 || ao_fired == 0 || is_fired == 0) {
+        eprintln!(
+            "{tag}: FAIL FSR4-RR feed gates vacuous (no sky / no armed sig / no occluded AO / no reflection on the default scene)"
+        );
+        return false;
+    }
+    true
+}
+
+/// `gpu/shaders/fsr_composite.hlsl` — the THIRD site of the composite identity,
+/// and the only one whose arithmetic runs nowhere else. `fsr::composite` is
+/// gated by --check-fsr and `cs_feed_fsr_rr`'s residual by the feed gate above,
+/// but this kernel executes only inside a live FSR4-RR session, so for a long
+/// time nothing tested it — and it shipped with its root constants written to
+/// the wrong DWORDs (HLSL bumps a `float3` that would straddle a 16-byte
+/// boundary, so `ambient` sat at offset 16 while the CPU wrote it at 8; the
+/// pass read one channel of AMBIENT shifted and two undeclared DWORDs).
+///
+/// The trick that makes it gateable with no denoiser in the loop: copy each
+/// signal's INPUT plane into its denoised-output UAV, making the denoiser an
+/// IDENTITY. `record_composite` must then remodulate back to what it started
+/// from. The oracle is built from the PLANE BYTES the GPU stored (the feed
+/// gate's discipline — never from a recompute that could drift), so what is
+/// pinned here is exactly this kernel: its arithmetic, its albedo decode, its
+/// SRV table ORDER, and its root constants. A wrong AMBIENT moves a lit pixel
+/// by ~0.03 = tens of f16 ulps; the tolerance is 2.
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn gate_fsr_composite(
+    tag: &str,
+    hg: &mut gpu::trace::HeadlessGpu,
+    fres: &gpu::ffx_rr::FsrResources,
+    pw: usize,
+    ph: usize,
+    diff_alb: &[u8],
+    spec_alb: &[u8],
+    dd: &[u8],
+    ds: &[u8],
+    ao: &[u8],
+    ind_s: &[u8],
+    residual: &[u8],
+    must_fire: bool,
+) -> bool {
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT;
+    if hg
+        .run(|l| {
+            fres.record_signal_passthrough(l);
+            fres.record_composite(l, pw as u32, ph as u32);
+        })
+        .is_err()
+    {
+        eprintln!("{tag}: FAIL composite dispatch");
+        return false;
+    }
+    let comp = match read_feed_tex(hg, fres.composite_tex(), DXGI_FORMAT_R16G16B16A16_FLOAT, 8, pw, ph) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{tag}: FAIL composite readback: {e}");
+            return false;
+        }
+    };
+    let h16 = |b: &[u8], off: usize| u16::from_le_bytes([b[off], b[off + 1]]);
+    let f16v = |b: &[u8], off: usize| half::f16::from_bits(h16(b, off)).to_f32();
+    // fsr_composite.hlsl's decode_albedo: the UNORM8 read is byte/255, squared.
+    let dec = |b: &[u8], i: usize, c: usize| {
+        let s = b[i * 4 + c] as f32 / 255.0;
+        s * s
+    };
+    let (mut bad, mut max_ulp, mut ao_fired, mut is_fired) = (0usize, 0u32, 0usize, 0usize);
+    let mut worst = String::new();
+    for i in 0..pw * ph {
+        let aoc = f16v(ao, i * 2);
+        let mut any_is = false;
+        for ch in 0..3 {
+            let (kd, f0) = (dec(diff_alb, i, ch), dec(spec_alb, i, ch));
+            let ddc = f16v(dd, i * 8 + ch * 2);
+            let dsc = f16v(ds, i * 8 + ch * 2);
+            let isc = f16v(ind_s, i * 8 + ch * 2);
+            let resc = f16v(residual, i * 8 + ch * 2);
+            any_is |= isc != 0.0;
+            let want = ddc * kd + dsc * f0 + aoc * shade::AMBIENT[ch] * kd + isc * f0 + resc;
+            let got = h16(&comp, i * 8 + ch * 2);
+            let d = (mono16(got) - mono16(half::f16::from_f32(want).to_bits())).unsigned_abs();
+            max_ulp = max_ulp.max(d);
+            if d > 2 {
+                bad += 1;
+                if worst.is_empty() {
+                    worst = format!(
+                        " | first: px ({},{}) ch{ch} got {} want {want:.6} ({d} ulp)",
+                        i % pw,
+                        i / pw,
+                        half::f16::from_bits(got).to_f32()
+                    );
+                }
+            }
+        }
+        // The AO term is live wherever the surface has any diffuse albedo and
+        // the hemisphere is not fully closed — without such pixels a wrong
+        // AMBIENT would be invisible, which is the whole point of this gate.
+        if aoc > 0.0 && (0..3).any(|c| dec(diff_alb, i, c) > 0.0) {
+            ao_fired += 1;
+        }
+        if any_is {
+            is_fired += 1;
+        }
+    }
+    eprintln!(
+        "{tag}: fsr composite identity ({pw}x{ph}, denoiser=passthrough): over-tol {bad} (max {max_ulp} f16 ulp, limit 2) | terms live: ao {ao_fired} ind-spec {is_fired}{worst}"
+    );
+    if bad != 0 {
+        eprintln!("{tag}: FAIL fsr_composite.hlsl does not reproduce the traced color (remodulation, albedo decode, SRV order or root constants)");
+        return false;
+    }
+    if must_fire && (ao_fired == 0 || is_fired == 0) {
+        eprintln!("{tag}: FAIL fsr composite gate vacuous (no live AO term / no reflection term — a wrong AMBIENT would pass)");
         return false;
     }
     true
@@ -2457,9 +2741,20 @@ fn run_check_gpu(
     };
     cpu_frame(0);
     let px = gw * gh;
+    // Snapshot frame 0's CPU visibility: the 64-frame radiance A/B below re-runs
+    // cpu_frame and clobbers tbuf, and every gate downstream compares against
+    // FRAME 0 (jitter makes each frame's t different at silhouettes).
+    let cpu_t0: Vec<f32> = tbuf.iter().map(|a| f32::from_bits(a.load(Relaxed))).collect();
     let mut class_mismatch = 0usize;
     let mut t_viol = 0usize;
     let mut max_rel = 0.0f32;
+    // Pixels where möller-trumbore and the hardware's watertight test disagree
+    // (a ray grazing a shared triangle edge). Expected, statistically bounded,
+    // and NOT evidence about the quadtree — but the reference's t is not
+    // trustworthy ground truth at these pixels, so the wavefront/reference gate
+    // below excludes them by this mask rather than by re-deriving them.
+    let mut edge_mask = vec![false; px];
+    let mut edge_px: Vec<(usize, usize, f32, f32)> = Vec::new();
     for i in 0..px {
         let ct = f32::from_bits(tbuf[i].load(Relaxed));
         let gt = gpu_t[i];
@@ -2469,11 +2764,21 @@ fn run_check_gpu(
                 max_rel = max_rel.max(rel);
                 if rel > 1e-3 {
                     t_viol += 1;
+                    edge_mask[i] = true;
+                    if edge_px.len() < 8 {
+                        edge_px.push((i % gw, i / gw, ct, gt));
+                    }
                 }
             }
             (false, false) => {}
-            _ => class_mismatch += 1,
+            _ => {
+                class_mismatch += 1;
+                edge_mask[i] = true;
+            }
         }
+    }
+    for (x, y, ct, gt) in &edge_px {
+        eprintln!("check-gpu:   two-intersector edge px ({x},{y}): cpu t {ct:.6} | gpu-ref t {gt:.6}");
     }
     let mut ok = true;
     eprintln!(
@@ -2752,40 +3057,194 @@ fn run_check_gpu(
     let mut overshoot = 0usize;
     let mut hybrid_extra = 0usize;
     let mut max_rel_t = 0.0f32;
+    let mut culprits: Vec<String> = Vec::new();
+
+    // The inherited t_start per pixel, scattered from the leaf queue once (a
+    // per-pixel scan of the rects would be O(px * n_leaf)). NaN = not a leaf
+    // pixel (sky rects carry no claim).
+    let mut t_start_of = vec![f32::NAN; px];
+    for r in 0..n_leaf.min(leaf_recs.len() / 4) {
+        let (xy0, xy1) = (leaf_recs[r * 4], leaf_recs[r * 4 + 1]);
+        let (x0, y0) = ((xy0 & 0xffff) as usize, (xy0 >> 16) as usize);
+        let (x1, y1) = ((xy1 & 0xffff) as usize, (xy1 >> 16) as usize);
+        let ts = f32::from_bits(leaf_recs[r * 4 + 2]);
+        for y in y0..y1.min(gh) {
+            for x in x0..x1.min(gw) {
+                t_start_of[y * gw + x] = ts;
+            }
+        }
+    }
+
+    // THE soundness contract, asserted directly instead of by proxy: the region
+    // a tile proved empty — frustum ∩ ball(origin, t_start) — must not contain
+    // the true nearest hit. Ground truth is the EARLIEST t either intersector
+    // reports (möller-trumbore or the hardware), which is the most pessimistic
+    // bar available; a hit either one finds is a real triangle inside the tile
+    // frustum, so a sound t_start lower-bounds it. Exact-zero, and strictly
+    // stronger than the old `wave_t > ref_t` inference — that one is a
+    // CONSEQUENCE of an overshoot, and a consequence can have other causes
+    // (below), whereas this is the invariant itself.
+    let mut claim_viol = 0usize;
+    for i in 0..px {
+        let ts = t_start_of[i];
+        if !ts.is_finite() {
+            continue;
+        }
+        let truth = match (cpu_t0[i].is_finite(), ref_t[i].is_finite()) {
+            (true, true) => cpu_t0[i].min(ref_t[i]),
+            (true, false) => cpu_t0[i],
+            (false, true) => ref_t[i],
+            (false, false) => continue, // both say sky: no geometry to overshoot
+        };
+        if ts > truth * (1.0 + 1e-4) {
+            claim_viol += 1;
+            if culprits.len() < 8 {
+                let (x, y) = (i % gw, i / gw);
+                culprits.push(format!(
+                    "CLAIM VIOLATION px ({x},{y}): t_start {ts:.6} > nearest hit {truth:.6} (cpu {:.6} | gpu-ref {:.6})",
+                    cpu_t0[i], ref_t[i]
+                ));
+            }
+        }
+    }
+
+    // Wavefront vs reference. Both run the hardware intersector, so identical
+    // hits are expected — EXCEPT at the two-intersector edge pixels, where a
+    // ray grazes a shared triangle edge. There the hardware's accept/reject is
+    // sensitive to TMin (AMD re-origins the ray at TMin; measured on an R9700:
+    // the reference at TMin=0 takes the edge, the leaf ray at TMin=t_start does
+    // not, and the CPU agrees with the leaf ray). Those pixels are ALREADY
+    // known-disagreeing from the CPU comparison above, so the reference's t is
+    // not ground truth there and they carry no information about the quadtree —
+    // `claim_viol` above is what guards the contract at them.
+    let mut edge_skipped = 0usize;
     for i in 0..px {
         let (rt, wt) = (ref_t[i], wave_t[i]);
+        let (x, y) = (i % gw, i / gw);
+        // NaN-safe "these two disagree" (sky is non-finite on both sides).
+        let disagree = match (rt.is_finite(), wt.is_finite()) {
+            (true, true) => rt != wt,
+            (false, false) => false,
+            _ => true,
+        };
+        if edge_mask[i] && disagree {
+            edge_skipped += 1;
+            continue;
+        }
         match (rt.is_finite(), wt.is_finite()) {
             (true, true) => {
                 let rel = (wt - rt) / rt.max(1e-6);
                 max_rel_t = max_rel_t.max(rel.abs());
                 if rel > 1e-4 {
-                    overshoot += 1; // wavefront started past real geometry
+                    overshoot += 1;
+                    if culprits.len() < 8 {
+                        culprits.push(format!(
+                            "overshoot px ({x},{y}): ref t {rt:.6} -> wave t {wt:.6} (rel +{rel:.3e}) | inherited t_start {:.6}",
+                            t_start_of[i]
+                        ));
+                    }
                 }
             }
-            (true, false) => false_sky += 1,
-            (false, true) => hybrid_extra += 1,
+            (true, false) => {
+                false_sky += 1;
+                if culprits.len() < 8 {
+                    culprits.push(format!("false-sky px ({x},{y}): ref t {rt:.6}, wave = sky"));
+                }
+            }
+            (false, true) => {
+                hybrid_extra += 1;
+                if culprits.len() < 8 {
+                    culprits.push(format!("hybrid-extra px ({x},{y}): ref = sky, wave t {wt:.6}"));
+                }
+            }
             (false, false) => {}
         }
     }
-    // Same-seed same-shading image A/B: identical hits => identical RNG
-    // streams => near-identical color (cross-kernel compilation fp only).
+    // Same-seed same-shading image A/B: identical hits => identical RNG streams
+    // => near-identical color (cross-kernel compilation fp only). A pixel that
+    // legitimately hit DIFFERENT geometry (the TMin-sensitive edge above) has no
+    // business in the MAX — its color difference measures the two surfaces, not
+    // the shading. It stays in the mean, which is a whole-image gate.
     let mut img_sum = 0.0f64;
     let mut img_max = 0.0f32;
+    let mut img_hot = 0usize; // channels past the tolerance, excluding hw-edge px
+    let mut hot_px: Vec<String> = Vec::new();
     for i in 0..px * 3 {
         let d = (wave_acc[i] - ref_acc[i]).abs();
         img_sum += d as f64;
-        img_max = img_max.max(d);
+        if !edge_mask[i / 3] {
+            img_max = img_max.max(d);
+            if d > 1e-2 {
+                img_hot += 1;
+                if hot_px.len() < 6 {
+                    let p = i / 3;
+                    hot_px.push(format!(
+                        "hot px ({},{}) ch{}: |d| {d:.4} | ref t {:.6} wave t {:.6} (rel {:.2e})",
+                        p % gw,
+                        p / gw,
+                        i % 3,
+                        ref_t[p],
+                        wave_t[p],
+                        (wave_t[p] - ref_t[p]) / ref_t[p].max(1e-6),
+                    ));
+                }
+            }
+        }
+    }
+    for h in &hot_px {
+        eprintln!("check-gpu:   {h}");
     }
     let img_mean = img_sum / (px * 3) as f64;
     eprintln!(
-        "check-gpu: wavefront vs reference ({px} px): false-sky {false_sky} | tmin-overshoot {overshoot} | hybrid-extra {hybrid_extra} | max rel t err {max_rel_t:.2e} | same-seed image mean |d| {img_mean:.2e} max {img_max:.2e}"
+        "check-gpu: wavefront vs reference ({px} px): claim-violation {claim_viol} | false-sky {false_sky} | tmin-overshoot {overshoot} | hybrid-extra {hybrid_extra} | hw-edge px {edge_skipped} | max rel t err {max_rel_t:.2e} | same-seed image mean |d| {img_mean:.2e} max {img_max:.2e} | hot ch {img_hot}"
     );
+    if claim_viol != 0 {
+        eprintln!("check-gpu: FAIL inherited-tmin claim violated (t_start past real geometry — THE bug class)");
+        ok = false;
+    }
     if false_sky != 0 || overshoot != 0 || hybrid_extra != 0 {
         eprintln!("check-gpu: FAIL wavefront visibility gates (the inherited-tmin bug class)");
         ok = false;
     }
-    if img_mean > 1e-5 || img_max > 1e-2 {
-        eprintln!("check-gpu: FAIL same-seed wavefront/reference images diverge");
+    if !culprits.is_empty() {
+        for c in &culprits {
+            eprintln!("check-gpu:   {c}");
+        }
+    }
+    // The hardware-edge pixels are bounded by the SAME statistical allowance the
+    // reference-vs-CPU gate uses — they are the same phenomenon, seen from the
+    // other side. A flood of them is a real signal (a broken cut would surface
+    // as mass disagreement); one or two is grazing-edge fp.
+    if edge_skipped as f64 > px as f64 * 5e-4 {
+        eprintln!("check-gpu: FAIL {edge_skipped} wavefront/reference disagreements above the 0.05% two-intersector edge allowance");
+        ok = false;
+    }
+    // The same-seed image A/B, in three parts that between them are strictly
+    // stronger than the old `mean || max` pair — and, unlike it, do not assume
+    // the hardware returns a BIT-IDENTICAL t for one ray at two different TMins.
+    // (NVIDIA does. AMD re-origins the ray at TMin and lands 1-2 ulp away;
+    // measured on an R9700: the hit point shifts by ulps, which moves the
+    // shadow/AO ray origin, which at a grazing angle flips a BINARY occlusion
+    // bit — 2 ulp of geometry becomes ~0.02 of color at a handful of pixels.
+    // No amount of correct code prevents that: a discrete decision on a
+    // continuous input is discontinuous by construction.)
+    //   mean  — a systematic shading bug (wrong rng, lobe, albedo) moves it.
+    //   hot   — a localized bug lights up far more than the edge allowance.
+    //   finite— a catastrophic single pixel (NaN/inf) that the counts would miss.
+    let hot_limit = (px * 3) as f64 * 5e-4;
+    let nonfinite = wave_acc.iter().filter(|v| !v.is_finite()).count();
+    if img_mean > 1e-5 {
+        eprintln!("check-gpu: FAIL same-seed wavefront/reference images diverge (mean {img_mean:.2e} > 1e-5)");
+        ok = false;
+    }
+    if img_hot as f64 > hot_limit {
+        eprintln!(
+            "check-gpu: FAIL {img_hot} same-seed channels past 1e-2 (limit {hot_limit:.0} = 0.05%) — beyond grazing-edge occlusion flips"
+        );
+        ok = false;
+    }
+    if nonfinite != 0 {
+        eprintln!("check-gpu: FAIL {nonfinite} non-finite channels in the wavefront image");
         ok = false;
     }
     if must_fire {
@@ -3462,6 +3921,8 @@ fn run_check_gpu(
                         (gpu::trace::FEED_FSR_DD, fpl[6].0, fpl[6].1),
                         (gpu::trace::FEED_FSR_DS, fpl[7].0, fpl[7].1),
                         (gpu::trace::FEED_COLOR, fpl[8].0, fpl[8].1),
+                        (gpu::trace::FEED_FSR_AO, fpl[9].0, fpl[9].1),
+                        (gpu::trace::FEED_FSR_IS, fpl[10].0, fpl[10].1),
                     ],
                 ) {
                     eprintln!("check-gpu: FAIL FSR4-RR feed wiring: {e}");
@@ -3533,6 +3994,11 @@ fn run_check_gpu(
                 ) else {
                     return 1;
                 };
+                let (Some(f_ao), Some(f_is)) =
+                    (read_plane(9, 2, "ao"), read_plane(10, 8, "indirect_spec"))
+                else {
+                    return 1;
+                };
                 if !gate_fsr_rr_feed(
                     "check-gpu",
                     pw,
@@ -3546,10 +4012,31 @@ fn run_check_gpu(
                     &f_dd,
                     &f_ds,
                     &f_res,
+                    &f_ao,
+                    &f_is,
                     &pack2,
                     &accum2,
                     near,
                     far,
+                    must_fire,
+                ) {
+                    ok = false;
+                }
+                // The planes the GPU just wrote are the composite's inputs —
+                // gate the remodulation kernel on them while they are live.
+                if !gate_fsr_composite(
+                    "check-gpu",
+                    &mut hg,
+                    &fres,
+                    pw,
+                    ph,
+                    &f_alb,
+                    &f_spec,
+                    &f_dd,
+                    &f_ds,
+                    &f_ao,
+                    &f_is,
+                    &f_res,
                     must_fire,
                 ) {
                     ok = false;
@@ -4001,7 +4488,7 @@ fn run_check_gpu(
 /// dynamic-range fallbacks match the documented FSR ratios, FsrBufs
 /// reinterprets in place under set_res, and turning the capture on leaves the
 /// rendered image bit-identical.
-fn run_check_fsr(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera) -> i32 {
+fn run_check_fsr(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: bool) -> i32 {
     let (_, far) = dlss::near_far(scene.diag);
     let mut all_ok = true;
 
@@ -4102,11 +4589,14 @@ fn run_check_fsr(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera) -> i32 {
             let mut v3 = |scale: f32| Vec3A::new(rng.f32(), rng.f32(), rng.f32()) * scale;
             let color = v3(4.0);
             let (direct_d, direct_s) = (v3(3.0), v3(2.0));
+            let ind_s = v3(2.0);
             let albedo = v3(1.0);
+            drop(v3);
+            let ao = rng.f32();
             let metallic = rng.f32();
             let kd = albedo * (1.0 - metallic);
             let f0 = Vec3A::splat(0.04).lerp(albedo, metallic);
-            let sig = fsr::split_signals(color, direct_d, direct_s, kd, f0);
+            let sig = fsr::split_signals(color, direct_d, direct_s, ao, ind_s, kd, f0);
             let re = fsr::composite(&sig, kd, f0);
             let err = (re - color).abs().max_element();
             if !re.is_finite() || err > 1e-5 * color.abs().max_element().max(1.0) {
@@ -4119,16 +4609,23 @@ fn run_check_fsr(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera) -> i32 {
         // spike hits the MIN_SPEC_ALB floor with direct_s/1e-4 ≫ f16::MAX;
         // the saturating q16 must keep ds finite (an inf ds makes the
         // residual inf·0 = NaN) and the identity must still hold exactly
-        // (residual is the remainder of the clamped wire products).
+        // (residual is the remainder of the clamped wire products). The
+        // reflection bounce divides by the same floor, so `is` is inside the
+        // regression too — a mirror-bright metal is exactly where it bites.
         {
             let albedo = Vec3A::new(1.0, 0.4, 0.0);
             let (kd, f0) = (Vec3A::ZERO, albedo); // metallic = 1
             let direct_s = Vec3A::splat(300.0);
-            let color = direct_s * fsr::albedo_wire3(f0) + Vec3A::splat(0.05);
-            let sig = fsr::split_signals(color, Vec3A::ZERO, direct_s, kd, f0);
+            let ind_s = Vec3A::splat(120.0);
+            let color = (direct_s + ind_s) * fsr::albedo_wire3(f0) + Vec3A::splat(0.05);
+            let sig = fsr::split_signals(color, Vec3A::ZERO, direct_s, 0.0, ind_s, kd, f0);
             let re = fsr::composite(&sig, kd, f0);
-            if !sig.ds.is_finite() || !sig.residual.is_finite() || !re.is_finite() {
-                eprintln!("zero-wire-F0 split not finite: ds {} residual {}", sig.ds, sig.residual);
+            if !sig.ds.is_finite() || !sig.is.is_finite() || !sig.residual.is_finite() || !re.is_finite()
+            {
+                eprintln!(
+                    "zero-wire-F0 split not finite: ds {} is {} residual {}",
+                    sig.ds, sig.is, sig.residual
+                );
                 pass = false;
             }
             if (re - color).abs().max_element() > 1e-5 * color.max_element() {
@@ -4164,11 +4661,18 @@ fn run_check_fsr(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera) -> i32 {
         let sig = fsr::Signals {
             dd: Vec3A::new(0.5, 0.25, 0.125),
             ds: Vec3A::new(1.0, 2.0, 4.0),
+            ao: 0.75,
+            is: Vec3A::new(0.5, 1.5, 2.5),
             residual: Vec3A::new(0.1, -0.2, 0.3),
         };
         f.write(19, 11, &sig, 42.0);
         let r = f.read(19, 11);
-        if r.dd != sig.dd || r.ds != sig.ds || r.residual != sig.residual {
+        if r.dd != sig.dd
+            || r.ds != sig.ds
+            || r.ao != sig.ao
+            || r.is != sig.is
+            || r.residual != sig.residual
+        {
             eprintln!("FsrBufs set_res write/read mismatch");
             pass = false;
         }
@@ -4253,7 +4757,7 @@ fn run_check_fsr(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera) -> i32 {
     // 7. Rendered-frame gates at a native and an odd dynamic res (odd dims
     // also exercise the quadtree's odd splits with the capture on).
     for (rw, rh) in [(800usize, 600usize), (531, 399)] {
-        all_ok &= fsr_frame_check(scene, bvh, cam0, rw, rh, far);
+        all_ok &= fsr_frame_check(scene, bvh, cam0, rw, rh, far, structural);
     }
 
     if all_ok {
@@ -4276,6 +4780,7 @@ fn fsr_frame_check(
     rw: usize,
     rh: usize,
     far: f32,
+    structural: bool,
 ) -> bool {
     let q = Quality {
         shadow_samples: 1,
@@ -4354,6 +4859,10 @@ fn fsr_frame_check(
     {
         let mut worst = 0.0f32;
         let mut sky_ok = true;
+        // Anti-vacuity: the two new signals must actually carry something on
+        // a scene with an AO-occluded surface and a reflective one, or the
+        // identity above is passing on all-zeros.
+        let (mut ao_fired, mut is_fired) = (0u64, 0u64);
         for y in 0..rh {
             for x in 0..rw {
                 let i = y * rw + x;
@@ -4368,12 +4877,23 @@ fn fsr_frame_check(
                     let prev_z = f32::from_bits(fb.prev_z[i].load(Relaxed));
                     if sig.dd != Vec3A::ZERO
                         || sig.ds != Vec3A::ZERO
+                        || sig.ao != 0.0
+                        || sig.is != Vec3A::ZERO
                         || sig.residual != c
                         || prev_z != far
                     {
                         sky_ok = false;
                     }
                     continue;
+                }
+                // An occluded AO ray (at the 1-sample preset the open
+                // fraction is binary, so this is exactly ao == 0) — a frame
+                // of all-open AO would satisfy the identity trivially.
+                if sig.ao < 1.0 {
+                    ao_fired += 1;
+                }
+                if sig.is != Vec3A::ZERO {
+                    is_fired += 1;
                 }
                 let l3 = |buf: &[std::sync::atomic::AtomicU16], j: usize| {
                     Vec3A::new(
@@ -4405,6 +4925,11 @@ fn fsr_frame_check(
             ok = false;
         } else {
             eprintln!("  sky signal contract: OK");
+        }
+        eprintln!("  signal must-fire: ao-occluded {ao_fired} px, indirect-spec {is_fired} px");
+        if structural && (ao_fired == 0 || is_fired == 0) {
+            eprintln!("  signal must-fire: FAIL (a new signal is identically zero)");
+            ok = false;
         }
     }
 
@@ -8268,12 +8793,30 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
         xess_dir: opts.xess_path.clone(),
         xess_autoexposure: opts.xess_autoexposure,
         ffx_dir: opts.ffx_path.clone(),
+        fsr_tune: opts.fsr_tune,
         prefer: opts.prefer,
         debug: opts.gpu_debug,
         vsync: opts.vsync,
     };
     let mut gpu = gpu::GpuContext::new(sdl_hwnd(&window), W as u32, H as u32, &gopts)
         .expect("GPU init failed");
+    // --fsr4: the FSR4 + Ray Regeneration level is a requirement, so the chain
+    // falling through it is fatal here rather than a quiet downgrade. Checked
+    // against the session's ACTUAL wiring (the probe already printed its own
+    // reason on the `fsr4:` line above) — it cannot disagree with what got
+    // wired. The two things worth trying are the fallback flavor and the
+    // adapter, so name both.
+    if opts.fsr4_required && gpu.fsr_flavor() != Some(fsr::Flavor::Fsr4Rr) {
+        eprintln!(
+            "--fsr4: FSR4 + Ray Regeneration is UNAVAILABLE on adapter \"{}\" (it needs an RDNA4 GPU \
+             and the ffx-api Ray Regeneration provider; the fsr4: line above states the probe's reason)",
+            gpu.adapter_name
+        );
+        eprintln!("  --fsr3        FSR 3.1 upscale-only instead — cross-vendor, runs anywhere");
+        eprintln!("  --prefer-amd  pick this box's AMD adapter, if it has one (--fsr4 already prefers AMD by default)");
+        eprintln!("  --fsr         the same force-start, but allowed to fall through to XeSS/FSR3");
+        std::process::exit(2);
+    }
     // The 500 Hz integrator owns the camera pose for the whole app lifetime
     // (spawned here, not per session, so the pose survives resize rebuilds —
     // re-entry continuity is automatic). Sessions only snapshot. It spawns
@@ -8439,6 +8982,11 @@ fn session(
                 "requested (--lock-res dynamic) — locked under --gpu, see the gpu: line".to_string()
             } else if dlss_drs {
                 "ON (step-wise; history survives steps)".to_string()
+            } else if opts.gpu {
+                // The CPU renderer never runs under --gpu, so its lock (the
+                // quality default) is not this session's render res — the
+                // gpu: line below states the tracer's own locked one.
+                "LOCKED under --gpu, see the gpu: line".to_string()
             } else if opts.lock_scale.is_some() {
                 if dlss_range.map(|(_, min, max)| min != max).unwrap_or(false) {
                     format!(
@@ -8601,12 +9149,12 @@ fn session(
     let (mut grw, mut grh) = (w, h);
     if opts.gpu {
         // Session sub-mode + locked trace res. `--lock-res dynamic` can't be
-        // honored here (no DRS on the GPU path): lock at the quality default.
-        let lock = opts.lock_scale.unwrap_or_else(|| {
+        // honored here (no DRS on the GPU path): lock at the mode default.
+        let lock = opts.gpu_lock_scale.unwrap_or_else(|| {
             if dlss_on || xess_on || fsr_on {
-                eprintln!("gpu: dynamic render res is unsupported under --gpu; locking at quality (2/3)");
+                eprintln!("gpu: dynamic render res is unsupported under --gpu; locking at native (100%)");
             }
-            2.0 / 3.0
+            1.0
         });
         if dlss_on {
             gpu_up = GpuUp::Rr;
@@ -8945,13 +9493,16 @@ fn session(
     // The DXR trace res: locked into the wired upscaler's range (the --gpu
     // contract — DxrGpu's buffers are sized once, no DRS), window-res when
     // plain. Computed once so the eager --dxr init and the lazy F init
-    // build the pipeline at the same res.
+    // build the pipeline at the same res. The scale is the GPU-mode one
+    // (native by default); `--lock-res dynamic` can't be honored here, so it
+    // falls back to that same default.
+    let dxr_lock = opts.gpu_lock_scale.unwrap_or(1.0);
     let (dxw, dxh) = if dxr_rr_avail {
-        locked_render_res(opts.lock_scale.unwrap_or(2.0 / 3.0), dlss_range, (w, h), (drw, drh), false)
+        locked_render_res(dxr_lock, dlss_range, (w, h), (drw, drh), false)
     } else if dxr_xess_avail {
-        locked_render_res(opts.lock_scale.unwrap_or(2.0 / 3.0), xess_range, (w, h), (w, h), true)
+        locked_render_res(dxr_lock, xess_range, (w, h), (w, h), true)
     } else if dxr_fsr3_avail || dxr_fsr4_avail {
-        locked_render_res(opts.lock_scale.unwrap_or(2.0 / 3.0), fsr_range, (w, h), (w, h), true)
+        locked_render_res(dxr_lock, fsr_range, (w, h), (w, h), true)
     } else {
         (w, h)
     };
@@ -8965,8 +9516,8 @@ fn session(
     let mut dxr_reset = true;
     if want_dxr && !dxr_failed && !gpu_trace {
         let compose = dxr_rr_avail || dxr_xess_avail || dxr_fsr3_avail || dxr_fsr4_avail;
-        if compose && opts.lock_scale.is_none() {
-            eprintln!("dxr: dynamic render res is unsupported on the DXR pipeline; locking at quality (2/3)");
+        if compose && opts.gpu_lock_scale.is_none() {
+            eprintln!("dxr: dynamic render res is unsupported on the DXR pipeline; locking at native (100%)");
         }
         match gpu::dxc::Dxc::load(&opts.dxc_path).and_then(|dxc| {
             gpu.init_dxr(&dxc, scene, bvh, dxw as u32, dxh as u32, compose, opts.gpu_debug, opts.bc7)
@@ -9820,8 +10371,8 @@ fn session(
                 eprintln!("dxr: unavailable (earlier init failed; restart with --dxc-path to retry)");
             } else {
                 let compose = dxr_rr_avail || dxr_xess_avail || dxr_fsr3_avail || dxr_fsr4_avail;
-                if compose && opts.lock_scale.is_none() {
-                    eprintln!("dxr: dynamic render res is unsupported on the DXR pipeline; locking at quality (2/3)");
+                if compose && opts.gpu_lock_scale.is_none() {
+                    eprintln!("dxr: dynamic render res is unsupported on the DXR pipeline; locking at native (100%)");
                 }
                 match gpu::dxc::Dxc::load(&opts.dxc_path).and_then(|dxc| {
                     gpu.init_dxr(&dxc, scene, bvh, dxw as u32, dxh as u32, compose, opts.gpu_debug, opts.bc7)

@@ -238,6 +238,17 @@ int32_t ffxshim_denoiser_kv(void* denoiser_ctx, uint64_t key, uint64_t count, co
     return static_cast<int32_t>(g_api.configure(&ctx, &desc.header));
 }
 
+// The desc is hand-mirrored in ffx_sys.rs (this is the shim's OWN struct, not
+// an ffx one — mirroring it is the design). Pin the two places a mismatch
+// could hide: `signal_flags` is a u32 wedged between 8-aligned members, so it
+// opens a padding hole that both languages must agree on. The Rust side
+// asserts the identical literals; a divergence fails one build or the other
+// instead of silently shifting every resource pointer.
+static_assert(offsetof(FfxShimDenoiseDesc, linear_depth) == 16,
+              "FfxShimDenoiseDesc: signal_flags padding hole disagrees with ffx_sys.rs");
+static_assert(sizeof(FfxShimDenoiseDesc) == 416,
+              "FfxShimDenoiseDesc: size disagrees with ffx_sys.rs");
+
 int32_t ffxshim_denoise(void* denoiser_ctx, const FfxShimDenoiseDesc* d) {
     if (!g_api.dll) return FFXSHIM_ERR_NOT_LOADED;
     if (!denoiser_ctx || !d || !d->cmdlist) return FFXSHIM_ERR_BAD_ARG;
@@ -262,8 +273,17 @@ int32_t ffxshim_denoise(void* denoiser_ctx, const FfxShimDenoiseDesc* d) {
     common.flags = (d->reset ? FFX_DENOISER_DISPATCH_RESET : 0u)
                  | (d->non_gamma_albedo ? FFX_DENOISER_DISPATCH_NON_GAMMA_ALBEDO : 0u);
 
-    // Per-signal descs chain behind the common desc; signal set must match
-    // the context's creation signalFlags exactly.
+    // Per-signal descs chain behind the common desc. The header requires the
+    // chained set to match the context's creation signalFlags EXACTLY (each
+    // desc is required "if and only if" its flag is set) — hence the flag word
+    // travels on the dispatch desc; the shim keeps no per-context state.
+    // All descs are stack locals, alive through g_api.dispatch below.
+    ffxDispatchDescDenoiserAmbientOcclusion ao{};
+    ao.header.type = FFX_API_DISPATCH_DESC_TYPE_DENOISER_AMBIENT_OCCLUSION;
+    ao.signal.input  = shim_res(d->ao_in);
+    ao.signal.output = shim_res(d->ao_out);
+    ao.signal.checkerboardOrigin = 0;
+
     ffxDispatchDescDenoiserDirectDiffuse dd{};
     dd.header.type = FFX_API_DISPATCH_DESC_TYPE_DENOISER_DIRECT_DIFFUSE;
     dd.signal.input  = shim_res(d->dd_in);
@@ -276,8 +296,30 @@ int32_t ffxshim_denoise(void* denoiser_ctx, const FfxShimDenoiseDesc* d) {
     ds.signal.output = shim_res(d->ds_out);
     ds.signal.checkerboardOrigin = 0;
 
-    common.header.pNext = &dd.header;
-    dd.header.pNext     = &ds.header;
+    ffxDispatchDescDenoiserIndirectSpecular is{};
+    is.header.type = FFX_API_DISPATCH_DESC_TYPE_DENOISER_INDIRECT_SPECULAR;
+    is.signal.input  = shim_res(d->is_in);
+    is.signal.output = shim_res(d->is_out);
+    is.signal.checkerboardOrigin = 0;
+
+    // Stitch in flag order: whichever signals are subscribed, in one chain.
+    ffxDispatchDescHeader* chain[4];
+    uint32_t n = 0;
+    if (d->signal_flags & FFXSHIM_SIGNAL_AMBIENT_OCCLUSION)  chain[n++] = &ao.header;
+    if (d->signal_flags & FFXSHIM_SIGNAL_DIRECT_DIFFUSE)     chain[n++] = &dd.header;
+    if (d->signal_flags & FFXSHIM_SIGNAL_DIRECT_SPECULAR)    chain[n++] = &ds.header;
+    if (d->signal_flags & FFXSHIM_SIGNAL_INDIRECT_SPECULAR)  chain[n++] = &is.header;
+    // A flag with no desc built above (dominant light, indirect diffuse,
+    // specular occlusion) would dispatch a set that does not match the
+    // creation flags — refuse rather than let the provider misbehave.
+    const uint32_t supported = FFXSHIM_SIGNAL_AMBIENT_OCCLUSION | FFXSHIM_SIGNAL_DIRECT_DIFFUSE
+                             | FFXSHIM_SIGNAL_DIRECT_SPECULAR | FFXSHIM_SIGNAL_INDIRECT_SPECULAR;
+    if (d->signal_flags & ~supported) return FFXSHIM_ERR_BAD_ARG;
+    if (n == 0) return FFXSHIM_ERR_BAD_ARG;
+
+    common.header.pNext = chain[0];
+    for (uint32_t i = 0; i + 1 < n; ++i) chain[i]->pNext = chain[i + 1];
+    chain[n - 1]->pNext = nullptr;
 
     ffxContext ctx = denoiser_ctx;
     return static_cast<int32_t>(g_api.dispatch(&ctx, &common.header));

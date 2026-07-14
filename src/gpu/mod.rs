@@ -55,6 +55,10 @@ pub struct GpuOptions {
     /// OR XESS_INIT_FLAG_ENABLE_AUTOEXPOSURE into the XeSS init flags
     /// (--xess-autoexposure; A/B lever, default off).
     pub xess_autoexposure: bool,
+    /// Ray Regeneration tuning overrides applied at denoiser creation
+    /// (`--fsr-max-radiance` &c). All-None = configure nothing = the
+    /// provider's own defaults.
+    pub fsr_tune: crate::fsr::DenoiseTuning,
     /// D3D12 debug layer + DXGI debug factory + verbose SL logging.
     pub debug: bool,
     /// Present at sync interval 1 (default). `--no-vsync` clears it for
@@ -319,7 +323,7 @@ impl GpuContext {
                 s
             };
             if opts.chain.fsr4 {
-                match Self::init_fsr(&opts.ffx_dir, &d3d.device, w, h, opts.debug, crate::fsr::Flavor::Fsr4Rr) {
+                match Self::init_fsr(&opts.ffx_dir, &d3d.device, w, h, opts.debug, crate::fsr::Flavor::Fsr4Rr, &opts.fsr_tune) {
                     Ok(s) => fsr_state = Some(wire_fsr(s)),
                     Err(e) => eprintln!("fsr4: level unavailable ({e}) — falling through the chain"),
                 }
@@ -341,7 +345,7 @@ impl GpuContext {
                 }
             }
             if fsr_state.is_none() && xess_state.is_none() && opts.chain.fsr3 {
-                match Self::init_fsr(&opts.ffx_dir, &d3d.device, w, h, opts.debug, crate::fsr::Flavor::Fsr3) {
+                match Self::init_fsr(&opts.ffx_dir, &d3d.device, w, h, opts.debug, crate::fsr::Flavor::Fsr3, &opts.fsr_tune) {
                     Ok(s) => fsr_state = Some(wire_fsr(s)),
                     Err(e) => eprintln!("fsr3: level unavailable ({e})"),
                 }
@@ -543,7 +547,7 @@ impl GpuContext {
                 } else {
                     crate::fsr::Flavor::Fsr3
                 };
-                match Self::init_fsr(&opts.ffx_dir, &self.d3d.device, w, h, opts.debug, flavor) {
+                match Self::init_fsr(&opts.ffx_dir, &self.d3d.device, w, h, opts.debug, flavor, &opts.fsr_tune) {
                     Ok(s) => {
                         self.passes.create_srv(
                             &self.d3d.device,
@@ -574,6 +578,7 @@ impl GpuContext {
         h: u32,
         debug: bool,
         flavor: crate::fsr::Flavor,
+        tune: &crate::fsr::DenoiseTuning,
     ) -> Result<FsrState> {
         let mut ctx = ffx::FfxContext::load(ffx_dir)?;
         // Ray Regeneration probe. A probe *error* degrades exactly like an
@@ -640,6 +645,9 @@ impl GpuContext {
         // window and a per-dispatch renderSize.
         if flavor == crate::fsr::Flavor::Fsr4Rr {
             ctx.create_denoiser(device, (w, h))?;
+            if tune.any() {
+                ctx.tune_denoiser(tune);
+            }
         }
         ctx.create_upscaler(device, (w, h), (w, h), debug, vid)?;
         let q = |mode: u32, ratio: f32| -> (u32, u32) {
@@ -735,7 +743,7 @@ impl GpuContext {
                     // cs_feed_fsr_rr's register/plane mapping (feed.hlsl —
                     // keep in lockstep; plane_resources returns upload order:
                     // depth_lin, depth_clip, mvec, normals, diff_alb,
-                    // spec_alb, dd_in, ds_in, residual).
+                    // spec_alb, dd_in, ds_in, residual, ao_in, is_in).
                     let pl = res.plane_resources();
                     wire(
                         trace::FeedKind::FsrRr,
@@ -749,6 +757,8 @@ impl GpuContext {
                             (trace::FEED_FSR_DD, pl[6].0, pl[6].1),
                             (trace::FEED_FSR_DS, pl[7].0, pl[7].1),
                             (trace::FEED_COLOR, pl[8].0, pl[8].1), // RGBA16F residual
+                            (trace::FEED_FSR_AO, pl[9].0, pl[9].1), // R16F AO
+                            (trace::FEED_FSR_IS, pl[10].0, pl[10].1), // RGBA16F indirect spec
                         ],
                     )
                 }
@@ -1576,19 +1586,25 @@ impl GpuContext {
         // Ray Regeneration: signals in UAV state, one ffxDispatch with the
         // common desc + both signal descs chained (built in the shim).
         res.barrier_denoise_begin(&d3d.list);
-        let (depth_lin, mvec, normals, spec_alb, diff_alb, dd_in, dd_out, ds_in, ds_out) =
-            res.denoise_res();
+        let r = res.denoise_res();
         let dd_desc = ffx::FfxShimDenoiseDesc {
             cmdlist: d3d.list.as_raw(),
-            linear_depth: depth_lin,
-            motion_vectors: mvec,
-            normals,
-            specular_albedo: spec_alb,
-            diffuse_albedo: diff_alb,
-            dd_in,
-            dd_out,
-            ds_in,
-            ds_out,
+            // The dispatch's signal set must equal the context's creation set
+            // (the ffx header's if-and-only-if rule) — one constant, both.
+            signal_flags: ffx_sys::SIGNALS,
+            linear_depth: r.depth_lin,
+            motion_vectors: r.mvec,
+            normals: r.normals,
+            specular_albedo: r.spec_alb,
+            diffuse_albedo: r.diff_alb,
+            dd_in: r.dd_in,
+            dd_out: r.dd_out,
+            ds_in: r.ds_in,
+            ds_out: r.ds_out,
+            ao_in: r.ao_in,
+            ao_out: r.ao_out,
+            is_in: r.is_in,
+            is_out: r.is_out,
             // Our MV plane is already PreviousUV - CurrentUV with the depth
             // delta in B (converted at the fill site) — the header's unit
             // scale.

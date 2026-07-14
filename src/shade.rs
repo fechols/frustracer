@@ -80,7 +80,11 @@ impl Quality {
     }
 }
 
-const AMBIENT: Vec3A = Vec3A::new(0.14, 0.17, 0.23);
+/// The constant ambient radiance the sampled/fb.ao tiers modulate by AO.
+/// `pub` because it is the modulation factor FSR Ray Regeneration's AO signal
+/// is remodulated by (fsr.rs's composite; the HLSL twin is shade.hlsli's
+/// AMBIENT, and the FSR composite pass takes it as a root constant).
+pub const AMBIENT: Vec3A = Vec3A::new(0.14, 0.17, 0.23);
 
 /// Primary-hit surface data captured for the DLSS-RR G-buffers. Filled by
 /// `shade` only when the caller passes `Some` — and the caller passes `Some`
@@ -99,6 +103,21 @@ pub struct PrimarySurface {
     /// Specular-reflection ray hit t; INFINITY when the reflection ray
     /// missed; 0.0 when no reflection was traced.
     pub spec_t: f32,
+    /// Open fraction of the ambient-occlusion tier, i.e. the `ao` that
+    /// `ambient = AMBIENT * ao` was built from — FSR Ray Regeneration's
+    /// AMBIENT_OCCLUSION signal (0 = fully occluded, 1 = fully exposed).
+    /// Stays 0.0 under `fb.gi`, whose ambient is real RGB irradiance and not
+    /// an AO-modulated constant: the composite then adds nothing and the
+    /// residual absorbs the whole GI term, exactly as before this signal
+    /// existed. (fb is pinned OFF in upscaler frames, so that is a
+    /// correctness fallback, not the live path.)
+    pub ao: f32,
+    /// The specular bounce's contribution to `color` — `tput * rcol`, i.e.
+    /// the whole reflection subtree including any glass continuation behind
+    /// it. FSR's INDIRECT_SPECULAR signal (demodulated by F0 at the split,
+    /// exactly like `direct_s`); its ray hit distance is `spec_t`. Zero when
+    /// no reflection was traced.
+    pub ind_s: Vec3A,
     /// Shadowed direct light, split by lobe, AFTER the sample average —
     /// exactly the two addends of `color = kd*(direct_d + ambient) +
     /// direct_s`. `direct_d` is albedo-free (kd multiplies it later), i.e.
@@ -306,6 +325,11 @@ pub fn shade(
             spec_t: 0.0,
             direct_d: Vec3A::ZERO,
             direct_s: Vec3A::ZERO,
+            // Both are filled below, when their tier runs; the zeros are the
+            // "no such term" values the composite adds nothing for (fb.gi's
+            // ambient, or a surface whose reflection gate never fired).
+            ao: 0.0,
+            ind_s: Vec3A::ZERO,
         };
     }
 
@@ -576,6 +600,12 @@ pub fn shade(
                 }
             }
         }
+        // FSR's AO signal: the open fraction itself, before the constant.
+        // Assignment-only (no rng draw), so the same-seed bit-identity gates
+        // are untouched.
+        if let Some(prim) = prim.as_deref_mut() {
+            prim.ao = ao;
+        }
         AMBIENT * ao
     };
 
@@ -667,7 +697,14 @@ pub fn shade(
                     sky(rdir, sun)
                 }
             };
-            color += tput * rcol;
+            let refl = tput * rcol;
+            // FSR's INDIRECT_SPECULAR signal — the reflection subtree's whole
+            // contribution (the recursive shade above already folded in any
+            // glass continuation behind the mirror). Assignment-only.
+            if let Some(prim) = prim.as_deref_mut() {
+                prim.ind_s = refl;
+            }
+            color += refl;
         }
     }
 

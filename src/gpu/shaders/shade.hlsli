@@ -220,6 +220,13 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
     float3 st_o = 0.0, st_d = 0.0, st_tput = 0.0;
     HitInfo st_hit = (HitInfo)0;
     uint st_depth = 0u;
+    // Is THIS lap inside the root's reflection subtree? Everything such a lap
+    // adds to `total` is part of the CPU's `tput * rcol` — i.e. the
+    // INDIRECT_SPECULAR signal — and the subtree is more than one lap: a
+    // reflected ray that hits glass continues its own transmission chain.
+    // The stash only ever holds the ROOT's transmission child, which is not.
+    bool in_refl = false;
+    bool st_in_refl = false;
     [loop] for (uint lap = 0u; lap < 1u + 2u * TRANS_MAX_DEPTH; ++lap) {
         float3 p, n;
         surface_point(ro, rd, hit, p, n);
@@ -374,7 +381,9 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
             // here — the CPU's sampled loop is skipped the same way. The
             // ambient sits INSIDE the (1 - transmission) factor (shade.rs),
             // so kt folds into the weight.
-            total += tput * (kd * kt * diffuse_d + direct_s);
+            float3 c = tput * (kd * kt * diffuse_d + direct_s);
+            total += c;
+            if (in_refl) prim.ind_s += c;
             amb_w = tput * kd * kt;
             amb_o = p;
             amb_n = n;
@@ -392,7 +401,12 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                 }
                 ao = float(open) / float(n_ao);
             }
-            total += tput * (kd * kt * (diffuse_d + AMBIENT * ao) + direct_s);
+            // FSR's AO signal — lap 0 only (later laps compute their own AO
+            // for their own ambient; the capture is the PRIMARY surface's).
+            if (lap == 0u) prim.ao = ao;
+            float3 c = tput * (kd * kt * (diffuse_d + AMBIENT * ao) + direct_s);
+            total += c;
+            if (in_refl) prim.ind_s += c;
         }
 
         // Emitted radiance — additive per lap, OUTSIDE the kd*kt factor, so
@@ -405,6 +419,7 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                             .SampleLevel(samp_lin, map_uv, 0.0).rgb;
             }
             total += tput * emis;
+            if (in_refl) prim.ind_s += tput * emis;
         }
 
         // Continuation bookkeeping: at most one of the two branches below
@@ -414,6 +429,9 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
         float3 nx_o = 0.0, nx_d = 0.0, nx_tput = 0.0;
         HitInfo nx_hit = (HitInfo)0;
         uint nx_depth = 0u;
+        // A continuation inherits this lap's subtree unless the reflection
+        // branch below sets it — that branch IS the root of the ind_s subtree.
+        bool nx_in_refl = in_refl;
 
         // (a) One specular bounce — ROOT only (shade.rs gates depth == 0):
         // GGX VNDF importance sample (Heitz 2018), throughput F*G2/G1 <= 1.
@@ -453,9 +471,13 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                     nx_tput = rtput;
                     nx_depth = 1u;
                     next_set = true;
+                    nx_in_refl = true; // everything below this is ind_s
                 } else {
                     prim.spec_t = INF; // reflection missed (shade.rs)
+                    // The reflection subtree is just the sky here — still the
+                    // ind_s signal (the CPU's tput * rcol with rcol = sky).
                     total += rtput * sky_color(rdir);
+                    prim.ind_s += rtput * sky_color(rdir);
                 }
             }
         }
@@ -528,10 +550,12 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                         st_hit = th;
                         st_tput = t_tput;
                         st_depth = depth + 1u;
+                        st_in_refl = in_refl; // root's own chain: not ind_s
                         have_stash = true;
                     }
                 } else {
                     total += t_tput * sky_color(tdir);
+                    if (in_refl) prim.ind_s += t_tput * sky_color(tdir);
                 }
             }
         }
@@ -543,6 +567,7 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
             nx_hit = st_hit;
             nx_tput = st_tput;
             nx_depth = st_depth;
+            nx_in_refl = st_in_refl;
             have_stash = false;
         }
         // Continuation laps shade with reflections ineligible past the root
@@ -553,6 +578,7 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
         hit = nx_hit;
         tput = nx_tput;
         depth = nx_depth;
+        in_refl = nx_in_refl;
     }
     return total;
 }

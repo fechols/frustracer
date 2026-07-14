@@ -26,6 +26,24 @@ use std::sync::atomic::Ordering::Relaxed;
 
 const COMPOSITE_HLSL: &str = include_str!("shaders/fsr_composite.hlsl");
 
+/// One Ray Regeneration dispatch's resource set: the shared inputs plus an
+/// in/out pair per subscribed signal (`ffx_sys::SIGNALS`).
+pub struct DenoiseRes {
+    pub depth_lin: FfxShimRes,
+    pub mvec: FfxShimRes,
+    pub normals: FfxShimRes,
+    pub spec_alb: FfxShimRes,
+    pub diff_alb: FfxShimRes,
+    pub dd_in: FfxShimRes,
+    pub dd_out: FfxShimRes,
+    pub ds_in: FfxShimRes,
+    pub ds_out: FfxShimRes,
+    pub ao_in: FfxShimRes,
+    pub ao_out: FfxShimRes,
+    pub is_in: FfxShimRes,
+    pub is_out: FfxShimRes,
+}
+
 struct Plane {
     tex: ID3D12Resource,
     format: DXGI_FORMAT,
@@ -43,7 +61,9 @@ const P_SPEC_ALB: usize = 5; // RGBA8 sqrt-encoded F0
 const P_DD_IN: usize = 6; // RGBA16F demodulated direct diffuse
 const P_DS_IN: usize = 7; // RGBA16F demodulated direct specular
 const P_RESIDUAL: usize = 8; // RGBA16F pass-through (composite input only)
-const N_PLANES: usize = 9;
+const P_AO_IN: usize = 9; // R16F ambient-occlusion open fraction [0,1]
+const P_IS_IN: usize = 10; // RGBA16F demodulated indirect specular (A = hit t)
+const N_PLANES: usize = 11;
 
 pub struct FsrResources {
     pub max_w: u32, // input plane allocation size (range max)
@@ -52,6 +72,8 @@ pub struct FsrResources {
     /// Denoised signal UAVs (max render size; ffx writes the sub-rect).
     dd_out: ID3D12Resource,
     ds_out: ID3D12Resource,
+    ao_out: ID3D12Resource,
+    is_out: ID3D12Resource,
     /// Remodulated render-res color (composite CS output, upscaler input).
     composite: ID3D12Resource,
     /// FSR4 output at window res — the tonemap SRV target (screenshots read
@@ -63,8 +85,9 @@ pub struct FsrResources {
     // Composite pass state.
     comp_root: ID3D12RootSignature,
     comp_pso: ID3D12PipelineState,
-    /// 5 SRVs (dd_out, ds_out, diff_alb, spec_alb, residual) + 1 UAV
-    /// (composite), created once — the textures never change.
+    /// 7 SRVs (dd_out, ds_out, diff_alb, spec_alb, residual, ao_out, is_out) +
+    /// 1 UAV (composite), created once — the textures never change. The ORDER
+    /// is fsr_composite.hlsl's t0..t6 and is pinned by the composite gate.
     comp_heap: ID3D12DescriptorHeap,
 }
 
@@ -79,6 +102,8 @@ impl FsrResources {
             (DXGI_FORMAT_R8G8B8A8_UNORM, 4),
             (DXGI_FORMAT_R16G16B16A16_FLOAT, 8),
             (DXGI_FORMAT_R16G16B16A16_FLOAT, 8),
+            (DXGI_FORMAT_R16G16B16A16_FLOAT, 8),
+            (DXGI_FORMAT_R16_FLOAT, 2),
             (DXGI_FORMAT_R16G16B16A16_FLOAT, 8),
         ];
         let mut offset = 0usize;
@@ -112,6 +137,16 @@ impl FsrResources {
         };
         let dd_out = signal_uav()?;
         let ds_out = signal_uav()?;
+        let is_out = signal_uav()?;
+        // The AO signal is scalar in and out (R16F, like its input plane).
+        let ao_out = committed_tex(
+            device,
+            max_w,
+            max_h,
+            DXGI_FORMAT_R16_FLOAT,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        )?;
         let composite = signal_uav()?;
         let upscaled = committed_tex(
             device,
@@ -123,11 +158,14 @@ impl FsrResources {
         )?;
         let planes: [Plane; N_PLANES] = planes.try_into().map_err(|_| "plane count".to_string())?;
 
-        // Composite pass: table of 5 SRVs + 1 UAV, two root constants (rw, rh).
+        // Composite pass: table of 7 SRVs + 1 UAV, five root constants
+        // (rw, rh, AMBIENT.rgb — the constant the AO signal remodulates by,
+        // single-sourced from shade::AMBIENT; the composite shader has no
+        // shade.hlsli prelude to read it from).
         let ranges = [
             D3D12_DESCRIPTOR_RANGE {
                 RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
-                NumDescriptors: 5,
+                NumDescriptors: 7,
                 BaseShaderRegister: 0,
                 ..Default::default()
             },
@@ -135,7 +173,7 @@ impl FsrResources {
                 RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
                 NumDescriptors: 1,
                 BaseShaderRegister: 0,
-                OffsetInDescriptorsFromTableStart: 5,
+                OffsetInDescriptorsFromTableStart: 7,
                 ..Default::default()
             },
         ];
@@ -156,7 +194,7 @@ impl FsrResources {
                     Constants: D3D12_ROOT_CONSTANTS {
                         ShaderRegister: 0,
                         RegisterSpace: 0,
-                        Num32BitValues: 2,
+                        Num32BitValues: 5,
                     },
                 },
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
@@ -197,7 +235,7 @@ impl FsrResources {
         let comp_heap: ID3D12DescriptorHeap = unsafe {
             device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                NumDescriptors: 6,
+                NumDescriptors: 8,
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                 ..Default::default()
             })
@@ -217,17 +255,20 @@ impl FsrResources {
             };
             unsafe { device.CreateShaderResourceView(res, Some(&desc), at(i)) };
         };
+        // t0..t6 in fsr_composite.hlsl's declaration order.
         srv(&dd_out, DXGI_FORMAT_R16G16B16A16_FLOAT, 0);
         srv(&ds_out, DXGI_FORMAT_R16G16B16A16_FLOAT, 1);
         srv(&planes[P_DIFF_ALB].tex, DXGI_FORMAT_R8G8B8A8_UNORM, 2);
         srv(&planes[P_SPEC_ALB].tex, DXGI_FORMAT_R8G8B8A8_UNORM, 3);
         srv(&planes[P_RESIDUAL].tex, DXGI_FORMAT_R16G16B16A16_FLOAT, 4);
+        srv(&ao_out, DXGI_FORMAT_R16_FLOAT, 5);
+        srv(&is_out, DXGI_FORMAT_R16G16B16A16_FLOAT, 6);
         let uav_desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
             ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
             ..Default::default()
         };
-        unsafe { device.CreateUnorderedAccessView(&composite, None, Some(&uav_desc), at(5)) };
+        unsafe { device.CreateUnorderedAccessView(&composite, None, Some(&uav_desc), at(7)) };
 
         Ok(Self {
             max_w,
@@ -235,6 +276,8 @@ impl FsrResources {
             planes,
             dd_out,
             ds_out,
+            ao_out,
+            is_out,
             composite,
             upscaled,
             upload: std::sync::OnceLock::new(),
@@ -388,6 +431,38 @@ impl FsrResources {
                 });
         }
 
+        // AO: f16 storage -> R16F, bit copy (the open fraction, already in
+        // [0,1]).
+        plane_mem(&self.planes[P_AO_IN])
+            .par_chunks_mut(aligned_pitch(w * 2))
+            .take(rh)
+            .enumerate()
+            .for_each(|(y, row)| {
+                let px: &mut [f16] = unsafe { std::slice::from_raw_parts_mut(row.as_mut_ptr() as *mut _, w) };
+                for (x, p) in px.iter_mut().enumerate() {
+                    *p = f16::from_bits(f.ao[y * w + x].load(Relaxed));
+                }
+            });
+
+        // Indirect specular: RGB the demodulated reflection radiance (f16 bit
+        // copy), A the reflection ray's hit distance — the channel layout
+        // ffx_denoiser.h's INDIRECT_SPECULAR signal documents.
+        plane_mem(&self.planes[P_IS_IN])
+            .par_chunks_mut(aligned_pitch(w * 8))
+            .take(rh)
+            .enumerate()
+            .for_each(|(y, row)| {
+                let px: &mut [[f16; 4]] = unsafe { std::slice::from_raw_parts_mut(row.as_mut_ptr() as *mut _, w) };
+                for (x, p) in px.iter_mut().enumerate() {
+                    let i = y * w + x;
+                    let i3 = i * 3;
+                    p[0] = f16::from_bits(f.is[i3].load(Relaxed));
+                    p[1] = f16::from_bits(f.is[i3 + 1].load(Relaxed));
+                    p[2] = f16::from_bits(f.is[i3 + 2].load(Relaxed));
+                    p[3] = f16::from_bits(g.spec_hit_t[i].load(Relaxed));
+                }
+            });
+
         // Residual: f32 storage -> RGBA16F (the identity's only wire
         // rounding; saturating so an extreme HDR remainder never becomes inf
         // on the wire).
@@ -447,11 +522,11 @@ impl FsrResources {
         Ok(())
     }
 
-    /// The nine input planes as GPU feed targets for `cs_feed_fsr_rr`, in
+    /// The eleven input planes as GPU feed targets for `cs_feed_fsr_rr`, in
     /// upload-plane order (depth_lin, depth_clip, mvec, normals, diff_alb,
-    /// spec_alb, dd_in, ds_in, residual) — `wire_session_feed` maps them to
-    /// the FEED_* registers explicitly, and the check suites' rewire gates
-    /// pin the mapping.
+    /// spec_alb, dd_in, ds_in, residual, ao_in, is_in) — `wire_session_feed`
+    /// maps them to the FEED_* registers explicitly, and the check suites'
+    /// rewire gates pin the mapping.
     pub fn plane_resources(&self) -> [(&ID3D12Resource, DXGI_FORMAT); N_PLANES] {
         [
             P_DEPTH_LIN,
@@ -463,6 +538,8 @@ impl FsrResources {
             P_DD_IN,
             P_DS_IN,
             P_RESIDUAL,
+            P_AO_IN,
+            P_IS_IN,
         ]
         .map(|p| (&self.planes[p].tex, self.planes[p].format))
     }
@@ -475,20 +552,24 @@ impl FsrResources {
     /// resources will actually be in when the recorded work executes (inputs
     /// NON_PIXEL_SHADER_RESOURCE = compute read; outputs UAV — the caller
     /// wraps the dispatch in `barrier_denoise_*`).
-    pub fn denoise_res(
-        &self,
-    ) -> (FfxShimRes, FfxShimRes, FfxShimRes, FfxShimRes, FfxShimRes, FfxShimRes, FfxShimRes, FfxShimRes, FfxShimRes) {
-        (
-            Self::shim(&self.planes[P_DEPTH_LIN].tex, RES_STATE_COMPUTE_READ),
-            Self::shim(&self.planes[P_MVEC].tex, RES_STATE_COMPUTE_READ),
-            Self::shim(&self.planes[P_NORMALS].tex, RES_STATE_COMPUTE_READ),
-            Self::shim(&self.planes[P_SPEC_ALB].tex, RES_STATE_COMPUTE_READ),
-            Self::shim(&self.planes[P_DIFF_ALB].tex, RES_STATE_COMPUTE_READ),
-            Self::shim(&self.planes[P_DD_IN].tex, RES_STATE_COMPUTE_READ),
-            Self::shim(&self.dd_out, RES_STATE_UNORDERED_ACCESS),
-            Self::shim(&self.planes[P_DS_IN].tex, RES_STATE_COMPUTE_READ),
-            Self::shim(&self.ds_out, RES_STATE_UNORDERED_ACCESS),
-        )
+    pub fn denoise_res(&self) -> DenoiseRes {
+        let read = |p: usize| Self::shim(&self.planes[p].tex, RES_STATE_COMPUTE_READ);
+        let write = |r: &ID3D12Resource| Self::shim(r, RES_STATE_UNORDERED_ACCESS);
+        DenoiseRes {
+            depth_lin: read(P_DEPTH_LIN),
+            mvec: read(P_MVEC),
+            normals: read(P_NORMALS),
+            spec_alb: read(P_SPEC_ALB),
+            diff_alb: read(P_DIFF_ALB),
+            dd_in: read(P_DD_IN),
+            dd_out: write(&self.dd_out),
+            ds_in: read(P_DS_IN),
+            ds_out: write(&self.ds_out),
+            ao_in: read(P_AO_IN),
+            ao_out: write(&self.ao_out),
+            is_in: read(P_IS_IN),
+            is_out: write(&self.is_out),
+        }
     }
 
     /// The upscale dispatch's resource references (color = composite output,
@@ -502,22 +583,104 @@ impl FsrResources {
         )
     }
 
+    /// Every denoised output the dispatch writes — one per subscribed signal.
+    fn outs(&self) -> [&ID3D12Resource; 4] {
+        [&self.dd_out, &self.ds_out, &self.ao_out, &self.is_out]
+    }
+
     pub fn barrier_denoise_begin(&self, list: &ID3D12GraphicsCommandList) {
-        unsafe {
-            list.ResourceBarrier(&[
-                transition(&self.dd_out, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-                transition(&self.ds_out, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-            ])
-        };
+        let b: Vec<_> = self
+            .outs()
+            .iter()
+            .map(|r| {
+                transition(
+                    r,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )
+            })
+            .collect();
+        unsafe { list.ResourceBarrier(&b) };
     }
 
     pub fn barrier_denoise_end(&self, list: &ID3D12GraphicsCommandList) {
+        let b: Vec<_> = self
+            .outs()
+            .iter()
+            .map(|r| {
+                transition(
+                    r,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                )
+            })
+            .collect();
+        unsafe { list.ResourceBarrier(&b) };
+    }
+
+    /// Gate hook (`--check-gpu` / `--check-dxr`): make the denoiser an IDENTITY
+    /// by copying each signal's input plane into its denoised-output UAV. With
+    /// pass-through signals, `record_composite` must reproduce the traced color
+    /// — which is the composite identity, and the only way to exercise
+    /// fsr_composite.hlsl without an RDNA4 denoiser in the loop. The four pairs
+    /// are same-format, same-dimension by construction (P_DD_IN/P_DS_IN/P_IS_IN
+    /// are RGBA16F like their outs; P_AO_IN and ao_out are both R16F).
+    pub fn record_signal_passthrough(&self, list: &ID3D12GraphicsCommandList) {
+        let pairs: [(&ID3D12Resource, &ID3D12Resource); 4] = [
+            (&self.planes[P_DD_IN].tex, &self.dd_out),
+            (&self.planes[P_DS_IN].tex, &self.ds_out),
+            (&self.planes[P_AO_IN].tex, &self.ao_out),
+            (&self.planes[P_IS_IN].tex, &self.is_out),
+        ];
         unsafe {
-            list.ResourceBarrier(&[
-                transition(&self.dd_out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-                transition(&self.ds_out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-            ])
-        };
+            let pre: Vec<_> = pairs
+                .iter()
+                .flat_map(|(src, dst)| {
+                    [
+                        transition(
+                            src,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        ),
+                        transition(
+                            dst,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        ),
+                    ]
+                })
+                .collect();
+            list.ResourceBarrier(&pre);
+            for (src, dst) in pairs {
+                list.CopyResource(dst, src);
+            }
+            // Back to the rest state both the composite SRVs and the next
+            // denoise dispatch expect.
+            let post: Vec<_> = pairs
+                .iter()
+                .flat_map(|(src, dst)| {
+                    [
+                        transition(
+                            src,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        ),
+                        transition(
+                            dst,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        ),
+                    ]
+                })
+                .collect();
+            list.ResourceBarrier(&post);
+        }
+    }
+
+    /// The composite CS's output texture (RGBA16F, render-res sub-rect) — the
+    /// gate reads it back; the upscaler consumes it in a live session.
+    pub fn composite_tex(&self) -> &ID3D12Resource {
+        &self.composite
     }
 
     /// Record the remodulation compute pass over the `rw×rh` sub-rect.
@@ -536,8 +699,17 @@ impl FsrResources {
             list.SetComputeRootSignature(&self.comp_root);
             list.SetPipelineState(&self.comp_pso);
             list.SetComputeRootDescriptorTable(0, self.comp_heap.GetGPUDescriptorHandleForHeapStart());
-            list.SetComputeRoot32BitConstant(1, rw, 0);
-            list.SetComputeRoot32BitConstant(1, rh, 1);
+            // DWORD order is fsr_composite.hlsl's cbuffer layout, which leads
+            // with the float3 so the block packs contiguously: ambient.xyz |
+            // rw | rh. AMBIENT is the AO signal's remodulation factor
+            // (shade::AMBIENT — the split subtracted exactly this product, so
+            // the shader must add back exactly this one).
+            let amb = crate::shade::AMBIENT;
+            for (k, v) in [amb.x, amb.y, amb.z].into_iter().enumerate() {
+                list.SetComputeRoot32BitConstant(1, v.to_bits(), k as u32);
+            }
+            list.SetComputeRoot32BitConstant(1, rw, 3);
+            list.SetComputeRoot32BitConstant(1, rh, 4);
             list.Dispatch(rw.div_ceil(8), rh.div_ceil(8), 1);
             list.ResourceBarrier(&[transition(
                 &self.composite,
