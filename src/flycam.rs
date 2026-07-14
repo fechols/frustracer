@@ -36,8 +36,8 @@ use windows::Win32::System::Threading::{
     THREAD_PRIORITY_ABOVE_NORMAL, TIMER_ALL_ACCESS,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, MapVirtualKeyW, MAPVK_VSC_TO_VK_EX, VK_CONTROL, VK_LBUTTON, VK_RBUTTON,
-    VK_SHIFT,
+    GetAsyncKeyState, MapVirtualKeyW, MAPVK_VSC_TO_VK_EX, VK_CONTROL, VK_DOWN, VK_LBUTTON,
+    VK_LEFT, VK_RBUTTON, VK_RIGHT, VK_SHIFT, VK_UP,
 };
 use windows::Win32::UI::Input::XboxController::{
     XInputGetState, XINPUT_GAMEPAD_LEFT_SHOULDER, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE,
@@ -380,10 +380,12 @@ fn integrate_loop(shared: &Shared, hwnd: isize, diag: f32) {
 
         // Keyboard direction flags (unit directions, normalized below —
         // exactly the old apply_movement).
-        let kw = down(keys.w);
-        let ks = down(keys.s);
-        let kd = down(keys.d);
-        let ka = down(keys.a);
+        // Arrows alias WASD. They are layout-independent VKs, so unlike the
+        // letter keys they need no scancode round-trip.
+        let kw = down(keys.w) || down(VK_UP.0);
+        let ks = down(keys.s) || down(VK_DOWN.0);
+        let kd = down(keys.d) || down(VK_RIGHT.0);
+        let ka = down(keys.a) || down(VK_LEFT.0);
         let kup = down(keys.e) || down(keys.space);
         let kdn = down(keys.q);
         let key_any = kw || ks || kd || ka || kup || kdn;
