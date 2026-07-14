@@ -87,36 +87,46 @@ fn table() -> Option<&'static Pix> {
 /// event when dropped. Holds a COM clone (a refcount bump), not a borrow, so
 /// the guard never conflicts with `&mut` access to the surrounding frame
 /// state. Zero work when markers are off.
-pub struct PixScope(Option<ID3D12GraphicsCommandList>);
+///
+/// The bracket drives TWO instruments: the PIX event and (under
+/// `--gpu-timing`) a `gputime` timestamp region of the same name. Keeping
+/// them on one bracket is deliberate — PIX cannot analyze a capture on an
+/// Intel adapter at all, so the timestamps are the only numbers available
+/// there, and a marker that wasn't timed would be a silent hole in the table.
+/// Both are independently opt-in and both are inert when off.
+pub struct PixScope(Option<ID3D12GraphicsCommandList>, super::gputime::TimeScope);
 
 impl Drop for PixScope {
     fn drop(&mut self) {
         if let (Some(list), Some(p)) = (&self.0, table()) {
             unsafe { (p.end)(list.as_raw()) };
         }
+        // .1 (the TimeScope) closes its timestamp in its own Drop, after this.
     }
 }
 
 pub fn scope(list: &ID3D12GraphicsCommandList, name: &CStr) -> PixScope {
+    let t = super::gputime::scope(list, || name.to_string_lossy().into_owned());
     match table() {
         Some(p) => {
             unsafe { (p.begin)(list.as_raw(), COLOR, PCSTR(name.as_ptr() as _)) };
-            PixScope(Some(list.clone()))
+            PixScope(Some(list.clone()), t)
         }
-        None => PixScope(None),
+        None => PixScope(None, t),
     }
 }
 
 /// Formatted variant for dynamic names (`level {d}`); allocates only when
-/// markers are actually on.
+/// markers (or timing) are actually on.
 pub fn scope_fmt(list: &ID3D12GraphicsCommandList, args: std::fmt::Arguments) -> PixScope {
+    let t = super::gputime::scope(list, || args.to_string());
     match table() {
         Some(p) => {
             let name = CString::new(args.to_string()).unwrap_or_default();
             unsafe { (p.begin)(list.as_raw(), COLOR, PCSTR(name.as_ptr() as _)) };
-            PixScope(Some(list.clone()))
+            PixScope(Some(list.clone()), t)
         }
-        None => PixScope(None),
+        None => PixScope(None, t),
     }
 }
 

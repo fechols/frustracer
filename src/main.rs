@@ -36,8 +36,17 @@ mod render;
 mod reproject;
 mod scene;
 mod scene_cache;
+// Glare: the optics between the scene and the sensor. A display-stage pass, so
+// it never touches accum, the temporal cache, or any upscaler guide.
+mod bloom;
 mod shade;
-mod shaft;
+// Order-2 SH sky irradiance — the smooth half of the one-sky model (the sharp
+// half, the sun disc, is an explicit light: SH cannot be shadow-rayed).
+mod sh;
+// The one sky: a scattering dome + a sun disc at infinity. Read its header —
+// the "the disc appears exactly once per light path" invariant governs every
+// sky call site in the renderer.
+mod sky;
 mod sphcell;
 mod stats;
 mod prof;
@@ -300,6 +309,15 @@ pub struct Opts {
     pub pix_markers: bool,
     /// Directory holding WinPixEventRuntime.dll.
     pub pix_path: String,
+    /// D3D12 timestamp queries around the PIX marker brackets, printed as a
+    /// per-region GPU-ms table (--gpu-timing; default off, zero-cost when
+    /// off — no query heap, no name allocation, byte-identical lists). The
+    /// vendor-neutral profiler, and vendor-neutrality is the whole point:
+    /// PIX's capture ANALYSIS only replays on AMD/NVIDIA, so on an Intel
+    /// adapter this is the only way to get per-pass GPU numbers at all — and
+    /// the per-pass AMD-vs-NVIDIA diff it makes possible is what found the
+    /// leaf kernel's wave64 bug.
+    pub gpu_timing: bool,
     /// V-sync'd presentation (default on). `--no-vsync` presents at sync
     /// interval 0 on a tearing swapchain so interactive frame times measure
     /// the renderer, not the monitor refresh.
@@ -439,6 +457,7 @@ fn main() {
         pix_path: std::env::var("FRUSTRACER_PIX_PATH").unwrap_or_else(|_| {
             concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\pix\bin\x64").to_string()
         }),
+        gpu_timing: false,
         vsync: true,
         // scRGB is the default swapchain: see Opts::hdr. The 8-bit path survives
         // as --no-hdr and as the automatic fallback.
@@ -594,6 +613,11 @@ fn main() {
             // pattern): no chains are built, every trilinear sample falls
             // back to mip-0 bilinear — the pre-mip renderer exactly.
             "--no-mips" => texture::set_mips(false),
+            // A/B lever: no glare. A display-stage pass, so this is a pure
+            // presentation change — accum, the temporal cache, every upscaler
+            // guide and every radiance gate are untouched either way, and the
+            // off path keeps the original alloc-free tonemap loop verbatim.
+            "--no-bloom" => bloom::set_enabled(false),
             // Same "knob before scene load" pattern: the GPU reads it for the
             // static sampler's MaxAnisotropy, the CPU for Cone::aniso. 1 = off
             // ⇒ the isotropic ray-cone lod path runs verbatim (bit-identical
@@ -698,6 +722,7 @@ fn main() {
                 );
             }
             "--pix-markers" => opts.pix_markers = true,
+            "--gpu-timing" => opts.gpu_timing = true,
             "--pix-path" => {
                 opts.pix_path = args.next().unwrap_or_else(|| {
                     eprintln!("--pix-path needs a directory argument");
@@ -1085,6 +1110,11 @@ fn main() {
 
     // PIX command-list markers: opt-in, runtime-loaded; inert otherwise.
     gpu::pix::init(&opts.pix_path, opts.pix_markers);
+    // The same marker brackets, timed with D3D12 timestamp queries. No DLL,
+    // every vendor — the only per-pass GPU numbers available on Intel. Armed
+    // for interactive sessions (a table every REPORT_EVERY frames) AND for the
+    // headless suites, whose bench is the deterministic workload.
+    gpu::gputime::enable(opts.gpu_timing);
 
     // A/B lever: --no-cut-rays sends cut-seeded rays down the root traversal
     // instead. Every ray consumer funnels through intersect_multi/occluded_multi,
@@ -2190,6 +2220,7 @@ fn run_check_dxr(
                     &accum2,
                     near,
                     far,
+                    &scene.sky_sh,
                     must_fire,
                 ) {
                     ok = false;
@@ -2209,6 +2240,8 @@ fn run_check_dxr(
                     &f_ao,
                     &f_is,
                     &f_res,
+                    &f_nrm,
+                    &scene.sky_sh,
                     must_fire,
                 ) {
                     ok = false;
@@ -2545,6 +2578,7 @@ fn gate_fsr_rr_feed(
     accum_bytes: &[u8],
     near: f32,
     far: f32,
+    sky_sh: &sh::Sh9,
     must_fire: bool,
 ) -> bool {
     let lanes = gpu::trace::GBUF_STRIDE as usize / 4;
@@ -2708,13 +2742,23 @@ fn gate_fsr_rr_feed(
             half::f16::from_bits(is16[2]).to_f32(),
         );
         let aof = half::f16::from_bits(ao16).to_f32();
+        // The AO signal's remodulation factor — the sky's SH irradiance at the
+        // WIRE normal, decoded from the PLANE BYTES the GPU stored, for exactly
+        // the reason the albedo wire factors are: the composite pass has only
+        // those bytes, so an oracle built from the pack's full-precision normal
+        // would be scoring a different identity than the one that runs.
+        let n_wire = fsr::oct_decode(
+            l10(got_n, 0) as f32 / 1023.0,
+            l10(got_n, 10) as f32 / 1023.0,
+        );
+        let amb = sky_sh.irradiance(n_wire);
         for ch in 0..3 {
             let color = accf(i * 3 + ch);
             // Every remodulated term, in the kernel's order (feed.hlsl's
             // cs_feed_fsr_rr — and fsr::split_signals' before it).
             let t_dd = ddf[ch] * wire[0][ch];
             let t_ds = dsf[ch] * wire[1][ch];
-            let t_ao = aof * shade::AMBIENT[ch] * wire[0][ch];
+            let t_ao = aof * amb[ch] * wire[0][ch];
             let t_is = isf[ch] * wire[1][ch];
             let e = color - t_dd - t_ds - t_ao - t_is;
             let got16 = h16(residual, i * 8 + ch * 2);
@@ -2784,8 +2828,12 @@ fn gate_fsr_rr_feed(
 /// from. The oracle is built from the PLANE BYTES the GPU stored (the feed
 /// gate's discipline — never from a recompute that could drift), so what is
 /// pinned here is exactly this kernel: its arithmetic, its albedo decode, its
-/// SRV table ORDER, and its root constants. A wrong AMBIENT moves a lit pixel
-/// by ~0.03 = tens of f16 ulps; the tolerance is 2.
+/// SRV table ORDER, and its root constants. A wrong ambient factor moves a lit
+/// pixel by ~0.03 = tens of f16 ulps; the tolerance is 2.
+///
+/// That factor is the sky's SH irradiance at the pixel's normal now, not a
+/// constant — so this gate also pins that the pass reads the NORMALS plane
+/// (t7) and evaluates `sh_irr` against the same coefficients the CPU holds.
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 fn gate_fsr_composite(
@@ -2801,13 +2849,15 @@ fn gate_fsr_composite(
     ao: &[u8],
     ind_s: &[u8],
     residual: &[u8],
+    normals: &[u8],
+    sky_sh: &sh::Sh9,
     must_fire: bool,
 ) -> bool {
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT;
     if hg
         .run(|l| {
             fres.record_signal_passthrough(l);
-            fres.record_composite(l, pw as u32, ph as u32);
+            fres.record_composite(l, pw as u32, ph as u32, sky_sh);
         })
         .is_err()
     {
@@ -2833,6 +2883,12 @@ fn gate_fsr_composite(
     for i in 0..pw * ph {
         let aoc = f16v(ao, i * 2);
         let mut any_is = false;
+        // The AO factor, decoded from the same RGB10A2 bytes the shader samples.
+        let nw = u32::from_le_bytes(normals[i * 4..][..4].try_into().unwrap());
+        let amb = sky_sh.irradiance(fsr::oct_decode(
+            (nw & 0x3ff) as f32 / 1023.0,
+            ((nw >> 10) & 0x3ff) as f32 / 1023.0,
+        ));
         for ch in 0..3 {
             let (kd, f0) = (dec(diff_alb, i, ch), dec(spec_alb, i, ch));
             let ddc = f16v(dd, i * 8 + ch * 2);
@@ -2840,7 +2896,7 @@ fn gate_fsr_composite(
             let isc = f16v(ind_s, i * 8 + ch * 2);
             let resc = f16v(residual, i * 8 + ch * 2);
             any_is |= isc != 0.0;
-            let want = ddc * kd + dsc * f0 + aoc * shade::AMBIENT[ch] * kd + isc * f0 + resc;
+            let want = ddc * kd + dsc * f0 + aoc * amb[ch] * kd + isc * f0 + resc;
             let got = h16(&comp, i * 8 + ch * 2);
             let d = (mono16(got) - mono16(half::f16::from_f32(want).to_bits())).unsigned_abs();
             max_ulp = max_ulp.max(d);
@@ -3741,8 +3797,8 @@ fn run_check_gpu(
     eprintln!("check-gpu: hemi probe set: {} points", probes.len());
     let mut hemi_ok = true;
     for (mode_name, fb) in [
-        ("AO", shade::FrustumBounce { ao: true, gi: false, shadows: false, depth: 3 }),
-        ("GI", shade::FrustumBounce { ao: false, gi: true, shadows: false, depth: 3 }),
+        ("AO", shade::FrustumBounce { ao: true, gi: false, depth: 3 }),
+        ("GI", shade::FrustumBounce { ao: false, gi: true, depth: 3 }),
     ] {
         // Multi-seed estimate (the CB frame seeds the Arvo draws), matching
         // the CPU suite's A/B. The verify/stat counters ACCUMULATE across
@@ -3865,7 +3921,10 @@ fn run_check_gpu(
                     let d = shade::cosine_dir(n, t1, t2, rng.f32(), rng.f32());
                     let ray = bvh::Ray::new(o, d);
                     sum += match bvh.intersect(scene, &ray, 0.0, f32::INFINITY, &mut vls.ray_nodes) {
-                        None => shade::sky(d, sun),
+                        // dome, NOT radiance — this reference must integrate the
+                        // same sky hemi.rs does (a GATHER path), or the GI A/B
+                        // below is comparing two different functions.
+                        None => crate::sky::dome(d, sun),
                         Some(hh) => shade::shade(
                             scene,
                             bvh,
@@ -3910,7 +3969,7 @@ fn run_check_gpu(
     // them, and compose must produce finite radiance everywhere.
     {
         let hq = Quality {
-            fb: shade::FrustumBounce { ao: false, gi: true, shadows: false, depth: 2 },
+            fb: shade::FrustumBounce { ao: false, gi: true, depth: 2 },
             ..q
         };
         let p = gpu::trace::FrameParams {
@@ -4489,6 +4548,7 @@ fn run_check_gpu(
                     &accum2,
                     near,
                     far,
+                    &scene.sky_sh,
                     must_fire,
                 ) {
                     ok = false;
@@ -4508,6 +4568,8 @@ fn run_check_gpu(
                     &f_ao,
                     &f_is,
                     &f_res,
+                    &f_nrm,
+                    &scene.sky_sh,
                     must_fire,
                 ) {
                     ok = false;
@@ -4818,6 +4880,9 @@ fn run_check_gpu(
         }
     }
 
+    // Both remaining gates borrow `hg` mutably and neither needs the tracer.
+    drop(tg);
+
     // --- M12: the tonemap PS vs tone::map (the HLSL twin gate) ---
     // tonemap.hlsl is a term-for-term port of tone::map, and this is what stops
     // it drifting: the REAL pixel shader, through the REAL PSO and SRV slot, over
@@ -4925,7 +4990,19 @@ fn run_check_gpu(
         }
     }
 
-    // --- M13: the registered-consensus fuse (--quinlight) ---
+    // --- M13: the glare pyramid, GPU vs CPU ---
+    // bloom.hlsl was the one CPU/GPU mirror in the renderer with no numeric gate
+    // — it PRESENTS, so a swapped octave weight or a bad barrier just looks
+    // slightly wrong and no suite objects. This scores the halo (the whole
+    // pyramid's product) against `bloom::Bloom`. Structure-free: it runs on a
+    // synthetic probe image, so `--stress` and loaded scenes gate it exactly like
+    // the default one.
+    if let Err(e) = gpu::bloom::self_test_gpu(&mut hg) {
+        eprintln!("check-gpu: FAIL {e}");
+        ok = false;
+    }
+
+    // --- M14: the registered-consensus fuse (--quinlight) ---
     // The REAL kernel, through its REAL root signature and descriptor table,
     // over synthetic engine images. Three gates, each aimed at a different way
     // the port can be wrong: N==1 passthrough (the degenerate arm + the
@@ -4935,9 +5012,9 @@ fn run_check_gpu(
     // flip, an inverted tensor solve), and a known (+1,0) SHIFT that the
     // registration must recover — measured against an ITERS=0 control, because
     // a solve that always returns zero would sail through the first two.
-    println!("check-gpu: M13 quinlight registered-consensus fuse");
+    println!("check-gpu: M14 quinlight registered-consensus fuse");
     if let Err(e) = gpu::quin::gate(&mut hg, &dxc, opts.gpu_debug) {
-        eprintln!("check-gpu: FAIL M13 {e}");
+        eprintln!("check-gpu: FAIL M14 {e}");
         ok = false;
     }
 
@@ -4949,8 +5026,8 @@ fn run_check_gpu(
     // --- Bench: full 1920x1080, GPU hybrid vs GPU vanilla vs CPU hybrid ---
     // Wall-clock around synchronous submits (includes per-frame sync — the
     // interactive loop pays the same). Correctness gates above are the
-    // point; this is the speedometer.
-    drop(tg);
+    // point; this is the speedometer. (`tg` was already dropped above, before
+    // the bloom gate borrowed `hg`.)
     let (bw, bh) = (1920usize, 1080usize);
     let dev = hg.device.clone();
     let btg = match gpu::trace::TraceGpu::new(
@@ -4974,6 +5051,12 @@ fn run_check_gpu(
         }
     };
     let bbasis = cam0.basis(bw, bh);
+    // --gpu-timing: the per-pass GPU breakdown of the LAST timed config, so
+    // any bench row can be asked "where did that go".
+    // (RefCell: `timed` writes it and `bench` reads it, and both are closures
+    // capturing the same local — a plain `&mut` capture in one would lock the
+    // other out.)
+    let passes: std::cell::RefCell<Vec<(String, u32, f64)>> = std::cell::RefCell::new(Vec::new());
     let mut timed = |hybrid: bool, fb: shade::FrustumBounce, spp: u32| -> f64 {
         let bq = Quality { fb, ..q };
         let n = 60u32;
@@ -4994,6 +5077,9 @@ fn run_check_gpu(
             btg.write_cb(0, &p);
             let _ = hg.run(|l| btg.record_frame(l, 0, &p, hybrid));
         }
+        // Discard whatever the correctness gates / warm frames left behind, so
+        // this row's table covers exactly this row's frames.
+        let _ = gpu::gputime::take_regions();
         let t0 = Instant::now();
         for f in 0..n {
             let p = gpu::trace::FrameParams {
@@ -5011,12 +5097,24 @@ fn run_check_gpu(
             btg.write_cb(0, &p);
             let _ = hg.run(|l| btg.record_frame(l, 0, &p, hybrid));
         }
-        t0.elapsed().as_secs_f64() * 1000.0 / n as f64
+        let ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
+        // HeadlessGpu::run collects each frame's timestamps at the START of the
+        // next one, so the last frame is still pending here; take_regions drops
+        // it rather than letting it leak into the next row.
+        *passes.borrow_mut() = gpu::gputime::take_regions();
+        ms
     };
     let fb_off = shade::FrustumBounce::OFF;
     let mut bench = |label: &str, hybrid: bool, fb: shade::FrustumBounce, spp: u32| -> f64 {
         let ms = timed(hybrid, fb, spp);
         eprintln!("check-gpu: bench {bw}x{bh} {label}: {ms:6.2} ms/frame");
+        for (name, depth, pms) in passes.borrow().iter() {
+            let pad = "  ".repeat(*depth as usize);
+            eprintln!(
+                "check-gpu:   gpu-time {pad}{name:<24} {pms:7.3} ms  ({:5.1}% of frame)",
+                100.0 * pms / ms.max(1e-9)
+            );
+        }
         ms
     };
     bench("gpu hybrid          ", true, fb_off, 1);
@@ -5024,7 +5122,7 @@ fn run_check_gpu(
     bench(
         "gpu hybrid + hemi-gi",
         true,
-        shade::FrustumBounce { ao: false, gi: true, shadows: false, depth: 3 },
+        shade::FrustumBounce { ao: false, gi: true, depth: 3 },
         1,
     );
     // --spp on the GPU: the wavefront pays its quadtree ONCE per frame no
@@ -5082,6 +5180,23 @@ fn run_check_gpu(
         mp / p[0],
         mh / mp,
     );
+    // The cost model's `m` (per-sample) is a wall-clock difference, which on
+    // a submit-per-frame headless loop carries CPU overhead too. Under
+    // --gpu-timing, re-run the two ends of the sweep so the per-pass GPU
+    // breakdown says WHICH kernel the marginal sample is spent in.
+    if opts.gpu_timing {
+        for (label, hybrid) in [("gpu hybrid spp=16   ", true), ("gpu plain ref spp=16", false)] {
+            let ms = timed(hybrid, fb_off, 16);
+            eprintln!("check-gpu: bench {bw}x{bh} {label}: {ms:6.2} ms/frame");
+            for (name, depth, pms) in passes.borrow().iter() {
+                let pad = "  ".repeat(*depth as usize);
+                eprintln!(
+                    "check-gpu:   gpu-time {pad}{name:<24} {pms:7.3} ms  ({:5.1}% of frame)",
+                    100.0 * pms / ms.max(1e-9)
+                );
+            }
+        }
+    }
     {
         // CPU hybrid at the same resolution/quality for scale.
         let stats2 = Stats::default();
@@ -5257,8 +5372,13 @@ fn run_check_fsr(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural:
             let metallic = rng.f32();
             let kd = albedo * (1.0 - metallic);
             let f0 = Vec3A::splat(0.04).lerp(albedo, metallic);
-            let sig = fsr::split_signals(color, direct_d, direct_s, ao, ind_s, kd, f0);
-            let re = fsr::composite(&sig, kd, f0);
+            // The AO remodulation factor is now an arbitrary per-pixel RGB (the
+            // sky's SH irradiance at the pixel's normal), so the identity is
+            // gated against a RANDOM one — strictly stronger than pinning it to
+            // whatever constant the renderer happens to use.
+            let amb = Vec3A::new(rng.f32(), rng.f32(), rng.f32());
+            let sig = fsr::split_signals(color, direct_d, direct_s, ao, ind_s, kd, f0, amb);
+            let re = fsr::composite(&sig, kd, f0, amb);
             let err = (re - color).abs().max_element();
             if !re.is_finite() || err > 1e-5 * color.abs().max_element().max(1.0) {
                 eprintln!("composite identity err {err} at color {color}");
@@ -5279,8 +5399,9 @@ fn run_check_fsr(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural:
             let direct_s = Vec3A::splat(300.0);
             let ind_s = Vec3A::splat(120.0);
             let color = (direct_s + ind_s) * fsr::albedo_wire3(f0) + Vec3A::splat(0.05);
-            let sig = fsr::split_signals(color, Vec3A::ZERO, direct_s, 0.0, ind_s, kd, f0);
-            let re = fsr::composite(&sig, kd, f0);
+            let amb = Vec3A::new(0.12, 0.18, 0.25);
+            let sig = fsr::split_signals(color, Vec3A::ZERO, direct_s, 0.0, ind_s, kd, f0, amb);
+            let re = fsr::composite(&sig, kd, f0, amb);
             if !sig.ds.is_finite() || !sig.is.is_finite() || !sig.residual.is_finite() || !re.is_finite()
             {
                 eprintln!(
@@ -5566,7 +5687,17 @@ fn fsr_frame_check(
                         dlss::ld16(&buf[j * 3 + 2]),
                     )
                 };
-                let re = fsr::composite(&sig, l3(&ga.diff_alb, i), l3(&ga.spec_alb, i));
+                // The AO factor, from the same f16 G-buffer normal the FSR
+                // upload oct-encodes the normals plane from (render.rs's
+                // write_fsr subtracted exactly this).
+                let n16 = Vec3A::new(
+                    dlss::ld16(&ga.normal_rough[i * 4]),
+                    dlss::ld16(&ga.normal_rough[i * 4 + 1]),
+                    dlss::ld16(&ga.normal_rough[i * 4 + 2]),
+                );
+                let amb = scene.sky_sh.irradiance(fsr::wire_normal(n16));
+                let re =
+                    fsr::composite(&sig, l3(&ga.diff_alb, i), l3(&ga.spec_alb, i), amb);
                 // NaN/inf must fail loudly — f32::max would silently discard
                 // a NaN err, hiding an overflowed signal plane.
                 if !re.is_finite() {
@@ -7666,6 +7797,42 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     // identical to the pre-mip renderer).
     let tex_ok = texture::self_test();
 
+    // SH sky irradiance — basis orthonormality (pins every constant), the
+    // uniform-sky convention pin (radiance L in, exactly L out — what makes it
+    // a drop-in for the old AMBIENT · ao), accuracy vs a brute-force
+    // cosine-weighted reference, and projection determinism.
+    let sh_ok = match sh::self_test() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("sh self-test: FAIL — {e}");
+            false
+        }
+    };
+
+    // Glare: normalized octave weights, ENERGY CONSERVATION (a uniform image
+    // must come back unchanged — glare redistributes light, never creates it),
+    // total-energy preservation on a point source, and a monotone heavy tail.
+    let bloom_ok = match bloom::self_test() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("bloom self-test: FAIL — {e}");
+            false
+        }
+    };
+
+    // The one sky: the disc's radiance/irradiance round-trip (the classic 4π
+    // slip), cone sampling inside-and-covering the disc, the disc test agreeing
+    // with the cone the sampler draws from, the DOME carrying no disc (the
+    // invariant the hemi fixed-point accumulator depends on), and the resulting
+    // ambient landing in a physically sane, blue-dominant band.
+    let sky_ok = match sky::self_test() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("sky self-test: FAIL — {e}");
+            false
+        }
+    };
+
     // Spherical-cell math self-test — closed-form identities the hemisphere
     // bounce integrator is built on (Ω/PSA anchors, exact partition,
     // in-cell sampling).
@@ -8203,7 +8370,9 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                     let d = shade::cosine_dir(pr.n, t1, t2, r1, r2);
                     let bray = bvh::Ray::new(pr.p, d);
                     e_r += match bvh.intersect(scene, &bray, 0.0, f32::INFINITY, &mut vis) {
-                        None => shade::sky(d, sun),
+                        // dome, NOT radiance — a GATHER path, mirroring
+                        // hemi.rs's leaf-ray miss exactly (see sky.rs).
+                        None => crate::sky::dome(d, sun),
                         Some(h) => shade::shade(
                             scene,
                             bvh,
@@ -8552,127 +8721,6 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         ok
     };
 
-    // Light-shaft shadow culling: proven-lit subrect claims re-validated by
-    // reference occlusion rays (corners + center of each lit leaf), sample
-    // classification re-checked against full-tree occlusion (exact-match —
-    // the shaft must never change a shadow result, only skip proven rays),
-    // and the leaf rects must exactly tile the light's param square.
-    let shaft_ok = {
-        // Same probe set and parallel/sequential-fold structure as hemi AO.
-        let results: Vec<_> = probes
-            .par_iter()
-            .map(|pr| {
-                let mut ls = stats::LocalStats::default();
-                let mut vis = 0u64;
-                let (mut false_lit, mut mismatch, mut area_bad) = (0u64, 0u64, 0u64);
-                let (mut samples, mut skipped) = (0u64, 0u64);
-                let (p, n) = (pr.p, pr.n);
-                let s = shaft::build(scene, bvh, p, n, &mut ls);
-                let mut area = 0.0f32;
-                for l in s.leaves() {
-                    area += (l.r[2] - l.r[0]) * (l.r[3] - l.r[1]);
-                    if l.lit {
-                        // Corners + center of the lit subrect must be reachable.
-                        let pts = [
-                            (l.r[0], l.r[1]),
-                            (l.r[2], l.r[1]),
-                            (l.r[2], l.r[3]),
-                            (l.r[0], l.r[3]),
-                            ((l.r[0] + l.r[2]) * 0.5, (l.r[1] + l.r[3]) * 0.5),
-                        ];
-                        for (su, sv) in pts {
-                            let lp = scene.light.center + scene.light.u * su + scene.light.v * sv;
-                            let lv = lp - p;
-                            let dist = lv.length();
-                            let wi = lv / dist;
-                            // The shaft claim covers the tangent upper
-                            // half-space only — exactly the samples shade
-                            // ever consults it for (ndl > 0).
-                            if wi.dot(n) <= 0.0 {
-                                continue;
-                            }
-                            if bvh.occluded(
-                                scene,
-                                &bvh::Ray::new(p, wi),
-                                0.0,
-                                dist - scene.eps,
-                                &mut vis,
-                            ) {
-                                false_lit += 1;
-                            }
-                        }
-                    }
-                }
-                if (area - 4.0).abs() > 1e-4 {
-                    area_bad += 1;
-                }
-                // Deterministic sample sweep: the shaft-classified occlusion
-                // result must equal the full-tree result for every sample.
-                let mut rng = fastrand::Rng::with_seed(
-                    (pr.x as u64).wrapping_mul(31).wrapping_add(pr.y as u64),
-                );
-                for _ in 0..16 {
-                    let (su, sv) = (rng.f32() * 2.0 - 1.0, rng.f32() * 2.0 - 1.0);
-                    let lp = scene.light.center + scene.light.u * su + scene.light.v * sv;
-                    let lv = lp - p;
-                    let dist = lv.length();
-                    let wi = lv / dist;
-                    if wi.dot(n) <= 0.0 {
-                        continue; // shade never consults the shaft below the horizon
-                    }
-                    let full = bvh.occluded(
-                        scene,
-                        &bvh::Ray::new(p, wi),
-                        0.0,
-                        dist - scene.eps,
-                        &mut vis,
-                    );
-                    samples += 1;
-                    let got = match s.classify(su, sv) {
-                        shaft::Class::Lit => {
-                            skipped += 1;
-                            false
-                        }
-                        shaft::Class::Test { tmin, cut } => bvh.occluded_multi(
-                            scene,
-                            &bvh::Ray::new(p, wi),
-                            tmin,
-                            dist - scene.eps,
-                            cut,
-                            &mut vis,
-                        ),
-                    };
-                    if got != full {
-                        mismatch += 1;
-                    }
-                }
-                (false_lit, mismatch, area_bad, samples, skipped, ls)
-            })
-            .collect();
-        let mut ls = stats::LocalStats::default();
-        let (mut false_lit, mut mismatch, mut area_bad) = (0u64, 0u64, 0u64);
-        let (mut samples, mut skipped) = (0u64, 0u64);
-        for (fl, mm, ab, sa, sk, pls) in &results {
-            false_lit += fl;
-            mismatch += mm;
-            area_bad += ab;
-            samples += sa;
-            skipped += sk;
-            ls.merge(pls);
-        }
-        let nprobes = results.len() as u64;
-        eprintln!(
-            "shaft shadows ({nprobes} probes): false-lit {false_lit} | class mismatch {mismatch} | area-bad {area_bad} | rays skipped {skipped}/{samples} ({:.0}%) | {:.1} queries/point",
-            skipped as f64 * 100.0 / samples.max(1) as f64,
-            ls.shaft_queries as f64 / nprobes.max(1) as f64,
-        );
-        let mut ok = false_lit == 0 && mismatch == 0 && area_bad == 0;
-        if structural && skipped == 0 {
-            eprintln!("shaft shadows: expected skipped rays > 0 — the lit path didn't fire");
-            ok = false;
-        }
-        ok
-    };
     // Probe gates done — the bench rows below measure the session defaults.
     bvh::CUT_SEED_HEMI.store(cut_hemi_session, Relaxed);
 
@@ -8684,20 +8732,18 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     // (hemi_queries, share groups, share fallback) per row, for the
     // hemi-share must-fires below (share-on must run strictly fewer queries).
     let mut share_rows: Vec<(&str, bool, u64, u64, u64)> = Vec::new();
-    for (label, hybrid, hemi_ao, hemi_gi, shafts, share) in [
-        ("hybrid ", true, false, false, false, false),
-        ("hemi-ao (share off)", true, true, false, false, false),
-        ("hemi-ao (share on) ", true, true, false, false, true),
-        ("hemi-gi (share off)", true, false, true, false, false),
-        ("hemi-gi (share on) ", true, false, true, false, true),
-        ("shafts ", true, false, false, true, false),
-        ("plain  ", false, false, false, false, false),
+    for (label, hybrid, hemi_ao, hemi_gi, share) in [
+        ("hybrid ", true, false, false, false),
+        ("hemi-ao (share off)", true, true, false, false),
+        ("hemi-ao (share on) ", true, true, false, true),
+        ("hemi-gi (share off)", true, false, true, false),
+        ("hemi-gi (share on) ", true, false, true, true),
+        ("plain  ", false, false, false, false),
     ] {
         stats.clear();
         let mut bq = q;
         bq.fb.ao = hemi_ao;
         bq.fb.gi = hemi_gi;
-        bq.fb.shadows = shafts;
         let ctx = FrameCtx {
             scene,
             bvh,
@@ -8746,7 +8792,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
         // Save the plain-hybrid and hemi-GI images while their buffers are
         // fresh (frame stays 0, so accum holds exactly the last frame).
-        if hybrid && !hemi_ao && !hemi_gi && !shafts {
+        if hybrid && !hemi_ao && !hemi_gi {
             let mut present = vec![0u32; rw * rh];
             render::resolve(&accum, &info, 1, false, &mut present, rw, rh, rw, rh);
             save_png("check.png", &present, rw, rh);
@@ -9828,6 +9874,9 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
 
     let gates = [
         ("texture", tex_ok),
+        ("sh", sh_ok),
+        ("sky", sky_ok),
+        ("bloom", bloom_ok),
         ("sphcell", sph_ok),
         ("ftree", ftree_ok),
         ("reproject", reproj_ok),
@@ -9842,7 +9891,6 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         ("hemi-ao", hemi_ok),
         ("hemi-gi", gi_ok),
         ("hemi-share", hemi_share_ok),
-        ("shaft", shaft_ok),
         ("verify", rep.ok()),
         ("wide-tiles", rep_wt.ok()),
         ("spp", spp_ok),
@@ -10061,6 +10109,13 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
             }
         }
     }
+    // --gpu-timing: the session-total table. The periodic one only fires every
+    // REPORT_EVERY frames, so without this a session shorter than that (or one
+    // ending mid-interval — every session does) silently prints nothing, and an
+    // asked-for flag that produces no output reads as broken. Survives the
+    // resize path: `gputime` state lives in the module, not the session, and
+    // the accumulator is never cleared here, so the table spans the whole run.
+    gpu::gputime::report();
 }
 
 /// One renderer session at a fixed window size (w, h): everything sized
@@ -10974,7 +11029,7 @@ fn session(
                 if gpu_up != GpuUp::Plain {
                     eprintln!("gpu: hemi bounces unavailable in the upscaler sub-mode (still-frame feature)");
                 } else {
-                    bounce_mode = (bounce_mode + 1) % 3; // no shafts tier on GPU (v1)
+                    bounce_mode = (bounce_mode + 1) % 3;
                     frame = 0;
                     eprintln!(
                         "gpu: hemisphere frustum bounces: {}",
@@ -11098,6 +11153,7 @@ fn session(
                             gpu_prev_cam.map(|c| c.pos),
                             gpu_up_idx,
                             last_ms as f32,
+                            &scene.sky_sh,
                         ),
                         GpuUp::Fsr4 => gpu.present_trace_fsr_rr(
                             &p,
@@ -11106,6 +11162,7 @@ fn session(
                             gpu_prev_cam.map(|c| c.pos),
                             gpu_up_idx,
                             last_ms as f32,
+                            &scene.sky_sh,
                         ),
                         _ => gpu.present_trace_rr(&p, hybrid, &fc, gpu_up_idx),
                     }
@@ -11337,12 +11394,11 @@ fn session(
             eprintln!("tonemap: {}{note}", if gpu_tonemap { "GPU" } else { "CPU" });
         }
         if edges.toggle_bounce {
-            bounce_mode = (bounce_mode + 1) % 4;
+            bounce_mode = (bounce_mode + 1) % 3;
             frame = 0;
             eprintln!(
                 "hemisphere frustum bounces: {}",
-                ["OFF", "AO (still frames)", "GI (still frames)", "GI + shadow shafts (still frames)"]
-                    [bounce_mode as usize]
+                ["OFF", "AO (still frames)", "GI (still frames)"][bounce_mode as usize]
             );
         }
         // --quinlight in DXR mode: the FUSE is the session's upscaler, so G/X/K
@@ -11937,6 +11993,7 @@ fn session(
                             dxr_prev_cam.map(|c| c.pos),
                             dxr_up_idx,
                             last_ms as f32,
+                            &scene.sky_sh,
                         ),
                         GpuUp::Fsr4 => gpu.present_dxr_fsr_rr(
                             &p,
@@ -11944,6 +12001,7 @@ fn session(
                             dxr_prev_cam.map(|c| c.pos),
                             dxr_up_idx,
                             last_ms as f32,
+                            &scene.sky_sh,
                         ),
                         _ => gpu.present_dxr_rr(&p, &fc, dxr_up_idx),
                     }
@@ -12283,7 +12341,6 @@ fn session(
         if !neural && !moved {
             q.fb.ao = bounce_mode == 1;
             q.fb.gi = bounce_mode >= 2;
-            q.fb.shadows = bounce_mode == 3;
         }
 
         // Temporal-OIDN mode renders fresh 1-spp frames (the DLSS pattern);
@@ -12558,7 +12615,15 @@ fn session(
             );
             let presented = if fsr_rr {
                 let fb = fsr_bufs.as_ref().expect("fsr_on without signal bufs");
-                gpu.present_fsr(fg, fb, &fc, fsr_prev.map(|c| c.pos), fsr_idx, last_ms as f32)
+                gpu.present_fsr(
+                    fg,
+                    fb,
+                    &fc,
+                    fsr_prev.map(|c| c.pos),
+                    fsr_idx,
+                    last_ms as f32,
+                    &scene.sky_sh,
+                )
             } else {
                 gpu.present_fsr3(&accum, fg, &fc, last_ms as f32)
             };
@@ -13155,7 +13220,7 @@ fn session(
                 if dlss_on || fsr_on || xess_on || nppd_on {
                     ""
                 } else {
-                    ["", " | hemi-AO", " | hemi-GI", " | hemi-GI+shafts"][bounce_mode as usize]
+                    ["", " | hemi-AO", " | hemi-GI"][bounce_mode as usize]
                 },
                 if use_gpu_tone && !dlss_on && !fsr_on && !xess_on { " | gpu-tone" } else { "" },
                 if overlay_on { " | overlay" } else { "" },

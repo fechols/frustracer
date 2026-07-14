@@ -3,19 +3,25 @@ use crate::scene::{MatKind, Scene, NO_TEX};
 use crate::stats::LocalStats;
 use glam::Vec3A;
 
-/// Which bounce effects run through the hemisphere/shaft frustum integrators
-/// instead of the sampled loops. `depth` is the hemisphere subdivision budget
+/// Which bounce effects run through the hemisphere frustum integrator instead
+/// of the sampled loops. `depth` is the hemisphere subdivision budget
 /// (4^depth leaf cells). All-off reproduces the sampled path bit-for-bit.
+///
+/// There used to be a third member here, `shadows`, dispatching light shafts
+/// (a frustum from the shading point through the light RECT, whose proven-lit
+/// subrects skipped their occlusion rays). It is gone: it was measured ~3x
+/// SLOWER than the rays it saved, and its whole premise — a finite rectangular
+/// light with four corners to build a frustum through — died with `AreaLight`.
+/// The sun is a disc at infinity now.
 #[derive(Clone, Copy, PartialEq)]
 pub struct FrustumBounce {
     pub ao: bool,
     pub gi: bool,
-    pub shadows: bool,
     pub depth: u32,
 }
 
 impl FrustumBounce {
-    pub const OFF: FrustumBounce = FrustumBounce { ao: false, gi: false, shadows: false, depth: 0 };
+    pub const OFF: FrustumBounce = FrustumBounce { ao: false, gi: false, depth: 0 };
 }
 
 #[derive(Clone, Copy)]
@@ -80,11 +86,14 @@ impl Quality {
     }
 }
 
-/// The constant ambient radiance the sampled/fb.ao tiers modulate by AO.
-/// `pub` because it is the modulation factor FSR Ray Regeneration's AO signal
-/// is remodulated by (fsr.rs's composite; the HLSL twin is shade.hlsli's
-/// AMBIENT, and the FSR composite pass takes it as a root constant).
-pub const AMBIENT: Vec3A = Vec3A::new(0.14, 0.17, 0.23);
+// The flat AMBIENT constant is gone: ambient is now the sky's own order-2 SH
+// irradiance (`Scene::sky_sh`, `sh::Sh9::irradiance`), which is directional and
+// agrees with what the fb.gi tier integrates with rays.
+//
+// It was also FSR Ray Regeneration's AO remodulation factor — the constant its
+// composite multiplies the denoised open fraction by. That factor is now
+// directional too, so it cannot ride in as a root constant: see
+// `fsr::wire_normal` for how the three composite sites keep agreeing on it.
 
 /// Primary-hit surface data captured for the DLSS-RR G-buffers. Filled by
 /// `shade` only when the caller passes `Some` — and the caller passes `Some`
@@ -222,13 +231,21 @@ pub(crate) fn cosine_dir(n: Vec3A, t1: Vec3A, t2: Vec3A, r1: f32, r2: f32) -> Ve
     t1 * (phi.cos() * sq) + t2 * (phi.sin() * sq) + n * (1.0 - r2).sqrt()
 }
 
-pub fn sky(d: Vec3A, sun: Vec3A) -> Vec3A {
-    let t = (d.y * 0.7 + 0.3).clamp(0.0, 1.0);
-    let horizon = Vec3A::new(0.72, 0.82, 0.95);
-    let zenith = Vec3A::new(0.18, 0.35, 0.70);
-    let glow = d.dot(sun).max(0.0).powi(32) * Vec3A::new(1.0, 0.9, 0.7) * 0.6;
-    horizon.lerp(zenith, t) + glow
-}
+// `sky(d, sun)` is gone. It was a two-color gradient plus a soft `dot^32` glow
+// lobe — a *backdrop*, not a light, which is why the thing that actually lit the
+// scene was a separate 4x4 rect lamp and the two disagreed. There are now two
+// functions, and which one a ray calls is a CORRECTNESS decision, not a
+// preference (see src/sky.rs's central invariant):
+//
+//   crate::sky::dome(d, sun)         — the smooth scattering dome, NO sun disc.
+//                                      Every GATHER path: hemi cells, GI leaf
+//                                      misses, the SH projection. The sun's
+//                                      diffuse is already delivered by direct_d.
+//   crate::sky::radiance(d, &sun)    — dome + disc. Every DISPLAY path: the
+//                                      camera's own miss, and glass.
+//
+// The specular reflection ray is the one path where both strategies can find the
+// sun, so it takes the dome plus a MIS-weighted disc.
 
 /// Ray-cone state for texture LOD (Möller 2019 ray cones, curvature-free):
 /// width at the ray origin plus per-unit-length spread — `width_at_hit =
@@ -439,7 +456,7 @@ pub fn shade(
     // Capture/Apply only exist for the sampled shadow/AO paths; the
     // frustum-bounce tiers would silently bypass the record.
     debug_assert!(
-        matches!(vis, VisCtl::Off) || (!q.fb.shadows && !q.fb.ao && !q.fb.gi),
+        matches!(vis, VisCtl::Off) || (!q.fb.ao && !q.fb.gi),
         "VisCtl requires the sampled shadow/AO paths (fb OFF)"
     );
     // A shared hemisphere root only means something to the fb tiers (fb
@@ -587,6 +604,18 @@ pub fn shade(
     // reuses the material roughness as sheen roughness).
     let sheen_inv_a = 1.0 / rough_eff.clamp(0.07, 1.0);
 
+    // Will the VNDF reflection ray actually be traced? MIS is a partition of
+    // ONE integral between TWO strategies, so the light-sampled specular may
+    // only be down-weighted if the BSDF-sampled half is really going to run —
+    // otherwise `w_l` deletes energy nobody else delivers. The gate is the one
+    // the reflection block below uses, hoisted verbatim (same expression, same
+    // FLAT roughness/metallic — a texture-driven gate would make the two
+    // conditional VNDF draws depend on the sampler and skew the same-seed A/Bs).
+    // It fails for the low preset (`reflections: false`) and at every depth > 0,
+    // and on those paths the light-sampled highlight is the ONLY estimator of
+    // the sun's specular — so it must carry the full weight.
+    let refl_ray = q.reflections && depth == 0 && (mat.metallic > 0.04 || mat.roughness < 0.45);
+
     // Direct light: N samples on the area light, Lambert diffuse +
     // Cook-Torrance GGX specular per sample. The renderer's convention omits
     // Lambert's 1/π (the light intensity absorbs it), so the specular term
@@ -597,12 +626,6 @@ pub fn shade(
     // Thin-surface diffuse transmission (foliage): light arriving from BEHIND
     // the surface, gathered in the ndl <= 0 arm below.
     let mut direct_t = Vec3A::ZERO;
-    // Light-shaft culling (fb.shadows): identical sampling and integrand —
-    // the shaft only removes occlusion rays for samples in subrects proven
-    // unoccluded, and seeds the remaining (penumbra) rays from its cut with
-    // its own apex-relative tmin. Built lazily: a light fully behind the
-    // surface never pays for a shaft.
-    let mut shaft: Option<crate::shaft::Shaft> = None;
     // Under Apply the loop runs over the record's samples (the SAME light
     // points its capture drew); Capture/Off draw fresh points from the rng.
     let n_shadow = match &vis {
@@ -619,13 +642,17 @@ pub fn shade(
                 let _ = (rng.f32(), rng.f32());
                 r.light_uv[si]
             }
-            _ => (rng.f32() * 2.0 - 1.0, rng.f32() * 2.0 - 1.0),
+            _ => (rng.f32(), rng.f32()),
         };
-        let lp = scene.light.center + scene.light.u * su + scene.light.v * sv;
-        let lv = lp - p;
-        let dist2 = lv.length_squared();
-        let dist = dist2.sqrt();
-        let wi = lv / dist;
+        // Uniform-in-cone toward the SUN DISC — exactly two draws, in the same
+        // order the old rect sampling consumed them, which is what keeps every
+        // same-seed / replay / VisCtl-burn bit-identity contract intact. The
+        // stored (su, sv) stay the RAW uniforms, so Apply reproduces the
+        // direction bit-exactly. No `lp`, no `dist`, no 1/d²: the sun is at
+        // infinity, so every shading point sees it at the same angle and the
+        // same brightness (which is why the tiled/stress scenes no longer
+        // rescale the light).
+        let wi = scene.sun.sample_dir(su, sv);
         // N·L against the SHADING normal (n_s ≡ n when unmapped); the
         // shadow/translucency ray geometry below stays on the geometric n.
         let ndl = n_s.dot(wi);
@@ -646,8 +673,7 @@ pub fn shade(
             // lands at hit - n·eps — the exact mirror of the front
             // convention; the ray departs the leaf's plane on the side it
             // starts on and never re-crosses its own triangle). Plain
-            // `occluded`: no cut exists for this apex, and the shaft's
-            // tangent-plane clip makes `classify` valid only for wi·n > 0.
+            // `occluded` — no cut exists for this apex.
             // Consumes no rng draws — stream alignment is untouched.
             if mat.translucency > 0.0 && ndl < 0.0 {
                 let back_occluded = match &vis {
@@ -659,17 +685,20 @@ pub fn shade(
                     }
                     _ => {
                         ls.secondary_rays += 1;
+                        // tmax = INFINITY: the sun is at infinity, so anything
+                        // along the ray occludes it (the old bound was the
+                        // 12-unit distance to the rect lamp).
                         bvh.occluded(
                             scene,
                             &Ray::new(p - n * (2.0 * scene.eps), wi),
                             0.0,
-                            dist - scene.eps,
+                            f32::INFINITY,
                             &mut ls.ray_nodes,
                         )
                     }
                 };
                 if !back_occluded {
-                    direct_t += scene.light.color * ((-ndl) / dist2);
+                    direct_t += scene.sun.e_over_pi * (-ndl);
                 }
             }
             continue;
@@ -679,31 +708,10 @@ pub fn shade(
                 ls.adapt_rays_saved += 1;
                 r.occluded[si]
             }
-            _ if q.fb.shadows => {
-                if shaft.is_none() {
-                    shaft = Some(crate::shaft::build(scene, bvh, p, n, ls));
-                }
-                match shaft.as_ref().unwrap().classify(su, sv) {
-                    crate::shaft::Class::Lit => {
-                        ls.shaft_rays_skipped += 1;
-                        false
-                    }
-                    crate::shaft::Class::Test { tmin, cut } => {
-                        ls.secondary_rays += 1;
-                        bvh.occluded_multi(
-                            scene,
-                            &Ray::new(p, wi),
-                            tmin,
-                            dist - scene.eps,
-                            cut,
-                            &mut ls.ray_nodes,
-                        )
-                    }
-                }
-            }
             _ => {
                 ls.secondary_rays += 1;
-                bvh.occluded(scene, &Ray::new(p, wi), 0.0, dist - scene.eps, &mut ls.ray_nodes)
+                // tmax = INFINITY — the sun is at infinity.
+                bvh.occluded(scene, &Ray::new(p, wi), 0.0, f32::INFINITY, &mut ls.ray_nodes)
             }
         };
         if let VisCtl::Capture(r) = &mut vis {
@@ -711,7 +719,10 @@ pub fn shade(
             r.occluded[si] = occluded;
         }
         if !occluded {
-            let li = scene.light.color * (ndl / dist2);
+            // No 1/d²: irradiance/π is authored directly (sky::SUN_E_OVER_PI is
+            // exactly the old `light.color / |light.center|²`, so the direct
+            // term at the scene origin is unchanged by construction).
+            let li = scene.sun.e_over_pi * ndl;
             direct_d += li;
             let h = (wi + v).normalize_or_zero();
             let hl = to_local(h);
@@ -719,8 +730,29 @@ pub fn shade(
                 let d = ggx_ndf(hl, ax, ay);
                 let g2 = 1.0 / (1.0 + lambda_v + ggx_lambda(to_local(wi), ax, ay));
                 let f = schlick(f0, wi.dot(h).max(0.0));
+                // MIS (balance heuristic) against the VNDF reflection ray, which
+                // can also land in the sun disc — see sky::mis_weight. Counting
+                // both would double the sun's specular AND put ~1e3-radiance
+                // fireflies in FSR's un-denoised residual. `w_l` sends the
+                // energy to light sampling exactly where light sampling is the
+                // better strategy (rough surfaces), and stands down on mirrors.
+                // Zero rays, zero rng draws — both pdfs are already in scope.
+                // The VNDF sampling pdf in solid angle:
+                //   p(wi) = G1(v)·D(h) / (4·n·v),  G1(v) = 1/(1 + λ_v).
+                //
+                // ONLY when that ray is actually traced (`refl_ray`): with no
+                // BSDF strategy in play there is nothing to share the integral
+                // with, and weighting down would just lose the highlight (a
+                // mirror under the low preset measured ~200x too dark).
+                let w_l = if refl_ray {
+                    let p_b = d / (4.0 * (1.0 + lambda_v) * vl.z.max(1e-6));
+                    1.0 - crate::sky::mis_weight(p_b, crate::sky::light_pdf(&scene.sun))
+                } else {
+                    1.0
+                };
                 // li carries ndl; D·G2·F/(4·nv·nl)·nl leaves /(4·nv).
-                direct_s += li * f * (std::f32::consts::PI * d * g2 / (4.0 * vl.z * ndl));
+                direct_s +=
+                    li * f * (std::f32::consts::PI * d * g2 * w_l / (4.0 * vl.z * ndl));
                 if mat.sheen > 0.0 {
                     // Retro-reflective fabric rim: Charlie NDF + Ashikhmin
                     // visibility (the glTF KHR_materials_sheen pair), white,
@@ -757,8 +789,15 @@ pub fn shade(
     // tmin is never involved):
     // - fb.gi: real sky+bounce irradiance/π over the hemisphere (subsumes AO —
     //   occluders contribute their radiance instead of darkening a constant).
-    // - fb.ao: the AMBIENT constant modulated by frustum-dispatched AO.
-    // - neither: the AMBIENT constant modulated by sampled AO.
+    // - fb.ao: SH sky irradiance modulated by frustum-dispatched AO.
+    // - neither: SH sky irradiance modulated by sampled AO.
+    //
+    // The lower two tiers used to multiply a flat AMBIENT constant, which gave
+    // a surface facing the sun exactly the same ambient as one facing away.
+    // `sky_sh` is the same integral the fb.gi tier computes with rays — minus
+    // occlusion and bounce — so the three tiers now agree on what the sky IS,
+    // and `sh::self_test` gates that agreement. Zero rng draws (a pure function
+    // of the normal), which is what keeps the same-seed contracts intact.
     let ambient = if q.fb.gi {
         let (t1, t2) = onb(n);
         let accel = crate::ftree::Accel::of(bvh);
@@ -817,13 +856,15 @@ pub fn shade(
                 }
             }
         }
-        // FSR's AO signal: the open fraction itself, before the constant.
-        // Assignment-only (no rng draw), so the same-seed bit-identity gates
-        // are untouched.
+        // FSR's AO signal: the open fraction itself, before the sky it
+        // modulates. Assignment-only (no rng draw), so the same-seed
+        // bit-identity gates are untouched.
         if let Some(prim) = prim.as_deref_mut() {
             prim.ao = ao;
         }
-        AMBIENT * ao
+        // The shading normal: ambient is a BRDF-side quantity, and the n_g/n_s
+        // split reserves the geometric normal for visibility.
+        scene.sky_sh.irradiance(n_s) * ao
     };
 
     // Ambient stays diffuse-only; metals get their environment from the
@@ -860,8 +901,10 @@ pub fn shade(
     // environment that accumulation / DLSS-RR converges. Throughput is
     // F·G2/G1 (≤ 1 per channel — no fireflies possible). roughness → 0
     // degenerates to the old exact mirror. The gate skips near-Lambertian
-    // dielectrics whose specular contribution wouldn't justify a ray.
-    if q.reflections && depth == 0 && (mat.metallic > 0.04 || mat.roughness < 0.45) {
+    // dielectrics whose specular contribution wouldn't justify a ray — and it
+    // is the SAME `refl_ray` the direct loop's MIS weight consulted, hoisted so
+    // the two can never disagree about whether a BSDF strategy exists.
+    if refl_ray {
         let vh = Vec3A::new(ax * vl.x, ay * vl.y, vl.z).normalize();
         let lensq = vh.x * vh.x + vh.y * vh.y;
         let b1 = if lensq > 0.0 {
@@ -913,7 +956,20 @@ pub fn shade(
                     if let Some(prim) = prim.as_deref_mut() {
                         prim.spec_t = f32::INFINITY;
                     }
-                    sky(rdir, sun)
+                    // The BSDF-sampling half of the MIS pair (see sky::mis_weight
+                    // and the direct loop's `w_l`). The DOME passes through
+                    // un-weighted — it is smooth and only this strategy sees it —
+                    // but the DISC is weighted by w_b, because `direct_s` is
+                    // also delivering the sun's specular. On a mirror w_b ≈ 1
+                    // and this carries the (round!) sun; on a rough surface
+                    // w_b ≈ 0, which is exactly what kills the firefly.
+                    let hl_r = to_local(h);
+                    let p_b = ggx_ndf(hl_r, ax, ay)
+                        / (4.0 * (1.0 + lambda_v) * vl.z.max(1e-6));
+                    let w_b =
+                        crate::sky::mis_weight(p_b, crate::sky::light_pdf(&scene.sun));
+                    crate::sky::dome(rdir, sun)
+                        + crate::sky::disc(rdir, &scene.sun, cone.spread * 0.5) * w_b
                 }
             };
             let refl = tput * rcol;
@@ -987,7 +1043,11 @@ pub fn shade(
                         scene, bvh, &tray, &th, None, &rq, rng, sun, tcone, depth + 1, ls,
                         None, VisCtl::Off, None,
                     ),
-                    None => sky(tdir, sun),
+                    // The FULL sky, disc included and un-weighted: refraction is
+                    // a near-delta path with no light-sampling partner, so this
+                    // is the only strategy that can deliver the sun through
+                    // glass. Nothing to double-count.
+                    None => crate::sky::radiance(tdir, &scene.sun, cone.spread * 0.5),
                 };
             // Tinted by albedo — the classifier lifts dark MTL glass Kd
             // toward white so this doesn't go black.
@@ -1051,7 +1111,7 @@ fn perturb_normal(
 /// a canonical triangle, the flat-map near-identity, the green-channel sign
 /// pin, mirrored-UV handedness, and the degenerate-UV skip.
 pub fn tangent_self_test() -> Result<(), String> {
-    use crate::scene::{AreaLight, Material, Scene};
+    use crate::scene::{Material, Scene};
     use crate::texture::Texture;
     let tri_scene = |texcoords: [glam::Vec2; 3], texel: [u8; 4]| -> Scene {
         let mut sc = Scene {
@@ -1086,12 +1146,8 @@ pub fn tangent_self_test() -> Result<(), String> {
                 mips: Vec::new(),
             }],
             any_alpha: false,
-            light: AreaLight {
-                center: Vec3A::Y,
-                u: Vec3A::X,
-                v: Vec3A::Z,
-                color: Vec3A::ONE,
-            },
+            sun: crate::sky::Sun::new(Vec3A::Y),
+            sky_sh: crate::sh::Sh9::ZERO,
             diag: 1.0,
             eps: 1e-4,
             ao_radius: 0.03,

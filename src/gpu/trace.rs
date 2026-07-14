@@ -173,6 +173,34 @@ const HEMI_MAX_DEPTH: u32 = 4;
 // MAX_SPP-entry jitter table (--spp), which is what sets the size.
 pub(crate) const CB_STRIDE: usize = 1536;
 
+/// The leaf kernel's thread-group width — ONE WAVE on both vendors, and that
+/// is the whole point.
+///
+/// A leaf tile is not 8x8. `depth_full` is driven by the WIDER screen axis, so
+/// at 1920x1080 a leaf rect is 1920/2^8 = 7.5 by 1080/2^8 = 4.2 — about **32
+/// pixels**, never 64. The kernel used to dispatch 64 lanes per tile and let
+/// the surplus half return immediately, which is nearly free on a wave32 GPU
+/// (the all-idle second wave retires at once) and expensive on wave64, where
+/// those lanes sit in the SAME wave and waste half its RT throughput. That one
+/// mismatch was most of the AMD-vs-NVIDIA gap: per extra sample the leaf kernel
+/// cost 2.27x its own reference kernel on RDNA but only 1.24x on Ada, for
+/// identical work.
+///
+/// leaf.hlsl grid-strides over the tile's pixels, so this is a free knob.
+/// Measured (--gpu-timing, leaf+sky, 1080p; 64 -> 32):
+///   spp=1   AMD 1.63 -> 1.01 ms (-38%)   NVIDIA 2.24 -> 1.38 ms (-38%)
+///   spp=16  AMD 19.7 -> 11.4 ms (-42%)   NVIDIA 10.2 ->  7.6 ms (-25%)
+/// i.e. a win on BOTH vendors, not an AMD-specific hack — a 64-thread group
+/// reserves registers for 64 threads on Ada too, so halving it doubles the
+/// blocks in flight.
+///
+/// 32 is a floor, not a tuning parameter: RDNA's wave is 32 lanes MINIMUM, so
+/// a 16-wide group is a half-empty wave again (measured worse — 1.31 ms AMD).
+/// And it never loses at other resolutions: a tile larger than 32 px simply
+/// takes a second full lap, which is the same lane utilization a 64-wide group
+/// would have had.
+const LEAF_GROUP_DEF: &str = "#define LEAF_GROUP 32";
+
 /// Quadtree depth to the leaf frontier: smallest D with
 /// max(rw, rh) / 2^D <= LEAF_TILE (temporal.rs uses the same formula).
 pub fn depth_full(rw: u32, rh: u32) -> u32 {
@@ -187,9 +215,26 @@ pub fn depth_full(rw: u32, rh: u32) -> u32 {
 }
 
 const SMOKE_HLSL: &str = include_str!("shaders/smoke.hlsl");
+/// Order-2 SH irradiance, standalone (no cbuffer of its own — the coefficients
+/// are a parameter). pub(crate) because gpu/ffx_rr.rs prepends it to the FSR
+/// composite pass, which needs the SAME evaluator but binds its own 9 rows.
+pub(crate) const SH_HLSLI: &str = include_str!("shaders/sh.hlsli");
+/// The FSR plane wire encodings (octahedral normals + their 10-bit quantum).
+/// pub(crate) for the same reason: feed.hlsl writes those planes and
+/// fsr_composite.hlsl reads them back, and the composite identity is exactly
+/// the claim that the two agree — so they share one copy.
+pub(crate) const FSR_WIRE_HLSLI: &str = include_str!("shaders/fsr_wire.hlsli");
 // pub(crate): gpu/dxr.rs pastes the same prelude/shading/resolve sources
 // into its DXR library (the kernels are single-sourced on disk).
-pub(crate) const TRACE_COMMON_HLSLI: &str = include_str!("shaders/trace_common.hlsli");
+//
+// sh.hlsli leads: trace_common's `sh_irradiance` is just the frame's cbuffer
+// bound to it. Folding it in here rather than at each of the dozen concat sites
+// keeps the prelude one name.
+pub(crate) const TRACE_COMMON_HLSLI: &str = concat!(
+    include_str!("shaders/sh.hlsli"),
+    "\n",
+    include_str!("shaders/trace_common.hlsli")
+);
 const CTR_HLSLI: &str = include_str!("shaders/ctr.hlsli");
 const QUEUES_HLSLI: &str = include_str!("shaders/queues.hlsli");
 const FRUSTUM_HLSLI: &str = include_str!("shaders/frustum.hlsli");
@@ -566,7 +611,15 @@ impl HeadlessGpu {
     pub fn run<F: FnOnce(&ID3D12GraphicsCommandList)>(&mut self, f: F) -> Result<()> {
         unsafe { self.alloc.Reset() }.map_err(|e| format!("alloc Reset: {e}"))?;
         unsafe { self.list.Reset(&self.alloc, None) }.map_err(|e| format!("list Reset: {e}"))?;
+        // --gpu-timing: every run() blocks on the fence below, so the previous
+        // run's timestamps are complete by the time we get here — the same
+        // wait-then-collect the frame ring gives `D3d::begin_frame`, with one
+        // slot instead of FRAMES_IN_FLIGHT. Without this the headless suites
+        // (the deterministic workloads, and the only place a per-pass number
+        // means anything) would record no timings at all.
+        super::gputime::begin_frame(&self.device, &self.queue, 0);
         f(&self.list);
+        super::gputime::resolve(&self.list, 0);
         unsafe { self.list.Close() }.map_err(|e| format!("list Close: {e}"))?;
         let lists = [Some(self.list.cast::<ID3D12CommandList>().unwrap())];
         unsafe { self.queue.ExecuteCommandLists(&lists) };
@@ -578,6 +631,10 @@ impl HeadlessGpu {
                 .map_err(|e| format!("SetEventOnCompletion: {e}"))?;
             unsafe { WaitForSingleObject(self.event, INFINITE) };
         }
+        // Surface whatever the debug layer found (no-op unless --gpu-debug). The
+        // `--check-gpu` suites record most of the renderer's command lists, so
+        // this is where a state or barrier error gets caught cheaply.
+        d3d12::drain_debug(&self.device);
         Ok(())
     }
 
@@ -1608,11 +1665,13 @@ pub(crate) struct FrameCb {
     cam_forward: [f32; 4],
     cam_right: [f32; 4],
     cam_up: [f32; 4],
-    sun: [f32; 4],
-    light_center: [f32; 4],
-    light_u: [f32; 4],
-    light_v: [f32; 4],
-    light_color: [f32; 4],
+    /// The sun (sky::Sun). Replaces the old five rows (sun + the rect light's
+    /// center/u/v/color): a disc at infinity needs a direction, a cone, and two
+    /// radiometric values. `scene.eps` / `ao_radius` used to ride in
+    /// `light_center.w` / `light_u.w`; they are rehomed onto these rows' w slots.
+    sun: [f32; 4],   // xyz = unit dir; w = cos(angular radius)
+    sun_e: [f32; 4], // xyz = irradiance/π (the direct loop's multiplier); w = scene eps
+    sun_l: [f32; 4], // xyz = DISC radiance (what an escaping ray sees); w = ao_radius
     rw: u32,
     rh: u32,
     frame: u32,
@@ -1653,12 +1712,21 @@ pub(crate) struct FrameCb {
     /// Sample offsets from `dlss::jitter_for_sample` (the ONE Halton source —
     /// no radical-inverse port in HLSL), two per 16-byte row.
     jitters: [[f32; 4]; (crate::dlss::MAX_SPP as usize) / 2],
+    /// The sky dome in order-2 SH (`scene.sky_sh`, `sh::N` = 9 RGB rows, .w
+    /// unused) — the GPU's copy of the analytic ambient the CPU reads through
+    /// `Sh9::irradiance`. Appended LAST so every offset above is unmoved.
+    sky_sh: [[f32; 4]; crate::sh::N],
 }
 // The HLSL cbuffer is hand-mirrored across 7 concatenated compile units —
 // a size drift here corrupts every field after the drift point.
-const _: () = assert!(std::mem::size_of::<FrameCb>() == 320 + 8 * crate::dlss::MAX_SPP as usize);
+// 304 (the pre-sun size) − 32 (two rect-light rows dropped) + 16 (the spp
+// block) + 8·MAX_SPP (the jitter table) + 16·9 (the SH sky).
+const _: () = assert!(
+    std::mem::size_of::<FrameCb>()
+        == 320 - 32 + 8 * crate::dlss::MAX_SPP as usize + 16 * crate::sh::N
+);
 // ...and the whole thing must still fit a CB ring slot.
-const _: () = assert!(std::mem::size_of::<FrameCb>() <= CB_STRIDE as usize);
+const _: () = assert!(std::mem::size_of::<FrameCb>() <= CB_STRIDE);
 
 impl FrameCb {
     /// The scene-static base: sun/light/eps/ao_radius, near/far riding the
@@ -1668,16 +1736,19 @@ impl FrameCb {
         let sun = crate::render::sun_dir(scene);
         let (near, far) = crate::dlss::near_far(scene.diag);
         let v4 = |v: Vec3A, w: f32| [v.x, v.y, v.z, w];
+        let mut sky_sh = [[0.0f32; 4]; crate::sh::N];
+        for (dst, c) in sky_sh.iter_mut().zip(scene.sky_sh.c.iter()) {
+            *dst = [c.x, c.y, c.z, 0.0];
+        }
         FrameCb {
+            sky_sh,
             cam_origin: [0.0; 4],
             cam_forward: [0.0; 4],
             cam_right: [0.0; 4],
             cam_up: [0.0; 4],
-            sun: v4(sun, 0.0),
-            light_center: v4(scene.light.center, scene.eps),
-            light_u: v4(scene.light.u, scene.ao_radius),
-            light_v: v4(scene.light.v, 0.0),
-            light_color: v4(scene.light.color, 0.0),
+            sun: v4(sun, scene.sun.cos_radius),
+            sun_e: v4(scene.sun.e_over_pi, scene.eps),
+            sun_l: v4(scene.sun.radiance, scene.ao_radius),
             rw,
             rh,
             frame: 0,
@@ -1876,6 +1947,10 @@ pub struct TraceGpu {
     pso_level: ID3D12PipelineState,
     pso_sky: ID3D12PipelineState,
     pso_leaf: ID3D12PipelineState,
+    /// The same kernel with the hemi arm compiled IN — used only by fb frames
+    /// (H). See leaf.hlsl's LEAF_NO_FB note: keeping the two apart is what
+    /// keeps the common path's VGPR count (and so RDNA's occupancy) low.
+    pso_leaf_fb: ID3D12PipelineState,
     pso_clear_h: ID3D12PipelineState,
     pso_prep_batch: ID3D12PipelineState,
     pso_seed_probes: ID3D12PipelineState,
@@ -1991,17 +2066,29 @@ impl TraceGpu {
             WAVEFRONT_HLSL,
         ]
         .join("\n");
-        let leaf_src = [
-            defs,
-            sd,
-            TRACE_COMMON_HLSLI,
-            CTR_HLSLI,
-            QUEUES_HLSLI,
-            RT_HLSLI,
-            SHADE_HLSLI,
-            LEAF_HLSL,
-        ]
-        .join("\n");
+        // Two leaf kernels from the one source. `fb_mode` is a cbuffer value,
+        // so leaving the hemi arm as a runtime branch inlines shade_split at
+        // both call sites and the kernel's register allocation is the MAX of
+        // the two — which on RDNA costs occupancy (and therefore latency
+        // hiding) in every fb-OFF frame, i.e. essentially all of them.
+        // `LEAF_NO_FB` compiles that arm out; record_wavefront picks per frame.
+        let leaf_of = |extra: &str| {
+            [
+                LEAF_GROUP_DEF,
+                extra,
+                defs,
+                sd,
+                TRACE_COMMON_HLSLI,
+                CTR_HLSLI,
+                QUEUES_HLSLI,
+                RT_HLSLI,
+                SHADE_HLSLI,
+                LEAF_HLSL,
+            ]
+            .join("\n")
+        };
+        let leaf_src = leaf_of("#define LEAF_NO_FB 1");
+        let leaf_fb_src = leaf_of("");
         // Hemi kernels stay on the BINARY tree deliberately (no ft_defs):
         // hemi bound queries terminate in ~10 visits, where a wide pop's
         // unconditional 8 slot tests lose to the binary pop's 1 — measured
@@ -2030,7 +2117,7 @@ impl TraceGpu {
         ]
         .join("\n");
         let compose_src = [sd, TRACE_COMMON_HLSLI, CTR_HLSLI, QUEUES_HLSLI, COMPOSE_HLSL].join("\n");
-        let feed_src = [sd, TRACE_COMMON_HLSLI, FEED_HLSL].join("\n");
+        let feed_src = [sd, TRACE_COMMON_HLSLI, FSR_WIRE_HLSLI, FEED_HLSL].join("\n");
         let pso = |src: &str, entry: &str, what: &str| -> Result<ID3D12PipelineState> {
             compute_pso(device, &root_sig, &dxc.compile(src, entry, "cs_6_5", what, debug)?, what)
         };
@@ -2042,6 +2129,7 @@ impl TraceGpu {
         let pso_level = pso(&wavefront_src, "cs_level", "level")?;
         let pso_sky = pso(&wavefront_src, "cs_sky", "sky")?;
         let pso_leaf = pso(&leaf_src, "cs_leaf", "leaf")?;
+        let pso_leaf_fb = pso(&leaf_fb_src, "cs_leaf", "leaf-fb")?;
         let pso_clear_h = pso(&wavefront_src, "cs_clear_h", "clear_h")?;
         let pso_prep_batch = pso(&wavefront_src, "cs_prep_batch", "prep_batch")?;
         let pso_seed_probes = pso(&wavefront_src, "cs_seed_probes", "seed_probes")?;
@@ -2271,6 +2359,7 @@ impl TraceGpu {
             pso_level,
             pso_sky,
             pso_leaf,
+            pso_leaf_fb,
             pso_clear_h,
             pso_prep_batch,
             pso_seed_probes,
@@ -2568,7 +2657,11 @@ impl TraceGpu {
                 self.push(list, [CTR_SKY, NO_RESET, 1, ARG_SKY]);
                 list.Dispatch(1, 1, 1);
                 self.args_to_indirect(list);
-                list.SetPipelineState(&self.pso_leaf);
+                // fb frames need the hemi arm; every other frame takes the
+                // slim kernel (leaf.hlsl's LEAF_NO_FB).
+                let leaf_pso =
+                    if fb_mode > 0 { &self.pso_leaf_fb } else { &self.pso_leaf };
+                list.SetPipelineState(leaf_pso);
                 self.push(list, [CTR_LEAF, 0, 0, 0]);
                 list.ExecuteIndirect(&self.cmd_sig, 1, &self.args, ARG_LEAF as u64 * 12, None, 0);
                 list.SetPipelineState(&self.pso_sky);

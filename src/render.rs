@@ -1202,6 +1202,18 @@ fn write_fsr(
         Some(prev) => (p - prev.origin).dot(prev.forward()),
         None => t * dir.dot(ctx.cam.forward()),
     };
+    // The AO signal's remodulation factor: the sky's SH irradiance at the WIRE
+    // normal, not at `prim.n` itself. The composite pass rebuilds this from the
+    // octahedral normals plane and has no other source for it, so the
+    // subtraction here has to be made against the same quantized normal or the
+    // composite identity picks up a quantization-sized hole (fsr::wire_normal).
+    //
+    // `q16v` first: on THIS (CPU-fed) path the plane is oct-encoded from the f16
+    // G-buffer normal (ffx_rr::record_upload's ld16), so the f16 hop is part of
+    // the wire here. The GPU feed encodes straight from the pack's f32 normal
+    // and has no such hop — each path is self-consistent with its own plane,
+    // which is all the identity requires.
+    let amb = ctx.scene.sky_sh.irradiance(crate::fsr::wire_normal(crate::fsr::q16v(prim.n)));
     let sig = crate::fsr::split_signals(
         c,
         prim.direct_d,
@@ -1210,6 +1222,7 @@ fn write_fsr(
         prim.ind_s,
         prim.albedo * (1.0 - prim.metallic),
         Vec3A::splat(0.04).lerp(prim.albedo, prim.metallic),
+        amb,
     );
     f.write(x, y, &sig, prev_z);
 }
@@ -1242,7 +1255,7 @@ fn write_gbuf_sky(ctx: &FrameCtx, x: usize, y: usize, fx: f32, fy: f32, dir: Vec
     );
     // `c` is this pixel's presented color, which for a sky pixel IS the sky
     // radiance (bit-identically at spp == 1 — the caller passes what
-    // `shade::sky` returned for this same dir). Passing it rather than
+    // `sky::radiance` returned for this same dir). Passing it rather than
     // recomputing is what lets the --spp average reach the residual.
     write_fsr(ctx, x, y, dir, f32::INFINITY, &shade::PrimarySurface::default(), c);
 }
@@ -1420,7 +1433,9 @@ fn shade_traced(
             if primary {
                 ctx.store_meta(x, y, f32::INFINITY, depth, kind);
             }
-            let c = shade::sky(tr.dir, ctx.sun);
+            // A DISPLAY path: the camera is looking at the sky, so it sees the
+            // sun disc. Nothing else delivers it here — this is the backdrop.
+            let c = crate::sky::radiance(tr.dir, &ctx.scene.sun, ctx.cam.pixel_cone() * 0.5);
             if do_splat {
                 ctx.splat(x, y, c);
             }
@@ -1608,7 +1623,9 @@ fn fill_sky_rows(ctx: &FrameCtx, x0: usize, y0: usize, x1: usize, y1: usize, dep
         for x in x0..x1 {
             let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
             let dir = ctx.cam.ray_dir(fx, fy);
-            let c = shade::sky(dir, ctx.sun);
+            // A DISPLAY path — the camera looking at the sky — so it sees the
+            // sun DISC, antialiased against the pixel's own cone (sky.rs).
+            let c = crate::sky::radiance(dir, &ctx.scene.sun, ctx.cam.pixel_cone() * 0.5);
             ctx.store_meta(x, y, f32::INFINITY, depth, KIND_SKY);
             ctx.splat(x, y, c);
             // A proven-empty tile shades one center direction, spp or not —
@@ -1679,6 +1696,28 @@ pub fn resolve(
 ) {
     crate::zone!("resolve");
     let inv = 1.0 / samples.max(1) as f32;
+
+    // Glare needs the whole HDR image (it is a convolution), so the bloom path
+    // materializes it — into bloom's own cached buffer, so a presented frame
+    // still allocates nothing. The `--no-bloom` path keeps the original
+    // per-pixel loop verbatim, which is what makes that flag bit-identical to
+    // the pre-bloom renderer by construction.
+    if crate::bloom::enabled() {
+        crate::bloom::with_glare_filled(
+            rw,
+            rh,
+            |hdr| {
+                hdr.par_chunks_mut(3).enumerate().for_each(|(p, px)| {
+                    for (k, o) in px.iter_mut().enumerate() {
+                        *o = f32::from_bits(accum[p * 3 + k].load(Relaxed)) * inv;
+                    }
+                });
+            },
+            |hdr| tonemap_to(hdr, info, overlay_on, present, rw, rh, ww, wh),
+        );
+        return;
+    }
+
     present.par_chunks_mut(ww).enumerate().for_each(|(wy, row)| {
         let sy = (wy * rh / wh).min(rh - 1);
         for (wx, out) in row.iter_mut().enumerate() {
@@ -1707,6 +1746,29 @@ pub fn resolve_hdr(
     wh: usize,
 ) {
     crate::zone!("resolve-hdr");
+    // The CPU denoisers' tonemap entry (OIDN / NPPD land here directly), and
+    // where their glare comes from. `resolve` does NOT funnel through this — it
+    // materializes its own HDR image and calls `tonemap_to` below with the glare
+    // already applied, so nothing can double-bloom.
+    crate::bloom::with_glare(hdr, rw, rh, |hdr| {
+        tonemap_to(hdr, info, overlay_on, present, rw, rh, ww, wh)
+    });
+}
+
+/// Tonemap + overlay + upscale an HDR image into the present buffer. The one
+/// CPU present loop, shared by `resolve` and `resolve_hdr`; glare is the
+/// caller's business, so this can never apply it twice.
+#[allow(clippy::too_many_arguments)]
+fn tonemap_to(
+    hdr: &[f32],
+    info: &[AtomicU32],
+    overlay_on: bool,
+    present: &mut [u32],
+    rw: usize,
+    rh: usize,
+    ww: usize,
+    wh: usize,
+) {
     present.par_chunks_mut(ww).enumerate().for_each(|(wy, row)| {
         let sy = (wy * rh / wh).min(rh - 1);
         for (wx, out) in row.iter_mut().enumerate() {
@@ -1734,6 +1796,27 @@ pub fn resolve_scrgb(
 ) {
     crate::zone!("resolve-scrgb");
     let inv = 1.0 / samples.max(1) as f32;
+    // Glare is a DISPLAY-stage pass on whatever the tonemap is about to read, so
+    // it applies to the scRGB encode exactly as it does to the SDR one — the
+    // swapchain format is not a reason to have or not have bloom. (It matters
+    // more here, if anything: scRGB is the default, so a miss would silently
+    // delete glare from every CPU-presented frame.) Same structure as `resolve`.
+    if crate::bloom::enabled() {
+        crate::bloom::with_glare_filled(
+            rw,
+            rh,
+            |hdr| {
+                hdr.par_chunks_mut(3).enumerate().for_each(|(px, o)| {
+                    for (k, v) in o.iter_mut().enumerate() {
+                        *v = f32::from_bits(accum[px * 3 + k].load(Relaxed)) * inv;
+                    }
+                });
+            },
+            |hdr| tonemap_to_scrgb(hdr, info, overlay_on, p, present, rw, rh, ww, wh),
+        );
+        return;
+    }
+
     present.par_chunks_mut(ww).enumerate().for_each(|(wy, row)| {
         let sy = (wy * rh / wh).min(rh - 1);
         for (wx, out) in row.iter_mut().enumerate() {
@@ -1763,6 +1846,27 @@ pub fn resolve_hdr_scrgb(
     wh: usize,
 ) {
     crate::zone!("resolve-hdr-scrgb");
+    // The scRGB twin of `resolve_hdr`: the CPU denoisers' glare comes from here.
+    crate::bloom::with_glare(hdr, rw, rh, |hdr| {
+        tonemap_to_scrgb(hdr, info, overlay_on, p, present, rw, rh, ww, wh)
+    });
+}
+
+/// `tonemap_to` for the scRGB f16 swapchain — the one scRGB present loop,
+/// shared by `resolve_scrgb` and `resolve_hdr_scrgb`. Glare is the caller's
+/// business, so this can never apply it twice.
+#[allow(clippy::too_many_arguments)]
+fn tonemap_to_scrgb(
+    hdr: &[f32],
+    info: &[AtomicU32],
+    overlay_on: bool,
+    p: tone::ToneParams,
+    present: &mut [[f16; 4]],
+    rw: usize,
+    rh: usize,
+    ww: usize,
+    wh: usize,
+) {
     present.par_chunks_mut(ww).enumerate().for_each(|(wy, row)| {
         let sy = (wy * rh / wh).min(rh - 1);
         for (wx, out) in row.iter_mut().enumerate() {
@@ -2041,6 +2145,10 @@ pub fn verify_sampled(
         )
 }
 
+/// The sun's direction. Used to be `light.center.normalize()` — the direction of
+/// a rect lamp 12 units away, which is why the sky's glow and the actual light
+/// were two different objects that merely pointed the same way. Now it is just
+/// the sun's own direction; there is one sun.
 pub fn sun_dir(scene: &Scene) -> Vec3A {
-    scene.light.center.normalize_or_zero()
+    scene.sun.dir
 }

@@ -15,8 +15,9 @@
 //!   `alpha_masked` is cleared post-decode (JPG-conversion junk alpha would
 //!   otherwise punch cutout holes in walls).
 //!
-//! Ignored (warned where it matters): KHR_lights_punctual (the engine's
-//! AreaLight + sky IS the lighting model), KHR_texture_transform, authored
+//! Ignored (warned where it matters): KHR_lights_punctual (the engine's ONE
+//! sky — a scattering dome plus a sun disc at infinity — IS the lighting
+//! model; see src/sky.rs), KHR_texture_transform, authored
 //! TANGENTs (one tangent source: shade.rs's on-the-fly derivation),
 //! COLOR_0, occlusionTexture (the engine computes its own AO), TEXCOORD_1+,
 //! non-TRIANGLES primitive modes. KHR_materials_ior is logged (GLASS_IOR is
@@ -26,7 +27,7 @@
 //! per-material threshold), so non-default cutoffs are counted in the
 //! summary line instead.
 
-use crate::scene::{AreaLight, MatKind, Material, Scene, SceneBuilder, NO_TEX};
+use crate::scene::{MatKind, Material, Scene, SceneBuilder, NO_TEX};
 use crate::texture::Texture;
 use glam::{Mat3A, Mat4, Vec2, Vec3A};
 use std::collections::HashMap;
@@ -455,7 +456,12 @@ fn build_scene(
             .unwrap_or(default_mat);
         b.add_mesh(pr.positions, pr.normals, pr.texcoords, &pr.indices, mat);
     }
-    let scene = b.finish(default_light_gltf());
+    // The engine's lighting model is the ONE sky (src/sky.rs); KHR_lights_punctual
+    // is deliberately ignored, exactly as MTL lights are. Shared with the OBJ and
+    // procedural loaders rather than re-spelled: the sun is now a single Vec3A, so
+    // a second copy would just be a direction that could silently drift out of
+    // step with theirs.
+    let scene = b.finish(crate::scene::default_sun());
     if verbose {
         eprintln!(
             "gltf: {} prims | {} tris | {} materials | {} textures | skipped: {} non-tri prims{}{}{}{}{}{}",
@@ -481,17 +487,6 @@ fn build_scene(
         );
     }
     scene
-}
-
-fn default_light_gltf() -> AreaLight {
-    // The engine's lighting model — KHR_lights_punctual is deliberately
-    // ignored (same as MTL lights); this is load_obj_scene's default light.
-    AreaLight {
-        center: Vec3A::new(6.0, 10.0, 4.0),
-        u: Vec3A::new(2.0, 0.0, 0.0),
-        v: Vec3A::new(0.0, 0.0, 2.0),
-        color: Vec3A::new(1.0, 0.95, 0.85) * 150.0,
-    }
 }
 
 /// Minimal RFC-4648 base64 decoder for data: URIs (avoids a dependency; the

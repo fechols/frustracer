@@ -115,6 +115,49 @@ pub struct D3d {
     present_flags: DXGI_PRESENT,
 }
 
+/// Drain the D3D12 debug layer's message queue to stderr.
+///
+/// The layer writes to `OutputDebugString`, NOT to stdout/stderr — so with a
+/// debugger unattached, `--gpu-debug` armed the validation and then threw every
+/// finding away. That is not a theoretical gap: a compute shader reading a
+/// resource left in PIXEL_SHADER_RESOURCE (the wrong state — compute needs
+/// NON_PIXEL) is a debug-layer ERROR that drivers wave through, so it presented
+/// perfectly and shipped, twice, because nobody was listening. Call this after
+/// every submit under `--gpu-debug` and the layer earns its keep.
+///
+/// A no-op without the layer (the InfoQueue only exists when it is on).
+pub fn drain_debug(device: &ID3D12Device) {
+    let Ok(q) = device.cast::<ID3D12InfoQueue>() else {
+        return;
+    };
+    let n = unsafe { q.GetNumStoredMessages() };
+    for i in 0..n {
+        let mut len = 0usize;
+        if unsafe { q.GetMessage(i, None, &mut len) }.is_err() || len == 0 {
+            continue;
+        }
+        let mut buf = vec![0u8; len];
+        let msg = buf.as_mut_ptr() as *mut D3D12_MESSAGE;
+        if unsafe { q.GetMessage(i, Some(msg), &mut len) }.is_err() {
+            continue;
+        }
+        let m = unsafe { &*msg };
+        let sev = match m.Severity {
+            D3D12_MESSAGE_SEVERITY_CORRUPTION => "CORRUPTION",
+            D3D12_MESSAGE_SEVERITY_ERROR => "ERROR",
+            D3D12_MESSAGE_SEVERITY_WARNING => "WARNING",
+            _ => continue, // INFO/MESSAGE: pure noise, and voluminous.
+        };
+        let text = unsafe {
+            std::slice::from_raw_parts(m.pDescription as *const u8, m.DescriptionByteLength)
+        };
+        eprintln!("d3d12 {sev}: {}", String::from_utf8_lossy(text).trim_end_matches('\0'));
+    }
+    if n > 0 {
+        unsafe { q.ClearStoredMessages() };
+    }
+}
+
 /// Create the native D3D12 device on the picked adapter (debug layer first —
 /// it must be enabled before device creation).
 pub fn create_device(adapter: &IDXGIAdapter4, debug: bool) -> Result<ID3D12Device> {
@@ -123,7 +166,30 @@ pub fn create_device(adapter: &IDXGIAdapter4, debug: bool) -> Result<ID3D12Devic
         if unsafe { D3D12GetDebugInterface(&mut dbg) }.is_ok() {
             if let Some(d) = dbg {
                 unsafe { d.EnableDebugLayer() };
-                eprintln!("gpu: D3D12 debug layer enabled");
+                // GPU-BASED VALIDATION, not just the basic layer. The basic layer
+                // checks barrier bookkeeping (before-state must match) but does
+                // NOT check the state a resource is actually IN when a shader
+                // reads it through a descriptor table — that is a GBV-only check,
+                // and it is precisely the class of bug that shipped here (a
+                // compute shader sampling a texture left in PIXEL_SHADER_RESOURCE
+                // instead of NON_PIXEL_SHADER_RESOURCE). Without GBV, --gpu-debug
+                // was quietly blind to the thing it most needed to see.
+                //
+                // GBV is SLOW (patched shaders, per-dispatch checks). That is fine:
+                // this is an opt-in correctness flag, not a benchmark path.
+                match d.cast::<ID3D12Debug1>() {
+                    Ok(d1) => {
+                        unsafe { d1.SetEnableGPUBasedValidation(true) };
+                        eprintln!(
+                            "gpu: D3D12 debug layer + GPU-based validation enabled \
+                             (messages drain to stderr; expect it to be slow)"
+                        );
+                    }
+                    Err(_) => eprintln!(
+                        "gpu: D3D12 debug layer enabled, but GPU-based validation is \
+                         unavailable (no ID3D12Debug1) — resource-state-at-use is NOT checked"
+                    ),
+                }
             }
         }
     }
@@ -382,11 +448,16 @@ impl D3d {
             .map_err(|e| format!("allocator Reset: {e}"))?;
         unsafe { self.list.Reset(&self.slots[slot].allocator, None) }
             .map_err(|e| format!("list Reset: {e}"))?;
+        // The fence wait above is what makes this slot's timestamps safe to
+        // map: --gpu-timing reports frame N at the top of frame N+2, never
+        // stalling the pipeline to do it.
+        super::gputime::begin_frame(&self.device, &self.queue, slot);
         Ok(slot)
     }
 
     /// Close, execute, present, signal. Call after recording the frame.
     pub fn end_frame(&mut self, slot: usize) -> Result<()> {
+        super::gputime::resolve(&self.list, slot);
         unsafe { self.list.Close() }.map_err(|e| format!("list Close: {e}"))?;
         let lists = [Some(self.list.cast::<ID3D12CommandList>().unwrap())];
         unsafe { self.queue.ExecuteCommandLists(&lists) };
@@ -398,6 +469,9 @@ impl D3d {
         unsafe { self.queue.Signal(&self.fence, v) }.map_err(|e| format!("queue Signal: {e}"))?;
         self.slots[slot].fence_value = v;
         self.frame_index += 1;
+        // Report whatever the layer found in this frame's recording (a no-op
+        // when it isn't on). Validation errors are useless unheard.
+        drain_debug(&self.device);
         Ok(())
     }
 
@@ -408,6 +482,7 @@ impl D3d {
     /// and the caller's Map of a readback buffer is safe on return.
     pub fn submit_and_wait(&mut self, slot: usize) -> Result<()> {
         crate::zone!("gpu-wait");
+        super::gputime::resolve(&self.list, slot);
         unsafe { self.list.Close() }.map_err(|e| format!("list Close: {e}"))?;
         let lists = [Some(self.list.cast::<ID3D12CommandList>().unwrap())];
         unsafe { self.queue.ExecuteCommandLists(&lists) };

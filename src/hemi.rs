@@ -772,7 +772,11 @@ fn leaf_rays(
                 }
             }
             let l = match hit {
-                None => shade::sky(d, g.sun),
+                // The DOME, not the full sky. A GI leaf ray landing in the sun
+                // disc would (a) double-count light `direct_d` already delivers
+                // with its own shadow ray, and (b) push ~1e3 radiance into the
+                // 2^18 fixed-point hemi accumulator, which would saturate.
+                None => crate::sky::dome(d, g.sun),
                 Some(h) => shade::shade(
                     cx.scene,
                     cx.accel.bvh,
@@ -802,7 +806,24 @@ fn leaf_rays(
 
 /// tmin soundness gate: a tmin=0 reference ray must not hit strictly inside
 /// the claimed-empty ball.
+///
+/// Only for a sample the integrand actually uses. Arvo sampling of a
+/// horizon-adjacent cell can land fp-epsilon BELOW the tangent plane, where
+/// `weight = d·n max 0` is exactly 0 — the sample contributes nothing, and
+/// nothing was ever claimed about it: the hemi ROOT CUT *is* the tangent
+/// half-space, so the bound query proves emptiness over the open hemisphere
+/// and says nothing about directions outside it. Traced from tmin=0, such a
+/// direction grazes back down onto the apex's OWN surface (at -eps) at
+/// t = eps/|d·n|, an eps-offset artifact rather than occlusion — and at a
+/// grazing angle that t is large enough to land deep inside a perfectly
+/// sound ball (measured on Intel Arc: d·n = -4.31e-4 put the own ground
+/// plane at t = 39.36 inside a correct empty claim of 57.26). NVIDIA and AMD
+/// round the sample the other way and never trip it; that is luck, not
+/// soundness, so the guard — not the platform — is the invariant.
 fn verify_leaf_ray(cx: &Cx, ray: &Ray, tc: f32, v: &mut VerifyCounters, ls: &mut LocalStats) {
+    if ray.d.dot(cx.n) <= 0.0 {
+        return;
+    }
     if let Some(h) = cx.accel.bvh.intersect(cx.scene, ray, 0.0, f32::INFINITY, &mut ls.ray_nodes) {
         if h.t < tc * (1.0 - 1e-3) {
             v.tmin_overshoot += 1;
@@ -810,10 +831,18 @@ fn verify_leaf_ray(cx: &Cx, ray: &Ray, tc: f32, v: &mut VerifyCounters, ls: &mut
     }
 }
 
-/// Analytic sky over a proven-empty cell: centroid radiance × exact PSA,
-/// with pure-math midpoint refinement near the sun-glow lobe (`dot^32`,
-/// significant out to ~21°) — an empty parent proves all children empty, so
-/// refinement costs sky() evaluations only, no BVH work.
+/// Analytic sky over a proven-empty cell: centroid radiance × exact PSA, with
+/// pure-math midpoint refinement where the dome varies fastest — an empty
+/// parent proves all children empty, so refinement costs `dome()` evaluations
+/// only, no BVH work.
+///
+/// This integrates the DOME, never `sky::radiance` — and that is a correctness
+/// requirement, not a preference. Centroid point-sampling a cell that is COARSER
+/// than the sun disc would either miss the disc entirely (the sun contributes
+/// nothing) or land on it and splat the whole cell at ~1e3 radiance. Classic
+/// aliasing: fireflies and energy loss, unfixable by adding `levels`. Excluding
+/// the disc removes the sharp feature outright — which is precisely why the
+/// frequency split is the right architecture and not merely a convenience.
 fn sky_cell(n: Vec3A, sun: Vec3A, a: Vec3A, b: Vec3A, c: Vec3A, levels: u32) -> Vec3A {
     let cen = sphcell::centroid(a, b, c);
     if levels > 0 {
@@ -821,15 +850,18 @@ fn sky_cell(n: Vec3A, sun: Vec3A, a: Vec3A, b: Vec3A, c: Vec3A, levels: u32) -> 
         let cos_r = cen.dot(a).min(cen.dot(b)).min(cen.dot(c)).clamp(-1.0, 1.0);
         // Refine while the cell is coarser than ~12° — the horizon→zenith
         // gradient is anti-correlated with the cosine weight, so a coarse
-        // centroid systematically over-brightens (measured +1.2% at octant
-        // granularity). Near the sun-glow lobe (cos 21.5° ≈ 0.93,
-        // angle(cen, sun) < radius + lobe) refine further, to ~6°.
+        // centroid systematically over-brightens.
         let coarse = cos_r < 0.978;
-        let near_glow = cos_r < 0.995 && {
+        // The dome's sharpest surviving feature is the MIE AUREOLE (the forward
+        // Henyey-Greenstein lobe at g = 0.76, which falls ~4x over 20° — a
+        // little softer than the `dot^32` glow this test used to chase). Refine
+        // to ~6° within a conservative 30° cone of the sun:
+        // cos(angle(cen, sun)) > cos(r + 30°), expanded.
+        let near_aureole = cos_r < 0.995 && {
             let sin_r = (1.0 - cos_r * cos_r).max(0.0).sqrt();
-            cen.dot(sun) > cos_r * 0.93 - sin_r * 0.368
+            cen.dot(sun) > cos_r * 0.866 - sin_r * 0.5
         };
-        if coarse || near_glow {
+        if coarse || near_aureole {
             let (mab, mbc, mca) = sphcell::midpoints(a, b, c);
             let mut sum = Vec3A::ZERO;
             for [ca, cb, cc] in [[a, mab, mca], [mab, b, mbc], [mca, mbc, c], [mab, mbc, mca]] {
@@ -838,7 +870,7 @@ fn sky_cell(n: Vec3A, sun: Vec3A, a: Vec3A, b: Vec3A, c: Vec3A, levels: u32) -> 
             return sum;
         }
     }
-    shade::sky(cen, sun) * sphcell::psa(a, b, c, n)
+    crate::sky::dome(cen, sun) * sphcell::psa(a, b, c, n)
 }
 
 /// Reference-ray re-validation of an empty-cell claim: directions strictly

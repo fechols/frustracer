@@ -150,7 +150,8 @@ impl DxrGpu {
         // Upscaler sessions: the same feed kernels the wavefront runs, at
         // this pipeline's cs_6_3 cap floor (feed.hlsl needs nothing newer).
         let (pso_feed_xess, pso_feed_rr, pso_feed_fsr_rr) = if gbuf_full {
-            let feed_src = [sd, trace::TRACE_COMMON_HLSLI, trace::FEED_HLSL].join("\n");
+            let feed_src =
+                [sd, trace::TRACE_COMMON_HLSLI, trace::FSR_WIRE_HLSLI, trace::FEED_HLSL].join("\n");
             let pso = |entry: &str, name: &str| -> Result<ID3D12PipelineState> {
                 trace::compute_pso(
                     device,

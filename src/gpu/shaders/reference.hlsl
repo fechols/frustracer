@@ -33,7 +33,8 @@ void cs_reference(uint3 id : SV_DispatchThreadID) {
             t = hit.t;
             if (prim) gbuf_write_hit(pi, sp.x, sp.y, dir, hit.t, ps);
         } else {
-            c = sky_color(dir);
+            // A DISPLAY path: the camera's own miss sees the sun DISC (sky.rs).
+            c = sky_radiance(dir, pixel_cone * 0.5);
             t = INF;
             if (prim) gbuf_write_sky(pi, sp.x, sp.y, dir);
         }
