@@ -34,10 +34,17 @@ struct HitInfo {
 // closest-hit continues the pixel's stream exactly where raygen's jitter
 // draws left it (the reference kernel's one-stream contract); color and the
 // primary t (INF = sky, the tbuf convention) ride out.
+//
+// --spp: raygen fires one of these per SAMPLE, so the sample's position (sp)
+// and whether it is the probe sample (prim — the one that owns tbuf/info/the
+// G-buffer pack) ride in too. chs_shade can no longer recompute the position
+// from frame_jitter alone, and it no longer fires exactly once per pixel.
 struct RayPayload {
     float3 color;
     float t;
     uint rng;
+    float2 sp;
+    uint prim;
 };
 
 struct ShadowPayload {

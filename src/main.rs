@@ -70,6 +70,18 @@ const MAX_SAMPLES: u32 = 1024;
 /// (render::sparse_fill). Cost roughly quadruples per level, so
 /// log4(budget/elapsed) reads "levels of headroom" directly.
 const RENDER_BUDGET: Duration = Duration::from_millis(15);
+/// U cycles samples per pixel by doubling, wrapping at dlss::MAX_SPP (128):
+/// 1 -> 2 -> 4 -> ... -> 128 -> 1. Powers of two because the interesting axis
+/// is variance, which halves per doubling (error ~ 1/√N).
+fn next_spp(cur: u32) -> u32 {
+    let n = cur.saturating_mul(2);
+    if n > dlss::MAX_SPP {
+        1
+    } else {
+        n
+    }
+}
+
 /// Controller gain on the log4 error.
 const DEPTH_GAIN: f32 = 0.6;
 /// Max upward step per frame — creep up (>= 3 frames per level)...
@@ -148,6 +160,13 @@ pub struct Opts {
     /// step-wise dynamic-resolution controller). CLI-only, no runtime
     /// toggle — T prints the locked note.
     pub lock_scale: Option<f32>,
+    /// Primary samples per pixel per frame (--spp, 1..=dlss::MAX_SPP; U cycles
+    /// it live). N jittered samples inside each pixel share the tile's
+    /// inherited t_start/cut (the quadtree cost amortizes over N× the rays)
+    /// and are averaged into ONE splat, so the upscalers/denoisers get a
+    /// ~1/N-variance frame at unchanged accum semantics. 1 = today's renderer,
+    /// bit-identically.
+    pub spp: u32,
     /// Master A/B lever (--no-temporal): disable ALL previous-frame quadtree
     /// reuse — no temporal cache produced or consumed, no claim ring, no cut
     /// store, no structure replay. Every frame proves its empty space from
@@ -335,6 +354,7 @@ fn main() {
         xess_autoexposure: false,
         adaptive: true,
         lock_scale: xess::lock_scale("quality"),
+        spp: 1,
         temporal: true,
         replay: true,
         adopt: true,
@@ -633,6 +653,16 @@ fn main() {
                     }
                 }
             }
+            "--spp" => {
+                opts.spp = args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .filter(|&n: &u32| n >= 1 && n <= dlss::MAX_SPP)
+                    .unwrap_or_else(|| {
+                        eprintln!("--spp needs an integer in 1..={}", dlss::MAX_SPP);
+                        std::process::exit(2);
+                    });
+            }
             "--oidn-no-clean-aux" => opts.oidn_clean_aux = false,
             "--gpu" => opts.gpu = true,
             "--check-gpu" => check_gpu = true,
@@ -781,6 +811,12 @@ fn main() {
                 eprintln!("                pre-mip bilinear (A/B lever; mips are on by default — implies --no-aniso)");
                 eprintln!("  --aniso N     max anisotropy for texture filtering, 1..=16 (default 16; 1 = off, i.e.");
                 eprintln!("                the isotropic ray-cone trilinear path verbatim). --no-aniso = --aniso 1");
+                eprintln!("  --spp <n>     primary samples per pixel per frame (1..=128, default 1; U doubles live).");
+                eprintln!("                The N jittered samples share the tile's inherited t_start/node cut, so");
+                eprintln!("                the quadtree's per-tile cost amortizes over N× the rays (--cpu/--gpu;");
+                eprintln!("                --dxr traces from the TLAS root, so there it is plain supersampling).");
+                eprintln!("                They average into ONE per-pixel value — a ~1/N-variance frame for the");
+                eprintln!("                upscaler/denoiser. Pinned to 1 on hemisphere-bounce (H) frames");
                 eprintln!("  --lock-res    DLSS/XeSS render res: quality|balanced|performance|ultra-performance|native,");
                 eprintln!("                a ratio in (0, 1], or dynamic (the step-wise DRS controller); default quality (2/3)");
                 eprintln!("  --xess-path   XeSS DLL directory (default: SDKs\\XeSS-SDK\\bin)");
@@ -1191,6 +1227,45 @@ fn run_check_dxr(
             fsr_buf: None,
             prev_cam: None,
             frame_jitter: None,
+            spp: 1,
+            primary_sample: 0,
+            adaptive: false,
+            hemi_share: false,
+            replay_rec: None,
+            cut_cur: None,
+            cut_prev: None,
+            discard_seeds: false,
+            defer_shade: false,
+        };
+        render::render_frame(&ctx, false);
+    };
+    // The same reference frame at (spp, probe_sample): reproduces ONE sample of
+    // a multi-sampled frame on the CPU, so the DXR spp gate below can compare
+    // per-sample rays. (1, 0) above is the historical single-sample frame.
+    let cpu_frame_spp = |frame: u32, spp: u32, probe: u32| {
+        let ctx = FrameCtx {
+            scene,
+            bvh,
+            cam: basis,
+            q,
+            frame,
+            jitter: frame > 0,
+            rw: gw,
+            rh: gh,
+            accum: &accum,
+            info: &info,
+            tbuf: &tbuf,
+            stats: &stats,
+            sun: render::sun_dir(scene),
+            tcache_cur: None,
+            tcache_prev: &[],
+            accumulate: true,
+            gbuf: None,
+            fsr_buf: None,
+            prev_cam: None,
+            frame_jitter: None,
+            spp,
+            primary_sample: probe,
             adaptive: false,
             hemi_share: false,
             replay_rec: None,
@@ -1216,6 +1291,8 @@ fn run_check_dxr(
                 prev_cam: None,
                 q,
                 verify: false,
+                spp: 1,
+                probe_sample: 0,
             },
         );
         let mut rec = Ok(());
@@ -1277,6 +1354,68 @@ fn run_check_dxr(
     if must_fire && (n_hit == 0 || n_sky == 0) {
         eprintln!("check-dxr: FAIL must-fire: the default view sees both geometry and sky");
         ok = false;
+    }
+
+    // T1b: multi-sampling (--spp). This pipeline has no tile claim to break
+    // (every ray starts at the TLAS root with TMin = 0), so the thing worth
+    // gating is that the two sides put sample k in the SAME place: the CPU
+    // takes its offset from dlss::jitter_for_sample, the GPU from the jitter
+    // table that function fills in the CB. A packing or index error there puts
+    // the GPU's ray somewhere else in the pixel and shows up here as t
+    // disagreement at silhouettes. Same thresholds as T1 (watertight hardware
+    // intersection ≠ möller-trumbore at edges — statistical, not exact).
+    {
+        const SPP_GATE: u32 = 4;
+        for probe in 0..SPP_GATE {
+            let p = gpu::trace::FrameParams {
+                cam: basis,
+                frame: 0,
+                accumulate: true,
+                jitter: false,
+                frame_jitter: None,
+                prev_cam: None,
+                q,
+                verify: false,
+                spp: SPP_GATE,
+                probe_sample: probe,
+            };
+            dg.write_cb(0, &p);
+            let mut rec = Ok(());
+            if hg.run(|l| rec = dg.record_frame(l, 0)).is_err() || rec.is_err() {
+                eprintln!("check-dxr: FAIL spp DispatchRays: {rec:?}");
+                return 1;
+            }
+            let gt4 = match read_f32(&mut hg, &dg.tbuf, px) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("check-dxr: FAIL spp tbuf readback: {e}");
+                    return 1;
+                }
+            };
+            cpu_frame_spp(0, SPP_GATE, probe);
+            let (mut cm, mut tv, mut mrel) = (0usize, 0usize, 0.0f32);
+            for i in 0..px {
+                let ct = f32::from_bits(tbuf[i].load(Relaxed));
+                match (ct.is_finite(), gt4[i].is_finite()) {
+                    (true, true) => {
+                        let rel = (ct - gt4[i]).abs() / ct.max(1e-6);
+                        mrel = mrel.max(rel);
+                        if rel > 1e-3 {
+                            tv += 1;
+                        }
+                    }
+                    (false, false) => {}
+                    _ => cm += 1,
+                }
+            }
+            eprintln!(
+                "check-dxr: spp={SPP_GATE} sample {probe} ({px} px): class-mismatch {cm} | rel-t > 1e-3: {tv} | max rel t err {mrel:.2e}"
+            );
+            if cm as f64 > px as f64 * 5e-4 || tv as f64 > px as f64 * 1e-4 {
+                eprintln!("check-dxr: FAIL spp sample {probe} disagrees with the CPU's same sample (jitter table?)");
+                ok = false;
+            }
+        }
     }
 
     // T2: 64-frame jittered accumulation both sides — converged radiance
@@ -1458,6 +1597,8 @@ fn run_check_dxr(
                 prev_cam: prev,
                 q: uq,
                 verify: false,
+                spp: 1,
+                probe_sample: 0,
             };
             dg2.write_cb(0, &p);
             let mut rec = Ok(());
@@ -1780,6 +1921,8 @@ fn run_check_dxr(
                     prev_cam: Some(basis_a),
                     q: uq,
                     verify: false,
+                    spp: 1,
+                    probe_sample: 0,
                 };
                 dg2.write_cb(0, &p);
                 let mut rec = Ok(());
@@ -2485,6 +2628,8 @@ fn run_check_gpu(
             fsr_buf: None,
             prev_cam: None,
             frame_jitter: None,
+            spp: 1,
+            primary_sample: 0,
             adaptive: false,
             hemi_share: false,
             replay_rec: None,
@@ -2508,6 +2653,8 @@ fn run_check_gpu(
             prev_cam: None,
             q,
             verify: false,
+            spp: 1,
+            probe_sample: 0,
         });
         hg.run(|l| tg.record_reference(l, 0))
     };
@@ -2700,6 +2847,8 @@ fn run_check_gpu(
         prev_cam: None,
         q,
         verify: false,
+        spp: 1,
+        probe_sample: 0,
     };
     tg.write_cb(0, &wf_params);
     if let Err(e) = hg.run(|l| tg.record_wavefront(l, 0, &wf_params, true)) {
@@ -2865,6 +3014,95 @@ fn run_check_gpu(
         }
     }
 
+    // --- Multi-sampling (--spp), GPU half ----------------------------------
+    // Same claim, same proof as the CPU --check: the extra samples ride the
+    // tile's inherited t_start, so each one gets the exact-zero visibility
+    // gates. `probe_sample` names the sample whose t lands in tbuf; sweeping
+    // it gates EVERY sample's ray, not just sample 0's. The reference kernel
+    // runs the same loop at the same spp/probe, so the same-seed image A/B
+    // stays live too (a divergence there means the sample loops disagree).
+    // Fixed spp, like the CPU gate — plain --check-gpu can never stop gating.
+    {
+        const SPP_GATE: u32 = 4;
+        // ...plus the top of the range: the LAST sample at spp = MAX_SPP, which
+        // is where the CB's jitter table ends. A table-bound or index-packing
+        // error there is invisible at spp=4.
+        let top = dlss::MAX_SPP;
+        let probes: Vec<(u32, u32)> =
+            (0..SPP_GATE).map(|k| (SPP_GATE, k)).chain([(top, top - 1)]).collect();
+        for (spp, probe) in probes {
+            let p = gpu::trace::FrameParams {
+                cam: basis,
+                frame: 0,
+                accumulate: true,
+                jitter: false,
+                frame_jitter: None,
+                prev_cam: None,
+                q,
+                verify: false,
+                spp,
+                probe_sample: probe,
+            };
+            tg.write_cb(0, &p);
+            if let Err(e) = hg.run(|l| tg.record_wavefront(l, 0, &p, true)) {
+                eprintln!("check-gpu: FAIL spp wavefront dispatch: {e}");
+                return 1;
+            }
+            let (wt4, wa4) =
+                match (read_f32(&mut hg, &tg.tbuf, px), read_f32(&mut hg, &tg.accum, px * 3)) {
+                    (Ok(a), Ok(b)) => (a, b),
+                    _ => {
+                        eprintln!("check-gpu: FAIL spp wavefront readback");
+                        return 1;
+                    }
+                };
+            tg.write_cb(0, &p);
+            if let Err(e) = hg.run(|l| tg.record_reference(l, 0)) {
+                eprintln!("check-gpu: FAIL spp reference dispatch: {e}");
+                return 1;
+            }
+            let (rt4, ra4) =
+                match (read_f32(&mut hg, &tg.tbuf, px), read_f32(&mut hg, &tg.accum, px * 3)) {
+                    (Ok(a), Ok(b)) => (a, b),
+                    _ => {
+                        eprintln!("check-gpu: FAIL spp reference readback");
+                        return 1;
+                    }
+                };
+            let (mut fs, mut ov, mut he) = (0usize, 0usize, 0usize);
+            for i in 0..px {
+                match (rt4[i].is_finite(), wt4[i].is_finite()) {
+                    (true, true) => {
+                        if (wt4[i] - rt4[i]) / rt4[i].max(1e-6) > 1e-4 {
+                            ov += 1;
+                        }
+                    }
+                    (true, false) => fs += 1,
+                    (false, true) => he += 1,
+                    (false, false) => {}
+                }
+            }
+            let (mut sum, mut mx) = (0.0f64, 0.0f32);
+            for i in 0..px * 3 {
+                let d = (wa4[i] - ra4[i]).abs();
+                sum += d as f64;
+                mx = mx.max(d);
+            }
+            let mean = sum / (px * 3) as f64;
+            eprintln!(
+                "check-gpu: spp={spp} sample {probe} ({px} px): false-sky {fs} | tmin-overshoot {ov} | hybrid-extra {he} | same-seed image mean |d| {mean:.2e} max {mx:.2e}"
+            );
+            if fs != 0 || ov != 0 || he != 0 {
+                eprintln!("check-gpu: FAIL spp visibility gates (a multi-sample ray broke the inherited-tmin claim)");
+                ok = false;
+            }
+            if mean > 1e-5 || mx > 1e-2 {
+                eprintln!("check-gpu: FAIL same-seed wavefront/reference images diverge at spp={spp}");
+                ok = false;
+            }
+        }
+    }
+
     // --- M5: the hemisphere AO/GI wavefront on a deterministic probe set ---
     // Probes are CPU-generated (center rays, surface_point) so both sides
     // integrate at the exact same (o, n). The exact-zero claim gates run on
@@ -2911,6 +3149,8 @@ fn run_check_gpu(
                 prev_cam: None,
                 q: hq,
                 verify: true,
+                spp: 1,
+                probe_sample: 0,
             });
             if let Err(e) = tg.run_hemi_probes(&mut hg, 0, &probes, fb.depth, s == 0) {
                 eprintln!("check-gpu: FAIL hemi {mode_name} probes: {e}");
@@ -3070,6 +3310,8 @@ fn run_check_gpu(
             prev_cam: None,
             q: hq,
             verify: false,
+            spp: 1,
+            probe_sample: 0,
         };
         tg.write_cb(0, &p);
         if let Err(e) = hg.run(|l| tg.record_wavefront(l, 0, &p, false)) {
@@ -3152,6 +3394,8 @@ fn run_check_gpu(
                 prev_cam: prev,
                 q: uq,
                 verify: false,
+                spp: 1,
+                probe_sample: 0,
             };
             ptg.write_cb(0, &p);
             hg.run(|l| ptg.record_wavefront(l, 0, &p, false))?;
@@ -3548,6 +3792,8 @@ fn run_check_gpu(
                     prev_cam: Some(basis_a),
                     q: uq,
                     verify: false,
+                    spp: 1,
+                    probe_sample: 0,
                 };
                 ptg.write_cb(0, &p);
                 if let Err(e) = hg.run(|l| ptg.record_wavefront(l, 0, &p, false)) {
@@ -3965,7 +4211,7 @@ fn run_check_gpu(
         }
     };
     let bbasis = cam0.basis(bw, bh);
-    let mut bench = |label: &str, hybrid: bool, fb: shade::FrustumBounce| {
+    let mut timed = |hybrid: bool, fb: shade::FrustumBounce, spp: u32| -> f64 {
         let bq = Quality { fb, ..q };
         let n = 60u32;
         // Warm once (PSO/cache effects), then time.
@@ -3979,6 +4225,8 @@ fn run_check_gpu(
                 prev_cam: None,
                 q: bq,
                 verify: false,
+                spp,
+                probe_sample: 0,
             };
             btg.write_cb(0, &p);
             let _ = hg.run(|l| btg.record_frame(l, 0, &p, hybrid));
@@ -3994,20 +4242,82 @@ fn run_check_gpu(
                 prev_cam: None,
                 q: bq,
                 verify: false,
+                spp,
+                probe_sample: 0,
             };
             btg.write_cb(0, &p);
             let _ = hg.run(|l| btg.record_frame(l, 0, &p, hybrid));
         }
-        let ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
-        eprintln!("check-gpu: bench {bw}x{bh} {label}: {ms:6.2} ms/frame");
+        t0.elapsed().as_secs_f64() * 1000.0 / n as f64
     };
     let fb_off = shade::FrustumBounce::OFF;
-    bench("gpu hybrid          ", true, fb_off);
-    bench("gpu plain reference ", false, fb_off);
+    let mut bench = |label: &str, hybrid: bool, fb: shade::FrustumBounce, spp: u32| -> f64 {
+        let ms = timed(hybrid, fb, spp);
+        eprintln!("check-gpu: bench {bw}x{bh} {label}: {ms:6.2} ms/frame");
+        ms
+    };
+    bench("gpu hybrid          ", true, fb_off, 1);
+    bench("gpu plain reference ", false, fb_off, 1);
     bench(
         "gpu hybrid + hemi-gi",
         true,
         shade::FrustumBounce { ao: false, gi: true, shadows: false, depth: 3 },
+        1,
+    );
+    // --spp on the GPU: the wavefront pays its quadtree ONCE per frame no
+    // matter the sample count, while the reference kernel pays per ray. The
+    // plain-reference row BEATS the hybrid row for primary visibility today
+    // (RT-core root traversal is cheap enough that our software frustum
+    // queries cost more than they save), so the number to watch is whether
+    // multi-sampling narrows that gap: the hybrid's fixed cost is diluted
+    // spp×, the reference's is not. Amortization = ms(N) / (N · ms(1)); 1.00
+    // means the extra samples paid full price.
+    //
+    // These rows are warm-clock noisy (a cold first row can "measure" a
+    // speedup that is physically impossible), so the configurations are
+    // INTERLEAVED and reduced by median — the temporal-bench lesson.
+    const SPP_SWEEP: [u32; 5] = [1, 2, 4, 8, 16];
+    const REPS: usize = 3;
+    let mut hs: Vec<Vec<f64>> = vec![Vec::new(); SPP_SWEEP.len()];
+    let mut ps: Vec<Vec<f64>> = vec![Vec::new(); SPP_SWEEP.len()];
+    for _ in 0..REPS {
+        for (i, &n) in SPP_SWEEP.iter().enumerate() {
+            hs[i].push(timed(true, fb_off, n));
+            ps[i].push(timed(false, fb_off, n));
+        }
+    }
+    let median = |v: &mut Vec<f64>| -> f64 {
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    };
+    let h: Vec<f64> = hs.iter_mut().map(median).collect();
+    let p: Vec<f64> = ps.iter_mut().map(median).collect();
+    for (i, &n) in SPP_SWEEP.iter().enumerate() {
+        eprintln!(
+            "check-gpu: bench {bw}x{bh} spp={n:<2}: hybrid {:5.2} ms (amort {:.2}×) | plain reference {:5.2} ms (amort {:.2}×) | hybrid/plain {:.2}×",
+            h[i],
+            h[i] / (n as f64 * h[0]),
+            p[i],
+            p[i] / (n as f64 * p[0]),
+            h[i] / p[i],
+        );
+    }
+    // ms(n) = F + m·n (see run_check's model): F is the once-per-frame
+    // quadtree, m one sample's rays+shading. amortization(n) has an asymptote
+    // m/(F+m) approached as 1/n — half the fixed cost gone by spp 2, 90% by
+    // spp 10 — so the dilution is spent by ~8-16 spp. hybrid/plain therefore
+    // settles at m_hybrid/m_plain: if THAT is > 1, no sample count ever makes
+    // the software quadtree beat RT-core root traversal for primary rays.
+    let (last, n_last) = (SPP_SWEEP.len() - 1, *SPP_SWEEP.last().unwrap() as f64);
+    let mh = (h[last] - h[0]) / (n_last - 1.0);
+    let mp = (p[last] - p[0]) / (n_last - 1.0);
+    eprintln!(
+        "check-gpu: spp cost model: hybrid = {:.2} ms fixed + {mh:.3} ms/sample (floor {:.2}×) | plain = {:.2} ms fixed + {mp:.3} ms/sample (floor {:.2}×) | hybrid/plain -> {:.2}× as spp -> inf",
+        (h[0] - mh).max(0.0),
+        mh / h[0],
+        (p[0] - mp).max(0.0),
+        mp / p[0],
+        mh / mp,
     );
     {
         // CPU hybrid at the same resolution/quality for scale.
@@ -4038,6 +4348,8 @@ fn run_check_gpu(
                 fsr_buf: None,
                 prev_cam: None,
                 frame_jitter: None,
+                spp: 1,
+                primary_sample: 0,
                 adaptive: false,
                 hemi_share: false,
                 replay_rec: None,
@@ -4393,6 +4705,8 @@ fn fsr_frame_check(
             fsr_buf: f,
             prev_cam: prev,
             frame_jitter: Some((0.0, 0.0)),
+            spp: 1,
+            primary_sample: 0,
             adaptive: false,
             hemi_share: false,
             replay_rec: None,
@@ -4637,6 +4951,8 @@ fn albedo_ab_check(
         fsr_buf: None,
         prev_cam: None,
         frame_jitter: Some((0.0, 0.0)),
+        spp: 1,
+        primary_sample: 0,
         adaptive: false,
         hemi_share: false,
         replay_rec: None,
@@ -4750,6 +5066,8 @@ fn mv_check_at(
                 fsr_buf: None,
                 prev_cam: prev,
                 frame_jitter: Some((0.0, 0.0)),
+                spp: 1,
+                primary_sample: 0,
                 adaptive: false,
                 hemi_share: false,
                 replay_rec: None,
@@ -5215,6 +5533,8 @@ fn run_check_xess(
                     fsr_buf: None,
                     prev_cam: None,
                     frame_jitter: Some(dlss::jitter_for(f)),
+                    spp: 1,
+                    primary_sample: 0,
                     adaptive,
                     hemi_share: false,
                     replay_rec: None,
@@ -5457,6 +5777,8 @@ fn run_check_nppd(
             fsr_buf: None,
             prev_cam: prev,
             frame_jitter: None,
+            spp: 1,
+            primary_sample: 0,
             adaptive: false,
             hemi_share: false, // inert: the NPPD contract pins fb OFF
             replay_rec: None,
@@ -5682,6 +6004,8 @@ fn run_check_oidn(
             fsr_buf: None,
             prev_cam: None,
             frame_jitter: None,
+            spp: 1,
+            primary_sample: 0,
             adaptive: false,
             hemi_share: false,
             replay_rec: None,
@@ -5832,6 +6156,8 @@ fn run_check_oidn(
             fsr_buf: None,
             prev_cam: None,
             frame_jitter: None,
+            spp: 1,
+            primary_sample: 0,
             adaptive: false,
             hemi_share: false,
             replay_rec: None,
@@ -6023,6 +6349,8 @@ fn run_check_oidn(
                 fsr_buf: None,
                 prev_cam: None,
                 frame_jitter: None,
+                spp: 1,
+                primary_sample: 0,
                 adaptive: false,
                 hemi_share: false,
                 replay_rec: None,
@@ -6469,6 +6797,10 @@ fn run_spin(
             fsr_buf: None,
             prev_cam: None,
             frame_jitter: Some(dlss::jitter_for(idx)),
+            // --spp rides the deterministic benchmark: `--spin path --spp 4`
+            // vs `--spin path` is the wall-clock amortization A/B.
+            spp: opts.spp,
+            primary_sample: 0,
             adaptive: false,
             hemi_share: false,
             replay_rec: if record { Some(&replay_cache) } else { None },
@@ -6700,6 +7032,200 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     if rep_c.coarse > 0 && smp_c == 0 {
         eprintln!("verify capped d=4: coarse pixels without point samples — sparse fill didn't fire");
         capped_ok = false;
+    }
+
+    // --- Multi-sampling (--spp) ---------------------------------------------
+    // The claim: an extra sample lands inside the same pixel, hence inside
+    // every ancestor tile frustum, so it may consume the tile's inherited
+    // t_start and node cut exactly like sample 0 (the leaf-tile argument).
+    // That is the inherited-tmin bug class, so it gets the same proof — the
+    // frame is rendered once per sample with `primary_sample` naming the
+    // sample whose t lands in tbuf, and verify re-traces THAT sample's ray
+    // from tmin=0. probe 0 is the historical pass; 1.. are the new rays.
+    // Fixed spp here (not --spp) so plain `--check` can never stop gating it.
+    const SPP_GATE: u32 = 4;
+    let mut spp_ok = true;
+    for probe in 0..SPP_GATE {
+        let r = render::verify_sampled(
+            scene, bvh, &cam, q, rw, rh, &stats, None, &[], None, SPP_GATE, probe,
+        );
+        eprintln!(
+            "verify spp={SPP_GATE} sample {probe} ({} px): false-sky {} | tmin-overshoot {} | hybrid-extra {} | max rel t err {:.2e}",
+            r.pixels, r.false_sky, r.overshoot, r.hybrid_extra, r.max_rel_err
+        );
+        spp_ok &= r.ok();
+    }
+    // The sample positions must be PAIRWISE DISTINCT across the whole --spp
+    // range: Halton is infinite, but `jitter_for` reduces its index mod
+    // JITTER_PHASE, so reusing it for the extra samples would silently alias
+    // sample 72 onto sample 0 (two rays supersampling the same point). Pure
+    // math, so it is gated on every scene.
+    {
+        let mut pts: Vec<(u32, u32)> = (0..dlss::MAX_SPP)
+            .map(|k| {
+                let (x, y) = dlss::jitter_for_sample(0, k);
+                (x.to_bits(), y.to_bits())
+            })
+            .collect();
+        pts.sort();
+        let n = pts.len();
+        pts.dedup();
+        eprintln!("spp jitter: {}/{} distinct sub-pixel positions over the full --spp range", pts.len(), n);
+        if pts.len() != n {
+            eprintln!("spp jitter: FAIL — sample positions alias (the Halton index must not wrap)");
+            spp_ok = false;
+        }
+    }
+    // The top of the range, where the GPU's constant-buffer jitter table ends:
+    // one verify pass at spp = MAX_SPP probing the LAST sample. Cheap
+    // insurance that the table bound, the index packing, and the no-wrap rule
+    // hold at the edge, not just at spp=4.
+    {
+        let top = dlss::MAX_SPP;
+        let r = render::verify_sampled(
+            scene,
+            bvh,
+            &cam,
+            q,
+            rw,
+            rh,
+            &stats,
+            None,
+            &[],
+            None,
+            top,
+            top - 1,
+        );
+        eprintln!(
+            "verify spp={top} sample {} ({} px): false-sky {} | tmin-overshoot {} | hybrid-extra {}",
+            top - 1,
+            r.pixels,
+            r.false_sky,
+            r.overshoot,
+            r.hybrid_extra
+        );
+        spp_ok &= r.ok();
+    }
+    // Accounting: the quadtree is a function of (scene, basis, res) — NOT of
+    // the sample count. So spp must multiply the RAYS and leave the frustum
+    // work bit-identical. That inequality IS the amortization claim (the
+    // per-tile query cost is paid once and spread over spp× the rays); if it
+    // ever stops holding, multi-sampling has started re-tracing the quadtree.
+    let spp_frame = |n: u32| -> (u64, u64, u64, u64) {
+        let accum: Vec<AtomicU32> = (0..rw * rh * 3).map(|_| AtomicU32::new(0)).collect();
+        let info: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
+        let tbuf: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
+        let s = Stats::default();
+        let ctx = FrameCtx {
+            scene,
+            bvh,
+            cam,
+            q,
+            frame: 0,
+            jitter: false,
+            rw,
+            rh,
+            accum: &accum,
+            info: &info,
+            tbuf: &tbuf,
+            stats: &s,
+            sun: render::sun_dir(scene),
+            tcache_cur: None,
+            tcache_prev: &[],
+            accumulate: true,
+            gbuf: None,
+            fsr_buf: None,
+            prev_cam: None,
+            frame_jitter: None,
+            spp: n,
+            primary_sample: 0,
+            adaptive: false,
+            hemi_share: false,
+            replay_rec: None,
+            cut_cur: None,
+            cut_prev: None,
+            discard_seeds: false,
+            defer_shade: false,
+        };
+        render::render_frame(&ctx, true);
+        (
+            s.primary_rays.load(Relaxed),
+            s.frustum_queries.load(Relaxed),
+            s.frustum_nodes.load(Relaxed),
+            s.tiles.load(Relaxed),
+        )
+    };
+    let (r1, fq1, fn1, ti1) = spp_frame(1);
+    let (r4, fq4, fn4, ti4) = spp_frame(SPP_GATE);
+    eprintln!(
+        "spp accounting: primary rays {r1} -> {r4} (×{:.2}, want ×{SPP_GATE}) | frustum queries {fq1} -> {fq4} | frustum nodes {fn1} -> {fn4} | tiles {ti1} -> {ti4}",
+        r4 as f64 / r1.max(1) as f64
+    );
+    if r4 != r1 * SPP_GATE as u64 {
+        eprintln!("spp accounting: FAIL — spp={SPP_GATE} must trace exactly {SPP_GATE}× the primary rays");
+        spp_ok = false;
+    }
+    if (fq4, fn4, ti4) != (fq1, fn1, ti1) {
+        eprintln!("spp accounting: FAIL — the quadtree must be bit-identical across spp (the amortization claim)");
+        spp_ok = false;
+    }
+    // The quality claim, gated: multi-sampling exists to hand the temporal
+    // upscaler a quieter frame, so a 4-spp frame pair must be measurably more
+    // temporally stable than a 1-spp pair (the FRUSTRACER_STAB metric: mean
+    // |Δ| between consecutive fresh jittered frames). Structural — it reads
+    // the default scene's noise level.
+    let spp_noise = |n: u32| -> f64 {
+        let info: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
+        let tbuf: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
+        let mut frames: Vec<Vec<f32>> = Vec::new();
+        for f in 0..2u32 {
+            let accum: Vec<AtomicU32> = (0..rw * rh * 3).map(|_| AtomicU32::new(0)).collect();
+            let ctx = FrameCtx {
+                scene,
+                bvh,
+                cam,
+                q,
+                frame: f,
+                jitter: false,
+                rw,
+                rh,
+                accum: &accum,
+                info: &info,
+                tbuf: &tbuf,
+                stats: &stats,
+                sun: render::sun_dir(scene),
+                tcache_cur: None,
+                tcache_prev: &[],
+                // The upscaler contract: every frame a fresh jittered frame.
+                accumulate: false,
+                gbuf: None,
+                fsr_buf: None,
+                prev_cam: None,
+                frame_jitter: Some(dlss::jitter_for(f)),
+                spp: n,
+                primary_sample: 0,
+                adaptive: false,
+                hemi_share: false,
+                replay_rec: None,
+                cut_cur: None,
+                cut_prev: None,
+                discard_seeds: false,
+                defer_shade: false,
+            };
+            render::render_frame(&ctx, true);
+            frames.push(accum.iter().map(|a| f32::from_bits(a.load(Relaxed))).collect());
+        }
+        let (a, b) = (&frames[0], &frames[1]);
+        a.iter().zip(b).map(|(x, y)| (x - y).abs() as f64).sum::<f64>() / a.len() as f64
+    };
+    let (n1, n4) = (spp_noise(1), spp_noise(SPP_GATE));
+    eprintln!(
+        "spp stability: inter-frame mean |Δ| {n1:.4} (spp 1) -> {n4:.4} (spp {SPP_GATE}) — {:.2}× quieter",
+        n1 / n4.max(1e-9)
+    );
+    if structural && !(n4 < n1) {
+        eprintln!("spp stability: FAIL — spp={SPP_GATE} must be measurably quieter than spp=1");
+        spp_ok = false;
     }
 
     // Hemisphere frustum AO: soundness gates (reference rays re-validate
@@ -7361,6 +7887,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             fsr_buf: None,
             prev_cam: None,
             frame_jitter: None,
+            spp: 1,
+            primary_sample: 0,
             adaptive: false,
             hemi_share: share,
             replay_rec: None,
@@ -7397,6 +7925,96 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
     }
     eprintln!("wrote check.png + check_gi.png");
+
+    // --spp bench: the honest measurement. The quadtree is traced ONCE per
+    // frame no matter the sample count, so an N-spp frame should cost less
+    // than N× a 1-spp frame; the printed AMORTIZATION factor is
+    // ms(N) / (N · ms(1)) — 1.00 means the extra samples paid full price
+    // (all cost is in the rays), below 1.00 is the frustum work being spread.
+    // Both hybrid and plain run, because the DIFFERENCE between their factors
+    // is the quadtree overhead this feature is trying to dilute.
+    let mut spp_bench: Vec<(bool, u32, f64)> = Vec::new();
+    for (hybrid, n) in
+        [(true, 1u32), (true, 2), (true, 4), (true, 8), (true, 16), (false, 1), (false, 16)]
+    {
+        stats.clear();
+        let ctx = FrameCtx {
+            scene,
+            bvh,
+            cam,
+            q,
+            frame: 0,
+            jitter: false,
+            rw,
+            rh,
+            accum: &accum,
+            info: &info,
+            tbuf: &tbuf,
+            stats: &stats,
+            sun: render::sun_dir(scene),
+            tcache_cur: None,
+            tcache_prev: &[],
+            accumulate: true,
+            gbuf: None,
+            fsr_buf: None,
+            prev_cam: None,
+            frame_jitter: None,
+            spp: n,
+            primary_sample: 0,
+            adaptive: false,
+            hemi_share: false,
+            replay_rec: None,
+            cut_cur: None,
+            cut_prev: None,
+            discard_seeds: false,
+            defer_shade: false,
+        };
+        // Frames scale down with spp — an spp=16 frame already does 16× the
+        // primary work of the spp=1 row.
+        let frames = (BENCH_FRAMES / n).max(2);
+        let t = Instant::now();
+        for _ in 0..frames {
+            render::render_frame(&ctx, hybrid);
+        }
+        let ms = t.elapsed().as_secs_f64() * 1000.0 / frames as f64;
+        let base = spp_bench.iter().find(|(h, k, _)| *h == hybrid && *k == 1).map(|(_, _, m)| *m);
+        let amort = base.map(|b| ms / (n as f64 * b));
+        eprintln!(
+            "{} spp={n:<2}: {ms:6.1} ms/frame{}",
+            if hybrid { "hybrid" } else { "plain " },
+            match amort {
+                Some(a) => format!(" | amortization {a:.2}× (1.00 = no saving)"),
+                None => String::new(),
+            },
+        );
+        spp_bench.push((hybrid, n, ms));
+    }
+    // The cost model, and with it the answer to "when do the returns stop?".
+    // Frame time is affine in the sample count: ms(n) = F + m·n, where F is
+    // everything paid ONCE (the quadtree: bound queries + refine_cut) and m is
+    // one sample's rays + shading. Two rows fix the line. Then
+    //   amortization(n) = ms(n) / (n · ms(1)) = m/(F+m) + F/((F+m)·n),
+    // an asymptote plus a term that decays as 1/n: HALF the fixed cost is
+    // diluted away by spp=2, 90% by spp=10, 99% by spp=100 — so the
+    // amortization benefit is essentially spent by ~8-16 spp, and every sample
+    // past that pays the full marginal price m. The QUALITY side meanwhile
+    // improves only as 1/√n. Both curves are printed so the trade is visible.
+    let fit = |hybrid: bool| -> Option<(f64, f64, f64)> {
+        let at = |k: u32| spp_bench.iter().find(|(h, n, _)| *h == hybrid && *n == k).map(|r| r.2);
+        let (lo, hi) = (at(1)?, at(16)?);
+        let m = (hi - lo) / 15.0; // marginal ms per extra sample
+        let f = (lo - m).max(0.0); // fixed ms per frame (the quadtree)
+        Some((f, m, m / (f + m)))
+    };
+    for hybrid in [true, false] {
+        if let Some((f, m, asym)) = fit(hybrid) {
+            eprintln!(
+                "{} spp cost model: fixed {f:.1} ms/frame + {m:.1} ms/sample => amortization floor {asym:.2}× (1/n approach: 0.5 of the fixed cost gone at spp 2, 0.9 at spp 10)",
+                if hybrid { "hybrid" } else { "plain " },
+            );
+        }
+    }
+
     // Hemi-share frame must-fires (KILL CRITERION rides the printed ms above,
     // the shafts/adopt precedent: if share-on is not measurably faster on
     // both the default scene and --stress 5000, the feature does not merge):
@@ -7456,6 +8074,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             fsr_buf: None,
             prev_cam: None,
             frame_jitter: None,
+            spp: 1,
+            primary_sample: 0,
             adaptive: false,
             hemi_share: true,
             replay_rec: Some(&rcache),
@@ -7535,6 +8155,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             fsr_buf: None,
             prev_cam: None,
             frame_jitter: None,
+            spp: 1,
+            primary_sample: 0,
             adaptive: false,
             hemi_share: false,
             replay_rec: None,
@@ -7584,6 +8206,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             fsr_buf: None,
             prev_cam: None,
             frame_jitter: None,
+            spp: 1,
+            primary_sample: 0,
             adaptive: false,
             hemi_share: false,
             replay_rec: None,
@@ -7690,6 +8314,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             fsr_buf: None,
             prev_cam: None,
             frame_jitter: None,
+            spp: 1,
+            primary_sample: 0,
             adaptive: false,
             hemi_share: false,
             replay_rec: None,
@@ -7754,6 +8380,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 fsr_buf: None,
                 prev_cam: None,
                 frame_jitter: None,
+                spp: 1,
+                primary_sample: 0,
                 adaptive: false,
                 hemi_share: false,
                 replay_rec: Some(&rcache),
@@ -7817,6 +8445,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 fsr_buf: None,
                 prev_cam: None,
                 frame_jitter: None,
+                spp: 1,
+                primary_sample: 0,
                 adaptive: false,
                 hemi_share: false,
                 replay_rec: None,
@@ -7866,6 +8496,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 fsr_buf: None,
                 prev_cam: None,
                 frame_jitter: None,
+                spp: 1,
+                primary_sample: 0,
                 adaptive: false,
                 hemi_share: false,
                 replay_rec: None,
@@ -7938,6 +8570,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 fsr_buf: None,
                 prev_cam: None,
                 frame_jitter: None,
+                spp: 1,
+                primary_sample: 0,
                 adaptive: false,
                 hemi_share: false,
                 replay_rec: if do_record { Some(&rcache) } else { None },
@@ -8004,6 +8638,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 fsr_buf: None,
                 prev_cam: None,
                 frame_jitter: None,
+                spp: 1,
+                primary_sample: 0,
                 adaptive: false,
                 hemi_share: false,
                 replay_rec: None,
@@ -8086,6 +8722,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 fsr_buf: None,
                 prev_cam: None,
                 frame_jitter: None,
+                spp: 1,
+                primary_sample: 0,
                 adaptive: false,
                 hemi_share: false,
                 replay_rec: None,
@@ -8127,6 +8765,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                     fsr_buf: None,
                     prev_cam: None,
                     frame_jitter: None,
+                    spp: 1,
+                    primary_sample: 0,
                     adaptive: false,
                     hemi_share: false,
                     replay_rec: None,
@@ -8199,6 +8839,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 fsr_buf: None,
                 prev_cam: None,
                 frame_jitter: None,
+                spp: 1,
+                primary_sample: 0,
                 adaptive: false,
                 hemi_share: false,
                 replay_rec: None,
@@ -8273,6 +8915,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 fsr_buf: None,
                 prev_cam: None,
                 frame_jitter: None,
+                spp: 1,
+                primary_sample: 0,
                 adaptive: false,
                 hemi_share: false,
                 replay_rec: None,
@@ -8325,6 +8969,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 fsr_buf: None,
                 prev_cam: None,
                 frame_jitter: None,
+                spp: 1,
+                primary_sample: 0,
                 adaptive: false,
                 hemi_share: false,
                 replay_rec: None,
@@ -8365,6 +9011,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         ("shaft", shaft_ok),
         ("verify", rep.ok()),
         ("wide-tiles", rep_wt.ok()),
+        ("spp", spp_ok),
         ("capped", capped_ok),
         ("temporal", temporal_ok),
         ("replay", replay_ok),
@@ -8462,6 +9109,8 @@ struct Persist {
     gpu_tonemap: bool,
     bounce_mode: u32,
     preset: u32,
+    /// Samples per pixel per frame (U cycles it; --spp seeds it).
+    spp: u32,
     dlss_on: bool,
     xess_on: bool,
     fsr_on: bool,
@@ -8609,6 +9258,9 @@ fn session(
     // quality — moving/DLSS frames keep the sampled path.
     let mut bounce_mode = p0.map_or(0u32, |p| p.bounce_mode);
     let mut preset = p0.map_or(2u32, |p| p.preset);
+    // Samples per pixel per frame (--spp seeds it, U cycles). Every mode reads
+    // it; FrameCtx::spp()/the GPU kernels pin it to 1 on fb (H) frames.
+    let mut spp = p0.map_or(opts.spp, |p| p.spp);
     let mut prev_rw = w;
 
     // DLSS Ray Reconstruction state. In DLSS mode every frame is a fresh
@@ -9351,8 +10003,16 @@ fn session(
                 if gpu_up == GpuUp::Plain {
                     eprintln!("quality preset {preset}");
                 } else {
-                    eprintln!("quality preset {preset} (upscaler sub-mode traces 1-spp; presets apply in plain)");
+                    eprintln!("quality preset {preset} (upscaler sub-mode traces the 1-spp preset; presets apply in plain)");
                 }
+            }
+            // U: samples per pixel — the same shading-statistics reset as a
+            // preset change (never on motion). The kernels take it from the CB.
+            if edges.cycle_spp {
+                spp = next_spp(spp);
+                frame = 0;
+                gpu_reset = true;
+                eprintln!("gpu: spp {spp}");
             }
             if edges.toggle_hybrid {
                 hybrid = !hybrid;
@@ -9487,6 +10147,12 @@ fn session(
                     prev_cam: gpu_prev_cam.map(|c| c.basis(grw, grh)),
                     q: Quality::upscaler_1spp(),
                     verify: false,
+                    // "1-spp" names the QUALITY preset, not the sample count:
+                    // --spp/U multiplies the primary samples inside the frame
+                    // and they average before the feed, so the upscaler still
+                    // sees one fresh jittered frame — a quieter one.
+                    spp,
+                    probe_sample: 0,
                 };
                 let presented = if gpu_up == GpuUp::Xess {
                     gpu.present_trace_xess(&p, hybrid, jit, gpu_reset, gpu_nppd_on)
@@ -9568,6 +10234,11 @@ fn session(
                     prev_cam: None,
                     q,
                     verify: false,
+                    // Plain accumulation: each frame still contributes one
+                    // averaged sample of weight (resolve divides by frames),
+                    // so spp just converges the image spp× faster per frame.
+                    spp,
+                    probe_sample: 0,
                 };
                 if frame < MAX_SAMPLES {
                     if let Err(e) = gpu.present_trace(&p, frame + 1, hybrid) {
@@ -9662,14 +10333,14 @@ fn session(
                         h
                     ),
                 };
-                let spp = if gpu_up == GpuUp::Plain {
+                let spp_txt = if gpu_up == GpuUp::Plain {
                     format!(
                         " | {} spp{}",
-                        frame.min(MAX_SAMPLES),
+                        (frame.min(MAX_SAMPLES) as u64) * spp as u64,
                         if frame >= MAX_SAMPLES { " | converged" } else { "" }
                     )
                 } else {
-                    " | 1 spp".to_string()
+                    format!(" | {spp} spp")
                 };
                 let _ = window.set_title(&format!(
                     "frustracer | {:.0} fps | GPU {} | {} | quality {}{}",
@@ -9677,7 +10348,7 @@ fn session(
                     if hybrid { "hybrid" } else { "plain" },
                     mode,
                     preset,
-                    spp,
+                    spp_txt,
                 ));
             }
             continue;
@@ -10145,6 +10816,16 @@ fn session(
             frame = 0;
             dlss_reset = true;
         }
+        // U: samples per pixel. A sample-count change is a shading-statistics
+        // change (the noise level of every pixel moves), so it resets
+        // accumulation and every temporal history exactly like a quality
+        // preset — and, like a preset, never on camera motion.
+        if edges.cycle_spp {
+            spp = next_spp(spp);
+            frame = 0;
+            dlss_reset = true;
+            eprintln!("spp {spp}{}", if bounce_mode > 0 { " (pinned to 1 on hemi-bounce frames)" } else { "" });
+        }
         // Any XeSS frame after this point sends reset_history = 1: the
         // upscaler's accumulated history mixes shading statistics, so every
         // predicate that resets `frame`/the OIDN history also resets it —
@@ -10153,6 +10834,7 @@ fn session(
         if edges.toggle_hybrid
             || edges.toggle_bounce
             || edges.quality.is_some()
+            || edges.cycle_spp
             || edges.toggle_xess
             || edges.toggle_oidn
             || edges.toggle_nppd
@@ -10167,6 +10849,7 @@ fn session(
         if edges.toggle_hybrid
             || edges.toggle_bounce
             || edges.quality.is_some()
+            || edges.cycle_spp
             || edges.toggle_fsr
             || temporal_flipped
         {
@@ -10185,6 +10868,7 @@ fn session(
             || edges.toggle_dynamic
             || edges.toggle_bounce
             || edges.quality.is_some()
+            || edges.cycle_spp
             || edges.toggle_oidn
             || edges.toggle_dlss
             || edges.toggle_xess
@@ -10231,6 +10915,14 @@ fn session(
                     dxr_reset = true;
                     eprintln!("dxr: quality pinned at the 1-spp upscaler preset (plain DXR honors 1-3)");
                 }
+                // U: a sample-count change moves every pixel's noise level by
+                // 1/√N — the same discontinuity class as a quality preset, and
+                // the upscaler history must not carry across it. The generic
+                // handler above resets `frame` and the CPU arm's latches; this
+                // arm's latch is dxr_reset (the --gpu twin does gpu_reset).
+                if edges.cycle_spp {
+                    dxr_reset = true;
+                }
                 let jit = dlss::jitter_for(dxr_up_idx);
                 let p = gpu::trace::FrameParams {
                     cam: cam.basis(dxw, dxh),
@@ -10241,6 +10933,13 @@ fn session(
                     prev_cam: dxr_prev_cam.map(|c| c.basis(dxw, dxh)),
                     q: Quality::upscaler_1spp(),
                     verify: false,
+                    // --spp/U: N samples per pixel inside the one fresh
+                    // jittered frame the upscaler contract asks for. Raygen
+                    // averages them before the feed. (This pipeline traces
+                    // from the TLAS root, so here it is plain supersampling —
+                    // there is no tile claim to amortize.)
+                    spp,
+                    probe_sample: 0,
                 };
                 let presented = if dxr_up == GpuUp::Xess {
                     gpu.present_dxr_xess(&p, jit, dxr_reset)
@@ -10312,6 +11011,8 @@ fn session(
                     prev_cam: None,
                     q,
                     verify: false,
+                    spp,
+                    probe_sample: 0,
                 };
                 if frame < MAX_SAMPLES {
                     match gpu.present_dxr(&p, frame + 1) {
@@ -10396,16 +11097,16 @@ fn session(
                 fps_frames = 0;
                 fps_t = now;
                 let sub = match dxr_up {
-                    GpuUp::Rr => format!("DXR {dxw}x{dxh} -> DLSS-RR {w}x{h}"),
-                    GpuUp::Xess => format!("DXR {dxw}x{dxh} -> XeSS {w}x{h}"),
-                    GpuUp::Fsr4 => format!("DXR {dxw}x{dxh} -> FSR4-RR {w}x{h}"),
-                    GpuUp::Fsr3 => format!("DXR {dxw}x{dxh} -> FSR3 {w}x{h}"),
+                    GpuUp::Rr => format!("DXR {dxw}x{dxh} -> DLSS-RR {w}x{h} | {spp} spp"),
+                    GpuUp::Xess => format!("DXR {dxw}x{dxh} -> XeSS {w}x{h} | {spp} spp"),
+                    GpuUp::Fsr4 => format!("DXR {dxw}x{dxh} -> FSR4-RR {w}x{h} | {spp} spp"),
+                    GpuUp::Fsr3 => format!("DXR {dxw}x{dxh} -> FSR3 {w}x{h} | {spp} spp"),
                     GpuUp::Plain => format!(
                         "DXR {}x{} | quality {} | {} spp{}",
                         dxw,
                         dxh,
                         preset,
-                        frame.min(MAX_SAMPLES),
+                        (frame.min(MAX_SAMPLES) as u64) * spp as u64,
                         if frame >= MAX_SAMPLES { " | converged" } else { "" },
                     ),
                 };
@@ -10712,6 +11413,10 @@ fn session(
                     RenderMode::Xess => Some(dlss::jitter_for(xess_idx)),
                     _ => None,
                 },
+                // --spp / U: N samples per pixel, averaged into one splat.
+                // FrameCtx::spp() pins it to 1 on fb frames.
+                spp,
+                primary_sample: 0,
                 // Adaptive shading rate: XeSS only — its temporal
                 // accumulation launders the spatially varying sampling. On
                 // RR the 2×2-correlated shadow noise and per-frame cell
@@ -11402,9 +12107,9 @@ fn session(
                 rh,
                 last_ms,
                 if dlss_on || fsr_on || xess_on || nppd_on {
-                    "1 spp".to_string()
+                    format!("{spp} spp")
                 } else {
-                    format!("{} spp", frame.min(MAX_SAMPLES))
+                    format!("{} spp", (frame.min(MAX_SAMPLES) as u64) * spp as u64)
                 },
                 preset,
                 coarse,
@@ -11475,6 +12180,7 @@ fn session(
         gpu_tonemap,
         bounce_mode,
         preset,
+        spp,
         dlss_on,
         xess_on,
         fsr_on,

@@ -123,8 +123,12 @@ impl DxrGpu {
         // ray flags in (trace.rs::alpha_defs — the same per-scene predicate
         // that drops OPAQUE from the BLAS); opaque scenes compile verbatim.
         let any_alpha = scene.any_alpha;
+        // The cbuffer's --spp jitter-table size, injected like alpha_defs.
+        let sd = trace::spp_defs();
+        let sd = sd.as_str();
         let lib_src = [
             trace::alpha_defs(scene),
+            sd,
             trace::TRACE_COMMON_HLSLI,
             RT_DXR_HLSLI,
             trace::SHADE_HLSLI,
@@ -132,7 +136,7 @@ impl DxrGpu {
         ]
         .join("\n");
         let dxil = dxc.compile(&lib_src, "", "lib_6_3", "dxr library", debug)?;
-        let resolve_src = [trace::TRACE_COMMON_HLSLI, trace::RESOLVE_HLSL].join("\n");
+        let resolve_src = [sd, trace::TRACE_COMMON_HLSLI, trace::RESOLVE_HLSL].join("\n");
         let pso_resolve = trace::compute_pso(
             device,
             &root_sig,
@@ -142,7 +146,7 @@ impl DxrGpu {
         // Upscaler sessions: the same feed kernels the wavefront runs, at
         // this pipeline's cs_6_3 cap floor (feed.hlsl needs nothing newer).
         let (pso_feed_xess, pso_feed_rr, pso_feed_fsr_rr) = if gbuf_full {
-            let feed_src = [trace::TRACE_COMMON_HLSLI, trace::FEED_HLSL].join("\n");
+            let feed_src = [sd, trace::TRACE_COMMON_HLSLI, trace::FEED_HLSL].join("\n");
             let pso = |entry: &str, name: &str| -> Result<ID3D12PipelineState> {
                 trace::compute_pso(
                     device,
@@ -208,10 +212,11 @@ impl DxrGpu {
             PCWSTR::null(),
             PCWSTR(ah_shadow_name.as_ptr()),
         );
-        // RayPayload {float3 + float + uint} = 20 B is the largest payload;
-        // triangle barycentrics = 8 B.
+        // RayPayload {float3 + float + uint + float2 + uint} = 32 B is the
+        // largest payload (the float2/uint tail is --spp: the sample's own
+        // position and its probe bit); triangle barycentrics = 8 B.
         let shader_cfg = D3D12_RAYTRACING_SHADER_CONFIG {
-            MaxPayloadSizeInBytes: 20,
+            MaxPayloadSizeInBytes: 32,
             MaxAttributeSizeInBytes: 8,
         };
         // raygen -> chs_shade (1); its shadow/AO/reflection rays (2); chs_hit
