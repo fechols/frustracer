@@ -290,6 +290,12 @@ pub struct Opts {
     pub pix_markers: bool,
     /// Directory holding WinPixEventRuntime.dll.
     pub pix_path: String,
+    /// D3D12 timestamp queries around the PIX marker brackets, printed as a
+    /// per-region GPU-ms table (--gpu-timing; default off, zero-cost when
+    /// off). The vendor-neutral profiler: PIX's capture ANALYSIS only replays
+    /// on AMD/NVIDIA, so on an Intel adapter this is the only way to get
+    /// per-pass GPU numbers at all.
+    pub gpu_timing: bool,
     /// V-sync'd presentation (default on). `--no-vsync` presents at sync
     /// interval 0 on a tearing swapchain so interactive frame times measure
     /// the renderer, not the monitor refresh.
@@ -427,6 +433,7 @@ fn main() {
         pix_path: std::env::var("FRUSTRACER_PIX_PATH").unwrap_or_else(|_| {
             concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\pix\bin\x64").to_string()
         }),
+        gpu_timing: false,
         vsync: true,
         // scRGB is the default swapchain: see Opts::hdr. The 8-bit path survives
         // as --no-hdr and as the automatic fallback.
@@ -675,6 +682,7 @@ fn main() {
                 );
             }
             "--pix-markers" => opts.pix_markers = true,
+            "--gpu-timing" => opts.gpu_timing = true,
             "--pix-path" => {
                 opts.pix_path = args.next().unwrap_or_else(|| {
                     eprintln!("--pix-path needs a directory argument");
@@ -1023,6 +1031,9 @@ fn main() {
 
     // PIX command-list markers: opt-in, runtime-loaded; inert otherwise.
     gpu::pix::init(&opts.pix_path, opts.pix_markers);
+    // The same marker brackets, timed with D3D12 timestamp queries. No DLL,
+    // every vendor — the only per-pass GPU numbers available on Intel.
+    gpu::gputime::enable(opts.gpu_timing);
 
     // A/B lever: --no-cut-rays sends cut-seeded rays down the root traversal
     // instead. Every ray consumer funnels through intersect_multi/occluded_multi,

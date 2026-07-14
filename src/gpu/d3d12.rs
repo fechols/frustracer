@@ -382,11 +382,16 @@ impl D3d {
             .map_err(|e| format!("allocator Reset: {e}"))?;
         unsafe { self.list.Reset(&self.slots[slot].allocator, None) }
             .map_err(|e| format!("list Reset: {e}"))?;
+        // The fence wait above is what makes this slot's timestamps safe to
+        // map: --gpu-timing reports frame N at the top of frame N+2, never
+        // stalling the pipeline to do it.
+        super::gputime::begin_frame(&self.device, &self.queue, slot);
         Ok(slot)
     }
 
     /// Close, execute, present, signal. Call after recording the frame.
     pub fn end_frame(&mut self, slot: usize) -> Result<()> {
+        super::gputime::resolve(&self.list, slot);
         unsafe { self.list.Close() }.map_err(|e| format!("list Close: {e}"))?;
         let lists = [Some(self.list.cast::<ID3D12CommandList>().unwrap())];
         unsafe { self.queue.ExecuteCommandLists(&lists) };
@@ -408,6 +413,7 @@ impl D3d {
     /// and the caller's Map of a readback buffer is safe on return.
     pub fn submit_and_wait(&mut self, slot: usize) -> Result<()> {
         crate::zone!("gpu-wait");
+        super::gputime::resolve(&self.list, slot);
         unsafe { self.list.Close() }.map_err(|e| format!("list Close: {e}"))?;
         let lists = [Some(self.list.cast::<ID3D12CommandList>().unwrap())];
         unsafe { self.queue.ExecuteCommandLists(&lists) };
