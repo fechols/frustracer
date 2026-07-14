@@ -102,6 +102,22 @@ cargo run --release -- --bvh-ctrav 3 --bvh-axes 3 --bvh-maxleaf 8  # BVH build k
                                         # 1 = the historical widest-axis build), leaf-size cap.
                                         # Build params key the .fcache (bvh::build_key), so
                                         # sweeps never collide with a stale sidecar
+cargo run --release -- --bvh-builder ploc  # ray-BVH builder bake-off: sah (default) | lbvh | ploc |
+                                        # som — same Bvh type, all consumers/gates/.fcache work
+                                        # unchanged (id rides bvh::build_key), all byte-deterministic.
+                                        # Verdict (spin path, measured ray nodes — never SAH): sah
+                                        # best-or-close everywhere and stays the default; ploc −34%
+                                        # vs sah on San Miguel (dense clustering merit) but +121% on
+                                        # --stress (sparse fields collapse; over-deep merge chains
+                                        # get median-rebalanced at the TRAV_STACK point of no
+                                        # return); lbvh the control, 2.7-4.4× worse; som — batch
+                                        # 3D-lattice SOM as a LEARNED space-filling curve — is
+                                        # WORSE than raw Morton on both scenes (BMU cell-boundary
+                                        # jumps tear bit-prefix locality): the SOFM question,
+                                        # settled with numbers. Caveat: lbvh trips the default
+                                        # scene's hemi-share paired-GI limit (reclassification
+                                        # fireflies on a coarser tree — topology-tuned gate; every
+                                        # exact-zero soundness gate passes on all four builders)
 cargo run --release -- --no-cut-rays    # A/B lever: cut-SEEDED rays (primary leaf-tile rays)
                                         # traverse from the BVH root instead; the inherited
                                         # t_start is a scalar and survives. Isolates what the

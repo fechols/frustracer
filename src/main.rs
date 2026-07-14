@@ -7,6 +7,7 @@ mod camera;
 mod dlss;
 // Signal split, wire encoders, and demodulation/composite math for FSR Ray
 // Regeneration — pure CPU, feeds --check-fsr; the GPU seam is gpu/ffx*.
+mod builders;
 mod fsr;
 mod frustum;
 mod ftree;
@@ -207,6 +208,10 @@ pub struct Opts {
     /// than a hardcode so the axis change and the C_trav change stay separately
     /// attributable — they landed together.
     pub split_axes: usize,
+    /// The M7 bake-off lever (--bvh-builder sah|lbvh|ploc|som): which
+    /// algorithm builds the ray BVH. Every builder produces the same Bvh
+    /// (consumers/gates/.fcache unchanged); score on measured counters.
+    pub bvh_builder: String,
     /// A/B lever (--no-ftree disables): route ALL bound queries through the
     /// 8-wide frustum tree lazily collapsed from the ray BVH (ftree.rs) — the
     /// two-tree split. Rays always stay on the binary BVH.
@@ -344,6 +349,7 @@ fn main() {
         c_trav: 3.0,
         max_leaf: 8,
         split_axes: 3,
+        bvh_builder: "sah".to_string(),
         ftree: true,
         ftree_tiles: false,
         gpu: false,
@@ -513,6 +519,12 @@ fn main() {
                         eprintln!("--bvh-axes needs 1 (widest centroid axis) or 3 (all axes)");
                         std::process::exit(2);
                     });
+            }
+            "--bvh-builder" => {
+                opts.bvh_builder = args.next().unwrap_or_else(|| {
+                    eprintln!("--bvh-builder needs one of: sah | lbvh | ploc | som");
+                    std::process::exit(2);
+                });
             }
             "--spin" => {
                 spin = Some(args.next().unwrap_or_else(|| {
@@ -839,6 +851,10 @@ fn main() {
     bvh::set_c_trav(opts.c_trav);
     bvh::set_max_leaf(opts.max_leaf);
     bvh::set_split_axes(opts.split_axes);
+    if bvh::set_builder(&opts.bvh_builder).is_none() {
+        eprintln!("--bvh-builder: unknown builder '{}' (sah | lbvh | ploc | som)", opts.bvh_builder);
+        std::process::exit(2);
+    }
     if !opts.ftree {
         ftree::FTREE_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
         eprintln!("ftree: --no-ftree — all bound queries stay on the binary BVH");
@@ -929,7 +945,8 @@ fn main() {
     // SAH is always scored at the fixed reference C_trav so trees built at
     // different C_trav stay comparable on one scale.
     eprintln!(
-        "bvh quality (c_trav {} axes {} maxleaf {}): {}",
+        "bvh quality (builder {} c_trav {} axes {} maxleaf {}): {}",
+        opts.bvh_builder,
         opts.c_trav,
         opts.split_axes,
         opts.max_leaf,

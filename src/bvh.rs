@@ -59,12 +59,12 @@ impl Aabb {
         max: Vec3A::NEG_INFINITY,
     };
 
-    fn grow(&mut self, p: Vec3A) {
+    pub(crate) fn grow(&mut self, p: Vec3A) {
         self.min = self.min.min(p);
         self.max = self.max.max(p);
     }
 
-    fn grow_aabb(&mut self, b: &Aabb) {
+    pub(crate) fn grow_aabb(&mut self, b: &Aabb) {
         self.min = self.min.min(b.min);
         self.max = self.max.max(b.max);
     }
@@ -144,6 +144,52 @@ static MAX_LEAF_N: AtomicUsize = AtomicUsize::new(MAX_LEAF);
 /// while `C_trav` is speed-neutral and buys memory instead.
 static SPLIT_AXES: AtomicUsize = AtomicUsize::new(3);
 
+/// The M7 bake-off lever (`--bvh-builder`): which algorithm builds the tree.
+/// All builders produce the same `Bvh` (every consumer, gate, and the .fcache
+/// work unchanged — the id is in `build_key`), and all are byte-deterministic
+/// (`Bvh::identical` gates them like the SAH build). Score on the measured
+/// counters, never the SAH readout — see the module doc's anti-correlation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Builder {
+    /// The default: binned SAH (3-axis, C_trav) — the M2 build.
+    Sah = 0,
+    /// Morton-order LBVH: sort by 63-bit Morton code, split at the highest
+    /// differing bit, M2 cost-model leaf test. The bake-off CONTROL.
+    Lbvh = 1,
+    /// PLOC-style agglomerative: bottom-up mutual-nearest-neighbor merging
+    /// under d(A,B) = SA(A ∪ B) — the SOFM instinct with the correct metric.
+    Ploc = 2,
+    /// Batch SOM on a 3D lattice (fixed seed, fixed epochs): the converged
+    /// lattice is a density-adaptive warped grid, i.e. a LEARNED space-
+    /// filling curve — BMU lattice Morton replaces raw Morton in the LBVH
+    /// path, isolating exactly that one variable vs the control.
+    Som = 3,
+}
+
+static BUILDER: AtomicUsize = AtomicUsize::new(0);
+
+pub fn set_builder(name: &str) -> Option<Builder> {
+    let b = match name {
+        "sah" => Builder::Sah,
+        "lbvh" => Builder::Lbvh,
+        "ploc" => Builder::Ploc,
+        "som" => Builder::Som,
+        _ => return None,
+    };
+    BUILDER.store(b as usize, Ordering::Relaxed);
+    Some(b)
+}
+
+#[inline]
+pub fn builder() -> Builder {
+    match BUILDER.load(Ordering::Relaxed) {
+        1 => Builder::Lbvh,
+        2 => Builder::Ploc,
+        3 => Builder::Som,
+        _ => Builder::Sah,
+    }
+}
+
 /// Reference C_trav for the `quality()` SAH readout, so trees built at DIFFERENT
 /// C_trav are still comparable on one scale. (Scoring each tree at its own build
 /// C_trav makes the number rise with C_trav by construction and compare nothing.)
@@ -162,12 +208,12 @@ pub fn set_split_axes(v: usize) {
 }
 
 #[inline]
-fn c_trav() -> f32 {
+pub(crate) fn c_trav() -> f32 {
     f32::from_bits(C_TRAV_BITS.load(Ordering::Relaxed))
 }
 
 #[inline]
-fn max_leaf() -> usize {
+pub(crate) fn max_leaf() -> usize {
     MAX_LEAF_N.load(Ordering::Relaxed)
 }
 
@@ -182,7 +228,10 @@ fn split_axes() -> usize {
 /// benchmarks the same cached tree every time. Distinct from `CACHE_VERSION`,
 /// which versions the on-disk FORMAT.
 pub fn build_key() -> u64 {
-    ((c_trav().to_bits() as u64) << 32) | ((max_leaf() as u64) << 8) | split_axes() as u64
+    ((c_trav().to_bits() as u64) << 32)
+        | ((builder() as u64) << 16)
+        | ((max_leaf() as u64) << 8)
+        | split_axes() as u64
 }
 /// Traversal stack capacity. Both traversal loops push at most one entry per
 /// level, so the required stack is exactly the tree depth; `Bvh::build`
@@ -191,7 +240,7 @@ pub fn build_key() -> u64 {
 /// and dropping the far child instead would be UNSOUND — a missed subtree
 /// breaks the frustum/temporal lower-bound contracts). SAH depth is ~45-50 at
 /// 10M tris and grows ~2 levels per 4x tris; 96 covers 100M+ with margin.
-const TRAV_STACK: usize = 96;
+pub(crate) const TRAV_STACK: usize = 96;
 
 /// Build-quality readout — the A/B currency for any builder change. `leaf_hist[i]`
 /// counts leaves holding exactly `i` triangles (the last bucket is saturating);
@@ -267,7 +316,23 @@ impl Bvh {
     /// in. Phase 1 never creates real leaves (threshold > MAX_LEAF and a
     /// too-big node always splits, via SAH or the median fallback), so the
     /// pending ranges exactly partition 0..n.
+    /// Build under the session's `--bvh-builder` (default: the SAH build).
+    /// The depth contract is asserted here for EVERY builder — never "fix"
+    /// an overflow by dropping stack entries.
     pub fn build(scene: &Scene) -> Bvh {
+        let bvh = match builder() {
+            Builder::Sah => Self::build_sah(scene),
+            b => crate::builders::build_alt(scene, b),
+        };
+        let depth = bvh.max_depth();
+        assert!(
+            depth <= TRAV_STACK,
+            "BVH depth {depth} exceeds the {TRAV_STACK}-entry traversal stack"
+        );
+        bvh
+    }
+
+    fn build_sah(scene: &Scene) -> Bvh {
         let n = scene.indices.len();
         let (tri_aabb, centroids): (Vec<Aabb>, Vec<Vec3A>) = scene
             .indices
@@ -341,13 +406,7 @@ impl Bvh {
             }
         }
 
-        let bvh = Bvh { nodes, tri_idx };
-        let depth = bvh.max_depth();
-        assert!(
-            depth <= TRAV_STACK,
-            "BVH depth {depth} exceeds the {TRAV_STACK}-entry traversal stack"
-        );
-        bvh
+        Bvh { nodes, tri_idx }
     }
 
     /// Byte-equality of two builds — the determinism gate: `--check` rebuilds
