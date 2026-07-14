@@ -802,7 +802,24 @@ fn leaf_rays(
 
 /// tmin soundness gate: a tmin=0 reference ray must not hit strictly inside
 /// the claimed-empty ball.
+///
+/// Only for a sample the integrand actually uses. Arvo sampling of a
+/// horizon-adjacent cell can land fp-epsilon BELOW the tangent plane, where
+/// `weight = d·n max 0` is exactly 0 — the sample contributes nothing, and
+/// nothing was ever claimed about it: the hemi ROOT CUT *is* the tangent
+/// half-space, so the bound query proves emptiness over the open hemisphere
+/// and says nothing about directions outside it. Traced from tmin=0, such a
+/// direction grazes back down onto the apex's OWN surface (at -eps) at
+/// t = eps/|d·n|, an eps-offset artifact rather than occlusion — and at a
+/// grazing angle that t is large enough to land deep inside a perfectly
+/// sound ball (measured on Intel Arc: d·n = -4.31e-4 put the own ground
+/// plane at t = 39.36 inside a correct empty claim of 57.26). NVIDIA and AMD
+/// round the sample the other way and never trip it; that is luck, not
+/// soundness, so the guard — not the platform — is the invariant.
 fn verify_leaf_ray(cx: &Cx, ray: &Ray, tc: f32, v: &mut VerifyCounters, ls: &mut LocalStats) {
+    if ray.d.dot(cx.n) <= 0.0 {
+        return;
+    }
     if let Some(h) = cx.accel.bvh.intersect(cx.scene, ray, 0.0, f32::INFINITY, &mut ls.ray_nodes) {
         if h.t < tc * (1.0 - 1e-3) {
             v.tmin_overshoot += 1;
