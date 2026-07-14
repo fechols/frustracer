@@ -33,6 +33,16 @@ pub struct Edges {
     /// (maximize, restore, fullscreen, drag — the last event in the drain
     /// wins). The consumer debounces and commits via `drawable_size()`.
     pub size_changed: Option<(u32, u32)>,
+    /// The window may now be on a different monitor — `DisplayChanged` (SDL's
+    /// own "you moved to another display") or `Moved` (a window can straddle
+    /// two monitors and change which one owns it without SDL firing
+    /// `DisplayChanged`). Either way the HDR capabilities under us may have
+    /// changed, so the consumer re-probes the display.
+    ///
+    /// Note this canNOT catch the user toggling Windows HDR on the monitor the
+    /// window is already sitting on — no window event fires for that at all.
+    /// The consumer's periodic re-probe is what covers it.
+    pub display_changed: bool,
 }
 
 pub struct Input {
@@ -76,6 +86,12 @@ impl Input {
                 Event::Window {
                     win_event: sdl2::event::WindowEvent::SizeChanged(w, h), ..
                 } => e.size_changed = Some((w.max(0) as u32, h.max(0) as u32)),
+                Event::Window {
+                    win_event:
+                        sdl2::event::WindowEvent::DisplayChanged(_)
+                        | sdl2::event::WindowEvent::Moved(_, _),
+                    ..
+                } => e.display_changed = true,
                 _ => {}
             }
         }

@@ -9,6 +9,9 @@
 
 pub mod adapter;
 pub mod d3d12;
+/// What the monitor under the window can actually display (HDR on/off, peak
+/// luminance) — re-probed on every move, not a startup fact.
+pub mod display;
 pub mod dxc;
 pub mod dxr;
 pub mod ffx;
@@ -65,6 +68,16 @@ pub struct GpuOptions {
     /// uncapped benchmark presentation (tearing swapchain when DXGI
     /// supports it).
     pub vsync: bool,
+    /// `--hdr`: ask for an scRGB f16 swapchain instead of the 8-bit SDR one.
+    /// A *request* — the swapchain may refuse the colour space, so read
+    /// `GpuContext::hdr()` for what actually happened, never this.
+    pub hdr: bool,
+    /// Where linear 1.0 lands, in nits (`--hdr-paper-white`, default 200). The
+    /// scene is authored so 1.0 ≈ diffuse white (see `scene::default_light`).
+    pub paper_white: f32,
+    /// Override the display's reported peak luminance (`--hdr-peak`). None =
+    /// use whatever `gpu::hdr` probes from the monitor.
+    pub peak_nits: Option<f32>,
 }
 
 /// Which chain level a session actually wired — derived from the live state
@@ -170,6 +183,15 @@ pub struct GpuContext {
     _proxy_factory: Option<IDXGIFactory6>,
     pub adapter_name: String,
     pub adapter_is_nvidia: bool,
+    /// The presentation curve every present arm reads (see
+    /// `fullscreen_to_backbuffer`). One field, so a display change is a retune.
+    tone: crate::tone::ToneParams,
+    /// The adapter and window, kept so the display can be RE-probed when the
+    /// window moves to another monitor — the probe is not a one-time startup
+    /// fact. `None` display = never probed (the SDR path never does).
+    adapter: windows::Win32::Graphics::Dxgi::IDXGIAdapter4,
+    hwnd: windows::Win32::Foundation::HWND,
+    display: Option<display::DisplayHdr>,
     /// Some(_) when Streamline is live; the queue and swapchain are then SL
     /// proxies and every present goes through Streamline (a manual-hooking
     /// requirement, and what makes Frame Generation possible later).
@@ -253,7 +275,7 @@ impl GpuContext {
             let pdev: ID3D12Device = s.upgrade(&device)?;
             let queue = d3d12::create_queue(&pdev)?;
             let pfac: IDXGIFactory6 = s.upgrade(&factory)?;
-            let d3d = D3d::with_queue(&pfac, device, queue, hwnd, w, h, opts.vsync)?;
+            let d3d = D3d::with_queue(&pfac, device, queue, hwnd, w, h, opts.vsync, opts.hdr)?;
             // The swapchain we hold MUST be the SL proxy — every present has
             // to route through presentCommon under manual hooking. A proxy
             // resolves to a distinct native interface; verify loudly.
@@ -270,13 +292,55 @@ impl GpuContext {
             d3d
         } else {
             let queue = d3d12::create_queue(&device)?;
-            D3d::with_queue(&factory, device, queue, hwnd, w, h, opts.vsync)?
+            D3d::with_queue(&factory, device, queue, hwnd, w, h, opts.vsync, opts.hdr)?
+        };
+
+        // The display probe and the curve it implies. Only meaningful once the
+        // swapchain is actually scRGB — on the 8-bit path there is one curve
+        // (ToneParams::SDR) and nothing to ask the monitor.
+        let disp = if d3d.hdr { Some(display::probe(&pick.adapter, hwnd)) } else { None };
+        let tone = match disp {
+            Some(d) => {
+                let t = d.tone(opts.paper_white, opts.peak_nits);
+                // Report the curve we ACTUALLY installed, not the probe's opinion:
+                // --hdr-peak overrides the probe (including an "HDR off" verdict),
+                // so keying the message off `d.enabled` could announce SDR levels
+                // while running an HDR rolloff.
+                if t.headroom > 1.0 {
+                    eprintln!(
+                        "hdr: display peak {:.0} nits (full-frame {:.0}){}, paper white {:.0} \
+                         -> headroom {:.1}x",
+                        t.peak_nits(),
+                        d.max_full_frame_nits,
+                        if opts.peak_nits.is_some() { " [--hdr-peak override]" } else { "" },
+                        opts.paper_white,
+                        t.headroom
+                    );
+                } else {
+                    // Not a failure — the common case. Windows maps our linear
+                    // f16 onto the panel; we just have no headroom above white,
+                    // so the curve is the same rolloff the SDR build used.
+                    eprintln!(
+                        "hdr: display reports HDR off — SDR levels, full panel bit depth \
+                         (enable Windows HDR on this monitor for highlights)"
+                    );
+                }
+                t
+            }
+            None => crate::tone::ToneParams::SDR,
         };
 
         let (rr_opt, rr_min, rr_max) = Self::query_rr_res(sl.as_ref(), w, h);
 
-        let passes = tonemap::Passes::new(&d3d.device)?;
-        let blit = upload::BlitUpload::new(&d3d, w, h)?;
+        let passes = tonemap::Passes::new(&d3d.device, d3d.format)?;
+        // The blit texture matches the SWAPCHAIN, not the CLI flag: under scRGB
+        // the CPU arms hand over f16, under SDR they hand over u32 0RGB. Keyed
+        // off `d3d.hdr` so a refused colour space can't leave them mismatched.
+        let blit = if d3d.hdr {
+            upload::BlitUpload::new_hdr(&d3d, w, h)?
+        } else {
+            upload::BlitUpload::new(&d3d, w, h)?
+        };
         let hdr = upload::HdrUpload::new(&d3d, w, h)?;
         let rr_res = if sl.is_some() {
             let r = rr::RrResources::new(&d3d.device, rr_opt, rr_min, rr_max, w, h)?;
@@ -290,12 +354,7 @@ impl GpuContext {
         } else {
             None
         };
-        passes.create_srv(
-            &d3d.device,
-            &blit.texture,
-            d3d12::SWAPCHAIN_FORMAT,
-            tonemap::SRV_SLOT_BLIT,
-        );
+        passes.create_srv(&d3d.device, &blit.texture, blit.format, tonemap::SRV_SLOT_BLIT);
         passes.create_srv(
             &d3d.device,
             &hdr.texture,
@@ -378,6 +437,10 @@ impl GpuContext {
             nppd_state_valid: false,
             adapter_name: pick.name,
             adapter_is_nvidia: pick.is_nvidia,
+            tone,
+            adapter: pick.adapter,
+            hwnd,
+            display: disp,
         })
     }
 
@@ -501,14 +564,21 @@ impl GpuContext {
         self.fsr = None;
         self.rr = None;
         self.d3d.resize(w, h)?;
-        self.blit = upload::BlitUpload::new(&self.d3d, w, h)?;
+        self.blit = if self.d3d.hdr {
+            upload::BlitUpload::new_hdr(&self.d3d, w, h)?
+        } else {
+            upload::BlitUpload::new(&self.d3d, w, h)?
+        };
         self.hdr = upload::HdrUpload::new(&self.d3d, w, h)?;
         self.passes.create_srv(
             &self.d3d.device,
             &self.blit.texture,
-            d3d12::SWAPCHAIN_FORMAT,
+            self.blit.format,
             tonemap::SRV_SLOT_BLIT,
         );
+        // A resize can also be a monitor change (drag to another display, then
+        // let go). Re-probe here rather than trusting the poll to catch up.
+        self.refresh_display(opts.paper_white, opts.peak_nits);
         self.passes.create_srv(
             &self.d3d.device,
             &self.hdr.texture,
@@ -2255,12 +2325,16 @@ impl GpuContext {
                 std::slice::from_raw_parts((ptr as *const u8).add(y * pitch) as *const _, w)
             };
             for (x, px) in row.iter().enumerate() {
-                let tm = |v: half::f16| -> u32 {
-                    let c = f32::from(v).max(0.0);
-                    let m = (1.0 - (-c).exp()).clamp(0.0, 1.0).powf(1.0 / 2.2);
-                    (m * 255.0 + 0.5) as u32
-                };
-                out[y * w + x] = (tm(px[0]) << 16) | (tm(px[1]) << 8) | tm(px[2]);
+                // Screenshots and --check PNGs stay SDR 8-bit regardless of the
+                // session's swapchain: a PNG has nowhere to put a nit. This used
+                // to open-code the curve a third time; it now shares tone::map,
+                // so the file can't drift from the screen.
+                let c = glam::Vec3A::new(px[0].into(), px[1].into(), px[2].into());
+                let m = crate::tone::map(c, crate::tone::ToneParams::SDR)
+                    .clamp(glam::Vec3A::ZERO, glam::Vec3A::ONE)
+                    * 255.0;
+                let q = |v: f32| (v + 0.5) as u32;
+                out[y * w + x] = (q(m.x) << 16) | (q(m.y) << 8) | q(m.z);
             }
         }
         unsafe { rb.resource.Unmap(0, None) };
@@ -2276,6 +2350,53 @@ impl GpuContext {
         self.d3d.end_frame(slot)
     }
 
+    /// `present_cpu` for the scRGB swapchain: the CPU produced final scRGB f16
+    /// (`render::present_px_scrgb` applied the curve, the overlay, and the
+    /// encode), so this is still a straight blit — the blit PS stays a
+    /// passthrough and never learns about colour spaces.
+    pub fn present_cpu_hdr(&mut self, pixels: &[[half::f16; 4]]) -> Result<()> {
+        crate::zone!("present-cpu-hdr");
+        let slot = self.d3d.begin_frame()?;
+        self.blit.record_hdr(&self.d3d, slot, pixels);
+        self.fullscreen_to_backbuffer(false, tonemap::SRV_SLOT_BLIT, 1.0);
+        self.d3d.end_frame(slot)
+    }
+
+    /// True when the swapchain actually came up as scRGB — NOT merely what
+    /// `--hdr` asked for (the colour space can be refused; see `D3d::with_queue`).
+    /// Callers pick their present arm and their `resolve*` on this.
+    pub fn is_hdr(&self) -> bool {
+        self.d3d.hdr
+    }
+
+    /// Re-probe the monitor the window now sits on and re-derive the curve.
+    /// Returns the new state when it actually changed, so the caller can log
+    /// once rather than every poll.
+    ///
+    /// Cheap by construction: this is a `GetDesc1` and a field write. It is NOT
+    /// a swapchain rebuild, and it deliberately does not reset the upscaler
+    /// history — a display change is a change of output device, not of scene.
+    pub fn refresh_display(&mut self, paper_white: f32, peak: Option<f32>) -> Option<display::DisplayHdr> {
+        if !self.d3d.hdr {
+            return None; // the 8-bit path has one curve and no display to ask
+        }
+        let d = display::probe(&self.adapter, self.hwnd);
+        if Some(d) == self.display {
+            return None;
+        }
+        self.display = Some(d);
+        self.tone = d.tone(paper_white, peak);
+        Some(d)
+    }
+
+    /// The presentation curve every present arm is reading right now. The CPU
+    /// arms pull it each frame (`CpuPresent::tone`), which is how a display
+    /// change reaches them.
+    pub fn tone(&self) -> crate::tone::ToneParams {
+        self.tone
+    }
+
+
     /// M2: present the raw linear-HDR accumulation with the GPU tonemap.
     pub fn present_hdr(&mut self, accum: &[AtomicU32], samples: u32) -> Result<()> {
         crate::zone!("present-hdr");
@@ -2285,6 +2406,12 @@ impl GpuContext {
         self.d3d.end_frame(slot)
     }
 
+    /// The single backbuffer bind point — all 16 present arms funnel here.
+    ///
+    /// The presentation curve is read from `self.tone` rather than threaded
+    /// through every arm: that is what makes a display change (a new monitor, or
+    /// Windows HDR toggled underneath us) a one-field retune instead of a
+    /// signature change at 16 call sites.
     fn fullscreen_to_backbuffer(&self, use_tonemap: bool, srv_slot: u32, inv_samples: f32) {
         let bb = unsafe { self.d3d.swapchain.GetCurrentBackBufferIndex() };
         let backbuffer = &self.d3d.backbuffers[bb as usize];
@@ -2301,6 +2428,7 @@ impl GpuContext {
             pso,
             srv_slot,
             inv_samples,
+            self.tone,
             self.d3d.rtv_handle(bb),
             self.d3d.width,
             self.d3d.height,
