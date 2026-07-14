@@ -272,6 +272,13 @@ pub struct Opts {
     /// (see ftree::FTREE_TILES). Hemi keeps its own wiring; --no-ftree kills
     /// both; --check verifies the wired path regardless (the wide-tiles gate).
     pub ftree_tiles: bool,
+    /// A/B lever (--no-wide-levels disables): run the SHALLOW GPU quadtree
+    /// levels on the group-cooperative kernel (one 64-lane group per tile)
+    /// instead of one thread per tile. Default on — the shallow ladder is
+    /// parallelism-starved (level 0 is a single lane descending the whole
+    /// frustum tree) and it is ~half the GPU frame, all of it fixed cost.
+    /// Bit-identical by construction (see trace::WIDE_LEVELS); GPU only.
+    pub wide_levels: bool,
     /// GPU-resident tracing (--gpu): the whole quadtree + shading runs in
     /// D3D12 compute with DXR RayQuery rays. Requires the DXC DLL drop and
     /// RT tier 1.1; falls back to the CPU path with a loud line otherwise.
@@ -427,6 +434,7 @@ fn main() {
         bvh_builder: "sah".to_string(),
         ftree: true,
         ftree_tiles: false,
+        wide_levels: true,
         gpu: false,
         dxr: true,
         dxc_path: std::env::var("FRUSTRACER_DXC_PATH").unwrap_or_else(|_| {
@@ -628,6 +636,8 @@ fn main() {
             "--no-ftree" => opts.ftree = false,
             "--ftree-tiles" => opts.ftree_tiles = true,
             "--no-ftree-tiles" => opts.ftree_tiles = false,
+            "--wide-levels" => opts.wide_levels = true,
+            "--no-wide-levels" => opts.wide_levels = false,
             "--bvh-axes" => {
                 opts.split_axes = args
                     .next()
@@ -1071,6 +1081,13 @@ fn main() {
     if opts.ftree_tiles {
         ftree::FTREE_TILES.store(true, std::sync::atomic::Ordering::Relaxed);
         eprintln!("ftree: --ftree-tiles — the tile recursion runs on the 8-wide frustum tree");
+    }
+    if !opts.wide_levels {
+        gpu::trace::WIDE_LEVELS_ON.store(false, std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "gpu: --no-wide-levels — every quadtree level runs one thread per tile \
+             (the pre-cooperative ladder)"
+        );
     }
 
     eprintln!("frustracer — loading scene...");

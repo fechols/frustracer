@@ -502,6 +502,59 @@ pub fn create_root_signature(device: &ID3D12Device) -> Result<ID3D12RootSignatur
     .map_err(|e| format!("CreateRootSignature(compute): {e}"))
 }
 
+/// A quadtree level runs the group-cooperative kernel (`cs_level_wide`, one
+/// 64-lane GROUP per tile) instead of the thread-per-tile `cs_level` while it
+/// holds at most this many tiles. Level `d` holds at most `4^d`, so this is the
+/// deepest level minus one at 1080p — and being a TILE COUNT rather than a
+/// level index, it means the same thing at any resolution.
+///
+/// The ladder was ~half the GPU frame and all of it fixed cost (bit-identical
+/// at spp=1 and spp=16), because one-thread-per-tile leaves it starved: level 0
+/// is ONE tile, i.e. a single lane of the whole GPU driving a full frustum-tree
+/// descent (60 us), while level 7's ~16000 tiles cost 100 us. The cooperative
+/// kernel splits one tile's descent across a group.
+///
+/// The crossover is MEASURED, and it landed deeper than the occupancy argument
+/// predicts (--gpu-timing, R9700, 1080p, `levels` = the 8-kernel ladder):
+///
+/// ```text
+///   wide through level   0(off)    5      6      7      8(all)
+///   default scene        1.004   0.756  0.692  0.557  0.593
+///   --stress 5000        1.729   0.948  0.858  0.689  0.781
+///   san-miguel-low-poly  0.937   0.747  0.794  0.615  0.589
+///   intel-sponza         0.953   0.779  0.698  0.529  0.562
+/// ```
+///
+/// Level 6 has ~4000 tiles — plenty to fill the machine one-thread-each — and
+/// STILL prefers the cooperative kernel, which the "too few tiles" story does
+/// not explain. Wave DIVERGENCE does: thread-per-tile puts 32 unrelated tiles
+/// in one wave, whose descent lengths differ wildly, so the wave costs the
+/// slowest of the 32. Giving one tile the whole group removes that entirely.
+/// Only the deepest level (~16000 tiles, descents of a handful of nodes) is
+/// short and uniform enough for thread-per-tile to win back the lanes.
+///
+/// `--no-wide-levels` disables the kernel outright (the pre-cooperative ladder
+/// at every level); it is also forced off under `--no-ftree`, whose binary
+/// backend has no wide bodies to descend cooperatively.
+const WIDE_MAX_TILES: u64 = 4096;
+
+/// The `--no-wide-levels` A/B lever. Read at kernel assembly (the PSO is only
+/// built when it is on) and again per level at dispatch, so the two can never
+/// disagree.
+pub static WIDE_LEVELS_ON: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+fn wide_levels_on() -> bool {
+    WIDE_LEVELS_ON.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Does level `d` take the cooperative kernel? `4^d` is the structural bound on
+/// its tile count (the real count is lower — sky and leaf tiles stop
+/// descending), which is all the CPU knows when it records the list.
+fn wide_level(d: u32) -> bool {
+    wide_levels_on() && d < 32 && (1u64 << (2 * d)) <= WIDE_MAX_TILES
+}
+
 /// Dispatch-only command signature: ExecuteIndirect over one 12-byte
 /// (x, y, z) record IS D3D12's DispatchIndirect. Null root signature —
 /// no root-argument changes ride the indirect stream.
@@ -1873,6 +1926,7 @@ pub struct TraceGpu {
     pso_prep: ID3D12PipelineState,
     pso_clear_info: ID3D12PipelineState,
     pso_level: ID3D12PipelineState,
+    pso_level_wide: Option<ID3D12PipelineState>,
     pso_sky: ID3D12PipelineState,
     pso_leaf: ID3D12PipelineState,
     /// The same kernel with the hemi arm compiled IN — used only by fb frames
@@ -2050,6 +2104,15 @@ impl TraceGpu {
         let pso_prep = pso(&wavefront_src, "cs_prep", "prep")?;
         let pso_clear_info = pso(&wavefront_src, "cs_clear_info", "clear_info")?;
         let pso_level = pso(&wavefront_src, "cs_level", "level")?;
+        // The group-cooperative shallow-level kernel — wide tree only (it is
+        // written against ft_expand/the slot-ref cut) and only when the lever
+        // is on, so --no-ftree / --no-wide-levels keep the one-thread-per-tile
+        // ladder for every level, exactly as before.
+        let pso_level_wide = if ftree_on && wide_levels_on() {
+            Some(pso(&wavefront_src, "cs_level_wide", "level_wide")?)
+        } else {
+            None
+        };
         let pso_sky = pso(&wavefront_src, "cs_sky", "sky")?;
         let pso_leaf = pso(&leaf_src, "cs_leaf", "leaf")?;
         let pso_leaf_fb = pso(&leaf_fb_src, "cs_leaf", "leaf-fb")?;
@@ -2286,6 +2349,7 @@ impl TraceGpu {
             pso_prep,
             pso_clear_info,
             pso_level,
+            pso_level_wide,
             pso_sky,
             pso_leaf,
             pso_leaf_fb,
@@ -2555,8 +2619,14 @@ impl TraceGpu {
                     if d % 2 == 0 { (&self.qa, &self.qb) } else { (&self.qb, &self.qa) };
                 // prep: this level's count -> indirect args; zero the OUT
                 // counter the level kernel is about to append into.
+                // Every level but the deepest takes the group-cooperative
+                // kernel — one TILE per 64-lane group, hence 1 item per group in
+                // the args (see WIDE_MAX_TILES). Same `best`, bit for bit; only
+                // the frustum-node counters move.
+                let wide = self.pso_level_wide.as_ref().filter(|_| wide_level(d));
+                let per_group = if wide.is_some() { 1 } else { 32 };
                 list.SetPipelineState(&self.pso_prep);
-                self.push(list, [in_ctr, out_ctr, 32, d]);
+                self.push(list, [in_ctr, out_ctr, per_group, d]);
                 list.Dispatch(1, 1, 1);
                 self.args_to_indirect(list);
                 list.SetComputeRootUnorderedAccessView(
@@ -2567,7 +2637,7 @@ impl TraceGpu {
                     RP_UAV0 + UAV_QOUT,
                     qout.GetGPUVirtualAddress(),
                 );
-                list.SetPipelineState(&self.pso_level);
+                list.SetPipelineState(wide.unwrap_or(&self.pso_level));
                 self.push(list, [in_ctr, out_ctr, 0, 0]);
                 list.ExecuteIndirect(&self.cmd_sig, 1, &self.args, d as u64 * 12, None, 0);
                 self.args_to_uav(list);

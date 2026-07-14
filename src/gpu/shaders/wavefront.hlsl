@@ -96,20 +96,19 @@ void cs_seed_probes(uint3 id : SV_DispatchThreadID) {
 
 // --- the level kernel: render.rs::tile_step, one thread per tile ----------
 // push0 = in counter (tile A or B), push1 = out counter (the other).
+//
+// The tail (sky enqueue -> advance_tc -> refine_cut -> 4-way split) is the
+// soundness-critical half and is shared verbatim with the group-cooperative
+// cs_level_wide below, which runs it on lane 0 after a cooperative bound
+// query. `lane` selects refine_cut's per-lane stack slab.
 
-[numthreads(32, 1, 1)]
-void cs_level(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
-    uint idx = flat_group(gid) * 32u + gtid.x;
-    if (idx >= counters[push0]) return;
-    TileRec rec = qin[idx];
+void level_emit(TileRec rec, TF f, float best, uint lane) {
     uint2 p0 = rect_min(rec.xy0);
     uint2 p1 = rect_max(rec.xy1);
     uint depth = rec.meta >> 8;
     uint cut_len = rec.meta & 0xffu;
     uint s;
 
-    TF f = tile_frustum(p0.x, p0.y, p1.x, p1.y);
-    float best = bound_query(f, rec.t_start, FLT_MAX, rec.cut_slot, cut_len, gtid.x);
     if (best == FLT_MAX) {
         // Sky: the whole frustum (beyond the inherited ball, which the
         // ancestor claim covers) is empty.
@@ -144,7 +143,7 @@ void cs_level(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     InterlockedAdd(counters[CTR_CUT], 1, out_slot);
     uint out_len = 0;
     if (out_slot < cap_cut) {
-        out_len = refine_cut(f, tc, FLT_MAX, rec.cut_slot, cut_len, out_slot, gtid.x);
+        out_len = refine_cut(f, tc, FLT_MAX, rec.cut_slot, cut_len, out_slot, lane);
     } else {
         InterlockedAdd(counters[CTR_CUT_FALLBACK], 1, s);
     }
@@ -198,6 +197,45 @@ void cs_level(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
         }
     }
 }
+
+[numthreads(32, 1, 1)]
+void cs_level(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
+    uint idx = flat_group(gid) * 32u + gtid.x;
+    if (idx >= counters[push0]) return;
+    TileRec rec = qin[idx];
+    uint2 p0 = rect_min(rec.xy0);
+    uint2 p1 = rect_max(rec.xy1);
+    TF f = tile_frustum(p0.x, p0.y, p1.x, p1.y);
+    float best = bound_query(f, rec.t_start, FLT_MAX, rec.cut_slot, rec.meta & 0xffu, gtid.x);
+    level_emit(rec, f, best, gtid.x);
+}
+
+#ifdef FTREE
+// The shallow-level kernel: ONE TILE per 64-lane group, the descent split
+// across the group (ftree.hlsli::gw_bound_query — bit-identical `best`, see
+// its header for why). Dispatched by record_wavefront for levels < WIDE_LEVELS,
+// where there are too few tiles to fill the machine one-thread-each; the deep
+// levels keep cs_level. The tail is serial on lane 0 so refine_cut's budget
+// argument — and therefore the emitted cut and every cut counter — stays exact.
+[numthreads(GW_GROUP, 1, 1)]
+void cs_level_wide(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
+    uint idx = flat_group(gid); // one group per tile
+    // Group-uniform: every lane returns together, so no barrier below is
+    // reached by only part of the group.
+    if (idx >= counters[push0]) return;
+    uint lane = gtid.x;
+    TileRec rec = qin[idx];
+    uint2 p0 = rect_min(rec.xy0);
+    uint2 p1 = rect_max(rec.xy1);
+    TF f = tile_frustum(p0.x, p0.y, p1.x, p1.y);
+    float best =
+        gw_bound_query(f, rec.t_start, FLT_MAX, rec.cut_slot, rec.meta & 0xffu, lane);
+    // The last barrier is inside gw_bound_query, so peeling off the other
+    // lanes here is safe.
+    if (lane != 0) return;
+    level_emit(rec, f, best, 0u);
+}
+#endif // FTREE
 
 // --- sky fill: one 64-lane group per SkyRec, grid-striding the rect -------
 // render.rs::fill_sky: pixel-CENTER dirs (no jitter, no rng), KIND_SKY at
