@@ -3,7 +3,8 @@
 //! resolve curve). Shaders are compiled at startup with D3DCompile (fxc,
 //! SM 5.0) from HLSL embedded via include_str! — no build-time toolchain.
 
-use super::d3d12::{Result, SWAPCHAIN_FORMAT};
+use super::d3d12::Result;
+use crate::tone::ToneParams;
 use windows::core::{s, PCSTR};
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::{ID3DBlob, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST};
@@ -34,6 +35,142 @@ pub const SRV_SLOT_DXR: u32 = 5;
 pub const SRV_SLOT_FSR: u32 = 6;
 /// Room for the DLSS-RR output SRV and future debug views.
 const SRV_HEAP_CAPACITY: u32 = 8;
+
+/// M12: run the REAL tonemap PS over a synthetic linear-HDR image and hand back
+/// what it wrote — the twin gate that stops `tonemap.hlsl` from drifting away
+/// from `tone::map`, the same discipline `feed.hlsl` and `nppd.hlsl` are held to.
+///
+/// Headless (no swapchain), so it renders into an offscreen target of whichever
+/// format the caller names: `SWAPCHAIN_FORMAT` gates the 8-bit SDR encode,
+/// `SWAPCHAIN_FORMAT_HDR` gates the scRGB one. Both curves come out of the same
+/// shader, so gating either would catch a drifted port — gating both also pins
+/// the encode.
+///
+/// `src` is w*h*3 linear f32; returns w*h RGB read back from the target.
+pub fn selftest(
+    hg: &mut super::trace::HeadlessGpu,
+    src: &[f32],
+    w: u32,
+    h: u32,
+    format: DXGI_FORMAT,
+    tone: ToneParams,
+) -> Result<Vec<[f32; 3]>> {
+    use super::d3d12::{
+        aligned_pitch, committed_tex, footprint, loc_footprint, loc_subresource, transition,
+        ReadbackBuffer, UploadBuffer,
+    };
+    use half::f16;
+    assert_eq!(src.len(), (w * h * 3) as usize);
+    let hdr = format == DXGI_FORMAT_R16G16B16A16_FLOAT;
+    let bpp = if hdr { 8usize } else { 4usize };
+
+    let passes = Passes::new(&hg.device, format)?;
+
+    // The source is a real RGBA16F texture bound to the real SRV slot the
+    // tonemap PS reads in `present_hdr` — not a debug binding that could hide a
+    // wiring bug.
+    let sw = w as usize;
+    let src_tex = committed_tex(
+        &hg.device,
+        w,
+        h,
+        DXGI_FORMAT_R16G16B16A16_FLOAT,
+        D3D12_RESOURCE_FLAG_NONE,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+    )?;
+    let src_pitch = aligned_pitch(sw * 8);
+    let up = UploadBuffer::new(&hg.device, src_pitch * h as usize)?;
+    for y in 0..h as usize {
+        let row: &mut [[f16; 4]] = unsafe {
+            std::slice::from_raw_parts_mut(up.ptr.add(y * src_pitch) as *mut [f16; 4], sw)
+        };
+        for (x, px) in row.iter_mut().enumerate() {
+            let i = (y * sw + x) * 3;
+            *px = [
+                f16::from_f32(src[i]),
+                f16::from_f32(src[i + 1]),
+                f16::from_f32(src[i + 2]),
+                f16::from_f32(1.0),
+            ];
+        }
+    }
+    passes.create_srv(&hg.device, &src_tex, DXGI_FORMAT_R16G16B16A16_FLOAT, SRV_SLOT_HDR);
+
+    let target = committed_tex(
+        &hg.device,
+        w,
+        h,
+        format,
+        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+        D3D12_RESOURCE_STATE_RENDER_TARGET,
+    )?;
+    let rtv_heap: ID3D12DescriptorHeap = unsafe {
+        hg.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+            NumDescriptors: 1,
+            ..Default::default()
+        })
+    }
+    .map_err(|e| format!("selftest RTV heap: {e}"))?;
+    let rtv = unsafe { rtv_heap.GetCPUDescriptorHandleForHeapStart() };
+    unsafe { hg.device.CreateRenderTargetView(&target, None, rtv) };
+
+    let pitch = aligned_pitch(sw * bpp);
+    let rb = ReadbackBuffer::new(&hg.device, pitch * h as usize)?;
+    let src_fp = footprint(DXGI_FORMAT_R16G16B16A16_FLOAT, w, h, 8, 0);
+    let dst_fp = footprint(format, w, h, bpp, 0);
+
+    hg.run(|list| unsafe {
+        list.CopyTextureRegion(
+            &loc_subresource(&src_tex),
+            0,
+            0,
+            0,
+            &loc_footprint(&up.resource, src_fp),
+            None,
+        );
+        list.ResourceBarrier(&[transition(
+            &src_tex,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        )]);
+        // inv_samples = 1.0: `src` is already a per-frame radiance image.
+        passes.record(list, &passes.tonemap_pso, SRV_SLOT_HDR, 1.0, tone, rtv, w, h);
+        list.ResourceBarrier(&[transition(
+            &target,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+        )]);
+        list.CopyTextureRegion(
+            &loc_footprint(&rb.resource, dst_fp),
+            0,
+            0,
+            0,
+            &loc_subresource(&target),
+            None,
+        );
+    })?;
+
+    let mut ptr = std::ptr::null_mut();
+    unsafe { rb.resource.Map(0, None, Some(&mut ptr)) }
+        .map_err(|e| format!("selftest readback Map: {e}"))?;
+    let mut out = vec![[0.0f32; 3]; (w * h) as usize];
+    for y in 0..h as usize {
+        let row = unsafe { (ptr as *const u8).add(y * pitch) };
+        for x in 0..sw {
+            out[y * sw + x] = if hdr {
+                let px: &[f16; 4] = unsafe { &*(row.add(x * 8) as *const [f16; 4]) };
+                [px[0].into(), px[1].into(), px[2].into()]
+            } else {
+                // B8G8R8A8_UNORM — B and R are swapped on the wire.
+                let px: &[u8; 4] = unsafe { &*(row.add(x * 4) as *const [u8; 4]) };
+                [px[2] as f32 / 255.0, px[1] as f32 / 255.0, px[0] as f32 / 255.0]
+            };
+        }
+    }
+    unsafe { rb.resource.Unmap(0, None) };
+    Ok(out)
+}
 
 pub(super) fn compile(src: &str, entry: PCSTR, target: PCSTR, what: &str) -> Result<ID3DBlob> {
     let mut blob: Option<ID3DBlob> = None;
@@ -95,8 +232,14 @@ fn default_blend() -> D3D12_BLEND_DESC {
     }
 }
 
+/// Root constants the fullscreen PS reads (b0). `inv_samples` plus the four
+/// `tone::ToneParams` fields — the presentation curve is uniform state, not
+/// baked into the shader, which is what lets a display change be a retune.
+const NUM_ROOT_CONSTS: u32 = 5;
+
 fn fullscreen_pso(
     device: &ID3D12Device,
+    rtv_format: DXGI_FORMAT,
     root_sig: &ID3D12RootSignature,
     vs: &ID3DBlob,
     ps: &ID3DBlob,
@@ -120,14 +263,16 @@ fn fullscreen_pso(
         ..Default::default()
     };
     let mut desc = desc;
-    desc.RTVFormats[0] = SWAPCHAIN_FORMAT;
+    desc.RTVFormats[0] = rtv_format;
     unsafe { device.CreateGraphicsPipelineState(&desc) }
         .map_err(|e| format!("CreateGraphicsPipelineState: {e}"))
 }
 
 impl Passes {
-    pub fn new(device: &ID3D12Device) -> Result<Self> {
-        // Root signature: [0] SRV table (t0, pixel), [1] 4 root constants (b0).
+    /// `rtv_format` is the swapchain's actual format (`D3d::format`) — both PSOs
+    /// bake it, so it must come from the swapchain, never from the CLI flag.
+    pub fn new(device: &ID3D12Device, rtv_format: DXGI_FORMAT) -> Result<Self> {
+        // Root signature: [0] SRV table (t0, pixel), [1] root constants (b0).
         let ranges = [D3D12_DESCRIPTOR_RANGE {
             RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
             NumDescriptors: 1,
@@ -152,7 +297,7 @@ impl Passes {
                     Constants: D3D12_ROOT_CONSTANTS {
                         ShaderRegister: 0,
                         RegisterSpace: 0,
-                        Num32BitValues: 4,
+                        Num32BitValues: NUM_ROOT_CONSTS,
                     },
                 },
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
@@ -184,8 +329,8 @@ impl Passes {
         let blit_ps = compile(BLIT_HLSL, s!("psmain"), s!("ps_5_0"), "blit ps")?;
         let tm_vs = compile(TONEMAP_HLSL, s!("vsmain"), s!("vs_5_0"), "tonemap vs")?;
         let tm_ps = compile(TONEMAP_HLSL, s!("psmain"), s!("ps_5_0"), "tonemap ps")?;
-        let blit_pso = fullscreen_pso(device, &root_sig, &blit_vs, &blit_ps)?;
-        let tonemap_pso = fullscreen_pso(device, &root_sig, &tm_vs, &tm_ps)?;
+        let blit_pso = fullscreen_pso(device, rtv_format, &root_sig, &blit_vs, &blit_ps)?;
+        let tonemap_pso = fullscreen_pso(device, rtv_format, &root_sig, &tm_vs, &tm_ps)?;
 
         let srv_heap: ID3D12DescriptorHeap = unsafe {
             device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
@@ -227,16 +372,20 @@ impl Passes {
         D3D12_GPU_DESCRIPTOR_HANDLE { ptr: start.ptr + ((slot * self.srv_size) as u64) }
     }
 
-    /// Record a fullscreen pass: PSO + root sig + SRV slot (+ optional
-    /// inv_samples root constant) drawing 3 vertices to the bound RTV.
+    /// Record a fullscreen pass: PSO + root sig + SRV slot + the inv_samples and
+    /// `ToneParams` root constants, drawing 3 vertices to the bound RTV.
     /// Re-binds everything each call — this doubles as the post-Streamline
     /// state restore required by eDisableCLStateTracking.
+    ///
+    /// `tone` is ignored by the blit PSO (its source is already encoded); it is
+    /// passed unconditionally so the two PSOs can share one root signature.
     pub fn record(
         &self,
         list: &ID3D12GraphicsCommandList,
         pso: &ID3D12PipelineState,
         srv_slot: u32,
         inv_samples: f32,
+        tone: ToneParams,
         rtv: D3D12_CPU_DESCRIPTOR_HANDLE,
         w: u32,
         h: u32,
@@ -246,8 +395,20 @@ impl Passes {
             list.SetGraphicsRootSignature(&self.root_sig);
             list.SetDescriptorHeaps(&[Some(self.srv_heap.clone())]);
             list.SetGraphicsRootDescriptorTable(0, self.gpu_srv(srv_slot));
-            let consts = [inv_samples, 0.0, 0.0, 0.0];
-            list.SetGraphicsRoot32BitConstants(1, 4, consts.as_ptr() as *const _, 0);
+            // Layout must match tonemap.hlsl's cbuffer exactly.
+            let consts: [f32; NUM_ROOT_CONSTS as usize] = [
+                inv_samples,
+                tone.knee,
+                tone.headroom,
+                tone.scale,
+                if tone.gamma { 1.0 } else { 0.0 },
+            ];
+            list.SetGraphicsRoot32BitConstants(
+                1,
+                NUM_ROOT_CONSTS,
+                consts.as_ptr() as *const _,
+                0,
+            );
             list.RSSetViewports(&[D3D12_VIEWPORT {
                 TopLeftX: 0.0,
                 TopLeftY: 0.0,

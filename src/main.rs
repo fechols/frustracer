@@ -44,6 +44,9 @@ mod prof;
 mod replay;
 mod temporal;
 mod texture;
+// The presentation curve — one source of truth for SDR and scRGB alike, shared
+// by every CPU present arm and ported term-for-term into tonemap.hlsl.
+mod tone;
 // Pure chain-resolution data for the always-on temporal-upscaler fallback
 // (DLSS-RR → FSR4-RR → XeSS → FSR3); the real probes live in GpuContext::new.
 mod upchain;
@@ -270,6 +273,20 @@ pub struct Opts {
     /// interval 0 on a tearing swapchain so interactive frame times measure
     /// the renderer, not the monitor refresh.
     pub vsync: bool,
+    /// Present scRGB (R16G16B16A16_FLOAT + G10_NONE_P709). **On by default**:
+    /// an f16 swapchain is the right thing to hand Windows regardless of the
+    /// monitor. On an HDR display it carries real highlights; on an SDR one it
+    /// still removes our 8-bit quantization and lets DWM drive a 10-bit panel
+    /// at full precision (deep colour) instead of banding at 8. `--no-hdr`
+    /// forces the legacy 8-bit swapchain — the A/B lever, and the automatic
+    /// fallback when the colour space is refused.
+    pub hdr: bool,
+    /// `--hdr-paper-white <nits>`: where linear 1.0 lands. The scene is authored
+    /// so 1.0 ≈ diffuse white; 200 is the usual desktop-HDR reference.
+    pub hdr_paper_white: f32,
+    /// `--hdr-peak <nits>`: override the display's reported peak. None = trust
+    /// what the monitor says (`gpu::display::probe`).
+    pub hdr_peak: Option<f32>,
 }
 
 /// OIDN placement in XeSS mode (N cycles off → pre → post). Pre denoises the
@@ -387,6 +404,11 @@ fn main() {
             concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\pix\bin\x64").to_string()
         }),
         vsync: true,
+        // scRGB is the default swapchain: see Opts::hdr. The 8-bit path survives
+        // as --no-hdr and as the automatic fallback.
+        hdr: true,
+        hdr_paper_white: tone::DEFAULT_PAPER_WHITE,
+        hdr_peak: None,
     };
     let mut check_dlss = false;
     let mut dlss_dump = false;
@@ -593,6 +615,29 @@ fn main() {
             }
             "--no-vsync" => opts.vsync = false,
             "--vsync" => opts.vsync = true,
+            "--hdr" => opts.hdr = true,
+            "--no-hdr" => opts.hdr = false,
+            "--hdr-paper-white" => {
+                opts.hdr_paper_white = args
+                    .next()
+                    .and_then(|v| v.parse::<f32>().ok())
+                    .filter(|v| *v >= 1.0)
+                    .unwrap_or_else(|| {
+                        eprintln!("--hdr-paper-white needs a luminance in nits (e.g. 200)");
+                        std::process::exit(2);
+                    });
+            }
+            "--hdr-peak" => {
+                opts.hdr_peak = Some(
+                    args.next()
+                        .and_then(|v| v.parse::<f32>().ok())
+                        .filter(|v| *v >= 1.0)
+                        .unwrap_or_else(|| {
+                            eprintln!("--hdr-peak needs a luminance in nits (e.g. 1000)");
+                            std::process::exit(2);
+                        }),
+                );
+            }
             "--pix-markers" => opts.pix_markers = true,
             "--pix-path" => {
                 opts.pix_path = args.next().unwrap_or_else(|| {
@@ -4178,6 +4223,113 @@ fn run_check_gpu(
         }
     }
 
+    // --- M12: the tonemap PS vs tone::map (the HLSL twin gate) ---
+    // tonemap.hlsl is a term-for-term port of tone::map, and this is what stops
+    // it drifting: the REAL pixel shader, through the REAL PSO and SRV slot, over
+    // a synthetic linear-HDR ramp that deliberately spans the whole interesting
+    // range — below the knee, through the rolloff, and far past it (a physical
+    // sun disc is ~44,000, so the tail is not hypothetical).
+    //
+    // Both encodings are gated: SDR 8-bit (the default, which must not move) and
+    // scRGB f16 (the --hdr path). One shader produces both, so gating each pins
+    // the curve AND its encode.
+    {
+        const TW: u32 = 64;
+        const TH: u32 = 32;
+        // The tail is the point: a physical sun disc is ~44,000, so the ramp is
+        // pinned to END at RAMP_HI rather than wherever a growth factor happens
+        // to land (an earlier `0.001 * 1.0002^(30i)` topped out near 215 — it
+        // never reached the regime this gate exists to cover). RAMP_HI stays
+        // under f16::MAX (65504) because the source is a real RGBA16F texture.
+        const RAMP_LO: f32 = 1e-3;
+        const RAMP_HI: f32 = 6.0e4;
+        let n = (TW * TH) as usize;
+        // Geometric from RAMP_LO to exactly RAMP_HI, plus a zero and an
+        // exact-knee sample.
+        let span = (n - 3) as f32;
+        let radiance = |i: usize| -> f32 {
+            match i {
+                0 => 0.0,
+                1 => 1.0, // exactly the HDR knee: must be reproduced, not rolled off
+                _ => RAMP_LO * (RAMP_HI / RAMP_LO).powf((i - 2) as f32 / span),
+            }
+        };
+        // Anti-vacuity: the gate's whole claim is that it spans the sun-disc
+        // range, so assert the ramp actually gets there rather than trusting the
+        // arithmetic above to stay right.
+        let top = radiance(n - 1);
+        if !(top >= 4.4e4 && top <= 65504.0) {
+            eprintln!("check-gpu: FAIL M12 ramp tops out at {top:.0} — must span the sun-disc range");
+            ok = false;
+        }
+        let src: Vec<f32> = (0..n * 3)
+            .map(|k| radiance(k / 3) * [1.0, 0.75, 0.4][k % 3])
+            .collect();
+
+        for (label, format, tp, tol) in [
+            (
+                "sdr",
+                gpu::d3d12::SWAPCHAIN_FORMAT,
+                tone::ToneParams::SDR,
+                1.0 / 255.0 + 1e-6, // one UNORM LSB — the wire quantizes
+            ),
+            (
+                "scrgb",
+                gpu::d3d12::SWAPCHAIN_FORMAT_HDR,
+                tone::ToneParams::hdr(200.0, 1000.0),
+                2e-3, // f16 wire + fp differences between HLSL exp/pow and Rust's
+            ),
+        ] {
+            match gpu::tonemap::selftest(&mut hg, &src, TW, TH, format, tp) {
+                Ok(got) => {
+                    let mut worst = 0.0f32;
+                    let mut worst_at = 0.0f32;
+                    for i in 0..n {
+                        // Feed the oracle what the SHADER actually reads: the
+                        // source is a real RGBA16F texture, so the f32 ramp is
+                        // f16-rounded on the way in. Comparing against the exact
+                        // f32 would charge the port for the wire's rounding —
+                        // which at the top of the ramp is a step of 32 radiance,
+                        // and this gate is about the curve, not the upload.
+                        let q = |v: f32| half::f16::from_f32(v).to_f32();
+                        let c = glam::Vec3A::new(
+                            q(src[i * 3]),
+                            q(src[i * 3 + 1]),
+                            q(src[i * 3 + 2]),
+                        );
+                        let want = tone::map(c, tp);
+                        for ch in 0..3 {
+                            // Relative for the big scRGB values, absolute for the
+                            // small ones — an absolute-only gate would be
+                            // meaningless at the top of the range.
+                            let w = want[ch];
+                            let d = (got[i][ch] - w).abs() / (1.0f32).max(w.abs());
+                            if d > worst {
+                                worst = d;
+                                worst_at = radiance(i);
+                            }
+                        }
+                    }
+                    if worst > tol {
+                        eprintln!(
+                            "check-gpu: FAIL M12 tonemap PS ({label}) vs tone::map — \
+                             worst {worst:.2e} > {tol:.2e} at radiance {worst_at:.3}"
+                        );
+                        ok = false;
+                    } else {
+                        println!(
+                            "check-gpu: M12 tonemap PS ({label}) == tone::map (worst {worst:.2e})"
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("check-gpu: FAIL M12 tonemap selftest ({label}): {e}");
+                    ok = false;
+                }
+            }
+        }
+    }
+
     if !ok {
         eprintln!("GPU CHECK FAILED");
         return 1;
@@ -6960,6 +7112,18 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
     };
 
+    // Presentation-curve self-test — the SDR degeneracy (bit-for-bit against
+    // the pre-HDR curve: the guard that --hdr did not move the default), the
+    // paper-white anchor, monotonicity, the headroom asymptote, and C¹ at the
+    // knee. The HLSL twin is gated against this same math by --check-gpu M12.
+    let tone_ok = match tone::self_test() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("tone self-test: FAIL — {e}");
+            false
+        }
+    };
+
     // glTF loader self-test — an in-code GLB exercises node flattening, the
     // mirrored-winding flip, u16 index widening, and the factor mapping.
     let gltf_ok = match gltf_loader::self_test() {
@@ -9003,6 +9167,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         ("matclass", matclass_ok),
         ("tangent", tangent_ok),
         ("upchain", upchain_ok),
+        ("tone", tone_ok),
         ("gltf", gltf_ok),
         ("bc7", bc7_ok),
         ("hemi-ao", hemi_ok),
@@ -9162,6 +9327,9 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
         prefer: opts.prefer,
         debug: opts.gpu_debug,
         vsync: opts.vsync,
+        hdr: opts.hdr,
+        paper_white: opts.hdr_paper_white,
+        peak_nits: opts.hdr_peak,
     };
     let mut gpu = gpu::GpuContext::new(sdl_hwnd(&window), W as u32, H as u32, &gopts)
         .expect("GPU init failed");
@@ -9236,7 +9404,7 @@ fn session(
     let accum: Vec<AtomicU32> = (0..w * h * 3).map(|_| AtomicU32::new(0)).collect();
     let info: Vec<AtomicU32> = (0..w * h).map(|_| AtomicU32::new(0)).collect();
     let tbuf: Vec<AtomicU32> = (0..w * h).map(|_| AtomicU32::new(0)).collect();
-    let mut present = vec![0u32; w * h];
+    let mut present = CpuPresent::new(w, h, gpu.is_hdr(), gpu.tone());
     let stats = Stats::default();
     // Temporal claim ring + lockstep cut stores: see TemporalRing. Half-res
     // and plain frames don't participate and drop the ring — a cache from
@@ -11637,28 +11805,20 @@ fn session(
                         let result = octx
                             .set_res(w, h)
                             .and_then(|()| octx.denoise_hdr(&xess_hdr, og).map(drop));
+                        present.tone = gpu.tone();
                         match result {
-                            Ok(()) => render::resolve_hdr(
-                                octx.last_output(),
-                                &info,
-                                false,
-                                &mut present,
-                                w,
-                                h,
-                                w,
-                                h,
-                            ),
+                            Ok(()) => {
+                                present.resolve_hdr(octx.last_output(), &info, false, w, h, w, h)
+                            }
                             Err(e) => {
                                 eprintln!(
                                     "oidn: post-denoise failed ({e}); presenting the raw upscale (N to retry)"
                                 );
                                 xess_oidn = XessOidn::Off;
-                                render::resolve_hdr(
-                                    &xess_hdr, &info, false, &mut present, w, h, w, h,
-                                );
+                                present.resolve_hdr(&xess_hdr, &info, false, w, h, w, h);
                             }
                         }
-                        gpu.present_cpu(&present).expect("GPU present failed");
+                        present.blit(gpu).expect("GPU present failed");
                     }
                     Err(e) => {
                         eprintln!("xess: upscale failed ({e}); XeSS disabled (X to retry)");
@@ -11803,12 +11963,12 @@ fn session(
                         octx.denoise(&accum, frame.max(1), og).map(drop)
                     }
                 });
+                present.tone = gpu.tone();
                 match result {
-                    Ok(()) => render::resolve_hdr(
+                    Ok(()) => present.resolve_hdr(
                         octx.last_output(),
                         &info,
                         overlay_on && hybrid,
-                        &mut present,
                         w,
                         h,
                         w,
@@ -11825,12 +11985,11 @@ fn session(
                                 h.invalidate();
                             }
                         }
-                        render::resolve(
+                        present.resolve(
                             &accum,
                             &info,
                             if oidn_t { 1 } else { frame.max(1) },
                             overlay_on && hybrid,
-                            &mut present,
                             rw,
                             rh,
                             w,
@@ -11839,18 +11998,18 @@ fn session(
                     }
                 }
             } else if edges.toggle_overlay {
-                render::resolve_hdr(
+                present.tone = gpu.tone();
+                present.resolve_hdr(
                     octx.last_output(),
                     &info,
                     overlay_on && hybrid,
-                    &mut present,
                     w,
                     h,
                     w,
                     h,
                 );
             }
-            gpu.present_cpu(&present).expect("GPU present failed");
+            present.blit(gpu).expect("GPU present failed");
         } else if nppd_on {
             // NPPD: one recurrent network step on the CPU-resolve path — the
             // state is warped by this frame's motion vectors, the 1-spp frame
@@ -11864,13 +12023,13 @@ fn session(
                 let result = nctx
                     .set_res(w, h)
                     .and_then(|()| nctx.denoise(&accum, ng, &basis, dlss_far).map(drop));
+                present.tone = gpu.tone();
                 match result {
                     Ok(()) => {
-                        render::resolve_hdr(
+                        present.resolve_hdr(
                             nctx.last_output(),
                             &info,
                             overlay_on && hybrid,
-                            &mut present,
                             w,
                             h,
                             w,
@@ -11887,12 +12046,11 @@ fn session(
                         // accum holds one 1-spp frame, not a sum: resolve it
                         // as 1 sample and restart accumulation cleanly.
                         frame = 0;
-                        render::resolve(
+                        present.resolve(
                             &accum,
                             &info,
                             1,
                             overlay_on && hybrid,
-                            &mut present,
                             rw,
                             rh,
                             w,
@@ -11901,22 +12059,22 @@ fn session(
                     }
                 }
             }
-            gpu.present_cpu(&present).expect("GPU present failed");
+            present.blit(gpu).expect("GPU present failed");
         } else if use_gpu_tone {
             gpu.present_hdr(&accum, frame.max(1)).expect("GPU present failed");
         } else {
-            render::resolve(
+            present.tone = gpu.tone();
+            present.resolve(
                 &accum,
                 &info,
                 frame.max(1),
                 overlay_on && hybrid,
-                &mut present,
                 rw,
                 rh,
                 w,
                 h,
             );
-            gpu.present_cpu(&present).expect("GPU present failed");
+            present.blit(gpu).expect("GPU present failed");
         }
         // Stability meter (FRUSTRACER_STAB=1): quantifies temporal
         // instability of the upscaled output — hold the camera still and a
@@ -11965,52 +12123,115 @@ fn session(
         plot!("replay leaves", stats.replay_leaf_tiles.load(Relaxed));
         plot!("render h", rh);
         fps_frames += 1;
-        if (now - fps_t).as_secs_f64() >= 1.0 {
+        let tick_1hz = (now - fps_t).as_secs_f64() >= 1.0;
+        if tick_1hz {
             fps = fps_frames as f64 / (now - fps_t).as_secs_f64();
             fps_frames = 0;
             fps_t = now;
         }
 
+        // The window may now be over a different monitor, or the same monitor's
+        // HDR may have been switched on or off underneath us. Re-probe on the
+        // window events that CAN signal it, and once a second regardless —
+        // toggling Windows HDR in place fires no window event at all, so the
+        // poll is the only thing that sees it. Both funnel into one refresh.
+        //
+        // This is deliberately cheap: a GetDesc1 and a root-constant retune.
+        // No ResizeBuffers, no PSO rebuild, no resource realloc — and no
+        // upscaler-history reset, because a change of output device is not a
+        // change of scene (the same reason camera motion never resets it).
+        if edges.display_changed || tick_1hz {
+            if let Some(d) = gpu.refresh_display(opts.hdr_paper_white, opts.hdr_peak) {
+                let t = gpu.tone();
+                if d.enabled {
+                    eprintln!(
+                        "hdr: display changed — peak {:.0} nits (full-frame {:.0}), \
+                         headroom {:.1}x at {:.0}-nit paper white",
+                        d.max_nits,
+                        d.max_full_frame_nits,
+                        t.headroom,
+                        opts.hdr_paper_white
+                    );
+                } else {
+                    eprintln!("hdr: display changed — HDR is OFF on this monitor; SDR levels");
+                }
+            }
+        }
+
         if edges.screenshot {
+            // A PNG is 8-bit and has nowhere to put a nit, so a screenshot is
+            // always the SDR curve — even in an --hdr session. The GPU readback
+            // paths already tonemap to SDR (read_hdr_output); the CPU-presented
+            // arms hold f16 scRGB under --hdr, so they re-resolve from the same
+            // linear source rather than trying to invert the display encode.
             if dlss_on {
                 // The denoised image exists only on the GPU — read the RR
                 // output back and tonemap it (same curve, 1 spp). On failure
                 // fall back to a fresh CPU resolve of the noisy input.
                 match gpu.read_rr_output() {
-                    Ok(px) => present.copy_from_slice(&px),
+                    Ok(px) => present.sdr.copy_from_slice(&px),
                     Err(e) => {
                         eprintln!("screenshot: RR readback failed ({e}); saving noisy 1-spp resolve");
-                        render::resolve(&accum, &info, 1, false, &mut present, rw, rh, w, h);
+                        present.resolve_sdr(&accum, &info, 1, false, rw, rh, w, h);
                     }
                 }
             } else if fsr_on {
                 // Same story as DLSS: the denoised+upscaled image lives only
                 // on the GPU.
                 match gpu.read_fsr_output() {
-                    Ok(px) => present.copy_from_slice(&px),
+                    Ok(px) => present.sdr.copy_from_slice(&px),
                     Err(e) => {
                         eprintln!("screenshot: FSR readback failed ({e}); saving noisy 1-spp resolve");
-                        render::resolve(&accum, &info, 1, false, &mut present, rw, rh, w, h);
+                        present.resolve_sdr(&accum, &info, 1, false, rw, rh, w, h);
                     }
                 }
             } else if xess_on && xess_oidn != XessOidn::Post {
                 // Same story as DLSS: the upscaled image lives only on the
-                // GPU. (POST placement presents via the CPU path, so its
-                // present buffer is already current — plain save.)
+                // GPU. (POST placement presents via the CPU path — it is
+                // handled with the other CPU arms below.)
                 match gpu.read_xess_output() {
-                    Ok(px) => present.copy_from_slice(&px),
+                    Ok(px) => present.sdr.copy_from_slice(&px),
                     Err(e) => {
                         eprintln!("screenshot: XeSS readback failed ({e}); saving noisy 1-spp resolve");
-                        render::resolve(&accum, &info, 1, false, &mut present, rw, rh, w, h);
+                        present.resolve_sdr(&accum, &info, 1, false, rw, rh, w, h);
                     }
                 }
             } else if use_gpu_tone {
                 // The present buffer is stale in GPU-tonemap mode; resolve
                 // fresh for the screenshot.
-                render::resolve(&accum, &info, frame.max(1), false, &mut present, rw, rh, w, h);
+                present.resolve_sdr(&accum, &info, frame.max(1), false, rw, rh, w, h);
+            } else if present.is_hdr {
+                // The CPU arms hold scRGB f16, which a PNG cannot carry — so
+                // re-resolve each arm's OWN linear source through the SDR curve.
+                // The overlay rides along exactly as it does on screen (an SDR
+                // session saves the present buffer verbatim, overlay included;
+                // dropping it here would make the two sessions disagree about
+                // what P captures).
+                let ov = overlay_on && hybrid;
+                if oidn_on {
+                    let src = oidn_ctx.as_ref().expect("oidn_on without context").last_output();
+                    present.resolve_hdr_sdr(src, &info, ov, w, h, w, h);
+                } else if nppd_on {
+                    let src = nppd_ctx.as_ref().expect("nppd_on without context").last_output();
+                    present.resolve_hdr_sdr(src, &info, ov, w, h, w, h);
+                } else if xess_on {
+                    // Only POST placement reaches here (the others took the GPU
+                    // readback arm), and POST presents the OIDN-denoised
+                    // window-res image — NOT the raw upscale in `xess_hdr`.
+                    // Saving xess_hdr would write a visibly noisier PNG than the
+                    // window showed. A failed denoise sets xess_oidn = Off, which
+                    // routes to the readback arm instead, so `Post` here really
+                    // does imply a live context with a current output.
+                    match oidn_ctx.as_ref().filter(|_| xess_oidn == XessOidn::Post) {
+                        Some(o) => present.resolve_hdr_sdr(o.last_output(), &info, ov, w, h, w, h),
+                        None => present.resolve_hdr_sdr(&xess_hdr, &info, ov, w, h, w, h),
+                    }
+                } else {
+                    present.resolve_sdr(&accum, &info, frame.max(1), ov, rw, rh, w, h);
+                }
             }
             let name = format!("screenshot_{shot}.png");
-            save_png(&name, &present, w, h);
+            save_png(&name, &present.sdr, w, h);
             eprintln!("saved {name}");
             shot += 1;
         }
@@ -12200,6 +12421,118 @@ fn session(
         depth_est,
     });
     end
+}
+
+/// The CPU present buffer for the arms that tonemap on the CPU (OIDN, NPPD,
+/// XeSS-post, and the plain resolve).
+///
+/// Two encodings, one curve. An SDR session fills `sdr` (u32 0x00RRGGBB); an
+/// scRGB session fills `hdr` ([f16; 4], already curve+overlay+encode). Which
+/// one is a property of the SWAPCHAIN, decided once — so an arm cannot
+/// accidentally present 8-bit pixels into an f16 backbuffer.
+///
+/// `sdr` is allocated in both modes because screenshots are always 8-bit PNG:
+/// a file has nowhere to put a nit. In an HDR session the screenshot path
+/// re-resolves into it (`resolve_*_sdr`) rather than trying to invert the
+/// display-referred f16 — that inversion is not well-defined, and a screenshot
+/// is rare enough that a second tonemap costs nothing.
+struct CpuPresent {
+    sdr: Vec<u32>,
+    hdr: Vec<[half::f16; 4]>,
+    /// Refreshed from `gpu.tone()` each frame — this is how a display change
+    /// reaches the CPU arms.
+    tone: tone::ToneParams,
+    is_hdr: bool,
+}
+
+impl CpuPresent {
+    fn new(w: usize, h: usize, is_hdr: bool, tone: tone::ToneParams) -> Self {
+        Self {
+            sdr: vec![0u32; w * h],
+            hdr: if is_hdr { vec![[half::f16::ZERO; 4]; w * h] } else { Vec::new() },
+            tone,
+            is_hdr,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve(
+        &mut self,
+        accum: &[AtomicU32],
+        info: &[AtomicU32],
+        samples: u32,
+        overlay: bool,
+        rw: usize,
+        rh: usize,
+        w: usize,
+        h: usize,
+    ) {
+        if self.is_hdr {
+            render::resolve_scrgb(
+                accum, info, samples, overlay, self.tone, &mut self.hdr, rw, rh, w, h,
+            );
+        } else {
+            render::resolve(accum, info, samples, overlay, &mut self.sdr, rw, rh, w, h);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_hdr(
+        &mut self,
+        src: &[f32],
+        info: &[AtomicU32],
+        overlay: bool,
+        rw: usize,
+        rh: usize,
+        w: usize,
+        h: usize,
+    ) {
+        if self.is_hdr {
+            render::resolve_hdr_scrgb(src, info, overlay, self.tone, &mut self.hdr, rw, rh, w, h);
+        } else {
+            render::resolve_hdr(src, info, overlay, &mut self.sdr, rw, rh, w, h);
+        }
+    }
+
+    /// Force the SDR encoding regardless of the session — the screenshot path,
+    /// where the destination is always an 8-bit PNG. The `resolve_*` pair above
+    /// picks its encoding from the swapchain; these two never do.
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_sdr(
+        &mut self,
+        accum: &[AtomicU32],
+        info: &[AtomicU32],
+        samples: u32,
+        overlay: bool,
+        rw: usize,
+        rh: usize,
+        w: usize,
+        h: usize,
+    ) {
+        render::resolve(accum, info, samples, overlay, &mut self.sdr, rw, rh, w, h);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_hdr_sdr(
+        &mut self,
+        src: &[f32],
+        info: &[AtomicU32],
+        overlay: bool,
+        rw: usize,
+        rh: usize,
+        w: usize,
+        h: usize,
+    ) {
+        render::resolve_hdr(src, info, overlay, &mut self.sdr, rw, rh, w, h);
+    }
+
+    fn blit(&self, gpu: &mut gpu::GpuContext) -> gpu::d3d12::Result<()> {
+        if self.is_hdr {
+            gpu.present_cpu_hdr(&self.hdr)
+        } else {
+            gpu.present_cpu(&self.sdr)
+        }
+    }
 }
 
 fn save_png(name: &str, present: &[u32], w: usize, h: usize) {

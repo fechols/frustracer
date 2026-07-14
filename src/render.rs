@@ -8,7 +8,9 @@ use crate::scene::Scene;
 use crate::shade::{self, Quality};
 use crate::stats::{LocalStats, Stats};
 use crate::temporal::{self, TemporalCache};
+use crate::tone;
 use glam::Vec3A;
+use half::f16;
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
@@ -1705,9 +1707,95 @@ pub fn resolve_hdr(
     });
 }
 
-/// Tonemap one averaged linear-RGB pixel (soft rolloff + gamma), blend the
-/// debug overlay, and pack to 0x00RRGGBB — the single CPU-side source of the
-/// presentation curve, shared by `resolve` and `resolve_hdr`.
+/// `resolve` for the scRGB f16 swapchain — same average, same overlay, same
+/// nearest upscale; only the encode differs.
+pub fn resolve_scrgb(
+    accum: &[AtomicU32],
+    info: &[AtomicU32],
+    samples: u32,
+    overlay_on: bool,
+    p: tone::ToneParams,
+    present: &mut [[f16; 4]],
+    rw: usize,
+    rh: usize,
+    ww: usize,
+    wh: usize,
+) {
+    crate::zone!("resolve-scrgb");
+    let inv = 1.0 / samples.max(1) as f32;
+    present.par_chunks_mut(ww).enumerate().for_each(|(wy, row)| {
+        let sy = (wy * rh / wh).min(rh - 1);
+        for (wx, out) in row.iter_mut().enumerate() {
+            let sx = (wx * rw / ww).min(rw - 1);
+            let i = (sy * rw + sx) * 3;
+            let c = Vec3A::new(
+                f32::from_bits(accum[i].load(Relaxed)),
+                f32::from_bits(accum[i + 1].load(Relaxed)),
+                f32::from_bits(accum[i + 2].load(Relaxed)),
+            ) * inv;
+            *out = present_px_scrgb(c, p, info, overlay_on, sx, sy, rw, rh);
+        }
+    });
+}
+
+/// `resolve_hdr` for the scRGB f16 swapchain — the OIDN / NPPD / XeSS-post
+/// output path, which hands over an already-averaged linear HDR buffer.
+pub fn resolve_hdr_scrgb(
+    hdr: &[f32],
+    info: &[AtomicU32],
+    overlay_on: bool,
+    p: tone::ToneParams,
+    present: &mut [[f16; 4]],
+    rw: usize,
+    rh: usize,
+    ww: usize,
+    wh: usize,
+) {
+    crate::zone!("resolve-hdr-scrgb");
+    present.par_chunks_mut(ww).enumerate().for_each(|(wy, row)| {
+        let sy = (wy * rh / wh).min(rh - 1);
+        for (wx, out) in row.iter_mut().enumerate() {
+            let sx = (wx * rw / ww).min(rw - 1);
+            let i = (sy * rw + sx) * 3;
+            let c = Vec3A::new(hdr[i], hdr[i + 1], hdr[i + 2]);
+            *out = present_px_scrgb(c, p, info, overlay_on, sx, sy, rw, rh);
+        }
+    });
+}
+
+/// Blend the quadtree debug overlay: tint by kind, darken tile borders.
+///
+/// The tints are **display-space [0,1] colours** — authored to look right
+/// against a gamma-encoded image — so both callers composite them in that space
+/// and nowhere else. The scRGB path pays a gamma round-trip to do so, which is
+/// the whole reason this is factored out: compositing in linear instead would
+/// tint highlights in proportion to their magnitude rather than uniformly, and
+/// the overlay would not match the SDR build.
+#[inline]
+fn overlay_px(
+    mut c: Vec3A,
+    info: &[AtomicU32],
+    sx: usize,
+    sy: usize,
+    rw: usize,
+    rh: usize,
+) -> Vec3A {
+    let pi = info[sy * rw + sx].load(Relaxed);
+    let (tint, alpha) = overlay::tint(pi);
+    c = c.lerp(tint, alpha);
+    let right = if sx + 1 < rw { info[sy * rw + sx + 1].load(Relaxed) } else { pi };
+    let down = if sy + 1 < rh { info[(sy + 1) * rw + sx].load(Relaxed) } else { pi };
+    if right != pi || down != pi {
+        c *= 0.25; // tile border
+    }
+    c
+}
+
+/// Tonemap and pack to 0x00RRGGBB for the 8-bit SDR swapchain (the fallback
+/// path when the scRGB colour space is refused). `ToneParams::SDR` is the
+/// pre-HDR curve exactly — gated bit-for-bit by `tone::self_test` — and
+/// `shape` has already applied the gamma, so the overlay lands in display
+/// space with no extra work.
 #[inline]
 fn present_px(
     c: Vec3A,
@@ -1718,20 +1806,42 @@ fn present_px(
     rw: usize,
     rh: usize,
 ) -> u32 {
-    // soft rolloff + gamma
-    let mut c = (Vec3A::ONE - (-c).exp()).powf(1.0 / 2.2);
+    let mut c = tone::shape(c, tone::ToneParams::SDR);
     if overlay_on {
-        let pi = info[sy * rw + sx].load(Relaxed);
-        let (tint, alpha) = overlay::tint(pi);
-        c = c.lerp(tint, alpha);
-        let right = if sx + 1 < rw { info[sy * rw + sx + 1].load(Relaxed) } else { pi };
-        let down = if sy + 1 < rh { info[(sy + 1) * rw + sx].load(Relaxed) } else { pi };
-        if right != pi || down != pi {
-            c *= 0.25; // tile border
-        }
+        c = overlay_px(c, info, sx, sy, rw, rh);
     }
     let c = (c.clamp(Vec3A::ZERO, Vec3A::ONE) * 255.0 + 0.5).floor();
     ((c.x as u32) << 16) | ((c.y as u32) << 8) | c.z as u32
+}
+
+/// Tonemap and encode to scRGB f16 for the `R16G16B16A16_FLOAT` swapchain.
+///
+/// scRGB is linear, so `shape` applies no gamma — which means the overlay must
+/// be taken INTO display space and back out again to composite where its tints
+/// were authored. The round-trip runs only when the overlay is on, so the
+/// normal path costs nothing and is not perturbed by a pow/pow⁻¹ pair.
+///
+/// Deliberately **not** clamped above: values over 1.0 are legal scRGB and are
+/// precisely the highlight headroom this path exists to carry. The lower clamp
+/// stays — negative scRGB is out of gamut and we never intend to emit it.
+#[inline]
+fn present_px_scrgb(
+    c: Vec3A,
+    p: tone::ToneParams,
+    info: &[AtomicU32],
+    overlay_on: bool,
+    sx: usize,
+    sy: usize,
+    rw: usize,
+    rh: usize,
+) -> [f16; 4] {
+    let mut v = tone::shape(c, p);
+    if overlay_on {
+        let g = overlay_px(v.max(Vec3A::ZERO).powf(1.0 / 2.2), info, sx, sy, rw, rh);
+        v = g.max(Vec3A::ZERO).powf(2.2);
+    }
+    let v = tone::encode(v, p).max(Vec3A::ZERO);
+    [f16::from_f32(v.x), f16::from_f32(v.y), f16::from_f32(v.z), f16::from_f32(1.0)]
 }
 
 pub struct VerifyReport {
