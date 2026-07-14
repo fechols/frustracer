@@ -10011,6 +10011,13 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
             }
         }
     }
+    // --gpu-timing: the session-total table. The periodic one only fires every
+    // REPORT_EVERY frames, so without this a session shorter than that (or one
+    // ending mid-interval — every session does) silently prints nothing, and an
+    // asked-for flag that produces no output reads as broken. Survives the
+    // resize path: `gputime` state lives in the module, not the session, and
+    // the accumulator is never cleared here, so the table spans the whole run.
+    gpu::gputime::report();
 }
 
 /// One renderer session at a fixed window size (w, h): everything sized
