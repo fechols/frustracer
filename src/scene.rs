@@ -71,6 +71,19 @@ pub struct Material {
     pub kind: MatKind,
 }
 
+impl Material {
+    /// Whether shading this material fetches ANY texture (albedo or one of
+    /// the PBR maps). Untextured materials have nothing for the deferred
+    /// material-sorted shading to make cache-coherent, so they shade inline.
+    pub fn any_tex(&self) -> bool {
+        matches!(self.kind, MatKind::Textured { .. })
+            || self.normal_tex != NO_TEX
+            || self.rough_tex != NO_TEX
+            || self.metal_tex != NO_TEX
+            || self.emissive_tex != NO_TEX
+    }
+}
+
 /// Rectangular area light: `center ± u ± v`, radiant intensity `color` (falls off 1/d²).
 pub struct AreaLight {
     pub center: Vec3A,

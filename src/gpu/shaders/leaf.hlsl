@@ -49,7 +49,7 @@ void cs_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
             // the surface point to the hemisphere wavefront.
             float3 o_h, n_h;
             c = shade_split(cam_origin.xyz, dir, hit, rng, shadow_samples, ao_samples,
-                            reflections != 0u, true, aw, o_h, n_h, ps);
+                            reflections != 0u, true, 0.0, pixel_cone, true, aw, o_h, n_h, ps);
             uint s;
             InterlockedAdd(counters[CTR_HEMI_PT], 1, s);
             if (s < cap_hemi_pt) {

@@ -230,8 +230,113 @@ Per-second stats on stderr show the frustum counters: queries, node visits
 coarse pixels, and mean `t_start / t_hit` (how much empty space the quadtree
 skipped before each pixel ray even started).
 
+## Deferred material-sorted shading (--defer-shade): a candid negative result
+
+The idea: the quadtree already visits the screen depth-first, so let leaf
+tiles trace their pixels but *defer* shading, merge same-material runs on the
+way back up (whole-segment pointer moves, capped at a 64×64 maximum shading
+tile for load balance), and flush each macro-tile with its segments
+stable-sorted by material — a "tiled shader" where one material's textures
+stay cache-hot for a whole burst instead of being evicted at every 8×8
+boundary. The plumbing is exact: each record carries its pixel's RNG state,
+`dir`/`ray` are recomputed bit-identically from the frame camera, and the
+flush replays `shade()` verbatim — `--check` on any textured scene gates
+defer-off vs defer-on **bit-identity** of color/t/info (0 px differ), so the
+reorder provably changes nothing but timing.
+
+Measured (7950X3D, 1080p `--spin path`, 200 frames): default procedural scene
+22.7 → 22.7 ms (untextured materials shade inline — the machinery
+structurally disengages), Vokselia 22.5 → 23.0, San Miguel interior 7.74 →
+7.75 with 12% of pixels deferring in mean-400 px bursts, Intel Sponza (2.7 GB
+of 4K textures, 23% of pixels deferring) 36.9 → **41.2 ms** — the more
+texture traffic, the more the staging costs, and nowhere a win. Two earlier
+implementation lessons are baked into the code: merging by `Vec::append`
+re-copied every record per level (~GB/frame, 3× frame time) — segments fixed
+that; and flushing a 4096-px bucket sequentially made every macro-tile an
+end-of-frame straggler on one core (+29% on Sponza) — the flush now re-splits
+across rayon at the fused path's 1024-px grain.
+
+Why it can't win: at 1 spp, adjacent pixels' bilinear footprints are
+essentially disjoint, so each texture cache line is touched about once per
+frame *regardless of shading order* — material sorting optimizes the order of
+a stream that has no reuse to exploit (and a 128 MB V-Cache absorbs much of
+what little there is). Mips were the obvious suspect for creating that reuse,
+so they were built next (below) and the A/B was rerun: **still no win** — San
+Miguel interior 7.49 → 8.89 ms, Intel Sponza 32.6 → 38.8. Mips shrink the
+*working set*, which helps the fused path just as much; they don't manufacture
+inter-pixel reuse that a reorder could newly exploit. The feature stays
+off-by-default behind `--defer-shade`, gates and `defer:` counters intact.
+
+## Mip-mapping, trilinear, and 16× anisotropic filtering
+
+Textures are sampled trilinear with a **ray-cone LOD** (Möller 2019,
+curvature-free), on all three renderers — CPU, the `--gpu` wavefront, and
+`--dxr`. Cone width grows along the ray (`w0 + t·spread`, primary spread = one
+pixel's angular size); the LOD adds the triangle's texel density
+(`0.5·log2(uv_area/world_area)`, computed on the fly from the hit's vertices —
+a cached per-tri array would cost ~400 MB at 100M-tri tiling scale), the map's
+dimensions, and a grazing-angle term. Reflection and glass continuations
+inherit the parent hit's cone width; hemisphere-GI bounce hits read a fixed
+broad footprint (over-blurred bounce albedo is variance reduction, never
+error).
+
+The chain is generated once on the CPU (2×2 box filter to 1×1) and uploaded to
+the GPU verbatim, so the renderers' long-standing parity axiom is *upgraded*
+rather than broken: identical texels at identical LODs, and the GPU-vs-CPU
+albedo gate (mean |Δ| ≤ 0.02/channel) now compares trilinear against trilinear
+— measuring 0.0000/channel on San Miguel, with no tolerance widened. Two
+details are load-bearing. The filter runs in **linear space** (sRGB texels
+decode, average, re-encode) — a gamma-space box filter darkens mid-tones, and
+the self-test's 2×2-checker case rejects it. And **alpha cutout never sees
+mips**: it stays nearest-texel at level 0 on every path, because that test is
+*visibility*, and CPU/RayQuery/DXR agreeing on it bit-for-bit is a correctness
+contract.
+
+`lod ≤ 0` reproduces the old bilinear sampler bit-exactly, so magnified views
+— and every existing tolerance gate — are unmoved by the feature. `--no-mips`
+is the A/B lever. Measured (1080p `--spin path`, 7950X3D): mips are *faster*,
+Intel Sponza 34.7 → 32.6 ms and San Miguel interior 7.7 → 7.5 (fewer
+DRAM-miss taps under minification more than pays for the extra tap), at +33%
+texture memory. Aliasing goes with them: `FRUSTRACER_STAB=1` on a still XeSS
+Sponza view reads 0.65 → 0.57 /255 of inter-frame shimmer.
+
+### Anisotropy (`--aniso N`, default 16)
+
+A ray cone is a *circle*, but the surface it lands on sees an *ellipse*:
+projected along the ray, the footprint is `cone_w` across the direction of
+travel and `cone_w / |n·d|` along it. One scalar LOD can only describe a
+circle, so the formula above covers the **major** axis and blurs the minor one
+with it — its `− log2(max(|n·d|, 0.05))` term *is* that compromise, and it is
+why trilinear mushes distant floors and long walls. Anisotropy is therefore not
+a rival filter here but the same footprint kept honest: `tri_grads` returns both
+axes as normalized-UV gradients (Cramer's rule against the triangle's UV basis
+— the on-the-fly `∂P/∂u, ∂P/∂v` the normal-mapping tangent frame already
+derived, now shared), the CPU averages up to 16 trilinear taps along the major
+axis at the *minor* axis's LOD, and the GPU hands the identical gradients to
+hardware `SampleGrad` on an anisotropic sampler. That the two paths are one
+formula is gated, not asserted: on a conformal UV map the major axis in texels
+must equal the old isotropic LOD to 1e-4.
+
+Worth knowing if you go looking for this in the code: **`SampleLevel` cannot be
+anisotropic.** It hands the TMU one scalar LOD and no gradients, so switching
+the sampler to `ANISOTROPIC` while still calling `SampleLevel` would have been
+a silent no-op — the gradients are the whole feature. Hemisphere-GI bounce rays
+deliberately stay isotropic (their cone is octant-coarse by design; 16 taps
+would buy nothing).
+
+`--aniso 1` (= `--no-aniso`) runs the isotropic path *verbatim*, so it is
+bit-identical to the pre-anisotropy renderer by construction — which makes the
+whole check suite re-run under it the regression proof. Hardware aniso and the
+CPU's N-tap approximation use different tap distributions, so they were never
+going to agree exactly; the GPU-vs-CPU albedo gate measures **0.0001/channel
+against its unchanged 0.02 limit**. Cost is pose-dependent and real on the CPU
+(16 taps where the footprint is 16:1): Intel Sponza 24.1 → 26.3 ms (+8.7%), San
+Miguel interior 16.0 → 16.1 (+1.1%); `--aniso 4|8` buys that back. On the GPU
+it disappears under the bench row's own noise.
+
 ## Future work
 
 Cut-aware leaf ordering (sort the cut by distance once per leaf tile so all 64
 rays shrink `tmax` early), and adapting the frame budget from measured
-resolve/present cost.
+resolve/present cost. A GPU compute BC7 encoder (the ispc encode is ~20 s on
+Intel Sponza and runs every load — there is no disk cache).

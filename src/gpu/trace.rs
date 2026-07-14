@@ -408,12 +408,23 @@ pub fn create_root_signature(device: &ID3D12Device) -> Result<ID3D12RootSignatur
         },
         ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
     });
-    // The one static sampler (0 root-signature DWORDs): bilinear, repeat
-    // wrap, no mips — the GPU mirror of texture.rs::sample_bilinear. The
-    // alpha-cutout test deliberately uses .Load, not a sampler (see
-    // trace_common.hlsli::alpha_cutout).
-    let samplers = [D3D12_STATIC_SAMPLER_DESC {
-        Filter: D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT,
+    // Two static samplers (0 root-signature DWORDs), both repeat-wrap, one per
+    // filter path — the GPU mirrors of texture.rs's two samplers:
+    //   s0 samp_lin   trilinear, fed an explicit ray-cone lod by SampleLevel
+    //                 (lod 0 on a MIP_LINEAR filter reads level 0 only, so
+    //                 single-mip textures and the magnification clamp behave
+    //                 exactly like the old bilinear sampler) — the --no-aniso
+    //                 path and every isotropic (hemi-bounce) lap.
+    //   s1 samp_aniso hardware anisotropic, fed the elliptical footprint by
+    //                 SampleGrad (shade.hlsli::tri_grads — SampleLevel gives
+    //                 the TMU no gradients, so aniso there would be a no-op).
+    //                 MaxAnisotropy is the session's --aniso, the same cap
+    //                 texture::sample_aniso clamps its tap count to.
+    // The alpha-cutout test deliberately uses NEITHER — it is a nearest-texel
+    // .Load (trace_common.hlsli::alpha_cutout): filtering never touches
+    // visibility.
+    let base = D3D12_STATIC_SAMPLER_DESC {
+        Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
         AddressU: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
         AddressV: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
         AddressW: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
@@ -422,15 +433,24 @@ pub fn create_root_signature(device: &ID3D12Device) -> Result<ID3D12RootSignatur
         ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
         BorderColor: D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK,
         MinLOD: 0.0,
-        MaxLOD: 0.0,
+        MaxLOD: f32::MAX,
         ShaderRegister: 0,
         RegisterSpace: 1,
         ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
-    }];
+    };
+    let samplers = [
+        base,
+        D3D12_STATIC_SAMPLER_DESC {
+            Filter: D3D12_FILTER_ANISOTROPIC,
+            MaxAnisotropy: crate::texture::max_aniso() as u32,
+            ShaderRegister: 1,
+            ..base
+        },
+    ];
     let desc = D3D12_ROOT_SIGNATURE_DESC {
         NumParameters: params.len() as u32,
         pParameters: params.as_ptr(),
-        NumStaticSamplers: 1,
+        NumStaticSamplers: samplers.len() as u32,
         pStaticSamplers: samplers.as_ptr(),
         Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
     };
@@ -1001,7 +1021,8 @@ impl SceneGpu {
         // sort (scene.rs / scene_cache.rs) — cost is ~linear in texels, so the
         // few 4K maps would otherwise dominate the tail while the rest idle.
         // Results scatter back by texture id, which must never shift.
-        let mut bc7_blocks: Vec<Option<Vec<u8>>> = scene.textures.iter().map(|_| None).collect();
+        let mut bc7_blocks: Vec<Option<Vec<Vec<u8>>>> =
+            scene.textures.iter().map(|_| None).collect();
         let mut enc_ms = 0.0f64;
         let mut enc_texels = 0u64;
         if let Some(q) = bc7_q {
@@ -1015,9 +1036,17 @@ impl SceneGpu {
             });
             enc_texels =
                 order.iter().map(|&i| scene.textures[i].w as u64 * scene.textures[i].h as u64).sum();
-            let done: Vec<(usize, Vec<u8>)> = order
+            let done: Vec<(usize, Vec<Vec<u8>>)> = order
                 .par_iter()
-                .map(|&i| (i, bc7::encode_opaque(&scene.textures[i], q)))
+                .map(|&i| {
+                    let t = &scene.textures[i];
+                    // Every level of the chain — a BC7 resource cannot mix
+                    // formats per mip, and the CPU/GPU trilinear parity
+                    // wants the same chain depth on both sides.
+                    let mut levels = vec![bc7::encode_opaque(t, q)];
+                    levels.extend(t.mips.iter().map(|m| bc7::encode_level(m.w, m.h, &m.texels, q)));
+                    (i, levels)
+                })
                 .collect();
             for (i, blocks) in done {
                 bc7_blocks[i] = Some(blocks);
@@ -1032,8 +1061,13 @@ impl SceneGpu {
                 .iter()
                 .enumerate()
                 .map(|(i, t)| match &bc7_blocks[i] {
-                    Some(b) => b.len() as u64,
-                    None => t.w as u64 * t.h as u64 * 4,
+                    Some(b) => b.iter().map(|l| l.len() as u64).sum::<u64>(),
+                    None => {
+                        let base = t.w as u64 * t.h as u64;
+                        let mips: u64 =
+                            t.mips.iter().map(|m| m.w as u64 * m.h as u64).sum();
+                        (base + mips) * 4
+                    }
                 })
                 .sum::<u64>();
             let n_bc7 = bc7_blocks.iter().filter(|b| b.is_some()).count();
@@ -1070,91 +1104,110 @@ impl SceneGpu {
         // so steady-state RAM is unchanged.
         let mut textures_v = Vec::new();
         for (i, t) in scene.textures.iter().enumerate() {
-            let (fmt, pitch, src_pitch, rows_total, row_h) = match &bc7_blocks[i] {
-                // A BC7 "row" is a block row: 4 texel rows in ceil(w/4)*16 B.
-                Some(_) => (
-                    bc7::dxgi_format(t),
-                    d3d12::block_pitch(t.w),
-                    bc7::blocks(t.w) as usize * bc7::BLOCK_BYTES,
-                    bc7::blocks(t.h) as usize,
-                    bc7::BLOCK as usize,
-                ),
-                None => (
+            let fmt = match &bc7_blocks[i] {
+                Some(_) => bc7::dxgi_format(t),
+                None => {
                     if t.srgb {
                         windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
                     } else {
                         windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM
-                    },
-                    d3d12::aligned_pitch(t.w as usize * 4),
-                    t.w as usize * 4,
-                    t.h as usize,
-                    1,
-                ),
+                    }
+                }
             };
-            let dst = d3d12::committed_tex(
+            let n_mips = 1 + t.mips.len();
+            let dst = d3d12::committed_tex_mips(
                 device,
                 t.w,
                 t.h,
+                n_mips as u16,
                 fmt,
                 D3D12_RESOURCE_FLAG_NONE,
                 D3D12_RESOURCE_STATE_COPY_DEST,
             )?;
-            let band = (ring.size / pitch).max(1).min(rows_total);
-            let mut r0 = 0usize;
-            while r0 < rows_total {
-                let rows = band.min(rows_total - r0);
-                for r in 0..rows {
-                    let src: &[u8] = match &bc7_blocks[i] {
-                        Some(b) => &b[(r0 + r) * src_pitch..(r0 + r + 1) * src_pitch],
-                        None => {
-                            let y = r0 + r;
-                            let row = &t.texels[y * t.w as usize..(y + 1) * t.w as usize];
-                            row.as_flattened()
-                        }
-                    };
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            src.as_ptr(),
-                            ring.ptr.add(r * pitch),
-                            src_pitch,
-                        )
-                    };
-                }
-                // The dst y offset and the footprint height are always in
-                // TEXELS. For BC7 both are whole block rows (DstY a multiple
-                // of 4, as the debug layer requires) except the final band,
-                // which runs to `t.h` exactly — the bottom edge of the
-                // resource, the other form the layer accepts.
-                let y0 = r0 * row_h;
-                let h_tex = (rows * row_h).min(t.h as usize - y0) as u32;
-                let fp = match &bc7_blocks[i] {
-                    Some(_) => d3d12::footprint_block(fmt, t.w, h_tex, 0),
-                    None => d3d12::footprint(fmt, t.w, h_tex, 4, 0),
+            // Every mip is its own subresource, streamed through the same
+            // ring in row bands. The COPY_DEST → NPSR transition rides the
+            // last band of the LAST mip.
+            for mip in 0..n_mips {
+                let (mw, mh, mip_texels): (u32, u32, &[[u8; 4]]) = if mip == 0 {
+                    (t.w, t.h, &t.texels)
+                } else {
+                    let m = &t.mips[mip - 1];
+                    (m.w, m.h, &m.texels)
                 };
-                let last = r0 + rows == rows_total;
-                sub.run_list(&mut |l| {
-                    unsafe {
-                        l.CopyTextureRegion(
-                            &d3d12::loc_subresource(&dst),
-                            0,
-                            y0 as u32,
-                            0,
-                            &d3d12::loc_footprint(&ring.resource, fp),
-                            None,
-                        )
-                    };
-                    if last {
+                let (pitch, src_pitch, rows_total, row_h) = match &bc7_blocks[i] {
+                    // A BC7 "row" is a block row: 4 texel rows in
+                    // ceil(w/4)*16 B — per-mip dims.
+                    Some(_) => (
+                        d3d12::block_pitch(mw),
+                        bc7::blocks(mw) as usize * bc7::BLOCK_BYTES,
+                        bc7::blocks(mh) as usize,
+                        bc7::BLOCK as usize,
+                    ),
+                    None => (
+                        d3d12::aligned_pitch(mw as usize * 4),
+                        mw as usize * 4,
+                        mh as usize,
+                        1,
+                    ),
+                };
+                let band = (ring.size / pitch).max(1).min(rows_total);
+                let mut r0 = 0usize;
+                while r0 < rows_total {
+                    let rows = band.min(rows_total - r0);
+                    for r in 0..rows {
+                        let src: &[u8] = match &bc7_blocks[i] {
+                            Some(b) => &b[mip][(r0 + r) * src_pitch..(r0 + r + 1) * src_pitch],
+                            None => {
+                                let y = r0 + r;
+                                let row = &mip_texels[y * mw as usize..(y + 1) * mw as usize];
+                                row.as_flattened()
+                            }
+                        };
                         unsafe {
-                            l.ResourceBarrier(&[transition(
-                                &dst,
-                                D3D12_RESOURCE_STATE_COPY_DEST,
-                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                            )])
+                            std::ptr::copy_nonoverlapping(
+                                src.as_ptr(),
+                                ring.ptr.add(r * pitch),
+                                src_pitch,
+                            )
                         };
                     }
-                    Ok(())
-                })?;
-                r0 += rows;
+                    // The dst y offset and the footprint height are always in
+                    // TEXELS. For BC7 both are whole block rows (DstY a
+                    // multiple of 4, as the debug layer requires) except the
+                    // final band, which runs to the mip's `mh` exactly — the
+                    // bottom edge of the subresource, the other form the
+                    // layer accepts.
+                    let y0 = r0 * row_h;
+                    let h_tex = (rows * row_h).min(mh as usize - y0) as u32;
+                    let fp = match &bc7_blocks[i] {
+                        Some(_) => d3d12::footprint_block(fmt, mw, h_tex, 0),
+                        None => d3d12::footprint(fmt, mw, h_tex, 4, 0),
+                    };
+                    let last = mip + 1 == n_mips && r0 + rows == rows_total;
+                    sub.run_list(&mut |l| {
+                        unsafe {
+                            l.CopyTextureRegion(
+                                &d3d12::loc_subresource_mip(&dst, mip as u32),
+                                0,
+                                y0 as u32,
+                                0,
+                                &d3d12::loc_footprint(&ring.resource, fp),
+                                None,
+                            )
+                        };
+                        if last {
+                            unsafe {
+                                l.ResourceBarrier(&[transition(
+                                    &dst,
+                                    D3D12_RESOURCE_STATE_COPY_DEST,
+                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                )])
+                            };
+                        }
+                        Ok(())
+                    })?;
+                    r0 += rows;
+                }
             }
             // The blocks are on the GPU now — drop them so peak RAM carries at
             // most the BC7 set (~0.25x the RGBA8 texels), never a second copy.
@@ -1409,16 +1462,19 @@ impl SceneGpu {
         buf_srv(&self.tri_mat, 4, self.n_tris, 2);
         buf_srv(&self.mat_cutout, 4, self.n_mats, 3);
         for (i, tex) in self.textures.iter().enumerate() {
+            let tex_desc = unsafe { tex.GetDesc() };
             let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
                 // The resource's own creation format: _SRGB for color
                 // textures, _UNORM for linear-data maps.
-                Format: unsafe { tex.GetDesc() }.Format,
+                Format: tex_desc.Format,
                 ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
                 Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
                 Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                     Texture2D: D3D12_TEX2D_SRV {
                         MostDetailedMip: 0,
-                        MipLevels: 1,
+                        // The whole CPU-generated chain (1 on chainless
+                        // textures — the 1×1 fallbacks and --no-mips).
+                        MipLevels: tex_desc.MipLevels as u32,
                         PlaneSlice: 0,
                         ResourceMinLODClamp: 0.0,
                     },
@@ -1495,6 +1551,13 @@ pub const FLAG_HAS_PREV: u32 = 32;
 /// direct-light signals (GBufPx.sig) and the prev-camera view-Z (mv.z);
 /// zeros under every other wiring — RR/XeSS packs stay byte-identical.
 pub const FLAG_FSR_SIG: u32 = 64;
+/// Anisotropic texture filtering on (the session's `--aniso` > 1). A session
+/// constant, not a per-frame decision — set from `texture::max_aniso()`, the
+/// same source the static aniso sampler's MaxAnisotropy and the CPU's
+/// `Cone::aniso` read, so all three renderers filter the same footprint.
+/// Which *rays* use it is decided per call site, not by this flag
+/// (`shade_split`'s `aniso` arg — hemi bounce laps pass false).
+pub const FLAG_ANISO: u32 = 128;
 
 /// GBufPx stride in bytes — lockstep with trace_common.hlsli's struct
 /// (nr | alb_z | spec | mv | sig = 4 float4 + 1 uint4).
@@ -1526,7 +1589,9 @@ pub(crate) struct FrameCb {
     reflections: u32,
     _pad0: u32,
     frame_jitter: [f32; 2],
-    _pad1: f32,
+    /// Primary ray-cone spread (CamBasis::pixel_cone — the CPU value
+    /// verbatim, single source for the trilinear LOD parity).
+    pixel_cone: f32,
     _pad2: f32,
     cap_tile: u32,
     cap_leaf: u32,
@@ -1578,7 +1643,7 @@ impl FrameCb {
             reflections: 0,
             _pad0: 0,
             frame_jitter: [0.0, 0.0],
-            _pad1: 0.0,
+            pixel_cone: 0.0,
             _pad2: 0.0,
             cap_tile: 0,
             cap_leaf: 0,
@@ -1615,7 +1680,8 @@ impl FrameCb {
             | (p.verify as u32 * FLAG_VERIFY)
             | (gbuf_full as u32 * FLAG_GBUF)
             | (p.prev_cam.is_some() as u32 * FLAG_HAS_PREV)
-            | ((gbuf_full && fsr_sig) as u32 * FLAG_FSR_SIG);
+            | ((gbuf_full && fsr_sig) as u32 * FLAG_FSR_SIG)
+            | ((crate::texture::max_aniso() > 1.0) as u32 * FLAG_ANISO);
         cb.shadow_samples = p.q.shadow_samples;
         cb.ao_samples = p.q.ao_samples;
         cb.reflections = p.q.reflections as u32;
@@ -1623,6 +1689,7 @@ impl FrameCb {
             Some((x, y)) => [x, y],
             None => [0.0, 0.0],
         };
+        cb.pixel_cone = p.cam.pixel_cone();
         cb.fb_mode = fb_mode_of(&p.q);
         cb.fb_depth = p.q.fb.depth.clamp(1, HEMI_MAX_DEPTH);
         if let Some(pc) = &p.prev_cam {
