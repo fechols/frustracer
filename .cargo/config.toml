@@ -1,0 +1,8 @@
+# Link with LLD (rust-lld), the COFF/link.exe-compatible driver bundled with the
+# rustup toolchain — no install, no PATH edit, no new prerequisite. This is the
+# Windows answer to mold, which is ELF-only and cannot link a PE binary at all.
+#
+# rustc puts the toolchain's lib/rustlib/<target>/bin on the linker search path,
+# so the bare executable name resolves without an absolute path.
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld.exe"
