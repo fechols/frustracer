@@ -146,6 +146,35 @@ cargo run --release -- --gpu --nppd   # the same composition GPU-resident: ONNX 
 
 Debug builds are ~10× too slow to judge anything — always use `--release`.
 
+### Runtime SDKs (optional features)
+
+Building never needs any SDK: the MIT headers the shims compile against are
+vendored, and every SDK below is `LoadLibrary`'d at runtime, so a bare checkout
+builds and passes every DLL-free `--check*` gate. The interactive features want
+runtime DLLs, which are license-restricted and therefore not committed —
+`install-prerequisites.bat` downloads them from each vendor's own release page
+into the directories the defaults already point at:
+
+```
+install-prerequisites.bat              # everything below (~700 MB)
+install-prerequisites.bat dxc xess     # just those; /force re-installs, /clean drops the cache
+```
+
+| Component | Enables | Lands in |
+|---|---|---|
+| `dxc` | `--dxr` (the **default** render mode) and `--gpu` | `SDKs\dxc\bin\x64` |
+| `dlss` | DLSS-RR (`G`) | `SDKs\streamline-sdk\bin\x64` |
+| `fsr` | FSR4-RR / FSR 3.1 (`K`) | `SDKs\FidelityFX-Samples-prebuilt\...` |
+| `xess` | XeSS-SR (`X`) | `SDKs\XeSS-SDK\bin` |
+| `nppd` | NPPD neural denoising (`J`) | `SDKs\onnxruntime\bin` |
+| `oidn` | OIDN denoising (`N`) | `SDKs\oidn.x64.windows\bin` |
+| `pix` | `--pix-markers` | `SDKs\pix\bin\x64` |
+
+Each is also overridable with the matching `--*-path` flag / `FRUSTRACER_*_PATH`
+env var. The one thing the script cannot fetch is the NPPD **model weights**
+(the upstream checkpoint carries no license grant) — export those yourself with
+`tools/nppd-export/export.py --fp16`; it prints the command.
+
 ### DLSS Ray Reconstruction setup (optional)
 
 The renderer can hand its 1-spp frames to NVIDIA's DLSS Ray Reconstruction
