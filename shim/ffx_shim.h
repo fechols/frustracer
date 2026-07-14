@@ -53,12 +53,23 @@ int32_t ffxshim_query_versions(int32_t is_upscaler, void* device,
                                const char** names /*may be null*/);
 
 // ---- context creation ----
-// signal_flags: FfxApiDenoiserSignalFlags combination (shim re-exports the
-// two we use below). version_id 0 = provider default, else chained
-// ffxOverrideVersion. max_w/max_h: ffxCreateContextDescDenoiser.maxRenderSize
-// (dynamic resolution: dispatches name any renderSize <= this).
-#define FFXSHIM_SIGNAL_DIRECT_DIFFUSE   (1u << 1)
-#define FFXSHIM_SIGNAL_DIRECT_SPECULAR  (1u << 2)
+// signal_flags: FfxApiDenoiserSignalFlags combination (the full set is
+// re-exported below; the session picks which to subscribe). version_id 0 =
+// provider default, else chained ffxOverrideVersion. max_w/max_h:
+// ffxCreateContextDescDenoiser.maxRenderSize (dynamic resolution: dispatches
+// name any renderSize <= this).
+//
+// The SAME flag word must be handed back to ffxshim_denoise: the header
+// requires the chained per-signal descs to match the context's signalFlags
+// EXACTLY (a desc is required "if and only if" its flag is set), and the shim
+// holds no per-context state to remember the creation set with.
+#define FFXSHIM_SIGNAL_AMBIENT_OCCLUSION (1u << 0)
+#define FFXSHIM_SIGNAL_DIRECT_DIFFUSE    (1u << 1)
+#define FFXSHIM_SIGNAL_DIRECT_SPECULAR   (1u << 2)
+#define FFXSHIM_SIGNAL_DOMINANT_LIGHT    (1u << 3)
+#define FFXSHIM_SIGNAL_INDIRECT_DIFFUSE  (1u << 4)
+#define FFXSHIM_SIGNAL_INDIRECT_SPECULAR (1u << 5)
+#define FFXSHIM_SIGNAL_SPECULAR_OCCLUSION (1u << 6)
 int32_t ffxshim_create_denoiser(void* device, uint32_t max_w, uint32_t max_h,
                                 uint32_t signal_flags, uint32_t flags,
                                 uint64_t version_id, void** ctx_out);
@@ -94,17 +105,24 @@ typedef struct FfxShimRes {
     uint32_t state;    // FfxApiResourceState the resource is in at dispatch
 } FfxShimRes;
 
-// One Ray Regeneration dispatch: common inputs + the two direct signals,
-// chained internally as ffxDispatchDescDenoiser -> DirectDiffuse ->
-// DirectSpecular. Conventions (from ffx_denoiser.h):
+// One Ray Regeneration dispatch: common inputs + one per-signal desc for each
+// bit in `signal_flags`, chained internally behind the common desc in flag
+// order. Conventions (from ffx_denoiser.h):
 //   linear_depth    R:  signed linear view-space Z
 //   motion_vectors  RG: PreviousUV - CurrentUV, B: prevZ - curZ (mv_scale {1,1,1})
 //   normals         RG: octahedral normal, B: linear roughness, A: material type
 //   albedos         RGB sqrt-encoded unless non_gamma_albedo
 //   jitter          screen pixels; cam_pos_delta = prev - cur (world)
 //   view/projection FfxApiMatrix4x4 layout (see file header note on glam)
+//   ao signal       R: open fraction in [0,1] (0 = fully occluded)
+//   is signal       RGB: indirect specular radiance, A: ray hit distance
+// A signal's in/out pair is read IF AND ONLY IF its flag is set; the unset
+// pairs may be left null. Signals the renderer has no source for
+// (dominant-light visibility, indirect diffuse, specular occlusion) are not
+// plumbed yet — add the desc next to the others below when they are.
 typedef struct FfxShimDenoiseDesc {
     void* cmdlist;                    // ID3D12GraphicsCommandList*
+    uint32_t signal_flags;            // MUST equal the creation signalFlags
     FfxShimRes linear_depth;
     FfxShimRes motion_vectors;
     FfxShimRes normals;
@@ -112,6 +130,8 @@ typedef struct FfxShimDenoiseDesc {
     FfxShimRes diffuse_albedo;
     FfxShimRes dd_in, dd_out;         // direct diffuse signal
     FfxShimRes ds_in, ds_out;         // direct specular signal
+    FfxShimRes ao_in, ao_out;         // ambient occlusion signal
+    FfxShimRes is_in, is_out;         // indirect specular signal
     float mv_scale[3];
     float jitter[2];
     float cam_pos_delta[3];

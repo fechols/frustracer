@@ -44,11 +44,11 @@ pub const RP_TEX: u32 = RP_SRV0 + NUM_SRVS;
 // The G-buffer pack root UAV (register u15), appended AFTER the table so the
 // established param indices never renumber. 53/64 root-signature DWORDs.
 pub const RP_GBUF: u32 = RP_TEX + 1;
-/// Upscaler feed-target texture UAVs: registers u16..u25, riding the u14
-/// descriptor table as a second range at heap slots 1..10 (0 DWORDs extra).
+/// Upscaler feed-target texture UAVs: registers u16..u27, riding the u14
+/// descriptor table as a second range at heap slots 1..12 (0 DWORDs extra).
 /// The register/type layout is shared by every feed kernel (feed.hlsl); a
 /// register's VALUE/format may differ per kernel, the HLSL type never does.
-pub const NUM_FEED: u32 = 10;
+pub const NUM_FEED: u32 = 12;
 pub const FEED_COLOR: u32 = 16; // RGBA16F (RR/XeSS); RGBA16F residual (FSR-RR)
 pub const FEED_NR: u32 = 17; // RGBA16F normal+rough (RR); RGB10A2 oct-normals (FSR-RR)
 pub const FEED_DEPTH: u32 = 18; // R32F (all; encoding differs per kernel)
@@ -59,8 +59,10 @@ pub const FEED_SPECHIT: u32 = 22; // R16F spec hit distance (RR); R32F linear de
 pub const FEED_FSR_MVEC: u32 = 23; // RGBA16F FSR-RR mvec (UV-delta RG + depth-delta B)
 pub const FEED_FSR_DD: u32 = 24; // RGBA16F FSR-RR demodulated direct diffuse
 pub const FEED_FSR_DS: u32 = 25; // RGBA16F FSR-RR demodulated direct specular
+pub const FEED_FSR_AO: u32 = 26; // R16F FSR-RR ambient-occlusion open fraction
+pub const FEED_FSR_IS: u32 = 27; // RGBA16F FSR-RR indirect specular (A = hit t)
 // GPU-resident NPPD staging (the --gpu --nppd composition): four raw-buffer
-// root UAVs at u26..u29 (nppd.hlsl's literals — lockstep), appended after
+// root UAVs at u28..u31 (nppd.hlsl's literals — lockstep), appended after
 // RP_GBUF so nothing renumbers (61/64 root-signature DWORDs). Bound only
 // when the session built them.
 pub const RP_NPPD_FRAME: u32 = RP_GBUF + 1;
@@ -152,7 +154,9 @@ pub const HEMI_BATCH: u32 = 16384;
 /// Max fb.depth the hemi queue sizing supports (presets top out at 4).
 const HEMI_MAX_DEPTH: u32 = 4;
 
-pub(crate) const CB_STRIDE: usize = 512; // root-CBV alignment (FrameCb is 304 bytes)
+// Root-CBV alignment (256 B). FrameCb is 1344 bytes — 320 of struct plus the
+// MAX_SPP-entry jitter table (--spp), which is what sets the size.
+pub(crate) const CB_STRIDE: usize = 1536;
 
 /// Quadtree depth to the leaf frontier: smallest D with
 /// max(rw, rh) / 2^D <= LEAF_TILE (temporal.rs uses the same formula).
@@ -168,9 +172,26 @@ pub fn depth_full(rw: u32, rh: u32) -> u32 {
 }
 
 const SMOKE_HLSL: &str = include_str!("shaders/smoke.hlsl");
+/// Order-2 SH irradiance, standalone (no cbuffer of its own — the coefficients
+/// are a parameter). pub(crate) because gpu/ffx_rr.rs prepends it to the FSR
+/// composite pass, which needs the SAME evaluator but binds its own 9 rows.
+pub(crate) const SH_HLSLI: &str = include_str!("shaders/sh.hlsli");
+/// The FSR plane wire encodings (octahedral normals + their 10-bit quantum).
+/// pub(crate) for the same reason: feed.hlsl writes those planes and
+/// fsr_composite.hlsl reads them back, and the composite identity is exactly
+/// the claim that the two agree — so they share one copy.
+pub(crate) const FSR_WIRE_HLSLI: &str = include_str!("shaders/fsr_wire.hlsli");
 // pub(crate): gpu/dxr.rs pastes the same prelude/shading/resolve sources
 // into its DXR library (the kernels are single-sourced on disk).
-pub(crate) const TRACE_COMMON_HLSLI: &str = include_str!("shaders/trace_common.hlsli");
+//
+// sh.hlsli leads: trace_common's `sh_irradiance` is just the frame's cbuffer
+// bound to it. Folding it in here rather than at each of the dozen concat sites
+// keeps the prelude one name.
+pub(crate) const TRACE_COMMON_HLSLI: &str = concat!(
+    include_str!("shaders/sh.hlsli"),
+    "\n",
+    include_str!("shaders/trace_common.hlsli")
+);
 const CTR_HLSLI: &str = include_str!("shaders/ctr.hlsli");
 const QUEUES_HLSLI: &str = include_str!("shaders/queues.hlsli");
 const FRUSTUM_HLSLI: &str = include_str!("shaders/frustum.hlsli");
@@ -363,7 +384,7 @@ pub fn create_root_signature(device: &ID3D12Device) -> Result<ID3D12RootSignatur
         },
         ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
     });
-    // RP_NPPD_*: the NPPD staging buffers (u23..u26), appended after RP_GBUF
+    // RP_NPPD_*: the NPPD staging buffers (u28..u31), appended after RP_GBUF
     // for the same no-renumber reason; bound only in NPPD sessions (unbound
     // root UAVs are fine as long as no dispatched kernel touches them).
     for i in 0..4 {
@@ -1502,6 +1523,20 @@ pub(crate) fn alpha_defs(scene: &Scene) -> &'static str {
     if scene.any_alpha { "#define ALPHA_CUTOUT 1" } else { "" }
 }
 
+/// HLSL prelude every compile unit takes: the `--spp` jitter table's row count
+/// (`FrameCb::jitters`, hand-mirrored in trace_common.hlsli's cbuffer). The
+/// SIZE is derived from `dlss::MAX_SPP` rather than written twice — a literal
+/// there would be a third constant to raise in lockstep, and a shader reading
+/// past a too-small array is silent (no gate can see it). Injected like
+/// ALPHA_CUTOUT / FTREE.
+pub(crate) fn spp_defs() -> String {
+    format!(
+        "#define MAX_SPP {}u\n#define JITTER_ROWS {}",
+        crate::dlss::MAX_SPP,
+        crate::dlss::MAX_SPP / 2
+    )
+}
+
 fn geometry_desc(
     positions: &ID3D12Resource,
     indices: &ID3D12Resource,
@@ -1564,8 +1599,8 @@ pub const FLAG_FSR_SIG: u32 = 64;
 pub const FLAG_ANISO: u32 = 128;
 
 /// GBufPx stride in bytes — lockstep with trace_common.hlsli's struct
-/// (nr | alb_z | spec | mv | sig = 4 float4 + 1 uint4).
-pub const GBUF_STRIDE: u64 = 80;
+/// (nr | alb_z | spec | mv | sig | sig2 = 4 float4 + 1 uint4 + 1 uint2).
+pub const GBUF_STRIDE: u64 = 88;
 
 /// Mirror of `cbuffer Frame` in trace_common.hlsli (304 bytes, 16-aligned
 /// rows — float3s ride in float4 slots with scalars packed in .w).
@@ -1617,6 +1652,15 @@ pub(crate) struct FrameCb {
     prev_forward: [f32; 4], // xyz; w = prev inv_h
     prev_right: [f32; 4],   // xyz; w = near
     prev_up: [f32; 4],      // xyz; w = far
+    // --spp: samples per pixel this frame, and which one writes the per-pixel
+    // side channels (tbuf/info/pack). See trace_common.hlsli.
+    spp: u32,
+    probe_sample: u32,
+    _pad4: u32,
+    _pad5: u32,
+    /// Sample offsets from `dlss::jitter_for_sample` (the ONE Halton source —
+    /// no radical-inverse port in HLSL), two per 16-byte row.
+    jitters: [[f32; 4]; (crate::dlss::MAX_SPP as usize) / 2],
     /// The sky dome in order-2 SH (`scene.sky_sh`, `sh::N` = 9 RGB rows, .w
     /// unused) — the GPU's copy of the analytic ambient the CPU reads through
     /// `Sh9::irradiance`. Appended LAST so every offset above is unmoved.
@@ -1624,9 +1668,13 @@ pub(crate) struct FrameCb {
 }
 // The HLSL cbuffer is hand-mirrored across 7 concatenated compile units —
 // a size drift here corrupts every field after the drift point.
-// 304 (the old size) − 32 (two light rows dropped) + 16·9 (the SH sky) = 416.
-const _: () = assert!(std::mem::size_of::<FrameCb>() == 304 - 32 + 16 * crate::sh::N);
-// ...and the whole thing must still fit one root-CBV stride.
+// 304 (the pre-sun size) − 32 (two rect-light rows dropped) + 16 (the spp
+// block) + 8·MAX_SPP (the jitter table) + 16·9 (the SH sky).
+const _: () = assert!(
+    std::mem::size_of::<FrameCb>()
+        == 320 - 32 + 8 * crate::dlss::MAX_SPP as usize + 16 * crate::sh::N
+);
+// ...and the whole thing must still fit a CB ring slot.
 const _: () = assert!(std::mem::size_of::<FrameCb>() <= CB_STRIDE);
 
 impl FrameCb {
@@ -1677,6 +1725,11 @@ impl FrameCb {
             prev_forward: [0.0; 4],
             prev_right: [0.0, 0.0, 0.0, near],
             prev_up: [0.0, 0.0, 0.0, far],
+            spp: 1,
+            probe_sample: 0,
+            _pad4: 0,
+            _pad5: 0,
+            jitters: [[0.0; 4]; (crate::dlss::MAX_SPP as usize) / 2],
         }
     }
 
@@ -1708,6 +1761,17 @@ impl FrameCb {
         cb.pixel_cone = p.cam.pixel_cone();
         cb.fb_mode = fb_mode_of(&p.q);
         cb.fb_depth = p.q.fb.depth.clamp(1, HEMI_MAX_DEPTH);
+        // --spp. Pinned to 1 on fb frames, exactly like FrameCtx::spp(): the
+        // leaf pass appends one hemi point per PIXEL (cap_hemi_pt = rw*rh),
+        // and N hemispheres per pixel is the wrong way to converge a bounce.
+        cb.spp = if cb.fb_mode > 0 { 1 } else { p.spp.clamp(1, crate::dlss::MAX_SPP) };
+        cb.probe_sample = p.probe_sample.min(cb.spp - 1);
+        for k in 0..cb.spp {
+            let (x, y) = crate::dlss::jitter_for_sample(p.frame, k);
+            let (row, half) = ((k / 2) as usize, (k % 2) as usize * 2);
+            cb.jitters[row][half] = x;
+            cb.jitters[row][half + 1] = y;
+        }
         if let Some(pc) = &p.prev_cam {
             // The near/far riding the w slots of the last two rows come from
             // the base and must survive the overwrite.
@@ -1745,6 +1809,13 @@ pub struct FrameParams {
     pub q: Quality,
     /// Check builds: hemi claim re-validation + PSA accounting on the GPU.
     pub verify: bool,
+    /// --spp: primary samples per pixel this frame (1..=dlss::MAX_SPP; the CB
+    /// pins it to 1 when fb is on). The samples share the tile's inherited
+    /// t_start and average into one partial write — accum semantics unchanged.
+    pub spp: u32,
+    /// Which sample writes tbuf/info/the G-buffer pack. 0 in every real frame;
+    /// the check suites sweep it 0..spp so every sample's ray is gated.
+    pub probe_sample: u32,
 }
 
 /// Which upscaler the feed pass targets — selects the kernel (and thereby
@@ -1896,11 +1967,15 @@ impl TraceGpu {
         // at t0 in place of the binary nodes. --no-ftree keeps the binary path.
         let ftree_on = crate::ftree::FTREE_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
         let ft_defs = if ftree_on { "#define FTREE 1" } else { "" };
+        // The cbuffer's jitter-table size (--spp) — every unit sees the cbuffer.
+        let sd = spp_defs();
+        let sd = sd.as_str();
         let reference_src =
-            [defs, TRACE_COMMON_HLSLI, RT_HLSLI, SHADE_HLSLI, REFERENCE_HLSL].join("\n");
-        let resolve_src = [TRACE_COMMON_HLSLI, RESOLVE_HLSL].join("\n");
+            [defs, sd, TRACE_COMMON_HLSLI, RT_HLSLI, SHADE_HLSLI, REFERENCE_HLSL].join("\n");
+        let resolve_src = [sd, TRACE_COMMON_HLSLI, RESOLVE_HLSL].join("\n");
         let wavefront_src = [
             ft_defs,
+            sd,
             TRACE_COMMON_HLSLI,
             CTR_HLSLI,
             QUEUES_HLSLI,
@@ -1909,9 +1984,17 @@ impl TraceGpu {
             WAVEFRONT_HLSL,
         ]
         .join("\n");
-        let leaf_src =
-            [defs, TRACE_COMMON_HLSLI, CTR_HLSLI, QUEUES_HLSLI, RT_HLSLI, SHADE_HLSLI, LEAF_HLSL]
-                .join("\n");
+        let leaf_src = [
+            defs,
+            sd,
+            TRACE_COMMON_HLSLI,
+            CTR_HLSLI,
+            QUEUES_HLSLI,
+            RT_HLSLI,
+            SHADE_HLSLI,
+            LEAF_HLSL,
+        ]
+        .join("\n");
         // Hemi kernels stay on the BINARY tree deliberately (no ft_defs):
         // hemi bound queries terminate in ~10 visits, where a wide pop's
         // unconditional 8 slot tests lose to the binary pop's 1 — measured
@@ -1919,6 +2002,7 @@ impl TraceGpu {
         // the tile path. record_hemi rebinds the binary buffer at t0.
         let hemi_wave_src = [
             defs,
+            sd,
             TRACE_COMMON_HLSLI,
             CTR_HLSLI,
             HEMI_HLSLI,
@@ -1927,11 +2011,19 @@ impl TraceGpu {
             HEMI_WAVE_HLSL,
         ]
         .join("\n");
-        let hemi_leaf_src =
-            [defs, TRACE_COMMON_HLSLI, CTR_HLSLI, HEMI_HLSLI, RT_HLSLI, SHADE_HLSLI, HEMI_LEAF_HLSL]
-                .join("\n");
-        let compose_src = [TRACE_COMMON_HLSLI, CTR_HLSLI, QUEUES_HLSLI, COMPOSE_HLSL].join("\n");
-        let feed_src = [TRACE_COMMON_HLSLI, FEED_HLSL].join("\n");
+        let hemi_leaf_src = [
+            defs,
+            sd,
+            TRACE_COMMON_HLSLI,
+            CTR_HLSLI,
+            HEMI_HLSLI,
+            RT_HLSLI,
+            SHADE_HLSLI,
+            HEMI_LEAF_HLSL,
+        ]
+        .join("\n");
+        let compose_src = [sd, TRACE_COMMON_HLSLI, CTR_HLSLI, QUEUES_HLSLI, COMPOSE_HLSL].join("\n");
+        let feed_src = [sd, TRACE_COMMON_HLSLI, FSR_WIRE_HLSLI, FEED_HLSL].join("\n");
         let pso = |src: &str, entry: &str, what: &str| -> Result<ID3D12PipelineState> {
             compute_pso(device, &root_sig, &dxc.compile(src, entry, "cs_6_5", what, debug)?, what)
         };
@@ -1963,7 +2055,7 @@ impl TraceGpu {
         };
         // NPPD staging kernels: only in --gpu --nppd (XeSS) sessions.
         let nppd_psos = if gbuf_full && nppd {
-            let nppd_src = [TRACE_COMMON_HLSLI, NPPD_HLSL].join("\n");
+            let nppd_src = [sd, TRACE_COMMON_HLSLI, NPPD_HLSL].join("\n");
             Some((
                 pso(&nppd_src, "cs_nppd_pack", "nppd_pack")?,
                 pso(&nppd_src, "cs_nppd_warp", "nppd_warp")?,

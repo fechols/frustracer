@@ -53,6 +53,9 @@ mod prof;
 mod replay;
 mod temporal;
 mod texture;
+// The presentation curve — one source of truth for SDR and scRGB alike, shared
+// by every CPU present arm and ported term-for-term into tonemap.hlsl.
+mod tone;
 // Pure chain-resolution data for the always-on temporal-upscaler fallback
 // (DLSS-RR → FSR4-RR → XeSS → FSR3); the real probes live in GpuContext::new.
 mod upchain;
@@ -79,6 +82,18 @@ const MAX_SAMPLES: u32 = 1024;
 /// (render::sparse_fill). Cost roughly quadruples per level, so
 /// log4(budget/elapsed) reads "levels of headroom" directly.
 const RENDER_BUDGET: Duration = Duration::from_millis(15);
+/// U cycles samples per pixel by doubling, wrapping at dlss::MAX_SPP (128):
+/// 1 -> 2 -> 4 -> ... -> 128 -> 1. Powers of two because the interesting axis
+/// is variance, which halves per doubling (error ~ 1/√N).
+fn next_spp(cur: u32) -> u32 {
+    let n = cur.saturating_mul(2);
+    if n > dlss::MAX_SPP {
+        1
+    } else {
+        n
+    }
+}
+
 /// Controller gain on the log4 error.
 const DEPTH_GAIN: f32 = 0.6;
 /// Max upward step per frame — creep up (>= 3 frames per level)...
@@ -136,6 +151,18 @@ pub struct Opts {
     pub xess_path: String,
     /// Directory holding amd_fidelityfx_loader_dx12.dll + the provider DLLs.
     pub ffx_path: String,
+    /// `--fsr4`: the FSR4 + Ray Regeneration level is REQUIRED, not merely
+    /// force-started. `--fsr` falls through to XeSS/FSR3 when the Ray
+    /// Regeneration provider is absent (no RDNA4, wrong adapter); this makes
+    /// that a hard error instead — the one place in the codebase where an
+    /// unsupported feature is not a loud-line fallback, because the flag's
+    /// whole point is to be told.
+    pub fsr4_required: bool,
+    /// Ray Regeneration tuning overrides (`--fsr-max-radiance` &c). All-None
+    /// by default: a flagless session configures nothing and runs the
+    /// provider's own constants. A/B levers for dialing in cleanliness —
+    /// `max_radiance` is the firefly clamp.
+    pub fsr_tune: fsr::DenoiseTuning,
     /// Explicit GPU adapter vendor preference (--prefer-nvidia /
     /// --prefer-intel / --prefer-amd). None = the mode default (AMD for
     /// --fsr, NVIDIA otherwise). A preference, not a requirement: the
@@ -155,8 +182,24 @@ pub struct Opts {
     /// Lock the DLSS/XeSS render resolution to this fixed scale of the
     /// window (default quality 2/3; `--lock-res dynamic` -> None = the
     /// step-wise dynamic-resolution controller). CLI-only, no runtime
-    /// toggle — T prints the locked note.
+    /// toggle — T prints the locked note. This is the CPU RENDERER's scale;
+    /// the GPU tracers read `gpu_lock_scale`.
     pub lock_scale: Option<f32>,
+    /// The GPU render modes' (`--gpu`, `--dxr`) counterpart of `lock_scale`:
+    /// they trace at NATIVE (100%) by default while the CPU renderer defaults
+    /// to quality (2/3) — the CPU tracer needs the pixel discount, the GPU
+    /// ones don't. The two are one flag: an explicit `--lock-res` sets BOTH,
+    /// so a session that asks for a scale gets that scale in whichever arm it
+    /// renders (F toggles between them; the res discontinuity is already a
+    /// history-reset latch).
+    pub gpu_lock_scale: Option<f32>,
+    /// Primary samples per pixel per frame (--spp, 1..=dlss::MAX_SPP; U cycles
+    /// it live). N jittered samples inside each pixel share the tile's
+    /// inherited t_start/cut (the quadtree cost amortizes over N× the rays)
+    /// and are averaged into ONE splat, so the upscalers/denoisers get a
+    /// ~1/N-variance frame at unchanged accum semantics. 1 = today's renderer,
+    /// bit-identically.
+    pub spp: u32,
     /// Master A/B lever (--no-temporal): disable ALL previous-frame quadtree
     /// reuse — no temporal cache produced or consumed, no claim ring, no cut
     /// store, no structure replay. Every frame proves its empty space from
@@ -260,6 +303,20 @@ pub struct Opts {
     /// interval 0 on a tearing swapchain so interactive frame times measure
     /// the renderer, not the monitor refresh.
     pub vsync: bool,
+    /// Present scRGB (R16G16B16A16_FLOAT + G10_NONE_P709). **On by default**:
+    /// an f16 swapchain is the right thing to hand Windows regardless of the
+    /// monitor. On an HDR display it carries real highlights; on an SDR one it
+    /// still removes our 8-bit quantization and lets DWM drive a 10-bit panel
+    /// at full precision (deep colour) instead of banding at 8. `--no-hdr`
+    /// forces the legacy 8-bit swapchain — the A/B lever, and the automatic
+    /// fallback when the colour space is refused.
+    pub hdr: bool,
+    /// `--hdr-paper-white <nits>`: where linear 1.0 lands. The scene is authored
+    /// so 1.0 ≈ diffuse white; 200 is the usual desktop-HDR reference.
+    pub hdr_paper_white: f32,
+    /// `--hdr-peak <nits>`: override the display's reported peak. None = trust
+    /// what the monitor says (`gpu::display::probe`).
+    pub hdr_peak: Option<f32>,
 }
 
 /// OIDN placement in XeSS mode (N cycles off → pre → post). Pre denoises the
@@ -339,11 +396,15 @@ fn main() {
             )
             .to_string()
         }),
+        fsr4_required: false,
+        fsr_tune: fsr::DenoiseTuning::default(),
         prefer: None,
         oidn_post: false,
         xess_autoexposure: false,
         adaptive: true,
         lock_scale: xess::lock_scale("quality"),
+        gpu_lock_scale: xess::lock_scale("native"),
+        spp: 1,
         temporal: true,
         replay: true,
         adopt: true,
@@ -376,6 +437,11 @@ fn main() {
             concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\pix\bin\x64").to_string()
         }),
         vsync: true,
+        // scRGB is the default swapchain: see Opts::hdr. The 8-bit path survives
+        // as --no-hdr and as the automatic fallback.
+        hdr: true,
+        hdr_paper_white: tone::DEFAULT_PAPER_WHITE,
+        hdr_peak: None,
     };
     let mut check_dlss = false;
     let mut dlss_dump = false;
@@ -475,6 +541,18 @@ fn main() {
             "--fsr" => {
                 opts.chain.force(upchain::UpLevel::Fsr4);
                 fsr_forced = true;
+            }
+            // --fsr4 IS --fsr, minus the fall-through: the level becomes a
+            // REQUIREMENT. Everywhere else in this codebase an unsupported
+            // feature is a loud line + a working fallback; here the user
+            // asked to be told, so a failed FSR4 probe exits(2) with the two
+            // things worth trying (--fsr3, --prefer-amd). Enforced in
+            // run_window against the session's actual wiring, so it can never
+            // disagree with what got wired.
+            "--fsr4" => {
+                opts.chain.force(upchain::UpLevel::Fsr4);
+                fsr_forced = true;
+                opts.fsr4_required = true;
             }
             "--fsr3" => {
                 opts.chain.force(upchain::UpLevel::Fsr3);
@@ -587,6 +665,29 @@ fn main() {
             }
             "--no-vsync" => opts.vsync = false,
             "--vsync" => opts.vsync = true,
+            "--hdr" => opts.hdr = true,
+            "--no-hdr" => opts.hdr = false,
+            "--hdr-paper-white" => {
+                opts.hdr_paper_white = args
+                    .next()
+                    .and_then(|v| v.parse::<f32>().ok())
+                    .filter(|v| *v >= 1.0)
+                    .unwrap_or_else(|| {
+                        eprintln!("--hdr-paper-white needs a luminance in nits (e.g. 200)");
+                        std::process::exit(2);
+                    });
+            }
+            "--hdr-peak" => {
+                opts.hdr_peak = Some(
+                    args.next()
+                        .and_then(|v| v.parse::<f32>().ok())
+                        .filter(|v| *v >= 1.0)
+                        .unwrap_or_else(|| {
+                            eprintln!("--hdr-peak needs a luminance in nits (e.g. 1000)");
+                            std::process::exit(2);
+                        }),
+                );
+            }
             "--pix-markers" => opts.pix_markers = true,
             "--pix-path" => {
                 opts.pix_path = args.next().unwrap_or_else(|| {
@@ -632,6 +733,8 @@ fn main() {
                 }
             }
             "--lock-res" => {
+                // One flag, both scales: an explicit request overrides the
+                // per-mode defaults (CPU quality, GPU native) in every arm.
                 opts.lock_scale = match args.next().as_deref() {
                     Some("dynamic") => None,
                     Some(s) => match xess::lock_scale(s) {
@@ -645,7 +748,44 @@ fn main() {
                         eprintln!("--lock-res needs quality|balanced|performance|ultra-performance|native|dynamic or a ratio in (0, 1]");
                         std::process::exit(2);
                     }
+                };
+                opts.gpu_lock_scale = opts.lock_scale;
+            }
+            // Ray Regeneration tuning overrides (FfxApiConfigureDenoiserKey).
+            // Absent = the provider's own default, so a flagless session is
+            // unchanged; each is an A/B lever on denoiser cleanliness.
+            "--fsr-max-radiance"
+            | "--fsr-stability-bias"
+            | "--fsr-radiance-clip-k"
+            | "--fsr-disocclusion-threshold"
+            | "--fsr-normal-strength"
+            | "--fsr-kernel-relaxation" => {
+                let v: f32 = args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(|| {
+                        eprintln!("{a} needs a float argument");
+                        std::process::exit(2);
+                    });
+                let t = &mut opts.fsr_tune;
+                match a.as_str() {
+                    "--fsr-max-radiance" => t.max_radiance = Some(v),
+                    "--fsr-stability-bias" => t.stability_bias = Some(v),
+                    "--fsr-radiance-clip-k" => t.radiance_clip_k = Some(v),
+                    "--fsr-disocclusion-threshold" => t.disocclusion_threshold = Some(v),
+                    "--fsr-normal-strength" => t.normal_strength = Some(v),
+                    _ => t.kernel_relaxation = Some(v),
                 }
+            }
+            "--spp" => {
+                opts.spp = args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .filter(|&n: &u32| n >= 1 && n <= dlss::MAX_SPP)
+                    .unwrap_or_else(|| {
+                        eprintln!("--spp needs an integer in 1..={}", dlss::MAX_SPP);
+                        std::process::exit(2);
+                    });
             }
             "--oidn-no-clean-aux" => opts.oidn_clean_aux = false,
             "--gpu" => opts.gpu = true,
@@ -772,6 +912,8 @@ fn main() {
                 eprintln!("  --check-fsr   headless: FSR signal-split/encoding/MV contract self-test (no GPU or DLL)");
                 eprintln!("  --fsr         force-start the upscaler chain at FSR4 + Ray Regeneration (K toggles;");
                 eprintln!("                RDNA4 only — elsewhere the chain falls to XeSS then FSR 3.1)");
+                eprintln!("  --fsr4        --fsr, but REQUIRED: exit(2) instead of falling through when FSR4 +");
+                eprintln!("                Ray Regeneration is unavailable (suggests --fsr3 / --prefer-amd)");
                 eprintln!("  --fsr3        force-start the chain at the FSR 3.1 upscale-only level (A/B lever)");
                 eprintln!("  --ffx-path    FidelityFX DLL directory (default: the FidelityFX-Samples-prebuilt drop)");
                 eprintln!("  --gpu         GPU-resident tracing: quadtree + shading in D3D12 compute with DXR");
@@ -795,6 +937,12 @@ fn main() {
                 eprintln!("                pre-mip bilinear (A/B lever; mips are on by default — implies --no-aniso)");
                 eprintln!("  --aniso N     max anisotropy for texture filtering, 1..=16 (default 16; 1 = off, i.e.");
                 eprintln!("                the isotropic ray-cone trilinear path verbatim). --no-aniso = --aniso 1");
+                eprintln!("  --spp <n>     primary samples per pixel per frame (1..=128, default 1; U doubles live).");
+                eprintln!("                The N jittered samples share the tile's inherited t_start/node cut, so");
+                eprintln!("                the quadtree's per-tile cost amortizes over N× the rays (--cpu/--gpu;");
+                eprintln!("                --dxr traces from the TLAS root, so there it is plain supersampling).");
+                eprintln!("                They average into ONE per-pixel value — a ~1/N-variance frame for the");
+                eprintln!("                upscaler/denoiser. Pinned to 1 on hemisphere-bounce (H) frames");
                 eprintln!("  --lock-res    DLSS/XeSS render res: quality|balanced|performance|ultra-performance|native,");
                 eprintln!("                a ratio in (0, 1], or dynamic (the step-wise DRS controller); default quality (2/3)");
                 eprintln!("  --xess-path   XeSS DLL directory (default: SDKs\\XeSS-SDK\\bin)");
@@ -832,6 +980,15 @@ fn main() {
         opts.nppd = false;
         opts.oidn = false;
         opts.oidn_post = false;
+    }
+    // --fsr4 requires the level it forces, so a flag that removed it from the
+    // chain (--no-fsr / --no-upscale / a later --xess|--fsr3|--nppd force —
+    // --nppd force-starts at XeSS) leaves nothing to require. Say which shape
+    // of failure this is: the level was never probed, so "unavailable" would
+    // be a lie.
+    if opts.fsr4_required && !opts.chain.fsr4 {
+        eprintln!("--fsr4: the FSR4 level was knocked out of the upscaler chain by another flag (--no-fsr / --no-upscale / a later --xess, --fsr3 or --nppd) — nothing left to require");
+        std::process::exit(2);
     }
     // Adapter preference default: AMD when FSR was explicitly requested
     // (--fsr/--fsr3), NVIDIA otherwise. An explicit --prefer-* always wins;
@@ -1036,7 +1193,7 @@ fn main() {
         std::process::exit(code);
     }
     if check_fsr {
-        let code = run_check_fsr(&scene, &bvh, cam0);
+        let code = run_check_fsr(&scene, &bvh, cam0, structural);
         std::process::exit(code);
     }
     if check_gpu {
@@ -1205,6 +1362,45 @@ fn run_check_dxr(
             fsr_buf: None,
             prev_cam: None,
             frame_jitter: None,
+            spp: 1,
+            primary_sample: 0,
+            adaptive: false,
+            hemi_share: false,
+            replay_rec: None,
+            cut_cur: None,
+            cut_prev: None,
+            discard_seeds: false,
+            defer_shade: false,
+        };
+        render::render_frame(&ctx, false);
+    };
+    // The same reference frame at (spp, probe_sample): reproduces ONE sample of
+    // a multi-sampled frame on the CPU, so the DXR spp gate below can compare
+    // per-sample rays. (1, 0) above is the historical single-sample frame.
+    let cpu_frame_spp = |frame: u32, spp: u32, probe: u32| {
+        let ctx = FrameCtx {
+            scene,
+            bvh,
+            cam: basis,
+            q,
+            frame,
+            jitter: frame > 0,
+            rw: gw,
+            rh: gh,
+            accum: &accum,
+            info: &info,
+            tbuf: &tbuf,
+            stats: &stats,
+            sun: render::sun_dir(scene),
+            tcache_cur: None,
+            tcache_prev: &[],
+            accumulate: true,
+            gbuf: None,
+            fsr_buf: None,
+            prev_cam: None,
+            frame_jitter: None,
+            spp,
+            primary_sample: probe,
             adaptive: false,
             hemi_share: false,
             replay_rec: None,
@@ -1230,6 +1426,8 @@ fn run_check_dxr(
                 prev_cam: None,
                 q,
                 verify: false,
+                spp: 1,
+                probe_sample: 0,
             },
         );
         let mut rec = Ok(());
@@ -1291,6 +1489,68 @@ fn run_check_dxr(
     if must_fire && (n_hit == 0 || n_sky == 0) {
         eprintln!("check-dxr: FAIL must-fire: the default view sees both geometry and sky");
         ok = false;
+    }
+
+    // T1b: multi-sampling (--spp). This pipeline has no tile claim to break
+    // (every ray starts at the TLAS root with TMin = 0), so the thing worth
+    // gating is that the two sides put sample k in the SAME place: the CPU
+    // takes its offset from dlss::jitter_for_sample, the GPU from the jitter
+    // table that function fills in the CB. A packing or index error there puts
+    // the GPU's ray somewhere else in the pixel and shows up here as t
+    // disagreement at silhouettes. Same thresholds as T1 (watertight hardware
+    // intersection ≠ möller-trumbore at edges — statistical, not exact).
+    {
+        const SPP_GATE: u32 = 4;
+        for probe in 0..SPP_GATE {
+            let p = gpu::trace::FrameParams {
+                cam: basis,
+                frame: 0,
+                accumulate: true,
+                jitter: false,
+                frame_jitter: None,
+                prev_cam: None,
+                q,
+                verify: false,
+                spp: SPP_GATE,
+                probe_sample: probe,
+            };
+            dg.write_cb(0, &p);
+            let mut rec = Ok(());
+            if hg.run(|l| rec = dg.record_frame(l, 0)).is_err() || rec.is_err() {
+                eprintln!("check-dxr: FAIL spp DispatchRays: {rec:?}");
+                return 1;
+            }
+            let gt4 = match read_f32(&mut hg, &dg.tbuf, px) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("check-dxr: FAIL spp tbuf readback: {e}");
+                    return 1;
+                }
+            };
+            cpu_frame_spp(0, SPP_GATE, probe);
+            let (mut cm, mut tv, mut mrel) = (0usize, 0usize, 0.0f32);
+            for i in 0..px {
+                let ct = f32::from_bits(tbuf[i].load(Relaxed));
+                match (ct.is_finite(), gt4[i].is_finite()) {
+                    (true, true) => {
+                        let rel = (ct - gt4[i]).abs() / ct.max(1e-6);
+                        mrel = mrel.max(rel);
+                        if rel > 1e-3 {
+                            tv += 1;
+                        }
+                    }
+                    (false, false) => {}
+                    _ => cm += 1,
+                }
+            }
+            eprintln!(
+                "check-dxr: spp={SPP_GATE} sample {probe} ({px} px): class-mismatch {cm} | rel-t > 1e-3: {tv} | max rel t err {mrel:.2e}"
+            );
+            if cm as f64 > px as f64 * 5e-4 || tv as f64 > px as f64 * 1e-4 {
+                eprintln!("check-dxr: FAIL spp sample {probe} disagrees with the CPU's same sample (jitter table?)");
+                ok = false;
+            }
+        }
     }
 
     // T2: 64-frame jittered accumulation both sides — converged radiance
@@ -1472,6 +1732,8 @@ fn run_check_dxr(
                 prev_cam: prev,
                 q: uq,
                 verify: false,
+                spp: 1,
+                probe_sample: 0,
             };
             dg2.write_cb(0, &p);
             let mut rec = Ok(());
@@ -1780,6 +2042,8 @@ fn run_check_dxr(
                         (gpu::trace::FEED_FSR_DD, fpl[6].0, fpl[6].1),
                         (gpu::trace::FEED_FSR_DS, fpl[7].0, fpl[7].1),
                         (gpu::trace::FEED_COLOR, fpl[8].0, fpl[8].1),
+                        (gpu::trace::FEED_FSR_AO, fpl[9].0, fpl[9].1),
+                        (gpu::trace::FEED_FSR_IS, fpl[10].0, fpl[10].1),
                     ],
                 ) {
                     eprintln!("check-dxr: FAIL FSR4-RR feed wiring: {e}");
@@ -1794,6 +2058,8 @@ fn run_check_dxr(
                     prev_cam: Some(basis_a),
                     q: uq,
                     verify: false,
+                    spp: 1,
+                    probe_sample: 0,
                 };
                 dg2.write_cb(0, &p);
                 let mut rec = Ok(());
@@ -1852,6 +2118,11 @@ fn run_check_dxr(
                 ) else {
                     return 1;
                 };
+                let (Some(f_ao), Some(f_is)) =
+                    (read_plane(9, 2, "ao"), read_plane(10, 8, "indirect_spec"))
+                else {
+                    return 1;
+                };
                 if !gate_fsr_rr_feed(
                     "check-dxr",
                     pw,
@@ -1865,10 +2136,34 @@ fn run_check_dxr(
                     &f_dd,
                     &f_ds,
                     &f_res,
+                    &f_ao,
+                    &f_is,
                     &pack2,
                     &accum2,
                     near,
                     far,
+                    &scene.sky_sh,
+                    must_fire,
+                ) {
+                    ok = false;
+                }
+                // The planes the GPU just wrote are the composite's inputs —
+                // gate the remodulation kernel on them while they are live.
+                if !gate_fsr_composite(
+                    "check-dxr",
+                    &mut hg,
+                    &fres,
+                    pw,
+                    ph,
+                    &f_alb,
+                    &f_spec,
+                    &f_dd,
+                    &f_ds,
+                    &f_ao,
+                    &f_is,
+                    &f_res,
+                    &f_nrm,
+                    &scene.sky_sh,
                     must_fire,
                 ) {
                     ok = false;
@@ -1902,11 +2197,11 @@ fn run_check_dxr(
     }
 }
 
-/// Unpack a GPU `GBufPx` pack readback (GBUF_STRIDE = 80 B/px, 20 lanes:
-/// nr | alb+z | spec | mv | sig) into a CPU `dlss::GBufs` so the existing
-/// CPU gates (`dlss::mv_selftest`) consume it unmodified — the four sig
-/// lanes and mv.zw are FSR-RR extras the GBufs shape doesn't carry (their
-/// own gates read the raw bytes). Shared by --check-gpu (M7) and
+/// Unpack a GPU `GBufPx` pack readback (GBUF_STRIDE = 88 B/px, 22 lanes:
+/// nr | alb+z | spec | mv | sig | sig2) into a CPU `dlss::GBufs` so the
+/// existing CPU gates (`dlss::mv_selftest`) consume it unmodified — the six
+/// sig/sig2 lanes and mv.zw are FSR-RR extras the GBufs shape doesn't carry
+/// (their own gates read the raw bytes). Shared by --check-gpu (M7) and
 /// --check-dxr (T4).
 #[cfg(windows)]
 fn unpack_gbuf_bytes(bytes: &[u8], pw: usize, ph: usize) -> dlss::GBufs {
@@ -2159,9 +2454,11 @@ fn gate_rr_feed(
 }
 
 /// The FSR4-RR feed gates over a pack traced WITH the FsrRr wiring
-/// (FLAG_FSR_SIG armed): all nine planes vs CPU oracles computed from the
-/// raw 80-B pack readback + accum. dd/ds are gated BIT-EQUAL to the pack's
-/// sig f16 halves (pure widen), the linear-depth plane bit-equal to view-Z
+/// (FLAG_FSR_SIG armed): all eleven planes vs CPU oracles computed from the
+/// raw 88-B pack readback + accum. dd/ds/ao/indirect-spec are gated BIT-EQUAL
+/// to the pack's sig/sig2 f16 halves (pure widen — the indirect-specular
+/// plane's A channel likewise against the spec_hit_t lane), the linear-depth
+/// plane bit-equal to view-Z
 /// (DEPTH_SIGN = 1 passthrough), clip depth at the XeSS 4-ulp bound with
 /// sky bit-equal 0.0, the albedos at <= 1 LSB against the single explicit
 /// sqrt quantization (`fsr::sqrt_encode8` of the pack f32 — no f16 hop
@@ -2170,8 +2467,9 @@ fn gate_rr_feed(
 /// prev-Z == far bit-equal => mvec B exactly 0).
 ///
 /// The residual is the one plane whose tolerance is NOT an ulp count of its
-/// own value: it is a near-**cancellation** (`color − dd⊗kd − ds⊗f0` — the
-/// two products are the same magnitude as the color), so the f32 arithmetic
+/// own value: it is a near-**cancellation** (`color − dd⊗kd − ds⊗f0 −
+/// ao·AMBIENT⊗kd − is⊗f0` — the products are the same magnitude as the
+/// color), so the f32 arithmetic
 /// slop is bounded by the CANCELLED terms, not by the tiny result. Gating it
 /// at 1 f16 ulp of the remainder makes the limit shrink toward zero exactly
 /// where the error doesn't — a lit pixel whose residual lands near 0 then
@@ -2196,10 +2494,13 @@ fn gate_fsr_rr_feed(
     dd: &[u8],
     ds: &[u8],
     residual: &[u8],
+    ao: &[u8],
+    ind_s: &[u8],
     pack: &[u8],
     accum_bytes: &[u8],
     near: f32,
     far: f32,
+    sky_sh: &sh::Sh9,
     must_fire: bool,
 ) -> bool {
     let lanes = gpu::trace::GBUF_STRIDE as usize / 4;
@@ -2214,7 +2515,10 @@ fn gate_fsr_rr_feed(
     let (mut dl_bad, mut dc_bad, mut dc_sky_bad, mut dc_sky_n) = (0usize, 0usize, 0usize, 0usize);
     let (mut mv_bad, mut nrm_bad, mut alb_bad, mut sig_bad) = (0usize, 0usize, 0usize, 0usize);
     let (mut res_bad, mut sky_sig_bad, mut sig_fired) = (0usize, 0usize, 0usize);
+    let (mut ao_fired, mut is_fired) = (0usize, 0usize);
+    let (mut dd_bad, mut ds_bad, mut is_bad, mut ao_bad, mut ish_bad) = (0, 0, 0, 0, 0usize);
     let mut max_dc_ulp = 0u32;
+    let mut max_ish_ulp = 0u32;
     // Worst margin among the channels that needed the cancellation escape
     // (negative = inside tolerance); -inf when none did.
     let mut worst_res = f32::NEG_INFINITY;
@@ -2266,21 +2570,62 @@ fn gate_fsr_rr_feed(
         {
             nrm_bad += 1;
         }
-        // Signals: the planes are pure widens of the pack's sig f16 halves.
+        // Signals: the planes are pure widens of the pack's sig/sig2 f16
+        // halves. sig = (dd.x|dd.y, dd.z|ds.x, ds.y|ds.z, 0); sig2 =
+        // (ao|is.x, is.y|is.z).
         let sig = [lane_u(i, 16), lane_u(i, 17), lane_u(i, 18)];
+        let sig2 = [lane_u(i, 20), lane_u(i, 21)];
         let dd16 = [sig[0] as u16, (sig[0] >> 16) as u16, sig[1] as u16];
         let ds16 = [(sig[1] >> 16) as u16, sig[2] as u16, (sig[2] >> 16) as u16];
+        let ao16 = sig2[0] as u16;
+        let is16 = [(sig2[0] >> 16) as u16, sig2[1] as u16, (sig2[1] >> 16) as u16];
         for ch in 0..3 {
-            if h16(dd, i * 8 + ch * 2) != dd16[ch] || h16(ds, i * 8 + ch * 2) != ds16[ch] {
-                sig_bad += 1;
+            if h16(dd, i * 8 + ch * 2) != dd16[ch] {
+                dd_bad += 1;
+            }
+            if h16(ds, i * 8 + ch * 2) != ds16[ch] {
+                ds_bad += 1;
+            }
+            if h16(ind_s, i * 8 + ch * 2) != is16[ch] {
+                is_bad += 1;
             }
         }
+        // AO: R16F, one half per pixel. The indirect-specular plane's A
+        // channel carries the reflection ray's hit distance — the pack's
+        // spec_hit_t lane, through the same f16 store.
+        if h16(ao, i * 2) != ao16 {
+            ao_bad += 1;
+        }
+        // The A channel is the reflection ray's hit distance — the same f32
+        // through the same typed f16 store gate_rr_feed's spec-hit plane
+        // takes, and at the same 1-ulp tolerance (a typed UAV store to a
+        // FLOAT16 format has rounding latitude the CPU's from_f32 does not).
+        {
+            let got = h16(ind_s, i * 8 + 6);
+            let want = half::f16::from_f32(lane_f(i, 11)).to_bits();
+            let d = (mono16(got) - mono16(want)).unsigned_abs();
+            max_ish_ulp = max_ish_ulp.max(d);
+            if d > 1 {
+                ish_bad += 1;
+            }
+        }
+        sig_bad = dd_bad + ds_bad + is_bad + ao_bad + ish_bad;
         if sky {
-            if sig != [0, 0, 0] || prev_z.to_bits() != far.to_bits() {
+            if sig != [0, 0, 0] || sig2 != [0, 0] || prev_z.to_bits() != far.to_bits() {
                 sky_sig_bad += 1;
             }
-        } else if sig != [0, 0, 0] {
-            sig_fired += 1;
+        } else {
+            if sig != [0, 0, 0] {
+                sig_fired += 1;
+            }
+            // AO fires when the ray was occluded (binary at the 1-sample
+            // preset), indirect specular when the reflection gate traced.
+            if half::f16::from_bits(ao16).to_f32() < 1.0 {
+                ao_fired += 1;
+            }
+            if is16 != [0, 0, 0] {
+                is_fired += 1;
+            }
         }
         // Albedos: ONE explicit sqrt quantization of the pack f32 — <= 1 LSB
         // vs the CPU encode (GPU sqrt has 1-ulp latitude, unlike Rust's
@@ -2313,10 +2658,31 @@ fn gate_fsr_rr_feed(
             half::f16::from_bits(ds16[1]).to_f32(),
             half::f16::from_bits(ds16[2]).to_f32(),
         );
+        let isf = Vec3A::new(
+            half::f16::from_bits(is16[0]).to_f32(),
+            half::f16::from_bits(is16[1]).to_f32(),
+            half::f16::from_bits(is16[2]).to_f32(),
+        );
+        let aof = half::f16::from_bits(ao16).to_f32();
+        // The AO signal's remodulation factor — the sky's SH irradiance at the
+        // WIRE normal, decoded from the PLANE BYTES the GPU stored, for exactly
+        // the reason the albedo wire factors are: the composite pass has only
+        // those bytes, so an oracle built from the pack's full-precision normal
+        // would be scoring a different identity than the one that runs.
+        let n_wire = fsr::oct_decode(
+            l10(got_n, 0) as f32 / 1023.0,
+            l10(got_n, 10) as f32 / 1023.0,
+        );
+        let amb = sky_sh.irradiance(n_wire);
         for ch in 0..3 {
             let color = accf(i * 3 + ch);
-            let (t_dd, t_ds) = (ddf[ch] * wire[0][ch], dsf[ch] * wire[1][ch]);
-            let e = color - t_dd - t_ds;
+            // Every remodulated term, in the kernel's order (feed.hlsl's
+            // cs_feed_fsr_rr — and fsr::split_signals' before it).
+            let t_dd = ddf[ch] * wire[0][ch];
+            let t_ds = dsf[ch] * wire[1][ch];
+            let t_ao = aof * amb[ch] * wire[0][ch];
+            let t_is = isf[ch] * wire[1][ch];
+            let e = color - t_dd - t_ds - t_ao - t_is;
             let got16 = h16(residual, i * 8 + ch * 2);
             if (mono16(got16) - mono16(fsr::f16_sat(e).to_bits())).unsigned_abs() <= 1 {
                 continue; // the ordinary storage tolerance, like every other plane
@@ -2327,8 +2693,15 @@ fn gate_fsr_rr_feed(
             // nothing about), and its own f16 store rounds by half an ulp of
             // what it holds. Anything past that is a real defect — a wiring
             // or formula error moves the residual by the size of a whole term.
+            // Every subtracted term is a cancelled magnitude, so all four
+            // enter the bound.
             let got = half::f16::from_bits(got16).to_f32();
-            let cancelled = color.abs().max(t_dd.abs()).max(t_ds.abs());
+            let cancelled = color
+                .abs()
+                .max(t_dd.abs())
+                .max(t_ds.abs())
+                .max(t_ao.abs())
+                .max(t_is.abs());
             let tol = 8.0 * f32::EPSILON * cancelled + (got.abs() * 4.9e-4).max(3.0e-8);
             let err = (got - e).abs();
             worst_res = worst_res.max(err - tol);
@@ -2338,7 +2711,7 @@ fn gate_fsr_rr_feed(
         }
     }
     eprintln!(
-        "{tag}: fsr-rr feed ({pw}x{ph}): depth-lin-not-bit-equal {dl_bad} | clip-ulp>4 {dc_bad} (max {max_dc_ulp}) | sky-not-0.0 {dc_sky_bad} (sky px {dc_sky_n}) | mvec-ulp>1 {mv_bad} | normals-lsb>1 {nrm_bad} | alb-lsb>1 {alb_bad} | sig-not-bit-equal {sig_bad} | residual-over-tol {res_bad} (worst margin {worst_res:.2e}) | sky-sig-bad {sky_sig_bad} | sig-fired {sig_fired}"
+        "{tag}: fsr-rr feed ({pw}x{ph}): depth-lin-not-bit-equal {dl_bad} | clip-ulp>4 {dc_bad} (max {max_dc_ulp}) | sky-not-0.0 {dc_sky_bad} (sky px {dc_sky_n}) | mvec-ulp>1 {mv_bad} | normals-lsb>1 {nrm_bad} | alb-lsb>1 {alb_bad} | sig-not-bit-equal {sig_bad} (dd {dd_bad} ds {ds_bad} is {is_bad} ao {ao_bad} | is-hit-t-ulp>1 {ish_bad} max {max_ish_ulp}) | residual-over-tol {res_bad} (worst margin {worst_res:.2e}) | sky-sig-bad {sky_sig_bad} | fired: sig {sig_fired} ao {ao_fired} ind-spec {is_fired}"
     );
     if dl_bad != 0
         || dc_bad != 0
@@ -2353,8 +2726,133 @@ fn gate_fsr_rr_feed(
         eprintln!("{tag}: FAIL FSR4-RR feed gates");
         return false;
     }
-    if must_fire && (dc_sky_n == 0 || sig_fired == 0) {
-        eprintln!("{tag}: FAIL FSR4-RR feed gates vacuous (no sky / no armed sig on the default scene)");
+    if must_fire && (dc_sky_n == 0 || sig_fired == 0 || ao_fired == 0 || is_fired == 0) {
+        eprintln!(
+            "{tag}: FAIL FSR4-RR feed gates vacuous (no sky / no armed sig / no occluded AO / no reflection on the default scene)"
+        );
+        return false;
+    }
+    true
+}
+
+/// `gpu/shaders/fsr_composite.hlsl` — the THIRD site of the composite identity,
+/// and the only one whose arithmetic runs nowhere else. `fsr::composite` is
+/// gated by --check-fsr and `cs_feed_fsr_rr`'s residual by the feed gate above,
+/// but this kernel executes only inside a live FSR4-RR session, so for a long
+/// time nothing tested it — and it shipped with its root constants written to
+/// the wrong DWORDs (HLSL bumps a `float3` that would straddle a 16-byte
+/// boundary, so `ambient` sat at offset 16 while the CPU wrote it at 8; the
+/// pass read one channel of AMBIENT shifted and two undeclared DWORDs).
+///
+/// The trick that makes it gateable with no denoiser in the loop: copy each
+/// signal's INPUT plane into its denoised-output UAV, making the denoiser an
+/// IDENTITY. `record_composite` must then remodulate back to what it started
+/// from. The oracle is built from the PLANE BYTES the GPU stored (the feed
+/// gate's discipline — never from a recompute that could drift), so what is
+/// pinned here is exactly this kernel: its arithmetic, its albedo decode, its
+/// SRV table ORDER, and its root constants. A wrong ambient factor moves a lit
+/// pixel by ~0.03 = tens of f16 ulps; the tolerance is 2.
+///
+/// That factor is the sky's SH irradiance at the pixel's normal now, not a
+/// constant — so this gate also pins that the pass reads the NORMALS plane
+/// (t7) and evaluates `sh_irr` against the same coefficients the CPU holds.
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn gate_fsr_composite(
+    tag: &str,
+    hg: &mut gpu::trace::HeadlessGpu,
+    fres: &gpu::ffx_rr::FsrResources,
+    pw: usize,
+    ph: usize,
+    diff_alb: &[u8],
+    spec_alb: &[u8],
+    dd: &[u8],
+    ds: &[u8],
+    ao: &[u8],
+    ind_s: &[u8],
+    residual: &[u8],
+    normals: &[u8],
+    sky_sh: &sh::Sh9,
+    must_fire: bool,
+) -> bool {
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT;
+    if hg
+        .run(|l| {
+            fres.record_signal_passthrough(l);
+            fres.record_composite(l, pw as u32, ph as u32, sky_sh);
+        })
+        .is_err()
+    {
+        eprintln!("{tag}: FAIL composite dispatch");
+        return false;
+    }
+    let comp = match read_feed_tex(hg, fres.composite_tex(), DXGI_FORMAT_R16G16B16A16_FLOAT, 8, pw, ph) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{tag}: FAIL composite readback: {e}");
+            return false;
+        }
+    };
+    let h16 = |b: &[u8], off: usize| u16::from_le_bytes([b[off], b[off + 1]]);
+    let f16v = |b: &[u8], off: usize| half::f16::from_bits(h16(b, off)).to_f32();
+    // fsr_composite.hlsl's decode_albedo: the UNORM8 read is byte/255, squared.
+    let dec = |b: &[u8], i: usize, c: usize| {
+        let s = b[i * 4 + c] as f32 / 255.0;
+        s * s
+    };
+    let (mut bad, mut max_ulp, mut ao_fired, mut is_fired) = (0usize, 0u32, 0usize, 0usize);
+    let mut worst = String::new();
+    for i in 0..pw * ph {
+        let aoc = f16v(ao, i * 2);
+        let mut any_is = false;
+        // The AO factor, decoded from the same RGB10A2 bytes the shader samples.
+        let nw = u32::from_le_bytes(normals[i * 4..][..4].try_into().unwrap());
+        let amb = sky_sh.irradiance(fsr::oct_decode(
+            (nw & 0x3ff) as f32 / 1023.0,
+            ((nw >> 10) & 0x3ff) as f32 / 1023.0,
+        ));
+        for ch in 0..3 {
+            let (kd, f0) = (dec(diff_alb, i, ch), dec(spec_alb, i, ch));
+            let ddc = f16v(dd, i * 8 + ch * 2);
+            let dsc = f16v(ds, i * 8 + ch * 2);
+            let isc = f16v(ind_s, i * 8 + ch * 2);
+            let resc = f16v(residual, i * 8 + ch * 2);
+            any_is |= isc != 0.0;
+            let want = ddc * kd + dsc * f0 + aoc * amb[ch] * kd + isc * f0 + resc;
+            let got = h16(&comp, i * 8 + ch * 2);
+            let d = (mono16(got) - mono16(half::f16::from_f32(want).to_bits())).unsigned_abs();
+            max_ulp = max_ulp.max(d);
+            if d > 2 {
+                bad += 1;
+                if worst.is_empty() {
+                    worst = format!(
+                        " | first: px ({},{}) ch{ch} got {} want {want:.6} ({d} ulp)",
+                        i % pw,
+                        i / pw,
+                        half::f16::from_bits(got).to_f32()
+                    );
+                }
+            }
+        }
+        // The AO term is live wherever the surface has any diffuse albedo and
+        // the hemisphere is not fully closed — without such pixels a wrong
+        // AMBIENT would be invisible, which is the whole point of this gate.
+        if aoc > 0.0 && (0..3).any(|c| dec(diff_alb, i, c) > 0.0) {
+            ao_fired += 1;
+        }
+        if any_is {
+            is_fired += 1;
+        }
+    }
+    eprintln!(
+        "{tag}: fsr composite identity ({pw}x{ph}, denoiser=passthrough): over-tol {bad} (max {max_ulp} f16 ulp, limit 2) | terms live: ao {ao_fired} ind-spec {is_fired}{worst}"
+    );
+    if bad != 0 {
+        eprintln!("{tag}: FAIL fsr_composite.hlsl does not reproduce the traced color (remodulation, albedo decode, SRV order or root constants)");
+        return false;
+    }
+    if must_fire && (ao_fired == 0 || is_fired == 0) {
+        eprintln!("{tag}: FAIL fsr composite gate vacuous (no live AO term / no reflection term — a wrong AMBIENT would pass)");
         return false;
     }
     true
@@ -2499,6 +2997,8 @@ fn run_check_gpu(
             fsr_buf: None,
             prev_cam: None,
             frame_jitter: None,
+            spp: 1,
+            primary_sample: 0,
             adaptive: false,
             hemi_share: false,
             replay_rec: None,
@@ -2522,6 +3022,8 @@ fn run_check_gpu(
             prev_cam: None,
             q,
             verify: false,
+            spp: 1,
+            probe_sample: 0,
         });
         hg.run(|l| tg.record_reference(l, 0))
     };
@@ -2540,9 +3042,20 @@ fn run_check_gpu(
     };
     cpu_frame(0);
     let px = gw * gh;
+    // Snapshot frame 0's CPU visibility: the 64-frame radiance A/B below re-runs
+    // cpu_frame and clobbers tbuf, and every gate downstream compares against
+    // FRAME 0 (jitter makes each frame's t different at silhouettes).
+    let cpu_t0: Vec<f32> = tbuf.iter().map(|a| f32::from_bits(a.load(Relaxed))).collect();
     let mut class_mismatch = 0usize;
     let mut t_viol = 0usize;
     let mut max_rel = 0.0f32;
+    // Pixels where möller-trumbore and the hardware's watertight test disagree
+    // (a ray grazing a shared triangle edge). Expected, statistically bounded,
+    // and NOT evidence about the quadtree — but the reference's t is not
+    // trustworthy ground truth at these pixels, so the wavefront/reference gate
+    // below excludes them by this mask rather than by re-deriving them.
+    let mut edge_mask = vec![false; px];
+    let mut edge_px: Vec<(usize, usize, f32, f32)> = Vec::new();
     for i in 0..px {
         let ct = f32::from_bits(tbuf[i].load(Relaxed));
         let gt = gpu_t[i];
@@ -2552,11 +3065,21 @@ fn run_check_gpu(
                 max_rel = max_rel.max(rel);
                 if rel > 1e-3 {
                     t_viol += 1;
+                    edge_mask[i] = true;
+                    if edge_px.len() < 8 {
+                        edge_px.push((i % gw, i / gw, ct, gt));
+                    }
                 }
             }
             (false, false) => {}
-            _ => class_mismatch += 1,
+            _ => {
+                class_mismatch += 1;
+                edge_mask[i] = true;
+            }
         }
+    }
+    for (x, y, ct, gt) in &edge_px {
+        eprintln!("check-gpu:   two-intersector edge px ({x},{y}): cpu t {ct:.6} | gpu-ref t {gt:.6}");
     }
     let mut ok = true;
     eprintln!(
@@ -2714,6 +3237,8 @@ fn run_check_gpu(
         prev_cam: None,
         q,
         verify: false,
+        spp: 1,
+        probe_sample: 0,
     };
     tg.write_cb(0, &wf_params);
     if let Err(e) = hg.run(|l| tg.record_wavefront(l, 0, &wf_params, true)) {
@@ -2835,40 +3360,194 @@ fn run_check_gpu(
     let mut overshoot = 0usize;
     let mut hybrid_extra = 0usize;
     let mut max_rel_t = 0.0f32;
+    let mut culprits: Vec<String> = Vec::new();
+
+    // The inherited t_start per pixel, scattered from the leaf queue once (a
+    // per-pixel scan of the rects would be O(px * n_leaf)). NaN = not a leaf
+    // pixel (sky rects carry no claim).
+    let mut t_start_of = vec![f32::NAN; px];
+    for r in 0..n_leaf.min(leaf_recs.len() / 4) {
+        let (xy0, xy1) = (leaf_recs[r * 4], leaf_recs[r * 4 + 1]);
+        let (x0, y0) = ((xy0 & 0xffff) as usize, (xy0 >> 16) as usize);
+        let (x1, y1) = ((xy1 & 0xffff) as usize, (xy1 >> 16) as usize);
+        let ts = f32::from_bits(leaf_recs[r * 4 + 2]);
+        for y in y0..y1.min(gh) {
+            for x in x0..x1.min(gw) {
+                t_start_of[y * gw + x] = ts;
+            }
+        }
+    }
+
+    // THE soundness contract, asserted directly instead of by proxy: the region
+    // a tile proved empty — frustum ∩ ball(origin, t_start) — must not contain
+    // the true nearest hit. Ground truth is the EARLIEST t either intersector
+    // reports (möller-trumbore or the hardware), which is the most pessimistic
+    // bar available; a hit either one finds is a real triangle inside the tile
+    // frustum, so a sound t_start lower-bounds it. Exact-zero, and strictly
+    // stronger than the old `wave_t > ref_t` inference — that one is a
+    // CONSEQUENCE of an overshoot, and a consequence can have other causes
+    // (below), whereas this is the invariant itself.
+    let mut claim_viol = 0usize;
+    for i in 0..px {
+        let ts = t_start_of[i];
+        if !ts.is_finite() {
+            continue;
+        }
+        let truth = match (cpu_t0[i].is_finite(), ref_t[i].is_finite()) {
+            (true, true) => cpu_t0[i].min(ref_t[i]),
+            (true, false) => cpu_t0[i],
+            (false, true) => ref_t[i],
+            (false, false) => continue, // both say sky: no geometry to overshoot
+        };
+        if ts > truth * (1.0 + 1e-4) {
+            claim_viol += 1;
+            if culprits.len() < 8 {
+                let (x, y) = (i % gw, i / gw);
+                culprits.push(format!(
+                    "CLAIM VIOLATION px ({x},{y}): t_start {ts:.6} > nearest hit {truth:.6} (cpu {:.6} | gpu-ref {:.6})",
+                    cpu_t0[i], ref_t[i]
+                ));
+            }
+        }
+    }
+
+    // Wavefront vs reference. Both run the hardware intersector, so identical
+    // hits are expected — EXCEPT at the two-intersector edge pixels, where a
+    // ray grazes a shared triangle edge. There the hardware's accept/reject is
+    // sensitive to TMin (AMD re-origins the ray at TMin; measured on an R9700:
+    // the reference at TMin=0 takes the edge, the leaf ray at TMin=t_start does
+    // not, and the CPU agrees with the leaf ray). Those pixels are ALREADY
+    // known-disagreeing from the CPU comparison above, so the reference's t is
+    // not ground truth there and they carry no information about the quadtree —
+    // `claim_viol` above is what guards the contract at them.
+    let mut edge_skipped = 0usize;
     for i in 0..px {
         let (rt, wt) = (ref_t[i], wave_t[i]);
+        let (x, y) = (i % gw, i / gw);
+        // NaN-safe "these two disagree" (sky is non-finite on both sides).
+        let disagree = match (rt.is_finite(), wt.is_finite()) {
+            (true, true) => rt != wt,
+            (false, false) => false,
+            _ => true,
+        };
+        if edge_mask[i] && disagree {
+            edge_skipped += 1;
+            continue;
+        }
         match (rt.is_finite(), wt.is_finite()) {
             (true, true) => {
                 let rel = (wt - rt) / rt.max(1e-6);
                 max_rel_t = max_rel_t.max(rel.abs());
                 if rel > 1e-4 {
-                    overshoot += 1; // wavefront started past real geometry
+                    overshoot += 1;
+                    if culprits.len() < 8 {
+                        culprits.push(format!(
+                            "overshoot px ({x},{y}): ref t {rt:.6} -> wave t {wt:.6} (rel +{rel:.3e}) | inherited t_start {:.6}",
+                            t_start_of[i]
+                        ));
+                    }
                 }
             }
-            (true, false) => false_sky += 1,
-            (false, true) => hybrid_extra += 1,
+            (true, false) => {
+                false_sky += 1;
+                if culprits.len() < 8 {
+                    culprits.push(format!("false-sky px ({x},{y}): ref t {rt:.6}, wave = sky"));
+                }
+            }
+            (false, true) => {
+                hybrid_extra += 1;
+                if culprits.len() < 8 {
+                    culprits.push(format!("hybrid-extra px ({x},{y}): ref = sky, wave t {wt:.6}"));
+                }
+            }
             (false, false) => {}
         }
     }
-    // Same-seed same-shading image A/B: identical hits => identical RNG
-    // streams => near-identical color (cross-kernel compilation fp only).
+    // Same-seed same-shading image A/B: identical hits => identical RNG streams
+    // => near-identical color (cross-kernel compilation fp only). A pixel that
+    // legitimately hit DIFFERENT geometry (the TMin-sensitive edge above) has no
+    // business in the MAX — its color difference measures the two surfaces, not
+    // the shading. It stays in the mean, which is a whole-image gate.
     let mut img_sum = 0.0f64;
     let mut img_max = 0.0f32;
+    let mut img_hot = 0usize; // channels past the tolerance, excluding hw-edge px
+    let mut hot_px: Vec<String> = Vec::new();
     for i in 0..px * 3 {
         let d = (wave_acc[i] - ref_acc[i]).abs();
         img_sum += d as f64;
-        img_max = img_max.max(d);
+        if !edge_mask[i / 3] {
+            img_max = img_max.max(d);
+            if d > 1e-2 {
+                img_hot += 1;
+                if hot_px.len() < 6 {
+                    let p = i / 3;
+                    hot_px.push(format!(
+                        "hot px ({},{}) ch{}: |d| {d:.4} | ref t {:.6} wave t {:.6} (rel {:.2e})",
+                        p % gw,
+                        p / gw,
+                        i % 3,
+                        ref_t[p],
+                        wave_t[p],
+                        (wave_t[p] - ref_t[p]) / ref_t[p].max(1e-6),
+                    ));
+                }
+            }
+        }
+    }
+    for h in &hot_px {
+        eprintln!("check-gpu:   {h}");
     }
     let img_mean = img_sum / (px * 3) as f64;
     eprintln!(
-        "check-gpu: wavefront vs reference ({px} px): false-sky {false_sky} | tmin-overshoot {overshoot} | hybrid-extra {hybrid_extra} | max rel t err {max_rel_t:.2e} | same-seed image mean |d| {img_mean:.2e} max {img_max:.2e}"
+        "check-gpu: wavefront vs reference ({px} px): claim-violation {claim_viol} | false-sky {false_sky} | tmin-overshoot {overshoot} | hybrid-extra {hybrid_extra} | hw-edge px {edge_skipped} | max rel t err {max_rel_t:.2e} | same-seed image mean |d| {img_mean:.2e} max {img_max:.2e} | hot ch {img_hot}"
     );
+    if claim_viol != 0 {
+        eprintln!("check-gpu: FAIL inherited-tmin claim violated (t_start past real geometry — THE bug class)");
+        ok = false;
+    }
     if false_sky != 0 || overshoot != 0 || hybrid_extra != 0 {
         eprintln!("check-gpu: FAIL wavefront visibility gates (the inherited-tmin bug class)");
         ok = false;
     }
-    if img_mean > 1e-5 || img_max > 1e-2 {
-        eprintln!("check-gpu: FAIL same-seed wavefront/reference images diverge");
+    if !culprits.is_empty() {
+        for c in &culprits {
+            eprintln!("check-gpu:   {c}");
+        }
+    }
+    // The hardware-edge pixels are bounded by the SAME statistical allowance the
+    // reference-vs-CPU gate uses — they are the same phenomenon, seen from the
+    // other side. A flood of them is a real signal (a broken cut would surface
+    // as mass disagreement); one or two is grazing-edge fp.
+    if edge_skipped as f64 > px as f64 * 5e-4 {
+        eprintln!("check-gpu: FAIL {edge_skipped} wavefront/reference disagreements above the 0.05% two-intersector edge allowance");
+        ok = false;
+    }
+    // The same-seed image A/B, in three parts that between them are strictly
+    // stronger than the old `mean || max` pair — and, unlike it, do not assume
+    // the hardware returns a BIT-IDENTICAL t for one ray at two different TMins.
+    // (NVIDIA does. AMD re-origins the ray at TMin and lands 1-2 ulp away;
+    // measured on an R9700: the hit point shifts by ulps, which moves the
+    // shadow/AO ray origin, which at a grazing angle flips a BINARY occlusion
+    // bit — 2 ulp of geometry becomes ~0.02 of color at a handful of pixels.
+    // No amount of correct code prevents that: a discrete decision on a
+    // continuous input is discontinuous by construction.)
+    //   mean  — a systematic shading bug (wrong rng, lobe, albedo) moves it.
+    //   hot   — a localized bug lights up far more than the edge allowance.
+    //   finite— a catastrophic single pixel (NaN/inf) that the counts would miss.
+    let hot_limit = (px * 3) as f64 * 5e-4;
+    let nonfinite = wave_acc.iter().filter(|v| !v.is_finite()).count();
+    if img_mean > 1e-5 {
+        eprintln!("check-gpu: FAIL same-seed wavefront/reference images diverge (mean {img_mean:.2e} > 1e-5)");
+        ok = false;
+    }
+    if img_hot as f64 > hot_limit {
+        eprintln!(
+            "check-gpu: FAIL {img_hot} same-seed channels past 1e-2 (limit {hot_limit:.0} = 0.05%) — beyond grazing-edge occlusion flips"
+        );
+        ok = false;
+    }
+    if nonfinite != 0 {
+        eprintln!("check-gpu: FAIL {nonfinite} non-finite channels in the wavefront image");
         ok = false;
     }
     if must_fire {
@@ -2876,6 +3555,141 @@ fn run_check_gpu(
         if n_sky == 0 || n_leaf == 0 || ctrs[gpu::trace::CTR_BLOCKED as usize] == 0 {
             eprintln!("check-gpu: FAIL structural must-fires (sky/leaf/blocked all expected > 0 on the default scene)");
             ok = false;
+        }
+    }
+
+    // --- Multi-sampling (--spp), GPU half ----------------------------------
+    // Same claim, same proof as the CPU --check: the extra samples ride the
+    // tile's inherited t_start, so each one gets the exact-zero visibility
+    // gates. `probe_sample` names the sample whose t lands in tbuf; sweeping
+    // it gates EVERY sample's ray, not just sample 0's. The reference kernel
+    // runs the same loop at the same spp/probe, so the same-seed image A/B
+    // stays live too (a divergence there means the sample loops disagree).
+    // Fixed spp, like the CPU gate — plain --check-gpu can never stop gating.
+    {
+        const SPP_GATE: u32 = 4;
+        // ...plus the top of the range: the LAST sample at spp = MAX_SPP, which
+        // is where the CB's jitter table ends. A table-bound or index-packing
+        // error there is invisible at spp=4.
+        let top = dlss::MAX_SPP;
+        let probes: Vec<(u32, u32)> =
+            (0..SPP_GATE).map(|k| (SPP_GATE, k)).chain([(top, top - 1)]).collect();
+        for (spp, probe) in probes {
+            let p = gpu::trace::FrameParams {
+                cam: basis,
+                frame: 0,
+                accumulate: true,
+                jitter: false,
+                frame_jitter: None,
+                prev_cam: None,
+                q,
+                verify: false,
+                spp,
+                probe_sample: probe,
+            };
+            tg.write_cb(0, &p);
+            if let Err(e) = hg.run(|l| tg.record_wavefront(l, 0, &p, true)) {
+                eprintln!("check-gpu: FAIL spp wavefront dispatch: {e}");
+                return 1;
+            }
+            let (wt4, wa4) =
+                match (read_f32(&mut hg, &tg.tbuf, px), read_f32(&mut hg, &tg.accum, px * 3)) {
+                    (Ok(a), Ok(b)) => (a, b),
+                    _ => {
+                        eprintln!("check-gpu: FAIL spp wavefront readback");
+                        return 1;
+                    }
+                };
+            tg.write_cb(0, &p);
+            if let Err(e) = hg.run(|l| tg.record_reference(l, 0)) {
+                eprintln!("check-gpu: FAIL spp reference dispatch: {e}");
+                return 1;
+            }
+            let (rt4, ra4) =
+                match (read_f32(&mut hg, &tg.tbuf, px), read_f32(&mut hg, &tg.accum, px * 3)) {
+                    (Ok(a), Ok(b)) => (a, b),
+                    _ => {
+                        eprintln!("check-gpu: FAIL spp reference readback");
+                        return 1;
+                    }
+                };
+            // Same rules as the spp=1 wavefront/reference gate above, and for
+            // the same reason: the wavefront's leaf ray carries TMin = t_start
+            // and the reference's does not, so on hardware that re-origins the
+            // ray at TMin (AMD) they are the same intersector but not the same
+            // ray. The two-intersector edge pixels are masked (they are already
+            // known-disagreeing from the reference-vs-CPU gate and carry no
+            // information about multi-sampling), and the image comparison is
+            // mean + a bounded hot COUNT rather than an absolute max, which
+            // would otherwise be set by a grazing binary occlusion flip.
+            let (mut fs, mut ov, mut he, mut edge) = (0usize, 0usize, 0usize, 0usize);
+            for i in 0..px {
+                let disagree = match (rt4[i].is_finite(), wt4[i].is_finite()) {
+                    (true, true) => rt4[i] != wt4[i],
+                    (false, false) => false,
+                    _ => true,
+                };
+                if edge_mask[i] && disagree {
+                    edge += 1;
+                    continue;
+                }
+                match (rt4[i].is_finite(), wt4[i].is_finite()) {
+                    (true, true) => {
+                        if (wt4[i] - rt4[i]) / rt4[i].max(1e-6) > 1e-4 {
+                            ov += 1;
+                        }
+                    }
+                    (true, false) => fs += 1,
+                    (false, true) => he += 1,
+                    (false, false) => {}
+                }
+            }
+            let (mut sum, mut mx, mut hot) = (0.0f64, 0.0f32, 0usize);
+            for i in 0..px * 3 {
+                let d = (wa4[i] - ra4[i]).abs();
+                sum += d as f64;
+                if !edge_mask[i / 3] {
+                    mx = mx.max(d);
+                    if d > 1e-2 {
+                        hot += 1;
+                    }
+                }
+            }
+            let mean = sum / (px * 3) as f64;
+            // RELATIVE to the image's own magnitude. The divergence here is
+            // per-sample fp rounding between two compile units' summations
+            // (spp=1 is bit-identical; the error averages DOWN ~1/sqrt(N), the
+            // signature of independent rounding noise, not a bias), so it
+            // scales with scene RADIANCE — an absolute limit tuned on the
+            // default scene is simply a different limit on a brighter one, and
+            // upstream's 1e-5 fails --stress 5000 for that reason alone.
+            let ref_mag = ra4.iter().map(|v| v.abs() as f64).sum::<f64>() / (px * 3) as f64;
+            let rel = mean / ref_mag.max(1e-9);
+            let hot_limit = (px * 3) as f64 * 5e-4;
+            let nonfinite = wa4.iter().filter(|v| !v.is_finite()).count();
+            eprintln!(
+                "check-gpu: spp={spp} sample {probe} ({px} px): false-sky {fs} | tmin-overshoot {ov} | hybrid-extra {he} | hw-edge px {edge} | same-seed image mean |d| {mean:.2e} (rel {rel:.2e} of {ref_mag:.3e}) max {mx:.2e} | hot ch {hot}"
+            );
+            if fs != 0 || ov != 0 || he != 0 {
+                eprintln!("check-gpu: FAIL spp visibility gates (a multi-sample ray broke the inherited-tmin claim)");
+                ok = false;
+            }
+            if edge as f64 > px as f64 * 5e-4 {
+                eprintln!("check-gpu: FAIL {edge} spp wavefront/reference disagreements above the 0.05% two-intersector edge allowance");
+                ok = false;
+            }
+            // 1e-4 relative: ~3.7x the worst fp noise measured across scenes and
+            // vendors (2.69e-5 — default 1.95e-5, San Miguel 1.93e-5, stress
+            // 2.34e-5/2.69e-5, all at spp=4, the worst spp), and ~100x BELOW the
+            // ~1e-2 a real shading divergence produces (wrong rng stream, lobe,
+            // or albedo). The old absolute 1e-5 was passing on its own scene by
+            // 15% and had no headroom to be scene-independent with.
+            if rel > 1e-4 || hot as f64 > hot_limit || nonfinite != 0 {
+                eprintln!(
+                    "check-gpu: FAIL same-seed wavefront/reference images diverge at spp={spp} (rel {rel:.2e} of limit 1e-4 | hot {hot} of limit {hot_limit:.0} | non-finite {nonfinite})"
+                );
+                ok = false;
+            }
         }
     }
 
@@ -2925,6 +3739,8 @@ fn run_check_gpu(
                 prev_cam: None,
                 q: hq,
                 verify: true,
+                spp: 1,
+                probe_sample: 0,
             });
             if let Err(e) = tg.run_hemi_probes(&mut hg, 0, &probes, fb.depth, s == 0) {
                 eprintln!("check-gpu: FAIL hemi {mode_name} probes: {e}");
@@ -3087,6 +3903,8 @@ fn run_check_gpu(
             prev_cam: None,
             q: hq,
             verify: false,
+            spp: 1,
+            probe_sample: 0,
         };
         tg.write_cb(0, &p);
         if let Err(e) = hg.run(|l| tg.record_wavefront(l, 0, &p, false)) {
@@ -3169,6 +3987,8 @@ fn run_check_gpu(
                 prev_cam: prev,
                 q: uq,
                 verify: false,
+                spp: 1,
+                probe_sample: 0,
             };
             ptg.write_cb(0, &p);
             hg.run(|l| ptg.record_wavefront(l, 0, &p, false))?;
@@ -3551,6 +4371,8 @@ fn run_check_gpu(
                         (gpu::trace::FEED_FSR_DD, fpl[6].0, fpl[6].1),
                         (gpu::trace::FEED_FSR_DS, fpl[7].0, fpl[7].1),
                         (gpu::trace::FEED_COLOR, fpl[8].0, fpl[8].1),
+                        (gpu::trace::FEED_FSR_AO, fpl[9].0, fpl[9].1),
+                        (gpu::trace::FEED_FSR_IS, fpl[10].0, fpl[10].1),
                     ],
                 ) {
                     eprintln!("check-gpu: FAIL FSR4-RR feed wiring: {e}");
@@ -3565,6 +4387,8 @@ fn run_check_gpu(
                     prev_cam: Some(basis_a),
                     q: uq,
                     verify: false,
+                    spp: 1,
+                    probe_sample: 0,
                 };
                 ptg.write_cb(0, &p);
                 if let Err(e) = hg.run(|l| ptg.record_wavefront(l, 0, &p, false)) {
@@ -3622,6 +4446,11 @@ fn run_check_gpu(
                 ) else {
                     return 1;
                 };
+                let (Some(f_ao), Some(f_is)) =
+                    (read_plane(9, 2, "ao"), read_plane(10, 8, "indirect_spec"))
+                else {
+                    return 1;
+                };
                 if !gate_fsr_rr_feed(
                     "check-gpu",
                     pw,
@@ -3635,10 +4464,34 @@ fn run_check_gpu(
                     &f_dd,
                     &f_ds,
                     &f_res,
+                    &f_ao,
+                    &f_is,
                     &pack2,
                     &accum2,
                     near,
                     far,
+                    &scene.sky_sh,
+                    must_fire,
+                ) {
+                    ok = false;
+                }
+                // The planes the GPU just wrote are the composite's inputs —
+                // gate the remodulation kernel on them while they are live.
+                if !gate_fsr_composite(
+                    "check-gpu",
+                    &mut hg,
+                    &fres,
+                    pw,
+                    ph,
+                    &f_alb,
+                    &f_spec,
+                    &f_dd,
+                    &f_ds,
+                    &f_ao,
+                    &f_is,
+                    &f_res,
+                    &f_nrm,
+                    &scene.sky_sh,
                     must_fire,
                 ) {
                     ok = false;
@@ -3949,13 +4802,123 @@ fn run_check_gpu(
         }
     }
 
-    // M13: the glare pyramid, GPU vs CPU. bloom.hlsl was the one CPU/GPU mirror
-    // in the renderer with no numeric gate — it PRESENTS, so a swapped octave
-    // weight or a bad barrier just looks slightly wrong and no suite objects.
-    // This scores the halo (the whole pyramid's product) against `bloom::Bloom`.
-    // Structure-free: it runs on a synthetic probe image, so `--stress` and
-    // loaded scenes gate it exactly like the default one.
+    // Both remaining gates borrow `hg` mutably and neither needs the tracer.
     drop(tg);
+
+    // --- M12: the tonemap PS vs tone::map (the HLSL twin gate) ---
+    // tonemap.hlsl is a term-for-term port of tone::map, and this is what stops
+    // it drifting: the REAL pixel shader, through the REAL PSO and SRV slot, over
+    // a synthetic linear-HDR ramp that deliberately spans the whole interesting
+    // range — below the knee, through the rolloff, and far past it (a physical
+    // sun disc is ~44,000, so the tail is not hypothetical).
+    //
+    // Both encodings are gated: SDR 8-bit (the default, which must not move) and
+    // scRGB f16 (the --hdr path). One shader produces both, so gating each pins
+    // the curve AND its encode.
+    {
+        const TW: u32 = 64;
+        const TH: u32 = 32;
+        // The tail is the point: a physical sun disc is ~44,000, so the ramp is
+        // pinned to END at RAMP_HI rather than wherever a growth factor happens
+        // to land (an earlier `0.001 * 1.0002^(30i)` topped out near 215 — it
+        // never reached the regime this gate exists to cover). RAMP_HI stays
+        // under f16::MAX (65504) because the source is a real RGBA16F texture.
+        const RAMP_LO: f32 = 1e-3;
+        const RAMP_HI: f32 = 6.0e4;
+        let n = (TW * TH) as usize;
+        // Geometric from RAMP_LO to exactly RAMP_HI, plus a zero and an
+        // exact-knee sample.
+        let span = (n - 3) as f32;
+        let radiance = |i: usize| -> f32 {
+            match i {
+                0 => 0.0,
+                1 => 1.0, // exactly the HDR knee: must be reproduced, not rolled off
+                _ => RAMP_LO * (RAMP_HI / RAMP_LO).powf((i - 2) as f32 / span),
+            }
+        };
+        // Anti-vacuity: the gate's whole claim is that it spans the sun-disc
+        // range, so assert the ramp actually gets there rather than trusting the
+        // arithmetic above to stay right.
+        let top = radiance(n - 1);
+        if !(top >= 4.4e4 && top <= 65504.0) {
+            eprintln!("check-gpu: FAIL M12 ramp tops out at {top:.0} — must span the sun-disc range");
+            ok = false;
+        }
+        let src: Vec<f32> = (0..n * 3)
+            .map(|k| radiance(k / 3) * [1.0, 0.75, 0.4][k % 3])
+            .collect();
+
+        for (label, format, tp, tol) in [
+            (
+                "sdr",
+                gpu::d3d12::SWAPCHAIN_FORMAT,
+                tone::ToneParams::SDR,
+                1.0 / 255.0 + 1e-6, // one UNORM LSB — the wire quantizes
+            ),
+            (
+                "scrgb",
+                gpu::d3d12::SWAPCHAIN_FORMAT_HDR,
+                tone::ToneParams::hdr(200.0, 1000.0),
+                2e-3, // f16 wire + fp differences between HLSL exp/pow and Rust's
+            ),
+        ] {
+            match gpu::tonemap::selftest(&mut hg, &src, TW, TH, format, tp) {
+                Ok(got) => {
+                    let mut worst = 0.0f32;
+                    let mut worst_at = 0.0f32;
+                    for i in 0..n {
+                        // Feed the oracle what the SHADER actually reads: the
+                        // source is a real RGBA16F texture, so the f32 ramp is
+                        // f16-rounded on the way in. Comparing against the exact
+                        // f32 would charge the port for the wire's rounding —
+                        // which at the top of the ramp is a step of 32 radiance,
+                        // and this gate is about the curve, not the upload.
+                        let q = |v: f32| half::f16::from_f32(v).to_f32();
+                        let c = glam::Vec3A::new(
+                            q(src[i * 3]),
+                            q(src[i * 3 + 1]),
+                            q(src[i * 3 + 2]),
+                        );
+                        let want = tone::map(c, tp);
+                        for ch in 0..3 {
+                            // Relative for the big scRGB values, absolute for the
+                            // small ones — an absolute-only gate would be
+                            // meaningless at the top of the range.
+                            let w = want[ch];
+                            let d = (got[i][ch] - w).abs() / (1.0f32).max(w.abs());
+                            if d > worst {
+                                worst = d;
+                                worst_at = radiance(i);
+                            }
+                        }
+                    }
+                    if worst > tol {
+                        eprintln!(
+                            "check-gpu: FAIL M12 tonemap PS ({label}) vs tone::map — \
+                             worst {worst:.2e} > {tol:.2e} at radiance {worst_at:.3}"
+                        );
+                        ok = false;
+                    } else {
+                        println!(
+                            "check-gpu: M12 tonemap PS ({label}) == tone::map (worst {worst:.2e})"
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("check-gpu: FAIL M12 tonemap selftest ({label}): {e}");
+                    ok = false;
+                }
+            }
+        }
+    }
+
+    // --- M13: the glare pyramid, GPU vs CPU ---
+    // bloom.hlsl was the one CPU/GPU mirror in the renderer with no numeric gate
+    // — it PRESENTS, so a swapped octave weight or a bad barrier just looks
+    // slightly wrong and no suite objects. This scores the halo (the whole
+    // pyramid's product) against `bloom::Bloom`. Structure-free: it runs on a
+    // synthetic probe image, so `--stress` and loaded scenes gate it exactly like
+    // the default one.
     if let Err(e) = gpu::bloom::self_test_gpu(&mut hg) {
         eprintln!("check-gpu: FAIL {e}");
         ok = false;
@@ -3994,7 +4957,7 @@ fn run_check_gpu(
         }
     };
     let bbasis = cam0.basis(bw, bh);
-    let mut bench = |label: &str, hybrid: bool, fb: shade::FrustumBounce| {
+    let mut timed = |hybrid: bool, fb: shade::FrustumBounce, spp: u32| -> f64 {
         let bq = Quality { fb, ..q };
         let n = 60u32;
         // Warm once (PSO/cache effects), then time.
@@ -4008,6 +4971,8 @@ fn run_check_gpu(
                 prev_cam: None,
                 q: bq,
                 verify: false,
+                spp,
+                probe_sample: 0,
             };
             btg.write_cb(0, &p);
             let _ = hg.run(|l| btg.record_frame(l, 0, &p, hybrid));
@@ -4023,20 +4988,82 @@ fn run_check_gpu(
                 prev_cam: None,
                 q: bq,
                 verify: false,
+                spp,
+                probe_sample: 0,
             };
             btg.write_cb(0, &p);
             let _ = hg.run(|l| btg.record_frame(l, 0, &p, hybrid));
         }
-        let ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
-        eprintln!("check-gpu: bench {bw}x{bh} {label}: {ms:6.2} ms/frame");
+        t0.elapsed().as_secs_f64() * 1000.0 / n as f64
     };
     let fb_off = shade::FrustumBounce::OFF;
-    bench("gpu hybrid          ", true, fb_off);
-    bench("gpu plain reference ", false, fb_off);
+    let mut bench = |label: &str, hybrid: bool, fb: shade::FrustumBounce, spp: u32| -> f64 {
+        let ms = timed(hybrid, fb, spp);
+        eprintln!("check-gpu: bench {bw}x{bh} {label}: {ms:6.2} ms/frame");
+        ms
+    };
+    bench("gpu hybrid          ", true, fb_off, 1);
+    bench("gpu plain reference ", false, fb_off, 1);
     bench(
         "gpu hybrid + hemi-gi",
         true,
         shade::FrustumBounce { ao: false, gi: true, depth: 3 },
+        1,
+    );
+    // --spp on the GPU: the wavefront pays its quadtree ONCE per frame no
+    // matter the sample count, while the reference kernel pays per ray. The
+    // plain-reference row BEATS the hybrid row for primary visibility today
+    // (RT-core root traversal is cheap enough that our software frustum
+    // queries cost more than they save), so the number to watch is whether
+    // multi-sampling narrows that gap: the hybrid's fixed cost is diluted
+    // spp×, the reference's is not. Amortization = ms(N) / (N · ms(1)); 1.00
+    // means the extra samples paid full price.
+    //
+    // These rows are warm-clock noisy (a cold first row can "measure" a
+    // speedup that is physically impossible), so the configurations are
+    // INTERLEAVED and reduced by median — the temporal-bench lesson.
+    const SPP_SWEEP: [u32; 5] = [1, 2, 4, 8, 16];
+    const REPS: usize = 3;
+    let mut hs: Vec<Vec<f64>> = vec![Vec::new(); SPP_SWEEP.len()];
+    let mut ps: Vec<Vec<f64>> = vec![Vec::new(); SPP_SWEEP.len()];
+    for _ in 0..REPS {
+        for (i, &n) in SPP_SWEEP.iter().enumerate() {
+            hs[i].push(timed(true, fb_off, n));
+            ps[i].push(timed(false, fb_off, n));
+        }
+    }
+    let median = |v: &mut Vec<f64>| -> f64 {
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    };
+    let h: Vec<f64> = hs.iter_mut().map(median).collect();
+    let p: Vec<f64> = ps.iter_mut().map(median).collect();
+    for (i, &n) in SPP_SWEEP.iter().enumerate() {
+        eprintln!(
+            "check-gpu: bench {bw}x{bh} spp={n:<2}: hybrid {:5.2} ms (amort {:.2}×) | plain reference {:5.2} ms (amort {:.2}×) | hybrid/plain {:.2}×",
+            h[i],
+            h[i] / (n as f64 * h[0]),
+            p[i],
+            p[i] / (n as f64 * p[0]),
+            h[i] / p[i],
+        );
+    }
+    // ms(n) = F + m·n (see run_check's model): F is the once-per-frame
+    // quadtree, m one sample's rays+shading. amortization(n) has an asymptote
+    // m/(F+m) approached as 1/n — half the fixed cost gone by spp 2, 90% by
+    // spp 10 — so the dilution is spent by ~8-16 spp. hybrid/plain therefore
+    // settles at m_hybrid/m_plain: if THAT is > 1, no sample count ever makes
+    // the software quadtree beat RT-core root traversal for primary rays.
+    let (last, n_last) = (SPP_SWEEP.len() - 1, *SPP_SWEEP.last().unwrap() as f64);
+    let mh = (h[last] - h[0]) / (n_last - 1.0);
+    let mp = (p[last] - p[0]) / (n_last - 1.0);
+    eprintln!(
+        "check-gpu: spp cost model: hybrid = {:.2} ms fixed + {mh:.3} ms/sample (floor {:.2}×) | plain = {:.2} ms fixed + {mp:.3} ms/sample (floor {:.2}×) | hybrid/plain -> {:.2}× as spp -> inf",
+        (h[0] - mh).max(0.0),
+        mh / h[0],
+        (p[0] - mp).max(0.0),
+        mp / p[0],
+        mh / mp,
     );
     {
         // CPU hybrid at the same resolution/quality for scale.
@@ -4067,6 +5094,8 @@ fn run_check_gpu(
                 fsr_buf: None,
                 prev_cam: None,
                 frame_jitter: None,
+                spp: 1,
+                primary_sample: 0,
                 adaptive: false,
                 hemi_share: false,
                 replay_rec: None,
@@ -4103,7 +5132,7 @@ fn run_check_gpu(
 /// dynamic-range fallbacks match the documented FSR ratios, FsrBufs
 /// reinterprets in place under set_res, and turning the capture on leaves the
 /// rendered image bit-identical.
-fn run_check_fsr(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera) -> i32 {
+fn run_check_fsr(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: bool) -> i32 {
     let (_, far) = dlss::near_far(scene.diag);
     let mut all_ok = true;
 
@@ -4204,12 +5233,20 @@ fn run_check_fsr(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera) -> i32 {
             let mut v3 = |scale: f32| Vec3A::new(rng.f32(), rng.f32(), rng.f32()) * scale;
             let color = v3(4.0);
             let (direct_d, direct_s) = (v3(3.0), v3(2.0));
+            let ind_s = v3(2.0);
             let albedo = v3(1.0);
+            drop(v3);
+            let ao = rng.f32();
             let metallic = rng.f32();
             let kd = albedo * (1.0 - metallic);
             let f0 = Vec3A::splat(0.04).lerp(albedo, metallic);
-            let sig = fsr::split_signals(color, direct_d, direct_s, kd, f0);
-            let re = fsr::composite(&sig, kd, f0);
+            // The AO remodulation factor is now an arbitrary per-pixel RGB (the
+            // sky's SH irradiance at the pixel's normal), so the identity is
+            // gated against a RANDOM one — strictly stronger than pinning it to
+            // whatever constant the renderer happens to use.
+            let amb = Vec3A::new(rng.f32(), rng.f32(), rng.f32());
+            let sig = fsr::split_signals(color, direct_d, direct_s, ao, ind_s, kd, f0, amb);
+            let re = fsr::composite(&sig, kd, f0, amb);
             let err = (re - color).abs().max_element();
             if !re.is_finite() || err > 1e-5 * color.abs().max_element().max(1.0) {
                 eprintln!("composite identity err {err} at color {color}");
@@ -4221,16 +5258,24 @@ fn run_check_fsr(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera) -> i32 {
         // spike hits the MIN_SPEC_ALB floor with direct_s/1e-4 ≫ f16::MAX;
         // the saturating q16 must keep ds finite (an inf ds makes the
         // residual inf·0 = NaN) and the identity must still hold exactly
-        // (residual is the remainder of the clamped wire products).
+        // (residual is the remainder of the clamped wire products). The
+        // reflection bounce divides by the same floor, so `is` is inside the
+        // regression too — a mirror-bright metal is exactly where it bites.
         {
             let albedo = Vec3A::new(1.0, 0.4, 0.0);
             let (kd, f0) = (Vec3A::ZERO, albedo); // metallic = 1
             let direct_s = Vec3A::splat(300.0);
-            let color = direct_s * fsr::albedo_wire3(f0) + Vec3A::splat(0.05);
-            let sig = fsr::split_signals(color, Vec3A::ZERO, direct_s, kd, f0);
-            let re = fsr::composite(&sig, kd, f0);
-            if !sig.ds.is_finite() || !sig.residual.is_finite() || !re.is_finite() {
-                eprintln!("zero-wire-F0 split not finite: ds {} residual {}", sig.ds, sig.residual);
+            let ind_s = Vec3A::splat(120.0);
+            let color = (direct_s + ind_s) * fsr::albedo_wire3(f0) + Vec3A::splat(0.05);
+            let amb = Vec3A::new(0.12, 0.18, 0.25);
+            let sig = fsr::split_signals(color, Vec3A::ZERO, direct_s, 0.0, ind_s, kd, f0, amb);
+            let re = fsr::composite(&sig, kd, f0, amb);
+            if !sig.ds.is_finite() || !sig.is.is_finite() || !sig.residual.is_finite() || !re.is_finite()
+            {
+                eprintln!(
+                    "zero-wire-F0 split not finite: ds {} is {} residual {}",
+                    sig.ds, sig.is, sig.residual
+                );
                 pass = false;
             }
             if (re - color).abs().max_element() > 1e-5 * color.max_element() {
@@ -4266,11 +5311,18 @@ fn run_check_fsr(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera) -> i32 {
         let sig = fsr::Signals {
             dd: Vec3A::new(0.5, 0.25, 0.125),
             ds: Vec3A::new(1.0, 2.0, 4.0),
+            ao: 0.75,
+            is: Vec3A::new(0.5, 1.5, 2.5),
             residual: Vec3A::new(0.1, -0.2, 0.3),
         };
         f.write(19, 11, &sig, 42.0);
         let r = f.read(19, 11);
-        if r.dd != sig.dd || r.ds != sig.ds || r.residual != sig.residual {
+        if r.dd != sig.dd
+            || r.ds != sig.ds
+            || r.ao != sig.ao
+            || r.is != sig.is
+            || r.residual != sig.residual
+        {
             eprintln!("FsrBufs set_res write/read mismatch");
             pass = false;
         }
@@ -4355,7 +5407,7 @@ fn run_check_fsr(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera) -> i32 {
     // 7. Rendered-frame gates at a native and an odd dynamic res (odd dims
     // also exercise the quadtree's odd splits with the capture on).
     for (rw, rh) in [(800usize, 600usize), (531, 399)] {
-        all_ok &= fsr_frame_check(scene, bvh, cam0, rw, rh, far);
+        all_ok &= fsr_frame_check(scene, bvh, cam0, rw, rh, far, structural);
     }
 
     if all_ok {
@@ -4378,6 +5430,7 @@ fn fsr_frame_check(
     rw: usize,
     rh: usize,
     far: f32,
+    structural: bool,
 ) -> bool {
     let q = Quality {
         shadow_samples: 1,
@@ -4422,6 +5475,8 @@ fn fsr_frame_check(
             fsr_buf: f,
             prev_cam: prev,
             frame_jitter: Some((0.0, 0.0)),
+            spp: 1,
+            primary_sample: 0,
             adaptive: false,
             hemi_share: false,
             replay_rec: None,
@@ -4457,6 +5512,10 @@ fn fsr_frame_check(
     {
         let mut worst = 0.0f32;
         let mut sky_ok = true;
+        // Anti-vacuity: the two new signals must actually carry something on
+        // a scene with an AO-occluded surface and a reflective one, or the
+        // identity above is passing on all-zeros.
+        let (mut ao_fired, mut is_fired) = (0u64, 0u64);
         for y in 0..rh {
             for x in 0..rw {
                 let i = y * rw + x;
@@ -4471,12 +5530,23 @@ fn fsr_frame_check(
                     let prev_z = f32::from_bits(fb.prev_z[i].load(Relaxed));
                     if sig.dd != Vec3A::ZERO
                         || sig.ds != Vec3A::ZERO
+                        || sig.ao != 0.0
+                        || sig.is != Vec3A::ZERO
                         || sig.residual != c
                         || prev_z != far
                     {
                         sky_ok = false;
                     }
                     continue;
+                }
+                // An occluded AO ray (at the 1-sample preset the open
+                // fraction is binary, so this is exactly ao == 0) — a frame
+                // of all-open AO would satisfy the identity trivially.
+                if sig.ao < 1.0 {
+                    ao_fired += 1;
+                }
+                if sig.is != Vec3A::ZERO {
+                    is_fired += 1;
                 }
                 let l3 = |buf: &[std::sync::atomic::AtomicU16], j: usize| {
                     Vec3A::new(
@@ -4485,7 +5555,17 @@ fn fsr_frame_check(
                         dlss::ld16(&buf[j * 3 + 2]),
                     )
                 };
-                let re = fsr::composite(&sig, l3(&ga.diff_alb, i), l3(&ga.spec_alb, i));
+                // The AO factor, from the same f16 G-buffer normal the FSR
+                // upload oct-encodes the normals plane from (render.rs's
+                // write_fsr subtracted exactly this).
+                let n16 = Vec3A::new(
+                    dlss::ld16(&ga.normal_rough[i * 4]),
+                    dlss::ld16(&ga.normal_rough[i * 4 + 1]),
+                    dlss::ld16(&ga.normal_rough[i * 4 + 2]),
+                );
+                let amb = scene.sky_sh.irradiance(fsr::wire_normal(n16));
+                let re =
+                    fsr::composite(&sig, l3(&ga.diff_alb, i), l3(&ga.spec_alb, i), amb);
                 // NaN/inf must fail loudly — f32::max would silently discard
                 // a NaN err, hiding an overflowed signal plane.
                 if !re.is_finite() {
@@ -4508,6 +5588,11 @@ fn fsr_frame_check(
             ok = false;
         } else {
             eprintln!("  sky signal contract: OK");
+        }
+        eprintln!("  signal must-fire: ao-occluded {ao_fired} px, indirect-spec {is_fired} px");
+        if structural && (ao_fired == 0 || is_fired == 0) {
+            eprintln!("  signal must-fire: FAIL (a new signal is identically zero)");
+            ok = false;
         }
     }
 
@@ -4666,6 +5751,8 @@ fn albedo_ab_check(
         fsr_buf: None,
         prev_cam: None,
         frame_jitter: Some((0.0, 0.0)),
+        spp: 1,
+        primary_sample: 0,
         adaptive: false,
         hemi_share: false,
         replay_rec: None,
@@ -4779,6 +5866,8 @@ fn mv_check_at(
                 fsr_buf: None,
                 prev_cam: prev,
                 frame_jitter: Some((0.0, 0.0)),
+                spp: 1,
+                primary_sample: 0,
                 adaptive: false,
                 hemi_share: false,
                 replay_rec: None,
@@ -5244,6 +6333,8 @@ fn run_check_xess(
                     fsr_buf: None,
                     prev_cam: None,
                     frame_jitter: Some(dlss::jitter_for(f)),
+                    spp: 1,
+                    primary_sample: 0,
                     adaptive,
                     hemi_share: false,
                     replay_rec: None,
@@ -5486,6 +6577,8 @@ fn run_check_nppd(
             fsr_buf: None,
             prev_cam: prev,
             frame_jitter: None,
+            spp: 1,
+            primary_sample: 0,
             adaptive: false,
             hemi_share: false, // inert: the NPPD contract pins fb OFF
             replay_rec: None,
@@ -5711,6 +6804,8 @@ fn run_check_oidn(
             fsr_buf: None,
             prev_cam: None,
             frame_jitter: None,
+            spp: 1,
+            primary_sample: 0,
             adaptive: false,
             hemi_share: false,
             replay_rec: None,
@@ -5861,6 +6956,8 @@ fn run_check_oidn(
             fsr_buf: None,
             prev_cam: None,
             frame_jitter: None,
+            spp: 1,
+            primary_sample: 0,
             adaptive: false,
             hemi_share: false,
             replay_rec: None,
@@ -6052,6 +7149,8 @@ fn run_check_oidn(
                 fsr_buf: None,
                 prev_cam: None,
                 frame_jitter: None,
+                spp: 1,
+                primary_sample: 0,
                 adaptive: false,
                 hemi_share: false,
                 replay_rec: None,
@@ -6498,6 +7597,10 @@ fn run_spin(
             fsr_buf: None,
             prev_cam: None,
             frame_jitter: Some(dlss::jitter_for(idx)),
+            // --spp rides the deterministic benchmark: `--spin path --spp 4`
+            // vs `--spin path` is the wall-clock amortization A/B.
+            spp: opts.spp,
+            primary_sample: 0,
             adaptive: false,
             hemi_share: false,
             replay_rec: if record { Some(&replay_cache) } else { None },
@@ -6693,6 +7796,18 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
     };
 
+    // Presentation-curve self-test — the SDR degeneracy (bit-for-bit against
+    // the pre-HDR curve: the guard that --hdr did not move the default), the
+    // paper-white anchor, monotonicity, the headroom asymptote, and C¹ at the
+    // knee. The HLSL twin is gated against this same math by --check-gpu M12.
+    let tone_ok = match tone::self_test() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("tone self-test: FAIL — {e}");
+            false
+        }
+    };
+
     // glTF loader self-test — an in-code GLB exercises node flattening, the
     // mirrored-winding flip, u16 index widening, and the factor mapping.
     let gltf_ok = match gltf_loader::self_test() {
@@ -6765,6 +7880,200 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     if rep_c.coarse > 0 && smp_c == 0 {
         eprintln!("verify capped d=4: coarse pixels without point samples — sparse fill didn't fire");
         capped_ok = false;
+    }
+
+    // --- Multi-sampling (--spp) ---------------------------------------------
+    // The claim: an extra sample lands inside the same pixel, hence inside
+    // every ancestor tile frustum, so it may consume the tile's inherited
+    // t_start and node cut exactly like sample 0 (the leaf-tile argument).
+    // That is the inherited-tmin bug class, so it gets the same proof — the
+    // frame is rendered once per sample with `primary_sample` naming the
+    // sample whose t lands in tbuf, and verify re-traces THAT sample's ray
+    // from tmin=0. probe 0 is the historical pass; 1.. are the new rays.
+    // Fixed spp here (not --spp) so plain `--check` can never stop gating it.
+    const SPP_GATE: u32 = 4;
+    let mut spp_ok = true;
+    for probe in 0..SPP_GATE {
+        let r = render::verify_sampled(
+            scene, bvh, &cam, q, rw, rh, &stats, None, &[], None, SPP_GATE, probe,
+        );
+        eprintln!(
+            "verify spp={SPP_GATE} sample {probe} ({} px): false-sky {} | tmin-overshoot {} | hybrid-extra {} | max rel t err {:.2e}",
+            r.pixels, r.false_sky, r.overshoot, r.hybrid_extra, r.max_rel_err
+        );
+        spp_ok &= r.ok();
+    }
+    // The sample positions must be PAIRWISE DISTINCT across the whole --spp
+    // range: Halton is infinite, but `jitter_for` reduces its index mod
+    // JITTER_PHASE, so reusing it for the extra samples would silently alias
+    // sample 72 onto sample 0 (two rays supersampling the same point). Pure
+    // math, so it is gated on every scene.
+    {
+        let mut pts: Vec<(u32, u32)> = (0..dlss::MAX_SPP)
+            .map(|k| {
+                let (x, y) = dlss::jitter_for_sample(0, k);
+                (x.to_bits(), y.to_bits())
+            })
+            .collect();
+        pts.sort();
+        let n = pts.len();
+        pts.dedup();
+        eprintln!("spp jitter: {}/{} distinct sub-pixel positions over the full --spp range", pts.len(), n);
+        if pts.len() != n {
+            eprintln!("spp jitter: FAIL — sample positions alias (the Halton index must not wrap)");
+            spp_ok = false;
+        }
+    }
+    // The top of the range, where the GPU's constant-buffer jitter table ends:
+    // one verify pass at spp = MAX_SPP probing the LAST sample. Cheap
+    // insurance that the table bound, the index packing, and the no-wrap rule
+    // hold at the edge, not just at spp=4.
+    {
+        let top = dlss::MAX_SPP;
+        let r = render::verify_sampled(
+            scene,
+            bvh,
+            &cam,
+            q,
+            rw,
+            rh,
+            &stats,
+            None,
+            &[],
+            None,
+            top,
+            top - 1,
+        );
+        eprintln!(
+            "verify spp={top} sample {} ({} px): false-sky {} | tmin-overshoot {} | hybrid-extra {}",
+            top - 1,
+            r.pixels,
+            r.false_sky,
+            r.overshoot,
+            r.hybrid_extra
+        );
+        spp_ok &= r.ok();
+    }
+    // Accounting: the quadtree is a function of (scene, basis, res) — NOT of
+    // the sample count. So spp must multiply the RAYS and leave the frustum
+    // work bit-identical. That inequality IS the amortization claim (the
+    // per-tile query cost is paid once and spread over spp× the rays); if it
+    // ever stops holding, multi-sampling has started re-tracing the quadtree.
+    let spp_frame = |n: u32| -> (u64, u64, u64, u64) {
+        let accum: Vec<AtomicU32> = (0..rw * rh * 3).map(|_| AtomicU32::new(0)).collect();
+        let info: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
+        let tbuf: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
+        let s = Stats::default();
+        let ctx = FrameCtx {
+            scene,
+            bvh,
+            cam,
+            q,
+            frame: 0,
+            jitter: false,
+            rw,
+            rh,
+            accum: &accum,
+            info: &info,
+            tbuf: &tbuf,
+            stats: &s,
+            sun: render::sun_dir(scene),
+            tcache_cur: None,
+            tcache_prev: &[],
+            accumulate: true,
+            gbuf: None,
+            fsr_buf: None,
+            prev_cam: None,
+            frame_jitter: None,
+            spp: n,
+            primary_sample: 0,
+            adaptive: false,
+            hemi_share: false,
+            replay_rec: None,
+            cut_cur: None,
+            cut_prev: None,
+            discard_seeds: false,
+            defer_shade: false,
+        };
+        render::render_frame(&ctx, true);
+        (
+            s.primary_rays.load(Relaxed),
+            s.frustum_queries.load(Relaxed),
+            s.frustum_nodes.load(Relaxed),
+            s.tiles.load(Relaxed),
+        )
+    };
+    let (r1, fq1, fn1, ti1) = spp_frame(1);
+    let (r4, fq4, fn4, ti4) = spp_frame(SPP_GATE);
+    eprintln!(
+        "spp accounting: primary rays {r1} -> {r4} (×{:.2}, want ×{SPP_GATE}) | frustum queries {fq1} -> {fq4} | frustum nodes {fn1} -> {fn4} | tiles {ti1} -> {ti4}",
+        r4 as f64 / r1.max(1) as f64
+    );
+    if r4 != r1 * SPP_GATE as u64 {
+        eprintln!("spp accounting: FAIL — spp={SPP_GATE} must trace exactly {SPP_GATE}× the primary rays");
+        spp_ok = false;
+    }
+    if (fq4, fn4, ti4) != (fq1, fn1, ti1) {
+        eprintln!("spp accounting: FAIL — the quadtree must be bit-identical across spp (the amortization claim)");
+        spp_ok = false;
+    }
+    // The quality claim, gated: multi-sampling exists to hand the temporal
+    // upscaler a quieter frame, so a 4-spp frame pair must be measurably more
+    // temporally stable than a 1-spp pair (the FRUSTRACER_STAB metric: mean
+    // |Δ| between consecutive fresh jittered frames). Structural — it reads
+    // the default scene's noise level.
+    let spp_noise = |n: u32| -> f64 {
+        let info: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
+        let tbuf: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
+        let mut frames: Vec<Vec<f32>> = Vec::new();
+        for f in 0..2u32 {
+            let accum: Vec<AtomicU32> = (0..rw * rh * 3).map(|_| AtomicU32::new(0)).collect();
+            let ctx = FrameCtx {
+                scene,
+                bvh,
+                cam,
+                q,
+                frame: f,
+                jitter: false,
+                rw,
+                rh,
+                accum: &accum,
+                info: &info,
+                tbuf: &tbuf,
+                stats: &stats,
+                sun: render::sun_dir(scene),
+                tcache_cur: None,
+                tcache_prev: &[],
+                // The upscaler contract: every frame a fresh jittered frame.
+                accumulate: false,
+                gbuf: None,
+                fsr_buf: None,
+                prev_cam: None,
+                frame_jitter: Some(dlss::jitter_for(f)),
+                spp: n,
+                primary_sample: 0,
+                adaptive: false,
+                hemi_share: false,
+                replay_rec: None,
+                cut_cur: None,
+                cut_prev: None,
+                discard_seeds: false,
+                defer_shade: false,
+            };
+            render::render_frame(&ctx, true);
+            frames.push(accum.iter().map(|a| f32::from_bits(a.load(Relaxed))).collect());
+        }
+        let (a, b) = (&frames[0], &frames[1]);
+        a.iter().zip(b).map(|(x, y)| (x - y).abs() as f64).sum::<f64>() / a.len() as f64
+    };
+    let (n1, n4) = (spp_noise(1), spp_noise(SPP_GATE));
+    eprintln!(
+        "spp stability: inter-frame mean |Δ| {n1:.4} (spp 1) -> {n4:.4} (spp {SPP_GATE}) — {:.2}× quieter",
+        n1 / n4.max(1e-9)
+    );
+    if structural && !(n4 < n1) {
+        eprintln!("spp stability: FAIL — spp={SPP_GATE} must be measurably quieter than spp=1");
+        spp_ok = false;
     }
 
     // Hemisphere frustum AO: soundness gates (reference rays re-validate
@@ -7305,6 +8614,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             fsr_buf: None,
             prev_cam: None,
             frame_jitter: None,
+            spp: 1,
+            primary_sample: 0,
             adaptive: false,
             hemi_share: share,
             replay_rec: None,
@@ -7341,6 +8652,96 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
     }
     eprintln!("wrote check.png + check_gi.png");
+
+    // --spp bench: the honest measurement. The quadtree is traced ONCE per
+    // frame no matter the sample count, so an N-spp frame should cost less
+    // than N× a 1-spp frame; the printed AMORTIZATION factor is
+    // ms(N) / (N · ms(1)) — 1.00 means the extra samples paid full price
+    // (all cost is in the rays), below 1.00 is the frustum work being spread.
+    // Both hybrid and plain run, because the DIFFERENCE between their factors
+    // is the quadtree overhead this feature is trying to dilute.
+    let mut spp_bench: Vec<(bool, u32, f64)> = Vec::new();
+    for (hybrid, n) in
+        [(true, 1u32), (true, 2), (true, 4), (true, 8), (true, 16), (false, 1), (false, 16)]
+    {
+        stats.clear();
+        let ctx = FrameCtx {
+            scene,
+            bvh,
+            cam,
+            q,
+            frame: 0,
+            jitter: false,
+            rw,
+            rh,
+            accum: &accum,
+            info: &info,
+            tbuf: &tbuf,
+            stats: &stats,
+            sun: render::sun_dir(scene),
+            tcache_cur: None,
+            tcache_prev: &[],
+            accumulate: true,
+            gbuf: None,
+            fsr_buf: None,
+            prev_cam: None,
+            frame_jitter: None,
+            spp: n,
+            primary_sample: 0,
+            adaptive: false,
+            hemi_share: false,
+            replay_rec: None,
+            cut_cur: None,
+            cut_prev: None,
+            discard_seeds: false,
+            defer_shade: false,
+        };
+        // Frames scale down with spp — an spp=16 frame already does 16× the
+        // primary work of the spp=1 row.
+        let frames = (BENCH_FRAMES / n).max(2);
+        let t = Instant::now();
+        for _ in 0..frames {
+            render::render_frame(&ctx, hybrid);
+        }
+        let ms = t.elapsed().as_secs_f64() * 1000.0 / frames as f64;
+        let base = spp_bench.iter().find(|(h, k, _)| *h == hybrid && *k == 1).map(|(_, _, m)| *m);
+        let amort = base.map(|b| ms / (n as f64 * b));
+        eprintln!(
+            "{} spp={n:<2}: {ms:6.1} ms/frame{}",
+            if hybrid { "hybrid" } else { "plain " },
+            match amort {
+                Some(a) => format!(" | amortization {a:.2}× (1.00 = no saving)"),
+                None => String::new(),
+            },
+        );
+        spp_bench.push((hybrid, n, ms));
+    }
+    // The cost model, and with it the answer to "when do the returns stop?".
+    // Frame time is affine in the sample count: ms(n) = F + m·n, where F is
+    // everything paid ONCE (the quadtree: bound queries + refine_cut) and m is
+    // one sample's rays + shading. Two rows fix the line. Then
+    //   amortization(n) = ms(n) / (n · ms(1)) = m/(F+m) + F/((F+m)·n),
+    // an asymptote plus a term that decays as 1/n: HALF the fixed cost is
+    // diluted away by spp=2, 90% by spp=10, 99% by spp=100 — so the
+    // amortization benefit is essentially spent by ~8-16 spp, and every sample
+    // past that pays the full marginal price m. The QUALITY side meanwhile
+    // improves only as 1/√n. Both curves are printed so the trade is visible.
+    let fit = |hybrid: bool| -> Option<(f64, f64, f64)> {
+        let at = |k: u32| spp_bench.iter().find(|(h, n, _)| *h == hybrid && *n == k).map(|r| r.2);
+        let (lo, hi) = (at(1)?, at(16)?);
+        let m = (hi - lo) / 15.0; // marginal ms per extra sample
+        let f = (lo - m).max(0.0); // fixed ms per frame (the quadtree)
+        Some((f, m, m / (f + m)))
+    };
+    for hybrid in [true, false] {
+        if let Some((f, m, asym)) = fit(hybrid) {
+            eprintln!(
+                "{} spp cost model: fixed {f:.1} ms/frame + {m:.1} ms/sample => amortization floor {asym:.2}× (1/n approach: 0.5 of the fixed cost gone at spp 2, 0.9 at spp 10)",
+                if hybrid { "hybrid" } else { "plain " },
+            );
+        }
+    }
+
     // Hemi-share frame must-fires (KILL CRITERION rides the printed ms above,
     // the shafts/adopt precedent: if share-on is not measurably faster on
     // both the default scene and --stress 5000, the feature does not merge):
@@ -7400,6 +8801,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             fsr_buf: None,
             prev_cam: None,
             frame_jitter: None,
+            spp: 1,
+            primary_sample: 0,
             adaptive: false,
             hemi_share: true,
             replay_rec: Some(&rcache),
@@ -7479,6 +8882,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             fsr_buf: None,
             prev_cam: None,
             frame_jitter: None,
+            spp: 1,
+            primary_sample: 0,
             adaptive: false,
             hemi_share: false,
             replay_rec: None,
@@ -7528,6 +8933,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             fsr_buf: None,
             prev_cam: None,
             frame_jitter: None,
+            spp: 1,
+            primary_sample: 0,
             adaptive: false,
             hemi_share: false,
             replay_rec: None,
@@ -7634,6 +9041,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             fsr_buf: None,
             prev_cam: None,
             frame_jitter: None,
+            spp: 1,
+            primary_sample: 0,
             adaptive: false,
             hemi_share: false,
             replay_rec: None,
@@ -7698,6 +9107,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 fsr_buf: None,
                 prev_cam: None,
                 frame_jitter: None,
+                spp: 1,
+                primary_sample: 0,
                 adaptive: false,
                 hemi_share: false,
                 replay_rec: Some(&rcache),
@@ -7761,6 +9172,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 fsr_buf: None,
                 prev_cam: None,
                 frame_jitter: None,
+                spp: 1,
+                primary_sample: 0,
                 adaptive: false,
                 hemi_share: false,
                 replay_rec: None,
@@ -7810,6 +9223,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 fsr_buf: None,
                 prev_cam: None,
                 frame_jitter: None,
+                spp: 1,
+                primary_sample: 0,
                 adaptive: false,
                 hemi_share: false,
                 replay_rec: None,
@@ -7882,6 +9297,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 fsr_buf: None,
                 prev_cam: None,
                 frame_jitter: None,
+                spp: 1,
+                primary_sample: 0,
                 adaptive: false,
                 hemi_share: false,
                 replay_rec: if do_record { Some(&rcache) } else { None },
@@ -7948,6 +9365,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 fsr_buf: None,
                 prev_cam: None,
                 frame_jitter: None,
+                spp: 1,
+                primary_sample: 0,
                 adaptive: false,
                 hemi_share: false,
                 replay_rec: None,
@@ -8030,6 +9449,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 fsr_buf: None,
                 prev_cam: None,
                 frame_jitter: None,
+                spp: 1,
+                primary_sample: 0,
                 adaptive: false,
                 hemi_share: false,
                 replay_rec: None,
@@ -8071,6 +9492,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                     fsr_buf: None,
                     prev_cam: None,
                     frame_jitter: None,
+                    spp: 1,
+                    primary_sample: 0,
                     adaptive: false,
                     hemi_share: false,
                     replay_rec: None,
@@ -8143,6 +9566,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 fsr_buf: None,
                 prev_cam: None,
                 frame_jitter: None,
+                spp: 1,
+                primary_sample: 0,
                 adaptive: false,
                 hemi_share: false,
                 replay_rec: None,
@@ -8217,6 +9642,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 fsr_buf: None,
                 prev_cam: None,
                 frame_jitter: None,
+                spp: 1,
+                primary_sample: 0,
                 adaptive: false,
                 hemi_share: false,
                 replay_rec: None,
@@ -8269,6 +9696,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 fsr_buf: None,
                 prev_cam: None,
                 frame_jitter: None,
+                spp: 1,
+                primary_sample: 0,
                 adaptive: false,
                 hemi_share: false,
                 replay_rec: None,
@@ -8304,6 +9733,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         ("matclass", matclass_ok),
         ("tangent", tangent_ok),
         ("upchain", upchain_ok),
+        ("tone", tone_ok),
         ("gltf", gltf_ok),
         ("bc7", bc7_ok),
         ("hemi-ao", hemi_ok),
@@ -8311,6 +9741,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         ("hemi-share", hemi_share_ok),
         ("verify", rep.ok()),
         ("wide-tiles", rep_wt.ok()),
+        ("spp", spp_ok),
         ("capped", capped_ok),
         ("temporal", temporal_ok),
         ("replay", replay_ok),
@@ -8408,6 +9839,8 @@ struct Persist {
     gpu_tonemap: bool,
     bounce_mode: u32,
     preset: u32,
+    /// Samples per pixel per frame (U cycles it; --spp seeds it).
+    spp: u32,
     dlss_on: bool,
     xess_on: bool,
     fsr_on: bool,
@@ -8456,12 +9889,33 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
         xess_dir: opts.xess_path.clone(),
         xess_autoexposure: opts.xess_autoexposure,
         ffx_dir: opts.ffx_path.clone(),
+        fsr_tune: opts.fsr_tune,
         prefer: opts.prefer,
         debug: opts.gpu_debug,
         vsync: opts.vsync,
+        hdr: opts.hdr,
+        paper_white: opts.hdr_paper_white,
+        peak_nits: opts.hdr_peak,
     };
     let mut gpu = gpu::GpuContext::new(sdl_hwnd(&window), W as u32, H as u32, &gopts)
         .expect("GPU init failed");
+    // --fsr4: the FSR4 + Ray Regeneration level is a requirement, so the chain
+    // falling through it is fatal here rather than a quiet downgrade. Checked
+    // against the session's ACTUAL wiring (the probe already printed its own
+    // reason on the `fsr4:` line above) — it cannot disagree with what got
+    // wired. The two things worth trying are the fallback flavor and the
+    // adapter, so name both.
+    if opts.fsr4_required && gpu.fsr_flavor() != Some(fsr::Flavor::Fsr4Rr) {
+        eprintln!(
+            "--fsr4: FSR4 + Ray Regeneration is UNAVAILABLE on adapter \"{}\" (it needs an RDNA4 GPU \
+             and the ffx-api Ray Regeneration provider; the fsr4: line above states the probe's reason)",
+            gpu.adapter_name
+        );
+        eprintln!("  --fsr3        FSR 3.1 upscale-only instead — cross-vendor, runs anywhere");
+        eprintln!("  --prefer-amd  pick this box's AMD adapter, if it has one (--fsr4 already prefers AMD by default)");
+        eprintln!("  --fsr         the same force-start, but allowed to fall through to XeSS/FSR3");
+        std::process::exit(2);
+    }
     // The 500 Hz integrator owns the camera pose for the whole app lifetime
     // (spawned here, not per session, so the pose survives resize rebuilds —
     // re-entry continuity is automatic). Sessions only snapshot. It spawns
@@ -8533,7 +9987,7 @@ fn session(
     let accum: Vec<AtomicU32> = (0..w * h * 3).map(|_| AtomicU32::new(0)).collect();
     let info: Vec<AtomicU32> = (0..w * h).map(|_| AtomicU32::new(0)).collect();
     let tbuf: Vec<AtomicU32> = (0..w * h).map(|_| AtomicU32::new(0)).collect();
-    let mut present = vec![0u32; w * h];
+    let mut present = CpuPresent::new(w, h, gpu.is_hdr(), gpu.tone());
     let stats = Stats::default();
     // Temporal claim ring + lockstep cut stores: see TemporalRing. Half-res
     // and plain frames don't participate and drop the ring — a cache from
@@ -8555,6 +10009,9 @@ fn session(
     // quality — moving/DLSS frames keep the sampled path.
     let mut bounce_mode = p0.map_or(0u32, |p| p.bounce_mode);
     let mut preset = p0.map_or(2u32, |p| p.preset);
+    // Samples per pixel per frame (--spp seeds it, U cycles). Every mode reads
+    // it; FrameCtx::spp()/the GPU kernels pin it to 1 on fb (H) frames.
+    let mut spp = p0.map_or(opts.spp, |p| p.spp);
     let mut prev_rw = w;
 
     // DLSS Ray Reconstruction state. In DLSS mode every frame is a fresh
@@ -8627,6 +10084,11 @@ fn session(
                 "requested (--lock-res dynamic) — locked under --gpu, see the gpu: line".to_string()
             } else if dlss_drs {
                 "ON (step-wise; history survives steps)".to_string()
+            } else if opts.gpu {
+                // The CPU renderer never runs under --gpu, so its lock (the
+                // quality default) is not this session's render res — the
+                // gpu: line below states the tracer's own locked one.
+                "LOCKED under --gpu, see the gpu: line".to_string()
             } else if opts.lock_scale.is_some() {
                 if dlss_range.map(|(_, min, max)| min != max).unwrap_or(false) {
                     format!(
@@ -8789,12 +10251,12 @@ fn session(
     let (mut grw, mut grh) = (w, h);
     if opts.gpu {
         // Session sub-mode + locked trace res. `--lock-res dynamic` can't be
-        // honored here (no DRS on the GPU path): lock at the quality default.
-        let lock = opts.lock_scale.unwrap_or_else(|| {
+        // honored here (no DRS on the GPU path): lock at the mode default.
+        let lock = opts.gpu_lock_scale.unwrap_or_else(|| {
             if dlss_on || xess_on || fsr_on {
-                eprintln!("gpu: dynamic render res is unsupported under --gpu; locking at quality (2/3)");
+                eprintln!("gpu: dynamic render res is unsupported under --gpu; locking at native (100%)");
             }
-            2.0 / 3.0
+            1.0
         });
         if dlss_on {
             gpu_up = GpuUp::Rr;
@@ -9133,13 +10595,16 @@ fn session(
     // The DXR trace res: locked into the wired upscaler's range (the --gpu
     // contract — DxrGpu's buffers are sized once, no DRS), window-res when
     // plain. Computed once so the eager --dxr init and the lazy F init
-    // build the pipeline at the same res.
+    // build the pipeline at the same res. The scale is the GPU-mode one
+    // (native by default); `--lock-res dynamic` can't be honored here, so it
+    // falls back to that same default.
+    let dxr_lock = opts.gpu_lock_scale.unwrap_or(1.0);
     let (dxw, dxh) = if dxr_rr_avail {
-        locked_render_res(opts.lock_scale.unwrap_or(2.0 / 3.0), dlss_range, (w, h), (drw, drh), false)
+        locked_render_res(dxr_lock, dlss_range, (w, h), (drw, drh), false)
     } else if dxr_xess_avail {
-        locked_render_res(opts.lock_scale.unwrap_or(2.0 / 3.0), xess_range, (w, h), (w, h), true)
+        locked_render_res(dxr_lock, xess_range, (w, h), (w, h), true)
     } else if dxr_fsr3_avail || dxr_fsr4_avail {
-        locked_render_res(opts.lock_scale.unwrap_or(2.0 / 3.0), fsr_range, (w, h), (w, h), true)
+        locked_render_res(dxr_lock, fsr_range, (w, h), (w, h), true)
     } else {
         (w, h)
     };
@@ -9153,8 +10618,8 @@ fn session(
     let mut dxr_reset = true;
     if want_dxr && !dxr_failed && !gpu_trace {
         let compose = dxr_rr_avail || dxr_xess_avail || dxr_fsr3_avail || dxr_fsr4_avail;
-        if compose && opts.lock_scale.is_none() {
-            eprintln!("dxr: dynamic render res is unsupported on the DXR pipeline; locking at quality (2/3)");
+        if compose && opts.gpu_lock_scale.is_none() {
+            eprintln!("dxr: dynamic render res is unsupported on the DXR pipeline; locking at native (100%)");
         }
         match gpu::dxc::Dxc::load(&opts.dxc_path).and_then(|dxc| {
             gpu.init_dxr(&dxc, scene, bvh, dxw as u32, dxh as u32, compose, opts.gpu_debug, opts.bc7)
@@ -9297,8 +10762,16 @@ fn session(
                 if gpu_up == GpuUp::Plain {
                     eprintln!("quality preset {preset}");
                 } else {
-                    eprintln!("quality preset {preset} (upscaler sub-mode traces 1-spp; presets apply in plain)");
+                    eprintln!("quality preset {preset} (upscaler sub-mode traces the 1-spp preset; presets apply in plain)");
                 }
+            }
+            // U: samples per pixel — the same shading-statistics reset as a
+            // preset change (never on motion). The kernels take it from the CB.
+            if edges.cycle_spp {
+                spp = next_spp(spp);
+                frame = 0;
+                gpu_reset = true;
+                eprintln!("gpu: spp {spp}");
             }
             if edges.toggle_hybrid {
                 hybrid = !hybrid;
@@ -9433,6 +10906,12 @@ fn session(
                     prev_cam: gpu_prev_cam.map(|c| c.basis(grw, grh)),
                     q: Quality::upscaler_1spp(),
                     verify: false,
+                    // "1-spp" names the QUALITY preset, not the sample count:
+                    // --spp/U multiplies the primary samples inside the frame
+                    // and they average before the feed, so the upscaler still
+                    // sees one fresh jittered frame — a quieter one.
+                    spp,
+                    probe_sample: 0,
                 };
                 let presented = if gpu_up == GpuUp::Xess {
                     gpu.present_trace_xess(&p, hybrid, jit, gpu_reset, gpu_nppd_on)
@@ -9466,6 +10945,7 @@ fn session(
                             gpu_prev_cam.map(|c| c.pos),
                             gpu_up_idx,
                             last_ms as f32,
+                            &scene.sky_sh,
                         ),
                         _ => gpu.present_trace_rr(&p, hybrid, &fc, gpu_up_idx),
                     }
@@ -9514,6 +10994,11 @@ fn session(
                     prev_cam: None,
                     q,
                     verify: false,
+                    // Plain accumulation: each frame still contributes one
+                    // averaged sample of weight (resolve divides by frames),
+                    // so spp just converges the image spp× faster per frame.
+                    spp,
+                    probe_sample: 0,
                 };
                 if frame < MAX_SAMPLES {
                     if let Err(e) = gpu.present_trace(&p, frame + 1, hybrid) {
@@ -9608,14 +11093,14 @@ fn session(
                         h
                     ),
                 };
-                let spp = if gpu_up == GpuUp::Plain {
+                let spp_txt = if gpu_up == GpuUp::Plain {
                     format!(
                         " | {} spp{}",
-                        frame.min(MAX_SAMPLES),
+                        (frame.min(MAX_SAMPLES) as u64) * spp as u64,
                         if frame >= MAX_SAMPLES { " | converged" } else { "" }
                     )
                 } else {
-                    " | 1 spp".to_string()
+                    format!(" | {spp} spp")
                 };
                 let _ = window.set_title(&format!(
                     "frustracer | {:.0} fps | GPU {} | {} | quality {}{}",
@@ -9623,7 +11108,7 @@ fn session(
                     if hybrid { "hybrid" } else { "plain" },
                     mode,
                     preset,
-                    spp,
+                    spp_txt,
                 ));
             }
             continue;
@@ -10007,8 +11492,8 @@ fn session(
                 eprintln!("dxr: unavailable (earlier init failed; restart with --dxc-path to retry)");
             } else {
                 let compose = dxr_rr_avail || dxr_xess_avail || dxr_fsr3_avail || dxr_fsr4_avail;
-                if compose && opts.lock_scale.is_none() {
-                    eprintln!("dxr: dynamic render res is unsupported on the DXR pipeline; locking at quality (2/3)");
+                if compose && opts.gpu_lock_scale.is_none() {
+                    eprintln!("dxr: dynamic render res is unsupported on the DXR pipeline; locking at native (100%)");
                 }
                 match gpu::dxc::Dxc::load(&opts.dxc_path).and_then(|dxc| {
                     gpu.init_dxr(&dxc, scene, bvh, dxw as u32, dxh as u32, compose, opts.gpu_debug, opts.bc7)
@@ -10090,6 +11575,16 @@ fn session(
             frame = 0;
             dlss_reset = true;
         }
+        // U: samples per pixel. A sample-count change is a shading-statistics
+        // change (the noise level of every pixel moves), so it resets
+        // accumulation and every temporal history exactly like a quality
+        // preset — and, like a preset, never on camera motion.
+        if edges.cycle_spp {
+            spp = next_spp(spp);
+            frame = 0;
+            dlss_reset = true;
+            eprintln!("spp {spp}{}", if bounce_mode > 0 { " (pinned to 1 on hemi-bounce frames)" } else { "" });
+        }
         // Any XeSS frame after this point sends reset_history = 1: the
         // upscaler's accumulated history mixes shading statistics, so every
         // predicate that resets `frame`/the OIDN history also resets it —
@@ -10098,6 +11593,7 @@ fn session(
         if edges.toggle_hybrid
             || edges.toggle_bounce
             || edges.quality.is_some()
+            || edges.cycle_spp
             || edges.toggle_xess
             || edges.toggle_oidn
             || edges.toggle_nppd
@@ -10112,6 +11608,7 @@ fn session(
         if edges.toggle_hybrid
             || edges.toggle_bounce
             || edges.quality.is_some()
+            || edges.cycle_spp
             || edges.toggle_fsr
             || temporal_flipped
         {
@@ -10130,6 +11627,7 @@ fn session(
             || edges.toggle_dynamic
             || edges.toggle_bounce
             || edges.quality.is_some()
+            || edges.cycle_spp
             || edges.toggle_oidn
             || edges.toggle_dlss
             || edges.toggle_xess
@@ -10176,6 +11674,14 @@ fn session(
                     dxr_reset = true;
                     eprintln!("dxr: quality pinned at the 1-spp upscaler preset (plain DXR honors 1-3)");
                 }
+                // U: a sample-count change moves every pixel's noise level by
+                // 1/√N — the same discontinuity class as a quality preset, and
+                // the upscaler history must not carry across it. The generic
+                // handler above resets `frame` and the CPU arm's latches; this
+                // arm's latch is dxr_reset (the --gpu twin does gpu_reset).
+                if edges.cycle_spp {
+                    dxr_reset = true;
+                }
                 let jit = dlss::jitter_for(dxr_up_idx);
                 let p = gpu::trace::FrameParams {
                     cam: cam.basis(dxw, dxh),
@@ -10186,6 +11692,13 @@ fn session(
                     prev_cam: dxr_prev_cam.map(|c| c.basis(dxw, dxh)),
                     q: Quality::upscaler_1spp(),
                     verify: false,
+                    // --spp/U: N samples per pixel inside the one fresh
+                    // jittered frame the upscaler contract asks for. Raygen
+                    // averages them before the feed. (This pipeline traces
+                    // from the TLAS root, so here it is plain supersampling —
+                    // there is no tile claim to amortize.)
+                    spp,
+                    probe_sample: 0,
                 };
                 let presented = if dxr_up == GpuUp::Xess {
                     gpu.present_dxr_xess(&p, jit, dxr_reset)
@@ -10215,6 +11728,7 @@ fn session(
                             dxr_prev_cam.map(|c| c.pos),
                             dxr_up_idx,
                             last_ms as f32,
+                            &scene.sky_sh,
                         ),
                         _ => gpu.present_dxr_rr(&p, &fc, dxr_up_idx),
                     }
@@ -10257,6 +11771,8 @@ fn session(
                     prev_cam: None,
                     q,
                     verify: false,
+                    spp,
+                    probe_sample: 0,
                 };
                 if frame < MAX_SAMPLES {
                     match gpu.present_dxr(&p, frame + 1) {
@@ -10341,16 +11857,16 @@ fn session(
                 fps_frames = 0;
                 fps_t = now;
                 let sub = match dxr_up {
-                    GpuUp::Rr => format!("DXR {dxw}x{dxh} -> DLSS-RR {w}x{h}"),
-                    GpuUp::Xess => format!("DXR {dxw}x{dxh} -> XeSS {w}x{h}"),
-                    GpuUp::Fsr4 => format!("DXR {dxw}x{dxh} -> FSR4-RR {w}x{h}"),
-                    GpuUp::Fsr3 => format!("DXR {dxw}x{dxh} -> FSR3 {w}x{h}"),
+                    GpuUp::Rr => format!("DXR {dxw}x{dxh} -> DLSS-RR {w}x{h} | {spp} spp"),
+                    GpuUp::Xess => format!("DXR {dxw}x{dxh} -> XeSS {w}x{h} | {spp} spp"),
+                    GpuUp::Fsr4 => format!("DXR {dxw}x{dxh} -> FSR4-RR {w}x{h} | {spp} spp"),
+                    GpuUp::Fsr3 => format!("DXR {dxw}x{dxh} -> FSR3 {w}x{h} | {spp} spp"),
                     GpuUp::Plain => format!(
                         "DXR {}x{} | quality {} | {} spp{}",
                         dxw,
                         dxh,
                         preset,
-                        frame.min(MAX_SAMPLES),
+                        (frame.min(MAX_SAMPLES) as u64) * spp as u64,
                         if frame >= MAX_SAMPLES { " | converged" } else { "" },
                     ),
                 };
@@ -10656,6 +12172,10 @@ fn session(
                     RenderMode::Xess => Some(dlss::jitter_for(xess_idx)),
                     _ => None,
                 },
+                // --spp / U: N samples per pixel, averaged into one splat.
+                // FrameCtx::spp() pins it to 1 on fb frames.
+                spp,
+                primary_sample: 0,
                 // Adaptive shading rate: XeSS only — its temporal
                 // accumulation launders the spatially varying sampling. On
                 // RR the 2×2-correlated shadow noise and per-frame cell
@@ -10811,7 +12331,15 @@ fn session(
             );
             let presented = if fsr_rr {
                 let fb = fsr_bufs.as_ref().expect("fsr_on without signal bufs");
-                gpu.present_fsr(fg, fb, &fc, fsr_prev.map(|c| c.pos), fsr_idx, last_ms as f32)
+                gpu.present_fsr(
+                    fg,
+                    fb,
+                    &fc,
+                    fsr_prev.map(|c| c.pos),
+                    fsr_idx,
+                    last_ms as f32,
+                    &scene.sky_sh,
+                )
             } else {
                 gpu.present_fsr3(&accum, fg, &fc, last_ms as f32)
             };
@@ -10876,28 +12404,20 @@ fn session(
                         let result = octx
                             .set_res(w, h)
                             .and_then(|()| octx.denoise_hdr(&xess_hdr, og).map(drop));
+                        present.tone = gpu.tone();
                         match result {
-                            Ok(()) => render::resolve_hdr(
-                                octx.last_output(),
-                                &info,
-                                false,
-                                &mut present,
-                                w,
-                                h,
-                                w,
-                                h,
-                            ),
+                            Ok(()) => {
+                                present.resolve_hdr(octx.last_output(), &info, false, w, h, w, h)
+                            }
                             Err(e) => {
                                 eprintln!(
                                     "oidn: post-denoise failed ({e}); presenting the raw upscale (N to retry)"
                                 );
                                 xess_oidn = XessOidn::Off;
-                                render::resolve_hdr(
-                                    &xess_hdr, &info, false, &mut present, w, h, w, h,
-                                );
+                                present.resolve_hdr(&xess_hdr, &info, false, w, h, w, h);
                             }
                         }
-                        gpu.present_cpu(&present).expect("GPU present failed");
+                        present.blit(gpu).expect("GPU present failed");
                     }
                     Err(e) => {
                         eprintln!("xess: upscale failed ({e}); XeSS disabled (X to retry)");
@@ -11042,12 +12562,12 @@ fn session(
                         octx.denoise(&accum, frame.max(1), og).map(drop)
                     }
                 });
+                present.tone = gpu.tone();
                 match result {
-                    Ok(()) => render::resolve_hdr(
+                    Ok(()) => present.resolve_hdr(
                         octx.last_output(),
                         &info,
                         overlay_on && hybrid,
-                        &mut present,
                         w,
                         h,
                         w,
@@ -11064,12 +12584,11 @@ fn session(
                                 h.invalidate();
                             }
                         }
-                        render::resolve(
+                        present.resolve(
                             &accum,
                             &info,
                             if oidn_t { 1 } else { frame.max(1) },
                             overlay_on && hybrid,
-                            &mut present,
                             rw,
                             rh,
                             w,
@@ -11078,18 +12597,18 @@ fn session(
                     }
                 }
             } else if edges.toggle_overlay {
-                render::resolve_hdr(
+                present.tone = gpu.tone();
+                present.resolve_hdr(
                     octx.last_output(),
                     &info,
                     overlay_on && hybrid,
-                    &mut present,
                     w,
                     h,
                     w,
                     h,
                 );
             }
-            gpu.present_cpu(&present).expect("GPU present failed");
+            present.blit(gpu).expect("GPU present failed");
         } else if nppd_on {
             // NPPD: one recurrent network step on the CPU-resolve path — the
             // state is warped by this frame's motion vectors, the 1-spp frame
@@ -11103,13 +12622,13 @@ fn session(
                 let result = nctx
                     .set_res(w, h)
                     .and_then(|()| nctx.denoise(&accum, ng, &basis, dlss_far).map(drop));
+                present.tone = gpu.tone();
                 match result {
                     Ok(()) => {
-                        render::resolve_hdr(
+                        present.resolve_hdr(
                             nctx.last_output(),
                             &info,
                             overlay_on && hybrid,
-                            &mut present,
                             w,
                             h,
                             w,
@@ -11126,12 +12645,11 @@ fn session(
                         // accum holds one 1-spp frame, not a sum: resolve it
                         // as 1 sample and restart accumulation cleanly.
                         frame = 0;
-                        render::resolve(
+                        present.resolve(
                             &accum,
                             &info,
                             1,
                             overlay_on && hybrid,
-                            &mut present,
                             rw,
                             rh,
                             w,
@@ -11140,22 +12658,22 @@ fn session(
                     }
                 }
             }
-            gpu.present_cpu(&present).expect("GPU present failed");
+            present.blit(gpu).expect("GPU present failed");
         } else if use_gpu_tone {
             gpu.present_hdr(&accum, frame.max(1)).expect("GPU present failed");
         } else {
-            render::resolve(
+            present.tone = gpu.tone();
+            present.resolve(
                 &accum,
                 &info,
                 frame.max(1),
                 overlay_on && hybrid,
-                &mut present,
                 rw,
                 rh,
                 w,
                 h,
             );
-            gpu.present_cpu(&present).expect("GPU present failed");
+            present.blit(gpu).expect("GPU present failed");
         }
         // Stability meter (FRUSTRACER_STAB=1): quantifies temporal
         // instability of the upscaled output — hold the camera still and a
@@ -11204,52 +12722,115 @@ fn session(
         plot!("replay leaves", stats.replay_leaf_tiles.load(Relaxed));
         plot!("render h", rh);
         fps_frames += 1;
-        if (now - fps_t).as_secs_f64() >= 1.0 {
+        let tick_1hz = (now - fps_t).as_secs_f64() >= 1.0;
+        if tick_1hz {
             fps = fps_frames as f64 / (now - fps_t).as_secs_f64();
             fps_frames = 0;
             fps_t = now;
         }
 
+        // The window may now be over a different monitor, or the same monitor's
+        // HDR may have been switched on or off underneath us. Re-probe on the
+        // window events that CAN signal it, and once a second regardless —
+        // toggling Windows HDR in place fires no window event at all, so the
+        // poll is the only thing that sees it. Both funnel into one refresh.
+        //
+        // This is deliberately cheap: a GetDesc1 and a root-constant retune.
+        // No ResizeBuffers, no PSO rebuild, no resource realloc — and no
+        // upscaler-history reset, because a change of output device is not a
+        // change of scene (the same reason camera motion never resets it).
+        if edges.display_changed || tick_1hz {
+            if let Some(d) = gpu.refresh_display(opts.hdr_paper_white, opts.hdr_peak) {
+                let t = gpu.tone();
+                if d.enabled {
+                    eprintln!(
+                        "hdr: display changed — peak {:.0} nits (full-frame {:.0}), \
+                         headroom {:.1}x at {:.0}-nit paper white",
+                        d.max_nits,
+                        d.max_full_frame_nits,
+                        t.headroom,
+                        opts.hdr_paper_white
+                    );
+                } else {
+                    eprintln!("hdr: display changed — HDR is OFF on this monitor; SDR levels");
+                }
+            }
+        }
+
         if edges.screenshot {
+            // A PNG is 8-bit and has nowhere to put a nit, so a screenshot is
+            // always the SDR curve — even in an --hdr session. The GPU readback
+            // paths already tonemap to SDR (read_hdr_output); the CPU-presented
+            // arms hold f16 scRGB under --hdr, so they re-resolve from the same
+            // linear source rather than trying to invert the display encode.
             if dlss_on {
                 // The denoised image exists only on the GPU — read the RR
                 // output back and tonemap it (same curve, 1 spp). On failure
                 // fall back to a fresh CPU resolve of the noisy input.
                 match gpu.read_rr_output() {
-                    Ok(px) => present.copy_from_slice(&px),
+                    Ok(px) => present.sdr.copy_from_slice(&px),
                     Err(e) => {
                         eprintln!("screenshot: RR readback failed ({e}); saving noisy 1-spp resolve");
-                        render::resolve(&accum, &info, 1, false, &mut present, rw, rh, w, h);
+                        present.resolve_sdr(&accum, &info, 1, false, rw, rh, w, h);
                     }
                 }
             } else if fsr_on {
                 // Same story as DLSS: the denoised+upscaled image lives only
                 // on the GPU.
                 match gpu.read_fsr_output() {
-                    Ok(px) => present.copy_from_slice(&px),
+                    Ok(px) => present.sdr.copy_from_slice(&px),
                     Err(e) => {
                         eprintln!("screenshot: FSR readback failed ({e}); saving noisy 1-spp resolve");
-                        render::resolve(&accum, &info, 1, false, &mut present, rw, rh, w, h);
+                        present.resolve_sdr(&accum, &info, 1, false, rw, rh, w, h);
                     }
                 }
             } else if xess_on && xess_oidn != XessOidn::Post {
                 // Same story as DLSS: the upscaled image lives only on the
-                // GPU. (POST placement presents via the CPU path, so its
-                // present buffer is already current — plain save.)
+                // GPU. (POST placement presents via the CPU path — it is
+                // handled with the other CPU arms below.)
                 match gpu.read_xess_output() {
-                    Ok(px) => present.copy_from_slice(&px),
+                    Ok(px) => present.sdr.copy_from_slice(&px),
                     Err(e) => {
                         eprintln!("screenshot: XeSS readback failed ({e}); saving noisy 1-spp resolve");
-                        render::resolve(&accum, &info, 1, false, &mut present, rw, rh, w, h);
+                        present.resolve_sdr(&accum, &info, 1, false, rw, rh, w, h);
                     }
                 }
             } else if use_gpu_tone {
                 // The present buffer is stale in GPU-tonemap mode; resolve
                 // fresh for the screenshot.
-                render::resolve(&accum, &info, frame.max(1), false, &mut present, rw, rh, w, h);
+                present.resolve_sdr(&accum, &info, frame.max(1), false, rw, rh, w, h);
+            } else if present.is_hdr {
+                // The CPU arms hold scRGB f16, which a PNG cannot carry — so
+                // re-resolve each arm's OWN linear source through the SDR curve.
+                // The overlay rides along exactly as it does on screen (an SDR
+                // session saves the present buffer verbatim, overlay included;
+                // dropping it here would make the two sessions disagree about
+                // what P captures).
+                let ov = overlay_on && hybrid;
+                if oidn_on {
+                    let src = oidn_ctx.as_ref().expect("oidn_on without context").last_output();
+                    present.resolve_hdr_sdr(src, &info, ov, w, h, w, h);
+                } else if nppd_on {
+                    let src = nppd_ctx.as_ref().expect("nppd_on without context").last_output();
+                    present.resolve_hdr_sdr(src, &info, ov, w, h, w, h);
+                } else if xess_on {
+                    // Only POST placement reaches here (the others took the GPU
+                    // readback arm), and POST presents the OIDN-denoised
+                    // window-res image — NOT the raw upscale in `xess_hdr`.
+                    // Saving xess_hdr would write a visibly noisier PNG than the
+                    // window showed. A failed denoise sets xess_oidn = Off, which
+                    // routes to the readback arm instead, so `Post` here really
+                    // does imply a live context with a current output.
+                    match oidn_ctx.as_ref().filter(|_| xess_oidn == XessOidn::Post) {
+                        Some(o) => present.resolve_hdr_sdr(o.last_output(), &info, ov, w, h, w, h),
+                        None => present.resolve_hdr_sdr(&xess_hdr, &info, ov, w, h, w, h),
+                    }
+                } else {
+                    present.resolve_sdr(&accum, &info, frame.max(1), ov, rw, rh, w, h);
+                }
             }
             let name = format!("screenshot_{shot}.png");
-            save_png(&name, &present, w, h);
+            save_png(&name, &present.sdr, w, h);
             eprintln!("saved {name}");
             shot += 1;
         }
@@ -11346,9 +12927,9 @@ fn session(
                 rh,
                 last_ms,
                 if dlss_on || fsr_on || xess_on || nppd_on {
-                    "1 spp".to_string()
+                    format!("{spp} spp")
                 } else {
-                    format!("{} spp", frame.min(MAX_SAMPLES))
+                    format!("{} spp", (frame.min(MAX_SAMPLES) as u64) * spp as u64)
                 },
                 preset,
                 coarse,
@@ -11419,6 +13000,7 @@ fn session(
         gpu_tonemap,
         bounce_mode,
         preset,
+        spp,
         dlss_on,
         xess_on,
         fsr_on,
@@ -11438,6 +13020,118 @@ fn session(
         depth_est,
     });
     end
+}
+
+/// The CPU present buffer for the arms that tonemap on the CPU (OIDN, NPPD,
+/// XeSS-post, and the plain resolve).
+///
+/// Two encodings, one curve. An SDR session fills `sdr` (u32 0x00RRGGBB); an
+/// scRGB session fills `hdr` ([f16; 4], already curve+overlay+encode). Which
+/// one is a property of the SWAPCHAIN, decided once — so an arm cannot
+/// accidentally present 8-bit pixels into an f16 backbuffer.
+///
+/// `sdr` is allocated in both modes because screenshots are always 8-bit PNG:
+/// a file has nowhere to put a nit. In an HDR session the screenshot path
+/// re-resolves into it (`resolve_*_sdr`) rather than trying to invert the
+/// display-referred f16 — that inversion is not well-defined, and a screenshot
+/// is rare enough that a second tonemap costs nothing.
+struct CpuPresent {
+    sdr: Vec<u32>,
+    hdr: Vec<[half::f16; 4]>,
+    /// Refreshed from `gpu.tone()` each frame — this is how a display change
+    /// reaches the CPU arms.
+    tone: tone::ToneParams,
+    is_hdr: bool,
+}
+
+impl CpuPresent {
+    fn new(w: usize, h: usize, is_hdr: bool, tone: tone::ToneParams) -> Self {
+        Self {
+            sdr: vec![0u32; w * h],
+            hdr: if is_hdr { vec![[half::f16::ZERO; 4]; w * h] } else { Vec::new() },
+            tone,
+            is_hdr,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve(
+        &mut self,
+        accum: &[AtomicU32],
+        info: &[AtomicU32],
+        samples: u32,
+        overlay: bool,
+        rw: usize,
+        rh: usize,
+        w: usize,
+        h: usize,
+    ) {
+        if self.is_hdr {
+            render::resolve_scrgb(
+                accum, info, samples, overlay, self.tone, &mut self.hdr, rw, rh, w, h,
+            );
+        } else {
+            render::resolve(accum, info, samples, overlay, &mut self.sdr, rw, rh, w, h);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_hdr(
+        &mut self,
+        src: &[f32],
+        info: &[AtomicU32],
+        overlay: bool,
+        rw: usize,
+        rh: usize,
+        w: usize,
+        h: usize,
+    ) {
+        if self.is_hdr {
+            render::resolve_hdr_scrgb(src, info, overlay, self.tone, &mut self.hdr, rw, rh, w, h);
+        } else {
+            render::resolve_hdr(src, info, overlay, &mut self.sdr, rw, rh, w, h);
+        }
+    }
+
+    /// Force the SDR encoding regardless of the session — the screenshot path,
+    /// where the destination is always an 8-bit PNG. The `resolve_*` pair above
+    /// picks its encoding from the swapchain; these two never do.
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_sdr(
+        &mut self,
+        accum: &[AtomicU32],
+        info: &[AtomicU32],
+        samples: u32,
+        overlay: bool,
+        rw: usize,
+        rh: usize,
+        w: usize,
+        h: usize,
+    ) {
+        render::resolve(accum, info, samples, overlay, &mut self.sdr, rw, rh, w, h);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_hdr_sdr(
+        &mut self,
+        src: &[f32],
+        info: &[AtomicU32],
+        overlay: bool,
+        rw: usize,
+        rh: usize,
+        w: usize,
+        h: usize,
+    ) {
+        render::resolve_hdr(src, info, overlay, &mut self.sdr, rw, rh, w, h);
+    }
+
+    fn blit(&self, gpu: &mut gpu::GpuContext) -> gpu::d3d12::Result<()> {
+        if self.is_hdr {
+            gpu.present_cpu_hdr(&self.hdr)
+        } else {
+            gpu.present_cpu(&self.sdr)
+        }
+    }
 }
 
 fn save_png(name: &str, present: &[u32], w: usize, h: usize) {

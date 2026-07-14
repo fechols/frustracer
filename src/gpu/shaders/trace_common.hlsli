@@ -77,6 +77,19 @@ cbuffer Frame : register(b0) {
     float4 prev_forward; // xyz (unit); w = prev inv_h
     float4 prev_right;   // xyz pre-scaled; w = NEAR
     float4 prev_up;      // xyz pre-scaled; w = FAR
+    // --spp: primary samples per pixel this frame (1..=MAX_SPP; the CPU pins
+    // it to 1 on fb frames — one hemi point per pixel). probe_sample names the
+    // sample that writes tbuf/info/the G-buffer pack: 0 in every real frame,
+    // swept by --check-gpu/--check-dxr so EVERY sample's ray gets gated.
+    uint spp; uint probe_sample; uint _pad4; uint _pad5;
+    // Sub-pixel offsets for samples 1.. (dlss::jitter_for_sample, computed on
+    // the CPU — one Halton source of truth), packed two per row. The row count
+    // is INJECTED (trace::spp_defs, the ALPHA_CUTOUT/FTREE pattern) so it is
+    // dlss::MAX_SPP / 2 by construction — a hand-mirrored literal here would
+    // be a third constant to keep in lockstep, and reading past it is silent.
+    // Slot 0 holds sample 0's offset, which the FLAG_FRAME_JITTER branch
+    // already knows (sample_pos never reads it).
+    float4 jitters[JITTER_ROWS];
     // The sky dome in order-2 SH (scene.sky_sh / sh.rs::Sh9) — the analytic
     // ambient irradiance, one RGB row per coefficient (.w unused). Appended
     // LAST so every offset above is unmoved.
@@ -116,6 +129,31 @@ float3 ray_dir(float fx, float fy) {
     float ndx = fx * cam_origin.w * 2.0 - 1.0;
     float ndy = 1.0 - fy * cam_forward.w * 2.0;
     return normalize(cam_forward.xyz + cam_right.xyz * ndx + cam_up.xyz * ndy);
+}
+
+// --- Multi-sampling (--spp) ---------------------------------------------------
+
+// Sample k's continuous position inside pixel (x, y) — render.rs's
+// trace_primary, term for term. k == 0 is the frame's REPORTED sample (the
+// jitter policy a single-sample frame has always used, so spp == 1 stays
+// bit-identical); k > 0 takes the deterministic Halton offset the CPU packed
+// into `jitters`. Every sample stays inside the pixel, hence inside the tile
+// frustum — which is what lets it consume the tile's inherited t_start/cut.
+float2 sample_pos(uint x, uint y, uint k, inout uint rng) {
+    float jx = 0.5, jy = 0.5;
+    if (k > 0u) {
+        float4 r = jitters[k >> 1u];
+        float2 o = (k & 1u) ? r.zw : r.xy;
+        jx = 0.5 + o.x;
+        jy = 0.5 + o.y;
+    } else if (flags & FLAG_FRAME_JITTER) {
+        jx = 0.5 + frame_jitter.x;
+        jy = 0.5 + frame_jitter.y;
+    } else if (flags & FLAG_JITTER) {
+        jx = rng_next(rng);
+        jy = rng_next(rng);
+    }
+    return float2(float(x) + jx, float(y) + jy);
 }
 
 // --- The one sky (src/sky.rs) -------------------------------------------------
@@ -235,15 +273,18 @@ struct PrimSurf {
     float spec_t;
     float3 direct_d; // albedo-free direct diffuse (kd multiplies later)
     float3 direct_s; // direct specular incl. per-sample Fresnel
+    float ao;        // AO open fraction, the `ambient = AMBIENT * ao` factor
+    float3 ind_s;    // the reflection bounce's whole contribution to color
 };
 
 // dlss::GBufs re-hosted as one interleaved plane; the feed kernels fan it out
-// into the upscalers' input textures. 80 B/px (GBUF_STRIDE in trace.rs —
+// into the upscalers' input textures. 88 B/px (GBUF_STRIDE in trace.rs —
 // keep in lockstep).
 struct GBufPx {
     float4 nr;    // normal.xyz, roughness
     float4 alb_z; // diff_alb.xyz = albedo*(1-metallic), view_z = t*dot(dir, forward)
     float4 spec;  // spec_alb.xyz = lerp(0.04, albedo, metallic) (RGB F0), spec_hit_t
+                  // (also the INDIRECT_SPECULAR signal's ray-hit-distance channel)
     float4 mv;    // xy = motion vector in render-res pixels (y-down, current ->
                   // previous); z = prev-camera linear view-Z of the SAME hit
                   // point (FLAG_FSR_SIG — the denoiser MV's B channel differences
@@ -252,6 +293,8 @@ struct GBufPx {
     uint4 sig;    // f16x2 packs (dd.x|dd.y, dd.z|ds.x, ds.y|ds.z, 0) of the
                   // DEMODULATED FSR-RR signals — fsr::split_signals' twin,
                   // f16 IS the wire precision. FLAG_FSR_SIG; else 0.
+    uint2 sig2;   // the other two FSR-RR signals, same f16x2 packing:
+                  // (ao|is.x, is.y|is.z). FLAG_FSR_SIG; else 0.
 };
 RWStructuredBuffer<GBufPx> gbuf : register(u15);
 
@@ -334,17 +377,21 @@ void gbuf_write_hit(uint pi, float fx, float fy, float3 dir, float t, PrimSurf p
     float3 hit_rel = cam_origin.xyz + dir * t - prev_origin.xyz;
     g.mv = float4(gbuf_mv(hit_rel, fx, fy), 0.0, 0.0);
     g.sig = uint4(0u, 0u, 0u, 0u);
+    g.sig2 = uint2(0u, 0u);
     if (flags & FLAG_FSR_SIG) {
         // render.rs's fsr_buf fill: prev-camera linear view-Z of the SAME
         // hit point (no prev camera degrades to "no depth motion"); the
-        // demodulation divides direct_s by the un-floored WIRE F0 —
+        // demodulation divides direct_s / ind_s by the un-floored WIRE F0 —
         // fsr::split_signals with sqrt_wire in place of albedo_wire (the
         // pack stores f32; the wire quantization happens exactly once).
         g.mv.z = (flags & FLAG_HAS_PREV) ? dot(hit_rel, prev_forward.xyz) : g.alb_z.w;
         float3 sf0w = sqrt_wire3(spec_alb);
+        float3 f0_floor = max(sf0w, float3(1e-4, 1e-4, 1e-4));
         float3 dd = ps.direct_d;
-        float3 ds = ps.direct_s / max(sf0w, float3(1e-4, 1e-4, 1e-4));
+        float3 ds = ps.direct_s / f0_floor;
+        float3 is = ps.ind_s / f0_floor;
         g.sig = uint4(pack_h2(dd.x, dd.y), pack_h2(dd.z, ds.x), pack_h2(ds.y, ds.z), 0u);
+        g.sig2 = uint2(pack_h2(ps.ao, is.x), pack_h2(is.y, is.z));
     }
     gbuf[pi] = g;
 }
@@ -361,6 +408,7 @@ void gbuf_write_sky(uint pi, float fx, float fy, float3 dir) {
     g.spec = float4(0.0, 0.0, 0.0, 0.0);
     g.mv = float4(gbuf_mv(dir, fx, fy), 0.0, 0.0);
     g.sig = uint4(0u, 0u, 0u, 0u);
+    g.sig2 = uint2(0u, 0u);
     if (flags & FLAG_FSR_SIG) {
         g.mv.z = CAM_FAR;
     }
@@ -376,18 +424,9 @@ void gbuf_write_sky(uint pi, float fx, float fy, float3 dir) {
 // Clamped at zero: a truncated series of a sky with a horizon step rings, and
 // negative irradiance is unphysical. Term-for-term with the Rust; change both
 // together.
-float3 sh_irradiance(float3 n) {
-    const float C1 = 0.429043, C2 = 0.511664, C3 = 0.743125,
-                C4 = 0.886227, C5 = 0.247708;
-    float x = n.x, y = n.y, z = n.z;
-    float3 e = sky_sh[0].xyz * C4 - sky_sh[6].xyz * C5
-             + sky_sh[6].xyz * (C3 * z * z)
-             + sky_sh[8].xyz * (C1 * (x * x - y * y))
-             + (sky_sh[4].xyz * (x * y) + sky_sh[7].xyz * (x * z)
-                + sky_sh[5].xyz * (y * z)) * (2.0 * C1)
-             + (sky_sh[3].xyz * x + sky_sh[1].xyz * y + sky_sh[2].xyz * z) * (2.0 * C2);
-    return max(e * (1.0 / PI), 0.0);
-}
+// The frame's sky, bound to the shared evaluator (sh.hlsli — the same function
+// the FSR composite pass calls against its own copy of the coefficients).
+float3 sh_irradiance(float3 n) { return sh_irr(sky_sh, n); }
 
 // Duff et al. orthonormal basis; right-handed (t1 x t2 = n) — the hemisphere
 // octant orientation relies on it (sphcell::self_test asserts the CPU twin).

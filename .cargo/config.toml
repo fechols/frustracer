@@ -1,0 +1,18 @@
+# target-cpu=native: measured -9.1% ms/frame on `--spin path`, default scene
+# (7950X3D, 24.99 -> 22.71, 2026-07 tree; the pre-merge tree measured -13.6%).
+# x86-64-v3 (AVX2+FMA, portable) captured well under half the win — most of it
+# is znver4 codegen (AVX-512) — so native it is; binaries are
+# build-machine-specific. If you ever need to distribute a binary, build it with
+# RUSTFLAGS="-C target-cpu=x86-64-v3" (env overrides this file).
+# (The C++ shims are compiled by cc/build.rs and are unaffected.)
+[build]
+rustflags = ["-C", "target-cpu=native"]
+
+# Link with LLD (rust-lld), the COFF/link.exe-compatible driver bundled with the
+# rustup toolchain — no install, no PATH edit, no new prerequisite. This is the
+# Windows answer to mold, which is ELF-only and cannot link a PE binary at all.
+#
+# rustc puts the toolchain's lib/rustlib/<target>/bin on the linker search path,
+# so the bare executable name resolves without an absolute path.
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld.exe"

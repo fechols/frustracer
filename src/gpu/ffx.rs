@@ -133,28 +133,41 @@ impl FfxContext {
             .collect())
     }
 
-    /// Create the Ray Regeneration context for direct diffuse + direct
-    /// specular. `max` is the dynamic-resolution range max (window size);
-    /// every dispatch names its own renderSize <= max.
+    /// Create the Ray Regeneration context for the session's signal set
+    /// (`sys::SIGNALS` — direct diffuse/specular, ambient occlusion, indirect
+    /// specular; every stochastic term the 1-spp shade produces). `max` is the
+    /// dynamic-resolution range max (window size); every dispatch names its
+    /// own renderSize <= max and re-states the SAME signal flags.
     pub fn create_denoiser(&mut self, device: &ID3D12Device, max: (u32, u32)) -> Result<(), String> {
         debug_assert!(self.denoiser.is_null());
         let mut ctx = std::ptr::null_mut();
         let r = unsafe {
-            sys::ffxshim_create_denoiser(
-                device.as_raw(),
-                max.0,
-                max.1,
-                sys::SIGNAL_DIRECT_DIFFUSE | sys::SIGNAL_DIRECT_SPECULAR,
-                0,
-                0,
-                &mut ctx,
-            )
+            sys::ffxshim_create_denoiser(device.as_raw(), max.0, max.1, sys::SIGNALS, 0, 0, &mut ctx)
         };
         if r != sys::FFX_OK {
             return Err(format!("ffx denoiser create failed: {}", result_str(r)));
         }
         self.denoiser = ctx;
         Ok(())
+    }
+
+    /// Apply the `--fsr-*` denoiser tuning overrides (ffxConfigureDescDenoiser-
+    /// KeyValue). Each is a single f32 the provider's default stands in for
+    /// when the flag is absent, so a flagless session configures nothing and
+    /// behaves exactly as before these levers existed. A rejected key is a
+    /// loud line, never a session failure — these are A/B knobs.
+    pub fn tune_denoiser(&self, t: &crate::fsr::DenoiseTuning) {
+        debug_assert!(!self.denoiser.is_null());
+        for (key, name, v) in t.entries() {
+            let r = unsafe {
+                sys::ffxshim_denoiser_kv(self.denoiser, key, 1, &v as *const f32 as *const c_void)
+            };
+            if r != sys::FFX_OK {
+                eprintln!("fsr: denoiser key {name} = {v} rejected ({})", result_str(r));
+            } else {
+                eprintln!("fsr: denoiser {name} = {v}");
+            }
+        }
     }
 
     /// Create the FSR upscaler context: HDR linear input, dynamic input

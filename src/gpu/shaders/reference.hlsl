@@ -13,31 +13,38 @@ RWStructuredBuffer<uint>  info  : register(u2); // pack_info(depth, kind)
 void cs_reference(uint3 id : SV_DispatchThreadID) {
     if (id.x >= rw || id.y >= rh) return;
 
-    uint rng = rng_init(id.x, id.y, frame, 0u);
-    float jx = 0.5, jy = 0.5;
-    if (flags & FLAG_FRAME_JITTER) {
-        jx = 0.5 + frame_jitter.x;
-        jy = 0.5 + frame_jitter.y;
-    } else if (flags & FLAG_JITTER) {
-        jx = rng_next(rng);
-        jy = rng_next(rng);
-    }
-    float3 dir = ray_dir(float(id.x) + jx, float(id.y) + jy);
-
     uint pi = id.y * rw + id.x;
-    HitInfo hit;
-    float3 c;
-    float t;
-    PrimSurf ps;
-    if (trace_closest(cam_origin.xyz, dir, 0.0, FLT_MAX, hit)) {
-        c = shade_full(cam_origin.xyz, dir, hit, rng, ps);
-        t = hit.t;
-        gbuf_write_hit(pi, float(id.x) + jx, float(id.y) + jy, dir, hit.t, ps);
-    } else {
-        c = sky_radiance(dir, pixel_cone * 0.5);
-        t = INF;
-        gbuf_write_sky(pi, float(id.x) + jx, float(id.y) + jy, dir);
+    // --spp: the leaf kernel's sample loop, minus the tile claim (this kernel
+    // traces from the root with TMin = 0). Same seeding, same probe rule — the
+    // same-seed wavefront-vs-reference A/B has to keep holding at every spp.
+    float3 csum = 0.0;
+    for (uint s = 0u; s < spp; ++s) {
+        uint rng = rng_init(id.x, id.y, frame, s);
+        float2 sp = sample_pos(id.x, id.y, s, rng);
+        float3 dir = ray_dir(sp.x, sp.y);
+        bool prim = (s == probe_sample);
+
+        HitInfo hit;
+        float3 c;
+        float t;
+        PrimSurf ps;
+        if (trace_closest(cam_origin.xyz, dir, 0.0, FLT_MAX, hit)) {
+            c = shade_full(cam_origin.xyz, dir, hit, rng, ps);
+            t = hit.t;
+            if (prim) gbuf_write_hit(pi, sp.x, sp.y, dir, hit.t, ps);
+        } else {
+            // A DISPLAY path: the camera's own miss sees the sun DISC (sky.rs).
+            c = sky_radiance(dir, pixel_cone * 0.5);
+            t = INF;
+            if (prim) gbuf_write_sky(pi, sp.x, sp.y, dir);
+        }
+        csum += c;
+        if (prim) {
+            tbuf[pi] = t;
+            info[pi] = pack_info(0u, KIND_LEAF);
+        }
     }
+    float3 c = csum * (1.0 / float(spp));
 
     uint i3 = pi * 3u;
     // splat: frame 0 (or non-accumulating) stores — the implicit clear.
@@ -50,6 +57,4 @@ void cs_reference(uint3 id : SV_DispatchThreadID) {
         accum[i3 + 1u] += c.y;
         accum[i3 + 2u] += c.z;
     }
-    tbuf[pi] = t;
-    info[pi] = pack_info(0u, KIND_LEAF);
 }

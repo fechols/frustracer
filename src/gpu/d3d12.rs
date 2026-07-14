@@ -18,7 +18,28 @@ use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFIN
 
 pub const FRAMES_IN_FLIGHT: usize = 2;
 pub const BACKBUFFERS: u32 = 3;
+
+/// The SDR swapchain format — 8-bit, display-encoded (the tonemap PS and
+/// `render::present_px` apply the gamma; there is no hardware sRGB encode).
 pub const SWAPCHAIN_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
+
+/// The scRGB HDR swapchain format: linear, Rec.709 primaries, 1.0 = 80 nits,
+/// values above 1.0 legal. Paired with `DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709`
+/// via `SetColorSpace1`. See `crate::tone`.
+pub const SWAPCHAIN_FORMAT_HDR: DXGI_FORMAT = DXGI_FORMAT_R16G16B16A16_FLOAT;
+
+/// The format the CPU-present blit texture is uploaded in. **Deliberately its
+/// own constant, not `SWAPCHAIN_FORMAT`**: `BlitUpload` packs pixels as
+/// `u32 0x00RRGGBB`, whose little-endian byte order is B,G,R,X — a layout that
+/// is only valid for B8G8R8A8. If it followed the swapchain format it would
+/// silently reinterpret those bytes as f16 under `--hdr`. The HDR blit path has
+/// its own f16 texture (`BlitUpload::new_hdr`) instead.
+pub const BLIT_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
+
+/// scRGB f16 for the CPU-present blit under `--hdr` — `render::present_px_scrgb`
+/// has already applied the curve and the encode, so the blit PS stays a
+/// passthrough.
+pub const BLIT_FORMAT_HDR: DXGI_FORMAT = DXGI_FORMAT_R16G16B16A16_FLOAT;
 
 pub type Result<T> = std::result::Result<T, String>;
 
@@ -38,6 +59,22 @@ pub fn get_or_try_init<T>(
 
 fn err<T>(ctx: &str, e: windows::core::Error) -> Result<T> {
     Err(format!("{ctx}: {e}"))
+}
+
+/// Declare the swapchain scRGB. `CheckColorSpaceSupport` first: `SetColorSpace1`
+/// on an unsupported space is an error, and we want to know *before* committing
+/// to the f16 buffer so the caller can rebuild at SDR.
+///
+/// Idempotent and cheap — the display-change retune re-runs it, since a swapchain
+/// that moves to a different output can in principle need re-declaring.
+fn set_scrgb(swapchain: &IDXGISwapChain3) -> Result<()> {
+    const SCRGB: DXGI_COLOR_SPACE_TYPE = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
+    let support = unsafe { swapchain.CheckColorSpaceSupport(SCRGB) }
+        .map_err(|e| format!("CheckColorSpaceSupport: {e}"))?;
+    if support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT.0 as u32 == 0 {
+        return Err("G10_NONE_P709 not present-supported".into());
+    }
+    unsafe { swapchain.SetColorSpace1(SCRGB) }.map_err(|e| format!("SetColorSpace1: {e}"))
 }
 
 pub struct FrameSlot {
@@ -63,6 +100,13 @@ pub struct D3d {
     pub frame_index: usize,
     pub width: u32,
     pub height: u32,
+    /// The format the swapchain was actually created with. Runtime, not the
+    /// const, because `--hdr` picks scRGB f16 — and because `ResizeBuffers` and
+    /// both fullscreen PSOs must agree with whatever was chosen. `hdr` is false
+    /// when scRGB was requested but the swapchain refused the colour space, so
+    /// callers must read THIS, never the CLI flag.
+    pub format: DXGI_FORMAT,
+    pub hdr: bool,
     /// Present sync interval (1 = v-sync, 0 = uncapped for benchmarking).
     sync_interval: u32,
     /// DXGI_PRESENT_ALLOW_TEARING when the swapchain was created with the
@@ -180,6 +224,7 @@ impl D3d {
         width: u32,
         height: u32,
         vsync: bool,
+        want_hdr: bool,
     ) -> Result<Self> {
         // Uncapped presentation needs DXGI tearing support (windowed flip
         // model otherwise paces on the compositor even at sync interval 0),
@@ -207,10 +252,11 @@ impl D3d {
                 );
             }
         }
+        let format = if want_hdr { SWAPCHAIN_FORMAT_HDR } else { SWAPCHAIN_FORMAT };
         let sc_desc = DXGI_SWAP_CHAIN_DESC1 {
             Width: width,
             Height: height,
-            Format: SWAPCHAIN_FORMAT,
+            Format: format,
             SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
             BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
             BufferCount: BACKBUFFERS,
@@ -218,12 +264,56 @@ impl D3d {
             Flags: if tearing { DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0 as u32 } else { 0 },
             ..Default::default()
         };
-        let sc1: IDXGISwapChain1 = unsafe {
-            factory.CreateSwapChainForHwnd(&queue, hwnd, &sc_desc, None, None)
+        // One creation site, so the IDXGISwapChain1 the factory hands back CANNOT
+        // outlive the cast: an HWND may own only one flip-model swapchain, so a
+        // stray IDXGISwapChain1 binding still holding the old one is enough to
+        // make the SDR-fallback re-create below fail with DXGI_ERROR_INVALID_CALL.
+        // Scoping it inside this closure is what guarantees the old swapchain is
+        // fully released before a new one is asked for.
+        let create = |fmt: DXGI_FORMAT| -> Result<IDXGISwapChain3> {
+            let mut d = sc_desc;
+            d.Format = fmt;
+            let sc1: IDXGISwapChain1 =
+                unsafe { factory.CreateSwapChainForHwnd(&queue, hwnd, &d, None, None) }
+                    .map_err(|e| format!("CreateSwapChainForHwnd({fmt:?}): {e}"))?;
+            sc1.cast().map_err(|e| format!("IDXGISwapChain3 cast: {e}"))
+        };
+        let mut swapchain = create(format)?;
+
+        // scRGB: the f16 buffer alone means nothing — DXGI interprets a swapchain
+        // as sRGB unless told otherwise, so the colour space declaration is what
+        // makes the linear values mean what we think. If it is refused we fall
+        // back to the 8-bit swapchain rather than present linear f16 into an
+        // sRGB-interpreted buffer (which would wash the whole image out). Loud
+        // line, full fallback, no degraded half-mode.
+        //
+        // This is the DEFAULT, not an HDR-only path: handing Windows an f16
+        // linear surface is the right thing on any monitor. On an HDR display it
+        // carries real highlights; on an SDR one DWM tone-maps/clamps it and can
+        // still drive a 10-bit panel at full precision, where the old 8-bit
+        // backbuffer would have banded. What varies with the display is the
+        // CURVE (crate::tone), not the swapchain.
+        let mut format = format;
+        let mut hdr = false;
+        if want_hdr {
+            match set_scrgb(&swapchain) {
+                Ok(()) => {
+                    hdr = true;
+                    eprintln!(
+                        "present: scRGB swapchain (R16G16B16A16_FLOAT, G10_NONE_P709) — \
+                         no 8-bit quantization; Windows drives the panel's real bit depth"
+                    );
+                }
+                Err(e) => {
+                    eprintln!("present: scRGB refused ({e}) — 8-bit B8G8R8A8 swapchain");
+                    format = SWAPCHAIN_FORMAT;
+                    // Release the f16 swapchain BEFORE asking for its replacement:
+                    // the HWND still owns it until the last reference dies.
+                    drop(swapchain);
+                    swapchain = create(format)?;
+                }
+            }
         }
-        .map_err(|e| format!("CreateSwapChainForHwnd: {e}"))?;
-        let swapchain: IDXGISwapChain3 =
-            sc1.cast().map_err(|e| format!("IDXGISwapChain3 cast: {e}"))?;
 
         let rtv_heap: ID3D12DescriptorHeap = unsafe {
             device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
@@ -281,6 +371,8 @@ impl D3d {
             frame_index: 0,
             width,
             height,
+            format,
+            hdr,
             sync_interval: if vsync { 1 } else { 0 },
             present_flags: if tearing { DXGI_PRESENT_ALLOW_TEARING } else { DXGI_PRESENT(0) },
         })
@@ -309,8 +401,18 @@ impl D3d {
         } else {
             DXGI_SWAP_CHAIN_FLAG(0)
         };
-        unsafe { self.swapchain.ResizeBuffers(BACKBUFFERS, w, h, SWAPCHAIN_FORMAT, flags) }
+        unsafe { self.swapchain.ResizeBuffers(BACKBUFFERS, w, h, self.format, flags) }
             .map_err(|e| format!("ResizeBuffers({w}x{h}): {e}"))?;
+        // ResizeBuffers preserves the colour space, so this re-declare is belt and
+        // braces — which is exactly why a refusal must NOT kill the resize. The
+        // swapchain we just resized is still the f16 one we were already
+        // presenting to; erroring here would take down the session over a
+        // redundant call. Loud line, carry on.
+        if self.hdr {
+            if let Err(e) = set_scrgb(&self.swapchain) {
+                eprintln!("present: scRGB re-declare after resize failed ({e}) — keeping the existing colour space");
+            }
+        }
         let rtv0 = unsafe { self.rtv_heap.GetCPUDescriptorHandleForHeapStart() };
         for i in 0..BACKBUFFERS {
             let buf: ID3D12Resource = unsafe { self.swapchain.GetBuffer(i) }

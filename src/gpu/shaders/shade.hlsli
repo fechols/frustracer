@@ -354,6 +354,13 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
     HitInfo st_hit = (HitInfo)0;
     uint st_depth = 0u;
     float st_cone = 0.0;
+    // Is THIS lap inside the root's reflection subtree? Everything such a lap
+    // adds to `total` is part of the CPU's `tput * rcol` — i.e. the
+    // INDIRECT_SPECULAR signal — and the subtree is more than one lap: a
+    // reflected ray that hits glass continues its own transmission chain.
+    // The stash only ever holds the ROOT's transmission child, which is not.
+    bool in_refl = false;
+    bool st_in_refl = false;
     [loop] for (uint lap = 0u; lap < 1u + 2u * TRANS_MAX_DEPTH; ++lap) {
         float3 p, n;
         surface_point(ro, rd, hit, p, n);
@@ -543,7 +550,9 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
             // here — the CPU's sampled loop is skipped the same way. The
             // ambient sits INSIDE the (1 - transmission) factor (shade.rs),
             // so kt folds into the weight.
-            total += tput * (kd * kt * diffuse_d + direct_s);
+            float3 c = tput * (kd * kt * diffuse_d + direct_s);
+            total += c;
+            if (in_refl) prim.ind_s += c;
             amb_w = tput * kd * kt;
             // fb_mode 1 (AO) scales the SKY's irradiance by an openness
             // scalar, so the sky term folds into the weight HERE, where n_s is
@@ -570,7 +579,15 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                 }
                 ao = float(open) / float(n_ao);
             }
-            total += tput * (kd * kt * (diffuse_d + sh_irradiance(n_s) * ao) + direct_s);
+            // FSR's AO signal — lap 0 only (later laps compute their own AO
+            // for their own ambient; the capture is the PRIMARY surface's).
+            // The factor it remodulates by is no longer a constant: it is the
+            // sky's own SH irradiance at n_s (feed.hlsl / fsr_composite.hlsl
+            // rebuild it from the WIRE normal — see fsr::wire_normal).
+            if (lap == 0u) prim.ao = ao;
+            float3 c = tput * (kd * kt * (diffuse_d + sh_irradiance(n_s) * ao) + direct_s);
+            total += c;
+            if (in_refl) prim.ind_s += c;
         }
 
         // Emitted radiance — additive per lap, OUTSIDE the kd*kt factor, so
@@ -582,6 +599,7 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                 emis *= tex_sample(mat.emissive_tex, map_uv, filt);
             }
             total += tput * emis;
+            if (in_refl) prim.ind_s += tput * emis;
         }
 
         // Continuation bookkeeping: at most one of the two branches below
@@ -594,6 +612,9 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
         // Both possible children originate at THIS hit: their cone starts at
         // this lap's width (the CPU's Cone{w0: cone_w} recursion).
         float nx_cone = cone_w;
+        // A continuation inherits this lap's subtree unless the reflection
+        // branch below sets it — that branch IS the root of the ind_s subtree.
+        bool nx_in_refl = in_refl;
 
         // (a) One specular bounce — ROOT only (shade.rs gates depth == 0):
         // GGX VNDF importance sample (Heitz 2018), throughput F*G2/G1 <= 1.
@@ -634,6 +655,7 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                     nx_tput = rtput;
                     nx_depth = 1u;
                     next_set = true;
+                    nx_in_refl = true; // everything below this is ind_s
                 } else {
                     prim.spec_t = INF; // reflection missed (shade.rs)
                     // The BSDF-sampling half of the MIS pair. The DOME passes
@@ -645,8 +667,12 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                     float p_b_r =
                         ggx_ndf(hl_r, ax, ay) / (4.0 * (1.0 + lambda_v) * max(vl.z, 1e-6));
                     float w_b = sky_mis_weight(p_b_r, sky_light_pdf());
-                    total += rtput
-                        * (sky_dome(rdir) + sky_disc(rdir, cone_spread * 0.5) * w_b);
+                    // The reflection subtree is just the sky here — so it is
+                    // still the ind_s signal (the CPU's tput * rcol).
+                    float3 rc =
+                        rtput * (sky_dome(rdir) + sky_disc(rdir, cone_spread * 0.5) * w_b);
+                    total += rc;
+                    prim.ind_s += rc;
                 }
             }
         }
@@ -722,6 +748,7 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                         st_tput = t_tput;
                         st_depth = depth + 1u;
                         st_cone = cone_w;
+                        st_in_refl = in_refl; // root's own chain: not ind_s
                         have_stash = true;
                     }
                 } else {
@@ -729,7 +756,9 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                     // a near-delta path with no light-sampling partner, so this
                     // is the only strategy that can deliver the sun through
                     // glass. Nothing to double-count.
-                    total += t_tput * sky_radiance(tdir, cone_spread * 0.5);
+                    float3 tc = t_tput * sky_radiance(tdir, cone_spread * 0.5);
+                    total += tc;
+                    if (in_refl) prim.ind_s += tc;
                 }
             }
         }
@@ -742,6 +771,7 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
             nx_tput = st_tput;
             nx_depth = st_depth;
             nx_cone = st_cone;
+            nx_in_refl = st_in_refl;
             have_stash = false;
         }
         // Continuation laps shade with reflections ineligible past the root
@@ -753,6 +783,7 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
         tput = nx_tput;
         depth = nx_depth;
         cone_o = nx_cone;
+        in_refl = nx_in_refl;
     }
     return total;
 }

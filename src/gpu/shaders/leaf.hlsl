@@ -23,64 +23,82 @@ void cs_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     uint x = p0.x + gtid.x % w;
     uint y = p0.y + gtid.x / w;
 
-    // Identical seeding/jitter policy to the reference kernel — a leaf pixel
-    // and a reference pixel draw the same streams (the same-seed A/B relies
-    // on it).
-    uint rng = rng_init(x, y, frame, 0u);
-    float jx = 0.5, jy = 0.5;
-    if (flags & FLAG_FRAME_JITTER) {
-        jx = 0.5 + frame_jitter.x;
-        jy = 0.5 + frame_jitter.y;
-    } else if (flags & FLAG_JITTER) {
-        jx = rng_next(rng);
-        jy = rng_next(rng);
-    }
-    float3 dir = ray_dir(float(x) + jx, float(y) + jy);
-
     uint pi = y * rw + x;
-    HitInfo hit;
-    float3 c;
-    float3 aw = 0.0;
-    float t;
-    PrimSurf ps;
-    if (trace_closest(cam_origin.xyz, dir, rec.t_start, FLT_MAX, hit)) {
-        if (fb_mode > 0u) {
-            // Hemi mode: shade everything except the primary ambient; hand
-            // the surface point to the hemisphere wavefront.
-            float3 o_h, n_h;
-            c = shade_split(cam_origin.xyz, dir, hit, rng, shadow_samples, ao_samples,
-                            reflections != 0u, true, 0.0, pixel_cone, true, aw, o_h, n_h, ps);
-            uint s;
-            InterlockedAdd(counters[CTR_HEMI_PT], 1, s);
-            if (s < cap_hemi_pt) {
-                HemiPointRec pt;
-                pt.o = o_h;
-                pt.pixel = pi;
-                pt.n = n_h;
-                pt._pad = 0;
-                hemi_pts[s] = pt;
+    // --spp: every sample of this pixel reuses the tile's inherited t_start
+    // (and, on the CPU, its cut) — they all lie inside the same pixel, hence
+    // inside the same tile frustum. The N colors average into ONE partial
+    // write, so the compose pass stays the single accum splat site and its
+    // store-or-add semantics are untouched. spp == 1 is bit-identical: the
+    // loop runs once, salt 0, and the 1.0 divide is exact.
+    float3 csum = 0.0, awsum = 0.0;
+    for (uint s = 0u; s < spp; ++s) {
+        // Identical seeding/jitter policy to the reference kernel — a leaf
+        // pixel and a reference pixel draw the same streams (the same-seed A/B
+        // relies on it). Sample index rides the salt slot.
+        uint rng = rng_init(x, y, frame, s);
+        float2 sp = sample_pos(x, y, s, rng);
+        float3 dir = ray_dir(sp.x, sp.y);
+        // The probe sample owns every per-pixel side channel (tbuf/info and
+        // the G-buffer pack, whose guides must stay tied to the jitter the
+        // upscaler was told about). 0 in every real frame.
+        bool prim = (s == probe_sample);
+
+        HitInfo hit;
+        float3 c;
+        float3 aw = 0.0;
+        float t;
+        PrimSurf ps;
+        if (trace_closest(cam_origin.xyz, dir, rec.t_start, FLT_MAX, hit)) {
+            if (fb_mode > 0u) {
+                // Hemi mode: shade everything except the primary ambient; hand
+                // the surface point to the hemisphere wavefront. One point per
+                // PIXEL, never per sample (cap_hemi_pt is rw*rh, and the CPU
+                // pins spp to 1 on fb frames anyway).
+                float3 o_h, n_h;
+                c = shade_split(cam_origin.xyz, dir, hit, rng, shadow_samples, ao_samples,
+                                reflections != 0u, true, 0.0, pixel_cone, true, aw, o_h, n_h, ps);
+                if (prim) {
+                    uint q;
+                    InterlockedAdd(counters[CTR_HEMI_PT], 1, q);
+                    if (q < cap_hemi_pt) {
+                        HemiPointRec pt;
+                        pt.o = o_h;
+                        pt.pixel = pi;
+                        pt.n = n_h;
+                        pt._pad = 0;
+                        hemi_pts[q] = pt;
+                    } else {
+                        InterlockedAdd(counters[CTR_OVERFLOW], 1, q);
+                    }
+                }
             } else {
-                InterlockedAdd(counters[CTR_OVERFLOW], 1, s);
+                c = shade_full(cam_origin.xyz, dir, hit, rng, ps);
             }
+            t = hit.t;
+            if (prim) gbuf_write_hit(pi, sp.x, sp.y, dir, hit.t, ps);
         } else {
-            c = shade_full(cam_origin.xyz, dir, hit, rng, ps);
+            // A DISPLAY path (the camera looking at the sky), so it sees the sun
+            // DISC — sky.rs's disc-exactly-once rule. The half-angle is the ray's
+            // own footprint, which is what antialiases the limb.
+            c = sky_radiance(dir, pixel_cone * 0.5);
+            t = INF;
+            if (prim) gbuf_write_sky(pi, sp.x, sp.y, dir);
         }
-        t = hit.t;
-        gbuf_write_hit(pi, float(x) + jx, float(y) + jy, dir, hit.t, ps);
-    } else {
-        c = sky_radiance(dir, pixel_cone * 0.5);
-        t = INF;
-        gbuf_write_sky(pi, float(x) + jx, float(y) + jy, dir);
+        csum += c;
+        awsum += aw;
+        if (prim) {
+            tbuf[pi] = t;
+            info[pi] = pack_info(rec.depth, KIND_LEAF);
+        }
     }
 
     uint i3 = pi * 3u;
+    float inv = 1.0 / float(spp);
     // The compose pass is the single accum splat site.
-    partial[i3 + 0u] = c.x;
-    partial[i3 + 1u] = c.y;
-    partial[i3 + 2u] = c.z;
-    ambw[i3 + 0u] = aw.x;
-    ambw[i3 + 1u] = aw.y;
-    ambw[i3 + 2u] = aw.z;
-    tbuf[pi] = t;
-    info[pi] = pack_info(rec.depth, KIND_LEAF);
+    partial[i3 + 0u] = csum.x * inv;
+    partial[i3 + 1u] = csum.y * inv;
+    partial[i3 + 2u] = csum.z * inv;
+    ambw[i3 + 0u] = awsum.x * inv;
+    ambw[i3 + 1u] = awsum.y * inv;
+    ambw[i3 + 2u] = awsum.z * inv;
 }

@@ -12,45 +12,56 @@ RWStructuredBuffer<uint>  info  : register(u2); // pack_info(depth, kind)
 [shader("raygeneration")]
 void raygen() {
     uint2 id = DispatchRaysIndex().xy;
-
-    uint rng = rng_init(id.x, id.y, frame, 0u);
-    float jx = 0.5, jy = 0.5;
-    if (flags & FLAG_FRAME_JITTER) {
-        jx = 0.5 + frame_jitter.x;
-        jy = 0.5 + frame_jitter.y;
-    } else if (flags & FLAG_JITTER) {
-        jx = rng_next(rng);
-        jy = rng_next(rng);
-    }
-    float3 dir = ray_dir(float(id.x) + jx, float(id.y) + jy);
-
-    RayDesc r;
-    r.Origin = cam_origin.xyz; r.Direction = dir; r.TMin = 0.0; r.TMax = FLT_MAX;
-    RayPayload p;
-    p.color = float3(0.0, 0.0, 0.0);
-    p.t = INF;
-    p.rng = rng;
-    TraceRay(tlas, OPAQUE_RF, 0xffu, 0u, 0u, 0u, r, p);
-
     uint pi = id.y * rw + id.x;
+
+    // --spp: one TraceRay per sample, averaged into a single accum
+    // store-or-add (two splats would break the accum semantics, exactly as on
+    // the CPU). No tile claim exists in this pipeline — every ray starts at
+    // the TLAS root with TMin = 0 — so this is plain supersampling: it buys
+    // the ~1/N variance the upscaler wants, not the quadtree amortization the
+    // --cpu/--gpu paths get.
+    float3 csum = 0.0;
+    for (uint s = 0u; s < spp; ++s) {
+        uint rng = rng_init(id.x, id.y, frame, s);
+        float2 sp = sample_pos(id.x, id.y, s, rng);
+        float3 dir = ray_dir(sp.x, sp.y);
+
+        RayDesc r;
+        r.Origin = cam_origin.xyz; r.Direction = dir; r.TMin = 0.0; r.TMax = FLT_MAX;
+        RayPayload p;
+        p.color = float3(0.0, 0.0, 0.0);
+        p.t = INF;
+        p.rng = rng;
+        p.sp = sp;
+        // The probe sample owns every per-pixel side channel; chs_shade reads
+        // this bit (it fires once per SAMPLE now, not once per pixel).
+        p.prim = (s == probe_sample) ? 1u : 0u;
+        TraceRay(tlas, OPAQUE_RF, 0xffu, 0u, 0u, 0u, r, p);
+
+        csum += p.color;
+        if (p.prim != 0u) {
+            tbuf[pi] = p.t;
+            info[pi] = pack_info(0u, KIND_LEAF);
+            // Sky G-buffer capture (FLAG_GBUF-gated inside the helper — plain
+            // sessions are bit-untouched, and no rng draw is consumed). The
+            // hit half lives in chs_shade, where the PrimSurf is.
+            if (isinf(p.t))
+                gbuf_write_sky(pi, sp.x, sp.y, dir);
+        }
+    }
+    float3 c = csum * (1.0 / float(spp));
+
     uint i3 = pi * 3u;
     // splat: frame 0 (or non-accumulating) stores — the implicit clear.
     if (frame == 0u || (flags & FLAG_ACCUM) == 0u) {
-        accum[i3 + 0u] = p.color.x;
-        accum[i3 + 1u] = p.color.y;
-        accum[i3 + 2u] = p.color.z;
+        accum[i3 + 0u] = c.x;
+        accum[i3 + 1u] = c.y;
+        accum[i3 + 2u] = c.z;
     } else {
-        accum[i3 + 0u] += p.color.x;
-        accum[i3 + 1u] += p.color.y;
-        accum[i3 + 2u] += p.color.z;
+        accum[i3 + 0u] += c.x;
+        accum[i3 + 1u] += c.y;
+        accum[i3 + 2u] += c.z;
     }
-    tbuf[pi] = p.t;
-    info[pi] = pack_info(0u, KIND_LEAF);
-    // Sky G-buffer capture (FLAG_GBUF-gated inside the helper — plain
-    // sessions are bit-untouched, and no rng draw is consumed). The hit
-    // half lives in chs_shade, where the PrimSurf is.
-    if (isinf(p.t))
-        gbuf_write_sky(pi, float(id.x) + jx, float(id.y) + jy, dir);
 }
 
 [shader("closesthit")]
@@ -64,22 +75,16 @@ void chs_shade(inout RayPayload p, in BuiltInTriangleIntersectionAttributes a) {
     p.color = shade_full(WorldRayOrigin(), WorldRayDirection(), h, p.rng, ps);
     p.t = h.t;
     // G-buffer capture: a pure copy of already-computed values, zero rng
-    // draws, FLAG_GBUF-gated inside the helper. chs_shade fires exactly
-    // once per pixel structurally (the reflection ray routes to HgHit, the
-    // occlusion ray to the null record). The (fx, fy) sample position is
-    // recomputed from the frame-uniform jitter — upscaler frames always run
-    // FLAG_FRAME_JITTER; on FLAG_JITTER (rng-drawn, plain accumulation)
-    // frames the offset here is the pixel center, which is harmless: (fx,
-    // fy) feeds only gbuf_mv, and those frames run with prev_cam unset, so
-    // the MV is (0,0) regardless.
+    // draws, FLAG_GBUF-gated inside the helper. Under --spp chs_shade fires
+    // once per SAMPLE (the reflection ray still routes to HgHit and the
+    // occlusion ray to the null record, so it is once per sample and no
+    // more), and only the probe sample may write the pack — otherwise the
+    // guides would drift off the jitter the upscaler was told about. The
+    // sample position rides the payload: raygen owns the jitter policy, this
+    // stage just reports where the ray was.
+    if (p.prim == 0u) return;
     uint2 id = DispatchRaysIndex().xy;
-    float jx = 0.5, jy = 0.5;
-    if (flags & FLAG_FRAME_JITTER) {
-        jx = 0.5 + frame_jitter.x;
-        jy = 0.5 + frame_jitter.y;
-    }
-    gbuf_write_hit(id.y * rw + id.x, float(id.x) + jx, float(id.y) + jy,
-                   WorldRayDirection(), h.t, ps);
+    gbuf_write_hit(id.y * rw + id.x, p.sp.x, p.sp.y, WorldRayDirection(), h.t, ps);
 }
 
 [shader("closesthit")]

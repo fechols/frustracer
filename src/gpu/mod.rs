@@ -9,6 +9,9 @@
 
 pub mod adapter;
 pub mod d3d12;
+/// What the monitor under the window can actually display (HDR on/off, peak
+/// luminance) — re-probed on every move, not a startup fact.
+pub mod display;
 pub mod dxc;
 pub mod dxr;
 pub mod ffx;
@@ -56,12 +59,26 @@ pub struct GpuOptions {
     /// OR XESS_INIT_FLAG_ENABLE_AUTOEXPOSURE into the XeSS init flags
     /// (--xess-autoexposure; A/B lever, default off).
     pub xess_autoexposure: bool,
+    /// Ray Regeneration tuning overrides applied at denoiser creation
+    /// (`--fsr-max-radiance` &c). All-None = configure nothing = the
+    /// provider's own defaults.
+    pub fsr_tune: crate::fsr::DenoiseTuning,
     /// D3D12 debug layer + DXGI debug factory + verbose SL logging.
     pub debug: bool,
     /// Present at sync interval 1 (default). `--no-vsync` clears it for
     /// uncapped benchmark presentation (tearing swapchain when DXGI
     /// supports it).
     pub vsync: bool,
+    /// `--hdr`: ask for an scRGB f16 swapchain instead of the 8-bit SDR one.
+    /// A *request* — the swapchain may refuse the colour space, so read
+    /// `GpuContext::hdr()` for what actually happened, never this.
+    pub hdr: bool,
+    /// Where linear 1.0 lands, in nits (`--hdr-paper-white`, default 200). The
+    /// scene is authored so 1.0 ≈ diffuse white (see `scene::default_light`).
+    pub paper_white: f32,
+    /// Override the display's reported peak luminance (`--hdr-peak`). None =
+    /// use whatever `gpu::hdr` probes from the monitor.
+    pub peak_nits: Option<f32>,
 }
 
 /// Which chain level a session actually wired — derived from the live state
@@ -171,6 +188,15 @@ pub struct GpuContext {
     _proxy_factory: Option<IDXGIFactory6>,
     pub adapter_name: String,
     pub adapter_is_nvidia: bool,
+    /// The presentation curve every present arm reads (see
+    /// `fullscreen_to_backbuffer`). One field, so a display change is a retune.
+    tone: crate::tone::ToneParams,
+    /// The adapter and window, kept so the display can be RE-probed when the
+    /// window moves to another monitor — the probe is not a one-time startup
+    /// fact. `None` display = never probed (the SDR path never does).
+    adapter: windows::Win32::Graphics::Dxgi::IDXGIAdapter4,
+    hwnd: windows::Win32::Foundation::HWND,
+    display: Option<display::DisplayHdr>,
     /// Some(_) when Streamline is live; the queue and swapchain are then SL
     /// proxies and every present goes through Streamline (a manual-hooking
     /// requirement, and what makes Frame Generation possible later).
@@ -280,7 +306,7 @@ impl GpuContext {
             let pdev: ID3D12Device = s.upgrade(&device)?;
             let queue = d3d12::create_queue(&pdev)?;
             let pfac: IDXGIFactory6 = s.upgrade(&factory)?;
-            let d3d = D3d::with_queue(&pfac, device, queue, hwnd, w, h, opts.vsync)?;
+            let d3d = D3d::with_queue(&pfac, device, queue, hwnd, w, h, opts.vsync, opts.hdr)?;
             // The swapchain we hold MUST be the SL proxy — every present has
             // to route through presentCommon under manual hooking. A proxy
             // resolves to a distinct native interface; verify loudly.
@@ -297,12 +323,47 @@ impl GpuContext {
             d3d
         } else {
             let queue = d3d12::create_queue(&device)?;
-            D3d::with_queue(&factory, device, queue, hwnd, w, h, opts.vsync)?
+            D3d::with_queue(&factory, device, queue, hwnd, w, h, opts.vsync, opts.hdr)?
+        };
+
+        // The display probe and the curve it implies. Only meaningful once the
+        // swapchain is actually scRGB — on the 8-bit path there is one curve
+        // (ToneParams::SDR) and nothing to ask the monitor.
+        let disp = if d3d.hdr { Some(display::probe(&pick.adapter, hwnd)) } else { None };
+        let tone = match disp {
+            Some(d) => {
+                let t = d.tone(opts.paper_white, opts.peak_nits);
+                // Report the curve we ACTUALLY installed, not the probe's opinion:
+                // --hdr-peak overrides the probe (including an "HDR off" verdict),
+                // so keying the message off `d.enabled` could announce SDR levels
+                // while running an HDR rolloff.
+                if t.headroom > 1.0 {
+                    eprintln!(
+                        "hdr: display peak {:.0} nits (full-frame {:.0}){}, paper white {:.0} \
+                         -> headroom {:.1}x",
+                        t.peak_nits(),
+                        d.max_full_frame_nits,
+                        if opts.peak_nits.is_some() { " [--hdr-peak override]" } else { "" },
+                        opts.paper_white,
+                        t.headroom
+                    );
+                } else {
+                    // Not a failure — the common case. Windows maps our linear
+                    // f16 onto the panel; we just have no headroom above white,
+                    // so the curve is the same rolloff the SDR build used.
+                    eprintln!(
+                        "hdr: display reports HDR off — SDR levels, full panel bit depth \
+                         (enable Windows HDR on this monitor for highlights)"
+                    );
+                }
+                t
+            }
+            None => crate::tone::ToneParams::SDR,
         };
 
         let (rr_opt, rr_min, rr_max) = Self::query_rr_res(sl.as_ref(), w, h);
 
-        let passes = tonemap::Passes::new(&d3d.device)?;
+        let passes = tonemap::Passes::new(&d3d.device, d3d.format)?;
         let bloom = bloom::BloomGpu::new(&d3d.device, w as u32, h as u32)?;
         passes.create_srv(
             &d3d.device,
@@ -310,7 +371,14 @@ impl GpuContext {
             windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
             tonemap::SRV_SLOT_BLOOM,
         );
-        let blit = upload::BlitUpload::new(&d3d, w, h)?;
+        // The blit texture matches the SWAPCHAIN, not the CLI flag: under scRGB
+        // the CPU arms hand over f16, under SDR they hand over u32 0RGB. Keyed
+        // off `d3d.hdr` so a refused colour space can't leave them mismatched.
+        let blit = if d3d.hdr {
+            upload::BlitUpload::new_hdr(&d3d, w, h)?
+        } else {
+            upload::BlitUpload::new(&d3d, w, h)?
+        };
         let hdr = upload::HdrUpload::new(&d3d, w, h)?;
         let rr_res = if sl.is_some() {
             let r = rr::RrResources::new(&d3d.device, rr_opt, rr_min, rr_max, w, h)?;
@@ -326,14 +394,11 @@ impl GpuContext {
         } else {
             None
         };
-        wire_tonemap_src(
-            &d3d.device,
-            &passes,
-            &bloom,
-            &blit.texture,
-            d3d12::SWAPCHAIN_FORMAT,
-            tonemap::SRV_SLOT_BLIT,
-        );
+        // The blit arm takes the blit PSO, which `fullscreen_to_backbuffer`
+        // never blooms (its source is an already-encoded, CPU-tonemapped image —
+        // the CPU applied glare in `render::resolve`). So it gets a plain
+        // tonemap SRV and no bloom source: nothing would ever read one.
+        passes.create_srv(&d3d.device, &blit.texture, blit.format, tonemap::SRV_SLOT_BLIT);
         wire_tonemap_src(
             &d3d.device,
             &passes,
@@ -365,7 +430,7 @@ impl GpuContext {
                 s
             };
             if opts.chain.fsr4 {
-                match Self::init_fsr(&opts.ffx_dir, &d3d.device, w, h, opts.debug, crate::fsr::Flavor::Fsr4Rr) {
+                match Self::init_fsr(&opts.ffx_dir, &d3d.device, w, h, opts.debug, crate::fsr::Flavor::Fsr4Rr, &opts.fsr_tune) {
                     Ok(s) => fsr_state = Some(wire_fsr(s)),
                     Err(e) => eprintln!("fsr4: level unavailable ({e}) — falling through the chain"),
                 }
@@ -389,7 +454,7 @@ impl GpuContext {
                 }
             }
             if fsr_state.is_none() && xess_state.is_none() && opts.chain.fsr3 {
-                match Self::init_fsr(&opts.ffx_dir, &d3d.device, w, h, opts.debug, crate::fsr::Flavor::Fsr3) {
+                match Self::init_fsr(&opts.ffx_dir, &d3d.device, w, h, opts.debug, crate::fsr::Flavor::Fsr3, &opts.fsr_tune) {
                     Ok(s) => fsr_state = Some(wire_fsr(s)),
                     Err(e) => eprintln!("fsr3: level unavailable ({e})"),
                 }
@@ -423,6 +488,10 @@ impl GpuContext {
             nppd_state_valid: false,
             adapter_name: pick.name,
             adapter_is_nvidia: pick.is_nvidia,
+            tone,
+            adapter: pick.adapter,
+            hwnd,
+            display: disp,
         })
     }
 
@@ -546,7 +615,11 @@ impl GpuContext {
         self.fsr = None;
         self.rr = None;
         self.d3d.resize(w, h)?;
-        self.blit = upload::BlitUpload::new(&self.d3d, w, h)?;
+        self.blit = if self.d3d.hdr {
+            upload::BlitUpload::new_hdr(&self.d3d, w, h)?
+        } else {
+            upload::BlitUpload::new(&self.d3d, w, h)?
+        };
         self.hdr = upload::HdrUpload::new(&self.d3d, w, h)?;
         // The glare pyramid is window-sized; rebuild it and re-point the tonemap's
         // halo SRV at the new level 0 (the old resource is gone).
@@ -557,14 +630,16 @@ impl GpuContext {
             windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
             tonemap::SRV_SLOT_BLOOM,
         );
-        wire_tonemap_src(
+        // The blit arm never blooms (blit PSO — see `new`), so a plain SRV.
+        self.passes.create_srv(
             &self.d3d.device,
-            &self.passes,
-            &self.bloom,
             &self.blit.texture,
-            d3d12::SWAPCHAIN_FORMAT,
+            self.blit.format,
             tonemap::SRV_SLOT_BLIT,
         );
+        // A resize can also be a monitor change (drag to another display, then
+        // let go). Re-probe here rather than trusting the poll to catch up.
+        self.refresh_display(opts.paper_white, opts.peak_nits);
         wire_tonemap_src(
             &self.d3d.device,
             &self.passes,
@@ -609,7 +684,7 @@ impl GpuContext {
                 } else {
                     crate::fsr::Flavor::Fsr3
                 };
-                match Self::init_fsr(&opts.ffx_dir, &self.d3d.device, w, h, opts.debug, flavor) {
+                match Self::init_fsr(&opts.ffx_dir, &self.d3d.device, w, h, opts.debug, flavor, &opts.fsr_tune) {
                     Ok(s) => {
                         wire_tonemap_src(
                             &self.d3d.device,
@@ -642,6 +717,7 @@ impl GpuContext {
         h: u32,
         debug: bool,
         flavor: crate::fsr::Flavor,
+        tune: &crate::fsr::DenoiseTuning,
     ) -> Result<FsrState> {
         let mut ctx = ffx::FfxContext::load(ffx_dir)?;
         // Ray Regeneration probe. A probe *error* degrades exactly like an
@@ -708,6 +784,9 @@ impl GpuContext {
         // window and a per-dispatch renderSize.
         if flavor == crate::fsr::Flavor::Fsr4Rr {
             ctx.create_denoiser(device, (w, h))?;
+            if tune.any() {
+                ctx.tune_denoiser(tune);
+            }
         }
         ctx.create_upscaler(device, (w, h), (w, h), debug, vid)?;
         let q = |mode: u32, ratio: f32| -> (u32, u32) {
@@ -803,7 +882,7 @@ impl GpuContext {
                     // cs_feed_fsr_rr's register/plane mapping (feed.hlsl —
                     // keep in lockstep; plane_resources returns upload order:
                     // depth_lin, depth_clip, mvec, normals, diff_alb,
-                    // spec_alb, dd_in, ds_in, residual).
+                    // spec_alb, dd_in, ds_in, residual, ao_in, is_in).
                     let pl = res.plane_resources();
                     wire(
                         trace::FeedKind::FsrRr,
@@ -817,6 +896,8 @@ impl GpuContext {
                             (trace::FEED_FSR_DD, pl[6].0, pl[6].1),
                             (trace::FEED_FSR_DS, pl[7].0, pl[7].1),
                             (trace::FEED_COLOR, pl[8].0, pl[8].1), // RGBA16F residual
+                            (trace::FEED_FSR_AO, pl[9].0, pl[9].1), // R16F AO
+                            (trace::FEED_FSR_IS, pl[10].0, pl[10].1), // RGBA16F indirect spec
                         ],
                     )
                 }
@@ -1441,6 +1522,8 @@ impl GpuContext {
             prev_cam: None,
             q: crate::shade::Quality { fb: crate::shade::FrustumBounce::OFF, ..q },
             verify: false,
+            spp: 1,
+            probe_sample: 0,
         };
         {
             // Field-split borrow: run_once needs d3d mutably, the recorder
@@ -1571,6 +1654,7 @@ impl GpuContext {
     /// this frame's sub-rect); only the upscaled output is window-sized.
     /// `prev_pos` is the previous frame's camera position (the denoiser's
     /// cameraPositionDelta); `frame_ms` feeds the upscaler's frameTimeDelta.
+    #[allow(clippy::too_many_arguments)]
     pub fn present_fsr(
         &mut self,
         g: &dlss::GBufs,
@@ -1579,6 +1663,7 @@ impl GpuContext {
         prev_pos: Option<glam::Vec3A>,
         frame_idx: u32,
         frame_ms: f32,
+        sky_sh: &crate::sh::Sh9,
     ) -> Result<()> {
         crate::zone!("present-fsr");
         let Some(fs) = &self.fsr else {
@@ -1608,7 +1693,9 @@ impl GpuContext {
             return Err(e);
         }
 
-        if let Err(e) = Self::record_fsr_rr_sequence(fs, &self.d3d, fc, prev_pos, frame_idx, frame_ms) {
+        if let Err(e) =
+            Self::record_fsr_rr_sequence(fs, &self.d3d, fc, prev_pos, frame_idx, frame_ms, sky_sh)
+        {
             self.d3d.abort_frame();
             return Err(e);
         }
@@ -1627,6 +1714,11 @@ impl GpuContext {
     /// cs_feed_fsr_rr kernel — both leave them resting in
     /// NON_PIXEL_SHADER_RESOURCE). The caller owns the open frame (and
     /// aborts it on Err).
+    /// `sky_sh` is the scene's sky in order-2 SH — the AO signal's remodulation
+    /// factor, which the composite pass evaluates per pixel against the normals
+    /// plane. It used to be a compile-time constant (`shade::AMBIENT`); the one
+    /// sky makes it directional, so it has to travel with the frame.
+    #[allow(clippy::too_many_arguments)]
     fn record_fsr_rr_sequence(
         fs: &FsrState,
         d3d: &D3d,
@@ -1634,6 +1726,7 @@ impl GpuContext {
         prev_pos: Option<glam::Vec3A>,
         frame_idx: u32,
         frame_ms: f32,
+        sky_sh: &crate::sh::Sh9,
     ) -> Result<()> {
         let FsrRes::Rr(res) = &fs.res else {
             return Err("FSR4-RR sequence on an FSR 3.1 session".into());
@@ -1648,19 +1741,25 @@ impl GpuContext {
         // Ray Regeneration: signals in UAV state, one ffxDispatch with the
         // common desc + both signal descs chained (built in the shim).
         res.barrier_denoise_begin(&d3d.list);
-        let (depth_lin, mvec, normals, spec_alb, diff_alb, dd_in, dd_out, ds_in, ds_out) =
-            res.denoise_res();
+        let r = res.denoise_res();
         let dd_desc = ffx::FfxShimDenoiseDesc {
             cmdlist: d3d.list.as_raw(),
-            linear_depth: depth_lin,
-            motion_vectors: mvec,
-            normals,
-            specular_albedo: spec_alb,
-            diffuse_albedo: diff_alb,
-            dd_in,
-            dd_out,
-            ds_in,
-            ds_out,
+            // The dispatch's signal set must equal the context's creation set
+            // (the ffx header's if-and-only-if rule) — one constant, both.
+            signal_flags: ffx_sys::SIGNALS,
+            linear_depth: r.depth_lin,
+            motion_vectors: r.mvec,
+            normals: r.normals,
+            specular_albedo: r.spec_alb,
+            diffuse_albedo: r.diff_alb,
+            dd_in: r.dd_in,
+            dd_out: r.dd_out,
+            ds_in: r.ds_in,
+            ds_out: r.ds_out,
+            ao_in: r.ao_in,
+            ao_out: r.ao_out,
+            is_in: r.is_in,
+            is_out: r.is_out,
             // Our MV plane is already PreviousUV - CurrentUV with the depth
             // delta in B (converted at the fill site) — the header's unit
             // scale.
@@ -1693,7 +1792,7 @@ impl GpuContext {
         res.barrier_denoise_end(&d3d.list);
 
         // Remodulate (binds from scratch — the post-ffx state restore).
-        res.record_composite(&d3d.list, rw, rh);
+        res.record_composite(&d3d.list, rw, rh, sky_sh);
 
         // FSR4 upscale: composite -> window-res output. The shared MV plane
         // holds UV-deltas here, so the scale multiplies the render dims back
@@ -1721,6 +1820,7 @@ impl GpuContext {
     /// Ray Regeneration + FSR4 fed by the GPU-resident tracer: trace -> feed
     /// (pack + sig -> the nine FSR planes, on-GPU) -> denoise -> composite ->
     /// upscale -> tonemap(SRV_SLOT_FSR) -> present. Never an SL session.
+    #[allow(clippy::too_many_arguments)]
     pub fn present_trace_fsr_rr(
         &mut self,
         p: &trace::FrameParams,
@@ -1729,6 +1829,7 @@ impl GpuContext {
         prev_pos: Option<glam::Vec3A>,
         frame_idx: u32,
         frame_ms: f32,
+        sky_sh: &crate::sh::Sh9,
     ) -> Result<()> {
         crate::zone!("present-trace-fsr-rr");
         if self.trace.is_none() || self.fsr.is_none() {
@@ -1756,7 +1857,7 @@ impl GpuContext {
         {
             let fs = self.fsr.as_ref().unwrap();
             if let Err(e) =
-                Self::record_fsr_rr_sequence(fs, &self.d3d, fc, prev_pos, frame_idx, frame_ms)
+                Self::record_fsr_rr_sequence(fs, &self.d3d, fc, prev_pos, frame_idx, frame_ms, sky_sh)
             {
                 self.d3d.abort_frame();
                 return Err(e);
@@ -1768,6 +1869,7 @@ impl GpuContext {
 
     /// Ray Regeneration + FSR4 fed by the DXR pipeline — the
     /// `present_dxr_fsr3` shape with the full denoise sequence in the middle.
+    #[allow(clippy::too_many_arguments)]
     pub fn present_dxr_fsr_rr(
         &mut self,
         p: &trace::FrameParams,
@@ -1775,6 +1877,7 @@ impl GpuContext {
         prev_pos: Option<glam::Vec3A>,
         frame_idx: u32,
         frame_ms: f32,
+        sky_sh: &crate::sh::Sh9,
     ) -> Result<()> {
         crate::zone!("present-dxr-fsr-rr");
         if self.dxr.is_none() || self.fsr.is_none() {
@@ -1805,7 +1908,7 @@ impl GpuContext {
         {
             let fs = self.fsr.as_ref().unwrap();
             if let Err(e) =
-                Self::record_fsr_rr_sequence(fs, &self.d3d, fc, prev_pos, frame_idx, frame_ms)
+                Self::record_fsr_rr_sequence(fs, &self.d3d, fc, prev_pos, frame_idx, frame_ms, sky_sh)
             {
                 self.d3d.abort_frame();
                 return Err(e);
@@ -2309,12 +2412,16 @@ impl GpuContext {
                 std::slice::from_raw_parts((ptr as *const u8).add(y * pitch) as *const _, w)
             };
             for (x, px) in row.iter().enumerate() {
-                let tm = |v: half::f16| -> u32 {
-                    let c = f32::from(v).max(0.0);
-                    let m = (1.0 - (-c).exp()).clamp(0.0, 1.0).powf(1.0 / 2.2);
-                    (m * 255.0 + 0.5) as u32
-                };
-                out[y * w + x] = (tm(px[0]) << 16) | (tm(px[1]) << 8) | tm(px[2]);
+                // Screenshots and --check PNGs stay SDR 8-bit regardless of the
+                // session's swapchain: a PNG has nowhere to put a nit. This used
+                // to open-code the curve a third time; it now shares tone::map,
+                // so the file can't drift from the screen.
+                let c = glam::Vec3A::new(px[0].into(), px[1].into(), px[2].into());
+                let m = crate::tone::map(c, crate::tone::ToneParams::SDR)
+                    .clamp(glam::Vec3A::ZERO, glam::Vec3A::ONE)
+                    * 255.0;
+                let q = |v: f32| (v + 0.5) as u32;
+                out[y * w + x] = (q(m.x) << 16) | (q(m.y) << 8) | q(m.z);
             }
         }
         unsafe { rb.resource.Unmap(0, None) };
@@ -2329,6 +2436,53 @@ impl GpuContext {
         self.fullscreen_to_backbuffer(false, tonemap::SRV_SLOT_BLIT, 1.0);
         self.d3d.end_frame(slot)
     }
+
+    /// `present_cpu` for the scRGB swapchain: the CPU produced final scRGB f16
+    /// (`render::present_px_scrgb` applied the curve, the overlay, and the
+    /// encode), so this is still a straight blit — the blit PS stays a
+    /// passthrough and never learns about colour spaces.
+    pub fn present_cpu_hdr(&mut self, pixels: &[[half::f16; 4]]) -> Result<()> {
+        crate::zone!("present-cpu-hdr");
+        let slot = self.d3d.begin_frame()?;
+        self.blit.record_hdr(&self.d3d, slot, pixels);
+        self.fullscreen_to_backbuffer(false, tonemap::SRV_SLOT_BLIT, 1.0);
+        self.d3d.end_frame(slot)
+    }
+
+    /// True when the swapchain actually came up as scRGB — NOT merely what
+    /// `--hdr` asked for (the colour space can be refused; see `D3d::with_queue`).
+    /// Callers pick their present arm and their `resolve*` on this.
+    pub fn is_hdr(&self) -> bool {
+        self.d3d.hdr
+    }
+
+    /// Re-probe the monitor the window now sits on and re-derive the curve.
+    /// Returns the new state when it actually changed, so the caller can log
+    /// once rather than every poll.
+    ///
+    /// Cheap by construction: this is a `GetDesc1` and a field write. It is NOT
+    /// a swapchain rebuild, and it deliberately does not reset the upscaler
+    /// history — a display change is a change of output device, not of scene.
+    pub fn refresh_display(&mut self, paper_white: f32, peak: Option<f32>) -> Option<display::DisplayHdr> {
+        if !self.d3d.hdr {
+            return None; // the 8-bit path has one curve and no display to ask
+        }
+        let d = display::probe(&self.adapter, self.hwnd);
+        if Some(d) == self.display {
+            return None;
+        }
+        self.display = Some(d);
+        self.tone = d.tone(paper_white, peak);
+        Some(d)
+    }
+
+    /// The presentation curve every present arm is reading right now. The CPU
+    /// arms pull it each frame (`CpuPresent::tone`), which is how a display
+    /// change reaches them.
+    pub fn tone(&self) -> crate::tone::ToneParams {
+        self.tone
+    }
+
 
     /// M2: present the raw linear-HDR accumulation with the GPU tonemap.
     pub fn present_hdr(&mut self, accum: &[AtomicU32], samples: u32) -> Result<()> {
@@ -2357,6 +2511,13 @@ impl GpuContext {
         }
     }
 
+    /// The single backbuffer bind point — all 16 present arms funnel here.
+    ///
+    /// The presentation curve is read from `self.tone` rather than threaded
+    /// through every arm: that is what makes a display change (a new monitor, or
+    /// Windows HDR toggled underneath us) a one-field retune instead of a
+    /// signature change at 16 call sites. Glare is likewise applied here and
+    /// nowhere else, on whatever this frame's tonemap source turns out to be.
     fn fullscreen_to_backbuffer(&self, use_tonemap: bool, srv_slot: u32, inv_samples: f32) {
         // Glare (src/bloom.rs): a display-stage pass on whatever the tonemap is
         // about to read, so EVERY GPU chain — RR, XeSS, FSR, plain, DXR — gets it
@@ -2407,6 +2568,7 @@ impl GpuContext {
             srv_slot,
             inv_samples,
             bloom,
+            self.tone,
             self.d3d.rtv_handle(bb),
             self.d3d.width,
             self.d3d.height,

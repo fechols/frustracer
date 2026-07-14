@@ -21,9 +21,21 @@ pub const FFXSHIM_ERR_GET_PROC: i32 = -1001;
 pub const FFXSHIM_ERR_NOT_LOADED: i32 = -1002;
 pub const FFXSHIM_ERR_BAD_ARG: i32 = -1003;
 
-// FfxApiDenoiserSignalFlags subset (re-exported by the shim header).
+// FfxApiDenoiserSignalFlags (re-exported by the shim header). The four the
+// shim builds descs for are the four this renderer has a source for; the other
+// three (dominant-light visibility, indirect diffuse, specular occlusion) are
+// rejected by the shim rather than silently dispatching a set that disagrees
+// with the context's creation flags.
+pub const SIGNAL_AMBIENT_OCCLUSION: u32 = 1 << 0;
 pub const SIGNAL_DIRECT_DIFFUSE: u32 = 1 << 1;
 pub const SIGNAL_DIRECT_SPECULAR: u32 = 1 << 2;
+pub const SIGNAL_INDIRECT_SPECULAR: u32 = 1 << 5;
+
+/// The signal set an FSR4-RR session subscribes to. ONE constant: the create
+/// and every dispatch must name the identical set (the ffx header's
+/// if-and-only-if rule), so they read it from here.
+pub const SIGNALS: u32 =
+    SIGNAL_DIRECT_DIFFUSE | SIGNAL_DIRECT_SPECULAR | SIGNAL_AMBIENT_OCCLUSION | SIGNAL_INDIRECT_SPECULAR;
 
 // FfxApiCreateContextUpscaleFlags subset.
 pub const UPSCALE_HDR: u32 = 1 << 0;
@@ -58,6 +70,8 @@ impl FfxShimRes {
 #[repr(C)]
 pub struct FfxShimDenoiseDesc {
     pub cmdlist: *mut c_void,
+    /// Must equal the context's creation signalFlags (`SIGNALS`).
+    pub signal_flags: u32,
     pub linear_depth: FfxShimRes,
     pub motion_vectors: FfxShimRes,
     pub normals: FfxShimRes,
@@ -67,6 +81,10 @@ pub struct FfxShimDenoiseDesc {
     pub dd_out: FfxShimRes,
     pub ds_in: FfxShimRes,
     pub ds_out: FfxShimRes,
+    pub ao_in: FfxShimRes,
+    pub ao_out: FfxShimRes,
+    pub is_in: FfxShimRes,
+    pub is_out: FfxShimRes,
     pub mv_scale: [f32; 3],
     pub jitter: [f32; 2],
     pub cam_pos_delta: [f32; 3],
@@ -80,6 +98,14 @@ pub struct FfxShimDenoiseDesc {
     pub reset: i32,
     pub non_gamma_albedo: i32,
 }
+
+// The C++ twin (ffx_shim.cpp) asserts the IDENTICAL two literals. `signal_flags`
+// is a u32 wedged between 8-aligned members, so it opens a padding hole both
+// languages must lay out the same way; if they ever disagree, one of the two
+// builds fails here instead of every resource pointer silently shifting by 4
+// bytes at the dispatch.
+const _: () = assert!(std::mem::offset_of!(FfxShimDenoiseDesc, linear_depth) == 16);
+const _: () = assert!(std::mem::size_of::<FfxShimDenoiseDesc>() == 416);
 
 #[repr(C)]
 pub struct FfxShimUpscaleDesc {

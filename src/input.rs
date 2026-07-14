@@ -26,12 +26,23 @@ pub struct Edges {
     pub toggle_bounce: bool,   // H (hemisphere frustum bounces)
     pub verify: bool,          // C
     pub screenshot: bool,      // P
+    pub cycle_spp: bool,       // U (samples per pixel: 1 -> 2 -> 4 -> 8 -> 1)
     pub quality: Option<u32>,  // 1/2/3
     pub toggle_fullscreen: bool, // F11 (borderless desktop fullscreen)
     /// Newest window client size from this frame's SizeChanged events
     /// (maximize, restore, fullscreen, drag — the last event in the drain
     /// wins). The consumer debounces and commits via `drawable_size()`.
     pub size_changed: Option<(u32, u32)>,
+    /// The window may now be on a different monitor — `DisplayChanged` (SDL's
+    /// own "you moved to another display") or `Moved` (a window can straddle
+    /// two monitors and change which one owns it without SDL firing
+    /// `DisplayChanged`). Either way the HDR capabilities under us may have
+    /// changed, so the consumer re-probes the display.
+    ///
+    /// Note this canNOT catch the user toggling Windows HDR on the monitor the
+    /// window is already sitting on — no window event fires for that at all.
+    /// The consumer's periodic re-probe is what covers it.
+    pub display_changed: bool,
 }
 
 pub struct Input {
@@ -65,6 +76,7 @@ impl Input {
                     Keycode::H => e.toggle_bounce = true,
                     Keycode::C => e.verify = true,
                     Keycode::P => e.screenshot = true,
+                    Keycode::U => e.cycle_spp = true,
                     Keycode::Num1 | Keycode::Kp1 => e.quality = Some(1),
                     Keycode::Num2 | Keycode::Kp2 => e.quality = Some(2),
                     Keycode::Num3 | Keycode::Kp3 => e.quality = Some(3),
@@ -74,6 +86,12 @@ impl Input {
                 Event::Window {
                     win_event: sdl2::event::WindowEvent::SizeChanged(w, h), ..
                 } => e.size_changed = Some((w.max(0) as u32, h.max(0) as u32)),
+                Event::Window {
+                    win_event:
+                        sdl2::event::WindowEvent::DisplayChanged(_)
+                        | sdl2::event::WindowEvent::Moved(_, _),
+                    ..
+                } => e.display_changed = true,
                 _ => {}
             }
         }

@@ -152,6 +152,23 @@ pub fn oct_decode(eu: f32, ev: f32) -> Vec3A {
     Vec3A::new(x, y, z).normalize()
 }
 
+/// The normal as the RGB10A2 normals plane actually STORES it: octahedral,
+/// 10 bits per channel, decoded back.
+///
+/// This exists because the AO signal's remodulation factor stopped being a
+/// constant. It used to be `shade::AMBIENT`, which every composite site could
+/// simply be handed; the one sky makes it `sky_sh.irradiance(n)` — directional,
+/// hence per-pixel. The GPU composite pass (`fsr_composite.hlsl`) has exactly
+/// one source for that normal: the plane bytes. So every site must derive the
+/// factor from the WIRE normal, not from the full-precision shading normal, or
+/// the composite identity picks up a quantization-sized hole that no tolerance
+/// should be widened to absorb. `--check-fsr`'s per-pixel identity gate is what
+/// pins this.
+pub fn wire_normal(n: Vec3A) -> Vec3A {
+    let (u, v) = oct_encode(n);
+    oct_decode(quant_unorm(u, 10), quant_unorm(v, 10))
+}
+
 /// Quantize a [0,1] value through an n-bit UNORM channel.
 #[inline(always)]
 pub fn quant_unorm(v: f32, bits: u32) -> f32 {
@@ -169,36 +186,69 @@ pub struct Signals {
     pub dd: Vec3A,
     /// Demodulated direct specular, f16-quantized.
     pub ds: Vec3A,
-    /// Exact f32 remainder: everything the pixel shows that is not the two
-    /// remodulated signals (kd*ambient, the reflection bounce, all
-    /// quantization slop). Passed through the denoiser untouched.
+    /// Ambient-occlusion open fraction in [0,1], f16-quantized — RR's scalar
+    /// AO signal. Remodulated as `ao * amb * kd`, where `amb` is the sky's SH
+    /// irradiance at the pixel's WIRE normal (`wire_normal`) — the factor the
+    /// sampled ambient tier multiplies the open fraction by.
+    pub ao: f32,
+    /// Demodulated indirect (reflection-bounce) specular, f16-quantized —
+    /// divided by the same wire F0 as `ds`, so it remodulates identically.
+    pub is: Vec3A,
+    /// Exact f32 remainder: everything the pixel shows that is not the four
+    /// remodulated signals (emissive, the glass transmission chain, all
+    /// quantization slop). Passed through the denoiser untouched — which is
+    /// why every NOISY term belongs in a signal, not here.
     pub residual: Vec3A,
 }
 
-/// Split a shaded primary hit into the two Ray Regeneration signals plus the
-/// exact residual. `direct_d`/`direct_s` are `PrimarySurface`'s post-average
-/// lobes; `color` is the pixel's final shaded color; `kd`/`f0` are the same
+/// Split a shaded primary hit into the four Ray Regeneration signals plus the
+/// exact residual. `direct_d`/`direct_s`/`ao`/`ind_s` are `PrimarySurface`'s
+/// captures; `color` is the pixel's final shaded color; `kd`/`f0` are the same
 /// diffuse/specular albedos the G-buffer write site derives
 /// (`albedo*(1-metallic)` and `lerp(0.04, albedo, metallic)`). The identity
 /// `composite(sig, kd, f0) == color` holds to f32 rounding by construction
 /// (the residual is defined as the remainder of the exact wire-value
 /// products), and `albedo_wire3`'s leading f16 rounding makes it insensitive
 /// to whether the caller hands raw f32 or the GBufs' f16-stored albedos.
-pub fn split_signals(color: Vec3A, direct_d: Vec3A, direct_s: Vec3A, kd: Vec3A, f0: Vec3A) -> Signals {
+///
+/// Note `color` multiplies the diffuse terms by `kd*(1-transmission)` while
+/// the wire carries only `kd`: on glass the remainder absorbs the difference.
+/// That approximation predates the AO signal (it already applied to `dd`) and
+/// `ao` deliberately inherits the same convention.
+///
+/// `amb` is the AO signal's remodulation factor — `sky_sh.irradiance` at the
+/// pixel's `wire_normal`. It is passed in rather than computed here so fsr.rs
+/// stays sky-agnostic, but it MUST be the wire-normal value: the GPU composite
+/// has only the normals plane to rebuild it from (see `wire_normal`).
+pub fn split_signals(
+    color: Vec3A,
+    direct_d: Vec3A,
+    direct_s: Vec3A,
+    ao: f32,
+    ind_s: Vec3A,
+    kd: Vec3A,
+    f0: Vec3A,
+    amb: Vec3A,
+) -> Signals {
     let kd_wire = albedo_wire3(kd);
     let sf0_wire = albedo_wire3(f0);
+    let f0_floor = sf0_wire.max(Vec3A::splat(MIN_SPEC_ALB));
     let dd = q16v(direct_d);
-    let ds = q16v(direct_s / sf0_wire.max(Vec3A::splat(MIN_SPEC_ALB)));
-    let residual = color - dd * kd_wire - ds * sf0_wire;
-    Signals { dd, ds, residual }
+    let ds = q16v(direct_s / f0_floor);
+    let ao = q16(ao);
+    let is = q16v(ind_s / f0_floor);
+    let residual = color - dd * kd_wire - ds * sf0_wire - ao * amb * kd_wire - is * sf0_wire;
+    Signals { dd, ds, ao, is, residual }
 }
 
-/// The remodulation the GPU composite pass performs (with denoised dd/ds in
-/// place of the raw signals): the CPU twin used by the identity gate. The
-/// wire quantization is applied here, exactly as `split_signals` applied it —
-/// composite.hlsl mirrors this decode.
-pub fn composite(sig: &Signals, kd: Vec3A, f0: Vec3A) -> Vec3A {
-    sig.dd * albedo_wire3(kd) + sig.ds * albedo_wire3(f0) + sig.residual
+/// The remodulation the GPU composite pass performs (with the denoised
+/// signals in place of the raw ones): the CPU twin used by the identity gate.
+/// The wire quantization is applied here, exactly as `split_signals` applied
+/// it — fsr_composite.hlsl mirrors this decode.
+pub fn composite(sig: &Signals, kd: Vec3A, f0: Vec3A, amb: Vec3A) -> Vec3A {
+    let kd_wire = albedo_wire3(kd);
+    let f0_wire = albedo_wire3(f0);
+    sig.dd * kd_wire + sig.ds * f0_wire + sig.ao * amb * kd_wire + sig.is * f0_wire + sig.residual
 }
 
 // ---------------------------------------------------------------------------
@@ -221,6 +271,10 @@ pub struct FsrBufs {
     pub dd: Vec<AtomicU16>,
     /// 3/px demodulated direct specular (f16 bits).
     pub ds: Vec<AtomicU16>,
+    /// 1/px ambient-occlusion open fraction (f16 bits).
+    pub ao: Vec<AtomicU16>,
+    /// 3/px demodulated indirect (reflection) specular (f16 bits).
+    pub is: Vec<AtomicU16>,
     /// 3/px exact residual (f32 bits).
     pub residual: Vec<AtomicU32>,
     /// 1/px previous-frame linear view-Z (f32 bits) — the exact hit point
@@ -237,6 +291,8 @@ impl FsrBufs {
             rh,
             dd: a16(rw * rh * 3),
             ds: a16(rw * rh * 3),
+            ao: a16(rw * rh),
+            is: a16(rw * rh * 3),
             residual: a32(rw * rh * 3),
             prev_z: a32(rw * rh),
         }
@@ -260,26 +316,75 @@ impl FsrBufs {
             crate::dlss::st16(&self.dd[i * 3 + k], d);
             crate::dlss::st16(&self.ds[i * 3 + k], s);
         }
+        crate::dlss::st16(&self.ao[i], sig.ao);
+        for (k, v) in [sig.is.x, sig.is.y, sig.is.z].into_iter().enumerate() {
+            crate::dlss::st16(&self.is[i * 3 + k], v);
+        }
         for (k, r) in [sig.residual.x, sig.residual.y, sig.residual.z].into_iter().enumerate() {
             self.residual[i * 3 + k].store(r.to_bits(), Relaxed);
         }
         self.prev_z[i].store(prev_z.to_bits(), Relaxed);
     }
 
-    /// Read back (dd, ds, residual) for the check gates.
+    /// Read back every signal for the check gates.
     pub fn read(&self, x: usize, y: usize) -> Signals {
         let i = y * self.rw + x;
         let l16 = |v: &AtomicU16| f16::from_bits(v.load(Relaxed)).to_f32();
         let l32 = |v: &AtomicU32| f32::from_bits(v.load(Relaxed));
+        let v3 = |b: &Vec<AtomicU16>| Vec3A::new(l16(&b[i * 3]), l16(&b[i * 3 + 1]), l16(&b[i * 3 + 2]));
         Signals {
-            dd: Vec3A::new(l16(&self.dd[i * 3]), l16(&self.dd[i * 3 + 1]), l16(&self.dd[i * 3 + 2])),
-            ds: Vec3A::new(l16(&self.ds[i * 3]), l16(&self.ds[i * 3 + 1]), l16(&self.ds[i * 3 + 2])),
+            dd: v3(&self.dd),
+            ds: v3(&self.ds),
+            ao: l16(&self.ao[i]),
+            is: v3(&self.is),
             residual: Vec3A::new(
                 l32(&self.residual[i * 3]),
                 l32(&self.residual[i * 3 + 1]),
                 l32(&self.residual[i * 3 + 2]),
             ),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Denoiser tuning (the `--fsr-*` A/B levers).
+// ---------------------------------------------------------------------------
+
+/// Runtime overrides for the Ray Regeneration tuning constants
+/// (`FfxApiConfigureDenoiserKey`, applied once at context creation through
+/// `ffxConfigureDescDenoiserKeyValue`). Every field is `None` by default,
+/// which configures NOTHING — a flagless session runs the provider's own
+/// defaults, exactly as it did before these levers existed. `max_radiance` is
+/// the firefly clamp, the one that matters most to a 1-spp path tracer.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct DenoiseTuning {
+    pub normal_strength: Option<f32>,
+    pub stability_bias: Option<f32>,
+    pub max_radiance: Option<f32>,
+    pub radiance_clip_k: Option<f32>,
+    pub kernel_relaxation: Option<f32>,
+    pub disocclusion_threshold: Option<f32>,
+}
+
+impl DenoiseTuning {
+    /// The (key, name, value) triples to configure — key ids straight from
+    /// `FfxApiConfigureDenoiserKey` in ffx_denoiser.h.
+    pub fn entries(&self) -> Vec<(u64, &'static str, f32)> {
+        [
+            (1u64, "cross-bilateral-normal-strength", self.normal_strength),
+            (2, "stability-bias", self.stability_bias),
+            (3, "max-radiance", self.max_radiance),
+            (4, "radiance-clip-std-k", self.radiance_clip_k),
+            (5, "gaussian-kernel-relaxation", self.kernel_relaxation),
+            (6, "disocclusion-threshold", self.disocclusion_threshold),
+        ]
+        .into_iter()
+        .filter_map(|(k, n, v)| v.map(|v| (k, n, v)))
+        .collect()
+    }
+
+    pub fn any(&self) -> bool {
+        !self.entries().is_empty()
     }
 }
 

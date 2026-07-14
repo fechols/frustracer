@@ -19,10 +19,10 @@ RWStructuredBuffer<float> accum : register(u0); // rw*rh*3 linear HDR (1-spp sto
 
 // Registers = trace.rs::NPPD_REG_BASE.. (NUM_UAVS + 2 + NUM_FEED) — keep the
 // literals in lockstep when the feed range grows.
-RWStructuredBuffer<float> nppd_frame  : register(u26);
-RWStructuredBuffer<float> nppd_state  : register(u27);
-RWStructuredBuffer<float> nppd_warped : register(u28);
-RWStructuredBuffer<float> nppd_out    : register(u29);
+RWStructuredBuffer<float> nppd_frame  : register(u28);
+RWStructuredBuffer<float> nppd_state  : register(u29);
+RWStructuredBuffer<float> nppd_warped : register(u30);
+RWStructuredBuffer<float> nppd_out    : register(u31);
 
 RWTexture2D<float4> nppd_feed_color : register(u16); // the XeSS color plane
 

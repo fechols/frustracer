@@ -23,6 +23,8 @@ RWTexture2D<float>  feed_spechit : register(u22); // R16F     spec hit distance 
 RWTexture2D<float4> feed_aux0    : register(u23); // RGBA16F  FSR-RR mvec (UV-delta RG + depth-delta B)
 RWTexture2D<float4> feed_aux1    : register(u24); // RGBA16F  FSR-RR demodulated direct diffuse
 RWTexture2D<float4> feed_aux2    : register(u25); // RGBA16F  FSR-RR demodulated direct specular
+RWTexture2D<float>  feed_aux3    : register(u26); // R16F     FSR-RR ambient-occlusion open fraction
+RWTexture2D<float4> feed_aux4    : register(u27); // RGBA16F  FSR-RR indirect specular (A = ray hit t)
 
 // xess.rs::view_z_to_clip_depth: linear view-Z -> [0,1] reversed-Z clip
 // depth. `precise` keeps DXC from FMA-contracting near*(far-z) — sky's
@@ -80,20 +82,9 @@ void cs_feed_rr(uint3 id : SV_DispatchThreadID) {
 #define FSR_DEPTH_SIGN 1.0
 #define FSR_MAT_TYPE   0.0
 
-// fsr::oct_encode — unit normal -> [0,1]^2 octahedral (RG of RGB10A2).
-float oct_sign_nz(float v) { return v >= 0.0 ? 1.0 : -1.0; }
-float2 oct_encode(float3 n) {
-    float inv = 1.0 / max(abs(n.x) + abs(n.y) + abs(n.z), 1e-12);
-    float u = n.x * inv;
-    float v = n.y * inv;
-    if (n.z < 0.0) {
-        float ou = u;
-        float ov = v;
-        u = (1.0 - abs(ov)) * oct_sign_nz(ou);
-        v = (1.0 - abs(ou)) * oct_sign_nz(ov);
-    }
-    return float2(u * 0.5 + 0.5, v * 0.5 + 0.5);
-}
+// oct_encode / oct_decode / oct_quant10 / wire_normal come from fsr_wire.hlsli,
+// which fsr_composite.hlsl pastes too — the two sides of the composite identity
+// must not each own a copy of the wire encoding.
 
 // The nine Ray Regeneration + FSR4 planes from pack + accum. The demodulated
 // signals ride the pack's f16 sig lanes (bit-preserved onto RGBA16F); the
@@ -112,8 +103,16 @@ void cs_feed_fsr_rr(uint3 id : SV_DispatchThreadID) {
                        f16tof32(g.sig.y & 0xffffu));
     float3 ds = float3(f16tof32(g.sig.y >> 16u), f16tof32(g.sig.z & 0xffffu),
                        f16tof32(g.sig.z >> 16u));
+    float ao = f16tof32(g.sig2.x & 0xffffu);
+    float3 is = float3(f16tof32(g.sig2.x >> 16u), f16tof32(g.sig2.y & 0xffffu),
+                       f16tof32(g.sig2.y >> 16u));
     feed_aux1[id.xy] = float4(dd, 0.0);
     feed_aux2[id.xy] = float4(ds, 0.0);
+    feed_aux3[id.xy] = ao;
+    // Indirect specular carries its ray hit distance in A (the signal's own
+    // channel layout) — the pack's spec_hit_t lane, same value RR's own
+    // spec-hit plane gets.
+    feed_aux4[id.xy] = float4(is, g.spec.w);
     // sqrt-encoded albedos; enc is exactly representable as n/255, so the
     // UNORM8 store round-trips to the same byte the wire factors assume.
     float3 kd_enc = float3(sqrt_enc8(g.alb_z.x), sqrt_enc8(g.alb_z.y), sqrt_enc8(g.alb_z.z));
@@ -123,13 +122,23 @@ void cs_feed_fsr_rr(uint3 id : SV_DispatchThreadID) {
     // Exact remainder — `precise` (no FMA re-association; the subtraction is
     // a near-cancellation of same-magnitude terms, so a fused multiply-add
     // would move the result by far more than its own size) and f16-saturated
-    // (an inf on the wire turns the composite into NaN).
+    // (an inf on the wire turns the composite into NaN). Every remodulated
+    // term comes off here, in fsr_composite.hlsl's exact set — the three
+    // sites' agreement IS the composite identity.
+    precise float3 kd_wire = kd_enc * kd_enc;
+    precise float3 f0_wire = f0_enc * f0_enc;
+    // The AO signal's remodulation factor is the sky's own SH irradiance, not a
+    // constant (the one sky — sky.rs), so it is DIRECTIONAL and must be built
+    // from the WIRE normal: fsr_composite.hlsl has only the plane bytes to
+    // rebuild it from. Quantize first, store exactly what we quantized.
+    float2 n_enc = oct_quant10(oct_encode(g.nr.xyz));
+    precise float3 amb = sh_irr(sky_sh, oct_decode(n_enc));
     precise float3 res = float3(accum[i3], accum[i3 + 1u], accum[i3 + 2u])
-        - dd * (kd_enc * kd_enc) - ds * (f0_enc * f0_enc);
+        - dd * kd_wire - ds * f0_wire - ao * amb * kd_wire - is * f0_wire;
     feed_color[id.xy] = float4(clamp(res, -65504.0, 65504.0), 0.0);
     // Octahedral normal + roughness + material type (RGB10A2; A's 2-bit
     // quantum holds FSR_MAT_TYPE's class, 0 = default).
-    feed_nr[id.xy] = float4(oct_encode(g.nr.xyz), g.nr.w, FSR_MAT_TYPE);
+    feed_nr[id.xy] = float4(n_enc, g.nr.w, FSR_MAT_TYPE);
     // Denoiser MVs: UV-delta RG (the pixel-space MV over the render dims),
     // linear-depth delta B from the pack's prev-Z lane (sky: far - far = 0).
     feed_aux0[id.xy] = float4(g.mv.x / float(rw), g.mv.y / float(rh),

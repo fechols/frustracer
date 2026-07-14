@@ -202,6 +202,44 @@ pub fn jitter_for(frame_idx: u32) -> (f32, f32) {
     (halton(n, 2) - 0.5, halton(n, 3) - 0.5)
 }
 
+/// Hard cap on `--spp`. Not a math limit — it is the size of the GPU constant
+/// buffer's jitter table (MAX_SPP × 8 B inside `FrameCb`, which must fit
+/// `CB_STRIDE`). Raising it is those two constants in lockstep; 128 already
+/// puts a 1080p frame in the seconds, and the returns are 1/√N (see the
+/// `--check` spp bench: the quadtree's fixed cost is fully amortized by
+/// ~8-16 spp, past which every sample pays full marginal price).
+pub const MAX_SPP: u32 = 128;
+
+/// Halton index stride between the samples of one multi-sampled frame.
+/// Coprime with JITTER_PHASE (72 = 8·9, so any odd non-multiple of 3 works),
+/// which is what keeps the extra samples spread across the whole phase
+/// instead of clustering on a coset of it.
+const SPP_STRIDE: u32 = 25;
+
+/// Sub-pixel offset for sample `k` of frame `frame_idx`, in [-0.5, 0.5).
+///
+/// `k == 0` IS the frame's reported jitter — `jitter_for` verbatim, so the
+/// sequence the upscalers see (and its 72-phase coverage, which the DRS ratio
+/// floors depend on) is untouched by multi-sampling, and spp == 1 stays
+/// bit-identical to a single-sample frame.
+///
+/// `k > 0` walks the SAME Halton sequence at a phase-coprime stride, but its
+/// index runs FREE — deliberately NOT reduced mod JITTER_PHASE. The phase
+/// bounds the sequence the *upscaler* sees; within one frame the samples must
+/// be distinct positions, and Halton is infinite, so `n` just keeps climbing
+/// (a wrap would make sample 72 land exactly on sample 0 at spp > 72 —
+/// supersampling the same point twice). Deterministic, low-discrepancy, inside
+/// the pixel footprint (so the tile-frustum/cut inheritance still covers it),
+/// and a pure function of (frame, k) — which is what lets `render::verify`
+/// reconstruct every extra sample's ray and gate it.
+pub fn jitter_for_sample(frame_idx: u32, k: u32) -> (f32, f32) {
+    if k == 0 {
+        return jitter_for(frame_idx);
+    }
+    let n = (frame_idx % JITTER_PHASE) + 1 + k * SPP_STRIDE;
+    (halton(n, 2) - 0.5, halton(n, 3) - 0.5)
+}
+
 /// Reporting values for the denoiser's projection matrices — the ray tracer
 /// has no clip planes. Single source for Constants and the sky-depth
 /// sentinel so they can never disagree. Note Scene::diag includes the ground
