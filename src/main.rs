@@ -290,10 +290,14 @@ pub struct Opts {
     pub pix_markers: bool,
     /// Directory holding WinPixEventRuntime.dll.
     pub pix_path: String,
-    /// D3D12 timestamp queries on the same scopes the PIX markers bracket, so
-    /// the app prints its own per-pass GPU breakdown with no external tool.
-    /// Vendor-neutral by construction — that is what makes a per-pass
-    /// AMD-vs-NVIDIA diff possible. Off = byte-identical command lists.
+    /// D3D12 timestamp queries around the PIX marker brackets, printed as a
+    /// per-region GPU-ms table (--gpu-timing; default off, zero-cost when
+    /// off — no query heap, no name allocation, byte-identical lists). The
+    /// vendor-neutral profiler, and vendor-neutrality is the whole point:
+    /// PIX's capture ANALYSIS only replays on AMD/NVIDIA, so on an Intel
+    /// adapter this is the only way to get per-pass GPU numbers at all — and
+    /// the per-pass AMD-vs-NVIDIA diff it makes possible is what found the
+    /// leaf kernel's wave64 bug.
     pub gpu_timing: bool,
     /// V-sync'd presentation (default on). `--no-vsync` presents at sync
     /// interval 0 on a tearing swapchain so interactive frame times measure
@@ -1030,15 +1034,11 @@ fn main() {
 
     // PIX command-list markers: opt-in, runtime-loaded; inert otherwise.
     gpu::pix::init(&opts.pix_path, opts.pix_markers);
-    // --gpu-timing is armed inside --check-gpu (the deterministic bench is
-    // where a per-pass number means something). Say so rather than leaving an
-    // asked-for flag silently inert.
-    if opts.gpu_timing && !check_gpu {
-        eprintln!(
-            "gpu-timing: --gpu-timing only reports under --check-gpu (its bench is the \
-             deterministic workload); ignored for this session."
-        );
-    }
+    // The same marker brackets, timed with D3D12 timestamp queries. No DLL,
+    // every vendor — the only per-pass GPU numbers available on Intel. Armed
+    // for interactive sessions (a table every REPORT_EVERY frames) AND for the
+    // headless suites, whose bench is the deterministic workload.
+    gpu::gputime::enable(opts.gpu_timing);
 
     // A/B lever: --no-cut-rays sends cut-seeded rays down the root traversal
     // instead. Every ray consumer funnels through intersect_multi/occluded_multi,
@@ -2891,9 +2891,6 @@ fn run_check_gpu(
         }
     };
     eprintln!("check-gpu: adapter \"{}\"", hg.adapter_name);
-    if let Err(e) = gpu::gputime::init(&hg.device, &hg.queue, opts.gpu_timing) {
-        eprintln!("check-gpu: --gpu-timing unavailable ({e}); per-pass timing off");
-    }
     let caps = match gpu::trace::require_caps(&hg.device) {
         Ok(c) => c,
         Err(e) => {
@@ -4916,9 +4913,7 @@ fn run_check_gpu(
     };
     let bbasis = cam0.basis(bw, bh);
     // --gpu-timing: the per-pass GPU breakdown of the LAST timed config, so
-    // any bench row can be asked "where did that go". Median over the timed
-    // frames (a GPU pass's wall time has a long right tail — a mean reports
-    // the tail, not the pass).
+    // any bench row can be asked "where did that go".
     // (RefCell: `timed` writes it and `bench` reads it, and both are closures
     // capturing the same local — a plain `&mut` capture in one would lock the
     // other out.)
@@ -4943,7 +4938,9 @@ fn run_check_gpu(
             btg.write_cb(0, &p);
             let _ = hg.run(|l| btg.record_frame(l, 0, &p, hybrid));
         }
-        let mut frames: Vec<Vec<gpu::gputime::PassTime>> = Vec::new();
+        // Discard whatever the correctness gates / warm frames left behind, so
+        // this row's table covers exactly this row's frames.
+        let _ = gpu::gputime::take_regions();
         let t0 = Instant::now();
         for f in 0..n {
             let p = gpu::trace::FrameParams {
@@ -4959,20 +4956,14 @@ fn run_check_gpu(
                 probe_sample: 0,
             };
             btg.write_cb(0, &p);
-            let _ = hg.run(|l| {
-                // Discard whatever the correctness gates / warm frames left
-                // behind, so this frame's spans are the only ones collected.
-                gpu::gputime::reset();
-                btg.record_frame(l, 0, &p, hybrid);
-                gpu::gputime::resolve(l);
-            });
-            // Safe to read: hg.run blocked on the fence.
-            if gpu::gputime::enabled() {
-                frames.push(gpu::gputime::collect());
-            }
+            let _ = hg.run(|l| btg.record_frame(l, 0, &p, hybrid));
         }
-        *passes.borrow_mut() = gpu::gputime::median_passes(&frames);
-        t0.elapsed().as_secs_f64() * 1000.0 / n as f64
+        let ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
+        // HeadlessGpu::run collects each frame's timestamps at the START of the
+        // next one, so the last frame is still pending here; take_regions drops
+        // it rather than letting it leak into the next row.
+        *passes.borrow_mut() = gpu::gputime::take_regions();
+        ms
     };
     let fb_off = shade::FrustumBounce::OFF;
     let mut bench = |label: &str, hybrid: bool, fb: shade::FrustumBounce, spp: u32| -> f64 {

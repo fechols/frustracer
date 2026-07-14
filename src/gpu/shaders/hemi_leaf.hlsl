@@ -40,9 +40,26 @@ void cs_hemi_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
         hemi_add(pt.pixel, 3, psa3(a, b, c, pt.n));
         // tmin soundness: a tmin=0 reference ray must not hit strictly
         // inside the claimed-empty ball (hemi.rs::verify_leaf_ray).
-        HitInfo vh;
-        if (trace_closest(pt.o, d, 0.0, FLT_MAX, vh) && vh.t < tc * (1.0 - 1e-3)) {
-            InterlockedAdd(counters[CTR_V_TMIN], 1, dummy);
+        //
+        // ONLY for a sample the integrand actually uses. Arvo sampling of a
+        // horizon-adjacent cell can land fp-epsilon BELOW the tangent plane;
+        // such a direction carries `weight == max(dot(d,n),0) == 0` and
+        // contributes literally nothing, and no claim was ever made about it
+        // — the hemi ROOT CUT *is* the tangent half-space, so the bound query
+        // proves things about the open hemisphere and nothing else. Traced
+        // from tmin=0 it grazes back down onto the apex's OWN surface (which
+        // sits at -eps) at t = eps/|d.n|, an artifact of the eps offset
+        // rather than occlusion, and at a grazing angle that t is huge:
+        // measured on Intel Arc, d.n = -4.31e-4 put the own ground plane at
+        // t = 39.36 inside a correctly-claimed empty ball of 57.26 (a "31%
+        // violation" that is really a zero-weight ray hitting the floor it
+        // stands on). NVIDIA/AMD round the sample the other way and never
+        // trip it, which is luck, not soundness — the guard is the invariant.
+        if (dot(d, pt.n) > 0.0) {
+            HitInfo vh;
+            if (trace_closest(pt.o, d, 0.0, FLT_MAX, vh) && vh.t < tc * (1.0 - 1e-3)) {
+                InterlockedAdd(counters[CTR_V_TMIN], 1, dummy);
+            }
         }
     }
 

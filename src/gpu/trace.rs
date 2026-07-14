@@ -579,7 +579,15 @@ impl HeadlessGpu {
     pub fn run<F: FnOnce(&ID3D12GraphicsCommandList)>(&mut self, f: F) -> Result<()> {
         unsafe { self.alloc.Reset() }.map_err(|e| format!("alloc Reset: {e}"))?;
         unsafe { self.list.Reset(&self.alloc, None) }.map_err(|e| format!("list Reset: {e}"))?;
+        // --gpu-timing: every run() blocks on the fence below, so the previous
+        // run's timestamps are complete by the time we get here — the same
+        // wait-then-collect the frame ring gives `D3d::begin_frame`, with one
+        // slot instead of FRAMES_IN_FLIGHT. Without this the headless suites
+        // (the deterministic workloads, and the only place a per-pass number
+        // means anything) would record no timings at all.
+        super::gputime::begin_frame(&self.device, &self.queue, 0);
         f(&self.list);
+        super::gputime::resolve(&self.list, 0);
         unsafe { self.list.Close() }.map_err(|e| format!("list Close: {e}"))?;
         let lists = [Some(self.list.cast::<ID3D12CommandList>().unwrap())];
         unsafe { self.queue.ExecuteCommandLists(&lists) };
@@ -2463,7 +2471,6 @@ impl TraceGpu {
     /// reference for the wavefront gates). Ends with a global UAV barrier.
     pub fn record_reference(&self, list: &ID3D12GraphicsCommandList, slot: usize) {
         let _ev = super::pix::scope(list, c"reference");
-        let _tm = super::gputime::scope(list, "reference");
         unsafe {
             self.bind_common(list, slot);
             list.SetPipelineState(&self.pso_reference);
@@ -2517,7 +2524,6 @@ impl TraceGpu {
     ) {
         let fb_mode = fb_mode_of(&p.q);
         let _ev = super::pix::scope(list, c"wavefront");
-        let _tm = super::gputime::scope(list, "wavefront");
         unsafe {
             self.bind_common(list, slot);
             // Seed sees level 0's queue arrangement (qin = A).
@@ -2540,7 +2546,6 @@ impl TraceGpu {
 
             for d in 0..self.depth_full {
                 let _ev = super::pix::scope_fmt(list, format_args!("level {d}"));
-                let _tm = super::gputime::scope(list, format!("level {d}"));
                 let (in_ctr, out_ctr) = if d % 2 == 0 {
                     (CTR_TILE_A, CTR_TILE_B)
                 } else {
@@ -2571,7 +2576,6 @@ impl TraceGpu {
             // Leaf + sky fills (disjoint pixels — no barrier between them).
             {
                 let _ev = super::pix::scope(list, c"leaf+sky");
-                let _tm = super::gputime::scope(list, "leaf+sky");
                 list.SetPipelineState(&self.pso_prep);
                 self.push(list, [CTR_LEAF, NO_RESET, 1, ARG_LEAF]);
                 list.Dispatch(1, 1, 1);
@@ -2607,7 +2611,6 @@ impl TraceGpu {
     /// dispatch zero groups. Caller must have bind_common'd already.
     fn record_hemi(&self, list: &ID3D12GraphicsCommandList, max_points: u32, fb_depth: u32) {
         let _ev = super::pix::scope(list, c"hemi");
-        let _tm = super::gputime::scope(list, "hemi");
         let n_batches = max_points.div_ceil(HEMI_BATCH);
         let levels = fb_depth.clamp(2, HEMI_MAX_DEPTH) - 1;
         unsafe {
@@ -2687,7 +2690,6 @@ impl TraceGpu {
     /// partial + ambW * ambient(H) -> accum (store-or-add): the single splat.
     fn record_compose(&self, list: &ID3D12GraphicsCommandList) {
         let _ev = super::pix::scope(list, c"compose");
-        let _tm = super::gputime::scope(list, "compose");
         unsafe {
             let groups = (self.rw * self.rh).div_ceil(256);
             list.SetPipelineState(&self.pso_compose);
@@ -2859,7 +2861,6 @@ impl TraceGpu {
     /// for the tonemap PS.
     pub fn record_resolve(&self, list: &ID3D12GraphicsCommandList, slot: usize, samples: u32) {
         let _ev = super::pix::scope(list, c"resolve");
-        let _tm = super::gputime::scope(list, "resolve");
         unsafe {
             list.ResourceBarrier(&[transition(
                 &self.hdr,
