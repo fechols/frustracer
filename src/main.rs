@@ -7,6 +7,7 @@ mod camera;
 mod dlss;
 // Signal split, wire encoders, and demodulation/composite math for FSR Ray
 // Regeneration — pure CPU, feeds --check-fsr; the GPU seam is gpu/ffx*.
+mod builders;
 mod fsr;
 mod frustum;
 mod ftree;
@@ -186,6 +187,10 @@ pub struct Opts {
     /// from benefit as wall-clock differences: (this − --no-temporal) =
     /// pure cost, (default − this) = gross benefit. Default off.
     pub discard_seeds: bool,
+    /// Deferred material-sorted shading (--defer-shade): plain-path leaf
+    /// tiles trace but defer shading; same-material runs merge up the
+    /// quadtree (≤ 64×64 px) and flush as single cache-coherent bursts.
+    pub defer_shade: bool,
     /// A/B lever (--no-hemi-share): disable the shared hemisphere capture
     /// in fb (H) frames — every shading point runs its own bounce tree.
     /// Default on.
@@ -228,12 +233,23 @@ pub struct Opts {
     /// than a hardcode so the axis change and the C_trav change stay separately
     /// attributable — they landed together.
     pub split_axes: usize,
-    /// A/B lever (--no-ftree disables): route hemi bound queries through the
+    /// The M7 bake-off lever (--bvh-builder sah|lbvh|ploc|som): which
+    /// algorithm builds the ray BVH. Every builder produces the same Bvh
+    /// (consumers/gates/.fcache unchanged); score on measured counters.
+    pub bvh_builder: String,
+    /// A/B lever (--no-ftree disables): route ALL bound queries through the
     /// 8-wide frustum tree lazily collapsed from the ray BVH (ftree.rs) — the
-    /// two-tree split's first consumer. Rays always stay on the binary BVH.
+    /// two-tree split. Rays always stay on the binary BVH.
     /// Default on: -15/-17% hemi-ao, -4/-8% hemi-gi (default scene + San
     /// Miguel), bounds bit-identical per the self-test.
     pub ftree: bool,
+    /// Per-consumer A/B lever (--ftree-tiles): the primary tile recursion
+    /// (tile_step/adopt_step bound queries + refines) on the wide tree, cuts
+    /// translated to binary ray roots once per leaf tile. Default OFF —
+    /// measured wall-neutral on San Miguel, ~10% slower on stress no-temporal
+    /// (see ftree::FTREE_TILES). Hemi keeps its own wiring; --no-ftree kills
+    /// both; --check verifies the wired path regardless (the wide-tiles gate).
+    pub ftree_tiles: bool,
     /// GPU-resident tracing (--gpu): the whole quadtree + shading runs in
     /// D3D12 compute with DXR RayQuery rays. Requires the DXC DLL drop and
     /// RT tier 1.1; falls back to the CPU path with a loud line otherwise.
@@ -347,6 +363,7 @@ fn main() {
         replay: true,
         adopt: true,
         discard_seeds: false,
+        defer_shade: false,
         hemi_share: true,
         cut_rays: true,
         cut_hemi: false,
@@ -361,7 +378,9 @@ fn main() {
         c_trav: 3.0,
         max_leaf: 8,
         split_axes: 3,
+        bvh_builder: "sah".to_string(),
         ftree: true,
+        ftree_tiles: false,
         gpu: false,
         dxr: true,
         dxc_path: std::env::var("FRUSTRACER_DXC_PATH").unwrap_or_else(|_| {
@@ -505,6 +524,31 @@ fn main() {
             "--no-replay" => opts.replay = false,
             "--no-adopt" => opts.adopt = false,
             "--discard-seeds" => opts.discard_seeds = true,
+            "--defer-shade" => opts.defer_shade = true,
+            // Before scene load by construction (the --bvh-ctrav knob
+            // pattern): no chains are built, every trilinear sample falls
+            // back to mip-0 bilinear — the pre-mip renderer exactly.
+            "--no-mips" => texture::set_mips(false),
+            // Same "knob before scene load" pattern: the GPU reads it for the
+            // static sampler's MaxAnisotropy, the CPU for Cone::aniso. 1 = off
+            // ⇒ the isotropic ray-cone lod path runs verbatim (bit-identical
+            // to the pre-aniso renderer). --no-mips forces it to 1 — mips are
+            // the prerequisite (texture::set_aniso).
+            "--no-aniso" => texture::set_aniso(1),
+            "--aniso" => {
+                let n: u32 = args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .filter(|&n| n >= 1 && n <= texture::MAX_ANISO_CAP)
+                    .unwrap_or_else(|| {
+                        eprintln!(
+                            "--aniso needs an integer in 1..={} (1 = off)",
+                            texture::MAX_ANISO_CAP
+                        );
+                        std::process::exit(2);
+                    });
+                texture::set_aniso(n);
+            }
             "--no-hemi-share" => opts.hemi_share = false,
             "--no-cut-rays" => opts.cut_rays = false,
             "--no-cut-hemi" => opts.cut_hemi = false,
@@ -530,6 +574,8 @@ fn main() {
             }
             "--ftree" => opts.ftree = true,
             "--no-ftree" => opts.ftree = false,
+            "--ftree-tiles" => opts.ftree_tiles = true,
+            "--no-ftree-tiles" => opts.ftree_tiles = false,
             "--bvh-axes" => {
                 opts.split_axes = args
                     .next()
@@ -539,6 +585,12 @@ fn main() {
                         eprintln!("--bvh-axes needs 1 (widest centroid axis) or 3 (all axes)");
                         std::process::exit(2);
                     });
+            }
+            "--bvh-builder" => {
+                opts.bvh_builder = args.next().unwrap_or_else(|| {
+                    eprintln!("--bvh-builder needs one of: sah | lbvh | ploc | som");
+                    std::process::exit(2);
+                });
             }
             "--spin" => {
                 spin = Some(args.next().unwrap_or_else(|| {
@@ -792,6 +844,10 @@ fn main() {
                 eprintln!("                visibility is per-pixel either way)");
                 eprintln!("  --no-hemi-share  disable the shared hemisphere capture in fb (H) frames — every");
                 eprintln!("                shading point runs its own bounce tree (A/B lever)");
+                eprintln!("  --no-mips     no texture mip chains; every trilinear sample degenerates to the");
+                eprintln!("                pre-mip bilinear (A/B lever; mips are on by default — implies --no-aniso)");
+                eprintln!("  --aniso N     max anisotropy for texture filtering, 1..=16 (default 16; 1 = off, i.e.");
+                eprintln!("                the isotropic ray-cone trilinear path verbatim). --no-aniso = --aniso 1");
                 eprintln!("  --lock-res    DLSS/XeSS render res: quality|balanced|performance|ultra-performance|native,");
                 eprintln!("                a ratio in (0, 1], or dynamic (the step-wise DRS controller); default quality (2/3)");
                 eprintln!("  --xess-path   XeSS DLL directory (default: SDKs\\XeSS-SDK\\bin)");
@@ -905,9 +961,19 @@ fn main() {
     bvh::set_c_trav(opts.c_trav);
     bvh::set_max_leaf(opts.max_leaf);
     bvh::set_split_axes(opts.split_axes);
+    if bvh::set_builder(&opts.bvh_builder).is_none() {
+        eprintln!("--bvh-builder: unknown builder '{}' (sah | lbvh | ploc | som)", opts.bvh_builder);
+        std::process::exit(2);
+    }
     if !opts.ftree {
         ftree::FTREE_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
-        eprintln!("ftree: --no-ftree — hemi bound queries stay on the binary BVH");
+        eprintln!("ftree: --no-ftree — all bound queries stay on the binary BVH");
+    }
+    // Tile recursion on the wide tree is opt-in (default off — the static's
+    // own default already matches, so only the opt-in stores).
+    if opts.ftree_tiles {
+        ftree::FTREE_TILES.store(true, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("ftree: --ftree-tiles — the tile recursion runs on the 8-wide frustum tree");
     }
 
     eprintln!("frustracer — loading scene...");
@@ -989,7 +1055,8 @@ fn main() {
     // SAH is always scored at the fixed reference C_trav so trees built at
     // different C_trav stay comparable on one scale.
     eprintln!(
-        "bvh quality (c_trav {} axes {} maxleaf {}): {}",
+        "bvh quality (builder {} c_trav {} axes {} maxleaf {}): {}",
+        opts.bvh_builder,
         opts.c_trav,
         opts.split_axes,
         opts.max_leaf,
@@ -1206,6 +1273,7 @@ fn run_check_dxr(
             cut_cur: None,
             cut_prev: None,
             discard_seeds: false,
+            defer_shade: false,
         };
         render::render_frame(&ctx, false);
     };
@@ -2707,6 +2775,7 @@ fn run_check_gpu(
             cut_cur: None,
             cut_prev: None,
             discard_seeds: false,
+            defer_shade: false,
         };
         render::render_frame(&ctx, false);
     };
@@ -3413,6 +3482,9 @@ fn run_check_gpu(
                             &hemi::BOUNCE_Q,
                             &mut rng,
                             sun,
+                            // Same bounce cone as hemi.rs's leaf shades — the
+                            // A/B needs both arms sampling textures alike.
+                            shade::Cone::bounce(),
                             1,
                             &mut vls,
                             None,
@@ -4459,6 +4531,7 @@ fn run_check_gpu(
                 cut_cur: None,
                 cut_prev: None,
                 discard_seeds: false,
+                defer_shade: false,
             };
             let t0 = Instant::now();
             render::render_frame(&ctx, true);
@@ -4831,6 +4904,7 @@ fn fsr_frame_check(
             cut_cur: None,
             cut_prev: None,
             discard_seeds: false,
+            defer_shade: false,
         };
         render::render_frame(&ctx, true);
     };
@@ -5094,6 +5168,7 @@ fn albedo_ab_check(
         cut_cur: None,
         cut_prev: None,
         discard_seeds: false,
+        defer_shade: false,
     };
     render::render_frame(&ctx, true);
 
@@ -5206,6 +5281,7 @@ fn mv_check_at(
                 cut_cur: None,
                 cut_prev: None,
                 discard_seeds: false,
+                defer_shade: false,
             };
             render::render_frame(&ctx, true);
         };
@@ -5670,6 +5746,7 @@ fn run_check_xess(
                     cut_cur: None,
                     cut_prev: None,
                     discard_seeds: false,
+                    defer_shade: false,
                 };
                 render::render_frame(&ctx, true);
             }
@@ -5911,6 +5988,7 @@ fn run_check_nppd(
             cut_cur: None,
             cut_prev: None,
             discard_seeds: false,
+            defer_shade: false,
         };
         render::render_frame(&ctx, true);
     };
@@ -6135,6 +6213,7 @@ fn run_check_oidn(
             cut_cur: None,
             cut_prev: None,
             discard_seeds: false,
+            defer_shade: false,
         };
         render::render_frame(&ctx, true);
     };
@@ -6284,6 +6363,7 @@ fn run_check_oidn(
             cut_cur: None,
             cut_prev: None,
             discard_seeds: false,
+            defer_shade: false,
         };
         match cap {
             Some(d) => render::render_frame_capped(&ctx, d),
@@ -6474,6 +6554,7 @@ fn run_check_oidn(
                 cut_cur: None,
                 cut_prev: None,
                 discard_seeds: false,
+                defer_shade: false,
             };
             render::render_frame(&ctx, true);
         }
@@ -6919,6 +7000,7 @@ fn run_spin(
             cut_cur,
             cut_prev,
             discard_seeds: opts.discard_seeds,
+            defer_shade: opts.defer_shade,
         };
         let t = Instant::now();
         if can_replay {
@@ -6969,6 +7051,12 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     let cam = cam0.basis(rw, rh);
     let q = Quality::preset(2);
     let stats = Stats::default();
+
+    // Mip-chain / trilinear / aniso gates: chain shape, linear-space
+    // filtering, sRGB roundtrip, level/lerp mechanics, the anisotropic tap
+    // mechanics, and the lod ≤ 0 bit-compat contract (magnified views
+    // identical to the pre-mip renderer).
+    let tex_ok = texture::self_test();
 
     // Spherical-cell math self-test — closed-form identities the hemisphere
     // bounce integrator is built on (Ω/PSA anchors, exact partition,
@@ -7097,6 +7185,23 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     eprintln!(
         "verify full-depth ({} px): false-sky {} | tmin-overshoot {} | hybrid-extra {} | max rel t err {:.2e}",
         rep.pixels, rep.false_sky, rep.overshoot, rep.hybrid_extra, rep.max_rel_err
+    );
+    // The wide-TILE wiring (tile_step/adopt_step dispatch, wide root_cut
+    // seeding, the once-per-leaf-tile slot-ref -> binary ray-root translation)
+    // defaults OFF — measured wall-neutral on San Miguel and ~10% SLOWER on
+    // the stress field's fat-cut/short-descent regime (the GPU-hemi lesson on
+    // CPU tiles; --ftree-tiles re-enables, the quantized-box work re-measures).
+    // So --check forces it ON for one full verify pass: the reference re-trace
+    // gates false-sky/tmin-overshoot through the whole translated path, which
+    // would otherwise rot while the lever is off. Restored so every later
+    // gate and bench row measures the session default.
+    let tiles_session = ftree::FTREE_TILES.load(Relaxed);
+    ftree::FTREE_TILES.store(true, Relaxed);
+    let rep_wt = render::verify(scene, bvh, &cam, q, rw, rh, &stats, None, &[], None);
+    ftree::FTREE_TILES.store(tiles_session, Relaxed);
+    eprintln!(
+        "verify wide-tiles ({} px): false-sky {} | tmin-overshoot {} | hybrid-extra {} | max rel t err {:.2e}",
+        rep_wt.pixels, rep_wt.false_sky, rep_wt.overshoot, rep_wt.hybrid_extra, rep_wt.max_rel_err
     );
     // The capped driver is the uncapped one with an extra depth check (a cap
     // past the leaf depth is bit-identical by construction), so verify it at a
@@ -7275,6 +7380,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                             &hemi::BOUNCE_Q,
                             &mut rng,
                             sun,
+                            shade::Cone::bounce(),
                             1,
                             &mut lsr,
                             None,
@@ -7786,6 +7892,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             cut_cur: None,
             cut_prev: None,
             discard_seeds: false,
+            defer_shade: false,
         };
         let t = Instant::now();
         for _ in 0..BENCH_FRAMES {
@@ -7880,6 +7987,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             cut_cur: None,
             cut_prev: None,
             discard_seeds: false,
+            defer_shade: false,
         };
         stats.clear();
         render::render_frame(&ctx_rec, true);
@@ -7958,6 +8066,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             cut_cur: None,
             cut_prev: None,
             discard_seeds: false,
+            defer_shade: false,
         };
         let t = Instant::now();
         render::render_frame_capped(&ctx, cap);
@@ -8006,6 +8115,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             cut_cur: Some(&cuts_a),
             cut_prev: None,
             discard_seeds: false,
+            defer_shade: false,
         };
         render::render_frame(&ctx, true);
     }
@@ -8111,6 +8221,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             cut_cur: None,
             cut_prev: None,
             discard_seeds: false,
+            defer_shade: false,
         };
         let t = Instant::now();
         render::render_frame(&ctx, true);
@@ -8174,6 +8285,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 cut_cur: None,
                 cut_prev: None,
                 discard_seeds: false,
+                defer_shade: false,
             };
             render::render_frame(&ctx, true);
         }
@@ -8236,6 +8348,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 cut_cur: None,
                 cut_prev: None,
                 discard_seeds: false,
+                defer_shade: false,
             };
             render::render_frame_replay(&ctx, &rcache);
             let (dt, di, da) = (
@@ -8284,6 +8397,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 cut_cur: None,
                 cut_prev: None,
                 discard_seeds: false,
+                defer_shade: false,
             };
             if fresh {
                 render::render_frame(&ctx, true);
@@ -8355,6 +8469,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 cut_cur: None,
                 cut_prev: None,
                 discard_seeds: false,
+                defer_shade: false,
             };
             let t = Instant::now();
             for _ in 0..BENCH_FRAMES {
@@ -8420,6 +8535,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 cut_cur: None,
                 cut_prev: None,
                 discard_seeds: false,
+                defer_shade: false,
             };
             render::render_frame(&ctx, true);
         }
@@ -8501,6 +8617,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 cut_cur: Some(&chain_cs[0]),
                 cut_prev: None,
                 discard_seeds: false,
+                defer_shade: false,
             };
             render::render_frame(&ctx, true);
         }
@@ -8541,6 +8658,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                     cut_cur: Some(&chain_cs[ci]),
                     cut_prev: Some(&chain_cs[pi]),
                     discard_seeds: false,
+                    defer_shade: false,
                 };
                 render::render_frame(&ctx, true);
             }
@@ -8612,6 +8730,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 cut_cur: None,
                 cut_prev: cuts_opt,
                 discard_seeds: false,
+                defer_shade: false,
             };
             // More frames than the other benches: the effect competes with
             // run-to-run noise at this frame time, and the kill criterion
@@ -8634,7 +8753,128 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
     }
 
+    // Deferred material-sorted shading (--defer-shade): a same-seed frame
+    // with deferral off vs on must be BIT-IDENTICAL — the records carry each
+    // pixel's rng stream and every accum/tbuf/info/G-buffer write is
+    // single-writer, so reordering shading may not change one bit. The
+    // off/on rows are the kill-criterion bench (the shaft precedent: the
+    // tiled shader earns a default only by measuring faster on a real
+    // textured scene). Scenes with no textured material skip — deferral
+    // structurally never engages there (the leaf probe shades inline).
+    let mut defer_ok = true;
+    if !scene.materials.iter().any(|m| m.any_tex()) {
+        eprintln!("defer gates: no textured materials — deferral never engages (skipped)");
+    } else {
+        let alloc3 = || (0..rw * rh * 3).map(|_| AtomicU32::new(0)).collect::<Vec<_>>();
+        let alloc1 = || (0..rw * rh).map(|_| AtomicU32::new(0)).collect::<Vec<_>>();
+        let bits_differ = |a: &[AtomicU32], b: &[AtomicU32]| {
+            a.iter().zip(b).filter(|(x, y)| x.load(Relaxed) != y.load(Relaxed)).count()
+        };
+        let (accum_a, info_a, tbuf_a) = (alloc3(), alloc1(), alloc1());
+        let (accum_b, info_b, tbuf_b) = (alloc3(), alloc1(), alloc1());
+        for (bufs, defer) in [
+            ((&accum_a, &info_a, &tbuf_a), false),
+            ((&accum_b, &info_b, &tbuf_b), true),
+        ] {
+            stats.clear();
+            let ctx = FrameCtx {
+                scene,
+                bvh,
+                cam,
+                q,
+                frame: 0,
+                jitter: false,
+                rw,
+                rh,
+                accum: bufs.0,
+                info: bufs.1,
+                tbuf: bufs.2,
+                stats: &stats,
+                sun: render::sun_dir(scene),
+                tcache_cur: None,
+                tcache_prev: &[],
+                accumulate: true,
+                gbuf: None,
+                fsr_buf: None,
+                prev_cam: None,
+                frame_jitter: None,
+                adaptive: false,
+                hemi_share: false,
+                replay_rec: None,
+                cut_cur: None,
+                cut_prev: None,
+                discard_seeds: false,
+                defer_shade: defer,
+            };
+            render::render_frame(&ctx, true);
+        }
+        let dpx = stats.defer_px.load(Relaxed);
+        let (dt, di, da) = (
+            bits_differ(&tbuf_a, &tbuf_b),
+            bits_differ(&info_a, &info_b),
+            bits_differ(&accum_a, &accum_b),
+        );
+        eprintln!("defer bit-identity: tbuf {dt} | info {di} | accum {da} px differ | deferred px {dpx}");
+        if dt + di + da > 0 {
+            defer_ok = false;
+        }
+        // A must-fire, so `structural` gates it like every other one: the
+        // scene having textured materials does not mean THIS VIEW contains
+        // any (a loaded OBJ at a custom --cam can legitimately see only the
+        // ground quad), and the bit-identity half above is the soundness
+        // signal that runs everywhere.
+        if structural && dpx == 0 {
+            eprintln!("defer: textured scene deferred 0 px — the path didn't fire");
+            defer_ok = false;
+        }
+        for (label, defer) in [("defer A/B (off)", false), ("defer A/B (on) ", true)] {
+            stats.clear();
+            let ctx = FrameCtx {
+                scene,
+                bvh,
+                cam,
+                q,
+                frame: 0,
+                jitter: false,
+                rw,
+                rh,
+                accum: &accum_a,
+                info: &info_a,
+                tbuf: &tbuf_a,
+                stats: &stats,
+                sun: render::sun_dir(scene),
+                tcache_cur: None,
+                tcache_prev: &[],
+                accumulate: true,
+                gbuf: None,
+                fsr_buf: None,
+                prev_cam: None,
+                frame_jitter: None,
+                adaptive: false,
+                hemi_share: false,
+                replay_rec: None,
+                cut_cur: None,
+                cut_prev: None,
+                discard_seeds: false,
+                defer_shade: defer,
+            };
+            const DEFER_BENCH_FRAMES: u32 = 24;
+            let t = Instant::now();
+            for _ in 0..DEFER_BENCH_FRAMES {
+                render::render_frame(&ctx, true);
+            }
+            eprintln!(
+                "{label}: {:5.2} ms | defer px {} flushes {} mixed {}",
+                t.elapsed().as_secs_f64() * 1000.0 / DEFER_BENCH_FRAMES as f64,
+                stats.defer_px.load(Relaxed) / DEFER_BENCH_FRAMES as u64,
+                stats.defer_flushes.load(Relaxed) / DEFER_BENCH_FRAMES as u64,
+                stats.defer_mixed.load(Relaxed) / DEFER_BENCH_FRAMES as u64,
+            );
+        }
+    }
+
     let gates = [
+        ("texture", tex_ok),
         ("sphcell", sph_ok),
         ("ftree", ftree_ok),
         ("reproject", reproj_ok),
@@ -8649,11 +8889,13 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         ("hemi-share", hemi_share_ok),
         ("shaft", shaft_ok),
         ("verify", rep.ok()),
+        ("wide-tiles", rep_wt.ok()),
         ("capped", capped_ok),
         ("temporal", temporal_ok),
         ("replay", replay_ok),
         ("ring", ring_ok),
         ("adopt", adopt_ok),
+        ("defer", defer_ok),
     ];
     let failed: Vec<&str> = gates.iter().filter(|(_, ok)| !ok).map(|(n, _)| *n).collect();
     if failed.is_empty() {
@@ -11039,6 +11281,7 @@ fn session(
                 cut_cur,
                 cut_prev,
                 discard_seeds: opts.discard_seeds,
+                defer_shade: opts.defer_shade,
             };
             let t = Instant::now();
             if can_replay {

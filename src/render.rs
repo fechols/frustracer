@@ -77,6 +77,14 @@ pub struct FrameCtx<'a> {
     /// consume its record — folded analytic empties plus per-leaf (tc, cut)
     /// seeds. Visibility stays per-pixel; every pixel shoots its own rays.
     pub hemi_share: bool,
+    /// Deferred material-sorted shading (--defer-shade, plain leaf path
+    /// only): leaf tiles trace their pixels but don't shade; runs whose every
+    /// pixel hit the SAME material merge up the quadtree (≤ DEFER_CAP px =
+    /// 64×64) and flush as single sequential bursts so one material's
+    /// textures stay cache-hot for the whole run. Bit-identical to the fused
+    /// path by construction: the per-pixel rng rides the record, and splat /
+    /// meta / G-buffer writes are single-writer and order-free.
+    pub defer_shade: bool,
     /// Structure recorder for static-frame replay: Some only on full-depth
     /// uncapped hybrid frames (main.rs gates it). trace_tile records every
     /// terminal (leaf rect + inherited t_start + cut, sky rect) so a later
@@ -127,7 +135,11 @@ impl FrameCtx<'_> {
 pub fn render_frame(ctx: &FrameCtx, hybrid: bool) {
     if hybrid {
         crate::zone!("trace-full");
-        trace_tile(ctx, 0, 0, ctx.rw, ctx.rh, 0.0, 0, 0, &[0], u32::MAX);
+        // Whole-tree root cut in the session's live id space (binary `[0]` or
+        // the wide root slots) — every cut below is refine output in the same
+        // space, translated back to binary ids only where a ray seeds.
+        let root = crate::ftree::Accel::for_tiles(ctx.bvh).root_cut();
+        flush_pend(ctx, trace_tile(ctx, 0, 0, ctx.rw, ctx.rh, 0.0, 0, 0, root, u32::MAX));
     } else {
         crate::zone!("trace-plain");
         // Plain per-pixel reference: the ground truth and the A/B baseline.
@@ -162,10 +174,14 @@ fn tile_step(
     ls: &mut LocalStats,
 ) -> TileStep {
     let f = ctx.cam.tile_frustum(x0, y0, x1, y1);
+    // The frustum structure: the 8-wide tree by default (the GPU tile
+    // kernels' measured-win regime, transplanted), binary under the
+    // --no-ftree(-tiles) levers. `visits` counts whichever tree's nodes.
+    let accel = crate::ftree::Accel::for_tiles(ctx.bvh);
     let mut visits = 0u64;
     ls.tiles += 1;
     ls.frustum_queries += 1;
-    let result = frustum::nearest_geometry_distance(ctx.bvh, &f, t_start, cut_in, &mut visits);
+    let result = accel.nearest_within(&f, t_start, f32::INFINITY, cut_in, &mut visits);
     let step = match result {
         None => TileStep::Sky,
         Some(t_safe) => {
@@ -178,7 +194,7 @@ fn tile_step(
                 ls.blocked_queries += 1;
             }
             let mut cut = [0u32; MAX_CUT];
-            let len = frustum::refine_cut(ctx.bvh, &f, tc, f32::INFINITY, cut_in, &mut cut, &mut visits, &mut ls.cut_overflows);
+            let len = accel.refine_cut(&f, tc, f32::INFINITY, cut_in, &mut cut, &mut visits, &mut ls.cut_overflows);
             ls.cut_len_sum += len as u64;
             TileStep::Split { tc, cut, len }
         }
@@ -203,17 +219,26 @@ fn trace_tile(
     path: u32,
     cut_in: &[u32],
     max_depth: u32,
-) {
+) -> TilePend {
     if x0 >= x1 || y0 >= y1 {
-        return;
+        return TilePend::Done;
     }
     let (w, h) = (x1 - x0, y1 - y0);
     if w <= LEAF_TILE && h <= LEAF_TILE {
         if let Some(rec) = ctx.replay_rec {
             rec.push_leaf(x0, y0, x1, y1, t_start, depth, cut_in);
         }
+        // Deferral replaces only the plain per-pixel branch; the adaptive and
+        // hemi-share cell machineries keep their own paths (and replay frames
+        // never come through here — they shade the recorded leaf list flat).
+        if ctx.defer_shade
+            && !ctx.adaptive
+            && !(ctx.hemi_share && (ctx.q.fb.ao || ctx.q.fb.gi))
+        {
+            return defer_leaf(ctx, x0, y0, x1, y1, t_start, depth, cut_in);
+        }
         shade_tile(ctx, x0, y0, x1, y1, t_start, depth, KIND_LEAF, cut_in);
-        return;
+        return TilePend::Done;
     }
     // After the leaf check, so a cap >= the leaf depth is exactly uncapped.
     // Sparse-fill uses the inherited cut and t_start — same as the split would.
@@ -229,7 +254,7 @@ fn trace_tile(
         let mut ls = LocalStats::default();
         sparse_fill(ctx, x0, y0, x1, y1, t_start, depth, cut_in, &mut ls);
         ctx.stats.add(&ls);
-        return;
+        return TilePend::Done;
     }
 
     let mut ls = LocalStats::default();
@@ -258,7 +283,7 @@ fn trace_tile(
                 ls.temporal_sky_tiles += 1;
                 ctx.stats.add(&ls);
                 fill_sky(ctx, x0, y0, x1, y1, depth);
-                return;
+                return TilePend::Done;
             }
             temporal::Seed::T(t) => {
                 if t > t0 {
@@ -311,6 +336,7 @@ fn trace_tile(
             }
             ctx.stats.add(&ls);
             fill_sky(ctx, x0, y0, x1, y1, depth);
+            TilePend::Done
         }
         TileStep::Split { tc, cut, len } => {
             if let Some(cur) = ctx.tcache_cur {
@@ -338,7 +364,7 @@ fn trace_tile(
             // temporal::rect_for_path, which replays these splits.
             let p = path << 2;
             if w.max(h) > SPAWN_MIN {
-                rayon::join(
+                let ((k0, k1), (k2, k3)) = rayon::join(
                     || {
                         rayon::join(
                             || trace_tile(ctx, x0, y0, xm, ym, tc, d, p, child, max_depth),
@@ -352,13 +378,283 @@ fn trace_tile(
                         )
                     },
                 );
+                merge_pend(ctx, [k0, k1, k2, k3])
             } else {
-                trace_tile(ctx, x0, y0, xm, ym, tc, d, p, child, max_depth);
-                trace_tile(ctx, xm, y0, x1, ym, tc, d, p | 1, child, max_depth);
-                trace_tile(ctx, x0, ym, xm, y1, tc, d, p | 2, child, max_depth);
-                trace_tile(ctx, xm, ym, x1, y1, tc, d, p | 3, child, max_depth);
+                let k0 = trace_tile(ctx, x0, y0, xm, ym, tc, d, p, child, max_depth);
+                let k1 = trace_tile(ctx, xm, y0, x1, ym, tc, d, p | 1, child, max_depth);
+                let k2 = trace_tile(ctx, x0, ym, xm, y1, tc, d, p | 2, child, max_depth);
+                let k3 = trace_tile(ctx, xm, ym, x1, y1, tc, d, p | 3, child, max_depth);
+                merge_pend(ctx, [k0, k1, k2, k3])
             }
         }
+    }
+}
+
+/// Deferred-shading bucket cap: a merged same-material run stops growing at
+/// 64×64 px. This is the MAXIMUM SHADING TILE — it bounds both the record
+/// memory in flight and the sequential burst a single flush shades, so a
+/// pathological case (the whole ground plane one material) becomes many
+/// 64×64 flushes stolen across the pool, never one core shading the screen.
+pub const DEFER_CAP: usize = 4096;
+
+/// One traced-but-unshaded pixel in a deferred segment — 48 B instead of
+/// buffering the whole `Traced` (~144 B): `dir` and `ray` are pure functions
+/// of (fx, fy) and the frame camera, so the flush reconstructs them
+/// bit-identically; only the rng STATE (advanced past any jitter draws) must
+/// be carried. `t_start`/`depth` ride per record because a merged run spans
+/// leaves with different inherited claims.
+struct DeferPx {
+    x: u16,
+    y: u16,
+    depth: u32,
+    fx: f32,
+    fy: f32,
+    t_start: f32,
+    /// `tri == u32::MAX` encodes a miss (only reachable through the
+    /// mixed-leaf inline path — deferred segments are all-hit by
+    /// construction).
+    hit: Hit,
+    rng: fastrand::Rng,
+}
+
+/// `trace_tile`'s return: `Done` = the subtree fully shaded (and splatted)
+/// itself; `Pend` = a list of single-material pixel segments (one per
+/// uniform leaf, in Z-order) whose shading is deferred upward. Ancestors
+/// merge by moving SEGMENT POINTERS only — records are written once at the
+/// leaf and read once at the flush; an early version that `append`ed record
+/// vectors up the chain re-copied every record per merge level (~GB/frame)
+/// and tripled the frame time.
+/// `#[must_use]` is load-bearing, not lint hygiene: a `Pend` holds the ONLY
+/// copy of its pixels' traced hits and rng state, so dropping one silently
+/// leaves that rect unshaded (stale/black) rather than crashing. Every
+/// recursion site must route its result to `merge_pend` or `flush_pend`.
+#[must_use]
+enum TilePend {
+    Done,
+    Pend { n: usize, segs: Vec<(u32, Vec<DeferPx>)> },
+}
+
+/// Deferred-shading leaf (--defer-shade, plain path only): trace every pixel
+/// now — visibility, rng streams and recorded structure identical to the
+/// fused path — and hand the records upward unshaded if all pixels hit ONE
+/// material. Mixed-material or sky-containing leaves shade inline from the
+/// already-traced records (the shade_cell trace-first precedent), which is
+/// bit-identical because each pixel's rng is self-contained in its Traced.
+fn defer_leaf(
+    ctx: &FrameCtx,
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+    t_start: f32,
+    depth: u32,
+    cut: &[u32],
+) -> TilePend {
+    let mut ls = LocalStats::default();
+    let w = x1 - x0;
+    // Slot-ref cut -> binary ray roots, once per leaf (the shade_tile /
+    // sparse_fill convention): this is the THIRD site where an inherited cut
+    // seeds primary rays, and deferred pixels are ordinary cut-seeded primary
+    // rays. Identity when the tile path runs binary.
+    let mut rbuf = [0u32; MAX_CUT];
+    let cut = crate::ftree::Accel::for_tiles(ctx.bvh).ray_roots(cut, &mut rbuf);
+    // Probe the first pixel: a deferrable leaf is uniform in ONE textured
+    // material, so a sky or untextured-material first hit already proves
+    // this leaf shades inline — take the fused trace+shade path with zero
+    // staging (the default scene must run at baseline speed).
+    let mut first = trace_primary(ctx, x0, y0, t_start, Some(cut), &mut ls, 0);
+    let mat = match &first.hit {
+        Some(h) => ctx.scene.tri_mat[h.tri as usize],
+        None => u32::MAX,
+    };
+    let deferrable = mat != u32::MAX && ctx.scene.materials[mat as usize].any_tex();
+    let shade_one = |i: usize, tr: &mut Traced, ls: &mut LocalStats| {
+        let (x, y) = (x0 + i % w, y0 + i / w);
+        shade_traced(ctx, x, y, t_start, depth, KIND_LEAF, tr, None, ls, true, true, shade::VisCtl::Off, None);
+    };
+    if !deferrable {
+        // Counted like any other inline-shaded leaf (`defer_mixed` is "shaded
+        // inline", not "mixed material") — otherwise a scene that defers
+        // nothing prints no `defer:` segment at all, which reads as "the flag
+        // did nothing" when it in fact tried and rejected every leaf.
+        ls.defer_mixed += 1;
+        shade_one(0, &mut first, &mut ls);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                if (x, y) != (x0, y0) {
+                    shade_pixel(ctx, x, y, t_start, depth, KIND_LEAF, Some(cut), &mut ls);
+                }
+            }
+        }
+        ctx.stats.add(&ls);
+        return TilePend::Done;
+    }
+    // Textured first hit: stage full Traced records (registers → one local
+    // Vec) while the leaf stays uniform; bail to direct shading on the first
+    // mismatch (no reconstruction — the staged Traced are shaded as-is).
+    let n = w * (y1 - y0);
+    let mut trs: Vec<Traced> = Vec::with_capacity(n);
+    trs.push(first);
+    let mut uniform = true;
+    'trace: for y in y0..y1 {
+        for x in x0..x1 {
+            if (x, y) == (x0, y0) {
+                continue;
+            }
+            let tr = trace_primary(ctx, x, y, t_start, Some(cut), &mut ls, 0);
+            let same = matches!(&tr.hit, Some(h) if ctx.scene.tri_mat[h.tri as usize] == mat);
+            trs.push(tr);
+            if !same {
+                uniform = false;
+                break 'trace;
+            }
+        }
+    }
+    if uniform {
+        ctx.stats.add(&ls);
+        let px: Vec<DeferPx> = trs
+            .into_iter()
+            .enumerate()
+            .map(|(i, tr)| DeferPx {
+                x: (x0 + i % w) as u16,
+                y: (y0 + i / w) as u16,
+                depth,
+                fx: tr.fx,
+                fy: tr.fy,
+                t_start,
+                hit: tr.hit.expect("uniform leaf is all-hit"),
+                rng: tr.rng,
+            })
+            .collect();
+        return TilePend::Pend { n, segs: vec![(mat, px)] };
+    }
+    // Mixed: shade what was staged, then finish the rest fused.
+    ls.defer_mixed += 1;
+    let staged = trs.len();
+    for (i, tr) in trs.iter_mut().enumerate() {
+        shade_one(i, tr, &mut ls);
+    }
+    for i in staged..n {
+        let (x, y) = (x0 + i % w, y0 + i / w);
+        shade_pixel(ctx, x, y, t_start, depth, KIND_LEAF, Some(cut), &mut ls);
+    }
+    ctx.stats.add(&ls);
+    TilePend::Done
+}
+
+/// Shade a run of deferred records in order. Exactly `shade_traced` per
+/// pixel — same rng stream, same meta/G-buffer/splat writes — just later:
+/// `dir`/`ray` are recomputed from (fx, fy), which is bit-identical because
+/// `ray_dir` and `Ray::new` are pure functions of the frame camera.
+fn shade_deferred(ctx: &FrameCtx, px: &mut [DeferPx], ls: &mut LocalStats) {
+    for p in px.iter_mut() {
+        let dir = ctx.cam.ray_dir(p.fx, p.fy);
+        let mut tr = Traced {
+            fx: p.fx,
+            fy: p.fy,
+            dir,
+            ray: Ray::new(ctx.cam.origin, dir),
+            hit: (p.hit.tri != u32::MAX).then_some(p.hit),
+            rng: p.rng.clone(),
+        };
+        shade_traced(
+            ctx,
+            p.x as usize,
+            p.y as usize,
+            p.t_start,
+            p.depth,
+            KIND_LEAF,
+            &mut tr,
+            None,
+            ls,
+            true,
+            true,
+            shade::VisCtl::Off,
+            None,
+        );
+    }
+}
+
+/// Sequential grain for shading a flushed bucket — matches the fused path's
+/// SPAWN_MIN subtree (32×32 px). Without this, a cap-size flush was a ~3 ms
+/// single-thread chunk on Sponza-class shading and the merge phase turned
+/// every 64×64 into an end-of-frame straggler (+29% measured).
+const DEFER_PAR: usize = 1024;
+
+/// Flush a pending macro-tile: STABLE-sort the segments by material (stable
+/// keeps the Z-order walk within each material group — texture UVs stay
+/// spatially coherent inside the group), then shade material by material,
+/// splitting the sorted segment list across rayon at DEFER_PAR grain — the
+/// material runs survive inside each half; only run boundaries land on a
+/// different core. This is the "tiled shader": one material's textures stay
+/// hot for its whole run instead of being evicted at every 8×8 boundary.
+fn flush_pend(ctx: &FrameCtx, pend: TilePend) {
+    if let TilePend::Pend { n, mut segs } = pend {
+        let mut ls = LocalStats::default();
+        ls.defer_flushes += 1;
+        ls.defer_px += n as u64;
+        ctx.stats.add(&ls);
+        segs.sort_by_key(|(mat, _)| *mat);
+        shade_segs(ctx, &mut segs, n);
+    }
+}
+
+fn shade_segs(ctx: &FrameCtx, segs: &mut [(u32, Vec<DeferPx>)], n: usize) {
+    if n > DEFER_PAR && segs.len() > 1 {
+        // Split at the pixel-count midpoint (whole segments — a segment is
+        // never torn, so its material run and Z-order stay intact).
+        let mut acc = 0usize;
+        let mut cut = 0usize;
+        for (i, s) in segs.iter().enumerate() {
+            acc += s.1.len();
+            if acc * 2 >= n {
+                cut = i + 1;
+                break;
+            }
+        }
+        if cut == 0 || cut >= segs.len() {
+            cut = segs.len() / 2;
+        }
+        let (a, b) = segs.split_at_mut(cut);
+        let na: usize = a.iter().map(|s| s.1.len()).sum();
+        rayon::join(|| shade_segs(ctx, a, na), || shade_segs(ctx, b, n - na));
+    } else {
+        let mut ls = LocalStats::default();
+        for (_, px) in segs.iter_mut() {
+            shade_deferred(ctx, px, &mut ls);
+        }
+        ctx.stats.add(&ls);
+    }
+}
+
+/// Merge four children's pends: while every child is still pending and the
+/// combined run fits the shading-tile cap, concatenate the SEGMENT LISTS
+/// (pointer moves, no record copies) — materials may differ; the flush
+/// sorts. Otherwise flush each pending child as its own ≤ DEFER_CAP unit.
+fn merge_pend(ctx: &FrameCtx, kids: [TilePend; 4]) -> TilePend {
+    let mergeable = kids.iter().all(|k| matches!(k, TilePend::Pend { .. }))
+        && kids
+            .iter()
+            .map(|k| match k {
+                TilePend::Pend { n, .. } => *n,
+                TilePend::Done => 0,
+            })
+            .sum::<usize>()
+            <= DEFER_CAP;
+    if mergeable {
+        let mut it = kids.into_iter();
+        let Some(TilePend::Pend { mut n, mut segs }) = it.next() else { unreachable!() };
+        for k in it {
+            let TilePend::Pend { n: kn, segs: mut ks } = k else { unreachable!() };
+            n += kn;
+            segs.append(&mut ks);
+        }
+        TilePend::Pend { n, segs }
+    } else {
+        for k in kids {
+            flush_pend(ctx, k);
+        }
+        TilePend::Done
     }
 }
 
@@ -398,7 +694,10 @@ fn adopt_step(
     ls.temporal_cut_adopts += 1;
     let mut visits = 0u64;
     let mut cut = [0u32; MAX_CUT];
-    let out = frustum::refine_cut(ctx.bvh, &f, t0, f32::INFINITY, input, &mut cut, &mut visits, &mut ls.cut_overflows);
+    // Same structure as tile_step — an adopted cut (this node's own previous
+    // refine output) is in the same id space, both levers being startup-set.
+    let accel = crate::ftree::Accel::for_tiles(ctx.bvh);
+    let out = accel.refine_cut(&f, t0, f32::INFINITY, input, &mut cut, &mut visits, &mut ls.cut_overflows);
     ls.frustum_nodes += visits;
     if out == 0 {
         ls.temporal_adopt_sky += 1;
@@ -421,6 +720,13 @@ fn shade_tile(
     cut: &[u32],
 ) {
     let mut ls = LocalStats::default();
+    // The inherited cut arrives in the frustum structure's id space (wide
+    // slot-refs by default). Primary rays seed from BINARY nodes, so map it
+    // ONCE per leaf tile — identity when the tile path runs binary. Every
+    // consumer below (per-pixel, adaptive cells, hemi-share cells, HOT
+    // top-ups, replayed leaves) sees only the translated roots.
+    let mut rbuf = [0u32; MAX_CUT];
+    let cut = crate::ftree::Accel::for_tiles(ctx.bvh).ray_roots(cut, &mut rbuf);
     // adaptive (XeSS) and fb never co-occur (fb is pinned OFF on upscaler
     // frames), so the two cell loops can share the branch without a tiebreak.
     debug_assert!(!(ctx.adaptive && (ctx.q.fb.ao || ctx.q.fb.gi)));
@@ -953,6 +1259,8 @@ fn shade_traced(
                 &ctx.q,
                 &mut tr.rng,
                 ctx.sun,
+                // Primary ray cone: apex at the camera, one-pixel spread.
+                shade::Cone::primary(&ctx.cam),
                 0,
                 ls,
                 if primary && ctx.gbuf.is_some() { Some(&mut prim) } else { None },
@@ -1024,7 +1332,11 @@ pub const MIN_BUDGET_DEPTH: u32 = 2;
 /// `render_frame(ctx, true)` (same code path, the cap never fires).
 pub fn render_frame_capped(ctx: &FrameCtx, max_depth: u32) {
     crate::zone!("trace-capped");
-    trace_tile(ctx, 0, 0, ctx.rw, ctx.rh, 0.0, 0, 0, &[0], max_depth.max(MIN_BUDGET_DEPTH));
+    let root = crate::ftree::Accel::for_tiles(ctx.bvh).root_cut();
+    flush_pend(
+        ctx,
+        trace_tile(ctx, 0, 0, ctx.rw, ctx.rh, 0.0, 0, 0, root, max_depth.max(MIN_BUDGET_DEPTH)),
+    );
 }
 
 /// Side length of the sparse-fill sample grid: each capped quad shoots one
@@ -1053,6 +1365,10 @@ fn sparse_fill(
     cut: &[u32],
     ls: &mut LocalStats,
 ) {
+    // Slot-ref cut -> binary ray roots, once per capped tile (the shade_tile
+    // convention — sparse samples are ordinary cut-seeded primary rays).
+    let mut rbuf = [0u32; MAX_CUT];
+    let cut = crate::ftree::Accel::for_tiles(ctx.bvh).ray_roots(cut, &mut rbuf);
     // Sample-position RNG: per-quad, per-frame (the old flat-fill seed recipe).
     let seed = (x0 as u64)
         .wrapping_mul(0x9E3779B97F4A7C15)
@@ -1321,6 +1637,7 @@ pub fn verify(
         cut_cur: None,
         cut_prev: temporal_cuts,
         discard_seeds: false,
+        defer_shade: false,
     };
     match max_depth {
         Some(d) => render_frame_capped(&ctx, d),

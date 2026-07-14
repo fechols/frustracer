@@ -153,16 +153,45 @@ void surface_point(float3 ro, float3 rd, HitInfo hit, out float3 p, out float3 n
     p = ro + rd * hit.t + n * SCENE_EPS;
 }
 
-// shade.rs::perturb_normal — tangent-space normal mapping with the tangent
-// derived on the fly from the triangle's positions + UVs (zero storage),
-// Gram-Schmidt vs n, bitangent handedness from the UV winding. Degenerate
-// UVs/tangent or a past-horizon perturbation degrade to n. The green channel
-// is negated (shade.rs::NORMAL_MAP_Y_SIGN): the loader V-flips at load, so
-// OpenGL-convention (+Y up) maps point against our +v rows.
-#define NORMAL_MAP_Y_SIGN (-1.0)
-float3 perturb_normal(HitInfo hit, float3 n, Mat mat, float2 uv) {
-    uint3 idx = uint3(indices[hit.tri * 3u], indices[hit.tri * 3u + 1u],
-                      indices[hit.tri * 3u + 2u]);
+// Ray-cone texture LOD base term — the term-for-term mirror of
+// shade.rs::tri_lod_base (change both together):
+//   0.5*log2(uv_area/world_area) + log2(cone_w) - log2(max(|n.d|, 0.05))
+// Each map completes it with its own dimension term (tex_lod below, the
+// Texture::lod_dims mirror). Degenerate UVs/triangles or a zero cone return
+// a large negative lod: SampleLevel clamps to level 0 = the exact old
+// bilinear (the magnification-compat contract). Pure hit-geometry ALU,
+// ZERO rng draws — the same-seed gates rely on that.
+float tex_lod_base(uint tri, float n_dot_d, float cone_w) {
+    uint3 idx = uint3(indices[tri * 3u], indices[tri * 3u + 1u], indices[tri * 3u + 2u]);
+    float3 p0 = positions[idx.x];
+    float3 e1 = positions[idx.y] - p0;
+    float3 e2 = positions[idx.z] - p0;
+    float wa = length(cross(e1, e2)); // 2x area — the 1/2 cancels in the ratio
+    float2 t0 = uv_buf[idx.x];
+    float2 d1 = uv_buf[idx.y] - t0;
+    float2 d2 = uv_buf[idx.z] - t0;
+    float ua = abs(d1.x * d2.y - d2.x * d1.y);
+    if (!(ua > 0.0) || !(wa > 0.0) || !(cone_w > 0.0)) return -1e30;
+    return 0.5 * log2(ua / wa) + log2(cone_w) - log2(max(n_dot_d, 0.05));
+}
+
+// Texture::lod_dims mirror: complete the base term for one map's dims.
+float tex_lod(uint ti, float lod_base) {
+    uint tw, th;
+    texs[NonUniformResourceIndex(ti)].GetDimensions(tw, th);
+    return lod_base + 0.5 * log2(float(tw * th));
+}
+
+// shade.rs::HEMI_CONE_SPREAD mirror — the cone spread hemi-GI bounce hits
+// shade with (octant-scale footprint; over-blur is variance reduction).
+#define HEMI_CONE_SPREAD 0.25
+
+// shade.rs::tri_uv_basis mirror: (dP/du, dP/dv) from the triangle's positions
+// + UVs, derived on the fly (zero storage). Called ONCE per lap by shade_split
+// and handed to BOTH consumers — the tangent frame (perturb_normal) and the
+// texture footprint (tri_grads_from) — same as on the CPU. Degenerate => false.
+bool tri_uv_basis(uint tri, out float3 tu, out float3 tv) {
+    uint3 idx = uint3(indices[tri * 3u], indices[tri * 3u + 1u], indices[tri * 3u + 2u]);
     float3 p0 = positions[idx.x];
     float3 e1 = positions[idx.y] - p0;
     float3 e2 = positions[idx.z] - p0;
@@ -170,13 +199,110 @@ float3 perturb_normal(HitInfo hit, float3 n, Mat mat, float2 uv) {
     float2 d1 = uv_buf[idx.y] - t0;
     float2 d2 = uv_buf[idx.z] - t0;
     float det = d1.x * d2.y - d2.x * d1.y;
-    if (abs(det) < 1e-12) return n;
-    float3 t = normalize_or_zero((e1 * d2.y - e2 * d1.y) / det - n * dot(n, (e1 * d2.y - e2 * d1.y) / det));
+    tu = 0.0;
+    tv = 0.0;
+    if (abs(det) < 1e-12) return false;
+    tu = (e1 * d2.y - e2 * d1.y) / det;
+    tv = (e2 * d1.x - e1 * d2.x) / det;
+    return true;
+}
+
+// shade.rs::tri_grads_from mirror (change both together): the ray cone's
+// ELLIPTICAL footprint at the hit, as two UV-space gradient vectors, against
+// an ALREADY-DERIVED UV basis (the caller derives it once and shares it with
+// perturb_normal — the triangle's two dP/d* consumers). The cone is a circle
+// of diameter cone_w perpendicular to d; projected along d onto the surface it
+// is cone_w across the direction of travel and cone_w / |n.d| along it — the
+// stretch tex_lod_base's -log2(max(|n.d|, 0.05)) term can only blur away.
+// Normalized-UV units, so one footprint serves every map on the material
+// (SampleGrad scales by each texture's own dims — the tex_lod_base / tex_lod
+// split in gradient form). Pure hit geometry, ZERO rng draws.
+bool tri_grads_from(float3 tu, float3 tv, float3 n, float3 d, float cone_w,
+                    out float2 gu, out float2 gv) {
+    gu = 0.0;
+    gv = 0.0;
+    if (!(cone_w > 0.0)) return false;
+    float den = dot(cross(tu, tv), n);
+    if (abs(den) < 1e-12) return false;
+    float n_d = dot(d, n);
+    float3 across = cross(n, d);
+    float3 a_dir, b_dir;
+    if (dot(across, across) > 1e-12) {
+        a_dir = normalize(across);              // across the direction of travel
+        b_dir = normalize_or_zero(d - n * n_d); // along it (the stretched axis)
+    } else {
+        // Normal incidence: the footprint is a circle — any in-plane
+        // orthonormal pair spans it.
+        a_dir = normalize_or_zero(tu - n * dot(n, tu));
+        if (all(a_dir == float3(0.0, 0.0, 0.0))) return false;
+        b_dir = cross(n, a_dir);
+    }
+    float3 w_min = a_dir * cone_w;
+    float3 w_maj = b_dir * (cone_w / max(abs(n_d), 0.05));
+    // Cramer against the UV basis: w = du*tu + dv*tv for in-plane w.
+    gu = float2(dot(cross(w_maj, tv), n), dot(cross(tu, w_maj), n)) / den;
+    gv = float2(dot(cross(w_min, tv), n), dot(cross(tu, w_min), n)) / den;
+    return true;
+}
+
+// How one hit's textures get filtered — the shade.rs::TexFilter mirror, built
+// once per lap and shared by all five maps on the material.
+struct TexFilt {
+    float  lod_base; // isotropic: the per-hit ray-cone lod term (-1e30 = mip 0)
+    float2 gu;       // anisotropic: the footprint's two axes, in UV units
+    float2 gv;
+    bool   aniso;
+};
+
+// The single texture-sampling choke point of the GPU shader (shade.rs's
+// TexFilter::sample). SampleGrad is what makes samp_aniso mean anything —
+// SampleLevel gives the TMU no gradients to be anisotropic about.
+float3 tex_sample(uint ti, float2 uv, TexFilt f) {
+    if (f.aniso) {
+        return texs[NonUniformResourceIndex(ti)].SampleGrad(samp_aniso, uv, f.gu, f.gv).rgb;
+    }
+    return texs[NonUniformResourceIndex(ti)].SampleLevel(samp_lin, uv, tex_lod(ti, f.lod_base)).rgb;
+}
+
+// The per-lap filter for a hit: the elliptical footprint when the session and
+// this ray both want it and the triangle's UV basis is sound, else the
+// isotropic ray-cone lod (coarser, never wrong). `aniso` is the RAY's
+// decision (hemi bounce laps pass false); FLAG_ANISO is the session's.
+// `has_basis`/(tu, tv) is the caller's ONE tri_uv_basis derivation, shared
+// with perturb_normal — mirrors the shade.rs factoring.
+TexFilt tex_filter(uint tri, float3 n, float3 rd, float cone_w, bool mat_tex, bool aniso,
+                   bool has_basis, float3 tu, float3 tv) {
+    TexFilt f;
+    f.lod_base = -1e30;
+    f.gu = 0.0;
+    f.gv = 0.0;
+    f.aniso = false;
+    if (!mat_tex) return f;
+    if (aniso && (flags & FLAG_ANISO) && has_basis &&
+        tri_grads_from(tu, tv, n, rd, cone_w, f.gu, f.gv)) {
+        f.aniso = true;
+        return f;
+    }
+    f.lod_base = tex_lod_base(tri, abs(dot(n, rd)), cone_w);
+    return f;
+}
+
+// shade.rs::perturb_normal — tangent-space normal mapping with the tangent
+// derived on the fly from the triangle's positions + UVs (zero storage),
+// Gram-Schmidt vs n, bitangent handedness from the UV winding. Degenerate
+// UVs/tangent or a past-horizon perturbation degrade to n. The green channel
+// is negated (shade.rs::NORMAL_MAP_Y_SIGN): the loader V-flips at load, so
+// OpenGL-convention (+Y up) maps point against our +v rows.
+// (t_raw, b_raw) is the caller's ONE tri_uv_basis derivation, shared with the
+// texture footprint (tri_grads_from) — a degenerate basis never reaches here.
+#define NORMAL_MAP_Y_SIGN (-1.0)
+float3 perturb_normal(float3 n, Mat mat, float2 uv, TexFilt filt,
+                      float3 t_raw, float3 b_raw) {
+    float3 t = normalize_or_zero(t_raw - n * dot(n, t_raw));
     if (all(t == float3(0.0, 0.0, 0.0))) return n;
-    float3 b_raw = (e2 * d1.x - e1 * d2.x) / det;
     float3 bx = cross(n, t);
     float3 b = bx * (dot(bx, b_raw) >= 0.0 ? 1.0 : -1.0);
-    float3 s = texs[NonUniformResourceIndex(mat.normal_tex)].SampleLevel(samp_lin, uv, 0.0).rgb;
+    float3 s = tex_sample(mat.normal_tex, uv, filt);
     float3 tn = float3((s.x * 2.0 - 1.0) * mat.normal_scale,
                        (s.y * 2.0 - 1.0) * mat.normal_scale * NORMAL_MAP_Y_SIGN,
                        max(s.z * 2.0 - 1.0, 0.05));
@@ -199,8 +325,12 @@ float3 perturb_normal(HitInfo hit, float3 n, Mat mat, float2 uv) {
 // `prim` is the PRIMARY surface capture (shade.rs::PrimarySurface, lap 0
 // only) for the G-buffer pack — a pure copy of already-computed values, so
 // exposing it adds NO rng draws (the same-seed A/B gates rely on that).
+// `aniso`: may THIS ray's footprint be resolved anisotropically (the CPU's
+// Cone::aniso > 1)? Primary/reflection/glass laps yes, hemi-GI bounce laps no
+// (their cone is octant-coarse by design). Gated by FLAG_ANISO on top.
 float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                    uint n_shadow, uint n_ao, bool refl, bool split_ambient,
+                   float cone_w0, float cone_spread, bool aniso,
                    out float3 amb_w, out float3 amb_o, out float3 amb_n,
                    out PrimSurf prim) {
     amb_w = 0.0;
@@ -209,6 +339,9 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
     prim = (PrimSurf)0;
     float3 total = 0.0;
     float3 tput = 1.0;
+    // Ray-cone origin width for the CURRENT lap's ray — advances to the
+    // hit's width at every continuation (the CPU recursion's Cone{w0}).
+    float cone_o = cone_w0;
     // Flattened-DFS state: `depth` is the CPU recursion depth of the surface
     // this lap shades; the one stash slot holds the root's transmission
     // child while the reflection subtree runs (only the root can have two
@@ -220,6 +353,7 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
     float3 st_o = 0.0, st_d = 0.0, st_tput = 0.0;
     HitInfo st_hit = (HitInfo)0;
     uint st_depth = 0u;
+    float st_cone = 0.0;
     // Is THIS lap inside the root's reflection subtree? Everything such a lap
     // adds to `total` is part of the CPU's `tput * rcol` — i.e. the
     // INDIRECT_SPECULAR signal — and the subtree is more than one lap: a
@@ -231,6 +365,22 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
         float3 p, n;
         surface_point(ro, rd, hit, p, n);
         Mat mat = materials[tri_mat[hit.tri]];
+        // Cone width at this hit + the per-hit lod base term shared by every
+        // map on this material (shade.rs's cone_w / lod_base pair).
+        float cone_w = cone_o + hit.t * cone_spread;
+        bool mat_tex = mat.kind == MAT_TEXTURED || mat.normal_tex != TEX_NONE ||
+                       mat.rough_tex != TEX_NONE || mat.metal_tex != TEX_NONE ||
+                       mat.emissive_tex != TEX_NONE;
+        // dP/du, dP/dv — derived at most ONCE per lap and shared by its two
+        // consumers, the anisotropic footprint and the tangent frame. Neither
+        // is reached without a texture, and the isotropic path with no normal
+        // map needs no basis at all (the shade.rs `uv_basis` factoring).
+        float3 tu = 0.0, tv = 0.0;
+        bool has_basis = false;
+        if (mat_tex && (aniso || mat.normal_tex != TEX_NONE)) {
+            has_basis = tri_uv_basis(hit.tri, tu, tv);
+        }
+        TexFilt filt = tex_filter(hit.tri, n, rd, cone_w, mat_tex, aniso, has_basis, tu, tv);
         // Albedo: the shade.rs match. A texture REPLACES Kd (exporters set
         // Kd = 1 alongside map_Kd); hardware bilinear + the SRGB SRV format
         // reproduce texture.rs::sample_bilinear (decode per texel, then
@@ -238,8 +388,7 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
         // statistical CPU-vs-GPU gates).
         float3 albedo =
             mat.kind == MAT_MARBLE   ? marble(ro + rd * hit.t, mat.scale)
-          : mat.kind == MAT_TEXTURED ? texs[NonUniformResourceIndex(mat.tex)]
-                .SampleLevel(samp_lin, tri_uv(hit.tri, hit.u, hit.v), 0.0).rgb
+          : mat.kind == MAT_TEXTURED ? tex_sample(mat.tex, tri_uv(hit.tri, hit.u, hit.v), filt)
           : mat.albedo;
         // Map-driven material terms — the shade.rs block, ZERO rng draws
         // (materials with every map at TEX_NONE run bit-identically to the
@@ -253,21 +402,21 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
         float rough_eff = mat.roughness;
         float metal_eff = mat.metallic;
         if (mat.rough_tex != TEX_NONE) {
-            rough_eff = clamp(rough_eff * texs[NonUniformResourceIndex(mat.rough_tex)]
-                                              .SampleLevel(samp_lin, map_uv, 0.0).g,
-                              0.02, 1.0);
+            rough_eff = clamp(rough_eff * tex_sample(mat.rough_tex, map_uv, filt).g, 0.02, 1.0);
         }
         if (mat.metal_tex != TEX_NONE) {
-            metal_eff = clamp(metal_eff * texs[NonUniformResourceIndex(mat.metal_tex)]
-                                              .SampleLevel(samp_lin, map_uv, 0.0).b,
-                              0.0, 1.0);
+            metal_eff = clamp(metal_eff * tex_sample(mat.metal_tex, map_uv, filt).b, 0.0, 1.0);
         }
         // Shading normal n_s (n_s == n when unmapped): the BRDF frame, N·L,
         // and the guide use it; n keeps the ray offsets, the translucency
         // back ray, the hemi handoff, and the glass chain — the shade.rs
         // n_g/n_s split.
+        // A degenerate UV basis is exactly the case perturb_normal used to
+        // bail on internally — no tangent frame, so n_s stays n.
         float3 n_s = n;
-        if (mat.normal_tex != TEX_NONE) n_s = perturb_normal(hit, n, mat, map_uv);
+        if (mat.normal_tex != TEX_NONE && has_basis) {
+            n_s = perturb_normal(n, mat, map_uv, filt, tu, tv);
+        }
         if (lap == 0u) {
             // shade.rs — spec_t stays 0 unless the lap-0 reflection below
             // traces (hit t / INF on miss).
@@ -415,8 +564,7 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
         if (any(mat.emissive != 0.0) || mat.emissive_tex != TEX_NONE) {
             float3 emis = mat.emissive;
             if (mat.emissive_tex != TEX_NONE) {
-                emis *= texs[NonUniformResourceIndex(mat.emissive_tex)]
-                            .SampleLevel(samp_lin, map_uv, 0.0).rgb;
+                emis *= tex_sample(mat.emissive_tex, map_uv, filt);
             }
             total += tput * emis;
             if (in_refl) prim.ind_s += tput * emis;
@@ -429,6 +577,9 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
         float3 nx_o = 0.0, nx_d = 0.0, nx_tput = 0.0;
         HitInfo nx_hit = (HitInfo)0;
         uint nx_depth = 0u;
+        // Both possible children originate at THIS hit: their cone starts at
+        // this lap's width (the CPU's Cone{w0: cone_w} recursion).
+        float nx_cone = cone_w;
         // A continuation inherits this lap's subtree unless the reflection
         // branch below sets it — that branch IS the root of the ind_s subtree.
         bool nx_in_refl = in_refl;
@@ -544,12 +695,15 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                         next_set = true;
                     } else {
                         // Root only: park the transmission child while the
-                        // reflection subtree runs (CPU DFS order).
+                        // reflection subtree runs (CPU DFS order). Its cone
+                        // origin is THIS hit's width — the reflection laps
+                        // must not advance it.
                         st_o = torig;
                         st_d = tdir;
                         st_hit = th;
                         st_tput = t_tput;
                         st_depth = depth + 1u;
+                        st_cone = cone_w;
                         st_in_refl = in_refl; // root's own chain: not ind_s
                         have_stash = true;
                     }
@@ -567,6 +721,7 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
             nx_hit = st_hit;
             nx_tput = st_tput;
             nx_depth = st_depth;
+            nx_cone = st_cone;
             nx_in_refl = st_in_refl;
             have_stash = false;
         }
@@ -578,14 +733,18 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
         hit = nx_hit;
         tput = nx_tput;
         depth = nx_depth;
+        cone_o = nx_cone;
         in_refl = nx_in_refl;
     }
     return total;
 }
 
-// The plain (non-hemi) entry: quality straight from the frame constants.
+// The plain (non-hemi) entry: quality straight from the frame constants;
+// the ray cone is the primary one (apex at the camera, one-pixel spread).
 float3 shade_full(float3 ro, float3 rd, HitInfo hit, inout uint rng, out PrimSurf prim) {
     float3 w, o, n;
+    // Camera rays (and their reflection/glass continuations) resolve their
+    // footprint anisotropically when the session asks for it — FLAG_ANISO.
     return shade_split(ro, rd, hit, rng, shadow_samples, ao_samples, reflections != 0u,
-                       false, w, o, n, prim);
+                       false, 0.0, pixel_cone, true, w, o, n, prim);
 }

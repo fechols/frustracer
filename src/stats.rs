@@ -83,6 +83,13 @@ pub struct Stats {
     /// recorded quadtree (zero frustum queries — see replay.rs).
     pub replay_leaf_tiles: AtomicU64,
     pub replay_sky_tiles: AtomicU64,
+    /// Deferred material-sorted shading (--defer-shade): pixels shaded
+    /// through merged same-material buckets, bucket flushes (mean bucket =
+    /// px/flushes), and leaves that shaded INLINE instead — sky, an untextured
+    /// material, or a mid-leaf material mismatch (`render::defer_leaf`).
+    pub defer_px: AtomicU64,
+    pub defer_flushes: AtomicU64,
+    pub defer_mixed: AtomicU64,
 }
 
 #[derive(Default)]
@@ -132,6 +139,9 @@ pub struct LocalStats {
     pub adapt_rays_saved: u64,
     pub replay_leaf_tiles: u64,
     pub replay_sky_tiles: u64,
+    pub defer_px: u64,
+    pub defer_flushes: u64,
+    pub defer_mixed: u64,
 }
 
 impl LocalStats {
@@ -183,6 +193,9 @@ impl LocalStats {
         self.adapt_rays_saved += o.adapt_rays_saved;
         self.replay_leaf_tiles += o.replay_leaf_tiles;
         self.replay_sky_tiles += o.replay_sky_tiles;
+        self.defer_px += o.defer_px;
+        self.defer_flushes += o.defer_flushes;
+        self.defer_mixed += o.defer_mixed;
     }
 }
 
@@ -233,6 +246,9 @@ impl Stats {
         self.adapt_rays_saved.store(0, Relaxed);
         self.replay_leaf_tiles.store(0, Relaxed);
         self.replay_sky_tiles.store(0, Relaxed);
+        self.defer_px.store(0, Relaxed);
+        self.defer_flushes.store(0, Relaxed);
+        self.defer_mixed.store(0, Relaxed);
     }
 
     pub fn add(&self, l: &LocalStats) {
@@ -371,6 +387,15 @@ impl Stats {
         if l.replay_sky_tiles > 0 {
             self.replay_sky_tiles.fetch_add(l.replay_sky_tiles, Relaxed);
         }
+        if l.defer_px > 0 {
+            self.defer_px.fetch_add(l.defer_px, Relaxed);
+        }
+        if l.defer_flushes > 0 {
+            self.defer_flushes.fetch_add(l.defer_flushes, Relaxed);
+        }
+        if l.defer_mixed > 0 {
+            self.defer_mixed.fetch_add(l.defer_mixed, Relaxed);
+        }
     }
 
     pub fn summary_line(&self) -> String {
@@ -475,8 +500,19 @@ impl Stats {
         } else {
             String::new()
         };
+        let dpx = self.defer_px.load(Relaxed);
+        let dmx = self.defer_mixed.load(Relaxed);
+        let defer = if dpx + dmx > 0 {
+            let df = self.defer_flushes.load(Relaxed);
+            format!(
+                " | defer: px {dpx} flushes {df} (mean {:.0}) mixed {dmx}",
+                if df > 0 { dpx as f64 / df as f64 } else { 0.0 },
+            )
+        } else {
+            String::new()
+        };
         format!(
-            "tiles {tiles} | fr-queries {fq} (blocked {blocked}) | cut mean {cut_mean:.1} (ovf {ovf}) | nodes: frustum {fnodes} + ray {rnodes} = {} | rays: {prim} prim + {sec} sec | sky-px (0 rays) {sky} | coarse-px {coarse} (smp {csmp}) | temporal: seeds {tseeds} sky {tsky} cells {ttests} | mean t_start/t_hit {skip:.2}{adopt}{tring}{replay}{hemi}{share}{shaft}{adapt}",
+            "tiles {tiles} | fr-queries {fq} (blocked {blocked}) | cut mean {cut_mean:.1} (ovf {ovf}) | nodes: frustum {fnodes} + ray {rnodes} = {} | rays: {prim} prim + {sec} sec | sky-px (0 rays) {sky} | coarse-px {coarse} (smp {csmp}) | temporal: seeds {tseeds} sky {tsky} cells {ttests} | mean t_start/t_hit {skip:.2}{adopt}{tring}{replay}{hemi}{share}{shaft}{adapt}{defer}",
             fnodes + rnodes
         )
     }

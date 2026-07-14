@@ -36,6 +36,11 @@
                                // signals in GBufPx.sig + the prev-camera
                                // view-Z in mv.z (zeros otherwise — RR/XeSS
                                // sessions keep their pack bytes unchanged)
+#define FLAG_ANISO        128u // anisotropic filtering on (--aniso > 1; a
+                               // SESSION constant from texture::max_aniso()).
+                               // WHICH laps use it is a call-site decision
+                               // (shade_split's `aniso` arg — hemi bounce
+                               // laps pass false), not this flag alone.
 
 cbuffer Frame : register(b0) {
     float4 cam_origin;   // xyz; w = inv_w
@@ -49,7 +54,9 @@ cbuffer Frame : register(b0) {
     float4 light_color;  // xyz (radiant intensity)
     uint rw; uint rh; uint frame; uint flags;
     uint shadow_samples; uint ao_samples; uint reflections; uint _pad0;
-    float2 frame_jitter; float _pad1; float _pad2;
+    // pixel_cone: primary ray-cone spread (CamBasis::pixel_cone verbatim,
+    // the trilinear texture LOD's single source — shade.hlsli::tex_lod_base).
+    float2 frame_jitter; float pixel_cone; float _pad2;
     // Wavefront queue capacities (resolution-derived, trace.rs computes them;
     // structural worst cases — the overflow counter is gated == 0).
     uint cap_tile; uint cap_leaf; uint cap_sky; uint cap_cut;
@@ -307,12 +314,21 @@ StructuredBuffer<uint>   uv_tri_mat : register(t2, space1); // material per tri
 // (the bvh.rs::moller_trumbore gate chain folded to one fetch).
 StructuredBuffer<uint>   mat_cutout : register(t3, space1);
 // R8G8B8A8 (_SRGB for color maps, _UNORM for linear-data normal/rough-metal
-// maps — Texture::srgb), 1 mip each (CPU-bilinear parity; no mip chain).
+// maps — Texture::srgb), carrying the FULL CPU-generated mip chain (built in
+// texture.rs::build_mips, uploaded verbatim — CPU-trilinear parity: both
+// samplers read identical texels at identical ray-cone lods).
 Texture2D<float4>        texs[]     : register(t4, space1);
-// Static: bilinear, repeat wrap, mip 0 — texture.rs::sample_bilinear in
-// hardware (sRGB decode per texel via the SRGB SRV format, texel centers at
-// i + 0.5). The cutout test below deliberately uses .Load instead.
+// Static: trilinear, repeat wrap — texture.rs::sample_trilinear in hardware
+// (sRGB decode per texel via the SRGB SRV format, texel centers at i + 0.5;
+// every sample passes an explicit ray-cone lod to SampleLevel, and lod <= 0
+// reads level 0 only = the old bilinear). The cutout test below deliberately
+// uses .Load instead — visibility never touches mips.
 SamplerState             samp_lin   : register(s0, space1);
+// Static: hardware anisotropic (MaxAnisotropy = the session's --aniso), fed
+// the elliptical footprint through SampleGrad — texture.rs::sample_aniso in
+// hardware. SampleLevel hands the TMU one scalar lod and no gradients, so an
+// aniso filter THERE would be a silent no-op: the gradients are the feature.
+SamplerState             samp_aniso : register(s1, space1);
 
 // texture.rs::wrap — repeat into [0,1], non-finite collapses to 0 (fp can
 // round c - floor(c) up to exactly 1.0 for c just below an integer; the

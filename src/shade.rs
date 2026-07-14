@@ -230,6 +230,192 @@ pub fn sky(d: Vec3A, sun: Vec3A) -> Vec3A {
     horizon.lerp(zenith, t) + glow
 }
 
+/// Ray-cone state for texture LOD (Möller 2019 ray cones, curvature-free):
+/// width at the ray origin plus per-unit-length spread — `width_at_hit =
+/// w0 + t·spread`. A zero cone drives every lod to −∞, which the trilinear
+/// samplers treat as mip-0 bilinear — bit-identical to the pre-mip renderer.
+/// Draws ZERO rng and is a pure function of the hit, so every same-seed /
+/// replay / VisCtl-burn contract is untouched.
+#[derive(Clone, Copy)]
+pub struct Cone {
+    pub w0: f32,
+    pub spread: f32,
+    /// Max anisotropy for footprints read through this cone (`1.0` = off ⇒
+    /// the isotropic `tri_lod_base` lod path runs verbatim, bit-identical to
+    /// the pre-aniso renderer). Primary/reflection/glass cones carry the
+    /// session's `texture::max_aniso()`; hemi-GI bounce cones pin 1.0 —
+    /// `HEMI_CONE_SPREAD` is octant-coarse on purpose and 16 taps per bounce
+    /// ray would buy nothing (over-blurred bounce albedo is variance
+    /// reduction). Mirrored on the GPU by FLAG_ANISO + shade_split's `aniso`.
+    pub aniso: f32,
+}
+
+impl Cone {
+    /// The primary camera cone: apex at the eye, one-pixel spread, resolved
+    /// anisotropically at whatever the session's `--aniso` asks for. The
+    /// GPU's twin is `leaf.hlsl`/`shade_full` passing (0, pixel_cone, true).
+    #[inline(always)]
+    pub fn primary(cam: &crate::camera::CamBasis) -> Cone {
+        Cone { w0: 0.0, spread: cam.pixel_cone(), aniso: crate::texture::max_aniso() }
+    }
+
+    /// The hemi-GI bounce cone: octant-scale and deliberately ISOTROPIC (see
+    /// `aniso`). `hemi_leaf.hlsl` passes (0, HEMI_CONE_SPREAD, false).
+    #[inline(always)]
+    pub fn bounce() -> Cone {
+        Cone { w0: 0.0, spread: HEMI_CONE_SPREAD, aniso: 1.0 }
+    }
+}
+
+/// How one hit's textures get filtered — the isotropic ray-cone lod, or the
+/// elliptical footprint. Built once per shaded hit and shared by all five
+/// maps on the material (`Lod` carries the per-hit base term, each map adding
+/// its own `Texture::lod_dims`; `Aniso` carries normalized-UV gradients, which
+/// every texture scales by its own dims). Mirrored by `shade.hlsli::tex_*`.
+#[derive(Clone, Copy)]
+pub enum TexFilter {
+    Lod(f32),
+    Aniso { gu: glam::Vec2, gv: glam::Vec2, max: f32 },
+}
+
+impl TexFilter {
+    /// The single texture-sampling choke point of the CPU shader.
+    #[inline]
+    pub fn sample(self, tx: &crate::texture::Texture, uv: glam::Vec2, srgb: bool) -> Vec3A {
+        match self {
+            TexFilter::Lod(base) => {
+                let lod = base + tx.lod_dims();
+                if srgb {
+                    tx.sample_trilinear(uv.x, uv.y, lod)
+                } else {
+                    tx.sample_trilinear_linear(uv.x, uv.y, lod)
+                }
+            }
+            TexFilter::Aniso { gu, gv, max } => tx.sample_aniso(uv.x, uv.y, gu, gv, max, srgb),
+        }
+    }
+}
+
+/// Cone spread for hemi-GI bounce hits: leaf cells are octant-scale, so the
+/// bounce albedo reads a matching broad footprint (over-blurred GI albedo is
+/// variance reduction, not error — coarser, never wrong). Mirrored in
+/// gpu/shaders/hemi_leaf.hlsl — change both together.
+pub const HEMI_CONE_SPREAD: f32 = 0.25;
+
+/// Ray-cone LOD base term, shared contract with the HLSL mirror
+/// `shade.hlsli::tex_lod_base` — change both together:
+/// `0.5·log2(uv_area/world_area) + log2(cone_width) − log2(max(|n·d|, 0.05))`
+/// (each map completes it with its own `Texture::lod_dims`). Computed on the
+/// fly from the triangle's vertices — the loads mirror `perturb_normal`'s,
+/// and a cached per-tri array would cost ~400 MB at 100M-tri tiling scale.
+/// Degenerate UVs/triangles or a zero cone return −∞ → mip-0 bilinear.
+pub fn tri_lod_base(scene: &Scene, tri: u32, n_dot_d: f32, cone_w: f32) -> f32 {
+    let [i0, i1, i2] = scene.indices[tri as usize];
+    let p0 = scene.positions[i0 as usize];
+    let e1 = scene.positions[i1 as usize] - p0;
+    let e2 = scene.positions[i2 as usize] - p0;
+    let wa = e1.cross(e2).length(); // 2× area — the ½ cancels in the ratio
+    let t0 = scene.texcoords[i0 as usize];
+    let d1 = scene.texcoords[i1 as usize] - t0;
+    let d2 = scene.texcoords[i2 as usize] - t0;
+    let ua = (d1.x * d2.y - d2.x * d1.y).abs();
+    if !(ua > 0.0) || !(wa > 0.0) || !(cone_w > 0.0) {
+        return f32::NEG_INFINITY;
+    }
+    0.5 * (ua / wa).log2() + cone_w.log2() - n_dot_d.max(0.05).log2()
+}
+
+/// The triangle's UV basis, derived on the fly from its positions + UVs:
+/// `(∂P/∂u, ∂P/∂v)`, both in the triangle's plane. Zero storage (a cached
+/// per-tri array would cost ~400 MB at 100M-tri tiling scale). Called ONCE per
+/// hit by `shade` and handed to BOTH consumers — the tangent frame
+/// (`perturb_normal`) and the texture footprint (`tri_grads_from`).
+/// Degenerate UVs (zero-area in UV space) ⇒ None.
+/// Mirrored by `shade.hlsli::tri_uv_basis`.
+fn tri_uv_basis(scene: &Scene, tri: u32) -> Option<(Vec3A, Vec3A)> {
+    let [i0, i1, i2] = scene.indices[tri as usize];
+    let p0 = scene.positions[i0 as usize];
+    let e1 = scene.positions[i1 as usize] - p0;
+    let e2 = scene.positions[i2 as usize] - p0;
+    let t0 = scene.texcoords[i0 as usize];
+    let d1 = scene.texcoords[i1 as usize] - t0;
+    let d2 = scene.texcoords[i2 as usize] - t0;
+    let det = d1.x * d2.y - d2.x * d1.y;
+    if det.abs() < 1e-12 {
+        return None;
+    }
+    Some(((e1 * d2.y - e2 * d1.y) / det, (e2 * d1.x - e1 * d2.x) / det))
+}
+
+/// The ray cone's texture footprint at a hit, as two UV-space gradient
+/// vectors — the ANISOTROPIC refinement of `tri_lod_base`.
+///
+/// The cone is a circle of diameter `cone_w` perpendicular to `d`; projected
+/// along `d` onto the surface it becomes an ellipse: `cone_w` across the
+/// direction of travel, `cone_w / |n·d|` along it. That stretch is exactly
+/// what `tri_lod_base`'s `− log2(max(|n·d|, 0.05))` term stands in for — one
+/// scalar lod can only describe a circle, so it takes the MAJOR axis and
+/// blurs the minor one with it. Here we keep both axes (same grazing clamp,
+/// so the major axis is unchanged) and let the sampler resolve the minor one.
+///
+/// Returned in NORMALIZED-UV units (Cramer's rule against the triangle's UV
+/// basis), so one footprint serves every map on the material — `SampleGrad`'s
+/// contract, and `Texture::sample_aniso` follows it. Pure hit geometry, ZERO
+/// rng draws (the same-seed / replay / VisCtl-burn gates rely on that).
+/// Degenerate UVs, a degenerate basis, or a zero cone ⇒ None ⇒ the caller
+/// falls back to the isotropic lod path. Mirrored by `shade.hlsli::tri_grads`.
+pub fn tri_grads(
+    scene: &Scene,
+    tri: u32,
+    n: Vec3A,
+    d: Vec3A,
+    cone_w: f32,
+) -> Option<(glam::Vec2, glam::Vec2)> {
+    tri_grads_from(tri_uv_basis(scene, tri)?, n, d, cone_w)
+}
+
+/// `tri_grads` against an ALREADY-DERIVED basis — the form `shade` calls, so
+/// the hit's `tri_uv_basis` is computed exactly once and shared with the
+/// tangent frame (`perturb_normal`) instead of each consumer re-fetching the
+/// triangle and re-inverting. Mirrored by `shade.hlsli::tri_grads_from`.
+fn tri_grads_from(
+    (tu, tv): (Vec3A, Vec3A),
+    n: Vec3A,
+    d: Vec3A,
+    cone_w: f32,
+) -> Option<(glam::Vec2, glam::Vec2)> {
+    if !(cone_w > 0.0) {
+        return None;
+    }
+    // In-plane inversion: for an in-plane w, w = du·tu + dv·tv, so Cramer
+    // against n gives du, dv. `den` is the basis' signed area — the same
+    // degeneracy `tri_uv_basis` already rejects, re-checked because n is the
+    // interpolated shading normal, not the exact face normal.
+    let den = tu.cross(tv).dot(n);
+    if den.abs() < 1e-12 {
+        return None;
+    }
+    let n_d = d.dot(n);
+    let across = n.cross(d);
+    let (a_dir, b_dir) = if across.length_squared() > 1e-12 {
+        // b: the direction of travel projected into the surface (the axis the
+        // grazing stretch acts along); a: across it.
+        (across.normalize(), (d - n * n_d).normalize_or_zero())
+    } else {
+        // Normal incidence — the footprint is a circle; any in-plane
+        // orthonormal pair spans it.
+        let t = (tu - n * n.dot(tu)).normalize_or_zero();
+        if t == Vec3A::ZERO {
+            return None;
+        }
+        (t, n.cross(t))
+    };
+    let w_min = a_dir * cone_w;
+    let w_maj = b_dir * (cone_w / n_d.abs().max(0.05));
+    let to_uv = |w: Vec3A| glam::Vec2::new(w.cross(tv).dot(n) / den, tu.cross(w).dot(n) / den);
+    Some((to_uv(w_maj), to_uv(w_min)))
+}
+
 /// Whitted-style shading. Secondary rays (shadow / AO / reflection) always use
 /// tmin ≈ 0 — the quadtree's inherited tmin is a primary-frustum property and
 /// must never leak in here.
@@ -243,6 +429,7 @@ pub fn shade(
     q: &Quality,
     rng: &mut fastrand::Rng,
     sun: Vec3A,
+    cone: Cone,
     depth: u32,
     ls: &mut LocalStats,
     mut prim: Option<&mut PrimarySurface>,
@@ -267,6 +454,34 @@ pub fn shade(
     // pay the triangle fetch + interpolation twice per pixel.
     let (p, n) = sp.unwrap_or_else(|| surface_point(scene, ray, hit));
     let mat = &scene.materials[scene.tri_mat[hit.tri as usize] as usize];
+    // Ray-cone texture LOD: cone width at the hit, then one per-hit base
+    // term shared by every map on this material (each adds its own
+    // dimension term at the sample). Untextured materials skip the
+    // triangle fetch entirely; a zero cone gives −∞ ⇒ mip-0 bilinear.
+    let cone_w = cone.w0 + hit.t * cone.spread;
+    let any_tex = mat.any_tex();
+    // ∂P/∂u, ∂P/∂v — derived at most ONCE per hit and shared by its two
+    // consumers, the anisotropic footprint below and the tangent frame in
+    // `perturb_normal`. Neither is reached without a texture, and the
+    // isotropic path with no normal map needs no basis at all.
+    let uv_basis = (any_tex && (cone.aniso > 1.0 || mat.normal_tex != NO_TEX))
+        .then(|| tri_uv_basis(scene, hit.tri))
+        .flatten();
+    let filt = if !any_tex {
+        TexFilter::Lod(f32::NEG_INFINITY)
+    } else {
+        // Anisotropic: the elliptical footprint, when the cone asks for it and
+        // the triangle's UV basis is sound. A degenerate basis falls through
+        // to the isotropic lod (coarser, never wrong).
+        match (cone.aniso > 1.0)
+            .then_some(uv_basis)
+            .flatten()
+            .and_then(|b| tri_grads_from(b, n, ray.d, cone_w))
+        {
+            Some((gu, gv)) => TexFilter::Aniso { gu, gv, max: cone.aniso },
+            None => TexFilter::Lod(tri_lod_base(scene, hit.tri, ray.d.dot(n).abs(), cone_w)),
+        }
+    };
     // Effective albedo: constant, except marble which is evaluated at the
     // world-space hit point (models are static, so world space is stable)
     // and textures, sampled at the hit's interpolated UV.
@@ -274,7 +489,7 @@ pub fn shade(
         MatKind::Marble { scale } => marble(ray.o + ray.d * hit.t, scale),
         MatKind::Textured { tex } => {
             let uv = scene.tri_uv(hit.tri, hit.u, hit.v);
-            scene.textures[tex as usize].sample_bilinear(uv.x, uv.y)
+            filt.sample(&scene.textures[tex as usize], uv, true)
         }
         _ => mat.albedo,
     };
@@ -298,11 +513,11 @@ pub fn shade(
     let mut metal_eff = mat.metallic;
     if let Some(uv) = map_uv {
         if mat.rough_tex != NO_TEX {
-            let s = scene.textures[mat.rough_tex as usize].sample_bilinear_linear(uv.x, uv.y);
+            let s = filt.sample(&scene.textures[mat.rough_tex as usize], uv, false);
             rough_eff = (rough_eff * s.y).clamp(0.02, 1.0);
         }
         if mat.metal_tex != NO_TEX {
-            let s = scene.textures[mat.metal_tex as usize].sample_bilinear_linear(uv.x, uv.y);
+            let s = filt.sample(&scene.textures[mat.metal_tex as usize], uv, false);
             metal_eff = (metal_eff * s.z).clamp(0.0, 1.0);
         }
     }
@@ -312,8 +527,10 @@ pub fn shade(
     // back ray, the ENTIRE hemi tier (a perturbed apex normal can put the
     // own triangle inside the "open" hemisphere ⇒ false-empty), and the
     // glass chain. n_s feeds the BRDF frame, N·L, and the G-buffer guide.
-    let n_s = match (mat.normal_tex != NO_TEX, map_uv) {
-        (true, Some(uv)) => perturb_normal(scene, hit, n, mat, uv),
+    // A degenerate UV basis (`uv_basis` None) is exactly the case the old
+    // in-function derivation bailed on — no tangent frame, so n_s stays n.
+    let n_s = match (mat.normal_tex != NO_TEX, map_uv, uv_basis) {
+        (true, Some(uv), Some(basis)) => perturb_normal(scene, n, mat, uv, filt, basis),
         _ => n,
     };
     if let Some(prim) = prim.as_deref_mut() {
@@ -631,8 +848,7 @@ pub fn shade(
     if mat.emissive != Vec3A::ZERO || mat.emissive_tex != NO_TEX {
         let e = match (mat.emissive_tex != NO_TEX, map_uv) {
             (true, Some(uv)) => {
-                mat.emissive
-                    * scene.textures[mat.emissive_tex as usize].sample_bilinear(uv.x, uv.y)
+                mat.emissive * filt.sample(&scene.textures[mat.emissive_tex as usize], uv, true)
             }
             _ => mat.emissive,
         };
@@ -688,7 +904,10 @@ pub fn shade(
                     // otherwise every glossy pixel would pay a second full
                     // hemisphere integration (and shaft build) at depth 1.
                     let rq = Quality { fb: FrustumBounce::OFF, ..*q };
-                    shade(scene, bvh, &rray, &rh, None, &rq, rng, sun, depth + 1, ls, None, VisCtl::Off, None)
+                    // The child cone starts at this hit's width — reflected
+                    // hits read footprints grown by the full path length.
+                    let rcone = Cone { w0: cone_w, spread: cone.spread, aniso: cone.aniso };
+                    shade(scene, bvh, &rray, &rh, None, &rq, rng, sun, rcone, depth + 1, ls, None, VisCtl::Off, None)
                 }
                 None => {
                     if let Some(prim) = prim.as_deref_mut() {
@@ -761,11 +980,12 @@ pub fn shade(
             let tray = Ray::new(torig, tdir);
             ls.secondary_rays += 1;
             let rq = Quality { fb: FrustumBounce::OFF, ..*q };
+            let tcone = Cone { w0: cone_w, spread: cone.spread, aniso: cone.aniso };
             let tcol =
                 match bvh.intersect(scene, &tray, 0.0, f32::INFINITY, &mut ls.ray_nodes) {
                     Some(th) => shade(
-                        scene, bvh, &tray, &th, None, &rq, rng, sun, depth + 1, ls, None,
-                        VisCtl::Off, None,
+                        scene, bvh, &tray, &th, None, &rq, rng, sun, tcone, depth + 1, ls,
+                        None, VisCtl::Off, None,
                     ),
                     None => sky(tdir, sun),
                 };
@@ -798,34 +1018,25 @@ const TRANS_MAX_DEPTH: u32 = 4;
 /// `tangent_self_test` and settled visually on San Miguel's railings.
 pub const NORMAL_MAP_Y_SIGN: f32 = -1.0;
 
+/// `basis` is the hit's `tri_uv_basis` — derived ONCE by the caller and shared
+/// with the texture footprint (`tri_grads_from`), the triangle's two `∂P/∂*`
+/// consumers. A degenerate basis never reaches here (the caller keeps n).
 fn perturb_normal(
     scene: &Scene,
-    hit: &Hit,
     n: Vec3A,
     mat: &crate::scene::Material,
     uv: glam::Vec2,
+    filt: TexFilter,
+    (t_raw, b_raw): (Vec3A, Vec3A),
 ) -> Vec3A {
-    let [i0, i1, i2] = scene.indices[hit.tri as usize];
-    let p0 = scene.positions[i0 as usize];
-    let e1 = scene.positions[i1 as usize] - p0;
-    let e2 = scene.positions[i2 as usize] - p0;
-    let t0 = scene.texcoords[i0 as usize];
-    let d1 = scene.texcoords[i1 as usize] - t0;
-    let d2 = scene.texcoords[i2 as usize] - t0;
-    let det = d1.x * d2.y - d2.x * d1.y;
-    if det.abs() < 1e-12 {
-        return n;
-    }
-    let t_raw = (e1 * d2.y - e2 * d1.y) / det;
     let t = (t_raw - n * n.dot(t_raw)).normalize_or_zero();
     if t == Vec3A::ZERO {
         return n;
     }
     // Bitangent: cross(n, t) signed to agree with the UV-derived bitangent
     // direction — mirrored UVs flip the frame's handedness exactly.
-    let b_raw = (e2 * d1.x - e1 * d2.x) / det;
     let b = n.cross(t) * n.cross(t).dot(b_raw).signum();
-    let s = scene.textures[mat.normal_tex as usize].sample_bilinear_linear(uv.x, uv.y);
+    let s = filt.sample(&scene.textures[mat.normal_tex as usize], uv, false);
     let tn = Vec3A::new(
         (s.x * 2.0 - 1.0) * mat.normal_scale,
         (s.y * 2.0 - 1.0) * mat.normal_scale * NORMAL_MAP_Y_SIGN,
@@ -872,6 +1083,7 @@ pub fn tangent_self_test() -> Result<(), String> {
                 alpha_masked: false,
                 srgb: false,
                 source: String::new(),
+                mips: Vec::new(),
             }],
             any_alpha: false,
             light: AreaLight {
@@ -889,9 +1101,20 @@ pub fn tangent_self_test() -> Result<(), String> {
     };
     let hit = Hit { t: 1.0, tri: 0, u: 0.25, v: 0.25 };
     let uv0 = [glam::Vec2::new(0.0, 0.0), glam::Vec2::new(1.0, 0.0), glam::Vec2::new(0.0, 1.0)];
+    // The `shade` caller's contract: no UV basis ⇒ no tangent frame ⇒ keep n.
     let perturb = |sc: &Scene| {
         let uv = sc.tri_uv(0, hit.u, hit.v);
-        perturb_normal(sc, &hit, Vec3A::Z, &sc.materials[0], uv)
+        match tri_uv_basis(sc, 0) {
+            Some(b) => perturb_normal(
+                sc,
+                Vec3A::Z,
+                &sc.materials[0],
+                uv,
+                TexFilter::Lod(f32::NEG_INFINITY),
+                b,
+            ),
+            None => Vec3A::Z,
+        }
     };
 
     // Flat map (128,128,255): near-identity (128/255 isn't exactly 0.5 — the
@@ -926,6 +1149,56 @@ pub fn tangent_self_test() -> Result<(), String> {
     let sc = tri_scene(uvz, [255, 128, 128, 255]);
     if perturb(&sc) != Vec3A::Z {
         return Err("degenerate UVs must skip the perturbation".into());
+    }
+
+    // --- tri_grads: the anisotropic footprint ------------------------------
+    // Canonical triangle (u along +X, v along +Y, unit scale — conformal),
+    // so the analytic answers are exact.
+    let sc = tri_scene(uv0, [128, 128, 255, 255]);
+    let n = Vec3A::Z;
+    let cw = 0.01f32;
+
+    // Normal incidence: the footprint is a CIRCLE — both axes = cone_w.
+    let Some((gu, gv)) = tri_grads(&sc, 0, n, -Vec3A::Z, cw) else {
+        return Err("tri_grads returned None at normal incidence".into());
+    };
+    if (gu.length() - cw).abs() > 1e-6 || (gv.length() - cw).abs() > 1e-6 {
+        return Err(format!("normal-incidence footprint not circular: {gu:?} {gv:?}"));
+    }
+
+    // Grazing: the major axis stretches by exactly 1/|n·d| — the anisotropy
+    // trilinear's `−log2(max(|n·d|, 0.05))` term can only blur away.
+    for deg in [30.0f32, 60.0, 80.0] {
+        let (s, c) = deg.to_radians().sin_cos();
+        let d = Vec3A::new(s, 0.0, -c);
+        let Some((gu, gv)) = tri_grads(&sc, 0, n, d, cw) else {
+            return Err(format!("tri_grads returned None at {deg}°"));
+        };
+        let (maj, min) = (gu.length().max(gv.length()), gu.length().min(gv.length()));
+        if (min - cw).abs() > 1e-6 || (maj - cw / c).abs() > 1e-5 {
+            return Err(format!("{deg}° footprint {min}×{maj}, want {cw}×{}", cw / c));
+        }
+        // The REDUCTION PIN: the major axis in texels IS today's isotropic
+        // lod. Aniso is a refinement of `tri_lod_base`, not a rival formula —
+        // if this drifts, the two paths have diverged and --no-aniso stops
+        // being a clean A/B.
+        let w = 256.0f32;
+        let want = tri_lod_base(&sc, 0, c, cw) + 0.5 * (w * w).log2();
+        if ((maj * w).log2() - want).abs() > 1e-4 {
+            return Err(format!(
+                "{deg}°: major-axis lod {} != tri_lod_base {want}",
+                (maj * w).log2()
+            ));
+        }
+    }
+
+    // Degenerate UVs / zero cone: no footprint — the caller falls back to the
+    // isotropic lod (coarser, never wrong).
+    if tri_grads(&tri_scene(uvz, [128, 128, 255, 255]), 0, n, -Vec3A::Z, cw).is_some() {
+        return Err("degenerate UVs must yield no footprint".into());
+    }
+    if tri_grads(&sc, 0, n, -Vec3A::Z, 0.0).is_some() {
+        return Err("a zero cone must yield no footprint".into());
     }
     Ok(())
 }

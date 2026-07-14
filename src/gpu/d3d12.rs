@@ -447,10 +447,16 @@ pub fn uav_barrier(res: Option<&ID3D12Resource>) -> D3D12_RESOURCE_BARRIER {
 /// Copy location for a texture subresource — either side of a
 /// CopyTextureRegion (upload dst, readback src).
 pub fn loc_subresource(res: &ID3D12Resource) -> D3D12_TEXTURE_COPY_LOCATION {
+    loc_subresource_mip(res, 0)
+}
+
+/// `loc_subresource` for an explicit mip level (scene-texture chains; every
+/// other texture in the renderer is single-mip).
+pub fn loc_subresource_mip(res: &ID3D12Resource, mip: u32) -> D3D12_TEXTURE_COPY_LOCATION {
     D3D12_TEXTURE_COPY_LOCATION {
         pResource: unsafe { std::mem::transmute_copy(res) },
         Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: mip },
     }
 }
 
@@ -542,18 +548,34 @@ pub fn committed_tex(
     flags: D3D12_RESOURCE_FLAGS,
     initial: D3D12_RESOURCE_STATES,
 ) -> Result<ID3D12Resource> {
+    committed_tex_mips(device, w, h, 1, format, flags, initial)
+}
+
+/// `committed_tex` with a mip chain (scene textures; every other texture
+/// stays single-mip through the wrapper above).
+pub fn committed_tex_mips(
+    device: &ID3D12Device,
+    w: u32,
+    h: u32,
+    mips: u16,
+    format: DXGI_FORMAT,
+    flags: D3D12_RESOURCE_FLAGS,
+    initial: D3D12_RESOURCE_STATES,
+) -> Result<ID3D12Resource> {
+    let mut desc = tex2d_desc(w, h, format, flags);
+    desc.MipLevels = mips;
     let mut res: Option<ID3D12Resource> = None;
     unsafe {
         device.CreateCommittedResource(
             &default_heap(),
             D3D12_HEAP_FLAG_NONE,
-            &tex2d_desc(w, h, format, flags),
+            &desc,
             initial,
             None,
             &mut res,
         )
     }
-    .map_err(|e| format!("CreateCommittedResource(tex {w}x{h} {format:?}): {e}"))?;
+    .map_err(|e| format!("CreateCommittedResource(tex {w}x{h} m{mips} {format:?}): {e}"))?;
     Ok(res.unwrap())
 }
 

@@ -132,6 +132,35 @@ pub fn encode_opaque(t: &Texture, q: Quality) -> Vec<u8> {
     )
 }
 
+/// Encode one MIP LEVEL of any dims. Levels below/off the 4-texel grid
+/// (2×2, 1×1, and odd intermediates of non-pow2 chains) are edge-replicate
+/// padded to whole blocks first — BC mips smaller than a block are legal
+/// (storage is block-aligned; the logical size stays small) and the padded
+/// texels are never sampled: the hardware clamps the filter footprint to
+/// the level's logical dims. `should_compress` still gates on the BASE dims
+/// only, unchanged.
+pub fn encode_level(w: u32, h: u32, texels: &[[u8; 4]], q: Quality) -> Vec<u8> {
+    if w % BLOCK == 0 && h % BLOCK == 0 {
+        return bc7::compress_blocks(
+            &q.settings(),
+            &RgbaSurface { data: texels.as_flattened(), width: w, height: h, stride: w * 4 },
+        );
+    }
+    let (pw, ph) = (blocks(w) * BLOCK, blocks(h) * BLOCK);
+    let mut padded: Vec<[u8; 4]> = Vec::with_capacity((pw * ph) as usize);
+    for y in 0..ph {
+        let sy = y.min(h - 1);
+        for x in 0..pw {
+            let sx = x.min(w - 1);
+            padded.push(texels[(sy * w + sx) as usize]);
+        }
+    }
+    bc7::compress_blocks(
+        &q.settings(),
+        &RgbaSurface { data: padded.as_flattened(), width: pw, height: ph, stride: pw * 4 },
+    )
+}
+
 /// The DXGI format a compressed `t` uploads as — the BC7 twin of the RGBA8
 /// `_SRGB` vs `_UNORM` choice in `SceneGpu::new_uploaded`, keyed on the same
 /// `Texture::srgb` role (color maps decode through the sRGB transfer in
@@ -165,6 +194,7 @@ pub fn self_test() -> Result<(), String> {
         alpha_masked: masked,
         srgb,
         source: String::new(),
+        mips: Vec::new(),
     };
 
     // should_compress IS the carve-out plus the spec guard. An alpha-masked

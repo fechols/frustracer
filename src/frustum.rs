@@ -177,18 +177,12 @@ fn point_aabb_max_dist(p: Vec3A, aabb: &Aabb) -> f32 {
 ///   over-cull near frustum corners and let child rays start past geometry.
 ///
 /// `roots` is the tile's inherited node cut — the parent's surviving BVH
-/// nodes from `refine_cut` (the whole-screen root passes `[0]`).
-pub fn nearest_geometry_distance(
-    bvh: &Bvh,
-    f: &TileFrustum,
-    t_start: f32,
-    roots: &[u32],
-    visits: &mut u64,
-) -> Option<f32> {
-    nearest_geometry_distance_within(bvh, f, t_start, f32::INFINITY, roots, visits)
-}
-
-/// `nearest_geometry_distance` clamped to a max distance of interest: only
+/// nodes from `refine_cut` (the whole-screen root passes `[0]`). The primary
+/// tile path calls this with `t_limit = INFINITY` (via `ftree::Accel`, which
+/// dispatches wide vs binary); the docs elsewhere still say
+/// "nearest_geometry_distance" for that unclamped shape.
+///
+/// The bound is clamped to a max distance of interest: only
 /// geometry strictly closer than `t_limit` is reported. `None` means
 /// "frustum ∩ (ball(t_limit) \ ball(t_start)) is empty" — it says NOTHING
 /// beyond `t_limit`, so a `None` may only be consumed as "open within

@@ -38,13 +38,18 @@ impl Camera {
         let right = forward.cross(Vec3A::Y).normalize();
         let up = right.cross(forward);
         let tan_half = (self.fov_y * 0.5).tan();
+        let up = up * tan_half;
+        let inv_h = 1.0 / h as f32;
         CamBasis {
             origin: self.pos,
             forward,
             right: right * (tan_half * w as f32 / h as f32),
-            up: up * tan_half,
+            up,
             inv_w: 1.0 / w as f32,
-            inv_h: 1.0 / h as f32,
+            inv_h,
+            // Derived once per frame, not per pixel: `shade_traced` builds the
+            // primary Cone for every shaded pixel and this is a sqrt.
+            pixel_cone: 2.0 * up.length() * inv_h,
         }
     }
 }
@@ -60,6 +65,9 @@ pub struct CamBasis {
     up: Vec3A,    // pre-scaled by tan(fov/2)
     inv_w: f32,
     inv_h: f32,
+    // A pure function of `up`/`inv_h` (see `pixel_cone`), so including it in
+    // the derived PartialEq changes no basis-equality decision.
+    pixel_cone: f32,
 }
 
 impl CamBasis {
@@ -76,6 +84,17 @@ impl CamBasis {
     /// these are its inputs, pre-scaled exactly as the CPU uses them.
     pub fn gpu_fields(&self) -> (Vec3A, Vec3A, Vec3A, Vec3A, f32, f32) {
         (self.origin, self.forward, self.right, self.up, self.inv_w, self.inv_h)
+    }
+
+    /// Angular size of one pixel at the screen center (radians) — the
+    /// primary ray-cone spread for texture LOD. `up` is pre-scaled by
+    /// tan(fov/2) against a unit forward, so one pixel step moves the
+    /// direction by 2·|up|·inv_h. Computed once in `Camera::basis` and stored;
+    /// the GPU tracer receives this exact value through FrameCb::pixel_cone
+    /// (single source, both samplers agree).
+    #[inline(always)]
+    pub fn pixel_cone(&self) -> f32 {
+        self.pixel_cone
     }
 
     /// Normalized ray direction through the continuous image point (fx, fy),

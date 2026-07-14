@@ -324,6 +324,7 @@ pub fn try_load(src_path: &str) -> Option<(Scene, Bvh)> {
                         alpha_masked: *masked,
                         srgb: *srgb,
                         source: path.clone(),
+                        mips: Vec::new(),
                     }
                 }
             }))

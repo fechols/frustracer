@@ -782,6 +782,12 @@ fn leaf_rays(
                     &BOUNCE_Q,
                     rng,
                     g.sun,
+                    // Bounce hits stay ISOTROPIC (aniso 1) at an octant-scale
+                    // spread: the cell footprint is coarse by design —
+                    // over-blurred bounce albedo is variance reduction, and 16
+                    // taps per GI ray would buy nothing. The GPU mirrors this
+                    // (hemi_leaf.hlsl: aniso false).
+                    shade::Cone::bounce(),
                     g.depth + 1,
                     ls,
                     None,
