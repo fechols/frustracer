@@ -290,6 +290,11 @@ pub struct Opts {
     pub pix_markers: bool,
     /// Directory holding WinPixEventRuntime.dll.
     pub pix_path: String,
+    /// D3D12 timestamp queries on the same scopes the PIX markers bracket, so
+    /// the app prints its own per-pass GPU breakdown with no external tool.
+    /// Vendor-neutral by construction — that is what makes a per-pass
+    /// AMD-vs-NVIDIA diff possible. Off = byte-identical command lists.
+    pub gpu_timing: bool,
     /// V-sync'd presentation (default on). `--no-vsync` presents at sync
     /// interval 0 on a tearing swapchain so interactive frame times measure
     /// the renderer, not the monitor refresh.
@@ -427,6 +432,7 @@ fn main() {
         pix_path: std::env::var("FRUSTRACER_PIX_PATH").unwrap_or_else(|_| {
             concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\pix\bin\x64").to_string()
         }),
+        gpu_timing: false,
         vsync: true,
         // scRGB is the default swapchain: see Opts::hdr. The 8-bit path survives
         // as --no-hdr and as the automatic fallback.
@@ -675,6 +681,7 @@ fn main() {
                 );
             }
             "--pix-markers" => opts.pix_markers = true,
+            "--gpu-timing" => opts.gpu_timing = true,
             "--pix-path" => {
                 opts.pix_path = args.next().unwrap_or_else(|| {
                     eprintln!("--pix-path needs a directory argument");
@@ -1023,6 +1030,15 @@ fn main() {
 
     // PIX command-list markers: opt-in, runtime-loaded; inert otherwise.
     gpu::pix::init(&opts.pix_path, opts.pix_markers);
+    // --gpu-timing is armed inside --check-gpu (the deterministic bench is
+    // where a per-pass number means something). Say so rather than leaving an
+    // asked-for flag silently inert.
+    if opts.gpu_timing && !check_gpu {
+        eprintln!(
+            "gpu-timing: --gpu-timing only reports under --check-gpu (its bench is the \
+             deterministic workload); ignored for this session."
+        );
+    }
 
     // A/B lever: --no-cut-rays sends cut-seeded rays down the root traversal
     // instead. Every ray consumer funnels through intersect_multi/occluded_multi,
@@ -2875,6 +2891,9 @@ fn run_check_gpu(
         }
     };
     eprintln!("check-gpu: adapter \"{}\"", hg.adapter_name);
+    if let Err(e) = gpu::gputime::init(&hg.device, &hg.queue, opts.gpu_timing) {
+        eprintln!("check-gpu: --gpu-timing unavailable ({e}); per-pass timing off");
+    }
     let caps = match gpu::trace::require_caps(&hg.device) {
         Ok(c) => c,
         Err(e) => {
@@ -4896,6 +4915,14 @@ fn run_check_gpu(
         }
     };
     let bbasis = cam0.basis(bw, bh);
+    // --gpu-timing: the per-pass GPU breakdown of the LAST timed config, so
+    // any bench row can be asked "where did that go". Median over the timed
+    // frames (a GPU pass's wall time has a long right tail — a mean reports
+    // the tail, not the pass).
+    // (RefCell: `timed` writes it and `bench` reads it, and both are closures
+    // capturing the same local — a plain `&mut` capture in one would lock the
+    // other out.)
+    let passes: std::cell::RefCell<Vec<(String, u32, f64)>> = std::cell::RefCell::new(Vec::new());
     let mut timed = |hybrid: bool, fb: shade::FrustumBounce, spp: u32| -> f64 {
         let bq = Quality { fb, ..q };
         let n = 60u32;
@@ -4916,6 +4943,7 @@ fn run_check_gpu(
             btg.write_cb(0, &p);
             let _ = hg.run(|l| btg.record_frame(l, 0, &p, hybrid));
         }
+        let mut frames: Vec<Vec<gpu::gputime::PassTime>> = Vec::new();
         let t0 = Instant::now();
         for f in 0..n {
             let p = gpu::trace::FrameParams {
@@ -4931,14 +4959,32 @@ fn run_check_gpu(
                 probe_sample: 0,
             };
             btg.write_cb(0, &p);
-            let _ = hg.run(|l| btg.record_frame(l, 0, &p, hybrid));
+            let _ = hg.run(|l| {
+                // Discard whatever the correctness gates / warm frames left
+                // behind, so this frame's spans are the only ones collected.
+                gpu::gputime::reset();
+                btg.record_frame(l, 0, &p, hybrid);
+                gpu::gputime::resolve(l);
+            });
+            // Safe to read: hg.run blocked on the fence.
+            if gpu::gputime::enabled() {
+                frames.push(gpu::gputime::collect());
+            }
         }
+        *passes.borrow_mut() = gpu::gputime::median_passes(&frames);
         t0.elapsed().as_secs_f64() * 1000.0 / n as f64
     };
     let fb_off = shade::FrustumBounce::OFF;
     let mut bench = |label: &str, hybrid: bool, fb: shade::FrustumBounce, spp: u32| -> f64 {
         let ms = timed(hybrid, fb, spp);
         eprintln!("check-gpu: bench {bw}x{bh} {label}: {ms:6.2} ms/frame");
+        for (name, depth, pms) in passes.borrow().iter() {
+            let pad = "  ".repeat(*depth as usize);
+            eprintln!(
+                "check-gpu:   gpu-time {pad}{name:<24} {pms:7.3} ms  ({:5.1}% of frame)",
+                100.0 * pms / ms.max(1e-9)
+            );
+        }
         ms
     };
     bench("gpu hybrid          ", true, fb_off, 1);
@@ -5004,6 +5050,23 @@ fn run_check_gpu(
         mp / p[0],
         mh / mp,
     );
+    // The cost model's `m` (per-sample) is a wall-clock difference, which on
+    // a submit-per-frame headless loop carries CPU overhead too. Under
+    // --gpu-timing, re-run the two ends of the sweep so the per-pass GPU
+    // breakdown says WHICH kernel the marginal sample is spent in.
+    if opts.gpu_timing {
+        for (label, hybrid) in [("gpu hybrid spp=16   ", true), ("gpu plain ref spp=16", false)] {
+            let ms = timed(hybrid, fb_off, 16);
+            eprintln!("check-gpu: bench {bw}x{bh} {label}: {ms:6.2} ms/frame");
+            for (name, depth, pms) in passes.borrow().iter() {
+                let pad = "  ".repeat(*depth as usize);
+                eprintln!(
+                    "check-gpu:   gpu-time {pad}{name:<24} {pms:7.3} ms  ({:5.1}% of frame)",
+                    100.0 * pms / ms.max(1e-9)
+                );
+            }
+        }
+    }
     {
         // CPU hybrid at the same resolution/quality for scale.
         let stats2 = Stats::default();

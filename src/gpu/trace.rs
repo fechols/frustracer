@@ -158,6 +158,34 @@ const HEMI_MAX_DEPTH: u32 = 4;
 // MAX_SPP-entry jitter table (--spp), which is what sets the size.
 pub(crate) const CB_STRIDE: usize = 1536;
 
+/// The leaf kernel's thread-group width — ONE WAVE on both vendors, and that
+/// is the whole point.
+///
+/// A leaf tile is not 8x8. `depth_full` is driven by the WIDER screen axis, so
+/// at 1920x1080 a leaf rect is 1920/2^8 = 7.5 by 1080/2^8 = 4.2 — about **32
+/// pixels**, never 64. The kernel used to dispatch 64 lanes per tile and let
+/// the surplus half return immediately, which is nearly free on a wave32 GPU
+/// (the all-idle second wave retires at once) and expensive on wave64, where
+/// those lanes sit in the SAME wave and waste half its RT throughput. That one
+/// mismatch was most of the AMD-vs-NVIDIA gap: per extra sample the leaf kernel
+/// cost 2.27x its own reference kernel on RDNA but only 1.24x on Ada, for
+/// identical work.
+///
+/// leaf.hlsl grid-strides over the tile's pixels, so this is a free knob.
+/// Measured (--gpu-timing, leaf+sky, 1080p; 64 -> 32):
+///   spp=1   AMD 1.63 -> 1.01 ms (-38%)   NVIDIA 2.24 -> 1.38 ms (-38%)
+///   spp=16  AMD 19.7 -> 11.4 ms (-42%)   NVIDIA 10.2 ->  7.6 ms (-25%)
+/// i.e. a win on BOTH vendors, not an AMD-specific hack — a 64-thread group
+/// reserves registers for 64 threads on Ada too, so halving it doubles the
+/// blocks in flight.
+///
+/// 32 is a floor, not a tuning parameter: RDNA's wave is 32 lanes MINIMUM, so
+/// a 16-wide group is a half-empty wave again (measured worse — 1.31 ms AMD).
+/// And it never loses at other resolutions: a tile larger than 32 px simply
+/// takes a second full lap, which is the same lane utilization a 64-wide group
+/// would have had.
+const LEAF_GROUP_DEF: &str = "#define LEAF_GROUP 32";
+
 /// Quadtree depth to the leaf frontier: smallest D with
 /// max(rw, rh) / 2^D <= LEAF_TILE (temporal.rs uses the same formula).
 pub fn depth_full(rw: u32, rh: u32) -> u32 {
@@ -1839,6 +1867,10 @@ pub struct TraceGpu {
     pso_level: ID3D12PipelineState,
     pso_sky: ID3D12PipelineState,
     pso_leaf: ID3D12PipelineState,
+    /// The same kernel with the hemi arm compiled IN — used only by fb frames
+    /// (H). See leaf.hlsl's LEAF_NO_FB note: keeping the two apart is what
+    /// keeps the common path's VGPR count (and so RDNA's occupancy) low.
+    pso_leaf_fb: ID3D12PipelineState,
     pso_clear_h: ID3D12PipelineState,
     pso_prep_batch: ID3D12PipelineState,
     pso_seed_probes: ID3D12PipelineState,
@@ -1949,17 +1981,29 @@ impl TraceGpu {
             WAVEFRONT_HLSL,
         ]
         .join("\n");
-        let leaf_src = [
-            defs,
-            sd,
-            TRACE_COMMON_HLSLI,
-            CTR_HLSLI,
-            QUEUES_HLSLI,
-            RT_HLSLI,
-            SHADE_HLSLI,
-            LEAF_HLSL,
-        ]
-        .join("\n");
+        // Two leaf kernels from the one source. `fb_mode` is a cbuffer value,
+        // so leaving the hemi arm as a runtime branch inlines shade_split at
+        // both call sites and the kernel's register allocation is the MAX of
+        // the two — which on RDNA costs occupancy (and therefore latency
+        // hiding) in every fb-OFF frame, i.e. essentially all of them.
+        // `LEAF_NO_FB` compiles that arm out; record_wavefront picks per frame.
+        let leaf_of = |extra: &str| {
+            [
+                LEAF_GROUP_DEF,
+                extra,
+                defs,
+                sd,
+                TRACE_COMMON_HLSLI,
+                CTR_HLSLI,
+                QUEUES_HLSLI,
+                RT_HLSLI,
+                SHADE_HLSLI,
+                LEAF_HLSL,
+            ]
+            .join("\n")
+        };
+        let leaf_src = leaf_of("#define LEAF_NO_FB 1");
+        let leaf_fb_src = leaf_of("");
         // Hemi kernels stay on the BINARY tree deliberately (no ft_defs):
         // hemi bound queries terminate in ~10 visits, where a wide pop's
         // unconditional 8 slot tests lose to the binary pop's 1 — measured
@@ -2000,6 +2044,7 @@ impl TraceGpu {
         let pso_level = pso(&wavefront_src, "cs_level", "level")?;
         let pso_sky = pso(&wavefront_src, "cs_sky", "sky")?;
         let pso_leaf = pso(&leaf_src, "cs_leaf", "leaf")?;
+        let pso_leaf_fb = pso(&leaf_fb_src, "cs_leaf", "leaf-fb")?;
         let pso_clear_h = pso(&wavefront_src, "cs_clear_h", "clear_h")?;
         let pso_prep_batch = pso(&wavefront_src, "cs_prep_batch", "prep_batch")?;
         let pso_seed_probes = pso(&wavefront_src, "cs_seed_probes", "seed_probes")?;
@@ -2235,6 +2280,7 @@ impl TraceGpu {
             pso_level,
             pso_sky,
             pso_leaf,
+            pso_leaf_fb,
             pso_clear_h,
             pso_prep_batch,
             pso_seed_probes,
@@ -2417,6 +2463,7 @@ impl TraceGpu {
     /// reference for the wavefront gates). Ends with a global UAV barrier.
     pub fn record_reference(&self, list: &ID3D12GraphicsCommandList, slot: usize) {
         let _ev = super::pix::scope(list, c"reference");
+        let _tm = super::gputime::scope(list, "reference");
         unsafe {
             self.bind_common(list, slot);
             list.SetPipelineState(&self.pso_reference);
@@ -2470,6 +2517,7 @@ impl TraceGpu {
     ) {
         let fb_mode = fb_mode_of(&p.q);
         let _ev = super::pix::scope(list, c"wavefront");
+        let _tm = super::gputime::scope(list, "wavefront");
         unsafe {
             self.bind_common(list, slot);
             // Seed sees level 0's queue arrangement (qin = A).
@@ -2492,6 +2540,7 @@ impl TraceGpu {
 
             for d in 0..self.depth_full {
                 let _ev = super::pix::scope_fmt(list, format_args!("level {d}"));
+                let _tm = super::gputime::scope(list, format!("level {d}"));
                 let (in_ctr, out_ctr) = if d % 2 == 0 {
                     (CTR_TILE_A, CTR_TILE_B)
                 } else {
@@ -2522,13 +2571,18 @@ impl TraceGpu {
             // Leaf + sky fills (disjoint pixels — no barrier between them).
             {
                 let _ev = super::pix::scope(list, c"leaf+sky");
+                let _tm = super::gputime::scope(list, "leaf+sky");
                 list.SetPipelineState(&self.pso_prep);
                 self.push(list, [CTR_LEAF, NO_RESET, 1, ARG_LEAF]);
                 list.Dispatch(1, 1, 1);
                 self.push(list, [CTR_SKY, NO_RESET, 1, ARG_SKY]);
                 list.Dispatch(1, 1, 1);
                 self.args_to_indirect(list);
-                list.SetPipelineState(&self.pso_leaf);
+                // fb frames need the hemi arm; every other frame takes the
+                // slim kernel (leaf.hlsl's LEAF_NO_FB).
+                let leaf_pso =
+                    if fb_mode > 0 { &self.pso_leaf_fb } else { &self.pso_leaf };
+                list.SetPipelineState(leaf_pso);
                 self.push(list, [CTR_LEAF, 0, 0, 0]);
                 list.ExecuteIndirect(&self.cmd_sig, 1, &self.args, ARG_LEAF as u64 * 12, None, 0);
                 list.SetPipelineState(&self.pso_sky);
@@ -2553,6 +2607,7 @@ impl TraceGpu {
     /// dispatch zero groups. Caller must have bind_common'd already.
     fn record_hemi(&self, list: &ID3D12GraphicsCommandList, max_points: u32, fb_depth: u32) {
         let _ev = super::pix::scope(list, c"hemi");
+        let _tm = super::gputime::scope(list, "hemi");
         let n_batches = max_points.div_ceil(HEMI_BATCH);
         let levels = fb_depth.clamp(2, HEMI_MAX_DEPTH) - 1;
         unsafe {
@@ -2632,6 +2687,7 @@ impl TraceGpu {
     /// partial + ambW * ambient(H) -> accum (store-or-add): the single splat.
     fn record_compose(&self, list: &ID3D12GraphicsCommandList) {
         let _ev = super::pix::scope(list, c"compose");
+        let _tm = super::gputime::scope(list, "compose");
         unsafe {
             let groups = (self.rw * self.rh).div_ceil(256);
             list.SetPipelineState(&self.pso_compose);
@@ -2803,6 +2859,7 @@ impl TraceGpu {
     /// for the tonemap PS.
     pub fn record_resolve(&self, list: &ID3D12GraphicsCommandList, slot: usize, samples: u32) {
         let _ev = super::pix::scope(list, c"resolve");
+        let _tm = super::gputime::scope(list, "resolve");
         unsafe {
             list.ResourceBarrier(&[transition(
                 &self.hdr,
