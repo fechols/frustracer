@@ -154,7 +154,9 @@ pub const HEMI_BATCH: u32 = 16384;
 /// Max fb.depth the hemi queue sizing supports (presets top out at 4).
 const HEMI_MAX_DEPTH: u32 = 4;
 
-pub(crate) const CB_STRIDE: usize = 512; // root-CBV alignment (FrameCb is 304 bytes)
+// Root-CBV alignment (256 B). FrameCb is 1344 bytes — 320 of struct plus the
+// MAX_SPP-entry jitter table (--spp), which is what sets the size.
+pub(crate) const CB_STRIDE: usize = 1536;
 
 /// Quadtree depth to the leaf frontier: smallest D with
 /// max(rw, rh) / 2^D <= LEAF_TILE (temporal.rs uses the same formula).
@@ -1500,6 +1502,20 @@ pub(crate) fn alpha_defs(scene: &Scene) -> &'static str {
     if scene.any_alpha { "#define ALPHA_CUTOUT 1" } else { "" }
 }
 
+/// HLSL prelude every compile unit takes: the `--spp` jitter table's row count
+/// (`FrameCb::jitters`, hand-mirrored in trace_common.hlsli's cbuffer). The
+/// SIZE is derived from `dlss::MAX_SPP` rather than written twice — a literal
+/// there would be a third constant to raise in lockstep, and a shader reading
+/// past a too-small array is silent (no gate can see it). Injected like
+/// ALPHA_CUTOUT / FTREE.
+pub(crate) fn spp_defs() -> String {
+    format!(
+        "#define MAX_SPP {}u\n#define JITTER_ROWS {}",
+        crate::dlss::MAX_SPP,
+        crate::dlss::MAX_SPP / 2
+    )
+}
+
 fn geometry_desc(
     positions: &ID3D12Resource,
     indices: &ID3D12Resource,
@@ -1613,10 +1629,21 @@ pub(crate) struct FrameCb {
     prev_forward: [f32; 4], // xyz; w = prev inv_h
     prev_right: [f32; 4],   // xyz; w = near
     prev_up: [f32; 4],      // xyz; w = far
+    // --spp: samples per pixel this frame, and which one writes the per-pixel
+    // side channels (tbuf/info/pack). See trace_common.hlsli.
+    spp: u32,
+    probe_sample: u32,
+    _pad4: u32,
+    _pad5: u32,
+    /// Sample offsets from `dlss::jitter_for_sample` (the ONE Halton source —
+    /// no radical-inverse port in HLSL), two per 16-byte row.
+    jitters: [[f32; 4]; (crate::dlss::MAX_SPP as usize) / 2],
 }
 // The HLSL cbuffer is hand-mirrored across 7 concatenated compile units —
 // a size drift here corrupts every field after the drift point.
-const _: () = assert!(std::mem::size_of::<FrameCb>() == 304);
+const _: () = assert!(std::mem::size_of::<FrameCb>() == 320 + 8 * crate::dlss::MAX_SPP as usize);
+// ...and the whole thing must still fit a CB ring slot.
+const _: () = assert!(std::mem::size_of::<FrameCb>() <= CB_STRIDE as usize);
 
 impl FrameCb {
     /// The scene-static base: sun/light/eps/ao_radius, near/far riding the
@@ -1663,6 +1690,11 @@ impl FrameCb {
             prev_forward: [0.0; 4],
             prev_right: [0.0, 0.0, 0.0, near],
             prev_up: [0.0, 0.0, 0.0, far],
+            spp: 1,
+            probe_sample: 0,
+            _pad4: 0,
+            _pad5: 0,
+            jitters: [[0.0; 4]; (crate::dlss::MAX_SPP as usize) / 2],
         }
     }
 
@@ -1694,6 +1726,17 @@ impl FrameCb {
         cb.pixel_cone = p.cam.pixel_cone();
         cb.fb_mode = fb_mode_of(&p.q);
         cb.fb_depth = p.q.fb.depth.clamp(1, HEMI_MAX_DEPTH);
+        // --spp. Pinned to 1 on fb frames, exactly like FrameCtx::spp(): the
+        // leaf pass appends one hemi point per PIXEL (cap_hemi_pt = rw*rh),
+        // and N hemispheres per pixel is the wrong way to converge a bounce.
+        cb.spp = if cb.fb_mode > 0 { 1 } else { p.spp.clamp(1, crate::dlss::MAX_SPP) };
+        cb.probe_sample = p.probe_sample.min(cb.spp - 1);
+        for k in 0..cb.spp {
+            let (x, y) = crate::dlss::jitter_for_sample(p.frame, k);
+            let (row, half) = ((k / 2) as usize, (k % 2) as usize * 2);
+            cb.jitters[row][half] = x;
+            cb.jitters[row][half + 1] = y;
+        }
         if let Some(pc) = &p.prev_cam {
             // The near/far riding the w slots of the last two rows come from
             // the base and must survive the overwrite.
@@ -1731,6 +1774,13 @@ pub struct FrameParams {
     pub q: Quality,
     /// Check builds: hemi claim re-validation + PSA accounting on the GPU.
     pub verify: bool,
+    /// --spp: primary samples per pixel this frame (1..=dlss::MAX_SPP; the CB
+    /// pins it to 1 when fb is on). The samples share the tile's inherited
+    /// t_start and average into one partial write — accum semantics unchanged.
+    pub spp: u32,
+    /// Which sample writes tbuf/info/the G-buffer pack. 0 in every real frame;
+    /// the check suites sweep it 0..spp so every sample's ray is gated.
+    pub probe_sample: u32,
 }
 
 /// Which upscaler the feed pass targets — selects the kernel (and thereby
@@ -1882,11 +1932,15 @@ impl TraceGpu {
         // at t0 in place of the binary nodes. --no-ftree keeps the binary path.
         let ftree_on = crate::ftree::FTREE_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
         let ft_defs = if ftree_on { "#define FTREE 1" } else { "" };
+        // The cbuffer's jitter-table size (--spp) — every unit sees the cbuffer.
+        let sd = spp_defs();
+        let sd = sd.as_str();
         let reference_src =
-            [defs, TRACE_COMMON_HLSLI, RT_HLSLI, SHADE_HLSLI, REFERENCE_HLSL].join("\n");
-        let resolve_src = [TRACE_COMMON_HLSLI, RESOLVE_HLSL].join("\n");
+            [defs, sd, TRACE_COMMON_HLSLI, RT_HLSLI, SHADE_HLSLI, REFERENCE_HLSL].join("\n");
+        let resolve_src = [sd, TRACE_COMMON_HLSLI, RESOLVE_HLSL].join("\n");
         let wavefront_src = [
             ft_defs,
+            sd,
             TRACE_COMMON_HLSLI,
             CTR_HLSLI,
             QUEUES_HLSLI,
@@ -1895,9 +1949,17 @@ impl TraceGpu {
             WAVEFRONT_HLSL,
         ]
         .join("\n");
-        let leaf_src =
-            [defs, TRACE_COMMON_HLSLI, CTR_HLSLI, QUEUES_HLSLI, RT_HLSLI, SHADE_HLSLI, LEAF_HLSL]
-                .join("\n");
+        let leaf_src = [
+            defs,
+            sd,
+            TRACE_COMMON_HLSLI,
+            CTR_HLSLI,
+            QUEUES_HLSLI,
+            RT_HLSLI,
+            SHADE_HLSLI,
+            LEAF_HLSL,
+        ]
+        .join("\n");
         // Hemi kernels stay on the BINARY tree deliberately (no ft_defs):
         // hemi bound queries terminate in ~10 visits, where a wide pop's
         // unconditional 8 slot tests lose to the binary pop's 1 — measured
@@ -1905,6 +1967,7 @@ impl TraceGpu {
         // the tile path. record_hemi rebinds the binary buffer at t0.
         let hemi_wave_src = [
             defs,
+            sd,
             TRACE_COMMON_HLSLI,
             CTR_HLSLI,
             HEMI_HLSLI,
@@ -1913,11 +1976,19 @@ impl TraceGpu {
             HEMI_WAVE_HLSL,
         ]
         .join("\n");
-        let hemi_leaf_src =
-            [defs, TRACE_COMMON_HLSLI, CTR_HLSLI, HEMI_HLSLI, RT_HLSLI, SHADE_HLSLI, HEMI_LEAF_HLSL]
-                .join("\n");
-        let compose_src = [TRACE_COMMON_HLSLI, CTR_HLSLI, QUEUES_HLSLI, COMPOSE_HLSL].join("\n");
-        let feed_src = [TRACE_COMMON_HLSLI, FEED_HLSL].join("\n");
+        let hemi_leaf_src = [
+            defs,
+            sd,
+            TRACE_COMMON_HLSLI,
+            CTR_HLSLI,
+            HEMI_HLSLI,
+            RT_HLSLI,
+            SHADE_HLSLI,
+            HEMI_LEAF_HLSL,
+        ]
+        .join("\n");
+        let compose_src = [sd, TRACE_COMMON_HLSLI, CTR_HLSLI, QUEUES_HLSLI, COMPOSE_HLSL].join("\n");
+        let feed_src = [sd, TRACE_COMMON_HLSLI, FEED_HLSL].join("\n");
         let pso = |src: &str, entry: &str, what: &str| -> Result<ID3D12PipelineState> {
             compute_pso(device, &root_sig, &dxc.compile(src, entry, "cs_6_5", what, debug)?, what)
         };
@@ -1949,7 +2020,7 @@ impl TraceGpu {
         };
         // NPPD staging kernels: only in --gpu --nppd (XeSS) sessions.
         let nppd_psos = if gbuf_full && nppd {
-            let nppd_src = [TRACE_COMMON_HLSLI, NPPD_HLSL].join("\n");
+            let nppd_src = [sd, TRACE_COMMON_HLSLI, NPPD_HLSL].join("\n");
             Some((
                 pso(&nppd_src, "cs_nppd_pack", "nppd_pack")?,
                 pso(&nppd_src, "cs_nppd_warp", "nppd_warp")?,

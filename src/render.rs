@@ -65,6 +65,19 @@ pub struct FrameCtx<'a> {
     /// Frame-uniform sub-pixel jitter offset in [-0.5, 0.5) (DLSS mode);
     /// None => the legacy per-pixel rng jitter controlled by `jitter`.
     pub frame_jitter: Option<(f32, f32)>,
+    /// Primary samples per pixel per frame (`--spp`, 1..=dlss::MAX_SPP).
+    /// Sample 0 is the frame's reported sample (today's position rule, today's
+    /// rng seed, the only one that writes tbuf/info/G-buffers); samples 1..spp
+    /// take `dlss::jitter_for_sample(frame, k)` inside the SAME pixel — hence
+    /// inside the tile frustum — and ride the inherited t_start/cut like any
+    /// leaf ray. The N colors are averaged and splatted ONCE, so a frame still
+    /// contributes exactly one sample of weight to `accum` and `resolve`'s
+    /// divisor stays a frame count.
+    pub spp: u32,
+    /// Which sample writes the per-pixel side channels (tbuf/info/G-buffers).
+    /// 0 in every real frame; `--check` sweeps it 0..spp so `verify` can gate
+    /// EVERY sample's ray against a tmin=0 reference, not just sample 0's.
+    pub primary_sample: u32,
     /// Adaptive shading rate (XeSS mode only): leaf tiles shade in 2×2 cells
     /// that share visibility rays where coherent and supersample where noisy.
     /// Visibility stays per-pixel regardless — tbuf/G-buffers are identical
@@ -109,6 +122,22 @@ pub struct FrameCtx<'a> {
 }
 
 impl FrameCtx<'_> {
+    /// Effective samples per pixel. Pinned to 1 on hemisphere-bounce (fb)
+    /// frames: the bounce integrator converges by frame accumulation (still
+    /// frames only), and N samples per pixel would mean N hemisphere trees per
+    /// pixel — N× the cost for an estimator that already has a cheaper
+    /// convergence path, plus N hemi points per pixel on the GPU (which would
+    /// blow `cap_hemi_pt` and the hemi accounting gates). Upscaler frames pin
+    /// fb OFF anyway, so this costs nothing on the path multi-sampling is for.
+    #[inline(always)]
+    fn spp(&self) -> u32 {
+        if self.q.fb.ao || self.q.fb.gi {
+            1
+        } else {
+            self.spp.max(1)
+        }
+    }
+
     #[inline(always)]
     fn splat(&self, x: usize, y: usize, c: Vec3A) {
         let i = (y * self.rw + x) * 3;
@@ -231,7 +260,12 @@ fn trace_tile(
         // Deferral replaces only the plain per-pixel branch; the adaptive and
         // hemi-share cell machineries keep their own paths (and replay frames
         // never come through here — they shade the recorded leaf list flat).
+        // (--spp stays on the fused path: a deferred leaf stages ONE Traced per
+        // pixel, so deferring a multi-sampled tile would silently drop every
+        // sample but the first. The two levers compose by the fused path
+        // winning — coarser, never wrong.)
         if ctx.defer_shade
+            && ctx.spp() == 1
             && !ctx.adaptive
             && !(ctx.hemi_share && (ctx.q.fb.ao || ctx.q.fb.gi))
         {
@@ -462,7 +496,8 @@ fn defer_leaf(
     // material, so a sky or untextured-material first hit already proves
     // this leaf shades inline — take the fused trace+shade path with zero
     // staging (the default scene must run at baseline speed).
-    let mut first = trace_primary(ctx, x0, y0, t_start, Some(cut), &mut ls, 0);
+    // spp == 1 here (trace_tile gates deferral on it), so this is sample 0.
+    let mut first = trace_primary(ctx, x0, y0, t_start, Some(cut), &mut ls, SampleId::First);
     let mat = match &first.hit {
         Some(h) => ctx.scene.tri_mat[h.tri as usize],
         None => u32::MAX,
@@ -501,7 +536,7 @@ fn defer_leaf(
             if (x, y) == (x0, y0) {
                 continue;
             }
-            let tr = trace_primary(ctx, x, y, t_start, Some(cut), &mut ls, 0);
+            let tr = trace_primary(ctx, x, y, t_start, Some(cut), &mut ls, SampleId::First);
             let same = matches!(&tr.hit, Some(h) if ctx.scene.tri_mat[h.tri as usize] == mat);
             trs.push(tr);
             if !same {
@@ -801,7 +836,7 @@ fn shade_hemi_cell(
     let coords = [(cx, cy), (cx + 1, cy), (cx, cy + 1), (cx + 1, cy + 1)];
     // Visibility phase first: the group predicate reads real hits.
     let mut tr: [Traced; 4] =
-        coords.map(|(x, y)| trace_primary(ctx, x, y, t_start, Some(cut), ls, 0));
+        coords.map(|(x, y)| trace_primary(ctx, x, y, t_start, Some(cut), ls, SampleId::First));
     let sp: [Option<(Vec3A, Vec3A)>; 4] = std::array::from_fn(|i| {
         tr[i].hit.map(|h| shade::surface_point(ctx.scene, &tr[i].ray, &h))
     });
@@ -931,7 +966,7 @@ fn shade_cell(
     let coords = [(cx, cy), (cx + 1, cy), (cx, cy + 1), (cx + 1, cy + 1)];
     // Visibility phase first: classification below reads real hits.
     let mut tr: [Traced; 4] =
-        coords.map(|(x, y)| trace_primary(ctx, x, y, t_start, Some(cut), ls, 0));
+        coords.map(|(x, y)| trace_primary(ctx, x, y, t_start, Some(cut), ls, SampleId::First));
     // Surface points once per pixel: the coherence test and shade() consume
     // the same (p, n) — recomputing per shaded pixel was a wasted triangle
     // fetch + interpolation in the hottest adaptive loop.
@@ -994,17 +1029,60 @@ fn shade_cell(
         .c;
     }
 
-    // HOT: in-cell luminance spread — shading noise or an in-cell edge;
-    // either earns a second full sample per pixel (footprint supersampling).
-    let lum = |c: Vec3A| 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;
-    let l = out.map(lum);
-    let (lmin, lmax) = l.iter().fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
-    let mean = (l[0] + l[1] + l[2] + l[3]) * 0.25;
-    if lmax - lmin > HOT_SPREAD * (mean + 1e-3) {
+    // --spp: the cell's extra samples. They come BEFORE the HOT test (which is
+    // a spread test on the pixel's estimate) and they replace it: multi-
+    // sampling already supersamples the footprint everywhere, and folding a
+    // top-up into an N-average with the fixed 0.5/0.5 weights below would
+    // misweight it. Extras never share visibility (VisCtl::Off) — the record
+    // was captured at the rep's sample-0 hit, which an extra ray need not hit.
+    let spp = ctx.spp();
+    let hot = if spp > 1 {
+        for i in 0..4 {
+            let (x, y) = coords[i];
+            let mut sum = out[i];
+            for k in 1..spp {
+                let mut t2 =
+                    trace_primary(ctx, x, y, t_start, Some(cut), ls, SampleId::Extra(k));
+                let s2 = shade_traced(
+                    ctx,
+                    x,
+                    y,
+                    t_start,
+                    depth,
+                    kind,
+                    &mut t2,
+                    None, // its hit differs from the first sample's
+                    ls,
+                    k == ctx.primary_sample,
+                    false,
+                    shade::VisCtl::Off,
+                    None,
+                );
+                sum += s2.c;
+            }
+            out[i] = sum / spp as f32;
+        }
+        // The HOT top-up is what --spp REPLACES (multi-sampling already
+        // supersamples the footprint everywhere, and folding a top-up into an
+        // N-average with the fixed 0.5/0.5 weights below would misweight it).
+        // The cell's COARSE/BASE classification is a property of the shared
+        // visibility record, not of the sample count, so it still stands below.
+        false
+    } else {
+        // HOT: in-cell luminance spread — shading noise or an in-cell edge;
+        // either earns a second full sample per pixel (footprint supersampling).
+        let lum = |c: Vec3A| 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;
+        let l = out.map(lum);
+        let (lmin, lmax) =
+            l.iter().fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
+        let mean = (l[0] + l[1] + l[2] + l[3]) * 0.25;
+        lmax - lmin > HOT_SPREAD * (mean + 1e-3)
+    };
+    if hot {
         ls.adapt_hot += 1;
         for i in 0..4 {
             let (x, y) = coords[i];
-            let mut t2 = trace_primary(ctx, x, y, t_start, Some(cut), ls, TOPUP_SALT);
+            let mut t2 = trace_primary(ctx, x, y, t_start, Some(cut), ls, SampleId::Topup);
             // The top-up traces its own salted ray — its hit differs from the
             // first sample's, so no precomputed surface point applies.
             let s2 = shade_traced(
@@ -1076,33 +1154,68 @@ fn write_gbuf_hit(
             spec_hit_t: if prim.spec_t.is_infinite() { far } else { prim.spec_t },
         },
     );
-    if let Some(f) = ctx.fsr_buf {
-        // Previous-frame linear view-Z of the SAME hit point — the denoiser
-        // MV's B channel is prev_z - cur_z. No previous camera degrades to
-        // "no depth motion"; a point behind the old image plane keeps its
-        // true (negative) prev view-Z — the large delta marks the
-        // disocclusion for history rejection (RG is (0,0) there, above).
-        let prev_z = match &ctx.prev_cam {
-            Some(prev) => (p - prev.origin).dot(prev.forward()),
-            None => t * dir.dot(ctx.cam.forward()),
+    write_fsr(ctx, x, y, dir, t, prim, c);
+}
+
+/// The FSR (Ray Regeneration) signal write — split out of the G-buffer writes
+/// because its residual is an EXACT REMAINDER against the color the frame
+/// PRESENTS: FSR reconstructs color as dd⊗kd + ds⊗f0 + ao·AMBIENT⊗kd + is⊗f0 +
+/// residual and never reads `accum` on the CPU-fed path. Under `--spp` the
+/// presented color is the N-sample average, which only exists after
+/// `shade_pixel`'s loop — hence a separate entry point it can call again with
+/// the average (see there). The GPU feed kernel obeys the same rule from the
+/// other side: it computes the residual against the averaged `accum`.
+fn write_fsr(
+    ctx: &FrameCtx,
+    x: usize,
+    y: usize,
+    dir: Vec3A,
+    t: f32,
+    prim: &shade::PrimarySurface,
+    c: Vec3A,
+) {
+    let Some(f) = ctx.fsr_buf else { return };
+    let (_, far) = dlss::near_far(ctx.scene.diag);
+    if !t.is_finite() {
+        // Sky: EVERY signal zero (AO included — nothing is shaded here, so the
+        // composite must add nothing), residual = the color itself (albedos
+        // don't matter — 0 * anything), prev_z = far so the depth delta is 0.
+        let sig = crate::fsr::Signals {
+            dd: Vec3A::ZERO,
+            ds: Vec3A::ZERO,
+            ao: 0.0,
+            is: Vec3A::ZERO,
+            residual: c,
         };
-        let sig = crate::fsr::split_signals(
-            c,
-            prim.direct_d,
-            prim.direct_s,
-            prim.ao,
-            prim.ind_s,
-            prim.albedo * (1.0 - prim.metallic),
-            Vec3A::splat(0.04).lerp(prim.albedo, prim.metallic),
-        );
-        f.write(x, y, &sig, prev_z);
+        f.write(x, y, &sig, far);
+        return;
     }
+    // Previous-frame linear view-Z of the SAME hit point — the denoiser
+    // MV's B channel is prev_z - cur_z. No previous camera degrades to
+    // "no depth motion"; a point behind the old image plane keeps its
+    // true (negative) prev view-Z — the large delta marks the
+    // disocclusion for history rejection (RG is (0,0) there, above).
+    let p = ctx.cam.origin + dir * t;
+    let prev_z = match &ctx.prev_cam {
+        Some(prev) => (p - prev.origin).dot(prev.forward()),
+        None => t * dir.dot(ctx.cam.forward()),
+    };
+    let sig = crate::fsr::split_signals(
+        c,
+        prim.direct_d,
+        prim.direct_s,
+        prim.ao,
+        prim.ind_s,
+        prim.albedo * (1.0 - prim.metallic),
+        Vec3A::splat(0.04).lerp(prim.albedo, prim.metallic),
+    );
+    f.write(x, y, &sig, prev_z);
 }
 
 /// G-buffer write for a sky/miss pixel: depth = far (finite, f16-safe), MV =
 /// direction-only reprojection (exact for an environment at infinity — zero
 /// under pure translation, the pan vector under rotation).
-fn write_gbuf_sky(ctx: &FrameCtx, x: usize, y: usize, fx: f32, fy: f32, dir: Vec3A) {
+fn write_gbuf_sky(ctx: &FrameCtx, x: usize, y: usize, fx: f32, fy: f32, dir: Vec3A, c: Vec3A) {
     let Some(g) = ctx.gbuf else { return };
     let (_, far) = dlss::near_far(ctx.scene.diag);
     let mv = match &ctx.prev_cam {
@@ -1125,21 +1238,11 @@ fn write_gbuf_sky(ctx: &FrameCtx, x: usize, y: usize, fx: f32, fy: f32, dir: Vec
             spec_hit_t: 0.0,
         },
     );
-    if let Some(f) = ctx.fsr_buf {
-        // Sky: every signal zero (AO included — nothing is shaded here, so
-        // the composite must add nothing; the denoiser's depth bounds pass
-        // sky texels through anyway), residual = the sky color itself
-        // (albedos don't matter — 0 * anything), prev_z = far so the depth
-        // delta is 0.
-        let sig = crate::fsr::Signals {
-            dd: Vec3A::ZERO,
-            ds: Vec3A::ZERO,
-            ao: 0.0,
-            is: Vec3A::ZERO,
-            residual: shade::sky(dir, ctx.sun),
-        };
-        f.write(x, y, &sig, far);
-    }
+    // `c` is this pixel's presented color, which for a sky pixel IS the sky
+    // radiance (bit-identically at spp == 1 — the caller passes what
+    // `shade::sky` returned for this same dir). Passing it rather than
+    // recomputing is what lets the --spp average reach the residual.
+    write_fsr(ctx, x, y, dir, f32::INFINITY, &shade::PrimarySurface::default(), c);
 }
 
 /// The traced result of one `shade_pixel` sample — returned so `sparse_fill`
@@ -1170,6 +1273,37 @@ struct Traced {
 /// Mixed into the HOT top-up sample's seed so its in-pixel position and
 /// shading stream decorrelate from the cell's first samples.
 const TOPUP_SALT: u64 = 0x517C_C1B7_2722_0A95;
+/// Mixed (times k) into multi-sample k's seed — a different constant from
+/// TOPUP_SALT so a HOT top-up and an `--spp` sample can never share a stream.
+const SPP_SALT: u64 = 0xA076_1D64_78BD_642F;
+
+/// Which sample of a pixel a primary ray is. The position rule and the rng
+/// salt are one decision, so they live in one type.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SampleId {
+    /// Sample 0: the frame's REPORTED sample — the position rule and rng seed
+    /// a single-sample frame has always used. spp == 1 is exactly this.
+    First,
+    /// Multi-sample k >= 1 (`--spp`): a deterministic Halton offset inside the
+    /// same pixel, its own rng stream. Color only — never a side channel
+    /// (unless `--check` probes it), so the guides stay tied to sample 0's
+    /// reported jitter.
+    Extra(u32),
+    /// The adaptive HOT footprint supersample: its own random in-pixel
+    /// position (spp == 1 frames only — see `shade_cell`).
+    Topup,
+}
+
+impl SampleId {
+    #[inline(always)]
+    fn salt(self) -> u64 {
+        match self {
+            SampleId::First => 0,
+            SampleId::Extra(k) => SPP_SALT.wrapping_mul(k as u64),
+            SampleId::Topup => TOPUP_SALT,
+        }
+    }
+}
 
 fn trace_primary(
     ctx: &FrameCtx,
@@ -1178,24 +1312,29 @@ fn trace_primary(
     t_start: f32,
     cut: Option<&[u32]>,
     ls: &mut LocalStats,
-    salt: u64,
+    sample: SampleId,
 ) -> Traced {
     let seed = (x as u64)
         .wrapping_mul(0x9E3779B97F4A7C15)
         .wrapping_add((y as u64).wrapping_mul(0xC2B2AE3D27D4EB4F))
         .wrapping_add(ctx.frame as u64)
-        .wrapping_add(salt);
+        .wrapping_add(sample.salt());
     let mut rng = fastrand::Rng::with_seed(seed);
     // DLSS mode: one frame-uniform low-discrepancy offset for every pixel
     // (the denoiser is told this exact offset). Legacy: per-pixel rng.
     // Either way the sample stays in [x, x+1) — the invariant leaf rays need.
-    // A salted (HOT top-up) sample takes its own random in-pixel position —
-    // footprint supersampling; the reported frame jitter stays tied to the
-    // cell's first samples, which are the only ones that write meta/G-buffers.
-    let (jx, jy) = if salt != 0 {
-        (rng.f32(), rng.f32())
-    } else {
-        match ctx.frame_jitter {
+    // An --spp sample takes the deterministic Halton offset for (frame, k) —
+    // a pure function, which is what lets verify rebuild its ray; a HOT top-up
+    // takes its own random in-pixel position. Both are footprint supersamples:
+    // the reported frame jitter stays tied to sample 0, the only one that
+    // writes meta/G-buffers.
+    let (jx, jy) = match sample {
+        SampleId::Extra(k) => {
+            let (ox, oy) = dlss::jitter_for_sample(ctx.frame, k);
+            (0.5 + ox, 0.5 + oy)
+        }
+        SampleId::Topup => (rng.f32(), rng.f32()),
+        SampleId::First => match ctx.frame_jitter {
             Some((ox, oy)) => (0.5 + ox, 0.5 + oy),
             None => {
                 if ctx.jitter {
@@ -1204,7 +1343,7 @@ fn trace_primary(
                     (0.5, 0.5)
                 }
             }
-        }
+        },
     };
     let (fx, fy) = (x as f32 + jx, y as f32 + jy);
     let dir = ctx.cam.ray_dir(fx, fy);
@@ -1284,13 +1423,24 @@ fn shade_traced(
                 ctx.splat(x, y, c);
             }
             if primary {
-                write_gbuf_sky(ctx, x, y, tr.fx, tr.fy, tr.dir);
+                write_gbuf_sky(ctx, x, y, tr.fx, tr.fy, tr.dir, c);
             }
             Sample { c, t: f32::INFINITY, dir: tr.dir, prim: shade::PrimarySurface::default() }
         }
     }
 }
 
+/// One pixel, `ctx.spp` samples, ONE splat.
+///
+/// Every extra sample lands inside the same pixel, hence inside every ancestor
+/// tile frustum, so it consumes the SAME inherited `t_start` and node cut as
+/// sample 0 — the leaf-tile argument, unchanged. That is the whole point:
+/// the quadtree's per-tile frustum work is paid once and amortizes over
+/// 64·spp rays instead of 64.
+///
+/// The returned Sample is sample `primary_sample`'s (its t/dir/PrimarySurface
+/// are what `sparse_fill` floods and the G-buffers hold), with the N-sample
+/// AVERAGE as its color — so a flooded cell broadcasts the averaged radiance.
 fn shade_pixel(
     ctx: &FrameCtx,
     x: usize,
@@ -1301,22 +1451,50 @@ fn shade_pixel(
     cut: Option<&[u32]>,
     ls: &mut LocalStats,
 ) -> Sample {
-    let mut tr = trace_primary(ctx, x, y, t_start, cut, ls, 0);
-    shade_traced(
-        ctx,
-        x,
-        y,
-        t_start,
-        depth,
-        kind,
-        &mut tr,
-        None,
-        ls,
-        true,
-        true,
-        shade::VisCtl::Off,
-        None,
-    )
+    let spp = ctx.spp();
+    let mut sum = Vec3A::ZERO;
+    let mut out = None;
+    for k in 0..spp {
+        let id = if k == 0 { SampleId::First } else { SampleId::Extra(k) };
+        let mut tr = trace_primary(ctx, x, y, t_start, cut, ls, id);
+        let s = shade_traced(
+            ctx,
+            x,
+            y,
+            t_start,
+            depth,
+            kind,
+            &mut tr,
+            None,
+            ls,
+            k == ctx.primary_sample, // side channels: tbuf/info/G-buffers/MV
+            false,                   // average locally, splat once below
+            shade::VisCtl::Off,
+            None,
+        );
+        sum += s.c;
+        if k == ctx.primary_sample {
+            out = Some(s);
+        }
+    }
+    let mut s = out.expect("primary_sample must be < spp");
+    s.c = sum / spp as f32;
+    // FSR Ray Regeneration reconstructs the presented color from its OWN
+    // planes (dd⊗kd + ds⊗f0 + ao·AMBIENT⊗kd + is⊗f0 + residual — `accum` is
+    // never uploaded on the CPU-fed path), so the residual `shade_traced` wrote
+    // for the probe sample is a remainder against THAT sample's color, not the
+    // average this frame presents. Rewrite it against the average, or FSR would
+    // put sample 0's image back on screen and --spp would be a costly no-op
+    // there. All four denoised signals (dd/ds/ao/is) stay the probe sample's —
+    // the residual is defined as the remainder, so the identity closes exactly
+    // whatever they are. The GPU pack captures them the same way, and its feed
+    // kernel likewise takes the residual against averaged accum, so both feeds
+    // mean exactly the same thing.
+    if spp > 1 {
+        write_fsr(ctx, x, y, s.dir, s.t, &s.prim, s.c);
+    }
+    ctx.splat(x, y, s.c);
+    s
 }
 
 /// The depth cap never flat-fills tiles shallower than this (a bad estimate
@@ -1402,7 +1580,7 @@ fn sparse_fill(
                     if s.t.is_finite() {
                         write_gbuf_hit(ctx, x, y, fx, fy, s.dir, s.t, &s.prim, s.c);
                     } else {
-                        write_gbuf_sky(ctx, x, y, fx, fy, s.dir);
+                        write_gbuf_sky(ctx, x, y, fx, fy, s.dir, s.c);
                     }
                 }
             }
@@ -1428,9 +1606,12 @@ fn fill_sky_rows(ctx: &FrameCtx, x0: usize, y0: usize, x1: usize, y1: usize, dep
         for x in x0..x1 {
             let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
             let dir = ctx.cam.ray_dir(fx, fy);
+            let c = shade::sky(dir, ctx.sun);
             ctx.store_meta(x, y, f32::INFINITY, depth, KIND_SKY);
-            ctx.splat(x, y, shade::sky(dir, ctx.sun));
-            write_gbuf_sky(ctx, x, y, fx, fy, dir);
+            ctx.splat(x, y, c);
+            // A proven-empty tile shades one center direction, spp or not —
+            // the presented color and the FSR residual are the same value.
+            write_gbuf_sky(ctx, x, y, fx, fy, dir, c);
         }
     }
 }
@@ -1594,6 +1775,7 @@ impl VerifyReport {
 /// the uncapped one; coarse (cell-flooded) pixels are skipped by the
 /// comparison but counted, so all non-coarse pixels — including sparse-fill
 /// sample pixels — must still verify exactly.
+#[allow(clippy::too_many_arguments)]
 pub fn verify(
     scene: &Scene,
     bvh: &Bvh,
@@ -1606,7 +1788,41 @@ pub fn verify(
     temporal_prev: &[(&TemporalCache, CamBasis)],
     temporal_cuts: Option<&temporal::CutStore>,
 ) -> VerifyReport {
+    verify_sampled(scene, bvh, cam, q, rw, rh, stats, max_depth, temporal_prev, temporal_cuts, 1, 0)
+}
+
+/// `verify` at `spp` samples per pixel, gating sample `probe` (< spp): the
+/// frame is rendered with `primary_sample = probe`, so tbuf holds THAT
+/// sample's t, and the reference ray is rebuilt at THAT sample's sub-pixel
+/// position — `dlss::jitter_for_sample(0, probe)`, a pure function of (frame,
+/// k), which is the whole reason the extra samples take a deterministic offset
+/// instead of an rng one. Sweeping probe over 0..spp gates every multi-sampled
+/// ray against a tmin=0 reference, not just sample 0's.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_sampled(
+    scene: &Scene,
+    bvh: &Bvh,
+    cam: &CamBasis,
+    q: Quality,
+    rw: usize,
+    rh: usize,
+    stats: &Stats,
+    max_depth: Option<u32>,
+    temporal_prev: &[(&TemporalCache, CamBasis)],
+    temporal_cuts: Option<&temporal::CutStore>,
+    spp: u32,
+    probe: u32,
+) -> VerifyReport {
     crate::zone!("verify");
+    assert!(probe < spp.max(1), "verify probe must name a sample the frame traces");
+    // Sample `probe`'s sub-pixel position, frame 0 (verify's ctx). probe == 0
+    // with jitter off is the pixel center — the historical reference ray.
+    let (jx, jy) = if probe == 0 {
+        (0.5, 0.5)
+    } else {
+        let (ox, oy) = dlss::jitter_for_sample(0, probe);
+        (0.5 + ox, 0.5 + oy)
+    };
     let accum: Vec<AtomicU32> = (0..rw * rh * 3).map(|_| AtomicU32::new(0)).collect();
     let info: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
     let tbuf: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
@@ -1631,6 +1847,8 @@ pub fn verify(
         fsr_buf: None,
         prev_cam: None,
         frame_jitter: None,
+        spp,
+        primary_sample: probe,
         adaptive: false,
         hemi_share: false,
         replay_rec: None,
@@ -1666,7 +1884,7 @@ pub fn verify(
                     continue;
                 }
                 rep.pixels += 1;
-                let dir = cam.ray_dir(x as f32 + 0.5, y as f32 + 0.5);
+                let dir = cam.ray_dir(x as f32 + jx, y as f32 + jy);
                 let t_ref = bvh
                     .intersect(scene, &Ray::new(cam.origin, dir), 0.0, f32::INFINITY, &mut visits)
                     .map(|h| h.t);

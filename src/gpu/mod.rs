@@ -1379,6 +1379,8 @@ impl GpuContext {
             prev_cam: None,
             q: crate::shade::Quality { fb: crate::shade::FrustumBounce::OFF, ..q },
             verify: false,
+            spp: 1,
+            probe_sample: 0,
         };
         {
             // Field-split borrow: run_once needs d3d mutably, the recorder

@@ -74,6 +74,19 @@ cbuffer Frame : register(b0) {
     float4 prev_forward; // xyz (unit); w = prev inv_h
     float4 prev_right;   // xyz pre-scaled; w = NEAR
     float4 prev_up;      // xyz pre-scaled; w = FAR
+    // --spp: primary samples per pixel this frame (1..=MAX_SPP; the CPU pins
+    // it to 1 on fb frames — one hemi point per pixel). probe_sample names the
+    // sample that writes tbuf/info/the G-buffer pack: 0 in every real frame,
+    // swept by --check-gpu/--check-dxr so EVERY sample's ray gets gated.
+    uint spp; uint probe_sample; uint _pad4; uint _pad5;
+    // Sub-pixel offsets for samples 1.. (dlss::jitter_for_sample, computed on
+    // the CPU — one Halton source of truth), packed two per row. The row count
+    // is INJECTED (trace::spp_defs, the ALPHA_CUTOUT/FTREE pattern) so it is
+    // dlss::MAX_SPP / 2 by construction — a hand-mirrored literal here would
+    // be a third constant to keep in lockstep, and reading past it is silent.
+    // Slot 0 holds sample 0's offset, which the FLAG_FRAME_JITTER branch
+    // already knows (sample_pos never reads it).
+    float4 jitters[JITTER_ROWS];
 }
 
 #define SCENE_EPS  (light_center.w)
@@ -109,6 +122,31 @@ float3 ray_dir(float fx, float fy) {
     float ndx = fx * cam_origin.w * 2.0 - 1.0;
     float ndy = 1.0 - fy * cam_forward.w * 2.0;
     return normalize(cam_forward.xyz + cam_right.xyz * ndx + cam_up.xyz * ndy);
+}
+
+// --- Multi-sampling (--spp) ---------------------------------------------------
+
+// Sample k's continuous position inside pixel (x, y) — render.rs's
+// trace_primary, term for term. k == 0 is the frame's REPORTED sample (the
+// jitter policy a single-sample frame has always used, so spp == 1 stays
+// bit-identical); k > 0 takes the deterministic Halton offset the CPU packed
+// into `jitters`. Every sample stays inside the pixel, hence inside the tile
+// frustum — which is what lets it consume the tile's inherited t_start/cut.
+float2 sample_pos(uint x, uint y, uint k, inout uint rng) {
+    float jx = 0.5, jy = 0.5;
+    if (k > 0u) {
+        float4 r = jitters[k >> 1u];
+        float2 o = (k & 1u) ? r.zw : r.xy;
+        jx = 0.5 + o.x;
+        jy = 0.5 + o.y;
+    } else if (flags & FLAG_FRAME_JITTER) {
+        jx = 0.5 + frame_jitter.x;
+        jy = 0.5 + frame_jitter.y;
+    } else if (flags & FLAG_JITTER) {
+        jx = rng_next(rng);
+        jy = rng_next(rng);
+    }
+    return float2(float(x) + jx, float(y) + jy);
 }
 
 // --- Sky (shade.rs::sky) ------------------------------------------------------
