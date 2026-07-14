@@ -1129,7 +1129,7 @@ fn write_gbuf_sky(ctx: &FrameCtx, x: usize, y: usize, fx: f32, fy: f32, dir: Vec
         let sig = crate::fsr::Signals {
             dd: Vec3A::ZERO,
             ds: Vec3A::ZERO,
-            residual: shade::sky(dir, ctx.sun),
+            residual: crate::sky::radiance(dir, &ctx.scene.sun, ctx.cam.pixel_cone() * 0.5),
         };
         f.write(x, y, &sig, far);
     }
@@ -1272,7 +1272,9 @@ fn shade_traced(
             if primary {
                 ctx.store_meta(x, y, f32::INFINITY, depth, kind);
             }
-            let c = shade::sky(tr.dir, ctx.sun);
+            // A DISPLAY path: the camera is looking at the sky, so it sees the
+            // sun disc. Nothing else delivers it here — this is the backdrop.
+            let c = crate::sky::radiance(tr.dir, &ctx.scene.sun, ctx.cam.pixel_cone() * 0.5);
             if do_splat {
                 ctx.splat(x, y, c);
             }
@@ -1422,7 +1424,7 @@ fn fill_sky_rows(ctx: &FrameCtx, x0: usize, y0: usize, x1: usize, y1: usize, dep
             let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
             let dir = ctx.cam.ray_dir(fx, fy);
             ctx.store_meta(x, y, f32::INFINITY, depth, KIND_SKY);
-            ctx.splat(x, y, shade::sky(dir, ctx.sun));
+            ctx.splat(x, y, crate::sky::radiance(dir, &ctx.scene.sun, ctx.cam.pixel_cone() * 0.5));
             write_gbuf_sky(ctx, x, y, fx, fy, dir);
         }
     }
@@ -1489,6 +1491,28 @@ pub fn resolve(
 ) {
     crate::zone!("resolve");
     let inv = 1.0 / samples.max(1) as f32;
+
+    // Glare needs the whole HDR image (it is a convolution), so the bloom path
+    // materializes it — into bloom's own cached buffer, so a presented frame
+    // still allocates nothing. The `--no-bloom` path keeps the original
+    // per-pixel loop verbatim, which is what makes that flag bit-identical to
+    // the pre-bloom renderer by construction.
+    if crate::bloom::enabled() {
+        crate::bloom::with_glare_filled(
+            rw,
+            rh,
+            |hdr| {
+                hdr.par_chunks_mut(3).enumerate().for_each(|(p, px)| {
+                    for (k, o) in px.iter_mut().enumerate() {
+                        *o = f32::from_bits(accum[p * 3 + k].load(Relaxed)) * inv;
+                    }
+                });
+            },
+            |hdr| tonemap_to(hdr, info, overlay_on, present, rw, rh, ww, wh),
+        );
+        return;
+    }
+
     present.par_chunks_mut(ww).enumerate().for_each(|(wy, row)| {
         let sy = (wy * rh / wh).min(rh - 1);
         for (wx, out) in row.iter_mut().enumerate() {
@@ -1517,6 +1541,29 @@ pub fn resolve_hdr(
     wh: usize,
 ) {
     crate::zone!("resolve-hdr");
+    // The CPU denoisers' tonemap entry (OIDN / NPPD land here directly), and
+    // where their glare comes from. `resolve` does NOT funnel through this — it
+    // materializes its own HDR image and calls `tonemap_to` below with the glare
+    // already applied, so nothing can double-bloom.
+    crate::bloom::with_glare(hdr, rw, rh, |hdr| {
+        tonemap_to(hdr, info, overlay_on, present, rw, rh, ww, wh)
+    });
+}
+
+/// Tonemap + overlay + upscale an HDR image into the present buffer. The one
+/// CPU present loop, shared by `resolve` and `resolve_hdr`; glare is the
+/// caller's business, so this can never apply it twice.
+#[allow(clippy::too_many_arguments)]
+fn tonemap_to(
+    hdr: &[f32],
+    info: &[AtomicU32],
+    overlay_on: bool,
+    present: &mut [u32],
+    rw: usize,
+    rh: usize,
+    ww: usize,
+    wh: usize,
+) {
     present.par_chunks_mut(ww).enumerate().for_each(|(wy, row)| {
         let sy = (wy * rh / wh).min(rh - 1);
         for (wx, out) in row.iter_mut().enumerate() {
@@ -1706,6 +1753,10 @@ pub fn verify(
         )
 }
 
+/// The sun's direction. Used to be `light.center.normalize()` — the direction of
+/// a rect lamp 12 units away, which is why the sky's glow and the actual light
+/// were two different objects that merely pointed the same way. Now it is just
+/// the sun's own direction; there is one sun.
 pub fn sun_dir(scene: &Scene) -> Vec3A {
-    scene.light.center.normalize_or_zero()
+    scene.sun.dir
 }

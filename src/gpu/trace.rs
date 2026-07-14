@@ -559,6 +559,10 @@ impl HeadlessGpu {
                 .map_err(|e| format!("SetEventOnCompletion: {e}"))?;
             unsafe { WaitForSingleObject(self.event, INFINITE) };
         }
+        // Surface whatever the debug layer found (no-op unless --gpu-debug). The
+        // `--check-gpu` suites record most of the renderer's command lists, so
+        // this is where a state or barrier error gets caught cheaply.
+        d3d12::drain_debug(&self.device);
         Ok(())
     }
 
@@ -1575,11 +1579,13 @@ pub(crate) struct FrameCb {
     cam_forward: [f32; 4],
     cam_right: [f32; 4],
     cam_up: [f32; 4],
-    sun: [f32; 4],
-    light_center: [f32; 4],
-    light_u: [f32; 4],
-    light_v: [f32; 4],
-    light_color: [f32; 4],
+    /// The sun (sky::Sun). Replaces the old five rows (sun + the rect light's
+    /// center/u/v/color): a disc at infinity needs a direction, a cone, and two
+    /// radiometric values. `scene.eps` / `ao_radius` used to ride in
+    /// `light_center.w` / `light_u.w`; they are rehomed onto these rows' w slots.
+    sun: [f32; 4],   // xyz = unit dir; w = cos(angular radius)
+    sun_e: [f32; 4], // xyz = irradiance/π (the direct loop's multiplier); w = scene eps
+    sun_l: [f32; 4], // xyz = DISC radiance (what an escaping ray sees); w = ao_radius
     rw: u32,
     rh: u32,
     frame: u32,
@@ -1611,10 +1617,17 @@ pub(crate) struct FrameCb {
     prev_forward: [f32; 4], // xyz; w = prev inv_h
     prev_right: [f32; 4],   // xyz; w = near
     prev_up: [f32; 4],      // xyz; w = far
+    /// The sky dome in order-2 SH (`scene.sky_sh`, `sh::N` = 9 RGB rows, .w
+    /// unused) — the GPU's copy of the analytic ambient the CPU reads through
+    /// `Sh9::irradiance`. Appended LAST so every offset above is unmoved.
+    sky_sh: [[f32; 4]; crate::sh::N],
 }
 // The HLSL cbuffer is hand-mirrored across 7 concatenated compile units —
 // a size drift here corrupts every field after the drift point.
-const _: () = assert!(std::mem::size_of::<FrameCb>() == 304);
+// 304 (the old size) − 32 (two light rows dropped) + 16·9 (the SH sky) = 416.
+const _: () = assert!(std::mem::size_of::<FrameCb>() == 304 - 32 + 16 * crate::sh::N);
+// ...and the whole thing must still fit one root-CBV stride.
+const _: () = assert!(std::mem::size_of::<FrameCb>() <= CB_STRIDE);
 
 impl FrameCb {
     /// The scene-static base: sun/light/eps/ao_radius, near/far riding the
@@ -1624,16 +1637,19 @@ impl FrameCb {
         let sun = crate::render::sun_dir(scene);
         let (near, far) = crate::dlss::near_far(scene.diag);
         let v4 = |v: Vec3A, w: f32| [v.x, v.y, v.z, w];
+        let mut sky_sh = [[0.0f32; 4]; crate::sh::N];
+        for (dst, c) in sky_sh.iter_mut().zip(scene.sky_sh.c.iter()) {
+            *dst = [c.x, c.y, c.z, 0.0];
+        }
         FrameCb {
+            sky_sh,
             cam_origin: [0.0; 4],
             cam_forward: [0.0; 4],
             cam_right: [0.0; 4],
             cam_up: [0.0; 4],
-            sun: v4(sun, 0.0),
-            light_center: v4(scene.light.center, scene.eps),
-            light_u: v4(scene.light.u, scene.ao_radius),
-            light_v: v4(scene.light.v, 0.0),
-            light_color: v4(scene.light.color, 0.0),
+            sun: v4(sun, scene.sun.cos_radius),
+            sun_e: v4(scene.sun.e_over_pi, scene.eps),
+            sun_l: v4(scene.sun.radiance, scene.ao_radius),
             rw,
             rh,
             frame: 0,

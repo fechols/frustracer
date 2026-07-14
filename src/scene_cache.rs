@@ -22,7 +22,7 @@
 //! matclass classification.
 
 use crate::bvh::{Bvh, BvhNode};
-use crate::scene::{self, AreaLight, MatKind, Material, Scene};
+use crate::scene::{self, MatKind, Material, Scene};
 use crate::texture::Texture;
 use glam::{Vec2, Vec3A};
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 // v5 supersedes two INCOMPATIBLE v4 lineages (build_key header on one side,
 // .webp sibling resolution on the other) — a bare version match can't tell
 // them apart, so both are invalidated.
-pub const CACHE_VERSION: u32 = 5; // v5: build_key in the header + .webp sibling textures
+pub const CACHE_VERSION: u32 = 6; // v6: AreaLight -> sky::Sun (a disc at infinity)
 const MAGIC: [u8; 8] = *b"FRSCACH\x01";
 
 /// Fixed on-disk material, `MatKind` flattened into (kind, param) — Marble
@@ -194,7 +194,7 @@ pub fn try_load(src_path: &str) -> Option<(Scene, Bvh)> {
     if n_verts == 0 || n_tris == 0 || n_nodes == 0 {
         return None;
     }
-    let light_v: Vec<Vec3A> = read_pod_vec_checked(&mut r, 4, &mut remaining)?;
+    let sun_v: Vec<Vec3A> = read_pod_vec_checked(&mut r, 1, &mut remaining)?;
 
     let positions: Vec<Vec3A> = read_pod_vec_checked(&mut r, n_verts, &mut remaining)?;
     let normals: Vec<Vec3A> = read_pod_vec_checked(&mut r, n_verts, &mut remaining)?;
@@ -354,12 +354,10 @@ pub fn try_load(src_path: &str) -> Option<(Scene, Bvh)> {
         materials,
         textures,
         any_alpha: false,
-        light: AreaLight {
-            center: light_v[0],
-            u: light_v[1],
-            v: light_v[2],
-            color: light_v[3],
-        },
+        sun: crate::sky::Sun::new(sun_v[0]),
+        // Derived from the sun by finalize_scalars below — deliberately not in
+        // the on-disk format, so the SH sky costs the cache nothing.
+        sky_sh: crate::sh::Sh9::ZERO,
         diag: 0.0,
         eps: 0.0,
         ao_radius: 0.0,
@@ -405,7 +403,10 @@ pub fn store(src_path: &str, scene: &Scene, bvh: &Bvh) {
         write_u64(&mut w, scene.textures.len() as u64)?;
         write_u64(&mut w, bvh.nodes.len() as u64)?;
         write_u64(&mut w, bvh.tri_idx.len() as u64)?;
-        write_pod(&mut w, &[scene.light.center, scene.light.u, scene.light.v, scene.light.color])?;
+        // Only the DIRECTION: the sun's cone and its two radiometric values are
+        // pure functions of it (sky::Sun::new), so storing them would create a
+        // second source of truth that could drift from sky.rs's constants.
+        write_pod(&mut w, &[scene.sun.dir])?;
 
         write_pod(&mut w, &scene.positions)?;
         write_pod(&mut w, &scene.normals)?;

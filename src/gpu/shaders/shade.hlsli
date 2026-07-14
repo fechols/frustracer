@@ -447,19 +447,26 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
         // Charlie-sheen inverse alpha, hoisted like the CPU.
         float sheen_inv_a = 1.0 / clamp(rough_eff, 0.07, 1.0);
 
-        // Direct light: N area-light samples, Lambert (1/pi omitted by
-        // convention) + Cook-Torrance GGX with the compensating pi.
+        // Will the VNDF reflection ray actually be traced? MIS partitions ONE
+        // integral between TWO strategies, so the light-sampled specular may
+        // only be down-weighted if the BSDF-sampled half really runs — else
+        // `w_l` deletes energy nobody else delivers (shade.rs::refl_ray, same
+        // expression, same FLAT roughness/metallic). False for the low preset
+        // and at every depth > 0.
+        bool refl_ray = (depth == 0u && refl && (mat.metallic > 0.04 || mat.roughness < 0.45));
+
+        // Direct light: N cone samples toward the SUN DISC at infinity (no
+        // position, no 1/d^2 — sky.rs). Lambert (1/pi omitted by convention,
+        // absorbed into sun_e = irradiance/pi) + Cook-Torrance GGX with the
+        // compensating pi.
         float3 direct_d = 0.0;
         float3 direct_s = 0.0;
         float3 direct_t = 0.0; // thin-surface back transmission (foliage)
         for (uint si = 0u; si < n_shadow; ++si) {
-            float su = rng_next(rng) * 2.0 - 1.0;
-            float sv = rng_next(rng) * 2.0 - 1.0;
-            float3 lp = light_center.xyz + light_u.xyz * su + light_v.xyz * sv;
-            float3 lv = lp - p;
-            float dist2 = dot(lv, lv);
-            float dist = sqrt(dist2);
-            float3 wi = lv / dist;
+            // The SAME two draws, in the same order, the rect sampling consumed.
+            float su = rng_next(rng);
+            float sv = rng_next(rng);
+            float3 wi = sun_sample_dir(su, sv);
             // N·L against the SHADING normal; the shadow/translucency ray
             // geometry stays on the geometric n (shade.rs).
             float ndl = dot(n_s, wi);
@@ -469,14 +476,16 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                 // transmitted side (p - 2*eps*n = hit - n*eps). The rng
                 // draws above already happened — order matches the CPU.
                 if (mat.translucency > 0.0 && ndl < 0.0) {
-                    if (!occluded_q(p - n * (2.0 * SCENE_EPS), wi, 0.0, dist - SCENE_EPS)) {
-                        direct_t += light_color.xyz * ((-ndl) / dist2);
+                    if (!occluded_q(p - n * (2.0 * SCENE_EPS), wi, 0.0, INF)) {
+                        direct_t += sun_e.xyz * (-ndl);
                     }
                 }
                 continue;
             }
-            if (!occluded_q(p, wi, 0.0, dist - SCENE_EPS)) {
-                float3 li = light_color.xyz * (ndl / dist2);
+            // tmax = INF: the sun is at infinity, so anything along the ray
+            // occludes it.
+            if (!occluded_q(p, wi, 0.0, INF)) {
+                float3 li = sun_e.xyz * ndl;
                 direct_d += li;
                 float3 h = normalize_or_zero(wi + v);
                 float3 hl = float3(dot(h, t1), dot(h, t2), dot(h, n_s));
@@ -485,7 +494,18 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                     float3 wil = float3(dot(wi, t1), dot(wi, t2), dot(wi, n_s));
                     float g2 = 1.0 / (1.0 + lambda_v + ggx_lambda(wil, ax, ay));
                     float3 f = schlick(f0, max(dot(wi, h), 0.0));
-                    direct_s += li * f * (PI * dn * g2 / (4.0 * vl.z * ndl));
+                    // MIS (balance heuristic) against the VNDF reflection ray,
+                    // which can also land in the disc — sky::mis_weight. The
+                    // VNDF pdf is G1(v)*D(h)/(4*n.v), G1 = 1/(1 + lambda_v).
+                    // ONLY when that ray is traced: with no BSDF strategy in
+                    // play there is nothing to share the integral with, and
+                    // weighting down would simply lose the highlight.
+                    float w_l = 1.0;
+                    if (refl_ray) {
+                        float p_b = dn / (4.0 * (1.0 + lambda_v) * max(vl.z, 1e-6));
+                        w_l = 1.0 - sky_mis_weight(p_b, sky_light_pdf());
+                    }
+                    direct_s += li * f * (PI * dn * g2 * w_l / (4.0 * vl.z * ndl));
                     if (mat.sheen > 0.0) {
                         // Charlie NDF + Ashikhmin visibility (shade.rs).
                         float sin2 = max(1.0 - hl.z * hl.z, 0.0);
@@ -525,10 +545,19 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
             // so kt folds into the weight.
             total += tput * (kd * kt * diffuse_d + direct_s);
             amb_w = tput * kd * kt;
+            // fb_mode 1 (AO) scales the SKY's irradiance by an openness
+            // scalar, so the sky term folds into the weight HERE, where n_s is
+            // in scope — compose has no normal. fb_mode 2 (GI) integrates the
+            // sky itself and must NOT be pre-multiplied by it (that would
+            // square the sky). See compose.hlsl.
+            if (fb_mode == 1u) amb_w *= sh_irradiance(n_s);
             amb_o = p;
             amb_n = n;
         } else {
-            // Sampled AO modulating the constant ambient.
+            // Sampled AO modulating the sky's own irradiance (sh.rs::Sh9 —
+            // shade.rs's `sky_sh.irradiance(n_s) * ao`). The SHADING normal:
+            // ambient is a BRDF-side quantity, while the AO ray directions
+            // below keep the GEOMETRIC n (visibility), per the n_g/n_s split.
             float ao = 1.0;
             if (n_ao > 0u) {
                 float3 at1, at2;
@@ -541,7 +570,7 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                 }
                 ao = float(open) / float(n_ao);
             }
-            total += tput * (kd * kt * (diffuse_d + AMBIENT * ao) + direct_s);
+            total += tput * (kd * kt * (diffuse_d + sh_irradiance(n_s) * ao) + direct_s);
         }
 
         // Emitted radiance — additive per lap, OUTSIDE the kd*kt factor, so
@@ -568,8 +597,9 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
 
         // (a) One specular bounce — ROOT only (shade.rs gates depth == 0):
         // GGX VNDF importance sample (Heitz 2018), throughput F*G2/G1 <= 1.
-        // The two rng draws stay conditional on the same gate as the CPU's.
-        if (depth == 0u && refl && (mat.metallic > 0.04 || mat.roughness < 0.45)) {
+        // The two rng draws stay conditional on the same gate as the CPU's —
+        // and it is the SAME `refl_ray` the direct loop's MIS weight consulted.
+        if (refl_ray) {
             float3 vh = normalize(float3(ax * vl.x, ay * vl.y, vl.z));
             float lensq = vh.x * vh.x + vh.y * vh.y;
             float3 b1 =
@@ -606,7 +636,17 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                     next_set = true;
                 } else {
                     prim.spec_t = INF; // reflection missed (shade.rs)
-                    total += rtput * sky_color(rdir);
+                    // The BSDF-sampling half of the MIS pair. The DOME passes
+                    // through un-weighted (only this strategy sees it); the DISC
+                    // is weighted, because direct_s is also delivering the sun's
+                    // specular. Mirror: w_b ~ 1, this carries the round sun.
+                    // Rough: w_b ~ 0, which is what kills the firefly.
+                    float3 hl_r = float3(dot(h, t1), dot(h, t2), dot(h, n_s));
+                    float p_b_r =
+                        ggx_ndf(hl_r, ax, ay) / (4.0 * (1.0 + lambda_v) * max(vl.z, 1e-6));
+                    float w_b = sky_mis_weight(p_b_r, sky_light_pdf());
+                    total += rtput
+                        * (sky_dome(rdir) + sky_disc(rdir, cone_spread * 0.5) * w_b);
                 }
             }
         }
@@ -685,7 +725,11 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                         have_stash = true;
                     }
                 } else {
-                    total += t_tput * sky_color(tdir);
+                    // The FULL sky, disc included and un-weighted: refraction is
+                    // a near-delta path with no light-sampling partner, so this
+                    // is the only strategy that can deliver the sun through
+                    // glass. Nothing to double-count.
+                    total += t_tput * sky_radiance(tdir, cone_spread * 0.5);
                 }
             }
         }

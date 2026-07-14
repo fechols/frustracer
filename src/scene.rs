@@ -84,13 +84,10 @@ impl Material {
     }
 }
 
-/// Rectangular area light: `center ± u ± v`, radiant intensity `color` (falls off 1/d²).
-pub struct AreaLight {
-    pub center: Vec3A,
-    pub u: Vec3A,
-    pub v: Vec3A,
-    pub color: Vec3A,
-}
+// The rectangular AreaLight is gone. It was a 4x4 rect ~12 units away with a
+// 1/d² falloff, and its GGX highlight was a mirror image of that rect — which
+// is why the sun used to reflect as a SQUARE. The light is now `sky::Sun`: a
+// disc at infinity, part of the one sky sphere. See src/sky.rs.
 
 pub struct Scene {
     pub positions: Vec<Vec3A>,
@@ -106,7 +103,13 @@ pub struct Scene {
     /// alpha-cutout path (false on the procedural/stress scenes, keeping the
     /// hot loop untouched there).
     pub any_alpha: bool,
-    pub light: AreaLight,
+    /// The sun: a disc at infinity, the sharp half of the one sky.
+    pub sun: crate::sky::Sun,
+    /// The sky's smooth dome, projected into order-2 SH once at load — the
+    /// analytic replacement for the old flat `shade::AMBIENT` constant, giving
+    /// every normal its own sky irradiance for free (zero rays). Derived
+    /// (`finalize_scalars`), never serialized: a pure function of the sun.
+    pub sky_sh: crate::sh::Sh9,
     /// Bounding diagonal — the scale reference for all epsilons.
     pub diag: f32,
     /// Self-intersection offset for secondary rays.
@@ -313,7 +316,7 @@ impl SceneBuilder {
         }
     }
 
-    pub fn finish(self, light: AreaLight) -> Scene {
+    pub fn finish(self, sun: crate::sky::Sun) -> Scene {
         let mut scene = Scene {
             positions: self.positions,
             normals: self.normals,
@@ -323,7 +326,8 @@ impl SceneBuilder {
             materials: self.materials,
             textures: self.textures,
             any_alpha: false,
-            light,
+            sun,
+            sky_sh: crate::sh::Sh9::ZERO,
             diag: 0.0,
             eps: 0.0,
             ao_radius: 0.0,
@@ -349,15 +353,24 @@ pub fn finalize_scalars(scene: &mut Scene) {
     scene.eps = 1e-4 * diag;
     scene.ao_radius = 0.03 * diag;
     scene.any_alpha = scene.textures.iter().any(|t| t.alpha_masked);
+
+    // The SH ambient is a pure function of the sun direction, so it is derived
+    // here rather than cached — which is why `scene_cache` needs no format
+    // change for it. Deterministic quadrature, no rng.
+    //
+    // The DOME, not the full sky: a gather path must never see the sun disc
+    // (the direct loop already delivers it, with a shadow ray). See sky.rs's
+    // central invariant.
+    let sun = scene.sun.dir;
+    scene.sky_sh = crate::sh::Sh9::project(|d| crate::sky::dome(d, sun));
 }
 
-fn default_light() -> AreaLight {
-    AreaLight {
-        center: Vec3A::new(6.0, 10.0, 4.0),
-        u: Vec3A::new(2.0, 0.0, 0.0),
-        v: Vec3A::new(0.0, 0.0, 2.0),
-        color: Vec3A::new(1.0, 0.95, 0.85) * 150.0,
-    }
+/// The sun direction is UNCHANGED from the old rect light's center — so shadow
+/// directions and the sun's place in the sky don't move, and the visual diff is
+/// attributable to the shading model alone. Its brightness is
+/// `sky::SUN_E_OVER_PI`, which is exactly the old `light.color / |center|²`.
+pub fn default_sun() -> crate::sky::Sun {
+    crate::sky::Sun::new(Vec3A::new(6.0, 10.0, 4.0))
 }
 
 /// Ground plane + a grid of boxes + three spheres + a marble Stanford Bunny
@@ -423,7 +436,7 @@ pub fn procedural_scene() -> Scene {
     let teapot = embedded_obj(include_bytes!("../assets/teapot.obj"));
     add_obj_models(&mut b, &teapot, |_| steel, 3.0, Vec3A::new(7.5, 0.0, 3.5));
 
-    b.finish(default_light())
+    b.finish(default_sun())
 }
 
 /// Verts/tris the scene loaders push before the model itself — the standard
@@ -511,16 +524,11 @@ pub fn tile_scene(base: Scene, nx: u32, nz: u32) -> (Scene, f32) {
         }
     }
 
-    // The default light pushed out and brightened to cover the field — the
-    // stress_scene idiom (1/d² falloff -> color scales with k²; direction
-    // preserved, so `render::sun_dir` is unchanged).
-    let k = (fh / 6.0).max(1.0);
-    let light = AreaLight {
-        center: base.light.center * k,
-        u: base.light.u * k,
-        v: base.light.v * k,
-        color: base.light.color * (k * k),
-    };
+    // The sun is at infinity and has no falloff, so a tiled/replicated scene
+    // needs NO light rescaling at all. (This used to push the rect light out by
+    // k and brighten it by k² to compensate 1/d² — a hack that existed only
+    // because the "sun" was a lamp 12 units away. A sun does not get closer to
+    // one end of the field.)
 
     let mut scene = Scene {
         positions,
@@ -531,7 +539,10 @@ pub fn tile_scene(base: Scene, nx: u32, nz: u32) -> (Scene, f32) {
         materials: base.materials,
         textures: base.textures,
         any_alpha: false,
-        light,
+        // The sun is at infinity: a replicated field sees the SAME sun, at the
+        // same angle, with the same irradiance, everywhere. Nothing to rescale.
+        sun: base.sun,
+        sky_sh: crate::sh::Sh9::ZERO,
         diag: 0.0,
         eps: 0.0,
         ao_radius: 0.0,
@@ -645,19 +656,11 @@ pub fn stress_scene(n: usize) -> Scene {
         }
     }
 
-    // The default light, pushed out and brightened to cover the field
-    // (1/d² falloff → color scales with k²). Direction is preserved, so
-    // `render::sun_dir` (light.center normalized) is unchanged.
-    let k = (fh / 6.0).max(1.0);
-    let base = default_light();
-    let light = AreaLight {
-        center: base.center * k,
-        u: base.u * k,
-        v: base.v * k,
-        color: base.color * (k * k),
-    };
+    // No light rescaling: the sun is at infinity, so however wide the stress
+    // field grows, every object sees the same sun at the same angle. (This used
+    // to push a rect lamp out by k and brighten it by k² to undo 1/d².)
 
-    let scene = b.finish(light);
+    let scene = b.finish(default_sun());
     eprintln!(
         "stress scene: {n} objects ({boxes} boxes, {spheres} spheres, {bunnies} bunnies, {teapots} teapots) | {} tris | field {:.0}x{:.0}",
         scene.tri_count(),
@@ -1041,7 +1044,7 @@ pub fn load_obj_scene(path: &str) -> Scene {
         Vec3A::ZERO,
     );
 
-    b.finish(default_light())
+    b.finish(default_sun())
 }
 
 /// Fit `models` to a bounding diagonal of `target_diag` — centered on x/z,

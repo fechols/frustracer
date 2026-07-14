@@ -34,7 +34,7 @@ void cs_reference(uint3 id : SV_DispatchThreadID) {
         t = hit.t;
         gbuf_write_hit(pi, float(id.x) + jx, float(id.y) + jy, dir, hit.t, ps);
     } else {
-        c = sky_color(dir);
+        c = sky_radiance(dir, pixel_cone * 0.5);
         t = INF;
         gbuf_write_sky(pi, float(id.x) + jx, float(id.y) + jy, dir);
     }

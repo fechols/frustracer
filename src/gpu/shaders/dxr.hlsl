@@ -92,7 +92,10 @@ void chs_hit(inout HitPayload p, in BuiltInTriangleIntersectionAttributes a) {
 
 [shader("miss")]
 void miss_radiance(inout RayPayload p) {
-    p.color = sky_color(WorldRayDirection());
+    // The raygen primary ray's miss: a DISPLAY path (the backdrop), so it sees
+    // the sun disc. Reflection/glass continuations route to miss_hit_info and
+    // are handled inside shade.hlsli, per the sky.rs invariant.
+    p.color = sky_radiance(WorldRayDirection(), pixel_cone * 0.5);
     p.t = INF;
 }
 

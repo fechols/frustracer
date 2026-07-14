@@ -68,7 +68,7 @@ void cs_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
         t = hit.t;
         gbuf_write_hit(pi, float(x) + jx, float(y) + jy, dir, hit.t, ps);
     } else {
-        c = sky_color(dir);
+        c = sky_radiance(dir, pixel_cone * 0.5);
         t = INF;
         gbuf_write_sky(pi, float(x) + jx, float(y) + jy, dir);
     }

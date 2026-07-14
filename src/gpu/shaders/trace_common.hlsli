@@ -5,7 +5,9 @@
 //
 // Contract notes (mirrors of the CPU renderer, keep in lockstep):
 // - ray_dir == camera.rs::CamBasis::ray_dir (normalized — distance == ray t).
-// - sky_color == shade.rs::sky.
+// - sky_dome / sky_radiance == src/sky.rs (read its header: WHICH one a ray
+//   calls is a correctness decision — the sun disc appears exactly once per
+//   light path).
 // - pack_info == overlay.rs::pack_info; KIND_* == overlay.rs.
 // - The RNG is a per-pixel counter-based PCG stream seeded from
 //   (x, y, frame, salt) — deliberately NOT the CPU's WyRand: sequences
@@ -47,11 +49,12 @@ cbuffer Frame : register(b0) {
     float4 cam_forward;  // xyz (unit); w = inv_h
     float4 cam_right;    // xyz pre-scaled by tan(fov/2)*aspect
     float4 cam_up;       // xyz pre-scaled by tan(fov/2)
-    float4 sun;          // xyz (unit)
-    float4 light_center; // xyz; w = scene eps
-    float4 light_u;      // xyz; w = ao_radius
-    float4 light_v;      // xyz
-    float4 light_color;  // xyz (radiant intensity)
+    // The sun (sky::Sun) — a DISC AT INFINITY, not the old rect area light.
+    // Its three rows replace the old five; scene eps / ao_radius were rehomed
+    // out of the dead light rows' w slots onto sun_e.w / sun_l.w.
+    float4 sun;   // xyz (unit dir); w = cos(angular radius)
+    float4 sun_e; // xyz = irradiance/PI (the direct loop's multiplier); w = scene eps
+    float4 sun_l; // xyz = DISC radiance (what an escaping ray sees); w = ao_radius
     uint rw; uint rh; uint frame; uint flags;
     uint shadow_samples; uint ao_samples; uint reflections; uint _pad0;
     // pixel_cone: primary ray-cone spread (CamBasis::pixel_cone verbatim,
@@ -74,10 +77,14 @@ cbuffer Frame : register(b0) {
     float4 prev_forward; // xyz (unit); w = prev inv_h
     float4 prev_right;   // xyz pre-scaled; w = NEAR
     float4 prev_up;      // xyz pre-scaled; w = FAR
+    // The sky dome in order-2 SH (scene.sky_sh / sh.rs::Sh9) — the analytic
+    // ambient irradiance, one RGB row per coefficient (.w unused). Appended
+    // LAST so every offset above is unmoved.
+    float4 sky_sh[9];
 }
 
-#define SCENE_EPS  (light_center.w)
-#define AO_RADIUS  (light_u.w)
+#define SCENE_EPS  (sun_e.w)
+#define AO_RADIUS  (sun_l.w)
 #define CAM_NEAR   (prev_right.w)
 #define CAM_FAR    (prev_up.w)
 
@@ -111,19 +118,101 @@ float3 ray_dir(float fx, float fy) {
     return normalize(cam_forward.xyz + cam_right.xyz * ndx + cam_up.xyz * ndy);
 }
 
-// --- Sky (shade.rs::sky) ------------------------------------------------------
+// --- The one sky (src/sky.rs) -------------------------------------------------
+//
+// Term-for-term with sky.rs; change both together. THE INVARIANT (see that
+// file's header): the sun disc is delivered exactly once per light path. A ray
+// sees the disc only if no light-sampling strategy already covers the sun along
+// that path.
+//
+//   sky_dome(d)      GATHER paths: hemi cells, GI leaf misses. NO disc — the
+//                    disc would double-count direct_d AND saturate the 2^18
+//                    fixed-point hemi accumulator outright.
+//   sky_radiance(d)  DISPLAY paths: the camera's own miss, and glass.
+//
+// The specular reflection ray is the one path both strategies can reach, so it
+// takes the dome plus a MIS-weighted disc (see shade.hlsli).
 
-float3 sky_color(float3 d) {
-    float t = saturate(d.y * 0.7 + 0.3);
-    const float3 horizon = float3(0.72, 0.82, 0.95);
-    const float3 zenith  = float3(0.18, 0.35, 0.70);
-    float g = max(dot(d, sun.xyz), 0.0);
-    // powi(32) by squaring, matching the CPU's exact operation chain.
-    float g2 = g * g; float g4 = g2 * g2; float g8 = g4 * g4;
-    float g16 = g8 * g8;
-    float3 glow = (g16 * g16) * float3(1.0, 0.9, 0.7) * 0.6;
-    return lerp(horizon, zenith, t) + glow;
+static const float  SKY_MIE_G   = 0.76;
+static const float3 SKY_BETA_R  = float3(0.038, 0.096, 0.244); // Rayleigh, 1/lambda^4
+static const float3 SKY_BETA_M  = float3(0.021, 0.021, 0.021); // Mie, wavelength-flat
+static const float  SKY_GROUND_ALBEDO = 0.28;
+static const float  SKY_DOME_SCALE    = 14.8;
+
+// Single-scatter, kept LINEAR in beta with extinction as separate view/sun
+// transmittances. Dividing the in-scatter by the (blue-heavy) combined beta
+// would invert the grey Mie aureole into a red one — see sky.rs.
+//
+// `t_sun` is passed IN, not recomputed: the sun's path down to the scattering
+// volume depends only on its elevation, so it is one value for the whole frame
+// (sky.rs hoists it the same way — this is the hemi integrator's inner loop).
+float3 sky_scatter(float3 dir, float mu, float3 t_sun) {
+    float ph_r = 0.0596831 * (1.0 + mu * mu);
+    float g2 = SKY_MIE_G * SKY_MIE_G;
+    float den = max(1.0 + g2 - 2.0 * SKY_MIE_G * mu, 1e-4);
+    float ph_m = 0.0795775 * (1.0 - g2) / (den * sqrt(den));
+
+    float m_view = 1.0 / (abs(dir.y) + 0.15);
+    float3 t_view = exp(-(SKY_BETA_R + SKY_BETA_M) * m_view);
+
+    return (SKY_BETA_R * ph_r + SKY_BETA_M * ph_m) * m_view * t_view * t_sun * SKY_DOME_SCALE;
 }
+
+// The smooth scattering dome — NO sun disc. Defined over the FULL sphere (the
+// SH projection integrates all of it); below the horizon is the ground bouncing
+// the dome back, blended over a band so order-2 SH doesn't ring on a step.
+//
+// The blend band is narrow, so each end returns EARLY rather than evaluating
+// both scatters and lerping one away at weight 0 or 1 (sky.rs, same shape).
+float3 sky_dome(float3 d) {
+    float3 t_sun = exp(-(SKY_BETA_R + SKY_BETA_M) / (max(sun.y, 0.0) + 0.15));
+    float t = saturate((d.y + 0.05) / 0.10);
+    if (t >= 1.0) return sky_scatter(d, clamp(dot(d, sun.xyz), -1.0, 1.0), t_sun);
+    float3 dm = float3(d.x, abs(d.y), d.z);
+    float3 ground =
+        sky_scatter(dm, clamp(dot(dm, sun.xyz), -1.0, 1.0), t_sun) * SKY_GROUND_ALBEDO;
+    if (t <= 0.0) return ground;
+    float3 sky = sky_scatter(d, clamp(dot(d, sun.xyz), -1.0, 1.0), t_sun);
+    return lerp(ground, sky, t);
+}
+
+// The disc, ANTIALIASED against the ray's angular footprint (sky::disc). The
+// limb really is a hard step, but a RAY has a footprint — a pixel that half
+// covers the sun gets half its radiance. Without this the edge is a binary
+// per-ray test: jagged still, crawling under motion at 1 spp. half_angle = 0
+// reproduces the hard step exactly.
+//
+// The angular radius is DERIVED from sun.w (= cos of it), never re-declared as
+// a literal here: sky::SUN_ANGULAR_RADIUS is a knob its own doc invites you to
+// turn (narrowing it sharpens shadows and brightens the disc without moving
+// exposure), and a second copy on this side would leave the AA band ramping
+// around the old angle while the hard-step test tracked the new one — a bright
+// or dark annulus on the GPU sun that no gate compares against the CPU's.
+float3 sky_disc(float3 d, float half_angle) {
+    float c = clamp(dot(d, sun.xyz), -1.0, 1.0);
+    if (half_angle <= 1e-7) return c >= sun.w ? sun_l.xyz : float3(0.0, 0.0, 0.0);
+    float radius = acos(clamp(sun.w, -1.0, 1.0));
+    float theta = acos(c);
+    float cov = saturate((radius + half_angle - theta) / (2.0 * half_angle));
+    return sun_l.xyz * cov;
+}
+
+// What an escaping ray SEES: dome + disc. DISPLAY paths only. `half_angle` is
+// the ray's angular footprint (primary: pixel_cone/2).
+float3 sky_radiance(float3 d, float half_angle) { return sky_dome(d) + sky_disc(d, half_angle); }
+
+// Balance heuristic (sky::mis_weight). The sun's specular is reachable both by
+// light sampling (direct_s) and by the VNDF reflection ray landing in the disc;
+// counting both double-counts it AND fires ~1e3-radiance fireflies into FSR's
+// un-denoised residual on rough surfaces.
+float sky_mis_weight(float p_bsdf, float p_light) {
+    float s = p_bsdf + p_light;
+    return s > 0.0 ? p_bsdf / s : 0.0;
+}
+
+// The light-sampling pdf: uniform in the sun's cone. Omega = 2pi(1 - cos_r).
+float sky_light_pdf() { return 1.0 / (6.28318530718 * (1.0 - sun.w)); }
+// sun_sample_dir is defined below, after onb().
 
 // glam normalize_or_zero.
 float3 normalize_or_zero(float3 v) {
@@ -278,8 +367,27 @@ void gbuf_write_sky(uint pi, float fx, float fy, float3 dir) {
     gbuf[pi] = g;
 }
 
-// shade.rs::AMBIENT — also consumed by the compose pass (hemi AO mode).
-static const float3 AMBIENT = float3(0.14, 0.17, 0.23);
+// sh.rs::Sh9::irradiance — cosine-weighted sky irradiance at `n`, DIVIDED BY PI
+// (the renderer convention: a uniform sky of radiance L returns exactly L, so
+// this drops straight into the slot the old flat AMBIENT constant occupied).
+// Ramamoorthi & Hanrahan 2001's closed form: the clamped-cosine kernel is a
+// zonal harmonic (A0 = pi, A1 = 2pi/3, A2 = pi/4) and folding those into the
+// basis constants collapses the hemisphere integral to these five numbers.
+// Clamped at zero: a truncated series of a sky with a horizon step rings, and
+// negative irradiance is unphysical. Term-for-term with the Rust; change both
+// together.
+float3 sh_irradiance(float3 n) {
+    const float C1 = 0.429043, C2 = 0.511664, C3 = 0.743125,
+                C4 = 0.886227, C5 = 0.247708;
+    float x = n.x, y = n.y, z = n.z;
+    float3 e = sky_sh[0].xyz * C4 - sky_sh[6].xyz * C5
+             + sky_sh[6].xyz * (C3 * z * z)
+             + sky_sh[8].xyz * (C1 * (x * x - y * y))
+             + (sky_sh[4].xyz * (x * y) + sky_sh[7].xyz * (x * z)
+                + sky_sh[5].xyz * (y * z)) * (2.0 * C1)
+             + (sky_sh[3].xyz * x + sky_sh[1].xyz * y + sky_sh[2].xyz * z) * (2.0 * C2);
+    return max(e * (1.0 / PI), 0.0);
+}
 
 // Duff et al. orthonormal basis; right-handed (t1 x t2 = n) — the hemisphere
 // octant orientation relies on it (sphcell::self_test asserts the CPU twin).
@@ -289,6 +397,19 @@ void onb(float3 n, out float3 t1, out float3 t2) {
     float b = n.x * n.y * a;
     t1 = float3(1.0 + s * n.x * n.x * a, s * b, -s * n.x);
     t2 = float3(b, s + n.y * n.y * a, -n.y);
+}
+
+// Uniform-in-cone sample toward the sun disc (sky::Sun::sample_dir) — the exact
+// replacement for the old rect sample, consuming the SAME two draws in the same
+// order, which is what keeps the same-seed bit-identity contracts intact. Needs
+// onb(), hence its position here rather than up with the rest of the sky.
+float3 sun_sample_dir(float r1, float r2) {
+    float cos_t = 1.0 - r1 * (1.0 - sun.w);
+    float sin_t = sqrt(max(1.0 - cos_t * cos_t, 0.0));
+    float phi = 6.28318530718 * r2;
+    float3 st1, st2;
+    onb(sun.xyz, st1, st2);
+    return st1 * (cos(phi) * sin_t) + st2 * (sin(phi) * sin_t) + sun.xyz * cos_t;
 }
 
 // --- Scene textures + UV stream (space1; the RP_SCENE_TEX table) --------------

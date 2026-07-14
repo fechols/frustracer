@@ -216,7 +216,7 @@ void cs_sky(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
         uint x = p0.x + i % w;
         uint y = p0.y + i / w;
         float3 dir = ray_dir(float(x) + 0.5, float(y) + 0.5);
-        float3 c = sky_color(dir);
+        float3 c = sky_radiance(dir, pixel_cone * 0.5);
         uint pi = y * rw + x;
         uint i3 = pi * 3u;
         // The compose pass is the single accum splat site; sky pixels carry

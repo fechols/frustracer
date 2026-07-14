@@ -56,8 +56,8 @@ exercised).
 
 Secondary lighting is an integral of incoming light over the hemisphere above
 each shading point — and the same divide-and-conquer that drives the screen
-quadtree can dispatch that search (**H** cycles it: off → AO → GI →
-GI + shadow shafts; still frames only).
+quadtree can dispatch that search (**H** cycles it: off → AO → GI; still frames
+only).
 
 The hemisphere is a quadtree too, but built from **spherical triangles**
 instead of squares: the root is the tangent half-space (a 1-plane frustum),
@@ -104,16 +104,93 @@ scene — but it is *converged* immediately where the sampled path needs
 hundreds of accumulation frames, and open scenes adapt (most of the
 hemisphere resolves analytically at octant scale).
 
-**Shadow shafts** apply the same machinery to the area light: a frustum from
-the shading point through the light's corners (clipped by the tangent plane —
-without that 5th plane the own surface's AABB hugs the apex and nothing is
-ever proven lit), subdivided once on ambiguity. Samples landing in a subrect
-proven empty skip their occlusion ray outright — same sampling, same
-estimator, identical image; 75% of shadow rays vanish on the default scene.
-The candid result: at 2–4 shadow samples/point the culling query costs more
-than the rays it saves (~3× net slower), so shafts are off by default — the
-technique needs cross-point claim sharing (the temporal cache's δ-subtraction
-transfer, future work) before it pays.
+**Shadow shafts** (removed) applied the same machinery to the light: a frustum
+from the shading point through the *rectangular* light's corners, subdivided
+once on ambiguity, so samples landing in a subrect proven empty skipped their
+occlusion ray outright — same sampling, same estimator, identical image; 75% of
+shadow rays vanished on the default scene. The candid result was that at 2–4
+shadow samples/point the culling query cost more than the rays it saved (~3× net
+slower). It is gone now for a second reason: its whole premise was a *finite
+rectangle with four corners*, and the light is a sun disc at infinity. Same
+economics killed a specular-bounce cone accelerator — one query costs more than
+one ray's traversal.
+
+## The lighting model: one sky, split by frequency
+
+There is exactly one light: a **sky sphere at infinity**, of which the sun is a
+bright patch. It is *stored* in two representations, and the split is by
+frequency, because the two bands need different sampling strategies:
+
+| band | representation | sampled how |
+|---|---|---|
+| scattering dome (smooth — Rayleigh + Mie) | order-2 SH, 9 RGB coefficients | analytic irradiance, **zero rays** |
+| sun disc (sharp) | direction + angular radius + radiance | cone-sampled, **shadow-rayed** |
+
+This is forced, not stylistic. Spherical harmonics have **no notion of
+visibility** — you cannot cast a shadow ray at a coefficient — and a 2° sun
+occupies ~0.01% of the hemisphere, so gathering it by cosine sampling is pure
+noise. Conversely, irradiance is a convolution of radiance with a clamped-cosine
+kernel whose own spectrum collapses above l = 2, so 9 coefficients carry >99% of
+what a Lambertian surface can see. Each representation is doing the job the other
+physically cannot. (This is why renderers with full HDR environment maps *still*
+keep an explicit sun: to importance-sample the bright region, you need it as a
+separable object.)
+
+**The invariant that keeps it honest: the sun disc is delivered exactly once per
+light path.** A ray sees the disc only if no light-sampling strategy already
+covers the sun along that path — the camera's own miss and refraction through
+glass see it (nothing else delivers it there); every *gather* path (the
+hemisphere integrator's cells, GI bounce misses, the SH projection itself)
+integrates the **sun-free dome**, because the direct-lighting loop already
+delivered the sun with its own shadow ray. The specular reflection ray is the one
+path both strategies can reach, so it takes the dome plus a **MIS-weighted** disc
+(balance heuristic; zero extra rays, zero extra random draws). Get the gather
+paths wrong and you double-count the sun *and* fire fireflies into the
+hemisphere's fixed-point accumulator.
+
+It also rescues the hemisphere integrator: its empty cells are evaluated by
+*centroid point-sampling*, so a cell coarser than the sun would either miss the
+disc entirely or splat the whole cell at sun radiance. Excluding the disc removes
+the sharp feature outright — the frequency split isn't a convenience, it's what
+makes the analytic path correct.
+
+The renderer previously had *two* suns that disagreed: a soft `dot^32` glow in
+the sky (a backdrop, too bright to be a light) and, separately, a 4×4 rectangular
+lamp 12 units away with `1/d²` falloff that actually lit the scene. Mirrors
+exposed the seam — the "sun" reflected as a **square**, because a specular
+highlight is an image of the light's shape. It is a round disc now, and it is the
+same sun that casts the shadows. A pleasing check: the ambient the physical
+Rayleigh sky produces, (0.120, 0.176, 0.247), lands within a few percent of the
+hand-tuned constant it replaced — the old guess was a good one, and it is now
+*derived*.
+
+### Glare, and why the sun is not the thing that needed fixing
+
+Looking straight at the sun, the disc first rendered as a flat white circle
+stamped on the aureole — a hard ring where the two met. The tempting fix is to
+soften the sun. That would be wrong: the solar limb *is* a hard edge, a ~650×
+radiance step, and the tonemap saturates above radiance ~5, so the disc lands at
+a dead-flat 1.0 no matter what shape you give it.
+
+Photographs and eyes don't show that ring, and the reason isn't the sun — it's
+the **optics in between**. Light scatters in the lens, the cornea, the vitreous,
+so a point source lands on the sensor as a bright core inside a wide,
+heavy-tailed halo. That's what makes a sun look like a sun, and it belongs at the
+display stage, not in the sky.
+
+So `src/bloom.rs` models the scatter: a mip pyramid whose octave-spaced blurs sum
+into the heavy tail a single Gaussian can't produce, folded back with a 3×3 tent
+(a plain bilinear tap leaves the box kernel's *square* footprint visible in the
+core — the glare comes out as a rounded rectangle, which is very obvious on the
+one thing the pass exists for). The composite is **energy-conserving** —
+`(1-s)·hdr + s·glare`, not `hdr + glare` — because glare *redistributes* light
+rather than creating it. A uniformly lit frame must come back unchanged, which is
+the gate, and it also means bloom can never be accidentally tuned into an
+exposure change.
+
+It runs on whatever image the tonemap is about to read, so it never touches
+`accum`, the temporal cache, or any upscaler guide — every radiance gate in the
+suite is structurally blind to it.
 
 ## Parallelism
 
@@ -187,7 +264,7 @@ staging buffers bound directly as tensors — no per-frame CPU traffic).
 | **O** | quadtree debug overlay: subdivision-depth heatmap + tile borders |
 | **G** | toggle DLSS Ray Reconstruction (when available) |
 | **J** | toggle NPPD neural denoising (in XeSS mode: the pre-upscale slot) |
-| **H** | hemisphere frustum bounces: off → AO → GI → GI + shadow shafts (still frames) |
+| **H** | hemisphere frustum bounces: off → AO → GI (still frames) |
 | **B** | toggle GPU vs CPU tonemap (non-DLSS mode) |
 | **1 / 2 / 3** | quality presets (shadow/AO samples, reflections) |
 | **C** | verify current view against the reference (prints counters) |

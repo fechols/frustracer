@@ -19,6 +19,7 @@ pub mod pix;
 pub mod rr;
 pub mod streamline;
 pub mod streamline_sys;
+pub mod bloom;
 pub mod tonemap;
 pub mod trace;
 pub mod upload;
@@ -132,6 +133,10 @@ struct FsrState {
 pub struct GpuContext {
     d3d: D3d,
     passes: tonemap::Passes,
+    /// Glare. Always built (never Option): the tonemap PS declares its halo SRV
+    /// unconditionally, so the descriptor must be valid even under `--no-bloom`,
+    /// where the pass simply isn't recorded and strength is 0.
+    bloom: bloom::BloomGpu,
     blit: upload::BlitUpload,
     hdr: upload::HdrUpload,
     /// The GPU-resident tracer (--gpu): quadtree + shading in compute with
@@ -193,6 +198,32 @@ fn rr_sl_sequence(
     sl.tag_resources(token, 0, &rr.tags(fc.rw, fc.rh), list_raw)?;
     sl.evaluate(streamline_sys::FEATURE_DLSS_RR, token, 0, list_raw)?;
     Ok(())
+}
+
+/// Register a texture the tonemap can present FROM: its SRV goes into the
+/// tonemap's heap (for the draw) and into the glare pyramid's heap (for the
+/// compute read), in the matching slot of each.
+///
+/// The two are paired here, in one call, deliberately. Only ONE CBV_SRV_UAV heap
+/// may be bound at a time, so bloom cannot reach into the tonemap's heap — and it
+/// cannot copy the descriptor across at present time either, because
+/// `CopyDescriptors` may not READ from a shader-visible heap. Each source
+/// therefore needs its descriptor created in BOTH heaps, and a source that got
+/// one but not the other would present fine and simply lose its glare — a silent
+/// failure. Route every tonemap source through here and it can't happen.
+///
+/// (`SRV_SLOT_BLOOM` is bloom's OUTPUT into the tonemap heap and is not a source;
+/// it stays a plain `Passes::create_srv`.)
+fn wire_tonemap_src(
+    device: &ID3D12Device,
+    passes: &tonemap::Passes,
+    bloom: &bloom::BloomGpu,
+    res: &ID3D12Resource,
+    format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+    slot: u32,
+) {
+    passes.create_srv(device, res, format, slot);
+    bloom.create_source_srv(device, res, format, slot);
 }
 
 impl GpuContext {
@@ -272,12 +303,21 @@ impl GpuContext {
         let (rr_opt, rr_min, rr_max) = Self::query_rr_res(sl.as_ref(), w, h);
 
         let passes = tonemap::Passes::new(&d3d.device)?;
+        let bloom = bloom::BloomGpu::new(&d3d.device, w as u32, h as u32)?;
+        passes.create_srv(
+            &d3d.device,
+            bloom.glare_srv_source(),
+            windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+            tonemap::SRV_SLOT_BLOOM,
+        );
         let blit = upload::BlitUpload::new(&d3d, w, h)?;
         let hdr = upload::HdrUpload::new(&d3d, w, h)?;
         let rr_res = if sl.is_some() {
             let r = rr::RrResources::new(&d3d.device, rr_opt, rr_min, rr_max, w, h)?;
-            passes.create_srv(
+            wire_tonemap_src(
                 &d3d.device,
+                &passes,
+                &bloom,
                 &r.output,
                 windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
                 tonemap::SRV_SLOT_RR,
@@ -286,14 +326,18 @@ impl GpuContext {
         } else {
             None
         };
-        passes.create_srv(
+        wire_tonemap_src(
             &d3d.device,
+            &passes,
+            &bloom,
             &blit.texture,
             d3d12::SWAPCHAIN_FORMAT,
             tonemap::SRV_SLOT_BLIT,
         );
-        passes.create_srv(
+        wire_tonemap_src(
             &d3d.device,
+            &passes,
+            &bloom,
             &hdr.texture,
             windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
             tonemap::SRV_SLOT_HDR,
@@ -310,8 +354,10 @@ impl GpuContext {
         let mut fsr_state: Option<FsrState> = None;
         if sl.is_none() {
             let wire_fsr = |s: FsrState| {
-                passes.create_srv(
+                wire_tonemap_src(
                     &d3d.device,
+                    &passes,
+                    &bloom,
                     s.res.upscaled(),
                     windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
                     tonemap::SRV_SLOT_FSR,
@@ -329,8 +375,10 @@ impl GpuContext {
                 // frame uploads and names its own sub-rect (dynamic res).
                 match Self::init_xess(&opts.xess_dir, &d3d.device, w, h, opts.xess_autoexposure) {
                     Ok(s) => {
-                        passes.create_srv(
+                        wire_tonemap_src(
                             &d3d.device,
+                            &passes,
+                            &bloom,
                             &s.res.output,
                             windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
                             tonemap::SRV_SLOT_XESS,
@@ -363,6 +411,7 @@ impl GpuContext {
             _proxy_factory: proxy_factory,
             d3d,
             passes,
+            bloom,
             blit,
             hdr,
             trace: None,
@@ -499,14 +548,27 @@ impl GpuContext {
         self.d3d.resize(w, h)?;
         self.blit = upload::BlitUpload::new(&self.d3d, w, h)?;
         self.hdr = upload::HdrUpload::new(&self.d3d, w, h)?;
+        // The glare pyramid is window-sized; rebuild it and re-point the tonemap's
+        // halo SRV at the new level 0 (the old resource is gone).
+        self.bloom.set_res(&self.d3d.device, w, h)?;
         self.passes.create_srv(
             &self.d3d.device,
+            self.bloom.glare_srv_source(),
+            windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+            tonemap::SRV_SLOT_BLOOM,
+        );
+        wire_tonemap_src(
+            &self.d3d.device,
+            &self.passes,
+            &self.bloom,
             &self.blit.texture,
             d3d12::SWAPCHAIN_FORMAT,
             tonemap::SRV_SLOT_BLIT,
         );
-        self.passes.create_srv(
+        wire_tonemap_src(
             &self.d3d.device,
+            &self.passes,
+            &self.bloom,
             &self.hdr.texture,
             windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
             tonemap::SRV_SLOT_HDR,
@@ -514,8 +576,10 @@ impl GpuContext {
         if self.sl.is_some() {
             let (opt, min, max) = Self::query_rr_res(self.sl.as_ref(), w, h);
             let r = rr::RrResources::new(&self.d3d.device, opt, min, max, w, h)?;
-            self.passes.create_srv(
+            wire_tonemap_src(
                 &self.d3d.device,
+                &self.passes,
+                &self.bloom,
                 &r.output,
                 windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
                 tonemap::SRV_SLOT_RR,
@@ -526,8 +590,10 @@ impl GpuContext {
             WiredUpscaler::Xess => {
                 match Self::init_xess(&opts.xess_dir, &self.d3d.device, w, h, opts.xess_autoexposure) {
                     Ok(s) => {
-                        self.passes.create_srv(
+                        wire_tonemap_src(
                             &self.d3d.device,
+                            &self.passes,
+                            &self.bloom,
                             &s.res.output,
                             windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
                             tonemap::SRV_SLOT_XESS,
@@ -545,8 +611,10 @@ impl GpuContext {
                 };
                 match Self::init_fsr(&opts.ffx_dir, &self.d3d.device, w, h, opts.debug, flavor) {
                     Ok(s) => {
-                        self.passes.create_srv(
+                        wire_tonemap_src(
                             &self.d3d.device,
+                            &self.passes,
+                            &self.bloom,
                             s.res.upscaled(),
                             windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
                             tonemap::SRV_SLOT_FSR,
@@ -833,8 +901,10 @@ impl GpuContext {
                 }
             }
         }
-        self.passes.create_srv(
+        wire_tonemap_src(
             &self.d3d.device,
+            &self.passes,
+            &self.bloom,
             &tg.hdr,
             windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
             tonemap::SRV_SLOT_GPU,
@@ -873,8 +943,10 @@ impl GpuContext {
         if gbuf {
             self.wire_session_feed(rw, rh, |kind, targets| d.wire_feed(&dev, kind, targets))?;
         }
-        self.passes.create_srv(
+        wire_tonemap_src(
             &self.d3d.device,
+            &self.passes,
+            &self.bloom,
             &d.hdr,
             windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
             tonemap::SRV_SLOT_DXR,
@@ -2267,7 +2339,58 @@ impl GpuContext {
         self.d3d.end_frame(slot)
     }
 
+    /// The resource behind a tonemap SRV slot. Bloom needs the RESOURCE, not just
+    /// its descriptor, because its downsample is a compute dispatch and D3D12
+    /// state is per-resource (see `fullscreen_to_backbuffer`). Keep in lockstep
+    /// with the `passes.create_srv` calls in `new` / `resize_output` /
+    /// `ensure_trace` / `ensure_dxr` — an omission here silently costs that mode
+    /// its glare rather than corrupting anything.
+    fn tonemap_source(&self, srv_slot: u32) -> Option<&ID3D12Resource> {
+        match srv_slot {
+            tonemap::SRV_SLOT_HDR => Some(&self.hdr.texture),
+            tonemap::SRV_SLOT_RR => self.rr.as_ref().map(|r| &r.output),
+            tonemap::SRV_SLOT_XESS => self.xess.as_ref().map(|s| &s.res.output),
+            tonemap::SRV_SLOT_FSR => self.fsr.as_ref().map(|s| s.res.upscaled()),
+            tonemap::SRV_SLOT_GPU => self.trace.as_ref().map(|t| &t.hdr),
+            tonemap::SRV_SLOT_DXR => self.dxr.as_ref().map(|d| &d.hdr),
+            _ => None,
+        }
+    }
+
     fn fullscreen_to_backbuffer(&self, use_tonemap: bool, srv_slot: u32, inv_samples: f32) {
+        // Glare (src/bloom.rs): a display-stage pass on whatever the tonemap is
+        // about to read, so EVERY GPU chain — RR, XeSS, FSR, plain, DXR — gets it
+        // from this one place, and nothing upstream (accum, the temporal cache,
+        // the upscaler guides) is touched. `--no-bloom` records nothing and
+        // passes strength 0, which is what makes it bit-identical to the
+        // pre-bloom presentation.
+        let bloom_src = if use_tonemap && crate::bloom::enabled() {
+            self.tonemap_source(srv_slot)
+        } else {
+            None
+        };
+        let bloom = if let Some(src) = bloom_src {
+            // Every tonemap source RESTS in PIXEL_SHADER_RESOURCE — that is the
+            // state the draw below wants. The pyramid's downsample, though, is a
+            // COMPUTE dispatch, and D3D12 requires NON_PIXEL_SHADER_RESOURCE for
+            // a shader-resource read outside the pixel stage: leaving it in PSR
+            // is a debug-layer error on every bloomed frame (both are read states,
+            // so drivers wave it through, which is exactly why it went unnoticed —
+            // the layer only arms under --gpu-debug). Borrow it for the pyramid
+            // and hand it back before the draw.
+            let (psr, npsr) = (
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            );
+            unsafe { self.d3d.list.ResourceBarrier(&[transition(src, psr, npsr)]) };
+            self.bloom.record(&self.d3d.list, srv_slot);
+            unsafe { self.d3d.list.ResourceBarrier(&[transition(src, npsr, psr)]) };
+            let (gw, gh) = self.bloom.glare_dims();
+            (crate::bloom::strength(), 1.0 / gw as f32, 1.0 / gh as f32)
+        } else {
+            (0.0, 0.0, 0.0)
+        };
+
         let bb = unsafe { self.d3d.swapchain.GetCurrentBackBufferIndex() };
         let backbuffer = &self.d3d.backbuffers[bb as usize];
         unsafe {
@@ -2283,6 +2406,7 @@ impl GpuContext {
             pso,
             srv_slot,
             inv_samples,
+            bloom,
             self.d3d.rtv_handle(bb),
             self.d3d.width,
             self.d3d.height,
@@ -2293,6 +2417,9 @@ impl GpuContext {
                 D3D12_RESOURCE_STATE_RENDER_TARGET,
                 D3D12_RESOURCE_STATE_PRESENT,
             )]);
+        }
+        if bloom.0 > 0.0 {
+            self.bloom.restore(&self.d3d.list);
         }
     }
 }

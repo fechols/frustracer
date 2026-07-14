@@ -64,7 +64,10 @@ void cs_hemi_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
                                    0.0, HEMI_CONE_SPREAD, false, w3, o3, n3, ps_unused);
             hemi_add3(pt.pixel, l * weight);
         } else {
-            hemi_add3(pt.pixel, sky_color(d) * weight);
+            // The DOME, not the full sky: a GI leaf ray landing in the sun disc
+            // would double-count direct_d AND saturate this 2^18 fixed-point
+            // accumulator outright (sky.rs's invariant).
+            hemi_add3(pt.pixel, sky_dome(d) * weight);
         }
     }
 }
