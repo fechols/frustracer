@@ -11,7 +11,7 @@
 // SLOT-REFS, `(node << 3) | slot` (ftree.rs's encoding); they ride the same
 // 64-u32 cut_pool slots. ROOT_CUT_SLOT expands to the wide root's occupied
 // slots in place: entry(0, s) == s, so the sentinel needs no seed changes —
-// the occupancy test (bnode == FT_INVALID) skips the empty tail. Rays never
+// the occupancy test (the occ bitmask) skips the empty tail. Rays never
 // consume these cuts on the GPU (every ray is DXR RayQuery), so no slot->
 // binary translation exists here at all.
 //
@@ -25,32 +25,60 @@
 
 #ifdef FTREE
 
-// ftree.rs::FNode, uploaded VERBATIM (repr(C), 256 B, no padding): SoA boxes
-// so the 8 slot tests are contiguous loads, `child` = wide child id or
-// FT_INVALID for terminal slots, `bnode` = the binary node id (occupancy
-// marker here; FT_INVALID = empty slot, its box is inverted-empty).
+// ftree.rs::QFNode — the QUANTIZED wire format FTree::quantized() produces
+// at upload (repr(C), 112 B, lockstep with the Rust layout; the CPU keeps
+// the f32 FNode — the per-processor split verdict): per-node frame (org +
+// per-axis quantization step sca) and u8 slot boxes rounded OUTWARD — every
+// decoded box CONTAINS its binary node's true AABB (self_test-audited), so
+// all three prunes only weaken conservatively and the bound can never
+// overshoot. The u8 rows ride as uint2 halves (slots 0-3 in .x, 4-7 in .y)
+// so extraction is a select + shift, never a dynamic array index (the
+// scratch-spill lesson). `child` = wide child id or FT_INVALID for terminal
+// slots; `occ` bit s = slot occupied (the CPU-side bnode array is not
+// uploaded — GPU cuts never seed rays).
 struct FtNode {
-    float mnx[8];
-    float mny[8];
-    float mnz[8];
-    float mxx[8];
-    float mxy[8];
-    float mxz[8];
+    float3 org;
+    float3 sca;
+    uint2 qmnx;
+    uint2 qmny;
+    uint2 qmnz;
+    uint2 qmxx;
+    uint2 qmxy;
+    uint2 qmxz;
     uint child[8];
-    uint bnode[8];
+    uint occ;
+    uint pad;
 };
 StructuredBuffer<FtNode> ft_nodes : register(t0);
 
 #define FT_INVALID 0xffffffffu
+
+uint ft_q8(uint2 row, uint s) {
+    return ((s < 4 ? row.x : row.y) >> ((s & 3u) * 8u)) & 0xffu;
+}
+
+// Decode one slot's box: org + q * sca per face — the EXACT expression the
+// Rust builder verify-adjusted each q against. `precise`, or a mad/fma
+// contraction could round a decoded face inward past the true box (the
+// false-sky class); the CPU side is a bare mul-then-add, so bit-parity
+// requires the same here.
+void ft_slot_box(FtNode nd, uint s, out float3 mn, out float3 mx) {
+    float3 qn = float3(ft_q8(nd.qmnx, s), ft_q8(nd.qmny, s), ft_q8(nd.qmnz, s));
+    float3 qx = float3(ft_q8(nd.qmxx, s), ft_q8(nd.qmxy, s), ft_q8(nd.qmxz, s));
+    precise float3 lo = nd.org + qn * nd.sca;
+    precise float3 hi = nd.org + qx * nd.sca;
+    mn = lo;
+    mx = hi;
+}
 
 // Test one slot's box against the frustum/ball/best prunes. False = culled
 // (empty slot, outside a plane, or inside the proven-empty ball); true hands
 // back d = max(dist, t_start), the slot's conservative bound candidate.
 bool ft_slot(TF f, FtNode nd, uint s, float t_start, out float d) {
     d = 0.0;
-    if (nd.bnode[s] == FT_INVALID) return false;
-    float3 mn = float3(nd.mnx[s], nd.mny[s], nd.mnz[s]);
-    float3 mx = float3(nd.mxx[s], nd.mxy[s], nd.mxz[s]);
+    if (((nd.occ >> s) & 1u) == 0) return false;
+    float3 mn, mx;
+    ft_slot_box(nd, s, mn, mx);
     if (aabb_outside(f, mn, mx)) return false;
     if (point_aabb_max_dist(f.origin, mn, mx) <= t_start) return false;
     d = max(point_aabb_dist(f.origin, mn, mx), t_start);
@@ -157,23 +185,19 @@ uint refine_cut(TF f, float t_ball, float t_far, uint parent_slot, uint parent_l
         uint ni = e >> 3;
         uint s = e & 7u;
         FtNode nd = ft_nodes[ni];
-        if (nd.bnode[s] == FT_INVALID) continue;
-        float3 mn = float3(nd.mnx[s], nd.mny[s], nd.mnz[s]);
-        float3 mx = float3(nd.mxx[s], nd.mxy[s], nd.mxz[s]);
+        if (((nd.occ >> s) & 1u) == 0) continue;
+        float3 mn, mx;
+        ft_slot_box(nd, s, mn, mx);
         if (aabb_outside(f, mn, mx)) continue;
         if (point_aabb_max_dist(f.origin, mn, mx) <= t_ball) continue;
         if (has_far && point_aabb_dist(f.origin, mn, mx) >= t_far) continue;
         uint c = nd.child[s];
         if (c != FT_INVALID) {
-            FtNode cn = ft_nodes[c];
-            uint n_occ = 0;
-            [unroll] for (uint cs = 0; cs < 8; ++cs) {
-                if (cn.bnode[cs] != FT_INVALID) ++n_occ;
-            }
-            if (olen + wlen + n_occ <= LANE_STACK) {
-                [unroll] for (uint cs2 = 0; cs2 < 8; ++cs2) {
-                    if (cn.bnode[cs2] != FT_INVALID) {
-                        g_stack[base + wlen++] = (c << 3) | cs2;
+            uint c_occ = ft_nodes[c].occ;
+            if (olen + wlen + countbits(c_occ) <= LANE_STACK) {
+                [unroll] for (uint cs = 0; cs < 8; ++cs) {
+                    if ((c_occ >> cs) & 1u) {
+                        g_stack[base + wlen++] = (c << 3) | cs;
                     }
                 }
                 continue;

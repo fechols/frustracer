@@ -61,6 +61,80 @@ pub struct FNode {
     bnode: [u32; WIDTH],
 }
 
+/// The GPU wire format of one wide node — 112 B vs FNode's 256 (the dead
+/// `bnode` lanes dropped: GPU cuts never seed rays; occupancy is the `occ`
+/// bitmask), boxes quantized to u8 coords in a per-node frame, rounded
+/// OUTWARD so every decoded box CONTAINS its FNode original. Sound for the
+/// bound-query consumer and only that one: a bigger box is plane-culled
+/// less, its `max_dist <= t_start` ball test fires less, and its
+/// `point_aabb_dist` only shrinks — a weaker but valid lower bound, never an
+/// overshoot. Produced by `FTree::quantized` at upload; consumed by
+/// ftree.hlsli's FtNode (field-for-field lockstep, decode `org + q * sca`
+/// kept `precise` there — an fma contraction could round a face inward).
+///
+/// Split verdict (measured): the CPU keeps the f32 FNode — the decode ALU
+/// cost +9-15% on the hemi bench with node counts unchanged; the GPU takes
+/// this format — San Miguel `gpu hybrid` medians 2.86 vs 3.03 ms (the
+/// bandwidth trade pays once the tree exceeds cache; the L2-resident
+/// default scene reads ~+6%, that row's noise band) and the tree upload
+/// drops -56% (~1.5 GB -> 0.65 GB at the 90M-tri tiled scale).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct QFNode {
+    /// Frame origin: componentwise min over the occupied slot boxes.
+    org: [f32; 3],
+    /// Quantization step per axis: ~ext/255, ulp-bumped so q = 255 decodes
+    /// at-or-past the frame max. 0 on flat axes (decode = org, exact).
+    sca: [f32; 3],
+    /// Per-axis quantized slot mins `[axis][slot]`, decoding <= the true min.
+    qmn: [[u8; WIDTH]; 3],
+    /// Per-axis quantized slot maxes, decoding >= the true max.
+    qmx: [[u8; WIDTH]; 3],
+    child: [u32; WIDTH],
+    /// Occupancy bitmask (bit s = slot s holds a binary node).
+    occ: u32,
+    _pad: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<QFNode>() == 112);
+
+/// Next representable f32 up — the sca bump and the outward verify-adjust
+/// step. Callers only pass finite positives.
+#[inline]
+fn bump_up(x: f32) -> f32 {
+    f32::from_bits(x.to_bits() + 1)
+}
+
+/// Largest q whose decode `org + q·sca` lands at or below `v` (outward for a
+/// min face). q = 0 decodes to exactly `org <= v` by frame construction, so
+/// the walk-down always terminates on a sound value.
+#[inline]
+fn quantize_min(v: f32, org: f32, sca: f32) -> u8 {
+    if sca == 0.0 {
+        return 0; // flat axis: decode == org == v, exact
+    }
+    let mut q = (((v - org) / sca).floor().clamp(0.0, 255.0)) as i32;
+    while q > 0 && org + q as f32 * sca > v {
+        q -= 1;
+    }
+    q as u8
+}
+
+/// Smallest q whose decode lands at or above `v` (outward for a max face).
+/// q = 255 decodes at-or-past the frame max by the sca bump, so the walk-up
+/// always terminates on a sound value.
+#[inline]
+fn quantize_max(v: f32, org: f32, sca: f32) -> u8 {
+    if sca == 0.0 {
+        return 0;
+    }
+    let mut q = (((v - org) / sca).ceil().clamp(0.0, 255.0)) as i32;
+    while q < 255 && ((org + q as f32 * sca) < v) {
+        q += 1;
+    }
+    q as u8
+}
+
 pub struct FTree {
     pub nodes: Vec<FNode>,
     /// The whole-tree cut (the analog of the binary `[0]`): the root node's
@@ -84,6 +158,65 @@ impl FTree {
 
     pub fn bytes(&self) -> usize {
         self.nodes.len() * std::mem::size_of::<FNode>()
+    }
+
+    /// GPU-upload size of the quantized wire format.
+    pub fn quantized_bytes(&self) -> usize {
+        self.nodes.len() * std::mem::size_of::<QFNode>()
+    }
+
+    /// Convert to the GPU wire format (QFNode): per node, a frame over the
+    /// occupied slots' f32 boxes and every face quantized OUTWARD against
+    /// the exact decode expression. Node ids (and so slot-ref cuts) are
+    /// unchanged — the arrays are index-parallel.
+    pub fn quantized(&self) -> Vec<QFNode> {
+        self.nodes
+            .iter()
+            .map(|nd| {
+                let mut q = QFNode {
+                    org: [0.0; 3],
+                    sca: [0.0; 3],
+                    qmn: [[0; WIDTH]; 3],
+                    qmx: [[0; WIDTH]; 3],
+                    child: nd.child,
+                    occ: 0,
+                    _pad: 0,
+                };
+                let (mn, mx) = ([&nd.min_x, &nd.min_y, &nd.min_z], [&nd.max_x, &nd.max_y, &nd.max_z]);
+                for a in 0..3 {
+                    let (mut org, mut top) = (f32::INFINITY, f32::NEG_INFINITY);
+                    for s in 0..WIDTH {
+                        if nd.bnode[s] != INVALID {
+                            org = org.min(mn[a][s]);
+                            top = top.max(mx[a][s]);
+                        }
+                    }
+                    if !org.is_finite() {
+                        continue; // no occupied slots (empty-scene root only)
+                    }
+                    q.org[a] = org;
+                    let ext = top - org;
+                    if ext > 0.0 {
+                        let mut sca = ext / 255.0;
+                        while org + 255.0 * sca < top {
+                            sca = bump_up(sca);
+                        }
+                        q.sca[a] = sca;
+                    }
+                }
+                for s in 0..WIDTH {
+                    if nd.bnode[s] == INVALID {
+                        continue;
+                    }
+                    q.occ |= 1 << s;
+                    for a in 0..3 {
+                        q.qmn[a][s] = quantize_min(mn[a][s], q.org[a], q.sca[a]);
+                        q.qmx[a][s] = quantize_max(mx[a][s], q.org[a], q.sca[a]);
+                    }
+                }
+                q
+            })
+            .collect()
     }
 
     /// Deterministic collapse of the binary BVH: each wide node's slots are up
@@ -595,6 +728,66 @@ pub fn self_test(scene: &crate::scene::Scene, bvh: &Bvh) -> Result<(), String> {
             }
         }
     }
+    // The GPU wire format (QFNode, consumed by ftree.hlsli): CONTAINMENT is
+    // the soundness half — every decoded face at-or-outside the true f32
+    // face, per the exact `org + q * sca` decode expression — and per-face
+    // slack within ~one quantum is the tightness half (a frame/decode wiring
+    // error lands faces whole-extents off). The slack mean doubles as
+    // quantization anti-vacuity: ~0.5 quanta is the healthy signature.
+    // (Probe-level tightness can't be read off bound queries here: scenes
+    // keep their dominant y=0 ground plane AT its frame origin, which
+    // decodes exactly, so quantized bounds match binary on most probes.)
+    let qn = ft.quantized();
+    if qn.len() != ft.nodes.len() {
+        return Err("ftree quantized(): length mismatch".into());
+    }
+    let (mut slack_n, mut slack_sum) = (0u64, 0.0f64);
+    for (i, (q, nd)) in qn.iter().zip(&ft.nodes).enumerate() {
+        if q.child != nd.child {
+            return Err(format!("ftree quantized node {i}: child mismatch"));
+        }
+        for s in 0..WIDTH {
+            let occupied = nd.bnode[s] != INVALID;
+            if occupied != (q.occ & (1 << s) != 0) {
+                return Err(format!("ftree quantized node {i} slot {s}: occ mismatch"));
+            }
+            if !occupied {
+                continue;
+            }
+            let tmn = [nd.min_x[s], nd.min_y[s], nd.min_z[s]];
+            let tmx = [nd.max_x[s], nd.max_y[s], nd.max_z[s]];
+            for a in 0..3 {
+                // The decode expression, verbatim (ftree.hlsli's precise twin).
+                let dmn = q.org[a] + q.qmn[a][s] as f32 * q.sca[a];
+                let dmx = q.org[a] + q.qmx[a][s] as f32 * q.sca[a];
+                if dmn > tmn[a] || dmx < tmx[a] {
+                    return Err(format!(
+                        "ftree quantized node {i} slot {s} axis {a}: decoded face INSIDE the true box — rounded inward"
+                    ));
+                }
+                let slack = (tmn[a] - dmn).max(dmx - tmx[a]);
+                // Near-flat axes have sca below the f32 spacing at org — the
+                // decode grid can't resolve finer than an ulp there, so the
+                // bound carries an ulp term (containment above is still the
+                // exact soundness gate; measured trips: 1 ulp of coord
+                // magnitude on stress and San Miguel).
+                let mag = dmn.abs().max(dmx.abs());
+                if slack > 1.5 * q.sca[a] + 4.0 * f32::EPSILON * mag {
+                    return Err(format!(
+                        "ftree quantized node {i} slot {s} axis {a}: slack {slack:.3e} > quantum bound"
+                    ));
+                }
+                // Mean only over grid-resolvable lanes (sub-ulp sca lanes
+                // would put unbounded slack/sca ratios into the stat).
+                if q.sca[a] > f32::EPSILON * mag {
+                    slack_n += 1;
+                    slack_sum += (slack / q.sca[a]) as f64;
+                }
+            }
+        }
+    }
+    let slack_mean = if slack_n > 0 { (slack_sum / slack_n as f64) as f32 } else { 0.0 };
+
     // Behavioral: bounds match the binary query on a deterministic probe sweep.
     let diag = scene.diag;
     let mut rng = fastrand::Rng::with_seed(0x5EED_F00D);
@@ -647,9 +840,11 @@ pub fn self_test(scene: &crate::scene::Scene, bvh: &Bvh) -> Result<(), String> {
         }
     }
     eprintln!(
-        "ftree self-test: {} wide nodes ({:.1} MB) from {} binary | 512 probes, bounds match (worst rel {:.2e})",
+        "ftree self-test: {} wide nodes ({:.1} MB cpu, {:.1} MB gpu-quantized, slack mean {:.2} quanta) from {} binary | 512 probes, bounds match (worst rel {:.2e})",
         ft.nodes.len(),
         ft.bytes() as f32 / (1024.0 * 1024.0),
+        ft.quantized_bytes() as f32 / (1024.0 * 1024.0),
+        slack_mean,
         bvh.nodes.len(),
         worst,
     );

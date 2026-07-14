@@ -739,7 +739,7 @@ fn scene_stream_bytes(scene: &Scene, sw_bvh: SwAccel) -> usize {
     let bin = |b: &Bvh| b.nodes.len() * size_of::<GpuBvhNode>() + b.tri_idx.len() * 4;
     let bvh = match sw_bvh {
         SwAccel::Bvh(b) => bin(b),
-        SwAccel::Both(b, ft) => bin(b) + ft.bytes(),
+        SwAccel::Both(b, ft) => bin(b) + ft.quantized_bytes(),
         SwAccel::None => 0,
     };
     bvh + v * (12 + 12 + 8) + t * (12 + 4) + m * (size_of::<GpuMat>() + 4)
@@ -905,11 +905,15 @@ impl SceneGpu {
             }
             // The per-consumer split: BOTH structures upload — the tile
             // kernels bind the wide tree at t0 (bind_common), the hemi
-            // kernels the binary one (record_hemi's rebind). The FNode
-            // array uploads verbatim (repr(C), the HLSL FtNode mirror).
+            // kernels the binary one (record_hemi's rebind). The wide tree
+            // uploads in its QUANTIZED wire format (ftree::QFNode, 112 B —
+            // the HLSL FtNode mirror; self_test audits containment): the
+            // per-processor split verdict — the CPU keeps the f32 nodes,
+            // the GPU trades decode ALU for -56% tree bandwidth/VRAM.
             SwAccel::Both(bvh, ft) => {
                 let (n, t) = up_bin(sub, bvh)?;
-                let f = stream_buffer(device, sub, &ring, &ft.nodes, |n| *n, srv)?;
+                let qn = ft.quantized();
+                let f = stream_buffer(device, sub, &ring, &qn, |n| *n, srv)?;
                 (n, t, Some(f))
             }
             SwAccel::None => (
@@ -1894,9 +1898,9 @@ impl TraceGpu {
             let t0 = std::time::Instant::now();
             let ft = crate::ftree::FTree::build(bvh);
             eprintln!(
-                "gpu ftree: {} wide nodes ({} MB) collapsed in {:.0} ms (tile kernels bind it at t0; hemi stays binary)",
+                "gpu ftree: {} wide nodes ({} MB quantized) collapsed in {:.0} ms (tile kernels bind it at t0; hemi stays binary)",
                 ft.nodes.len(),
-                ft.bytes() >> 20,
+                ft.quantized_bytes() >> 20,
                 t0.elapsed().as_secs_f64() * 1000.0
             );
             ft
