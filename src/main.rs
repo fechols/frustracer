@@ -299,6 +299,15 @@ pub struct Opts {
     pub pix_markers: bool,
     /// Directory holding WinPixEventRuntime.dll.
     pub pix_path: String,
+    /// D3D12 timestamp queries around the PIX marker brackets, printed as a
+    /// per-region GPU-ms table (--gpu-timing; default off, zero-cost when
+    /// off — no query heap, no name allocation, byte-identical lists). The
+    /// vendor-neutral profiler, and vendor-neutrality is the whole point:
+    /// PIX's capture ANALYSIS only replays on AMD/NVIDIA, so on an Intel
+    /// adapter this is the only way to get per-pass GPU numbers at all — and
+    /// the per-pass AMD-vs-NVIDIA diff it makes possible is what found the
+    /// leaf kernel's wave64 bug.
+    pub gpu_timing: bool,
     /// V-sync'd presentation (default on). `--no-vsync` presents at sync
     /// interval 0 on a tearing swapchain so interactive frame times measure
     /// the renderer, not the monitor refresh.
@@ -436,6 +445,7 @@ fn main() {
         pix_path: std::env::var("FRUSTRACER_PIX_PATH").unwrap_or_else(|_| {
             concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\pix\bin\x64").to_string()
         }),
+        gpu_timing: false,
         vsync: true,
         // scRGB is the default swapchain: see Opts::hdr. The 8-bit path survives
         // as --no-hdr and as the automatic fallback.
@@ -689,6 +699,7 @@ fn main() {
                 );
             }
             "--pix-markers" => opts.pix_markers = true,
+            "--gpu-timing" => opts.gpu_timing = true,
             "--pix-path" => {
                 opts.pix_path = args.next().unwrap_or_else(|| {
                     eprintln!("--pix-path needs a directory argument");
@@ -1037,6 +1048,11 @@ fn main() {
 
     // PIX command-list markers: opt-in, runtime-loaded; inert otherwise.
     gpu::pix::init(&opts.pix_path, opts.pix_markers);
+    // The same marker brackets, timed with D3D12 timestamp queries. No DLL,
+    // every vendor — the only per-pass GPU numbers available on Intel. Armed
+    // for interactive sessions (a table every REPORT_EVERY frames) AND for the
+    // headless suites, whose bench is the deterministic workload.
+    gpu::gputime::enable(opts.gpu_timing);
 
     // A/B lever: --no-cut-rays sends cut-seeded rays down the root traversal
     // instead. Every ray consumer funnels through intersect_multi/occluded_multi,
@@ -4957,6 +4973,12 @@ fn run_check_gpu(
         }
     };
     let bbasis = cam0.basis(bw, bh);
+    // --gpu-timing: the per-pass GPU breakdown of the LAST timed config, so
+    // any bench row can be asked "where did that go".
+    // (RefCell: `timed` writes it and `bench` reads it, and both are closures
+    // capturing the same local — a plain `&mut` capture in one would lock the
+    // other out.)
+    let passes: std::cell::RefCell<Vec<(String, u32, f64)>> = std::cell::RefCell::new(Vec::new());
     let mut timed = |hybrid: bool, fb: shade::FrustumBounce, spp: u32| -> f64 {
         let bq = Quality { fb, ..q };
         let n = 60u32;
@@ -4977,6 +4999,9 @@ fn run_check_gpu(
             btg.write_cb(0, &p);
             let _ = hg.run(|l| btg.record_frame(l, 0, &p, hybrid));
         }
+        // Discard whatever the correctness gates / warm frames left behind, so
+        // this row's table covers exactly this row's frames.
+        let _ = gpu::gputime::take_regions();
         let t0 = Instant::now();
         for f in 0..n {
             let p = gpu::trace::FrameParams {
@@ -4994,12 +5019,24 @@ fn run_check_gpu(
             btg.write_cb(0, &p);
             let _ = hg.run(|l| btg.record_frame(l, 0, &p, hybrid));
         }
-        t0.elapsed().as_secs_f64() * 1000.0 / n as f64
+        let ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
+        // HeadlessGpu::run collects each frame's timestamps at the START of the
+        // next one, so the last frame is still pending here; take_regions drops
+        // it rather than letting it leak into the next row.
+        *passes.borrow_mut() = gpu::gputime::take_regions();
+        ms
     };
     let fb_off = shade::FrustumBounce::OFF;
     let mut bench = |label: &str, hybrid: bool, fb: shade::FrustumBounce, spp: u32| -> f64 {
         let ms = timed(hybrid, fb, spp);
         eprintln!("check-gpu: bench {bw}x{bh} {label}: {ms:6.2} ms/frame");
+        for (name, depth, pms) in passes.borrow().iter() {
+            let pad = "  ".repeat(*depth as usize);
+            eprintln!(
+                "check-gpu:   gpu-time {pad}{name:<24} {pms:7.3} ms  ({:5.1}% of frame)",
+                100.0 * pms / ms.max(1e-9)
+            );
+        }
         ms
     };
     bench("gpu hybrid          ", true, fb_off, 1);
@@ -5065,6 +5102,23 @@ fn run_check_gpu(
         mp / p[0],
         mh / mp,
     );
+    // The cost model's `m` (per-sample) is a wall-clock difference, which on
+    // a submit-per-frame headless loop carries CPU overhead too. Under
+    // --gpu-timing, re-run the two ends of the sweep so the per-pass GPU
+    // breakdown says WHICH kernel the marginal sample is spent in.
+    if opts.gpu_timing {
+        for (label, hybrid) in [("gpu hybrid spp=16   ", true), ("gpu plain ref spp=16", false)] {
+            let ms = timed(hybrid, fb_off, 16);
+            eprintln!("check-gpu: bench {bw}x{bh} {label}: {ms:6.2} ms/frame");
+            for (name, depth, pms) in passes.borrow().iter() {
+                let pad = "  ".repeat(*depth as usize);
+                eprintln!(
+                    "check-gpu:   gpu-time {pad}{name:<24} {pms:7.3} ms  ({:5.1}% of frame)",
+                    100.0 * pms / ms.max(1e-9)
+                );
+            }
+        }
+    }
     {
         // CPU hybrid at the same resolution/quality for scale.
         let stats2 = Stats::default();
@@ -9951,6 +10005,13 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
             }
         }
     }
+    // --gpu-timing: the session-total table. The periodic one only fires every
+    // REPORT_EVERY frames, so without this a session shorter than that (or one
+    // ending mid-interval — every session does) silently prints nothing, and an
+    // asked-for flag that produces no output reads as broken. Survives the
+    // resize path: `gputime` state lives in the module, not the session, and
+    // the accumulator is never cleared here, so the table spans the whole run.
+    gpu::gputime::report();
 }
 
 /// One renderer session at a fixed window size (w, h): everything sized

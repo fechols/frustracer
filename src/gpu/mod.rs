@@ -18,6 +18,7 @@ pub mod ffx;
 pub mod ffx_rr;
 pub mod ffx_sys;
 pub mod ffx_up;
+pub mod gputime;
 pub mod pix;
 pub mod rr;
 pub mod streamline;

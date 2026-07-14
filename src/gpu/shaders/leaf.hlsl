@@ -9,8 +9,17 @@
 // tile's — the CLAUDE.md invariant).
 // Requires trace_common.hlsli + queues.hlsli + shade.hlsli pasted first.
 // push0 = CTR_LEAF.
+//
+// `LEAF_NO_FB` compiles the hemi arm OUT (trace.rs builds this kernel twice —
+// see `pso_leaf` / `pso_leaf_fb`). It is not a code-size nicety: `fb_mode` is
+// a cbuffer value, so a runtime branch inlines shade_split's (large) body at
+// BOTH call sites and the kernel's register allocation is the max over the
+// two. VGPR count sets occupancy directly on RDNA, so the fb arm was costing
+// every fb-OFF frame its latency hiding. Measured (--gpu-timing, leaf+sky at
+// spp=16): -11% on AMD, -16% on NVIDIA — a real win on BOTH, so this is not
+// an AMD-specific hack. fb frames take the untouched `pso_leaf_fb`.
 
-[numthreads(64, 1, 1)]
+[numthreads(LEAF_GROUP, 1, 1)]
 void cs_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     uint rec_i = flat_group(gid);
     if (rec_i >= counters[push0]) return;
@@ -18,10 +27,18 @@ void cs_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     uint2 p0 = rect_min(rec.xy0);
     uint2 p1 = rect_max(rec.xy1);
     uint w = p1.x - p0.x;
-    uint npx = w * (p1.y - p0.y); // <= 64 == the group width
-    if (gtid.x >= npx) return;
-    uint x = p0.x + gtid.x % w;
-    uint y = p0.y + gtid.x / w;
+    uint npx = w * (p1.y - p0.y);
+    // Grid-stride over the tile's pixels, so LEAF_GROUP is a knob instead of
+    // being welded to "64 >= the largest tile". A leaf tile is NOT 8x8:
+    // depth_full is driven by the WIDER screen axis, so at 1920x1080 a leaf is
+    // 1920/2^8 = 7.5 by 1080/2^8 = 4.2 -- about 32 px. Dispatched into 64
+    // lanes, half of them used to return immediately. That is nearly free on a
+    // wave32 GPU (the all-idle second wave retires at once) but NOT on wave64,
+    // where the idle lanes sit in the SAME wave and cost half the RT
+    // throughput. See trace.rs's LEAF_GROUP note for the measurement.
+    for (uint k = gtid.x; k < npx; k += LEAF_GROUP) {
+    uint x = p0.x + k % w;
+    uint y = p0.y + k / w;
 
     uint pi = y * rw + x;
     // --spp: every sample of this pixel reuses the tile's inherited t_start
@@ -49,6 +66,11 @@ void cs_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
         float t;
         PrimSurf ps;
         if (trace_closest(cam_origin.xyz, dir, rec.t_start, FLT_MAX, hit)) {
+#ifdef LEAF_NO_FB
+            {
+                c = shade_full(cam_origin.xyz, dir, hit, rng, ps);
+            }
+#else
             if (fb_mode > 0u) {
                 // Hemi mode: shade everything except the primary ambient; hand
                 // the surface point to the hemisphere wavefront. One point per
@@ -74,6 +96,7 @@ void cs_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
             } else {
                 c = shade_full(cam_origin.xyz, dir, hit, rng, ps);
             }
+#endif
             t = hit.t;
             if (prim) gbuf_write_hit(pi, sp.x, sp.y, dir, hit.t, ps);
         } else {
@@ -101,4 +124,5 @@ void cs_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     ambw[i3 + 0u] = awsum.x * inv;
     ambw[i3 + 1u] = awsum.y * inv;
     ambw[i3 + 2u] = awsum.z * inv;
+    } // grid-stride over the tile's pixels
 }
