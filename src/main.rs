@@ -154,6 +154,16 @@ pub struct Opts {
     /// provider's own constants. A/B levers for dialing in cleanliness —
     /// `max_radiance` is the firefly clamp.
     pub fsr_tune: fsr::DenoiseTuning,
+    /// `--quinlight`: wire EVERY supported chain level at once, run them all
+    /// over the same traced frame, and present the registered-consensus fuse of
+    /// their outputs (gpu/quin.rs — LK registration + warp + winsorized mean;
+    /// a port of quinlight-player's consensus_registered.comp). GPU-fed only
+    /// (--dxr or --gpu): there is no CPU-fed arm.
+    pub quin: bool,
+    /// `--quin-anchor N`: which engine is the fuse's anchor (never warped;
+    /// defines the spatial frame). None = engine 0 = the highest wired chain
+    /// level, which is a DENOISING engine wherever the box has one.
+    pub quin_anchor: Option<u32>,
     /// Explicit GPU adapter vendor preference (--prefer-nvidia /
     /// --prefer-intel / --prefer-amd). None = the mode default (AMD for
     /// --fsr, NVIDIA otherwise). A preference, not a requirement: the
@@ -389,6 +399,8 @@ fn main() {
         }),
         fsr4_required: false,
         fsr_tune: fsr::DenoiseTuning::default(),
+        quin: false,
+        quin_anchor: None,
         prefer: None,
         oidn_post: false,
         xess_autoexposure: false,
@@ -552,6 +564,17 @@ fn main() {
             "--no-fsr" => {
                 opts.chain.skip(upchain::UpLevel::Fsr4);
                 opts.chain.skip(upchain::UpLevel::Fsr3);
+            }
+            // --quinlight suspends the chain's first-hit-wins rule: every level
+            // it leaves enabled is WIRED, and the fuse consumes them all. The
+            // chain flags still compose (--no-xess &c drop an engine), so the
+            // engine set stays the user's to shape.
+            "--quinlight" => opts.quin = true,
+            "--quin-anchor" => {
+                opts.quin_anchor = args.next().and_then(|s| s.parse::<u32>().ok()).or_else(|| {
+                    eprintln!("--quin-anchor needs a non-negative engine index");
+                    std::process::exit(2);
+                })
             }
             "--ffx-path" => {
                 opts.ffx_path = args.next().unwrap_or_else(|| {
@@ -902,6 +925,12 @@ fn main() {
                 eprintln!("                Ray Regeneration is unavailable (suggests --fsr3 / --prefer-amd)");
                 eprintln!("  --fsr3        force-start the chain at the FSR 3.1 upscale-only level (A/B lever)");
                 eprintln!("  --ffx-path    FidelityFX DLL directory (default: the FidelityFX-Samples-prebuilt drop)");
+                eprintln!("  --quinlight   REGISTERED CONSENSUS: suspend the chain's first-hit-wins rule, wire");
+                eprintln!("                EVERY supported level at once (DLSS-RR + FSR4-RR + XeSS + FSR 3.1),");
+                eprintln!("                run them all over the SAME traced frame, and present the LK-registered");
+                eprintln!("                winsorized consensus of their outputs. GPU-fed only (--dxr/--gpu)");
+                eprintln!("  --quin-anchor <n>  which engine defines the fuse's spatial frame (never warped);");
+                eprintln!("                default = the denoising engine (DLSS-RR, else FSR4-RR), else engine 0");
                 eprintln!("  --gpu         GPU-resident tracing: quadtree + shading in D3D12 compute with DXR");
                 eprintln!("                RayQuery rays (needs the DXC DLLs and RT tier 1.1; falls back to CPU)");
                 eprintln!("  --check-gpu   headless: GPU tracer gate suite (needs a D3D12 GPU + the DXC DLLs)");
@@ -974,6 +1003,39 @@ fn main() {
     // be a lie.
     if opts.fsr4_required && !opts.chain.fsr4 {
         eprintln!("--fsr4: the FSR4 level was knocked out of the upscaler chain by another flag (--no-fsr / --no-upscale / a later --xess, --fsr3 or --nppd) — nothing left to require");
+        std::process::exit(2);
+    }
+    // --quinlight is GPU-fed only: the engines read the tracer's G-buffer pack
+    // through the feed kernels, and there is deliberately no CPU-upload arm
+    // (the CPU rings feed ONE upscaler; N of them would be N window-res
+    // uploads per frame — the fuse exists to avoid exactly that traffic).
+    // --cpu clears both GPU modes, so this is the check.
+    if opts.quin && !opts.gpu && !opts.dxr {
+        eprintln!(
+            "--quinlight needs a GPU render mode (--dxr, the default, or --gpu) — \
+             there is no CPU-fed fuse arm"
+        );
+        std::process::exit(2);
+    }
+    // The fuse needs at least two engines, so it cannot run on an empty chain.
+    if opts.quin && opts.chain == upchain::UpChain::NONE {
+        eprintln!("--quinlight: --no-upscale leaves no engines to fuse");
+        std::process::exit(2);
+    }
+    // NPPD's present arm is the XeSS one (the frame SPLITS around the ORT run);
+    // the fuse's is its own. A quinlight session would build the ORT session and
+    // its ~340 MB of staging and then never dispatch it — a silent no-op is
+    // worse than being told, so this is the --fsr4 shape: exit, don't degrade.
+    if opts.quin && opts.nppd {
+        eprintln!(
+            "--quinlight cannot compose with --nppd: the neural denoiser rides the XeSS \
+             present arm, and the fuse presents through its own. Drop one."
+        );
+        std::process::exit(2);
+    }
+    // A --quin-anchor with no fuse to anchor is a typo, not a preference.
+    if opts.quin_anchor.is_some() && !opts.quin {
+        eprintln!("--quin-anchor selects the fuse's anchor engine, but --quinlight was not passed");
         std::process::exit(2);
     }
     // Adapter preference default: AMD when FSR was explicitly requested
@@ -4863,6 +4925,22 @@ fn run_check_gpu(
         }
     }
 
+    // --- M13: the registered-consensus fuse (--quinlight) ---
+    // The REAL kernel, through its REAL root signature and descriptor table,
+    // over synthetic engine images. Three gates, each aimed at a different way
+    // the port can be wrong: N==1 passthrough (the degenerate arm + the
+    // SRV/UAV wiring), a two-identical-engine IDENTITY fuse (the LK must solve
+    // (0,0) and come back bit-exact — this is what catches the sampler's
+    // texel-centre convention, the groupshared HALO indexing, a residual sign
+    // flip, an inverted tensor solve), and a known (+1,0) SHIFT that the
+    // registration must recover — measured against an ITERS=0 control, because
+    // a solve that always returns zero would sail through the first two.
+    println!("check-gpu: M13 quinlight registered-consensus fuse");
+    if let Err(e) = gpu::quin::gate(&mut hg, &dxc, opts.gpu_debug) {
+        eprintln!("check-gpu: FAIL M13 {e}");
+        ok = false;
+    }
+
     if !ok {
         eprintln!("GPU CHECK FAILED");
         return 1;
@@ -7695,6 +7773,25 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
     };
 
+    // Registered-consensus self-test (--quinlight) — the winsorized reduce's
+    // identities: the m==2 plain-mean degeneracy (what makes a two-engine fuse a
+    // PROVABLE registered mean), the m>=3 outlier rejection, median order
+    // independence, and the non-finite-is-MISSING bit predicate. Pure math, the
+    // Rust twin of quin.hlsl's reduce; the wired kernel is gated by --check-gpu.
+    #[cfg(windows)]
+    let quin_ok = match gpu::quin::self_test() {
+        Ok(()) => {
+            eprintln!("quin self-test: OK");
+            true
+        }
+        Err(e) => {
+            eprintln!("quin self-test: FAIL — {e}");
+            false
+        }
+    };
+    #[cfg(not(windows))]
+    let quin_ok = true;
+
     // glTF loader self-test — an in-code GLB exercises node flattening, the
     // mirrored-winding flip, u16 index widening, and the factor mapping.
     let gltf_ok = match gltf_loader::self_test() {
@@ -9741,6 +9838,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         ("tone", tone_ok),
         ("gltf", gltf_ok),
         ("bc7", bc7_ok),
+        ("quin", quin_ok),
         ("hemi-ao", hemi_ok),
         ("hemi-gi", gi_ok),
         ("hemi-share", hemi_share_ok),
@@ -9818,6 +9916,10 @@ enum GpuUp {
     Xess,
     Fsr4,
     Fsr3,
+    /// --quinlight: several upscalers at once, presented through the
+    /// registered-consensus fuse (gpu/quin.rs). Not a chain level — a
+    /// composition of them.
+    Quin,
 }
 
 /// A session's exit reason: quit the app, or rebuild everything at a new
@@ -9902,6 +10004,8 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
         hdr: opts.hdr,
         paper_white: opts.hdr_paper_white,
         peak_nits: opts.hdr_peak,
+        quin: opts.quin,
+        quin_anchor: opts.quin_anchor,
     };
     let mut gpu = gpu::GpuContext::new(sdl_hwnd(&window), W as u32, H as u32, &gopts)
         .expect("GPU init failed");
@@ -10264,7 +10368,13 @@ fn session(
             }
             1.0
         });
-        if dlss_on {
+        // --quinlight wins over any single level: the fuse IS the presentation,
+        // and every wired engine feeds it. The frame is traced ONCE, so the res
+        // must be legal for all of them at once — hence the intersected range.
+        if gpu.quin_planned() {
+            gpu_up = GpuUp::Quin;
+            (grw, grh) = locked_render_res(lock, gpu.quin_res_range(), (w, h), (w, h), true);
+        } else if dlss_on {
             gpu_up = GpuUp::Rr;
             // Degenerate range: the SDK optimal/DLAA res.
             (grw, grh) = locked_render_res(lock, dlss_range, (w, h), (drw, drh), false);
@@ -10303,6 +10413,9 @@ fn session(
                         GpuUp::Xess => format!(" -> XeSS-SR {w}x{h}"),
                         GpuUp::Fsr4 => format!(" -> FSR4-RR {w}x{h}"),
                         GpuUp::Fsr3 => format!(" -> FSR3 {w}x{h}"),
+                        // The engine list + anchor already printed from
+                        // build_quin, which is where the fuse learns them.
+                        GpuUp::Quin => format!(" -> quinlight fuse {w}x{h}"),
                     }
                 );
                 true
@@ -10330,6 +10443,11 @@ fn session(
     // init-time).
     let gpu_xess_avail = gpu_trace && gpu_up == GpuUp::Xess;
     let gpu_rr_avail = gpu_trace && gpu_up == GpuUp::Rr;
+    // --quinlight: the FUSE is this session's upscaler. G/X/K all toggle IT
+    // against plain — there is no single engine to switch to, since the engines
+    // exist only as fuse inputs (switching to one would strand the session: no
+    // key restores the fuse).
+    let gpu_quin_avail = gpu_trace && gpu_up == GpuUp::Quin;
     // The wired FSR kind (captured before the plain-toggle restore below —
     // the K toggle moves between Plain and exactly this).
     let gpu_fsr_kind = (gpu_trace && matches!(gpu_up, GpuUp::Fsr4 | GpuUp::Fsr3)).then_some(gpu_up);
@@ -10604,8 +10722,13 @@ fn session(
     // build the pipeline at the same res. The scale is the GPU-mode one
     // (native by default); `--lock-res dynamic` can't be honored here, so it
     // falls back to that same default.
+    let dxr_quin_avail = gpu.quin_planned();
     let dxr_lock = opts.gpu_lock_scale.unwrap_or(1.0);
-    let (dxw, dxh) = if dxr_rr_avail {
+    let (dxw, dxh) = if dxr_quin_avail {
+        // One trace feeds every engine, so the res must sit inside ALL their
+        // ranges (the --gpu quinlight rule).
+        locked_render_res(dxr_lock, gpu.quin_res_range(), (w, h), (w, h), true)
+    } else if dxr_rr_avail {
         locked_render_res(dxr_lock, dlss_range, (w, h), (drw, drh), false)
     } else if dxr_xess_avail {
         locked_render_res(dxr_lock, xess_range, (w, h), (w, h), true)
@@ -10623,7 +10746,8 @@ fn session(
     let mut dxr_prev_cam: Option<Camera> = None;
     let mut dxr_reset = true;
     if want_dxr && !dxr_failed && !gpu_trace {
-        let compose = dxr_rr_avail || dxr_xess_avail || dxr_fsr3_avail || dxr_fsr4_avail;
+        let compose =
+            dxr_quin_avail || dxr_rr_avail || dxr_xess_avail || dxr_fsr3_avail || dxr_fsr4_avail;
         if compose && opts.gpu_lock_scale.is_none() {
             eprintln!("dxr: dynamic render res is unsupported on the DXR pipeline; locking at native (100%)");
         }
@@ -10632,7 +10756,10 @@ fn session(
         }) {
             Ok(()) => {
                 dxr_on = true;
-                dxr_up = if dxr_rr_avail {
+                // The fuse wins over any single level — it consumes them all.
+                dxr_up = if dxr_quin_avail {
+                    GpuUp::Quin
+                } else if dxr_rr_avail {
                     GpuUp::Rr
                 } else if dxr_xess_avail {
                     GpuUp::Xess
@@ -10667,6 +10794,7 @@ fn session(
                         GpuUp::Xess => format!(" -> XeSS-SR {w}x{h} (X toggles plain)"),
                         GpuUp::Fsr4 => format!(" -> FSR4-RR {w}x{h} (K toggles plain)"),
                         GpuUp::Fsr3 => format!(" -> FSR3 {w}x{h} (K toggles plain)"),
+                        GpuUp::Quin => format!(" -> quinlight fuse {w}x{h}"),
                         GpuUp::Plain => String::new(),
                     }
                 );
@@ -10785,7 +10913,21 @@ fn session(
                 gpu_reset = true;
                 eprintln!("gpu: {}", if hybrid { "hybrid (wavefront quadtree)" } else { "plain (per-pixel reference)" });
             }
-            if edges.toggle_xess {
+            // --quinlight: every upscaler key toggles the fuse vs plain (see
+            // gpu_quin_avail). Handled once, ahead of the per-level toggles,
+            // which are then suppressed — their "not wired" lines would be a
+            // lie about a session that wired every level there is.
+            if gpu_quin_avail && (edges.toggle_dlss || edges.toggle_xess || edges.toggle_fsr) {
+                gpu_up = if gpu_up == GpuUp::Quin { GpuUp::Plain } else { GpuUp::Quin };
+                frame = 0;
+                gpu_reset = true;
+                gpu_prev_cam = None;
+                eprintln!(
+                    "gpu: quinlight fuse {}",
+                    if gpu_up == GpuUp::Quin { "ON" } else { "OFF (plain present)" }
+                );
+            }
+            if edges.toggle_xess && !gpu_quin_avail {
                 if gpu_xess_avail {
                     gpu_up = if gpu_up == GpuUp::Xess { GpuUp::Plain } else { GpuUp::Xess };
                     frame = 0;
@@ -10799,7 +10941,7 @@ fn session(
                     eprintln!("gpu: XeSS not wired in this session (start with --gpu --xess)");
                 }
             }
-            if edges.toggle_dlss {
+            if edges.toggle_dlss && !gpu_quin_avail {
                 if gpu_rr_avail {
                     gpu_up = if gpu_up == GpuUp::Rr { GpuUp::Plain } else { GpuUp::Rr };
                     frame = 0;
@@ -10813,7 +10955,7 @@ fn session(
                     eprintln!("gpu: DLSS-RR not wired in this session");
                 }
             }
-            if edges.toggle_fsr {
+            if edges.toggle_fsr && !gpu_quin_avail {
                 if let Some(kind) = gpu_fsr_kind {
                     gpu_up = if gpu_up == kind { GpuUp::Plain } else { kind };
                     frame = 0;
@@ -10944,6 +11086,19 @@ fn session(
                         // (the DXR arm's contract); the desc clamps it into
                         // [0.1, 200].
                         GpuUp::Fsr3 => gpu.present_trace_fsr3(&p, hybrid, &fc, last_ms as f32),
+                        // Every wired engine, then the fuse. It needs the whole
+                        // union of what the individual arms take: the XeSS
+                        // jitter/reset pair AND the FSR/RR frame constants.
+                        GpuUp::Quin => gpu.present_trace_quin(
+                            &p,
+                            hybrid,
+                            jit,
+                            gpu_reset,
+                            &fc,
+                            gpu_prev_cam.map(|c| c.pos),
+                            gpu_up_idx,
+                            last_ms as f32,
+                        ),
                         GpuUp::Fsr4 => gpu.present_trace_fsr_rr(
                             &p,
                             hybrid,
@@ -10974,6 +11129,7 @@ fn session(
                                 GpuUp::Xess => ("XeSS", 'X'),
                                 GpuUp::Fsr3 => ("FSR3", 'K'),
                                 GpuUp::Fsr4 => ("FSR4-RR", 'K'),
+                                GpuUp::Quin => ("quinlight fuse", 'G'),
                                 _ => ("DLSS-RR", 'G'),
                             };
                             eprintln!("gpu: {name} present failed ({e}); presenting plain ({key} to retry)");
@@ -11034,6 +11190,10 @@ fn session(
                     let cap = match gpu_up {
                         GpuUp::Xess => gpu.read_xess_output(),
                         GpuUp::Fsr3 | GpuUp::Fsr4 => gpu.read_fsr_output(),
+                        // The meter must read what is PRESENTED — the fuse, not
+                        // any single engine (an engine's own output would report
+                        // that engine's stability and silently ignore the fuse).
+                        GpuUp::Quin => gpu.read_quin_output(),
                         _ => gpu.read_rr_output(),
                     };
                     if let Ok(px) = cap {
@@ -11067,6 +11227,8 @@ fn session(
                     GpuUp::Xess => gpu.read_xess_output().map(|px| (px, w, h)),
                     GpuUp::Rr => gpu.read_rr_output().map(|px| (px, w, h)),
                     GpuUp::Fsr3 | GpuUp::Fsr4 => gpu.read_fsr_output().map(|px| (px, w, h)),
+                    // P captures what is ON SCREEN: the fuse, not any one engine.
+                    GpuUp::Quin => gpu.read_quin_output().map(|px| (px, w, h)),
                     GpuUp::Plain => gpu.read_trace_output(),
                 };
                 match cap {
@@ -11086,6 +11248,14 @@ fn session(
                 fps_t = now;
                 let mode = match gpu_up {
                     GpuUp::Plain => format!("{}x{}", grw, grh),
+                    GpuUp::Quin => format!(
+                        "quinlight[{}] {}x{} -> {}x{}",
+                        gpu.quin_names().unwrap_or_default(),
+                        grw,
+                        grh,
+                        w,
+                        h
+                    ),
                     GpuUp::Rr => format!("RR {}x{} -> {}x{}", grw, grh, w, h),
                     GpuUp::Fsr4 => format!("FSR4-RR {}x{} -> {}x{}", grw, grh, w, h),
                     GpuUp::Fsr3 => format!("FSR3 {}x{} -> {}x{}", grw, grh, w, h),
@@ -11175,7 +11345,26 @@ fn session(
                     [bounce_mode as usize]
             );
         }
-        if edges.toggle_dlss {
+        // --quinlight in DXR mode: the FUSE is the session's upscaler, so G/X/K
+        // all toggle IT against plain DXR (the --gpu gpu_quin_avail semantics).
+        // Handled once, ahead of the per-level toggles, which are suppressed
+        // below: every level IS wired here, so letting G switch to DLSS-RR alone
+        // would strand the session — no key would bring the fuse back.
+        if dxr_on
+            && dxr_quin_avail
+            && (edges.toggle_dlss || edges.toggle_xess || edges.toggle_fsr)
+        {
+            dxr_up = if dxr_up == GpuUp::Quin { GpuUp::Plain } else { GpuUp::Quin };
+            frame = 0;
+            dxr_reset = true;
+            dxr_prev_cam = None;
+            eprintln!(
+                "dxr: quinlight fuse {}",
+                if dxr_up == GpuUp::Quin { "ON" } else { "OFF (plain present)" }
+            );
+        }
+        let dxr_quin_key = dxr_on && dxr_quin_avail;
+        if edges.toggle_dlss && !dxr_quin_key {
             if dxr_on {
                 // Inside DXR mode G toggles the wired upscaler vs plain
                 // DXR — the --gpu G semantics; the CPU DLSS state is
@@ -11222,7 +11411,7 @@ fn session(
                 eprintln!("dlss: not wired in this session (the chain selected another level; restart with --dlss)");
             }
         }
-        if edges.toggle_xess {
+        if edges.toggle_xess && !dxr_quin_key {
             if dxr_on {
                 // The X twin of the DXR-mode G toggle.
                 if dxr_xess_avail {
@@ -11280,7 +11469,7 @@ fn session(
                 eprintln!("xess: not wired in this session (restart with --xess and the SDK DLL on disk)");
             }
         }
-        if edges.toggle_fsr {
+        if edges.toggle_fsr && !dxr_quin_key {
             if dxr_on {
                 // The K twin of the DXR-mode G/X toggles: wired-FSR <-> plain.
                 let kind = if dxr_fsr4_avail {
@@ -11497,7 +11686,11 @@ fn session(
             } else if dxr_failed {
                 eprintln!("dxr: unavailable (earlier init failed; restart with --dxc-path to retry)");
             } else {
-                let compose = dxr_rr_avail || dxr_xess_avail || dxr_fsr3_avail || dxr_fsr4_avail;
+                let compose = dxr_quin_avail
+                    || dxr_rr_avail
+                    || dxr_xess_avail
+                    || dxr_fsr3_avail
+                    || dxr_fsr4_avail;
                 if compose && opts.gpu_lock_scale.is_none() {
                     eprintln!("dxr: dynamic render res is unsupported on the DXR pipeline; locking at native (100%)");
                 }
@@ -11509,7 +11702,13 @@ fn session(
                         frame = 0;
                         // Every F enable restores the session default
                         // sub-mode (a G/X/K plain-toggle doesn't outlive it).
-                        dxr_up = if dxr_rr_avail {
+                        // The fuse is the session default wherever it came up —
+                        // this ladder must stay in lockstep with the init pick,
+                        // or an F off/on would silently strand a --quinlight
+                        // session on a single engine with no way back.
+                        dxr_up = if dxr_quin_avail {
+                            GpuUp::Quin
+                        } else if dxr_rr_avail {
                             GpuUp::Rr
                         } else if dxr_xess_avail {
                             GpuUp::Xess
@@ -11543,6 +11742,7 @@ fn session(
                                 GpuUp::Xess => format!(" -> XeSS-SR {w}x{h} (X toggles plain)"),
                                 GpuUp::Fsr4 => format!(" -> FSR4-RR {w}x{h} (K toggles plain)"),
                                 GpuUp::Fsr3 => format!(" -> FSR3 {w}x{h} (K toggles plain)"),
+                                GpuUp::Quin => format!(" -> quinlight fuse {w}x{h}"),
                                 GpuUp::Plain => String::new(),
                             }
                         );
@@ -11728,6 +11928,16 @@ fn session(
                     );
                     match dxr_up {
                         GpuUp::Fsr3 => gpu.present_dxr_fsr3(&p, &fc, last_ms as f32),
+                        // Every wired engine, then the fuse.
+                        GpuUp::Quin => gpu.present_dxr_quin(
+                            &p,
+                            jit,
+                            dxr_reset,
+                            &fc,
+                            dxr_prev_cam.map(|c| c.pos),
+                            dxr_up_idx,
+                            last_ms as f32,
+                        ),
                         GpuUp::Fsr4 => gpu.present_dxr_fsr_rr(
                             &p,
                             &fc,
@@ -11750,6 +11960,7 @@ fn session(
                             GpuUp::Xess => ("XeSS", 'X'),
                             GpuUp::Fsr3 => ("FSR3", 'K'),
                             GpuUp::Fsr4 => ("FSR4-RR", 'K'),
+                            GpuUp::Quin => ("quinlight fuse", 'G'),
                             _ => ("DLSS-RR", 'G'),
                         };
                         eprintln!("dxr: {name} present failed ({e}); presenting plain ({key} to retry)");
@@ -11811,6 +12022,10 @@ fn session(
                     let cap = match dxr_up {
                         GpuUp::Xess => gpu.read_xess_output(),
                         GpuUp::Fsr3 | GpuUp::Fsr4 => gpu.read_fsr_output(),
+                        // The meter must read what is PRESENTED — the fuse, not
+                        // any single engine (an engine's own output would report
+                        // that engine's stability and silently ignore the fuse).
+                        GpuUp::Quin => gpu.read_quin_output(),
                         _ => gpu.read_rr_output(),
                     };
                     if let Ok(px) = cap {
@@ -11844,6 +12059,8 @@ fn session(
                     GpuUp::Rr => gpu.read_rr_output().map(|px| (px, w, h)),
                     GpuUp::Xess => gpu.read_xess_output().map(|px| (px, w, h)),
                     GpuUp::Fsr3 | GpuUp::Fsr4 => gpu.read_fsr_output().map(|px| (px, w, h)),
+                    // P captures what is ON SCREEN: the fuse, not any one engine.
+                    GpuUp::Quin => gpu.read_quin_output().map(|px| (px, w, h)),
                     GpuUp::Plain => gpu.read_dxr_output(),
                 };
                 match grab {
@@ -11862,6 +12079,10 @@ fn session(
                 fps_frames = 0;
                 fps_t = now;
                 let sub = match dxr_up {
+                    GpuUp::Quin => format!(
+                        "DXR {dxw}x{dxh} -> quinlight[{}] {w}x{h} | {spp} spp",
+                        gpu.quin_names().unwrap_or_default()
+                    ),
                     GpuUp::Rr => format!("DXR {dxw}x{dxh} -> DLSS-RR {w}x{h} | {spp} spp"),
                     GpuUp::Xess => format!("DXR {dxw}x{dxh} -> XeSS {w}x{h} | {spp} spp"),
                     GpuUp::Fsr4 => format!("DXR {dxw}x{dxh} -> FSR4-RR {w}x{h} | {spp} spp"),

@@ -49,6 +49,21 @@ pub const RP_GBUF: u32 = RP_TEX + 1;
 /// The register/type layout is shared by every feed kernel (feed.hlsl); a
 /// register's VALUE/format may differ per kernel, the HLSL type never does.
 pub const NUM_FEED: u32 = 12;
+/// One descriptor SET is the whole RP_TEX table: the u14 resolve target at
+/// offset 0, then the NUM_FEED feed registers.
+pub const FEED_SET_STRIDE: u32 = 1 + NUM_FEED;
+/// How many feed sets the heap holds. Normal sessions wire ONE (the session's
+/// one upscaler). `--quinlight` wires several engines at once, and their plane
+/// sets OVERLAP in registers (RR and FSR4-RR both claim u16/u17/u18/u20..u22) —
+/// so each engine gets its OWN set of descriptors and each feed dispatch binds
+/// the table at its set's offset. Rewriting one set of descriptors between two
+/// dispatches recorded into the SAME command list would be a bug: descriptors
+/// are read at execute time, so the last write would win for both.
+///
+/// 3 is the ceiling, not a guess: the engines that need a DISTINCT plane set are
+/// DLSS-RR, FSR4-RR, and the XeSS/FSR3 trio — XeSS and FSR 3.1 take a
+/// byte-identical plane set, so they share one feed (see `ffx_up::upscale_res_shared`).
+pub const FEED_SETS: u32 = 3;
 pub const FEED_COLOR: u32 = 16; // RGBA16F (RR/XeSS); RGBA16F residual (FSR-RR)
 pub const FEED_NR: u32 = 17; // RGBA16F normal+rough (RR); RGB10A2 oct-normals (FSR-RR)
 pub const FEED_DEPTH: u32 = 18; // R32F (all; encoding differs per kernel)
@@ -79,8 +94,8 @@ pub const NPPD_REG_BASE: u32 = NUM_UAVS + 2 + NUM_FEED; // u26
 /// as the u14/feed slots (only one CBV_SRV_UAV heap is bindable at a time),
 /// starting at slot TEX_HEAP_BASE.
 pub const RP_SCENE_TEX: u32 = RP_NPPD_OUT + 1;
-/// First heap slot of the scene-texture table (after hdr + the feed range).
-pub const TEX_HEAP_BASE: u32 = 1 + NUM_FEED;
+/// First heap slot of the scene-texture table (after every feed set).
+pub const TEX_HEAP_BASE: u32 = FEED_SETS * FEED_SET_STRIDE;
 /// Buffer-SRV descriptors preceding the Texture2D array in the table.
 pub const TEX_TABLE_BUFS: u32 = 4;
 
@@ -1798,6 +1813,28 @@ pub enum FeedKind {
     FsrRr,
 }
 
+/// The kernel a feed kind runs. Shared by TraceGpu and DxrGpu, which hold the
+/// same three PSOs and now both fan over a LIST of wired engines
+/// (`--quinlight`), so the mapping had to stop being an inline match.
+/// `nppd_dm` (XeSS + GPU-resident NPPD only) substitutes the depth+mvec variant
+/// for the plain XeSS feed.
+pub(crate) fn feed_pso<'a>(
+    kind: FeedKind,
+    nppd_dm: Option<&'a ID3D12PipelineState>,
+    xess: Option<&'a ID3D12PipelineState>,
+    rr: Option<&'a ID3D12PipelineState>,
+    fsr_rr: Option<&'a ID3D12PipelineState>,
+) -> Option<&'a ID3D12PipelineState> {
+    match kind {
+        // Fsr3 IS the XeSS feed (same planes, same encodings) — the kind exists
+        // only so the wiring is explicit.
+        FeedKind::Xess => nppd_dm.or(xess),
+        FeedKind::Fsr3 => xess,
+        FeedKind::Rr => rr,
+        FeedKind::FsrRr => fsr_rr,
+    }
+}
+
 /// 0 = off, 1 = AO, 2 = GI (GI subsumes AO, mirroring shade.rs's tiering).
 fn fb_mode_of(q: &Quality) -> u32 {
     if q.fb.gi {
@@ -1849,9 +1886,14 @@ pub struct TraceGpu {
     pso_feed_xess: Option<ID3D12PipelineState>,
     pso_feed_rr: Option<ID3D12PipelineState>,
     pso_feed_fsr_rr: Option<ID3D12PipelineState>,
-    /// The wired upscaler feed targets (wire_feed): plane resources cloned
-    /// for record_feed's barriers, plus which feed kernel consumes them.
-    feed: Option<(FeedKind, Vec<ID3D12Resource>)>,
+    /// The wired upscaler feed targets (wire_feed): plane resources cloned for
+    /// record_feed's barriers, plus which feed kernel consumes them. ONE entry
+    /// per wired engine — normally exactly one, several under `--quinlight`.
+    /// The INDEX is the engine's descriptor set (see FEED_SETS): its planes'
+    /// UAVs live at that set's slots, and its feed dispatch binds RP_TEX there.
+    feed: Vec<(FeedKind, Vec<ID3D12Resource>)>,
+    /// Kept for the per-set descriptor-table handles record_feed computes.
+    device: ID3D12Device,
     /// GPU-resident NPPD staging (the --gpu --nppd composition) — buffers
     /// nppd::NppdGpu wraps as ORT tensors, plus the staging kernels.
     pub nppd: Option<NppdRes>,
@@ -2136,11 +2178,12 @@ impl TraceGpu {
             }
             None => None,
         };
-        // Slot 0 = hdr (u14, resolve); slots 1..7 = the upscaler feed targets
-        // (u16..u22), wired per session by wire_feed — null until then (RS 1.0
-        // descriptors are volatile; only accessed slots must be valid); slots
-        // TEX_HEAP_BASE.. = the RP_SCENE_TEX scene table (4 buffer SRVs + one
-        // Texture2D per scene texture — same heap by necessity: only one
+        // FEED_SETS copies of the RP_TEX table, back to back: each set is the
+        // hdr resolve UAV (u14) at its offset 0, then NUM_FEED feed targets
+        // (u16.., wired per session by wire_feed — null until then; RS 1.0
+        // descriptors are volatile, so only ACCESSED slots must be valid).
+        // Slots TEX_HEAP_BASE.. = the RP_SCENE_TEX scene table (4 buffer SRVs +
+        // one Texture2D per scene texture — same heap by necessity: only one
         // CBV_SRV_UAV heap can be bound at a time).
         let uav_heap: ID3D12DescriptorHeap = unsafe {
             device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
@@ -2153,14 +2196,7 @@ impl TraceGpu {
             })
         }
         .map_err(|e| format!("CreateDescriptorHeap(trace UAV): {e}"))?;
-        unsafe {
-            device.CreateUnorderedAccessView(
-                &hdr,
-                None,
-                None,
-                uav_heap.GetCPUDescriptorHandleForHeapStart(),
-            )
-        };
+        write_resolve_uavs(device, &uav_heap, &hdr);
         scene_gpu.write_scene_descriptors(device, &uav_heap, TEX_HEAP_BASE);
         let tex_table = D3D12_GPU_DESCRIPTOR_HANDLE {
             ptr: unsafe { uav_heap.GetGPUDescriptorHandleForHeapStart() }.ptr
@@ -2245,7 +2281,8 @@ impl TraceGpu {
             pso_feed_xess,
             pso_feed_rr,
             pso_feed_fsr_rr,
-            feed: None,
+            feed: Vec::new(),
+            device: device.clone(),
             nppd: nppd_res,
             scene: scene_gpu,
             accum,
@@ -2288,9 +2325,12 @@ impl TraceGpu {
             .store(unsafe { self.frame_cb.ptr.add(slot * CB_STRIDE) });
     }
 
-    /// Whether the wired feed consumes the pack's FSR signal lanes.
+    /// Whether ANY wired feed consumes the pack's FSR signal lanes (under
+    /// --quinlight, FSR4-RR can be one engine among several — one subscriber is
+    /// enough to arm FLAG_FSR_SIG, and the capture is assignment-only, so the
+    /// other engines' frames stay bit-identical).
     fn fsr_sig(&self) -> bool {
-        matches!(&self.feed, Some((FeedKind::FsrRr, _)))
+        self.feed.iter().any(|(k, _)| matches!(k, FeedKind::FsrRr))
     }
 
     /// Bind the shared root signature + everything every kernel might read.
@@ -2705,18 +2745,38 @@ impl TraceGpu {
         })
     }
 
-    /// Wire the upscaler feed targets into the descriptor heap (slots 1..7 =
-    /// registers u16..u22) and remember them for record_feed's barriers.
-    /// `targets` = (shader register, plane, format). Gated on typed-UAV-store
-    /// support per format (optional in D3D12) — an Err here means the caller
-    /// falls back to plain presentation, loudly.
+    /// Wire ONE engine's upscaler feed targets into the descriptor heap and
+    /// remember them for record_feed's barriers. `targets` = (shader register,
+    /// plane, format). Gated on typed-UAV-store support per format (optional in
+    /// D3D12) — an Err here means the caller falls back to plain presentation,
+    /// loudly.
+    ///
+    /// REPLACES the wiring with this one engine (descriptor set 0) — the
+    /// single-upscaler contract, and what lets `--check-gpu` rewire the same
+    /// tracer from one feed kind to the next. Use `wire_feed_add` to wire
+    /// several engines at once (--quinlight).
     pub fn wire_feed(
         &mut self,
         device: &ID3D12Device,
         kind: FeedKind,
         targets: &[(u32, &ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT)],
     ) -> Result<()> {
-        self.feed = Some((kind, wire_feed_targets(device, &self.uav_heap, targets)?));
+        self.feed.clear();
+        self.wire_feed_add(device, kind, targets)
+    }
+
+    /// APPENDS one engine: it claims the next descriptor set, so a --quinlight
+    /// session calls this once per engine and their (overlapping) registers land
+    /// in disjoint heap slots.
+    pub fn wire_feed_add(
+        &mut self,
+        device: &ID3D12Device,
+        kind: FeedKind,
+        targets: &[(u32, &ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT)],
+    ) -> Result<()> {
+        let set = self.feed.len() as u32;
+        let planes = wire_feed_targets(device, &self.uav_heap, set, targets)?;
+        self.feed.push((kind, planes));
         Ok(())
     }
 
@@ -2732,41 +2792,46 @@ impl TraceGpu {
     /// denoised planar buffer ORT wrote in an earlier submission on the same
     /// queue) — two dispatches writing disjoint planes inside one barrier
     /// window.
+    /// One dispatch per WIRED engine (normal sessions wire exactly one;
+    /// `--quinlight` wires several and each takes its own descriptor set).
     pub fn record_feed(
         &self,
         list: &ID3D12GraphicsCommandList,
         slot: usize,
         nppd_color: bool,
     ) -> Result<()> {
-        let Some((kind, planes)) = &self.feed else {
+        if self.feed.is_empty() {
             return Err("feed targets not wired".into());
-        };
+        }
         let nppd = if nppd_color {
-            if !matches!(kind, FeedKind::Xess) {
+            // NPPD composes with XeSS only — and never with --quinlight, whose
+            // engines each own a descriptor set (the color-crop dispatch below
+            // rides the single feed's set).
+            if self.feed.len() != 1 || !matches!(self.feed[0].0, FeedKind::Xess) {
                 return Err("NPPD feed composition is XeSS-only".into());
             }
             Some(self.nppd.as_ref().ok_or("NPPD staging not built")?)
         } else {
             None
         };
-        let pso = match (kind, nppd) {
-            (FeedKind::Xess, Some(n)) => Some(&n.pso_feed_dm),
-            // Fsr3/FsrRr can't carry nppd: the guard above already rejected
-            // non-XeSS NPPD composition.
-            (FeedKind::Xess | FeedKind::Fsr3, None) => self.pso_feed_xess.as_ref(),
-            (FeedKind::Fsr3 | FeedKind::FsrRr, Some(_)) => {
-                unreachable!("nppd guard rejected non-XeSS")
-            }
-            (FeedKind::Rr, _) => self.pso_feed_rr.as_ref(),
-            (FeedKind::FsrRr, None) => self.pso_feed_fsr_rr.as_ref(),
+        let mut feeds: Vec<(&ID3D12PipelineState, u32, &[ID3D12Resource])> = Vec::new();
+        for (set, (kind, planes)) in self.feed.iter().enumerate() {
+            let pso = feed_pso(
+                *kind,
+                nppd.map(|n| &n.pso_feed_dm),
+                self.pso_feed_xess.as_ref(),
+                self.pso_feed_rr.as_ref(),
+                self.pso_feed_fsr_rr.as_ref(),
+            )
+            .ok_or("feed PSO missing (TraceGpu built without gbuf)")?;
+            feeds.push((pso, set as u32, planes.as_slice()));
         }
-        .ok_or("feed PSO missing (TraceGpu built without gbuf)")?;
         record_feed_dispatch(
             list,
+            &self.device,
             &self.uav_heap,
-            pso,
+            &feeds,
             nppd.map(|n| &n.pso_out),
-            planes,
             self.rw,
             self.rh,
             &|| unsafe { self.bind_common(list, slot) },
@@ -2835,11 +2900,58 @@ impl TraceGpu {
 /// Returns the plane list the record-side barriers need. Shared by TraceGpu
 /// and DxrGpu — both bind the same root layout, so the heap contract is
 /// identical.
+/// The resolve target (u14) sits at offset 0 of the RP_TEX table — so it must
+/// be present at the head of EVERY feed set, since a feed dispatch binds the
+/// table at its own set's offset and the range layout is the same one the
+/// kernel declares. Cheap: a descriptor, not a resource.
+pub(crate) fn write_resolve_uavs(
+    device: &ID3D12Device,
+    uav_heap: &ID3D12DescriptorHeap,
+    hdr: &ID3D12Resource,
+) {
+    let inc =
+        unsafe { device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) }
+            as usize;
+    let base = unsafe { uav_heap.GetCPUDescriptorHandleForHeapStart() };
+    for set in 0..FEED_SETS as usize {
+        unsafe {
+            device.CreateUnorderedAccessView(
+                hdr,
+                None,
+                None,
+                D3D12_CPU_DESCRIPTOR_HANDLE {
+                    ptr: base.ptr + set * FEED_SET_STRIDE as usize * inc,
+                },
+            )
+        };
+    }
+}
+
+/// The GPU handle a feed dispatch binds RP_TEX at: the start of `set`'s copy of
+/// the table.
+pub(crate) fn feed_set_handle(
+    device: &ID3D12Device,
+    uav_heap: &ID3D12DescriptorHeap,
+    set: u32,
+) -> D3D12_GPU_DESCRIPTOR_HANDLE {
+    let inc =
+        unsafe { device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) }
+            as u64;
+    D3D12_GPU_DESCRIPTOR_HANDLE {
+        ptr: unsafe { uav_heap.GetGPUDescriptorHandleForHeapStart() }.ptr
+            + (set * FEED_SET_STRIDE) as u64 * inc,
+    }
+}
+
 pub(crate) fn wire_feed_targets(
     device: &ID3D12Device,
     uav_heap: &ID3D12DescriptorHeap,
+    set: u32,
     targets: &[(u32, &ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT)],
 ) -> Result<Vec<ID3D12Resource>> {
+    if set >= FEED_SETS {
+        return Err(format!("feed set {set} >= FEED_SETS ({FEED_SETS})"));
+    }
     for &(reg, _, format) in targets {
         let mut fs = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: format, ..Default::default() };
         unsafe {
@@ -2867,9 +2979,14 @@ pub(crate) fn wire_feed_targets(
         // hdr descriptor (slot 0) or write past the heap end — descriptor
         // writes have no bounds check of their own, so gate in release.
         if !(NUM_UAVS + 2..NUM_UAVS + 2 + NUM_FEED).contains(&reg) {
-            return Err(format!("feed target u{reg} outside u16..u22"));
+            return Err(format!(
+                "feed target u{reg} outside u{}..u{}",
+                NUM_UAVS + 2,
+                NUM_UAVS + 1 + NUM_FEED
+            ));
         }
-        let slot = (reg - (NUM_UAVS + 1)) as usize; // u16 -> heap slot 1
+        // u16 -> slot 1 of the set (slot 0 is the set's resolve-target copy).
+        let slot = (set * FEED_SET_STRIDE + (reg - (NUM_UAVS + 1))) as usize;
         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: format,
             ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
@@ -2895,12 +3012,20 @@ pub(crate) fn wire_feed_targets(
 /// barrier window — TraceGpu's NPPD color crop), and the NPSR
 /// back-transitions that double as the write->read sync and the upscalers'
 /// state-at-use contract.
+/// `feeds` is one entry per wired engine: (its PSO, its descriptor set, its
+/// planes). Normal sessions pass exactly one; `--quinlight` passes one per
+/// engine, and each dispatch binds RP_TEX at ITS set — which is precisely why
+/// the sets exist (rewriting one set's descriptors between two dispatches in
+/// the same list would let the last write win for both).
+///
+/// All the engines' planes share ONE barrier window: they are pairwise disjoint
+/// resources and each is written by exactly one dispatch.
 pub(crate) fn record_feed_dispatch(
     list: &ID3D12GraphicsCommandList,
+    device: &ID3D12Device,
     uav_heap: &ID3D12DescriptorHeap,
-    pso: &ID3D12PipelineState,
+    feeds: &[(&ID3D12PipelineState, u32, &[ID3D12Resource])],
     extra_pso: Option<&ID3D12PipelineState>,
-    planes: &[ID3D12Resource],
     rw: u32,
     rh: u32,
     bind: &dyn Fn(),
@@ -2909,18 +3034,24 @@ pub(crate) fn record_feed_dispatch(
     unsafe {
         let npsr = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         let ua = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-        let to_uav: Vec<_> = planes.iter().map(|p| transition(p, npsr, ua)).collect();
+        let all = || feeds.iter().flat_map(|(_, _, planes)| planes.iter());
+        let to_uav: Vec<_> = all().map(|p| transition(p, npsr, ua)).collect();
         list.ResourceBarrier(&to_uav);
         bind();
         list.SetDescriptorHeaps(&[Some(uav_heap.clone())]);
-        list.SetComputeRootDescriptorTable(RP_TEX, uav_heap.GetGPUDescriptorHandleForHeapStart());
-        list.SetPipelineState(pso);
-        list.Dispatch(rw.div_ceil(8), rh.div_ceil(8), 1);
+        for (pso, set, _) in feeds {
+            list.SetComputeRootDescriptorTable(RP_TEX, feed_set_handle(device, uav_heap, *set));
+            list.SetPipelineState(*pso);
+            list.Dispatch(rw.div_ceil(8), rh.div_ceil(8), 1);
+        }
         if let Some(p2) = extra_pso {
+            // NPPD's color crop: a second dispatch writing planes DISJOINT from
+            // the feed's, inside the same barrier window. XeSS-only, so it rides
+            // the single feed's set, which record_feed's guard pins.
             list.SetPipelineState(p2);
             list.Dispatch(rw.div_ceil(8), rh.div_ceil(8), 1);
         }
-        let back: Vec<_> = planes.iter().map(|p| transition(p, ua, npsr)).collect();
+        let back: Vec<_> = all().map(|p| transition(p, ua, npsr)).collect();
         list.ResourceBarrier(&back);
     }
 }

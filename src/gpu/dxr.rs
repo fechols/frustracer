@@ -95,7 +95,11 @@ pub struct DxrGpu {
     pso_feed_xess: Option<ID3D12PipelineState>,
     pso_feed_rr: Option<ID3D12PipelineState>,
     pso_feed_fsr_rr: Option<ID3D12PipelineState>,
-    feed: Option<(trace::FeedKind, Vec<ID3D12Resource>)>,
+    /// One entry per wired engine; the index IS its descriptor set (see
+    /// trace::FEED_SETS). Normally one — several under --quinlight.
+    feed: Vec<(trace::FeedKind, Vec<ID3D12Resource>)>,
+    /// For the per-set descriptor-table handles record_feed computes.
+    device: ID3D12Device,
     frame_cb: d3d12::UploadBuffer,
     cb_base: FrameCb,
     pub rw: u32,
@@ -315,9 +319,10 @@ impl DxrGpu {
             uaf,
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
         )?;
-        // Slot 0 = hdr (the resolve target), slots 1..7 = the feed planes
-        // (wired later), slots TEX_HEAP_BASE.. = the RP_SCENE_TEX scene
-        // table — the tracer's heap layout exactly.
+        // FEED_SETS copies of the RP_TEX table (hdr resolve target at each set's
+        // offset 0, then that set's feed planes — wired later), then slots
+        // TEX_HEAP_BASE.. = the RP_SCENE_TEX scene table — the tracer's heap
+        // layout exactly.
         let uav_heap: ID3D12DescriptorHeap = unsafe {
             device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
@@ -329,14 +334,7 @@ impl DxrGpu {
             })
         }
         .map_err(|e| format!("CreateDescriptorHeap(dxr UAV): {e}"))?;
-        unsafe {
-            device.CreateUnorderedAccessView(
-                &hdr,
-                None,
-                None,
-                uav_heap.GetCPUDescriptorHandleForHeapStart(),
-            )
-        };
+        trace::write_resolve_uavs(device, &uav_heap, &hdr);
         scene_gpu.write_scene_descriptors(device, &uav_heap, TEX_HEAP_BASE);
         let tex_table = D3D12_GPU_DESCRIPTOR_HANDLE {
             ptr: unsafe { uav_heap.GetGPUDescriptorHandleForHeapStart() }.ptr
@@ -376,7 +374,8 @@ impl DxrGpu {
             pso_feed_xess,
             pso_feed_rr,
             pso_feed_fsr_rr,
-            feed: None,
+            feed: Vec::new(),
+            device: device.clone(),
             frame_cb,
             cb_base: FrameCb::base(scene, rw, rh),
             rw,
@@ -385,42 +384,69 @@ impl DxrGpu {
     }
 
     pub fn write_cb(&self, slot: usize, p: &FrameParams) {
-        let fsr_sig = matches!(&self.feed, Some((trace::FeedKind::FsrRr, _)));
+        // One FSR4-RR subscriber among the wired engines is enough to arm the
+        // pack's signal lanes (--quinlight can wire several).
+        let fsr_sig = self.feed.iter().any(|(k, _)| matches!(k, trace::FeedKind::FsrRr));
         self.cb_base
             .with_frame(p, self.gbuf_full, fsr_sig)
             .store(unsafe { self.frame_cb.ptr.add(slot * CB_STRIDE) });
     }
 
-    /// Wire the upscaler feed targets (registers u16..u22) into this
-    /// pipeline's descriptor heap — the DXR twin of TraceGpu::wire_feed,
-    /// same heap layout, same typed-store gate.
+    /// The DXR twin of TraceGpu::wire_feed — same heap layout, same typed-store
+    /// gate, same semantics: REPLACES the wiring with this one engine (so
+    /// --check-dxr can rewire from one feed kind to the next).
     pub fn wire_feed(
         &mut self,
         device: &ID3D12Device,
         kind: trace::FeedKind,
         targets: &[(u32, &ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT)],
     ) -> Result<()> {
-        self.feed = Some((kind, trace::wire_feed_targets(device, &self.uav_heap, targets)?));
+        self.feed.clear();
+        self.wire_feed_add(device, kind, targets)
+    }
+
+    /// APPENDS one engine, claiming the next descriptor set (--quinlight).
+    pub fn wire_feed_add(
+        &mut self,
+        device: &ID3D12Device,
+        kind: trace::FeedKind,
+        targets: &[(u32, &ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT)],
+    ) -> Result<()> {
+        let set = self.feed.len() as u32;
+        let planes = trace::wire_feed_targets(device, &self.uav_heap, set, targets)?;
+        self.feed.push((kind, planes));
         Ok(())
     }
 
-    /// Fan the pack + accum out into the wired upscaler input planes. Record
-    /// AFTER record_frame on the same list (its trailing global UAV barrier
-    /// fences the pack/accum writes).
+    /// Fan the pack + accum out into the wired upscaler input planes — one
+    /// dispatch per wired engine. Record AFTER record_frame on the same list
+    /// (its trailing global UAV barrier fences the pack/accum writes).
     pub fn record_feed(&self, list: &ID3D12GraphicsCommandList, slot: usize) -> Result<()> {
-        let Some((kind, planes)) = &self.feed else {
+        if self.feed.is_empty() {
             return Err("feed targets not wired".into());
-        };
-        let pso = match kind {
-            // Fsr3 IS the XeSS feed (same planes, formats, depth encode).
-            trace::FeedKind::Xess | trace::FeedKind::Fsr3 => self.pso_feed_xess.as_ref(),
-            trace::FeedKind::Rr => self.pso_feed_rr.as_ref(),
-            trace::FeedKind::FsrRr => self.pso_feed_fsr_rr.as_ref(),
         }
-        .ok_or("feed PSO missing (DxrGpu built without gbuf)")?;
-        trace::record_feed_dispatch(list, &self.uav_heap, pso, None, planes, self.rw, self.rh, &|| unsafe {
-            self.bind_common(list, slot)
-        });
+        let mut feeds: Vec<(&ID3D12PipelineState, u32, &[ID3D12Resource])> = Vec::new();
+        for (set, (kind, planes)) in self.feed.iter().enumerate() {
+            let pso = trace::feed_pso(
+                *kind,
+                None,
+                self.pso_feed_xess.as_ref(),
+                self.pso_feed_rr.as_ref(),
+                self.pso_feed_fsr_rr.as_ref(),
+            )
+            .ok_or("feed PSO missing (DxrGpu built without gbuf)")?;
+            feeds.push((pso, set as u32, planes.as_slice()));
+        }
+        trace::record_feed_dispatch(
+            list,
+            &self.device,
+            &self.uav_heap,
+            &feeds,
+            None,
+            self.rw,
+            self.rh,
+            &|| unsafe { self.bind_common(list, slot) },
+        );
         Ok(())
     }
 

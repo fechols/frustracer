@@ -19,6 +19,8 @@ pub mod ffx_rr;
 pub mod ffx_sys;
 pub mod ffx_up;
 pub mod pix;
+/// `--quinlight`: the registered-consensus fuse of every wired upscaler.
+pub mod quin;
 pub mod rr;
 pub mod streamline;
 pub mod streamline_sys;
@@ -78,6 +80,17 @@ pub struct GpuOptions {
     /// Override the display's reported peak luminance (`--hdr-peak`). None =
     /// use whatever `gpu::hdr` probes from the monitor.
     pub peak_nits: Option<f32>,
+    /// `--quinlight`: wire EVERY chain level the box supports instead of the
+    /// first, run them all over the same traced frame, and present the
+    /// registered-consensus fuse of their outputs (gpu/quin.rs). The one
+    /// session shape where the "exactly one upscaler" rule is deliberately
+    /// suspended.
+    pub quin: bool,
+    /// `--quin-anchor N`: which engine defines the fuse's spatial frame (it is
+    /// never warped). None = the first wired engine, which is the highest chain
+    /// level present — i.e. a DENOISING one wherever the box has one, which is
+    /// what you want as the anchor (see the quin docs).
+    pub quin_anchor: Option<u32>,
 }
 
 /// Which chain level a session actually wired — derived from the live state
@@ -85,6 +98,8 @@ pub struct GpuOptions {
 /// (--no-upscale or chain exhausted).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum WiredUpscaler {
+    /// --quinlight: several levels wired at once, presented through the fuse.
+    Quin,
     Rr,
     Fsr4,
     Xess,
@@ -141,6 +156,21 @@ struct FsrState {
     max: (u32, u32),
 }
 
+/// The trace res must sit inside this context's SDK range. The caller already
+/// quantize_res-clamped it, but the range is the SDK's contract, so a drift
+/// fails loudly at init rather than quietly at execute. Split out of
+/// `wire_fsr_feed` because a `--quinlight` FSR 3.1 that SHARES the XeSS feed
+/// still has to satisfy its own range — one frame is traced for every engine.
+fn fsr_range_check(fs: &FsrState, rw: u32, rh: u32) -> Result<()> {
+    if rw < fs.min.0 || rh < fs.min.1 || rw > fs.max.0 || rh > fs.max.1 {
+        return Err(format!(
+            "trace res {}x{} outside FSR render range {}x{}..{}x{}",
+            rw, rh, fs.min.0, fs.min.1, fs.max.0, fs.max.1
+        ));
+    }
+    Ok(())
+}
+
 /// Field order is drop order (Rust drops in declaration order), and teardown
 /// must mirror Streamline's documented shutdown sequence: release the proxied
 /// queue/swapchain (`d3d`, which also waits the GPU idle) and both proxy
@@ -163,11 +193,24 @@ pub struct GpuContext {
     /// torn down by GpuContext::drop after a queue drain — xessDestroyContext
     /// requires completed command lists and a live device.
     xess: Option<XessState>,
-    /// FSR (native pipeline only; never coexists with `sl` or `xess`). Same
-    /// teardown discipline: ffxDestroyContext needs completed lists and a
-    /// live device, so GpuContext::drop drains the queue and drops this
-    /// explicitly.
+    /// FSR. Normally the session's ONE wired flavor (FSR4-RR or FSR 3.1); under
+    /// --quinlight it is the FSR4-RR flavor and `fsr3` holds 3.1 alongside it.
+    /// Teardown discipline: ffxDestroyContext needs completed lists and a live
+    /// device, so GpuContext::drop drains the queue and drops this explicitly.
     fsr: Option<FsrState>,
+    /// --quinlight only: the FSR 3.1 upscale-only context, live ALONGSIDE
+    /// `fsr` (FSR4-RR). They are two contexts of the same ffx effect at
+    /// different provider versions — independent, so both can be created.
+    fsr3: Option<FsrState>,
+    /// --quinlight: the fuse pass over every wired engine's output. It AddRefs
+    /// the engine output textures it reads, so it may drop in any order
+    /// relative to them; GpuContext::drop still tears it down explicitly after
+    /// the queue drain, like every other GPU-resource field.
+    quin: Option<quin::Quin>,
+    /// The --quinlight session config, kept because the fuse is built lazily
+    /// from init_trace/init_dxr (which hold the DXC its PSO needs) and those do
+    /// not take a GpuOptions. `(anchor, debug)`; None = not a quinlight session.
+    quin_cfg: Option<(Option<u32>, bool)>,
     /// GPU-resident NPPD (`--gpu --nppd`, XeSS sessions only): ONNX Runtime
     /// executing on `d3d.queue` with the tracer's NppdRes buffers bound as
     /// tensors. Dropped before `trace`'s resources it wraps is fine — the
@@ -362,63 +405,8 @@ impl GpuContext {
             tonemap::SRV_SLOT_HDR,
         );
 
-        // Native chain levels (2-4), probed only when DLSS didn't win —
-        // XeSS and the ffx contexts are created on the real device and
-        // never coexist with the SL proxies. First hit wins; every failure
-        // is one loud fall-through line. FSR4-RR and FSR3 are the SAME
-        // ffx-api effect probed as two chain levels: level 2 requires the
-        // Ray Regeneration provider (RDNA4), level 4 is the cross-vendor
-        // FSR 3.1 upscale-only flavor (provider via ffxOverrideVersion).
-        let mut xess_state: Option<XessState> = None;
-        let mut fsr_state: Option<FsrState> = None;
-        if sl.is_none() {
-            let wire_fsr = |s: FsrState| {
-                passes.create_srv(
-                    &d3d.device,
-                    s.res.upscaled(),
-                    windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
-                    tonemap::SRV_SLOT_FSR,
-                );
-                s
-            };
-            if opts.chain.fsr4 {
-                match Self::init_fsr(&opts.ffx_dir, &d3d.device, w, h, opts.debug, crate::fsr::Flavor::Fsr4Rr, &opts.fsr_tune) {
-                    Ok(s) => fsr_state = Some(wire_fsr(s)),
-                    Err(e) => eprintln!("fsr4: level unavailable ({e}) — falling through the chain"),
-                }
-            }
-            if fsr_state.is_none() && opts.chain.xess {
-                // Input planes are allocated once at the range MAX; every
-                // frame uploads and names its own sub-rect (dynamic res).
-                match Self::init_xess(&opts.xess_dir, &d3d.device, w, h, opts.xess_autoexposure) {
-                    Ok(s) => {
-                        passes.create_srv(
-                            &d3d.device,
-                            &s.res.output,
-                            windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
-                            tonemap::SRV_SLOT_XESS,
-                        );
-                        xess_state = Some(s);
-                    }
-                    Err(e) => eprintln!("xess: level unavailable ({e}) — falling through the chain"),
-                }
-            }
-            if fsr_state.is_none() && xess_state.is_none() && opts.chain.fsr3 {
-                match Self::init_fsr(&opts.ffx_dir, &d3d.device, w, h, opts.debug, crate::fsr::Flavor::Fsr3, &opts.fsr_tune) {
-                    Ok(s) => fsr_state = Some(wire_fsr(s)),
-                    Err(e) => eprintln!("fsr3: level unavailable ({e})"),
-                }
-            }
-            if fsr_state.is_none()
-                && xess_state.is_none()
-                && opts.chain != crate::upchain::UpChain::NONE
-            {
-                eprintln!(
-                    "upscale: NO temporal upscaler available — chain exhausted \
-                     (dlss -> fsr4 -> xess -> fsr3); PLAIN presentation"
-                );
-            }
-        }
+        let (xess_state, fsr_state, fsr3_state) =
+            Self::probe_native(&passes, &d3d.device, opts, w, h, sl.is_some());
 
         Ok(Self {
             sl,
@@ -433,6 +421,9 @@ impl GpuContext {
             rr: rr_res,
             xess: xess_state,
             fsr: fsr_state,
+            fsr3: fsr3_state,
+            quin: None,
+            quin_cfg: opts.quin.then_some((opts.quin_anchor, opts.debug)),
             nppd_gpu: None,
             nppd_state_valid: false,
             adapter_name: pick.name,
@@ -442,6 +433,119 @@ impl GpuContext {
             hwnd,
             display: disp,
         })
+    }
+
+    /// Bring up the native chain levels (2-4) for an output size, and create
+    /// their presentation SRVs. Shared by `new` and `resize_output` — a resize
+    /// re-runs exactly the probe that wired the session, so it can never end up
+    /// with a different engine set than it started with.
+    ///
+    /// FSR4-RR and FSR 3.1 are the SAME ffx-api effect at two provider
+    /// versions, probed as two chain levels; XeSS and both ffx flavors are
+    /// created on the NATIVE device.
+    ///
+    /// Normally this is FIRST-HIT-WINS and only runs when DLSS didn't take the
+    /// session. Under `--quinlight` that rule is deliberately suspended and
+    /// EVERY supported level is wired, because the fuse's inputs ARE the engines
+    /// (gpu/quin.rs). Two things make the coexistence legal, and neither is new:
+    ///   * `d3d.device` is the NATIVE device even under Streamline — only the
+    ///     queue and swapchain are SL proxies (see `D3d::with_queue`), so the
+    ///     XeSS/ffx contexts are created exactly where they always were. Their
+    ///     dispatches record into the same native command list, and SL's queue
+    ///     proxy simply forwards the ExecuteCommandLists.
+    ///   * FSR4-RR and FSR 3.1 are independent ffx CONTEXTS, so one session can
+    ///     hold both.
+    /// A level that fails to come up is just not an engine: the fuse is
+    /// N-generic, so --quinlight degrades to whatever actually wired.
+    #[allow(clippy::type_complexity)]
+    fn probe_native(
+        passes: &tonemap::Passes,
+        device: &ID3D12Device,
+        opts: &GpuOptions,
+        w: u32,
+        h: u32,
+        sl_live: bool,
+    ) -> (Option<XessState>, Option<FsrState>, Option<FsrState>) {
+        let (mut xess, mut fsr, mut fsr3) = (None, None, None);
+        let all = opts.quin;
+        if sl_live && !all {
+            return (xess, fsr, fsr3);
+        }
+        let wire_fsr = |s: FsrState| {
+            passes.create_srv(
+                device,
+                s.res.upscaled(),
+                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+                tonemap::SRV_SLOT_FSR,
+            );
+            s
+        };
+        if opts.chain.fsr4 {
+            match Self::init_fsr(
+                &opts.ffx_dir,
+                device,
+                w,
+                h,
+                opts.debug,
+                crate::fsr::Flavor::Fsr4Rr,
+                &opts.fsr_tune,
+            ) {
+                Ok(s) => fsr = Some(wire_fsr(s)),
+                Err(e) => eprintln!("fsr4: level unavailable ({e}) — falling through the chain"),
+            }
+        }
+        if (all || fsr.is_none()) && opts.chain.xess {
+            // Input planes are allocated once at the range MAX; every frame
+            // uploads and names its own sub-rect (dynamic res).
+            match Self::init_xess(&opts.xess_dir, device, w, h, opts.xess_autoexposure) {
+                Ok(s) => {
+                    passes.create_srv(
+                        device,
+                        &s.res.output,
+                        windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+                        tonemap::SRV_SLOT_XESS,
+                    );
+                    xess = Some(s);
+                }
+                Err(e) => eprintln!("xess: level unavailable ({e}) — falling through the chain"),
+            }
+        }
+        if (all || (fsr.is_none() && xess.is_none())) && opts.chain.fsr3 {
+            match Self::init_fsr(
+                &opts.ffx_dir,
+                device,
+                w,
+                h,
+                opts.debug,
+                crate::fsr::Flavor::Fsr3,
+                &opts.fsr_tune,
+            ) {
+                Ok(s) => {
+                    if fsr.is_none() {
+                        fsr = Some(wire_fsr(s));
+                    } else {
+                        // --quinlight with BOTH ffx flavors: FSR4-RR already owns
+                        // SRV_SLOT_FSR (there is one standalone-FSR present slot),
+                        // and 3.1 is here purely as a fuse engine — the fuse reads
+                        // its engines from its OWN descriptor heap, never these
+                        // slots.
+                        fsr3 = Some(s);
+                    }
+                }
+                Err(e) => eprintln!("fsr3: level unavailable ({e})"),
+            }
+        }
+        if !sl_live
+            && fsr.is_none()
+            && xess.is_none()
+            && opts.chain != crate::upchain::UpChain::NONE
+        {
+            eprintln!(
+                "upscale: NO temporal upscaler available — chain exhausted \
+                 (dlss -> fsr4 -> xess -> fsr3); PLAIN presentation"
+            );
+        }
+        (xess, fsr, fsr3)
     }
 
     /// Query DLSS-RR's optimal Quality-mode render resolution and its
@@ -562,6 +666,8 @@ impl GpuContext {
         self.nppd_state_valid = false;
         self.xess = None;
         self.fsr = None;
+        self.fsr3 = None;
+        self.quin = None;
         self.rr = None;
         self.d3d.resize(w, h)?;
         self.blit = if self.d3d.hdr {
@@ -597,6 +703,19 @@ impl GpuContext {
             self.rr = Some(r);
         }
         match wired {
+            // --quinlight: the session's engines ARE "what was wired", so the
+            // rebuild is the same probe `new` ran. It cannot switch upscalers
+            // mid-session (the invariant this match exists to protect): support
+            // is a property of the box, not of the window size. The fuse itself
+            // is rebuilt lazily by the session's init_trace/init_dxr re-entry,
+            // which a resize already forces.
+            WiredUpscaler::Quin => {
+                let (x, f, f3) =
+                    Self::probe_native(&self.passes, &self.d3d.device, opts, w, h, self.sl.is_some());
+                self.xess = x;
+                self.fsr = f;
+                self.fsr3 = f3;
+            }
             WiredUpscaler::Xess => {
                 match Self::init_xess(&opts.xess_dir, &self.d3d.device, w, h, opts.xess_autoexposure) {
                     Ok(s) => {
@@ -740,10 +859,13 @@ impl GpuContext {
         Ok(FsrState { ctx, res, opt, min, max: (w, h) })
     }
 
-    /// Wire the session's live upscaler input planes as feed targets on a
-    /// GPU tracer (`wire` = TraceGpu's or DxrGpu's `wire_feed`). The trace
-    /// res was quantize_res-clamped by the caller, but the range is the
-    /// SDK's contract: re-check here so a drift fails loudly at init. A gbuf
+    /// Wire the session's live upscaler input planes as feed targets on a GPU
+    /// tracer (`wire` = TraceGpu's or DxrGpu's `wire_feed_add` — it APPENDS, and
+    /// is called once per engine, which is what --quinlight needs; the tracer is
+    /// freshly built here, so there is nothing to clear).
+    ///
+    /// The trace res was quantize_res-clamped by the caller, but the range is
+    /// the SDK's contract: re-check here so a drift fails loudly at init. A gbuf
     /// session with no live upscaler is a wiring bug, not a fallback.
     fn wire_session_feed(
         &self,
@@ -754,87 +876,166 @@ impl GpuContext {
             &[(u32, &ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT)],
         ) -> Result<()>,
     ) -> Result<()> {
+        // --quinlight: EVERY wired engine gets fed, each into its own descriptor
+        // set (wire_feed appends). The engines' register sets overlap — DLSS-RR
+        // and FSR4-RR both claim u16..u22 — which is exactly what the sets are
+        // for. XeSS and FSR 3.1 are the one exception that needs no second feed:
+        // their plane sets are byte-identical, so FSR 3.1 upscales straight from
+        // the XeSS trio (ffx_up::upscale_res_shared) and only pays a feed of its
+        // own when XeSS is absent.
+        // The predicate is STRUCTURAL, not `self.quin.is_some()`: the fuse is
+        // built after the feed is wired (it needs the DXC that init_trace holds),
+        // so asking for it here would always say no. More than one live engine IS
+        // a quinlight session.
+        if self.quin_engines().0.len() > 1 {
+            if let Some(rr) = &self.rr {
+                if self.sl.is_some() {
+                    self.wire_rr_feed(rr, rw, rh, &mut wire)?;
+                }
+            }
+            // The sharing keys on the FLAVOR, not on the field. probe_native
+            // parks FSR 3.1 in `fsr` whenever FSR4-RR is absent — which is the
+            // NVIDIA set (dlss-rr + fsr3 + xess) — and only in `fsr3` when both
+            // ffx flavors came up. A field-keyed rule fed the `fsr`-resident 3.1
+            // a whole descriptor set per frame that record_quin_engines then
+            // never read (it hands every Up-flavor context the XeSS trio): a full
+            // wasted feed dispatch on the primary dev config, and it burned the
+            // third and last FEED_SET. FSR4-RR always needs its own eleven-plane
+            // feed; a shared 3.1 still has its SDK range checked, since the one
+            // traced res must be legal for it too.
+            for fs in [self.fsr.as_ref(), self.fsr3.as_ref()].into_iter().flatten() {
+                if self.xess.is_some() && matches!(fs.res, FsrRes::Up(_)) {
+                    fsr_range_check(fs, rw, rh)?;
+                    continue;
+                }
+                self.wire_fsr_feed(fs, rw, rh, &mut wire)?;
+            }
+            if let Some(x) = &self.xess {
+                self.wire_xess_feed(x, rw, rh, &mut wire)?;
+            }
+            return Ok(());
+        }
         if let Some(rr) = &self.rr {
-            if rw < rr.min.0 || rh < rr.min.1 || rw > rr.max.0 || rh > rr.max.1 {
-                return Err(format!(
-                    "trace res {}x{} outside DLSS-RR render range {}x{}..{}x{}",
-                    rw, rh, rr.min.0, rr.min.1, rr.max.0, rr.max.1
-                ));
-            }
-            let pl = rr.plane_resources();
-            wire(
-                trace::FeedKind::Rr,
-                &[
-                    (trace::FEED_COLOR, pl[0].0, pl[0].1),
-                    (trace::FEED_NR, pl[1].0, pl[1].1),
-                    (trace::FEED_DEPTH, pl[2].0, pl[2].1),
-                    (trace::FEED_MVEC, pl[3].0, pl[3].1),
-                    (trace::FEED_ALB, pl[4].0, pl[4].1),
-                    (trace::FEED_SPEC, pl[5].0, pl[5].1),
-                    (trace::FEED_SPECHIT, pl[6].0, pl[6].1),
-                ],
-            )
+            self.wire_rr_feed(rr, rw, rh, &mut wire)
         } else if let Some(x) = &self.xess {
-            if rw < x.min.0 || rh < x.min.1 || rw > x.max.0 || rh > x.max.1 {
-                return Err(format!(
-                    "trace res {}x{} outside XeSS input range {}x{}..{}x{}",
-                    rw, rh, x.min.0, x.min.1, x.max.0, x.max.1
-                ));
-            }
-            let pl = x.res.plane_resources();
-            wire(
-                trace::FeedKind::Xess,
-                &[
-                    (trace::FEED_COLOR, pl[0].0, pl[0].1),
-                    (trace::FEED_MVEC, pl[1].0, pl[1].1),
-                    (trace::FEED_DEPTH, pl[2].0, pl[2].1),
-                ],
-            )
+            self.wire_xess_feed(x, rw, rh, &mut wire)
         } else if let Some(fs) = &self.fsr {
-            if rw < fs.min.0 || rh < fs.min.1 || rw > fs.max.0 || rh > fs.max.1 {
-                return Err(format!(
-                    "trace res {}x{} outside FSR render range {}x{}..{}x{}",
-                    rw, rh, fs.min.0, fs.min.1, fs.max.0, fs.max.1
-                ));
-            }
-            match &fs.res {
-                FsrRes::Up(res) => {
-                    let pl = res.plane_resources();
-                    wire(
-                        trace::FeedKind::Fsr3,
-                        &[
-                            (trace::FEED_COLOR, pl[0].0, pl[0].1),
-                            (trace::FEED_MVEC, pl[1].0, pl[1].1),
-                            (trace::FEED_DEPTH, pl[2].0, pl[2].1),
-                        ],
-                    )
-                }
-                FsrRes::Rr(res) => {
-                    // cs_feed_fsr_rr's register/plane mapping (feed.hlsl —
-                    // keep in lockstep; plane_resources returns upload order:
-                    // depth_lin, depth_clip, mvec, normals, diff_alb,
-                    // spec_alb, dd_in, ds_in, residual, ao_in, is_in).
-                    let pl = res.plane_resources();
-                    wire(
-                        trace::FeedKind::FsrRr,
-                        &[
-                            (trace::FEED_SPECHIT, pl[0].0, pl[0].1), // R32F linear depth
-                            (trace::FEED_DEPTH, pl[1].0, pl[1].1),   // R32F clip depth
-                            (trace::FEED_FSR_MVEC, pl[2].0, pl[2].1),
-                            (trace::FEED_NR, pl[3].0, pl[3].1), // RGB10A2 oct-normals
-                            (trace::FEED_ALB, pl[4].0, pl[4].1),
-                            (trace::FEED_SPEC, pl[5].0, pl[5].1),
-                            (trace::FEED_FSR_DD, pl[6].0, pl[6].1),
-                            (trace::FEED_FSR_DS, pl[7].0, pl[7].1),
-                            (trace::FEED_COLOR, pl[8].0, pl[8].1), // RGBA16F residual
-                            (trace::FEED_FSR_AO, pl[9].0, pl[9].1), // R16F AO
-                            (trace::FEED_FSR_IS, pl[10].0, pl[10].1), // RGBA16F indirect spec
-                        ],
-                    )
-                }
-            }
+            self.wire_fsr_feed(fs, rw, rh, &mut wire)
         } else {
             Err("gbuf session with no live upscaler".into())
+        }
+    }
+
+    /// Every engine's feed wiring is one of these three. Each re-checks the
+    /// trace res against ITS SDK's range: the caller clamped it, but the range
+    /// is the SDK's contract, so a drift fails loudly at init rather than
+    /// quietly at execute. (Under --quinlight the res must satisfy every wired
+    /// engine at once — main.rs intersects the ranges, and these are what
+    /// enforce it.)
+    fn wire_rr_feed(
+        &self,
+        rr: &rr::RrResources,
+        rw: u32,
+        rh: u32,
+        wire: &mut impl FnMut(
+            trace::FeedKind,
+            &[(u32, &ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT)],
+        ) -> Result<()>,
+    ) -> Result<()> {
+        if rw < rr.min.0 || rh < rr.min.1 || rw > rr.max.0 || rh > rr.max.1 {
+            return Err(format!(
+                "trace res {}x{} outside DLSS-RR render range {}x{}..{}x{}",
+                rw, rh, rr.min.0, rr.min.1, rr.max.0, rr.max.1
+            ));
+        }
+        let pl = rr.plane_resources();
+        wire(
+            trace::FeedKind::Rr,
+            &[
+                (trace::FEED_COLOR, pl[0].0, pl[0].1),
+                (trace::FEED_NR, pl[1].0, pl[1].1),
+                (trace::FEED_DEPTH, pl[2].0, pl[2].1),
+                (trace::FEED_MVEC, pl[3].0, pl[3].1),
+                (trace::FEED_ALB, pl[4].0, pl[4].1),
+                (trace::FEED_SPEC, pl[5].0, pl[5].1),
+                (trace::FEED_SPECHIT, pl[6].0, pl[6].1),
+            ],
+        )
+    }
+
+    fn wire_xess_feed(
+        &self,
+        x: &XessState,
+        rw: u32,
+        rh: u32,
+        wire: &mut impl FnMut(
+            trace::FeedKind,
+            &[(u32, &ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT)],
+        ) -> Result<()>,
+    ) -> Result<()> {
+        if rw < x.min.0 || rh < x.min.1 || rw > x.max.0 || rh > x.max.1 {
+            return Err(format!(
+                "trace res {}x{} outside XeSS input range {}x{}..{}x{}",
+                rw, rh, x.min.0, x.min.1, x.max.0, x.max.1
+            ));
+        }
+        let pl = x.res.plane_resources();
+        wire(
+            trace::FeedKind::Xess,
+            &[
+                (trace::FEED_COLOR, pl[0].0, pl[0].1),
+                (trace::FEED_MVEC, pl[1].0, pl[1].1),
+                (trace::FEED_DEPTH, pl[2].0, pl[2].1),
+            ],
+        )
+    }
+
+    fn wire_fsr_feed(
+        &self,
+        fs: &FsrState,
+        rw: u32,
+        rh: u32,
+        wire: &mut impl FnMut(
+            trace::FeedKind,
+            &[(u32, &ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT)],
+        ) -> Result<()>,
+    ) -> Result<()> {
+        fsr_range_check(fs, rw, rh)?;
+        match &fs.res {
+            FsrRes::Up(res) => {
+                let pl = res.plane_resources();
+                wire(
+                    trace::FeedKind::Fsr3,
+                    &[
+                        (trace::FEED_COLOR, pl[0].0, pl[0].1),
+                        (trace::FEED_MVEC, pl[1].0, pl[1].1),
+                        (trace::FEED_DEPTH, pl[2].0, pl[2].1),
+                    ],
+                )
+            }
+            FsrRes::Rr(res) => {
+                // cs_feed_fsr_rr's register/plane mapping (feed.hlsl — keep in
+                // lockstep; plane_resources returns upload order: depth_lin,
+                // depth_clip, mvec, normals, diff_alb, spec_alb, dd_in, ds_in,
+                // residual, ao_in, is_in).
+                let pl = res.plane_resources();
+                wire(
+                    trace::FeedKind::FsrRr,
+                    &[
+                        (trace::FEED_SPECHIT, pl[0].0, pl[0].1), // R32F linear depth
+                        (trace::FEED_DEPTH, pl[1].0, pl[1].1),   // R32F clip depth
+                        (trace::FEED_FSR_MVEC, pl[2].0, pl[2].1),
+                        (trace::FEED_NR, pl[3].0, pl[3].1), // RGB10A2 oct-normals
+                        (trace::FEED_ALB, pl[4].0, pl[4].1),
+                        (trace::FEED_SPEC, pl[5].0, pl[5].1),
+                        (trace::FEED_FSR_DD, pl[6].0, pl[6].1),
+                        (trace::FEED_FSR_DS, pl[7].0, pl[7].1),
+                        (trace::FEED_COLOR, pl[8].0, pl[8].1), // RGBA16F residual
+                        (trace::FEED_FSR_AO, pl[9].0, pl[9].1), // R16F AO
+                        (trace::FEED_FSR_IS, pl[10].0, pl[10].1), // RGBA16F indirect spec
+                    ],
+                )
+            }
         }
     }
 
@@ -876,7 +1077,7 @@ impl GpuContext {
         // Upscaler sessions: wire the live upscaler's input planes as feed
         // targets — the feed kernel writes them directly, no CPU upload.
         if gbuf {
-            self.wire_session_feed(rw, rh, |kind, targets| tg.wire_feed(&dev, kind, targets))?;
+            self.wire_session_feed(rw, rh, |kind, targets| tg.wire_feed_add(&dev, kind, targets))?;
         }
         // GPU-resident NPPD: ORT session on OUR device/queue, tensors bound
         // over the NppdRes buffers. XeSS-only (RR is itself a denoiser — the
@@ -920,6 +1121,8 @@ impl GpuContext {
             tonemap::SRV_SLOT_GPU,
         );
         self.trace = Some(tg);
+        // The fuse, over whatever engines the chain wired (--quinlight only).
+        self.build_quin(dxc)?;
         Ok(())
     }
 
@@ -951,7 +1154,7 @@ impl GpuContext {
         let dev = self.d3d.device.clone();
         let mut d = dxr::DxrGpu::new(&dev, dxc, scene, rw, rh, gbuf, debug, bc7_q, &mut self.d3d)?;
         if gbuf {
-            self.wire_session_feed(rw, rh, |kind, targets| d.wire_feed(&dev, kind, targets))?;
+            self.wire_session_feed(rw, rh, |kind, targets| d.wire_feed_add(&dev, kind, targets))?;
         }
         self.passes.create_srv(
             &self.d3d.device,
@@ -960,6 +1163,8 @@ impl GpuContext {
             tonemap::SRV_SLOT_DXR,
         );
         self.dxr = Some(d);
+        // The fuse, over whatever engines the chain wired (--quinlight only).
+        self.build_quin(dxc)?;
         Ok(())
     }
 
@@ -1196,7 +1401,7 @@ impl GpuContext {
         }
         {
             let fs = self.fsr.as_ref().unwrap();
-            if let Err(e) = Self::record_fsr3_upscale(fs, &self.d3d, fc, frame_ms) {
+            if let Err(e) = Self::record_fsr3_upscale(fs, &self.d3d, fc, frame_ms, None) {
                 self.d3d.abort_frame();
                 return Err(e);
             }
@@ -1303,55 +1508,177 @@ impl GpuContext {
             let d3d = &mut self.d3d;
             let tg = self.trace.as_ref().unwrap();
             let x = self.xess.as_ref().unwrap();
-            unsafe {
-                d3d.list.ResourceBarrier(&[transition(
-                    &x.res.output,
-                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                )]);
-            }
-            let (c, m, d) = x.res.input_ptrs();
-            let params = crate::xess::XessD3d12ExecuteParams {
-                color_texture: c,
-                velocity_texture: m,
-                depth_texture: d,
-                exposure_scale_texture: std::ptr::null_mut(),
-                responsive_pixel_mask_texture: std::ptr::null_mut(),
-                output_texture: x.res.output.as_raw(),
-                jitter_offset_x: crate::xess::JITTER_SIGN * jitter.0,
-                jitter_offset_y: crate::xess::JITTER_SIGN * jitter.1,
-                exposure_scale: 1.0,
-                reset_history: reset as u32,
-                input_width: tg.rw,
-                input_height: tg.rh,
-                input_color_base: Default::default(),
-                input_motion_vector_base: Default::default(),
-                input_depth_base: Default::default(),
-                input_responsive_mask_base: Default::default(),
-                reserved0: Default::default(),
-                output_color_base: Default::default(),
-                descriptor_heap: std::ptr::null_mut(),
-                descriptor_heap_offset: 0,
-            };
-            {
-                let _ev = pix::scope(&d3d.list, c"xess-eval");
-                if let Err(e) = x.ctx.execute(d3d.list.as_raw(), &params) {
-                    d3d.abort_frame();
-                    return Err(e);
-                }
-            }
-            unsafe {
-                d3d.list.ResourceBarrier(&[transition(
-                    &x.res.output,
-                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-                )]);
+            if let Err(e) = Self::record_xess_eval(x, d3d, tg.rw, tg.rh, jitter, reset) {
+                d3d.abort_frame();
+                return Err(e);
             }
         }
         // The tonemap pass re-binds root sig/PSO/heaps/viewport from scratch,
         // restoring whatever list state the XeSS dispatch left behind.
         self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_XESS, 1.0);
         self.d3d.end_frame(slot)
+    }
+
+    /// Record EVERY wired engine's upscale into its own output texture, then the
+    /// registered-consensus fuse over them — the shared middle of the two
+    /// --quinlight present arms (wavefront and DXR). The caller has already
+    /// recorded the trace and ONE feed dispatch per engine.
+    ///
+    /// All of it rides one command list, in FIFO order: each engine reads the
+    /// same G-buffer-derived planes (they are read-only consumers, so no barrier
+    /// between them) and writes its own window-res output; the fuse then reads
+    /// those N outputs as SRVs and writes the one image the tonemap presents.
+    /// Under DLSS the whole list executes on the SL proxy queue, exactly as
+    /// present_trace_rr's does.
+    ///
+    /// An engine that errors here fails the frame — by this point it is wired,
+    /// fed, and counted in the fuse's N, so silently skipping it would fuse a
+    /// stale output.
+    #[allow(clippy::too_many_arguments)]
+    fn record_quin_engines(
+        &mut self,
+        rw: u32,
+        rh: u32,
+        jitter: (f32, f32),
+        reset: bool,
+        fc: &dlss::FrameConstants,
+        prev_pos: Option<glam::Vec3A>,
+        frame_idx: u32,
+        frame_ms: f32,
+    ) -> Result<()> {
+        // DLSS-RR (engine 0 when Streamline is live).
+        if let (Some(sl), Some(rr)) = (self.sl.as_ref(), self.rr.as_ref()) {
+            let d3d = &self.d3d;
+            unsafe {
+                d3d.list.ResourceBarrier(&[transition(
+                    &rr.output,
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+            }
+            rr_sl_sequence(sl, rr, &d3d.list, fc, frame_idx)?;
+            unsafe {
+                d3d.list.ResourceBarrier(&[transition(
+                    &rr.output,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                )]);
+            }
+        }
+        // The ffx flavors. FSR4-RR denoises + upscales; FSR 3.1 upscales only —
+        // and does it from the XeSS trio when XeSS is also wired (one feed, two
+        // readers), else from its own planes.
+        let shared = self.xess.as_ref().map(|x| x.res.plane_resources());
+        for fs in [self.fsr.as_ref(), self.fsr3.as_ref()].into_iter().flatten() {
+            match &fs.res {
+                FsrRes::Rr(_) => {
+                    Self::record_fsr_rr_sequence(fs, &self.d3d, fc, prev_pos, frame_idx, frame_ms)?
+                }
+                FsrRes::Up(_) => {
+                    Self::record_fsr3_upscale(fs, &self.d3d, fc, frame_ms, shared.as_ref())?
+                }
+            }
+        }
+        // XeSS.
+        if let Some(x) = self.xess.as_ref() {
+            Self::record_xess_eval(x, &self.d3d, rw, rh, jitter, reset)?;
+        }
+        // The fuse: N engine outputs -> one image at SRV_SLOT_QUIN.
+        self.quin.as_ref().ok_or("quinlight fuse not built")?.record(&self.d3d.list);
+        Ok(())
+    }
+
+    /// The registered-consensus fuse fed by the GPU-resident tracer
+    /// (`--gpu --quinlight`): trace -> one feed dispatch per engine -> every
+    /// wired upscaler -> the LK-registered winsorized fuse -> tonemap
+    /// (SRV_SLOT_QUIN) -> present. One command list, one Present.
+    #[allow(clippy::too_many_arguments)]
+    pub fn present_trace_quin(
+        &mut self,
+        p: &trace::FrameParams,
+        hybrid: bool,
+        jitter: (f32, f32),
+        reset: bool,
+        fc: &dlss::FrameConstants,
+        prev_pos: Option<glam::Vec3A>,
+        frame_idx: u32,
+        frame_ms: f32,
+    ) -> Result<()> {
+        crate::zone!("present-trace-quin");
+        if self.trace.is_none() || self.quin.is_none() {
+            return Err("GPU tracer + quinlight fuse not both initialized".into());
+        }
+        let slot = self.d3d.begin_frame()?;
+        let (rw, rh) = {
+            let d3d = &mut self.d3d;
+            let tg = self.trace.as_ref().unwrap();
+            tg.write_cb(slot, p);
+            tg.record_frame(&d3d.list, slot, p, hybrid);
+            if let Err(e) = tg.record_feed(&d3d.list, slot, false) {
+                d3d.abort_frame();
+                return Err(e);
+            }
+            (tg.rw, tg.rh)
+        };
+        if let Err(e) =
+            self.record_quin_engines(rw, rh, jitter, reset, fc, prev_pos, frame_idx, frame_ms)
+        {
+            self.d3d.abort_frame();
+            return Err(e);
+        }
+        self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_QUIN, 1.0);
+        self.d3d.end_frame(slot)
+    }
+
+    /// The DXR twin of `present_trace_quin` (the `--dxr` default + --quinlight):
+    /// DispatchRays instead of the wavefront, same engines, same fuse.
+    #[allow(clippy::too_many_arguments)]
+    pub fn present_dxr_quin(
+        &mut self,
+        p: &trace::FrameParams,
+        jitter: (f32, f32),
+        reset: bool,
+        fc: &dlss::FrameConstants,
+        prev_pos: Option<glam::Vec3A>,
+        frame_idx: u32,
+        frame_ms: f32,
+    ) -> Result<()> {
+        crate::zone!("present-dxr-quin");
+        if self.dxr.is_none() || self.quin.is_none() {
+            return Err("DXR pipeline + quinlight fuse not both initialized".into());
+        }
+        let slot = self.d3d.begin_frame()?;
+        let (rw, rh) = {
+            let d3d = &mut self.d3d;
+            let d = self.dxr.as_ref().unwrap();
+            d.write_cb(slot, p);
+            if let Err(e) = d.record_frame(&d3d.list, slot) {
+                d3d.abort_frame();
+                return Err(e);
+            }
+            if let Err(e) = d.record_feed(&d3d.list, slot) {
+                d3d.abort_frame();
+                return Err(e);
+            }
+            (d.rw, d.rh)
+        };
+        if let Err(e) =
+            self.record_quin_engines(rw, rh, jitter, reset, fc, prev_pos, frame_idx, frame_ms)
+        {
+            self.d3d.abort_frame();
+            return Err(e);
+        }
+        self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_QUIN, 1.0);
+        self.d3d.end_frame(slot)
+    }
+
+    /// Screenshot path for --quinlight: the fused image exists only on the GPU.
+    pub fn read_quin_output(&mut self) -> Result<Vec<u32>> {
+        let Some(q) = &self.quin else {
+            return Err("quinlight fuse not initialized".into());
+        };
+        let output = q.output.clone();
+        Ok(self.read_hdr_output(output)?.0)
     }
 
     /// FSR 3.1 fed by the GPU-resident tracer (`--gpu` with FSR3 wired):
@@ -1390,7 +1717,7 @@ impl GpuContext {
         }
         {
             let fs = self.fsr.as_ref().unwrap();
-            if let Err(e) = Self::record_fsr3_upscale(fs, &self.d3d, fc, frame_ms) {
+            if let Err(e) = Self::record_fsr3_upscale(fs, &self.d3d, fc, frame_ms, None) {
                 self.d3d.abort_frame();
                 return Err(e);
             }
@@ -1513,10 +1840,15 @@ impl GpuContext {
     }
 
     /// Which chain level this session wired — derived from the live state
-    /// (at most one upscaler exists per session by the probe's construction),
-    /// so it can never disagree with the contexts actually held.
+    /// (at most one upscaler exists per session by the probe's construction,
+    /// EXCEPT under --quinlight, where several do and the fuse presents), so it
+    /// can never disagree with the contexts actually held.
     pub fn wired(&self) -> WiredUpscaler {
-        if self.dlss_ready() {
+        // Tested first: a quinlight session holds several engines, and any of
+        // the branches below would also match one of them.
+        if self.quin.is_some() {
+            WiredUpscaler::Quin
+        } else if self.dlss_ready() {
             WiredUpscaler::Rr
         } else if let Some(f) = &self.fsr {
             match f.res.flavor() {
@@ -1528,6 +1860,123 @@ impl GpuContext {
         } else {
             WiredUpscaler::Plain
         }
+    }
+
+    /// The engines a --quinlight session fuses, in CHAIN order (which is also
+    /// fuse order, so engine 0 is the highest level present — a DENOISING one
+    /// wherever the box has one, which is what the default anchor wants).
+    ///
+    /// Their window-res RGBA16F outputs are the fuse's SRVs. Ordinary sessions
+    /// return at most one, which is why `quin_engines().len() < 2` is the
+    /// "nothing to fuse" test.
+    fn quin_engines(&self) -> (Vec<&ID3D12Resource>, quin::Engines) {
+        let mut res: Vec<&ID3D12Resource> = Vec::new();
+        let mut names: Vec<&'static str> = Vec::new();
+        if let Some(r) = &self.rr {
+            if self.sl.is_some() {
+                res.push(&r.output);
+                names.push("dlss-rr");
+            }
+        }
+        for f in [self.fsr.as_ref(), self.fsr3.as_ref()].into_iter().flatten() {
+            res.push(f.res.upscaled());
+            names.push(match f.res.flavor() {
+                crate::fsr::Flavor::Fsr4Rr => "fsr4-rr",
+                crate::fsr::Flavor::Fsr3 => "fsr3",
+            });
+        }
+        if let Some(x) = &self.xess {
+            res.push(&x.res.output);
+            names.push("xess");
+        }
+        (res, quin::Engines(names))
+    }
+
+    /// Build the fuse over whatever engines came up — called from
+    /// init_trace/init_dxr, which already hold the DXC the PSO needs. A single
+    /// engine is not a consensus: the session then presents that engine
+    /// directly (its own chain level), and `wired()` reports it.
+    fn build_quin(&mut self, dxc: &dxc::Dxc) -> Result<()> {
+        let Some((anchor_opt, debug)) = self.quin_cfg else {
+            return Ok(());
+        };
+        let (w, h) = (self.d3d.width, self.d3d.height);
+        let (engines, names) = self.quin_engines();
+        if engines.len() < 2 {
+            eprintln!(
+                "quinlight: only {} engine(s) came up ({}) — nothing to fuse; \
+                 presenting that level directly",
+                engines.len(),
+                if names.0.is_empty() { "none".into() } else { names.names() }
+            );
+            return Ok(());
+        }
+        // Default: anchor on a DENOISING engine (DLSS-RR, else FSR4-RR) when the
+        // box wired one — the anchor is never warped, so it is the engine whose
+        // spatial frame survives, and a ray-reconstruction image is both the
+        // cleanest reference for the LK solve and the one worth keeping. An
+        // explicit --quin-anchor always wins.
+        // An out-of-range --quin-anchor is a typo, and silently clamping it would
+        // report someone else's engine as the anchor they asked for — an A/B run
+        // against a bad index would read as a legitimate result. Say so, then
+        // clamp (the shader clamps too; this is about the user, not soundness).
+        let last = engines.len() as u32 - 1;
+        if let Some(a) = anchor_opt.filter(|a| *a > last) {
+            eprintln!(
+                "quinlight: --quin-anchor {a} is past the last engine ({last}: {}) — \
+                 clamping to {last}",
+                names.names()
+            );
+        }
+        let anchor = anchor_opt.unwrap_or_else(|| names.default_anchor()).min(last);
+        let q =
+            quin::Quin::new(&self.d3d.device, dxc, &engines, names.clone(), anchor, w, h, debug)?;
+        self.passes.create_srv(
+            &self.d3d.device,
+            &q.output,
+            windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+            tonemap::SRV_SLOT_QUIN,
+        );
+        eprintln!(
+            "quinlight: fusing {} engines [{}], anchor {} ({}) — registered consensus \
+             (LK + warp + winsorized mean){}",
+            engines.len(),
+            names.names(),
+            names.0[anchor as usize],
+            match anchor_opt {
+                Some(_) => "--quin-anchor",
+                None if quin::DENOISING.contains(&names.0[anchor as usize]) =>
+                    "default: the denoising engine",
+                None => "default: engine 0",
+            },
+            if engines.len() == 2 {
+                "; NOTE 2 engines => the winsorized mean IS a plain mean (see gpu/quin.rs)"
+            } else {
+                ""
+            }
+        );
+        // The measured caveat, said out loud: the reduce can only pull the clean
+        // anchor toward the noisy ones, so a mixed stack is quieter than the TAA
+        // engines but NOISIER than the denoiser alone. Not a failure — a property
+        // of the mean — but a user who wired this expecting a free win should be
+        // told, not left to discover it.
+        if names.mixed_noise(anchor) {
+            eprintln!(
+                "quinlight: NOTE the anchor denoises but [{}] does not — the winsorized mean \
+                 pulls the anchor toward the noisier engines, so expect MORE temporal noise \
+                 than {} alone (measured; see CLAUDE.md). --quinlight --no-dlss fuses peers.",
+                names
+                    .0
+                    .iter()
+                    .filter(|n| !quin::DENOISING.contains(n))
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(" + "),
+                names.0[anchor as usize],
+            );
+        }
+        self.quin = Some(q);
+        Ok(())
     }
 
     /// The optimal render resolution for DLSS mode (SL's Quality-mode
@@ -1547,6 +1996,44 @@ impl GpuContext {
     /// XeSS live => the dynamic-res upscale path is available.
     pub fn xess_ready(&self) -> bool {
         self.xess.is_some()
+    }
+
+    /// The fused engines, for the HUD ("dlss-rr + xess + fsr3").
+    pub fn quin_names(&self) -> Option<String> {
+        self.quin.as_ref().map(|q| q.names.names())
+    }
+
+    /// Will this session present through the fuse? True iff `--quinlight` AND at
+    /// least two engines actually came up. The fuse itself is built later (in
+    /// init_trace/init_dxr, which hold the DXC), but the ANSWER is fixed at
+    /// probe time — main.rs needs it before then, to pick the render res that
+    /// satisfies every engine at once.
+    pub fn quin_planned(&self) -> bool {
+        self.quin_cfg.is_some() && self.quin_engines().0.len() > 1
+    }
+
+    /// The render-res range every wired engine accepts: the INTERSECTION of
+    /// their SDK ranges (max of the mins, min of the maxes). A --quinlight frame
+    /// is traced ONCE and fed to all of them, so the one res must be legal for
+    /// each — and `wire_session_feed`'s per-engine range checks enforce it.
+    /// None = no engine wired.
+    pub fn quin_res_range(&self) -> Option<((u32, u32), (u32, u32), (u32, u32))> {
+        let mut it = [
+            self.rr.as_ref().filter(|_| self.sl.is_some()).map(|r| (r.opt, r.min, r.max)),
+            self.fsr.as_ref().map(|f| (f.opt, f.min, f.max)),
+            self.fsr3.as_ref().map(|f| (f.opt, f.min, f.max)),
+            self.xess.as_ref().map(|x| (x.opt, x.min, x.max)),
+        ]
+        .into_iter()
+        .flatten();
+        let first = it.next()?;
+        Some(it.fold(first, |(o, lo, hi), (o2, lo2, hi2)| {
+            (
+                (o.0.min(o2.0), o.1.min(o2.1)),
+                (lo.0.max(lo2.0), lo.1.max(lo2.1)),
+                (hi.0.min(hi2.0), hi.1.min(hi2.1)),
+            )
+        }))
     }
 
     /// XeSS input-resolution range: (optimal, min, max). Every dynamic frame
@@ -1920,7 +2407,7 @@ impl GpuContext {
             return Err(e);
         }
 
-        if let Err(e) = Self::record_fsr3_upscale(fs, &self.d3d, fc, frame_ms) {
+        if let Err(e) = Self::record_fsr3_upscale(fs, &self.d3d, fc, frame_ms, None) {
             self.d3d.abort_frame();
             return Err(e);
         }
@@ -1937,11 +2424,16 @@ impl GpuContext {
     /// output. The plane already holds pixel-space MVs, so the scale is the
     /// bare polarity signs. The caller owns the open frame (and aborts it on
     /// Err).
+    /// `src` (--quinlight): upscale from FOREIGN input planes — the XeSS trio,
+    /// which is byte-for-byte FSR 3.1's own plane set, so a quinlight session
+    /// feeds one trio and both SDKs read it (see `upscale_res_shared`). None =
+    /// this context's own planes, the single-engine path.
     fn record_fsr3_upscale(
         fs: &FsrState,
         d3d: &D3d,
         fc: &dlss::FrameConstants,
         frame_ms: f32,
+        src: Option<&[(&ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT); 3]>,
     ) -> Result<()> {
         let FsrRes::Up(res) = &fs.res else {
             return Err("FSR3 upscale on an FSR4+RR session".into());
@@ -1956,7 +2448,10 @@ impl GpuContext {
         res.barrier_upscale_begin(&d3d.list);
         let up_desc = Self::fsr_upscale_desc(
             d3d.list.as_raw(),
-            res.upscale_res(),
+            match src {
+                Some(p) => res.upscale_res_shared(p),
+                None => res.upscale_res(),
+            },
             fc,
             fs.max,
             frame_ms,
@@ -1967,6 +2462,65 @@ impl GpuContext {
             fs.ctx.upscale(&up_desc)?;
         }
         res.barrier_upscale_end(&d3d.list);
+        Ok(())
+    }
+
+    /// One XeSS upscale into `x.res.output`, recorded on `d3d.list`: the block
+    /// every GPU-fed XeSS path shares (present_trace_xess, present_dxr_xess, and
+    /// the --quinlight fuse, which runs XeSS as one engine among several).
+    /// `(rw, rh)` is the trace res — the sub-rect XeSS reads.
+    ///
+    /// Leaves `output` back in PIXEL_SHADER_RESOURCE (where the tonemap and the
+    /// fuse both expect their inputs).
+    fn record_xess_eval(
+        x: &XessState,
+        d3d: &D3d,
+        rw: u32,
+        rh: u32,
+        jitter: (f32, f32),
+        reset: bool,
+    ) -> Result<()> {
+        unsafe {
+            d3d.list.ResourceBarrier(&[transition(
+                &x.res.output,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            )]);
+        }
+        let (c, m, d) = x.res.input_ptrs();
+        let params = crate::xess::XessD3d12ExecuteParams {
+            color_texture: c,
+            velocity_texture: m,
+            depth_texture: d,
+            exposure_scale_texture: std::ptr::null_mut(),
+            responsive_pixel_mask_texture: std::ptr::null_mut(),
+            output_texture: x.res.output.as_raw(),
+            jitter_offset_x: crate::xess::JITTER_SIGN * jitter.0,
+            jitter_offset_y: crate::xess::JITTER_SIGN * jitter.1,
+            exposure_scale: 1.0,
+            reset_history: reset as u32,
+            input_width: rw,
+            input_height: rh,
+            input_color_base: Default::default(),
+            input_motion_vector_base: Default::default(),
+            input_depth_base: Default::default(),
+            input_responsive_mask_base: Default::default(),
+            reserved0: Default::default(),
+            output_color_base: Default::default(),
+            descriptor_heap: std::ptr::null_mut(),
+            descriptor_heap_offset: 0,
+        };
+        {
+            let _ev = pix::scope(&d3d.list, c"xess-eval");
+            x.ctx.execute(d3d.list.as_raw(), &params)?;
+        }
+        unsafe {
+            d3d.list.ResourceBarrier(&[transition(
+                &x.res.output,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            )]);
+        }
         Ok(())
     }
 

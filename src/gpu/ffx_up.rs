@@ -257,6 +257,29 @@ impl Fsr3Resources {
         )
     }
 
+    /// `--quinlight`: upscale from FOREIGN input planes — the XeSS trio, which
+    /// is this plane set byte for byte (same three formats, same pixel-space MV
+    /// convention, same reversed-Z depth encode; `plane_resources`' own doc says
+    /// the FSR3 feed IS the XeSS feed). So a quinlight session feeds ONE trio and
+    /// both SDKs read it: two read-only consumers of one texture in one state
+    /// (NON_PIXEL_SHADER_RESOURCE == RES_STATE_COMPUTE_READ), which needs no
+    /// barrier between them. Our own planes stay allocated and unused — deleting
+    /// them would cost more lines than the ~50 MB they hold.
+    ///
+    /// `p` is (color, mvec, depth) — `XessResources::plane_resources`' order.
+    /// Note the reorder: this tuple is (color, DEPTH, MVEC, out).
+    pub fn upscale_res_shared(
+        &self,
+        p: &[(&ID3D12Resource, DXGI_FORMAT); N_PLANES],
+    ) -> (FfxShimRes, FfxShimRes, FfxShimRes, FfxShimRes) {
+        (
+            Self::shim(p[0].0, RES_STATE_COMPUTE_READ),
+            Self::shim(p[2].0, RES_STATE_COMPUTE_READ),
+            Self::shim(p[1].0, RES_STATE_COMPUTE_READ),
+            Self::shim(&self.upscaled, RES_STATE_UNORDERED_ACCESS),
+        )
+    }
+
     pub fn barrier_upscale_begin(&self, list: &ID3D12GraphicsCommandList) {
         unsafe {
             list.ResourceBarrier(&[transition(
