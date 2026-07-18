@@ -3081,6 +3081,7 @@ impl GpuContext {
             tonemap::SRV_SLOT_FSR => self.fsr.as_ref().map(|s| s.res.upscaled()),
             tonemap::SRV_SLOT_GPU => self.trace.as_ref().map(|t| &t.hdr),
             tonemap::SRV_SLOT_DXR => self.dxr.as_ref().map(|d| &d.hdr),
+            tonemap::SRV_SLOT_QUIN => self.quin.as_ref().map(|q| &q.output),
             _ => None,
         }
     }
