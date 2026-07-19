@@ -621,6 +621,29 @@ fn main() {
             // pattern): no chains are built, every trilinear sample falls
             // back to mip-0 bilinear — the pre-mip renderer exactly.
             "--no-mips" => texture::set_mips(false),
+            // Load-time converter kill levers, same "knob before scene load"
+            // pattern: --no-h2n restores the pre-conversion behavior exactly
+            // (grayscale bump maps are dropped, normal_tex stays NO_TEX);
+            // --no-n2h leaves real normal maps' alpha at 255 and height_amp
+            // at 0.0 — relief has no field to march, structurally off.
+            "--no-h2n" => texture::set_h2n(false),
+            "--no-n2h" => texture::set_n2h(false),
+            // Relief rendering session levers. --no-heightfield is STRUCTURAL
+            // (no AABB sweep at BVH build, no march anywhere — part of the
+            // scene-cache lever word); --heightfield is the explicit default
+            // spelling (relief starts ON wherever the scene carries height).
+            // The V key toggles live within an armed session.
+            // Restores BOTH statics so `--no-heightfield --heightfield`
+            // (later flags win) is a true no-op — headless --check* paths
+            // read height_on() directly, with no session() to re-seed it.
+            "--heightfield" => {
+                bvh::set_height_armed(true);
+                bvh::set_height_on(true);
+            }
+            "--no-heightfield" => {
+                bvh::set_height_armed(false);
+                bvh::set_height_on(false);
+            }
             // A/B lever: no glare. A display-stage pass, so this is a pure
             // presentation change — accum, the temporal cache, every upscaler
             // guide and every radiance gate are untouched either way, and the
@@ -1002,6 +1025,13 @@ fn main() {
                 eprintln!("                off is bit-identical to the pre-cloud renderer)");
                 eprintln!("  --no-mips     no texture mip chains; every trilinear sample degenerates to the");
                 eprintln!("                pre-mip bilinear (A/B lever; mips are on by default — implies --no-aniso)");
+                eprintln!("  --no-h2n      don't Sobel-convert grayscale bump maps into normal maps (they are");
+                eprintln!("                dropped, the pre-conversion behavior)");
+                eprintln!("  --no-n2h      don't derive heightfields from normal maps (Frankot–Chellappa) — no");
+                eprintln!("                alpha-channel height, height_amp stays 0");
+                eprintln!("  --no-heightfield  no relief rendering, structurally (no swept AABBs, no march;");
+                eprintln!("                the pre-relief renderer bit-exactly). Default: relief ON where the");
+                eprintln!("                scene carries height data; V toggles it live vs normal-mapped");
                 eprintln!("  --aniso N     max anisotropy for texture filtering, 1..=16 (default 16; 1 = off, i.e.");
                 eprintln!("                the isotropic ray-cone trilinear path verbatim). --no-aniso = --aniso 1");
                 eprintln!("  --spp <n>     primary samples per pixel per frame (1..=128, default 1; U doubles live).");
@@ -1197,11 +1227,16 @@ fn main() {
             let (s, b) = match cached {
                 Some((s, b)) => (s, Some(b)),
                 None => {
-                    let s = if is_gltf {
+                    let mut s = if is_gltf {
                         gltf_loader::load_gltf_scene(&resolved)
                     } else {
                         scene::load_obj_scene(&resolved)
                     };
+                    // Cold loads only — before the cache store, so the n2h
+                    // flags + height_amps persist; warm loads re-apply the
+                    // texture conversions from the cached flags and take
+                    // height_amp from DiskMat.
+                    scene::derive_heights(&mut s);
                     // Under --tile the untiled build's ONLY use is feeding
                     // the cache store (the tiled BVH is always a fresh
                     // build) — and glTF skips the cache, so a tiled glTF
@@ -3453,6 +3488,23 @@ fn run_check_gpu(
     } else if alpha_rej != 0 {
         eprintln!(
             "check-gpu: FAIL {alpha_rej} alpha rejections on an opaque scene (ALPHA_CUTOUT must be compiled out)"
+        );
+        ok = false;
+    }
+    // Relief anti-vacuity, the cutout's twin: a height-carrying scene with
+    // the toggle on must actually reject candidates somewhere (silhouettes/
+    // side exits); a height-free scene must count zero (HEIGHTFIELD compiled
+    // out). Same --cam caveat class as the cutout must-fire.
+    let height_rej = ctrs[gpu::trace::CTR_HEIGHT_REJ as usize];
+    if scene.any_height && bvh::height_on() {
+        eprintln!("check-gpu: relief-march rejections: {height_rej}");
+        if height_rej == 0 {
+            eprintln!("check-gpu: FAIL height-carrying scene rejected 0 candidates (relief must fire)");
+            ok = false;
+        }
+    } else if height_rej != 0 {
+        eprintln!(
+            "check-gpu: FAIL {height_rej} relief rejections without height data (HEIGHTFIELD must be compiled out)"
         );
         ok = false;
     }
@@ -7937,6 +7989,20 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
     };
 
+    // Relief-march gates — flat-field bitwise identity, closed-form marched
+    // hits, silhouette reject, interior escape / pit-wall occlusion, the
+    // underside crossing, and the build-vs-march depth pin.
+    let height_ok = match bvh::height_self_test() {
+        Ok(()) => {
+            eprintln!("height self-test: OK");
+            true
+        }
+        Err(e) => {
+            eprintln!("height self-test: FAIL — {e}");
+            false
+        }
+    };
+
     // Spherical-cell math self-test — closed-form identities the hemisphere
     // bounce integrator is built on (Ω/PSA anchors, exact partition,
     // in-cell sampling).
@@ -9988,6 +10054,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
 
     let gates = [
         ("texture", tex_ok),
+        ("height", height_ok),
         ("sh", sh_ok),
         ("sky", sky_ok),
         ("clouds", clouds_ok),
@@ -10110,6 +10177,10 @@ struct Persist {
     overlay_on: bool,
     gpu_tonemap: bool,
     bounce_mode: u32,
+    /// Heightfield relief vs normal-mapped (V toggles; `--heightfield` /
+    /// `--no-heightfield` seed it). Mirrored into `bvh::set_height_on` each
+    /// frame — a shading+visibility switch, never a rebuild.
+    height_on: bool,
     preset: u32,
     /// Samples per pixel per frame (U cycles it; --spp seeds it).
     spp: u32,
@@ -10312,6 +10383,11 @@ fn session(
     // Hemisphere frustum bounces (H cycles off → AO → GI): still-frame
     // quality — moving/DLSS frames keep the sampled path.
     let mut bounce_mode = p0.map_or(0u32, |p| p.bounce_mode);
+    // Heightfield relief vs normal-mapped (V; starts ON where the scene has
+    // height data unless --no-heightfield disarmed it). The static the
+    // intersector reads is stored here and at every V edge.
+    let mut height_on = p0.map_or(bvh::height_armed(), |p| p.height_on);
+    bvh::set_height_on(height_on);
     let mut preset = p0.map_or(2u32, |p| p.preset);
     // Samples per pixel per frame (--spp seeds it, U cycles). Every mode reads
     // it; FrameCtx::spp()/the GPU kernels pin it to 1 on fb (H) frames.
@@ -11209,6 +11285,25 @@ fn session(
                     );
                 }
             }
+            // V in the --gpu arm: same semantics as the CPU arm's handler —
+            // shading+visibility change ⇒ frame reset + upscaler history
+            // reset, works in every sub-mode.
+            if edges.toggle_height {
+                if !bvh::height_armed() {
+                    eprintln!("gpu: heightfield disarmed (--no-heightfield)");
+                } else if !scene.any_height {
+                    eprintln!("gpu: no height data in this scene");
+                } else {
+                    height_on = !height_on;
+                    bvh::set_height_on(height_on);
+                    frame = 0;
+                    gpu_reset = true;
+                    eprintln!(
+                        "gpu: heightfield relief: {}",
+                        if height_on { "ON" } else { "OFF (normal-mapped)" }
+                    );
+                }
+            }
             if edges.toggle_nppd {
                 if gpu_nppd_avail {
                     if gpu_up == GpuUp::Xess {
@@ -11588,6 +11683,30 @@ fn session(
                 "hemisphere frustum bounces: {}",
                 ["OFF", "AO (still frames)", "GI (still frames)"][bounce_mode as usize]
             );
+        }
+        // V: heightfield relief vs normal-mapped — a shading+VISIBILITY
+        // change, so it takes the quality-preset reset set (frame + every
+        // upscaler/denoiser history via the predicates below), but NEVER the
+        // temporal ring or replay_key: claims live on the swept AABBs in
+        // both modes, and replay re-shades through shade_tile, which
+        // re-marches. Works in every render mode/upscaler sub-mode (the
+        // clouds class, not H's still-frame refusal).
+        if edges.toggle_height {
+            if !bvh::height_armed() {
+                eprintln!("heightfield: disarmed (--no-heightfield)");
+            } else if !scene.any_height {
+                eprintln!("heightfield: no height data in this scene (no normal maps?)");
+            } else {
+                height_on = !height_on;
+                bvh::set_height_on(height_on);
+                frame = 0;
+                dlss_reset = true;
+                dxr_reset = true;
+                eprintln!(
+                    "heightfield relief: {}",
+                    if height_on { "ON" } else { "OFF (normal-mapped)" }
+                );
+            }
         }
         // --quinlight in DXR mode: the FUSE is the session's upscaler, so G/X/K
         // all toggle IT against plain DXR (the --gpu gpu_quin_avail semantics).
@@ -12042,6 +12161,7 @@ fn session(
         // exists to survive.
         if edges.toggle_hybrid
             || edges.toggle_bounce
+            || edges.toggle_height
             || edges.quality.is_some()
             || edges.cycle_spp
             || edges.toggle_xess
@@ -12058,6 +12178,7 @@ fn session(
         // never camera motion.
         if edges.toggle_hybrid
             || edges.toggle_bounce
+            || edges.toggle_height
             || edges.quality.is_some()
             || edges.cycle_spp
             || edges.toggle_fsr
@@ -12078,6 +12199,7 @@ fn session(
         let hist_stale = edges.toggle_hybrid
             || edges.toggle_dynamic
             || edges.toggle_bounce
+            || edges.toggle_height
             || edges.quality.is_some()
             || edges.cycle_spp
             || edges.toggle_oidn
@@ -13496,6 +13618,7 @@ fn session(
         overlay_on,
         gpu_tonemap,
         bounce_mode,
+        height_on,
         preset,
         spp,
         dlss_on,

@@ -75,6 +75,14 @@ void chs_shade(inout RayPayload p, in BuiltInTriangleIntersectionAttributes a) {
     h.tri = PrimitiveIndex();
     h.u = a.barycentrics.x;
     h.v = a.barycentrics.y;
+#ifdef HEIGHTFIELD
+    // Re-march the committed hit for the displaced (t', u', v') — an any-hit
+    // can only accept/ignore at the plane t, so the hardware sorts by plane t
+    // (the depth-band mis-ordering known-accept) and the closest-hit derives
+    // the true marched hit. Deterministic: same inputs as the any-hit's run.
+    if (flags & FLAG_HEIGHT)
+        height_march(h.tri, WorldRayOrigin(), WorldRayDirection(), h.t, h.u, h.v);
+#endif
     PrimSurf ps;
     p.color = shade_full(WorldRayOrigin(), WorldRayDirection(), h, p.rng, ps);
     p.t = h.t;
@@ -98,6 +106,10 @@ void chs_hit(inout HitPayload p, in BuiltInTriangleIntersectionAttributes a) {
     p.tri = PrimitiveIndex();
     p.u = a.barycentrics.x;
     p.v = a.barycentrics.y;
+#ifdef HEIGHTFIELD
+    if (flags & FLAG_HEIGHT)
+        height_march(p.tri, WorldRayOrigin(), WorldRayDirection(), p.t, p.u, p.v);
+#endif
 }
 
 [shader("miss")]
@@ -122,29 +134,50 @@ void miss_hit(inout HitPayload p) {
     p.t = -1.0;
 }
 
-#ifdef ALPHA_CUTOUT
-// Alpha-cutout any-hit shaders (alpha-masked scenes only; the BLAS drops
-// OPAQUE and the OPAQUE_RF ray flags drop FORCE_OPAQUE so these run). One
-// per payload type — a hit group's any-hit must share its ray's payload —
-// all three deferring to the SAME trace_common.hlsli::alpha_cutout the
-// RayQuery candidate loops use, so both intersectors agree bit-for-bit.
-// IgnoreHit() == moller_trumbore returning None: the candidate is removed,
-// traversal continues, TMax stays unshrunk.
+#if defined(ALPHA_CUTOUT) || defined(HEIGHTFIELD)
+// Cutout/relief any-hit shaders (alpha-masked or height-carrying scenes;
+// the BLAS drops OPAQUE and the OPAQUE_RF ray flags drop FORCE_OPAQUE so
+// these run). One per payload type — a hit group's any-hit must share its
+// ray's payload — all three deferring to the SAME trace_common.hlsli::
+// candidate_reject the RayQuery candidate loops use, so both intersectors
+// agree bit-for-bit. IgnoreHit() == moller_trumbore returning None: the
+// candidate is removed, traversal continues, TMax stays unshrunk — which is
+// exactly what makes relief silhouettes real on this pipeline too. The
+// marched t'/bary are discarded here (an any-hit cannot move the committed
+// t); chs_shade/chs_hit re-derive them. ah_shadow keeps its own body below:
+// it consumes the marched t for the logical-tmax re-check.
+bool ah_reject(uint tri, float u, float v) {
+    float t = RayTCurrent();
+    return candidate_reject(tri, WorldRayOrigin(), WorldRayDirection(), t, u, v) != 0u;
+}
+
 [shader("anyhit")]
 void ah_shade(inout RayPayload p, in BuiltInTriangleIntersectionAttributes a) {
-    if (alpha_cutout(PrimitiveIndex(), a.barycentrics.x, a.barycentrics.y))
+    if (ah_reject(PrimitiveIndex(), a.barycentrics.x, a.barycentrics.y))
         IgnoreHit();
 }
 
 [shader("anyhit")]
 void ah_hit(inout HitPayload p, in BuiltInTriangleIntersectionAttributes a) {
-    if (alpha_cutout(PrimitiveIndex(), a.barycentrics.x, a.barycentrics.y))
+    if (ah_reject(PrimitiveIndex(), a.barycentrics.x, a.barycentrics.y))
         IgnoreHit();
 }
 
+// The shadow flavor additionally re-checks the MARCHED t against the
+// segment's LOGICAL far bound (ShadowPayload::tmax): occluded_q widens the
+// hardware TMax by one relief depth so underside candidates whose plane t
+// lies just beyond the segment still surface (rt_dxr.hlsli), and this test —
+// the mirror of the RayQuery loops' explicit `ct < tmax` — is what keeps a
+// marched hit BEYOND the segment from occluding it. Unwidened rays never
+// trip it (their candidates already satisfy plane t <= tmax and, without a
+// live march, t' == plane t).
 [shader("anyhit")]
 void ah_shadow(inout ShadowPayload p, in BuiltInTriangleIntersectionAttributes a) {
-    if (alpha_cutout(PrimitiveIndex(), a.barycentrics.x, a.barycentrics.y))
+    float t = RayTCurrent();
+    float u = a.barycentrics.x;
+    float v = a.barycentrics.y;
+    if (candidate_reject(PrimitiveIndex(), WorldRayOrigin(), WorldRayDirection(), t, u, v) != 0u
+        || t >= p.tmax)
         IgnoreHit();
 }
-#endif // ALPHA_CUTOUT
+#endif // ALPHA_CUTOUT || HEIGHTFIELD

@@ -1178,7 +1178,20 @@ fn perturb_normal(
 pub fn tangent_self_test() -> Result<(), String> {
     use crate::scene::{Material, Scene};
     use crate::texture::Texture;
-    let tri_scene = |texcoords: [glam::Vec2; 3], texel: [u8; 4]| -> Scene {
+    // 1×1 single-texel map — the original cases; ramp cases below hand in a
+    // full converted texture instead.
+    let px = |texel: [u8; 4]| Texture {
+        w: 1,
+        h: 1,
+        texels: vec![texel],
+        alpha_masked: false,
+        srgb: false,
+        source: String::new(),
+        h2n: false,
+        n2h: false,
+        mips: Vec::new(),
+    };
+    let tri_scene = |texcoords: [glam::Vec2; 3], tex: Texture| -> Scene {
         let mut sc = Scene {
             positions: vec![Vec3A::ZERO, Vec3A::X, Vec3A::Y],
             normals: vec![Vec3A::Z; 3],
@@ -1196,21 +1209,15 @@ pub fn tangent_self_test() -> Result<(), String> {
                 emissive: Vec3A::ZERO,
                 normal_tex: 0,
                 normal_scale: 1.0,
+                height_amp: 0.0,
                 rough_tex: NO_TEX,
                 metal_tex: NO_TEX,
                 emissive_tex: NO_TEX,
                 kind: MatKind::Diffuse,
             }],
-            textures: vec![Texture {
-                w: 1,
-                h: 1,
-                texels: vec![texel],
-                alpha_masked: false,
-                srgb: false,
-                source: String::new(),
-                mips: Vec::new(),
-            }],
+            textures: vec![tex],
             any_alpha: false,
+            any_height: false,
             sun: crate::sky::Sun::new(Vec3A::Y),
             sky_sh: crate::sh::Sh9::ZERO,
             sky_scale: 1.0,
@@ -1242,42 +1249,66 @@ pub fn tangent_self_test() -> Result<(), String> {
 
     // Flat map (128,128,255): near-identity (128/255 isn't exactly 0.5 — the
     // no-map case is the bit-identical one; the flat MAP is merely close).
-    let sc = tri_scene(uv0, [128, 128, 255, 255]);
+    let sc = tri_scene(uv0, px([128, 128, 255, 255]));
     if perturb(&sc).dot(Vec3A::Z) < 0.999 {
         return Err("flat normal map should be a near-identity perturbation".into());
     }
     // Red = +x in tangent space: UVs align u with +X, so the normal tilts
     // toward +X and stays above the horizon.
-    let sc = tri_scene(uv0, [255, 128, 128, 255]);
+    let sc = tri_scene(uv0, px([255, 128, 128, 255]));
     let out = perturb(&sc);
     if out.x < 0.5 || out.z <= 0.0 {
         return Err(format!("+x tangent tilt wrong: {out:?}"));
     }
     // Green-channel sign pin (NORMAL_MAP_Y_SIGN): +green tilts toward -Y in
     // our V-flipped storage. A sign regression flips every embossing.
-    let sc = tri_scene(uv0, [128, 255, 128, 255]);
+    let sc = tri_scene(uv0, px([128, 255, 128, 255]));
     let out = perturb(&sc);
     if out.y * NORMAL_MAP_Y_SIGN < 0.5 * NORMAL_MAP_Y_SIGN.abs() && out.y > -0.5 {
         return Err(format!("green-channel sign pin failed: {out:?}"));
     }
     // Mirrored UVs (u negated): the tangent flips with the UV winding.
     let uvm = [glam::Vec2::new(0.0, 0.0), glam::Vec2::new(-1.0, 0.0), glam::Vec2::new(0.0, 1.0)];
-    let sc = tri_scene(uvm, [255, 128, 128, 255]);
+    let sc = tri_scene(uvm, px([255, 128, 128, 255]));
     let out = perturb(&sc);
     if out.x > -0.5 {
         return Err(format!("mirrored-UV handedness wrong: {out:?}"));
     }
     // Degenerate UVs: skip — the geometric normal comes back exactly.
     let uvz = [glam::Vec2::ZERO; 3];
-    let sc = tri_scene(uvz, [255, 128, 128, 255]);
+    let sc = tri_scene(uvz, px([255, 128, 128, 255]));
     if perturb(&sc) != Vec3A::Z {
         return Err("degenerate UVs must skip the perturbation".into());
+    }
+
+    // --- height_to_normal, end-to-end through the REAL decode --------------
+    // An 8×8 grayscale ramp ascending in +u, Sobel-converted, sampled via
+    // perturb_normal (NORMAL_MAP_Y_SIGN included): the normal must tilt
+    // AGAINST the ascent. The +v ramp is the pin on the conversion's green
+    // pre-negation — an implementation storing raw n.y comes back +y after
+    // the shader's negation and fails here.
+    let gray = |v: u8| [v, v, v, 255];
+    let ramp_u: Vec<[u8; 4]> = (0..64).map(|i| gray(((i % 8) * 32) as u8)).collect();
+    let mut hu = px([0; 4]);
+    (hu.w, hu.h, hu.texels) = (8, 8, ramp_u);
+    let sc = tri_scene(uv0, hu.height_to_normal());
+    let out = perturb(&sc);
+    if out.x > -0.15 || out.z < 0.8 {
+        return Err(format!("h2n +u ramp should tilt −x: {out:?}"));
+    }
+    let ramp_v: Vec<[u8; 4]> = (0..64).map(|i| gray(((i / 8) * 32) as u8)).collect();
+    let mut hv = px([0; 4]);
+    (hv.w, hv.h, hv.texels) = (8, 8, ramp_v);
+    let sc = tri_scene(uv0, hv.height_to_normal());
+    let out = perturb(&sc);
+    if out.y > -0.15 || out.z < 0.8 {
+        return Err(format!("h2n +v ramp should tilt −y (green pre-negation): {out:?}"));
     }
 
     // --- tri_grads: the anisotropic footprint ------------------------------
     // Canonical triangle (u along +X, v along +Y, unit scale — conformal),
     // so the analytic answers are exact.
-    let sc = tri_scene(uv0, [128, 128, 255, 255]);
+    let sc = tri_scene(uv0, px([128, 128, 255, 255]));
     let n = Vec3A::Z;
     let cw = 0.01f32;
 
@@ -1317,7 +1348,7 @@ pub fn tangent_self_test() -> Result<(), String> {
 
     // Degenerate UVs / zero cone: no footprint — the caller falls back to the
     // isotropic lod (coarser, never wrong).
-    if tri_grads(&tri_scene(uvz, [128, 128, 255, 255]), 0, n, -Vec3A::Z, cw).is_some() {
+    if tri_grads(&tri_scene(uvz, px([128, 128, 255, 255])), 0, n, -Vec3A::Z, cw).is_some() {
         return Err("degenerate UVs must yield no footprint".into());
     }
     if tri_grads(&sc, 0, n, -Vec3A::Z, 0.0).is_some() {

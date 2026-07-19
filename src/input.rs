@@ -24,6 +24,7 @@ pub struct Edges {
     pub toggle_dxr: bool,      // F (DXR DispatchRays pipeline)
     pub toggle_temporal: bool, // M (OIDN temporal reprojection)
     pub toggle_bounce: bool,   // H (hemisphere frustum bounces)
+    pub toggle_height: bool,   // V (heightfield relief vs normal-mapped)
     pub verify: bool,          // C
     pub screenshot: bool,      // P
     pub cycle_spp: bool,       // U (samples per pixel: 1 -> 2 -> 4 -> 8 -> 1)
@@ -74,6 +75,7 @@ impl Input {
                     Keycode::F => e.toggle_dxr = true,
                     Keycode::M => e.toggle_temporal = true,
                     Keycode::H => e.toggle_bounce = true,
+                    Keycode::V => e.toggle_height = true,
                     Keycode::C => e.verify = true,
                     Keycode::P => e.screenshot = true,
                     Keycode::U => e.cycle_spp = true,

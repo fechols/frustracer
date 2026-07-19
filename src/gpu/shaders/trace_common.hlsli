@@ -45,6 +45,11 @@
                                // laps pass false), not this flag alone.
 #define FLAG_CLOUDS       256u // volumetric cloud layer on (--no-clouds
                                // clears it); state rides SCENE_DIAG/CLOUD_TIME
+#define FLAG_HEIGHT       512u // heightfield relief march on (the V toggle ×
+                               // scene.any_height × --no-heightfield; the
+                               // HEIGHTFIELD compile-in is per-SCENE, this
+                               // bit is the per-frame runtime gate — the
+                               // LEAF_NO_FB pattern)
 
 cbuffer Frame : register(b0) {
     float4 cam_origin;   // xyz; w = inv_w
@@ -88,7 +93,12 @@ cbuffer Frame : register(b0) {
     // night: star visibility (Scene::night — exactly 0.0 in an untouched
     // session; sky_stars' guard is a BRANCH on it, so day kernels are
     // bit-identical by construction).
-    uint spp; uint probe_sample; float night; uint _pad5;
+    // height_max: the scene-wide maximum relief depth in world units (0.0 =
+    // no height data) — the wavefront TMin widening under FLAG_HEIGHT (a
+    // below/interior marched hit can land up to one depth EARLIER than its
+    // plane t, and the hardware would cull the candidate at an inherited
+    // TMin the CPU accepts).
+    uint spp; uint probe_sample; float night; float height_max;
     // Sub-pixel offsets for samples 1.. (dlss::jitter_for_sample, computed on
     // the CPU — one Halton source of truth), packed two per row. The row count
     // is INJECTED (trace::spp_defs, the ALPHA_CUTOUT/FTREE pattern) so it is
@@ -1033,11 +1043,22 @@ StructuredBuffer<uint>   uv_tri_mat : register(t2, space1); // material per tri
 // Per-material cutout map: tex + 1 when textured AND alpha_masked, else 0
 // (the bvh.rs::moller_trumbore gate chain folded to one fetch).
 StructuredBuffer<uint>   mat_cutout : register(t3, space1);
+// Second descriptor over the space0 positions resource (the uv_indices /
+// uv_tri_mat pattern) — the relief march needs the triangle's vertices for
+// its tangent-frame/depth math inside the trace primitives, where the
+// space0 root SRVs aren't necessarily bound.
+StructuredBuffer<float3> uv_positions : register(t4, space1);
+// Per-material relief map: normal tex + 1 when the material carries a
+// heightfield (Material::height_amp > 0), else 0, plus the amp itself in
+// texel widths (bvh.rs::tri_height_depth's inputs, folded to one fetch —
+// the mat_cutout pattern).
+struct MatH { uint tex1; float amp; };
+StructuredBuffer<MatH>   mat_height : register(t5, space1);
 // R8G8B8A8 (_SRGB for color maps, _UNORM for linear-data normal/rough-metal
 // maps — Texture::srgb), carrying the FULL CPU-generated mip chain (built in
 // texture.rs::build_mips, uploaded verbatim — CPU-trilinear parity: both
 // samplers read identical texels at identical ray-cone lods).
-Texture2D<float4>        texs[]     : register(t4, space1);
+Texture2D<float4>        texs[]     : register(t6, space1);
 // Static: trilinear, repeat wrap — texture.rs::sample_trilinear in hardware
 // (sRGB decode per texel via the SRGB SRV format, texel centers at i + 0.5;
 // every sample passes an explicit ray-cone lod to SampleLevel, and lod <= 0
@@ -1081,4 +1102,183 @@ bool alpha_cutout(uint tri, float u, float v) {
     uint x = min(uint(uv_wrap(uv.x) * float(w)), w - 1u);
     uint y = min(uint(uv_wrap(uv.y) * float(h)), h - 1u);
     return texs[ti].Load(int3(int(x), int(y), 0)).a * 255.0 < 127.5;
+}
+
+#ifdef HEIGHTFIELD
+
+// --- Relief march (bvh.rs's height_march / tri_height_depth ports) ----------
+// Compiled in per scene (any_height, the ALPHA_CUTOUT pattern); the runtime
+// gate is FLAG_HEIGHT. Everything here mirrors bvh.rs term-for-term — the
+// CPU is the source of truth; read height_march's header there for the
+// entry rules and the soundness argument.
+
+#define HEIGHT_COARSE 16u
+#define HEIGHT_REFINE 5u
+// Edge-crack fix: how far the march continues past the footprint's exit
+// edge, in height_amp-texels of uv travel (see bvh.rs HEIGHT_EDGE_EXTEND —
+// the swept AABBs pad laterally by the same budget).
+#define HEIGHT_EDGE_EXTEND 4.0
+
+// texture.rs::height_bilinear — ALU nested-lerp over four level-0 loads of
+// the alpha channel, repeat wrap. Bytes recovered via *255 (the alpha_cutout
+// UNORM precedent) so the op ORDER matches the CPU's byte-lerp-then-/255;
+// the nested `a + t*(b-a)` form is exact on constant plateaus, which is what
+// makes a 255-alpha region an exact 1.0 field (the flat-field identity).
+float height_bilinear(uint ti, float2 uv) {
+    uint w, h;
+    texs[ti].GetDimensions(w, h);
+    float x = uv_wrap(uv.x) * float(w) - 0.5;
+    float y = uv_wrap(uv.y) * float(h) - 0.5;
+    float x0f = floor(x), y0f = floor(y);
+    float fx = x - x0f, fy = y - y0f;
+    int iw = int(w), ih = int(h);
+    int x0 = ((int(x0f) % iw) + iw) % iw;
+    int x1 = ((int(x0f) + 1) % iw + iw) % iw;
+    int y0 = ((int(y0f) % ih) + ih) % ih;
+    int y1 = ((int(y0f) + 1) % ih + ih) % ih;
+    float a00 = texs[ti].Load(int3(x0, y0, 0)).a * 255.0;
+    float a10 = texs[ti].Load(int3(x1, y0, 0)).a * 255.0;
+    float a01 = texs[ti].Load(int3(x0, y1, 0)).a * 255.0;
+    float a11 = texs[ti].Load(int3(x1, y1, 0)).a * 255.0;
+    float bot = a00 + fx * (a10 - a00);
+    float top = a01 + fx * (a11 - a01);
+    return (bot + fy * (top - bot)) / 255.0;
+}
+
+// bvh.rs::height_march. Returns 0 = no relief on this candidate (plane hit
+// stands verbatim), 1 = marched hit (t/u/v updated), 2 = REJECT (the ray
+// exits the prism untouched — the silhouette/cutout continue).
+uint height_march(uint tri, float3 o, float3 dir, inout float t_io, inout float u_io, inout float v_io) {
+    MatH mh = mat_height[uv_tri_mat[tri]];
+    if (mh.tex1 == 0u) return 0u;
+    uint ti = NonUniformResourceIndex(mh.tex1 - 1u);
+    uint i0 = uv_indices[tri * 3u];
+    uint i1 = uv_indices[tri * 3u + 1u];
+    uint i2 = uv_indices[tri * 3u + 2u];
+    float3 p0 = uv_positions[i0];
+    float3 e1 = uv_positions[i1] - p0;
+    float3 e2 = uv_positions[i2] - p0;
+    // tri_height_depth: amp (texel widths) × sqrt(world_area/(uv_area·w·h)).
+    float2 d1 = uv_buf[i1] - uv_buf[i0];
+    float2 d2 = uv_buf[i2] - uv_buf[i0];
+    float3 nn = cross(e1, e2);
+    precise float wa = 0.5 * length(nn);
+    precise float ua = 0.5 * abs(d1.x * d2.y - d1.y * d2.x);
+    uint tw, th;
+    texs[ti].GetDimensions(tw, th);
+    float denom = ua * float(tw * th);
+    if (!(denom > 1e-20) || !(wa > 0.0)) return 0u;
+    float ts = sqrt(wa / denom);
+    if (!isfinite(ts)) return 0u;
+    float depth = mh.amp * ts;
+    if (!(depth > 0.0)) return 0u;
+
+    float t_p = t_io, u = u_io, v = v_io;
+    float n2 = dot(nn, nn);
+    float dh = dot(dir, nn) / (sqrt(n2) * depth);
+    if (!isfinite(dh) || dh == 0.0) return 0u;
+    // Barycentric rates along the ray (Cramer; the normal component of dir
+    // cancels identically — (N×e2)·N ≡ 0).
+    float bu = dot(cross(dir, e2), nn) / n2;
+    float bv = dot(cross(e1, dir), nn) / n2;
+    float t_h0 = t_p - 1.0 / dh;
+    float t_a, t_b, sgn;
+    bool two_phase;
+    if (dh < 0.0)       { t_a = t_p;  t_b = t_h0; sgn = 1.0;  two_phase = false; }
+    else if (t_h0 > 0.0){ t_a = t_h0; t_b = t_p;  sgn = -1.0; two_phase = false; }
+    else                { t_a = 0.0;  t_b = t_p;  sgn = 1.0;  two_phase = true; }
+    // Footprint interval on t (each bary constraint is linear in t and holds
+    // AT t_p): ct > 0 clips the start, ct < 0 clips the end.
+    float lo = t_a, hi_slab = t_b, hi_foot = t_b;
+    {
+        float c0[3] = { u, v, 1.0 - u - v };
+        float ct[3] = { bu, bv, -bu - bv };
+        [unroll]
+        for (uint c = 0u; c < 3u; c++) {
+            if (ct[c] != 0.0) {
+                float tc = t_p - c0[c] / ct[c];
+                if (ct[c] > 0.0) lo = max(lo, tc);
+                else             hi_foot = min(hi_foot, tc);
+            }
+        }
+    }
+    // Edge extension past the exit edge (the crack fix — bvh.rs's
+    // HEIGHT_EDGE_EXTEND header): bounded in uv travel and by the slab.
+    float hi = min(hi_foot, hi_slab);
+    if (hi_foot < hi_slab) {
+        float2 duv = d1 * bu + d2 * bv;
+        float texel_rate = length(float2(duv.x * float(tw), duv.y * float(th)));
+        if (texel_rate > 0.0) {
+            // Clamped to the sweep's pad (EXTEND · depth) — the anisotropic-
+            // chart containment argument; see bvh.rs's twin.
+            float budget = min(HEIGHT_EDGE_EXTEND * mh.amp / texel_rate,
+                               HEIGHT_EDGE_EXTEND * depth);
+            hi = min(hi_foot + budget, hi_slab);
+        }
+    }
+    if (!(hi > lo)) return 2u;
+    if (sgn > 0.0 && !two_phase && height_bilinear(ti, tri_uv(tri, u, v)) >= 1.0)
+        return 0u; // flat plateau at the plane: the exact plane hit stands
+    float stp = (hi - lo) / float(HEIGHT_COARSE);
+    bool armed = !two_phase;
+    bool has_prev = false;
+    float pt = 0.0, pf = 0.0;
+    for (uint k = 0u; k <= HEIGHT_COARSE; k++) {
+        float t_k = (k == HEIGHT_COARSE) ? hi : lo + stp * float(k);
+        float b1 = u + (t_k - t_p) * bu;
+        float b2 = v + (t_k - t_p) * bv;
+        float f = sgn * (1.0 + (t_k - t_p) * dh - height_bilinear(ti, tri_uv(tri, b1, b2)));
+        if (f <= 0.0) {
+            if (armed) {
+                float t_hit = t_k;
+                if (has_prev) {
+                    float ta = pt, fa = pf, tb = t_k, fb = f;
+                    for (uint r = 0u; r < HEIGHT_REFINE; r++) {
+                        float tm = 0.5 * (ta + tb);
+                        float bm1 = u + (tm - t_p) * bu;
+                        float bm2 = v + (tm - t_p) * bv;
+                        float fm = sgn * (1.0 + (tm - t_p) * dh
+                                          - height_bilinear(ti, tri_uv(tri, bm1, bm2)));
+                        if (fm <= 0.0) { tb = tm; fb = fm; } else { ta = tm; fa = fm; }
+                    }
+                    t_hit = (fa > fb) ? clamp(ta + fa * (tb - ta) / (fa - fb), ta, tb) : tb;
+                }
+                // Extension hits shade with the EDGE's attributes: clamp the
+                // reported bary to the footprint (identity for interior hits).
+                float b1h = max(u + (t_hit - t_p) * bu, 0.0);
+                float b2h = max(v + (t_hit - t_p) * bv, 0.0);
+                float s = b1h + b2h;
+                if (s > 1.0) { b1h /= s; b2h /= s; }
+                t_io = t_hit;
+                u_io = b1h;
+                v_io = b2h;
+                return 1u;
+            }
+        } else {
+            armed = true;
+            has_prev = true;
+            pt = t_k;
+            pf = f;
+        }
+    }
+    return 2u;
+}
+
+#endif // HEIGHTFIELD
+
+// Shared candidate tail for the RayQuery loops and the DXR any-hits — the
+// mirror of moller_trumbore's tail: relief march first (may move t/u/v or
+// reject), then the alpha cutout at the DISPLACED uv. Returns 0 = accept,
+// 1 = alpha-cutout reject, 2 = relief reject (the split keeps the two
+// anti-vacuity counters distinct).
+uint candidate_reject(uint tri, float3 o, float3 d, inout float t, inout float u, inout float v) {
+#ifdef HEIGHTFIELD
+    if (flags & FLAG_HEIGHT) {
+        if (height_march(tri, o, d, t, u, v) == 2u) return 2u;
+    }
+#endif
+#ifdef ALPHA_CUTOUT
+    if (alpha_cutout(tri, u, v)) return 1u;
+#endif
+    return 0u;
 }

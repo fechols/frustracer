@@ -11,12 +11,13 @@
 //                   ALPHA_CUTOUT scenes)
 //   miss:       0 = miss_radiance, 1 = miss_shadow, 2 = miss_hit
 //
-// ALPHA_CUTOUT (per-scene, trace.rs::alpha_defs): the BLAS drops OPAQUE and
-// every TraceRay drops FORCE_OPAQUE so the ah_* any-hit shaders (dxr.hlsl)
-// run the shared alpha_cutout test; opaque scenes compile the FORCE_OPAQUE
-// flags verbatim and keep the null occlusion record.
+// ALPHA_CUTOUT / HEIGHTFIELD (per-scene, trace.rs::alpha_defs /
+// height_defs): the BLAS drops OPAQUE and every TraceRay drops FORCE_OPAQUE
+// so the ah_* any-hit shaders (dxr.hlsl) run the shared candidate_reject
+// test (relief march + cutout at the displaced uv); opaque scenes compile
+// the FORCE_OPAQUE flags verbatim and keep the null occlusion record.
 
-#ifdef ALPHA_CUTOUT
+#if defined(ALPHA_CUTOUT) || defined(HEIGHTFIELD)
 #define OPAQUE_RF RAY_FLAG_NONE
 #else
 #define OPAQUE_RF RAY_FLAG_FORCE_OPAQUE
@@ -51,6 +52,13 @@ struct RayPayload {
 
 struct ShadowPayload {
     uint hit;
+    // The segment's LOGICAL far bound. Relief widens the hardware TMax below
+    // (a marched underside hit inside tmax can belong to a candidate whose
+    // PLANE t lies beyond it — the hardware culls at the plane t), so
+    // ah_shadow re-checks the MARCHED t against this — the mirror of the
+    // RayQuery loops' explicit `ct < tmax`. Opaque scenes never run an
+    // any-hit and ignore the field.
+    float tmax;
 };
 
 // trace_closest's wire format; t < 0 = miss.
@@ -65,6 +73,13 @@ struct HitPayload {
 // shade_split. Hit group 1 records bare hit info: the lap loop shades the
 // reflected surface itself (the CPU's depth-1 recursion), so routing it to
 // chs_shade would double-shade.
+//
+// Relief TMax contract: every trace_closest call in this pipeline passes
+// tmax = FLT_MAX (shade.hlsli), so the relief TMax widening lives on the
+// occlusion path only. A future FINITE-tmax closest-hit ray would need the
+// ShadowPayload treatment (widen + payload-carried logical bound), because
+// the hardware culls candidates at the PLANE t while the marched t can land
+// one relief depth earlier.
 bool trace_closest(float3 o, float3 d, float tmin, float tmax, out HitInfo h) {
     RayDesc r;
     r.Origin = o; r.Direction = d; r.TMin = tmin; r.TMax = tmax;
@@ -76,14 +91,24 @@ bool trace_closest(float3 o, float3 d, float tmin, float tmax, out HitInfo h) {
 }
 
 // rt.hlsli::occluded_q. The closest-hit stage is skipped — only miss_shadow
-// (and, in ALPHA_CUTOUT scenes, HgOcclude's any-hit rejecting masked
-// candidates) can run, so an untouched payload IS the hit answer.
+// (and, in ALPHA_CUTOUT/HEIGHTFIELD scenes, HgOcclude's any-hit rejecting
+// masked/escaped candidates) can run, so an untouched payload IS the hit
+// answer. Relief widens the hardware TMax by one relief depth (rt.hlsli's
+// height_tmax rationale — the AO segment is this pipeline's finite-tmax
+// case); ah_shadow re-checks the marched t against the LOGICAL bound riding
+// the payload. TMin stays unwidened: every occluded_q call here passes
+// tmin = 0 (shade.hlsli), so there is nothing to widen.
 bool occluded_q(float3 o, float3 d, float tmin, float tmax) {
     if (tmax <= tmin) return false;
     RayDesc r;
-    r.Origin = o; r.Direction = d; r.TMin = tmin; r.TMax = tmax;
+    r.Origin = o; r.Direction = d; r.TMin = tmin;
+    r.TMax = tmax;
+#ifdef HEIGHTFIELD
+    if (flags & FLAG_HEIGHT) r.TMax = tmax + height_max;
+#endif
     ShadowPayload p;
     p.hit = 1u;
+    p.tmax = tmax;
     TraceRay(tlas,
              OPAQUE_RF | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
                  RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,

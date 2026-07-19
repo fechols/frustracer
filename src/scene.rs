@@ -56,6 +56,13 @@ pub struct Material {
     pub normal_tex: u32,
     /// map_Bump `-bm s` / glTF normalTexture.scale. Default 1.0.
     pub normal_scale: f32,
+    /// Peak-to-peak height amplitude of `normal_tex`'s alpha-channel
+    /// heightfield, in TEXEL widths (0.0 = no height data — the structural
+    /// off state, like NO_TEX). Sobel-converted height maps carry exactly
+    /// `texture::HEIGHT_NORMAL_STRENGTH` (the same K both modes describe);
+    /// Poisson-derived heights carry the integration's own amplitude. The
+    /// relief march converts to world units per hit via the UV basis.
+    pub height_amp: f32,
     /// Roughness map (NO_TEX = none; samples .g — the glTF channel
     /// convention, which grayscale MTL maps satisfy via to_rgba8 gray
     /// replication). Effective roughness = `roughness` × sample: factor ×
@@ -103,6 +110,11 @@ pub struct Scene {
     /// alpha-cutout path (false on the procedural/stress scenes, keeping the
     /// hot loop untouched there).
     pub any_alpha: bool,
+    /// Any material carries a heightfield (`height_amp` > 0 with a normal
+    /// map) — the intersector's one-bool gate for the relief march, the
+    /// `any_alpha` pattern (false on procedural/stress scenes). Derived by
+    /// `finalize_scalars`.
+    pub any_height: bool,
     /// The sun: a disc at infinity, the sharp half of the one sky.
     pub sun: crate::sky::Sun,
     /// The sky's smooth dome, projected into order-2 SH once at load — the
@@ -194,6 +206,7 @@ impl SceneBuilder {
             emissive: Vec3A::ZERO,
             normal_tex: NO_TEX,
             normal_scale: 1.0,
+            height_amp: 0.0,
             rough_tex: NO_TEX,
             metal_tex: NO_TEX,
             emissive_tex: NO_TEX,
@@ -334,6 +347,7 @@ impl SceneBuilder {
             materials: self.materials,
             textures: self.textures,
             any_alpha: false,
+            any_height: false,
             sun,
             sky_sh: crate::sh::Sh9::ZERO,
             sky_scale: 1.0,
@@ -344,6 +358,91 @@ impl SceneBuilder {
         };
         finalize_scalars(&mut scene);
         scene
+    }
+}
+
+/// Post-load heightfield derivation, shared by the OBJ and glTF loaders
+/// (COLD loads only — run before `scene_cache::store`, so the per-texture
+/// `n2h` flags and the materials' `height_amp` persist; warm loads re-apply
+/// the texture conversions from the cached flags and take `height_amp` from
+/// `DiskMat`). Every normal map that doesn't already carry a heightfield
+/// (Sobel-converted maps carry the exact source height) gets one derived by
+/// the Frankot–Chellappa solve (`Texture::apply_n2h`) into its alpha
+/// channel; `height_amp` = the texture's own amplitude × the material's
+/// `-bm`/`normalTexture.scale` factor, the same composition the decoded
+/// slopes carry.
+pub fn derive_heights(scene: &mut Scene) {
+    use std::collections::HashSet;
+    let n2h_on = crate::texture::n2h_enabled();
+    let mut ids: Vec<u32> = scene
+        .materials
+        .iter()
+        .filter_map(|m| (m.normal_tex != NO_TEX).then_some(m.normal_tex))
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.is_empty() {
+        return; // procedural/stress scenes: structurally untouched
+    }
+    let solve: HashSet<u32> = ids
+        .iter()
+        .copied()
+        .filter(|&id| {
+            let t = &scene.textures[id as usize];
+            n2h_on && !t.h2n && !t.n2h
+        })
+        .collect();
+    let t0 = std::time::Instant::now();
+    let amps: std::collections::HashMap<u32, f32> = {
+        use rayon::prelude::*;
+        // Bounded pool: one 4K solve holds ~0.5 GB of complex scratch, so
+        // the full rayon width would spike memory on 4K-heavy scenes.
+        let workers = rayon::current_num_threads().min(8);
+        let mut run = || {
+            scene
+                .textures
+                .par_iter_mut()
+                .enumerate()
+                .filter(|(i, _)| solve.contains(&(*i as u32)))
+                .map(|(i, t)| (i as u32, t.apply_n2h()))
+                .collect()
+        };
+        match rayon::ThreadPoolBuilder::new().num_threads(workers).build() {
+            Ok(pool) => pool.install(run),
+            Err(_) => run(),
+        }
+    };
+    let (mut n_mats, mut amp_max) = (0u32, 0.0f32);
+    for m in &mut scene.materials {
+        if m.normal_tex == NO_TEX {
+            continue;
+        }
+        let base = if scene.textures[m.normal_tex as usize].h2n {
+            crate::texture::HEIGHT_NORMAL_STRENGTH
+        } else {
+            amps.get(&m.normal_tex)
+                .copied()
+                .unwrap_or(m.height_amp)
+                .min(crate::texture::N2H_AMP_CAP)
+        };
+        m.height_amp = base * m.normal_scale;
+        if m.height_amp > 0.0 {
+            n_mats += 1;
+            amp_max = amp_max.max(m.height_amp);
+        }
+    }
+    // `finalize_scalars` already ran inside the loader's finish(), BEFORE the
+    // amps existed — refresh the intersector's one-bool gate here (the BVH
+    // build that follows reads it for the AABB sweep).
+    scene.any_height = n_mats > 0;
+    if n_mats > 0 || !solve.is_empty() {
+        eprintln!(
+            "heightfield: {} materials, amp max {:.2} texels ({} maps solved in {:.0} ms)",
+            n_mats,
+            amp_max,
+            solve.len(),
+            t0.elapsed().as_secs_f64() * 1000.0
+        );
     }
 }
 
@@ -363,6 +462,8 @@ pub fn finalize_scalars(scene: &mut Scene) {
     scene.eps = 1e-4 * diag;
     scene.ao_radius = 0.03 * diag;
     scene.any_alpha = scene.textures.iter().any(|t| t.alpha_masked);
+    scene.any_height =
+        scene.materials.iter().any(|m| m.height_amp > 0.0 && m.normal_tex != NO_TEX);
 
     refresh_sky_sh(scene);
 }
@@ -749,6 +850,7 @@ pub fn tile_scene(base: Scene, nx: u32, nz: u32) -> (Scene, f32) {
         materials: base.materials,
         textures: base.textures,
         any_alpha: false,
+        any_height: false,
         // The sun is at infinity: a replicated field sees the SAME sun, at the
         // same angle, with the same irradiance, everywhere. Nothing to rescale.
         sun: base.sun,
@@ -1086,21 +1188,34 @@ pub fn load_obj_scene(path: &str) -> Scene {
     };
     // Assign ids in request (MTL) order, not HashMap order. Grayscale
     // "normal maps" are height maps (San Miguel's map_Bump files are a mix)
-    // — treating one as a normal map shades garbage, so they're recorded in
-    // `height_maps` (normal lookups skip them) and dropped outright when no
-    // other role wants the file.
+    // — treating one as a normal map shades garbage, so each is CONVERTED
+    // (`Texture::height_to_normal`: Sobel normal in RGB, the exact source
+    // height in A) into its own texture id, recorded in `h2n_ids` so the
+    // material lookup below points at the converted texels. The raw
+    // grayscale copy is still kept when another linear role (rough/metal —
+    // same (path, false) dedup key) wants the file: those must sample raw
+    // texels, never a normal map.
     let mut tex_ids: HashMap<(std::path::PathBuf, bool), u32> = HashMap::new();
-    let mut height_maps: std::collections::HashSet<std::path::PathBuf> =
-        std::collections::HashSet::new();
+    let mut h2n_ids: HashMap<std::path::PathBuf, u32> = HashMap::new();
     let mut n_height = 0u32;
     for r in &reqs {
         let k = (r.path.clone(), r.srgb);
         if let Some(mut t) = decoded.remove(&k) {
             if r.normal && t.is_grayscale() {
-                height_maps.insert(r.path.clone());
                 n_height += 1;
+                // NO_TEX under --no-h2n: the entry still marks the file as a
+                // height map so the material lookup can't wire the raw
+                // grayscale as a normal map (the pre-conversion skip).
+                let id = if crate::texture::h2n_enabled() {
+                    let mut nt = t.height_to_normal();
+                    nt.source = r.path.to_string_lossy().into_owned();
+                    b.add_texture(nt)
+                } else {
+                    NO_TEX
+                };
+                h2n_ids.insert(r.path.clone(), id);
                 if !r.kd && !r.other {
-                    continue; // height-map only — don't keep unused texels
+                    continue; // height-map only — the raw texels aren't needed
                 }
             }
             if !r.kd {
@@ -1150,24 +1265,31 @@ pub fn load_obj_scene(path: &str) -> Scene {
                 None => MatKind::Diffuse,
             };
             // Normal map: map_Bump/bump (first-class in tobj, value may
-            // carry `-bm s`) or `norm` (unknown_param); grayscale files are
-            // height maps and stay NO_TEX (see height_maps above).
+            // carry `-bm s`) or `norm` (unknown_param); grayscale files
+            // resolve to their Sobel-converted normal map (see h2n_ids
+            // above), keeping the parsed `-bm` and carrying the exact
+            // source height (amp = the conversion's own K, texel units).
             let norm_val = m
                 .normal_texture
                 .as_deref()
                 .or_else(|| m.unknown_param.get("norm").map(|s| s.as_str()));
-            let (normal_tex, normal_scale) = norm_val
+            let (normal_tex, normal_scale, height_amp) = norm_val
                 .map(parse_map_value)
                 .filter(|(p, _)| !p.is_empty())
                 .map(|(p, s)| {
                     let rp = resolve(&p);
-                    if height_maps.contains(&rp) {
-                        (NO_TEX, 1.0)
-                    } else {
-                        (tex_ids.get(&(rp, false)).copied().unwrap_or(NO_TEX), s)
+                    match h2n_ids.get(&rp) {
+                        Some(&id) if id != NO_TEX => {
+                            (id, s, crate::texture::HEIGHT_NORMAL_STRENGTH)
+                        }
+                        // Height map under --no-h2n: the pre-conversion skip.
+                        Some(_) => (NO_TEX, 1.0, 0.0),
+                        None => {
+                            (tex_ids.get(&(rp, false)).copied().unwrap_or(NO_TEX), s, 0.0)
+                        }
                     }
                 })
-                .unwrap_or((NO_TEX, 1.0));
+                .unwrap_or((NO_TEX, 1.0, 0.0));
             // Roughness/metallic maps (PBR MTL extension, unknown_param) +
             // their scalars: factor × sample is the glTF semantic — with a
             // map the factor is the MTL's own Pr/Pm (default 1.0), bypassing
@@ -1216,6 +1338,7 @@ pub fn load_obj_scene(path: &str) -> Scene {
                 emissive,
                 normal_tex,
                 normal_scale,
+                height_amp,
                 rough_tex,
                 metal_tex,
                 emissive_tex,
@@ -1233,7 +1356,7 @@ pub fn load_obj_scene(path: &str) -> Scene {
             .collect::<Vec<_>>()
             .join(" | ");
         eprintln!(
-            "obj materials: {} -> {} || maps: normal {} | rough {} | metal {} | emissive {} | height-maps skipped {}",
+            "obj materials: {} -> {} || maps: normal {} | rough {} | metal {} | emissive {} | height-maps converted {}",
             obj_mats.len(),
             body,
             n_normal,

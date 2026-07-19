@@ -113,9 +113,16 @@ pub fn encoded_len(w: u32, h: u32) -> usize {
 ///   arbitrary-dim research scans (63% of its opaque MB, on a scene with no
 ///   memory pressure), while the scenes BC7 exists for (Bistro, Intel
 ///   Sponza) are 100% 4-aligned game textures.
+/// (A third condition joined the two: height-carrying textures — `h2n`/`n2h`,
+/// whose ALPHA is the relief march's field — must stay RGBA8. The `opaque_*`
+/// ISPC presets skip BC7's alpha-carrying modes outright, which would flatten
+/// the field to garbage; and like the cutout carve-out, the predicate here
+/// must agree with the `mat_height` fill in trace.rs so the id set the relief
+/// samplers can reach is exactly the RGBA8 set — the agreement IS the
+/// soundness argument.)
 #[inline]
 pub fn should_compress(t: &Texture) -> bool {
-    !t.alpha_masked && t.w % BLOCK == 0 && t.h % BLOCK == 0
+    !t.alpha_masked && !t.h2n && !t.n2h && t.w % BLOCK == 0 && t.h % BLOCK == 0
 }
 
 /// Encode one opaque texture to tightly-packed BC7 blocks (row-major block
@@ -194,6 +201,8 @@ pub fn self_test() -> Result<(), String> {
         alpha_masked: masked,
         srgb,
         source: String::new(),
+        h2n: false,
+        n2h: false,
         mips: Vec::new(),
     };
 
@@ -211,6 +220,15 @@ pub fn self_test() -> Result<(), String> {
             "bc7: should_compress must accept 4-aligned opaque and reject alpha-masked/odd-dim"
                 .into(),
         );
+    }
+    // Height-carrying textures (relief field in alpha) must stay RGBA8 —
+    // the opaque presets would flatten the field.
+    let mut hcarry = tex(8, 8, &|x, y| [x as u8 * 8, y as u8 * 8, 128, 200], false, false);
+    hcarry.h2n = true;
+    let mut ncarry = tex(8, 8, &|x, y| [x as u8 * 8, y as u8 * 8, 128, 200], false, false);
+    ncarry.n2h = true;
+    if should_compress(&hcarry) || should_compress(&ncarry) {
+        return Err("bc7: should_compress must reject height-carrying (h2n/n2h) textures".into());
     }
 
     // Encode: exact output length, and determinism — the encode is re-run on

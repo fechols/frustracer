@@ -345,6 +345,7 @@ fn build_scene(
                 emissive,
                 normal_tex,
                 normal_scale,
+                height_amp: 0.0,
                 rough_tex: mr_tex, // glTF packs roughness = G ...
                 metal_tex: mr_tex, // ... and metallic = B of the SAME map
                 emissive_tex,

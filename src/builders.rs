@@ -42,7 +42,8 @@ pub fn build_alt(scene: &Scene, which: Builder) -> Bvh {
     let (tri_aabb, centroids): (Vec<Aabb>, Vec<Vec3A>) = scene
         .indices
         .par_iter()
-        .map(|tri| {
+        .enumerate()
+        .map(|(i, tri)| {
             let (a, b, c) = (
                 scene.positions[tri[0] as usize],
                 scene.positions[tri[1] as usize],
@@ -52,6 +53,7 @@ pub fn build_alt(scene: &Scene, which: Builder) -> Bvh {
             bb.grow(a);
             bb.grow(b);
             bb.grow(c);
+            crate::bvh::grow_height_sweep(scene, i as u32, a, b, c, &mut bb);
             (bb, (a + b + c) / 3.0)
         })
         .unzip();

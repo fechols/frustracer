@@ -96,8 +96,10 @@ pub const NPPD_REG_BASE: u32 = NUM_UAVS + 2 + NUM_FEED; // u26
 pub const RP_SCENE_TEX: u32 = RP_NPPD_OUT + 1;
 /// First heap slot of the scene-texture table (after every feed set).
 pub const TEX_HEAP_BASE: u32 = FEED_SETS * FEED_SET_STRIDE;
-/// Buffer-SRV descriptors preceding the Texture2D array in the table.
-pub const TEX_TABLE_BUFS: u32 = 4;
+/// Buffer-SRV descriptors preceding the Texture2D array in the table
+/// (t0..t5 space1: texcoords, indices alias, tri_mat alias, mat_cutout,
+/// positions alias, mat_height — texs[] starts at t6).
+pub const TEX_TABLE_BUFS: u32 = 6;
 
 // SRV register assignments (t0..t7) — shared across every kernel; a kernel
 // declares only what it reads, DXC strips the rest.
@@ -149,6 +151,7 @@ pub const CTR_HEMI_RAYS: u32 = 15;
 pub const CTR_V_FALSE_EMPTY: u32 = 16;
 pub const CTR_V_TMIN: u32 = 17;
 pub const CTR_ALPHA_REJ: u32 = 18;
+pub const CTR_HEIGHT_REJ: u32 = 19;
 pub const CTR_COUNT: u32 = 24;
 
 // Indirect-args buffer slots: level d at slot d (depth_full <= 11 asserted
@@ -917,6 +920,10 @@ pub struct SceneGpu {
     /// its texture has masked texels, else 0 (mirrors the bvh.rs cutout
     /// gates: MatKind::Textured -> Texture::alpha_masked).
     pub mat_cutout: ID3D12Resource,
+    /// Per-material relief map: `normal_tex + 1` + `height_amp` bits where
+    /// the material carries a heightfield, else zeros (mirrors the bvh.rs
+    /// tri_height_depth gates).
+    pub mat_height: ID3D12Resource,
     /// One RGBA8 Texture2D per `Scene::textures` entry, 1 mip (the CPU
     /// samples bilinear with no mip chain — parity over aliasing); _SRGB for
     /// color textures, _UNORM for linear-data maps (Texture::srgb).
@@ -1082,6 +1089,24 @@ impl SceneGpu {
             })
             .collect();
         let mat_cutout_b = stream_buffer(device, sub, &ring, &mat_cutout, |m| *m, srv)?;
+        // Per-material relief map the height_march helper consumes: normal
+        // tex + 1 where the material carries a heightfield, else 0, plus the
+        // amp (texel widths). The nonzero set is exactly the h2n/n2h texture
+        // set — the same predicate `bc7::should_compress` excludes, so every
+        // texture the march can `.Load` is RGBA8 (the mat_cutout agreement
+        // argument verbatim).
+        let mat_height: Vec<[u32; 2]> = scene
+            .materials
+            .iter()
+            .map(|m| {
+                if m.height_amp > 0.0 && m.normal_tex != crate::scene::NO_TEX {
+                    [m.normal_tex + 1, m.height_amp.to_bits()]
+                } else {
+                    [0, 0]
+                }
+            })
+            .collect();
+        let mat_height_b = stream_buffer(device, sub, &ring, &mat_height, |m| *m, srv)?;
         // --bc7: block-compress the OPAQUE 4-aligned textures before
         // uploading them (8 bpp vs 32 — Intel Sponza's set is 4.6 GB of VRAM
         // as RGBA8). Alpha-masked cutout textures are EXCLUDED and stay
@@ -1294,7 +1319,11 @@ impl SceneGpu {
         // --- acceleration-structure sizing ---
         let n_verts = scene.positions.len() as u32;
         let n_tris = scene.indices.len() as u32;
-        let geom = geometry_desc(&positions_b, &indices_b, n_verts, n_tris, scene.any_alpha);
+        // OPAQUE drops when EITHER conditional-hit feature is armed — the
+        // any-hit/candidate machinery is shared (candidate_reject).
+        let non_opaque =
+            scene.any_alpha || (scene.any_height && crate::bvh::height_armed());
+        let geom = geometry_desc(&positions_b, &indices_b, n_verts, n_tris, non_opaque);
         // ALLOW_COMPACTION: the build lands in a worst-case-sized buffer,
         // then a compact copy (~40-50% smaller in practice) replaces it and
         // the original drops before this function returns — the compacted
@@ -1493,6 +1522,7 @@ impl SceneGpu {
             tlas,
             texcoords: texcoords_b,
             mat_cutout: mat_cutout_b,
+            mat_height: mat_height_b,
             textures: textures_v,
             n_verts,
             n_tris,
@@ -1501,8 +1531,9 @@ impl SceneGpu {
     }
 
     /// Write the RP_SCENE_TEX table's descriptors into `heap` at slots
-    /// `base..`: 4 buffer SRVs (texcoords, indices, tri_mat, mat_cutout —
-    /// t0..t3 space1) then one Texture2D SRV per scene texture (t4.. space1).
+    /// `base..`: 6 buffer SRVs (texcoords, indices, tri_mat, mat_cutout,
+    /// positions, mat_height — t0..t5 space1) then one Texture2D SRV per
+    /// scene texture (t6.. space1).
     /// The heap must be sized `base + TEX_TABLE_BUFS + textures.len()`.
     pub fn write_scene_descriptors(
         &self,
@@ -1537,6 +1568,10 @@ impl SceneGpu {
         buf_srv(&self.indices, 4, self.n_tris * 3, 1);
         buf_srv(&self.tri_mat, 4, self.n_tris, 2);
         buf_srv(&self.mat_cutout, 4, self.n_mats, 3);
+        // Second descriptor over positions (the indices/tri_mat pattern) +
+        // the per-material relief map — the march's intersector-scope inputs.
+        buf_srv(&self.positions, 12, self.n_verts, 4);
+        buf_srv(&self.mat_height, 8, self.n_mats, 5);
         for (i, tex) in self.textures.iter().enumerate() {
             let tex_desc = unsafe { tex.GetDesc() };
             let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
@@ -1572,6 +1607,14 @@ impl SceneGpu {
 /// to the pre-cutout tracer. Shared with dxr.rs (the DXR library concat).
 pub(crate) fn alpha_defs(scene: &Scene) -> &'static str {
     if scene.any_alpha { "#define ALPHA_CUTOUT 1" } else { "" }
+}
+
+/// The relief twin of `alpha_defs`: height-carrying scenes compile the march
+/// + candidate loops / any-hit shaders in (runtime-gated by FLAG_HEIGHT —
+/// the V toggle); scenes without height data compile byte-identical sources
+/// to the pre-relief tracer. Shared with dxr.rs.
+pub(crate) fn height_defs(scene: &Scene) -> &'static str {
+    if scene.any_height && crate::bvh::height_armed() { "#define HEIGHTFIELD 1" } else { "" }
 }
 
 /// HLSL prelude every compile unit takes: the `--spp` jitter table's row count
@@ -1672,6 +1715,11 @@ pub const FLAG_ANISO: u32 = 128;
 /// SCENE_EPS/AO_RADIUS alias pattern) — so no CB offset moves.
 pub const FLAG_CLOUDS: u32 = 256;
 
+/// Heightfield relief march on — the V toggle × any_height × the
+/// --no-heightfield lever; per-frame runtime gate over the per-scene
+/// HEIGHTFIELD compile-in (trace_common.hlsli mirror).
+pub const FLAG_HEIGHT: u32 = 512;
+
 /// GBufPx stride in bytes — lockstep with trace_common.hlsli's struct
 /// (nr | alb_z | spec | mv | sig | sig2 = 4 float4 + 1 uint4 + 1 uint2).
 pub const GBUF_STRIDE: u64 = 88;
@@ -1737,7 +1785,10 @@ pub(crate) struct FrameCb {
     /// the HLSL star branch is guarded on it, so day kernels are bit-identical
     /// by construction). Rides what was `_pad4`.
     night: f32,
-    _pad5: u32,
+    /// Scene-wide max relief depth in world units (`bvh::height_max_world` —
+    /// 0.0 = no height data, which is also how FLAG_HEIGHT's `with_frame`
+    /// predicate reads `any_height`). The wavefront TMin widening constant.
+    height_max: f32,
     /// Sample offsets from `dlss::jitter_for_sample` (the ONE Halton source —
     /// no radical-inverse port in HLSL), two per 16-byte row.
     jitters: [[f32; 4]; (crate::dlss::MAX_SPP as usize) / 2],
@@ -1808,7 +1859,7 @@ impl FrameCb {
             spp: 1,
             probe_sample: 0,
             night: scene.night,
-            _pad5: 0,
+            height_max: crate::bvh::height_max_world(scene),
             jitters: [[0.0; 4]; (crate::dlss::MAX_SPP as usize) / 2],
         }
     }
@@ -1848,7 +1899,11 @@ impl FrameCb {
             | (p.prev_cam.is_some() as u32 * FLAG_HAS_PREV)
             | ((gbuf_full && fsr_sig) as u32 * FLAG_FSR_SIG)
             | ((crate::texture::max_aniso() > 1.0) as u32 * FLAG_ANISO)
-            | (p.clouds.enabled as u32 * FLAG_CLOUDS);
+            | (p.clouds.enabled as u32 * FLAG_CLOUDS)
+            // The V toggle read at CB-build time (height_max > 0 encodes
+            // any_height from base()) — no FrameParams plumbing needed, and
+            // the HEIGHTFIELD compile-in stays per-scene.
+            | ((crate::bvh::height_on() && self.height_max > 0.0) as u32 * FLAG_HEIGHT);
         cb.shadow_samples = p.q.shadow_samples;
         cb.ao_samples = p.q.ao_samples;
         cb.reflections = p.q.reflections as u32;
@@ -2088,11 +2143,13 @@ impl TraceGpu {
         let cmd_sig = create_dispatch_signature(device)?;
 
         // Alpha-masked scenes compile the cutout candidate loops into the
-        // trace primitives (rt.hlsli); opaque scenes compile the FORCE_OPAQUE
-        // originals verbatim (modulo a leading blank line) — procedural/
-        // stress sessions are structurally untouched (the bit gates rely on
-        // that).
-        let defs = alpha_defs(scene);
+        // trace primitives (rt.hlsli); height-carrying scenes likewise
+        // compile the relief march in (runtime-gated by FLAG_HEIGHT — the V
+        // toggle). Scenes with neither compile the FORCE_OPAQUE originals
+        // verbatim (modulo leading blank lines) — procedural/stress sessions
+        // are structurally untouched (the bit gates rely on that).
+        let defs = format!("{}\n{}", alpha_defs(scene), height_defs(scene));
+        let defs = defs.as_str();
         // The session's frustum structure: `#define FTREE` swaps frustum.hlsli's
         // binary bound_query/refine_cut for ftree.hlsli's wide bodies (same
         // signatures — the call sites don't know), and the FNode array uploads

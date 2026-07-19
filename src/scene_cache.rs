@@ -4,9 +4,10 @@
 //! `read_exact`s into its byte view, so a San Miguel load drops from ~a minute
 //! of parse + normal-gen + BVH build to under a second. Keyed on the RESOLVED
 //! source file's size + mtime (plus the `.mtl` sibling's and each TEXTURE
-//! file's — `alpha_masked` and the height-map skip are texture-CONTENT
-//! decisions, so an edited texture must miss the whole cache, not resurface
-//! stale flags) and `CACHE_VERSION`; any mismatch — including a truncated or
+//! file's — `alpha_masked` and the height-map detection/conversions are
+//! texture-CONTENT decisions, so an edited texture must miss the whole
+//! cache, not resurface stale flags) and `CACHE_VERSION`; any mismatch —
+//! including a truncated or
 //! bit-rotted sidecar — is a silent miss, never a panic: every count is
 //! capped against the real file size before allocating, and the payload's
 //! cross-array links are validated before anything indexes them. Texels are
@@ -34,7 +35,11 @@ use std::path::{Path, PathBuf};
 // The TOD fields (Scene::sky_scale/night) needed NO bump: they are
 // derived-only (`apply_tod` runs after load/store, the loader initializes
 // them to the defaults), so the v6 on-disk layout is unchanged.
-pub const CACHE_VERSION: u32 = 6; // v6: AreaLight -> sky::Sun (a disc at infinity)
+// v7: grayscale map_Bump height→normal conversion (h2n/n2h flag bytes so the
+// warm-load re-decode re-applies the conversions; Material/DiskMat gained
+// height_amp; texture ids shift on scenes with height maps, which used to be
+// dropped and are now converted-and-kept).
+pub const CACHE_VERSION: u32 = 7;
 const MAGIC: [u8; 8] = *b"FRSCACH\x01";
 
 /// Fixed on-disk material, `MatKind` flattened into (kind, param) — Marble
@@ -53,6 +58,7 @@ struct DiskMat {
     param: u32,
     emissive: [f32; 3],
     normal_scale: f32,
+    height_amp: f32,
     normal_tex: u32,
     rough_tex: u32,
     metal_tex: u32,
@@ -68,6 +74,17 @@ struct DiskNode {
     max: [f32; 3],
     left_first: u32,
     count: u32,
+}
+
+/// The load-time lever word, part of the cache key: the h2n/n2h converters
+/// change texel content + materials, and the heightfield session lever
+/// changes the BUILT tree's AABBs (the inward sweep) — a sidecar written
+/// under one lever state must never be served to a session under another
+/// (the levers would silently not take effect on warm loads).
+fn lever_word() -> u32 {
+    crate::texture::h2n_enabled() as u32
+        | (crate::texture::n2h_enabled() as u32) << 1
+        | (crate::bvh::height_armed() as u32) << 2
 }
 
 /// (size, mtime-ns) of a file, (0, 0) if absent — the staleness key.
@@ -175,6 +192,9 @@ pub fn try_load(src_path: &str) -> Option<(Scene, Bvh)> {
     if read_u64(&mut r).ok()? != crate::bvh::build_key() {
         return None;
     }
+    if read_u32(&mut r).ok()? != lever_word() {
+        return None;
+    }
     let (src_size, src_mtime) = stat_key(src);
     let (mtl_size, mtl_mtime) = stat_key(&mtl_sibling(src));
     if read_u64(&mut r).ok()? != src_size
@@ -206,7 +226,8 @@ pub fn try_load(src_path: &str) -> Option<(Scene, Bvh)> {
     let tri_mat: Vec<u32> = read_pod_vec_checked(&mut r, n_tris, &mut remaining)?;
     let disk_mats: Vec<DiskMat> = read_pod_vec_checked(&mut r, n_mats, &mut remaining)?;
 
-    let mut tex_meta: Vec<(String, bool, bool)> = Vec::with_capacity(n_tex.min(4096));
+    let mut tex_meta: Vec<(String, bool, bool, bool, bool)> =
+        Vec::with_capacity(n_tex.min(4096));
     for _ in 0..n_tex {
         let len = read_u32(&mut r).ok()? as usize;
         if len as u64 > remaining {
@@ -215,17 +236,17 @@ pub fn try_load(src_path: &str) -> Option<(Scene, Bvh)> {
         remaining -= len as u64;
         let mut path = vec![0u8; len];
         r.read_exact(&mut path).ok()?;
-        let mut flags = [0u8; 2];
+        let mut flags = [0u8; 4];
         r.read_exact(&mut flags).ok()?;
         let path = String::from_utf8(path).ok()?;
         // Texture-content staleness: alpha_masked (restored verbatim below)
-        // and the loader's height-map skip are functions of the FILE's
+        // and the loader's height-map detection are functions of the FILE's
         // pixels — an edited/replaced texture must miss the whole cache.
         let (t_size, t_mtime) = (read_u64(&mut r).ok()?, read_u64(&mut r).ok()?);
         if stat_key(Path::new(&path)) != (t_size, t_mtime) {
             return None;
         }
-        tex_meta.push((path, flags[0] != 0, flags[1] != 0));
+        tex_meta.push((path, flags[0] != 0, flags[1] != 0, flags[2] != 0, flags[3] != 0));
     }
 
     let disk_nodes: Vec<DiskNode> = read_pod_vec_checked(&mut r, n_nodes, &mut remaining)?;
@@ -275,6 +296,7 @@ pub fn try_load(src_path: &str) -> Option<(Scene, Bvh)> {
             emissive: Vec3A::from_array(m.emissive),
             normal_tex: m.normal_tex,
             normal_scale: m.normal_scale,
+            height_amp: m.height_amp,
             rough_tex: m.rough_tex,
             metal_tex: m.metal_tex,
             emissive_tex: m.emissive_tex,
@@ -304,32 +326,49 @@ pub fn try_load(src_path: &str) -> Option<(Scene, Bvh)> {
             .par_iter()
             .with_max_len(1)
             .map(|&i| (i, &tex_meta[i]))
-            .map(|(i, (path, masked, srgb))| (i, match image::open(path) {
-                Ok(img) => {
-                    let mut t = Texture::from_image(img, *srgb);
-                    // The loader's role-gating (e.g. an emissive-only color
-                    // map never arms the cutout) is baked into the cached
-                    // flag — restore it verbatim rather than re-deriving.
-                    // Sound because the per-texture stat key above already
-                    // missed the cache if the file's content changed.
-                    t.alpha_masked = *masked;
-                    t.source = path.clone();
-                    t
-                }
-                Err(e) => {
-                    eprintln!(
-                        "warning: cached texture '{path}' failed to re-decode ({e}); using 1x1 white"
-                    );
-                    Texture {
-                        w: 1,
-                        h: 1,
-                        texels: vec![[255; 4]],
-                        alpha_masked: *masked,
-                        srgb: *srgb,
-                        source: path.clone(),
-                        mips: Vec::new(),
+            .map(|(i, (path, masked, srgb, h2n, n2h))| (i, {
+                let mut t = match image::open(path) {
+                    Ok(img) => Texture::from_image(img, *srgb),
+                    Err(e) => {
+                        eprintln!(
+                            "warning: cached texture '{path}' failed to re-decode ({e}); using 1x1 white"
+                        );
+                        Texture {
+                            w: 1,
+                            h: 1,
+                            texels: vec![[255; 4]],
+                            alpha_masked: false,
+                            srgb: *srgb,
+                            source: String::new(),
+                            h2n: false,
+                            n2h: false,
+                            mips: Vec::new(),
+                        }
                     }
+                };
+                // The load-time conversions are texture-CONTENT decisions
+                // baked into the cached flags — a warm load must re-apply
+                // them or the material's normal_tex points at raw grayscale
+                // texels. The 1×1-white fallback converts to a flat identity
+                // normal map — semantically the right substitute.
+                if *h2n {
+                    t = t.height_to_normal();
                 }
+                if *n2h {
+                    // Deterministic re-derivation — same texels, same field
+                    // (the warm image must be bit-identical to the cold one;
+                    // the returned amp is discarded: materials carry theirs
+                    // in DiskMat).
+                    t.apply_n2h();
+                }
+                // The loader's role-gating (e.g. an emissive-only color
+                // map never arms the cutout) is baked into the cached
+                // flag — restore it verbatim rather than re-deriving.
+                // Sound because the per-texture stat key above already
+                // missed the cache if the file's content changed.
+                t.alpha_masked = *masked;
+                t.source = path.clone();
+                t
             }))
             .collect();
         pairs.sort_unstable_by_key(|&(i, _)| i);
@@ -357,6 +396,7 @@ pub fn try_load(src_path: &str) -> Option<(Scene, Bvh)> {
         materials,
         textures,
         any_alpha: false,
+        any_height: false,
         sun: crate::sky::Sun::new(sun_v[0]),
         // Derived from the sun by finalize_scalars below — deliberately not in
         // the on-disk format, so the SH sky costs the cache nothing. The TOD
@@ -398,6 +438,7 @@ pub fn store(src_path: &str, scene: &Scene, bvh: &Bvh) {
         // benchmarks the same tree every time. Distinct from CACHE_VERSION,
         // which versions the format.
         write_u64(&mut w, crate::bvh::build_key())?;
+        write_u32(&mut w, lever_word())?;
         let (src_size, src_mtime) = stat_key(src);
         let (mtl_size, mtl_mtime) = stat_key(&mtl_sibling(src));
         write_u64(&mut w, src_size)?;
@@ -441,6 +482,7 @@ pub fn store(src_path: &str, scene: &Scene, bvh: &Bvh) {
                     param,
                     emissive: m.emissive.to_array(),
                     normal_scale: m.normal_scale,
+                    height_amp: m.height_amp,
                     normal_tex: m.normal_tex,
                     rough_tex: m.rough_tex,
                     metal_tex: m.metal_tex,
@@ -452,7 +494,7 @@ pub fn store(src_path: &str, scene: &Scene, bvh: &Bvh) {
         for t in &scene.textures {
             write_u32(&mut w, t.source.len() as u32)?;
             w.write_all(t.source.as_bytes())?;
-            w.write_all(&[t.alpha_masked as u8, t.srgb as u8])?;
+            w.write_all(&[t.alpha_masked as u8, t.srgb as u8, t.h2n as u8, t.n2h as u8])?;
             // Per-texture staleness key (see try_load): content edits to a
             // texture must invalidate the cached alpha_masked/height-map
             // decisions, which only a full reparse re-derives.

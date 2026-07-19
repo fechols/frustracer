@@ -123,15 +123,18 @@ impl DxrGpu {
             device.cast().map_err(|e| format!("ID3D12Device5: {e}"))?;
         let root_sig = trace::create_root_signature(device)?;
 
-        // Alpha-masked scenes compile the ah_* any-hit shaders + non-opaque
-        // ray flags in (trace.rs::alpha_defs — the same per-scene predicate
-        // that drops OPAQUE from the BLAS); opaque scenes compile verbatim.
-        let any_alpha = scene.any_alpha;
+        // Alpha-masked and height-carrying scenes compile the ah_* any-hit
+        // shaders + non-opaque ray flags in (trace.rs::alpha_defs /
+        // height_defs — the same per-scene predicates that drop OPAQUE from
+        // the BLAS); scenes with neither compile verbatim.
+        let non_opaque =
+            scene.any_alpha || (scene.any_height && crate::bvh::height_armed());
         // The cbuffer's --spp jitter-table size, injected like alpha_defs.
         let sd = trace::spp_defs();
         let sd = sd.as_str();
+        let defs = format!("{}\n{}", trace::alpha_defs(scene), trace::height_defs(scene));
         let lib_src = [
-            trace::alpha_defs(scene),
+            defs.as_str(),
             sd,
             trace::TRACE_COMMON_HLSLI,
             RT_DXR_HLSLI,
@@ -196,7 +199,7 @@ impl DxrGpu {
         // alpha-tested-shadow pattern, and the untouched-payload = occluded
         // convention holds: all-rejected => miss_shadow writes 0).
         let ahs = |name: &Vec<u16>| {
-            if any_alpha { PCWSTR(name.as_ptr()) } else { PCWSTR::null() }
+            if non_opaque { PCWSTR(name.as_ptr()) } else { PCWSTR::null() }
         };
         let hit_group = |export: &Vec<u16>, chs: PCWSTR, ah: PCWSTR| D3D12_HIT_GROUP_DESC {
             HitGroupExport: PCWSTR(export.as_ptr()),
@@ -250,9 +253,10 @@ impl DxrGpu {
             ),
             sub(D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE, &grs as *const _ as *const _),
         ];
-        // HgOcclude imports ah_shadow, which only exports under ALPHA_CUTOUT
-        // — the subobject exists exactly when the library exports it.
-        if any_alpha {
+        // HgOcclude imports ah_shadow, which only exports under
+        // ALPHA_CUTOUT/HEIGHTFIELD — the subobject exists exactly when the
+        // library exports it.
+        if non_opaque {
             subobjects.push(sub(
                 D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP,
                 &hg_occlude as *const _ as *const _,
@@ -291,8 +295,8 @@ impl DxrGpu {
         put(SBT_HIT + IDENT, ident("HgHit")?);
         // Hit group 2 (occlusion rays): the zeroed null record on opaque
         // scenes (SKIP_CLOSEST_HIT + FORCE_OPAQUE never run a shader from
-        // it); the any-hit-only HgOcclude on alpha-masked scenes.
-        if any_alpha {
+        // it); the any-hit-only HgOcclude on alpha-masked/height scenes.
+        if non_opaque {
             put(SBT_HIT + 2 * IDENT, ident("HgOcclude")?);
         }
 
