@@ -50,6 +50,10 @@
                                // HEIGHTFIELD compile-in is per-SCENE, this
                                // bit is the per-frame runtime gate — the
                                // LEAF_NO_FB pattern)
+#define FLAG_FIREFLIES   1024u // firefly point lights live this frame
+                               // (src/fireflies.rs — count > 0 folds in the
+                               // session enable AND the night fade, so day
+                               // kernels are bit-identical by construction)
 
 cbuffer Frame : register(b0) {
     float4 cam_origin;   // xyz; w = inv_w
@@ -63,7 +67,10 @@ cbuffer Frame : register(b0) {
     float4 sun_e; // xyz = irradiance/PI (the direct loop's multiplier); w = scene eps
     float4 sun_l; // xyz = DISC radiance (what an escaping ray sees); w = ao_radius
     uint rw; uint rh; uint frame; uint flags;
-    uint shadow_samples; uint ao_samples; uint reflections; uint _pad0;
+    // ff_scale: the fireflies' CONTENT-diagonal scale (Fireflies::scale —
+    // every FF_* length multiplies it; NOT SCENE_DIAG, which the ground quad
+    // inflates ~17× on the procedural scenes). Rode what was _pad0.
+    uint shadow_samples; uint ao_samples; uint reflections; float ff_scale;
     // pixel_cone: primary ray-cone spread (CamBasis::pixel_cone verbatim,
     // the trilinear texture LOD's single source — shade.hlsli::tex_lod_base).
     // sky_scale: time-of-day dome brightness (Scene::sky_scale — exactly 1.0
@@ -78,7 +85,9 @@ cbuffer Frame : register(b0) {
     // capacity (rw*rh).
     uint fb_mode; uint fb_depth; uint hemi_batch; uint cap_hemi_pt;
     // Hemi per-batch queue capacities (batch-bounded, cannot overflow).
-    uint cap_hemi_cell; uint cap_hemi_leaf; uint cap_hemi_cut; uint _pad3;
+    // ff_count: live firefly count (rode what was _pad3, so no offset moves)
+    // — 0 in every day/--no-fireflies session; FLAG_FIREFLIES mirrors it.
+    uint cap_hemi_cell; uint cap_hemi_leaf; uint cap_hemi_cut; uint ff_count;
     // Previous frame's camera basis for G-buffer motion vectors (upscaler
     // sessions; zeroed with FLAG_HAS_PREV clear when there is no prev frame).
     // The scene-static near/far planes (dlss::near_far) ride the w slots.
@@ -109,8 +118,13 @@ cbuffer Frame : register(b0) {
     float4 jitters[JITTER_ROWS];
     // The sky dome in order-2 SH (scene.sky_sh / sh.rs::Sh9) — the analytic
     // ambient irradiance, one RGB row per coefficient (.w unused). Appended
-    // LAST so every offset above is unmoved.
+    // after every scalar so no offset above moves.
     float4 sky_sh[9];
+    // Firefly poses (src/fireflies.rs — xyz = world position, w =
+    // brightness), the CPU's baked f32s verbatim: both renderers light from
+    // bit-equal positions. MAX_FIREFLIES is injected by trace::spp_defs (the
+    // JITTER_ROWS pattern); rows past ff_count are zero and never read.
+    float4 ff[MAX_FIREFLIES];
 }
 
 #define SCENE_EPS  (sun_e.w)
@@ -323,6 +337,48 @@ float3 sky_stars(float3 d, float half_angle, uint twinkle) {
     float tw = 0.75 + 0.25 * star_hash01(pcg_mix(seed ^ pcg_mix(twinkle >> 3u)));
     float l = min(STAR_E * tier / (6.2831853 * sigma * sigma), STAR_L_MAX);
     return tint * (l * g * tw * night * star_rise(d.y, 0.0, 0.05));
+}
+
+// --- Fireflies (src/fireflies.rs — term-for-term; change both together) ------
+//
+// The camera GLOW half of the firefly feature: a depth-tested Gaussian splat
+// at finite distance (the sky_stars construction with a 1/s² flux term).
+// DISPLAY paths only — the kernels' primary hit/miss composites and cs_sky;
+// never any gather (the stars rule). The LIGHT half is shade.hlsli::the
+// firefly loop in shade_split. Poses come from the CB rows (CPU-baked, so
+// there is no cross-language position derivation to drift); every call is
+// gated on FLAG_FIREFLIES, so day kernels are bit-identical by construction.
+
+static const float  FF_RADIUS_K   = 0.06;
+static const float  FF_E_K        = 2.0e-4;
+static const float  FF_RMIN_K     = 0.005;
+static const float  FF_SRC_K      = 1.0e-3;
+static const float  FF_GLOW_L_MAX = 512.0;
+static const float3 FF_COLOR      = float3(0.65, 1.0, 0.25);
+
+float3 ff_glow(float3 o, float3 d, float t_max, float half_angle) {
+    float3 acc = 0.0;
+    float e = FF_E_K * ff_scale * ff_scale;
+    float src_r = FF_SRC_K * ff_scale;
+    for (uint i = 0u; i < ff_count; ++i) {
+        float3 to = ff[i].xyz - o;
+        float s = dot(to, d);
+        // Behind the camera, or behind the primary hit — the depth test that
+        // makes the glow a scene object rather than a screen decal.
+        if (s <= 0.0 || s >= t_max) continue;
+        float3 pv = to - d * s;
+        float sigma = max(half_angle * 0.5, src_r / s);
+        float theta2 = dot(pv, pv) / (s * s);
+        // Reject BEFORE the exp (the CPU twin's measured lesson): 9.22 >
+        // -ln(1e-4), so skipped pairs would fail the post-test anyway.
+        float a = theta2 / (2.0 * sigma * sigma);
+        if (a > 9.22) continue;
+        float g = exp(-a);
+        if (g < 1e-4) continue;
+        float l = min(e * ff[i].w / (s * s * 6.2831853 * sigma * sigma), FF_GLOW_L_MAX);
+        acc += FF_COLOR * (l * g);
+    }
+    return acc;
 }
 
 // --- Volumetric clouds (src/clouds.rs — term-for-term; change both together) --

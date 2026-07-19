@@ -78,7 +78,8 @@ void cs_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
                 // pins spp to 1 on fb frames anyway).
                 float3 o_h, n_h;
                 c = shade_split(cam_origin.xyz, dir, hit, rng, shadow_samples, ao_samples,
-                                reflections != 0u, true, 0.0, pixel_cone, true, aw, o_h, n_h, ps);
+                                reflections != 0u, true, 0.0, pixel_cone, true, true,
+                                aw, o_h, n_h, ps);
                 if (prim) {
                     uint q;
                     InterlockedAdd(counters[CTR_HEMI_PT], 1, q);
@@ -109,6 +110,10 @@ void cs_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
             t = INF;
             if (prim) gbuf_write_sky(pi, sp.x, sp.y, dir);
         }
+        // Firefly glow, depth-tested against this sample's own hit (INF on a
+        // miss) — render.rs::shade_traced's composite, term for term. Guarded
+        // by the flag, so day frames add nothing (bit-identity).
+        if (flags & FLAG_FIREFLIES) c += ff_glow(cam_origin.xyz, dir, t, pixel_cone * 0.5);
         csum += c;
         awsum += aw;
         if (prim) {

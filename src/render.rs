@@ -43,6 +43,11 @@ pub struct FrameCtx<'a> {
     /// Per-frame cloud state (src/clouds.rs). main.rs owns the clock; every
     /// headless context pins `Clouds::check` so gate pairs compare one sky.
     pub clouds: crate::clouds::Clouds,
+    /// Per-frame firefly state (src/fireflies.rs) — poses baked once per
+    /// frame on the same clock as `clouds`; `count == 0` (every day session)
+    /// is the structural off state. Consumed by the primary shade path and
+    /// the display glow only — never the gathers (the stars rule).
+    pub fireflies: crate::fireflies::Fireflies,
     /// This frame's temporal cache to fill (per-node tc / sky markers).
     pub tcache_cur: Option<&'a TemporalCache>,
     /// Ring of previous frames' caches, NEWEST FIRST, each paired with the
@@ -1420,7 +1425,7 @@ fn shade_traced(
                 ls.skip_ratio_count += 1;
             }
             let mut prim = shade::PrimarySurface::default();
-            let c = shade::shade(
+            let mut c = shade::shade(
                 ctx.scene,
                 ctx.bvh,
                 &tr.ray,
@@ -1437,7 +1442,26 @@ fn shade_traced(
                 if primary && ctx.gbuf.is_some() { Some(&mut prim) } else { None },
                 vis,
                 hemi_share,
+                // The ONE Some site: fireflies light the primary camera path
+                // only. Day sessions (count 0) hand shade a structural None.
+                (ctx.fireflies.count > 0).then_some(&ctx.fireflies),
             );
+            // Firefly glow, depth-tested against the primary hit — a firefly
+            // between the camera and the surface splats over the shaded
+            // color (this sample's own ray, so --spp averages it). Guarded:
+            // `-0.0 + 0.0 = +0.0` would break day bit-identity (the emissive
+            // discipline). Color-only — tbuf/info/meta and every exact-zero
+            // verify counter are structurally blind to it; under FSR it
+            // lands in the deterministic residual (the emissive accept).
+            if ctx.fireflies.count > 0 {
+                c += crate::fireflies::glow(
+                    &ctx.fireflies,
+                    tr.ray.o,
+                    tr.dir,
+                    hit.t,
+                    ctx.cam.pixel_cone() * 0.5,
+                );
+            }
             if do_splat {
                 ctx.splat(x, y, c);
             }
@@ -1455,7 +1479,7 @@ fn shade_traced(
             // (through the cloud layer, which marches from the ray's origin
             // with this sample's own dither phase — per (pixel, frame,
             // sample), so --spp and accumulation genuinely average the march).
-            let c = crate::sky::radiance(
+            let mut c = crate::sky::radiance(
                 tr.ray.o,
                 tr.dir,
                 &ctx.scene.sun,
@@ -1466,6 +1490,17 @@ fn shade_traced(
                 &ctx.clouds,
                 crate::clouds::dither_jk(x as u32, y as u32, ctx.frame, tr.k, ctx.spp()),
             );
+            // Firefly glow against the open sky — a miss has no depth to
+            // test (t_max ∞). Guarded like the hit arm.
+            if ctx.fireflies.count > 0 {
+                c += crate::fireflies::glow(
+                    &ctx.fireflies,
+                    tr.ray.o,
+                    tr.dir,
+                    f32::INFINITY,
+                    ctx.cam.pixel_cone() * 0.5,
+                );
+            }
             if do_splat {
                 ctx.splat(x, y, c);
             }
@@ -1675,6 +1710,21 @@ fn fill_sky_rows(ctx: &FrameCtx, x0: usize, y0: usize, x1: usize, y1: usize, dep
                 &ctx.clouds,
                 j,
             );
+            // Firefly glow against a proven-empty tile — the feature's most
+            // visible case (a firefly on the night sky), still ZERO rays:
+            // nothing occludes along a sky direction, so t_max is ∞ and the
+            // splat needs no depth test. Guarded (the emissive discipline);
+            // the splat is Gaussian at ≥ the pixel footprint, so the
+            // center-direction rule stays sound exactly as it does for stars.
+            if ctx.fireflies.count > 0 {
+                c += crate::fireflies::glow(
+                    &ctx.fireflies,
+                    ctx.cam.origin,
+                    dir,
+                    f32::INFINITY,
+                    ctx.cam.pixel_cone() * 0.5,
+                );
+            }
             // A proven-empty tile has always shaded ONE center direction, spp
             // or not — sound while the sky was smooth at sub-pixel scale. The
             // cloud layer broke that premise (a cover-ramp edge crosses a
@@ -1707,6 +1757,17 @@ fn fill_sky_rows(ctx: &FrameCtx, x0: usize, y0: usize, x1: usize, y1: usize, dep
                         &ctx.clouds,
                         crate::clouds::dither_jk(x as u32, y as u32, ctx.frame, k, spp),
                     );
+                    // Each extra sample carries its own glow along its own
+                    // direction, exactly like a leaf pixel's sample loop.
+                    if ctx.fireflies.count > 0 {
+                        c += crate::fireflies::glow(
+                            &ctx.fireflies,
+                            ctx.cam.origin,
+                            dk,
+                            f32::INFINITY,
+                            ctx.cam.pixel_cone() * 0.5,
+                        );
+                    }
                 }
                 c *= 1.0 / spp as f32;
             }
@@ -2140,6 +2201,7 @@ pub fn verify_sampled(
         // verify's re-trace must shade the SAME sky as the frame it checks —
         // the pinned check state, matching every headless FrameCtx.
         clouds: crate::clouds::Clouds::check(scene.diag),
+        fireflies: crate::fireflies::Fireflies::check(scene),
         tcache_cur: None,
         tcache_prev: temporal_prev,
         accumulate: true,

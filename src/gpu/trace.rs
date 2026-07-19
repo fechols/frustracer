@@ -172,9 +172,10 @@ pub const HEMI_BATCH: u32 = 16384;
 /// Max fb.depth the hemi queue sizing supports (presets top out at 4).
 const HEMI_MAX_DEPTH: u32 = 4;
 
-// Root-CBV alignment (256 B). FrameCb is 1344 bytes — 320 of struct plus the
-// MAX_SPP-entry jitter table (--spp), which is what sets the size.
-pub(crate) const CB_STRIDE: usize = 1536;
+// Root-CBV alignment (256 B). FrameCb is 1856 bytes — 320 of struct plus the
+// MAX_SPP-entry jitter table (--spp) and the MAX_FIREFLIES pose rows, which
+// are what set the size (raise the stride in lockstep with either cap).
+pub(crate) const CB_STRIDE: usize = 2048;
 
 /// The leaf kernel's thread-group width — ONE WAVE on both vendors, and that
 /// is the whole point.
@@ -1642,9 +1643,14 @@ pub(crate) fn spp_defs() -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "#define MAX_SPP {}u\n#define JITTER_ROWS {}\nstatic const float2 SKY_J[MAX_SPP] = {{ {} }};",
+        "#define MAX_SPP {}u\n#define JITTER_ROWS {}\n#define MAX_FIREFLIES {}\nstatic const float2 SKY_J[MAX_SPP] = {{ {} }};",
         crate::dlss::MAX_SPP,
         crate::dlss::MAX_SPP / 2,
+        // The firefly pose-row count (fireflies.rs::MAX_FIREFLIES), injected
+        // for the same reason as JITTER_ROWS: a hand-mirrored literal would
+        // be a second constant to raise in lockstep, and a shader reading
+        // past a too-small cbuffer array is silent.
+        crate::fireflies::MAX_FIREFLIES,
         sky_j
     )
 }
@@ -1720,6 +1726,12 @@ pub const FLAG_CLOUDS: u32 = 256;
 /// HEIGHTFIELD compile-in (trace_common.hlsli mirror).
 pub const FLAG_HEIGHT: u32 = 512;
 
+/// Firefly point lights live this frame (src/fireflies.rs — count > 0, which
+/// already folds in the session enable and the night fade: a day session
+/// never sets it, so day kernels are bit-identical by construction). Poses
+/// ride the CB's `ff` rows, CPU-baked — the HLSL re-derives nothing.
+pub const FLAG_FIREFLIES: u32 = 1024;
+
 /// GBufPx stride in bytes — lockstep with trace_common.hlsli's struct
 /// (nr | alb_z | spec | mv | sig | sig2 = 4 float4 + 1 uint4 + 1 uint2).
 pub const GBUF_STRIDE: u64 = 88;
@@ -1750,7 +1762,10 @@ pub(crate) struct FrameCb {
     shadow_samples: u32,
     ao_samples: u32,
     reflections: u32,
-    _pad0: u32,
+    /// The fireflies' CONTENT-diagonal scale (`Fireflies::scale` — every FF_*
+    /// length multiplies it; deliberately NOT SCENE_DIAG, which the ground
+    /// quad inflates ~17× on the procedural scenes). Rode what was `_pad0`.
+    ff_scale: f32,
     frame_jitter: [f32; 2],
     /// Primary ray-cone spread (CamBasis::pixel_cone — the CPU value
     /// verbatim, single source for the trilinear LOD parity).
@@ -1770,7 +1785,9 @@ pub(crate) struct FrameCb {
     cap_hemi_cell: u32,
     cap_hemi_leaf: u32,
     cap_hemi_cut: u32,
-    _pad3: u32,
+    /// Live firefly count (rode what was `_pad3`, so no offset moves) —
+    /// 0 in every day/`--no-fireflies` session; FLAG_FIREFLIES mirrors it.
+    ff_count: u32,
     // Previous frame's camera basis for G-buffer MVs; near/far ride the w
     // slots of the last two rows (scene-static, from dlss::near_far).
     prev_origin: [f32; 4],  // xyz; w = prev inv_w
@@ -1794,16 +1811,25 @@ pub(crate) struct FrameCb {
     jitters: [[f32; 4]; (crate::dlss::MAX_SPP as usize) / 2],
     /// The sky dome in order-2 SH (`scene.sky_sh`, `sh::N` = 9 RGB rows, .w
     /// unused) — the GPU's copy of the analytic ambient the CPU reads through
-    /// `Sh9::irradiance`. Appended LAST so every offset above is unmoved.
+    /// `Sh9::irradiance`. Appended after every scalar so no offset above moves.
     sky_sh: [[f32; 4]; crate::sh::N],
+    /// Firefly poses (src/fireflies.rs — xyz = world position, w =
+    /// brightness), the CPU's baked f32s verbatim so both renderers light
+    /// from bit-equal positions. Appended LAST (the sky_sh precedent); rows
+    /// past `ff_count` are zero and never read (the HLSL loops on the count).
+    ff: [[f32; 4]; crate::fireflies::MAX_FIREFLIES],
 }
 // The HLSL cbuffer is hand-mirrored across 7 concatenated compile units —
 // a size drift here corrupts every field after the drift point.
 // 304 (the pre-sun size) − 32 (two rect-light rows dropped) + 16 (the spp
-// block) + 8·MAX_SPP (the jitter table) + 16·9 (the SH sky).
+// block) + 8·MAX_SPP (the jitter table) + 16·9 (the SH sky) +
+// 16·MAX_FIREFLIES (the firefly pose rows).
 const _: () = assert!(
     std::mem::size_of::<FrameCb>()
-        == 320 - 32 + 8 * crate::dlss::MAX_SPP as usize + 16 * crate::sh::N
+        == 320 - 32
+            + 8 * crate::dlss::MAX_SPP as usize
+            + 16 * crate::sh::N
+            + 16 * crate::fireflies::MAX_FIREFLIES
 );
 // ...and the whole thing must still fit a CB ring slot.
 const _: () = assert!(std::mem::size_of::<FrameCb>() <= CB_STRIDE);
@@ -1836,7 +1862,7 @@ impl FrameCb {
             shadow_samples: 0,
             ao_samples: 0,
             reflections: 0,
-            _pad0: 0,
+            ff_scale: 1.0,
             frame_jitter: [0.0, 0.0],
             pixel_cone: 0.0,
             sky_scale: scene.sky_scale,
@@ -1851,7 +1877,8 @@ impl FrameCb {
             cap_hemi_cell: 0,
             cap_hemi_leaf: 0,
             cap_hemi_cut: 0,
-            _pad3: 0,
+            ff_count: 0,
+            ff: [[0.0; 4]; crate::fireflies::MAX_FIREFLIES],
             prev_origin: [0.0; 4],
             prev_forward: [0.0; 4],
             prev_right: [0.0, 0.0, 0.0, near],
@@ -1900,6 +1927,10 @@ impl FrameCb {
             | ((gbuf_full && fsr_sig) as u32 * FLAG_FSR_SIG)
             | ((crate::texture::max_aniso() > 1.0) as u32 * FLAG_ANISO)
             | (p.clouds.enabled as u32 * FLAG_CLOUDS)
+            // count > 0 already folds in the session enable + the night fade
+            // (fireflies.rs::new) — a day session never sets the bit, so day
+            // kernels are bit-identical by construction.
+            | ((p.fireflies.count > 0) as u32 * FLAG_FIREFLIES)
             // The V toggle read at CB-build time (height_max > 0 encodes
             // any_height from base()) — no FrameParams plumbing needed, and
             // the HEIGHTFIELD compile-in stays per-scene.
@@ -1912,6 +1943,14 @@ impl FrameCb {
             None => [0.0, 0.0],
         };
         cb.pixel_cone = p.cam.pixel_cone();
+        // Firefly poses: the CPU's baked f32 rows verbatim (CPU↔GPU positions
+        // bit-equal by DATA — the HLSL re-derives nothing). Rows past the
+        // count stay the base's zeros.
+        cb.ff_count = p.fireflies.count;
+        cb.ff_scale = p.fireflies.scale;
+        for i in 0..p.fireflies.count as usize {
+            cb.ff[i] = p.fireflies.pos[i];
+        }
         cb.fb_mode = fb_mode_of(&p.q);
         cb.fb_depth = p.q.fb.depth.clamp(1, HEMI_MAX_DEPTH);
         // --spp. Pinned to 1 on fb frames, exactly like FrameCtx::spp(): the
@@ -1972,6 +2011,10 @@ pub struct FrameParams {
     /// Per-frame cloud state (src/clouds.rs) — enable bit + clock + diag,
     /// mapped onto FLAG_CLOUDS and the cam rows' w lanes by `with_frame`.
     pub clouds: crate::clouds::Clouds,
+    /// Per-frame firefly state (src/fireflies.rs) — CPU-baked poses, mapped
+    /// onto FLAG_FIREFLIES + the `ff`/`ff_count` CB rows by `with_frame`
+    /// (count 0 — every day session — writes neither).
+    pub fireflies: crate::fireflies::Fireflies,
 }
 
 /// Which upscaler the feed pass targets — selects the kernel (and thereby

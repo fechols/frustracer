@@ -40,6 +40,9 @@ void cs_reference(uint3 id : SV_DispatchThreadID) {
             t = INF;
             if (prim) gbuf_write_sky(pi, sp.x, sp.y, dir);
         }
+        // Firefly glow — the leaf kernel's composite, term for term (the
+        // same-seed wavefront-vs-reference bit gate rides on that).
+        if (flags & FLAG_FIREFLIES) c += ff_glow(cam_origin.xyz, dir, t, pixel_cone * 0.5);
         csum += c;
         if (prim) {
             tbuf[pi] = t;

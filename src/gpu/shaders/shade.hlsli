@@ -328,9 +328,14 @@ float3 perturb_normal(float3 n, Mat mat, float2 uv, TexFilt filt,
 // `aniso`: may THIS ray's footprint be resolved anisotropically (the CPU's
 // Cone::aniso > 1)? Primary/reflection/glass laps yes, hemi-GI bounce laps no
 // (their cone is octant-coarse by design). Gated by FLAG_ANISO on top.
+// `fireflies`: may the PRIMARY surface (lap 0) take firefly point light
+// (the CPU's `ff: Option<&Fireflies>` — Some only on the camera path)?
+// Camera laps yes, hemi bounce laps no — like emissive, fireflies never
+// light bounce surfaces. FLAG_FIREFLIES (count > 0) gates on top, so day
+// kernels are bit-identical whatever the call site passes.
 float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                    uint n_shadow, uint n_ao, bool refl, bool split_ambient,
-                   float cone_w0, float cone_spread, bool aniso,
+                   float cone_w0, float cone_spread, bool aniso, bool fireflies,
                    out float3 amb_w, out float3 amb_o, out float3 amb_n,
                    out PrimSurf prim) {
     amb_w = 0.0;
@@ -538,6 +543,50 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
             direct_d *= cloud_t;
             direct_s *= cloud_t;
             direct_t *= cloud_t;
+        }
+        // Firefly point lights (shade.rs, same insertion point): AFTER the
+        // cloud scaling (a firefly is a local light under the slab) and
+        // BEFORE the lap-0 prim export (the light rides FSR-RR's denoised
+        // dd/ds lobes). Lap 0 only — the CPU recursion passes ff = None.
+        // ZERO rng draws: deterministic iteration, one HARD shadow ray per
+        // in-radius firefly, finite tmax (stop 2·eps short of the light
+        // point). `w_l = 1` on the specular — a point light has zero solid
+        // angle, so the VNDF ray can never deliver it; MIS does not apply.
+        if (fireflies && lap == 0u && (flags & FLAG_FIREFLIES)) {
+            float r_inf = FF_RADIUS_K * ff_scale;
+            float ff_r2 = r_inf * r_inf;
+            float ff_rmin2 = (FF_RMIN_K * ff_scale) * (FF_RMIN_K * ff_scale);
+            for (uint fi = 0u; fi < ff_count; ++fi) {
+                float3 fto = ff[fi].xyz - p;
+                float fd2 = dot(fto, fto);
+                // The rejection test — a far firefly's only cost.
+                if (fd2 >= ff_r2) continue;
+                float fdist = sqrt(fd2);
+                float3 fwi = fto / fdist;
+                float fndl = dot(n_s, fwi);
+                if (fndl <= 0.0) continue;
+                // Windowed 1/d² (fireflies.rs::irradiance — exactly 0 at the
+                // radius, C¹ there, near-field clamped under the f16 ceiling).
+                float fx = 1.0 - fd2 / ff_r2;
+                float fe = FF_E_K * ff_scale * ff_scale * ff[fi].w
+                           / max(fd2, ff_rmin2) * (fx * fx);
+                if (fe <= 0.0) continue;
+                if (occluded_q(p, fwi, 0.0, max(fdist - 2.0 * SCENE_EPS, 0.0)))
+                    continue;
+                float3 fli = FF_COLOR * (fe * fndl);
+                direct_d += fli;
+                float3 fh = normalize_or_zero(fwi + v);
+                float3 fhl = float3(dot(fh, t1), dot(fh, t2), dot(fh, n_s));
+                if (fhl.z > 0.0) {
+                    float fdn = ggx_ndf(fhl, ax, ay);
+                    float3 fwil = float3(dot(fwi, t1), dot(fwi, t2), dot(fwi, n_s));
+                    float fg2 = 1.0 / (1.0 + lambda_v + ggx_lambda(fwil, ax, ay));
+                    float3 ffr = schlick(f0, max(dot(fwi, fh), 0.0));
+                    // fli carries ndl; D·G2·F/(4·nv·nl)·nl leaves /(4·nv) —
+                    // the sun loop's exact term shape, at full weight.
+                    direct_s += fli * ffr * (PI * fdn * fg2 / (4.0 * vl.z * fndl));
+                }
+            }
         }
         if (lap == 0u) {
             // shade.rs's post-average lobe export (the FSR-RR signal split
@@ -829,5 +878,5 @@ float3 shade_full(float3 ro, float3 rd, HitInfo hit, inout uint rng, out PrimSur
     // Camera rays (and their reflection/glass continuations) resolve their
     // footprint anisotropically when the session asks for it — FLAG_ANISO.
     return shade_split(ro, rd, hit, rng, shadow_samples, ao_samples, reflections != 0u,
-                       false, 0.0, pixel_cone, true, w, o, n, prim);
+                       false, 0.0, pixel_cone, true, true, w, o, n, prim);
 }

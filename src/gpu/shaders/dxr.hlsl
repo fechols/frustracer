@@ -42,6 +42,10 @@ void raygen() {
         p.prim = (s << 1) | ((s == probe_sample) ? 1u : 0u);
         TraceRay(tlas, OPAQUE_RF, 0xffu, 0u, 0u, 0u, r, p);
 
+        // Firefly glow, depth-tested against the payload's t (INF on a miss)
+        // — the wavefront kernels' composite, term for term.
+        if (flags & FLAG_FIREFLIES)
+            p.color += ff_glow(cam_origin.xyz, dir, p.t, pixel_cone * 0.5);
         csum += p.color;
         if ((p.prim & 1u) != 0u) {
             tbuf[pi] = p.t;

@@ -408,6 +408,8 @@ pub fn try_load(src_path: &str) -> Option<(Scene, Bvh)> {
         diag: 0.0,
         eps: 0.0,
         ao_radius: 0.0,
+        content_min: glam::Vec3A::ZERO,
+        content_max: glam::Vec3A::ZERO,
     };
     scene::finalize_scalars(&mut sc);
     eprintln!(

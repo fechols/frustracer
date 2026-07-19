@@ -9,6 +9,7 @@ mod dlss;
 // Signal split, wire encoders, and demodulation/composite math for FSR Ray
 // Regeneration — pure CPU, feeds --check-fsr; the GPU seam is gpu/ffx*.
 mod builders;
+mod fireflies;
 mod fsr;
 mod frustum;
 mod ftree;
@@ -655,6 +656,27 @@ fn main() {
             // guarded early returns everywhere — bit-identical to the
             // pre-cloud renderer (clouds::self_test pins it).
             "--no-clouds" => clouds::set_enabled(false),
+            // Firefly point lights (default ON, but they only exist after
+            // dusk — a day session snapshots count = 0 and is bit-identical
+            // structurally). Same "session constant before scene load"
+            // pattern; the count clamps to the CB row cap loudly.
+            "--no-fireflies" => fireflies::set_enabled(false),
+            "--fireflies" => {
+                let n: u32 = args.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| {
+                    eprintln!(
+                        "--fireflies needs an integer count (1..={})",
+                        fireflies::MAX_FIREFLIES
+                    );
+                    std::process::exit(2);
+                });
+                if n > fireflies::MAX_FIREFLIES as u32 {
+                    eprintln!(
+                        "fireflies: count {n} clamped to {} (the CB row cap)",
+                        fireflies::MAX_FIREFLIES
+                    );
+                }
+                fireflies::set_count(n);
+            }
             // Same "knob before scene load" pattern: the GPU reads it for the
             // static sampler's MaxAnisotropy, the CPU for Cone::aniso. 1 = off
             // ⇒ the isotropic ray-cone lod path runs verbatim (bit-identical
@@ -1024,6 +1046,11 @@ fn main() {
                 eprintln!("  --no-clouds   disable the drifting volumetric cloud layer (on by default: raymarched");
                 eprintln!("                FBM slab — sky, reflections, glass, and cloud shadows on the direct sun;");
                 eprintln!("                off is bit-identical to the pre-cloud renderer)");
+                eprintln!("  --no-fireflies  disable the firefly point lights (on by default AFTER DUSK — under");
+                eprintln!("                --tod they fade in with the stars: curl-noise drift, real 1/d² light");
+                eprintln!("                with hard shadow rays + a depth-tested glow; a day session has zero");
+                eprintln!("                fireflies and is bit-identical structurally)");
+                eprintln!("  --fireflies N   firefly count (default {}, max {})", fireflies::DEFAULT_COUNT, fireflies::MAX_FIREFLIES);
                 eprintln!("  --no-mips     no texture mip chains; every trilinear sample degenerates to the");
                 eprintln!("                pre-mip bilinear (A/B lever; mips are on by default — implies --no-aniso)");
                 eprintln!("  --no-h2n      don't Sobel-convert grayscale bump maps into normal maps (they are");
@@ -1512,6 +1539,7 @@ fn run_check_dxr(
             tbuf: &tbuf,
             stats: &stats,
             sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
             tcache_cur: None,
             tcache_prev: &[],
             accumulate: true,
@@ -1549,6 +1577,7 @@ fn run_check_dxr(
             tbuf: &tbuf,
             stats: &stats,
             sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
             tcache_cur: None,
             tcache_prev: &[],
             accumulate: true,
@@ -1586,6 +1615,7 @@ fn run_check_dxr(
                 spp: 1,
                 probe_sample: 0,
                 clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
             },
         );
         let mut rec = Ok(());
@@ -1672,6 +1702,7 @@ fn run_check_dxr(
                 spp: SPP_GATE,
                 probe_sample: probe,
                 clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
             };
             dg.write_cb(0, &p);
             let mut rec = Ok(());
@@ -1894,6 +1925,7 @@ fn run_check_dxr(
                 spp: 1,
                 probe_sample: 0,
                 clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
             };
             dg2.write_cb(0, &p);
             let mut rec = Ok(());
@@ -2221,6 +2253,7 @@ fn run_check_dxr(
                     spp: 1,
                     probe_sample: 0,
                     clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
                 };
                 dg2.write_cb(0, &p);
                 let mut rec = Ok(());
@@ -3151,6 +3184,7 @@ fn run_check_gpu(
             tbuf: &tbuf,
             stats: &stats,
             sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
             tcache_cur: None,
             tcache_prev: &[],
             accumulate: true,
@@ -3186,6 +3220,7 @@ fn run_check_gpu(
             spp: 1,
             probe_sample: 0,
             clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
         });
         hg.run(|l| tg.record_reference(l, 0))
     };
@@ -3402,6 +3437,7 @@ fn run_check_gpu(
         spp: 1,
         probe_sample: 0,
         clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
     };
     tg.write_cb(0, &wf_params);
     if let Err(e) = hg.run(|l| tg.record_wavefront(l, 0, &wf_params, true)) {
@@ -3767,6 +3803,7 @@ fn run_check_gpu(
                 spp,
                 probe_sample: probe,
                 clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
             };
             tg.write_cb(0, &p);
             if let Err(e) = hg.run(|l| tg.record_wavefront(l, 0, &p, true)) {
@@ -3943,6 +3980,7 @@ fn run_check_gpu(
                 spp: 1,
                 probe_sample: 0,
                 clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
             });
             if let Err(e) = tg.run_hemi_probes(&mut hg, 0, &probes, fb.depth, s == 0) {
                 eprintln!("check-gpu: FAIL hemi {mode_name} probes: {e}");
@@ -4070,6 +4108,9 @@ fn run_check_gpu(
                             None,
                             shade::VisCtl::Off,
                             None,
+                            // Gather reference: fireflies excluded, like the
+                            // hemi leaf shades it gates against.
+                            None,
                         ),
                     };
                 }
@@ -4112,6 +4153,7 @@ fn run_check_gpu(
             spp: 1,
             probe_sample: 0,
             clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
         };
         tg.write_cb(0, &p);
         if let Err(e) = hg.run(|l| tg.record_wavefront(l, 0, &p, false)) {
@@ -4197,6 +4239,7 @@ fn run_check_gpu(
                 spp: 1,
                 probe_sample: 0,
                 clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
             };
             ptg.write_cb(0, &p);
             hg.run(|l| ptg.record_wavefront(l, 0, &p, false))?;
@@ -4598,6 +4641,7 @@ fn run_check_gpu(
                     spp: 1,
                     probe_sample: 0,
                     clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
                 };
                 ptg.write_cb(0, &p);
                 if let Err(e) = hg.run(|l| ptg.record_wavefront(l, 0, &p, false)) {
@@ -5205,6 +5249,7 @@ fn run_check_gpu(
                 spp,
                 probe_sample: 0,
                 clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
             };
             btg.write_cb(0, &p);
             let _ = hg.run(|l| btg.record_frame(l, 0, &p, hybrid));
@@ -5226,6 +5271,7 @@ fn run_check_gpu(
                 spp,
                 probe_sample: 0,
                 clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
             };
             btg.write_cb(0, &p);
             let _ = hg.run(|l| btg.record_frame(l, 0, &p, hybrid));
@@ -5352,6 +5398,7 @@ fn run_check_gpu(
                 tbuf: &tbuf2,
                 stats: &stats2,
                 sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
                 tcache_cur: None,
                 tcache_prev: &[],
                 accumulate: true,
@@ -5733,6 +5780,7 @@ fn fsr_frame_check(
             tbuf: &tbuf,
             stats: &stats,
             sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
             tcache_cur: None,
             tcache_prev: &[],
             accumulate: false,
@@ -6009,6 +6057,7 @@ fn albedo_ab_check(
         tbuf: &tbuf,
         stats: &stats,
         sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
         tcache_cur: None,
         tcache_prev: &[],
         accumulate: false,
@@ -6124,6 +6173,7 @@ fn mv_check_at(
                 tbuf: &tbuf,
                 stats: &stats,
                 sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
                 tcache_cur: None,
                 tcache_prev: &[],
                 accumulate: false,
@@ -6591,6 +6641,7 @@ fn run_check_xess(
                     tbuf: &tbuf,
                     stats,
                     sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
                     tcache_cur: None,
                     tcache_prev: &[],
                     accumulate: true,
@@ -6835,6 +6886,7 @@ fn run_check_nppd(
             tbuf: &tbuf,
             stats: &stats,
             sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
             tcache_cur: None,
             tcache_prev: &[],
             accumulate: false,
@@ -7062,6 +7114,7 @@ fn run_check_oidn(
             tbuf: &tbuf,
             stats: &stats,
             sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
             tcache_cur: None,
             tcache_prev: &[],
             accumulate: true,
@@ -7214,6 +7267,7 @@ fn run_check_oidn(
             tbuf: &tbuf,
             stats: &stats,
             sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
             tcache_cur: None,
             tcache_prev: &[],
             accumulate: false,
@@ -7407,6 +7461,7 @@ fn run_check_oidn(
                 tbuf: &tbuf,
                 stats: &stats,
                 sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
                 tcache_cur: None,
                 tcache_prev: &[],
                 accumulate: true,
@@ -7857,6 +7912,7 @@ fn run_spin(
             // --spin's cloud clock is a pure function of the frame index —
             // bit-repeatable A/Bs, like the pose itself.
             sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::spin(scene.diag, idx),
+            fireflies: crate::fireflies::Fireflies::spin(scene, idx),
             tcache_cur,
             tcache_prev: &tprev_vec,
             accumulate: false,
@@ -7976,6 +8032,19 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         Ok(()) => true,
         Err(e) => {
             eprintln!("clouds self-test: FAIL — {e}");
+            false
+        }
+    };
+
+    // Fireflies: the structural off arms (disabled / day / zero count), bake
+    // determinism, the by-construction position bounds (in-box, above-ground,
+    // brightness band), the windowed-falloff exact zero + monotonicity + the
+    // f16-safe near-field peak, and the glow's depth test / energy
+    // conservation / radiance cap.
+    let fireflies_ok = match fireflies::self_test() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("fireflies self-test: FAIL — {e}");
             false
         }
     };
@@ -8301,6 +8370,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             tbuf: &tbuf,
             stats: &s,
             sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
             tcache_cur: None,
             tcache_prev: &[],
             accumulate: true,
@@ -8365,6 +8435,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 tbuf: &tbuf,
                 stats: &stats,
                 sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
                 tcache_cur: None,
                 tcache_prev: &[],
                 // The upscaler contract: every frame a fresh jittered frame.
@@ -8564,6 +8635,9 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                             &mut lsr,
                             None,
                             shade::VisCtl::Off,
+                            None,
+                            // Gather reference: fireflies excluded, like the
+                            // hemi leaf shades it gates against.
                             None,
                         ),
                     };
@@ -8940,6 +9014,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             tbuf: &tbuf,
             stats: &stats,
             sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
             tcache_cur: None,
             tcache_prev: &[],
             accumulate: true,
@@ -9012,6 +9087,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             tbuf: &tbuf,
             stats: &stats,
             sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
             tcache_cur: None,
             tcache_prev: &[],
             accumulate: true,
@@ -9127,6 +9203,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             tbuf: &tbuf,
             stats: &stats,
             sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
             tcache_cur: None,
             tcache_prev: &[],
             accumulate: true,
@@ -9208,6 +9285,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             tbuf: &tbuf,
             stats: &stats,
             sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
             tcache_cur: None,
             tcache_prev: &[],
             accumulate: true,
@@ -9256,6 +9334,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             tbuf: &tbuf,
             stats: &stats,
             sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
             tcache_cur: Some(&tcache),
             tcache_prev: &[],
             // Produced in lockstep with the claim cache: the T passes below
@@ -9367,6 +9446,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             tbuf: &tbuf,
             stats: &stats,
             sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
             tcache_cur: None,
             tcache_prev: prev,
             accumulate: true,
@@ -9433,6 +9513,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 tbuf: &tbuf_p,
                 stats: &stats,
                 sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
                 tcache_cur: Some(&tcache_p),
                 tcache_prev: &[],
                 accumulate: true,
@@ -9498,6 +9579,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 tbuf: &tbuf_r,
                 stats: &stats,
                 sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
                 tcache_cur: None,
                 tcache_prev: &[],
                 accumulate: true,
@@ -9549,6 +9631,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 tbuf: bufs.2,
                 stats: &stats,
                 sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
                 tcache_cur: None,
                 tcache_prev: if fresh { &warm_p[..] } else { &warm_p[..0] },
                 accumulate: true,
@@ -9623,6 +9706,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 tbuf: &tbuf_p,
                 stats: &stats,
                 sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
                 tcache_cur: None,
                 tcache_prev: if warm { &warm_p[..] } else { &warm_p[..0] },
                 accumulate: true,
@@ -9691,6 +9775,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 tbuf: &tbuf,
                 stats: &stats,
                 sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
                 tcache_cur: Some(&tc_b),
                 tcache_prev: &warm_a,
                 accumulate: true,
@@ -9775,6 +9860,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 tbuf: &tbuf,
                 stats: &stats,
                 sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
                 tcache_cur: Some(&chain_tc[0]),
                 tcache_prev: &[],
                 accumulate: true,
@@ -9818,6 +9904,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                     tbuf: &tbuf,
                     stats: &stats,
                     sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
                     tcache_cur: Some(&chain_tc[ci]),
                     tcache_prev: &prev_ring,
                     accumulate: true,
@@ -9892,6 +9979,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 tbuf: &tbuf,
                 stats: &stats,
                 sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
                 tcache_cur: None,
                 tcache_prev: &warm,
                 accumulate: true,
@@ -9968,6 +10056,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 tbuf: bufs.2,
                 stats: &stats,
                 sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
                 tcache_cur: None,
                 tcache_prev: &[],
                 accumulate: true,
@@ -10022,6 +10111,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 tbuf: &tbuf_a,
                 stats: &stats,
                 sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
                 tcache_cur: None,
                 tcache_prev: &[],
                 accumulate: true,
@@ -10060,6 +10150,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         ("sh", sh_ok),
         ("sky", sky_ok),
         ("clouds", clouds_ok),
+        ("fireflies", fireflies_ok),
         ("tod", tod_ok),
         ("bloom", bloom_ok),
         ("sphcell", sph_ok),
@@ -11359,6 +11450,7 @@ fn session(
                     &cam.basis(grw, grh),
                     base_q,
                     crate::clouds::Clouds::live(scene.diag, cloud_time as f32),
+                    crate::fireflies::Fireflies::live(scene, cloud_time as f32),
                 ) {
                     Ok(report) => eprintln!("{report}"),
                     Err(e) => eprintln!("gpu: verify failed to run: {e}"),
@@ -11398,6 +11490,7 @@ fn session(
                     spp,
                     probe_sample: 0,
                     clouds: crate::clouds::Clouds::live(scene.diag, cloud_time as f32),
+                    fireflies: crate::fireflies::Fireflies::live(scene, cloud_time as f32),
                 };
                 let presented = if gpu_up == GpuUp::Xess {
                     gpu.present_trace_xess(&p, hybrid, jit, gpu_reset, gpu_nppd_on)
@@ -11503,6 +11596,7 @@ fn session(
                     // Frozen mid-accumulation (the clock only advanced at
                     // frame 0 above) — the still frames integrate one sky.
                     clouds: crate::clouds::Clouds::live(scene.diag, cloud_time as f32),
+                    fireflies: crate::fireflies::Fireflies::live(scene, cloud_time as f32),
                 };
                 if frame < MAX_SAMPLES {
                     if let Err(e) = gpu.present_trace(&p, frame + 1, hybrid) {
@@ -12284,6 +12378,7 @@ fn session(
                     spp,
                     probe_sample: 0,
                     clouds: crate::clouds::Clouds::live(scene.diag, cloud_time as f32),
+                    fireflies: crate::fireflies::Fireflies::live(scene, cloud_time as f32),
                 };
                 let presented = if dxr_up == GpuUp::Xess {
                     gpu.present_dxr_xess(&p, jit, dxr_reset)
@@ -12372,6 +12467,7 @@ fn session(
                     probe_sample: 0,
                     // Frozen mid-accumulation (clock advanced at frame 0 only).
                     clouds: crate::clouds::Clouds::live(scene.diag, cloud_time as f32),
+                    fireflies: crate::fireflies::Fireflies::live(scene, cloud_time as f32),
                 };
                 if frame < MAX_SAMPLES {
                     match gpu.present_dxr(&p, frame + 1) {
@@ -12762,6 +12858,7 @@ fn session(
                 stats: &stats,
                 sun: render::sun_dir(scene),
                 clouds: crate::clouds::Clouds::live(scene.diag, cloud_time as f32),
+                    fireflies: crate::fireflies::Fireflies::live(scene, cloud_time as f32),
                 tcache_cur,
                 tcache_prev: &tprev_vec,
                 accumulate: cpu_accumulate,

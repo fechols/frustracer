@@ -1866,6 +1866,7 @@ impl GpuContext {
         cam: &crate::camera::CamBasis,
         q: crate::shade::Quality,
         clouds: crate::clouds::Clouds,
+        fireflies: crate::fireflies::Fireflies,
     ) -> Result<String> {
         let (tbuf, info, counters, px) = {
             let Some(tg) = &self.trace else {
@@ -1888,6 +1889,7 @@ impl GpuContext {
             // same-seed comparison holds whatever the sky is doing — and the
             // C verify then exercises the cloud code the session actually runs.
             clouds,
+            fireflies,
         };
         {
             // Field-split borrow: run_once needs d3d mutably, the recorder

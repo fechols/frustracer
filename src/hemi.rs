@@ -812,6 +812,9 @@ fn leaf_rays(
                     None,
                     shade::VisCtl::Off,
                     None,
+                    // Fireflies never light bounce surfaces (the gather
+                    // exclusion — the emissive precedent).
+                    None,
                 ),
             };
             acc.ray += l * weight;

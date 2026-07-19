@@ -77,8 +77,10 @@ void cs_hemi_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
             // (aniso false — hemi.rs pins Cone::aniso = 1.0): the cell
             // footprint is coarse by design, so resolving it anisotropically
             // would buy nothing.
+            // fireflies false — bounce surfaces take no firefly light (the
+            // CPU hemi tier's ff = None; the emissive precedent).
             float3 l = shade_split(pt.o, d, h, rng, 1u, 0u, false, false,
-                                   0.0, HEMI_CONE_SPREAD, false, w3, o3, n3, ps_unused);
+                                   0.0, HEMI_CONE_SPREAD, false, false, w3, o3, n3, ps_unused);
             hemi_add3(pt.pixel, l * weight);
         } else {
             // The DOME, not the full sky: a GI leaf ray landing in the sun disc

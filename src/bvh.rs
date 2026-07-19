@@ -1338,6 +1338,8 @@ pub fn height_self_test() -> Result<(), String> {
             diag: 1.0,
             eps: 1e-4,
             ao_radius: 0.03,
+            content_min: Vec3A::ZERO,
+            content_max: Vec3A::ZERO,
         };
         crate::scene::finalize_scalars(&mut sc);
         sc

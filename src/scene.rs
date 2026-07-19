@@ -135,6 +135,15 @@ pub struct Scene {
     /// Self-intersection offset for secondary rays.
     pub eps: f32,
     pub ao_radius: f32,
+    /// CONTENT bounds: the geometry EXCLUDING the standard ground quad (the
+    /// first `GROUND_VERTS` positions every loader pushes) — where the models
+    /// actually are. `diag` is ground-quad-dominated on the procedural/stress
+    /// scenes (a ±60 ground makes it ~17× the content scale), so anything
+    /// that should live AMONG the content (the fireflies' placement box)
+    /// anchors here instead. Falls back to the full AABB when the skip would
+    /// be degenerate. Derived (`finalize_scalars`), never serialized.
+    pub content_min: Vec3A,
+    pub content_max: Vec3A,
 }
 
 impl Scene {
@@ -355,6 +364,8 @@ impl SceneBuilder {
             diag: 0.0,
             eps: 0.0,
             ao_radius: 0.0,
+            content_min: Vec3A::ZERO,
+            content_max: Vec3A::ZERO,
         };
         finalize_scalars(&mut scene);
         scene
@@ -453,14 +464,31 @@ pub fn derive_heights(scene: &mut Scene) {
 pub fn finalize_scalars(scene: &mut Scene) {
     let mut mn = Vec3A::splat(f32::INFINITY);
     let mut mx = Vec3A::splat(f32::NEG_INFINITY);
-    for p in &scene.positions {
+    // The content AABB in the same pass: every loader pushes the standard
+    // ground quad FIRST (GROUND_VERTS), so positions[GROUND_VERTS..] is the
+    // content. Hand-built self-test scenes without that convention fall back
+    // to the full bounds below.
+    let mut cmn = Vec3A::splat(f32::INFINITY);
+    let mut cmx = Vec3A::splat(f32::NEG_INFINITY);
+    for (i, p) in scene.positions.iter().enumerate() {
         mn = mn.min(*p);
         mx = mx.max(*p);
+        if i >= GROUND_VERTS {
+            cmn = cmn.min(*p);
+            cmx = cmx.max(*p);
+        }
     }
     let diag = (mx - mn).length().max(1e-3);
     scene.diag = diag;
     scene.eps = 1e-4 * diag;
     scene.ao_radius = 0.03 * diag;
+    if cmn.x <= cmx.x && (cmx - cmn).length() > 1e-3 {
+        scene.content_min = cmn;
+        scene.content_max = cmx;
+    } else {
+        scene.content_min = mn;
+        scene.content_max = mx;
+    }
     scene.any_alpha = scene.textures.iter().any(|t| t.alpha_masked);
     scene.any_height =
         scene.materials.iter().any(|m| m.height_amp > 0.0 && m.normal_tex != NO_TEX);
@@ -860,6 +888,8 @@ pub fn tile_scene(base: Scene, nx: u32, nz: u32) -> (Scene, f32) {
         diag: 0.0,
         eps: 0.0,
         ao_radius: 0.0,
+        content_min: Vec3A::ZERO,
+        content_max: Vec3A::ZERO,
     };
     finalize_scalars(&mut scene);
     eprintln!(

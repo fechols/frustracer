@@ -453,6 +453,12 @@ pub fn shade(
     mut prim: Option<&mut PrimarySurface>,
     mut vis: VisCtl,
     hemi_share: Option<&crate::hemi::HemiShare>,
+    // Firefly point lights — Some ONLY on the primary camera path
+    // (render.rs::shade_traced). The reflection/glass recursion, the hemi
+    // bounce tier, and both GI reference estimators pass None: like emissive
+    // materials, fireflies do not light bounce surfaces (the one-sky gather
+    // exclusion — the stars rule).
+    ff: Option<&crate::fireflies::Fireflies>,
 ) -> Vec3A {
     // Capture/Apply only exist for the sampled shadow/AO paths; the
     // frustum-bounce tiers would silently bypass the record.
@@ -788,6 +794,67 @@ pub fn shade(
         direct_s *= tc;
         direct_t *= tc;
     }
+    // Firefly point lights — the direct tier's second entry, AFTER the cloud
+    // scaling (a firefly is a local light under the slab — the sun's cloud
+    // transmittance must not dim it) and BEFORE the prim capture (the light
+    // rides FSR-RR's denoised dd/ds lobes; the diffuse term is albedo-free
+    // radiance like the sun's `li`, so the composite identity closes
+    // untouched). ZERO rng draws — deterministic iteration, one HARD shadow
+    // ray per in-radius firefly (the translucency/sheen/cloud-shadow
+    // precedent: every same-seed / replay / VisCtl-burn contract holds with
+    // no burn-accounting changes; under VisCtl the firefly rays always trace
+    // their own). `w_l = 1` on the specular: a point light has zero solid
+    // angle, so the VNDF ray can never deliver it — MIS does not apply (the
+    // direction of the MIS rule that forbids down-weighting). A day session
+    // has `count == 0` and never enters the loop — bit-identity structurally.
+    if let Some(ff) = ff {
+        let r_inf = crate::fireflies::FF_RADIUS_K * ff.scale;
+        let r2 = r_inf * r_inf;
+        for i in 0..ff.count as usize {
+            let to = Vec3A::from_slice(&ff.pos[i]) - p;
+            let d2 = to.length_squared();
+            // The rejection test — the only cost a far firefly ever charges.
+            if d2 >= r2 {
+                continue;
+            }
+            let dist = d2.sqrt();
+            let wi = to / dist;
+            let ndl = n_s.dot(wi);
+            if ndl <= 0.0 {
+                continue;
+            }
+            let e = crate::fireflies::irradiance(ff, i, d2);
+            if e <= 0.0 {
+                continue;
+            }
+            // One hard shadow ray with FINITE tmax — stop 2·eps short of the
+            // light point so a firefly hovering eps off a leaf never
+            // self-occludes on the far end. Plain `occluded`: no cut exists
+            // for this apex (the translucency-ray rule).
+            ls.secondary_rays += 1;
+            if bvh.occluded(
+                scene,
+                &Ray::new(p, wi),
+                0.0,
+                (dist - 2.0 * scene.eps).max(0.0),
+                &mut ls.ray_nodes,
+            ) {
+                continue;
+            }
+            let li = crate::fireflies::FF_COLOR * (e * ndl);
+            direct_d += li;
+            let h = (wi + v).normalize_or_zero();
+            let hl = to_local(h);
+            if hl.z > 0.0 {
+                let dg = ggx_ndf(hl, ax, ay);
+                let g2 = 1.0 / (1.0 + lambda_v + ggx_lambda(to_local(wi), ax, ay));
+                let f = schlick(f0, wi.dot(h).max(0.0));
+                // li carries ndl; D·G2·F/(4·nv·nl)·nl leaves /(4·nv) — the
+                // sun loop's exact term shape, at full weight.
+                direct_s += li * f * (std::f32::consts::PI * dg * g2 / (4.0 * vl.z * ndl));
+            }
+        }
+    }
     if let Some(prim) = prim.as_deref_mut() {
         prim.direct_d = direct_d;
         prim.direct_s = direct_s;
@@ -965,7 +1032,7 @@ pub fn shade(
                     // The child cone starts at this hit's width — reflected
                     // hits read footprints grown by the full path length.
                     let rcone = Cone { w0: cone_w, spread: cone.spread, aniso: cone.aniso };
-                    shade(scene, bvh, &rray, &rh, None, &rq, rng, sun, cl, rcone, depth + 1, ls, None, VisCtl::Off, None)
+                    shade(scene, bvh, &rray, &rh, None, &rq, rng, sun, cl, rcone, depth + 1, ls, None, VisCtl::Off, None, None)
                 }
                 None => {
                     if let Some(prim) = prim.as_deref_mut() {
@@ -1091,7 +1158,7 @@ pub fn shade(
                 match bvh.intersect(scene, &tray, 0.0, f32::INFINITY, &mut ls.ray_nodes) {
                     Some(th) => shade(
                         scene, bvh, &tray, &th, None, &rq, rng, sun, cl, tcone, depth + 1, ls,
-                        None, VisCtl::Off, None,
+                        None, VisCtl::Off, None, None,
                     ),
                     // The FULL sky, disc included and un-weighted: refraction is
                     // a near-delta path with no light-sampling partner, so this
@@ -1225,6 +1292,8 @@ pub fn tangent_self_test() -> Result<(), String> {
             diag: 1.0,
             eps: 1e-4,
             ao_radius: 0.03,
+            content_min: Vec3A::ZERO,
+            content_max: Vec3A::ZERO,
         };
         crate::scene::finalize_scalars(&mut sc);
         sc

@@ -220,6 +220,11 @@ void cs_sky(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
         // sample 0's stratum, mirroring render.rs::fill_sky_rows verbatim.
         float cj = cloud_dither_k(uint2(x, y), frame, 0u, spp);
         float3 c = sky_radiance(cam_origin.xyz, dir, pixel_cone * 0.5, frame, cj);
+        // Firefly glow against a proven-empty tile — still zero rays (t_max
+        // ∞, nothing occludes a sky direction). render.rs::fill_sky_rows,
+        // term for term; the flag guard keeps day frames bit-identical.
+        if (flags & FLAG_FIREFLIES)
+            c += ff_glow(cam_origin.xyz, dir, INF, pixel_cone * 0.5);
         // Under CLOUDS the sky has sub-pixel structure (a cover-ramp edge
         // crosses a pixel), so a multi-sampled frame averages spp sample
         // positions — render.rs::fill_sky_rows, term for term (sample 0 stays
@@ -237,6 +242,10 @@ void cs_sky(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
                 float3 ds = ray_dir(float(x) + 0.5 + o.x, float(y) + 0.5 + o.y);
                 c += sky_radiance(cam_origin.xyz, ds, pixel_cone * 0.5, frame,
                                   cloud_dither_k(uint2(x, y), frame, s, spp));
+                // Each extra sample carries its own glow along its own
+                // direction, exactly like a leaf pixel's sample loop.
+                if (flags & FLAG_FIREFLIES)
+                    c += ff_glow(cam_origin.xyz, ds, INF, pixel_cone * 0.5);
             }
             c *= 1.0 / float(spp);
         }
