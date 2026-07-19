@@ -34,7 +34,9 @@ void cs_reference(uint3 id : SV_DispatchThreadID) {
             if (prim) gbuf_write_hit(pi, sp.x, sp.y, dir, hit.t, ps);
         } else {
             // A DISPLAY path: the camera's own miss sees the sun DISC (sky.rs).
-            c = sky_radiance(dir, pixel_cone * 0.5);
+            // Cloud phase per (pixel, frame, SAMPLE) — the leaf kernel's twin.
+            c = sky_radiance(cam_origin.xyz, dir, pixel_cone * 0.5, frame,
+                             cloud_dither_k(id.xy, frame, s, spp));
             t = INF;
             if (prim) gbuf_write_sky(pi, sp.x, sp.y, dir);
         }

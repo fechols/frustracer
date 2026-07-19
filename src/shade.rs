@@ -446,6 +446,7 @@ pub fn shade(
     q: &Quality,
     rng: &mut fastrand::Rng,
     sun: Vec3A,
+    cl: &crate::clouds::Clouds,
     cone: Cone,
     depth: u32,
     ls: &mut LocalStats,
@@ -773,6 +774,20 @@ pub fn shade(
         direct_s /= n_shadow as f32;
         direct_t /= n_shadow as f32;
     }
+    // Cloud shadow: ONE transmittance toward the sun per shade() call (2
+    // density evals, zero rng), scaling the WHOLE direct sun contribution —
+    // diffuse, specular, and the translucent back term are the same light
+    // through the same cloud. Applied BEFORE the prim capture below so FSR's
+    // dd/ds signals carry it (the composite identity closes untouched), and
+    // before every consumer of direct_* further down. An unshadowed path
+    // returns an exact 1.0 and `x * 1.0` is bit-preserving, so a clear-sun
+    // pixel — and every `--no-clouds` pixel via the guard — is untouched.
+    if cl.enabled {
+        let tc = crate::clouds::sun_transmittance(p, scene.sun.dir, cl);
+        direct_d *= tc;
+        direct_s *= tc;
+        direct_t *= tc;
+    }
     if let Some(prim) = prim.as_deref_mut() {
         prim.direct_d = direct_d;
         prim.direct_s = direct_s;
@@ -801,7 +816,7 @@ pub fn shade(
     let ambient = if q.fb.gi {
         let (t1, t2) = onb(n);
         let accel = crate::ftree::Accel::of(bvh);
-        crate::hemi::gi(scene, accel, p, n, t1, t2, q.fb.depth, sun, depth, hemi_share, rng, None, ls)
+        crate::hemi::gi(scene, accel, p, n, t1, t2, q.fb.depth, sun, cl, depth, hemi_share, rng, None, ls)
     } else {
         let mut ao = 1.0;
         if q.fb.ao {
@@ -950,7 +965,7 @@ pub fn shade(
                     // The child cone starts at this hit's width — reflected
                     // hits read footprints grown by the full path length.
                     let rcone = Cone { w0: cone_w, spread: cone.spread, aniso: cone.aniso };
-                    shade(scene, bvh, &rray, &rh, None, &rq, rng, sun, rcone, depth + 1, ls, None, VisCtl::Off, None)
+                    shade(scene, bvh, &rray, &rh, None, &rq, rng, sun, cl, rcone, depth + 1, ls, None, VisCtl::Off, None)
                 }
                 None => {
                     if let Some(prim) = prim.as_deref_mut() {
@@ -968,8 +983,43 @@ pub fn shade(
                         / (4.0 * (1.0 + lambda_v) * vl.z.max(1e-6));
                     let w_b =
                         crate::sky::mis_weight(p_b, crate::sky::light_pdf(&scene.sun));
-                    crate::sky::dome(rdir, sun)
-                        + crate::sky::disc(rdir, &scene.sun, cone.spread * 0.5) * w_b
+                    // Stars ride un-weighted: they are BSDF-only delivery
+                    // (never light-sampled), so there is no partner strategy
+                    // to partition with. Twinkle phase 0 — secondary paths
+                    // render the fixed-phase field (shade has no frame index,
+                    // and a static starfield in a reflection is invisible).
+                    //
+                    // The cloud layer extinguishes this whole backdrop along
+                    // the REFLECTED ray from the hit point (mirrored skies
+                    // show the same clouds), including the MIS-weighted disc:
+                    // the BSDF strategy's sun rides the march's T while the
+                    // light strategy's rides `sun_transmittance` — two
+                    // transmittances of the same field along near-identical
+                    // directions, a bracketed partition, never a double count
+                    // (see clouds.rs's header; do NOT force one T on both).
+                    {
+                        let dm = crate::sky::dome(rdir, sun, scene.sky_scale);
+                        let backdrop = dm
+                            + crate::sky::disc(rdir, &scene.sun, cone.spread * 0.5) * w_b
+                            + crate::sky::stars(rdir, cone.spread * 0.5, scene.night, 0);
+                        if cl.enabled {
+                            // The ROUGH march: a reflected sky is seen
+                            // through the GGX lobe — 2 steps on the 2-octave
+                            // field (clouds::along_rough's cost rationale).
+                            match crate::clouds::along_rough(
+                                p,
+                                rdir,
+                                &scene.sun,
+                                dm * crate::clouds::CLOUD_AMB_K,
+                                cl,
+                            ) {
+                                None => backdrop,
+                                Some(cs) => backdrop * cs.t + cs.scatter,
+                            }
+                        } else {
+                            backdrop
+                        }
+                    }
                 }
             };
             let refl = tput * rcol;
@@ -1040,14 +1090,29 @@ pub fn shade(
             let tcol =
                 match bvh.intersect(scene, &tray, 0.0, f32::INFINITY, &mut ls.ray_nodes) {
                     Some(th) => shade(
-                        scene, bvh, &tray, &th, None, &rq, rng, sun, tcone, depth + 1, ls,
+                        scene, bvh, &tray, &th, None, &rq, rng, sun, cl, tcone, depth + 1, ls,
                         None, VisCtl::Off, None,
                     ),
                     // The FULL sky, disc included and un-weighted: refraction is
                     // a near-delta path with no light-sampling partner, so this
                     // is the only strategy that can deliver the sun through
-                    // glass. Nothing to double-count.
-                    None => crate::sky::radiance(tdir, &scene.sun, cone.spread * 0.5),
+                    // glass. Nothing to double-count. Clouds ride along like
+                    // any other display path (radiance marches from torig).
+                    None => crate::sky::radiance(
+                        torig,
+                        tdir,
+                        &scene.sun,
+                        cone.spread * 0.5,
+                        scene.sky_scale,
+                        scene.night,
+                        0,
+                        cl,
+                        // No pixel in scope — the fixed-midpoint legacy
+                        // phase (the GPU glass miss passes the same 0.5;
+                        // the per-(pixel, frame, sample) temporal dither
+                        // deliberately excludes this path).
+                        0.5,
+                    ),
                 };
             // Tinted by albedo — the classifier lifts dark MTL glass Kd
             // toward white so this doesn't go black.
@@ -1148,6 +1213,8 @@ pub fn tangent_self_test() -> Result<(), String> {
             any_alpha: false,
             sun: crate::sky::Sun::new(Vec3A::Y),
             sky_sh: crate::sh::Sh9::ZERO,
+            sky_scale: 1.0,
+            night: 0.0,
             diag: 1.0,
             eps: 1e-4,
             ao_radius: 0.03,

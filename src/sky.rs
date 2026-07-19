@@ -30,6 +30,16 @@
 //! Break the last row and you get (a) a double count of light the direct loop
 //! already added with its own shadow ray, and (b) a ~1e3-magnitude firefly into
 //! `hemi`'s 2^18 fixed-point accumulator, which would saturate outright.
+//!
+//! **The cloud layer (src/clouds.rs, default-on, `--no-clouds`) extends the
+//! table without changing it**: every `radiance()` row sees the backdrop
+//! through the layer's transmittance along its own ray plus the layer's
+//! scatter; the direct loop's sun (both strategies' partner) is attenuated by
+//! `clouds::sun_transmittance` once per `shade()`; and the `dome()` row stays
+//! CLOUD-FREE — a drifting occluder cannot live in a load-time SH projection,
+//! and the gather paths must keep integrating exactly the function the SH and
+//! the GI references were built from. The known-accepts live in clouds.rs's
+//! header.
 
 use glam::Vec3A;
 
@@ -45,6 +55,24 @@ pub const SUN_ANGULAR_RADIUS: f32 = 2.0 * std::f32::consts::PI / 180.0;
 /// the direct term at the scene origin is unchanged by construction, so every
 /// existing scene, gate, and screenshot keeps its exposure.
 pub const SUN_E_OVER_PI: Vec3A = Vec3A::new(0.9868, 0.9375, 0.8388);
+
+/// The moon's angular RADIUS — like the sun's, deliberately wider than the real
+/// 0.26° so the disc reads at interactive resolutions and its radiance stays
+/// far under the f16 upscaler wires (radiance is derived as e/Ω, so a narrower
+/// moon is a brighter disc).
+pub const MOON_ANGULAR_RADIUS: f32 = 0.5 * std::f32::consts::PI / 180.0;
+
+/// Moonlight irradiance / π — ARTISTIC, not physical. A real full moon is
+/// ~2e-6 of the sun (invisible at any exposure this renderer presents); ~1% of
+/// the sun with a blue-shifted tint is the filmic "moonlight" convention and
+/// makes moonlit shadows readable. The one moonlight brightness knob, the
+/// `DOME_SCALE` pattern.
+pub const MOON_E_OVER_PI: Vec3A = Vec3A::new(0.0085, 0.0095, 0.0115);
+
+/// The night dome's floor, as a fraction of the day dome — the moonlit sky is
+/// the same Rayleigh dome (around the moon), this much dimmer. Applied through
+/// `scene.sky_scale`; only `scene::apply_tod` ever consumes it.
+pub const MOON_DOME_FRAC: f32 = 0.01;
 
 /// THE dome brightness knob — the single number that sets both the sky you look
 /// at and the ambient it casts. Tuned so the SH irradiance lands at ~0.17
@@ -130,6 +158,81 @@ impl Sun {
         let (t1, t2) = crate::shade::onb(self.dir);
         t1 * (phi.cos() * sin_t) + t2 * (phi.sin() * sin_t) + self.dir * cos_t
     }
+
+    /// `Sun::new`, with `e_over_pi` AND `radiance` scaled by the same
+    /// per-channel fade (`sun_fade`) — radiance stays derived from e_over_pi,
+    /// so CPU and GPU keep one source. `Sun::new` itself is untouched: this is
+    /// only ever reached through `scene::apply_tod`, never on the default path
+    /// (an untouched session's Sun must stay bit-identical).
+    pub fn with_fade(dir: Vec3A, fade: Vec3A) -> Sun {
+        let s = Sun::new(dir);
+        Sun { e_over_pi: s.e_over_pi * fade, radiance: s.radiance * fade, ..s }
+    }
+}
+
+/// Hermite smoothstep of `y` over `[lo, hi]` — exactly 0 at/below `lo`,
+/// exactly 1 at/above `hi`. The exact endpoints are load-bearing: they are
+/// what lets `sun_fade` reach a true zero (the moon handoff) and a true one
+/// (daytime bit-identity).
+fn rise(y: f32, lo: f32, hi: f32) -> f32 {
+    let t = ((y - lo) / (hi - lo)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// The dome's hoisted sun-path transmittance at elevation `y` — the SAME
+/// expression `dome()` always computed inline (`exp(-(β_R+β_M)·m)`, air mass
+/// `m = 1/(y.max(0)+0.15)`), factored so the cloud layer (`clouds::along`'s
+/// sunlight tint) and the dome can never disagree about how the low sun
+/// reddens. Bit-identical to the old inline form.
+#[inline(always)]
+pub(crate) fn t_sun_path(y: f32) -> Vec3A {
+    let bt = BETA_R + BETA_M;
+    let m_sun = 1.0 / (y.max(0.0) + 0.15);
+    (-(bt * m_sun)).exp()
+}
+
+/// Per-channel direct-sun irradiance fade for a sun at elevation `y`, relative
+/// to the reference elevation `y_ref` (the default sun's — so an untouched
+/// scene is exactly factor 1, though the real guard is that nothing calls this
+/// on the default path).
+///
+/// Two factors:
+/// - The dome's own sun-path transmittance, `exp(-(β_R+β_M)·m)` at the SAME
+///   air-mass model `dome()` uses (`m = 1/(y.max(0)+0.15)`), as a RATIO
+///   against `y_ref` and clamped ≤ 1 per channel. This is what dims AND
+///   reddens the low sun — blue extinguishes first (β_R is blue-heavy), the
+///   same physics that reddens the dome. It bottoms out around
+///   (0.72, 0.52, 0.23) at the horizon: a sunset tint, deliberately not night.
+/// - A horizon smoothstep over y ∈ [-0.05, 0] carrying the fade to a true
+///   zero once the disc has fully set (sin 2° ≈ 0.035, so -0.05 is just past
+///   the lower limb). For y ≥ 0 it is exactly 1 and perturbs nothing.
+pub fn sun_fade(y: f32, y_ref: f32) -> Vec3A {
+    let bt = BETA_R + BETA_M;
+    let dm = 1.0 / (y.max(0.0) + 0.15) - 1.0 / (y_ref + 0.15);
+    let t = (-(bt * dm)).exp().min(Vec3A::ONE);
+    t * rise(y, -0.05, 0.0)
+}
+
+/// The full moon as the one light at infinity — a `Sun` with the moon's cone
+/// and radiometrics, so the direct loop, MIS, cone sampling, the disc render,
+/// and the dome's `t_sun` tint all consume it unchanged. `scene::apply_tod`
+/// installs it (antipodal to the sun's arc position — a full moon IS opposite
+/// the sun, so it is above the horizon exactly when the sun is not) once the
+/// sun's fade reaches zero.
+///
+/// Its own rise ramp over y ∈ [0, 0.10] softens the handoff: at the swap the
+/// moon sits ~0.05 above the horizon, mid-ramp and near-zero intensity, so
+/// the switch of active light is invisible.
+pub fn moon(dir: Vec3A) -> Sun {
+    let cos_radius = MOON_ANGULAR_RADIUS.cos();
+    let omega = std::f32::consts::TAU * (1.0 - cos_radius);
+    let e = MOON_E_OVER_PI * rise(dir.y, 0.0, 0.10);
+    Sun {
+        dir: dir.normalize_or_zero(),
+        cos_radius,
+        e_over_pi: e,
+        radiance: e * (std::f32::consts::PI / omega),
+    }
 }
 
 /// The smooth scattering dome — NO sun disc. Single-scattering Rayleigh + Mie.
@@ -138,7 +241,14 @@ impl Sun {
 /// SH projection) and what `radiance()` adds the disc to. Defined over the FULL
 /// sphere: below the horizon it is the ground bouncing the dome back, blended
 /// smoothly so order-2 SH doesn't ring on a step.
-pub fn dome(d: Vec3A, sun: Vec3A) -> Vec3A {
+///
+/// `scale` is the time-of-day brightness (`Scene::sky_scale`): exactly 1.0 in
+/// every untouched session (`x * 1.0` is bit-preserving, so daytime output is
+/// unchanged), falling through dusk to the `MOON_DOME_FRAC` moonlight floor.
+/// At night `sun` is the MOON (see `moon()`), so the same Rayleigh model
+/// renders the moonlit sky — a dim blue day sky around the moon, which is what
+/// a real moonlit sky is.
+pub fn dome(d: Vec3A, sun: Vec3A, scale: f32) -> Vec3A {
     // The sun's own path down to the scattering volume depends ONLY on its
     // elevation, so its transmittance is the same for every direction in the
     // frame — hoisted out of `scatter`, which would otherwise recompute this
@@ -148,8 +258,7 @@ pub fn dome(d: Vec3A, sun: Vec3A) -> Vec3A {
     let bt = BETA_R + BETA_M;
     // ...and it is what reddens the sky when the sun is low: the blue is
     // scattered out of the sunlight before it ever reaches the air we look at.
-    let m_sun = 1.0 / (sun.y.max(0.0) + 0.15);
-    let t_sun = (-(bt * m_sun)).exp();
+    let t_sun = t_sun_path(sun.y);
 
     // The in-scatter is kept LINEAR in β, and extinction is applied as separate
     // view/sun transmittances. This matters: an earlier version divided the
@@ -188,15 +297,15 @@ pub fn dome(d: Vec3A, sun: Vec3A) -> Vec3A {
     // each a full `scatter`, and the discarded one was pure waste.
     let t = ((d.y + 0.05) / 0.10).clamp(0.0, 1.0);
     if t >= 1.0 {
-        return scatter(d, d.dot(sun).clamp(-1.0, 1.0));
+        return scatter(d, d.dot(sun).clamp(-1.0, 1.0)) * scale;
     }
     let dm = Vec3A::new(d.x, d.y.abs(), d.z);
     let ground = scatter(dm, dm.dot(sun).clamp(-1.0, 1.0)) * GROUND_ALBEDO;
     if t <= 0.0 {
-        return ground;
+        return ground * scale;
     }
     let sky = scatter(d, d.dot(sun).clamp(-1.0, 1.0));
-    ground.lerp(sky, t)
+    ground.lerp(sky, t) * scale
 }
 
 /// The sun disc, ANTIALIASED against the ray's angular footprint.
@@ -233,15 +342,160 @@ pub fn disc(d: Vec3A, sun: &Sun, half_angle: f32) -> Vec3A {
     sun.radiance * cov
 }
 
-/// What an escaping ray SEES: dome + disc. For *display* paths only — see the
-/// module's central invariant. Gather paths must call `dome()`.
-///
-/// `half_angle` is the ray's angular footprint (primary: `pixel_cone/2`;
-/// reflection/glass continuations: their cone's spread/2), used only to
-/// antialias the disc's limb.
+/// A star's nominal angular radius — used as the floor of the splat width, so
+/// stars stay sub-footprint points at every real resolution.
+const STAR_ANGULAR_RADIUS: f32 = 0.03 * std::f32::consts::PI / 180.0;
+/// Irradiance of a tier-1.0 star. Authored as IRRADIANCE, not radiance: the
+/// splat divides by its own solid angle, so a star delivers the same energy to
+/// a pixel whatever the footprint — no dimming/blooming with resolution.
+const STAR_E: f32 = 2.0e-6;
+/// Star cells per cube-face side (6·64² cells, ~40% occupied ⇒ ~10k stars).
+const STAR_CELLS: u32 = 64;
+/// Radiance ceiling per star — far under f16 max, so the upscaler wires and
+/// the RGBA16F sky can never be spiked by a tiny footprint.
+const STAR_L_MAX: f32 = 4096.0;
+
+/// The exact integer mix trace_common.hlsli's `pcg_mix` computes — the star
+/// field is a pure function of this hash, so mirroring it is what makes the
+/// CPU and HLSL fields the SAME sky. Change both together.
 #[inline(always)]
-pub fn radiance(d: Vec3A, sun: &Sun, half_angle: f32) -> Vec3A {
-    dome(d, sun.dir) + disc(d, sun, half_angle)
+pub(crate) fn pcg_mix(s: u32) -> u32 {
+    let s = s.wrapping_mul(747796405).wrapping_add(2891336453);
+    let w = ((s >> ((s >> 28) + 4)) ^ s).wrapping_mul(277803737);
+    (w >> 22) ^ w
+}
+#[inline(always)]
+pub(crate) fn hash01(h: u32) -> f32 {
+    (h >> 8) as f32 * (1.0 / 16777216.0)
+}
+
+/// Procedural twinkling stars — DISPLAY paths only, like the disc (never
+/// `dome()`/gather: a point field would alias catastrophically in the SH
+/// projection and hemi cells, and its energy is negligible). Deterministic,
+/// ZERO rng draws; `twinkle` is a frame index (`ctx.frame` on the primary
+/// miss; secondary paths pass 0 and render the fixed-phase field), so every
+/// same-seed/replay contract is untouched.
+///
+/// `night` (`Scene::night`) gates the whole field: exactly 0.0 in an untouched
+/// session, and the guard is a BRANCH, so the day sky is bit-identical by
+/// construction, not by arithmetic.
+///
+/// Geometry: the direction's dominant-axis cube face is split into
+/// `STAR_CELLS`² hash cells; an occupied cell holds one star, inset to the
+/// cell's inner 80% so a single-cell lookup needs no neighbor scan. The star
+/// renders as a Gaussian splat of width `max(half_angle/2, star radius)` —
+/// energy-conserving in the footprint (the `disc()` AA argument taken to the
+/// point limit), so stars neither crawl at 1 spp nor change brightness with
+/// render resolution.
+pub fn stars(d: Vec3A, half_angle: f32, night: f32, twinkle: u32) -> Vec3A {
+    if night <= 0.0 || d.y <= 0.0 {
+        return Vec3A::ZERO;
+    }
+    // Dominant-axis cube face: 0..5, plus the two in-face coordinates in
+    // [-1, 1] BEFORE the perspective divide. Orientation per face is arbitrary
+    // (it only feeds a hash) but must match the HLSL twin exactly.
+    let ad = d.abs();
+    let (face, b1, b2, ma) = if ad.x >= ad.y && ad.x >= ad.z {
+        (if d.x > 0.0 { 0u32 } else { 1 }, d.y, d.z, ad.x)
+    } else if ad.y >= ad.z {
+        (if d.y > 0.0 { 2 } else { 3 }, d.x, d.z, ad.y)
+    } else {
+        (if d.z > 0.0 { 4 } else { 5 }, d.x, d.y, ad.z)
+    };
+    let u = (b1 / ma) * 0.5 + 0.5;
+    let v = (b2 / ma) * 0.5 + 0.5;
+    let n = STAR_CELLS;
+    let cx = ((u * n as f32) as u32).min(n - 1);
+    let cy = ((v * n as f32) as u32).min(n - 1);
+
+    let seed = face * n * n + cy * n + cx;
+    let h0 = pcg_mix(seed);
+    // ~40% of cells hold a star.
+    if h0 & 0xff >= 102 {
+        return Vec3A::ZERO;
+    }
+    let h1 = pcg_mix(h0);
+    let h2 = pcg_mix(h1);
+    let h3 = pcg_mix(h2);
+
+    // The star's own direction: inset sub-position in the cell, mapped back
+    // through the same face parameterization and normalized.
+    let su = (cx as f32 + 0.1 + 0.8 * hash01(h1)) / n as f32 * 2.0 - 1.0;
+    let sv = (cy as f32 + 0.1 + 0.8 * hash01(h2)) / n as f32 * 2.0 - 1.0;
+    let sdir = match face {
+        0 => Vec3A::new(1.0, su, sv),
+        1 => Vec3A::new(-1.0, su, sv),
+        2 => Vec3A::new(su, 1.0, sv),
+        3 => Vec3A::new(su, -1.0, sv),
+        4 => Vec3A::new(su, sv, 1.0),
+        _ => Vec3A::new(su, sv, -1.0),
+    }
+    .normalize();
+
+    // Gaussian splat over angle. theta² = 2(1-cosθ) to second order — exact
+    // enough at star scales and cheaper/robuster than acos.
+    let sigma = (half_angle * 0.5).max(STAR_ANGULAR_RADIUS);
+    let theta2 = (2.0 * (1.0 - d.dot(sdir))).max(0.0);
+    let g = (-theta2 / (2.0 * sigma * sigma)).exp();
+    if g < 1e-4 {
+        return Vec3A::ZERO;
+    }
+
+    // Brightness tier (0.25x..2x), a warm/cool tint, and the twinkle — a
+    // deterministic re-hash of the star id with the frame's 8-frame bucket
+    // (~7 Hz at 60 fps), swinging ±25% about the mean.
+    let tier = 0.25 * (1u32 << (h3 & 3)) as f32;
+    let warm = hash01(pcg_mix(h3));
+    let tint = Vec3A::new(0.75, 0.85, 1.0).lerp(Vec3A::new(1.0, 0.85, 0.7), warm);
+    let tw = 0.75 + 0.25 * hash01(pcg_mix(seed ^ pcg_mix(twinkle >> 3)));
+
+    let l = (STAR_E * tier / (std::f32::consts::TAU * sigma * sigma)).min(STAR_L_MAX);
+    tint * (l * g * tw * night * rise(d.y, 0.0, 0.05))
+}
+
+/// What an escaping ray SEES: the infinity backdrop (dome + disc + stars)
+/// through the cloud layer, plus the layer's own scatter. For *display* paths
+/// only — see the module's central invariant. Gather paths must call `dome()`.
+///
+/// `o` is the ray's ORIGIN — the cloud slab is finite-altitude geometry, so
+/// unlike everything else at infinity the ray's start matters (parallax is
+/// what makes clouds drift *overhead* rather than painted on). `half_angle`
+/// is the ray's angular footprint (primary: `pixel_cone/2`;
+/// reflection/glass continuations: their cone's spread/2), used to antialias
+/// the disc's limb and to size the star splats. `scale`/`night` are the
+/// scene's time-of-day state (`Scene::sky_scale`/`Scene::night` — 1.0/0.0
+/// untouched); `twinkle` is the frame index on primary misses, 0 on secondary
+/// paths.
+///
+/// The cloud rule (the disc-once table's extension): the WHOLE backdrop —
+/// disc and stars included — is extinguished by the layer's transmittance
+/// along this ray; the guarded arms (`--no-clouds`, and any ray whose march
+/// meets no cloud) return the backdrop bit-identically.
+/// `j` is the cloud march's phase dither (`clouds::dither_jk(x, y, frame, k,
+/// spp)` where the caller has a pixel — per (pixel, frame, sample), so spp
+/// and accumulation average the march; 0.5 — the fixed-midpoint legacy phase
+/// — on pixel-less paths like the glass miss). Pure function, zero rng draws.
+#[inline]
+pub fn radiance(
+    o: Vec3A,
+    d: Vec3A,
+    sun: &Sun,
+    half_angle: f32,
+    scale: f32,
+    night: f32,
+    twinkle: u32,
+    cl: &crate::clouds::Clouds,
+    j: f32,
+) -> Vec3A {
+    let dm = dome(d, sun.dir, scale);
+    let backdrop = dm + disc(d, sun, half_angle) + stars(d, half_angle, night, twinkle);
+    if !cl.enabled {
+        return backdrop;
+    }
+    match crate::clouds::along(o, d, sun, dm * crate::clouds::CLOUD_AMB_K, cl, j) {
+        None => backdrop,
+        Some(cs) => backdrop * cs.t + cs.scatter,
+    }
 }
 
 /// Balance-heuristic MIS weight for the BSDF-sampling strategy against light
@@ -379,7 +633,7 @@ pub fn self_test() -> Result<(), String> {
     // must be true is that the aureole and the DISC are orders of magnitude
     // apart — a leak would put the disc's full radiance into the dome, which is
     // ~100x over this bound rather than a hair over it.
-    let at_sun = dome(sun.dir, sun.dir).max_element();
+    let at_sun = dome(sun.dir, sun.dir, 1.0).max_element();
     let leak_limit = sun.radiance.max_element() * 0.01;
     if at_sun > leak_limit {
         return Err(format!(
@@ -389,7 +643,10 @@ pub fn self_test() -> Result<(), String> {
         ));
     }
     // ...and the disc really is there for the paths that SHOULD see it.
-    if radiance(sun.dir, &sun, 0.0).max_element() < sun.radiance.max_element() {
+    if radiance(Vec3A::ZERO, sun.dir, &sun, 0.0, 1.0, 0.0, 0, &crate::clouds::Clouds::off(), 0.5)
+        .max_element()
+        < sun.radiance.max_element()
+    {
         return Err("radiance() at the sun's direction has no disc".into());
     }
 
@@ -400,7 +657,7 @@ pub fn self_test() -> Result<(), String> {
         let z = 1.0 - 2.0 * (i as f32 + 0.5) / 2000.0;
         let r = (1.0 - z * z).max(0.0).sqrt();
         let d = Vec3A::new(r * a.cos(), z, r * a.sin());
-        let v = dome(d, sun.dir);
+        let v = dome(d, sun.dir, 1.0);
         if !v.is_finite() || v.min_element() < 0.0 {
             return Err(format!("dome({d:?}) = {v:?} — must be finite and non-negative"));
         }
@@ -411,7 +668,7 @@ pub fn self_test() -> Result<(), String> {
     // AMBIENT constant sat at 0.168 luminance, which is inside that band. This
     // is what pins DOME_SCALE — if someone retunes the dome for looks and the
     // ambient drifts out of band, the scene's exposure has silently moved.
-    let sh = crate::sh::Sh9::project(|d| dome(d, sun.dir));
+    let sh = crate::sh::Sh9::project(|d| dome(d, sun.dir, 1.0));
     let e_up = sh.irradiance(Vec3A::Y);
     let lum = e_up.dot(Vec3A::new(0.2126, 0.7152, 0.0722));
     if !(0.10..=0.30).contains(&lum) {

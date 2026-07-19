@@ -198,6 +198,7 @@ pub fn share_capture(
     delta: f32,
     eta: f32,
     sun: Option<Vec3A>,
+    cl: &crate::clouds::Clouds,
     rec: &mut HemiShare,
     ls: &mut LocalStats,
 ) {
@@ -214,7 +215,10 @@ pub fn share_capture(
         n,
         max_depth,
         t_limit: if t_limit.is_finite() { t_limit + delta } else { t_limit },
-        gi: sun.map(|s| Gi { sun: s, depth: 0 }),
+        // The capture itself never shades (empty-cell folding is dome-only —
+        // pure functions of n/sun, bit-identical per member), but the state
+        // rides along so the record can never diverge from its consumers'.
+        gi: sun.map(|s| Gi { sun: s, depth: 0, cl: *cl }),
     };
     let root = TileFrustum::half_space_padded(o, n, eta);
     ls.hemi_queries += 1;
@@ -283,7 +287,8 @@ fn capture_cell(
         match cx.gi {
             None => rec.open_mass.x += sphcell::psa(a, b, c, cx.n),
             Some(g) => {
-                rec.open_mass += sky_cell(cx.n, g.sun, a, b, c, 5u32.saturating_sub(depth))
+                rec.open_mass +=
+                    sky_cell(cx.n, g.sun, cx.scene.sky_scale, a, b, c, 5u32.saturating_sub(depth))
             }
         }
         rec.open_psa += sphcell::psa(a, b, c, cx.n);
@@ -407,6 +412,11 @@ struct Gi {
     sun: Vec3A,
     /// Shade depth of the point being integrated (bounce rays shade at +1).
     depth: u32,
+    /// Cloud state for the leaf-hit BOUNCE shade only — its direct sun term
+    /// is cloud-shadowed like any other `shade()` (T ≤ 1, so the 2^18
+    /// fixed-point accumulator only gets QUIETER). The gather geometry —
+    /// `sky_cell`, `dome()` leaf misses — never sees clouds (sky.rs's table).
+    cl: crate::clouds::Clouds,
 }
 
 struct Cx<'a> {
@@ -464,6 +474,7 @@ pub fn gi(
     t2: Vec3A,
     max_depth: u32,
     sun: Vec3A,
+    cl: &crate::clouds::Clouds,
     depth: u32,
     share: Option<&HemiShare>,
     rng: &mut fastrand::Rng,
@@ -477,7 +488,7 @@ pub fn gi(
         n,
         max_depth: max_depth.max(1),
         t_limit: f32::INFINITY,
-        gi: Some(Gi { sun, depth }),
+        gi: Some(Gi { sun, depth, cl: *cl }),
     };
     (integrate(&cx, t1, t2, share, rng, verify, ls) / PI).max(Vec3A::ZERO)
 }
@@ -607,7 +618,7 @@ fn open_hemisphere(
         None => acc.open.x = PI,
         Some(g) => {
             for [a, b, c] in sphcell::octants(cx.n, t1, t2) {
-                acc.open += sky_cell(cx.n, g.sun, a, b, c, 4);
+                acc.open += sky_cell(cx.n, g.sun, cx.scene.sky_scale, a, b, c, 4);
             }
         }
     }
@@ -652,7 +663,10 @@ fn cell(
             None => acc.open.x += sphcell::psa(a, b, c, cx.n),
             // Refinement budget: enough extra levels to reach ~6° cells even
             // for an octant-sized empty cell near the sun glow.
-            Some(g) => acc.open += sky_cell(cx.n, g.sun, a, b, c, 5u32.saturating_sub(depth)),
+            Some(g) => {
+                acc.open +=
+                    sky_cell(cx.n, g.sun, cx.scene.sky_scale, a, b, c, 5u32.saturating_sub(depth))
+            }
         }
         if let Some(v) = verify.as_deref_mut() {
             acc.accounted += sphcell::psa(a, b, c, cx.n);
@@ -776,7 +790,7 @@ fn leaf_rays(
                 // disc would (a) double-count light `direct_d` already delivers
                 // with its own shadow ray, and (b) push ~1e3 radiance into the
                 // 2^18 fixed-point hemi accumulator, which would saturate.
-                None => crate::sky::dome(d, g.sun),
+                None => crate::sky::dome(d, g.sun, cx.scene.sky_scale),
                 Some(h) => shade::shade(
                     cx.scene,
                     cx.accel.bvh,
@@ -786,6 +800,7 @@ fn leaf_rays(
                     &BOUNCE_Q,
                     rng,
                     g.sun,
+                    &g.cl,
                     // Bounce hits stay ISOTROPIC (aniso 1) at an octant-scale
                     // spread: the cell footprint is coarse by design —
                     // over-blurred bounce albedo is variance reduction, and 16
@@ -843,7 +858,7 @@ fn verify_leaf_ray(cx: &Cx, ray: &Ray, tc: f32, v: &mut VerifyCounters, ls: &mut
 /// aliasing: fireflies and energy loss, unfixable by adding `levels`. Excluding
 /// the disc removes the sharp feature outright — which is precisely why the
 /// frequency split is the right architecture and not merely a convenience.
-fn sky_cell(n: Vec3A, sun: Vec3A, a: Vec3A, b: Vec3A, c: Vec3A, levels: u32) -> Vec3A {
+fn sky_cell(n: Vec3A, sun: Vec3A, scale: f32, a: Vec3A, b: Vec3A, c: Vec3A, levels: u32) -> Vec3A {
     let cen = sphcell::centroid(a, b, c);
     if levels > 0 {
         // Angular radius of the cell around its centroid.
@@ -865,12 +880,12 @@ fn sky_cell(n: Vec3A, sun: Vec3A, a: Vec3A, b: Vec3A, c: Vec3A, levels: u32) -> 
             let (mab, mbc, mca) = sphcell::midpoints(a, b, c);
             let mut sum = Vec3A::ZERO;
             for [ca, cb, cc] in [[a, mab, mca], [mab, b, mbc], [mca, mbc, c], [mab, mbc, mca]] {
-                sum += sky_cell(n, sun, ca, cb, cc, levels - 1);
+                sum += sky_cell(n, sun, scale, ca, cb, cc, levels - 1);
             }
             return sum;
         }
     }
-    crate::sky::dome(cen, sun) * sphcell::psa(a, b, c, n)
+    crate::sky::dome(cen, sun, scale) * sphcell::psa(a, b, c, n)
 }
 
 /// Reference-ray re-validation of an empty-cell claim: directions strictly

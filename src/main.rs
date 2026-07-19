@@ -4,6 +4,7 @@
 mod bc7;
 mod bvh;
 mod camera;
+mod clouds;
 mod dlss;
 // Signal split, wire encoders, and demodulation/composite math for FSR Ray
 // Regeneration — pure CPU, feeds --check-fsr; the GPU seam is gpu/ffx*.
@@ -336,6 +337,12 @@ pub struct Opts {
     /// `--hdr-peak <nits>`: override the display's reported peak. None = trust
     /// what the monitor says (`gpu::display::probe`).
     pub hdr_peak: Option<f32>,
+    /// `--tod <hour>`: start time-of-day (float hours, wrapped into 0..24 —
+    /// e.g. 17.5 = sunset light). None = the default sun, bit-identical to
+    /// the pre-TOD renderer; the `,`/`.` keys and D-pad still scrub live.
+    /// Applied AFTER the scene cache load/store so a `--tod` session can
+    /// never poison the `.fcache` with a non-default sun.
+    pub tod: Option<f32>,
 }
 
 /// OIDN placement in XeSS mode (N cycles off → pre → post). Pre denoises the
@@ -464,6 +471,7 @@ fn main() {
         hdr: true,
         hdr_paper_white: tone::DEFAULT_PAPER_WHITE,
         hdr_peak: None,
+        tod: None,
     };
     let mut check_dlss = false;
     let mut dlss_dump = false;
@@ -618,6 +626,11 @@ fn main() {
             // guide and every radiance gate are untouched either way, and the
             // off path keeps the original alloc-free tonemap loop verbatim.
             "--no-bloom" => bloom::set_enabled(false),
+            // A/B kill lever for the volumetric cloud layer (default ON).
+            // Same "session constant before scene load" pattern: off takes
+            // guarded early returns everywhere — bit-identical to the
+            // pre-cloud renderer (clouds::self_test pins it).
+            "--no-clouds" => clouds::set_enabled(false),
             // Same "knob before scene load" pattern: the GPU reads it for the
             // static sampler's MaxAnisotropy, the CPU for Cone::aniso. 1 = off
             // ⇒ the isotropic ray-cone lod path runs verbatim (bit-identical
@@ -821,6 +834,17 @@ fn main() {
                         std::process::exit(2);
                     });
             }
+            "--tod" => {
+                opts.tod = args
+                    .next()
+                    .and_then(|s| s.parse::<f32>().ok())
+                    .filter(|v| v.is_finite())
+                    .map(|v| v.rem_euclid(24.0))
+                    .or_else(|| {
+                        eprintln!("--tod needs an hour, e.g. 17.5 (wraps into 0..24)");
+                        std::process::exit(2);
+                    });
+            }
             "--oidn-no-clean-aux" => opts.oidn_clean_aux = false,
             "--gpu" => opts.gpu = true,
             "--check-gpu" => check_gpu = true,
@@ -973,6 +997,9 @@ fn main() {
                 eprintln!("                visibility is per-pixel either way)");
                 eprintln!("  --no-hemi-share  disable the shared hemisphere capture in fb (H) frames — every");
                 eprintln!("                shading point runs its own bounce tree (A/B lever)");
+                eprintln!("  --no-clouds   disable the drifting volumetric cloud layer (on by default: raymarched");
+                eprintln!("                FBM slab — sky, reflections, glass, and cloud shadows on the direct sun;");
+                eprintln!("                off is bit-identical to the pre-cloud renderer)");
                 eprintln!("  --no-mips     no texture mip chains; every trilinear sample degenerates to the");
                 eprintln!("                pre-mip bilinear (A/B lever; mips are on by default — implies --no-aniso)");
                 eprintln!("  --aniso N     max anisotropy for texture filtering, 1..=16 (default 16; 1 = off, i.e.");
@@ -1154,7 +1181,7 @@ fn main() {
     // A cache hit hands back the untiled scene's BVH too; tiling replicates
     // the geometry, so the tiled BVH is always a fresh (parallel) build.
     let mut prebuilt: Option<bvh::Bvh> = None;
-    let scene = match (&obj, stress) {
+    let mut scene = match (&obj, stress) {
         (Some(p), _) => {
             let resolved = scene::resolve_scene_path(p);
             // Extension sniff: .gltf/.glb take the glTF loader, everything
@@ -1248,6 +1275,21 @@ fn main() {
         eprintln!("bvh: deterministic rebuild verified");
     }
 
+    // --tod: applied strictly AFTER the cache load/store and the BVH build
+    // (the sun feeds neither), so the .fcache always holds the default day
+    // and the determinism gate compared like with like. Every downstream
+    // consumer — --spin, the check suites, run_window — sees the applied sun.
+    // Combining --tod with --check* is user's-own-risk: the same-seed and
+    // CPU-vs-GPU A/B gates are self-consistent under any sun, but structural
+    // must-fires and pinned bands assume the default (the --cam caveat class).
+    if let Some(h) = opts.tod {
+        scene::apply_tod(&mut scene, h);
+        eprintln!(
+            "tod: starting at {h:.2}h (sun y {:+.2}, sky scale {:.3}, night {:.2})",
+            scene.sun.dir.y, scene.sky_scale, scene.night
+        );
+    }
+
     if let Some(mode) = &spin {
         let code = run_spin(&scene, &bvh, cam0, mode, spin_frames, &opts);
         std::process::exit(code);
@@ -1325,7 +1367,7 @@ fn main() {
         }
     }
     #[cfg(windows)]
-    run_window(&scene, &bvh, &opts, cam0);
+    run_window(&mut scene, &bvh, &opts, cam0);
     #[cfg(not(windows))]
     {
         let _ = (&opts, cam0);
@@ -1432,7 +1474,7 @@ fn run_check_dxr(
             info: &info,
             tbuf: &tbuf,
             stats: &stats,
-            sun: render::sun_dir(scene),
+            sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
             tcache_cur: None,
             tcache_prev: &[],
             accumulate: true,
@@ -1469,7 +1511,7 @@ fn run_check_dxr(
             info: &info,
             tbuf: &tbuf,
             stats: &stats,
-            sun: render::sun_dir(scene),
+            sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
             tcache_cur: None,
             tcache_prev: &[],
             accumulate: true,
@@ -1506,6 +1548,7 @@ fn run_check_dxr(
                 verify: false,
                 spp: 1,
                 probe_sample: 0,
+                clouds: crate::clouds::Clouds::check(scene.diag),
             },
         );
         let mut rec = Ok(());
@@ -1591,6 +1634,7 @@ fn run_check_dxr(
                 verify: false,
                 spp: SPP_GATE,
                 probe_sample: probe,
+                clouds: crate::clouds::Clouds::check(scene.diag),
             };
             dg.write_cb(0, &p);
             let mut rec = Ok(());
@@ -1812,6 +1856,7 @@ fn run_check_dxr(
                 verify: false,
                 spp: 1,
                 probe_sample: 0,
+                clouds: crate::clouds::Clouds::check(scene.diag),
             };
             dg2.write_cb(0, &p);
             let mut rec = Ok(());
@@ -2138,6 +2183,7 @@ fn run_check_dxr(
                     verify: false,
                     spp: 1,
                     probe_sample: 0,
+                    clouds: crate::clouds::Clouds::check(scene.diag),
                 };
                 dg2.write_cb(0, &p);
                 let mut rec = Ok(());
@@ -3067,7 +3113,7 @@ fn run_check_gpu(
             info: &info,
             tbuf: &tbuf,
             stats: &stats,
-            sun: render::sun_dir(scene),
+            sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
             tcache_cur: None,
             tcache_prev: &[],
             accumulate: true,
@@ -3102,6 +3148,7 @@ fn run_check_gpu(
             verify: false,
             spp: 1,
             probe_sample: 0,
+            clouds: crate::clouds::Clouds::check(scene.diag),
         });
         hg.run(|l| tg.record_reference(l, 0))
     };
@@ -3317,6 +3364,7 @@ fn run_check_gpu(
         verify: false,
         spp: 1,
         probe_sample: 0,
+        clouds: crate::clouds::Clouds::check(scene.diag),
     };
     tg.write_cb(0, &wf_params);
     if let Err(e) = hg.run(|l| tg.record_wavefront(l, 0, &wf_params, true)) {
@@ -3664,6 +3712,7 @@ fn run_check_gpu(
                 verify: false,
                 spp,
                 probe_sample: probe,
+                clouds: crate::clouds::Clouds::check(scene.diag),
             };
             tg.write_cb(0, &p);
             if let Err(e) = hg.run(|l| tg.record_wavefront(l, 0, &p, true)) {
@@ -3723,12 +3772,26 @@ fn run_check_gpu(
                 }
             }
             let (mut sum, mut mx, mut hot) = (0.0f64, 0.0f32, 0usize);
+            let mut hot_diag: Vec<String> = Vec::new();
             for i in 0..px * 3 {
                 let d = (wa4[i] - ra4[i]).abs();
                 sum += d as f64;
                 if !edge_mask[i / 3] {
                     mx = mx.max(d);
                     if d > 1e-2 {
+                        // Same diagnostic discipline as the spp=1 gate's
+                        // hot_px list: a failure must name its pixels.
+                        if hot_diag.len() < 8 {
+                            let (x, y) = ((i / 3) % gw, (i / 3) / gw);
+                            hot_diag.push(format!(
+                                "spp={spp} probe={probe} px ({x},{y}) ch{} wave {:.4} ref {:.4} | t wave {:.4} ref {:.4}",
+                                i % 3,
+                                wa4[i],
+                                ra4[i],
+                                wt4[i / 3],
+                                rt4[i / 3]
+                            ));
+                        }
                         hot += 1;
                     }
                 }
@@ -3766,6 +3829,12 @@ fn run_check_gpu(
                 eprintln!(
                     "check-gpu: FAIL same-seed wavefront/reference images diverge at spp={spp} (rel {rel:.2e} of limit 1e-4 | hot {hot} of limit {hot_limit:.0} | non-finite {nonfinite})"
                 );
+                // Only a FAILURE names its pixels — a passing AMD run
+                // legitimately carries a few hot channels (the TMin
+                // re-origining class) and must not spam the log.
+                for h in &hot_diag {
+                    eprintln!("check-gpu:   {h}");
+                }
                 ok = false;
             }
         }
@@ -3819,6 +3888,7 @@ fn run_check_gpu(
                 verify: true,
                 spp: 1,
                 probe_sample: 0,
+                clouds: crate::clouds::Clouds::check(scene.diag),
             });
             if let Err(e) = tg.run_hemi_probes(&mut hg, 0, &probes, fb.depth, s == 0) {
                 eprintln!("check-gpu: FAIL hemi {mode_name} probes: {e}");
@@ -3923,8 +3993,9 @@ fn run_check_gpu(
                     sum += match bvh.intersect(scene, &ray, 0.0, f32::INFINITY, &mut vls.ray_nodes) {
                         // dome, NOT radiance — this reference must integrate the
                         // same sky hemi.rs does (a GATHER path), or the GI A/B
-                        // below is comparing two different functions.
-                        None => crate::sky::dome(d, sun),
+                        // below is comparing two different functions. Same
+                        // sky_scale source as hemi's leaf miss, same reason.
+                        None => crate::sky::dome(d, sun, scene.sky_scale),
                         Some(hh) => shade::shade(
                             scene,
                             bvh,
@@ -3934,6 +4005,9 @@ fn run_check_gpu(
                             &hemi::BOUNCE_Q,
                             &mut rng,
                             sun,
+                            // The pinned check cloud state — the GPU frame this
+                            // reference gates shades under the same sky.
+                            &crate::clouds::Clouds::check(scene.diag),
                             // Same bounce cone as hemi.rs's leaf shades — the
                             // A/B needs both arms sampling textures alike.
                             shade::Cone::bounce(),
@@ -3983,6 +4057,7 @@ fn run_check_gpu(
             verify: false,
             spp: 1,
             probe_sample: 0,
+            clouds: crate::clouds::Clouds::check(scene.diag),
         };
         tg.write_cb(0, &p);
         if let Err(e) = hg.run(|l| tg.record_wavefront(l, 0, &p, false)) {
@@ -4067,6 +4142,7 @@ fn run_check_gpu(
                 verify: false,
                 spp: 1,
                 probe_sample: 0,
+                clouds: crate::clouds::Clouds::check(scene.diag),
             };
             ptg.write_cb(0, &p);
             hg.run(|l| ptg.record_wavefront(l, 0, &p, false))?;
@@ -4467,6 +4543,7 @@ fn run_check_gpu(
                     verify: false,
                     spp: 1,
                     probe_sample: 0,
+                    clouds: crate::clouds::Clouds::check(scene.diag),
                 };
                 ptg.write_cb(0, &p);
                 if let Err(e) = hg.run(|l| ptg.record_wavefront(l, 0, &p, false)) {
@@ -5073,6 +5150,7 @@ fn run_check_gpu(
                 verify: false,
                 spp,
                 probe_sample: 0,
+                clouds: crate::clouds::Clouds::check(scene.diag),
             };
             btg.write_cb(0, &p);
             let _ = hg.run(|l| btg.record_frame(l, 0, &p, hybrid));
@@ -5093,6 +5171,7 @@ fn run_check_gpu(
                 verify: false,
                 spp,
                 probe_sample: 0,
+                clouds: crate::clouds::Clouds::check(scene.diag),
             };
             btg.write_cb(0, &p);
             let _ = hg.run(|l| btg.record_frame(l, 0, &p, hybrid));
@@ -5218,7 +5297,7 @@ fn run_check_gpu(
                 info: &info2,
                 tbuf: &tbuf2,
                 stats: &stats2,
-                sun: render::sun_dir(scene),
+                sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
                 tcache_cur: None,
                 tcache_prev: &[],
                 accumulate: true,
@@ -5599,7 +5678,7 @@ fn fsr_frame_check(
             info: &info,
             tbuf: &tbuf,
             stats: &stats,
-            sun: render::sun_dir(scene),
+            sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
             tcache_cur: None,
             tcache_prev: &[],
             accumulate: false,
@@ -5875,7 +5954,7 @@ fn albedo_ab_check(
         info: &info,
         tbuf: &tbuf,
         stats: &stats,
-        sun: render::sun_dir(scene),
+        sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
         tcache_cur: None,
         tcache_prev: &[],
         accumulate: false,
@@ -5990,7 +6069,7 @@ fn mv_check_at(
                 info: &info,
                 tbuf: &tbuf,
                 stats: &stats,
-                sun: render::sun_dir(scene),
+                sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
                 tcache_cur: None,
                 tcache_prev: &[],
                 accumulate: false,
@@ -6457,7 +6536,7 @@ fn run_check_xess(
                     info: &info,
                     tbuf: &tbuf,
                     stats,
-                    sun: render::sun_dir(scene),
+                    sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
                     tcache_cur: None,
                     tcache_prev: &[],
                     accumulate: true,
@@ -6701,7 +6780,7 @@ fn run_check_nppd(
             info: &info,
             tbuf: &tbuf,
             stats: &stats,
-            sun: render::sun_dir(scene),
+            sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
             tcache_cur: None,
             tcache_prev: &[],
             accumulate: false,
@@ -6928,7 +7007,7 @@ fn run_check_oidn(
             info: &info,
             tbuf: &tbuf,
             stats: &stats,
-            sun: render::sun_dir(scene),
+            sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
             tcache_cur: None,
             tcache_prev: &[],
             accumulate: true,
@@ -7080,7 +7159,7 @@ fn run_check_oidn(
             info: &info,
             tbuf: &tbuf,
             stats: &stats,
-            sun: render::sun_dir(scene),
+            sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
             tcache_cur: None,
             tcache_prev: &[],
             accumulate: false,
@@ -7273,7 +7352,7 @@ fn run_check_oidn(
                 info: &info,
                 tbuf: &tbuf,
                 stats: &stats,
-                sun: render::sun_dir(scene),
+                sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
                 tcache_cur: None,
                 tcache_prev: &[],
                 accumulate: true,
@@ -7721,7 +7800,9 @@ fn run_spin(
             info: &info,
             tbuf: &tbuf,
             stats: &stats,
-            sun: render::sun_dir(scene),
+            // --spin's cloud clock is a pure function of the frame index —
+            // bit-repeatable A/Bs, like the pose itself.
+            sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::spin(scene.diag, idx),
             tcache_cur,
             tcache_prev: &tprev_vec,
             accumulate: false,
@@ -7829,6 +7910,29 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         Ok(()) => true,
         Err(e) => {
             eprintln!("sky self-test: FAIL — {e}");
+            false
+        }
+    };
+
+    // Clouds: the --no-clouds bit-identity sweep, T/scatter range+finiteness
+    // over a direction × time sweep, Beer monotonicity in optical depth, the
+    // per-ray None arm's bit-passthrough, the cloudy/clear/shadow must-fires,
+    // the exact advection identity, and the horizon-fade continuity.
+    let clouds_ok = match clouds::self_test() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("clouds self-test: FAIL — {e}");
+            false
+        }
+    };
+
+    // Time-of-day: the sun arc's anchors, the fade's exact identities (the
+    // untouched-session bit-identity guards), the sunset channel ordering, the
+    // moon handoff, and the star field's day-guard/determinism/clamp.
+    let tod_ok = match scene::tod_self_test() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("tod self-test: FAIL — {e}");
             false
         }
     };
@@ -8128,7 +8232,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             info: &info,
             tbuf: &tbuf,
             stats: &s,
-            sun: render::sun_dir(scene),
+            sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
             tcache_cur: None,
             tcache_prev: &[],
             accumulate: true,
@@ -8192,7 +8296,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 info: &info,
                 tbuf: &tbuf,
                 stats: &stats,
-                sun: render::sun_dir(scene),
+                sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
                 tcache_cur: None,
                 tcache_prev: &[],
                 // The upscaler contract: every frame a fresh jittered frame.
@@ -8351,6 +8455,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                         t2,
                         q.fb.depth,
                         sun,
+                        &crate::clouds::Clouds::check(scene.diag),
                         0,
                         None,
                         &mut rng,
@@ -8371,8 +8476,9 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                     let bray = bvh::Ray::new(pr.p, d);
                     e_r += match bvh.intersect(scene, &bray, 0.0, f32::INFINITY, &mut vis) {
                         // dome, NOT radiance — a GATHER path, mirroring
-                        // hemi.rs's leaf-ray miss exactly (see sky.rs).
-                        None => crate::sky::dome(d, sun),
+                        // hemi.rs's leaf-ray miss exactly (see sky.rs),
+                        // including its sky_scale source.
+                        None => crate::sky::dome(d, sun, scene.sky_scale),
                         Some(h) => shade::shade(
                             scene,
                             bvh,
@@ -8382,6 +8488,9 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                             &hemi::BOUNCE_Q,
                             &mut rng,
                             sun,
+                            // Pinned check clouds — both arms of the A/B shade
+                            // the same sky (hemi::gi got the same state above).
+                            &crate::clouds::Clouds::check(scene.diag),
                             shade::Cone::bounce(),
                             1,
                             &mut lsr,
@@ -8538,6 +8647,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                     g.delta,
                     g.eta,
                     None,
+                    &crate::clouds::Clouds::check(scene.diag),
                     &mut ao_share,
                     &mut ls,
                 );
@@ -8555,6 +8665,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                     g.delta,
                     g.eta,
                     Some(sun),
+                    &crate::clouds::Clouds::check(scene.diag),
                     &mut gi_share,
                     &mut ls,
                 );
@@ -8619,6 +8730,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                             t2,
                             q.fb.depth,
                             sun,
+                            &crate::clouds::Clouds::check(scene.diag),
                             0,
                             Some(&gi_share),
                             &mut rng,
@@ -8635,6 +8747,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                             t2,
                             q.fb.depth,
                             sun,
+                            &crate::clouds::Clouds::check(scene.diag),
                             0,
                             None,
                             &mut rng,
@@ -8707,6 +8820,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 g.delta,
                 g.eta,
                 None,
+                &crate::clouds::Clouds::check(scene.diag),
                 &mut deep,
                 &mut dls,
             );
@@ -8757,7 +8871,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             info: &info,
             tbuf: &tbuf,
             stats: &stats,
-            sun: render::sun_dir(scene),
+            sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
             tcache_cur: None,
             tcache_prev: &[],
             accumulate: true,
@@ -8829,7 +8943,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             info: &info,
             tbuf: &tbuf,
             stats: &stats,
-            sun: render::sun_dir(scene),
+            sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
             tcache_cur: None,
             tcache_prev: &[],
             accumulate: true,
@@ -8944,7 +9058,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             info: &info,
             tbuf: &tbuf,
             stats: &stats,
-            sun: render::sun_dir(scene),
+            sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
             tcache_cur: None,
             tcache_prev: &[],
             accumulate: true,
@@ -9025,7 +9139,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             info: &info,
             tbuf: &tbuf,
             stats: &stats,
-            sun: render::sun_dir(scene),
+            sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
             tcache_cur: None,
             tcache_prev: &[],
             accumulate: true,
@@ -9073,7 +9187,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             info: &info,
             tbuf: &tbuf,
             stats: &stats,
-            sun: render::sun_dir(scene),
+            sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
             tcache_cur: Some(&tcache),
             tcache_prev: &[],
             // Produced in lockstep with the claim cache: the T passes below
@@ -9184,7 +9298,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             info: &info,
             tbuf: &tbuf,
             stats: &stats,
-            sun: render::sun_dir(scene),
+            sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
             tcache_cur: None,
             tcache_prev: prev,
             accumulate: true,
@@ -9250,7 +9364,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 info: &info_p,
                 tbuf: &tbuf_p,
                 stats: &stats,
-                sun: render::sun_dir(scene),
+                sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
                 tcache_cur: Some(&tcache_p),
                 tcache_prev: &[],
                 accumulate: true,
@@ -9315,7 +9429,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 info: &info_r,
                 tbuf: &tbuf_r,
                 stats: &stats,
-                sun: render::sun_dir(scene),
+                sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
                 tcache_cur: None,
                 tcache_prev: &[],
                 accumulate: true,
@@ -9366,7 +9480,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 info: bufs.1,
                 tbuf: bufs.2,
                 stats: &stats,
-                sun: render::sun_dir(scene),
+                sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
                 tcache_cur: None,
                 tcache_prev: if fresh { &warm_p[..] } else { &warm_p[..0] },
                 accumulate: true,
@@ -9440,7 +9554,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 info: &info_p,
                 tbuf: &tbuf_p,
                 stats: &stats,
-                sun: render::sun_dir(scene),
+                sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
                 tcache_cur: None,
                 tcache_prev: if warm { &warm_p[..] } else { &warm_p[..0] },
                 accumulate: true,
@@ -9508,7 +9622,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 info: &info,
                 tbuf: &tbuf,
                 stats: &stats,
-                sun: render::sun_dir(scene),
+                sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
                 tcache_cur: Some(&tc_b),
                 tcache_prev: &warm_a,
                 accumulate: true,
@@ -9592,7 +9706,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 info: &info,
                 tbuf: &tbuf,
                 stats: &stats,
-                sun: render::sun_dir(scene),
+                sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
                 tcache_cur: Some(&chain_tc[0]),
                 tcache_prev: &[],
                 accumulate: true,
@@ -9635,7 +9749,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                     info: &info,
                     tbuf: &tbuf,
                     stats: &stats,
-                    sun: render::sun_dir(scene),
+                    sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
                     tcache_cur: Some(&chain_tc[ci]),
                     tcache_prev: &prev_ring,
                     accumulate: true,
@@ -9709,7 +9823,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 info: &info,
                 tbuf: &tbuf,
                 stats: &stats,
-                sun: render::sun_dir(scene),
+                sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
                 tcache_cur: None,
                 tcache_prev: &warm,
                 accumulate: true,
@@ -9785,7 +9899,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 info: bufs.1,
                 tbuf: bufs.2,
                 stats: &stats,
-                sun: render::sun_dir(scene),
+                sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
                 tcache_cur: None,
                 tcache_prev: &[],
                 accumulate: true,
@@ -9839,7 +9953,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 info: &info_a,
                 tbuf: &tbuf_a,
                 stats: &stats,
-                sun: render::sun_dir(scene),
+                sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
                 tcache_cur: None,
                 tcache_prev: &[],
                 accumulate: true,
@@ -9876,6 +9990,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         ("texture", tex_ok),
         ("sh", sh_ok),
         ("sky", sky_ok),
+        ("clouds", clouds_ok),
+        ("tod", tod_ok),
         ("bloom", bloom_ok),
         ("sphcell", sph_ok),
         ("ftree", ftree_ok),
@@ -10018,10 +10134,22 @@ struct Persist {
     dxr_failed: bool,
     shot: u32,
     depth_est: f32,
+    /// The cloud animation clock (seconds, f64 so long sessions don't lose
+    /// resolution) — carried across resize/F11 re-entries like the camera
+    /// pose: a rebuild is not a weather change.
+    cloud_time: f64,
+}
+
+/// "HH:MM" of a time-of-day hour — the window-title readout (doubles as the
+/// manual-verification signal that a scrub actually landed).
+#[cfg(windows)]
+fn tod_hhmm(h: f32) -> String {
+    let h = h.rem_euclid(24.0);
+    format!("{:02}:{:02}", h as u32, (h.fract() * 60.0) as u32)
 }
 
 #[cfg(windows)]
-fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
+fn run_window(scene: &mut scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     // Opt into per-monitor DPI awareness so Windows doesn't stretch the window
     // on scaled displays — W×H stays W×H physical pixels, matching the swapchain.
     sdl2::hint::set("SDL_WINDOWS_DPI_AWARENESS", "permonitorv2");
@@ -10081,8 +10209,14 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     // FRAME must integrate (the whole point), but a rebuild presents nothing,
     // and flying through a seconds-long BLAS build with W held is flying
     // blind.
-    let fly =
-        flycam::FlyCam::spawn(sdl_hwnd(&window).0 as isize, cam0, scene.diag);
+    // TOD seeds from --tod or the default sun's own derived hour; the thread
+    // owns it across sessions like the pose, so a scrub survives resizes.
+    let fly = flycam::FlyCam::spawn(
+        sdl_hwnd(&window).0 as isize,
+        cam0,
+        opts.tod.unwrap_or_else(scene::default_tod),
+        scene.diag,
+    );
 
     // A window resize exits the session and re-enters it at the new client
     // size: the session init code IS the rebuild path (every buffer,
@@ -10125,7 +10259,7 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 fn session(
-    scene: &scene::Scene,
+    scene: &mut scene::Scene,
     bvh: &bvh::Bvh,
     opts: &Opts,
     fly: &flycam::FlyCam,
@@ -10147,8 +10281,13 @@ fn session(
 
     // The integrator thread owns the pose (it kept flying through any resize
     // rebuild); the session works exclusively on per-iteration snapshots.
-    let mut cam = fly.snapshot();
+    // TOD likewise: `cur_tod` tracks the hour the scene's lighting was last
+    // derived for. On re-entry after a mid-scrub resize the thread's tod and
+    // the (already-mutated) scene agree, so no spurious re-derive fires.
+    let snap0 = fly.snapshot();
+    let mut cam = snap0.cam;
     let mut prev_snap = cam;
+    let mut cur_tod = snap0.tod;
     let accum: Vec<AtomicU32> = (0..w * h * 3).map(|_| AtomicU32::new(0)).collect();
     let info: Vec<AtomicU32> = (0..w * h).map(|_| AtomicU32::new(0)).collect();
     let tbuf: Vec<AtomicU32> = (0..w * h).map(|_| AtomicU32::new(0)).collect();
@@ -10870,6 +11009,12 @@ fn session(
     // A resize re-entry keeps the last estimate — cost scales with area,
     // but the controller corrects within a frame either way.
     let mut depth_est: f32 = p0.map_or(4.0, |p| p.depth_est);
+    // The cloud clock. Advanced by the last frame's measured render time at
+    // each arm's fresh-frame predicate (upscaler/denoiser frames always;
+    // plain accumulation only at frame 0, so a converging still frame keeps
+    // integrating ONE sky). No wall clock is read in the renderer — this is
+    // main.rs's clock, like depth_est's.
+    let mut cloud_time: f64 = p0.map_or(0.0, |p| p.cloud_time);
     let mut last_title = Instant::now();
     let mut last_stats = Instant::now();
     // Presented-frames-per-second, recomputed once per second (frame ms in
@@ -10934,9 +11079,36 @@ fn session(
         // MV pose == prev-capture pose even while the integrator keeps
         // flying. `moved` = the integrator wrote between frames (bit compare;
         // taps shorter than a frame land as exactly one moved frame).
-        cam = fly.snapshot();
+        let snap = fly.snapshot();
+        cam = snap.cam;
         let moved = cam != prev_snap;
         prev_snap = cam;
+
+        // Time-of-day scrub (`,`/`.`, D-pad L/R). A TOD delta is a SHADING
+        // change, not camera motion: re-derive the sun/moon + SH ambient
+        // (scene::apply_tod), push the new rows into the GPU pipelines'
+        // cached base CBs, and fire the quality-change reset set — frame = 0
+        // plus every temporal history (the U-key contract; the CPU arm's
+        // xess/fsr/OIDN/NPPD latches take `sun_moved` below). Deliberately
+        // KEPT: the temporal frustum cache, claim ring, and structure replay —
+        // geometry-only claims; replay re-shades from the fresh ctx. An idle
+        // session never enters this block (bit compare of an unwritten tod),
+        // which is the untouched-session bit-identity guard.
+        let sun_moved = snap.tod != cur_tod;
+        if sun_moved {
+            cur_tod = snap.tod;
+            scene::apply_tod(scene, cur_tod);
+            gpu.refresh_sky(scene);
+            frame = 0;
+            gpu_reset = true;
+            dxr_reset = true;
+            dlss_reset = true;
+        }
+        // The rest of the iteration is read-only on the scene: shadow the
+        // &mut down to a shared borrow so every existing use (FrameCtx,
+        // rayon scopes, the upscaler feeds) compiles verbatim; the &mut
+        // re-arms at the next iteration.
+        let scene: &scene::Scene = scene;
 
         // GPU-resident tracing (--gpu): a self-contained arm — every frame is
         // traced (and in upscaler sub-modes fed + upscaled), tonemapped, and
@@ -11084,7 +11256,11 @@ fn session(
             // sized to it), not the window.
             if edges.verify {
                 eprintln!("gpu: verifying current view (wavefront vs reference, on-GPU)...");
-                match gpu.verify_trace(&cam.basis(grw, grh), base_q) {
+                match gpu.verify_trace(
+                    &cam.basis(grw, grh),
+                    base_q,
+                    crate::clouds::Clouds::live(scene.diag, cloud_time as f32),
+                ) {
                     Ok(report) => eprintln!("{report}"),
                     Err(e) => eprintln!("gpu: verify failed to run: {e}"),
                 }
@@ -11092,6 +11268,13 @@ fn session(
                 gpu_reset = true;
             }
             let t = Instant::now();
+            // Cloud clock: upscaled frames are always fresh (the upscaler is
+            // the temporal integrator — clouds drift continuously); plain
+            // accumulation advances only at frame 0, so a converging still
+            // frame keeps integrating ONE sky.
+            if gpu_up != GpuUp::Plain || frame == 0 {
+                cloud_time += (last_ms / 1000.0).clamp(0.0, 0.25);
+            }
             if gpu_up != GpuUp::Plain {
                 // The upscaler contract (the CPU arms'): every frame is a
                 // fresh jittered 1-spp full-depth frame at the locked render
@@ -11115,6 +11298,7 @@ fn session(
                     // sees one fresh jittered frame — a quieter one.
                     spp,
                     probe_sample: 0,
+                    clouds: crate::clouds::Clouds::live(scene.diag, cloud_time as f32),
                 };
                 let presented = if gpu_up == GpuUp::Xess {
                     gpu.present_trace_xess(&p, hybrid, jit, gpu_reset, gpu_nppd_on)
@@ -11217,6 +11401,9 @@ fn session(
                     // so spp just converges the image spp× faster per frame.
                     spp,
                     probe_sample: 0,
+                    // Frozen mid-accumulation (the clock only advanced at
+                    // frame 0 above) — the still frames integrate one sky.
+                    clouds: crate::clouds::Clouds::live(scene.diag, cloud_time as f32),
                 };
                 if frame < MAX_SAMPLES {
                     if let Err(e) = gpu.present_trace(&p, frame + 1, hybrid) {
@@ -11335,12 +11522,13 @@ fn session(
                     format!(" | {spp} spp")
                 };
                 let _ = window.set_title(&format!(
-                    "frustracer | {:.0} fps | GPU {} | {} | quality {}{}",
+                    "frustracer | {:.0} fps | GPU {} | {} | quality {}{} | {}",
                     fps,
                     if hybrid { "hybrid" } else { "plain" },
                     mode,
                     preset,
                     spp_txt,
+                    tod_hhmm(cur_tod),
                 ));
             }
             continue;
@@ -11861,6 +12049,7 @@ fn session(
             || edges.toggle_nppd
             || edges.toggle_dxr
             || temporal_flipped
+            || sun_moved
         {
             xess_reset = true;
         }
@@ -11873,6 +12062,7 @@ fn session(
             || edges.cycle_spp
             || edges.toggle_fsr
             || temporal_flipped
+            || sun_moved
         {
             fsr_reset = true;
         }
@@ -11896,7 +12086,8 @@ fn session(
             || edges.toggle_fsr
             || edges.toggle_nppd
             || edges.toggle_dxr
-            || temporal_flipped;
+            || temporal_flipped
+            || sun_moved;
         if hist_stale {
             if let Some(h) = &mut oidn_hist {
                 h.invalidate();
@@ -11929,6 +12120,11 @@ fn session(
                 eprintln!("dxr: C verify is a CPU-tracer feature; --check-dxr gates this pipeline");
             }
             let t = Instant::now();
+            // Cloud clock — the --gpu arm's rule: upscaled = always fresh,
+            // plain accumulation advances only at frame 0.
+            if dxr_up != GpuUp::Plain || frame == 0 {
+                cloud_time += (last_ms / 1000.0).clamp(0.0, 0.25);
+            }
             if dxr_up != GpuUp::Plain {
                 if edges.quality.is_some() {
                     // The generic handler already reset `frame`; the noise
@@ -11961,6 +12157,7 @@ fn session(
                     // there is no tile claim to amortize.)
                     spp,
                     probe_sample: 0,
+                    clouds: crate::clouds::Clouds::live(scene.diag, cloud_time as f32),
                 };
                 let presented = if dxr_up == GpuUp::Xess {
                     gpu.present_dxr_xess(&p, jit, dxr_reset)
@@ -12047,6 +12244,8 @@ fn session(
                     verify: false,
                     spp,
                     probe_sample: 0,
+                    // Frozen mid-accumulation (clock advanced at frame 0 only).
+                    clouds: crate::clouds::Clouds::live(scene.diag, cloud_time as f32),
                 };
                 if frame < MAX_SAMPLES {
                     match gpu.present_dxr(&p, frame + 1) {
@@ -12154,8 +12353,10 @@ fn session(
                         if frame >= MAX_SAMPLES { " | converged" } else { "" },
                     ),
                 };
-                let _ =
-                    window.set_title(&format!("frustracer | {fps:.0} fps | {last_ms:.1} ms | {sub}"));
+                let _ = window.set_title(&format!(
+                    "frustracer | {fps:.0} fps | {last_ms:.1} ms | {sub} | {}",
+                    tod_hhmm(cur_tod)
+                ));
             }
             continue;
         }
@@ -12398,6 +12599,16 @@ fn session(
                 && (upscaled || (rw, rh) == (w, h));
             let (tcache_cur, tprev_vec, cut_cur, cut_prev) =
                 tr.begin(temporal_on, opts.adopt, rw, rh);
+            // Cloud clock — the CPU arm's rule: the fresh-1-spp modes (DLSS/
+            // XeSS/FSR/NPPD/temporal-OIDN) advance every frame (their
+            // upscaler/denoiser is the temporal integrator, clouds drift
+            // continuously); plain accumulation advances only at frame 0, so
+            // a converging still frame — and every replay of it — keeps
+            // integrating ONE sky.
+            let cpu_accumulate = !neural && !oidn_t;
+            if !cpu_accumulate || frame == 0 {
+                cloud_time += (last_ms / 1000.0).clamp(0.0, 0.25);
+            }
             let ctx = FrameCtx {
                 scene,
                 bvh,
@@ -12424,9 +12635,10 @@ fn session(
                 tbuf: &tbuf,
                 stats: &stats,
                 sun: render::sun_dir(scene),
+                clouds: crate::clouds::Clouds::live(scene.diag, cloud_time as f32),
                 tcache_cur,
                 tcache_prev: &tprev_vec,
-                accumulate: !neural && !oidn_t,
+                accumulate: cpu_accumulate,
                 gbuf: match mode {
                     RenderMode::Dlss => Some(&gbufs),
                     RenderMode::Fsr => fsr_gbufs.as_ref(),
@@ -13143,7 +13355,7 @@ fn session(
                 String::new()
             };
             let _ = window.set_title(&format!(
-                "frustracer | {:.0} fps | {}{}{} | {}x{} | {:.1} ms | {} | quality {}{}{}{}{}{}",
+                "frustracer | {:.0} fps | {}{}{} | {}x{} | {:.1} ms | {} | quality {}{}{}{}{}{} | {}",
                 fps,
                 if hybrid { "hybrid" } else { "plain" },
                 if !dlss_on && !fsr_on && !xess_on && hybrid && dynamic { "+dyn" } else { "" },
@@ -13229,6 +13441,7 @@ fn session(
                 } else {
                     ""
                 },
+                tod_hhmm(cur_tod),
             ));
         }
         if (now - last_stats).as_secs_f64() > 1.0 && frame <= MAX_SAMPLES && frame > 0 {
@@ -13302,6 +13515,7 @@ fn session(
         dxr_failed,
         shot,
         depth_est,
+        cloud_time,
     });
     end
 }

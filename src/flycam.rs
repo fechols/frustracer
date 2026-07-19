@@ -37,10 +37,11 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, MapVirtualKeyW, MAPVK_VSC_TO_VK_EX, VK_CONTROL, VK_DOWN, VK_LBUTTON,
-    VK_LEFT, VK_RBUTTON, VK_RIGHT, VK_SHIFT, VK_UP,
+    VK_LEFT, VK_OEM_COMMA, VK_OEM_PERIOD, VK_RBUTTON, VK_RIGHT, VK_SHIFT, VK_UP,
 };
 use windows::Win32::UI::Input::XboxController::{
-    XInputGetState, XINPUT_GAMEPAD_LEFT_SHOULDER, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE,
+    XInputGetState, XINPUT_GAMEPAD_DPAD_LEFT, XINPUT_GAMEPAD_DPAD_RIGHT,
+    XINPUT_GAMEPAD_LEFT_SHOULDER, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE,
     XINPUT_GAMEPAD_RIGHT_SHOULDER, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE,
     XINPUT_GAMEPAD_TRIGGER_THRESHOLD, XINPUT_STATE,
 };
@@ -61,6 +62,24 @@ const STICK_CURVE: i32 = 2;
 /// Probing a disconnected XInput slot is documented-slow — back off ~2 s
 /// between probes (in ticks) after ERROR_DEVICE_NOT_CONNECTED.
 const PAD_REPROBE_TICKS: u32 = 2000 / TICK_MS;
+/// Time-of-day scrub rate: game-hours per real second held (`.`/`,` or D-pad
+/// right/left). The Ctrl(/16)/Shift(/8)/bumper divisors apply, for fine scrub.
+const TOD_RATE: f32 = 1.0;
+/// Seconds for a slow-factor modifier (Ctrl/LB, Shift/RB) to ramp between
+/// full speed and its divided speed. The ramp is smoothstep-shaped, so
+/// engaging AND releasing both ease instead of stepping the speed 8-16x in
+/// one tick.
+const SLOW_EASE_S: f32 = 0.25;
+
+/// One integrator snapshot: the camera pose of record plus the time-of-day
+/// hour, taken under ONE lock so a render iteration sees a consistent pair.
+#[derive(Clone, Copy)]
+pub struct FlyState {
+    pub cam: Camera,
+    /// Hours, wrapped into [0, 24). Consumed by the session loop, which turns
+    /// a delta into `scene::apply_tod` + the shading-change resets.
+    pub tod: f32,
+}
 
 pub struct FlyCam {
     shared: Arc<Shared>,
@@ -68,7 +87,7 @@ pub struct FlyCam {
 }
 
 struct Shared {
-    cam: Mutex<Camera>,
+    state: Mutex<FlyState>,
     stop: AtomicBool,
     /// Integration gate. A LONG FRAME must still integrate — that is the
     /// whole feature. But a session rebuild (resize / F11 re-entry: kernel
@@ -84,9 +103,9 @@ impl FlyCam {
     /// Spawn the integrator for the session window, PAUSED (see `resume`).
     /// `hwnd` rides as isize because windows::HWND is a raw pointer and not
     /// Send; the thread only ever compares it / hands it to read-only queries.
-    pub fn spawn(hwnd: isize, cam0: Camera, diag: f32) -> Self {
+    pub fn spawn(hwnd: isize, cam0: Camera, tod0: f32, diag: f32) -> Self {
         let shared = Arc::new(Shared {
-            cam: Mutex::new(cam0),
+            state: Mutex::new(FlyState { cam: cam0, tod: tod0 }),
             stop: AtomicBool::new(false),
             paused: AtomicBool::new(true),
         });
@@ -98,10 +117,10 @@ impl FlyCam {
         Self { shared, handle: Some(handle) }
     }
 
-    /// The camera pose of record. Call ONCE per render-loop iteration and
-    /// use only the returned snapshot for the whole iteration.
-    pub fn snapshot(&self) -> Camera {
-        *self.shared.cam.lock().unwrap()
+    /// The pose + time-of-day of record. Call ONCE per render-loop iteration
+    /// and use only the returned snapshot for the whole iteration.
+    pub fn snapshot(&self) -> FlyState {
+        *self.shared.state.lock().unwrap()
     }
 
     /// Stop/start integrating. Paused ticks keep advancing the integrator's
@@ -122,7 +141,7 @@ impl FlyCam {
     /// session-local copy the integrator would immediately overwrite.
     #[allow(dead_code)]
     pub fn set(&self, cam: Camera) {
-        *self.shared.cam.lock().unwrap() = cam;
+        self.shared.state.lock().unwrap().cam = cam;
     }
 }
 
@@ -206,6 +225,9 @@ struct Keys {
     q: u16,
     e: u16,
     space: u16,
+    /// Time-of-day reverse / fast-forward (`,` / `.` physical keys).
+    comma: u16,
+    period: u16,
 }
 
 impl Keys {
@@ -222,6 +244,8 @@ impl Keys {
             q: vk(0x10, b'Q' as u16),
             e: vk(0x12, b'E' as u16),
             space: vk(0x39, 0x20),
+            comma: vk(0x33, VK_OEM_COMMA.0),
+            period: vk(0x34, VK_OEM_PERIOD.0),
         }
     }
 }
@@ -237,6 +261,9 @@ struct Pad {
     rt: f32,
     lb: bool,
     rb: bool,
+    /// D-pad left/right: time-of-day reverse / fast-forward.
+    dpad_l: bool,
+    dpad_r: bool,
 }
 
 /// Radial deadzone + response curve: the 2D magnitude below the deadzone is
@@ -279,6 +306,8 @@ fn poll_pad(backoff: &mut u32) -> Option<Pad> {
         rt: trigger(g.bRightTrigger),
         lb: (g.wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER).0 != 0,
         rb: (g.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER).0 != 0,
+        dpad_l: (g.wButtons & XINPUT_GAMEPAD_DPAD_LEFT).0 != 0,
+        dpad_r: (g.wButtons & XINPUT_GAMEPAD_DPAD_RIGHT).0 != 0,
     })
 }
 
@@ -330,6 +359,11 @@ fn integrate_loop(shared: &Shared, hwnd: isize, diag: f32) {
     let mut last = Instant::now();
     let mut drag: Option<(i32, i32)> = None;
     let mut pad_backoff = 0u32;
+    // Slow-modifier ramp positions in [0, 1]: 0 = full speed, 1 = fully
+    // engaged divisor. Advanced every focused tick (even idle ones, so a
+    // modifier held before movement starts is already engaged).
+    let mut slow_ctrl = 0.0f32;
+    let mut slow_shift = 0.0f32;
 
     loop {
         ticker.wait();
@@ -369,14 +403,22 @@ fn integrate_loop(shared: &Shared, hwnd: isize, diag: f32) {
             drag = Some((pt.x, pt.y)); // latch; first tick contributes no delta
         }
 
-        // --- flight speed: diag * 0.25 / s, Ctrl (or LB) /16, Shift (or RB) /8.
-        let mut speed = diag * 0.25 * dt;
-        if down(VK_CONTROL.0) || pad.as_ref().is_some_and(|p| p.lb) {
-            speed /= 16.0;
-        }
-        if down(VK_SHIFT.0) || pad.as_ref().is_some_and(|p| p.rb) {
-            speed /= 8.0;
-        }
+        // --- shared slow factor: Ctrl (or LB) /16, Shift (or RB) /8 — the
+        // flight-speed divisors, also applied to the TOD scrub rate so the
+        // same chord means "finer" everywhere. Eased: each modifier ramps
+        // over SLOW_EASE_S with smoothstep shaping, and the divisor is
+        // applied in log2 space (exp2 of a lerped exponent), so engagement
+        // glides through the intermediate speeds and the rest states stay
+        // EXACT (2^0 = 1, 2^-4 = 1/16, 2^-3 = 1/8 — no powf rounding).
+        let ramp = |t: f32, held: bool| {
+            if held { (t + dt / SLOW_EASE_S).min(1.0) } else { (t - dt / SLOW_EASE_S).max(0.0) }
+        };
+        slow_ctrl = ramp(slow_ctrl, down(VK_CONTROL.0) || pad.as_ref().is_some_and(|p| p.lb));
+        slow_shift = ramp(slow_shift, down(VK_SHIFT.0) || pad.as_ref().is_some_and(|p| p.rb));
+        let smooth = |t: f32| t * t * (3.0 - 2.0 * t);
+        let slow = (-4.0 * smooth(slow_ctrl) - 3.0 * smooth(slow_shift)).exp2();
+        // --- flight speed: diag * 0.25 / s, times the slow factor.
+        let speed = diag * 0.25 * dt * slow;
 
         // Keyboard direction flags (unit directions, normalized below —
         // exactly the old apply_movement).
@@ -390,13 +432,21 @@ fn integrate_loop(shared: &Shared, hwnd: isize, diag: f32) {
         let kdn = down(keys.q);
         let key_any = kw || ks || kd || ka || kup || kdn;
 
+        // --- time-of-day scrub: `.`/D-pad-right forward, `,`/D-pad-left
+        // reverse (both held = 0). Wall-clock-exact by the same measured-dt
+        // argument as displacement.
+        let t_fwd = down(keys.period) || pad.as_ref().is_some_and(|p| p.dpad_r);
+        let t_rev = down(keys.comma) || pad.as_ref().is_some_and(|p| p.dpad_l);
+        let tod_dir = (t_fwd as i32 - t_rev as i32) as f32;
+
         let pad_move = pad.as_ref().is_some_and(|p| p.lx != 0.0 || p.ly != 0.0 || p.lt != 0.0 || p.rt != 0.0);
         let pad_look = pad.as_ref().is_some_and(|p| p.rx != 0.0 || p.ry != 0.0);
-        if !key_any && !pad_move && !pad_look && dx == 0.0 && dy == 0.0 {
-            continue; // nothing to integrate; the shared camera stays bit-untouched
+        if !key_any && !pad_move && !pad_look && dx == 0.0 && dy == 0.0 && tod_dir == 0.0 {
+            continue; // nothing to integrate; the shared state stays bit-untouched
         }
 
-        let mut cam = shared.cam.lock().unwrap();
+        let mut st = shared.state.lock().unwrap();
+        let cam = &mut st.cam;
         let f = cam.forward();
         let r = f.cross(Vec3A::Y).normalize();
         let mut step = Vec3A::ZERO;
@@ -447,6 +497,13 @@ fn integrate_loop(shared: &Shared, hwnd: isize, diag: f32) {
         if yaw_d != 0.0 || pitch_d != 0.0 {
             cam.yaw += yaw_d;
             cam.pitch = (cam.pitch + pitch_d).clamp(-1.5, 1.5);
+        }
+
+        // Time-of-day: 1 game-hour per held second (times the slow factor),
+        // wrapped into [0, 24). Written only on an actual scrub, so an idle
+        // session's snapshot compares bit-equal forever.
+        if tod_dir != 0.0 {
+            st.tod = (st.tod + tod_dir * TOD_RATE * dt * slow).rem_euclid(24.0);
         }
     }
 }

@@ -528,6 +528,17 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
             direct_s /= float(n_shadow);
             direct_t /= float(n_shadow);
         }
+        // Cloud shadow (shade.rs, same insertion point): ONE transmittance
+        // toward the sun per lap, scaling the whole direct sun contribution —
+        // applied BEFORE the lap-0 prim export so the FSR dd/ds signals carry
+        // it. The guard is FLAG_CLOUDS (inside the helper) and the unshadowed
+        // arm's exact 1.0, so clouds-off stays bit-identical.
+        if (flags & FLAG_CLOUDS) {
+            float cloud_t = cloud_sun_transmittance(p);
+            direct_d *= cloud_t;
+            direct_s *= cloud_t;
+            direct_t *= cloud_t;
+        }
         if (lap == 0u) {
             // shade.rs's post-average lobe export (the FSR-RR signal split
             // demodulates these at the G-buffer write) — pure copies, zero
@@ -668,9 +679,30 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                         ggx_ndf(hl_r, ax, ay) / (4.0 * (1.0 + lambda_v) * max(vl.z, 1e-6));
                     float w_b = sky_mis_weight(p_b_r, sky_light_pdf());
                     // The reflection subtree is just the sky here — so it is
-                    // still the ind_s signal (the CPU's tput * rcol).
-                    float3 rc =
-                        rtput * (sky_dome(rdir) + sky_disc(rdir, cone_spread * 0.5) * w_b);
+                    // still the ind_s signal (the CPU's tput * rcol). Stars
+                    // ride un-weighted (BSDF-only delivery, no MIS partner),
+                    // twinkle phase 0 — the CPU's secondary-path convention.
+                    //
+                    // The cloud layer extinguishes this whole backdrop along
+                    // the REFLECTED ray from the hit point (mirrored skies
+                    // show the same clouds), MIS-weighted disc included: the
+                    // BSDF sun rides the march's T, the light-sampled sun
+                    // rides cloud_sun_transmittance — two transmittances of
+                    // one field along near-identical directions, a bracketed
+                    // partition (clouds.rs header; never force one T on both).
+                    float3 dm_r = sky_dome(rdir);
+                    float3 sky_r = dm_r + sky_disc(rdir, cone_spread * 0.5) * w_b
+                        + sky_stars(rdir, cone_spread * 0.5, 0u);
+                    if (flags & FLAG_CLOUDS) {
+                        // The ROUGH march — reflected sky through the GGX
+                        // lobe (clouds_along_rough's cost rationale).
+                        float rct;
+                        float3 rcs;
+                        if (clouds_along_rough(p, rdir, dm_r * CLOUD_AMB_K, rct, rcs)) {
+                            sky_r = sky_r * rct + rcs;
+                        }
+                    }
+                    float3 rc = rtput * sky_r;
                     total += rc;
                     prim.ind_s += rc;
                 }
@@ -756,7 +788,9 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                     // a near-delta path with no light-sampling partner, so this
                     // is the only strategy that can deliver the sun through
                     // glass. Nothing to double-count.
-                    float3 tc = t_tput * sky_radiance(tdir, cone_spread * 0.5);
+                    // No pixel in scope — the fixed-midpoint legacy phase
+                    // (the CPU glass miss passes the same 0.5).
+                    float3 tc = t_tput * sky_radiance(torig, tdir, cone_spread * 0.5, 0u, 0.5);
                     total += tc;
                     if (in_refl) prim.ind_s += tc;
                 }

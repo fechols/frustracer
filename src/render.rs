@@ -40,6 +40,9 @@ pub struct FrameCtx<'a> {
     pub tbuf: &'a [AtomicU32],
     pub stats: &'a Stats,
     pub sun: Vec3A,
+    /// Per-frame cloud state (src/clouds.rs). main.rs owns the clock; every
+    /// headless context pins `Clouds::check` so gate pairs compare one sky.
+    pub clouds: crate::clouds::Clouds,
     /// This frame's temporal cache to fill (per-node tc / sky markers).
     pub tcache_cur: Option<&'a TemporalCache>,
     /// Ring of previous frames' caches, NEWEST FIRST, each paired with the
@@ -593,6 +596,9 @@ fn shade_deferred(ctx: &FrameCtx, px: &mut [DeferPx], ls: &mut LocalStats) {
             ray: Ray::new(ctx.cam.origin, dir),
             hit: (p.hit.tri != u32::MAX).then_some(p.hit),
             rng: p.rng.clone(),
+            // Deferred records exist only at spp == 1 (sample 0) and only for
+            // HIT pixels — the cloud-phase stratum is never read here.
+            k: 0,
         };
         shade_traced(
             ctx,
@@ -888,6 +894,7 @@ fn shade_hemi_cell(
                 delta,
                 eta,
                 ctx.q.fb.gi.then_some(ctx.sun),
+                &ctx.clouds,
                 rec,
                 ls,
             );
@@ -1283,6 +1290,11 @@ struct Traced {
     hit: Option<Hit>,
     /// Shading RNG, positioned exactly where the fused path would have it.
     rng: fastrand::Rng,
+    /// The spp sample index (First/Topup → 0, Extra(k) → k) — the cloud
+    /// march's stratified dither stratum (`clouds::dither_jk`). A Topup
+    /// shares sample 0's stratum: top-ups exist only at spp == 1, where
+    /// k/spp is 0 anyway, and the frame term still decorrelates them.
+    k: u32,
 }
 
 /// Mixed into the HOT top-up sample's seed so its in-pixel position and
@@ -1370,7 +1382,11 @@ fn trace_primary(
         // Plain reference path: full traversal from the root.
         None => ctx.bvh.intersect(ctx.scene, &ray, t_start, f32::INFINITY, &mut ls.ray_nodes),
     };
-    Traced { fx, fy, dir, ray, hit, rng }
+    let k = match sample {
+        SampleId::Extra(k) => k,
+        SampleId::First | SampleId::Topup => 0,
+    };
+    Traced { fx, fy, dir, ray, hit, rng, k }
 }
 
 /// Shade a traced sample. `primary` gates every per-pixel side channel
@@ -1413,6 +1429,7 @@ fn shade_traced(
                 &ctx.q,
                 &mut tr.rng,
                 ctx.sun,
+                &ctx.clouds,
                 // Primary ray cone: apex at the camera, one-pixel spread.
                 shade::Cone::primary(&ctx.cam),
                 0,
@@ -1434,8 +1451,21 @@ fn shade_traced(
                 ctx.store_meta(x, y, f32::INFINITY, depth, kind);
             }
             // A DISPLAY path: the camera is looking at the sky, so it sees the
-            // sun disc. Nothing else delivers it here — this is the backdrop.
-            let c = crate::sky::radiance(tr.dir, &ctx.scene.sun, ctx.cam.pixel_cone() * 0.5);
+            // sun disc. Nothing else delivers it here — this is the backdrop
+            // (through the cloud layer, which marches from the ray's origin
+            // with this sample's own dither phase — per (pixel, frame,
+            // sample), so --spp and accumulation genuinely average the march).
+            let c = crate::sky::radiance(
+                tr.ray.o,
+                tr.dir,
+                &ctx.scene.sun,
+                ctx.cam.pixel_cone() * 0.5,
+                ctx.scene.sky_scale,
+                ctx.scene.night,
+                ctx.frame,
+                &ctx.clouds,
+                crate::clouds::dither_jk(x as u32, y as u32, ctx.frame, tr.k, ctx.spp()),
+            );
             if do_splat {
                 ctx.splat(x, y, c);
             }
@@ -1619,17 +1649,70 @@ fn fill_sky(ctx: &FrameCtx, x0: usize, y0: usize, x1: usize, y1: usize, depth: u
 /// The per-pixel body of `fill_sky`, stats-free so the replay driver can fan
 /// a large sky rect out across row bands without double-counting the tile.
 fn fill_sky_rows(ctx: &FrameCtx, x0: usize, y0: usize, x1: usize, y1: usize, depth: u32) {
+    let spp = ctx.spp();
     for y in y0..y1 {
         for x in x0..x1 {
             let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
             let dir = ctx.cam.ray_dir(fx, fy);
+            // The pixel's cloud march phase — per (pixel, frame, SAMPLE),
+            // mirroring the per-pixel sample loops: the center rides sample
+            // 0's stratum (bitwise `dither_j(x, y, frame)`), each SKY_J extra
+            // takes its own stratum, so a multi-sampled sky tile averages the
+            // march phase exactly like a leaf pixel does.
+            let j = crate::clouds::dither_jk(x as u32, y as u32, ctx.frame, 0, spp);
             // A DISPLAY path — the camera looking at the sky — so it sees the
-            // sun DISC, antialiased against the pixel's own cone (sky.rs).
-            let c = crate::sky::radiance(dir, &ctx.scene.sun, ctx.cam.pixel_cone() * 0.5);
+            // sun DISC, antialiased against the pixel's own cone (sky.rs),
+            // plus the stars (twinkle-phased by the frame index — replay
+            // re-shades at the same frame, so bit-identity holds).
+            let mut c = crate::sky::radiance(
+                ctx.cam.origin,
+                dir,
+                &ctx.scene.sun,
+                ctx.cam.pixel_cone() * 0.5,
+                ctx.scene.sky_scale,
+                ctx.scene.night,
+                ctx.frame,
+                &ctx.clouds,
+                j,
+            );
+            // A proven-empty tile has always shaded ONE center direction, spp
+            // or not — sound while the sky was smooth at sub-pixel scale. The
+            // cloud layer broke that premise (a cover-ramp edge crosses a
+            // pixel), so under clouds a multi-sampled frame averages spp
+            // sample positions — still ZERO rays, sample 0 still the center,
+            // side channels still the center's. The extra DIRECTION offsets
+            // are the PHASE-0 Halton set, deliberately frame-INDEPENDENT like
+            // the center itself (the sky fill antialiases a static function;
+            // per-frame offsets put inter-frame dither on cloud edges, which
+            // the spp stability gate rightly rejects at night, where nothing
+            // louder masks it — a lesson about the direction SET only: the
+            // march PHASE below is per-sample and frame-keyed, symmetric
+            // across spp levels, which that gate accepts). The guard keeps
+            // spp == 1 and --no-clouds on the old path VERBATIM, and the GPU
+            // twin (cs_sky + the injected SKY_J table) mirrors the loop term
+            // for term — the spp wavefront-vs-reference image A/B at frame 0
+            // is the gate.
+            if ctx.clouds.enabled && spp > 1 {
+                for k in 1..spp {
+                    let (ox, oy) = dlss::jitter_for_sample(0, k);
+                    let dk = ctx.cam.ray_dir(fx + ox, fy + oy);
+                    c += crate::sky::radiance(
+                        ctx.cam.origin,
+                        dk,
+                        &ctx.scene.sun,
+                        ctx.cam.pixel_cone() * 0.5,
+                        ctx.scene.sky_scale,
+                        ctx.scene.night,
+                        ctx.frame,
+                        &ctx.clouds,
+                        crate::clouds::dither_jk(x as u32, y as u32, ctx.frame, k, spp),
+                    );
+                }
+                c *= 1.0 / spp as f32;
+            }
             ctx.store_meta(x, y, f32::INFINITY, depth, KIND_SKY);
             ctx.splat(x, y, c);
-            // A proven-empty tile shades one center direction, spp or not —
-            // the presented color and the FSR residual are the same value.
+            // The presented color and the FSR residual are the same value.
             write_gbuf_sky(ctx, x, y, fx, fy, dir, c);
         }
     }
@@ -2054,6 +2137,9 @@ pub fn verify_sampled(
         tbuf: &tbuf,
         stats,
         sun: sun_dir(scene),
+        // verify's re-trace must shade the SAME sky as the frame it checks —
+        // the pinned check state, matching every headless FrameCtx.
+        clouds: crate::clouds::Clouds::check(scene.diag),
         tcache_cur: None,
         tcache_prev: temporal_prev,
         accumulate: true,

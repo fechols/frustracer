@@ -1581,10 +1581,28 @@ pub(crate) fn alpha_defs(scene: &Scene) -> &'static str {
 /// past a too-small array is silent (no gate can see it). Injected like
 /// ALPHA_CUTOUT / FTREE.
 pub(crate) fn spp_defs() -> String {
+    // The sky-fill's extra-sample offsets (cs_sky under FLAG_CLOUDS at
+    // spp > 1): PHASE-0 Halton, deliberately frame-INDEPENDENT — a proven-
+    // empty tile antialiases a static function, and per-frame offsets put
+    // inter-frame dither on cloud edges that the spp stability gate (rightly)
+    // rejects at night. Injected as literals ({:.9e} — 10 significant digits,
+    // past f32's 9 — so the HLSL parses back the exact bits) because the CB
+    // jitter table carries the FRAME's phase and the CB has no room for a
+    // second one; the frame-0 gates still match the reference kernel exactly
+    // (its jitters[] ARE jitter_for_sample(0, s) there). The CPU twin is
+    // fill_sky_rows' jitter_for_sample(0, k).
+    let sky_j: String = (0..crate::dlss::MAX_SPP)
+        .map(|k| {
+            let (x, y) = crate::dlss::jitter_for_sample(0, k);
+            format!("float2({x:.9e}, {y:.9e})")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
-        "#define MAX_SPP {}u\n#define JITTER_ROWS {}",
+        "#define MAX_SPP {}u\n#define JITTER_ROWS {}\nstatic const float2 SKY_J[MAX_SPP] = {{ {} }};",
         crate::dlss::MAX_SPP,
-        crate::dlss::MAX_SPP / 2
+        crate::dlss::MAX_SPP / 2,
+        sky_j
     )
 }
 
@@ -1648,6 +1666,11 @@ pub const FLAG_FSR_SIG: u32 = 64;
 /// Which *rays* use it is decided per call site, not by this flag
 /// (`shade_split`'s `aniso` arg — hemi bounce laps pass false).
 pub const FLAG_ANISO: u32 = 128;
+/// Volumetric clouds on (`--no-clouds` clears it). The cloud state rides two
+/// otherwise-zero cam-row w lanes — `cam_right.w` = scene diag, `cam_up.w` =
+/// the animation clock (`SCENE_DIAG`/`CLOUD_TIME` in trace_common.hlsli, the
+/// SCENE_EPS/AO_RADIUS alias pattern) — so no CB offset moves.
+pub const FLAG_CLOUDS: u32 = 256;
 
 /// GBufPx stride in bytes — lockstep with trace_common.hlsli's struct
 /// (nr | alb_z | spec | mv | sig | sig2 = 4 float4 + 1 uint4 + 1 uint2).
@@ -1684,7 +1707,10 @@ pub(crate) struct FrameCb {
     /// Primary ray-cone spread (CamBasis::pixel_cone — the CPU value
     /// verbatim, single source for the trilinear LOD parity).
     pixel_cone: f32,
-    _pad2: f32,
+    /// Time-of-day dome brightness (`Scene::sky_scale` — exactly 1.0 in an
+    /// untouched session; `x * 1.0` is bit-preserving, so the day sky gates
+    /// are unmoved). Rides what was `_pad2`, so no offset moves.
+    sky_scale: f32,
     cap_tile: u32,
     cap_leaf: u32,
     cap_sky: u32,
@@ -1707,7 +1733,10 @@ pub(crate) struct FrameCb {
     // side channels (tbuf/info/pack). See trace_common.hlsli.
     spp: u32,
     probe_sample: u32,
-    _pad4: u32,
+    /// Star visibility (`Scene::night` — exactly 0.0 in an untouched session;
+    /// the HLSL star branch is guarded on it, so day kernels are bit-identical
+    /// by construction). Rides what was `_pad4`.
+    night: f32,
     _pad5: u32,
     /// Sample offsets from `dlss::jitter_for_sample` (the ONE Halton source —
     /// no radical-inverse port in HLSL), two per 16-byte row.
@@ -1759,7 +1788,7 @@ impl FrameCb {
             _pad0: 0,
             frame_jitter: [0.0, 0.0],
             pixel_cone: 0.0,
-            _pad2: 0.0,
+            sky_scale: scene.sky_scale,
             cap_tile: 0,
             cap_leaf: 0,
             cap_sky: 0,
@@ -1778,10 +1807,25 @@ impl FrameCb {
             prev_up: [0.0, 0.0, 0.0, far],
             spp: 1,
             probe_sample: 0,
-            _pad4: 0,
+            night: scene.night,
             _pad5: 0,
             jitters: [[0.0; 4]; (crate::dlss::MAX_SPP as usize) / 2],
         }
+    }
+
+    /// Re-derive the sun/sky rows from the scene after a TOD change
+    /// (`scene::apply_tod`) — the shared body of `TraceGpu::refresh_sky` /
+    /// `DxrGpu::refresh_sky`. Whole rows are copied from a fresh base, so the
+    /// rehomed w slots (sun_e.w = eps, sun_l.w = ao_radius) are preserved by
+    /// construction; every other field (queue caps included) is untouched.
+    pub(crate) fn refresh_sky_rows(&mut self, scene: &Scene, rw: u32, rh: u32) {
+        let fresh = FrameCb::base(scene, rw, rh);
+        self.sun = fresh.sun;
+        self.sun_e = fresh.sun_e;
+        self.sun_l = fresh.sun_l;
+        self.sky_sh = fresh.sky_sh;
+        self.sky_scale = fresh.sky_scale;
+        self.night = fresh.night;
     }
 
     /// The per-frame fields folded onto the static base — the single source
@@ -1791,8 +1835,10 @@ impl FrameCb {
         let mut cb = *self;
         cb.cam_origin = [origin.x, origin.y, origin.z, inv_w];
         cb.cam_forward = [forward.x, forward.y, forward.z, inv_h];
-        cb.cam_right = [right.x, right.y, right.z, 0.0];
-        cb.cam_up = [up.x, up.y, up.z, 0.0];
+        // The cloud state rides the cam rows' free w lanes (SCENE_DIAG /
+        // CLOUD_TIME in the HLSL) — per-frame values on per-frame rows.
+        cb.cam_right = [right.x, right.y, right.z, p.clouds.diag];
+        cb.cam_up = [up.x, up.y, up.z, p.clouds.time];
         cb.frame = p.frame;
         cb.flags = (p.accumulate as u32 * FLAG_ACCUM)
             | (p.jitter as u32 * FLAG_JITTER)
@@ -1801,7 +1847,8 @@ impl FrameCb {
             | (gbuf_full as u32 * FLAG_GBUF)
             | (p.prev_cam.is_some() as u32 * FLAG_HAS_PREV)
             | ((gbuf_full && fsr_sig) as u32 * FLAG_FSR_SIG)
-            | ((crate::texture::max_aniso() > 1.0) as u32 * FLAG_ANISO);
+            | ((crate::texture::max_aniso() > 1.0) as u32 * FLAG_ANISO)
+            | (p.clouds.enabled as u32 * FLAG_CLOUDS);
         cb.shadow_samples = p.q.shadow_samples;
         cb.ao_samples = p.q.ao_samples;
         cb.reflections = p.q.reflections as u32;
@@ -1867,6 +1914,9 @@ pub struct FrameParams {
     /// Which sample writes tbuf/info/the G-buffer pack. 0 in every real frame;
     /// the check suites sweep it 0..spp so every sample's ray is gated.
     pub probe_sample: u32,
+    /// Per-frame cloud state (src/clouds.rs) — enable bit + clock + diag,
+    /// mapped onto FLAG_CLOUDS and the cam rows' w lanes by `with_frame`.
+    pub clouds: crate::clouds::Clouds,
 }
 
 /// Which upscaler the feed pass targets — selects the kernel (and thereby
@@ -2412,6 +2462,13 @@ impl TraceGpu {
         self.cb_base
             .with_frame(p, self.gbuf_full, self.fsr_sig())
             .store(unsafe { self.frame_cb.ptr.add(slot * CB_STRIDE) });
+    }
+
+    /// Re-derive the base CB's sun/sky rows after a TOD change
+    /// (`FrameCb::refresh_sky_rows`). No fence hazard: `write_cb` stores a
+    /// fresh ring slot per frame.
+    pub fn refresh_sky(&mut self, scene: &Scene) {
+        self.cb_base.refresh_sky_rows(scene, self.rw, self.rh);
     }
 
     /// Whether ANY wired feed consumes the pack's FSR signal lanes (under

@@ -110,6 +110,14 @@ pub struct Scene {
     /// every normal its own sky irradiance for free (zero rays). Derived
     /// (`finalize_scalars`), never serialized: a pure function of the sun.
     pub sky_sh: crate::sh::Sh9,
+    /// Time-of-day dome brightness (`sky::dome`'s `scale`): exactly 1.0 in an
+    /// untouched session (`* 1.0` is bit-preserving), falling through dusk to
+    /// the `MOON_DOME_FRAC` moonlight floor. Derived, never serialized — only
+    /// `apply_tod` moves it.
+    pub sky_scale: f32,
+    /// Star visibility (`sky::stars`' gate): exactly 0.0 in an untouched
+    /// session, ramping to 1.0 after sunset. Derived, never serialized.
+    pub night: f32,
     /// Bounding diagonal — the scale reference for all epsilons.
     pub diag: f32,
     /// Self-intersection offset for secondary rays.
@@ -328,6 +336,8 @@ impl SceneBuilder {
             any_alpha: false,
             sun,
             sky_sh: crate::sh::Sh9::ZERO,
+            sky_scale: 1.0,
+            night: 0.0,
             diag: 0.0,
             eps: 0.0,
             ao_radius: 0.0,
@@ -354,15 +364,22 @@ pub fn finalize_scalars(scene: &mut Scene) {
     scene.ao_radius = 0.03 * diag;
     scene.any_alpha = scene.textures.iter().any(|t| t.alpha_masked);
 
-    // The SH ambient is a pure function of the sun direction, so it is derived
-    // here rather than cached — which is why `scene_cache` needs no format
-    // change for it. Deterministic quadrature, no rng.
-    //
-    // The DOME, not the full sky: a gather path must never see the sun disc
-    // (the direct loop already delivers it, with a shadow ray). See sky.rs's
-    // central invariant.
+    refresh_sky_sh(scene);
+}
+
+/// Re-derive the SH ambient from the current sun/sky state. Split out of
+/// `finalize_scalars` so `apply_tod` can re-run it without the O(n) position
+/// scan. Deterministic quadrature, no rng — which is why `scene_cache` needs
+/// no format change for it.
+///
+/// The DOME, not the full sky: a gather path must never see the sun disc
+/// (the direct loop already delivers it, with a shadow ray). See sky.rs's
+/// central invariant. At night `scene.sun` IS the moon, so the ambient is the
+/// moonlit dome — the frequency split carries over unchanged.
+pub fn refresh_sky_sh(scene: &mut Scene) {
     let sun = scene.sun.dir;
-    scene.sky_sh = crate::sh::Sh9::project(|d| crate::sky::dome(d, sun));
+    let scale = scene.sky_scale;
+    scene.sky_sh = crate::sh::Sh9::project(|d| crate::sky::dome(d, sun, scale));
 }
 
 /// The sun direction is UNCHANGED from the old rect light's center — so shadow
@@ -371,6 +388,199 @@ pub fn finalize_scalars(scene: &mut Scene) {
 /// `sky::SUN_E_OVER_PI`, which is exactly the old `light.color / |center|²`.
 pub fn default_sun() -> crate::sky::Sun {
     crate::sky::Sun::new(Vec3A::new(6.0, 10.0, 4.0))
+}
+
+/// Time-of-day hour → unit sun direction: the great circle in the vertical
+/// plane through the default sun's azimuth. 06:00 = horizon at +az, 12:00 =
+/// zenith, 18:00 = horizon at −az; the 24→0 wrap is the same point on the
+/// circle. Below-horizon hours are the night half of the arc (the MOON, at
+/// `−dir`, is then above the horizon — see `apply_tod`).
+pub fn sun_dir_for_tod(hour: f32) -> Vec3A {
+    let d0 = default_sun().dir;
+    let az = Vec3A::new(d0.x, 0.0, d0.z).normalize();
+    let th = (hour.rem_euclid(24.0) - 6.0) / 12.0 * std::f32::consts::PI;
+    az * th.cos() + Vec3A::Y * th.sin()
+}
+
+/// The hour whose arc position labels the DEFAULT sun (~9.61 ⇒ 09:37).
+/// Derived FROM the default dir; it is a LABEL — the arc is never evaluated
+/// at it unless the user actually scrubs, because the float round-trip is
+/// approximate and untouched-session bit-identity depends on never
+/// recomputing at zero delta.
+pub fn default_tod() -> f32 {
+    6.0 + default_sun().dir.y.asin() * (12.0 / std::f32::consts::PI)
+}
+
+/// Set the scene's lighting to time-of-day `hour` and re-derive the SH
+/// ambient. The ONLY caller of `Sun::with_fade`/`sky::moon` — an untouched
+/// session never reaches this, which is the structural bit-identity guard.
+///
+/// Day/dusk: the sun at its arc position, irradiance faded/reddened by the
+/// dome's own transmittance (`sky::sun_fade`). Once the fade hits zero the
+/// one light BECOMES the full moon, antipodal — above the horizon exactly
+/// when the sun is not — and the dome (whose `sun` argument is now the moon)
+/// renders the moonlit sky at the `MOON_DOME_FRAC` floor. `night` gates the
+/// stars in after sunset.
+pub fn apply_tod(scene: &mut Scene, hour: f32) {
+    let dir = sun_dir_for_tod(hour);
+    let fade = crate::sky::sun_fade(dir.y, default_sun().dir.y);
+    let lum = fade.dot(Vec3A::new(0.2126, 0.7152, 0.0722));
+    if fade != Vec3A::ZERO {
+        scene.sun = crate::sky::Sun::with_fade(dir, fade);
+    } else {
+        scene.sun = crate::sky::moon(-dir);
+    }
+    // The dome tracks the direct light down through dusk, then rests on the
+    // moonlight floor (scaled by the moon's own rise so deep twilight — both
+    // bodies at the horizon — stays the darkest moment, as in life).
+    let moon_up = ((-dir.y - 0.0) / 0.10).clamp(0.0, 1.0);
+    scene.sky_scale = lum.max(crate::sky::MOON_DOME_FRAC * moon_up);
+    // Stars fade in once the sun is well below the horizon.
+    let t = ((-dir.y - 0.05) / 0.10).clamp(0.0, 1.0);
+    scene.night = t * t * (3.0 - 2.0 * t);
+    refresh_sky_sh(scene);
+}
+
+/// Closed-form time-of-day gates, run by `--check`. No rng, no DLLs. Pins the
+/// arc's anchors, the fade's identities (the bit-identity guards), the sunset
+/// ordering, the moon handoff, and the star field's day-guard/determinism.
+pub fn tod_self_test() -> Result<(), String> {
+    use crate::sky;
+    let d0 = default_sun().dir;
+
+    // Arc anchors: 06:00 east horizon, 12:00 zenith, 18:00 west horizon, all
+    // unit; the default hour reproduces the default direction; 24 h wrap.
+    let az = Vec3A::new(d0.x, 0.0, d0.z).normalize();
+    for (h, want) in [(6.0, az), (12.0, Vec3A::Y), (18.0, -az)] {
+        let d = sun_dir_for_tod(h);
+        if (d.length() - 1.0).abs() > 1e-5 {
+            return Err(format!("arc dir at {h}h is not unit: {d:?}"));
+        }
+        if (d - want).length() > 1e-5 {
+            return Err(format!("arc anchor at {h}h: {d:?}, want {want:?}"));
+        }
+    }
+    let h0 = default_tod();
+    if (h0 - 9.61).abs() > 0.02 {
+        return Err(format!("default_tod {h0:.3} drifted from ~9.61"));
+    }
+    if sun_dir_for_tod(h0).dot(d0) < 1.0 - 1e-6 {
+        return Err("arc at default_tod does not reproduce the default sun".into());
+    }
+    for h in [0.5f32, 3.25, 9.61, 17.75, 23.0] {
+        if sun_dir_for_tod(h).dot(sun_dir_for_tod(h + 24.0)) < 1.0 - 1e-4 {
+            return Err(format!("arc is not 24h-periodic at {h}h"));
+        }
+    }
+    if sun_dir_for_tod(23.999).dot(sun_dir_for_tod(0.001)) < 1.0 - 1e-4 {
+        return Err("arc is discontinuous across the 24->0 wrap".into());
+    }
+
+    // Fade identities — the daytime bit-identity guards. exp(-0) == 1 exactly,
+    // and a fade of exactly ONE must leave Sun::new untouched bit-for-bit.
+    if sky::sun_fade(d0.y, d0.y) != Vec3A::ONE {
+        return Err("sun_fade at the reference elevation is not exactly 1".into());
+    }
+    let s_ref = sky::Sun::new(d0);
+    let s_faded = sky::Sun::with_fade(d0, Vec3A::ONE);
+    if s_faded != s_ref {
+        return Err("Sun::with_fade at fade 1 is not bit-identical to Sun::new".into());
+    }
+    // Shape: per-channel <= 1, monotone in y, the horizon transmittance pin
+    // (red > green > blue — the sunset ordering; a channel swap fails loudly),
+    // and a true zero once the disc has set.
+    let mut prev = Vec3A::ZERO;
+    for i in 0..=40 {
+        let y = -0.1 + i as f32 * (1.0 + 0.1) / 40.0;
+        let f = sky::sun_fade(y, d0.y);
+        if f.max_element() > 1.0 + 1e-6 || f.min_element() < 0.0 {
+            return Err(format!("sun_fade({y}) = {f:?} out of [0,1]"));
+        }
+        if (f - prev).min_element() < -1e-6 {
+            return Err(format!("sun_fade is not monotone in y at {y}"));
+        }
+        prev = f;
+    }
+    let hz = sky::sun_fade(0.0, d0.y);
+    if (hz - Vec3A::new(0.7176, 0.5178, 0.2251)).abs().max_element() > 0.01 {
+        return Err(format!("horizon fade {hz:?} drifted from the transmittance model"));
+    }
+    if !(hz.x > hz.y && hz.y > hz.z) {
+        return Err(format!("horizon fade is not sunset-ordered (r>g>b): {hz:?}"));
+    }
+    if sky::sun_fade(-0.05, d0.y) != Vec3A::ZERO || sky::sun_fade(-0.5, d0.y) != Vec3A::ZERO {
+        return Err("sun_fade below the horizon band is not exactly zero".into());
+    }
+
+    // The moon handoff, on a throwaway scene. Night: the light is the moon
+    // (above the horizon, dim, disc radiance f16-safe), the dome rests on the
+    // moonlight floor, stars are armed. Deep dusk at the swap point: both
+    // bodies near-zero, so the handoff cannot pop.
+    let mut sc = SceneBuilder::new().finish(default_sun());
+    apply_tod(&mut sc, 0.0); // midnight
+    if sc.sun.dir.y <= 0.5 {
+        return Err(format!("midnight light is not a high moon: dir {:?}", sc.sun.dir));
+    }
+    let lum = |v: Vec3A| v.dot(Vec3A::new(0.2126, 0.7152, 0.0722));
+    if lum(sc.sun.e_over_pi) <= 0.0 || lum(sc.sun.e_over_pi) > 0.05 {
+        return Err(format!("moonlight is out of band: {:?}", sc.sun.e_over_pi));
+    }
+    if !sc.sun.radiance.is_finite() || sc.sun.radiance.max_element() > 4096.0 {
+        return Err(format!("moon disc radiance not f16-comfortable: {:?}", sc.sun.radiance));
+    }
+    if sc.sky_scale <= 0.0 || sc.sky_scale > 0.05 {
+        return Err(format!("night sky_scale {} out of the moonlight band", sc.sky_scale));
+    }
+    if sc.night != 1.0 {
+        return Err(format!("midnight night factor {} != 1", sc.night));
+    }
+    apply_tod(&mut sc, 18.20); // just past the sun's last light
+    if lum(sc.sun.e_over_pi) > 0.02 {
+        return Err(format!("handoff pop: light lum {} at 18.20h", lum(sc.sun.e_over_pi)));
+    }
+    apply_tod(&mut sc, 12.0); // noon: near-full sun, no stars
+    if sc.night != 0.0 || sc.sky_scale < 0.9 {
+        return Err(format!("noon state wrong: night {} scale {}", sc.night, sc.sky_scale));
+    }
+
+    // Stars: the day guard is a hard zero; the field is deterministic, finite,
+    // clamped, and its mean radiance is negligible next to even the night dome.
+    let mut sum = Vec3A::ZERO;
+    let mut peak = 0.0f32;
+    for i in 0..2000 {
+        let a = i as f32 * 2.399_963;
+        let z = (i as f32 + 0.5) / 2000.0; // upper hemisphere
+        let r = (1.0 - z * z).max(0.0).sqrt();
+        let d = Vec3A::new(r * a.cos(), z, r * a.sin());
+        if sky::stars(d, 5e-4, 0.0, 7) != Vec3A::ZERO {
+            return Err("stars are not exactly zero by day (night = 0)".into());
+        }
+        let s = sky::stars(d, 5e-4, 1.0, 7);
+        if !s.is_finite() || s.min_element() < 0.0 {
+            return Err(format!("stars({d:?}) = {s:?} — must be finite, non-negative"));
+        }
+        if s != sky::stars(d, 5e-4, 1.0, 7) {
+            return Err("star field is not deterministic".into());
+        }
+        sum += s;
+        peak = peak.max(s.max_element());
+    }
+    let mean = lum(sum / 2000.0);
+    if mean <= 0.0 {
+        return Err("star sweep found no stars at night = 1".into());
+    }
+    if mean > 0.01 {
+        return Err(format!("star field mean radiance {mean} is not negligible"));
+    }
+    if peak > 4200.0 {
+        return Err(format!("star peak radiance {peak} escaped the clamp"));
+    }
+
+    eprintln!(
+        "tod self-test: OK (default {h0:.2}h, horizon fade {:.2}/{:.2}/{:.2}, star mean {mean:.2e})",
+        hz.x, hz.y, hz.z
+    );
+    Ok(())
 }
 
 /// Ground plane + a grid of boxes + three spheres + a marble Stanford Bunny
@@ -543,6 +753,8 @@ pub fn tile_scene(base: Scene, nx: u32, nz: u32) -> (Scene, f32) {
         // same angle, with the same irradiance, everywhere. Nothing to rescale.
         sun: base.sun,
         sky_sh: crate::sh::Sh9::ZERO,
+        sky_scale: base.sky_scale,
+        night: base.night,
         diag: 0.0,
         eps: 0.0,
         ao_radius: 0.0,

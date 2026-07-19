@@ -31,6 +31,9 @@ use std::path::{Path, PathBuf};
 // v5 supersedes two INCOMPATIBLE v4 lineages (build_key header on one side,
 // .webp sibling resolution on the other) — a bare version match can't tell
 // them apart, so both are invalidated.
+// The TOD fields (Scene::sky_scale/night) needed NO bump: they are
+// derived-only (`apply_tod` runs after load/store, the loader initializes
+// them to the defaults), so the v6 on-disk layout is unchanged.
 pub const CACHE_VERSION: u32 = 6; // v6: AreaLight -> sky::Sun (a disc at infinity)
 const MAGIC: [u8; 8] = *b"FRSCACH\x01";
 
@@ -356,8 +359,12 @@ pub fn try_load(src_path: &str) -> Option<(Scene, Bvh)> {
         any_alpha: false,
         sun: crate::sky::Sun::new(sun_v[0]),
         // Derived from the sun by finalize_scalars below — deliberately not in
-        // the on-disk format, so the SH sky costs the cache nothing.
+        // the on-disk format, so the SH sky costs the cache nothing. The TOD
+        // state (sky_scale/night) is likewise derived-only: a `--tod` override
+        // applies AFTER load/store, so the cache always holds the default day.
         sky_sh: crate::sh::Sh9::ZERO,
+        sky_scale: 1.0,
+        night: 0.0,
         diag: 0.0,
         eps: 0.0,
         ao_radius: 0.0,

@@ -43,6 +43,8 @@
                                // WHICH laps use it is a call-site decision
                                // (shade_split's `aniso` arg — hemi bounce
                                // laps pass false), not this flag alone.
+#define FLAG_CLOUDS       256u // volumetric cloud layer on (--no-clouds
+                               // clears it); state rides SCENE_DIAG/CLOUD_TIME
 
 cbuffer Frame : register(b0) {
     float4 cam_origin;   // xyz; w = inv_w
@@ -59,7 +61,9 @@ cbuffer Frame : register(b0) {
     uint shadow_samples; uint ao_samples; uint reflections; uint _pad0;
     // pixel_cone: primary ray-cone spread (CamBasis::pixel_cone verbatim,
     // the trilinear texture LOD's single source — shade.hlsli::tex_lod_base).
-    float2 frame_jitter; float pixel_cone; float _pad2;
+    // sky_scale: time-of-day dome brightness (Scene::sky_scale — exactly 1.0
+    // in an untouched session; x * 1.0 is bit-preserving).
+    float2 frame_jitter; float pixel_cone; float sky_scale;
     // Wavefront queue capacities (resolution-derived, trace.rs computes them;
     // structural worst cases — the overflow counter is gated == 0).
     uint cap_tile; uint cap_leaf; uint cap_sky; uint cap_cut;
@@ -81,7 +85,10 @@ cbuffer Frame : register(b0) {
     // it to 1 on fb frames — one hemi point per pixel). probe_sample names the
     // sample that writes tbuf/info/the G-buffer pack: 0 in every real frame,
     // swept by --check-gpu/--check-dxr so EVERY sample's ray gets gated.
-    uint spp; uint probe_sample; uint _pad4; uint _pad5;
+    // night: star visibility (Scene::night — exactly 0.0 in an untouched
+    // session; sky_stars' guard is a BRANCH on it, so day kernels are
+    // bit-identical by construction).
+    uint spp; uint probe_sample; float night; uint _pad5;
     // Sub-pixel offsets for samples 1.. (dlss::jitter_for_sample, computed on
     // the CPU — one Halton source of truth), packed two per row. The row count
     // is INJECTED (trace::spp_defs, the ALPHA_CUTOUT/FTREE pattern) so it is
@@ -100,6 +107,10 @@ cbuffer Frame : register(b0) {
 #define AO_RADIUS  (sun_l.w)
 #define CAM_NEAR   (prev_right.w)
 #define CAM_FAR    (prev_up.w)
+// The cloud layer's state rides the cam rows' otherwise-zero w lanes
+// (trace.rs::with_frame) — scene diag + the animation clock in seconds.
+#define SCENE_DIAG (cam_right.w)
+#define CLOUD_TIME (cam_up.w)
 
 uint pack_info(uint depth, uint kind) { return (depth & 0xffu) | (kind << 8); }
 
@@ -166,7 +177,9 @@ float2 sample_pos(uint x, uint y, uint k, inout uint rng) {
 //   sky_dome(d)      GATHER paths: hemi cells, GI leaf misses. NO disc — the
 //                    disc would double-count direct_d AND saturate the 2^18
 //                    fixed-point hemi accumulator outright.
-//   sky_radiance(d)  DISPLAY paths: the camera's own miss, and glass.
+//   sky_radiance(o, d)  DISPLAY paths: the camera's own miss, and glass —
+//                    the backdrop through the CLOUD layer along the ray
+//                    (FLAG_CLOUDS; the cloud block below), plus its scatter.
 //
 // The specular reflection ray is the one path both strategies can reach, so it
 // takes the dome plus a MIS-weighted disc (see shade.hlsli).
@@ -202,16 +215,19 @@ float3 sky_scatter(float3 dir, float mu, float3 t_sun) {
 //
 // The blend band is narrow, so each end returns EARLY rather than evaluating
 // both scatters and lerping one away at weight 0 or 1 (sky.rs, same shape).
+// sky_scale is the time-of-day brightness (cbuffer; sky.rs::dome's `scale`):
+// exactly 1.0 untouched (bit-preserving multiply), the MOON_DOME_FRAC floor at
+// night — when `sun` is the MOON and this same model renders the moonlit sky.
 float3 sky_dome(float3 d) {
     float3 t_sun = exp(-(SKY_BETA_R + SKY_BETA_M) / (max(sun.y, 0.0) + 0.15));
     float t = saturate((d.y + 0.05) / 0.10);
-    if (t >= 1.0) return sky_scatter(d, clamp(dot(d, sun.xyz), -1.0, 1.0), t_sun);
+    if (t >= 1.0) return sky_scatter(d, clamp(dot(d, sun.xyz), -1.0, 1.0), t_sun) * sky_scale;
     float3 dm = float3(d.x, abs(d.y), d.z);
     float3 ground =
         sky_scatter(dm, clamp(dot(dm, sun.xyz), -1.0, 1.0), t_sun) * SKY_GROUND_ALBEDO;
-    if (t <= 0.0) return ground;
+    if (t <= 0.0) return ground * sky_scale;
     float3 sky = sky_scatter(d, clamp(dot(d, sun.xyz), -1.0, 1.0), t_sun);
-    return lerp(ground, sky, t);
+    return lerp(ground, sky, t) * sky_scale;
 }
 
 // The disc, ANTIALIASED against the ray's angular footprint (sky::disc). The
@@ -235,9 +251,563 @@ float3 sky_disc(float3 d, float half_angle) {
     return sun_l.xyz * cov;
 }
 
-// What an escaping ray SEES: dome + disc. DISPLAY paths only. `half_angle` is
-// the ray's angular footprint (primary: pixel_cone/2).
-float3 sky_radiance(float3 d, float half_angle) { return sky_dome(d) + sky_disc(d, half_angle); }
+// --- Stars (sky.rs::stars — term-for-term; change both together) -------------
+//
+// Procedural twinkling stars, DISPLAY paths only like the disc (never
+// sky_dome/gather). Deterministic, zero rng draws; `twinkle` is the frame
+// index on primary misses, 0 on secondary paths (matching the CPU, which has
+// no frame in scope there). Gated by the cbuffer `night` — exactly 0.0 by
+// day, and the guard is a BRANCH, so day kernels are bit-identical.
+static const float STAR_ANGULAR_RADIUS = 0.03 * 3.14159265 / 180.0;
+static const float STAR_E     = 2.0e-6;
+static const uint  STAR_CELLS = 64u;
+static const float STAR_L_MAX = 4096.0;
+
+float star_hash01(uint h) { return float(h >> 8u) * (1.0 / 16777216.0); }
+float star_rise(float y, float lo, float hi) {
+    float t = saturate((y - lo) / (hi - lo));
+    return t * t * (3.0 - 2.0 * t);
+}
+
+float3 sky_stars(float3 d, float half_angle, uint twinkle) {
+    if (night <= 0.0 || d.y <= 0.0) return float3(0.0, 0.0, 0.0);
+    // Dominant-axis cube face + in-face coords: hash cells over the sphere.
+    float3 ad = abs(d);
+    uint face; float b1; float b2; float ma;
+    if (ad.x >= ad.y && ad.x >= ad.z) { face = d.x > 0.0 ? 0u : 1u; b1 = d.y; b2 = d.z; ma = ad.x; }
+    else if (ad.y >= ad.z)            { face = d.y > 0.0 ? 2u : 3u; b1 = d.x; b2 = d.z; ma = ad.y; }
+    else                              { face = d.z > 0.0 ? 4u : 5u; b1 = d.x; b2 = d.y; ma = ad.z; }
+    float u = (b1 / ma) * 0.5 + 0.5;
+    float v = (b2 / ma) * 0.5 + 0.5;
+    uint n = STAR_CELLS;
+    uint cx = min(uint(u * float(n)), n - 1u);
+    uint cy = min(uint(v * float(n)), n - 1u);
+    uint seed = face * n * n + cy * n + cx;
+    uint h0 = pcg_mix(seed);
+    if ((h0 & 0xffu) >= 102u) return float3(0.0, 0.0, 0.0); // ~40% occupancy
+    uint h1 = pcg_mix(h0);
+    uint h2 = pcg_mix(h1);
+    uint h3 = pcg_mix(h2);
+    // Inset sub-position (inner 80% — single-cell lookup, no neighbor scan),
+    // mapped back through the face parameterization.
+    float su = (float(cx) + 0.1 + 0.8 * star_hash01(h1)) / float(n) * 2.0 - 1.0;
+    float sv = (float(cy) + 0.1 + 0.8 * star_hash01(h2)) / float(n) * 2.0 - 1.0;
+    float3 sdir;
+    if      (face == 0u) sdir = float3( 1.0, su, sv);
+    else if (face == 1u) sdir = float3(-1.0, su, sv);
+    else if (face == 2u) sdir = float3(su,  1.0, sv);
+    else if (face == 3u) sdir = float3(su, -1.0, sv);
+    else if (face == 4u) sdir = float3(su, sv,  1.0);
+    else                 sdir = float3(su, sv, -1.0);
+    sdir = normalize(sdir);
+    // Energy-conserving Gaussian splat over angle (theta^2 = 2(1-cos), exact
+    // enough at star scales): irradiance-authored, so a star delivers the
+    // same energy whatever the footprint — no crawl, no resolution dimming.
+    float sigma = max(half_angle * 0.5, STAR_ANGULAR_RADIUS);
+    float theta2 = max(2.0 * (1.0 - dot(d, sdir)), 0.0);
+    float g = exp(-theta2 / (2.0 * sigma * sigma));
+    if (g < 1e-4) return float3(0.0, 0.0, 0.0);
+    float tier = 0.25 * float(1u << (h3 & 3u));
+    float warm = star_hash01(pcg_mix(h3));
+    float3 tint = lerp(float3(0.75, 0.85, 1.0), float3(1.0, 0.85, 0.7), warm);
+    float tw = 0.75 + 0.25 * star_hash01(pcg_mix(seed ^ pcg_mix(twinkle >> 3u)));
+    float l = min(STAR_E * tier / (6.2831853 * sigma * sigma), STAR_L_MAX);
+    return tint * (l * g * tw * night * star_rise(d.y, 0.0, 0.05));
+}
+
+// --- Volumetric clouds (src/clouds.rs — term-for-term; change both together) --
+//
+// A drifting 2.5D coverage slab carved by 3D erosion, marched TWO-PHASE with
+// a per-(pixel, frame, sample) DITHERED phase (cloud_dither_k — a pure
+// integer hash + spp stratification, zero rng draws like everything in the
+// sky). Display paths see the whole infinity backdrop (dome + disc + stars)
+// extinguished through the layer plus its sun-lit scatter; the direct loop
+// multiplies its sun by cloud_sun_transmittance (shade.hlsli).
+// sky_dome/gather paths NEVER see clouds — the SH ambient and the hemi
+// integrators stay cloud-free by design. Guards are BRANCHES on FLAG_CLOUDS /
+// the per-ray miss, so a --no-clouds session (and every cloud-free ray) is
+// bit-identical by construction.
+
+static const float CLOUD_BASE_K       = 1.6;
+static const float CLOUD_THICK_K      = 0.8;
+static const float CLOUD_MIN_DY       = 0.05;
+static const float CLOUD_FADE_BAND    = 0.10;
+// Sun elevations at/below this cast no cloud shadow; the shadow eases out
+// over CLOUD_FADE_BAND above it (clouds.rs::CLOUD_SUN_MIN_Y).
+static const float CLOUD_SUN_MIN_Y    = 0.05;
+static const float CLOUD_SCALE_K      = 2.6;
+static const float CLOUD_WIND_SPEED_K = 0.02;
+// Coverage octave-1 amplitude; the retired detail octaves ride as their mean
+// (CLOUD_REST_MEAN). Coverage is 2D (where clouds ARE); the 3D EROSION
+// octaves are what shape they are (clouds.rs).
+static const float CLOUD_AMP1         = 0.3;
+static const float CLOUD_REST_MEAN    = 0.1;
+static const float CLOUD_EROSION      = 0.4;
+// xz lean per unit altitude above base — the strata lean downwind.
+static const float CLOUD_SHEAR        = 0.5;
+static const float CLOUD_THRESH       = 0.60;
+static const float CLOUD_SOFT         = 0.14;
+static const float CLOUD_TAU          = 3.5;
+static const uint  CLOUD_STEPS        = 6u;  // coarse occupancy probes
+static const uint  CLOUD_FINE         = 3u;  // fine sub-steps per occupied one
+static const float CLOUD_MAX_STEP_K   = 3.0;
+static const float CLOUD_SUN_STEP_K   = 0.25;
+static const float CLOUD_ALBEDO       = 0.92;
+static const float CLOUD_AMB_K        = 1.0;
+static const float CLOUD_MS           = 0.06;   // multi-scatter floor (clouds.rs)
+static const float CLOUD_G_FWD        = 0.60;
+static const float CLOUD_G_BACK       = -0.15;
+static const float CLOUD_LOBE_MIX     = 0.7;
+// The static 3D curl wind field (clouds.rs) — wavelength, amplitude, and the
+// vertical fraction of the displacement.
+static const float CLOUD_CURL_SCALE_K = 6.5;
+static const float CLOUD_CURL_AMP_K   = 0.8;
+static const float CLOUD_CURL_YSCALE  = 0.3;
+
+// Gates ONLY the frame term of the march-phase dither — clouds.rs's
+// CLOUD_TEMPORAL_DITHER, keep in lockstep (false = the static fallback).
+static const bool CLOUD_TEMPORAL_DITHER = true;
+
+// The march-phase dither seed (clouds::dither_j): a PURE integer hash of
+// (pixel, frame) — u32-exact CPU<->GPU, consuming NOTHING from any shading
+// rng stream (n = 0 is the XOR identity: bit-identical to the pre-temporal
+// dither). The frame term turns march grain into ordinary temporal noise
+// that accumulation/RR/XeSS integrate; it is NOT the SKY_J lesson's case —
+// that gate rejected the sky-tile fill's DIRECTION set changing per frame,
+// while the phase rides the same directions and applies to every sample
+// symmetrically. Do NOT "clean up" the dither back to a fixed 0.5: with a
+// fixed phase the sample altitudes are ray-independent and every smooth
+// field renders as N nested step-entry contours (the wedding-cake bug,
+// twice shipped).
+float cloud_dither(uint2 px, uint n) {
+    n = CLOUD_TEMPORAL_DITHER ? n : 0u;
+    return star_hash01(pcg_mix(px.x * 0x9E3779B9u ^ px.y * 0x85EBCA6Bu
+        ^ n * 0x3C6EF372u ^ 0x68E31DA4u));
+}
+
+// The per-(pixel, frame, SAMPLE) phase (clouds::dither_jk): hashed per
+// (pixel, frame), STRATIFIED across the frame's spp samples — N evenly
+// spaced phases integrate the march near-exactly, which is what makes --spp
+// soften the clouds. k = 0 adds an exact 0.0 (bitwise cloud_dither); the
+// wrap is a conditional subtract, exact for s < 2.
+float cloud_dither_k(uint2 px, uint n, uint k, uint nspp) {
+    float s = cloud_dither(px, n) + float(k) / float(nspp);
+    return s >= 1.0 ? s - 1.0 : s;
+}
+
+// Lattice hash: pcg_mix over a corner mix — int -> uint is bit-preserving,
+// matching the CPU's wrapping `as u32` casts exactly (u32-exact pipeline).
+float cloud_cell_hash(int i, int j, uint oct) {
+    return star_hash01(pcg_mix(uint(i) * 0x9E3779B9u ^ uint(j) * 0x85EBCA6Bu ^ oct * 0xC2B2AE3Du));
+}
+
+// 3D lattice corner hash — the 2D mix plus a third axis constant.
+float cloud_cell_hash3(int i, int j, int k, uint oct) {
+    return star_hash01(pcg_mix(uint(i) * 0x9E3779B9u ^ uint(j) * 0x85EBCA6Bu
+        ^ uint(k) * 0x27D4EB2Fu ^ oct * 0xC2B2AE3Du));
+}
+
+// 2D value noise: floor() then cast (NEVER a bare int() truncation — negative
+// coordinates would mirror), smoothstep fade, bilerp of 4 corner hashes.
+float cloud_vnoise(float2 q, uint oct) {
+    float fx = floor(q.x);
+    float fy = floor(q.y);
+    int i = int(fx);
+    int j = int(fy);
+    float tx = q.x - fx;
+    float ty = q.y - fy;
+    float ux = tx * tx * (3.0 - 2.0 * tx);
+    float uy = ty * ty * (3.0 - 2.0 * ty);
+    float h00 = cloud_cell_hash(i, j, oct);
+    float h10 = cloud_cell_hash(i + 1, j, oct);
+    float h01 = cloud_cell_hash(i, j + 1, oct);
+    float h11 = cloud_cell_hash(i + 1, j + 1, oct);
+    float a = h00 + (h10 - h00) * ux;
+    float b = h01 + (h11 - h01) * ux;
+    return a + (b - a) * uy;
+}
+
+// 3D value noise (clouds.rs::vnoise3): smoothstep-faded trilerp of 8 corner
+// hashes — the erosion field's genuinely-3D noise.
+float cloud_vnoise3(float3 q, uint oct) {
+    float fx = floor(q.x);
+    float fy = floor(q.y);
+    float fz = floor(q.z);
+    int i = int(fx);
+    int j = int(fy);
+    int k = int(fz);
+    float tx = q.x - fx;
+    float ty = q.y - fy;
+    float tz = q.z - fz;
+    float ux = tx * tx * (3.0 - 2.0 * tx);
+    float uy = ty * ty * (3.0 - 2.0 * ty);
+    float uz = tz * tz * (3.0 - 2.0 * tz);
+    float h000 = cloud_cell_hash3(i, j, k, oct);
+    float h100 = cloud_cell_hash3(i + 1, j, k, oct);
+    float h010 = cloud_cell_hash3(i, j + 1, k, oct);
+    float h110 = cloud_cell_hash3(i + 1, j + 1, k, oct);
+    float h001 = cloud_cell_hash3(i, j, k + 1, oct);
+    float h101 = cloud_cell_hash3(i + 1, j, k + 1, oct);
+    float h011 = cloud_cell_hash3(i, j + 1, k + 1, oct);
+    float h111 = cloud_cell_hash3(i + 1, j + 1, k + 1, oct);
+    float a0 = h000 + (h100 - h000) * ux;
+    float b0 = h010 + (h110 - h010) * ux;
+    float c0 = a0 + (b0 - a0) * uy;
+    float a1 = h001 + (h101 - h001) * ux;
+    float b1 = h011 + (h111 - h011) * ux;
+    float c1 = a1 + (b1 - a1) * uy;
+    return c0 + (c1 - c0) * uz;
+}
+
+// ANALYTIC gradient of cloud_vnoise3 w.r.t. its unit-cell coordinate
+// (clouds.rs::vnoise3_grad): same 8 corner hashes, the Hermite fade's own
+// derivative, per-axis bilerps of the corner differences. C1 across cell
+// edges (the fade's derivative vanishes there), so the curl field it feeds
+// has no creases.
+float3 cloud_vnoise3_grad(float3 q, uint oct) {
+    float fx = floor(q.x);
+    float fy = floor(q.y);
+    float fz = floor(q.z);
+    int i = int(fx);
+    int j = int(fy);
+    int k = int(fz);
+    float tx = q.x - fx;
+    float ty = q.y - fy;
+    float tz = q.z - fz;
+    float ux = tx * tx * (3.0 - 2.0 * tx);
+    float uy = ty * ty * (3.0 - 2.0 * ty);
+    float uz = tz * tz * (3.0 - 2.0 * tz);
+    float dux = 6.0 * tx * (1.0 - tx);
+    float duy = 6.0 * ty * (1.0 - ty);
+    float duz = 6.0 * tz * (1.0 - tz);
+    float h000 = cloud_cell_hash3(i, j, k, oct);
+    float h100 = cloud_cell_hash3(i + 1, j, k, oct);
+    float h010 = cloud_cell_hash3(i, j + 1, k, oct);
+    float h110 = cloud_cell_hash3(i + 1, j + 1, k, oct);
+    float h001 = cloud_cell_hash3(i, j, k + 1, oct);
+    float h101 = cloud_cell_hash3(i + 1, j, k + 1, oct);
+    float h011 = cloud_cell_hash3(i, j + 1, k + 1, oct);
+    float h111 = cloud_cell_hash3(i + 1, j + 1, k + 1, oct);
+    float xa = (h100 - h000) + ((h110 - h010) - (h100 - h000)) * uy;
+    float xb = (h101 - h001) + ((h111 - h011) - (h101 - h001)) * uy;
+    float ya = (h010 - h000) + ((h110 - h100) - (h010 - h000)) * ux;
+    float yb = (h011 - h001) + ((h111 - h101) - (h011 - h001)) * ux;
+    float za = (h001 - h000) + ((h101 - h100) - (h001 - h000)) * ux;
+    float zb = (h011 - h010) + ((h111 - h110) - (h011 - h010)) * ux;
+    return float3(
+        dux * (xa + (xb - xa) * uz),
+        duy * (ya + (yb - ya) * uz),
+        duz * (za + (zb - za) * uy));
+}
+
+// The low-frequency 3D curl wind field as a STATIC sampling displacement
+// (clouds.rs::curl_offset): v = grad(psi1) x grad(psi2), soft-normalized to
+// |v| < 1 (the hard bound the march's skip margin leans on), y scaled by
+// CLOUD_CURL_YSCALE. Time-independent, sampled at raw world coordinates —
+// clouds deform/wander/billow as the wind carries them through it.
+float3 cloud_curl_offset(float3 p) {
+    float lc = CLOUD_CURL_SCALE_K * SCENE_DIAG;
+    float3 q = p * (1.0 / lc);
+    float3 v = cross(cloud_vnoise3_grad(q, 6u), cloud_vnoise3_grad(q, 7u));
+    v *= 1.0 / (1.0 + length(v));
+    return float3(v.x, CLOUD_CURL_YSCALE * v.y, v.z) * (CLOUD_CURL_AMP_K * SCENE_DIAG);
+}
+
+// Per-octave anti-alias attenuation (clouds.rs::oct_t): full detail while
+// the octave's wavelength is resolved by the sampling footprint w (the
+// march's step length), collapsing to the octave MEAN once w >= l —
+// point-sampling unresolvable detail renders each grazing march step as its
+// own separated bead. Fully-attenuated octaves skip their noise evals.
+float cloud_oct_t(float w, float l) { return saturate(2.0 - 2.0 * w / l); }
+
+// THE advection expression (clouds.rs::advect), factored so cover and
+// erosion share ONE copy — the CPU's advection-identity gate premise. The
+// wind term stays the LAST subtraction.
+float2 cloud_advect(float3 p) {
+    float base = CLOUD_BASE_K * SCENE_DIAG;
+    float2 wind = float2(0.932, 0.362) * (CLOUD_WIND_SPEED_K * SCENE_DIAG);
+    float lean = CLOUD_SHEAR * (p.y - base);
+    return float2(p.x + 0.932 * lean, p.z + 0.362 * lean) - wind * CLOUD_TIME;
+}
+
+// THE 2D coverage field (clouds.rs::cloud_cover) — where clouds ARE. Shared
+// verbatim by the lo (shadow/lighting) and visible (erosion-carved) fields,
+// which is what makes density <= density_lo a bitwise theorem (G8). The
+// staged cutoff is the clear-sky fast path AND exact: octave 0's partial sum
+// plus the full remaining amplitude bounds the sum, so the early 0.0 is the
+// value the remap would produce (value-continuous).
+float cloud_cover(float3 p, float w) {
+    float l0 = CLOUD_SCALE_K * SCENE_DIAG;
+    float2 q = cloud_advect(p) * (1.0 / l0);
+    float t0 = cloud_oct_t(w, l0);
+    float n0 = 0.5;
+    if (t0 >= 1.0) n0 = cloud_vnoise(q, 0u);
+    else if (t0 > 0.0) n0 = 0.5 + (cloud_vnoise(q, 0u) - 0.5) * t0;
+    float c0 = 0.5 * n0;
+    if (c0 + CLOUD_AMP1 + CLOUD_REST_MEAN <= CLOUD_THRESH) return 0.0;
+    float t1 = cloud_oct_t(w, l0 * 0.5);
+    float n1 = 0.5;
+    if (t1 >= 1.0) n1 = cloud_vnoise(q * 2.0, 1u);
+    else if (t1 > 0.0) n1 = 0.5 + (cloud_vnoise(q * 2.0, 1u) - 0.5) * t1;
+    float c1 = c0 + CLOUD_AMP1 * n1;
+    return saturate((c1 + CLOUD_REST_MEAN - CLOUD_THRESH) / CLOUD_SOFT);
+}
+
+// The column's local top (clouds.rs::cloud_top) — shared by prof and the
+// march's interval-window skip.
+float cloud_top(float cover, float base, float thick) {
+    return base + thick * (0.30 + 0.70 * cover);
+}
+
+// The coverage-driven vertical window (clouds.rs::cloud_prof): fast rise off
+// the base, taper to the column's OWN top (taller where denser).
+float cloud_prof(float py, float cover, float base, float thick) {
+    float top_l = cloud_top(cover, base, thick);
+    return saturate((py - base) / (0.20 * thick))
+        * saturate((top_l - py) / (0.30 * thick));
+}
+
+// The 3D erosion factor (clouds.rs::erosion3): ONE octave of genuinely-3D
+// value noise at l0/4 (a second at l0/8 was tried and rejected on cost —
+// clouds.rs) — what breaks the nested-level-set structure a 2D field is
+// stuck with. xz rides the SAME advection expression (the erosion drifts and
+// shears with its cloud); y raw over the same wavelength.
+float cloud_erosion3(float3 p, float w) {
+    float l0 = CLOUD_SCALE_K * SCENE_DIAG;
+    float le = l0 * 0.25;
+    float2 uv = cloud_advect(p);
+    float3 qe = float3(uv.x, p.y, uv.y) * (1.0 / le);
+    float te0 = cloud_oct_t(w, le);
+    if (te0 >= 1.0) return cloud_vnoise3(qe, 5u);
+    if (te0 > 0.0) return 0.5 + (cloud_vnoise3(qe, 5u) - 0.5) * te0;
+    return 0.5;
+}
+
+// The VISIBLE density at an ALREADY-WARPED point (clouds.rs::density_at):
+// shared 2D coverage carved by the 3D erosion inside the coverage-driven
+// window. vnoise3 runs only where cover*prof > 0. The public _f wrapper
+// applies the exact per-point curl warp; the march passes a warp HOISTED
+// per coarse interval.
+float cloud_density_at(float3 pw, float w) {
+    float base = CLOUD_BASE_K * SCENE_DIAG;
+    float thick = CLOUD_THICK_K * SCENE_DIAG;
+    float cover = cloud_cover(pw, w);
+    if (cover <= 0.0) return 0.0;
+    float prof = cloud_prof(pw.y, cover, base, thick);
+    if (prof <= 0.0) return 0.0;
+    float s3 = cloud_erosion3(pw, w);
+    float eroded = saturate(cover - CLOUD_EROSION * (1.0 - s3));
+    return eroded * prof;
+}
+float cloud_density_f(float3 p, float w) {
+    return cloud_density_at(p + cloud_curl_offset(p), w);
+}
+float cloud_density(float3 p) { return cloud_density_f(p, 0.0); }
+
+// The 2D SHADOW/LIGHTING field (cover*prof, no erosion) — the hot one:
+// sun_transmittance, the march's sun probes, the rough reflection march.
+// Sees the SAME curl warp as the visible field (the shadow must track the
+// cloud that casts it; G8 requires the shared domain).
+float cloud_density_lo_at(float3 pw, float w) {
+    float base = CLOUD_BASE_K * SCENE_DIAG;
+    float thick = CLOUD_THICK_K * SCENE_DIAG;
+    float cover = cloud_cover(pw, w);
+    if (cover <= 0.0) return 0.0;
+    return cover * cloud_prof(pw.y, cover, base, thick);
+}
+float cloud_density_lo_f(float3 p, float w) {
+    return cloud_density_lo_at(p + cloud_curl_offset(p), w);
+}
+float cloud_density_lo(float3 p) { return cloud_density_lo_f(p, 0.0); }
+
+float cloud_hg(float mu, float g) {
+    float g2 = g * g;
+    float den = max(1.0 + g2 - 2.0 * g * mu, 1e-4);
+    return (1.0 - g2) / (4.0 * 3.14159265 * den * sqrt(den));
+}
+
+// The two-phase adaptive march (clouds::along_k). Returns false when the ray
+// met no cloud — the caller's backdrop must pass through UNTOUCHED (the
+// bit-identity arm). `j` in [0,1) is the dither phase
+// (cloud_dither_k(px, frame, s, spp) where a pixel exists — per (pixel,
+// frame, sample); 0.5 on pixel-less paths).
+// Phase A: CLOUD_STEPS coarse DITHERED probes of the 2D cover only (a point
+// test of prof would re-quantize the top surface — the ring bug). Phase B:
+// occupied coarse intervals get CLOUD_FINE fine sub-steps of the full 3D
+// density at the FINE footprint, plus ONE shared sun probe per coarse step.
+// `amb` is dome(d) * CLOUD_AMB_K; `sun` may be the MOON at night.
+bool clouds_along(float3 o, float3 d, float3 amb, float j, out float t_out, out float3 sc_out) {
+    t_out = 1.0;
+    sc_out = float3(0.0, 0.0, 0.0);
+    if ((flags & FLAG_CLOUDS) == 0u || d.y <= CLOUD_MIN_DY) return false;
+    float base = CLOUD_BASE_K * SCENE_DIAG;
+    float thick = CLOUD_THICK_K * SCENE_DIAG;
+    if (o.y >= base) return false; // 2.5D: modeled from below only
+    float sigma_t = CLOUD_TAU / thick;
+    float t0 = (base - o.y) / d.y;
+    float dt_c = min(thick / (float(CLOUD_STEPS) * d.y), CLOUD_MAX_STEP_K * thick);
+    float dt_f = dt_c / float(CLOUD_FINE);
+    float mu = clamp(dot(d, sun.xyz), -1.0, 1.0);
+    float phase = CLOUD_LOBE_MIX * cloud_hg(mu, CLOUD_G_FWD)
+        + (1.0 - CLOUD_LOBE_MIX) * cloud_hg(mu, CLOUD_G_BACK);
+    // Sunlight at cloud altitude: e_over_pi rebuilt to irradiance, tinted by
+    // the dome's own sun-path transmittance (sky.rs::t_sun_path) — clouds
+    // redden at sunset in lockstep with the sky.
+    float3 sun_col = sun_e.xyz * 3.14159265
+        * exp(-(SKY_BETA_R + SKY_BETA_M) / (max(sun.y, 0.0) + 0.15));
+    float l_sun = CLOUD_SUN_STEP_K * thick / max(sun.y, 0.35);
+    float t_acc = 1.0;
+    bool opaque = false;
+    // The curl warp, HOISTED per RAY and folded into a WARPED RAY ORIGIN
+    // (clouds.rs::along_k — per-coarse-step warps measured +21 ms CPU and
+    // ~2x the wavefront's per-sample cost): every sample position below is
+    // ow + d*t, zero extra inner-loop arithmetic, and the skip's
+    // field-space altitude is exact. The slab geometry (t0, dt_c) stays a
+    // function of the REAL o.
+    float3 ow = o + cloud_curl_offset(o + d * (t0 + 0.5 * float(CLOUD_STEPS) * dt_c));
+    [unroll]
+    for (uint i = 0u; i < CLOUD_STEPS; i++) {
+        if (opaque) break;
+        // Phase A: DITHERED coarse occupancy probe — 2D cover only, sampled
+        // through the ray's hoisted curl warp.
+        float tc = t0 + (float(i) + j) * dt_c;
+        float3 pc = ow + d * tc;
+        float cov = cloud_cover(pc, dt_c);
+        if (cov <= 0.0) continue;
+        // Interval-window skip (clouds.rs): fine-marching the empty air
+        // above the column's own top was a measured +17 ms CPU regression.
+        // The per-RAY hoist makes the warp constant along this chord, so
+        // ow.y + d.y*t IS the field-space altitude — exact, no margin.
+        float y_lo = ow.y + d.y * (t0 + float(i) * dt_c);
+        if (y_lo >= cloud_top(cov, base, thick) + 0.1 * thick) continue;
+        // One sun probe AND one lighting transmittance per occupied coarse
+        // step, shared by its sub-steps (clouds.rs — a per-fine-sample exp
+        // pair was a measured cost driver; the coarse cover is the local-
+        // density proxy). The probe rides the ray's hoisted warp.
+        float rho_sun = cloud_density_lo_at(pc + sun.xyz * l_sun, 0.0);
+        float t_sun = exp(-((rho_sun + 0.5 * cov) * sigma_t * l_sun));
+        float3 s = (sun_col * ((phase + CLOUD_MS) * t_sun) + amb) * CLOUD_ALBEDO;
+        // Phase B: fine sub-steps, full 3D density, same dither phase.
+        // [loop], not [unroll]: 18 inlined density bodies would bloat every
+        // kernel that pastes this file (the LEAF_NO_FB VGPR lesson).
+        [loop]
+        for (uint m = 0u; m < CLOUD_FINE; m++) {
+            // The COARSE cover is reused across the sub-interval (clouds.rs:
+            // re-evaluating the smooth 2D placement per fine sample was a
+            // measured cost with no visible gain); only erosion + the
+            // vertical window run at fine resolution.
+            float tf = t0 + float(i) * dt_c + (float(m) + j) * dt_f;
+            float3 p = ow + d * tf;
+            float prof = cloud_prof(p.y, cov, base, thick);
+            if (prof <= 0.0) continue;
+            float s3 = cloud_erosion3(p, dt_f);
+            float rho = saturate(cov - CLOUD_EROSION * (1.0 - s3)) * prof;
+            if (rho <= 0.0) continue;
+            float a = exp(-(rho * sigma_t * dt_f));
+            sc_out += s * (t_acc * (1.0 - a));
+            t_acc *= a;
+            // Opaque-core break (clouds.rs): < 0.5% left to add.
+            if (t_acc < 0.005) { opaque = true; break; }
+        }
+    }
+    if (t_acc >= 1.0) return false; // every sample empty — bit-clean fallthrough
+    float fade = saturate((d.y - CLOUD_MIN_DY) / CLOUD_FADE_BAND);
+    t_out = 1.0 + (t_acc - 1.0) * fade;
+    sc_out *= fade;
+    return true;
+}
+
+// The ROUGH-path march (clouds::along_rough): 2 fixed midpoints over the
+// 2-octave field, for SECONDARY specular paths — a reflected sky is seen
+// through the GGX lobe's blur, and the full march at the reflection-miss
+// site was the largest single share of the cloud layer's cost.
+static const uint CLOUD_ROUGH_STEPS = 2u;
+bool clouds_along_rough(float3 o, float3 d, float3 amb, out float t_out, out float3 sc_out) {
+    t_out = 1.0;
+    sc_out = float3(0.0, 0.0, 0.0);
+    if ((flags & FLAG_CLOUDS) == 0u || d.y <= CLOUD_MIN_DY) return false;
+    float base = CLOUD_BASE_K * SCENE_DIAG;
+    float thick = CLOUD_THICK_K * SCENE_DIAG;
+    if (o.y >= base) return false;
+    float sigma_t = CLOUD_TAU / thick;
+    float t0 = (base - o.y) / d.y;
+    float dt = min(thick / (float(CLOUD_ROUGH_STEPS) * d.y), CLOUD_MAX_STEP_K * thick);
+    float mu = clamp(dot(d, sun.xyz), -1.0, 1.0);
+    float phase = CLOUD_LOBE_MIX * cloud_hg(mu, CLOUD_G_FWD)
+        + (1.0 - CLOUD_LOBE_MIX) * cloud_hg(mu, CLOUD_G_BACK);
+    float3 sun_col = sun_e.xyz * 3.14159265
+        * exp(-(SKY_BETA_R + SKY_BETA_M) / (max(sun.y, 0.0) + 0.15));
+    float l_sun = CLOUD_SUN_STEP_K * thick / max(sun.y, 0.35);
+    float t_acc = 1.0;
+    // ONE curl warp for the whole rough march, folded into the ray origin
+    // (clouds.rs::along_rough): a reflected sky is seen through the GGX
+    // lobe's blur.
+    float3 ow = o + cloud_curl_offset(o + d * (t0 + 0.5 * dt));
+    [unroll]
+    for (uint k = 0u; k < CLOUD_ROUGH_STEPS; k++) {
+        float tk = t0 + (float(k) + 0.5) * dt;
+        float3 p = ow + d * tk;
+        float rho = cloud_density_lo_at(p, dt);
+        if (rho <= 0.0) continue;
+        float a = exp(-(rho * sigma_t * dt));
+        float rho_sun = cloud_density_lo_at(p + sun.xyz * l_sun, 0.0);
+        float t_sun = exp(-((rho_sun + 0.5 * rho) * sigma_t * l_sun));
+        float3 s = (sun_col * ((phase + CLOUD_MS) * t_sun) + amb) * CLOUD_ALBEDO;
+        sc_out += s * (t_acc * (1.0 - a));
+        t_acc *= a;
+    }
+    if (t_acc >= 1.0) return false;
+    float fade = saturate((d.y - CLOUD_MIN_DY) / CLOUD_FADE_BAND);
+    t_out = 1.0 + (t_acc - 1.0) * fade;
+    sc_out *= fade;
+    return true;
+}
+
+// Cloud shadow toward the sun (clouds::sun_transmittance): exactly two
+// density evals at the slab's quarter heights, Beer over the slant path.
+// The unshadowed arms return an EXACT 1.0 (x * 1.0 is bit-preserving); the
+// low-sun band eases the shadow out so a TOD scrub never pops it.
+float cloud_sun_transmittance(float3 p) {
+    if ((flags & FLAG_CLOUDS) == 0u || sun.y <= CLOUD_SUN_MIN_Y) return 1.0;
+    float base = CLOUD_BASE_K * SCENE_DIAG;
+    float thick = CLOUD_THICK_K * SCENE_DIAG;
+    if (p.y >= base) return 1.0;
+    float s_lo = (base + 0.25 * thick - p.y) / sun.y;
+    float s_hi = (base + 0.75 * thick - p.y) / sun.y;
+    // ONE curl warp at the probes' midpoint, folded into the surface point
+    // and shared by both evals — the hot path (two evals per shade on every
+    // lit pixel); clouds.rs, term for term.
+    float3 pw = p + cloud_curl_offset(p + sun.xyz * (0.5 * (s_lo + s_hi)));
+    float rho =
+        0.5 * (cloud_density_lo_at(pw + sun.xyz * s_lo, 0.0)
+             + cloud_density_lo_at(pw + sun.xyz * s_hi, 0.0));
+    if (rho <= 0.0) return 1.0;
+    float t = exp(-(rho * CLOUD_TAU / max(sun.y, 0.25)));
+    // Low-sun ease-out (clouds.rs, term for term). fade >= 1 returns the
+    // Beer factor VERBATIM — 1 + (t-1) is not bit-preserving for small t.
+    float fade = saturate((sun.y - CLOUD_SUN_MIN_Y) / CLOUD_FADE_BAND);
+    return fade >= 1.0 ? t : 1.0 + (t - 1.0) * fade;
+}
+
+// What an escaping ray SEES: the backdrop (dome + disc + stars) through the
+// cloud layer, plus the layer's scatter. DISPLAY paths only. `o` is the ray's
+// ORIGIN — the slab is finite-altitude, so unlike everything at infinity the
+// start matters (sky.rs::radiance, same signature change). `half_angle` is
+// the ray's angular footprint (primary: pixel_cone/2); `twinkle` is the frame
+// index on primary misses, 0 on secondary paths.
+// `j` is the cloud march's dither phase (cloud_dither_k(px, frame, s, spp)
+// where a pixel exists — every kernel's miss and the sky fill, per (pixel,
+// frame, sample); 0.5 on pixel-less paths like the glass miss inside
+// shade.hlsli, which the temporal dither deliberately excludes).
+float3 sky_radiance(float3 o, float3 d, float half_angle, uint twinkle, float j) {
+    float3 dm = sky_dome(d);
+    float3 backdrop = dm + sky_disc(d, half_angle) + sky_stars(d, half_angle, twinkle);
+    if ((flags & FLAG_CLOUDS) == 0u) return backdrop;
+    float ct;
+    float3 cs;
+    if (!clouds_along(o, d, dm * CLOUD_AMB_K, j, ct, cs)) return backdrop;
+    return backdrop * ct + cs;
+}
 
 // Balance heuristic (sky::mis_weight). The sun's specular is reachable both by
 // light sampling (direct_s) and by the VNDF reflection ray landing in the disc;

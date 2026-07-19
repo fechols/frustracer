@@ -102,8 +102,10 @@ void cs_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
         } else {
             // A DISPLAY path (the camera looking at the sky), so it sees the sun
             // DISC — sky.rs's disc-exactly-once rule. The half-angle is the ray's
-            // own footprint, which is what antialiases the limb.
-            c = sky_radiance(dir, pixel_cone * 0.5);
+            // own footprint, which is what antialiases the limb. The cloud march
+            // phase is per (pixel, frame, SAMPLE) — render.rs's dither_jk twin.
+            c = sky_radiance(cam_origin.xyz, dir, pixel_cone * 0.5, frame,
+                             cloud_dither_k(uint2(x, y), frame, s, spp));
             t = INF;
             if (prim) gbuf_write_sky(pi, sp.x, sp.y, dir);
         }

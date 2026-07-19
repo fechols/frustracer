@@ -33,13 +33,17 @@ void raygen() {
         p.t = INF;
         p.rng = rng;
         p.sp = sp;
-        // The probe sample owns every per-pixel side channel; chs_shade reads
-        // this bit (it fires once per SAMPLE now, not once per pixel).
-        p.prim = (s == probe_sample) ? 1u : 0u;
+        // prim packs TWO things (payload stays 32 B): bit 0 = the probe bit
+        // (the sample that owns every per-pixel side channel; chs_shade reads
+        // it), bits 1.. = the sample index s — the miss shader has the pixel
+        // (DispatchRaysIndex) and the frame (CB) but not s, and the cloud
+        // march phase is per (pixel, frame, SAMPLE). spp <= MAX_SPP = 128
+        // fits with 23 bits to spare.
+        p.prim = (s << 1) | ((s == probe_sample) ? 1u : 0u);
         TraceRay(tlas, OPAQUE_RF, 0xffu, 0u, 0u, 0u, r, p);
 
         csum += p.color;
-        if (p.prim != 0u) {
+        if ((p.prim & 1u) != 0u) {
             tbuf[pi] = p.t;
             info[pi] = pack_info(0u, KIND_LEAF);
             // Sky G-buffer capture (FLAG_GBUF-gated inside the helper — plain
@@ -81,8 +85,9 @@ void chs_shade(inout RayPayload p, in BuiltInTriangleIntersectionAttributes a) {
     // more), and only the probe sample may write the pack — otherwise the
     // guides would drift off the jitter the upscaler was told about. The
     // sample position rides the payload: raygen owns the jitter policy, this
-    // stage just reports where the ray was.
-    if (p.prim == 0u) return;
+    // stage just reports where the ray was. Bit 0 of prim is the probe bit —
+    // the high bits carry the sample index for the miss shader's cloud phase.
+    if ((p.prim & 1u) == 0u) return;
     uint2 id = DispatchRaysIndex().xy;
     gbuf_write_hit(id.y * rw + id.x, p.sp.x, p.sp.y, WorldRayDirection(), h.t, ps);
 }
@@ -99,8 +104,11 @@ void chs_hit(inout HitPayload p, in BuiltInTriangleIntersectionAttributes a) {
 void miss_radiance(inout RayPayload p) {
     // The raygen primary ray's miss: a DISPLAY path (the backdrop), so it sees
     // the sun disc. Reflection/glass continuations route to miss_hit_info and
-    // are handled inside shade.hlsli, per the sky.rs invariant.
-    p.color = sky_radiance(WorldRayDirection(), pixel_cone * 0.5);
+    // are handled inside shade.hlsli, per the sky.rs invariant. The cloud
+    // march phase is per (pixel, frame, SAMPLE) — the sample index rides
+    // prim's high bits (raygen packs `(s << 1) | probe`).
+    p.color = sky_radiance(WorldRayOrigin(), WorldRayDirection(), pixel_cone * 0.5, frame,
+                           cloud_dither_k(DispatchRaysIndex().xy, frame, p.prim >> 1u, spp));
     p.t = INF;
 }
 

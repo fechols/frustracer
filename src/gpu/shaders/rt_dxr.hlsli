@@ -36,8 +36,10 @@ struct HitInfo {
 // primary t (INF = sky, the tbuf convention) ride out.
 //
 // --spp: raygen fires one of these per SAMPLE, so the sample's position (sp)
-// and whether it is the probe sample (prim — the one that owns tbuf/info/the
-// G-buffer pack) ride in too. chs_shade can no longer recompute the position
+// and its identity ride in too: prim = `(s << 1) | probe_bit` — bit 0 marks
+// the probe sample (the one that owns tbuf/info/the G-buffer pack), the high
+// bits carry the sample index for the miss shader's per-sample cloud march
+// phase (cloud_dither_k). chs_shade can no longer recompute the position
 // from frame_jitter alone, and it no longer fires exactly once per pixel.
 struct RayPayload {
     float3 color;

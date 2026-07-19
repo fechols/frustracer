@@ -219,7 +219,9 @@ impl DxrGpu {
         );
         // RayPayload {float3 + float + uint + float2 + uint} = 32 B is the
         // largest payload (the float2/uint tail is --spp: the sample's own
-        // position and its probe bit); triangle barycentrics = 8 B.
+        // position, and prim = `(sample << 1) | probe_bit` — the index rides
+        // the high bits so the miss shader can key the per-sample cloud march
+        // phase without growing the payload); triangle barycentrics = 8 B.
         let shader_cfg = D3D12_RAYTRACING_SHADER_CONFIG {
             MaxPayloadSizeInBytes: 32,
             MaxAttributeSizeInBytes: 8,
@@ -391,6 +393,12 @@ impl DxrGpu {
         self.cb_base
             .with_frame(p, self.gbuf_full, fsr_sig)
             .store(unsafe { self.frame_cb.ptr.add(slot * CB_STRIDE) });
+    }
+
+    /// Re-derive the base CB's sun/sky rows after a TOD change —
+    /// `TraceGpu::refresh_sky`'s twin (`FrameCb::refresh_sky_rows`).
+    pub fn refresh_sky(&mut self, scene: &Scene) {
+        self.cb_base.refresh_sky_rows(scene, self.rw, self.rh);
     }
 
     /// The DXR twin of TraceGpu::wire_feed — same heap layout, same typed-store

@@ -216,7 +216,30 @@ void cs_sky(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
         uint x = p0.x + i % w;
         uint y = p0.y + i / w;
         float3 dir = ray_dir(float(x) + 0.5, float(y) + 0.5);
-        float3 c = sky_radiance(dir, pixel_cone * 0.5);
+        // March-phase dither per (pixel, frame, SAMPLE) — the center rides
+        // sample 0's stratum, mirroring render.rs::fill_sky_rows verbatim.
+        float cj = cloud_dither_k(uint2(x, y), frame, 0u, spp);
+        float3 c = sky_radiance(cam_origin.xyz, dir, pixel_cone * 0.5, frame, cj);
+        // Under CLOUDS the sky has sub-pixel structure (a cover-ramp edge
+        // crosses a pixel), so a multi-sampled frame averages spp sample
+        // positions — render.rs::fill_sky_rows, term for term (sample 0 stays
+        // the center; still zero rays). The DIRECTION offsets are the PHASE-0
+        // Halton table (SKY_J, injected by trace::spp_defs), frame-independent
+        // like the center itself: a static function's antialias must not
+        // dither across frames (the spp stability gate at night is the proof
+        // — a direction-SET lesson; the march PHASE is per-sample and
+        // frame-keyed, symmetric across spp levels, which that gate accepts).
+        // The guard keeps spp == 1 and cloudless skies on the old path
+        // verbatim.
+        if ((flags & FLAG_CLOUDS) && spp > 1u) {
+            for (uint s = 1u; s < spp; ++s) {
+                float2 o = SKY_J[s];
+                float3 ds = ray_dir(float(x) + 0.5 + o.x, float(y) + 0.5 + o.y);
+                c += sky_radiance(cam_origin.xyz, ds, pixel_cone * 0.5, frame,
+                                  cloud_dither_k(uint2(x, y), frame, s, spp));
+            }
+            c *= 1.0 / float(spp);
+        }
         uint pi = y * rw + x;
         uint i3 = pi * 3u;
         // The compose pass is the single accum splat site; sky pixels carry

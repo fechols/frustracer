@@ -1211,6 +1211,19 @@ impl GpuContext {
         self.trace.is_some()
     }
 
+    /// Push a TOD change (`scene::apply_tod`) into the GPU pipelines' cached
+    /// base constants — sun rows + SH sky + sky_scale/night. A pipeline built
+    /// lazily AFTER the change needs nothing: `init_trace`/`init_dxr` read the
+    /// scene at call time.
+    pub fn refresh_sky(&mut self, scene: &crate::scene::Scene) {
+        if let Some(t) = &mut self.trace {
+            t.refresh_sky(scene);
+        }
+        if let Some(d) = &mut self.dxr {
+            d.refresh_sky(scene);
+        }
+    }
+
     /// Build the DXR DispatchRays pipeline (the F key / --dxr). Idempotent —
     /// a live pipeline is kept. `(rw, rh)` is the session's fixed DXR trace
     /// resolution (the locked render res when `gbuf` composes with the wired
@@ -1848,7 +1861,12 @@ impl GpuContext {
     /// vanilla reference, compare per pixel (same intersector both sides —
     /// the exact-zero gates), and report. Clobbers accum/tbuf/info; the
     /// caller resets the accumulation.
-    pub fn verify_trace(&mut self, cam: &crate::camera::CamBasis, q: crate::shade::Quality) -> Result<String> {
+    pub fn verify_trace(
+        &mut self,
+        cam: &crate::camera::CamBasis,
+        q: crate::shade::Quality,
+        clouds: crate::clouds::Clouds,
+    ) -> Result<String> {
         let (tbuf, info, counters, px) = {
             let Some(tg) = &self.trace else {
                 return Err("GPU tracer not initialized".into());
@@ -1866,6 +1884,10 @@ impl GpuContext {
             verify: false,
             spp: 1,
             probe_sample: 0,
+            // The live session state: both kernels read the same CB, so the
+            // same-seed comparison holds whatever the sky is doing — and the
+            // C verify then exercises the cloud code the session actually runs.
+            clouds,
         };
         {
             // Field-split borrow: run_once needs d3d mutably, the recorder
