@@ -62,9 +62,13 @@ pub fn cut_seed_hemi() -> bool {
 /// switch that needs NO rebuild — the swept boxes stay conservative for
 /// both modes (they only ever contain the flat triangle), so every frustum
 /// claim, temporal entry, and hemi bound remains sound with the toggle in
-/// either state.
+/// either state. The DEFAULT is plain normal-mapping (`HEIGHT_ON` false;
+/// `--heightfield` or V opts into relief) while ARMED stays true, so the
+/// swept tree is built and V can enable relief live without a rebuild —
+/// and the scene-cache key, which rides ARMED only, is unmoved by the
+/// mode default.
 static HEIGHT_ARMED: AtomicBool = AtomicBool::new(true);
-static HEIGHT_ON: AtomicBool = AtomicBool::new(true);
+static HEIGHT_ON: AtomicBool = AtomicBool::new(false);
 
 pub fn set_height_armed(on: bool) {
     HEIGHT_ARMED.store(on, Ordering::Relaxed);

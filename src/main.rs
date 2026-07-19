@@ -630,9 +630,10 @@ fn main() {
             "--no-n2h" => texture::set_n2h(false),
             // Relief rendering session levers. --no-heightfield is STRUCTURAL
             // (no AABB sweep at BVH build, no march anywhere — part of the
-            // scene-cache lever word); --heightfield is the explicit default
-            // spelling (relief starts ON wherever the scene carries height).
-            // The V key toggles live within an armed session.
+            // scene-cache lever word); --heightfield starts relief ON where
+            // the scene carries height (the DEFAULT mode is plain
+            // normal-mapping: armed but off, so the swept tree exists and
+            // the V key toggles relief live within an armed session).
             // Restores BOTH statics so `--no-heightfield --heightfield`
             // (later flags win) is a true no-op — headless --check* paths
             // read height_on() directly, with no session() to re-seed it.
@@ -1029,9 +1030,10 @@ fn main() {
                 eprintln!("                dropped, the pre-conversion behavior)");
                 eprintln!("  --no-n2h      don't derive heightfields from normal maps (Frankot–Chellappa) — no");
                 eprintln!("                alpha-channel height, height_amp stays 0");
+                eprintln!("  --heightfield start with relief rendering ON where the scene carries height data");
+                eprintln!("                (default: plain normal-mapping; V toggles relief live either way)");
                 eprintln!("  --no-heightfield  no relief rendering, structurally (no swept AABBs, no march;");
-                eprintln!("                the pre-relief renderer bit-exactly). Default: relief ON where the");
-                eprintln!("                scene carries height data; V toggles it live vs normal-mapped");
+                eprintln!("                the pre-relief renderer bit-exactly — V cannot re-enable it)");
                 eprintln!("  --aniso N     max anisotropy for texture filtering, 1..=16 (default 16; 1 = off, i.e.");
                 eprintln!("                the isotropic ray-cone trilinear path verbatim). --no-aniso = --aniso 1");
                 eprintln!("  --spp <n>     primary samples per pixel per frame (1..=128, default 1; U doubles live).");
@@ -10383,10 +10385,12 @@ fn session(
     // Hemisphere frustum bounces (H cycles off → AO → GI): still-frame
     // quality — moving/DLSS frames keep the sampled path.
     let mut bounce_mode = p0.map_or(0u32, |p| p.bounce_mode);
-    // Heightfield relief vs normal-mapped (V; starts ON where the scene has
-    // height data unless --no-heightfield disarmed it). The static the
-    // intersector reads is stored here and at every V edge.
-    let mut height_on = p0.map_or(bvh::height_armed(), |p| p.height_on);
+    // Heightfield relief vs normal-mapped (V; starts OFF — plain
+    // normal-mapping is the default mode — unless --heightfield opted in).
+    // Seeded from the flag-state static (height_on(), NOT height_armed():
+    // armed stays true by default so V can enable relief live). The static
+    // the intersector reads is stored here and at every V edge.
+    let mut height_on = p0.map_or(bvh::height_on(), |p| p.height_on);
     bvh::set_height_on(height_on);
     let mut preset = p0.map_or(2u32, |p| p.preset);
     // Samples per pixel per frame (--spp seeds it, U cycles). Every mode reads
