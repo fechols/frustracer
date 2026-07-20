@@ -11288,22 +11288,27 @@ fn session(
         // Time-of-day scrub (`,`/`.`, D-pad L/R). A TOD delta is a SHADING
         // change, not camera motion: re-derive the sun/moon + SH ambient
         // (scene::apply_tod), push the new rows into the GPU pipelines'
-        // cached base CBs, and fire the quality-change reset set — frame = 0
-        // plus every temporal history (the U-key contract; the CPU arm's
-        // xess/fsr/OIDN/NPPD latches take `sun_moved` below). Deliberately
-        // KEPT: the temporal frustum cache, claim ring, and structure replay —
-        // geometry-only claims; replay re-shades from the fresh ctx. An idle
-        // session never enters this block (bit compare of an unwritten tod),
-        // which is the untouched-session bit-identity guard.
+        // cached base CBs, and reset plain ACCUMULATION (frame = 0 — a
+        // converged still frame must not keep stale lighting). Deliberately
+        // KEPT: every upscaler/denoiser history (RR/FSR/XeSS/OIDN/NPPD) — a
+        // held scrub fires this block EVERY frame, so a per-tick history
+        // reset left RR reconstructing 1-spp frames with zero temporal
+        // context for the whole scrub, and its spatial prior smeared the
+        // night-sky star field into drifting cloud-shaped blotches (worst on
+        // the CPU arm's 66% lock-res input). The scrub is rate-limited
+        // (1 h/s ⇒ ~seconds of sky per frame), so lighting drift is the
+        // cloud/firefly precedent: a shading change the temporal integrators
+        // absorb, never a discontinuity. Also KEPT: the temporal frustum
+        // cache, claim ring, and structure replay — geometry-only claims;
+        // replay re-shades from the fresh ctx. An idle session never enters
+        // this block (bit compare of an unwritten tod), which is the
+        // untouched-session bit-identity guard.
         let sun_moved = snap.tod != cur_tod;
         if sun_moved {
             cur_tod = snap.tod;
             scene::apply_tod(scene, cur_tod);
             gpu.refresh_sky(scene);
             frame = 0;
-            gpu_reset = true;
-            dxr_reset = true;
-            dlss_reset = true;
         }
         // The rest of the iteration is read-only on the scene: shadow the
         // &mut down to a shared borrow so every existing use (FrameCtx,
@@ -12407,7 +12412,10 @@ fn session(
         // upscaler's accumulated history mixes shading statistics, so every
         // predicate that resets `frame`/the OIDN history also resets it —
         // EXCEPT camera motion, which is exactly what the temporal upscaler
-        // exists to survive.
+        // exists to survive, and EXCEPT the TOD scrub (`sun_moved`), which
+        // fires per frame while held: continuous lighting drift is the
+        // cloud-drift class of shading change, and a per-tick reset starves
+        // the history for the whole scrub (the star-smear bug).
         if edges.toggle_hybrid
             || edges.toggle_bounce
             || edges.toggle_height
@@ -12419,13 +12427,12 @@ fn session(
             || edges.toggle_dxr
             || edges.cycle_mode
             || temporal_flipped
-            || sun_moved
         {
             xess_reset = true;
         }
         // The same reset contract for the FSR histories (Ray Regeneration's
         // temporal accumulation + FSR4's): every shading-semantics change,
-        // never camera motion.
+        // never camera motion, never the TOD scrub.
         if edges.toggle_hybrid
             || edges.toggle_bounce
             || edges.toggle_height
@@ -12433,7 +12440,6 @@ fn session(
             || edges.cycle_spp
             || edges.toggle_fsr
             || temporal_flipped
-            || sun_moved
         {
             fsr_reset = true;
         }
@@ -12444,8 +12450,11 @@ fn session(
         // shading or mode semantics drops the history; camera motion and the
         // budget↔normal transition deliberately do NOT (surviving motion is
         // the history's whole purpose; coarse budget pixels are handled
-        // per-pixel by the KIND_COARSE rule). Over-invalidating on no-op
-        // edges (e.g. T in DLSS mode) is accepted for the simple predicate.
+        // per-pixel by the KIND_COARSE rule), and neither does the TOD scrub
+        // (per-frame while held — old lighting washes out at the EMA rate, a
+        // brief crossfade instead of a per-tick history wipe). Over-
+        // invalidating on no-op edges (e.g. T in DLSS mode) is accepted for
+        // the simple predicate.
         let hist_stale = edges.toggle_hybrid
             || edges.toggle_dynamic
             || edges.toggle_bounce
@@ -12459,8 +12468,7 @@ fn session(
             || edges.toggle_nppd
             || edges.toggle_dxr
             || edges.cycle_mode
-            || temporal_flipped
-            || sun_moved;
+            || temporal_flipped;
         if hist_stale {
             if let Some(h) = &mut oidn_hist {
                 h.invalidate();
