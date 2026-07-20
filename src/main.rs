@@ -629,15 +629,18 @@ fn main() {
             // at 0.0 — relief has no field to march, structurally off.
             "--no-h2n" => texture::set_h2n(false),
             "--no-n2h" => texture::set_n2h(false),
-            // Relief rendering session levers. --no-heightfield is STRUCTURAL
-            // (no AABB sweep at BVH build, no march anywhere — part of the
-            // scene-cache lever word); --heightfield starts relief ON where
-            // the scene carries height (the DEFAULT mode is plain
-            // normal-mapping: armed but off, so the swept tree exists and
-            // the V key toggles relief live within an armed session).
-            // Restores BOTH statics so `--no-heightfield --heightfield`
-            // (later flags win) is a true no-op — headless --check* paths
-            // read height_on() directly, with no session() to re-seed it.
+            // Relief rendering session levers. The DEFAULT is DISARMED —
+            // structurally the pre-relief renderer (no AABB sweep at BVH
+            // build, no march anywhere; the sweep's all-axis edge pad
+            // measurably wrecks BVH quality on all-tris-carry-height scenes
+            // even with relief off — see bvh.rs's HEIGHT_ARMED header).
+            // --heightfield ARMS the session and starts relief ON (V then
+            // toggles relief live within the armed session); --no-heightfield
+            // is the explicit spelling of the default, kept as the
+            // later-flags-win override. Both set BOTH statics so
+            // `--no-heightfield --heightfield` is a true arm — headless
+            // --check* paths read height_on() directly, with no session()
+            // to re-seed it. Armed state keys the scene cache.
             "--heightfield" => {
                 bvh::set_height_armed(true);
                 bvh::set_height_on(true);
@@ -1057,10 +1060,11 @@ fn main() {
                 eprintln!("                dropped, the pre-conversion behavior)");
                 eprintln!("  --no-n2h      don't derive heightfields from normal maps (Frankot–Chellappa) — no");
                 eprintln!("                alpha-channel height, height_amp stays 0");
-                eprintln!("  --heightfield start with relief rendering ON where the scene carries height data");
-                eprintln!("                (default: plain normal-mapping; V toggles relief live either way)");
-                eprintln!("  --no-heightfield  no relief rendering, structurally (no swept AABBs, no march;");
-                eprintln!("                the pre-relief renderer bit-exactly — V cannot re-enable it)");
+                eprintln!("  --heightfield ARM relief rendering and start it ON where the scene carries height");
+                eprintln!("                data (V toggles relief vs normal-mapping live in the armed session).");
+                eprintln!("                The DEFAULT is unarmed: no swept AABBs, no march — the pre-relief");
+                eprintln!("                renderer bit-exactly (the swept tree costs real BVH quality)");
+                eprintln!("  --no-heightfield  the default, spelled explicitly (later flags win)");
                 eprintln!("  --aniso N     max anisotropy for texture filtering, 1..=16 (default 16; 1 = off, i.e.");
                 eprintln!("                the isotropic ray-cone trilinear path verbatim). --no-aniso = --aniso 1");
                 eprintln!("  --spp <n>     primary samples per pixel per frame (1..=128, default 1; U doubles live).");
@@ -11618,7 +11622,7 @@ fn session(
             // reset, works in every sub-mode.
             if edges.toggle_height {
                 if !bvh::height_armed() {
-                    eprintln!("gpu: heightfield disarmed (--no-heightfield)");
+                    eprintln!("gpu: heightfield not armed (restart with --heightfield for relief)");
                 } else if !scene.any_height {
                     eprintln!("gpu: no height data in this scene");
                 } else {
@@ -12021,7 +12025,7 @@ fn session(
         // clouds class, not H's still-frame refusal).
         if edges.toggle_height {
             if !bvh::height_armed() {
-                eprintln!("heightfield: disarmed (--no-heightfield)");
+                eprintln!("heightfield: not armed (restart with --heightfield for relief)");
             } else if !scene.any_height {
                 eprintln!("heightfield: no height data in this scene (no normal maps?)");
             } else {

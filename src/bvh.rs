@@ -55,19 +55,24 @@ pub fn cut_seed_hemi() -> bool {
 /// monotonicity precedent — silhouettes come out right because the miss
 /// really continues traversal).
 ///
-/// `HEIGHT_ARMED` is the SESSION lever (`--no-heightfield`): off means no
-/// swept AABBs and no march anywhere — structurally the pre-relief renderer
-/// (part of the scene-cache lever word, since the sweep changes the stored
-/// tree). `HEIGHT_ON` is the live V-key toggle: a pure shading+visibility
-/// switch that needs NO rebuild — the swept boxes stay conservative for
-/// both modes (they only ever contain the flat triangle), so every frustum
-/// claim, temporal entry, and hemi bound remains sound with the toggle in
-/// either state. The DEFAULT is plain normal-mapping (`HEIGHT_ON` false;
-/// `--heightfield` or V opts into relief) while ARMED stays true, so the
-/// swept tree is built and V can enable relief live without a rebuild —
-/// and the scene-cache key, which rides ARMED only, is unmoved by the
-/// mode default.
-static HEIGHT_ARMED: AtomicBool = AtomicBool::new(true);
+/// `HEIGHT_ARMED` is the SESSION lever (`--heightfield` arms it): off means
+/// no swept AABBs and no march anywhere — structurally the pre-relief
+/// renderer (part of the scene-cache lever word, since the sweep changes the
+/// stored tree). `HEIGHT_ON` is the live V-key toggle: a pure
+/// shading+visibility switch that needs NO rebuild — the swept boxes stay
+/// conservative for both modes (they only ever contain the flat triangle),
+/// so every frustum claim, temporal entry, and hemi bound remains sound
+/// with the toggle in either state. The DEFAULT is DISARMED: the sweep's
+/// edge-extension pad (`grow_height_sweep` — ±`HEIGHT_EDGE_EXTEND`·depth on
+/// every axis) measurably wrecks BVH quality on scenes where EVERY triangle
+/// carries height and triangles are only a few texels wide (DamagedHelmet:
+/// 596 → 146 ms/frame close-up, 4×, with relief OFF — the armed-but-off
+/// tree pays the whole price for a toggle that may never fire), so an armed
+/// session is opt-in: `--heightfield` arms AND starts relief ON, and V then
+/// toggles relief ↔ normal-mapping live within the armed session (armed
+/// stays true across the toggle, no rebuild). Unarmed sessions get the
+/// pre-relief renderer bit-exactly and V prints a note instead.
+static HEIGHT_ARMED: AtomicBool = AtomicBool::new(false);
 static HEIGHT_ON: AtomicBool = AtomicBool::new(false);
 
 pub fn set_height_armed(on: bool) {
