@@ -321,6 +321,159 @@ fn cell_hash3(i: i32, j: i32, k: i32, oct: u32) -> f32 {
     ))
 }
 
+/// The 4 corner hashes of `vnoise`'s cell, in (h00, h10, h01, h11) order —
+/// AVX2-batched where the CPU has it, the scalar `cell_hash` loop verbatim
+/// elsewhere. Lane values are BIT-EQUAL to the scalar path by construction
+/// (the integer mix is exact in vector lanes; `hash01`'s u32→f32 convert and
+/// power-of-two scale are exact for values < 2^24) — gated by `self_test`.
+#[inline(always)]
+fn corner_hashes(i: i32, j: i32, oct: u32) -> [f32; 4] {
+    #[cfg(target_arch = "x86_64")]
+    if hashx::avx2() {
+        return unsafe { hashx::cell_hash_x4(i, j, oct) };
+    }
+    [
+        cell_hash(i, j, oct),
+        cell_hash(i + 1, j, oct),
+        cell_hash(i, j + 1, oct),
+        cell_hash(i + 1, j + 1, oct),
+    ]
+}
+
+/// The 8 corner hashes of `vnoise3`'s cell, in
+/// (h000, h100, h010, h110, h001, h101, h011, h111) order — `corner_hashes`'s
+/// 3D twin, one 8-lane pcg_mix instead of eight scalar ones.
+#[inline(always)]
+fn corner_hashes3(i: i32, j: i32, k: i32, oct: u32) -> [f32; 8] {
+    #[cfg(target_arch = "x86_64")]
+    if hashx::avx2() {
+        return unsafe { hashx::cell_hash3_x8(i, j, k, oct) };
+    }
+    corner_hashes3_scalar(i, j, k, oct)
+}
+
+/// The scalar fallback arm, kept callable on its own so `self_test` can pin
+/// the AVX2 lanes against it bitwise on hardware that has both.
+#[inline(always)]
+fn corner_hashes3_scalar(i: i32, j: i32, k: i32, oct: u32) -> [f32; 8] {
+    [
+        cell_hash3(i, j, k, oct),
+        cell_hash3(i + 1, j, k, oct),
+        cell_hash3(i, j + 1, k, oct),
+        cell_hash3(i + 1, j + 1, k, oct),
+        cell_hash3(i, j, k + 1, oct),
+        cell_hash3(i + 1, j, k + 1, oct),
+        cell_hash3(i, j + 1, k + 1, oct),
+        cell_hash3(i + 1, j + 1, k + 1, oct),
+    ]
+}
+
+/// AVX2-batched corner hashes. The vector pipeline is `sky::pcg_mix`
+/// term-for-term in u32 lanes — `_mm256_mullo_epi32`/`_mm256_add_epi32` are
+/// exact wrapping arithmetic, `_mm256_srlv_epi32` is the per-lane variable
+/// shift `s >> ((s >> 28) + 4)` (the instruction that makes this AVX2-only:
+/// SSE has no per-lane shift), and the `hash01` tail is exact in-vector
+/// (`h >> 8` < 2^24, so the i32→f32 convert is lossless and the 2^-24 scale
+/// is a pure exponent shift). Lane l of the 3D variant is corner
+/// (l & 1, (l >> 1) & 1, (l >> 2) & 1) — `corner_hashes3_scalar`'s order.
+/// Same values, same bits, fewer instructions: this module changes NOTHING
+/// but time, which is why the HLSL twin and every gate are untouched.
+#[cfg(target_arch = "x86_64")]
+mod hashx {
+    use std::arch::x86_64::*;
+
+    /// One cached CPUID probe — the dispatch branch in the corner fetchers.
+    #[inline(always)]
+    pub fn avx2() -> bool {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        static AVX2: AtomicU8 = AtomicU8::new(2);
+        match AVX2.load(Ordering::Relaxed) {
+            2 => {
+                let has = std::is_x86_feature_detected!("avx2");
+                AVX2.store(has as u8, Ordering::Relaxed);
+                has
+            }
+            v => v != 0,
+        }
+    }
+
+    /// `pcg_mix` then `hash01` over 8 u32 lanes — bit-equal to the scalar
+    /// pair per lane.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn pcg_hash01_x8(seed: __m256i) -> __m256i {
+        let s = _mm256_add_epi32(
+            _mm256_mullo_epi32(seed, _mm256_set1_epi32(747796405u32 as i32)),
+            _mm256_set1_epi32(2891336453u32 as i32),
+        );
+        let sh = _mm256_add_epi32(_mm256_srli_epi32(s, 28), _mm256_set1_epi32(4));
+        let w = _mm256_xor_si256(_mm256_srlv_epi32(s, sh), s);
+        let w = _mm256_mullo_epi32(w, _mm256_set1_epi32(277803737u32 as i32));
+        let h = _mm256_xor_si256(_mm256_srli_epi32(w, 22), w);
+        _mm256_srli_epi32(h, 8)
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn cell_hash3_x8(i: i32, j: i32, k: i32, oct: u32) -> [f32; 8] {
+        // The lane seeds are XOR combos of 6 scalar products — cheaper built
+        // scalar than multiplied in-vector (6 muls vs 24).
+        let a0 = (i as u32).wrapping_mul(0x9E37_79B9);
+        let a1 = ((i as u32).wrapping_add(1)).wrapping_mul(0x9E37_79B9);
+        let b0 = (j as u32).wrapping_mul(0x85EB_CA6B);
+        let b1 = ((j as u32).wrapping_add(1)).wrapping_mul(0x85EB_CA6B);
+        let c0 = (k as u32).wrapping_mul(0x27D4_EB2F) ^ oct.wrapping_mul(0xC2B2_AE3D);
+        let c1 = ((k as u32).wrapping_add(1)).wrapping_mul(0x27D4_EB2F)
+            ^ oct.wrapping_mul(0xC2B2_AE3D);
+        let seed = _mm256_setr_epi32(
+            (a0 ^ b0 ^ c0) as i32,
+            (a1 ^ b0 ^ c0) as i32,
+            (a0 ^ b1 ^ c0) as i32,
+            (a1 ^ b1 ^ c0) as i32,
+            (a0 ^ b0 ^ c1) as i32,
+            (a1 ^ b0 ^ c1) as i32,
+            (a0 ^ b1 ^ c1) as i32,
+            (a1 ^ b1 ^ c1) as i32,
+        );
+        let t = pcg_hash01_x8(seed);
+        let f = _mm256_mul_ps(
+            _mm256_cvtepi32_ps(t),
+            _mm256_set1_ps(1.0 / 16777216.0),
+        );
+        let mut out = [0.0_f32; 8];
+        unsafe { _mm256_storeu_ps(out.as_mut_ptr(), f) };
+        out
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn cell_hash_x4(i: i32, j: i32, oct: u32) -> [f32; 4] {
+        // 128-bit lanes; `_mm_srlv_epi32` is AVX2-encoded, hence the same gate.
+        let a0 = (i as u32).wrapping_mul(0x9E37_79B9);
+        let a1 = ((i as u32).wrapping_add(1)).wrapping_mul(0x9E37_79B9);
+        let b0 = (j as u32).wrapping_mul(0x85EB_CA6B) ^ oct.wrapping_mul(0xC2B2_AE3D);
+        let b1 = ((j as u32).wrapping_add(1)).wrapping_mul(0x85EB_CA6B)
+            ^ oct.wrapping_mul(0xC2B2_AE3D);
+        let seed = _mm_setr_epi32(
+            (a0 ^ b0) as i32,
+            (a1 ^ b0) as i32,
+            (a0 ^ b1) as i32,
+            (a1 ^ b1) as i32,
+        );
+        let s = _mm_add_epi32(
+            _mm_mullo_epi32(seed, _mm_set1_epi32(747796405u32 as i32)),
+            _mm_set1_epi32(2891336453u32 as i32),
+        );
+        let sh = _mm_add_epi32(_mm_srli_epi32(s, 28), _mm_set1_epi32(4));
+        let w = _mm_xor_si128(_mm_srlv_epi32(s, sh), s);
+        let w = _mm_mullo_epi32(w, _mm_set1_epi32(277803737u32 as i32));
+        let h = _mm_xor_si128(_mm_srli_epi32(w, 22), w);
+        let t = _mm_srli_epi32(h, 8);
+        let f = _mm_mul_ps(_mm_cvtepi32_ps(t), _mm_set1_ps(1.0 / 16777216.0));
+        let mut out = [0.0_f32; 4];
+        unsafe { _mm_storeu_ps(out.as_mut_ptr(), f) };
+        out
+    }
+}
+
 /// 2D value noise in [0, 1): smoothstep-faded bilerp of 4 corner hashes.
 /// `floor()` then cast — NEVER a bare `as i32` truncation (negative
 /// coordinates would mirror; the HLSL twin uses `floor()` for the same
@@ -332,10 +485,7 @@ fn vnoise(q: Vec2, oct: u32) -> f32 {
     let (tx, ty) = (q.x - fx, q.y - fy);
     let ux = tx * tx * (3.0 - 2.0 * tx);
     let uy = ty * ty * (3.0 - 2.0 * ty);
-    let h00 = cell_hash(i, j, oct);
-    let h10 = cell_hash(i + 1, j, oct);
-    let h01 = cell_hash(i, j + 1, oct);
-    let h11 = cell_hash(i + 1, j + 1, oct);
+    let [h00, h10, h01, h11] = corner_hashes(i, j, oct);
     let a = h00 + (h10 - h00) * ux;
     let b = h01 + (h11 - h01) * ux;
     a + (b - a) * uy
@@ -354,14 +504,7 @@ fn vnoise3(q: Vec3A, oct: u32) -> f32 {
     let ux = tx * tx * (3.0 - 2.0 * tx);
     let uy = ty * ty * (3.0 - 2.0 * ty);
     let uz = tz * tz * (3.0 - 2.0 * tz);
-    let h000 = cell_hash3(i, j, k, oct);
-    let h100 = cell_hash3(i + 1, j, k, oct);
-    let h010 = cell_hash3(i, j + 1, k, oct);
-    let h110 = cell_hash3(i + 1, j + 1, k, oct);
-    let h001 = cell_hash3(i, j, k + 1, oct);
-    let h101 = cell_hash3(i + 1, j, k + 1, oct);
-    let h011 = cell_hash3(i, j + 1, k + 1, oct);
-    let h111 = cell_hash3(i + 1, j + 1, k + 1, oct);
+    let [h000, h100, h010, h110, h001, h101, h011, h111] = corner_hashes3(i, j, k, oct);
     let a0 = h000 + (h100 - h000) * ux;
     let b0 = h010 + (h110 - h010) * ux;
     let c0 = a0 + (b0 - a0) * uy;
@@ -379,29 +522,62 @@ fn vnoise3(q: Vec3A, oct: u32) -> f32 {
 /// differences were rejected on cost (6 extra vnoise3 = 48 hashes); G10
 /// gates this against them instead.
 fn vnoise3_grad(q: Vec3A, oct: u32) -> Vec3A {
+    let c = grad_cell(q);
+    grad_from(corner_hashes3(c.i, c.j, c.k, oct), &c)
+}
+
+/// TWO gradients of the same cell at two octave ids — `curl_offset`'s pair.
+/// One shared floor/fade computation (value-identical: the fades are pure
+/// functions of `q`, so sharing them changes nothing but time), two batched
+/// corner fetches.
+fn vnoise3_grad2(q: Vec3A, o1: u32, o2: u32) -> (Vec3A, Vec3A) {
+    let c = grad_cell(q);
+    (
+        grad_from(corner_hashes3(c.i, c.j, c.k, o1), &c),
+        grad_from(corner_hashes3(c.i, c.j, c.k, o2), &c),
+    )
+}
+
+/// The lattice cell + Hermite fades/derivatives `vnoise3_grad` shares across
+/// octaves — hoisted verbatim from the old body.
+struct GradCell {
+    i: i32,
+    j: i32,
+    k: i32,
+    ux: f32,
+    uy: f32,
+    uz: f32,
+    dux: f32,
+    duy: f32,
+    duz: f32,
+}
+
+#[inline(always)]
+fn grad_cell(q: Vec3A) -> GradCell {
     let fx = q.x.floor();
     let fy = q.y.floor();
     let fz = q.z.floor();
     let (i, j, k) = (fx as i32, fy as i32, fz as i32);
     let (tx, ty, tz) = (q.x - fx, q.y - fy, q.z - fz);
-    let (ux, uy, uz) = (
-        tx * tx * (3.0 - 2.0 * tx),
-        ty * ty * (3.0 - 2.0 * ty),
-        tz * tz * (3.0 - 2.0 * tz),
-    );
-    let (dux, duy, duz) = (
-        6.0 * tx * (1.0 - tx),
-        6.0 * ty * (1.0 - ty),
-        6.0 * tz * (1.0 - tz),
-    );
-    let h000 = cell_hash3(i, j, k, oct);
-    let h100 = cell_hash3(i + 1, j, k, oct);
-    let h010 = cell_hash3(i, j + 1, k, oct);
-    let h110 = cell_hash3(i + 1, j + 1, k, oct);
-    let h001 = cell_hash3(i, j, k + 1, oct);
-    let h101 = cell_hash3(i + 1, j, k + 1, oct);
-    let h011 = cell_hash3(i, j + 1, k + 1, oct);
-    let h111 = cell_hash3(i + 1, j + 1, k + 1, oct);
+    GradCell {
+        i,
+        j,
+        k,
+        ux: tx * tx * (3.0 - 2.0 * tx),
+        uy: ty * ty * (3.0 - 2.0 * ty),
+        uz: tz * tz * (3.0 - 2.0 * tz),
+        dux: 6.0 * tx * (1.0 - tx),
+        duy: 6.0 * ty * (1.0 - ty),
+        duz: 6.0 * tz * (1.0 - tz),
+    }
+}
+
+/// The gradient bilerps over one cell's 8 corner hashes — the old
+/// `vnoise3_grad` expressions verbatim.
+#[inline(always)]
+fn grad_from(h: [f32; 8], c: &GradCell) -> Vec3A {
+    let [h000, h100, h010, h110, h001, h101, h011, h111] = h;
+    let (ux, uy, uz) = (c.ux, c.uy, c.uz);
     // d/dx: bilerp the x-differences over (uy, uz).
     let xa = (h100 - h000) + ((h110 - h010) - (h100 - h000)) * uy;
     let xb = (h101 - h001) + ((h111 - h011) - (h101 - h001)) * uy;
@@ -412,9 +588,9 @@ fn vnoise3_grad(q: Vec3A, oct: u32) -> Vec3A {
     let za = (h001 - h000) + ((h101 - h100) - (h001 - h000)) * ux;
     let zb = (h011 - h010) + ((h111 - h110) - (h011 - h010)) * ux;
     Vec3A::new(
-        dux * (xa + (xb - xa) * uz),
-        duy * (ya + (yb - ya) * uz),
-        duz * (za + (zb - za) * uy),
+        c.dux * (xa + (xb - xa) * uz),
+        c.duy * (ya + (yb - ya) * uz),
+        c.duz * (za + (zb - za) * uy),
     )
 }
 
@@ -435,7 +611,8 @@ fn vnoise3_grad(q: Vec3A, oct: u32) -> Vec3A {
 pub(crate) fn curl_offset(p: Vec3A, cl: &Clouds) -> Vec3A {
     let lc = CLOUD_CURL_SCALE_K * cl.diag;
     let q = p * (1.0 / lc);
-    let v = vnoise3_grad(q, 6).cross(vnoise3_grad(q, 7));
+    let (g6, g7) = vnoise3_grad2(q, 6, 7);
+    let v = g6.cross(g7);
     let v = v * (1.0 / (1.0 + v.length()));
     Vec3A::new(v.x, CLOUD_CURL_YSCALE * v.y, v.z) * (CLOUD_CURL_AMP_K * cl.diag)
 }
@@ -783,10 +960,13 @@ pub const CLOUD_ROUGH_STEPS: u32 = 2;
 /// midpoints over the 2-octave field. A reflected sky is seen through the
 /// GGX lobe's blur, so the crinkle and the fine step resolution buy variance,
 /// not fidelity — the `HEMI_CONE_SPREAD`/bounce-cone philosophy applied to
-/// clouds. Measured: the full march here (the big reflective ground plane
-/// sends ~1M rays/frame into the sky on the default scene) was the largest
-/// single share of the cloud layer's CPU cost. Same None/bit-passthrough
-/// contract as `along`.
+/// clouds. Cost history: the FULL march here (the big reflective ground
+/// plane sends ~1M rays/frame into the sky on the default scene) was once
+/// the largest single share of the cloud layer's CPU cost — this 2-step
+/// lo-field form with the per-ray warp fold fixed that, and the 2026-07
+/// ablation A/B measures the whole function at ≈ 0 ms/frame on the spin
+/// path (the layer's cost now lives ~80% in `along_k`, see CLAUDE.md).
+/// Same None/bit-passthrough contract as `along`.
 pub fn along_rough(o: Vec3A, d: Vec3A, sun: &Sun, amb: Vec3A, cl: &Clouds) -> Option<CloudSample> {
     if !cl.enabled || d.y <= CLOUD_MIN_DY {
         return None;
@@ -1163,6 +1343,46 @@ pub fn self_test() -> Result<(), String> {
         );
         if at.to_bits() != 1.0_f32.to_bits() {
             return Err("G11: at/below CLOUD_SUN_MIN_Y is not exactly 1.0".into());
+        }
+    }
+
+    // G12: the AVX2 corner-hash lanes are BIT-EQUAL to the scalar hashes —
+    // the whole soundness argument for the SIMD path (same values, fewer
+    // instructions ⇒ every other gate, the HLSL twin, and the replay/
+    // same-seed contracts are untouched by construction). Sweep includes
+    // negative cells (the i32→u32 wrap), zero, and large magnitudes. On a
+    // non-AVX2 CPU the dispatch takes the scalar arm and this compares it to
+    // itself — vacuous there, load-bearing on every machine we ship numbers
+    // from.
+    for n in 0..2000_u32 {
+        let m = crate::sky::pcg_mix(n.wrapping_mul(0x0019_660D));
+        let i = (m & 0xFFFF) as i32 - 0x8000 + if n % 5 == 0 { 1_000_000 } else { 0 };
+        let j = ((m >> 8) & 0xFFFF) as i32 - 0x8000;
+        let k = ((m >> 16) & 0x7FFF) as i32 - 0x4000;
+        let oct = n % 8;
+        let simd = corner_hashes3(i, j, k, oct);
+        let scal = corner_hashes3_scalar(i, j, k, oct);
+        for l in 0..8 {
+            if simd[l].to_bits() != scal[l].to_bits() {
+                return Err(format!(
+                    "G12: corner_hashes3 lane {l} diverges from scalar at ({i},{j},{k}) oct {oct}: {} vs {}",
+                    simd[l], scal[l]
+                ));
+            }
+        }
+        let simd2 = corner_hashes(i, j, oct);
+        let scal2 = [
+            cell_hash(i, j, oct),
+            cell_hash(i + 1, j, oct),
+            cell_hash(i, j + 1, oct),
+            cell_hash(i + 1, j + 1, oct),
+        ];
+        for l in 0..4 {
+            if simd2[l].to_bits() != scal2[l].to_bits() {
+                return Err(format!(
+                    "G12: corner_hashes lane {l} diverges from scalar at ({i},{j}) oct {oct}"
+                ));
+            }
         }
     }
 

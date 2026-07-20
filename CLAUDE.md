@@ -199,7 +199,28 @@ cargo run --release -- --no-clouds    # A/B kill lever: no volumetric clouds (th
                                       # per-COARSE-step (per-fine was a measured driver), and
                                       # the interval-window skip vs the column's own top is
                                       # mandatory (fine-marching the air above the tops was
-                                      # +17 ms)
+                                      # +17 ms). WHERE THE LAYER'S TIME GOES (2026-07 ablation
+                                      # A/B — one-line neutralizations, interleaved 600-frame
+                                      # spins, drift floor ±0.3): the primary/sky-tile march
+                                      # along_k ≈ 21.6 ms of the ~27 (≈ 80%), sun_transmittance
+                                      # ≈ 2.6, along_rough ≈ 0 — its "largest single share" era
+                                      # PREDATES the per-ray warp fold (header updated; don't
+                                      # optimize it on the old comment) — with curl ≈ 6.5
+                                      # cross-cutting inside those and CLOUD_FINE 3→2 ≈ 3.7.
+                                      # The corner hashes are AVX2-BATCHED (clouds::hashx +
+                                      # corner_hashes/corner_hashes3: one 8-lane pcg_mix per
+                                      # vnoise3 cell, 4-lane per vnoise, u32-exact lane-wise ⇒
+                                      # values BIT-IDENTICAL to the scalar arm, which stays as
+                                      # the non-AVX2 fallback; curl's two octaves share one
+                                      # floor/fade via vnoise3_grad2; self_test G12 pins the
+                                      # lanes bitwise and the change moved check.png by ZERO
+                                      # bytes): default spin 47.2 → 44.9 ms (layer 23.2 → 20.9,
+                                      # ~−10%) — about the ceiling of VALUE-IDENTICAL work,
+                                      # because the scalar hash chains were already ILP-friendly
+                                      # and most cover evals take the staged cutoff (octave 0's
+                                      # 4 hashes only). Anything bigger is look-affecting
+                                      # (coarse/fine step counts, field cheapening) and needs
+                                      # the HLSL mirror + the three-pose screenshot check
 cargo run --release -- --stress 5000  # perf test: n-object procedural field (composes with --check*)
 cargo run --release -- model.obj --tile 3       # replicate a loaded OBJ into a 3x3 grid (also NxM,
                                                 # e.g. --tile 4x2): flattened copies, shared
