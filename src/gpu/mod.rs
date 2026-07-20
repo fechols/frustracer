@@ -2012,6 +2012,15 @@ impl GpuContext {
         let Some((anchor_opt, debug)) = self.quin_cfg else {
             return Ok(());
         };
+        // Idempotent (the init_dxr precedent): the fuse reads the UPSCALER
+        // outputs, which are session objects independent of which tracer
+        // feeds them, so one fuse serves both. With the SPACE mode cycle the
+        // second tracer's LAZY init lands here mid-session, and replacing a
+        // fuse whose PSO/heap prior frames may still reference is exactly
+        // the in-flight-release class D3D12 forbids.
+        if self.quin.is_some() {
+            return Ok(());
+        }
         let (w, h) = (self.d3d.width, self.d3d.height);
         let (engines, names) = self.quin_engines();
         if engines.len() < 2 {

@@ -224,7 +224,6 @@ struct Keys {
     d: u16,
     q: u16,
     e: u16,
-    space: u16,
     /// Time-of-day reverse / fast-forward (`,` / `.` physical keys).
     comma: u16,
     period: u16,
@@ -243,7 +242,9 @@ impl Keys {
             d: vk(0x20, b'D' as u16),
             q: vk(0x10, b'Q' as u16),
             e: vk(0x12, b'E' as u16),
-            space: vk(0x39, 0x20),
+            // Space deliberately absent: it is the render-mode cycle
+            // (input.rs), and a flight key polled here would ALSO fire on
+            // every mode switch — the camera bumped upward per press.
             comma: vk(0x33, VK_OEM_COMMA.0),
             period: vk(0x34, VK_OEM_PERIOD.0),
         }
@@ -428,7 +429,7 @@ fn integrate_loop(shared: &Shared, hwnd: isize, diag: f32) {
         let ks = down(keys.s) || down(VK_DOWN.0);
         let kd = down(keys.d) || down(VK_RIGHT.0);
         let ka = down(keys.a) || down(VK_LEFT.0);
-        let kup = down(keys.e) || down(keys.space);
+        let kup = down(keys.e);
         let kdn = down(keys.q);
         let key_any = kw || ks || kd || ka || kup || kdn;
 

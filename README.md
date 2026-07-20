@@ -322,8 +322,9 @@ staging buffers bound directly as tensors — no per-frame CPU traffic).
 
 | Input | Action |
 |---|---|
-| WASD / QE / Space | fly (Shift = fast) |
+| WASD / QE | fly (Shift = fast) |
 | hold left mouse | look around |
+| **SPACE** | cycle render mode: CPU → GPU wavefront → DXR |
 | **R** | toggle hybrid frustum-tracer vs plain per-pixel (A/B benchmark) |
 | **T** | toggle dynamic resolution vs fixed half-res while moving |
 | **O** | quadtree debug overlay: subdivision-depth heatmap + tile borders |

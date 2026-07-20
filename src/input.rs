@@ -22,6 +22,7 @@ pub struct Edges {
     pub toggle_oidn: bool,     // N (Open Image Denoise)
     pub toggle_nppd: bool,     // J (NPPD neural denoiser)
     pub toggle_dxr: bool,      // F (DXR DispatchRays pipeline)
+    pub cycle_mode: bool,      // SPACE (render mode: CPU -> GPU wavefront -> DXR)
     pub toggle_temporal: bool, // M (OIDN temporal reprojection)
     pub toggle_bounce: bool,   // H (hemisphere frustum bounces)
     pub toggle_height: bool,   // V (heightfield relief vs normal-mapped)
@@ -73,6 +74,7 @@ impl Input {
                     Keycode::N => e.toggle_oidn = true,
                     Keycode::J => e.toggle_nppd = true,
                     Keycode::F => e.toggle_dxr = true,
+                    Keycode::Space => e.cycle_mode = true,
                     Keycode::M => e.toggle_temporal = true,
                     Keycode::H => e.toggle_bounce = true,
                     Keycode::V => e.toggle_height = true,
