@@ -14,8 +14,8 @@
 //!   param 18                table          u8 = the RGBA16F HDR output
 //!                                          (typed texture UAVs can't be root
 //!                                          descriptors — the one exception)
-//!   param RP_SCENE_TEX      table          t0..t3 space1 + Texture2D[] at
-//!                                          t4.. space1 (scene textures; the
+//!   param RP_SCENE_TEX      table          t0..t6 space1 + Texture2D[] at
+//!                                          t7.. space1 (scene textures; the
 //!                                          only other exception — texture
 //!                                          SRVs can't be root descriptors)
 
@@ -88,8 +88,9 @@ pub const NPPD_REG_BASE: u32 = NUM_UAVS + 2 + NUM_FEED; // u26
 /// Scene textures + UV stream: one SRV descriptor table in register space1
 /// (collision-free with every space0 register above), appended after the
 /// NPPD params so nothing renumbers (62/64 root-signature DWORDs). Range 0 =
-/// t0..t3 space1 (texcoords, indices alias, tri_mat alias, mat_cutout);
-/// range 1 = t4.. space1, UNBOUNDED — the per-scene Texture2D array (must be
+/// t0..t6 space1 (texcoords, indices alias, tri_mat alias, mat_cutout,
+/// positions alias, mat_height, mat_shadow);
+/// range 1 = t7.. space1, UNBOUNDED — the per-scene Texture2D array (must be
 /// the table's last range). Descriptors live in the same shader-visible heap
 /// as the u14/feed slots (only one CBV_SRV_UAV heap is bindable at a time),
 /// starting at slot TEX_HEAP_BASE.
@@ -97,9 +98,9 @@ pub const RP_SCENE_TEX: u32 = RP_NPPD_OUT + 1;
 /// First heap slot of the scene-texture table (after every feed set).
 pub const TEX_HEAP_BASE: u32 = FEED_SETS * FEED_SET_STRIDE;
 /// Buffer-SRV descriptors preceding the Texture2D array in the table
-/// (t0..t5 space1: texcoords, indices alias, tri_mat alias, mat_cutout,
-/// positions alias, mat_height — texs[] starts at t6).
-pub const TEX_TABLE_BUFS: u32 = 6;
+/// (t0..t6 space1: texcoords, indices alias, tri_mat alias, mat_cutout,
+/// positions alias, mat_height, mat_shadow — texs[] starts at t7).
+pub const TEX_TABLE_BUFS: u32 = 7;
 
 // SRV register assignments (t0..t7) — shared across every kernel; a kernel
 // declares only what it reads, DXC strips the rest.
@@ -152,6 +153,9 @@ pub const CTR_V_FALSE_EMPTY: u32 = 16;
 pub const CTR_V_TMIN: u32 = 17;
 pub const CTR_ALPHA_REJ: u32 = 18;
 pub const CTR_HEIGHT_REJ: u32 = 19;
+/// Tinted-shadow candidate passes (TRANS_SHADOW scenes) — the anti-vacuity
+/// stat proving occlusion rays really crossed transmissive surfaces.
+pub const CTR_TRANS_PASS: u32 = 20;
 pub const CTR_COUNT: u32 = 24;
 
 // Indirect-args buffer slots: level d at slot d (depth_full <= 11 asserted
@@ -172,10 +176,11 @@ pub const HEMI_BATCH: u32 = 16384;
 /// Max fb.depth the hemi queue sizing supports (presets top out at 4).
 const HEMI_MAX_DEPTH: u32 = 4;
 
-// Root-CBV alignment (256 B). FrameCb is 1856 bytes — 320 of struct plus the
-// MAX_SPP-entry jitter table (--spp) and the MAX_FIREFLIES pose rows, which
-// are what set the size (raise the stride in lockstep with either cap).
-pub(crate) const CB_STRIDE: usize = 2048;
+// Root-CBV alignment (256 B). FrameCb is 2480 bytes — 288 of struct plus the
+// MAX_SPP-entry jitter table (--spp), the SH sky rows, and the MAX_FIREFLIES
+// pose rows, which are what set the size (raise the stride in lockstep with
+// either cap; the const asserts below police both directions).
+pub(crate) const CB_STRIDE: usize = 2560;
 
 /// The leaf kernel's thread-group width — ONE WAVE on both vendors, and that
 /// is the whole point.
@@ -925,6 +930,9 @@ pub struct SceneGpu {
     /// the material carries a heightfield, else zeros (mirrors the bvh.rs
     /// tri_height_depth gates).
     pub mat_height: ID3D12Resource,
+    /// Per-material tinted-shadow map: rgb = `Material::shadow_tint`, a =
+    /// transmission (a == 0 ⇒ opaque) — `transmit_q`'s per-interface data.
+    pub mat_shadow: ID3D12Resource,
     /// One RGBA8 Texture2D per `Scene::textures` entry, 1 mip (the CPU
     /// samples bilinear with no mip chain — parity over aliasing); _SRGB for
     /// color textures, _UNORM for linear-data maps (Texture::srgb).
@@ -1108,6 +1116,18 @@ impl SceneGpu {
             })
             .collect();
         let mat_height_b = stream_buffer(device, sub, &ring, &mat_height, |m| *m, srv)?;
+        // Per-material tinted-shadow data `transmit_q` consumes: rgb = the
+        // interface tint (`Material::shadow_tint` — the ONE tint source, so
+        // CPU↔GPU agreement is by data), a = transmission (a == 0 ⇒ opaque).
+        let mat_shadow: Vec<[f32; 4]> = scene
+            .materials
+            .iter()
+            .map(|m| {
+                let t = m.shadow_tint();
+                [t.x, t.y, t.z, m.transmission]
+            })
+            .collect();
+        let mat_shadow_b = stream_buffer(device, sub, &ring, &mat_shadow, |m| *m, srv)?;
         // --bc7: block-compress the OPAQUE 4-aligned textures before
         // uploading them (8 bpp vs 32 — Intel Sponza's set is 4.6 GB of VRAM
         // as RGBA8). Alpha-masked cutout textures are EXCLUDED and stay
@@ -1320,11 +1340,20 @@ impl SceneGpu {
         // --- acceleration-structure sizing ---
         let n_verts = scene.positions.len() as u32;
         let n_tris = scene.indices.len() as u32;
-        // OPAQUE drops when EITHER conditional-hit feature is armed — the
-        // any-hit/candidate machinery is shared (candidate_reject).
-        let non_opaque =
-            scene.any_alpha || (scene.any_height && crate::bvh::height_armed());
-        let geom = geometry_desc(&positions_b, &indices_b, n_verts, n_tris, non_opaque);
+        // OPAQUE drops when ANY conditional-hit feature is armed — the
+        // any-hit/candidate machinery is shared (candidate_reject), and the
+        // tinted-shadow pass needs candidates to surface in `transmit_q`.
+        let non_opaque = scene.any_alpha
+            || (scene.any_height && crate::bvh::height_armed())
+            || scene.any_transmissive;
+        let geom = geometry_desc(
+            &positions_b,
+            &indices_b,
+            n_verts,
+            n_tris,
+            non_opaque,
+            scene.any_transmissive,
+        );
         // ALLOW_COMPACTION: the build lands in a worst-case-sized buffer,
         // then a compact copy (~40-50% smaller in practice) replaces it and
         // the original drops before this function returns — the compacted
@@ -1524,6 +1553,7 @@ impl SceneGpu {
             texcoords: texcoords_b,
             mat_cutout: mat_cutout_b,
             mat_height: mat_height_b,
+            mat_shadow: mat_shadow_b,
             textures: textures_v,
             n_verts,
             n_tris,
@@ -1532,9 +1562,9 @@ impl SceneGpu {
     }
 
     /// Write the RP_SCENE_TEX table's descriptors into `heap` at slots
-    /// `base..`: 6 buffer SRVs (texcoords, indices, tri_mat, mat_cutout,
-    /// positions, mat_height — t0..t5 space1) then one Texture2D SRV per
-    /// scene texture (t6.. space1).
+    /// `base..`: 7 buffer SRVs (texcoords, indices, tri_mat, mat_cutout,
+    /// positions, mat_height, mat_shadow — t0..t6 space1) then one
+    /// Texture2D SRV per scene texture (t7.. space1).
     /// The heap must be sized `base + TEX_TABLE_BUFS + textures.len()`.
     pub fn write_scene_descriptors(
         &self,
@@ -1573,6 +1603,7 @@ impl SceneGpu {
         // the per-material relief map — the march's intersector-scope inputs.
         buf_srv(&self.positions, 12, self.n_verts, 4);
         buf_srv(&self.mat_height, 8, self.n_mats, 5);
+        buf_srv(&self.mat_shadow, 16, self.n_mats, 6);
         for (i, tex) in self.textures.iter().enumerate() {
             let tex_desc = unsafe { tex.GetDesc() };
             let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
@@ -1618,6 +1649,15 @@ pub(crate) fn height_defs(scene: &Scene) -> &'static str {
     if scene.any_height && crate::bvh::height_armed() { "#define HEIGHTFIELD 1" } else { "" }
 }
 
+/// The tinted-shadows twin: transmissive scenes compile `transmit_q`'s
+/// candidate loop / the ah_shadow tint arm in (`Scene::any_transmissive`
+/// already folds the `--no-tinted-shadows` lever); scenes without
+/// transmissive materials compile byte-identical sources to the binary
+/// occlusion tracer. Shared with dxr.rs.
+pub(crate) fn trans_defs(scene: &Scene) -> &'static str {
+    if scene.any_transmissive { "#define TRANS_SHADOW 1" } else { "" }
+}
+
 /// HLSL prelude every compile unit takes: the `--spp` jitter table's row count
 /// (`FrameCb::jitters`, hand-mirrored in trace_common.hlsli's cbuffer). The
 /// SIZE is derived from `dlss::MAX_SPP` rather than written twice — a literal
@@ -1660,16 +1700,26 @@ fn geometry_desc(
     indices: &ID3D12Resource,
     n_verts: u32,
     n_tris: u32,
-    any_alpha: bool,
+    non_opaque: bool,
+    any_transmissive: bool,
 ) -> D3D12_RAYTRACING_GEOMETRY_DESC {
     D3D12_RAYTRACING_GEOMETRY_DESC {
         Type: D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES,
         // OPAQUE == the kernels' FORCE_OPAQUE assumption (no any-hit ever) —
-        // the per-scene fast path. Alpha-masked scenes build with NONE so
-        // candidates surface to the ALPHA_CUTOUT candidate loops / any-hit
-        // shaders (compiled in under the same per-scene predicate).
-        Flags: if any_alpha {
-            D3D12_RAYTRACING_GEOMETRY_FLAG_NONE
+        // the per-scene fast path. Alpha-masked/height/transmissive scenes
+        // build with NONE so candidates surface to the candidate loops /
+        // any-hit shaders (compiled in under the same per-scene predicates).
+        // Transmissive scenes ALSO need NO_DUPLICATE_ANYHIT_INVOCATION:
+        // D3D12 may legally surface the same triangle more than once to
+        // any-hit/candidate code without it, and the tint MULTIPLY is not
+        // idempotent (the cutout/relief rejects were, which is why they
+        // never needed the flag — a duplicate reject rejects the same way).
+        Flags: if non_opaque {
+            if any_transmissive {
+                D3D12_RAYTRACING_GEOMETRY_FLAG_NO_DUPLICATE_ANYHIT_INVOCATION
+            } else {
+                D3D12_RAYTRACING_GEOMETRY_FLAG_NONE
+            }
         } else {
             D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE
         },
@@ -1731,6 +1781,12 @@ pub const FLAG_HEIGHT: u32 = 512;
 /// never sets it, so day kernels are bit-identical by construction). Poses
 /// ride the CB's `ff` rows, CPU-baked — the HLSL re-derives nothing.
 pub const FLAG_FIREFLIES: u32 = 1024;
+
+/// Beer–Lambert depth tint over the transmission chain's interior segments
+/// (`--no-depth-tint` clears it; shade.hlsli branches inside the
+/// transmission arm, which non-transmissive scenes never enter — no compile
+/// define needed).
+pub const FLAG_DEPTH_TINT: u32 = 2048;
 
 /// GBufPx stride in bytes — lockstep with trace_common.hlsli's struct
 /// (nr | alb_z | spec | mv | sig | sig2 = 4 float4 + 1 uint4 + 1 uint2).
@@ -1934,7 +1990,11 @@ impl FrameCb {
             // The V toggle read at CB-build time (height_max > 0 encodes
             // any_height from base()) — no FrameParams plumbing needed, and
             // the HEIGHTFIELD compile-in stays per-scene.
-            | ((crate::bvh::height_on() && self.height_max > 0.0) as u32 * FLAG_HEIGHT);
+            | ((crate::bvh::height_on() && self.height_max > 0.0) as u32 * FLAG_HEIGHT)
+            // The --no-depth-tint lever, read at CB-build time like the V
+            // toggle — the branch lives inside shade.hlsli's transmission
+            // arm, which non-transmissive scenes never enter.
+            | (crate::scene::depth_tint() as u32 * FLAG_DEPTH_TINT);
         cb.shadow_samples = p.q.shadow_samples;
         cb.ao_samples = p.q.ao_samples;
         cb.reflections = p.q.reflections as u32;
@@ -2188,10 +2248,12 @@ impl TraceGpu {
         // Alpha-masked scenes compile the cutout candidate loops into the
         // trace primitives (rt.hlsli); height-carrying scenes likewise
         // compile the relief march in (runtime-gated by FLAG_HEIGHT — the V
-        // toggle). Scenes with neither compile the FORCE_OPAQUE originals
-        // verbatim (modulo leading blank lines) — procedural/stress sessions
-        // are structurally untouched (the bit gates rely on that).
-        let defs = format!("{}\n{}", alpha_defs(scene), height_defs(scene));
+        // toggle); transmissive scenes compile transmit_q's tinted candidate
+        // loop in (TRANS_SHADOW). Scenes with none compile the FORCE_OPAQUE
+        // originals verbatim (modulo leading blank lines) — procedural/stress
+        // sessions are structurally untouched (the bit gates rely on that).
+        let defs =
+            format!("{}\n{}\n{}", alpha_defs(scene), height_defs(scene), trans_defs(scene));
         let defs = defs.as_str();
         // The session's frustum structure: `#define FTREE` swaps frustum.hlsli's
         // binary bound_query/refine_cut for ftree.hlsli's wide bodies (same

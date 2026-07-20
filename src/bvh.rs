@@ -800,7 +800,148 @@ impl Bvh {
             node_idx = stack[sp];
         }
     }
+
+    /// Light-transport occlusion: the RGB throughput of segment (tmin, tmax)
+    /// — ONE when clear, ZERO on any opaque hit, and the product of
+    /// `Material::shadow_tint` per transmissive interface crossed (the
+    /// tinted-shadows feature; `--no-tinted-shadows` kills it). This is the
+    /// query every LIGHT ray takes (sun shadow, translucency back ray,
+    /// firefly shadow, sampled AO, hemi-AO leaf); `occluded` KEEPS the binary
+    /// "any geometry in segment" semantics for geometric oracles (hemi
+    /// empty-cell verification, relief self-tests) — a glass-containing cell
+    /// must never verify as "empty". With `!scene.any_transmissive` this runs
+    /// `occluded` verbatim — bit-identical traversal, the structural
+    /// guarantee for procedural/stress scenes and the lever-off A/B.
+    pub fn transmittance(
+        &self,
+        scene: &Scene,
+        ray: &Ray,
+        tmin: f32,
+        tmax: f32,
+        visits: &mut u64,
+    ) -> Vec3A {
+        if !scene.any_transmissive {
+            return if self.occluded(scene, ray, tmin, tmax, visits) {
+                Vec3A::ZERO
+            } else {
+                Vec3A::ONE
+            };
+        }
+        let mut tp = Vec3A::ONE;
+        if slab_t(&self.nodes[0].aabb, ray, tmin, tmax).is_finite()
+            && self.transmittance_from(scene, ray, tmin, tmax, 0, &mut tp, visits)
+        {
+            return Vec3A::ZERO;
+        }
+        tp
+    }
+
+    /// `transmittance` seeded from a node cut — the light-transport analog of
+    /// `occluded_multi` (hemisphere bounce rays that own their OWN
+    /// apex-relative cut). Cut roots are a frontier of disjoint subtrees, so
+    /// the per-root throughputs multiply into the segment's total; any opaque
+    /// hit short-circuits to ZERO.
+    pub fn transmittance_multi(
+        &self,
+        scene: &Scene,
+        ray: &Ray,
+        tmin: f32,
+        tmax: f32,
+        roots: &[u32],
+        visits: &mut u64,
+    ) -> Vec3A {
+        if !scene.any_transmissive {
+            return if self.occluded_multi(scene, ray, tmin, tmax, roots, visits) {
+                Vec3A::ZERO
+            } else {
+                Vec3A::ONE
+            };
+        }
+        if !cut_seed_rays() {
+            return self.transmittance(scene, ray, tmin, tmax, visits);
+        }
+        let mut tp = Vec3A::ONE;
+        for &r in roots {
+            if slab_t(&self.nodes[r as usize].aabb, ray, tmin, tmax).is_finite()
+                && self.transmittance_from(scene, ray, tmin, tmax, r, &mut tp, visits)
+            {
+                return Vec3A::ZERO;
+            }
+        }
+        tp
+    }
+
+    /// `occluded_from`'s traversal with the tinted leaf test: a transmissive
+    /// in-range hit multiplies `tp` and traversal CONTINUES (the relief march
+    /// and alpha cutout inside `moller_trumbore` still apply first — a
+    /// cutout-rejected texel passes untinted); an opaque in-range hit returns
+    /// true (⇒ ZERO at the caller), as does `tp` decaying under
+    /// `SHADOW_TP_MIN` (the early-out that bounds deep glass stacks). Each
+    /// tri lives in exactly one leaf slice, so no interface multiplies twice;
+    /// the traversal order is deterministic, so the product is bit-stable
+    /// per ray (and a two-factor product is order-independent bitwise —
+    /// f32 multiplication commutes).
+    fn transmittance_from(
+        &self,
+        scene: &Scene,
+        ray: &Ray,
+        tmin: f32,
+        tmax: f32,
+        start: u32,
+        tp: &mut Vec3A,
+        visits: &mut u64,
+    ) -> bool {
+        let mut stack = [0u32; TRAV_STACK];
+        let mut sp = 0usize;
+        let mut node_idx = start;
+        loop {
+            let node = &self.nodes[node_idx as usize];
+            *visits += 1;
+            if node.count > 0 {
+                let first = node.left_first as usize;
+                for &t in &self.tri_idx[first..first + node.count as usize] {
+                    if let Some((tt, _, _)) = moller_trumbore(scene, t, ray) {
+                        if tt > tmin && tt < tmax {
+                            let m = &scene.materials[scene.tri_mat[t as usize] as usize];
+                            if m.transmission <= 0.0 {
+                                return true;
+                            }
+                            *tp *= m.shadow_tint();
+                            if tp.max_element() < SHADOW_TP_MIN {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            } else {
+                let l = node.left_first;
+                if slab_t(&self.nodes[l as usize].aabb, ray, tmin, tmax).is_finite() {
+                    if slab_t(&self.nodes[l as usize + 1].aabb, ray, tmin, tmax).is_finite() {
+                        debug_assert!(sp < stack.len(), "BVH traversal stack overflow");
+                        stack[sp] = l + 1;
+                        sp += 1;
+                    }
+                    node_idx = l;
+                    continue;
+                }
+                if slab_t(&self.nodes[l as usize + 1].aabb, ray, tmin, tmax).is_finite() {
+                    node_idx = l + 1;
+                    continue;
+                }
+            }
+            if sp == 0 {
+                return false;
+            }
+            sp -= 1;
+            node_idx = stack[sp];
+        }
+    }
 }
+
+/// Throughput floor for `transmittance`: below this the segment counts as
+/// opaque (ZERO) — the deterministic early-out that keeps a deep glass stack
+/// from costing unbounded leaf visits. Mirrored in trace_common.hlsli.
+pub const SHADOW_TP_MIN: f32 = 1e-3;
 
 /// Build one pending subtree into a local arena: root at local 0, internal
 /// `left_first` = LOCAL node index (the stitch rebases them by one uniform
@@ -1336,6 +1477,7 @@ pub fn height_self_test() -> Result<(), String> {
             }],
             any_alpha: false,
             any_height: false,
+            any_transmissive: false,
             sun: crate::sky::Sun::new(Vec3A::Y),
             sky_sh: crate::sh::Sh9::ZERO,
             sky_scale: 1.0,
@@ -1536,6 +1678,149 @@ pub fn height_self_test() -> Result<(), String> {
             != (hz.t.to_bits(), hz.u.to_bits(), hz.v.to_bits())
         {
             return Err("toggle-off is not bitwise the plane hit".into());
+        }
+        Ok(())
+    };
+    let r = run();
+    restore(r)
+}
+
+/// Tinted-shadow gates, run by `--check` (the height_self_test pattern —
+/// analytic scenes, closed-form expectations): single-interface tint bitwise,
+/// two-interface product, opaque termination, the `SHADOW_TP_MIN` cutoff,
+/// the primary-visibility pin (glass still HITS), binary `occluded` still
+/// seeing glass (the geometric-oracle contract), the cut-seeded twin, and the
+/// lever-off binary block.
+pub fn tinted_shadow_self_test() -> Result<(), String> {
+    use crate::scene::{MatKind, Material, NO_TEX, Scene};
+    let mat = |transmission: f32, albedo: Vec3A| Material {
+        albedo,
+        roughness: 0.05,
+        metallic: 0.0,
+        anisotropy: 0.0,
+        sheen: 0.0,
+        translucency: 0.0,
+        transmission,
+        emissive: Vec3A::ZERO,
+        normal_tex: NO_TEX,
+        normal_scale: 1.0,
+        height_amp: 0.0,
+        rough_tex: NO_TEX,
+        metal_tex: NO_TEX,
+        emissive_tex: NO_TEX,
+        kind: MatKind::Diffuse,
+    };
+    // Parallel triangles across the ray o=(1,1,5), d=-Z: glass1 at z=3
+    // (t=2), glass2 at z=2 (t=3), opaque at z=1 (t=4).
+    let mk_scene = |mats: Vec<Material>, zs: &[f32]| -> Scene {
+        let mut positions = Vec::new();
+        let mut indices = Vec::new();
+        for (i, &z) in zs.iter().enumerate() {
+            positions.push(Vec3A::new(0.0, 0.0, z));
+            positions.push(Vec3A::new(4.0, 0.0, z));
+            positions.push(Vec3A::new(0.0, 4.0, z));
+            let b = (i * 3) as u32;
+            indices.push([b, b + 1, b + 2]);
+        }
+        let n = positions.len();
+        let tri_mat = (0..zs.len() as u32).collect();
+        let mut sc = Scene {
+            positions,
+            normals: vec![Vec3A::Z; n],
+            texcoords: vec![glam::Vec2::ZERO; n],
+            indices,
+            tri_mat,
+            materials: mats,
+            textures: Vec::new(),
+            any_alpha: false,
+            any_height: false,
+            any_transmissive: false,
+            sun: crate::sky::Sun::new(Vec3A::Y),
+            sky_sh: crate::sh::Sh9::ZERO,
+            sky_scale: 1.0,
+            night: 0.0,
+            diag: 1.0,
+            eps: 1e-4,
+            ao_radius: 0.03,
+            content_min: Vec3A::ZERO,
+            content_max: Vec3A::ZERO,
+        };
+        crate::scene::finalize_scalars(&mut sc);
+        sc
+    };
+    let saved = crate::scene::tinted_shadows();
+    crate::scene::set_tinted_shadows(true);
+    let restore = |r: Result<(), String>| {
+        crate::scene::set_tinted_shadows(saved);
+        r
+    };
+    let run = || -> Result<(), String> {
+        let mut vis = 0u64;
+        let (g1, g2) = (
+            mat(0.9, Vec3A::new(0.82, 0.9, 1.0)),
+            mat(0.5, Vec3A::new(0.5, 0.6, 0.7)),
+        );
+        let (tint1, tint2) = (g1.shadow_tint(), g2.shadow_tint());
+        let sc = mk_scene(vec![g1, g2, mat(0.0, Vec3A::ONE)], &[3.0, 2.0, 1.0]);
+        if !sc.any_transmissive {
+            return Err("any_transmissive not armed".into());
+        }
+        let bvh = Bvh::build(&sc);
+        let ray = Ray::new(Vec3A::new(1.0, 1.0, 5.0), -Vec3A::Z);
+        // (a) One interface: bitwise the material's tint.
+        let tp = bvh.transmittance(&sc, &ray, 0.0, 2.5, &mut vis);
+        if tp.to_array().map(f32::to_bits) != tint1.to_array().map(f32::to_bits) {
+            return Err(format!("one interface: {tp:?} != {tint1:?}"));
+        }
+        // (b) Two interfaces: the product (order-independent bitwise — f32
+        // multiplication commutes and there are exactly two factors).
+        let tp = bvh.transmittance(&sc, &ray, 0.0, 3.5, &mut vis);
+        let want = tint1 * tint2;
+        if tp.to_array().map(f32::to_bits) != want.to_array().map(f32::to_bits) {
+            return Err(format!("two interfaces: {tp:?} != {want:?}"));
+        }
+        // (c) Opaque termination: exactly ZERO.
+        if bvh.transmittance(&sc, &ray, 0.0, 10.0, &mut vis) != Vec3A::ZERO {
+            return Err("opaque hit must zero the throughput".into());
+        }
+        // (d) The primary-visibility pin: glass still HITS (shading-only
+        // feature — visibility untouched).
+        let h = bvh
+            .intersect(&sc, &ray, 0.0, f32::INFINITY, &mut vis)
+            .ok_or("primary ray must still hit glass")?;
+        if (h.t - 2.0).abs() > 1e-5 || h.tri != 0 {
+            return Err(format!("primary hit t {} tri {} — want the z=3 glass", h.t, h.tri));
+        }
+        // (e) Binary `occluded` still sees glass — the geometric-oracle
+        // contract (empty-cell verification must not look through glass).
+        if !bvh.occluded(&sc, &ray, 0.0, 2.5, &mut vis) {
+            return Err("occluded() must keep binary any-geometry semantics".into());
+        }
+        // (f) Cut-seeded twin from the root cut is bit-equal.
+        let tp_m = bvh.transmittance_multi(&sc, &ray, 0.0, 2.5, &[0], &mut vis);
+        if tp_m.to_array().map(f32::to_bits) != tint1.to_array().map(f32::to_bits) {
+            return Err(format!("multi[root]: {tp_m:?} != {tint1:?}"));
+        }
+        // (g) SHADOW_TP_MIN cutoff: a tint under the floor counts opaque.
+        let faint = mk_scene(vec![mat(5.0e-4, Vec3A::ONE)], &[3.0]);
+        let bvhf = Bvh::build(&faint);
+        if bvhf.transmittance(&faint, &ray, 0.0, 10.0, &mut vis) != Vec3A::ZERO {
+            return Err("sub-floor tint must count as opaque".into());
+        }
+        // (h) Lever off: finalize never arms, glass binary-blocks (the
+        // pre-feature behavior, bit-identically through the occluded arm).
+        crate::scene::set_tinted_shadows(false);
+        let sc_off = mk_scene(
+            vec![mat(0.9, Vec3A::new(0.82, 0.9, 1.0))],
+            &[3.0],
+        );
+        crate::scene::set_tinted_shadows(true);
+        if sc_off.any_transmissive {
+            return Err("lever off: any_transmissive must not arm".into());
+        }
+        let bvho = Bvh::build(&sc_off);
+        if bvho.transmittance(&sc_off, &ray, 0.0, 10.0, &mut vis) != Vec3A::ZERO {
+            return Err("lever off: glass must binary-block".into());
         }
         Ok(())
     };

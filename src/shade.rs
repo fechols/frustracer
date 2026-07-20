@@ -154,20 +154,22 @@ pub struct VisRecord {
     /// the SAME light points, so the only approximation is the shadow-ray
     /// origin shift within the cell (sub-pixel in world scale).
     pub light_uv: [(f32, f32); VIS_MAX],
-    /// Occlusion per light sample. Below-horizon capture samples record
-    /// occluded AND poison `uniform`: that occlusion was never traced (the
-    /// rep's own N·L rejected it), so it must not be replayed onto a
-    /// neighbor whose horizon differs — the terminator is a declassify
-    /// signal exactly like penumbra.
-    pub occluded: [bool; VIS_MAX],
+    /// Light-transport throughput per light sample (`Bvh::transmittance`:
+    /// ONE = lit, ZERO = blocked, in between = seen through tinted glass).
+    /// Below-horizon capture samples record ZERO AND poison `uniform`: that
+    /// occlusion was never traced (the rep's own N·L rejected it), so it
+    /// must not be replayed onto a neighbor whose horizon differs — the
+    /// terminator is a declassify signal exactly like penumbra.
+    pub vis: [Vec3A; VIS_MAX],
     pub n_light: u32,
     /// Sampled-AO open fraction.
     pub ao: f32,
-    /// Every light sample agreed (all lit / all blocked) and every one was
-    /// actually traced — sharing is then near-exact. Fractional visibility
-    /// means penumbra, a below-horizon sample means the terminator; both
-    /// make the cell fall back to per-pixel rays (fractional visibility is
-    /// only meaningful with >= 2 samples; one sample is trivially uniform).
+    /// Every light sample agreed (bit-equal throughputs — all lit, all
+    /// blocked, or all through the SAME glass) and every one was actually
+    /// traced — sharing is then near-exact. MIXED visibility means penumbra,
+    /// a below-horizon sample means the terminator; both make the cell fall
+    /// back to per-pixel rays (mixed visibility is only meaningful with
+    /// >= 2 samples; one sample is trivially uniform).
     pub uniform: bool,
     /// Any capture sample fell below the rep's horizon (untraced occlusion).
     pub below_horizon: bool,
@@ -177,7 +179,7 @@ impl Default for VisRecord {
     fn default() -> Self {
         Self {
             light_uv: [(0.0, 0.0); VIS_MAX],
-            occluded: [false; VIS_MAX],
+            vis: [Vec3A::ONE; VIS_MAX],
             n_light: 0,
             ao: 1.0,
             uniform: false,
@@ -671,7 +673,7 @@ pub fn shade(
             // light the neighbor actually receives (terminator darkening).
             if let VisCtl::Capture(r) = &mut vis {
                 r.light_uv[si] = (su, sv);
-                r.occluded[si] = true;
+                r.vis[si] = Vec3A::ZERO;
                 r.below_horizon = true;
             }
             // Thin-surface transmission: a back-lit translucent surface
@@ -683,19 +685,21 @@ pub fn shade(
             // `occluded` — no cut exists for this apex.
             // Consumes no rng draws — stream alignment is untouched.
             if mat.translucency > 0.0 && ndl < 0.0 {
-                let back_occluded = match &vis {
-                    // The rep's traced bit is segment occlusion between the
-                    // same two points — normal-independent within 2·eps.
+                let back_vis = match &vis {
+                    // The rep's traced throughput is segment transmittance
+                    // between the same two points — normal-independent
+                    // within 2·eps.
                     VisCtl::Apply(r) => {
                         ls.adapt_rays_saved += 1;
-                        r.occluded[si]
+                        r.vis[si]
                     }
                     _ => {
                         ls.secondary_rays += 1;
                         // tmax = INFINITY: the sun is at infinity, so anything
                         // along the ray occludes it (the old bound was the
-                        // 12-unit distance to the rect lamp).
-                        bvh.occluded(
+                        // 12-unit distance to the rect lamp). `transmittance`,
+                        // not `occluded`: light rays see through tinted glass.
+                        bvh.transmittance(
                             scene,
                             &Ray::new(p - n * (2.0 * scene.eps), wi),
                             0.0,
@@ -704,32 +708,36 @@ pub fn shade(
                         )
                     }
                 };
-                if !back_occluded {
-                    direct_t += scene.sun.e_over_pi * (-ndl);
+                if back_vis != Vec3A::ZERO {
+                    direct_t += scene.sun.e_over_pi * (-ndl) * back_vis;
                 }
             }
             continue;
         }
-        let occluded = match &vis {
+        let vis_t = match &vis {
             VisCtl::Apply(r) => {
                 ls.adapt_rays_saved += 1;
-                r.occluded[si]
+                r.vis[si]
             }
             _ => {
                 ls.secondary_rays += 1;
-                // tmax = INFINITY — the sun is at infinity.
-                bvh.occluded(scene, &Ray::new(p, wi), 0.0, f32::INFINITY, &mut ls.ray_nodes)
+                // tmax = INFINITY — the sun is at infinity. `transmittance`,
+                // not `occluded`: the sun ray carries a tint through glass
+                // (ONE when clear — `x * 1.0` keeps opaque scenes bitwise).
+                bvh.transmittance(scene, &Ray::new(p, wi), 0.0, f32::INFINITY, &mut ls.ray_nodes)
             }
         };
         if let VisCtl::Capture(r) = &mut vis {
             r.light_uv[si] = (su, sv);
-            r.occluded[si] = occluded;
+            r.vis[si] = vis_t;
         }
-        if !occluded {
+        if vis_t != Vec3A::ZERO {
             // No 1/d²: irradiance/π is authored directly (sky::SUN_E_OVER_PI is
             // exactly the old `light.color / |light.center|²`, so the direct
-            // term at the scene origin is unchanged by construction).
-            let li = scene.sun.e_over_pi * ndl;
+            // term at the scene origin is unchanged by construction). The
+            // throughput rides `li`, so the GGX/sheen terms below inherit the
+            // glass tint componentwise.
+            let li = scene.sun.e_over_pi * ndl * vis_t;
             direct_d += li;
             let h = (wi + v).normalize_or_zero();
             let hl = to_local(h);
@@ -829,19 +837,21 @@ pub fn shade(
             }
             // One hard shadow ray with FINITE tmax — stop 2·eps short of the
             // light point so a firefly hovering eps off a leaf never
-            // self-occludes on the far end. Plain `occluded`: no cut exists
-            // for this apex (the translucency-ray rule).
+            // self-occludes on the far end. Root `transmittance`: no cut
+            // exists for this apex (the translucency-ray rule), and a firefly
+            // behind glass shines through with the tint.
             ls.secondary_rays += 1;
-            if bvh.occluded(
+            let vis_t = bvh.transmittance(
                 scene,
                 &Ray::new(p, wi),
                 0.0,
                 (dist - 2.0 * scene.eps).max(0.0),
                 &mut ls.ray_nodes,
-            ) {
+            );
+            if vis_t == Vec3A::ZERO {
                 continue;
             }
-            let li = crate::fireflies::FF_COLOR * (e * ndl);
+            let li = crate::fireflies::FF_COLOR * (e * ndl) * vis_t;
             direct_d += li;
             let h = (wi + v).normalize_or_zero();
             let hl = to_local(h);
@@ -862,8 +872,11 @@ pub fn shade(
     if let VisCtl::Capture(r) = &mut vis {
         r.n_light = n_shadow;
         let k = n_shadow as usize;
+        // Bit-equal throughputs: all-lit, all-blocked, AND all-through-the-
+        // same-glass are uniform (a consistently tinted cell is not a
+        // penumbra); mixed values still declassify.
         r.uniform = k == 0
-            || (!r.below_horizon && r.occluded[..k].iter().all(|&o| o == r.occluded[0]));
+            || (!r.below_horizon && r.vis[..k].iter().all(|&o| o == r.vis[0]));
     }
 
     // Diffuse ambient term. Three tiers, all through the hemisphere's OWN
@@ -916,23 +929,28 @@ pub fn shade(
                 ls.adapt_rays_saved += q.ao_samples as u64;
             } else {
                 let (t1, t2) = onb(n);
-                let mut open = 0u32;
+                let mut open = 0.0f32;
                 for _ in 0..q.ao_samples {
                     let r1 = rng.f32();
                     let r2 = rng.f32();
                     let dir = cosine_dir(n, t1, t2, r1, r2);
                     ls.secondary_rays += 1;
-                    if !bvh.occluded(
+                    // Mean-of-components: the AO plane is a SCALAR by
+                    // contract (FSR's signal, the SH-ambient modulator), so
+                    // an RGB glass throughput folds to gray here. `x / 3.0`
+                    // (a true divide): 3.0/3.0 == 1.0 and 0.0/3.0 == 0.0
+                    // exactly, so opaque scenes accumulate the old integer
+                    // counts bit-identically.
+                    let tp = bvh.transmittance(
                         scene,
                         &Ray::new(p, dir),
                         0.0,
                         scene.ao_radius,
                         &mut ls.ray_nodes,
-                    ) {
-                        open += 1;
-                    }
+                    );
+                    open += (tp.x + tp.y + tp.z) / 3.0;
                 }
-                ao = open as f32 / q.ao_samples as f32;
+                ao = open / q.ao_samples as f32;
                 if let VisCtl::Capture(r) = &mut vis {
                     r.ao = ao;
                 }
@@ -1154,33 +1172,59 @@ pub fn shade(
             ls.secondary_rays += 1;
             let rq = Quality { fb: FrustumBounce::OFF, ..*q };
             let tcone = Cone { w0: cone_w, spread: cone.spread, aniso: cone.aniso };
-            let tcol =
+            // Does the continuation travel INSIDE the medium? Entering
+            // crosses in; TIR (k < 0, only possible on the exit attempt)
+            // stays in; a clean exit travels outside.
+            let interior = entering || k < 0.0;
+            let (mut tcol, seg) =
                 match bvh.intersect(scene, &tray, 0.0, f32::INFINITY, &mut ls.ray_nodes) {
-                    Some(th) => shade(
-                        scene, bvh, &tray, &th, None, &rq, rng, sun, cl, tcone, depth + 1, ls,
-                        None, VisCtl::Off, None, None,
+                    Some(th) => (
+                        shade(
+                            scene, bvh, &tray, &th, None, &rq, rng, sun, cl, tcone, depth + 1,
+                            ls, None, VisCtl::Off, None, None,
+                        ),
+                        th.t,
                     ),
                     // The FULL sky, disc included and un-weighted: refraction is
                     // a near-delta path with no light-sampling partner, so this
                     // is the only strategy that can deliver the sun through
                     // glass. Nothing to double-count. Clouds ride along like
                     // any other display path (radiance marches from torig).
-                    None => crate::sky::radiance(
-                        torig,
-                        tdir,
-                        &scene.sun,
-                        cone.spread * 0.5,
-                        scene.sky_scale,
-                        scene.night,
-                        0,
-                        cl,
-                        // No pixel in scope — the fixed-midpoint legacy
-                        // phase (the GPU glass miss passes the same 0.5;
-                        // the per-(pixel, frame, sample) temporal dither
-                        // deliberately excludes this path).
-                        0.5,
+                    // An INTERIOR ray reaching sky is leaked geometry — no
+                    // attenuation (seg = INF, skipped below), the status-quo
+                    // shape.
+                    None => (
+                        crate::sky::radiance(
+                            torig,
+                            tdir,
+                            &scene.sun,
+                            cone.spread * 0.5,
+                            scene.sky_scale,
+                            scene.night,
+                            0,
+                            cl,
+                            // No pixel in scope — the fixed-midpoint legacy
+                            // phase (the GPU glass miss passes the same 0.5;
+                            // the per-(pixel, frame, sample) temporal dither
+                            // deliberately excludes this path).
+                            0.5,
+                        ),
+                        f32::INFINITY,
                     ),
                 };
+            // Beer–Lambert over the interior segment (tinted-shadows part 2,
+            // `--no-depth-tint` kills): albedo^(d / D_ref) — the medium is
+            // exactly albedo-tinted at TRANS_DEPTH_K·diag of traversal,
+            // clearer above, darker below. The depth term the per-interface
+            // tint below cannot carry (1 mm of droplet ≠ 2 m of pool); that
+            // interface tint STAYS, so thin glassware keeps its look —
+            // dimming, never gaining. Zero rng draws (pure hit geometry);
+            // shadow rays keep the per-interface tint (unordered candidates
+            // have no path lengths — the clouds two-transmittance bracket
+            // precedent).
+            if interior && seg.is_finite() && crate::scene::depth_tint() {
+                tcol *= depth_attenuation(albedo, seg, scene.diag);
+            }
             // Tinted by albedo — the classifier lifts dark MTL glass Kd
             // toward white so this doesn't go black.
             color += albedo * (tput * tcol);
@@ -1193,6 +1237,49 @@ pub fn shade(
 /// Fixed glassware IOR — thin-tumbler transmission needs no per-material
 /// value; the classifier's `transmission` scalar carries all the variation.
 const GLASS_IOR: f32 = 1.5;
+/// Beer–Lambert reference depth, relative to `Scene::diag`: the interior
+/// traversal at which a medium's transmitted light is tinted to exactly its
+/// albedo (≈1 m at the OBJ fit's diag 10). Mirrored in shade.hlsli.
+pub const TRANS_DEPTH_K: f32 = 0.015;
+
+/// Componentwise `albedo^(seg / (TRANS_DEPTH_K·diag))` — the Beer–Lambert
+/// attenuation of one interior segment, in the closed form whose anchors the
+/// self-test pins: seg = 0 ⇒ exactly ONE (powf(_, 0) == 1), seg = D_ref ⇒
+/// exactly albedo (powf(x, 1) == x), monotone decreasing in seg.
+#[inline]
+pub fn depth_attenuation(albedo: Vec3A, seg: f32, diag: f32) -> Vec3A {
+    let e = seg / (TRANS_DEPTH_K * diag);
+    Vec3A::new(albedo.x.powf(e), albedo.y.powf(e), albedo.z.powf(e))
+}
+
+/// Depth-tint math gates, run by `--check`: the closed-form anchors above
+/// plus monotonicity and the ONE-albedo passthrough.
+pub fn depth_tint_self_test() -> Result<(), String> {
+    let a = Vec3A::new(0.82, 0.9, 0.97);
+    let d_ref = TRANS_DEPTH_K * 10.0;
+    let t0 = depth_attenuation(a, 0.0, 10.0);
+    if t0.to_array().map(f32::to_bits) != Vec3A::ONE.to_array().map(f32::to_bits) {
+        return Err(format!("seg 0 must be exactly ONE, got {t0:?}"));
+    }
+    let t1 = depth_attenuation(a, d_ref, 10.0);
+    if t1.to_array().map(f32::to_bits) != a.to_array().map(f32::to_bits) {
+        return Err(format!("seg D_ref must be exactly the albedo, got {t1:?}"));
+    }
+    let mut prev = f32::INFINITY;
+    for i in 0..64 {
+        let t = depth_attenuation(a, d_ref * i as f32 * 0.5, 10.0);
+        let l = t.x + t.y + t.z;
+        if !(l <= prev) || !t.x.is_finite() {
+            return Err(format!("attenuation must decrease monotonically (step {i})"));
+        }
+        prev = l;
+    }
+    let w = depth_attenuation(Vec3A::ONE, 123.0, 10.0);
+    if w.to_array().map(f32::to_bits) != Vec3A::ONE.to_array().map(f32::to_bits) {
+        return Err("a white medium must pass through exactly".into());
+    }
+    Ok(())
+}
 /// Interface budget for the refraction chain: front/back walls of a
 /// two-walled tumbler with no TIR detour. Past it, glass shades opaque.
 const TRANS_MAX_DEPTH: u32 = 4;
@@ -1285,6 +1372,7 @@ pub fn tangent_self_test() -> Result<(), String> {
             textures: vec![tex],
             any_alpha: false,
             any_height: false,
+            any_transmissive: false,
             sun: crate::sky::Sun::new(Vec3A::Y),
             sky_sh: crate::sh::Sh9::ZERO,
             sky_scale: 1.0,

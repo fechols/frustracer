@@ -127,12 +127,18 @@ impl DxrGpu {
         // shaders + non-opaque ray flags in (trace.rs::alpha_defs /
         // height_defs — the same per-scene predicates that drop OPAQUE from
         // the BLAS); scenes with neither compile verbatim.
-        let non_opaque =
-            scene.any_alpha || (scene.any_height && crate::bvh::height_armed());
+        let non_opaque = scene.any_alpha
+            || (scene.any_height && crate::bvh::height_armed())
+            || scene.any_transmissive;
         // The cbuffer's --spp jitter-table size, injected like alpha_defs.
         let sd = trace::spp_defs();
         let sd = sd.as_str();
-        let defs = format!("{}\n{}", trace::alpha_defs(scene), trace::height_defs(scene));
+        let defs = format!(
+            "{}\n{}\n{}",
+            trace::alpha_defs(scene),
+            trace::height_defs(scene),
+            trace::trans_defs(scene)
+        );
         let lib_src = [
             defs.as_str(),
             sd,

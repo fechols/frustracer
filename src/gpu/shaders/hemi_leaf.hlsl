@@ -64,8 +64,13 @@ void cs_hemi_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     }
 
     if (fb_mode == 1u) {
-        if (!occluded_q(pt.o, d, tc, t_lim)) {
-            hemi_add(pt.pixel, 0, weight);
+        // transmit_q (hemi.rs's tinted-shadows twin): AO is a LIGHT query,
+        // so glass passes its tint, folded to gray by the mean-of-components
+        // rule (exact 1.0/0.0 on opaque scenes via the true divide).
+        float3 tp = transmit_q(pt.o, d, tc, t_lim);
+        float w_open = weight * ((tp.x + tp.y + tp.z) / 3.0);
+        if (w_open > 0.0) {
+            hemi_add(pt.pixel, 0, w_open);
         }
     } else {
         HitInfo h;

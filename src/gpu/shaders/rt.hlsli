@@ -20,25 +20,6 @@ struct HitInfo {
     float u, v; // moller-trumbore == DXR convention: p = (1-u-v)p0 + u·p1 + v·p2
 };
 
-#if defined(ALPHA_CUTOUT) || defined(HEIGHTFIELD)
-
-// Anti-vacuity stat: cutout/relief rejections, counted only by compile units
-// that bind `counters` (ctr.hlsli pastes before this file in the wavefront
-// kernels; the reference kernel / DXR library never touch the slot).
-void count_alpha_rej() {
-#ifdef HAVE_COUNTERS
-    uint _d;
-    InterlockedAdd(counters[CTR_ALPHA_REJ], 1u, _d);
-#endif
-}
-
-void count_height_rej() {
-#ifdef HAVE_COUNTERS
-    uint _d;
-    InterlockedAdd(counters[CTR_HEIGHT_REJ], 1u, _d);
-#endif
-}
-
 // Relief widens the hardware ray interval on BOTH ends — the hardware culls
 // candidates at the PLANE t, and a marched hit can sit up to one relief
 // depth on the far side of its plane t in either direction: a below/interior
@@ -63,6 +44,25 @@ float height_tmax(float tmax) {
     if (flags & FLAG_HEIGHT) return tmax + height_max;
 #endif
     return tmax;
+}
+
+#if defined(ALPHA_CUTOUT) || defined(HEIGHTFIELD)
+
+// Anti-vacuity stat: cutout/relief rejections, counted only by compile units
+// that bind `counters` (ctr.hlsli pastes before this file in the wavefront
+// kernels; the reference kernel / DXR library never touch the slot).
+void count_alpha_rej() {
+#ifdef HAVE_COUNTERS
+    uint _d;
+    InterlockedAdd(counters[CTR_ALPHA_REJ], 1u, _d);
+#endif
+}
+
+void count_height_rej() {
+#ifdef HAVE_COUNTERS
+    uint _d;
+    InterlockedAdd(counters[CTR_HEIGHT_REJ], 1u, _d);
+#endif
 }
 
 bool trace_closest(float3 o, float3 d, float tmin, float tmax, out HitInfo h) {
@@ -154,3 +154,75 @@ bool occluded_q(float3 o, float3 d, float tmin, float tmax) {
 }
 
 #endif // ALPHA_CUTOUT
+
+// Light-transport occlusion (bvh.rs::Bvh::transmittance — tinted shadows):
+// the RGB throughput of segment (tmin, tmax). ONE when clear, ZERO on any
+// opaque hit, the product of mat_shadow tints per transmissive interface
+// crossed. Every LIGHT ray (sun shadow, translucency back, firefly, AO,
+// hemi-AO leaf) calls this; occluded_q keeps binary any-geometry semantics
+// for the geometric verify oracles (check_empty_cell). Without TRANS_SHADOW
+// this is occluded_q verbatim — the structural bit-identity arm.
+// SHADOW_TP_MIN lives in trace_common.hlsli (shared with rt_dxr.hlsli).
+
+#ifdef TRANS_SHADOW
+
+void count_trans_pass() {
+#ifdef HAVE_COUNTERS
+    uint _d;
+    InterlockedAdd(counters[CTR_TRANS_PASS], 1u, _d);
+#endif
+}
+
+float3 transmit_q(float3 o, float3 d, float tmin, float tmax) {
+    if (tmax <= tmin) return float3(1.0, 1.0, 1.0);
+    RayDesc r;
+    r.Origin = o; r.Direction = d; r.TMin = height_tmin(tmin); r.TMax = height_tmax(tmax);
+    // ACCEPT_FIRST_HIT still applies — but only to COMMITTED hits, and only
+    // opaque candidates commit: a transmissive candidate multiplies the
+    // running tint and is NOT committed, so traversal keeps enumerating.
+    // Candidate order is hardware-arbitrary; the product commutes, and any
+    // opaque commit zeroes the result regardless of what multiplied in. The
+    // BLAS builds with NO_DUPLICATE_ANYHIT_INVOCATION when TRANS_SHADOW is
+    // armed (trace.rs::geometry_desc) — without it a candidate may surface
+    // twice and the multiply, unlike the cutout reject, is not idempotent.
+    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
+    q.TraceRayInline(tlas, RAY_FLAG_NONE, 0xffu, r);
+    float3 tp = float3(1.0, 1.0, 1.0);
+    while (q.Proceed()) {
+        float ct = q.CandidateTriangleRayT();
+        float cu = q.CandidateTriangleBarycentrics().x;
+        float cv = q.CandidateTriangleBarycentrics().y;
+        uint tri = q.CandidatePrimitiveIndex();
+        uint rej = candidate_reject(tri, o, d, ct, cu, cv);
+        if (rej == 0u && ct > tmin && ct < tmax) {
+            float4 ms = mat_shadow[uv_tri_mat[tri]];
+            if (ms.a > 0.0) {
+                tp *= ms.rgb;
+                count_trans_pass();
+                if (max(tp.x, max(tp.y, tp.z)) < SHADOW_TP_MIN)
+                    return float3(0.0, 0.0, 0.0);
+            } else {
+                q.CommitNonOpaqueTriangleHit();
+            }
+        }
+#if defined(ALPHA_CUTOUT) || defined(HEIGHTFIELD)
+        else if (rej == 1u)
+            count_alpha_rej();
+        else if (rej == 2u)
+            count_height_rej();
+#endif
+    }
+    return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT
+        ? float3(0.0, 0.0, 0.0)
+        : tp;
+}
+
+#else
+
+float3 transmit_q(float3 o, float3 d, float tmin, float tmax) {
+    return occluded_q(o, d, tmin, tmax)
+        ? float3(0.0, 0.0, 0.0)
+        : float3(1.0, 1.0, 1.0);
+}
+
+#endif // TRANS_SHADOW

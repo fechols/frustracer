@@ -64,6 +64,57 @@ pub fn load_gltf_scene(path: &str) -> Scene {
     build_scene(&doc, &buffers, &base_dir, true)
 }
 
+/// Every external FILE a glTF scene reads: the buffers' and images' resolved
+/// paths, mirroring `resolve_buffers`' `.zst` and the image decode's `.webp`
+/// sibling fallbacks — the world sidecar's staleness key for glTF islands
+/// (the source file's own stat covers the JSON/GLB itself; a reference
+/// change therefore misses via the source, a content change via the dep).
+/// A buffer path that resolution would pick is recorded even if MISSING —
+/// its (0,0) stat key then catches the file appearing later. Deterministic
+/// order (buffers, then images, document order) — the key is blob-compared.
+/// GLB embeds everything, so a self-contained one yields an empty list.
+/// Parse failure is a loud warning + empty Vec: the actual load will fail on
+/// its own terms (the loader convention), and an empty dep list still keys
+/// on the source stat.
+pub fn dependency_files(path: &str) -> Vec<std::path::PathBuf> {
+    let gltf = match gltf::Gltf::open(path) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("warning: glTF '{path}' failed to parse for dependency scan ({e})");
+            return Vec::new();
+        }
+    };
+    let base_dir = std::path::Path::new(path)
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .to_path_buf();
+    let mut out = Vec::new();
+    for b in gltf.document.buffers() {
+        if let gltf::buffer::Source::Uri(uri) = b.source() {
+            if !uri.starts_with("data:") {
+                let p = base_dir.join(uri.replace("%20", " "));
+                if p.exists() {
+                    out.push(p);
+                } else {
+                    let mut z = p.into_os_string();
+                    z.push(".zst");
+                    out.push(std::path::PathBuf::from(z));
+                }
+            }
+        }
+    }
+    for image in gltf.document.images() {
+        if let gltf::image::Source::Uri { uri, .. } = image.source() {
+            if !uri.starts_with("data:") {
+                out.push(crate::scene::resolve_texture_path(
+                    base_dir.join(uri.replace("%20", " ")),
+                ));
+            }
+        }
+    }
+    out
+}
+
 /// Resolve the document's buffers like `gltf::import_buffers`, plus the
 /// engine's `.zst` sibling convention: an external buffer URI whose file is
 /// absent falls back to `<file>.zst` and decodes transparently. Raw glTF

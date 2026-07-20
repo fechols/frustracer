@@ -8,7 +8,7 @@
 // lockstep):
 //   hit groups: 0 = HgShade (chs_shade), 1 = HgHit (chs_hit),
 //               2 = null (opaque scenes) / HgOcclude (any-hit only,
-//                   ALPHA_CUTOUT scenes)
+//                   ALPHA_CUTOUT / HEIGHTFIELD / TRANS_SHADOW scenes)
 //   miss:       0 = miss_radiance, 1 = miss_shadow, 2 = miss_hit
 //
 // ALPHA_CUTOUT / HEIGHTFIELD (per-scene, trace.rs::alpha_defs /
@@ -16,11 +16,27 @@
 // so the ah_* any-hit shaders (dxr.hlsl) run the shared candidate_reject
 // test (relief march + cutout at the displaced uv); opaque scenes compile
 // the FORCE_OPAQUE flags verbatim and keep the null occlusion record.
+// TRANS_SHADOW (trace.rs::trans_defs, tinted shadows) drops FORCE_OPAQUE on
+// the OCCLUSION rays only (SHADOW_RF below) — ah_shadow accumulates glass
+// tints into the payload while closest rays keep OPAQUE_RF (glass still
+// HITS for visibility).
 
 #if defined(ALPHA_CUTOUT) || defined(HEIGHTFIELD)
 #define OPAQUE_RF RAY_FLAG_NONE
 #else
 #define OPAQUE_RF RAY_FLAG_FORCE_OPAQUE
+#endif
+
+// Occlusion rays additionally drop FORCE_OPAQUE under TRANS_SHADOW (tinted
+// shadows): ah_shadow must run to accumulate the glass tint into the
+// payload. CLOSEST rays keep OPAQUE_RF — on a transmission-only scene they
+// still fly FORCE_OPAQUE (glass HITS for visibility; the ray flag overrides
+// the BLAS's non-opaque geometry flag), so the extra compiled any-hits stay
+// inert there.
+#if defined(ALPHA_CUTOUT) || defined(HEIGHTFIELD) || defined(TRANS_SHADOW)
+#define SHADOW_RF RAY_FLAG_NONE
+#else
+#define SHADOW_RF RAY_FLAG_FORCE_OPAQUE
 #endif
 
 RaytracingAccelerationStructure tlas : register(t7);
@@ -59,6 +75,14 @@ struct ShadowPayload {
     // RayQuery loops' explicit `ct < tmax`. Opaque scenes never run an
     // any-hit and ignore the field.
     float tmax;
+    // Tinted shadows (TRANS_SHADOW): the running product of glass tints
+    // ah_shadow accumulates while IgnoreHit()-ing transmissive candidates
+    // (payload writes persist through IgnoreHit — the standard tinted-shadow
+    // pattern). Any-hit order is hardware-arbitrary; the product commutes,
+    // and a committed opaque hit zeroes the result regardless. The BLAS
+    // carries NO_DUPLICATE_ANYHIT_INVOCATION when TRANS_SHADOW is armed —
+    // the multiply, unlike the cutout reject, is not idempotent.
+    float3 tint;
 };
 
 // trace_closest's wire format; t < 0 = miss.
@@ -109,9 +133,43 @@ bool occluded_q(float3 o, float3 d, float tmin, float tmax) {
     ShadowPayload p;
     p.hit = 1u;
     p.tmax = tmax;
+    p.tint = float3(1.0, 1.0, 1.0);
+    // NOTE: under TRANS_SHADOW ah_shadow passes transmissive candidates, so
+    // this binary query sees THROUGH glass on this pipeline. Every DXR light
+    // ray goes through transmit_q below and no geometric oracle runs here —
+    // if one ever does, give it its own hit group.
     TraceRay(tlas,
-             OPAQUE_RF | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
+             SHADOW_RF | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
                  RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
              0xffu, 2u, 0u, 1u, r, p);
     return p.hit != 0u;
+}
+
+// rt.hlsli::transmit_q, DispatchRays flavor (tinted shadows): the RGB
+// throughput of segment (tmin, tmax) — ONE when clear, ZERO on any opaque
+// hit, the product of ah_shadow's accumulated glass tints otherwise. Without
+// TRANS_SHADOW this degenerates to occluded_q's binary answer bit-exactly
+// (the tint stays the initialized ONE and only hit/miss decides).
+float3 transmit_q(float3 o, float3 d, float tmin, float tmax) {
+    if (tmax <= tmin) return float3(1.0, 1.0, 1.0);
+    RayDesc r;
+    r.Origin = o; r.Direction = d; r.TMin = tmin;
+    r.TMax = tmax;
+#ifdef HEIGHTFIELD
+    if (flags & FLAG_HEIGHT) r.TMax = tmax + height_max;
+#endif
+    ShadowPayload p;
+    p.hit = 1u;
+    p.tmax = tmax;
+    p.tint = float3(1.0, 1.0, 1.0);
+    TraceRay(tlas,
+             SHADOW_RF | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
+                 RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
+             0xffu, 2u, 0u, 1u, r, p);
+    // The SHADOW_TP_MIN floor lands at the return here — an any-hit cannot
+    // end the search mid-traversal like the RayQuery loop does; tints are
+    // ≤ 1 per component so the two placements agree (trace_common.hlsli).
+    if (p.hit != 0u || max(p.tint.x, max(p.tint.y, p.tint.z)) < SHADOW_TP_MIN)
+        return float3(0.0, 0.0, 0.0);
+    return p.tint;
 }

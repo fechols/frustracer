@@ -189,6 +189,32 @@ impl Texture {
         t
     }
 
+    /// Reconstruct a texture from CACHED post-conversion texels (the world
+    /// sidecar's inline flavor — glTF textures have no decodable file path).
+    /// Flags are restored VERBATIM, never re-derived: `from_image` would
+    /// recompute `alpha_masked` from the texels and resurrect the junk-alpha
+    /// cutouts the glTF loader deliberately cleared on OPAQUE materials.
+    /// Mips are rebuilt fresh (never persisted — the scene-cache convention),
+    /// through the same `MIPS_ENABLED` lever check as `from_image`, so
+    /// `--no-mips` means the same thing on a warm world boot.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_cached(
+        w: u32,
+        h: u32,
+        texels: Vec<[u8; 4]>,
+        alpha_masked: bool,
+        srgb: bool,
+        source: String,
+        h2n: bool,
+        n2h: bool,
+    ) -> Texture {
+        let mut t = Texture { w, h, texels, alpha_masked, srgb, source, h2n, n2h, mips: Vec::new() };
+        if MIPS_ENABLED.load(Relaxed) {
+            t.build_mips();
+        }
+        t
+    }
+
     /// Build the floor-halving box-filter chain down to 1×1. Each level
     /// averages a 2×2 tap block of the level above (taps clamp at odd
     /// edges); sRGB channels average in LINEAR space through

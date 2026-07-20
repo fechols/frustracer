@@ -138,18 +138,21 @@ void miss_hit(inout HitPayload p) {
     p.t = -1.0;
 }
 
-#if defined(ALPHA_CUTOUT) || defined(HEIGHTFIELD)
-// Cutout/relief any-hit shaders (alpha-masked or height-carrying scenes;
-// the BLAS drops OPAQUE and the OPAQUE_RF ray flags drop FORCE_OPAQUE so
-// these run). One per payload type — a hit group's any-hit must share its
-// ray's payload — all three deferring to the SAME trace_common.hlsli::
-// candidate_reject the RayQuery candidate loops use, so both intersectors
-// agree bit-for-bit. IgnoreHit() == moller_trumbore returning None: the
-// candidate is removed, traversal continues, TMax stays unshrunk — which is
-// exactly what makes relief silhouettes real on this pipeline too. The
-// marched t'/bary are discarded here (an any-hit cannot move the committed
-// t); chs_shade/chs_hit re-derive them. ah_shadow keeps its own body below:
-// it consumes the marched t for the logical-tmax re-check.
+#if defined(ALPHA_CUTOUT) || defined(HEIGHTFIELD) || defined(TRANS_SHADOW)
+// Cutout/relief/tinted-shadow any-hit shaders (alpha-masked, height-carrying
+// or transmissive scenes; the BLAS drops OPAQUE and the SHADOW_RF — plus,
+// for cutout/relief, OPAQUE_RF — ray flags drop FORCE_OPAQUE so these run;
+// on a transmission-only scene closest rays keep FORCE_OPAQUE and ah_shade/
+// ah_hit compile but stay inert). One per payload type — a hit group's
+// any-hit must share its ray's payload — all three deferring to the SAME
+// trace_common.hlsli::candidate_reject the RayQuery candidate loops use, so
+// both intersectors agree bit-for-bit. IgnoreHit() == moller_trumbore
+// returning None: the candidate is removed, traversal continues, TMax stays
+// unshrunk — which is exactly what makes relief silhouettes real on this
+// pipeline too. The marched t'/bary are discarded here (an any-hit cannot
+// move the committed t); chs_shade/chs_hit re-derive them. ah_shadow keeps
+// its own body below: it consumes the marched t for the logical-tmax
+// re-check and accumulates the tinted-shadow throughput.
 bool ah_reject(uint tri, float u, float v) {
     float t = RayTCurrent();
     return candidate_reject(tri, WorldRayOrigin(), WorldRayDirection(), t, u, v) != 0u;
@@ -183,5 +186,18 @@ void ah_shadow(inout ShadowPayload p, in BuiltInTriangleIntersectionAttributes a
     if (candidate_reject(PrimitiveIndex(), WorldRayOrigin(), WorldRayDirection(), t, u, v) != 0u
         || t >= p.tmax)
         IgnoreHit();
+#ifdef TRANS_SHADOW
+    // Tinted shadows: a transmissive candidate multiplies the payload tint
+    // and is IGNORED (payload writes persist through IgnoreHit — traversal
+    // continues, the standard tinted-shadow pattern; rt.hlsli::transmit_q is
+    // the RayQuery twin). Opaque candidates fall through and commit. The
+    // ordering matters: a candidate rejected above (cutout texel, relief
+    // escape, beyond the logical tmax) must NOT tint.
+    float4 ms = mat_shadow[uv_tri_mat[PrimitiveIndex()]];
+    if (ms.a > 0.0) {
+        p.tint *= ms.rgb;
+        IgnoreHit();
+    }
+#endif
 }
-#endif // ALPHA_CUTOUT || HEIGHTFIELD
+#endif // ALPHA_CUTOUT || HEIGHTFIELD || TRANS_SHADOW

@@ -1,6 +1,48 @@
 use crate::texture::Texture;
 use glam::{Vec2, Vec3A};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+
+/// Tinted-shadows switch, settable ONCE before scene load
+/// (`--no-tinted-shadows`) — the `texture::set_mips` "knob before build"
+/// family. Off = `finalize_scalars` never arms `Scene::any_transmissive`, so
+/// every occlusion query runs the pre-feature binary arm bit-identically.
+static TINTED_SHADOWS: AtomicBool = AtomicBool::new(true);
+
+pub fn set_tinted_shadows(on: bool) {
+    TINTED_SHADOWS.store(on, Relaxed);
+}
+
+pub fn tinted_shadows() -> bool {
+    TINTED_SHADOWS.load(Relaxed)
+}
+
+/// Spray-reclassification switch (`--no-spray`), same knob-before-load
+/// family. Off = `reclassify_spray` is a no-op — transmissive droplets stay
+/// clear glass (the pre-spray behavior). Keys the scene cache's lever word:
+/// the pass rewrites cached materials/tri_mat.
+static SPRAY: AtomicBool = AtomicBool::new(true);
+
+pub fn set_spray(on: bool) {
+    SPRAY.store(on, Relaxed);
+}
+
+pub fn spray_enabled() -> bool {
+    SPRAY.load(Relaxed)
+}
+
+/// Depth-tint switch (`--no-depth-tint`): Beer–Lambert attenuation over the
+/// transmission chain's interior segments. Runtime shading lever (no scene
+/// data changes — reads live in shade.rs / the GPU FLAG_DEPTH_TINT bit).
+static DEPTH_TINT: AtomicBool = AtomicBool::new(true);
+
+pub fn set_depth_tint(on: bool) {
+    DEPTH_TINT.store(on, Relaxed);
+}
+
+pub fn depth_tint() -> bool {
+    DEPTH_TINT.load(Relaxed)
+}
 
 /// How a material derives its albedo. Reflection behavior is fully described
 /// by the metallic/roughness/anisotropy parameters (the old `Metal` variant is
@@ -46,8 +88,8 @@ pub struct Material {
     pub transmission: f32,
     /// Emitted radiance (Ke / glTF emissiveFactor). Added to color at every
     /// shading depth, OUTSIDE the kd·(1−transmission) factor; emitters do
-    /// NOT light other surfaces — only the analytic area light + sky do (the
-    /// "glass stays opaque to shadow rays" precedent). Default ZERO.
+    /// NOT light other surfaces — only the analytic sun + sky do (the
+    /// stars/fireflies gather-exclusion class). Default ZERO.
     pub emissive: Vec3A,
     /// Tangent-space normal map (NO_TEX = none; linear data). Perturbs the
     /// SHADING normal only — the geometric normal keeps driving ray offsets,
@@ -79,6 +121,19 @@ pub struct Material {
 }
 
 impl Material {
+    /// Per-interface throughput of a light-transport occlusion ray crossing
+    /// this surface (the tinted-shadows feature): `transmission × albedo` —
+    /// ZERO for opaque materials. The ONE tint source: `Bvh::transmittance`
+    /// and the GPU `mat_shadow` buffer fill both read this, so CPU↔GPU
+    /// agreement is by data (the fireflies-CB precedent). Deliberately the
+    /// FLAT albedo — no UV/texture fetch in the occlusion inner loop
+    /// (documented known-accept for textured transmissive materials). Glass
+    /// Kd was already lifted toward white at load, so this composes.
+    #[inline]
+    pub fn shadow_tint(&self) -> Vec3A {
+        self.albedo * self.transmission
+    }
+
     /// Whether shading this material fetches ANY texture (albedo or one of
     /// the PBR maps). Untextured materials have nothing for the deferred
     /// material-sorted shading to make cache-coherent, so they shade inline.
@@ -115,6 +170,12 @@ pub struct Scene {
     /// `any_alpha` pattern (false on procedural/stress scenes). Derived by
     /// `finalize_scalars`.
     pub any_height: bool,
+    /// Any material is transmissive (`transmission` > 0) AND the tinted-
+    /// shadows lever is armed — the one-bool gate for `Bvh::transmittance`'s
+    /// tinted arm (the `any_alpha` pattern: false on procedural/stress scenes
+    /// and under `--no-tinted-shadows`, keeping those paths bit-identical).
+    /// Derived by `finalize_scalars`.
+    pub any_transmissive: bool,
     /// The sun: a disc at infinity, the sharp half of the one sky.
     pub sun: crate::sky::Sun,
     /// The sky's smooth dome, projected into order-2 SH once at load — the
@@ -357,6 +418,7 @@ impl SceneBuilder {
             textures: self.textures,
             any_alpha: false,
             any_height: false,
+            any_transmissive: false,
             sun,
             sky_sh: crate::sh::Sh9::ZERO,
             sky_scale: 1.0,
@@ -457,6 +519,281 @@ pub fn derive_heights(scene: &mut Scene) {
     }
 }
 
+/// Spray component ceiling, relative to `Scene::diag`: a transmissive
+/// connected component whose AABB diagonal is under `SPRAY_MAX_K · diag`
+/// reclassifies as spray. Calibrated on San Miguel (diag 10): droplets are
+/// ~3e-4·diag islands inside the `o Water` mesh, the smallest glassware
+/// ~1.5e-3·diag — 6e-4 (~4 cm) sits between with ~2× margin either way (the
+/// load-time histogram line is the tuning signal).
+pub const SPRAY_MAX_K: f32 = 6e-4;
+/// Spray look: aerated water scatters white (games ship spray as white
+/// particles for the same reason) — albedo lifts toward white, transmission
+/// drops to 0 (a clear millimeter droplet is invisible against a matched
+/// background), translucency keeps back-lit drops glowing.
+pub const SPRAY_ALBEDO_LIFT: f32 = 0.6;
+pub const SPRAY_TRANSLUCENCY: f32 = 0.35;
+pub const SPRAY_ROUGHNESS: f32 = 0.4;
+
+/// Post-load spray reclassification (shared OBJ+glTF, the `derive_heights`
+/// pass family — cold loads only, BEFORE the cache store, so warm loads
+/// inherit the retag from the sidecar; `--no-spray` kills it and keys the
+/// cache lever word). Union-find over shared vertex indices, restricted to
+/// transmissive-material triangles: tiny disconnected islands (the airborne
+/// droplets of a fountain) become a white scattering "spray" clone of their
+/// source material, while pools/streams/glassware (large components) stay
+/// glass. Purely load-time — no per-ray cost, zero rng, and a scene with no
+/// transmissive materials is structurally untouched.
+pub fn reclassify_spray(scene: &mut Scene) {
+    if !spray_enabled() {
+        return;
+    }
+    let nv = scene.positions.len();
+    let mut parent: Vec<u32> = (0..nv as u32).collect();
+    fn find(parent: &mut [u32], mut x: u32) -> u32 {
+        while parent[x as usize] != x {
+            let g = parent[parent[x as usize] as usize];
+            parent[x as usize] = g;
+            x = g;
+        }
+        x
+    }
+    let mut any = false;
+    for (t, idx) in scene.indices.iter().enumerate() {
+        if scene.materials[scene.tri_mat[t] as usize].transmission <= 0.0 {
+            continue;
+        }
+        any = true;
+        let r0 = find(&mut parent, idx[0]);
+        let r1 = find(&mut parent, idx[1]);
+        let r2 = find(&mut parent, idx[2]);
+        parent[r1 as usize] = r0;
+        parent[r2 as usize] = r0;
+    }
+    if !any {
+        return; // no transmissive geometry: structurally untouched
+    }
+    // Component AABBs, keyed by root vertex.
+    let mut boxes: HashMap<u32, (Vec3A, Vec3A, u32)> = HashMap::new();
+    for (t, idx) in scene.indices.iter().enumerate() {
+        if scene.materials[scene.tri_mat[t] as usize].transmission <= 0.0 {
+            continue;
+        }
+        let root = find(&mut parent, idx[0]);
+        let e = boxes.entry(root).or_insert((
+            Vec3A::splat(f32::INFINITY),
+            Vec3A::splat(f32::NEG_INFINITY),
+            0,
+        ));
+        for &i in idx {
+            let p = scene.positions[i as usize];
+            e.0 = e.0.min(p);
+            e.1 = e.1.max(p);
+        }
+        e.2 += 1;
+    }
+    // Size histogram (log10 of diag-relative extent) — the threshold's
+    // tuning signal, printed once per load.
+    let mut hist = [0u32; 8];
+    let limit = SPRAY_MAX_K * scene.diag;
+    let mut spray_roots: HashMap<u32, ()> = HashMap::new();
+    for (&root, &(mn, mx, _)) in &boxes {
+        let d = (mx - mn).length();
+        let rel = (d / scene.diag).max(1e-9);
+        let bucket = ((rel.log10() + 6.0).floor() as i32).clamp(0, 7) as usize;
+        hist[bucket] += 1;
+        if d < limit {
+            spray_roots.insert(root, ());
+        }
+    }
+    if spray_roots.is_empty() {
+        eprintln!(
+            "spray: 0 of {} transmissive components under {:.0e}·diag | comp size hist (log10 rel, -6..) {:?}",
+            boxes.len(),
+            SPRAY_MAX_K,
+            hist
+        );
+        return;
+    }
+    // Retag: one spray clone per source material (deduped), all fields
+    // carried over except the spray overrides.
+    let mut clones: HashMap<u32, u32> = HashMap::new();
+    let mut n_tris = 0u64;
+    for t in 0..scene.indices.len() {
+        let m = scene.tri_mat[t];
+        if scene.materials[m as usize].transmission <= 0.0 {
+            continue;
+        }
+        let root = find(&mut parent, scene.indices[t][0]);
+        if !spray_roots.contains_key(&root) {
+            continue;
+        }
+        let clone = *clones.entry(m).or_insert_with(|| {
+            // Field-by-field carry-over (Material is deliberately not Clone);
+            // the scoped borrow ends before the push.
+            let spray = {
+                let s = &scene.materials[m as usize];
+                Material {
+                    albedo: s.albedo.lerp(Vec3A::ONE, SPRAY_ALBEDO_LIFT),
+                    roughness: SPRAY_ROUGHNESS,
+                    metallic: 0.0,
+                    anisotropy: s.anisotropy,
+                    sheen: s.sheen,
+                    translucency: SPRAY_TRANSLUCENCY,
+                    transmission: 0.0,
+                    emissive: s.emissive,
+                    normal_tex: s.normal_tex,
+                    normal_scale: s.normal_scale,
+                    height_amp: s.height_amp,
+                    rough_tex: s.rough_tex,
+                    metal_tex: s.metal_tex,
+                    emissive_tex: s.emissive_tex,
+                    kind: s.kind,
+                }
+            };
+            scene.materials.push(spray);
+            (scene.materials.len() - 1) as u32
+        });
+        scene.tri_mat[t] = clone;
+        n_tris += 1;
+    }
+    eprintln!(
+        "spray: {} components ({} tris) retagged from {} transmissive | comp size hist (log10 rel, -6..) {:?}",
+        spray_roots.len(),
+        n_tris,
+        boxes.len(),
+        hist
+    );
+}
+
+/// Spray gates, run by `--check` (the tinted_shadow_self_test pattern —
+/// hand-built islands, closed-form expectations): only tiny TRANSMISSIVE
+/// components retag, the clone's overrides are pinned bitwise, two islands
+/// of one source material share one deduped clone, large components and
+/// tiny opaque islands are untouched, and the lever-off arm is a no-op.
+pub fn spray_self_test() -> Result<(), String> {
+    let glass = |transmission: f32| Material {
+        albedo: Vec3A::new(0.8, 0.85, 0.9),
+        roughness: 0.05,
+        metallic: 0.0,
+        anisotropy: 0.0,
+        sheen: 0.0,
+        translucency: 0.0,
+        transmission,
+        emissive: Vec3A::ZERO,
+        normal_tex: NO_TEX,
+        normal_scale: 1.0,
+        height_amp: 0.0,
+        rough_tex: NO_TEX,
+        metal_tex: NO_TEX,
+        emissive_tex: NO_TEX,
+        kind: MatKind::Diffuse,
+    };
+    // Island A: a unit-scale glass quad (2 tris sharing vertices — one
+    // component). Islands B/C: two detached 1e-4-scale glass tris (droplets;
+    // same source material, so they must SHARE one clone). Island D: a tiny
+    // OPAQUE tri that must never retag.
+    let mk = || -> Scene {
+        let mut positions = vec![
+            Vec3A::new(0.0, 0.0, 0.0),
+            Vec3A::new(1.0, 0.0, 0.0),
+            Vec3A::new(0.0, 1.0, 0.0),
+            Vec3A::new(1.0, 1.0, 0.0),
+        ];
+        let mut indices = vec![[0u32, 1, 2], [1, 3, 2]];
+        let mut tri_mat = vec![0u32, 0];
+        let mut tiny = |at: Vec3A, mat: u32,
+                        positions: &mut Vec<Vec3A>,
+                        indices: &mut Vec<[u32; 3]>,
+                        tri_mat: &mut Vec<u32>| {
+            let b = positions.len() as u32;
+            positions.push(at);
+            positions.push(at + Vec3A::new(1e-4, 0.0, 0.0));
+            positions.push(at + Vec3A::new(0.0, 1e-4, 0.0));
+            indices.push([b, b + 1, b + 2]);
+            tri_mat.push(mat);
+        };
+        tiny(Vec3A::new(0.2, 0.2, 0.5), 0, &mut positions, &mut indices, &mut tri_mat);
+        tiny(Vec3A::new(0.7, 0.7, 0.5), 0, &mut positions, &mut indices, &mut tri_mat);
+        tiny(Vec3A::new(0.5, 0.5, 0.7), 1, &mut positions, &mut indices, &mut tri_mat);
+        let n = positions.len();
+        let mut sc = Scene {
+            positions,
+            normals: vec![Vec3A::Z; n],
+            texcoords: vec![Vec2::ZERO; n],
+            indices,
+            tri_mat,
+            materials: vec![glass(0.9), glass(0.0)],
+            textures: Vec::new(),
+            any_alpha: false,
+            any_height: false,
+            any_transmissive: false,
+            sun: crate::sky::Sun::new(Vec3A::Y),
+            sky_sh: crate::sh::Sh9::ZERO,
+            sky_scale: 1.0,
+            night: 0.0,
+            diag: 1.0,
+            eps: 1e-4,
+            ao_radius: 0.03,
+            content_min: Vec3A::ZERO,
+            content_max: Vec3A::ZERO,
+        };
+        finalize_scalars(&mut sc);
+        sc
+    };
+    let saved = spray_enabled();
+    set_spray(true);
+    let restore = |r: Result<(), String>| {
+        set_spray(saved);
+        r
+    };
+    let run = || -> Result<(), String> {
+        let mut sc = mk();
+        reclassify_spray(&mut sc);
+        // Exactly ONE clone appended (B and C dedupe onto it).
+        if sc.materials.len() != 3 {
+            return Err(format!("expected 3 materials after retag, got {}", sc.materials.len()));
+        }
+        if sc.tri_mat[0] != 0 || sc.tri_mat[1] != 0 {
+            return Err("large glass component must stay glass".into());
+        }
+        if sc.tri_mat[2] != 2 || sc.tri_mat[3] != 2 {
+            return Err(format!(
+                "tiny glass islands must share the spray clone (got {}, {})",
+                sc.tri_mat[2], sc.tri_mat[3]
+            ));
+        }
+        if sc.tri_mat[4] != 1 {
+            return Err("tiny OPAQUE island must not retag".into());
+        }
+        let s = &sc.materials[2];
+        let want_albedo = Vec3A::new(0.8, 0.85, 0.9).lerp(Vec3A::ONE, SPRAY_ALBEDO_LIFT);
+        if s.transmission != 0.0
+            || s.translucency != SPRAY_TRANSLUCENCY
+            || s.roughness != SPRAY_ROUGHNESS
+            || s.metallic != 0.0
+            || s.albedo.to_array().map(f32::to_bits)
+                != want_albedo.to_array().map(f32::to_bits)
+        {
+            return Err("spray clone overrides not pinned".into());
+        }
+        // Lever off: a no-op, bit-for-bit.
+        set_spray(false);
+        let mut off = mk();
+        set_spray(true);
+        // mk() ran finalize under lever-off (any_transmissive false is fine
+        // here — the pass keys on material transmission, not the flag).
+        set_spray(false);
+        reclassify_spray(&mut off);
+        set_spray(true);
+        if off.materials.len() != 2 || off.tri_mat != vec![0, 0, 0, 0, 1] {
+            return Err("lever off must be a structural no-op".into());
+        }
+        Ok(())
+    };
+    let r = run();
+    restore(r)
+}
+
 /// Recompute the scale-relative scalars (`diag`/`eps`/`ao_radius`) and
 /// `any_alpha` from the current geometry/textures — shared by
 /// `SceneBuilder::finish` and `tile_scene`: replication changes the bounds,
@@ -492,6 +829,8 @@ pub fn finalize_scalars(scene: &mut Scene) {
     scene.any_alpha = scene.textures.iter().any(|t| t.alpha_masked);
     scene.any_height =
         scene.materials.iter().any(|m| m.height_amp > 0.0 && m.normal_tex != NO_TEX);
+    scene.any_transmissive =
+        tinted_shadows() && scene.materials.iter().any(|m| m.transmission > 0.0);
 
     refresh_sky_sh(scene);
 }
@@ -780,9 +1119,10 @@ pub fn procedural_scene() -> Scene {
 
 /// Verts/tris the scene loaders push before the model itself — the standard
 /// ground quad (`quad()` = two `tri()` calls = 6 duplicated verts / 2 tris).
-/// `tile_scene` relies on this layout to replicate only the model.
-const GROUND_VERTS: usize = 6;
-const GROUND_TRIS: usize = 2;
+/// `tile_scene` relies on this layout to replicate only the model, and
+/// `world::merge_scenes` to strip each part's ground before placing it.
+pub(crate) const GROUND_VERTS: usize = 6;
+pub(crate) const GROUND_TRIS: usize = 2;
 
 /// Tile a loaded (already diag-10-fitted) OBJ scene into an `nx`×`nz` grid by
 /// duplicating the transformed geometry — flattened replication, deliberately
@@ -879,6 +1219,7 @@ pub fn tile_scene(base: Scene, nx: u32, nz: u32) -> (Scene, f32) {
         textures: base.textures,
         any_alpha: false,
         any_height: false,
+        any_transmissive: false,
         // The sun is at infinity: a replicated field sees the SAME sun, at the
         // same angle, with the same irradiance, everywhere. Nothing to rescale.
         sun: base.sun,

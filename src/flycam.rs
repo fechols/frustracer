@@ -81,6 +81,44 @@ pub struct FlyState {
     pub tod: f32,
 }
 
+/// A world island's time-of-day attractor (world mode only): flying toward
+/// an island eases the GLOBAL tod toward its theme hour at the manual-scrub
+/// rate, so every downstream contract is the held-scrub one (accumulation
+/// reset per delta, histories kept). An empty list = the feature off — every
+/// non-world session passes `vec![]` and is structurally unchanged.
+pub struct TodAttractor {
+    pub pos: Vec3A,
+    /// Theme hour, [0, 24).
+    pub hour: f32,
+    /// Falloff scale (the island's content half-footprint): weight is
+    /// 1 / (d² + radius²), so the blend is finite ON the island and fades
+    /// with the square of distance off it.
+    pub radius: f32,
+}
+
+/// Distance-weighted CIRCULAR mean of the attractor hours at `pos` (x/z
+/// distance — altitude must not drag the blend). Circular because hours wrap:
+/// 22h and 2h must blend toward midnight, never toward noon; each hour maps
+/// to a point on the unit circle, the weighted vector sum is averaged, and
+/// atan2 maps back. Returns [0, 24). Pure — world::self_test pins it.
+pub(crate) fn attractor_hour(attractors: &[TodAttractor], pos: Vec3A) -> f32 {
+    use std::f32::consts::TAU;
+    let (mut sx, mut sy) = (0.0f64, 0.0f64);
+    for a in attractors {
+        let d = pos - a.pos;
+        let d2 = d.x * d.x + d.z * d.z;
+        let w = 1.0 / (d2 + a.radius * a.radius).max(1e-6) as f64;
+        let th = (a.hour / 24.0 * TAU) as f64;
+        sx += w * th.cos();
+        sy += w * th.sin();
+    }
+    if sx == 0.0 && sy == 0.0 {
+        return 0.0; // fully antipodal cancellation — pick midnight over NaN
+    }
+    let h = (sy.atan2(sx) / TAU as f64 * 24.0) as f32;
+    h.rem_euclid(24.0)
+}
+
 pub struct FlyCam {
     shared: Arc<Shared>,
     handle: Option<std::thread::JoinHandle<()>>,
@@ -103,7 +141,15 @@ impl FlyCam {
     /// Spawn the integrator for the session window, PAUSED (see `resume`).
     /// `hwnd` rides as isize because windows::HWND is a raw pointer and not
     /// Send; the thread only ever compares it / hands it to read-only queries.
-    pub fn spawn(hwnd: isize, cam0: Camera, tod0: f32, diag: f32) -> Self {
+    /// `attractors` arms world-mode auto-TOD (empty = off, the structural
+    /// non-world state); the first manual scrub disables it for the session.
+    pub fn spawn(
+        hwnd: isize,
+        cam0: Camera,
+        tod0: f32,
+        diag: f32,
+        attractors: Vec<TodAttractor>,
+    ) -> Self {
         let shared = Arc::new(Shared {
             state: Mutex::new(FlyState { cam: cam0, tod: tod0 }),
             stop: AtomicBool::new(false),
@@ -112,7 +158,7 @@ impl FlyCam {
         let s2 = shared.clone();
         let handle = std::thread::Builder::new()
             .name("flycam".into())
-            .spawn(move || integrate_loop(&s2, hwnd, diag))
+            .spawn(move || integrate_loop(&s2, hwnd, diag, &attractors))
             .expect("flycam thread spawn failed");
         Self { shared, handle: Some(handle) }
     }
@@ -334,7 +380,10 @@ fn drag_may_start(hwnd: HWND, pt: POINT) -> bool {
     }
 }
 
-fn integrate_loop(shared: &Shared, hwnd: isize, diag: f32) {
+fn integrate_loop(shared: &Shared, hwnd: isize, diag: f32, attractors: &[TodAttractor]) {
+    // World auto-TOD: sticky-off after the first manual scrub — the user
+    // taking the clock is a decision, not a fight to have every tick.
+    let mut manual_tod = false;
     // Above the rayon workers. The renderer saturates every core at normal
     // priority for the whole trace, and this thread needs ~10 us every 2 ms.
     // A starved tick never loses displacement (dt is measured, so the total
@@ -440,9 +489,18 @@ fn integrate_loop(shared: &Shared, hwnd: isize, diag: f32) {
         let t_rev = down(keys.comma) || pad.as_ref().is_some_and(|p| p.dpad_l);
         let tod_dir = (t_fwd as i32 - t_rev as i32) as f32;
 
+        if tod_dir != 0.0 {
+            manual_tod = true;
+        }
+        let auto_tod = !manual_tod && !attractors.is_empty();
+
         let pad_move = pad.as_ref().is_some_and(|p| p.lx != 0.0 || p.ly != 0.0 || p.lt != 0.0 || p.rt != 0.0);
         let pad_look = pad.as_ref().is_some_and(|p| p.rx != 0.0 || p.ry != 0.0);
-        if !key_any && !pad_move && !pad_look && dx == 0.0 && dy == 0.0 && tod_dir == 0.0 {
+        // auto_tod must integrate with NO input held (the ease keeps running
+        // after the flight stops) — but once converged it writes nothing (see
+        // below), so an idle converged session still compares bit-equal.
+        if !key_any && !pad_move && !pad_look && dx == 0.0 && dy == 0.0 && tod_dir == 0.0 && !auto_tod
+        {
             continue; // nothing to integrate; the shared state stays bit-untouched
         }
 
@@ -505,6 +563,28 @@ fn integrate_loop(shared: &Shared, hwnd: isize, diag: f32) {
         // session's snapshot compares bit-equal forever.
         if tod_dir != 0.0 {
             st.tod = (st.tod + tod_dir * TOD_RATE * dt * slow).rem_euclid(24.0);
+        } else if auto_tod {
+            // World auto-TOD: ease toward the islands' blended theme hour at
+            // the MANUAL scrub rate (no slow factor — that chord belongs to
+            // the user's hand), along the shorter wrap direction. Within one
+            // step of the target it SNAPS to the exact target value, so the
+            // next tick's delta is exactly 0.0 and the write stops — a still
+            // camera therefore converges tod, the session loop stops seeing
+            // deltas, and plain accumulation converges like any still frame.
+            // Stepping by `st.tod + d` instead of snapping would leave an
+            // ulp-scale residue that re-writes (and re-resets accumulation)
+            // every tick, forever.
+            let target = attractor_hour(attractors, st.cam.pos);
+            let mut d = target - st.tod;
+            d -= (d / 24.0).round() * 24.0;
+            if d != 0.0 {
+                let step = TOD_RATE * dt;
+                st.tod = if d.abs() <= step {
+                    target
+                } else {
+                    (st.tod + step * d.signum()).rem_euclid(24.0)
+                };
+            }
         }
     }
 }

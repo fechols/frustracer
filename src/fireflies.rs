@@ -66,10 +66,12 @@ pub fn count() -> u32 {
 }
 
 /// Hard cap — sizes the `FrameCb` firefly rows (raise `CB_STRIDE` in lockstep;
-/// past ~32 the per-pixel linear scan wants the per-leaf-tile cull follow-on
-/// before the cap moves anyway).
-pub const MAX_FIREFLIES: usize = 32;
-pub const DEFAULT_COUNT: u32 = 16;
+/// past ~64 the per-pixel linear scan wants the per-leaf-tile cull + SRV-table
+/// follow-ons before the cap moves again — CPU cost is ~+0.45 ms/firefly,
+/// dominated by the two per-pixel scans, and the CB rows stop being the
+/// right transport at hundreds).
+pub const MAX_FIREFLIES: usize = 64;
+pub const DEFAULT_COUNT: u32 = 32;
 
 /// Every FF length constant below is a multiple of `Fireflies::scale` — the
 /// CONTENT diagonal (`Scene::content_min/max`), NOT `Scene::diag`: the
@@ -77,10 +79,15 @@ pub const DEFAULT_COUNT: u32 = 16;
 /// scale, and fireflies placed off it hovered high over the whole field
 /// instead of flitting among the models (the first look-pass screenshot).
 ///
-/// Vertical placement band above the content floor. The band floor must
-/// exceed the total downward displacement bound
+/// Vertical placement spans the WHOLE content height (`cmin.y..cmax.y` — the
+/// swarm fills the model's volume, not a floor band): floor clearance
+/// `FF_Y_MIN_K` must exceed the total downward displacement bound
 /// (`FF_DRIFT_K · CLOUD_CURL_YSCALE + FF_BOB_K` = 0.016) so every pose stays
-/// strictly above the ground BY CONSTRUCTION — `self_test` sweeps it.
+/// strictly above the ground BY CONSTRUCTION, and the top is inset by the
+/// same bound (upward) so poses stay inside the content box — `self_test`
+/// sweeps both. `FF_Y_MAX_K` survives as the MINIMUM band top: a flat
+/// content box (a plane-like scene) keeps at least the original
+/// `[FF_Y_MIN_K, FF_Y_MAX_K]` band instead of collapsing to a sheet.
 pub const FF_Y_MIN_K: f32 = 0.02;
 pub const FF_Y_MAX_K: f32 = 0.06;
 /// Curl-drift displacement amplitude. The curl field's soft |v| < 1
@@ -215,14 +222,22 @@ fn pose(i: u32, night: f32, cmin: Vec3A, cmax: Vec3A, time: f32) -> [f32; 4] {
     // Base: hashed uniform over the content box's xz footprint, inset by the
     // exact displacement bound so every pose stays inside it (a footprint
     // narrower than two insets collapses to its center line — never
-    // negative); y in a low band above the content floor.
+    // negative); y uniform over the WHOLE content height — floor-cleared by
+    // FF_Y_MIN_K (above the exact downward displacement bound) and top-inset
+    // by the exact UPWARD bound (the curl's vertical leg is CLOUD_CURL_YSCALE
+    // of the unit direction), so every pose stays inside the box by
+    // construction. A flat content box keeps at least the original
+    // [FF_Y_MIN_K, FF_Y_MAX_K] band (y_hi >= y_lo since FF_Y_MAX_K > FF_Y_MIN_K).
     let inset = (FF_DRIFT_K + FF_BOB_K) * scale;
+    let vinset = (FF_DRIFT_K * crate::clouds::CLOUD_CURL_YSCALE + FF_BOB_K) * scale;
     let cx = 0.5 * (cmin + cmax);
     let hx = (0.5 * (cmax.x - cmin.x) - inset).max(0.0);
     let hz = (0.5 * (cmax.z - cmin.z) - inset).max(0.0);
+    let y_lo = cmin.y + FF_Y_MIN_K * scale;
+    let y_hi = (cmax.y - vinset).max(cmin.y + FF_Y_MAX_K * scale);
     let base = Vec3A::new(
         cx.x + (hash01(h0) - 0.5) * 2.0 * hx,
-        cmin.y + (FF_Y_MIN_K + hash01(h1) * (FF_Y_MAX_K - FF_Y_MIN_K)) * scale,
+        y_lo + hash01(h1) * (y_hi - y_lo),
         cx.z + (hash01(h2) - 0.5) * 2.0 * hz,
     );
 
@@ -367,8 +382,18 @@ pub fn self_test() -> Result<(), String> {
 
     // 3. Bounds by construction: sweep i × t (the check clock included) —
     //    every pose inside the content footprint, strictly above the content
-    //    floor, w in a sane band. This is the no-clamp proof (and the
-    //    FF_Y_MIN_K > vertical-displacement-bound pin).
+    //    floor, under the content top (or the flat-scene minimum band + its
+    //    displacement bound, whichever is higher), w in a sane band. This is
+    //    the no-clamp proof (and the FF_Y_MIN_K > vertical-displacement-bound
+    //    pin). The must-fire: the full-height spread is LIVE — some pose in
+    //    the sweep reaches the upper half of the content height (uniform
+    //    placement over 64 × 200 samples makes a miss astronomically
+    //    improbable; a regression back to the old floor band fails it
+    //    structurally, since the band top sits well under half height here).
+    let y_cap = cmax
+        .y
+        .max(cmin.y + (FF_Y_MAX_K + FF_DRIFT_K * crate::clouds::CLOUD_CURL_YSCALE + FF_BOB_K) * scale);
+    let mut y_seen = f32::NEG_INFINITY;
     for i in 0..MAX_FIREFLIES as u32 {
         for step in 0..200 {
             let t = step as f32 * 3.7;
@@ -380,14 +405,20 @@ pub fn self_test() -> Result<(), String> {
                 || p[0] > cmax.x
                 || p[2] < cmin.z
                 || p[2] > cmax.z
-                || p[1] > cmin.y + (FF_Y_MAX_K + FF_DRIFT_K * 0.3 + FF_BOB_K) * scale + 1e-4
+                || p[1] > y_cap + 1e-4
             {
                 return Err(format!("firefly {i} at t {t} out of box: {:?}", &p[..3]));
             }
             if !(p[3] > 0.0 && p[3] <= 1.3) {
                 return Err(format!("firefly {i} at t {t} brightness {} out of band", p[3]));
             }
+            y_seen = y_seen.max(p[1]);
         }
+    }
+    if y_seen < 0.5 * (cmin.y + cmax.y) {
+        return Err(format!(
+            "full-height spread not live: max pose y {y_seen} under half height"
+        ));
     }
 
     // 4. Falloff: exactly 0 at the radius (window's zero is exact in fp:

@@ -61,6 +61,7 @@ mod tone;
 // Pure chain-resolution data for the always-on temporal-upscaler fallback
 // (DLSS-RR → FSR4-RR → XeSS → FSR3); the real probes live in GpuContext::new.
 mod upchain;
+mod world;
 // The loader half is Windows-only (LoadLibrary); the FFI structs, depth
 // encoding, and the dynamic-res controller are pure and feed --check-xess.
 mod xess;
@@ -498,6 +499,11 @@ fn main() {
     let mut cam_override: Option<Camera> = None;
     let mut spin: Option<String> = None;
     let mut spin_frames = 2000u32;
+    // World mode: None = the default (interactive flagless boots the world),
+    // Some(true) = explicit --world (exclusivity ERRORS instead of silently
+    // resolving), Some(false) = --no-world (today's procedural boot). Later
+    // flags win, the --heightfield/--no-heightfield pattern.
+    let mut world_flag: Option<bool> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -629,6 +635,20 @@ fn main() {
             // at 0.0 — relief has no field to march, structurally off.
             "--no-h2n" => texture::set_h2n(false),
             "--no-n2h" => texture::set_n2h(false),
+            // Tinted-shadows kill lever, same "knob before scene load"
+            // pattern: finalize_scalars never arms any_transmissive, so
+            // every light-occlusion query binary-blocks on glass — the
+            // pre-feature renderer bit-identically (occlusion rays through
+            // transmissive surfaces otherwise carry a transmission×albedo
+            // tint per interface).
+            "--no-tinted-shadows" => scene::set_tinted_shadows(false),
+            // Water-look levers: --no-spray keeps tiny transmissive islands
+            // (fountain droplets) as clear glass instead of retagging them
+            // white-scatter at load (keys the cache lever word);
+            // --no-depth-tint drops the Beer–Lambert attenuation over the
+            // transmission chain's interior segments (runtime shading lever).
+            "--no-spray" => scene::set_spray(false),
+            "--no-depth-tint" => scene::set_depth_tint(false),
             // Relief rendering session levers. The DEFAULT is DISARMED —
             // structurally the pre-relief renderer (no AABB sweep at BVH
             // build, no march anywhere; the sweep's all-axis edge pad
@@ -938,6 +958,8 @@ fn main() {
                     std::process::exit(2);
                 })
             }
+            "--world" => world_flag = Some(true),
+            "--no-world" => world_flag = Some(false),
             "--stress" => {
                 stress = Some(
                     args.next()
@@ -983,6 +1005,9 @@ fn main() {
             }
             "--help" | "-h" => {
                 eprintln!("usage: frustracer [model.obj|.gltf|.glb] [--stress <n>] [--check] [--check-dlss] [--dlss-dump] [--no-dlss] [--check-oidn] [--oidn-dump] [--oidn] [--check-xess] [--xess-dump] [--xess] [--lock-res <r>] [--gpu-debug] [--sl-path <dir>] [--oidn-path <dir>] [--oidn-device <d>] [--xess-path <dir>]");
+                eprintln!("  --world       boot the curated multi-scene world (the flagless interactive default;");
+                eprintln!("                exclusive with a scene arg, --stress, --tile, --spin, and --check*)");
+                eprintln!("  --no-world    flagless boot uses the procedural default scene instead");
                 eprintln!("  --stress <n>  procedural stress field of n objects (perf test; composes with --check)");
                 eprintln!("  --tile <n|nxm>  replicate a loaded OBJ scene into an n×n (or n×m) grid of copies —");
                 eprintln!("                flattened geometry, shared materials/textures (composes with --check)");
@@ -1060,6 +1085,12 @@ fn main() {
                 eprintln!("                dropped, the pre-conversion behavior)");
                 eprintln!("  --no-n2h      don't derive heightfields from normal maps (Frankot–Chellappa) — no");
                 eprintln!("                alpha-channel height, height_amp stays 0");
+                eprintln!("  --no-tinted-shadows  shadow/AO rays binary-block on transmissive surfaces (the");
+                eprintln!("                pre-feature behavior; default: they pass with a transmission×albedo tint)");
+                eprintln!("  --no-spray    keep tiny transmissive islands (fountain droplets) as clear glass");
+                eprintln!("                instead of white-scatter spray (load-time retag; keys the scene cache)");
+                eprintln!("  --no-depth-tint  no Beer–Lambert attenuation over the transmission chain's interior");
+                eprintln!("                segments (water loses its depth-graded tint)");
                 eprintln!("  --heightfield ARM relief rendering and start it ON where the scene carries height");
                 eprintln!("                data (V toggles relief vs normal-mapping live in the armed session).");
                 eprintln!("                The DEFAULT is unarmed: no swept AABBs, no march — the pre-relief");
@@ -1244,16 +1275,50 @@ fn main() {
     // A cache hit hands back the untiled scene's BVH too; tiling replicates
     // the geometry, so the tiled BVH is always a fresh (parallel) build.
     let mut prebuilt: Option<bvh::Bvh> = None;
+    // World selection: ONLY the flagless interactive path. Every headless
+    // suite and benchmark keeps its own scene (flagless --check/--spin stay
+    // on the procedural scene — the structural must-fire gates are tuned to
+    // its topology, and no gate may move), and a positional scene always
+    // wins. An EXPLICIT --world in one of those combinations errors instead
+    // of silently resolving — being told is the feature (the --fsr4 shape).
+    let any_check = check
+        || check_dlss
+        || check_oidn
+        || check_xess
+        || check_fsr
+        || check_nppd
+        || check_gpu
+        || check_dxr;
+    if world_flag == Some(true)
+        && (obj.is_some() || stress.is_some() || tile.is_some() || spin.is_some() || any_check)
+    {
+        eprintln!(
+            "--world is exclusive with a scene argument, --stress, --tile, --spin, and --check* \
+             (those modes keep their own scenes; the world is the flagless interactive default)"
+        );
+        std::process::exit(2);
+    }
+    let world_wanted = world_flag.unwrap_or(true)
+        && obj.is_none()
+        && stress.is_none()
+        && tile.is_none()
+        && spin.is_none()
+        && !any_check;
+    let mut world_info: Option<world::World> = None;
     let mut scene = match (&obj, stress) {
         (Some(p), _) => {
             let resolved = scene::resolve_scene_path(p);
             // Extension sniff: .gltf/.glb take the glTF loader, everything
             // else the OBJ path — reusing the positional arg inherits the
             // exclusivity checks, default camera, structural-skip predicate,
-            // and --tile. glTF scenes SKIP the sidecar cache: its texture
-            // table stores re-decodable file paths, and glTF images live
-            // inside GLB buffer views / data URIs (a cache hit would come
-            // back with 1x1 white textures).
+            // and --tile. glTF scenes SKIP the PER-SCENE sidecar cache: its
+            // texture table stores re-decodable file paths, and glTF images
+            // live inside GLB buffer views / data URIs (a cache hit would
+            // come back with 1x1 white textures). The WORLD sidecar solves
+            // this differently — path-less textures ride it as INLINE texels
+            // (scene_cache::store_world) — but that flavor is deliberately
+            // not retrofitted here: a per-scene glTF cache would balloon by
+            // its texel payload for scenes that already re-parse in seconds.
             let lower = resolved.to_ascii_lowercase();
             let is_gltf = lower.ends_with(".gltf") || lower.ends_with(".glb");
             let cached = if is_gltf { None } else { scene_cache::try_load(&resolved) };
@@ -1270,6 +1335,10 @@ fn main() {
                     // texture conversions from the cached flags and take
                     // height_amp from DiskMat.
                     scene::derive_heights(&mut s);
+                    // Spray reclassification, same cold-load-only placement:
+                    // the retagged tri_mat/materials ride the cache (the
+                    // --no-spray lever keys its lever word).
+                    scene::reclassify_spray(&mut s);
                     // Under --tile the untiled build's ONLY use is feeding
                     // the cache store (the tiled BVH is always a fresh
                     // build) — and glTF skips the cache, so a tiled glTF
@@ -1301,8 +1370,37 @@ fn main() {
             }
         }
         (None, Some(n)) => scene::stress_scene(n),
-        (None, None) => scene::procedural_scene(),
+        (None, None) => {
+            if world_wanted {
+                match world::world_scene() {
+                    Some((s, w, b)) => {
+                        world_info = Some(w);
+                        // Cache hit or freshly built inside world_scene (the
+                        // world sidecar stores the built tree) — either way
+                        // the shared build arm below must not rebuild it.
+                        prebuilt = Some(b);
+                        s
+                    }
+                    None => {
+                        eprintln!(
+                            "world: no curated scenes found on disk (git lfs pull?) — \
+                             falling back to the procedural scene"
+                        );
+                        scene::procedural_scene()
+                    }
+                }
+            } else {
+                scene::procedural_scene()
+            }
+        }
     };
+    // A GPU world session carries every island's textures in VRAM at RGBA8 —
+    // the one place the opt-in BC7 encode reliably earns its per-boot cost.
+    // A tip, not a default: there is no BC7 disk cache, so defaulting it
+    // would tax every boot ~10-15 s.
+    if world_info.is_some() && opts.bc7.is_none() && (opts.gpu || opts.dxr) {
+        eprintln!("world: tip — --bc7 trims GPU texture VRAM (costs ~10-15 s of encode per boot)");
+    }
     // The stress field (and a tiled OBJ field) keeps the default look
     // direction but pulls the camera back/up to overlook the field; /8 (not
     // the field half-extent itself) trades the nearest rows off the bottom of
@@ -1310,7 +1408,12 @@ fn main() {
     let cam0 = cam_override.unwrap_or_else(|| match (stress, tile_fh) {
         (Some(n), _) => scaled_camera((scene::stress_field_half(n) / 8.0).max(1.0)),
         (None, Some(fh)) => scaled_camera((fh / 8.0).max(1.0)),
-        (None, None) => default_camera(),
+        // The world overview reuses the tiled-field framing: pull back/up by
+        // the field half-extent so the opening frame reads the whole ring.
+        (None, None) => match &world_info {
+            Some(w) => scaled_camera((w.field_half / 8.0).max(1.0)),
+            None => default_camera(),
+        },
     });
     let t0 = Instant::now();
     let bvh = prebuilt.unwrap_or_else(|| bvh::Bvh::build(&scene));
@@ -1434,11 +1537,28 @@ fn main() {
             std::process::exit(2);
         }
     }
+    // World auto-TOD attractors: one per island, unless an explicit --tod
+    // claimed the clock (an explicit hour is manual intent — starting a
+    // session that immediately eases away from the asked-for hour would make
+    // the flag a lie). Non-world sessions pass the empty vec — the flycam's
+    // structural off state.
+    let attractors: Vec<flycam::TodAttractor> = match (&world_info, opts.tod) {
+        (Some(w), None) => w
+            .islands
+            .iter()
+            .map(|i| flycam::TodAttractor {
+                pos: i.center,
+                hour: i.theme_hour,
+                radius: i.radius.max(1.0),
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
     #[cfg(windows)]
-    run_window(&mut scene, &bvh, &opts, cam0);
+    run_window(&mut scene, &bvh, &opts, cam0, attractors);
     #[cfg(not(windows))]
     {
-        let _ = (&opts, cam0);
+        let _ = (&opts, cam0, attractors);
         eprintln!("the interactive window requires Windows (D3D12 + DLSS); use --check / --check-dlss");
         std::process::exit(2);
     }
@@ -3550,6 +3670,25 @@ fn run_check_gpu(
         );
         ok = false;
     }
+    // Tinted-shadow anti-vacuity, the third twin: a transmissive scene's
+    // occlusion rays must actually pass through glass somewhere, or the
+    // TRANS_SHADOW path is dead code; a scene without transmissive materials
+    // (or with --no-tinted-shadows) must count zero (compiled out). Same
+    // --cam caveat class — a pose whose shadow rays never cross glass would
+    // trip the must-fire.
+    let trans_pass = ctrs[gpu::trace::CTR_TRANS_PASS as usize];
+    if scene.any_transmissive {
+        eprintln!("check-gpu: tinted-shadow candidate passes: {trans_pass}");
+        if trans_pass == 0 {
+            eprintln!("check-gpu: FAIL transmissive scene passed 0 shadow candidates (tinted shadows must fire)");
+            ok = false;
+        }
+    } else if trans_pass != 0 {
+        eprintln!(
+            "check-gpu: FAIL {trans_pass} tinted-shadow passes without transmissive materials (TRANS_SHADOW must be compiled out)"
+        );
+        ok = false;
+    }
     if dangling != 0 {
         eprintln!("check-gpu: FAIL {dangling} tile records left after the last level (depth accounting)");
         ok = false;
@@ -4051,14 +4190,16 @@ fn run_check_gpu(
             for (i, &(o, n)) in probes.iter().enumerate() {
                 let gpu_ao = h[i * 4] as f64 / FIXED / seeds_f / std::f64::consts::PI;
                 let (t1, t2) = shade::onb(n);
-                let mut open = 0u32;
+                let mut open = 0.0f64;
                 for _ in 0..REF_N {
                     let d = shade::cosine_dir(n, t1, t2, rng.f32(), rng.f32());
-                    if !bvh.occluded(scene, &bvh::Ray::new(o, d), 0.0, scene.ao_radius, &mut vls.ray_nodes) {
-                        open += 1;
-                    }
+                    // `transmittance` in lockstep with the estimator (tinted
+                    // shadows): glass folds to its gray tint, opaque scenes
+                    // keep the old 0/1 counts exactly.
+                    let tp = bvh.transmittance(scene, &bvh::Ray::new(o, d), 0.0, scene.ao_radius, &mut vls.ray_nodes);
+                    open += ((tp.x + tp.y + tp.z) / 3.0) as f64;
                 }
-                let cpu_ao = open as f64 / REF_N as f64;
+                let cpu_ao = open / REF_N as f64;
                 sum_abs += (gpu_ao - cpu_ao).abs();
                 sum_signed += gpu_ao - cpu_ao;
             }
@@ -8078,6 +8219,47 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
     };
 
+    // Tinted-shadow gates — single/double-interface tint bitwise, opaque
+    // termination, the SHADOW_TP_MIN cutoff, the primary-visibility pin,
+    // binary `occluded`'s geometric-oracle contract, the lever-off block.
+    let tinted_ok = match bvh::tinted_shadow_self_test() {
+        Ok(()) => {
+            eprintln!("tinted-shadow self-test: OK");
+            true
+        }
+        Err(e) => {
+            eprintln!("tinted-shadow self-test: FAIL — {e}");
+            false
+        }
+    };
+
+    // Spray-reclassification gates — tiny transmissive islands retag to one
+    // deduped white-scatter clone; large/opaque components and the lever-off
+    // arm untouched.
+    let spray_ok = match scene::spray_self_test() {
+        Ok(()) => {
+            eprintln!("spray self-test: OK");
+            true
+        }
+        Err(e) => {
+            eprintln!("spray self-test: FAIL — {e}");
+            false
+        }
+    };
+
+    // Depth-tint math gates — the Beer–Lambert closed-form anchors (seg 0 ⇒
+    // exactly ONE, seg D_ref ⇒ exactly albedo, monotone, white passthrough).
+    let depth_tint_ok = match shade::depth_tint_self_test() {
+        Ok(()) => {
+            eprintln!("depth-tint self-test: OK");
+            true
+        }
+        Err(e) => {
+            eprintln!("depth-tint self-test: FAIL — {e}");
+            false
+        }
+    };
+
     // Spherical-cell math self-test — closed-form identities the hemisphere
     // bounce integrator is built on (Ω/PSA anchors, exact partition,
     // in-cell sampling).
@@ -8228,6 +8410,20 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
         Err(e) => {
             eprintln!("bc7 self-test: FAIL — {e}");
+            false
+        }
+    };
+
+    // World-merge self-test — pure math (id offsetting incl. the NO_TEX
+    // sentinel, ground-drop accounting, ring-layout determinism); the world
+    // itself is never the --check scene (flagless --check stays procedural).
+    let world_ok = match world::self_test() {
+        Ok(()) => {
+            eprintln!("world self-test: OK");
+            true
+        }
+        Err(e) => {
+            eprintln!("world self-test: FAIL — {e}");
             false
         }
     };
@@ -8523,17 +8719,19 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 // Reference: cosine-sampled AO, the same construction shade()
                 // uses, from the same eps-offset point.
                 let mut rng = fastrand::Rng::with_seed(px_seed(pr.x, pr.y, 0xA0));
-                let mut open = 0u32;
+                let mut open = 0.0f32;
                 for _ in 0..REF_SAMPLES {
                     let r1 = rng.f32();
                     let r2 = rng.f32();
                     let d = shade::cosine_dir(pr.n, t1, t2, r1, r2);
-                    if !bvh.occluded(scene, &bvh::Ray::new(pr.p, d), 0.0, scene.ao_radius, &mut vis)
-                    {
-                        open += 1;
-                    }
+                    // `transmittance` in lockstep with the hemi estimator
+                    // (tinted shadows) — glass folds to its gray tint,
+                    // opaque scenes keep the old 0/1 counts exactly.
+                    let tp =
+                        bvh.transmittance(scene, &bvh::Ray::new(pr.p, d), 0.0, scene.ao_radius, &mut vis);
+                    open += (tp.x + tp.y + tp.z) / 3.0;
                 }
-                let ao_r = open as f32 / REF_SAMPLES as f32;
+                let ao_r = open / REF_SAMPLES as f32;
                 ((ao_h - ao_r) as f64, hv, ls)
             })
             .collect();
@@ -10151,6 +10349,9 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     let gates = [
         ("texture", tex_ok),
         ("height", height_ok),
+        ("tinted-shadow", tinted_ok),
+        ("spray", spray_ok),
+        ("depth-tint", depth_tint_ok),
         ("sh", sh_ok),
         ("sky", sky_ok),
         ("clouds", clouds_ok),
@@ -10167,6 +10368,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         ("tone", tone_ok),
         ("gltf", gltf_ok),
         ("bc7", bc7_ok),
+        ("world", world_ok),
         ("quin", quin_ok),
         ("hemi-ao", hemi_ok),
         ("hemi-gi", gi_ok),
@@ -10334,7 +10536,13 @@ fn tod_hhmm(h: f32) -> String {
 }
 
 #[cfg(windows)]
-fn run_window(scene: &mut scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
+fn run_window(
+    scene: &mut scene::Scene,
+    bvh: &bvh::Bvh,
+    opts: &Opts,
+    cam0: Camera,
+    attractors: Vec<flycam::TodAttractor>,
+) {
     // Opt into per-monitor DPI awareness so Windows doesn't stretch the window
     // on scaled displays — W×H stays W×H physical pixels, matching the swapchain.
     sdl2::hint::set("SDL_WINDOWS_DPI_AWARENESS", "permonitorv2");
@@ -10401,6 +10609,7 @@ fn run_window(scene: &mut scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camer
         cam0,
         opts.tod.unwrap_or_else(scene::default_tod),
         scene.diag,
+        attractors,
     );
 
     // A window resize exits the session and re-enters it at the new client

@@ -740,21 +740,39 @@ fn leaf_rays(
             // either way, so the tmin-overshoot / cut-miss gates are unaffected.
             // Under the wide tree the cut is slot-refs and must translate to
             // binary roots first (ray_roots) — rays only ever walk the ray BVH.
-            let occ = if crate::bvh::cut_seed_hemi() {
+            // `transmittance`, not `occluded`: AO is a LIGHT query, so a
+            // glass occluder passes its tint (folded to gray — the sampled-AO
+            // tier's mean-of-components rule, exact 1.0/0.0 on opaque scenes
+            // via the true divide).
+            let tp = if crate::bvh::cut_seed_hemi() {
                 let mut buf = [0u32; HEMI_CUT];
                 let roots = cx.accel.ray_roots(cut, &mut buf);
-                cx.accel.bvh.occluded_multi(cx.scene, &ray, tc, cx.t_limit, roots, &mut ls.ray_nodes)
+                cx.accel.bvh.transmittance_multi(
+                    cx.scene,
+                    &ray,
+                    tc,
+                    cx.t_limit,
+                    roots,
+                    &mut ls.ray_nodes,
+                )
             } else {
-                cx.accel.bvh.occluded(cx.scene, &ray, tc, cx.t_limit, &mut ls.ray_nodes)
+                cx.accel.bvh.transmittance(cx.scene, &ray, tc, cx.t_limit, &mut ls.ray_nodes)
             };
-            if !occ {
-                acc.ray.x += weight;
-            }
+            acc.ray.x += weight * ((tp.x + tp.y + tp.z) / 3.0);
             if let Some(v) = verify.as_deref_mut() {
                 acc.accounted += sphcell::psa(a, b, c, cx.n);
                 verify_leaf_ray(cx, &ray, tc, v, ls);
-                if occ != cx.accel.bvh.occluded(cx.scene, &ray, tc, cx.t_limit, &mut ls.ray_nodes)
-                {
+                // Cut-vs-root agreement. Bit-equality is the gate on the
+                // binary arm (exact ZERO/ONE); with ≥3 tinted interfaces the
+                // two traversals may associate the f32 product differently,
+                // so tinted throughputs get a 1-ulp-scale relative slack —
+                // a real cut miss (a whole interface dropped) moves the
+                // product by the interface's tint, orders of magnitude more.
+                let root =
+                    cx.accel.bvh.transmittance(cx.scene, &ray, tc, cx.t_limit, &mut ls.ray_nodes);
+                let agree = tp == root
+                    || (tp - root).abs().max_element() <= 1e-6 * root.abs().max_element();
+                if !agree {
                     v.cut_miss += 1;
                 }
             }

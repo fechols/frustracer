@@ -51,6 +51,10 @@
                                // bit is the per-frame runtime gate — the
                                // LEAF_NO_FB pattern)
 #define FLAG_FIREFLIES   1024u // firefly point lights live this frame
+#define FLAG_DEPTH_TINT  2048u // Beer–Lambert over transmission-chain
+                               // interior segments (--no-depth-tint clears;
+                               // the branch lives inside the transmission
+                               // arm, unreachable on opaque scenes)
                                // (src/fireflies.rs — count > 0 folds in the
                                // session enable AND the night fade, so day
                                // kernels are bit-identical by construction)
@@ -1110,11 +1114,21 @@ StructuredBuffer<float3> uv_positions : register(t4, space1);
 // the mat_cutout pattern).
 struct MatH { uint tex1; float amp; };
 StructuredBuffer<MatH>   mat_height : register(t5, space1);
+// Per-material tinted-shadow map: rgb = Material::shadow_tint (transmission
+// × albedo — the ONE tint source, filled CPU-side so CPU↔GPU agreement is
+// by data), a = transmission; a == 0 ⇒ opaque. transmit_q's per-interface
+// data (the mat_cutout pattern).
+StructuredBuffer<float4> mat_shadow : register(t6, space1);
+// bvh.rs::SHADOW_TP_MIN — the throughput floor below which a segment counts
+// opaque. Tints are ≤ 1 per component, so the running product is monotone
+// decreasing and flooring mid-traversal (rt.hlsli) or at the return
+// (rt_dxr.hlsli — an any-hit cannot end the search) gives the same answer.
+#define SHADOW_TP_MIN 1e-3
 // R8G8B8A8 (_SRGB for color maps, _UNORM for linear-data normal/rough-metal
 // maps — Texture::srgb), carrying the FULL CPU-generated mip chain (built in
 // texture.rs::build_mips, uploaded verbatim — CPU-trilinear parity: both
 // samplers read identical texels at identical ray-cone lods).
-Texture2D<float4>        texs[]     : register(t6, space1);
+Texture2D<float4>        texs[]     : register(t7, space1);
 // Static: trilinear, repeat wrap — texture.rs::sample_trilinear in hardware
 // (sRGB decode per texel via the SRGB SRV format, texel centers at i + 0.5;
 // every sample passes an explicit ray-cone lod to SampleLevel, and lod <= 0

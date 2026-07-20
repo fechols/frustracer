@@ -61,6 +61,9 @@ StructuredBuffer<Mat> materials : register(t6);
 // detour). Past the budget, glass shades opaque.
 #define GLASS_IOR 1.5
 #define TRANS_MAX_DEPTH 4u
+// shade.rs::TRANS_DEPTH_K — the Beer–Lambert reference depth (relative to
+// SCENE_DIAG) at which transmitted light is tinted to exactly the albedo.
+#define TRANS_DEPTH_K 0.015
 
 // --- shade.rs helper ports ----------------------------------------------------
 
@@ -488,16 +491,23 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                 // transmitted side (p - 2*eps*n = hit - n*eps). The rng
                 // draws above already happened — order matches the CPU.
                 if (mat.translucency > 0.0 && ndl < 0.0) {
-                    if (!occluded_q(p - n * (2.0 * SCENE_EPS), wi, 0.0, INF)) {
-                        direct_t += sun_e.xyz * (-ndl);
+                    // transmit_q (shade.rs's tinted-shadows twin): the back
+                    // ray carries a tint through glass; ONE when clear, so
+                    // `x * 1.0` keeps opaque scenes bitwise.
+                    float3 back_vis = transmit_q(p - n * (2.0 * SCENE_EPS), wi, 0.0, INF);
+                    if (any(back_vis != 0.0)) {
+                        direct_t += sun_e.xyz * (-ndl) * back_vis;
                     }
                 }
                 continue;
             }
             // tmax = INF: the sun is at infinity, so anything along the ray
-            // occludes it.
-            if (!occluded_q(p, wi, 0.0, INF)) {
-                float3 li = sun_e.xyz * ndl;
+            // occludes it. transmit_q: the sun ray carries a tint through
+            // glass (tinted shadows); the throughput rides `li`, so the
+            // GGX/sheen terms inherit it componentwise (shade.rs).
+            float3 vis_t = transmit_q(p, wi, 0.0, INF);
+            if (any(vis_t != 0.0)) {
+                float3 li = sun_e.xyz * ndl * vis_t;
                 direct_d += li;
                 float3 h = normalize_or_zero(wi + v);
                 float3 hl = float3(dot(h, t1), dot(h, t2), dot(h, n_s));
@@ -571,9 +581,10 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                 float fe = FF_E_K * ff_scale * ff_scale * ff[fi].w
                            / max(fd2, ff_rmin2) * (fx * fx);
                 if (fe <= 0.0) continue;
-                if (occluded_q(p, fwi, 0.0, max(fdist - 2.0 * SCENE_EPS, 0.0)))
+                float3 fvis = transmit_q(p, fwi, 0.0, max(fdist - 2.0 * SCENE_EPS, 0.0));
+                if (all(fvis == 0.0))
                     continue;
-                float3 fli = FF_COLOR * (fe * fndl);
+                float3 fli = FF_COLOR * (fe * fndl) * fvis;
                 direct_d += fli;
                 float3 fh = normalize_or_zero(fwi + v);
                 float3 fhl = float3(dot(fh, t1), dot(fh, t2), dot(fh, n_s));
@@ -631,13 +642,19 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
             if (n_ao > 0u) {
                 float3 at1, at2;
                 onb(n, at1, at2);
-                uint open = 0u;
+                float open = 0.0;
                 for (uint ai = 0u; ai < n_ao; ++ai) {
                     float r1 = rng_next(rng);
                     float r2 = rng_next(rng);
-                    if (!occluded_q(p, cosine_dir(n, at1, at2, r1, r2), 0.0, AO_RADIUS)) open++;
+                    // Mean-of-components (shade.rs): the AO plane is a
+                    // SCALAR, so a glass throughput folds to gray. The true
+                    // divide keeps 3.0/3.0 == 1.0 and 0.0/3.0 == 0.0 exact —
+                    // opaque scenes accumulate the old integer counts
+                    // bit-identically.
+                    float3 tp = transmit_q(p, cosine_dir(n, at1, at2, r1, r2), 0.0, AO_RADIUS);
+                    open += (tp.x + tp.y + tp.z) / 3.0;
                 }
-                ao = float(open) / float(n_ao);
+                ao = open / float(n_ao);
             }
             // FSR's AO signal — lap 0 only (later laps compute their own AO
             // for their own ambient; the capture is the PRIMARY surface's).
@@ -811,6 +828,18 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                 float3 t_tput = tput * albedo * ttw;
                 HitInfo th;
                 if (trace_closest(torig, tdir, 0.0, FLT_MAX, th)) {
+                    // Beer–Lambert over the interior segment (shade.rs's
+                    // depth_attenuation twin — the flattened DFS folds it
+                    // into the child's THROUGHPUT, since the child hit is
+                    // already traced here; same product, different fp
+                    // association, absorbed by the statistical CPU-vs-GPU
+                    // gates). Entering crosses in; TIR (k < 0) stays in; a
+                    // clean exit travels outside. The sky-miss arm below
+                    // stays unattenuated (leaked geometry — CPU parity).
+                    if ((entering || k < 0.0) && (flags & FLAG_DEPTH_TINT)) {
+                        t_tput *= pow(max(albedo, 1e-6),
+                                      th.t / (TRANS_DEPTH_K * SCENE_DIAG));
+                    }
                     if (!next_set) {
                         nx_o = torig;
                         nx_d = tdir;
