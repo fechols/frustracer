@@ -33,7 +33,7 @@ StructuredBuffer<uint>   tri_mat   : register(t5);
 // scene.rs::NO_TEX — "no map" sentinel for the texture-index fields.
 #define TEX_NONE 0xffffffffu
 
-// Mirrors trace.rs::GpuMat field-for-field (80 B) — a stride skew reads
+// Mirrors trace.rs::GpuMat field-for-field (100 B) — a stride skew reads
 // garbage; the two must move in the same commit.
 struct Mat {
     float3 albedo;
@@ -52,13 +52,22 @@ struct Mat {
     uint metal_tex;    // metallic map, samples .b
     uint emissive_tex; // emissive map (sRGB SRV)
     float normal_scale;
+    float3 trans_tint; // transmission/absorption tint; sentinel .x < 0 = "use albedo"
+    float ior;         // Snell/Fresnel IOR (default 1.5; water 1.33)
+    float ripple_amp;  // water ripple slope amplitude (0 = none)
 };
 StructuredBuffer<Mat> materials : register(t6);
 
-// shade.rs's glassware constants: fixed IOR (the classifier's `transmission`
-// scalar carries all the variation) and the interface budget for the
-// refraction chain (front/back walls of a two-walled tumbler, no TIR
-// detour). Past the budget, glass shades opaque.
+// Material::trans_tint_or — the ONE tint source (per-interface glass tint,
+// Beer–Lambert, shadow tint): trans_tint when set, else albedo verbatim.
+float3 trans_tint_or(Mat m, float3 albedo) {
+    return m.trans_tint.x >= 0.0 ? m.trans_tint : albedo;
+}
+
+// shade.rs's glassware constants: the interface budget for the refraction
+// chain (front/back walls of a two-walled tumbler, no TIR detour). Past the
+// budget, glass shades opaque. IOR now rides mat.ior (default 1.5; water
+// 1.33) — GLASS_IOR stays only as the documented default.
 #define GLASS_IOR 1.5
 #define TRANS_MAX_DEPTH 4u
 // shade.rs::TRANS_DEPTH_K — the Beer–Lambert reference depth (relative to
@@ -314,6 +323,69 @@ float3 perturb_normal(float3 n, Mat mat, float2 uv, TexFilt filt,
     return outn;
 }
 
+// shade.rs::ripple_grad / ripple_normal — the procedural water ripple field,
+// a sum of 3 directional sinusoid gradients (an integrable field ⇒ a
+// consistent virtual heightfield). Constants are LITERALS matching shade.rs,
+// so this is identical by construction (only cos ulps differ). Pure ALU, no
+// rng. Animated on CLOUD_TIME; every length SCENE_DIAG-relative.
+static const float2 RIPPLE_DIR[3] = {
+    float2(0.932, 0.362), float2(-0.588, 0.809), float2(0.259, -0.966)
+};
+static const float3 RIPPLE_LAMBDA_K = float3(5.2e-3, 2.9e-3, 1.6e-3);
+static const float3 RIPPLE_W = float3(2.1, 3.4, 4.9);
+static const float3 RIPPLE_A = float3(0.45, 0.32, 0.23);
+
+float2 ripple_grad(float3 p, float t, float diag) {
+    float2 g = float2(0.0, 0.0);
+    float2 pxz = float2(p.x, p.z);
+    [unroll]
+    for (int i = 0; i < 3; i++) {
+        float ph = TAU * (dot(RIPPLE_DIR[i], pxz) / (RIPPLE_LAMBDA_K[i] * diag)) - RIPPLE_W[i] * t;
+        g += RIPPLE_DIR[i] * (RIPPLE_A[i] * cos(ph));
+    }
+    return g;
+}
+
+// Tilt `base` by the ripple slope (× amp), unit on the +n side; a
+// degenerate/below-horizon result falls back to base. `n` is the geometric
+// normal (horizon guard + projection axis).
+float3 ripple_normal(float3 base, float3 n, float3 p, float t, float amp, float diag) {
+    if (amp == 0.0) return base; // off state: no re-normalize (unit base drift)
+    float2 g = ripple_grad(p, t, diag) * amp;
+    float3 g3 = float3(g.x, 0.0, g.y);
+    float3 gt = g3 - n * dot(g3, n);
+    float3 outn = normalize_or_zero(base - gt);
+    if (all(outn == float3(0.0, 0.0, 0.0)) || dot(outn, n) <= 0.0) return base;
+    return outn;
+}
+
+// shade.rs's `snell` closure — one Snell/Fresnel evaluation over axis `ns`.
+// Refraction and the reflected-fraction Fresnel ride `ns`; the eps offsets
+// ride the GEOMETRIC n. Returns (tdir, torig, ttw, is_tir) via out params.
+void glass_snell(float3 rd, float3 v, float3 ns, float3 n, float3 hit_p,
+                 float eta, float transmission, out float3 tdir, out float3 torig,
+                 out float ttw, out bool is_tir) {
+    float cos_i = max(dot(v, ns), 1e-4);
+    float k = 1.0 - eta * eta * (1.0 - cos_i * cos_i);
+    if (k >= 0.0) {
+        // Exact unpolarized dielectric Fresnel (not Schlick — it must reach 1
+        // as k -> 0 or the TIR handoff pops).
+        float cos_t = sqrt(k);
+        float rs = (eta * cos_i - cos_t) / (eta * cos_i + cos_t);
+        float rp = (cos_i - eta * cos_t) / (cos_i + eta * cos_t);
+        float fr = 0.5 * (rs * rs + rp * rp);
+        tdir = normalize(rd * eta + ns * (eta * cos_i - cos_t));
+        torig = hit_p - n * SCENE_EPS;
+        ttw = transmission * (1.0 - fr);
+        is_tir = false;
+    } else {
+        tdir = rd + ns * (2.0 * cos_i);
+        torig = hit_p + n * SCENE_EPS;
+        ttw = transmission;
+        is_tir = true;
+    }
+}
+
 // --- The shade() port ----------------------------------------------------------
 
 // Whitted shading of a committed primary hit, reflection bounce included.
@@ -424,6 +496,12 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
         float3 n_s = n;
         if (mat.normal_tex != TEX_NONE && has_basis) {
             n_s = perturb_normal(n, mat, map_uv, filt, tu, tv);
+        }
+        // Water ripples tilt the SHADING normal on the shared cloud clock
+        // (pure ALU, no rng). Composes on the normal map; geometric n
+        // untouched. Off (ripple_amp 0) leaves n_s exactly as selected.
+        if (mat.ripple_amp > 0.0) {
+            n_s = ripple_normal(n_s, n, ro + rd * hit.t, CLOUD_TIME, mat.ripple_amp, SCENE_DIAG);
         }
         if (lap == 0u) {
             // shade.rs — spec_t stays 0 unless the lap-0 reflection below
@@ -797,35 +875,30 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                 n_raw = normalize_or_zero(cross(e1, e2));
             }
             bool entering = dot(n_raw, n) >= 0.0; // the viewer-flip didn't fire
-            float eta = entering ? 1.0 / GLASS_IOR : GLASS_IOR;
-            // The refraction chain stays on the GEOMETRIC normal (shade.rs);
-            // v·n with the same grazing guard is bit-identical to the old
-            // n-frame vl.z when no normal map is present.
-            float cos_i = max(dot(v, n), 1e-4);
-            float k = 1.0 - eta * eta * (1.0 - cos_i * cos_i);
+            float eta = entering ? 1.0 / mat.ior : mat.ior;
             float3 hit_p = ro + rd * hit.t;
             float3 tdir, torig;
             float ttw;
-            if (k >= 0.0) {
-                // Exact unpolarized dielectric Fresnel (not Schlick — it
-                // must reach 1 as k -> 0 or the TIR handoff pops).
-                float cos_t = sqrt(k);
-                float rs = (eta * cos_i - cos_t) / (eta * cos_i + cos_t);
-                float rp = (cos_i - eta * cos_t) / (cos_i + eta * cos_t);
-                float fr = 0.5 * (rs * rs + rp * rp);
-                tdir = normalize(rd * eta + n * (eta * cos_i - cos_t));
-                torig = hit_p - n * SCENE_EPS;
-                ttw = mat.transmission * (1.0 - fr);
+            bool is_tir;
+            // Water ripples perturb the Snell axis too (guarded): a refraction
+            // must cross the geometric surface (tdir·n < 0), a TIR mirror stay
+            // on the near side (tdir·n > 0). A ripple that flips the side is
+            // rejected and the arm recomputes on geometric n (which always
+            // passes both). Off (ripple_amp 0) runs geometric-n verbatim.
+            if (mat.ripple_amp > 0.0) {
+                float3 n_snell = ripple_normal(n, n, hit_p, CLOUD_TIME, mat.ripple_amp, SCENE_DIAG);
+                glass_snell(rd, v, n_snell, n, hit_p, eta, mat.transmission, tdir, torig, ttw, is_tir);
+                bool ok = is_tir ? (dot(tdir, n) > 0.0) : (dot(tdir, n) < 0.0);
+                if (!ok) {
+                    glass_snell(rd, v, n, n, hit_p, eta, mat.transmission, tdir, torig, ttw, is_tir);
+                }
             } else {
-                // TIR: mirror about n, staying on the incident side.
-                tdir = rd + n * (2.0 * cos_i);
-                torig = hit_p + n * SCENE_EPS;
-                ttw = mat.transmission;
+                glass_snell(rd, v, n, n, hit_p, eta, mat.transmission, tdir, torig, ttw, is_tir);
             }
             if (ttw > 1e-3) {
-                // Tinted by albedo — the classifier lifts dark MTL glass Kd
-                // toward white so this doesn't go black.
-                float3 t_tput = tput * albedo * ttw;
+                // Tinted by the ONE tint source (trans_tint for water, else
+                // the albedo the classifier lifts toward white).
+                float3 t_tput = tput * trans_tint_or(mat, albedo) * ttw;
                 HitInfo th;
                 if (trace_closest(torig, tdir, 0.0, FLT_MAX, th)) {
                     // Beer–Lambert over the interior segment (shade.rs's
@@ -836,8 +909,8 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                     // gates). Entering crosses in; TIR (k < 0) stays in; a
                     // clean exit travels outside. The sky-miss arm below
                     // stays unattenuated (leaked geometry — CPU parity).
-                    if ((entering || k < 0.0) && (flags & FLAG_DEPTH_TINT)) {
-                        t_tput *= pow(max(albedo, 1e-6),
+                    if ((entering || is_tir) && (flags & FLAG_DEPTH_TINT)) {
+                        t_tput *= pow(max(trans_tint_or(mat, albedo), 1e-6),
                                       th.t / (TRANS_DEPTH_K * SCENE_DIAG));
                     }
                     if (!next_set) {

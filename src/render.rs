@@ -17,6 +17,23 @@ use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 /// Tiles at or below this size stop subdividing and trace per-pixel rays.
 /// Caps quadtree overhead at ~(pixels/64)·4/3 frustum queries per frame.
 pub const LEAF_TILE: usize = 8;
+
+/// R&D lever (FR_LEAF, default LEAF_TILE): the quadtree's leaf-rect cutoff, so
+/// the subdivision depth can be swept without a rebuild. Smaller = narrower
+/// leaf frustums (deeper distance penetration, more tiles provable as sky) at
+/// 4x the tiles per level down and 1/4 the pixels to amortize each tile's
+/// bound-query + refine_cut over. Read once; the GPU gets the same number as an
+/// injected `#define LEAF_TILE` so both intersectors agree on the frontier.
+pub fn leaf_tile() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("FR_LEAF")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| n.is_power_of_two() && *n >= 1 && *n <= 64)
+            .unwrap_or(LEAF_TILE)
+    })
+}
 /// Tiles larger than this spawn their quadrants as rayon tasks; smaller ones
 /// recurse sequentially (task granularity, not correctness).
 const SPAWN_MIN: usize = 32;
@@ -263,7 +280,7 @@ fn trace_tile(
         return TilePend::Done;
     }
     let (w, h) = (x1 - x0, y1 - y0);
-    if w <= LEAF_TILE && h <= LEAF_TILE {
+    if w <= leaf_tile() && h <= leaf_tile() {
         if let Some(rec) = ctx.replay_rec {
             rec.push_leaf(x0, y0, x1, y1, t_start, depth, cut_in);
         }

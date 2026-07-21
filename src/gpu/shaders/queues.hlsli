@@ -51,8 +51,15 @@ RWStructuredBuffer<float> accum : register(u0);
 RWStructuredBuffer<float> tbuf  : register(u1);
 RWStructuredBuffer<uint>  info  : register(u2);
 
+// SKY_UNIT (sky.hlsl) takes u5 for the cloud lattice instead: the tile queues
+// are dead by the time the sky fill runs, and each compile unit re-declares
+// what its registers mean in that phase (the codebase idiom — see the header
+// on `TRACE_COMMON_HLSLI`'s concat sites). The leaf kernel keeps these
+// declarations and simply never touches them.
+#ifndef SKY_UNIT
 RWStructuredBuffer<TileRec> qin      : register(u5);
 RWStructuredBuffer<TileRec> qout     : register(u6);
+#endif
 RWStructuredBuffer<LeafRec> qleaf    : register(u7);
 RWStructuredBuffer<SkyRec>  qsky     : register(u8);
 RWStructuredBuffer<uint>    cut_pool : register(u9); // 64 x u32 slots

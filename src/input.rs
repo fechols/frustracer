@@ -29,6 +29,8 @@ pub struct Edges {
     pub verify: bool,          // C
     pub screenshot: bool,      // P
     pub cycle_spp: bool,       // U (samples per pixel: 1 -> 2 -> 4 -> 8 -> 1)
+    pub capture_frustum: bool, // Y (freeze the current view's quadtree frustums as scene geometry)
+    pub clear_frustum: bool,   // Z (remove the frozen frustum snapshot)
     pub quality: Option<u32>,  // 1/2/3
     pub toggle_fullscreen: bool, // F11 (borderless desktop fullscreen)
     /// Newest window client size from this frame's SizeChanged events
@@ -81,6 +83,8 @@ impl Input {
                     Keycode::C => e.verify = true,
                     Keycode::P => e.screenshot = true,
                     Keycode::U => e.cycle_spp = true,
+                    Keycode::Y => e.capture_frustum = true,
+                    Keycode::Z => e.clear_frustum = true,
                     Keycode::Num1 | Keycode::Kp1 => e.quality = Some(1),
                     Keycode::Num2 | Keycode::Kp2 => e.quality = Some(2),
                     Keycode::Num3 | Keycode::Kp3 => e.quality = Some(3),

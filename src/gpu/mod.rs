@@ -1211,6 +1211,22 @@ impl GpuContext {
         self.trace.is_some()
     }
 
+    /// Drop the resident GPU tracers (--gpu wavefront + DXR) and their
+    /// dependents (the quinlight fuse, GPU-resident NPPD) so the next mode
+    /// entry rebuilds their SceneGpu/BLAS/TLAS from the current scene — the
+    /// runtime frustum-snapshot capture path, which edits the scene live.
+    /// Drains the queue first so no in-flight frame references the freed
+    /// resources; `init_trace`/`init_dxr` re-read the scene at call time and
+    /// re-run `build_quin`. The upscaler contexts (rr/xess/fsr) are kept —
+    /// they are resolution-, not scene-, bound.
+    pub fn drop_scene_tracers(&mut self) {
+        let _ = self.d3d.wait_idle();
+        self.nppd_gpu = None;
+        self.quin = None;
+        self.trace = None;
+        self.dxr = None;
+    }
+
     /// Push a TOD change (`scene::apply_tod`) into the GPU pipelines' cached
     /// base constants — sun rows + SH sky + sky_scale/night. A pipeline built
     /// lazily AFTER the change needs nothing: `init_trace`/`init_dxr` read the

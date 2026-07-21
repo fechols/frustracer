@@ -32,7 +32,7 @@
 
 use crate::camera::CamBasis;
 use crate::frustum::MAX_CUT;
-use crate::render::LEAF_TILE;
+use crate::render::leaf_tile;
 use crate::stats::LocalStats;
 use glam::Vec3A;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
@@ -87,7 +87,7 @@ impl TemporalCache {
         // deepest tile_step depth is ceil(log2(max(rw,rh)/LEAF_TILE)) − 1, but
         // allocate through the leaf depth — store() bounds-checks anyway and
         // odd resolutions can go one level deeper on some branches.
-        let max_depth = ((rw.max(rh) as f32) / LEAF_TILE as f32).log2().ceil() as u32;
+        let max_depth = ((rw.max(rh) as f32) / leaf_tile() as f32).log2().ceil() as u32;
         let mut offsets = Vec::with_capacity(max_depth as usize + 2);
         let mut total = 0usize;
         for d in 0..=max_depth + 1 {
@@ -160,7 +160,7 @@ impl CutStore {
     pub fn new(rw: usize, rh: usize) -> Self {
         // Mirror TemporalCache's depth/offsets exactly — a cut is stored at
         // the same (depth, path) key as its node's claim.
-        let max_depth = ((rw.max(rh) as f32) / LEAF_TILE as f32).log2().ceil() as u32;
+        let max_depth = ((rw.max(rh) as f32) / leaf_tile() as f32).log2().ceil() as u32;
         let mut offsets = Vec::with_capacity(max_depth as usize + 2);
         let mut total = 0usize;
         for d in 0..=max_depth + 1 {

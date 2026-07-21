@@ -33,6 +33,7 @@ mod oidn;
 // The ORT loader half is Windows-only (LoadLibrary + DirectML); the padding,
 // NCHW packing, and temporal-warp math are pure and feed --check.
 mod nppd;
+mod frustcap;
 mod overlay;
 mod render;
 mod reproject;
@@ -303,6 +304,17 @@ pub struct Opts {
     /// back into the CPU renderer). Requires the DXC DLL drop and RT tier
     /// 1.0; falls back to the CPU path with a loud line.
     pub dxr: bool,
+    /// Did the user name a render mode at all (`--cpu` / `--gpu` / `--dxr`)?
+    /// `dxr` defaults to true, so "is DXR on" cannot answer "did they ASK for
+    /// DXR" — and two places need that distinction: `--spin` (which drives the
+    /// CPU renderer unless a GPU arm was requested) and the vendor-default
+    /// policy in `run_window`, which may only move a default the user left
+    /// alone. `dxr_explicit` already existed as a parse-local for the
+    /// OIDN/NPPD opt-out; this is the same idea, promoted so it survives parse.
+    pub mode_explicit: bool,
+    /// Did the user pass `--lock-res`? Same reason: `gpu_lock_scale` has a
+    /// non-None default, so its value cannot report whether it was chosen.
+    pub lock_res_explicit: bool,
     /// Directory holding dxcompiler.dll + dxil.dll.
     pub dxc_path: String,
     /// PIX Begin/End events on the D3D12 command lists (--pix-markers;
@@ -459,6 +471,8 @@ fn main() {
         ftree_tiles: false,
         gpu: false,
         dxr: true,
+        mode_explicit: false,
+        lock_res_explicit: false,
         dxc_path: std::env::var("FRUSTRACER_DXC_PATH").unwrap_or_else(|_| {
             concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\dxc\bin\x64").to_string()
         }),
@@ -649,6 +663,10 @@ fn main() {
             // transmission chain's interior segments (runtime shading lever).
             "--no-spray" => scene::set_spray(false),
             "--no-depth-tint" => scene::set_depth_tint(false),
+            // --no-water: the fountain classifies as generic glassware (the
+            // pre-water-class look) instead of the water refinement (blue-green
+            // tint, IOR 1.33, ripple normals); keys the cache lever word.
+            "--no-water" => scene::set_water(false),
             // Relief rendering session levers. The DEFAULT is DISARMED —
             // structurally the pre-relief renderer (no AABB sweep at BVH
             // build, no march anywhere; the sweep's all-axis edge pad
@@ -866,6 +884,7 @@ fn main() {
                     }
                 };
                 opts.gpu_lock_scale = opts.lock_scale;
+                opts.lock_res_explicit = true;
             }
             // Ray Regeneration tuning overrides (FfxApiConfigureDenoiserKey).
             // Absent = the provider's own default, so a flagless session is
@@ -915,11 +934,15 @@ fn main() {
                     });
             }
             "--oidn-no-clean-aux" => opts.oidn_clean_aux = false,
-            "--gpu" => opts.gpu = true,
+            "--gpu" => {
+                opts.gpu = true;
+                opts.mode_explicit = true;
+            }
             "--check-gpu" => check_gpu = true,
             "--dxr" => {
                 opts.dxr = true;
                 dxr_explicit = true;
+                opts.mode_explicit = true;
             }
             // The CPU frustum-tracer as the render mode: it is what both GPU
             // modes are peers of, so --cpu clears both. Later flags win (a
@@ -927,6 +950,7 @@ fn main() {
             "--cpu" => {
                 opts.dxr = false;
                 opts.gpu = false;
+                opts.mode_explicit = true;
             }
             "--check-dxr" => check_dxr = true,
             "--dxc-path" => {
@@ -1091,6 +1115,8 @@ fn main() {
                 eprintln!("                instead of white-scatter spray (load-time retag; keys the scene cache)");
                 eprintln!("  --no-depth-tint  no Beer–Lambert attenuation over the transmission chain's interior");
                 eprintln!("                segments (water loses its depth-graded tint)");
+                eprintln!("  --no-water    classify the fountain as generic glassware, not the water class");
+                eprintln!("                (no blue-green tint / IOR 1.33 / ripple normals; keys the scene cache)");
                 eprintln!("  --heightfield ARM relief rendering and start it ON where the scene carries height");
                 eprintln!("                data (V toggles relief vs normal-mapping live in the armed session).");
                 eprintln!("                The DEFAULT is unarmed: no swept AABBs, no march — the pre-relief");
@@ -1416,7 +1442,7 @@ fn main() {
         },
     });
     let t0 = Instant::now();
-    let bvh = prebuilt.unwrap_or_else(|| bvh::Bvh::build(&scene));
+    let mut bvh = prebuilt.unwrap_or_else(|| bvh::Bvh::build(&scene));
     eprintln!(
         "scene: {} tris | BVH: {} nodes ready in {:.0} ms",
         scene.tri_count(),
@@ -1555,7 +1581,7 @@ fn main() {
         _ => Vec::new(),
     };
     #[cfg(windows)]
-    run_window(&mut scene, &bvh, &opts, cam0, attractors);
+    run_window(&mut scene, &mut bvh, &opts, cam0, attractors);
     #[cfg(not(windows))]
     {
         let _ = (&opts, cam0, attractors);
@@ -8007,8 +8033,14 @@ fn run_spin(
             return 2;
         }
     };
-    if opts.gpu {
-        eprintln!("--spin: drives the CPU renderer only; ignoring --gpu");
+    // GPU arms: `--gpu` (the wavefront tracer) or an EXPLICIT `--dxr`.
+    // `opts.dxr` defaults ON, so its value cannot be read as a request —
+    // `mode_explicit` is what separates "the user asked for the DispatchRays
+    // pipeline" from "nobody said anything", and that is why a bare `--spin`
+    // still drives the CPU renderer exactly as it always has.
+    #[cfg(windows)]
+    if opts.gpu || (opts.dxr && opts.mode_explicit) {
+        return run_spin_gpu(scene, bvh, cam0, mode, moving, frames, opts);
     }
     let (rw, rh) = (W, H);
     let q = Quality::upscaler_1spp();
@@ -8112,6 +8144,192 @@ fn run_spin(
         peak_ms,
         timed as u64,
     );
+    0
+}
+
+/// `--spin` on a GPU arm (`--gpu` wavefront, or an explicit `--dxr`): the same
+/// closed-loop `spin_path_pose` camera and the same per-frame contract the CPU
+/// arm runs, submitted through `HeadlessGpu` (record -> execute -> block)
+/// instead of a swapchain.
+///
+/// It exists because the GPU tracers had no deterministic wall-clock workload
+/// at all. `--check-gpu`'s bench rows are warm-clock noisy by their own
+/// admission — a cold row can "measure" a physically impossible speedup, which
+/// is exactly why the spp sweep interleaves its configurations and reduces by
+/// median — and an interactive `--gpu-timing` table depends on wherever the
+/// user happened to be flying. Here the pose, the cloud clock and the firefly
+/// poses are all pure functions of the frame index, the same as on the CPU, so
+/// an A/B across a code change compares two byte-identical workloads. Because
+/// the contract matches `run_spin`'s line for line (1-spp upscaler quality,
+/// `accumulate` off, frame-uniform Halton jitter), `--cpu` / `--gpu` / `--dxr`
+/// spin rows are directly comparable to each other.
+///
+/// What it measures is the TRACER, not the presented frame: `gbuf_full` is off,
+/// so there is no G-buffer pack and no feed/upscale pass. Those are constant
+/// across tracer changes (measured on the Arc Pro B70: feed 0.53 + xess-eval
+/// 0.51 ms) and wiring them in would need a swapchain this path deliberately
+/// does not have. The wall clock therefore carries the per-frame submit+fence
+/// overhead the interactive loop hides behind FRAMES_IN_FLIGHT — compare GPU
+/// time to GPU time via `--gpu-timing`, whose per-pass table prints every 120
+/// frames and once more at exit. On Intel that table is the only per-pass
+/// profiler that exists (PIX cannot analyze an Arc capture).
+#[cfg(windows)]
+fn run_spin_gpu(
+    scene: &scene::Scene,
+    bvh: &bvh::Bvh,
+    cam0: Camera,
+    mode: &str,
+    moving: bool,
+    frames: u32,
+    opts: &Opts,
+) -> i32 {
+    let arm = if opts.gpu { "gpu" } else { "dxr" };
+    let dxc = match gpu::dxc::Dxc::load(&opts.dxc_path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("spin {arm}: {e}");
+            return 2;
+        }
+    };
+    let mut hg = match gpu::trace::HeadlessGpu::new(
+        opts.gpu_debug,
+        opts.prefer.unwrap_or(gpu::adapter::Prefer::Nvidia),
+    ) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("spin {arm}: device creation failed: {e}");
+            return 2;
+        }
+    };
+    // Trace res = the GPU-mode lock scale (`--lock-res`, default native), so
+    // `--gpu --lock-res quality` is measurable here — which is precisely the
+    // claim the Intel default rests on. No upscaler range exists headlessly, so
+    // this is a plain scale of the interactive native res rounded to even
+    // rather than `quantize_res`'s SDK-clamped quantum.
+    let lock = opts.gpu_lock_scale.unwrap_or(1.0).clamp(0.1, 1.0);
+    let rw = (((W as f32 * lock).round() as usize) & !1usize).max(8);
+    let rh = (((H as f32 * lock).round() as usize) & !1usize).max(8);
+    let dev = hg.device.clone();
+    let q = Quality::upscaler_1spp();
+
+    // One enum instead of two copies of the loop: the two tracers share the
+    // FrameParams contract but not a trait (DxrGpu::record_frame is fallible —
+    // it casts to ID3D12GraphicsCommandList4).
+    enum Arm {
+        Wave(gpu::trace::TraceGpu),
+        Dxr(gpu::dxr::DxrGpu),
+    }
+    let armv = if opts.gpu {
+        match gpu::trace::TraceGpu::new(
+            &dev,
+            &dxc,
+            scene,
+            bvh,
+            rw as u32,
+            rh as u32,
+            false, // no G-buffer pack: this measures the tracer
+            false, // no NPPD stage
+            opts.gpu_debug,
+            opts.bc7,
+            &mut hg,
+        ) {
+            Ok(t) => Arm::Wave(t),
+            Err(e) => {
+                eprintln!("spin gpu: TraceGpu init failed: {e}");
+                return 2;
+            }
+        }
+    } else {
+        match gpu::dxr::DxrGpu::new(
+            &dev,
+            &dxc,
+            scene,
+            rw as u32,
+            rh as u32,
+            false,
+            opts.gpu_debug,
+            opts.bc7,
+            &mut hg,
+        ) {
+            Ok(d) => Arm::Dxr(d),
+            Err(e) => {
+                eprintln!("spin dxr: DxrGpu init failed: {e}");
+                return 2;
+            }
+        }
+    };
+
+    eprintln!(
+        "spin {mode} [{arm}]: {frames} frames at {rw}x{rh} ({:.0}% of {W}x{H}), 1-spp quality, spp {} | adapter \"{}\" | pid {}",
+        lock * 100.0,
+        opts.spp,
+        hg.adapter_name,
+        std::process::id()
+    );
+    const WARMUP: u32 = 20;
+    let mut total_ms = 0.0f64;
+    let mut peak_ms = 0.0f64;
+    let mut window = Instant::now();
+    for idx in 0..frames {
+        let cam = if moving { spin_path_pose(&cam0, scene.diag, idx) } else { cam0 };
+        let p = gpu::trace::FrameParams {
+            cam: cam.basis(rw, rh),
+            frame: idx,
+            // The upscaler frame contract, matching run_spin's CPU ctx exactly:
+            // every frame is a fresh 1-spp trace with frame-uniform Halton
+            // jitter and a free-running index (pinning it would freeze the noise
+            // pattern), so the two arms measure the same workload.
+            accumulate: false,
+            jitter: false,
+            frame_jitter: Some(dlss::jitter_for(idx)),
+            prev_cam: None,
+            q,
+            verify: false,
+            spp: opts.spp,
+            probe_sample: 0,
+            clouds: crate::clouds::Clouds::spin(scene.diag, idx),
+            fireflies: crate::fireflies::Fireflies::spin(scene, idx),
+        };
+        let t = Instant::now();
+        let r = match &armv {
+            Arm::Wave(tg) => {
+                tg.write_cb(0, &p);
+                hg.run(|l| tg.record_frame(l, 0, &p, true))
+            }
+            Arm::Dxr(dg) => {
+                dg.write_cb(0, &p);
+                let mut rec = Ok(());
+                hg.run(|l| rec = dg.record_frame(l, 0)).and(rec)
+            }
+        };
+        if let Err(e) = r {
+            eprintln!("spin {arm}: frame {idx} failed: {e}");
+            return 1;
+        }
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        prof::frame_mark();
+        if idx >= WARMUP {
+            total_ms += ms;
+            peak_ms = peak_ms.max(ms);
+        }
+        if (idx + 1) % 200 == 0 {
+            eprintln!(
+                "spin {mode} [{arm}] [{:4}]: {:6.2} ms/frame over the last 200",
+                idx + 1,
+                window.elapsed().as_secs_f64() * 1000.0 / 200.0,
+            );
+            window = Instant::now();
+        }
+    }
+    let timed = frames.saturating_sub(WARMUP).max(1) as f64;
+    eprintln!(
+        "spin {mode} [{arm}] summary: {:.2} ms/frame mean (peak {:.2}) over {} timed frames \
+         (wall clock, includes per-frame submit+fence; --gpu-timing for GPU time)",
+        total_ms / timed,
+        peak_ms,
+        timed as u64,
+    );
+    gpu::gputime::report();
     0
 }
 
@@ -8338,6 +8556,19 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
         Err(e) => {
             eprintln!("tangent self-test: FAIL — {e}");
+            false
+        }
+    };
+
+    // Water-ripple field self-test — off-state bit-identity, horizon guard,
+    // closed-form anchor, animation.
+    let ripple_ok = match shade::ripple_self_test() {
+        Ok(()) => {
+            eprintln!("ripple self-test: OK");
+            true
+        }
+        Err(e) => {
+            eprintln!("ripple self-test: FAIL — {e}");
             false
         }
     };
@@ -10364,6 +10595,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         ("nppd", nppd_ok),
         ("matclass", matclass_ok),
         ("tangent", tangent_ok),
+        ("ripple", ripple_ok),
         ("upchain", upchain_ok),
         ("tone", tone_ok),
         ("gltf", gltf_ok),
@@ -10525,6 +10757,12 @@ struct Persist {
     /// resolution) — carried across resize/F11 re-entries like the camera
     /// pose: a rebuild is not a weather change.
     cloud_time: f64,
+    /// The frozen frustum snapshot appended to the scene (Y captures, Z
+    /// clears), if any — its appended vert/tri/material counts, so a
+    /// recapture/clear can truncate the tail. The geometry itself lives in the
+    /// owned `Scene` (mutated in place) and survives resize with it; this is
+    /// the bookkeeping that survives alongside.
+    frust: Option<frustcap::FrustArtifact>,
 }
 
 /// "HH:MM" of a time-of-day hour — the window-title readout (doubles as the
@@ -10538,7 +10776,7 @@ fn tod_hhmm(h: f32) -> String {
 #[cfg(windows)]
 fn run_window(
     scene: &mut scene::Scene,
-    bvh: &bvh::Bvh,
+    bvh: &mut bvh::Bvh,
     opts: &Opts,
     cam0: Camera,
     attractors: Vec<flycam::TodAttractor>,
@@ -10654,7 +10892,7 @@ fn run_window(
 #[allow(clippy::too_many_arguments)]
 fn session(
     scene: &mut scene::Scene,
-    bvh: &bvh::Bvh,
+    bvh: &mut bvh::Bvh,
     opts: &Opts,
     fly: &flycam::FlyCam,
     window: &mut sdl2::video::Window,
@@ -10697,6 +10935,11 @@ fn session(
     // does neither and clears it; idle (converged) frames don't touch it.
     let replay_cache = replay::ReplayCache::new(w, h);
     let mut replay_key: Option<(camera::CamBasis, (usize, usize))> = None;
+
+    // Frozen frustum snapshot (Y captures, Z clears). The geometry already
+    // lives in the owned `Scene` across a resize re-entry; this local tracks
+    // how much of the tail is artifact so a recapture/clear can truncate it.
+    let mut frust: Option<frustcap::FrustArtifact> = p0.and_then(|p| p.frust);
 
     let mut frame: u32 = 0;
     let mut hybrid = p0.map_or(true, |p| p.hybrid);
@@ -11411,7 +11654,7 @@ fn session(
     }
     let mut prev_budget = false;
     // Depth cap that fully resolves the screen (tiles reach LEAF_TILE): 7 at 1024.
-    let depth_full: f32 = ((w.max(h) as f32) / render::LEAF_TILE as f32).log2().ceil();
+    let depth_full: f32 = ((w.max(h) as f32) / render::leaf_tile() as f32).log2().ceil();
     // Fractional depth-cap estimate for budget frames. Mid-range prior: one
     // slightly-coarse first frame beats a hitch. Deliberately not reset when
     // the camera stops — the last value is the best prior for the same
@@ -11519,11 +11762,109 @@ fn session(
             gpu.refresh_sky(scene);
             frame = 0;
         }
-        // The rest of the iteration is read-only on the scene: shadow the
-        // &mut down to a shared borrow so every existing use (FrameCtx,
-        // rayon scopes, the upscaler feeds) compiles verbatim; the &mut
-        // re-arms at the next iteration.
+        // ── Frozen frustum snapshot (Y captures / replaces, Z clears).
+        // Freeze the current view's terminal quadtree as emissive near-plane
+        // quads (one per leaf tile, at its inherited t_start, colored by
+        // depth) so the user can fly around and see the projected tile
+        // frustums as real geometry. Runs BEFORE the scene reborrow below
+        // (it needs &mut scene/bvh) and before the render-mode split, so it
+        // fires in every mode. A capture/clear is a scene GEOMETRY change:
+        // it invalidates every static-scene claim (temporal ring, structure
+        // replay) and the resident GPU acceleration structures, so it drops
+        // the GPU tracers and falls the render back to the CPU tracer (where
+        // the artifact is immediately visible); SPACE re-enters a GPU mode,
+        // rebuilding its acceleration structure with the snapshot.
+        if edges.capture_frustum || (edges.clear_frustum && frust.is_some()) {
+            // 1. Truncate any prior artifact back to the base scene, so the
+            //    capture trace never sees the old wireframe as geometry.
+            if let Some(a) = frust.take() {
+                frustcap::clear(scene, a);
+                *bvh = bvh::Bvh::build(scene);
+            }
+            if edges.capture_frustum {
+                // 2. Record one full-depth uncapped hybrid frame's terminal
+                //    quadtree over the base scene (bvh is base here).
+                let cap_basis = cam.basis(w, h);
+                let cap_cache = replay::ReplayCache::new(w, h);
+                cap_cache.begin(w, h);
+                {
+                    let scene_ref: &scene::Scene = scene;
+                    let bvh_ref: &bvh::Bvh = bvh;
+                    let ctx = FrameCtx {
+                        scene: scene_ref,
+                        bvh: bvh_ref,
+                        cam: cap_basis,
+                        q: Quality::upscaler_1spp(),
+                        frame: 0,
+                        jitter: false,
+                        rw: w,
+                        rh: h,
+                        accum: &accum,
+                        info: &info,
+                        tbuf: &tbuf,
+                        stats: &stats,
+                        sun: render::sun_dir(scene_ref),
+                        clouds: crate::clouds::Clouds::off(),
+                        fireflies: crate::fireflies::Fireflies::off(),
+                        tcache_cur: None,
+                        tcache_prev: &[],
+                        accumulate: false,
+                        gbuf: None,
+                        fsr_buf: None,
+                        prev_cam: None,
+                        frame_jitter: None,
+                        spp: 1,
+                        primary_sample: 0,
+                        adaptive: false,
+                        hemi_share: false,
+                        replay_rec: Some(&cap_cache),
+                        cut_cur: None,
+                        cut_prev: None,
+                        discard_seeds: false,
+                        defer_shade: false,
+                    };
+                    render::render_frame(&ctx, true);
+                }
+                // 3. Build the near-quad wireframe, append it, rebuild the BVH.
+                let (n_leaves, _) = cap_cache.counts();
+                let art = frustcap::build(scene, &cap_basis, &cap_cache, n_leaves);
+                *bvh = bvh::Bvh::build(scene);
+                frust = Some(art);
+                eprintln!(
+                    "frustum snapshot: {n_leaves} leaf tiles, {} tris ({} depth colours); scene now {} tris",
+                    art.tris,
+                    art.mats,
+                    scene.tri_count()
+                );
+            } else {
+                eprintln!("frustum snapshot cleared");
+            }
+            // 4. A geometry change: reset accumulation + every upscaler
+            //    history, drop the static-scene claim ring / replay, and drop
+            //    the resident GPU tracers (their uploaded scene is now stale),
+            //    falling back to the CPU tracer for the render.
+            frame = 0;
+            dlss_reset = true;
+            xess_reset = true;
+            fsr_reset = true;
+            dxr_reset = true;
+            gpu_reset = true;
+            tr = TemporalRing::new(w, h);
+            replay_key = None;
+            gpu.drop_scene_tracers();
+            gpu_trace = false;
+            dxr_on = false;
+        } else if edges.clear_frustum {
+            eprintln!("frustum snapshot: nothing to clear");
+        }
+
+        // The rest of the iteration is read-only on the scene AND the BVH:
+        // shadow both &mut down to shared borrows so every existing use
+        // (FrameCtx, rayon scopes, the upscaler feeds, gpu.init_*) compiles
+        // verbatim; the &mut re-arm at the next iteration (the frustum
+        // snapshot above is their one mutable writer, and it runs first).
         let scene: &scene::Scene = scene;
+        let bvh: &bvh::Bvh = bvh;
 
         // ── Render-mode transitions: SPACE cycles CPU -> GPU wavefront ->
         // DXR; F keeps its historical toggle (CPU/GPU -> DXR, DXR -> CPU).
@@ -14112,6 +14453,7 @@ fn session(
         shot,
         depth_est,
         cloud_time,
+        frust,
     });
     end
 }

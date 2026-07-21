@@ -555,10 +555,20 @@ pub fn shade(
     // glass chain. n_s feeds the BRDF frame, N·L, and the G-buffer guide.
     // A degenerate UV basis (`uv_basis` None) is exactly the case the old
     // in-function derivation bailed on — no tangent frame, so n_s stays n.
-    let n_s = match (mat.normal_tex != NO_TEX, map_uv, uv_basis) {
+    let mut n_s = match (mat.normal_tex != NO_TEX, map_uv, uv_basis) {
         (true, Some(uv), Some(basis)) => perturb_normal(scene, n, mat, uv, filt, basis),
         _ => n,
     };
+    // Water ripples tilt the SHADING normal on the shared cloud clock (a
+    // pure-function wave field, zero rng). Composes ON the normal map: the
+    // full-res fountain has none (n_s == n, ripple is the only perturbation),
+    // low-poly's water_bump.png perturbs first and the ripple rides on top.
+    // Geometric n is untouched (the n_g/n_s split — eps offsets, the hemi
+    // tier, and the glass chain's own axis all stay on n). Structural off
+    // state: ripple_amp == 0.0 leaves n_s exactly as selected above.
+    if mat.ripple_amp > 0.0 {
+        n_s = ripple_normal(n_s, n, ray.o + ray.d * hit.t, cl.time, mat.ripple_amp, scene.diag);
+    }
     if let Some(prim) = prim.as_deref_mut() {
         *prim = PrimarySurface {
             n: n_s,
@@ -1146,26 +1156,43 @@ pub fn shade(
             n_raw = e1.cross(e2).normalize_or_zero();
         }
         let entering = n_raw.dot(n) >= 0.0; // the viewer-flip didn't fire
-        let eta = if entering { 1.0 / GLASS_IOR } else { GLASS_IOR };
-        // The refraction chain stays on the GEOMETRIC normal (normal-mapped
-        // glass is out of scope; a perturbed Snell axis would bend rays into
-        // the surface). v·n with the same grazing guard is bit-identical to
-        // the old n-frame vl.z.
-        let cos_i = v.dot(n).max(1e-4);
-        let k = 1.0 - eta * eta * (1.0 - cos_i * cos_i);
+        let eta = if entering { 1.0 / mat.ior } else { mat.ior };
         let hit_p = ray.o + ray.d * hit.t;
-        let (tdir, torig, tput) = if k >= 0.0 {
-            // Exact unpolarized dielectric Fresnel (not Schlick — it must
-            // reach 1 as k -> 0 or the TIR handoff pops).
-            let cos_t = k.sqrt();
-            let rs = (eta * cos_i - cos_t) / (eta * cos_i + cos_t);
-            let rp = (cos_i - eta * cos_t) / (cos_i + eta * cos_t);
-            let fr = 0.5 * (rs * rs + rp * rp);
-            let td = (ray.d * eta + n * (eta * cos_i - cos_t)).normalize();
-            (td, hit_p - n * scene.eps, mat.transmission * (1.0 - fr))
+        // The Snell/Fresnel math over an axis `ns`. Refraction and the
+        // reflected-fraction Fresnel ride `ns`; the eps offsets stay on the
+        // GEOMETRIC n (a perturbed offset could push the origin to the wrong
+        // side). Returns (tdir, torig, tput, is_tir).
+        let snell = |ns: Vec3A| -> (Vec3A, Vec3A, f32, bool) {
+            let cos_i = v.dot(ns).max(1e-4);
+            let k = 1.0 - eta * eta * (1.0 - cos_i * cos_i);
+            if k >= 0.0 {
+                // Exact unpolarized dielectric Fresnel (not Schlick — it must
+                // reach 1 as k -> 0 or the TIR handoff pops).
+                let cos_t = k.sqrt();
+                let rs = (eta * cos_i - cos_t) / (eta * cos_i + cos_t);
+                let rp = (cos_i - eta * cos_t) / (cos_i + eta * cos_t);
+                let fr = 0.5 * (rs * rs + rp * rp);
+                let td = (ray.d * eta + ns * (eta * cos_i - cos_t)).normalize();
+                (td, hit_p - n * scene.eps, mat.transmission * (1.0 - fr), false)
+            } else {
+                // TIR: mirror about ns, staying on the incident side.
+                (ray.d + ns * (2.0 * cos_i), hit_p + n * scene.eps, mat.transmission, true)
+            }
+        };
+        // Water ripples perturb the Snell axis too (bends the basin image —
+        // the dominant water cue), GUARDED: a refraction must cross to the far
+        // side of the geometric surface (tdir·n < 0), a TIR mirror stay on the
+        // near side (tdir·n > 0). A ripple that flips the side is rejected and
+        // the arm recomputes on the geometric n (which provably satisfies both
+        // tests — coarser, never wrong). Off (ripple_amp 0) runs geometric-n
+        // verbatim: bit-identical to the pre-ripple chain.
+        let (tdir, torig, tput, is_tir) = if mat.ripple_amp > 0.0 {
+            let n_snell = ripple_normal(n, n, hit_p, cl.time, mat.ripple_amp, scene.diag);
+            let r = snell(n_snell);
+            let ok = if r.3 { r.0.dot(n) > 0.0 } else { r.0.dot(n) < 0.0 };
+            if ok { r } else { snell(n) }
         } else {
-            // TIR: mirror about n, staying on the incident side.
-            (ray.d + n * (2.0 * cos_i), hit_p + n * scene.eps, mat.transmission)
+            snell(n)
         };
         if tput > 1e-3 {
             let tray = Ray::new(torig, tdir);
@@ -1173,9 +1200,9 @@ pub fn shade(
             let rq = Quality { fb: FrustumBounce::OFF, ..*q };
             let tcone = Cone { w0: cone_w, spread: cone.spread, aniso: cone.aniso };
             // Does the continuation travel INSIDE the medium? Entering
-            // crosses in; TIR (k < 0, only possible on the exit attempt)
-            // stays in; a clean exit travels outside.
-            let interior = entering || k < 0.0;
+            // crosses in; TIR (only possible on the exit attempt) stays in; a
+            // clean exit travels outside.
+            let interior = entering || is_tir;
             let (mut tcol, seg) =
                 match bvh.intersect(scene, &tray, 0.0, f32::INFINITY, &mut ls.ray_nodes) {
                     Some(th) => (
@@ -1223,20 +1250,20 @@ pub fn shade(
             // have no path lengths — the clouds two-transmittance bracket
             // precedent).
             if interior && seg.is_finite() && crate::scene::depth_tint() {
-                tcol *= depth_attenuation(albedo, seg, scene.diag);
+                tcol *= depth_attenuation(mat.trans_tint_or(albedo), seg, scene.diag);
             }
-            // Tinted by albedo — the classifier lifts dark MTL glass Kd
-            // toward white so this doesn't go black.
-            color += albedo * (tput * tcol);
+            // Tinted by the ONE tint source (`trans_tint` for water, else the
+            // albedo the classifier lifts toward white so glass isn't black).
+            color += mat.trans_tint_or(albedo) * (tput * tcol);
         }
     }
 
     color
 }
 
-/// Fixed glassware IOR — thin-tumbler transmission needs no per-material
-/// value; the classifier's `transmission` scalar carries all the variation.
-const GLASS_IOR: f32 = 1.5;
+// Glassware IOR now rides `Material::ior` (default 1.5 — the old fixed
+// `GLASS_IOR`; water is 1.33). `1.0/1.5f32` is bit-identical to the old
+// `1.0/GLASS_IOR` const, so existing glass is unchanged.
 /// Beer–Lambert reference depth, relative to `Scene::diag`: the interior
 /// traversal at which a medium's transmitted light is tinted to exactly its
 /// albedo (≈1 m at the OBJ fit's diag 10). Mirrored in shade.hlsli.
@@ -1325,6 +1352,53 @@ fn perturb_normal(
     if out == Vec3A::ZERO || out.dot(n) <= 0.0 { n } else { out }
 }
 
+/// Procedural water ripples — a sum of 3 directional sinusoid GRADIENTS, so
+/// the field is integrable (a consistent virtual heightfield; no
+/// impossible-normal shimmer). Pure f32, ZERO rng, term-for-term mirrored in
+/// shade.hlsli (CPU/GPU normals then differ only by sin/cos ulps, absorbed by
+/// the statistical A/Bs). All constants are LITERALS (no build-time
+/// normalize) so the twin is identical by construction — the clouds-wind
+/// precedent. Animated on the shared cloud clock; every length is
+/// `Scene::diag`-relative (the scale-relative rule).
+const RIPPLE_DIR: [[f32; 2]; 3] = [[0.932, 0.362], [-0.588, 0.809], [0.259, -0.966]];
+const RIPPLE_LAMBDA_K: [f32; 3] = [5.2e-3, 2.9e-3, 1.6e-3]; // wavelength / diag
+const RIPPLE_W: [f32; 3] = [2.1, 3.4, 4.9]; // rad/s; shorter waves faster (dispersion)
+const RIPPLE_A: [f32; 3] = [0.45, 0.32, 0.23]; // slope weights (sum 1.0)
+
+/// ∂h/∂x, ∂h/∂z of the virtual ripple height at world point `p`, time `t`.
+fn ripple_grad(p: Vec3A, t: f32, diag: f32) -> glam::Vec2 {
+    let mut g = glam::Vec2::ZERO;
+    let pxz = glam::Vec2::new(p.x, p.z);
+    for i in 0..3 {
+        let d = glam::Vec2::from(RIPPLE_DIR[i]);
+        let ph = std::f32::consts::TAU * (d.dot(pxz) / (RIPPLE_LAMBDA_K[i] * diag))
+            - RIPPLE_W[i] * t;
+        g += d * (RIPPLE_A[i] * ph.cos());
+    }
+    g
+}
+
+/// Tilt `base` by the ripple slope (× `amp`), keeping it a unit vector on the
+/// +`n` side. `n` is the GEOMETRIC normal — both the horizon guard and the
+/// axis the world-XZ slope is projected against. A degenerate/below-horizon
+/// result falls back to `base` (coarser, never wrong). Zero rng.
+fn ripple_normal(base: Vec3A, n: Vec3A, p: Vec3A, t: f32, amp: f32, diag: f32) -> Vec3A {
+    // Off state returns `base` untouched (no re-normalize — an already-unit
+    // base would drift by a ulp). The call sites also guard `ripple_amp > 0`,
+    // so this is the structural bit-identity in-function too.
+    if amp == 0.0 {
+        return base;
+    }
+    let g = ripple_grad(p, t, diag) * amp;
+    // A heightfield normal is (−∂h/∂x, 1, −∂h/∂z): subtract the in-plane
+    // gradient from the base. Project the world-XZ slope into n's tangent
+    // plane first so a (near-)horizontal but slightly tilted basin behaves.
+    let g3 = Vec3A::new(g.x, 0.0, g.y);
+    let gt = g3 - n * g3.dot(n);
+    let out = (base - gt).normalize_or_zero();
+    if out == Vec3A::ZERO || out.dot(n) <= 0.0 { base } else { out }
+}
+
 /// Pure self-test for the on-the-fly tangent frame + normal-map decode (run
 /// by `--check` beside `matclass::self_test`): analytic tangent directions on
 /// a canonical triangle, the flat-map near-identity, the green-channel sign
@@ -1360,6 +1434,9 @@ pub fn tangent_self_test() -> Result<(), String> {
                 sheen: 0.0,
                 translucency: 0.0,
                 transmission: 0.0,
+                trans_tint: Vec3A::splat(-1.0),
+                ior: 1.5,
+                ripple_amp: 0.0,
                 emissive: Vec3A::ZERO,
                 normal_tex: 0,
                 normal_scale: 1.0,
@@ -1510,6 +1587,60 @@ pub fn tangent_self_test() -> Result<(), String> {
     }
     if tri_grads(&sc, 0, n, -Vec3A::Z, 0.0).is_some() {
         return Err("a zero cone must yield no footprint".into());
+    }
+    Ok(())
+}
+
+/// Pure self-test for the water ripple field (run by `--check`): the
+/// structural off state (amp 0 ⇒ input returned BITWISE), the horizon guard
+/// (unit-length, `·n > 0` over a direction/time sweep), a closed-form
+/// single-axis anchor, and animation (two times ⇒ different normals). Zero
+/// rng — a pure function of (p, t).
+pub fn ripple_self_test() -> Result<(), String> {
+    let n = Vec3A::Y;
+    let diag = 10.0f32;
+    // (a) Structural off: amp 0 returns the base normal bit-for-bit, for any
+    // base — this is what makes WATER_RIPPLE_AMP = 0.0 a clean A/B.
+    for &base in &[Vec3A::Y, Vec3A::new(0.1, 0.98, -0.05).normalize()] {
+        let out = ripple_normal(base, n, Vec3A::new(1.3, 0.0, -2.1), 3.7, 0.0, diag);
+        if out.to_array().map(f32::to_bits) != base.to_array().map(f32::to_bits) {
+            return Err(format!("amp 0 must return the base verbatim: {out:?} != {base:?}"));
+        }
+    }
+    // (b) Horizon guard + unit length over a sweep of world points and times.
+    for i in 0..16 {
+        let p = Vec3A::new(i as f32 * 0.37 - 3.0, 0.0, i as f32 * -0.51 + 2.0);
+        for &t in &[0.0f32, 1.25, 5.5] {
+            let out = ripple_normal(n, n, p, t, crate::scene::WATER_RIPPLE_AMP, diag);
+            if (out.length() - 1.0).abs() > 1e-5 {
+                return Err(format!("ripple normal not unit-length: {out:?}"));
+            }
+            if out.dot(n) <= 0.0 {
+                return Err(format!("ripple normal dipped below horizon: {out:?}"));
+            }
+        }
+    }
+    // (c) Closed-form anchor: the gradient is Σ dir_i·A_i·cos(phase_i). At
+    // p = 0, t = 0 every phase is 0 ⇒ cos = 1, so grad = Σ dir_i·A_i, and the
+    // flat +Y normal tilts to normalize(−grad.x, 1, −grad.y).
+    let mut gx = 0.0f32;
+    let mut gz = 0.0f32;
+    for i in 0..3 {
+        gx += RIPPLE_DIR[i][0] * RIPPLE_A[i];
+        gz += RIPPLE_DIR[i][1] * RIPPLE_A[i];
+    }
+    let amp = crate::scene::WATER_RIPPLE_AMP;
+    let want = Vec3A::new(-gx * amp, 1.0, -gz * amp).normalize();
+    let got = ripple_normal(n, n, Vec3A::ZERO, 0.0, amp, diag);
+    if (got - want).length() > 1e-5 {
+        return Err(format!("closed-form anchor: {got:?} != {want:?}"));
+    }
+    // (d) Animation: the same point at two times gives different normals (the
+    // field advects — a still frame would freeze, which is the known accept).
+    let a = ripple_normal(n, n, Vec3A::new(0.5, 0.0, 0.5), 0.0, amp, diag);
+    let b = ripple_normal(n, n, Vec3A::new(0.5, 0.0, 0.5), 1.0, amp, diag);
+    if (a - b).length() < 1e-4 {
+        return Err("ripple must advance with time".into());
     }
     Ok(())
 }

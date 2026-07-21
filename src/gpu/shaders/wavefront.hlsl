@@ -9,7 +9,7 @@
 [numthreads(1, 1, 1)]
 void cs_seed(uint3 id : SV_DispatchThreadID) {
     for (uint i = 0; i < CTR_COUNT; ++i) counters[i] = 0;
-    if (rw <= 8 && rh <= 8) {
+    if (rw <= LEAF_TILE && rh <= LEAF_TILE) {
         // Degenerate window: the root IS a leaf (trace_tile's first check).
         LeafRec lf;
         lf.xy0 = pack_xy(0, 0);
@@ -44,6 +44,17 @@ void cs_prep(uint3 id : SV_DispatchThreadID) {
     uint gy = (groups + 32767u) / 32768u;
     args[push3] = uint3(gx, groups > 0 ? gy : 0, 1);
     if (push1 != 0xffffffffu) counters[push1] = 0;
+}
+
+// --- prep-args, MULTIPLYING flavor: groups = counters[push0] * push2 -------
+// cs_prep divides (N work items -> N/push2 groups); the sky fill needs the
+// inverse, because SKY_SPLIT groups cooperate on each record. Same 2D split
+// past 32768 and the same never-zero-dispatch-on-empty rule.
+
+[numthreads(1, 1, 1)]
+void cs_prep_mul(uint3 id : SV_DispatchThreadID) {
+    uint groups = counters[push0] * push2;
+    args[push3] = uint3(min(groups, 32768u), groups > 0 ? (groups + 32767u) / 32768u : 0u, 1);
 }
 
 // --- check builds: flood info with the exactly-once coverage sentinel ---
@@ -94,22 +105,144 @@ void cs_seed_probes(uint3 id : SV_DispatchThreadID) {
     counters[CTR_HEMI_PT] = push0;
 }
 
-// --- the level kernel: render.rs::tile_step, one thread per tile ----------
+// --- WAVE-COOPERATIVE bound query: ONE TILE PER GROUP ---------------------
+// The serial `bound_query` gives each tile one thread and a private DFS. That
+// is right where tiles are many and cuts are tight, and badly wrong at shallow
+// depths: level 0 is ONE tile, so the whole GPU runs ONE lane descending an
+// enormous slice of the BVH (a level-0 frustum is the whole screen and its cut
+// is the root), and levels 0-4 together are <= 256 tiles yet 67% of the
+// ladder's cost. Measured (B70, --spin path 1080p, --stress 5000): the prep
+// dispatches and args transitions across all 8 levels total 0.011 ms against
+// the kernels' 1.817 — the ladder is not dispatch-bound, it is UNDER-OCCUPIED.
+//
+// So for shallow levels the group cooperates on one tile: 32 lanes share a
+// breadth-first frontier instead of one lane walking a depth-first stack.
+//
+// Two deliberate differences from the serial path, both sound:
+//   * BFS, not DFS. `best` is order-independent (the serial port already says
+//     so), and the min is exact either way — only the PRUNING order changes,
+//     so a round may visit nodes an ordered descent would have culled. That is
+//     the price of 32x parallelism, and it is why this kernel is used only
+//     where lanes would otherwise sit idle.
+//   * No FAR->NEAR sibling ordering (ftree.hlsli's selection scan). Its whole
+//     purpose is tightening `best` early within one lane's DFS; in a frontier
+//     every survivor is processed next round regardless, so it would be pure
+//     cost. `ft_slot`'s per-slot math is reused verbatim, so every conservative
+//     slack is still the same code.
+//
+// Frontier storage ALIASES frustum.hlsli's per-lane stack slab (32*LANE_STACK
+// u32 = 8 KB). Legal for exactly the reason the serial path already relies on:
+// this phase and refine_cut's never overlap in time — here refine_cut runs
+// after the query returns, on lane 0 only. Zero extra groupshared, which
+// matters because groupshared is what caps resident groups.
+#define WQ_CAP (16u * LANE_STACK)   // two frontiers inside the shared slab
+groupshared uint gw_len[2];
+groupshared uint gw_best;
+
+// float-min via InterlockedMin on the IEEE bit pattern: exact for NON-NEGATIVE
+// finite floats, whose bit patterns order exactly as their values. Every
+// candidate here is `max(distance, t_start) >= 0` or the FLT_MAX seed.
+void gw_min(float d) {
+    uint prev;
+    InterlockedMin(gw_best, asuint(d), prev);
+}
+
+float bound_query_wave(TF f, float t_start, float t_limit, uint cut_slot, uint cut_len, uint tid) {
+    if (tid == 0) {
+        gw_len[0] = 0;
+        gw_len[1] = 0;
+        gw_best = asuint(t_limit);
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // Seed the frontier from the inherited cut, lane-strided.
+#ifdef FTREE
+    uint n0 = cut_slot == ROOT_CUT_SLOT ? 8u : cut_len;
+    for (uint r = tid; r < n0; r += 32u) {
+        uint e = cut_slot == ROOT_CUT_SLOT ? r : cut_pool[cut_slot * 64u + r];
+        FtNode nd = ft_nodes[e >> 3];
+        float d;
+        if (!ft_slot(f, nd, e & 7u, t_start, d) || d >= asfloat(gw_best)) continue;
+        uint c = nd.child[e & 7u];
+        if (c == FT_INVALID) { gw_min(d); continue; } // terminal: a leaf's box
+        uint w;
+        InterlockedAdd(gw_len[0], 1u, w);
+        if (w < WQ_CAP) g_stack[w] = c; else gw_min(d);
+    }
+#else
+    for (uint r = tid; r < cut_len; r += 32u) {
+        uint w;
+        InterlockedAdd(gw_len[0], 1u, w);
+        if (w < WQ_CAP) g_stack[w] = cut_node(cut_slot, r);
+    }
+#endif
+
+    uint cur = 0;
+    [loop] while (true) {
+        GroupMemoryBarrierWithGroupSync();
+        // Clamped: the overflow arms below bump the counter past capacity on
+        // purpose (having already folded that node in as a coarse bound), so
+        // the length is an intent, not a fill level.
+        uint n = min(gw_len[cur], WQ_CAP);
+        if (n == 0) break; // group-uniform: every lane reads the same counter
+        uint bin = cur * WQ_CAP;
+        uint bout = (1u - cur) * WQ_CAP;
+        for (uint i = tid; i < n; i += 32u) {
+            uint idx = g_stack[bin + i];
+#ifdef FTREE
+            FtNode nd = ft_nodes[idx];
+            [unroll] for (uint s = 0; s < 8; ++s) {
+                float d;
+                if (!ft_slot(f, nd, s, t_start, d) || d >= asfloat(gw_best)) continue;
+                uint c = nd.child[s];
+                if (c == FT_INVALID) { gw_min(d); continue; }
+                uint w;
+                InterlockedAdd(gw_len[1u - cur], 1u, w);
+                if (w < WQ_CAP) g_stack[bout + w] = c; else gw_min(d);
+            }
+#else
+            BvhNode node = bvh_nodes[idx];
+            if (aabb_outside(f, node.mn, node.mx)) continue;
+            if (point_aabb_max_dist(f.origin, node.mn, node.mx) <= t_start) continue;
+            float d = max(point_aabb_dist(f.origin, node.mn, node.mx), t_start);
+            if (d >= asfloat(gw_best)) continue;
+            if (node.count > 0) { gw_min(d); continue; }
+            uint w;
+            InterlockedAdd(gw_len[1u - cur], 2u, w);
+            // Adds are all +2 from a zeroed base, so accepted w are even and
+            // slots [0, WQ_CAP) are fully written whenever the clamp bites.
+            if (w + 1u < WQ_CAP) {
+                g_stack[bout + w] = node.left_first;
+                g_stack[bout + w + 1u] = node.left_first + 1u;
+            } else {
+                // Frontier full: take this node's own distance as if it were a
+                // leaf — a valid lower bound for everything inside it. The
+                // serial path's stack-pressure fallback, verbatim.
+                gw_min(d);
+            }
+#endif
+        }
+        GroupMemoryBarrierWithGroupSync();
+        if (tid == 0) gw_len[cur] = 0;
+        cur = 1u - cur;
+    }
+    // Every lane is past its last g_stack write before this returns, so lane 0
+    // may reuse the slab for refine_cut. (The break above sits directly after a
+    // group sync, and both barriers are reached by the whole group — never in
+    // divergent control flow.)
+    return asfloat(gw_best);
+}
+
+// --- the level kernel: render.rs::tile_step -------------------------------
 // push0 = in counter (tile A or B), push1 = out counter (the other).
+//
+// The tail (sky / advance / refine / enqueue the 4 quadrants) is shared by the
+// per-thread and per-group flavors so the two can never drift apart; only the
+// bound query differs, and `lane` says which g_stack slab refine_cut owns.
 
-[numthreads(32, 1, 1)]
-void cs_level(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
-    uint idx = flat_group(gid) * 32u + gtid.x;
-    if (idx >= counters[push0]) return;
-    TileRec rec = qin[idx];
-    uint2 p0 = rect_min(rec.xy0);
-    uint2 p1 = rect_max(rec.xy1);
-    uint depth = rec.meta >> 8;
-    uint cut_len = rec.meta & 0xffu;
+void level_finish(TileRec rec, uint2 p0, uint2 p1, uint depth, uint cut_len, TF f,
+                  float best, uint lane) {
     uint s;
-
-    TF f = tile_frustum(p0.x, p0.y, p1.x, p1.y);
-    float best = bound_query(f, rec.t_start, FLT_MAX, rec.cut_slot, cut_len, gtid.x);
     if (best == FLT_MAX) {
         // Sky: the whole frustum (beyond the inherited ball, which the
         // ancestor claim covers) is empty.
@@ -144,7 +277,7 @@ void cs_level(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     InterlockedAdd(counters[CTR_CUT], 1, out_slot);
     uint out_len = 0;
     if (out_slot < cap_cut) {
-        out_len = refine_cut(f, tc, FLT_MAX, rec.cut_slot, cut_len, out_slot, gtid.x);
+        out_len = refine_cut(f, tc, FLT_MAX, rec.cut_slot, cut_len, out_slot, lane);
     } else {
         InterlockedAdd(counters[CTR_CUT_FALLBACK], 1, s);
     }
@@ -169,7 +302,7 @@ void cs_level(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
         uint w = cx1[c] - cx0[c];
         uint h = cy1[c] - cy0[c];
         if (w == 0 || h == 0) continue; // trace_tile's empty-rect guard
-        if (w <= 8 && h <= 8) {
+        if (w <= LEAF_TILE && h <= LEAF_TILE) {
             InterlockedAdd(counters[CTR_LEAF], 1, s);
             if (s < cap_leaf) {
                 LeafRec lf;
@@ -199,70 +332,41 @@ void cs_level(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     }
 }
 
-// --- sky fill: one 64-lane group per SkyRec, grid-striding the rect -------
-// render.rs::fill_sky: pixel-CENTER dirs (no jitter, no rng), KIND_SKY at
-// the depth the tile was proven.
-
-[numthreads(64, 1, 1)]
-void cs_sky(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
-    uint rec_i = flat_group(gid);
-    if (rec_i >= counters[push0]) return;
-    SkyRec rec = qsky[rec_i];
+// One thread per tile — the deep-level flavor, where tiles are many and each
+// one's inherited cut is tight enough that a private DFS is the right shape.
+[numthreads(32, 1, 1)]
+void cs_level(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
+    uint idx = flat_group(gid) * 32u + gtid.x;
+    if (idx >= counters[push0]) return;
+    TileRec rec = qin[idx];
     uint2 p0 = rect_min(rec.xy0);
     uint2 p1 = rect_max(rec.xy1);
-    uint w = p1.x - p0.x;
-    uint total = w * (p1.y - p0.y);
-    for (uint i = gtid.x; i < total; i += 64u) {
-        uint x = p0.x + i % w;
-        uint y = p0.y + i / w;
-        float3 dir = ray_dir(float(x) + 0.5, float(y) + 0.5);
-        // March-phase dither per (pixel, frame, SAMPLE) — the center rides
-        // sample 0's stratum, mirroring render.rs::fill_sky_rows verbatim.
-        float cj = cloud_dither_k(uint2(x, y), frame, 0u, spp);
-        float3 c = sky_radiance(cam_origin.xyz, dir, pixel_cone * 0.5, frame, cj);
-        // Firefly glow against a proven-empty tile — still zero rays (t_max
-        // ∞, nothing occludes a sky direction). render.rs::fill_sky_rows,
-        // term for term; the flag guard keeps day frames bit-identical.
-        if (flags & FLAG_FIREFLIES)
-            c += ff_glow(cam_origin.xyz, dir, INF, pixel_cone * 0.5);
-        // Under CLOUDS the sky has sub-pixel structure (a cover-ramp edge
-        // crosses a pixel), so a multi-sampled frame averages spp sample
-        // positions — render.rs::fill_sky_rows, term for term (sample 0 stays
-        // the center; still zero rays). The DIRECTION offsets are the PHASE-0
-        // Halton table (SKY_J, injected by trace::spp_defs), frame-independent
-        // like the center itself: a static function's antialias must not
-        // dither across frames (the spp stability gate at night is the proof
-        // — a direction-SET lesson; the march PHASE is per-sample and
-        // frame-keyed, symmetric across spp levels, which that gate accepts).
-        // The guard keeps spp == 1 and cloudless skies on the old path
-        // verbatim.
-        if ((flags & FLAG_CLOUDS) && spp > 1u) {
-            for (uint s = 1u; s < spp; ++s) {
-                float2 o = SKY_J[s];
-                float3 ds = ray_dir(float(x) + 0.5 + o.x, float(y) + 0.5 + o.y);
-                c += sky_radiance(cam_origin.xyz, ds, pixel_cone * 0.5, frame,
-                                  cloud_dither_k(uint2(x, y), frame, s, spp));
-                // Each extra sample carries its own glow along its own
-                // direction, exactly like a leaf pixel's sample loop.
-                if (flags & FLAG_FIREFLIES)
-                    c += ff_glow(cam_origin.xyz, ds, INF, pixel_cone * 0.5);
-            }
-            c *= 1.0 / float(spp);
-        }
-        uint pi = y * rw + x;
-        uint i3 = pi * 3u;
-        // The compose pass is the single accum splat site; sky pixels carry
-        // their full color in `partial` with zero ambient weight.
-        partial[i3 + 0u] = c.x;
-        partial[i3 + 1u] = c.y;
-        partial[i3 + 2u] = c.z;
-        ambw[i3 + 0u] = 0.0;
-        ambw[i3 + 1u] = 0.0;
-        ambw[i3 + 2u] = 0.0;
-        tbuf[pi] = INF;
-        info[pi] = pack_info(rec.depth, KIND_SKY);
-        // Pixel centers, matching the CPU sky-tile flood (leaf-tile sky
-        // pixels get the jittered position in leaf.hlsl instead).
-        gbuf_write_sky(pi, float(x) + 0.5, float(y) + 0.5, dir);
-    }
+    TF f = tile_frustum(p0.x, p0.y, p1.x, p1.y);
+    uint cut_len = rec.meta & 0xffu;
+    float best = bound_query(f, rec.t_start, FLT_MAX, rec.cut_slot, cut_len, gtid.x);
+    level_finish(rec, p0, p1, rec.meta >> 8, cut_len, f, best, gtid.x);
 }
+
+// One GROUP per tile — the shallow-level flavor. Dispatched with one group per
+// record (the prep's items-per-group is 1 here, not 32), so `flat_group` IS the
+// tile index. The early-out and every barrier inside the query are
+// group-uniform; only after the query does the group narrow to lane 0, which
+// owns g_stack slab 0 for refine_cut.
+[numthreads(32, 1, 1)]
+void cs_level_wide(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
+    uint idx = flat_group(gid);
+    if (idx >= counters[push0]) return;
+    TileRec rec = qin[idx];
+    uint2 p0 = rect_min(rec.xy0);
+    uint2 p1 = rect_max(rec.xy1);
+    TF f = tile_frustum(p0.x, p0.y, p1.x, p1.y);
+    uint cut_len = rec.meta & 0xffu;
+    float best = bound_query_wave(f, rec.t_start, FLT_MAX, rec.cut_slot, cut_len, gtid.x);
+    if (gtid.x != 0) return;
+    level_finish(rec, p0, p1, rec.meta >> 8, cut_len, f, best, 0u);
+}
+
+// --- sky fill: moved to sky.hlsl -----------------------------------------
+// `cs_sky` and its lattice pass live in their own compile unit so the cloud
+// lattice can take u5 (the tile queue's register, dead by then) without a
+// 15th root UAV — the root signature is at 62/64 DWORDs. See sky.hlsl.

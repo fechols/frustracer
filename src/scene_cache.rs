@@ -51,7 +51,11 @@ use std::path::{Path, PathBuf};
 // boots, which skipped `reclassify_spray` before storing (world.rs's cold
 // arm; fixed alongside this bump). Those sidecars are wrong under the same
 // key and only a version bump can retire them.
-pub const CACHE_VERSION: u32 = 9;
+// v10: the water class — Material/DiskMat gained trans_tint/ior/ripple_amp,
+// and the loader stamps water params + skips the dark-glass albedo lift for
+// the fountain, so a v9 sidecar's materials are stale (the --no-water lever
+// also joins the lever word, bit 4).
+pub const CACHE_VERSION: u32 = 10;
 const MAGIC: [u8; 8] = *b"FRSCACH\x01";
 
 /// Fixed on-disk material, `MatKind` flattened into (kind, param) — Marble
@@ -75,6 +79,9 @@ struct DiskMat {
     rough_tex: u32,
     metal_tex: u32,
     emissive_tex: u32,
+    trans_tint: [f32; 3],
+    ior: f32,
+    ripple_amp: f32,
 }
 
 /// Fixed on-disk BVH node: 32 B, no padding (the in-memory `BvhNode` is
@@ -100,6 +107,9 @@ fn lever_word() -> u32 {
         // Spray reclassification rewrites the cached tri_mat/materials — a
         // sidecar written under one spray state must miss under the other.
         | (crate::scene::spray_enabled() as u32) << 3
+        // The water class refines the fountain's material (tint/ior/ripple +
+        // no albedo lift), baked into the cached materials.
+        | (crate::scene::water_enabled() as u32) << 4
 }
 
 /// (size, mtime-ns) of a file, (0, 0) if absent — the staleness key.
@@ -248,6 +258,9 @@ fn mat_to_disk(m: &Material) -> DiskMat {
         rough_tex: m.rough_tex,
         metal_tex: m.metal_tex,
         emissive_tex: m.emissive_tex,
+        trans_tint: m.trans_tint.to_array(),
+        ior: m.ior,
+        ripple_amp: m.ripple_amp,
     }
 }
 
@@ -260,6 +273,9 @@ fn mat_from_disk(m: &DiskMat) -> Material {
         sheen: m.sheen,
         translucency: m.translucency,
         transmission: m.transmission,
+        trans_tint: Vec3A::from_array(m.trans_tint),
+        ior: m.ior,
+        ripple_amp: m.ripple_amp,
         emissive: Vec3A::from_array(m.emissive),
         normal_tex: m.normal_tex,
         normal_scale: m.normal_scale,

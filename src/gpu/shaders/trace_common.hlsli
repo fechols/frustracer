@@ -129,6 +129,9 @@ cbuffer Frame : register(b0) {
     // bit-equal positions. MAX_FIREFLIES is injected by trace::spp_defs (the
     // JITTER_ROWS pattern); rows past ff_count are zero and never read.
     float4 ff[MAX_FIREFLIES];
+    // Cloud shadow cache transform: xy = grid origin in world (x,z), z = 1/cell,
+    // w unused. Appended LAST (the sky_sh / ff precedent) so no offset moves.
+    float4 cloud_grid;
 }
 
 #define SCENE_EPS  (sun_e.w)
@@ -793,6 +796,10 @@ bool clouds_along(float3 o, float3 d, float3 amb, float j, out float t_out, out 
 // site was the largest single share of the cloud layer's cost.
 static const uint CLOUD_ROUGH_STEPS = 2u;
 bool clouds_along_rough(float3 o, float3 d, float3 amb, out float t_out, out float3 sc_out) {
+#ifdef ABL_ROUGH
+    t_out = 1.0; sc_out = float3(0.0, 0.0, 0.0);
+    return false; // dev ablation (FR_ABL=rough): cost attribution only
+#endif
     t_out = 1.0;
     sc_out = float3(0.0, 0.0, 0.0);
     if ((flags & FLAG_CLOUDS) == 0u || d.y <= CLOUD_MIN_DY) return false;
@@ -837,7 +844,96 @@ bool clouds_along_rough(float3 o, float3 d, float3 amb, out float t_out, out flo
 // density evals at the slab's quarter heights, Beer over the slant path.
 // The unshadowed arms return an EXACT 1.0 (x * 1.0 is bit-preserving); the
 // low-sun band eases the shadow out so a TOD scrub never pops it.
+#if CLOUD_SHADOW_N > 0
+// --- the slab-space cloud shadow cache ------------------------------------
+//
+// `cloud_sun_transmittance(p)` LOOKS like a function of the 3D shading point.
+// It is not. With m = (base + 0.5*thick - p.y)/sun.y and M = p + sun*m:
+//   * M.y = p.y + sun.y*m = base + 0.5*thick — CONSTANT. M is on a fixed plane.
+//   * the curl warp's argument is p + sun*(0.5(s_lo+s_hi)) = p + sun*m = M.
+//   * s_lo - m = -0.25*thick/sun.y is a CONSTANT, so
+//     probe_lo = M + curl(M) - sun*(0.25*thick/sun.y), and likewise probe_hi.
+// Both probes — including their y, which density_lo_at needs for cloud_prof —
+// are determined by M alone. So
+//         cloud_sun_transmittance(p) == F(M.x, M.z)      EXACTLY,
+// for every p below the slab. Only the interpolation below is approximate; the
+// domain reduction is not.
+//
+// That is why the cache lives in SLAB space and not screen space. A
+// screen-space cache of a function of p needs a depth-aware bilateral filter to
+// survive silhouettes and still smears across them; projecting to the slab
+// first removes the discontinuity BY CONSTRUCTION — two pixels either side of a
+// silhouette whose shadow rays reach the same slab point genuinely have the
+// same answer.
+//
+// Measured share of the cloud bill this attacks (B70, --spin path 1080p,
+// warm shader cache): sun_transmittance 65%, sky march 26%, along_rough 5%.
+// Note that INVERTS the CPU ablation in CLAUDE.md (along_k 80% / sun_t 10%):
+// this runs on every LIT pixel with no early-out, while the sky march covers a
+// quarter of the screen and mostly takes its staged-cutoff fast path.
+//
+// SIZING KEYS OFF THE CLOUD WAVELENGTH, NOT THE SCREEN. cloud_cover samples two
+// octaves at l0 = CLOUD_SCALE_K*diag and l0/2, so the finest feature in this
+// field is 1.3*diag — WIDER THAN THE WHOLE SCENE. A coarse grid is therefore
+// almost exact. If a future tuning pass shortens CLOUD_SCALE_K, the cell size
+// must shrink with it or this silently starts aliasing.
+RWStructuredBuffer<float> cloud_shadow : register(u6); // N*N transmittances
+
+// The exact probe pair as a function of the slab point M. This is the body
+// below from `pw` onward with M substituted — used ONLY by the fill kernel, so
+// the cache-off path keeps the original expression bit-for-bit.
+float cloud_shadow_at(float2 mxz) {
+    float base = CLOUD_BASE_K * SCENE_DIAG;
+    float thick = CLOUD_THICK_K * SCENE_DIAG;
+    float3 m = float3(mxz.x, base + 0.5 * thick, mxz.y);
+    float half_s = 0.25 * thick / sun.y;
+    float3 pw = m + cloud_curl_offset(m);
+    float rho = 0.5 * (cloud_density_lo_at(pw - sun.xyz * half_s, 0.0)
+                     + cloud_density_lo_at(pw + sun.xyz * half_s, 0.0));
+    if (rho <= 0.0) return 1.0;
+    float t = exp(-(rho * CLOUD_TAU / max(sun.y, 0.25)));
+    float fade = saturate((sun.y - CLOUD_SUN_MIN_Y) / CLOUD_FADE_BAND);
+    return fade >= 1.0 ? t : 1.0 + (t - 1.0) * fade;
+}
+
+// Bilinear fetch. cloud_grid = (origin.x, origin.z, 1/cell, unused); the origin
+// is snapped to a whole cell on the CPU so the lattice is FRAME-STATIC — a grid
+// that slides with the camera moves its own interpolation error every frame,
+// which the temporal upscalers read as shimmer (the sky fill carries the same
+// lesson about per-frame direction offsets).
+float cloud_shadow_fetch(float2 mxz) {
+    // The grid SIDE is derived per frame (the cell is pinned to the cloud
+    // wavelength, so the side follows the footprint) and rides cloud_grid.w;
+    // CLOUD_SHADOW_N is only the on/off switch.
+    uint n = uint(cloud_grid.w);
+    float2 g = (mxz - cloud_grid.xy) * cloud_grid.z;
+    // Clamp so the +1 taps stay in range: g < n-1 => floor(g) <= n-2.
+    g = clamp(g, 0.0, float(n - 1u) - 1e-4);
+    uint2 c = uint2(g);
+    float2 f = g - float2(c);
+    uint i = c.y * n + c.x;
+    float t0 = lerp(cloud_shadow[i], cloud_shadow[i + 1u], f.x);
+    float t1 = lerp(cloud_shadow[i + n], cloud_shadow[i + n + 1u], f.x);
+    return lerp(t0, t1, f.y);
+}
+#endif
+
 float cloud_sun_transmittance(float3 p) {
+#if CLOUD_SHADOW_N > 0
+    if ((flags & FLAG_CLOUDS) == 0u || sun.y <= CLOUD_SUN_MIN_Y) return 1.0;
+    {
+        float base_c = CLOUD_BASE_K * SCENE_DIAG;
+        float thick_c = CLOUD_THICK_K * SCENE_DIAG;
+        if (p.y >= base_c) return 1.0;
+        float m = (base_c + 0.5 * thick_c - p.y) / sun.y;
+        return cloud_shadow_fetch(float2(p.x + sun.x * m, p.z + sun.z * m));
+    }
+#endif
+    // Cache off: the ORIGINAL expression, verbatim, so the off state is
+    // bit-identical by construction rather than by tolerance.
+#ifdef ABL_SUNT
+    return 1.0; // dev ablation (FR_ABL=sunt): cost attribution only
+#endif
     if ((flags & FLAG_CLOUDS) == 0u || sun.y <= CLOUD_SUN_MIN_Y) return 1.0;
     float base = CLOUD_BASE_K * SCENE_DIAG;
     float thick = CLOUD_THICK_K * SCENE_DIAG;
@@ -878,6 +974,48 @@ float3 sky_radiance(float3 o, float3 d, float half_angle, uint twinkle, float j)
     if (!clouds_along(o, d, dm * CLOUD_AMB_K, j, ct, cs)) return backdrop;
     return backdrop * ct + cs;
 }
+
+// --- the sky integral, split BY COST for frustum-amortized shading ----------
+//
+// `sky_radiance` above stays the exact per-ray path and is untouched. These
+// three split the same expression so a proven-empty tile can evaluate the two
+// halves at DIFFERENT RATES:
+//
+//   backdrop = dome + disc + stars      cheap, and SHARP (the sun's limb is a
+//                                       ~650x step; stars are point-like) — so
+//                                       it stays per-pixel, always.
+//   cloud    = (scatter, transmittance) 6 coarse + 18 fine steps of multi-
+//                                       octave 3D noise; ~80% of the layer's
+//                                       cost by clouds.rs's own ablation, and
+//                                       measured at 35% of a whole sample on
+//                                       the B70. Smooth enough to interpolate.
+//   compose  = backdrop * t + scatter   exactly sky_radiance's own last line.
+//
+// The cloud half is one float4, which is what makes the lattice cheap. Its
+// no-cloud identity is (0,0,0,1): backdrop*1 + 0 == backdrop, so a clear ray
+// composes back to the untouched backdrop bitwise.
+//
+// WHAT THE EMPTY-SPACE PROOF DOES AND DOES NOT LICENSE (be exact here — the
+// rhetoric is tempting and wrong): the cloud field is INDEPENDENT of scene
+// geometry, so `clouds_along` is well-defined everywhere and interpolating it
+// is not made *correct* by the tile being empty. What the proof gives is a
+// contiguous, divergence-free domain on which EVERY pixel is known, before any
+// shading, to need the expensive term. That is a coherence and scheduling
+// property — and it is what makes the amortization free rather than legal.
+float3 sky_backdrop(float3 d, float half_angle, uint twinkle) {
+    return sky_dome(d) + sky_disc(d, half_angle) + sky_stars(d, half_angle, twinkle);
+}
+
+float4 sky_cloud4(float3 o, float3 d, float j) {
+    if ((flags & FLAG_CLOUDS) == 0u) return float4(0.0, 0.0, 0.0, 1.0);
+    float ct;
+    float3 cs;
+    if (!clouds_along(o, d, sky_dome(d) * CLOUD_AMB_K, j, ct, cs))
+        return float4(0.0, 0.0, 0.0, 1.0);
+    return float4(cs, ct);
+}
+
+float3 sky_compose(float3 backdrop, float4 cl) { return backdrop * cl.w + cl.xyz; }
 
 // Balance heuristic (sky::mis_weight). The sun's specular is reachable both by
 // light sampling (direct_s) and by the VNDF reflection ray landing in the disc;

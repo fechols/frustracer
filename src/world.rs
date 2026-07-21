@@ -60,37 +60,41 @@ pub const CURATED: &[IslandSpec] = &[
     IslandSpec {
         name: "sponza",
         path: "scenes/sponza-khronos/Sponza.gltf",
-        theme_hour: 9.0, // morning courtyard
+        theme_hour: 8.5, // morning courtyard
         mtris: 0.262,
     },
     IslandSpec {
         name: "rungholt",
         path: "scenes/rungholt/rungholt.obj",
-        theme_hour: 12.0, // noon city
+        theme_hour: 11.0, // late-morning city
         mtris: 6.7,
     },
     IslandSpec {
         name: "helmet",
         path: "scenes/damaged-helmet/DamagedHelmet.glb",
-        theme_hour: 14.0, // pedestal piece
+        theme_hour: 13.0, // early-afternoon pedestal piece
         mtris: 0.015,
     },
     IslandSpec {
         name: "san-miguel",
         path: "scenes/san-miguel/san-miguel.obj",
-        theme_hour: 17.5, // golden-hour patio
+        theme_hour: 15.5, // afternoon patio
         mtris: 10.0,
     },
     IslandSpec {
         name: "bistro",
         path: "scenes/bistro/Exterior/exterior.obj",
-        theme_hour: 19.5, // dusk street (the emissive-map showcase)
+        theme_hour: 17.5, // golden-hour street (the emissive-map showcase)
         mtris: 2.8,
     },
     IslandSpec {
         name: "vokselia",
+        // Civil dusk, NOT full night: the sun sits just below the west horizon
+        // (~18:00 = sunset), so the garden gets warm afterglow + the first
+        // fireflies without ever reaching the 22:00 star-field dark. This is
+        // the darkest island in the ring by construction.
         path: "scenes/vokselia-spawn/vokselia_spawn.obj",
-        theme_hour: 22.0, // night garden (fireflies live here)
+        theme_hour: 18.75, // civil-dusk garden (fireflies begin here)
         mtris: 1.9,
     },
 ];
@@ -216,6 +220,9 @@ fn merge_scenes(parts: Vec<(Scene, Vec3A)>, field_half: f32) -> Scene {
         sheen: 0.0,
         translucency: 0.0,
         transmission: 0.0,
+        trans_tint: Vec3A::splat(-1.0),
+        ior: 1.5,
+        ripple_amp: 0.0,
         emissive: Vec3A::ZERO,
         normal_tex: NO_TEX,
         normal_scale: 1.0,
@@ -532,6 +539,9 @@ fn test_part(n_tex: u32, albedo_tex: u32, normal_tex: u32) -> Scene {
         sheen: 0.0,
         translucency: 0.0,
         transmission: 0.0,
+        trans_tint: Vec3A::splat(-1.0),
+        ior: 1.5,
+        ripple_amp: 0.0,
         emissive: Vec3A::ZERO,
         normal_tex,
         normal_scale: 1.0,

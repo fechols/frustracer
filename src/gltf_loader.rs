@@ -393,6 +393,13 @@ fn build_scene(
                 sheen,
                 translucency: 0.0,
                 transmission,
+                // glTF glass keeps the sentinel tint (baseColor is authored
+                // for tinting, so albedo IS the tint) and the fixed 1.5 IOR;
+                // KHR_materials_ior → `ior` and a glTF water class are noted
+                // follow-ons.
+                trans_tint: Vec3A::splat(-1.0),
+                ior: 1.5,
+                ripple_amp: 0.0,
                 emissive,
                 normal_tex,
                 normal_scale,

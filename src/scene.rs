@@ -31,6 +31,22 @@ pub fn spray_enabled() -> bool {
     SPRAY.load(Relaxed)
 }
 
+/// Water-class switch (`--no-water`), same knob-before-load family. Off = the
+/// classifier never refines the glass tier into water (`classify` is handed
+/// `water_hint = false, tf = None`), so the fountain classifies glassware
+/// exactly as before this feature. Keys the scene cache's lever word:
+/// classification is baked into the sidecar, so a lever A/B must never serve a
+/// stale cache.
+static WATER: AtomicBool = AtomicBool::new(true);
+
+pub fn set_water(on: bool) {
+    WATER.store(on, Relaxed);
+}
+
+pub fn water_enabled() -> bool {
+    WATER.load(Relaxed)
+}
+
 /// Depth-tint switch (`--no-depth-tint`): Beer–Lambert attenuation over the
 /// transmission chain's interior segments. Runtime shading lever (no scene
 /// data changes — reads live in shade.rs / the GPU FLAG_DEPTH_TINT bit).
@@ -86,6 +102,24 @@ pub struct Material {
     /// transmitted light is tinted by albedo — dark MTL glass Kd must be
     /// lifted toward white by the classifier or glass renders near-black.
     pub transmission: f32,
+    /// Absorption/transmission tint, the SINGLE source for the per-interface
+    /// glass tint, the Beer–Lambert depth attenuation, and `shadow_tint`.
+    /// Sentinel `< 0` (default `splat(-1.0)`) = "use albedo" — the structural
+    /// bit-identity guarantee: `trans_tint_or(albedo)` returns albedo VERBATIM
+    /// for every non-water material. Water (`matclass::WATER`) sets a light
+    /// blue-green so the Beer–Lambert exponent does the depth work (red
+    /// extinguishes fastest); the loader does NOT white-lift a water albedo,
+    /// so the tint lives here instead.
+    pub trans_tint: Vec3A,
+    /// Index of refraction for the transmission chain's Snell/Fresnel math.
+    /// Default 1.5 (== the old global `GLASS_IOR`; `1.0/1.5f32` is bit-identical
+    /// to the old const, so existing glass is unchanged). Water is 1.33.
+    pub ior: f32,
+    /// Procedural water-ripple slope amplitude (0.0 = no ripples — the
+    /// structural off state, the `height_amp` pattern). Perturbs the SHADING
+    /// normal (and, guarded, the Snell axis) with a pure-function wave field on
+    /// the shared cloud clock (`shade::ripple_normal`); zero rng draws.
+    pub ripple_amp: f32,
     /// Emitted radiance (Ke / glTF emissiveFactor). Added to color at every
     /// shading depth, OUTSIDE the kd·(1−transmission) factor; emitters do
     /// NOT light other surfaces — only the analytic sun + sky do (the
@@ -128,10 +162,26 @@ impl Material {
     /// agreement is by data (the fireflies-CB precedent). Deliberately the
     /// FLAT albedo — no UV/texture fetch in the occlusion inner loop
     /// (documented known-accept for textured transmissive materials). Glass
-    /// Kd was already lifted toward white at load, so this composes.
+    /// Kd was already lifted toward white at load, so this composes. Water
+    /// carries its color in `trans_tint` instead of a lifted albedo, so the
+    /// tint source is `trans_tint_or(albedo)` — bit-identical (`albedo`
+    /// verbatim) for every material with the sentinel tint.
     #[inline]
     pub fn shadow_tint(&self) -> Vec3A {
-        self.albedo * self.transmission
+        self.trans_tint_or(self.albedo) * self.transmission
+    }
+
+    /// The transmission/absorption tint: `trans_tint` when set (`.x >= 0`),
+    /// else `albedo` returned VERBATIM. A sign test (not NaN) so the GPU
+    /// mirror is a plain `>= 0.0` select. This is the ONE tint source shared
+    /// by the per-interface glass tint, Beer–Lambert, and `shadow_tint`.
+    #[inline]
+    pub fn trans_tint_or(&self, albedo: Vec3A) -> Vec3A {
+        if self.trans_tint.x >= 0.0 {
+            self.trans_tint
+        } else {
+            albedo
+        }
     }
 
     /// Whether shading this material fetches ANY texture (albedo or one of
@@ -273,6 +323,9 @@ impl SceneBuilder {
             sheen: 0.0,
             translucency: 0.0,
             transmission: 0.0,
+            trans_tint: Vec3A::splat(-1.0),
+            ior: 1.5,
+            ripple_amp: 0.0,
             emissive: Vec3A::ZERO,
             normal_tex: NO_TEX,
             normal_scale: 1.0,
@@ -534,6 +587,18 @@ pub const SPRAY_ALBEDO_LIFT: f32 = 0.6;
 pub const SPRAY_TRANSLUCENCY: f32 = 0.35;
 pub const SPRAY_ROUGHNESS: f32 = 0.4;
 
+/// Water material fields the loader stamps onto a `matclass::WATER` material
+/// (`Pbr::water`). `WATER_TINT` is the absorption/transmission color — light
+/// blue-green so the Beer–Lambert exponent does the depth work: at
+/// `TRANS_DEPTH_K·diag` of traversal the medium is exactly this tint, and red
+/// (0.75) extinguishes fastest, so shallow rims stay clear and the deep basin
+/// goes blue-green. It is the ONE look knob (screenshot-tuned; gates prove
+/// soundness, never looks). `WATER_IOR` 1.33 vs glassware's 1.5 lowers the
+/// face-on reflectance (2% vs 4%). `WATER_RIPPLE_AMP` is the peak ripple slope.
+pub const WATER_TINT: Vec3A = Vec3A::new(0.75, 0.92, 0.96);
+pub const WATER_IOR: f32 = 1.33;
+pub const WATER_RIPPLE_AMP: f32 = 0.25;
+
 /// Post-load spray reclassification (shared OBJ+glTF, the `derive_heights`
 /// pass family — cold loads only, BEFORE the cache store, so warm loads
 /// inherit the retag from the sidecar; `--no-spray` kills it and keys the
@@ -633,13 +698,23 @@ pub fn reclassify_spray(scene: &mut Scene) {
             let spray = {
                 let s = &scene.materials[m as usize];
                 Material {
-                    albedo: s.albedo.lerp(Vec3A::ONE, SPRAY_ALBEDO_LIFT),
+                    // Lift from the source TINT, not the raw albedo: bitwise
+                    // unchanged for glassware (sentinel ⇒ albedo), but a
+                    // water-sourced droplet lifts from its light blue-green
+                    // instead of the now-unlifted dark Kd (else spray would dim
+                    // from ~0.93 to ~0.64 as a side effect of the water class).
+                    albedo: s.trans_tint_or(s.albedo).lerp(Vec3A::ONE, SPRAY_ALBEDO_LIFT),
                     roughness: SPRAY_ROUGHNESS,
                     metallic: 0.0,
                     anisotropy: s.anisotropy,
                     sheen: s.sheen,
                     translucency: SPRAY_TRANSLUCENCY,
                     transmission: 0.0,
+                    // A droplet is opaque white scatter: sentinel tint, plain
+                    // IOR, no ripples.
+                    trans_tint: Vec3A::splat(-1.0),
+                    ior: 1.5,
+                    ripple_amp: 0.0,
                     emissive: s.emissive,
                     normal_tex: s.normal_tex,
                     normal_scale: s.normal_scale,
@@ -679,6 +754,9 @@ pub fn spray_self_test() -> Result<(), String> {
         sheen: 0.0,
         translucency: 0.0,
         transmission,
+        trans_tint: Vec3A::splat(-1.0),
+        ior: 1.5,
+        ripple_amp: 0.0,
         emissive: Vec3A::ZERO,
         normal_tex: NO_TEX,
         normal_scale: 1.0,
@@ -766,11 +844,16 @@ pub fn spray_self_test() -> Result<(), String> {
             return Err("tiny OPAQUE island must not retag".into());
         }
         let s = &sc.materials[2];
+        // Sentinel-tint glass source ⇒ lift from albedo verbatim (the water
+        // path is covered by the tint-source arm below).
         let want_albedo = Vec3A::new(0.8, 0.85, 0.9).lerp(Vec3A::ONE, SPRAY_ALBEDO_LIFT);
         if s.transmission != 0.0
             || s.translucency != SPRAY_TRANSLUCENCY
             || s.roughness != SPRAY_ROUGHNESS
             || s.metallic != 0.0
+            || s.trans_tint.x >= 0.0
+            || s.ior != 1.5
+            || s.ripple_amp != 0.0
             || s.albedo.to_array().map(f32::to_bits)
                 != want_albedo.to_array().map(f32::to_bits)
         {
@@ -1121,6 +1204,7 @@ pub fn procedural_scene() -> Scene {
 /// ground quad (`quad()` = two `tri()` calls = 6 duplicated verts / 2 tris).
 /// `tile_scene` relies on this layout to replicate only the model, and
 /// `world::merge_scenes` to strip each part's ground before placing it.
+
 pub(crate) const GROUND_VERTS: usize = 6;
 pub(crate) const GROUND_TRIS: usize = 2;
 
@@ -1410,6 +1494,17 @@ fn parse_map_value(v: &str) -> (String, f32) {
     (toks.last().map(|s| s.to_string()).unwrap_or_default(), scale)
 }
 
+/// Parse an MTL `Tf r g b` transmission-filter value (three floats). Only the
+/// chromaticity is used downstream (`matclass::tf_chromatic`) — the water tint
+/// is the curated constant — so a malformed/short value is simply `None`.
+fn parse_tf(v: &str) -> Option<[f32; 3]> {
+    let mut it = v.split_whitespace().filter_map(|s| s.parse::<f32>().ok());
+    match (it.next(), it.next(), it.next()) {
+        (Some(r), Some(g), Some(b)) => Some([r, g, b]),
+        _ => None,
+    }
+}
+
 /// Load an OBJ, auto-fit it (centered on x/z, resting on y=0, diagonal = 10),
 /// and drop it onto the standard ground plane + light.
 ///
@@ -1446,6 +1541,23 @@ pub fn load_obj_scene(path: &str) -> Scene {
     }
     .unwrap_or_else(|e| panic!("failed to load OBJ '{path}': {e}"));
     let obj_mats = materials_res.unwrap_or_default();
+
+    // Water detection (a glass-tier refinement): which materials are used by
+    // an OBJ object/group named `water`/`agua` — `o Water` → `materialo` in
+    // both San Miguel flavors (and NOT `o Fountain`, the stone basin).
+    // `--no-water` disarms the whole signal path so classification is exactly
+    // the pre-feature glassware.
+    let water_on = water_enabled();
+    let mut water_named = vec![false; obj_mats.len()];
+    if water_on {
+        for m in &models {
+            if let Some(id) = m.mesh.material_id {
+                if id < water_named.len() && crate::matclass::water_name(&m.name) {
+                    water_named[id] = true;
+                }
+            }
+        }
+    }
 
     let mut b = SceneBuilder::new();
     let ground = b.material(Vec3A::new(0.42, 0.46, 0.40), 0.55, 0.0);
@@ -1605,7 +1717,8 @@ pub fn load_obj_scene(path: &str) -> Scene {
     let (mut n_normal, mut n_rough, mut n_metal, mut n_emissive) = (0u32, 0u32, 0u32, 0u32);
     let mat_map: Vec<u32> = obj_mats
         .iter()
-        .map(|m| {
+        .enumerate()
+        .map(|(mi, m)| {
             let mut kd = Vec3A::from_array(m.diffuse.unwrap_or([0.7, 0.7, 0.7]));
             let tex = m
                 .diffuse_texture
@@ -1619,13 +1732,26 @@ pub fn load_obj_scene(path: &str) -> Scene {
                 let file = t.rsplit('/').next().unwrap_or(&t);
                 file.split('.').next().unwrap_or(file).to_ascii_lowercase()
             });
-            let (class, pbr) =
-                crate::matclass::classify(stem.as_deref(), &m.name, m.shininess, m.illumination_model);
+            // Water refines the glass tier only: `water_hint` from the OBJ
+            // object name, `tf` the parsed MTL transmission filter (tobj has
+            // no first-class Tf — it rides unknown_param, the `norm`/`Pr`
+            // precedent). Both suppressed under --no-water.
+            let tf = if water_on { m.unknown_param.get("Tf").and_then(|v| parse_tf(v)) } else { None };
+            let (class, pbr) = crate::matclass::classify(
+                stem.as_deref(),
+                &m.name,
+                m.shininess,
+                m.illumination_model,
+                water_on && water_named[mi],
+                tf,
+            );
             class_counts[class] += 1;
-            if pbr.transmission > 0.0 {
+            if pbr.transmission > 0.0 && !pbr.water {
                 // Transmitted light is tinted by albedo and San Miguel's
                 // glass Kd is 0.1-0.2 dark — lift toward white or glass
-                // renders near-black.
+                // renders near-black. Water is EXEMPT: it carries its color in
+                // `trans_tint` (below), so its raw dark Kd stays, which kills
+                // the neutral `kd·(1−T)` wash that read as chrome.
                 kd = Vec3A::ONE.lerp(kd, 0.2);
             }
             let kind = match tex {
@@ -1698,6 +1824,14 @@ pub fn load_obj_scene(path: &str) -> Scene {
             n_rough += (rough_tex != NO_TEX) as u32;
             n_metal += (metal_tex != NO_TEX) as u32;
             n_emissive += (emissive != Vec3A::ZERO || emissive_tex != NO_TEX) as u32;
+            // Water carries its color/IOR/ripples here; every other material
+            // takes the sentinel tint (⇒ albedo verbatim), IOR 1.5 (bit-
+            // identical to the old GLASS_IOR const), and no ripples.
+            let (trans_tint, ior, ripple_amp) = if pbr.water {
+                (WATER_TINT, WATER_IOR, WATER_RIPPLE_AMP)
+            } else {
+                (Vec3A::splat(-1.0), 1.5, 0.0)
+            };
             b.material_full(Material {
                 albedo: kd,
                 roughness,
@@ -1706,6 +1840,9 @@ pub fn load_obj_scene(path: &str) -> Scene {
                 sheen: pbr.sheen,
                 translucency: pbr.translucency,
                 transmission: pbr.transmission,
+                trans_tint,
+                ior,
+                ripple_amp,
                 emissive,
                 normal_tex,
                 normal_scale,

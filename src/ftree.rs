@@ -25,7 +25,7 @@
 //! hot path.
 
 use crate::bvh::{Aabb, Bvh};
-use crate::frustum::TileFrustum;
+use crate::frustum::{frustum_aabb_dist, TileFrustum};
 use glam::Vec3A;
 
 pub const WIDTH: usize = 8;
@@ -387,7 +387,8 @@ impl FTree {
         if point_aabb_max_dist(f.origin, &aabb) <= t_start {
             return; // entirely inside the proven-empty ball
         }
-        let d = point_aabb_dist(f.origin, &aabb).max(t_start);
+        // The SHARED range (frustum.rs) — self_test pins wide == binary bitwise.
+        let d = frustum_aabb_dist(f, &aabb).max(t_start);
         if d >= *best {
             return;
         }
@@ -417,10 +418,18 @@ impl FTree {
             // max().min(), NOT f32::clamp — empty slots carry an inverted box
             // (min = +inf > max = -inf) and std clamp panics on min > max;
             // max/min just produces an infinite distance the bnode check skips.
-            let cx = o.x.max(nd.min_x[s]).min(nd.max_x[s]) - o.x;
-            let cy = o.y.max(nd.min_y[s]).min(nd.max_y[s]) - o.y;
-            let cz = o.z.max(nd.min_z[s]).min(nd.max_z[s]) - o.z;
-            d[s] = (cx * cx + cy * cy + cz * cz).sqrt();
+            // The SHARED frustum-aware range (frustum.rs), NOT a lane-math copy
+            // of it: `self_test` pins wide == binary BITWISE, and two ports of
+            // the same formula do not agree to the ulp. This costs the slot
+            // loop its vectorizability — the plane culls below stay lane-wise.
+            // (An empty slot's inverted box makes every clip vacuous and the
+            // emptiness test fire, so it lands on +INF and the `bnode ==
+            // INVALID` skip below never sees a NaN.)
+            let ab = Aabb {
+                min: Vec3A::new(nd.min_x[s], nd.min_y[s], nd.min_z[s]),
+                max: Vec3A::new(nd.max_x[s], nd.max_y[s], nd.max_z[s]),
+            };
+            d[s] = frustum_aabb_dist(f, &ab);
             let mx = (o.x - nd.min_x[s]).abs().max((o.x - nd.max_x[s]).abs());
             let my = (o.y - nd.min_y[s]).abs().max((o.y - nd.max_y[s]).abs());
             let mz = (o.z - nd.min_z[s]).abs().max((o.z - nd.max_z[s]).abs());

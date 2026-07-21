@@ -1453,6 +1453,9 @@ pub fn height_self_test() -> Result<(), String> {
                 sheen: 0.0,
                 translucency: 0.0,
                 transmission: 0.0,
+                trans_tint: Vec3A::splat(-1.0),
+                ior: 1.5,
+                ripple_amp: 0.0,
                 emissive: Vec3A::ZERO,
                 normal_tex: 0,
                 normal_scale: 1.0,
@@ -1693,7 +1696,7 @@ pub fn height_self_test() -> Result<(), String> {
 /// lever-off binary block.
 pub fn tinted_shadow_self_test() -> Result<(), String> {
     use crate::scene::{MatKind, Material, NO_TEX, Scene};
-    let mat = |transmission: f32, albedo: Vec3A| Material {
+    let mat_tinted = |transmission: f32, albedo: Vec3A, trans_tint: Vec3A| Material {
         albedo,
         roughness: 0.05,
         metallic: 0.0,
@@ -1701,6 +1704,9 @@ pub fn tinted_shadow_self_test() -> Result<(), String> {
         sheen: 0.0,
         translucency: 0.0,
         transmission,
+        trans_tint,
+        ior: 1.5,
+        ripple_amp: 0.0,
         emissive: Vec3A::ZERO,
         normal_tex: NO_TEX,
         normal_scale: 1.0,
@@ -1710,6 +1716,9 @@ pub fn tinted_shadow_self_test() -> Result<(), String> {
         emissive_tex: NO_TEX,
         kind: MatKind::Diffuse,
     };
+    // Sentinel tint = "use albedo" — the bit-identity path every existing
+    // transmissive material takes.
+    let mat = |transmission: f32, albedo: Vec3A| mat_tinted(transmission, albedo, Vec3A::splat(-1.0));
     // Parallel triangles across the ray o=(1,1,5), d=-Z: glass1 at z=3
     // (t=2), glass2 at z=2 (t=3), opaque at z=1 (t=4).
     let mk_scene = |mats: Vec<Material>, zs: &[f32]| -> Scene {
@@ -1800,6 +1809,22 @@ pub fn tinted_shadow_self_test() -> Result<(), String> {
         let tp_m = bvh.transmittance_multi(&sc, &ray, 0.0, 2.5, &[0], &mut vis);
         if tp_m.to_array().map(f32::to_bits) != tint1.to_array().map(f32::to_bits) {
             return Err(format!("multi[root]: {tp_m:?} != {tint1:?}"));
+        }
+        // (f2) An explicit trans_tint replaces albedo as the tint source (the
+        // water class): shadow_tint = trans_tint · transmission bitwise, even
+        // though the albedo (a dark 0.1) differs — and transmittance carries
+        // it through.
+        let wtint = Vec3A::new(0.75, 0.92, 0.96);
+        let wt = mat_tinted(0.9, Vec3A::splat(0.1), wtint);
+        let want_wt = wtint * 0.9;
+        if wt.shadow_tint().to_array().map(f32::to_bits) != want_wt.to_array().map(f32::to_bits) {
+            return Err("trans_tint must override albedo as the shadow tint source".into());
+        }
+        let sc_w = mk_scene(vec![wt], &[3.0]);
+        let bvhw = Bvh::build(&sc_w);
+        let tpw = bvhw.transmittance(&sc_w, &ray, 0.0, 2.5, &mut vis);
+        if tpw.to_array().map(f32::to_bits) != want_wt.to_array().map(f32::to_bits) {
+            return Err(format!("water transmittance {tpw:?} != {want_wt:?}"));
         }
         // (g) SHADOW_TP_MIN cutoff: a tint under the floor counts opaque.
         let faint = mk_scene(vec![mat(5.0e-4, Vec3A::ONE)], &[3.0]);
