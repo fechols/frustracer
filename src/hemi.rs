@@ -287,8 +287,16 @@ fn capture_cell(
         match cx.gi {
             None => rec.open_mass.x += sphcell::psa(a, b, c, cx.n),
             Some(g) => {
-                rec.open_mass +=
-                    sky_cell(cx.n, g.sun, cx.scene.sky_scale, a, b, c, 5u32.saturating_sub(depth))
+                rec.open_mass += sky_cell(
+                    cx.n,
+                    g.sun,
+                    cx.scene.sky_scale,
+                    cx.scene.night,
+                    a,
+                    b,
+                    c,
+                    5u32.saturating_sub(depth),
+                )
             }
         }
         rec.open_psa += sphcell::psa(a, b, c, cx.n);
@@ -618,7 +626,7 @@ fn open_hemisphere(
         None => acc.open.x = PI,
         Some(g) => {
             for [a, b, c] in sphcell::octants(cx.n, t1, t2) {
-                acc.open += sky_cell(cx.n, g.sun, cx.scene.sky_scale, a, b, c, 4);
+                acc.open += sky_cell(cx.n, g.sun, cx.scene.sky_scale, cx.scene.night, a, b, c, 4);
             }
         }
     }
@@ -664,8 +672,16 @@ fn cell(
             // Refinement budget: enough extra levels to reach ~6° cells even
             // for an octant-sized empty cell near the sun glow.
             Some(g) => {
-                acc.open +=
-                    sky_cell(cx.n, g.sun, cx.scene.sky_scale, a, b, c, 5u32.saturating_sub(depth))
+                acc.open += sky_cell(
+                    cx.n,
+                    g.sun,
+                    cx.scene.sky_scale,
+                    cx.scene.night,
+                    a,
+                    b,
+                    c,
+                    5u32.saturating_sub(depth),
+                )
             }
         }
         if let Some(v) = verify.as_deref_mut() {
@@ -804,11 +820,14 @@ fn leaf_rays(
                 }
             }
             let l = match hit {
-                // The DOME, not the full sky. A GI leaf ray landing in the sun
+                // `gather`, not the full sky. A GI leaf ray landing in the sun
                 // disc would (a) double-count light `direct_d` already delivers
                 // with its own shadow ray, and (b) push ~1e3 radiance into the
-                // 2^18 fixed-point hemi accumulator, which would saturate.
-                None => crate::sky::dome(d, g.sun, cx.scene.sky_scale),
+                // 2^18 fixed-point hemi accumulator, which would saturate. The
+                // star field is the opposite case (nothing else delivers it and
+                // its mean is ~1e-3), so `gather` carries it in — see sky.rs's
+                // star row.
+                None => crate::sky::gather(d, g.sun, cx.scene.sky_scale, cx.scene.night),
                 Some(h) => shade::shade(
                     cx.scene,
                     cx.accel.bvh,
@@ -879,7 +898,17 @@ fn verify_leaf_ray(cx: &Cx, ray: &Ray, tc: f32, v: &mut VerifyCounters, ls: &mut
 /// aliasing: fireflies and energy loss, unfixable by adding `levels`. Excluding
 /// the disc removes the sharp feature outright — which is precisely why the
 /// frequency split is the right architecture and not merely a convenience.
-fn sky_cell(n: Vec3A, sun: Vec3A, scale: f32, a: Vec3A, b: Vec3A, c: Vec3A, levels: u32) -> Vec3A {
+#[allow(clippy::too_many_arguments)]
+fn sky_cell(
+    n: Vec3A,
+    sun: Vec3A,
+    scale: f32,
+    night: f32,
+    a: Vec3A,
+    b: Vec3A,
+    c: Vec3A,
+    levels: u32,
+) -> Vec3A {
     let cen = sphcell::centroid(a, b, c);
     if levels > 0 {
         // Angular radius of the cell around its centroid.
@@ -901,12 +930,16 @@ fn sky_cell(n: Vec3A, sun: Vec3A, scale: f32, a: Vec3A, b: Vec3A, c: Vec3A, leve
             let (mab, mbc, mca) = sphcell::midpoints(a, b, c);
             let mut sum = Vec3A::ZERO;
             for [ca, cb, cc] in [[a, mab, mca], [mab, b, mbc], [mca, mbc, c], [mab, mbc, mca]] {
-                sum += sky_cell(n, sun, scale, ca, cb, cc, levels - 1);
+                sum += sky_cell(n, sun, scale, night, ca, cb, cc, levels - 1);
             }
             return sum;
         }
     }
-    crate::sky::dome(cen, sun, scale) * sphcell::psa(a, b, c, n)
+    // `gather`, not `dome`: the star field's smooth mean rides along (see
+    // sky.rs's star row). It adds no sharp feature for the refinement above to
+    // chase — it is near-constant over the whole upper hemisphere — so the
+    // `coarse`/`near_aureole` budget is unaffected.
+    crate::sky::gather(cen, sun, scale, night) * sphcell::psa(a, b, c, n)
 }
 
 /// Reference-ray re-validation of an empty-cell claim: directions strictly

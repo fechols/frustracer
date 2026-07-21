@@ -205,12 +205,20 @@ float2 sample_pos(uint x, uint y, uint k, inout uint rng) {
 // sees the disc only if no light-sampling strategy already covers the sun along
 // that path.
 //
-//   sky_dome(d)      GATHER paths: hemi cells, GI leaf misses. NO disc — the
-//                    disc would double-count direct_d AND saturate the 2^18
-//                    fixed-point hemi accumulator outright.
+//   sky_gather(d)    GATHER paths: hemi cells, GI leaf misses. The dome plus
+//                    the star field's smooth MEAN. NO disc — the disc would
+//                    double-count direct_d AND saturate the 2^18 fixed-point
+//                    hemi accumulator outright.
+//   sky_dome(d)      the scattering dome alone — the gather term's smooth half,
+//                    and what display paths compose the disc/stars ONTO.
 //   sky_radiance(o, d)  DISPLAY paths: the camera's own miss, and glass —
 //                    the backdrop through the CLOUD layer along the ray
 //                    (FLAG_CLOUDS; the cloud block below), plus its scatter.
+//
+// The star field follows the same once-per-path rule in the other polarity:
+// nothing importance-samples a star, so instead of being excluded from gathers
+// it is delivered to them in a different REPRESENTATION — points through
+// sky_radiance, the mean through sky_gather, identical total energy.
 //
 // The specular reflection ray is the one path both strategies can reach, so it
 // takes the dome plus a MIS-weighted disc (see shade.hlsli).
@@ -344,6 +352,40 @@ float3 sky_stars(float3 d, float half_angle, uint twinkle) {
     float tw = 0.75 + 0.25 * star_hash01(pcg_mix(seed ^ pcg_mix(twinkle >> 3u)));
     float l = min(STAR_E * tier / (6.2831853 * sigma * sigma), STAR_L_MAX);
     return tint * (l * g * tw * night * star_rise(d.y, 0.0, 0.05));
+}
+
+// The star field's smooth MEAN — what GATHER paths integrate, exactly as
+// sky_stars is what display paths see (sky.rs::star_glow, term-for-term).
+//
+// The field cannot be projected as points (order-2 SH would catch ~11 of ~4.9k
+// stars as quadrature noise), but SH carries only DC + linear + quadratic and a
+// near-uniform point field's whole low-order content IS its mean — so this is
+// the EXACT order-2 projection, minus the noise. STAR_FLUX is the field's own
+// above-horizon flux, enumerated and pinned by sky::self_test on the CPU side;
+// mirrored here as a literal (the clouds-wind idiom). Spread over the 2π sr
+// above the horizon, carried across it by sky_dome's own blend band with the
+// same ground bounce below (a hard step rings under order-2 truncation).
+//
+// `night` gates it exactly as it gates the points, and the guard is a BRANCH —
+// day kernels are bit-identical by construction.
+static const float3 STAR_FLUX = float3(6.87870e-3, 6.67376e-3, 6.66328e-3);
+static const float  STAR_AMBIENT_K = 1.0;
+
+float3 sky_star_glow(float3 d) {
+    if (night <= 0.0) return float3(0.0, 0.0, 0.0);
+    float3 l = STAR_FLUX * (STAR_AMBIENT_K / 6.2831853);
+    float t = saturate((d.y + 0.05) / 0.10);
+    return l * ((SKY_GROUND_ALBEDO + (1.0 - SKY_GROUND_ALBEDO) * t) * night);
+}
+
+// GATHER paths: the scattering dome plus the star field's mean. The two GPU
+// gather sites are hemi.hlsli's empty-cell term and hemi_leaf.hlsl's leaf-ray
+// miss — display paths keep sky_radiance (points), and mixing the two is the
+// double count the split exists to prevent. See sky.rs's star row.
+float3 sky_gather(float3 d) {
+    float3 dm = sky_dome(d);
+    if (night <= 0.0) return dm; // bitwise the pre-feature gather; a branch
+    return dm + sky_star_glow(d);
 }
 
 // --- Fireflies (src/fireflies.rs — term-for-term; change both together) ------

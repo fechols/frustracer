@@ -4254,11 +4254,12 @@ fn run_check_gpu(
                     let d = shade::cosine_dir(n, t1, t2, rng.f32(), rng.f32());
                     let ray = bvh::Ray::new(o, d);
                     sum += match bvh.intersect(scene, &ray, 0.0, f32::INFINITY, &mut vls.ray_nodes) {
-                        // dome, NOT radiance — this reference must integrate the
-                        // same sky hemi.rs does (a GATHER path), or the GI A/B
-                        // below is comparing two different functions. Same
-                        // sky_scale source as hemi's leaf miss, same reason.
-                        None => crate::sky::dome(d, sun, scene.sky_scale),
+                        // gather, NOT radiance — this reference must integrate
+                        // the same sky hemi.rs does (a GATHER path), or the GI
+                        // A/B below is comparing two different functions. Same
+                        // sky_scale AND night sources as hemi's leaf miss, same
+                        // reason (night carries the star field's smooth mean).
+                        None => crate::sky::gather(d, sun, scene.sky_scale, scene.night),
                         Some(hh) => shade::shade(
                             scene,
                             bvh,
@@ -9047,10 +9048,10 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                     let d = shade::cosine_dir(pr.n, t1, t2, r1, r2);
                     let bray = bvh::Ray::new(pr.p, d);
                     e_r += match bvh.intersect(scene, &bray, 0.0, f32::INFINITY, &mut vis) {
-                        // dome, NOT radiance — a GATHER path, mirroring
+                        // gather, NOT radiance — a GATHER path, mirroring
                         // hemi.rs's leaf-ray miss exactly (see sky.rs),
-                        // including its sky_scale source.
-                        None => crate::sky::dome(d, sun, scene.sky_scale),
+                        // including its sky_scale and night sources.
+                        None => crate::sky::gather(d, sun, scene.sky_scale, scene.night),
                         Some(h) => shade::shade(
                             scene,
                             bvh,

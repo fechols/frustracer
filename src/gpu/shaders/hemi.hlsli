@@ -203,9 +203,12 @@ float3 sky_cell_sum(float3 n, float3 a0, float3 b0, float3 c0, uint levels0) {
             sa[sp] = mca; sb[sp] = mbc; sc[sp] = c;   sl[sp] = lv - 1; ++sp;
             sa[sp] = mab; sb[sp] = mbc; sc[sp] = mca; sl[sp] = lv - 1; ++sp;
         } else {
-            // The DOME — never the disc. Centroid point-sampling a cell coarser
-            // than the sun would alias it catastrophically (see hemi.rs).
-            sum += sky_dome(cen) * psa3(a, b, c, n);
+            // GATHER — never the disc. Centroid point-sampling a cell coarser
+            // than the sun would alias it catastrophically (see hemi.rs). The
+            // star field's smooth mean rides along and is safe here for the
+            // opposite reason: it is near-constant over the hemisphere, so it
+            // adds no feature for the refinement above to chase.
+            sum += sky_gather(cen) * psa3(a, b, c, n);
         }
     }
     return sum;

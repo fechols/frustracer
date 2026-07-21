@@ -88,10 +88,12 @@ void cs_hemi_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
                                    0.0, HEMI_CONE_SPREAD, false, false, w3, o3, n3, ps_unused);
             hemi_add3(pt.pixel, l * weight);
         } else {
-            // The DOME, not the full sky: a GI leaf ray landing in the sun disc
+            // GATHER, not the full sky: a GI leaf ray landing in the sun disc
             // would double-count direct_d AND saturate this 2^18 fixed-point
-            // accumulator outright (sky.rs's invariant).
-            hemi_add3(pt.pixel, sky_dome(d) * weight);
+            // accumulator outright (sky.rs's invariant). The star field is the
+            // opposite case — nothing else delivers it to a bounce, and its
+            // mean is ~1e-3 — so sky_gather carries it in.
+            hemi_add3(pt.pixel, sky_gather(d) * weight);
         }
     }
 }

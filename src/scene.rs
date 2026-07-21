@@ -923,14 +923,18 @@ pub fn finalize_scalars(scene: &mut Scene) {
 /// scan. Deterministic quadrature, no rng — which is why `scene_cache` needs
 /// no format change for it.
 ///
-/// The DOME, not the full sky: a gather path must never see the sun disc
+/// `sky::gather`, not the full sky: a gather path must never see the sun disc
 /// (the direct loop already delivers it, with a shadow ray). See sky.rs's
 /// central invariant. At night `scene.sun` IS the moon, so the ambient is the
-/// moonlit dome — the frequency split carries over unchanged.
+/// moonlit dome — the frequency split carries over unchanged — PLUS the star
+/// field's smooth mean (`sky::star_glow`, gated by `scene.night`), which is
+/// what gives night a moon-independent ambient floor. `gather` is bitwise
+/// `dome` whenever `night == 0`, so every day session is untouched.
 pub fn refresh_sky_sh(scene: &mut Scene) {
     let sun = scene.sun.dir;
     let scale = scene.sky_scale;
-    scene.sky_sh = crate::sh::Sh9::project(|d| crate::sky::dome(d, sun, scale));
+    let night = scene.night;
+    scene.sky_sh = crate::sh::Sh9::project(|d| crate::sky::gather(d, sun, scale, night));
 }
 
 /// The sun direction is UNCHANGED from the old rect light's center — so shadow
@@ -1084,6 +1088,21 @@ pub fn tod_self_test() -> Result<(), String> {
     }
     if sc.night != 1.0 {
         return Err(format!("midnight night factor {} != 1", sc.night));
+    }
+    // END-TO-END STARLIGHT: the SH the renderer actually shades from must carry
+    // the star field's floor, not just the moonlit dome. sky::self_test gates
+    // the term itself (energy vs the enumerated field, the band); this gates
+    // that `refresh_sky_sh` really routes through `sky::gather` — a revert to
+    // `dome` there would pass every gate in sky.rs and silently un-light the
+    // night.
+    let e_night = sc.sky_sh.irradiance(Vec3A::Y);
+    let moon_only = crate::sh::Sh9::project(|d| sky::dome(d, sc.sun.dir, sc.sky_scale))
+        .irradiance(Vec3A::Y);
+    if lum(e_night) <= lum(moon_only) * 1.05 {
+        return Err(format!(
+            "midnight sky_sh {e_night:?} carries no starlight over the moonlit \
+             dome {moon_only:?} — refresh_sky_sh is not calling sky::gather"
+        ));
     }
     apply_tod(&mut sc, 18.20); // just past the sun's last light
     if lum(sc.sun.e_over_pi) > 0.02 {
