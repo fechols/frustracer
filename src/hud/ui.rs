@@ -96,8 +96,15 @@ slint::slint! {
         // (row id, new text) — Text rows, committed on Enter.
         callback text-edited(string, string);
 
+        // Compass + clock fade like the keymap panel: awake on camera/TOD
+        // activity (mod.rs's linger), asleep when idle. `hud-on` (F1) stays
+        // the hard gate; one animated opacity — settled states dirty nothing.
+        in property <bool> hud-live: true;
+
         compass := Rectangle {
             visible: root.hud-on;
+            opacity: root.hud-live ? 1.0 : 0.0;
+            animate opacity { duration: 400ms; easing: ease-in-out; }
             x: parent.width - 152px;
             y: 16px;
             width: 136px;

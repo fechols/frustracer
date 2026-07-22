@@ -12288,7 +12288,7 @@ fn session(
                 hd.set_visible(!hd.visible());
                 eprintln!("hud: {} (F1 toggles)", if hd.visible() { "ON" } else { "OFF" });
             }
-            if let Some(hf) = hd.frame(&cam, cur_tod, moved) {
+            if let Some(hf) = hd.frame(&cam, cur_tod, moved, sun_moved) {
                 gpu.hud_stage(hf);
             }
             gpu.set_hud_visible(hd.visible() || hd.menu_open());

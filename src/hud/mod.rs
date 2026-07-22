@@ -38,6 +38,11 @@ use std::time::Instant;
 /// flying; a short linger keeps brief pauses from strobing it).
 const HELP_LINGER: std::time::Duration = std::time::Duration::from_millis(2500);
 
+/// The compass + clock's own linger: they wake on camera OR time-of-day
+/// activity and fade when both go idle. Longer than HELP_LINGER — heading
+/// and hour are exactly what you glance at just AFTER stopping.
+const HUD_LINGER: std::time::Duration = std::time::Duration::from_millis(4000);
+
 /// One changed region of the HUD buffer, in pixels.
 #[derive(Clone, Copy, Debug)]
 pub struct DirtyRect {
@@ -127,8 +132,12 @@ pub struct Hud {
     last_minute: i32,
     last_help: bool,
     last_hud_on: bool,
+    last_hud_live: bool,
     /// Last time the camera was moving (drives the keymap panel's fade).
     last_move: Option<Instant>,
+    /// Last camera OR time-of-day activity (drives the compass/clock fade).
+    /// Seeded at construction so the HUD shows itself once at boot.
+    last_active: Option<Instant>,
     /// Pause-menu state (Rust owns it; the ui properties mirror it).
     menu_open: bool,
     page: MenuPage,
@@ -198,7 +207,9 @@ impl Hud {
             last_minute: i32::MIN,
             last_help: false,
             last_hud_on: !visible, // != visible so the first frame sets it
+            last_hud_live: true,   // the markup default; first frame reconciles
             last_move: None,
+            last_active: Some(Instant::now()), // show once at boot, then fade
             menu_open: false,
             page: MenuPage::Main,
             group: "Display".to_string(),
@@ -318,7 +329,15 @@ impl Hud {
     /// Once per frame: feed the pose/clock/motion state, tick Slint's
     /// timers/animations, render if anything is dirty, and return the changed
     /// rects + their pixels (None = nothing changed, upload nothing).
-    pub fn frame(&mut self, cam: &Camera, tod: f32, moving: bool) -> Option<HudFrame> {
+    /// `tod_moved` = the clock changed this frame (scrub / attractors / menu)
+    /// — it wakes the compass+clock fade like camera motion does.
+    pub fn frame(
+        &mut self,
+        cam: &Camera,
+        tod: f32,
+        moving: bool,
+        tod_moved: bool,
+    ) -> Option<HudFrame> {
         // Compass heading: the camera's forward projected to the ground
         // plane; north = +Z, east = +X (the sun-arc azimuth convention),
         // quantized to whole degrees so a still camera dirties nothing.
@@ -343,6 +362,20 @@ impl Hud {
         if help != self.last_help {
             self.last_help = help;
             self.ui.set_help_on(help);
+        }
+        // Compass + clock: awake on camera OR clock activity (and while the
+        // pause menu is up — its TOD row wants live clock feedback), asleep
+        // HUD_LINGER after both go idle. While asleep nothing updates their
+        // properties (an idle camera moves neither heading nor hour), so the
+        // faded state costs zero repaints.
+        if moving || tod_moved {
+            self.last_active = Some(Instant::now());
+        }
+        let hud_live =
+            self.menu_open || self.last_active.is_some_and(|t| t.elapsed() < HUD_LINGER);
+        if hud_live != self.last_hud_live {
+            self.last_hud_live = hud_live;
+            self.ui.set_hud_live(hud_live);
         }
         if self.visible != self.last_hud_on {
             self.last_hud_on = self.visible;
