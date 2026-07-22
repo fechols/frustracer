@@ -11068,13 +11068,30 @@ fn vendor_defaults(opts: &mut Opts, vendor: gpu::adapter::Vendor) {
     // DXR default since W2) moved the DXR column to 2.35/1.64, so the Intel
     // ratio now STRADDLES 1.0 by scene at spp=1 (default 1.34x, stress
     // 0.81x, san-miguel-lp 0.94x) — most of the old gap was secondary
-    // TraceRay dispatch, not RT-core weakness. This entry is KEPT because
-    // the wavefront still wins the flagless contract where it matters (the
-    // default scene at spp=1, every scene from ~spp 3 up via the quadtree's
-    // cheaper marginal sample, and it owns H/R/C/O) — but the clean crossing
-    // is gone, and a re-measure ON THE WORLD (the actual flagless scene,
-    // which --spin never loads) is owed before this policy is extended or
-    // defended with the old numbers.
+    // TraceRay dispatch, not RT-core weakness. THE WORLD RE-MEASURE (same
+    // day — the debt this paragraph used to record, now paid): interactive
+    // boot-pose sessions on the B70, native 1080p spp=1, --gpu-timing
+    // running means over 6-30k frames, 2 interleaved reps (spread 1-5%; a
+    // live desktop never repeats to the headless loop's ±0.1%):
+    // ```text
+    //                    tracer ms   frame span
+    //   wavefront          4.15        5.21
+    //   DXR --dxr-inline 1 3.80        4.88     (0.92x / 0.94x)
+    //   DXR --dxr-inline 2 3.83        4.92
+    //   DXR --dxr-inline 0 7.28        8.37     (matches the BLAS-era 7.27/8.34)
+    // ```
+    // So at spp=1 the wavefront now LOSES on the flagless scene itself —
+    // and on stress (0.81x) and san-miguel-lp (0.94x) — keeping only the
+    // sky-heavy procedural default scene (1.34x). This entry is
+    // nevertheless KEPT, with its basis narrowed from "wavefront wins
+    // spp=1" to: the ~8% span margin is imperceptible at 5 ms, while the
+    // wavefront owns H/R/C/O and the >=spp-3 regime (the quadtree's
+    // marginal sample is the cheaper one — measured procedural; mode 1's
+    // candidate-loop-fattened chs_shade pays occupancy per sample, and the
+    // world arms cutout, so high spp should read WORSE there, though that
+    // point is unmeasured). Flipping Intel flagless to DXR is a one-line
+    // change if that trade ever reads the other way; make it on these
+    // numbers, not the table above.
     //
     // AMD is deliberately absent: this box's only AMD adapter is an iGPU
     // (~22x slower, useless as a signal), so RDNA has no measurement here and
