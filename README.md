@@ -477,6 +477,54 @@ against its unchanged 0.02 limit**. Cost is pose-dependent and real on the CPU
 Miguel interior 16.0 → 16.1 (+1.1%); `--aniso 4|8` buys that back. On the GPU
 it disappears under the bench row's own noise.
 
+## Where DXR's time actually goes: a three-point ablation
+
+The `--dxr` pipeline and the `--gpu` wavefront trace the same rays with the
+same pasted shading code; only the dispatch shape differs — recursive
+`TraceRay` through a shader binding table versus inline `RayQuery` in
+compute. On an Arc Pro B70 that difference read as "DispatchRays is 5×
+slower than the wavefront," which is the kind of claim that deserves a
+decomposition rather than a vibe. `FR_DXR_INLINE` (env lever, default 0 =
+off and byte-identical) is that decomposition: mode 1 keeps the primary
+TraceRay → closest-hit but compiles the inline-RayQuery trace primitives in
+place of the TraceRay flavors, so every secondary ray (shadow, AO,
+reflection, the glass chain) runs inline *inside the hit shader*; mode 2
+goes all-inline in raygen — no TraceRay anywhere, DispatchRays reduced to a
+bare launch grid over the reference loop. Every mode passes the full
+`--check-dxr` suite with statistics identical to the shipping pipeline
+(same hardware traversal, same shading), so the A/B is dispatch and nothing
+else.
+
+| `--spin path` 1080p, spp=1, tracer ms | all TraceRay | inline secondaries | all inline | wavefront |
+|---|---|---|---|---|
+| B70 default | 9.05 | 2.35 | 1.41 | 1.76 |
+| B70 `--stress 5000` | 5.30 | 1.64 | 1.22 | 2.02 |
+| B70 San Miguel low-poly | 6.75 | 1.94 | 1.29 | 2.05 |
+| 4090 default | 1.34 | 0.26 | 0.29 | 2.09 |
+| 4090 `--stress 5000` | 0.79 | 0.25 | 0.27 | 1.08 |
+| 4090 San Miguel low-poly | 1.18 | 0.34 | 0.34 | 1.00 |
+
+**Arc executes DispatchRays and inline RayQuery just fine; what it hates is
+re-entering the scheduler from a hit shader.** Recursive TraceRay
+secondaries multiply the tracer 4.4–6.4× on the B70 — and this is not an
+Arc quirk but a cross-vendor property: the 4090 pays 3.0–4.6× on the same
+scenes. Arc's penalty is ~1.4–1.5× NVIDIA's, and it lands on top of a
+weaker RT-core baseline; the two *compound* into the 5× that started the
+investigation. DispatchRays launch overhead itself is ≈ zero — mode 2 lands
+at the compute reference kernel's own cost on both vendors.
+
+Two riders worth keeping. The primary ray is the one place TraceRay earns
+anything: on the 4090, mode 1 beats mode 2 (a coherent primary on the
+hardware pipeline is worth a few percent), while the B70 always prefers
+zero TraceRay. And mode 1's *marginal sample* on the B70 is 2.2 ms against
+mode 2's 1.11 — the candidate-loop-fattened closest-hit shader pays
+occupancy per sample where the all-TraceRay pipeline paid per dispatch, so
+a fat hit shader is fine at 1 spp and ruinous at 16. The spp sweep also
+places the wavefront: on the B70 the all-inline DXR only beats the quadtree
+below ~3 spp (the quadtree's marginal sample is 0.86 ms vs the
+reference-shaped 1.11), while on the 4090 inline DXR wins at every spp
+measured. The lever ships off by default; the numbers are the product.
+
 ## Future work
 
 Cut-aware leaf ordering (sort the cut by distance once per leaf tile so all 64
