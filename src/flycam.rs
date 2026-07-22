@@ -135,6 +135,11 @@ struct Shared {
     /// and `session` resumes once its frame loop is actually running; the
     /// thread spawns paused so the first session's init is covered too.
     paused: AtomicBool,
+    /// World auto-TOD sticky-off: set by the first manual scrub (integrator
+    /// side) OR a pause-menu `set_tod` (main thread) — either way the user
+    /// took the clock, and the attractors easing it back would undo them.
+    /// Shared (not an integrator local) precisely so the menu can set it.
+    manual_tod: AtomicBool,
 }
 
 impl FlyCam {
@@ -154,6 +159,7 @@ impl FlyCam {
             state: Mutex::new(FlyState { cam: cam0, tod: tod0 }),
             stop: AtomicBool::new(false),
             paused: AtomicBool::new(true),
+            manual_tod: AtomicBool::new(false),
         });
         let s2 = shared.clone();
         let handle = std::thread::Builder::new()
@@ -188,6 +194,18 @@ impl FlyCam {
     #[allow(dead_code)]
     pub fn set(&self, cam: Camera) {
         self.shared.state.lock().unwrap().cam = cam;
+    }
+
+    /// Time-of-day write-through (the pause menu's TOD control): the thread
+    /// owns the hour like it owns the pose, so a menu set rides the same
+    /// channel a scrub does — the session's existing `snap.tod != cur_tod`
+    /// detection applies it (scene::apply_tod + refresh_sky + frame reset,
+    /// histories kept). Also takes the clock for the session, like the first
+    /// manual scrub — a menu set IS a manual choice, and the world-mode
+    /// attractors easing it back would undo it.
+    pub fn set_tod(&self, hours: f32) {
+        self.shared.manual_tod.store(true, Relaxed);
+        self.shared.state.lock().unwrap().tod = hours.rem_euclid(24.0);
     }
 }
 
@@ -381,9 +399,6 @@ fn drag_may_start(hwnd: HWND, pt: POINT) -> bool {
 }
 
 fn integrate_loop(shared: &Shared, hwnd: isize, diag: f32, attractors: &[TodAttractor]) {
-    // World auto-TOD: sticky-off after the first manual scrub — the user
-    // taking the clock is a decision, not a fight to have every tick.
-    let mut manual_tod = false;
     // Above the rayon workers. The renderer saturates every core at normal
     // priority for the whole trace, and this thread needs ~10 us every 2 ms.
     // A starved tick never loses displacement (dt is measured, so the total
@@ -490,9 +505,9 @@ fn integrate_loop(shared: &Shared, hwnd: isize, diag: f32, attractors: &[TodAttr
         let tod_dir = (t_fwd as i32 - t_rev as i32) as f32;
 
         if tod_dir != 0.0 {
-            manual_tod = true;
+            shared.manual_tod.store(true, Relaxed);
         }
-        let auto_tod = !manual_tod && !attractors.is_empty();
+        let auto_tod = !shared.manual_tod.load(Relaxed) && !attractors.is_empty();
 
         let pad_move = pad.as_ref().is_some_and(|p| p.lx != 0.0 || p.ly != 0.0 || p.lt != 0.0 || p.rt != 0.0);
         let pad_look = pad.as_ref().is_some_and(|p| p.rx != 0.0 || p.ry != 0.0);

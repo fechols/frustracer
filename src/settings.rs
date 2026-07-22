@@ -784,6 +784,445 @@ pub fn apply_globals(s: &Settings) {
 }
 
 // ---------------------------------------------------------------------------
+// Pause-menu descriptor (the UI binds rows to this; src/hud consumes it)
+// ---------------------------------------------------------------------------
+
+/// How a menu row is manipulated. `CycleFwd` mirrors a cycle KEY (one click =
+/// one press — SPACE/U/H/N semantics, forward only); `Cycle` is a ±-steppable
+/// option list; `Step*` are ± numeric steps; `Text` is a free-text field
+/// (restart-tier paths). One mechanism per row, zero drift from the keys.
+pub enum Control {
+    Toggle { default: bool },
+    Cycle { options: &'static [&'static str], default_ix: usize },
+    CycleFwd,
+    StepU { min: u32, max: u32, step: u32, default: u32 },
+    StepF { min: f32, max: f32, step: f32, default: f32 },
+    Text,
+}
+
+/// Live rows apply instantly through the SAME code paths as their keys
+/// (synthesized `Edges` / the shared atomics); Restart rows edit the settings
+/// file and badge "restart" — they apply next launch.
+#[derive(PartialEq, Clone, Copy)]
+pub enum Tier {
+    Live,
+    Restart,
+}
+
+pub struct MenuItem {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub group: &'static str,
+    pub tier: Tier,
+    pub control: Control,
+    /// Read the persisted value (None = never set — the default rules).
+    pub get: fn(&Settings) -> Option<String>,
+    /// Write the persisted value (invalid input = ignored, the load() rule).
+    pub set: fn(&mut Settings, &str),
+}
+
+pub const GROUPS: &[&str] = &["Display", "Renderer", "Upscaler", "Effects", "Scene", "Advanced"];
+
+macro_rules! acc_bool {
+    ($($p:ident).+) => {
+        (
+            |s: &Settings| s.$($p).+.map(|v| if v { "on" } else { "off" }.to_string()),
+            |s: &mut Settings, v: &str| {
+                s.$($p).+ = match v {
+                    "on" => Some(true),
+                    "off" => Some(false),
+                    _ => s.$($p).+,
+                }
+            },
+        )
+    };
+}
+macro_rules! acc_u32 {
+    ($($p:ident).+) => {
+        (
+            |s: &Settings| s.$($p).+.map(|v| v.to_string()),
+            |s: &mut Settings, v: &str| {
+                if let Ok(n) = v.parse::<u32>() {
+                    s.$($p).+ = Some(n);
+                }
+            },
+        )
+    };
+}
+macro_rules! acc_f32 {
+    ($($p:ident).+) => {
+        (
+            |s: &Settings| s.$($p).+.map(|v| format!("{v}")),
+            |s: &mut Settings, v: &str| {
+                if let Ok(n) = v.parse::<f32>() {
+                    if n.is_finite() {
+                        s.$($p).+ = Some(n);
+                    }
+                }
+            },
+        )
+    };
+}
+macro_rules! acc_str {
+    ($($p:ident).+) => {
+        (
+            |s: &Settings| s.$($p).+.clone(),
+            |s: &mut Settings, v: &str| s.$($p).+ = Some(v.to_string()),
+        )
+    };
+}
+
+macro_rules! item {
+    ($id:literal, $label:literal, $group:literal, $tier:expr, $control:expr, $acc:expr) => {{
+        let (g, s): (fn(&Settings) -> Option<String>, fn(&mut Settings, &str)) = $acc;
+        MenuItem { id: $id, label: $label, group: $group, tier: $tier, control: $control, get: g, set: s }
+    }};
+}
+
+/// The whole menu, one declarative table. IDs are stable (the UI round-trips
+/// them through callbacks); labels carry the key mnemonic for live rows.
+/// EVERY CLI-exposable option appears here except the headless/bench harness
+/// (--check*/--spin/--*-dump/--cam/--stress/--tile — excluded by design; see
+/// the module header).
+pub fn menu_items() -> &'static [MenuItem] {
+    use Control::*;
+    use Tier::*;
+    static ITEMS: std::sync::OnceLock<Vec<MenuItem>> = std::sync::OnceLock::new();
+    ITEMS.get_or_init(|| {
+        vec![
+            // ── Display
+            item!("hud", "HUD compass + clock (F1)", "Display", Live, Toggle { default: true }, acc_bool!(display.hud)),
+            item!("overlay", "quadtree overlay (O, CPU mode)", "Display", Live, Toggle { default: false }, ((|_| None), (|_, _| {}))),
+            item!("gpu_tone", "GPU tonemap A/B (B)", "Display", Live, Toggle { default: false }, ((|_| None), (|_, _| {}))),
+            item!("vsync", "v-sync", "Display", Restart, Toggle { default: true }, acc_bool!(display.vsync)),
+            item!("hdr", "scRGB (HDR) swapchain", "Display", Restart, Toggle { default: true }, acc_bool!(display.hdr)),
+            item!("hdr_paper_white", "paper white (nits)", "Display", Restart, StepF { min: 80.0, max: 1000.0, step: 20.0, default: 200.0 }, acc_f32!(display.hdr_paper_white)),
+            item!("hdr_peak", "peak override (nits)", "Display", Restart, StepF { min: 400.0, max: 4000.0, step: 100.0, default: 1000.0 }, acc_f32!(display.hdr_peak)),
+            // ── Renderer
+            item!("mode", "render mode (SPACE cycles)", "Renderer", Live, CycleFwd, acc_str!(renderer.mode)),
+            item!("preset", "quality preset (1-3)", "Renderer", Live, Cycle { options: &["1", "2", "3"], default_ix: 1 }, acc_u32!(renderer.preset)),
+            item!("spp", "samples per pixel (U cycles)", "Renderer", Live, CycleFwd, acc_u32!(renderer.spp)),
+            item!("bounce", "hemi bounce (H cycles)", "Renderer", Live, CycleFwd, acc_str!(renderer.bounce)),
+            item!("hybrid", "hybrid tracer (R)", "Renderer", Live, Toggle { default: true }, ((|_| None), (|_, _| {}))),
+            item!("dynamic", "dynamic res (T, CPU mode)", "Renderer", Live, Toggle { default: true }, ((|_| None), (|_, _| {}))),
+            item!("height_on", "relief rendering (V, armed only)", "Renderer", Live, Toggle { default: false }, ((|_| None), (|_, _| {}))),
+            item!("lock_res", "render res lock", "Renderer", Restart, Cycle { options: &["quality", "balanced", "performance", "ultra-performance", "native", "dynamic"], default_ix: 0 }, acc_str!(renderer.lock_res)),
+            item!("heightfield", "arm heightfield relief", "Renderer", Restart, Toggle { default: false }, acc_bool!(renderer.heightfield)),
+            // ── Upscaler
+            item!("chain", "upscaler chain start", "Upscaler", Restart, Cycle { options: &["auto", "dlss", "fsr4", "fsr3", "xess", "none"], default_ix: 0 }, acc_str!(upscaler.chain)),
+            item!("dlss", "DLSS-RR vs plain (G)", "Upscaler", Live, Toggle { default: true }, ((|_| None), (|_, _| {}))),
+            item!("xess", "XeSS vs plain (X)", "Upscaler", Live, Toggle { default: false }, ((|_| None), (|_, _| {}))),
+            item!("fsr", "FSR vs plain (K)", "Upscaler", Live, Toggle { default: false }, ((|_| None), (|_, _| {}))),
+            item!("oidn", "OIDN denoise (N cycles)", "Upscaler", Live, CycleFwd, acc_bool!(upscaler.oidn)),
+            item!("oidn_temporal", "OIDN temporal history (M)", "Upscaler", Live, Toggle { default: true }, acc_bool!(upscaler.oidn_temporal)),
+            item!("nppd", "NPPD neural denoise (J)", "Upscaler", Live, Toggle { default: false }, acc_bool!(upscaler.nppd)),
+            item!("prefer", "adapter preference", "Upscaler", Restart, Cycle { options: &["nvidia", "amd", "intel"], default_ix: 0 }, acc_str!(upscaler.prefer)),
+            item!("quinlight", "quinlight consensus fuse", "Upscaler", Restart, Toggle { default: false }, acc_bool!(upscaler.quinlight)),
+            item!("quin_anchor", "quinlight anchor engine", "Upscaler", Restart, StepU { min: 0, max: 3, step: 1, default: 0 }, acc_u32!(upscaler.quin_anchor)),
+            item!("oidn_quality", "OIDN quality", "Upscaler", Restart, Cycle { options: &["fast", "balanced", "high"], default_ix: 1 }, acc_str!(upscaler.oidn_quality)),
+            item!("oidn_device", "OIDN device", "Upscaler", Restart, Cycle { options: &["default", "cpu", "sycl", "cuda", "hip"], default_ix: 0 }, acc_str!(upscaler.oidn_device)),
+            item!("oidn_clean_aux", "OIDN clean guides", "Upscaler", Restart, Toggle { default: true }, acc_bool!(upscaler.oidn_clean_aux)),
+            item!("nppd_device", "NPPD device", "Upscaler", Restart, Cycle { options: &["auto", "cpu", "dml"], default_ix: 0 }, acc_str!(upscaler.nppd_device)),
+            item!("xess_autoexposure", "XeSS autoexposure", "Upscaler", Restart, Toggle { default: false }, acc_bool!(upscaler.xess_autoexposure)),
+            item!("adaptive", "adaptive shading (XeSS)", "Upscaler", Restart, Toggle { default: true }, acc_bool!(upscaler.adaptive)),
+            item!("fsr_max_radiance", "FSR-RR max radiance", "Upscaler", Restart, StepF { min: 0.0, max: 64.0, step: 2.0, default: 10.0 }, acc_f32!(upscaler.fsr_max_radiance)),
+            item!("fsr_stability_bias", "FSR-RR stability bias", "Upscaler", Restart, StepF { min: 0.0, max: 1.0, step: 0.05, default: 0.5 }, acc_f32!(upscaler.fsr_stability_bias)),
+            item!("fsr_radiance_clip_k", "FSR-RR radiance clip k", "Upscaler", Restart, StepF { min: 0.0, max: 10.0, step: 0.5, default: 1.0 }, acc_f32!(upscaler.fsr_radiance_clip_k)),
+            item!("fsr_disocclusion_threshold", "FSR-RR disocclusion thr", "Upscaler", Restart, StepF { min: 0.0, max: 1.0, step: 0.05, default: 0.1 }, acc_f32!(upscaler.fsr_disocclusion_threshold)),
+            item!("fsr_normal_strength", "FSR-RR normal strength", "Upscaler", Restart, StepF { min: 0.0, max: 2.0, step: 0.1, default: 1.0 }, acc_f32!(upscaler.fsr_normal_strength)),
+            item!("fsr_kernel_relaxation", "FSR-RR kernel relaxation", "Upscaler", Restart, StepF { min: 0.0, max: 1.0, step: 0.05, default: 0.5 }, acc_f32!(upscaler.fsr_kernel_relaxation)),
+            // ── Effects
+            item!("tod", "time of day", "Effects", Live, StepF { min: 0.0, max: 24.0, step: 0.5, default: 12.0 }, acc_f32!(effects.tod)),
+            item!("bloom", "bloom (glare)", "Effects", Live, Toggle { default: true }, acc_bool!(effects.bloom)),
+            item!("clouds", "volumetric clouds", "Effects", Live, Toggle { default: true }, acc_bool!(effects.clouds)),
+            item!("fireflies", "fireflies (night)", "Effects", Live, Toggle { default: true }, acc_bool!(effects.fireflies)),
+            item!("fireflies_count", "firefly count", "Effects", Live, StepU { min: 8, max: 64, step: 8, default: 32 }, acc_u32!(effects.fireflies_count)),
+            item!("aniso", "max anisotropy", "Effects", Restart, Cycle { options: &["1", "2", "4", "8", "16"], default_ix: 4 }, acc_u32!(effects.aniso)),
+            item!("mips", "texture mip chains", "Effects", Restart, Toggle { default: true }, acc_bool!(effects.mips)),
+            item!("h2n", "height-to-normal convert", "Effects", Restart, Toggle { default: true }, acc_bool!(effects.h2n)),
+            item!("n2h", "normal-to-height derive", "Effects", Restart, Toggle { default: true }, acc_bool!(effects.n2h)),
+            item!("tinted_shadows", "tinted glass shadows", "Effects", Restart, Toggle { default: true }, acc_bool!(effects.tinted_shadows)),
+            item!("spray", "spray reclassification", "Effects", Restart, Toggle { default: true }, acc_bool!(effects.spray)),
+            item!("depth_tint", "water depth tint", "Effects", Restart, Toggle { default: true }, acc_bool!(effects.depth_tint)),
+            item!("water", "water material class", "Effects", Restart, Toggle { default: true }, acc_bool!(effects.water)),
+            // ── Scene
+            item!("world", "world mode (flagless boot)", "Scene", Restart, Toggle { default: true }, acc_bool!(scene.world)),
+            item!("scene_path", "scene path", "Scene", Restart, Text, acc_str!(scene.scene_path)),
+            // ── Advanced
+            item!("bvh_builder", "BVH builder", "Advanced", Restart, Cycle { options: &["sah", "lbvh", "ploc", "som"], default_ix: 0 }, acc_str!(advanced.bvh_builder)),
+            item!("bvh_ctrav", "BVH SAH traversal cost", "Advanced", Restart, StepF { min: 0.0, max: 8.0, step: 0.5, default: 3.0 }, acc_f32!(advanced.bvh_ctrav)),
+            item!("bvh_maxleaf", "BVH max leaf tris", "Advanced", Restart, StepU { min: 2, max: 32, step: 2, default: 8 }, acc_u32!(advanced.bvh_maxleaf)),
+            item!("bvh_axes", "BVH SAH axes", "Advanced", Restart, Cycle { options: &["1", "3"], default_ix: 1 }, acc_u32!(advanced.bvh_axes)),
+            item!("blas_split", "BLAS split (tris; off = one BLAS)", "Advanced", Restart, Cycle { options: &["off", "64", "4096", "65536", "262144"], default_ix: 3 }, ((|s: &Settings| s.advanced.blas_split.map(|v| if v == 0 { "off".into() } else { v.to_string() })), (|s: &mut Settings, v: &str| {
+                s.advanced.blas_split = if v == "off" { Some(0) } else { v.parse().ok() };
+            }))),
+            item!("ftree", "8-wide frustum tree", "Advanced", Restart, Toggle { default: true }, acc_bool!(advanced.ftree)),
+            item!("ftree_tiles", "wide tree for CPU tiles", "Advanced", Restart, Toggle { default: false }, acc_bool!(advanced.ftree_tiles)),
+            item!("temporal", "temporal reuse", "Advanced", Restart, Toggle { default: true }, acc_bool!(advanced.temporal)),
+            item!("replay", "structure replay", "Advanced", Restart, Toggle { default: true }, acc_bool!(advanced.replay)),
+            item!("adopt", "query skip / cut adoption", "Advanced", Restart, Toggle { default: true }, acc_bool!(advanced.adopt)),
+            item!("discard_seeds", "discard temporal seeds (A/B)", "Advanced", Restart, Toggle { default: false }, acc_bool!(advanced.discard_seeds)),
+            item!("defer_shade", "deferred shading (A/B)", "Advanced", Restart, Toggle { default: false }, acc_bool!(advanced.defer_shade)),
+            item!("hemi_share", "hemi sharing", "Advanced", Restart, Toggle { default: true }, acc_bool!(advanced.hemi_share)),
+            item!("cut_rays", "cut-seeded rays", "Advanced", Restart, Toggle { default: true }, acc_bool!(advanced.cut_rays)),
+            item!("cut_hemi", "cut-seeded hemi rays", "Advanced", Restart, Toggle { default: false }, acc_bool!(advanced.cut_hemi)),
+            item!("bc7", "BC7 texture compression", "Advanced", Restart, Toggle { default: false }, acc_bool!(advanced.bc7)),
+            item!("bc7_quality", "BC7 quality", "Advanced", Restart, Cycle { options: &["ultrafast", "fast", "basic", "slow"], default_ix: 1 }, acc_str!(advanced.bc7_quality)),
+            item!("fsr4_required", "require FSR4 (exit if absent)", "Advanced", Restart, Toggle { default: false }, acc_bool!(advanced.fsr4_required)),
+            item!("gpu_debug", "D3D12 debug layer", "Advanced", Restart, Toggle { default: false }, acc_bool!(advanced.gpu_debug)),
+            item!("pix_markers", "PIX markers", "Advanced", Restart, Toggle { default: false }, acc_bool!(advanced.pix_markers)),
+            item!("gpu_timing", "GPU timestamp table", "Advanced", Restart, Toggle { default: false }, acc_bool!(advanced.gpu_timing)),
+            item!("sl_path", "Streamline DLL dir", "Advanced", Restart, Text, acc_str!(advanced.sl_path)),
+            item!("oidn_path", "OIDN DLL dir", "Advanced", Restart, Text, acc_str!(advanced.oidn_path)),
+            item!("nppd_path", "ONNX Runtime DLL dir", "Advanced", Restart, Text, acc_str!(advanced.nppd_path)),
+            item!("nppd_model", "NPPD model path", "Advanced", Restart, Text, acc_str!(advanced.nppd_model)),
+            item!("xess_path", "XeSS DLL dir", "Advanced", Restart, Text, acc_str!(advanced.xess_path)),
+            item!("ffx_path", "FidelityFX DLL dir", "Advanced", Restart, Text, acc_str!(advanced.ffx_path)),
+            item!("dxc_path", "DXC DLL dir", "Advanced", Restart, Text, acc_str!(advanced.dxc_path)),
+            item!("pix_path", "PIX runtime dir", "Advanced", Restart, Text, acc_str!(advanced.pix_path)),
+        ]
+    })
+}
+
+/// The session's LIVE state, snapshotted by main.rs each menu-visible frame —
+/// what Live-tier rows display, and the base current-value for their adjusts.
+#[derive(Clone, Copy, Default)]
+pub struct LiveView {
+    /// 0 = cpu, 1 = gpu wavefront, 2 = dxr.
+    pub mode: u8,
+    pub hybrid: bool,
+    pub dynamic: bool,
+    pub overlay: bool,
+    pub gpu_tone: bool,
+    pub preset: u32,
+    pub spp: u32,
+    /// 0 off / 1 AO / 2 GI.
+    pub bounce: u32,
+    pub height_armed: bool,
+    pub height_on: bool,
+    pub dlss: bool,
+    pub xess: bool,
+    pub fsr: bool,
+    /// 0 off / 1 on (pre) / 2 post.
+    pub oidn: u8,
+    pub oidn_temporal: bool,
+    pub nppd: bool,
+    pub tod: f32,
+    pub hud: bool,
+    pub bloom: bool,
+    pub clouds: bool,
+    pub fireflies: bool,
+    pub fireflies_count: u32,
+}
+
+/// What a Live-tier adjust does to the session — main.rs maps these onto the
+/// exact key-handler paths (`Edges` synthesis / shared atomics), so reset
+/// semantics cannot drift from the keys.
+pub enum MenuFx {
+    /// Restart-tier: persisted; applies next launch.
+    Restart,
+    /// Synthesize this frame's Edges field (one key press).
+    CycleMode,
+    ToggleHybrid,
+    ToggleDynamic,
+    ToggleOverlay,
+    ToggleGpuTone,
+    ToggleDlss,
+    ToggleXess,
+    ToggleFsr,
+    ToggleOidn,
+    ToggleOidnTemporal,
+    ToggleNppd,
+    ToggleBounce,
+    ToggleHeight,
+    CycleSpp,
+    Quality(u32),
+    SetTod(f32),
+    ToggleBloom,
+    ToggleClouds,
+    ToggleFireflies,
+    FirefliesCount(u32),
+    ToggleHud,
+    None,
+}
+
+/// The value string a row displays.
+pub fn menu_value(item: &MenuItem, s: &Settings, live: &LiveView) -> String {
+    if item.tier == Tier::Live {
+        return match item.id {
+            "hud" => onoff(live.hud),
+            "overlay" => onoff(live.overlay),
+            "gpu_tone" => onoff(live.gpu_tone),
+            "mode" => ["cpu", "gpu", "dxr"][live.mode.min(2) as usize].into(),
+            "preset" => live.preset.to_string(),
+            "spp" => live.spp.to_string(),
+            "bounce" => ["off", "ao", "gi"][live.bounce.min(2) as usize].into(),
+            "hybrid" => onoff(live.hybrid),
+            "dynamic" => onoff(live.dynamic),
+            "height_on" => {
+                if live.height_armed { onoff(live.height_on) } else { "unarmed".into() }
+            }
+            "dlss" => onoff(live.dlss),
+            "xess" => onoff(live.xess),
+            "fsr" => onoff(live.fsr),
+            "oidn" => ["off", "on", "post"][live.oidn.min(2) as usize].into(),
+            "oidn_temporal" => onoff(live.oidn_temporal),
+            "nppd" => onoff(live.nppd),
+            "tod" => format!("{:02}:{:02}", live.tod as u32 % 24, (live.tod.fract() * 60.0) as u32),
+            "bloom" => onoff(live.bloom),
+            "clouds" => onoff(live.clouds),
+            "fireflies" => onoff(live.fireflies),
+            "fireflies_count" => live.fireflies_count.to_string(),
+            _ => "?".into(),
+        };
+    }
+    // Restart tier: the persisted value, or the compiled default.
+    match (item.get)(s) {
+        Some(v) => v,
+        None => match &item.control {
+            Control::Toggle { default } => format!("{} (default)", onoff(*default)),
+            Control::Cycle { options, default_ix } => format!("{} (default)", options[*default_ix]),
+            Control::StepU { default, .. } => format!("{default} (default)"),
+            Control::StepF { default, .. } => format!("{default} (default)"),
+            _ => "(default)".into(),
+        },
+    }
+}
+
+fn onoff(v: bool) -> String {
+    if v { "on" } else { "off" }.to_string()
+}
+
+/// Apply one click/step to a row: persist the new value into `s` (Live rows
+/// persist too — a menu click IS a preference, unlike a key press) and return
+/// the live action for main.rs. `dir` is ±1 (Toggle ignores it).
+pub fn menu_adjust(item: &MenuItem, dir: i32, s: &mut Settings, live: &LiveView) -> MenuFx {
+    if item.tier == Tier::Live {
+        return match item.id {
+            "hud" => {
+                (item.set)(s, &onoff(!live.hud));
+                MenuFx::ToggleHud
+            }
+            "overlay" => MenuFx::ToggleOverlay,
+            "gpu_tone" => MenuFx::ToggleGpuTone,
+            "mode" => {
+                // One SPACE press; the landing mode depends on availability,
+                // so nothing is persisted here (mode is persisted only via
+                // the file's renderer.mode, which advanced users set).
+                MenuFx::CycleMode
+            }
+            "preset" => {
+                let n = (live.preset as i32 + dir).clamp(1, 3) as u32;
+                if n == live.preset {
+                    return MenuFx::None;
+                }
+                (item.set)(s, &n.to_string());
+                MenuFx::Quality(n)
+            }
+            "spp" => {
+                // One U press (the cycle wraps at the top like the key).
+                MenuFx::CycleSpp
+            }
+            "bounce" => MenuFx::ToggleBounce,
+            "hybrid" => MenuFx::ToggleHybrid,
+            "dynamic" => MenuFx::ToggleDynamic,
+            "height_on" => {
+                if live.height_armed { MenuFx::ToggleHeight } else { MenuFx::None }
+            }
+            "dlss" => MenuFx::ToggleDlss,
+            "xess" => MenuFx::ToggleXess,
+            "fsr" => MenuFx::ToggleFsr,
+            "oidn" => {
+                (item.set)(s, &onoff(live.oidn == 0));
+                MenuFx::ToggleOidn
+            }
+            "oidn_temporal" => {
+                (item.set)(s, &onoff(!live.oidn_temporal));
+                MenuFx::ToggleOidnTemporal
+            }
+            "nppd" => {
+                (item.set)(s, &onoff(!live.nppd));
+                MenuFx::ToggleNppd
+            }
+            "tod" => {
+                let step = match &item.control {
+                    Control::StepF { step, .. } => *step,
+                    _ => 0.5,
+                };
+                let t = (live.tod + dir as f32 * step).rem_euclid(24.0);
+                (item.set)(s, &format!("{t}"));
+                MenuFx::SetTod(t)
+            }
+            "bloom" => {
+                (item.set)(s, &onoff(!live.bloom));
+                MenuFx::ToggleBloom
+            }
+            "clouds" => {
+                (item.set)(s, &onoff(!live.clouds));
+                MenuFx::ToggleClouds
+            }
+            "fireflies" => {
+                (item.set)(s, &onoff(!live.fireflies));
+                MenuFx::ToggleFireflies
+            }
+            "fireflies_count" => {
+                let (min, max, step) = match &item.control {
+                    Control::StepU { min, max, step, .. } => (*min, *max, *step),
+                    _ => (8, 64, 8),
+                };
+                let n = (live.fireflies_count as i64 + dir as i64 * step as i64)
+                    .clamp(min as i64, max as i64) as u32;
+                if n == live.fireflies_count {
+                    return MenuFx::None;
+                }
+                (item.set)(s, &n.to_string());
+                MenuFx::FirefliesCount(n)
+            }
+            _ => MenuFx::None,
+        };
+    }
+    // Restart tier: pure Settings edit through the row's control semantics.
+    match &item.control {
+        Control::Toggle { default } => {
+            let cur = (item.get)(s).map(|v| v == "on").unwrap_or(*default);
+            (item.set)(s, &onoff(!cur));
+        }
+        Control::Cycle { options, default_ix } => {
+            let cur = (item.get)(s)
+                .and_then(|v| options.iter().position(|o| *o == v))
+                .unwrap_or(*default_ix);
+            let next = (cur as i32 + dir).rem_euclid(options.len() as i32) as usize;
+            (item.set)(s, options[next]);
+        }
+        Control::StepU { min, max, step, default } => {
+            let cur = (item.get)(s).and_then(|v| v.parse::<u32>().ok()).unwrap_or(*default);
+            let n = (cur as i64 + dir as i64 * *step as i64).clamp(*min as i64, *max as i64) as u32;
+            (item.set)(s, &n.to_string());
+        }
+        Control::StepF { min, max, step, default } => {
+            let cur = (item.get)(s).and_then(|v| v.parse::<f32>().ok()).unwrap_or(*default);
+            let n = (cur + dir as f32 * step).clamp(*min, *max);
+            (item.set)(s, &format!("{n}"));
+        }
+        _ => {}
+    }
+    MenuFx::Restart
+}
+
+/// Free-text commit (Text rows — paths, scene). Restart-tier by construction.
+pub fn menu_text_edit(item: &MenuItem, value: &str, s: &mut Settings) -> MenuFx {
+    if matches!(item.control, Control::Text) {
+        (item.set)(s, value.trim());
+        return MenuFx::Restart;
+    }
+    MenuFx::None
+}
+
+pub fn item_by_id(id: &str) -> Option<&'static MenuItem> {
+    menu_items().iter().find(|i| i.id == id)
+}
+
+// ---------------------------------------------------------------------------
 // Self-test (run by --check — DLL-free, pure)
 // ---------------------------------------------------------------------------
 
@@ -859,6 +1298,71 @@ pub fn self_test() -> Result<(), String> {
     }
     for q in ["ultrafast", "fast", "basic", "slow"] {
         crate::bc7::Quality::parse(q).ok_or_else(|| format!("bc7 vocab '{q}' rejected"))?;
+    }
+
+    // Menu descriptor invariants: unique ids, known groups, valid cycle
+    // defaults, and every restart-tier Cycle vocabulary accepted by the SAME
+    // consumer the startup apply path uses — the menu cannot offer an option
+    // the file loader would warn-and-ignore.
+    let items = menu_items();
+    let mut seen = std::collections::HashSet::new();
+    for it in items {
+        if !seen.insert(it.id) {
+            return Err(format!("menu id '{}' duplicated", it.id));
+        }
+        if !GROUPS.contains(&it.group) {
+            return Err(format!("menu id '{}' names unknown group '{}'", it.id, it.group));
+        }
+        if let Control::Cycle { options, default_ix } = &it.control {
+            if *default_ix >= options.len() {
+                return Err(format!("menu id '{}' default_ix out of range", it.id));
+            }
+        }
+        let ok = match (it.id, &it.control) {
+            ("chain", Control::Cycle { options, .. }) => {
+                options.iter().all(|o| parse_chain(o).is_some())
+            }
+            ("lock_res", Control::Cycle { options, .. }) => {
+                options.iter().all(|o| *o == "dynamic" || crate::xess::lock_scale(o).is_some())
+            }
+            ("prefer", Control::Cycle { options, .. }) => {
+                options.iter().all(|o| parse_prefer(o).is_some())
+            }
+            ("oidn_device", Control::Cycle { options, .. }) => {
+                options.iter().all(|o| parse_oidn_device(o).is_some())
+            }
+            ("oidn_quality", Control::Cycle { options, .. }) => {
+                options.iter().all(|o| parse_oidn_quality(o).is_some())
+            }
+            ("nppd_device", Control::Cycle { options, .. }) => {
+                options.iter().all(|o| parse_nppd_device(o).is_some())
+            }
+            ("bc7_quality", Control::Cycle { options, .. }) => {
+                options.iter().all(|o| crate::bc7::Quality::parse(o).is_some())
+            }
+            ("bvh_builder", Control::Cycle { options, .. }) => {
+                options.iter().all(|o| matches!(*o, "sah" | "lbvh" | "ploc" | "som"))
+            }
+            _ => true,
+        };
+        if !ok {
+            return Err(format!("menu id '{}' offers an option its consumer rejects", it.id));
+        }
+    }
+    // A restart Toggle round-trips through its accessors: adjust flips from
+    // the compiled default, a second adjust flips back.
+    let vsync = item_by_id("vsync").ok_or("menu item 'vsync' missing")?;
+    let mut probe = Settings::default();
+    let live = LiveView::default();
+    if !matches!(menu_adjust(vsync, 1, &mut probe, &live), MenuFx::Restart) {
+        return Err("restart-tier adjust did not report Restart".into());
+    }
+    if probe.display.vsync != Some(false) {
+        return Err("vsync adjust from default(true) should persist Some(false)".into());
+    }
+    menu_adjust(vsync, 1, &mut probe, &live);
+    if probe.display.vsync != Some(true) {
+        return Err("second vsync adjust should flip back to Some(true)".into());
     }
 
     // The headless predicate: gates must never see the file.

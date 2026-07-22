@@ -3,6 +3,14 @@
 //! deliberately does NOT live here: SDL state only updates at pump time and
 //! the main thread blocks for whole traces, so flight is integrated at
 //! 500 Hz wall-clock on the flycam thread (src/flycam.rs) instead.
+//!
+//! Two modes, switched by the pause menu (`poll`'s `menu` argument): menu
+//! CLOSED = the historical toggle-edge drain; menu OPEN = window-level
+//! events (quit/resize/display/F11) and ESC keep their edges, and EVERY
+//! other event is translated + dispatched into the Slint menu
+//! (hud/events.rs) — toggle keys structurally cannot fire under the menu.
+//! Note this only silences SDL-side toggles: the flycam thread reads raw OS
+//! key state and is separately paused by the menu's state machine.
 
 use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
@@ -12,6 +20,9 @@ use sdl2::EventPump;
 #[derive(Default)]
 pub struct Edges {
     pub quit: bool,
+    /// ESC — opens the pause menu (closed) / back / close (open). The menu
+    /// path is what quit used to be; window-X still sets `quit`.
+    pub esc: bool,
     pub toggle_hybrid: bool,   // R
     pub toggle_dynamic: bool,  // T
     pub toggle_overlay: bool,  // O
@@ -32,6 +43,7 @@ pub struct Edges {
     pub capture_frustum: bool, // Y (freeze the current view's quadtree frustums as scene geometry)
     pub clear_frustum: bool,   // Z (remove the frozen frustum snapshot)
     pub quality: Option<u32>,  // 1/2/3
+    pub toggle_hud: bool,      // F1 (compass/clock/keymap overlay)
     pub toggle_fullscreen: bool, // F11 (borderless desktop fullscreen)
     /// Newest window client size from this frame's SizeChanged events
     /// (maximize, restore, fullscreen, drag — the last event in the drain
@@ -49,6 +61,39 @@ pub struct Edges {
     pub display_changed: bool,
 }
 
+impl Edges {
+    /// OR another frame's edges in (the pause menu synthesizes key edges so
+    /// its rows ride the exact key-handler reset semantics).
+    pub fn merge(&mut self, o: &Edges) {
+        self.quit |= o.quit;
+        self.esc |= o.esc;
+        self.toggle_hybrid |= o.toggle_hybrid;
+        self.toggle_dynamic |= o.toggle_dynamic;
+        self.toggle_overlay |= o.toggle_overlay;
+        self.toggle_gpu_tone |= o.toggle_gpu_tone;
+        self.toggle_dlss |= o.toggle_dlss;
+        self.toggle_xess |= o.toggle_xess;
+        self.toggle_fsr |= o.toggle_fsr;
+        self.toggle_oidn |= o.toggle_oidn;
+        self.toggle_nppd |= o.toggle_nppd;
+        self.toggle_dxr |= o.toggle_dxr;
+        self.cycle_mode |= o.cycle_mode;
+        self.toggle_temporal |= o.toggle_temporal;
+        self.toggle_bounce |= o.toggle_bounce;
+        self.toggle_height |= o.toggle_height;
+        self.verify |= o.verify;
+        self.screenshot |= o.screenshot;
+        self.cycle_spp |= o.cycle_spp;
+        self.capture_frustum |= o.capture_frustum;
+        self.clear_frustum |= o.clear_frustum;
+        self.quality = self.quality.or(o.quality);
+        self.toggle_hud |= o.toggle_hud;
+        self.toggle_fullscreen |= o.toggle_fullscreen;
+        self.size_changed = self.size_changed.or(o.size_changed);
+        self.display_changed |= o.display_changed;
+    }
+}
+
 pub struct Input {
     pump: EventPump,
 }
@@ -59,13 +104,59 @@ impl Input {
     }
 
     /// Drain the event queue, collecting edges. Call once per frame.
-    pub fn poll(&mut self) -> Edges {
+    /// `menu` = Some while the pause menu is open — see the module header.
+    pub fn poll(&mut self, menu: Option<&crate::hud::Hud>) -> Edges {
         let mut e = Edges::default();
         for ev in self.pump.poll_iter() {
-            match ev {
-                Event::Quit { .. } => e.quit = true,
-                Event::KeyDown { keycode: Some(k), repeat: false, .. } => match k {
-                    Keycode::Escape => e.quit = true,
+            // Window-level events keep their edges in BOTH modes: quitting,
+            // resizing, and monitor changes must work under an open menu.
+            match &ev {
+                Event::Quit { .. } => {
+                    e.quit = true;
+                    continue;
+                }
+                Event::Window {
+                    win_event: sdl2::event::WindowEvent::SizeChanged(w, h), ..
+                } => {
+                    e.size_changed = Some(((*w).max(0) as u32, (*h).max(0) as u32));
+                    continue;
+                }
+                Event::Window {
+                    win_event:
+                        sdl2::event::WindowEvent::DisplayChanged(_)
+                        | sdl2::event::WindowEvent::Moved(_, _),
+                    ..
+                } => {
+                    e.display_changed = true;
+                    continue;
+                }
+                _ => {}
+            }
+            if let Some(hud) = menu {
+                // Menu open: ESC/F11 stay ours, everything else goes to Slint.
+                match &ev {
+                    Event::KeyDown { keycode: Some(Keycode::Escape), repeat: false, .. } => {
+                        e.esc = true
+                    }
+                    Event::KeyDown { keycode: Some(Keycode::F11), repeat: false, .. } => {
+                        e.toggle_fullscreen = true
+                    }
+                    _ => {
+                        if matches!(
+                            &ev,
+                            Event::MouseButtonDown { .. } | Event::MouseButtonUp { .. }
+                        ) && std::env::var_os("FRUSTRACER_HUD_STATS").is_some()
+                        {
+                            eprintln!("hud-input: {ev:?}");
+                        }
+                        crate::hud::events::forward(hud.slint_window(), &ev)
+                    }
+                }
+                continue;
+            }
+            if let Event::KeyDown { keycode: Some(k), repeat: false, .. } = ev {
+                match k {
+                    Keycode::Escape => e.esc = true,
                     Keycode::R => e.toggle_hybrid = true,
                     Keycode::T => e.toggle_dynamic = true,
                     Keycode::O => e.toggle_overlay = true,
@@ -88,19 +179,10 @@ impl Input {
                     Keycode::Num1 | Keycode::Kp1 => e.quality = Some(1),
                     Keycode::Num2 | Keycode::Kp2 => e.quality = Some(2),
                     Keycode::Num3 | Keycode::Kp3 => e.quality = Some(3),
+                    Keycode::F1 => e.toggle_hud = true,
                     Keycode::F11 => e.toggle_fullscreen = true,
                     _ => {}
-                },
-                Event::Window {
-                    win_event: sdl2::event::WindowEvent::SizeChanged(w, h), ..
-                } => e.size_changed = Some((w.max(0) as u32, h.max(0) as u32)),
-                Event::Window {
-                    win_event:
-                        sdl2::event::WindowEvent::DisplayChanged(_)
-                        | sdl2::event::WindowEvent::Moved(_, _),
-                    ..
-                } => e.display_changed = true,
-                _ => {}
+                }
             }
         }
         e

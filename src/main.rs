@@ -26,6 +26,10 @@ mod input;
 // shared camera); Win32-only by nature, like the window it serves.
 #[cfg(windows)]
 mod flycam;
+// Slint-software-rendered HUD (compass/clock/keymap) + pause menu, dirty-rect
+// composited over every present arm by gpu/hud.rs.
+#[cfg(windows)]
+mod hud;
 mod matclass;
 // OIDN loads its DLLs through the Win32 loader; the denoiser itself is
 // CPU/GPU-agnostic but the SDK drop and load path here are Windows-only.
@@ -1696,10 +1700,10 @@ fn main() {
         _ => Vec::new(),
     };
     #[cfg(windows)]
-    run_window(&mut scene, &mut bvh, &opts, cam0, attractors);
+    run_window(&mut scene, &mut bvh, &opts, cam0, attractors, file_settings);
     #[cfg(not(windows))]
     {
-        let _ = (&opts, cam0, attractors);
+        let _ = (&opts, cam0, attractors, file_settings);
         eprintln!("the interactive window requires Windows (D3D12 + DLSS); use --check / --check-dlss");
         std::process::exit(2);
     }
@@ -10819,6 +10823,35 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     }
 }
 
+/// Build one settings page's rows for the pause menu: the declarative
+/// descriptor (settings::menu_items) rendered against the live session state
+/// + the persisted file. Control tags mirror settings::Control for the
+/// markup's row dispatch.
+#[cfg(windows)]
+fn build_menu_rows(
+    cfg: &settings::Settings,
+    live: &settings::LiveView,
+    group: &str,
+) -> Vec<hud::MenuRow> {
+    settings::menu_items()
+        .iter()
+        .filter(|i| i.group == group)
+        .map(|i| hud::MenuRow {
+            id: i.id.to_string(),
+            label: i.label.to_string(),
+            value: settings::menu_value(i, cfg, live),
+            restart: i.tier == settings::Tier::Restart,
+            control: match i.control {
+                settings::Control::Toggle { .. } => "toggle",
+                settings::Control::Cycle { .. } => "cycle",
+                settings::Control::CycleFwd => "cyclefwd",
+                settings::Control::StepU { .. } | settings::Control::StepF { .. } => "step",
+                settings::Control::Text => "text",
+            },
+        })
+        .collect()
+}
+
 /// Extract the Win32 HWND from the SDL2 window for swapchain creation.
 #[cfg(windows)]
 fn sdl_hwnd(window: &sdl2::video::Window) -> windows::Win32::Foundation::HWND {
@@ -11044,15 +11077,21 @@ fn run_window(
     opts: &Opts,
     cam0: Camera,
     attractors: Vec<flycam::TodAttractor>,
+    file_settings: settings::Settings,
 ) {
     // Opt into per-monitor DPI awareness so Windows doesn't stretch the window
     // on scaled displays — W×H stays W×H physical pixels, matching the swapchain.
     sdl2::hint::set("SDL_WINDOWS_DPI_AWARENESS", "permonitorv2");
+    // Deliver the click that lands on an unfocused window instead of
+    // swallowing it as an activation click (SDL's default). Standard for
+    // game windows — with a pause menu on screen, the first click back into
+    // the window should press the button it hit, not vanish.
+    sdl2::hint::set("SDL_MOUSE_FOCUS_CLICKTHROUGH", "1");
     let sdl = sdl2::init().expect("SDL init failed");
     let video = sdl.video().expect("SDL video failed");
     let mut window = video
         .window(
-            "frustracer — SPACE: cpu/gpu/dxr  R: hybrid/plain  T: dynamic-res  O: overlay  B: gpu-tonemap  G: dlss  X: xess  N: oidn  H: hemi-bounce  1-3: quality  C: verify  P: screenshot",
+            "frustracer — SPACE: cpu/gpu/dxr  R: hybrid/plain  T: dynamic-res  O: overlay  B: gpu-tonemap  G: dlss  X: xess  N: oidn  H: hemi-bounce  1-3: quality  C: verify  P: screenshot  F1: hud",
             W as u32,
             H as u32,
         )
@@ -11080,6 +11119,26 @@ fn run_window(
     };
     let mut gpu = gpu::GpuContext::new(sdl_hwnd(&window), W as u32, H as u32, &gopts)
         .expect("GPU init failed");
+    // The Slint HUD lives at run_window scope like `fly` — one per process
+    // (set_platform is once), surviving session re-entries so menu/HUD state
+    // needs no Persist mirror. Initial visibility from the settings file
+    // (display.hud), default on. A failed init disables the HUD loudly and
+    // the session runs without it — the SDK-fallback shape.
+    let mut hud = match hud::Hud::new(
+        W as u32,
+        H as u32,
+        file_settings.display.hud.unwrap_or(true),
+    ) {
+        Ok(h) => Some(h),
+        Err(e) => {
+            eprintln!("hud: disabled — {e}");
+            None
+        }
+    };
+    // The pause menu owns the settings from here: menu edits mutate + save
+    // this struct (auto-save on change); the pre-parse apply in main()
+    // already consumed the startup values.
+    let mut cfg = file_settings;
     // The adapter is only now a fact rather than a preference, so this is the
     // first point a hardware-keyed default can be honest. Everything downstream
     // reads the adjusted copy; `opts` shadows the parameter so no site can
@@ -11133,8 +11192,10 @@ fn run_window(
     let (mut w, mut h) = (W, H);
     let mut persist: Option<Persist> = None;
     loop {
-        match session(scene, bvh, opts, &fly, &mut window, &mut inp, &mut gpu, &mut persist, w, h)
-        {
+        match session(
+            scene, bvh, opts, &fly, &mut window, &mut inp, &mut gpu, &mut hud, &mut cfg,
+            &mut persist, w, h,
+        ) {
             SessionEnd::Quit => break,
             SessionEnd::Resize(nw, nh) => {
                 // No frames from here until the next session's loop starts.
@@ -11142,6 +11203,11 @@ fn run_window(
                 if let Err(e) = gpu.resize_output(nw, nh, &gopts) {
                     eprintln!("resize: rebuild at {nw}x{nh} failed ({e}); exiting");
                     break;
+                }
+                if let Some(hd) = hud.as_mut() {
+                    // New Slint buffer + forced full-window dirty: the GPU
+                    // overlay texture was just rebuilt undefined.
+                    hd.set_size(nw, nh);
                 }
                 (w, h) = (nw as usize, nh as usize);
                 eprintln!("window: resized to {nw}x{nh}");
@@ -11171,6 +11237,8 @@ fn session(
     window: &mut sdl2::video::Window,
     inp: &mut input::Input,
     gpu: &mut gpu::GpuContext,
+    hud: &mut Option<hud::Hud>,
+    cfg: &mut settings::Settings,
     persist: &mut Option<Persist>,
     w: usize,
     h: usize,
@@ -11221,7 +11289,12 @@ fn session(
     let mut gpu_tonemap = p0.map_or(false, |p| p.gpu_tonemap);
     // Hemisphere frustum bounces (H cycles off → AO → GI): still-frame
     // quality — moving/DLSS frames keep the sampled path.
-    let mut bounce_mode = p0.map_or(0u32, |p| p.bounce_mode);
+    let mut bounce_mode = p0.map_or_else(
+        // First entry: the settings file's saved bounce (no CLI flag exists);
+        // re-entries restore the live state like every other toggle.
+        || cfg.renderer.bounce.as_deref().and_then(settings::parse_bounce).unwrap_or(0),
+        |p| p.bounce_mode,
+    );
     // Heightfield relief vs normal-mapped (V; starts OFF — plain
     // normal-mapping is the default mode — unless --heightfield opted in).
     // Seeded from the flag-state static (height_on(), NOT height_armed():
@@ -11229,7 +11302,10 @@ fn session(
     // the intersector reads is stored here and at every V edge.
     let mut height_on = p0.map_or(bvh::height_on(), |p| p.height_on);
     bvh::set_height_on(height_on);
-    let mut preset = p0.map_or(2u32, |p| p.preset);
+    let mut preset = p0.map_or_else(
+        || cfg.renderer.preset.filter(|n| (1..=3).contains(n)).unwrap_or(2),
+        |p| p.preset,
+    );
     // Samples per pixel per frame (--spp seeds it, U cycles). Every mode reads
     // it; FrameCtx::spp()/the GPU kernels pin it to 1 on fb (H) frames.
     let mut spp = p0.map_or(opts.spp, |p| p.spp);
@@ -11964,15 +12040,22 @@ fn session(
     // line — kernel compile, scene upload, BLAS build — presented nothing.
     // No baseline re-sync is needed: a paused span integrates nothing, so the
     // pose `prev_snap` captured at init is still the shared camera's pose.
-    fly.resume();
+    // EXCEPT under an open pause menu (a resize/F11 re-entry can happen with
+    // the menu up): the menu owns the pause until it closes.
+    if hud.as_ref().is_none_or(|hd| !hd.menu_open()) {
+        fly.resume();
+    }
+    // Settings rows need (re)building: menu open, group/page change, or an
+    // edit whose live effect lands a frame later (rebuild after handlers ran).
+    let mut menu_rows_stale = true;
 
     let end = loop {
         let now = Instant::now();
 
-        let edges = inp.poll();
-        if edges.quit {
-            break SessionEnd::Quit;
-        }
+        // Menu OPEN routes events to Slint (toggle keys can't fire); the
+        // quit check moves BELOW the menu drain so the menu's Exit button
+        // (which arrives as a drained action) breaks the same way.
+        let mut edges = inp.poll(hud.as_ref().filter(|hd| hd.menu_open()));
         if edges.toggle_fullscreen {
             // Borderless desktop fullscreen (F11) — the resulting
             // SizeChanged flows through the same debounce below.
@@ -11999,6 +12082,163 @@ fn session(
                     break SessionEnd::Resize(dw, dh);
                 }
             }
+        }
+        // ── Pause menu (ESC): state machine + settings-row plumbing. Live
+        // rows apply through SYNTHESIZED Edges fields (the exact key-handler
+        // paths below — reset semantics cannot drift); restart rows edit the
+        // settings file only. Every menu edit auto-saves; keyboard toggles
+        // deliberately never persist. Opening pauses the flycam (it reads
+        // raw OS key state — typing in a text field must not fly the
+        // camera); closing resumes it.
+        let mut menu_live_edit = false;
+        if let Some(hd) = hud.as_mut() {
+            if edges.esc {
+                if hd.menu_open() {
+                    if !hd.escape() {
+                        hd.close_menu();
+                        fly.resume();
+                        window.subsystem().text_input().stop();
+                    }
+                } else {
+                    hd.open_menu();
+                    menu_rows_stale = true;
+                    fly.pause();
+                    // Printable characters reach Slint via SDL TextInput.
+                    window.subsystem().text_input().start();
+                }
+            }
+            // Live state snapshot for row display + adjust baselines.
+            let live = settings::LiveView {
+                mode: if gpu_trace { 1 } else if dxr_on { 2 } else { 0 },
+                hybrid,
+                dynamic,
+                overlay: overlay_on,
+                gpu_tone: gpu_tonemap,
+                preset,
+                spp,
+                bounce: bounce_mode,
+                height_armed: bvh::height_armed(),
+                height_on,
+                dlss: dlss_on
+                    || (gpu_trace && gpu_up == GpuUp::Rr)
+                    || (dxr_on && dxr_up == GpuUp::Rr),
+                xess: xess_on
+                    || (gpu_trace && gpu_up == GpuUp::Xess)
+                    || (dxr_on && dxr_up == GpuUp::Xess),
+                fsr: fsr_on
+                    || (gpu_trace && matches!(gpu_up, GpuUp::Fsr4 | GpuUp::Fsr3))
+                    || (dxr_on && matches!(dxr_up, GpuUp::Fsr4 | GpuUp::Fsr3)),
+                oidn: if oidn_on || xess_oidn == XessOidn::Pre {
+                    1
+                } else if xess_oidn == XessOidn::Post {
+                    2
+                } else {
+                    0
+                },
+                oidn_temporal,
+                nppd: nppd_on || xess_nppd,
+                tod: cur_tod,
+                hud: hd.visible(),
+                bloom: bloom::enabled(),
+                clouds: clouds::enabled(),
+                fireflies: fireflies::enabled(),
+                fireflies_count: fireflies::count(),
+            };
+            if hd.menu_open() && menu_rows_stale {
+                menu_rows_stale = false;
+                let group = hd.group().to_string();
+                hd.set_rows(build_menu_rows(cfg, &live, &group));
+            }
+            for act in hd.take_actions() {
+                match act {
+                    hud::HudAction::Resume => {
+                        hd.close_menu();
+                        fly.resume();
+                        window.subsystem().text_input().stop();
+                    }
+                    hud::HudAction::Quit => edges.quit = true,
+                    hud::HudAction::OpenSettings => {
+                        hd.open_settings_page();
+                        menu_rows_stale = true;
+                    }
+                    hud::HudAction::Back => hd.back_to_main(),
+                    hud::HudAction::Group(g) => {
+                        hd.set_group(&g);
+                        menu_rows_stale = true;
+                    }
+                    hud::HudAction::Adjust(id, dir) => {
+                        if let Some(item) = settings::item_by_id(&id) {
+                            match settings::menu_adjust(item, dir, cfg, &live) {
+                                settings::MenuFx::Restart => {
+                                    eprintln!("settings: '{id}' saved — applies on next launch");
+                                }
+                                settings::MenuFx::CycleMode => edges.cycle_mode = true,
+                                settings::MenuFx::ToggleHybrid => edges.toggle_hybrid = true,
+                                settings::MenuFx::ToggleDynamic => edges.toggle_dynamic = true,
+                                settings::MenuFx::ToggleOverlay => edges.toggle_overlay = true,
+                                settings::MenuFx::ToggleGpuTone => edges.toggle_gpu_tone = true,
+                                settings::MenuFx::ToggleDlss => edges.toggle_dlss = true,
+                                settings::MenuFx::ToggleXess => edges.toggle_xess = true,
+                                settings::MenuFx::ToggleFsr => edges.toggle_fsr = true,
+                                settings::MenuFx::ToggleOidn => edges.toggle_oidn = true,
+                                settings::MenuFx::ToggleOidnTemporal => {
+                                    edges.toggle_temporal = true
+                                }
+                                settings::MenuFx::ToggleNppd => edges.toggle_nppd = true,
+                                settings::MenuFx::ToggleBounce => edges.toggle_bounce = true,
+                                settings::MenuFx::ToggleHeight => edges.toggle_height = true,
+                                settings::MenuFx::CycleSpp => edges.cycle_spp = true,
+                                settings::MenuFx::Quality(n) => edges.quality = Some(n),
+                                settings::MenuFx::SetTod(t) => fly.set_tod(t),
+                                settings::MenuFx::ToggleBloom => {
+                                    // Display-stage — deliberately NO reset
+                                    // (the --no-bloom bit-identity argument).
+                                    bloom::set_enabled(!bloom::enabled());
+                                }
+                                settings::MenuFx::ToggleClouds => {
+                                    // Shading change: plain accumulation only,
+                                    // histories kept (the TOD-scrub precedent).
+                                    clouds::set_enabled(!clouds::enabled());
+                                    frame = 0;
+                                }
+                                settings::MenuFx::ToggleFireflies => {
+                                    fireflies::set_enabled(!fireflies::enabled());
+                                    frame = 0;
+                                }
+                                settings::MenuFx::FirefliesCount(n) => {
+                                    fireflies::set_count(n);
+                                    frame = 0;
+                                }
+                                settings::MenuFx::ToggleHud => edges.toggle_hud = true,
+                                settings::MenuFx::None => {}
+                            }
+                            settings::save(cfg);
+                            menu_rows_stale = true;
+                            menu_live_edit = true;
+                        }
+                    }
+                    hud::HudAction::TextEdit(id, v) => {
+                        if let Some(item) = settings::item_by_id(&id) {
+                            if matches!(
+                                settings::menu_text_edit(item, &v, cfg),
+                                settings::MenuFx::Restart
+                            ) {
+                                eprintln!("settings: '{id}' saved — applies on next launch");
+                                settings::save(cfg);
+                                menu_rows_stale = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if edges.quit {
+            break SessionEnd::Quit;
+        }
+        // ESC with no HUD (Slint init failed): the menu can't exist, so keep
+        // the historical quit semantics rather than a dead key.
+        if edges.esc && hud.is_none() {
+            break SessionEnd::Quit;
         }
         // One pose snapshot per iteration: everything this frame does (trace,
         // MVs, prev-camera captures, verify) reads this copy, so trace pose ==
@@ -12034,6 +12274,50 @@ fn session(
             scene::apply_tod(scene, cur_tod);
             gpu.refresh_sky(scene);
             frame = 0;
+        }
+        // ── HUD overlay (compass / clock / motion-gated keymap). Purely
+        // display-stage: Slint software-renders into its persistent CPU
+        // buffer, only the DIRTY RECTS are staged for upload, and the
+        // composite draw rides fullscreen_to_backbuffer in EVERY present arm
+        // below — no render/accum/temporal state is touched, so F1 needs no
+        // reset of any kind. An unchanged HUD stages nothing (zero raster,
+        // zero bytes); staging continues while hidden so re-showing needs no
+        // special case.
+        if let Some(hd) = hud.as_mut() {
+            if edges.toggle_hud {
+                hd.set_visible(!hd.visible());
+                eprintln!("hud: {} (F1 toggles)", if hd.visible() { "ON" } else { "OFF" });
+            }
+            if let Some(hf) = hd.frame(&cam, cur_tod, moved) {
+                gpu.hud_stage(hf);
+            }
+            gpu.set_hud_visible(hd.visible() || hd.menu_open());
+        }
+        // ── Pause-menu hold: while the menu is open, skip tracing/upscaler
+        // evaluation entirely and re-present the last frame + the overlay at
+        // fast cadence — the menu repaints at ~140 Hz instead of the trace
+        // cadence, and "pause" genuinely pauses (no history advances, no
+        // accumulation, camera frozen by the flycam pause). Falls through to
+        // a normal frame when: a live menu edit needs its key handler to run
+        // (the user then SEES the setting change behind the menu), the TOD
+        // was just set (apply_tod + one real frame), nothing was ever
+        // presented, or the re-present source was dropped.
+        if hud.as_ref().is_some_and(|hd| hd.menu_open()) && !menu_live_edit && !sun_moved {
+            match gpu.present_again() {
+                Ok(()) => {
+                    std::thread::sleep(std::time::Duration::from_millis(7));
+                    continue;
+                }
+                Err(_) => {
+                    // First-open before any present, or the source was
+                    // dropped: fall through to a normal frame — and since a
+                    // failed attempt may have consumed staged dirty rects,
+                    // re-upload everything next frame.
+                    if let Some(hd) = hud.as_mut() {
+                        hd.request_full_redraw();
+                    }
+                }
+            }
         }
         // ── Frozen frustum snapshot (Y captures / replaces, Z clears).
         // Freeze the current view's terminal quadtree as emissive near-plane

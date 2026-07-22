@@ -19,6 +19,9 @@ pub mod ffx_rr;
 pub mod ffx_sys;
 pub mod ffx_up;
 pub mod gputime;
+/// The HUD/menu overlay's GPU half: dirty-rect texture uploads + the
+/// premultiplied composite draw inside `fullscreen_to_backbuffer`.
+pub mod hud;
 pub mod pix;
 /// `--quinlight`: the registered-consensus fuse of every wired upscaler.
 pub mod quin;
@@ -187,6 +190,14 @@ pub struct GpuContext {
     bloom: bloom::BloomGpu,
     blit: upload::BlitUpload,
     hdr: upload::HdrUpload,
+    /// The HUD/menu overlay (gpu/hud.rs): window-sized premultiplied RGBA8,
+    /// dirty-rect-uploaded, composited by `fullscreen_to_backbuffer` in every
+    /// present arm. Always built (cheap); `visible` gates the draw.
+    hud: hud::HudGpu,
+    /// What `fullscreen_to_backbuffer` last presented `(use_tonemap, srv_slot,
+    /// inv_samples)` — `present_again`'s re-present source (the pause menu
+    /// holds the frame without tracing). Cell: the recorder is `&self`.
+    last_present: std::cell::Cell<Option<(bool, u32, f32)>>,
     /// The GPU-resident tracer (--gpu): quadtree + shading in compute with
     /// RayQuery rays. Lives on whatever device the queue runs on (v1 forces
     /// the native pipeline — main.rs disables DLSS/XeSS/OIDN under --gpu).
@@ -426,6 +437,10 @@ impl GpuContext {
             upload::BlitUpload::new(&d3d, w, h)?
         };
         let hdr = upload::HdrUpload::new(&d3d, w, h)?;
+        // The HUD overlay (SRV slot 9): not a tonemap source — bloom never
+        // reads it — so a plain create_srv inside HudGpu::new, never
+        // wire_tonemap_src.
+        let hud = hud::HudGpu::new(&d3d.device, &passes, d3d.format, w, h)?;
         let rr_res = if sl.is_some() {
             let r = rr::RrResources::new(&d3d.device, rr_opt, rr_min, rr_max, w, h)?;
             wire_tonemap_src(
@@ -466,6 +481,8 @@ impl GpuContext {
             bloom,
             blit,
             hdr,
+            hud,
+            last_present: std::cell::Cell::new(None),
             trace: None,
             dxr: None,
             rr: rr_res,
@@ -731,6 +748,15 @@ impl GpuContext {
             upload::BlitUpload::new(&self.d3d, w, h)?
         };
         self.hdr = upload::HdrUpload::new(&self.d3d, w, h)?;
+        // The HUD overlay is window-sized: new texture (fresh SRV in slot 9),
+        // new ring, content undefined until crate::hud's forced full-window
+        // frame lands. Carry the visibility flag across.
+        let hud_visible = self.hud.visible.get();
+        self.hud = hud::HudGpu::new(&self.d3d.device, &self.passes, self.d3d.format, w, h)?;
+        self.hud.visible.set(hud_visible);
+        // A resize invalidates the last-present record: every source it could
+        // name is being rebuilt at the new size.
+        self.last_present.set(None);
         // The glare pyramid is window-sized; rebuild it and re-point the tonemap's
         // halo SRV at the new level 0 (the old resource is gone).
         self.bloom.set_res(&self.d3d.device, w, h)?;
@@ -3146,6 +3172,14 @@ impl GpuContext {
     /// signature change at 16 call sites. Glare is likewise applied here and
     /// nowhere else, on whatever this frame's tonemap source turns out to be.
     fn fullscreen_to_backbuffer(&self, use_tonemap: bool, srv_slot: u32, inv_samples: f32) {
+        // HUD overlay dirty rects: consume whatever the frame staged. Recorded
+        // BEFORE the backbuffer transition (any point in the list before the
+        // draws is fine — begin_frame's fence wait already made this slot's
+        // ring memory safe). Runs even while the HUD is hidden, so the texture
+        // stays current and re-showing needs no special case.
+        let hud_slot = self.d3d.frame_index % d3d12::FRAMES_IN_FLIGHT;
+        self.hud.record_upload(&self.d3d.list, hud_slot);
+
         // Glare (src/bloom.rs): a display-stage pass on whatever the tonemap is
         // about to read, so EVERY GPU chain — RR, XeSS, FSR, plain, DXR — gets it
         // from this one place, and nothing upstream (accum, the temporal cache,
@@ -3200,6 +3234,25 @@ impl GpuContext {
             self.d3d.width,
             self.d3d.height,
         );
+        // The HUD/menu composite: a second fullscreen draw over the tonemapped
+        // frame while the backbuffer is still a render target — this ONE
+        // insertion covers every present arm. `Passes::record` rebinds
+        // everything, so the extra draw needs no state bookkeeping; the hud
+        // PSO blends premultiplied-over and its PS reads only the
+        // scale/gamma_on lanes of the shared root-constant layout.
+        if self.hud.drawable() {
+            self.passes.record(
+                &self.d3d.list,
+                &self.hud.pso,
+                tonemap::SRV_SLOT_OVERLAY,
+                1.0,
+                (0.0, 0.0, 0.0),
+                self.tone,
+                self.d3d.rtv_handle(bb),
+                self.d3d.width,
+                self.d3d.height,
+            );
+        }
         unsafe {
             self.d3d.list.ResourceBarrier(&[transition(
                 backbuffer,
@@ -3210,6 +3263,44 @@ impl GpuContext {
         if bloom.0 > 0.0 {
             self.bloom.restore(&self.d3d.list);
         }
+        // Remember what was presented so `present_again` (the pause menu's
+        // trace-free hold) can re-run this exact call.
+        self.last_present.set(Some((use_tonemap, srv_slot, inv_samples)));
+    }
+
+    /// Stage a HUD frame's dirty rects for the next recorded present (main
+    /// loop, once per frame, before the present arm runs).
+    pub fn hud_stage(&self, frame: crate::hud::HudFrame) {
+        self.hud.stage(frame);
+    }
+
+    /// Whether the HUD composite draw runs (fed per frame from the session's
+    /// HUD state; staging continues regardless).
+    pub fn set_hud_visible(&self, on: bool) {
+        self.hud.visible.set(on);
+    }
+
+    /// Re-present the last presented image + the current HUD overlay without
+    /// tracing, evaluating any upscaler, or advancing any history — the
+    /// pause-menu hold, generalizing `present_hold`/`present_dxr_hold` to
+    /// every arm (every tonemap source rests in PIXEL_SHADER_RESOURCE between
+    /// frames). Errs when nothing was ever presented or the recorded source
+    /// no longer exists (a mode switch dropped its textures) — the caller
+    /// falls back to rendering a normal frame.
+    pub fn present_again(&mut self) -> Result<()> {
+        let Some((use_tonemap, srv_slot, inv_samples)) = self.last_present.get() else {
+            return Err("nothing presented yet".into());
+        };
+        // The blit/hdr uploads always exist; every other slot's source is
+        // owned by an Option field that a mode switch may have dropped.
+        let src_alive = matches!(srv_slot, tonemap::SRV_SLOT_BLIT | tonemap::SRV_SLOT_HDR)
+            || self.tonemap_source(srv_slot).is_some();
+        if !src_alive {
+            return Err("last-present source was dropped".into());
+        }
+        let slot = self.d3d.begin_frame()?;
+        self.fullscreen_to_backbuffer(use_tonemap, srv_slot, inv_samples);
+        self.d3d.end_frame(slot)
     }
 }
 

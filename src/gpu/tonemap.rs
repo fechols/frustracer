@@ -40,6 +40,10 @@ pub const SRV_SLOT_BLOOM: u32 = 7;
 /// The registered-consensus fuse of every wired upscaler (--quinlight,
 /// gpu/quin.rs).
 pub const SRV_SLOT_QUIN: u32 = 8;
+/// The HUD/menu overlay texture (gpu/hud.rs) — NOT a tonemap source (bloom
+/// never reads it; it composites OVER whatever was tonemapped), so it takes a
+/// plain `create_srv`, never `wire_tonemap_src`.
+pub const SRV_SLOT_OVERLAY: u32 = 9;
 /// Room for future debug views. Also sizes `gpu/bloom.rs`'s source-slot region:
 /// the glare pyramid keeps a permanent SRV per tonemap slot in its own heap.
 pub const SRV_HEAP_CAPACITY: u32 = 12;
@@ -247,6 +251,19 @@ fn default_blend() -> D3D12_BLEND_DESC {
     }
 }
 
+/// PREMULTIPLIED alpha-over (src + dest·(1−src.a)) — the HUD overlay's blend
+/// (gpu/hud.rs). Slint's software renderer hands us premultiplied pixels, so
+/// SrcBlend is ONE, not SRC_ALPHA.
+pub(super) fn premultiplied_blend() -> D3D12_BLEND_DESC {
+    let mut b = default_blend();
+    b.RenderTarget[0].BlendEnable = true.into();
+    b.RenderTarget[0].SrcBlend = D3D12_BLEND_ONE;
+    b.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+    b.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
+    b.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+    b
+}
+
 /// Root constants the fullscreen PS reads (b0), in tonemap.hlsl's cbuffer
 /// order: `inv_samples`, the three glare fields (strength + the tent's texel
 /// step), then the four `tone::ToneParams` fields — the presentation curve is
@@ -261,11 +278,24 @@ fn fullscreen_pso(
     vs: &ID3DBlob,
     ps: &ID3DBlob,
 ) -> Result<ID3D12PipelineState> {
+    fullscreen_pso_blend(device, rtv_format, root_sig, vs, ps, default_blend())
+}
+
+/// `fullscreen_pso` with an explicit blend state — the HUD overlay's
+/// premultiplied-alpha composite (gpu/hud.rs) is the one non-opaque pass.
+pub(super) fn fullscreen_pso_blend(
+    device: &ID3D12Device,
+    rtv_format: DXGI_FORMAT,
+    root_sig: &ID3D12RootSignature,
+    vs: &ID3DBlob,
+    ps: &ID3DBlob,
+    blend: D3D12_BLEND_DESC,
+) -> Result<ID3D12PipelineState> {
     let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
         pRootSignature: unsafe { std::mem::transmute_copy(root_sig) },
         VS: bytecode(vs),
         PS: bytecode(ps),
-        BlendState: default_blend(),
+        BlendState: blend,
         SampleMask: u32::MAX,
         RasterizerState: D3D12_RASTERIZER_DESC {
             FillMode: D3D12_FILL_MODE_SOLID,
