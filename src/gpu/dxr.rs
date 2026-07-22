@@ -15,6 +15,10 @@
 //!   raygen @ 0    | miss @ 64: [radiance, shadow, hit_info]
 //!   hit groups @ 192: [HgShade, HgHit, null (occlusion; the any-hit-only
 //!   HgOcclude instead on alpha-masked scenes — see ALPHA_CUTOUT)]
+//!
+//! FR_DXR_INLINE (dxr_inline_mode below) is the W2 experiment lever: the
+//! same pipeline with its rays moved onto inline RayQuery, one stage at a
+//! time — the layout above is unchanged in every mode.
 
 use super::d3d12::{self, committed_buffer, transition, uav_barrier, Result};
 use super::dxc::Dxc;
@@ -63,6 +67,40 @@ pub fn require_caps(device: &ID3D12Device) -> Result<()> {
     } else {
         Err(format!("DXR pipeline unsupported here: {}", missing.join("; ")))
     }
+}
+
+/// R&D lever (FR_DXR_INLINE, default 0 = OFF and byte-identical library —
+/// the W2 arm of the Intel campaign): move the DXR pipeline's rays off
+/// recursive TraceRay and onto inline RayQuery, WITHOUT leaving DispatchRays.
+///
+/// The question it decomposes: the B70 runs this pipeline ~5.1x slower than
+/// the wavefront on the same rays with the same pasted shading code, and the
+/// only structural difference is dispatch shape. Three points pin where that
+/// cost lives:
+///   0 (default) — all TraceRay: the shipping pipeline, bit-identical.
+///   1 — primary TraceRay + INLINE SECONDARIES: rt.hlsli's RayQuery bodies
+///       compile in place of rt_dxr.hlsli's TraceRay flavors, so every ray
+///       shade.hlsli fires (shadow/AO/reflection/transmission/translucency)
+///       runs inline inside chs_shade and MaxTraceRecursionDepth drops to 1.
+///       Baseline-vs-1 = the cost of SECONDARY TraceRay dispatch.
+///   2 — everything inline in raygen (dxr.hlsl's DXR_INLINE_SEC == 2 arm):
+///       no TraceRay anywhere, DispatchRays as a bare launch grid over the
+///       reference loop. 1-vs-2 = the primary TraceRay + closest-hit stage;
+///       2-vs-the-compute-reference-kernel = pure DispatchRays-vs-Dispatch
+///       launch overhead.
+/// Both armed modes need SM 6.5 + RT tier 1.1 (the wavefront's own floor —
+/// lib_6_5 for RayQuery); on lesser hardware the lever prints one loud line
+/// and stays off. The RTPSO/SBT layout is unchanged in every mode: unreached
+/// hit groups and misses stay exported (identifier-only records, no cost).
+fn dxr_inline_mode() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("FR_DXR_INLINE")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|n| *n <= 2)
+            .unwrap_or(0)
+    })
 }
 
 pub struct DxrGpu {
@@ -126,6 +164,37 @@ impl DxrGpu {
             device.cast().map_err(|e| format!("ID3D12Device5: {e}"))?;
         let root_sig = trace::create_root_signature(device)?;
 
+        // FR_DXR_INLINE (see dxr_inline_mode): armed modes compile RayQuery
+        // into the library, which needs the wavefront's caps floor, not this
+        // pipeline's — gate here so a tier-1.0 box degrades to the shipping
+        // path with one loud line instead of a DXC error.
+        let inline_mode = {
+            let m = dxr_inline_mode();
+            if m > 0 {
+                let caps = trace::query_caps(device)?;
+                if caps.rt_tier < D3D12_RAYTRACING_TIER_1_1.0 || caps.shader_model < 0x65 {
+                    eprintln!(
+                        "dxr: FR_DXR_INLINE={m} ignored — inline RayQuery needs RT tier 1.1 + \
+                         SM 6.5 (device: tier {}, SM 0x{:x})",
+                        caps.rt_tier, caps.shader_model
+                    );
+                    0
+                } else {
+                    eprintln!(
+                        "dxr: FR_DXR_INLINE={m} — {} (lib_6_5, MaxTraceRecursionDepth 1)",
+                        if m == 1 {
+                            "TraceRay primary + inline RayQuery secondaries"
+                        } else {
+                            "everything inline in raygen (DispatchRays as a bare launch grid)"
+                        }
+                    );
+                    m
+                }
+            } else {
+                0
+            }
+        };
+
         // Alpha-masked and height-carrying scenes compile the ah_* any-hit
         // shaders + non-opaque ray flags in (trace.rs::alpha_defs /
         // height_defs — the same per-scene predicates that drop OPAQUE from
@@ -143,16 +212,24 @@ impl DxrGpu {
             trace::trans_defs(scene),
             trace::blas_defs()
         );
-        let lib_src = [
-            defs.as_str(),
-            sd,
-            trace::TRACE_COMMON_HLSLI,
-            RT_DXR_HLSLI,
-            trace::SHADE_HLSLI,
-            DXR_HLSL,
-        ]
-        .join("\n");
-        let dxil = dxc.compile(&lib_src, "", "lib_6_3", "dxr library", debug)?;
+        // Mode 0 assembles EXACTLY the shipping sequence (the lever's
+        // off-state is byte-identical source, not merely equivalent); armed
+        // modes prepend the define and paste rt.hlsli's RayQuery primitives
+        // ahead of rt_dxr.hlsli, whose TraceRay flavors + tlas/HitInfo
+        // compile out under DXR_INLINE_SEC.
+        let inline_def = format!("#define DXR_INLINE_SEC {inline_mode}");
+        let mut parts = vec![defs.as_str(), sd];
+        if inline_mode > 0 {
+            parts.push(inline_def.as_str());
+        }
+        parts.push(trace::TRACE_COMMON_HLSLI);
+        if inline_mode > 0 {
+            parts.push(trace::RT_HLSLI);
+        }
+        parts.extend([RT_DXR_HLSLI, trace::SHADE_HLSLI, DXR_HLSL]);
+        let lib_src = parts.join("\n");
+        let lib_target = if inline_mode > 0 { "lib_6_5" } else { "lib_6_3" };
+        let dxil = dxc.compile(&lib_src, "", lib_target, "dxr library", debug)?;
         let resolve_src = [sd, trace::TRACE_COMMON_HLSLI, trace::RESOLVE_HLSL].join("\n");
         let pso_resolve = trace::compute_pso(
             device,
@@ -241,8 +318,14 @@ impl DxrGpu {
         };
         // raygen -> chs_shade (1); its shadow/AO/reflection rays (2); chs_hit
         // and the misses fire nothing. The CPU's depth-1 recursion is the
-        // flattened lap loop inside chs_shade, not payload recursion.
-        let pipe_cfg = D3D12_RAYTRACING_PIPELINE_CONFIG { MaxTraceRecursionDepth: 2 };
+        // flattened lap loop inside chs_shade, not payload recursion. Under
+        // FR_DXR_INLINE the secondaries are inline RayQuery, so the deepest
+        // TraceRay is raygen's primary (mode 1) or none at all (mode 2 —
+        // depth 1 stays declared: 0 is legal but is a separate micro-variant,
+        // not worth a DispatchRays-validation seam until mode 2 shows a win).
+        let pipe_cfg = D3D12_RAYTRACING_PIPELINE_CONFIG {
+            MaxTraceRecursionDepth: if inline_mode > 0 { 1 } else { 2 },
+        };
         let grs = D3D12_GLOBAL_ROOT_SIGNATURE {
             pGlobalRootSignature: unsafe { std::mem::transmute_copy(&root_sig) },
         };

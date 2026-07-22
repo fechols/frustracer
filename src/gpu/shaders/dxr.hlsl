@@ -4,6 +4,12 @@
 // (gpu/dxr.rs concatenates). Recursion shape: raygen's primary TraceRay is
 // depth 1; chs_shade's shadow/AO/reflection rays are depth 2; chs_hit and
 // the misses fire nothing — MaxTraceRecursionDepth = 2 in the RTPSO.
+//
+// FR_DXR_INLINE (gpu/dxr.rs) reshapes that: mode 1 keeps the primary
+// TraceRay but the pasted trace primitives are rt.hlsli's inline RayQuery,
+// so chs_shade's secondaries never re-enter the pipeline (recursion depth 1);
+// mode 2 additionally takes the DXR_INLINE_SEC == 2 arm in raygen below —
+// no TraceRay anywhere, DispatchRays as a bare launch grid.
 
 RWStructuredBuffer<float> accum : register(u0); // rw*rh*3, CPU layout parity
 RWStructuredBuffer<float> tbuf  : register(u1); // primary-hit t, INF = sky
@@ -26,6 +32,40 @@ void raygen() {
         float2 sp = sample_pos(id.x, id.y, s, rng);
         float3 dir = ray_dir(sp.x, sp.y);
 
+#if defined(DXR_INLINE_SEC) && DXR_INLINE_SEC == 2
+        // FR_DXR_INLINE=2: NO TraceRay anywhere — the primary is rt.hlsli's
+        // inline trace_closest and shade_full runs right here, i.e. the
+        // payload path's raygen + chs_shade + miss_radiance fused (same rng
+        // stream, same splat, same probe-sample side channels; the relief
+        // re-march lives inside the inline trace_closest's committed block,
+        // exactly as in reference.hlsl). Against the compute reference
+        // kernel this isolates pure DispatchRays-vs-Dispatch launch cost;
+        // against mode 1 it isolates the primary TraceRay + closest-hit
+        // stage.
+        HitInfo h;
+        float3 col;
+        float t;
+        if (trace_closest(cam_origin.xyz, dir, 0.0, FLT_MAX, h)) {
+            PrimSurf ps;
+            col = shade_full(cam_origin.xyz, dir, h, rng, ps);
+            t = h.t;
+            if (s == probe_sample)
+                gbuf_write_hit(pi, sp.x, sp.y, dir, t, ps);
+        } else {
+            col = sky_radiance(cam_origin.xyz, dir, pixel_cone * 0.5, frame,
+                               cloud_dither_k(id, frame, s, spp));
+            t = INF;
+            if (s == probe_sample)
+                gbuf_write_sky(pi, sp.x, sp.y, dir);
+        }
+        if (flags & FLAG_FIREFLIES)
+            col += ff_glow(cam_origin.xyz, dir, t, pixel_cone * 0.5);
+        csum += col;
+        if (s == probe_sample) {
+            tbuf[pi] = t;
+            info[pi] = pack_info(0u, KIND_LEAF);
+        }
+#else
         RayDesc r;
         r.Origin = cam_origin.xyz; r.Direction = dir; r.TMin = 0.0; r.TMax = FLT_MAX;
         RayPayload p;
@@ -56,6 +96,7 @@ void raygen() {
             if (isinf(p.t))
                 gbuf_write_sky(pi, sp.x, sp.y, dir);
         }
+#endif // DXR_INLINE_SEC == 2
     }
     float3 c = csum * (1.0 / float(spp));
 

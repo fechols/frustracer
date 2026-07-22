@@ -423,7 +423,9 @@ const FRUSTUM_HLSLI: &str = include_str!("shaders/frustum.hlsli");
 // pasted right after FRUSTUM_HLSLI (whose binary halves are `#ifndef FTREE`);
 // the ftree_defs prelude picks the structure per session.
 const FTREE_HLSLI: &str = include_str!("shaders/ftree.hlsli");
-const RT_HLSLI: &str = include_str!("shaders/rt.hlsli");
+/// pub for gpu/dxr.rs: FR_DXR_INLINE pastes the inline-RayQuery primitives
+/// into the DXR library in place of rt_dxr.hlsli's TraceRay flavors.
+pub const RT_HLSLI: &str = include_str!("shaders/rt.hlsli");
 pub(crate) const SHADE_HLSLI: &str = include_str!("shaders/shade.hlsli");
 const HEMI_HLSLI: &str = include_str!("shaders/hemi.hlsli");
 const REFERENCE_HLSL: &str = include_str!("shaders/reference.hlsl");

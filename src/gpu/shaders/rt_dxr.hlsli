@@ -39,6 +39,13 @@
 #define SHADOW_RF RAY_FLAG_FORCE_OPAQUE
 #endif
 
+// FR_DXR_INLINE (gpu/dxr.rs — the W2 Intel-campaign lever): rt.hlsli is
+// pasted BEFORE this file, so tlas + HitInfo + the three trace primitives
+// already exist as inline RayQuery; this file then contributes only the
+// payload structs + ray flags the DispatchRays stages still need (raygen's
+// primary TraceRay in mode 1; in mode 2 the chs_*/miss_*/ah_* entry points
+// are dead-but-exported and no ray can reach them).
+#ifndef DXR_INLINE_SEC
 RaytracingAccelerationStructure tlas : register(t7);
 
 struct HitInfo {
@@ -46,6 +53,7 @@ struct HitInfo {
     uint tri;
     float u, v; // DXR barycentrics == moller-trumbore: p = (1-u-v)p0 + u·p1 + v·p2
 };
+#endif
 
 // Radiance ray (raygen -> chs_shade / miss_radiance). rng rides IN so the
 // closest-hit continues the pixel's stream exactly where raygen's jitter
@@ -92,6 +100,12 @@ struct HitPayload {
     float u;
     float v;
 };
+
+// The three TraceRay-flavor primitives. Compiled out under FR_DXR_INLINE —
+// rt.hlsli's inline RayQuery bodies (pasted above) serve shade.hlsli instead,
+// so every secondary runs inline inside chs_shade (mode 1) or raygen (mode 2)
+// and the SBT's HgHit/miss/occlusion machinery goes dead-but-exported.
+#ifndef DXR_INLINE_SEC
 
 // rt.hlsli::trace_closest, DispatchRays flavor — the reflection ray inside
 // shade_split. Hit group 1 records bare hit info: the lap loop shades the
@@ -173,3 +187,5 @@ float3 transmit_q(float3 o, float3 d, float tmin, float tmax) {
         return float3(0.0, 0.0, 0.0);
     return p.tint;
 }
+
+#endif // DXR_INLINE_SEC
