@@ -1,4 +1,4 @@
-//! GPU presentation layer: SDL2 hands us an HWND, we own a D3D12 device on
+//! GPU presentation layer: SDL3 hands us an HWND, we own a D3D12 device on
 //! the NVIDIA adapter, a DXGI swapchain, and the upload/fullscreen-pass
 //! machinery. Everything here consumes finished CPU frames after
 //! `render_frame`/`resolve` return — no tracer state is touched.

@@ -228,6 +228,9 @@ opt_fields! {
         pub bc7: bool,
         /// "ultrafast" | "fast" | "basic" | "slow" (implies bc7)
         pub bc7_quality: String,
+        /// --dxr-inline 0|1|2 (the DXR ray-dispatch mode; default 1 = inline
+        /// RayQuery secondaries)
+        pub dxr_inline: u32,
         /// --fsr4's REQUIRED semantics for a "fsr4" chain force
         pub fsr4_required: bool,
         pub gpu_debug: bool,
@@ -781,6 +784,13 @@ pub fn apply_globals(s: &Settings) {
         }
         crate::fireflies::set_count(n);
     }
+    if let Some(n) = s.advanced.dxr_inline {
+        if n <= 2 {
+            crate::gpu::dxr::set_inline_mode(n);
+        } else {
+            warn("advanced.dxr_inline", &n.to_string());
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -968,6 +978,7 @@ pub fn menu_items() -> &'static [MenuItem] {
             item!("cut_hemi", "cut-seeded hemi rays", "Advanced", Restart, Toggle { default: false }, acc_bool!(advanced.cut_hemi)),
             item!("bc7", "BC7 texture compression", "Advanced", Restart, Toggle { default: false }, acc_bool!(advanced.bc7)),
             item!("bc7_quality", "BC7 quality", "Advanced", Restart, Cycle { options: &["ultrafast", "fast", "basic", "slow"], default_ix: 1 }, acc_str!(advanced.bc7_quality)),
+            item!("dxr_inline", "DXR dispatch mode (0/1/2)", "Advanced", Restart, Cycle { options: &["0", "1", "2"], default_ix: 1 }, acc_u32!(advanced.dxr_inline)),
             item!("fsr4_required", "require FSR4 (exit if absent)", "Advanced", Restart, Toggle { default: false }, acc_bool!(advanced.fsr4_required)),
             item!("gpu_debug", "D3D12 debug layer", "Advanced", Restart, Toggle { default: false }, acc_bool!(advanced.gpu_debug)),
             item!("pix_markers", "PIX markers", "Advanced", Restart, Toggle { default: false }, acc_bool!(advanced.pix_markers)),

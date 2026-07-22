@@ -1,4 +1,4 @@
-// BC7 block compression of OPAQUE scene textures (--bc7) — GPU upload only;
+﻿// BC7 block compression of OPAQUE scene textures (--bc7) — GPU upload only;
 // the CPU renderer keeps sampling the exact RGBA8 texels. Alpha-masked cutout
 // textures are deliberately excluded (see the module note).
 mod bc7;
@@ -857,6 +857,26 @@ fn main() {
                 opts.blas_split = Some(n);
             }
             "--no-blas-split" => opts.blas_split = None,
+            // The DXR pipeline's ray-dispatch mode (gpu::dxr::dxr_inline_mode
+            // — the set_aniso knob idiom). DEFAULT 1 = primary TraceRay +
+            // inline RayQuery secondaries, which strictly dominates the
+            // all-TraceRay pipeline (0) at every measured point on both
+            // vendors; 2 = everything inline in raygen (the high-spp Intel
+            // pick). See the DXR section's ablation table in CLAUDE.md.
+            "--dxr-inline" => {
+                let n: u32 = args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .filter(|&n| n <= 2)
+                    .unwrap_or_else(|| {
+                        eprintln!(
+                            "--dxr-inline needs 0 (all TraceRay), 1 (inline secondaries — \
+                             the default), or 2 (everything inline in raygen)"
+                        );
+                        std::process::exit(2);
+                    });
+                gpu::dxr::set_inline_mode(n);
+            }
             "--spin" => {
                 spin = Some(args.next().unwrap_or_else(|| {
                     eprintln!("--spin needs a workload: still | path");
@@ -10852,9 +10872,9 @@ fn build_menu_rows(
         .collect()
 }
 
-/// Extract the Win32 HWND from the SDL2 window for swapchain creation.
+/// Extract the Win32 HWND from the SDL window for swapchain creation.
 #[cfg(windows)]
-fn sdl_hwnd(window: &sdl2::video::Window) -> windows::Win32::Foundation::HWND {
+fn sdl_hwnd(window: &sdl3::video::Window) -> windows::Win32::Foundation::HWND {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     let handle = window.window_handle().expect("window handle").as_raw();
     match handle {
@@ -11043,6 +11063,19 @@ fn vendor_defaults(opts: &mut Opts, vendor: gpu::adapter::Vendor) {
     // quadtree that proves space empty and traces no rays there is worth far
     // more; and it is worth MOST on the default scene, which is mostly sky.
     //
+    // W2 CAVEAT (2026-07-22): that table is the ALL-TRACERAY pipeline —
+    // --dxr-inline 0. The mode-1 promotion (inline RayQuery secondaries, the
+    // DXR default since W2) moved the DXR column to 2.35/1.64, so the Intel
+    // ratio now STRADDLES 1.0 by scene at spp=1 (default 1.34x, stress
+    // 0.81x, san-miguel-lp 0.94x) — most of the old gap was secondary
+    // TraceRay dispatch, not RT-core weakness. This entry is KEPT because
+    // the wavefront still wins the flagless contract where it matters (the
+    // default scene at spp=1, every scene from ~spp 3 up via the quadtree's
+    // cheaper marginal sample, and it owns H/R/C/O) — but the clean crossing
+    // is gone, and a re-measure ON THE WORLD (the actual flagless scene,
+    // which --spin never loads) is owed before this policy is extended or
+    // defended with the old numbers.
+    //
     // AMD is deliberately absent: this box's only AMD adapter is an iGPU
     // (~22x slower, useless as a signal), so RDNA has no measurement here and
     // therefore keeps the cross-vendor default. Do not extend this to a vendor
@@ -11063,9 +11096,8 @@ fn vendor_defaults(opts: &mut Opts, vendor: gpu::adapter::Vendor) {
     if vendor == Vendor::Intel && !opts.mode_explicit && opts.dxr && !opts.gpu {
         opts.gpu = true;
         eprintln!(
-            "gpu: Intel adapter — starting in the compute WAVEFRONT tracer (measured 2.6-5.1x \
-             faster than the DispatchRays pipeline here; --dxr starts in DXR instead, --cpu in \
-             the CPU tracer, SPACE cycles all three live)"
+            "gpu: Intel adapter — starting in the compute WAVEFRONT tracer (--dxr starts the \
+             DispatchRays pipeline instead, --cpu the CPU tracer, SPACE cycles all three live)"
         );
     }
 }
@@ -11079,15 +11111,15 @@ fn run_window(
     attractors: Vec<flycam::TodAttractor>,
     file_settings: settings::Settings,
 ) {
-    // Opt into per-monitor DPI awareness so Windows doesn't stretch the window
-    // on scaled displays — W×H stays W×H physical pixels, matching the swapchain.
-    sdl2::hint::set("SDL_WINDOWS_DPI_AWARENESS", "permonitorv2");
+    // SDL3 is per-monitor-v2 DPI aware on Windows unconditionally (SDL2's
+    // SDL_WINDOWS_DPI_AWARENESS hint is gone), so W×H stays W×H physical
+    // pixels, matching the swapchain.
     // Deliver the click that lands on an unfocused window instead of
     // swallowing it as an activation click (SDL's default). Standard for
     // game windows — with a pause menu on screen, the first click back into
     // the window should press the button it hit, not vanish.
-    sdl2::hint::set("SDL_MOUSE_FOCUS_CLICKTHROUGH", "1");
-    let sdl = sdl2::init().expect("SDL init failed");
+    sdl3::hint::set("SDL_MOUSE_FOCUS_CLICKTHROUGH", "1");
+    let sdl = sdl3::init().expect("SDL init failed");
     let video = sdl.video().expect("SDL video failed");
     let mut window = video
         .window(
@@ -11234,7 +11266,7 @@ fn session(
     bvh: &mut bvh::Bvh,
     opts: &Opts,
     fly: &flycam::FlyCam,
-    window: &mut sdl2::video::Window,
+    window: &mut sdl3::video::Window,
     inp: &mut input::Input,
     gpu: &mut gpu::GpuContext,
     hud: &mut Option<hud::Hud>,
@@ -12057,14 +12089,12 @@ fn session(
         // (which arrives as a drained action) breaks the same way.
         let mut edges = inp.poll(hud.as_ref().filter(|hd| hd.menu_open()));
         if edges.toggle_fullscreen {
-            // Borderless desktop fullscreen (F11) — the resulting
-            // SizeChanged flows through the same debounce below.
-            let to = if window.fullscreen_state() == sdl2::video::FullscreenType::Off {
-                sdl2::video::FullscreenType::Desktop
-            } else {
-                sdl2::video::FullscreenType::Off
-            };
-            if let Err(e) = window.set_fullscreen(to) {
+            // Borderless desktop fullscreen (F11) — SDL3's set_fullscreen is
+            // a bool, and fullscreen with no exclusive mode set IS borderless
+            // desktop. The resulting size event flows through the same
+            // debounce below.
+            let on = window.fullscreen_state() == sdl3::video::FullscreenType::Off;
+            if let Err(e) = window.set_fullscreen(on) {
                 eprintln!("fullscreen: {e}");
             }
         }
@@ -12074,10 +12104,9 @@ fn session(
         if let Some(t0) = pending_resize {
             if (now - t0).as_millis() >= RESIZE_SETTLE_MS {
                 pending_resize = None;
-                // drawable_size at settle time is authoritative (physical
-                // pixels — the permonitorv2 DPI hint makes logical equal
-                // physical).
-                let (dw, dh) = window.drawable_size();
+                // size_in_pixels at settle time is authoritative (physical
+                // pixels — SDL3 is per-monitor DPI aware by default).
+                let (dw, dh) = window.size_in_pixels();
                 if dw > 0 && dh > 0 && (dw as usize, dh as usize) != (w, h) {
                     break SessionEnd::Resize(dw, dh);
                 }
@@ -12097,14 +12126,14 @@ fn session(
                     if !hd.escape() {
                         hd.close_menu();
                         fly.resume();
-                        window.subsystem().text_input().stop();
+                        window.subsystem().text_input().stop(window);
                     }
                 } else {
                     hd.open_menu();
                     menu_rows_stale = true;
                     fly.pause();
                     // Printable characters reach Slint via SDL TextInput.
-                    window.subsystem().text_input().start();
+                    window.subsystem().text_input().start(window);
                 }
             }
             // Live state snapshot for row display + adjust baselines.
@@ -12154,7 +12183,7 @@ fn session(
                     hud::HudAction::Resume => {
                         hd.close_menu();
                         fly.resume();
-                        window.subsystem().text_input().stop();
+                        window.subsystem().text_input().stop(window);
                     }
                     hud::HudAction::Quit => edges.quit = true,
                     hud::HudAction::OpenSettings => {
