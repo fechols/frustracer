@@ -27,6 +27,14 @@ gltf = { version = "1.4", default-features = false, features = [
     "KHR_materials_unlit",
 ] }
 fastrand = "2"
+# JSON-persisted user settings (src/settings.rs — frustracer-settings.json
+# next to the exe; the pause menu writes it, startup reads it as defaults the
+# CLI overrides). Both were ALREADY in Cargo.lock transitively via gltf, so
+# this adds no new downloads. Base deps, not windows-only: main() loads the
+# file before the parse loop on every platform (headless --check*/--spin runs
+# ignore it — gates stay a pure function of the command line).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 # FFT for the Poisson normal→height solve (texture.rs apply_n2h — the
 # Frankot–Chellappa inverse over the wrap-repeat texture domain, where
 # periodic boundary conditions are exact). Pure Rust, no runtime DLL (the
@@ -54,6 +62,21 @@ tracy = ["dep:tracy-client"]
 # The interactive presentation stack (SDL2 window + D3D12 + Streamline) is
 # Windows-only; headless --check/--check-dlss build everywhere without it.
 [target.'cfg(windows)'.dependencies]
+# The HUD/pause-menu UI (src/hud/): Slint's SOFTWARE renderer only — no
+# winit/femtovg/skia backends compile (default-features off), because the
+# renderer draws into OUR CPU buffer behind a custom slint::platform::Platform
+# and the result is dirty-rect-uploaded onto the D3D12 swapchain
+# (src/gpu/hud.rs). `software-renderer-systemfonts` rasterizes system fonts at
+# runtime, which is what lets the UI live in a slint! macro with no
+# slint-build/pre-rendered-glyph step. Licensing: Slint is triple-licensed
+# (GPLv3 / Royalty-Free / commercial); this project uses it under the
+# Royalty-Free license (https://slint.dev/terms-and-conditions).
+slint = { version = "1", default-features = false, features = [
+    "std",
+    "compat-1-2",
+    "renderer-software",
+    "software-renderer-systemfonts",
+] }
 sdl2 = { version = "0.38", features = ["bundled", "static-link", "raw-window-handle"] }
 raw-window-handle = "0.6"
 windows = { version = "0.62", features = [

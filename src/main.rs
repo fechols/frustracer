@@ -40,6 +40,10 @@ mod render;
 mod reproject;
 mod scene;
 mod scene_cache;
+// JSON-persisted user settings (frustracer-settings.json next to the exe):
+// file provides defaults, CLI flags override, the pause menu writes it.
+// Headless --check*/--spin runs ignore the file entirely.
+mod settings;
 // Glare: the optics between the scene and the sensor. A display-stage pass, so
 // it never touches accum, the temporal cache, or any upscaler guide.
 mod bloom;
@@ -541,6 +545,22 @@ fn main() {
     // resolving), Some(false) = --no-world (today's procedural boot). Later
     // flags win, the --heightfield/--no-heightfield pattern.
     let mut world_flag: Option<bool> = None;
+    // JSON settings: the file's values land here — after the defaults
+    // literal, BEFORE the parse loop — so every CLI flag parsed below simply
+    // overwrites them (defaults < file < flags, by ordering alone). Headless
+    // gate/bench runs (--check*, --*-dump, --spin*) and --no-settings skip
+    // the file entirely: the gates' value is that a command line fully
+    // determines the run.
+    let file_settings = if settings::headless_args(std::env::args().skip(1)) {
+        if settings::path().exists() {
+            eprintln!("settings: {} ignored (headless or --no-settings run)", settings::FILE_NAME);
+        }
+        settings::Settings::default()
+    } else {
+        settings::load()
+    };
+    let sfx = settings::apply_to_opts(&file_settings, &mut opts);
+    settings::apply_globals(&file_settings);
     // Peekable so a flag can take an OPTIONAL value (--blas-split [N]) without
     // swallowing the next flag.
     let mut args = std::env::args().skip(1).peekable();
@@ -1034,6 +1054,10 @@ fn main() {
                     std::process::exit(2);
                 })
             }
+            // Consumed by the pre-parse settings scan (settings::headless_args)
+            // — this arm only keeps the token out of the positional fallback,
+            // which would read it as a scene path.
+            "--no-settings" => {}
             "--world" => world_flag = Some(true),
             "--no-world" => world_flag = Some(false),
             "--stress" => {
@@ -1191,9 +1215,29 @@ fn main() {
                 eprintln!("                can't support fall back with a log line)");
                 eprintln!("  --gpu-debug   D3D12 debug layer + verbose Streamline logging");
                 eprintln!("  --sl-path     Streamline DLL directory (default: SDKs\\streamline-sdk\\bin\\x64)");
+                eprintln!("  --no-settings ignore {} for this run (the pause menu's", settings::FILE_NAME);
+                eprintln!("                saved settings, read as defaults that CLI flags override;");
+                eprintln!("                headless --check*/--spin runs always ignore it)");
                 return;
             }
             _ => obj = Some(a),
+        }
+    }
+
+    // Settings side channels the parse loop couldn't carry through &mut Opts.
+    // A file-forced FSR level flips the adapter-preference default exactly
+    // like --fsr/--fsr3; the file's scene choice applies ONLY when the CLI
+    // named no scene source at all (a CLI scene path, --world, or --stress
+    // replaces it outright — a file value must never turn into an
+    // exclusivity error against a flag).
+    if sfx.fsr_forced {
+        fsr_forced = true;
+    }
+    if obj.is_none() && world_flag.is_none() && stress.is_none() {
+        if let Some(p) = sfx.scene_path {
+            obj = Some(p);
+        } else if let Some(w) = sfx.world {
+            world_flag = Some(w);
         }
     }
 
@@ -8718,6 +8762,22 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
     };
 
+    // Settings self-test — serde round-trip/sparseness/forward-compat of the
+    // JSON schema, the enum vocabularies pinned against their consumers
+    // (xess::lock_scale, bc7::Quality::parse, the parse_* mirrors of the CLI
+    // arms), and the headless predicate that keeps this very suite blind to
+    // the settings file.
+    let settings_ok = match settings::self_test() {
+        Ok(()) => {
+            eprintln!("settings self-test: OK");
+            true
+        }
+        Err(e) => {
+            eprintln!("settings self-test: FAIL — {e}");
+            false
+        }
+    };
+
     // Presentation-curve self-test — the SDR degeneracy (bit-for-bit against
     // the pre-HDR curve: the guard that --hdr did not move the default), the
     // paper-white anchor, monotonicity, the headroom asymptote, and C¹ at the
@@ -10730,6 +10790,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         ("tangent", tangent_ok),
         ("ripple", ripple_ok),
         ("upchain", upchain_ok),
+        ("settings", settings_ok),
         ("tone", tone_ok),
         ("gltf", gltf_ok),
         ("bc7", bc7_ok),
