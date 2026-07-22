@@ -2,6 +2,7 @@
 // the CPU renderer keeps sampling the exact RGBA8 texels. Alpha-masked cutout
 // textures are deliberately excluded (see the module note).
 mod bc7;
+mod blas_split;
 mod bvh;
 mod camera;
 mod clouds;
@@ -282,6 +283,21 @@ pub struct Opts {
     /// algorithm builds the ray BVH. Every builder produces the same Bvh
     /// (consumers/gates/.fcache unchanged); score on measured counters.
     pub bvh_builder: String,
+    /// Triangles per BLAS: cut the ray BVH into maximal subtrees of at most N
+    /// triangles and build ONE BLAS per subtree, instanced identity into the
+    /// TLAS (blas_split.rs). DEFAULT ON at `DEFAULT_MAX_PRIMS`; `None` =
+    /// --no-blas-split = one BLAS over the whole scene (the pre-feature build).
+    ///
+    /// It is the default for ROBUSTNESS, not throughput — on NVIDIA it is
+    /// neutral (measured within +-1% on four world poses). BLAS scratch is
+    /// sized by the largest single geometry, so one 34.4M-triangle BLAS made
+    /// Intel's driver ask for 1891 MB of it and REMOVE THE DEVICE mid-boot on
+    /// THE WORLD (NVIDIA asked 276 MB for the same build and survived); at a
+    /// 64k cap the scratch is a function of one chunk — 3 MB — and the same
+    /// session runs. GPU-only and derived from the built BVH, so it keys
+    /// nothing in the scene cache; the CPU tracer, the software BVH and the
+    /// frustum cut never see it.
+    pub blas_split: Option<u32>,
     /// A/B lever (--no-ftree disables): route ALL bound queries through the
     /// 8-wide frustum tree lazily collapsed from the ray BVH (ftree.rs) — the
     /// two-tree split. Rays always stay on the binary BVH.
@@ -467,6 +483,7 @@ fn main() {
         max_leaf: 8,
         split_axes: 3,
         bvh_builder: "sah".to_string(),
+        blas_split: Some(blas_split::DEFAULT_MAX_PRIMS),
         ftree: true,
         ftree_tiles: false,
         gpu: false,
@@ -518,7 +535,9 @@ fn main() {
     // resolving), Some(false) = --no-world (today's procedural boot). Later
     // flags win, the --heightfield/--no-heightfield pattern.
     let mut world_flag: Option<bool> = None;
-    let mut args = std::env::args().skip(1);
+    // Peekable so a flag can take an OPTIONAL value (--blas-split [N]) without
+    // swallowing the next flag.
+    let mut args = std::env::args().skip(1).peekable();
     while let Some(a) = args.next() {
         match a.as_str() {
             "--check" => check = true,
@@ -781,6 +800,33 @@ fn main() {
                     std::process::exit(2);
                 });
             }
+            "--blas-split" => {
+                // Optional value: a bare flag takes the conventional-band cap,
+                // an explicit N (e.g. 64) reaches the tiny-BLAS regime. The
+                // next token is only CONSUMED when it is all digits — so
+                // `--blas-split model.obj` and `--blas-split --stress 5000`
+                // leave their arguments alone — but a numeric token that is
+                // not a legal cap (0, or past u32) is a typo, not a scene
+                // path, and exits rather than silently arming at the default
+                // and landing in the positional arm as an OBJ named "0".
+                let numeric = args.peek().is_some_and(|v| {
+                    !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit())
+                });
+                let n = if numeric {
+                    let v = args.next().unwrap();
+                    v.parse::<u32>().ok().filter(|n| *n >= 1).unwrap_or_else(|| {
+                        eprintln!(
+                            "--blas-split: '{v}' is not a triangle cap (1..={})",
+                            u32::MAX
+                        );
+                        std::process::exit(2);
+                    })
+                } else {
+                    blas_split::DEFAULT_MAX_PRIMS
+                };
+                opts.blas_split = Some(n);
+            }
+            "--no-blas-split" => opts.blas_split = None,
             "--spin" => {
                 spin = Some(args.next().unwrap_or_else(|| {
                     eprintln!("--spin needs a workload: still | path");
@@ -1285,6 +1331,25 @@ fn main() {
         eprintln!("--bvh-builder: unknown builder '{}' (sah | lbvh | ploc | som)", opts.bvh_builder);
         std::process::exit(2);
     }
+    // GPU-only and read at SceneGpu upload (both tracers), so it may land any
+    // time before a GPU tracer is built — but it belongs with the other
+    // build-shape levers, and the startup line is the arming signal.
+    blas_split::set_max_prims(opts.blas_split);
+    // Silent at the default — the `gpu scene:` line already reports the chunk
+    // count, and this is now every GPU session. Only a DEPARTURE speaks.
+    match opts.blas_split {
+        Some(n) if n != blas_split::DEFAULT_MAX_PRIMS => eprintln!(
+            "blas-split: --blas-split {n} — one BLAS per maximal BVH subtree of <= {n} tris \
+             (default {})",
+            blas_split::DEFAULT_MAX_PRIMS
+        ),
+        None => eprintln!(
+            "blas-split: --no-blas-split — ONE BLAS over the whole scene. Note this is the \
+             configuration that removed the device on Intel at 34.4M tris (BLAS scratch is \
+             sized by the largest geometry); it is the A/B arm, not a safe default"
+        ),
+        _ => {}
+    }
     if !opts.ftree {
         ftree::FTREE_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
         eprintln!("ftree: --no-ftree — all bound queries stay on the binary BVH");
@@ -1643,6 +1708,7 @@ fn run_check_dxr(
         &dev,
         &dxc,
         scene,
+        bvh,
         gw as u32,
         gh as u32,
         false,
@@ -1660,6 +1726,30 @@ fn run_check_dxr(
         "check-dxr: RTPSO + SBT built, scene uploaded, BLAS/TLAS built ({} tris)",
         scene.tri_count()
     );
+    // Anti-vacuity: with blas-split armed (the DEFAULT), every gate below is
+    // only a proof of the (InstanceID, PrimitiveIndex) remap if the scene
+    // actually split. A scene UNDER the cap legitimately builds one chunk —
+    // that is the single-BLAS shape reached through the split path, not a
+    // failure — so it says so instead of failing. Over the cap, one chunk
+    // means the planner stopped cutting and the remap went untested.
+    if let Some(cap) = blas_split::max_prims() {
+        if dg.scene.n_chunks < 2 {
+            if scene.tri_count() as u32 > cap {
+                eprintln!(
+                    "check-dxr: FAIL blas-split cap {cap} but the scene built {} chunk(s) \
+                     from {} tris — the remap is untested",
+                    dg.scene.n_chunks,
+                    scene.tri_count()
+                );
+                return 1;
+            }
+            eprintln!(
+                "check-dxr: note — {} tris is under the {cap} cap, so the scene is ONE chunk; \
+                 the remap runs as the identity here (use --blas-split N to split it)",
+                scene.tri_count()
+            );
+        }
+    }
 
     let q = Quality::preset(2);
     let basis = cam0.basis(gw, gh);
@@ -2041,6 +2131,7 @@ fn run_check_dxr(
             &dev,
             &dxc,
             scene,
+            bvh,
             pw as u32,
             ph as u32,
             true,
@@ -3305,6 +3396,27 @@ fn run_check_gpu(
         }
     };
     eprintln!("check-gpu: scene uploaded, BLAS/TLAS built ({} tris)", scene.tri_count());
+    // Anti-vacuity, the --check-dxr twin: an armed lever that produced one
+    // chunk has exercised nothing the unarmed run does not — unless the scene
+    // is genuinely under the cap, which is a note, not a failure.
+    if let Some(cap) = blas_split::max_prims() {
+        if tg.scene.n_chunks < 2 {
+            if scene.tri_count() as u32 > cap {
+                eprintln!(
+                    "check-gpu: FAIL blas-split cap {cap} but the scene built {} chunk(s) \
+                     from {} tris — the remap is untested",
+                    tg.scene.n_chunks,
+                    scene.tri_count()
+                );
+                return 1;
+            }
+            eprintln!(
+                "check-gpu: note — {} tris is under the {cap} cap, so the scene is ONE chunk; \
+                 the remap runs as the identity here (use --blas-split N to split it)",
+                scene.tri_count()
+            );
+        }
+    }
 
     let q = Quality::preset(2);
     let basis = cam0.basis(gw, gh);
@@ -8245,6 +8357,7 @@ fn run_spin_gpu(
             &dev,
             &dxc,
             scene,
+            bvh,
             rw as u32,
             rh as u32,
             false,
@@ -8501,6 +8614,18 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         Ok(()) => true,
         Err(e) => {
             eprintln!("ftree self-test: FAIL — {e}");
+            false
+        }
+    };
+
+    // BLAS chunk planner: the cut's structural contracts (cap, exact triangle
+    // partition, antichain coverage, determinism) at several caps on the
+    // session's real tree. Runs on every --check regardless of --blas-split —
+    // it plans its own cuts — so the planner can't rot while the lever is off.
+    let blas_ok = match blas_split::self_test(bvh) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("blas-split self-test: FAIL — {e}");
             false
         }
     };
@@ -10592,6 +10717,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         ("bloom", bloom_ok),
         ("sphcell", sph_ok),
         ("ftree", ftree_ok),
+        ("blas-split", blas_ok),
         ("reproject", reproj_ok),
         ("nppd", nppd_ok),
         ("matclass", matclass_ok),

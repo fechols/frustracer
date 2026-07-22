@@ -76,7 +76,9 @@ void raygen() {
 void chs_shade(inout RayPayload p, in BuiltInTriangleIntersectionAttributes a) {
     HitInfo h;
     h.t = RayTCurrent();
-    h.tri = PrimitiveIndex();
+    // tri_of == PrimitiveIndex() in the single-BLAS build; the chunk remap
+    // under --blas-split (trace_common.hlsli).
+    h.tri = tri_of(InstanceID(), PrimitiveIndex());
     h.u = a.barycentrics.x;
     h.v = a.barycentrics.y;
 #ifdef HEIGHTFIELD
@@ -107,7 +109,7 @@ void chs_shade(inout RayPayload p, in BuiltInTriangleIntersectionAttributes a) {
 [shader("closesthit")]
 void chs_hit(inout HitPayload p, in BuiltInTriangleIntersectionAttributes a) {
     p.t = RayTCurrent();
-    p.tri = PrimitiveIndex();
+    p.tri = tri_of(InstanceID(), PrimitiveIndex());
     p.u = a.barycentrics.x;
     p.v = a.barycentrics.y;
 #ifdef HEIGHTFIELD
@@ -160,13 +162,13 @@ bool ah_reject(uint tri, float u, float v) {
 
 [shader("anyhit")]
 void ah_shade(inout RayPayload p, in BuiltInTriangleIntersectionAttributes a) {
-    if (ah_reject(PrimitiveIndex(), a.barycentrics.x, a.barycentrics.y))
+    if (ah_reject(tri_of(InstanceID(), PrimitiveIndex()), a.barycentrics.x, a.barycentrics.y))
         IgnoreHit();
 }
 
 [shader("anyhit")]
 void ah_hit(inout HitPayload p, in BuiltInTriangleIntersectionAttributes a) {
-    if (ah_reject(PrimitiveIndex(), a.barycentrics.x, a.barycentrics.y))
+    if (ah_reject(tri_of(InstanceID(), PrimitiveIndex()), a.barycentrics.x, a.barycentrics.y))
         IgnoreHit();
 }
 
@@ -183,7 +185,8 @@ void ah_shadow(inout ShadowPayload p, in BuiltInTriangleIntersectionAttributes a
     float t = RayTCurrent();
     float u = a.barycentrics.x;
     float v = a.barycentrics.y;
-    if (candidate_reject(PrimitiveIndex(), WorldRayOrigin(), WorldRayDirection(), t, u, v) != 0u
+    uint tri = tri_of(InstanceID(), PrimitiveIndex());
+    if (candidate_reject(tri, WorldRayOrigin(), WorldRayDirection(), t, u, v) != 0u
         || t >= p.tmax)
         IgnoreHit();
 #ifdef TRANS_SHADOW
@@ -193,7 +196,7 @@ void ah_shadow(inout ShadowPayload p, in BuiltInTriangleIntersectionAttributes a
     // the RayQuery twin). Opaque candidates fall through and commit. The
     // ordering matters: a candidate rejected above (cutout texel, relief
     // escape, beyond the logical tmax) must NOT tint.
-    float4 ms = mat_shadow[uv_tri_mat[PrimitiveIndex()]];
+    float4 ms = mat_shadow[uv_tri_mat[tri]];
     if (ms.a > 0.0) {
         p.tint *= ms.rgb;
         IgnoreHit();

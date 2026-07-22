@@ -98,9 +98,11 @@ pub const RP_SCENE_TEX: u32 = RP_NPPD_OUT + 1;
 /// First heap slot of the scene-texture table (after every feed set).
 pub const TEX_HEAP_BASE: u32 = FEED_SETS * FEED_SET_STRIDE;
 /// Buffer-SRV descriptors preceding the Texture2D array in the table
-/// (t0..t6 space1: texcoords, indices alias, tri_mat alias, mat_cutout,
-/// positions alias, mat_height, mat_shadow — texs[] starts at t7).
-pub const TEX_TABLE_BUFS: u32 = 7;
+/// (t0..t8 space1: texcoords, indices alias, tri_mat alias, mat_cutout,
+/// positions alias, mat_height, mat_shadow, blas_tri, chunk_base — texs[]
+/// starts at t9). Must stay in lockstep with trace_common.hlsli's space1
+/// declarations: this const IS the texs[] base register.
+pub const TEX_TABLE_BUFS: u32 = 9;
 
 // SRV register assignments (t0..t7) — shared across every kernel; a kernel
 // declares only what it reads, DXC strips the rest.
@@ -1070,12 +1072,24 @@ pub struct SceneGpu {
     pub indices: ID3D12Resource,
     pub tri_mat: ID3D12Resource,
     pub materials: ID3D12Resource,
-    /// Never read, but MUST be held: the TLAS instance desc bakes only the
+    /// Never read, but MUST be held: the TLAS instance descs bake only the
     /// (compacted) BLAS's GPU VA — dropping this resource would free the
-    /// memory the TLAS points into.
+    /// memory the TLAS points into. Under `--blas-split` this is the ARENA all
+    /// chunk BLASes were sub-allocated from, so the same rule covers all of
+    /// them at once.
     #[allow(dead_code)]
     pub blas: ID3D12Resource,
     pub tlas: ID3D12Resource,
+    /// `--blas-split` only (4-byte dummies otherwise): the reordered index
+    /// stream the chunk BLASes were built over, and the remap the shaders read
+    /// to recover a triangle id from `(InstanceID, PrimitiveIndex)` —
+    /// `blas_tri[chunk_base[inst] + prim]`. Held by SRVs in the space1 table.
+    pub blas_tri: ID3D12Resource,
+    pub chunk_base: ID3D12Resource,
+    /// Packed slots (== `n_tris` when armed, 0 when not) and chunk count — the
+    /// SRV element counts, and the must-fire the GPU gates read.
+    n_packed: u32,
+    pub n_chunks: u32,
     /// `Scene::texcoords` as float2 per vertex (parallel to positions; zeros
     /// on procedural scenes — 4 dummy bytes, never read there).
     pub texcoords: ID3D12Resource,
@@ -1111,9 +1125,14 @@ impl SceneGpu {
     /// `bc7_q`: block-compress the OPAQUE scene textures at this ISPC quality
     /// before upload (`--bc7`; `None` = today's RGBA8 everywhere). Alpha-masked
     /// cutout textures stay RGBA8 either way — see src/bc7.rs.
+    /// `bvh` is the CHUNKING source for `--blas-split` and is read only when
+    /// that lever is armed — deliberately separate from `sw_bvh`, which decides
+    /// whether the software tree UPLOADS (a DXR-only session passes
+    /// `SwAccel::None` and still splits).
     pub fn new_uploaded(
         device: &ID3D12Device,
         scene: &Scene,
+        bvh: &Bvh,
         sw_bvh: SwAccel,
         sub: &mut dyn d3d12::Submit,
         bc7_q: Option<bc7::Quality>,
@@ -1506,6 +1525,103 @@ impl SceneGpu {
         let non_opaque = scene.any_alpha
             || (scene.any_height && crate::bvh::height_armed())
             || scene.any_transmissive;
+
+        // --blas-split: one BLAS per maximal BVH subtree under the cap, each
+        // instanced identity into the TLAS. Everything below this block is the
+        // single-BLAS build, reached whenever the lever is off — bit-identical
+        // to the pre-feature path, which is what keeps every unarmed gate's
+        // baseline valid.
+        if let Some(cap) = crate::blas_split::max_prims() {
+            let t0 = std::time::Instant::now();
+            let plan = crate::blas_split::plan(bvh, cap);
+            // The chunk index rides InstanceID (24 bits). No real scene comes
+            // near this at a 64k cap; a tiny cap on a huge scene could, and a
+            // silent wrap would remap every triangle in the overflowing chunks.
+            if plan.chunks() > (1 << 24) {
+                return Err(format!(
+                    "--blas-split {cap}: {} chunks exceeds the 2^24 InstanceID ceiling \
+                     (raise the cap)",
+                    plan.chunks()
+                ));
+            }
+            // A triangle-free scene plans zero chunks, and every size below
+            // would be zero (a 0-byte committed_buffer is invalid, a 0-instance
+            // TLAS pointless). Unreachable today — every scene carries at least
+            // the ground quad — so this is the assert, not a fallback.
+            if plan.chunks() == 0 {
+                return Err("--blas-split: the scene has no triangles to chunk".into());
+            }
+            // The reordered index stream, mapped straight out of the plan — no
+            // transient CPU copy of the whole buffer (12 B/tri would be 1 GB on
+            // a tiled scene). Positions are SHARED with the single-BLAS path:
+            // chunks reference the one vertex buffer, so nothing duplicates.
+            let blas_indices = stream_buffer(
+                device,
+                sub,
+                &ring,
+                &plan.packed_tris,
+                |&t| scene.indices[t as usize],
+                srv,
+            )?;
+            let blas_tri_b = stream_buffer(device, sub, &ring, &plan.packed_tris, |t| *t, srv)?;
+            let chunk_base_b = stream_buffer(device, sub, &ring, &plan.chunk_base, |b| *b, srv)?;
+
+            let (blas, tlas, report) = build_split_blas(
+                device,
+                &device5,
+                sub,
+                &positions_b,
+                &blas_indices,
+                &plan,
+                n_verts,
+                non_opaque,
+                scene.any_transmissive,
+            )?;
+            // A built AS is self-contained: the reordered index stream existed
+            // only to feed the builds (which `sub` ran to completion), so it
+            // goes back now rather than resting for the session. `indices_b`
+            // (original order) stays — that one is what SHADING reads.
+            drop(blas_indices);
+            let (lo, mean, hi) = plan.stats();
+            eprintln!(
+                "gpu scene: streams {} MB | {} | blas-split {} chunks (prims min {lo} mean {mean:.0} max {hi}, cap {cap}) in {:.0} ms{}",
+                (scene_stream_bytes(scene, sw_bvh) + plan.packed_tris.len() * 16) >> 20,
+                report,
+                plan.chunks(),
+                t0.elapsed().as_secs_f64() * 1e3,
+                match adapter::vram_info(device) {
+                    Some((usage, budget)) =>
+                        format!(" | vram {} / {} MB", usage >> 20, budget >> 20),
+                    None => String::new(),
+                }
+            );
+            drop(ring);
+            return Ok(Self {
+                bvh_nodes,
+                tri_idx,
+                ftree_nodes,
+                positions: positions_b,
+                normals: normals_b,
+                indices: indices_b,
+                tri_mat,
+                materials: materials_b,
+                blas,
+                tlas,
+                blas_tri: blas_tri_b,
+                chunk_base: chunk_base_b,
+                n_packed: plan.packed_tris.len() as u32,
+                n_chunks: plan.chunks() as u32,
+                texcoords: texcoords_b,
+                mat_cutout: mat_cutout_b,
+                mat_height: mat_height_b,
+                mat_shadow: mat_shadow_b,
+                textures: textures_v,
+                n_verts,
+                n_tris,
+                n_mats: scene.materials.len() as u32,
+            });
+        }
+
         let geom = geometry_desc(
             &positions_b,
             &indices_b,
@@ -1710,6 +1826,18 @@ impl SceneGpu {
             materials: materials_b,
             blas,
             tlas,
+            // Unarmed: no remap exists and the kernels compile without
+            // BLAS_SPLIT, so these are never read — 4-byte dummies keep the
+            // descriptor table's shape uniform across both paths.
+            blas_tri: committed_buffer(device, 4, D3D12_RESOURCE_FLAG_NONE, srv)?,
+            chunk_base: committed_buffer(device, 4, D3D12_RESOURCE_FLAG_NONE, srv)?,
+            // ZERO, not 1: these are SRV ELEMENT counts, and the table's
+            // `chunk_base` view is sized `n_chunks + 1` (the plan's sentinel).
+            // A 1 here would describe 8 bytes of a 4-byte dummy — an
+            // out-of-range buffer SRV, which is exactly the kind of invalid
+            // view that takes the device out at heap-write time.
+            n_packed: 0,
+            n_chunks: 0,
             texcoords: texcoords_b,
             mat_cutout: mat_cutout_b,
             mat_height: mat_height_b,
@@ -1722,9 +1850,9 @@ impl SceneGpu {
     }
 
     /// Write the RP_SCENE_TEX table's descriptors into `heap` at slots
-    /// `base..`: 7 buffer SRVs (texcoords, indices, tri_mat, mat_cutout,
-    /// positions, mat_height, mat_shadow — t0..t6 space1) then one
-    /// Texture2D SRV per scene texture (t7.. space1).
+    /// `base..`: 9 buffer SRVs (texcoords, indices, tri_mat, mat_cutout,
+    /// positions, mat_height, mat_shadow, blas_tri, chunk_base — t0..t8
+    /// space1) then one Texture2D SRV per scene texture (t9.. space1).
     /// The heap must be sized `base + TEX_TABLE_BUFS + textures.len()`.
     pub fn write_scene_descriptors(
         &self,
@@ -1764,6 +1892,16 @@ impl SceneGpu {
         buf_srv(&self.positions, 12, self.n_verts, 4);
         buf_srv(&self.mat_height, 8, self.n_mats, 5);
         buf_srv(&self.mat_shadow, 16, self.n_mats, 6);
+        // --blas-split's (InstanceID, PrimitiveIndex) -> tri remap. Unarmed
+        // sessions bind the 4-byte dummies: the kernels compile without
+        // BLAS_SPLIT and never read them, but the table's shape (and so
+        // TEX_TABLE_BUFS, and so texs[]'s base register) stays session-
+        // independent. Both element counts are ZERO-BASED on purpose and lean
+        // on `elems.max(1)` above: a view must describe no more than the 4-byte
+        // dummy holds, and an over-long one takes the device out at heap-write
+        // time (n_chunks + 1 with n_chunks = 1 did exactly that once).
+        buf_srv(&self.blas_tri, 4, self.n_packed, 7);
+        buf_srv(&self.chunk_base, 4, self.n_chunks + 1, 8);
         for (i, tex) in self.textures.iter().enumerate() {
             let tex_desc = unsafe { tex.GetDesc() };
             let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
@@ -1818,6 +1956,15 @@ pub(crate) fn trans_defs(scene: &Scene) -> &'static str {
     if scene.any_transmissive { "#define TRANS_SHADOW 1" } else { "" }
 }
 
+/// The `--blas-split` twin: armed sessions compile `tri_of()` as the chunk
+/// remap (`blas_tri[chunk_base[inst] + prim]`), unarmed ones as the identity,
+/// so every unarmed kernel is byte-identical to the pre-feature source. A
+/// SESSION constant (the lever is read once, before any tracer is built), not
+/// a per-scene one — hence no `scene` argument.
+pub(crate) fn blas_defs() -> &'static str {
+    if crate::blas_split::max_prims().is_some() { "#define BLAS_SPLIT 1" } else { "" }
+}
+
 /// HLSL prelude every compile unit takes: the `--spp` jitter table's row count
 /// (`FrameCb::jitters`, hand-mirrored in trace_common.hlsli's cbuffer). The
 /// SIZE is derived from `dlss::MAX_SPP` rather than written twice — a literal
@@ -1853,6 +2000,295 @@ pub(crate) fn spp_defs() -> String {
         crate::fireflies::MAX_FIREFLIES,
         sky_j
     )
+}
+
+/// D3D12 requires every acceleration structure to start on a 256-byte boundary
+/// (`D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT`), which is what
+/// lets all chunk BLASes share ONE committed arena instead of one resource
+/// each.
+const AS_ALIGN: u64 = 256;
+
+fn align_as(x: u64) -> u64 {
+    (x + AS_ALIGN - 1) & !(AS_ALIGN - 1)
+}
+
+/// `--blas-split`: build one BLAS per plan chunk and a TLAS instancing them all
+/// identity. Returns (arena holding every compacted chunk BLAS, TLAS, the
+/// `gpu scene:` line's size report).
+///
+/// Shape mirrors the single-BLAS build one level up — build worst-case with
+/// ALLOW_COMPACTION emitting postbuild sizes, read them back, compact into an
+/// exact-size arena, then build the TLAS against the compacted addresses — and
+/// keeps its affordances for the same reasons: compaction is 40-50% of BLAS
+/// memory, and at a few hundred chunks the extra queries are noise. Builds run
+/// SERIALLY through one max-sized scratch buffer with a UAV barrier between
+/// them; the alternative (a scratch slot per chunk) trades hundreds of MB of
+/// transient VRAM for parallelism the build is not bound by.
+#[allow(clippy::too_many_arguments)]
+fn build_split_blas(
+    device: &ID3D12Device,
+    device5: &ID3D12Device5,
+    sub: &mut dyn d3d12::Submit,
+    positions: &ID3D12Resource,
+    blas_indices: &ID3D12Resource,
+    plan: &crate::blas_split::BlasPlan,
+    n_verts: u32,
+    non_opaque: bool,
+    any_transmissive: bool,
+) -> Result<(ID3D12Resource, ID3D12Resource, String)> {
+    let n = plan.chunks();
+    let uaf = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    let as_state = D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE;
+    let flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE
+        | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_COMPACTION;
+
+    // Per-chunk geometry descs: the SHARED vertex buffer, this chunk's slice of
+    // the reordered index stream. Held for the whole function — the build descs
+    // point at them.
+    let index_va = unsafe { blas_indices.GetGPUVirtualAddress() };
+    let geoms: Vec<D3D12_RAYTRACING_GEOMETRY_DESC> = (0..n)
+        .map(|i| {
+            let mut g = geometry_desc(
+                positions,
+                blas_indices,
+                n_verts,
+                plan.prims(i),
+                non_opaque,
+                any_transmissive,
+            );
+            g.Anonymous.Triangles.IndexBuffer =
+                index_va + plan.chunk_base[i] as u64 * 12;
+            g
+        })
+        .collect();
+
+    // Sizing pass: worst-case offsets into the build arena + the scratch high
+    // water mark. One prebuild query per chunk — a few hundred calls.
+    let mut build_off = Vec::with_capacity(n);
+    let mut total_build = 0u64;
+    let mut scratch_max = 0u64;
+    for g in &geoms {
+        let inputs = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
+            Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL,
+            Flags: flags,
+            NumDescs: 1,
+            DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
+            Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+                pGeometryDescs: g,
+            },
+        };
+        let mut info = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO::default();
+        unsafe { device5.GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &mut info) };
+        build_off.push(total_build);
+        total_build = align_as(total_build + info.ResultDataMaxSizeInBytes);
+        scratch_max = scratch_max.max(info.ScratchDataSizeInBytes);
+    }
+
+    let tlas_inputs = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
+        Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL,
+        Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE,
+        NumDescs: n as u32,
+        DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
+        Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+            InstanceDescs: 0,
+        },
+    };
+    let mut tlas_info = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO::default();
+    unsafe { device5.GetRaytracingAccelerationStructurePrebuildInfo(&tlas_inputs, &mut tlas_info) };
+
+    // VRAM pre-flight: the transient peak is the worst-case arena + scratch +
+    // the TLAS, and the caller has already committed the scene streams. Over
+    // budget is a LOUD failure here rather than a WDDM demotion that silently
+    // renders at a tenth the speed.
+    //
+    // It CANNOT degrade to the single-BLAS build, and the reason is ordering:
+    // both tracers bake `blas_defs()` into their kernels/RTPSO before calling
+    // `new_uploaded`, so by the time this function can price the structure the
+    // shaders already read `blas_tri[chunk_base[inst] + prim]` — handing them a
+    // one-BLAS scene and the 4-byte dummies would remap every hit to garbage.
+    // (Falling back WOULD be possible by binding an identity remap instead of
+    // the dummies, at 4 B/tri and one indirection; deliberately not done — an
+    // untested path reachable only by exhausting VRAM is exactly how the
+    // dummy-SRV device removal got in.) So the tracer init fails, and the
+    // session's normal shape takes over: a loud line and the CPU renderer.
+    if let Some((usage, budget)) = adapter::vram_info(device) {
+        let want = total_build + scratch_max + tlas_info.ResultDataMaxSizeInBytes;
+        if usage + want > budget {
+            return Err(format!(
+                "--blas-split: {} chunks need {} MB of acceleration structure on top of \
+                 {} MB already committed, over the {} MB budget — raise the cap or drop \
+                 --blas-split (the GPU tracer cannot start, so the session falls back to \
+                 the CPU renderer)",
+                n,
+                want >> 20,
+                usage >> 20,
+                budget >> 20
+            ));
+        }
+    }
+
+    let build_arena = committed_buffer(device, total_build, uaf, as_state)?;
+    let scratch = committed_buffer(
+        device,
+        scratch_max.max(tlas_info.ScratchDataSizeInBytes),
+        uaf,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+    )?;
+    let build_va = unsafe { build_arena.GetGPUVirtualAddress() };
+    let scratch_va = unsafe { scratch.GetGPUVirtualAddress() };
+
+    // Submit 1: every chunk build, each emitting its compacted size into one
+    // u64-per-chunk buffer, copied to readback in the same list.
+    let csize_buf = committed_buffer(
+        device,
+        (n * 8) as u64,
+        uaf,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+    )?;
+    let csize_rb = d3d12::ReadbackBuffer::new(device, n * 8)?;
+    let csize_va = unsafe { csize_buf.GetGPUVirtualAddress() };
+    sub.run_list(&mut |list| {
+        let list4: ID3D12GraphicsCommandList4 =
+            list.cast().map_err(|e| format!("ID3D12GraphicsCommandList4: {e}"))?;
+        for (i, g) in geoms.iter().enumerate() {
+            let desc = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
+                DestAccelerationStructureData: build_va + build_off[i],
+                Inputs: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
+                    Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL,
+                    Flags: flags,
+                    NumDescs: 1,
+                    DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
+                    Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+                        pGeometryDescs: g,
+                    },
+                },
+                SourceAccelerationStructureData: 0,
+                ScratchAccelerationStructureData: scratch_va,
+            };
+            let postbuild = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC {
+                DestBuffer: csize_va + (i * 8) as u64,
+                InfoType: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_COMPACTED_SIZE,
+            };
+            unsafe { list4.BuildRaytracingAccelerationStructure(&desc, Some(&[postbuild])) };
+            // The scratch buffer is shared, so consecutive builds MUST NOT
+            // overlap — this barrier is the serialization, not an optimization
+            // to remove.
+            unsafe { list.ResourceBarrier(&[uav_barrier(None)]) };
+        }
+        unsafe {
+            list.ResourceBarrier(&[transition(
+                &csize_buf,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )])
+        };
+        unsafe { list.CopyBufferRegion(&csize_rb.resource, 0, &csize_buf, 0, (n * 8) as u64) };
+        Ok(())
+    })?;
+
+    let csizes: Vec<u64> = {
+        let mut ptr = std::ptr::null_mut();
+        unsafe { csize_rb.resource.Map(0, None, Some(&mut ptr)) }
+            .map_err(|e| format!("compacted-size Map: {e}"))?;
+        let v = (0..n)
+            .map(|i| unsafe { (ptr as *const u64).add(i).read_unaligned() })
+            .collect();
+        unsafe { csize_rb.resource.Unmap(0, None) };
+        v
+    };
+
+    // Compacted layout. A degenerate reported size (0, or no smaller than the
+    // build) keeps that chunk uncompacted — never wrong, just bigger — exactly
+    // as the single-BLAS path does.
+    let mut final_off = Vec::with_capacity(n);
+    let mut total_final = 0u64;
+    let mut compact = Vec::with_capacity(n);
+    for i in 0..n {
+        let built = if i + 1 < n {
+            build_off[i + 1] - build_off[i]
+        } else {
+            total_build - build_off[i]
+        };
+        let c = csizes[i] > 0 && csizes[i] < built;
+        compact.push(c);
+        final_off.push(total_final);
+        total_final = align_as(total_final + if c { csizes[i] } else { built });
+    }
+    let arena = committed_buffer(device, total_final, uaf, as_state)?;
+    let arena_va = unsafe { arena.GetGPUVirtualAddress() };
+
+    // Identity instances, InstanceID = chunk index — the (InstanceID,
+    // PrimitiveIndex) -> tri remap's first coordinate, and the stable handle a
+    // cut-driven TLAS rebuild would address chunks by.
+    let instances = d3d12::UploadBuffer::new(
+        device,
+        n * std::mem::size_of::<D3D12_RAYTRACING_INSTANCE_DESC>(),
+    )?;
+    for i in 0..n {
+        let mut idesc: D3D12_RAYTRACING_INSTANCE_DESC = unsafe { std::mem::zeroed() };
+        idesc.Transform = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+        idesc._bitfield1 = (0xffu32 << 24) | (i as u32 & 0x00ff_ffff);
+        idesc._bitfield2 = 0;
+        idesc.AccelerationStructure = arena_va + final_off[i];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                &idesc as *const _ as *const u8,
+                instances
+                    .ptr
+                    .add(i * std::mem::size_of::<D3D12_RAYTRACING_INSTANCE_DESC>()),
+                std::mem::size_of::<D3D12_RAYTRACING_INSTANCE_DESC>(),
+            )
+        };
+    }
+    let tlas = committed_buffer(device, tlas_info.ResultDataMaxSizeInBytes, uaf, as_state)?;
+    let instances_va = unsafe { instances.resource.GetGPUVirtualAddress() };
+
+    // Submit 2: compact every chunk into the exact-size arena, then build the
+    // TLAS against the COMPACTED addresses.
+    sub.run_list(&mut |list| {
+        let list4: ID3D12GraphicsCommandList4 =
+            list.cast().map_err(|e| format!("ID3D12GraphicsCommandList4: {e}"))?;
+        for i in 0..n {
+            unsafe {
+                list4.CopyRaytracingAccelerationStructure(
+                    arena_va + final_off[i],
+                    build_va + build_off[i],
+                    if compact[i] {
+                        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_COMPACT
+                    } else {
+                        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE
+                    },
+                )
+            };
+        }
+        unsafe { list.ResourceBarrier(&[uav_barrier(None)]) };
+        let desc = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
+            DestAccelerationStructureData: unsafe { tlas.GetGPUVirtualAddress() },
+            Inputs: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
+                Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL,
+                Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE,
+                NumDescs: n as u32,
+                DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
+                Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+                    InstanceDescs: instances_va,
+                },
+            },
+            SourceAccelerationStructureData: 0,
+            ScratchAccelerationStructureData: scratch_va,
+        };
+        unsafe { list4.BuildRaytracingAccelerationStructure(&desc, None) };
+        unsafe { list.ResourceBarrier(&[uav_barrier(None)]) };
+        Ok(())
+    })?;
+
+    let report = format!(
+        "blas {} MB (compacted from {}) | tlas {} MB | transient scratch {} MB (freed)",
+        total_final >> 20,
+        total_build >> 20,
+        tlas_info.ResultDataMaxSizeInBytes >> 20,
+        scratch_max.max(tlas_info.ScratchDataSizeInBytes) >> 20,
+    );
+    Ok((arena, tlas, report))
 }
 
 fn geometry_desc(
@@ -2444,10 +2880,11 @@ impl TraceGpu {
         // Not shipping levers — they change the image.
         let abl = std::env::var("FR_ABL").unwrap_or_default();
         let defs = format!(
-            "{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}",
             alpha_defs(scene),
             height_defs(scene),
             trans_defs(scene),
+            blas_defs(),
             if abl.contains("sunt") { "#define ABL_SUNT 1" } else { "" },
             if abl.contains("rough") { "#define ABL_ROUGH 1" } else { "" }
         );
@@ -2641,7 +3078,7 @@ impl TraceGpu {
             Some(t) => SwAccel::Both(bvh, t),
             None => SwAccel::Bvh(bvh),
         };
-        let scene_gpu = SceneGpu::new_uploaded(device, scene, sw, sub, bc7_q)?;
+        let scene_gpu = SceneGpu::new_uploaded(device, scene, bvh, sw, sub, bc7_q)?;
         drop(ft);
 
         let uaf = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;

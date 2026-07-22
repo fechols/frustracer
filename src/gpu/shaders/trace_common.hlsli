@@ -1299,6 +1299,25 @@ StructuredBuffer<MatH>   mat_height : register(t5, space1);
 // by data), a = transmission; a == 0 ⇒ opaque. transmit_q's per-interface
 // data (the mat_cutout pattern).
 StructuredBuffer<float4> mat_shadow : register(t6, space1);
+// --blas-split (BLAS_SPLIT): the scene is one BLAS per maximal BVH subtree
+// under the cap, so PrimitiveIndex() is an index into a CHUNK, not a triangle
+// id. blas_tri is the chunk-major remap (original tri ids, the order the chunk
+// index buffers were built in) and chunk_base[i] the chunk's first slot —
+// hence tri_of() below. Declared unconditionally (the descriptors are always
+// written; unarmed sessions bind 4-byte dummies) so the space1 register wall
+// does not move with the lever, but READ only under BLAS_SPLIT.
+StructuredBuffer<uint>   blas_tri   : register(t7, space1);
+StructuredBuffer<uint>   chunk_base : register(t8, space1);
+
+// The one (InstanceID, PrimitiveIndex) -> triangle id reconstruction. Without
+// the lever every intersector's primitive index IS the triangle id (one BLAS
+// over scene.indices in order + an identity instance), which is what the
+// unarmed arm compiles to, verbatim.
+#ifdef BLAS_SPLIT
+uint tri_of(uint inst, uint prim) { return blas_tri[chunk_base[inst] + prim]; }
+#else
+uint tri_of(uint inst, uint prim) { return prim; }
+#endif
 // bvh.rs::SHADOW_TP_MIN — the throughput floor below which a segment counts
 // opaque. Tints are ≤ 1 per component, so the running product is monotone
 // decreasing and flooring mid-traversal (rt.hlsli) or at the return
@@ -1308,7 +1327,7 @@ StructuredBuffer<float4> mat_shadow : register(t6, space1);
 // maps — Texture::srgb), carrying the FULL CPU-generated mip chain (built in
 // texture.rs::build_mips, uploaded verbatim — CPU-trilinear parity: both
 // samplers read identical texels at identical ray-cone lods).
-Texture2D<float4>        texs[]     : register(t7, space1);
+Texture2D<float4>        texs[]     : register(t9, space1);
 // Static: trilinear, repeat wrap — texture.rs::sample_trilinear in hardware
 // (sRGB decode per texel via the SRGB SRV format, texel centers at i + 0.5;
 // every sample passes an explicit ray-cone lod to SampleLevel, and lod <= 0

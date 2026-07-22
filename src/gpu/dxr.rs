@@ -111,6 +111,9 @@ impl DxrGpu {
         device: &ID3D12Device,
         dxc: &Dxc,
         scene: &Scene,
+        // The --blas-split chunking source; read only when that lever is armed
+        // (this pipeline never uploads the software tree).
+        bvh: &crate::bvh::Bvh,
         rw: u32,
         rh: u32,
         gbuf_full: bool,
@@ -134,10 +137,11 @@ impl DxrGpu {
         let sd = trace::spp_defs();
         let sd = sd.as_str();
         let defs = format!(
-            "{}\n{}\n{}",
+            "{}\n{}\n{}\n{}",
             trace::alpha_defs(scene),
             trace::height_defs(scene),
-            trace::trans_defs(scene)
+            trace::trans_defs(scene),
+            trace::blas_defs()
         );
         let lib_src = [
             defs.as_str(),
@@ -308,9 +312,16 @@ impl DxrGpu {
 
         // SwAccel::None: the DXR pipeline never binds the software BVH (see
         // bind_common — t0/t1 stay unset), so its ~32 B/node upload is
-        // skipped entirely (~2.3 GB at 100M tris).
-        let scene_gpu =
-            SceneGpu::new_uploaded(device, scene, crate::gpu::trace::SwAccel::None, submit, bc7_q)?;
+        // skipped entirely (~2.3 GB at 100M tris). `bvh` is still handed over:
+        // --blas-split chunks the tree on the CPU without uploading it.
+        let scene_gpu = SceneGpu::new_uploaded(
+            device,
+            scene,
+            bvh,
+            crate::gpu::trace::SwAccel::None,
+            submit,
+            bc7_q,
+        )?;
 
         let uaf = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         let ua = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;

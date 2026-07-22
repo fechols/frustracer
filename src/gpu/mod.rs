@@ -1249,9 +1249,9 @@ impl GpuContext {
         &mut self,
         dxc: &dxc::Dxc,
         scene: &crate::scene::Scene,
-        // Unused since the DXR pipeline stopped uploading the software BVH
-        // (SceneGpu sw_bvh: None); kept so the call sites stay uniform.
-        _bvh: &crate::bvh::Bvh,
+        // Not uploaded (the DXR pipeline never binds the software tree), but
+        // read on the CPU as the --blas-split chunking source.
+        bvh: &crate::bvh::Bvh,
         rw: u32,
         rh: u32,
         gbuf: bool,
@@ -1262,7 +1262,8 @@ impl GpuContext {
             return Ok(());
         }
         let dev = self.d3d.device.clone();
-        let mut d = dxr::DxrGpu::new(&dev, dxc, scene, rw, rh, gbuf, debug, bc7_q, &mut self.d3d)?;
+        let mut d =
+            dxr::DxrGpu::new(&dev, dxc, scene, bvh, rw, rh, gbuf, debug, bc7_q, &mut self.d3d)?;
         if gbuf {
             self.wire_session_feed(rw, rh, |kind, targets| d.wire_feed_add(&dev, kind, targets))?;
         }

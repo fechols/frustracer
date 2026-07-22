@@ -2,9 +2,14 @@
 // (leaf/reference shading, hemi leaf rays, verify probes). Requires
 // trace_common.hlsli pasted first.
 //
-// One BLAS over scene.indices in order + one identity-instance TLAS, so
-// CommittedPrimitiveIndex() == tri and tri_mat/indices/normals index
-// directly. No cull flags (moller_trumbore is two-sided). Geometry is OPAQUE
+// The scene is one BLAS per maximal BVH subtree of <= 64k tris, each an
+// identity instance (BLAS_SPLIT — the DEFAULT), so a primitive index is an
+// index into a CHUNK: every one below goes through trace_common.hlsli's
+// tri_of(), the chunk remap. Under --no-blas-split it is one BLAS over
+// scene.indices in order and tri_of compiles to the identity, which is the
+// build that made CommittedPrimitiveIndex() == tri true. Never index
+// tri_mat/indices/normals by a raw primitive index — go through tri_of().
+// No cull flags (moller_trumbore is two-sided). Geometry is OPAQUE
 // unless the scene has alpha-masked textures: then trace.rs builds the BLAS
 // with FLAG_NONE and prepends #define ALPHA_CUTOUT 1, and the wrappers below
 // run a candidate loop mirroring bvh.rs::moller_trumbore's rejection — the
@@ -82,7 +87,8 @@ bool trace_closest(float3 o, float3 d, float tmin, float tmax, out HitInfo h) {
         float ct = q.CandidateTriangleRayT();
         float cu = q.CandidateTriangleBarycentrics().x;
         float cv = q.CandidateTriangleBarycentrics().y;
-        uint rej = candidate_reject(q.CandidatePrimitiveIndex(), o, d, ct, cu, cv);
+        uint rej = candidate_reject(
+            tri_of(q.CandidateInstanceID(), q.CandidatePrimitiveIndex()), o, d, ct, cu, cv);
         if (rej == 0u && ct > tmin && ct < tmax)
             q.CommitNonOpaqueTriangleHit();
         else if (rej == 1u)
@@ -92,7 +98,7 @@ bool trace_closest(float3 o, float3 d, float tmin, float tmax, out HitInfo h) {
     }
     if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
         h.t = q.CommittedRayT();
-        h.tri = q.CommittedPrimitiveIndex();
+        h.tri = tri_of(q.CommittedInstanceID(), q.CommittedPrimitiveIndex());
         float2 b = q.CommittedTriangleBarycentrics();
         h.u = b.x; h.v = b.y;
         // Re-march the committed winner for the displaced (t', u', v') the
@@ -113,7 +119,8 @@ bool occluded_q(float3 o, float3 d, float tmin, float tmax) {
         float ct = q.CandidateTriangleRayT();
         float cu = q.CandidateTriangleBarycentrics().x;
         float cv = q.CandidateTriangleBarycentrics().y;
-        uint rej = candidate_reject(q.CandidatePrimitiveIndex(), o, d, ct, cu, cv);
+        uint rej = candidate_reject(
+            tri_of(q.CandidateInstanceID(), q.CandidatePrimitiveIndex()), o, d, ct, cu, cv);
         if (rej == 0u && ct > tmin && ct < tmax)
             q.CommitNonOpaqueTriangleHit();
         else if (rej == 1u)
@@ -135,7 +142,7 @@ bool trace_closest(float3 o, float3 d, float tmin, float tmax, out HitInfo h) {
     q.Proceed();
     if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
         h.t = q.CommittedRayT();
-        h.tri = q.CommittedPrimitiveIndex();
+        h.tri = tri_of(q.CommittedInstanceID(), q.CommittedPrimitiveIndex());
         float2 b = q.CommittedTriangleBarycentrics();
         h.u = b.x; h.v = b.y;
         return true;
@@ -192,7 +199,7 @@ float3 transmit_q(float3 o, float3 d, float tmin, float tmax) {
         float ct = q.CandidateTriangleRayT();
         float cu = q.CandidateTriangleBarycentrics().x;
         float cv = q.CandidateTriangleBarycentrics().y;
-        uint tri = q.CandidatePrimitiveIndex();
+        uint tri = tri_of(q.CandidateInstanceID(), q.CandidatePrimitiveIndex());
         uint rej = candidate_reject(tri, o, d, ct, cu, cv);
         if (rej == 0u && ct > tmin && ct < tmax) {
             float4 ms = mat_shadow[uv_tri_mat[tri]];

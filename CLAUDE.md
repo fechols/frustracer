@@ -559,6 +559,109 @@ cargo run --release -- --bvh-builder ploc  # ray-BVH builder bake-off: sah (defa
                                         # scene's hemi-share paired-GI limit (reclassification
                                         # fireflies on a coarser tree — topology-tuned gate; every
                                         # exact-zero soundness gate passes on all four builders)
+cargo run --release -- --no-blas-split  # A/B lever (GPU only) BACK to ONE BLAS over scene.indices
+                                        # in order + an identity instance. THE SPLIT IS THE DEFAULT
+                                        # (65536 tris per BLAS, blas_split::DEFAULT_MAX_PRIMS;
+                                        # --blas-split N overrides the cap): cut the ray BVH into
+                                        # maximal subtrees of <= N tris and build ONE BLAS per
+                                        # subtree, each instanced identity into the TLAS with
+                                        # InstanceID = the chunk index — so the driver's structure
+                                        # is ADDRESSABLE at BVH-node granularity (BlasPlan::
+                                        # chunk_node is the instance <-> node map a cut-driven TLAS
+                                        # rebuild would need). PrimitiveIndex() indexes a CHUNK,
+                                        # not a triangle, so every intersector site goes through
+                                        # trace_common.hlsli's tri_of(inst, prim) =
+                                        # blas_tri[chunk_base[inst] + prim] — the chunk-major remap
+                                        # (blas_tri/chunk_base ride t7/t8 space1, moving texs[] to t9;
+                                        # TEX_TABLE_BUFS 7->9, lockstep with the HLSL). --no-blas-split
+                                        # compiles tri_of as the IDENTITY (no BLAS_SPLIT define, the
+                                        # ALPHA_CUTOUT precedent) and binds 4-byte dummies, which is
+                                        # the pre-feature renderer bit-identically.
+                                        # IT IS THE DEFAULT FOR ROBUSTNESS, NOT SPEED — and the
+                                        # measurement that decided it is worth not re-deriving.
+                                        # On NVIDIA it is NEUTRAL: 4090, THE WORLD, four static
+                                        # poses, gpu-timing running means over thousands of frames,
+                                        # tracer ms 1.692->1.698 (boot), 1.850->1.829 (island),
+                                        # 1.894->1.888 (long view); --spin DXR -0.6% procedural /
+                                        # -2.9% SM-lp, wavefront neutral. On INTEL IT IS THE
+                                        # DIFFERENCE BETWEEN RUNNING AND NOT. BLAS scratch is sized
+                                        # by the LARGEST SINGLE GEOMETRY, so THE WORLD's one
+                                        # 34.4M-tri BLAS made the B70's driver ask 1891 MB of
+                                        # scratch and REMOVE THE DEVICE mid-boot (0x887A0005 ->
+                                        # "dxr: falling back to CPU tracing" -> XeSS disabled ->
+                                        # panic at Present), where the same build asks NVIDIA for
+                                        # 276 MB and survives. Split at 64k the scratch is a
+                                        # function of one chunk — 3 MB — and the session runs
+                                        # (dxr 7.27 ms, frame span 8.34). PROVEN to be the BLAS
+                                        # size and nothing else by `--blas-split 40000000`: one
+                                        # chunk through the ARMED path (no dummies anywhere)
+                                        # reproduces the removal with the same 1891 MB. Intel's
+                                        # compaction differs wildly too (4624->1576 MB vs NVIDIA's
+                                        # 1844->668), so treat single-BLAS scratch as a vendor
+                                        # cliff, not a constant. COSTS, paid on every GPU session:
+                                        # a permanent 4 B/tri remap (+146 MB on the world), a
+                                        # transient 12 B/tri reordered index stream during the
+                                        # builds, and ~1 s of build time at 34.4M tris — against
+                                        # which the scratch peak drops by 276 MB (NV) / 1888 MB
+                                        # (Intel). --no-blas-split is the escape if a mega-scene
+                                        # ever wants that 4 B/tri back.
+                                        # THE CAP IS THE WHOLE DESIGN: 64k puts scenes in
+                                        # the band drivers are tuned for (~1 chunk per ~40k tris —
+                                        # MEASURED procedural 79.7k tris -> 2 chunks, San Miguel
+                                        # low-poly 5.6M -> 152, --stress 5000 3.97M -> 157, THE
+                                        # WORLD 34.4M -> 890, mean ~37k prims) and keeps compaction
+                                        # affordable; a cap in the TENS gives ~25 single-use BLASes
+                                        # per 1000 tris (~250k on San Miguel), two-three orders past
+                                        # normal practice, each paying a header + an instance
+                                        # transition — reachable as `--blas-split 64` precisely so it
+                                        # can be measured, not argued. BLAS
+                                        # 122 MB vs 124 MB single on SM-lp (same 300 MB pre-compaction),
+                                        # build +0.4 s. Build shape mirrors the single-BLAS path
+                                        # (worst-case arena + ALLOW_COMPACTION -> postbuild sizes ->
+                                        # compact into an exact arena -> TLAS over the compacted VAs);
+                                        # chunk BLASes SUB-ALLOCATE from one committed arena at
+                                        # 256-B alignment (never one resource each) and build serially
+                                        # through one max-sized scratch buffer — the UAV barrier
+                                        # between builds IS that sharing's serialization, not a
+                                        # removable pessimization. Vertex positions are SHARED (only
+                                        # the index stream reorders, and it is dropped once the builds
+                                        # run — a built AS is self-contained). A bare numeric that is
+                                        # not a legal cap (0, past u32) exits 2 rather than arming at
+                                        # the default and being read as an OBJ path; only a departure
+                                        # from the default prints a lever line (the `gpu scene:` line
+                                        # already reports the chunk count). A VRAM pre-flight vs
+                                        # adapter::vram_info fails LOUDLY rather than letting WDDM
+                                        # demote, and > 2^24 chunks is an error (the InstanceID
+                                        # ceiling). NOTE what the VRAM failure costs: it CANNOT
+                                        # degrade to the single-BLAS build, because both tracers bake
+                                        # blas_defs() into their kernels/RTPSO BEFORE SceneGpu::
+                                        # new_uploaded runs — by the time the structure can be priced
+                                        # the shaders already read the remap, and a one-BLAS scene
+                                        # under them would remap every hit to garbage. So the tracer
+                                        # init fails and the session falls back to the CPU renderer
+                                        # (an identity remap would make a real fallback possible at
+                                        # 4 B/tri; deliberately not built — an untested path reachable
+                                        # only by exhausting VRAM is how the dummy-SRV device removal
+                                        # got in). blas_split::self_test gates the planner in --check
+                                        # (cap, exact triangle partition, antichain-cut coverage,
+                                        # determinism at the shipping cap, the single-chunk edge, and
+                                        # a MUST-FIRE on the oversized-leaf split at cap
+                                        # widest_leaf-1 — two chunks sharing a node id is the
+                                        # observable proof it ran, and without it --bvh-maxleaf 1
+                                        # would leave that branch dead while every other gate passed;
+                                        # the sub-64 caps are skipped LOUDLY above 4M tris, where one
+                                        # chunk per triangle would spike ~1 GB inside the gate);
+                                        # the REMAP is proven by the existing suites, which now run
+                                        # armed BY DEFAULT — --check-gpu/--check-dxr keep every
+                                        # exact-zero counter at 0 with the same-seed image A/B
+                                        # unchanged to the digit. Both suites FAIL on < 2 chunks
+                                        # when the scene is OVER the cap (an over-cap run can't pass
+                                        # vacuously) and print a NOTE when it is under (a small
+                                        # scene is legitimately one chunk — the identity remap —
+                                        # which is why the predicate is not simply chunks < 2).
+                                        # Run --check-gpu/--check-dxr --no-blas-split to gate the
+                                        # single-BLAS arm; --check* NEVER loads the world, so the
+                                        # Intel removal above is reachable only interactively
 cargo run --release -- --no-cut-rays    # A/B lever: cut-SEEDED rays (primary leaf-tile rays)
                                         # traverse from the BVH root instead; the inherited
                                         # t_start is a scalar and survives. Isolates what the
@@ -953,7 +1056,7 @@ The full algorithm — quadtree frustum tracing with inherited tmin + node cuts,
 
 **A leaf tile is ~32 px, not 64 — the leaf kernel is ONE WAVE wide (`trace::LEAF_GROUP_DEF` = 32), and this is a correctness-of-performance invariant, not a tuning knob.** `depth_full` is driven by the WIDER screen axis, so at 1920×1080 a leaf rect is 1920/2⁸ = 7.5 by 1080/2⁸ = 4.2 — about 32 pixels. The kernel originally dispatched **64** lanes per tile and let the surplus half `return` immediately. On a wave32 GPU that is nearly free (the all-idle second wave retires at once); on **wave64 it is catastrophic** — the idle lanes sit inside the SAME wave and waste half its RT throughput. That single mismatch was most of the AMD-vs-NVIDIA gap: per extra sample the leaf kernel cost **2.27× its own reference kernel on RDNA but only 1.24× on Ada**, for identical work (same rays, same `shade_full`). leaf.hlsl now grid-strides over the tile's pixels, so the group width is free. Measured (`--gpu-timing`, leaf+sky, 1080p, 64 → 32): spp=1 **AMD 1.63 → 1.01 ms (−38%)**, NVIDIA 2.24 → 1.38 (−38%); spp=16 **AMD 19.7 → 11.4 (−42%)**, NVIDIA 10.2 → 7.6 (−25%) — a win on BOTH vendors (a 64-thread group reserves registers for 64 threads on Ada too, so halving it doubles the blocks in flight). 32 is a FLOOR: RDNA's wave is 32 lanes minimum, so a 16-wide group is a half-empty wave again (measured worse), and a tile bigger than 32 px simply takes a second full lap — the same lane utilization a 64-wide group would have had. Bit-neutral: NVIDIA's same-seed wavefront-vs-reference image A/B stays exactly 0.00e0 / hot ch 0 across the change. **Two things this ruled OUT, both worth not re-litigating**: the inherited `t_start` is *exactly free* on AMD as a RayQuery TMin (20.719 vs 20.714 ms with TMin forced to 0 — AMD's documented re-origining costs nothing, and equally buys the ray path nothing); and while the fb arm's register pressure was real (`leaf.hlsl`'s `LEAF_NO_FB`: `fb_mode` is a cbuffer value, so a runtime branch inlines shade_split at both call sites and the kernel's VGPR allocation is the max of the two — worth −11% AMD / −16% NVIDIA, and kept), it was a *shared* cost, not the AMD-specific one.
 
-**The intersector split**: frustum machinery (`bound_query`/`refine_cut` in `frustum.hlsli` — term-for-term ports with the same slacks, `precise` on the accumulating math, per-lane groupshared stacks) runs on our own uploaded BVH; **every actual ray is DXR inline RayQuery** against a driver BLAS/TLAS (one BLAS over `scene.indices` in order + identity instance, so `PrimitiveIndex() == tri`; geometry OPAQUE, no cull — möller-trumbore is two-sided). Leaf primary rays consume the inherited claim as `TMin = t_start` (sound: hit acceptance is strictly beyond TMin and tc is shaved 1e-4 at the advance); cut-*seeded* rays (`intersect_multi`) don't exist on the GPU — RT-core root traversal replaces them, and the cut is consumed only by the bound queries. There is deliberately NO cut-vs-full-tree bound-compare gate: the cut legitimately encodes ancestor culling (e.g. the hemi root's tangent half-space) that a descendant's own frustum can't express, so a conservative full-tree query can report a *lower* bound than the tighter, correct cut. Cut fidelity is gated where claims are consumed: `false-empty` and `tmin-overshoot`, both with real RayQuery rays.
+**The intersector split**: frustum machinery (`bound_query`/`refine_cut` in `frustum.hlsli` — term-for-term ports with the same slacks, `precise` on the accumulating math, per-lane groupshared stacks) runs on our own uploaded BVH; **every actual ray is DXR inline RayQuery** against a driver BLAS/TLAS (geometry OPAQUE, no cull — möller-trumbore is two-sided). **`PrimitiveIndex() == tri` is NO LONGER the shipping configuration**: the scene is one BLAS per maximal BVH subtree of ≤ 64k triangles by default (see `--no-blas-split` in the command block — it defaulted on because a single 34.4M-tri BLAS removes the device on Intel), so the primitive index indexes a CHUNK and every site reads `tri_of(InstanceID(), PrimitiveIndex())` — the chunk remap by default, the identity under `--no-blas-split`. Both GPU pipelines and all of `rt.hlsli`/`dxr.hlsl` route through that one function; if you are adding an intersector site, it is the only correct way to get a triangle id. Leaf primary rays consume the inherited claim as `TMin = t_start` (sound: hit acceptance is strictly beyond TMin and tc is shaved 1e-4 at the advance); cut-*seeded* rays (`intersect_multi`) don't exist on the GPU — RT-core root traversal replaces them, and the cut is consumed only by the bound queries. There is deliberately NO cut-vs-full-tree bound-compare gate: the cut legitimately encodes ancestor culling (e.g. the hemi root's tangent half-space) that a descendant's own frustum can't express, so a conservative full-tree query can report a *lower* bound than the tighter, correct cut. Cut fidelity is gated where claims are consumed: `false-empty` and `tmin-overshoot`, both with real RayQuery rays.
 
 **Hemi on GPU** (H cycles off → AO → GI; still frames, wavefront path only): its own wavefront over `HemiPointRec`s appended by the leaf pass (fb mode splits shade: `partial` = ambient-free color, `ambw` = kd; `compose` is the single accum splat site), processed in `HEMI_BATCH` slices whose per-batch counter/pool reset bounds transient memory (queues sized to batch × 4^(depth−1) — bounded, cannot overflow). Results land in a fixed-point (2^18) atomic accumulator — order-independent adds ⇒ run-to-run determinism; leaf-ray RNG is keyed by (pixel, hemi path, frame, salt), never the atomic slot index. All hemi.rs soundness contracts carry over verbatim (apex t_start = 0 not eps, root cut `[0]`, blocked-must-subdivide, AO's None-means-open-within-radius); `sky_cell` is ported iteratively (no HLSL recursion).
 
