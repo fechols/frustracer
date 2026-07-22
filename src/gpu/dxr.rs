@@ -69,38 +69,43 @@ pub fn require_caps(device: &ID3D12Device) -> Result<()> {
     }
 }
 
-/// R&D lever (FR_DXR_INLINE, default 0 = OFF and byte-identical library —
-/// the W2 arm of the Intel campaign): move the DXR pipeline's rays off
-/// recursive TraceRay and onto inline RayQuery, WITHOUT leaving DispatchRays.
-///
-/// The question it decomposes: the B70 runs this pipeline ~5.1x slower than
-/// the wavefront on the same rays with the same pasted shading code, and the
-/// only structural difference is dispatch shape. Three points pin where that
-/// cost lives:
-///   0 (default) — all TraceRay: the shipping pipeline, bit-identical.
-///   1 — primary TraceRay + INLINE SECONDARIES: rt.hlsli's RayQuery bodies
-///       compile in place of rt_dxr.hlsli's TraceRay flavors, so every ray
+/// `--dxr-inline` (default **1** — the W2 promotion): which of this
+/// pipeline's rays ride recursive TraceRay vs inline RayQuery, without
+/// leaving DispatchRays.
+///   0 — all TraceRay: the original by-the-book pipeline, kept as the A/B
+///       escape (bit-identical library to the pre-lever build).
+///   1 — THE DEFAULT: primary TraceRay -> chs_shade, every secondary
 ///       shade.hlsli fires (shadow/AO/reflection/transmission/translucency)
-///       runs inline inside chs_shade and MaxTraceRecursionDepth drops to 1.
-///       Baseline-vs-1 = the cost of SECONDARY TraceRay dispatch.
+///       an inline RayQuery inside the hit shader (rt.hlsli's bodies compile
+///       in place of rt_dxr.hlsli's TraceRay flavors);
+///       MaxTraceRecursionDepth 1. Promoted because it strictly DOMINATES
+///       mode 0 at every measured point on both vendors — never slower,
+///       −68 to −81% at the shipping spp=1 — while the payload/closest-hit/
+///       SBT machinery keeps doing its real job for the primary.
 ///   2 — everything inline in raygen (dxr.hlsl's DXR_INLINE_SEC == 2 arm):
 ///       no TraceRay anywhere, DispatchRays as a bare launch grid over the
-///       reference loop. 1-vs-2 = the primary TraceRay + closest-hit stage;
-///       2-vs-the-compute-reference-kernel = pure DispatchRays-vs-Dispatch
-///       launch overhead.
-/// Both armed modes need SM 6.5 + RT tier 1.1 (the wavefront's own floor —
-/// lib_6_5 for RayQuery); on lesser hardware the lever prints one loud line
-/// and stays off. The RTPSO/SBT layout is unchanged in every mode: unreached
-/// hit groups and misses stay exported (identifier-only records, no cost).
+///       reference loop. The measurement arm that proved launch overhead is
+///       ≈ zero — and the right MANUAL pick for a high-spp Intel DXR
+///       session (mode 1's fat hit shader pays occupancy per sample: B70
+///       marginal 2.2 ms/sample vs mode 2's 1.11).
+/// Measured (--spin path 1080p spp=1, GPU frame span ms, default/stress/
+/// SM-lp): B70 mode 0 9.05/5.30/6.75 -> mode 1 2.35/1.64/1.94 -> mode 2
+/// 1.41/1.22/1.29; 4090 1.34/0.79/1.18 -> 0.26/0.25/0.34 -> 0.29/0.27/0.34.
+/// Armed modes compile lib_6_5 and need RT tier 1.1 (the wavefront's own
+/// floor); lesser hardware degrades to 0 with one loud line — the default is
+/// a preference, never a requirement (NOT the --fsr4 shape). The RTPSO/SBT
+/// layout is identical in every mode: unreached hit groups and misses stay
+/// exported (identifier-only records, no cost). Set from main's parse via
+/// `set_inline_mode` (the texture::set_aniso knob-before-anything idiom);
+/// legal values 0..=2, main exits 2 on anything else.
+static INLINE_MODE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+pub fn set_inline_mode(n: u32) {
+    INLINE_MODE.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn dxr_inline_mode() -> u32 {
-    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("FR_DXR_INLINE")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .filter(|n| *n <= 2)
-            .unwrap_or(0)
-    })
+    INLINE_MODE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub struct DxrGpu {
@@ -164,33 +169,38 @@ impl DxrGpu {
             device.cast().map_err(|e| format!("ID3D12Device5: {e}"))?;
         let root_sig = trace::create_root_signature(device)?;
 
-        // FR_DXR_INLINE (see dxr_inline_mode): armed modes compile RayQuery
+        // --dxr-inline (see dxr_inline_mode): armed modes compile RayQuery
         // into the library, which needs the wavefront's caps floor, not this
-        // pipeline's — gate here so a tier-1.0 box degrades to the shipping
-        // path with one loud line instead of a DXC error.
+        // pipeline's — gate here so a tier-1.0 box degrades to the TraceRay
+        // path with one loud line instead of a DXC error. The default (1)
+        // stays QUIET; only a departure prints a lever line (the blas-split
+        // precedent).
         let inline_mode = {
             let m = dxr_inline_mode();
             if m > 0 {
                 let caps = trace::query_caps(device)?;
                 if caps.rt_tier < D3D12_RAYTRACING_TIER_1_1.0 || caps.shader_model < 0x65 {
                     eprintln!(
-                        "dxr: FR_DXR_INLINE={m} ignored — inline RayQuery needs RT tier 1.1 + \
-                         SM 6.5 (device: tier {}, SM 0x{:x})",
+                        "dxr: --dxr-inline {m} unavailable — inline RayQuery needs RT tier 1.1 \
+                         + SM 6.5 (device: tier {}, SM 0x{:x}); running the all-TraceRay \
+                         pipeline",
                         caps.rt_tier, caps.shader_model
                     );
                     0
                 } else {
-                    eprintln!(
-                        "dxr: FR_DXR_INLINE={m} — {} (lib_6_5, MaxTraceRecursionDepth 1)",
-                        if m == 1 {
-                            "TraceRay primary + inline RayQuery secondaries"
-                        } else {
-                            "everything inline in raygen (DispatchRays as a bare launch grid)"
-                        }
-                    );
+                    if m == 2 {
+                        eprintln!(
+                            "dxr: --dxr-inline 2 — everything inline in raygen (DispatchRays \
+                             as a bare launch grid; the default is 1, inline secondaries)"
+                        );
+                    }
                     m
                 }
             } else {
+                eprintln!(
+                    "dxr: --dxr-inline 0 — all-TraceRay dispatch (the pre-lever pipeline; \
+                     the default is 1, inline RayQuery secondaries)"
+                );
                 0
             }
         };

@@ -484,8 +484,8 @@ same pasted shading code; only the dispatch shape differs — recursive
 `TraceRay` through a shader binding table versus inline `RayQuery` in
 compute. On an Arc Pro B70 that difference read as "DispatchRays is 5×
 slower than the wavefront," which is the kind of claim that deserves a
-decomposition rather than a vibe. `FR_DXR_INLINE` (env lever, default 0 =
-off and byte-identical) is that decomposition: mode 1 keeps the primary
+decomposition rather than a vibe. `--dxr-inline 0|1|2` is that
+decomposition: mode 1 keeps the primary
 TraceRay → closest-hit but compiles the inline-RayQuery trace primitives in
 place of the TraceRay flavors, so every secondary ray (shadow, AO,
 reflection, the glass chain) runs inline *inside the hit shader*; mode 2
@@ -523,7 +523,15 @@ a fat hit shader is fine at 1 spp and ruinous at 16. The spp sweep also
 places the wavefront: on the B70 the all-inline DXR only beats the quadtree
 below ~3 spp (the quadtree's marginal sample is 0.86 ms vs the
 reference-shaped 1.11), while on the 4090 inline DXR wins at every spp
-measured. The lever ships off by default; the numbers are the product.
+measured.
+
+The measurement became the default: **mode 1 now ships as the DXR
+pipeline's dispatch mode** — it strictly dominates the all-TraceRay build
+at every measured (vendor, scene, spp) point while keeping the payload /
+closest-hit / SBT machinery doing its real job for the primary ray.
+`--dxr-inline 0` is the A/B escape back to the by-the-book pipeline, and
+`--dxr-inline 2` remains the right manual pick for a high-spp Intel DXR
+session. The numbers were the product; the default is the dividend.
 
 ## Future work
 

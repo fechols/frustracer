@@ -833,6 +833,26 @@ fn main() {
                 opts.blas_split = Some(n);
             }
             "--no-blas-split" => opts.blas_split = None,
+            // The DXR pipeline's ray-dispatch mode (gpu::dxr::dxr_inline_mode
+            // — the set_aniso knob idiom). DEFAULT 1 = primary TraceRay +
+            // inline RayQuery secondaries, which strictly dominates the
+            // all-TraceRay pipeline (0) at every measured point on both
+            // vendors; 2 = everything inline in raygen (the high-spp Intel
+            // pick). See the DXR section's ablation table in CLAUDE.md.
+            "--dxr-inline" => {
+                let n: u32 = args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .filter(|&n| n <= 2)
+                    .unwrap_or_else(|| {
+                        eprintln!(
+                            "--dxr-inline needs 0 (all TraceRay), 1 (inline secondaries — \
+                             the default), or 2 (everything inline in raygen)"
+                        );
+                        std::process::exit(2);
+                    });
+                gpu::dxr::set_inline_mode(n);
+            }
             "--spin" => {
                 spin = Some(args.next().unwrap_or_else(|| {
                     eprintln!("--spin needs a workload: still | path");
@@ -10949,6 +10969,19 @@ fn vendor_defaults(opts: &mut Opts, vendor: gpu::adapter::Vendor) {
     // quadtree that proves space empty and traces no rays there is worth far
     // more; and it is worth MOST on the default scene, which is mostly sky.
     //
+    // W2 CAVEAT (2026-07-22): that table is the ALL-TRACERAY pipeline —
+    // --dxr-inline 0. The mode-1 promotion (inline RayQuery secondaries, the
+    // DXR default since W2) moved the DXR column to 2.35/1.64, so the Intel
+    // ratio now STRADDLES 1.0 by scene at spp=1 (default 1.34x, stress
+    // 0.81x, san-miguel-lp 0.94x) — most of the old gap was secondary
+    // TraceRay dispatch, not RT-core weakness. This entry is KEPT because
+    // the wavefront still wins the flagless contract where it matters (the
+    // default scene at spp=1, every scene from ~spp 3 up via the quadtree's
+    // cheaper marginal sample, and it owns H/R/C/O) — but the clean crossing
+    // is gone, and a re-measure ON THE WORLD (the actual flagless scene,
+    // which --spin never loads) is owed before this policy is extended or
+    // defended with the old numbers.
+    //
     // AMD is deliberately absent: this box's only AMD adapter is an iGPU
     // (~22x slower, useless as a signal), so RDNA has no measurement here and
     // therefore keeps the cross-vendor default. Do not extend this to a vendor
@@ -10969,9 +11002,8 @@ fn vendor_defaults(opts: &mut Opts, vendor: gpu::adapter::Vendor) {
     if vendor == Vendor::Intel && !opts.mode_explicit && opts.dxr && !opts.gpu {
         opts.gpu = true;
         eprintln!(
-            "gpu: Intel adapter — starting in the compute WAVEFRONT tracer (measured 2.6-5.1x \
-             faster than the DispatchRays pipeline here; --dxr starts in DXR instead, --cpu in \
-             the CPU tracer, SPACE cycles all three live)"
+            "gpu: Intel adapter — starting in the compute WAVEFRONT tracer (--dxr starts the \
+             DispatchRays pipeline instead, --cpu the CPU tracer, SPACE cycles all three live)"
         );
     }
 }
