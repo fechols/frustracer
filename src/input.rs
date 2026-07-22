@@ -1,12 +1,12 @@
-//! SDL2 input: the main-thread event drain — toggles from KeyDown edges
+//! SDL3 input: the main-thread event drain — toggles from KeyDown edges
 //! (repeat filtered), quit, and window size changes. Camera movement/look
 //! deliberately does NOT live here: SDL state only updates at pump time and
 //! the main thread blocks for whole traces, so flight is integrated at
 //! 500 Hz wall-clock on the flycam thread (src/flycam.rs) instead.
 
-use sdl2::event::Event;
-use sdl2::keyboard::Keycode;
-use sdl2::EventPump;
+use sdl3::event::Event;
+use sdl3::keyboard::Keycode;
+use sdl3::EventPump;
 
 /// One-frame key edges (KeyDown, no repeat) plus quit.
 #[derive(Default)]
@@ -33,9 +33,9 @@ pub struct Edges {
     pub clear_frustum: bool,   // Z (remove the frozen frustum snapshot)
     pub quality: Option<u32>,  // 1/2/3
     pub toggle_fullscreen: bool, // F11 (borderless desktop fullscreen)
-    /// Newest window client size from this frame's SizeChanged events
-    /// (maximize, restore, fullscreen, drag — the last event in the drain
-    /// wins). The consumer debounces and commits via `drawable_size()`.
+    /// Newest window client size from this frame's Resized/PixelSizeChanged
+    /// events (maximize, restore, fullscreen, drag — the last event in the
+    /// drain wins). The consumer debounces and commits via `size_in_pixels()`.
     pub size_changed: Option<(u32, u32)>,
     /// The window may now be on a different monitor — `DisplayChanged` (SDL's
     /// own "you moved to another display") or `Moved` (a window can straddle
@@ -54,8 +54,8 @@ pub struct Input {
 }
 
 impl Input {
-    pub fn new(sdl: &sdl2::Sdl) -> Result<Self, String> {
-        Ok(Self { pump: sdl.event_pump()? })
+    pub fn new(sdl: &sdl3::Sdl) -> Result<Self, String> {
+        Ok(Self { pump: sdl.event_pump().map_err(|e| e.to_string())? })
     }
 
     /// Drain the event queue, collecting edges. Call once per frame.
@@ -85,19 +85,26 @@ impl Input {
                     Keycode::U => e.cycle_spp = true,
                     Keycode::Y => e.capture_frustum = true,
                     Keycode::Z => e.clear_frustum = true,
-                    Keycode::Num1 | Keycode::Kp1 => e.quality = Some(1),
-                    Keycode::Num2 | Keycode::Kp2 => e.quality = Some(2),
-                    Keycode::Num3 | Keycode::Kp3 => e.quality = Some(3),
+                    Keycode::_1 | Keycode::Kp1 => e.quality = Some(1),
+                    Keycode::_2 | Keycode::Kp2 => e.quality = Some(2),
+                    Keycode::_3 | Keycode::Kp3 => e.quality = Some(3),
                     Keycode::F11 => e.toggle_fullscreen = true,
                     _ => {}
                 },
+                // SDL3 split SDL2's SizeChanged into Resized (logical) and
+                // PixelSizeChanged (physical). Arm on either — this edge only
+                // starts the settle debounce; the authoritative size is read
+                // from `size_in_pixels()` at commit time.
                 Event::Window {
-                    win_event: sdl2::event::WindowEvent::SizeChanged(w, h), ..
+                    win_event:
+                        sdl3::event::WindowEvent::Resized(w, h)
+                        | sdl3::event::WindowEvent::PixelSizeChanged(w, h),
+                    ..
                 } => e.size_changed = Some((w.max(0) as u32, h.max(0) as u32)),
                 Event::Window {
                     win_event:
-                        sdl2::event::WindowEvent::DisplayChanged(_)
-                        | sdl2::event::WindowEvent::Moved(_, _),
+                        sdl3::event::WindowEvent::DisplayChanged(_)
+                        | sdl3::event::WindowEvent::Moved(_, _),
                     ..
                 } => e.display_changed = true,
                 _ => {}

@@ -51,10 +51,10 @@ tracy-client = { version = "0.17.6", optional = true, default-features = false, 
 [features]
 tracy = ["dep:tracy-client"]
 
-# The interactive presentation stack (SDL2 window + D3D12 + Streamline) is
+# The interactive presentation stack (SDL3 window + D3D12 + Streamline) is
 # Windows-only; headless --check/--check-dlss build everywhere without it.
 [target.'cfg(windows)'.dependencies]
-sdl2 = { version = "0.38", features = ["bundled", "static-link", "raw-window-handle"] }
+sdl3 = { version = "0.18", features = ["build-from-source-static", "raw-window-handle"] }
 raw-window-handle = "0.6"
 windows = { version = "0.62", features = [
     "Win32_Foundation",

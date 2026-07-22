@@ -10778,9 +10778,9 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     }
 }
 
-/// Extract the Win32 HWND from the SDL2 window for swapchain creation.
+/// Extract the Win32 HWND from the SDL window for swapchain creation.
 #[cfg(windows)]
-fn sdl_hwnd(window: &sdl2::video::Window) -> windows::Win32::Foundation::HWND {
+fn sdl_hwnd(window: &sdl3::video::Window) -> windows::Win32::Foundation::HWND {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     let handle = window.window_handle().expect("window handle").as_raw();
     match handle {
@@ -11016,10 +11016,10 @@ fn run_window(
     cam0: Camera,
     attractors: Vec<flycam::TodAttractor>,
 ) {
-    // Opt into per-monitor DPI awareness so Windows doesn't stretch the window
-    // on scaled displays — W×H stays W×H physical pixels, matching the swapchain.
-    sdl2::hint::set("SDL_WINDOWS_DPI_AWARENESS", "permonitorv2");
-    let sdl = sdl2::init().expect("SDL init failed");
+    // SDL3 is per-monitor-v2 DPI aware on Windows unconditionally (SDL2's
+    // SDL_WINDOWS_DPI_AWARENESS hint is gone), so W×H stays W×H physical
+    // pixels, matching the swapchain.
+    let sdl = sdl3::init().expect("SDL init failed");
     let video = sdl.video().expect("SDL video failed");
     let mut window = video
         .window(
@@ -11139,7 +11139,7 @@ fn session(
     bvh: &mut bvh::Bvh,
     opts: &Opts,
     fly: &flycam::FlyCam,
-    window: &mut sdl2::video::Window,
+    window: &mut sdl3::video::Window,
     inp: &mut input::Input,
     gpu: &mut gpu::GpuContext,
     persist: &mut Option<Persist>,
@@ -11945,14 +11945,12 @@ fn session(
             break SessionEnd::Quit;
         }
         if edges.toggle_fullscreen {
-            // Borderless desktop fullscreen (F11) — the resulting
-            // SizeChanged flows through the same debounce below.
-            let to = if window.fullscreen_state() == sdl2::video::FullscreenType::Off {
-                sdl2::video::FullscreenType::Desktop
-            } else {
-                sdl2::video::FullscreenType::Off
-            };
-            if let Err(e) = window.set_fullscreen(to) {
+            // Borderless desktop fullscreen (F11) — SDL3's set_fullscreen is
+            // a bool, and fullscreen with no exclusive mode set IS borderless
+            // desktop. The resulting size event flows through the same
+            // debounce below.
+            let on = window.fullscreen_state() == sdl3::video::FullscreenType::Off;
+            if let Err(e) = window.set_fullscreen(on) {
                 eprintln!("fullscreen: {e}");
             }
         }
@@ -11962,10 +11960,9 @@ fn session(
         if let Some(t0) = pending_resize {
             if (now - t0).as_millis() >= RESIZE_SETTLE_MS {
                 pending_resize = None;
-                // drawable_size at settle time is authoritative (physical
-                // pixels — the permonitorv2 DPI hint makes logical equal
-                // physical).
-                let (dw, dh) = window.drawable_size();
+                // size_in_pixels at settle time is authoritative (physical
+                // pixels — SDL3 is per-monitor DPI aware by default).
+                let (dw, dh) = window.size_in_pixels();
                 if dw > 0 && dh > 0 && (dw as usize, dh as usize) != (w, h) {
                     break SessionEnd::Resize(dw, dh);
                 }
