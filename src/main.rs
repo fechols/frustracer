@@ -107,6 +107,12 @@ const STEP_UP_MAX: f32 = 0.4;
 const STEP_DOWN_MAX: f32 = 1.5;
 
 /// CLI options beyond the OBJ path / --check.
+///
+/// `Clone` exists for exactly one caller: `run_window` takes a private copy so
+/// `vendor_defaults` can move a default the user left alone, once the adapter
+/// is known. Parsing stays the single source of the user's intent; the copy is
+/// where the HARDWARE's opinion is folded in.
+#[derive(Clone)]
 pub struct Opts {
     /// The temporal-upscaler fallback chain: which levels of
     /// DLSS-RR → FSR4-RR → XeSS → FSR3 may be probed (first supported level
@@ -10900,6 +10906,76 @@ fn tod_hhmm(h: f32) -> String {
     format!("{:02}:{:02}", h as u32, (h.fract() * 60.0) as u32)
 }
 
+/// Fold the PICKED adapter's measured preferences into the defaults the user
+/// left alone. Called once, from `run_window`, right after `GpuContext::new` —
+/// the earliest moment the vendor is a FACT: `--prefer-*` is only a request,
+/// and a box without that vendor silently falls back to the first hardware
+/// adapter, so keying a default off the preference would be keying it off a
+/// guess.
+///
+/// The bar for adding anything here is deliberately high: the choice must be
+/// one whose right answer is a property of the HARDWARE BALANCE rather than of
+/// the scene, must be measured on more than one vendor, and must actually
+/// INVERT between them. A knob that merely wins a bit more on one vendor is a
+/// constant, not a policy — this function is where a wrong entry costs every
+/// user of that vendor silently, so it stays small and each entry carries its
+/// numbers.
+///
+/// Nothing here may override an explicit flag. `mode_explicit` exists for
+/// precisely this: `opts.dxr` defaults ON, so its value cannot answer "did the
+/// user ASK for DXR", and a policy that cannot tell the difference would quietly
+/// countermand the command line.
+#[cfg(windows)]
+fn vendor_defaults(opts: &mut Opts, vendor: gpu::adapter::Vendor) {
+    use gpu::adapter::Vendor;
+
+    // --- starting render mode: DXR pipeline vs compute wavefront ------------
+    //
+    // The shipping default is the DXR DispatchRays pipeline, and that is the
+    // right call on NVIDIA and exactly backwards on Intel. Measured cold-free
+    // (rep 1 discarded, median of 3), `--spin path` 1080p 1-spp, GPU frame span:
+    // ```text
+    //                      wavefront     DXR    DXR/wavefront
+    //   B70  default          1.762     9.061       5.14x
+    //   B70  stress 5000      2.022     5.282       2.61x
+    //   4090 default          2.582     1.383       0.54x
+    //   4090 stress 5000      1.081     0.782       0.72x
+    // ```
+    // The ratio does not merely shrink across vendors, it CROSSES ONE — which
+    // is the whole justification for a vendor-aware default rather than a
+    // better global one. The mechanism is the one the quadtree analysis in
+    // CLAUDE.md already established: Arc's RT cores are weak relative to its
+    // shader cores, so replacing per-pixel RT-core root traversal with a
+    // quadtree that proves space empty and traces no rays there is worth far
+    // more; and it is worth MOST on the default scene, which is mostly sky.
+    //
+    // AMD is deliberately absent: this box's only AMD adapter is an iGPU
+    // (~22x slower, useless as a signal), so RDNA has no measurement here and
+    // therefore keeps the cross-vendor default. Do not extend this to a vendor
+    // on inference — measure it or leave it out.
+    //
+    // NOTE the pair this leaves behind: `gpu` AND `dxr` both true. That is not
+    // the contradictory state the argument parser rejects ("--gpu --dxr", where
+    // one flag must win) — `session()` reads the pair as a PREFERENCE ORDER,
+    // trying the wavefront first and taking the DXR arm only `if want_dxr &&
+    // !dxr_failed && !gpu_trace`. So the DXR pipeline stays as the automatic
+    // fallback, which matters: the wavefront additionally carries the software
+    // BVH for its frustum queries, so on a small-VRAM Arc a scene DXR could
+    // hold (THE WORLD is 34.5M tris) may fail to init here — and falling to the
+    // CPU tracer when a working GPU arm existed would be a real regression.
+    // Only reached when the DXR default is actually in force, so the pair is
+    // never manufactured against a user who already opted out (`--oidn` etc.
+    // clear `dxr` at parse time and are left alone).
+    if vendor == Vendor::Intel && !opts.mode_explicit && opts.dxr && !opts.gpu {
+        opts.gpu = true;
+        eprintln!(
+            "gpu: Intel adapter — starting in the compute WAVEFRONT tracer (measured 2.6-5.1x \
+             faster than the DispatchRays pipeline here; --dxr starts in DXR instead, --cpu in \
+             the CPU tracer, SPACE cycles all three live)"
+        );
+    }
+}
+
 #[cfg(windows)]
 fn run_window(
     scene: &mut scene::Scene,
@@ -10943,6 +11019,15 @@ fn run_window(
     };
     let mut gpu = gpu::GpuContext::new(sdl_hwnd(&window), W as u32, H as u32, &gopts)
         .expect("GPU init failed");
+    // The adapter is only now a fact rather than a preference, so this is the
+    // first point a hardware-keyed default can be honest. Everything downstream
+    // reads the adjusted copy; `opts` shadows the parameter so no site can
+    // accidentally consult the pre-policy values.
+    let opts = &{
+        let mut o = opts.clone();
+        vendor_defaults(&mut o, gpu.adapter_vendor);
+        o
+    };
     // --fsr4: the FSR4 + Ray Regeneration level is a requirement, so the chain
     // falling through it is fatal here rather than a quiet downgrade. Checked
     // against the session's ACTUAL wiring (the probe already printed its own

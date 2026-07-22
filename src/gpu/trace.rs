@@ -210,6 +210,24 @@ pub(crate) const CB_STRIDE: usize = 2560;
 /// And it never loses at other resolutions: a tile larger than 32 px simply
 /// takes a second full lap, which is the same lane utilization a 64-wide group
 /// would have had.
+///
+/// AND 32 IS RIGHT ON INTEL TOO — do not read the FR_LEAF/FR_LGROUP 2-D
+/// sweep's (32, 256) optimum as "Intel wants group 256" and adopt the group
+/// axis alone. Measured at the SHIPPING LEAF_TILE=8 (interleaved medians,
+/// rep 1 discarded, `--spin path` 1080p GPU frame span vs group 32):
+/// ```text
+///            g16     g64    g128    g256
+///   B70 default   +0.1%   +0.9%   +6.3%  +21.1%
+///   B70 stress    +1.3%   -0.4%   +1.6%   +9.5%
+///   4090 stress     --    +7.6%  +23.2%     --
+/// ```
+/// The 256-group appetite is a property of the COARSE frontier: a TILE=32
+/// leaf is ~540 px and genuinely feeds 256 lanes, while a TILE=8 leaf is
+/// ~32 px and wider groups only idle lanes — on every vendor. So the whole
+/// (32, 256) win stays gated behind re-tuning the temporal must-fires for a
+/// coarser frontier (see CLAUDE.md), and there is no group-only vendor
+/// default to take (`main::vendor_defaults` stays mode-only). Intel's SIMD16
+/// does not rescue g16 either.
 const LEAF_GROUP: u32 = 32;
 
 /// R&D lever (FR_LGROUP): the leaf kernel's group width. Swept together with

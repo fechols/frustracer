@@ -231,7 +231,9 @@ pub struct GpuContext {
     _proxy_device: Option<ID3D12Device>,
     _proxy_factory: Option<IDXGIFactory6>,
     pub adapter_name: String,
-    pub adapter_is_nvidia: bool,
+    /// What the picked adapter IS (not what `--prefer-*` asked for) — the input
+    /// to `main::vendor_defaults`.
+    pub adapter_vendor: adapter::Vendor,
     /// The presentation curve every present arm reads (see
     /// `fullscreen_to_backbuffer`). One field, so a display change is a retune.
     tone: crate::tone::ToneParams,
@@ -326,7 +328,7 @@ impl GpuContext {
         let prefer = opts.prefer.unwrap_or(adapter::Prefer::Nvidia);
         let pick = adapter::pick(&factory, prefer)?;
         eprintln!("gpu: using adapter \"{}\"", pick.name);
-        if sl.is_some() && !pick.is_nvidia {
+        if sl.is_some() && pick.vendor != adapter::Vendor::Nvidia {
             eprintln!("dlss: level unavailable (no NVIDIA adapter) — falling through the chain");
             sl = None;
         }
@@ -475,7 +477,7 @@ impl GpuContext {
             nppd_gpu: None,
             nppd_state_valid: false,
             adapter_name: pick.name,
-            adapter_is_nvidia: pick.is_nvidia,
+            adapter_vendor: pick.vendor,
             tone,
             adapter: pick.adapter,
             hwnd,
