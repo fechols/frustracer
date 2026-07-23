@@ -43,6 +43,26 @@ pub const UPSCALE_DEPTH_INVERTED: u32 = 1 << 3;
 pub const UPSCALE_DYNAMIC_RESOLUTION: u32 = 1 << 6;
 pub const UPSCALE_DEBUG_CHECKING: u32 = 1 << 7;
 
+// FfxApiCreateContextFramegenerationFlags subset (ffx_framegeneration.h). The
+// absent bits are deliberate: display-res MVs (ours are render-res), jitter
+// cancellation (our MV fill sites project unjittered hit points), infinite
+// depth (our reversed-Z clip encode has a finite far with sky at exactly 0.0).
+pub const FG_ASYNC_SUPPORT: u32 = 1 << 0;
+pub const FG_DEPTH_INVERTED: u32 = 1 << 3;
+pub const FG_HDR: u32 = 1 << 5;
+pub const FG_DEBUG_CHECKING: u32 = 1 << 6;
+
+// FfxApiDispatchFramegenerationFlags subset — debug overlays for the FG
+// dispatch/configure path.
+pub const FG_DISPATCH_DEBUG_TEAR_LINES: u32 = 1 << 0;
+pub const FG_DISPATCH_DEBUG_VIEW: u32 = 1 << 2;
+pub const FG_DISPATCH_DEBUG_PACING_LINES: u32 = 1 << 4;
+
+// FfxApiSurfaceFormat ordinals for the two swapchain formats this renderer
+// creates (ffx_api_types.h — the enum is ordinal, no explicit values).
+pub const SURFACE_FORMAT_R16G16B16A16_FLOAT: u32 = 4;
+pub const SURFACE_FORMAT_B8G8R8A8_UNORM: u32 = 14;
+
 // FfxApiUpscaleQualityMode (ffx_upscale.h) — used for the render-res range
 // derivation queries.
 pub const QUALITY_MODE_NATIVEAA: u32 = 0;
@@ -132,6 +152,54 @@ pub struct FfxShimUpscaleDesc {
     pub flags: u32,
 }
 
+#[repr(C)]
+pub struct FfxShimFgConfig {
+    pub swapchain: *mut c_void,
+    pub enabled: i32,
+    pub allow_async: i32,
+    pub hudless: FfxShimRes,
+    pub flags: u32,
+    pub only_present_generated: i32,
+    pub rect_left: u32,
+    pub rect_top: u32,
+    pub rect_w: u32,
+    pub rect_h: u32,
+    pub min_max_luminance: [f32; 2],
+    pub frame_id: u64,
+}
+
+#[repr(C)]
+pub struct FfxShimFgPrepare {
+    pub cmdlist: *mut c_void,
+    pub frame_id: u64,
+    pub flags: u32,
+    pub render_w: u32,
+    pub render_h: u32,
+    pub jitter: [f32; 2],
+    pub mv_scale: [f32; 2],
+    pub frame_time_delta_ms: f32,
+    pub reset: i32,
+    pub cam_near: f32,
+    pub cam_far: f32,
+    pub cam_fovy: f32,
+    pub view_space_to_meters: f32,
+    pub depth: FfxShimRes,
+    pub motion_vectors: FfxShimRes,
+    pub cam_pos: [f32; 3],
+    pub cam_up: [f32; 3],
+    pub cam_right: [f32; 3],
+    pub cam_fwd: [f32; 3],
+}
+
+// The FG twins of the denoise-desc layout pins: `hudless` sits after two i32s
+// (an 8-aligned member after a 4-hole boundary), and `depth` lands after a
+// float run that ends mid-slot — the exact shapes a C/Rust packing divergence
+// would silently shift. The C++ TU asserts the identical literals.
+const _: () = assert!(std::mem::offset_of!(FfxShimFgConfig, hudless) == 16);
+const _: () = assert!(std::mem::size_of::<FfxShimFgConfig>() == 72);
+const _: () = assert!(std::mem::offset_of!(FfxShimFgPrepare, depth) == 72);
+const _: () = assert!(std::mem::size_of::<FfxShimFgPrepare>() == 152);
+
 unsafe extern "C" {
     pub fn ffxshim_load(loader_dll_path: *const u16) -> i32;
     pub fn ffxshim_unload();
@@ -174,4 +242,31 @@ unsafe extern "C" {
     pub fn ffxshim_denoiser_kv(denoiser_ctx: *mut c_void, key: u64, count: u64, data: *const c_void) -> i32;
     pub fn ffxshim_denoise(denoiser_ctx: *mut c_void, d: *const FfxShimDenoiseDesc) -> i32;
     pub fn ffxshim_upscale(upscaler_ctx: *mut c_void, d: *const FfxShimUpscaleDesc) -> i32;
+    pub fn ffxshim_preload_dir(dir: *const u16) -> i32;
+    pub fn ffxshim_query_versions_fg(
+        device: *mut c_void,
+        inout_count: *mut u64,
+        ids: *mut u64,
+        names: *mut *const i8,
+    ) -> i32;
+    pub fn ffxshim_fg_swapchain_wrap(
+        game_queue: *mut c_void,
+        inout_swapchain: *mut *mut c_void,
+        out_sc_ctx: *mut *mut c_void,
+    ) -> i32;
+    pub fn ffxshim_fg_swapchain_wait(sc_ctx: *mut c_void) -> i32;
+    pub fn ffxshim_fg_swapchain_ui(sc_ctx: *mut c_void, ui: *const FfxShimRes, premul: i32) -> i32;
+    pub fn ffxshim_create_fg(
+        device: *mut c_void,
+        display_w: u32,
+        display_h: u32,
+        max_render_w: u32,
+        max_render_h: u32,
+        backbuffer_format: u32,
+        flags: u32,
+        version_id: u64,
+        out_ctx: *mut *mut c_void,
+    ) -> i32;
+    pub fn ffxshim_fg_configure(fg_ctx: *mut c_void, c: *const FfxShimFgConfig) -> i32;
+    pub fn ffxshim_fg_prepare(fg_ctx: *mut c_void, p: *const FfxShimFgPrepare) -> i32;
 }

@@ -170,6 +170,16 @@ pub struct Opts {
     pub xess_path: String,
     /// Directory holding amd_fidelityfx_loader_dx12.dll + the provider DLLs.
     pub ffx_path: String,
+    /// `--fg`: arm frame generation for the session's wired upscaler family.
+    /// Native sessions (FSR4-RR / FSR3) wrap the swapchain with the
+    /// FidelityFX frame-interpolation proxy and insert one generated frame
+    /// per rendered frame; unsupported pairings fall through with a loud
+    /// line. Interactive sessions only — headless paths never consult it.
+    pub fg: bool,
+    /// Directory holding amd_fidelityfx_framegeneration_dx12.dll (`--fg-path`;
+    /// the prebuilt drop ships it in the FSR sample dir, not next to the
+    /// loader).
+    pub fg_path: String,
     /// `--fsr4`: the FSR4 + Ray Regeneration level is REQUIRED, not merely
     /// force-started. `--fsr` falls through to XeSS/FSR3 when the Ray
     /// Regeneration provider is absent (no RDNA4, wrong adapter); this makes
@@ -466,6 +476,14 @@ fn main() {
             )
             .to_string()
         }),
+        fg: false,
+        fg_path: std::env::var("FRUSTRACER_FG_PATH").unwrap_or_else(|_| {
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                r"\SDKs\FidelityFX-Samples-prebuilt\Samples\Upscalers\FidelityFX_FSR\dx12\x64\Release"
+            )
+            .to_string()
+        }),
         fsr4_required: false,
         fsr_tune: fsr::DenoiseTuning::default(),
         quin: false,
@@ -676,6 +694,14 @@ fn main() {
             "--ffx-path" => {
                 opts.ffx_path = args.next().unwrap_or_else(|| {
                     eprintln!("--ffx-path needs a directory argument");
+                    std::process::exit(2);
+                })
+            }
+            "--fg" => opts.fg = true,
+            "--no-fg" => opts.fg = false,
+            "--fg-path" => {
+                opts.fg_path = args.next().unwrap_or_else(|| {
+                    eprintln!("--fg-path needs a directory argument");
                     std::process::exit(2);
                 })
             }
@@ -1172,6 +1198,12 @@ fn main() {
                 eprintln!("                Ray Regeneration is unavailable (suggests --fsr3 / --prefer-amd)");
                 eprintln!("  --fsr3        force-start the chain at the FSR 3.1 upscale-only level (A/B lever)");
                 eprintln!("  --ffx-path    FidelityFX DLL directory (default: the FidelityFX-Samples-prebuilt drop)");
+                eprintln!("  --fg          FRAME GENERATION for the wired upscaler family: FSR sessions wrap the");
+                eprintln!("                swapchain with the FidelityFX frame-interpolation proxy and insert one");
+                eprintln!("                generated frame per rendered frame (provider 4.x on an FSR4 session,");
+                eprintln!("                3.1 interpolation cross-vendor; unsupported pairings fall through loudly)");
+                eprintln!("  --fg-path     directory holding amd_fidelityfx_framegeneration_dx12.dll (default: the");
+                eprintln!("                drop's FSR sample dir — the FG provider does NOT ship next to the loader)");
                 eprintln!("  --quinlight   REGISTERED CONSENSUS: suspend the chain's first-hit-wins rule, wire");
                 eprintln!("                EVERY supported level at once (DLSS-RR + FSR4-RR + XeSS + FSR 3.1),");
                 eprintln!("                run them all over the SAME traced frame, and present the LK-registered");
@@ -1328,6 +1360,14 @@ fn main() {
     // A --quin-anchor with no fuse to anchor is a typo, not a preference.
     if opts.quin_anchor.is_some() && !opts.quin {
         eprintln!("--quin-anchor selects the fuse's anchor engine, but --quinlight was not passed");
+        std::process::exit(2);
+    }
+    // Frame generation wraps the swapchain with ONE family's frame-
+    // interpolation proxy; the fuse wires every engine at once and its
+    // present arm is its own. Untested composition — the --nppd shape:
+    // exit, don't degrade.
+    if opts.quin && opts.fg {
+        eprintln!("--quinlight cannot compose with --fg. Drop one.");
         std::process::exit(2);
     }
     // Adapter preference default: AMD when FSR was explicitly requested
@@ -6070,6 +6110,28 @@ fn run_check_fsr(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural:
             eprintln!("parse_provider_versions accepted a non-version");
             pass = false;
         }
+        // The frame-generation pick: family coherence (FSR4 session prefers
+        // the 4.x ML frame generation, everything else the 3.1 interpolation),
+        // the other major as fallback rather than failure (the enumeration is
+        // device-filtered — anything in it is claimed to run), never id 0
+        // (FG picks are always explicit overrides), empty = None.
+        let mut fg_case = |desc: &str, got: Option<(u64, String)>, want: Option<u64>| {
+            if got.as_ref().map(|(id, _)| *id) != want {
+                eprintln!("pick_fg_version {desc}: got {got:?}, want id {want:?}");
+                pass = false;
+            }
+        };
+        let fg_all = list(&["FSR FG 4.0.1", "FSR 3.1.5", "FSR 3.1.4"]);
+        fg_case("all, fsr4", fsr::pick_fg_version(&fg_all, true), Some(fg_all[0].0));
+        fg_case("all, fsr3", fsr::pick_fg_version(&fg_all, false), Some(fg_all[1].0));
+        let fg_only3 = list(&["FSR 3.1.4", "FSR 3.1.5"]);
+        fg_case("only-3, fsr4", fsr::pick_fg_version(&fg_only3, true), Some(fg_only3[1].0));
+        fg_case("only-3, fsr3", fsr::pick_fg_version(&fg_only3, false), Some(fg_only3[1].0));
+        let fg_only4 = list(&["FSR FG 4.0.1"]);
+        fg_case("only-4, fsr4", fsr::pick_fg_version(&fg_only4, true), Some(fg_only4[0].0));
+        fg_case("only-4, fsr3", fsr::pick_fg_version(&fg_only4, false), Some(fg_only4[0].0));
+        fg_case("empty", fsr::pick_fg_version(&[], true), None);
+        fg_case("unparseable", fsr::pick_fg_version(&list(&["experimental"]), false), None);
         eprintln!("provider pick: {}", if pass { "OK" } else { "FAIL" });
         all_ok &= pass;
     }
@@ -11156,6 +11218,8 @@ fn run_window(
         xess_dir: opts.xess_path.clone(),
         xess_autoexposure: opts.xess_autoexposure,
         ffx_dir: opts.ffx_path.clone(),
+        fg: opts.fg,
+        fg_dir: opts.fg_path.clone(),
         fsr_tune: opts.fsr_tune,
         prefer: opts.prefer,
         debug: opts.gpu_debug,

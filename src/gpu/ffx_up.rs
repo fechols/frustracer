@@ -243,6 +243,13 @@ impl Fsr3Resources {
         ]
     }
 
+    /// The frame-generation prepare's inputs: (reversed-Z clip depth, MV
+    /// plane). This plane set carries pixel-space MVs, so the prepare's
+    /// mv_scale is (1,1) — exactly what `upscale_res`'s consumer passes.
+    pub fn fg_inputs(&self) -> (&ID3D12Resource, &ID3D12Resource) {
+        (&self.planes[P_DEPTH].tex, &self.planes[P_MVEC].tex)
+    }
+
     /// The upscale dispatch's resource references in (color, depth, mvec,
     /// output) order — the same tuple shape `ffx_rr.rs::upscale_res` hands
     /// the shared desc builder, in the ffx states the resources will be in

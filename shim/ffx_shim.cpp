@@ -14,6 +14,8 @@
 #include "../SDKs/fidelityfx-sdk/api/include/dx12/ffx_api_dx12.h"
 #include "../SDKs/fidelityfx-sdk/denoisers/include/ffx_denoiser.h"
 #include "../SDKs/fidelityfx-sdk/upscalers/include/ffx_upscale.h"
+#include "../SDKs/fidelityfx-sdk/framegeneration/include/ffx_framegeneration.h"
+#include "../SDKs/fidelityfx-sdk/framegeneration/include/dx12/ffx_api_framegeneration_dx12.h"
 
 namespace {
 
@@ -38,6 +40,23 @@ void log_trampoline(uint32_t type, const wchar_t* msg) {
 FfxApiResource shim_res(const FfxShimRes& r) {
     if (!r.resource) return FfxApiResource{};
     return ffxApiGetResourceDX12(static_cast<ID3D12Resource*>(r.resource), r.state);
+}
+
+// The luminance patch the FG trampoline applies (see ffxshim_fg_configure).
+float g_fg_min_max_luminance[2] = {0.0f, 0.0f};
+
+// The FI swapchain drives generation through this callback at present time,
+// handing a dispatch desc it built (presentColor, outputs, frameID, reset,
+// backbuffer transfer function). Route it into the FG effect context; patch
+// the luminance range when the display probe supplied a real one (the
+// swapchain's own value is a guess — it cannot see the panel).
+ffxReturnCode_t fg_dispatch_trampoline(ffxDispatchDescFrameGeneration* params, void* uctx) {
+    if (g_fg_min_max_luminance[1] > 0.0f) {
+        params->minMaxLuminance[0] = g_fg_min_max_luminance[0];
+        params->minMaxLuminance[1] = g_fg_min_max_luminance[1];
+    }
+    ffxContext ctx = uctx;
+    return g_api.dispatch(&ctx, &params->header);
 }
 
 } // namespace
@@ -323,6 +342,197 @@ int32_t ffxshim_denoise(void* denoiser_ctx, const FfxShimDenoiseDesc* d) {
 
     ffxContext ctx = denoiser_ctx;
     return static_cast<int32_t>(g_api.dispatch(&ctx, &common.header));
+}
+
+int32_t ffxshim_preload_dir(const wchar_t* extra_dir) {
+    if (!extra_dir) return FFXSHIM_ERR_BAD_ARG;
+    // Same glob + absolute-path preload as ffxshim_load's own directory pass,
+    // with one addition: skip any basename ALREADY in the module list
+    // (GetModuleHandleW). The Windows loader resolves same-basename loads to
+    // the existing module anyway, so the skip changes nothing semantically —
+    // it exists so the primary directory's DLLs stay authoritative REGARDLESS
+    // of whether this runs before or after ffxshim_load, and so the intent is
+    // explicit rather than an accident of loader behavior.
+    std::wstring dir(extra_dir);
+    if (dir.empty()) return FFXSHIM_ERR_BAD_ARG;
+    if (dir.back() != L'\\' && dir.back() != L'/') dir += L'\\';
+    WIN32_FIND_DATAW fd;
+    HANDLE find = FindFirstFileW((dir + L"amd_fidelityfx_*_dx12.dll").c_str(), &fd);
+    if (find == INVALID_HANDLE_VALUE) return FFX_API_RETURN_OK; // nothing there = fine
+    do {
+        if (GetModuleHandleW(fd.cFileName)) continue;
+        LoadLibraryExW((dir + fd.cFileName).c_str(), nullptr,
+                       LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    } while (FindNextFileW(find, &fd));
+    FindClose(find);
+    return FFX_API_RETURN_OK;
+}
+
+int32_t ffxshim_query_versions_fg(void* device, uint64_t* inout_count,
+                                  uint64_t* ids, const char** names) {
+    if (!g_api.dll) return FFXSHIM_ERR_NOT_LOADED;
+    if (!inout_count) return FFXSHIM_ERR_BAD_ARG;
+    ffxQueryDescGetVersions q{};
+    q.header.type    = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
+    q.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION;
+    q.device       = device;
+    q.outputCount  = inout_count;
+    q.versionIds   = ids;
+    q.versionNames = names;
+    return static_cast<int32_t>(g_api.query(nullptr, &q.header));
+}
+
+int32_t ffxshim_fg_swapchain_wrap(void* game_queue, void** inout_swapchain, void** out_sc_ctx) {
+    if (!g_api.dll) return FFXSHIM_ERR_NOT_LOADED;
+    if (!game_queue || !inout_swapchain || !*inout_swapchain || !out_sc_ctx)
+        return FFXSHIM_ERR_BAD_ARG;
+
+    ffxCreateContextDescFrameGenerationSwapChainWrapDX12 desc{};
+    desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_WRAP_DX12;
+    desc.swapchain   = reinterpret_cast<IDXGISwapChain4**>(inout_swapchain);
+    desc.gameQueue   = static_cast<ID3D12CommandQueue*>(game_queue);
+
+    // The API-version pin (the upscaler-create precedent): omitting it locks
+    // newer swapchain APIs out per the header's own comment.
+    ffxCreateContextDescFrameGenerationSwapChainVersionDX12 ver{};
+    ver.header.type  = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_VERSION_DX12;
+    ver.version      = FFX_FRAMEGENERATION_SWAPCHAIN_DX12_VERSION;
+    desc.header.pNext = &ver.header;
+
+    ffxContext ctx = nullptr;
+    ffxReturnCode_t rc = g_api.create(&ctx, &desc.header, nullptr);
+    if (rc == FFX_API_RETURN_OK) *out_sc_ctx = ctx;
+    return static_cast<int32_t>(rc);
+}
+
+int32_t ffxshim_fg_swapchain_wait(void* sc_ctx) {
+    if (!g_api.dll) return FFXSHIM_ERR_NOT_LOADED;
+    if (!sc_ctx) return FFXSHIM_ERR_BAD_ARG;
+    ffxDispatchDescFrameGenerationSwapChainWaitForPresentsDX12 d{};
+    d.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_WAIT_FOR_PRESENTS_DX12;
+    ffxContext ctx = sc_ctx;
+    return static_cast<int32_t>(g_api.dispatch(&ctx, &d.header));
+}
+
+int32_t ffxshim_fg_swapchain_ui(void* sc_ctx, const FfxShimRes* ui, int32_t premul) {
+    if (!g_api.dll) return FFXSHIM_ERR_NOT_LOADED;
+    if (!sc_ctx || !ui) return FFXSHIM_ERR_BAD_ARG;
+    ffxConfigureDescFrameGenerationSwapChainRegisterUiResourceDX12 desc{};
+    desc.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_REGISTERUIRESOURCE_DX12;
+    desc.uiResource  = shim_res(*ui);
+    desc.flags       = premul ? FFX_FRAMEGENERATION_UI_COMPOSITION_FLAG_USE_PREMUL_ALPHA : 0u;
+    ffxContext ctx = sc_ctx;
+    return static_cast<int32_t>(g_api.configure(&ctx, &desc.header));
+}
+
+int32_t ffxshim_create_fg(void* device, uint32_t display_w, uint32_t display_h,
+                          uint32_t max_render_w, uint32_t max_render_h,
+                          uint32_t backbuffer_format, uint32_t flags,
+                          uint64_t version_id, void** out_ctx) {
+    if (!g_api.dll) return FFXSHIM_ERR_NOT_LOADED;
+    if (!device || !out_ctx) return FFXSHIM_ERR_BAD_ARG;
+
+    ffxCreateContextDescFrameGeneration desc{};
+    desc.header.type      = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION;
+    desc.flags            = flags;
+    desc.displaySize      = {display_w, display_h};
+    desc.maxRenderSize    = {max_render_w, max_render_h};
+    desc.backBufferFormat = backbuffer_format;
+
+    ffxCreateBackendDX12Desc backend{};
+    backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12;
+    backend.device      = static_cast<ID3D12Device*>(device);
+    desc.header.pNext   = &backend.header;
+
+    // Version chaining — the upscaler's mutual-exclusion rule verbatim: an
+    // explicit override IS an exact provider choice; the API pin desc names
+    // the 4.x version this TU compiled against, which a 3.1 provider may
+    // reject.
+    ffxCreateContextDescFrameGenerationVersion apiver{};
+    ffxOverrideVersion ver{};
+    if (version_id != 0) {
+        ver.header.type      = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
+        ver.versionId        = version_id;
+        backend.header.pNext = &ver.header;
+    } else {
+        apiver.header.type   = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION_VERSION;
+        apiver.version       = FFX_FRAMEGENERATION_VERSION;
+        backend.header.pNext = &apiver.header;
+    }
+
+    ffxContext ctx = nullptr;
+    ffxReturnCode_t rc = g_api.create(&ctx, &desc.header, nullptr);
+    if (rc == FFX_API_RETURN_OK) *out_ctx = ctx;
+    return static_cast<int32_t>(rc);
+}
+
+// The FG twins of the denoise-desc layout pins — ffx_sys.rs asserts the
+// identical literals (see the comment there for which holes these guard).
+static_assert(offsetof(FfxShimFgConfig, hudless) == 16,
+              "FfxShimFgConfig: layout disagrees with ffx_sys.rs");
+static_assert(sizeof(FfxShimFgConfig) == 72,
+              "FfxShimFgConfig: size disagrees with ffx_sys.rs");
+static_assert(offsetof(FfxShimFgPrepare, depth) == 72,
+              "FfxShimFgPrepare: layout disagrees with ffx_sys.rs");
+static_assert(sizeof(FfxShimFgPrepare) == 152,
+              "FfxShimFgPrepare: size disagrees with ffx_sys.rs");
+
+int32_t ffxshim_fg_configure(void* fg_ctx, const FfxShimFgConfig* c) {
+    if (!g_api.dll) return FFXSHIM_ERR_NOT_LOADED;
+    if (!fg_ctx || !c || !c->swapchain) return FFXSHIM_ERR_BAD_ARG;
+
+    g_fg_min_max_luminance[0] = c->min_max_luminance[0];
+    g_fg_min_max_luminance[1] = c->min_max_luminance[1];
+
+    ffxConfigureDescFrameGeneration desc{};
+    desc.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
+    desc.swapChain   = c->swapchain;
+    desc.presentCallback                    = nullptr; // default composition
+    desc.presentCallbackUserContext         = nullptr;
+    desc.frameGenerationCallback            = &fg_dispatch_trampoline;
+    desc.frameGenerationCallbackUserContext = fg_ctx;
+    desc.frameGenerationEnabled = c->enabled != 0;
+    desc.allowAsyncWorkloads    = c->allow_async != 0;
+    desc.HUDLessColor           = shim_res(c->hudless);
+    desc.flags                  = c->flags;
+    desc.onlyPresentGenerated   = c->only_present_generated != 0;
+    desc.generationRect         = {static_cast<int32_t>(c->rect_left),
+                                   static_cast<int32_t>(c->rect_top),
+                                   static_cast<int32_t>(c->rect_w),
+                                   static_cast<int32_t>(c->rect_h)};
+    desc.frameID                = c->frame_id;
+
+    ffxContext ctx = fg_ctx;
+    return static_cast<int32_t>(g_api.configure(&ctx, &desc.header));
+}
+
+int32_t ffxshim_fg_prepare(void* fg_ctx, const FfxShimFgPrepare* p) {
+    if (!g_api.dll) return FFXSHIM_ERR_NOT_LOADED;
+    if (!fg_ctx || !p || !p->cmdlist) return FFXSHIM_ERR_BAD_ARG;
+
+    ffxDispatchDescFrameGenerationPrepareV2 desc{};
+    desc.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2;
+    desc.frameID     = p->frame_id;
+    desc.flags       = p->flags;
+    desc.commandList = p->cmdlist;
+    desc.renderSize  = {p->render_w, p->render_h};
+    desc.jitterOffset      = {p->jitter[0], p->jitter[1]};
+    desc.motionVectorScale = {p->mv_scale[0], p->mv_scale[1]};
+    desc.frameTimeDelta    = p->frame_time_delta_ms;
+    desc.reset             = p->reset != 0;
+    desc.cameraNear        = p->cam_near;
+    desc.cameraFar         = p->cam_far;
+    desc.cameraFovAngleVertical  = p->cam_fovy;
+    desc.viewSpaceToMetersFactor = p->view_space_to_meters > 0.0f ? p->view_space_to_meters : 1.0f;
+    desc.depth         = shim_res(p->depth);
+    desc.motionVectors = shim_res(p->motion_vectors);
+    std::memcpy(desc.cameraPosition, p->cam_pos,   sizeof(desc.cameraPosition));
+    std::memcpy(desc.cameraUp,       p->cam_up,    sizeof(desc.cameraUp));
+    std::memcpy(desc.cameraRight,    p->cam_right, sizeof(desc.cameraRight));
+    std::memcpy(desc.cameraForward,  p->cam_fwd,   sizeof(desc.cameraForward));
+
+    ffxContext ctx = fg_ctx;
+    return static_cast<int32_t>(g_api.dispatch(&ctx, &desc.header));
 }
 
 int32_t ffxshim_upscale(void* upscaler_ctx, const FfxShimUpscaleDesc* d) {

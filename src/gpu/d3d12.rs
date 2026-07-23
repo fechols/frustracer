@@ -213,6 +213,17 @@ pub fn create_queue(device: &ID3D12Device) -> Result<ID3D12CommandQueue> {
     .map_err(|e| format!("CreateCommandQueue: {e}"))
 }
 
+/// Frame-generation swapchain wrap hook (see `with_queue`): receives the
+/// present queue and the fully negotiated swapchain (post scRGB fallback) and
+/// returns the frame-interpolation proxy the session presents through from
+/// then on. Err hands the ORIGINAL swapchain back so a failed wrap degrades
+/// to a normal session (the hook owns its loud line). d3d12.rs stays
+/// SDK-agnostic — the closure lives with the FG runtime that owns the proxy.
+pub type SwapWrap<'a> = &'a mut dyn FnMut(
+    &ID3D12CommandQueue,
+    IDXGISwapChain3,
+) -> std::result::Result<IDXGISwapChain3, (IDXGISwapChain3, String)>;
+
 impl D3d {
     /// Build the swapchain + frame machinery around an existing device/queue
     /// (M3 passes the Streamline proxy queue here so present is hooked).
@@ -225,6 +236,7 @@ impl D3d {
         height: u32,
         vsync: bool,
         want_hdr: bool,
+        fg_wrap: Option<SwapWrap>,
     ) -> Result<Self> {
         // Uncapped presentation needs DXGI tearing support (windowed flip
         // model otherwise paces on the compositor even at sync interval 0),
@@ -313,6 +325,38 @@ impl D3d {
                     swapchain = create(format)?;
                 }
             }
+        }
+
+        // Frame generation: wrap the negotiated swapchain with the runtime's
+        // frame-interpolation proxy. This must sit AFTER the scRGB fallback
+        // (the proxy clones the final desc, and a post-wrap SDR re-create
+        // would orphan it) and BEFORE RTV creation (GetBuffer on the proxy
+        // returns the PROXY's backbuffers — the real presentation chain lives
+        // inside it, and RTVs built from the pre-wrap chain would render into
+        // buffers nothing ever presents). A wrap failure keeps the original
+        // chain and the session runs without FG.
+        if let Some(hook) = fg_wrap {
+            swapchain = match hook(&queue, swapchain) {
+                Ok(proxy) => {
+                    // The proxy's internal chain was created fresh from our
+                    // desc; a colour-space declaration does not survive that.
+                    // Re-assert scRGB through the proxy (it forwards
+                    // SetColorSpace1 to the real chain).
+                    if hdr {
+                        if let Err(e) = set_scrgb(&proxy) {
+                            eprintln!(
+                                "present: scRGB re-declare through the FG proxy refused ({e}) — \
+                                 if colors look washed out, combine --fg with --no-hdr"
+                            );
+                        }
+                    }
+                    proxy
+                }
+                Err((orig, e)) => {
+                    eprintln!("fg: swapchain wrap failed ({e}) — frame generation disabled");
+                    orig
+                }
+            };
         }
 
         let rtv_heap: ID3D12DescriptorHeap = unsafe {

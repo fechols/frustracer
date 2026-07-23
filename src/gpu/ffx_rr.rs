@@ -564,6 +564,14 @@ impl FsrResources {
         .map(|p| (&self.planes[p].tex, self.planes[p].format))
     }
 
+    /// The frame-generation prepare's inputs: (reversed-Z clip depth, the MV
+    /// plane). This plane's RG carries UV deltas (prev − cur), so the
+    /// prepare's mv_scale is (rw, rh) — the same conversion the upscale desc
+    /// applies for this flavor.
+    pub fn fg_inputs(&self) -> (&ID3D12Resource, &ID3D12Resource) {
+        (&self.planes[P_DEPTH_CLIP].tex, &self.planes[P_MVEC].tex)
+    }
+
     fn shim(res: &ID3D12Resource, state: u32) -> FfxShimRes {
         FfxShimRes { resource: res.as_raw(), state }
     }

@@ -96,6 +96,16 @@ pub struct GpuOptions {
     /// level present — i.e. a DENOISING one wherever the box has one, which is
     /// what you want as the anchor (see the quin docs).
     pub quin_anchor: Option<u32>,
+    /// `--fg`: arm frame generation for the session. Family follows the wired
+    /// upscaler — native sessions (FSR4-RR / FSR3 / XeSS) take the FidelityFX
+    /// frame-interpolation swapchain built here; DLSS sessions take DLSS-G
+    /// through the SL proxy. Unsupported combinations fall through with a loud
+    /// line, never an error (except `--fg --quinlight`, rejected at parse).
+    pub fg: bool,
+    /// Directory holding amd_fidelityfx_framegeneration_dx12.dll (`--fg-path`;
+    /// the prebuilt drop ships it in the FSR sample dir, NOT next to the
+    /// loader the default --ffx-path points at).
+    pub fg_dir: String,
 }
 
 /// Which chain level a session actually wired — derived from the live state
@@ -145,6 +155,23 @@ impl FsrRes {
             FsrRes::Up(_) => crate::fsr::Flavor::Fsr3,
         }
     }
+
+    /// (depth, mvec, mv_scale) for the FG prepare — each flavor's plane pair
+    /// with the SAME mv_scale its own upscale dispatch uses (the trio carries
+    /// pixels, the RR plane UV deltas), so FG and upscaler read one MV
+    /// convention per session by construction.
+    fn fg_inputs(&self, rw: u32, rh: u32) -> (&ID3D12Resource, &ID3D12Resource, [f32; 2]) {
+        match self {
+            FsrRes::Up(r) => {
+                let (d, m) = r.fg_inputs();
+                (d, m, [crate::fsr::UPSCALE_MV_SIGN.0, crate::fsr::UPSCALE_MV_SIGN.1])
+            }
+            FsrRes::Rr(r) => {
+                let (d, m) = r.fg_inputs();
+                (d, m, [crate::fsr::UPSCALE_MV_SIGN.0 * rw as f32, crate::fsr::UPSCALE_MV_SIGN.1 * rh as f32])
+            }
+        }
+    }
 }
 
 /// Live FSR contexts on the native device + the flavor's resources and the
@@ -159,6 +186,45 @@ struct FsrState {
     opt: (u32, u32),
     min: (u32, u32),
     max: (u32, u32),
+}
+
+/// Frame generation over the FidelityFX frame-interpolation swapchain (the
+/// native-session `--fg` family — DLSS sessions use DLSS-G instead). The FI
+/// swapchain proxy replaced `D3d::swapchain` at creation (d3d12::SwapWrap);
+/// `sc` is the context that owns it, `ctx` the display-size-bound FG effect
+/// (None = creation failed or resize is mid-rebuild — the proxy then presents
+/// passthrough, never wrongly).
+///
+/// The per-frame protocol ("prepared" handshake): an arm that can feed FG
+/// calls `GpuContext::fg_prepare` before `fullscreen_to_backbuffer` — that
+/// advances `frame_id` by EXACTLY 1 (the ffx contract; any other delta resets
+/// interpolation history), configures the swapchain live, and records the
+/// PrepareV2 dispatch (depth + MVs) into the frame's list. The funnel then
+/// consumes `prepared`; a frame presented WITHOUT a prepare (plain arms, mode
+/// switches, the pause-menu hold) finds it false and configures the FI
+/// swapchain DISABLED first, so pacing never runs against stale motion.
+/// Cells because the funnel and the hold path run on `&self`.
+struct FgState {
+    sc: ffx::FgSwapchain,
+    ctx: Option<ffx::FgContext>,
+    /// The user-facing toggle (`--fg` starts true; set_fg_enabled flips).
+    enabled: bool,
+    /// What the FI swapchain was last CONFIGURED to (avoid re-issuing
+    /// disable configures every held frame).
+    live: std::cell::Cell<bool>,
+    /// Set by fg_prepare, consumed by fullscreen_to_backbuffer.
+    prepared: std::cell::Cell<bool>,
+    frame_id: std::cell::Cell<u64>,
+    /// Last frame's wall time, stashed once per loop by `fg_set_frame_ms`
+    /// (main.rs owns the clock — the renderer never reads one), read by every
+    /// arm's prepare. Pacing quality follows this number.
+    frame_ms: std::cell::Cell<f32>,
+    /// (min, max) nits handed to the HDR dispatch patch; (0,0) = SDR, no
+    /// patch.
+    luminance: [f32; 2],
+    /// The picked provider (override id + display name) — the boot line and
+    /// the title bar read the name.
+    version: (u64, String),
 }
 
 /// The trace res must sit inside this context's SDK range. The caller already
@@ -236,6 +302,10 @@ pub struct GpuContext {
     /// Whether the recurrent state carries history (false forces the next
     /// NPPD frame to zero the warped-state input — a reset).
     nppd_state_valid: bool,
+    /// Frame generation (native sessions; see FgState). Declared AFTER `d3d`
+    /// deliberately: d3d's swapchain/backbuffer refs on the FI proxy must
+    /// release before FgState's drop destroys the swapchain context.
+    fg: Option<FgState>,
     /// Kept alive for the app lifetime: the hooked CreateCommandQueue /
     /// CreateSwapChain entry points live on these (Frame Gen will need them
     /// again), and dropping them to refcount 0 destroys the SL wrappers.
@@ -352,18 +422,50 @@ impl GpuContext {
 
         let device = d3d12::create_device(&pick.adapter, opts.debug)?;
 
+        // Frame generation, native family (the ffx frame-interpolation
+        // swapchain). Decided BEFORE the swapchain exists because the FI
+        // proxy owns the backbuffers the session renders into — the wrap
+        // happens inside D3d::with_queue, between colour-space negotiation
+        // and RTV creation. Arm only when a device-filtered FG provider
+        // version actually enumerates; every failure is a loud line + a
+        // normal session (the chain-fallback shape).
+        let mut fg_versions: Vec<ffx::Version> = Vec::new();
+        if opts.fg && sl.is_none() && !opts.quin {
+            match ffx::fg_load(&opts.ffx_dir, &opts.fg_dir) {
+                Ok(()) => match ffx::fg_versions(&device) {
+                    Ok(v) if !v.is_empty() => {
+                        for (id, name) in &v {
+                            eprintln!("fg: provider version 0x{id:x} \"{name}\"");
+                        }
+                        fg_versions = v;
+                    }
+                    Ok(_) => eprintln!(
+                        "fg: no framegeneration provider supports this adapter — frame generation off"
+                    ),
+                    Err(e) => eprintln!("fg: provider enumeration failed ({e}) — frame generation off"),
+                },
+                Err(e) => eprintln!("fg: {e} — frame generation off"),
+            }
+        } else if opts.fg && sl.is_some() {
+            eprintln!(
+                "fg: DLSS session — frame generation for the DLSS level is DLSS-G (not wired yet); \
+                 use --no-dlss for FidelityFX frame generation"
+            );
+        }
+
         // Manual-hooking proxy plumbing: queue from the proxy DEVICE,
         // swapchain from the proxy FACTORY — both required so present and
         // queue submissions are visible to SL (presentCommon fires every
         // frame from day one; DLSS-G later needs exactly these hooks).
         let mut proxy_device: Option<ID3D12Device> = None;
         let mut proxy_factory: Option<IDXGIFactory6> = None;
+        let mut fg_sc: Option<ffx::FgSwapchain> = None;
         let d3d = if let Some(s) = &sl {
             s.set_d3d_device(&device)?;
             let pdev: ID3D12Device = s.upgrade(&device)?;
             let queue = d3d12::create_queue(&pdev)?;
             let pfac: IDXGIFactory6 = s.upgrade(&factory)?;
-            let d3d = D3d::with_queue(&pfac, device, queue, hwnd, w, h, opts.vsync, opts.hdr)?;
+            let d3d = D3d::with_queue(&pfac, device, queue, hwnd, w, h, opts.vsync, opts.hdr, None)?;
             // The swapchain we hold MUST be the SL proxy — every present has
             // to route through presentCommon under manual hooking. A proxy
             // resolves to a distinct native interface; verify loudly.
@@ -380,7 +482,25 @@ impl GpuContext {
             d3d
         } else {
             let queue = d3d12::create_queue(&device)?;
-            D3d::with_queue(&factory, device, queue, hwnd, w, h, opts.vsync, opts.hdr)?
+            if fg_versions.is_empty() {
+                D3d::with_queue(&factory, device, queue, hwnd, w, h, opts.vsync, opts.hdr, None)?
+            } else {
+                let mut hook = |q: &ID3D12CommandQueue,
+                                sc: windows::Win32::Graphics::Dxgi::IDXGISwapChain3|
+                 -> std::result::Result<
+                    windows::Win32::Graphics::Dxgi::IDXGISwapChain3,
+                    (windows::Win32::Graphics::Dxgi::IDXGISwapChain3, String),
+                > {
+                    let (proxy, sc_ctx) = ffx::fg_wrap_swapchain(q, sc)?;
+                    eprintln!("fg: swapchain wrapped by the FidelityFX frame-interpolation proxy");
+                    fg_sc = Some(sc_ctx);
+                    Ok(proxy)
+                };
+                D3d::with_queue(
+                    &factory, device, queue, hwnd, w, h, opts.vsync, opts.hdr,
+                    Some(&mut hook),
+                )?
+            }
         };
 
         // The display probe and the curve it implies. Only meaningful once the
@@ -472,6 +592,70 @@ impl GpuContext {
         let (xess_state, fsr_state, fsr3_state) =
             Self::probe_native(&passes, &bloom, &d3d.device, opts, w, h, sl.is_some());
 
+        // Frame generation, part 2: the display-size FG effect context. The
+        // provider pick keys on the session's resolved upscaler family (an
+        // FSR4-RR session prefers the 4.x ML frame generation; everything
+        // else the 3.1 interpolation), which is only known after probe_native
+        // — the swapchain wrap above deliberately did not need it. A create
+        // failure leaves the wrapped proxy presenting passthrough: correct,
+        // just generation-free.
+        let fg_state = fg_sc.map(|sc| {
+            let fsr4_session =
+                fsr_state.as_ref().is_some_and(|f| f.res.flavor() == crate::fsr::Flavor::Fsr4Rr);
+            let version = if fsr_state.is_some() {
+                crate::fsr::pick_fg_version(&fg_versions, fsr4_session)
+            } else {
+                // The wrap happened before the chain resolved; only the FSR
+                // arms carry the prepare today. A session that wired XeSS (or
+                // nothing) presents through the proxy passthrough — harmless,
+                // one line.
+                eprintln!(
+                    "fg: wired upscaler has no ffx frame-generation pairing yet — \
+                     use --fsr3/--fsr for frame generation today"
+                );
+                None
+            };
+            let ctx = version.as_ref().and_then(|(id, name)| {
+                match ffx::FgContext::create(
+                    &d3d.device,
+                    (w, h),
+                    (w, h),
+                    if d3d.hdr {
+                        ffx_sys::SURFACE_FORMAT_R16G16B16A16_FLOAT
+                    } else {
+                        ffx_sys::SURFACE_FORMAT_B8G8R8A8_UNORM
+                    },
+                    d3d.hdr,
+                    opts.debug,
+                    *id,
+                ) {
+                    Ok(ctx) => {
+                        eprintln!("fg: frame generation live — provider \"{name}\" (1 generated frame per rendered frame)");
+                        Some(ctx)
+                    }
+                    Err(e) => {
+                        eprintln!("fg: {e} — swapchain proxy presents passthrough");
+                        None
+                    }
+                }
+            });
+            if version.is_none() {
+                eprintln!("fg: no provider version parseable — swapchain proxy presents passthrough");
+            }
+            let luminance = if d3d.hdr { [0.0, tone.peak_nits()] } else { [0.0, 0.0] };
+            FgState {
+                sc,
+                ctx,
+                enabled: true,
+                live: std::cell::Cell::new(false),
+                prepared: std::cell::Cell::new(false),
+                frame_id: std::cell::Cell::new(0),
+                frame_ms: std::cell::Cell::new(16.6),
+                luminance,
+                version: version.unwrap_or((0, String::new())),
+            }
+        });
+
         Ok(Self {
             sl,
             _proxy_device: proxy_device,
@@ -493,6 +677,7 @@ impl GpuContext {
             quin_cfg: opts.quin.then_some((opts.quin_anchor, opts.debug)),
             nppd_gpu: None,
             nppd_state_valid: false,
+            fg: fg_state,
             adapter_name: pick.name,
             adapter_vendor: pick.vendor,
             tone,
@@ -727,6 +912,18 @@ impl GpuContext {
         // not switch upscalers mid-session (captured before the teardown
         // below clears the state it derives from).
         let wired = self.wired();
+        // Frame generation straddles the resize: pending paced presents must
+        // retire before ResizeBuffers reaches the FI proxy, and the FG effect
+        // context is display-size-bound — drop it here, recreate at the new
+        // size at the bottom. The swapchain CONTEXT survives (it owns the
+        // proxy the session keeps presenting through; the proxy forwards
+        // ResizeBuffers to its internal chain).
+        if let Some(fg) = &mut self.fg {
+            fg.sc.wait_for_presents();
+            fg.live.set(false);
+            fg.prepared.set(false);
+            fg.ctx = None;
+        }
         // Everything below drops live GPU resources; drain first (the
         // GpuContext::drop discipline — xess/ffx destroy-context require
         // completed command lists, ResizeBuffers requires zero outstanding
@@ -858,6 +1055,30 @@ impl GpuContext {
             }
             // Rr rebuilds through the sl block above; Plain has nothing.
             WiredUpscaler::Rr | WiredUpscaler::Plain => {}
+        }
+        // Frame generation, rebuilt at the new display size (the provider
+        // pick was made at boot and does not move — `version` survives on the
+        // state). Only when the FSR level actually came back up: its arms
+        // carry the prepare.
+        if let Some(fg) = &mut self.fg {
+            if self.fsr.is_some() && fg.version.0 != 0 {
+                match ffx::FgContext::create(
+                    &self.d3d.device,
+                    (w, h),
+                    (w, h),
+                    if self.d3d.hdr {
+                        ffx_sys::SURFACE_FORMAT_R16G16B16A16_FLOAT
+                    } else {
+                        ffx_sys::SURFACE_FORMAT_B8G8R8A8_UNORM
+                    },
+                    self.d3d.hdr,
+                    opts.debug,
+                    fg.version.0,
+                ) {
+                    Ok(ctx) => fg.ctx = Some(ctx),
+                    Err(e) => eprintln!("fg: disabled after resize — {e}"),
+                }
+            }
         }
         Ok(())
     }
@@ -1547,6 +1768,11 @@ impl GpuContext {
                 return Err(e);
             }
         }
+        self.fg_set_frame_ms(frame_ms);
+        if let Some(fs) = &self.fsr {
+            let (dep, mv, scale) = fs.res.fg_inputs(fc.rw as u32, fc.rh as u32);
+            self.fg_prepare(&self.d3d.list, fc, dep, mv, scale);
+        }
         // The tonemap pass re-binds root sig/PSO/heaps/viewport from scratch,
         // restoring whatever list state the ffx dispatch left behind.
         self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_FSR, 1.0);
@@ -1867,6 +2093,11 @@ impl GpuContext {
                 self.d3d.abort_frame();
                 return Err(e);
             }
+        }
+        self.fg_set_frame_ms(frame_ms);
+        if let Some(fs) = &self.fsr {
+            let (dep, mv, scale) = fs.res.fg_inputs(fc.rw as u32, fc.rh as u32);
+            self.fg_prepare(&self.d3d.list, fc, dep, mv, scale);
         }
         // The tonemap pass re-binds root sig/PSO/heaps/viewport from scratch,
         // restoring whatever list state the ffx dispatch left behind.
@@ -2285,6 +2516,11 @@ impl GpuContext {
             return Err(e);
         }
 
+        self.fg_set_frame_ms(frame_ms);
+        if let Some(fs) = &self.fsr {
+            let (dep, mv, scale) = fs.res.fg_inputs(fc.rw as u32, fc.rh as u32);
+            self.fg_prepare(&self.d3d.list, fc, dep, mv, scale);
+        }
         // The tonemap pass re-binds root sig/PSO/heaps/viewport from scratch,
         // restoring whatever list state the ffx dispatches left behind.
         self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_FSR, 1.0);
@@ -2448,6 +2684,11 @@ impl GpuContext {
                 return Err(e);
             }
         }
+        self.fg_set_frame_ms(frame_ms);
+        if let Some(fs) = &self.fsr {
+            let (dep, mv, scale) = fs.res.fg_inputs(fc.rw as u32, fc.rh as u32);
+            self.fg_prepare(&self.d3d.list, fc, dep, mv, scale);
+        }
         self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_FSR, 1.0);
         self.d3d.end_frame(slot)
     }
@@ -2498,6 +2739,11 @@ impl GpuContext {
                 self.d3d.abort_frame();
                 return Err(e);
             }
+        }
+        self.fg_set_frame_ms(frame_ms);
+        if let Some(fs) = &self.fsr {
+            let (dep, mv, scale) = fs.res.fg_inputs(fc.rw as u32, fc.rh as u32);
+            self.fg_prepare(&self.d3d.list, fc, dep, mv, scale);
         }
         self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_FSR, 1.0);
         self.d3d.end_frame(slot)
@@ -2597,6 +2843,11 @@ impl GpuContext {
             return Err(e);
         }
 
+        self.fg_set_frame_ms(frame_ms);
+        if let Some(fs) = &self.fsr {
+            let (dep, mv, scale) = fs.res.fg_inputs(fc.rw as u32, fc.rh as u32);
+            self.fg_prepare(&self.d3d.list, fc, dep, mv, scale);
+        }
         // The tonemap pass re-binds root sig/PSO/heaps/viewport from scratch,
         // restoring whatever list state the ffx dispatch left behind.
         self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_FSR, 1.0);
@@ -3164,6 +3415,152 @@ impl GpuContext {
         }
     }
 
+    // ---- frame generation (native family — FgState's per-frame protocol) ----
+
+    /// True when the session's swapchain is the FI proxy AND the FG effect
+    /// context came up (the boot line said "frame generation live").
+    pub fn fg_wired(&self) -> bool {
+        self.fg.as_ref().is_some_and(|f| f.ctx.is_some())
+    }
+
+    /// Whether generated frames are currently being inserted (the toggle
+    /// state, not the per-frame handshake).
+    pub fn fg_enabled(&self) -> bool {
+        self.fg.as_ref().is_some_and(|f| f.ctx.is_some() && f.enabled)
+    }
+
+    /// The picked FG provider's display name (the boot line / title bar).
+    pub fn fg_label(&self) -> Option<&str> {
+        self.fg.as_ref().filter(|f| f.ctx.is_some()).map(|f| f.version.1.as_str())
+    }
+
+    /// The live toggle. Turning off configures the FI swapchain disabled
+    /// immediately (passthrough presents from the very next frame).
+    pub fn set_fg_enabled(&mut self, on: bool) {
+        let Some(fg) = &mut self.fg else { return };
+        fg.enabled = on;
+        if !on {
+            self.fg_disable_now();
+        }
+    }
+
+    /// Stash last frame's wall-clock ms for this loop's prepare (main.rs owns
+    /// the clock; pacing quality follows this number).
+    pub fn fg_set_frame_ms(&self, ms: f32) {
+        if let Some(fg) = &self.fg {
+            fg.frame_ms.set(ms);
+        }
+    }
+
+    /// Configure the FI swapchain DISABLED at the current frame id, once
+    /// (idempotent via `live`). Used by the toggle, the pause gate, and the
+    /// funnel's not-prepared fallback.
+    fn fg_disable_now(&self) {
+        let Some(fg) = &self.fg else { return };
+        let Some(ctx) = &fg.ctx else { return };
+        if !fg.live.get() {
+            return;
+        }
+        let cfg = ffx::FfxShimFgConfig {
+            swapchain: self.d3d.swapchain.as_raw(),
+            enabled: 0,
+            allow_async: 0,
+            hudless: ffx_sys::FfxShimRes::NULL,
+            flags: 0,
+            only_present_generated: 0,
+            rect_left: 0,
+            rect_top: 0,
+            rect_w: self.d3d.width,
+            rect_h: self.d3d.height,
+            min_max_luminance: fg.luminance,
+            frame_id: fg.frame_id.get(),
+        };
+        if let Err(e) = ctx.configure(&cfg) {
+            eprintln!("fg: disable configure failed ({e})");
+        }
+        fg.live.set(false);
+    }
+
+    /// Record this frame's FG work: advance the frame id by exactly one (the
+    /// ffx contract), configure the FI swapchain live, and record the
+    /// PrepareV2 dispatch (depth + motion-vector dilation) into the frame's
+    /// list. Call AFTER the depth/mvec planes are final for the frame (post
+    /// feed/upload — both stay in NON_PIXEL_SHADER_RESOURCE, the compute-read
+    /// state the dispatch declares), BEFORE `fullscreen_to_backbuffer`.
+    /// `mv_scale` converts the plane's MV convention to the provider's UV
+    /// space: (1,1) for the pixel-space RG16F trio planes (the FSR3-upscale
+    /// precedent), (rw,rh) for the FSR4-RR UV-delta plane.
+    fn fg_prepare(
+        &self,
+        list: &ID3D12GraphicsCommandList,
+        fc: &dlss::FrameConstants,
+        depth: &ID3D12Resource,
+        mvec: &ID3D12Resource,
+        mv_scale: [f32; 2],
+    ) {
+        let Some(fg) = &self.fg else { return };
+        let Some(ctx) = &fg.ctx else { return };
+        if !fg.enabled {
+            return;
+        }
+        let frame_ms = fg.frame_ms.get();
+        let id = fg.frame_id.get() + 1;
+        fg.frame_id.set(id);
+        let cfg = ffx::FfxShimFgConfig {
+            swapchain: self.d3d.swapchain.as_raw(),
+            enabled: 1,
+            allow_async: 0,
+            hudless: ffx_sys::FfxShimRes::NULL,
+            flags: 0,
+            only_present_generated: 0,
+            rect_left: 0,
+            rect_top: 0,
+            rect_w: self.d3d.width,
+            rect_h: self.d3d.height,
+            min_max_luminance: fg.luminance,
+            frame_id: id,
+        };
+        if let Err(e) = ctx.configure(&cfg) {
+            eprintln!("fg: configure failed ({e})");
+            return;
+        }
+        fg.live.set(true);
+        let prep = ffx::FfxShimFgPrepare {
+            cmdlist: list.as_raw(),
+            frame_id: id,
+            flags: 0,
+            render_w: fc.rw as u32,
+            render_h: fc.rh as u32,
+            // The ffx-family jitter polarity settled for the upscaler applies
+            // here too (one constant, one family).
+            jitter: [crate::fsr::JITTER_SIGN * fc.jitter.0, crate::fsr::JITTER_SIGN * fc.jitter.1],
+            mv_scale,
+            frame_time_delta_ms: frame_ms.clamp(0.1, 200.0),
+            reset: fc.reset as i32,
+            cam_near: fc.near,
+            cam_far: fc.far,
+            cam_fovy: fc.fov_y,
+            view_space_to_meters: 1.0,
+            depth: ffx_sys::FfxShimRes {
+                resource: depth.as_raw(),
+                state: ffx_sys::RES_STATE_COMPUTE_READ,
+            },
+            motion_vectors: ffx_sys::FfxShimRes {
+                resource: mvec.as_raw(),
+                state: ffx_sys::RES_STATE_COMPUTE_READ,
+            },
+            cam_pos: v3(fc.pos),
+            cam_up: v3(fc.up),
+            cam_right: v3(fc.right),
+            cam_fwd: v3(fc.forward),
+        };
+        if let Err(e) = ctx.prepare(&prep) {
+            eprintln!("fg: prepare failed ({e})");
+            return;
+        }
+        fg.prepared.set(true);
+    }
+
     /// The single backbuffer bind point — all 16 present arms funnel here.
     ///
     /// The presentation curve is read from `self.tone` rather than threaded
@@ -3172,6 +3569,15 @@ impl GpuContext {
     /// signature change at 16 call sites. Glare is likewise applied here and
     /// nowhere else, on whatever this frame's tonemap source turns out to be.
     fn fullscreen_to_backbuffer(&self, use_tonemap: bool, srv_slot: u32, inv_samples: f32) {
+        // Frame generation handshake: a frame that reaches presentation
+        // WITHOUT an fg_prepare (plain arms, mode switches, holds) must not
+        // let the FI swapchain interpolate against stale motion — configure
+        // it disabled first (idempotent). A prepared frame consumes its flag.
+        if let Some(fg) = &self.fg {
+            if !fg.prepared.replace(false) {
+                self.fg_disable_now();
+            }
+        }
         // HUD overlay dirty rects: consume whatever the frame staged. Recorded
         // BEFORE the backbuffer transition (any point in the list before the
         // draws is fine — begin_frame's fence wait already made this slot's
@@ -3310,10 +3716,19 @@ impl Drop for GpuContext {
         // lists complete and a live device: drain the queue, then drop the
         // contexts here — before the field-order teardown releases the
         // swapchain/device.
-        if self.xess.is_some() || self.fsr.is_some() {
+        if self.xess.is_some() || self.fsr.is_some() || self.fg.is_some() {
             let _ = self.d3d.wait_idle();
             self.xess = None;
             self.fsr = None;
+            // FG: retire pending paced presents while the queue is live, and
+            // drop the display-size effect context. The SWAPCHAIN context
+            // stays for field order — it must destroy AFTER d3d releases its
+            // proxy/backbuffer refs (fg is declared after d3d exactly for
+            // this).
+            if let Some(fg) = &mut self.fg {
+                fg.sc.wait_for_presents();
+                fg.ctx = None;
+            }
         }
     }
 }

@@ -406,6 +406,62 @@ cargo run --release -- --fsr4         # --fsr, but the level is REQUIRED, not me
 cargo run --release -- --fsr3         # force-start the chain at the FSR 3.1 upscale-only level even
                                       # where FSR4+RR exists (A/B lever; no 3.1 provider = loud line
                                       # + plain, never a silent un-force)
+cargo run --release -- --fsr3 --fg    # FRAME GENERATION, ffx family (W4 leg 1 of 3; legs 2-3 =
+                                      # DLSS-G for DLSS sessions, XeSS-FG+XeLL for Intel XeSS
+                                      # sessions — not wired yet, loud note). Default OFF. In an
+                                      # FSR session (FSR4-RR or FSR3 wired) the swapchain is
+                                      # WRAPPED by the FidelityFX frame-interpolation proxy at
+                                      # creation (d3d12::SwapWrap — the wrap sits between scRGB
+                                      # negotiation and RTV creation because GetBuffer on the
+                                      # proxy returns the PROXY's backbuffers; scRGB is
+                                      # re-asserted through the proxy, which ffx supports — the
+                                      # SCRGB transfer function + the display probe's real
+                                      # min/max nits ride the dispatch) and ONE generated frame
+                                      # is inserted per rendered frame (measured 4090, THE
+                                      # WORLD, DXR->FSR3 vsync: 96 rendered -> ~195 presented
+                                      # fps, the exact-halving pacing signature; same stack live
+                                      # on the B70 and the AMD iGPU — AMD interpolation on Intel
+                                      # silicon is the cross-vendor demo). The FG provider ships
+                                      # in a DIFFERENT sample dir than the loader
+                                      # (--fg-path/FRUSTRACER_FG_PATH; ffxshim_preload_dir skips
+                                      # basenames already in the module list, so the primary
+                                      # --ffx-path stays authoritative). fsr::pick_fg_version:
+                                      # an FSR4 session prefers the 4.x ML frame generation,
+                                      # everything else the 3.1 interpolation, other major =
+                                      # fallback (the enumeration is device-filtered; the 4.0.1
+                                      # provider DLL enumerates only "3.1.6" on non-RDNA4 —
+                                      # RDNA4-gating observed live), never id 0 — gated in
+                                      # --check-fsr. Per-frame contract: frame_id advances by
+                                      # EXACTLY 1 (any other delta resets interpolation history
+                                      # by ffx contract); the six FSR present arms record a
+                                      # PrepareV2 dispatch (reversed-Z clip depth + the MV plane
+                                      # with the SAME mv_scale their upscale dispatch uses — trio
+                                      # = pixels (1,1), RR plane = UV-deltas (rw,rh); one MV
+                                      # convention per session by construction) and configure the
+                                      # FI swapchain live; fullscreen_to_backbuffer's HANDSHAKE
+                                      # covers everything else — any frame presented WITHOUT a
+                                      # prepare (plain arms, SPACE mode switches, the pause-menu
+                                      # present_again hold) finds `prepared` unset and configures
+                                      # the proxy DISABLED first (idempotent via `live`), so
+                                      # pacing never runs against stale motion. Resize: pending
+                                      # paced presents retire, the display-size-bound FG effect
+                                      # context rebuilds, the swapchain context survives
+                                      # (ResizeBuffers forwards). Teardown: GpuContext::drop
+                                      # waits presents with the queue live; `fg` is declared
+                                      # AFTER `d3d` so the proxy refs release before the
+                                      # swapchain context destroys the proxy. Known-accepts v1:
+                                      # HUD is baked pre-present (interpolated with the frame —
+                                      # static HUD ≈ invisible; the premul UI-resource
+                                      # registration is plumbed in the shim, unwired); XeSS/plain
+                                      # sessions wrap but present passthrough (their FG families
+                                      # are legs 2-3); latency untouched (W5). --fg --quinlight
+                                      # exits 2 (the --nppd shape). Headless (--check*/--spin)
+                                      # never consults it. Vendored: the v2.3.0 framegeneration
+                                      # headers (FG kit 4.0.1 + FI swapchain 3.1.7) under
+                                      # SDKs/fidelityfx-sdk/framegeneration/. Touch the shim FG
+                                      # block/ffx.rs FG wrappers/fg_prepare/the wrap hook -> run
+                                      # --check, --check-fsr, --check-gpu, then the interactive
+                                      # smoke on 4090 + B70 (fg lines + the cadence-halving test)
 cargo run --release -- --fsr --fsr-max-radiance 10  # Ray Regeneration tuning (FfxApiConfigureDenoiserKey,
                                       # applied at denoiser creation): --fsr-max-radiance (the firefly
                                       # clamp — the highest-value knob for a 1-spp path tracer),

@@ -494,3 +494,34 @@ pub fn pick_version(upscalers: &[(u64, String)], rr_available: bool, force_fsr3:
         .max_by_key(|&(_, v)| v)
         .map(|(id, _)| (id, Flavor::Fsr3))
 }
+
+/// Choose the FRAME GENERATION provider. `fg_versions` is the device-filtered
+/// framegeneration enumeration (empty = FG unsupported, the caller already
+/// bailed); `fsr4_session` says whether the session's UPSCALER resolved to the
+/// FSR4 family (family coherence: an FSR4-RR session prefers the 4.x ML frame
+/// generation, everything else — FSR3, XeSS-fed, cross-vendor — prefers the
+/// proven 3.1 interpolation). The preferred major may simply not be there
+/// (4.x FG is RDNA4-gated the way RR is; a 3.1-only drop enumerates no 4.x),
+/// so the other major is the fallback rather than a failure — the enumeration
+/// is device-filtered, anything in it is claimed to run here. Returns
+/// (version_id, display_name); version_id 0 (provider default + API pin) is
+/// deliberately NOT used — FG picks are always explicit overrides, because
+/// "default" would float with the drop while the session's flavor pairing is
+/// the contract we print and test against.
+pub fn pick_fg_version(fg_versions: &[(u64, String)], fsr4_session: bool) -> Option<(u64, String)> {
+    let best_of = |major: u32| {
+        fg_versions
+            .iter()
+            .filter_map(|(id, name)| {
+                parse_provider_versions(name)
+                    .into_iter()
+                    .filter(|v| v.0 == major)
+                    .max()
+                    .map(|v| (*id, name.clone(), v))
+            })
+            .max_by_key(|&(_, _, v)| v)
+            .map(|(id, name, _)| (id, name))
+    };
+    let (preferred, fallback) = if fsr4_session { (4, 3) } else { (3, 4) };
+    best_of(preferred).or_else(|| best_of(fallback))
+}

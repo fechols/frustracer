@@ -8,12 +8,14 @@
 use super::ffx_sys as sys;
 use std::ffi::c_void;
 use windows::core::Interface;
-use windows::Win32::Graphics::Direct3D12::ID3D12Device;
+use windows::Win32::Graphics::Direct3D12::{ID3D12CommandQueue, ID3D12Device};
+use windows::Win32::Graphics::Dxgi::{IDXGISwapChain3, IDXGISwapChain4};
 
-pub use sys::{FfxShimDenoiseDesc, FfxShimUpscaleDesc};
+pub use sys::{FfxShimDenoiseDesc, FfxShimFgConfig, FfxShimFgPrepare, FfxShimUpscaleDesc};
 
 // ffx_api.h effect ids, used only for debug-message routing.
 const EFFECT_ID_UPSCALE: u64 = 0x0001_0000;
+const EFFECT_ID_FRAMEGEN: u64 = 0x0002_0000;
 const EFFECT_ID_DENOISER: u64 = 0x0005_0000;
 const DEBUG_LEVEL_WARNINGS: u32 = 0x2;
 
@@ -264,6 +266,224 @@ impl Drop for FfxContext {
                 if r != sys::FFX_OK {
                     eprintln!("[ffx] context destroy failed: {}", result_str(r));
                 }
+            }
+        }
+    }
+}
+
+// ---- frame generation ----
+//
+// FG has a different lifetime shape from the upscaler/denoiser pair: the
+// frame-interpolation SWAPCHAIN must exist before the first GetBuffer (it
+// owns the backbuffers the session renders into — see d3d12::SwapWrap), while
+// the FG EFFECT context is display-size-bound and rebuilds on resize. And FG
+// can run in sessions where FSR is NOT the wired upscaler (an XeSS session on
+// a non-Intel adapter takes ffx-FG), so loading is a free function, not an
+// FfxContext method — the shim's loader state is process-global and
+// idempotent either way.
+
+/// Ensure the ffx loader is live and the framegeneration provider directory
+/// is preloaded. `loader_dir` is the session's --ffx-path; `fg_dir` is where
+/// amd_fidelityfx_framegeneration_dx12.dll lives (the prebuilt drop ships it
+/// in the FSR sample directory, NOT next to the loader — --fg-path). Safe to
+/// call when FSR already loaded the shim; safe to call twice.
+pub fn fg_load(loader_dir: &str, fg_dir: &str) -> Result<(), String> {
+    let loader = format!("{loader_dir}\\amd_fidelityfx_loader_dx12.dll");
+    if !std::path::Path::new(&loader).exists() {
+        return Err(format!("ffx loader not found at {loader}"));
+    }
+    let loader_w = wide(&loader);
+    let r = unsafe { sys::ffxshim_load(loader_w.as_ptr()) };
+    if r != sys::FFX_OK {
+        return Err(format!("ffx load failed: {}", result_str(r)));
+    }
+    let fg_dir_w = wide(fg_dir);
+    let r = unsafe { sys::ffxshim_preload_dir(fg_dir_w.as_ptr()) };
+    if r != sys::FFX_OK {
+        return Err(format!("fg provider preload failed: {}", result_str(r)));
+    }
+    unsafe { sys::ffxshim_set_debug(EFFECT_ID_FRAMEGEN, Some(log_cb), DEBUG_LEVEL_WARNINGS) };
+    Ok(())
+}
+
+/// Enumerate framegeneration provider versions on `device`. Empty = FG
+/// unsupported here (provider DLL missing from the preload dirs, or every
+/// provider rejected this adapter).
+pub fn fg_versions(device: &ID3D12Device) -> Result<Vec<Version>, String> {
+    let mut count: u64 = 0;
+    let r = unsafe {
+        sys::ffxshim_query_versions_fg(device.as_raw(), &mut count, std::ptr::null_mut(), std::ptr::null_mut())
+    };
+    if r != sys::FFX_OK {
+        return Err(format!("fg version query failed: {}", result_str(r)));
+    }
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let mut ids = vec![0u64; count as usize];
+    let mut names = vec![std::ptr::null::<i8>(); count as usize];
+    let mut inout = count;
+    let r = unsafe {
+        sys::ffxshim_query_versions_fg(device.as_raw(), &mut inout, ids.as_mut_ptr(), names.as_mut_ptr())
+    };
+    if r != sys::FFX_OK {
+        return Err(format!("fg version query failed: {}", result_str(r)));
+    }
+    Ok(ids
+        .into_iter()
+        .zip(names)
+        .take(inout as usize)
+        .map(|(id, name)| {
+            let name = if name.is_null() {
+                String::new()
+            } else {
+                unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy().into_owned()
+            };
+            (id, name)
+        })
+        .collect())
+}
+
+/// The frame-interpolation swapchain context. Owns the FI proxy: every ref
+/// the session holds on the proxy (D3d::swapchain, backbuffers) must be
+/// released BEFORE this drops — GpuContext's field order guarantees it (d3d
+/// declared before the FG state).
+pub struct FgSwapchain {
+    ctx: *mut c_void,
+}
+
+/// Wrap `sc` with the frame-interpolation swapchain on `queue`. Ok returns
+/// (proxy, context); Err hands the ORIGINAL swapchain back untouched so the
+/// session degrades to a normal present path.
+pub fn fg_wrap_swapchain(
+    queue: &ID3D12CommandQueue,
+    sc: IDXGISwapChain3,
+) -> Result<(IDXGISwapChain3, FgSwapchain), (IDXGISwapChain3, String)> {
+    // The wrap desc speaks IDXGISwapChain4; flip-model chains on any OS new
+    // enough to run this renderer implement it.
+    let sc4: IDXGISwapChain4 = match sc.cast() {
+        Ok(s) => s,
+        Err(e) => return Err((sc, format!("IDXGISwapChain4 cast: {e}"))),
+    };
+    drop(sc);
+    let mut raw = sc4.into_raw();
+    let mut ctx = std::ptr::null_mut();
+    let r = unsafe { sys::ffxshim_fg_swapchain_wrap(queue.as_raw(), &mut raw, &mut ctx) };
+    if r != sys::FFX_OK {
+        // Create failed: the desc's in/out pointer is untouched — reclaim the
+        // original reference we handed over.
+        let orig = unsafe { IDXGISwapChain3::from_raw(raw) };
+        return Err((orig, format!("wrap create: {}", result_str(r))));
+    }
+    // The out pointer is the FI proxy carrying one reference for us; every
+    // IDXGISwapChain4 is prefix-compatible with 3.
+    let proxy = unsafe { IDXGISwapChain3::from_raw(raw) };
+    Ok((proxy, FgSwapchain { ctx }))
+}
+
+impl FgSwapchain {
+    /// Block until every pending (paced/generated) present retired.
+    pub fn wait_for_presents(&self) {
+        let r = unsafe { sys::ffxshim_fg_swapchain_wait(self.ctx) };
+        if r != sys::FFX_OK {
+            eprintln!("[ffx] fg wait-for-presents failed: {}", result_str(r));
+        }
+    }
+
+    /// Register the premultiplied-alpha UI texture (the HUD) the proxy
+    /// composites onto BOTH real and generated frames. Null = unregister.
+    pub fn register_ui(&self, resource: *mut c_void, state: u32) -> Result<(), String> {
+        let ui = sys::FfxShimRes { resource, state };
+        let r = unsafe { sys::ffxshim_fg_swapchain_ui(self.ctx, &ui, 1) };
+        if r != sys::FFX_OK {
+            return Err(format!("fg ui register failed: {}", result_str(r)));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for FgSwapchain {
+    fn drop(&mut self) {
+        if !self.ctx.is_null() {
+            self.wait_for_presents();
+            let r = unsafe { sys::ffxshim_destroy(&mut self.ctx) };
+            if r != sys::FFX_OK {
+                eprintln!("[ffx] fg swapchain destroy failed: {}", result_str(r));
+            }
+        }
+    }
+}
+
+/// The FG effect context — display-size-bound (recreated on resize by the
+/// owner; the swapchain context above survives a ResizeBuffers).
+pub struct FgContext {
+    ctx: *mut c_void,
+}
+
+impl FgContext {
+    /// `backbuffer_format`: sys::SURFACE_FORMAT_* ordinal of the swapchain.
+    /// `hdr` arms FG_HDR (linear scRGB backbuffer). `version_id` 0 = provider
+    /// default + API pin; nonzero = the enumerated override
+    /// (`fsr::pick_fg_version`).
+    pub fn create(
+        device: &ID3D12Device,
+        display: (u32, u32),
+        max_render: (u32, u32),
+        backbuffer_format: u32,
+        hdr: bool,
+        debug_checking: bool,
+        version_id: u64,
+    ) -> Result<Self, String> {
+        let mut flags = sys::FG_DEPTH_INVERTED;
+        if hdr {
+            flags |= sys::FG_HDR;
+        }
+        if debug_checking {
+            flags |= sys::FG_DEBUG_CHECKING;
+        }
+        let mut ctx = std::ptr::null_mut();
+        let r = unsafe {
+            sys::ffxshim_create_fg(
+                device.as_raw(),
+                display.0,
+                display.1,
+                max_render.0,
+                max_render.1,
+                backbuffer_format,
+                flags,
+                version_id,
+                &mut ctx,
+            )
+        };
+        if r != sys::FFX_OK {
+            return Err(format!("fg context create failed: {}", result_str(r)));
+        }
+        Ok(Self { ctx })
+    }
+
+    pub fn configure(&self, c: &FfxShimFgConfig) -> Result<(), String> {
+        let r = unsafe { sys::ffxshim_fg_configure(self.ctx, c) };
+        if r != sys::FFX_OK {
+            return Err(format!("fg configure failed: {}", result_str(r)));
+        }
+        Ok(())
+    }
+
+    pub fn prepare(&self, p: &FfxShimFgPrepare) -> Result<(), String> {
+        let r = unsafe { sys::ffxshim_fg_prepare(self.ctx, p) };
+        if r != sys::FFX_OK {
+            return Err(format!("fg prepare failed: {}", result_str(r)));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for FgContext {
+    fn drop(&mut self) {
+        if !self.ctx.is_null() {
+            let r = unsafe { sys::ffxshim_destroy(&mut self.ctx) };
+            if r != sys::FFX_OK {
+                eprintln!("[ffx] fg context destroy failed: {}", result_str(r));
             }
         }
     }
