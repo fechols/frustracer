@@ -113,21 +113,29 @@ cc = "1"
 
 [profile.release]
 lto = "thin"
-codegen-units = 1
+# 16 CGUs, not 1 (adopted 2026-07-23): ThinLTO is DESIGNED for many CGUs —
+# parallel per-unit codegen with cross-unit inlining via summaries — and cgu=1
+# was serializing it into a fat-LTO-shaped single pass. Measured on this tree:
+# one-line-touch rebuild 198 -> 45 s (4.4x), full rebuild 72 s, priced at
+# +1-2% CPU-tracer ms/frame (interleaved 600-frame --spin path medians:
+# default scene 49.01 -> 49.96, san-miguel-low-poly 47.87 -> 48.42).
+# CPU benchmark numbers recorded before this date carry that offset.
+# `codegen-units = 1` is the one-line revert if a measurement ever needs the
+# last 2% back — re-price it with the same interleaved spin A/B if so.
+codegen-units = 16
 # Line tables so samplers (Tracy sampling, PIX timing captures, WPA) can
 # symbolize release frames; no runtime cost.
 debug = "line-tables-only"
 
-# Iteration-only profile: optimized, but without the ThinLTO + single-codegen-unit
-# whole-program pass, which is where a one-line-change rebuild actually spends its
-# time (measured on a one-line touch of main.rs: ~123 s under `release`, ~25 s
-# here — the whole-program pass, not the linker, is the cost).
+# Iteration-only profile: optimized, but without the ThinLTO whole-program pass
+# (measured on a one-line touch of main.rs: ~45 s under `release` at cgu=16,
+# ~25 s here — and ~123 s under the old cgu=1 release).
 #
 # NEVER BENCHMARK UNDER THIS PROFILE. Every performance number this project
 # reports — `--check`'s A/B bench rows, the hemi-share kill criterion ("if
 # share-on is not measurably faster, the feature does not merge"), the adopt
 # on/off regression guards — is only meaningful under `release`'s lto = "thin" +
-# codegen-units = 1. Use `quick` to find compile errors and to exercise the
+# codegen-units = 16. Use `quick` to find compile errors and to exercise the
 # exact-zero correctness gates (which are perf-independent); use `--release` for
 # anything that prints a number.
 [profile.quick]
