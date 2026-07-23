@@ -372,13 +372,14 @@ fn rr_sl_sequence(
     list: &ID3D12GraphicsCommandList,
     fc: &dlss::FrameConstants,
     frame_idx: u32,
+    dlssg: bool,
 ) -> Result<()> {
     let _ev = pix::scope(list, c"rr-eval");
     let list_raw = list.as_raw();
     let token = sl.new_frame_token(frame_idx)?;
     sl.set_constants(token, 0, &shim_constants(fc))?;
     sl.dlssd_set_options(0, &shim_options(fc, rr.ow, rr.oh))?;
-    sl.tag_resources(token, 0, &rr.tags(fc.rw, fc.rh), list_raw)?;
+    sl.tag_resources(token, 0, &rr.tags(fc.rw, fc.rh, dlssg), list_raw)?;
     sl.evaluate(streamline_sys::FEATURE_DLSS_RR, token, 0, list_raw)?;
     Ok(())
 }
@@ -487,29 +488,18 @@ impl GpuContext {
         }
         if fg_dlssg {
             // Hardware-accelerated GPU scheduling is a hard DLSS-G
-            // requirement the support probe does NOT surface: without it the
-            // driver cannot schedule interpolated presents, and every
-            // generated frame is silently dropped while status polls stay
-            // eOk (measured on this box — multiplier pinned at 1 with a
-            // clean status). Say so at boot instead of letting the user
-            // chase a phantom. reg.exe once at init; any failure to read =
-            // stay quiet (the feature still validates end to end).
-            let hags_on = std::process::Command::new("reg")
-                .args([
-                    "query",
-                    r"HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers",
-                    "/v",
-                    "HwSchMode",
-                ])
-                .output()
-                .ok()
-                .is_some_and(|o| String::from_utf8_lossy(&o.stdout).contains("0x2"));
-            if !hags_on {
-                eprintln!(
-                    "fg: Hardware-accelerated GPU Scheduling is OFF — DLSS-G will validate but \
+            // requirement the support probe does NOT surface. Ask the DRIVER
+            // (D3DKMT — the query the Settings page reads); a registry
+            // heuristic misreads Windows 11's default-on-with-absent-key
+            // common case, which shipped here once.
+            match adapter::hags_enabled(pick.luid) {
+                Some(true) => eprintln!("fg: hardware-accelerated GPU scheduling on (driver-confirmed)"),
+                Some(false) => eprintln!(
+                    "fg: hardware-accelerated GPU scheduling is OFF — DLSS-G will validate but \
                      DROP every generated frame. Enable it (Settings > System > Display > \
                      Graphics > Default graphics settings) and reboot."
-                );
+                ),
+                None => eprintln!("fg: hardware-accelerated GPU scheduling state unknown (query failed)"),
             }
         }
 
@@ -1741,7 +1731,7 @@ impl GpuContext {
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 )]);
             }
-            if let Err(e) = rr_sl_sequence(sl, rr, &d3d.list, fc, frame_idx) {
+            if let Err(e) = rr_sl_sequence(sl, rr, &d3d.list, fc, frame_idx, self.fg_g.as_ref().is_some_and(|g| g.enabled && !g.failed.get())) {
                 d3d.abort_frame();
                 return Err(e);
             }
@@ -2047,7 +2037,7 @@ impl GpuContext {
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 )]);
             }
-            rr_sl_sequence(sl, rr, &d3d.list, fc, frame_idx)?;
+            rr_sl_sequence(sl, rr, &d3d.list, fc, frame_idx, self.fg_g.as_ref().is_some_and(|g| g.enabled && !g.failed.get()))?;
             unsafe {
                 d3d.list.ResourceBarrier(&[transition(
                     &rr.output,
@@ -3280,7 +3270,7 @@ impl GpuContext {
             )]);
         }
 
-        if let Err(e) = rr_sl_sequence(sl, rr, &self.d3d.list, fc, frame_idx) {
+        if let Err(e) = rr_sl_sequence(sl, rr, &self.d3d.list, fc, frame_idx, self.fg_g.as_ref().is_some_and(|g| g.enabled && !g.failed.get())) {
             // Abandon the recorded-but-unexecuted frame: nothing reached the
             // GPU, so tracked resource states are unchanged, and closing the
             // list lets the next present's begin_frame Reset it. The caller
@@ -3353,7 +3343,7 @@ impl GpuContext {
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 )]);
             }
-            if let Err(e) = rr_sl_sequence(sl, rr, &d3d.list, fc, frame_idx) {
+            if let Err(e) = rr_sl_sequence(sl, rr, &d3d.list, fc, frame_idx, self.fg_g.as_ref().is_some_and(|g| g.enabled && !g.failed.get())) {
                 d3d.abort_frame();
                 return Err(e);
             }
@@ -3589,10 +3579,23 @@ impl GpuContext {
             return;
         }
         let Ok(token) = sl.new_frame_token(frame_idx) else { return };
-        let _ = sl.reflex_sleep(token);
-        let _ = sl.pcl_marker(streamline_sys::PCL_SIMULATION_START, token);
-        let _ = sl.pcl_marker(streamline_sys::PCL_SIMULATION_END, token);
-        let _ = sl.pcl_marker(streamline_sys::PCL_RENDERSUBMIT_START, token);
+        // First-frame diagnostics: marker plumbing failures are otherwise
+        // invisible (the calls are fire-and-forget by design), and a silent
+        // marker failure is exactly how "DLSS-G validates but never
+        // generates" presents itself.
+        let dbg = !g.on.get();
+        let chk = |name: &str, r: std::result::Result<(), String>| {
+            if dbg {
+                match r {
+                    Ok(()) => eprintln!("fg: {name} ok"),
+                    Err(e) => eprintln!("fg: {name} FAILED: {e}"),
+                }
+            }
+        };
+        chk("reflex_sleep", sl.reflex_sleep(token));
+        chk("pcl sim-start", sl.pcl_marker(streamline_sys::PCL_SIMULATION_START, token));
+        chk("pcl sim-end", sl.pcl_marker(streamline_sys::PCL_SIMULATION_END, token));
+        chk("pcl rsubmit-start", sl.pcl_marker(streamline_sys::PCL_RENDERSUBMIT_START, token));
         if !g.on.get() {
             let o = streamline_sys::SlShimDlssgOptions {
                 mode: streamline_sys::DLSSG_MODE_ON,
@@ -3623,14 +3626,23 @@ impl GpuContext {
             return self.d3d.end_frame(slot);
         }
         let token = self.sl.as_ref().unwrap().new_frame_token(frame_idx)?;
+        let dbg = self.fg_g.as_ref().unwrap().poll.get() == 0;
+        let chk = |name: &str, r: std::result::Result<(), String>| {
+            if dbg {
+                match r {
+                    Ok(()) => eprintln!("fg: {name} ok"),
+                    Err(e) => eprintln!("fg: {name} FAILED: {e}"),
+                }
+            }
+        };
         {
             let sl = self.sl.as_ref().unwrap();
-            let _ = sl.pcl_marker(streamline_sys::PCL_RENDERSUBMIT_END, token);
-            let _ = sl.pcl_marker(streamline_sys::PCL_PRESENT_START, token);
+            chk("pcl rsubmit-end", sl.pcl_marker(streamline_sys::PCL_RENDERSUBMIT_END, token));
+            chk("pcl present-start", sl.pcl_marker(streamline_sys::PCL_PRESENT_START, token));
         }
         let r = self.d3d.end_frame(slot);
         let sl = self.sl.as_ref().unwrap();
-        let _ = sl.pcl_marker(streamline_sys::PCL_PRESENT_END, token);
+        chk("pcl present-end", sl.pcl_marker(streamline_sys::PCL_PRESENT_END, token));
         let g = self.fg_g.as_ref().unwrap();
         let n = g.poll.get() + 1;
         g.poll.set(n);

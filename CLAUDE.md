@@ -486,19 +486,34 @@ cargo run --release -- --fg           # FRAME GENERATION, DLSS family (W4 leg 2)
                                       # (1) DLSS-G REJECTS the scRGB fp16 swapchain (guide §11)
                                       # — a G session forces the SDR 8-bit path (--no-fg
                                       # restores HDR; an HDR10/PQ tonemap arm is the open
-                                      # follow-on); (2) HAGS (hardware-accelerated GPU
-                                      # scheduling) must be ON in Windows or the driver DROPS
-                                      # every generated frame while slDLSSGGetState stays eOk —
-                                      # MEASURED on the dev box (multiplier pinned at 1, dlfg
-                                      # present layer engaged, flip metering 'good', zero
-                                      # errors); the boot line detects HwSchMode != 2 and names
-                                      # the Settings toggle + reboot. numFramesActuallyPresented
-                                      # reads as the PER-PRESENT MULTIPLIER (2 = generating) —
-                                      # the second 120-frame poll logs it. Gates: --check,
-                                      # --check-dlss, --check-gpu (SL paths untouched when
-                                      # --no-fg: the feature list only grows under --fg).
-                                      # Verification on a HAGS-on box: the boot multiplier line
-                                      # reads x2 and the --gpu-timing cadence test halves
+                                      # follow-on); (2) HAGS must be ON — asked of the DRIVER
+                                      # (adapter::hags_enabled, D3DKMT WDDM 2.7 caps, the query
+                                      # the Settings page reads); NEVER the registry: Win11
+                                      # defaults HAGS ON with the HwSchMode key ABSENT, and a
+                                      # registry heuristic misread exactly that (shipped once).
+                                      # DLSS-G's REQUIRED depth tag is kBufferTypeDepth (0), a
+                                      # DIFFERENT slot from RR's kBufferTypeLinearDepth (49) —
+                                      # rr.tags() dual-tags the linear view-Z plane in G
+                                      # sessions (monotone with distance, depthInverted 0; a
+                                      # missing tag has NO status bit). numFramesActuallyPresented
+                                      # reads as the PER-PRESENT MULTIPLIER (2 = generating);
+                                      # the second 120-frame poll logs it, and the first
+                                      # bracketed frame prints each marker/sleep result.
+                                      # OPEN ISSUE (dev 4090, driver 576.x-era, 2026-07-22):
+                                      # with EVERY verifiable element green — markers all eOk,
+                                      # Reflex armed, status eOk, HAGS driver-confirmed, type-0
+                                      # depth tagged, iFlip present mode, camera motion injected
+                                      # — the multiplier stays x1 and PresentMon shows 1:1
+                                      # presents: the dlfg layer engages (cloneFakeBuffers,
+                                      # flip metering 'good') but never inserts. ELIMINATED, do
+                                      # not re-test: vsync on AND off, static-scene (motion
+                                      # injected), high source fps (--spp 64), missing PCL
+                                      # plugin (loads + markers accepted), HAGS. Next
+                                      # instruments: eyes on screen / NVIDIA App overlay
+                                      # (shows FG state live), SL development DLLs + sl.imgui
+                                      # debug HUD, per-frame ETW. Gates: --check, --check-dlss,
+                                      # --check-gpu (SL paths untouched when --no-fg: the
+                                      # feature list only grows under --fg)
 cargo run --release -- --fsr --fsr-max-radiance 10  # Ray Regeneration tuning (FfxApiConfigureDenoiserKey,
                                       # applied at denoiser creation): --fsr-max-radiance (the firefly
                                       # clamp — the highest-value knob for a 1-spp path tracer),
