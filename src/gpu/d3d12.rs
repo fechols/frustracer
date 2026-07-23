@@ -550,6 +550,23 @@ impl D3d {
     /// let the next `begin_frame` reset the allocator under the still-running
     /// submission. On the success path `end_frame` overwrites it with a later
     /// value — the Signal is pure error-path insurance, never waited on here.
+    /// Mid-frame present — the frame-generation pair-present's first half:
+    /// Close + Execute + Present, then Reset the list on the SAME slot
+    /// allocator (split_frame's legality argument — only ALLOCATOR reset
+    /// needs the fence) so the caller records the frame's second half. The
+    /// slot's fence signals once, at the final end_frame; under vsync the two
+    /// Presents land one vblank apart, which IS the pacing.
+    pub fn present_mid(&mut self, slot: usize) -> Result<()> {
+        unsafe { self.list.Close() }.map_err(|e| format!("mid Close: {e}"))?;
+        let lists = [Some(self.list.cast::<ID3D12CommandList>().unwrap())];
+        unsafe { self.queue.ExecuteCommandLists(&lists) };
+        unsafe { self.swapchain.Present(self.sync_interval, self.present_flags) }
+            .ok()
+            .map_err(|e| format!("mid Present: {e}"))?;
+        unsafe { self.list.Reset(&self.slots[slot].allocator, None) }
+            .map_err(|e| format!("mid list Reset: {e}"))
+    }
+
     pub fn split_frame(&mut self, slot: usize) -> Result<()> {
         unsafe { self.list.Close() }.map_err(|e| format!("split Close: {e}"))?;
         let lists = [Some(self.list.cast::<ID3D12CommandList>().unwrap())];

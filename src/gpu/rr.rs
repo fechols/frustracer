@@ -324,6 +324,13 @@ impl RrResources {
         Ok(())
     }
 
+    /// The raw-NGX frame-generation inputs: (depth, mvec) — the same linear
+    /// view-Z + pixel-space MV planes the SL tags name, resting
+    /// NON_PIXEL_SHADER_RESOURCE.
+    pub fn fg_inputs(&self) -> (&ID3D12Resource, &ID3D12Resource) {
+        (&self.planes[P_DEPTH].tex, &self.planes[P_MVEC].tex)
+    }
+
     /// The full tag table for slEvaluateFeature(DLSS-RR). States must be the
     /// states the resources are in when SL *uses* them (manual hooking).
     /// Under DRS every input tag carries the current render-size extent

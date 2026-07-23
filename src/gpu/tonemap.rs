@@ -44,6 +44,9 @@ pub const SRV_SLOT_QUIN: u32 = 8;
 /// never reads it; it composites OVER whatever was tonemapped), so it takes a
 /// plain `create_srv`, never `wire_tonemap_src`.
 pub const SRV_SLOT_OVERLAY: u32 = 9;
+/// The raw-NGX DLSS-G interpolated frame (`--fg` DLSS sessions with the NDA
+/// SDK present) — presented BEFORE the real frame each pair-present.
+pub const SRV_SLOT_NGXFG: u32 = 10;
 /// Room for future debug views. Also sizes `gpu/bloom.rs`'s source-slot region:
 /// the glare pyramid keeps a permanent SRV per tonemap slot in its own heap.
 pub const SRV_HEAP_CAPACITY: u32 = 12;

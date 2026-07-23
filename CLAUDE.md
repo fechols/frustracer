@@ -503,9 +503,52 @@ cargo run --release -- --fsr3 --fg    # FRAME GENERATION, ffx family (W4 leg 1 o
                                       # --check, --check-fsr, --check-gpu, then the interactive
                                       # smoke on 4090 + B70 (fg lines + the cadence-halving test)
 cargo run --release -- --fg           # FRAME GENERATION, DLSS family (W4 leg 2): in a DLSS
-                                      # session (the flagless NVIDIA default) --fg arms DLSS-G
-                                      # through the SL proxy swapchain manual hooking
-                                      # deliberately created for this. slInit requests
+                                      # session (the flagless NVIDIA default) --fg arms DLSS
+                                      # frame generation. TWO BACKENDS, picked at BUILD time:
+                                      # (A) RAW NGX — the DEFAULT when the NDA-tier DLSS SDK
+                                      # is present at build (FRUSTRACER_DLSS_SDK, default
+                                      # ..\quinlight-player\SDKs\DLSS-SDK; never committed,
+                                      # build.rs cfg(dlssg_ngx) + stages nvngx_dlssg.dll) —
+                                      # VERIFIED GENERATING on the 4090: shim/dlssg_shim.cpp
+                                      # (the quinlight-player blueprint, adapted with REAL
+                                      # camera data) drives NVSDK_NGX_Feature_FrameGeneration
+                                      # directly; the feature retains the previous rr.output
+                                      # internally, one evaluate per frame writes the
+                                      # in-between frame into fg_n.out, and ngxfg_tail
+                                      # PAIR-PRESENTS: tonemap(interp) -> present_mid (Close+
+                                      # Execute+Present+Reset on the same slot allocator, the
+                                      # split_frame legality) -> tonemap(real) -> end_frame.
+                                      # Under vsync the two presents land a vblank apart =
+                                      # the pacing (measured: rendered 186 -> 93 fps while
+                                      # presents hold ~174/s — the exact-halving signature).
+                                      # NO handshake needed (nothing generates behind our
+                                      # back), DLSS-RR runs in the SAME session, and scRGB
+                                      # fp16 is PRESERVED (no swapchain policing — there is no
+                                      # swapchain hook). SL DLSS-G/Reflex are NOT requested at
+                                      # slInit when this path is built. THREE TRAPS, all
+                                      # measured: (1) NGX may already be initialized
+                                      # in-process by Streamline — probe GetCapability-
+                                      # Parameters FIRST and only key our own
+                                      # Init_with_ProjectID when it fails (two differently-
+                                      # keyed inits on one device silently break each other;
+                                      # only Shutdown1 an init we own); (2) a null app-data
+                                      # path fails init with 0xBAD0000F FAIL_UnableToWrite-
+                                      # ToAppDataPath — pass %LOCALAPPDATA%\frustracer\ngx;
+                                      # (3) motionVectorsInvalidValue must be FLT_MAX, not 0
+                                      # (0 tags every static pixel invalid — the quinlight
+                                      # lesson). Reset frames evaluate (to seed history) but
+                                      # present real-only (`primed`); the feature is fixed-res
+                                      # (lazy-created at the locked render res; --lock-res
+                                      # dynamic skips FG with a note; resize destroys +
+                                      # lazy-recreates). Known-accepts: HUD interpolated with
+                                      # the frame (pHudless/pUI null); latency +~half frame
+                                      # (the interpolation cost, W5 owns measurement).
+                                      # (B) STREAMLINE DLSS-G — the fallback when built
+                                      # WITHOUT the SDK: contract-complete but SL's closed
+                                      # dlfg layer DECLINES TO INSERT on the dev box (the
+                                      # open issue below; kept for the day SL fixes it).
+                                      # The SL attempt arms through the proxy swapchain
+                                      # manual hooking deliberately created for this. slInit requests
                                       # [RR, DLSS_G, Reflex] (PCL auto-loads; features cannot
                                       # load later); Reflex is configured low-latency at init
                                       # (a HARD DLSS-G runtime requirement) and the three RR

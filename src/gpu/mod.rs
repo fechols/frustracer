@@ -227,6 +227,114 @@ struct FgState {
     version: (u64, String),
 }
 
+/// Raw-NGX DLSS-G FFI (shim/dlssg_shim.cpp — the quinlight-player blueprint).
+/// The dispatch struct exists in BOTH cfg arms so the call sites typecheck;
+/// without the NDA-tier SDK at build time the fns stub to UNSUPPORTED and
+/// the session falls back to the Streamline DLSS-G attempt.
+mod ngxfg {
+    use std::ffi::c_void;
+
+    pub const ERR_UNSUPPORTED: i32 = -3;
+
+    #[repr(C)]
+    pub struct FrDlssgDispatch {
+        pub cmdlist: *mut c_void,
+        pub color: *mut c_void,
+        pub motion: *mut c_void,
+        pub depth: *mut c_void,
+        pub output: *mut c_void,
+        pub frame_id: u64,
+        pub reset: i32,
+        pub view_to_clip: [f32; 16],
+        pub clip_to_view: [f32; 16],
+        pub clip_to_prev_clip: [f32; 16],
+        pub prev_clip_to_clip: [f32; 16],
+        pub jitter: [f32; 2],
+        pub mv_scale: [f32; 2],
+        pub cam_pos: [f32; 3],
+        pub cam_up: [f32; 3],
+        pub cam_right: [f32; 3],
+        pub cam_fwd: [f32; 3],
+        pub cam_near: f32,
+        pub cam_far: f32,
+        pub cam_fov: f32,
+        pub cam_aspect: f32,
+        pub rend_w: u32,
+        pub rend_h: u32,
+        pub depth_inverted: i32,
+    }
+    // The dlssg_shim.cpp twin asserts the identical literals (the ffx FG
+    // desc discipline: pin the padding-hole shapes on both sides).
+    const _: () = assert!(std::mem::offset_of!(FrDlssgDispatch, view_to_clip) == 52);
+    const _: () = assert!(std::mem::size_of::<FrDlssgDispatch>() == 400);
+
+    #[cfg(dlssg_ngx)]
+    pub const BUILT: bool = true;
+    #[cfg(dlssg_ngx)]
+    unsafe extern "C" {
+        pub fn frdlssg_create(
+            device: *mut c_void,
+            disp_w: u32,
+            disp_h: u32,
+            rend_w: u32,
+            rend_h: u32,
+            color_hdr: i32,
+            out_handle: *mut *mut c_void,
+        ) -> i32;
+        pub fn frdlssg_dispatch(handle: *mut c_void, d: *const FrDlssgDispatch) -> i32;
+        pub fn frdlssg_destroy(handle: *mut c_void);
+    }
+
+    #[cfg(not(dlssg_ngx))]
+    pub const BUILT: bool = false;
+    #[cfg(not(dlssg_ngx))]
+    #[allow(clippy::missing_safety_doc)]
+    pub unsafe fn frdlssg_create(
+        _device: *mut c_void,
+        _dw: u32,
+        _dh: u32,
+        _rw: u32,
+        _rh: u32,
+        _hdr: i32,
+        _out: *mut *mut c_void,
+    ) -> i32 {
+        ERR_UNSUPPORTED
+    }
+    #[cfg(not(dlssg_ngx))]
+    #[allow(clippy::missing_safety_doc)]
+    pub unsafe fn frdlssg_dispatch(_h: *mut c_void, _d: *const FrDlssgDispatch) -> i32 {
+        ERR_UNSUPPORTED
+    }
+    #[cfg(not(dlssg_ngx))]
+    #[allow(clippy::missing_safety_doc)]
+    pub unsafe fn frdlssg_destroy(_h: *mut c_void) {}
+}
+
+/// Raw-NGX DLSS-G state (DLSS sessions when the shim is compiled in — see
+/// `ngxfg`). No swapchain wrap, no pacer, no handshake: WE evaluate the
+/// interpolated frame into `out` and present it BEFORE the real frame
+/// (pair-present; vsync spaces the two). The NGX feature is created LAZILY at
+/// the first dispatch — the session's locked render res is main.rs's
+/// decision, unknown at GpuContext::new.
+struct NgxFgState {
+    /// The interpolated-frame target: window-res RGBA16F, rests
+    /// PIXEL_SHADER_RESOURCE (tonemap source at SRV_SLOT_NGXFG), UAV during
+    /// the evaluate.
+    out: ID3D12Resource,
+    handle: std::cell::Cell<*mut std::ffi::c_void>,
+    /// The render res the feature was created at; (0,0) = not yet created.
+    /// A frame at a different res skips FG (loud once) — the NGX feature is
+    /// fixed-res by creation (DynamicResolutionScaling=false).
+    dims: std::cell::Cell<(u32, u32)>,
+    enabled: bool,
+    failed: std::cell::Cell<bool>,
+    /// A previous frame seeded the feature's internal history — the
+    /// interpolated output is only presentable when the PAIR exists.
+    primed: std::cell::Cell<bool>,
+    frame_id: std::cell::Cell<u64>,
+    noted_res: std::cell::Cell<bool>,
+}
+
 /// XeSS-FG frame generation (Intel XeSS sessions — the third `--fg` family).
 /// The xefg swapchain proxy does interpolation + pacing at Present (the ffx
 /// FI shape); XeLL is created and linked inside the wrap (a hard xefg
@@ -359,6 +467,10 @@ pub struct GpuContext {
     /// Declared AFTER `d3d` like `fg`: destroying the xefg context tears the
     /// FI proxy down, so d3d's proxy refs must release first.
     fg_x: Option<XefgState>,
+    /// Raw-NGX DLSS-G (DLSS sessions with the NDA SDK built in; see
+    /// NgxFgState). The NGX handle is destroyed explicitly in Drop /
+    /// resize_output after a queue drain — no COM field-order constraint.
+    fg_n: Option<NgxFgState>,
     /// Kept alive for the app lifetime: the hooked CreateCommandQueue /
     /// CreateSwapChain entry points live on these (Frame Gen will need them
     /// again), and dropping them to refcount 0 destroys the SL wrappers.
@@ -439,10 +551,14 @@ impl GpuContext {
         // DXGI factory exists — which is why DLSS is structurally the top of
         // the chain: it decides the SL-proxy-vs-native device split before
         // anything else can be probed.
-        // --fg in a DLSS session = DLSS-G, which (with its hard Reflex
-        // prerequisite) must be REQUESTED at slInit — features cannot be
-        // loaded later. PCL (the marker plugin) loads by default.
-        let sl_features: &[u32] = if opts.fg && !opts.quin {
+        // --fg in a DLSS session = DLSS-G. When the raw-NGX shim is built in
+        // (the quinlight-player blueprint — see `ngxfg`), that path owns
+        // frame generation and the Streamline DLSS-G feature is NOT
+        // requested (SL's dlfg present layer is the declines-to-insert open
+        // issue the NGX path exists to bypass); Reflex/PCL likewise stay
+        // unloaded. Without the SDK, the SL attempt remains (with its hard
+        // Reflex prerequisite) — features cannot be loaded after slInit.
+        let sl_features: &[u32] = if opts.fg && !opts.quin && !ngxfg::BUILT {
             &[
                 streamline_sys::FEATURE_DLSS_RR,
                 streamline_sys::FEATURE_DLSS_G,
@@ -492,7 +608,7 @@ impl GpuContext {
         // eFailHDRFormatNotSupported), so a G session presents SDR 8-bit.
         // G's absence never affects RR.
         let mut fg_dlssg = false;
-        if opts.fg && !opts.quin {
+        if opts.fg && !opts.quin && !ngxfg::BUILT {
             if let Some(s) = &sl {
                 match s.is_feature_supported(streamline_sys::FEATURE_DLSS_G, pick.luid) {
                     Ok(()) => fg_dlssg = true,
@@ -744,11 +860,57 @@ impl GpuContext {
             tonemap::SRV_SLOT_HDR,
         );
 
-        // DLSS-G, part 2: Reflex must be configured at least once BEFORE the
-        // first frame with G on (the runtime enforces its presence:
-        // eFailReflexNotDetectedAtRuntime). Low-latency mode — the whole
-        // point of pairing Reflex with generation is clawing the latency
-        // back. Mode eOn itself is set lazily by the first RR frame's
+        // Raw-NGX DLSS-G (preferred when built): the interpolated-frame
+        // target + lazy-created feature. scRGB fp16 is fine on this path —
+        // there is no swapchain policing because there is no swapchain hook.
+        let fg_n = if opts.fg && !opts.quin && ngxfg::BUILT && sl.is_some() && rr_res.is_some() {
+            match d3d12::committed_tex(
+                &d3d.device,
+                w,
+                h,
+                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            ) {
+                Ok(out) => {
+                    wire_tonemap_src(
+                        &d3d.device,
+                        &passes,
+                        &bloom,
+                        &out,
+                        windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+                        tonemap::SRV_SLOT_NGXFG,
+                    );
+                    eprintln!(
+                        "fg: raw-NGX DLSS-G armed (no Streamline pacer — pair-present; feature \
+                         created on the first frame)"
+                    );
+                    Some(NgxFgState {
+                        out,
+                        handle: std::cell::Cell::new(std::ptr::null_mut()),
+                        dims: std::cell::Cell::new((0, 0)),
+                        enabled: true,
+                        failed: std::cell::Cell::new(false),
+                        primed: std::cell::Cell::new(false),
+                        frame_id: std::cell::Cell::new(0),
+                        noted_res: std::cell::Cell::new(false),
+                    })
+                }
+                Err(e) => {
+                    eprintln!("fg: interpolated-frame target creation failed ({e}) — FG off");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // DLSS-G, part 2 (the Streamline attempt — reachable only when the
+        // raw-NGX shim is NOT built in): Reflex must be configured at least
+        // once BEFORE the first frame with G on (the runtime enforces its
+        // presence: eFailReflexNotDetectedAtRuntime). Low-latency mode — the
+        // whole point of pairing Reflex with generation is clawing the
+        // latency back. Mode eOn itself is set lazily by the first RR frame's
         // dlssg_frame_begin (options take effect at the next Present, and
         // that keeps the enable on the present thread by construction).
         let fg_g = if fg_dlssg && rr_res.is_some() {
@@ -914,6 +1076,7 @@ impl GpuContext {
             fg: fg_state,
             fg_g,
             fg_x,
+            fg_n,
             adapter_name: pick.name,
             adapter_vendor: pick.vendor,
             tone,
@@ -1175,6 +1338,19 @@ impl GpuContext {
         // completed command lists, ResizeBuffers requires zero outstanding
         // backbuffer refs).
         self.d3d.wait_idle()?;
+        // Raw-NGX DLSS-G: the feature is display-size-bound (created at the
+        // old window dims) — release it now (queue just drained) and let the
+        // first frame at the new size lazy-recreate; the interpolated-frame
+        // target rebuilds below with the other window-sized textures.
+        if let Some(n) = &self.fg_n {
+            let h = n.handle.replace(std::ptr::null_mut());
+            if !h.is_null() {
+                unsafe { ngxfg::frdlssg_destroy(h) };
+            }
+            n.dims.set((0, 0));
+            n.primed.set(false);
+            n.noted_res.set(false);
+        }
         self.trace = None;
         self.dxr = None;
         self.nppd_gpu = None;
@@ -1301,6 +1477,27 @@ impl GpuContext {
             }
             // Rr rebuilds through the sl block above; Plain has nothing.
             WiredUpscaler::Rr | WiredUpscaler::Plain => {}
+        }
+        // Raw-NGX DLSS-G: rebuild the window-sized interpolated-frame target
+        // + its tonemap SRV (the feature itself lazy-recreates on the first
+        // frame).
+        if let Some(n) = &mut self.fg_n {
+            n.out = d3d12::committed_tex(
+                &self.d3d.device,
+                w,
+                h,
+                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            )?;
+            wire_tonemap_src(
+                &self.d3d.device,
+                &self.passes,
+                &self.bloom,
+                &n.out,
+                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+                tonemap::SRV_SLOT_NGXFG,
+            );
         }
         // XeSS-FG re-enable when the XeSS level came back up (the swapchain
         // context itself survived the ResizeBuffers).
@@ -1917,12 +2114,17 @@ impl GpuContext {
             let d = self.dxr.as_ref().unwrap();
             d.record_resolve(&self.d3d.list, slot, 1);
             self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_DXR, 1.0);
-        } else {
-            // The tonemap pass re-binds root sig/PSO/heaps/viewport from
-            // scratch — the post-evaluate state restore
-            // eDisableCLStateTracking makes the host's responsibility.
-            self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_RR, 1.0);
+            return self.dlssg_end_frame(slot, frame_idx);
         }
+        // Raw-NGX frame generation owns the tail when armed (pair-present);
+        // the SL-G marker bracket below is its fallback sibling.
+        if self.fg_n.is_some() {
+            return self.ngxfg_tail(slot, fc);
+        }
+        // The tonemap pass re-binds root sig/PSO/heaps/viewport from
+        // scratch — the post-evaluate state restore
+        // eDisableCLStateTracking makes the host's responsibility.
+        self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_RR, 1.0);
         self.dlssg_end_frame(slot, frame_idx)
     }
 
@@ -3472,6 +3674,9 @@ impl GpuContext {
                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
             )]);
         }
+        if self.fg_n.is_some() {
+            return self.ngxfg_tail(slot, fc);
+        }
         // The tonemap pass re-binds root sig/PSO/heaps/viewport from scratch,
         // which is exactly the post-evaluate state restore that
         // eDisableCLStateTracking makes the host's responsibility.
@@ -3540,6 +3745,9 @@ impl GpuContext {
                     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
                 )]);
             }
+        }
+        if self.fg_n.is_some() {
+            return self.ngxfg_tail(slot, fc);
         }
         // The tonemap pass re-binds root sig/PSO/heaps/viewport from scratch —
         // the post-evaluate state restore eDisableCLStateTracking makes the
@@ -3722,6 +3930,7 @@ impl GpuContext {
         self.fg.as_ref().is_some_and(|f| f.ctx.is_some())
             || self.fg_g.is_some()
             || self.fg_x.as_ref().is_some_and(|x| !x.failed.get())
+            || self.fg_n.as_ref().is_some_and(|n| !n.failed.get())
     }
 
     /// Whether generated frames are currently being inserted (the toggle
@@ -3730,10 +3939,14 @@ impl GpuContext {
         self.fg.as_ref().is_some_and(|f| f.ctx.is_some() && f.enabled)
             || self.fg_g.as_ref().is_some_and(|g| g.enabled && !g.failed.get())
             || self.fg_x.as_ref().is_some_and(|x| x.enabled && !x.failed.get())
+            || self.fg_n.as_ref().is_some_and(|n| n.enabled && !n.failed.get())
     }
 
     /// The wired FG family's display name (the boot line / title bar).
     pub fn fg_label(&self) -> Option<&str> {
+        if self.fg_n.as_ref().is_some_and(|n| !n.failed.get()) {
+            return Some("DLSS-G (NGX)");
+        }
         if self.fg_g.is_some() {
             return Some("DLSS-G");
         }
@@ -3747,6 +3960,12 @@ impl GpuContext {
     /// proxy configures passthrough; DLSS-G's mode-off edge lands via the
     /// funnel handshake on the very next present; XeSS-FG flips SetEnabled).
     pub fn set_fg_enabled(&mut self, on: bool) {
+        if let Some(n) = &mut self.fg_n {
+            n.enabled = on;
+            if !on {
+                n.primed.set(false);
+            }
+        }
         if let Some(g) = &mut self.fg_g {
             g.enabled = on;
         }
@@ -3858,6 +4077,126 @@ impl GpuContext {
             }
         }
         r
+    }
+
+    /// Raw-NGX DLSS-G: record this frame's interpolation evaluate into the
+    /// open list. `rr.output` is the CURRENT denoised frame; the NGX feature
+    /// retains the previous one internally, so the evaluate produces the
+    /// frame BETWEEN them into `fg_n.out`. Returns true when that output is
+    /// presentable (a prior frame primed the pair and this one is no reset).
+    /// The feature is created lazily at the frame's locked render res.
+    fn ngxfg_dispatch(&self, fc: &dlss::FrameConstants) -> bool {
+        let (Some(n), Some(rr)) = (&self.fg_n, &self.rr) else { return false };
+        if !n.enabled || n.failed.get() {
+            return false;
+        }
+        let (rw, rh) = (fc.rw as u32, fc.rh as u32);
+        if n.handle.get().is_null() {
+            let mut h = std::ptr::null_mut();
+            let r = unsafe {
+                ngxfg::frdlssg_create(self.d3d.device.as_raw(), rr.ow, rr.oh, rw, rh, 1, &mut h)
+            };
+            if r != 0 || h.is_null() {
+                eprintln!("fg: raw-NGX DLSS-G create failed ({r}) — frame generation off");
+                n.failed.set(true);
+                return false;
+            }
+            n.handle.set(h);
+            n.dims.set((rw, rh));
+            eprintln!(
+                "fg: raw-NGX DLSS-G live — 1 generated frame per rendered frame (pair-present)"
+            );
+        }
+        if n.dims.get() != (rw, rh) {
+            if !n.noted_res.get() {
+                n.noted_res.set(true);
+                eprintln!(
+                    "fg: render res moved off the feature's {}x{} — skipping frame generation \
+                     (fixed-res by creation; avoid --lock-res dynamic with --fg)",
+                    n.dims.get().0,
+                    n.dims.get().1
+                );
+            }
+            n.primed.set(false);
+            return false;
+        }
+        let id = n.frame_id.get() + 1;
+        n.frame_id.set(id);
+        let (dep, mv) = rr.fg_inputs();
+        let (psr, npsr, uav) = (
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        );
+        let list = &self.d3d.list;
+        unsafe {
+            list.ResourceBarrier(&[
+                transition(&rr.output, psr, npsr),
+                transition(&n.out, psr, uav),
+            ]);
+        }
+        let d = ngxfg::FrDlssgDispatch {
+            cmdlist: list.as_raw(),
+            color: rr.output.as_raw(),
+            motion: mv.as_raw(),
+            depth: dep.as_raw(),
+            output: n.out.as_raw(),
+            frame_id: id,
+            reset: fc.reset as i32,
+            view_to_clip: row_major(&fc.view_to_clip),
+            clip_to_view: row_major(&fc.clip_to_view),
+            clip_to_prev_clip: row_major(&fc.clip_to_prev_clip),
+            prev_clip_to_clip: row_major(&fc.prev_clip_to_clip),
+            // The SL-negated jitter convention — same NGX family, one sign.
+            jitter: [-fc.jitter.0, -fc.jitter.1],
+            // Pixel MVs -> [-1,1] (the quinlight-settled normalization).
+            mv_scale: [1.0 / rw as f32, 1.0 / rh as f32],
+            cam_pos: v3(fc.pos),
+            cam_up: v3(fc.up),
+            cam_right: v3(fc.right),
+            cam_fwd: v3(fc.forward),
+            cam_near: fc.near,
+            cam_far: fc.far,
+            cam_fov: fc.fov_y,
+            cam_aspect: fc.aspect,
+            rend_w: rw,
+            rend_h: rh,
+            // Linear view-Z grows with distance — not inverted.
+            depth_inverted: 0,
+        };
+        let r = unsafe { ngxfg::frdlssg_dispatch(n.handle.get(), &d) };
+        unsafe {
+            list.ResourceBarrier(&[
+                transition(&rr.output, npsr, psr),
+                transition(&n.out, uav, psr),
+            ]);
+        }
+        if r != 0 {
+            eprintln!("fg: raw-NGX DLSS-G evaluate failed ({r}) — frame generation off");
+            n.failed.set(true);
+            n.primed.set(false);
+            return false;
+        }
+        // A reset evaluate re-seeds the history but its OUTPUT pairs against
+        // a stale frame — present real-only this frame, pairs from the next.
+        let show = n.primed.get() && !fc.reset;
+        n.primed.set(true);
+        show
+    }
+
+    /// The pair-present tail for the RR arms under raw-NGX frame generation:
+    /// evaluate, present the INTERPOLATED frame first (it sits between prev
+    /// and current in time), then the real frame. Under vsync the two
+    /// presents land a vblank apart — that IS the pacing; no handshake is
+    /// needed because nothing generates behind our back.
+    fn ngxfg_tail(&mut self, slot: usize, fc: &dlss::FrameConstants) -> Result<()> {
+        let show = self.ngxfg_dispatch(fc);
+        if show {
+            self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_NGXFG, 1.0);
+            self.d3d.present_mid(slot)?;
+        }
+        self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_RR, 1.0);
+        self.d3d.end_frame(slot)
     }
 
     /// DLSS-G per-frame bracket, first half — the top of an RR arm: Reflex
@@ -4278,10 +4617,23 @@ impl Drop for GpuContext {
         // lists complete and a live device: drain the queue, then drop the
         // contexts here — before the field-order teardown releases the
         // swapchain/device.
-        if self.xess.is_some() || self.fsr.is_some() || self.fg.is_some() || self.fg_x.is_some() {
+        if self.xess.is_some()
+            || self.fsr.is_some()
+            || self.fg.is_some()
+            || self.fg_x.is_some()
+            || self.fg_n.is_some()
+        {
             let _ = self.d3d.wait_idle();
             self.xess = None;
             self.fsr = None;
+            // Raw-NGX DLSS-G: release the feature with the queue drained and
+            // the device alive (its texture drops by field order).
+            if let Some(n) = &self.fg_n {
+                let h = n.handle.replace(std::ptr::null_mut());
+                if !h.is_null() {
+                    unsafe { ngxfg::frdlssg_destroy(h) };
+                }
+            }
             // FG: retire pending paced presents while the queue is live, and
             // drop the display-size effect context. The SWAPCHAIN context
             // stays for field order — it must destroy AFTER d3d releases its
