@@ -8964,6 +8964,26 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     #[cfg(not(windows))]
     let quin_ok = true;
 
+    // Raw-NGX DLSS-G guide self-test — the two conversions the --fg
+    // evaluate feeds the FG snippet: clip depth must be the exact z-mapping
+    // of the perspective_lh matrix riding the same dispatch
+    // (matrix-consistency sweep + the near/far/harmonic-midpoint anchors),
+    // and the reflection-aware MV's virtual-image reprojection must
+    // degenerate to CamBasis::project at t_r = 0 (the plane's own MV
+    // convention), zero out under a static camera, and collapse a strafe's
+    // reflected-sky MV to ~nothing (the DamagedHelmet swim, as a gate).
+    // Pure math, DLL- and GPU-free; the HLSL twin is a literal mirror.
+    #[cfg(windows)]
+    let ngxfg_guides_ok = match gpu::ngxfg_guides::self_test() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("ngxfg-guides self-test: FAIL — {e}");
+            false
+        }
+    };
+    #[cfg(not(windows))]
+    let ngxfg_guides_ok = true;
+
     // glTF loader self-test — an in-code GLB exercises node flattening, the
     // mirrored-winding flip, u16 index widening, and the factor mapping.
     let gltf_ok = match gltf_loader::self_test() {
@@ -10966,6 +10986,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         ("world", world_ok),
         ("audio", audio_ok),
         ("quin", quin_ok),
+        ("ngxfg-guides", ngxfg_guides_ok),
         ("hemi-ao", hemi_ok),
         ("hemi-gi", gi_ok),
         ("hemi-share", hemi_share_ok),

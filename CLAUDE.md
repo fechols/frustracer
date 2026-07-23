@@ -536,32 +536,82 @@ cargo run --release -- --fg           # FRAME GENERATION, DLSS family (W4 leg 2)
                                       # ToAppDataPath — pass %LOCALAPPDATA%\frustracer\ngx;
                                       # (3) motionVectorsInvalidValue must be FLT_MAX, not 0
                                       # (0 tags every static pixel invalid — the quinlight
-                                      # lesson). A FOURTH TRAP, found on DamagedHelmet (sky
-                                      # reflections danced on every generated frame): the
-                                      # snippet's Depth slot has DLSS-SR's contract — a [0,1]
-                                      # buffer CONSISTENT WITH THE SUPPLIED MATRICES — while
-                                      # RR's plane holds unbounded linear view-Z (RR reads it
-                                      # via the LINEAR-depth tag, a different contract); raw
-                                      # view-Z broke the geometric warp and the snippet fell
-                                      # back to optical-flow guessing. quinlight never caught
-                                      # it: its depth was a synthetic [0,1] luma field and its
-                                      # MVs were ZERO, so nothing motion-dependent was ever
-                                      # validated there. The evaluate now consumes a clip-depth
-                                      # plane converted per frame by gpu/ngxfg_depth.rs (fxc
-                                      # cs_5_0, the bloom no-DXC precedent — the pass records
-                                      # inside ngxfg_dispatch, the one site all three RR arms
-                                      # share; d = A + B/z, the EXACT perspective_lh z-mapping,
-                                      # matrix-consistency-gated in --check as `ngxfg-depth`;
-                                      # deliberately NOT xess::view_z_to_clip_depth, which is
-                                      # REVERSED-Z and inconsistent with the matrices NGX gets).
-                                      # Empirical-settling env levers (the FR_SKY_LOD idiom,
-                                      # each loud when departing the default):
-                                      # FR_NGXFG_DEPTH=linear (the pre-fix A/B arm),
-                                      # FR_NGXFG_JITTER=0|raw (sign walk), FR_NGXFG_MV=neg
-                                      # (mvecScale polarity), FR_NGXFG_SHOW=interp (present the
-                                      # INTERPOLATED frame for both halves of the pair —
-                                      # artifact inspection at full rate instead of a half-rate
-                                      # strobe). Reset frames evaluate (to seed history) but
+                                      # lesson). THREE MORE, found chasing the DamagedHelmet
+                                      # sky-reflection swim (generated frames only) — the
+                                      # common root: quinlight's inputs were ZERO MVs, zero
+                                      # jitter, and a synthetic [0,1] luma-depth, so NOTHING
+                                      # motion-dependent in the blueprint was ever validated;
+                                      # treat every "quinlight-settled" constant that way.
+                                      # (4) DEPTH: the snippet's Depth slot has DLSS-SR's
+                                      # contract — a [0,1] buffer CONSISTENT WITH THE SUPPLIED
+                                      # MATRICES — while RR's plane holds unbounded linear
+                                      # view-Z (RR reads it via the LINEAR-depth tag, a
+                                      # different contract). (5) MVEC SCALE: DLSSG.MvecScale
+                                      # converts stored MVs to PIXELS — settled from
+                                      # dlssg-to-fsr3, which hands it STRAIGHT to FSR3's
+                                      # motionVectorScale across shipped SL titles; the SDK
+                                      # header's "[-1,1]" comment is stale, and the
+                                      # quinlight-era {1/rend} starved the snippet of geometry
+                                      # motion ~2000× (why the depth fix alone changed nothing
+                                      # visible). Our MV plane stores pixels ⇒ mv_scale {1,1}.
+                                      # (6) REFLECTION MVs: surface MVs describe the SURFACE,
+                                      # but a mirror pixel's CONTENT is the reflection — a
+                                      # VIRTUAL IMAGE at path depth t_surf + t_refl (planar
+                                      # unfold along the primary ray; reflected sky ⇒ ~far ⇒
+                                      # near-zero translation parallax — the "reflection
+                                      # drifts opposite the surface" strafe observation), so
+                                      # warping with surface MVs drags the reflection with the
+                                      # helmet on every generated frame. Both conversions run
+                                      # in ONE fused pass, gpu/ngxfg_guides.rs (fxc cs_5_0,
+                                      # the bloom no-DXC precedent — records inside
+                                      # ngxfg_dispatch, the one site all three RR arms share):
+                                      # clip depth d = A + B/z (the EXACT perspective_lh
+                                      # z-mapping — deliberately NOT xess::view_z_to_clip_
+                                      # depth, which is REVERSED-Z and inconsistent with the
+                                      # matrices NGX gets) + an FG-ONLY MV plane
+                                      # lerp(mv_surface, mv_virtual, w), w = lum(spec_alb)/
+                                      # (lum(diff_alb)+lum(spec_alb)) damped over roughness
+                                      # ROUGH_LO..ROUGH_HI (metal helmet ⇒ w≈1; RR's own MV
+                                      # plane untouched — RR is trained for surface MVs + the
+                                      # spec-hit guide; spec_hit_t is the reflection distance
+                                      # source, 0 = no ray ⇒ passthrough). True RADIANCE-
+                                      # weighted w needs a dd/ds/ind_s-style capture in DLSS
+                                      # sessions (the FLAG_FSR_SIG precedent) — the follow-on
+                                      # if albedo-weighting leaves residue. Gated in --check as
+                                      # `ngxfg-guides` (clip-depth matrix-consistency sweep;
+                                      # virtual-MV: static-camera zero, t_r=0 continuity vs
+                                      # CamBasis::project itself, the strafe reflected-sky
+                                      # collapse, weight anchors). A SEVENTH trap, structural:
+                                      # pair-present consumes TWO backbuffers per frame, so at
+                                      # the shipped BACKBUFFERS=3 a buffer came back around
+                                      # 1.5 frames later — under vsync with the DXGI present
+                                      # queue full that re-renders into a buffer still queued
+                                      # for scanout (stale-frame flicker; a timing race no
+                                      # debug layer flags). Raw-NGX sessions now create the
+                                      # swapchain at d3d12::PAIR_BACKBUFFERS=6, restoring the
+                                      # exact 3-buffers-per-present ratio every other session
+                                      # has (quinlight's pair-present had its own fence ring —
+                                      # PAIR_PRESENT_FENCES — which the port had dropped).
+                                      # Empirical-settling + ELIMINATION env levers (the
+                                      # FR_SKY_LOD idiom, loud on departure):
+                                      # FR_NGXFG_DEPTH=linear, FR_NGXFG_RMV=off (surface MVs —
+                                      # brings the reflection swim back on demand),
+                                      # FR_NGXFG_JITTER=0|raw, FR_NGXFG_MV=norm|neg|normneg
+                                      # (scale/polarity walks), FR_NGXFG_CAM=identity
+                                      # (quinlight's proven identity-camera block — isolates
+                                      # our matrix plumbing), FR_NGXFG_MAT=col (column-major
+                                      # matrices — the majority was never validated: quinlight's
+                                      # identities are transpose-invariant), FR_NGXFG_SHOW=
+                                      # interp|real (present ONE side for both halves of the
+                                      # pair: interp = inspect generated frames at full rate —
+                                      # non-generating frames fall back to the real frame, so
+                                      # a failed/skipped evaluate never re-presents a stale
+                                      # out-texture; real = nothing NGX-made on screen, the
+                                      # present-path null test — pacing identical in all
+                                      # modes). An unrecognized lever value is LOUD and takes
+                                      # the default (a silent no-op A/B walk is the failure
+                                      # mode the levers exist to prevent).
+                                      # Reset frames evaluate (to seed history) but
                                       # present real-only (`primed`); the feature is fixed-res
                                       # (lazy-created at the locked render res; --lock-res
                                       # dynamic skips FG with a note; resize destroys +

@@ -18,6 +18,18 @@ use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFIN
 
 pub const FRAMES_IN_FLIGHT: usize = 2;
 pub const BACKBUFFERS: u32 = 3;
+/// Backbuffer count for sessions that PAIR-PRESENT (raw-NGX DLSS-G: two
+/// Presents per rendered frame). The single-present sessions reuse a buffer
+/// 3 presents apart; at 3 buffers a pair-presenting session reuses one only
+/// 1.5 FRAMES apart — and under vsync with the DXGI present queue full
+/// (max latency 3), that is re-rendering into a buffer still QUEUED FOR
+/// SCANOUT: stale frames flicker through, no debug layer objects (it is a
+/// timing race, not an API error). 6 restores the exact
+/// 3-buffers-per-present ratio the shipped path has always had. quinlight's
+/// own pair-present ran its second present through a dedicated fence ring
+/// (PAIR_PRESENT_FENCES) — the port dropped that; this is the counting-safe
+/// equivalent.
+pub const PAIR_BACKBUFFERS: u32 = 6;
 
 /// The SDR swapchain format — 8-bit, display-encoded (the tonemap PS and
 /// `render::present_px` apply the gamma; there is no hardware sRGB encode).
@@ -143,6 +155,10 @@ pub struct D3d {
     pub frame_index: usize,
     pub width: u32,
     pub height: u32,
+    /// Swapchain buffer count this chain was created with (BACKBUFFERS, or
+    /// PAIR_BACKBUFFERS for pair-presenting raw-NGX FG sessions) — resize
+    /// must pass the same count.
+    nbuf: u32,
     /// The format the swapchain was actually created with. Runtime, not the
     /// const, because `--hdr` picks scRGB f16 (and the wrapper-FG arm HDR10) —
     /// and because `ResizeBuffers` and both fullscreen PSOs must agree with
@@ -289,7 +305,9 @@ impl D3d {
         vsync: bool,
         want: PresentSpace,
         fg_hook: Option<FgHook>,
+        pair_present: bool,
     ) -> Result<Self> {
+        let nbuf = if pair_present { PAIR_BACKBUFFERS } else { BACKBUFFERS };
         // Uncapped presentation needs DXGI tearing support (windowed flip
         // model otherwise paces on the compositor even at sync interval 0),
         // and the Present flag is only legal on a swapchain created with the
@@ -322,7 +340,7 @@ impl D3d {
             Format: want.format(),
             SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
             BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-            BufferCount: BACKBUFFERS,
+            BufferCount: nbuf,
             SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
             Flags: if tearing { DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0 as u32 } else { 0 },
             ..Default::default()
@@ -467,7 +485,7 @@ impl D3d {
         let rtv_heap: ID3D12DescriptorHeap = unsafe {
             device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
-                NumDescriptors: BACKBUFFERS,
+                NumDescriptors: nbuf,
                 ..Default::default()
             })
         }
@@ -475,8 +493,8 @@ impl D3d {
         let rtv_size =
             unsafe { device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV) };
         let rtv0 = unsafe { rtv_heap.GetCPUDescriptorHandleForHeapStart() };
-        let mut backbuffers = Vec::with_capacity(BACKBUFFERS as usize);
-        for i in 0..BACKBUFFERS {
+        let mut backbuffers = Vec::with_capacity(nbuf as usize);
+        for i in 0..nbuf {
             let buf: ID3D12Resource = unsafe { swapchain.GetBuffer(i) }
                 .map_err(|e| format!("swapchain GetBuffer({i}): {e}"))?;
             let handle = D3D12_CPU_DESCRIPTOR_HANDLE {
@@ -520,6 +538,7 @@ impl D3d {
             frame_index: 0,
             width,
             height,
+            nbuf,
             format,
             space,
             sync_interval: if vsync { 1 } else { 0 },
@@ -546,7 +565,7 @@ impl D3d {
     /// `backbuffers` Vec is their sole holder), ResizeBuffers with the SAME
     /// creation flags (a tearing swapchain must keep the tearing flag or the
     /// call fails), and recreates the RTVs in place (the heap holds a fixed
-    /// BACKBUFFERS descriptors — overwritten, never reallocated).
+    /// `nbuf` descriptors — overwritten, never reallocated).
     /// `frame_index` needs no reset: it is only the frames-in-flight slot
     /// counter; the backbuffer index is queried fresh at every present.
     /// Works through the Streamline proxy swapchain too — ResizeBuffers is
@@ -559,7 +578,7 @@ impl D3d {
         } else {
             DXGI_SWAP_CHAIN_FLAG(0)
         };
-        unsafe { self.swapchain.ResizeBuffers(BACKBUFFERS, w, h, self.format, flags) }
+        unsafe { self.swapchain.ResizeBuffers(self.nbuf, w, h, self.format, flags) }
             .map_err(|e| format!("ResizeBuffers({w}x{h}): {e}"))?;
         // ResizeBuffers preserves the colour space, so this re-declare is belt and
         // braces — which is exactly why a refusal must NOT kill the resize. The
@@ -575,7 +594,7 @@ impl D3d {
             }
         }
         let rtv0 = unsafe { self.rtv_heap.GetCPUDescriptorHandleForHeapStart() };
-        for i in 0..BACKBUFFERS {
+        for i in 0..self.nbuf {
             let buf: ID3D12Resource = unsafe { self.swapchain.GetBuffer(i) }
                 .map_err(|e| format!("resize GetBuffer({i}): {e}"))?;
             let handle = D3D12_CPU_DESCRIPTOR_HANDLE {

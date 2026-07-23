@@ -331,6 +331,21 @@ impl RrResources {
         (&self.planes[P_DEPTH].tex, &self.planes[P_MVEC].tex)
     }
 
+    /// The guide-conversion pass's source planes, in `ngxfg_guides`' kernel
+    /// order (its `SRC_FORMATS` mirrors these planes' formats — change both
+    /// together). All rest NON_PIXEL_SHADER_RESOURCE, the state a compute
+    /// SRV read wants.
+    pub fn guide_inputs(&self) -> [&ID3D12Resource; crate::gpu::ngxfg_guides::SRC_PLANES] {
+        [
+            &self.planes[P_DEPTH].tex,
+            &self.planes[P_MVEC].tex,
+            &self.planes[P_SPEC_HIT].tex,
+            &self.planes[P_ALBEDO].tex,
+            &self.planes[P_SPEC_ALBEDO].tex,
+            &self.planes[P_NORMAL_ROUGH].tex,
+        ]
+    }
+
     /// The full tag table for slEvaluateFeature(DLSS-RR). States must be the
     /// states the resources are in when SL *uses* them (manual hooking).
     /// Under DRS every input tag carries the current render-size extent

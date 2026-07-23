@@ -22,6 +22,9 @@ pub mod gputime;
 /// The HUD/menu overlay's GPU half: dirty-rect texture uploads + the
 /// premultiplied composite draw inside `fullscreen_to_backbuffer`.
 pub mod hud;
+/// Raw-NGX DLSS-G's guide conversion (`--fg` DLSS sessions): clip depth +
+/// reflection-aware motion vectors.
+pub mod ngxfg_guides;
 pub mod pix;
 /// `--quinlight`: the registered-consensus fuse of every wired upscaler.
 pub mod quin;
@@ -345,6 +348,52 @@ struct NgxFgState {
     /// construction, since this path calls Present itself. The title bar's
     /// presented-per-rendered multiplier.
     pair: std::cell::Cell<bool>,
+    /// The guide-conversion pass (see `ngxfg_guides.rs`): clip depth (the FG
+    /// snippet's depth contract is DLSS-SR's [0,1] buffer, not RR's linear
+    /// tag) + reflection-aware MVs (the virtual-image blend — the
+    /// DamagedHelmet reflection-swim fix). `None` = BOTH levers disabled it
+    /// or a loud creation failure — the evaluate then gets the raw RR
+    /// planes.
+    guides: Option<std::cell::RefCell<ngxfg_guides::GuidePass>>,
+    /// A guide-pass `ensure` failed at feature creation — loud once, then
+    /// the raw-plane arms (never a session failure).
+    guides_failed: std::cell::Cell<bool>,
+    /// FR_NGXFG_DEPTH=linear — hand the evaluate the raw linear view-Z plane
+    /// (the round-1 A/B arm).
+    depth_linear: bool,
+    /// FR_NGXFG_RMV=off — hand the evaluate the raw SURFACE-MV plane (the
+    /// A/B arm that brings the reflection swimming back on demand).
+    rmv_off: bool,
+    /// FR_NGXFG_JITTER: 0 = the SL-negated default, 1 = zero, 2 = raw
+    /// (un-negated). Empirical-settling lever — quinlight validated the
+    /// snippet with jitter (0,0) only.
+    jitter_mode: u8,
+    /// FR_NGXFG_MV: 0 = pixel scale {1,1} — THE DEFAULT, settled from
+    /// dlssg-to-fsr3, which passes DLSSG.MvecScale STRAIGHT into FSR3's
+    /// motionVectorScale (unit: pixels) and works across shipped SL titles;
+    /// the SDK header's "[-1,1]" comment is stale, and the quinlight-era
+    /// {1/rw,1/rh} starved the snippet of geometry motion ~2000× (zero MVs
+    /// in quinlight meant any scale "worked"). 1 = "norm" {1/rw,1/rh} (the
+    /// round-1 arm), 2 = "neg" {-1,-1}, 3 = "normneg" {-1/rw,-1/rh}.
+    mv_mode: u8,
+    /// FR_NGXFG_SHOW: 0 = normal pair (interp, then real). 1 = "interp" —
+    /// the INTERPOLATED frame for both halves, so its artifacts are
+    /// inspectable at full rate instead of strobing against the real frame.
+    /// 2 = "real" — the REAL frame for both halves (the evaluate still
+    /// runs): NOTHING NGX-made reaches the screen, so any artifact that
+    /// survives is in the PRESENT PATH, not the generated frames — the
+    /// process-of-elimination null test.
+    show_mode: u8,
+    /// FR_NGXFG_CAM=identity — quinlight's exact camera block (identity
+    /// matrices, axis-aligned basis, near .1/far 10000/fov 60°): the
+    /// configuration the snippet was PROVEN with on this box. Calmer
+    /// artifacts under it = our camera-matrix plumbing is the poison.
+    cam_identity: bool,
+    /// FR_NGXFG_MAT=col — pass glam's column-major matrices raw instead of
+    /// `row_major`. quinlight's identity matrices are transpose-invariant,
+    /// so the raw-NGX matrix majority was never validated (SL may transpose
+    /// internally before setting the DLSSG params).
+    mat_col: bool,
 }
 
 /// XeSS-FG frame generation (Intel XeSS sessions — the third `--fg` family).
@@ -747,7 +796,11 @@ impl GpuContext {
             let pdev: ID3D12Device = s.upgrade(&device)?;
             let queue = d3d12::create_queue(&pdev)?;
             let pfac: IDXGIFactory6 = s.upgrade(&factory)?;
-            let d3d = D3d::with_queue(&pfac, device, queue, hwnd, w, h, opts.vsync, want, None)?;
+            // Pair-present arms only in raw-NGX FG sessions — extra
+            // backbuffers so a buffer never comes back around while still
+            // queued for scanout (see d3d12::PAIR_BACKBUFFERS).
+            let pair = opts.fg && !opts.quin && ngxfg::BUILT;
+            let d3d = D3d::with_queue(&pfac, device, queue, hwnd, w, h, opts.vsync, want, None, pair)?;
             // The swapchain we hold MUST be the SL proxy — every present has
             // to route through presentCommon under manual hooking. A proxy
             // resolves to a distinct native interface; verify loudly.
@@ -804,9 +857,10 @@ impl GpuContext {
                 D3d::with_queue(
                     &factory, device, queue, hwnd, w, h, opts.vsync, want,
                     Some(d3d12::FgHook { wrap: &mut wrap, unwind: &mut unwind }),
+                    false,
                 )?
             } else if fg_versions.is_empty() {
-                D3d::with_queue(&factory, device, queue, hwnd, w, h, opts.vsync, want, None)?
+                D3d::with_queue(&factory, device, queue, hwnd, w, h, opts.vsync, want, None, false)?
             } else {
                 let mut wrap = |q: &ID3D12CommandQueue,
                                 sc: windows::Win32::Graphics::Dxgi::IDXGISwapChain3|
@@ -829,6 +883,7 @@ impl GpuContext {
                 D3d::with_queue(
                     &factory, device, queue, hwnd, w, h, opts.vsync, want,
                     Some(d3d12::FgHook { wrap: &mut wrap, unwind: &mut unwind }),
+                    false,
                 )?
             }
         };
@@ -955,6 +1010,101 @@ impl GpuContext {
                         "fg: raw-NGX DLSS-G armed (no Streamline pacer — pair-present; feature \
                          created on the first frame)"
                     );
+                    // Empirical-settling levers (env vars, the FR_SKY_LOD
+                    // idiom — quinlight settled the snippet's conventions
+                    // against zero MVs / zero jitter / [0,1] luma-depth, so
+                    // the motion-dependent ones are settled HERE instead).
+                    // Only a departure from the default prints a line — but
+                    // an UNRECOGNIZED value is loud too and takes the
+                    // default: a silently no-op'd A/B walk is the exact
+                    // failure mode these levers exist to prevent. Values are
+                    // matched case-insensitively. Returns 0 for unset /
+                    // unrecognized, i+1 for legal[i].
+                    let lever = |k: &str, legal: &[&str]| -> u8 {
+                        let Ok(s) = std::env::var(k) else { return 0 };
+                        let s = s.to_ascii_lowercase();
+                        match legal.iter().position(|v| *v == s) {
+                            Some(i) => i as u8 + 1,
+                            None => {
+                                eprintln!(
+                                    "fg: {k}={s} unrecognized (legal: {}) — using the default",
+                                    legal.join("|")
+                                );
+                                0
+                            }
+                        }
+                    };
+                    let depth_linear = lever("FR_NGXFG_DEPTH", &["linear"]) == 1;
+                    if depth_linear {
+                        eprintln!(
+                            "fg: FR_NGXFG_DEPTH=linear — raw linear view-Z to the NGX \
+                             evaluate (the round-1 A/B arm)"
+                        );
+                    }
+                    let rmv_off = lever("FR_NGXFG_RMV", &["off"]) == 1;
+                    if rmv_off {
+                        eprintln!(
+                            "fg: FR_NGXFG_RMV=off — raw surface MVs to the NGX evaluate \
+                             (expect reflections to swim under motion)"
+                        );
+                    }
+                    let guides = if depth_linear && rmv_off {
+                        None
+                    } else {
+                        match ngxfg_guides::GuidePass::new(&d3d.device) {
+                            Ok(p) => Some(std::cell::RefCell::new(p)),
+                            Err(e) => {
+                                eprintln!(
+                                    "fg: guide-conversion pass creation failed ({e}) — \
+                                     falling back to the raw RR planes (expect reflection \
+                                     shimmer)"
+                                );
+                                None
+                            }
+                        }
+                    };
+                    let jitter_mode = lever("FR_NGXFG_JITTER", &["0", "raw"]);
+                    match jitter_mode {
+                        1 => eprintln!("fg: FR_NGXFG_JITTER=0 — zero jitter to the evaluate"),
+                        2 => eprintln!("fg: FR_NGXFG_JITTER=raw — un-negated jitter"),
+                        _ => {}
+                    }
+                    let mv_mode = lever("FR_NGXFG_MV", &["norm", "neg", "normneg"]);
+                    match mv_mode {
+                        1 => eprintln!(
+                            "fg: FR_NGXFG_MV=norm — {{1/rw,1/rh}} mvecScale (round-1 arm)"
+                        ),
+                        2 => eprintln!("fg: FR_NGXFG_MV=neg — negated pixel mvecScale"),
+                        3 => eprintln!("fg: FR_NGXFG_MV=normneg — negated {{1/rw,1/rh}} mvecScale"),
+                        _ => {}
+                    }
+                    let show_mode = lever("FR_NGXFG_SHOW", &["interp", "real"]);
+                    match show_mode {
+                        1 => eprintln!(
+                            "fg: FR_NGXFG_SHOW=interp — presenting the interpolated \
+                             frame for BOTH halves of each pair (non-generating frames \
+                             fall back to the real frame)"
+                        ),
+                        2 => eprintln!(
+                            "fg: FR_NGXFG_SHOW=real — presenting the REAL frame for \
+                             BOTH halves (evaluate still runs; artifacts that survive \
+                             this are in the present path, not the generated frames)"
+                        ),
+                        _ => {}
+                    }
+                    let cam_identity = lever("FR_NGXFG_CAM", &["identity"]) == 1;
+                    if cam_identity {
+                        eprintln!(
+                            "fg: FR_NGXFG_CAM=identity — quinlight's identity camera block \
+                             to the evaluate (combine with FR_NGXFG_DEPTH=linear for the \
+                             faithful quinlight reproduction — its depth was never \
+                             matrix-consistent either)"
+                        );
+                    }
+                    let mat_col = lever("FR_NGXFG_MAT", &["col"]) == 1;
+                    if mat_col {
+                        eprintln!("fg: FR_NGXFG_MAT=col — column-major matrices to the evaluate");
+                    }
                     Some(NgxFgState {
                         out,
                         handle: std::cell::Cell::new(std::ptr::null_mut()),
@@ -965,6 +1115,15 @@ impl GpuContext {
                         frame_id: std::cell::Cell::new(0),
                         noted_res: std::cell::Cell::new(false),
                         pair: std::cell::Cell::new(false),
+                        guides,
+                        guides_failed: std::cell::Cell::new(false),
+                        depth_linear,
+                        rmv_off,
+                        jitter_mode,
+                        mv_mode,
+                        show_mode,
+                        cam_identity,
+                        mat_col,
                     })
                 }
                 Err(e) => {
@@ -4020,6 +4179,13 @@ impl GpuContext {
             tonemap::SRV_SLOT_GPU => self.trace.as_ref().map(|t| &t.hdr),
             tonemap::SRV_SLOT_DXR => self.dxr.as_ref().map(|d| &d.hdr),
             tonemap::SRV_SLOT_QUIN => self.quin.as_ref().map(|q| &q.output),
+            // The raw-NGX interpolated frame: without this arm the pair's
+            // first present skipped BLOOM (tonemap_source → None → strength
+            // 0), so every bright highlight strobed glare-on/glare-off at
+            // half the present rate — shipped in the first --fg cut, and on
+            // a sun-reflecting helmet it reads as the reflections dancing.
+            // (Its bloom SRV was already registered by wire_tonemap_src.)
+            tonemap::SRV_SLOT_NGXFG => self.fg_n.as_ref().map(|n| &n.out),
             _ => None,
         }
     }
@@ -4249,6 +4415,23 @@ impl GpuContext {
             }
             n.handle.set(h);
             n.dims.set((rw, rh));
+            // The guide planes are created (and every descriptor rewritten —
+            // a resize rebuilt the RR planes) HERE, with the feature: the
+            // one point where the render res is known and no in-flight frame
+            // references the pass's heap (first dispatch ever, or the first
+            // after resize_output's wait_idle).
+            if let Some(gp) = &n.guides {
+                match gp.borrow_mut().ensure(&self.d3d.device, rw, rh, rr.guide_inputs()) {
+                    Ok(()) => n.guides_failed.set(false),
+                    Err(e) => {
+                        eprintln!(
+                            "fg: guide-plane creation failed ({e}) — falling back to the \
+                             raw RR planes (expect reflection shimmer)"
+                        );
+                        n.guides_failed.set(true);
+                    }
+                }
+            }
             eprintln!(
                 "fg: raw-NGX DLSS-G live — 1 generated frame per rendered frame (pair-present)"
             );
@@ -4275,39 +4458,122 @@ impl GpuContext {
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         );
         let list = &self.d3d.list;
+        // The guide pass converts the RR planes into what the FG snippet's
+        // contracts actually want (see ngxfg_guides.rs): depth = the [0,1]
+        // clip mapping of the matrices below (depth_inverted stays 0 — both
+        // encodings grow with distance), MVs = the virtual-image blend that
+        // stops mirror reflections being dragged with the surface. Each
+        // lever falls back to the raw plane independently.
+        let guide_pass = match (&n.guides, n.guides_failed.get()) {
+            (Some(gp), false) => Some(gp.borrow()),
+            _ => None,
+        };
+        if let Some(gp) = &guide_pass {
+            // world -> PREVIOUS clip: column-vector composition, right to
+            // left (world -> view -> clip -> prev clip).
+            let m = (fc.clip_to_prev_clip * fc.view_to_clip * fc.world_to_view)
+                .to_cols_array_2d();
+            let (near, far) = (fc.near, fc.far);
+            let tanh = (fc.fov_y * 0.5).tan();
+            let v4 = |v: glam::Vec3A| [v.x, v.y, v.z, 0.0];
+            let p = ngxfg_guides::GuideParams {
+                w: rw,
+                h: rh,
+                a: far / (far - near),
+                b: -near * far / (far - near),
+                m,
+                org: v4(fc.pos),
+                fwd: v4(fc.forward),
+                // The CamBasis pre-scaling (camera.rs): right by
+                // tan(fov/2)*aspect, up by tan(fov/2).
+                rgt: v4(fc.right * (tanh * fc.aspect)),
+                upv: v4(fc.up * tanh),
+                rmv: (!n.rmv_off) as u32,
+                _pad: [0.0; 3],
+            };
+            gp.record(list, &p);
+        }
+        let depth_res = match &guide_pass {
+            Some(gp) if !n.depth_linear => gp.clip().as_raw(),
+            _ => dep.as_raw(),
+        };
+        let motion_res = match &guide_pass {
+            Some(gp) if !n.rmv_off => gp.mv().as_raw(),
+            _ => mv.as_raw(),
+        };
         unsafe {
             list.ResourceBarrier(&[
                 transition(&rr.output, psr, npsr),
                 transition(&n.out, psr, uav),
             ]);
         }
+        // Matrix majority: `row_major` matches what shim_constants hands SL,
+        // but SL's closed plugin may itself transpose before setting the
+        // DLSSG params — quinlight's identity matrices were transpose-
+        // invariant, so this was never validated. FR_NGXFG_MAT=col walks it;
+        // FR_NGXFG_CAM=identity substitutes quinlight's whole proven camera
+        // block (matrices AND basis) to isolate camera plumbing entirely.
+        const IDENT: [f32; 16] =
+            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+        let mat = |m: &glam::Mat4| -> [f32; 16] {
+            if n.cam_identity {
+                IDENT
+            } else if n.mat_col {
+                m.to_cols_array()
+            } else {
+                row_major(m)
+            }
+        };
         let d = ngxfg::FrDlssgDispatch {
             cmdlist: list.as_raw(),
             color: rr.output.as_raw(),
-            motion: mv.as_raw(),
-            depth: dep.as_raw(),
+            motion: motion_res,
+            depth: depth_res,
             output: n.out.as_raw(),
             frame_id: id,
             reset: fc.reset as i32,
-            view_to_clip: row_major(&fc.view_to_clip),
-            clip_to_view: row_major(&fc.clip_to_view),
-            clip_to_prev_clip: row_major(&fc.clip_to_prev_clip),
-            prev_clip_to_clip: row_major(&fc.prev_clip_to_clip),
-            // The SL-negated jitter convention — same NGX family, one sign.
-            jitter: [-fc.jitter.0, -fc.jitter.1],
-            // Pixel MVs -> [-1,1] (the quinlight-settled normalization).
-            mv_scale: [1.0 / rw as f32, 1.0 / rh as f32],
-            cam_pos: v3(fc.pos),
-            cam_up: v3(fc.up),
-            cam_right: v3(fc.right),
-            cam_fwd: v3(fc.forward),
-            cam_near: fc.near,
-            cam_far: fc.far,
-            cam_fov: fc.fov_y,
-            cam_aspect: fc.aspect,
+            view_to_clip: mat(&fc.view_to_clip),
+            clip_to_view: mat(&fc.clip_to_view),
+            clip_to_prev_clip: mat(&fc.clip_to_prev_clip),
+            prev_clip_to_clip: mat(&fc.prev_clip_to_clip),
+            // Default: the SL-negated jitter convention — same NGX family,
+            // one sign. FR_NGXFG_JITTER walks the alternatives (unvalidated
+            // in quinlight, whose jitter was 0,0).
+            jitter: match n.jitter_mode {
+                1 => [0.0, 0.0],
+                2 => [fc.jitter.0, fc.jitter.1],
+                _ => [-fc.jitter.0, -fc.jitter.1],
+            },
+            // PIXEL scale — settled from dlssg-to-fsr3, which hands
+            // DLSSG.MvecScale straight to FSR3's motionVectorScale (unit:
+            // pixels) and works across shipped SL titles; the SDK header's
+            // "[-1,1]" comment is stale, and the quinlight-era {1/rw,1/rh}
+            // starved the snippet of geometry motion ~2000× (quinlight's
+            // MVs were zero, so any scale "worked" there). FR_NGXFG_MV
+            // walks the alternatives.
+            mv_scale: match n.mv_mode {
+                1 => [1.0 / rw as f32, 1.0 / rh as f32],
+                2 => [-1.0, -1.0],
+                3 => [-1.0 / rw as f32, -1.0 / rh as f32],
+                _ => [1.0, 1.0],
+            },
+            // The identity arm is quinlight's literal camera block (its
+            // dlssg_shim_d3d12.cpp lines 355-372).
+            cam_pos: if n.cam_identity { [0.0; 3] } else { v3(fc.pos) },
+            cam_up: if n.cam_identity { [0.0, 1.0, 0.0] } else { v3(fc.up) },
+            cam_right: if n.cam_identity { [1.0, 0.0, 0.0] } else { v3(fc.right) },
+            cam_fwd: if n.cam_identity { [0.0, 0.0, 1.0] } else { v3(fc.forward) },
+            cam_near: if n.cam_identity { 0.1 } else { fc.near },
+            cam_far: if n.cam_identity { 10_000.0 } else { fc.far },
+            cam_fov: if n.cam_identity { 1.047_197_5 } else { fc.fov_y },
+            cam_aspect: if n.cam_identity {
+                rr.ow as f32 / rr.oh as f32
+            } else {
+                fc.aspect
+            },
             rend_w: rw,
             rend_h: rh,
-            // Linear view-Z grows with distance — not inverted.
+            // Grows with distance in both depth arms — not inverted.
             depth_inverted: 0,
         };
         let r = unsafe { ngxfg::frdlssg_dispatch(n.handle.get(), &d) };
@@ -4316,6 +4582,9 @@ impl GpuContext {
                 transition(&rr.output, npsr, psr),
                 transition(&n.out, uav, psr),
             ]);
+        }
+        if let Some(gp) = &guide_pass {
+            gp.restore(list);
         }
         if r != 0 {
             eprintln!("fg: raw-NGX DLSS-G evaluate failed ({r}) — frame generation off");
@@ -4340,11 +4609,29 @@ impl GpuContext {
         if let Some(n) = &self.fg_n {
             n.pair.set(show);
         }
+        // FR_NGXFG_SHOW walks WHAT the two presents show, never the pacing
+        // (same two Presents either way): 1 = interp twice (inspect the
+        // generated frames at full rate), 2 = real twice (nothing NGX-made
+        // on screen — artifacts that survive are the present path's).
+        let show_mode = self.fg_n.as_ref().map_or(0, |n| n.show_mode);
+        let (mid_slot, mut end_slot) = match show_mode {
+            1 => (tonemap::SRV_SLOT_NGXFG, tonemap::SRV_SLOT_NGXFG),
+            2 => (tonemap::SRV_SLOT_RR, tonemap::SRV_SLOT_RR),
+            _ => (tonemap::SRV_SLOT_NGXFG, tonemap::SRV_SLOT_RR),
+        };
+        // A non-generating frame (unprimed reset, res-moved skip — which
+        // returns BEFORE the evaluate — or a failed evaluate) has nothing
+        // fresh in fg_n.out: under SHOW=interp the single present must fall
+        // back to the real frame, or a failed session re-presents a stale /
+        // never-written texture indefinitely.
+        if !show {
+            end_slot = tonemap::SRV_SLOT_RR;
+        }
         if show {
-            self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_NGXFG, 1.0);
+            self.fullscreen_to_backbuffer(true, mid_slot, 1.0);
             self.d3d.present_mid(slot)?;
         }
-        self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_RR, 1.0);
+        self.fullscreen_to_backbuffer(true, end_slot, 1.0);
         self.d3d.end_frame(slot)
     }
 
