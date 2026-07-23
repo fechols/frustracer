@@ -462,6 +462,43 @@ cargo run --release -- --fsr3 --fg    # FRAME GENERATION, ffx family (W4 leg 1 o
                                       # block/ffx.rs FG wrappers/fg_prepare/the wrap hook -> run
                                       # --check, --check-fsr, --check-gpu, then the interactive
                                       # smoke on 4090 + B70 (fg lines + the cadence-halving test)
+cargo run --release -- --fg           # FRAME GENERATION, DLSS family (W4 leg 2): in a DLSS
+                                      # session (the flagless NVIDIA default) --fg arms DLSS-G
+                                      # through the SL proxy swapchain manual hooking
+                                      # deliberately created for this. slInit requests
+                                      # [RR, DLSS_G, Reflex] (PCL auto-loads; features cannot
+                                      # load later); Reflex is configured low-latency at init
+                                      # (a HARD DLSS-G runtime requirement) and the three RR
+                                      # arms bracket every frame: dlssg_frame_begin = Reflex
+                                      # sleep + sim/renderSubmit PCL markers + the lazy mode-eOn
+                                      # edge; dlssg_end_frame = the REQUIRED present markers
+                                      # around Execute+Present + a 120-frame status poll (a bad
+                                      # status = sticky off + one loud line, the pink-overlay
+                                      # guard; the marker token is fetched by the SAME frame
+                                      # index rr_sl_sequence hands slSetConstants — index drift
+                                      # is the documented constants-not-found failure). Depth +
+                                      # MV tags are the ones RR already sets (shared by
+                                      # contract). The funnel handshake extends to G: an
+                                      # unprepared present (plain arms, holds, mode switches)
+                                      # flips mode eOff before presenting — READ-not-consume,
+                                      # because the present markers land AFTER the funnel.
+                                      # TWO HARD ENVIRONMENT CONSTRAINTS, both loud at boot:
+                                      # (1) DLSS-G REJECTS the scRGB fp16 swapchain (guide §11)
+                                      # — a G session forces the SDR 8-bit path (--no-fg
+                                      # restores HDR; an HDR10/PQ tonemap arm is the open
+                                      # follow-on); (2) HAGS (hardware-accelerated GPU
+                                      # scheduling) must be ON in Windows or the driver DROPS
+                                      # every generated frame while slDLSSGGetState stays eOk —
+                                      # MEASURED on the dev box (multiplier pinned at 1, dlfg
+                                      # present layer engaged, flip metering 'good', zero
+                                      # errors); the boot line detects HwSchMode != 2 and names
+                                      # the Settings toggle + reboot. numFramesActuallyPresented
+                                      # reads as the PER-PRESENT MULTIPLIER (2 = generating) —
+                                      # the second 120-frame poll logs it. Gates: --check,
+                                      # --check-dlss, --check-gpu (SL paths untouched when
+                                      # --no-fg: the feature list only grows under --fg).
+                                      # Verification on a HAGS-on box: the boot multiplier line
+                                      # reads x2 and the --gpu-timing cadence test halves
 cargo run --release -- --fsr --fsr-max-radiance 10  # Ray Regeneration tuning (FfxApiConfigureDenoiserKey,
                                       # applied at denoiser creation): --fsr-max-radiance (the firefly
                                       # clamp — the highest-value knob for a 1-spp path tracer),

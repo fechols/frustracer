@@ -19,6 +19,10 @@
 // include AFTER a macro rename would be fragile — instead just include it:
 // the inline helpers are never instantiated, so no link error can occur.
 #include <sl_dlss_d.h>
+// Frame generation (DLSS-G) + its hard prerequisites: Reflex (sleep) and PCL
+// (latency markers). sl_reflex.h includes sl_pcl.h. Same inline-helper caveat.
+#include <sl_dlss_g.h>
+#include <sl_reflex.h>
 
 #include <string>
 #include <vector>
@@ -48,6 +52,14 @@ PFun_slFreeResources* p_slFreeResources = nullptr;
 PFun_slDLSSDGetOptimalSettings* p_slDLSSDGetOptimalSettings = nullptr;
 PFun_slDLSSDSetOptions* p_slDLSSDSetOptions = nullptr;
 PFun_slDLSSDGetState* p_slDLSSDGetState = nullptr;
+
+// DLSS-G / Reflex / PCL functions, fetched the same way. Reflex and PCL are
+// SEPARATE plugins (sleep rides kFeatureReflex, markers kFeaturePCL).
+PFun_slDLSSGSetOptions* p_slDLSSGSetOptions = nullptr;
+PFun_slDLSSGGetState* p_slDLSSGGetState = nullptr;
+PFun_slReflexSetOptions* p_slReflexSetOptions = nullptr;
+PFun_slReflexSleep* p_slReflexSleep = nullptr;
+PFun_slPCLSetMarker* p_slPCLSetMarker = nullptr;
 
 // Preferences keeps pointers alive past slInit? SL copies the struct, but be
 // conservative: keep everything it points at in static storage.
@@ -223,6 +235,54 @@ int32_t slshim_dlssd_get_state(uint32_t viewport, uint64_t* vram_bytes_out) {
     if (r != sl::Result::eOk) return to_i32(r);
     *vram_bytes_out = st.estimatedVRAMUsageInBytes;
     return 0;
+}
+
+int32_t slshim_dlssg_set_options(uint32_t viewport, const SlShimDlssgOptions* o) {
+    int32_t f = fetch(sl::kFeatureDLSS_G, "slDLSSGSetOptions", p_slDLSSGSetOptions);
+    if (f) return f;
+    sl::DLSSGOptions opt{};
+    opt.mode = static_cast<sl::DLSSGMode>(o->mode);
+    opt.numFramesToGenerate = o->num_frames_to_generate;
+    opt.flags = static_cast<sl::DLSSGFlags>(o->flags);
+    // Everything else stays at the header's own defaults (the optional
+    // dimension/format hints exist for VRAM estimates, not correctness).
+    return to_i32(p_slDLSSGSetOptions(sl::ViewportHandle(viewport), opt));
+}
+
+int32_t slshim_dlssg_get_state(uint32_t viewport, SlShimDlssgState* out) {
+    int32_t f = fetch(sl::kFeatureDLSS_G, "slDLSSGGetState", p_slDLSSGGetState);
+    if (f) return f;
+    sl::DLSSGState st{};
+    // Null options: no VRAM estimate requested — the guide warns against
+    // per-frame estimate requests, and this is a per-frame status poll.
+    sl::Result r = p_slDLSSGGetState(sl::ViewportHandle(viewport), st, nullptr);
+    if (r != sl::Result::eOk) return to_i32(r);
+    out->status = static_cast<uint32_t>(st.status);
+    out->min_width_or_height = st.minWidthOrHeight;
+    out->frames_presented = st.numFramesActuallyPresented;
+    out->frames_max = st.numFramesToGenerateMax;
+    return 0;
+}
+
+int32_t slshim_reflex_set_options(uint32_t mode) {
+    int32_t f = fetch(sl::kFeatureReflex, "slReflexSetOptions", p_slReflexSetOptions);
+    if (f) return f;
+    sl::ReflexOptions opt{};
+    opt.mode = static_cast<sl::ReflexMode>(mode);
+    return to_i32(p_slReflexSetOptions(opt));
+}
+
+int32_t slshim_reflex_sleep(void* token) {
+    int32_t f = fetch(sl::kFeatureReflex, "slReflexSleep", p_slReflexSleep);
+    if (f) return f;
+    return to_i32(p_slReflexSleep(*static_cast<sl::FrameToken*>(token)));
+}
+
+int32_t slshim_pcl_set_marker(uint32_t marker, void* token) {
+    int32_t f = fetch(sl::kFeaturePCL, "slPCLSetMarker", p_slPCLSetMarker);
+    if (f) return f;
+    return to_i32(p_slPCLSetMarker(static_cast<sl::PCLMarker>(marker),
+                                   *static_cast<sl::FrameToken*>(token)));
 }
 
 int32_t slshim_allocate_resources(void* cmdlist, uint32_t feature, uint32_t viewport) {

@@ -88,8 +88,41 @@ pub struct SlShimResourceTag {
 
 // sl::Feature ids (sl_core_types.h)
 pub const FEATURE_DLSS: u32 = 0;
+pub const FEATURE_REFLEX: u32 = 3;
+pub const FEATURE_PCL: u32 = 4;
 pub const FEATURE_DLSS_G: u32 = 1000;
 pub const FEATURE_DLSS_RR: u32 = 1001;
+
+// sl::DLSSGMode (sl_dlss_g.h)
+pub const DLSSG_MODE_OFF: u32 = 0;
+pub const DLSSG_MODE_ON: u32 = 1;
+
+// sl::ReflexMode (sl_reflex.h)
+pub const REFLEX_MODE_LOW_LATENCY: u32 = 1;
+
+// sl::PCLMarker ordinals (sl_pcl.h) — the standard per-frame set.
+pub const PCL_SIMULATION_START: u32 = 0;
+pub const PCL_SIMULATION_END: u32 = 1;
+pub const PCL_RENDERSUBMIT_START: u32 = 2;
+pub const PCL_RENDERSUBMIT_END: u32 = 3;
+pub const PCL_PRESENT_START: u32 = 4;
+pub const PCL_PRESENT_END: u32 = 5;
+
+#[repr(C)]
+pub struct SlShimDlssgOptions {
+    pub mode: u32,
+    pub num_frames_to_generate: u32,
+    pub flags: u32,
+}
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+pub struct SlShimDlssgState {
+    pub status: u32,
+    pub min_width_or_height: u32,
+    pub frames_presented: u32,
+    pub frames_max: u32,
+}
 
 // sl::DLSSMode (sl_dlss.h)
 pub const DLSS_MODE_OFF: u32 = 0;
@@ -156,4 +189,9 @@ unsafe extern "C" {
         cmdlist: *mut c_void,
     ) -> i32;
     pub fn slshim_evaluate(feature: u32, token: *mut c_void, viewport: u32, cmdlist: *mut c_void) -> i32;
+    pub fn slshim_dlssg_set_options(viewport: u32, o: *const SlShimDlssgOptions) -> i32;
+    pub fn slshim_dlssg_get_state(viewport: u32, out: *mut SlShimDlssgState) -> i32;
+    pub fn slshim_reflex_set_options(mode: u32) -> i32;
+    pub fn slshim_reflex_sleep(token: *mut c_void) -> i32;
+    pub fn slshim_pcl_set_marker(marker: u32, token: *mut c_void) -> i32;
 }

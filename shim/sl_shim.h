@@ -118,6 +118,38 @@ int32_t slshim_tag_resources(void* token, uint32_t viewport, const SlShimResourc
 
 int32_t slshim_evaluate(uint32_t feature, void* token, uint32_t viewport, void* cmdlist);
 
+// ---- DLSS-G frame generation + Reflex/PCL (its hard prerequisites) ----
+//
+// DLSS-G interpolates the presented backbuffer through the SL proxy swapchain
+// the session already presents on; it consumes the SAME depth/mvec tags and
+// per-frame constants the RR path sets. Reflex sleep + the PCL present
+// markers are REQUIRED at runtime (DLSSGStatus::eFailReflexNotDetectedAt-
+// Runtime otherwise), and the marker token must carry the SAME frame index
+// slSetConstants used.
+
+typedef struct SlShimDlssgOptions {
+    uint32_t mode;                   // sl::DLSSGMode: 0 off, 1 on, 2 auto
+    uint32_t num_frames_to_generate; // 1 = 2x
+    uint32_t flags;                  // sl::DLSSGFlags
+} SlShimDlssgOptions;
+int32_t slshim_dlssg_set_options(uint32_t viewport, const SlShimDlssgOptions* o);
+
+typedef struct SlShimDlssgState {
+    uint32_t status;              // sl::DLSSGStatus bits; 0 == eOk
+    uint32_t min_width_or_height; // minimum supported backbuffer dimension
+    uint32_t frames_presented;    // presents since the previous get_state
+    uint32_t frames_max;          // numFramesToGenerateMax (1 = 2x ceiling)
+} SlShimDlssgState;
+int32_t slshim_dlssg_get_state(uint32_t viewport, SlShimDlssgState* out);
+
+// mode: sl::ReflexMode (0 off, 1 low latency, 2 low latency + boost). Must be
+// called at least once (even at eOff) for DLSS-G; sleep every frame.
+int32_t slshim_reflex_set_options(uint32_t mode);
+int32_t slshim_reflex_sleep(void* token);
+// marker: sl::PCLMarker ordinal (0 simStart, 1 simEnd, 2 renderSubmitStart,
+// 3 renderSubmitEnd, 4 presentStart, 5 presentEnd).
+int32_t slshim_pcl_set_marker(uint32_t marker, void* token);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif
