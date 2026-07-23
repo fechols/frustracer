@@ -3758,10 +3758,20 @@ impl TraceGpu {
                     if fb_mode > 0 { &self.pso_leaf_fb } else { &self.pso_leaf };
                 list.SetPipelineState(leaf_pso);
                 self.push(list, [CTR_LEAF, 0, 0, 0]);
-                list.ExecuteIndirect(&self.cmd_sig, 1, &self.args, ARG_LEAF as u64 * 12, None, 0);
+                {
+                    // Nested sub-brackets (the level-ladder idiom). No barrier
+                    // separates the two EIs, so `sky` under-reports whatever
+                    // overlapped `leaf`; `leaf` is honest — its end timestamp
+                    // is bottom-of-pipe at the leaf EI's drain.
+                    let _e = super::pix::scope(list, c"leaf");
+                    list.ExecuteIndirect(&self.cmd_sig, 1, &self.args, ARG_LEAF as u64 * 12, None, 0);
+                }
                 list.SetPipelineState(&self.pso_sky);
                 self.push(list, [CTR_SKY, 0, 0, 0]);
-                list.ExecuteIndirect(&self.cmd_sig, 1, &self.args, ARG_SKY as u64 * 12, None, 0);
+                {
+                    let _e = super::pix::scope(list, c"sky");
+                    list.ExecuteIndirect(&self.cmd_sig, 1, &self.args, ARG_SKY as u64 * 12, None, 0);
+                }
                 self.args_to_uav(list);
             }
 
