@@ -89,12 +89,14 @@ pub const CURATED: &[IslandSpec] = &[
     },
     IslandSpec {
         name: "vokselia",
-        // Civil dusk, NOT full night: the sun sits just below the west horizon
-        // (~18:00 = sunset), so the garden gets warm afterglow + the first
-        // fireflies without ever reaching the 22:00 star-field dark. This is
-        // the darkest island in the ring by construction.
+        // FULL night, deliberately past the dusk handoff: at 22:00 the
+        // antipodal moon sits ~60 deg up (a real overhead light — at the old
+        // 18:45 "civil dusk" hour it grazed the horizon at ~11 deg), the star
+        // field is fully in, and the fireflies are at full brightness. This
+        // is the darkest island in the ring by construction, and the one
+        // place a flagless lap reaches the moonlit/star-lit night tier.
         path: "scenes/vokselia-spawn/vokselia_spawn.obj",
-        theme_hour: 18.75, // civil-dusk garden (fireflies begin here)
+        theme_hour: 22.0, // moonlit night garden (fireflies at full strength)
         mtris: 1.9,
     },
 ];

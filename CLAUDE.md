@@ -19,9 +19,11 @@ cargo run --release                   # interactive window (DLSS-RR on when supp
                                       # ground quad, hour-ordered so a lap sweeps the day
                                       # (powerplant 06:30 -> sponza 08:30 -> rungholt 11:00 ->
                                       # helmet 13:00 -> san-miguel 15:30 -> bistro 17:30 ->
-                                      # vokselia 18:45 — capped at CIVIL DUSK, never full night:
-                                      # the darkest island sits just below sunset, so a lap sweeps
-                                      # sunrise -> dusk but never reaches the 22:00 star-field dark)
+                                      # vokselia 22:00 — the last island is FULL night: the
+                                      # antipodal moon is ~60 deg up as the one light, stars and
+                                      # fireflies at full strength, so a lap sweeps sunrise ->
+                                      # moonlit night; the old 18:45 civil-dusk cap left the moon
+                                      # grazing the horizon at ~11 deg)
                                       # — and the flycam gains per-island TOD
                                       # ATTRACTORS: flying toward an island eases the GLOBAL tod
                                       # toward its theme hour at the manual-scrub rate (circular
@@ -200,6 +202,44 @@ cargo run --release -- --tod 22 --fireflies 24  # FIREFLIES (src/fireflies.rs, d
                                       # follow-ons are an SRV table + a per-leaf-tile cull (the
                                       # per-pixel scans are the linear-in-N cost — cull before
                                       # raising the cap again)
+cargo run --release -- --no-audio     # kill lever: no audio (it is ON by default in interactive
+                                      # sessions — src/audio.rs: per-island CC0 ambience loops in
+                                      # world mode, crossfaded by camera proximity with the TOD
+                                      # attractors' inverse-square weight g = r²/(d²+r²) but over
+                                      # FULL 3D distance (climbing away fades the island; the
+                                      # clock ignores altitude on purpose); a directly-loaded
+                                      # curated scene plays its own loop steadily
+                                      # (audio::match_scene_path — san-miguel-low-poly,
+                                      # intel-sponza, bistro Interior alias onto the curated
+                                      # names); plus a PROCEDURAL wind swish everywhere — hash-
+                                      # noise through a TWO-stage one-pole low-pass (−12 dB/oct;
+                                      # one pole read as harsh static) whose gain (norm^1.5) AND
+                                      # cutoff (150→1200 Hz log-lerp) track the REAL camera
+                                      # speed, published by the flycam thread as a 500 Hz atomic
+                                      # (flycam::speed_handle) so the wind stays responsive while
+                                      # the main thread is blocked in a trace. One SDL3 callback
+                                      # stream mixes everything (core sdl3 audio, NO mixer
+                                      # feature; lewton pure-Rust vorbis decode at load: mono
+                                      # downmix → wrap-aware linear resample to 48 kHz → RMS
+                                      # normalize → 50 ms equal-power loop-seam bake). Assets:
+                                      # scenes/audio/<island>.ogg via LFS (CC0, credited in
+                                      # scenes/audio/credits_license.txt); a missing file is one
+                                      # loud line + that island silent (the missing-island
+                                      # degrade), no device = loud line + silent session.
+                                      # DISPLAY-ONLY: no render-path, rng-stream, or gate-read
+                                      # contact — every same-seed/replay contract structurally
+                                      # untouched, --check* / --spin never construct the device
+                                      # (AudioSys lives in run_window beside the FlyCam, so it
+                                      # survives resize re-entries). audio::self_test gates the
+                                      # pure math in --check (wrap-resampler, seam continuity,
+                                      # proximity/wind anchors incl. exact-0.0 stillness, mixer
+                                      # must-fires + all-off exact-silence — incl. the
+                                      # post-activity GAIN_FLUSH re-latch, since an unflushed
+                                      # smoother stalls at a denormal — + determinism, the
+                                      # curated-name mapping incl. every CURATED island having a
+                                      # loop). Follow-on documented in the module: TOD modulation
+                                      # (rungholt birds → crickets after dusk, the fireflies
+                                      # precedent)
 cargo run --release -- --no-clouds    # A/B kill lever: no volumetric clouds (they are ON by
                                       # default — src/clouds.rs, a drifting slab of 2D coverage
                                       # carved by 3D erosion noise, marched TWO-PHASE: 6 coarse

@@ -22,7 +22,7 @@
 
 use crate::camera::Camera;
 use glam::Vec3A;
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -140,6 +140,14 @@ struct Shared {
     /// took the clock, and the attractors easing it back would undo them.
     /// Shared (not an integrator local) precisely so the menu can set it.
     manual_tod: AtomicBool,
+    /// Camera speed in world units/s (f32 bits), written by the integrator
+    /// each moving tick and read by the audio mixer's wind synth at the
+    /// audio callback rate — an Arc so the mixer can hold its own handle
+    /// (the render thread being blocked in a trace must not gate the wind).
+    /// Deliberately NOT a FlyState field: the one-lock snapshot contract
+    /// stays exactly what it was. Idle steady state writes nothing (the
+    /// snapshot bit-compare discipline); pause/unfocus store one 0.0.
+    speed: Arc<AtomicU32>,
 }
 
 impl FlyCam {
@@ -160,6 +168,7 @@ impl FlyCam {
             stop: AtomicBool::new(false),
             paused: AtomicBool::new(true),
             manual_tod: AtomicBool::new(false),
+            speed: Arc::new(AtomicU32::new(0)),
         });
         let s2 = shared.clone();
         let handle = std::thread::Builder::new()
@@ -173,6 +182,12 @@ impl FlyCam {
     /// and use only the returned snapshot for the whole iteration.
     pub fn snapshot(&self) -> FlyState {
         *self.shared.state.lock().unwrap()
+    }
+
+    /// A clone of the integrator's live camera-speed atomic (world units/s
+    /// as f32 bits) — the audio wind synth's input. See `Shared::speed`.
+    pub fn speed_handle(&self) -> Arc<AtomicU32> {
+        self.shared.speed.clone()
     }
 
     /// Stop/start integrating. Paused ticks keep advancing the integrator's
@@ -429,6 +444,10 @@ fn integrate_loop(shared: &Shared, hwnd: isize, diag: f32, attractors: &[TodAttr
     // modifier held before movement starts is already engaged).
     let mut slow_ctrl = 0.0f32;
     let mut slow_shift = 0.0f32;
+    // Last speed value stored (world units/s). Compare-before-store keeps
+    // the idle steady state write-free (the snapshot bit-compare
+    // discipline); the pause/unfocus and no-input paths park it at 0.0 once.
+    let mut prev_speed = 0.0f32;
 
     loop {
         ticker.wait();
@@ -448,6 +467,10 @@ fn integrate_loop(shared: &Shared, hwnd: isize, diag: f32, attractors: &[TodAttr
         // integrating would fly the camera blind. Both drop the drag.
         if shared.paused.load(Relaxed) || unsafe { GetForegroundWindow() } != hwnd {
             drag = None;
+            if prev_speed != 0.0 {
+                prev_speed = 0.0;
+                shared.speed.store(0.0f32.to_bits(), Relaxed);
+            }
             continue;
         }
 
@@ -516,6 +539,10 @@ fn integrate_loop(shared: &Shared, hwnd: isize, diag: f32, attractors: &[TodAttr
         // below), so an idle converged session still compares bit-equal.
         if !key_any && !pad_move && !pad_look && dx == 0.0 && dy == 0.0 && tod_dir == 0.0 && !auto_tod
         {
+            if prev_speed != 0.0 {
+                prev_speed = 0.0;
+                shared.speed.store(0.0f32.to_bits(), Relaxed);
+            }
             continue; // nothing to integrate; the shared state stays bit-untouched
         }
 
@@ -556,6 +583,14 @@ fn integrate_loop(shared: &Shared, hwnd: isize, diag: f32, attractors: &[TodAttr
         }
         if step != Vec3A::ZERO {
             cam.pos += step;
+        }
+        // Publish the tick's speed for the audio wind (units/s — dt-invariant
+        // by the same measured-dt argument as displacement). A look-only tick
+        // parks it at 0.0; the compare keeps steady states write-free.
+        let sp = if step != Vec3A::ZERO { step.length() / dt.max(1e-4) } else { 0.0 };
+        if sp != prev_speed {
+            prev_speed = sp;
+            shared.speed.store(sp.to_bits(), Relaxed);
         }
 
         // Look: mouse per-pixel (tick-rate independent by construction) +

@@ -78,6 +78,11 @@ slint = { version = "1", default-features = false, features = [
     "software-renderer-systemfonts",
 ] }
 sdl3 = { version = "0.18", features = ["build-from-source-static", "raw-window-handle"] }
+# Ogg Vorbis decode for the ambience loops (src/audio.rs) — pure Rust, zero
+# unsafe, no runtime DLL (the --check* DLL-free bar; the rustfft precedent).
+# Windows-only because only run_window sessions ever decode audio; core SDL3
+# audio (no `mixer` feature) does the playback.
+lewton = "0.10"
 raw-window-handle = "0.6"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
