@@ -1864,6 +1864,21 @@ impl GpuContext {
                 return Err(e);
             }
         }
+        // FR_DLSSG_NO_RR=1: the RR+G ISOLATION EXPERIMENT. DLSS-G's full
+        // contract stays — token, constants, options, tags (type-0 depth
+        // included), markers, mode — but the RR EVALUATE is removed from the
+        // frame and the DXR pipeline's own resolve presents instead. If G
+        // inserts here and not in the normal arm, the RR coexistence is the
+        // blocker; if it still declines, RR is exonerated. Diagnostic lever,
+        // not a mode: the image loses RR's denoise while it is set.
+        static ISOLATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let isolate = *ISOLATE.get_or_init(|| {
+            let on = std::env::var("FR_DLSSG_NO_RR").is_ok();
+            if on {
+                eprintln!("fg: FR_DLSSG_NO_RR — RR evaluate SKIPPED (DLSS-G isolation experiment)");
+            }
+            on
+        });
         {
             let d3d = &mut self.d3d;
             let sl = self.sl.as_ref().unwrap();
@@ -1875,7 +1890,18 @@ impl GpuContext {
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 )]);
             }
-            if let Err(e) = rr_sl_sequence(sl, rr, &d3d.list, fc, frame_idx, self.fg_g.as_ref().is_some_and(|g| g.enabled && !g.failed.get())) {
+            let dlssg = self.fg_g.as_ref().is_some_and(|g| g.enabled && !g.failed.get());
+            let r = if isolate {
+                let list_raw = d3d.list.as_raw();
+                sl.new_frame_token(frame_idx).and_then(|token| {
+                    sl.set_constants(token, 0, &shim_constants(fc))?;
+                    sl.dlssd_set_options(0, &shim_options(fc, rr.ow, rr.oh))?;
+                    sl.tag_resources(token, 0, &rr.tags(fc.rw, fc.rh, dlssg), list_raw)
+                })
+            } else {
+                rr_sl_sequence(sl, rr, &d3d.list, fc, frame_idx, dlssg)
+            };
+            if let Err(e) = r {
                 d3d.abort_frame();
                 return Err(e);
             }
@@ -1887,10 +1913,16 @@ impl GpuContext {
                 )]);
             }
         }
-        // The tonemap pass re-binds root sig/PSO/heaps/viewport from scratch —
-        // the post-evaluate state restore eDisableCLStateTracking makes the
-        // host's responsibility.
-        self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_RR, 1.0);
+        if isolate {
+            let d = self.dxr.as_ref().unwrap();
+            d.record_resolve(&self.d3d.list, slot, 1);
+            self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_DXR, 1.0);
+        } else {
+            // The tonemap pass re-binds root sig/PSO/heaps/viewport from
+            // scratch — the post-evaluate state restore
+            // eDisableCLStateTracking makes the host's responsibility.
+            self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_RR, 1.0);
+        }
         self.dlssg_end_frame(slot, frame_idx)
     }
 

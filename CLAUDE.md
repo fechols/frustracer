@@ -557,6 +557,15 @@ cargo run --release -- --fg           # FRAME GENERATION, DLSS family (W4 leg 2)
                                       # initialized, cubins loaded — then silence). The decline
                                       # is inside closed NGX/driver code with no diagnostic
                                       # surface; next would be per-frame ETW or NVIDIA devrel.
+                                      # ALSO ELIMINATED: RR+G coexistence — FR_DLSSG_NO_RR=1
+                                      # (a kept diagnostic lever in present_dxr_rr) runs the
+                                      # FULL G contract with the RR evaluate REMOVED from the
+                                      # frame (plain DXR resolve presents); multiplier still
+                                      # x1, so G declines even ALONE. Suspicious remaining
+                                      # lead: the NGX log shows the NVIDIA App's "dlssg
+                                      # override enabled" + a driver fallback snippet loading —
+                                      # worth disabling the NVIDIA App's DLSS override for
+                                      # this app and retrying.
                                       # PRAGMATIC FALLBACK if wanted: the ffx FI swapchain is
                                       # vendor-neutral and PROVEN on this 4090 — a native
                                       # swapchain + proxied-queue-only SL session could pair
