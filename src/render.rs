@@ -2039,6 +2039,102 @@ fn tonemap_to_scrgb(
     });
 }
 
+/// `resolve` for the HDR10 (R10G10B10A2 + PQ) swapchain — same average, same
+/// overlay, same nearest upscale; the encode is `tone::ToneMode::Pq` and the
+/// pack is the 10-bit lane layout (R low).
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_pq(
+    accum: &[AtomicU32],
+    info: &[AtomicU32],
+    samples: u32,
+    overlay_on: bool,
+    p: tone::ToneParams,
+    present: &mut [u32],
+    rw: usize,
+    rh: usize,
+    ww: usize,
+    wh: usize,
+) {
+    crate::zone!("resolve-pq");
+    let inv = 1.0 / samples.max(1) as f32;
+    // Glare before the curve, exactly as in `resolve_scrgb` — the swapchain
+    // encode is never a reason to have or not have bloom.
+    if crate::bloom::enabled() {
+        crate::bloom::with_glare_filled(
+            rw,
+            rh,
+            |hdr| {
+                hdr.par_chunks_mut(3).enumerate().for_each(|(px, o)| {
+                    for (k, v) in o.iter_mut().enumerate() {
+                        *v = f32::from_bits(accum[px * 3 + k].load(Relaxed)) * inv;
+                    }
+                });
+            },
+            |hdr| tonemap_to_pq(hdr, info, overlay_on, p, present, rw, rh, ww, wh),
+        );
+        return;
+    }
+
+    present.par_chunks_mut(ww).enumerate().for_each(|(wy, row)| {
+        let sy = (wy * rh / wh).min(rh - 1);
+        for (wx, out) in row.iter_mut().enumerate() {
+            let sx = (wx * rw / ww).min(rw - 1);
+            let i = (sy * rw + sx) * 3;
+            let c = Vec3A::new(
+                f32::from_bits(accum[i].load(Relaxed)),
+                f32::from_bits(accum[i + 1].load(Relaxed)),
+                f32::from_bits(accum[i + 2].load(Relaxed)),
+            ) * inv;
+            *out = present_px_pq(c, p, info, overlay_on, sx, sy, rw, rh);
+        }
+    });
+}
+
+/// `resolve_hdr` for the HDR10 swapchain — the OIDN / NPPD / XeSS-post output
+/// path under PQ.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_hdr_pq(
+    hdr: &[f32],
+    info: &[AtomicU32],
+    overlay_on: bool,
+    p: tone::ToneParams,
+    present: &mut [u32],
+    rw: usize,
+    rh: usize,
+    ww: usize,
+    wh: usize,
+) {
+    crate::zone!("resolve-hdr-pq");
+    crate::bloom::with_glare(hdr, rw, rh, |hdr| {
+        tonemap_to_pq(hdr, info, overlay_on, p, present, rw, rh, ww, wh)
+    });
+}
+
+/// `tonemap_to` for the HDR10 swapchain — the one PQ present loop, shared by
+/// `resolve_pq` and `resolve_hdr_pq`. Glare is the caller's business.
+#[allow(clippy::too_many_arguments)]
+fn tonemap_to_pq(
+    hdr: &[f32],
+    info: &[AtomicU32],
+    overlay_on: bool,
+    p: tone::ToneParams,
+    present: &mut [u32],
+    rw: usize,
+    rh: usize,
+    ww: usize,
+    wh: usize,
+) {
+    present.par_chunks_mut(ww).enumerate().for_each(|(wy, row)| {
+        let sy = (wy * rh / wh).min(rh - 1);
+        for (wx, out) in row.iter_mut().enumerate() {
+            let sx = (wx * rw / ww).min(rw - 1);
+            let i = (sy * rw + sx) * 3;
+            let c = Vec3A::new(hdr[i], hdr[i + 1], hdr[i + 2]);
+            *out = present_px_pq(c, p, info, overlay_on, sx, sy, rw, rh);
+        }
+    });
+}
+
 /// Blend the quadtree debug overlay: tint by kind, darken tile borders.
 ///
 /// The tints are **display-space [0,1] colours** — authored to look right
@@ -2118,6 +2214,35 @@ fn present_px_scrgb(
     }
     let v = tone::encode(v, p).max(Vec3A::ZERO);
     [f16::from_f32(v.x), f16::from_f32(v.y), f16::from_f32(v.z), f16::from_f32(1.0)]
+}
+
+/// Tonemap and encode to packed 10-bit PQ for the `R10G10B10A2_UNORM`
+/// swapchain (`r | g<<10 | b<<20 | 3<<30` — R in the LOW bits, R10G10B10A2's
+/// lane order, opposite the SDR pack's BGRA8). The overlay composite reuses
+/// the scRGB path's display-space round-trip: `shape` under PQ is still
+/// paper-white-relative *light* (the ST 2084 encode lives in `tone::encode`),
+/// so the same pow pair lands the tints where they were authored.
+#[inline]
+fn present_px_pq(
+    c: Vec3A,
+    p: tone::ToneParams,
+    info: &[AtomicU32],
+    overlay_on: bool,
+    sx: usize,
+    sy: usize,
+    rw: usize,
+    rh: usize,
+) -> u32 {
+    let mut v = tone::shape(c, p);
+    if overlay_on {
+        let g = overlay_px(v.max(Vec3A::ZERO).powf(1.0 / 2.2), info, sx, sy, rw, rh);
+        v = g.max(Vec3A::ZERO).powf(2.2);
+    }
+    // `encode` (matrix + ST 2084) lands in [0, 1] by construction — pq_encode
+    // saturates its input — so the clamp here is only the pack's own guard.
+    let v = tone::encode(v, p).clamp(Vec3A::ZERO, Vec3A::ONE);
+    let q = (v * 1023.0 + 0.5).floor();
+    (q.x as u32) | ((q.y as u32) << 10) | ((q.z as u32) << 20) | (3 << 30)
 }
 
 pub struct VerifyReport {

@@ -62,6 +62,7 @@ pub const FG_DISPATCH_DEBUG_PACING_LINES: u32 = 1 << 4;
 // creates (ffx_api_types.h — the enum is ordinal, no explicit values).
 pub const SURFACE_FORMAT_R16G16B16A16_FLOAT: u32 = 4;
 pub const SURFACE_FORMAT_B8G8R8A8_UNORM: u32 = 14;
+pub const SURFACE_FORMAT_R10G10B10A2_UNORM: u32 = 17;
 
 // FfxApiUpscaleQualityMode (ffx_upscale.h) — used for the render-res range
 // derivation queries.

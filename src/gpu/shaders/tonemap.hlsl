@@ -28,9 +28,25 @@ cbuffer Params : register(b0) {
     float2 bloom_texel;   // 1 / glare dims (the tent's tap spacing)
     float knee;      // rolloff start, in paper-white units
     float headroom;  // asymptote = peak_nits / paper_white; 1.0 on SDR
-    float scale;     // scRGB: paper_white / 80. SDR: 1.0
-    float gamma_on;  // 1.0 only for the 8-bit UNORM swapchain; scRGB is linear
+    float scale;     // scRGB: paper_white / 80. SDR: 1.0. HDR10: paper_white / 10000
+    float mode;      // 0 = scRGB linear, 1 = 8-bit gamma 2.2, 2 = HDR10 PQ (tone::ToneMode)
 };
+
+// Rec.709 -> Rec.2020 primaries. Literals mirror tone::m709_to_2020
+// term-for-term; change both together.
+float3 m709_to_2020(float3 v) {
+    return float3(
+        0.627404 * v.r + 0.329283 * v.g + 0.043313 * v.b,
+        0.069097 * v.r + 0.919540 * v.g + 0.011362 * v.b,
+        0.016391 * v.r + 0.088013 * v.g + 0.895595 * v.b);
+}
+
+// SMPTE ST 2084 inverse EOTF (luminance normalized to 10000 nits -> PQ
+// signal). Literals mirror tone::pq_encode term-for-term.
+float3 pq_encode(float3 y) {
+    float3 yp = pow(saturate(y), 0.1593017578125);
+    return pow((0.8359375 + 18.8515625 * yp) / (1.0 + 18.6875 * yp), 78.84375);
+}
 
 float4 vsmain(uint id : SV_VertexID) : SV_Position {
     float2 uv = float2((id << 1) & 2, id & 2);
@@ -82,7 +98,12 @@ float4 psmain(float4 pos : SV_Position) : SV_Target {
         c = lerp(c, tent(uv), bloom_strength);
     }
     float3 f = float3(curve(c.r), curve(c.g), curve(c.b));
-    if (gamma_on > 0.5) f = pow(f, 1.0 / 2.2);
+    if (mode > 1.5) {
+        // HDR10: paper-white-relative -> PQ's 10000-nit-normalized domain,
+        // then gamut matrix + ST 2084 — tone::encode's Pq arm verbatim.
+        return float4(pq_encode(m709_to_2020(f * scale)), 1.0);
+    }
+    if (mode > 0.5) f = pow(f, 1.0 / 2.2);
     // No saturate: under scRGB, values above 1.0 are legal and ARE the highlight
     // headroom. The curve is bounded by `headroom` on its own.
     return float4(f * scale, 1.0);

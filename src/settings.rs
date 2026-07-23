@@ -82,6 +82,10 @@ opt_fields! {
         pub vsync: bool,
         /// --hdr / --no-hdr (the scRGB f16 swapchain)
         pub hdr: bool,
+        /// --hdr10 / --no-hdr10 (force the 10-bit PQ swapchain — the encode
+        /// the wrapper-FG families take automatically on an HDR-on display).
+        /// True implies `hdr` at apply time, the CLI arm's own semantics.
+        pub hdr10: bool,
         /// --hdr-paper-white <nits>
         pub hdr_paper_white: f32,
         /// --hdr-peak <nits>
@@ -455,6 +459,19 @@ pub fn apply_to_opts(s: &Settings, opts: &mut crate::Opts) -> AppliedFx {
     }
     if let Some(v) = d.hdr {
         opts.hdr = v;
+        if !v {
+            opts.hdr10 = false;
+        }
+    }
+    if let Some(v) = d.hdr10 {
+        opts.hdr10 = v;
+        if v {
+            // The CLI arm's semantics: PQ is an HDR mode, so forcing it turns
+            // the wide swapchain on (a file with hdr=false + hdr10=true reads
+            // as "the PQ flavor", not a contradiction — hdr10 is the more
+            // specific choice and wins).
+            opts.hdr = true;
+        }
     }
     if let Some(v) = d.hdr_paper_white {
         if v >= 1.0 {
@@ -906,6 +923,7 @@ pub fn menu_items() -> &'static [MenuItem] {
             item!("gpu_tone", "GPU tonemap A/B (B)", "Display", Live, Toggle { default: false }, ((|_| None), (|_, _| {}))),
             item!("vsync", "v-sync", "Display", Restart, Toggle { default: true }, acc_bool!(display.vsync)),
             item!("hdr", "scRGB (HDR) swapchain", "Display", Restart, Toggle { default: true }, acc_bool!(display.hdr)),
+            item!("hdr10", "HDR10 (PQ) swapchain", "Display", Restart, Toggle { default: false }, acc_bool!(display.hdr10)),
             item!("hdr_paper_white", "paper white (nits)", "Display", Restart, StepF { min: 80.0, max: 1000.0, step: 20.0, default: 200.0 }, acc_f32!(display.hdr_paper_white)),
             item!("hdr_peak", "peak override (nits)", "Display", Restart, StepF { min: 400.0, max: 4000.0, step: 100.0, default: 1000.0 }, acc_f32!(display.hdr_peak)),
             // ── Renderer

@@ -395,6 +395,13 @@ pub struct Opts {
     /// forces the legacy 8-bit swapchain — the A/B lever, and the automatic
     /// fallback when the colour space is refused.
     pub hdr: bool,
+    /// `--hdr10`: force the 10-bit PQ (R10G10B10A2 + G2084) swapchain in any
+    /// session — the A/B lever for the encode the wrapper-FG families take
+    /// automatically on an HDR-on display. Override-wins like `--hdr-peak`.
+    /// Only meaningful with `hdr` (the parse arms keep the pair consistent:
+    /// `--hdr10` sets both, `--no-hdr`/`--hdr` clear this one — three states,
+    /// later flags win).
+    pub hdr10: bool,
     /// `--hdr-paper-white <nits>`: where linear 1.0 lands. The scene is authored
     /// so 1.0 ≈ diffuse white; 200 is the usual desktop-HDR reference.
     pub hdr_paper_white: f32,
@@ -545,6 +552,7 @@ fn main() {
         // scRGB is the default swapchain: see Opts::hdr. The 8-bit path survives
         // as --no-hdr and as the automatic fallback.
         hdr: true,
+        hdr10: false,
         hdr_paper_white: tone::DEFAULT_PAPER_WHITE,
         hdr_peak: None,
         tod: None,
@@ -933,8 +941,24 @@ fn main() {
             }
             "--no-vsync" => opts.vsync = false,
             "--vsync" => opts.vsync = true,
-            "--hdr" => opts.hdr = true,
-            "--no-hdr" => opts.hdr = false,
+            // The swapchain flags are a three-way choice (SDR | scRGB | HDR10)
+            // spelled as two toggles, so each arm writes BOTH fields — that is
+            // what makes later-flags-win hold across the pairs (`--no-hdr
+            // --hdr10` = PQ, `--hdr10 --no-hdr` = SDR). Mirrored in
+            // settings.rs (display.hdr / display.hdr10).
+            "--hdr" => {
+                opts.hdr = true;
+                opts.hdr10 = false;
+            }
+            "--no-hdr" => {
+                opts.hdr = false;
+                opts.hdr10 = false;
+            }
+            "--hdr10" => {
+                opts.hdr = true;
+                opts.hdr10 = true;
+            }
+            "--no-hdr10" => opts.hdr10 = false,
             "--hdr-paper-white" => {
                 opts.hdr_paper_white = args
                     .next()
@@ -5498,9 +5522,10 @@ fn run_check_gpu(
     // range — below the knee, through the rolloff, and far past it (a physical
     // sun disc is ~44,000, so the tail is not hypothetical).
     //
-    // Both encodings are gated: SDR 8-bit (the default, which must not move) and
-    // scRGB f16 (the --hdr path). One shader produces both, so gating each pins
-    // the curve AND its encode.
+    // All three encodings are gated: SDR 8-bit (the default, which must not
+    // move), scRGB f16 (the --hdr path), and HDR10/PQ 10-bit (the wrapper-FG
+    // arm + --hdr10). One shader produces all of them, so gating each pins the
+    // curve AND its encode.
     {
         const TW: u32 = 64;
         const TH: u32 = 32;
@@ -5546,6 +5571,15 @@ fn run_check_gpu(
                 gpu::d3d12::SWAPCHAIN_FORMAT_HDR,
                 tone::ToneParams::hdr(200.0, 1000.0),
                 2e-3, // f16 wire + fp differences between HLSL exp/pow and Rust's
+            ),
+            (
+                "hdr10",
+                gpu::d3d12::SWAPCHAIN_FORMAT_HDR10,
+                tone::ToneParams::hdr10(200.0, 1000.0),
+                // ~2 ten-bit LSBs + fxc pow/exp slop through the ST 2084 pair.
+                // Never widen past 5e-3 without investigating — a wiring or
+                // constant error moves this by tens of percent.
+                2.5e-3,
             ),
         ] {
             match gpu::tonemap::selftest(&mut hg, &src, TW, TH, format, tp) {
@@ -11132,6 +11166,23 @@ fn tod_hhmm(h: f32) -> String {
     format!("{:02}:{:02}", h as u32, (h.fract() * 60.0) as u32)
 }
 
+/// The title's fps field. The frame loop counts RENDERED frames; frame
+/// generation presents more than that (a generated frame per rendered one),
+/// so an FG session shows both rates — "87 -> ~174 fps (fg x2)" — using the
+/// family's own measured multiplier (`GpuContext::fg_display_mult`). "x1"
+/// means FG is armed but not inserting (holds, unprimed reset frames, a
+/// declined DLSS-G session).
+#[cfg(windows)]
+fn fps_title(fps: f64, fg_mult: Option<u32>) -> String {
+    match fg_mult {
+        Some(m) if m >= 2 => {
+            format!("{fps:.0} -> ~{:.0} fps (fg x{m})", fps * m as f64)
+        }
+        Some(_) => format!("{fps:.0} fps (fg x1)"),
+        None => format!("{fps:.0} fps"),
+    }
+}
+
 /// Fold the PICKED adapter's measured preferences into the defaults the user
 /// left alone. Called once, from `run_window`, right after `GpuContext::new` —
 /// the earliest moment the vendor is a FACT: `--prefer-*` is only a request,
@@ -11276,6 +11327,7 @@ fn run_window(
         debug: opts.gpu_debug,
         vsync: opts.vsync,
         hdr: opts.hdr,
+        hdr10: opts.hdr10,
         paper_white: opts.hdr_paper_white,
         peak_nits: opts.hdr_peak,
         quin: opts.quin,
@@ -11436,7 +11488,7 @@ fn session(
     let accum: Vec<AtomicU32> = (0..w * h * 3).map(|_| AtomicU32::new(0)).collect();
     let info: Vec<AtomicU32> = (0..w * h).map(|_| AtomicU32::new(0)).collect();
     let tbuf: Vec<AtomicU32> = (0..w * h).map(|_| AtomicU32::new(0)).collect();
-    let mut present = CpuPresent::new(w, h, gpu.is_hdr(), gpu.tone());
+    let mut present = CpuPresent::new(w, h, gpu.encoding(), gpu.tone());
     let stats = Stats::default();
     // Temporal claim ring + lockstep cut stores: see TemporalRing. Half-res
     // and plain frames don't participate and drop the ring — a cache from
@@ -13236,8 +13288,8 @@ fn session(
                     format!(" | {spp} spp")
                 };
                 let _ = window.set_title(&format!(
-                    "frustracer | {:.0} fps | GPU {} | {} | quality {}{} | {}",
-                    fps,
+                    "frustracer | {} | GPU {} | {} | quality {}{} | {}",
+                    fps_title(fps, gpu.fg_display_mult()),
                     if hybrid { "hybrid" } else { "plain" },
                     mode,
                     preset,
@@ -14020,7 +14072,8 @@ fn session(
                     ),
                 };
                 let _ = window.set_title(&format!(
-                    "frustracer | {fps:.0} fps | {last_ms:.1} ms | {sub} | {}",
+                    "frustracer | {} | {last_ms:.1} ms | {sub} | {}",
+                    fps_title(fps, gpu.fg_display_mult()),
                     tod_hhmm(cur_tod)
                 ));
             }
@@ -14982,8 +15035,9 @@ fn session(
                 // The present buffer is stale in GPU-tonemap mode; resolve
                 // fresh for the screenshot.
                 present.resolve_sdr(&accum, &info, frame.max(1), false, rw, rh, w, h);
-            } else if present.is_hdr {
-                // The CPU arms hold scRGB f16, which a PNG cannot carry — so
+            } else if present.is_hdr() {
+                // The CPU arms hold scRGB f16 (or packed PQ), which a PNG
+                // cannot carry — so
                 // re-resolve each arm's OWN linear source through the SDR curve.
                 // The overlay rides along exactly as it does on screen (an SDR
                 // session saves the present buffer verbatim, overlay included;
@@ -15042,8 +15096,8 @@ fn session(
                 String::new()
             };
             let _ = window.set_title(&format!(
-                "frustracer | {:.0} fps | {}{}{} | {}x{} | {:.1} ms | {} | quality {}{}{}{}{}{} | {}",
-                fps,
+                "frustracer | {} | {}{}{} | {}x{} | {:.1} ms | {} | quality {}{}{}{}{}{} | {}",
+                fps_title(fps, gpu.fg_display_mult()),
                 if hybrid { "hybrid" } else { "plain" },
                 if !dlss_on && !fsr_on && !xess_on && hybrid && dynamic { "+dyn" } else { "" },
                 if dlss_on {
@@ -15214,33 +15268,48 @@ fn session(
 /// The CPU present buffer for the arms that tonemap on the CPU (OIDN, NPPD,
 /// XeSS-post, and the plain resolve).
 ///
-/// Two encodings, one curve. An SDR session fills `sdr` (u32 0x00RRGGBB); an
-/// scRGB session fills `hdr` ([f16; 4], already curve+overlay+encode). Which
-/// one is a property of the SWAPCHAIN, decided once — so an arm cannot
-/// accidentally present 8-bit pixels into an f16 backbuffer.
+/// Three encodings, one curve. An SDR session fills `sdr` (u32 0x00RRGGBB);
+/// an scRGB session fills `hdr` ([f16; 4], already curve+overlay+encode); an
+/// HDR10 session fills `pq` (packed 10-bit PQ u32, R low). Which one is a
+/// property of the SWAPCHAIN (`GpuContext::encoding()`), decided once — so an
+/// arm cannot accidentally present the wrong wire into the backbuffer.
 ///
-/// `sdr` is allocated in both modes because screenshots are always 8-bit PNG:
+/// `sdr` is allocated in every mode because screenshots are always 8-bit PNG:
 /// a file has nowhere to put a nit. In an HDR session the screenshot path
 /// re-resolves into it (`resolve_*_sdr`) rather than trying to invert the
-/// display-referred f16 — that inversion is not well-defined, and a screenshot
-/// is rare enough that a second tonemap costs nothing.
+/// display-referred output — that inversion is not well-defined, and a
+/// screenshot is rare enough that a second tonemap costs nothing.
 struct CpuPresent {
     sdr: Vec<u32>,
     hdr: Vec<[half::f16; 4]>,
+    pq: Vec<u32>,
     /// Refreshed from `gpu.tone()` each frame — this is how a display change
     /// reaches the CPU arms.
     tone: tone::ToneParams,
-    is_hdr: bool,
+    enc: gpu::d3d12::PresentSpace,
 }
 
 impl CpuPresent {
-    fn new(w: usize, h: usize, is_hdr: bool, tone: tone::ToneParams) -> Self {
+    fn new(w: usize, h: usize, enc: gpu::d3d12::PresentSpace, tone: tone::ToneParams) -> Self {
+        use gpu::d3d12::PresentSpace;
         Self {
             sdr: vec![0u32; w * h],
-            hdr: if is_hdr { vec![[half::f16::ZERO; 4]; w * h] } else { Vec::new() },
+            hdr: if enc == PresentSpace::Scrgb {
+                vec![[half::f16::ZERO; 4]; w * h]
+            } else {
+                Vec::new()
+            },
+            pq: if enc == PresentSpace::Hdr10 { vec![0u32; w * h] } else { Vec::new() },
             tone,
-            is_hdr,
+            enc,
         }
+    }
+
+    /// Was the presented frame display-referred wide-gamut (scRGB or HDR10)?
+    /// The screenshot path keys its "re-resolve the linear source through the
+    /// SDR curve" decision on this.
+    fn is_hdr(&self) -> bool {
+        self.enc != gpu::d3d12::PresentSpace::Sdr
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -15255,12 +15324,16 @@ impl CpuPresent {
         w: usize,
         h: usize,
     ) {
-        if self.is_hdr {
-            render::resolve_scrgb(
+        match self.enc {
+            gpu::d3d12::PresentSpace::Scrgb => render::resolve_scrgb(
                 accum, info, samples, overlay, self.tone, &mut self.hdr, rw, rh, w, h,
-            );
-        } else {
-            render::resolve(accum, info, samples, overlay, &mut self.sdr, rw, rh, w, h);
+            ),
+            gpu::d3d12::PresentSpace::Hdr10 => render::resolve_pq(
+                accum, info, samples, overlay, self.tone, &mut self.pq, rw, rh, w, h,
+            ),
+            gpu::d3d12::PresentSpace::Sdr => {
+                render::resolve(accum, info, samples, overlay, &mut self.sdr, rw, rh, w, h)
+            }
         }
     }
 
@@ -15275,10 +15348,16 @@ impl CpuPresent {
         w: usize,
         h: usize,
     ) {
-        if self.is_hdr {
-            render::resolve_hdr_scrgb(src, info, overlay, self.tone, &mut self.hdr, rw, rh, w, h);
-        } else {
-            render::resolve_hdr(src, info, overlay, &mut self.sdr, rw, rh, w, h);
+        match self.enc {
+            gpu::d3d12::PresentSpace::Scrgb => render::resolve_hdr_scrgb(
+                src, info, overlay, self.tone, &mut self.hdr, rw, rh, w, h,
+            ),
+            gpu::d3d12::PresentSpace::Hdr10 => {
+                render::resolve_hdr_pq(src, info, overlay, self.tone, &mut self.pq, rw, rh, w, h)
+            }
+            gpu::d3d12::PresentSpace::Sdr => {
+                render::resolve_hdr(src, info, overlay, &mut self.sdr, rw, rh, w, h)
+            }
         }
     }
 
@@ -15315,10 +15394,10 @@ impl CpuPresent {
     }
 
     fn blit(&self, gpu: &mut gpu::GpuContext) -> gpu::d3d12::Result<()> {
-        if self.is_hdr {
-            gpu.present_cpu_hdr(&self.hdr)
-        } else {
-            gpu.present_cpu(&self.sdr)
+        match self.enc {
+            gpu::d3d12::PresentSpace::Scrgb => gpu.present_cpu_hdr(&self.hdr),
+            gpu::d3d12::PresentSpace::Hdr10 => gpu.present_cpu_pq(&self.pq),
+            gpu::d3d12::PresentSpace::Sdr => gpu.present_cpu(&self.sdr),
         }
     }
 }

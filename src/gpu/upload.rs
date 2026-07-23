@@ -6,7 +6,7 @@
 
 use super::d3d12::{
     aligned_pitch, committed_tex, footprint, loc_footprint, loc_subresource, transition, D3d,
-    Result, UploadBuffer, BLIT_FORMAT, BLIT_FORMAT_HDR, FRAMES_IN_FLIGHT,
+    Result, UploadBuffer, BLIT_FORMAT, BLIT_FORMAT_HDR, BLIT_FORMAT_HDR10, FRAMES_IN_FLIGHT,
 };
 use half::f16;
 use rayon::prelude::*;
@@ -22,6 +22,10 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 /// - **scRGB** (`BLIT_FORMAT_HDR`, under `--hdr`): [f16; 4] straight from
 ///   `render::present_px_scrgb`, which already applied the curve, the overlay,
 ///   and the 80-nit encode.
+/// - **HDR10** (`BLIT_FORMAT_HDR10`, wrapper-FG/`--hdr10` sessions): u32
+///   `A2:B10:G10:R10` (R in the LOW bits — R10G10B10A2's lane order, opposite
+///   BGRA8's) straight from `render::present_px_pq`, which already applied
+///   the curve, the overlay, and the matrix + ST 2084 encode.
 ///
 /// Either way the blit PS is a passthrough — the CPU owns the encode on this
 /// path, which is what keeps the debug overlay's display-space semantics exact.
@@ -44,6 +48,11 @@ impl BlitUpload {
     /// The scRGB f16 variant, for a `--hdr` session's CPU-presented arms.
     pub fn new_hdr(d3d: &D3d, w: u32, h: u32) -> Result<Self> {
         Self::with_format(d3d, w, h, BLIT_FORMAT_HDR, 8)
+    }
+
+    /// The 10-bit PQ variant, for an HDR10 session's CPU-presented arms.
+    pub fn new_pq(d3d: &D3d, w: u32, h: u32) -> Result<Self> {
+        Self::with_format(d3d, w, h, BLIT_FORMAT_HDR10, 4)
     }
 
     fn with_format(d3d: &D3d, w: u32, h: u32, format: DXGI_FORMAT, bpp: usize) -> Result<Self> {
@@ -71,6 +80,18 @@ impl BlitUpload {
     /// scRGB f16x4, for the `--hdr` CPU present arms.
     pub fn record_hdr(&self, d3d: &D3d, slot: usize, pixels: &[[f16; 4]]) {
         debug_assert_eq!(self.format, BLIT_FORMAT_HDR, "f16x4 into a non-RGBA16F blit texture");
+        self.copy_rows(d3d, slot, unsafe {
+            std::slice::from_raw_parts(pixels.as_ptr() as *const u8, std::mem::size_of_val(pixels))
+        });
+    }
+
+    /// Packed 10-bit PQ, for the HDR10 CPU present arms
+    /// (`render::present_px_pq` owns the pack: `r | g<<10 | b<<20 | 3<<30`).
+    pub fn record_pq(&self, d3d: &D3d, slot: usize, pixels: &[u32]) {
+        debug_assert_eq!(
+            self.format, BLIT_FORMAT_HDR10,
+            "packed 10-bit PQ into a non-R10G10B10A2 blit texture"
+        );
         self.copy_rows(d3d, slot, unsafe {
             std::slice::from_raw_parts(pixels.as_ptr() as *const u8, std::mem::size_of_val(pixels))
         });

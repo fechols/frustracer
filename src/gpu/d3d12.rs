@@ -28,6 +28,13 @@ pub const SWAPCHAIN_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
 /// via `SetColorSpace1`. See `crate::tone`.
 pub const SWAPCHAIN_FORMAT_HDR: DXGI_FORMAT = DXGI_FORMAT_R16G16B16A16_FLOAT;
 
+/// The HDR10 swapchain format: 10-bit PQ-encoded, Rec.2020 primaries, paired
+/// with `DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020`. This is the arm the
+/// swapchain-wrapper FG families take (DLSS-G and XeSS-FG both reject the
+/// scRGB fp16 swapchain; 10-bit PQ is the format HDR FG titles actually ship),
+/// plus the `--hdr10` A/B lever. See `tone::ToneMode::Pq`.
+pub const SWAPCHAIN_FORMAT_HDR10: DXGI_FORMAT = DXGI_FORMAT_R10G10B10A2_UNORM;
+
 /// The format the CPU-present blit texture is uploaded in. **Deliberately its
 /// own constant, not `SWAPCHAIN_FORMAT`**: `BlitUpload` packs pixels as
 /// `u32 0x00RRGGBB`, whose little-endian byte order is B,G,R,X — a layout that
@@ -40,6 +47,37 @@ pub const BLIT_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
 /// has already applied the curve and the encode, so the blit PS stays a
 /// passthrough.
 pub const BLIT_FORMAT_HDR: DXGI_FORMAT = DXGI_FORMAT_R16G16B16A16_FLOAT;
+
+/// 10-bit PQ for the CPU-present blit under HDR10 — `render::present_px_pq`
+/// owns the whole encode (curve + matrix + ST 2084 + the 10-bit pack), so the
+/// blit PS stays a passthrough here too. Its own const per the `BLIT_FORMAT`
+/// doctrine: the packed `u32` lane order (R low) is only valid for R10G10B10A2.
+pub const BLIT_FORMAT_HDR10: DXGI_FORMAT = DXGI_FORMAT_R10G10B10A2_UNORM;
+
+/// Which color space presentation was actually negotiated in. Runtime fact,
+/// never the CLI flag — the scRGB/HDR10 declares can be refused and the FG
+/// wrap can force a rebuild, so callers must read `D3d::space`. What varies
+/// with it is the tonemap encode (`tone::ToneMode`), the CPU blit format, and
+/// nothing upstream of the present.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PresentSpace {
+    /// 8-bit `B8G8R8A8_UNORM`, display-encoded (gamma 2.2 is ours to apply).
+    Sdr,
+    /// f16 scRGB — linear, `G10_NONE_P709`, 1.0 = 80 nits.
+    Scrgb,
+    /// 10-bit PQ — `R10G10B10A2_UNORM`, `G2084_NONE_P2020`.
+    Hdr10,
+}
+
+impl PresentSpace {
+    pub fn format(self) -> DXGI_FORMAT {
+        match self {
+            PresentSpace::Sdr => SWAPCHAIN_FORMAT,
+            PresentSpace::Scrgb => SWAPCHAIN_FORMAT_HDR,
+            PresentSpace::Hdr10 => SWAPCHAIN_FORMAT_HDR10,
+        }
+    }
+}
 
 pub type Result<T> = std::result::Result<T, String>;
 
@@ -61,20 +99,25 @@ fn err<T>(ctx: &str, e: windows::core::Error) -> Result<T> {
     Err(format!("{ctx}: {e}"))
 }
 
-/// Declare the swapchain scRGB. `CheckColorSpaceSupport` first: `SetColorSpace1`
-/// on an unsupported space is an error, and we want to know *before* committing
-/// to the f16 buffer so the caller can rebuild at SDR.
+/// Declare the swapchain's color space (scRGB G10 or HDR10 G2084 — `Sdr` is
+/// DXGI's default reading and declares nothing). `CheckColorSpaceSupport`
+/// first: `SetColorSpace1` on an unsupported space is an error, and we want to
+/// know *before* committing to the buffer so the caller can rebuild at SDR.
 ///
 /// Idempotent and cheap — the display-change retune re-runs it, since a swapchain
 /// that moves to a different output can in principle need re-declaring.
-fn set_scrgb(swapchain: &IDXGISwapChain3) -> Result<()> {
-    const SCRGB: DXGI_COLOR_SPACE_TYPE = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
-    let support = unsafe { swapchain.CheckColorSpaceSupport(SCRGB) }
+fn declare_colorspace(swapchain: &IDXGISwapChain3, space: PresentSpace) -> Result<()> {
+    let (cs, name) = match space {
+        PresentSpace::Sdr => return Ok(()),
+        PresentSpace::Scrgb => (DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709, "G10_NONE_P709"),
+        PresentSpace::Hdr10 => (DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, "G2084_NONE_P2020"),
+    };
+    let support = unsafe { swapchain.CheckColorSpaceSupport(cs) }
         .map_err(|e| format!("CheckColorSpaceSupport: {e}"))?;
     if support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT.0 as u32 == 0 {
-        return Err("G10_NONE_P709 not present-supported".into());
+        return Err(format!("{name} not present-supported"));
     }
-    unsafe { swapchain.SetColorSpace1(SCRGB) }.map_err(|e| format!("SetColorSpace1: {e}"))
+    unsafe { swapchain.SetColorSpace1(cs) }.map_err(|e| format!("SetColorSpace1({name}): {e}"))
 }
 
 pub struct FrameSlot {
@@ -101,12 +144,13 @@ pub struct D3d {
     pub width: u32,
     pub height: u32,
     /// The format the swapchain was actually created with. Runtime, not the
-    /// const, because `--hdr` picks scRGB f16 — and because `ResizeBuffers` and
-    /// both fullscreen PSOs must agree with whatever was chosen. `hdr` is false
-    /// when scRGB was requested but the swapchain refused the colour space, so
-    /// callers must read THIS, never the CLI flag.
+    /// const, because `--hdr` picks scRGB f16 (and the wrapper-FG arm HDR10) —
+    /// and because `ResizeBuffers` and both fullscreen PSOs must agree with
+    /// whatever was chosen. `space` falls back to `Sdr` when a colour space
+    /// was requested but refused (or the FG wrap forced a rebuild), so callers
+    /// must read THIS, never the CLI flag.
     pub format: DXGI_FORMAT,
-    pub hdr: bool,
+    pub space: PresentSpace,
     /// Present sync interval (1 = v-sync, 0 = uncapped for benchmarking).
     sync_interval: u32,
     /// DXGI_PRESENT_ALLOW_TEARING when the swapchain was created with the
@@ -213,16 +257,24 @@ pub fn create_queue(device: &ID3D12Device) -> Result<ID3D12CommandQueue> {
     .map_err(|e| format!("CreateCommandQueue: {e}"))
 }
 
-/// Frame-generation swapchain wrap hook (see `with_queue`): receives the
-/// present queue and the fully negotiated swapchain (post scRGB fallback) and
-/// returns the frame-interpolation proxy the session presents through from
-/// then on. Err hands the ORIGINAL swapchain back so a failed wrap degrades
-/// to a normal session (the hook owns its loud line). d3d12.rs stays
-/// SDK-agnostic — the closure lives with the FG runtime that owns the proxy.
-pub type SwapWrap<'a> = &'a mut dyn FnMut(
-    &ID3D12CommandQueue,
-    IDXGISwapChain3,
-) -> std::result::Result<IDXGISwapChain3, (IDXGISwapChain3, String)>;
+/// Frame-generation swapchain wrap hook (see `with_queue`). `wrap` receives
+/// the present queue and the fully negotiated swapchain (post colour-space
+/// fallback) and returns the frame-interpolation proxy the session presents
+/// through from then on; Err hands the ORIGINAL swapchain back so a failed
+/// wrap degrades to a normal session (the hook owns its loud line). `unwind`
+/// destroys whatever FG context the last successful `wrap` created — called
+/// only after every proxy reference has been released, when the post-wrap
+/// colour-space re-declare fails and the session must rebuild at SDR (a
+/// mis-declared present is never acceptable; SDR *with* FG beats it). d3d12.rs
+/// stays SDK-agnostic — both closures live with the FG runtime that owns the
+/// proxy.
+pub struct FgHook<'a> {
+    pub wrap: &'a mut dyn FnMut(
+        &ID3D12CommandQueue,
+        IDXGISwapChain3,
+    ) -> std::result::Result<IDXGISwapChain3, (IDXGISwapChain3, String)>,
+    pub unwind: &'a mut dyn FnMut(),
+}
 
 impl D3d {
     /// Build the swapchain + frame machinery around an existing device/queue
@@ -235,8 +287,8 @@ impl D3d {
         width: u32,
         height: u32,
         vsync: bool,
-        want_hdr: bool,
-        fg_wrap: Option<SwapWrap>,
+        want: PresentSpace,
+        fg_hook: Option<FgHook>,
     ) -> Result<Self> {
         // Uncapped presentation needs DXGI tearing support (windowed flip
         // model otherwise paces on the compositor even at sync interval 0),
@@ -264,11 +316,10 @@ impl D3d {
                 );
             }
         }
-        let format = if want_hdr { SWAPCHAIN_FORMAT_HDR } else { SWAPCHAIN_FORMAT };
         let sc_desc = DXGI_SWAP_CHAIN_DESC1 {
             Width: width,
             Height: height,
-            Format: format,
+            Format: want.format(),
             SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
             BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
             BufferCount: BACKBUFFERS,
@@ -290,74 +341,128 @@ impl D3d {
                     .map_err(|e| format!("CreateSwapChainForHwnd({fmt:?}): {e}"))?;
             sc1.cast().map_err(|e| format!("IDXGISwapChain3 cast: {e}"))
         };
-        let mut swapchain = create(format)?;
+        let mut space = want;
+        let mut swapchain = create(space.format())?;
 
-        // scRGB: the f16 buffer alone means nothing — DXGI interprets a swapchain
-        // as sRGB unless told otherwise, so the colour space declaration is what
-        // makes the linear values mean what we think. If it is refused we fall
-        // back to the 8-bit swapchain rather than present linear f16 into an
-        // sRGB-interpreted buffer (which would wash the whole image out). Loud
+        // scRGB/HDR10: the buffer alone means nothing — DXGI interprets a
+        // swapchain as sRGB unless told otherwise, so the colour space
+        // declaration is what makes the values mean what we think. If it is
+        // refused we fall back to the 8-bit swapchain rather than present into
+        // a misinterpreted buffer (which would wash the whole image out). Loud
         // line, full fallback, no degraded half-mode.
         //
-        // This is the DEFAULT, not an HDR-only path: handing Windows an f16
+        // scRGB is the DEFAULT, not an HDR-only path: handing Windows an f16
         // linear surface is the right thing on any monitor. On an HDR display it
         // carries real highlights; on an SDR one DWM tone-maps/clamps it and can
         // still drive a 10-bit panel at full precision, where the old 8-bit
         // backbuffer would have banded. What varies with the display is the
-        // CURVE (crate::tone), not the swapchain.
-        let mut format = format;
-        let mut hdr = false;
-        if want_hdr {
-            match set_scrgb(&swapchain) {
-                Ok(()) => {
-                    hdr = true;
-                    eprintln!(
+        // CURVE (crate::tone), not the swapchain. HDR10 is the wrapper-FG arm
+        // (+ the --hdr10 lever): the FG proxies reject scRGB fp16 but take
+        // 10-bit PQ, the format HDR FG titles ship.
+        if space != PresentSpace::Sdr {
+            match declare_colorspace(&swapchain, space) {
+                Ok(()) => match space {
+                    PresentSpace::Scrgb => eprintln!(
                         "present: scRGB swapchain (R16G16B16A16_FLOAT, G10_NONE_P709) — \
                          no 8-bit quantization; Windows drives the panel's real bit depth"
-                    );
-                }
+                    ),
+                    PresentSpace::Hdr10 => eprintln!(
+                        "present: HDR10 swapchain (R10G10B10A2_UNORM, G2084_NONE_P2020, PQ)"
+                    ),
+                    PresentSpace::Sdr => unreachable!(),
+                },
                 Err(e) => {
-                    eprintln!("present: scRGB refused ({e}) — 8-bit B8G8R8A8 swapchain");
-                    format = SWAPCHAIN_FORMAT;
-                    // Release the f16 swapchain BEFORE asking for its replacement:
+                    eprintln!("present: {space:?} refused ({e}) — 8-bit B8G8R8A8 swapchain");
+                    space = PresentSpace::Sdr;
+                    // Release the old swapchain BEFORE asking for its replacement:
                     // the HWND still owns it until the last reference dies.
                     drop(swapchain);
-                    swapchain = create(format)?;
+                    swapchain = create(space.format())?;
                 }
             }
         }
 
         // Frame generation: wrap the negotiated swapchain with the runtime's
-        // frame-interpolation proxy. This must sit AFTER the scRGB fallback
-        // (the proxy clones the final desc, and a post-wrap SDR re-create
-        // would orphan it) and BEFORE RTV creation (GetBuffer on the proxy
-        // returns the PROXY's backbuffers — the real presentation chain lives
-        // inside it, and RTVs built from the pre-wrap chain would render into
-        // buffers nothing ever presents). A wrap failure keeps the original
-        // chain and the session runs without FG.
-        if let Some(hook) = fg_wrap {
-            swapchain = match hook(&queue, swapchain) {
+        // frame-interpolation proxy. This must sit AFTER the colour-space
+        // fallback (the proxy clones the final desc, and a post-wrap SDR
+        // re-create would orphan it) and BEFORE RTV creation (GetBuffer on the
+        // proxy returns the PROXY's backbuffers — the real presentation chain
+        // lives inside it, and RTVs built from the pre-wrap chain would render
+        // into buffers nothing ever presents).
+        //
+        // Failure ladder, in order of what is worth keeping:
+        //  - wrap fails at Hdr10: the proxy itself may be rejecting the 10-bit
+        //    format (XeSS-FG's InitFromSwapChain is format-picky). FG is the
+        //    reason this session exists, so rebuild at SDR and wrap AGAIN —
+        //    SDR with FG beats HDR10 without it.
+        //  - wrap fails otherwise: keep the original chain, session runs
+        //    without FG (the hook owns its loud line) — today's shape.
+        //  - wrap succeeds but the colour-space re-declare through the proxy
+        //    fails: NEVER present mis-declared. Drop the proxy, `unwind` the
+        //    FG context (every proxy ref must be gone before the FG runtime
+        //    can destroy it, and the wrap consumed the app chain, so unwind
+        //    must run before a new chain can exist on this HWND), rebuild at
+        //    SDR, wrap again.
+        if let Some(hook) = fg_hook {
+            let mut rebuild_sdr_and_rewrap =
+                |sc: IDXGISwapChain3,
+                 unwind: bool,
+                 hook_wrap: &mut dyn FnMut(
+                    &ID3D12CommandQueue,
+                    IDXGISwapChain3,
+                )
+                    -> std::result::Result<IDXGISwapChain3, (IDXGISwapChain3, String)>,
+                 hook_unwind: &mut dyn FnMut()|
+                 -> Result<IDXGISwapChain3> {
+                    drop(sc);
+                    if unwind {
+                        hook_unwind();
+                    }
+                    let fresh = create(PresentSpace::Sdr.format())?;
+                    Ok(match hook_wrap(&queue, fresh) {
+                        Ok(proxy) => proxy,
+                        Err((orig, e2)) => {
+                            eprintln!(
+                                "fg: swapchain wrap failed at SDR too ({e2}) — \
+                                 frame generation disabled"
+                            );
+                            orig
+                        }
+                    })
+                };
+            swapchain = match (hook.wrap)(&queue, swapchain) {
                 Ok(proxy) => {
                     // The proxy's internal chain was created fresh from our
                     // desc; a colour-space declaration does not survive that.
-                    // Re-assert scRGB through the proxy (it forwards
+                    // Re-assert it through the proxy (it forwards
                     // SetColorSpace1 to the real chain).
-                    if hdr {
-                        if let Err(e) = set_scrgb(&proxy) {
+                    match declare_colorspace(&proxy, space) {
+                        Ok(()) => proxy,
+                        Err(e) => {
                             eprintln!(
-                                "present: scRGB re-declare through the FG proxy refused ({e}) — \
-                                 if colors look washed out, combine --fg with --no-hdr"
+                                "present: {space:?} re-declare through the FG proxy refused ({e}) — \
+                                 rebuilding at SDR (never a mis-declared present)"
                             );
+                            space = PresentSpace::Sdr;
+                            rebuild_sdr_and_rewrap(proxy, true, hook.wrap, hook.unwind)?
                         }
                     }
-                    proxy
                 }
                 Err((orig, e)) => {
-                    eprintln!("fg: swapchain wrap failed ({e}) — frame generation disabled");
-                    orig
+                    if space == PresentSpace::Hdr10 {
+                        eprintln!(
+                            "fg: swapchain wrap rejects the HDR10 chain ({e}) — rebuilding at SDR"
+                        );
+                        space = PresentSpace::Sdr;
+                        rebuild_sdr_and_rewrap(orig, false, hook.wrap, hook.unwind)?
+                    } else {
+                        eprintln!("fg: swapchain wrap failed ({e}) — frame generation disabled");
+                        orig
+                    }
                 }
             };
         }
+        let format = space.format();
 
         let rtv_heap: ID3D12DescriptorHeap = unsafe {
             device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
@@ -416,7 +521,7 @@ impl D3d {
             width,
             height,
             format,
-            hdr,
+            space,
             sync_interval: if vsync { 1 } else { 0 },
             present_flags: if tearing { DXGI_PRESENT_ALLOW_TEARING } else { DXGI_PRESENT(0) },
         })
@@ -425,6 +530,15 @@ impl D3d {
     pub fn rtv_handle(&self, backbuffer: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
         let start = unsafe { self.rtv_heap.GetCPUDescriptorHandleForHeapStart() };
         D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start.ptr + (backbuffer * self.rtv_size) as usize }
+    }
+
+    /// scRGB f16 live? The historical `hdr` bit — sites that mean "is the
+    /// backbuffer linear f16" (the ffx FG backbuffer-format report, the f16
+    /// blit) keep reading exactly this; sites that need the third arm switch
+    /// on `space` instead.
+    #[inline]
+    pub fn hdr(&self) -> bool {
+        self.space == PresentSpace::Scrgb
     }
 
     /// Resize the swapchain to a new client size. Drains the GPU, releases
@@ -449,12 +563,15 @@ impl D3d {
             .map_err(|e| format!("ResizeBuffers({w}x{h}): {e}"))?;
         // ResizeBuffers preserves the colour space, so this re-declare is belt and
         // braces — which is exactly why a refusal must NOT kill the resize. The
-        // swapchain we just resized is still the f16 one we were already
+        // swapchain we just resized is still the one we were already
         // presenting to; erroring here would take down the session over a
         // redundant call. Loud line, carry on.
-        if self.hdr {
-            if let Err(e) = set_scrgb(&self.swapchain) {
-                eprintln!("present: scRGB re-declare after resize failed ({e}) — keeping the existing colour space");
+        if self.space != PresentSpace::Sdr {
+            if let Err(e) = declare_colorspace(&self.swapchain, self.space) {
+                eprintln!(
+                    "present: {:?} re-declare after resize failed ({e}) — keeping the existing colour space",
+                    self.space
+                );
             }
         }
         let rtv0 = unsafe { self.rtv_heap.GetCPUDescriptorHandleForHeapStart() };

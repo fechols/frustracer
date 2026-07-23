@@ -38,6 +38,12 @@
 //!   linear (G10) — **never** apply gamma, the display pipeline owns the EOTF.
 //!   scRGB is *defined* so that 1.0 = 80 nits, hence `scale = paper_white / 80`.
 //!   Values above 1.0 are legal and are exactly what buys us the highlights.
+//! - **HDR10** (`R10G10B10A2_UNORM` + `DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020`):
+//!   the same rolloff, then the Rec.709 → Rec.2020 gamut matrix and the SMPTE
+//!   ST 2084 (PQ) inverse EOTF, whose signal is normalized so encoded 1.0 =
+//!   10000 nits — hence `scale = paper_white / 10000`. This is the arm the
+//!   swapchain-wrapper FG families take (DLSS-G and XeSS-FG both reject the
+//!   scRGB fp16 swapchain but accept 10-bit PQ, the format HDR titles ship).
 //!
 //! An SDR display under an scRGB swapchain is therefore not a special case
 //! either — it is `paper_white = 80, w = 1`, i.e. the same `1 - exp(-x)` rolloff
@@ -58,6 +64,55 @@ pub const DEFAULT_PAPER_WHITE: f32 = 200.0;
 /// diffuse white is reproduced *exactly* and only the highlights are compressed.
 const HDR_KNEE: f32 = 1.0;
 
+/// PQ's definition: the ST 2084 signal is normalized so encoded 1.0 = 10000
+/// nits. Not tunable — it is the transfer function, not a preference.
+pub const PQ_MAX_NITS: f32 = 10000.0;
+
+// SMPTE ST 2084 constants — exact dyadic rationals, so the literals are exact
+// in f32 and identical in the HLSL twin by construction (the clouds-wind
+// literal idiom). Note c1 + c2 == 1 + c3 == 19.6875 exactly, which is what
+// makes `pq_encode(1.0) == 1.0` bitwise (a self_test anchor).
+const PQ_M1: f32 = 0.1593017578125; // 2610 / 16384
+const PQ_M2: f32 = 78.84375; //        2523 / 4096 * 128
+const PQ_C1: f32 = 0.8359375; //       3424 / 4096
+const PQ_C2: f32 = 18.8515625; //      2413 / 4096 * 32
+const PQ_C3: f32 = 18.6875; //         2392 / 4096 * 32
+
+/// Rec.709 → Rec.2020 primaries (BT.2087 matrix). Row sums are 1 to ~1e-6, so
+/// white maps to white — the self_test anchor. Literals mirrored term-for-term
+/// in `tonemap.hlsl`/`hud.hlsl`; change both together.
+#[inline]
+pub fn m709_to_2020(v: Vec3A) -> Vec3A {
+    Vec3A::new(
+        0.627404 * v.x + 0.329283 * v.y + 0.043313 * v.z,
+        0.069097 * v.x + 0.919540 * v.y + 0.011362 * v.z,
+        0.016391 * v.x + 0.088013 * v.y + 0.895595 * v.z,
+    )
+}
+
+/// SMPTE ST 2084 inverse EOTF: display luminance normalized to 10000 nits
+/// (`y` in [0,1]) → the PQ-encoded signal. Saturates its input — the curve is
+/// only defined on [0,1], and the rolloff already bounded the value at the
+/// display's own peak, so the clamp is belt-and-braces, not a tone decision.
+#[inline]
+pub fn pq_encode(y: f32) -> f32 {
+    let y = y.clamp(0.0, 1.0);
+    let yp = y.powf(PQ_M1);
+    ((PQ_C1 + PQ_C2 * yp) / (1.0 + PQ_C3 * yp)).powf(PQ_M2)
+}
+
+/// The display encode applied after the rolloff. Which one is a property of
+/// the negotiated swapchain, never of the scene.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ToneMode {
+    /// Linear output (scRGB) — the display pipeline owns the EOTF.
+    Linear,
+    /// `^(1/2.2)` display encode — the 8-bit UNORM swapchain.
+    Gamma22,
+    /// Rec.709→2020 matrix + ST 2084 (PQ) — the HDR10 R10G10B10A2 swapchain.
+    Pq,
+}
+
 /// Parameters of the presentation curve. Pure data — the GPU gets these as root
 /// constants, the CPU passes them to `map`.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -66,23 +121,25 @@ pub struct ToneParams {
     pub knee: f32,
     /// Asymptote, in paper-white units: `peak_nits / paper_white`. Always >= 1.
     pub headroom: f32,
-    /// Output scale applied after the curve (scRGB: `paper_white / 80`).
+    /// Output scale applied after the curve (scRGB: `paper_white / 80`;
+    /// HDR10: `paper_white / 10000`).
     pub scale: f32,
-    /// Apply `^(1/2.2)`? True only for the 8-bit UNORM swapchain — an scRGB
-    /// buffer is linear and the display applies the EOTF itself.
-    pub gamma: bool,
+    /// The display encode (see `ToneMode`). `Gamma22` only for the 8-bit UNORM
+    /// swapchain — an scRGB buffer is linear and the display applies the EOTF
+    /// itself; `Pq` for the HDR10 swapchain.
+    pub mode: ToneMode,
 }
 
 impl ToneParams {
     /// The 8-bit SDR swapchain. Reproduces the pre-HDR renderer bit-for-bit.
     pub const SDR: ToneParams =
-        ToneParams { knee: 0.0, headroom: 1.0, scale: 1.0, gamma: true };
+        ToneParams { knee: 0.0, headroom: 1.0, scale: 1.0, mode: ToneMode::Gamma22 };
 
     /// scRGB output on a display whose HDR is *off* (or unknown). Same rolloff
     /// as `SDR`, but linear-encoded and anchored at scRGB's own 80-nit white —
     /// so the displayed image matches `SDR` while the buffer stays f16.
     pub const SCRGB_SDR: ToneParams =
-        ToneParams { knee: 0.0, headroom: 1.0, scale: 1.0, gamma: false };
+        ToneParams { knee: 0.0, headroom: 1.0, scale: 1.0, mode: ToneMode::Linear };
 
     /// scRGB output on an HDR display. `peak_nits` is what the display actually
     /// reports (see `gpu::hdr`), `paper_white` is where linear 1.0 lands.
@@ -98,12 +155,28 @@ impl ToneParams {
         if headroom <= HDR_KNEE {
             return ToneParams { scale, ..ToneParams::SCRGB_SDR };
         }
-        ToneParams { knee: HDR_KNEE, headroom, scale, gamma: false }
+        ToneParams { knee: HDR_KNEE, headroom, scale, mode: ToneMode::Linear }
+    }
+
+    /// HDR10/PQ output — the arm the swapchain-wrapper FG families take. Same
+    /// rolloff as `hdr()`, but the scale anchors paper white against PQ's
+    /// 10000-nit signal ceiling and the encode is matrix + ST 2084. The same
+    /// no-headroom degeneracy applies (a `peak <= paper` display gets the SDR
+    /// rolloff, PQ-encoded).
+    pub fn hdr10(paper_white: f32, peak_nits: f32) -> ToneParams {
+        let paper = paper_white.max(1.0);
+        let scale = paper / PQ_MAX_NITS;
+        let headroom = peak_nits / paper;
+        if headroom <= HDR_KNEE {
+            return ToneParams { knee: 0.0, headroom: 1.0, scale, mode: ToneMode::Pq };
+        }
+        ToneParams { knee: HDR_KNEE, headroom, scale, mode: ToneMode::Pq }
     }
 
     /// Peak luminance this parameterisation will actually emit, in nits.
     pub fn peak_nits(&self) -> f32 {
-        self.headroom * self.scale * SCRGB_NITS
+        let anchor = if self.mode == ToneMode::Pq { PQ_MAX_NITS } else { SCRGB_NITS };
+        self.headroom * self.scale * anchor
     }
 }
 
@@ -135,7 +208,7 @@ pub fn shape(c: Vec3A, p: ToneParams) -> Vec3A {
         curve(c.y, p.knee, p.headroom),
         curve(c.z, p.knee, p.headroom),
     );
-    if p.gamma {
+    if p.mode == ToneMode::Gamma22 {
         f.powf(1.0 / 2.2)
     } else {
         f
@@ -144,10 +217,17 @@ pub fn shape(c: Vec3A, p: ToneParams) -> Vec3A {
 
 /// Paper-white-relative display value -> the value the swapchain wants. For
 /// scRGB that is the 80-nit anchor; for the 8-bit path `scale` is 1.0 and this
-/// is the identity.
+/// is the identity; for HDR10 the scale lands in PQ's 10000-nit-normalized
+/// domain and the value goes through the gamut matrix + ST 2084 encode.
 #[inline]
 pub fn encode(v: Vec3A, p: ToneParams) -> Vec3A {
-    v * p.scale
+    match p.mode {
+        ToneMode::Pq => {
+            let n = m709_to_2020(v * p.scale);
+            Vec3A::new(pq_encode(n.x), pq_encode(n.y), pq_encode(n.z))
+        }
+        _ => v * p.scale,
+    }
 }
 
 /// The whole pipeline, no overlay — what the tonemap PS computes, and what the
@@ -264,6 +344,70 @@ pub fn self_test() -> Result<(), String> {
     let v = map(Vec3A::splat(3.0), flat).x;
     if !v.is_finite() {
         return Err(format!("no-headroom display produced {v}"));
+    }
+
+    // (7) The PQ encode — closed-form ST 2084 anchors. Signal 1.0 is exact by
+    // construction (c1 + c2 == 1 + c3 == 19.6875, all dyadic), the 100-nit
+    // point is the classic published anchor (~0.508), and 0 encodes to ~7e-7.
+    if pq_encode(1.0).to_bits() != 1.0f32.to_bits() {
+        return Err(format!("pq_encode(1.0) = {} != 1.0 exactly", pq_encode(1.0)));
+    }
+    if pq_encode(0.0) >= 1e-6 {
+        return Err(format!("pq_encode(0.0) = {} >= 1e-6", pq_encode(0.0)));
+    }
+    let at_100 = pq_encode(100.0 / PQ_MAX_NITS);
+    if (at_100 - 0.5081).abs() > 1e-3 {
+        return Err(format!("pq_encode(100 nits) = {at_100}, want ~0.5081"));
+    }
+    // Monotone over the full signal domain, and a numeric EOTF round-trip:
+    // decode(encode(y)) must land back on y — the inverse pair is the proof
+    // the constants are the real ST 2084 set and not a typo'd cousin.
+    let pq_decode = |e: f32| -> f32 {
+        let ep = e.powf(1.0 / PQ_M2);
+        ((ep - PQ_C1).max(0.0) / (PQ_C2 - PQ_C3 * ep)).powf(1.0 / PQ_M1)
+    };
+    let mut prev = f32::NEG_INFINITY;
+    for i in 0..=1000 {
+        let y = i as f32 * 1e-3;
+        let e = pq_encode(y);
+        if e < prev {
+            return Err(format!("pq_encode not monotone at y={y}: {e} < {prev}"));
+        }
+        prev = e;
+        let back = pq_decode(e);
+        if (back - y).abs() > 1e-4 {
+            return Err(format!("PQ round-trip: y={y} -> encode {e} -> decode {back}"));
+        }
+    }
+    // The gamut matrix maps white to white (rows sum to 1) — a transposed or
+    // mistyped matrix tints every neutral.
+    let mw = m709_to_2020(Vec3A::ONE);
+    if (mw - Vec3A::ONE).abs().max_element() > 1e-5 {
+        return Err(format!("m709_to_2020(white) = {mw:?}, want white"));
+    }
+
+    // (8) The HDR10 parameterisation: paper-white anchor through the whole
+    // map (linear 1.0 must display at exactly paper_white nits after the PQ
+    // decode), the reported peak, and the no-headroom degeneracy.
+    let p10 = ToneParams::hdr10(200.0, 1000.0);
+    if p10.headroom != 5.0 {
+        return Err(format!("hdr10(200, 1000) headroom {} != 5", p10.headroom));
+    }
+    let white_nits = pq_decode(map(Vec3A::ONE, p10).x) * PQ_MAX_NITS;
+    if (white_nits - 200.0).abs() > 0.5 {
+        return Err(format!("hdr10 paper-white anchor: linear 1.0 -> {white_nits} nits, want 200"));
+    }
+    let peak10 = p10.peak_nits();
+    if (peak10 - 1000.0).abs() > 1e-2 {
+        return Err(format!("hdr10 peak_nits {peak10} != 1000"));
+    }
+    let flat10 = ToneParams::hdr10(200.0, 200.0);
+    if flat10.knee != 0.0 || flat10.headroom != 1.0 || flat10.mode != ToneMode::Pq {
+        return Err("hdr10(200, 200) must degenerate to the SDR rolloff, PQ-encoded".into());
+    }
+    let v10 = map(Vec3A::splat(3.0), flat10).x;
+    if !v10.is_finite() || !(0.0..=1.0).contains(&v10) {
+        return Err(format!("no-headroom HDR10 display produced {v10}"));
     }
 
     eprintln!("tone self-test: OK");

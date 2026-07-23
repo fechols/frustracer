@@ -79,6 +79,14 @@ pub struct GpuOptions {
     /// A *request* — the swapchain may refuse the colour space, so read
     /// `GpuContext::hdr()` for what actually happened, never this.
     pub hdr: bool,
+    /// `--hdr10`: force the 10-bit PQ (R10G10B10A2 + G2084) swapchain in ANY
+    /// session — the A/B lever, and override-wins like `--hdr-peak` (it fires
+    /// even where the display probe says HDR is off; the probe can be wrong,
+    /// and a lever that no-ops exactly then is no escape hatch). Without it
+    /// the PQ arm is taken automatically only by the swapchain-wrapper FG
+    /// families on an HDR-on display. Read `GpuContext::encoding()` for what
+    /// actually happened.
+    pub hdr10: bool,
     /// Where linear 1.0 lands, in nits (`--hdr-paper-white`, default 200). The
     /// scene is authored so 1.0 ≈ diffuse white (see `scene::default_light`).
     pub paper_white: f32,
@@ -333,6 +341,10 @@ struct NgxFgState {
     primed: std::cell::Cell<bool>,
     frame_id: std::cell::Cell<u64>,
     noted_res: std::cell::Cell<bool>,
+    /// Whether the last present was a PAIR (interpolated + real) — exact by
+    /// construction, since this path calls Present itself. The title bar's
+    /// presented-per-rendered multiplier.
+    pair: std::cell::Cell<bool>,
 }
 
 /// XeSS-FG frame generation (Intel XeSS sessions — the third `--fg` family).
@@ -352,6 +364,9 @@ struct XefgState {
     frame_id: std::cell::Cell<u32>,
     poll: std::cell::Cell<u32>,
     logged: std::cell::Cell<bool>,
+    /// Last healthy poll's frames-presented-per-present (0 = not yet
+    /// measured). The title bar's presented-per-rendered multiplier.
+    mult: std::cell::Cell<u32>,
 }
 
 /// DLSS-G frame generation (DLSS sessions — the SL-family counterpart of
@@ -378,6 +393,10 @@ struct DlssgState {
     /// First successful poll logged the presented/rendered ratio (the
     /// headless proof generation is happening).
     logged: std::cell::Cell<bool>,
+    /// Last healthy second-interval poll's numFramesActuallyPresented — the
+    /// per-present multiplier (0 = not yet measured; 1 = generated frames
+    /// not landing). The title bar reads it.
+    mult: std::cell::Cell<u32>,
 }
 
 /// The trace res must sit inside this context's SDK range. The caller already
@@ -631,20 +650,42 @@ impl GpuContext {
 
         // Both DLSS-G and XeSS-FG reject the scRGB fp16 swapchain (DLSS-G by
         // documented policy, XeSS-FG measured: InitFromSwapChain returns
-        // INVALID_ARGUMENT on R16G16B16A16_FLOAT) — those FG sessions present
-        // SDR 8-bit. The ffx family supports scRGB and keeps it.
-        let want_hdr = opts.hdr && !fg_dlssg && !try_xefg;
-        if fg_dlssg && opts.hdr {
-            eprintln!(
-                "fg: DLSS-G does not support the scRGB fp16 swapchain — presenting SDR 8-bit \
-                 (--no-fg restores HDR)"
-            );
-        }
-        if try_xefg && opts.hdr {
-            eprintln!(
-                "fg: XeSS-FG rejects the scRGB fp16 swapchain — presenting SDR 8-bit \
-                 (--no-fg restores HDR)"
-            );
+        // INVALID_ARGUMENT on R16G16B16A16_FLOAT) — but 10-bit PQ is the
+        // format HDR FG titles actually ship, so on an HDR-on display those
+        // sessions take the HDR10 arm instead of dropping to SDR 8-bit (the
+        // probe needs only adapter+hwnd, so it can run before the swapchain
+        // exists). The ffx family supports scRGB and keeps it. `--hdr10`
+        // forces the PQ arm in any session (the A/B lever; override-wins,
+        // including over an "HDR off" probe verdict — the --hdr-peak
+        // doctrine). If the wrap still rejects the 10-bit chain,
+        // D3d::with_queue rebuilds at SDR and wraps again — FG is why the
+        // session exists, so SDR with FG beats HDR10 without it.
+        let fg_wrapper = fg_dlssg || try_xefg;
+        let want = if !opts.hdr {
+            d3d12::PresentSpace::Sdr
+        } else if opts.hdr10 {
+            d3d12::PresentSpace::Hdr10
+        } else if fg_wrapper {
+            if display::probe(&pick.adapter, hwnd).enabled {
+                d3d12::PresentSpace::Hdr10
+            } else {
+                d3d12::PresentSpace::Sdr
+            }
+        } else {
+            d3d12::PresentSpace::Scrgb
+        };
+        if fg_wrapper && opts.hdr {
+            let family = if fg_dlssg { "DLSS-G" } else { "XeSS-FG" };
+            match want {
+                d3d12::PresentSpace::Hdr10 => eprintln!(
+                    "fg: {family} rejects the scRGB fp16 swapchain — presenting HDR10/PQ \
+                     (R10G10B10A2, G2084; --no-fg restores scRGB)"
+                ),
+                _ => eprintln!(
+                    "fg: {family} rejects the scRGB fp16 swapchain and the display reports \
+                     HDR off — presenting SDR 8-bit (--no-fg restores scRGB; --hdr10 forces PQ)"
+                ),
+            }
         }
         if fg_dlssg {
             // Hardware-accelerated GPU scheduling is a hard DLSS-G
@@ -695,14 +736,18 @@ impl GpuContext {
         // frame from day one; DLSS-G later needs exactly these hooks).
         let mut proxy_device: Option<ID3D12Device> = None;
         let mut proxy_factory: Option<IDXGIFactory6> = None;
-        let mut fg_sc: Option<ffx::FgSwapchain> = None;
-        let mut fg_xefg: Option<crate::xess_fg::XefgSwapchain> = None;
+        // RefCells, not `let mut`: the wrap AND unwind closures of one FgHook
+        // both need to write the context slot, and two &mut captures of one
+        // local can't coexist. `into_inner` right after the d3d block.
+        let fg_sc: std::cell::RefCell<Option<ffx::FgSwapchain>> = std::cell::RefCell::new(None);
+        let fg_xefg: std::cell::RefCell<Option<crate::xess_fg::XefgSwapchain>> =
+            std::cell::RefCell::new(None);
         let d3d = if let Some(s) = &sl {
             s.set_d3d_device(&device)?;
             let pdev: ID3D12Device = s.upgrade(&device)?;
             let queue = d3d12::create_queue(&pdev)?;
             let pfac: IDXGIFactory6 = s.upgrade(&factory)?;
-            let d3d = D3d::with_queue(&pfac, device, queue, hwnd, w, h, opts.vsync, want_hdr, None)?;
+            let d3d = D3d::with_queue(&pfac, device, queue, hwnd, w, h, opts.vsync, want, None)?;
             // The swapchain we hold MUST be the SL proxy — every present has
             // to route through presentCommon under manual hooking. A proxy
             // resolves to a distinct native interface; verify loudly.
@@ -725,7 +770,7 @@ impl GpuContext {
                 // hook runs, so the raw pointer captured here stays valid.
                 let dev_raw = device.as_raw();
                 let xess_dir = opts.xess_dir.clone();
-                let mut hook = |q: &ID3D12CommandQueue,
+                let mut wrap = |q: &ID3D12CommandQueue,
                                 sc: windows::Win32::Graphics::Dxgi::IDXGISwapChain3|
                  -> std::result::Result<
                     windows::Win32::Graphics::Dxgi::IDXGISwapChain3,
@@ -736,7 +781,7 @@ impl GpuContext {
                     {
                         Ok((ctx, proxy)) => {
                             eprintln!("fg: swapchain wrapped by the XeSS-FG proxy (XeLL linked)");
-                            fg_xefg = Some(ctx);
+                            *fg_xefg.borrow_mut() = Some(ctx);
                             Ok(unsafe {
                                 windows::Win32::Graphics::Dxgi::IDXGISwapChain3::from_raw(proxy)
                             })
@@ -749,14 +794,21 @@ impl GpuContext {
                         )),
                     }
                 };
+                // Unwind: dropping the XefgSwapchain destroys the xefg context
+                // and releases its app-chain ref LAST (the ownership trap —
+                // the proxy DELEGATES to the app chain, so that ref must
+                // outlive xefgSwapChainDestroy).
+                let mut unwind = || {
+                    *fg_xefg.borrow_mut() = None;
+                };
                 D3d::with_queue(
-                    &factory, device, queue, hwnd, w, h, opts.vsync, want_hdr,
-                    Some(&mut hook),
+                    &factory, device, queue, hwnd, w, h, opts.vsync, want,
+                    Some(d3d12::FgHook { wrap: &mut wrap, unwind: &mut unwind }),
                 )?
             } else if fg_versions.is_empty() {
-                D3d::with_queue(&factory, device, queue, hwnd, w, h, opts.vsync, want_hdr, None)?
+                D3d::with_queue(&factory, device, queue, hwnd, w, h, opts.vsync, want, None)?
             } else {
-                let mut hook = |q: &ID3D12CommandQueue,
+                let mut wrap = |q: &ID3D12CommandQueue,
                                 sc: windows::Win32::Graphics::Dxgi::IDXGISwapChain3|
                  -> std::result::Result<
                     windows::Win32::Graphics::Dxgi::IDXGISwapChain3,
@@ -764,23 +816,40 @@ impl GpuContext {
                 > {
                     let (proxy, sc_ctx) = ffx::fg_wrap_swapchain(q, sc)?;
                     eprintln!("fg: swapchain wrapped by the FidelityFX frame-interpolation proxy");
-                    fg_sc = Some(sc_ctx);
+                    *fg_sc.borrow_mut() = Some(sc_ctx);
                     Ok(proxy)
                 };
+                // Unwind: FgSwapchain::drop = wait_for_presents +
+                // ffxshim_destroy, which releases the app chain the wrap
+                // consumed — required before a new chain can exist on this
+                // HWND (one flip-model swapchain per HWND).
+                let mut unwind = || {
+                    *fg_sc.borrow_mut() = None;
+                };
                 D3d::with_queue(
-                    &factory, device, queue, hwnd, w, h, opts.vsync, want_hdr,
-                    Some(&mut hook),
+                    &factory, device, queue, hwnd, w, h, opts.vsync, want,
+                    Some(d3d12::FgHook { wrap: &mut wrap, unwind: &mut unwind }),
                 )?
             }
         };
+        let fg_sc = fg_sc.into_inner();
+        let fg_xefg = fg_xefg.into_inner();
 
         // The display probe and the curve it implies. Only meaningful once the
-        // swapchain is actually scRGB — on the 8-bit path there is one curve
-        // (ToneParams::SDR) and nothing to ask the monitor.
-        let disp = if d3d.hdr { Some(display::probe(&pick.adapter, hwnd)) } else { None };
+        // swapchain actually carries a wide colour space — on the 8-bit path
+        // there is one curve (ToneParams::SDR) and nothing to ask the monitor.
+        let disp = if d3d.space != d3d12::PresentSpace::Sdr {
+            Some(display::probe(&pick.adapter, hwnd))
+        } else {
+            None
+        };
         let tone = match disp {
             Some(d) => {
-                let t = d.tone(opts.paper_white, opts.peak_nits);
+                let t = if d3d.space == d3d12::PresentSpace::Hdr10 {
+                    d.tone_pq(opts.paper_white, opts.peak_nits)
+                } else {
+                    d.tone(opts.paper_white, opts.peak_nits)
+                };
                 // Report the curve we ACTUALLY installed, not the probe's opinion:
                 // --hdr-peak overrides the probe (including an "HDR off" verdict),
                 // so keying the message off `d.enabled` could announce SDR levels
@@ -820,12 +889,13 @@ impl GpuContext {
             tonemap::SRV_SLOT_BLOOM,
         );
         // The blit texture matches the SWAPCHAIN, not the CLI flag: under scRGB
-        // the CPU arms hand over f16, under SDR they hand over u32 0RGB. Keyed
-        // off `d3d.hdr` so a refused colour space can't leave them mismatched.
-        let blit = if d3d.hdr {
-            upload::BlitUpload::new_hdr(&d3d, w, h)?
-        } else {
-            upload::BlitUpload::new(&d3d, w, h)?
+        // the CPU arms hand over f16, under HDR10 packed 10-bit PQ, under SDR
+        // u32 0RGB. Keyed off `d3d.space` so a refused colour space (or an FG
+        // rebuild) can't leave them mismatched.
+        let blit = match d3d.space {
+            d3d12::PresentSpace::Scrgb => upload::BlitUpload::new_hdr(&d3d, w, h)?,
+            d3d12::PresentSpace::Hdr10 => upload::BlitUpload::new_pq(&d3d, w, h)?,
+            d3d12::PresentSpace::Sdr => upload::BlitUpload::new(&d3d, w, h)?,
         };
         let hdr = upload::HdrUpload::new(&d3d, w, h)?;
         // The HUD overlay (SRV slot 9): not a tonemap source — bloom never
@@ -894,6 +964,7 @@ impl GpuContext {
                         primed: std::cell::Cell::new(false),
                         frame_id: std::cell::Cell::new(0),
                         noted_res: std::cell::Cell::new(false),
+                        pair: std::cell::Cell::new(false),
                     })
                 }
                 Err(e) => {
@@ -945,6 +1016,7 @@ impl GpuContext {
                         failed: std::cell::Cell::new(false),
                         poll: std::cell::Cell::new(0),
                         logged: std::cell::Cell::new(false),
+                        mult: std::cell::Cell::new(0),
                     })
                 }
                 Err(e) => {
@@ -987,12 +1059,15 @@ impl GpuContext {
                     &d3d.device,
                     (w, h),
                     (w, h),
-                    if d3d.hdr {
-                        ffx_sys::SURFACE_FORMAT_R16G16B16A16_FLOAT
-                    } else {
-                        ffx_sys::SURFACE_FORMAT_B8G8R8A8_UNORM
+                    match d3d.space {
+                        d3d12::PresentSpace::Scrgb => ffx_sys::SURFACE_FORMAT_R16G16B16A16_FLOAT,
+                        d3d12::PresentSpace::Hdr10 => ffx_sys::SURFACE_FORMAT_R10G10B10A2_UNORM,
+                        d3d12::PresentSpace::Sdr => ffx_sys::SURFACE_FORMAT_B8G8R8A8_UNORM,
                     },
-                    d3d.hdr,
+                    // FG_HDR = "the backbuffer is high dynamic range"; the FI
+                    // swapchain reads the transfer function off the chain's own
+                    // declared colour space, so PQ needs no extra plumbing.
+                    d3d.space != d3d12::PresentSpace::Sdr,
                     opts.debug,
                     *id,
                 ) {
@@ -1009,7 +1084,11 @@ impl GpuContext {
             if version.is_none() {
                 eprintln!("fg: no provider version parseable — swapchain proxy presents passthrough");
             }
-            let luminance = if d3d.hdr { [0.0, tone.peak_nits()] } else { [0.0, 0.0] };
+            let luminance = if d3d.space != d3d12::PresentSpace::Sdr {
+                [0.0, tone.peak_nits()]
+            } else {
+                [0.0, 0.0]
+            };
             FgState {
                 sc,
                 ctx,
@@ -1049,6 +1128,7 @@ impl GpuContext {
                 frame_id: std::cell::Cell::new(0),
                 poll: std::cell::Cell::new(0),
                 logged: std::cell::Cell::new(false),
+                mult: std::cell::Cell::new(0),
             }
         });
 
@@ -1361,10 +1441,10 @@ impl GpuContext {
         self.quin = None;
         self.rr = None;
         self.d3d.resize(w, h)?;
-        self.blit = if self.d3d.hdr {
-            upload::BlitUpload::new_hdr(&self.d3d, w, h)?
-        } else {
-            upload::BlitUpload::new(&self.d3d, w, h)?
+        self.blit = match self.d3d.space {
+            d3d12::PresentSpace::Scrgb => upload::BlitUpload::new_hdr(&self.d3d, w, h)?,
+            d3d12::PresentSpace::Hdr10 => upload::BlitUpload::new_pq(&self.d3d, w, h)?,
+            d3d12::PresentSpace::Sdr => upload::BlitUpload::new(&self.d3d, w, h)?,
         };
         self.hdr = upload::HdrUpload::new(&self.d3d, w, h)?;
         // The HUD overlay is window-sized: new texture (fresh SRV in slot 9),
@@ -1517,12 +1597,12 @@ impl GpuContext {
                     &self.d3d.device,
                     (w, h),
                     (w, h),
-                    if self.d3d.hdr {
-                        ffx_sys::SURFACE_FORMAT_R16G16B16A16_FLOAT
-                    } else {
-                        ffx_sys::SURFACE_FORMAT_B8G8R8A8_UNORM
+                    match self.d3d.space {
+                        d3d12::PresentSpace::Scrgb => ffx_sys::SURFACE_FORMAT_R16G16B16A16_FLOAT,
+                        d3d12::PresentSpace::Hdr10 => ffx_sys::SURFACE_FORMAT_R10G10B10A2_UNORM,
+                        d3d12::PresentSpace::Sdr => ffx_sys::SURFACE_FORMAT_B8G8R8A8_UNORM,
                     },
-                    self.d3d.hdr,
+                    self.d3d.space != d3d12::PresentSpace::Sdr,
                     opts.debug,
                     fg.version.0,
                 ) {
@@ -3859,11 +3939,29 @@ impl GpuContext {
         self.d3d.end_frame(slot)
     }
 
+    /// `present_cpu` for the HDR10 swapchain: the CPU produced final packed
+    /// 10-bit PQ (`render::present_px_pq` applied the curve, the overlay, the
+    /// matrix + ST 2084 encode, and the R10G10B10A2 pack), so this is still a
+    /// straight blit.
+    pub fn present_cpu_pq(&mut self, pixels: &[u32]) -> Result<()> {
+        crate::zone!("present-cpu-pq");
+        let slot = self.d3d.begin_frame()?;
+        self.blit.record_pq(&self.d3d, slot, pixels);
+        self.fullscreen_to_backbuffer(false, tonemap::SRV_SLOT_BLIT, 1.0);
+        self.d3d.end_frame(slot)
+    }
+
     /// True when the swapchain actually came up as scRGB — NOT merely what
     /// `--hdr` asked for (the colour space can be refused; see `D3d::with_queue`).
     /// Callers pick their present arm and their `resolve*` on this.
     pub fn is_hdr(&self) -> bool {
-        self.d3d.hdr
+        self.d3d.hdr()
+    }
+
+    /// Which colour space presentation actually negotiated — the three-way
+    /// fact `is_hdr()` collapses. The CPU arms pick their encode on this.
+    pub fn encoding(&self) -> d3d12::PresentSpace {
+        self.d3d.space
     }
 
     /// Re-probe the monitor the window now sits on and re-derive the curve.
@@ -3874,7 +3972,7 @@ impl GpuContext {
     /// a swapchain rebuild, and it deliberately does not reset the upscaler
     /// history — a display change is a change of output device, not of scene.
     pub fn refresh_display(&mut self, paper_white: f32, peak: Option<f32>) -> Option<display::DisplayHdr> {
-        if !self.d3d.hdr {
+        if self.d3d.space == d3d12::PresentSpace::Sdr {
             return None; // the 8-bit path has one curve and no display to ask
         }
         let d = display::probe(&self.adapter, self.hwnd);
@@ -3882,7 +3980,11 @@ impl GpuContext {
             return None;
         }
         self.display = Some(d);
-        self.tone = d.tone(paper_white, peak);
+        self.tone = if self.d3d.space == d3d12::PresentSpace::Hdr10 {
+            d.tone_pq(paper_white, peak)
+        } else {
+            d.tone(paper_white, peak)
+        };
         Some(d)
     }
 
@@ -3956,6 +4058,46 @@ impl GpuContext {
         self.fg.as_ref().filter(|f| f.ctx.is_some()).map(|f| f.version.1.as_str())
     }
 
+    /// The presented-per-rendered multiplier for the title bar: None when no
+    /// FG family is armed (or the toggle is off); Some(m) when armed. The
+    /// frame loop counts RENDERED frames, so an FG session's displayed fps
+    /// under-reports what the monitor receives by this factor. m is measured
+    /// wherever the family can be asked — raw NGX pair-presents itself (exact
+    /// by construction), XeSS-FG and SL DLSS-G read their status polls'
+    /// frames-presented (XeSS-FG assumes 2 until the first poll lands; SL
+    /// claims nothing until measured — the declines-to-insert history), ffx
+    /// FI has no query and reports 2 by configuration when live. m == 1 is
+    /// meaningful: armed but not inserting (holds, unprimed reset frames, a
+    /// declined SL session).
+    pub fn fg_display_mult(&self) -> Option<u32> {
+        if let Some(n) = &self.fg_n {
+            if n.enabled && !n.failed.get() {
+                return Some(if n.pair.get() { 2 } else { 1 });
+            }
+        }
+        if let Some(g) = &self.fg_g {
+            if g.enabled && !g.failed.get() {
+                return Some(g.mult.get().max(1));
+            }
+        }
+        if let Some(x) = &self.fg_x {
+            if x.enabled && !x.failed.get() {
+                let m = x.mult.get();
+                return Some(if m == 0 {
+                    if x.on.get() { 2 } else { 1 }
+                } else {
+                    m
+                });
+            }
+        }
+        if let Some(f) = &self.fg {
+            if f.ctx.is_some() && f.enabled {
+                return Some(if f.live.get() { 2 } else { 1 });
+            }
+        }
+        None
+    }
+
     /// The live toggle. Turning off disables generation immediately (the ffx
     /// proxy configures passthrough; DLSS-G's mode-off edge lands via the
     /// funnel handshake on the very next present; XeSS-FG flips SetEnabled).
@@ -3964,6 +4106,7 @@ impl GpuContext {
             n.enabled = on;
             if !on {
                 n.primed.set(false);
+                n.pair.set(false);
             }
         }
         if let Some(g) = &mut self.fg_g {
@@ -4064,16 +4207,19 @@ impl GpuContext {
                     x.on.set(false);
                     x.failed.set(true);
                 }
-                Ok(s) if !x.logged.get() && n >= 240 => {
-                    x.logged.set(true);
-                    eprintln!(
-                        "fg: XeSS-FG last present: {} frame(s) presented, gen result {}, enabled {}",
-                        s.frames_presented,
-                        crate::xess_fg::result_name(s.frame_gen_result),
-                        s.is_frame_gen_enabled != 0
-                    );
+                Ok(s) => {
+                    x.mult.set(s.frames_presented.max(1));
+                    if !x.logged.get() && n >= 240 {
+                        x.logged.set(true);
+                        eprintln!(
+                            "fg: XeSS-FG last present: {} frame(s) presented, gen result {}, enabled {}",
+                            s.frames_presented,
+                            crate::xess_fg::result_name(s.frame_gen_result),
+                            s.is_frame_gen_enabled != 0
+                        );
+                    }
                 }
-                _ => {}
+                Err(_) => {}
             }
         }
         r
@@ -4191,6 +4337,9 @@ impl GpuContext {
     /// needed because nothing generates behind our back.
     fn ngxfg_tail(&mut self, slot: usize, fc: &dlss::FrameConstants) -> Result<()> {
         let show = self.ngxfg_dispatch(fc);
+        if let Some(n) = &self.fg_n {
+            n.pair.set(show);
+        }
         if show {
             self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_NGXFG, 1.0);
             self.d3d.present_mid(slot)?;
@@ -4302,17 +4451,20 @@ impl GpuContext {
                 // symptom — measured: status stays eOk while every generated
                 // frame is dropped). Second interval — the first poll has no
                 // baseline.
-                Ok(st) if !g.logged.get() && n >= 240 => {
-                    g.logged.set(true);
-                    eprintln!(
-                        "fg: DLSS-G present multiplier x{} {}",
-                        st.frames_presented,
-                        if st.frames_presented >= 2 {
-                            "— generated frames presenting"
-                        } else {
-                            "— generated frames NOT landing (see the HAGS note above if printed)"
-                        }
-                    );
+                Ok(st) if n >= 240 => {
+                    g.mult.set(st.frames_presented.max(1));
+                    if !g.logged.get() {
+                        g.logged.set(true);
+                        eprintln!(
+                            "fg: DLSS-G present multiplier x{} {}",
+                            st.frames_presented,
+                            if st.frames_presented >= 2 {
+                                "— generated frames presenting"
+                            } else {
+                                "— generated frames NOT landing (see the HAGS note above if printed)"
+                            }
+                        );
+                    }
                 }
                 _ => {}
             }
@@ -4546,7 +4698,7 @@ impl GpuContext {
         // insertion covers every present arm. `Passes::record` rebinds
         // everything, so the extra draw needs no state bookkeeping; the hud
         // PSO blends premultiplied-over and its PS reads only the
-        // scale/gamma_on lanes of the shared root-constant layout.
+        // scale/mode lanes of the shared root-constant layout.
         if self.hud.drawable() {
             self.passes.record(
                 &self.d3d.list,
