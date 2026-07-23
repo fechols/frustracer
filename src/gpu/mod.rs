@@ -676,13 +676,30 @@ impl GpuContext {
             let s = sl.as_ref().unwrap();
             match s.reflex_set_options(streamline_sys::REFLEX_MODE_LOW_LATENCY) {
                 Ok(()) => {
+                    // Enable BEFORE the first present: a mode toggle after
+                    // presents have begun restructures the live swapchain
+                    // into the degraded off-screen-copy path (§18 is why the
+                    // guide wants a swapchain recreate on toggles) — armed
+                    // from frame 0, the FG buffer topology is native.
+                    let o = streamline_sys::SlShimDlssgOptions {
+                        mode: streamline_sys::DLSSG_MODE_ON,
+                        num_frames_to_generate: 1,
+                        flags: 0,
+                    };
+                    let on = match s.dlssg_set_options(0, &o) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            eprintln!("fg: DLSS-G init enable failed ({e}) — will retry on the first frame");
+                            false
+                        }
+                    };
                     eprintln!(
                         "fg: DLSS-G live — Reflex low-latency armed, 1 generated frame per \
                          rendered frame"
                     );
                     Some(DlssgState {
                         enabled: true,
-                        on: std::cell::Cell::new(false),
+                        on: std::cell::Cell::new(on),
                         prepared: std::cell::Cell::new(false),
                         failed: std::cell::Cell::new(false),
                         poll: std::cell::Cell::new(0),

@@ -545,13 +545,23 @@ cargo run --release -- --fg           # FRAME GENERATION, DLSS family (W4 leg 2)
                                       # depth tagged, iFlip present mode, camera motion injected
                                       # — the multiplier stays x1 and PresentMon shows 1:1
                                       # presents: the dlfg layer engages (cloneFakeBuffers,
-                                      # flip metering 'good') but never inserts. ELIMINATED, do
-                                      # not re-test: vsync on AND off, static-scene (motion
-                                      # injected), high source fps (--spp 64), missing PCL
-                                      # plugin (loads + markers accepted), HAGS. Next
-                                      # instruments: eyes on screen / NVIDIA App overlay
-                                      # (shows FG state live), SL development DLLs + sl.imgui
-                                      # debug HUD, per-frame ETW. Gates: --check, --check-dlss,
+                                      # flip metering 'good') but never inserts (user-confirmed
+                                      # visually). ELIMINATED, do not re-test: vsync on AND off,
+                                      # static-scene (motion injected), high source fps
+                                      # (--spp 64), missing PCL plugin (loads + markers
+                                      # accepted), HAGS, enable-after-first-present (mode is now
+                                      # set at INIT, before any present — options land once,
+                                      # cloneFakeBuffers precedes the first Present), and the SL
+                                      # DEVELOPMENT DLLs at logLevel 2 show ZERO per-frame FG
+                                      # work after setup (NGX FrameGeneration v310.6.0 fully
+                                      # initialized, cubins loaded — then silence). The decline
+                                      # is inside closed NGX/driver code with no diagnostic
+                                      # surface; next would be per-frame ETW or NVIDIA devrel.
+                                      # PRAGMATIC FALLBACK if wanted: the ffx FI swapchain is
+                                      # vendor-neutral and PROVEN on this 4090 — a native
+                                      # swapchain + proxied-queue-only SL session could pair
+                                      # DLSS-RR denoising with AMD frame interpolation (not
+                                      # built; the quinlight-spirit hybrid). Gates: --check, --check-dlss,
                                       # --check-gpu (SL paths untouched when --no-fg: the
                                       # feature list only grows under --fg)
 cargo run --release -- --fsr --fsr-max-radiance 10  # Ray Regeneration tuning (FfxApiConfigureDenoiserKey,
