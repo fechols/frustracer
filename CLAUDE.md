@@ -564,6 +564,41 @@ cargo run --release -- --fg           # FRAME GENERATION, DLSS family (W4 leg 2)
                                       # built; the quinlight-spirit hybrid). Gates: --check, --check-dlss,
                                       # --check-gpu (SL paths untouched when --no-fg: the
                                       # feature list only grows under --fg)
+cargo run --release -- --fg --prefer-intel  # FRAME GENERATION, XeSS family (W4 leg 3 —
+                                      # VERIFIED GENERATING on the B70): an Intel XeSS session
+                                      # (the flagless Arc default) wraps its swapchain with the
+                                      # XeSS-FG proxy (src/xess_fg.rs — libxess_fg.dll +
+                                      # libxell.dll from the xess_path dir, the xess.rs
+                                      # fn-table loader idiom; xefgSwapChainD3D12InitFromSwap-
+                                      # Chain + GetSwapChainPtr at the same d3d12::SwapWrap
+                                      # hook the ffx family uses). XeLL is created, sleep-moded
+                                      # low-latency, and LINKED at wrap (a hard xefg
+                                      # requirement); the three XeSS present arms tag depth +
+                                      # MV (the XeSS trio planes, NPSR state) + row-major
+                                      # frame constants per presentId (+1 per prepared frame),
+                                      # fire all six XeLL markers (sleep + sim/renderSubmit at
+                                      # prepare, present pair around Execute+Present), and the
+                                      # funnel handshake disables generation on any unprepared
+                                      # present (READ-not-consume, the DLSS-G shape). THE
+                                      # OWNERSHIP TRAP (measured as a silent native crash):
+                                      # unlike the ffx wrap, which CONSUMES the app swapchain,
+                                      # the xefg proxy DELEGATES to it — the app-side ref must
+                                      # stay alive until xefgSwapChainDestroy (XefgSwapchain
+                                      # holds it; released LAST in Drop). XeSS-FG REJECTS the
+                                      # scRGB fp16 swapchain (InitFromSwapChain INVALID_
+                                      # ARGUMENT — measured; no HDR flag exists in its API), so
+                                      # an XeFG session auto-forces the SDR 8-bit path like
+                                      # DLSS-G. Verified on the B70 (SDK 1.2.2 + XeLL 1.2.1):
+                                      # the library's own GetLastPresentStatus reports 2
+                                      # frames presented per present / gen result SUCCESS, and
+                                      # PresentMon shows ~174 presents/s over ~87 rendered.
+                                      # Composes with --cpu (the CPU-fed XeSS arm carries the
+                                      # prepare too — the biggest visual win, low source fps).
+                                      # A status poll auto-disables on a negative gen result.
+                                      # Gates: --check, --check-xess, --check-gpu
+                                      # --prefer-intel. Touch xess_fg.rs / the xefg_* helpers /
+                                      # the XeSS arms -> run those three + the interactive B70
+                                      # smoke (fg lines + last-present status x2)
 cargo run --release -- --fsr --fsr-max-radiance 10  # Ray Regeneration tuning (FfxApiConfigureDenoiserKey,
                                       # applied at denoiser creation): --fsr-max-radiance (the firefly
                                       # clamp — the highest-value knob for a 1-spp path tracer),

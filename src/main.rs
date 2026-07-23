@@ -80,6 +80,7 @@ mod world;
 // The loader half is Windows-only (LoadLibrary); the FFI structs, depth
 // encoding, and the dynamic-res controller are pure and feed --check-xess.
 mod xess;
+mod xess_fg;
 
 use camera::Camera;
 use glam::Vec3A;
@@ -13011,26 +13012,27 @@ fn session(
                     clouds: crate::clouds::Clouds::live(scene.diag, cloud_time as f32),
                     fireflies: crate::fireflies::Fireflies::live(scene, cloud_time as f32),
                 };
+                // The prev matrices are recomputed from the stored
+                // camera (pure math, fixed res: identical to last
+                // frame's). Hoisted above the arm split: the XeSS arm
+                // needs fc too now (the XeSS-FG prepare's camera data).
+                let mats = dlss::cam_matrices(&cam, grw, grh, dlss_near, dlss_far);
+                let prev_mats = gpu_prev_cam
+                    .map(|c| dlss::cam_matrices(&c, grw, grh, dlss_near, dlss_far));
+                let fc = dlss::frame_constants(
+                    &cam,
+                    &mats,
+                    prev_mats.as_ref(),
+                    jit,
+                    gpu_reset,
+                    dlss_near,
+                    dlss_far,
+                    grw,
+                    grh,
+                );
                 let presented = if gpu_up == GpuUp::Xess {
-                    gpu.present_trace_xess(&p, hybrid, jit, gpu_reset, gpu_nppd_on)
+                    gpu.present_trace_xess(&p, hybrid, jit, gpu_reset, gpu_nppd_on, &fc, last_ms as f32)
                 } else {
-                    // The prev matrices are recomputed from the stored
-                    // camera (pure math, fixed res: identical to last
-                    // frame's).
-                    let mats = dlss::cam_matrices(&cam, grw, grh, dlss_near, dlss_far);
-                    let prev_mats = gpu_prev_cam
-                        .map(|c| dlss::cam_matrices(&c, grw, grh, dlss_near, dlss_far));
-                    let fc = dlss::frame_constants(
-                        &cam,
-                        &mats,
-                        prev_mats.as_ref(),
-                        jit,
-                        gpu_reset,
-                        dlss_near,
-                        dlss_far,
-                        grw,
-                        grh,
-                    );
                     match gpu_up {
                         // frameTimeDelta is the PREVIOUS frame's render time
                         // (the DXR arm's contract); the desc clamps it into
@@ -13821,26 +13823,27 @@ fn session(
                     clouds: crate::clouds::Clouds::live(scene.diag, cloud_time as f32),
                     fireflies: crate::fireflies::Fireflies::live(scene, cloud_time as f32),
                 };
+                // The prev matrices are recomputed from the stored
+                // camera (pure math, fixed res: identical to last
+                // frame's). Hoisted above the arm split: the XeSS arm
+                // needs fc too now (the XeSS-FG prepare's camera data).
+                let mats = dlss::cam_matrices(&cam, dxw, dxh, dlss_near, dlss_far);
+                let prev_mats =
+                    dxr_prev_cam.map(|c| dlss::cam_matrices(&c, dxw, dxh, dlss_near, dlss_far));
+                let fc = dlss::frame_constants(
+                    &cam,
+                    &mats,
+                    prev_mats.as_ref(),
+                    jit,
+                    dxr_reset,
+                    dlss_near,
+                    dlss_far,
+                    dxw,
+                    dxh,
+                );
                 let presented = if dxr_up == GpuUp::Xess {
-                    gpu.present_dxr_xess(&p, jit, dxr_reset)
+                    gpu.present_dxr_xess(&p, jit, dxr_reset, &fc, last_ms as f32)
                 } else {
-                    // The prev matrices are recomputed from the stored
-                    // camera (pure math, fixed res: identical to last
-                    // frame's).
-                    let mats = dlss::cam_matrices(&cam, dxw, dxh, dlss_near, dlss_far);
-                    let prev_mats =
-                        dxr_prev_cam.map(|c| dlss::cam_matrices(&c, dxw, dxh, dlss_near, dlss_far));
-                    let fc = dlss::frame_constants(
-                        &cam,
-                        &mats,
-                        prev_mats.as_ref(),
-                        jit,
-                        dxr_reset,
-                        dlss_near,
-                        dlss_far,
-                        dxw,
-                        dxh,
-                    );
                     match dxr_up {
                         GpuUp::Fsr3 => gpu.present_dxr_fsr3(&p, &fc, last_ms as f32),
                         // Every wired engine, then the fuse.
@@ -14679,7 +14682,27 @@ fn session(
                     }
                     None => gpu::xr::ColorSrc::Accum(&accum[..n]),
                 };
-                match gpu.present_xess(&color, xg, rw, rh, jit, xess_reset, dlss_near, dlss_far) {
+                // Frame constants for the XeSS-FG prepare (camera + jitter
+                // at this frame's dynamic render res; pure math, unused when
+                // FG is not wired).
+                let xmats = dlss::cam_matrices(&cam, rw, rh, dlss_near, dlss_far);
+                let xprev_mats =
+                    xess_prev.map(|c| dlss::cam_matrices(&c, rw, rh, dlss_near, dlss_far));
+                let xfc = dlss::frame_constants(
+                    &cam,
+                    &xmats,
+                    xprev_mats.as_ref(),
+                    jit,
+                    xess_reset,
+                    dlss_near,
+                    dlss_far,
+                    rw,
+                    rh,
+                );
+                match gpu.present_xess(
+                    &color, xg, rw, rh, jit, xess_reset, dlss_near, dlss_far, &xfc,
+                    last_ms as f32,
+                ) {
                     Ok(()) => {
                         xess_prev = Some(cam);
                         xess_reset = false;

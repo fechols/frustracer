@@ -227,6 +227,25 @@ struct FgState {
     version: (u64, String),
 }
 
+/// XeSS-FG frame generation (Intel XeSS sessions — the third `--fg` family).
+/// The xefg swapchain proxy does interpolation + pacing at Present (the ffx
+/// FI shape); XeLL is created and linked inside the wrap (a hard xefg
+/// requirement). Same funnel handshake as DLSS-G: the funnel READS
+/// `prepared` (an unprepared present disables generation), `xefg_end_frame`
+/// consumes it after the XeLL present markers.
+struct XefgState {
+    sc: crate::xess_fg::XefgSwapchain,
+    enabled: bool,
+    on: std::cell::Cell<bool>,
+    prepared: std::cell::Cell<bool>,
+    failed: std::cell::Cell<bool>,
+    /// The xefg presentId — u32, +1 per prepared frame (tags, constants,
+    /// XeLL sleep/markers all key on it).
+    frame_id: std::cell::Cell<u32>,
+    poll: std::cell::Cell<u32>,
+    logged: std::cell::Cell<bool>,
+}
+
 /// DLSS-G frame generation (DLSS sessions — the SL-family counterpart of
 /// `FgState`; exactly one family per session). The SL proxy swapchain does
 /// the interpolation at Present; this side owns the mode transitions and the
@@ -336,6 +355,10 @@ pub struct GpuContext {
     /// constraint — it holds no COM refs, and `sl` (declared last) outlives
     /// it by the existing field order.
     fg_g: Option<DlssgState>,
+    /// XeSS-FG frame generation (Intel XeSS sessions; see XefgState).
+    /// Declared AFTER `d3d` like `fg`: destroying the xefg context tears the
+    /// FI proxy down, so d3d's proxy refs must release first.
+    fg_x: Option<XefgState>,
     /// Kept alive for the app lifetime: the hooked CreateCommandQueue /
     /// CreateSwapChain entry points live on these (Frame Gen will need them
     /// again), and dropping them to refcount 0 destroys the SL wrappers.
@@ -479,10 +502,31 @@ impl GpuContext {
                 }
             }
         }
-        let want_hdr = opts.hdr && !fg_dlssg;
+        // Frame generation, Intel family (the XeSS-FG swapchain, XeLL
+        // linked): taken when the chain is headed for the XeSS level on an
+        // Intel adapter — the family follows the upscaler. The wrap happens
+        // inside D3d::with_queue like the ffx one; a failed wrap/init is a
+        // loud line + a normal session.
+        let try_xefg = opts.fg
+            && sl.is_none()
+            && !opts.quin
+            && pick.vendor == adapter::Vendor::Intel
+            && opts.chain.xess;
+
+        // Both DLSS-G and XeSS-FG reject the scRGB fp16 swapchain (DLSS-G by
+        // documented policy, XeSS-FG measured: InitFromSwapChain returns
+        // INVALID_ARGUMENT on R16G16B16A16_FLOAT) — those FG sessions present
+        // SDR 8-bit. The ffx family supports scRGB and keeps it.
+        let want_hdr = opts.hdr && !fg_dlssg && !try_xefg;
         if fg_dlssg && opts.hdr {
             eprintln!(
                 "fg: DLSS-G does not support the scRGB fp16 swapchain — presenting SDR 8-bit \
+                 (--no-fg restores HDR)"
+            );
+        }
+        if try_xefg && opts.hdr {
+            eprintln!(
+                "fg: XeSS-FG rejects the scRGB fp16 swapchain — presenting SDR 8-bit \
                  (--no-fg restores HDR)"
             );
         }
@@ -511,7 +555,7 @@ impl GpuContext {
         // version actually enumerates; every failure is a loud line + a
         // normal session (the chain-fallback shape).
         let mut fg_versions: Vec<ffx::Version> = Vec::new();
-        if opts.fg && sl.is_none() && !opts.quin {
+        if opts.fg && sl.is_none() && !opts.quin && !try_xefg {
             match ffx::fg_load(&opts.ffx_dir, &opts.fg_dir) {
                 Ok(()) => match ffx::fg_versions(&device) {
                     Ok(v) if !v.is_empty() => {
@@ -536,6 +580,7 @@ impl GpuContext {
         let mut proxy_device: Option<ID3D12Device> = None;
         let mut proxy_factory: Option<IDXGIFactory6> = None;
         let mut fg_sc: Option<ffx::FgSwapchain> = None;
+        let mut fg_xefg: Option<crate::xess_fg::XefgSwapchain> = None;
         let d3d = if let Some(s) = &sl {
             s.set_d3d_device(&device)?;
             let pdev: ID3D12Device = s.upgrade(&device)?;
@@ -558,7 +603,41 @@ impl GpuContext {
             d3d
         } else {
             let queue = d3d12::create_queue(&device)?;
-            if fg_versions.is_empty() {
+            if try_xefg {
+                // The XeFG wrap needs the DEVICE at hook time (context
+                // creation); `device` is alive inside with_queue while the
+                // hook runs, so the raw pointer captured here stays valid.
+                let dev_raw = device.as_raw();
+                let xess_dir = opts.xess_dir.clone();
+                let mut hook = |q: &ID3D12CommandQueue,
+                                sc: windows::Win32::Graphics::Dxgi::IDXGISwapChain3|
+                 -> std::result::Result<
+                    windows::Win32::Graphics::Dxgi::IDXGISwapChain3,
+                    (windows::Win32::Graphics::Dxgi::IDXGISwapChain3, String),
+                > {
+                    let raw = sc.into_raw();
+                    match crate::xess_fg::XefgSwapchain::wrap(&xess_dir, dev_raw, q.as_raw(), raw)
+                    {
+                        Ok((ctx, proxy)) => {
+                            eprintln!("fg: swapchain wrapped by the XeSS-FG proxy (XeLL linked)");
+                            fg_xefg = Some(ctx);
+                            Ok(unsafe {
+                                windows::Win32::Graphics::Dxgi::IDXGISwapChain3::from_raw(proxy)
+                            })
+                        }
+                        Err(e) => Err((
+                            unsafe {
+                                windows::Win32::Graphics::Dxgi::IDXGISwapChain3::from_raw(raw)
+                            },
+                            e,
+                        )),
+                    }
+                };
+                D3d::with_queue(
+                    &factory, device, queue, hwnd, w, h, opts.vsync, want_hdr,
+                    Some(&mut hook),
+                )?
+            } else if fg_versions.is_empty() {
                 D3d::with_queue(&factory, device, queue, hwnd, w, h, opts.vsync, want_hdr, None)?
             } else {
                 let mut hook = |q: &ID3D12CommandQueue,
@@ -782,6 +861,35 @@ impl GpuContext {
             }
         });
 
+        // XeSS-FG, part 2: only the XeSS arms carry the prepare, so the state
+        // arms iff the XeSS level actually wired (else the proxy presents
+        // passthrough — the leg-1 shape). Init-time enable, the DLSS-G
+        // lesson: the funnel disables it on any unprepared present.
+        let fg_x = fg_xefg.map(|sc| {
+            let wired_xess = xess_state.is_some();
+            if wired_xess {
+                sc.set_enabled(true);
+                eprintln!(
+                    "fg: XeSS frame generation live — 1 generated frame per rendered frame"
+                );
+            } else {
+                sc.set_enabled(false);
+                eprintln!(
+                    "fg: XeSS level did not wire — XeSS-FG proxy presents passthrough"
+                );
+            }
+            XefgState {
+                sc,
+                enabled: wired_xess,
+                on: std::cell::Cell::new(wired_xess),
+                prepared: std::cell::Cell::new(false),
+                failed: std::cell::Cell::new(!wired_xess),
+                frame_id: std::cell::Cell::new(0),
+                poll: std::cell::Cell::new(0),
+                logged: std::cell::Cell::new(false),
+            }
+        });
+
         Ok(Self {
             sl,
             _proxy_device: proxy_device,
@@ -805,6 +913,7 @@ impl GpuContext {
             nppd_state_valid: false,
             fg: fg_state,
             fg_g,
+            fg_x,
             adapter_name: pick.name,
             adapter_vendor: pick.vendor,
             tone,
@@ -1051,6 +1160,16 @@ impl GpuContext {
             fg.prepared.set(false);
             fg.ctx = None;
         }
+        // XeSS-FG: disable so no interpolation is pending across the
+        // ResizeBuffers (which the xefg proxy forwards); re-enabled below if
+        // the XeSS level comes back up.
+        if let Some(x) = &self.fg_x {
+            if x.on.get() {
+                x.sc.set_enabled(false);
+                x.on.set(false);
+            }
+            x.prepared.set(false);
+        }
         // Everything below drops live GPU resources; drain first (the
         // GpuContext::drop discipline — xess/ffx destroy-context require
         // completed command lists, ResizeBuffers requires zero outstanding
@@ -1182,6 +1301,14 @@ impl GpuContext {
             }
             // Rr rebuilds through the sl block above; Plain has nothing.
             WiredUpscaler::Rr | WiredUpscaler::Plain => {}
+        }
+        // XeSS-FG re-enable when the XeSS level came back up (the swapchain
+        // context itself survived the ResizeBuffers).
+        if let Some(x) = &self.fg_x {
+            if self.xess.is_some() && x.enabled && !x.failed.get() {
+                x.sc.set_enabled(true);
+                x.on.set(true);
+            }
         }
         // Frame generation, rebuilt at the new display size (the provider
         // pick was made at boot and does not move — `version` survives on the
@@ -1776,6 +1903,8 @@ impl GpuContext {
         p: &trace::FrameParams,
         jitter: (f32, f32),
         reset: bool,
+        fc: &dlss::FrameConstants,
+        frame_ms: f32,
     ) -> Result<()> {
         crate::zone!("present-dxr-xess");
         if self.dxr.is_none() || self.xess.is_none() {
@@ -1844,10 +1973,11 @@ impl GpuContext {
                 )]);
             }
         }
+        self.xefg_prepare(fc, frame_ms);
         // The tonemap pass re-binds root sig/PSO/heaps/viewport from scratch,
         // restoring whatever list state the XeSS dispatch left behind.
         self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_XESS, 1.0);
-        self.d3d.end_frame(slot)
+        self.xefg_end_frame(slot)
     }
 
     /// FSR 3.1 fed by the DXR pipeline: DispatchRays -> feed (pack -> the 3
@@ -1960,6 +2090,8 @@ impl GpuContext {
         jitter: (f32, f32),
         reset: bool,
         nppd: bool,
+        fc: &dlss::FrameConstants,
+        frame_ms: f32,
     ) -> Result<()> {
         crate::zone!("present-trace-xess");
         if self.trace.is_none() || self.xess.is_none() {
@@ -2008,10 +2140,11 @@ impl GpuContext {
                 return Err(e);
             }
         }
+        self.xefg_prepare(fc, frame_ms);
         // The tonemap pass re-binds root sig/PSO/heaps/viewport from scratch,
         // restoring whatever list state the XeSS dispatch left behind.
         self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_XESS, 1.0);
-        self.d3d.end_frame(slot)
+        self.xefg_end_frame(slot)
     }
 
     /// Record EVERY wired engine's upscale into its own output texture, then the
@@ -3192,6 +3325,7 @@ impl GpuContext {
     /// window-sized. `jitter` is the renderer's sample offset; the sign
     /// reported to XeSS is settled in xess::JITTER_SIGN, nowhere else.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn present_xess(
         &mut self,
         color: &xr::ColorSrc,
@@ -3202,6 +3336,8 @@ impl GpuContext {
         reset: bool,
         near: f32,
         far: f32,
+        fc: &dlss::FrameConstants,
+        frame_ms: f32,
     ) -> Result<()> {
         crate::zone!("present-xess");
         let slot = self.record_xess_dispatch(color, g, rw, rh, jitter, reset, near, far)?;
@@ -3213,10 +3349,11 @@ impl GpuContext {
                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
             )]);
         }
+        self.xefg_prepare(fc, frame_ms);
         // The tonemap pass re-binds root sig/PSO/heaps/viewport from scratch,
         // restoring whatever list state the XeSS dispatch left behind.
         self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_XESS, 1.0);
-        self.d3d.end_frame(slot)
+        self.xefg_end_frame(slot)
     }
 
     /// XeSS-SR, post-upscale-denoise flavor: same dispatch, but instead of
@@ -3548,9 +3685,11 @@ impl GpuContext {
     // ---- frame generation (both families' per-frame protocols) ----
 
     /// True when a frame-generation family is wired: the ffx FI proxy with a
-    /// live FG effect context, or DLSS-G in an SL session.
+    /// live FG effect context, DLSS-G in an SL session, or the XeSS-FG proxy.
     pub fn fg_wired(&self) -> bool {
-        self.fg.as_ref().is_some_and(|f| f.ctx.is_some()) || self.fg_g.is_some()
+        self.fg.as_ref().is_some_and(|f| f.ctx.is_some())
+            || self.fg_g.is_some()
+            || self.fg_x.as_ref().is_some_and(|x| !x.failed.get())
     }
 
     /// Whether generated frames are currently being inserted (the toggle
@@ -3558,6 +3697,7 @@ impl GpuContext {
     pub fn fg_enabled(&self) -> bool {
         self.fg.as_ref().is_some_and(|f| f.ctx.is_some() && f.enabled)
             || self.fg_g.as_ref().is_some_and(|g| g.enabled && !g.failed.get())
+            || self.fg_x.as_ref().is_some_and(|x| x.enabled && !x.failed.get())
     }
 
     /// The wired FG family's display name (the boot line / title bar).
@@ -3565,15 +3705,25 @@ impl GpuContext {
         if self.fg_g.is_some() {
             return Some("DLSS-G");
         }
+        if self.fg_x.as_ref().is_some_and(|x| !x.failed.get()) {
+            return Some("XeSS-FG");
+        }
         self.fg.as_ref().filter(|f| f.ctx.is_some()).map(|f| f.version.1.as_str())
     }
 
     /// The live toggle. Turning off disables generation immediately (the ffx
     /// proxy configures passthrough; DLSS-G's mode-off edge lands via the
-    /// funnel handshake on the very next present).
+    /// funnel handshake on the very next present; XeSS-FG flips SetEnabled).
     pub fn set_fg_enabled(&mut self, on: bool) {
         if let Some(g) = &mut self.fg_g {
             g.enabled = on;
+        }
+        if let Some(x) = &mut self.fg_x {
+            x.enabled = on;
+            if !on && x.on.get() {
+                x.sc.set_enabled(false);
+                x.on.set(false);
+            }
         }
         if let Some(fg) = &mut self.fg {
             fg.enabled = on;
@@ -3581,6 +3731,101 @@ impl GpuContext {
                 self.fg_disable_now();
             }
         }
+    }
+
+    /// XeSS-FG per-frame work — call in the XeSS arms AFTER the feed/upload
+    /// (planes final, resting NON_PIXEL_SHADER_RESOURCE), BEFORE the funnel:
+    /// XeLL sleep + first markers, the depth/MV tags and frame constants for
+    /// this presentId, the presentId itself, and the lazy re-enable.
+    fn xefg_prepare(&self, fc: &dlss::FrameConstants, frame_ms: f32) {
+        let (Some(x), Some(xs)) = (&self.fg_x, &self.xess) else { return };
+        if !x.enabled || x.failed.get() {
+            return;
+        }
+        let id = x.frame_id.get().wrapping_add(1);
+        x.frame_id.set(id);
+        x.sc.sleep(id);
+        x.sc.marker(id, crate::xess_fg::XELL_SIMULATION_START);
+        x.sc.marker(id, crate::xess_fg::XELL_SIMULATION_END);
+        x.sc.marker(id, crate::xess_fg::XELL_RENDERSUBMIT_START);
+        let npsr = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0 as u32;
+        let (_c, m, d) = xs.res.input_ptrs();
+        let (rw, rh) = (fc.rw as u32, fc.rh as u32);
+        let r = x
+            .sc
+            .tag_resource(id, crate::xess_fg::RES_DEPTH, d, npsr, rw, rh)
+            .and_then(|()| {
+                x.sc.tag_resource(id, crate::xess_fg::RES_MOTION_VECTOR, m, npsr, rw, rh)
+            })
+            .and_then(|()| {
+                // Row-major matrices — the SL transpose convention, NOT the
+                // ffx memcpy (the header says row-major explicitly).
+                x.sc.tag_constants(
+                    id,
+                    row_major(&fc.world_to_view),
+                    row_major(&fc.view_to_clip),
+                    fc.jitter,
+                    fc.reset,
+                    frame_ms,
+                )
+            });
+        if let Err(e) = r {
+            eprintln!("fg: XeSS-FG {e} — frame generation off");
+            x.sc.set_enabled(false);
+            x.on.set(false);
+            x.failed.set(true);
+            return;
+        }
+        x.sc.set_present_id(id);
+        if !x.on.get() {
+            x.sc.set_enabled(true);
+            x.on.set(true);
+        }
+        x.prepared.set(true);
+    }
+
+    /// The XeSS arms' end_frame: XeLL render-submit-end + present markers
+    /// around Execute+Present, then the periodic status poll (a negative
+    /// frameGenResult = sticky off; the first clean second-interval poll logs
+    /// framesPresented — 2 per present = generating).
+    fn xefg_end_frame(&mut self, slot: usize) -> Result<()> {
+        let bracket = self.fg_x.as_ref().is_some_and(|x| x.prepared.replace(false));
+        if !bracket {
+            return self.d3d.end_frame(slot);
+        }
+        let x = self.fg_x.as_ref().unwrap();
+        let id = x.frame_id.get();
+        x.sc.marker(id, crate::xess_fg::XELL_RENDERSUBMIT_END);
+        x.sc.marker(id, crate::xess_fg::XELL_PRESENT_START);
+        let r = self.d3d.end_frame(slot);
+        let x = self.fg_x.as_ref().unwrap();
+        x.sc.marker(id, crate::xess_fg::XELL_PRESENT_END);
+        let n = x.poll.get() + 1;
+        x.poll.set(n);
+        if n % 120 == 0 {
+            match x.sc.last_status() {
+                Ok(s) if s.frame_gen_result < 0 => {
+                    eprintln!(
+                        "fg: XeSS-FG present status {} — frame generation off",
+                        crate::xess_fg::result_name(s.frame_gen_result)
+                    );
+                    x.sc.set_enabled(false);
+                    x.on.set(false);
+                    x.failed.set(true);
+                }
+                Ok(s) if !x.logged.get() && n >= 240 => {
+                    x.logged.set(true);
+                    eprintln!(
+                        "fg: XeSS-FG last present: {} frame(s) presented, gen result {}, enabled {}",
+                        s.frames_presented,
+                        crate::xess_fg::result_name(s.frame_gen_result),
+                        s.is_frame_gen_enabled != 0
+                    );
+                }
+                _ => {}
+            }
+        }
+        r
     }
 
     /// DLSS-G per-frame bracket, first half — the top of an RR arm: Reflex
@@ -3855,6 +4100,14 @@ impl GpuContext {
                 }
             }
         }
+        // XeSS-FG's half — same READ-not-consume shape (xefg_end_frame
+        // consumes after the XeLL present markers).
+        if let Some(x) = &self.fg_x {
+            if x.on.get() && !x.prepared.get() {
+                x.sc.set_enabled(false);
+                x.on.set(false);
+            }
+        }
         // HUD overlay dirty rects: consume whatever the frame staged. Recorded
         // BEFORE the backbuffer transition (any point in the list before the
         // draws is fine — begin_frame's fence wait already made this slot's
@@ -3993,7 +4246,7 @@ impl Drop for GpuContext {
         // lists complete and a live device: drain the queue, then drop the
         // contexts here — before the field-order teardown releases the
         // swapchain/device.
-        if self.xess.is_some() || self.fsr.is_some() || self.fg.is_some() {
+        if self.xess.is_some() || self.fsr.is_some() || self.fg.is_some() || self.fg_x.is_some() {
             let _ = self.d3d.wait_idle();
             self.xess = None;
             self.fsr = None;
