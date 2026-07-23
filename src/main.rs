@@ -1,4 +1,9 @@
-﻿// BC7 block compression of OPAQUE scene textures (--bc7) — GPU upload only;
+// Audio ambience: per-island biome loops (world mode) + a speed-scaled
+// procedural wind. The device half (SDL3 stream + lewton decode) is
+// Windows-only inside the module; the mixer/resampler/gain math is pure and
+// feeds --check. Display-only — no render-path or rng-stream contact.
+mod audio;
+// BC7 block compression of OPAQUE scene textures (--bc7) — GPU upload only;
 // the CPU renderer keeps sampling the exact RGBA8 texels. Alpha-masked cutout
 // textures are deliberately excluded (see the module note).
 mod bc7;
@@ -138,6 +143,10 @@ pub struct Opts {
     pub bc7: Option<bc7::Quality>,
     /// Directory holding sl.interposer.dll + plugins (M3+).
     pub sl_path: String,
+    /// Audio ambience (biome loops + speed-scaled wind; default on —
+    /// interactive sessions only, headless paths never initialize audio).
+    /// --no-audio is the kill lever: the subsystem is never constructed.
+    pub audio: bool,
     /// Start with OIDN denoising on (N toggles at runtime; default off —
     /// DLSS-RR stays the primary denoiser).
     pub oidn: bool,
@@ -440,6 +449,7 @@ fn main() {
         sl_path: std::env::var("FRUSTRACER_SL_PATH").unwrap_or_else(|_| {
             concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\streamline-sdk\bin\x64").to_string()
         }),
+        audio: true,
         oidn: false,
         oidn_path: std::env::var("FRUSTRACER_OIDN_PATH").unwrap_or_else(|_| {
             concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\oidn.x64.windows\bin").to_string()
@@ -589,6 +599,8 @@ fn main() {
             }
             "--oidn" => opts.oidn = true,
             "--no-oidn" => opts.oidn = false,
+            "--no-audio" => opts.audio = false,
+            "--audio" => opts.audio = true,
             "--oidn-no-temporal" => opts.oidn_temporal = false,
             "--check-nppd" => check_nppd = true,
             "--nppd-dump" => {
@@ -1719,11 +1731,33 @@ fn main() {
             .collect(),
         _ => Vec::new(),
     };
+    // Ambience cues, the attractors' audio twin: world mode gets one
+    // positioned cue per island (crossfaded by proximity in audio::update);
+    // a directly-loaded curated scene gets its own loop at steady gain; an
+    // unmatched scene is wind-only. --no-audio kills the whole device in
+    // run_window, so the cues are built unconditionally here.
+    let cues: audio::Cues = match (&world_info, &obj) {
+        (Some(w), _) => audio::Cues::World(
+            w.islands
+                .iter()
+                .map(|i| audio::Cue {
+                    name: i.name.clone(),
+                    pos: i.center,
+                    radius: i.radius.max(1.0),
+                })
+                .collect(),
+        ),
+        (None, Some(p)) => match audio::match_scene_path(&scene::resolve_scene_path(p)) {
+            Some(name) => audio::Cues::Steady(name),
+            None => audio::Cues::None,
+        },
+        _ => audio::Cues::None,
+    };
     #[cfg(windows)]
-    run_window(&mut scene, &mut bvh, &opts, cam0, attractors, file_settings);
+    run_window(&mut scene, &mut bvh, &opts, cam0, attractors, file_settings, cues);
     #[cfg(not(windows))]
     {
-        let _ = (&opts, cam0, attractors, file_settings);
+        let _ = (&opts, cam0, attractors, file_settings, cues);
         eprintln!("the interactive window requires Windows (D3D12 + DLSS); use --check / --check-dlss");
         std::process::exit(2);
     }
@@ -8875,6 +8909,20 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
     };
 
+    // Audio self-test — pure math only (resampler, loop seam, proximity and
+    // wind gain anchors, mixer must-fires, the curated-island loop mapping);
+    // no device, no DLL — the audio DEVICE never exists on a headless path.
+    let audio_ok = match audio::self_test() {
+        Ok(()) => {
+            eprintln!("audio self-test: OK");
+            true
+        }
+        Err(e) => {
+            eprintln!("audio self-test: FAIL — {e}");
+            false
+        }
+    };
+
     let rep = render::verify(scene, bvh, &cam, q, rw, rh, &stats, None, &[], None);
     eprintln!(
         "verify full-depth ({} px): false-sky {} | tmin-overshoot {} | hybrid-extra {} | max rel t err {:.2e}",
@@ -10819,6 +10867,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         ("gltf", gltf_ok),
         ("bc7", bc7_ok),
         ("world", world_ok),
+        ("audio", audio_ok),
         ("quin", quin_ok),
         ("hemi-ao", hemi_ok),
         ("hemi-gi", gi_ok),
@@ -11127,6 +11176,7 @@ fn run_window(
     cam0: Camera,
     attractors: Vec<flycam::TodAttractor>,
     file_settings: settings::Settings,
+    cues: audio::Cues,
 ) {
     // SDL3 is per-monitor-v2 DPI aware on Windows unconditionally (SDL2's
     // SDL_WINDOWS_DPI_AWARENESS hint is gone), so W×H stays W×H physical
@@ -11230,6 +11280,13 @@ fn run_window(
         scene.diag,
         attractors,
     );
+    // Audio lives here beside the FlyCam for the same reason: a resize
+    // re-enters session(), and the loops must keep playing through the
+    // rebuild. The wind reads the integrator's 500 Hz speed atomic, so it
+    // stays responsive while the main thread is blocked in a trace (and
+    // decays to silence across a pause, since the integrator parks it at 0).
+    let audio_sys =
+        if opts.audio { audio::AudioSys::new(&sdl, cues, fly.speed_handle(), scene.diag) } else { None };
 
     // A window resize exits the session and re-enters it at the new client
     // size: the session init code IS the rebuild path (every buffer,
@@ -11242,8 +11299,8 @@ fn run_window(
     let mut persist: Option<Persist> = None;
     loop {
         match session(
-            scene, bvh, opts, &fly, &mut window, &mut inp, &mut gpu, &mut hud, &mut cfg,
-            &mut persist, w, h,
+            scene, bvh, opts, &fly, audio_sys.as_ref(), &mut window, &mut inp, &mut gpu,
+            &mut hud, &mut cfg, &mut persist, w, h,
         ) {
             SessionEnd::Quit => break,
             SessionEnd::Resize(nw, nh) => {
@@ -11283,6 +11340,7 @@ fn session(
     bvh: &mut bvh::Bvh,
     opts: &Opts,
     fly: &flycam::FlyCam,
+    audio_sys: Option<&audio::AudioSys>,
     window: &mut sdl3::video::Window,
     inp: &mut input::Input,
     gpu: &mut gpu::GpuContext,
@@ -12293,6 +12351,11 @@ fn session(
         // taps shorter than a frame land as exactly one moved frame).
         let snap = fly.snapshot();
         cam = snap.cam;
+        // Ambience crossfade from the frame's ONE pose snapshot (N atomic
+        // stores; the mixer smooths). Wind rides the flycam atomic directly.
+        if let Some(a) = audio_sys {
+            a.update(cam.pos);
+        }
         let moved = cam != prev_snap;
         prev_snap = cam;
 

@@ -1,0 +1,37 @@
+Ambience loops for the world islands (src/audio.rs::AMBIENCE).
+
+All source recordings are licensed CC0 1.0 Universal (public domain
+dedication — https://creativecommons.org/publicdomain/zero/1.0/), verified
+per sound on its freesound.org page at download time (2026-07-22).
+Attribution is not required by CC0; it is given anyway, with thanks.
+helmet.ogg is the exception: fully synthesized in-repo (no source
+recording), dedicated CC0 the same way.
+
+Processing applied here (identical per file, see the scene-acquisition notes
+in CLAUDE.md and src/audio.rs): trimmed to a ~48 s bed, downmixed to mono,
+resampled to 48 kHz, re-encoded Ogg Vorbis q3 with ffmpeg. Loudness is
+normalized and the loop seam crossfaded at LOAD time by the renderer
+(audio.rs), not baked into the files.
+
+file            source sound (freesound.org)                         author
+--------------  ---------------------------------------------------  ----------
+powerplant.ogg  "Factory Atmo" (id 580455)                           szegvari
+                https://freesound.org/people/szegvari/sounds/580455/
+sponza.ogg      "140809_Neuenburg_Courtyd_Morning_R.wav" (id 240582) blaukreuz
+                https://freesound.org/people/blaukreuz/sounds/240582/
+rungholt.ogg    "Birdsong with Blackcap, Nightingale, Robin,         hoshisato
+                Chaffinch and Woodland Birds Ambience" (id 853112)
+                https://freesound.org/people/hoshisato/sounds/853112/
+helmet.ogg      synthesized by tools/helmet-ambience/gen.py          (this repo)
+                (deterministic DSP — reactor drone, sub thrum,
+                life-support air, telemetry bleeps, sonar ping;
+                wav byte-reproducible, loop-seamless by construction)
+san-miguel.ogg  "garden afternoon light birds crickets fountain      kyles
+                water sweet.flac" (id 637582)
+                https://freesound.org/people/kyles/sounds/637582/
+bistro.ogg      "Crowd / Chatter / 30 people / Exterior /            tferrino
+                Restaurant Terrace" (id 640630)
+                https://freesound.org/people/tferrino/sounds/640630/
+vokselia.ogg    "Southern Summer Evening Ambience with Crickets 5"   RyanKingArt
+                (id 746366)
+                https://freesound.org/people/RyanKingArt/sounds/746366/
