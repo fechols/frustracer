@@ -444,19 +444,30 @@ int32_t ffxshim_create_fg(void* device, uint32_t display_w, uint32_t display_h,
     backend.device      = static_cast<ID3D12Device*>(device);
     desc.header.pNext   = &backend.header;
 
-    // Version chaining — the upscaler's mutual-exclusion rule verbatim: an
-    // explicit override IS an exact provider choice; the API pin desc names
-    // the 4.x version this TU compiled against, which a 3.1 provider may
-    // reject.
+    // Version chaining. NOT the upscaler's mutual-exclusion rule, which this
+    // used to copy verbatim -- FG's two version descs answer DIFFERENT
+    // questions and both belong on the chain:
+    //   ffxCreateContextDescFrameGenerationVersion is the API level this TU
+    //     compiled against, and the runtime REQUIRES it to expose the current
+    //     entry points. Omitting it is not silent: the library prints "An
+    //     instance of ffxCreateContextDescFrameGenerationVersion must be
+    //     attached ... to access new API functions" and the context comes up
+    //     on a legacy path.
+    //   ffxOverrideVersion picks WHICH enumerated provider backs the context
+    //     (fsr::pick_fg_version -- 4.x ML FG for an FSR4 session, 3.1
+    //     interpolation otherwise).
+    // Choosing a provider says nothing about which API level we speak, so the
+    // override chains AHEAD of the pin rather than replacing it.
     ffxCreateContextDescFrameGenerationVersion apiver{};
     ffxOverrideVersion ver{};
+    apiver.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION_VERSION;
+    apiver.version     = FFX_FRAMEGENERATION_VERSION;
     if (version_id != 0) {
         ver.header.type      = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
         ver.versionId        = version_id;
         backend.header.pNext = &ver.header;
+        ver.header.pNext     = &apiver.header;
     } else {
-        apiver.header.type   = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION_VERSION;
-        apiver.version       = FFX_FRAMEGENERATION_VERSION;
         backend.header.pNext = &apiver.header;
     }
 
