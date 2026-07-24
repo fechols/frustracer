@@ -1,8 +1,25 @@
-//! BC7 block compression of OPAQUE scene textures (`--bc7`, GPU upload only).
+//! BC7 block compression of OPAQUE scene textures (ON BY DEFAULT for GPU
+//! sessions, GPU upload only; `--no-bc7` is the kill lever).
 //!
 //! Scene textures upload as RGBA8 (4 B/texel). Intel Sponza's set alone is
 //! 9.1 GB of VRAM that way — CLAUDE.md's "texture-memory stress", and WDDM
 //! demotes over-budget commits silently. BC7 is 8 bpp: a flat 4× cut.
+//!
+//! # Two encoder arms (`Bc7Mode`)
+//!
+//! The DEFAULT arm is the GPU compute encoder (`gpu/bc7gpu.rs` +
+//! `gpu/shaders/bc7enc.hlsl`, mode-6): it runs at scene-upload time on the
+//! session's own device, which is what made default-on affordable — the ispc
+//! CPU encode below is ~20 s for Intel Sponza at `fast`, and there is
+//! deliberately no BC7 disk cache. `--bc7-cpu` keeps this module's ispc path
+//! as the A/B lever and independent quality cross-check (it shares no code
+//! with the kernel). If the GPU encoder fails to construct, the upload falls
+//! back LOUDLY to uncompressed RGBA8 — never an implicit CPU encode stall.
+//!
+//! Determinism: the CPU arm is fully deterministic (pinned below). The GPU
+//! arm claims per-(device, driver) determinism only — nothing depends on
+//! more (no disk cache; the M11 fidelity gate runs the session's own encoder
+//! in-session).
 //!
 //! # Opaque only — the cutout carve-out
 //!
@@ -52,13 +69,59 @@ pub const BLOCK_BYTES: usize = 16;
 
 /// ISPC quality profile. `Fast` is the default: the encode is paid on EVERY
 /// load (there is deliberately no BC7 disk cache), so the profile is a
-/// load-time-vs-fidelity knob, not a one-off asset-bake setting.
+/// load-time-vs-fidelity knob, not a one-off asset-bake setting. The GPU arm
+/// maps the same names onto its effort tiers (`gpu/bc7gpu.rs::effort` —
+/// `basic`/`slow` deepen the mode-1 partition search there).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Quality {
     UltraFast,
     Fast,
     Basic,
     Slow,
+}
+
+/// The session's BC7 stance — which encoder arm, at what quality. The
+/// compiled default is `Gpu(Fast)`; `--no-bc7` → `Off`; `--bc7-cpu` → the
+/// ispc arm. Threaded as a parameter into `SceneGpu::new_uploaded` (never a
+/// global), so CPU-only sessions — which never construct a `SceneGpu` —
+/// structurally never read it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Bc7Mode {
+    Off,
+    Gpu(Quality),
+    Cpu(Quality),
+}
+
+impl Bc7Mode {
+    pub fn armed(self) -> bool {
+        !matches!(self, Bc7Mode::Off)
+    }
+
+    pub fn quality(self) -> Option<Quality> {
+        match self {
+            Bc7Mode::Off => None,
+            Bc7Mode::Gpu(q) | Bc7Mode::Cpu(q) => Some(q),
+        }
+    }
+
+    /// `--bc7-quality q`: set the quality on the CURRENT arm; an `Off` mode
+    /// arms the GPU default (the flag implies `--bc7`, order-independent).
+    pub fn with_quality(self, q: Quality) -> Bc7Mode {
+        match self {
+            Bc7Mode::Off | Bc7Mode::Gpu(_) => Bc7Mode::Gpu(q),
+            Bc7Mode::Cpu(_) => Bc7Mode::Cpu(q),
+        }
+    }
+
+    /// `--bc7`: arm the GPU default if off; an already-armed mode is kept
+    /// (so `--bc7-cpu --bc7` stays on the CPU arm — `--bc7` asserts "on",
+    /// not "which arm").
+    pub fn armed_or_default(self) -> Bc7Mode {
+        match self {
+            Bc7Mode::Off => Bc7Mode::Gpu(Quality::Fast),
+            m => m,
+        }
+    }
 }
 
 impl Quality {
@@ -252,6 +315,30 @@ pub fn self_test() -> Result<(), String> {
     let enc = encode_opaque(&flat, Quality::Fast);
     if enc.chunks_exact(BLOCK_BYTES).any(|b| b != &enc[..BLOCK_BYTES]) {
         return Err("bc7: flat texture did not encode to identical blocks (stride bug?)".into());
+    }
+
+    // Bc7Mode: the flag algebra the CLI arms rely on. --bc7 arms the GPU
+    // default but never switches an explicit CPU arm; --bc7-quality keys the
+    // CURRENT arm and arms Gpu from Off.
+    if Bc7Mode::Off.armed() || !Bc7Mode::Gpu(Quality::Fast).armed() {
+        return Err("bc7: Bc7Mode::armed polarity".into());
+    }
+    if Bc7Mode::Off.armed_or_default() != Bc7Mode::Gpu(Quality::Fast) {
+        return Err("bc7: --bc7 from Off must arm Gpu(Fast)".into());
+    }
+    if Bc7Mode::Cpu(Quality::Slow).armed_or_default() != Bc7Mode::Cpu(Quality::Slow) {
+        return Err("bc7: --bc7 must not switch an explicit CPU arm".into());
+    }
+    if Bc7Mode::Off.with_quality(Quality::Basic) != Bc7Mode::Gpu(Quality::Basic)
+        || Bc7Mode::Cpu(Quality::Fast).with_quality(Quality::Slow) != Bc7Mode::Cpu(Quality::Slow)
+        || Bc7Mode::Gpu(Quality::Fast).with_quality(Quality::UltraFast)
+            != Bc7Mode::Gpu(Quality::UltraFast)
+    {
+        return Err("bc7: Bc7Mode::with_quality must key the current arm".into());
+    }
+    if Bc7Mode::Off.quality().is_some() || Bc7Mode::Gpu(Quality::Slow).quality() != Some(Quality::Slow)
+    {
+        return Err("bc7: Bc7Mode::quality".into());
     }
 
     Ok(())

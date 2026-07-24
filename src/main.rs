@@ -3,9 +3,10 @@
 // Windows-only inside the module; the mixer/resampler/gain math is pure and
 // feeds --check. Display-only — no render-path or rng-stream contact.
 mod audio;
-// BC7 block compression of OPAQUE scene textures (--bc7) — GPU upload only;
-// the CPU renderer keeps sampling the exact RGBA8 texels. Alpha-masked cutout
-// textures are deliberately excluded (see the module note).
+// BC7 block compression of OPAQUE scene textures (ON by default via the GPU
+// compute encoder; --no-bc7 kills, --bc7-cpu = the ispc A/B arm) — GPU upload
+// only; the CPU renderer keeps sampling the exact RGBA8 texels. Alpha-masked
+// cutout textures are deliberately excluded (see the module note).
 mod bc7;
 mod blas_split;
 mod bvh;
@@ -135,13 +136,17 @@ pub struct Opts {
     pub chain: upchain::UpChain,
     /// D3D12 debug layer + Streamline verbose logging.
     pub gpu_debug: bool,
-    /// Block-compress the OPAQUE scene textures to BC7 at load (8 bpp vs 32),
-    /// GPU upload only — the CPU renderer keeps sampling the exact RGBA8
+    /// Block-compress the OPAQUE scene textures to BC7 on upload (8 bpp vs
+    /// 32), GPU upload only — the CPU renderer keeps sampling the exact RGBA8
     /// texels, so this moves the GPU-vs-CPU statistical gates (albedo A/B,
     /// T2 radiance) and nothing else. Alpha-masked cutout textures are never
-    /// compressed (src/bc7.rs). Off by default: an A/B lever, and the encode
-    /// is paid on every load (there is deliberately no BC7 disk cache).
-    pub bc7: Option<bc7::Quality>,
+    /// compressed (src/bc7.rs). ON BY DEFAULT via the GPU compute encoder
+    /// (`Gpu(Fast)` — gpu/bc7gpu.rs; only GPU/DXR sessions ever read this,
+    /// so CPU-only sessions are structurally unaffected): `--no-bc7` kills,
+    /// `--bc7-cpu` is the ispc A/B arm (the old ~20 s-per-Sponza encode),
+    /// `--bc7-quality` keys the current arm. There is still deliberately no
+    /// BC7 disk cache — the GPU encode is what made per-load affordable.
+    pub bc7: bc7::Bc7Mode,
     /// Directory holding sl.interposer.dll + plugins (M3+).
     pub sl_path: String,
     /// Audio ambience (biome loops + speed-scaled wind; default on —
@@ -463,7 +468,7 @@ fn main() {
     let mut opts = Opts {
         chain: upchain::UpChain::ALL,
         gpu_debug: false,
-        bc7: None,
+        bc7: bc7::Bc7Mode::Gpu(bc7::Quality::Fast),
         sl_path: std::env::var("FRUSTRACER_SL_PATH").unwrap_or_else(|_| {
             concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\streamline-sdk\bin\x64").to_string()
         }),
@@ -1122,18 +1127,26 @@ fn main() {
             "--prefer-intel" => opts.prefer = Some(gpu::adapter::Prefer::Intel),
             "--prefer-amd" => opts.prefer = Some(gpu::adapter::Prefer::Amd),
             "--gpu-debug" => opts.gpu_debug = true,
-            // --bc7 alone = the `fast` profile; --bc7-quality overrides (and
-            // implies --bc7, so the order of the two flags doesn't matter).
-            "--bc7" => opts.bc7 = opts.bc7.or(Some(bc7::Quality::Fast)),
+            // BC7 is ON by default (the GPU arm at `fast`). --bc7 re-arms
+            // after a --no-bc7 (later flags win, never switching an explicit
+            // CPU arm); --bc7-cpu picks the ispc A/B arm; --bc7-quality keys
+            // the CURRENT arm (and arms the GPU default, so order between it
+            // and --bc7 doesn't matter).
+            "--bc7" => opts.bc7 = opts.bc7.armed_or_default(),
+            "--no-bc7" => opts.bc7 = bc7::Bc7Mode::Off,
+            "--bc7-cpu" => {
+                opts.bc7 = bc7::Bc7Mode::Cpu(opts.bc7.quality().unwrap_or(bc7::Quality::Fast))
+            }
             "--bc7-quality" => {
                 let q = args.next().unwrap_or_else(|| {
                     eprintln!("--bc7-quality needs ultrafast|fast|basic|slow");
                     std::process::exit(2);
                 });
-                opts.bc7 = Some(bc7::Quality::parse(&q).unwrap_or_else(|| {
+                let q = bc7::Quality::parse(&q).unwrap_or_else(|| {
                     eprintln!("--bc7-quality: unknown profile '{q}' (ultrafast|fast|basic|slow)");
                     std::process::exit(2);
-                }));
+                });
+                opts.bc7 = opts.bc7.with_quality(q);
             }
             "--sl-path" => {
                 opts.sl_path = args.next().unwrap_or_else(|| {
@@ -1206,10 +1219,11 @@ fn main() {
                 eprintln!("                the chain DLSS-RR -> FSR4-RR -> XeSS -> FSR3 is always on — the first");
                 eprintln!("                supported level wins; --<x> force-starts the chain at that level");
                 eprintln!("  --no-upscale  plain presentation: no temporal upscaler at all (benchmark escape)");
-                eprintln!("  --bc7         block-compress the OPAQUE scene textures to BC7 at load (8 bpp vs 32;");
-                eprintln!("                GPU upload only — alpha-masked cutout textures stay exact RGBA8).");
-                eprintln!("                No disk cache: the encode runs every load. --bc7-quality <p> sets the");
-                eprintln!("                ISPC profile: ultrafast|fast|basic|slow (default fast)");
+                eprintln!("  --no-bc7      upload scene textures as raw RGBA8 — BC7 block compression is ON by");
+                eprintln!("                default (8 bpp vs 32; GPU-compute encode at upload; alpha-masked cutout");
+                eprintln!("                textures stay exact RGBA8 always). --bc7-cpu forces the CPU ispc encode");
+                eprintln!("                (the A/B arm; slow). --bc7-quality <p>: ultrafast|fast|basic|slow");
+                eprintln!("                (default fast; on the GPU arm basic|slow deepen the mode-1 search)");
                 eprintln!("  --check-oidn  headless: OIDN denoise self-test (needs the OIDN DLLs)");
                 eprintln!("  --oidn-dump   --check-oidn plus before/after/G-buffer PNG dumps");
                 eprintln!("  --oidn        start with OIDN denoising on (N toggles; implies DLSS off)");
@@ -1636,13 +1650,6 @@ fn main() {
             }
         }
     };
-    // A GPU world session carries every island's textures in VRAM at RGBA8 —
-    // the one place the opt-in BC7 encode reliably earns its per-boot cost.
-    // A tip, not a default: there is no BC7 disk cache, so defaulting it
-    // would tax every boot ~10-15 s.
-    if world_info.is_some() && opts.bc7.is_none() && (opts.gpu || opts.dxr) {
-        eprintln!("world: tip — --bc7 trims GPU texture VRAM (costs ~10-15 s of encode per boot)");
-    }
     // The stress field (and a tiled OBJ field) keeps the default look
     // direction but pulls the camera back/up to overlook the field; /8 (not
     // the field half-extent itself) trades the nearest rows off the bottom of
@@ -4782,16 +4789,34 @@ fn run_check_gpu(
             ok = false;
         }
 
-        // --- M11: --bc7 encode fidelity (GPU decode vs the CPU RGBA8 source).
-        // Only meaningful with the flag on: it measures the ENCODER, per
-        // texel, through the spec-bit-exact hardware decoder — the number the
-        // statistical albedo/radiance gates can't give. The 25 dB limit is a
-        // WIRING gate, not a quality bar: a pitch/footprint/format error
-        // lands ~10-20 dB, while the worst honest texture measured 31.7 dB at
-        // `fast` (San Miguel) — 25 separates the two without false-failing a
-        // hard texture at `ultrafast`.
-        if let Some(bq) = opts.bc7 {
-            match gpu::trace::bc7_fidelity(scene, bq, &mut hg) {
+        // --- bc7-gpu: the GPU encoder's STRUCTURAL gate (synthetic textures,
+        // so it fires on every scene — including the untextured procedural
+        // default, where M11 below skips). Runs UNCONDITIONALLY, --no-bc7
+        // included (the wide-tiles precedent: the default-path encoder must
+        // not rot behind a lever), and a construction failure is a suite
+        // FAIL, never a skip — interactively the same failure is a loud
+        // RGBA8 fallback, and this is where it gets teeth.
+        match gpu::trace::bc7_gpu_self_test(&mut hg) {
+            Ok(()) => eprintln!(
+                "check-gpu: bc7 gpu encoder: OK (flat bit-exact, stride, ramp, two-cluster mode-1)"
+            ),
+            Err(e) => {
+                eprintln!("check-gpu: FAIL bc7 gpu encoder: {e}");
+                ok = false;
+            }
+        }
+
+        // --- M11: BC7 encode fidelity (GPU decode vs the CPU RGBA8 source) —
+        // it measures the session's ENCODER (default: the GPU compute
+        // encoder; --bc7-cpu: the ispc arm), per texel, through the
+        // spec-bit-exact hardware decoder — the number the statistical
+        // albedo/radiance gates can't give. The 25 dB limit is a WIRING
+        // gate, not a quality bar: a pitch/footprint/format error lands
+        // ~10-20 dB, while the worst honest texture measured 31.7 dB at
+        // ispc `fast` (San Miguel) — 25 separates the two without
+        // false-failing a hard texture at `ultrafast`.
+        if opts.bc7.armed() {
+            match gpu::trace::bc7_fidelity(scene, opts.bc7, &mut hg) {
                 Ok(Some(f)) => {
                     eprintln!(
                         "check-gpu: bc7 fidelity: {} textures | mean |d| {:.3} LSB | max {} | worst PSNR {:.1} dB (limit 25)",

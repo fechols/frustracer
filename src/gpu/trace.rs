@@ -1187,9 +1187,11 @@ impl SceneGpu {
     /// is steady-state + one chunk, not steady-state × 2. Runs ONCE per
     /// session (GpuContext caches the Rc); the wavefront's software trees
     /// upload separately per TraceGpu (`SwTreesGpu::new_uploaded`).
-    /// `bc7_q`: block-compress the OPAQUE scene textures at this ISPC quality
-    /// before upload (`--bc7`; `None` = today's RGBA8 everywhere). Alpha-masked
-    /// cutout textures stay RGBA8 either way — see src/bc7.rs.
+    /// `bc7_mode`: block-compress the OPAQUE scene textures (the DEFAULT —
+    /// `Gpu(Fast)`: the compute encoder in gpu/bc7gpu.rs runs per band inside
+    /// this upload; `Cpu(q)` = the `--bc7-cpu` ispc A/B arm, pre-encoded
+    /// below; `Off` = `--no-bc7`, RGBA8 everywhere). Alpha-masked cutout
+    /// textures stay RGBA8 in every mode — see src/bc7.rs.
     /// `bvh` is the CHUNKING source for `--blas-split` and is read only when
     /// that lever is armed.
     pub fn new_uploaded(
@@ -1197,7 +1199,7 @@ impl SceneGpu {
         scene: &Scene,
         bvh: &Bvh,
         sub: &mut dyn d3d12::Submit,
-        bc7_q: Option<bc7::Quality>,
+        bc7_mode: bc7::Bc7Mode,
     ) -> Result<Self> {
         let device5: ID3D12Device5 = device
             .cast()
@@ -1208,18 +1210,20 @@ impl SceneGpu {
         // the ring (`scene_stream_bytes` deliberately excludes textures, and
         // its geometry-only size can undershoot a wide texture's pitch on a
         // small mesh — the band `.max(1)` would then overrun the mapping).
-        // A BC7 texture's "row" is a 4-texel-tall BLOCK row, so its pitch is
-        // the block pitch, not w*4 — mispredicting this here is exactly the
+        // A BC7 texture's "row" is a 4-texel-tall BLOCK row: on the CPU
+        // (ispc) arm the ring stages ENCODED block rows (block pitch); on the
+        // GPU arm it stages the 4 SOURCE texel rows a block row encodes from
+        // (4 aligned RGBA8 rows). Mispredicting this here is exactly the
         // overrun the comment above warns about.
         let max_tex_pitch = scene
             .textures
             .iter()
-            .map(|t| {
-                if bc7_q.is_some() && bc7::should_compress(t) {
-                    d3d12::block_pitch(t.w)
-                } else {
-                    d3d12::aligned_pitch(t.w as usize * 4)
+            .map(|t| match bc7_mode {
+                bc7::Bc7Mode::Cpu(_) if bc7::should_compress(t) => d3d12::block_pitch(t.w),
+                bc7::Bc7Mode::Gpu(_) if bc7::should_compress(t) => {
+                    4 * d3d12::aligned_pitch(t.w as usize * 4)
                 }
+                _ => d3d12::aligned_pitch(t.w as usize * 4),
             })
             .max()
             .unwrap_or(0);
@@ -1327,36 +1331,51 @@ impl SceneGpu {
             })
             .collect();
         let mat_shadow_b = stream_buffer(device, sub, &ring, &mat_shadow, |m| *m, srv)?;
-        // --bc7: block-compress the OPAQUE 4-aligned textures before
-        // uploading them (8 bpp vs 32 — Intel Sponza's set is 4.6 GB of VRAM
-        // as RGBA8). Alpha-masked cutout textures are EXCLUDED and stay
-        // RGBA8: the intersector `.Load()`s their alpha per texel against a
-        // hard `< 128` threshold, and BC7 quantizes alpha across it (a .Load
-        // on a BC SRV returns the DECODED — lossy — texel).
+        // BC7 (ON BY DEFAULT — --no-bc7 kills): block-compress the OPAQUE
+        // 4-aligned textures on upload (8 bpp vs 32 — Intel Sponza's set is
+        // 4.6 GB of VRAM as RGBA8). Alpha-masked cutout textures are EXCLUDED
+        // and stay RGBA8: the intersector `.Load()`s their alpha per texel
+        // against a hard `< 128` threshold, and BC7 quantizes alpha across it
+        // (a .Load on a BC SRV returns the DECODED — lossy — texel).
         // `bc7::should_compress`'s masked arm is the same predicate as
         // `mat_cutout` below — see src/bc7.rs for why that agreement IS the
         // soundness argument.
         //
-        // There is deliberately no BC7 disk cache: the encode runs every load.
-        // Largest-first (LPT) scheduling for the same reason the DECODE sites
-        // sort (scene.rs / scene_cache.rs) — cost is ~linear in texels, so the
-        // few 4K maps would otherwise dominate the tail while the rest idle.
-        // Results scatter back by texture id, which must never shift.
+        // There is deliberately no BC7 disk cache: the encode runs every load
+        // — affordable because the DEFAULT arm is the GPU compute encoder
+        // (gpu/bc7gpu.rs), dispatched per band inside the upload loop below.
+        // The `--bc7-cpu` ispc arm pre-encodes here instead (LPT largest-first
+        // for the same reason the DECODE sites sort — cost is ~linear in
+        // texels; results scatter back by texture id, which must never shift).
+        let mut compress: Vec<bool> = scene
+            .textures
+            .iter()
+            .map(|t| bc7_mode.armed() && bc7::should_compress(t))
+            .collect();
         let mut bc7_blocks: Vec<Option<Vec<Vec<u8>>>> =
             scene.textures.iter().map(|_| None).collect();
         let mut enc_ms = 0.0f64;
-        let mut enc_texels = 0u64;
-        if let Some(q) = bc7_q {
+        // Every ENCODED level counts (base + mips, ~4/3 of base) — the
+        // Mtexel/s print divides by this, and both arms encode the chain.
+        let enc_texels: u64 = compress
+            .iter()
+            .zip(&scene.textures)
+            .filter(|&(&c, _)| c)
+            .map(|(_, t)| {
+                std::iter::once((t.w, t.h))
+                    .chain(t.mips.iter().map(|m| (m.w, m.h)))
+                    .map(|(w, h)| w as u64 * h as u64)
+                    .sum::<u64>()
+            })
+            .sum();
+        if let bc7::Bc7Mode::Cpu(q) = bc7_mode {
             use rayon::prelude::*;
             let t0 = std::time::Instant::now();
-            let mut order: Vec<usize> = (0..scene.textures.len())
-                .filter(|&i| bc7::should_compress(&scene.textures[i]))
-                .collect();
+            let mut order: Vec<usize> =
+                (0..scene.textures.len()).filter(|&i| compress[i]).collect();
             order.sort_by_key(|&i| {
                 std::cmp::Reverse(scene.textures[i].w as u64 * scene.textures[i].h as u64)
             });
-            enc_texels =
-                order.iter().map(|&i| scene.textures[i].w as u64 * scene.textures[i].h as u64).sum();
             let done: Vec<(usize, Vec<Vec<u8>>)> = order
                 .par_iter()
                 .map(|&i| {
@@ -1374,66 +1393,74 @@ impl SceneGpu {
             }
             enc_ms = t0.elapsed().as_secs_f64() * 1e3;
         }
-
-        if !scene.textures.is_empty() {
-            let raw = scene.textures.iter().map(|t| t.w as u64 * t.h as u64 * 4).sum::<u64>();
-            let live = scene
-                .textures
-                .iter()
-                .enumerate()
-                .map(|(i, t)| match &bc7_blocks[i] {
-                    Some(b) => b.iter().map(|l| l.len() as u64).sum::<u64>(),
-                    None => {
-                        let base = t.w as u64 * t.h as u64;
-                        let mips: u64 =
-                            t.mips.iter().map(|m| m.w as u64 * m.h as u64).sum();
-                        (base + mips) * 4
+        // GPU arm: one encoder + one block buffer (sized to the largest whole
+        // compressible mip), reused across every band — the ring's own reuse
+        // discipline. Construction failure is a LOUD line + uncompressed
+        // RGBA8, never an implicit CPU-encode stall (the default-on contract;
+        // --check-gpu's bc7-gpu gate turns the same failure into a suite
+        // FAIL so it can't rot silently).
+        let mut gpu_enc: Option<super::bc7gpu::Bc7Enc> = None;
+        if let bc7::Bc7Mode::Gpu(_) = bc7_mode {
+            if compress.iter().any(|&c| c) {
+                let block_cap = scene
+                    .textures
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| compress[*i])
+                    .flat_map(|(_, t)| {
+                        std::iter::once((t.w, t.h))
+                            .chain(t.mips.iter().map(|m| (m.w, m.h)))
+                            .map(|(w, h)| d3d12::block_pitch(w) * bc7::blocks(h) as usize)
+                    })
+                    .max()
+                    .unwrap_or(0);
+                match super::bc7gpu::Bc7Enc::new(device, block_cap) {
+                    Ok(e) => gpu_enc = Some(e),
+                    Err(e) => {
+                        eprintln!(
+                            "bc7: GPU encoder unavailable ({e}) — textures upload UNCOMPRESSED \
+                             RGBA8 (--bc7-cpu forces the CPU encode)"
+                        );
+                        compress.iter_mut().for_each(|c| *c = false);
                     }
-                })
-                .sum::<u64>();
-            let n_bc7 = bc7_blocks.iter().filter(|b| b.is_some()).count();
-            let bc7_note = if n_bc7 > 0 {
-                // Mtexel/s is the "is a load-time encode real-time?" number.
-                format!(
-                    ", {} BC7 + {} RGBA8, was {} MB | bc7 encode {:.0} ms ({:.0} Mtexel/s)",
-                    n_bc7,
-                    scene.textures.len() - n_bc7,
-                    raw >> 20,
-                    enc_ms,
-                    enc_texels as f64 / 1e6 / (enc_ms / 1e3).max(1e-9),
-                )
-            } else {
-                String::new()
-            };
-            eprintln!(
-                "gpu: {} textures uploaded ({} MB{}{})",
-                scene.textures.len(),
-                live >> 20,
-                if scene.any_alpha { ", alpha cutout on" } else { "" },
-                bc7_note,
-            );
+                }
+            }
         }
+        let gpu_effort = bc7_mode.quality().map(super::bc7gpu::effort).unwrap_or(1);
 
         // Scene textures: RGBA8 Texture2Ds — _SRGB for color textures (the
         // per-texel decode of texture.rs::sample_bilinear in hardware) and
         // plain _UNORM for linear-data maps (normal / rough-metal; the CPU
         // samples those via sample_bilinear_linear). Texels upload raw (row
         // 0 = v0, the V flip is baked at OBJ load) in row bands through the
-        // same staging ring — no per-texture staging commit. Under --bc7 the
-        // opaque ones instead upload as BC7 (same _SRGB/_UNORM role split),
-        // staged in 4-texel-tall BLOCK rows; the blocks are dropped as we go,
-        // so steady-state RAM is unchanged.
+        // same staging ring — no per-texture staging commit. Compressed ones
+        // upload as BC7 (same _SRGB/_UNORM role split): the DEFAULT Gpu arm
+        // stages the SOURCE texel rows and encodes per band on the GPU (ring
+        // SRV → block_buf → CopyTextureRegion — the blocks never touch the
+        // CPU); the --bc7-cpu arm stages its pre-encoded 4-texel-tall block
+        // rows, dropped as we go so steady-state RAM is unchanged.
+        //
+        // The band-loop arm per (texture, mip): what one ring "unit" is.
+        enum TexArm {
+            Rgba,   // unit = 1 texel row, straight CopyTextureRegion
+            CpuBlk, // unit = 1 ENCODED block row, straight CopyTextureRegion
+            GpuEnc, // unit = 4 SOURCE texel rows, dispatch + copy-out
+        }
         let mut textures_v = Vec::new();
         for (i, t) in scene.textures.iter().enumerate() {
-            let fmt = match &bc7_blocks[i] {
-                Some(_) => bc7::dxgi_format(t),
-                None => {
-                    if t.srgb {
-                        windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
-                    } else {
-                        windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM
-                    }
-                }
+            let fmt = if compress[i] {
+                bc7::dxgi_format(t)
+            } else if t.srgb {
+                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+            } else {
+                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM
+            };
+            let arm = if !compress[i] {
+                TexArm::Rgba
+            } else if bc7_blocks[i].is_some() {
+                TexArm::CpuBlk
+            } else {
+                TexArm::GpuEnc
             };
             let n_mips = 1 + t.mips.len();
             let dst = d3d12::committed_tex_mips(
@@ -1455,42 +1482,69 @@ impl SceneGpu {
                     let m = &t.mips[mip - 1];
                     (m.w, m.h, &m.texels)
                 };
-                let (pitch, src_pitch, rows_total, row_h) = match &bc7_blocks[i] {
-                    // A BC7 "row" is a block row: 4 texel rows in
-                    // ceil(w/4)*16 B — per-mip dims.
-                    Some(_) => (
-                        d3d12::block_pitch(mw),
-                        bc7::blocks(mw) as usize * bc7::BLOCK_BYTES,
-                        bc7::blocks(mh) as usize,
-                        bc7::BLOCK as usize,
-                    ),
-                    None => (
-                        d3d12::aligned_pitch(mw as usize * 4),
-                        mw as usize * 4,
-                        mh as usize,
-                        1,
-                    ),
+                let row_pitch = d3d12::aligned_pitch(mw as usize * 4);
+                let (pitch, rows_total, row_h) = match arm {
+                    // A BC7 "row" is a block row: 4 texel rows — encoded
+                    // ceil(w/4)*16 B on the CPU arm, 4 aligned source rows
+                    // on the GPU arm (per-mip dims either way).
+                    TexArm::CpuBlk => {
+                        (d3d12::block_pitch(mw), bc7::blocks(mh) as usize, bc7::BLOCK as usize)
+                    }
+                    TexArm::GpuEnc => {
+                        (4 * row_pitch, bc7::blocks(mh) as usize, bc7::BLOCK as usize)
+                    }
+                    TexArm::Rgba => (row_pitch, mh as usize, 1),
                 };
                 let band = (ring.size / pitch).max(1).min(rows_total);
                 let mut r0 = 0usize;
                 while r0 < rows_total {
                     let rows = band.min(rows_total - r0);
                     for r in 0..rows {
-                        let src: &[u8] = match &bc7_blocks[i] {
-                            Some(b) => &b[mip][(r0 + r) * src_pitch..(r0 + r + 1) * src_pitch],
-                            None => {
+                        match arm {
+                            TexArm::CpuBlk => {
+                                let src_pitch = bc7::blocks(mw) as usize * bc7::BLOCK_BYTES;
+                                let b = bc7_blocks[i].as_ref().unwrap();
+                                let src = &b[mip][(r0 + r) * src_pitch..(r0 + r + 1) * src_pitch];
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(
+                                        src.as_ptr(),
+                                        ring.ptr.add(r * pitch),
+                                        src_pitch,
+                                    )
+                                };
+                            }
+                            TexArm::GpuEnc => {
+                                // Up to 4 source texel rows per block row;
+                                // the mip's bottom edge simply stages fewer
+                                // (the kernel edge-replicates via its clamp).
+                                for k in 0..bc7::BLOCK as usize {
+                                    let y = (r0 + r) * bc7::BLOCK as usize + k;
+                                    if y >= mh as usize {
+                                        break;
+                                    }
+                                    let row =
+                                        &mip_texels[y * mw as usize..(y + 1) * mw as usize];
+                                    unsafe {
+                                        std::ptr::copy_nonoverlapping(
+                                            row.as_flattened().as_ptr(),
+                                            ring.ptr.add(r * pitch + k * row_pitch),
+                                            mw as usize * 4,
+                                        )
+                                    };
+                                }
+                            }
+                            TexArm::Rgba => {
                                 let y = r0 + r;
                                 let row = &mip_texels[y * mw as usize..(y + 1) * mw as usize];
-                                row.as_flattened()
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(
+                                        row.as_flattened().as_ptr(),
+                                        ring.ptr.add(r * pitch),
+                                        mw as usize * 4,
+                                    )
+                                };
                             }
-                        };
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(
-                                src.as_ptr(),
-                                ring.ptr.add(r * pitch),
-                                src_pitch,
-                            )
-                        };
+                        }
                     }
                     // The dst y offset and the footprint height are always in
                     // TEXELS. For BC7 both are whole block rows (DstY a
@@ -1500,22 +1554,41 @@ impl SceneGpu {
                     // layer accepts.
                     let y0 = r0 * row_h;
                     let h_tex = (rows * row_h).min(mh as usize - y0) as u32;
-                    let fp = match &bc7_blocks[i] {
-                        Some(_) => d3d12::footprint_block(fmt, mw, h_tex, 0),
-                        None => d3d12::footprint(fmt, mw, h_tex, 4, 0),
-                    };
                     let last = mip + 1 == n_mips && r0 + rows == rows_total;
+                    let t_enc = matches!(arm, TexArm::GpuEnc).then(std::time::Instant::now);
                     sub.run_list(&mut |l| {
-                        unsafe {
-                            l.CopyTextureRegion(
-                                &d3d12::loc_subresource_mip(&dst, mip as u32),
-                                0,
-                                y0 as u32,
-                                0,
-                                &d3d12::loc_footprint(&ring.resource, fp),
-                                None,
-                            )
-                        };
+                        match arm {
+                            TexArm::GpuEnc => {
+                                let enc = gpu_enc.as_ref().expect("GpuEnc arm without encoder");
+                                // h_tex is exactly the texel rows staged above.
+                                enc.record_encode(
+                                    l,
+                                    &ring.resource,
+                                    mw,
+                                    h_tex,
+                                    row_pitch as u32,
+                                    rows as u32,
+                                    gpu_effort,
+                                );
+                                enc.record_copy_out(l, &dst, mip as u32, y0 as u32, fmt, mw, h_tex);
+                            }
+                            TexArm::CpuBlk | TexArm::Rgba => {
+                                let fp = match arm {
+                                    TexArm::CpuBlk => d3d12::footprint_block(fmt, mw, h_tex, 0),
+                                    _ => d3d12::footprint(fmt, mw, h_tex, 4, 0),
+                                };
+                                unsafe {
+                                    l.CopyTextureRegion(
+                                        &d3d12::loc_subresource_mip(&dst, mip as u32),
+                                        0,
+                                        y0 as u32,
+                                        0,
+                                        &d3d12::loc_footprint(&ring.resource, fp),
+                                        None,
+                                    )
+                                };
+                            }
+                        }
                         if last {
                             unsafe {
                                 l.ResourceBarrier(&[transition(
@@ -1527,6 +1600,9 @@ impl SceneGpu {
                         }
                         Ok(())
                     })?;
+                    if let Some(t0) = t_enc {
+                        enc_ms += t0.elapsed().as_secs_f64() * 1e3;
+                    }
                     r0 += rows;
                 }
             }
@@ -1534,6 +1610,52 @@ impl SceneGpu {
             // most the BC7 set (~0.25x the RGBA8 texels), never a second copy.
             bc7_blocks[i] = None;
             textures_v.push(dst);
+        }
+        drop(gpu_enc);
+
+        if !scene.textures.is_empty() {
+            let raw = scene.textures.iter().map(|t| t.w as u64 * t.h as u64 * 4).sum::<u64>();
+            // Analytic per-texture VRAM: the CPU arm's actual block vecs are
+            // exactly `encoded_len` sized, so one formula serves both arms.
+            let live = scene
+                .textures
+                .iter()
+                .enumerate()
+                .map(|(i, t)| {
+                    let levels = std::iter::once((t.w, t.h))
+                        .chain(t.mips.iter().map(|m| (m.w, m.h)));
+                    if compress[i] {
+                        levels.map(|(w, h)| bc7::encoded_len(w, h) as u64).sum::<u64>()
+                    } else {
+                        levels.map(|(w, h)| w as u64 * h as u64 * 4).sum::<u64>()
+                    }
+                })
+                .sum::<u64>();
+            let n_bc7 = compress.iter().filter(|&&c| c).count();
+            let bc7_note = if n_bc7 > 0 {
+                // Mtexel/s is the "is a load-time encode real-time?" number.
+                // The GPU arm's ms is the summed wall time of its encode
+                // submits (blocking submits, so wall ≈ GPU time).
+                let arm = if matches!(bc7_mode, bc7::Bc7Mode::Cpu(_)) { "cpu" } else { "gpu" };
+                format!(
+                    ", {} BC7 + {} RGBA8, was {} MB | bc7 encode ({}) {:.0} ms ({:.0} Mtexel/s)",
+                    n_bc7,
+                    scene.textures.len() - n_bc7,
+                    raw >> 20,
+                    arm,
+                    enc_ms,
+                    enc_texels as f64 / 1e6 / (enc_ms / 1e3).max(1e-9),
+                )
+            } else {
+                String::new()
+            };
+            eprintln!(
+                "gpu: {} textures uploaded ({} MB{}{})",
+                scene.textures.len(),
+                live >> 20,
+                if scene.any_alpha { ", alpha cutout on" } else { "" },
+                bc7_note,
+            );
         }
 
         // --- acceleration-structure sizing ---
@@ -2131,9 +2253,10 @@ fn build_split_blas(
         if usage + want > budget {
             return Err(format!(
                 "--blas-split: {} chunks need {} MB of acceleration structure on top of \
-                 {} MB already committed, over the {} MB budget — free VRAM first: --bc7 \
-                 (opaque textures 8 bpp vs 32), --lock-res <scale> (smaller render-res \
-                 buffers), or a smaller scene. Do NOT drop --blas-split on Intel — the \
+                 {} MB already committed, over the {} MB budget — free VRAM first: \
+                 --lock-res <scale> (smaller render-res buffers), a smaller scene, or \
+                 re-enable BC7 if --no-bc7 dropped it (opaque textures 8 bpp vs 32). \
+                 Do NOT drop --blas-split on Intel — the \
                  single-BLAS build's scratch ask removes the device on large scenes. \
                  (The GPU tracers cannot start, so the session falls back to the CPU \
                  renderer)",
@@ -4259,7 +4382,8 @@ pub(crate) fn record_feed_dispatch(
 }
 
 // ---------------------------------------------------------------------------
-// M11 (--bc7): encode fidelity, measured on the GPU.
+// M11: BC7 encode fidelity, measured on the GPU (runs whenever BC7 is armed
+// — the default — on a scene with compressible textures).
 
 /// The whole M11 kernel: `.Load` one texel of the BC7 SRV (legal on BC —
 /// returns the hardware-decoded value) and store it back as packed RGBA8.
@@ -4289,25 +4413,33 @@ pub struct Bc7Fidelity {
     pub worst_psnr: f64,
 }
 
-/// Re-encode every compressible texture (deterministic — `bc7::self_test`
-/// pins it, so these blocks ARE the session's), upload each as a plain
-/// `BC7_UNORM` Texture2D (deliberately never `_SRGB`: the kernel must read
-/// raw code values, not the transfer function), GPU-decode it back with
-/// `BC7_READ_HLSL`, and diff against the CPU RGBA8 source.
+/// Encode every compressible texture with the session's arm — the GPU
+/// (default) arm runs the SESSION'S OWN encoder module on the session's own
+/// device (no determinism bridge needed: this literally is the encoder that
+/// uploads); the `--bc7-cpu` arm re-encodes with the deterministic ispc path
+/// (`bc7::self_test` pins it, so those blocks ARE the session's). Each lands
+/// in a plain `BC7_UNORM` Texture2D (deliberately never `_SRGB`: the decode
+/// kernel must read raw code values, not the transfer function), is
+/// GPU-decoded back with `BC7_READ_HLSL`, and diffed against the CPU RGBA8
+/// source.
 ///
 /// RGB only: nothing ever samples a compressed texture's alpha (the cutout
 /// path reads only the alpha-masked RGBA8 set, and shade.hlsli consumes
 /// .rgb/.g/.b), and "opaque" merely means every alpha ≥ 250 — a 252 would
 /// quantize and show up here as false loss.
 ///
-/// `Ok(None)` = nothing compressible (untextured scene, or every texture
-/// masked/odd-dim).
+/// `Ok(None)` = BC7 off, or nothing compressible (untextured scene, or
+/// every texture masked/odd-dim).
 pub fn bc7_fidelity(
     scene: &Scene,
-    q: bc7::Quality,
+    mode: bc7::Bc7Mode,
     hg: &mut HeadlessGpu,
 ) -> Result<Option<Bc7Fidelity>> {
     use super::d3d12::Submit;
+    let Some(q) = mode.quality() else {
+        return Ok(None);
+    };
+    let cpu_arm = matches!(mode, bc7::Bc7Mode::Cpu(_));
     let ids: Vec<usize> =
         (0..scene.textures.len()).filter(|&i| bc7::should_compress(&scene.textures[i])).collect();
     if ids.is_empty() {
@@ -4315,19 +4447,187 @@ pub fn bc7_fidelity(
     }
     let device = hg.device.clone();
 
-    // The session's exact blocks, re-encoded (LPT largest-first, the upload
-    // path's scheduling).
-    let blocks_by_id: Vec<(usize, Vec<u8>)> = {
+    // CPU arm: the session's exact blocks, re-encoded (LPT largest-first,
+    // the upload path's scheduling). GPU arm: the encoder itself, encoding
+    // in-gate below.
+    let mut cpu_blocks: Vec<Option<Vec<u8>>> = scene.textures.iter().map(|_| None).collect();
+    if cpu_arm {
         use rayon::prelude::*;
         let mut order = ids.clone();
         order.sort_by_key(|&i| {
             std::cmp::Reverse(scene.textures[i].w as u64 * scene.textures[i].h as u64)
         });
-        order.par_iter().map(|&i| (i, bc7::encode_opaque(&scene.textures[i], q))).collect()
+        let done: Vec<(usize, Vec<u8>)> =
+            order.par_iter().map(|&i| (i, bc7::encode_opaque(&scene.textures[i], q))).collect();
+        for (i, b) in done {
+            cpu_blocks[i] = Some(b);
+        }
+    }
+    let gpu_enc = if cpu_arm {
+        None
+    } else {
+        let block_cap = ids
+            .iter()
+            .map(|&i| {
+                let t = &scene.textures[i];
+                d3d12::block_pitch(t.w) * bc7::blocks(t.h) as usize
+            })
+            .max()
+            .unwrap();
+        // In the gate, encoder-construction failure is a hard error (the
+        // caller FAILs the suite) — gates never silently skip.
+        Some(super::bc7gpu::Bc7Enc::new(&device, block_cap)?)
     };
 
-    // Root signature: [0] table of one SRV (t0), [1] root UAV (u0),
-    // [2] two root constants (b0: W, H).
+    let rk = bc7_read_kernel(&device)?;
+
+    // One staging pair reused across textures (the blocking submits fence
+    // it). The CPU arm stages encoded block rows; the GPU arm stages the
+    // RGBA8 source rows the encoder reads.
+    let max_stage = ids
+        .iter()
+        .map(|&i| {
+            let t = &scene.textures[i];
+            if cpu_arm {
+                d3d12::block_pitch(t.w) * bc7::blocks(t.h) as usize
+            } else {
+                d3d12::aligned_pitch(t.w as usize * 4) * t.h as usize
+            }
+        })
+        .max()
+        .unwrap();
+    let max_out = ids
+        .iter()
+        .map(|&i| scene.textures[i].w as u64 * scene.textures[i].h as u64 * 4)
+        .max()
+        .unwrap();
+    let stage = d3d12::UploadBuffer::new(&device, max_stage)?;
+    let out = committed_buffer(
+        &device,
+        max_out,
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+    )?;
+
+    let (mut sum_abs, mut n_samples, mut max_abs, mut worst_psnr) = (0f64, 0u64, 0u32, f64::MAX);
+    for &i in &ids {
+        let t = &scene.textures[i];
+        let fmt = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_BC7_UNORM;
+        let tex = d3d12::committed_tex(
+            &device,
+            t.w,
+            t.h,
+            fmt,
+            D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        )?;
+        if let Some(enc) = &cpu_blocks[i] {
+            let src_pitch = bc7::blocks(t.w) as usize * bc7::BLOCK_BYTES;
+            let pitch = d3d12::block_pitch(t.w);
+            for r in 0..bc7::blocks(t.h) as usize {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        enc[r * src_pitch..].as_ptr(),
+                        stage.ptr.add(r * pitch),
+                        src_pitch,
+                    )
+                };
+            }
+            let fp = d3d12::footprint_block(fmt, t.w, t.h, 0);
+            hg.run_list(&mut |l| {
+                unsafe {
+                    l.CopyTextureRegion(
+                        &d3d12::loc_subresource(&tex),
+                        0,
+                        0,
+                        0,
+                        &d3d12::loc_footprint(&stage.resource, fp),
+                        None,
+                    );
+                    l.ResourceBarrier(&[transition(
+                        &tex,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    )]);
+                }
+                Ok(())
+            })?;
+        } else {
+            let enc = gpu_enc.as_ref().unwrap();
+            let row_pitch = d3d12::aligned_pitch(t.w as usize * 4);
+            for y in 0..t.h as usize {
+                let row = &t.texels[y * t.w as usize..(y + 1) * t.w as usize];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        row.as_flattened().as_ptr(),
+                        stage.ptr.add(y * row_pitch),
+                        t.w as usize * 4,
+                    )
+                };
+            }
+            let (tw, th) = (t.w, t.h);
+            hg.run_list(&mut |l| {
+                enc.record_encode(
+                    l,
+                    &stage.resource,
+                    tw,
+                    th,
+                    row_pitch as u32,
+                    bc7::blocks(th),
+                    super::bc7gpu::effort(q),
+                );
+                enc.record_copy_out(l, &tex, 0, 0, fmt, tw, th);
+                unsafe {
+                    l.ResourceBarrier(&[transition(
+                        &tex,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    )])
+                };
+                Ok(())
+            })?;
+        }
+        let dec = bc7_decode_tex(hg, &rk, &tex, t.w, t.h, &out)?;
+        let mut sq = 0f64;
+        for (px, src) in t.texels.iter().enumerate() {
+            for c in 0..3 {
+                let d = dec[px * 4 + c].abs_diff(src[c]) as u32;
+                sum_abs += d as f64;
+                sq += (d as f64) * (d as f64);
+                max_abs = max_abs.max(d);
+            }
+            n_samples += 3;
+        }
+        let mse = sq / (t.texels.len() as f64 * 3.0);
+        let psnr = if mse > 0.0 { 10.0 * (255.0f64 * 255.0 / mse).log10() } else { 99.0 };
+        // Per-texture diagnostic (which texture holds the worst PSNR): the
+        // FR_SKY_LOD env-lever idiom, read-only and off by default.
+        if std::env::var_os("FR_BC7_DUMP").is_some() {
+            eprintln!(
+                "bc7 fid: {:>7.1} dB  {}x{} srgb={} {}",
+                psnr, t.w, t.h, t.srgb, t.source
+            );
+        }
+        worst_psnr = worst_psnr.min(psnr);
+    }
+    Ok(Some(Bc7Fidelity {
+        textures: ids.len(),
+        mean_abs: sum_abs / n_samples as f64,
+        max_abs,
+        worst_psnr,
+    }))
+}
+
+/// The M11 `.Load`-decode kernel, packaged so `bc7_fidelity` and the
+/// structural gate below share one implementation: [0] table of one SRV
+/// (t0), [1] root UAV (u0), [2] two root constants (b0: W, H).
+struct Bc7ReadKernel {
+    root: ID3D12RootSignature,
+    pso: ID3D12PipelineState,
+    heap: ID3D12DescriptorHeap,
+}
+
+fn bc7_read_kernel(device: &ID3D12Device) -> Result<Bc7ReadKernel> {
     let ranges = [D3D12_DESCRIPTOR_RANGE {
         RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
         NumDescriptors: 1,
@@ -4371,7 +4671,7 @@ pub fn bc7_fidelity(
     };
     let mut blob = None;
     unsafe { D3D12SerializeRootSignature(&sig_desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, None) }
-        .map_err(|e| format!("bc7 fidelity root sig serialize: {e}"))?;
+        .map_err(|e| format!("bc7 read root sig serialize: {e}"))?;
     let blob = blob.unwrap();
     let root: ID3D12RootSignature = unsafe {
         device.CreateRootSignature(
@@ -4379,7 +4679,7 @@ pub fn bc7_fidelity(
             std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()),
         )
     }
-    .map_err(|e| format!("bc7 fidelity root sig: {e}"))?;
+    .map_err(|e| format!("bc7 read root sig: {e}"))?;
     let cs = super::tonemap::compile(
         BC7_READ_HLSL,
         windows::core::s!("cs_bc7_read"),
@@ -4396,7 +4696,7 @@ pub fn bc7_fidelity(
             ..Default::default()
         })
     }
-    .map_err(|e| format!("bc7 fidelity PSO: {e}"))?;
+    .map_err(|e| format!("bc7 read PSO: {e}"))?;
     let heap: ID3D12DescriptorHeap = unsafe {
         device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
             Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
@@ -4405,121 +4705,214 @@ pub fn bc7_fidelity(
             ..Default::default()
         })
     }
-    .map_err(|e| format!("bc7 fidelity heap: {e}"))?;
+    .map_err(|e| format!("bc7 read heap: {e}"))?;
+    Ok(Bc7ReadKernel { root, pso, heap })
+}
 
-    // One staging pair reused across textures (the blocking submits fence it).
-    let max_stage = ids
-        .iter()
-        .map(|&i| {
-            let t = &scene.textures[i];
-            d3d12::block_pitch(t.w) * bc7::blocks(t.h) as usize
-        })
-        .max()
-        .unwrap();
-    let max_out = ids
-        .iter()
-        .map(|&i| scene.textures[i].w as u64 * scene.textures[i].h as u64 * 4)
-        .max()
-        .unwrap();
-    let stage = d3d12::UploadBuffer::new(&device, max_stage)?;
+/// Hardware-decode a `BC7_UNORM` texture (resting in NPSR) back to packed
+/// RGBA8 bytes via the spec-bit-exact `.Load` path. `out` must be an
+/// UNORDERED_ACCESS buffer of at least `w*h*4` bytes.
+fn bc7_decode_tex(
+    hg: &mut HeadlessGpu,
+    rk: &Bc7ReadKernel,
+    tex: &ID3D12Resource,
+    w: u32,
+    h: u32,
+    out: &ID3D12Resource,
+) -> Result<Vec<u8>> {
+    use super::d3d12::Submit;
+    let device = hg.device.clone();
+    let fmt = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_BC7_UNORM;
+    unsafe {
+        device.CreateShaderResourceView(
+            tex,
+            Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: fmt,
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2D: D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() },
+                },
+            }),
+            rk.heap.GetCPUDescriptorHandleForHeapStart(),
+        )
+    };
+    hg.run_list(&mut |l| {
+        unsafe {
+            l.SetDescriptorHeaps(&[Some(rk.heap.clone())]);
+            l.SetComputeRootSignature(&rk.root);
+            l.SetPipelineState(&rk.pso);
+            l.SetComputeRootDescriptorTable(0, rk.heap.GetGPUDescriptorHandleForHeapStart());
+            l.SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
+            l.SetComputeRoot32BitConstants(2, 2, [w, h].as_ptr() as *const _, 0);
+            l.Dispatch(w.div_ceil(8), h.div_ceil(8), 1);
+        }
+        Ok(())
+    })?;
+    hg.read_buffer(out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, (w * h) as usize * 4)
+}
+
+/// The `--check-gpu` STRUCTURAL gate for the GPU BC7 encoder — synthetic
+/// textures, so it fires on every scene including the untextured procedural
+/// default (where M11 skips). Three teeth:
+///
+/// 1. A flat 16x16 whose channels all agree in parity (all-even) must come
+///    back through the hardware decoder BIT-EXACT — mode 6 represents such a
+///    color exactly via e0 == e1, so any loss here is a wiring bug, not
+///    quantization.
+/// 2. Every block of that flat texture must be byte-identical to block 0 —
+///    the CPU self_test's stride-bug catch, ported: a tight-packed store
+///    (ignoring `block_pitch`) or a wrong row stride makes blocks differ.
+/// 3. A gradient ramp at both effort tiers must clear 30 dB RGB PSNR — a
+///    sanity bar the mode-6 fit passes with a wide margin (a broken index /
+///    anchor / endpoint path lands far below it).
+pub fn bc7_gpu_self_test(hg: &mut HeadlessGpu) -> Result<()> {
+    use super::d3d12::Submit;
+    let device = hg.device.clone();
+    let fmt = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_BC7_UNORM;
+    let enc = super::bc7gpu::Bc7Enc::new(&device, d3d12::block_pitch(64) * bc7::blocks(64) as usize)
+        .map_err(|e| format!("bc7-gpu: encoder construction: {e}"))?;
+    let rk = bc7_read_kernel(&device)?;
     let out = committed_buffer(
         &device,
-        max_out,
+        64 * 64 * 4,
         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
     )?;
+    let stage = d3d12::UploadBuffer::new(&device, d3d12::aligned_pitch(64 * 4) * 64)?;
 
-    let (mut sum_abs, mut n_samples, mut max_abs, mut worst_psnr) = (0f64, 0u64, 0u32, f64::MAX);
-    for (i, enc) in &blocks_by_id {
-        let t = &scene.textures[*i];
-        let fmt = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_BC7_UNORM;
+    // Encode w×h texels on the GPU; return (raw block-buffer bytes, decoded
+    // RGBA8) — the pair every tooth below is scored on.
+    let encode = |hg: &mut HeadlessGpu,
+                      w: u32,
+                      h: u32,
+                      texels: &[[u8; 4]],
+                      effort: u32|
+     -> Result<(Vec<u8>, Vec<u8>)> {
+        let row_pitch = d3d12::aligned_pitch(w as usize * 4);
+        for y in 0..h as usize {
+            let row = &texels[y * w as usize..(y + 1) * w as usize];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    row.as_flattened().as_ptr(),
+                    stage.ptr.add(y * row_pitch),
+                    w as usize * 4,
+                )
+            };
+        }
         let tex = d3d12::committed_tex(
             &device,
-            t.w,
-            t.h,
+            w,
+            h,
             fmt,
             D3D12_RESOURCE_FLAG_NONE,
             D3D12_RESOURCE_STATE_COPY_DEST,
         )?;
-        let src_pitch = bc7::blocks(t.w) as usize * bc7::BLOCK_BYTES;
-        let pitch = d3d12::block_pitch(t.w);
-        for r in 0..bc7::blocks(t.h) as usize {
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    enc[r * src_pitch..].as_ptr(),
-                    stage.ptr.add(r * pitch),
-                    src_pitch,
-                )
-            };
-        }
-        let fp = d3d12::footprint_block(fmt, t.w, t.h, 0);
         hg.run_list(&mut |l| {
+            enc.record_encode(l, &stage.resource, w, h, row_pitch as u32, bc7::blocks(h), effort);
+            enc.record_copy_out(l, &tex, 0, 0, fmt, w, h);
             unsafe {
-                l.CopyTextureRegion(
-                    &d3d12::loc_subresource(&tex),
-                    0,
-                    0,
-                    0,
-                    &d3d12::loc_footprint(&stage.resource, fp),
-                    None,
-                );
                 l.ResourceBarrier(&[transition(
                     &tex,
                     D3D12_RESOURCE_STATE_COPY_DEST,
                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                )]);
-            }
+                )])
+            };
             Ok(())
         })?;
-        unsafe {
-            device.CreateShaderResourceView(
-                &tex,
-                Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
-                    Format: fmt,
-                    ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
-                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                        Texture2D: D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() },
-                    },
-                }),
-                heap.GetCPUDescriptorHandleForHeapStart(),
-            )
-        };
-        hg.run_list(&mut |l| {
-            unsafe {
-                l.SetDescriptorHeaps(&[Some(heap.clone())]);
-                l.SetComputeRootSignature(&root);
-                l.SetPipelineState(&pso);
-                l.SetComputeRootDescriptorTable(0, heap.GetGPUDescriptorHandleForHeapStart());
-                l.SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
-                l.SetComputeRoot32BitConstants(2, 2, [t.w, t.h].as_ptr() as *const _, 0);
-                l.Dispatch(t.w.div_ceil(8), t.h.div_ceil(8), 1);
-            }
-            Ok(())
-        })?;
-        let dec = hg.read_buffer(
-            &out,
+        let blocks = hg.read_buffer(
+            &enc.block_buf,
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            (t.w * t.h) as usize * 4,
+            d3d12::block_pitch(w) * bc7::blocks(h) as usize,
         )?;
-        let mut sq = 0f64;
-        for (px, src) in t.texels.iter().enumerate() {
-            for c in 0..3 {
-                let d = dec[px * 4 + c].abs_diff(src[c]) as u32;
-                sum_abs += d as f64;
-                sq += (d as f64) * (d as f64);
-                max_abs = max_abs.max(d);
-            }
-            n_samples += 3;
-        }
-        let mse = sq / (t.texels.len() as f64 * 3.0);
-        let psnr = if mse > 0.0 { 10.0 * (255.0f64 * 255.0 / mse).log10() } else { 99.0 };
-        worst_psnr = worst_psnr.min(psnr);
+        let dec = bc7_decode_tex(hg, &rk, &tex, w, h, &out)?;
+        Ok((blocks, dec))
+    };
+
+    // Tooth 1 + 2: the all-even flat block.
+    let flat_c = [200u8, 30, 30, 255];
+    let flat: Vec<[u8; 4]> = vec![flat_c; 16 * 16];
+    let (blocks, dec) = encode(hg, 16, 16, &flat, 1)?;
+    let pitch = d3d12::block_pitch(16);
+    let b0 = &blocks[0..bc7::BLOCK_BYTES];
+    if b0.iter().all(|&b| b == 0) {
+        return Err("bc7-gpu: flat block encoded to all zeros (kernel did not run?)".into());
     }
-    Ok(Some(Bc7Fidelity {
-        textures: blocks_by_id.len(),
-        mean_abs: sum_abs / n_samples as f64,
-        max_abs,
-        worst_psnr,
-    }))
+    for by in 0..bc7::blocks(16) as usize {
+        for bx in 0..bc7::blocks(16) as usize {
+            let b = &blocks[by * pitch + bx * bc7::BLOCK_BYTES..][..bc7::BLOCK_BYTES];
+            if b != b0 {
+                return Err(format!(
+                    "bc7-gpu: flat texture block ({bx},{by}) differs from block 0 (stride bug? \
+                     the store must honor block_pitch)"
+                ));
+            }
+        }
+    }
+    for (px, d) in dec.chunks_exact(4).enumerate() {
+        if d[0] != flat_c[0] || d[1] != flat_c[1] || d[2] != flat_c[2] {
+            return Err(format!(
+                "bc7-gpu: all-even flat color must round-trip BIT-EXACT; px {px} decoded \
+                 ({},{},{}) want ({},{},{})",
+                d[0], d[1], d[2], flat_c[0], flat_c[1], flat_c[2]
+            ));
+        }
+    }
+
+    // Tooth 3: gradient ramp, every effort tier (0/1 = mode-6 depth, 2/3 =
+    // the always-mode-1 arms — a smooth ramp must never get WORSE for
+    // trying the two-subset mode, since the chooser keeps the lower SSE).
+    let ramp: Vec<[u8; 4]> = (0..64u32)
+        .flat_map(|y| {
+            (0..64u32).map(move |x| [(x * 4 + 1) as u8, (y * 4) as u8, (x * 2 + y * 2) as u8, 255])
+        })
+        .collect();
+    for effort in [0u32, 1, 2, 3] {
+        let (_, dec) = encode(hg, 64, 64, &ramp, effort)?;
+        let mut sq = 0f64;
+        for (px, s) in ramp.iter().enumerate() {
+            for c in 0..3 {
+                let d = dec[px * 4 + c].abs_diff(s[c]) as f64;
+                sq += d * d;
+            }
+        }
+        let mse = sq / (ramp.len() as f64 * 3.0);
+        let psnr = if mse > 0.0 { 10.0 * (255.0f64 * 255.0 / mse).log10() } else { 99.0 };
+        if psnr < 30.0 {
+            return Err(format!(
+                "bc7-gpu: ramp PSNR {psnr:.1} dB < 30 at effort {effort} (encoder math broken?)"
+            ));
+        }
+    }
+
+    // Tooth 4: a two-CLUSTER block (a red-ish pair left, a blue-ish pair
+    // right — four colors no single line can fit). Mode 6 alone leaves
+    // ~20-LSB errors; a small max error therefore proves the mode-1 arm
+    // FIRED and that its partition/anchor tables and packing agree with the
+    // hardware decoder (a wrong table entry decodes texels against the
+    // wrong subset and the error explodes).
+    let cl = |x: usize, y: usize| -> [u8; 4] {
+        match (x < 2, y % 2 == 0) {
+            (true, true) => [200, 0, 0, 255],
+            (true, false) => [220, 20, 20, 255],
+            (false, true) => [0, 0, 200, 255],
+            (false, false) => [20, 20, 220, 255],
+        }
+    };
+    let pair: Vec<[u8; 4]> =
+        (0..4usize).flat_map(|y| (0..4usize).map(move |x| cl(x, y))).collect();
+    let (_, dec) = encode(hg, 4, 4, &pair, 1)?;
+    let mut worst = 0u32;
+    for (px, s) in pair.iter().enumerate() {
+        for c in 0..3 {
+            worst = worst.max(dec[px * 4 + c].abs_diff(s[c]) as u32);
+        }
+    }
+    if worst > 6 {
+        return Err(format!(
+            "bc7-gpu: two-cluster block max err {worst} LSB > 6 — the mode-1 arm did not fire \
+             or its partition/anchor/packing disagree with the hardware decoder"
+        ));
+    }
+    Ok(())
 }

@@ -31,6 +31,7 @@ pub mod quin;
 pub mod rr;
 pub mod streamline;
 pub mod streamline_sys;
+pub mod bc7gpu;
 pub mod bloom;
 pub mod tonemap;
 pub mod trace;
@@ -2118,10 +2119,10 @@ impl GpuContext {
         gbuf: bool,
         nppd: Option<(&str, &str)>,
         debug: bool,
-        bc7_q: Option<crate::bc7::Quality>,
+        bc7_mode: crate::bc7::Bc7Mode,
     ) -> Result<()> {
         let dev = self.d3d.device.clone();
-        let core = self.ensure_scene_gpu(scene, bvh, bc7_q)?;
+        let core = self.ensure_scene_gpu(scene, bvh, bc7_mode)?;
         let tg = trace::TraceGpu::new(
             &dev,
             dxc,
@@ -2215,11 +2216,11 @@ impl GpuContext {
         &mut self,
         scene: &crate::scene::Scene,
         bvh: &crate::bvh::Bvh,
-        bc7_q: Option<crate::bc7::Quality>,
+        bc7_mode: crate::bc7::Bc7Mode,
     ) -> Result<std::rc::Rc<trace::SceneGpu>> {
         if self.scene_gpu.is_none() {
             let dev = self.d3d.device.clone();
-            let core = trace::SceneGpu::new_uploaded(&dev, scene, bvh, &mut self.d3d, bc7_q)?;
+            let core = trace::SceneGpu::new_uploaded(&dev, scene, bvh, &mut self.d3d, bc7_mode)?;
             self.scene_gpu = Some(std::rc::Rc::new(core));
         }
         Ok(self.scene_gpu.clone().expect("just ensured"))
@@ -2284,13 +2285,13 @@ impl GpuContext {
         rh: u32,
         gbuf: bool,
         debug: bool,
-        bc7_q: Option<crate::bc7::Quality>,
+        bc7_mode: crate::bc7::Bc7Mode,
     ) -> Result<()> {
         if self.dxr.is_some() {
             return Ok(());
         }
         let dev = self.d3d.device.clone();
-        let core = self.ensure_scene_gpu(scene, bvh, bc7_q)?;
+        let core = self.ensure_scene_gpu(scene, bvh, bc7_mode)?;
         let mut d = match dxr::DxrGpu::new(&dev, dxc, scene, core, rw, rh, gbuf, debug) {
             Ok(d) => d,
             Err(e) => {

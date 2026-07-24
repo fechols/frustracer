@@ -228,9 +228,10 @@ opt_fields! {
         pub hemi_share: bool,
         pub cut_rays: bool,
         pub cut_hemi: bool,
-        /// --bc7 (the `fast` profile unless bc7_quality names one)
+        /// BC7 texture compression (ON by default — the GPU encoder at
+        /// `fast`; false = --no-bc7. The --bc7-cpu A/B arm is CLI-only.)
         pub bc7: bool,
-        /// "ultrafast" | "fast" | "basic" | "slow" (implies bc7)
+        /// "ultrafast" | "fast" | "basic" | "slow" (implies bc7 on)
         pub bc7_quality: String,
         /// --dxr-inline 0|1|2 (the DXR ray-dispatch mode; default 1 = inline
         /// RayQuery secondaries)
@@ -695,17 +696,25 @@ pub fn apply_to_opts(s: &Settings, opts: &mut crate::Opts) -> AppliedFx {
     if let Some(v) = a.cut_hemi {
         opts.cut_hemi = v;
     }
-    if let Some(v) = a.bc7 {
-        if v {
-            opts.bc7 = opts.bc7.or(Some(crate::bc7::Quality::Fast));
-        } else {
-            opts.bc7 = None;
-        }
-    }
+    // bc7_quality applies BEFORE the bc7 toggle: a settings file has no flag
+    // order, so "quality implies on" (the CLI rule) must not defeat an
+    // explicit bc7=false — quality first, then the toggle, makes off always
+    // win while bc7=true keeps the quality (`armed_or_default` preserves an
+    // armed mode).
     if let Some(q) = a.bc7_quality.as_deref() {
         match crate::bc7::Quality::parse(q) {
-            Some(v) => opts.bc7 = Some(v),
+            Some(v) => opts.bc7 = opts.bc7.with_quality(v),
             None => warn("advanced.bc7_quality", q),
+        }
+    }
+    if let Some(v) = a.bc7 {
+        // The file toggle mirrors --bc7/--no-bc7: true arms the default
+        // (keeping an already-armed mode's arm/quality — precedence lets a
+        // later CLI --bc7-cpu still win), false is the kill lever.
+        if v {
+            opts.bc7 = opts.bc7.armed_or_default();
+        } else {
+            opts.bc7 = crate::bc7::Bc7Mode::Off;
         }
     }
     if let Some(v) = a.fsr4_required {
@@ -994,7 +1003,7 @@ pub fn menu_items() -> &'static [MenuItem] {
             item!("hemi_share", "hemi sharing", "Advanced", Restart, Toggle { default: true }, acc_bool!(advanced.hemi_share)),
             item!("cut_rays", "cut-seeded rays", "Advanced", Restart, Toggle { default: true }, acc_bool!(advanced.cut_rays)),
             item!("cut_hemi", "cut-seeded hemi rays", "Advanced", Restart, Toggle { default: false }, acc_bool!(advanced.cut_hemi)),
-            item!("bc7", "BC7 texture compression", "Advanced", Restart, Toggle { default: false }, acc_bool!(advanced.bc7)),
+            item!("bc7", "BC7 texture compression", "Advanced", Restart, Toggle { default: true }, acc_bool!(advanced.bc7)),
             item!("bc7_quality", "BC7 quality", "Advanced", Restart, Cycle { options: &["ultrafast", "fast", "basic", "slow"], default_ix: 1 }, acc_str!(advanced.bc7_quality)),
             item!("dxr_inline", "DXR dispatch mode (0/1/2)", "Advanced", Restart, Cycle { options: &["0", "1", "2"], default_ix: 1 }, acc_u32!(advanced.dxr_inline)),
             item!("fsr4_required", "require FSR4 (exit if absent)", "Advanced", Restart, Toggle { default: false }, acc_bool!(advanced.fsr4_required)),

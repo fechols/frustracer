@@ -537,5 +537,6 @@ session. The numbers were the product; the default is the dividend.
 
 Cut-aware leaf ordering (sort the cut by distance once per leaf tile so all 64
 rays shrink `tmax` early), and adapting the frame budget from measured
-resolve/present cost. A GPU compute BC7 encoder (the ispc encode is ~20 s on
-Intel Sponza and runs every load — there is no disk cache).
+resolve/present cost. (The GPU compute BC7 encoder that used to live here
+shipped: `src/gpu/bc7gpu.rs` — Intel Sponza's ~20 s ispc encode is now 280 ms
+on the GPU, which is what let BC7 become the default.)
