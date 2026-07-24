@@ -608,7 +608,12 @@ cargo run --release -- --fg           # FRAME GENERATION, DLSS family (W4 leg 2)
                                       # a failed/skipped evaluate never re-presents a stale
                                       # out-texture; real = nothing NGX-made on screen, the
                                       # present-path null test — pacing identical in all
-                                      # modes). An unrecognized lever value is LOUD and takes
+                                      # modes), FR_NGXFG_PACE=1 (per-frame pacing probe:
+                                      # backbuffer indices of both pair halves + DXGI frame
+                                      # statistics per rendered frame — diff pacing between
+                                      # arms from a log; FOREGROUND window only, DWM retires
+                                      # an occluded window's presents unthrottled). An
+                                      # unrecognized lever value is LOUD and takes
                                       # the default (a silent no-op A/B walk is the failure
                                       # mode the levers exist to prevent).
                                       # Reset frames evaluate (to seed history) but

@@ -4627,12 +4627,46 @@ impl GpuContext {
         if !show {
             end_slot = tonemap::SRV_SLOT_RR;
         }
+        // FR_NGXFG_PACE=1: per-frame pacing probe (kept diagnostic lever, the
+        // FR_DLSSG_NO_RR class) — logs the backbuffer indices both halves
+        // record into and the swapchain's own frame statistics, so a pacing
+        // anomaly (skipped/duplicated vblanks, present-queue stalls, a
+        // buffer-rotation break) is diffable between arms from a log instead
+        // of argued about. A 2026-07 flicker report was triaged with it:
+        // wavefront and DXR arms measured byte-identical rotation
+        // (1/2 -> 3/4 -> 5/0 mod PAIR_BACKBUFFERS, one pair per frame).
+        // Caveat: run the window FOREGROUND — DWM retires an occluded
+        // window's presents unthrottled, which voids the vsync half of the
+        // statistics.
+        static PACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let pace = *PACE.get_or_init(|| std::env::var("FR_NGXFG_PACE").is_ok());
+        let t0 = pace.then(std::time::Instant::now);
+        let bb0 = pace.then(|| unsafe { self.d3d.swapchain.GetCurrentBackBufferIndex() });
         if show {
             self.fullscreen_to_backbuffer(true, mid_slot, 1.0);
             self.d3d.present_mid(slot)?;
         }
+        let bb1 = pace.then(|| unsafe { self.d3d.swapchain.GetCurrentBackBufferIndex() });
         self.fullscreen_to_backbuffer(true, end_slot, 1.0);
-        self.d3d.end_frame(slot)
+        let r = self.d3d.end_frame(slot);
+        if pace {
+            let mut st = windows::Win32::Graphics::Dxgi::DXGI_FRAME_STATISTICS::default();
+            let stats = unsafe { self.d3d.swapchain.GetFrameStatistics(&mut st) };
+            let id = self.fg_n.as_ref().map_or(0, |n| n.frame_id.get());
+            eprintln!(
+                "fg-pace: id={} show={} bb={}/{} ms={:.2} pc={} spc={} src={} {}",
+                id,
+                show as u8,
+                bb0.unwrap_or(9),
+                bb1.unwrap_or(9),
+                t0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0),
+                st.PresentCount,
+                st.SyncQPCTime / 10_000,
+                st.SyncRefreshCount,
+                if stats.is_err() { "(stats-err)" } else { "" },
+            );
+        }
+        r
     }
 
     /// DLSS-G per-frame bracket, first half — the top of an RR arm: Reflex
