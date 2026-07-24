@@ -505,8 +505,8 @@ fn integrate_loop(shared: &Shared, hwnd: isize, diag: f32, attractors: &[TodAttr
         slow_shift = ramp(slow_shift, down(VK_SHIFT.0) || pad.as_ref().is_some_and(|p| p.rb));
         let smooth = |t: f32| t * t * (3.0 - 2.0 * t);
         let slow = (-4.0 * smooth(slow_ctrl) - 3.0 * smooth(slow_shift)).exp2();
-        // --- flight speed: diag * 0.25 / s, times the slow factor.
-        let speed = diag * 0.25 * dt * slow;
+        // --- flight speed: diag * 0.1875 / s, times the slow factor.
+        let speed = diag * 0.1875 * dt * slow;
 
         // Keyboard direction flags (unit directions, normalized below —
         // exactly the old apply_movement).
