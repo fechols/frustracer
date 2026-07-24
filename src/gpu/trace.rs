@@ -998,35 +998,81 @@ struct GpuMat {
 /// ~7 GB of repack Vecs).
 const STAGE_CHUNK: usize = 256 << 20;
 
-/// Which software acceleration structure(s) ride t0 for the FRUSTUM queries
-/// (their only consumer — every actual ray is DXR RayQuery). `Bvh` = the
-/// binary tree alone; `Both` = binary PLUS the 8-wide frustum tree — the
-/// per-consumer split ON the GPU: the tile kernels compile `#define FTREE`
-/// and bind the wide tree at t0 (long queries, wide wins big), while
-/// `record_hemi` rebinds the binary tree for the hemi kernels (hemi bound
-/// queries terminate in ~10 visits — a binary pop is 1 box test where a wide
-/// pop is always 8, and the wide tree measured +35% there). `None` =
-/// DXR-only, dummies.
-#[derive(Clone, Copy)]
-pub enum SwAccel<'a> {
-    Bvh(&'a Bvh),
-    Both(&'a Bvh, &'a crate::ftree::FTree),
-    None,
-}
-
-/// Steady-state byte total of the scene's buffer streams (excludes textures
-/// and acceleration structures) — sizes the staging ring and the init report.
-fn scene_stream_bytes(scene: &Scene, sw_bvh: SwAccel) -> usize {
+/// Steady-state byte total of the scene's buffer streams (excludes textures,
+/// acceleration structures, and the wavefront-only software trees — those
+/// live in `SwTreesGpu`) — sizes the staging ring and the init report.
+fn scene_stream_bytes(scene: &Scene) -> usize {
     let v = scene.positions.len();
     let t = scene.indices.len();
     let m = scene.materials.len();
-    let bin = |b: &Bvh| b.nodes.len() * size_of::<GpuBvhNode>() + b.tri_idx.len() * 4;
-    let bvh = match sw_bvh {
-        SwAccel::Bvh(b) => bin(b),
-        SwAccel::Both(b, ft) => bin(b) + ft.quantized_bytes(),
-        SwAccel::None => 0,
-    };
-    bvh + v * (12 + 12 + 8) + t * (12 + 4) + m * (size_of::<GpuMat>() + 4)
+    v * (12 + 12 + 8) + t * (12 + 4) + m * (size_of::<GpuMat>() + 4)
+}
+
+/// The software acceleration structure(s) that ride t0 for the FRUSTUM
+/// queries (their only consumer — every actual ray is DXR RayQuery).
+/// WAVEFRONT-ONLY, which is why these live outside the shared `SceneGpu`
+/// core: DxrGpu never binds any of them, so a DXR session simply never
+/// uploads them (~2.3 GB at 100M tris — what the old `SwAccel::None`
+/// dummies bought, now structural). `ftree_nodes` is the per-consumer split
+/// ON the GPU: the tile kernels compile `#define FTREE` and bind the wide
+/// tree at t0 (long queries, wide wins big), while `record_hemi` rebinds the
+/// binary tree for the hemi kernels (hemi bound queries terminate in ~10
+/// visits — a binary pop is 1 box test where a wide pop is always 8, and the
+/// wide tree measured +35% there).
+pub struct SwTreesGpu {
+    pub bvh_nodes: ID3D12Resource,
+    pub tri_idx: ID3D12Resource,
+    /// The 8-wide frustum tree, uploaded in its QUANTIZED wire format
+    /// (ftree::QFNode, 112 B — the HLSL FtNode mirror; self_test audits
+    /// containment): the per-processor split verdict — the CPU keeps the
+    /// f32 nodes, the GPU trades decode ALU for -56% tree bandwidth/VRAM.
+    /// None when the ftree lever is off.
+    pub ftree_nodes: Option<ID3D12Resource>,
+}
+
+impl SwTreesGpu {
+    /// Upload the binary BVH (+ the wide tree when built) through a
+    /// buffer-sized staging ring. Separate from `SceneGpu::new_uploaded` by
+    /// design: the shared core is per-SESSION (both tracers hold an Rc),
+    /// these trees are per-TraceGpu.
+    fn new_uploaded(
+        device: &ID3D12Device,
+        bvh: &Bvh,
+        ft: Option<&crate::ftree::FTree>,
+        sub: &mut dyn d3d12::Submit,
+    ) -> Result<Self> {
+        let srv = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        let bytes = bvh.nodes.len() * size_of::<GpuBvhNode>()
+            + bvh.tri_idx.len() * 4
+            + ft.map_or(0, |f| f.quantized_bytes());
+        let ring = d3d12::UploadBuffer::new(device, STAGE_CHUNK.min(bytes.max(4096)))?;
+        let bvh_nodes = stream_buffer(
+            device,
+            sub,
+            &ring,
+            &bvh.nodes,
+            |n| GpuBvhNode {
+                mn: [n.aabb.min.x, n.aabb.min.y, n.aabb.min.z],
+                left_first: n.left_first,
+                mx: [n.aabb.max.x, n.aabb.max.y, n.aabb.max.z],
+                count: n.count,
+            },
+            srv,
+        )?;
+        let tri_idx = stream_buffer(device, sub, &ring, &bvh.tri_idx, |t| *t, srv)?;
+        let ftree_nodes = match ft {
+            Some(f) => {
+                let qn = f.quantized();
+                Some(stream_buffer(device, sub, &ring, &qn, |n| *n, srv)?)
+            }
+            None => None,
+        };
+        eprintln!("gpu sw-trees: {} MB (binary bvh + tri idx{})", bytes >> 20, match ft {
+            Some(f) => format!(", ftree {} MB", f.quantized_bytes() >> 20),
+            None => String::new(),
+        });
+        Ok(Self { bvh_nodes, tri_idx, ftree_nodes })
+    }
 }
 
 /// Stream `src` into a new default-heap buffer through `ring`, `map`ping each
@@ -1080,13 +1126,13 @@ fn stream_buffer<T: Copy, U: Copy>(
     Ok(dst)
 }
 
+/// The SHARED scene core: everything both GPU tracers read — streams,
+/// materials, textures, the driver BLAS/TLAS, the blas-split remap.
+/// Immutable after upload; held as `Rc<SceneGpu>` by TraceGpu AND DxrGpu
+/// (cached in GpuContext, so the second tracer and every resize re-entry
+/// skip the upload + BLAS build entirely). The wavefront-only software
+/// trees live in `SwTreesGpu`, deliberately outside the core.
 pub struct SceneGpu {
-    pub bvh_nodes: ID3D12Resource,
-    pub tri_idx: ID3D12Resource,
-    /// The 8-wide frustum tree (SwAccel::Both sessions): bound at t0 by the
-    /// TILE dispatches in place of `bvh_nodes`; the hemi dispatches rebind
-    /// the binary tree (record_hemi) — the per-consumer split on the GPU.
-    pub ftree_nodes: Option<ID3D12Resource>,
     pub positions: ID3D12Resource,
     pub normals: ID3D12Resource,
     pub indices: ID3D12Resource,
@@ -1134,26 +1180,22 @@ pub struct SceneGpu {
 }
 
 impl SceneGpu {
-    /// Create AND upload the scene in one call: every stream chunks through
-    /// one reusable `STAGE_CHUNK` staging ring (blocking submits via `sub`),
-    /// then the BLAS + TLAS build rides a final submit — scratch and staging
-    /// are gone by the time this returns, so peak commit is
-    /// steady-state + one chunk, not steady-state × 2. `sw_bvh: None` is the
-    /// DXR-only session: the software BVH (frustum kernels' tree) is never
-    /// bound there, so `bvh_nodes`/`tri_idx` become 4-byte dummies (~2.3 GB
-    /// saved at 100M tris).
+    /// Create AND upload the shared scene core in one call: every stream
+    /// chunks through one reusable `STAGE_CHUNK` staging ring (blocking
+    /// submits via `sub`), then the BLAS + TLAS build rides a final submit —
+    /// scratch and staging are gone by the time this returns, so peak commit
+    /// is steady-state + one chunk, not steady-state × 2. Runs ONCE per
+    /// session (GpuContext caches the Rc); the wavefront's software trees
+    /// upload separately per TraceGpu (`SwTreesGpu::new_uploaded`).
     /// `bc7_q`: block-compress the OPAQUE scene textures at this ISPC quality
     /// before upload (`--bc7`; `None` = today's RGBA8 everywhere). Alpha-masked
     /// cutout textures stay RGBA8 either way — see src/bc7.rs.
     /// `bvh` is the CHUNKING source for `--blas-split` and is read only when
-    /// that lever is armed — deliberately separate from `sw_bvh`, which decides
-    /// whether the software tree UPLOADS (a DXR-only session passes
-    /// `SwAccel::None` and still splits).
+    /// that lever is armed.
     pub fn new_uploaded(
         device: &ID3D12Device,
         scene: &Scene,
         bvh: &Bvh,
-        sw_bvh: SwAccel,
         sub: &mut dyn d3d12::Submit,
         bc7_q: Option<bc7::Quality>,
     ) -> Result<Self> {
@@ -1184,52 +1226,10 @@ impl SceneGpu {
         let ring = d3d12::UploadBuffer::new(
             device,
             STAGE_CHUNK
-                .min(scene_stream_bytes(scene, sw_bvh).max(4096))
+                .min(scene_stream_bytes(scene).max(4096))
                 .max(max_tex_pitch),
         )?;
 
-        let up_bin = |sub: &mut dyn d3d12::Submit, bvh: &Bvh| -> Result<(ID3D12Resource, ID3D12Resource)> {
-            Ok((
-                stream_buffer(
-                    device,
-                    sub,
-                    &ring,
-                    &bvh.nodes,
-                    |n| GpuBvhNode {
-                        mn: [n.aabb.min.x, n.aabb.min.y, n.aabb.min.z],
-                        left_first: n.left_first,
-                        mx: [n.aabb.max.x, n.aabb.max.y, n.aabb.max.z],
-                        count: n.count,
-                    },
-                    srv,
-                )?,
-                stream_buffer(device, sub, &ring, &bvh.tri_idx, |t| *t, srv)?,
-            ))
-        };
-        let (bvh_nodes, tri_idx, ftree_nodes) = match sw_bvh {
-            SwAccel::Bvh(bvh) => {
-                let (n, t) = up_bin(sub, bvh)?;
-                (n, t, None)
-            }
-            // The per-consumer split: BOTH structures upload — the tile
-            // kernels bind the wide tree at t0 (bind_common), the hemi
-            // kernels the binary one (record_hemi's rebind). The wide tree
-            // uploads in its QUANTIZED wire format (ftree::QFNode, 112 B —
-            // the HLSL FtNode mirror; self_test audits containment): the
-            // per-processor split verdict — the CPU keeps the f32 nodes,
-            // the GPU trades decode ALU for -56% tree bandwidth/VRAM.
-            SwAccel::Both(bvh, ft) => {
-                let (n, t) = up_bin(sub, bvh)?;
-                let qn = ft.quantized();
-                let f = stream_buffer(device, sub, &ring, &qn, |n| *n, srv)?;
-                (n, t, Some(f))
-            }
-            SwAccel::None => (
-                committed_buffer(device, 4, D3D12_RESOURCE_FLAG_NONE, srv)?,
-                committed_buffer(device, 4, D3D12_RESOURCE_FLAG_NONE, srv)?,
-                None,
-            ),
-        };
         let positions_b = stream_buffer(
             device,
             sub,
@@ -1605,7 +1605,7 @@ impl SceneGpu {
             let (lo, mean, hi) = plan.stats();
             eprintln!(
                 "gpu scene: streams {} MB | {} | blas-split {} chunks (prims min {lo} mean {mean:.0} max {hi}, cap {cap}) in {:.0} ms{}",
-                (scene_stream_bytes(scene, sw_bvh) + plan.packed_tris.len() * 16) >> 20,
+                (scene_stream_bytes(scene) + plan.packed_tris.len() * 16) >> 20,
                 report,
                 plan.chunks(),
                 t0.elapsed().as_secs_f64() * 1e3,
@@ -1617,9 +1617,6 @@ impl SceneGpu {
             );
             drop(ring);
             return Ok(Self {
-                bvh_nodes,
-                tri_idx,
-                ftree_nodes,
                 positions: positions_b,
                 normals: normals_b,
                 indices: indices_b,
@@ -1820,7 +1817,7 @@ impl SceneGpu {
 
         eprintln!(
             "gpu scene: streams {} MB | blas {} MB{} | transient scratch {} MB (freed){}",
-            scene_stream_bytes(scene, sw_bvh) >> 20,
+            scene_stream_bytes(scene) >> 20,
             if use_compact { compacted_size } else { blas_info.ResultDataMaxSizeInBytes } >> 20,
             if use_compact {
                 format!(" (compacted from {})", blas_info.ResultDataMaxSizeInBytes >> 20)
@@ -1836,9 +1833,6 @@ impl SceneGpu {
         );
 
         Ok(Self {
-            bvh_nodes,
-            tri_idx,
-            ftree_nodes,
             positions: positions_b,
             normals: normals_b,
             indices: indices_b,
@@ -2121,24 +2115,28 @@ fn build_split_blas(
     // budget is a LOUD failure here rather than a WDDM demotion that silently
     // renders at a tenth the speed.
     //
-    // It CANNOT degrade to the single-BLAS build, and the reason is ordering:
-    // both tracers bake `blas_defs()` into their kernels/RTPSO before calling
-    // `new_uploaded`, so by the time this function can price the structure the
-    // shaders already read `blas_tri[chunk_base[inst] + prim]` — handing them a
-    // one-BLAS scene and the 4-byte dummies would remap every hit to garbage.
-    // (Falling back WOULD be possible by binding an identity remap instead of
-    // the dummies, at 4 B/tri and one indirection; deliberately not done — an
-    // untested path reachable only by exhausting VRAM is exactly how the
-    // dummy-SRV device removal got in.) So the tracer init fails, and the
-    // session's normal shape takes over: a loud line and the CPU renderer.
+    // It CANNOT degrade to the single-BLAS build: the `--blas-split` lever is
+    // session-global and both tracers bake `blas_defs()` into their
+    // kernels/RTPSO, so a degraded ONE-BLAS core would have any armed shader
+    // (already compiled, or compiled later against the shared Rc<SceneGpu>)
+    // reading `blas_tri[chunk_base[inst] + prim]` through 4-byte dummies —
+    // every hit remapped to garbage. (Falling back WOULD be possible by
+    // binding an identity remap instead of the dummies, at 4 B/tri and one
+    // indirection; deliberately not done — an untested path reachable only by
+    // exhausting VRAM is exactly how the dummy-SRV device removal got in.) So
+    // the core upload fails, and the session's normal shape takes over: a
+    // loud line and the CPU renderer.
     if let Some((usage, budget)) = adapter::vram_info(device) {
         let want = total_build + scratch_max + tlas_info.ResultDataMaxSizeInBytes;
         if usage + want > budget {
             return Err(format!(
                 "--blas-split: {} chunks need {} MB of acceleration structure on top of \
-                 {} MB already committed, over the {} MB budget — raise the cap or drop \
-                 --blas-split (the GPU tracer cannot start, so the session falls back to \
-                 the CPU renderer)",
+                 {} MB already committed, over the {} MB budget — free VRAM first: --bc7 \
+                 (opaque textures 8 bpp vs 32), --lock-res <scale> (smaller render-res \
+                 buffers), or a smaller scene. Do NOT drop --blas-split on Intel — the \
+                 single-BLAS build's scratch ask removes the device on large scenes. \
+                 (The GPU tracers cannot start, so the session falls back to the CPU \
+                 renderer)",
                 n,
                 want >> 20,
                 usage >> 20,
@@ -2823,7 +2821,13 @@ pub struct TraceGpu {
     /// GPU-resident NPPD staging (the --gpu --nppd composition) — buffers
     /// nppd::NppdGpu wraps as ORT tensors, plus the staging kernels.
     pub nppd: Option<NppdRes>,
-    pub scene: SceneGpu,
+    /// The shared scene core — one Rc per tracer, cached in GpuContext (the
+    /// second tracer and resize re-entries skip the upload + BLAS build).
+    pub scene: std::rc::Rc<SceneGpu>,
+    /// The wavefront-only software trees (binary BVH + optional wide tree) —
+    /// per-TraceGpu, deliberately outside the shared core (DXR never binds
+    /// them).
+    sw: SwTreesGpu,
     /// Per-pixel planes, CPU-layout parity (accum = 3 f32/px, tbuf = f32/px,
     /// info = u32/px) so readback compares are direct memcmp-shaped.
     pub accum: ID3D12Resource,
@@ -2876,12 +2880,12 @@ impl TraceGpu {
         dxc: &Dxc,
         scene: &Scene,
         bvh: &Bvh,
+        scene_gpu: std::rc::Rc<SceneGpu>,
         rw: u32,
         rh: u32,
         gbuf_full: bool,
         nppd: bool,
         debug: bool,
-        bc7_q: Option<bc7::Quality>,
         sub: &mut dyn d3d12::Submit,
     ) -> Result<Self> {
         require_caps(device)?;
@@ -3094,11 +3098,9 @@ impl TraceGpu {
             );
             ft
         });
-        let sw = match &ft {
-            Some(t) => SwAccel::Both(bvh, t),
-            None => SwAccel::Bvh(bvh),
-        };
-        let scene_gpu = SceneGpu::new_uploaded(device, scene, bvh, sw, sub, bc7_q)?;
+        // The shared core arrived pre-uploaded (Rc from GpuContext's cache);
+        // only the wavefront's own software trees upload here.
+        let sw = SwTreesGpu::new_uploaded(device, bvh, ft.as_ref(), sub)?;
         drop(ft);
 
         let uaf = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
@@ -3320,6 +3322,7 @@ impl TraceGpu {
             device: device.clone(),
             nppd: nppd_res,
             scene: scene_gpu,
+            sw,
             accum,
             tbuf,
             info,
@@ -3509,14 +3512,15 @@ impl TraceGpu {
             // Tile dispatches consume the wide frustum tree at t0 when the
             // session carries one (`#define FTREE` matched at kernel-assembly
             // time); record_hemi rebinds the binary tree for the hemi phase.
-            let t0 = s.ftree_nodes.as_ref().unwrap_or(&s.bvh_nodes);
+            // The software trees live in self.sw, not the shared core.
+            let t0 = self.sw.ftree_nodes.as_ref().unwrap_or(&self.sw.bvh_nodes);
             list.SetComputeRootShaderResourceView(
                 RP_SRV0 + SRV_BVH_NODES,
                 t0.GetGPUVirtualAddress(),
             );
             list.SetComputeRootShaderResourceView(
                 RP_SRV0 + SRV_TRI_IDX,
-                s.tri_idx.GetGPUVirtualAddress(),
+                self.sw.tri_idx.GetGPUVirtualAddress(),
             );
             list.SetComputeRootShaderResourceView(
                 RP_SRV0 + SRV_POSITIONS,
@@ -3798,10 +3802,10 @@ impl TraceGpu {
             // pool (the primary qleaf/cut_pool are done for this frame) —
             // and t0 back to the BINARY tree: the hemi kernels compile the
             // binary bound_query (short queries lose on the wide tree; see
-            // SwAccel), while bind_common bound the wide one for the tiles.
+            // SwTreesGpu), while bind_common bound the wide one for the tiles.
             list.SetComputeRootShaderResourceView(
                 RP_SRV0 + SRV_BVH_NODES,
-                self.scene.bvh_nodes.GetGPUVirtualAddress(),
+                self.sw.bvh_nodes.GetGPUVirtualAddress(),
             );
             list.SetComputeRootUnorderedAccessView(
                 RP_UAV0 + UAV_QLEAF,

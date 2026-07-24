@@ -513,6 +513,14 @@ pub struct GpuContext {
     /// inv_samples)` — `present_again`'s re-present source (the pause menu
     /// holds the frame without tracing). Cell: the recorder is `&self`.
     last_present: std::cell::Cell<Option<(bool, u32, f32)>>,
+    /// The SHARED scene core both GPU tracers hold an Rc of: uploaded once
+    /// per session by whichever of init_trace/init_dxr runs first, so the
+    /// second tracer (and every resize re-entry — the device survives
+    /// resize_output) skips the scene upload + BLAS build entirely. Cleared
+    /// by drop_scene_tracers (the scene was edited) and by the init-failure
+    /// eviction arm (a session with no live tracer must not strand ~9 GB
+    /// under the CPU renderer).
+    scene_gpu: Option<std::rc::Rc<trace::SceneGpu>>,
     /// The GPU-resident tracer (--gpu): quadtree + shading in compute with
     /// RayQuery rays. Lives on whatever device the queue runs on (v1 forces
     /// the native pipeline — main.rs disables DLSS/XeSS/OIDN under --gpu).
@@ -1330,6 +1338,7 @@ impl GpuContext {
             hdr,
             hud,
             last_present: std::cell::Cell::new(None),
+            scene_gpu: None,
             trace: None,
             dxr: None,
             rr: rr_res,
@@ -1620,6 +1629,11 @@ impl GpuContext {
         }
         self.trace = None;
         self.dxr = None;
+        // scene_gpu deliberately SURVIVES: the shared core is scene-bound,
+        // not window-bound (device+queue live across d3d.resize), so the
+        // re-entry's tracer rebuilds skip the scene upload + BLAS build —
+        // resize/F11 no longer re-pays them (only kernel compiles + the
+        // window-sized planes).
         self.nppd_gpu = None;
         self.nppd_state_valid = false;
         self.xess = None;
@@ -2107,23 +2121,38 @@ impl GpuContext {
         bc7_q: Option<crate::bc7::Quality>,
     ) -> Result<()> {
         let dev = self.d3d.device.clone();
-        let mut tg = trace::TraceGpu::new(
+        let core = self.ensure_scene_gpu(scene, bvh, bc7_q)?;
+        let tg = trace::TraceGpu::new(
             &dev,
             dxc,
             scene,
             bvh,
+            core,
             rw,
             rh,
             gbuf,
             nppd.is_some(),
             debug,
-            bc7_q,
             &mut self.d3d,
-        )?;
+        );
+        let mut tg = match tg {
+            Ok(t) => t,
+            Err(e) => {
+                self.evict_unused_scene_gpu();
+                return Err(e);
+            }
+        };
         // Upscaler sessions: wire the live upscaler's input planes as feed
         // targets — the feed kernel writes them directly, no CPU upload.
+        // (Failures before `self.trace = Some(..)` evict the cached core —
+        // the tracer never went live, so nobody holds it.)
         if gbuf {
-            self.wire_session_feed(rw, rh, |kind, targets| tg.wire_feed_add(&dev, kind, targets))?;
+            let wired = self
+                .wire_session_feed(rw, rh, |kind, targets| tg.wire_feed_add(&dev, kind, targets));
+            if let Err(e) = wired {
+                self.evict_unused_scene_gpu();
+                return Err(e);
+            }
         }
         // GPU-resident NPPD: ORT session on OUR device/queue, tensors bound
         // over the NppdRes buffers. XeSS-only (RR is itself a denoiser — the
@@ -2131,6 +2160,7 @@ impl GpuContext {
         // running plain and frees the ~340 MB staging.
         if let Some((dir, model)) = nppd {
             if self.xess.is_none() {
+                self.evict_unused_scene_gpu();
                 return Err("NPPD composition requires the XeSS session".into());
             }
             let built = tg.nppd.as_ref().ok_or("NPPD staging missing".to_string()).and_then(
@@ -2178,6 +2208,33 @@ impl GpuContext {
         self.trace.is_some()
     }
 
+    /// Build-or-fetch the SHARED scene core — the upload + BLAS/TLAS build
+    /// runs once per session (or per scene edit), whichever tracer asks
+    /// first; the other gets the cached Rc for free.
+    fn ensure_scene_gpu(
+        &mut self,
+        scene: &crate::scene::Scene,
+        bvh: &crate::bvh::Bvh,
+        bc7_q: Option<crate::bc7::Quality>,
+    ) -> Result<std::rc::Rc<trace::SceneGpu>> {
+        if self.scene_gpu.is_none() {
+            let dev = self.d3d.device.clone();
+            let core = trace::SceneGpu::new_uploaded(&dev, scene, bvh, &mut self.d3d, bc7_q)?;
+            self.scene_gpu = Some(std::rc::Rc::new(core));
+        }
+        Ok(self.scene_gpu.clone().expect("just ensured"))
+    }
+
+    /// The init-failure eviction arm: when tracer construction fails and no
+    /// tracer is live, a cached core is ~gigabytes serving nobody under the
+    /// CPU renderer — drop it (the failure latch in main.rs means nothing
+    /// will ask again this session).
+    fn evict_unused_scene_gpu(&mut self) {
+        if self.trace.is_none() && self.dxr.is_none() {
+            self.scene_gpu = None;
+        }
+    }
+
     /// Drop the resident GPU tracers (--gpu wavefront + DXR) and their
     /// dependents (the quinlight fuse, GPU-resident NPPD) so the next mode
     /// entry rebuilds their SceneGpu/BLAS/TLAS from the current scene — the
@@ -2192,6 +2249,9 @@ impl GpuContext {
         self.quin = None;
         self.trace = None;
         self.dxr = None;
+        // The shared core is scene-bound too — the next mode entry must
+        // re-upload from the edited scene, never serve the stale cache.
+        self.scene_gpu = None;
     }
 
     /// Push a TOD change (`scene::apply_tod`) into the GPU pipelines' cached
@@ -2210,8 +2270,9 @@ impl GpuContext {
     /// Build the DXR DispatchRays pipeline (the F key / --dxr). Idempotent —
     /// a live pipeline is kept. `(rw, rh)` is the session's fixed DXR trace
     /// resolution (the locked render res when `gbuf` composes with the wired
-    /// upscaler, the window size otherwise); scene buffers + BLAS/TLAS build
-    /// once here (the scene is static, --stress included).
+    /// upscaler, the window size otherwise); scene buffers + BLAS/TLAS come
+    /// from the SHARED core (`ensure_scene_gpu` — uploaded once per session,
+    /// whichever tracer asks first).
     pub fn init_dxr(
         &mut self,
         dxc: &dxc::Dxc,
@@ -2229,10 +2290,22 @@ impl GpuContext {
             return Ok(());
         }
         let dev = self.d3d.device.clone();
-        let mut d =
-            dxr::DxrGpu::new(&dev, dxc, scene, bvh, rw, rh, gbuf, debug, bc7_q, &mut self.d3d)?;
+        let core = self.ensure_scene_gpu(scene, bvh, bc7_q)?;
+        let mut d = match dxr::DxrGpu::new(&dev, dxc, scene, core, rw, rh, gbuf, debug) {
+            Ok(d) => d,
+            Err(e) => {
+                self.evict_unused_scene_gpu();
+                return Err(e);
+            }
+        };
         if gbuf {
-            self.wire_session_feed(rw, rh, |kind, targets| d.wire_feed_add(&dev, kind, targets))?;
+            // Pre-store failure: evict the cached core (the init_trace shape).
+            let wired = self
+                .wire_session_feed(rw, rh, |kind, targets| d.wire_feed_add(&dev, kind, targets));
+            if let Err(e) = wired {
+                self.evict_unused_scene_gpu();
+                return Err(e);
+            }
         }
         wire_tonemap_src(
             &self.d3d.device,

@@ -1877,21 +1877,28 @@ fn run_check_dxr(
 
     let (gw, gh) = (800usize, 600usize);
     let dev = hg.device.clone();
+    // ONE shared core for both DxrGpus this suite builds — the interactive
+    // sessions' Rc-sharing shape (the --check-gpu twin).
+    let core = match gpu::trace::SceneGpu::new_uploaded(&dev, scene, bvh, &mut hg, opts.bc7) {
+        Ok(c) => std::rc::Rc::new(c),
+        Err(e) => {
+            eprintln!("check-dxr: FAIL scene upload: {e}");
+            return 1;
+        }
+    };
     let dg = match gpu::dxr::DxrGpu::new(
         &dev,
         &dxc,
         scene,
-        bvh,
+        core.clone(),
         gw as u32,
         gh as u32,
         false,
         opts.gpu_debug,
-        opts.bc7,
-        &mut hg,
     ) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("check-dxr: FAIL DxrGpu init (RTPSO/SBT/scene upload): {e}");
+            eprintln!("check-dxr: FAIL DxrGpu init (RTPSO/SBT): {e}");
             return 1;
         }
     };
@@ -2304,13 +2311,11 @@ fn run_check_dxr(
             &dev,
             &dxc,
             scene,
-            bvh,
+            core.clone(),
             pw as u32,
             ph as u32,
             true,
             opts.gpu_debug,
-            opts.bc7,
-            &mut hg,
         ) {
             Ok(d) => d,
             Err(e) => {
@@ -3549,17 +3554,27 @@ fn run_check_gpu(
     // at edges/grazing, and the RNG streams differ by design.
     let (gw, gh) = (800usize, 600usize);
     let dev = hg.device.clone();
+    // ONE shared core for every tracer this suite builds — the interactive
+    // sessions' Rc-sharing shape, so the suite's M2/M7/bench trio EXERCISES
+    // the sharing rather than testing three private copies.
+    let core = match gpu::trace::SceneGpu::new_uploaded(&dev, scene, bvh, &mut hg, opts.bc7) {
+        Ok(c) => std::rc::Rc::new(c),
+        Err(e) => {
+            eprintln!("check-gpu: FAIL scene upload: {e}");
+            return 1;
+        }
+    };
     let tg = match gpu::trace::TraceGpu::new(
         &dev,
         &dxc,
         scene,
         bvh,
+        core.clone(),
         gw as u32,
         gh as u32,
         false, // no pack: the M7-M9 gbuf/feed gates build their own tracer
         false,
         opts.gpu_debug,
-        opts.bc7,
         &mut hg,
     ) {
         Ok(t) => t,
@@ -4659,12 +4674,12 @@ fn run_check_gpu(
             &dxc,
             scene,
             bvh,
+            core.clone(),
             pw as u32,
             ph as u32,
             true,
             true, // + the NPPD staging buffers/kernels (M10 gates them)
             opts.gpu_debug,
-            opts.bc7,
             &mut hg,
         ) {
             Ok(t) => t,
@@ -5677,12 +5692,12 @@ fn run_check_gpu(
         &dxc,
         scene,
         bvh,
+        core.clone(),
         bw as u32,
         bh as u32,
         false, // bench frames don't consume the pack
         false,
         opts.gpu_debug,
-        opts.bc7,
         &mut hg,
     ) {
         Ok(t) => t,
@@ -8537,18 +8552,25 @@ fn run_spin_gpu(
         Wave(gpu::trace::TraceGpu),
         Dxr(gpu::dxr::DxrGpu),
     }
+    let core = match gpu::trace::SceneGpu::new_uploaded(&dev, scene, bvh, &mut hg, opts.bc7) {
+        Ok(c) => std::rc::Rc::new(c),
+        Err(e) => {
+            eprintln!("spin: scene upload failed: {e}");
+            return 2;
+        }
+    };
     let armv = if opts.gpu {
         match gpu::trace::TraceGpu::new(
             &dev,
             &dxc,
             scene,
             bvh,
+            core,
             rw as u32,
             rh as u32,
             false, // no G-buffer pack: this measures the tracer
             false, // no NPPD stage
             opts.gpu_debug,
-            opts.bc7,
             &mut hg,
         ) {
             Ok(t) => Arm::Wave(t),
@@ -8562,13 +8584,11 @@ fn run_spin_gpu(
             &dev,
             &dxc,
             scene,
-            bvh,
+            core,
             rw as u32,
             rh as u32,
             false,
             opts.gpu_debug,
-            opts.bc7,
-            &mut hg,
         ) {
             Ok(d) => Arm::Dxr(d),
             Err(e) => {
@@ -12695,11 +12715,13 @@ fn session(
         // present-failure fallback aside), so the pair can never be both
         // true; runs before either GPU arm's `continue`, so it is reachable
         // exactly once per frame in every mode. Each GPU tracer is lazily
-        // built on first entry (DXC load, kernel/RTPSO compile, its own
-        // scene + BLAS upload — TraceGpu and DxrGpu each own a SceneGpu, so
-        // both resident costs ~2x the scene streams; the `gpu scene:`/vram
-        // lines report it) and then stays RESIDENT: later switches are
-        // free. A failed init is memoized (trace_failed/dxr_failed) and the
+        // built on first entry (DXC load, kernel/RTPSO compile) and then
+        // stays RESIDENT: later switches are free. The SCENE half (streams +
+        // BLAS/TLAS + textures) is a SHARED Rc<SceneGpu> cached in
+        // GpuContext — uploaded once by whichever tracer comes first (the
+        // one `gpu scene:` line per session), so the second tracer pays only
+        // its kernels + window planes (+ the wavefront's own sw trees, the
+        // `gpu sw-trees:` line). A failed init is memoized (trace_failed/dxr_failed) and the
         // cycle SKIPS that mode — RT-tier-1.0-only hardware runs DXR but
         // not the wavefront (tier 1.1 / SM 6.5), so the cycle degrades to
         // CPU <-> DXR there, and to CPU-only with no DXC at all.

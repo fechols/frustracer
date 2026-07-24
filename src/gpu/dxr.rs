@@ -113,7 +113,9 @@ pub struct DxrGpu {
     state: ID3D12StateObject,
     sbt: d3d12::UploadBuffer,
     pso_resolve: ID3D12PipelineState,
-    pub scene: SceneGpu,
+    /// The shared scene core — the SAME Rc the wavefront tracer holds (cached
+    /// in GpuContext), so a session running both pays the scene VRAM once.
+    pub scene: std::rc::Rc<SceneGpu>,
     /// Per-pixel planes, CPU-layout parity (accum = 3 f32/px, tbuf = f32/px,
     /// info = u32/px) — the same readback-compare shape as the compute tracer.
     pub accum: ID3D12Resource,
@@ -154,15 +156,11 @@ impl DxrGpu {
         device: &ID3D12Device,
         dxc: &Dxc,
         scene: &Scene,
-        // The --blas-split chunking source; read only when that lever is armed
-        // (this pipeline never uploads the software tree).
-        bvh: &crate::bvh::Bvh,
+        scene_gpu: std::rc::Rc<SceneGpu>,
         rw: u32,
         rh: u32,
         gbuf_full: bool,
         debug: bool,
-        bc7_q: Option<crate::bc7::Quality>,
-        submit: &mut dyn d3d12::Submit,
     ) -> Result<Self> {
         require_caps(device)?;
         let device5: ID3D12Device5 =
@@ -403,19 +401,11 @@ impl DxrGpu {
             put(SBT_HIT + 2 * IDENT, ident("HgOcclude")?);
         }
 
-        // SwAccel::None: the DXR pipeline never binds the software BVH (see
-        // bind_common — t0/t1 stay unset), so its ~32 B/node upload is
-        // skipped entirely (~2.3 GB at 100M tris). `bvh` is still handed over:
-        // --blas-split chunks the tree on the CPU without uploading it.
-        let scene_gpu = SceneGpu::new_uploaded(
-            device,
-            scene,
-            bvh,
-            crate::gpu::trace::SwAccel::None,
-            submit,
-            bc7_q,
-        )?;
-
+        // The shared core arrived pre-uploaded (Rc from GpuContext's cache).
+        // The DXR pipeline never binds the software BVH (see bind_common —
+        // t0/t1 stay unset), and those trees now live OUTSIDE the core
+        // (trace::SwTreesGpu, per-TraceGpu), so a DXR session structurally
+        // never pays their upload (~2.3 GB at 100M tris).
         let uaf = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         let ua = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         let px = rw as u64 * rh as u64;
