@@ -51,9 +51,12 @@ const SMOOTH_TC_S: f32 = 0.15;
 /// Wind low-pass cutoff range: idle-adjacent rumble to full-speed whoosh.
 /// Retuned 300->4000 down to 150->1200 ("too harsh"): wind heard from a
 /// moving viewpoint is low-mid energy — 4 kHz noise reads as hiss/static,
-/// not airflow. The steepness fix rides WIND_LP_STAGES.
-const WIND_FC_MIN: f32 = 150.0;
-const WIND_FC_MAX: f32 = 1200.0;
+/// not airflow. The steepness fix rides WIND_LP_STAGES. Then 150->1200
+/// down to 100->600 ("a bit lower frequency"): the top end is what full
+/// flight speed sounds like, so the max is the knob — an octave down
+/// turns swish into swoosh.
+const WIND_FC_MIN: f32 = 100.0;
+const WIND_FC_MAX: f32 = 600.0;
 /// Cascaded one-pole stages per channel. TWO, not one: a single pole falls
 /// only −6 dB/octave, which leaves enough top-octave noise past any cutoff
 /// to read as harsh static; the cascade's −12 dB/octave is where the sound
