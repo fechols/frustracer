@@ -1666,14 +1666,26 @@ fn main() {
     // its topology, and no gate may move), and a positional scene always
     // wins. An EXPLICIT --world in one of those combinations errors instead
     // of silently resolving â€” being told is the feature (the --fsr4 shape).
-    let any_check = check
+    let any_check = (check
         || check_dlss
         || check_oidn
         || check_xess
         || check_fsr
         || check_nppd
         || check_gpu
-        || check_dxr;
+        || check_dxr)
+        // FR_WORLD_CHECK=1 (opt-in, off by default) lets the headless suites
+        // run ON the world. The world is the ONE scene no gate can otherwise
+        // reach, so a world-only regression is structurally invisible — this
+        // is the escape hatch for diagnosing one. No default gate moves: a
+        // flagless --check* is unchanged, so the structural must-fires stay
+        // tuned to the procedural scene's topology. Expect the world to trip
+        // the pose-sensitive gates (mv_selftest's fixed dolly, the sky/hemi
+        // must-fires) and the vacuous transmissive must-fire — the world has
+        // 3 transmissive tris, 2 of which spray-retagging turns opaque. Read
+        // the exact-zero counters (claim-violation / false-sky /
+        // tmin-overshoot), which are scene-independent.
+        && std::env::var("FR_WORLD_CHECK").is_err();
     if world_flag == Some(true)
         && (obj.is_some() || stress.is_some() || tile.is_some() || spin.is_some() || any_check)
     {
@@ -4132,6 +4144,13 @@ fn run_check_gpu(
     // Same intersector on both sides, same seeds, same shading code â€” these
     // are the transplanted exact-zero gates from the CPU --check.
     let read_u32 = |hg: &mut gpu::trace::HeadlessGpu, res, n: usize| -> Result<Vec<u32>, String> {
+        // A zero-element readback is legitimate — an enclosed interior pose
+        // proves no sky, so CTR_SKY is 0 — but CreateCommittedResource(0)
+        // is E_INVALIDARG, which used to abort the whole suite before the
+        // wavefront gates ran. Empty in, empty out.
+        if n == 0 {
+            return Ok(Vec::new());
+        }
         let b = hg.read_buffer(res, ua, n * 4)?;
         Ok(b.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect())
     };
