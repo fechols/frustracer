@@ -198,6 +198,7 @@ pub fn share_capture(
     delta: f32,
     eta: f32,
     sun: Option<Vec3A>,
+    cl: &crate::clouds::Clouds,
     rec: &mut HemiShare,
     ls: &mut LocalStats,
 ) {
@@ -214,7 +215,10 @@ pub fn share_capture(
         n,
         max_depth,
         t_limit: if t_limit.is_finite() { t_limit + delta } else { t_limit },
-        gi: sun.map(|s| Gi { sun: s, depth: 0 }),
+        // The capture itself never shades (empty-cell folding is dome-only —
+        // pure functions of n/sun, bit-identical per member), but the state
+        // rides along so the record can never diverge from its consumers'.
+        gi: sun.map(|s| Gi { sun: s, depth: 0, cl: *cl }),
     };
     let root = TileFrustum::half_space_padded(o, n, eta);
     ls.hemi_queries += 1;
@@ -283,7 +287,16 @@ fn capture_cell(
         match cx.gi {
             None => rec.open_mass.x += sphcell::psa(a, b, c, cx.n),
             Some(g) => {
-                rec.open_mass += sky_cell(cx.n, g.sun, a, b, c, 5u32.saturating_sub(depth))
+                rec.open_mass += sky_cell(
+                    cx.n,
+                    g.sun,
+                    cx.scene.sky_scale,
+                    cx.scene.night,
+                    a,
+                    b,
+                    c,
+                    5u32.saturating_sub(depth),
+                )
             }
         }
         rec.open_psa += sphcell::psa(a, b, c, cx.n);
@@ -407,6 +420,11 @@ struct Gi {
     sun: Vec3A,
     /// Shade depth of the point being integrated (bounce rays shade at +1).
     depth: u32,
+    /// Cloud state for the leaf-hit BOUNCE shade only — its direct sun term
+    /// is cloud-shadowed like any other `shade()` (T ≤ 1, so the 2^18
+    /// fixed-point accumulator only gets QUIETER). The gather geometry —
+    /// `sky_cell`, `dome()` leaf misses — never sees clouds (sky.rs's table).
+    cl: crate::clouds::Clouds,
 }
 
 struct Cx<'a> {
@@ -464,6 +482,7 @@ pub fn gi(
     t2: Vec3A,
     max_depth: u32,
     sun: Vec3A,
+    cl: &crate::clouds::Clouds,
     depth: u32,
     share: Option<&HemiShare>,
     rng: &mut fastrand::Rng,
@@ -477,7 +496,7 @@ pub fn gi(
         n,
         max_depth: max_depth.max(1),
         t_limit: f32::INFINITY,
-        gi: Some(Gi { sun, depth }),
+        gi: Some(Gi { sun, depth, cl: *cl }),
     };
     (integrate(&cx, t1, t2, share, rng, verify, ls) / PI).max(Vec3A::ZERO)
 }
@@ -607,7 +626,7 @@ fn open_hemisphere(
         None => acc.open.x = PI,
         Some(g) => {
             for [a, b, c] in sphcell::octants(cx.n, t1, t2) {
-                acc.open += sky_cell(cx.n, g.sun, a, b, c, 4);
+                acc.open += sky_cell(cx.n, g.sun, cx.scene.sky_scale, cx.scene.night, a, b, c, 4);
             }
         }
     }
@@ -652,7 +671,18 @@ fn cell(
             None => acc.open.x += sphcell::psa(a, b, c, cx.n),
             // Refinement budget: enough extra levels to reach ~6° cells even
             // for an octant-sized empty cell near the sun glow.
-            Some(g) => acc.open += sky_cell(cx.n, g.sun, a, b, c, 5u32.saturating_sub(depth)),
+            Some(g) => {
+                acc.open += sky_cell(
+                    cx.n,
+                    g.sun,
+                    cx.scene.sky_scale,
+                    cx.scene.night,
+                    a,
+                    b,
+                    c,
+                    5u32.saturating_sub(depth),
+                )
+            }
         }
         if let Some(v) = verify.as_deref_mut() {
             acc.accounted += sphcell::psa(a, b, c, cx.n);
@@ -726,21 +756,39 @@ fn leaf_rays(
             // either way, so the tmin-overshoot / cut-miss gates are unaffected.
             // Under the wide tree the cut is slot-refs and must translate to
             // binary roots first (ray_roots) — rays only ever walk the ray BVH.
-            let occ = if crate::bvh::cut_seed_hemi() {
+            // `transmittance`, not `occluded`: AO is a LIGHT query, so a
+            // glass occluder passes its tint (folded to gray — the sampled-AO
+            // tier's mean-of-components rule, exact 1.0/0.0 on opaque scenes
+            // via the true divide).
+            let tp = if crate::bvh::cut_seed_hemi() {
                 let mut buf = [0u32; HEMI_CUT];
                 let roots = cx.accel.ray_roots(cut, &mut buf);
-                cx.accel.bvh.occluded_multi(cx.scene, &ray, tc, cx.t_limit, roots, &mut ls.ray_nodes)
+                cx.accel.bvh.transmittance_multi(
+                    cx.scene,
+                    &ray,
+                    tc,
+                    cx.t_limit,
+                    roots,
+                    &mut ls.ray_nodes,
+                )
             } else {
-                cx.accel.bvh.occluded(cx.scene, &ray, tc, cx.t_limit, &mut ls.ray_nodes)
+                cx.accel.bvh.transmittance(cx.scene, &ray, tc, cx.t_limit, &mut ls.ray_nodes)
             };
-            if !occ {
-                acc.ray.x += weight;
-            }
+            acc.ray.x += weight * ((tp.x + tp.y + tp.z) / 3.0);
             if let Some(v) = verify.as_deref_mut() {
                 acc.accounted += sphcell::psa(a, b, c, cx.n);
                 verify_leaf_ray(cx, &ray, tc, v, ls);
-                if occ != cx.accel.bvh.occluded(cx.scene, &ray, tc, cx.t_limit, &mut ls.ray_nodes)
-                {
+                // Cut-vs-root agreement. Bit-equality is the gate on the
+                // binary arm (exact ZERO/ONE); with ≥3 tinted interfaces the
+                // two traversals may associate the f32 product differently,
+                // so tinted throughputs get a 1-ulp-scale relative slack —
+                // a real cut miss (a whole interface dropped) moves the
+                // product by the interface's tint, orders of magnitude more.
+                let root =
+                    cx.accel.bvh.transmittance(cx.scene, &ray, tc, cx.t_limit, &mut ls.ray_nodes);
+                let agree = tp == root
+                    || (tp - root).abs().max_element() <= 1e-6 * root.abs().max_element();
+                if !agree {
                     v.cut_miss += 1;
                 }
             }
@@ -772,7 +820,14 @@ fn leaf_rays(
                 }
             }
             let l = match hit {
-                None => shade::sky(d, g.sun),
+                // `gather`, not the full sky. A GI leaf ray landing in the sun
+                // disc would (a) double-count light `direct_d` already delivers
+                // with its own shadow ray, and (b) push ~1e3 radiance into the
+                // 2^18 fixed-point hemi accumulator, which would saturate. The
+                // star field is the opposite case (nothing else delivers it and
+                // its mean is ~1e-3), so `gather` carries it in — see sky.rs's
+                // star row.
+                None => crate::sky::gather(d, g.sun, cx.scene.sky_scale, cx.scene.night),
                 Some(h) => shade::shade(
                     cx.scene,
                     cx.accel.bvh,
@@ -782,6 +837,7 @@ fn leaf_rays(
                     &BOUNCE_Q,
                     rng,
                     g.sun,
+                    &g.cl,
                     // Bounce hits stay ISOTROPIC (aniso 1) at an octant-scale
                     // spread: the cell footprint is coarse by design —
                     // over-blurred bounce albedo is variance reduction, and 16
@@ -792,6 +848,9 @@ fn leaf_rays(
                     ls,
                     None,
                     shade::VisCtl::Off,
+                    None,
+                    // Fireflies never light bounce surfaces (the gather
+                    // exclusion — the emissive precedent).
                     None,
                 ),
             };
@@ -827,35 +886,60 @@ fn verify_leaf_ray(cx: &Cx, ray: &Ray, tc: f32, v: &mut VerifyCounters, ls: &mut
     }
 }
 
-/// Analytic sky over a proven-empty cell: centroid radiance × exact PSA,
-/// with pure-math midpoint refinement near the sun-glow lobe (`dot^32`,
-/// significant out to ~21°) — an empty parent proves all children empty, so
-/// refinement costs sky() evaluations only, no BVH work.
-fn sky_cell(n: Vec3A, sun: Vec3A, a: Vec3A, b: Vec3A, c: Vec3A, levels: u32) -> Vec3A {
+/// Analytic sky over a proven-empty cell: centroid radiance × exact PSA, with
+/// pure-math midpoint refinement where the dome varies fastest — an empty
+/// parent proves all children empty, so refinement costs `dome()` evaluations
+/// only, no BVH work.
+///
+/// This integrates the DOME, never `sky::radiance` — and that is a correctness
+/// requirement, not a preference. Centroid point-sampling a cell that is COARSER
+/// than the sun disc would either miss the disc entirely (the sun contributes
+/// nothing) or land on it and splat the whole cell at ~1e3 radiance. Classic
+/// aliasing: fireflies and energy loss, unfixable by adding `levels`. Excluding
+/// the disc removes the sharp feature outright — which is precisely why the
+/// frequency split is the right architecture and not merely a convenience.
+#[allow(clippy::too_many_arguments)]
+fn sky_cell(
+    n: Vec3A,
+    sun: Vec3A,
+    scale: f32,
+    night: f32,
+    a: Vec3A,
+    b: Vec3A,
+    c: Vec3A,
+    levels: u32,
+) -> Vec3A {
     let cen = sphcell::centroid(a, b, c);
     if levels > 0 {
         // Angular radius of the cell around its centroid.
         let cos_r = cen.dot(a).min(cen.dot(b)).min(cen.dot(c)).clamp(-1.0, 1.0);
         // Refine while the cell is coarser than ~12° — the horizon→zenith
         // gradient is anti-correlated with the cosine weight, so a coarse
-        // centroid systematically over-brightens (measured +1.2% at octant
-        // granularity). Near the sun-glow lobe (cos 21.5° ≈ 0.93,
-        // angle(cen, sun) < radius + lobe) refine further, to ~6°.
+        // centroid systematically over-brightens.
         let coarse = cos_r < 0.978;
-        let near_glow = cos_r < 0.995 && {
+        // The dome's sharpest surviving feature is the MIE AUREOLE (the forward
+        // Henyey-Greenstein lobe at g = 0.76, which falls ~4x over 20° — a
+        // little softer than the `dot^32` glow this test used to chase). Refine
+        // to ~6° within a conservative 30° cone of the sun:
+        // cos(angle(cen, sun)) > cos(r + 30°), expanded.
+        let near_aureole = cos_r < 0.995 && {
             let sin_r = (1.0 - cos_r * cos_r).max(0.0).sqrt();
-            cen.dot(sun) > cos_r * 0.93 - sin_r * 0.368
+            cen.dot(sun) > cos_r * 0.866 - sin_r * 0.5
         };
-        if coarse || near_glow {
+        if coarse || near_aureole {
             let (mab, mbc, mca) = sphcell::midpoints(a, b, c);
             let mut sum = Vec3A::ZERO;
             for [ca, cb, cc] in [[a, mab, mca], [mab, b, mbc], [mca, mbc, c], [mab, mbc, mca]] {
-                sum += sky_cell(n, sun, ca, cb, cc, levels - 1);
+                sum += sky_cell(n, sun, scale, night, ca, cb, cc, levels - 1);
             }
             return sum;
         }
     }
-    shade::sky(cen, sun) * sphcell::psa(a, b, c, n)
+    // `gather`, not `dome`: the star field's smooth mean rides along (see
+    // sky.rs's star row). It adds no sharp feature for the refinement above to
+    // chase — it is near-constant over the whole upper hemisphere — so the
+    // `coarse`/`near_aureole` budget is unaffected.
+    crate::sky::gather(cen, sun, scale, night) * sphcell::psa(a, b, c, n)
 }
 
 /// Reference-ray re-validation of an empty-cell claim: directions strictly

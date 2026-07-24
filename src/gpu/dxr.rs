@@ -15,6 +15,10 @@
 //!   raygen @ 0    | miss @ 64: [radiance, shadow, hit_info]
 //!   hit groups @ 192: [HgShade, HgHit, null (occlusion; the any-hit-only
 //!   HgOcclude instead on alpha-masked scenes — see ALPHA_CUTOUT)]
+//!
+//! FR_DXR_INLINE (dxr_inline_mode below) is the W2 experiment lever: the
+//! same pipeline with its rays moved onto inline RayQuery, one stage at a
+//! time — the layout above is unchanged in every mode.
 
 use super::d3d12::{self, committed_buffer, transition, uav_barrier, Result};
 use super::dxc::Dxc;
@@ -65,12 +69,53 @@ pub fn require_caps(device: &ID3D12Device) -> Result<()> {
     }
 }
 
+/// `--dxr-inline` (default **1** — the W2 promotion): which of this
+/// pipeline's rays ride recursive TraceRay vs inline RayQuery, without
+/// leaving DispatchRays.
+///   0 — all TraceRay: the original by-the-book pipeline, kept as the A/B
+///       escape (bit-identical library to the pre-lever build).
+///   1 — THE DEFAULT: primary TraceRay -> chs_shade, every secondary
+///       shade.hlsli fires (shadow/AO/reflection/transmission/translucency)
+///       an inline RayQuery inside the hit shader (rt.hlsli's bodies compile
+///       in place of rt_dxr.hlsli's TraceRay flavors);
+///       MaxTraceRecursionDepth 1. Promoted because it strictly DOMINATES
+///       mode 0 at every measured point on both vendors — never slower,
+///       −68 to −81% at the shipping spp=1 — while the payload/closest-hit/
+///       SBT machinery keeps doing its real job for the primary.
+///   2 — everything inline in raygen (dxr.hlsl's DXR_INLINE_SEC == 2 arm):
+///       no TraceRay anywhere, DispatchRays as a bare launch grid over the
+///       reference loop. The measurement arm that proved launch overhead is
+///       ≈ zero — and the right MANUAL pick for a high-spp Intel DXR
+///       session (mode 1's fat hit shader pays occupancy per sample: B70
+///       marginal 2.2 ms/sample vs mode 2's 1.11).
+/// Measured (--spin path 1080p spp=1, GPU frame span ms, default/stress/
+/// SM-lp): B70 mode 0 9.05/5.30/6.75 -> mode 1 2.35/1.64/1.94 -> mode 2
+/// 1.41/1.22/1.29; 4090 1.34/0.79/1.18 -> 0.26/0.25/0.34 -> 0.29/0.27/0.34.
+/// Armed modes compile lib_6_5 and need RT tier 1.1 (the wavefront's own
+/// floor); lesser hardware degrades to 0 with one loud line — the default is
+/// a preference, never a requirement (NOT the --fsr4 shape). The RTPSO/SBT
+/// layout is identical in every mode: unreached hit groups and misses stay
+/// exported (identifier-only records, no cost). Set from main's parse via
+/// `set_inline_mode` (the texture::set_aniso knob-before-anything idiom);
+/// legal values 0..=2, main exits 2 on anything else.
+static INLINE_MODE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+pub fn set_inline_mode(n: u32) {
+    INLINE_MODE.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn dxr_inline_mode() -> u32 {
+    INLINE_MODE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub struct DxrGpu {
     root_sig: ID3D12RootSignature,
     state: ID3D12StateObject,
     sbt: d3d12::UploadBuffer,
     pso_resolve: ID3D12PipelineState,
-    pub scene: SceneGpu,
+    /// The shared scene core — the SAME Rc the wavefront tracer holds (cached
+    /// in GpuContext), so a session running both pays the scene VRAM once.
+    pub scene: std::rc::Rc<SceneGpu>,
     /// Per-pixel planes, CPU-layout parity (accum = 3 f32/px, tbuf = f32/px,
     /// info = u32/px) — the same readback-compare shape as the compute tracer.
     pub accum: ID3D12Resource,
@@ -95,7 +140,11 @@ pub struct DxrGpu {
     pso_feed_xess: Option<ID3D12PipelineState>,
     pso_feed_rr: Option<ID3D12PipelineState>,
     pso_feed_fsr_rr: Option<ID3D12PipelineState>,
-    feed: Option<(trace::FeedKind, Vec<ID3D12Resource>)>,
+    /// One entry per wired engine; the index IS its descriptor set (see
+    /// trace::FEED_SETS). Normally one — several under --quinlight.
+    feed: Vec<(trace::FeedKind, Vec<ID3D12Resource>)>,
+    /// For the per-set descriptor-table handles record_feed computes.
+    device: ID3D12Device,
     frame_cb: d3d12::UploadBuffer,
     cb_base: FrameCb,
     pub rw: u32,
@@ -107,35 +156,88 @@ impl DxrGpu {
         device: &ID3D12Device,
         dxc: &Dxc,
         scene: &Scene,
+        scene_gpu: std::rc::Rc<SceneGpu>,
         rw: u32,
         rh: u32,
         gbuf_full: bool,
         debug: bool,
-        bc7_q: Option<crate::bc7::Quality>,
-        submit: &mut dyn d3d12::Submit,
     ) -> Result<Self> {
         require_caps(device)?;
         let device5: ID3D12Device5 =
             device.cast().map_err(|e| format!("ID3D12Device5: {e}"))?;
         let root_sig = trace::create_root_signature(device)?;
 
-        // Alpha-masked scenes compile the ah_* any-hit shaders + non-opaque
-        // ray flags in (trace.rs::alpha_defs — the same per-scene predicate
-        // that drops OPAQUE from the BLAS); opaque scenes compile verbatim.
-        let any_alpha = scene.any_alpha;
+        // --dxr-inline (see dxr_inline_mode): armed modes compile RayQuery
+        // into the library, which needs the wavefront's caps floor, not this
+        // pipeline's — gate here so a tier-1.0 box degrades to the TraceRay
+        // path with one loud line instead of a DXC error. The default (1)
+        // stays QUIET; only a departure prints a lever line (the blas-split
+        // precedent).
+        let inline_mode = {
+            let m = dxr_inline_mode();
+            if m > 0 {
+                let caps = trace::query_caps(device)?;
+                if caps.rt_tier < D3D12_RAYTRACING_TIER_1_1.0 || caps.shader_model < 0x65 {
+                    eprintln!(
+                        "dxr: --dxr-inline {m} unavailable — inline RayQuery needs RT tier 1.1 \
+                         + SM 6.5 (device: tier {}, SM 0x{:x}); running the all-TraceRay \
+                         pipeline",
+                        caps.rt_tier, caps.shader_model
+                    );
+                    0
+                } else {
+                    if m == 2 {
+                        eprintln!(
+                            "dxr: --dxr-inline 2 — everything inline in raygen (DispatchRays \
+                             as a bare launch grid; the default is 1, inline secondaries)"
+                        );
+                    }
+                    m
+                }
+            } else {
+                eprintln!(
+                    "dxr: --dxr-inline 0 — all-TraceRay dispatch (the pre-lever pipeline; \
+                     the default is 1, inline RayQuery secondaries)"
+                );
+                0
+            }
+        };
+
+        // Alpha-masked and height-carrying scenes compile the ah_* any-hit
+        // shaders + non-opaque ray flags in (trace.rs::alpha_defs /
+        // height_defs — the same per-scene predicates that drop OPAQUE from
+        // the BLAS); scenes with neither compile verbatim.
+        let non_opaque = scene.any_alpha
+            || (scene.any_height && crate::bvh::height_armed())
+            || scene.any_transmissive;
         // The cbuffer's --spp jitter-table size, injected like alpha_defs.
         let sd = trace::spp_defs();
         let sd = sd.as_str();
-        let lib_src = [
+        let defs = format!(
+            "{}\n{}\n{}\n{}",
             trace::alpha_defs(scene),
-            sd,
-            trace::TRACE_COMMON_HLSLI,
-            RT_DXR_HLSLI,
-            trace::SHADE_HLSLI,
-            DXR_HLSL,
-        ]
-        .join("\n");
-        let dxil = dxc.compile(&lib_src, "", "lib_6_3", "dxr library", debug)?;
+            trace::height_defs(scene),
+            trace::trans_defs(scene),
+            trace::blas_defs()
+        );
+        // Mode 0 assembles EXACTLY the shipping sequence (the lever's
+        // off-state is byte-identical source, not merely equivalent); armed
+        // modes prepend the define and paste rt.hlsli's RayQuery primitives
+        // ahead of rt_dxr.hlsli, whose TraceRay flavors + tlas/HitInfo
+        // compile out under DXR_INLINE_SEC.
+        let inline_def = format!("#define DXR_INLINE_SEC {inline_mode}");
+        let mut parts = vec![defs.as_str(), sd];
+        if inline_mode > 0 {
+            parts.push(inline_def.as_str());
+        }
+        parts.push(trace::TRACE_COMMON_HLSLI);
+        if inline_mode > 0 {
+            parts.push(trace::RT_HLSLI);
+        }
+        parts.extend([RT_DXR_HLSLI, trace::SHADE_HLSLI, DXR_HLSL]);
+        let lib_src = parts.join("\n");
+        let lib_target = if inline_mode > 0 { "lib_6_5" } else { "lib_6_3" };
+        let dxil = dxc.compile(&lib_src, "", lib_target, "dxr library", debug)?;
         let resolve_src = [sd, trace::TRACE_COMMON_HLSLI, trace::RESOLVE_HLSL].join("\n");
         let pso_resolve = trace::compute_pso(
             device,
@@ -146,7 +248,8 @@ impl DxrGpu {
         // Upscaler sessions: the same feed kernels the wavefront runs, at
         // this pipeline's cs_6_3 cap floor (feed.hlsl needs nothing newer).
         let (pso_feed_xess, pso_feed_rr, pso_feed_fsr_rr) = if gbuf_full {
-            let feed_src = [sd, trace::TRACE_COMMON_HLSLI, trace::FEED_HLSL].join("\n");
+            let feed_src =
+                [sd, trace::TRACE_COMMON_HLSLI, trace::FSR_WIRE_HLSLI, trace::FEED_HLSL].join("\n");
             let pso = |entry: &str, name: &str| -> Result<ID3D12PipelineState> {
                 trace::compute_pso(
                     device,
@@ -191,7 +294,7 @@ impl DxrGpu {
         // alpha-tested-shadow pattern, and the untouched-payload = occluded
         // convention holds: all-rejected => miss_shadow writes 0).
         let ahs = |name: &Vec<u16>| {
-            if any_alpha { PCWSTR(name.as_ptr()) } else { PCWSTR::null() }
+            if non_opaque { PCWSTR(name.as_ptr()) } else { PCWSTR::null() }
         };
         let hit_group = |export: &Vec<u16>, chs: PCWSTR, ah: PCWSTR| D3D12_HIT_GROUP_DESC {
             HitGroupExport: PCWSTR(export.as_ptr()),
@@ -214,15 +317,23 @@ impl DxrGpu {
         );
         // RayPayload {float3 + float + uint + float2 + uint} = 32 B is the
         // largest payload (the float2/uint tail is --spp: the sample's own
-        // position and its probe bit); triangle barycentrics = 8 B.
+        // position, and prim = `(sample << 1) | probe_bit` — the index rides
+        // the high bits so the miss shader can key the per-sample cloud march
+        // phase without growing the payload); triangle barycentrics = 8 B.
         let shader_cfg = D3D12_RAYTRACING_SHADER_CONFIG {
             MaxPayloadSizeInBytes: 32,
             MaxAttributeSizeInBytes: 8,
         };
         // raygen -> chs_shade (1); its shadow/AO/reflection rays (2); chs_hit
         // and the misses fire nothing. The CPU's depth-1 recursion is the
-        // flattened lap loop inside chs_shade, not payload recursion.
-        let pipe_cfg = D3D12_RAYTRACING_PIPELINE_CONFIG { MaxTraceRecursionDepth: 2 };
+        // flattened lap loop inside chs_shade, not payload recursion. Under
+        // FR_DXR_INLINE the secondaries are inline RayQuery, so the deepest
+        // TraceRay is raygen's primary (mode 1) or none at all (mode 2 —
+        // depth 1 stays declared: 0 is legal but is a separate micro-variant,
+        // not worth a DispatchRays-validation seam until mode 2 shows a win).
+        let pipe_cfg = D3D12_RAYTRACING_PIPELINE_CONFIG {
+            MaxTraceRecursionDepth: if inline_mode > 0 { 1 } else { 2 },
+        };
         let grs = D3D12_GLOBAL_ROOT_SIGNATURE {
             pGlobalRootSignature: unsafe { std::mem::transmute_copy(&root_sig) },
         };
@@ -243,9 +354,10 @@ impl DxrGpu {
             ),
             sub(D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE, &grs as *const _ as *const _),
         ];
-        // HgOcclude imports ah_shadow, which only exports under ALPHA_CUTOUT
-        // — the subobject exists exactly when the library exports it.
-        if any_alpha {
+        // HgOcclude imports ah_shadow, which only exports under
+        // ALPHA_CUTOUT/HEIGHTFIELD — the subobject exists exactly when the
+        // library exports it.
+        if non_opaque {
             subobjects.push(sub(
                 D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP,
                 &hg_occlude as *const _ as *const _,
@@ -284,17 +396,16 @@ impl DxrGpu {
         put(SBT_HIT + IDENT, ident("HgHit")?);
         // Hit group 2 (occlusion rays): the zeroed null record on opaque
         // scenes (SKIP_CLOSEST_HIT + FORCE_OPAQUE never run a shader from
-        // it); the any-hit-only HgOcclude on alpha-masked scenes.
-        if any_alpha {
+        // it); the any-hit-only HgOcclude on alpha-masked/height scenes.
+        if non_opaque {
             put(SBT_HIT + 2 * IDENT, ident("HgOcclude")?);
         }
 
-        // SwAccel::None: the DXR pipeline never binds the software BVH (see
-        // bind_common — t0/t1 stay unset), so its ~32 B/node upload is
-        // skipped entirely (~2.3 GB at 100M tris).
-        let scene_gpu =
-            SceneGpu::new_uploaded(device, scene, crate::gpu::trace::SwAccel::None, submit, bc7_q)?;
-
+        // The shared core arrived pre-uploaded (Rc from GpuContext's cache).
+        // The DXR pipeline never binds the software BVH (see bind_common —
+        // t0/t1 stay unset), and those trees now live OUTSIDE the core
+        // (trace::SwTreesGpu, per-TraceGpu), so a DXR session structurally
+        // never pays their upload (~2.3 GB at 100M tris).
         let uaf = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         let ua = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         let px = rw as u64 * rh as u64;
@@ -315,9 +426,10 @@ impl DxrGpu {
             uaf,
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
         )?;
-        // Slot 0 = hdr (the resolve target), slots 1..7 = the feed planes
-        // (wired later), slots TEX_HEAP_BASE.. = the RP_SCENE_TEX scene
-        // table — the tracer's heap layout exactly.
+        // FEED_SETS copies of the RP_TEX table (hdr resolve target at each set's
+        // offset 0, then that set's feed planes — wired later), then slots
+        // TEX_HEAP_BASE.. = the RP_SCENE_TEX scene table — the tracer's heap
+        // layout exactly.
         let uav_heap: ID3D12DescriptorHeap = unsafe {
             device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
@@ -329,14 +441,7 @@ impl DxrGpu {
             })
         }
         .map_err(|e| format!("CreateDescriptorHeap(dxr UAV): {e}"))?;
-        unsafe {
-            device.CreateUnorderedAccessView(
-                &hdr,
-                None,
-                None,
-                uav_heap.GetCPUDescriptorHandleForHeapStart(),
-            )
-        };
+        trace::write_resolve_uavs(device, &uav_heap, &hdr);
         scene_gpu.write_scene_descriptors(device, &uav_heap, TEX_HEAP_BASE);
         let tex_table = D3D12_GPU_DESCRIPTOR_HANDLE {
             ptr: unsafe { uav_heap.GetGPUDescriptorHandleForHeapStart() }.ptr
@@ -376,7 +481,8 @@ impl DxrGpu {
             pso_feed_xess,
             pso_feed_rr,
             pso_feed_fsr_rr,
-            feed: None,
+            feed: Vec::new(),
+            device: device.clone(),
             frame_cb,
             cb_base: FrameCb::base(scene, rw, rh),
             rw,
@@ -385,42 +491,75 @@ impl DxrGpu {
     }
 
     pub fn write_cb(&self, slot: usize, p: &FrameParams) {
-        let fsr_sig = matches!(&self.feed, Some((trace::FeedKind::FsrRr, _)));
+        // One FSR4-RR subscriber among the wired engines is enough to arm the
+        // pack's signal lanes (--quinlight can wire several).
+        let fsr_sig = self.feed.iter().any(|(k, _)| matches!(k, trace::FeedKind::FsrRr));
         self.cb_base
             .with_frame(p, self.gbuf_full, fsr_sig)
             .store(unsafe { self.frame_cb.ptr.add(slot * CB_STRIDE) });
     }
 
-    /// Wire the upscaler feed targets (registers u16..u22) into this
-    /// pipeline's descriptor heap — the DXR twin of TraceGpu::wire_feed,
-    /// same heap layout, same typed-store gate.
+    /// Re-derive the base CB's sun/sky rows after a TOD change —
+    /// `TraceGpu::refresh_sky`'s twin (`FrameCb::refresh_sky_rows`).
+    pub fn refresh_sky(&mut self, scene: &Scene) {
+        self.cb_base.refresh_sky_rows(scene, self.rw, self.rh);
+    }
+
+    /// The DXR twin of TraceGpu::wire_feed — same heap layout, same typed-store
+    /// gate, same semantics: REPLACES the wiring with this one engine (so
+    /// --check-dxr can rewire from one feed kind to the next).
     pub fn wire_feed(
         &mut self,
         device: &ID3D12Device,
         kind: trace::FeedKind,
         targets: &[(u32, &ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT)],
     ) -> Result<()> {
-        self.feed = Some((kind, trace::wire_feed_targets(device, &self.uav_heap, targets)?));
+        self.feed.clear();
+        self.wire_feed_add(device, kind, targets)
+    }
+
+    /// APPENDS one engine, claiming the next descriptor set (--quinlight).
+    pub fn wire_feed_add(
+        &mut self,
+        device: &ID3D12Device,
+        kind: trace::FeedKind,
+        targets: &[(u32, &ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT)],
+    ) -> Result<()> {
+        let set = self.feed.len() as u32;
+        let planes = trace::wire_feed_targets(device, &self.uav_heap, set, targets)?;
+        self.feed.push((kind, planes));
         Ok(())
     }
 
-    /// Fan the pack + accum out into the wired upscaler input planes. Record
-    /// AFTER record_frame on the same list (its trailing global UAV barrier
-    /// fences the pack/accum writes).
+    /// Fan the pack + accum out into the wired upscaler input planes — one
+    /// dispatch per wired engine. Record AFTER record_frame on the same list
+    /// (its trailing global UAV barrier fences the pack/accum writes).
     pub fn record_feed(&self, list: &ID3D12GraphicsCommandList, slot: usize) -> Result<()> {
-        let Some((kind, planes)) = &self.feed else {
+        if self.feed.is_empty() {
             return Err("feed targets not wired".into());
-        };
-        let pso = match kind {
-            // Fsr3 IS the XeSS feed (same planes, formats, depth encode).
-            trace::FeedKind::Xess | trace::FeedKind::Fsr3 => self.pso_feed_xess.as_ref(),
-            trace::FeedKind::Rr => self.pso_feed_rr.as_ref(),
-            trace::FeedKind::FsrRr => self.pso_feed_fsr_rr.as_ref(),
         }
-        .ok_or("feed PSO missing (DxrGpu built without gbuf)")?;
-        trace::record_feed_dispatch(list, &self.uav_heap, pso, None, planes, self.rw, self.rh, &|| unsafe {
-            self.bind_common(list, slot)
-        });
+        let mut feeds: Vec<(&ID3D12PipelineState, u32, &[ID3D12Resource])> = Vec::new();
+        for (set, (kind, planes)) in self.feed.iter().enumerate() {
+            let pso = trace::feed_pso(
+                *kind,
+                None,
+                self.pso_feed_xess.as_ref(),
+                self.pso_feed_rr.as_ref(),
+                self.pso_feed_fsr_rr.as_ref(),
+            )
+            .ok_or("feed PSO missing (DxrGpu built without gbuf)")?;
+            feeds.push((pso, set as u32, planes.as_slice()));
+        }
+        trace::record_feed_dispatch(
+            list,
+            &self.device,
+            &self.uav_heap,
+            &feeds,
+            None,
+            self.rw,
+            self.rh,
+            &|| unsafe { self.bind_common(list, slot) },
+        );
         Ok(())
     }
 

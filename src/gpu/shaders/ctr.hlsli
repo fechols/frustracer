@@ -22,6 +22,8 @@
 #define CTR_V_FALSE_EMPTY 16u // verify: empty-cell claims contradicted by rays
 #define CTR_V_TMIN        17u // verify: leaf-ray tmin skipped real geometry
 #define CTR_ALPHA_REJ     18u // stat: alpha-cutout candidate rejections (ALPHA_CUTOUT scenes)
+#define CTR_HEIGHT_REJ    19u // stat: relief-march candidate rejections (HEIGHTFIELD scenes)
+#define CTR_TRANS_PASS    20u // stat: tinted-shadow candidate passes (TRANS_SHADOW scenes)
 #define CTR_COUNT        24u
 
 // Compile units that paste this file bind `counters` — rt.hlsli's cutout

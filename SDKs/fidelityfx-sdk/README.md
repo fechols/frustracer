@@ -6,6 +6,10 @@ https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK at tag **v2.3.0**:
 - `api/include/` — `Kits/FidelityFX/api/include` (ffx-api core + DX12 backend descs)
 - `denoisers/include/` — `Kits/FidelityFX/denoisers/include` (FSR Ray Regeneration 1.2.0)
 - `upscalers/include/` — `Kits/FidelityFX/upscalers/include` (FSR4 upscaler)
+- `framegeneration/include/` — `Kits/FidelityFX/framegeneration/include` (frame
+  generation 4.0.1 + the DX12 frame-interpolation swapchain 3.1.7 — the effect
+  descs speak both the 4.x and 3.1.x provider generations, see the deprecated
+  FSR3.1.4/3.1.5 compat structs in `ffx_framegeneration.h`)
 
 The directory layout preserves the headers' own relative includes
 (`ffx_denoiser.h` includes `../../api/include/ffx_api.h`). Every vendored file

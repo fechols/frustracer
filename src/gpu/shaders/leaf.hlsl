@@ -65,6 +65,20 @@ void cs_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
         float3 aw = 0.0;
         float t;
         PrimSurf ps;
+        // WHAT THE INHERITED t_start IS ACTUALLY WORTH — measured, so nobody
+        // has to assume. Ablation: trace from 0 instead (sound; t_start lower-
+        // bounds the nearest hit, so the same hit is found and only traversal
+        // is paid), keeping the rest of the quadtree intact. `--spin path`
+        // 1080p spp=16, 3 interleaved reps, medians:
+        //   Arc Pro B70   default +1.7%   stress +1.1%   powerplant +1.7%
+        //   RTX 4090      default -3.5%   stress -7.1%   powerplant +5.2%
+        // Intel is consistent and small; NVIDIA straddles zero, i.e. free and
+        // worth nothing — the same verdict CLAUDE.md already records for AMD's
+        // documented TMin re-origining. So on the ONE GPU where the quadtree
+        // beats a plain per-pixel reference (Intel, see trace::WIDE_LEVELS and
+        // the --spp cost model), the inherited bound explains only 7-21% of
+        // that advantage; the rest is tiles proven empty tracing NO rays.
+        // Re-run by making this a 0.0 and rebuilding.
         if (trace_closest(cam_origin.xyz, dir, rec.t_start, FLT_MAX, hit)) {
 #ifdef LEAF_NO_FB
             {
@@ -78,7 +92,8 @@ void cs_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
                 // pins spp to 1 on fb frames anyway).
                 float3 o_h, n_h;
                 c = shade_split(cam_origin.xyz, dir, hit, rng, shadow_samples, ao_samples,
-                                reflections != 0u, true, 0.0, pixel_cone, true, aw, o_h, n_h, ps);
+                                reflections != 0u, true, 0.0, pixel_cone, true, true,
+                                aw, o_h, n_h, ps);
                 if (prim) {
                     uint q;
                     InterlockedAdd(counters[CTR_HEMI_PT], 1, q);
@@ -100,10 +115,27 @@ void cs_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
             t = hit.t;
             if (prim) gbuf_write_hit(pi, sp.x, sp.y, dir, hit.t, ps);
         } else {
-            c = sky_color(dir);
+            // A DISPLAY path (the camera looking at the sky), so it sees the sun
+            // DISC — sky.rs's disc-exactly-once rule. The half-angle is the ray's
+            // own footprint, which is what antialiases the limb. The cloud march
+            // phase is per (pixel, frame, SAMPLE) — render.rs's dither_jk twin.
+#if SKY_LOD > 1
+            // Sky inside a LEAF tile — not a proven-empty region, but the cloud
+            // field does not care about geometry, so the same screen-space
+            // lattice serves it. Measured: the rect-only lattice reached just
+            // 27% of the cloud bill; this is where most of the rest was.
+            c = sky_radiance_lod(dir, x, y);
+#else
+            c = sky_radiance(cam_origin.xyz, dir, pixel_cone * 0.5, frame,
+                             cloud_dither_k(uint2(x, y), frame, s, spp));
+#endif
             t = INF;
             if (prim) gbuf_write_sky(pi, sp.x, sp.y, dir);
         }
+        // Firefly glow, depth-tested against this sample's own hit (INF on a
+        // miss) — render.rs::shade_traced's composite, term for term. Guarded
+        // by the flag, so day frames add nothing (bit-identity).
+        if (flags & FLAG_FIREFLIES) c += ff_glow(cam_origin.xyz, dir, t, pixel_cone * 0.5);
         csum += c;
         awsum += aw;
         if (prim) {

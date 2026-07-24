@@ -1,6 +1,64 @@
 use crate::texture::Texture;
 use glam::{Vec2, Vec3A};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+
+/// Tinted-shadows switch, settable ONCE before scene load
+/// (`--no-tinted-shadows`) — the `texture::set_mips` "knob before build"
+/// family. Off = `finalize_scalars` never arms `Scene::any_transmissive`, so
+/// every occlusion query runs the pre-feature binary arm bit-identically.
+static TINTED_SHADOWS: AtomicBool = AtomicBool::new(true);
+
+pub fn set_tinted_shadows(on: bool) {
+    TINTED_SHADOWS.store(on, Relaxed);
+}
+
+pub fn tinted_shadows() -> bool {
+    TINTED_SHADOWS.load(Relaxed)
+}
+
+/// Spray-reclassification switch (`--no-spray`), same knob-before-load
+/// family. Off = `reclassify_spray` is a no-op — transmissive droplets stay
+/// clear glass (the pre-spray behavior). Keys the scene cache's lever word:
+/// the pass rewrites cached materials/tri_mat.
+static SPRAY: AtomicBool = AtomicBool::new(true);
+
+pub fn set_spray(on: bool) {
+    SPRAY.store(on, Relaxed);
+}
+
+pub fn spray_enabled() -> bool {
+    SPRAY.load(Relaxed)
+}
+
+/// Water-class switch (`--no-water`), same knob-before-load family. Off = the
+/// classifier never refines the glass tier into water (`classify` is handed
+/// `water_hint = false, tf = None`), so the fountain classifies glassware
+/// exactly as before this feature. Keys the scene cache's lever word:
+/// classification is baked into the sidecar, so a lever A/B must never serve a
+/// stale cache.
+static WATER: AtomicBool = AtomicBool::new(true);
+
+pub fn set_water(on: bool) {
+    WATER.store(on, Relaxed);
+}
+
+pub fn water_enabled() -> bool {
+    WATER.load(Relaxed)
+}
+
+/// Depth-tint switch (`--no-depth-tint`): Beer–Lambert attenuation over the
+/// transmission chain's interior segments. Runtime shading lever (no scene
+/// data changes — reads live in shade.rs / the GPU FLAG_DEPTH_TINT bit).
+static DEPTH_TINT: AtomicBool = AtomicBool::new(true);
+
+pub fn set_depth_tint(on: bool) {
+    DEPTH_TINT.store(on, Relaxed);
+}
+
+pub fn depth_tint() -> bool {
+    DEPTH_TINT.load(Relaxed)
+}
 
 /// How a material derives its albedo. Reflection behavior is fully described
 /// by the metallic/roughness/anisotropy parameters (the old `Metal` variant is
@@ -44,10 +102,28 @@ pub struct Material {
     /// transmitted light is tinted by albedo — dark MTL glass Kd must be
     /// lifted toward white by the classifier or glass renders near-black.
     pub transmission: f32,
+    /// Absorption/transmission tint, the SINGLE source for the per-interface
+    /// glass tint, the Beer–Lambert depth attenuation, and `shadow_tint`.
+    /// Sentinel `< 0` (default `splat(-1.0)`) = "use albedo" — the structural
+    /// bit-identity guarantee: `trans_tint_or(albedo)` returns albedo VERBATIM
+    /// for every non-water material. Water (`matclass::WATER`) sets a light
+    /// blue-green so the Beer–Lambert exponent does the depth work (red
+    /// extinguishes fastest); the loader does NOT white-lift a water albedo,
+    /// so the tint lives here instead.
+    pub trans_tint: Vec3A,
+    /// Index of refraction for the transmission chain's Snell/Fresnel math.
+    /// Default 1.5 (== the old global `GLASS_IOR`; `1.0/1.5f32` is bit-identical
+    /// to the old const, so existing glass is unchanged). Water is 1.33.
+    pub ior: f32,
+    /// Procedural water-ripple slope amplitude (0.0 = no ripples — the
+    /// structural off state, the `height_amp` pattern). Perturbs the SHADING
+    /// normal (and, guarded, the Snell axis) with a pure-function wave field on
+    /// the shared cloud clock (`shade::ripple_normal`); zero rng draws.
+    pub ripple_amp: f32,
     /// Emitted radiance (Ke / glTF emissiveFactor). Added to color at every
     /// shading depth, OUTSIDE the kd·(1−transmission) factor; emitters do
-    /// NOT light other surfaces — only the analytic area light + sky do (the
-    /// "glass stays opaque to shadow rays" precedent). Default ZERO.
+    /// NOT light other surfaces — only the analytic sun + sky do (the
+    /// stars/fireflies gather-exclusion class). Default ZERO.
     pub emissive: Vec3A,
     /// Tangent-space normal map (NO_TEX = none; linear data). Perturbs the
     /// SHADING normal only — the geometric normal keeps driving ray offsets,
@@ -56,6 +132,13 @@ pub struct Material {
     pub normal_tex: u32,
     /// map_Bump `-bm s` / glTF normalTexture.scale. Default 1.0.
     pub normal_scale: f32,
+    /// Peak-to-peak height amplitude of `normal_tex`'s alpha-channel
+    /// heightfield, in TEXEL widths (0.0 = no height data — the structural
+    /// off state, like NO_TEX). Sobel-converted height maps carry exactly
+    /// `texture::HEIGHT_NORMAL_STRENGTH` (the same K both modes describe);
+    /// Poisson-derived heights carry the integration's own amplitude. The
+    /// relief march converts to world units per hit via the UV basis.
+    pub height_amp: f32,
     /// Roughness map (NO_TEX = none; samples .g — the glTF channel
     /// convention, which grayscale MTL maps satisfy via to_rgba8 gray
     /// replication). Effective roughness = `roughness` × sample: factor ×
@@ -72,6 +155,35 @@ pub struct Material {
 }
 
 impl Material {
+    /// Per-interface throughput of a light-transport occlusion ray crossing
+    /// this surface (the tinted-shadows feature): `transmission × albedo` —
+    /// ZERO for opaque materials. The ONE tint source: `Bvh::transmittance`
+    /// and the GPU `mat_shadow` buffer fill both read this, so CPU↔GPU
+    /// agreement is by data (the fireflies-CB precedent). Deliberately the
+    /// FLAT albedo — no UV/texture fetch in the occlusion inner loop
+    /// (documented known-accept for textured transmissive materials). Glass
+    /// Kd was already lifted toward white at load, so this composes. Water
+    /// carries its color in `trans_tint` instead of a lifted albedo, so the
+    /// tint source is `trans_tint_or(albedo)` — bit-identical (`albedo`
+    /// verbatim) for every material with the sentinel tint.
+    #[inline]
+    pub fn shadow_tint(&self) -> Vec3A {
+        self.trans_tint_or(self.albedo) * self.transmission
+    }
+
+    /// The transmission/absorption tint: `trans_tint` when set (`.x >= 0`),
+    /// else `albedo` returned VERBATIM. A sign test (not NaN) so the GPU
+    /// mirror is a plain `>= 0.0` select. This is the ONE tint source shared
+    /// by the per-interface glass tint, Beer–Lambert, and `shadow_tint`.
+    #[inline]
+    pub fn trans_tint_or(&self, albedo: Vec3A) -> Vec3A {
+        if self.trans_tint.x >= 0.0 {
+            self.trans_tint
+        } else {
+            albedo
+        }
+    }
+
     /// Whether shading this material fetches ANY texture (albedo or one of
     /// the PBR maps). Untextured materials have nothing for the deferred
     /// material-sorted shading to make cache-coherent, so they shade inline.
@@ -84,13 +196,10 @@ impl Material {
     }
 }
 
-/// Rectangular area light: `center ± u ± v`, radiant intensity `color` (falls off 1/d²).
-pub struct AreaLight {
-    pub center: Vec3A,
-    pub u: Vec3A,
-    pub v: Vec3A,
-    pub color: Vec3A,
-}
+// The rectangular AreaLight is gone. It was a 4x4 rect ~12 units away with a
+// 1/d² falloff, and its GGX highlight was a mirror image of that rect — which
+// is why the sun used to reflect as a SQUARE. The light is now `sky::Sun`: a
+// disc at infinity, part of the one sky sphere. See src/sky.rs.
 
 pub struct Scene {
     pub positions: Vec<Vec3A>,
@@ -106,12 +215,46 @@ pub struct Scene {
     /// alpha-cutout path (false on the procedural/stress scenes, keeping the
     /// hot loop untouched there).
     pub any_alpha: bool,
-    pub light: AreaLight,
+    /// Any material carries a heightfield (`height_amp` > 0 with a normal
+    /// map) — the intersector's one-bool gate for the relief march, the
+    /// `any_alpha` pattern (false on procedural/stress scenes). Derived by
+    /// `finalize_scalars`.
+    pub any_height: bool,
+    /// Any material is transmissive (`transmission` > 0) AND the tinted-
+    /// shadows lever is armed — the one-bool gate for `Bvh::transmittance`'s
+    /// tinted arm (the `any_alpha` pattern: false on procedural/stress scenes
+    /// and under `--no-tinted-shadows`, keeping those paths bit-identical).
+    /// Derived by `finalize_scalars`.
+    pub any_transmissive: bool,
+    /// The sun: a disc at infinity, the sharp half of the one sky.
+    pub sun: crate::sky::Sun,
+    /// The sky's smooth dome, projected into order-2 SH once at load — the
+    /// analytic replacement for the old flat `shade::AMBIENT` constant, giving
+    /// every normal its own sky irradiance for free (zero rays). Derived
+    /// (`finalize_scalars`), never serialized: a pure function of the sun.
+    pub sky_sh: crate::sh::Sh9,
+    /// Time-of-day dome brightness (`sky::dome`'s `scale`): exactly 1.0 in an
+    /// untouched session (`* 1.0` is bit-preserving), falling through dusk to
+    /// the `MOON_DOME_FRAC` moonlight floor. Derived, never serialized — only
+    /// `apply_tod` moves it.
+    pub sky_scale: f32,
+    /// Star visibility (`sky::stars`' gate): exactly 0.0 in an untouched
+    /// session, ramping to 1.0 after sunset. Derived, never serialized.
+    pub night: f32,
     /// Bounding diagonal — the scale reference for all epsilons.
     pub diag: f32,
     /// Self-intersection offset for secondary rays.
     pub eps: f32,
     pub ao_radius: f32,
+    /// CONTENT bounds: the geometry EXCLUDING the standard ground quad (the
+    /// first `GROUND_VERTS` positions every loader pushes) — where the models
+    /// actually are. `diag` is ground-quad-dominated on the procedural/stress
+    /// scenes (a ±60 ground makes it ~17× the content scale), so anything
+    /// that should live AMONG the content (the fireflies' placement box)
+    /// anchors here instead. Falls back to the full AABB when the skip would
+    /// be degenerate. Derived (`finalize_scalars`), never serialized.
+    pub content_min: Vec3A,
+    pub content_max: Vec3A,
 }
 
 impl Scene {
@@ -180,9 +323,13 @@ impl SceneBuilder {
             sheen: 0.0,
             translucency: 0.0,
             transmission: 0.0,
+            trans_tint: Vec3A::splat(-1.0),
+            ior: 1.5,
+            ripple_amp: 0.0,
             emissive: Vec3A::ZERO,
             normal_tex: NO_TEX,
             normal_scale: 1.0,
+            height_amp: 0.0,
             rough_tex: NO_TEX,
             metal_tex: NO_TEX,
             emissive_tex: NO_TEX,
@@ -313,7 +460,7 @@ impl SceneBuilder {
         }
     }
 
-    pub fn finish(self, light: AreaLight) -> Scene {
+    pub fn finish(self, sun: crate::sky::Sun) -> Scene {
         let mut scene = Scene {
             positions: self.positions,
             normals: self.normals,
@@ -323,14 +470,411 @@ impl SceneBuilder {
             materials: self.materials,
             textures: self.textures,
             any_alpha: false,
-            light,
+            any_height: false,
+            any_transmissive: false,
+            sun,
+            sky_sh: crate::sh::Sh9::ZERO,
+            sky_scale: 1.0,
+            night: 0.0,
             diag: 0.0,
             eps: 0.0,
             ao_radius: 0.0,
+            content_min: Vec3A::ZERO,
+            content_max: Vec3A::ZERO,
         };
         finalize_scalars(&mut scene);
         scene
     }
+}
+
+/// Post-load heightfield derivation, shared by the OBJ and glTF loaders
+/// (COLD loads only — run before `scene_cache::store`, so the per-texture
+/// `n2h` flags and the materials' `height_amp` persist; warm loads re-apply
+/// the texture conversions from the cached flags and take `height_amp` from
+/// `DiskMat`). Every normal map that doesn't already carry a heightfield
+/// (Sobel-converted maps carry the exact source height) gets one derived by
+/// the Frankot–Chellappa solve (`Texture::apply_n2h`) into its alpha
+/// channel; `height_amp` = the texture's own amplitude × the material's
+/// `-bm`/`normalTexture.scale` factor, the same composition the decoded
+/// slopes carry.
+pub fn derive_heights(scene: &mut Scene) {
+    use std::collections::HashSet;
+    let n2h_on = crate::texture::n2h_enabled();
+    let mut ids: Vec<u32> = scene
+        .materials
+        .iter()
+        .filter_map(|m| (m.normal_tex != NO_TEX).then_some(m.normal_tex))
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.is_empty() {
+        return; // procedural/stress scenes: structurally untouched
+    }
+    let solve: HashSet<u32> = ids
+        .iter()
+        .copied()
+        .filter(|&id| {
+            let t = &scene.textures[id as usize];
+            n2h_on && !t.h2n && !t.n2h
+        })
+        .collect();
+    let t0 = std::time::Instant::now();
+    let amps: std::collections::HashMap<u32, f32> = {
+        use rayon::prelude::*;
+        // Bounded pool: one 4K solve holds ~0.5 GB of complex scratch, so
+        // the full rayon width would spike memory on 4K-heavy scenes.
+        let workers = rayon::current_num_threads().min(8);
+        let mut run = || {
+            scene
+                .textures
+                .par_iter_mut()
+                .enumerate()
+                .filter(|(i, _)| solve.contains(&(*i as u32)))
+                .map(|(i, t)| (i as u32, t.apply_n2h()))
+                .collect()
+        };
+        match rayon::ThreadPoolBuilder::new().num_threads(workers).build() {
+            Ok(pool) => pool.install(run),
+            Err(_) => run(),
+        }
+    };
+    let (mut n_mats, mut amp_max) = (0u32, 0.0f32);
+    for m in &mut scene.materials {
+        if m.normal_tex == NO_TEX {
+            continue;
+        }
+        let base = if scene.textures[m.normal_tex as usize].h2n {
+            crate::texture::HEIGHT_NORMAL_STRENGTH
+        } else {
+            amps.get(&m.normal_tex)
+                .copied()
+                .unwrap_or(m.height_amp)
+                .min(crate::texture::N2H_AMP_CAP)
+        };
+        m.height_amp = base * m.normal_scale;
+        if m.height_amp > 0.0 {
+            n_mats += 1;
+            amp_max = amp_max.max(m.height_amp);
+        }
+    }
+    // `finalize_scalars` already ran inside the loader's finish(), BEFORE the
+    // amps existed — refresh the intersector's one-bool gate here (the BVH
+    // build that follows reads it for the AABB sweep).
+    scene.any_height = n_mats > 0;
+    if n_mats > 0 || !solve.is_empty() {
+        eprintln!(
+            "heightfield: {} materials, amp max {:.2} texels ({} maps solved in {:.0} ms)",
+            n_mats,
+            amp_max,
+            solve.len(),
+            t0.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+}
+
+/// Spray component ceiling, relative to `Scene::diag`: a transmissive
+/// connected component whose AABB diagonal is under `SPRAY_MAX_K · diag`
+/// reclassifies as spray. Calibrated on San Miguel (diag 10): droplets are
+/// ~3e-4·diag islands inside the `o Water` mesh, the smallest glassware
+/// ~1.5e-3·diag — 6e-4 (~4 cm) sits between with ~2× margin either way (the
+/// load-time histogram line is the tuning signal).
+pub const SPRAY_MAX_K: f32 = 6e-4;
+/// Spray look: aerated water scatters white (games ship spray as white
+/// particles for the same reason) — albedo lifts toward white, transmission
+/// drops to 0 (a clear millimeter droplet is invisible against a matched
+/// background), translucency keeps back-lit drops glowing.
+pub const SPRAY_ALBEDO_LIFT: f32 = 0.6;
+pub const SPRAY_TRANSLUCENCY: f32 = 0.35;
+pub const SPRAY_ROUGHNESS: f32 = 0.4;
+
+/// Water material fields the loader stamps onto a `matclass::WATER` material
+/// (`Pbr::water`). `WATER_TINT` is the absorption/transmission color — light
+/// blue-green so the Beer–Lambert exponent does the depth work: at
+/// `TRANS_DEPTH_K·diag` of traversal the medium is exactly this tint, and red
+/// (0.75) extinguishes fastest, so shallow rims stay clear and the deep basin
+/// goes blue-green. It is the ONE look knob (screenshot-tuned; gates prove
+/// soundness, never looks). `WATER_IOR` 1.33 vs glassware's 1.5 lowers the
+/// face-on reflectance (2% vs 4%). `WATER_RIPPLE_AMP` is the peak ripple slope.
+pub const WATER_TINT: Vec3A = Vec3A::new(0.75, 0.92, 0.96);
+pub const WATER_IOR: f32 = 1.33;
+pub const WATER_RIPPLE_AMP: f32 = 0.25;
+
+/// Post-load spray reclassification (shared OBJ+glTF, the `derive_heights`
+/// pass family — cold loads only, BEFORE the cache store, so warm loads
+/// inherit the retag from the sidecar; `--no-spray` kills it and keys the
+/// cache lever word). Union-find over shared vertex indices, restricted to
+/// transmissive-material triangles: tiny disconnected islands (the airborne
+/// droplets of a fountain) become a white scattering "spray" clone of their
+/// source material, while pools/streams/glassware (large components) stay
+/// glass. Purely load-time — no per-ray cost, zero rng, and a scene with no
+/// transmissive materials is structurally untouched.
+pub fn reclassify_spray(scene: &mut Scene) {
+    if !spray_enabled() {
+        return;
+    }
+    let nv = scene.positions.len();
+    let mut parent: Vec<u32> = (0..nv as u32).collect();
+    fn find(parent: &mut [u32], mut x: u32) -> u32 {
+        while parent[x as usize] != x {
+            let g = parent[parent[x as usize] as usize];
+            parent[x as usize] = g;
+            x = g;
+        }
+        x
+    }
+    let mut any = false;
+    for (t, idx) in scene.indices.iter().enumerate() {
+        if scene.materials[scene.tri_mat[t] as usize].transmission <= 0.0 {
+            continue;
+        }
+        any = true;
+        let r0 = find(&mut parent, idx[0]);
+        let r1 = find(&mut parent, idx[1]);
+        let r2 = find(&mut parent, idx[2]);
+        parent[r1 as usize] = r0;
+        parent[r2 as usize] = r0;
+    }
+    if !any {
+        return; // no transmissive geometry: structurally untouched
+    }
+    // Component AABBs, keyed by root vertex.
+    let mut boxes: HashMap<u32, (Vec3A, Vec3A, u32)> = HashMap::new();
+    for (t, idx) in scene.indices.iter().enumerate() {
+        if scene.materials[scene.tri_mat[t] as usize].transmission <= 0.0 {
+            continue;
+        }
+        let root = find(&mut parent, idx[0]);
+        let e = boxes.entry(root).or_insert((
+            Vec3A::splat(f32::INFINITY),
+            Vec3A::splat(f32::NEG_INFINITY),
+            0,
+        ));
+        for &i in idx {
+            let p = scene.positions[i as usize];
+            e.0 = e.0.min(p);
+            e.1 = e.1.max(p);
+        }
+        e.2 += 1;
+    }
+    // Size histogram (log10 of diag-relative extent) — the threshold's
+    // tuning signal, printed once per load.
+    let mut hist = [0u32; 8];
+    let limit = SPRAY_MAX_K * scene.diag;
+    let mut spray_roots: HashMap<u32, ()> = HashMap::new();
+    for (&root, &(mn, mx, _)) in &boxes {
+        let d = (mx - mn).length();
+        let rel = (d / scene.diag).max(1e-9);
+        let bucket = ((rel.log10() + 6.0).floor() as i32).clamp(0, 7) as usize;
+        hist[bucket] += 1;
+        if d < limit {
+            spray_roots.insert(root, ());
+        }
+    }
+    if spray_roots.is_empty() {
+        eprintln!(
+            "spray: 0 of {} transmissive components under {:.0e}·diag | comp size hist (log10 rel, -6..) {:?}",
+            boxes.len(),
+            SPRAY_MAX_K,
+            hist
+        );
+        return;
+    }
+    // Retag: one spray clone per source material (deduped), all fields
+    // carried over except the spray overrides.
+    let mut clones: HashMap<u32, u32> = HashMap::new();
+    let mut n_tris = 0u64;
+    for t in 0..scene.indices.len() {
+        let m = scene.tri_mat[t];
+        if scene.materials[m as usize].transmission <= 0.0 {
+            continue;
+        }
+        let root = find(&mut parent, scene.indices[t][0]);
+        if !spray_roots.contains_key(&root) {
+            continue;
+        }
+        let clone = *clones.entry(m).or_insert_with(|| {
+            // Field-by-field carry-over (Material is deliberately not Clone);
+            // the scoped borrow ends before the push.
+            let spray = {
+                let s = &scene.materials[m as usize];
+                Material {
+                    // Lift from the source TINT, not the raw albedo: bitwise
+                    // unchanged for glassware (sentinel ⇒ albedo), but a
+                    // water-sourced droplet lifts from its light blue-green
+                    // instead of the now-unlifted dark Kd (else spray would dim
+                    // from ~0.93 to ~0.64 as a side effect of the water class).
+                    albedo: s.trans_tint_or(s.albedo).lerp(Vec3A::ONE, SPRAY_ALBEDO_LIFT),
+                    roughness: SPRAY_ROUGHNESS,
+                    metallic: 0.0,
+                    anisotropy: s.anisotropy,
+                    sheen: s.sheen,
+                    translucency: SPRAY_TRANSLUCENCY,
+                    transmission: 0.0,
+                    // A droplet is opaque white scatter: sentinel tint, plain
+                    // IOR, no ripples.
+                    trans_tint: Vec3A::splat(-1.0),
+                    ior: 1.5,
+                    ripple_amp: 0.0,
+                    emissive: s.emissive,
+                    normal_tex: s.normal_tex,
+                    normal_scale: s.normal_scale,
+                    height_amp: s.height_amp,
+                    rough_tex: s.rough_tex,
+                    metal_tex: s.metal_tex,
+                    emissive_tex: s.emissive_tex,
+                    kind: s.kind,
+                }
+            };
+            scene.materials.push(spray);
+            (scene.materials.len() - 1) as u32
+        });
+        scene.tri_mat[t] = clone;
+        n_tris += 1;
+    }
+    eprintln!(
+        "spray: {} components ({} tris) retagged from {} transmissive | comp size hist (log10 rel, -6..) {:?}",
+        spray_roots.len(),
+        n_tris,
+        boxes.len(),
+        hist
+    );
+}
+
+/// Spray gates, run by `--check` (the tinted_shadow_self_test pattern —
+/// hand-built islands, closed-form expectations): only tiny TRANSMISSIVE
+/// components retag, the clone's overrides are pinned bitwise, two islands
+/// of one source material share one deduped clone, large components and
+/// tiny opaque islands are untouched, and the lever-off arm is a no-op.
+pub fn spray_self_test() -> Result<(), String> {
+    let glass = |transmission: f32| Material {
+        albedo: Vec3A::new(0.8, 0.85, 0.9),
+        roughness: 0.05,
+        metallic: 0.0,
+        anisotropy: 0.0,
+        sheen: 0.0,
+        translucency: 0.0,
+        transmission,
+        trans_tint: Vec3A::splat(-1.0),
+        ior: 1.5,
+        ripple_amp: 0.0,
+        emissive: Vec3A::ZERO,
+        normal_tex: NO_TEX,
+        normal_scale: 1.0,
+        height_amp: 0.0,
+        rough_tex: NO_TEX,
+        metal_tex: NO_TEX,
+        emissive_tex: NO_TEX,
+        kind: MatKind::Diffuse,
+    };
+    // Island A: a unit-scale glass quad (2 tris sharing vertices — one
+    // component). Islands B/C: two detached 1e-4-scale glass tris (droplets;
+    // same source material, so they must SHARE one clone). Island D: a tiny
+    // OPAQUE tri that must never retag.
+    let mk = || -> Scene {
+        let mut positions = vec![
+            Vec3A::new(0.0, 0.0, 0.0),
+            Vec3A::new(1.0, 0.0, 0.0),
+            Vec3A::new(0.0, 1.0, 0.0),
+            Vec3A::new(1.0, 1.0, 0.0),
+        ];
+        let mut indices = vec![[0u32, 1, 2], [1, 3, 2]];
+        let mut tri_mat = vec![0u32, 0];
+        let mut tiny = |at: Vec3A, mat: u32,
+                        positions: &mut Vec<Vec3A>,
+                        indices: &mut Vec<[u32; 3]>,
+                        tri_mat: &mut Vec<u32>| {
+            let b = positions.len() as u32;
+            positions.push(at);
+            positions.push(at + Vec3A::new(1e-4, 0.0, 0.0));
+            positions.push(at + Vec3A::new(0.0, 1e-4, 0.0));
+            indices.push([b, b + 1, b + 2]);
+            tri_mat.push(mat);
+        };
+        tiny(Vec3A::new(0.2, 0.2, 0.5), 0, &mut positions, &mut indices, &mut tri_mat);
+        tiny(Vec3A::new(0.7, 0.7, 0.5), 0, &mut positions, &mut indices, &mut tri_mat);
+        tiny(Vec3A::new(0.5, 0.5, 0.7), 1, &mut positions, &mut indices, &mut tri_mat);
+        let n = positions.len();
+        let mut sc = Scene {
+            positions,
+            normals: vec![Vec3A::Z; n],
+            texcoords: vec![Vec2::ZERO; n],
+            indices,
+            tri_mat,
+            materials: vec![glass(0.9), glass(0.0)],
+            textures: Vec::new(),
+            any_alpha: false,
+            any_height: false,
+            any_transmissive: false,
+            sun: crate::sky::Sun::new(Vec3A::Y),
+            sky_sh: crate::sh::Sh9::ZERO,
+            sky_scale: 1.0,
+            night: 0.0,
+            diag: 1.0,
+            eps: 1e-4,
+            ao_radius: 0.03,
+            content_min: Vec3A::ZERO,
+            content_max: Vec3A::ZERO,
+        };
+        finalize_scalars(&mut sc);
+        sc
+    };
+    let saved = spray_enabled();
+    set_spray(true);
+    let restore = |r: Result<(), String>| {
+        set_spray(saved);
+        r
+    };
+    let run = || -> Result<(), String> {
+        let mut sc = mk();
+        reclassify_spray(&mut sc);
+        // Exactly ONE clone appended (B and C dedupe onto it).
+        if sc.materials.len() != 3 {
+            return Err(format!("expected 3 materials after retag, got {}", sc.materials.len()));
+        }
+        if sc.tri_mat[0] != 0 || sc.tri_mat[1] != 0 {
+            return Err("large glass component must stay glass".into());
+        }
+        if sc.tri_mat[2] != 2 || sc.tri_mat[3] != 2 {
+            return Err(format!(
+                "tiny glass islands must share the spray clone (got {}, {})",
+                sc.tri_mat[2], sc.tri_mat[3]
+            ));
+        }
+        if sc.tri_mat[4] != 1 {
+            return Err("tiny OPAQUE island must not retag".into());
+        }
+        let s = &sc.materials[2];
+        // Sentinel-tint glass source ⇒ lift from albedo verbatim (the water
+        // path is covered by the tint-source arm below).
+        let want_albedo = Vec3A::new(0.8, 0.85, 0.9).lerp(Vec3A::ONE, SPRAY_ALBEDO_LIFT);
+        if s.transmission != 0.0
+            || s.translucency != SPRAY_TRANSLUCENCY
+            || s.roughness != SPRAY_ROUGHNESS
+            || s.metallic != 0.0
+            || s.trans_tint.x >= 0.0
+            || s.ior != 1.5
+            || s.ripple_amp != 0.0
+            || s.albedo.to_array().map(f32::to_bits)
+                != want_albedo.to_array().map(f32::to_bits)
+        {
+            return Err("spray clone overrides not pinned".into());
+        }
+        // Lever off: a no-op, bit-for-bit.
+        set_spray(false);
+        let mut off = mk();
+        set_spray(true);
+        // mk() ran finalize under lever-off (any_transmissive false is fine
+        // here — the pass keys on material transmission, not the flag).
+        set_spray(false);
+        reclassify_spray(&mut off);
+        set_spray(true);
+        if off.materials.len() != 2 || off.tri_mat != vec![0, 0, 0, 0, 1] {
+            return Err("lever off must be a structural no-op".into());
+        }
+        Ok(())
+    };
+    let r = run();
+    restore(r)
 }
 
 /// Recompute the scale-relative scalars (`diag`/`eps`/`ao_radius`) and
@@ -340,24 +884,273 @@ impl SceneBuilder {
 pub fn finalize_scalars(scene: &mut Scene) {
     let mut mn = Vec3A::splat(f32::INFINITY);
     let mut mx = Vec3A::splat(f32::NEG_INFINITY);
-    for p in &scene.positions {
+    // The content AABB in the same pass: every loader pushes the standard
+    // ground quad FIRST (GROUND_VERTS), so positions[GROUND_VERTS..] is the
+    // content. Hand-built self-test scenes without that convention fall back
+    // to the full bounds below.
+    let mut cmn = Vec3A::splat(f32::INFINITY);
+    let mut cmx = Vec3A::splat(f32::NEG_INFINITY);
+    for (i, p) in scene.positions.iter().enumerate() {
         mn = mn.min(*p);
         mx = mx.max(*p);
+        if i >= GROUND_VERTS {
+            cmn = cmn.min(*p);
+            cmx = cmx.max(*p);
+        }
     }
     let diag = (mx - mn).length().max(1e-3);
     scene.diag = diag;
     scene.eps = 1e-4 * diag;
     scene.ao_radius = 0.03 * diag;
+    if cmn.x <= cmx.x && (cmx - cmn).length() > 1e-3 {
+        scene.content_min = cmn;
+        scene.content_max = cmx;
+    } else {
+        scene.content_min = mn;
+        scene.content_max = mx;
+    }
     scene.any_alpha = scene.textures.iter().any(|t| t.alpha_masked);
+    scene.any_height =
+        scene.materials.iter().any(|m| m.height_amp > 0.0 && m.normal_tex != NO_TEX);
+    scene.any_transmissive =
+        tinted_shadows() && scene.materials.iter().any(|m| m.transmission > 0.0);
+
+    refresh_sky_sh(scene);
 }
 
-fn default_light() -> AreaLight {
-    AreaLight {
-        center: Vec3A::new(6.0, 10.0, 4.0),
-        u: Vec3A::new(2.0, 0.0, 0.0),
-        v: Vec3A::new(0.0, 0.0, 2.0),
-        color: Vec3A::new(1.0, 0.95, 0.85) * 150.0,
+/// Re-derive the SH ambient from the current sun/sky state. Split out of
+/// `finalize_scalars` so `apply_tod` can re-run it without the O(n) position
+/// scan. Deterministic quadrature, no rng — which is why `scene_cache` needs
+/// no format change for it.
+///
+/// `sky::gather`, not the full sky: a gather path must never see the sun disc
+/// (the direct loop already delivers it, with a shadow ray). See sky.rs's
+/// central invariant. At night `scene.sun` IS the moon, so the ambient is the
+/// moonlit dome — the frequency split carries over unchanged — PLUS the star
+/// field's smooth mean (`sky::star_glow`, gated by `scene.night`), which is
+/// what gives night a moon-independent ambient floor. `gather` is bitwise
+/// `dome` whenever `night == 0`, so every day session is untouched.
+pub fn refresh_sky_sh(scene: &mut Scene) {
+    let sun = scene.sun.dir;
+    let scale = scene.sky_scale;
+    let night = scene.night;
+    scene.sky_sh = crate::sh::Sh9::project(|d| crate::sky::gather(d, sun, scale, night));
+}
+
+/// The sun direction is UNCHANGED from the old rect light's center — so shadow
+/// directions and the sun's place in the sky don't move, and the visual diff is
+/// attributable to the shading model alone. Its brightness is
+/// `sky::SUN_E_OVER_PI`, which is exactly the old `light.color / |center|²`.
+pub fn default_sun() -> crate::sky::Sun {
+    crate::sky::Sun::new(Vec3A::new(6.0, 10.0, 4.0))
+}
+
+/// Time-of-day hour → unit sun direction: the great circle in the vertical
+/// plane through the default sun's azimuth. 06:00 = horizon at +az, 12:00 =
+/// zenith, 18:00 = horizon at −az; the 24→0 wrap is the same point on the
+/// circle. Below-horizon hours are the night half of the arc (the MOON, at
+/// `−dir`, is then above the horizon — see `apply_tod`).
+pub fn sun_dir_for_tod(hour: f32) -> Vec3A {
+    let d0 = default_sun().dir;
+    let az = Vec3A::new(d0.x, 0.0, d0.z).normalize();
+    let th = (hour.rem_euclid(24.0) - 6.0) / 12.0 * std::f32::consts::PI;
+    az * th.cos() + Vec3A::Y * th.sin()
+}
+
+/// The hour whose arc position labels the DEFAULT sun (~9.61 ⇒ 09:37).
+/// Derived FROM the default dir; it is a LABEL — the arc is never evaluated
+/// at it unless the user actually scrubs, because the float round-trip is
+/// approximate and untouched-session bit-identity depends on never
+/// recomputing at zero delta.
+pub fn default_tod() -> f32 {
+    6.0 + default_sun().dir.y.asin() * (12.0 / std::f32::consts::PI)
+}
+
+/// Set the scene's lighting to time-of-day `hour` and re-derive the SH
+/// ambient. The ONLY caller of `Sun::with_fade`/`sky::moon` — an untouched
+/// session never reaches this, which is the structural bit-identity guard.
+///
+/// Day/dusk: the sun at its arc position, irradiance faded/reddened by the
+/// dome's own transmittance (`sky::sun_fade`). Once the fade hits zero the
+/// one light BECOMES the full moon, antipodal — above the horizon exactly
+/// when the sun is not — and the dome (whose `sun` argument is now the moon)
+/// renders the moonlit sky at the `MOON_DOME_FRAC` floor. `night` gates the
+/// stars in after sunset.
+pub fn apply_tod(scene: &mut Scene, hour: f32) {
+    let dir = sun_dir_for_tod(hour);
+    let fade = crate::sky::sun_fade(dir.y, default_sun().dir.y);
+    let lum = fade.dot(Vec3A::new(0.2126, 0.7152, 0.0722));
+    if fade != Vec3A::ZERO {
+        scene.sun = crate::sky::Sun::with_fade(dir, fade);
+    } else {
+        scene.sun = crate::sky::moon(-dir);
     }
+    // The dome tracks the direct light down through dusk, then rests on the
+    // moonlight floor (scaled by the moon's own rise so deep twilight — both
+    // bodies at the horizon — stays the darkest moment, as in life).
+    let moon_up = ((-dir.y - 0.0) / 0.10).clamp(0.0, 1.0);
+    scene.sky_scale = lum.max(crate::sky::MOON_DOME_FRAC * moon_up);
+    // Stars fade in once the sun is well below the horizon.
+    let t = ((-dir.y - 0.05) / 0.10).clamp(0.0, 1.0);
+    scene.night = t * t * (3.0 - 2.0 * t);
+    refresh_sky_sh(scene);
+}
+
+/// Closed-form time-of-day gates, run by `--check`. No rng, no DLLs. Pins the
+/// arc's anchors, the fade's identities (the bit-identity guards), the sunset
+/// ordering, the moon handoff, and the star field's day-guard/determinism.
+pub fn tod_self_test() -> Result<(), String> {
+    use crate::sky;
+    let d0 = default_sun().dir;
+
+    // Arc anchors: 06:00 east horizon, 12:00 zenith, 18:00 west horizon, all
+    // unit; the default hour reproduces the default direction; 24 h wrap.
+    let az = Vec3A::new(d0.x, 0.0, d0.z).normalize();
+    for (h, want) in [(6.0, az), (12.0, Vec3A::Y), (18.0, -az)] {
+        let d = sun_dir_for_tod(h);
+        if (d.length() - 1.0).abs() > 1e-5 {
+            return Err(format!("arc dir at {h}h is not unit: {d:?}"));
+        }
+        if (d - want).length() > 1e-5 {
+            return Err(format!("arc anchor at {h}h: {d:?}, want {want:?}"));
+        }
+    }
+    let h0 = default_tod();
+    if (h0 - 9.61).abs() > 0.02 {
+        return Err(format!("default_tod {h0:.3} drifted from ~9.61"));
+    }
+    if sun_dir_for_tod(h0).dot(d0) < 1.0 - 1e-6 {
+        return Err("arc at default_tod does not reproduce the default sun".into());
+    }
+    for h in [0.5f32, 3.25, 9.61, 17.75, 23.0] {
+        if sun_dir_for_tod(h).dot(sun_dir_for_tod(h + 24.0)) < 1.0 - 1e-4 {
+            return Err(format!("arc is not 24h-periodic at {h}h"));
+        }
+    }
+    if sun_dir_for_tod(23.999).dot(sun_dir_for_tod(0.001)) < 1.0 - 1e-4 {
+        return Err("arc is discontinuous across the 24->0 wrap".into());
+    }
+
+    // Fade identities — the daytime bit-identity guards. exp(-0) == 1 exactly,
+    // and a fade of exactly ONE must leave Sun::new untouched bit-for-bit.
+    if sky::sun_fade(d0.y, d0.y) != Vec3A::ONE {
+        return Err("sun_fade at the reference elevation is not exactly 1".into());
+    }
+    let s_ref = sky::Sun::new(d0);
+    let s_faded = sky::Sun::with_fade(d0, Vec3A::ONE);
+    if s_faded != s_ref {
+        return Err("Sun::with_fade at fade 1 is not bit-identical to Sun::new".into());
+    }
+    // Shape: per-channel <= 1, monotone in y, the horizon transmittance pin
+    // (red > green > blue — the sunset ordering; a channel swap fails loudly),
+    // and a true zero once the disc has set.
+    let mut prev = Vec3A::ZERO;
+    for i in 0..=40 {
+        let y = -0.1 + i as f32 * (1.0 + 0.1) / 40.0;
+        let f = sky::sun_fade(y, d0.y);
+        if f.max_element() > 1.0 + 1e-6 || f.min_element() < 0.0 {
+            return Err(format!("sun_fade({y}) = {f:?} out of [0,1]"));
+        }
+        if (f - prev).min_element() < -1e-6 {
+            return Err(format!("sun_fade is not monotone in y at {y}"));
+        }
+        prev = f;
+    }
+    let hz = sky::sun_fade(0.0, d0.y);
+    if (hz - Vec3A::new(0.7176, 0.5178, 0.2251)).abs().max_element() > 0.01 {
+        return Err(format!("horizon fade {hz:?} drifted from the transmittance model"));
+    }
+    if !(hz.x > hz.y && hz.y > hz.z) {
+        return Err(format!("horizon fade is not sunset-ordered (r>g>b): {hz:?}"));
+    }
+    if sky::sun_fade(-0.05, d0.y) != Vec3A::ZERO || sky::sun_fade(-0.5, d0.y) != Vec3A::ZERO {
+        return Err("sun_fade below the horizon band is not exactly zero".into());
+    }
+
+    // The moon handoff, on a throwaway scene. Night: the light is the moon
+    // (above the horizon, dim, disc radiance f16-safe), the dome rests on the
+    // moonlight floor, stars are armed. Deep dusk at the swap point: both
+    // bodies near-zero, so the handoff cannot pop.
+    let mut sc = SceneBuilder::new().finish(default_sun());
+    apply_tod(&mut sc, 0.0); // midnight
+    if sc.sun.dir.y <= 0.5 {
+        return Err(format!("midnight light is not a high moon: dir {:?}", sc.sun.dir));
+    }
+    let lum = |v: Vec3A| v.dot(Vec3A::new(0.2126, 0.7152, 0.0722));
+    if lum(sc.sun.e_over_pi) <= 0.0 || lum(sc.sun.e_over_pi) > 0.05 {
+        return Err(format!("moonlight is out of band: {:?}", sc.sun.e_over_pi));
+    }
+    if !sc.sun.radiance.is_finite() || sc.sun.radiance.max_element() > 4096.0 {
+        return Err(format!("moon disc radiance not f16-comfortable: {:?}", sc.sun.radiance));
+    }
+    if sc.sky_scale <= 0.0 || sc.sky_scale > 0.05 {
+        return Err(format!("night sky_scale {} out of the moonlight band", sc.sky_scale));
+    }
+    if sc.night != 1.0 {
+        return Err(format!("midnight night factor {} != 1", sc.night));
+    }
+    // END-TO-END STARLIGHT: the SH the renderer actually shades from must carry
+    // the star field's floor, not just the moonlit dome. sky::self_test gates
+    // the term itself (energy vs the enumerated field, the band); this gates
+    // that `refresh_sky_sh` really routes through `sky::gather` — a revert to
+    // `dome` there would pass every gate in sky.rs and silently un-light the
+    // night.
+    let e_night = sc.sky_sh.irradiance(Vec3A::Y);
+    let moon_only = crate::sh::Sh9::project(|d| sky::dome(d, sc.sun.dir, sc.sky_scale))
+        .irradiance(Vec3A::Y);
+    if lum(e_night) <= lum(moon_only) * 1.05 {
+        return Err(format!(
+            "midnight sky_sh {e_night:?} carries no starlight over the moonlit \
+             dome {moon_only:?} — refresh_sky_sh is not calling sky::gather"
+        ));
+    }
+    apply_tod(&mut sc, 18.20); // just past the sun's last light
+    if lum(sc.sun.e_over_pi) > 0.02 {
+        return Err(format!("handoff pop: light lum {} at 18.20h", lum(sc.sun.e_over_pi)));
+    }
+    apply_tod(&mut sc, 12.0); // noon: near-full sun, no stars
+    if sc.night != 0.0 || sc.sky_scale < 0.9 {
+        return Err(format!("noon state wrong: night {} scale {}", sc.night, sc.sky_scale));
+    }
+
+    // Stars: the day guard is a hard zero; the field is deterministic, finite,
+    // clamped, and its mean radiance is negligible next to even the night dome.
+    let mut sum = Vec3A::ZERO;
+    let mut peak = 0.0f32;
+    for i in 0..2000 {
+        let a = i as f32 * 2.399_963;
+        let z = (i as f32 + 0.5) / 2000.0; // upper hemisphere
+        let r = (1.0 - z * z).max(0.0).sqrt();
+        let d = Vec3A::new(r * a.cos(), z, r * a.sin());
+        if sky::stars(d, 5e-4, 0.0, 7) != Vec3A::ZERO {
+            return Err("stars are not exactly zero by day (night = 0)".into());
+        }
+        let s = sky::stars(d, 5e-4, 1.0, 7);
+        if !s.is_finite() || s.min_element() < 0.0 {
+            return Err(format!("stars({d:?}) = {s:?} — must be finite, non-negative"));
+        }
+        if s != sky::stars(d, 5e-4, 1.0, 7) {
+            return Err("star field is not deterministic".into());
+        }
+        sum += s;
+        peak = peak.max(s.max_element());
+    }
+    let mean = lum(sum / 2000.0);
+    if mean <= 0.0 {
+        return Err("star sweep found no stars at night = 1".into());
+    }
+    if mean > 0.01 {
+        return Err(format!("star field mean radiance {mean} is not negligible"));
+    }
+    if peak > 4200.0 {
+        return Err(format!("star peak radiance {peak} escaped the clamp"));
+    }
+
+    eprintln!(
+        "tod self-test: OK (default {h0:.2}h, horizon fade {:.2}/{:.2}/{:.2}, star mean {mean:.2e})",
+        hz.x, hz.y, hz.z
+    );
+    Ok(())
 }
 
 /// Ground plane + a grid of boxes + three spheres + a marble Stanford Bunny
@@ -423,14 +1216,16 @@ pub fn procedural_scene() -> Scene {
     let teapot = embedded_obj(include_bytes!("../assets/teapot.obj"));
     add_obj_models(&mut b, &teapot, |_| steel, 3.0, Vec3A::new(7.5, 0.0, 3.5));
 
-    b.finish(default_light())
+    b.finish(default_sun())
 }
 
 /// Verts/tris the scene loaders push before the model itself — the standard
 /// ground quad (`quad()` = two `tri()` calls = 6 duplicated verts / 2 tris).
-/// `tile_scene` relies on this layout to replicate only the model.
-const GROUND_VERTS: usize = 6;
-const GROUND_TRIS: usize = 2;
+/// `tile_scene` relies on this layout to replicate only the model, and
+/// `world::merge_scenes` to strip each part's ground before placing it.
+
+pub(crate) const GROUND_VERTS: usize = 6;
+pub(crate) const GROUND_TRIS: usize = 2;
 
 /// Tile a loaded (already diag-10-fitted) OBJ scene into an `nx`×`nz` grid by
 /// duplicating the transformed geometry — flattened replication, deliberately
@@ -511,16 +1306,11 @@ pub fn tile_scene(base: Scene, nx: u32, nz: u32) -> (Scene, f32) {
         }
     }
 
-    // The default light pushed out and brightened to cover the field — the
-    // stress_scene idiom (1/d² falloff -> color scales with k²; direction
-    // preserved, so `render::sun_dir` is unchanged).
-    let k = (fh / 6.0).max(1.0);
-    let light = AreaLight {
-        center: base.light.center * k,
-        u: base.light.u * k,
-        v: base.light.v * k,
-        color: base.light.color * (k * k),
-    };
+    // The sun is at infinity and has no falloff, so a tiled/replicated scene
+    // needs NO light rescaling at all. (This used to push the rect light out by
+    // k and brighten it by k² to compensate 1/d² — a hack that existed only
+    // because the "sun" was a lamp 12 units away. A sun does not get closer to
+    // one end of the field.)
 
     let mut scene = Scene {
         positions,
@@ -531,10 +1321,19 @@ pub fn tile_scene(base: Scene, nx: u32, nz: u32) -> (Scene, f32) {
         materials: base.materials,
         textures: base.textures,
         any_alpha: false,
-        light,
+        any_height: false,
+        any_transmissive: false,
+        // The sun is at infinity: a replicated field sees the SAME sun, at the
+        // same angle, with the same irradiance, everywhere. Nothing to rescale.
+        sun: base.sun,
+        sky_sh: crate::sh::Sh9::ZERO,
+        sky_scale: base.sky_scale,
+        night: base.night,
         diag: 0.0,
         eps: 0.0,
         ao_radius: 0.0,
+        content_min: Vec3A::ZERO,
+        content_max: Vec3A::ZERO,
     };
     finalize_scalars(&mut scene);
     eprintln!(
@@ -645,19 +1444,11 @@ pub fn stress_scene(n: usize) -> Scene {
         }
     }
 
-    // The default light, pushed out and brightened to cover the field
-    // (1/d² falloff → color scales with k²). Direction is preserved, so
-    // `render::sun_dir` (light.center normalized) is unchanged.
-    let k = (fh / 6.0).max(1.0);
-    let base = default_light();
-    let light = AreaLight {
-        center: base.center * k,
-        u: base.u * k,
-        v: base.v * k,
-        color: base.color * (k * k),
-    };
+    // No light rescaling: the sun is at infinity, so however wide the stress
+    // field grows, every object sees the same sun at the same angle. (This used
+    // to push a rect lamp out by k and brighten it by k² to undo 1/d².)
 
-    let scene = b.finish(light);
+    let scene = b.finish(default_sun());
     eprintln!(
         "stress scene: {n} objects ({boxes} boxes, {spheres} spheres, {bunnies} bunnies, {teapots} teapots) | {} tris | field {:.0}x{:.0}",
         scene.tri_count(),
@@ -722,6 +1513,17 @@ fn parse_map_value(v: &str) -> (String, f32) {
     (toks.last().map(|s| s.to_string()).unwrap_or_default(), scale)
 }
 
+/// Parse an MTL `Tf r g b` transmission-filter value (three floats). Only the
+/// chromaticity is used downstream (`matclass::tf_chromatic`) — the water tint
+/// is the curated constant — so a malformed/short value is simply `None`.
+fn parse_tf(v: &str) -> Option<[f32; 3]> {
+    let mut it = v.split_whitespace().filter_map(|s| s.parse::<f32>().ok());
+    match (it.next(), it.next(), it.next()) {
+        (Some(r), Some(g), Some(b)) => Some([r, g, b]),
+        _ => None,
+    }
+}
+
 /// Load an OBJ, auto-fit it (centered on x/z, resting on y=0, diagonal = 10),
 /// and drop it onto the standard ground plane + light.
 ///
@@ -758,6 +1560,23 @@ pub fn load_obj_scene(path: &str) -> Scene {
     }
     .unwrap_or_else(|e| panic!("failed to load OBJ '{path}': {e}"));
     let obj_mats = materials_res.unwrap_or_default();
+
+    // Water detection (a glass-tier refinement): which materials are used by
+    // an OBJ object/group named `water`/`agua` — `o Water` → `materialo` in
+    // both San Miguel flavors (and NOT `o Fountain`, the stone basin).
+    // `--no-water` disarms the whole signal path so classification is exactly
+    // the pre-feature glassware.
+    let water_on = water_enabled();
+    let mut water_named = vec![false; obj_mats.len()];
+    if water_on {
+        for m in &models {
+            if let Some(id) = m.mesh.material_id {
+                if id < water_named.len() && crate::matclass::water_name(&m.name) {
+                    water_named[id] = true;
+                }
+            }
+        }
+    }
 
     let mut b = SceneBuilder::new();
     let ground = b.material(Vec3A::new(0.42, 0.46, 0.40), 0.55, 0.0);
@@ -871,21 +1690,34 @@ pub fn load_obj_scene(path: &str) -> Scene {
     };
     // Assign ids in request (MTL) order, not HashMap order. Grayscale
     // "normal maps" are height maps (San Miguel's map_Bump files are a mix)
-    // — treating one as a normal map shades garbage, so they're recorded in
-    // `height_maps` (normal lookups skip them) and dropped outright when no
-    // other role wants the file.
+    // — treating one as a normal map shades garbage, so each is CONVERTED
+    // (`Texture::height_to_normal`: Sobel normal in RGB, the exact source
+    // height in A) into its own texture id, recorded in `h2n_ids` so the
+    // material lookup below points at the converted texels. The raw
+    // grayscale copy is still kept when another linear role (rough/metal —
+    // same (path, false) dedup key) wants the file: those must sample raw
+    // texels, never a normal map.
     let mut tex_ids: HashMap<(std::path::PathBuf, bool), u32> = HashMap::new();
-    let mut height_maps: std::collections::HashSet<std::path::PathBuf> =
-        std::collections::HashSet::new();
+    let mut h2n_ids: HashMap<std::path::PathBuf, u32> = HashMap::new();
     let mut n_height = 0u32;
     for r in &reqs {
         let k = (r.path.clone(), r.srgb);
         if let Some(mut t) = decoded.remove(&k) {
             if r.normal && t.is_grayscale() {
-                height_maps.insert(r.path.clone());
                 n_height += 1;
+                // NO_TEX under --no-h2n: the entry still marks the file as a
+                // height map so the material lookup can't wire the raw
+                // grayscale as a normal map (the pre-conversion skip).
+                let id = if crate::texture::h2n_enabled() {
+                    let mut nt = t.height_to_normal();
+                    nt.source = r.path.to_string_lossy().into_owned();
+                    b.add_texture(nt)
+                } else {
+                    NO_TEX
+                };
+                h2n_ids.insert(r.path.clone(), id);
                 if !r.kd && !r.other {
-                    continue; // height-map only — don't keep unused texels
+                    continue; // height-map only — the raw texels aren't needed
                 }
             }
             if !r.kd {
@@ -904,7 +1736,8 @@ pub fn load_obj_scene(path: &str) -> Scene {
     let (mut n_normal, mut n_rough, mut n_metal, mut n_emissive) = (0u32, 0u32, 0u32, 0u32);
     let mat_map: Vec<u32> = obj_mats
         .iter()
-        .map(|m| {
+        .enumerate()
+        .map(|(mi, m)| {
             let mut kd = Vec3A::from_array(m.diffuse.unwrap_or([0.7, 0.7, 0.7]));
             let tex = m
                 .diffuse_texture
@@ -918,13 +1751,26 @@ pub fn load_obj_scene(path: &str) -> Scene {
                 let file = t.rsplit('/').next().unwrap_or(&t);
                 file.split('.').next().unwrap_or(file).to_ascii_lowercase()
             });
-            let (class, pbr) =
-                crate::matclass::classify(stem.as_deref(), &m.name, m.shininess, m.illumination_model);
+            // Water refines the glass tier only: `water_hint` from the OBJ
+            // object name, `tf` the parsed MTL transmission filter (tobj has
+            // no first-class Tf — it rides unknown_param, the `norm`/`Pr`
+            // precedent). Both suppressed under --no-water.
+            let tf = if water_on { m.unknown_param.get("Tf").and_then(|v| parse_tf(v)) } else { None };
+            let (class, pbr) = crate::matclass::classify(
+                stem.as_deref(),
+                &m.name,
+                m.shininess,
+                m.illumination_model,
+                water_on && water_named[mi],
+                tf,
+            );
             class_counts[class] += 1;
-            if pbr.transmission > 0.0 {
+            if pbr.transmission > 0.0 && !pbr.water {
                 // Transmitted light is tinted by albedo and San Miguel's
                 // glass Kd is 0.1-0.2 dark — lift toward white or glass
-                // renders near-black.
+                // renders near-black. Water is EXEMPT: it carries its color in
+                // `trans_tint` (below), so its raw dark Kd stays, which kills
+                // the neutral `kd·(1−T)` wash that read as chrome.
                 kd = Vec3A::ONE.lerp(kd, 0.2);
             }
             let kind = match tex {
@@ -935,24 +1781,31 @@ pub fn load_obj_scene(path: &str) -> Scene {
                 None => MatKind::Diffuse,
             };
             // Normal map: map_Bump/bump (first-class in tobj, value may
-            // carry `-bm s`) or `norm` (unknown_param); grayscale files are
-            // height maps and stay NO_TEX (see height_maps above).
+            // carry `-bm s`) or `norm` (unknown_param); grayscale files
+            // resolve to their Sobel-converted normal map (see h2n_ids
+            // above), keeping the parsed `-bm` and carrying the exact
+            // source height (amp = the conversion's own K, texel units).
             let norm_val = m
                 .normal_texture
                 .as_deref()
                 .or_else(|| m.unknown_param.get("norm").map(|s| s.as_str()));
-            let (normal_tex, normal_scale) = norm_val
+            let (normal_tex, normal_scale, height_amp) = norm_val
                 .map(parse_map_value)
                 .filter(|(p, _)| !p.is_empty())
                 .map(|(p, s)| {
                     let rp = resolve(&p);
-                    if height_maps.contains(&rp) {
-                        (NO_TEX, 1.0)
-                    } else {
-                        (tex_ids.get(&(rp, false)).copied().unwrap_or(NO_TEX), s)
+                    match h2n_ids.get(&rp) {
+                        Some(&id) if id != NO_TEX => {
+                            (id, s, crate::texture::HEIGHT_NORMAL_STRENGTH)
+                        }
+                        // Height map under --no-h2n: the pre-conversion skip.
+                        Some(_) => (NO_TEX, 1.0, 0.0),
+                        None => {
+                            (tex_ids.get(&(rp, false)).copied().unwrap_or(NO_TEX), s, 0.0)
+                        }
                     }
                 })
-                .unwrap_or((NO_TEX, 1.0));
+                .unwrap_or((NO_TEX, 1.0, 0.0));
             // Roughness/metallic maps (PBR MTL extension, unknown_param) +
             // their scalars: factor × sample is the glTF semantic — with a
             // map the factor is the MTL's own Pr/Pm (default 1.0), bypassing
@@ -990,6 +1843,14 @@ pub fn load_obj_scene(path: &str) -> Scene {
             n_rough += (rough_tex != NO_TEX) as u32;
             n_metal += (metal_tex != NO_TEX) as u32;
             n_emissive += (emissive != Vec3A::ZERO || emissive_tex != NO_TEX) as u32;
+            // Water carries its color/IOR/ripples here; every other material
+            // takes the sentinel tint (⇒ albedo verbatim), IOR 1.5 (bit-
+            // identical to the old GLASS_IOR const), and no ripples.
+            let (trans_tint, ior, ripple_amp) = if pbr.water {
+                (WATER_TINT, WATER_IOR, WATER_RIPPLE_AMP)
+            } else {
+                (Vec3A::splat(-1.0), 1.5, 0.0)
+            };
             b.material_full(Material {
                 albedo: kd,
                 roughness,
@@ -998,9 +1859,13 @@ pub fn load_obj_scene(path: &str) -> Scene {
                 sheen: pbr.sheen,
                 translucency: pbr.translucency,
                 transmission: pbr.transmission,
+                trans_tint,
+                ior,
+                ripple_amp,
                 emissive,
                 normal_tex,
                 normal_scale,
+                height_amp,
                 rough_tex,
                 metal_tex,
                 emissive_tex,
@@ -1018,7 +1883,7 @@ pub fn load_obj_scene(path: &str) -> Scene {
             .collect::<Vec<_>>()
             .join(" | ");
         eprintln!(
-            "obj materials: {} -> {} || maps: normal {} | rough {} | metal {} | emissive {} | height-maps skipped {}",
+            "obj materials: {} -> {} || maps: normal {} | rough {} | metal {} | emissive {} | height-maps converted {}",
             obj_mats.len(),
             body,
             n_normal,
@@ -1041,7 +1906,7 @@ pub fn load_obj_scene(path: &str) -> Scene {
         Vec3A::ZERO,
     );
 
-    b.finish(default_light())
+    b.finish(default_sun())
 }
 
 /// Fit `models` to a bounding diagonal of `target_diag` — centered on x/z,

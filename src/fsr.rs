@@ -152,6 +152,23 @@ pub fn oct_decode(eu: f32, ev: f32) -> Vec3A {
     Vec3A::new(x, y, z).normalize()
 }
 
+/// The normal as the RGB10A2 normals plane actually STORES it: octahedral,
+/// 10 bits per channel, decoded back.
+///
+/// This exists because the AO signal's remodulation factor stopped being a
+/// constant. It used to be `shade::AMBIENT`, which every composite site could
+/// simply be handed; the one sky makes it `sky_sh.irradiance(n)` — directional,
+/// hence per-pixel. The GPU composite pass (`fsr_composite.hlsl`) has exactly
+/// one source for that normal: the plane bytes. So every site must derive the
+/// factor from the WIRE normal, not from the full-precision shading normal, or
+/// the composite identity picks up a quantization-sized hole that no tolerance
+/// should be widened to absorb. `--check-fsr`'s per-pixel identity gate is what
+/// pins this.
+pub fn wire_normal(n: Vec3A) -> Vec3A {
+    let (u, v) = oct_encode(n);
+    oct_decode(quant_unorm(u, 10), quant_unorm(v, 10))
+}
+
 /// Quantize a [0,1] value through an n-bit UNORM channel.
 #[inline(always)]
 pub fn quant_unorm(v: f32, bits: u32) -> f32 {
@@ -170,8 +187,9 @@ pub struct Signals {
     /// Demodulated direct specular, f16-quantized.
     pub ds: Vec3A,
     /// Ambient-occlusion open fraction in [0,1], f16-quantized — RR's scalar
-    /// AO signal. Remodulated as `ao * AMBIENT * kd` (the constant the
-    /// sampled ambient tier multiplies it by; `shade::AMBIENT`).
+    /// AO signal. Remodulated as `ao * amb * kd`, where `amb` is the sky's SH
+    /// irradiance at the pixel's WIRE normal (`wire_normal`) — the factor the
+    /// sampled ambient tier multiplies the open fraction by.
     pub ao: f32,
     /// Demodulated indirect (reflection-bounce) specular, f16-quantized —
     /// divided by the same wire F0 as `ds`, so it remodulates identically.
@@ -197,6 +215,11 @@ pub struct Signals {
 /// the wire carries only `kd`: on glass the remainder absorbs the difference.
 /// That approximation predates the AO signal (it already applied to `dd`) and
 /// `ao` deliberately inherits the same convention.
+///
+/// `amb` is the AO signal's remodulation factor — `sky_sh.irradiance` at the
+/// pixel's `wire_normal`. It is passed in rather than computed here so fsr.rs
+/// stays sky-agnostic, but it MUST be the wire-normal value: the GPU composite
+/// has only the normals plane to rebuild it from (see `wire_normal`).
 pub fn split_signals(
     color: Vec3A,
     direct_d: Vec3A,
@@ -205,6 +228,7 @@ pub fn split_signals(
     ind_s: Vec3A,
     kd: Vec3A,
     f0: Vec3A,
+    amb: Vec3A,
 ) -> Signals {
     let kd_wire = albedo_wire3(kd);
     let sf0_wire = albedo_wire3(f0);
@@ -213,8 +237,7 @@ pub fn split_signals(
     let ds = q16v(direct_s / f0_floor);
     let ao = q16(ao);
     let is = q16v(ind_s / f0_floor);
-    let residual =
-        color - dd * kd_wire - ds * sf0_wire - ao * crate::shade::AMBIENT * kd_wire - is * sf0_wire;
+    let residual = color - dd * kd_wire - ds * sf0_wire - ao * amb * kd_wire - is * sf0_wire;
     Signals { dd, ds, ao, is, residual }
 }
 
@@ -222,14 +245,10 @@ pub fn split_signals(
 /// signals in place of the raw ones): the CPU twin used by the identity gate.
 /// The wire quantization is applied here, exactly as `split_signals` applied
 /// it — fsr_composite.hlsl mirrors this decode.
-pub fn composite(sig: &Signals, kd: Vec3A, f0: Vec3A) -> Vec3A {
+pub fn composite(sig: &Signals, kd: Vec3A, f0: Vec3A, amb: Vec3A) -> Vec3A {
     let kd_wire = albedo_wire3(kd);
     let f0_wire = albedo_wire3(f0);
-    sig.dd * kd_wire
-        + sig.ds * f0_wire
-        + sig.ao * crate::shade::AMBIENT * kd_wire
-        + sig.is * f0_wire
-        + sig.residual
+    sig.dd * kd_wire + sig.ds * f0_wire + sig.ao * amb * kd_wire + sig.is * f0_wire + sig.residual
 }
 
 // ---------------------------------------------------------------------------
@@ -474,4 +493,35 @@ pub fn pick_version(upscalers: &[(u64, String)], rr_available: bool, force_fsr3:
         })
         .max_by_key(|&(_, v)| v)
         .map(|(id, _)| (id, Flavor::Fsr3))
+}
+
+/// Choose the FRAME GENERATION provider. `fg_versions` is the device-filtered
+/// framegeneration enumeration (empty = FG unsupported, the caller already
+/// bailed); `fsr4_session` says whether the session's UPSCALER resolved to the
+/// FSR4 family (family coherence: an FSR4-RR session prefers the 4.x ML frame
+/// generation, everything else — FSR3, XeSS-fed, cross-vendor — prefers the
+/// proven 3.1 interpolation). The preferred major may simply not be there
+/// (4.x FG is RDNA4-gated the way RR is; a 3.1-only drop enumerates no 4.x),
+/// so the other major is the fallback rather than a failure — the enumeration
+/// is device-filtered, anything in it is claimed to run here. Returns
+/// (version_id, display_name); version_id 0 (provider default + API pin) is
+/// deliberately NOT used — FG picks are always explicit overrides, because
+/// "default" would float with the drop while the session's flavor pairing is
+/// the contract we print and test against.
+pub fn pick_fg_version(fg_versions: &[(u64, String)], fsr4_session: bool) -> Option<(u64, String)> {
+    let best_of = |major: u32| {
+        fg_versions
+            .iter()
+            .filter_map(|(id, name)| {
+                parse_provider_versions(name)
+                    .into_iter()
+                    .filter(|v| v.0 == major)
+                    .max()
+                    .map(|v| (*id, name.clone(), v))
+            })
+            .max_by_key(|&(_, _, v)| v)
+            .map(|(id, name, _)| (id, name))
+    };
+    let (preferred, fallback) = if fsr4_session { (4, 3) } else { (3, 4) };
+    best_of(preferred).or_else(|| best_of(fallback))
 }

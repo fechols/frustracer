@@ -17,6 +17,23 @@ use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 /// Tiles at or below this size stop subdividing and trace per-pixel rays.
 /// Caps quadtree overhead at ~(pixels/64)·4/3 frustum queries per frame.
 pub const LEAF_TILE: usize = 8;
+
+/// R&D lever (FR_LEAF, default LEAF_TILE): the quadtree's leaf-rect cutoff, so
+/// the subdivision depth can be swept without a rebuild. Smaller = narrower
+/// leaf frustums (deeper distance penetration, more tiles provable as sky) at
+/// 4x the tiles per level down and 1/4 the pixels to amortize each tile's
+/// bound-query + refine_cut over. Read once; the GPU gets the same number as an
+/// injected `#define LEAF_TILE` so both intersectors agree on the frontier.
+pub fn leaf_tile() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("FR_LEAF")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| n.is_power_of_two() && *n >= 1 && *n <= 64)
+            .unwrap_or(LEAF_TILE)
+    })
+}
 /// Tiles larger than this spawn their quadrants as rayon tasks; smaller ones
 /// recurse sequentially (task granularity, not correctness).
 const SPAWN_MIN: usize = 32;
@@ -40,6 +57,14 @@ pub struct FrameCtx<'a> {
     pub tbuf: &'a [AtomicU32],
     pub stats: &'a Stats,
     pub sun: Vec3A,
+    /// Per-frame cloud state (src/clouds.rs). main.rs owns the clock; every
+    /// headless context pins `Clouds::check` so gate pairs compare one sky.
+    pub clouds: crate::clouds::Clouds,
+    /// Per-frame firefly state (src/fireflies.rs) — poses baked once per
+    /// frame on the same clock as `clouds`; `count == 0` (every day session)
+    /// is the structural off state. Consumed by the primary shade path and
+    /// the display glow only — never the gathers (the stars rule).
+    pub fireflies: crate::fireflies::Fireflies,
     /// This frame's temporal cache to fill (per-node tc / sky markers).
     pub tcache_cur: Option<&'a TemporalCache>,
     /// Ring of previous frames' caches, NEWEST FIRST, each paired with the
@@ -255,7 +280,7 @@ fn trace_tile(
         return TilePend::Done;
     }
     let (w, h) = (x1 - x0, y1 - y0);
-    if w <= LEAF_TILE && h <= LEAF_TILE {
+    if w <= leaf_tile() && h <= leaf_tile() {
         if let Some(rec) = ctx.replay_rec {
             rec.push_leaf(x0, y0, x1, y1, t_start, depth, cut_in);
         }
@@ -593,6 +618,9 @@ fn shade_deferred(ctx: &FrameCtx, px: &mut [DeferPx], ls: &mut LocalStats) {
             ray: Ray::new(ctx.cam.origin, dir),
             hit: (p.hit.tri != u32::MAX).then_some(p.hit),
             rng: p.rng.clone(),
+            // Deferred records exist only at spp == 1 (sample 0) and only for
+            // HIT pixels — the cloud-phase stratum is never read here.
+            k: 0,
         };
         shade_traced(
             ctx,
@@ -888,6 +916,7 @@ fn shade_hemi_cell(
                 delta,
                 eta,
                 ctx.q.fb.gi.then_some(ctx.sun),
+                &ctx.clouds,
                 rec,
                 ls,
             );
@@ -1202,6 +1231,18 @@ fn write_fsr(
         Some(prev) => (p - prev.origin).dot(prev.forward()),
         None => t * dir.dot(ctx.cam.forward()),
     };
+    // The AO signal's remodulation factor: the sky's SH irradiance at the WIRE
+    // normal, not at `prim.n` itself. The composite pass rebuilds this from the
+    // octahedral normals plane and has no other source for it, so the
+    // subtraction here has to be made against the same quantized normal or the
+    // composite identity picks up a quantization-sized hole (fsr::wire_normal).
+    //
+    // `q16v` first: on THIS (CPU-fed) path the plane is oct-encoded from the f16
+    // G-buffer normal (ffx_rr::record_upload's ld16), so the f16 hop is part of
+    // the wire here. The GPU feed encodes straight from the pack's f32 normal
+    // and has no such hop — each path is self-consistent with its own plane,
+    // which is all the identity requires.
+    let amb = ctx.scene.sky_sh.irradiance(crate::fsr::wire_normal(crate::fsr::q16v(prim.n)));
     let sig = crate::fsr::split_signals(
         c,
         prim.direct_d,
@@ -1210,6 +1251,7 @@ fn write_fsr(
         prim.ind_s,
         prim.albedo * (1.0 - prim.metallic),
         Vec3A::splat(0.04).lerp(prim.albedo, prim.metallic),
+        amb,
     );
     f.write(x, y, &sig, prev_z);
 }
@@ -1242,7 +1284,7 @@ fn write_gbuf_sky(ctx: &FrameCtx, x: usize, y: usize, fx: f32, fy: f32, dir: Vec
     );
     // `c` is this pixel's presented color, which for a sky pixel IS the sky
     // radiance (bit-identically at spp == 1 — the caller passes what
-    // `shade::sky` returned for this same dir). Passing it rather than
+    // `sky::radiance` returned for this same dir). Passing it rather than
     // recomputing is what lets the --spp average reach the residual.
     write_fsr(ctx, x, y, dir, f32::INFINITY, &shade::PrimarySurface::default(), c);
 }
@@ -1270,6 +1312,11 @@ struct Traced {
     hit: Option<Hit>,
     /// Shading RNG, positioned exactly where the fused path would have it.
     rng: fastrand::Rng,
+    /// The spp sample index (First/Topup → 0, Extra(k) → k) — the cloud
+    /// march's stratified dither stratum (`clouds::dither_jk`). A Topup
+    /// shares sample 0's stratum: top-ups exist only at spp == 1, where
+    /// k/spp is 0 anyway, and the frame term still decorrelates them.
+    k: u32,
 }
 
 /// Mixed into the HOT top-up sample's seed so its in-pixel position and
@@ -1357,7 +1404,11 @@ fn trace_primary(
         // Plain reference path: full traversal from the root.
         None => ctx.bvh.intersect(ctx.scene, &ray, t_start, f32::INFINITY, &mut ls.ray_nodes),
     };
-    Traced { fx, fy, dir, ray, hit, rng }
+    let k = match sample {
+        SampleId::Extra(k) => k,
+        SampleId::First | SampleId::Topup => 0,
+    };
+    Traced { fx, fy, dir, ray, hit, rng, k }
 }
 
 /// Shade a traced sample. `primary` gates every per-pixel side channel
@@ -1391,7 +1442,7 @@ fn shade_traced(
                 ls.skip_ratio_count += 1;
             }
             let mut prim = shade::PrimarySurface::default();
-            let c = shade::shade(
+            let mut c = shade::shade(
                 ctx.scene,
                 ctx.bvh,
                 &tr.ray,
@@ -1400,6 +1451,7 @@ fn shade_traced(
                 &ctx.q,
                 &mut tr.rng,
                 ctx.sun,
+                &ctx.clouds,
                 // Primary ray cone: apex at the camera, one-pixel spread.
                 shade::Cone::primary(&ctx.cam),
                 0,
@@ -1407,7 +1459,26 @@ fn shade_traced(
                 if primary && ctx.gbuf.is_some() { Some(&mut prim) } else { None },
                 vis,
                 hemi_share,
+                // The ONE Some site: fireflies light the primary camera path
+                // only. Day sessions (count 0) hand shade a structural None.
+                (ctx.fireflies.count > 0).then_some(&ctx.fireflies),
             );
+            // Firefly glow, depth-tested against the primary hit — a firefly
+            // between the camera and the surface splats over the shaded
+            // color (this sample's own ray, so --spp averages it). Guarded:
+            // `-0.0 + 0.0 = +0.0` would break day bit-identity (the emissive
+            // discipline). Color-only — tbuf/info/meta and every exact-zero
+            // verify counter are structurally blind to it; under FSR it
+            // lands in the deterministic residual (the emissive accept).
+            if ctx.fireflies.count > 0 {
+                c += crate::fireflies::glow(
+                    &ctx.fireflies,
+                    tr.ray.o,
+                    tr.dir,
+                    hit.t,
+                    ctx.cam.pixel_cone() * 0.5,
+                );
+            }
             if do_splat {
                 ctx.splat(x, y, c);
             }
@@ -1420,7 +1491,33 @@ fn shade_traced(
             if primary {
                 ctx.store_meta(x, y, f32::INFINITY, depth, kind);
             }
-            let c = shade::sky(tr.dir, ctx.sun);
+            // A DISPLAY path: the camera is looking at the sky, so it sees the
+            // sun disc. Nothing else delivers it here — this is the backdrop
+            // (through the cloud layer, which marches from the ray's origin
+            // with this sample's own dither phase — per (pixel, frame,
+            // sample), so --spp and accumulation genuinely average the march).
+            let mut c = crate::sky::radiance(
+                tr.ray.o,
+                tr.dir,
+                &ctx.scene.sun,
+                ctx.cam.pixel_cone() * 0.5,
+                ctx.scene.sky_scale,
+                ctx.scene.night,
+                ctx.frame,
+                &ctx.clouds,
+                crate::clouds::dither_jk(x as u32, y as u32, ctx.frame, tr.k, ctx.spp()),
+            );
+            // Firefly glow against the open sky — a miss has no depth to
+            // test (t_max ∞). Guarded like the hit arm.
+            if ctx.fireflies.count > 0 {
+                c += crate::fireflies::glow(
+                    &ctx.fireflies,
+                    tr.ray.o,
+                    tr.dir,
+                    f32::INFINITY,
+                    ctx.cam.pixel_cone() * 0.5,
+                );
+            }
             if do_splat {
                 ctx.splat(x, y, c);
             }
@@ -1604,15 +1701,96 @@ fn fill_sky(ctx: &FrameCtx, x0: usize, y0: usize, x1: usize, y1: usize, depth: u
 /// The per-pixel body of `fill_sky`, stats-free so the replay driver can fan
 /// a large sky rect out across row bands without double-counting the tile.
 fn fill_sky_rows(ctx: &FrameCtx, x0: usize, y0: usize, x1: usize, y1: usize, depth: u32) {
+    let spp = ctx.spp();
     for y in y0..y1 {
         for x in x0..x1 {
             let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
             let dir = ctx.cam.ray_dir(fx, fy);
-            let c = shade::sky(dir, ctx.sun);
+            // The pixel's cloud march phase — per (pixel, frame, SAMPLE),
+            // mirroring the per-pixel sample loops: the center rides sample
+            // 0's stratum (bitwise `dither_j(x, y, frame)`), each SKY_J extra
+            // takes its own stratum, so a multi-sampled sky tile averages the
+            // march phase exactly like a leaf pixel does.
+            let j = crate::clouds::dither_jk(x as u32, y as u32, ctx.frame, 0, spp);
+            // A DISPLAY path — the camera looking at the sky — so it sees the
+            // sun DISC, antialiased against the pixel's own cone (sky.rs),
+            // plus the stars (twinkle-phased by the frame index — replay
+            // re-shades at the same frame, so bit-identity holds).
+            let mut c = crate::sky::radiance(
+                ctx.cam.origin,
+                dir,
+                &ctx.scene.sun,
+                ctx.cam.pixel_cone() * 0.5,
+                ctx.scene.sky_scale,
+                ctx.scene.night,
+                ctx.frame,
+                &ctx.clouds,
+                j,
+            );
+            // Firefly glow against a proven-empty tile — the feature's most
+            // visible case (a firefly on the night sky), still ZERO rays:
+            // nothing occludes along a sky direction, so t_max is ∞ and the
+            // splat needs no depth test. Guarded (the emissive discipline);
+            // the splat is Gaussian at ≥ the pixel footprint, so the
+            // center-direction rule stays sound exactly as it does for stars.
+            if ctx.fireflies.count > 0 {
+                c += crate::fireflies::glow(
+                    &ctx.fireflies,
+                    ctx.cam.origin,
+                    dir,
+                    f32::INFINITY,
+                    ctx.cam.pixel_cone() * 0.5,
+                );
+            }
+            // A proven-empty tile has always shaded ONE center direction, spp
+            // or not — sound while the sky was smooth at sub-pixel scale. The
+            // cloud layer broke that premise (a cover-ramp edge crosses a
+            // pixel), so under clouds a multi-sampled frame averages spp
+            // sample positions — still ZERO rays, sample 0 still the center,
+            // side channels still the center's. The extra DIRECTION offsets
+            // are the PHASE-0 Halton set, deliberately frame-INDEPENDENT like
+            // the center itself (the sky fill antialiases a static function;
+            // per-frame offsets put inter-frame dither on cloud edges, which
+            // the spp stability gate rightly rejects at night, where nothing
+            // louder masks it — a lesson about the direction SET only: the
+            // march PHASE below is per-sample and frame-keyed, symmetric
+            // across spp levels, which that gate accepts). The guard keeps
+            // spp == 1 and --no-clouds on the old path VERBATIM, and the GPU
+            // twin (cs_sky + the injected SKY_J table) mirrors the loop term
+            // for term — the spp wavefront-vs-reference image A/B at frame 0
+            // is the gate.
+            if ctx.clouds.enabled && spp > 1 {
+                for k in 1..spp {
+                    let (ox, oy) = dlss::jitter_for_sample(0, k);
+                    let dk = ctx.cam.ray_dir(fx + ox, fy + oy);
+                    c += crate::sky::radiance(
+                        ctx.cam.origin,
+                        dk,
+                        &ctx.scene.sun,
+                        ctx.cam.pixel_cone() * 0.5,
+                        ctx.scene.sky_scale,
+                        ctx.scene.night,
+                        ctx.frame,
+                        &ctx.clouds,
+                        crate::clouds::dither_jk(x as u32, y as u32, ctx.frame, k, spp),
+                    );
+                    // Each extra sample carries its own glow along its own
+                    // direction, exactly like a leaf pixel's sample loop.
+                    if ctx.fireflies.count > 0 {
+                        c += crate::fireflies::glow(
+                            &ctx.fireflies,
+                            ctx.cam.origin,
+                            dk,
+                            f32::INFINITY,
+                            ctx.cam.pixel_cone() * 0.5,
+                        );
+                    }
+                }
+                c *= 1.0 / spp as f32;
+            }
             ctx.store_meta(x, y, f32::INFINITY, depth, KIND_SKY);
             ctx.splat(x, y, c);
-            // A proven-empty tile shades one center direction, spp or not —
-            // the presented color and the FSR residual are the same value.
+            // The presented color and the FSR residual are the same value.
             write_gbuf_sky(ctx, x, y, fx, fy, dir, c);
         }
     }
@@ -1679,6 +1857,28 @@ pub fn resolve(
 ) {
     crate::zone!("resolve");
     let inv = 1.0 / samples.max(1) as f32;
+
+    // Glare needs the whole HDR image (it is a convolution), so the bloom path
+    // materializes it — into bloom's own cached buffer, so a presented frame
+    // still allocates nothing. The `--no-bloom` path keeps the original
+    // per-pixel loop verbatim, which is what makes that flag bit-identical to
+    // the pre-bloom renderer by construction.
+    if crate::bloom::enabled() {
+        crate::bloom::with_glare_filled(
+            rw,
+            rh,
+            |hdr| {
+                hdr.par_chunks_mut(3).enumerate().for_each(|(p, px)| {
+                    for (k, o) in px.iter_mut().enumerate() {
+                        *o = f32::from_bits(accum[p * 3 + k].load(Relaxed)) * inv;
+                    }
+                });
+            },
+            |hdr| tonemap_to(hdr, info, overlay_on, present, rw, rh, ww, wh),
+        );
+        return;
+    }
+
     present.par_chunks_mut(ww).enumerate().for_each(|(wy, row)| {
         let sy = (wy * rh / wh).min(rh - 1);
         for (wx, out) in row.iter_mut().enumerate() {
@@ -1707,6 +1907,29 @@ pub fn resolve_hdr(
     wh: usize,
 ) {
     crate::zone!("resolve-hdr");
+    // The CPU denoisers' tonemap entry (OIDN / NPPD land here directly), and
+    // where their glare comes from. `resolve` does NOT funnel through this — it
+    // materializes its own HDR image and calls `tonemap_to` below with the glare
+    // already applied, so nothing can double-bloom.
+    crate::bloom::with_glare(hdr, rw, rh, |hdr| {
+        tonemap_to(hdr, info, overlay_on, present, rw, rh, ww, wh)
+    });
+}
+
+/// Tonemap + overlay + upscale an HDR image into the present buffer. The one
+/// CPU present loop, shared by `resolve` and `resolve_hdr`; glare is the
+/// caller's business, so this can never apply it twice.
+#[allow(clippy::too_many_arguments)]
+fn tonemap_to(
+    hdr: &[f32],
+    info: &[AtomicU32],
+    overlay_on: bool,
+    present: &mut [u32],
+    rw: usize,
+    rh: usize,
+    ww: usize,
+    wh: usize,
+) {
     present.par_chunks_mut(ww).enumerate().for_each(|(wy, row)| {
         let sy = (wy * rh / wh).min(rh - 1);
         for (wx, out) in row.iter_mut().enumerate() {
@@ -1734,6 +1957,27 @@ pub fn resolve_scrgb(
 ) {
     crate::zone!("resolve-scrgb");
     let inv = 1.0 / samples.max(1) as f32;
+    // Glare is a DISPLAY-stage pass on whatever the tonemap is about to read, so
+    // it applies to the scRGB encode exactly as it does to the SDR one — the
+    // swapchain format is not a reason to have or not have bloom. (It matters
+    // more here, if anything: scRGB is the default, so a miss would silently
+    // delete glare from every CPU-presented frame.) Same structure as `resolve`.
+    if crate::bloom::enabled() {
+        crate::bloom::with_glare_filled(
+            rw,
+            rh,
+            |hdr| {
+                hdr.par_chunks_mut(3).enumerate().for_each(|(px, o)| {
+                    for (k, v) in o.iter_mut().enumerate() {
+                        *v = f32::from_bits(accum[px * 3 + k].load(Relaxed)) * inv;
+                    }
+                });
+            },
+            |hdr| tonemap_to_scrgb(hdr, info, overlay_on, p, present, rw, rh, ww, wh),
+        );
+        return;
+    }
+
     present.par_chunks_mut(ww).enumerate().for_each(|(wy, row)| {
         let sy = (wy * rh / wh).min(rh - 1);
         for (wx, out) in row.iter_mut().enumerate() {
@@ -1763,6 +2007,27 @@ pub fn resolve_hdr_scrgb(
     wh: usize,
 ) {
     crate::zone!("resolve-hdr-scrgb");
+    // The scRGB twin of `resolve_hdr`: the CPU denoisers' glare comes from here.
+    crate::bloom::with_glare(hdr, rw, rh, |hdr| {
+        tonemap_to_scrgb(hdr, info, overlay_on, p, present, rw, rh, ww, wh)
+    });
+}
+
+/// `tonemap_to` for the scRGB f16 swapchain — the one scRGB present loop,
+/// shared by `resolve_scrgb` and `resolve_hdr_scrgb`. Glare is the caller's
+/// business, so this can never apply it twice.
+#[allow(clippy::too_many_arguments)]
+fn tonemap_to_scrgb(
+    hdr: &[f32],
+    info: &[AtomicU32],
+    overlay_on: bool,
+    p: tone::ToneParams,
+    present: &mut [[f16; 4]],
+    rw: usize,
+    rh: usize,
+    ww: usize,
+    wh: usize,
+) {
     present.par_chunks_mut(ww).enumerate().for_each(|(wy, row)| {
         let sy = (wy * rh / wh).min(rh - 1);
         for (wx, out) in row.iter_mut().enumerate() {
@@ -1770,6 +2035,102 @@ pub fn resolve_hdr_scrgb(
             let i = (sy * rw + sx) * 3;
             let c = Vec3A::new(hdr[i], hdr[i + 1], hdr[i + 2]);
             *out = present_px_scrgb(c, p, info, overlay_on, sx, sy, rw, rh);
+        }
+    });
+}
+
+/// `resolve` for the HDR10 (R10G10B10A2 + PQ) swapchain — same average, same
+/// overlay, same nearest upscale; the encode is `tone::ToneMode::Pq` and the
+/// pack is the 10-bit lane layout (R low).
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_pq(
+    accum: &[AtomicU32],
+    info: &[AtomicU32],
+    samples: u32,
+    overlay_on: bool,
+    p: tone::ToneParams,
+    present: &mut [u32],
+    rw: usize,
+    rh: usize,
+    ww: usize,
+    wh: usize,
+) {
+    crate::zone!("resolve-pq");
+    let inv = 1.0 / samples.max(1) as f32;
+    // Glare before the curve, exactly as in `resolve_scrgb` — the swapchain
+    // encode is never a reason to have or not have bloom.
+    if crate::bloom::enabled() {
+        crate::bloom::with_glare_filled(
+            rw,
+            rh,
+            |hdr| {
+                hdr.par_chunks_mut(3).enumerate().for_each(|(px, o)| {
+                    for (k, v) in o.iter_mut().enumerate() {
+                        *v = f32::from_bits(accum[px * 3 + k].load(Relaxed)) * inv;
+                    }
+                });
+            },
+            |hdr| tonemap_to_pq(hdr, info, overlay_on, p, present, rw, rh, ww, wh),
+        );
+        return;
+    }
+
+    present.par_chunks_mut(ww).enumerate().for_each(|(wy, row)| {
+        let sy = (wy * rh / wh).min(rh - 1);
+        for (wx, out) in row.iter_mut().enumerate() {
+            let sx = (wx * rw / ww).min(rw - 1);
+            let i = (sy * rw + sx) * 3;
+            let c = Vec3A::new(
+                f32::from_bits(accum[i].load(Relaxed)),
+                f32::from_bits(accum[i + 1].load(Relaxed)),
+                f32::from_bits(accum[i + 2].load(Relaxed)),
+            ) * inv;
+            *out = present_px_pq(c, p, info, overlay_on, sx, sy, rw, rh);
+        }
+    });
+}
+
+/// `resolve_hdr` for the HDR10 swapchain — the OIDN / NPPD / XeSS-post output
+/// path under PQ.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_hdr_pq(
+    hdr: &[f32],
+    info: &[AtomicU32],
+    overlay_on: bool,
+    p: tone::ToneParams,
+    present: &mut [u32],
+    rw: usize,
+    rh: usize,
+    ww: usize,
+    wh: usize,
+) {
+    crate::zone!("resolve-hdr-pq");
+    crate::bloom::with_glare(hdr, rw, rh, |hdr| {
+        tonemap_to_pq(hdr, info, overlay_on, p, present, rw, rh, ww, wh)
+    });
+}
+
+/// `tonemap_to` for the HDR10 swapchain — the one PQ present loop, shared by
+/// `resolve_pq` and `resolve_hdr_pq`. Glare is the caller's business.
+#[allow(clippy::too_many_arguments)]
+fn tonemap_to_pq(
+    hdr: &[f32],
+    info: &[AtomicU32],
+    overlay_on: bool,
+    p: tone::ToneParams,
+    present: &mut [u32],
+    rw: usize,
+    rh: usize,
+    ww: usize,
+    wh: usize,
+) {
+    present.par_chunks_mut(ww).enumerate().for_each(|(wy, row)| {
+        let sy = (wy * rh / wh).min(rh - 1);
+        for (wx, out) in row.iter_mut().enumerate() {
+            let sx = (wx * rw / ww).min(rw - 1);
+            let i = (sy * rw + sx) * 3;
+            let c = Vec3A::new(hdr[i], hdr[i + 1], hdr[i + 2]);
+            *out = present_px_pq(c, p, info, overlay_on, sx, sy, rw, rh);
         }
     });
 }
@@ -1853,6 +2214,35 @@ fn present_px_scrgb(
     }
     let v = tone::encode(v, p).max(Vec3A::ZERO);
     [f16::from_f32(v.x), f16::from_f32(v.y), f16::from_f32(v.z), f16::from_f32(1.0)]
+}
+
+/// Tonemap and encode to packed 10-bit PQ for the `R10G10B10A2_UNORM`
+/// swapchain (`r | g<<10 | b<<20 | 3<<30` — R in the LOW bits, R10G10B10A2's
+/// lane order, opposite the SDR pack's BGRA8). The overlay composite reuses
+/// the scRGB path's display-space round-trip: `shape` under PQ is still
+/// paper-white-relative *light* (the ST 2084 encode lives in `tone::encode`),
+/// so the same pow pair lands the tints where they were authored.
+#[inline]
+fn present_px_pq(
+    c: Vec3A,
+    p: tone::ToneParams,
+    info: &[AtomicU32],
+    overlay_on: bool,
+    sx: usize,
+    sy: usize,
+    rw: usize,
+    rh: usize,
+) -> u32 {
+    let mut v = tone::shape(c, p);
+    if overlay_on {
+        let g = overlay_px(v.max(Vec3A::ZERO).powf(1.0 / 2.2), info, sx, sy, rw, rh);
+        v = g.max(Vec3A::ZERO).powf(2.2);
+    }
+    // `encode` (matrix + ST 2084) lands in [0, 1] by construction — pq_encode
+    // saturates its input — so the clamp here is only the pack's own guard.
+    let v = tone::encode(v, p).clamp(Vec3A::ZERO, Vec3A::ONE);
+    let q = (v * 1023.0 + 0.5).floor();
+    (q.x as u32) | ((q.y as u32) << 10) | ((q.z as u32) << 20) | (3 << 30)
 }
 
 pub struct VerifyReport {
@@ -1950,6 +2340,10 @@ pub fn verify_sampled(
         tbuf: &tbuf,
         stats,
         sun: sun_dir(scene),
+        // verify's re-trace must shade the SAME sky as the frame it checks —
+        // the pinned check state, matching every headless FrameCtx.
+        clouds: crate::clouds::Clouds::check(scene.diag),
+        fireflies: crate::fireflies::Fireflies::check(scene),
         tcache_cur: None,
         tcache_prev: temporal_prev,
         accumulate: true,
@@ -2041,6 +2435,10 @@ pub fn verify_sampled(
         )
 }
 
+/// The sun's direction. Used to be `light.center.normalize()` — the direction of
+/// a rect lamp 12 units away, which is why the sky's glow and the actual light
+/// were two different objects that merely pointed the same way. Now it is just
+/// the sun's own direction; there is one sun.
 pub fn sun_dir(scene: &Scene) -> Vec3A {
-    scene.light.center.normalize_or_zero()
+    scene.sun.dir
 }

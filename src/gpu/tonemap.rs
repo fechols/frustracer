@@ -33,8 +33,23 @@ pub const SRV_SLOT_GPU: u32 = 4;
 pub const SRV_SLOT_DXR: u32 = 5;
 /// The FSR4 upscaled output (gpu/ffx_rr.rs).
 pub const SRV_SLOT_FSR: u32 = 6;
-/// Room for the DLSS-RR output SRV and future debug views.
-const SRV_HEAP_CAPACITY: u32 = 8;
+/// The glare halo (gpu/bloom.rs level 0). Always bound — the tonemap PS declares
+/// t1 unconditionally, so the table must be valid even under `--no-bloom`, where
+/// `bloom_strength = 0` simply never samples it.
+pub const SRV_SLOT_BLOOM: u32 = 7;
+/// The registered-consensus fuse of every wired upscaler (--quinlight,
+/// gpu/quin.rs).
+pub const SRV_SLOT_QUIN: u32 = 8;
+/// The HUD/menu overlay texture (gpu/hud.rs) — NOT a tonemap source (bloom
+/// never reads it; it composites OVER whatever was tonemapped), so it takes a
+/// plain `create_srv`, never `wire_tonemap_src`.
+pub const SRV_SLOT_OVERLAY: u32 = 9;
+/// The raw-NGX DLSS-G interpolated frame (`--fg` DLSS sessions with the NDA
+/// SDK present) — presented BEFORE the real frame each pair-present.
+pub const SRV_SLOT_NGXFG: u32 = 10;
+/// Room for future debug views. Also sizes `gpu/bloom.rs`'s source-slot region:
+/// the glare pyramid keeps a permanent SRV per tonemap slot in its own heap.
+pub const SRV_HEAP_CAPACITY: u32 = 12;
 
 /// M12: run the REAL tonemap PS over a synthetic linear-HDR image and hand back
 /// what it wrote — the twin gate that stops `tonemap.hlsl` from drifting away
@@ -42,9 +57,9 @@ const SRV_HEAP_CAPACITY: u32 = 8;
 ///
 /// Headless (no swapchain), so it renders into an offscreen target of whichever
 /// format the caller names: `SWAPCHAIN_FORMAT` gates the 8-bit SDR encode,
-/// `SWAPCHAIN_FORMAT_HDR` gates the scRGB one. Both curves come out of the same
-/// shader, so gating either would catch a drifted port — gating both also pins
-/// the encode.
+/// `SWAPCHAIN_FORMAT_HDR` the scRGB one, `SWAPCHAIN_FORMAT_HDR10` the PQ one.
+/// All three curves come out of the same shader, so gating any would catch a
+/// drifted port — gating all three also pins each encode.
 ///
 /// `src` is w*h*3 linear f32; returns w*h RGB read back from the target.
 pub fn selftest(
@@ -95,6 +110,10 @@ pub fn selftest(
         }
     }
     passes.create_srv(&hg.device, &src_tex, DXGI_FORMAT_R16G16B16A16_FLOAT, SRV_SLOT_HDR);
+    // `record` binds the glare table unconditionally (the PS declares t1 whether
+    // or not it samples it), so the slot must hold a REAL descriptor even though
+    // strength 0 means it is never read — an uninitialized one is a GBV error.
+    passes.create_srv(&hg.device, &src_tex, DXGI_FORMAT_R16G16B16A16_FLOAT, SRV_SLOT_BLOOM);
 
     let target = committed_tex(
         &hg.device,
@@ -134,8 +153,11 @@ pub fn selftest(
             D3D12_RESOURCE_STATE_COPY_DEST,
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
         )]);
-        // inv_samples = 1.0: `src` is already a per-frame radiance image.
-        passes.record(list, &passes.tonemap_pso, SRV_SLOT_HDR, 1.0, tone, rtv, w, h);
+        // inv_samples = 1.0: `src` is already a per-frame radiance image. Bloom
+        // strength 0: this gate scores the CURVE, and glare is a separate pass
+        // with its own gate (--check-gpu M13) — mixing them would let a bloom
+        // regression masquerade as a tonemap one, and vice versa.
+        passes.record(list, &passes.tonemap_pso, SRV_SLOT_HDR, 1.0, (0.0, 0.0, 0.0), tone, rtv, w, h);
         list.ResourceBarrier(&[transition(
             &target,
             D3D12_RESOURCE_STATE_RENDER_TARGET,
@@ -161,6 +183,16 @@ pub fn selftest(
             out[y * sw + x] = if hdr {
                 let px: &[f16; 4] = unsafe { &*(row.add(x * 8) as *const [f16; 4]) };
                 [px[0].into(), px[1].into(), px[2].into()]
+            } else if format == DXGI_FORMAT_R10G10B10A2_UNORM {
+                // R10G10B10A2 — R is the LOW 10 bits (unlike BGRA8's byte
+                // order, where B leads).
+                let px: &[u8; 4] = unsafe { &*(row.add(x * 4) as *const [u8; 4]) };
+                let v = u32::from_le_bytes(*px);
+                [
+                    (v & 1023) as f32 / 1023.0,
+                    ((v >> 10) & 1023) as f32 / 1023.0,
+                    ((v >> 20) & 1023) as f32 / 1023.0,
+                ]
             } else {
                 // B8G8R8A8_UNORM — B and R are swapped on the wire.
                 let px: &[u8; 4] = unsafe { &*(row.add(x * 4) as *const [u8; 4]) };
@@ -232,10 +264,25 @@ fn default_blend() -> D3D12_BLEND_DESC {
     }
 }
 
-/// Root constants the fullscreen PS reads (b0). `inv_samples` plus the four
-/// `tone::ToneParams` fields — the presentation curve is uniform state, not
-/// baked into the shader, which is what lets a display change be a retune.
-const NUM_ROOT_CONSTS: u32 = 5;
+/// PREMULTIPLIED alpha-over (src + dest·(1−src.a)) — the HUD overlay's blend
+/// (gpu/hud.rs). Slint's software renderer hands us premultiplied pixels, so
+/// SrcBlend is ONE, not SRC_ALPHA.
+pub(super) fn premultiplied_blend() -> D3D12_BLEND_DESC {
+    let mut b = default_blend();
+    b.RenderTarget[0].BlendEnable = true.into();
+    b.RenderTarget[0].SrcBlend = D3D12_BLEND_ONE;
+    b.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+    b.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
+    b.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+    b
+}
+
+/// Root constants the fullscreen PS reads (b0), in tonemap.hlsl's cbuffer
+/// order: `inv_samples`, the three glare fields (strength + the tent's texel
+/// step), then the four `tone::ToneParams` fields — the presentation curve is
+/// uniform state, not baked into the shader, which is what lets a display
+/// change be a retune.
+const NUM_ROOT_CONSTS: u32 = 8;
 
 fn fullscreen_pso(
     device: &ID3D12Device,
@@ -244,11 +291,24 @@ fn fullscreen_pso(
     vs: &ID3DBlob,
     ps: &ID3DBlob,
 ) -> Result<ID3D12PipelineState> {
+    fullscreen_pso_blend(device, rtv_format, root_sig, vs, ps, default_blend())
+}
+
+/// `fullscreen_pso` with an explicit blend state — the HUD overlay's
+/// premultiplied-alpha composite (gpu/hud.rs) is the one non-opaque pass.
+pub(super) fn fullscreen_pso_blend(
+    device: &ID3D12Device,
+    rtv_format: DXGI_FORMAT,
+    root_sig: &ID3D12RootSignature,
+    vs: &ID3DBlob,
+    ps: &ID3DBlob,
+    blend: D3D12_BLEND_DESC,
+) -> Result<ID3D12PipelineState> {
     let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
         pRootSignature: unsafe { std::mem::transmute_copy(root_sig) },
         VS: bytecode(vs),
         PS: bytecode(ps),
-        BlendState: default_blend(),
+        BlendState: blend,
         SampleMask: u32::MAX,
         RasterizerState: D3D12_RASTERIZER_DESC {
             FillMode: D3D12_FILL_MODE_SOLID,
@@ -272,11 +332,20 @@ impl Passes {
     /// `rtv_format` is the swapchain's actual format (`D3d::format`) — both PSOs
     /// bake it, so it must come from the swapchain, never from the CLI flag.
     pub fn new(device: &ID3D12Device, rtv_format: DXGI_FORMAT) -> Result<Self> {
-        // Root signature: [0] SRV table (t0, pixel), [1] root constants (b0).
+        // Root signature: [0] SRV table (t0 = source), [1] TONE_CONSTS root
+        // constants (b0), [2] SRV table (t1 = the glare halo), + one static
+        // linear/clamp sampler (0 DWORDs) for the tent tap.
         let ranges = [D3D12_DESCRIPTOR_RANGE {
             RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
             NumDescriptors: 1,
             BaseShaderRegister: 0,
+            RegisterSpace: 0,
+            OffsetInDescriptorsFromTableStart: 0,
+        }];
+        let bloom_range = [D3D12_DESCRIPTOR_RANGE {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+            NumDescriptors: 1,
+            BaseShaderRegister: 1,
             RegisterSpace: 0,
             OffsetInDescriptorsFromTableStart: 0,
         }];
@@ -302,12 +371,32 @@ impl Passes {
                 },
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
             },
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                        NumDescriptorRanges: 1,
+                        pDescriptorRanges: bloom_range.as_ptr(),
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+            },
         ];
+        let samp = [D3D12_STATIC_SAMPLER_DESC {
+            Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+            AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            MaxLOD: D3D12_FLOAT32_MAX,
+            ShaderRegister: 0,
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+            ..Default::default()
+        }];
         let rs_desc = D3D12_ROOT_SIGNATURE_DESC {
             NumParameters: params.len() as u32,
             pParameters: params.as_ptr(),
-            NumStaticSamplers: 0,
-            pStaticSamplers: std::ptr::null(),
+            NumStaticSamplers: 1,
+            pStaticSamplers: samp.as_ptr(),
             Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
         };
         let mut blob: Option<ID3DBlob> = None;
@@ -377,14 +466,20 @@ impl Passes {
     /// Re-binds everything each call — this doubles as the post-Streamline
     /// state restore required by eDisableCLStateTracking.
     ///
+    /// `bloom` is `(strength, texel_w, texel_h)`; strength 0 disables the arm and
+    /// the halo SRV is never sampled (but the table is still bound — the PS
+    /// declares t1 unconditionally).
+    ///
     /// `tone` is ignored by the blit PSO (its source is already encoded); it is
     /// passed unconditionally so the two PSOs can share one root signature.
+    #[allow(clippy::too_many_arguments)]
     pub fn record(
         &self,
         list: &ID3D12GraphicsCommandList,
         pso: &ID3D12PipelineState,
         srv_slot: u32,
         inv_samples: f32,
+        bloom: (f32, f32, f32),
         tone: ToneParams,
         rtv: D3D12_CPU_DESCRIPTOR_HANDLE,
         w: u32,
@@ -395,20 +490,23 @@ impl Passes {
             list.SetGraphicsRootSignature(&self.root_sig);
             list.SetDescriptorHeaps(&[Some(self.srv_heap.clone())]);
             list.SetGraphicsRootDescriptorTable(0, self.gpu_srv(srv_slot));
+            list.SetGraphicsRootDescriptorTable(2, self.gpu_srv(SRV_SLOT_BLOOM));
             // Layout must match tonemap.hlsl's cbuffer exactly.
             let consts: [f32; NUM_ROOT_CONSTS as usize] = [
                 inv_samples,
+                bloom.0,
+                bloom.1,
+                bloom.2,
                 tone.knee,
                 tone.headroom,
                 tone.scale,
-                if tone.gamma { 1.0 } else { 0.0 },
+                match tone.mode {
+                    crate::tone::ToneMode::Linear => 0.0,
+                    crate::tone::ToneMode::Gamma22 => 1.0,
+                    crate::tone::ToneMode::Pq => 2.0,
+                },
             ];
-            list.SetGraphicsRoot32BitConstants(
-                1,
-                NUM_ROOT_CONSTS,
-                consts.as_ptr() as *const _,
-                0,
-            );
+            list.SetGraphicsRoot32BitConstants(1, NUM_ROOT_CONSTS, consts.as_ptr() as *const _, 0);
             list.RSSetViewports(&[D3D12_VIEWPORT {
                 TopLeftX: 0.0,
                 TopLeftY: 0.0,

@@ -1,13 +1,22 @@
-// BC7 block compression of OPAQUE scene textures (--bc7) — GPU upload only;
-// the CPU renderer keeps sampling the exact RGBA8 texels. Alpha-masked cutout
-// textures are deliberately excluded (see the module note).
+// Audio ambience: per-island biome loops (world mode) + a speed-scaled
+// procedural wind. The device half (SDL3 stream + lewton decode) is
+// Windows-only inside the module; the mixer/resampler/gain math is pure and
+// feeds --check. Display-only — no render-path or rng-stream contact.
+mod audio;
+// BC7 block compression of OPAQUE scene textures (ON by default via the GPU
+// compute encoder; --no-bc7 kills, --bc7-cpu = the ispc A/B arm) — GPU upload
+// only; the CPU renderer keeps sampling the exact RGBA8 texels. Alpha-masked
+// cutout textures are deliberately excluded (see the module note).
 mod bc7;
+mod blas_split;
 mod bvh;
 mod camera;
+mod clouds;
 mod dlss;
 // Signal split, wire encoders, and demodulation/composite math for FSR Ray
 // Regeneration — pure CPU, feeds --check-fsr; the GPU seam is gpu/ffx*.
 mod builders;
+mod fireflies;
 mod fsr;
 mod frustum;
 mod ftree;
@@ -23,6 +32,10 @@ mod input;
 // shared camera); Win32-only by nature, like the window it serves.
 #[cfg(windows)]
 mod flycam;
+// Slint-software-rendered HUD (compass/clock/keymap) + pause menu, dirty-rect
+// composited over every present arm by gpu/hud.rs.
+#[cfg(windows)]
+mod hud;
 mod matclass;
 // OIDN loads its DLLs through the Win32 loader; the denoiser itself is
 // CPU/GPU-agnostic but the SDK drop and load path here are Windows-only.
@@ -31,13 +44,27 @@ mod oidn;
 // The ORT loader half is Windows-only (LoadLibrary + DirectML); the padding,
 // NCHW packing, and temporal-warp math are pure and feed --check.
 mod nppd;
+mod frustcap;
 mod overlay;
 mod render;
 mod reproject;
 mod scene;
 mod scene_cache;
+// JSON-persisted user settings (frustracer-settings.json next to the exe):
+// file provides defaults, CLI flags override, the pause menu writes it.
+// Headless --check*/--spin runs ignore the file entirely.
+mod settings;
+// Glare: the optics between the scene and the sensor. A display-stage pass, so
+// it never touches accum, the temporal cache, or any upscaler guide.
+mod bloom;
 mod shade;
-mod shaft;
+// Order-2 SH sky irradiance — the smooth half of the one-sky model (the sharp
+// half, the sun disc, is an explicit light: SH cannot be shadow-rayed).
+mod sh;
+// The one sky: a scattering dome + a sun disc at infinity. Read its header —
+// the "the disc appears exactly once per light path" invariant governs every
+// sky call site in the renderer.
+mod sky;
 mod sphcell;
 mod stats;
 mod prof;
@@ -50,9 +77,11 @@ mod tone;
 // Pure chain-resolution data for the always-on temporal-upscaler fallback
 // (DLSS-RR → FSR4-RR → XeSS → FSR3); the real probes live in GpuContext::new.
 mod upchain;
+mod world;
 // The loader half is Windows-only (LoadLibrary); the FFI structs, depth
 // encoding, and the dynamic-res controller are pure and feed --check-xess.
 mod xess;
+mod xess_fg;
 
 use camera::Camera;
 use glam::Vec3A;
@@ -93,6 +122,12 @@ const STEP_UP_MAX: f32 = 0.4;
 const STEP_DOWN_MAX: f32 = 1.5;
 
 /// CLI options beyond the OBJ path / --check.
+///
+/// `Clone` exists for exactly one caller: `run_window` takes a private copy so
+/// `vendor_defaults` can move a default the user left alone, once the adapter
+/// is known. Parsing stays the single source of the user's intent; the copy is
+/// where the HARDWARE's opinion is folded in.
+#[derive(Clone)]
 pub struct Opts {
     /// The temporal-upscaler fallback chain: which levels of
     /// DLSS-RR → FSR4-RR → XeSS → FSR3 may be probed (first supported level
@@ -101,15 +136,23 @@ pub struct Opts {
     pub chain: upchain::UpChain,
     /// D3D12 debug layer + Streamline verbose logging.
     pub gpu_debug: bool,
-    /// Block-compress the OPAQUE scene textures to BC7 at load (8 bpp vs 32),
-    /// GPU upload only — the CPU renderer keeps sampling the exact RGBA8
+    /// Block-compress the OPAQUE scene textures to BC7 on upload (8 bpp vs
+    /// 32), GPU upload only — the CPU renderer keeps sampling the exact RGBA8
     /// texels, so this moves the GPU-vs-CPU statistical gates (albedo A/B,
     /// T2 radiance) and nothing else. Alpha-masked cutout textures are never
-    /// compressed (src/bc7.rs). Off by default: an A/B lever, and the encode
-    /// is paid on every load (there is deliberately no BC7 disk cache).
-    pub bc7: Option<bc7::Quality>,
+    /// compressed (src/bc7.rs). ON BY DEFAULT via the GPU compute encoder
+    /// (`Gpu(Fast)` — gpu/bc7gpu.rs; only GPU/DXR sessions ever read this,
+    /// so CPU-only sessions are structurally unaffected): `--no-bc7` kills,
+    /// `--bc7-cpu` is the ispc A/B arm (the old ~20 s-per-Sponza encode),
+    /// `--bc7-quality` keys the current arm. There is still deliberately no
+    /// BC7 disk cache — the GPU encode is what made per-load affordable.
+    pub bc7: bc7::Bc7Mode,
     /// Directory holding sl.interposer.dll + plugins (M3+).
     pub sl_path: String,
+    /// Audio ambience (biome loops + speed-scaled wind; default on —
+    /// interactive sessions only, headless paths never initialize audio).
+    /// --no-audio is the kill lever: the subsystem is never constructed.
+    pub audio: bool,
     /// Start with OIDN denoising on (N toggles at runtime; default off —
     /// DLSS-RR stays the primary denoiser).
     pub oidn: bool,
@@ -142,6 +185,28 @@ pub struct Opts {
     pub xess_path: String,
     /// Directory holding amd_fidelityfx_loader_dx12.dll + the provider DLLs.
     pub ffx_path: String,
+    /// Frame generation for the session's wired upscaler family — ON BY
+    /// DEFAULT (`--no-fg` is the kill lever; `--fg` spells the default
+    /// explicitly and additionally arms the explicit-only SL DLSS-G
+    /// fallback, see `fg_explicit`). Native sessions (FSR4-RR / FSR3) wrap
+    /// the swapchain with the FidelityFX frame-interpolation proxy and
+    /// insert one generated frame per rendered frame; unsupported pairings
+    /// fall through with a loud line. Interactive sessions only — headless
+    /// paths never consult it.
+    pub fg: bool,
+    /// Whether `--fg` was PASSED rather than defaulted (the `mode_explicit`
+    /// pattern). Two consumers: `--quinlight` against the mere default
+    /// disarms fg with a loud line instead of exit(2) — a default must never
+    /// make another flag fatal on its own — and the Streamline DLSS-G
+    /// fallback (non-NDA builds) stays explicit-only, because that path is
+    /// the documented declines-to-insert open issue AND rejects the scRGB
+    /// swapchain, so arming it by default would trade every flagless
+    /// non-SDK NVIDIA session's fp16 presentation for nothing.
+    pub fg_explicit: bool,
+    /// Directory holding amd_fidelityfx_framegeneration_dx12.dll (`--fg-path`;
+    /// the prebuilt drop ships it in the FSR sample dir, not next to the
+    /// loader).
+    pub fg_path: String,
     /// `--fsr4`: the FSR4 + Ray Regeneration level is REQUIRED, not merely
     /// force-started. `--fsr` falls through to XeSS/FSR3 when the Ray
     /// Regeneration provider is absent (no RDNA4, wrong adapter); this makes
@@ -154,6 +219,16 @@ pub struct Opts {
     /// provider's own constants. A/B levers for dialing in cleanliness —
     /// `max_radiance` is the firefly clamp.
     pub fsr_tune: fsr::DenoiseTuning,
+    /// `--quinlight`: wire EVERY supported chain level at once, run them all
+    /// over the same traced frame, and present the registered-consensus fuse of
+    /// their outputs (gpu/quin.rs — LK registration + warp + winsorized mean;
+    /// a port of quinlight-player's consensus_registered.comp). GPU-fed only
+    /// (--dxr or --gpu): there is no CPU-fed arm.
+    pub quin: bool,
+    /// `--quin-anchor N`: which engine is the fuse's anchor (never warped;
+    /// defines the spatial frame). None = engine 0 = the highest wired chain
+    /// level, which is a DENOISING engine wherever the box has one.
+    pub quin_anchor: Option<u32>,
     /// Explicit GPU adapter vendor preference (--prefer-nvidia /
     /// --prefer-intel / --prefer-amd). None = the mode default (AMD for
     /// --fsr, NVIDIA otherwise). A preference, not a requirement: the
@@ -259,6 +334,21 @@ pub struct Opts {
     /// algorithm builds the ray BVH. Every builder produces the same Bvh
     /// (consumers/gates/.fcache unchanged); score on measured counters.
     pub bvh_builder: String,
+    /// Triangles per BLAS: cut the ray BVH into maximal subtrees of at most N
+    /// triangles and build ONE BLAS per subtree, instanced identity into the
+    /// TLAS (blas_split.rs). DEFAULT ON at `DEFAULT_MAX_PRIMS`; `None` =
+    /// --no-blas-split = one BLAS over the whole scene (the pre-feature build).
+    ///
+    /// It is the default for ROBUSTNESS, not throughput — on NVIDIA it is
+    /// neutral (measured within +-1% on four world poses). BLAS scratch is
+    /// sized by the largest single geometry, so one 34.4M-triangle BLAS made
+    /// Intel's driver ask for 1891 MB of it and REMOVE THE DEVICE mid-boot on
+    /// THE WORLD (NVIDIA asked 276 MB for the same build and survived); at a
+    /// 64k cap the scratch is a function of one chunk — 3 MB — and the same
+    /// session runs. GPU-only and derived from the built BVH, so it keys
+    /// nothing in the scene cache; the CPU tracer, the software BVH and the
+    /// frustum cut never see it.
+    pub blas_split: Option<u32>,
     /// A/B lever (--no-ftree disables): route ALL bound queries through the
     /// 8-wide frustum tree lazily collapsed from the ray BVH (ftree.rs) — the
     /// two-tree split. Rays always stay on the binary BVH.
@@ -273,11 +363,11 @@ pub struct Opts {
     /// both; --check verifies the wired path regardless (the wide-tiles gate).
     pub ftree_tiles: bool,
     /// A/B lever (--no-wide-levels disables): run the SHALLOW GPU quadtree
-    /// levels on the group-cooperative kernel (one 64-lane group per tile)
-    /// instead of one thread per tile. Default on — the shallow ladder is
-    /// parallelism-starved (level 0 is a single lane descending the whole
-    /// frustum tree) and it is ~half the GPU frame, all of it fixed cost.
-    /// Bit-identical by construction (see trace::WIDE_LEVELS); GPU only.
+    /// levels on the wave-cooperative kernel (one 32-lane group per tile,
+    /// sharing a breadth-first frontier) instead of one thread per tile.
+    /// Default on — the shallow ladder is under-occupied (level 0 is a single
+    /// lane descending the whole BVH). Same-seed image A/B unchanged to the
+    /// digit (BFS min is order-independent — see trace::WIDE_LEVELS); GPU only.
     pub wide_levels: bool,
     /// GPU-resident tracing (--gpu): the whole quadtree + shading runs in
     /// D3D12 compute with DXR RayQuery rays. Requires the DXC DLL drop and
@@ -288,6 +378,17 @@ pub struct Opts {
     /// back into the CPU renderer). Requires the DXC DLL drop and RT tier
     /// 1.0; falls back to the CPU path with a loud line.
     pub dxr: bool,
+    /// Did the user name a render mode at all (`--cpu` / `--gpu` / `--dxr`)?
+    /// `dxr` defaults to true, so "is DXR on" cannot answer "did they ASK for
+    /// DXR" — and two places need that distinction: `--spin` (which drives the
+    /// CPU renderer unless a GPU arm was requested) and the vendor-default
+    /// policy in `run_window`, which may only move a default the user left
+    /// alone. `dxr_explicit` already existed as a parse-local for the
+    /// OIDN/NPPD opt-out; this is the same idea, promoted so it survives parse.
+    pub mode_explicit: bool,
+    /// Did the user pass `--lock-res`? Same reason: `gpu_lock_scale` has a
+    /// non-None default, so its value cannot report whether it was chosen.
+    pub lock_res_explicit: bool,
     /// Directory holding dxcompiler.dll + dxil.dll.
     pub dxc_path: String,
     /// PIX Begin/End events on the D3D12 command lists (--pix-markers;
@@ -318,12 +419,25 @@ pub struct Opts {
     /// forces the legacy 8-bit swapchain — the A/B lever, and the automatic
     /// fallback when the colour space is refused.
     pub hdr: bool,
+    /// `--hdr10`: force the 10-bit PQ (R10G10B10A2 + G2084) swapchain in any
+    /// session — the A/B lever for the encode the wrapper-FG families take
+    /// automatically on an HDR-on display. Override-wins like `--hdr-peak`.
+    /// Only meaningful with `hdr` (the parse arms keep the pair consistent:
+    /// `--hdr10` sets both, `--no-hdr`/`--hdr` clear this one — three states,
+    /// later flags win).
+    pub hdr10: bool,
     /// `--hdr-paper-white <nits>`: where linear 1.0 lands. The scene is authored
     /// so 1.0 ≈ diffuse white; 200 is the usual desktop-HDR reference.
     pub hdr_paper_white: f32,
     /// `--hdr-peak <nits>`: override the display's reported peak. None = trust
     /// what the monitor says (`gpu::display::probe`).
     pub hdr_peak: Option<f32>,
+    /// `--tod <hour>`: start time-of-day (float hours, wrapped into 0..24 —
+    /// e.g. 17.5 = sunset light). None = the default sun, bit-identical to
+    /// the pre-TOD renderer; the `,`/`.` keys and D-pad still scrub live.
+    /// Applied AFTER the scene cache load/store so a `--tod` session can
+    /// never poison the `.fcache` with a non-default sun.
+    pub tod: Option<f32>,
 }
 
 /// OIDN placement in XeSS mode (N cycles off → pre → post). Pre denoises the
@@ -373,10 +487,11 @@ fn main() {
     let mut opts = Opts {
         chain: upchain::UpChain::ALL,
         gpu_debug: false,
-        bc7: None,
+        bc7: bc7::Bc7Mode::Gpu(bc7::Quality::Fast),
         sl_path: std::env::var("FRUSTRACER_SL_PATH").unwrap_or_else(|_| {
             concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\streamline-sdk\bin\x64").to_string()
         }),
+        audio: true,
         oidn: false,
         oidn_path: std::env::var("FRUSTRACER_OIDN_PATH").unwrap_or_else(|_| {
             concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\oidn.x64.windows\bin").to_string()
@@ -403,8 +518,19 @@ fn main() {
             )
             .to_string()
         }),
+        fg: true,
+        fg_explicit: false,
+        fg_path: std::env::var("FRUSTRACER_FG_PATH").unwrap_or_else(|_| {
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                r"\SDKs\FidelityFX-Samples-prebuilt\Samples\Upscalers\FidelityFX_FSR\dx12\x64\Release"
+            )
+            .to_string()
+        }),
         fsr4_required: false,
         fsr_tune: fsr::DenoiseTuning::default(),
+        quin: false,
+        quin_anchor: None,
         prefer: None,
         oidn_post: false,
         xess_autoexposure: false,
@@ -432,11 +558,14 @@ fn main() {
         max_leaf: 8,
         split_axes: 3,
         bvh_builder: "sah".to_string(),
+        blas_split: Some(blas_split::DEFAULT_MAX_PRIMS),
         ftree: true,
         ftree_tiles: false,
         wide_levels: true,
         gpu: false,
         dxr: true,
+        mode_explicit: false,
+        lock_res_explicit: false,
         dxc_path: std::env::var("FRUSTRACER_DXC_PATH").unwrap_or_else(|_| {
             concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\dxc\bin\x64").to_string()
         }),
@@ -449,8 +578,10 @@ fn main() {
         // scRGB is the default swapchain: see Opts::hdr. The 8-bit path survives
         // as --no-hdr and as the automatic fallback.
         hdr: true,
+        hdr10: false,
         hdr_paper_white: tone::DEFAULT_PAPER_WHITE,
         hdr_peak: None,
+        tod: None,
     };
     let mut check_dlss = false;
     let mut dlss_dump = false;
@@ -476,7 +607,30 @@ fn main() {
     let mut cam_override: Option<Camera> = None;
     let mut spin: Option<String> = None;
     let mut spin_frames = 2000u32;
-    let mut args = std::env::args().skip(1);
+    // World mode: None = the default (interactive flagless boots the world),
+    // Some(true) = explicit --world (exclusivity ERRORS instead of silently
+    // resolving), Some(false) = --no-world (today's procedural boot). Later
+    // flags win, the --heightfield/--no-heightfield pattern.
+    let mut world_flag: Option<bool> = None;
+    // JSON settings: the file's values land here — after the defaults
+    // literal, BEFORE the parse loop — so every CLI flag parsed below simply
+    // overwrites them (defaults < file < flags, by ordering alone). Headless
+    // gate/bench runs (--check*, --*-dump, --spin*) and --no-settings skip
+    // the file entirely: the gates' value is that a command line fully
+    // determines the run.
+    let file_settings = if settings::headless_args(std::env::args().skip(1)) {
+        if settings::path().exists() {
+            eprintln!("settings: {} ignored (headless or --no-settings run)", settings::FILE_NAME);
+        }
+        settings::Settings::default()
+    } else {
+        settings::load()
+    };
+    let sfx = settings::apply_to_opts(&file_settings, &mut opts);
+    settings::apply_globals(&file_settings);
+    // Peekable so a flag can take an OPTIONAL value (--blas-split [N]) without
+    // swallowing the next flag.
+    let mut args = std::env::args().skip(1).peekable();
     while let Some(a) = args.next() {
         match a.as_str() {
             "--check" => check = true,
@@ -498,6 +652,8 @@ fn main() {
             }
             "--oidn" => opts.oidn = true,
             "--no-oidn" => opts.oidn = false,
+            "--no-audio" => opts.audio = false,
+            "--audio" => opts.audio = true,
             "--oidn-no-temporal" => opts.oidn_temporal = false,
             "--check-nppd" => check_nppd = true,
             "--nppd-dump" => {
@@ -571,9 +727,34 @@ fn main() {
                 opts.chain.skip(upchain::UpLevel::Fsr4);
                 opts.chain.skip(upchain::UpLevel::Fsr3);
             }
+            // --quinlight suspends the chain's first-hit-wins rule: every level
+            // it leaves enabled is WIRED, and the fuse consumes them all. The
+            // chain flags still compose (--no-xess &c drop an engine), so the
+            // engine set stays the user's to shape.
+            "--quinlight" => opts.quin = true,
+            "--quin-anchor" => {
+                opts.quin_anchor = args.next().and_then(|s| s.parse::<u32>().ok()).or_else(|| {
+                    eprintln!("--quin-anchor needs a non-negative engine index");
+                    std::process::exit(2);
+                })
+            }
             "--ffx-path" => {
                 opts.ffx_path = args.next().unwrap_or_else(|| {
                     eprintln!("--ffx-path needs a directory argument");
+                    std::process::exit(2);
+                })
+            }
+            "--fg" => {
+                opts.fg = true;
+                opts.fg_explicit = true;
+            }
+            "--no-fg" => {
+                opts.fg = false;
+                opts.fg_explicit = false;
+            }
+            "--fg-path" => {
+                opts.fg_path = args.next().unwrap_or_else(|| {
+                    eprintln!("--fg-path needs a directory argument");
                     std::process::exit(2);
                 })
             }
@@ -589,6 +770,82 @@ fn main() {
             // pattern): no chains are built, every trilinear sample falls
             // back to mip-0 bilinear — the pre-mip renderer exactly.
             "--no-mips" => texture::set_mips(false),
+            // Load-time converter kill levers, same "knob before scene load"
+            // pattern: --no-h2n restores the pre-conversion behavior exactly
+            // (grayscale bump maps are dropped, normal_tex stays NO_TEX);
+            // --no-n2h leaves real normal maps' alpha at 255 and height_amp
+            // at 0.0 — relief has no field to march, structurally off.
+            "--no-h2n" => texture::set_h2n(false),
+            "--no-n2h" => texture::set_n2h(false),
+            // Tinted-shadows kill lever, same "knob before scene load"
+            // pattern: finalize_scalars never arms any_transmissive, so
+            // every light-occlusion query binary-blocks on glass — the
+            // pre-feature renderer bit-identically (occlusion rays through
+            // transmissive surfaces otherwise carry a transmission×albedo
+            // tint per interface).
+            "--no-tinted-shadows" => scene::set_tinted_shadows(false),
+            // Water-look levers: --no-spray keeps tiny transmissive islands
+            // (fountain droplets) as clear glass instead of retagging them
+            // white-scatter at load (keys the cache lever word);
+            // --no-depth-tint drops the Beer–Lambert attenuation over the
+            // transmission chain's interior segments (runtime shading lever).
+            "--no-spray" => scene::set_spray(false),
+            "--no-depth-tint" => scene::set_depth_tint(false),
+            // --no-water: the fountain classifies as generic glassware (the
+            // pre-water-class look) instead of the water refinement (blue-green
+            // tint, IOR 1.33, ripple normals); keys the cache lever word.
+            "--no-water" => scene::set_water(false),
+            // Relief rendering session levers. The DEFAULT is DISARMED —
+            // structurally the pre-relief renderer (no AABB sweep at BVH
+            // build, no march anywhere; the sweep's all-axis edge pad
+            // measurably wrecks BVH quality on all-tris-carry-height scenes
+            // even with relief off — see bvh.rs's HEIGHT_ARMED header).
+            // --heightfield ARMS the session and starts relief ON (V then
+            // toggles relief live within the armed session); --no-heightfield
+            // is the explicit spelling of the default, kept as the
+            // later-flags-win override. Both set BOTH statics so
+            // `--no-heightfield --heightfield` is a true arm — headless
+            // --check* paths read height_on() directly, with no session()
+            // to re-seed it. Armed state keys the scene cache.
+            "--heightfield" => {
+                bvh::set_height_armed(true);
+                bvh::set_height_on(true);
+            }
+            "--no-heightfield" => {
+                bvh::set_height_armed(false);
+                bvh::set_height_on(false);
+            }
+            // A/B lever: no glare. A display-stage pass, so this is a pure
+            // presentation change — accum, the temporal cache, every upscaler
+            // guide and every radiance gate are untouched either way, and the
+            // off path keeps the original alloc-free tonemap loop verbatim.
+            "--no-bloom" => bloom::set_enabled(false),
+            // A/B kill lever for the volumetric cloud layer (default ON).
+            // Same "session constant before scene load" pattern: off takes
+            // guarded early returns everywhere — bit-identical to the
+            // pre-cloud renderer (clouds::self_test pins it).
+            "--no-clouds" => clouds::set_enabled(false),
+            // Firefly point lights (default ON, but they only exist after
+            // dusk — a day session snapshots count = 0 and is bit-identical
+            // structurally). Same "session constant before scene load"
+            // pattern; the count clamps to the CB row cap loudly.
+            "--no-fireflies" => fireflies::set_enabled(false),
+            "--fireflies" => {
+                let n: u32 = args.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| {
+                    eprintln!(
+                        "--fireflies needs an integer count (1..={})",
+                        fireflies::MAX_FIREFLIES
+                    );
+                    std::process::exit(2);
+                });
+                if n > fireflies::MAX_FIREFLIES as u32 {
+                    eprintln!(
+                        "fireflies: count {n} clamped to {} (the CB row cap)",
+                        fireflies::MAX_FIREFLIES
+                    );
+                }
+                fireflies::set_count(n);
+            }
             // Same "knob before scene load" pattern: the GPU reads it for the
             // static sampler's MaxAnisotropy, the CPU for Cone::aniso. 1 = off
             // ⇒ the isotropic ray-cone lod path runs verbatim (bit-identical
@@ -654,6 +911,53 @@ fn main() {
                     std::process::exit(2);
                 });
             }
+            "--blas-split" => {
+                // Optional value: a bare flag takes the conventional-band cap,
+                // an explicit N (e.g. 64) reaches the tiny-BLAS regime. The
+                // next token is only CONSUMED when it is all digits — so
+                // `--blas-split model.obj` and `--blas-split --stress 5000`
+                // leave their arguments alone — but a numeric token that is
+                // not a legal cap (0, or past u32) is a typo, not a scene
+                // path, and exits rather than silently arming at the default
+                // and landing in the positional arm as an OBJ named "0".
+                let numeric = args.peek().is_some_and(|v| {
+                    !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit())
+                });
+                let n = if numeric {
+                    let v = args.next().unwrap();
+                    v.parse::<u32>().ok().filter(|n| *n >= 1).unwrap_or_else(|| {
+                        eprintln!(
+                            "--blas-split: '{v}' is not a triangle cap (1..={})",
+                            u32::MAX
+                        );
+                        std::process::exit(2);
+                    })
+                } else {
+                    blas_split::DEFAULT_MAX_PRIMS
+                };
+                opts.blas_split = Some(n);
+            }
+            "--no-blas-split" => opts.blas_split = None,
+            // The DXR pipeline's ray-dispatch mode (gpu::dxr::dxr_inline_mode
+            // — the set_aniso knob idiom). DEFAULT 1 = primary TraceRay +
+            // inline RayQuery secondaries, which strictly dominates the
+            // all-TraceRay pipeline (0) at every measured point on both
+            // vendors; 2 = everything inline in raygen (the high-spp Intel
+            // pick). See the DXR section's ablation table in CLAUDE.md.
+            "--dxr-inline" => {
+                let n: u32 = args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .filter(|&n| n <= 2)
+                    .unwrap_or_else(|| {
+                        eprintln!(
+                            "--dxr-inline needs 0 (all TraceRay), 1 (inline secondaries — \
+                             the default), or 2 (everything inline in raygen)"
+                        );
+                        std::process::exit(2);
+                    });
+                gpu::dxr::set_inline_mode(n);
+            }
             "--spin" => {
                 spin = Some(args.next().unwrap_or_else(|| {
                     eprintln!("--spin needs a workload: still | path");
@@ -671,8 +975,24 @@ fn main() {
             }
             "--no-vsync" => opts.vsync = false,
             "--vsync" => opts.vsync = true,
-            "--hdr" => opts.hdr = true,
-            "--no-hdr" => opts.hdr = false,
+            // The swapchain flags are a three-way choice (SDR | scRGB | HDR10)
+            // spelled as two toggles, so each arm writes BOTH fields — that is
+            // what makes later-flags-win hold across the pairs (`--no-hdr
+            // --hdr10` = PQ, `--hdr10 --no-hdr` = SDR). Mirrored in
+            // settings.rs (display.hdr / display.hdr10).
+            "--hdr" => {
+                opts.hdr = true;
+                opts.hdr10 = false;
+            }
+            "--no-hdr" => {
+                opts.hdr = false;
+                opts.hdr10 = false;
+            }
+            "--hdr10" => {
+                opts.hdr = true;
+                opts.hdr10 = true;
+            }
+            "--no-hdr10" => opts.hdr10 = false,
             "--hdr-paper-white" => {
                 opts.hdr_paper_white = args
                     .next()
@@ -757,6 +1077,7 @@ fn main() {
                     }
                 };
                 opts.gpu_lock_scale = opts.lock_scale;
+                opts.lock_res_explicit = true;
             }
             // Ray Regeneration tuning overrides (FfxApiConfigureDenoiserKey).
             // Absent = the provider's own default, so a flagless session is
@@ -794,12 +1115,27 @@ fn main() {
                         std::process::exit(2);
                     });
             }
+            "--tod" => {
+                opts.tod = args
+                    .next()
+                    .and_then(|s| s.parse::<f32>().ok())
+                    .filter(|v| v.is_finite())
+                    .map(|v| v.rem_euclid(24.0))
+                    .or_else(|| {
+                        eprintln!("--tod needs an hour, e.g. 17.5 (wraps into 0..24)");
+                        std::process::exit(2);
+                    });
+            }
             "--oidn-no-clean-aux" => opts.oidn_clean_aux = false,
-            "--gpu" => opts.gpu = true,
+            "--gpu" => {
+                opts.gpu = true;
+                opts.mode_explicit = true;
+            }
             "--check-gpu" => check_gpu = true,
             "--dxr" => {
                 opts.dxr = true;
                 dxr_explicit = true;
+                opts.mode_explicit = true;
             }
             // The CPU frustum-tracer as the render mode: it is what both GPU
             // modes are peers of, so --cpu clears both. Later flags win (a
@@ -807,6 +1143,7 @@ fn main() {
             "--cpu" => {
                 opts.dxr = false;
                 opts.gpu = false;
+                opts.mode_explicit = true;
             }
             "--check-dxr" => check_dxr = true,
             "--dxc-path" => {
@@ -819,18 +1156,26 @@ fn main() {
             "--prefer-intel" => opts.prefer = Some(gpu::adapter::Prefer::Intel),
             "--prefer-amd" => opts.prefer = Some(gpu::adapter::Prefer::Amd),
             "--gpu-debug" => opts.gpu_debug = true,
-            // --bc7 alone = the `fast` profile; --bc7-quality overrides (and
-            // implies --bc7, so the order of the two flags doesn't matter).
-            "--bc7" => opts.bc7 = opts.bc7.or(Some(bc7::Quality::Fast)),
+            // BC7 is ON by default (the GPU arm at `fast`). --bc7 re-arms
+            // after a --no-bc7 (later flags win, never switching an explicit
+            // CPU arm); --bc7-cpu picks the ispc A/B arm; --bc7-quality keys
+            // the CURRENT arm (and arms the GPU default, so order between it
+            // and --bc7 doesn't matter).
+            "--bc7" => opts.bc7 = opts.bc7.armed_or_default(),
+            "--no-bc7" => opts.bc7 = bc7::Bc7Mode::Off,
+            "--bc7-cpu" => {
+                opts.bc7 = bc7::Bc7Mode::Cpu(opts.bc7.quality().unwrap_or(bc7::Quality::Fast))
+            }
             "--bc7-quality" => {
                 let q = args.next().unwrap_or_else(|| {
                     eprintln!("--bc7-quality needs ultrafast|fast|basic|slow");
                     std::process::exit(2);
                 });
-                opts.bc7 = Some(bc7::Quality::parse(&q).unwrap_or_else(|| {
+                let q = bc7::Quality::parse(&q).unwrap_or_else(|| {
                     eprintln!("--bc7-quality: unknown profile '{q}' (ultrafast|fast|basic|slow)");
                     std::process::exit(2);
-                }));
+                });
+                opts.bc7 = opts.bc7.with_quality(q);
             }
             "--sl-path" => {
                 opts.sl_path = args.next().unwrap_or_else(|| {
@@ -838,6 +1183,12 @@ fn main() {
                     std::process::exit(2);
                 })
             }
+            // Consumed by the pre-parse settings scan (settings::headless_args)
+            // — this arm only keeps the token out of the positional fallback,
+            // which would read it as a scene path.
+            "--no-settings" => {}
+            "--world" => world_flag = Some(true),
+            "--no-world" => world_flag = Some(false),
             "--stress" => {
                 stress = Some(
                     args.next()
@@ -883,6 +1234,9 @@ fn main() {
             }
             "--help" | "-h" => {
                 eprintln!("usage: frustracer [model.obj|.gltf|.glb] [--stress <n>] [--check] [--check-dlss] [--dlss-dump] [--no-dlss] [--check-oidn] [--oidn-dump] [--oidn] [--check-xess] [--xess-dump] [--xess] [--lock-res <r>] [--gpu-debug] [--sl-path <dir>] [--oidn-path <dir>] [--oidn-device <d>] [--xess-path <dir>]");
+                eprintln!("  --world       boot the curated multi-scene world (the flagless interactive default;");
+                eprintln!("                exclusive with a scene arg, --stress, --tile, --spin, and --check*)");
+                eprintln!("  --no-world    flagless boot uses the procedural default scene instead");
                 eprintln!("  --stress <n>  procedural stress field of n objects (perf test; composes with --check)");
                 eprintln!("  --tile <n|nxm>  replicate a loaded OBJ scene into an n×n (or n×m) grid of copies —");
                 eprintln!("                flattened geometry, shared materials/textures (composes with --check)");
@@ -894,10 +1248,11 @@ fn main() {
                 eprintln!("                the chain DLSS-RR -> FSR4-RR -> XeSS -> FSR3 is always on — the first");
                 eprintln!("                supported level wins; --<x> force-starts the chain at that level");
                 eprintln!("  --no-upscale  plain presentation: no temporal upscaler at all (benchmark escape)");
-                eprintln!("  --bc7         block-compress the OPAQUE scene textures to BC7 at load (8 bpp vs 32;");
-                eprintln!("                GPU upload only — alpha-masked cutout textures stay exact RGBA8).");
-                eprintln!("                No disk cache: the encode runs every load. --bc7-quality <p> sets the");
-                eprintln!("                ISPC profile: ultrafast|fast|basic|slow (default fast)");
+                eprintln!("  --no-bc7      upload scene textures as raw RGBA8 — BC7 block compression is ON by");
+                eprintln!("                default (8 bpp vs 32; GPU-compute encode at upload; alpha-masked cutout");
+                eprintln!("                textures stay exact RGBA8 always). --bc7-cpu forces the CPU ispc encode");
+                eprintln!("                (the A/B arm; slow). --bc7-quality <p>: ultrafast|fast|basic|slow");
+                eprintln!("                (default fast; on the GPU arm basic|slow deepen the mode-1 search)");
                 eprintln!("  --check-oidn  headless: OIDN denoise self-test (needs the OIDN DLLs)");
                 eprintln!("  --oidn-dump   --check-oidn plus before/after/G-buffer PNG dumps");
                 eprintln!("  --oidn        start with OIDN denoising on (N toggles; implies DLSS off)");
@@ -923,6 +1278,23 @@ fn main() {
                 eprintln!("                Ray Regeneration is unavailable (suggests --fsr3 / --prefer-amd)");
                 eprintln!("  --fsr3        force-start the chain at the FSR 3.1 upscale-only level (A/B lever)");
                 eprintln!("  --ffx-path    FidelityFX DLL directory (default: the FidelityFX-Samples-prebuilt drop)");
+                eprintln!("  --fg          FRAME GENERATION for the wired upscaler family — ON BY DEFAULT");
+                eprintln!("                (--no-fg disables): FSR sessions wrap the swapchain with the FidelityFX");
+                eprintln!("                frame-interpolation proxy, DLSS sessions run raw-NGX DLSS-G (SDK builds),");
+                eprintln!("                Intel XeSS sessions XeSS-FG; one generated frame per rendered frame;");
+                eprintln!("                unsupported pairings fall through loudly. Passing --fg explicitly also");
+                eprintln!("                arms the Streamline DLSS-G fallback on non-SDK builds (explicit-only:");
+                eprintln!("                it rejects scRGB and is the declines-to-insert open issue)");
+                eprintln!("  --no-fg       kill lever: no frame generation (restores scRGB where a wrapper family");
+                eprintln!("                would have taken the HDR10/PQ or SDR arm)");
+                eprintln!("  --fg-path     directory holding amd_fidelityfx_framegeneration_dx12.dll (default: the");
+                eprintln!("                drop's FSR sample dir — the FG provider does NOT ship next to the loader)");
+                eprintln!("  --quinlight   REGISTERED CONSENSUS: suspend the chain's first-hit-wins rule, wire");
+                eprintln!("                EVERY supported level at once (DLSS-RR + FSR4-RR + XeSS + FSR 3.1),");
+                eprintln!("                run them all over the SAME traced frame, and present the LK-registered");
+                eprintln!("                winsorized consensus of their outputs. GPU-fed only (--dxr/--gpu)");
+                eprintln!("  --quin-anchor <n>  which engine defines the fuse's spatial frame (never warped);");
+                eprintln!("                default = the denoising engine (DLSS-RR, else FSR4-RR), else engine 0");
                 eprintln!("  --gpu         GPU-resident tracing: quadtree + shading in D3D12 compute with DXR");
                 eprintln!("                RayQuery rays (needs the DXC DLLs and RT tier 1.1; falls back to CPU)");
                 eprintln!("  --check-gpu   headless: GPU tracer gate suite (needs a D3D12 GPU + the DXC DLLs)");
@@ -940,8 +1312,33 @@ fn main() {
                 eprintln!("                visibility is per-pixel either way)");
                 eprintln!("  --no-hemi-share  disable the shared hemisphere capture in fb (H) frames — every");
                 eprintln!("                shading point runs its own bounce tree (A/B lever)");
+                eprintln!("  --no-clouds   disable the drifting volumetric cloud layer (on by default: raymarched");
+                eprintln!("                FBM slab — sky, reflections, glass, and cloud shadows on the direct sun;");
+                eprintln!("                off is bit-identical to the pre-cloud renderer)");
+                eprintln!("  --no-fireflies  disable the firefly point lights (on by default AFTER DUSK — under");
+                eprintln!("                --tod they fade in with the stars: curl-noise drift, real 1/d² light");
+                eprintln!("                with hard shadow rays + a depth-tested glow; a day session has zero");
+                eprintln!("                fireflies and is bit-identical structurally)");
+                eprintln!("  --fireflies N   firefly count (default {}, max {})", fireflies::DEFAULT_COUNT, fireflies::MAX_FIREFLIES);
                 eprintln!("  --no-mips     no texture mip chains; every trilinear sample degenerates to the");
                 eprintln!("                pre-mip bilinear (A/B lever; mips are on by default — implies --no-aniso)");
+                eprintln!("  --no-h2n      don't Sobel-convert grayscale bump maps into normal maps (they are");
+                eprintln!("                dropped, the pre-conversion behavior)");
+                eprintln!("  --no-n2h      don't derive heightfields from normal maps (Frankot–Chellappa) — no");
+                eprintln!("                alpha-channel height, height_amp stays 0");
+                eprintln!("  --no-tinted-shadows  shadow/AO rays binary-block on transmissive surfaces (the");
+                eprintln!("                pre-feature behavior; default: they pass with a transmission×albedo tint)");
+                eprintln!("  --no-spray    keep tiny transmissive islands (fountain droplets) as clear glass");
+                eprintln!("                instead of white-scatter spray (load-time retag; keys the scene cache)");
+                eprintln!("  --no-depth-tint  no Beer–Lambert attenuation over the transmission chain's interior");
+                eprintln!("                segments (water loses its depth-graded tint)");
+                eprintln!("  --no-water    classify the fountain as generic glassware, not the water class");
+                eprintln!("                (no blue-green tint / IOR 1.33 / ripple normals; keys the scene cache)");
+                eprintln!("  --heightfield ARM relief rendering and start it ON where the scene carries height");
+                eprintln!("                data (V toggles relief vs normal-mapping live in the armed session).");
+                eprintln!("                The DEFAULT is unarmed: no swept AABBs, no march — the pre-relief");
+                eprintln!("                renderer bit-exactly (the swept tree costs real BVH quality)");
+                eprintln!("  --no-heightfield  the default, spelled explicitly (later flags win)");
                 eprintln!("  --aniso N     max anisotropy for texture filtering, 1..=16 (default 16; 1 = off, i.e.");
                 eprintln!("                the isotropic ray-cone trilinear path verbatim). --no-aniso = --aniso 1");
                 eprintln!("  --spp <n>     primary samples per pixel per frame (1..=128, default 1; U doubles live).");
@@ -959,9 +1356,29 @@ fn main() {
                 eprintln!("                can't support fall back with a log line)");
                 eprintln!("  --gpu-debug   D3D12 debug layer + verbose Streamline logging");
                 eprintln!("  --sl-path     Streamline DLL directory (default: SDKs\\streamline-sdk\\bin\\x64)");
+                eprintln!("  --no-settings ignore {} for this run (the pause menu's", settings::FILE_NAME);
+                eprintln!("                saved settings, read as defaults that CLI flags override;");
+                eprintln!("                headless --check*/--spin runs always ignore it)");
                 return;
             }
             _ => obj = Some(a),
+        }
+    }
+
+    // Settings side channels the parse loop couldn't carry through &mut Opts.
+    // A file-forced FSR level flips the adapter-preference default exactly
+    // like --fsr/--fsr3; the file's scene choice applies ONLY when the CLI
+    // named no scene source at all (a CLI scene path, --world, or --stress
+    // replaces it outright — a file value must never turn into an
+    // exclusivity error against a flag).
+    if sfx.fsr_forced {
+        fsr_forced = true;
+    }
+    if obj.is_none() && world_flag.is_none() && stress.is_none() {
+        if let Some(p) = sfx.scene_path {
+            obj = Some(p);
+        } else if let Some(w) = sfx.world {
+            world_flag = Some(w);
         }
     }
 
@@ -996,6 +1413,56 @@ fn main() {
     if opts.fsr4_required && !opts.chain.fsr4 {
         eprintln!("--fsr4: the FSR4 level was knocked out of the upscaler chain by another flag (--no-fsr / --no-upscale / a later --xess, --fsr3 or --nppd) — nothing left to require");
         std::process::exit(2);
+    }
+    // --quinlight is GPU-fed only: the engines read the tracer's G-buffer pack
+    // through the feed kernels, and there is deliberately no CPU-upload arm
+    // (the CPU rings feed ONE upscaler; N of them would be N window-res
+    // uploads per frame — the fuse exists to avoid exactly that traffic).
+    // --cpu clears both GPU modes, so this is the check.
+    if opts.quin && !opts.gpu && !opts.dxr {
+        eprintln!(
+            "--quinlight needs a GPU render mode (--dxr, the default, or --gpu) — \
+             there is no CPU-fed fuse arm"
+        );
+        std::process::exit(2);
+    }
+    // The fuse needs at least two engines, so it cannot run on an empty chain.
+    if opts.quin && opts.chain == upchain::UpChain::NONE {
+        eprintln!("--quinlight: --no-upscale leaves no engines to fuse");
+        std::process::exit(2);
+    }
+    // NPPD's present arm is the XeSS one (the frame SPLITS around the ORT run);
+    // the fuse's is its own. A quinlight session would build the ORT session and
+    // its ~340 MB of staging and then never dispatch it — a silent no-op is
+    // worse than being told, so this is the --fsr4 shape: exit, don't degrade.
+    if opts.quin && opts.nppd {
+        eprintln!(
+            "--quinlight cannot compose with --nppd: the neural denoiser rides the XeSS \
+             present arm, and the fuse presents through its own. Drop one."
+        );
+        std::process::exit(2);
+    }
+    // A --quin-anchor with no fuse to anchor is a typo, not a preference.
+    if opts.quin_anchor.is_some() && !opts.quin {
+        eprintln!("--quin-anchor selects the fuse's anchor engine, but --quinlight was not passed");
+        std::process::exit(2);
+    }
+    // Frame generation wraps the swapchain with ONE family's frame-
+    // interpolation proxy; the fuse wires every engine at once and its
+    // present arm is its own. Untested composition — the --nppd shape when
+    // EXPLICITLY requested: exit, don't degrade. But fg is on by DEFAULT,
+    // and a default must never make `--quinlight` alone fatal — the
+    // defaulted arm disarms with a loud line instead.
+    if opts.quin && opts.fg {
+        if opts.fg_explicit {
+            eprintln!("--quinlight cannot compose with --fg. Drop one.");
+            std::process::exit(2);
+        }
+        eprintln!(
+            "fg: off under --quinlight (frame generation is on by default, but the fuse \
+             presents through its own arm; pass --fg explicitly to be told instead)"
+        );
+        opts.fg = false;
     }
     // Adapter preference default: AMD when FSR was explicitly requested
     // (--fsr/--fsr3), NVIDIA otherwise. An explicit --prefer-* always wins;
@@ -1072,6 +1539,25 @@ fn main() {
         eprintln!("--bvh-builder: unknown builder '{}' (sah | lbvh | ploc | som)", opts.bvh_builder);
         std::process::exit(2);
     }
+    // GPU-only and read at SceneGpu upload (both tracers), so it may land any
+    // time before a GPU tracer is built — but it belongs with the other
+    // build-shape levers, and the startup line is the arming signal.
+    blas_split::set_max_prims(opts.blas_split);
+    // Silent at the default — the `gpu scene:` line already reports the chunk
+    // count, and this is now every GPU session. Only a DEPARTURE speaks.
+    match opts.blas_split {
+        Some(n) if n != blas_split::DEFAULT_MAX_PRIMS => eprintln!(
+            "blas-split: --blas-split {n} — one BLAS per maximal BVH subtree of <= {n} tris \
+             (default {})",
+            blas_split::DEFAULT_MAX_PRIMS
+        ),
+        None => eprintln!(
+            "blas-split: --no-blas-split — ONE BLAS over the whole scene. Note this is the \
+             configuration that removed the device on Intel at 34.4M tris (BLAS scratch is \
+             sized by the largest geometry); it is the A/B arm, not a safe default"
+        ),
+        _ => {}
+    }
     if !opts.ftree {
         ftree::FTREE_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
         eprintln!("ftree: --no-ftree — all bound queries stay on the binary BVH");
@@ -1095,27 +1581,70 @@ fn main() {
     // A cache hit hands back the untiled scene's BVH too; tiling replicates
     // the geometry, so the tiled BVH is always a fresh (parallel) build.
     let mut prebuilt: Option<bvh::Bvh> = None;
-    let scene = match (&obj, stress) {
+    // World selection: ONLY the flagless interactive path. Every headless
+    // suite and benchmark keeps its own scene (flagless --check/--spin stay
+    // on the procedural scene — the structural must-fire gates are tuned to
+    // its topology, and no gate may move), and a positional scene always
+    // wins. An EXPLICIT --world in one of those combinations errors instead
+    // of silently resolving — being told is the feature (the --fsr4 shape).
+    let any_check = check
+        || check_dlss
+        || check_oidn
+        || check_xess
+        || check_fsr
+        || check_nppd
+        || check_gpu
+        || check_dxr;
+    if world_flag == Some(true)
+        && (obj.is_some() || stress.is_some() || tile.is_some() || spin.is_some() || any_check)
+    {
+        eprintln!(
+            "--world is exclusive with a scene argument, --stress, --tile, --spin, and --check* \
+             (those modes keep their own scenes; the world is the flagless interactive default)"
+        );
+        std::process::exit(2);
+    }
+    let world_wanted = world_flag.unwrap_or(true)
+        && obj.is_none()
+        && stress.is_none()
+        && tile.is_none()
+        && spin.is_none()
+        && !any_check;
+    let mut world_info: Option<world::World> = None;
+    let mut scene = match (&obj, stress) {
         (Some(p), _) => {
             let resolved = scene::resolve_scene_path(p);
             // Extension sniff: .gltf/.glb take the glTF loader, everything
             // else the OBJ path — reusing the positional arg inherits the
             // exclusivity checks, default camera, structural-skip predicate,
-            // and --tile. glTF scenes SKIP the sidecar cache: its texture
-            // table stores re-decodable file paths, and glTF images live
-            // inside GLB buffer views / data URIs (a cache hit would come
-            // back with 1x1 white textures).
+            // and --tile. glTF scenes SKIP the PER-SCENE sidecar cache: its
+            // texture table stores re-decodable file paths, and glTF images
+            // live inside GLB buffer views / data URIs (a cache hit would
+            // come back with 1x1 white textures). The WORLD sidecar solves
+            // this differently — path-less textures ride it as INLINE texels
+            // (scene_cache::store_world) — but that flavor is deliberately
+            // not retrofitted here: a per-scene glTF cache would balloon by
+            // its texel payload for scenes that already re-parse in seconds.
             let lower = resolved.to_ascii_lowercase();
             let is_gltf = lower.ends_with(".gltf") || lower.ends_with(".glb");
             let cached = if is_gltf { None } else { scene_cache::try_load(&resolved) };
             let (s, b) = match cached {
                 Some((s, b)) => (s, Some(b)),
                 None => {
-                    let s = if is_gltf {
+                    let mut s = if is_gltf {
                         gltf_loader::load_gltf_scene(&resolved)
                     } else {
                         scene::load_obj_scene(&resolved)
                     };
+                    // Cold loads only — before the cache store, so the n2h
+                    // flags + height_amps persist; warm loads re-apply the
+                    // texture conversions from the cached flags and take
+                    // height_amp from DiskMat.
+                    scene::derive_heights(&mut s);
+                    // Spray reclassification, same cold-load-only placement:
+                    // the retagged tri_mat/materials ride the cache (the
+                    // --no-spray lever keys its lever word).
+                    scene::reclassify_spray(&mut s);
                     // Under --tile the untiled build's ONLY use is feeding
                     // the cache store (the tiled BVH is always a fresh
                     // build) — and glTF skips the cache, so a tiled glTF
@@ -1147,7 +1676,29 @@ fn main() {
             }
         }
         (None, Some(n)) => scene::stress_scene(n),
-        (None, None) => scene::procedural_scene(),
+        (None, None) => {
+            if world_wanted {
+                match world::world_scene() {
+                    Some((s, w, b)) => {
+                        world_info = Some(w);
+                        // Cache hit or freshly built inside world_scene (the
+                        // world sidecar stores the built tree) — either way
+                        // the shared build arm below must not rebuild it.
+                        prebuilt = Some(b);
+                        s
+                    }
+                    None => {
+                        eprintln!(
+                            "world: no curated scenes found on disk (git lfs pull?) — \
+                             falling back to the procedural scene"
+                        );
+                        scene::procedural_scene()
+                    }
+                }
+            } else {
+                scene::procedural_scene()
+            }
+        }
     };
     // The stress field (and a tiled OBJ field) keeps the default look
     // direction but pulls the camera back/up to overlook the field; /8 (not
@@ -1156,10 +1707,15 @@ fn main() {
     let cam0 = cam_override.unwrap_or_else(|| match (stress, tile_fh) {
         (Some(n), _) => scaled_camera((scene::stress_field_half(n) / 8.0).max(1.0)),
         (None, Some(fh)) => scaled_camera((fh / 8.0).max(1.0)),
-        (None, None) => default_camera(),
+        // The world overview reuses the tiled-field framing: pull back/up by
+        // the field half-extent so the opening frame reads the whole ring.
+        (None, None) => match &world_info {
+            Some(w) => scaled_camera((w.field_half / 8.0).max(1.0)),
+            None => default_camera(),
+        },
     });
     let t0 = Instant::now();
-    let bvh = prebuilt.unwrap_or_else(|| bvh::Bvh::build(&scene));
+    let mut bvh = prebuilt.unwrap_or_else(|| bvh::Bvh::build(&scene));
     eprintln!(
         "scene: {} tris | BVH: {} nodes ready in {:.0} ms",
         scene.tri_count(),
@@ -1187,6 +1743,21 @@ fn main() {
             "BVH build is not deterministic (or the scene cache is corrupt)"
         );
         eprintln!("bvh: deterministic rebuild verified");
+    }
+
+    // --tod: applied strictly AFTER the cache load/store and the BVH build
+    // (the sun feeds neither), so the .fcache always holds the default day
+    // and the determinism gate compared like with like. Every downstream
+    // consumer — --spin, the check suites, run_window — sees the applied sun.
+    // Combining --tod with --check* is user's-own-risk: the same-seed and
+    // CPU-vs-GPU A/B gates are self-consistent under any sun, but structural
+    // must-fires and pinned bands assume the default (the --cam caveat class).
+    if let Some(h) = opts.tod {
+        scene::apply_tod(&mut scene, h);
+        eprintln!(
+            "tod: starting at {h:.2}h (sun y {:+.2}, sky scale {:.3}, night {:.2})",
+            scene.sun.dir.y, scene.sky_scale, scene.night
+        );
     }
 
     if let Some(mode) = &spin {
@@ -1265,11 +1836,50 @@ fn main() {
             std::process::exit(2);
         }
     }
+    // World auto-TOD attractors: one per island, unless an explicit --tod
+    // claimed the clock (an explicit hour is manual intent — starting a
+    // session that immediately eases away from the asked-for hour would make
+    // the flag a lie). Non-world sessions pass the empty vec — the flycam's
+    // structural off state.
+    let attractors: Vec<flycam::TodAttractor> = match (&world_info, opts.tod) {
+        (Some(w), None) => w
+            .islands
+            .iter()
+            .map(|i| flycam::TodAttractor {
+                pos: i.center,
+                hour: i.theme_hour,
+                radius: i.radius.max(1.0),
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    // Ambience cues, the attractors' audio twin: world mode gets one
+    // positioned cue per island (crossfaded by proximity in audio::update);
+    // a directly-loaded curated scene gets its own loop at steady gain; an
+    // unmatched scene is wind-only. --no-audio kills the whole device in
+    // run_window, so the cues are built unconditionally here.
+    let cues: audio::Cues = match (&world_info, &obj) {
+        (Some(w), _) => audio::Cues::World(
+            w.islands
+                .iter()
+                .map(|i| audio::Cue {
+                    name: i.name.clone(),
+                    pos: i.center,
+                    radius: i.radius.max(1.0),
+                })
+                .collect(),
+        ),
+        (None, Some(p)) => match audio::match_scene_path(&scene::resolve_scene_path(p)) {
+            Some(name) => audio::Cues::Steady(name),
+            None => audio::Cues::None,
+        },
+        _ => audio::Cues::None,
+    };
     #[cfg(windows)]
-    run_window(&scene, &bvh, &opts, cam0);
+    run_window(&mut scene, &mut bvh, &opts, cam0, attractors, file_settings, cues);
     #[cfg(not(windows))]
     {
-        let _ = (&opts, cam0);
+        let _ = (&opts, cam0, attractors, file_settings, cues);
         eprintln!("the interactive window requires Windows (D3D12 + DLSS); use --check / --check-dlss");
         std::process::exit(2);
     }
@@ -1324,20 +1934,28 @@ fn run_check_dxr(
 
     let (gw, gh) = (800usize, 600usize);
     let dev = hg.device.clone();
+    // ONE shared core for both DxrGpus this suite builds — the interactive
+    // sessions' Rc-sharing shape (the --check-gpu twin).
+    let core = match gpu::trace::SceneGpu::new_uploaded(&dev, scene, bvh, &mut hg, opts.bc7) {
+        Ok(c) => std::rc::Rc::new(c),
+        Err(e) => {
+            eprintln!("check-dxr: FAIL scene upload: {e}");
+            return 1;
+        }
+    };
     let dg = match gpu::dxr::DxrGpu::new(
         &dev,
         &dxc,
         scene,
+        core.clone(),
         gw as u32,
         gh as u32,
         false,
         opts.gpu_debug,
-        opts.bc7,
-        &mut hg,
     ) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("check-dxr: FAIL DxrGpu init (RTPSO/SBT/scene upload): {e}");
+            eprintln!("check-dxr: FAIL DxrGpu init (RTPSO/SBT): {e}");
             return 1;
         }
     };
@@ -1345,6 +1963,30 @@ fn run_check_dxr(
         "check-dxr: RTPSO + SBT built, scene uploaded, BLAS/TLAS built ({} tris)",
         scene.tri_count()
     );
+    // Anti-vacuity: with blas-split armed (the DEFAULT), every gate below is
+    // only a proof of the (InstanceID, PrimitiveIndex) remap if the scene
+    // actually split. A scene UNDER the cap legitimately builds one chunk —
+    // that is the single-BLAS shape reached through the split path, not a
+    // failure — so it says so instead of failing. Over the cap, one chunk
+    // means the planner stopped cutting and the remap went untested.
+    if let Some(cap) = blas_split::max_prims() {
+        if dg.scene.n_chunks < 2 {
+            if scene.tri_count() as u32 > cap {
+                eprintln!(
+                    "check-dxr: FAIL blas-split cap {cap} but the scene built {} chunk(s) \
+                     from {} tris — the remap is untested",
+                    dg.scene.n_chunks,
+                    scene.tri_count()
+                );
+                return 1;
+            }
+            eprintln!(
+                "check-dxr: note — {} tris is under the {cap} cap, so the scene is ONE chunk; \
+                 the remap runs as the identity here (use --blas-split N to split it)",
+                scene.tri_count()
+            );
+        }
+    }
 
     let q = Quality::preset(2);
     let basis = cam0.basis(gw, gh);
@@ -1373,7 +2015,8 @@ fn run_check_dxr(
             info: &info,
             tbuf: &tbuf,
             stats: &stats,
-            sun: render::sun_dir(scene),
+            sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
             tcache_cur: None,
             tcache_prev: &[],
             accumulate: true,
@@ -1410,7 +2053,8 @@ fn run_check_dxr(
             info: &info,
             tbuf: &tbuf,
             stats: &stats,
-            sun: render::sun_dir(scene),
+            sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
             tcache_cur: None,
             tcache_prev: &[],
             accumulate: true,
@@ -1447,6 +2091,8 @@ fn run_check_dxr(
                 verify: false,
                 spp: 1,
                 probe_sample: 0,
+                clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
             },
         );
         let mut rec = Ok(());
@@ -1532,6 +2178,8 @@ fn run_check_dxr(
                 verify: false,
                 spp: SPP_GATE,
                 probe_sample: probe,
+                clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
             };
             dg.write_cb(0, &p);
             let mut rec = Ok(());
@@ -1720,12 +2368,11 @@ fn run_check_dxr(
             &dev,
             &dxc,
             scene,
+            core.clone(),
             pw as u32,
             ph as u32,
             true,
             opts.gpu_debug,
-            opts.bc7,
-            &mut hg,
         ) {
             Ok(d) => d,
             Err(e) => {
@@ -1753,6 +2400,8 @@ fn run_check_dxr(
                 verify: false,
                 spp: 1,
                 probe_sample: 0,
+                clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
             };
             dg2.write_cb(0, &p);
             let mut rec = Ok(());
@@ -2079,6 +2728,8 @@ fn run_check_dxr(
                     verify: false,
                     spp: 1,
                     probe_sample: 0,
+                    clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
                 };
                 dg2.write_cb(0, &p);
                 let mut rec = Ok(());
@@ -2161,6 +2812,7 @@ fn run_check_dxr(
                     &accum2,
                     near,
                     far,
+                    &scene.sky_sh,
                     must_fire,
                 ) {
                     ok = false;
@@ -2180,6 +2832,8 @@ fn run_check_dxr(
                     &f_ao,
                     &f_is,
                     &f_res,
+                    &f_nrm,
+                    &scene.sky_sh,
                     must_fire,
                 ) {
                     ok = false;
@@ -2516,6 +3170,7 @@ fn gate_fsr_rr_feed(
     accum_bytes: &[u8],
     near: f32,
     far: f32,
+    sky_sh: &sh::Sh9,
     must_fire: bool,
 ) -> bool {
     let lanes = gpu::trace::GBUF_STRIDE as usize / 4;
@@ -2679,13 +3334,23 @@ fn gate_fsr_rr_feed(
             half::f16::from_bits(is16[2]).to_f32(),
         );
         let aof = half::f16::from_bits(ao16).to_f32();
+        // The AO signal's remodulation factor — the sky's SH irradiance at the
+        // WIRE normal, decoded from the PLANE BYTES the GPU stored, for exactly
+        // the reason the albedo wire factors are: the composite pass has only
+        // those bytes, so an oracle built from the pack's full-precision normal
+        // would be scoring a different identity than the one that runs.
+        let n_wire = fsr::oct_decode(
+            l10(got_n, 0) as f32 / 1023.0,
+            l10(got_n, 10) as f32 / 1023.0,
+        );
+        let amb = sky_sh.irradiance(n_wire);
         for ch in 0..3 {
             let color = accf(i * 3 + ch);
             // Every remodulated term, in the kernel's order (feed.hlsl's
             // cs_feed_fsr_rr — and fsr::split_signals' before it).
             let t_dd = ddf[ch] * wire[0][ch];
             let t_ds = dsf[ch] * wire[1][ch];
-            let t_ao = aof * shade::AMBIENT[ch] * wire[0][ch];
+            let t_ao = aof * amb[ch] * wire[0][ch];
             let t_is = isf[ch] * wire[1][ch];
             let e = color - t_dd - t_ds - t_ao - t_is;
             let got16 = h16(residual, i * 8 + ch * 2);
@@ -2755,8 +3420,12 @@ fn gate_fsr_rr_feed(
 /// from. The oracle is built from the PLANE BYTES the GPU stored (the feed
 /// gate's discipline — never from a recompute that could drift), so what is
 /// pinned here is exactly this kernel: its arithmetic, its albedo decode, its
-/// SRV table ORDER, and its root constants. A wrong AMBIENT moves a lit pixel
-/// by ~0.03 = tens of f16 ulps; the tolerance is 2.
+/// SRV table ORDER, and its root constants. A wrong ambient factor moves a lit
+/// pixel by ~0.03 = tens of f16 ulps; the tolerance is 2.
+///
+/// That factor is the sky's SH irradiance at the pixel's normal now, not a
+/// constant — so this gate also pins that the pass reads the NORMALS plane
+/// (t7) and evaluates `sh_irr` against the same coefficients the CPU holds.
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 fn gate_fsr_composite(
@@ -2772,13 +3441,15 @@ fn gate_fsr_composite(
     ao: &[u8],
     ind_s: &[u8],
     residual: &[u8],
+    normals: &[u8],
+    sky_sh: &sh::Sh9,
     must_fire: bool,
 ) -> bool {
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT;
     if hg
         .run(|l| {
             fres.record_signal_passthrough(l);
-            fres.record_composite(l, pw as u32, ph as u32);
+            fres.record_composite(l, pw as u32, ph as u32, sky_sh);
         })
         .is_err()
     {
@@ -2804,6 +3475,12 @@ fn gate_fsr_composite(
     for i in 0..pw * ph {
         let aoc = f16v(ao, i * 2);
         let mut any_is = false;
+        // The AO factor, decoded from the same RGB10A2 bytes the shader samples.
+        let nw = u32::from_le_bytes(normals[i * 4..][..4].try_into().unwrap());
+        let amb = sky_sh.irradiance(fsr::oct_decode(
+            (nw & 0x3ff) as f32 / 1023.0,
+            ((nw >> 10) & 0x3ff) as f32 / 1023.0,
+        ));
         for ch in 0..3 {
             let (kd, f0) = (dec(diff_alb, i, ch), dec(spec_alb, i, ch));
             let ddc = f16v(dd, i * 8 + ch * 2);
@@ -2811,7 +3488,7 @@ fn gate_fsr_composite(
             let isc = f16v(ind_s, i * 8 + ch * 2);
             let resc = f16v(residual, i * 8 + ch * 2);
             any_is |= isc != 0.0;
-            let want = ddc * kd + dsc * f0 + aoc * shade::AMBIENT[ch] * kd + isc * f0 + resc;
+            let want = ddc * kd + dsc * f0 + aoc * amb[ch] * kd + isc * f0 + resc;
             let got = h16(&comp, i * 8 + ch * 2);
             let d = (mono16(got) - mono16(half::f16::from_f32(want).to_bits())).unsigned_abs();
             max_ulp = max_ulp.max(d);
@@ -2934,17 +3611,27 @@ fn run_check_gpu(
     // at edges/grazing, and the RNG streams differ by design.
     let (gw, gh) = (800usize, 600usize);
     let dev = hg.device.clone();
+    // ONE shared core for every tracer this suite builds — the interactive
+    // sessions' Rc-sharing shape, so the suite's M2/M7/bench trio EXERCISES
+    // the sharing rather than testing three private copies.
+    let core = match gpu::trace::SceneGpu::new_uploaded(&dev, scene, bvh, &mut hg, opts.bc7) {
+        Ok(c) => std::rc::Rc::new(c),
+        Err(e) => {
+            eprintln!("check-gpu: FAIL scene upload: {e}");
+            return 1;
+        }
+    };
     let tg = match gpu::trace::TraceGpu::new(
         &dev,
         &dxc,
         scene,
         bvh,
+        core.clone(),
         gw as u32,
         gh as u32,
         false, // no pack: the M7-M9 gbuf/feed gates build their own tracer
         false,
         opts.gpu_debug,
-        opts.bc7,
         &mut hg,
     ) {
         Ok(t) => t,
@@ -2954,6 +3641,27 @@ fn run_check_gpu(
         }
     };
     eprintln!("check-gpu: scene uploaded, BLAS/TLAS built ({} tris)", scene.tri_count());
+    // Anti-vacuity, the --check-dxr twin: an armed lever that produced one
+    // chunk has exercised nothing the unarmed run does not — unless the scene
+    // is genuinely under the cap, which is a note, not a failure.
+    if let Some(cap) = blas_split::max_prims() {
+        if tg.scene.n_chunks < 2 {
+            if scene.tri_count() as u32 > cap {
+                eprintln!(
+                    "check-gpu: FAIL blas-split cap {cap} but the scene built {} chunk(s) \
+                     from {} tris — the remap is untested",
+                    tg.scene.n_chunks,
+                    scene.tri_count()
+                );
+                return 1;
+            }
+            eprintln!(
+                "check-gpu: note — {} tris is under the {cap} cap, so the scene is ONE chunk; \
+                 the remap runs as the identity here (use --blas-split N to split it)",
+                scene.tri_count()
+            );
+        }
+    }
 
     let q = Quality::preset(2);
     let basis = cam0.basis(gw, gh);
@@ -2982,7 +3690,8 @@ fn run_check_gpu(
             info: &info,
             tbuf: &tbuf,
             stats: &stats,
-            sun: render::sun_dir(scene),
+            sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
             tcache_cur: None,
             tcache_prev: &[],
             accumulate: true,
@@ -3017,6 +3726,8 @@ fn run_check_gpu(
             verify: false,
             spp: 1,
             probe_sample: 0,
+            clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
         });
         hg.run(|l| tg.record_reference(l, 0))
     };
@@ -3232,6 +3943,8 @@ fn run_check_gpu(
         verify: false,
         spp: 1,
         probe_sample: 0,
+        clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
     };
     tg.write_cb(0, &wf_params);
     if let Err(e) = hg.run(|l| tg.record_wavefront(l, 0, &wf_params, true)) {
@@ -3320,6 +4033,42 @@ fn run_check_gpu(
     } else if alpha_rej != 0 {
         eprintln!(
             "check-gpu: FAIL {alpha_rej} alpha rejections on an opaque scene (ALPHA_CUTOUT must be compiled out)"
+        );
+        ok = false;
+    }
+    // Relief anti-vacuity, the cutout's twin: a height-carrying scene with
+    // the toggle on must actually reject candidates somewhere (silhouettes/
+    // side exits); a height-free scene must count zero (HEIGHTFIELD compiled
+    // out). Same --cam caveat class as the cutout must-fire.
+    let height_rej = ctrs[gpu::trace::CTR_HEIGHT_REJ as usize];
+    if scene.any_height && bvh::height_on() {
+        eprintln!("check-gpu: relief-march rejections: {height_rej}");
+        if height_rej == 0 {
+            eprintln!("check-gpu: FAIL height-carrying scene rejected 0 candidates (relief must fire)");
+            ok = false;
+        }
+    } else if height_rej != 0 {
+        eprintln!(
+            "check-gpu: FAIL {height_rej} relief rejections without height data (HEIGHTFIELD must be compiled out)"
+        );
+        ok = false;
+    }
+    // Tinted-shadow anti-vacuity, the third twin: a transmissive scene's
+    // occlusion rays must actually pass through glass somewhere, or the
+    // TRANS_SHADOW path is dead code; a scene without transmissive materials
+    // (or with --no-tinted-shadows) must count zero (compiled out). Same
+    // --cam caveat class — a pose whose shadow rays never cross glass would
+    // trip the must-fire.
+    let trans_pass = ctrs[gpu::trace::CTR_TRANS_PASS as usize];
+    if scene.any_transmissive {
+        eprintln!("check-gpu: tinted-shadow candidate passes: {trans_pass}");
+        if trans_pass == 0 {
+            eprintln!("check-gpu: FAIL transmissive scene passed 0 shadow candidates (tinted shadows must fire)");
+            ok = false;
+        }
+    } else if trans_pass != 0 {
+        eprintln!(
+            "check-gpu: FAIL {trans_pass} tinted-shadow passes without transmissive materials (TRANS_SHADOW must be compiled out)"
         );
         ok = false;
     }
@@ -3579,6 +4328,8 @@ fn run_check_gpu(
                 verify: false,
                 spp,
                 probe_sample: probe,
+                clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
             };
             tg.write_cb(0, &p);
             if let Err(e) = hg.run(|l| tg.record_wavefront(l, 0, &p, true)) {
@@ -3638,12 +4389,26 @@ fn run_check_gpu(
                 }
             }
             let (mut sum, mut mx, mut hot) = (0.0f64, 0.0f32, 0usize);
+            let mut hot_diag: Vec<String> = Vec::new();
             for i in 0..px * 3 {
                 let d = (wa4[i] - ra4[i]).abs();
                 sum += d as f64;
                 if !edge_mask[i / 3] {
                     mx = mx.max(d);
                     if d > 1e-2 {
+                        // Same diagnostic discipline as the spp=1 gate's
+                        // hot_px list: a failure must name its pixels.
+                        if hot_diag.len() < 8 {
+                            let (x, y) = ((i / 3) % gw, (i / 3) / gw);
+                            hot_diag.push(format!(
+                                "spp={spp} probe={probe} px ({x},{y}) ch{} wave {:.4} ref {:.4} | t wave {:.4} ref {:.4}",
+                                i % 3,
+                                wa4[i],
+                                ra4[i],
+                                wt4[i / 3],
+                                rt4[i / 3]
+                            ));
+                        }
                         hot += 1;
                     }
                 }
@@ -3681,6 +4446,12 @@ fn run_check_gpu(
                 eprintln!(
                     "check-gpu: FAIL same-seed wavefront/reference images diverge at spp={spp} (rel {rel:.2e} of limit 1e-4 | hot {hot} of limit {hot_limit:.0} | non-finite {nonfinite})"
                 );
+                // Only a FAILURE names its pixels — a passing AMD run
+                // legitimately carries a few hot channels (the TMin
+                // re-origining class) and must not spam the log.
+                for h in &hot_diag {
+                    eprintln!("check-gpu:   {h}");
+                }
                 ok = false;
             }
         }
@@ -3712,8 +4483,8 @@ fn run_check_gpu(
     eprintln!("check-gpu: hemi probe set: {} points", probes.len());
     let mut hemi_ok = true;
     for (mode_name, fb) in [
-        ("AO", shade::FrustumBounce { ao: true, gi: false, shadows: false, depth: 3 }),
-        ("GI", shade::FrustumBounce { ao: false, gi: true, shadows: false, depth: 3 }),
+        ("AO", shade::FrustumBounce { ao: true, gi: false, depth: 3 }),
+        ("GI", shade::FrustumBounce { ao: false, gi: true, depth: 3 }),
     ] {
         // Multi-seed estimate (the CB frame seeds the Arvo draws), matching
         // the CPU suite's A/B. The verify/stat counters ACCUMULATE across
@@ -3734,6 +4505,8 @@ fn run_check_gpu(
                 verify: true,
                 spp: 1,
                 probe_sample: 0,
+                clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
             });
             if let Err(e) = tg.run_hemi_probes(&mut hg, 0, &probes, fb.depth, s == 0) {
                 eprintln!("check-gpu: FAIL hemi {mode_name} probes: {e}");
@@ -3800,14 +4573,16 @@ fn run_check_gpu(
             for (i, &(o, n)) in probes.iter().enumerate() {
                 let gpu_ao = h[i * 4] as f64 / FIXED / seeds_f / std::f64::consts::PI;
                 let (t1, t2) = shade::onb(n);
-                let mut open = 0u32;
+                let mut open = 0.0f64;
                 for _ in 0..REF_N {
                     let d = shade::cosine_dir(n, t1, t2, rng.f32(), rng.f32());
-                    if !bvh.occluded(scene, &bvh::Ray::new(o, d), 0.0, scene.ao_radius, &mut vls.ray_nodes) {
-                        open += 1;
-                    }
+                    // `transmittance` in lockstep with the estimator (tinted
+                    // shadows): glass folds to its gray tint, opaque scenes
+                    // keep the old 0/1 counts exactly.
+                    let tp = bvh.transmittance(scene, &bvh::Ray::new(o, d), 0.0, scene.ao_radius, &mut vls.ray_nodes);
+                    open += ((tp.x + tp.y + tp.z) / 3.0) as f64;
                 }
-                let cpu_ao = open as f64 / REF_N as f64;
+                let cpu_ao = open / REF_N as f64;
                 sum_abs += (gpu_ao - cpu_ao).abs();
                 sum_signed += gpu_ao - cpu_ao;
             }
@@ -3836,7 +4611,12 @@ fn run_check_gpu(
                     let d = shade::cosine_dir(n, t1, t2, rng.f32(), rng.f32());
                     let ray = bvh::Ray::new(o, d);
                     sum += match bvh.intersect(scene, &ray, 0.0, f32::INFINITY, &mut vls.ray_nodes) {
-                        None => shade::sky(d, sun),
+                        // gather, NOT radiance — this reference must integrate
+                        // the same sky hemi.rs does (a GATHER path), or the GI
+                        // A/B below is comparing two different functions. Same
+                        // sky_scale AND night sources as hemi's leaf miss, same
+                        // reason (night carries the star field's smooth mean).
+                        None => crate::sky::gather(d, sun, scene.sky_scale, scene.night),
                         Some(hh) => shade::shade(
                             scene,
                             bvh,
@@ -3846,6 +4626,9 @@ fn run_check_gpu(
                             &hemi::BOUNCE_Q,
                             &mut rng,
                             sun,
+                            // The pinned check cloud state — the GPU frame this
+                            // reference gates shades under the same sky.
+                            &crate::clouds::Clouds::check(scene.diag),
                             // Same bounce cone as hemi.rs's leaf shades — the
                             // A/B needs both arms sampling textures alike.
                             shade::Cone::bounce(),
@@ -3853,6 +4636,9 @@ fn run_check_gpu(
                             &mut vls,
                             None,
                             shade::VisCtl::Off,
+                            None,
+                            // Gather reference: fireflies excluded, like the
+                            // hemi leaf shades it gates against.
                             None,
                         ),
                     };
@@ -3881,7 +4667,7 @@ fn run_check_gpu(
     // them, and compose must produce finite radiance everywhere.
     {
         let hq = Quality {
-            fb: shade::FrustumBounce { ao: false, gi: true, shadows: false, depth: 2 },
+            fb: shade::FrustumBounce { ao: false, gi: true, depth: 2 },
             ..q
         };
         let p = gpu::trace::FrameParams {
@@ -3895,6 +4681,8 @@ fn run_check_gpu(
             verify: false,
             spp: 1,
             probe_sample: 0,
+            clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
         };
         tg.write_cb(0, &p);
         if let Err(e) = hg.run(|l| tg.record_wavefront(l, 0, &p, false)) {
@@ -3943,12 +4731,12 @@ fn run_check_gpu(
             &dxc,
             scene,
             bvh,
+            core.clone(),
             pw as u32,
             ph as u32,
             true,
             true, // + the NPPD staging buffers/kernels (M10 gates them)
             opts.gpu_debug,
-            opts.bc7,
             &mut hg,
         ) {
             Ok(t) => t,
@@ -3979,6 +4767,8 @@ fn run_check_gpu(
                 verify: false,
                 spp: 1,
                 probe_sample: 0,
+                clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
             };
             ptg.write_cb(0, &p);
             hg.run(|l| ptg.record_wavefront(l, 0, &p, false))?;
@@ -4049,16 +4839,34 @@ fn run_check_gpu(
             ok = false;
         }
 
-        // --- M11: --bc7 encode fidelity (GPU decode vs the CPU RGBA8 source).
-        // Only meaningful with the flag on: it measures the ENCODER, per
-        // texel, through the spec-bit-exact hardware decoder — the number the
-        // statistical albedo/radiance gates can't give. The 25 dB limit is a
-        // WIRING gate, not a quality bar: a pitch/footprint/format error
-        // lands ~10-20 dB, while the worst honest texture measured 31.7 dB at
-        // `fast` (San Miguel) — 25 separates the two without false-failing a
-        // hard texture at `ultrafast`.
-        if let Some(bq) = opts.bc7 {
-            match gpu::trace::bc7_fidelity(scene, bq, &mut hg) {
+        // --- bc7-gpu: the GPU encoder's STRUCTURAL gate (synthetic textures,
+        // so it fires on every scene — including the untextured procedural
+        // default, where M11 below skips). Runs UNCONDITIONALLY, --no-bc7
+        // included (the wide-tiles precedent: the default-path encoder must
+        // not rot behind a lever), and a construction failure is a suite
+        // FAIL, never a skip — interactively the same failure is a loud
+        // RGBA8 fallback, and this is where it gets teeth.
+        match gpu::trace::bc7_gpu_self_test(&mut hg) {
+            Ok(()) => eprintln!(
+                "check-gpu: bc7 gpu encoder: OK (flat bit-exact, stride, ramp, two-cluster mode-1)"
+            ),
+            Err(e) => {
+                eprintln!("check-gpu: FAIL bc7 gpu encoder: {e}");
+                ok = false;
+            }
+        }
+
+        // --- M11: BC7 encode fidelity (GPU decode vs the CPU RGBA8 source) —
+        // it measures the session's ENCODER (default: the GPU compute
+        // encoder; --bc7-cpu: the ispc arm), per texel, through the
+        // spec-bit-exact hardware decoder — the number the statistical
+        // albedo/radiance gates can't give. The 25 dB limit is a WIRING
+        // gate, not a quality bar: a pitch/footprint/format error lands
+        // ~10-20 dB, while the worst honest texture measured 31.7 dB at
+        // ispc `fast` (San Miguel) — 25 separates the two without
+        // false-failing a hard texture at `ultrafast`.
+        if opts.bc7.armed() {
+            match gpu::trace::bc7_fidelity(scene, opts.bc7, &mut hg) {
                 Ok(Some(f)) => {
                     eprintln!(
                         "check-gpu: bc7 fidelity: {} textures | mean |d| {:.3} LSB | max {} | worst PSNR {:.1} dB (limit 25)",
@@ -4379,6 +5187,8 @@ fn run_check_gpu(
                     verify: false,
                     spp: 1,
                     probe_sample: 0,
+                    clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
                 };
                 ptg.write_cb(0, &p);
                 if let Err(e) = hg.run(|l| ptg.record_wavefront(l, 0, &p, false)) {
@@ -4460,6 +5270,7 @@ fn run_check_gpu(
                     &accum2,
                     near,
                     far,
+                    &scene.sky_sh,
                     must_fire,
                 ) {
                     ok = false;
@@ -4479,6 +5290,8 @@ fn run_check_gpu(
                     &f_ao,
                     &f_is,
                     &f_res,
+                    &f_nrm,
+                    &scene.sky_sh,
                     must_fire,
                 ) {
                     ok = false;
@@ -4789,6 +5602,9 @@ fn run_check_gpu(
         }
     }
 
+    // Both remaining gates borrow `hg` mutably and neither needs the tracer.
+    drop(tg);
+
     // --- M12: the tonemap PS vs tone::map (the HLSL twin gate) ---
     // tonemap.hlsl is a term-for-term port of tone::map, and this is what stops
     // it drifting: the REAL pixel shader, through the REAL PSO and SRV slot, over
@@ -4796,9 +5612,10 @@ fn run_check_gpu(
     // range — below the knee, through the rolloff, and far past it (a physical
     // sun disc is ~44,000, so the tail is not hypothetical).
     //
-    // Both encodings are gated: SDR 8-bit (the default, which must not move) and
-    // scRGB f16 (the --hdr path). One shader produces both, so gating each pins
-    // the curve AND its encode.
+    // All three encodings are gated: SDR 8-bit (the default, which must not
+    // move), scRGB f16 (the --hdr path), and HDR10/PQ 10-bit (the wrapper-FG
+    // arm + --hdr10). One shader produces all of them, so gating each pins the
+    // curve AND its encode.
     {
         const TW: u32 = 64;
         const TH: u32 = 32;
@@ -4844,6 +5661,15 @@ fn run_check_gpu(
                 gpu::d3d12::SWAPCHAIN_FORMAT_HDR,
                 tone::ToneParams::hdr(200.0, 1000.0),
                 2e-3, // f16 wire + fp differences between HLSL exp/pow and Rust's
+            ),
+            (
+                "hdr10",
+                gpu::d3d12::SWAPCHAIN_FORMAT_HDR10,
+                tone::ToneParams::hdr10(200.0, 1000.0),
+                // ~2 ten-bit LSBs + fxc pow/exp slop through the ST 2084 pair.
+                // Never widen past 5e-3 without investigating — a wiring or
+                // constant error moves this by tens of percent.
+                2.5e-3,
             ),
         ] {
             match gpu::tonemap::selftest(&mut hg, &src, TW, TH, format, tp) {
@@ -4896,6 +5722,34 @@ fn run_check_gpu(
         }
     }
 
+    // --- M13: the glare pyramid, GPU vs CPU ---
+    // bloom.hlsl was the one CPU/GPU mirror in the renderer with no numeric gate
+    // — it PRESENTS, so a swapped octave weight or a bad barrier just looks
+    // slightly wrong and no suite objects. This scores the halo (the whole
+    // pyramid's product) against `bloom::Bloom`. Structure-free: it runs on a
+    // synthetic probe image, so `--stress` and loaded scenes gate it exactly like
+    // the default one.
+    if let Err(e) = gpu::bloom::self_test_gpu(&mut hg) {
+        eprintln!("check-gpu: FAIL {e}");
+        ok = false;
+    }
+
+    // --- M14: the registered-consensus fuse (--quinlight) ---
+    // The REAL kernel, through its REAL root signature and descriptor table,
+    // over synthetic engine images. Three gates, each aimed at a different way
+    // the port can be wrong: N==1 passthrough (the degenerate arm + the
+    // SRV/UAV wiring), a two-identical-engine IDENTITY fuse (the LK must solve
+    // (0,0) and come back bit-exact — this is what catches the sampler's
+    // texel-centre convention, the groupshared HALO indexing, a residual sign
+    // flip, an inverted tensor solve), and a known (+1,0) SHIFT that the
+    // registration must recover — measured against an ITERS=0 control, because
+    // a solve that always returns zero would sail through the first two.
+    println!("check-gpu: M14 quinlight registered-consensus fuse");
+    if let Err(e) = gpu::quin::gate(&mut hg, &dxc, opts.gpu_debug) {
+        eprintln!("check-gpu: FAIL M14 {e}");
+        ok = false;
+    }
+
     if !ok {
         eprintln!("GPU CHECK FAILED");
         return 1;
@@ -4904,8 +5758,8 @@ fn run_check_gpu(
     // --- Bench: full 1920x1080, GPU hybrid vs GPU vanilla vs CPU hybrid ---
     // Wall-clock around synchronous submits (includes per-frame sync — the
     // interactive loop pays the same). Correctness gates above are the
-    // point; this is the speedometer.
-    drop(tg);
+    // point; this is the speedometer. (`tg` was already dropped above, before
+    // the bloom gate borrowed `hg`.)
     let (bw, bh) = (1920usize, 1080usize);
     let dev = hg.device.clone();
     let btg = match gpu::trace::TraceGpu::new(
@@ -4913,12 +5767,12 @@ fn run_check_gpu(
         &dxc,
         scene,
         bvh,
+        core.clone(),
         bw as u32,
         bh as u32,
         false, // bench frames don't consume the pack
         false,
         opts.gpu_debug,
-        opts.bc7,
         &mut hg,
     ) {
         Ok(t) => t,
@@ -4951,6 +5805,8 @@ fn run_check_gpu(
                 verify: false,
                 spp,
                 probe_sample: 0,
+                clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
             };
             btg.write_cb(0, &p);
             let _ = hg.run(|l| btg.record_frame(l, 0, &p, hybrid));
@@ -4971,6 +5827,8 @@ fn run_check_gpu(
                 verify: false,
                 spp,
                 probe_sample: 0,
+                clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
             };
             btg.write_cb(0, &p);
             let _ = hg.run(|l| btg.record_frame(l, 0, &p, hybrid));
@@ -5000,7 +5858,7 @@ fn run_check_gpu(
     bench(
         "gpu hybrid + hemi-gi",
         true,
-        shade::FrustumBounce { ao: false, gi: true, shadows: false, depth: 3 },
+        shade::FrustumBounce { ao: false, gi: true, depth: 3 },
         1,
     );
     // --spp on the GPU: the wavefront pays its quadtree ONCE per frame no
@@ -5096,7 +5954,8 @@ fn run_check_gpu(
                 info: &info2,
                 tbuf: &tbuf2,
                 stats: &stats2,
-                sun: render::sun_dir(scene),
+                sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
                 tcache_cur: None,
                 tcache_prev: &[],
                 accumulate: true,
@@ -5250,8 +6109,13 @@ fn run_check_fsr(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural:
             let metallic = rng.f32();
             let kd = albedo * (1.0 - metallic);
             let f0 = Vec3A::splat(0.04).lerp(albedo, metallic);
-            let sig = fsr::split_signals(color, direct_d, direct_s, ao, ind_s, kd, f0);
-            let re = fsr::composite(&sig, kd, f0);
+            // The AO remodulation factor is now an arbitrary per-pixel RGB (the
+            // sky's SH irradiance at the pixel's normal), so the identity is
+            // gated against a RANDOM one — strictly stronger than pinning it to
+            // whatever constant the renderer happens to use.
+            let amb = Vec3A::new(rng.f32(), rng.f32(), rng.f32());
+            let sig = fsr::split_signals(color, direct_d, direct_s, ao, ind_s, kd, f0, amb);
+            let re = fsr::composite(&sig, kd, f0, amb);
             let err = (re - color).abs().max_element();
             if !re.is_finite() || err > 1e-5 * color.abs().max_element().max(1.0) {
                 eprintln!("composite identity err {err} at color {color}");
@@ -5272,8 +6136,9 @@ fn run_check_fsr(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural:
             let direct_s = Vec3A::splat(300.0);
             let ind_s = Vec3A::splat(120.0);
             let color = (direct_s + ind_s) * fsr::albedo_wire3(f0) + Vec3A::splat(0.05);
-            let sig = fsr::split_signals(color, Vec3A::ZERO, direct_s, 0.0, ind_s, kd, f0);
-            let re = fsr::composite(&sig, kd, f0);
+            let amb = Vec3A::new(0.12, 0.18, 0.25);
+            let sig = fsr::split_signals(color, Vec3A::ZERO, direct_s, 0.0, ind_s, kd, f0, amb);
+            let re = fsr::composite(&sig, kd, f0, amb);
             if !sig.ds.is_finite() || !sig.is.is_finite() || !sig.residual.is_finite() || !re.is_finite()
             {
                 eprintln!(
@@ -5404,6 +6269,28 @@ fn run_check_fsr(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural:
             eprintln!("parse_provider_versions accepted a non-version");
             pass = false;
         }
+        // The frame-generation pick: family coherence (FSR4 session prefers
+        // the 4.x ML frame generation, everything else the 3.1 interpolation),
+        // the other major as fallback rather than failure (the enumeration is
+        // device-filtered — anything in it is claimed to run), never id 0
+        // (FG picks are always explicit overrides), empty = None.
+        let mut fg_case = |desc: &str, got: Option<(u64, String)>, want: Option<u64>| {
+            if got.as_ref().map(|(id, _)| *id) != want {
+                eprintln!("pick_fg_version {desc}: got {got:?}, want id {want:?}");
+                pass = false;
+            }
+        };
+        let fg_all = list(&["FSR FG 4.0.1", "FSR 3.1.5", "FSR 3.1.4"]);
+        fg_case("all, fsr4", fsr::pick_fg_version(&fg_all, true), Some(fg_all[0].0));
+        fg_case("all, fsr3", fsr::pick_fg_version(&fg_all, false), Some(fg_all[1].0));
+        let fg_only3 = list(&["FSR 3.1.4", "FSR 3.1.5"]);
+        fg_case("only-3, fsr4", fsr::pick_fg_version(&fg_only3, true), Some(fg_only3[1].0));
+        fg_case("only-3, fsr3", fsr::pick_fg_version(&fg_only3, false), Some(fg_only3[1].0));
+        let fg_only4 = list(&["FSR FG 4.0.1"]);
+        fg_case("only-4, fsr4", fsr::pick_fg_version(&fg_only4, true), Some(fg_only4[0].0));
+        fg_case("only-4, fsr3", fsr::pick_fg_version(&fg_only4, false), Some(fg_only4[0].0));
+        fg_case("empty", fsr::pick_fg_version(&[], true), None);
+        fg_case("unparseable", fsr::pick_fg_version(&list(&["experimental"]), false), None);
         eprintln!("provider pick: {}", if pass { "OK" } else { "FAIL" });
         all_ok &= pass;
     }
@@ -5471,7 +6358,8 @@ fn fsr_frame_check(
             info: &info,
             tbuf: &tbuf,
             stats: &stats,
-            sun: render::sun_dir(scene),
+            sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
             tcache_cur: None,
             tcache_prev: &[],
             accumulate: false,
@@ -5559,7 +6447,17 @@ fn fsr_frame_check(
                         dlss::ld16(&buf[j * 3 + 2]),
                     )
                 };
-                let re = fsr::composite(&sig, l3(&ga.diff_alb, i), l3(&ga.spec_alb, i));
+                // The AO factor, from the same f16 G-buffer normal the FSR
+                // upload oct-encodes the normals plane from (render.rs's
+                // write_fsr subtracted exactly this).
+                let n16 = Vec3A::new(
+                    dlss::ld16(&ga.normal_rough[i * 4]),
+                    dlss::ld16(&ga.normal_rough[i * 4 + 1]),
+                    dlss::ld16(&ga.normal_rough[i * 4 + 2]),
+                );
+                let amb = scene.sky_sh.irradiance(fsr::wire_normal(n16));
+                let re =
+                    fsr::composite(&sig, l3(&ga.diff_alb, i), l3(&ga.spec_alb, i), amb);
                 // NaN/inf must fail loudly — f32::max would silently discard
                 // a NaN err, hiding an overflowed signal plane.
                 if !re.is_finite() {
@@ -5737,7 +6635,8 @@ fn albedo_ab_check(
         info: &info,
         tbuf: &tbuf,
         stats: &stats,
-        sun: render::sun_dir(scene),
+        sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
         tcache_cur: None,
         tcache_prev: &[],
         accumulate: false,
@@ -5852,7 +6751,8 @@ fn mv_check_at(
                 info: &info,
                 tbuf: &tbuf,
                 stats: &stats,
-                sun: render::sun_dir(scene),
+                sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
                 tcache_cur: None,
                 tcache_prev: &[],
                 accumulate: false,
@@ -6319,7 +7219,8 @@ fn run_check_xess(
                     info: &info,
                     tbuf: &tbuf,
                     stats,
-                    sun: render::sun_dir(scene),
+                    sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
                     tcache_cur: None,
                     tcache_prev: &[],
                     accumulate: true,
@@ -6563,7 +7464,8 @@ fn run_check_nppd(
             info: &info,
             tbuf: &tbuf,
             stats: &stats,
-            sun: render::sun_dir(scene),
+            sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
             tcache_cur: None,
             tcache_prev: &[],
             accumulate: false,
@@ -6790,7 +7692,8 @@ fn run_check_oidn(
             info: &info,
             tbuf: &tbuf,
             stats: &stats,
-            sun: render::sun_dir(scene),
+            sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
             tcache_cur: None,
             tcache_prev: &[],
             accumulate: true,
@@ -6942,7 +7845,8 @@ fn run_check_oidn(
             info: &info,
             tbuf: &tbuf,
             stats: &stats,
-            sun: render::sun_dir(scene),
+            sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
             tcache_cur: None,
             tcache_prev: &[],
             accumulate: false,
@@ -7135,7 +8039,8 @@ fn run_check_oidn(
                 info: &info,
                 tbuf: &tbuf,
                 stats: &stats,
-                sun: render::sun_dir(scene),
+                sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
                 tcache_cur: None,
                 tcache_prev: &[],
                 accumulate: true,
@@ -7536,8 +8441,14 @@ fn run_spin(
             return 2;
         }
     };
-    if opts.gpu {
-        eprintln!("--spin: drives the CPU renderer only; ignoring --gpu");
+    // GPU arms: `--gpu` (the wavefront tracer) or an EXPLICIT `--dxr`.
+    // `opts.dxr` defaults ON, so its value cannot be read as a request —
+    // `mode_explicit` is what separates "the user asked for the DispatchRays
+    // pipeline" from "nobody said anything", and that is why a bare `--spin`
+    // still drives the CPU renderer exactly as it always has.
+    #[cfg(windows)]
+    if opts.gpu || (opts.dxr && opts.mode_explicit) {
+        return run_spin_gpu(scene, bvh, cam0, mode, moving, frames, opts);
     }
     let (rw, rh) = (W, H);
     let q = Quality::upscaler_1spp();
@@ -7583,7 +8494,10 @@ fn run_spin(
             info: &info,
             tbuf: &tbuf,
             stats: &stats,
-            sun: render::sun_dir(scene),
+            // --spin's cloud clock is a pure function of the frame index —
+            // bit-repeatable A/Bs, like the pose itself.
+            sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::spin(scene.diag, idx),
+            fireflies: crate::fireflies::Fireflies::spin(scene, idx),
             tcache_cur,
             tcache_prev: &tprev_vec,
             accumulate: false,
@@ -7641,6 +8555,198 @@ fn run_spin(
     0
 }
 
+/// `--spin` on a GPU arm (`--gpu` wavefront, or an explicit `--dxr`): the same
+/// closed-loop `spin_path_pose` camera and the same per-frame contract the CPU
+/// arm runs, submitted through `HeadlessGpu` (record -> execute -> block)
+/// instead of a swapchain.
+///
+/// It exists because the GPU tracers had no deterministic wall-clock workload
+/// at all. `--check-gpu`'s bench rows are warm-clock noisy by their own
+/// admission — a cold row can "measure" a physically impossible speedup, which
+/// is exactly why the spp sweep interleaves its configurations and reduces by
+/// median — and an interactive `--gpu-timing` table depends on wherever the
+/// user happened to be flying. Here the pose, the cloud clock and the firefly
+/// poses are all pure functions of the frame index, the same as on the CPU, so
+/// an A/B across a code change compares two byte-identical workloads. Because
+/// the contract matches `run_spin`'s line for line (1-spp upscaler quality,
+/// `accumulate` off, frame-uniform Halton jitter), `--cpu` / `--gpu` / `--dxr`
+/// spin rows are directly comparable to each other.
+///
+/// What it measures is the TRACER, not the presented frame: `gbuf_full` is off,
+/// so there is no G-buffer pack and no feed/upscale pass. Those are constant
+/// across tracer changes (measured on the Arc Pro B70: feed 0.53 + xess-eval
+/// 0.51 ms) and wiring them in would need a swapchain this path deliberately
+/// does not have. The wall clock therefore carries the per-frame submit+fence
+/// overhead the interactive loop hides behind FRAMES_IN_FLIGHT — compare GPU
+/// time to GPU time via `--gpu-timing`, whose per-pass table prints every 120
+/// frames and once more at exit. On Intel that table is the only per-pass
+/// profiler that exists (PIX cannot analyze an Arc capture).
+#[cfg(windows)]
+fn run_spin_gpu(
+    scene: &scene::Scene,
+    bvh: &bvh::Bvh,
+    cam0: Camera,
+    mode: &str,
+    moving: bool,
+    frames: u32,
+    opts: &Opts,
+) -> i32 {
+    let arm = if opts.gpu { "gpu" } else { "dxr" };
+    let dxc = match gpu::dxc::Dxc::load(&opts.dxc_path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("spin {arm}: {e}");
+            return 2;
+        }
+    };
+    let mut hg = match gpu::trace::HeadlessGpu::new(
+        opts.gpu_debug,
+        opts.prefer.unwrap_or(gpu::adapter::Prefer::Nvidia),
+    ) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("spin {arm}: device creation failed: {e}");
+            return 2;
+        }
+    };
+    // Trace res = the GPU-mode lock scale (`--lock-res`, default native), so
+    // `--gpu --lock-res quality` is measurable here — which is precisely the
+    // claim the Intel default rests on. No upscaler range exists headlessly, so
+    // this is a plain scale of the interactive native res rounded to even
+    // rather than `quantize_res`'s SDK-clamped quantum.
+    let lock = opts.gpu_lock_scale.unwrap_or(1.0).clamp(0.1, 1.0);
+    let rw = (((W as f32 * lock).round() as usize) & !1usize).max(8);
+    let rh = (((H as f32 * lock).round() as usize) & !1usize).max(8);
+    let dev = hg.device.clone();
+    let q = Quality::upscaler_1spp();
+
+    // One enum instead of two copies of the loop: the two tracers share the
+    // FrameParams contract but not a trait (DxrGpu::record_frame is fallible —
+    // it casts to ID3D12GraphicsCommandList4).
+    enum Arm {
+        Wave(gpu::trace::TraceGpu),
+        Dxr(gpu::dxr::DxrGpu),
+    }
+    let core = match gpu::trace::SceneGpu::new_uploaded(&dev, scene, bvh, &mut hg, opts.bc7) {
+        Ok(c) => std::rc::Rc::new(c),
+        Err(e) => {
+            eprintln!("spin: scene upload failed: {e}");
+            return 2;
+        }
+    };
+    let armv = if opts.gpu {
+        match gpu::trace::TraceGpu::new(
+            &dev,
+            &dxc,
+            scene,
+            bvh,
+            core,
+            rw as u32,
+            rh as u32,
+            false, // no G-buffer pack: this measures the tracer
+            false, // no NPPD stage
+            opts.gpu_debug,
+            &mut hg,
+        ) {
+            Ok(t) => Arm::Wave(t),
+            Err(e) => {
+                eprintln!("spin gpu: TraceGpu init failed: {e}");
+                return 2;
+            }
+        }
+    } else {
+        match gpu::dxr::DxrGpu::new(
+            &dev,
+            &dxc,
+            scene,
+            core,
+            rw as u32,
+            rh as u32,
+            false,
+            opts.gpu_debug,
+        ) {
+            Ok(d) => Arm::Dxr(d),
+            Err(e) => {
+                eprintln!("spin dxr: DxrGpu init failed: {e}");
+                return 2;
+            }
+        }
+    };
+
+    eprintln!(
+        "spin {mode} [{arm}]: {frames} frames at {rw}x{rh} ({:.0}% of {W}x{H}), 1-spp quality, spp {} | adapter \"{}\" | pid {}",
+        lock * 100.0,
+        opts.spp,
+        hg.adapter_name,
+        std::process::id()
+    );
+    const WARMUP: u32 = 20;
+    let mut total_ms = 0.0f64;
+    let mut peak_ms = 0.0f64;
+    let mut window = Instant::now();
+    for idx in 0..frames {
+        let cam = if moving { spin_path_pose(&cam0, scene.diag, idx) } else { cam0 };
+        let p = gpu::trace::FrameParams {
+            cam: cam.basis(rw, rh),
+            frame: idx,
+            // The upscaler frame contract, matching run_spin's CPU ctx exactly:
+            // every frame is a fresh 1-spp trace with frame-uniform Halton
+            // jitter and a free-running index (pinning it would freeze the noise
+            // pattern), so the two arms measure the same workload.
+            accumulate: false,
+            jitter: false,
+            frame_jitter: Some(dlss::jitter_for(idx)),
+            prev_cam: None,
+            q,
+            verify: false,
+            spp: opts.spp,
+            probe_sample: 0,
+            clouds: crate::clouds::Clouds::spin(scene.diag, idx),
+            fireflies: crate::fireflies::Fireflies::spin(scene, idx),
+        };
+        let t = Instant::now();
+        let r = match &armv {
+            Arm::Wave(tg) => {
+                tg.write_cb(0, &p);
+                hg.run(|l| tg.record_frame(l, 0, &p, true))
+            }
+            Arm::Dxr(dg) => {
+                dg.write_cb(0, &p);
+                let mut rec = Ok(());
+                hg.run(|l| rec = dg.record_frame(l, 0)).and(rec)
+            }
+        };
+        if let Err(e) = r {
+            eprintln!("spin {arm}: frame {idx} failed: {e}");
+            return 1;
+        }
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        prof::frame_mark();
+        if idx >= WARMUP {
+            total_ms += ms;
+            peak_ms = peak_ms.max(ms);
+        }
+        if (idx + 1) % 200 == 0 {
+            eprintln!(
+                "spin {mode} [{arm}] [{:4}]: {:6.2} ms/frame over the last 200",
+                idx + 1,
+                window.elapsed().as_secs_f64() * 1000.0 / 200.0,
+            );
+            window = Instant::now();
+        }
+    }
+    let timed = frames.saturating_sub(WARMUP).max(1) as f64;
+    eprintln!(
+        "spin {mode} [{arm}] summary: {:.2} ms/frame mean (peak {:.2}) over {} timed frames \
+         (wall clock, includes per-frame submit+fence; --gpu-timing for GPU time)",
+        total_ms / timed,
+        peak_ms,
+        timed as u64,
+    );
+    gpu::gputime::report();
+    0
+}
+
 /// Headless end-to-end check: correctness counters (must be 0), an A/B
 /// benchmark of hybrid vs plain, and a rendered check.png. `structural`
 /// additionally gates the scene-topology assertions (coarse pixels at fixed
@@ -7658,6 +8764,133 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     // mechanics, and the lod ≤ 0 bit-compat contract (magnified views
     // identical to the pre-mip renderer).
     let tex_ok = texture::self_test();
+
+    // SH sky irradiance — basis orthonormality (pins every constant), the
+    // uniform-sky convention pin (radiance L in, exactly L out — what makes it
+    // a drop-in for the old AMBIENT · ao), accuracy vs a brute-force
+    // cosine-weighted reference, and projection determinism.
+    let sh_ok = match sh::self_test() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("sh self-test: FAIL — {e}");
+            false
+        }
+    };
+
+    // Glare: normalized octave weights, ENERGY CONSERVATION (a uniform image
+    // must come back unchanged — glare redistributes light, never creates it),
+    // total-energy preservation on a point source, and a monotone heavy tail.
+    let bloom_ok = match bloom::self_test() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("bloom self-test: FAIL — {e}");
+            false
+        }
+    };
+
+    // The one sky: the disc's radiance/irradiance round-trip (the classic 4π
+    // slip), cone sampling inside-and-covering the disc, the disc test agreeing
+    // with the cone the sampler draws from, the DOME carrying no disc (the
+    // invariant the hemi fixed-point accumulator depends on), and the resulting
+    // ambient landing in a physically sane, blue-dominant band.
+    let sky_ok = match sky::self_test() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("sky self-test: FAIL — {e}");
+            false
+        }
+    };
+
+    // Clouds: the --no-clouds bit-identity sweep, T/scatter range+finiteness
+    // over a direction × time sweep, Beer monotonicity in optical depth, the
+    // per-ray None arm's bit-passthrough, the cloudy/clear/shadow must-fires,
+    // the exact advection identity, and the horizon-fade continuity.
+    let clouds_ok = match clouds::self_test() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("clouds self-test: FAIL — {e}");
+            false
+        }
+    };
+
+    // Fireflies: the structural off arms (disabled / day / zero count), bake
+    // determinism, the by-construction position bounds (in-box, above-ground,
+    // brightness band), the windowed-falloff exact zero + monotonicity + the
+    // f16-safe near-field peak, and the glow's depth test / energy
+    // conservation / radiance cap.
+    let fireflies_ok = match fireflies::self_test() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("fireflies self-test: FAIL — {e}");
+            false
+        }
+    };
+
+    // Time-of-day: the sun arc's anchors, the fade's exact identities (the
+    // untouched-session bit-identity guards), the sunset channel ordering, the
+    // moon handoff, and the star field's day-guard/determinism/clamp.
+    let tod_ok = match scene::tod_self_test() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("tod self-test: FAIL — {e}");
+            false
+        }
+    };
+
+    // Relief-march gates — flat-field bitwise identity, closed-form marched
+    // hits, silhouette reject, interior escape / pit-wall occlusion, the
+    // underside crossing, and the build-vs-march depth pin.
+    let height_ok = match bvh::height_self_test() {
+        Ok(()) => {
+            eprintln!("height self-test: OK");
+            true
+        }
+        Err(e) => {
+            eprintln!("height self-test: FAIL — {e}");
+            false
+        }
+    };
+
+    // Tinted-shadow gates — single/double-interface tint bitwise, opaque
+    // termination, the SHADOW_TP_MIN cutoff, the primary-visibility pin,
+    // binary `occluded`'s geometric-oracle contract, the lever-off block.
+    let tinted_ok = match bvh::tinted_shadow_self_test() {
+        Ok(()) => {
+            eprintln!("tinted-shadow self-test: OK");
+            true
+        }
+        Err(e) => {
+            eprintln!("tinted-shadow self-test: FAIL — {e}");
+            false
+        }
+    };
+
+    // Spray-reclassification gates — tiny transmissive islands retag to one
+    // deduped white-scatter clone; large/opaque components and the lever-off
+    // arm untouched.
+    let spray_ok = match scene::spray_self_test() {
+        Ok(()) => {
+            eprintln!("spray self-test: OK");
+            true
+        }
+        Err(e) => {
+            eprintln!("spray self-test: FAIL — {e}");
+            false
+        }
+    };
+
+    // Depth-tint math gates — the Beer–Lambert closed-form anchors (seg 0 ⇒
+    // exactly ONE, seg D_ref ⇒ exactly albedo, monotone, white passthrough).
+    let depth_tint_ok = match shade::depth_tint_self_test() {
+        Ok(()) => {
+            eprintln!("depth-tint self-test: OK");
+            true
+        }
+        Err(e) => {
+            eprintln!("depth-tint self-test: FAIL — {e}");
+            false
+        }
+    };
 
     // Spherical-cell math self-test — closed-form identities the hemisphere
     // bounce integrator is built on (Ω/PSA anchors, exact partition,
@@ -7681,6 +8914,18 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         Ok(()) => true,
         Err(e) => {
             eprintln!("ftree self-test: FAIL — {e}");
+            false
+        }
+    };
+
+    // BLAS chunk planner: the cut's structural contracts (cap, exact triangle
+    // partition, antichain coverage, determinism) at several caps on the
+    // session's real tree. Runs on every --check regardless of --blas-split —
+    // it plans its own cuts — so the planner can't rot while the lever is off.
+    let blas_ok = match blas_split::self_test(bvh) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("blas-split self-test: FAIL — {e}");
             false
         }
     };
@@ -7741,6 +8986,19 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
     };
 
+    // Water-ripple field self-test — off-state bit-identity, horizon guard,
+    // closed-form anchor, animation.
+    let ripple_ok = match shade::ripple_self_test() {
+        Ok(()) => {
+            eprintln!("ripple self-test: OK");
+            true
+        }
+        Err(e) => {
+            eprintln!("ripple self-test: FAIL — {e}");
+            false
+        }
+    };
+
     // Upscaler-chain self-test — the DLSS→FSR4→XeSS→FSR3 resolution order and
     // the force/skip flag algebra, with availability injected (DLL-free).
     let upchain_ok = match upchain::self_test() {
@@ -7750,6 +9008,22 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
         Err(e) => {
             eprintln!("upchain self-test: FAIL — {e}");
+            false
+        }
+    };
+
+    // Settings self-test — serde round-trip/sparseness/forward-compat of the
+    // JSON schema, the enum vocabularies pinned against their consumers
+    // (xess::lock_scale, bc7::Quality::parse, the parse_* mirrors of the CLI
+    // arms), and the headless predicate that keeps this very suite blind to
+    // the settings file.
+    let settings_ok = match settings::self_test() {
+        Ok(()) => {
+            eprintln!("settings self-test: OK");
+            true
+        }
+        Err(e) => {
+            eprintln!("settings self-test: FAIL — {e}");
             false
         }
     };
@@ -7765,6 +9039,45 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             false
         }
     };
+
+    // Registered-consensus self-test (--quinlight) — the winsorized reduce's
+    // identities: the m==2 plain-mean degeneracy (what makes a two-engine fuse a
+    // PROVABLE registered mean), the m>=3 outlier rejection, median order
+    // independence, and the non-finite-is-MISSING bit predicate. Pure math, the
+    // Rust twin of quin.hlsl's reduce; the wired kernel is gated by --check-gpu.
+    #[cfg(windows)]
+    let quin_ok = match gpu::quin::self_test() {
+        Ok(()) => {
+            eprintln!("quin self-test: OK");
+            true
+        }
+        Err(e) => {
+            eprintln!("quin self-test: FAIL — {e}");
+            false
+        }
+    };
+    #[cfg(not(windows))]
+    let quin_ok = true;
+
+    // Raw-NGX DLSS-G guide self-test — the two conversions the --fg
+    // evaluate feeds the FG snippet: clip depth must be the exact z-mapping
+    // of the perspective_lh matrix riding the same dispatch
+    // (matrix-consistency sweep + the near/far/harmonic-midpoint anchors),
+    // and the reflection-aware MV's virtual-image reprojection must
+    // degenerate to CamBasis::project at t_r = 0 (the plane's own MV
+    // convention), zero out under a static camera, and collapse a strafe's
+    // reflected-sky MV to ~nothing (the DamagedHelmet swim, as a gate).
+    // Pure math, DLL- and GPU-free; the HLSL twin is a literal mirror.
+    #[cfg(windows)]
+    let ngxfg_guides_ok = match gpu::ngxfg_guides::self_test() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("ngxfg-guides self-test: FAIL — {e}");
+            false
+        }
+    };
+    #[cfg(not(windows))]
+    let ngxfg_guides_ok = true;
 
     // glTF loader self-test — an in-code GLB exercises node flattening, the
     // mirrored-winding flip, u16 index widening, and the factor mapping.
@@ -7790,6 +9103,34 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
         Err(e) => {
             eprintln!("bc7 self-test: FAIL — {e}");
+            false
+        }
+    };
+
+    // World-merge self-test — pure math (id offsetting incl. the NO_TEX
+    // sentinel, ground-drop accounting, ring-layout determinism); the world
+    // itself is never the --check scene (flagless --check stays procedural).
+    let world_ok = match world::self_test() {
+        Ok(()) => {
+            eprintln!("world self-test: OK");
+            true
+        }
+        Err(e) => {
+            eprintln!("world self-test: FAIL — {e}");
+            false
+        }
+    };
+
+    // Audio self-test — pure math only (resampler, loop seam, proximity and
+    // wind gain anchors, mixer must-fires, the curated-island loop mapping);
+    // no device, no DLL — the audio DEVICE never exists on a headless path.
+    let audio_ok = match audio::self_test() {
+        Ok(()) => {
+            eprintln!("audio self-test: OK");
+            true
+        }
+        Err(e) => {
+            eprintln!("audio self-test: FAIL — {e}");
             false
         }
     };
@@ -7935,7 +9276,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             info: &info,
             tbuf: &tbuf,
             stats: &s,
-            sun: render::sun_dir(scene),
+            sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
             tcache_cur: None,
             tcache_prev: &[],
             accumulate: true,
@@ -7999,7 +9341,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 info: &info,
                 tbuf: &tbuf,
                 stats: &stats,
-                sun: render::sun_dir(scene),
+                sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
                 tcache_cur: None,
                 tcache_prev: &[],
                 // The upscaler contract: every frame a fresh jittered frame.
@@ -8083,17 +9426,19 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 // Reference: cosine-sampled AO, the same construction shade()
                 // uses, from the same eps-offset point.
                 let mut rng = fastrand::Rng::with_seed(px_seed(pr.x, pr.y, 0xA0));
-                let mut open = 0u32;
+                let mut open = 0.0f32;
                 for _ in 0..REF_SAMPLES {
                     let r1 = rng.f32();
                     let r2 = rng.f32();
                     let d = shade::cosine_dir(pr.n, t1, t2, r1, r2);
-                    if !bvh.occluded(scene, &bvh::Ray::new(pr.p, d), 0.0, scene.ao_radius, &mut vis)
-                    {
-                        open += 1;
-                    }
+                    // `transmittance` in lockstep with the hemi estimator
+                    // (tinted shadows) — glass folds to its gray tint,
+                    // opaque scenes keep the old 0/1 counts exactly.
+                    let tp =
+                        bvh.transmittance(scene, &bvh::Ray::new(pr.p, d), 0.0, scene.ao_radius, &mut vis);
+                    open += (tp.x + tp.y + tp.z) / 3.0;
                 }
-                let ao_r = open as f32 / REF_SAMPLES as f32;
+                let ao_r = open / REF_SAMPLES as f32;
                 ((ao_h - ao_r) as f64, hv, ls)
             })
             .collect();
@@ -8158,6 +9503,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                         t2,
                         q.fb.depth,
                         sun,
+                        &crate::clouds::Clouds::check(scene.diag),
                         0,
                         None,
                         &mut rng,
@@ -8177,7 +9523,10 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                     let d = shade::cosine_dir(pr.n, t1, t2, r1, r2);
                     let bray = bvh::Ray::new(pr.p, d);
                     e_r += match bvh.intersect(scene, &bray, 0.0, f32::INFINITY, &mut vis) {
-                        None => shade::sky(d, sun),
+                        // gather, NOT radiance — a GATHER path, mirroring
+                        // hemi.rs's leaf-ray miss exactly (see sky.rs),
+                        // including its sky_scale and night sources.
+                        None => crate::sky::gather(d, sun, scene.sky_scale, scene.night),
                         Some(h) => shade::shade(
                             scene,
                             bvh,
@@ -8187,11 +9536,17 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                             &hemi::BOUNCE_Q,
                             &mut rng,
                             sun,
+                            // Pinned check clouds — both arms of the A/B shade
+                            // the same sky (hemi::gi got the same state above).
+                            &crate::clouds::Clouds::check(scene.diag),
                             shade::Cone::bounce(),
                             1,
                             &mut lsr,
                             None,
                             shade::VisCtl::Off,
+                            None,
+                            // Gather reference: fireflies excluded, like the
+                            // hemi leaf shades it gates against.
                             None,
                         ),
                     };
@@ -8343,6 +9698,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                     g.delta,
                     g.eta,
                     None,
+                    &crate::clouds::Clouds::check(scene.diag),
                     &mut ao_share,
                     &mut ls,
                 );
@@ -8360,6 +9716,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                     g.delta,
                     g.eta,
                     Some(sun),
+                    &crate::clouds::Clouds::check(scene.diag),
                     &mut gi_share,
                     &mut ls,
                 );
@@ -8424,6 +9781,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                             t2,
                             q.fb.depth,
                             sun,
+                            &crate::clouds::Clouds::check(scene.diag),
                             0,
                             Some(&gi_share),
                             &mut rng,
@@ -8440,6 +9798,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                             t2,
                             q.fb.depth,
                             sun,
+                            &crate::clouds::Clouds::check(scene.diag),
                             0,
                             None,
                             &mut rng,
@@ -8512,6 +9871,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 g.delta,
                 g.eta,
                 None,
+                &crate::clouds::Clouds::check(scene.diag),
                 &mut deep,
                 &mut dls,
             );
@@ -8526,127 +9886,6 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         ok
     };
 
-    // Light-shaft shadow culling: proven-lit subrect claims re-validated by
-    // reference occlusion rays (corners + center of each lit leaf), sample
-    // classification re-checked against full-tree occlusion (exact-match —
-    // the shaft must never change a shadow result, only skip proven rays),
-    // and the leaf rects must exactly tile the light's param square.
-    let shaft_ok = {
-        // Same probe set and parallel/sequential-fold structure as hemi AO.
-        let results: Vec<_> = probes
-            .par_iter()
-            .map(|pr| {
-                let mut ls = stats::LocalStats::default();
-                let mut vis = 0u64;
-                let (mut false_lit, mut mismatch, mut area_bad) = (0u64, 0u64, 0u64);
-                let (mut samples, mut skipped) = (0u64, 0u64);
-                let (p, n) = (pr.p, pr.n);
-                let s = shaft::build(scene, bvh, p, n, &mut ls);
-                let mut area = 0.0f32;
-                for l in s.leaves() {
-                    area += (l.r[2] - l.r[0]) * (l.r[3] - l.r[1]);
-                    if l.lit {
-                        // Corners + center of the lit subrect must be reachable.
-                        let pts = [
-                            (l.r[0], l.r[1]),
-                            (l.r[2], l.r[1]),
-                            (l.r[2], l.r[3]),
-                            (l.r[0], l.r[3]),
-                            ((l.r[0] + l.r[2]) * 0.5, (l.r[1] + l.r[3]) * 0.5),
-                        ];
-                        for (su, sv) in pts {
-                            let lp = scene.light.center + scene.light.u * su + scene.light.v * sv;
-                            let lv = lp - p;
-                            let dist = lv.length();
-                            let wi = lv / dist;
-                            // The shaft claim covers the tangent upper
-                            // half-space only — exactly the samples shade
-                            // ever consults it for (ndl > 0).
-                            if wi.dot(n) <= 0.0 {
-                                continue;
-                            }
-                            if bvh.occluded(
-                                scene,
-                                &bvh::Ray::new(p, wi),
-                                0.0,
-                                dist - scene.eps,
-                                &mut vis,
-                            ) {
-                                false_lit += 1;
-                            }
-                        }
-                    }
-                }
-                if (area - 4.0).abs() > 1e-4 {
-                    area_bad += 1;
-                }
-                // Deterministic sample sweep: the shaft-classified occlusion
-                // result must equal the full-tree result for every sample.
-                let mut rng = fastrand::Rng::with_seed(
-                    (pr.x as u64).wrapping_mul(31).wrapping_add(pr.y as u64),
-                );
-                for _ in 0..16 {
-                    let (su, sv) = (rng.f32() * 2.0 - 1.0, rng.f32() * 2.0 - 1.0);
-                    let lp = scene.light.center + scene.light.u * su + scene.light.v * sv;
-                    let lv = lp - p;
-                    let dist = lv.length();
-                    let wi = lv / dist;
-                    if wi.dot(n) <= 0.0 {
-                        continue; // shade never consults the shaft below the horizon
-                    }
-                    let full = bvh.occluded(
-                        scene,
-                        &bvh::Ray::new(p, wi),
-                        0.0,
-                        dist - scene.eps,
-                        &mut vis,
-                    );
-                    samples += 1;
-                    let got = match s.classify(su, sv) {
-                        shaft::Class::Lit => {
-                            skipped += 1;
-                            false
-                        }
-                        shaft::Class::Test { tmin, cut } => bvh.occluded_multi(
-                            scene,
-                            &bvh::Ray::new(p, wi),
-                            tmin,
-                            dist - scene.eps,
-                            cut,
-                            &mut vis,
-                        ),
-                    };
-                    if got != full {
-                        mismatch += 1;
-                    }
-                }
-                (false_lit, mismatch, area_bad, samples, skipped, ls)
-            })
-            .collect();
-        let mut ls = stats::LocalStats::default();
-        let (mut false_lit, mut mismatch, mut area_bad) = (0u64, 0u64, 0u64);
-        let (mut samples, mut skipped) = (0u64, 0u64);
-        for (fl, mm, ab, sa, sk, pls) in &results {
-            false_lit += fl;
-            mismatch += mm;
-            area_bad += ab;
-            samples += sa;
-            skipped += sk;
-            ls.merge(pls);
-        }
-        let nprobes = results.len() as u64;
-        eprintln!(
-            "shaft shadows ({nprobes} probes): false-lit {false_lit} | class mismatch {mismatch} | area-bad {area_bad} | rays skipped {skipped}/{samples} ({:.0}%) | {:.1} queries/point",
-            skipped as f64 * 100.0 / samples.max(1) as f64,
-            ls.shaft_queries as f64 / nprobes.max(1) as f64,
-        );
-        let mut ok = false_lit == 0 && mismatch == 0 && area_bad == 0;
-        if structural && skipped == 0 {
-            eprintln!("shaft shadows: expected skipped rays > 0 — the lit path didn't fire");
-            ok = false;
-        }
-        ok
-    };
     // Probe gates done — the bench rows below measure the session defaults.
     bvh::CUT_SEED_HEMI.store(cut_hemi_session, Relaxed);
 
@@ -8658,20 +9897,18 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     // (hemi_queries, share groups, share fallback) per row, for the
     // hemi-share must-fires below (share-on must run strictly fewer queries).
     let mut share_rows: Vec<(&str, bool, u64, u64, u64)> = Vec::new();
-    for (label, hybrid, hemi_ao, hemi_gi, shafts, share) in [
-        ("hybrid ", true, false, false, false, false),
-        ("hemi-ao (share off)", true, true, false, false, false),
-        ("hemi-ao (share on) ", true, true, false, false, true),
-        ("hemi-gi (share off)", true, false, true, false, false),
-        ("hemi-gi (share on) ", true, false, true, false, true),
-        ("shafts ", true, false, false, true, false),
-        ("plain  ", false, false, false, false, false),
+    for (label, hybrid, hemi_ao, hemi_gi, share) in [
+        ("hybrid ", true, false, false, false),
+        ("hemi-ao (share off)", true, true, false, false),
+        ("hemi-ao (share on) ", true, true, false, true),
+        ("hemi-gi (share off)", true, false, true, false),
+        ("hemi-gi (share on) ", true, false, true, true),
+        ("plain  ", false, false, false, false),
     ] {
         stats.clear();
         let mut bq = q;
         bq.fb.ao = hemi_ao;
         bq.fb.gi = hemi_gi;
-        bq.fb.shadows = shafts;
         let ctx = FrameCtx {
             scene,
             bvh,
@@ -8685,7 +9922,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             info: &info,
             tbuf: &tbuf,
             stats: &stats,
-            sun: render::sun_dir(scene),
+            sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
             tcache_cur: None,
             tcache_prev: &[],
             accumulate: true,
@@ -8720,7 +9958,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
         // Save the plain-hybrid and hemi-GI images while their buffers are
         // fresh (frame stays 0, so accum holds exactly the last frame).
-        if hybrid && !hemi_ao && !hemi_gi && !shafts {
+        if hybrid && !hemi_ao && !hemi_gi {
             let mut present = vec![0u32; rw * rh];
             render::resolve(&accum, &info, 1, false, &mut present, rw, rh, rw, rh);
             save_png("check.png", &present, rw, rh);
@@ -8757,7 +9995,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             info: &info,
             tbuf: &tbuf,
             stats: &stats,
-            sun: render::sun_dir(scene),
+            sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
             tcache_cur: None,
             tcache_prev: &[],
             accumulate: true,
@@ -8872,7 +10111,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             info: &info,
             tbuf: &tbuf,
             stats: &stats,
-            sun: render::sun_dir(scene),
+            sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
             tcache_cur: None,
             tcache_prev: &[],
             accumulate: true,
@@ -8953,7 +10193,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             info: &info,
             tbuf: &tbuf,
             stats: &stats,
-            sun: render::sun_dir(scene),
+            sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
             tcache_cur: None,
             tcache_prev: &[],
             accumulate: true,
@@ -9001,7 +10242,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             info: &info,
             tbuf: &tbuf,
             stats: &stats,
-            sun: render::sun_dir(scene),
+            sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
             tcache_cur: Some(&tcache),
             tcache_prev: &[],
             // Produced in lockstep with the claim cache: the T passes below
@@ -9112,7 +10354,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             info: &info,
             tbuf: &tbuf,
             stats: &stats,
-            sun: render::sun_dir(scene),
+            sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
             tcache_cur: None,
             tcache_prev: prev,
             accumulate: true,
@@ -9178,7 +10421,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 info: &info_p,
                 tbuf: &tbuf_p,
                 stats: &stats,
-                sun: render::sun_dir(scene),
+                sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
                 tcache_cur: Some(&tcache_p),
                 tcache_prev: &[],
                 accumulate: true,
@@ -9243,7 +10487,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 info: &info_r,
                 tbuf: &tbuf_r,
                 stats: &stats,
-                sun: render::sun_dir(scene),
+                sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
                 tcache_cur: None,
                 tcache_prev: &[],
                 accumulate: true,
@@ -9294,7 +10539,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 info: bufs.1,
                 tbuf: bufs.2,
                 stats: &stats,
-                sun: render::sun_dir(scene),
+                sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
                 tcache_cur: None,
                 tcache_prev: if fresh { &warm_p[..] } else { &warm_p[..0] },
                 accumulate: true,
@@ -9368,7 +10614,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 info: &info_p,
                 tbuf: &tbuf_p,
                 stats: &stats,
-                sun: render::sun_dir(scene),
+                sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
                 tcache_cur: None,
                 tcache_prev: if warm { &warm_p[..] } else { &warm_p[..0] },
                 accumulate: true,
@@ -9436,7 +10683,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 info: &info,
                 tbuf: &tbuf,
                 stats: &stats,
-                sun: render::sun_dir(scene),
+                sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
                 tcache_cur: Some(&tc_b),
                 tcache_prev: &warm_a,
                 accumulate: true,
@@ -9520,7 +10768,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 info: &info,
                 tbuf: &tbuf,
                 stats: &stats,
-                sun: render::sun_dir(scene),
+                sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
                 tcache_cur: Some(&chain_tc[0]),
                 tcache_prev: &[],
                 accumulate: true,
@@ -9563,7 +10812,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                     info: &info,
                     tbuf: &tbuf,
                     stats: &stats,
-                    sun: render::sun_dir(scene),
+                    sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
                     tcache_cur: Some(&chain_tc[ci]),
                     tcache_prev: &prev_ring,
                     accumulate: true,
@@ -9637,7 +10887,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 info: &info,
                 tbuf: &tbuf,
                 stats: &stats,
-                sun: render::sun_dir(scene),
+                sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
                 tcache_cur: None,
                 tcache_prev: &warm,
                 accumulate: true,
@@ -9713,7 +10964,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 info: bufs.1,
                 tbuf: bufs.2,
                 stats: &stats,
-                sun: render::sun_dir(scene),
+                sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
                 tcache_cur: None,
                 tcache_prev: &[],
                 accumulate: true,
@@ -9767,7 +11019,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 info: &info_a,
                 tbuf: &tbuf_a,
                 stats: &stats,
-                sun: render::sun_dir(scene),
+                sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
                 tcache_cur: None,
                 tcache_prev: &[],
                 accumulate: true,
@@ -9802,20 +11055,36 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
 
     let gates = [
         ("texture", tex_ok),
+        ("height", height_ok),
+        ("tinted-shadow", tinted_ok),
+        ("spray", spray_ok),
+        ("depth-tint", depth_tint_ok),
+        ("sh", sh_ok),
+        ("sky", sky_ok),
+        ("clouds", clouds_ok),
+        ("fireflies", fireflies_ok),
+        ("tod", tod_ok),
+        ("bloom", bloom_ok),
         ("sphcell", sph_ok),
         ("ftree", ftree_ok),
+        ("blas-split", blas_ok),
         ("reproject", reproj_ok),
         ("nppd", nppd_ok),
         ("matclass", matclass_ok),
         ("tangent", tangent_ok),
+        ("ripple", ripple_ok),
         ("upchain", upchain_ok),
+        ("settings", settings_ok),
         ("tone", tone_ok),
         ("gltf", gltf_ok),
         ("bc7", bc7_ok),
+        ("world", world_ok),
+        ("audio", audio_ok),
+        ("quin", quin_ok),
+        ("ngxfg-guides", ngxfg_guides_ok),
         ("hemi-ao", hemi_ok),
         ("hemi-gi", gi_ok),
         ("hemi-share", hemi_share_ok),
-        ("shaft", shaft_ok),
         ("verify", rep.ok()),
         ("wide-tiles", rep_wt.ok()),
         ("spp", spp_ok),
@@ -9836,9 +11105,38 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     }
 }
 
-/// Extract the Win32 HWND from the SDL2 window for swapchain creation.
+/// Build one settings page's rows for the pause menu: the declarative
+/// descriptor (settings::menu_items) rendered against the live session state
+/// + the persisted file. Control tags mirror settings::Control for the
+/// markup's row dispatch.
 #[cfg(windows)]
-fn sdl_hwnd(window: &sdl2::video::Window) -> windows::Win32::Foundation::HWND {
+fn build_menu_rows(
+    cfg: &settings::Settings,
+    live: &settings::LiveView,
+    group: &str,
+) -> Vec<hud::MenuRow> {
+    settings::menu_items()
+        .iter()
+        .filter(|i| i.group == group)
+        .map(|i| hud::MenuRow {
+            id: i.id.to_string(),
+            label: i.label.to_string(),
+            value: settings::menu_value(i, cfg, live),
+            restart: i.tier == settings::Tier::Restart,
+            control: match i.control {
+                settings::Control::Toggle { .. } => "toggle",
+                settings::Control::Cycle { .. } => "cycle",
+                settings::Control::CycleFwd => "cyclefwd",
+                settings::Control::StepU { .. } | settings::Control::StepF { .. } => "step",
+                settings::Control::Text => "text",
+            },
+        })
+        .collect()
+}
+
+/// Extract the Win32 HWND from the SDL window for swapchain creation.
+#[cfg(windows)]
+fn sdl_hwnd(window: &sdl3::video::Window) -> windows::Win32::Foundation::HWND {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     let handle = window.window_handle().expect("window handle").as_raw();
     match handle {
@@ -9889,6 +11187,22 @@ enum GpuUp {
     Xess,
     Fsr4,
     Fsr3,
+    /// --quinlight: several upscalers at once, presented through the
+    /// registered-consensus fuse (gpu/quin.rs). Not a chain level — a
+    /// composition of them.
+    Quin,
+}
+
+/// The live render mode — SPACE cycles it (CPU -> GPU wavefront -> DXR).
+/// Purely cycle arithmetic for the transition block: the stored truth stays
+/// the `gpu_trace`/`dxr_on` pair (never both true), which every arm guard
+/// and Persist site reads directly.
+#[cfg(windows)]
+#[derive(Clone, Copy, PartialEq)]
+enum RMode {
+    Cpu,
+    Gpu,
+    Dxr,
 }
 
 /// A session's exit reason: quit the app, or rebuild everything at a new
@@ -9915,6 +11229,10 @@ struct Persist {
     overlay_on: bool,
     gpu_tonemap: bool,
     bounce_mode: u32,
+    /// Heightfield relief vs normal-mapped (V toggles; `--heightfield` /
+    /// `--no-heightfield` seed it). Mirrored into `bvh::set_height_on` each
+    /// frame — a shading+visibility switch, never a rebuild.
+    height_on: bool,
     preset: u32,
     /// Samples per pixel per frame (U cycles it; --spp seeds it).
     spp: u32,
@@ -9927,6 +11245,10 @@ struct Persist {
     nppd_on: bool,
     xess_nppd: bool,
     dxr_on: bool,
+    /// The live render mode's GPU-wavefront half (SPACE cycles CPU -> GPU ->
+    /// DXR): a resize re-entry resumes the mode the user was IN, not the CLI
+    /// starting mode. Never true together with dxr_on.
+    gpu_on: bool,
     /// The user toggled the DXR / --gpu arm to plain presentation (G/X
     /// inside the arm); the wired upscaler itself is re-derived at re-entry.
     dxr_up_plain: bool,
@@ -9937,20 +11259,168 @@ struct Persist {
     oidn_failed: bool,
     nppd_failed: bool,
     dxr_failed: bool,
+    trace_failed: bool,
     shot: u32,
     depth_est: f32,
+    /// The cloud animation clock (seconds, f64 so long sessions don't lose
+    /// resolution) — carried across resize/F11 re-entries like the camera
+    /// pose: a rebuild is not a weather change.
+    cloud_time: f64,
+    /// The frozen frustum snapshot appended to the scene (Y captures, Z
+    /// clears), if any — its appended vert/tri/material counts, so a
+    /// recapture/clear can truncate the tail. The geometry itself lives in the
+    /// owned `Scene` (mutated in place) and survives resize with it; this is
+    /// the bookkeeping that survives alongside.
+    frust: Option<frustcap::FrustArtifact>,
+}
+
+/// "HH:MM" of a time-of-day hour — the window-title readout (doubles as the
+/// manual-verification signal that a scrub actually landed).
+#[cfg(windows)]
+fn tod_hhmm(h: f32) -> String {
+    let h = h.rem_euclid(24.0);
+    format!("{:02}:{:02}", h as u32, (h.fract() * 60.0) as u32)
+}
+
+/// The title's fps field. The frame loop counts RENDERED frames; frame
+/// generation presents more than that (a generated frame per rendered one),
+/// so an FG session shows both rates — "87 -> ~174 fps (fg x2)" — using the
+/// family's own measured multiplier (`GpuContext::fg_display_mult`). "x1"
+/// means FG is armed but not inserting (holds, unprimed reset frames, a
+/// declined DLSS-G session).
+#[cfg(windows)]
+fn fps_title(fps: f64, fg_mult: Option<u32>) -> String {
+    match fg_mult {
+        Some(m) if m >= 2 => {
+            format!("{fps:.0} -> ~{:.0} fps (fg x{m})", fps * m as f64)
+        }
+        Some(_) => format!("{fps:.0} fps (fg x1)"),
+        None => format!("{fps:.0} fps"),
+    }
+}
+
+/// Fold the PICKED adapter's measured preferences into the defaults the user
+/// left alone. Called once, from `run_window`, right after `GpuContext::new` —
+/// the earliest moment the vendor is a FACT: `--prefer-*` is only a request,
+/// and a box without that vendor silently falls back to the first hardware
+/// adapter, so keying a default off the preference would be keying it off a
+/// guess.
+///
+/// The bar for adding anything here is deliberately high: the choice must be
+/// one whose right answer is a property of the HARDWARE BALANCE rather than of
+/// the scene, must be measured on more than one vendor, and must actually
+/// INVERT between them. A knob that merely wins a bit more on one vendor is a
+/// constant, not a policy — this function is where a wrong entry costs every
+/// user of that vendor silently, so it stays small and each entry carries its
+/// numbers.
+///
+/// Nothing here may override an explicit flag. `mode_explicit` exists for
+/// precisely this: `opts.dxr` defaults ON, so its value cannot answer "did the
+/// user ASK for DXR", and a policy that cannot tell the difference would quietly
+/// countermand the command line.
+#[cfg(windows)]
+fn vendor_defaults(opts: &mut Opts, vendor: gpu::adapter::Vendor) {
+    use gpu::adapter::Vendor;
+
+    // --- starting render mode: DXR pipeline vs compute wavefront ------------
+    //
+    // The shipping default is the DXR DispatchRays pipeline, and that is the
+    // right call on NVIDIA and exactly backwards on Intel. Measured cold-free
+    // (rep 1 discarded, median of 3), `--spin path` 1080p 1-spp, GPU frame span:
+    // ```text
+    //                      wavefront     DXR    DXR/wavefront
+    //   B70  default          1.762     9.061       5.14x
+    //   B70  stress 5000      2.022     5.282       2.61x
+    //   4090 default          2.582     1.383       0.54x
+    //   4090 stress 5000      1.081     0.782       0.72x
+    // ```
+    // The ratio does not merely shrink across vendors, it CROSSES ONE — which
+    // is the whole justification for a vendor-aware default rather than a
+    // better global one. The mechanism is the one the quadtree analysis in
+    // CLAUDE.md already established: Arc's RT cores are weak relative to its
+    // shader cores, so replacing per-pixel RT-core root traversal with a
+    // quadtree that proves space empty and traces no rays there is worth far
+    // more; and it is worth MOST on the default scene, which is mostly sky.
+    //
+    // W2 CAVEAT (2026-07-22): that table is the ALL-TRACERAY pipeline —
+    // --dxr-inline 0. The mode-1 promotion (inline RayQuery secondaries, the
+    // DXR default since W2) moved the DXR column to 2.35/1.64, so the Intel
+    // ratio now STRADDLES 1.0 by scene at spp=1 (default 1.34x, stress
+    // 0.81x, san-miguel-lp 0.94x) — most of the old gap was secondary
+    // TraceRay dispatch, not RT-core weakness. THE WORLD RE-MEASURE (same
+    // day — the debt this paragraph used to record, now paid): interactive
+    // boot-pose sessions on the B70, native 1080p spp=1, --gpu-timing
+    // running means over 6-30k frames, 2 interleaved reps (spread 1-5%; a
+    // live desktop never repeats to the headless loop's ±0.1%):
+    // ```text
+    //                    tracer ms   frame span
+    //   wavefront          4.15        5.21
+    //   DXR --dxr-inline 1 3.80        4.88     (0.92x / 0.94x)
+    //   DXR --dxr-inline 2 3.83        4.92
+    //   DXR --dxr-inline 0 7.28        8.37     (matches the BLAS-era 7.27/8.34)
+    // ```
+    // So at spp=1 the wavefront now LOSES on the flagless scene itself —
+    // and on stress (0.81x) and san-miguel-lp (0.94x) — keeping only the
+    // sky-heavy procedural default scene (1.34x). This entry is
+    // nevertheless KEPT, with its basis narrowed from "wavefront wins
+    // spp=1" to: the ~8% span margin is imperceptible at 5 ms, while the
+    // wavefront owns H/R/C/O and the >=spp-3 regime (the quadtree's
+    // marginal sample is the cheaper one — measured procedural; mode 1's
+    // candidate-loop-fattened chs_shade pays occupancy per sample, and the
+    // world arms cutout, so high spp should read WORSE there, though that
+    // point is unmeasured). Flipping Intel flagless to DXR is a one-line
+    // change if that trade ever reads the other way; make it on these
+    // numbers, not the table above.
+    //
+    // AMD is deliberately absent: this box's only AMD adapter is an iGPU
+    // (~22x slower, useless as a signal), so RDNA has no measurement here and
+    // therefore keeps the cross-vendor default. Do not extend this to a vendor
+    // on inference — measure it or leave it out.
+    //
+    // NOTE the pair this leaves behind: `gpu` AND `dxr` both true. That is not
+    // the contradictory state the argument parser rejects ("--gpu --dxr", where
+    // one flag must win) — `session()` reads the pair as a PREFERENCE ORDER,
+    // trying the wavefront first and taking the DXR arm only `if want_dxr &&
+    // !dxr_failed && !gpu_trace`. So the DXR pipeline stays as the automatic
+    // fallback, which matters: the wavefront additionally carries the software
+    // BVH for its frustum queries, so on a small-VRAM Arc a scene DXR could
+    // hold (THE WORLD is 34.5M tris) may fail to init here — and falling to the
+    // CPU tracer when a working GPU arm existed would be a real regression.
+    // Only reached when the DXR default is actually in force, so the pair is
+    // never manufactured against a user who already opted out (`--oidn` etc.
+    // clear `dxr` at parse time and are left alone).
+    if vendor == Vendor::Intel && !opts.mode_explicit && opts.dxr && !opts.gpu {
+        opts.gpu = true;
+        eprintln!(
+            "gpu: Intel adapter — starting in the compute WAVEFRONT tracer (--dxr starts the \
+             DispatchRays pipeline instead, --cpu the CPU tracer, SPACE cycles all three live)"
+        );
+    }
 }
 
 #[cfg(windows)]
-fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
-    // Opt into per-monitor DPI awareness so Windows doesn't stretch the window
-    // on scaled displays — W×H stays W×H physical pixels, matching the swapchain.
-    sdl2::hint::set("SDL_WINDOWS_DPI_AWARENESS", "permonitorv2");
-    let sdl = sdl2::init().expect("SDL init failed");
+fn run_window(
+    scene: &mut scene::Scene,
+    bvh: &mut bvh::Bvh,
+    opts: &Opts,
+    cam0: Camera,
+    attractors: Vec<flycam::TodAttractor>,
+    file_settings: settings::Settings,
+    cues: audio::Cues,
+) {
+    // SDL3 is per-monitor-v2 DPI aware on Windows unconditionally (SDL2's
+    // SDL_WINDOWS_DPI_AWARENESS hint is gone), so W×H stays W×H physical
+    // pixels, matching the swapchain.
+    // Deliver the click that lands on an unfocused window instead of
+    // swallowing it as an activation click (SDL's default). Standard for
+    // game windows — with a pause menu on screen, the first click back into
+    // the window should press the button it hit, not vanish.
+    sdl3::hint::set("SDL_MOUSE_FOCUS_CLICKTHROUGH", "1");
+    let sdl = sdl3::init().expect("SDL init failed");
     let video = sdl.video().expect("SDL video failed");
     let mut window = video
         .window(
-            "frustracer — R: hybrid/plain  T: dynamic-res  O: overlay  B: gpu-tonemap  G: dlss  X: xess  N: oidn  H: hemi-bounce  1-3: quality  C: verify  P: screenshot",
+            "frustracer — SPACE: cpu/gpu/dxr  R: hybrid/plain  T: dynamic-res  O: overlay  B: gpu-tonemap  G: dlss  X: xess  N: oidn  H: hemi-bounce  1-3: quality  C: verify  P: screenshot  F1: hud",
             W as u32,
             H as u32,
         )
@@ -9966,16 +11436,51 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
         xess_dir: opts.xess_path.clone(),
         xess_autoexposure: opts.xess_autoexposure,
         ffx_dir: opts.ffx_path.clone(),
+        fg: opts.fg,
+        fg_explicit: opts.fg_explicit,
+        fg_dir: opts.fg_path.clone(),
         fsr_tune: opts.fsr_tune,
         prefer: opts.prefer,
         debug: opts.gpu_debug,
         vsync: opts.vsync,
         hdr: opts.hdr,
+        hdr10: opts.hdr10,
         paper_white: opts.hdr_paper_white,
         peak_nits: opts.hdr_peak,
+        quin: opts.quin,
+        quin_anchor: opts.quin_anchor,
     };
     let mut gpu = gpu::GpuContext::new(sdl_hwnd(&window), W as u32, H as u32, &gopts)
         .expect("GPU init failed");
+    // The Slint HUD lives at run_window scope like `fly` — one per process
+    // (set_platform is once), surviving session re-entries so menu/HUD state
+    // needs no Persist mirror. Initial visibility from the settings file
+    // (display.hud), default on. A failed init disables the HUD loudly and
+    // the session runs without it — the SDK-fallback shape.
+    let mut hud = match hud::Hud::new(
+        W as u32,
+        H as u32,
+        file_settings.display.hud.unwrap_or(true),
+    ) {
+        Ok(h) => Some(h),
+        Err(e) => {
+            eprintln!("hud: disabled — {e}");
+            None
+        }
+    };
+    // The pause menu owns the settings from here: menu edits mutate + save
+    // this struct (auto-save on change); the pre-parse apply in main()
+    // already consumed the startup values.
+    let mut cfg = file_settings;
+    // The adapter is only now a fact rather than a preference, so this is the
+    // first point a hardware-keyed default can be honest. Everything downstream
+    // reads the adjusted copy; `opts` shadows the parameter so no site can
+    // accidentally consult the pre-policy values.
+    let opts = &{
+        let mut o = opts.clone();
+        vendor_defaults(&mut o, gpu.adapter_vendor);
+        o
+    };
     // --fsr4: the FSR4 + Ray Regeneration level is a requirement, so the chain
     // falling through it is fatal here rather than a quiet downgrade. Checked
     // against the session's ACTUAL wiring (the probe already printed its own
@@ -10000,8 +11505,22 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     // FRAME must integrate (the whole point), but a rebuild presents nothing,
     // and flying through a seconds-long BLAS build with W held is flying
     // blind.
-    let fly =
-        flycam::FlyCam::spawn(sdl_hwnd(&window).0 as isize, cam0, scene.diag);
+    // TOD seeds from --tod or the default sun's own derived hour; the thread
+    // owns it across sessions like the pose, so a scrub survives resizes.
+    let fly = flycam::FlyCam::spawn(
+        sdl_hwnd(&window).0 as isize,
+        cam0,
+        opts.tod.unwrap_or_else(scene::default_tod),
+        scene.diag,
+        attractors,
+    );
+    // Audio lives here beside the FlyCam for the same reason: a resize
+    // re-enters session(), and the loops must keep playing through the
+    // rebuild. The wind reads the integrator's 500 Hz speed atomic, so it
+    // stays responsive while the main thread is blocked in a trace (and
+    // decays to silence across a pause, since the integrator parks it at 0).
+    let audio_sys =
+        if opts.audio { audio::AudioSys::new(&sdl, cues, fly.speed_handle(), scene.diag) } else { None };
 
     // A window resize exits the session and re-enters it at the new client
     // size: the session init code IS the rebuild path (every buffer,
@@ -10013,8 +11532,10 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
     let (mut w, mut h) = (W, H);
     let mut persist: Option<Persist> = None;
     loop {
-        match session(scene, bvh, opts, &fly, &mut window, &mut inp, &mut gpu, &mut persist, w, h)
-        {
+        match session(
+            scene, bvh, opts, &fly, audio_sys.as_ref(), &mut window, &mut inp, &mut gpu,
+            &mut hud, &mut cfg, &mut persist, w, h,
+        ) {
             SessionEnd::Quit => break,
             SessionEnd::Resize(nw, nh) => {
                 // No frames from here until the next session's loop starts.
@@ -10022,6 +11543,11 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
                 if let Err(e) = gpu.resize_output(nw, nh, &gopts) {
                     eprintln!("resize: rebuild at {nw}x{nh} failed ({e}); exiting");
                     break;
+                }
+                if let Some(hd) = hud.as_mut() {
+                    // New Slint buffer + forced full-window dirty: the GPU
+                    // overlay texture was just rebuilt undefined.
+                    hd.set_size(nw, nh);
                 }
                 (w, h) = (nw as usize, nh as usize);
                 eprintln!("window: resized to {nw}x{nh}");
@@ -10044,13 +11570,16 @@ fn run_window(scene: &scene::Scene, bvh: &bvh::Bvh, opts: &Opts, cam0: Camera) {
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 fn session(
-    scene: &scene::Scene,
-    bvh: &bvh::Bvh,
+    scene: &mut scene::Scene,
+    bvh: &mut bvh::Bvh,
     opts: &Opts,
     fly: &flycam::FlyCam,
-    window: &mut sdl2::video::Window,
+    audio_sys: Option<&audio::AudioSys>,
+    window: &mut sdl3::video::Window,
     inp: &mut input::Input,
     gpu: &mut gpu::GpuContext,
+    hud: &mut Option<hud::Hud>,
+    cfg: &mut settings::Settings,
     persist: &mut Option<Persist>,
     w: usize,
     h: usize,
@@ -10066,12 +11595,17 @@ fn session(
 
     // The integrator thread owns the pose (it kept flying through any resize
     // rebuild); the session works exclusively on per-iteration snapshots.
-    let mut cam = fly.snapshot();
+    // TOD likewise: `cur_tod` tracks the hour the scene's lighting was last
+    // derived for. On re-entry after a mid-scrub resize the thread's tod and
+    // the (already-mutated) scene agree, so no spurious re-derive fires.
+    let snap0 = fly.snapshot();
+    let mut cam = snap0.cam;
     let mut prev_snap = cam;
+    let mut cur_tod = snap0.tod;
     let accum: Vec<AtomicU32> = (0..w * h * 3).map(|_| AtomicU32::new(0)).collect();
     let info: Vec<AtomicU32> = (0..w * h).map(|_| AtomicU32::new(0)).collect();
     let tbuf: Vec<AtomicU32> = (0..w * h).map(|_| AtomicU32::new(0)).collect();
-    let mut present = CpuPresent::new(w, h, gpu.is_hdr(), gpu.tone());
+    let mut present = CpuPresent::new(w, h, gpu.encoding(), gpu.tone());
     let stats = Stats::default();
     // Temporal claim ring + lockstep cut stores: see TemporalRing. Half-res
     // and plain frames don't participate and drop the ring — a cache from
@@ -10084,6 +11618,11 @@ fn session(
     let replay_cache = replay::ReplayCache::new(w, h);
     let mut replay_key: Option<(camera::CamBasis, (usize, usize))> = None;
 
+    // Frozen frustum snapshot (Y captures, Z clears). The geometry already
+    // lives in the owned `Scene` across a resize re-entry; this local tracks
+    // how much of the tail is artifact so a recapture/clear can truncate it.
+    let mut frust: Option<frustcap::FrustArtifact> = p0.and_then(|p| p.frust);
+
     let mut frame: u32 = 0;
     let mut hybrid = p0.map_or(true, |p| p.hybrid);
     let mut dynamic = p0.map_or(true, |p| p.dynamic);
@@ -10091,8 +11630,23 @@ fn session(
     let mut gpu_tonemap = p0.map_or(false, |p| p.gpu_tonemap);
     // Hemisphere frustum bounces (H cycles off → AO → GI): still-frame
     // quality — moving/DLSS frames keep the sampled path.
-    let mut bounce_mode = p0.map_or(0u32, |p| p.bounce_mode);
-    let mut preset = p0.map_or(2u32, |p| p.preset);
+    let mut bounce_mode = p0.map_or_else(
+        // First entry: the settings file's saved bounce (no CLI flag exists);
+        // re-entries restore the live state like every other toggle.
+        || cfg.renderer.bounce.as_deref().and_then(settings::parse_bounce).unwrap_or(0),
+        |p| p.bounce_mode,
+    );
+    // Heightfield relief vs normal-mapped (V; starts OFF — plain
+    // normal-mapping is the default mode — unless --heightfield opted in).
+    // Seeded from the flag-state static (height_on(), NOT height_armed():
+    // armed stays true by default so V can enable relief live). The static
+    // the intersector reads is stored here and at every V edge.
+    let mut height_on = p0.map_or(bvh::height_on(), |p| p.height_on);
+    bvh::set_height_on(height_on);
+    let mut preset = p0.map_or_else(
+        || cfg.renderer.preset.filter(|n| (1..=3).contains(n)).unwrap_or(2),
+        |p| p.preset,
+    );
     // Samples per pixel per frame (--spp seeds it, U cycles). Every mode reads
     // it; FrameCtx::spp()/the GPU kernels pin it to 1 on fb (H) frames.
     let mut spp = p0.map_or(opts.spp, |p| p.spp);
@@ -10330,33 +11884,44 @@ fn session(
     // renderer with the reason on stderr. With Streamline live the tracer's
     // whole workload (ExecuteIndirect + DXR + AS builds) executes on the SL
     // PROXY queue — validated in M7.
-    let mut gpu_up = GpuUp::Plain;
+    // Session sub-mode + locked trace res — computed UNCONDITIONALLY (the
+    // dxw/dxh pattern below): the SPACE mode cycle can lazily build the
+    // wavefront tracer in a session that started CPU or DXR, and the lazy
+    // init must build at exactly the res/wiring the eager one would have.
+    // `--lock-res dynamic` can't be honored here (no DRS on the GPU path):
+    // lock at the mode default; the note prints where GPU mode is entered.
+    let gpu_lock = opts.gpu_lock_scale.unwrap_or(1.0);
+    let gpu_lock_note = opts.gpu_lock_scale.is_none() && (dlss_on || xess_on || fsr_on);
+    // --quinlight wins over any single level: the fuse IS the presentation,
+    // and every wired engine feeds it. The frame is traced ONCE, so the res
+    // must be legal for all of them at once — hence the intersected range.
+    let (gpu_wired_up, (grw, grh)) = if gpu.quin_planned() {
+        (GpuUp::Quin, locked_render_res(gpu_lock, gpu.quin_res_range(), (w, h), (w, h), true))
+    } else if dlss_on {
+        // Degenerate range: the SDK optimal/DLAA res.
+        (GpuUp::Rr, locked_render_res(gpu_lock, dlss_range, (w, h), (drw, drh), false))
+    } else if xess_on {
+        (GpuUp::Xess, locked_render_res(gpu_lock, xess_range, (w, h), (w, h), true))
+    } else if fsr_on {
+        // Both FSR chain levels compose on-GPU: FSR4-RR via the
+        // nine-plane feed, FSR3 via the XeSS trio.
+        let kind = match gpu.fsr_flavor() {
+            Some(fsr::Flavor::Fsr4Rr) => GpuUp::Fsr4,
+            _ => GpuUp::Fsr3,
+        };
+        (kind, locked_render_res(gpu_lock, fsr_range, (w, h), (w, h), true))
+    } else {
+        (GpuUp::Plain, (w, h))
+    };
+    let mut gpu_up = gpu_wired_up;
     let mut gpu_trace = false;
-    let (mut grw, mut grh) = (w, h);
-    if opts.gpu {
-        // Session sub-mode + locked trace res. `--lock-res dynamic` can't be
-        // honored here (no DRS on the GPU path): lock at the mode default.
-        let lock = opts.gpu_lock_scale.unwrap_or_else(|| {
-            if dlss_on || xess_on || fsr_on {
-                eprintln!("gpu: dynamic render res is unsupported under --gpu; locking at native (100%)");
-            }
-            1.0
-        });
-        if dlss_on {
-            gpu_up = GpuUp::Rr;
-            // Degenerate range: the SDK optimal/DLAA res.
-            (grw, grh) = locked_render_res(lock, dlss_range, (w, h), (drw, drh), false);
-        } else if xess_on {
-            gpu_up = GpuUp::Xess;
-            (grw, grh) = locked_render_res(lock, xess_range, (w, h), (w, h), true);
-        } else if fsr_on {
-            // Both FSR chain levels compose on-GPU: FSR4-RR via the
-            // nine-plane feed, FSR3 via the XeSS trio.
-            gpu_up = match gpu.fsr_flavor() {
-                Some(fsr::Flavor::Fsr4Rr) => GpuUp::Fsr4,
-                _ => GpuUp::Fsr3,
-            };
-            (grw, grh) = locked_render_res(lock, fsr_range, (w, h), (w, h), true);
+    let mut trace_failed = p0.map_or(false, |p| p.trace_failed);
+    // The mode the session STARTS in: the CLI flag on a fresh run, the mode
+    // the user was cycled into on a resize re-entry.
+    let want_gpu = p0.map_or(opts.gpu, |p| p.gpu_on);
+    if want_gpu && !trace_failed {
+        if gpu_lock_note {
+            eprintln!("gpu: dynamic render res is unsupported under --gpu; locking at native (100%)");
         }
         gpu_trace = match gpu::dxc::Dxc::load(&opts.dxc_path).and_then(|dxc| {
             gpu.init_trace(
@@ -10365,8 +11930,8 @@ fn session(
                 bvh,
                 grw as u32,
                 grh as u32,
-                gpu_up != GpuUp::Plain,
-                (gpu_up == GpuUp::Xess && opts.nppd)
+                gpu_wired_up != GpuUp::Plain,
+                (gpu_wired_up == GpuUp::Xess && opts.nppd)
                     .then_some((opts.nppd_path.as_str(), opts.nppd_model.as_str())),
                 opts.gpu_debug,
                 opts.bc7,
@@ -10381,14 +11946,17 @@ fn session(
                         GpuUp::Xess => format!(" -> XeSS-SR {w}x{h}"),
                         GpuUp::Fsr4 => format!(" -> FSR4-RR {w}x{h}"),
                         GpuUp::Fsr3 => format!(" -> FSR3 {w}x{h}"),
+                        // The engine list + anchor already printed from
+                        // build_quin, which is where the fuse learns them.
+                        GpuUp::Quin => format!(" -> quinlight fuse {w}x{h}"),
                     }
                 );
                 true
             }
             Err(e) => {
                 eprintln!("gpu: falling back to CPU tracing — {e}");
+                trace_failed = true;
                 gpu_up = GpuUp::Plain;
-                (grw, grh) = (w, h);
                 false
             }
         };
@@ -10403,17 +11971,26 @@ fn session(
     let mut gpu_up_idx: u32 = 0;
     let mut gpu_prev_cam: Option<Camera> = None;
     let mut gpu_reset = true;
-    // Whether this session wired an upscaler feed at init (the G/X/K toggles
-    // can only move between Plain and a WIRED upscaler — wiring is
-    // init-time).
-    let gpu_xess_avail = gpu_trace && gpu_up == GpuUp::Xess;
-    let gpu_rr_avail = gpu_trace && gpu_up == GpuUp::Rr;
+    // Whether this session WIRED an upscaler feed (the G/X/K toggles can
+    // only move between Plain and a WIRED upscaler). Wiring facts of the
+    // SESSION, not "the tracer is built" — the dxr_*_avail convention — so a
+    // lazily built (SPACE) wavefront arm gets the same sub-mode ladder the
+    // eager one would.
+    let gpu_xess_avail = gpu_wired_up == GpuUp::Xess;
+    let gpu_rr_avail = gpu_wired_up == GpuUp::Rr;
+    // --quinlight: the FUSE is this session's upscaler. G/X/K all toggle IT
+    // against plain — there is no single engine to switch to, since the engines
+    // exist only as fuse inputs (switching to one would strand the session: no
+    // key restores the fuse).
+    let gpu_quin_avail = gpu_wired_up == GpuUp::Quin;
     // The wired FSR kind (captured before the plain-toggle restore below —
     // the K toggle moves between Plain and exactly this).
-    let gpu_fsr_kind = (gpu_trace && matches!(gpu_up, GpuUp::Fsr4 | GpuUp::Fsr3)).then_some(gpu_up);
+    let gpu_fsr_kind = matches!(gpu_wired_up, GpuUp::Fsr4 | GpuUp::Fsr3).then_some(gpu_wired_up);
     // GPU-resident NPPD (wired at init in --gpu --nppd XeSS sessions; J
     // toggles the pre-upscale slot, mirroring the CPU xess_nppd contract).
-    let gpu_nppd_avail = gpu_trace && gpu.nppd_gpu_ready();
+    // Only the EAGER init wires it, so this stays false in a session that
+    // cycles into a lazily built wavefront arm.
+    let gpu_nppd_avail = gpu.nppd_gpu_ready();
     let mut gpu_nppd_on = p0.map_or(gpu_nppd_avail, |p| p.gpu_nppd_on && gpu_nppd_avail);
     if gpu_nppd_avail {
         eprintln!("gpu: NPPD pre-upscale denoise ON (J toggles)");
@@ -10682,8 +12259,13 @@ fn session(
     // build the pipeline at the same res. The scale is the GPU-mode one
     // (native by default); `--lock-res dynamic` can't be honored here, so it
     // falls back to that same default.
+    let dxr_quin_avail = gpu.quin_planned();
     let dxr_lock = opts.gpu_lock_scale.unwrap_or(1.0);
-    let (dxw, dxh) = if dxr_rr_avail {
+    let (dxw, dxh) = if dxr_quin_avail {
+        // One trace feeds every engine, so the res must sit inside ALL their
+        // ranges (the --gpu quinlight rule).
+        locked_render_res(dxr_lock, gpu.quin_res_range(), (w, h), (w, h), true)
+    } else if dxr_rr_avail {
         locked_render_res(dxr_lock, dlss_range, (w, h), (drw, drh), false)
     } else if dxr_xess_avail {
         locked_render_res(dxr_lock, xess_range, (w, h), (w, h), true)
@@ -10701,7 +12283,8 @@ fn session(
     let mut dxr_prev_cam: Option<Camera> = None;
     let mut dxr_reset = true;
     if want_dxr && !dxr_failed && !gpu_trace {
-        let compose = dxr_rr_avail || dxr_xess_avail || dxr_fsr3_avail || dxr_fsr4_avail;
+        let compose =
+            dxr_quin_avail || dxr_rr_avail || dxr_xess_avail || dxr_fsr3_avail || dxr_fsr4_avail;
         if compose && opts.gpu_lock_scale.is_none() {
             eprintln!("dxr: dynamic render res is unsupported on the DXR pipeline; locking at native (100%)");
         }
@@ -10710,7 +12293,10 @@ fn session(
         }) {
             Ok(()) => {
                 dxr_on = true;
-                dxr_up = if dxr_rr_avail {
+                // The fuse wins over any single level — it consumes them all.
+                dxr_up = if dxr_quin_avail {
+                    GpuUp::Quin
+                } else if dxr_rr_avail {
                     GpuUp::Rr
                 } else if dxr_xess_avail {
                     GpuUp::Xess
@@ -10745,6 +12331,7 @@ fn session(
                         GpuUp::Xess => format!(" -> XeSS-SR {w}x{h} (X toggles plain)"),
                         GpuUp::Fsr4 => format!(" -> FSR4-RR {w}x{h} (K toggles plain)"),
                         GpuUp::Fsr3 => format!(" -> FSR3 {w}x{h} (K toggles plain)"),
+                        GpuUp::Quin => format!(" -> quinlight fuse {w}x{h}"),
                         GpuUp::Plain => String::new(),
                     }
                 );
@@ -10757,7 +12344,7 @@ fn session(
     }
     let mut prev_budget = false;
     // Depth cap that fully resolves the screen (tiles reach LEAF_TILE): 7 at 1024.
-    let depth_full: f32 = ((w.max(h) as f32) / render::LEAF_TILE as f32).log2().ceil();
+    let depth_full: f32 = ((w.max(h) as f32) / render::leaf_tile() as f32).log2().ceil();
     // Fractional depth-cap estimate for budget frames. Mid-range prior: one
     // slightly-coarse first frame beats a hitch. Deliberately not reset when
     // the camera stops — the last value is the best prior for the same
@@ -10765,6 +12352,12 @@ fn session(
     // A resize re-entry keeps the last estimate — cost scales with area,
     // but the controller corrects within a frame either way.
     let mut depth_est: f32 = p0.map_or(4.0, |p| p.depth_est);
+    // The cloud clock. Advanced by the last frame's measured render time at
+    // each arm's fresh-frame predicate (upscaler/denoiser frames always;
+    // plain accumulation only at frame 0, so a converging still frame keeps
+    // integrating ONE sky). No wall clock is read in the renderer — this is
+    // main.rs's clock, like depth_est's.
+    let mut cloud_time: f64 = p0.map_or(0.0, |p| p.cloud_time);
     let mut last_title = Instant::now();
     let mut last_stats = Instant::now();
     // Presented-frames-per-second, recomputed once per second (frame ms in
@@ -10788,24 +12381,29 @@ fn session(
     // line — kernel compile, scene upload, BLAS build — presented nothing.
     // No baseline re-sync is needed: a paused span integrates nothing, so the
     // pose `prev_snap` captured at init is still the shared camera's pose.
-    fly.resume();
+    // EXCEPT under an open pause menu (a resize/F11 re-entry can happen with
+    // the menu up): the menu owns the pause until it closes.
+    if hud.as_ref().is_none_or(|hd| !hd.menu_open()) {
+        fly.resume();
+    }
+    // Settings rows need (re)building: menu open, group/page change, or an
+    // edit whose live effect lands a frame later (rebuild after handlers ran).
+    let mut menu_rows_stale = true;
 
     let end = loop {
         let now = Instant::now();
 
-        let edges = inp.poll();
-        if edges.quit {
-            break SessionEnd::Quit;
-        }
+        // Menu OPEN routes events to Slint (toggle keys can't fire); the
+        // quit check moves BELOW the menu drain so the menu's Exit button
+        // (which arrives as a drained action) breaks the same way.
+        let mut edges = inp.poll(hud.as_ref().filter(|hd| hd.menu_open()));
         if edges.toggle_fullscreen {
-            // Borderless desktop fullscreen (F11) — the resulting
-            // SizeChanged flows through the same debounce below.
-            let to = if window.fullscreen_state() == sdl2::video::FullscreenType::Off {
-                sdl2::video::FullscreenType::Desktop
-            } else {
-                sdl2::video::FullscreenType::Off
-            };
-            if let Err(e) = window.set_fullscreen(to) {
+            // Borderless desktop fullscreen (F11) — SDL3's set_fullscreen is
+            // a bool, and fullscreen with no exclusive mode set IS borderless
+            // desktop. The resulting size event flows through the same
+            // debounce below.
+            let on = window.fullscreen_state() == sdl3::video::FullscreenType::Off;
+            if let Err(e) = window.set_fullscreen(on) {
                 eprintln!("fullscreen: {e}");
             }
         }
@@ -10815,23 +12413,582 @@ fn session(
         if let Some(t0) = pending_resize {
             if (now - t0).as_millis() >= RESIZE_SETTLE_MS {
                 pending_resize = None;
-                // drawable_size at settle time is authoritative (physical
-                // pixels — the permonitorv2 DPI hint makes logical equal
-                // physical).
-                let (dw, dh) = window.drawable_size();
+                // size_in_pixels at settle time is authoritative (physical
+                // pixels — SDL3 is per-monitor DPI aware by default).
+                let (dw, dh) = window.size_in_pixels();
                 if dw > 0 && dh > 0 && (dw as usize, dh as usize) != (w, h) {
                     break SessionEnd::Resize(dw, dh);
                 }
             }
+        }
+        // ── Pause menu (ESC): state machine + settings-row plumbing. Live
+        // rows apply through SYNTHESIZED Edges fields (the exact key-handler
+        // paths below — reset semantics cannot drift); restart rows edit the
+        // settings file only. Every menu edit auto-saves; keyboard toggles
+        // deliberately never persist. Opening pauses the flycam (it reads
+        // raw OS key state — typing in a text field must not fly the
+        // camera); closing resumes it.
+        let mut menu_live_edit = false;
+        if let Some(hd) = hud.as_mut() {
+            if edges.esc {
+                if hd.menu_open() {
+                    if !hd.escape() {
+                        hd.close_menu();
+                        fly.resume();
+                        window.subsystem().text_input().stop(window);
+                    }
+                } else {
+                    hd.open_menu();
+                    menu_rows_stale = true;
+                    fly.pause();
+                    // Printable characters reach Slint via SDL TextInput.
+                    window.subsystem().text_input().start(window);
+                }
+            }
+            // Live state snapshot for row display + adjust baselines.
+            let live = settings::LiveView {
+                mode: if gpu_trace { 1 } else if dxr_on { 2 } else { 0 },
+                hybrid,
+                dynamic,
+                overlay: overlay_on,
+                gpu_tone: gpu_tonemap,
+                preset,
+                spp,
+                bounce: bounce_mode,
+                height_armed: bvh::height_armed(),
+                height_on,
+                dlss: dlss_on
+                    || (gpu_trace && gpu_up == GpuUp::Rr)
+                    || (dxr_on && dxr_up == GpuUp::Rr),
+                xess: xess_on
+                    || (gpu_trace && gpu_up == GpuUp::Xess)
+                    || (dxr_on && dxr_up == GpuUp::Xess),
+                fsr: fsr_on
+                    || (gpu_trace && matches!(gpu_up, GpuUp::Fsr4 | GpuUp::Fsr3))
+                    || (dxr_on && matches!(dxr_up, GpuUp::Fsr4 | GpuUp::Fsr3)),
+                oidn: if oidn_on || xess_oidn == XessOidn::Pre {
+                    1
+                } else if xess_oidn == XessOidn::Post {
+                    2
+                } else {
+                    0
+                },
+                oidn_temporal,
+                nppd: nppd_on || xess_nppd,
+                tod: cur_tod,
+                hud: hd.visible(),
+                bloom: bloom::enabled(),
+                clouds: clouds::enabled(),
+                fireflies: fireflies::enabled(),
+                fireflies_count: fireflies::count(),
+            };
+            if hd.menu_open() && menu_rows_stale {
+                menu_rows_stale = false;
+                let group = hd.group().to_string();
+                hd.set_rows(build_menu_rows(cfg, &live, &group));
+            }
+            for act in hd.take_actions() {
+                match act {
+                    hud::HudAction::Resume => {
+                        hd.close_menu();
+                        fly.resume();
+                        window.subsystem().text_input().stop(window);
+                    }
+                    hud::HudAction::Quit => edges.quit = true,
+                    hud::HudAction::OpenSettings => {
+                        hd.open_settings_page();
+                        menu_rows_stale = true;
+                    }
+                    hud::HudAction::Back => hd.back_to_main(),
+                    hud::HudAction::Group(g) => {
+                        hd.set_group(&g);
+                        menu_rows_stale = true;
+                    }
+                    hud::HudAction::Adjust(id, dir) => {
+                        if let Some(item) = settings::item_by_id(&id) {
+                            match settings::menu_adjust(item, dir, cfg, &live) {
+                                settings::MenuFx::Restart => {
+                                    eprintln!("settings: '{id}' saved — applies on next launch");
+                                }
+                                settings::MenuFx::CycleMode => edges.cycle_mode = true,
+                                settings::MenuFx::ToggleHybrid => edges.toggle_hybrid = true,
+                                settings::MenuFx::ToggleDynamic => edges.toggle_dynamic = true,
+                                settings::MenuFx::ToggleOverlay => edges.toggle_overlay = true,
+                                settings::MenuFx::ToggleGpuTone => edges.toggle_gpu_tone = true,
+                                settings::MenuFx::ToggleDlss => edges.toggle_dlss = true,
+                                settings::MenuFx::ToggleXess => edges.toggle_xess = true,
+                                settings::MenuFx::ToggleFsr => edges.toggle_fsr = true,
+                                settings::MenuFx::ToggleOidn => edges.toggle_oidn = true,
+                                settings::MenuFx::ToggleOidnTemporal => {
+                                    edges.toggle_temporal = true
+                                }
+                                settings::MenuFx::ToggleNppd => edges.toggle_nppd = true,
+                                settings::MenuFx::ToggleBounce => edges.toggle_bounce = true,
+                                settings::MenuFx::ToggleHeight => edges.toggle_height = true,
+                                settings::MenuFx::CycleSpp => edges.cycle_spp = true,
+                                settings::MenuFx::Quality(n) => edges.quality = Some(n),
+                                settings::MenuFx::SetTod(t) => fly.set_tod(t),
+                                settings::MenuFx::ToggleBloom => {
+                                    // Display-stage — deliberately NO reset
+                                    // (the --no-bloom bit-identity argument).
+                                    bloom::set_enabled(!bloom::enabled());
+                                }
+                                settings::MenuFx::ToggleClouds => {
+                                    // Shading change: plain accumulation only,
+                                    // histories kept (the TOD-scrub precedent).
+                                    clouds::set_enabled(!clouds::enabled());
+                                    frame = 0;
+                                }
+                                settings::MenuFx::ToggleFireflies => {
+                                    fireflies::set_enabled(!fireflies::enabled());
+                                    frame = 0;
+                                }
+                                settings::MenuFx::FirefliesCount(n) => {
+                                    fireflies::set_count(n);
+                                    frame = 0;
+                                }
+                                settings::MenuFx::ToggleHud => edges.toggle_hud = true,
+                                settings::MenuFx::None => {}
+                            }
+                            settings::save(cfg);
+                            menu_rows_stale = true;
+                            menu_live_edit = true;
+                        }
+                    }
+                    hud::HudAction::TextEdit(id, v) => {
+                        if let Some(item) = settings::item_by_id(&id) {
+                            if matches!(
+                                settings::menu_text_edit(item, &v, cfg),
+                                settings::MenuFx::Restart
+                            ) {
+                                eprintln!("settings: '{id}' saved — applies on next launch");
+                                settings::save(cfg);
+                                menu_rows_stale = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if edges.quit {
+            break SessionEnd::Quit;
+        }
+        // ESC with no HUD (Slint init failed): the menu can't exist, so keep
+        // the historical quit semantics rather than a dead key.
+        if edges.esc && hud.is_none() {
+            break SessionEnd::Quit;
         }
         // One pose snapshot per iteration: everything this frame does (trace,
         // MVs, prev-camera captures, verify) reads this copy, so trace pose ==
         // MV pose == prev-capture pose even while the integrator keeps
         // flying. `moved` = the integrator wrote between frames (bit compare;
         // taps shorter than a frame land as exactly one moved frame).
-        cam = fly.snapshot();
+        let snap = fly.snapshot();
+        cam = snap.cam;
+        // Ambience crossfade from the frame's ONE pose snapshot (N atomic
+        // stores; the mixer smooths). Wind rides the flycam atomic directly.
+        if let Some(a) = audio_sys {
+            a.update(cam.pos);
+        }
         let moved = cam != prev_snap;
         prev_snap = cam;
+
+        // Time-of-day scrub (`,`/`.`, D-pad L/R). A TOD delta is a SHADING
+        // change, not camera motion: re-derive the sun/moon + SH ambient
+        // (scene::apply_tod), push the new rows into the GPU pipelines'
+        // cached base CBs, and reset plain ACCUMULATION (frame = 0 — a
+        // converged still frame must not keep stale lighting). Deliberately
+        // KEPT: every upscaler/denoiser history (RR/FSR/XeSS/OIDN/NPPD) — a
+        // held scrub fires this block EVERY frame, so a per-tick history
+        // reset left RR reconstructing 1-spp frames with zero temporal
+        // context for the whole scrub, and its spatial prior smeared the
+        // night-sky star field into drifting cloud-shaped blotches (worst on
+        // the CPU arm's 66% lock-res input). The scrub is rate-limited
+        // (1 h/s ⇒ ~seconds of sky per frame), so lighting drift is the
+        // cloud/firefly precedent: a shading change the temporal integrators
+        // absorb, never a discontinuity. Also KEPT: the temporal frustum
+        // cache, claim ring, and structure replay — geometry-only claims;
+        // replay re-shades from the fresh ctx. An idle session never enters
+        // this block (bit compare of an unwritten tod), which is the
+        // untouched-session bit-identity guard.
+        let sun_moved = snap.tod != cur_tod;
+        if sun_moved {
+            cur_tod = snap.tod;
+            scene::apply_tod(scene, cur_tod);
+            gpu.refresh_sky(scene);
+            frame = 0;
+        }
+        // ── HUD overlay (compass / clock / motion-gated keymap). Purely
+        // display-stage: Slint software-renders into its persistent CPU
+        // buffer, only the DIRTY RECTS are staged for upload, and the
+        // composite draw rides fullscreen_to_backbuffer in EVERY present arm
+        // below — no render/accum/temporal state is touched, so F1 needs no
+        // reset of any kind. An unchanged HUD stages nothing (zero raster,
+        // zero bytes); staging continues while hidden so re-showing needs no
+        // special case.
+        if let Some(hd) = hud.as_mut() {
+            if edges.toggle_hud {
+                hd.set_visible(!hd.visible());
+                eprintln!("hud: {} (F1 toggles)", if hd.visible() { "ON" } else { "OFF" });
+            }
+            // Mode label: derived from the stored truth (the gpu_trace/dxr_on
+            // pair — never both). The SPACE/F transition block runs LATER
+            // this iteration, so a mode-switch frame shows the old label for
+            // exactly one (pipeline-compile-stall) frame — invisible. last_ms
+            // is the PREVIOUS frame's render time (0.0 before the first
+            // present), which is exactly the sample the FPS graph wants; the
+            // FG multiplier is the same family-measured value the title bar
+            // shows, read at the same previous-frame cadence.
+            let mode_label: &'static str =
+                if gpu_trace { "GPU" } else if dxr_on { "DXR" } else { "CPU" };
+            let fg_mult = gpu.fg_display_mult().unwrap_or(1) as f32;
+            if let Some(hf) = hd.frame(
+                &cam,
+                cur_tod,
+                moved,
+                sun_moved,
+                mode_label,
+                last_ms as f32,
+                fg_mult,
+            ) {
+                gpu.hud_stage(hf);
+            }
+            gpu.set_hud_visible(hd.visible() || hd.menu_open());
+        }
+        // ── Pause-menu hold: while the menu is open, skip tracing/upscaler
+        // evaluation entirely and re-present the last frame + the overlay at
+        // fast cadence — the menu repaints at ~140 Hz instead of the trace
+        // cadence, and "pause" genuinely pauses (no history advances, no
+        // accumulation, camera frozen by the flycam pause). Falls through to
+        // a normal frame when: a live menu edit needs its key handler to run
+        // (the user then SEES the setting change behind the menu), the TOD
+        // was just set (apply_tod + one real frame), nothing was ever
+        // presented, or the re-present source was dropped.
+        if hud.as_ref().is_some_and(|hd| hd.menu_open()) && !menu_live_edit && !sun_moved {
+            match gpu.present_again() {
+                Ok(()) => {
+                    std::thread::sleep(std::time::Duration::from_millis(7));
+                    continue;
+                }
+                Err(_) => {
+                    // First-open before any present, or the source was
+                    // dropped: fall through to a normal frame — and since a
+                    // failed attempt may have consumed staged dirty rects,
+                    // re-upload everything next frame.
+                    if let Some(hd) = hud.as_mut() {
+                        hd.request_full_redraw();
+                    }
+                }
+            }
+        }
+        // ── Frozen frustum snapshot (Y captures / replaces, Z clears).
+        // Freeze the current view's terminal quadtree as emissive near-plane
+        // quads (one per leaf tile, at its inherited t_start, colored by
+        // depth) so the user can fly around and see the projected tile
+        // frustums as real geometry. Runs BEFORE the scene reborrow below
+        // (it needs &mut scene/bvh) and before the render-mode split, so it
+        // fires in every mode. A capture/clear is a scene GEOMETRY change:
+        // it invalidates every static-scene claim (temporal ring, structure
+        // replay) and the resident GPU acceleration structures, so it drops
+        // the GPU tracers and falls the render back to the CPU tracer (where
+        // the artifact is immediately visible); SPACE re-enters a GPU mode,
+        // rebuilding its acceleration structure with the snapshot.
+        if edges.capture_frustum || (edges.clear_frustum && frust.is_some()) {
+            // 1. Truncate any prior artifact back to the base scene, so the
+            //    capture trace never sees the old wireframe as geometry.
+            if let Some(a) = frust.take() {
+                frustcap::clear(scene, a);
+                *bvh = bvh::Bvh::build(scene);
+            }
+            if edges.capture_frustum {
+                // 2. Record one full-depth uncapped hybrid frame's terminal
+                //    quadtree over the base scene (bvh is base here).
+                let cap_basis = cam.basis(w, h);
+                let cap_cache = replay::ReplayCache::new(w, h);
+                cap_cache.begin(w, h);
+                {
+                    let scene_ref: &scene::Scene = scene;
+                    let bvh_ref: &bvh::Bvh = bvh;
+                    let ctx = FrameCtx {
+                        scene: scene_ref,
+                        bvh: bvh_ref,
+                        cam: cap_basis,
+                        q: Quality::upscaler_1spp(),
+                        frame: 0,
+                        jitter: false,
+                        rw: w,
+                        rh: h,
+                        accum: &accum,
+                        info: &info,
+                        tbuf: &tbuf,
+                        stats: &stats,
+                        sun: render::sun_dir(scene_ref),
+                        clouds: crate::clouds::Clouds::off(),
+                        fireflies: crate::fireflies::Fireflies::off(),
+                        tcache_cur: None,
+                        tcache_prev: &[],
+                        accumulate: false,
+                        gbuf: None,
+                        fsr_buf: None,
+                        prev_cam: None,
+                        frame_jitter: None,
+                        spp: 1,
+                        primary_sample: 0,
+                        adaptive: false,
+                        hemi_share: false,
+                        replay_rec: Some(&cap_cache),
+                        cut_cur: None,
+                        cut_prev: None,
+                        discard_seeds: false,
+                        defer_shade: false,
+                    };
+                    render::render_frame(&ctx, true);
+                }
+                // 3. Build the near-quad wireframe, append it, rebuild the BVH.
+                let (n_leaves, _) = cap_cache.counts();
+                let art = frustcap::build(scene, &cap_basis, &cap_cache, n_leaves);
+                *bvh = bvh::Bvh::build(scene);
+                frust = Some(art);
+                eprintln!(
+                    "frustum snapshot: {n_leaves} leaf tiles, {} tris ({} depth colours); scene now {} tris",
+                    art.tris,
+                    art.mats,
+                    scene.tri_count()
+                );
+            } else {
+                eprintln!("frustum snapshot cleared");
+            }
+            // 4. A geometry change: reset accumulation + every upscaler
+            //    history, drop the static-scene claim ring / replay, and drop
+            //    the resident GPU tracers (their uploaded scene is now stale),
+            //    falling back to the CPU tracer for the render.
+            frame = 0;
+            dlss_reset = true;
+            xess_reset = true;
+            fsr_reset = true;
+            dxr_reset = true;
+            gpu_reset = true;
+            tr = TemporalRing::new(w, h);
+            replay_key = None;
+            gpu.drop_scene_tracers();
+            gpu_trace = false;
+            dxr_on = false;
+        } else if edges.clear_frustum {
+            eprintln!("frustum snapshot: nothing to clear");
+        }
+
+        // The rest of the iteration is read-only on the scene AND the BVH:
+        // shadow both &mut down to shared borrows so every existing use
+        // (FrameCtx, rayon scopes, the upscaler feeds, gpu.init_*) compiles
+        // verbatim; the &mut re-arm at the next iteration (the frustum
+        // snapshot above is their one mutable writer, and it runs first).
+        let scene: &scene::Scene = scene;
+        let bvh: &bvh::Bvh = bvh;
+
+        // ── Render-mode transitions: SPACE cycles CPU -> GPU wavefront ->
+        // DXR; F keeps its historical toggle (CPU/GPU -> DXR, DXR -> CPU).
+        // The ONLY writers of gpu_trace/dxr_on after session init (the DXR
+        // present-failure fallback aside), so the pair can never be both
+        // true; runs before either GPU arm's `continue`, so it is reachable
+        // exactly once per frame in every mode. Each GPU tracer is lazily
+        // built on first entry (DXC load, kernel/RTPSO compile) and then
+        // stays RESIDENT: later switches are free. The SCENE half (streams +
+        // BLAS/TLAS + textures) is a SHARED Rc<SceneGpu> cached in
+        // GpuContext — uploaded once by whichever tracer comes first (the
+        // one `gpu scene:` line per session), so the second tracer pays only
+        // its kernels + window planes (+ the wavefront's own sw trees, the
+        // `gpu sw-trees:` line). A failed init is memoized (trace_failed/dxr_failed) and the
+        // cycle SKIPS that mode — RT-tier-1.0-only hardware runs DXR but
+        // not the wavefront (tier 1.1 / SM 6.5), so the cycle degrades to
+        // CPU <-> DXR there, and to CPU-only with no DXC at all.
+        if edges.cycle_mode || edges.toggle_dxr {
+            let mode_now = if gpu_trace {
+                RMode::Gpu
+            } else if dxr_on {
+                RMode::Dxr
+            } else {
+                RMode::Cpu
+            };
+            // F wins when both keys land in one frame: one deliberate
+            // toggle beats fighting over the cycle's landing spot.
+            let mut want = if edges.toggle_dxr {
+                if mode_now == RMode::Dxr { RMode::Cpu } else { RMode::Dxr }
+            } else {
+                match mode_now {
+                    RMode::Cpu => RMode::Gpu,
+                    RMode::Gpu => RMode::Dxr,
+                    RMode::Dxr => RMode::Cpu,
+                }
+            };
+            // A failed target advances along the cycle (Gpu -> Dxr -> Cpu);
+            // landing back on mode_now exits with NO resets — the memoized-F
+            // precedent: a refused press changes nothing.
+            while want != mode_now {
+                match want {
+                    RMode::Gpu => {
+                        if trace_failed {
+                            eprintln!("gpu: unavailable (earlier init failed; restart to retry)");
+                            want = RMode::Dxr;
+                            continue;
+                        }
+                        if !gpu.trace_ready() {
+                            if gpu_lock_note {
+                                eprintln!("gpu: dynamic render res is unsupported under --gpu; locking at native (100%)");
+                            }
+                            let built = gpu::dxc::Dxc::load(&opts.dxc_path).and_then(|dxc| {
+                                gpu.init_trace(
+                                    &dxc,
+                                    scene,
+                                    bvh,
+                                    grw as u32,
+                                    grh as u32,
+                                    gpu_wired_up != GpuUp::Plain,
+                                    // GPU-resident NPPD wires at --gpu --nppd
+                                    // session init only; gpu_nppd_avail is
+                                    // structurally false on this path.
+                                    None,
+                                    opts.gpu_debug,
+                                    opts.bc7,
+                                )
+                            });
+                            if let Err(e) = built {
+                                eprintln!("gpu: unavailable — {e}");
+                                trace_failed = true;
+                                want = RMode::Dxr;
+                                continue;
+                            }
+                        }
+                        gpu_trace = true;
+                        dxr_on = false;
+                        // Each entry restores the session-default sub-mode
+                        // (the F contract: a G/X/K plain-toggle doesn't
+                        // outlive the arm).
+                        gpu_up = gpu_wired_up;
+                        frame = 0;
+                        gpu_reset = true;
+                        gpu_prev_cam = None;
+                        // CPU-side denoisers can't run under the GPU arms;
+                        // the CPU upscalers stay wired — returning to CPU
+                        // mode resumes them intact.
+                        if oidn_on {
+                            oidn_on = false;
+                            eprintln!("oidn: OFF (GPU tracing; N re-enables in CPU mode)");
+                        }
+                        if nppd_on {
+                            nppd_on = false;
+                            nppd_prev = None;
+                            eprintln!("nppd: OFF (GPU tracing; J re-enables in CPU mode)");
+                        }
+                        eprintln!(
+                            "gpu: wavefront tracer ON at {grw}x{grh}{} (SPACE cycles CPU -> GPU -> DXR)",
+                            match gpu_up {
+                                GpuUp::Rr => format!(" -> DLSS-RR {w}x{h} (G toggles plain)"),
+                                GpuUp::Xess => format!(" -> XeSS-SR {w}x{h} (X toggles plain)"),
+                                GpuUp::Fsr4 => format!(" -> FSR4-RR {w}x{h} (K toggles plain)"),
+                                GpuUp::Fsr3 => format!(" -> FSR3 {w}x{h} (K toggles plain)"),
+                                GpuUp::Quin => format!(" -> quinlight fuse {w}x{h}"),
+                                GpuUp::Plain => String::new(),
+                            }
+                        );
+                        break;
+                    }
+                    RMode::Dxr => {
+                        if dxr_failed {
+                            eprintln!("dxr: unavailable (earlier init failed; restart with --dxc-path to retry)");
+                            want = RMode::Cpu;
+                            continue;
+                        }
+                        let compose = dxr_quin_avail
+                            || dxr_rr_avail
+                            || dxr_xess_avail
+                            || dxr_fsr3_avail
+                            || dxr_fsr4_avail;
+                        if compose && opts.gpu_lock_scale.is_none() {
+                            eprintln!("dxr: dynamic render res is unsupported on the DXR pipeline; locking at native (100%)");
+                        }
+                        match gpu::dxc::Dxc::load(&opts.dxc_path).and_then(|dxc| {
+                            gpu.init_dxr(&dxc, scene, bvh, dxw as u32, dxh as u32, compose, opts.gpu_debug, opts.bc7)
+                        }) {
+                            Ok(()) => {
+                                gpu_trace = false;
+                                dxr_on = true;
+                                frame = 0;
+                                // Every enable restores the session default
+                                // sub-mode (a G/X/K plain-toggle doesn't outlive it).
+                                // The fuse is the session default wherever it came up —
+                                // this ladder must stay in lockstep with the init pick,
+                                // or an off/on would silently strand a --quinlight
+                                // session on a single engine with no way back.
+                                dxr_up = if dxr_quin_avail {
+                                    GpuUp::Quin
+                                } else if dxr_rr_avail {
+                                    GpuUp::Rr
+                                } else if dxr_xess_avail {
+                                    GpuUp::Xess
+                                } else if dxr_fsr4_avail {
+                                    GpuUp::Fsr4
+                                } else if dxr_fsr3_avail {
+                                    GpuUp::Fsr3
+                                } else {
+                                    GpuUp::Plain
+                                };
+                                dxr_reset = true;
+                                dxr_prev_cam = None;
+                                // CPU-side denoisers can't run under the DXR arm;
+                                // the CPU upscalers stay wired (fsr_on included —
+                                // every FSR kind composes) — the arm presents
+                                // through the same session contexts, and a return
+                                // to CPU mode resumes them intact.
+                                if oidn_on {
+                                    oidn_on = false;
+                                    eprintln!("oidn: OFF (DXR enabled)");
+                                }
+                                if nppd_on {
+                                    nppd_on = false;
+                                    nppd_prev = None;
+                                    eprintln!("nppd: OFF (DXR enabled)");
+                                }
+                                eprintln!(
+                                    "dxr: DispatchRays pipeline ON at {dxw}x{dxh}{} (SPACE cycles CPU -> GPU -> DXR)",
+                                    match dxr_up {
+                                        GpuUp::Rr => format!(" -> DLSS-RR {w}x{h} (G toggles plain)"),
+                                        GpuUp::Xess => format!(" -> XeSS-SR {w}x{h} (X toggles plain)"),
+                                        GpuUp::Fsr4 => format!(" -> FSR4-RR {w}x{h} (K toggles plain)"),
+                                        GpuUp::Fsr3 => format!(" -> FSR3 {w}x{h} (K toggles plain)"),
+                                        GpuUp::Quin => format!(" -> quinlight fuse {w}x{h}"),
+                                        GpuUp::Plain => String::new(),
+                                    }
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("dxr: unavailable — {e}");
+                                dxr_failed = true;
+                                want = RMode::Cpu;
+                                continue;
+                            }
+                        }
+                        break;
+                    }
+                    RMode::Cpu => {
+                        gpu_trace = false;
+                        dxr_on = false;
+                        frame = 0;
+                        // The CPU upscalers resume with their own contracts;
+                        // their histories just watched GPU/DXR frames at a
+                        // different res — declare the discontinuity
+                        // (harmless when they're off).
+                        dlss_prev = None;
+                        dlss_reset = true;
+                        xess_prev = None;
+                        xess_reset = true;
+                        fsr_prev = None;
+                        fsr_reset = true;
+                        eprintln!("mode: CPU tracing (SPACE cycles CPU -> GPU -> DXR)");
+                        break;
+                    }
+                }
+            }
+        }
 
         // GPU-resident tracing (--gpu): a self-contained arm — every frame is
         // traced (and in upscaler sub-modes fed + upscaled), tonemapped, and
@@ -10839,6 +12996,10 @@ fn session(
         // counter, and ~300 bytes of constants. The CPU mode machinery below
         // (budget frames, OIDN/DLSS/XeSS, overlay) deliberately doesn't run.
         if gpu_trace {
+            // The temporal ring must not survive non-participating frames
+            // (the DXR arm's rule): a SPACE back to CPU tracing must not
+            // resume against whatever stale claims it still holds.
+            tr.end(false, false, cam.basis(w, h));
             if let Some(p) = edges.quality {
                 preset = p;
                 frame = 0;
@@ -10863,7 +13024,21 @@ fn session(
                 gpu_reset = true;
                 eprintln!("gpu: {}", if hybrid { "hybrid (wavefront quadtree)" } else { "plain (per-pixel reference)" });
             }
-            if edges.toggle_xess {
+            // --quinlight: every upscaler key toggles the fuse vs plain (see
+            // gpu_quin_avail). Handled once, ahead of the per-level toggles,
+            // which are then suppressed — their "not wired" lines would be a
+            // lie about a session that wired every level there is.
+            if gpu_quin_avail && (edges.toggle_dlss || edges.toggle_xess || edges.toggle_fsr) {
+                gpu_up = if gpu_up == GpuUp::Quin { GpuUp::Plain } else { GpuUp::Quin };
+                frame = 0;
+                gpu_reset = true;
+                gpu_prev_cam = None;
+                eprintln!(
+                    "gpu: quinlight fuse {}",
+                    if gpu_up == GpuUp::Quin { "ON" } else { "OFF (plain present)" }
+                );
+            }
+            if edges.toggle_xess && !gpu_quin_avail {
                 if gpu_xess_avail {
                     gpu_up = if gpu_up == GpuUp::Xess { GpuUp::Plain } else { GpuUp::Xess };
                     frame = 0;
@@ -10877,7 +13052,7 @@ fn session(
                     eprintln!("gpu: XeSS not wired in this session (start with --gpu --xess)");
                 }
             }
-            if edges.toggle_dlss {
+            if edges.toggle_dlss && !gpu_quin_avail {
                 if gpu_rr_avail {
                     gpu_up = if gpu_up == GpuUp::Rr { GpuUp::Plain } else { GpuUp::Rr };
                     frame = 0;
@@ -10891,7 +13066,7 @@ fn session(
                     eprintln!("gpu: DLSS-RR not wired in this session");
                 }
             }
-            if edges.toggle_fsr {
+            if edges.toggle_fsr && !gpu_quin_avail {
                 if let Some(kind) = gpu_fsr_kind {
                     gpu_up = if gpu_up == kind { GpuUp::Plain } else { kind };
                     frame = 0;
@@ -10910,11 +13085,30 @@ fn session(
                 if gpu_up != GpuUp::Plain {
                     eprintln!("gpu: hemi bounces unavailable in the upscaler sub-mode (still-frame feature)");
                 } else {
-                    bounce_mode = (bounce_mode + 1) % 3; // no shafts tier on GPU (v1)
+                    bounce_mode = (bounce_mode + 1) % 3;
                     frame = 0;
                     eprintln!(
                         "gpu: hemisphere frustum bounces: {}",
                         ["OFF", "AO (still frames)", "GI (still frames)"][bounce_mode as usize]
+                    );
+                }
+            }
+            // V in the --gpu arm: same semantics as the CPU arm's handler —
+            // shading+visibility change ⇒ frame reset + upscaler history
+            // reset, works in every sub-mode.
+            if edges.toggle_height {
+                if !bvh::height_armed() {
+                    eprintln!("gpu: heightfield not armed (restart with --heightfield for relief)");
+                } else if !scene.any_height {
+                    eprintln!("gpu: no height data in this scene");
+                } else {
+                    height_on = !height_on;
+                    bvh::set_height_on(height_on);
+                    frame = 0;
+                    gpu_reset = true;
+                    eprintln!(
+                        "gpu: heightfield relief: {}",
+                        if height_on { "ON" } else { "OFF (normal-mapped)" }
                     );
                 }
             }
@@ -10951,9 +13145,6 @@ fn session(
             if edges.toggle_temporal {
                 eprintln!("gpu: the OIDN reprojection history is CPU-only; unavailable under --gpu");
             }
-            if edges.toggle_dxr {
-                eprintln!("gpu: the DXR DispatchRays pipeline is a CPU-session mode; unavailable under --gpu");
-            }
             if moved {
                 frame = 0;
             }
@@ -10965,7 +13156,12 @@ fn session(
             // sized to it), not the window.
             if edges.verify {
                 eprintln!("gpu: verifying current view (wavefront vs reference, on-GPU)...");
-                match gpu.verify_trace(&cam.basis(grw, grh), base_q) {
+                match gpu.verify_trace(
+                    &cam.basis(grw, grh),
+                    base_q,
+                    crate::clouds::Clouds::live(scene.diag, cloud_time as f32),
+                    crate::fireflies::Fireflies::live(scene, cloud_time as f32),
+                ) {
                     Ok(report) => eprintln!("{report}"),
                     Err(e) => eprintln!("gpu: verify failed to run: {e}"),
                 }
@@ -10973,6 +13169,13 @@ fn session(
                 gpu_reset = true;
             }
             let t = Instant::now();
+            // Cloud clock: upscaled frames are always fresh (the upscaler is
+            // the temporal integrator — clouds drift continuously); plain
+            // accumulation advances only at frame 0, so a converging still
+            // frame keeps integrating ONE sky.
+            if gpu_up != GpuUp::Plain || frame == 0 {
+                cloud_time += (last_ms / 1000.0).clamp(0.0, 0.25);
+            }
             if gpu_up != GpuUp::Plain {
                 // The upscaler contract (the CPU arms'): every frame is a
                 // fresh jittered 1-spp full-depth frame at the locked render
@@ -10996,32 +13199,49 @@ fn session(
                     // sees one fresh jittered frame — a quieter one.
                     spp,
                     probe_sample: 0,
+                    clouds: crate::clouds::Clouds::live(scene.diag, cloud_time as f32),
+                    fireflies: crate::fireflies::Fireflies::live(scene, cloud_time as f32),
                 };
+                // The prev matrices are recomputed from the stored
+                // camera (pure math, fixed res: identical to last
+                // frame's). Hoisted above the arm split: the XeSS arm
+                // needs fc too now (the XeSS-FG prepare's camera data).
+                let mats = dlss::cam_matrices(&cam, grw, grh, dlss_near, dlss_far);
+                let prev_mats = gpu_prev_cam
+                    .map(|c| dlss::cam_matrices(&c, grw, grh, dlss_near, dlss_far));
+                let fc = dlss::frame_constants(
+                    &cam,
+                    &mats,
+                    prev_mats.as_ref(),
+                    jit,
+                    gpu_reset,
+                    dlss_near,
+                    dlss_far,
+                    grw,
+                    grh,
+                );
                 let presented = if gpu_up == GpuUp::Xess {
-                    gpu.present_trace_xess(&p, hybrid, jit, gpu_reset, gpu_nppd_on)
+                    gpu.present_trace_xess(&p, hybrid, jit, gpu_reset, gpu_nppd_on, &fc, last_ms as f32)
                 } else {
-                    // The prev matrices are recomputed from the stored
-                    // camera (pure math, fixed res: identical to last
-                    // frame's).
-                    let mats = dlss::cam_matrices(&cam, grw, grh, dlss_near, dlss_far);
-                    let prev_mats = gpu_prev_cam
-                        .map(|c| dlss::cam_matrices(&c, grw, grh, dlss_near, dlss_far));
-                    let fc = dlss::frame_constants(
-                        &cam,
-                        &mats,
-                        prev_mats.as_ref(),
-                        jit,
-                        gpu_reset,
-                        dlss_near,
-                        dlss_far,
-                        grw,
-                        grh,
-                    );
                     match gpu_up {
                         // frameTimeDelta is the PREVIOUS frame's render time
                         // (the DXR arm's contract); the desc clamps it into
                         // [0.1, 200].
                         GpuUp::Fsr3 => gpu.present_trace_fsr3(&p, hybrid, &fc, last_ms as f32),
+                        // Every wired engine, then the fuse. It needs the whole
+                        // union of what the individual arms take: the XeSS
+                        // jitter/reset pair AND the FSR/RR frame constants.
+                        GpuUp::Quin => gpu.present_trace_quin(
+                            &p,
+                            hybrid,
+                            jit,
+                            gpu_reset,
+                            &fc,
+                            gpu_prev_cam.map(|c| c.pos),
+                            gpu_up_idx,
+                            last_ms as f32,
+                            &scene.sky_sh,
+                        ),
                         GpuUp::Fsr4 => gpu.present_trace_fsr_rr(
                             &p,
                             hybrid,
@@ -11029,6 +13249,7 @@ fn session(
                             gpu_prev_cam.map(|c| c.pos),
                             gpu_up_idx,
                             last_ms as f32,
+                            &scene.sky_sh,
                         ),
                         _ => gpu.present_trace_rr(&p, hybrid, &fc, gpu_up_idx),
                     }
@@ -11052,6 +13273,7 @@ fn session(
                                 GpuUp::Xess => ("XeSS", 'X'),
                                 GpuUp::Fsr3 => ("FSR3", 'K'),
                                 GpuUp::Fsr4 => ("FSR4-RR", 'K'),
+                                GpuUp::Quin => ("quinlight fuse", 'G'),
                                 _ => ("DLSS-RR", 'G'),
                             };
                             eprintln!("gpu: {name} present failed ({e}); presenting plain ({key} to retry)");
@@ -11082,6 +13304,10 @@ fn session(
                     // so spp just converges the image spp× faster per frame.
                     spp,
                     probe_sample: 0,
+                    // Frozen mid-accumulation (the clock only advanced at
+                    // frame 0 above) — the still frames integrate one sky.
+                    clouds: crate::clouds::Clouds::live(scene.diag, cloud_time as f32),
+                    fireflies: crate::fireflies::Fireflies::live(scene, cloud_time as f32),
                 };
                 if frame < MAX_SAMPLES {
                     if let Err(e) = gpu.present_trace(&p, frame + 1, hybrid) {
@@ -11112,6 +13338,10 @@ fn session(
                     let cap = match gpu_up {
                         GpuUp::Xess => gpu.read_xess_output(),
                         GpuUp::Fsr3 | GpuUp::Fsr4 => gpu.read_fsr_output(),
+                        // The meter must read what is PRESENTED — the fuse, not
+                        // any single engine (an engine's own output would report
+                        // that engine's stability and silently ignore the fuse).
+                        GpuUp::Quin => gpu.read_quin_output(),
                         _ => gpu.read_rr_output(),
                     };
                     if let Ok(px) = cap {
@@ -11145,6 +13375,8 @@ fn session(
                     GpuUp::Xess => gpu.read_xess_output().map(|px| (px, w, h)),
                     GpuUp::Rr => gpu.read_rr_output().map(|px| (px, w, h)),
                     GpuUp::Fsr3 | GpuUp::Fsr4 => gpu.read_fsr_output().map(|px| (px, w, h)),
+                    // P captures what is ON SCREEN: the fuse, not any one engine.
+                    GpuUp::Quin => gpu.read_quin_output().map(|px| (px, w, h)),
                     GpuUp::Plain => gpu.read_trace_output(),
                 };
                 match cap {
@@ -11164,6 +13396,14 @@ fn session(
                 fps_t = now;
                 let mode = match gpu_up {
                     GpuUp::Plain => format!("{}x{}", grw, grh),
+                    GpuUp::Quin => format!(
+                        "quinlight[{}] {}x{} -> {}x{}",
+                        gpu.quin_names().unwrap_or_default(),
+                        grw,
+                        grh,
+                        w,
+                        h
+                    ),
                     GpuUp::Rr => format!("RR {}x{} -> {}x{}", grw, grh, w, h),
                     GpuUp::Fsr4 => format!("FSR4-RR {}x{} -> {}x{}", grw, grh, w, h),
                     GpuUp::Fsr3 => format!("FSR3 {}x{} -> {}x{}", grw, grh, w, h),
@@ -11186,12 +13426,13 @@ fn session(
                     format!(" | {spp} spp")
                 };
                 let _ = window.set_title(&format!(
-                    "frustracer | {:.0} fps | GPU {} | {} | quality {}{}",
-                    fps,
+                    "frustracer | {} | GPU {} | {} | quality {}{} | {}",
+                    fps_title(fps, gpu.fg_display_mult()),
                     if hybrid { "hybrid" } else { "plain" },
                     mode,
                     preset,
                     spp_txt,
+                    tod_hhmm(cur_tod),
                 ));
             }
             continue;
@@ -11245,15 +13486,57 @@ fn session(
             eprintln!("tonemap: {}{note}", if gpu_tonemap { "GPU" } else { "CPU" });
         }
         if edges.toggle_bounce {
-            bounce_mode = (bounce_mode + 1) % 4;
+            bounce_mode = (bounce_mode + 1) % 3;
             frame = 0;
             eprintln!(
                 "hemisphere frustum bounces: {}",
-                ["OFF", "AO (still frames)", "GI (still frames)", "GI + shadow shafts (still frames)"]
-                    [bounce_mode as usize]
+                ["OFF", "AO (still frames)", "GI (still frames)"][bounce_mode as usize]
             );
         }
-        if edges.toggle_dlss {
+        // V: heightfield relief vs normal-mapped — a shading+VISIBILITY
+        // change, so it takes the quality-preset reset set (frame + every
+        // upscaler/denoiser history via the predicates below), but NEVER the
+        // temporal ring or replay_key: claims live on the swept AABBs in
+        // both modes, and replay re-shades through shade_tile, which
+        // re-marches. Works in every render mode/upscaler sub-mode (the
+        // clouds class, not H's still-frame refusal).
+        if edges.toggle_height {
+            if !bvh::height_armed() {
+                eprintln!("heightfield: not armed (restart with --heightfield for relief)");
+            } else if !scene.any_height {
+                eprintln!("heightfield: no height data in this scene (no normal maps?)");
+            } else {
+                height_on = !height_on;
+                bvh::set_height_on(height_on);
+                frame = 0;
+                dlss_reset = true;
+                dxr_reset = true;
+                eprintln!(
+                    "heightfield relief: {}",
+                    if height_on { "ON" } else { "OFF (normal-mapped)" }
+                );
+            }
+        }
+        // --quinlight in DXR mode: the FUSE is the session's upscaler, so G/X/K
+        // all toggle IT against plain DXR (the --gpu gpu_quin_avail semantics).
+        // Handled once, ahead of the per-level toggles, which are suppressed
+        // below: every level IS wired here, so letting G switch to DLSS-RR alone
+        // would strand the session — no key would bring the fuse back.
+        if dxr_on
+            && dxr_quin_avail
+            && (edges.toggle_dlss || edges.toggle_xess || edges.toggle_fsr)
+        {
+            dxr_up = if dxr_up == GpuUp::Quin { GpuUp::Plain } else { GpuUp::Quin };
+            frame = 0;
+            dxr_reset = true;
+            dxr_prev_cam = None;
+            eprintln!(
+                "dxr: quinlight fuse {}",
+                if dxr_up == GpuUp::Quin { "ON" } else { "OFF (plain present)" }
+            );
+        }
+        let dxr_quin_key = dxr_on && dxr_quin_avail;
+        if edges.toggle_dlss && !dxr_quin_key {
             if dxr_on {
                 // Inside DXR mode G toggles the wired upscaler vs plain
                 // DXR — the --gpu G semantics; the CPU DLSS state is
@@ -11300,7 +13583,7 @@ fn session(
                 eprintln!("dlss: not wired in this session (the chain selected another level; restart with --dlss)");
             }
         }
-        if edges.toggle_xess {
+        if edges.toggle_xess && !dxr_quin_key {
             if dxr_on {
                 // The X twin of the DXR-mode G toggle.
                 if dxr_xess_avail {
@@ -11358,7 +13641,7 @@ fn session(
                 eprintln!("xess: not wired in this session (restart with --xess and the SDK DLL on disk)");
             }
         }
-        if edges.toggle_fsr {
+        if edges.toggle_fsr && !dxr_quin_key {
             if dxr_on {
                 // The K twin of the DXR-mode G/X toggles: wired-FSR <-> plain.
                 let kind = if dxr_fsr4_avail {
@@ -11558,80 +13841,8 @@ fn session(
                 nppd_failed = true;
             }
         }
-        if edges.toggle_dxr {
-            if dxr_on {
-                dxr_on = false;
-                frame = 0;
-                // The CPU upscalers resume with their own contracts; their
-                // histories just watched DXR frames at a different res —
-                // declare the discontinuity (harmless when they're off).
-                dlss_prev = None;
-                dlss_reset = true;
-                xess_prev = None;
-                xess_reset = true;
-                fsr_prev = None;
-                fsr_reset = true;
-                eprintln!("dxr: OFF (CPU tracing)");
-            } else if dxr_failed {
-                eprintln!("dxr: unavailable (earlier init failed; restart with --dxc-path to retry)");
-            } else {
-                let compose = dxr_rr_avail || dxr_xess_avail || dxr_fsr3_avail || dxr_fsr4_avail;
-                if compose && opts.gpu_lock_scale.is_none() {
-                    eprintln!("dxr: dynamic render res is unsupported on the DXR pipeline; locking at native (100%)");
-                }
-                match gpu::dxc::Dxc::load(&opts.dxc_path).and_then(|dxc| {
-                    gpu.init_dxr(&dxc, scene, bvh, dxw as u32, dxh as u32, compose, opts.gpu_debug, opts.bc7)
-                }) {
-                    Ok(()) => {
-                        dxr_on = true;
-                        frame = 0;
-                        // Every F enable restores the session default
-                        // sub-mode (a G/X/K plain-toggle doesn't outlive it).
-                        dxr_up = if dxr_rr_avail {
-                            GpuUp::Rr
-                        } else if dxr_xess_avail {
-                            GpuUp::Xess
-                        } else if dxr_fsr4_avail {
-                            GpuUp::Fsr4
-                        } else if dxr_fsr3_avail {
-                            GpuUp::Fsr3
-                        } else {
-                            GpuUp::Plain
-                        };
-                        dxr_reset = true;
-                        dxr_prev_cam = None;
-                        // CPU-side denoisers can't run under the DXR arm;
-                        // the CPU upscalers stay wired (fsr_on included —
-                        // every FSR kind composes) — the arm presents
-                        // through the same session contexts, and F-off
-                        // resumes them intact.
-                        if oidn_on {
-                            oidn_on = false;
-                            eprintln!("oidn: OFF (DXR enabled)");
-                        }
-                        if nppd_on {
-                            nppd_on = false;
-                            nppd_prev = None;
-                            eprintln!("nppd: OFF (DXR enabled)");
-                        }
-                        eprintln!(
-                            "dxr: DispatchRays pipeline ON at {dxw}x{dxh}{} (F toggles CPU <-> DXR)",
-                            match dxr_up {
-                                GpuUp::Rr => format!(" -> DLSS-RR {w}x{h} (G toggles plain)"),
-                                GpuUp::Xess => format!(" -> XeSS-SR {w}x{h} (X toggles plain)"),
-                                GpuUp::Fsr4 => format!(" -> FSR4-RR {w}x{h} (K toggles plain)"),
-                                GpuUp::Fsr3 => format!(" -> FSR3 {w}x{h} (K toggles plain)"),
-                                GpuUp::Plain => String::new(),
-                            }
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!("dxr: unavailable — {e}");
-                        dxr_failed = true;
-                    }
-                }
-            }
-        }
+        // (The F/SPACE render-mode transitions live ABOVE the GPU arm — the
+        // one spot every mode reaches each frame.)
         // True only when M actually flipped oidn_temporal (not the Post/no-op
         // arms) — the single source for the reset predicates below, so they
         // can't drift from the handler's own condition.
@@ -11673,24 +13884,30 @@ fn session(
         // upscaler's accumulated history mixes shading statistics, so every
         // predicate that resets `frame`/the OIDN history also resets it —
         // EXCEPT camera motion, which is exactly what the temporal upscaler
-        // exists to survive.
+        // exists to survive, and EXCEPT the TOD scrub (`sun_moved`), which
+        // fires per frame while held: continuous lighting drift is the
+        // cloud-drift class of shading change, and a per-tick reset starves
+        // the history for the whole scrub (the star-smear bug).
         if edges.toggle_hybrid
             || edges.toggle_bounce
+            || edges.toggle_height
             || edges.quality.is_some()
             || edges.cycle_spp
             || edges.toggle_xess
             || edges.toggle_oidn
             || edges.toggle_nppd
             || edges.toggle_dxr
+            || edges.cycle_mode
             || temporal_flipped
         {
             xess_reset = true;
         }
         // The same reset contract for the FSR histories (Ray Regeneration's
         // temporal accumulation + FSR4's): every shading-semantics change,
-        // never camera motion.
+        // never camera motion, never the TOD scrub.
         if edges.toggle_hybrid
             || edges.toggle_bounce
+            || edges.toggle_height
             || edges.quality.is_some()
             || edges.cycle_spp
             || edges.toggle_fsr
@@ -11705,11 +13922,15 @@ fn session(
         // shading or mode semantics drops the history; camera motion and the
         // budget↔normal transition deliberately do NOT (surviving motion is
         // the history's whole purpose; coarse budget pixels are handled
-        // per-pixel by the KIND_COARSE rule). Over-invalidating on no-op
-        // edges (e.g. T in DLSS mode) is accepted for the simple predicate.
+        // per-pixel by the KIND_COARSE rule), and neither does the TOD scrub
+        // (per-frame while held — old lighting washes out at the EMA rate, a
+        // brief crossfade instead of a per-tick history wipe). Over-
+        // invalidating on no-op edges (e.g. T in DLSS mode) is accepted for
+        // the simple predicate.
         let hist_stale = edges.toggle_hybrid
             || edges.toggle_dynamic
             || edges.toggle_bounce
+            || edges.toggle_height
             || edges.quality.is_some()
             || edges.cycle_spp
             || edges.toggle_oidn
@@ -11718,6 +13939,7 @@ fn session(
             || edges.toggle_fsr
             || edges.toggle_nppd
             || edges.toggle_dxr
+            || edges.cycle_mode
             || temporal_flipped;
         if hist_stale {
             if let Some(h) = &mut oidn_hist {
@@ -11751,6 +13973,11 @@ fn session(
                 eprintln!("dxr: C verify is a CPU-tracer feature; --check-dxr gates this pipeline");
             }
             let t = Instant::now();
+            // Cloud clock — the --gpu arm's rule: upscaled = always fresh,
+            // plain accumulation advances only at frame 0.
+            if dxr_up != GpuUp::Plain || frame == 0 {
+                cloud_time += (last_ms / 1000.0).clamp(0.0, 0.25);
+            }
             if dxr_up != GpuUp::Plain {
                 if edges.quality.is_some() {
                     // The generic handler already reset `frame`; the noise
@@ -11783,35 +14010,50 @@ fn session(
                     // there is no tile claim to amortize.)
                     spp,
                     probe_sample: 0,
+                    clouds: crate::clouds::Clouds::live(scene.diag, cloud_time as f32),
+                    fireflies: crate::fireflies::Fireflies::live(scene, cloud_time as f32),
                 };
+                // The prev matrices are recomputed from the stored
+                // camera (pure math, fixed res: identical to last
+                // frame's). Hoisted above the arm split: the XeSS arm
+                // needs fc too now (the XeSS-FG prepare's camera data).
+                let mats = dlss::cam_matrices(&cam, dxw, dxh, dlss_near, dlss_far);
+                let prev_mats =
+                    dxr_prev_cam.map(|c| dlss::cam_matrices(&c, dxw, dxh, dlss_near, dlss_far));
+                let fc = dlss::frame_constants(
+                    &cam,
+                    &mats,
+                    prev_mats.as_ref(),
+                    jit,
+                    dxr_reset,
+                    dlss_near,
+                    dlss_far,
+                    dxw,
+                    dxh,
+                );
                 let presented = if dxr_up == GpuUp::Xess {
-                    gpu.present_dxr_xess(&p, jit, dxr_reset)
+                    gpu.present_dxr_xess(&p, jit, dxr_reset, &fc, last_ms as f32)
                 } else {
-                    // The prev matrices are recomputed from the stored
-                    // camera (pure math, fixed res: identical to last
-                    // frame's).
-                    let mats = dlss::cam_matrices(&cam, dxw, dxh, dlss_near, dlss_far);
-                    let prev_mats =
-                        dxr_prev_cam.map(|c| dlss::cam_matrices(&c, dxw, dxh, dlss_near, dlss_far));
-                    let fc = dlss::frame_constants(
-                        &cam,
-                        &mats,
-                        prev_mats.as_ref(),
-                        jit,
-                        dxr_reset,
-                        dlss_near,
-                        dlss_far,
-                        dxw,
-                        dxh,
-                    );
                     match dxr_up {
                         GpuUp::Fsr3 => gpu.present_dxr_fsr3(&p, &fc, last_ms as f32),
+                        // Every wired engine, then the fuse.
+                        GpuUp::Quin => gpu.present_dxr_quin(
+                            &p,
+                            jit,
+                            dxr_reset,
+                            &fc,
+                            dxr_prev_cam.map(|c| c.pos),
+                            dxr_up_idx,
+                            last_ms as f32,
+                            &scene.sky_sh,
+                        ),
                         GpuUp::Fsr4 => gpu.present_dxr_fsr_rr(
                             &p,
                             &fc,
                             dxr_prev_cam.map(|c| c.pos),
                             dxr_up_idx,
                             last_ms as f32,
+                            &scene.sky_sh,
                         ),
                         _ => gpu.present_dxr_rr(&p, &fc, dxr_up_idx),
                     }
@@ -11828,6 +14070,7 @@ fn session(
                             GpuUp::Xess => ("XeSS", 'X'),
                             GpuUp::Fsr3 => ("FSR3", 'K'),
                             GpuUp::Fsr4 => ("FSR4-RR", 'K'),
+                            GpuUp::Quin => ("quinlight fuse", 'G'),
                             _ => ("DLSS-RR", 'G'),
                         };
                         eprintln!("dxr: {name} present failed ({e}); presenting plain ({key} to retry)");
@@ -11856,6 +14099,9 @@ fn session(
                     verify: false,
                     spp,
                     probe_sample: 0,
+                    // Frozen mid-accumulation (clock advanced at frame 0 only).
+                    clouds: crate::clouds::Clouds::live(scene.diag, cloud_time as f32),
+                    fireflies: crate::fireflies::Fireflies::live(scene, cloud_time as f32),
                 };
                 if frame < MAX_SAMPLES {
                     match gpu.present_dxr(&p, frame + 1) {
@@ -11889,6 +14135,10 @@ fn session(
                     let cap = match dxr_up {
                         GpuUp::Xess => gpu.read_xess_output(),
                         GpuUp::Fsr3 | GpuUp::Fsr4 => gpu.read_fsr_output(),
+                        // The meter must read what is PRESENTED — the fuse, not
+                        // any single engine (an engine's own output would report
+                        // that engine's stability and silently ignore the fuse).
+                        GpuUp::Quin => gpu.read_quin_output(),
                         _ => gpu.read_rr_output(),
                     };
                     if let Ok(px) = cap {
@@ -11922,6 +14172,8 @@ fn session(
                     GpuUp::Rr => gpu.read_rr_output().map(|px| (px, w, h)),
                     GpuUp::Xess => gpu.read_xess_output().map(|px| (px, w, h)),
                     GpuUp::Fsr3 | GpuUp::Fsr4 => gpu.read_fsr_output().map(|px| (px, w, h)),
+                    // P captures what is ON SCREEN: the fuse, not any one engine.
+                    GpuUp::Quin => gpu.read_quin_output().map(|px| (px, w, h)),
                     GpuUp::Plain => gpu.read_dxr_output(),
                 };
                 match grab {
@@ -11940,6 +14192,10 @@ fn session(
                 fps_frames = 0;
                 fps_t = now;
                 let sub = match dxr_up {
+                    GpuUp::Quin => format!(
+                        "DXR {dxw}x{dxh} -> quinlight[{}] {w}x{h} | {spp} spp",
+                        gpu.quin_names().unwrap_or_default()
+                    ),
                     GpuUp::Rr => format!("DXR {dxw}x{dxh} -> DLSS-RR {w}x{h} | {spp} spp"),
                     GpuUp::Xess => format!("DXR {dxw}x{dxh} -> XeSS {w}x{h} | {spp} spp"),
                     GpuUp::Fsr4 => format!("DXR {dxw}x{dxh} -> FSR4-RR {w}x{h} | {spp} spp"),
@@ -11953,8 +14209,11 @@ fn session(
                         if frame >= MAX_SAMPLES { " | converged" } else { "" },
                     ),
                 };
-                let _ =
-                    window.set_title(&format!("frustracer | {fps:.0} fps | {last_ms:.1} ms | {sub}"));
+                let _ = window.set_title(&format!(
+                    "frustracer | {} | {last_ms:.1} ms | {sub} | {}",
+                    fps_title(fps, gpu.fg_display_mult()),
+                    tod_hhmm(cur_tod)
+                ));
             }
             continue;
         }
@@ -12140,7 +14399,6 @@ fn session(
         if !neural && !moved {
             q.fb.ao = bounce_mode == 1;
             q.fb.gi = bounce_mode >= 2;
-            q.fb.shadows = bounce_mode == 3;
         }
 
         // Temporal-OIDN mode renders fresh 1-spp frames (the DLSS pattern);
@@ -12198,6 +14456,16 @@ fn session(
                 && (upscaled || (rw, rh) == (w, h));
             let (tcache_cur, tprev_vec, cut_cur, cut_prev) =
                 tr.begin(temporal_on, opts.adopt, rw, rh);
+            // Cloud clock — the CPU arm's rule: the fresh-1-spp modes (DLSS/
+            // XeSS/FSR/NPPD/temporal-OIDN) advance every frame (their
+            // upscaler/denoiser is the temporal integrator, clouds drift
+            // continuously); plain accumulation advances only at frame 0, so
+            // a converging still frame — and every replay of it — keeps
+            // integrating ONE sky.
+            let cpu_accumulate = !neural && !oidn_t;
+            if !cpu_accumulate || frame == 0 {
+                cloud_time += (last_ms / 1000.0).clamp(0.0, 0.25);
+            }
             let ctx = FrameCtx {
                 scene,
                 bvh,
@@ -12224,9 +14492,11 @@ fn session(
                 tbuf: &tbuf,
                 stats: &stats,
                 sun: render::sun_dir(scene),
+                clouds: crate::clouds::Clouds::live(scene.diag, cloud_time as f32),
+                    fireflies: crate::fireflies::Fireflies::live(scene, cloud_time as f32),
                 tcache_cur,
                 tcache_prev: &tprev_vec,
-                accumulate: !neural && !oidn_t,
+                accumulate: cpu_accumulate,
                 gbuf: match mode {
                     RenderMode::Dlss => Some(&gbufs),
                     RenderMode::Fsr => fsr_gbufs.as_ref(),
@@ -12415,7 +14685,15 @@ fn session(
             );
             let presented = if fsr_rr {
                 let fb = fsr_bufs.as_ref().expect("fsr_on without signal bufs");
-                gpu.present_fsr(fg, fb, &fc, fsr_prev.map(|c| c.pos), fsr_idx, last_ms as f32)
+                gpu.present_fsr(
+                    fg,
+                    fb,
+                    &fc,
+                    fsr_prev.map(|c| c.pos),
+                    fsr_idx,
+                    last_ms as f32,
+                    &scene.sky_sh,
+                )
             } else {
                 gpu.present_fsr3(&accum, fg, &fc, last_ms as f32)
             };
@@ -12595,7 +14873,27 @@ fn session(
                     }
                     None => gpu::xr::ColorSrc::Accum(&accum[..n]),
                 };
-                match gpu.present_xess(&color, xg, rw, rh, jit, xess_reset, dlss_near, dlss_far) {
+                // Frame constants for the XeSS-FG prepare (camera + jitter
+                // at this frame's dynamic render res; pure math, unused when
+                // FG is not wired).
+                let xmats = dlss::cam_matrices(&cam, rw, rh, dlss_near, dlss_far);
+                let xprev_mats =
+                    xess_prev.map(|c| dlss::cam_matrices(&c, rw, rh, dlss_near, dlss_far));
+                let xfc = dlss::frame_constants(
+                    &cam,
+                    &xmats,
+                    xprev_mats.as_ref(),
+                    jit,
+                    xess_reset,
+                    dlss_near,
+                    dlss_far,
+                    rw,
+                    rh,
+                );
+                match gpu.present_xess(
+                    &color, xg, rw, rh, jit, xess_reset, dlss_near, dlss_far, &xfc,
+                    last_ms as f32,
+                ) {
                     Ok(()) => {
                         xess_prev = Some(cam);
                         xess_reset = false;
@@ -12875,8 +15173,9 @@ fn session(
                 // The present buffer is stale in GPU-tonemap mode; resolve
                 // fresh for the screenshot.
                 present.resolve_sdr(&accum, &info, frame.max(1), false, rw, rh, w, h);
-            } else if present.is_hdr {
-                // The CPU arms hold scRGB f16, which a PNG cannot carry — so
+            } else if present.is_hdr() {
+                // The CPU arms hold scRGB f16 (or packed PQ), which a PNG
+                // cannot carry — so
                 // re-resolve each arm's OWN linear source through the SDR curve.
                 // The overlay rides along exactly as it does on screen (an SDR
                 // session saves the present buffer verbatim, overlay included;
@@ -12935,8 +15234,8 @@ fn session(
                 String::new()
             };
             let _ = window.set_title(&format!(
-                "frustracer | {:.0} fps | {}{}{} | {}x{} | {:.1} ms | {} | quality {}{}{}{}{}{}",
-                fps,
+                "frustracer | {} | {}{}{} | {}x{} | {:.1} ms | {} | quality {}{}{}{}{}{} | {}",
+                fps_title(fps, gpu.fg_display_mult()),
                 if hybrid { "hybrid" } else { "plain" },
                 if !dlss_on && !fsr_on && !xess_on && hybrid && dynamic { "+dyn" } else { "" },
                 if dlss_on {
@@ -13012,7 +15311,7 @@ fn session(
                 if dlss_on || fsr_on || xess_on || nppd_on {
                     ""
                 } else {
-                    ["", " | hemi-AO", " | hemi-GI", " | hemi-GI+shafts"][bounce_mode as usize]
+                    ["", " | hemi-AO", " | hemi-GI"][bounce_mode as usize]
                 },
                 if use_gpu_tone && !dlss_on && !fsr_on && !xess_on { " | gpu-tone" } else { "" },
                 if overlay_on { " | overlay" } else { "" },
@@ -13021,6 +15320,7 @@ fn session(
                 } else {
                     ""
                 },
+                tod_hhmm(cur_tod),
             ));
         }
         if (now - last_stats).as_secs_f64() > 1.0 && frame <= MAX_SAMPLES && frame > 0 {
@@ -13075,6 +15375,7 @@ fn session(
         overlay_on,
         gpu_tonemap,
         bounce_mode,
+        height_on,
         preset,
         spp,
         dlss_on,
@@ -13086,14 +15387,18 @@ fn session(
         nppd_on,
         xess_nppd,
         dxr_on,
+        gpu_on: gpu_trace,
         dxr_up_plain: dxr_up == GpuUp::Plain,
         gpu_up_plain: gpu_up == GpuUp::Plain,
         gpu_nppd_on,
         oidn_failed,
         nppd_failed,
         dxr_failed,
+        trace_failed,
         shot,
         depth_est,
+        cloud_time,
+        frust,
     });
     end
 }
@@ -13101,33 +15406,48 @@ fn session(
 /// The CPU present buffer for the arms that tonemap on the CPU (OIDN, NPPD,
 /// XeSS-post, and the plain resolve).
 ///
-/// Two encodings, one curve. An SDR session fills `sdr` (u32 0x00RRGGBB); an
-/// scRGB session fills `hdr` ([f16; 4], already curve+overlay+encode). Which
-/// one is a property of the SWAPCHAIN, decided once — so an arm cannot
-/// accidentally present 8-bit pixels into an f16 backbuffer.
+/// Three encodings, one curve. An SDR session fills `sdr` (u32 0x00RRGGBB);
+/// an scRGB session fills `hdr` ([f16; 4], already curve+overlay+encode); an
+/// HDR10 session fills `pq` (packed 10-bit PQ u32, R low). Which one is a
+/// property of the SWAPCHAIN (`GpuContext::encoding()`), decided once — so an
+/// arm cannot accidentally present the wrong wire into the backbuffer.
 ///
-/// `sdr` is allocated in both modes because screenshots are always 8-bit PNG:
+/// `sdr` is allocated in every mode because screenshots are always 8-bit PNG:
 /// a file has nowhere to put a nit. In an HDR session the screenshot path
 /// re-resolves into it (`resolve_*_sdr`) rather than trying to invert the
-/// display-referred f16 — that inversion is not well-defined, and a screenshot
-/// is rare enough that a second tonemap costs nothing.
+/// display-referred output — that inversion is not well-defined, and a
+/// screenshot is rare enough that a second tonemap costs nothing.
 struct CpuPresent {
     sdr: Vec<u32>,
     hdr: Vec<[half::f16; 4]>,
+    pq: Vec<u32>,
     /// Refreshed from `gpu.tone()` each frame — this is how a display change
     /// reaches the CPU arms.
     tone: tone::ToneParams,
-    is_hdr: bool,
+    enc: gpu::d3d12::PresentSpace,
 }
 
 impl CpuPresent {
-    fn new(w: usize, h: usize, is_hdr: bool, tone: tone::ToneParams) -> Self {
+    fn new(w: usize, h: usize, enc: gpu::d3d12::PresentSpace, tone: tone::ToneParams) -> Self {
+        use gpu::d3d12::PresentSpace;
         Self {
             sdr: vec![0u32; w * h],
-            hdr: if is_hdr { vec![[half::f16::ZERO; 4]; w * h] } else { Vec::new() },
+            hdr: if enc == PresentSpace::Scrgb {
+                vec![[half::f16::ZERO; 4]; w * h]
+            } else {
+                Vec::new()
+            },
+            pq: if enc == PresentSpace::Hdr10 { vec![0u32; w * h] } else { Vec::new() },
             tone,
-            is_hdr,
+            enc,
         }
+    }
+
+    /// Was the presented frame display-referred wide-gamut (scRGB or HDR10)?
+    /// The screenshot path keys its "re-resolve the linear source through the
+    /// SDR curve" decision on this.
+    fn is_hdr(&self) -> bool {
+        self.enc != gpu::d3d12::PresentSpace::Sdr
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -13142,12 +15462,16 @@ impl CpuPresent {
         w: usize,
         h: usize,
     ) {
-        if self.is_hdr {
-            render::resolve_scrgb(
+        match self.enc {
+            gpu::d3d12::PresentSpace::Scrgb => render::resolve_scrgb(
                 accum, info, samples, overlay, self.tone, &mut self.hdr, rw, rh, w, h,
-            );
-        } else {
-            render::resolve(accum, info, samples, overlay, &mut self.sdr, rw, rh, w, h);
+            ),
+            gpu::d3d12::PresentSpace::Hdr10 => render::resolve_pq(
+                accum, info, samples, overlay, self.tone, &mut self.pq, rw, rh, w, h,
+            ),
+            gpu::d3d12::PresentSpace::Sdr => {
+                render::resolve(accum, info, samples, overlay, &mut self.sdr, rw, rh, w, h)
+            }
         }
     }
 
@@ -13162,10 +15486,16 @@ impl CpuPresent {
         w: usize,
         h: usize,
     ) {
-        if self.is_hdr {
-            render::resolve_hdr_scrgb(src, info, overlay, self.tone, &mut self.hdr, rw, rh, w, h);
-        } else {
-            render::resolve_hdr(src, info, overlay, &mut self.sdr, rw, rh, w, h);
+        match self.enc {
+            gpu::d3d12::PresentSpace::Scrgb => render::resolve_hdr_scrgb(
+                src, info, overlay, self.tone, &mut self.hdr, rw, rh, w, h,
+            ),
+            gpu::d3d12::PresentSpace::Hdr10 => {
+                render::resolve_hdr_pq(src, info, overlay, self.tone, &mut self.pq, rw, rh, w, h)
+            }
+            gpu::d3d12::PresentSpace::Sdr => {
+                render::resolve_hdr(src, info, overlay, &mut self.sdr, rw, rh, w, h)
+            }
         }
     }
 
@@ -13202,10 +15532,10 @@ impl CpuPresent {
     }
 
     fn blit(&self, gpu: &mut gpu::GpuContext) -> gpu::d3d12::Result<()> {
-        if self.is_hdr {
-            gpu.present_cpu_hdr(&self.hdr)
-        } else {
-            gpu.present_cpu(&self.sdr)
+        match self.enc {
+            gpu::d3d12::PresentSpace::Scrgb => gpu.present_cpu_hdr(&self.hdr),
+            gpu::d3d12::PresentSpace::Hdr10 => gpu.present_cpu_pq(&self.pq),
+            gpu::d3d12::PresentSpace::Sdr => gpu.present_cpu(&self.sdr),
         }
     }
 }

@@ -11,6 +11,77 @@ const VENDOR_NVIDIA: u32 = 0x10DE;
 const VENDOR_AMD: u32 = 0x1002;
 const VENDOR_INTEL: u32 = 0x8086;
 
+/// The vendor of the adapter we actually PICKED — the input to every
+/// vendor-aware default (`main::vendor_defaults`, `trace::leaf_group`).
+///
+/// Deliberately not the same type as `Prefer`: a preference is what the user
+/// asked for and may not be honored (a box without that vendor falls back to
+/// the first hardware adapter), while this is what the device is. Defaults must
+/// key off the fact, never the request.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Vendor {
+    Nvidia,
+    Amd,
+    Intel,
+    /// Anything else, including a software/virtual adapter that slipped the
+    /// SOFTWARE flag. Always takes the cross-vendor default — an unknown GPU
+    /// is exactly the case where a tuned constant is least likely to hold.
+    Other,
+}
+
+impl Vendor {
+    fn of(id: u32) -> Self {
+        match id {
+            VENDOR_NVIDIA => Vendor::Nvidia,
+            VENDOR_AMD => Vendor::Amd,
+            VENDOR_INTEL => Vendor::Intel,
+            _ => Vendor::Other,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Vendor::Nvidia => "NVIDIA",
+            Vendor::Amd => "AMD",
+            Vendor::Intel => "Intel",
+            Vendor::Other => "unknown-vendor",
+        }
+    }
+}
+
+/// The last `pick()`'s vendor, as a process-global so consumers that never see
+/// an `AdapterPick` can read it — specifically the KERNEL-ASSEMBLY constants in
+/// trace.rs, which are chosen long after the device exists and are threaded
+/// through nothing.
+///
+/// Recording it inside `pick()` is what makes it unforgettable: every path that
+/// obtains a device (GpuContext, HeadlessGpu, every `--check*` suite) goes
+/// through that one function, so a new device path cannot silently inherit a
+/// stale vendor. One device per process in practice; last-writer-wins is the
+/// correct rule regardless, since the newest pick IS the device in use.
+static PICKED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// The picked adapter's vendor, or `Other` before any pick (the conservative
+/// answer — cross-vendor defaults).
+pub fn picked_vendor() -> Vendor {
+    match PICKED.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => Vendor::Nvidia,
+        1 => Vendor::Amd,
+        2 => Vendor::Intel,
+        _ => Vendor::Other,
+    }
+}
+
+fn record_picked(v: Vendor) {
+    let code = match v {
+        Vendor::Nvidia => 0,
+        Vendor::Amd => 1,
+        Vendor::Intel => 2,
+        Vendor::Other => 3,
+    };
+    PICKED.store(code, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Which vendor's best-VRAM adapter to prefer (never a hard requirement —
 /// the caller's feature-support probe is the real gate; a wrong-vendor pick
 /// just reports unsupported and falls back to the plain path).
@@ -25,7 +96,7 @@ pub struct AdapterPick {
     pub adapter: IDXGIAdapter4,
     pub luid: LUID,
     pub name: String,
-    pub is_nvidia: bool,
+    pub vendor: Vendor,
 }
 
 fn desc_name(desc: &DXGI_ADAPTER_DESC3) -> String {
@@ -71,17 +142,74 @@ pub fn pick(factory: &IDXGIFactory6, prefer: Prefer) -> std::result::Result<Adap
         (None, None) => return Err("no hardware DXGI adapter found".into()),
     };
     let name = desc_name(&picked.1);
-    Ok(AdapterPick {
-        adapter: picked.0,
-        luid: picked.1.AdapterLuid,
-        name,
-        is_nvidia: picked.1.VendorId == VENDOR_NVIDIA,
-    })
+    let vendor = Vendor::of(picked.1.VendorId);
+    record_picked(vendor);
+    Ok(AdapterPick { adapter: picked.0, luid: picked.1.AdapterLuid, name, vendor })
 }
 
 pub fn create_factory(debug: bool) -> Result<IDXGIFactory6> {
     let flags = if debug { DXGI_CREATE_FACTORY_DEBUG } else { DXGI_CREATE_FACTORY_FLAGS(0) };
     unsafe { CreateDXGIFactory2(flags) }
+}
+
+/// Whether hardware-accelerated GPU scheduling (HAGS) is ENABLED on this
+/// adapter — asked of the driver itself (D3DKMT WDDM 2.7 caps, the same
+/// query the Settings page reads), never the registry: on Windows 11 the
+/// HwSchMode key only exists after a manual toggle, and its ABSENCE means
+/// "OS default", which is ON for supported GPUs — a registry heuristic
+/// misreads exactly the common case (shipped once). None = the query itself
+/// failed (old OS/driver); callers treat that as unknown, not off.
+pub fn hags_enabled(luid: LUID) -> Option<bool> {
+    use std::ffi::c_void;
+    #[repr(C)]
+    struct OpenFromLuid {
+        luid: LUID,
+        adapter: u32,
+    }
+    #[repr(C)]
+    struct QueryInfo {
+        adapter: u32,
+        ty: u32,
+        data: *mut c_void,
+        size: u32,
+    }
+    #[repr(C)]
+    struct CloseAdapter {
+        adapter: u32,
+    }
+    const KMTQAITYPE_WDDM_2_7_CAPS: u32 = 70;
+    type OpenFn = unsafe extern "system" fn(*mut OpenFromLuid) -> i32;
+    type QueryFn = unsafe extern "system" fn(*mut QueryInfo) -> i32;
+    type CloseFn = unsafe extern "system" fn(*const CloseAdapter) -> i32;
+    unsafe {
+        use windows::core::{s, PCWSTR};
+        use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+        let wide: Vec<u16> = "gdi32.dll".encode_utf16().chain(std::iter::once(0)).collect();
+        let gdi = GetModuleHandleW(PCWSTR(wide.as_ptr())).ok()?;
+        let open: OpenFn = std::mem::transmute(GetProcAddress(gdi, s!("D3DKMTOpenAdapterFromLuid"))?);
+        let query: QueryFn = std::mem::transmute(GetProcAddress(gdi, s!("D3DKMTQueryAdapterInfo"))?);
+        let close: CloseFn = std::mem::transmute(GetProcAddress(gdi, s!("D3DKMTCloseAdapter"))?);
+        let mut o = OpenFromLuid { luid, adapter: 0 };
+        if open(&mut o) != 0 {
+            return None;
+        }
+        // D3DKMT_WDDM_2_7_CAPS: bit 0 HwSchSupported, bit 1 HwSchEnabled,
+        // bit 2 HwSchEnabledByDefault, bit 3 IsHwSchStateStable.
+        let mut caps: u32 = 0;
+        let mut q = QueryInfo {
+            adapter: o.adapter,
+            ty: KMTQAITYPE_WDDM_2_7_CAPS,
+            data: &mut caps as *mut u32 as *mut c_void,
+            size: std::mem::size_of::<u32>() as u32,
+        };
+        let qr = query(&mut q);
+        let c = CloseAdapter { adapter: o.adapter };
+        let _ = close(&c);
+        if qr != 0 {
+            return None;
+        }
+        Some(caps & 0x2 != 0)
+    }
 }
 
 /// (current usage, budget) of the device's adapter's LOCAL memory segment —

@@ -59,6 +59,59 @@ pub fn max_aniso() -> f32 {
     MAX_ANISO.load(Relaxed) as f32
 }
 
+/// Load-time converter kill levers (`--no-h2n` / `--no-n2h`), settable once
+/// before scene load — the `set_mips`/`clouds::set_enabled` "knob before
+/// build" family. h2n off restores the pre-conversion behavior exactly
+/// (grayscale bump maps are dropped, `normal_tex` stays NO_TEX); n2h off
+/// leaves every real normal map's alpha at 255 and `height_amp` at 0.0.
+static H2N_ENABLED: AtomicBool = AtomicBool::new(true);
+static N2H_ENABLED: AtomicBool = AtomicBool::new(true);
+
+pub fn set_h2n(on: bool) {
+    H2N_ENABLED.store(on, Relaxed);
+}
+
+pub fn h2n_enabled() -> bool {
+    H2N_ENABLED.load(Relaxed)
+}
+
+pub fn set_n2h(on: bool) {
+    N2H_ENABLED.store(on, Relaxed);
+}
+
+pub fn n2h_enabled() -> bool {
+    N2H_ENABLED.load(Relaxed)
+}
+
+/// High-pass knee of the normal→height solve, in CYCLES per texture tile:
+/// spectral integration divides by |k|, so the lowest bins amplify normal-map
+/// noise into tile-scale height swell (the classic Frankot–Chellappa
+/// ill-conditioning). Bins at radial frequency r cycles are attenuated by
+/// r²/(r² + K²) — wavelengths longer than ~1/K of the tile fade out, detail
+/// passes untouched. The eyeball knob; 0.0 = off (the self-test's solver-core
+/// setting).
+pub const N2H_HIGHPASS: f32 = 2.0;
+
+/// Ceiling on a DERIVED (n2h) heightfield's amplitude, in texel widths.
+/// Aggressive normal maps (near-horizon texels — the z-clamp admits slopes
+/// of ±20/texel) integrate to absurd depths (a Bistro map measured 7711
+/// texels), which would balloon the swept AABBs and read as geometry, not
+/// surface detail. The FIELD keeps its shape ([0,1]-normalized either way);
+/// only the world amplitude clamps. Sobel-converted maps keep their exact
+/// `HEIGHT_NORMAL_STRENGTH` and never hit this.
+pub const N2H_AMP_CAP: f32 = 8.0;
+
+/// Implied bump amplitude of a converted height map, in TEXEL widths: the
+/// full black→white height range spans K texels of geometric height, so the
+/// Sobel normal is `normalize(−K·∂h, 1)` with ∂h in height-per-texel.
+/// Per-texel derivatives are the industry convention (GIMP/NVTT-class
+/// filters) and deliberately NOT resolution-normalized — per-UV-unit scaling
+/// would make a 4K map 4096× steeper than its content implies. The MTL's
+/// `-bm` (`Material::normal_scale`) still multiplies on top at decode time,
+/// and the relief march consumes the same K through `Material::height_amp`
+/// so the two modes describe one surface.
+pub const HEIGHT_NORMAL_STRENGTH: f32 = 2.0;
+
 /// One mip level below the base image (level 0 lives in `Texture::{w,h,
 /// texels}` unchanged — every existing consumer keeps its layout).
 pub struct Mip {
@@ -93,6 +146,17 @@ pub struct Texture {
     /// textures). The scene cache stores paths instead of texels and
     /// re-decodes on load, so texture identity must survive the roundtrip.
     pub source: String,
+    /// Generated from a grayscale height map by `height_to_normal` (RGB =
+    /// Sobel normal, A = the exact source height). Persisted by the scene
+    /// cache so the warm-load re-decode re-applies the conversion — the
+    /// cached material's `normal_tex` points at the CONVERTED texels, and a
+    /// warm load that skipped the conversion would shade the raw grayscale
+    /// as a normal map.
+    pub h2n: bool,
+    /// Height derived from this normal map by `normal_to_height` (Poisson /
+    /// Frankot–Chellappa) into the alpha channel, RGB untouched. Persisted
+    /// like `h2n` and for the same reason: a re-decoded file has alpha 255.
+    pub n2h: bool,
     /// Mip chain, levels 1.. down to 1×1 (floor-halving; level 0 is the base
     /// fields above). Built at decode time in LINEAR space (sRGB textures
     /// decode → average → re-encode; a gamma-space box filter darkens
@@ -108,7 +172,43 @@ impl Texture {
         let (w, h) = (rgba.width(), rgba.height());
         let texels: Vec<[u8; 4]> = rgba.pixels().map(|p| p.0).collect();
         let alpha_masked = srgb && texels.iter().any(|t| t[3] < 250);
-        let mut t = Texture { w, h, texels, alpha_masked, srgb, source: String::new(), mips: Vec::new() };
+        let mut t = Texture {
+            w,
+            h,
+            texels,
+            alpha_masked,
+            srgb,
+            source: String::new(),
+            h2n: false,
+            n2h: false,
+            mips: Vec::new(),
+        };
+        if MIPS_ENABLED.load(Relaxed) {
+            t.build_mips();
+        }
+        t
+    }
+
+    /// Reconstruct a texture from CACHED post-conversion texels (the world
+    /// sidecar's inline flavor — glTF textures have no decodable file path).
+    /// Flags are restored VERBATIM, never re-derived: `from_image` would
+    /// recompute `alpha_masked` from the texels and resurrect the junk-alpha
+    /// cutouts the glTF loader deliberately cleared on OPAQUE materials.
+    /// Mips are rebuilt fresh (never persisted — the scene-cache convention),
+    /// through the same `MIPS_ENABLED` lever check as `from_image`, so
+    /// `--no-mips` means the same thing on a warm world boot.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_cached(
+        w: u32,
+        h: u32,
+        texels: Vec<[u8; 4]>,
+        alpha_masked: bool,
+        srgb: bool,
+        source: String,
+        h2n: bool,
+        n2h: bool,
+    ) -> Texture {
+        let mut t = Texture { w, h, texels, alpha_masked, srgb, source, h2n, n2h, mips: Vec::new() };
         if MIPS_ENABLED.load(Relaxed) {
             t.build_mips();
         }
@@ -177,6 +277,112 @@ impl Texture {
         self.texels.iter().all(|t| t[0] == t[1] && t[1] == t[2])
     }
 
+    /// Convert a grayscale HEIGHT map into a tangent-space normal map: 3×3
+    /// Sobel derivatives with WRAP addressing (matching the repeat-wrap
+    /// samplers — a clamp here would seam every tiled floor), normal =
+    /// normalize(−K·∂h/∂u, −K·∂h/∂v, 1) with K = `HEIGHT_NORMAL_STRENGTH`.
+    /// The GREEN channel stores −n.y (OpenGL convention): derivatives here
+    /// are in image-row space (+y = +v), which is the TRUE tangent frame,
+    /// but `shade::perturb_normal` multiplies green by `NORMAL_MAP_Y_SIGN`
+    /// (−1) on every map it decodes — so the store pre-negates to land back
+    /// on the true normal (pinned end-to-end by `shade::tangent_self_test`).
+    /// ALPHA keeps the exact source height byte (h ∈ [0,1], 1 = the surface
+    /// plane) — the relief-render field, exact for these maps. Pure function
+    /// of the texels: deterministic, zero rng — the cache roundtrip and every
+    /// same-seed contract rely on it.
+    pub fn height_to_normal(&self) -> Texture {
+        let (w, h) = (self.w as i64, self.h as i64);
+        let hf = |x: i64, y: i64| -> f32 {
+            let xi = x.rem_euclid(w) as u32;
+            let yi = y.rem_euclid(h) as u32;
+            self.texels[(yi * self.w + xi) as usize][0] as f32 / 255.0
+        };
+        let enc = |c: f32| ((c * 0.5 + 0.5) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+        let mut texels = Vec::with_capacity(self.texels.len());
+        for y in 0..h {
+            for x in 0..w {
+                // Sobel: [-1,0,1] columns (left→right = +u) smoothed [1,2,1]
+                // across rows, and the transpose for +v (row 0 = v 0). The
+                // [-1,0,1] arm estimates 2·∂h and the smoothing sums to 4,
+                // so ∂h per texel = g/8.
+                let (mut gx, mut gy) = (0.0f32, 0.0f32);
+                for (d, wgt) in [(-1i64, 1.0f32), (0, 2.0), (1, 1.0)] {
+                    gx += wgt * (hf(x + 1, y + d) - hf(x - 1, y + d));
+                    gy += wgt * (hf(x + d, y + 1) - hf(x + d, y - 1));
+                }
+                let k = HEIGHT_NORMAL_STRENGTH;
+                let n = Vec3A::new(-k * gx / 8.0, -k * gy / 8.0, 1.0).normalize();
+                let src_h = self.texels[(y * w + x) as usize][0];
+                texels.push([enc(n.x), enc(-n.y), enc(n.z), src_h]);
+            }
+        }
+        let mut t = Texture {
+            w: self.w,
+            h: self.h,
+            texels,
+            alpha_masked: false,
+            srgb: false,
+            source: self.source.clone(),
+            h2n: true,
+            n2h: false,
+            mips: Vec::new(),
+        };
+        if MIPS_ENABLED.load(Relaxed) {
+            t.build_mips();
+        }
+        t
+    }
+
+    /// Derive a heightfield from this NORMAL map (Frankot–Chellappa): decode
+    /// each texel's slope exactly as `shade::perturb_normal` does (Y_SIGN
+    /// included, z-clamped), least-squares integrate the gradient field by
+    /// FFT over the wrap-repeat domain (periodic boundary conditions are
+    /// EXACT for repeat-wrap textures — this is the discrete solve, with the
+    /// central-difference transfer function, not the continuous ik), and pack
+    /// the [0,1]-normalized height into the ALPHA channel (RGB untouched;
+    /// the PEAK maps to 1.0 = the surface plane, so relief displacement is
+    /// strictly inward). Returns the peak-to-peak amplitude in TEXEL widths
+    /// (`Material::height_amp` units), or 0.0 when degenerate (flat map /
+    /// tiny dims) — in which case nothing is modified. The least-squares
+    /// projection discards the curl (non-integrable) part of hand-authored
+    /// maps; `N2H_HIGHPASS` damps the ill-conditioned lowest bins. Pure
+    /// function of the texels — deterministic, zero rng (the cache re-applies
+    /// it from the `n2h` flag on warm loads).
+    pub fn apply_n2h(&mut self) -> f32 {
+        let (w, h) = (self.w as usize, self.h as usize);
+        if w < 2 || h < 2 {
+            return 0.0;
+        }
+        let mut gx = vec![0.0f32; w * h];
+        let mut gy = vec![0.0f32; w * h];
+        for (i, t) in self.texels.iter().enumerate() {
+            let tnx = t[0] as f32 / 255.0 * 2.0 - 1.0;
+            let tny = (t[1] as f32 / 255.0 * 2.0 - 1.0) * crate::shade::NORMAL_MAP_Y_SIGN;
+            let tnz = (t[2] as f32 / 255.0 * 2.0 - 1.0).max(0.05);
+            gx[i] = -tnx / tnz;
+            gy[i] = -tny / tnz;
+        }
+        let hf = n2h_solve(&gx, &gy, w, h, N2H_HIGHPASS);
+        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        for &v in &hf {
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+        let amp = hi - lo;
+        if !(amp > 1e-4) {
+            return 0.0; // flat (or NaN — a corrupt map must not arm relief)
+        }
+        for (t, &v) in self.texels.iter_mut().zip(&hf) {
+            t[3] = (((v - lo) / amp) * 255.0 + 0.5) as u8;
+        }
+        self.n2h = true;
+        if !self.mips.is_empty() {
+            self.mips.clear();
+            self.build_mips();
+        }
+        amp
+    }
+
     /// Repeat-wrap a texture coordinate into [0, 1). Handles negatives
     /// (`-0.25 → 0.75`); non-finite inputs collapse to 0.
     #[inline]
@@ -188,6 +394,30 @@ impl Texture {
     #[inline]
     fn texel(&self, x: u32, y: u32) -> [u8; 4] {
         self.texels[(y * self.w + x) as usize]
+    }
+
+    /// ALU bilinear over the ALPHA channel at level 0, repeat wrap, texel
+    /// centers at i+0.5 — the relief march's field sampler, in [0,1].
+    /// NESTED-LERP form (`a + t·(b−a)`) deliberately: it is EXACT on
+    /// constant plateaus, which is what makes a 255-alpha region an exact
+    /// 1.0 field and the flat-field relief identity BITWISE (a weighted-sum
+    /// form lands ~1 ulp off 1.0 and the identity dies). Level 0 fixed —
+    /// visibility never touches mips (the alpha-cutout rule). Bit-mirrored
+    /// by trace_common.hlsli's `height_bilinear`; change both together.
+    #[inline]
+    pub fn height_bilinear(&self, u: f32, v: f32) -> f32 {
+        let x = Self::wrap(u) * self.w as f32 - 0.5;
+        let y = Self::wrap(v) * self.h as f32 - 0.5;
+        let (x0f, y0f) = (x.floor(), y.floor());
+        let (fx, fy) = (x - x0f, y - y0f);
+        let wrap_i = |i: i64, n: u32| i.rem_euclid(n as i64) as u32;
+        let (x0, x1) = (wrap_i(x0f as i64, self.w), wrap_i(x0f as i64 + 1, self.w));
+        let (y0, y1) = (wrap_i(y0f as i64, self.h), wrap_i(y0f as i64 + 1, self.h));
+        let a = |xx: u32, yy: u32| self.texel(xx, yy)[3] as f32;
+        let lerp = |p: f32, q: f32, t: f32| p + t * (q - p);
+        let bot = lerp(a(x0, y0), a(x1, y0), fx);
+        let top = lerp(a(x0, y1), a(x1, y1), fx);
+        lerp(bot, top, fy) / 255.0
     }
 
     /// Bilinear sample, repeat wrap, sRGB → linear. Returns linear RGB.
@@ -368,6 +598,72 @@ impl Texture {
     }
 }
 
+/// Least-squares integration of a per-texel gradient field over the periodic
+/// (wrap-repeat) domain — the discrete Frankot–Chellappa solve. Uses the
+/// CENTRAL-DIFFERENCE transfer function `D(f) = i·sin(2πf/N)` rather than the
+/// continuous `ik`, so gradients produced by central differencing (the Sobel
+/// forward's single-axis case) integrate back EXACTLY; bins where both
+/// transfers vanish (DC, the Nyquist checkerboards — content invisible to
+/// central differencing) stay zero. `highpass` (cycles) attenuates the
+/// ill-conditioned lowest bins by r²/(r²+hp²); 0.0 = off. Returns h per
+/// texel in the same length units as the input slopes (texel widths).
+fn n2h_solve(gx: &[f32], gy: &[f32], w: usize, h: usize, highpass: f32) -> Vec<f32> {
+    use rustfft::{FftPlanner, num_complex::Complex};
+    let mut planner = FftPlanner::<f32>::new();
+    let fft2 = |buf: &mut Vec<Complex<f32>>, planner: &mut FftPlanner<f32>, forward: bool| {
+        let fw =
+            if forward { planner.plan_fft_forward(w) } else { planner.plan_fft_inverse(w) };
+        for row in buf.chunks_exact_mut(w) {
+            fw.process(row);
+        }
+        let mut tr = vec![Complex::new(0.0f32, 0.0); w * h];
+        for y in 0..h {
+            for x in 0..w {
+                tr[x * h + y] = buf[y * w + x];
+            }
+        }
+        let fh =
+            if forward { planner.plan_fft_forward(h) } else { planner.plan_fft_inverse(h) };
+        for col in tr.chunks_exact_mut(h) {
+            fh.process(col);
+        }
+        for x in 0..w {
+            for y in 0..h {
+                buf[y * w + x] = tr[x * h + y];
+            }
+        }
+    };
+    let mut cgx: Vec<Complex<f32>> = gx.iter().map(|&v| Complex::new(v, 0.0)).collect();
+    let mut cgy: Vec<Complex<f32>> = gy.iter().map(|&v| Complex::new(v, 0.0)).collect();
+    fft2(&mut cgx, &mut planner, true);
+    fft2(&mut cgy, &mut planner, true);
+    let mut hh = vec![Complex::new(0.0f32, 0.0); w * h];
+    for fy in 0..h {
+        let sy = (std::f32::consts::TAU * fy as f32 / h as f32).sin();
+        let cy = if fy <= h / 2 { fy as f32 } else { fy as f32 - h as f32 };
+        for fx in 0..w {
+            let sx = (std::f32::consts::TAU * fx as f32 / w as f32).sin();
+            let denom = sx * sx + sy * sy;
+            if denom < 1e-12 {
+                continue;
+            }
+            let i = fy * w + fx;
+            // Ĥ = (conj(Dx)·Gx + conj(Dy)·Gy)/(|Dx|²+|Dy|²); conj(i·s) = −i·s.
+            let num = cgx[i] * Complex::new(0.0, -sx) + cgy[i] * Complex::new(0.0, -sy);
+            let mut v = num / denom;
+            if highpass > 0.0 {
+                let cx = if fx <= w / 2 { fx as f32 } else { fx as f32 - w as f32 };
+                let r2 = cx * cx + cy * cy;
+                v *= r2 / (r2 + highpass * highpass);
+            }
+            hh[i] = v;
+        }
+    }
+    fft2(&mut hh, &mut planner, false);
+    let norm = 1.0 / (w * h) as f32;
+    hh.iter().map(|c| c.re * norm).collect()
+}
+
 /// The CPU sampler's own tap budget per anisotropic sample — a COST knob, not
 /// a limit anyone else shares (the GPU resolves the same footprint in the TMU
 /// with no tap loop at all). `MAX_ANISO_CAP` is what bounds the ratio; this
@@ -385,8 +681,17 @@ pub fn self_test() -> bool {
         eprintln!("texture self-test: {msg}");
     };
     let mk = |w: u32, h: u32, texels: Vec<[u8; 4]>, srgb: bool| {
-        let mut t =
-            Texture { w, h, texels, alpha_masked: false, srgb, source: String::new(), mips: Vec::new() };
+        let mut t = Texture {
+            w,
+            h,
+            texels,
+            alpha_masked: false,
+            srgb,
+            source: String::new(),
+            h2n: false,
+            n2h: false,
+            mips: Vec::new(),
+        };
         t.build_mips();
         t
     };
@@ -529,6 +834,130 @@ pub fn self_test() -> bool {
         let b = t.sample_bilinear_linear(u, v);
         if a.to_array().map(f32::to_bits) != b.to_array().map(f32::to_bits) {
             fail("aniso(degenerate, linear) not bit-equal to bilinear_linear".into());
+            ok = false;
+        }
+    }
+
+    // --- height_to_normal (Sobel) -------------------------------------------
+    // Expected bytes are HAND-DERIVED constants (K = 2.0), never recomputed
+    // through the function under test.
+    //
+    // Constant field: zero gradient ⇒ exactly (128,128,255) with the source
+    // height in alpha, everywhere — borders included (paired with the ramp's
+    // wrap pin below, this is where a clamp bug can't hide).
+    let t = mk(4, 4, vec![[100, 100, 100, 255]; 16], false).height_to_normal();
+    if !(t.h2n && !t.srgb && !t.alpha_masked && !t.mips.is_empty()) {
+        fail("height_to_normal flags/mips wrong on the constant field".into());
+        ok = false;
+    }
+    if t.texels.iter().any(|&p| p != [128, 128, 255, 100]) {
+        fail(format!("constant height field: {:?}, want [128,128,255,100]", t.texels[0]));
+        ok = false;
+    }
+
+    // 4×1 x-ramp, reds [0,60,120,180]: interior column 1 sees ∂h/∂u =
+    // (120−0)/255/2 ⇒ n = normalize(−0.4706, 0, 1) ⇒ [73,128,243]; WRAP
+    // column 0 sees columns 3 and 1 ⇒ ∂h/∂u = (60−180)/255/2 < 0 ⇒
+    // [182,128,243] — clamp addressing would produce a different byte.
+    let ramp = |v: [u8; 4]| v.map(|c| [c, c, c, 255]).to_vec();
+    let t = mk(4, 1, ramp([0, 60, 120, 180]), false).height_to_normal();
+    if t.texels[1] != [73, 128, 243, 60] {
+        fail(format!("x-ramp interior texel {:?}, want [73,128,243,60]", t.texels[1]));
+        ok = false;
+    }
+    if t.texels[0] != [182, 128, 243, 0] {
+        fail(format!("x-ramp wrap texel {:?}, want [182,128,243,0] (wrap pin)", t.texels[0]));
+        ok = false;
+    }
+
+    // 1×4 y-ramp, same values down rows: green stores −n.y (the OpenGL-
+    // convention pre-negation `perturb_normal`'s NORMAL_MAP_Y_SIGN undoes),
+    // so an ASCENDING +v ramp encodes green ABOVE 128.
+    let t = mk(1, 4, ramp([0, 60, 120, 180]), false).height_to_normal();
+    if t.texels[1] != [128, 182, 243, 60] {
+        fail(format!("y-ramp interior texel {:?}, want [128,182,243,60] (pre-negation pin)", t.texels[1]));
+        ok = false;
+    }
+
+    // --- normal_to_height (Frankot–Chellappa) -------------------------------
+    // Round-trip: a single-axis cosine height field, Sobel-forward (exactly
+    // central differences when the field is constant along the other axis),
+    // then apply_n2h on the resulting NORMAL map must recover the source
+    // height up to normalization + u8 quantization. Single-frequency, so the
+    // high-pass attenuation is a pure scale the normalization absorbs.
+    let cosf = |i: u32, n: u32| {
+        (127.5 + 100.0 * (std::f32::consts::TAU * 3.0 * i as f32 / n as f32).cos() + 0.5) as u8
+    };
+    let norm_bytes = |a: &[u8]| -> Vec<u8> {
+        let (lo, hi) = (*a.iter().min().unwrap() as f32, *a.iter().max().unwrap() as f32);
+        a.iter().map(|&v| ((v as f32 - lo) / (hi - lo) * 255.0 + 0.5) as u8).collect()
+    };
+    for (w, h, along_x, label) in [(32u32, 8u32, true, "+u"), (8, 32, false, "+v")] {
+        let field: Vec<[u8; 4]> = (0..w * h)
+            .map(|i| {
+                let c = if along_x { cosf(i % w, w) } else { cosf(i / w, h) };
+                [c, c, c, 255]
+            })
+            .collect();
+        let src = mk(w, h, field.clone(), false).height_to_normal();
+        let mut rec = mk(w, h, field.clone(), false).height_to_normal();
+        let mut det = mk(w, h, field, false).height_to_normal();
+        let amp = rec.apply_n2h();
+        if !(amp > 0.0) || !rec.n2h {
+            fail(format!("n2h {label} round-trip: amp {amp} (want > 0)"));
+            ok = false;
+            continue;
+        }
+        // The expected alpha is the SOURCE height normalized to [0,255] —
+        // the h2n forward stored it verbatim, so normalize that.
+        let want = norm_bytes(&src.texels.iter().map(|t| t[3]).collect::<Vec<_>>());
+        let (mut sum, mut worst) = (0u32, 0u32);
+        for (t, &wb) in rec.texels.iter().zip(&want) {
+            let d = (t[3] as i32 - wb as i32).unsigned_abs();
+            sum += d;
+            worst = worst.max(d);
+        }
+        let mean = sum as f32 / want.len() as f32;
+        // An inverted sign convention comes back as 255−want (mean ≈ 120) —
+        // this is the end-to-end Y_SIGN pin for the INVERSE direction.
+        if mean > 6.0 || worst > 20 {
+            fail(format!("n2h {label} round-trip: mean |Δ| {mean:.1} worst {worst}"));
+            ok = false;
+        }
+        // Determinism (the cache re-applies the conversion on warm loads).
+        let amp2 = det.apply_n2h();
+        if amp2.to_bits() != amp.to_bits()
+            || det.texels.iter().zip(&rec.texels).any(|(a, b)| a[3] != b[3])
+        {
+            fail(format!("n2h {label} conversion is not deterministic"));
+            ok = false;
+        }
+    }
+
+    // Flat map: no gradient ⇒ amp 0.0, texture untouched (alpha keeps the
+    // source height byte, n2h stays false so the cache never re-applies).
+    let mut flat = mk(8, 8, vec![[90, 90, 90, 255]; 64], false).height_to_normal();
+    if flat.apply_n2h() != 0.0 || flat.n2h || flat.texels.iter().any(|t| t[3] != 90) {
+        fail("n2h flat map must be a no-op with amp 0".into());
+        ok = false;
+    }
+
+    // High-pass must-fire: a frequency-1 gradient (the ill-conditioned bin)
+    // is attenuated by 1/(1+hp²) = 1/5 at hp = 2 — the knob must bite there
+    // and must not zero it outright.
+    {
+        let (w, h) = (32usize, 8usize);
+        let gx: Vec<f32> = (0..w * h)
+            .map(|i| -(std::f32::consts::TAU * (i % w) as f32 / w as f32).sin())
+            .collect();
+        let gy = vec![0.0f32; w * h];
+        let span = |v: &[f32]| {
+            v.iter().fold(0.0f32, |a, &x| a.max(x)) - v.iter().fold(0.0f32, |a, &x| a.min(x))
+        };
+        let plain = span(&n2h_solve(&gx, &gy, w, h, 0.0));
+        let damped = span(&n2h_solve(&gx, &gy, w, h, 2.0));
+        if !(damped < 0.35 * plain && damped > 0.05 * plain) {
+            fail(format!("n2h high-pass: damped {damped:.3} vs plain {plain:.3}"));
             ok = false;
         }
     }

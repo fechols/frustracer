@@ -65,4 +65,5 @@ __pycache__/
 !/SDKs/fidelityfx-sdk/api/
 !/SDKs/fidelityfx-sdk/denoisers/
 !/SDKs/fidelityfx-sdk/upscalers/
+!/SDKs/fidelityfx-sdk/framegeneration/
 !/SDKs/fidelityfx-sdk/README.md

@@ -1,4 +1,4 @@
-//! GPU presentation layer: SDL2 hands us an HWND, we own a D3D12 device on
+//! GPU presentation layer: SDL3 hands us an HWND, we own a D3D12 device on
 //! the NVIDIA adapter, a DXGI swapchain, and the upload/fullscreen-pass
 //! machinery. Everything here consumes finished CPU frames after
 //! `render_frame`/`resolve` return — no tracer state is touched.
@@ -19,10 +19,20 @@ pub mod ffx_rr;
 pub mod ffx_sys;
 pub mod ffx_up;
 pub mod gputime;
+/// The HUD/menu overlay's GPU half: dirty-rect texture uploads + the
+/// premultiplied composite draw inside `fullscreen_to_backbuffer`.
+pub mod hud;
+/// Raw-NGX DLSS-G's guide conversion (`--fg` DLSS sessions): clip depth +
+/// reflection-aware motion vectors.
+pub mod ngxfg_guides;
 pub mod pix;
+/// `--quinlight`: the registered-consensus fuse of every wired upscaler.
+pub mod quin;
 pub mod rr;
 pub mod streamline;
 pub mod streamline_sys;
+pub mod bc7gpu;
+pub mod bloom;
 pub mod tonemap;
 pub mod trace;
 pub mod upload;
@@ -73,12 +83,49 @@ pub struct GpuOptions {
     /// A *request* — the swapchain may refuse the colour space, so read
     /// `GpuContext::hdr()` for what actually happened, never this.
     pub hdr: bool,
+    /// `--hdr10`: force the 10-bit PQ (R10G10B10A2 + G2084) swapchain in ANY
+    /// session — the A/B lever, and override-wins like `--hdr-peak` (it fires
+    /// even where the display probe says HDR is off; the probe can be wrong,
+    /// and a lever that no-ops exactly then is no escape hatch). Without it
+    /// the PQ arm is taken automatically only by the swapchain-wrapper FG
+    /// families on an HDR-on display. Read `GpuContext::encoding()` for what
+    /// actually happened.
+    pub hdr10: bool,
     /// Where linear 1.0 lands, in nits (`--hdr-paper-white`, default 200). The
     /// scene is authored so 1.0 ≈ diffuse white (see `scene::default_light`).
     pub paper_white: f32,
     /// Override the display's reported peak luminance (`--hdr-peak`). None =
     /// use whatever `gpu::hdr` probes from the monitor.
     pub peak_nits: Option<f32>,
+    /// `--quinlight`: wire EVERY chain level the box supports instead of the
+    /// first, run them all over the same traced frame, and present the
+    /// registered-consensus fuse of their outputs (gpu/quin.rs). The one
+    /// session shape where the "exactly one upscaler" rule is deliberately
+    /// suspended.
+    pub quin: bool,
+    /// `--quin-anchor N`: which engine defines the fuse's spatial frame (it is
+    /// never warped). None = the first wired engine, which is the highest chain
+    /// level present — i.e. a DENOISING one wherever the box has one, which is
+    /// what you want as the anchor (see the quin docs).
+    pub quin_anchor: Option<u32>,
+    /// Frame generation for the session — ON BY DEFAULT (`--no-fg` clears
+    /// it). Family follows the wired upscaler — native sessions (FSR4-RR /
+    /// FSR3 / XeSS) take the FidelityFX frame-interpolation swapchain built
+    /// here; DLSS sessions take raw-NGX DLSS-G when the shim is built in.
+    /// Unsupported combinations fall through with a loud line, never an
+    /// error (except explicit `--fg --quinlight`, rejected at parse).
+    pub fg: bool,
+    /// Whether `--fg` was PASSED rather than defaulted. One consumer: the
+    /// Streamline DLSS-G fallback (non-NDA builds, `!ngxfg::BUILT`) arms
+    /// only when explicit — it is the declines-to-insert open issue AND
+    /// rejects the scRGB swapchain, so the mere default must not trade a
+    /// flagless session's fp16 presentation for a frame generator that has
+    /// never been seen inserting.
+    pub fg_explicit: bool,
+    /// Directory holding amd_fidelityfx_framegeneration_dx12.dll (`--fg-path`;
+    /// the prebuilt drop ships it in the FSR sample dir, NOT next to the
+    /// loader the default --ffx-path points at).
+    pub fg_dir: String,
 }
 
 /// Which chain level a session actually wired — derived from the live state
@@ -86,6 +133,8 @@ pub struct GpuOptions {
 /// (--no-upscale or chain exhausted).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum WiredUpscaler {
+    /// --quinlight: several levels wired at once, presented through the fuse.
+    Quin,
     Rr,
     Fsr4,
     Xess,
@@ -126,6 +175,23 @@ impl FsrRes {
             FsrRes::Up(_) => crate::fsr::Flavor::Fsr3,
         }
     }
+
+    /// (depth, mvec, mv_scale) for the FG prepare — each flavor's plane pair
+    /// with the SAME mv_scale its own upscale dispatch uses (the trio carries
+    /// pixels, the RR plane UV deltas), so FG and upscaler read one MV
+    /// convention per session by construction.
+    fn fg_inputs(&self, rw: u32, rh: u32) -> (&ID3D12Resource, &ID3D12Resource, [f32; 2]) {
+        match self {
+            FsrRes::Up(r) => {
+                let (d, m) = r.fg_inputs();
+                (d, m, [crate::fsr::UPSCALE_MV_SIGN.0, crate::fsr::UPSCALE_MV_SIGN.1])
+            }
+            FsrRes::Rr(r) => {
+                let (d, m) = r.fg_inputs();
+                (d, m, [crate::fsr::UPSCALE_MV_SIGN.0 * rw as f32, crate::fsr::UPSCALE_MV_SIGN.1 * rh as f32])
+            }
+        }
+    }
 }
 
 /// Live FSR contexts on the native device + the flavor's resources and the
@@ -142,6 +208,298 @@ struct FsrState {
     max: (u32, u32),
 }
 
+/// Frame generation over the FidelityFX frame-interpolation swapchain (the
+/// native-session `--fg` family — DLSS sessions use DLSS-G instead). The FI
+/// swapchain proxy replaced `D3d::swapchain` at creation (d3d12::SwapWrap);
+/// `sc` is the context that owns it, `ctx` the display-size-bound FG effect
+/// (None = creation failed or resize is mid-rebuild — the proxy then presents
+/// passthrough, never wrongly).
+///
+/// The per-frame protocol ("prepared" handshake): an arm that can feed FG
+/// calls `GpuContext::fg_prepare` before `fullscreen_to_backbuffer` — that
+/// advances `frame_id` by EXACTLY 1 (the ffx contract; any other delta resets
+/// interpolation history), configures the swapchain live, and records the
+/// PrepareV2 dispatch (depth + MVs) into the frame's list. The funnel then
+/// consumes `prepared`; a frame presented WITHOUT a prepare (plain arms, mode
+/// switches, the pause-menu hold) finds it false and configures the FI
+/// swapchain DISABLED first, so pacing never runs against stale motion.
+/// Cells because the funnel and the hold path run on `&self`.
+struct FgState {
+    sc: ffx::FgSwapchain,
+    ctx: Option<ffx::FgContext>,
+    /// The user-facing toggle (`--fg` starts true; set_fg_enabled flips).
+    enabled: bool,
+    /// What the FI swapchain was last CONFIGURED to (avoid re-issuing
+    /// disable configures every held frame).
+    live: std::cell::Cell<bool>,
+    /// Set by fg_prepare, consumed by fullscreen_to_backbuffer.
+    prepared: std::cell::Cell<bool>,
+    frame_id: std::cell::Cell<u64>,
+    /// Last frame's wall time, stashed once per loop by `fg_set_frame_ms`
+    /// (main.rs owns the clock — the renderer never reads one), read by every
+    /// arm's prepare. Pacing quality follows this number.
+    frame_ms: std::cell::Cell<f32>,
+    /// (min, max) nits handed to the HDR dispatch patch; (0,0) = SDR, no
+    /// patch.
+    luminance: [f32; 2],
+    /// The picked provider (override id + display name) — the boot line and
+    /// the title bar read the name.
+    version: (u64, String),
+}
+
+/// Raw-NGX DLSS-G FFI (shim/dlssg_shim.cpp — the quinlight-player blueprint).
+/// The dispatch struct exists in BOTH cfg arms so the call sites typecheck;
+/// without the NDA-tier SDK at build time the fns stub to UNSUPPORTED and
+/// the session falls back to the Streamline DLSS-G attempt.
+mod ngxfg {
+    use std::ffi::c_void;
+
+    pub const ERR_UNSUPPORTED: i32 = -3;
+
+    #[repr(C)]
+    pub struct FrDlssgDispatch {
+        pub cmdlist: *mut c_void,
+        pub color: *mut c_void,
+        pub motion: *mut c_void,
+        pub depth: *mut c_void,
+        pub output: *mut c_void,
+        pub frame_id: u64,
+        pub reset: i32,
+        pub view_to_clip: [f32; 16],
+        pub clip_to_view: [f32; 16],
+        pub clip_to_prev_clip: [f32; 16],
+        pub prev_clip_to_clip: [f32; 16],
+        pub jitter: [f32; 2],
+        pub mv_scale: [f32; 2],
+        pub cam_pos: [f32; 3],
+        pub cam_up: [f32; 3],
+        pub cam_right: [f32; 3],
+        pub cam_fwd: [f32; 3],
+        pub cam_near: f32,
+        pub cam_far: f32,
+        pub cam_fov: f32,
+        pub cam_aspect: f32,
+        pub rend_w: u32,
+        pub rend_h: u32,
+        pub depth_inverted: i32,
+    }
+    // The dlssg_shim.cpp twin asserts the identical literals (the ffx FG
+    // desc discipline: pin the padding-hole shapes on both sides).
+    const _: () = assert!(std::mem::offset_of!(FrDlssgDispatch, view_to_clip) == 52);
+    const _: () = assert!(std::mem::size_of::<FrDlssgDispatch>() == 400);
+
+    #[cfg(dlssg_ngx)]
+    pub const BUILT: bool = true;
+    #[cfg(dlssg_ngx)]
+    unsafe extern "C" {
+        pub fn frdlssg_create(
+            device: *mut c_void,
+            disp_w: u32,
+            disp_h: u32,
+            rend_w: u32,
+            rend_h: u32,
+            color_hdr: i32,
+            out_handle: *mut *mut c_void,
+        ) -> i32;
+        pub fn frdlssg_dispatch(handle: *mut c_void, d: *const FrDlssgDispatch) -> i32;
+        /// FEATURE-scoped res move: ReleaseFeature + CreateFeature at the new
+        /// render res — params/init untouched (destroy's DestroyParameters
+        /// killed the SHARED SL NGX parameter map mid-session and every
+        /// subsequent sl.dlss_d evaluate failed 0xBAD00004 FeatureNotFound).
+        pub fn frdlssg_recreate(handle: *mut c_void, rend_w: u32, rend_h: u32) -> i32;
+        pub fn frdlssg_destroy(handle: *mut c_void);
+    }
+
+    #[cfg(not(dlssg_ngx))]
+    pub const BUILT: bool = false;
+    #[cfg(not(dlssg_ngx))]
+    #[allow(clippy::missing_safety_doc)]
+    pub unsafe fn frdlssg_create(
+        _device: *mut c_void,
+        _dw: u32,
+        _dh: u32,
+        _rw: u32,
+        _rh: u32,
+        _hdr: i32,
+        _out: *mut *mut c_void,
+    ) -> i32 {
+        ERR_UNSUPPORTED
+    }
+    #[cfg(not(dlssg_ngx))]
+    #[allow(clippy::missing_safety_doc)]
+    pub unsafe fn frdlssg_dispatch(_h: *mut c_void, _d: *const FrDlssgDispatch) -> i32 {
+        ERR_UNSUPPORTED
+    }
+    #[cfg(not(dlssg_ngx))]
+    #[allow(clippy::missing_safety_doc)]
+    pub unsafe fn frdlssg_recreate(_h: *mut c_void, _rw: u32, _rh: u32) -> i32 {
+        ERR_UNSUPPORTED
+    }
+    #[cfg(not(dlssg_ngx))]
+    #[allow(clippy::missing_safety_doc)]
+    pub unsafe fn frdlssg_destroy(_h: *mut c_void) {}
+}
+
+/// How many consecutive FG dispatches a MOVED render res must hold before
+/// the NGX feature recreates at it. The feature is fixed-res by creation, so
+/// following a res move costs a feature release + re-create (queue drain
+/// included) — fine once per SPACE/F mode switch, ruinous per frame under a
+/// `--lock-res dynamic` ramp, whose per-frame res changes must never
+/// qualify. 8 ≈ under a tenth of a second at interactive rates.
+const FG_RECREATE_STABLE: u32 = 8;
+
+/// Raw-NGX DLSS-G state (DLSS sessions when the shim is compiled in — see
+/// `ngxfg`). No swapchain wrap, no pacer, no handshake: WE evaluate the
+/// interpolated frame into `out` and present it BEFORE the real frame
+/// (pair-present; vsync spaces the two). The NGX feature is created LAZILY at
+/// the first dispatch — the session's locked render res is main.rs's
+/// decision, unknown at GpuContext::new.
+struct NgxFgState {
+    /// The interpolated-frame target: window-res RGBA16F, rests
+    /// PIXEL_SHADER_RESOURCE (tonemap source at SRV_SLOT_NGXFG), UAV during
+    /// the evaluate.
+    out: ID3D12Resource,
+    handle: std::cell::Cell<*mut std::ffi::c_void>,
+    /// The render res the feature was created at; (0,0) = not yet created.
+    /// The NGX feature is fixed-res by creation
+    /// (DynamicResolutionScaling=false) — a frame at a different res skips
+    /// FG until the moved res HOLDS `FG_RECREATE_STABLE` dispatches, then
+    /// the feature FEATURE-SCOPE-recreates at it in place
+    /// (`frdlssg_recreate` — never a destroy; see `res_pend` and TRAP 8).
+    dims: std::cell::Cell<(u32, u32)>,
+    enabled: bool,
+    failed: std::cell::Cell<bool>,
+    /// A previous frame seeded the feature's internal history — the
+    /// interpolated output is only presentable when the PAIR exists.
+    primed: std::cell::Cell<bool>,
+    frame_id: std::cell::Cell<u64>,
+    /// The recreate-storm guard: (pending res, consecutive dispatches seen
+    /// at it). A SPACE/F mode switch moves the render res ONCE (the CPU
+    /// arm's quality-2/3 vs the GPU arms' native default) and then holds —
+    /// it recreates a fraction of a second in; a `--lock-res dynamic` RAMP
+    /// changes res every frame, never qualifies, and keeps skipping (the
+    /// pre-recreate behavior); a completed DRS step holds >= the 90-frame
+    /// dwell and recreates once per adoption.
+    res_pend: std::cell::Cell<((u32, u32), u32)>,
+    /// Whether the last present was a PAIR (interpolated + real) — exact by
+    /// construction, since this path calls Present itself. The title bar's
+    /// presented-per-rendered multiplier.
+    pair: std::cell::Cell<bool>,
+    /// The guide-conversion pass (see `ngxfg_guides.rs`): clip depth (the FG
+    /// snippet's depth contract is DLSS-SR's [0,1] buffer, not RR's linear
+    /// tag) + reflection-aware MVs (the virtual-image blend — the
+    /// DamagedHelmet reflection-swim fix). `None` = BOTH levers disabled it
+    /// or a loud creation failure — the evaluate then gets the raw RR
+    /// planes.
+    guides: Option<std::cell::RefCell<ngxfg_guides::GuidePass>>,
+    /// A guide-pass `ensure` failed at feature creation — loud once, then
+    /// the raw-plane arms (never a session failure).
+    guides_failed: std::cell::Cell<bool>,
+    /// FR_NGXFG_DEPTH=linear — hand the evaluate the raw linear view-Z plane
+    /// (the round-1 A/B arm).
+    depth_linear: bool,
+    /// FR_NGXFG_RMV=off — hand the evaluate the raw SURFACE-MV plane (the
+    /// A/B arm that brings the reflection swimming back on demand).
+    rmv_off: bool,
+    /// FR_NGXFG_JITTER: 0 = the SL-negated default, 1 = zero, 2 = raw
+    /// (un-negated). Empirical-settling lever — quinlight validated the
+    /// snippet with jitter (0,0) only.
+    jitter_mode: u8,
+    /// FR_NGXFG_MV: 0 = pixel scale {1,1} — THE DEFAULT, settled from
+    /// dlssg-to-fsr3, which passes DLSSG.MvecScale STRAIGHT into FSR3's
+    /// motionVectorScale (unit: pixels) and works across shipped SL titles;
+    /// the SDK header's "[-1,1]" comment is stale, and the quinlight-era
+    /// {1/rw,1/rh} starved the snippet of geometry motion ~2000× (zero MVs
+    /// in quinlight meant any scale "worked"). 1 = "norm" {1/rw,1/rh} (the
+    /// round-1 arm), 2 = "neg" {-1,-1}, 3 = "normneg" {-1/rw,-1/rh}.
+    mv_mode: u8,
+    /// FR_NGXFG_SHOW: 0 = normal pair (interp, then real). 1 = "interp" —
+    /// the INTERPOLATED frame for both halves, so its artifacts are
+    /// inspectable at full rate instead of strobing against the real frame.
+    /// 2 = "real" — the REAL frame for both halves (the evaluate still
+    /// runs): NOTHING NGX-made reaches the screen, so any artifact that
+    /// survives is in the PRESENT PATH, not the generated frames — the
+    /// process-of-elimination null test.
+    show_mode: u8,
+    /// FR_NGXFG_CAM=identity — quinlight's exact camera block (identity
+    /// matrices, axis-aligned basis, near .1/far 10000/fov 60°): the
+    /// configuration the snippet was PROVEN with on this box. Calmer
+    /// artifacts under it = our camera-matrix plumbing is the poison.
+    cam_identity: bool,
+    /// FR_NGXFG_MAT=col — pass glam's column-major matrices raw instead of
+    /// `row_major`. quinlight's identity matrices are transpose-invariant,
+    /// so the raw-NGX matrix majority was never validated (SL may transpose
+    /// internally before setting the DLSSG params).
+    mat_col: bool,
+}
+
+/// XeSS-FG frame generation (Intel XeSS sessions — the third `--fg` family).
+/// The xefg swapchain proxy does interpolation + pacing at Present (the ffx
+/// FI shape); XeLL is created and linked inside the wrap (a hard xefg
+/// requirement). Same funnel handshake as DLSS-G: the funnel READS
+/// `prepared` (an unprepared present disables generation), `xefg_end_frame`
+/// consumes it after the XeLL present markers.
+struct XefgState {
+    sc: crate::xess_fg::XefgSwapchain,
+    enabled: bool,
+    on: std::cell::Cell<bool>,
+    prepared: std::cell::Cell<bool>,
+    failed: std::cell::Cell<bool>,
+    /// The xefg presentId — u32, +1 per prepared frame (tags, constants,
+    /// XeLL sleep/markers all key on it).
+    frame_id: std::cell::Cell<u32>,
+    poll: std::cell::Cell<u32>,
+    logged: std::cell::Cell<bool>,
+    /// Last healthy poll's frames-presented-per-present (0 = not yet
+    /// measured). The title bar's presented-per-rendered multiplier.
+    mult: std::cell::Cell<u32>,
+}
+
+/// DLSS-G frame generation (DLSS sessions — the SL-family counterpart of
+/// `FgState`; exactly one family per session). The SL proxy swapchain does
+/// the interpolation at Present; this side owns the mode transitions and the
+/// Reflex/PCL contract. Same handshake discipline as FgState with one twist:
+/// the funnel READS `prepared` without consuming (an unprepared present
+/// turns DLSS-G's mode off) and `dlssg_end_frame` consumes it after the
+/// present markers — the markers bracket the Present itself, which happens
+/// AFTER the funnel.
+struct DlssgState {
+    /// The user-facing toggle (`--fg` starts true).
+    enabled: bool,
+    /// What SL was last told (mode eOn/eOff) — mode flips are edges.
+    on: std::cell::Cell<bool>,
+    /// Set by dlssg_frame_begin; read by the funnel; consumed by
+    /// dlssg_end_frame.
+    prepared: std::cell::Cell<bool>,
+    /// Status poll tripped (HAGS off, resolution too low, HDR format…) —
+    /// sticky off + one loud line, the pink-overlay guard.
+    failed: std::cell::Cell<bool>,
+    /// Prepared-frame counter driving the periodic status poll.
+    poll: std::cell::Cell<u32>,
+    /// First successful poll logged the presented/rendered ratio (the
+    /// headless proof generation is happening).
+    logged: std::cell::Cell<bool>,
+    /// Last healthy second-interval poll's numFramesActuallyPresented — the
+    /// per-present multiplier (0 = not yet measured; 1 = generated frames
+    /// not landing). The title bar reads it.
+    mult: std::cell::Cell<u32>,
+}
+
+/// The trace res must sit inside this context's SDK range. The caller already
+/// quantize_res-clamped it, but the range is the SDK's contract, so a drift
+/// fails loudly at init rather than quietly at execute. Split out of
+/// `wire_fsr_feed` because a `--quinlight` FSR 3.1 that SHARES the XeSS feed
+/// still has to satisfy its own range — one frame is traced for every engine.
+fn fsr_range_check(fs: &FsrState, rw: u32, rh: u32) -> Result<()> {
+    if rw < fs.min.0 || rh < fs.min.1 || rw > fs.max.0 || rh > fs.max.1 {
+        return Err(format!(
+            "trace res {}x{} outside FSR render range {}x{}..{}x{}",
+            rw, rh, fs.min.0, fs.min.1, fs.max.0, fs.max.1
+        ));
+    }
+    Ok(())
+}
+
 /// Field order is drop order (Rust drops in declaration order), and teardown
 /// must mirror Streamline's documented shutdown sequence: release the proxied
 /// queue/swapchain (`d3d`, which also waits the GPU idle) and both proxy
@@ -150,8 +508,28 @@ struct FsrState {
 pub struct GpuContext {
     d3d: D3d,
     passes: tonemap::Passes,
+    /// Glare. Always built (never Option): the tonemap PS declares its halo SRV
+    /// unconditionally, so the descriptor must be valid even under `--no-bloom`,
+    /// where the pass simply isn't recorded and strength is 0.
+    bloom: bloom::BloomGpu,
     blit: upload::BlitUpload,
     hdr: upload::HdrUpload,
+    /// The HUD/menu overlay (gpu/hud.rs): window-sized premultiplied RGBA8,
+    /// dirty-rect-uploaded, composited by `fullscreen_to_backbuffer` in every
+    /// present arm. Always built (cheap); `visible` gates the draw.
+    hud: hud::HudGpu,
+    /// What `fullscreen_to_backbuffer` last presented `(use_tonemap, srv_slot,
+    /// inv_samples)` — `present_again`'s re-present source (the pause menu
+    /// holds the frame without tracing). Cell: the recorder is `&self`.
+    last_present: std::cell::Cell<Option<(bool, u32, f32)>>,
+    /// The SHARED scene core both GPU tracers hold an Rc of: uploaded once
+    /// per session by whichever of init_trace/init_dxr runs first, so the
+    /// second tracer (and every resize re-entry — the device survives
+    /// resize_output) skips the scene upload + BLAS build entirely. Cleared
+    /// by drop_scene_tracers (the scene was edited) and by the init-failure
+    /// eviction arm (a session with no live tracer must not strand ~9 GB
+    /// under the CPU renderer).
+    scene_gpu: Option<std::rc::Rc<trace::SceneGpu>>,
     /// The GPU-resident tracer (--gpu): quadtree + shading in compute with
     /// RayQuery rays. Lives on whatever device the queue runs on (v1 forces
     /// the native pipeline — main.rs disables DLSS/XeSS/OIDN under --gpu).
@@ -164,11 +542,24 @@ pub struct GpuContext {
     /// torn down by GpuContext::drop after a queue drain — xessDestroyContext
     /// requires completed command lists and a live device.
     xess: Option<XessState>,
-    /// FSR (native pipeline only; never coexists with `sl` or `xess`). Same
-    /// teardown discipline: ffxDestroyContext needs completed lists and a
-    /// live device, so GpuContext::drop drains the queue and drops this
-    /// explicitly.
+    /// FSR. Normally the session's ONE wired flavor (FSR4-RR or FSR 3.1); under
+    /// --quinlight it is the FSR4-RR flavor and `fsr3` holds 3.1 alongside it.
+    /// Teardown discipline: ffxDestroyContext needs completed lists and a live
+    /// device, so GpuContext::drop drains the queue and drops this explicitly.
     fsr: Option<FsrState>,
+    /// --quinlight only: the FSR 3.1 upscale-only context, live ALONGSIDE
+    /// `fsr` (FSR4-RR). They are two contexts of the same ffx effect at
+    /// different provider versions — independent, so both can be created.
+    fsr3: Option<FsrState>,
+    /// --quinlight: the fuse pass over every wired engine's output. It AddRefs
+    /// the engine output textures it reads, so it may drop in any order
+    /// relative to them; GpuContext::drop still tears it down explicitly after
+    /// the queue drain, like every other GPU-resource field.
+    quin: Option<quin::Quin>,
+    /// The --quinlight session config, kept because the fuse is built lazily
+    /// from init_trace/init_dxr (which hold the DXC its PSO needs) and those do
+    /// not take a GpuOptions. `(anchor, debug)`; None = not a quinlight session.
+    quin_cfg: Option<(Option<u32>, bool)>,
     /// GPU-resident NPPD (`--gpu --nppd`, XeSS sessions only): ONNX Runtime
     /// executing on `d3d.queue` with the tracer's NppdRes buffers bound as
     /// tensors. Dropped before `trace`'s resources it wraps is fine — the
@@ -177,13 +568,31 @@ pub struct GpuContext {
     /// Whether the recurrent state carries history (false forces the next
     /// NPPD frame to zero the warped-state input — a reset).
     nppd_state_valid: bool,
+    /// Frame generation (native sessions; see FgState). Declared AFTER `d3d`
+    /// deliberately: d3d's swapchain/backbuffer refs on the FI proxy must
+    /// release before FgState's drop destroys the swapchain context.
+    fg: Option<FgState>,
+    /// DLSS-G frame generation (DLSS sessions; see DlssgState). No drop
+    /// constraint — it holds no COM refs, and `sl` (declared last) outlives
+    /// it by the existing field order.
+    fg_g: Option<DlssgState>,
+    /// XeSS-FG frame generation (Intel XeSS sessions; see XefgState).
+    /// Declared AFTER `d3d` like `fg`: destroying the xefg context tears the
+    /// FI proxy down, so d3d's proxy refs must release first.
+    fg_x: Option<XefgState>,
+    /// Raw-NGX DLSS-G (DLSS sessions with the NDA SDK built in; see
+    /// NgxFgState). The NGX handle is destroyed explicitly in Drop /
+    /// resize_output after a queue drain — no COM field-order constraint.
+    fg_n: Option<NgxFgState>,
     /// Kept alive for the app lifetime: the hooked CreateCommandQueue /
     /// CreateSwapChain entry points live on these (Frame Gen will need them
     /// again), and dropping them to refcount 0 destroys the SL wrappers.
     _proxy_device: Option<ID3D12Device>,
     _proxy_factory: Option<IDXGIFactory6>,
     pub adapter_name: String,
-    pub adapter_is_nvidia: bool,
+    /// What the picked adapter IS (not what `--prefer-*` asked for) — the input
+    /// to `main::vendor_defaults`.
+    pub adapter_vendor: adapter::Vendor,
     /// The presentation curve every present arm reads (see
     /// `fullscreen_to_backbuffer`). One field, so a display change is a retune.
     tone: crate::tone::ToneParams,
@@ -211,15 +620,42 @@ fn rr_sl_sequence(
     list: &ID3D12GraphicsCommandList,
     fc: &dlss::FrameConstants,
     frame_idx: u32,
+    dlssg: bool,
 ) -> Result<()> {
     let _ev = pix::scope(list, c"rr-eval");
     let list_raw = list.as_raw();
     let token = sl.new_frame_token(frame_idx)?;
     sl.set_constants(token, 0, &shim_constants(fc))?;
     sl.dlssd_set_options(0, &shim_options(fc, rr.ow, rr.oh))?;
-    sl.tag_resources(token, 0, &rr.tags(fc.rw, fc.rh), list_raw)?;
+    sl.tag_resources(token, 0, &rr.tags(fc.rw, fc.rh, dlssg), list_raw)?;
     sl.evaluate(streamline_sys::FEATURE_DLSS_RR, token, 0, list_raw)?;
     Ok(())
+}
+
+/// Register a texture the tonemap can present FROM: its SRV goes into the
+/// tonemap's heap (for the draw) and into the glare pyramid's heap (for the
+/// compute read), in the matching slot of each.
+///
+/// The two are paired here, in one call, deliberately. Only ONE CBV_SRV_UAV heap
+/// may be bound at a time, so bloom cannot reach into the tonemap's heap — and it
+/// cannot copy the descriptor across at present time either, because
+/// `CopyDescriptors` may not READ from a shader-visible heap. Each source
+/// therefore needs its descriptor created in BOTH heaps, and a source that got
+/// one but not the other would present fine and simply lose its glare — a silent
+/// failure. Route every tonemap source through here and it can't happen.
+///
+/// (`SRV_SLOT_BLOOM` is bloom's OUTPUT into the tonemap heap and is not a source;
+/// it stays a plain `Passes::create_srv`.)
+fn wire_tonemap_src(
+    device: &ID3D12Device,
+    passes: &tonemap::Passes,
+    bloom: &bloom::BloomGpu,
+    res: &ID3D12Resource,
+    format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+    slot: u32,
+) {
+    passes.create_srv(device, res, format, slot);
+    bloom.create_source_srv(device, res, format, slot);
 }
 
 impl GpuContext {
@@ -228,12 +664,28 @@ impl GpuContext {
         // DXGI factory exists — which is why DLSS is structurally the top of
         // the chain: it decides the SL-proxy-vs-native device split before
         // anything else can be probed.
+        // --fg in a DLSS session = DLSS-G. When the raw-NGX shim is built in
+        // (the quinlight-player blueprint — see `ngxfg`), that path owns
+        // frame generation and the Streamline DLSS-G feature is NOT
+        // requested (SL's dlfg present layer is the declines-to-insert open
+        // issue the NGX path exists to bypass); Reflex/PCL likewise stay
+        // unloaded. Without the SDK, the SL attempt remains (with its hard
+        // Reflex prerequisite) — features cannot be loaded after slInit —
+        // but only under an EXPLICIT --fg: fg is on by default now, and the
+        // defaulted arm must not swap the scRGB swapchain for a present
+        // layer that has never been seen inserting (`fg_explicit`).
+        let fg_sl = opts.fg && opts.fg_explicit && !opts.quin && !ngxfg::BUILT;
+        let sl_features: &[u32] = if fg_sl {
+            &[
+                streamline_sys::FEATURE_DLSS_RR,
+                streamline_sys::FEATURE_DLSS_G,
+                streamline_sys::FEATURE_REFLEX,
+            ]
+        } else {
+            &[streamline_sys::FEATURE_DLSS_RR]
+        };
         let mut sl = if opts.chain.dlss {
-            match streamline::SlContext::init(
-                &opts.sl_dir,
-                &[streamline_sys::FEATURE_DLSS_RR],
-                opts.debug,
-            ) {
+            match streamline::SlContext::init(&opts.sl_dir, sl_features, opts.debug) {
                 Ok(s) => {
                     eprintln!("dlss: Streamline initialized ({})", opts.sl_dir);
                     Some(s)
@@ -252,7 +704,7 @@ impl GpuContext {
         let prefer = opts.prefer.unwrap_or(adapter::Prefer::Nvidia);
         let pick = adapter::pick(&factory, prefer)?;
         eprintln!("gpu: using adapter \"{}\"", pick.name);
-        if sl.is_some() && !pick.is_nvidia {
+        if sl.is_some() && pick.vendor != adapter::Vendor::Nvidia {
             eprintln!("dlss: level unavailable (no NVIDIA adapter) — falling through the chain");
             sl = None;
         }
@@ -265,18 +717,148 @@ impl GpuContext {
 
         let device = d3d12::create_device(&pick.adapter, opts.debug)?;
 
+        // Frame generation, DLSS family (DLSS-G through the SL proxy
+        // swapchain the session already presents on). Probed here — before
+        // the swapchain exists — because DLSS-G's one hard swapchain
+        // constraint must shape the format choice below: it rejects the
+        // scRGB fp16 swapchain outright (guide §11, runtime
+        // eFailHDRFormatNotSupported), so a G session presents SDR 8-bit.
+        // G's absence never affects RR.
+        let mut fg_dlssg = false;
+        if fg_sl {
+            if let Some(s) = &sl {
+                match s.is_feature_supported(streamline_sys::FEATURE_DLSS_G, pick.luid) {
+                    Ok(()) => fg_dlssg = true,
+                    Err(e) => eprintln!(
+                        "fg: DLSS-G unavailable ({e}) — frame generation off (RR unaffected)"
+                    ),
+                }
+            }
+        } else if opts.fg && !opts.quin && !ngxfg::BUILT && sl.is_some() {
+            // Defaulted fg in a DLSS session on a non-SDK build: the SL
+            // DLSS-G fallback is deliberately not armed (see fg_sl above) —
+            // say so once instead of silently presenting without generation.
+            eprintln!(
+                "fg: on by default, but the Streamline DLSS-G fallback is explicit-only \
+                 (declines-to-insert open issue; it would also cost the scRGB swapchain) — \
+                 pass --fg to arm it, or build with the DLSS SDK for the raw-NGX path"
+            );
+        }
+        // Frame generation, Intel family (the XeSS-FG swapchain, XeLL
+        // linked): taken when the chain is headed for the XeSS level on an
+        // Intel adapter — the family follows the upscaler. The wrap happens
+        // inside D3d::with_queue like the ffx one; a failed wrap/init is a
+        // loud line + a normal session.
+        let try_xefg = opts.fg
+            && sl.is_none()
+            && !opts.quin
+            && pick.vendor == adapter::Vendor::Intel
+            && opts.chain.xess;
+
+        // Both DLSS-G and XeSS-FG reject the scRGB fp16 swapchain (DLSS-G by
+        // documented policy, XeSS-FG measured: InitFromSwapChain returns
+        // INVALID_ARGUMENT on R16G16B16A16_FLOAT) — but 10-bit PQ is the
+        // format HDR FG titles actually ship, so on an HDR-on display those
+        // sessions take the HDR10 arm instead of dropping to SDR 8-bit (the
+        // probe needs only adapter+hwnd, so it can run before the swapchain
+        // exists). The ffx family supports scRGB and keeps it. `--hdr10`
+        // forces the PQ arm in any session (the A/B lever; override-wins,
+        // including over an "HDR off" probe verdict — the --hdr-peak
+        // doctrine). If the wrap still rejects the 10-bit chain,
+        // D3d::with_queue rebuilds at SDR and wraps again — FG is why the
+        // session exists, so SDR with FG beats HDR10 without it.
+        let fg_wrapper = fg_dlssg || try_xefg;
+        let want = if !opts.hdr {
+            d3d12::PresentSpace::Sdr
+        } else if opts.hdr10 {
+            d3d12::PresentSpace::Hdr10
+        } else if fg_wrapper {
+            if display::probe(&pick.adapter, hwnd).enabled {
+                d3d12::PresentSpace::Hdr10
+            } else {
+                d3d12::PresentSpace::Sdr
+            }
+        } else {
+            d3d12::PresentSpace::Scrgb
+        };
+        if fg_wrapper && opts.hdr {
+            let family = if fg_dlssg { "DLSS-G" } else { "XeSS-FG" };
+            match want {
+                d3d12::PresentSpace::Hdr10 => eprintln!(
+                    "fg: {family} rejects the scRGB fp16 swapchain — presenting HDR10/PQ \
+                     (R10G10B10A2, G2084; --no-fg restores scRGB)"
+                ),
+                _ => eprintln!(
+                    "fg: {family} rejects the scRGB fp16 swapchain and the display reports \
+                     HDR off — presenting SDR 8-bit (--no-fg restores scRGB; --hdr10 forces PQ)"
+                ),
+            }
+        }
+        if fg_dlssg {
+            // Hardware-accelerated GPU scheduling is a hard DLSS-G
+            // requirement the support probe does NOT surface. Ask the DRIVER
+            // (D3DKMT — the query the Settings page reads); a registry
+            // heuristic misreads Windows 11's default-on-with-absent-key
+            // common case, which shipped here once.
+            match adapter::hags_enabled(pick.luid) {
+                Some(true) => eprintln!("fg: hardware-accelerated GPU scheduling on (driver-confirmed)"),
+                Some(false) => eprintln!(
+                    "fg: hardware-accelerated GPU scheduling is OFF — DLSS-G will validate but \
+                     DROP every generated frame. Enable it (Settings > System > Display > \
+                     Graphics > Default graphics settings) and reboot."
+                ),
+                None => eprintln!("fg: hardware-accelerated GPU scheduling state unknown (query failed)"),
+            }
+        }
+
+        // Frame generation, native family (the ffx frame-interpolation
+        // swapchain). Decided BEFORE the swapchain exists because the FI
+        // proxy owns the backbuffers the session renders into — the wrap
+        // happens inside D3d::with_queue, between colour-space negotiation
+        // and RTV creation. Arm only when a device-filtered FG provider
+        // version actually enumerates; every failure is a loud line + a
+        // normal session (the chain-fallback shape).
+        let mut fg_versions: Vec<ffx::Version> = Vec::new();
+        if opts.fg && sl.is_none() && !opts.quin && !try_xefg {
+            match ffx::fg_load(&opts.ffx_dir, &opts.fg_dir) {
+                Ok(()) => match ffx::fg_versions(&device) {
+                    Ok(v) if !v.is_empty() => {
+                        for (id, name) in &v {
+                            eprintln!("fg: provider version 0x{id:x} \"{name}\"");
+                        }
+                        fg_versions = v;
+                    }
+                    Ok(_) => eprintln!(
+                        "fg: no framegeneration provider supports this adapter — frame generation off"
+                    ),
+                    Err(e) => eprintln!("fg: provider enumeration failed ({e}) — frame generation off"),
+                },
+                Err(e) => eprintln!("fg: {e} — frame generation off"),
+            }
+        }
+
         // Manual-hooking proxy plumbing: queue from the proxy DEVICE,
         // swapchain from the proxy FACTORY — both required so present and
         // queue submissions are visible to SL (presentCommon fires every
         // frame from day one; DLSS-G later needs exactly these hooks).
         let mut proxy_device: Option<ID3D12Device> = None;
         let mut proxy_factory: Option<IDXGIFactory6> = None;
+        // RefCells, not `let mut`: the wrap AND unwind closures of one FgHook
+        // both need to write the context slot, and two &mut captures of one
+        // local can't coexist. `into_inner` right after the d3d block.
+        let fg_sc: std::cell::RefCell<Option<ffx::FgSwapchain>> = std::cell::RefCell::new(None);
+        let fg_xefg: std::cell::RefCell<Option<crate::xess_fg::XefgSwapchain>> =
+            std::cell::RefCell::new(None);
         let d3d = if let Some(s) = &sl {
             s.set_d3d_device(&device)?;
             let pdev: ID3D12Device = s.upgrade(&device)?;
             let queue = d3d12::create_queue(&pdev)?;
             let pfac: IDXGIFactory6 = s.upgrade(&factory)?;
-            let d3d = D3d::with_queue(&pfac, device, queue, hwnd, w, h, opts.vsync, opts.hdr)?;
+            // Pair-present arms only in raw-NGX FG sessions — extra
+            // backbuffers so a buffer never comes back around while still
+            // queued for scanout (see d3d12::PAIR_BACKBUFFERS).
+            let pair = opts.fg && !opts.quin && ngxfg::BUILT;
+            let d3d = D3d::with_queue(&pfac, device, queue, hwnd, w, h, opts.vsync, want, None, pair)?;
             // The swapchain we hold MUST be the SL proxy — every present has
             // to route through presentCommon under manual hooking. A proxy
             // resolves to a distinct native interface; verify loudly.
@@ -293,16 +875,94 @@ impl GpuContext {
             d3d
         } else {
             let queue = d3d12::create_queue(&device)?;
-            D3d::with_queue(&factory, device, queue, hwnd, w, h, opts.vsync, opts.hdr)?
+            if try_xefg {
+                // The XeFG wrap needs the DEVICE at hook time (context
+                // creation); `device` is alive inside with_queue while the
+                // hook runs, so the raw pointer captured here stays valid.
+                let dev_raw = device.as_raw();
+                let xess_dir = opts.xess_dir.clone();
+                let mut wrap = |q: &ID3D12CommandQueue,
+                                sc: windows::Win32::Graphics::Dxgi::IDXGISwapChain3|
+                 -> std::result::Result<
+                    windows::Win32::Graphics::Dxgi::IDXGISwapChain3,
+                    (windows::Win32::Graphics::Dxgi::IDXGISwapChain3, String),
+                > {
+                    let raw = sc.into_raw();
+                    match crate::xess_fg::XefgSwapchain::wrap(&xess_dir, dev_raw, q.as_raw(), raw)
+                    {
+                        Ok((ctx, proxy)) => {
+                            eprintln!("fg: swapchain wrapped by the XeSS-FG proxy (XeLL linked)");
+                            *fg_xefg.borrow_mut() = Some(ctx);
+                            Ok(unsafe {
+                                windows::Win32::Graphics::Dxgi::IDXGISwapChain3::from_raw(proxy)
+                            })
+                        }
+                        Err(e) => Err((
+                            unsafe {
+                                windows::Win32::Graphics::Dxgi::IDXGISwapChain3::from_raw(raw)
+                            },
+                            e,
+                        )),
+                    }
+                };
+                // Unwind: dropping the XefgSwapchain destroys the xefg context
+                // and releases its app-chain ref LAST (the ownership trap —
+                // the proxy DELEGATES to the app chain, so that ref must
+                // outlive xefgSwapChainDestroy).
+                let mut unwind = || {
+                    *fg_xefg.borrow_mut() = None;
+                };
+                D3d::with_queue(
+                    &factory, device, queue, hwnd, w, h, opts.vsync, want,
+                    Some(d3d12::FgHook { wrap: &mut wrap, unwind: &mut unwind }),
+                    false,
+                )?
+            } else if fg_versions.is_empty() {
+                D3d::with_queue(&factory, device, queue, hwnd, w, h, opts.vsync, want, None, false)?
+            } else {
+                let mut wrap = |q: &ID3D12CommandQueue,
+                                sc: windows::Win32::Graphics::Dxgi::IDXGISwapChain3|
+                 -> std::result::Result<
+                    windows::Win32::Graphics::Dxgi::IDXGISwapChain3,
+                    (windows::Win32::Graphics::Dxgi::IDXGISwapChain3, String),
+                > {
+                    let (proxy, sc_ctx) = ffx::fg_wrap_swapchain(q, sc)?;
+                    eprintln!("fg: swapchain wrapped by the FidelityFX frame-interpolation proxy");
+                    *fg_sc.borrow_mut() = Some(sc_ctx);
+                    Ok(proxy)
+                };
+                // Unwind: FgSwapchain::drop = wait_for_presents +
+                // ffxshim_destroy, which releases the app chain the wrap
+                // consumed — required before a new chain can exist on this
+                // HWND (one flip-model swapchain per HWND).
+                let mut unwind = || {
+                    *fg_sc.borrow_mut() = None;
+                };
+                D3d::with_queue(
+                    &factory, device, queue, hwnd, w, h, opts.vsync, want,
+                    Some(d3d12::FgHook { wrap: &mut wrap, unwind: &mut unwind }),
+                    false,
+                )?
+            }
         };
+        let fg_sc = fg_sc.into_inner();
+        let fg_xefg = fg_xefg.into_inner();
 
         // The display probe and the curve it implies. Only meaningful once the
-        // swapchain is actually scRGB — on the 8-bit path there is one curve
-        // (ToneParams::SDR) and nothing to ask the monitor.
-        let disp = if d3d.hdr { Some(display::probe(&pick.adapter, hwnd)) } else { None };
+        // swapchain actually carries a wide colour space — on the 8-bit path
+        // there is one curve (ToneParams::SDR) and nothing to ask the monitor.
+        let disp = if d3d.space != d3d12::PresentSpace::Sdr {
+            Some(display::probe(&pick.adapter, hwnd))
+        } else {
+            None
+        };
         let tone = match disp {
             Some(d) => {
-                let t = d.tone(opts.paper_white, opts.peak_nits);
+                let t = if d3d.space == d3d12::PresentSpace::Hdr10 {
+                    d.tone_pq(opts.paper_white, opts.peak_nits)
+                } else {
+                    d.tone(opts.paper_white, opts.peak_nits)
+                };
                 // Report the curve we ACTUALLY installed, not the probe's opinion:
                 // --hdr-peak overrides the probe (including an "HDR off" verdict),
                 // so keying the message off `d.enabled` could announce SDR levels
@@ -334,19 +994,33 @@ impl GpuContext {
         let (rr_opt, rr_min, rr_max) = Self::query_rr_res(sl.as_ref(), w, h);
 
         let passes = tonemap::Passes::new(&d3d.device, d3d.format)?;
+        let bloom = bloom::BloomGpu::new(&d3d.device, w as u32, h as u32)?;
+        passes.create_srv(
+            &d3d.device,
+            bloom.glare_srv_source(),
+            windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+            tonemap::SRV_SLOT_BLOOM,
+        );
         // The blit texture matches the SWAPCHAIN, not the CLI flag: under scRGB
-        // the CPU arms hand over f16, under SDR they hand over u32 0RGB. Keyed
-        // off `d3d.hdr` so a refused colour space can't leave them mismatched.
-        let blit = if d3d.hdr {
-            upload::BlitUpload::new_hdr(&d3d, w, h)?
-        } else {
-            upload::BlitUpload::new(&d3d, w, h)?
+        // the CPU arms hand over f16, under HDR10 packed 10-bit PQ, under SDR
+        // u32 0RGB. Keyed off `d3d.space` so a refused colour space (or an FG
+        // rebuild) can't leave them mismatched.
+        let blit = match d3d.space {
+            d3d12::PresentSpace::Scrgb => upload::BlitUpload::new_hdr(&d3d, w, h)?,
+            d3d12::PresentSpace::Hdr10 => upload::BlitUpload::new_pq(&d3d, w, h)?,
+            d3d12::PresentSpace::Sdr => upload::BlitUpload::new(&d3d, w, h)?,
         };
         let hdr = upload::HdrUpload::new(&d3d, w, h)?;
+        // The HUD overlay (SRV slot 9): not a tonemap source — bloom never
+        // reads it — so a plain create_srv inside HudGpu::new, never
+        // wire_tonemap_src.
+        let hud = hud::HudGpu::new(&d3d.device, &passes, d3d.format, w, h)?;
         let rr_res = if sl.is_some() {
             let r = rr::RrResources::new(&d3d.device, rr_opt, rr_min, rr_max, w, h)?;
-            passes.create_srv(
+            wire_tonemap_src(
                 &d3d.device,
+                &passes,
+                &bloom,
                 &r.output,
                 windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
                 tonemap::SRV_SLOT_RR,
@@ -355,71 +1029,325 @@ impl GpuContext {
         } else {
             None
         };
+        // The blit arm takes the blit PSO, which `fullscreen_to_backbuffer`
+        // never blooms (its source is an already-encoded, CPU-tonemapped image —
+        // the CPU applied glare in `render::resolve`). So it gets a plain
+        // tonemap SRV and no bloom source: nothing would ever read one.
         passes.create_srv(&d3d.device, &blit.texture, blit.format, tonemap::SRV_SLOT_BLIT);
-        passes.create_srv(
+        wire_tonemap_src(
             &d3d.device,
+            &passes,
+            &bloom,
             &hdr.texture,
             windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
             tonemap::SRV_SLOT_HDR,
         );
 
-        // Native chain levels (2-4), probed only when DLSS didn't win —
-        // XeSS and the ffx contexts are created on the real device and
-        // never coexist with the SL proxies. First hit wins; every failure
-        // is one loud fall-through line. FSR4-RR and FSR3 are the SAME
-        // ffx-api effect probed as two chain levels: level 2 requires the
-        // Ray Regeneration provider (RDNA4), level 4 is the cross-vendor
-        // FSR 3.1 upscale-only flavor (provider via ffxOverrideVersion).
-        let mut xess_state: Option<XessState> = None;
-        let mut fsr_state: Option<FsrState> = None;
-        if sl.is_none() {
-            let wire_fsr = |s: FsrState| {
-                passes.create_srv(
-                    &d3d.device,
-                    s.res.upscaled(),
-                    windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
-                    tonemap::SRV_SLOT_FSR,
-                );
-                s
-            };
-            if opts.chain.fsr4 {
-                match Self::init_fsr(&opts.ffx_dir, &d3d.device, w, h, opts.debug, crate::fsr::Flavor::Fsr4Rr, &opts.fsr_tune) {
-                    Ok(s) => fsr_state = Some(wire_fsr(s)),
-                    Err(e) => eprintln!("fsr4: level unavailable ({e}) — falling through the chain"),
-                }
-            }
-            if fsr_state.is_none() && opts.chain.xess {
-                // Input planes are allocated once at the range MAX; every
-                // frame uploads and names its own sub-rect (dynamic res).
-                match Self::init_xess(&opts.xess_dir, &d3d.device, w, h, opts.xess_autoexposure) {
-                    Ok(s) => {
-                        passes.create_srv(
-                            &d3d.device,
-                            &s.res.output,
-                            windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
-                            tonemap::SRV_SLOT_XESS,
+        // Raw-NGX DLSS-G (preferred when built): the interpolated-frame
+        // target + lazy-created feature. scRGB fp16 is fine on this path —
+        // there is no swapchain policing because there is no swapchain hook.
+        let fg_n = if opts.fg && !opts.quin && ngxfg::BUILT && sl.is_some() && rr_res.is_some() {
+            match d3d12::committed_tex(
+                &d3d.device,
+                w,
+                h,
+                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            ) {
+                Ok(out) => {
+                    wire_tonemap_src(
+                        &d3d.device,
+                        &passes,
+                        &bloom,
+                        &out,
+                        windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+                        tonemap::SRV_SLOT_NGXFG,
+                    );
+                    eprintln!(
+                        "fg: raw-NGX DLSS-G armed (no Streamline pacer — pair-present; feature \
+                         created on the first frame)"
+                    );
+                    // Empirical-settling levers (env vars, the FR_SKY_LOD
+                    // idiom — quinlight settled the snippet's conventions
+                    // against zero MVs / zero jitter / [0,1] luma-depth, so
+                    // the motion-dependent ones are settled HERE instead).
+                    // Only a departure from the default prints a line — but
+                    // an UNRECOGNIZED value is loud too and takes the
+                    // default: a silently no-op'd A/B walk is the exact
+                    // failure mode these levers exist to prevent. Values are
+                    // matched case-insensitively. Returns 0 for unset /
+                    // unrecognized, i+1 for legal[i].
+                    let lever = |k: &str, legal: &[&str]| -> u8 {
+                        let Ok(s) = std::env::var(k) else { return 0 };
+                        let s = s.to_ascii_lowercase();
+                        match legal.iter().position(|v| *v == s) {
+                            Some(i) => i as u8 + 1,
+                            None => {
+                                eprintln!(
+                                    "fg: {k}={s} unrecognized (legal: {}) — using the default",
+                                    legal.join("|")
+                                );
+                                0
+                            }
+                        }
+                    };
+                    let depth_linear = lever("FR_NGXFG_DEPTH", &["linear"]) == 1;
+                    if depth_linear {
+                        eprintln!(
+                            "fg: FR_NGXFG_DEPTH=linear — raw linear view-Z to the NGX \
+                             evaluate (the round-1 A/B arm)"
                         );
-                        xess_state = Some(s);
                     }
-                    Err(e) => eprintln!("xess: level unavailable ({e}) — falling through the chain"),
+                    let rmv_off = lever("FR_NGXFG_RMV", &["off"]) == 1;
+                    if rmv_off {
+                        eprintln!(
+                            "fg: FR_NGXFG_RMV=off — raw surface MVs to the NGX evaluate \
+                             (expect reflections to swim under motion)"
+                        );
+                    }
+                    let guides = if depth_linear && rmv_off {
+                        None
+                    } else {
+                        match ngxfg_guides::GuidePass::new(&d3d.device) {
+                            Ok(p) => Some(std::cell::RefCell::new(p)),
+                            Err(e) => {
+                                eprintln!(
+                                    "fg: guide-conversion pass creation failed ({e}) — \
+                                     falling back to the raw RR planes (expect reflection \
+                                     shimmer)"
+                                );
+                                None
+                            }
+                        }
+                    };
+                    let jitter_mode = lever("FR_NGXFG_JITTER", &["0", "raw"]);
+                    match jitter_mode {
+                        1 => eprintln!("fg: FR_NGXFG_JITTER=0 — zero jitter to the evaluate"),
+                        2 => eprintln!("fg: FR_NGXFG_JITTER=raw — un-negated jitter"),
+                        _ => {}
+                    }
+                    let mv_mode = lever("FR_NGXFG_MV", &["norm", "neg", "normneg"]);
+                    match mv_mode {
+                        1 => eprintln!(
+                            "fg: FR_NGXFG_MV=norm — {{1/rw,1/rh}} mvecScale (round-1 arm)"
+                        ),
+                        2 => eprintln!("fg: FR_NGXFG_MV=neg — negated pixel mvecScale"),
+                        3 => eprintln!("fg: FR_NGXFG_MV=normneg — negated {{1/rw,1/rh}} mvecScale"),
+                        _ => {}
+                    }
+                    let show_mode = lever("FR_NGXFG_SHOW", &["interp", "real"]);
+                    match show_mode {
+                        1 => eprintln!(
+                            "fg: FR_NGXFG_SHOW=interp — presenting the interpolated \
+                             frame for BOTH halves of each pair (non-generating frames \
+                             fall back to the real frame)"
+                        ),
+                        2 => eprintln!(
+                            "fg: FR_NGXFG_SHOW=real — presenting the REAL frame for \
+                             BOTH halves (evaluate still runs; artifacts that survive \
+                             this are in the present path, not the generated frames)"
+                        ),
+                        _ => {}
+                    }
+                    let cam_identity = lever("FR_NGXFG_CAM", &["identity"]) == 1;
+                    if cam_identity {
+                        eprintln!(
+                            "fg: FR_NGXFG_CAM=identity — quinlight's identity camera block \
+                             to the evaluate (combine with FR_NGXFG_DEPTH=linear for the \
+                             faithful quinlight reproduction — its depth was never \
+                             matrix-consistent either)"
+                        );
+                    }
+                    let mat_col = lever("FR_NGXFG_MAT", &["col"]) == 1;
+                    if mat_col {
+                        eprintln!("fg: FR_NGXFG_MAT=col — column-major matrices to the evaluate");
+                    }
+                    Some(NgxFgState {
+                        out,
+                        handle: std::cell::Cell::new(std::ptr::null_mut()),
+                        dims: std::cell::Cell::new((0, 0)),
+                        enabled: true,
+                        failed: std::cell::Cell::new(false),
+                        primed: std::cell::Cell::new(false),
+                        frame_id: std::cell::Cell::new(0),
+                        res_pend: std::cell::Cell::new(((0, 0), 0)),
+                        pair: std::cell::Cell::new(false),
+                        guides,
+                        guides_failed: std::cell::Cell::new(false),
+                        depth_linear,
+                        rmv_off,
+                        jitter_mode,
+                        mv_mode,
+                        show_mode,
+                        cam_identity,
+                        mat_col,
+                    })
+                }
+                Err(e) => {
+                    eprintln!("fg: interpolated-frame target creation failed ({e}) — FG off");
+                    None
                 }
             }
-            if fsr_state.is_none() && xess_state.is_none() && opts.chain.fsr3 {
-                match Self::init_fsr(&opts.ffx_dir, &d3d.device, w, h, opts.debug, crate::fsr::Flavor::Fsr3, &opts.fsr_tune) {
-                    Ok(s) => fsr_state = Some(wire_fsr(s)),
-                    Err(e) => eprintln!("fsr3: level unavailable ({e})"),
+        } else {
+            None
+        };
+
+        // DLSS-G, part 2 (the Streamline attempt — reachable only when the
+        // raw-NGX shim is NOT built in): Reflex must be configured at least
+        // once BEFORE the first frame with G on (the runtime enforces its
+        // presence: eFailReflexNotDetectedAtRuntime). Low-latency mode — the
+        // whole point of pairing Reflex with generation is clawing the
+        // latency back. Mode eOn itself is set lazily by the first RR frame's
+        // dlssg_frame_begin (options take effect at the next Present, and
+        // that keeps the enable on the present thread by construction).
+        let fg_g = if fg_dlssg && rr_res.is_some() {
+            let s = sl.as_ref().unwrap();
+            match s.reflex_set_options(streamline_sys::REFLEX_MODE_LOW_LATENCY) {
+                Ok(()) => {
+                    // Enable BEFORE the first present: a mode toggle after
+                    // presents have begun restructures the live swapchain
+                    // into the degraded off-screen-copy path (§18 is why the
+                    // guide wants a swapchain recreate on toggles) — armed
+                    // from frame 0, the FG buffer topology is native.
+                    let o = streamline_sys::SlShimDlssgOptions {
+                        mode: streamline_sys::DLSSG_MODE_ON,
+                        num_frames_to_generate: 1,
+                        flags: 0,
+                    };
+                    let on = match s.dlssg_set_options(0, &o) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            eprintln!("fg: DLSS-G init enable failed ({e}) — will retry on the first frame");
+                            false
+                        }
+                    };
+                    eprintln!(
+                        "fg: DLSS-G live — Reflex low-latency armed, 1 generated frame per \
+                         rendered frame"
+                    );
+                    Some(DlssgState {
+                        enabled: true,
+                        on: std::cell::Cell::new(on),
+                        prepared: std::cell::Cell::new(false),
+                        failed: std::cell::Cell::new(false),
+                        poll: std::cell::Cell::new(0),
+                        logged: std::cell::Cell::new(false),
+                        mult: std::cell::Cell::new(0),
+                    })
+                }
+                Err(e) => {
+                    eprintln!("fg: Reflex init failed ({e}) — DLSS-G off (it requires Reflex)");
+                    None
                 }
             }
-            if fsr_state.is_none()
-                && xess_state.is_none()
-                && opts.chain != crate::upchain::UpChain::NONE
-            {
+        } else {
+            None
+        };
+
+        let (xess_state, fsr_state, fsr3_state) =
+            Self::probe_native(&passes, &bloom, &d3d.device, opts, w, h, sl.is_some());
+
+        // Frame generation, part 2: the display-size FG effect context. The
+        // provider pick keys on the session's resolved upscaler family (an
+        // FSR4-RR session prefers the 4.x ML frame generation; everything
+        // else the 3.1 interpolation), which is only known after probe_native
+        // — the swapchain wrap above deliberately did not need it. A create
+        // failure leaves the wrapped proxy presenting passthrough: correct,
+        // just generation-free.
+        let fg_state = fg_sc.map(|sc| {
+            let fsr4_session =
+                fsr_state.as_ref().is_some_and(|f| f.res.flavor() == crate::fsr::Flavor::Fsr4Rr);
+            let version = if fsr_state.is_some() {
+                crate::fsr::pick_fg_version(&fg_versions, fsr4_session)
+            } else {
+                // The wrap happened before the chain resolved; only the FSR
+                // arms carry the prepare today. A session that wired XeSS (or
+                // nothing) presents through the proxy passthrough — harmless,
+                // one line.
                 eprintln!(
-                    "upscale: NO temporal upscaler available — chain exhausted \
-                     (dlss -> fsr4 -> xess -> fsr3); PLAIN presentation"
+                    "fg: wired upscaler has no ffx frame-generation pairing yet — \
+                     use --fsr3/--fsr for frame generation today"
+                );
+                None
+            };
+            let ctx = version.as_ref().and_then(|(id, name)| {
+                match ffx::FgContext::create(
+                    &d3d.device,
+                    (w, h),
+                    (w, h),
+                    match d3d.space {
+                        d3d12::PresentSpace::Scrgb => ffx_sys::SURFACE_FORMAT_R16G16B16A16_FLOAT,
+                        d3d12::PresentSpace::Hdr10 => ffx_sys::SURFACE_FORMAT_R10G10B10A2_UNORM,
+                        d3d12::PresentSpace::Sdr => ffx_sys::SURFACE_FORMAT_B8G8R8A8_UNORM,
+                    },
+                    // FG_HDR = "the backbuffer is high dynamic range"; the FI
+                    // swapchain reads the transfer function off the chain's own
+                    // declared colour space, so PQ needs no extra plumbing.
+                    d3d.space != d3d12::PresentSpace::Sdr,
+                    opts.debug,
+                    *id,
+                ) {
+                    Ok(ctx) => {
+                        eprintln!("fg: frame generation live — provider \"{name}\" (1 generated frame per rendered frame)");
+                        Some(ctx)
+                    }
+                    Err(e) => {
+                        eprintln!("fg: {e} — swapchain proxy presents passthrough");
+                        None
+                    }
+                }
+            });
+            if version.is_none() {
+                eprintln!("fg: no provider version parseable — swapchain proxy presents passthrough");
+            }
+            let luminance = if d3d.space != d3d12::PresentSpace::Sdr {
+                [0.0, tone.peak_nits()]
+            } else {
+                [0.0, 0.0]
+            };
+            FgState {
+                sc,
+                ctx,
+                enabled: true,
+                live: std::cell::Cell::new(false),
+                prepared: std::cell::Cell::new(false),
+                frame_id: std::cell::Cell::new(0),
+                frame_ms: std::cell::Cell::new(16.6),
+                luminance,
+                version: version.unwrap_or((0, String::new())),
+            }
+        });
+
+        // XeSS-FG, part 2: only the XeSS arms carry the prepare, so the state
+        // arms iff the XeSS level actually wired (else the proxy presents
+        // passthrough — the leg-1 shape). Init-time enable, the DLSS-G
+        // lesson: the funnel disables it on any unprepared present.
+        let fg_x = fg_xefg.map(|sc| {
+            let wired_xess = xess_state.is_some();
+            if wired_xess {
+                sc.set_enabled(true);
+                eprintln!(
+                    "fg: XeSS frame generation live — 1 generated frame per rendered frame"
+                );
+            } else {
+                sc.set_enabled(false);
+                eprintln!(
+                    "fg: XeSS level did not wire — XeSS-FG proxy presents passthrough"
                 );
             }
-        }
+            XefgState {
+                sc,
+                enabled: wired_xess,
+                on: std::cell::Cell::new(wired_xess),
+                prepared: std::cell::Cell::new(false),
+                failed: std::cell::Cell::new(!wired_xess),
+                frame_id: std::cell::Cell::new(0),
+                poll: std::cell::Cell::new(0),
+                logged: std::cell::Cell::new(false),
+                mult: std::cell::Cell::new(0),
+            }
+        });
 
         Ok(Self {
             sl,
@@ -427,22 +1355,151 @@ impl GpuContext {
             _proxy_factory: proxy_factory,
             d3d,
             passes,
+            bloom,
             blit,
             hdr,
+            hud,
+            last_present: std::cell::Cell::new(None),
+            scene_gpu: None,
             trace: None,
             dxr: None,
             rr: rr_res,
             xess: xess_state,
             fsr: fsr_state,
+            fsr3: fsr3_state,
+            quin: None,
+            quin_cfg: opts.quin.then_some((opts.quin_anchor, opts.debug)),
             nppd_gpu: None,
             nppd_state_valid: false,
+            fg: fg_state,
+            fg_g,
+            fg_x,
+            fg_n,
             adapter_name: pick.name,
-            adapter_is_nvidia: pick.is_nvidia,
+            adapter_vendor: pick.vendor,
             tone,
             adapter: pick.adapter,
             hwnd,
             display: disp,
         })
+    }
+
+    /// Bring up the native chain levels (2-4) for an output size, and create
+    /// their presentation SRVs. Shared by `new` and `resize_output` — a resize
+    /// re-runs exactly the probe that wired the session, so it can never end up
+    /// with a different engine set than it started with.
+    ///
+    /// FSR4-RR and FSR 3.1 are the SAME ffx-api effect at two provider
+    /// versions, probed as two chain levels; XeSS and both ffx flavors are
+    /// created on the NATIVE device.
+    ///
+    /// Normally this is FIRST-HIT-WINS and only runs when DLSS didn't take the
+    /// session. Under `--quinlight` that rule is deliberately suspended and
+    /// EVERY supported level is wired, because the fuse's inputs ARE the engines
+    /// (gpu/quin.rs). Two things make the coexistence legal, and neither is new:
+    ///   * `d3d.device` is the NATIVE device even under Streamline — only the
+    ///     queue and swapchain are SL proxies (see `D3d::with_queue`), so the
+    ///     XeSS/ffx contexts are created exactly where they always were. Their
+    ///     dispatches record into the same native command list, and SL's queue
+    ///     proxy simply forwards the ExecuteCommandLists.
+    ///   * FSR4-RR and FSR 3.1 are independent ffx CONTEXTS, so one session can
+    ///     hold both.
+    /// A level that fails to come up is just not an engine: the fuse is
+    /// N-generic, so --quinlight degrades to whatever actually wired.
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
+    fn probe_native(
+        passes: &tonemap::Passes,
+        bloom: &bloom::BloomGpu,
+        device: &ID3D12Device,
+        opts: &GpuOptions,
+        w: u32,
+        h: u32,
+        sl_live: bool,
+    ) -> (Option<XessState>, Option<FsrState>, Option<FsrState>) {
+        let (mut xess, mut fsr, mut fsr3) = (None, None, None);
+        let all = opts.quin;
+        if sl_live && !all {
+            return (xess, fsr, fsr3);
+        }
+        let wire_fsr = |s: FsrState| {
+            wire_tonemap_src(
+                device,
+                passes,
+                bloom,
+                s.res.upscaled(),
+                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+                tonemap::SRV_SLOT_FSR,
+            );
+            s
+        };
+        if opts.chain.fsr4 {
+            match Self::init_fsr(
+                &opts.ffx_dir,
+                device,
+                w,
+                h,
+                opts.debug,
+                crate::fsr::Flavor::Fsr4Rr,
+                &opts.fsr_tune,
+            ) {
+                Ok(s) => fsr = Some(wire_fsr(s)),
+                Err(e) => eprintln!("fsr4: level unavailable ({e}) — falling through the chain"),
+            }
+        }
+        if (all || fsr.is_none()) && opts.chain.xess {
+            // Input planes are allocated once at the range MAX; every frame
+            // uploads and names its own sub-rect (dynamic res).
+            match Self::init_xess(&opts.xess_dir, device, w, h, opts.xess_autoexposure) {
+                Ok(s) => {
+                    wire_tonemap_src(
+                        device,
+                        passes,
+                        bloom,
+                        &s.res.output,
+                        windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+                        tonemap::SRV_SLOT_XESS,
+                    );
+                    xess = Some(s);
+                }
+                Err(e) => eprintln!("xess: level unavailable ({e}) — falling through the chain"),
+            }
+        }
+        if (all || (fsr.is_none() && xess.is_none())) && opts.chain.fsr3 {
+            match Self::init_fsr(
+                &opts.ffx_dir,
+                device,
+                w,
+                h,
+                opts.debug,
+                crate::fsr::Flavor::Fsr3,
+                &opts.fsr_tune,
+            ) {
+                Ok(s) => {
+                    if fsr.is_none() {
+                        fsr = Some(wire_fsr(s));
+                    } else {
+                        // --quinlight with BOTH ffx flavors: FSR4-RR already owns
+                        // SRV_SLOT_FSR (there is one standalone-FSR present slot),
+                        // and 3.1 is here purely as a fuse engine — the fuse reads
+                        // its engines from its OWN descriptor heap, never these
+                        // slots.
+                        fsr3 = Some(s);
+                    }
+                }
+                Err(e) => eprintln!("fsr3: level unavailable ({e})"),
+            }
+        }
+        if !sl_live
+            && fsr.is_none()
+            && xess.is_none()
+            && opts.chain != crate::upchain::UpChain::NONE
+        {
+            eprintln!(
+                "upscale: NO temporal upscaler available — chain exhausted \
+                 (dlss -> fsr4 -> xess -> fsr3); PLAIN presentation"
+            );
+        }
+        (xess, fsr, fsr3)
     }
 
     /// Query DLSS-RR's optimal Quality-mode render resolution and its
@@ -552,25 +1609,86 @@ impl GpuContext {
         // not switch upscalers mid-session (captured before the teardown
         // below clears the state it derives from).
         let wired = self.wired();
+        // Frame generation straddles the resize: pending paced presents must
+        // retire before ResizeBuffers reaches the FI proxy, and the FG effect
+        // context is display-size-bound — drop it here, recreate at the new
+        // size at the bottom. The swapchain CONTEXT survives (it owns the
+        // proxy the session keeps presenting through; the proxy forwards
+        // ResizeBuffers to its internal chain).
+        if let Some(fg) = &mut self.fg {
+            fg.sc.wait_for_presents();
+            fg.live.set(false);
+            fg.prepared.set(false);
+            fg.ctx = None;
+        }
+        // XeSS-FG: disable so no interpolation is pending across the
+        // ResizeBuffers (which the xefg proxy forwards); re-enabled below if
+        // the XeSS level comes back up.
+        if let Some(x) = &self.fg_x {
+            if x.on.get() {
+                x.sc.set_enabled(false);
+                x.on.set(false);
+            }
+            x.prepared.set(false);
+        }
         // Everything below drops live GPU resources; drain first (the
         // GpuContext::drop discipline — xess/ffx destroy-context require
         // completed command lists, ResizeBuffers requires zero outstanding
         // backbuffer refs).
         self.d3d.wait_idle()?;
+        // Raw-NGX DLSS-G: the feature is display-size-bound (created at the
+        // old window dims) — release it now (queue just drained) and let the
+        // first frame at the new size lazy-recreate; the interpolated-frame
+        // target rebuilds below with the other window-sized textures.
+        if let Some(n) = &self.fg_n {
+            let h = n.handle.replace(std::ptr::null_mut());
+            if !h.is_null() {
+                unsafe { ngxfg::frdlssg_destroy(h) };
+            }
+            n.dims.set((0, 0));
+            n.primed.set(false);
+            n.res_pend.set(((0, 0), 0));
+        }
         self.trace = None;
         self.dxr = None;
+        // scene_gpu deliberately SURVIVES: the shared core is scene-bound,
+        // not window-bound (device+queue live across d3d.resize), so the
+        // re-entry's tracer rebuilds skip the scene upload + BLAS build —
+        // resize/F11 no longer re-pays them (only kernel compiles + the
+        // window-sized planes).
         self.nppd_gpu = None;
         self.nppd_state_valid = false;
         self.xess = None;
         self.fsr = None;
+        self.fsr3 = None;
+        self.quin = None;
         self.rr = None;
         self.d3d.resize(w, h)?;
-        self.blit = if self.d3d.hdr {
-            upload::BlitUpload::new_hdr(&self.d3d, w, h)?
-        } else {
-            upload::BlitUpload::new(&self.d3d, w, h)?
+        self.blit = match self.d3d.space {
+            d3d12::PresentSpace::Scrgb => upload::BlitUpload::new_hdr(&self.d3d, w, h)?,
+            d3d12::PresentSpace::Hdr10 => upload::BlitUpload::new_pq(&self.d3d, w, h)?,
+            d3d12::PresentSpace::Sdr => upload::BlitUpload::new(&self.d3d, w, h)?,
         };
         self.hdr = upload::HdrUpload::new(&self.d3d, w, h)?;
+        // The HUD overlay is window-sized: new texture (fresh SRV in slot 9),
+        // new ring, content undefined until crate::hud's forced full-window
+        // frame lands. Carry the visibility flag across.
+        let hud_visible = self.hud.visible.get();
+        self.hud = hud::HudGpu::new(&self.d3d.device, &self.passes, self.d3d.format, w, h)?;
+        self.hud.visible.set(hud_visible);
+        // A resize invalidates the last-present record: every source it could
+        // name is being rebuilt at the new size.
+        self.last_present.set(None);
+        // The glare pyramid is window-sized; rebuild it and re-point the tonemap's
+        // halo SRV at the new level 0 (the old resource is gone).
+        self.bloom.set_res(&self.d3d.device, w, h)?;
+        self.passes.create_srv(
+            &self.d3d.device,
+            self.bloom.glare_srv_source(),
+            windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+            tonemap::SRV_SLOT_BLOOM,
+        );
+        // The blit arm never blooms (blit PSO — see `new`), so a plain SRV.
         self.passes.create_srv(
             &self.d3d.device,
             &self.blit.texture,
@@ -580,8 +1698,10 @@ impl GpuContext {
         // A resize can also be a monitor change (drag to another display, then
         // let go). Re-probe here rather than trusting the poll to catch up.
         self.refresh_display(opts.paper_white, opts.peak_nits);
-        self.passes.create_srv(
+        wire_tonemap_src(
             &self.d3d.device,
+            &self.passes,
+            &self.bloom,
             &self.hdr.texture,
             windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
             tonemap::SRV_SLOT_HDR,
@@ -589,8 +1709,10 @@ impl GpuContext {
         if self.sl.is_some() {
             let (opt, min, max) = Self::query_rr_res(self.sl.as_ref(), w, h);
             let r = rr::RrResources::new(&self.d3d.device, opt, min, max, w, h)?;
-            self.passes.create_srv(
+            wire_tonemap_src(
                 &self.d3d.device,
+                &self.passes,
+                &self.bloom,
                 &r.output,
                 windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
                 tonemap::SRV_SLOT_RR,
@@ -598,11 +1720,34 @@ impl GpuContext {
             self.rr = Some(r);
         }
         match wired {
+            // --quinlight: the session's engines ARE "what was wired", so the
+            // rebuild is the same probe `new` ran. It cannot switch upscalers
+            // mid-session (the invariant this match exists to protect): support
+            // is a property of the box, not of the window size. The fuse itself
+            // is rebuilt lazily by the session's init_trace/init_dxr re-entry,
+            // which a resize already forces.
+            WiredUpscaler::Quin => {
+                let (x, f, f3) =
+                    Self::probe_native(
+                        &self.passes,
+                        &self.bloom,
+                        &self.d3d.device,
+                        opts,
+                        w,
+                        h,
+                        self.sl.is_some(),
+                    );
+                self.xess = x;
+                self.fsr = f;
+                self.fsr3 = f3;
+            }
             WiredUpscaler::Xess => {
                 match Self::init_xess(&opts.xess_dir, &self.d3d.device, w, h, opts.xess_autoexposure) {
                     Ok(s) => {
-                        self.passes.create_srv(
+                        wire_tonemap_src(
                             &self.d3d.device,
+                            &self.passes,
+                            &self.bloom,
                             &s.res.output,
                             windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
                             tonemap::SRV_SLOT_XESS,
@@ -620,8 +1765,10 @@ impl GpuContext {
                 };
                 match Self::init_fsr(&opts.ffx_dir, &self.d3d.device, w, h, opts.debug, flavor, &opts.fsr_tune) {
                     Ok(s) => {
-                        self.passes.create_srv(
+                        wire_tonemap_src(
                             &self.d3d.device,
+                            &self.passes,
+                            &self.bloom,
                             s.res.upscaled(),
                             windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
                             tonemap::SRV_SLOT_FSR,
@@ -633,6 +1780,59 @@ impl GpuContext {
             }
             // Rr rebuilds through the sl block above; Plain has nothing.
             WiredUpscaler::Rr | WiredUpscaler::Plain => {}
+        }
+        // Raw-NGX DLSS-G: rebuild the window-sized interpolated-frame target
+        // + its tonemap SRV (the feature itself lazy-recreates on the first
+        // frame).
+        if let Some(n) = &mut self.fg_n {
+            n.out = d3d12::committed_tex(
+                &self.d3d.device,
+                w,
+                h,
+                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            )?;
+            wire_tonemap_src(
+                &self.d3d.device,
+                &self.passes,
+                &self.bloom,
+                &n.out,
+                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+                tonemap::SRV_SLOT_NGXFG,
+            );
+        }
+        // XeSS-FG re-enable when the XeSS level came back up (the swapchain
+        // context itself survived the ResizeBuffers).
+        if let Some(x) = &self.fg_x {
+            if self.xess.is_some() && x.enabled && !x.failed.get() {
+                x.sc.set_enabled(true);
+                x.on.set(true);
+            }
+        }
+        // Frame generation, rebuilt at the new display size (the provider
+        // pick was made at boot and does not move — `version` survives on the
+        // state). Only when the FSR level actually came back up: its arms
+        // carry the prepare.
+        if let Some(fg) = &mut self.fg {
+            if self.fsr.is_some() && fg.version.0 != 0 {
+                match ffx::FgContext::create(
+                    &self.d3d.device,
+                    (w, h),
+                    (w, h),
+                    match self.d3d.space {
+                        d3d12::PresentSpace::Scrgb => ffx_sys::SURFACE_FORMAT_R16G16B16A16_FLOAT,
+                        d3d12::PresentSpace::Hdr10 => ffx_sys::SURFACE_FORMAT_R10G10B10A2_UNORM,
+                        d3d12::PresentSpace::Sdr => ffx_sys::SURFACE_FORMAT_B8G8R8A8_UNORM,
+                    },
+                    self.d3d.space != d3d12::PresentSpace::Sdr,
+                    opts.debug,
+                    fg.version.0,
+                ) {
+                    Ok(ctx) => fg.ctx = Some(ctx),
+                    Err(e) => eprintln!("fg: disabled after resize — {e}"),
+                }
+            }
         }
         Ok(())
     }
@@ -741,10 +1941,13 @@ impl GpuContext {
         Ok(FsrState { ctx, res, opt, min, max: (w, h) })
     }
 
-    /// Wire the session's live upscaler input planes as feed targets on a
-    /// GPU tracer (`wire` = TraceGpu's or DxrGpu's `wire_feed`). The trace
-    /// res was quantize_res-clamped by the caller, but the range is the
-    /// SDK's contract: re-check here so a drift fails loudly at init. A gbuf
+    /// Wire the session's live upscaler input planes as feed targets on a GPU
+    /// tracer (`wire` = TraceGpu's or DxrGpu's `wire_feed_add` — it APPENDS, and
+    /// is called once per engine, which is what --quinlight needs; the tracer is
+    /// freshly built here, so there is nothing to clear).
+    ///
+    /// The trace res was quantize_res-clamped by the caller, but the range is
+    /// the SDK's contract: re-check here so a drift fails loudly at init. A gbuf
     /// session with no live upscaler is a wiring bug, not a fallback.
     fn wire_session_feed(
         &self,
@@ -755,87 +1958,166 @@ impl GpuContext {
             &[(u32, &ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT)],
         ) -> Result<()>,
     ) -> Result<()> {
+        // --quinlight: EVERY wired engine gets fed, each into its own descriptor
+        // set (wire_feed appends). The engines' register sets overlap — DLSS-RR
+        // and FSR4-RR both claim u16..u22 — which is exactly what the sets are
+        // for. XeSS and FSR 3.1 are the one exception that needs no second feed:
+        // their plane sets are byte-identical, so FSR 3.1 upscales straight from
+        // the XeSS trio (ffx_up::upscale_res_shared) and only pays a feed of its
+        // own when XeSS is absent.
+        // The predicate is STRUCTURAL, not `self.quin.is_some()`: the fuse is
+        // built after the feed is wired (it needs the DXC that init_trace holds),
+        // so asking for it here would always say no. More than one live engine IS
+        // a quinlight session.
+        if self.quin_engines().0.len() > 1 {
+            if let Some(rr) = &self.rr {
+                if self.sl.is_some() {
+                    self.wire_rr_feed(rr, rw, rh, &mut wire)?;
+                }
+            }
+            // The sharing keys on the FLAVOR, not on the field. probe_native
+            // parks FSR 3.1 in `fsr` whenever FSR4-RR is absent — which is the
+            // NVIDIA set (dlss-rr + fsr3 + xess) — and only in `fsr3` when both
+            // ffx flavors came up. A field-keyed rule fed the `fsr`-resident 3.1
+            // a whole descriptor set per frame that record_quin_engines then
+            // never read (it hands every Up-flavor context the XeSS trio): a full
+            // wasted feed dispatch on the primary dev config, and it burned the
+            // third and last FEED_SET. FSR4-RR always needs its own eleven-plane
+            // feed; a shared 3.1 still has its SDK range checked, since the one
+            // traced res must be legal for it too.
+            for fs in [self.fsr.as_ref(), self.fsr3.as_ref()].into_iter().flatten() {
+                if self.xess.is_some() && matches!(fs.res, FsrRes::Up(_)) {
+                    fsr_range_check(fs, rw, rh)?;
+                    continue;
+                }
+                self.wire_fsr_feed(fs, rw, rh, &mut wire)?;
+            }
+            if let Some(x) = &self.xess {
+                self.wire_xess_feed(x, rw, rh, &mut wire)?;
+            }
+            return Ok(());
+        }
         if let Some(rr) = &self.rr {
-            if rw < rr.min.0 || rh < rr.min.1 || rw > rr.max.0 || rh > rr.max.1 {
-                return Err(format!(
-                    "trace res {}x{} outside DLSS-RR render range {}x{}..{}x{}",
-                    rw, rh, rr.min.0, rr.min.1, rr.max.0, rr.max.1
-                ));
-            }
-            let pl = rr.plane_resources();
-            wire(
-                trace::FeedKind::Rr,
-                &[
-                    (trace::FEED_COLOR, pl[0].0, pl[0].1),
-                    (trace::FEED_NR, pl[1].0, pl[1].1),
-                    (trace::FEED_DEPTH, pl[2].0, pl[2].1),
-                    (trace::FEED_MVEC, pl[3].0, pl[3].1),
-                    (trace::FEED_ALB, pl[4].0, pl[4].1),
-                    (trace::FEED_SPEC, pl[5].0, pl[5].1),
-                    (trace::FEED_SPECHIT, pl[6].0, pl[6].1),
-                ],
-            )
+            self.wire_rr_feed(rr, rw, rh, &mut wire)
         } else if let Some(x) = &self.xess {
-            if rw < x.min.0 || rh < x.min.1 || rw > x.max.0 || rh > x.max.1 {
-                return Err(format!(
-                    "trace res {}x{} outside XeSS input range {}x{}..{}x{}",
-                    rw, rh, x.min.0, x.min.1, x.max.0, x.max.1
-                ));
-            }
-            let pl = x.res.plane_resources();
-            wire(
-                trace::FeedKind::Xess,
-                &[
-                    (trace::FEED_COLOR, pl[0].0, pl[0].1),
-                    (trace::FEED_MVEC, pl[1].0, pl[1].1),
-                    (trace::FEED_DEPTH, pl[2].0, pl[2].1),
-                ],
-            )
+            self.wire_xess_feed(x, rw, rh, &mut wire)
         } else if let Some(fs) = &self.fsr {
-            if rw < fs.min.0 || rh < fs.min.1 || rw > fs.max.0 || rh > fs.max.1 {
-                return Err(format!(
-                    "trace res {}x{} outside FSR render range {}x{}..{}x{}",
-                    rw, rh, fs.min.0, fs.min.1, fs.max.0, fs.max.1
-                ));
-            }
-            match &fs.res {
-                FsrRes::Up(res) => {
-                    let pl = res.plane_resources();
-                    wire(
-                        trace::FeedKind::Fsr3,
-                        &[
-                            (trace::FEED_COLOR, pl[0].0, pl[0].1),
-                            (trace::FEED_MVEC, pl[1].0, pl[1].1),
-                            (trace::FEED_DEPTH, pl[2].0, pl[2].1),
-                        ],
-                    )
-                }
-                FsrRes::Rr(res) => {
-                    // cs_feed_fsr_rr's register/plane mapping (feed.hlsl —
-                    // keep in lockstep; plane_resources returns upload order:
-                    // depth_lin, depth_clip, mvec, normals, diff_alb,
-                    // spec_alb, dd_in, ds_in, residual, ao_in, is_in).
-                    let pl = res.plane_resources();
-                    wire(
-                        trace::FeedKind::FsrRr,
-                        &[
-                            (trace::FEED_SPECHIT, pl[0].0, pl[0].1), // R32F linear depth
-                            (trace::FEED_DEPTH, pl[1].0, pl[1].1),   // R32F clip depth
-                            (trace::FEED_FSR_MVEC, pl[2].0, pl[2].1),
-                            (trace::FEED_NR, pl[3].0, pl[3].1), // RGB10A2 oct-normals
-                            (trace::FEED_ALB, pl[4].0, pl[4].1),
-                            (trace::FEED_SPEC, pl[5].0, pl[5].1),
-                            (trace::FEED_FSR_DD, pl[6].0, pl[6].1),
-                            (trace::FEED_FSR_DS, pl[7].0, pl[7].1),
-                            (trace::FEED_COLOR, pl[8].0, pl[8].1), // RGBA16F residual
-                            (trace::FEED_FSR_AO, pl[9].0, pl[9].1), // R16F AO
-                            (trace::FEED_FSR_IS, pl[10].0, pl[10].1), // RGBA16F indirect spec
-                        ],
-                    )
-                }
-            }
+            self.wire_fsr_feed(fs, rw, rh, &mut wire)
         } else {
             Err("gbuf session with no live upscaler".into())
+        }
+    }
+
+    /// Every engine's feed wiring is one of these three. Each re-checks the
+    /// trace res against ITS SDK's range: the caller clamped it, but the range
+    /// is the SDK's contract, so a drift fails loudly at init rather than
+    /// quietly at execute. (Under --quinlight the res must satisfy every wired
+    /// engine at once — main.rs intersects the ranges, and these are what
+    /// enforce it.)
+    fn wire_rr_feed(
+        &self,
+        rr: &rr::RrResources,
+        rw: u32,
+        rh: u32,
+        wire: &mut impl FnMut(
+            trace::FeedKind,
+            &[(u32, &ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT)],
+        ) -> Result<()>,
+    ) -> Result<()> {
+        if rw < rr.min.0 || rh < rr.min.1 || rw > rr.max.0 || rh > rr.max.1 {
+            return Err(format!(
+                "trace res {}x{} outside DLSS-RR render range {}x{}..{}x{}",
+                rw, rh, rr.min.0, rr.min.1, rr.max.0, rr.max.1
+            ));
+        }
+        let pl = rr.plane_resources();
+        wire(
+            trace::FeedKind::Rr,
+            &[
+                (trace::FEED_COLOR, pl[0].0, pl[0].1),
+                (trace::FEED_NR, pl[1].0, pl[1].1),
+                (trace::FEED_DEPTH, pl[2].0, pl[2].1),
+                (trace::FEED_MVEC, pl[3].0, pl[3].1),
+                (trace::FEED_ALB, pl[4].0, pl[4].1),
+                (trace::FEED_SPEC, pl[5].0, pl[5].1),
+                (trace::FEED_SPECHIT, pl[6].0, pl[6].1),
+            ],
+        )
+    }
+
+    fn wire_xess_feed(
+        &self,
+        x: &XessState,
+        rw: u32,
+        rh: u32,
+        wire: &mut impl FnMut(
+            trace::FeedKind,
+            &[(u32, &ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT)],
+        ) -> Result<()>,
+    ) -> Result<()> {
+        if rw < x.min.0 || rh < x.min.1 || rw > x.max.0 || rh > x.max.1 {
+            return Err(format!(
+                "trace res {}x{} outside XeSS input range {}x{}..{}x{}",
+                rw, rh, x.min.0, x.min.1, x.max.0, x.max.1
+            ));
+        }
+        let pl = x.res.plane_resources();
+        wire(
+            trace::FeedKind::Xess,
+            &[
+                (trace::FEED_COLOR, pl[0].0, pl[0].1),
+                (trace::FEED_MVEC, pl[1].0, pl[1].1),
+                (trace::FEED_DEPTH, pl[2].0, pl[2].1),
+            ],
+        )
+    }
+
+    fn wire_fsr_feed(
+        &self,
+        fs: &FsrState,
+        rw: u32,
+        rh: u32,
+        wire: &mut impl FnMut(
+            trace::FeedKind,
+            &[(u32, &ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT)],
+        ) -> Result<()>,
+    ) -> Result<()> {
+        fsr_range_check(fs, rw, rh)?;
+        match &fs.res {
+            FsrRes::Up(res) => {
+                let pl = res.plane_resources();
+                wire(
+                    trace::FeedKind::Fsr3,
+                    &[
+                        (trace::FEED_COLOR, pl[0].0, pl[0].1),
+                        (trace::FEED_MVEC, pl[1].0, pl[1].1),
+                        (trace::FEED_DEPTH, pl[2].0, pl[2].1),
+                    ],
+                )
+            }
+            FsrRes::Rr(res) => {
+                // cs_feed_fsr_rr's register/plane mapping (feed.hlsl — keep in
+                // lockstep; plane_resources returns upload order: depth_lin,
+                // depth_clip, mvec, normals, diff_alb, spec_alb, dd_in, ds_in,
+                // residual, ao_in, is_in).
+                let pl = res.plane_resources();
+                wire(
+                    trace::FeedKind::FsrRr,
+                    &[
+                        (trace::FEED_SPECHIT, pl[0].0, pl[0].1), // R32F linear depth
+                        (trace::FEED_DEPTH, pl[1].0, pl[1].1),   // R32F clip depth
+                        (trace::FEED_FSR_MVEC, pl[2].0, pl[2].1),
+                        (trace::FEED_NR, pl[3].0, pl[3].1), // RGB10A2 oct-normals
+                        (trace::FEED_ALB, pl[4].0, pl[4].1),
+                        (trace::FEED_SPEC, pl[5].0, pl[5].1),
+                        (trace::FEED_FSR_DD, pl[6].0, pl[6].1),
+                        (trace::FEED_FSR_DS, pl[7].0, pl[7].1),
+                        (trace::FEED_COLOR, pl[8].0, pl[8].1), // RGBA16F residual
+                        (trace::FEED_FSR_AO, pl[9].0, pl[9].1), // R16F AO
+                        (trace::FEED_FSR_IS, pl[10].0, pl[10].1), // RGBA16F indirect spec
+                    ],
+                )
+            }
         }
     }
 
@@ -858,26 +2140,41 @@ impl GpuContext {
         gbuf: bool,
         nppd: Option<(&str, &str)>,
         debug: bool,
-        bc7_q: Option<crate::bc7::Quality>,
+        bc7_mode: crate::bc7::Bc7Mode,
     ) -> Result<()> {
         let dev = self.d3d.device.clone();
-        let mut tg = trace::TraceGpu::new(
+        let core = self.ensure_scene_gpu(scene, bvh, bc7_mode)?;
+        let tg = trace::TraceGpu::new(
             &dev,
             dxc,
             scene,
             bvh,
+            core,
             rw,
             rh,
             gbuf,
             nppd.is_some(),
             debug,
-            bc7_q,
             &mut self.d3d,
-        )?;
+        );
+        let mut tg = match tg {
+            Ok(t) => t,
+            Err(e) => {
+                self.evict_unused_scene_gpu();
+                return Err(e);
+            }
+        };
         // Upscaler sessions: wire the live upscaler's input planes as feed
         // targets — the feed kernel writes them directly, no CPU upload.
+        // (Failures before `self.trace = Some(..)` evict the cached core —
+        // the tracer never went live, so nobody holds it.)
         if gbuf {
-            self.wire_session_feed(rw, rh, |kind, targets| tg.wire_feed(&dev, kind, targets))?;
+            let wired = self
+                .wire_session_feed(rw, rh, |kind, targets| tg.wire_feed_add(&dev, kind, targets));
+            if let Err(e) = wired {
+                self.evict_unused_scene_gpu();
+                return Err(e);
+            }
         }
         // GPU-resident NPPD: ORT session on OUR device/queue, tensors bound
         // over the NppdRes buffers. XeSS-only (RR is itself a denoiser — the
@@ -885,6 +2182,7 @@ impl GpuContext {
         // running plain and frees the ~340 MB staging.
         if let Some((dir, model)) = nppd {
             if self.xess.is_none() {
+                self.evict_unused_scene_gpu();
                 return Err("NPPD composition requires the XeSS session".into());
             }
             let built = tg.nppd.as_ref().ok_or("NPPD staging missing".to_string()).and_then(
@@ -914,13 +2212,17 @@ impl GpuContext {
                 }
             }
         }
-        self.passes.create_srv(
+        wire_tonemap_src(
             &self.d3d.device,
+            &self.passes,
+            &self.bloom,
             &tg.hdr,
             windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
             tonemap::SRV_SLOT_GPU,
         );
         self.trace = Some(tg);
+        // The fuse, over whatever engines the chain wired (--quinlight only).
+        self.build_quin(dxc)?;
         Ok(())
     }
 
@@ -928,39 +2230,116 @@ impl GpuContext {
         self.trace.is_some()
     }
 
+    /// Build-or-fetch the SHARED scene core — the upload + BLAS/TLAS build
+    /// runs once per session (or per scene edit), whichever tracer asks
+    /// first; the other gets the cached Rc for free.
+    fn ensure_scene_gpu(
+        &mut self,
+        scene: &crate::scene::Scene,
+        bvh: &crate::bvh::Bvh,
+        bc7_mode: crate::bc7::Bc7Mode,
+    ) -> Result<std::rc::Rc<trace::SceneGpu>> {
+        if self.scene_gpu.is_none() {
+            let dev = self.d3d.device.clone();
+            let core = trace::SceneGpu::new_uploaded(&dev, scene, bvh, &mut self.d3d, bc7_mode)?;
+            self.scene_gpu = Some(std::rc::Rc::new(core));
+        }
+        Ok(self.scene_gpu.clone().expect("just ensured"))
+    }
+
+    /// The init-failure eviction arm: when tracer construction fails and no
+    /// tracer is live, a cached core is ~gigabytes serving nobody under the
+    /// CPU renderer — drop it (the failure latch in main.rs means nothing
+    /// will ask again this session).
+    fn evict_unused_scene_gpu(&mut self) {
+        if self.trace.is_none() && self.dxr.is_none() {
+            self.scene_gpu = None;
+        }
+    }
+
+    /// Drop the resident GPU tracers (--gpu wavefront + DXR) and their
+    /// dependents (the quinlight fuse, GPU-resident NPPD) so the next mode
+    /// entry rebuilds their SceneGpu/BLAS/TLAS from the current scene — the
+    /// runtime frustum-snapshot capture path, which edits the scene live.
+    /// Drains the queue first so no in-flight frame references the freed
+    /// resources; `init_trace`/`init_dxr` re-read the scene at call time and
+    /// re-run `build_quin`. The upscaler contexts (rr/xess/fsr) are kept —
+    /// they are resolution-, not scene-, bound.
+    pub fn drop_scene_tracers(&mut self) {
+        let _ = self.d3d.wait_idle();
+        self.nppd_gpu = None;
+        self.quin = None;
+        self.trace = None;
+        self.dxr = None;
+        // The shared core is scene-bound too — the next mode entry must
+        // re-upload from the edited scene, never serve the stale cache.
+        self.scene_gpu = None;
+    }
+
+    /// Push a TOD change (`scene::apply_tod`) into the GPU pipelines' cached
+    /// base constants — sun rows + SH sky + sky_scale/night. A pipeline built
+    /// lazily AFTER the change needs nothing: `init_trace`/`init_dxr` read the
+    /// scene at call time.
+    pub fn refresh_sky(&mut self, scene: &crate::scene::Scene) {
+        if let Some(t) = &mut self.trace {
+            t.refresh_sky(scene);
+        }
+        if let Some(d) = &mut self.dxr {
+            d.refresh_sky(scene);
+        }
+    }
+
     /// Build the DXR DispatchRays pipeline (the F key / --dxr). Idempotent —
     /// a live pipeline is kept. `(rw, rh)` is the session's fixed DXR trace
     /// resolution (the locked render res when `gbuf` composes with the wired
-    /// upscaler, the window size otherwise); scene buffers + BLAS/TLAS build
-    /// once here (the scene is static, --stress included).
+    /// upscaler, the window size otherwise); scene buffers + BLAS/TLAS come
+    /// from the SHARED core (`ensure_scene_gpu` — uploaded once per session,
+    /// whichever tracer asks first).
     pub fn init_dxr(
         &mut self,
         dxc: &dxc::Dxc,
         scene: &crate::scene::Scene,
-        // Unused since the DXR pipeline stopped uploading the software BVH
-        // (SceneGpu sw_bvh: None); kept so the call sites stay uniform.
-        _bvh: &crate::bvh::Bvh,
+        // Not uploaded (the DXR pipeline never binds the software tree), but
+        // read on the CPU as the --blas-split chunking source.
+        bvh: &crate::bvh::Bvh,
         rw: u32,
         rh: u32,
         gbuf: bool,
         debug: bool,
-        bc7_q: Option<crate::bc7::Quality>,
+        bc7_mode: crate::bc7::Bc7Mode,
     ) -> Result<()> {
         if self.dxr.is_some() {
             return Ok(());
         }
         let dev = self.d3d.device.clone();
-        let mut d = dxr::DxrGpu::new(&dev, dxc, scene, rw, rh, gbuf, debug, bc7_q, &mut self.d3d)?;
+        let core = self.ensure_scene_gpu(scene, bvh, bc7_mode)?;
+        let mut d = match dxr::DxrGpu::new(&dev, dxc, scene, core, rw, rh, gbuf, debug) {
+            Ok(d) => d,
+            Err(e) => {
+                self.evict_unused_scene_gpu();
+                return Err(e);
+            }
+        };
         if gbuf {
-            self.wire_session_feed(rw, rh, |kind, targets| d.wire_feed(&dev, kind, targets))?;
+            // Pre-store failure: evict the cached core (the init_trace shape).
+            let wired = self
+                .wire_session_feed(rw, rh, |kind, targets| d.wire_feed_add(&dev, kind, targets));
+            if let Err(e) = wired {
+                self.evict_unused_scene_gpu();
+                return Err(e);
+            }
         }
-        self.passes.create_srv(
+        wire_tonemap_src(
             &self.d3d.device,
+            &self.passes,
+            &self.bloom,
             &d.hdr,
             windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
             tonemap::SRV_SLOT_DXR,
         );
         self.dxr = Some(d);
+        // The fuse, over whatever engines the chain wired (--quinlight only).
+        self.build_quin(dxc)?;
         Ok(())
     }
 
@@ -1020,6 +2399,7 @@ impl GpuContext {
         if self.dxr.is_none() || self.sl.is_none() || self.rr.is_none() {
             return Err("DXR pipeline + DLSS-RR not both initialized".into());
         }
+        self.dlssg_frame_begin(frame_idx);
         let slot = self.d3d.begin_frame()?;
         {
             let d3d = &mut self.d3d;
@@ -1043,6 +2423,21 @@ impl GpuContext {
                 return Err(e);
             }
         }
+        // FR_DLSSG_NO_RR=1: the RR+G ISOLATION EXPERIMENT. DLSS-G's full
+        // contract stays — token, constants, options, tags (type-0 depth
+        // included), markers, mode — but the RR EVALUATE is removed from the
+        // frame and the DXR pipeline's own resolve presents instead. If G
+        // inserts here and not in the normal arm, the RR coexistence is the
+        // blocker; if it still declines, RR is exonerated. Diagnostic lever,
+        // not a mode: the image loses RR's denoise while it is set.
+        static ISOLATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let isolate = *ISOLATE.get_or_init(|| {
+            let on = std::env::var("FR_DLSSG_NO_RR").is_ok();
+            if on {
+                eprintln!("fg: FR_DLSSG_NO_RR — RR evaluate SKIPPED (DLSS-G isolation experiment)");
+            }
+            on
+        });
         {
             let d3d = &mut self.d3d;
             let sl = self.sl.as_ref().unwrap();
@@ -1054,7 +2449,18 @@ impl GpuContext {
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 )]);
             }
-            if let Err(e) = rr_sl_sequence(sl, rr, &d3d.list, fc, frame_idx) {
+            let dlssg = self.fg_g.as_ref().is_some_and(|g| g.enabled && !g.failed.get());
+            let r = if isolate {
+                let list_raw = d3d.list.as_raw();
+                sl.new_frame_token(frame_idx).and_then(|token| {
+                    sl.set_constants(token, 0, &shim_constants(fc))?;
+                    sl.dlssd_set_options(0, &shim_options(fc, rr.ow, rr.oh))?;
+                    sl.tag_resources(token, 0, &rr.tags(fc.rw, fc.rh, dlssg), list_raw)
+                })
+            } else {
+                rr_sl_sequence(sl, rr, &d3d.list, fc, frame_idx, dlssg)
+            };
+            if let Err(e) = r {
                 d3d.abort_frame();
                 return Err(e);
             }
@@ -1066,11 +2472,22 @@ impl GpuContext {
                 )]);
             }
         }
-        // The tonemap pass re-binds root sig/PSO/heaps/viewport from scratch —
-        // the post-evaluate state restore eDisableCLStateTracking makes the
-        // host's responsibility.
+        if isolate {
+            let d = self.dxr.as_ref().unwrap();
+            d.record_resolve(&self.d3d.list, slot, 1);
+            self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_DXR, 1.0);
+            return self.dlssg_end_frame(slot, frame_idx);
+        }
+        // Raw-NGX frame generation owns the tail when armed (pair-present);
+        // the SL-G marker bracket below is its fallback sibling.
+        if self.fg_n.is_some() {
+            return self.ngxfg_tail(slot, fc);
+        }
+        // The tonemap pass re-binds root sig/PSO/heaps/viewport from
+        // scratch — the post-evaluate state restore
+        // eDisableCLStateTracking makes the host's responsibility.
         self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_RR, 1.0);
-        self.d3d.end_frame(slot)
+        self.dlssg_end_frame(slot, frame_idx)
     }
 
     /// XeSS-SR fed by the DXR pipeline (`--dxr --xess`): DispatchRays ->
@@ -1082,6 +2499,8 @@ impl GpuContext {
         p: &trace::FrameParams,
         jitter: (f32, f32),
         reset: bool,
+        fc: &dlss::FrameConstants,
+        frame_ms: f32,
     ) -> Result<()> {
         crate::zone!("present-dxr-xess");
         if self.dxr.is_none() || self.xess.is_none() {
@@ -1150,10 +2569,11 @@ impl GpuContext {
                 )]);
             }
         }
+        self.xefg_prepare(fc, frame_ms);
         // The tonemap pass re-binds root sig/PSO/heaps/viewport from scratch,
         // restoring whatever list state the XeSS dispatch left behind.
         self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_XESS, 1.0);
-        self.d3d.end_frame(slot)
+        self.xefg_end_frame(slot)
     }
 
     /// FSR 3.1 fed by the DXR pipeline: DispatchRays -> feed (pack -> the 3
@@ -1197,10 +2617,15 @@ impl GpuContext {
         }
         {
             let fs = self.fsr.as_ref().unwrap();
-            if let Err(e) = Self::record_fsr3_upscale(fs, &self.d3d, fc, frame_ms) {
+            if let Err(e) = Self::record_fsr3_upscale(fs, &self.d3d, fc, frame_ms, None) {
                 self.d3d.abort_frame();
                 return Err(e);
             }
+        }
+        self.fg_set_frame_ms(frame_ms);
+        if let Some(fs) = &self.fsr {
+            let (dep, mv, scale) = fs.res.fg_inputs(fc.rw as u32, fc.rh as u32);
+            self.fg_prepare(&self.d3d.list, fc, dep, mv, scale);
         }
         // The tonemap pass re-binds root sig/PSO/heaps/viewport from scratch,
         // restoring whatever list state the ffx dispatch left behind.
@@ -1261,6 +2686,8 @@ impl GpuContext {
         jitter: (f32, f32),
         reset: bool,
         nppd: bool,
+        fc: &dlss::FrameConstants,
+        frame_ms: f32,
     ) -> Result<()> {
         crate::zone!("present-trace-xess");
         if self.trace.is_none() || self.xess.is_none() {
@@ -1304,55 +2731,183 @@ impl GpuContext {
             let d3d = &mut self.d3d;
             let tg = self.trace.as_ref().unwrap();
             let x = self.xess.as_ref().unwrap();
+            if let Err(e) = Self::record_xess_eval(x, d3d, tg.rw, tg.rh, jitter, reset) {
+                d3d.abort_frame();
+                return Err(e);
+            }
+        }
+        self.xefg_prepare(fc, frame_ms);
+        // The tonemap pass re-binds root sig/PSO/heaps/viewport from scratch,
+        // restoring whatever list state the XeSS dispatch left behind.
+        self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_XESS, 1.0);
+        self.xefg_end_frame(slot)
+    }
+
+    /// Record EVERY wired engine's upscale into its own output texture, then the
+    /// registered-consensus fuse over them — the shared middle of the two
+    /// --quinlight present arms (wavefront and DXR). The caller has already
+    /// recorded the trace and ONE feed dispatch per engine.
+    ///
+    /// All of it rides one command list, in FIFO order: each engine reads the
+    /// same G-buffer-derived planes (they are read-only consumers, so no barrier
+    /// between them) and writes its own window-res output; the fuse then reads
+    /// those N outputs as SRVs and writes the one image the tonemap presents.
+    /// Under DLSS the whole list executes on the SL proxy queue, exactly as
+    /// present_trace_rr's does.
+    ///
+    /// An engine that errors here fails the frame — by this point it is wired,
+    /// fed, and counted in the fuse's N, so silently skipping it would fuse a
+    /// stale output.
+    /// `sky_sh` rides through to an FSR4-RR engine's composite (the AO signal's
+    /// remodulation factor — the one sky made it directional).
+    #[allow(clippy::too_many_arguments)]
+    fn record_quin_engines(
+        &mut self,
+        rw: u32,
+        rh: u32,
+        jitter: (f32, f32),
+        reset: bool,
+        fc: &dlss::FrameConstants,
+        prev_pos: Option<glam::Vec3A>,
+        frame_idx: u32,
+        frame_ms: f32,
+        sky_sh: &crate::sh::Sh9,
+    ) -> Result<()> {
+        // DLSS-RR (engine 0 when Streamline is live).
+        if let (Some(sl), Some(rr)) = (self.sl.as_ref(), self.rr.as_ref()) {
+            let d3d = &self.d3d;
             unsafe {
                 d3d.list.ResourceBarrier(&[transition(
-                    &x.res.output,
+                    &rr.output,
                     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 )]);
             }
-            let (c, m, d) = x.res.input_ptrs();
-            let params = crate::xess::XessD3d12ExecuteParams {
-                color_texture: c,
-                velocity_texture: m,
-                depth_texture: d,
-                exposure_scale_texture: std::ptr::null_mut(),
-                responsive_pixel_mask_texture: std::ptr::null_mut(),
-                output_texture: x.res.output.as_raw(),
-                jitter_offset_x: crate::xess::JITTER_SIGN * jitter.0,
-                jitter_offset_y: crate::xess::JITTER_SIGN * jitter.1,
-                exposure_scale: 1.0,
-                reset_history: reset as u32,
-                input_width: tg.rw,
-                input_height: tg.rh,
-                input_color_base: Default::default(),
-                input_motion_vector_base: Default::default(),
-                input_depth_base: Default::default(),
-                input_responsive_mask_base: Default::default(),
-                reserved0: Default::default(),
-                output_color_base: Default::default(),
-                descriptor_heap: std::ptr::null_mut(),
-                descriptor_heap_offset: 0,
-            };
-            {
-                let _ev = pix::scope(&d3d.list, c"xess-eval");
-                if let Err(e) = x.ctx.execute(d3d.list.as_raw(), &params) {
-                    d3d.abort_frame();
-                    return Err(e);
-                }
-            }
+            rr_sl_sequence(sl, rr, &d3d.list, fc, frame_idx, self.fg_g.as_ref().is_some_and(|g| g.enabled && !g.failed.get()))?;
             unsafe {
                 d3d.list.ResourceBarrier(&[transition(
-                    &x.res.output,
+                    &rr.output,
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
                 )]);
             }
         }
-        // The tonemap pass re-binds root sig/PSO/heaps/viewport from scratch,
-        // restoring whatever list state the XeSS dispatch left behind.
-        self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_XESS, 1.0);
+        // The ffx flavors. FSR4-RR denoises + upscales; FSR 3.1 upscales only —
+        // and does it from the XeSS trio when XeSS is also wired (one feed, two
+        // readers), else from its own planes.
+        let shared = self.xess.as_ref().map(|x| x.res.plane_resources());
+        for fs in [self.fsr.as_ref(), self.fsr3.as_ref()].into_iter().flatten() {
+            match &fs.res {
+                FsrRes::Rr(_) => Self::record_fsr_rr_sequence(
+                    fs, &self.d3d, fc, prev_pos, frame_idx, frame_ms, sky_sh,
+                )?,
+                FsrRes::Up(_) => {
+                    Self::record_fsr3_upscale(fs, &self.d3d, fc, frame_ms, shared.as_ref())?
+                }
+            }
+        }
+        // XeSS.
+        if let Some(x) = self.xess.as_ref() {
+            Self::record_xess_eval(x, &self.d3d, rw, rh, jitter, reset)?;
+        }
+        // The fuse: N engine outputs -> one image at SRV_SLOT_QUIN.
+        self.quin.as_ref().ok_or("quinlight fuse not built")?.record(&self.d3d.list);
+        Ok(())
+    }
+
+    /// The registered-consensus fuse fed by the GPU-resident tracer
+    /// (`--gpu --quinlight`): trace -> one feed dispatch per engine -> every
+    /// wired upscaler -> the LK-registered winsorized fuse -> tonemap
+    /// (SRV_SLOT_QUIN) -> present. One command list, one Present.
+    #[allow(clippy::too_many_arguments)]
+    pub fn present_trace_quin(
+        &mut self,
+        p: &trace::FrameParams,
+        hybrid: bool,
+        jitter: (f32, f32),
+        reset: bool,
+        fc: &dlss::FrameConstants,
+        prev_pos: Option<glam::Vec3A>,
+        frame_idx: u32,
+        frame_ms: f32,
+        sky_sh: &crate::sh::Sh9,
+    ) -> Result<()> {
+        crate::zone!("present-trace-quin");
+        if self.trace.is_none() || self.quin.is_none() {
+            return Err("GPU tracer + quinlight fuse not both initialized".into());
+        }
+        let slot = self.d3d.begin_frame()?;
+        let (rw, rh) = {
+            let d3d = &mut self.d3d;
+            let tg = self.trace.as_ref().unwrap();
+            tg.write_cb(slot, p);
+            tg.record_frame(&d3d.list, slot, p, hybrid);
+            if let Err(e) = tg.record_feed(&d3d.list, slot, false) {
+                d3d.abort_frame();
+                return Err(e);
+            }
+            (tg.rw, tg.rh)
+        };
+        if let Err(e) =
+            self.record_quin_engines(rw, rh, jitter, reset, fc, prev_pos, frame_idx, frame_ms, sky_sh)
+        {
+            self.d3d.abort_frame();
+            return Err(e);
+        }
+        self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_QUIN, 1.0);
         self.d3d.end_frame(slot)
+    }
+
+    /// The DXR twin of `present_trace_quin` (the `--dxr` default + --quinlight):
+    /// DispatchRays instead of the wavefront, same engines, same fuse.
+    #[allow(clippy::too_many_arguments)]
+    pub fn present_dxr_quin(
+        &mut self,
+        p: &trace::FrameParams,
+        jitter: (f32, f32),
+        reset: bool,
+        fc: &dlss::FrameConstants,
+        prev_pos: Option<glam::Vec3A>,
+        frame_idx: u32,
+        frame_ms: f32,
+        sky_sh: &crate::sh::Sh9,
+    ) -> Result<()> {
+        crate::zone!("present-dxr-quin");
+        if self.dxr.is_none() || self.quin.is_none() {
+            return Err("DXR pipeline + quinlight fuse not both initialized".into());
+        }
+        let slot = self.d3d.begin_frame()?;
+        let (rw, rh) = {
+            let d3d = &mut self.d3d;
+            let d = self.dxr.as_ref().unwrap();
+            d.write_cb(slot, p);
+            if let Err(e) = d.record_frame(&d3d.list, slot) {
+                d3d.abort_frame();
+                return Err(e);
+            }
+            if let Err(e) = d.record_feed(&d3d.list, slot) {
+                d3d.abort_frame();
+                return Err(e);
+            }
+            (d.rw, d.rh)
+        };
+        if let Err(e) =
+            self.record_quin_engines(rw, rh, jitter, reset, fc, prev_pos, frame_idx, frame_ms, sky_sh)
+        {
+            self.d3d.abort_frame();
+            return Err(e);
+        }
+        self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_QUIN, 1.0);
+        self.d3d.end_frame(slot)
+    }
+
+    /// Screenshot path for --quinlight: the fused image exists only on the GPU.
+    pub fn read_quin_output(&mut self) -> Result<Vec<u32>> {
+        let Some(q) = &self.quin else {
+            return Err("quinlight fuse not initialized".into());
+        };
+        let output = q.output.clone();
+        Ok(self.read_hdr_output(output)?.0)
     }
 
     /// FSR 3.1 fed by the GPU-resident tracer (`--gpu` with FSR3 wired):
@@ -1391,10 +2946,15 @@ impl GpuContext {
         }
         {
             let fs = self.fsr.as_ref().unwrap();
-            if let Err(e) = Self::record_fsr3_upscale(fs, &self.d3d, fc, frame_ms) {
+            if let Err(e) = Self::record_fsr3_upscale(fs, &self.d3d, fc, frame_ms, None) {
                 self.d3d.abort_frame();
                 return Err(e);
             }
+        }
+        self.fg_set_frame_ms(frame_ms);
+        if let Some(fs) = &self.fsr {
+            let (dep, mv, scale) = fs.res.fg_inputs(fc.rw as u32, fc.rh as u32);
+            self.fg_prepare(&self.d3d.list, fc, dep, mv, scale);
         }
         // The tonemap pass re-binds root sig/PSO/heaps/viewport from scratch,
         // restoring whatever list state the ffx dispatch left behind.
@@ -1434,7 +2994,13 @@ impl GpuContext {
     /// vanilla reference, compare per pixel (same intersector both sides —
     /// the exact-zero gates), and report. Clobbers accum/tbuf/info; the
     /// caller resets the accumulation.
-    pub fn verify_trace(&mut self, cam: &crate::camera::CamBasis, q: crate::shade::Quality) -> Result<String> {
+    pub fn verify_trace(
+        &mut self,
+        cam: &crate::camera::CamBasis,
+        q: crate::shade::Quality,
+        clouds: crate::clouds::Clouds,
+        fireflies: crate::fireflies::Fireflies,
+    ) -> Result<String> {
         let (tbuf, info, counters, px) = {
             let Some(tg) = &self.trace else {
                 return Err("GPU tracer not initialized".into());
@@ -1452,6 +3018,11 @@ impl GpuContext {
             verify: false,
             spp: 1,
             probe_sample: 0,
+            // The live session state: both kernels read the same CB, so the
+            // same-seed comparison holds whatever the sky is doing — and the
+            // C verify then exercises the cloud code the session actually runs.
+            clouds,
+            fireflies,
         };
         {
             // Field-split borrow: run_once needs d3d mutably, the recorder
@@ -1514,10 +3085,15 @@ impl GpuContext {
     }
 
     /// Which chain level this session wired — derived from the live state
-    /// (at most one upscaler exists per session by the probe's construction),
-    /// so it can never disagree with the contexts actually held.
+    /// (at most one upscaler exists per session by the probe's construction,
+    /// EXCEPT under --quinlight, where several do and the fuse presents), so it
+    /// can never disagree with the contexts actually held.
     pub fn wired(&self) -> WiredUpscaler {
-        if self.dlss_ready() {
+        // Tested first: a quinlight session holds several engines, and any of
+        // the branches below would also match one of them.
+        if self.quin.is_some() {
+            WiredUpscaler::Quin
+        } else if self.dlss_ready() {
             WiredUpscaler::Rr
         } else if let Some(f) = &self.fsr {
             match f.res.flavor() {
@@ -1529,6 +3105,137 @@ impl GpuContext {
         } else {
             WiredUpscaler::Plain
         }
+    }
+
+    /// The engines a --quinlight session fuses, in CHAIN order (which is also
+    /// fuse order, so engine 0 is the highest level present — a DENOISING one
+    /// wherever the box has one, which is what the default anchor wants).
+    ///
+    /// Their window-res RGBA16F outputs are the fuse's SRVs. Ordinary sessions
+    /// return at most one, which is why `quin_engines().len() < 2` is the
+    /// "nothing to fuse" test.
+    fn quin_engines(&self) -> (Vec<&ID3D12Resource>, quin::Engines) {
+        let mut res: Vec<&ID3D12Resource> = Vec::new();
+        let mut names: Vec<&'static str> = Vec::new();
+        if let Some(r) = &self.rr {
+            if self.sl.is_some() {
+                res.push(&r.output);
+                names.push("dlss-rr");
+            }
+        }
+        for f in [self.fsr.as_ref(), self.fsr3.as_ref()].into_iter().flatten() {
+            res.push(f.res.upscaled());
+            names.push(match f.res.flavor() {
+                crate::fsr::Flavor::Fsr4Rr => "fsr4-rr",
+                crate::fsr::Flavor::Fsr3 => "fsr3",
+            });
+        }
+        if let Some(x) = &self.xess {
+            res.push(&x.res.output);
+            names.push("xess");
+        }
+        (res, quin::Engines(names))
+    }
+
+    /// Build the fuse over whatever engines came up — called from
+    /// init_trace/init_dxr, which already hold the DXC the PSO needs. A single
+    /// engine is not a consensus: the session then presents that engine
+    /// directly (its own chain level), and `wired()` reports it.
+    fn build_quin(&mut self, dxc: &dxc::Dxc) -> Result<()> {
+        let Some((anchor_opt, debug)) = self.quin_cfg else {
+            return Ok(());
+        };
+        // Idempotent (the init_dxr precedent): the fuse reads the UPSCALER
+        // outputs, which are session objects independent of which tracer
+        // feeds them, so one fuse serves both. With the SPACE mode cycle the
+        // second tracer's LAZY init lands here mid-session, and replacing a
+        // fuse whose PSO/heap prior frames may still reference is exactly
+        // the in-flight-release class D3D12 forbids.
+        if self.quin.is_some() {
+            return Ok(());
+        }
+        let (w, h) = (self.d3d.width, self.d3d.height);
+        let (engines, names) = self.quin_engines();
+        if engines.len() < 2 {
+            eprintln!(
+                "quinlight: only {} engine(s) came up ({}) — nothing to fuse; \
+                 presenting that level directly",
+                engines.len(),
+                if names.0.is_empty() { "none".into() } else { names.names() }
+            );
+            return Ok(());
+        }
+        // Default: anchor on a DENOISING engine (DLSS-RR, else FSR4-RR) when the
+        // box wired one — the anchor is never warped, so it is the engine whose
+        // spatial frame survives, and a ray-reconstruction image is both the
+        // cleanest reference for the LK solve and the one worth keeping. An
+        // explicit --quin-anchor always wins.
+        // An out-of-range --quin-anchor is a typo, and silently clamping it would
+        // report someone else's engine as the anchor they asked for — an A/B run
+        // against a bad index would read as a legitimate result. Say so, then
+        // clamp (the shader clamps too; this is about the user, not soundness).
+        let last = engines.len() as u32 - 1;
+        if let Some(a) = anchor_opt.filter(|a| *a > last) {
+            eprintln!(
+                "quinlight: --quin-anchor {a} is past the last engine ({last}: {}) — \
+                 clamping to {last}",
+                names.names()
+            );
+        }
+        let anchor = anchor_opt.unwrap_or_else(|| names.default_anchor()).min(last);
+        let q =
+            quin::Quin::new(&self.d3d.device, dxc, &engines, names.clone(), anchor, w, h, debug)?;
+        // A tonemap SOURCE, so it goes through wire_tonemap_src: the fused image
+        // is what the glare pyramid must read (bloom's source SRV per slot), or
+        // a --quinlight session would present without highlights.
+        wire_tonemap_src(
+            &self.d3d.device,
+            &self.passes,
+            &self.bloom,
+            &q.output,
+            windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+            tonemap::SRV_SLOT_QUIN,
+        );
+        eprintln!(
+            "quinlight: fusing {} engines [{}], anchor {} ({}) — registered consensus \
+             (LK + warp + winsorized mean){}",
+            engines.len(),
+            names.names(),
+            names.0[anchor as usize],
+            match anchor_opt {
+                Some(_) => "--quin-anchor",
+                None if quin::DENOISING.contains(&names.0[anchor as usize]) =>
+                    "default: the denoising engine",
+                None => "default: engine 0",
+            },
+            if engines.len() == 2 {
+                "; NOTE 2 engines => the winsorized mean IS a plain mean (see gpu/quin.rs)"
+            } else {
+                ""
+            }
+        );
+        // The measured caveat, said out loud: the reduce can only pull the clean
+        // anchor toward the noisy ones, so a mixed stack is quieter than the TAA
+        // engines but NOISIER than the denoiser alone. Not a failure — a property
+        // of the mean — but a user who wired this expecting a free win should be
+        // told, not left to discover it.
+        if names.mixed_noise(anchor) {
+            eprintln!(
+                "quinlight: NOTE the anchor denoises but [{}] does not — the winsorized mean \
+                 pulls the anchor toward the noisier engines, so expect MORE temporal noise \
+                 than {} alone (measured; see CLAUDE.md). --quinlight --no-dlss fuses peers.",
+                names
+                    .0
+                    .iter()
+                    .filter(|n| !quin::DENOISING.contains(n))
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(" + "),
+                names.0[anchor as usize],
+            );
+        }
+        self.quin = Some(q);
+        Ok(())
     }
 
     /// The optimal render resolution for DLSS mode (SL's Quality-mode
@@ -1548,6 +3255,44 @@ impl GpuContext {
     /// XeSS live => the dynamic-res upscale path is available.
     pub fn xess_ready(&self) -> bool {
         self.xess.is_some()
+    }
+
+    /// The fused engines, for the HUD ("dlss-rr + xess + fsr3").
+    pub fn quin_names(&self) -> Option<String> {
+        self.quin.as_ref().map(|q| q.names.names())
+    }
+
+    /// Will this session present through the fuse? True iff `--quinlight` AND at
+    /// least two engines actually came up. The fuse itself is built later (in
+    /// init_trace/init_dxr, which hold the DXC), but the ANSWER is fixed at
+    /// probe time — main.rs needs it before then, to pick the render res that
+    /// satisfies every engine at once.
+    pub fn quin_planned(&self) -> bool {
+        self.quin_cfg.is_some() && self.quin_engines().0.len() > 1
+    }
+
+    /// The render-res range every wired engine accepts: the INTERSECTION of
+    /// their SDK ranges (max of the mins, min of the maxes). A --quinlight frame
+    /// is traced ONCE and fed to all of them, so the one res must be legal for
+    /// each — and `wire_session_feed`'s per-engine range checks enforce it.
+    /// None = no engine wired.
+    pub fn quin_res_range(&self) -> Option<((u32, u32), (u32, u32), (u32, u32))> {
+        let mut it = [
+            self.rr.as_ref().filter(|_| self.sl.is_some()).map(|r| (r.opt, r.min, r.max)),
+            self.fsr.as_ref().map(|f| (f.opt, f.min, f.max)),
+            self.fsr3.as_ref().map(|f| (f.opt, f.min, f.max)),
+            self.xess.as_ref().map(|x| (x.opt, x.min, x.max)),
+        ]
+        .into_iter()
+        .flatten();
+        let first = it.next()?;
+        Some(it.fold(first, |(o, lo, hi), (o2, lo2, hi2)| {
+            (
+                (o.0.min(o2.0), o.1.min(o2.1)),
+                (lo.0.max(lo2.0), lo.1.max(lo2.1)),
+                (hi.0.min(hi2.0), hi.1.min(hi2.1)),
+            )
+        }))
     }
 
     /// XeSS input-resolution range: (optimal, min, max). Every dynamic frame
@@ -1582,6 +3327,7 @@ impl GpuContext {
     /// this frame's sub-rect); only the upscaled output is window-sized.
     /// `prev_pos` is the previous frame's camera position (the denoiser's
     /// cameraPositionDelta); `frame_ms` feeds the upscaler's frameTimeDelta.
+    #[allow(clippy::too_many_arguments)]
     pub fn present_fsr(
         &mut self,
         g: &dlss::GBufs,
@@ -1590,6 +3336,7 @@ impl GpuContext {
         prev_pos: Option<glam::Vec3A>,
         frame_idx: u32,
         frame_ms: f32,
+        sky_sh: &crate::sh::Sh9,
     ) -> Result<()> {
         crate::zone!("present-fsr");
         let Some(fs) = &self.fsr else {
@@ -1619,11 +3366,18 @@ impl GpuContext {
             return Err(e);
         }
 
-        if let Err(e) = Self::record_fsr_rr_sequence(fs, &self.d3d, fc, prev_pos, frame_idx, frame_ms) {
+        if let Err(e) =
+            Self::record_fsr_rr_sequence(fs, &self.d3d, fc, prev_pos, frame_idx, frame_ms, sky_sh)
+        {
             self.d3d.abort_frame();
             return Err(e);
         }
 
+        self.fg_set_frame_ms(frame_ms);
+        if let Some(fs) = &self.fsr {
+            let (dep, mv, scale) = fs.res.fg_inputs(fc.rw as u32, fc.rh as u32);
+            self.fg_prepare(&self.d3d.list, fc, dep, mv, scale);
+        }
         // The tonemap pass re-binds root sig/PSO/heaps/viewport from scratch,
         // restoring whatever list state the ffx dispatches left behind.
         self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_FSR, 1.0);
@@ -1638,6 +3392,11 @@ impl GpuContext {
     /// cs_feed_fsr_rr kernel — both leave them resting in
     /// NON_PIXEL_SHADER_RESOURCE). The caller owns the open frame (and
     /// aborts it on Err).
+    /// `sky_sh` is the scene's sky in order-2 SH — the AO signal's remodulation
+    /// factor, which the composite pass evaluates per pixel against the normals
+    /// plane. It used to be a compile-time constant (`shade::AMBIENT`); the one
+    /// sky makes it directional, so it has to travel with the frame.
+    #[allow(clippy::too_many_arguments)]
     fn record_fsr_rr_sequence(
         fs: &FsrState,
         d3d: &D3d,
@@ -1645,6 +3404,7 @@ impl GpuContext {
         prev_pos: Option<glam::Vec3A>,
         frame_idx: u32,
         frame_ms: f32,
+        sky_sh: &crate::sh::Sh9,
     ) -> Result<()> {
         let FsrRes::Rr(res) = &fs.res else {
             return Err("FSR4-RR sequence on an FSR 3.1 session".into());
@@ -1710,7 +3470,7 @@ impl GpuContext {
         res.barrier_denoise_end(&d3d.list);
 
         // Remodulate (binds from scratch — the post-ffx state restore).
-        res.record_composite(&d3d.list, rw, rh);
+        res.record_composite(&d3d.list, rw, rh, sky_sh);
 
         // FSR4 upscale: composite -> window-res output. The shared MV plane
         // holds UV-deltas here, so the scale multiplies the render dims back
@@ -1738,6 +3498,7 @@ impl GpuContext {
     /// Ray Regeneration + FSR4 fed by the GPU-resident tracer: trace -> feed
     /// (pack + sig -> the nine FSR planes, on-GPU) -> denoise -> composite ->
     /// upscale -> tonemap(SRV_SLOT_FSR) -> present. Never an SL session.
+    #[allow(clippy::too_many_arguments)]
     pub fn present_trace_fsr_rr(
         &mut self,
         p: &trace::FrameParams,
@@ -1746,6 +3507,7 @@ impl GpuContext {
         prev_pos: Option<glam::Vec3A>,
         frame_idx: u32,
         frame_ms: f32,
+        sky_sh: &crate::sh::Sh9,
     ) -> Result<()> {
         crate::zone!("present-trace-fsr-rr");
         if self.trace.is_none() || self.fsr.is_none() {
@@ -1773,11 +3535,16 @@ impl GpuContext {
         {
             let fs = self.fsr.as_ref().unwrap();
             if let Err(e) =
-                Self::record_fsr_rr_sequence(fs, &self.d3d, fc, prev_pos, frame_idx, frame_ms)
+                Self::record_fsr_rr_sequence(fs, &self.d3d, fc, prev_pos, frame_idx, frame_ms, sky_sh)
             {
                 self.d3d.abort_frame();
                 return Err(e);
             }
+        }
+        self.fg_set_frame_ms(frame_ms);
+        if let Some(fs) = &self.fsr {
+            let (dep, mv, scale) = fs.res.fg_inputs(fc.rw as u32, fc.rh as u32);
+            self.fg_prepare(&self.d3d.list, fc, dep, mv, scale);
         }
         self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_FSR, 1.0);
         self.d3d.end_frame(slot)
@@ -1785,6 +3552,7 @@ impl GpuContext {
 
     /// Ray Regeneration + FSR4 fed by the DXR pipeline — the
     /// `present_dxr_fsr3` shape with the full denoise sequence in the middle.
+    #[allow(clippy::too_many_arguments)]
     pub fn present_dxr_fsr_rr(
         &mut self,
         p: &trace::FrameParams,
@@ -1792,6 +3560,7 @@ impl GpuContext {
         prev_pos: Option<glam::Vec3A>,
         frame_idx: u32,
         frame_ms: f32,
+        sky_sh: &crate::sh::Sh9,
     ) -> Result<()> {
         crate::zone!("present-dxr-fsr-rr");
         if self.dxr.is_none() || self.fsr.is_none() {
@@ -1822,11 +3591,16 @@ impl GpuContext {
         {
             let fs = self.fsr.as_ref().unwrap();
             if let Err(e) =
-                Self::record_fsr_rr_sequence(fs, &self.d3d, fc, prev_pos, frame_idx, frame_ms)
+                Self::record_fsr_rr_sequence(fs, &self.d3d, fc, prev_pos, frame_idx, frame_ms, sky_sh)
             {
                 self.d3d.abort_frame();
                 return Err(e);
             }
+        }
+        self.fg_set_frame_ms(frame_ms);
+        if let Some(fs) = &self.fsr {
+            let (dep, mv, scale) = fs.res.fg_inputs(fc.rw as u32, fc.rh as u32);
+            self.fg_prepare(&self.d3d.list, fc, dep, mv, scale);
         }
         self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_FSR, 1.0);
         self.d3d.end_frame(slot)
@@ -1921,11 +3695,16 @@ impl GpuContext {
             return Err(e);
         }
 
-        if let Err(e) = Self::record_fsr3_upscale(fs, &self.d3d, fc, frame_ms) {
+        if let Err(e) = Self::record_fsr3_upscale(fs, &self.d3d, fc, frame_ms, None) {
             self.d3d.abort_frame();
             return Err(e);
         }
 
+        self.fg_set_frame_ms(frame_ms);
+        if let Some(fs) = &self.fsr {
+            let (dep, mv, scale) = fs.res.fg_inputs(fc.rw as u32, fc.rh as u32);
+            self.fg_prepare(&self.d3d.list, fc, dep, mv, scale);
+        }
         // The tonemap pass re-binds root sig/PSO/heaps/viewport from scratch,
         // restoring whatever list state the ffx dispatch left behind.
         self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_FSR, 1.0);
@@ -1938,11 +3717,16 @@ impl GpuContext {
     /// output. The plane already holds pixel-space MVs, so the scale is the
     /// bare polarity signs. The caller owns the open frame (and aborts it on
     /// Err).
+    /// `src` (--quinlight): upscale from FOREIGN input planes — the XeSS trio,
+    /// which is byte-for-byte FSR 3.1's own plane set, so a quinlight session
+    /// feeds one trio and both SDKs read it (see `upscale_res_shared`). None =
+    /// this context's own planes, the single-engine path.
     fn record_fsr3_upscale(
         fs: &FsrState,
         d3d: &D3d,
         fc: &dlss::FrameConstants,
         frame_ms: f32,
+        src: Option<&[(&ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT); 3]>,
     ) -> Result<()> {
         let FsrRes::Up(res) = &fs.res else {
             return Err("FSR3 upscale on an FSR4+RR session".into());
@@ -1957,7 +3741,10 @@ impl GpuContext {
         res.barrier_upscale_begin(&d3d.list);
         let up_desc = Self::fsr_upscale_desc(
             d3d.list.as_raw(),
-            res.upscale_res(),
+            match src {
+                Some(p) => res.upscale_res_shared(p),
+                None => res.upscale_res(),
+            },
             fc,
             fs.max,
             frame_ms,
@@ -1968,6 +3755,65 @@ impl GpuContext {
             fs.ctx.upscale(&up_desc)?;
         }
         res.barrier_upscale_end(&d3d.list);
+        Ok(())
+    }
+
+    /// One XeSS upscale into `x.res.output`, recorded on `d3d.list`: the block
+    /// every GPU-fed XeSS path shares (present_trace_xess, present_dxr_xess, and
+    /// the --quinlight fuse, which runs XeSS as one engine among several).
+    /// `(rw, rh)` is the trace res — the sub-rect XeSS reads.
+    ///
+    /// Leaves `output` back in PIXEL_SHADER_RESOURCE (where the tonemap and the
+    /// fuse both expect their inputs).
+    fn record_xess_eval(
+        x: &XessState,
+        d3d: &D3d,
+        rw: u32,
+        rh: u32,
+        jitter: (f32, f32),
+        reset: bool,
+    ) -> Result<()> {
+        unsafe {
+            d3d.list.ResourceBarrier(&[transition(
+                &x.res.output,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            )]);
+        }
+        let (c, m, d) = x.res.input_ptrs();
+        let params = crate::xess::XessD3d12ExecuteParams {
+            color_texture: c,
+            velocity_texture: m,
+            depth_texture: d,
+            exposure_scale_texture: std::ptr::null_mut(),
+            responsive_pixel_mask_texture: std::ptr::null_mut(),
+            output_texture: x.res.output.as_raw(),
+            jitter_offset_x: crate::xess::JITTER_SIGN * jitter.0,
+            jitter_offset_y: crate::xess::JITTER_SIGN * jitter.1,
+            exposure_scale: 1.0,
+            reset_history: reset as u32,
+            input_width: rw,
+            input_height: rh,
+            input_color_base: Default::default(),
+            input_motion_vector_base: Default::default(),
+            input_depth_base: Default::default(),
+            input_responsive_mask_base: Default::default(),
+            reserved0: Default::default(),
+            output_color_base: Default::default(),
+            descriptor_heap: std::ptr::null_mut(),
+            descriptor_heap_offset: 0,
+        };
+        {
+            let _ev = pix::scope(&d3d.list, c"xess-eval");
+            x.ctx.execute(d3d.list.as_raw(), &params)?;
+        }
+        unsafe {
+            d3d.list.ResourceBarrier(&[transition(
+                &x.res.output,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            )]);
+        }
         Ok(())
     }
 
@@ -2075,6 +3921,7 @@ impl GpuContext {
     /// window-sized. `jitter` is the renderer's sample offset; the sign
     /// reported to XeSS is settled in xess::JITTER_SIGN, nowhere else.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn present_xess(
         &mut self,
         color: &xr::ColorSrc,
@@ -2085,6 +3932,8 @@ impl GpuContext {
         reset: bool,
         near: f32,
         far: f32,
+        fc: &dlss::FrameConstants,
+        frame_ms: f32,
     ) -> Result<()> {
         crate::zone!("present-xess");
         let slot = self.record_xess_dispatch(color, g, rw, rh, jitter, reset, near, far)?;
@@ -2096,10 +3945,11 @@ impl GpuContext {
                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
             )]);
         }
+        self.xefg_prepare(fc, frame_ms);
         // The tonemap pass re-binds root sig/PSO/heaps/viewport from scratch,
         // restoring whatever list state the XeSS dispatch left behind.
         self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_XESS, 1.0);
-        self.d3d.end_frame(slot)
+        self.xefg_end_frame(slot)
     }
 
     /// XeSS-SR, post-upscale-denoise flavor: same dispatch, but instead of
@@ -2143,6 +3993,7 @@ impl GpuContext {
         frame_idx: u32,
     ) -> Result<()> {
         crate::zone!("present-rr");
+        self.dlssg_frame_begin(frame_idx);
         let (Some(sl), Some(rr)) = (&self.sl, &self.rr) else {
             return Err("DLSS-RR not initialized".into());
         };
@@ -2169,7 +4020,7 @@ impl GpuContext {
             )]);
         }
 
-        if let Err(e) = rr_sl_sequence(sl, rr, &self.d3d.list, fc, frame_idx) {
+        if let Err(e) = rr_sl_sequence(sl, rr, &self.d3d.list, fc, frame_idx, self.fg_g.as_ref().is_some_and(|g| g.enabled && !g.failed.get())) {
             // Abandon the recorded-but-unexecuted frame: nothing reached the
             // GPU, so tracked resource states are unchanged, and closing the
             // list lets the next present's begin_frame Reset it. The caller
@@ -2185,11 +4036,14 @@ impl GpuContext {
                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
             )]);
         }
+        if self.fg_n.is_some() {
+            return self.ngxfg_tail(slot, fc);
+        }
         // The tonemap pass re-binds root sig/PSO/heaps/viewport from scratch,
         // which is exactly the post-evaluate state restore that
         // eDisableCLStateTracking makes the host's responsibility.
         self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_RR, 1.0);
-        self.d3d.end_frame(slot)
+        self.dlssg_end_frame(slot, frame_idx)
     }
 
     /// DLSS-RR fed by the GPU-resident tracer (`--gpu` default): one command
@@ -2210,6 +4064,7 @@ impl GpuContext {
         if self.trace.is_none() || self.sl.is_none() || self.rr.is_none() {
             return Err("GPU tracer + DLSS-RR not both initialized".into());
         }
+        self.dlssg_frame_begin(frame_idx);
         let slot = self.d3d.begin_frame()?;
         {
             let d3d = &mut self.d3d;
@@ -2241,7 +4096,7 @@ impl GpuContext {
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 )]);
             }
-            if let Err(e) = rr_sl_sequence(sl, rr, &d3d.list, fc, frame_idx) {
+            if let Err(e) = rr_sl_sequence(sl, rr, &d3d.list, fc, frame_idx, self.fg_g.as_ref().is_some_and(|g| g.enabled && !g.failed.get())) {
                 d3d.abort_frame();
                 return Err(e);
             }
@@ -2253,11 +4108,14 @@ impl GpuContext {
                 )]);
             }
         }
+        if self.fg_n.is_some() {
+            return self.ngxfg_tail(slot, fc);
+        }
         // The tonemap pass re-binds root sig/PSO/heaps/viewport from scratch —
         // the post-evaluate state restore eDisableCLStateTracking makes the
         // host's responsibility.
         self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_RR, 1.0);
-        self.d3d.end_frame(slot)
+        self.dlssg_end_frame(slot, frame_idx)
     }
 
     /// Read back the denoised RR output and tonemap it on the CPU with the
@@ -2363,11 +4221,29 @@ impl GpuContext {
         self.d3d.end_frame(slot)
     }
 
+    /// `present_cpu` for the HDR10 swapchain: the CPU produced final packed
+    /// 10-bit PQ (`render::present_px_pq` applied the curve, the overlay, the
+    /// matrix + ST 2084 encode, and the R10G10B10A2 pack), so this is still a
+    /// straight blit.
+    pub fn present_cpu_pq(&mut self, pixels: &[u32]) -> Result<()> {
+        crate::zone!("present-cpu-pq");
+        let slot = self.d3d.begin_frame()?;
+        self.blit.record_pq(&self.d3d, slot, pixels);
+        self.fullscreen_to_backbuffer(false, tonemap::SRV_SLOT_BLIT, 1.0);
+        self.d3d.end_frame(slot)
+    }
+
     /// True when the swapchain actually came up as scRGB — NOT merely what
     /// `--hdr` asked for (the colour space can be refused; see `D3d::with_queue`).
     /// Callers pick their present arm and their `resolve*` on this.
     pub fn is_hdr(&self) -> bool {
-        self.d3d.hdr
+        self.d3d.hdr()
+    }
+
+    /// Which colour space presentation actually negotiated — the three-way
+    /// fact `is_hdr()` collapses. The CPU arms pick their encode on this.
+    pub fn encoding(&self) -> d3d12::PresentSpace {
+        self.d3d.space
     }
 
     /// Re-probe the monitor the window now sits on and re-derive the curve.
@@ -2378,7 +4254,7 @@ impl GpuContext {
     /// a swapchain rebuild, and it deliberately does not reset the upscaler
     /// history — a display change is a change of output device, not of scene.
     pub fn refresh_display(&mut self, paper_white: f32, peak: Option<f32>) -> Option<display::DisplayHdr> {
-        if !self.d3d.hdr {
+        if self.d3d.space == d3d12::PresentSpace::Sdr {
             return None; // the 8-bit path has one curve and no display to ask
         }
         let d = display::probe(&self.adapter, self.hwnd);
@@ -2386,7 +4262,11 @@ impl GpuContext {
             return None;
         }
         self.display = Some(d);
-        self.tone = d.tone(paper_white, peak);
+        self.tone = if self.d3d.space == d3d12::PresentSpace::Hdr10 {
+            d.tone_pq(paper_white, peak)
+        } else {
+            d.tone(paper_white, peak)
+        };
         Some(d)
     }
 
@@ -2407,13 +4287,898 @@ impl GpuContext {
         self.d3d.end_frame(slot)
     }
 
+    /// The resource behind a tonemap SRV slot. Bloom needs the RESOURCE, not just
+    /// its descriptor, because its downsample is a compute dispatch and D3D12
+    /// state is per-resource (see `fullscreen_to_backbuffer`). Keep in lockstep
+    /// with the `passes.create_srv` calls in `new` / `resize_output` /
+    /// `ensure_trace` / `ensure_dxr` — an omission here silently costs that mode
+    /// its glare rather than corrupting anything.
+    fn tonemap_source(&self, srv_slot: u32) -> Option<&ID3D12Resource> {
+        match srv_slot {
+            tonemap::SRV_SLOT_HDR => Some(&self.hdr.texture),
+            tonemap::SRV_SLOT_RR => self.rr.as_ref().map(|r| &r.output),
+            tonemap::SRV_SLOT_XESS => self.xess.as_ref().map(|s| &s.res.output),
+            tonemap::SRV_SLOT_FSR => self.fsr.as_ref().map(|s| s.res.upscaled()),
+            tonemap::SRV_SLOT_GPU => self.trace.as_ref().map(|t| &t.hdr),
+            tonemap::SRV_SLOT_DXR => self.dxr.as_ref().map(|d| &d.hdr),
+            tonemap::SRV_SLOT_QUIN => self.quin.as_ref().map(|q| &q.output),
+            // The raw-NGX interpolated frame: without this arm the pair's
+            // first present skipped BLOOM (tonemap_source → None → strength
+            // 0), so every bright highlight strobed glare-on/glare-off at
+            // half the present rate — shipped in the first --fg cut, and on
+            // a sun-reflecting helmet it reads as the reflections dancing.
+            // (Its bloom SRV was already registered by wire_tonemap_src.)
+            tonemap::SRV_SLOT_NGXFG => self.fg_n.as_ref().map(|n| &n.out),
+            _ => None,
+        }
+    }
+
+    // ---- frame generation (both families' per-frame protocols) ----
+
+    /// True when a frame-generation family is wired: the ffx FI proxy with a
+    /// live FG effect context, DLSS-G in an SL session, or the XeSS-FG proxy.
+    pub fn fg_wired(&self) -> bool {
+        self.fg.as_ref().is_some_and(|f| f.ctx.is_some())
+            || self.fg_g.is_some()
+            || self.fg_x.as_ref().is_some_and(|x| !x.failed.get())
+            || self.fg_n.as_ref().is_some_and(|n| !n.failed.get())
+    }
+
+    /// Whether generated frames are currently being inserted (the toggle
+    /// state, not the per-frame handshake).
+    pub fn fg_enabled(&self) -> bool {
+        self.fg.as_ref().is_some_and(|f| f.ctx.is_some() && f.enabled)
+            || self.fg_g.as_ref().is_some_and(|g| g.enabled && !g.failed.get())
+            || self.fg_x.as_ref().is_some_and(|x| x.enabled && !x.failed.get())
+            || self.fg_n.as_ref().is_some_and(|n| n.enabled && !n.failed.get())
+    }
+
+    /// The wired FG family's display name (the boot line / title bar).
+    pub fn fg_label(&self) -> Option<&str> {
+        if self.fg_n.as_ref().is_some_and(|n| !n.failed.get()) {
+            return Some("DLSS-G (NGX)");
+        }
+        if self.fg_g.is_some() {
+            return Some("DLSS-G");
+        }
+        if self.fg_x.as_ref().is_some_and(|x| !x.failed.get()) {
+            return Some("XeSS-FG");
+        }
+        self.fg.as_ref().filter(|f| f.ctx.is_some()).map(|f| f.version.1.as_str())
+    }
+
+    /// The presented-per-rendered multiplier for the title bar: None when no
+    /// FG family is armed (or the toggle is off); Some(m) when armed. The
+    /// frame loop counts RENDERED frames, so an FG session's displayed fps
+    /// under-reports what the monitor receives by this factor. m is measured
+    /// wherever the family can be asked — raw NGX pair-presents itself (exact
+    /// by construction), XeSS-FG and SL DLSS-G read their status polls'
+    /// frames-presented (XeSS-FG assumes 2 until the first poll lands; SL
+    /// claims nothing until measured — the declines-to-insert history), ffx
+    /// FI has no query and reports 2 by configuration when live. m == 1 is
+    /// meaningful: armed but not inserting (holds, unprimed reset frames, a
+    /// declined SL session).
+    pub fn fg_display_mult(&self) -> Option<u32> {
+        if let Some(n) = &self.fg_n {
+            if n.enabled && !n.failed.get() {
+                return Some(if n.pair.get() { 2 } else { 1 });
+            }
+        }
+        if let Some(g) = &self.fg_g {
+            if g.enabled && !g.failed.get() {
+                return Some(g.mult.get().max(1));
+            }
+        }
+        if let Some(x) = &self.fg_x {
+            if x.enabled && !x.failed.get() {
+                let m = x.mult.get();
+                return Some(if m == 0 {
+                    if x.on.get() { 2 } else { 1 }
+                } else {
+                    m
+                });
+            }
+        }
+        if let Some(f) = &self.fg {
+            if f.ctx.is_some() && f.enabled {
+                return Some(if f.live.get() { 2 } else { 1 });
+            }
+        }
+        None
+    }
+
+    /// The live toggle. Turning off disables generation immediately (the ffx
+    /// proxy configures passthrough; DLSS-G's mode-off edge lands via the
+    /// funnel handshake on the very next present; XeSS-FG flips SetEnabled).
+    pub fn set_fg_enabled(&mut self, on: bool) {
+        if let Some(n) = &mut self.fg_n {
+            n.enabled = on;
+            if !on {
+                n.primed.set(false);
+                n.pair.set(false);
+            }
+        }
+        if let Some(g) = &mut self.fg_g {
+            g.enabled = on;
+        }
+        if let Some(x) = &mut self.fg_x {
+            x.enabled = on;
+            if !on && x.on.get() {
+                x.sc.set_enabled(false);
+                x.on.set(false);
+            }
+        }
+        if let Some(fg) = &mut self.fg {
+            fg.enabled = on;
+            if !on {
+                self.fg_disable_now();
+            }
+        }
+    }
+
+    /// XeSS-FG per-frame work — call in the XeSS arms AFTER the feed/upload
+    /// (planes final, resting NON_PIXEL_SHADER_RESOURCE), BEFORE the funnel:
+    /// XeLL sleep + first markers, the depth/MV tags and frame constants for
+    /// this presentId, the presentId itself, and the lazy re-enable.
+    fn xefg_prepare(&self, fc: &dlss::FrameConstants, frame_ms: f32) {
+        let (Some(x), Some(xs)) = (&self.fg_x, &self.xess) else { return };
+        if !x.enabled || x.failed.get() {
+            return;
+        }
+        let id = x.frame_id.get().wrapping_add(1);
+        x.frame_id.set(id);
+        x.sc.sleep(id);
+        x.sc.marker(id, crate::xess_fg::XELL_SIMULATION_START);
+        x.sc.marker(id, crate::xess_fg::XELL_SIMULATION_END);
+        x.sc.marker(id, crate::xess_fg::XELL_RENDERSUBMIT_START);
+        let npsr = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0 as u32;
+        let (_c, m, d) = xs.res.input_ptrs();
+        let (rw, rh) = (fc.rw as u32, fc.rh as u32);
+        let r = x
+            .sc
+            .tag_resource(id, crate::xess_fg::RES_DEPTH, d, npsr, rw, rh)
+            .and_then(|()| {
+                x.sc.tag_resource(id, crate::xess_fg::RES_MOTION_VECTOR, m, npsr, rw, rh)
+            })
+            .and_then(|()| {
+                // Row-major matrices — the SL transpose convention, NOT the
+                // ffx memcpy (the header says row-major explicitly).
+                x.sc.tag_constants(
+                    id,
+                    row_major(&fc.world_to_view),
+                    row_major(&fc.view_to_clip),
+                    fc.jitter,
+                    fc.reset,
+                    frame_ms,
+                )
+            });
+        if let Err(e) = r {
+            eprintln!("fg: XeSS-FG {e} — frame generation off");
+            x.sc.set_enabled(false);
+            x.on.set(false);
+            x.failed.set(true);
+            return;
+        }
+        x.sc.set_present_id(id);
+        if !x.on.get() {
+            x.sc.set_enabled(true);
+            x.on.set(true);
+        }
+        x.prepared.set(true);
+    }
+
+    /// The XeSS arms' end_frame: XeLL render-submit-end + present markers
+    /// around Execute+Present, then the periodic status poll (a negative
+    /// frameGenResult = sticky off; the first clean second-interval poll logs
+    /// framesPresented — 2 per present = generating).
+    fn xefg_end_frame(&mut self, slot: usize) -> Result<()> {
+        let bracket = self.fg_x.as_ref().is_some_and(|x| x.prepared.replace(false));
+        if !bracket {
+            return self.d3d.end_frame(slot);
+        }
+        let x = self.fg_x.as_ref().unwrap();
+        let id = x.frame_id.get();
+        x.sc.marker(id, crate::xess_fg::XELL_RENDERSUBMIT_END);
+        x.sc.marker(id, crate::xess_fg::XELL_PRESENT_START);
+        let r = self.d3d.end_frame(slot);
+        let x = self.fg_x.as_ref().unwrap();
+        x.sc.marker(id, crate::xess_fg::XELL_PRESENT_END);
+        let n = x.poll.get() + 1;
+        x.poll.set(n);
+        if n % 120 == 0 {
+            match x.sc.last_status() {
+                Ok(s) if s.frame_gen_result < 0 => {
+                    eprintln!(
+                        "fg: XeSS-FG present status {} — frame generation off",
+                        crate::xess_fg::result_name(s.frame_gen_result)
+                    );
+                    x.sc.set_enabled(false);
+                    x.on.set(false);
+                    x.failed.set(true);
+                }
+                Ok(s) => {
+                    x.mult.set(s.frames_presented.max(1));
+                    if !x.logged.get() && n >= 240 {
+                        x.logged.set(true);
+                        eprintln!(
+                            "fg: XeSS-FG last present: {} frame(s) presented, gen result {}, enabled {}",
+                            s.frames_presented,
+                            crate::xess_fg::result_name(s.frame_gen_result),
+                            s.is_frame_gen_enabled != 0
+                        );
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        r
+    }
+
+    /// Raw-NGX DLSS-G: record this frame's interpolation evaluate into the
+    /// open list. `rr.output` is the CURRENT denoised frame; the NGX feature
+    /// retains the previous one internally, so the evaluate produces the
+    /// frame BETWEEN them into `fg_n.out`. Returns true when that output is
+    /// presentable (a prior frame primed the pair and this one is no reset).
+    /// The feature is created lazily at the frame's locked render res.
+    fn ngxfg_dispatch(&mut self, fc: &dlss::FrameConstants) -> bool {
+        let (Some(n), Some(rr)) = (&self.fg_n, &self.rr) else { return false };
+        if !n.enabled || n.failed.get() {
+            return false;
+        }
+        let (rw, rh) = (fc.rw as u32, fc.rh as u32);
+        // A render-res MOVE recreates the feature instead of skipping
+        // forever: the CPU renderer fills the same MV/depth/guide planes the
+        // GPU arms do, so FG follows SPACE/F mode cycles across their
+        // different locked resolutions (CPU quality-2/3 vs GPU/DXR native).
+        // Gated on the moved res HOLDING FG_RECREATE_STABLE dispatches —
+        // `--lock-res dynamic` ramps change res per frame and must keep the
+        // old skip behavior, never a per-frame recreate storm.
+        if !n.handle.get().is_null() && n.dims.get() != (rw, rh) {
+            let (pres, prev_cnt) = n.res_pend.get();
+            let cnt = if pres == (rw, rh) { prev_cnt + 1 } else { 1 };
+            n.res_pend.set(((rw, rh), cnt));
+            if cnt < FG_RECREATE_STABLE {
+                // One line per move EPISODE (pres == settled), not per new
+                // res — a dynamic ramp changes res every frame, and cnt == 1
+                // alone would print on each of its ~24 intermediates.
+                if cnt == 1 && pres == (0, 0) {
+                    let (ow, oh) = n.dims.get();
+                    eprintln!(
+                        "fg: render res moved {}x{} -> {}x{} — frame generation \
+                         recreates once the new res holds {} frames",
+                        ow, oh, rw, rh, FG_RECREATE_STABLE
+                    );
+                }
+                n.primed.set(false);
+                return false;
+            }
+            let (ow, oh) = n.dims.get();
+            eprintln!(
+                "fg: recreating the NGX frame-generation feature at {}x{} (was {}x{})",
+                rw, rh, ow, oh
+            );
+            // The resize-path discipline (resize_output): drain the queue
+            // before releasing — in-flight frames may still reference the
+            // feature's internals and the guide pass's heap, whose
+            // descriptors the ensure below rewrites.
+            if let Err(e) = self.d3d.wait_idle() {
+                eprintln!("fg: queue drain before FG recreate failed ({e}) — frame generation off");
+                n.failed.set(true);
+                n.primed.set(false);
+                return false;
+            }
+            // FEATURE-scoped recreate — deliberately NOT destroy + lazy
+            // create: frdlssg_destroy calls DestroyParameters on the map
+            // GetCapabilityParameters returned, which an SL session SHARES
+            // with the in-process Streamline NGX state — the first attempt
+            // did exactly that and every subsequent sl.dlss_d (RR) evaluate
+            // failed 0xBAD00004 FeatureNotFound.
+            let r = unsafe { ngxfg::frdlssg_recreate(n.handle.get(), rw, rh) };
+            if r != 0 {
+                eprintln!("fg: NGX feature recreate failed ({r}) — frame generation off");
+                n.failed.set(true);
+                n.primed.set(false);
+                return false;
+            }
+            n.dims.set((rw, rh));
+            n.primed.set(false);
+            n.res_pend.set(((0, 0), 0));
+            // The guide planes follow the render res (their descriptors
+            // rewrite safely — the queue just drained).
+            if let Some(gp) = &n.guides {
+                match gp.borrow_mut().ensure(&self.d3d.device, rw, rh, rr.guide_inputs()) {
+                    Ok(()) => n.guides_failed.set(false),
+                    Err(e) => {
+                        eprintln!(
+                            "fg: guide-plane recreate failed ({e}) — falling back to the \
+                             raw RR planes (expect reflection shimmer)"
+                        );
+                        n.guides_failed.set(true);
+                    }
+                }
+            }
+        }
+        if n.handle.get().is_null() {
+            let mut h = std::ptr::null_mut();
+            let r = unsafe {
+                ngxfg::frdlssg_create(self.d3d.device.as_raw(), rr.ow, rr.oh, rw, rh, 1, &mut h)
+            };
+            if r != 0 || h.is_null() {
+                eprintln!("fg: raw-NGX DLSS-G create failed ({r}) — frame generation off");
+                n.failed.set(true);
+                return false;
+            }
+            n.handle.set(h);
+            n.dims.set((rw, rh));
+            // The guide planes are created (and every descriptor rewritten —
+            // a resize rebuilt the RR planes) HERE, with the feature: the
+            // one point where the render res is known and no in-flight frame
+            // references the pass's heap (first dispatch ever, or the first
+            // after resize_output's wait_idle).
+            if let Some(gp) = &n.guides {
+                match gp.borrow_mut().ensure(&self.d3d.device, rw, rh, rr.guide_inputs()) {
+                    Ok(()) => n.guides_failed.set(false),
+                    Err(e) => {
+                        eprintln!(
+                            "fg: guide-plane creation failed ({e}) — falling back to the \
+                             raw RR planes (expect reflection shimmer)"
+                        );
+                        n.guides_failed.set(true);
+                    }
+                }
+            }
+            eprintln!(
+                "fg: raw-NGX DLSS-G live — 1 generated frame per rendered frame (pair-present)"
+            );
+        }
+        // dims == (rw, rh) from here (a stable move recreated in place
+        // above; an unstable one returned above). A res that bounced BACK
+        // before the threshold clears its pending count.
+        n.res_pend.set(((0, 0), 0));
+        let id = n.frame_id.get() + 1;
+        n.frame_id.set(id);
+        let (dep, mv) = rr.fg_inputs();
+        let (psr, npsr, uav) = (
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        );
+        let list = &self.d3d.list;
+        // The guide pass converts the RR planes into what the FG snippet's
+        // contracts actually want (see ngxfg_guides.rs): depth = the [0,1]
+        // clip mapping of the matrices below (depth_inverted stays 0 — both
+        // encodings grow with distance), MVs = the virtual-image blend that
+        // stops mirror reflections being dragged with the surface. Each
+        // lever falls back to the raw plane independently.
+        let guide_pass = match (&n.guides, n.guides_failed.get()) {
+            (Some(gp), false) => Some(gp.borrow()),
+            _ => None,
+        };
+        if let Some(gp) = &guide_pass {
+            // world -> PREVIOUS clip: column-vector composition, right to
+            // left (world -> view -> clip -> prev clip).
+            let m = (fc.clip_to_prev_clip * fc.view_to_clip * fc.world_to_view)
+                .to_cols_array_2d();
+            let (near, far) = (fc.near, fc.far);
+            let tanh = (fc.fov_y * 0.5).tan();
+            let v4 = |v: glam::Vec3A| [v.x, v.y, v.z, 0.0];
+            let p = ngxfg_guides::GuideParams {
+                w: rw,
+                h: rh,
+                a: far / (far - near),
+                b: -near * far / (far - near),
+                m,
+                org: v4(fc.pos),
+                fwd: v4(fc.forward),
+                // The CamBasis pre-scaling (camera.rs): right by
+                // tan(fov/2)*aspect, up by tan(fov/2).
+                rgt: v4(fc.right * (tanh * fc.aspect)),
+                upv: v4(fc.up * tanh),
+                rmv: (!n.rmv_off) as u32,
+                _pad: [0.0; 3],
+            };
+            gp.record(list, &p);
+        }
+        let depth_res = match &guide_pass {
+            Some(gp) if !n.depth_linear => gp.clip().as_raw(),
+            _ => dep.as_raw(),
+        };
+        let motion_res = match &guide_pass {
+            Some(gp) if !n.rmv_off => gp.mv().as_raw(),
+            _ => mv.as_raw(),
+        };
+        unsafe {
+            list.ResourceBarrier(&[
+                transition(&rr.output, psr, npsr),
+                transition(&n.out, psr, uav),
+            ]);
+        }
+        // Matrix majority: `row_major` matches what shim_constants hands SL,
+        // but SL's closed plugin may itself transpose before setting the
+        // DLSSG params — quinlight's identity matrices were transpose-
+        // invariant, so this was never validated. FR_NGXFG_MAT=col walks it;
+        // FR_NGXFG_CAM=identity substitutes quinlight's whole proven camera
+        // block (matrices AND basis) to isolate camera plumbing entirely.
+        const IDENT: [f32; 16] =
+            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+        let mat = |m: &glam::Mat4| -> [f32; 16] {
+            if n.cam_identity {
+                IDENT
+            } else if n.mat_col {
+                m.to_cols_array()
+            } else {
+                row_major(m)
+            }
+        };
+        let d = ngxfg::FrDlssgDispatch {
+            cmdlist: list.as_raw(),
+            color: rr.output.as_raw(),
+            motion: motion_res,
+            depth: depth_res,
+            output: n.out.as_raw(),
+            frame_id: id,
+            reset: fc.reset as i32,
+            view_to_clip: mat(&fc.view_to_clip),
+            clip_to_view: mat(&fc.clip_to_view),
+            clip_to_prev_clip: mat(&fc.clip_to_prev_clip),
+            prev_clip_to_clip: mat(&fc.prev_clip_to_clip),
+            // Default: the SL-negated jitter convention — same NGX family,
+            // one sign. FR_NGXFG_JITTER walks the alternatives (unvalidated
+            // in quinlight, whose jitter was 0,0).
+            jitter: match n.jitter_mode {
+                1 => [0.0, 0.0],
+                2 => [fc.jitter.0, fc.jitter.1],
+                _ => [-fc.jitter.0, -fc.jitter.1],
+            },
+            // PIXEL scale — settled from dlssg-to-fsr3, which hands
+            // DLSSG.MvecScale straight to FSR3's motionVectorScale (unit:
+            // pixels) and works across shipped SL titles; the SDK header's
+            // "[-1,1]" comment is stale, and the quinlight-era {1/rw,1/rh}
+            // starved the snippet of geometry motion ~2000× (quinlight's
+            // MVs were zero, so any scale "worked" there). FR_NGXFG_MV
+            // walks the alternatives.
+            mv_scale: match n.mv_mode {
+                1 => [1.0 / rw as f32, 1.0 / rh as f32],
+                2 => [-1.0, -1.0],
+                3 => [-1.0 / rw as f32, -1.0 / rh as f32],
+                _ => [1.0, 1.0],
+            },
+            // The identity arm is quinlight's literal camera block (its
+            // dlssg_shim_d3d12.cpp lines 355-372).
+            cam_pos: if n.cam_identity { [0.0; 3] } else { v3(fc.pos) },
+            cam_up: if n.cam_identity { [0.0, 1.0, 0.0] } else { v3(fc.up) },
+            cam_right: if n.cam_identity { [1.0, 0.0, 0.0] } else { v3(fc.right) },
+            cam_fwd: if n.cam_identity { [0.0, 0.0, 1.0] } else { v3(fc.forward) },
+            cam_near: if n.cam_identity { 0.1 } else { fc.near },
+            cam_far: if n.cam_identity { 10_000.0 } else { fc.far },
+            cam_fov: if n.cam_identity { 1.047_197_5 } else { fc.fov_y },
+            cam_aspect: if n.cam_identity {
+                rr.ow as f32 / rr.oh as f32
+            } else {
+                fc.aspect
+            },
+            rend_w: rw,
+            rend_h: rh,
+            // Grows with distance in both depth arms — not inverted.
+            depth_inverted: 0,
+        };
+        let r = unsafe { ngxfg::frdlssg_dispatch(n.handle.get(), &d) };
+        unsafe {
+            list.ResourceBarrier(&[
+                transition(&rr.output, npsr, psr),
+                transition(&n.out, uav, psr),
+            ]);
+        }
+        if let Some(gp) = &guide_pass {
+            gp.restore(list);
+        }
+        if r != 0 {
+            eprintln!("fg: raw-NGX DLSS-G evaluate failed ({r}) — frame generation off");
+            n.failed.set(true);
+            n.primed.set(false);
+            return false;
+        }
+        // A reset evaluate re-seeds the history but its OUTPUT pairs against
+        // a stale frame — present real-only this frame, pairs from the next.
+        let show = n.primed.get() && !fc.reset;
+        n.primed.set(true);
+        show
+    }
+
+    /// The pair-present tail for the RR arms under raw-NGX frame generation:
+    /// evaluate, present the INTERPOLATED frame first (it sits between prev
+    /// and current in time), then the real frame. Under vsync the two
+    /// presents land a vblank apart — that IS the pacing; no handshake is
+    /// needed because nothing generates behind our back.
+    fn ngxfg_tail(&mut self, slot: usize, fc: &dlss::FrameConstants) -> Result<()> {
+        let show = self.ngxfg_dispatch(fc);
+        if let Some(n) = &self.fg_n {
+            n.pair.set(show);
+        }
+        // FR_NGXFG_SHOW walks WHAT the two presents show, never the pacing
+        // (same two Presents either way): 1 = interp twice (inspect the
+        // generated frames at full rate), 2 = real twice (nothing NGX-made
+        // on screen — artifacts that survive are the present path's).
+        let show_mode = self.fg_n.as_ref().map_or(0, |n| n.show_mode);
+        let (mid_slot, mut end_slot) = match show_mode {
+            1 => (tonemap::SRV_SLOT_NGXFG, tonemap::SRV_SLOT_NGXFG),
+            2 => (tonemap::SRV_SLOT_RR, tonemap::SRV_SLOT_RR),
+            _ => (tonemap::SRV_SLOT_NGXFG, tonemap::SRV_SLOT_RR),
+        };
+        // A non-generating frame (unprimed reset, res-moved skip — which
+        // returns BEFORE the evaluate — or a failed evaluate) has nothing
+        // fresh in fg_n.out: under SHOW=interp the single present must fall
+        // back to the real frame, or a failed session re-presents a stale /
+        // never-written texture indefinitely.
+        if !show {
+            end_slot = tonemap::SRV_SLOT_RR;
+        }
+        // FR_NGXFG_PACE=1: per-frame pacing probe (kept diagnostic lever, the
+        // FR_DLSSG_NO_RR class) — logs the backbuffer indices both halves
+        // record into and the swapchain's own frame statistics, so a pacing
+        // anomaly (skipped/duplicated vblanks, present-queue stalls, a
+        // buffer-rotation break) is diffable between arms from a log instead
+        // of argued about. A 2026-07 flicker report was triaged with it:
+        // wavefront and DXR arms measured byte-identical rotation
+        // (1/2 -> 3/4 -> 5/0 mod PAIR_BACKBUFFERS, one pair per frame).
+        // Caveat: run the window FOREGROUND — DWM retires an occluded
+        // window's presents unthrottled, which voids the vsync half of the
+        // statistics.
+        static PACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let pace = *PACE.get_or_init(|| std::env::var("FR_NGXFG_PACE").is_ok());
+        let t0 = pace.then(std::time::Instant::now);
+        let bb0 = pace.then(|| unsafe { self.d3d.swapchain.GetCurrentBackBufferIndex() });
+        if show {
+            self.fullscreen_to_backbuffer(true, mid_slot, 1.0);
+            self.d3d.present_mid(slot)?;
+        }
+        let bb1 = pace.then(|| unsafe { self.d3d.swapchain.GetCurrentBackBufferIndex() });
+        self.fullscreen_to_backbuffer(true, end_slot, 1.0);
+        let r = self.d3d.end_frame(slot);
+        if pace {
+            let mut st = windows::Win32::Graphics::Dxgi::DXGI_FRAME_STATISTICS::default();
+            let stats = unsafe { self.d3d.swapchain.GetFrameStatistics(&mut st) };
+            let id = self.fg_n.as_ref().map_or(0, |n| n.frame_id.get());
+            eprintln!(
+                "fg-pace: id={} show={} bb={}/{} ms={:.2} pc={} spc={} src={} {}",
+                id,
+                show as u8,
+                bb0.unwrap_or(9),
+                bb1.unwrap_or(9),
+                t0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0),
+                st.PresentCount,
+                st.SyncQPCTime / 10_000,
+                st.SyncRefreshCount,
+                if stats.is_err() { "(stats-err)" } else { "" },
+            );
+        }
+        r
+    }
+
+    /// DLSS-G per-frame bracket, first half — the top of an RR arm: Reflex
+    /// sleep, the simulation/render-submit markers, and the lazy mode-eOn
+    /// edge (options take effect at the next Present, and this thread IS the
+    /// present thread). The marker token is fetched by the SAME frame index
+    /// rr_sl_sequence hands slSetConstants — SL keys them together, and
+    /// index drift is the documented "common constants cannot be found for
+    /// frame N" failure.
+    fn dlssg_frame_begin(&self, frame_idx: u32) {
+        let (Some(sl), Some(g)) = (&self.sl, &self.fg_g) else { return };
+        if !g.enabled || g.failed.get() {
+            return;
+        }
+        let Ok(token) = sl.new_frame_token(frame_idx) else { return };
+        // First-frame diagnostics: marker plumbing failures are otherwise
+        // invisible (the calls are fire-and-forget by design), and a silent
+        // marker failure is exactly how "DLSS-G validates but never
+        // generates" presents itself.
+        let dbg = !g.on.get();
+        let chk = |name: &str, r: std::result::Result<(), String>| {
+            if dbg {
+                match r {
+                    Ok(()) => eprintln!("fg: {name} ok"),
+                    Err(e) => eprintln!("fg: {name} FAILED: {e}"),
+                }
+            }
+        };
+        chk("reflex_sleep", sl.reflex_sleep(token));
+        chk("pcl sim-start", sl.pcl_marker(streamline_sys::PCL_SIMULATION_START, token));
+        chk("pcl sim-end", sl.pcl_marker(streamline_sys::PCL_SIMULATION_END, token));
+        chk("pcl rsubmit-start", sl.pcl_marker(streamline_sys::PCL_RENDERSUBMIT_START, token));
+        if !g.on.get() {
+            let o = streamline_sys::SlShimDlssgOptions {
+                mode: streamline_sys::DLSSG_MODE_ON,
+                num_frames_to_generate: 1,
+                flags: 0,
+            };
+            match sl.dlssg_set_options(0, &o) {
+                Ok(()) => g.on.set(true),
+                Err(e) => {
+                    eprintln!("fg: DLSS-G enable failed ({e}) — frame generation off");
+                    g.failed.set(true);
+                    return;
+                }
+            }
+        }
+        g.prepared.set(true);
+    }
+
+    /// Second half — replaces `d3d.end_frame` at the tail of the RR arms:
+    /// render-submit-end + the REQUIRED present markers bracketing the
+    /// Execute+Present, then the periodic status poll. A failing status is
+    /// the sticky-off pink-overlay guard; the first healthy poll logs the
+    /// presented-per-rendered ratio (the headless proof generation is live).
+    fn dlssg_end_frame(&mut self, slot: usize, frame_idx: u32) -> Result<()> {
+        let bracket =
+            self.fg_g.as_ref().is_some_and(|g| g.prepared.replace(false)) && self.sl.is_some();
+        if !bracket {
+            return self.d3d.end_frame(slot);
+        }
+        let token = self.sl.as_ref().unwrap().new_frame_token(frame_idx)?;
+        let dbg = self.fg_g.as_ref().unwrap().poll.get() == 0;
+        let chk = |name: &str, r: std::result::Result<(), String>| {
+            if dbg {
+                match r {
+                    Ok(()) => eprintln!("fg: {name} ok"),
+                    Err(e) => eprintln!("fg: {name} FAILED: {e}"),
+                }
+            }
+        };
+        {
+            let sl = self.sl.as_ref().unwrap();
+            chk("pcl rsubmit-end", sl.pcl_marker(streamline_sys::PCL_RENDERSUBMIT_END, token));
+            chk("pcl present-start", sl.pcl_marker(streamline_sys::PCL_PRESENT_START, token));
+        }
+        let r = self.d3d.end_frame(slot);
+        let sl = self.sl.as_ref().unwrap();
+        chk("pcl present-end", sl.pcl_marker(streamline_sys::PCL_PRESENT_END, token));
+        let g = self.fg_g.as_ref().unwrap();
+        let n = g.poll.get() + 1;
+        g.poll.set(n);
+        if n % 120 == 0 {
+            match sl.dlssg_state(0) {
+                Ok(st) if st.status != 0 => {
+                    eprintln!(
+                        "fg: DLSS-G status 0x{:x} (bits: 1 res too low, 2 no Reflex, 4 HDR \
+                         format, 8 constants, 16 backbuffer-index) — frame generation off",
+                        st.status
+                    );
+                    let o = streamline_sys::SlShimDlssgOptions {
+                        mode: streamline_sys::DLSSG_MODE_OFF,
+                        num_frames_to_generate: 1,
+                        flags: 0,
+                    };
+                    let _ = sl.dlssg_set_options(0, &o);
+                    g.on.set(false);
+                    g.failed.set(true);
+                }
+                // numFramesActuallyPresented reads as the per-present
+                // MULTIPLIER (guide §13 "read the multiplier back"): 2 =
+                // generation landing, 1 = real frames only (the HAGS-off
+                // symptom — measured: status stays eOk while every generated
+                // frame is dropped). Second interval — the first poll has no
+                // baseline.
+                Ok(st) if n >= 240 => {
+                    g.mult.set(st.frames_presented.max(1));
+                    if !g.logged.get() {
+                        g.logged.set(true);
+                        eprintln!(
+                            "fg: DLSS-G present multiplier x{} {}",
+                            st.frames_presented,
+                            if st.frames_presented >= 2 {
+                                "— generated frames presenting"
+                            } else {
+                                "— generated frames NOT landing (see the HAGS note above if printed)"
+                            }
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        r
+    }
+
+    /// Stash last frame's wall-clock ms for this loop's prepare (main.rs owns
+    /// the clock; pacing quality follows this number).
+    pub fn fg_set_frame_ms(&self, ms: f32) {
+        if let Some(fg) = &self.fg {
+            fg.frame_ms.set(ms);
+        }
+    }
+
+    /// Configure the FI swapchain DISABLED at the current frame id, once
+    /// (idempotent via `live`). Used by the toggle, the pause gate, and the
+    /// funnel's not-prepared fallback.
+    fn fg_disable_now(&self) {
+        let Some(fg) = &self.fg else { return };
+        let Some(ctx) = &fg.ctx else { return };
+        if !fg.live.get() {
+            return;
+        }
+        let cfg = ffx::FfxShimFgConfig {
+            swapchain: self.d3d.swapchain.as_raw(),
+            enabled: 0,
+            allow_async: 0,
+            hudless: ffx_sys::FfxShimRes::NULL,
+            flags: 0,
+            only_present_generated: 0,
+            rect_left: 0,
+            rect_top: 0,
+            rect_w: self.d3d.width,
+            rect_h: self.d3d.height,
+            min_max_luminance: fg.luminance,
+            frame_id: fg.frame_id.get(),
+        };
+        if let Err(e) = ctx.configure(&cfg) {
+            eprintln!("fg: disable configure failed ({e})");
+        }
+        fg.live.set(false);
+    }
+
+    /// Record this frame's FG work: advance the frame id by exactly one (the
+    /// ffx contract), configure the FI swapchain live, and record the
+    /// PrepareV2 dispatch (depth + motion-vector dilation) into the frame's
+    /// list. Call AFTER the depth/mvec planes are final for the frame (post
+    /// feed/upload — both stay in NON_PIXEL_SHADER_RESOURCE, the compute-read
+    /// state the dispatch declares), BEFORE `fullscreen_to_backbuffer`.
+    /// `mv_scale` converts the plane's MV convention to the provider's UV
+    /// space: (1,1) for the pixel-space RG16F trio planes (the FSR3-upscale
+    /// precedent), (rw,rh) for the FSR4-RR UV-delta plane.
+    fn fg_prepare(
+        &self,
+        list: &ID3D12GraphicsCommandList,
+        fc: &dlss::FrameConstants,
+        depth: &ID3D12Resource,
+        mvec: &ID3D12Resource,
+        mv_scale: [f32; 2],
+    ) {
+        let Some(fg) = &self.fg else { return };
+        let Some(ctx) = &fg.ctx else { return };
+        if !fg.enabled {
+            return;
+        }
+        let frame_ms = fg.frame_ms.get();
+        let id = fg.frame_id.get() + 1;
+        fg.frame_id.set(id);
+        let cfg = ffx::FfxShimFgConfig {
+            swapchain: self.d3d.swapchain.as_raw(),
+            enabled: 1,
+            allow_async: 0,
+            hudless: ffx_sys::FfxShimRes::NULL,
+            flags: 0,
+            only_present_generated: 0,
+            rect_left: 0,
+            rect_top: 0,
+            rect_w: self.d3d.width,
+            rect_h: self.d3d.height,
+            min_max_luminance: fg.luminance,
+            frame_id: id,
+        };
+        if let Err(e) = ctx.configure(&cfg) {
+            eprintln!("fg: configure failed ({e})");
+            return;
+        }
+        fg.live.set(true);
+        let prep = ffx::FfxShimFgPrepare {
+            cmdlist: list.as_raw(),
+            frame_id: id,
+            flags: 0,
+            render_w: fc.rw as u32,
+            render_h: fc.rh as u32,
+            // The ffx-family jitter polarity settled for the upscaler applies
+            // here too (one constant, one family).
+            jitter: [crate::fsr::JITTER_SIGN * fc.jitter.0, crate::fsr::JITTER_SIGN * fc.jitter.1],
+            mv_scale,
+            frame_time_delta_ms: frame_ms.clamp(0.1, 200.0),
+            reset: fc.reset as i32,
+            cam_near: fc.near,
+            cam_far: fc.far,
+            cam_fovy: fc.fov_y,
+            view_space_to_meters: 1.0,
+            depth: ffx_sys::FfxShimRes {
+                resource: depth.as_raw(),
+                state: ffx_sys::RES_STATE_COMPUTE_READ,
+            },
+            motion_vectors: ffx_sys::FfxShimRes {
+                resource: mvec.as_raw(),
+                state: ffx_sys::RES_STATE_COMPUTE_READ,
+            },
+            cam_pos: v3(fc.pos),
+            cam_up: v3(fc.up),
+            cam_right: v3(fc.right),
+            cam_fwd: v3(fc.forward),
+        };
+        if let Err(e) = ctx.prepare(&prep) {
+            eprintln!("fg: prepare failed ({e})");
+            return;
+        }
+        fg.prepared.set(true);
+    }
+
     /// The single backbuffer bind point — all 16 present arms funnel here.
     ///
     /// The presentation curve is read from `self.tone` rather than threaded
     /// through every arm: that is what makes a display change (a new monitor, or
     /// Windows HDR toggled underneath us) a one-field retune instead of a
-    /// signature change at 16 call sites.
+    /// signature change at 16 call sites. Glare is likewise applied here and
+    /// nowhere else, on whatever this frame's tonemap source turns out to be.
     fn fullscreen_to_backbuffer(&self, use_tonemap: bool, srv_slot: u32, inv_samples: f32) {
+        // Frame generation handshake: a frame that reaches presentation
+        // WITHOUT an fg_prepare (plain arms, mode switches, holds) must not
+        // let the FI swapchain interpolate against stale motion — configure
+        // it disabled first (idempotent). A prepared frame consumes its flag.
+        if let Some(fg) = &self.fg {
+            if !fg.prepared.replace(false) {
+                self.fg_disable_now();
+            }
+        }
+        // DLSS-G's half of the same handshake: READ prepared without
+        // consuming (dlssg_end_frame consumes it after the present markers,
+        // which bracket the Present — AFTER this funnel). An unprepared
+        // present in a G session flips the mode off so the SL pacer never
+        // interpolates a plain or held frame.
+        if let (Some(sl), Some(g)) = (&self.sl, &self.fg_g) {
+            if g.on.get() && !g.prepared.get() {
+                let o = streamline_sys::SlShimDlssgOptions {
+                    mode: streamline_sys::DLSSG_MODE_OFF,
+                    num_frames_to_generate: 1,
+                    flags: 0,
+                };
+                if sl.dlssg_set_options(0, &o).is_ok() {
+                    g.on.set(false);
+                }
+            }
+        }
+        // XeSS-FG's half — same READ-not-consume shape (xefg_end_frame
+        // consumes after the XeLL present markers).
+        if let Some(x) = &self.fg_x {
+            if x.on.get() && !x.prepared.get() {
+                x.sc.set_enabled(false);
+                x.on.set(false);
+            }
+        }
+        // HUD overlay dirty rects: consume whatever the frame staged. Recorded
+        // BEFORE the backbuffer transition (any point in the list before the
+        // draws is fine — begin_frame's fence wait already made this slot's
+        // ring memory safe). Runs even while the HUD is hidden, so the texture
+        // stays current and re-showing needs no special case.
+        let hud_slot = self.d3d.frame_index % d3d12::FRAMES_IN_FLIGHT;
+        self.hud.record_upload(&self.d3d.list, hud_slot);
+
+        // Glare (src/bloom.rs): a display-stage pass on whatever the tonemap is
+        // about to read, so EVERY GPU chain — RR, XeSS, FSR, plain, DXR — gets it
+        // from this one place, and nothing upstream (accum, the temporal cache,
+        // the upscaler guides) is touched. `--no-bloom` records nothing and
+        // passes strength 0, which is what makes it bit-identical to the
+        // pre-bloom presentation.
+        let bloom_src = if use_tonemap && crate::bloom::enabled() {
+            self.tonemap_source(srv_slot)
+        } else {
+            None
+        };
+        let bloom = if let Some(src) = bloom_src {
+            // Every tonemap source RESTS in PIXEL_SHADER_RESOURCE — that is the
+            // state the draw below wants. The pyramid's downsample, though, is a
+            // COMPUTE dispatch, and D3D12 requires NON_PIXEL_SHADER_RESOURCE for
+            // a shader-resource read outside the pixel stage: leaving it in PSR
+            // is a debug-layer error on every bloomed frame (both are read states,
+            // so drivers wave it through, which is exactly why it went unnoticed —
+            // the layer only arms under --gpu-debug). Borrow it for the pyramid
+            // and hand it back before the draw.
+            let (psr, npsr) = (
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            );
+            unsafe { self.d3d.list.ResourceBarrier(&[transition(src, psr, npsr)]) };
+            self.bloom.record(&self.d3d.list, srv_slot);
+            unsafe { self.d3d.list.ResourceBarrier(&[transition(src, npsr, psr)]) };
+            let (gw, gh) = self.bloom.glare_dims();
+            (crate::bloom::strength(), 1.0 / gw as f32, 1.0 / gh as f32)
+        } else {
+            (0.0, 0.0, 0.0)
+        };
+
         let bb = unsafe { self.d3d.swapchain.GetCurrentBackBufferIndex() };
         let backbuffer = &self.d3d.backbuffers[bb as usize];
         unsafe {
@@ -2429,11 +5194,31 @@ impl GpuContext {
             pso,
             srv_slot,
             inv_samples,
+            bloom,
             self.tone,
             self.d3d.rtv_handle(bb),
             self.d3d.width,
             self.d3d.height,
         );
+        // The HUD/menu composite: a second fullscreen draw over the tonemapped
+        // frame while the backbuffer is still a render target — this ONE
+        // insertion covers every present arm. `Passes::record` rebinds
+        // everything, so the extra draw needs no state bookkeeping; the hud
+        // PSO blends premultiplied-over and its PS reads only the
+        // scale/mode lanes of the shared root-constant layout.
+        if self.hud.drawable() {
+            self.passes.record(
+                &self.d3d.list,
+                &self.hud.pso,
+                tonemap::SRV_SLOT_OVERLAY,
+                1.0,
+                (0.0, 0.0, 0.0),
+                self.tone,
+                self.d3d.rtv_handle(bb),
+                self.d3d.width,
+                self.d3d.height,
+            );
+        }
         unsafe {
             self.d3d.list.ResourceBarrier(&[transition(
                 backbuffer,
@@ -2441,6 +5226,47 @@ impl GpuContext {
                 D3D12_RESOURCE_STATE_PRESENT,
             )]);
         }
+        if bloom.0 > 0.0 {
+            self.bloom.restore(&self.d3d.list);
+        }
+        // Remember what was presented so `present_again` (the pause menu's
+        // trace-free hold) can re-run this exact call.
+        self.last_present.set(Some((use_tonemap, srv_slot, inv_samples)));
+    }
+
+    /// Stage a HUD frame's dirty rects for the next recorded present (main
+    /// loop, once per frame, before the present arm runs).
+    pub fn hud_stage(&self, frame: crate::hud::HudFrame) {
+        self.hud.stage(frame);
+    }
+
+    /// Whether the HUD composite draw runs (fed per frame from the session's
+    /// HUD state; staging continues regardless).
+    pub fn set_hud_visible(&self, on: bool) {
+        self.hud.visible.set(on);
+    }
+
+    /// Re-present the last presented image + the current HUD overlay without
+    /// tracing, evaluating any upscaler, or advancing any history — the
+    /// pause-menu hold, generalizing `present_hold`/`present_dxr_hold` to
+    /// every arm (every tonemap source rests in PIXEL_SHADER_RESOURCE between
+    /// frames). Errs when nothing was ever presented or the recorded source
+    /// no longer exists (a mode switch dropped its textures) — the caller
+    /// falls back to rendering a normal frame.
+    pub fn present_again(&mut self) -> Result<()> {
+        let Some((use_tonemap, srv_slot, inv_samples)) = self.last_present.get() else {
+            return Err("nothing presented yet".into());
+        };
+        // The blit/hdr uploads always exist; every other slot's source is
+        // owned by an Option field that a mode switch may have dropped.
+        let src_alive = matches!(srv_slot, tonemap::SRV_SLOT_BLIT | tonemap::SRV_SLOT_HDR)
+            || self.tonemap_source(srv_slot).is_some();
+        if !src_alive {
+            return Err("last-present source was dropped".into());
+        }
+        let slot = self.d3d.begin_frame()?;
+        self.fullscreen_to_backbuffer(use_tonemap, srv_slot, inv_samples);
+        self.d3d.end_frame(slot)
     }
 }
 
@@ -2450,10 +5276,32 @@ impl Drop for GpuContext {
         // lists complete and a live device: drain the queue, then drop the
         // contexts here — before the field-order teardown releases the
         // swapchain/device.
-        if self.xess.is_some() || self.fsr.is_some() {
+        if self.xess.is_some()
+            || self.fsr.is_some()
+            || self.fg.is_some()
+            || self.fg_x.is_some()
+            || self.fg_n.is_some()
+        {
             let _ = self.d3d.wait_idle();
             self.xess = None;
             self.fsr = None;
+            // Raw-NGX DLSS-G: release the feature with the queue drained and
+            // the device alive (its texture drops by field order).
+            if let Some(n) = &self.fg_n {
+                let h = n.handle.replace(std::ptr::null_mut());
+                if !h.is_null() {
+                    unsafe { ngxfg::frdlssg_destroy(h) };
+                }
+            }
+            // FG: retire pending paced presents while the queue is live, and
+            // drop the display-size effect context. The SWAPCHAIN context
+            // stays for field order — it must destroy AFTER d3d releases its
+            // proxy/backbuffer refs (fg is declared after d3d exactly for
+            // this).
+            if let Some(fg) = &mut self.fg {
+                fg.sc.wait_for_presents();
+                fg.ctx = None;
+            }
         }
     }
 }

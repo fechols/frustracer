@@ -64,8 +64,13 @@ void cs_hemi_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     }
 
     if (fb_mode == 1u) {
-        if (!occluded_q(pt.o, d, tc, t_lim)) {
-            hemi_add(pt.pixel, 0, weight);
+        // transmit_q (hemi.rs's tinted-shadows twin): AO is a LIGHT query,
+        // so glass passes its tint, folded to gray by the mean-of-components
+        // rule (exact 1.0/0.0 on opaque scenes via the true divide).
+        float3 tp = transmit_q(pt.o, d, tc, t_lim);
+        float w_open = weight * ((tp.x + tp.y + tp.z) / 3.0);
+        if (w_open > 0.0) {
+            hemi_add(pt.pixel, 0, w_open);
         }
     } else {
         HitInfo h;
@@ -77,11 +82,18 @@ void cs_hemi_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
             // (aniso false — hemi.rs pins Cone::aniso = 1.0): the cell
             // footprint is coarse by design, so resolving it anisotropically
             // would buy nothing.
+            // fireflies false — bounce surfaces take no firefly light (the
+            // CPU hemi tier's ff = None; the emissive precedent).
             float3 l = shade_split(pt.o, d, h, rng, 1u, 0u, false, false,
-                                   0.0, HEMI_CONE_SPREAD, false, w3, o3, n3, ps_unused);
+                                   0.0, HEMI_CONE_SPREAD, false, false, w3, o3, n3, ps_unused);
             hemi_add3(pt.pixel, l * weight);
         } else {
-            hemi_add3(pt.pixel, sky_color(d) * weight);
+            // GATHER, not the full sky: a GI leaf ray landing in the sun disc
+            // would double-count direct_d AND saturate this 2^18 fixed-point
+            // accumulator outright (sky.rs's invariant). The star field is the
+            // opposite case — nothing else delivers it to a bounce, and its
+            // mean is ~1e-3 — so sky_gather carries it in.
+            hemi_add3(pt.pixel, sky_gather(d) * weight);
         }
     }
 }

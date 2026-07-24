@@ -169,6 +169,100 @@ typedef struct FfxShimUpscaleDesc {
 } FfxShimUpscaleDesc;
 int32_t ffxshim_upscale(void* upscaler_ctx, const FfxShimUpscaleDesc* d);
 
+// ---- frame generation (FG effect + frame-interpolation swapchain) ----
+//
+// The framegeneration provider DLL ships in a DIFFERENT sample directory than
+// the loader/denoiser/upscaler drop the default --ffx-path points at, so it
+// is preloaded from its own directory. Call any time before the first FG
+// query/create (before or after ffxshim_load): basenames already in the
+// module list are SKIPPED (GetModuleHandleW), so the primary directory's
+// loader/upscaler/denoiser stay authoritative no matter the call order — this
+// only ever contributes DLLs the primary directory lacks. Missing dir = OK
+// (the FG probe then reports no versions, the loud-fallback shape).
+int32_t ffxshim_preload_dir(const wchar_t* dir);
+
+// Provider-version enumeration for the FG effect (the upscaler/denoiser
+// query's third sibling; same in/out count protocol).
+int32_t ffxshim_query_versions_fg(void* device, uint64_t* inout_count,
+                                  uint64_t* ids /*may be null*/,
+                                  const char** names /*may be null*/);
+
+// Wrap an existing flip-model swapchain with the FidelityFX frame-
+// interpolation swapchain. *inout_swapchain: IDXGISwapChain4* in (the shim
+// takes the reference over), FI proxy out — the caller must present through
+// the proxy from then on and must Release() every ref it holds on the proxy
+// BEFORE ffxshim_destroy(sc_ctx) (destroying the context tears the proxy
+// down). The swapchain-API version pin desc is always chained.
+int32_t ffxshim_fg_swapchain_wrap(void* game_queue,
+                                  void** inout_swapchain,
+                                  void** out_sc_ctx);
+
+// Block until every pending (paced/generated) present has retired. Call
+// before releasing the proxy / destroying the swapchain context, and before
+// device teardown.
+int32_t ffxshim_fg_swapchain_wait(void* sc_ctx);
+
+// Register the premultiplied-alpha UI texture (the HUD) composited by the FI
+// swapchain onto BOTH real and generated frames. Empty resource = unregister.
+int32_t ffxshim_fg_swapchain_ui(void* sc_ctx, const FfxShimRes* ui, int32_t premul);
+
+// Create the FG effect context. backbuffer_format: FfxApiSurfaceFormat of the
+// swapchain. flags: FfxApiCreateContextFramegenerationFlags. version_id 0 =
+// provider default + the FFX_FRAMEGENERATION_VERSION API pin desc; nonzero =
+// chained ffxOverrideVersion alone (the upscaler's mutual-exclusion rule — a
+// 3.1 provider may reject the 4.x pin).
+#define FFXSHIM_FG_ASYNC_SUPPORT      (1u << 0)
+#define FFXSHIM_FG_DEPTH_INVERTED     (1u << 3)
+#define FFXSHIM_FG_HDR                (1u << 5)
+#define FFXSHIM_FG_DEBUG_CHECKING     (1u << 6)
+int32_t ffxshim_create_fg(void* device, uint32_t display_w, uint32_t display_h,
+                          uint32_t max_render_w, uint32_t max_render_h,
+                          uint32_t backbuffer_format, uint32_t flags,
+                          uint64_t version_id, void** out_ctx);
+
+// Per-frame FG configuration (ffxConfigureDescFrameGeneration). The frame
+// generation callback is a fixed shim trampoline routing the FI swapchain's
+// dispatch desc into fg_ctx; the present callback stays null (the swapchain's
+// default composition). min_max_luminance nonzero = patched over the
+// swapchain-derived values in the trampoline (the display probe knows the
+// real panel range; the swapchain only guesses). frame_id must advance by
+// EXACTLY 1 per rendered frame across configure and prepare alike — any other
+// delta resets the interpolation history by contract.
+typedef struct FfxShimFgConfig {
+    void*    swapchain;            // the FI proxy (IDXGISwapChain*)
+    int32_t  enabled;
+    int32_t  allow_async;
+    FfxShimRes hudless;            // empty = interpolate the whole backbuffer
+    uint32_t flags;                // FfxApiDispatchFramegenerationFlags (debug)
+    int32_t  only_present_generated;
+    uint32_t rect_left, rect_top, rect_w, rect_h; // generationRect
+    float    min_max_luminance[2];
+    uint64_t frame_id;
+} FfxShimFgConfig;
+int32_t ffxshim_fg_configure(void* fg_ctx, const FfxShimFgConfig* c);
+
+// Per-frame prepare pass (ffxDispatchDescFrameGenerationPrepareV2), recorded
+// into the frame's own command list AFTER the depth/motion planes are final.
+// Conventions match FfxShimUpscaleDesc: pixel-space MVs ride mv_scale, jitter
+// in render-res pixels, depth is the reversed-Z clip plane (create the FG
+// context with FFXSHIM_FG_DEPTH_INVERTED).
+typedef struct FfxShimFgPrepare {
+    void*    cmdlist;
+    uint64_t frame_id;
+    uint32_t flags;
+    uint32_t render_w, render_h;
+    float    jitter[2];
+    float    mv_scale[2];
+    float    frame_time_delta_ms;
+    int32_t  reset;
+    float    cam_near, cam_far, cam_fovy;
+    float    view_space_to_meters;
+    FfxShimRes depth;
+    FfxShimRes motion_vectors;
+    float    cam_pos[3], cam_up[3], cam_right[3], cam_fwd[3];
+} FfxShimFgPrepare;
+int32_t ffxshim_fg_prepare(void* fg_ctx, const FfxShimFgPrepare* p);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

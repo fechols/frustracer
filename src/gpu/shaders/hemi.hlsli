@@ -184,12 +184,16 @@ float3 sky_cell_sum(float3 n, float3 a0, float3 b0, float3 c0, uint levels0) {
         if (lv > 0) {
             float cos_r = clamp(min(dot(cen, a), min(dot(cen, b), dot(cen, c))), -1.0, 1.0);
             bool coarse = cos_r < 0.978;
-            bool near_glow = cos_r < 0.995;
-            if (near_glow) {
+            // The dome's sharpest surviving feature is the MIE AUREOLE (the
+            // forward HG lobe at g = 0.76). Refine to ~6 deg within a
+            // conservative 30 deg cone of the sun: cos(ang) > cos(r + 30),
+            // expanded. hemi.rs::sky_cell — keep in lockstep.
+            bool near_aureole = cos_r < 0.995;
+            if (near_aureole) {
                 float sin_r = sqrt(max(1.0 - cos_r * cos_r, 0.0));
-                near_glow = dot(cen, sun.xyz) > cos_r * 0.93 - sin_r * 0.368;
+                near_aureole = dot(cen, sun.xyz) > cos_r * 0.866 - sin_r * 0.5;
             }
-            refine = coarse || near_glow;
+            refine = coarse || near_aureole;
         }
         if (refine) {
             float3 mab, mbc, mca;
@@ -199,7 +203,12 @@ float3 sky_cell_sum(float3 n, float3 a0, float3 b0, float3 c0, uint levels0) {
             sa[sp] = mca; sb[sp] = mbc; sc[sp] = c;   sl[sp] = lv - 1; ++sp;
             sa[sp] = mab; sb[sp] = mbc; sc[sp] = mca; sl[sp] = lv - 1; ++sp;
         } else {
-            sum += sky_color(cen) * psa3(a, b, c, n);
+            // GATHER — never the disc. Centroid point-sampling a cell coarser
+            // than the sun would alias it catastrophically (see hemi.rs). The
+            // star field's smooth mean rides along and is safe here for the
+            // opposite reason: it is near-constant over the hemisphere, so it
+            // adds no feature for the refinement above to chase.
+            sum += sky_gather(cen) * psa3(a, b, c, n);
         }
     }
     return sum;

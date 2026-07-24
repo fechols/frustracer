@@ -56,8 +56,8 @@ exercised).
 
 Secondary lighting is an integral of incoming light over the hemisphere above
 each shading point — and the same divide-and-conquer that drives the screen
-quadtree can dispatch that search (**H** cycles it: off → AO → GI →
-GI + shadow shafts; still frames only).
+quadtree can dispatch that search (**H** cycles it: off → AO → GI; still frames
+only).
 
 The hemisphere is a quadtree too, but built from **spherical triangles**
 instead of squares: the root is the tangent half-space (a 1-plane frustum),
@@ -104,16 +104,93 @@ scene — but it is *converged* immediately where the sampled path needs
 hundreds of accumulation frames, and open scenes adapt (most of the
 hemisphere resolves analytically at octant scale).
 
-**Shadow shafts** apply the same machinery to the area light: a frustum from
-the shading point through the light's corners (clipped by the tangent plane —
-without that 5th plane the own surface's AABB hugs the apex and nothing is
-ever proven lit), subdivided once on ambiguity. Samples landing in a subrect
-proven empty skip their occlusion ray outright — same sampling, same
-estimator, identical image; 75% of shadow rays vanish on the default scene.
-The candid result: at 2–4 shadow samples/point the culling query costs more
-than the rays it saves (~3× net slower), so shafts are off by default — the
-technique needs cross-point claim sharing (the temporal cache's δ-subtraction
-transfer, future work) before it pays.
+**Shadow shafts** (removed) applied the same machinery to the light: a frustum
+from the shading point through the *rectangular* light's corners, subdivided
+once on ambiguity, so samples landing in a subrect proven empty skipped their
+occlusion ray outright — same sampling, same estimator, identical image; 75% of
+shadow rays vanished on the default scene. The candid result was that at 2–4
+shadow samples/point the culling query cost more than the rays it saved (~3× net
+slower). It is gone now for a second reason: its whole premise was a *finite
+rectangle with four corners*, and the light is a sun disc at infinity. Same
+economics killed a specular-bounce cone accelerator — one query costs more than
+one ray's traversal.
+
+## The lighting model: one sky, split by frequency
+
+There is exactly one light: a **sky sphere at infinity**, of which the sun is a
+bright patch. It is *stored* in two representations, and the split is by
+frequency, because the two bands need different sampling strategies:
+
+| band | representation | sampled how |
+|---|---|---|
+| scattering dome (smooth — Rayleigh + Mie) | order-2 SH, 9 RGB coefficients | analytic irradiance, **zero rays** |
+| sun disc (sharp) | direction + angular radius + radiance | cone-sampled, **shadow-rayed** |
+
+This is forced, not stylistic. Spherical harmonics have **no notion of
+visibility** — you cannot cast a shadow ray at a coefficient — and a 2° sun
+occupies ~0.01% of the hemisphere, so gathering it by cosine sampling is pure
+noise. Conversely, irradiance is a convolution of radiance with a clamped-cosine
+kernel whose own spectrum collapses above l = 2, so 9 coefficients carry >99% of
+what a Lambertian surface can see. Each representation is doing the job the other
+physically cannot. (This is why renderers with full HDR environment maps *still*
+keep an explicit sun: to importance-sample the bright region, you need it as a
+separable object.)
+
+**The invariant that keeps it honest: the sun disc is delivered exactly once per
+light path.** A ray sees the disc only if no light-sampling strategy already
+covers the sun along that path — the camera's own miss and refraction through
+glass see it (nothing else delivers it there); every *gather* path (the
+hemisphere integrator's cells, GI bounce misses, the SH projection itself)
+integrates the **sun-free dome**, because the direct-lighting loop already
+delivered the sun with its own shadow ray. The specular reflection ray is the one
+path both strategies can reach, so it takes the dome plus a **MIS-weighted** disc
+(balance heuristic; zero extra rays, zero extra random draws). Get the gather
+paths wrong and you double-count the sun *and* fire fireflies into the
+hemisphere's fixed-point accumulator.
+
+It also rescues the hemisphere integrator: its empty cells are evaluated by
+*centroid point-sampling*, so a cell coarser than the sun would either miss the
+disc entirely or splat the whole cell at sun radiance. Excluding the disc removes
+the sharp feature outright — the frequency split isn't a convenience, it's what
+makes the analytic path correct.
+
+The renderer previously had *two* suns that disagreed: a soft `dot^32` glow in
+the sky (a backdrop, too bright to be a light) and, separately, a 4×4 rectangular
+lamp 12 units away with `1/d²` falloff that actually lit the scene. Mirrors
+exposed the seam — the "sun" reflected as a **square**, because a specular
+highlight is an image of the light's shape. It is a round disc now, and it is the
+same sun that casts the shadows. A pleasing check: the ambient the physical
+Rayleigh sky produces, (0.120, 0.176, 0.247), lands within a few percent of the
+hand-tuned constant it replaced — the old guess was a good one, and it is now
+*derived*.
+
+### Glare, and why the sun is not the thing that needed fixing
+
+Looking straight at the sun, the disc first rendered as a flat white circle
+stamped on the aureole — a hard ring where the two met. The tempting fix is to
+soften the sun. That would be wrong: the solar limb *is* a hard edge, a ~650×
+radiance step, and the tonemap saturates above radiance ~5, so the disc lands at
+a dead-flat 1.0 no matter what shape you give it.
+
+Photographs and eyes don't show that ring, and the reason isn't the sun — it's
+the **optics in between**. Light scatters in the lens, the cornea, the vitreous,
+so a point source lands on the sensor as a bright core inside a wide,
+heavy-tailed halo. That's what makes a sun look like a sun, and it belongs at the
+display stage, not in the sky.
+
+So `src/bloom.rs` models the scatter: a mip pyramid whose octave-spaced blurs sum
+into the heavy tail a single Gaussian can't produce, folded back with a 3×3 tent
+(a plain bilinear tap leaves the box kernel's *square* footprint visible in the
+core — the glare comes out as a rounded rectangle, which is very obvious on the
+one thing the pass exists for). The composite is **energy-conserving** —
+`(1-s)·hdr + s·glare`, not `hdr + glare` — because glare *redistributes* light
+rather than creating it. A uniformly lit frame must come back unchanged, which is
+the gate, and it also means bloom can never be accidentally tuned into an
+exposure change.
+
+It runs on whatever image the tonemap is about to read, so it never touches
+`accum`, the temporal cache, or any upscaler guide — every radiance gate in the
+suite is structurally blind to it.
 
 ## Parallelism
 
@@ -245,14 +322,15 @@ staging buffers bound directly as tensors — no per-frame CPU traffic).
 
 | Input | Action |
 |---|---|
-| WASD / QE / Space | fly (Shift = fast) |
+| WASD / QE | fly (Shift = fast) |
 | hold left mouse | look around |
+| **SPACE** | cycle render mode: CPU → GPU wavefront → DXR |
 | **R** | toggle hybrid frustum-tracer vs plain per-pixel (A/B benchmark) |
 | **T** | toggle dynamic resolution vs fixed half-res while moving |
 | **O** | quadtree debug overlay: subdivision-depth heatmap + tile borders |
 | **G** | toggle DLSS Ray Reconstruction (when available) |
 | **J** | toggle NPPD neural denoising (in XeSS mode: the pre-upscale slot) |
-| **H** | hemisphere frustum bounces: off → AO → GI → GI + shadow shafts (still frames) |
+| **H** | hemisphere frustum bounces: off → AO → GI (still frames) |
 | **B** | toggle GPU vs CPU tonemap (non-DLSS mode) |
 | **1 / 2 / 3** | quality presets (shadow/AO samples, reflections) |
 | **C** | verify current view against the reference (prints counters) |
@@ -399,9 +477,66 @@ against its unchanged 0.02 limit**. Cost is pose-dependent and real on the CPU
 Miguel interior 16.0 → 16.1 (+1.1%); `--aniso 4|8` buys that back. On the GPU
 it disappears under the bench row's own noise.
 
+## Where DXR's time actually goes: a three-point ablation
+
+The `--dxr` pipeline and the `--gpu` wavefront trace the same rays with the
+same pasted shading code; only the dispatch shape differs — recursive
+`TraceRay` through a shader binding table versus inline `RayQuery` in
+compute. On an Arc Pro B70 that difference read as "DispatchRays is 5×
+slower than the wavefront," which is the kind of claim that deserves a
+decomposition rather than a vibe. `--dxr-inline 0|1|2` is that
+decomposition: mode 1 keeps the primary
+TraceRay → closest-hit but compiles the inline-RayQuery trace primitives in
+place of the TraceRay flavors, so every secondary ray (shadow, AO,
+reflection, the glass chain) runs inline *inside the hit shader*; mode 2
+goes all-inline in raygen — no TraceRay anywhere, DispatchRays reduced to a
+bare launch grid over the reference loop. Every mode passes the full
+`--check-dxr` suite with statistics identical to the shipping pipeline
+(same hardware traversal, same shading), so the A/B is dispatch and nothing
+else.
+
+| `--spin path` 1080p, spp=1, tracer ms | all TraceRay | inline secondaries | all inline | wavefront |
+|---|---|---|---|---|
+| B70 default | 9.05 | 2.35 | 1.41 | 1.76 |
+| B70 `--stress 5000` | 5.30 | 1.64 | 1.22 | 2.02 |
+| B70 San Miguel low-poly | 6.75 | 1.94 | 1.29 | 2.05 |
+| 4090 default | 1.34 | 0.26 | 0.29 | 2.09 |
+| 4090 `--stress 5000` | 0.79 | 0.25 | 0.27 | 1.08 |
+| 4090 San Miguel low-poly | 1.18 | 0.34 | 0.34 | 1.00 |
+
+**Arc executes DispatchRays and inline RayQuery just fine; what it hates is
+re-entering the scheduler from a hit shader.** Recursive TraceRay
+secondaries multiply the tracer 4.4–6.4× on the B70 — and this is not an
+Arc quirk but a cross-vendor property: the 4090 pays 3.0–4.6× on the same
+scenes. Arc's penalty is ~1.4–1.5× NVIDIA's, and it lands on top of a
+weaker RT-core baseline; the two *compound* into the 5× that started the
+investigation. DispatchRays launch overhead itself is ≈ zero — mode 2 lands
+at the compute reference kernel's own cost on both vendors.
+
+Two riders worth keeping. The primary ray is the one place TraceRay earns
+anything: on the 4090, mode 1 beats mode 2 (a coherent primary on the
+hardware pipeline is worth a few percent), while the B70 always prefers
+zero TraceRay. And mode 1's *marginal sample* on the B70 is 2.2 ms against
+mode 2's 1.11 — the candidate-loop-fattened closest-hit shader pays
+occupancy per sample where the all-TraceRay pipeline paid per dispatch, so
+a fat hit shader is fine at 1 spp and ruinous at 16. The spp sweep also
+places the wavefront: on the B70 the all-inline DXR only beats the quadtree
+below ~3 spp (the quadtree's marginal sample is 0.86 ms vs the
+reference-shaped 1.11), while on the 4090 inline DXR wins at every spp
+measured.
+
+The measurement became the default: **mode 1 now ships as the DXR
+pipeline's dispatch mode** — it strictly dominates the all-TraceRay build
+at every measured (vendor, scene, spp) point while keeping the payload /
+closest-hit / SBT machinery doing its real job for the primary ray.
+`--dxr-inline 0` is the A/B escape back to the by-the-book pipeline, and
+`--dxr-inline 2` remains the right manual pick for a high-spp Intel DXR
+session. The numbers were the product; the default is the dividend.
+
 ## Future work
 
 Cut-aware leaf ordering (sort the cut by distance once per leaf tile so all 64
 rays shrink `tmax` early), and adapting the frame budget from measured
-resolve/present cost. A GPU compute BC7 encoder (the ispc encode is ~20 s on
-Intel Sponza and runs every load — there is no disk cache).
+resolve/present cost. (The GPU compute BC7 encoder that used to live here
+shipped: `src/gpu/bc7gpu.rs` — Intel Sponza's ~20 s ispc encode is now 280 ms
+on the GPU, which is what let BC7 become the default.)

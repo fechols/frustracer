@@ -2,9 +2,14 @@
 // (leaf/reference shading, hemi leaf rays, verify probes). Requires
 // trace_common.hlsli pasted first.
 //
-// One BLAS over scene.indices in order + one identity-instance TLAS, so
-// CommittedPrimitiveIndex() == tri and tri_mat/indices/normals index
-// directly. No cull flags (moller_trumbore is two-sided). Geometry is OPAQUE
+// The scene is one BLAS per maximal BVH subtree of <= 64k tris, each an
+// identity instance (BLAS_SPLIT — the DEFAULT), so a primitive index is an
+// index into a CHUNK: every one below goes through trace_common.hlsli's
+// tri_of(), the chunk remap. Under --no-blas-split it is one BLAS over
+// scene.indices in order and tri_of compiles to the identity, which is the
+// build that made CommittedPrimitiveIndex() == tri true. Never index
+// tri_mat/indices/normals by a raw primitive index — go through tri_of().
+// No cull flags (moller_trumbore is two-sided). Geometry is OPAQUE
 // unless the scene has alpha-masked textures: then trace.rs builds the BLAS
 // with FLAG_NONE and prepends #define ALPHA_CUTOUT 1, and the wrappers below
 // run a candidate loop mirroring bvh.rs::moller_trumbore's rejection — the
@@ -20,10 +25,36 @@ struct HitInfo {
     float u, v; // moller-trumbore == DXR convention: p = (1-u-v)p0 + u·p1 + v·p2
 };
 
-#ifdef ALPHA_CUTOUT
+// Relief widens the hardware ray interval on BOTH ends — the hardware culls
+// candidates at the PLANE t, and a marched hit can sit up to one relief
+// depth on the far side of its plane t in either direction: a below/interior
+// hit lands EARLIER than its plane t (so an inherited t_start ∈ (t_plane,
+// t'] would drop a candidate the CPU accepts — the TMin side), and a hit
+// with marched t' < tmax can belong to a candidate whose plane t lies BEYOND
+// tmax (an underside hit just inside an AO/shadow segment's far end — the
+// TMax side). The marched t is re-checked against the ORIGINAL bounds
+// explicitly in the loops (mirroring intersect_from's `tt > tmin &&
+// tt < tmax`), so the widening only ever surfaces candidates, never accepts
+// out-of-range hits.
+float height_tmin(float tmin) {
+#ifdef HEIGHTFIELD
+    if (flags & FLAG_HEIGHT) return max(0.0, tmin - height_max);
+#endif
+    return tmin;
+}
 
-// Anti-vacuity stat: cutout rejections, counted only by compile units that
-// bind `counters` (ctr.hlsli pastes before this file in the wavefront
+float height_tmax(float tmax) {
+#ifdef HEIGHTFIELD
+    // +height_max saturates INF/FLT_MAX harmlessly (the unbounded rays).
+    if (flags & FLAG_HEIGHT) return tmax + height_max;
+#endif
+    return tmax;
+}
+
+#if defined(ALPHA_CUTOUT) || defined(HEIGHTFIELD)
+
+// Anti-vacuity stat: cutout/relief rejections, counted only by compile units
+// that bind `counters` (ctr.hlsli pastes before this file in the wavefront
 // kernels; the reference kernel / DXR library never touch the slot).
 void count_alpha_rej() {
 #ifdef HAVE_COUNTERS
@@ -32,28 +63,47 @@ void count_alpha_rej() {
 #endif
 }
 
+void count_height_rej() {
+#ifdef HAVE_COUNTERS
+    uint _d;
+    InterlockedAdd(counters[CTR_HEIGHT_REJ], 1u, _d);
+#endif
+}
+
 bool trace_closest(float3 o, float3 d, float tmin, float tmax, out HitInfo h) {
     h = (HitInfo)0;
     RayDesc r;
-    r.Origin = o; r.Direction = d; r.TMin = tmin; r.TMax = tmax;
+    r.Origin = o; r.Direction = d; r.TMin = height_tmin(tmin); r.TMax = height_tmax(tmax);
     RayQuery<RAY_FLAG_NONE> q;
     q.TraceRayInline(tlas, RAY_FLAG_NONE, 0xffu, r);
     while (q.Proceed()) {
-        // Only non-opaque candidates surface here (BLAS flag NONE in alpha
-        // scenes). Committing shrinks TMax; rejecting leaves it unshrunk —
-        // exactly moller_trumbore returning None.
-        if (!alpha_cutout(q.CandidatePrimitiveIndex(),
-                          q.CandidateTriangleBarycentrics().x,
-                          q.CandidateTriangleBarycentrics().y))
+        // Only non-opaque candidates surface here (BLAS flag NONE in
+        // alpha/height scenes). Committing shrinks TMax; rejecting leaves it
+        // unshrunk — exactly moller_trumbore returning None. A marched hit
+        // COMMITS AT THE PLANE t (the only t a RayQuery can commit):
+        // candidates whose plane-t's interleave within one relief depth can
+        // mis-sort — bounded, the documented known-accept — and the winner
+        // is re-marched below for its true (t', u', v').
+        float ct = q.CandidateTriangleRayT();
+        float cu = q.CandidateTriangleBarycentrics().x;
+        float cv = q.CandidateTriangleBarycentrics().y;
+        uint rej = candidate_reject(
+            tri_of(q.CandidateInstanceID(), q.CandidatePrimitiveIndex()), o, d, ct, cu, cv);
+        if (rej == 0u && ct > tmin && ct < tmax)
             q.CommitNonOpaqueTriangleHit();
-        else
+        else if (rej == 1u)
             count_alpha_rej();
+        else
+            count_height_rej();
     }
     if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
         h.t = q.CommittedRayT();
-        h.tri = q.CommittedPrimitiveIndex();
+        h.tri = tri_of(q.CommittedInstanceID(), q.CommittedPrimitiveIndex());
         float2 b = q.CommittedTriangleBarycentrics();
         h.u = b.x; h.v = b.y;
+        // Re-march the committed winner for the displaced (t', u', v') the
+        // shading consumes (deterministic — same inputs as the in-loop run).
+        candidate_reject(h.tri, o, d, h.t, h.u, h.v);
         return true;
     }
     return false;
@@ -62,16 +112,21 @@ bool trace_closest(float3 o, float3 d, float tmin, float tmax, out HitInfo h) {
 bool occluded_q(float3 o, float3 d, float tmin, float tmax) {
     if (tmax <= tmin) return false;
     RayDesc r;
-    r.Origin = o; r.Direction = d; r.TMin = tmin; r.TMax = tmax;
+    r.Origin = o; r.Direction = d; r.TMin = height_tmin(tmin); r.TMax = height_tmax(tmax);
     RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
     q.TraceRayInline(tlas, RAY_FLAG_NONE, 0xffu, r);
     while (q.Proceed()) {
-        if (!alpha_cutout(q.CandidatePrimitiveIndex(),
-                          q.CandidateTriangleBarycentrics().x,
-                          q.CandidateTriangleBarycentrics().y))
+        float ct = q.CandidateTriangleRayT();
+        float cu = q.CandidateTriangleBarycentrics().x;
+        float cv = q.CandidateTriangleBarycentrics().y;
+        uint rej = candidate_reject(
+            tri_of(q.CandidateInstanceID(), q.CandidatePrimitiveIndex()), o, d, ct, cu, cv);
+        if (rej == 0u && ct > tmin && ct < tmax)
             q.CommitNonOpaqueTriangleHit();
-        else
+        else if (rej == 1u)
             count_alpha_rej();
+        else
+            count_height_rej();
     }
     return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
 }
@@ -87,7 +142,7 @@ bool trace_closest(float3 o, float3 d, float tmin, float tmax, out HitInfo h) {
     q.Proceed();
     if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
         h.t = q.CommittedRayT();
-        h.tri = q.CommittedPrimitiveIndex();
+        h.tri = tri_of(q.CommittedInstanceID(), q.CommittedPrimitiveIndex());
         float2 b = q.CommittedTriangleBarycentrics();
         h.u = b.x; h.v = b.y;
         return true;
@@ -106,3 +161,75 @@ bool occluded_q(float3 o, float3 d, float tmin, float tmax) {
 }
 
 #endif // ALPHA_CUTOUT
+
+// Light-transport occlusion (bvh.rs::Bvh::transmittance — tinted shadows):
+// the RGB throughput of segment (tmin, tmax). ONE when clear, ZERO on any
+// opaque hit, the product of mat_shadow tints per transmissive interface
+// crossed. Every LIGHT ray (sun shadow, translucency back, firefly, AO,
+// hemi-AO leaf) calls this; occluded_q keeps binary any-geometry semantics
+// for the geometric verify oracles (check_empty_cell). Without TRANS_SHADOW
+// this is occluded_q verbatim — the structural bit-identity arm.
+// SHADOW_TP_MIN lives in trace_common.hlsli (shared with rt_dxr.hlsli).
+
+#ifdef TRANS_SHADOW
+
+void count_trans_pass() {
+#ifdef HAVE_COUNTERS
+    uint _d;
+    InterlockedAdd(counters[CTR_TRANS_PASS], 1u, _d);
+#endif
+}
+
+float3 transmit_q(float3 o, float3 d, float tmin, float tmax) {
+    if (tmax <= tmin) return float3(1.0, 1.0, 1.0);
+    RayDesc r;
+    r.Origin = o; r.Direction = d; r.TMin = height_tmin(tmin); r.TMax = height_tmax(tmax);
+    // ACCEPT_FIRST_HIT still applies — but only to COMMITTED hits, and only
+    // opaque candidates commit: a transmissive candidate multiplies the
+    // running tint and is NOT committed, so traversal keeps enumerating.
+    // Candidate order is hardware-arbitrary; the product commutes, and any
+    // opaque commit zeroes the result regardless of what multiplied in. The
+    // BLAS builds with NO_DUPLICATE_ANYHIT_INVOCATION when TRANS_SHADOW is
+    // armed (trace.rs::geometry_desc) — without it a candidate may surface
+    // twice and the multiply, unlike the cutout reject, is not idempotent.
+    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
+    q.TraceRayInline(tlas, RAY_FLAG_NONE, 0xffu, r);
+    float3 tp = float3(1.0, 1.0, 1.0);
+    while (q.Proceed()) {
+        float ct = q.CandidateTriangleRayT();
+        float cu = q.CandidateTriangleBarycentrics().x;
+        float cv = q.CandidateTriangleBarycentrics().y;
+        uint tri = tri_of(q.CandidateInstanceID(), q.CandidatePrimitiveIndex());
+        uint rej = candidate_reject(tri, o, d, ct, cu, cv);
+        if (rej == 0u && ct > tmin && ct < tmax) {
+            float4 ms = mat_shadow[uv_tri_mat[tri]];
+            if (ms.a > 0.0) {
+                tp *= ms.rgb;
+                count_trans_pass();
+                if (max(tp.x, max(tp.y, tp.z)) < SHADOW_TP_MIN)
+                    return float3(0.0, 0.0, 0.0);
+            } else {
+                q.CommitNonOpaqueTriangleHit();
+            }
+        }
+#if defined(ALPHA_CUTOUT) || defined(HEIGHTFIELD)
+        else if (rej == 1u)
+            count_alpha_rej();
+        else if (rej == 2u)
+            count_height_rej();
+#endif
+    }
+    return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT
+        ? float3(0.0, 0.0, 0.0)
+        : tp;
+}
+
+#else
+
+float3 transmit_q(float3 o, float3 d, float tmin, float tmax) {
+    return occluded_q(o, d, tmin, tmax)
+        ? float3(0.0, 0.0, 0.0)
+        : float3(1.0, 1.0, 1.0);
+}
+
+#endif // TRANS_SHADOW

@@ -21,7 +21,7 @@ pub fn info_kind(info: u32) -> u32 {
 }
 
 /// Blue → cyan → green → yellow → red over quadtree depth 0..=8.
-fn heat(depth: u32) -> Vec3A {
+pub fn heat(depth: u32) -> Vec3A {
     let t = (depth as f32 / 8.0).clamp(0.0, 1.0);
     let stops = [
         Vec3A::new(0.10, 0.15, 0.85),

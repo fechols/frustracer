@@ -173,6 +173,51 @@ impl SlContext {
         }
         Ok(())
     }
+
+    // ---- DLSS-G + Reflex/PCL (frame generation) ----
+
+    pub fn dlssg_set_options(&self, viewport: u32, o: &sys::SlShimDlssgOptions) -> Result<(), String> {
+        let r = unsafe { sys::slshim_dlssg_set_options(viewport, o) };
+        if r != sys::SL_OK {
+            return Err(format!("slDLSSGSetOptions failed: {}", result_str(r)));
+        }
+        Ok(())
+    }
+
+    pub fn dlssg_state(&self, viewport: u32) -> Result<sys::SlShimDlssgState, String> {
+        let mut out = sys::SlShimDlssgState::default();
+        let r = unsafe { sys::slshim_dlssg_get_state(viewport, &mut out) };
+        if r != sys::SL_OK {
+            return Err(format!("slDLSSGGetState failed: {}", result_str(r)));
+        }
+        Ok(out)
+    }
+
+    /// Must run at least once for DLSS-G (even at mode 0); the sleep is the
+    /// per-frame half.
+    pub fn reflex_set_options(&self, mode: u32) -> Result<(), String> {
+        let r = unsafe { sys::slshim_reflex_set_options(mode) };
+        if r != sys::SL_OK {
+            return Err(format!("slReflexSetOptions failed: {}", result_str(r)));
+        }
+        Ok(())
+    }
+
+    pub fn reflex_sleep(&self, token: *mut c_void) -> Result<(), String> {
+        let r = unsafe { sys::slshim_reflex_sleep(token) };
+        if r != sys::SL_OK {
+            return Err(format!("slReflexSleep failed: {}", result_str(r)));
+        }
+        Ok(())
+    }
+
+    pub fn pcl_marker(&self, marker: u32, token: *mut c_void) -> Result<(), String> {
+        let r = unsafe { sys::slshim_pcl_set_marker(marker, token) };
+        if r != sys::SL_OK {
+            return Err(format!("slPCLSetMarker failed: {}", result_str(r)));
+        }
+        Ok(())
+    }
 }
 
 impl Drop for SlContext {

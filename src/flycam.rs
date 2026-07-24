@@ -22,7 +22,7 @@
 
 use crate::camera::Camera;
 use glam::Vec3A;
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -37,10 +37,11 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, MapVirtualKeyW, MAPVK_VSC_TO_VK_EX, VK_CONTROL, VK_DOWN, VK_LBUTTON,
-    VK_LEFT, VK_RBUTTON, VK_RIGHT, VK_SHIFT, VK_UP,
+    VK_LEFT, VK_OEM_COMMA, VK_OEM_PERIOD, VK_RBUTTON, VK_RIGHT, VK_SHIFT, VK_UP,
 };
 use windows::Win32::UI::Input::XboxController::{
-    XInputGetState, XINPUT_GAMEPAD_LEFT_SHOULDER, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE,
+    XInputGetState, XINPUT_GAMEPAD_DPAD_LEFT, XINPUT_GAMEPAD_DPAD_RIGHT,
+    XINPUT_GAMEPAD_LEFT_SHOULDER, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE,
     XINPUT_GAMEPAD_RIGHT_SHOULDER, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE,
     XINPUT_GAMEPAD_TRIGGER_THRESHOLD, XINPUT_STATE,
 };
@@ -61,6 +62,62 @@ const STICK_CURVE: i32 = 2;
 /// Probing a disconnected XInput slot is documented-slow — back off ~2 s
 /// between probes (in ticks) after ERROR_DEVICE_NOT_CONNECTED.
 const PAD_REPROBE_TICKS: u32 = 2000 / TICK_MS;
+/// Time-of-day scrub rate: game-hours per real second held (`.`/`,` or D-pad
+/// right/left). The Ctrl(/16)/Shift(/8)/bumper divisors apply, for fine scrub.
+const TOD_RATE: f32 = 1.0;
+/// Seconds for a slow-factor modifier (Ctrl/LB, Shift/RB) to ramp between
+/// full speed and its divided speed. The ramp is smoothstep-shaped, so
+/// engaging AND releasing both ease instead of stepping the speed 8-16x in
+/// one tick.
+const SLOW_EASE_S: f32 = 0.25;
+
+/// One integrator snapshot: the camera pose of record plus the time-of-day
+/// hour, taken under ONE lock so a render iteration sees a consistent pair.
+#[derive(Clone, Copy)]
+pub struct FlyState {
+    pub cam: Camera,
+    /// Hours, wrapped into [0, 24). Consumed by the session loop, which turns
+    /// a delta into `scene::apply_tod` + the shading-change resets.
+    pub tod: f32,
+}
+
+/// A world island's time-of-day attractor (world mode only): flying toward
+/// an island eases the GLOBAL tod toward its theme hour at the manual-scrub
+/// rate, so every downstream contract is the held-scrub one (accumulation
+/// reset per delta, histories kept). An empty list = the feature off — every
+/// non-world session passes `vec![]` and is structurally unchanged.
+pub struct TodAttractor {
+    pub pos: Vec3A,
+    /// Theme hour, [0, 24).
+    pub hour: f32,
+    /// Falloff scale (the island's content half-footprint): weight is
+    /// 1 / (d² + radius²), so the blend is finite ON the island and fades
+    /// with the square of distance off it.
+    pub radius: f32,
+}
+
+/// Distance-weighted CIRCULAR mean of the attractor hours at `pos` (x/z
+/// distance — altitude must not drag the blend). Circular because hours wrap:
+/// 22h and 2h must blend toward midnight, never toward noon; each hour maps
+/// to a point on the unit circle, the weighted vector sum is averaged, and
+/// atan2 maps back. Returns [0, 24). Pure — world::self_test pins it.
+pub(crate) fn attractor_hour(attractors: &[TodAttractor], pos: Vec3A) -> f32 {
+    use std::f32::consts::TAU;
+    let (mut sx, mut sy) = (0.0f64, 0.0f64);
+    for a in attractors {
+        let d = pos - a.pos;
+        let d2 = d.x * d.x + d.z * d.z;
+        let w = 1.0 / (d2 + a.radius * a.radius).max(1e-6) as f64;
+        let th = (a.hour / 24.0 * TAU) as f64;
+        sx += w * th.cos();
+        sy += w * th.sin();
+    }
+    if sx == 0.0 && sy == 0.0 {
+        return 0.0; // fully antipodal cancellation — pick midnight over NaN
+    }
+    let h = (sy.atan2(sx) / TAU as f64 * 24.0) as f32;
+    h.rem_euclid(24.0)
+}
 
 pub struct FlyCam {
     shared: Arc<Shared>,
@@ -68,7 +125,7 @@ pub struct FlyCam {
 }
 
 struct Shared {
-    cam: Mutex<Camera>,
+    state: Mutex<FlyState>,
     stop: AtomicBool,
     /// Integration gate. A LONG FRAME must still integrate — that is the
     /// whole feature. But a session rebuild (resize / F11 re-entry: kernel
@@ -78,30 +135,59 @@ struct Shared {
     /// and `session` resumes once its frame loop is actually running; the
     /// thread spawns paused so the first session's init is covered too.
     paused: AtomicBool,
+    /// World auto-TOD sticky-off: set by the first manual scrub (integrator
+    /// side) OR a pause-menu `set_tod` (main thread) — either way the user
+    /// took the clock, and the attractors easing it back would undo them.
+    /// Shared (not an integrator local) precisely so the menu can set it.
+    manual_tod: AtomicBool,
+    /// Camera speed in world units/s (f32 bits), written by the integrator
+    /// each moving tick and read by the audio mixer's wind synth at the
+    /// audio callback rate — an Arc so the mixer can hold its own handle
+    /// (the render thread being blocked in a trace must not gate the wind).
+    /// Deliberately NOT a FlyState field: the one-lock snapshot contract
+    /// stays exactly what it was. Idle steady state writes nothing (the
+    /// snapshot bit-compare discipline); pause/unfocus store one 0.0.
+    speed: Arc<AtomicU32>,
 }
 
 impl FlyCam {
     /// Spawn the integrator for the session window, PAUSED (see `resume`).
     /// `hwnd` rides as isize because windows::HWND is a raw pointer and not
     /// Send; the thread only ever compares it / hands it to read-only queries.
-    pub fn spawn(hwnd: isize, cam0: Camera, diag: f32) -> Self {
+    /// `attractors` arms world-mode auto-TOD (empty = off, the structural
+    /// non-world state); the first manual scrub disables it for the session.
+    pub fn spawn(
+        hwnd: isize,
+        cam0: Camera,
+        tod0: f32,
+        diag: f32,
+        attractors: Vec<TodAttractor>,
+    ) -> Self {
         let shared = Arc::new(Shared {
-            cam: Mutex::new(cam0),
+            state: Mutex::new(FlyState { cam: cam0, tod: tod0 }),
             stop: AtomicBool::new(false),
             paused: AtomicBool::new(true),
+            manual_tod: AtomicBool::new(false),
+            speed: Arc::new(AtomicU32::new(0)),
         });
         let s2 = shared.clone();
         let handle = std::thread::Builder::new()
             .name("flycam".into())
-            .spawn(move || integrate_loop(&s2, hwnd, diag))
+            .spawn(move || integrate_loop(&s2, hwnd, diag, &attractors))
             .expect("flycam thread spawn failed");
         Self { shared, handle: Some(handle) }
     }
 
-    /// The camera pose of record. Call ONCE per render-loop iteration and
-    /// use only the returned snapshot for the whole iteration.
-    pub fn snapshot(&self) -> Camera {
-        *self.shared.cam.lock().unwrap()
+    /// The pose + time-of-day of record. Call ONCE per render-loop iteration
+    /// and use only the returned snapshot for the whole iteration.
+    pub fn snapshot(&self) -> FlyState {
+        *self.shared.state.lock().unwrap()
+    }
+
+    /// A clone of the integrator's live camera-speed atomic (world units/s
+    /// as f32 bits) — the audio wind synth's input. See `Shared::speed`.
+    pub fn speed_handle(&self) -> Arc<AtomicU32> {
+        self.shared.speed.clone()
     }
 
     /// Stop/start integrating. Paused ticks keep advancing the integrator's
@@ -122,7 +208,19 @@ impl FlyCam {
     /// session-local copy the integrator would immediately overwrite.
     #[allow(dead_code)]
     pub fn set(&self, cam: Camera) {
-        *self.shared.cam.lock().unwrap() = cam;
+        self.shared.state.lock().unwrap().cam = cam;
+    }
+
+    /// Time-of-day write-through (the pause menu's TOD control): the thread
+    /// owns the hour like it owns the pose, so a menu set rides the same
+    /// channel a scrub does — the session's existing `snap.tod != cur_tod`
+    /// detection applies it (scene::apply_tod + refresh_sky + frame reset,
+    /// histories kept). Also takes the clock for the session, like the first
+    /// manual scrub — a menu set IS a manual choice, and the world-mode
+    /// attractors easing it back would undo it.
+    pub fn set_tod(&self, hours: f32) {
+        self.shared.manual_tod.store(true, Relaxed);
+        self.shared.state.lock().unwrap().tod = hours.rem_euclid(24.0);
     }
 }
 
@@ -205,7 +303,9 @@ struct Keys {
     d: u16,
     q: u16,
     e: u16,
-    space: u16,
+    /// Time-of-day reverse / fast-forward (`,` / `.` physical keys).
+    comma: u16,
+    period: u16,
 }
 
 impl Keys {
@@ -221,7 +321,11 @@ impl Keys {
             d: vk(0x20, b'D' as u16),
             q: vk(0x10, b'Q' as u16),
             e: vk(0x12, b'E' as u16),
-            space: vk(0x39, 0x20),
+            // Space deliberately absent: it is the render-mode cycle
+            // (input.rs), and a flight key polled here would ALSO fire on
+            // every mode switch — the camera bumped upward per press.
+            comma: vk(0x33, VK_OEM_COMMA.0),
+            period: vk(0x34, VK_OEM_PERIOD.0),
         }
     }
 }
@@ -237,6 +341,9 @@ struct Pad {
     rt: f32,
     lb: bool,
     rb: bool,
+    /// D-pad left/right: time-of-day reverse / fast-forward.
+    dpad_l: bool,
+    dpad_r: bool,
 }
 
 /// Radial deadzone + response curve: the 2D magnitude below the deadzone is
@@ -279,6 +386,8 @@ fn poll_pad(backoff: &mut u32) -> Option<Pad> {
         rt: trigger(g.bRightTrigger),
         lb: (g.wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER).0 != 0,
         rb: (g.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER).0 != 0,
+        dpad_l: (g.wButtons & XINPUT_GAMEPAD_DPAD_LEFT).0 != 0,
+        dpad_r: (g.wButtons & XINPUT_GAMEPAD_DPAD_RIGHT).0 != 0,
     })
 }
 
@@ -304,7 +413,7 @@ fn drag_may_start(hwnd: HWND, pt: POINT) -> bool {
     }
 }
 
-fn integrate_loop(shared: &Shared, hwnd: isize, diag: f32) {
+fn integrate_loop(shared: &Shared, hwnd: isize, diag: f32, attractors: &[TodAttractor]) {
     // Above the rayon workers. The renderer saturates every core at normal
     // priority for the whole trace, and this thread needs ~10 us every 2 ms.
     // A starved tick never loses displacement (dt is measured, so the total
@@ -330,6 +439,15 @@ fn integrate_loop(shared: &Shared, hwnd: isize, diag: f32) {
     let mut last = Instant::now();
     let mut drag: Option<(i32, i32)> = None;
     let mut pad_backoff = 0u32;
+    // Slow-modifier ramp positions in [0, 1]: 0 = full speed, 1 = fully
+    // engaged divisor. Advanced every focused tick (even idle ones, so a
+    // modifier held before movement starts is already engaged).
+    let mut slow_ctrl = 0.0f32;
+    let mut slow_shift = 0.0f32;
+    // Last speed value stored (world units/s). Compare-before-store keeps
+    // the idle steady state write-free (the snapshot bit-compare
+    // discipline); the pause/unfocus and no-input paths park it at 0.0 once.
+    let mut prev_speed = 0.0f32;
 
     loop {
         ticker.wait();
@@ -349,6 +467,10 @@ fn integrate_loop(shared: &Shared, hwnd: isize, diag: f32) {
         // integrating would fly the camera blind. Both drop the drag.
         if shared.paused.load(Relaxed) || unsafe { GetForegroundWindow() } != hwnd {
             drag = None;
+            if prev_speed != 0.0 {
+                prev_speed = 0.0;
+                shared.speed.store(0.0f32.to_bits(), Relaxed);
+            }
             continue;
         }
 
@@ -369,14 +491,22 @@ fn integrate_loop(shared: &Shared, hwnd: isize, diag: f32) {
             drag = Some((pt.x, pt.y)); // latch; first tick contributes no delta
         }
 
-        // --- flight speed: diag * 0.25 / s, Ctrl (or LB) /16, Shift (or RB) /8.
-        let mut speed = diag * 0.25 * dt;
-        if down(VK_CONTROL.0) || pad.as_ref().is_some_and(|p| p.lb) {
-            speed /= 16.0;
-        }
-        if down(VK_SHIFT.0) || pad.as_ref().is_some_and(|p| p.rb) {
-            speed /= 8.0;
-        }
+        // --- shared slow factor: Ctrl (or LB) /16, Shift (or RB) /8 — the
+        // flight-speed divisors, also applied to the TOD scrub rate so the
+        // same chord means "finer" everywhere. Eased: each modifier ramps
+        // over SLOW_EASE_S with smoothstep shaping, and the divisor is
+        // applied in log2 space (exp2 of a lerped exponent), so engagement
+        // glides through the intermediate speeds and the rest states stay
+        // EXACT (2^0 = 1, 2^-4 = 1/16, 2^-3 = 1/8 — no powf rounding).
+        let ramp = |t: f32, held: bool| {
+            if held { (t + dt / SLOW_EASE_S).min(1.0) } else { (t - dt / SLOW_EASE_S).max(0.0) }
+        };
+        slow_ctrl = ramp(slow_ctrl, down(VK_CONTROL.0) || pad.as_ref().is_some_and(|p| p.lb));
+        slow_shift = ramp(slow_shift, down(VK_SHIFT.0) || pad.as_ref().is_some_and(|p| p.rb));
+        let smooth = |t: f32| t * t * (3.0 - 2.0 * t);
+        let slow = (-4.0 * smooth(slow_ctrl) - 3.0 * smooth(slow_shift)).exp2();
+        // --- flight speed: diag * 0.1875 / s, times the slow factor.
+        let speed = diag * 0.1875 * dt * slow;
 
         // Keyboard direction flags (unit directions, normalized below —
         // exactly the old apply_movement).
@@ -386,17 +516,38 @@ fn integrate_loop(shared: &Shared, hwnd: isize, diag: f32) {
         let ks = down(keys.s) || down(VK_DOWN.0);
         let kd = down(keys.d) || down(VK_RIGHT.0);
         let ka = down(keys.a) || down(VK_LEFT.0);
-        let kup = down(keys.e) || down(keys.space);
+        let kup = down(keys.e);
         let kdn = down(keys.q);
         let key_any = kw || ks || kd || ka || kup || kdn;
 
+        // --- time-of-day scrub: `.`/D-pad-right forward, `,`/D-pad-left
+        // reverse (both held = 0). Wall-clock-exact by the same measured-dt
+        // argument as displacement.
+        let t_fwd = down(keys.period) || pad.as_ref().is_some_and(|p| p.dpad_r);
+        let t_rev = down(keys.comma) || pad.as_ref().is_some_and(|p| p.dpad_l);
+        let tod_dir = (t_fwd as i32 - t_rev as i32) as f32;
+
+        if tod_dir != 0.0 {
+            shared.manual_tod.store(true, Relaxed);
+        }
+        let auto_tod = !shared.manual_tod.load(Relaxed) && !attractors.is_empty();
+
         let pad_move = pad.as_ref().is_some_and(|p| p.lx != 0.0 || p.ly != 0.0 || p.lt != 0.0 || p.rt != 0.0);
         let pad_look = pad.as_ref().is_some_and(|p| p.rx != 0.0 || p.ry != 0.0);
-        if !key_any && !pad_move && !pad_look && dx == 0.0 && dy == 0.0 {
-            continue; // nothing to integrate; the shared camera stays bit-untouched
+        // auto_tod must integrate with NO input held (the ease keeps running
+        // after the flight stops) — but once converged it writes nothing (see
+        // below), so an idle converged session still compares bit-equal.
+        if !key_any && !pad_move && !pad_look && dx == 0.0 && dy == 0.0 && tod_dir == 0.0 && !auto_tod
+        {
+            if prev_speed != 0.0 {
+                prev_speed = 0.0;
+                shared.speed.store(0.0f32.to_bits(), Relaxed);
+            }
+            continue; // nothing to integrate; the shared state stays bit-untouched
         }
 
-        let mut cam = shared.cam.lock().unwrap();
+        let mut st = shared.state.lock().unwrap();
+        let cam = &mut st.cam;
         let f = cam.forward();
         let r = f.cross(Vec3A::Y).normalize();
         let mut step = Vec3A::ZERO;
@@ -433,6 +584,14 @@ fn integrate_loop(shared: &Shared, hwnd: isize, diag: f32) {
         if step != Vec3A::ZERO {
             cam.pos += step;
         }
+        // Publish the tick's speed for the audio wind (units/s — dt-invariant
+        // by the same measured-dt argument as displacement). A look-only tick
+        // parks it at 0.0; the compare keeps steady states write-free.
+        let sp = if step != Vec3A::ZERO { step.length() / dt.max(1e-4) } else { 0.0 };
+        if sp != prev_speed {
+            prev_speed = sp;
+            shared.speed.store(sp.to_bits(), Relaxed);
+        }
 
         // Look: mouse per-pixel (tick-rate independent by construction) +
         // right stick as a rate (rad/s x deflection x dt — the term that
@@ -447,6 +606,35 @@ fn integrate_loop(shared: &Shared, hwnd: isize, diag: f32) {
         if yaw_d != 0.0 || pitch_d != 0.0 {
             cam.yaw += yaw_d;
             cam.pitch = (cam.pitch + pitch_d).clamp(-1.5, 1.5);
+        }
+
+        // Time-of-day: 1 game-hour per held second (times the slow factor),
+        // wrapped into [0, 24). Written only on an actual scrub, so an idle
+        // session's snapshot compares bit-equal forever.
+        if tod_dir != 0.0 {
+            st.tod = (st.tod + tod_dir * TOD_RATE * dt * slow).rem_euclid(24.0);
+        } else if auto_tod {
+            // World auto-TOD: ease toward the islands' blended theme hour at
+            // the MANUAL scrub rate (no slow factor — that chord belongs to
+            // the user's hand), along the shorter wrap direction. Within one
+            // step of the target it SNAPS to the exact target value, so the
+            // next tick's delta is exactly 0.0 and the write stops — a still
+            // camera therefore converges tod, the session loop stops seeing
+            // deltas, and plain accumulation converges like any still frame.
+            // Stepping by `st.tod + d` instead of snapping would leave an
+            // ulp-scale residue that re-writes (and re-resets accumulation)
+            // every tick, forever.
+            let target = attractor_hour(attractors, st.cam.pos);
+            let mut d = target - st.tod;
+            d -= (d / 24.0).round() * 24.0;
+            if d != 0.0 {
+                let step = TOD_RATE * dt;
+                st.tod = if d.abs() <= step {
+                    target
+                } else {
+                    (st.tod + step * d.signum()).rem_euclid(24.0)
+                };
+            }
         }
     }
 }

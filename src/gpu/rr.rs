@@ -324,13 +324,44 @@ impl RrResources {
         Ok(())
     }
 
+    /// The raw-NGX frame-generation inputs: (depth, mvec) — the same linear
+    /// view-Z + pixel-space MV planes the SL tags name, resting
+    /// NON_PIXEL_SHADER_RESOURCE.
+    pub fn fg_inputs(&self) -> (&ID3D12Resource, &ID3D12Resource) {
+        (&self.planes[P_DEPTH].tex, &self.planes[P_MVEC].tex)
+    }
+
+    /// The guide-conversion pass's source planes, in `ngxfg_guides`' kernel
+    /// order (its `SRC_FORMATS` mirrors these planes' formats — change both
+    /// together). All rest NON_PIXEL_SHADER_RESOURCE, the state a compute
+    /// SRV read wants.
+    pub fn guide_inputs(&self) -> [&ID3D12Resource; crate::gpu::ngxfg_guides::SRC_PLANES] {
+        [
+            &self.planes[P_DEPTH].tex,
+            &self.planes[P_MVEC].tex,
+            &self.planes[P_SPEC_HIT].tex,
+            &self.planes[P_ALBEDO].tex,
+            &self.planes[P_SPEC_ALBEDO].tex,
+            &self.planes[P_NORMAL_ROUGH].tex,
+        ]
+    }
+
     /// The full tag table for slEvaluateFeature(DLSS-RR). States must be the
     /// states the resources are in when SL *uses* them (manual hooking).
     /// Under DRS every input tag carries the current render-size extent
     /// `{0,0,rw,rh}` (the RR guide tags ALL inputs with the input extent)
     /// and the output its full window-size extent — SL derives the ratio
     /// and low-res-MV handling from these, not from the texture dims.
-    pub fn tags(&self, rw: usize, rh: usize) -> [sl::SlShimResourceTag; 8] {
+    ///
+    /// `dlssg`: DLSS-G's REQUIRED depth tag is `kBufferTypeDepth (0)`, a
+    /// DIFFERENT slot from RR's `kBufferTypeLinearDepth (49)` — a G frame
+    /// with only the 49 tag has no depth in G's eyes, and there is no status
+    /// bit for a missing tag: generation just silently never inserts
+    /// (measured — multiplier pinned at 1 with every marker accepted). The
+    /// same linear view-Z plane rides both slots; interpolation's dilation
+    /// needs monotone-with-distance, which linear view-Z is
+    /// (Constants::depthInverted = 0).
+    pub fn tags(&self, rw: usize, rh: usize, dlssg: bool) -> Vec<sl::SlShimResourceTag> {
         let npsr = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0 as u32;
         let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32;
         let tag = |tex: &ID3D12Resource, buffer_type: u32, state: u32, w: u32, h: u32| {
@@ -346,7 +377,7 @@ impl RrResources {
             }
         };
         let (rw, rh) = (rw as u32, rh as u32);
-        [
+        let mut tags = vec![
             tag(&self.planes[P_COLOR].tex, sl::BUFFER_SCALING_INPUT_COLOR, npsr, rw, rh),
             tag(&self.output, sl::BUFFER_SCALING_OUTPUT_COLOR, uav, self.ow, self.oh),
             tag(&self.planes[P_DEPTH].tex, sl::BUFFER_LINEAR_DEPTH, npsr, rw, rh),
@@ -355,6 +386,10 @@ impl RrResources {
             tag(&self.planes[P_SPEC_ALBEDO].tex, sl::BUFFER_SPECULAR_ALBEDO, npsr, rw, rh),
             tag(&self.planes[P_NORMAL_ROUGH].tex, sl::BUFFER_NORMAL_ROUGHNESS, npsr, rw, rh),
             tag(&self.planes[P_SPEC_HIT].tex, sl::BUFFER_SPECULAR_HIT_DISTANCE, npsr, rw, rh),
-        ]
+        ];
+        if dlssg {
+            tags.push(tag(&self.planes[P_DEPTH].tex, sl::BUFFER_DEPTH, npsr, rw, rh));
+        }
+        tags
     }
 }

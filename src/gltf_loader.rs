@@ -15,8 +15,9 @@
 //!   `alpha_masked` is cleared post-decode (JPG-conversion junk alpha would
 //!   otherwise punch cutout holes in walls).
 //!
-//! Ignored (warned where it matters): KHR_lights_punctual (the engine's
-//! AreaLight + sky IS the lighting model), KHR_texture_transform, authored
+//! Ignored (warned where it matters): KHR_lights_punctual (the engine's ONE
+//! sky — a scattering dome plus a sun disc at infinity — IS the lighting
+//! model; see src/sky.rs), KHR_texture_transform, authored
 //! TANGENTs (one tangent source: shade.rs's on-the-fly derivation),
 //! COLOR_0, occlusionTexture (the engine computes its own AO), TEXCOORD_1+,
 //! non-TRIANGLES primitive modes. KHR_materials_ior is logged (GLASS_IOR is
@@ -26,7 +27,7 @@
 //! per-material threshold), so non-default cutoffs are counted in the
 //! summary line instead.
 
-use crate::scene::{AreaLight, MatKind, Material, Scene, SceneBuilder, NO_TEX};
+use crate::scene::{MatKind, Material, Scene, SceneBuilder, NO_TEX};
 use crate::texture::Texture;
 use glam::{Mat3A, Mat4, Vec2, Vec3A};
 use std::collections::HashMap;
@@ -61,6 +62,57 @@ pub fn load_gltf_scene(path: &str) -> Scene {
     let buffers = resolve_buffers(&doc, &base_dir, gltf.blob)
         .unwrap_or_else(|e| panic!("failed to resolve glTF buffers for '{path}': {e}"));
     build_scene(&doc, &buffers, &base_dir, true)
+}
+
+/// Every external FILE a glTF scene reads: the buffers' and images' resolved
+/// paths, mirroring `resolve_buffers`' `.zst` and the image decode's `.webp`
+/// sibling fallbacks — the world sidecar's staleness key for glTF islands
+/// (the source file's own stat covers the JSON/GLB itself; a reference
+/// change therefore misses via the source, a content change via the dep).
+/// A buffer path that resolution would pick is recorded even if MISSING —
+/// its (0,0) stat key then catches the file appearing later. Deterministic
+/// order (buffers, then images, document order) — the key is blob-compared.
+/// GLB embeds everything, so a self-contained one yields an empty list.
+/// Parse failure is a loud warning + empty Vec: the actual load will fail on
+/// its own terms (the loader convention), and an empty dep list still keys
+/// on the source stat.
+pub fn dependency_files(path: &str) -> Vec<std::path::PathBuf> {
+    let gltf = match gltf::Gltf::open(path) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("warning: glTF '{path}' failed to parse for dependency scan ({e})");
+            return Vec::new();
+        }
+    };
+    let base_dir = std::path::Path::new(path)
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .to_path_buf();
+    let mut out = Vec::new();
+    for b in gltf.document.buffers() {
+        if let gltf::buffer::Source::Uri(uri) = b.source() {
+            if !uri.starts_with("data:") {
+                let p = base_dir.join(uri.replace("%20", " "));
+                if p.exists() {
+                    out.push(p);
+                } else {
+                    let mut z = p.into_os_string();
+                    z.push(".zst");
+                    out.push(std::path::PathBuf::from(z));
+                }
+            }
+        }
+    }
+    for image in gltf.document.images() {
+        if let gltf::image::Source::Uri { uri, .. } = image.source() {
+            if !uri.starts_with("data:") {
+                out.push(crate::scene::resolve_texture_path(
+                    base_dir.join(uri.replace("%20", " ")),
+                ));
+            }
+        }
+    }
+    out
 }
 
 /// Resolve the document's buffers like `gltf::import_buffers`, plus the
@@ -341,9 +393,17 @@ fn build_scene(
                 sheen,
                 translucency: 0.0,
                 transmission,
+                // glTF glass keeps the sentinel tint (baseColor is authored
+                // for tinting, so albedo IS the tint) and the fixed 1.5 IOR;
+                // KHR_materials_ior → `ior` and a glTF water class are noted
+                // follow-ons.
+                trans_tint: Vec3A::splat(-1.0),
+                ior: 1.5,
+                ripple_amp: 0.0,
                 emissive,
                 normal_tex,
                 normal_scale,
+                height_amp: 0.0,
                 rough_tex: mr_tex, // glTF packs roughness = G ...
                 metal_tex: mr_tex, // ... and metallic = B of the SAME map
                 emissive_tex,
@@ -455,7 +515,12 @@ fn build_scene(
             .unwrap_or(default_mat);
         b.add_mesh(pr.positions, pr.normals, pr.texcoords, &pr.indices, mat);
     }
-    let scene = b.finish(default_light_gltf());
+    // The engine's lighting model is the ONE sky (src/sky.rs); KHR_lights_punctual
+    // is deliberately ignored, exactly as MTL lights are. Shared with the OBJ and
+    // procedural loaders rather than re-spelled: the sun is now a single Vec3A, so
+    // a second copy would just be a direction that could silently drift out of
+    // step with theirs.
+    let scene = b.finish(crate::scene::default_sun());
     if verbose {
         eprintln!(
             "gltf: {} prims | {} tris | {} materials | {} textures | skipped: {} non-tri prims{}{}{}{}{}{}",
@@ -481,17 +546,6 @@ fn build_scene(
         );
     }
     scene
-}
-
-fn default_light_gltf() -> AreaLight {
-    // The engine's lighting model — KHR_lights_punctual is deliberately
-    // ignored (same as MTL lights); this is load_obj_scene's default light.
-    AreaLight {
-        center: Vec3A::new(6.0, 10.0, 4.0),
-        u: Vec3A::new(2.0, 0.0, 0.0),
-        v: Vec3A::new(0.0, 0.0, 2.0),
-        color: Vec3A::new(1.0, 0.95, 0.85) * 150.0,
-    }
 }
 
 /// Minimal RFC-4648 base64 decoder for data: URIs (avoids a dependency; the

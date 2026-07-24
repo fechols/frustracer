@@ -22,10 +22,15 @@ pub struct Pbr {
     pub sheen: f32,
     pub translucency: f32,
     pub transmission: f32,
+    /// A liquid-water refinement of the glass tier (see `WATER`): the loader
+    /// reads it to skip the dark-glass albedo lift and to fill the water
+    /// `trans_tint`/`ior`/`ripple_amp` material fields. `false` for every
+    /// keyword/glossy/glass class — structural bit-identity for non-water.
+    pub water: bool,
 }
 
 const fn opaque(roughness: f32, metallic: f32) -> Pbr {
-    Pbr { roughness, metallic, sheen: 0.0, translucency: 0.0, transmission: 0.0 }
+    Pbr { roughness, metallic, sheen: 0.0, translucency: 0.0, transmission: 0.0, water: false }
 }
 
 /// Keyword: `Tok` matches a whole lowercase token (tokens are maximal
@@ -163,17 +168,26 @@ const CLASSES: &[ClassDef] = &[
 /// Ns-tier classes for materials nothing above matched. Index into `NAMES`
 /// continues past `CLASSES`.
 const GLASS: Pbr = Pbr { transmission: 0.9, ..opaque(0.05, 0.0) };
+/// Liquid water: a refinement of the glass tier for the fountain (`materialo`
+/// in San Miguel). Transmission near 1 so Fresnel owns the reflect/transmit
+/// split (glass 0.9 left a `kd·(1−T)` neutral wash that read as chrome); the
+/// blue-green `trans_tint`, the 1.33 IOR, and the ripple amplitude are
+/// material fields the loader fills (see `scene::WATER_*`). Roughness stays
+/// mirror-smooth — the ripple normals, not micro-roughness, supply the
+/// water structure.
+const WATER: Pbr = Pbr { transmission: 0.97, water: true, ..opaque(0.05, 0.0) };
 pub const FABRIC_SHEEN: f32 = 0.5;
 
 /// Class names in report order: the keyword classes, then the Ns tiers and
 /// the default — indices returned by `classify` point in here.
 pub const NAMES: &[&str] = &[
     "rust", "metal", "wood", "ceramic", "clay", "fabric", "leather", "stone", "foliage",
-    "glass", "glossy", "default",
+    "glass", "water", "glossy", "default",
 ];
 const IDX_GLASS: usize = 9;
-const IDX_GLOSSY: usize = 10;
-const IDX_DEFAULT: usize = 11;
+const IDX_WATER: usize = 10;
+const IDX_GLOSSY: usize = 11;
+const IDX_DEFAULT: usize = 12;
 
 /// Blinn-Phong exponent -> perceptual GGX roughness (Brian Karis' mapping),
 /// clamped to the plausible glossy band.
@@ -183,6 +197,27 @@ fn ns_to_rough(ns: f32) -> f32 {
 
 fn tokens(s: &str) -> impl Iterator<Item = &str> {
     s.split(|c: char| !c.is_ascii_alphabetic()).filter(|t| !t.is_empty())
+}
+
+/// Whole-token `water`/`agua` match (the `tokens()` matcher keeps
+/// `watercolor` safe). Checked against the OBJ object/group name at the
+/// loader (a `usemtl materialo` under `o Water`) and against the texture
+/// stem / material name inside `classify`.
+pub fn water_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    tokens(&lower).any(|t| t == "water" || t == "agua")
+}
+
+/// A chromatic MTL transmission filter (`Tf`) on an illum-4 material is the
+/// structural "colored liquid, not clear glassware" signal — `materialo`'s
+/// `Tf 0.5 0.4 0.2` fires; neutral glassware (`Tf 0.1 0.1 0.1`) does not. The
+/// color itself is NOT used (2003-exporter Tf is untrustworthy as a hue — the
+/// curated `WATER_TINT` is always the tint); only its chromaticity is the cue.
+fn tf_chromatic(tf: Option<[f32; 3]>) -> bool {
+    match tf {
+        Some([r, g, b]) => r.max(g).max(b) - r.min(g).min(b) > 0.05,
+        None => false,
+    }
 }
 
 fn keyword_class(key: &str) -> Option<usize> {
@@ -202,12 +237,16 @@ fn keyword_class(key: &str) -> Option<usize> {
 
 /// Classify one MTL material. `tex_stem` is the lowercase filename stem of
 /// map_Kd (no directory, no extension); `mat_name` the `newmtl` name;
-/// `ns`/`illum` straight from tobj. Returns (index into `NAMES`, params).
+/// `ns`/`illum` straight from tobj. `water_hint` is the loader's OBJ
+/// object-name signal (`o Water` → this material); `tf` the parsed MTL
+/// transmission filter. Returns (index into `NAMES`, params).
 pub fn classify(
     tex_stem: Option<&str>,
     mat_name: &str,
     ns: Option<f32>,
     illum: Option<u8>,
+    water_hint: bool,
+    tf: Option<[f32; 3]>,
 ) -> (usize, Pbr) {
     // Tier 1: texture filename stem. Tier 2: material name, same table.
     let hit = tex_stem
@@ -227,6 +266,17 @@ pub fn classify(
     // opaque glossy dielectric — transmission there would dissolve chairs.
     let ns = ns.unwrap_or(0.0);
     if illum == Some(4) || ns >= 500.0 {
+        // A water REFINEMENT of the glass tier — only a material that already
+        // classifies glassware can become water, so transmission stays
+        // shading-only and every soundness property is unchanged. Signals:
+        // an OBJ `water`/`agua` object/stem/material name, or a chromatic Tf.
+        let is_water = water_hint
+            || tex_stem.is_some_and(water_name)
+            || water_name(mat_name)
+            || tf_chromatic(tf);
+        if is_water {
+            return (IDX_WATER, WATER);
+        }
         return (IDX_GLASS, Pbr { roughness: ns_to_rough(ns.max(500.0)), ..GLASS });
     }
     if ns >= 100.0 {
@@ -243,7 +293,7 @@ pub fn classify(
 /// compounds, the untextured name/Ns/illum tiers.
 pub fn self_test() -> Result<(), String> {
     let expect = |stem: Option<&str>, name: &str, ns: f32, illum: u8, want: &str| {
-        let got = NAMES[classify(stem, name, Some(ns), Some(illum)).0];
+        let got = NAMES[classify(stem, name, Some(ns), Some(illum), false, None).0];
         if got == want {
             Ok(())
         } else {
@@ -267,21 +317,61 @@ pub fn self_test() -> Result<(), String> {
     // Name tier: CafeChair_Metal is untextured.
     expect(None, "CafeChair_Metal", 256.0, 2, "metal")?;
     // Ns tiers: glassware (illum 4 or Ns >= 500) vs untextured opaque glossy.
+    // material_79/materialn are neutral-Tf illum-4 glassware — must STAY glass.
     expect(None, "material_79", 1024.0, 4, "glass")?;
     expect(None, "materialn", 100.0, 4, "glass")?;
     expect(None, "material_267", 256.0, 2, "glossy")?;
     expect(None, "material_9", 16.0, 2, "default")?;
-    let (_, g) = classify(None, "material_0", Some(4096.0), Some(2));
+    let (_, g) = classify(None, "material_0", Some(4096.0), Some(2), false, None);
     if !(g.transmission > 0.0 && g.roughness <= 0.06) {
         return Err(format!("Ns 4096: transmission {} roughness {}", g.transmission, g.roughness));
     }
-    let (_, f) = classify(Some("tela_mesa_b"), "material_2", Some(16.0), Some(2));
+    let (_, f) = classify(Some("tela_mesa_b"), "material_2", Some(16.0), Some(2), false, None);
     if f.sheen != FABRIC_SHEEN || f.transmission != 0.0 {
         return Err(format!("fabric: sheen {} transmission {}", f.sheen, f.transmission));
     }
-    let (_, l) = classify(Some("bs01lef"), "material_3", Some(16.0), Some(2));
+    let (_, l) = classify(Some("bs01lef"), "material_3", Some(16.0), Some(2), false, None);
     if l.translucency != 0.3 || l.roughness < 0.45 {
         return Err(format!("foliage: translucency {} roughness {}", l.translucency, l.roughness));
+    }
+    // Water is a glass-tier refinement, not a rival to the keyword/glossy
+    // tiers. Signals, each in isolation:
+    let water_named = |stem: Option<&str>, name: &str, hint: bool, tf: Option<[f32; 3]>| {
+        NAMES[classify(stem, name, Some(1024.0), Some(4), hint, tf).0]
+    };
+    // (a) the OBJ object name (`o Water` → materialo), no texture, no Tf.
+    if water_named(None, "materialo", true, None) != "water" {
+        return Err("object-name water_hint should classify water".into());
+    }
+    // (b) a chromatic Tf alone (materialo's Tf 0.5 0.4 0.2), no name hint.
+    if water_named(None, "materialo", false, Some([0.5, 0.4, 0.2])) != "water" {
+        return Err("chromatic Tf should classify water".into());
+    }
+    // (c) a `water` stem or material name.
+    if water_named(Some("agua_fuente"), "material_5", false, None) != "water" {
+        return Err("water stem should classify water".into());
+    }
+    // Neutral Tf + no name = glassware still (the material_79 pin, restated
+    // with an explicit neutral Tf).
+    if water_named(None, "material_79", false, Some([0.1, 0.1, 0.1])) != "glass" {
+        return Err("neutral-Tf glassware must stay glass".into());
+    }
+    // Refinement-only: a water name on an illum-2 opaque material does NOT
+    // pull it into the glass tier.
+    if NAMES[classify(None, "water_chair", Some(256.0), Some(2), true, None).0] != "glossy" {
+        return Err("water hint must not override the opaque glossy tier".into());
+    }
+    // Token safety: `watercolor` is not water; `Water` is.
+    if !water_name("Water") || water_name("watercolor_paper") {
+        return Err("water_name token match wrong".into());
+    }
+    // The water params: transmission near 1, mirror-smooth, flagged.
+    let (_, w) = classify(None, "materialo", Some(1024.0), Some(4), true, None);
+    if !(w.water && w.transmission > 0.95 && w.roughness <= 0.06 && w.metallic == 0.0) {
+        return Err(format!(
+            "water pbr: water {} T {} rough {} metal {}",
+            w.water, w.transmission, w.roughness, w.metallic
+        ));
     }
     Ok(())
 }

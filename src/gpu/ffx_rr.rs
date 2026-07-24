@@ -65,6 +65,12 @@ const P_AO_IN: usize = 9; // R16F ambient-occlusion open fraction [0,1]
 const P_IS_IN: usize = 10; // RGBA16F demodulated indirect specular (A = hit t)
 const N_PLANES: usize = 11;
 
+/// Composite-pass root constants: the sky's 9 SH rows as float4 (the cbuffer
+/// declares `float4 sky_sh[9]`, so HLSL's 16-byte row stride is the layout —
+/// a float3 array would pad to the same 4 DWORDs per row while inviting the
+/// straddle bug that shipped once here), then rw and rh.
+const COMP_CONSTS: u32 = 4 * crate::sh::N as u32 + 2;
+
 pub struct FsrResources {
     pub max_w: u32, // input plane allocation size (range max)
     pub max_h: u32,
@@ -158,14 +164,17 @@ impl FsrResources {
         )?;
         let planes: [Plane; N_PLANES] = planes.try_into().map_err(|_| "plane count".to_string())?;
 
-        // Composite pass: table of 7 SRVs + 1 UAV, five root constants
-        // (rw, rh, AMBIENT.rgb — the constant the AO signal remodulates by,
-        // single-sourced from shade::AMBIENT; the composite shader has no
-        // shade.hlsli prelude to read it from).
+        // Composite pass: table of 8 SRVs + 1 UAV, and COMP_CONSTS root
+        // constants (the sky's 9 SH rows, then rw/rh).
+        //
+        // The AO signal's remodulation factor used to be one float3 here
+        // (shade::AMBIENT). The one sky makes it directional — sky_sh.irradiance
+        // at the pixel's normal — so the pass reads the NORMALS plane (the 8th
+        // SRV) and carries the sky itself in its constants.
         let ranges = [
             D3D12_DESCRIPTOR_RANGE {
                 RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
-                NumDescriptors: 7,
+                NumDescriptors: 8,
                 BaseShaderRegister: 0,
                 ..Default::default()
             },
@@ -173,7 +182,7 @@ impl FsrResources {
                 RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
                 NumDescriptors: 1,
                 BaseShaderRegister: 0,
-                OffsetInDescriptorsFromTableStart: 7,
+                OffsetInDescriptorsFromTableStart: 8,
                 ..Default::default()
             },
         ];
@@ -194,7 +203,7 @@ impl FsrResources {
                     Constants: D3D12_ROOT_CONSTANTS {
                         ShaderRegister: 0,
                         RegisterSpace: 0,
-                        Num32BitValues: 5,
+                        Num32BitValues: COMP_CONSTS,
                     },
                 },
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
@@ -220,7 +229,14 @@ impl FsrResources {
         }
         .map_err(|e| format!("fsr composite root sig: {e}"))?;
 
-        let cs = tonemap::compile(COMPOSITE_HLSL, s!("cs"), s!("cs_5_0"), "fsr_composite")?;
+        // sh.hlsli (the SH evaluator) and fsr_wire.hlsli (the octahedral wire
+        // encoding) are the SHARED halves — the tracer's kernels and feed.hlsl
+        // paste the same two. This pass has no shade.hlsli prelude, but it must
+        // not therefore own private copies of either: the composite identity is
+        // precisely the claim that it and feed.hlsl agree.
+        let comp_src =
+            [super::trace::SH_HLSLI, super::trace::FSR_WIRE_HLSLI, COMPOSITE_HLSL].join("\n");
+        let cs = tonemap::compile(&comp_src, s!("cs"), s!("cs_5_0"), "fsr_composite")?;
         let pso_desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: unsafe { std::mem::transmute_copy(&comp_root) },
             CS: D3D12_SHADER_BYTECODE {
@@ -235,7 +251,7 @@ impl FsrResources {
         let comp_heap: ID3D12DescriptorHeap = unsafe {
             device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                NumDescriptors: 8,
+                NumDescriptors: 9,
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                 ..Default::default()
             })
@@ -255,7 +271,10 @@ impl FsrResources {
             };
             unsafe { device.CreateShaderResourceView(res, Some(&desc), at(i)) };
         };
-        // t0..t6 in fsr_composite.hlsl's declaration order.
+        // t0..t7 in fsr_composite.hlsl's declaration order. t7 (the normals
+        // plane) is the AO signal's remodulation input — the pass rebuilds
+        // sky_sh.irradiance(n) from it, which is why the split site had to
+        // subtract the factor at the WIRE normal (fsr::wire_normal).
         srv(&dd_out, DXGI_FORMAT_R16G16B16A16_FLOAT, 0);
         srv(&ds_out, DXGI_FORMAT_R16G16B16A16_FLOAT, 1);
         srv(&planes[P_DIFF_ALB].tex, DXGI_FORMAT_R8G8B8A8_UNORM, 2);
@@ -263,12 +282,13 @@ impl FsrResources {
         srv(&planes[P_RESIDUAL].tex, DXGI_FORMAT_R16G16B16A16_FLOAT, 4);
         srv(&ao_out, DXGI_FORMAT_R16_FLOAT, 5);
         srv(&is_out, DXGI_FORMAT_R16G16B16A16_FLOAT, 6);
+        srv(&planes[P_NORMALS].tex, DXGI_FORMAT_R10G10B10A2_UNORM, 7);
         let uav_desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
             ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
             ..Default::default()
         };
-        unsafe { device.CreateUnorderedAccessView(&composite, None, Some(&uav_desc), at(7)) };
+        unsafe { device.CreateUnorderedAccessView(&composite, None, Some(&uav_desc), at(8)) };
 
         Ok(Self {
             max_w,
@@ -544,6 +564,14 @@ impl FsrResources {
         .map(|p| (&self.planes[p].tex, self.planes[p].format))
     }
 
+    /// The frame-generation prepare's inputs: (reversed-Z clip depth, the MV
+    /// plane). This plane's RG carries UV deltas (prev − cur), so the
+    /// prepare's mv_scale is (rw, rh) — the same conversion the upscale desc
+    /// applies for this flavor.
+    pub fn fg_inputs(&self) -> (&ID3D12Resource, &ID3D12Resource) {
+        (&self.planes[P_DEPTH_CLIP].tex, &self.planes[P_MVEC].tex)
+    }
+
     fn shim(res: &ID3D12Resource, state: u32) -> FfxShimRes {
         FfxShimRes { resource: res.as_raw(), state }
     }
@@ -687,7 +715,13 @@ impl FsrResources {
     /// Binds everything from scratch (heap, root sig, PSO) — this doubles as
     /// the state restore after the ffx dispatch, same rationale as
     /// `Passes::record`.
-    pub fn record_composite(&self, list: &ID3D12GraphicsCommandList, rw: u32, rh: u32) {
+    pub fn record_composite(
+        &self,
+        list: &ID3D12GraphicsCommandList,
+        rw: u32,
+        rh: u32,
+        sky_sh: &crate::sh::Sh9,
+    ) {
         let _ev = super::pix::scope(list, c"fsr-composite");
         unsafe {
             list.ResourceBarrier(&[transition(
@@ -699,17 +733,21 @@ impl FsrResources {
             list.SetComputeRootSignature(&self.comp_root);
             list.SetPipelineState(&self.comp_pso);
             list.SetComputeRootDescriptorTable(0, self.comp_heap.GetGPUDescriptorHandleForHeapStart());
-            // DWORD order is fsr_composite.hlsl's cbuffer layout, which leads
-            // with the float3 so the block packs contiguously: ambient.xyz |
-            // rw | rh. AMBIENT is the AO signal's remodulation factor
-            // (shade::AMBIENT — the split subtracted exactly this product, so
-            // the shader must add back exactly this one).
-            let amb = crate::shade::AMBIENT;
-            for (k, v) in [amb.x, amb.y, amb.z].into_iter().enumerate() {
-                list.SetComputeRoot32BitConstant(1, v.to_bits(), k as u32);
+            // DWORD order is fsr_composite.hlsl's cbuffer layout, which LEADS
+            // with the float4 array so the block packs contiguously:
+            // sky_sh[0..9] (4 DWORDs each, .w unused) | rw | rh. The sky is the
+            // AO signal's remodulation factor — the split subtracted
+            // irradiance(n_wire)*ao*kd, so the shader must add back exactly
+            // that, which means it needs these coefficients and the normals
+            // plane, not a constant.
+            for (i, c) in sky_sh.c.iter().enumerate() {
+                let base = (i * 4) as u32;
+                for (k, v) in [c.x, c.y, c.z, 0.0].into_iter().enumerate() {
+                    list.SetComputeRoot32BitConstant(1, v.to_bits(), base + k as u32);
+                }
             }
-            list.SetComputeRoot32BitConstant(1, rw, 3);
-            list.SetComputeRoot32BitConstant(1, rh, 4);
+            list.SetComputeRoot32BitConstant(1, rw, COMP_CONSTS - 2);
+            list.SetComputeRoot32BitConstant(1, rh, COMP_CONSTS - 1);
             list.Dispatch(rw.div_ceil(8), rh.div_ceil(8), 1);
             list.ResourceBarrier(&[transition(
                 &self.composite,

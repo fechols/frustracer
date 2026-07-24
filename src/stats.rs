@@ -61,11 +61,6 @@ pub struct Stats {
     pub hemi_share_groups: AtomicU64,
     pub hemi_share_points: AtomicU64,
     pub hemi_share_fallback: AtomicU64,
-    /// Light-shaft subrect bound queries and their node visits.
-    pub shaft_queries: AtomicU64,
-    pub shaft_nodes: AtomicU64,
-    /// Shadow rays skipped because the shaft proved the subrect unoccluded.
-    pub shaft_rays_skipped: AtomicU64,
     /// Adaptive-rate cells (XeSS mode): shared-visibility, per-pixel, and
     /// supersampled tiers; edge pixels that didn't form a full cell.
     pub adapt_coarse: AtomicU64,
@@ -127,9 +122,6 @@ pub struct LocalStats {
     pub hemi_share_groups: u64,
     pub hemi_share_points: u64,
     pub hemi_share_fallback: u64,
-    pub shaft_queries: u64,
-    pub shaft_nodes: u64,
-    pub shaft_rays_skipped: u64,
     pub adapt_coarse: u64,
     pub adapt_base: u64,
     pub adapt_hot: u64,
@@ -181,9 +173,6 @@ impl LocalStats {
         self.hemi_share_groups += o.hemi_share_groups;
         self.hemi_share_points += o.hemi_share_points;
         self.hemi_share_fallback += o.hemi_share_fallback;
-        self.shaft_queries += o.shaft_queries;
-        self.shaft_nodes += o.shaft_nodes;
-        self.shaft_rays_skipped += o.shaft_rays_skipped;
         self.adapt_coarse += o.adapt_coarse;
         self.adapt_base += o.adapt_base;
         self.adapt_hot += o.adapt_hot;
@@ -234,9 +223,6 @@ impl Stats {
         self.hemi_share_groups.store(0, Relaxed);
         self.hemi_share_points.store(0, Relaxed);
         self.hemi_share_fallback.store(0, Relaxed);
-        self.shaft_queries.store(0, Relaxed);
-        self.shaft_nodes.store(0, Relaxed);
-        self.shaft_rays_skipped.store(0, Relaxed);
         self.adapt_coarse.store(0, Relaxed);
         self.adapt_base.store(0, Relaxed);
         self.adapt_hot.store(0, Relaxed);
@@ -351,15 +337,6 @@ impl Stats {
         if l.hemi_share_fallback > 0 {
             self.hemi_share_fallback.fetch_add(l.hemi_share_fallback, Relaxed);
         }
-        if l.shaft_queries > 0 {
-            self.shaft_queries.fetch_add(l.shaft_queries, Relaxed);
-        }
-        if l.shaft_nodes > 0 {
-            self.shaft_nodes.fetch_add(l.shaft_nodes, Relaxed);
-        }
-        if l.shaft_rays_skipped > 0 {
-            self.shaft_rays_skipped.fetch_add(l.shaft_rays_skipped, Relaxed);
-        }
         if l.adapt_coarse > 0 {
             self.adapt_coarse.fetch_add(l.adapt_coarse, Relaxed);
         }
@@ -449,16 +426,6 @@ impl Stats {
         } else {
             String::new()
         };
-        let sq = self.shaft_queries.load(Relaxed);
-        let shaft = if sq > 0 {
-            format!(
-                " | shaft: q {sq} skip {} nodes {}",
-                self.shaft_rays_skipped.load(Relaxed),
-                self.shaft_nodes.load(Relaxed),
-            )
-        } else {
-            String::new()
-        };
         let adopts = self.temporal_cut_adopts.load(Relaxed);
         let adopt = if adopts > 0 {
             format!(
@@ -512,7 +479,7 @@ impl Stats {
             String::new()
         };
         format!(
-            "tiles {tiles} | fr-queries {fq} (blocked {blocked}) | cut mean {cut_mean:.1} (ovf {ovf}) | nodes: frustum {fnodes} + ray {rnodes} = {} | rays: {prim} prim + {sec} sec | sky-px (0 rays) {sky} | coarse-px {coarse} (smp {csmp}) | temporal: seeds {tseeds} sky {tsky} cells {ttests} | mean t_start/t_hit {skip:.2}{adopt}{tring}{replay}{hemi}{share}{shaft}{adapt}{defer}",
+            "tiles {tiles} | fr-queries {fq} (blocked {blocked}) | cut mean {cut_mean:.1} (ovf {ovf}) | nodes: frustum {fnodes} + ray {rnodes} = {} | rays: {prim} prim + {sec} sec | sky-px (0 rays) {sky} | coarse-px {coarse} (smp {csmp}) | temporal: seeds {tseeds} sky {tsky} cells {ttests} | mean t_start/t_hit {skip:.2}{adopt}{tring}{replay}{hemi}{share}{adapt}{defer}",
             fnodes + rnodes
         )
     }

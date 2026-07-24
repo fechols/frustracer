@@ -33,7 +33,7 @@ StructuredBuffer<uint>   tri_mat   : register(t5);
 // scene.rs::NO_TEX — "no map" sentinel for the texture-index fields.
 #define TEX_NONE 0xffffffffu
 
-// Mirrors trace.rs::GpuMat field-for-field (80 B) — a stride skew reads
+// Mirrors trace.rs::GpuMat field-for-field (100 B) — a stride skew reads
 // garbage; the two must move in the same commit.
 struct Mat {
     float3 albedo;
@@ -52,15 +52,27 @@ struct Mat {
     uint metal_tex;    // metallic map, samples .b
     uint emissive_tex; // emissive map (sRGB SRV)
     float normal_scale;
+    float3 trans_tint; // transmission/absorption tint; sentinel .x < 0 = "use albedo"
+    float ior;         // Snell/Fresnel IOR (default 1.5; water 1.33)
+    float ripple_amp;  // water ripple slope amplitude (0 = none)
 };
 StructuredBuffer<Mat> materials : register(t6);
 
-// shade.rs's glassware constants: fixed IOR (the classifier's `transmission`
-// scalar carries all the variation) and the interface budget for the
-// refraction chain (front/back walls of a two-walled tumbler, no TIR
-// detour). Past the budget, glass shades opaque.
+// Material::trans_tint_or — the ONE tint source (per-interface glass tint,
+// Beer–Lambert, shadow tint): trans_tint when set, else albedo verbatim.
+float3 trans_tint_or(Mat m, float3 albedo) {
+    return m.trans_tint.x >= 0.0 ? m.trans_tint : albedo;
+}
+
+// shade.rs's glassware constants: the interface budget for the refraction
+// chain (front/back walls of a two-walled tumbler, no TIR detour). Past the
+// budget, glass shades opaque. IOR now rides mat.ior (default 1.5; water
+// 1.33) — GLASS_IOR stays only as the documented default.
 #define GLASS_IOR 1.5
 #define TRANS_MAX_DEPTH 4u
+// shade.rs::TRANS_DEPTH_K — the Beer–Lambert reference depth (relative to
+// SCENE_DIAG) at which transmitted light is tinted to exactly the albedo.
+#define TRANS_DEPTH_K 0.015
 
 // --- shade.rs helper ports ----------------------------------------------------
 
@@ -311,6 +323,69 @@ float3 perturb_normal(float3 n, Mat mat, float2 uv, TexFilt filt,
     return outn;
 }
 
+// shade.rs::ripple_grad / ripple_normal — the procedural water ripple field,
+// a sum of 3 directional sinusoid gradients (an integrable field ⇒ a
+// consistent virtual heightfield). Constants are LITERALS matching shade.rs,
+// so this is identical by construction (only cos ulps differ). Pure ALU, no
+// rng. Animated on CLOUD_TIME; every length SCENE_DIAG-relative.
+static const float2 RIPPLE_DIR[3] = {
+    float2(0.932, 0.362), float2(-0.588, 0.809), float2(0.259, -0.966)
+};
+static const float3 RIPPLE_LAMBDA_K = float3(5.2e-3, 2.9e-3, 1.6e-3);
+static const float3 RIPPLE_W = float3(2.1, 3.4, 4.9);
+static const float3 RIPPLE_A = float3(0.45, 0.32, 0.23);
+
+float2 ripple_grad(float3 p, float t, float diag) {
+    float2 g = float2(0.0, 0.0);
+    float2 pxz = float2(p.x, p.z);
+    [unroll]
+    for (int i = 0; i < 3; i++) {
+        float ph = TAU * (dot(RIPPLE_DIR[i], pxz) / (RIPPLE_LAMBDA_K[i] * diag)) - RIPPLE_W[i] * t;
+        g += RIPPLE_DIR[i] * (RIPPLE_A[i] * cos(ph));
+    }
+    return g;
+}
+
+// Tilt `base` by the ripple slope (× amp), unit on the +n side; a
+// degenerate/below-horizon result falls back to base. `n` is the geometric
+// normal (horizon guard + projection axis).
+float3 ripple_normal(float3 base, float3 n, float3 p, float t, float amp, float diag) {
+    if (amp == 0.0) return base; // off state: no re-normalize (unit base drift)
+    float2 g = ripple_grad(p, t, diag) * amp;
+    float3 g3 = float3(g.x, 0.0, g.y);
+    float3 gt = g3 - n * dot(g3, n);
+    float3 outn = normalize_or_zero(base - gt);
+    if (all(outn == float3(0.0, 0.0, 0.0)) || dot(outn, n) <= 0.0) return base;
+    return outn;
+}
+
+// shade.rs's `snell` closure — one Snell/Fresnel evaluation over axis `ns`.
+// Refraction and the reflected-fraction Fresnel ride `ns`; the eps offsets
+// ride the GEOMETRIC n. Returns (tdir, torig, ttw, is_tir) via out params.
+void glass_snell(float3 rd, float3 v, float3 ns, float3 n, float3 hit_p,
+                 float eta, float transmission, out float3 tdir, out float3 torig,
+                 out float ttw, out bool is_tir) {
+    float cos_i = max(dot(v, ns), 1e-4);
+    float k = 1.0 - eta * eta * (1.0 - cos_i * cos_i);
+    if (k >= 0.0) {
+        // Exact unpolarized dielectric Fresnel (not Schlick — it must reach 1
+        // as k -> 0 or the TIR handoff pops).
+        float cos_t = sqrt(k);
+        float rs = (eta * cos_i - cos_t) / (eta * cos_i + cos_t);
+        float rp = (cos_i - eta * cos_t) / (cos_i + eta * cos_t);
+        float fr = 0.5 * (rs * rs + rp * rp);
+        tdir = normalize(rd * eta + ns * (eta * cos_i - cos_t));
+        torig = hit_p - n * SCENE_EPS;
+        ttw = transmission * (1.0 - fr);
+        is_tir = false;
+    } else {
+        tdir = rd + ns * (2.0 * cos_i);
+        torig = hit_p + n * SCENE_EPS;
+        ttw = transmission;
+        is_tir = true;
+    }
+}
+
 // --- The shade() port ----------------------------------------------------------
 
 // Whitted shading of a committed primary hit, reflection bounce included.
@@ -328,9 +403,14 @@ float3 perturb_normal(float3 n, Mat mat, float2 uv, TexFilt filt,
 // `aniso`: may THIS ray's footprint be resolved anisotropically (the CPU's
 // Cone::aniso > 1)? Primary/reflection/glass laps yes, hemi-GI bounce laps no
 // (their cone is octant-coarse by design). Gated by FLAG_ANISO on top.
+// `fireflies`: may the PRIMARY surface (lap 0) take firefly point light
+// (the CPU's `ff: Option<&Fireflies>` — Some only on the camera path)?
+// Camera laps yes, hemi bounce laps no — like emissive, fireflies never
+// light bounce surfaces. FLAG_FIREFLIES (count > 0) gates on top, so day
+// kernels are bit-identical whatever the call site passes.
 float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                    uint n_shadow, uint n_ao, bool refl, bool split_ambient,
-                   float cone_w0, float cone_spread, bool aniso,
+                   float cone_w0, float cone_spread, bool aniso, bool fireflies,
                    out float3 amb_w, out float3 amb_o, out float3 amb_n,
                    out PrimSurf prim) {
     amb_w = 0.0;
@@ -417,6 +497,12 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
         if (mat.normal_tex != TEX_NONE && has_basis) {
             n_s = perturb_normal(n, mat, map_uv, filt, tu, tv);
         }
+        // Water ripples tilt the SHADING normal on the shared cloud clock
+        // (pure ALU, no rng). Composes on the normal map; geometric n
+        // untouched. Off (ripple_amp 0) leaves n_s exactly as selected.
+        if (mat.ripple_amp > 0.0) {
+            n_s = ripple_normal(n_s, n, ro + rd * hit.t, CLOUD_TIME, mat.ripple_amp, SCENE_DIAG);
+        }
         if (lap == 0u) {
             // shade.rs — spec_t stays 0 unless the lap-0 reflection below
             // traces (hit t / INF on miss).
@@ -454,19 +540,26 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
         // Charlie-sheen inverse alpha, hoisted like the CPU.
         float sheen_inv_a = 1.0 / clamp(rough_eff, 0.07, 1.0);
 
-        // Direct light: N area-light samples, Lambert (1/pi omitted by
-        // convention) + Cook-Torrance GGX with the compensating pi.
+        // Will the VNDF reflection ray actually be traced? MIS partitions ONE
+        // integral between TWO strategies, so the light-sampled specular may
+        // only be down-weighted if the BSDF-sampled half really runs — else
+        // `w_l` deletes energy nobody else delivers (shade.rs::refl_ray, same
+        // expression, same FLAT roughness/metallic). False for the low preset
+        // and at every depth > 0.
+        bool refl_ray = (depth == 0u && refl && (mat.metallic > 0.04 || mat.roughness < 0.45));
+
+        // Direct light: N cone samples toward the SUN DISC at infinity (no
+        // position, no 1/d^2 — sky.rs). Lambert (1/pi omitted by convention,
+        // absorbed into sun_e = irradiance/pi) + Cook-Torrance GGX with the
+        // compensating pi.
         float3 direct_d = 0.0;
         float3 direct_s = 0.0;
         float3 direct_t = 0.0; // thin-surface back transmission (foliage)
         for (uint si = 0u; si < n_shadow; ++si) {
-            float su = rng_next(rng) * 2.0 - 1.0;
-            float sv = rng_next(rng) * 2.0 - 1.0;
-            float3 lp = light_center.xyz + light_u.xyz * su + light_v.xyz * sv;
-            float3 lv = lp - p;
-            float dist2 = dot(lv, lv);
-            float dist = sqrt(dist2);
-            float3 wi = lv / dist;
+            // The SAME two draws, in the same order, the rect sampling consumed.
+            float su = rng_next(rng);
+            float sv = rng_next(rng);
+            float3 wi = sun_sample_dir(su, sv);
             // N·L against the SHADING normal; the shadow/translucency ray
             // geometry stays on the geometric n (shade.rs).
             float ndl = dot(n_s, wi);
@@ -476,14 +569,23 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                 // transmitted side (p - 2*eps*n = hit - n*eps). The rng
                 // draws above already happened — order matches the CPU.
                 if (mat.translucency > 0.0 && ndl < 0.0) {
-                    if (!occluded_q(p - n * (2.0 * SCENE_EPS), wi, 0.0, dist - SCENE_EPS)) {
-                        direct_t += light_color.xyz * ((-ndl) / dist2);
+                    // transmit_q (shade.rs's tinted-shadows twin): the back
+                    // ray carries a tint through glass; ONE when clear, so
+                    // `x * 1.0` keeps opaque scenes bitwise.
+                    float3 back_vis = transmit_q(p - n * (2.0 * SCENE_EPS), wi, 0.0, INF);
+                    if (any(back_vis != 0.0)) {
+                        direct_t += sun_e.xyz * (-ndl) * back_vis;
                     }
                 }
                 continue;
             }
-            if (!occluded_q(p, wi, 0.0, dist - SCENE_EPS)) {
-                float3 li = light_color.xyz * (ndl / dist2);
+            // tmax = INF: the sun is at infinity, so anything along the ray
+            // occludes it. transmit_q: the sun ray carries a tint through
+            // glass (tinted shadows); the throughput rides `li`, so the
+            // GGX/sheen terms inherit it componentwise (shade.rs).
+            float3 vis_t = transmit_q(p, wi, 0.0, INF);
+            if (any(vis_t != 0.0)) {
+                float3 li = sun_e.xyz * ndl * vis_t;
                 direct_d += li;
                 float3 h = normalize_or_zero(wi + v);
                 float3 hl = float3(dot(h, t1), dot(h, t2), dot(h, n_s));
@@ -492,7 +594,18 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                     float3 wil = float3(dot(wi, t1), dot(wi, t2), dot(wi, n_s));
                     float g2 = 1.0 / (1.0 + lambda_v + ggx_lambda(wil, ax, ay));
                     float3 f = schlick(f0, max(dot(wi, h), 0.0));
-                    direct_s += li * f * (PI * dn * g2 / (4.0 * vl.z * ndl));
+                    // MIS (balance heuristic) against the VNDF reflection ray,
+                    // which can also land in the disc — sky::mis_weight. The
+                    // VNDF pdf is G1(v)*D(h)/(4*n.v), G1 = 1/(1 + lambda_v).
+                    // ONLY when that ray is traced: with no BSDF strategy in
+                    // play there is nothing to share the integral with, and
+                    // weighting down would simply lose the highlight.
+                    float w_l = 1.0;
+                    if (refl_ray) {
+                        float p_b = dn / (4.0 * (1.0 + lambda_v) * max(vl.z, 1e-6));
+                        w_l = 1.0 - sky_mis_weight(p_b, sky_light_pdf());
+                    }
+                    direct_s += li * f * (PI * dn * g2 * w_l / (4.0 * vl.z * ndl));
                     if (mat.sheen > 0.0) {
                         // Charlie NDF + Ashikhmin visibility (shade.rs).
                         float sin2 = max(1.0 - hl.z * hl.z, 0.0);
@@ -507,6 +620,62 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
             direct_d /= float(n_shadow);
             direct_s /= float(n_shadow);
             direct_t /= float(n_shadow);
+        }
+        // Cloud shadow (shade.rs, same insertion point): ONE transmittance
+        // toward the sun per lap, scaling the whole direct sun contribution —
+        // applied BEFORE the lap-0 prim export so the FSR dd/ds signals carry
+        // it. The guard is FLAG_CLOUDS (inside the helper) and the unshadowed
+        // arm's exact 1.0, so clouds-off stays bit-identical.
+        if (flags & FLAG_CLOUDS) {
+            float cloud_t = cloud_sun_transmittance(p);
+            direct_d *= cloud_t;
+            direct_s *= cloud_t;
+            direct_t *= cloud_t;
+        }
+        // Firefly point lights (shade.rs, same insertion point): AFTER the
+        // cloud scaling (a firefly is a local light under the slab) and
+        // BEFORE the lap-0 prim export (the light rides FSR-RR's denoised
+        // dd/ds lobes). Lap 0 only — the CPU recursion passes ff = None.
+        // ZERO rng draws: deterministic iteration, one HARD shadow ray per
+        // in-radius firefly, finite tmax (stop 2·eps short of the light
+        // point). `w_l = 1` on the specular — a point light has zero solid
+        // angle, so the VNDF ray can never deliver it; MIS does not apply.
+        if (fireflies && lap == 0u && (flags & FLAG_FIREFLIES)) {
+            float r_inf = FF_RADIUS_K * ff_scale;
+            float ff_r2 = r_inf * r_inf;
+            float ff_rmin2 = (FF_RMIN_K * ff_scale) * (FF_RMIN_K * ff_scale);
+            for (uint fi = 0u; fi < ff_count; ++fi) {
+                float3 fto = ff[fi].xyz - p;
+                float fd2 = dot(fto, fto);
+                // The rejection test — a far firefly's only cost.
+                if (fd2 >= ff_r2) continue;
+                float fdist = sqrt(fd2);
+                float3 fwi = fto / fdist;
+                float fndl = dot(n_s, fwi);
+                if (fndl <= 0.0) continue;
+                // Windowed 1/d² (fireflies.rs::irradiance — exactly 0 at the
+                // radius, C¹ there, near-field clamped under the f16 ceiling).
+                float fx = 1.0 - fd2 / ff_r2;
+                float fe = FF_E_K * ff_scale * ff_scale * ff[fi].w
+                           / max(fd2, ff_rmin2) * (fx * fx);
+                if (fe <= 0.0) continue;
+                float3 fvis = transmit_q(p, fwi, 0.0, max(fdist - 2.0 * SCENE_EPS, 0.0));
+                if (all(fvis == 0.0))
+                    continue;
+                float3 fli = FF_COLOR * (fe * fndl) * fvis;
+                direct_d += fli;
+                float3 fh = normalize_or_zero(fwi + v);
+                float3 fhl = float3(dot(fh, t1), dot(fh, t2), dot(fh, n_s));
+                if (fhl.z > 0.0) {
+                    float fdn = ggx_ndf(fhl, ax, ay);
+                    float3 fwil = float3(dot(fwi, t1), dot(fwi, t2), dot(fwi, n_s));
+                    float fg2 = 1.0 / (1.0 + lambda_v + ggx_lambda(fwil, ax, ay));
+                    float3 ffr = schlick(f0, max(dot(fwi, fh), 0.0));
+                    // fli carries ndl; D·G2·F/(4·nv·nl)·nl leaves /(4·nv) —
+                    // the sun loop's exact term shape, at full weight.
+                    direct_s += fli * ffr * (PI * fdn * fg2 / (4.0 * vl.z * fndl));
+                }
+            }
         }
         if (lap == 0u) {
             // shade.rs's post-average lobe export (the FSR-RR signal split
@@ -534,26 +703,44 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
             total += c;
             if (in_refl) prim.ind_s += c;
             amb_w = tput * kd * kt;
+            // fb_mode 1 (AO) scales the SKY's irradiance by an openness
+            // scalar, so the sky term folds into the weight HERE, where n_s is
+            // in scope — compose has no normal. fb_mode 2 (GI) integrates the
+            // sky itself and must NOT be pre-multiplied by it (that would
+            // square the sky). See compose.hlsl.
+            if (fb_mode == 1u) amb_w *= sh_irradiance(n_s);
             amb_o = p;
             amb_n = n;
         } else {
-            // Sampled AO modulating the constant ambient.
+            // Sampled AO modulating the sky's own irradiance (sh.rs::Sh9 —
+            // shade.rs's `sky_sh.irradiance(n_s) * ao`). The SHADING normal:
+            // ambient is a BRDF-side quantity, while the AO ray directions
+            // below keep the GEOMETRIC n (visibility), per the n_g/n_s split.
             float ao = 1.0;
             if (n_ao > 0u) {
                 float3 at1, at2;
                 onb(n, at1, at2);
-                uint open = 0u;
+                float open = 0.0;
                 for (uint ai = 0u; ai < n_ao; ++ai) {
                     float r1 = rng_next(rng);
                     float r2 = rng_next(rng);
-                    if (!occluded_q(p, cosine_dir(n, at1, at2, r1, r2), 0.0, AO_RADIUS)) open++;
+                    // Mean-of-components (shade.rs): the AO plane is a
+                    // SCALAR, so a glass throughput folds to gray. The true
+                    // divide keeps 3.0/3.0 == 1.0 and 0.0/3.0 == 0.0 exact —
+                    // opaque scenes accumulate the old integer counts
+                    // bit-identically.
+                    float3 tp = transmit_q(p, cosine_dir(n, at1, at2, r1, r2), 0.0, AO_RADIUS);
+                    open += (tp.x + tp.y + tp.z) / 3.0;
                 }
-                ao = float(open) / float(n_ao);
+                ao = open / float(n_ao);
             }
             // FSR's AO signal — lap 0 only (later laps compute their own AO
             // for their own ambient; the capture is the PRIMARY surface's).
+            // The factor it remodulates by is no longer a constant: it is the
+            // sky's own SH irradiance at n_s (feed.hlsl / fsr_composite.hlsl
+            // rebuild it from the WIRE normal — see fsr::wire_normal).
             if (lap == 0u) prim.ao = ao;
-            float3 c = tput * (kd * kt * (diffuse_d + AMBIENT * ao) + direct_s);
+            float3 c = tput * (kd * kt * (diffuse_d + sh_irradiance(n_s) * ao) + direct_s);
             total += c;
             if (in_refl) prim.ind_s += c;
         }
@@ -586,8 +773,9 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
 
         // (a) One specular bounce — ROOT only (shade.rs gates depth == 0):
         // GGX VNDF importance sample (Heitz 2018), throughput F*G2/G1 <= 1.
-        // The two rng draws stay conditional on the same gate as the CPU's.
-        if (depth == 0u && refl && (mat.metallic > 0.04 || mat.roughness < 0.45)) {
+        // The two rng draws stay conditional on the same gate as the CPU's —
+        // and it is the SAME `refl_ray` the direct loop's MIS weight consulted.
+        if (refl_ray) {
             float3 vh = normalize(float3(ax * vl.x, ay * vl.y, vl.z));
             float lensq = vh.x * vh.x + vh.y * vh.y;
             float3 b1 =
@@ -625,10 +813,42 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                     nx_in_refl = true; // everything below this is ind_s
                 } else {
                     prim.spec_t = INF; // reflection missed (shade.rs)
-                    // The reflection subtree is just the sky here — still the
-                    // ind_s signal (the CPU's tput * rcol with rcol = sky).
-                    total += rtput * sky_color(rdir);
-                    prim.ind_s += rtput * sky_color(rdir);
+                    // The BSDF-sampling half of the MIS pair. The DOME passes
+                    // through un-weighted (only this strategy sees it); the DISC
+                    // is weighted, because direct_s is also delivering the sun's
+                    // specular. Mirror: w_b ~ 1, this carries the round sun.
+                    // Rough: w_b ~ 0, which is what kills the firefly.
+                    float3 hl_r = float3(dot(h, t1), dot(h, t2), dot(h, n_s));
+                    float p_b_r =
+                        ggx_ndf(hl_r, ax, ay) / (4.0 * (1.0 + lambda_v) * max(vl.z, 1e-6));
+                    float w_b = sky_mis_weight(p_b_r, sky_light_pdf());
+                    // The reflection subtree is just the sky here — so it is
+                    // still the ind_s signal (the CPU's tput * rcol). Stars
+                    // ride un-weighted (BSDF-only delivery, no MIS partner),
+                    // twinkle phase 0 — the CPU's secondary-path convention.
+                    //
+                    // The cloud layer extinguishes this whole backdrop along
+                    // the REFLECTED ray from the hit point (mirrored skies
+                    // show the same clouds), MIS-weighted disc included: the
+                    // BSDF sun rides the march's T, the light-sampled sun
+                    // rides cloud_sun_transmittance — two transmittances of
+                    // one field along near-identical directions, a bracketed
+                    // partition (clouds.rs header; never force one T on both).
+                    float3 dm_r = sky_dome(rdir);
+                    float3 sky_r = dm_r + sky_disc(rdir, cone_spread * 0.5) * w_b
+                        + sky_stars(rdir, cone_spread * 0.5, 0u);
+                    if (flags & FLAG_CLOUDS) {
+                        // The ROUGH march — reflected sky through the GGX
+                        // lobe (clouds_along_rough's cost rationale).
+                        float rct;
+                        float3 rcs;
+                        if (clouds_along_rough(p, rdir, dm_r * CLOUD_AMB_K, rct, rcs)) {
+                            sky_r = sky_r * rct + rcs;
+                        }
+                    }
+                    float3 rc = rtput * sky_r;
+                    total += rc;
+                    prim.ind_s += rc;
                 }
             }
         }
@@ -655,37 +875,44 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                 n_raw = normalize_or_zero(cross(e1, e2));
             }
             bool entering = dot(n_raw, n) >= 0.0; // the viewer-flip didn't fire
-            float eta = entering ? 1.0 / GLASS_IOR : GLASS_IOR;
-            // The refraction chain stays on the GEOMETRIC normal (shade.rs);
-            // v·n with the same grazing guard is bit-identical to the old
-            // n-frame vl.z when no normal map is present.
-            float cos_i = max(dot(v, n), 1e-4);
-            float k = 1.0 - eta * eta * (1.0 - cos_i * cos_i);
+            float eta = entering ? 1.0 / mat.ior : mat.ior;
             float3 hit_p = ro + rd * hit.t;
             float3 tdir, torig;
             float ttw;
-            if (k >= 0.0) {
-                // Exact unpolarized dielectric Fresnel (not Schlick — it
-                // must reach 1 as k -> 0 or the TIR handoff pops).
-                float cos_t = sqrt(k);
-                float rs = (eta * cos_i - cos_t) / (eta * cos_i + cos_t);
-                float rp = (cos_i - eta * cos_t) / (cos_i + eta * cos_t);
-                float fr = 0.5 * (rs * rs + rp * rp);
-                tdir = normalize(rd * eta + n * (eta * cos_i - cos_t));
-                torig = hit_p - n * SCENE_EPS;
-                ttw = mat.transmission * (1.0 - fr);
+            bool is_tir;
+            // Water ripples perturb the Snell axis too (guarded): a refraction
+            // must cross the geometric surface (tdir·n < 0), a TIR mirror stay
+            // on the near side (tdir·n > 0). A ripple that flips the side is
+            // rejected and the arm recomputes on geometric n (which always
+            // passes both). Off (ripple_amp 0) runs geometric-n verbatim.
+            if (mat.ripple_amp > 0.0) {
+                float3 n_snell = ripple_normal(n, n, hit_p, CLOUD_TIME, mat.ripple_amp, SCENE_DIAG);
+                glass_snell(rd, v, n_snell, n, hit_p, eta, mat.transmission, tdir, torig, ttw, is_tir);
+                bool ok = is_tir ? (dot(tdir, n) > 0.0) : (dot(tdir, n) < 0.0);
+                if (!ok) {
+                    glass_snell(rd, v, n, n, hit_p, eta, mat.transmission, tdir, torig, ttw, is_tir);
+                }
             } else {
-                // TIR: mirror about n, staying on the incident side.
-                tdir = rd + n * (2.0 * cos_i);
-                torig = hit_p + n * SCENE_EPS;
-                ttw = mat.transmission;
+                glass_snell(rd, v, n, n, hit_p, eta, mat.transmission, tdir, torig, ttw, is_tir);
             }
             if (ttw > 1e-3) {
-                // Tinted by albedo — the classifier lifts dark MTL glass Kd
-                // toward white so this doesn't go black.
-                float3 t_tput = tput * albedo * ttw;
+                // Tinted by the ONE tint source (trans_tint for water, else
+                // the albedo the classifier lifts toward white).
+                float3 t_tput = tput * trans_tint_or(mat, albedo) * ttw;
                 HitInfo th;
                 if (trace_closest(torig, tdir, 0.0, FLT_MAX, th)) {
+                    // Beer–Lambert over the interior segment (shade.rs's
+                    // depth_attenuation twin — the flattened DFS folds it
+                    // into the child's THROUGHPUT, since the child hit is
+                    // already traced here; same product, different fp
+                    // association, absorbed by the statistical CPU-vs-GPU
+                    // gates). Entering crosses in; TIR (k < 0) stays in; a
+                    // clean exit travels outside. The sky-miss arm below
+                    // stays unattenuated (leaked geometry — CPU parity).
+                    if ((entering || is_tir) && (flags & FLAG_DEPTH_TINT)) {
+                        t_tput *= pow(max(trans_tint_or(mat, albedo), 1e-6),
+                                      th.t / (TRANS_DEPTH_K * SCENE_DIAG));
+                    }
                     if (!next_set) {
                         nx_o = torig;
                         nx_d = tdir;
@@ -708,8 +935,15 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                         have_stash = true;
                     }
                 } else {
-                    total += t_tput * sky_color(tdir);
-                    if (in_refl) prim.ind_s += t_tput * sky_color(tdir);
+                    // The FULL sky, disc included and un-weighted: refraction is
+                    // a near-delta path with no light-sampling partner, so this
+                    // is the only strategy that can deliver the sun through
+                    // glass. Nothing to double-count.
+                    // No pixel in scope — the fixed-midpoint legacy phase
+                    // (the CPU glass miss passes the same 0.5).
+                    float3 tc = t_tput * sky_radiance(torig, tdir, cone_spread * 0.5, 0u, 0.5);
+                    total += tc;
+                    if (in_refl) prim.ind_s += tc;
                 }
             }
         }
@@ -746,5 +980,5 @@ float3 shade_full(float3 ro, float3 rd, HitInfo hit, inout uint rng, out PrimSur
     // Camera rays (and their reflection/glass continuations) resolve their
     // footprint anisotropically when the session asks for it — FLAG_ANISO.
     return shade_split(ro, rd, hit, rng, shadow_samples, ao_samples, reflections != 0u,
-                       false, 0.0, pixel_cone, true, w, o, n, prim);
+                       false, 0.0, pixel_cone, true, true, w, o, n, prim);
 }

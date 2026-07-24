@@ -33,10 +33,16 @@ void cs_reference(uint3 id : SV_DispatchThreadID) {
             t = hit.t;
             if (prim) gbuf_write_hit(pi, sp.x, sp.y, dir, hit.t, ps);
         } else {
-            c = sky_color(dir);
+            // A DISPLAY path: the camera's own miss sees the sun DISC (sky.rs).
+            // Cloud phase per (pixel, frame, SAMPLE) — the leaf kernel's twin.
+            c = sky_radiance(cam_origin.xyz, dir, pixel_cone * 0.5, frame,
+                             cloud_dither_k(id.xy, frame, s, spp));
             t = INF;
             if (prim) gbuf_write_sky(pi, sp.x, sp.y, dir);
         }
+        // Firefly glow — the leaf kernel's composite, term for term (the
+        // same-seed wavefront-vs-reference bit gate rides on that).
+        if (flags & FLAG_FIREFLIES) c += ff_glow(cam_origin.xyz, dir, t, pixel_cone * 0.5);
         csum += c;
         if (prim) {
             tbuf[pi] = t;

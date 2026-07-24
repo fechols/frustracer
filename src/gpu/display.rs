@@ -62,6 +62,20 @@ impl DisplayHdr {
         }
     }
 
+    /// `tone()` for the HDR10/PQ swapchain (the wrapper-FG arm + `--hdr10`).
+    /// Same override doctrine — `--hdr-peak` wins, including over an "HDR off"
+    /// verdict. HDR-off gets the SDR rolloff anchored at paper white
+    /// (`hdr10(paper, paper)` is the degenerate knee-0 curve, PQ-encoded), so
+    /// a `--hdr10` session on an SDR output displays like SDR through DWM's
+    /// own PQ handling rather than blowing highlights.
+    pub fn tone_pq(&self, paper_white: f32, peak_override: Option<f32>) -> ToneParams {
+        match peak_override {
+            Some(peak) => ToneParams::hdr10(paper_white, peak),
+            None if !self.enabled => ToneParams::hdr10(paper_white, paper_white),
+            None => ToneParams::hdr10(paper_white, self.max_nits),
+        }
+    }
+
     fn from_desc(d: &DXGI_OUTPUT_DESC1) -> DisplayHdr {
         // A non-finite luminance would ride straight into `ToneParams::hdr` and
         // come out as a NaN headroom — `NaN <= HDR_KNEE` is false, so the

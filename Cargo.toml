@@ -27,6 +27,20 @@ gltf = { version = "1.4", default-features = false, features = [
     "KHR_materials_unlit",
 ] }
 fastrand = "2"
+# JSON-persisted user settings (src/settings.rs — frustracer-settings.json
+# next to the exe; the pause menu writes it, startup reads it as defaults the
+# CLI overrides). Both were ALREADY in Cargo.lock transitively via gltf, so
+# this adds no new downloads. Base deps, not windows-only: main() loads the
+# file before the parse loop on every platform (headless --check*/--spin runs
+# ignore it — gates stay a pure function of the command line).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# FFT for the Poisson normal→height solve (texture.rs apply_n2h — the
+# Frankot–Chellappa inverse over the wrap-repeat texture domain, where
+# periodic boundary conditions are exact). Pure Rust, no runtime DLL (the
+# --check* DLL-free bar); mixed-radix + Bluestein cover San Miguel's
+# arbitrary/odd texture dims.
+rustfft = "6"
 # f16 bit-pattern storage for the CPU G-buffer planes (dlss.rs ld16/st16) —
 # a base dependency, not windows-only: headless --check reads them too.
 half = "2"
@@ -45,10 +59,30 @@ tracy-client = { version = "0.17.6", optional = true, default-features = false, 
 [features]
 tracy = ["dep:tracy-client"]
 
-# The interactive presentation stack (SDL2 window + D3D12 + Streamline) is
+# The interactive presentation stack (SDL3 window + D3D12 + Streamline) is
 # Windows-only; headless --check/--check-dlss build everywhere without it.
 [target.'cfg(windows)'.dependencies]
-sdl2 = { version = "0.38", features = ["bundled", "static-link", "raw-window-handle"] }
+# The HUD/pause-menu UI (src/hud/): Slint's SOFTWARE renderer only — no
+# winit/femtovg/skia backends compile (default-features off), because the
+# renderer draws into OUR CPU buffer behind a custom slint::platform::Platform
+# and the result is dirty-rect-uploaded onto the D3D12 swapchain
+# (src/gpu/hud.rs). `software-renderer-systemfonts` rasterizes system fonts at
+# runtime, which is what lets the UI live in a slint! macro with no
+# slint-build/pre-rendered-glyph step. Licensing: Slint is triple-licensed
+# (GPLv3 / Royalty-Free / commercial); this project uses it under the
+# Royalty-Free license (https://slint.dev/terms-and-conditions).
+slint = { version = "1", default-features = false, features = [
+    "std",
+    "compat-1-2",
+    "renderer-software",
+    "software-renderer-systemfonts",
+] }
+sdl3 = { version = "0.18", features = ["build-from-source-static", "raw-window-handle"] }
+# Ogg Vorbis decode for the ambience loops (src/audio.rs) — pure Rust, zero
+# unsafe, no runtime DLL (the --check* DLL-free bar; the rustfft precedent).
+# Windows-only because only run_window sessions ever decode audio; core SDL3
+# audio (no `mixer` feature) does the playback.
+lewton = "0.10"
 raw-window-handle = "0.6"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
@@ -79,21 +113,29 @@ cc = "1"
 
 [profile.release]
 lto = "thin"
-codegen-units = 1
+# 16 CGUs, not 1 (adopted 2026-07-23): ThinLTO is DESIGNED for many CGUs —
+# parallel per-unit codegen with cross-unit inlining via summaries — and cgu=1
+# was serializing it into a fat-LTO-shaped single pass. Measured on this tree:
+# one-line-touch rebuild 198 -> 45 s (4.4x), full rebuild 72 s, priced at
+# +1-2% CPU-tracer ms/frame (interleaved 600-frame --spin path medians:
+# default scene 49.01 -> 49.96, san-miguel-low-poly 47.87 -> 48.42).
+# CPU benchmark numbers recorded before this date carry that offset.
+# `codegen-units = 1` is the one-line revert if a measurement ever needs the
+# last 2% back — re-price it with the same interleaved spin A/B if so.
+codegen-units = 16
 # Line tables so samplers (Tracy sampling, PIX timing captures, WPA) can
 # symbolize release frames; no runtime cost.
 debug = "line-tables-only"
 
-# Iteration-only profile: optimized, but without the ThinLTO + single-codegen-unit
-# whole-program pass, which is where a one-line-change rebuild actually spends its
-# time (measured on a one-line touch of main.rs: ~123 s under `release`, ~25 s
-# here — the whole-program pass, not the linker, is the cost).
+# Iteration-only profile: optimized, but without the ThinLTO whole-program pass
+# (measured on a one-line touch of main.rs: ~45 s under `release` at cgu=16,
+# ~25 s here — and ~123 s under the old cgu=1 release).
 #
 # NEVER BENCHMARK UNDER THIS PROFILE. Every performance number this project
 # reports — `--check`'s A/B bench rows, the hemi-share kill criterion ("if
 # share-on is not measurably faster, the feature does not merge"), the adopt
 # on/off regression guards — is only meaningful under `release`'s lto = "thin" +
-# codegen-units = 1. Use `quick` to find compile errors and to exercise the
+# codegen-units = 16. Use `quick` to find compile errors and to exercise the
 # exact-zero correctness gates (which are perf-independent); use `--release` for
 # anything that prints a number.
 [profile.quick]
