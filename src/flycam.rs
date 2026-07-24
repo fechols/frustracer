@@ -364,6 +364,10 @@ fn trigger(t: u8) -> f32 {
     t.saturating_sub(thr) as f32 / (255 - thr) as f32
 }
 
+// NOTE: src/pad.rs is a SECOND XInput reader (main thread, pause-menu edges).
+// Safe because XInputGetState is a stateless read-only snapshot — and while
+// the menu is open this thread's pause gate skips its own poll entirely, so
+// the two never even overlap in that state.
 fn poll_pad(backoff: &mut u32) -> Option<Pad> {
     if *backoff > 0 {
         *backoff -= 1;
