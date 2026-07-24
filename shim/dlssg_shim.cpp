@@ -104,6 +104,74 @@ void copy4x4(float dst[4][4], const float src[16]) {
     std::memcpy(dst, src, sizeof(float) * 16);
 }
 
+// Create s->feature at s's current dims over a shim-owned transient queue
+// (the C ABI takes no command list), submitted + fence-waited before return.
+// FEATURE-scoped by design: touches nothing but s->feature, so
+// frdlssg_recreate (a render-res move) can reuse it MID-SESSION while the
+// in-process Streamline NGX state (params map, sl.dlss_d) stays live.
+// Failure returns the error code and leaves the Ctx intact — the CALLER
+// decides between full teardown (create) and failed-but-alive (recreate).
+int32_t create_feature(Ctx* s) {
+    ID3D12Device*              dev   = s->device;
+    ID3D12CommandQueue*        queue = nullptr;
+    ID3D12CommandAllocator*    alloc = nullptr;
+    ID3D12GraphicsCommandList* cmd   = nullptr;
+    ID3D12Fence*               fence = nullptr;
+    auto cleanup = [&]() {
+        release(fence);
+        release(cmd);
+        release(alloc);
+        release(queue);
+    };
+    auto fail = [&](int32_t code) {
+        cleanup();
+        return code;
+    };
+
+    D3D12_COMMAND_QUEUE_DESC qd{};
+    qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    if (FAILED(dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue))) ||
+        FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc))) ||
+        FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, nullptr,
+                                      IID_PPV_ARGS(&cmd))) ||
+        FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) {
+        std::fprintf(stderr, "[fr-dlssg] warm-up queue/list/fence creation failed\n");
+        return fail(FRDLSSG_ERR_D3D12);
+    }
+
+    NVSDK_NGX_DLSSG_Create_Params cp{};
+    cp.Width                    = s->disp_w;
+    cp.Height                   = s->disp_h;
+    cp.NativeBackbufferFormat   = (unsigned int)DXGI_FORMAT_R16G16B16A16_FLOAT;
+    cp.RenderWidth              = s->rend_w;
+    cp.RenderHeight             = s->rend_h;
+    cp.DynamicResolutionScaling = false;
+
+    NVSDK_NGX_Result create_r =
+        NGX_D3D12_CREATE_DLSSG(cmd, 0, 0, &s->feature, s->params, &cp);
+    if (NVSDK_NGX_FAILED(create_r)) {
+        std::fprintf(stderr,
+            "[fr-dlssg] NGX_D3D12_CREATE_DLSSG failed: 0x%08X (disp=%ux%u rend=%ux%u)\n",
+            (unsigned)create_r, s->disp_w, s->disp_h, s->rend_w, s->rend_h);
+        return fail(FRDLSSG_ERR_UNSUPPORTED);
+    }
+
+    if (FAILED(cmd->Close())) return fail(FRDLSSG_ERR_D3D12);
+    ID3D12CommandList* lists[] = {cmd};
+    queue->ExecuteCommandLists(1, lists);
+    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!event || FAILED(queue->Signal(fence, 1)) ||
+        FAILED(fence->SetEventOnCompletion(1, event))) {
+        if (event) CloseHandle(event);
+        std::fprintf(stderr, "[fr-dlssg] warm-up fence submit failed\n");
+        return fail(FRDLSSG_ERR_D3D12);
+    }
+    WaitForSingleObject(event, INFINITE);
+    CloseHandle(event);
+    cleanup();
+    return FRDLSSG_OK;
+}
+
 }  // namespace
 
 extern "C" int32_t frdlssg_create(void* device_v, uint32_t disp_w, uint32_t disp_h,
@@ -163,68 +231,40 @@ extern "C" int32_t frdlssg_create(void* device_v, uint32_t disp_w, uint32_t disp
         return FRDLSSG_ERR_UNSUPPORTED;
     }
 
-    // The C ABI takes no command list, so the feature's creation work runs on
-    // a shim-owned transient queue, submitted + fence-waited before return.
-    ID3D12CommandQueue*        queue = nullptr;
-    ID3D12CommandAllocator*    alloc = nullptr;
-    ID3D12GraphicsCommandList* cmd   = nullptr;
-    ID3D12Fence*               fence = nullptr;
-    auto cleanup = [&]() {
-        release(fence);
-        release(cmd);
-        release(alloc);
-        release(queue);
-    };
-    auto fail = [&](int32_t code) {
-        cleanup();
+    // The feature's creation work runs on a shim-owned transient queue
+    // inside create_feature (shared with frdlssg_recreate). Initial-create
+    // failures tear the whole Ctx down — nothing else references it yet.
+    int32_t cr = create_feature(s);
+    if (cr != FRDLSSG_OK) {
         frdlssg_destroy(s);
-        return code;
-    };
-
-    D3D12_COMMAND_QUEUE_DESC qd{};
-    qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-    if (FAILED(dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue))) ||
-        FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc))) ||
-        FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, nullptr,
-                                      IID_PPV_ARGS(&cmd))) ||
-        FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) {
-        std::fprintf(stderr, "[fr-dlssg] warm-up queue/list/fence creation failed\n");
-        return fail(FRDLSSG_ERR_D3D12);
+        return cr;
     }
-
-    NVSDK_NGX_DLSSG_Create_Params cp{};
-    cp.Width                    = disp_w;
-    cp.Height                   = disp_h;
-    cp.NativeBackbufferFormat   = (unsigned int)DXGI_FORMAT_R16G16B16A16_FLOAT;
-    cp.RenderWidth              = rend_w;
-    cp.RenderHeight             = rend_h;
-    cp.DynamicResolutionScaling = false;
-
-    NVSDK_NGX_Result create_r =
-        NGX_D3D12_CREATE_DLSSG(cmd, 0, 0, &s->feature, s->params, &cp);
-    if (NVSDK_NGX_FAILED(create_r)) {
-        std::fprintf(stderr,
-            "[fr-dlssg] NGX_D3D12_CREATE_DLSSG failed: 0x%08X (disp=%ux%u rend=%ux%u)\n",
-            (unsigned)create_r, disp_w, disp_h, rend_w, rend_h);
-        return fail(FRDLSSG_ERR_UNSUPPORTED);
-    }
-
-    if (FAILED(cmd->Close())) return fail(FRDLSSG_ERR_D3D12);
-    ID3D12CommandList* lists[] = {cmd};
-    queue->ExecuteCommandLists(1, lists);
-    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (!event || FAILED(queue->Signal(fence, 1)) ||
-        FAILED(fence->SetEventOnCompletion(1, event))) {
-        if (event) CloseHandle(event);
-        std::fprintf(stderr, "[fr-dlssg] warm-up fence submit failed\n");
-        return fail(FRDLSSG_ERR_D3D12);
-    }
-    WaitForSingleObject(event, INFINITE);
-    CloseHandle(event);
-    cleanup();
 
     *out_handle = s;
     return FRDLSSG_OK;
+}
+
+extern "C" int32_t frdlssg_recreate(void* handle, uint32_t rend_w, uint32_t rend_h) {
+    if (!handle || rend_w == 0 || rend_h == 0) return FRDLSSG_ERR_INTERNAL;
+    auto* s = static_cast<Ctx*>(handle);
+    // FEATURE-scoped by contract: ReleaseFeature + CreateFeature at the new
+    // render res, params/init/device untouched. The first attempt at this
+    // used frdlssg_destroy + frdlssg_create — and destroy calls
+    // NVSDK_NGX_D3D12_DestroyParameters on the map GetCapabilityParameters
+    // returned, which in an SL session is SHARED with the in-process
+    // Streamline NGX state: every subsequent sl.dlss_d (RR) evaluate failed
+    // FeatureNotFound (0xBAD00004). Mid-session teardown may release ONLY
+    // what this Ctx exclusively owns — the feature handle. The caller
+    // drains the queue first (in-flight evaluates reference the feature).
+    if (s->feature) {
+        NVSDK_NGX_D3D12_ReleaseFeature(s->feature);
+        s->feature = nullptr;
+    }
+    s->rend_w = rend_w;
+    s->rend_h = rend_h;
+    // Failure leaves the Ctx alive (params/init still serve a later retry or
+    // the session-end destroy); the Rust side marks the session failed-loud.
+    return create_feature(s);
 }
 
 // The Rust twin (gpu/mod.rs::ngxfg) asserts the identical literals.

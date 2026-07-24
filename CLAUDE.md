@@ -618,9 +618,30 @@ cargo run --release -- --fg           # FRAME GENERATION, DLSS family (W4 leg 2)
                                       # mode the levers exist to prevent).
                                       # Reset frames evaluate (to seed history) but
                                       # present real-only (`primed`); the feature is fixed-res
-                                      # (lazy-created at the locked render res; --lock-res
-                                      # dynamic skips FG with a note; resize destroys +
-                                      # lazy-recreates). Known-accepts: HUD interpolated with
+                                      # by creation (lazy-created at the frame's render res)
+                                      # but FOLLOWS a render-res MOVE: a moved res that HOLDS
+                                      # FG_RECREATE_STABLE=8 consecutive dispatches drains the
+                                      # queue and FEATURE-SCOPE-recreates at it
+                                      # (shim frdlssg_recreate: ReleaseFeature + CreateFeature
+                                      # ONLY, then the guide planes re-ensure) — so FG survives
+                                      # SPACE/F mode cycles (the CPU arm's quality-2/3 res vs
+                                      # the GPU arms' native; the CPU renderer fills the same
+                                      # MV/depth/guide planes, so CPU-rendered frames generate
+                                      # too — the XeSS-FG composes-with---cpu precedent).
+                                      # TRAP 8, measured: the recreate must NEVER route through
+                                      # frdlssg_destroy mid-session — destroy calls
+                                      # DestroyParameters on the GetCapabilityParameters map,
+                                      # which an SL session SHARES with the in-process
+                                      # Streamline NGX state, and every subsequent sl.dlss_d
+                                      # (RR) evaluate then fails 0xBAD00004 FeatureNotFound
+                                      # (the resize path masks this only because it rebuilds
+                                      # the RR context too; destroy stays session-end/resize-
+                                      # only). A --lock-res dynamic RAMP changes res per
+                                      # frame, never qualifies, and skips with a note (the
+                                      # recreate-storm guard; a completed DRS step holds the
+                                      # 90-frame dwell = one recreate per adoption); resize
+                                      # destroys + lazy-recreates as before. Known-accepts: HUD
+                                      # interpolated with
                                       # the frame (pHudless/pUI null); latency +~half frame
                                       # (the interpolation cost, W5 owns measurement).
                                       # (B) STREAMLINE DLSS-G — the fallback when built

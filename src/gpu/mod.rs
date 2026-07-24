@@ -293,6 +293,11 @@ mod ngxfg {
             out_handle: *mut *mut c_void,
         ) -> i32;
         pub fn frdlssg_dispatch(handle: *mut c_void, d: *const FrDlssgDispatch) -> i32;
+        /// FEATURE-scoped res move: ReleaseFeature + CreateFeature at the new
+        /// render res — params/init untouched (destroy's DestroyParameters
+        /// killed the SHARED SL NGX parameter map mid-session and every
+        /// subsequent sl.dlss_d evaluate failed 0xBAD00004 FeatureNotFound).
+        pub fn frdlssg_recreate(handle: *mut c_void, rend_w: u32, rend_h: u32) -> i32;
         pub fn frdlssg_destroy(handle: *mut c_void);
     }
 
@@ -318,8 +323,21 @@ mod ngxfg {
     }
     #[cfg(not(dlssg_ngx))]
     #[allow(clippy::missing_safety_doc)]
+    pub unsafe fn frdlssg_recreate(_h: *mut c_void, _rw: u32, _rh: u32) -> i32 {
+        ERR_UNSUPPORTED
+    }
+    #[cfg(not(dlssg_ngx))]
+    #[allow(clippy::missing_safety_doc)]
     pub unsafe fn frdlssg_destroy(_h: *mut c_void) {}
 }
+
+/// How many consecutive FG dispatches a MOVED render res must hold before
+/// the NGX feature recreates at it. The feature is fixed-res by creation, so
+/// following a res move costs a feature release + re-create (queue drain
+/// included) — fine once per SPACE/F mode switch, ruinous per frame under a
+/// `--lock-res dynamic` ramp, whose per-frame res changes must never
+/// qualify. 8 ≈ under a tenth of a second at interactive rates.
+const FG_RECREATE_STABLE: u32 = 8;
 
 /// Raw-NGX DLSS-G state (DLSS sessions when the shim is compiled in — see
 /// `ngxfg`). No swapchain wrap, no pacer, no handshake: WE evaluate the
@@ -334,8 +352,11 @@ struct NgxFgState {
     out: ID3D12Resource,
     handle: std::cell::Cell<*mut std::ffi::c_void>,
     /// The render res the feature was created at; (0,0) = not yet created.
-    /// A frame at a different res skips FG (loud once) — the NGX feature is
-    /// fixed-res by creation (DynamicResolutionScaling=false).
+    /// The NGX feature is fixed-res by creation
+    /// (DynamicResolutionScaling=false) — a frame at a different res skips
+    /// FG until the moved res HOLDS `FG_RECREATE_STABLE` dispatches, then
+    /// the feature FEATURE-SCOPE-recreates at it in place
+    /// (`frdlssg_recreate` — never a destroy; see `res_pend` and TRAP 8).
     dims: std::cell::Cell<(u32, u32)>,
     enabled: bool,
     failed: std::cell::Cell<bool>,
@@ -343,7 +364,14 @@ struct NgxFgState {
     /// interpolated output is only presentable when the PAIR exists.
     primed: std::cell::Cell<bool>,
     frame_id: std::cell::Cell<u64>,
-    noted_res: std::cell::Cell<bool>,
+    /// The recreate-storm guard: (pending res, consecutive dispatches seen
+    /// at it). A SPACE/F mode switch moves the render res ONCE (the CPU
+    /// arm's quality-2/3 vs the GPU arms' native default) and then holds —
+    /// it recreates a fraction of a second in; a `--lock-res dynamic` RAMP
+    /// changes res every frame, never qualifies, and keeps skipping (the
+    /// pre-recreate behavior); a completed DRS step holds >= the 90-frame
+    /// dwell and recreates once per adoption.
+    res_pend: std::cell::Cell<((u32, u32), u32)>,
     /// Whether the last present was a PAIR (interpolated + real) — exact by
     /// construction, since this path calls Present itself. The title bar's
     /// presented-per-rendered multiplier.
@@ -1113,7 +1141,7 @@ impl GpuContext {
                         failed: std::cell::Cell::new(false),
                         primed: std::cell::Cell::new(false),
                         frame_id: std::cell::Cell::new(0),
-                        noted_res: std::cell::Cell::new(false),
+                        res_pend: std::cell::Cell::new(((0, 0), 0)),
                         pair: std::cell::Cell::new(false),
                         guides,
                         guides_failed: std::cell::Cell::new(false),
@@ -1588,7 +1616,7 @@ impl GpuContext {
             }
             n.dims.set((0, 0));
             n.primed.set(false);
-            n.noted_res.set(false);
+            n.res_pend.set(((0, 0), 0));
         }
         self.trace = None;
         self.dxr = None;
@@ -4397,12 +4425,84 @@ impl GpuContext {
     /// frame BETWEEN them into `fg_n.out`. Returns true when that output is
     /// presentable (a prior frame primed the pair and this one is no reset).
     /// The feature is created lazily at the frame's locked render res.
-    fn ngxfg_dispatch(&self, fc: &dlss::FrameConstants) -> bool {
+    fn ngxfg_dispatch(&mut self, fc: &dlss::FrameConstants) -> bool {
         let (Some(n), Some(rr)) = (&self.fg_n, &self.rr) else { return false };
         if !n.enabled || n.failed.get() {
             return false;
         }
         let (rw, rh) = (fc.rw as u32, fc.rh as u32);
+        // A render-res MOVE recreates the feature instead of skipping
+        // forever: the CPU renderer fills the same MV/depth/guide planes the
+        // GPU arms do, so FG follows SPACE/F mode cycles across their
+        // different locked resolutions (CPU quality-2/3 vs GPU/DXR native).
+        // Gated on the moved res HOLDING FG_RECREATE_STABLE dispatches —
+        // `--lock-res dynamic` ramps change res per frame and must keep the
+        // old skip behavior, never a per-frame recreate storm.
+        if !n.handle.get().is_null() && n.dims.get() != (rw, rh) {
+            let (pres, prev_cnt) = n.res_pend.get();
+            let cnt = if pres == (rw, rh) { prev_cnt + 1 } else { 1 };
+            n.res_pend.set(((rw, rh), cnt));
+            if cnt < FG_RECREATE_STABLE {
+                // One line per move EPISODE (pres == settled), not per new
+                // res — a dynamic ramp changes res every frame, and cnt == 1
+                // alone would print on each of its ~24 intermediates.
+                if cnt == 1 && pres == (0, 0) {
+                    let (ow, oh) = n.dims.get();
+                    eprintln!(
+                        "fg: render res moved {}x{} -> {}x{} — frame generation \
+                         recreates once the new res holds {} frames",
+                        ow, oh, rw, rh, FG_RECREATE_STABLE
+                    );
+                }
+                n.primed.set(false);
+                return false;
+            }
+            let (ow, oh) = n.dims.get();
+            eprintln!(
+                "fg: recreating the NGX frame-generation feature at {}x{} (was {}x{})",
+                rw, rh, ow, oh
+            );
+            // The resize-path discipline (resize_output): drain the queue
+            // before releasing — in-flight frames may still reference the
+            // feature's internals and the guide pass's heap, whose
+            // descriptors the ensure below rewrites.
+            if let Err(e) = self.d3d.wait_idle() {
+                eprintln!("fg: queue drain before FG recreate failed ({e}) — frame generation off");
+                n.failed.set(true);
+                n.primed.set(false);
+                return false;
+            }
+            // FEATURE-scoped recreate — deliberately NOT destroy + lazy
+            // create: frdlssg_destroy calls DestroyParameters on the map
+            // GetCapabilityParameters returned, which an SL session SHARES
+            // with the in-process Streamline NGX state — the first attempt
+            // did exactly that and every subsequent sl.dlss_d (RR) evaluate
+            // failed 0xBAD00004 FeatureNotFound.
+            let r = unsafe { ngxfg::frdlssg_recreate(n.handle.get(), rw, rh) };
+            if r != 0 {
+                eprintln!("fg: NGX feature recreate failed ({r}) — frame generation off");
+                n.failed.set(true);
+                n.primed.set(false);
+                return false;
+            }
+            n.dims.set((rw, rh));
+            n.primed.set(false);
+            n.res_pend.set(((0, 0), 0));
+            // The guide planes follow the render res (their descriptors
+            // rewrite safely — the queue just drained).
+            if let Some(gp) = &n.guides {
+                match gp.borrow_mut().ensure(&self.d3d.device, rw, rh, rr.guide_inputs()) {
+                    Ok(()) => n.guides_failed.set(false),
+                    Err(e) => {
+                        eprintln!(
+                            "fg: guide-plane recreate failed ({e}) — falling back to the \
+                             raw RR planes (expect reflection shimmer)"
+                        );
+                        n.guides_failed.set(true);
+                    }
+                }
+            }
+        }
         if n.handle.get().is_null() {
             let mut h = std::ptr::null_mut();
             let r = unsafe {
@@ -4436,19 +4536,10 @@ impl GpuContext {
                 "fg: raw-NGX DLSS-G live — 1 generated frame per rendered frame (pair-present)"
             );
         }
-        if n.dims.get() != (rw, rh) {
-            if !n.noted_res.get() {
-                n.noted_res.set(true);
-                eprintln!(
-                    "fg: render res moved off the feature's {}x{} — skipping frame generation \
-                     (fixed-res by creation; avoid --lock-res dynamic with --fg)",
-                    n.dims.get().0,
-                    n.dims.get().1
-                );
-            }
-            n.primed.set(false);
-            return false;
-        }
+        // dims == (rw, rh) from here (a stable move recreated in place
+        // above; an unstable one returned above). A res that bounced BACK
+        // before the threshold clears its pending count.
+        n.res_pend.set(((0, 0), 0));
         let id = n.frame_id.get() + 1;
         n.frame_id.set(id);
         let (dep, mv) = rr.fg_inputs();
