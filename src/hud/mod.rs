@@ -47,9 +47,12 @@ const HELP_LINGER: std::time::Duration = std::time::Duration::from_millis(2500);
 const HUD_LINGER: std::time::Duration = std::time::Duration::from_millis(4000);
 
 /// FPS graph: `GRAPH_BARS` buckets of `GRAPH_TICK` each — a 5 s window. Bars
-/// carry bucket-average FPS on the markup's fixed 0..120 scale, so the 60-fps
-/// reference line sits statically at mid-strip and a spike clamps instead of
-/// rescaling the whole history (auto-range would churn a static element).
+/// carry bucket-average (rendered FPS, FG-added FPS) on the markup's fixed
+/// 0..120 scale, so the 60-fps reference line sits statically at mid-strip
+/// and a spike clamps instead of rescaling the whole history (auto-range
+/// would churn a static element). The FG half is the frame-generation
+/// surplus — presented minus rendered, from the family's own multiplier —
+/// stacked as a violet segment on the base bar.
 const GRAPH_BARS: usize = 40;
 const GRAPH_TICK: std::time::Duration = std::time::Duration::from_millis(125);
 
@@ -145,16 +148,20 @@ pub struct Hud {
     last_hud_live: bool,
     /// Render-mode label last pushed ("" so the first frame sets it).
     last_mode: &'static str,
-    /// FPS graph: ring of bucket-average FPS (oldest first), the open
-    /// bucket's accumulators, and the persistent VecModel whose rows mirror
-    /// `hist` while the HUD is live (`push_graph_rows`). The ring samples
-    /// even while faded — only the Slint writes gate on hud_live — so a
-    /// woken graph shows live recent history, not a stale pre-fade picture.
-    hist: [f32; GRAPH_BARS],
+    /// FPS graph: ring of bucket-average (rendered FPS, FG-added FPS)
+    /// (oldest first), the open bucket's accumulators, and the persistent
+    /// VecModel whose rows mirror `hist` while the HUD is live
+    /// (`push_graph_rows`). The ring samples even while faded — only the
+    /// Slint writes gate on hud_live — so a woken graph shows live recent
+    /// history, not a stale pre-fade picture. `acc_mult` sums the per-frame
+    /// presented-per-rendered multiplier (1.0 without FG), so a bucket's
+    /// presented FPS is `1000·Σmult/Σms` even when FG flips mid-bucket.
+    hist: [(f32, f32); GRAPH_BARS],
     acc_sum: f32,
     acc_n: u32,
+    acc_mult: f32,
     last_bucket: Option<Instant>,
-    graph: Rc<slint::VecModel<f32>>,
+    graph: Rc<slint::VecModel<ui::FpsBar>>,
     last_fps_txt: String,
     last_ms_txt: String,
     /// Last time the camera was moving (drives the keymap panel's fade).
@@ -222,7 +229,10 @@ impl Hud {
         // The graph model is created ONCE and updated via set_row_data —
         // re-setting a fresh ModelRc per tick would tear down and rebuild
         // all GRAPH_BARS for-items instead of dirtying their properties.
-        let graph = Rc::new(slint::VecModel::from(vec![0.0f32; GRAPH_BARS]));
+        let graph = Rc::new(slint::VecModel::from(vec![
+            ui::FpsBar { base: 0.0, fg: 0.0 };
+            GRAPH_BARS
+        ]));
         ui.set_fps_bars(slint::ModelRc::from(graph.clone()));
         Ok(Self {
             ui,
@@ -238,9 +248,10 @@ impl Hud {
             last_hud_on: !visible, // != visible so the first frame sets it
             last_hud_live: true,   // the markup default; first frame reconciles
             last_mode: "",
-            hist: [0.0; GRAPH_BARS],
+            hist: [(0.0, 0.0); GRAPH_BARS],
             acc_sum: 0.0,
             acc_n: 0,
+            acc_mult: 0.0,
             last_bucket: None,
             graph,
             last_fps_txt: String::new(),
@@ -368,14 +379,19 @@ impl Hud {
     /// wake resync would otherwise repaint a frozen graph for free).
     fn push_graph_rows(&mut self) {
         use slint::Model;
-        for (i, v) in self.hist.iter().enumerate() {
-            if self.graph.row_data(i) != Some(*v) {
-                self.graph.set_row_data(i, *v);
+        for (i, &(base, fg)) in self.hist.iter().enumerate() {
+            let row = ui::FpsBar { base, fg };
+            if self.graph.row_data(i) != Some(row.clone()) {
+                self.graph.set_row_data(i, row);
             }
         }
-        let fps = self.hist[GRAPH_BARS - 1];
-        let (fps_txt, ms_txt) = if fps > 0.0 {
-            (format!("{:.0}", fps.min(999.0)), format!("{:.1} ms", 1000.0 / fps))
+        // Readouts: FPS is what the monitor receives (base + FG surplus —
+        // equal to base without FG); ms stays the RENDER frame time, so the
+        // pair deliberately doesn't invert under FG.
+        let (base, fg) = self.hist[GRAPH_BARS - 1];
+        let fps = base + fg;
+        let (fps_txt, ms_txt) = if base > 0.0 {
+            (format!("{:.0}", fps.min(999.0)), format!("{:.1} ms", 1000.0 / base))
         } else {
             ("--".to_string(), String::new())
         };
@@ -397,7 +413,10 @@ impl Hud {
     /// the render-mode label ("CPU" | "GPU" | "DXR"), quantized by nature
     /// (SPACE/F only) and a WAKE source like motion; `last_ms` is the
     /// PREVIOUS frame's render wall-clock ms (`<= 0.0` before the first
-    /// present — skipped, never a fake bar).
+    /// present — skipped, never a fake bar); `fg_mult` is the FG family's
+    /// presented-per-rendered multiplier for that same frame
+    /// (`GpuContext::fg_display_mult`, 1.0 when no FG inserts) — the FG
+    /// graph segment is `(mult − 1) ×` the base rate.
     pub fn frame(
         &mut self,
         cam: &Camera,
@@ -406,6 +425,7 @@ impl Hud {
         tod_moved: bool,
         mode: &'static str,
         last_ms: f32,
+        fg_mult: f32,
     ) -> Option<HudFrame> {
         // Compass heading: the camera's forward projected to the ground
         // plane; north = +Z, east = +X (the sun-arc azimuth convention),
@@ -474,13 +494,18 @@ impl Hud {
         if last_ms > 0.0 && !self.menu_open {
             self.acc_sum += last_ms;
             self.acc_n += 1;
+            self.acc_mult += fg_mult.max(1.0);
         }
         if self.acc_n > 0 && self.last_bucket.map_or(true, |t| t.elapsed() >= GRAPH_TICK) {
             self.last_bucket = Some(Instant::now());
             self.hist.rotate_left(1);
-            self.hist[GRAPH_BARS - 1] = 1000.0 * self.acc_n as f32 / self.acc_sum;
+            let base = 1000.0 * self.acc_n as f32 / self.acc_sum;
+            // FG surplus: presented minus rendered over the same wall time.
+            let fg = (1000.0 * (self.acc_mult - self.acc_n as f32) / self.acc_sum).max(0.0);
+            self.hist[GRAPH_BARS - 1] = (base, fg);
             self.acc_sum = 0.0;
             self.acc_n = 0;
+            self.acc_mult = 0.0;
             if hud_live && self.visible {
                 self.push_graph_rows();
             }

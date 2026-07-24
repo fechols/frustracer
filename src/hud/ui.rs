@@ -34,6 +34,14 @@ slint::slint! {
         control: string,
     }
 
+    // One FPS-graph bar: rendered-frame FPS plus the frame-generation
+    // ADDITION (presented minus rendered, 0 when no FG inserts) — drawn as
+    // a stacked pair on the shared 0..120 scale.
+    export struct FpsBar {
+        base: float,
+        fg: float,
+    }
+
     component MenuButton inherits Rectangle {
         in property <string> label;
         callback clicked;
@@ -111,12 +119,12 @@ slint::slint! {
         // the hard gate; one animated opacity — settled states dirty nothing.
         in property <bool> hud-live: true;
 
-        // FPS graph rows: bucket-average FPS, oldest first, on a FIXED
-        // 0..120 scale (60 = the static mid-strip reference line). mod.rs
-        // rewrites the rows of ONE persistent VecModel at most once per
-        // 125 ms tick, and only while hud-live — a faded HUD's graph is
-        // frozen and dirties nothing.
-        in property <[float]> fps-bars: [];
+        // FPS graph rows: bucket-average (rendered FPS, FG-added FPS),
+        // oldest first, on a FIXED 0..120 scale (60 = the static mid-strip
+        // reference line). mod.rs rewrites the rows of ONE persistent
+        // VecModel at most once per 125 ms tick, and only while hud-live —
+        // a faded HUD's graph is frozen and dirties nothing.
+        in property <[FpsBar]> fps-bars: [];
         in property <string> fps-now: "--";
         in property <string> ms-now: "";
 
@@ -294,18 +302,34 @@ slint::slint! {
                 }
 
                 // Bars: 40 x 4px on a 5px pitch (strip x 10..210), baseline
-                // y 66, 44px full scale. v <= 0 (unfilled boot slots) draws
-                // nothing; anything faster than 120 fps clamps full-height.
-                for v[i] in root.fps-bars : Rectangle {
+                // y 66, 44px full scale. base <= 0 (unfilled boot slots)
+                // draws nothing; the STACK (base + fg) clamps at 120 fps —
+                // the FG segment rides on the base bar's drawn top (its 2px
+                // floor included) and shows the presented frames the render
+                // loop never sees. Colors: base bands by RENDERED fps (FG
+                // doesn't make tracing cheaper); the FG add-on is violet.
+                for b[i] in root.fps-bars : Rectangle {
                     x: 10px + i * 5px;
+                    y: 22px;
                     width: 4px;
-                    height: v <= 0.0 ? 0px : Math.max(2px, Math.min(v / 120.0, 1.0) * 44px);
-                    y: 66px - self.height;
-                    background: v >= 60.0
-                        ? @linear-gradient(180deg, #7df3ff 0%, #1e7fa0F0 100%)
-                        : (v >= 30.0
-                            ? @linear-gradient(180deg, #ffd24d 0%, #a06a1eF0 100%)
-                            : @linear-gradient(180deg, #ff6060 0%, #a01e2eF0 100%));
+                    height: 44px;
+                    basebar := Rectangle {
+                        width: 100%;
+                        height: b.base <= 0.0 ? 0px : Math.max(2px, Math.min(b.base / 120.0, 1.0) * 44px);
+                        y: parent.height - self.height;
+                        background: b.base >= 60.0
+                            ? @linear-gradient(180deg, #7df3ff 0%, #1e7fa0F0 100%)
+                            : (b.base >= 30.0
+                                ? @linear-gradient(180deg, #ffd24d 0%, #a06a1eF0 100%)
+                                : @linear-gradient(180deg, #ff6060 0%, #a01e2eF0 100%));
+                    }
+                    Rectangle {
+                        width: 100%;
+                        height: b.fg <= 0.0 ? 0px : Math.max(0px,
+                            Math.min((b.base + b.fg) / 120.0, 1.0) * 44px - basebar.height);
+                        y: basebar.y - self.height;
+                        background: @linear-gradient(180deg, #e08dff 0%, #8d3fc0F0 100%);
+                    }
                 }
                 // 60-fps reference: mid-strip of the FIXED 0..120 scale —
                 // the fixed scale is what keeps this element static.

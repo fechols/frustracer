@@ -12540,11 +12540,21 @@ fn session(
             // this iteration, so a mode-switch frame shows the old label for
             // exactly one (pipeline-compile-stall) frame — invisible. last_ms
             // is the PREVIOUS frame's render time (0.0 before the first
-            // present), which is exactly the sample the FPS graph wants.
+            // present), which is exactly the sample the FPS graph wants; the
+            // FG multiplier is the same family-measured value the title bar
+            // shows, read at the same previous-frame cadence.
             let mode_label: &'static str =
                 if gpu_trace { "GPU" } else if dxr_on { "DXR" } else { "CPU" };
-            if let Some(hf) = hd.frame(&cam, cur_tod, moved, sun_moved, mode_label, last_ms as f32)
-            {
+            let fg_mult = gpu.fg_display_mult().unwrap_or(1) as f32;
+            if let Some(hf) = hd.frame(
+                &cam,
+                cur_tod,
+                moved,
+                sun_moved,
+                mode_label,
+                last_ms as f32,
+                fg_mult,
+            ) {
                 gpu.hud_stage(hf);
             }
             gpu.set_hud_visible(hd.visible() || hd.menu_open());
