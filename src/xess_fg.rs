@@ -251,6 +251,8 @@ mod loader {
         /// the input chain), the xefg proxy DELEGATES to the app's chain —
         /// releasing the last app-side ref kills the real swapchain under
         /// the proxy (measured: a silent native crash right after init).
+        /// `xefgSwapChainDestroy` CONSUMES this ref (measured: the object is
+        /// freed the moment destroy returns), so Drop must never release it.
         app: *mut c_void,
     }
 
@@ -258,10 +260,12 @@ mod loader {
         /// Wrap `app_swapchain` (a raw IDXGISwapChain* whose ONE caller ref
         /// is transferred in) on `queue`, with XeLL created + linked. Ok
         /// returns the context and the FI proxy (carrying one ref for the
-        /// caller); the library holds its own ref on the original, so the
-        /// caller's transferred ref is released here either way. Err hands
-        /// nothing back — the caller still owns `app_swapchain` (it is NOT
-        /// released on failure).
+        /// caller); the transferred ref lives in `app` until Drop, where
+        /// `xefgSwapChainDestroy` consumes it (the library holds NO ref of
+        /// its own — it borrows the caller's, which is why the ref must stay
+        /// alive for the context's whole life). Err hands the chain back —
+        /// the caller still owns `app_swapchain` (it is NOT released on an
+        /// init failure; but see the GetSwapChainPtr arm's caveat below).
         pub fn wrap(
             dll_dir: &str,
             device: *mut c_void,
@@ -362,6 +366,15 @@ mod loader {
             let r = unsafe { (api.get_swapchain_ptr)(fg, &riid, &mut proxy) };
             if r != XEFG_SUCCESS || proxy.is_null() {
                 let e = format!("xefgSwapChainD3D12GetSwapChainPtr: {} ({r})", result_name(r));
+                // Init SUCCEEDED on this arm, so destroy will CONSUME the
+                // caller's transferred app-chain ref (see Drop). AddRef
+                // first so the Err contract — the caller still owns
+                // `app_swapchain` — stays true here too.
+                unsafe {
+                    let sc = IDXGISwapChain3::from_raw(app_swapchain);
+                    std::mem::forget(sc.clone());
+                    std::mem::forget(sc);
+                }
                 unsafe { (api.destroy)(fg) };
                 unsafe { (xell.destroy_context)(xell_ctx) };
                 return Err(e);
@@ -466,8 +479,13 @@ mod loader {
         fn drop(&mut self) {
             // Destroy tears the FI proxy down; the owner released every proxy
             // ref first (GpuContext field order) and drained the queue. The
-            // app chain's ref is released LAST — the proxy delegates to it
-            // until destroy returns.
+            // app chain must stay alive UNTIL destroy (the proxy delegates to
+            // it) — and destroy CONSUMES that transferred ref: the object is
+            // already freed when it returns. `self.app` is therefore
+            // deliberately NOT released here (measured 2026-07-24: a
+            // `from_raw(self.app)` release after destroy was the shutdown
+            // STATUS_ACCESS_VIOLATION in Interface::assume_vtable, caught
+            // under cdb — freed vtable read).
             let r = unsafe { (self.api.destroy)(self.fg) };
             if r != XEFG_SUCCESS {
                 eprintln!("fg: xefg destroy: {}", result_name(r));
@@ -475,9 +493,6 @@ mod loader {
             let r = unsafe { (self.xell.destroy_context)(self.xell_ctx) };
             if r != XEFG_SUCCESS {
                 eprintln!("fg: xell destroy: {}", result_name(r));
-            }
-            unsafe {
-                let _ = IDXGISwapChain3::from_raw(self.app);
             }
         }
     }
