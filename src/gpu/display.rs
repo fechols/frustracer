@@ -12,13 +12,30 @@
 //! DLSS the swapchain is a Streamline proxy, and whether SL forwards that call
 //! is not a question worth depending on. `MonitorFromWindow` on the HWND we
 //! already own, matched against `DXGI_OUTPUT_DESC1::Monitor`, sidesteps it.
+//!
+//! **The monitor need not hang off the adapter we render on.** A display is
+//! enumerated by the adapter it is PHYSICALLY PLUGGED INTO, and on a
+//! multi-GPU box those are routinely different devices: render on the AMD card
+//! (what `--fsr`/`--fsr4` prefers) with the panel cabled to the NVIDIA one, and
+//! the AMD adapter's output list does not contain that monitor at all. DWM
+//! cross-adapter-copies the presented frame to the display, so presentation
+//! works fine — but a probe that searched only the render adapter found
+//! nothing, returned `SDR`, and handed the scRGB swapchain the flat SDR
+//! rolloff: an HDR panel driven at 80-nit paper white with zero highlight
+//! headroom. So the search falls THROUGH to every adapter on the box. Reading
+//! `GetDesc1` off the adapter that owns the output is not a workaround — that
+//! adapter is the authority on that display, and the luminance numbers are a
+//! property of the panel, not of whatever device we happen to be drawing with.
 
 use crate::tone::ToneParams;
 use windows::core::Interface;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
-use windows::Win32::Graphics::Dxgi::{IDXGIAdapter4, IDXGIOutput6, DXGI_OUTPUT_DESC1};
-use windows::Win32::Graphics::Gdi::{MonitorFromWindow, MONITOR_DEFAULTTONEAREST};
+use windows::Win32::Graphics::Dxgi::{
+    IDXGIAdapter4, IDXGIFactory6, IDXGIOutput6, DXGI_ADAPTER_FLAG3_NONE,
+    DXGI_ADAPTER_FLAG3_SOFTWARE, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, DXGI_OUTPUT_DESC1,
+};
+use windows::Win32::Graphics::Gdi::{MonitorFromWindow, HMONITOR, MONITOR_DEFAULTTONEAREST};
 
 /// What the monitor the window currently sits on reports.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -105,10 +122,9 @@ impl DisplayHdr {
     }
 }
 
-/// Probe the output the window currently sits on. Never fails — an unprobeable
-/// display is reported SDR, which costs a highlight, not a frame.
-pub fn probe(adapter: &IDXGIAdapter4, hwnd: HWND) -> DisplayHdr {
-    let mon = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+/// Search ONE adapter's outputs for `mon`. `None` = this adapter does not drive
+/// that monitor (the ordinary answer for every adapter but one).
+fn search(adapter: &IDXGIAdapter4, mon: HMONITOR) -> Option<DisplayHdr> {
     for i in 0.. {
         let Ok(out) = (unsafe { adapter.EnumOutputs(i) }) else {
             break; // DXGI_ERROR_NOT_FOUND — end of the list
@@ -120,8 +136,115 @@ pub fn probe(adapter: &IDXGIAdapter4, hwnd: HWND) -> DisplayHdr {
             continue;
         };
         if desc.Monitor == mon {
-            return DisplayHdr::from_desc(&desc);
+            return Some(DisplayHdr::from_desc(&desc));
         }
     }
+    None
+}
+
+/// A factory for the cross-adapter fallback, cached across calls.
+///
+/// `probe` runs on a 1 Hz poll (`GpuContext::refresh_display` — the only thing
+/// that catches the user toggling Windows HDR on the monitor the window is
+/// already sitting on), and on a cross-adapter box the fallback runs EVERY
+/// poll, so creating a factory each time would be a needless recurring cost.
+/// Staleness is the reason this can't just be created once and kept forever: a
+/// DXGI factory does not see displays attached after its creation, which is
+/// exactly the event the poll exists to notice — hence the documented
+/// `IsCurrent` check, re-creating only when the topology actually moved.
+///
+/// Main-thread-only by construction (`probe` takes an HWND and is called from
+/// `GpuContext`), so a `thread_local` is the right scope and no lock is needed.
+fn fallback_factory() -> Option<IDXGIFactory6> {
+    use std::cell::RefCell;
+    thread_local! {
+        static FACTORY: RefCell<Option<IDXGIFactory6>> = const { RefCell::new(None) };
+    }
+    FACTORY.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let stale = match slot.as_ref() {
+            Some(f) => !unsafe { f.IsCurrent() }.as_bool(),
+            None => true,
+        };
+        if stale {
+            *slot = super::adapter::create_factory(false).ok();
+        }
+        slot.clone()
+    })
+}
+
+/// Probe the output the window currently sits on. Never fails — an unprobeable
+/// display is reported SDR, which costs a highlight, not a frame.
+///
+/// `adapter` is the RENDER adapter and is only a fast path: it is searched
+/// first because on a single-GPU box (and on any box where the panel is cabled
+/// to the card we draw with) it is the whole answer. When it does not own the
+/// monitor we search every other adapter — see the module header for why that
+/// is the correct question rather than a fallback.
+pub fn probe(adapter: &IDXGIAdapter4, hwnd: HWND) -> DisplayHdr {
+    let mon = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    if let Some(d) = search(adapter, mon) {
+        return d;
+    }
+    let Some(factory) = fallback_factory() else {
+        note_once(
+            "hdr: the render adapter does not drive this monitor and no DXGI factory could be \
+             created to find the adapter that does — treating the display as SDR (--hdr-peak \
+             overrides)",
+        );
+        return DisplayHdr::SDR;
+    };
+    for i in 0.. {
+        let Ok(other) = (unsafe {
+            factory.EnumAdapterByGpuPreference::<IDXGIAdapter4>(
+                i,
+                DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+            )
+        }) else {
+            break;
+        };
+        // A software adapter drives no physical panel; skipping it keeps a
+        // WARP/Basic-Render entry from ever answering for a real display.
+        let software = unsafe { other.GetDesc3() }
+            .map(|d| (d.Flags & DXGI_ADAPTER_FLAG3_SOFTWARE) != DXGI_ADAPTER_FLAG3_NONE)
+            .unwrap_or(false);
+        if software {
+            continue;
+        }
+        if let Some(d) = search(&other, mon) {
+            let name = unsafe { other.GetDesc3() }
+                .map(|desc| {
+                    let len = desc.Description.iter().position(|&c| c == 0).unwrap_or(128);
+                    String::from_utf16_lossy(&desc.Description[..len])
+                })
+                .unwrap_or_else(|_| "another adapter".into());
+            note_once(&format!(
+                "hdr: this monitor is driven by {name}, not the render adapter — probing HDR \
+                 capability there (cross-adapter present; DWM copies the frame)"
+            ));
+            return d;
+        }
+    }
+    note_once(
+        "hdr: no adapter on this box enumerates the monitor the window is on — treating the \
+         display as SDR (--hdr-peak overrides the probe)",
+    );
     DisplayHdr::SDR
+}
+
+/// One-shot for the lines above. They describe a STANDING property of the box,
+/// and `probe` is on a 1 Hz poll — printing per call would be a scrolling wall
+/// saying the same thing. Latching per distinct message keeps the loud-fallback
+/// discipline (the fact is visible) without the spam.
+fn note_once(msg: &str) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+    let mut g = match SEEN.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(), // a poisoned latch must not silence a diagnostic
+    };
+    if g.get_or_insert_with(HashSet::new).insert(msg.to_string()) {
+        eprintln!("{msg}");
+    }
 }
