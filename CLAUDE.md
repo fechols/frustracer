@@ -468,7 +468,17 @@ cargo run --release -- --fsr3         # force-start the chain at the FSR 3.1 ups
                                       # + plain, never a silent un-force)
 cargo run --release -- --fsr3 --fg    # FRAME GENERATION, ffx family (W4 leg 1 of 3; legs 2-3 =
                                       # DLSS-G for DLSS sessions, XeSS-FG+XeLL for Intel XeSS
-                                      # sessions — not wired yet, loud note). Default OFF. In an
+                                      # sessions — not wired yet, loud note). DEFAULT ON since
+                                      # 2026-07-24 (--no-fg is the kill lever; --fg spells the
+                                      # default and additionally arms the EXPLICIT-ONLY Streamline
+                                      # DLSS-G fallback below; a defaulted fg under --quinlight
+                                      # disarms with a loud line instead of the explicit pair's
+                                      # exit 2 — the Opts::fg_explicit / mode_explicit pattern).
+                                      # Exposed in the settings menu as the Upscaler page's
+                                      # frame-generation row (restart-tier; the file drives the
+                                      # DEFAULT arm only — never fg_explicit, so a menu click
+                                      # can't arm the SL fallback or make --quinlight fatal).
+                                      # In an
                                       # FSR session (FSR4-RR or FSR3 wired) the swapchain is
                                       # WRAPPED by the FidelityFX frame-interpolation proxy at
                                       # creation (d3d12::SwapWrap — the wrap sits between scRGB
@@ -514,8 +524,11 @@ cargo run --release -- --fsr3 --fg    # FRAME GENERATION, ffx family (W4 leg 1 o
                                       # static HUD ≈ invisible; the premul UI-resource
                                       # registration is plumbed in the shim, unwired); XeSS/plain
                                       # sessions wrap but present passthrough (their FG families
-                                      # are legs 2-3); latency untouched (W5). --fg --quinlight
-                                      # exits 2 (the --nppd shape). Headless (--check*/--spin)
+                                      # are legs 2-3); latency untouched (W5). An EXPLICIT
+                                      # --fg --quinlight exits 2 (the --nppd shape); a bare
+                                      # --quinlight disarms the fg DEFAULT with a loud line
+                                      # instead (a default must never make another flag fatal).
+                                      # Headless (--check*/--spin)
                                       # never consults it. Vendored: the v2.3.0 framegeneration
                                       # headers (FG kit 4.0.1 + FI swapchain 3.1.7) under
                                       # SDKs/fidelityfx-sdk/framegeneration/. Touch the shim FG
@@ -523,8 +536,15 @@ cargo run --release -- --fsr3 --fg    # FRAME GENERATION, ffx family (W4 leg 1 o
                                       # --check, --check-fsr, --check-gpu, then the interactive
                                       # smoke on 4090 + B70 (fg lines + the cadence-halving test)
 cargo run --release -- --fg           # FRAME GENERATION, DLSS family (W4 leg 2): in a DLSS
-                                      # session (the flagless NVIDIA default) --fg arms DLSS
-                                      # frame generation. TWO BACKENDS, picked at BUILD time:
+                                      # session (the flagless NVIDIA default) fg — ON BY DEFAULT
+                                      # — arms DLSS frame generation. TWO BACKENDS, picked at
+                                      # BUILD time — and the DEFAULT arms only backend (A): the
+                                      # Streamline fallback (B) is EXPLICIT---fg-ONLY
+                                      # (gpu/mod.rs fg_sl), because it both rejects the scRGB
+                                      # swapchain and is the declines-to-insert open issue, so a
+                                      # non-SDK flagless NVIDIA build prints one loud line and
+                                      # generates nothing rather than trading fp16 presentation
+                                      # for a dead present layer:
                                       # (A) RAW NGX — the DEFAULT when the NDA-tier DLSS SDK
                                       # is present at build (FRUSTRACER_DLSS_SDK, default
                                       # ..\quinlight-player\SDKs\DLSS-SDK; never committed,
@@ -738,10 +758,13 @@ cargo run --release -- --fg           # FRAME GENERATION, DLSS family (W4 leg 2)
                                       # swapchain + proxied-queue-only SL session could pair
                                       # DLSS-RR denoising with AMD frame interpolation (not
                                       # built; the quinlight-spirit hybrid). Gates: --check, --check-dlss,
-                                      # --check-gpu (SL paths untouched when --no-fg: the
-                                      # feature list only grows under --fg)
-cargo run --release -- --fg --prefer-intel  # FRAME GENERATION, XeSS family (W4 leg 3 —
-                                      # VERIFIED GENERATING on the B70): an Intel XeSS session
+                                      # --check-gpu (SL paths untouched when --no-fg AND when fg
+                                      # is merely defaulted on a non-SDK build: the feature list
+                                      # only grows under an EXPLICIT --fg)
+cargo run --release -- --prefer-intel # FRAME GENERATION, XeSS family (W4 leg 3 —
+                                      # VERIFIED GENERATING on the B70; fg is ON BY DEFAULT, so
+                                      # a flagless Arc session takes this leg — --no-fg opts
+                                      # out): an Intel XeSS session
                                       # (the flagless Arc default) wraps its swapchain with the
                                       # XeSS-FG proxy (src/xess_fg.rs — libxess_fg.dll +
                                       # libxell.dll from the xess_path dir, the xess.rs

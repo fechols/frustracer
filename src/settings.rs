@@ -128,6 +128,14 @@ opt_fields! {
         pub quin_anchor: u32,
         /// "nvidia" | "amd" | "intel" (--prefer-*; restart)
         pub prefer: String,
+        /// --fg / --no-fg (frame generation for the wired upscaler family;
+        /// ON by default). Restart-tier — the swapchain wrap happens at
+        /// creation. The file drives the DEFAULT arm only: it never sets
+        /// `fg_explicit`, so fg=true here neither arms the explicit-only
+        /// SL DLSS-G fallback nor makes a CLI --quinlight fatal (it disarms
+        /// with the loud line instead) — a menu click is a preference, not
+        /// a being-told.
+        pub fg: bool,
         /// --oidn (live: N toggles)
         pub oidn: bool,
         /// --oidn-no-temporal inverse (live: M toggles)
@@ -559,6 +567,13 @@ pub fn apply_to_opts(s: &Settings, opts: &mut crate::Opts) -> AppliedFx {
             None => warn("upscaler.prefer", p),
         }
     }
+    if let Some(v) = u.fg {
+        // The DEFAULT arm only — deliberately never `fg_explicit`: the
+        // explicit-only consumers (the SL DLSS-G fallback, the --quinlight
+        // exit(2)) key on being TOLD on the command line. CLI --fg/--no-fg
+        // parse after this and override per the precedence rule.
+        opts.fg = v;
+    }
     if let Some(v) = u.oidn {
         opts.oidn = v;
     }
@@ -947,6 +962,7 @@ pub fn menu_items() -> &'static [MenuItem] {
             item!("heightfield", "arm heightfield relief", "Renderer", Restart, Toggle { default: false }, acc_bool!(renderer.heightfield)),
             // ── Upscaler
             item!("chain", "upscaler chain start", "Upscaler", Restart, Cycle { options: &["auto", "dlss", "fsr4", "fsr3", "xess", "none"], default_ix: 0 }, acc_str!(upscaler.chain)),
+            item!("fg", "frame generation", "Upscaler", Restart, Toggle { default: true }, acc_bool!(upscaler.fg)),
             item!("dlss", "DLSS-RR vs plain (G)", "Upscaler", Live, Toggle { default: true }, ((|_| None), (|_, _| {}))),
             item!("xess", "XeSS vs plain (X)", "Upscaler", Live, Toggle { default: false }, ((|_| None), (|_, _| {}))),
             item!("fsr", "FSR vs plain (K)", "Upscaler", Live, Toggle { default: false }, ((|_| None), (|_, _| {}))),
@@ -1292,6 +1308,7 @@ pub fn self_test() -> Result<(), String> {
     full.renderer.mode = Some("gpu".into());
     full.renderer.lock_res = Some("balanced".into());
     full.upscaler.chain = Some("fsr3".into());
+    full.upscaler.fg = Some(false);
     full.effects.fireflies_count = Some(24);
     full.advanced.blas_split = Some(0);
     let j = serde_json::to_string(&full).map_err(|e| format!("serialize full: {e}"))?;

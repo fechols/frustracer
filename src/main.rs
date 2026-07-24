@@ -185,12 +185,24 @@ pub struct Opts {
     pub xess_path: String,
     /// Directory holding amd_fidelityfx_loader_dx12.dll + the provider DLLs.
     pub ffx_path: String,
-    /// `--fg`: arm frame generation for the session's wired upscaler family.
-    /// Native sessions (FSR4-RR / FSR3) wrap the swapchain with the
-    /// FidelityFX frame-interpolation proxy and insert one generated frame
-    /// per rendered frame; unsupported pairings fall through with a loud
-    /// line. Interactive sessions only — headless paths never consult it.
+    /// Frame generation for the session's wired upscaler family — ON BY
+    /// DEFAULT (`--no-fg` is the kill lever; `--fg` spells the default
+    /// explicitly and additionally arms the explicit-only SL DLSS-G
+    /// fallback, see `fg_explicit`). Native sessions (FSR4-RR / FSR3) wrap
+    /// the swapchain with the FidelityFX frame-interpolation proxy and
+    /// insert one generated frame per rendered frame; unsupported pairings
+    /// fall through with a loud line. Interactive sessions only — headless
+    /// paths never consult it.
     pub fg: bool,
+    /// Whether `--fg` was PASSED rather than defaulted (the `mode_explicit`
+    /// pattern). Two consumers: `--quinlight` against the mere default
+    /// disarms fg with a loud line instead of exit(2) — a default must never
+    /// make another flag fatal on its own — and the Streamline DLSS-G
+    /// fallback (non-NDA builds) stays explicit-only, because that path is
+    /// the documented declines-to-insert open issue AND rejects the scRGB
+    /// swapchain, so arming it by default would trade every flagless
+    /// non-SDK NVIDIA session's fp16 presentation for nothing.
+    pub fg_explicit: bool,
     /// Directory holding amd_fidelityfx_framegeneration_dx12.dll (`--fg-path`;
     /// the prebuilt drop ships it in the FSR sample dir, not next to the
     /// loader).
@@ -499,7 +511,8 @@ fn main() {
             )
             .to_string()
         }),
-        fg: false,
+        fg: true,
+        fg_explicit: false,
         fg_path: std::env::var("FRUSTRACER_FG_PATH").unwrap_or_else(|_| {
             concat!(
                 env!("CARGO_MANIFEST_DIR"),
@@ -723,8 +736,14 @@ fn main() {
                     std::process::exit(2);
                 })
             }
-            "--fg" => opts.fg = true,
-            "--no-fg" => opts.fg = false,
+            "--fg" => {
+                opts.fg = true;
+                opts.fg_explicit = true;
+            }
+            "--no-fg" => {
+                opts.fg = false;
+                opts.fg_explicit = false;
+            }
             "--fg-path" => {
                 opts.fg_path = args.next().unwrap_or_else(|| {
                     eprintln!("--fg-path needs a directory argument");
@@ -1249,10 +1268,15 @@ fn main() {
                 eprintln!("                Ray Regeneration is unavailable (suggests --fsr3 / --prefer-amd)");
                 eprintln!("  --fsr3        force-start the chain at the FSR 3.1 upscale-only level (A/B lever)");
                 eprintln!("  --ffx-path    FidelityFX DLL directory (default: the FidelityFX-Samples-prebuilt drop)");
-                eprintln!("  --fg          FRAME GENERATION for the wired upscaler family: FSR sessions wrap the");
-                eprintln!("                swapchain with the FidelityFX frame-interpolation proxy and insert one");
-                eprintln!("                generated frame per rendered frame (provider 4.x on an FSR4 session,");
-                eprintln!("                3.1 interpolation cross-vendor; unsupported pairings fall through loudly)");
+                eprintln!("  --fg          FRAME GENERATION for the wired upscaler family — ON BY DEFAULT");
+                eprintln!("                (--no-fg disables): FSR sessions wrap the swapchain with the FidelityFX");
+                eprintln!("                frame-interpolation proxy, DLSS sessions run raw-NGX DLSS-G (SDK builds),");
+                eprintln!("                Intel XeSS sessions XeSS-FG; one generated frame per rendered frame;");
+                eprintln!("                unsupported pairings fall through loudly. Passing --fg explicitly also");
+                eprintln!("                arms the Streamline DLSS-G fallback on non-SDK builds (explicit-only:");
+                eprintln!("                it rejects scRGB and is the declines-to-insert open issue)");
+                eprintln!("  --no-fg       kill lever: no frame generation (restores scRGB where a wrapper family");
+                eprintln!("                would have taken the HDR10/PQ or SDR arm)");
                 eprintln!("  --fg-path     directory holding amd_fidelityfx_framegeneration_dx12.dll (default: the");
                 eprintln!("                drop's FSR sample dir — the FG provider does NOT ship next to the loader)");
                 eprintln!("  --quinlight   REGISTERED CONSENSUS: suspend the chain's first-hit-wins rule, wire");
@@ -1415,11 +1439,20 @@ fn main() {
     }
     // Frame generation wraps the swapchain with ONE family's frame-
     // interpolation proxy; the fuse wires every engine at once and its
-    // present arm is its own. Untested composition — the --nppd shape:
-    // exit, don't degrade.
+    // present arm is its own. Untested composition — the --nppd shape when
+    // EXPLICITLY requested: exit, don't degrade. But fg is on by DEFAULT,
+    // and a default must never make `--quinlight` alone fatal — the
+    // defaulted arm disarms with a loud line instead.
     if opts.quin && opts.fg {
-        eprintln!("--quinlight cannot compose with --fg. Drop one.");
-        std::process::exit(2);
+        if opts.fg_explicit {
+            eprintln!("--quinlight cannot compose with --fg. Drop one.");
+            std::process::exit(2);
+        }
+        eprintln!(
+            "fg: off under --quinlight (frame generation is on by default, but the fuse \
+             presents through its own arm; pass --fg explicitly to be told instead)"
+        );
+        opts.fg = false;
     }
     // Adapter preference default: AMD when FSR was explicitly requested
     // (--fsr/--fsr3), NVIDIA otherwise. An explicit --prefer-* always wins;
@@ -11387,6 +11420,7 @@ fn run_window(
         xess_autoexposure: opts.xess_autoexposure,
         ffx_dir: opts.ffx_path.clone(),
         fg: opts.fg,
+        fg_explicit: opts.fg_explicit,
         fg_dir: opts.fg_path.clone(),
         fsr_tune: opts.fsr_tune,
         prefer: opts.prefer,

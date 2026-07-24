@@ -108,12 +108,20 @@ pub struct GpuOptions {
     /// level present — i.e. a DENOISING one wherever the box has one, which is
     /// what you want as the anchor (see the quin docs).
     pub quin_anchor: Option<u32>,
-    /// `--fg`: arm frame generation for the session. Family follows the wired
-    /// upscaler — native sessions (FSR4-RR / FSR3 / XeSS) take the FidelityFX
-    /// frame-interpolation swapchain built here; DLSS sessions take DLSS-G
-    /// through the SL proxy. Unsupported combinations fall through with a loud
-    /// line, never an error (except `--fg --quinlight`, rejected at parse).
+    /// Frame generation for the session — ON BY DEFAULT (`--no-fg` clears
+    /// it). Family follows the wired upscaler — native sessions (FSR4-RR /
+    /// FSR3 / XeSS) take the FidelityFX frame-interpolation swapchain built
+    /// here; DLSS sessions take raw-NGX DLSS-G when the shim is built in.
+    /// Unsupported combinations fall through with a loud line, never an
+    /// error (except explicit `--fg --quinlight`, rejected at parse).
     pub fg: bool,
+    /// Whether `--fg` was PASSED rather than defaulted. One consumer: the
+    /// Streamline DLSS-G fallback (non-NDA builds, `!ngxfg::BUILT`) arms
+    /// only when explicit — it is the declines-to-insert open issue AND
+    /// rejects the scRGB swapchain, so the mere default must not trade a
+    /// flagless session's fp16 presentation for a frame generator that has
+    /// never been seen inserting.
+    pub fg_explicit: bool,
     /// Directory holding amd_fidelityfx_framegeneration_dx12.dll (`--fg-path`;
     /// the prebuilt drop ships it in the FSR sample dir, NOT next to the
     /// loader the default --ffx-path points at).
@@ -662,8 +670,12 @@ impl GpuContext {
         // requested (SL's dlfg present layer is the declines-to-insert open
         // issue the NGX path exists to bypass); Reflex/PCL likewise stay
         // unloaded. Without the SDK, the SL attempt remains (with its hard
-        // Reflex prerequisite) — features cannot be loaded after slInit.
-        let sl_features: &[u32] = if opts.fg && !opts.quin && !ngxfg::BUILT {
+        // Reflex prerequisite) — features cannot be loaded after slInit —
+        // but only under an EXPLICIT --fg: fg is on by default now, and the
+        // defaulted arm must not swap the scRGB swapchain for a present
+        // layer that has never been seen inserting (`fg_explicit`).
+        let fg_sl = opts.fg && opts.fg_explicit && !opts.quin && !ngxfg::BUILT;
+        let sl_features: &[u32] = if fg_sl {
             &[
                 streamline_sys::FEATURE_DLSS_RR,
                 streamline_sys::FEATURE_DLSS_G,
@@ -713,7 +725,7 @@ impl GpuContext {
         // eFailHDRFormatNotSupported), so a G session presents SDR 8-bit.
         // G's absence never affects RR.
         let mut fg_dlssg = false;
-        if opts.fg && !opts.quin && !ngxfg::BUILT {
+        if fg_sl {
             if let Some(s) = &sl {
                 match s.is_feature_supported(streamline_sys::FEATURE_DLSS_G, pick.luid) {
                     Ok(()) => fg_dlssg = true,
@@ -722,6 +734,15 @@ impl GpuContext {
                     ),
                 }
             }
+        } else if opts.fg && !opts.quin && !ngxfg::BUILT && sl.is_some() {
+            // Defaulted fg in a DLSS session on a non-SDK build: the SL
+            // DLSS-G fallback is deliberately not armed (see fg_sl above) —
+            // say so once instead of silently presenting without generation.
+            eprintln!(
+                "fg: on by default, but the Streamline DLSS-G fallback is explicit-only \
+                 (declines-to-insert open issue; it would also cost the scRGB swapchain) — \
+                 pass --fg to arm it, or build with the DLSS SDK for the raw-NGX path"
+            );
         }
         // Frame generation, Intel family (the XeSS-FG swapchain, XeLL
         // linked): taken when the chain is headed for the XeSS level on an
