@@ -5293,14 +5293,59 @@ impl Drop for GpuContext {
                     unsafe { ngxfg::frdlssg_destroy(h) };
                 }
             }
-            // FG: retire pending paced presents while the queue is live, and
+            // FG, in three ordered steps.
+            //
+            // First unregister: a generating session leaves the FI swapchain
+            // CONFIGURED LIVE, which is a registration holding the proxy's
+            // frame-generation callback into the effect context dropped below,
+            // and destroying a context the proxy still points into is not
+            // defensible whatever else is true. `fg_disable_now` is the
+            // existing unregister — the same `enabled: 0` configure the K
+            // toggle, the pause gate and the funnel's not-prepared fallback
+            // use, idempotent via `live`, so a session that was not generating
+            // pays nothing. Teardown is simply the fourth caller.
+            //
+            // Honest about what this buys: it is API hygiene, NOT the fix.
+            // Adding it did not move the teardown crash at all — measured, on
+            // this exact stack. The leak below is what fixes that.
+            self.fg_disable_now();
+            // Then retire pending paced presents while the queue is live (they
+            // can actually retire now that generation is off), and only then
             // drop the display-size effect context. The SWAPCHAIN context
             // stays for field order — it must destroy AFTER d3d releases its
             // proxy/backbuffer refs (fg is declared after d3d exactly for
             // this).
-            if let Some(fg) = &mut self.fg {
+            if let Some(mut fg) = self.fg.take() {
                 fg.sc.wait_for_presents();
                 fg.ctx = None;
+                // ...and then DELIBERATELY LEAK the FI swapchain context.
+                //
+                // `ffxDestroyContext` on it does not reliably return on this
+                // stack: measured over repeated runs it either spins forever
+                // inside the provider (a QPC busy-wait, main thread, with the
+                // proxy's presenter thread already gone -- 90-thread dump has
+                // nobody left to satisfy it) or faults outright (0xC0000005
+                // ~3.7 s in). Neither depends on anything we can see: the wrap
+                // is configured disabled, presents are retired, the effect
+                // context is gone, and every documented ordering constraint
+                // (d3d12.rs:419 -- proxy refs released first) is met by field
+                // order. Attaching the FG version desc, which the provider
+                // does demand, changed nothing here either.
+                //
+                // This is the LAST act of the process, so the leak costs
+                // exactly nothing the OS is not about to reclaim, and it turns
+                // a crash-or-hang on every FG session into a clean exit. It is
+                // scoped to process teardown ON PURPOSE: `FgSwapchain::drop`
+                // still destroys normally on the colour-space unwind path,
+                // where the context genuinely must go before a new chain can
+                // exist on the HWND.
+                //
+                // NOT the real fix, which is architectural: quinlight-player
+                // drives frame interpolation itself
+                // (ffxFrameInterpolationContextDestroy + its own pair-present)
+                // and never wraps the swapchain, so it cannot reach this path
+                // at all. See the FG section in CLAUDE.md.
+                std::mem::forget(fg.sc);
             }
         }
     }
