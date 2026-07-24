@@ -52,6 +52,7 @@ struct ImgRole {
 }
 
 pub fn load_gltf_scene(path: &str) -> Scene {
+    crate::progress::phase(crate::progress::Phase::Parse, path, 0);
     let gltf = gltf::Gltf::open(path)
         .unwrap_or_else(|e| panic!("failed to open glTF '{path}': {e}"));
     let base_dir = std::path::Path::new(path)
@@ -274,10 +275,12 @@ fn build_scene(
         };
         let mut order: Vec<usize> = (0..wanted.len()).collect();
         order.sort_by_key(|&i| std::cmp::Reverse(approx_size(wanted[i].0)));
+        crate::progress::phase(crate::progress::Phase::Textures, "", order.len() as u32);
         let mut pairs: Vec<(usize, Option<Texture>)> = order
             .par_iter()
             .with_max_len(1)
             .map(|&wi| {
+                crate::progress::tick();
                 let (img, srgb) = wanted[wi];
                 let tex = (|| {
                     let image = doc.images().nth(img)?;

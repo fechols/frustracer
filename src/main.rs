@@ -48,6 +48,11 @@ mod frustcap;
 mod overlay;
 #[cfg(windows)]
 mod pad;
+// Loading-progress sink for the in-window loading screen — a publish-only
+// global written by the scene loaders, read by run_window's loading loop.
+// Zero-cost + never activated on any headless path (the gates stay a pure
+// function of the command line).
+mod progress;
 mod render;
 mod reproject;
 mod scene;
@@ -1578,11 +1583,6 @@ fn main() {
         );
     }
 
-    eprintln!("frustracer — loading scene...");
-    let mut tile_fh: Option<f32> = None;
-    // A cache hit hands back the untiled scene's BVH too; tiling replicates
-    // the geometry, so the tiled BVH is always a fresh (parallel) build.
-    let mut prebuilt: Option<bvh::Bvh> = None;
     // World selection: ONLY the flagless interactive path. Every headless
     // suite and benchmark keeps its own scene (flagless --check/--spin stay
     // on the procedural scene — the structural must-fire gates are tuned to
@@ -1612,155 +1612,26 @@ fn main() {
         && tile.is_none()
         && spin.is_none()
         && !any_check;
-    let mut world_info: Option<world::World> = None;
-    let mut scene = match (&obj, stress) {
-        (Some(p), _) => {
-            let resolved = scene::resolve_scene_path(p);
-            // Extension sniff: .gltf/.glb take the glTF loader, everything
-            // else the OBJ path — reusing the positional arg inherits the
-            // exclusivity checks, default camera, structural-skip predicate,
-            // and --tile. glTF scenes SKIP the PER-SCENE sidecar cache: its
-            // texture table stores re-decodable file paths, and glTF images
-            // live inside GLB buffer views / data URIs (a cache hit would
-            // come back with 1x1 white textures). The WORLD sidecar solves
-            // this differently — path-less textures ride it as INLINE texels
-            // (scene_cache::store_world) — but that flavor is deliberately
-            // not retrofitted here: a per-scene glTF cache would balloon by
-            // its texel payload for scenes that already re-parse in seconds.
-            let lower = resolved.to_ascii_lowercase();
-            let is_gltf = lower.ends_with(".gltf") || lower.ends_with(".glb");
-            let cached = if is_gltf { None } else { scene_cache::try_load(&resolved) };
-            let (s, b) = match cached {
-                Some((s, b)) => (s, Some(b)),
-                None => {
-                    let mut s = if is_gltf {
-                        gltf_loader::load_gltf_scene(&resolved)
-                    } else {
-                        scene::load_obj_scene(&resolved)
-                    };
-                    // Cold loads only — before the cache store, so the n2h
-                    // flags + height_amps persist; warm loads re-apply the
-                    // texture conversions from the cached flags and take
-                    // height_amp from DiskMat.
-                    scene::derive_heights(&mut s);
-                    // Spray reclassification, same cold-load-only placement:
-                    // the retagged tri_mat/materials ride the cache (the
-                    // --no-spray lever keys its lever word).
-                    scene::reclassify_spray(&mut s);
-                    // Under --tile the untiled build's ONLY use is feeding
-                    // the cache store (the tiled BVH is always a fresh
-                    // build) — and glTF skips the cache, so a tiled glTF
-                    // run skips this build instead of discarding it.
-                    let b = if is_gltf && tile.is_some() {
-                        None
-                    } else {
-                        let b = bvh::Bvh::build(&s);
-                        if !is_gltf {
-                            scene_cache::store(&resolved, &s, &b);
-                        }
-                        Some(b)
-                    };
-                    (s, b)
-                }
-            };
-            match tile {
-                Some((tx, tz)) => {
-                    let (s, fh) = scene::tile_scene(s, tx, tz);
-                    tile_fh = Some(fh);
-                    s
-                }
-                None => {
-                    // b is always Some here: the None arm above requires
-                    // tile.is_some().
-                    prebuilt = b;
-                    s
-                }
-            }
-        }
-        (None, Some(n)) => scene::stress_scene(n),
-        (None, None) => {
-            if world_wanted {
-                match world::world_scene() {
-                    Some((s, w, b)) => {
-                        world_info = Some(w);
-                        // Cache hit or freshly built inside world_scene (the
-                        // world sidecar stores the built tree) — either way
-                        // the shared build arm below must not rebuild it.
-                        prebuilt = Some(b);
-                        s
-                    }
-                    None => {
-                        eprintln!(
-                            "world: no curated scenes found on disk (git lfs pull?) — \
-                             falling back to the procedural scene"
-                        );
-                        scene::procedural_scene()
-                    }
-                }
-            } else {
-                scene::procedural_scene()
-            }
-        }
+    let req = SceneRequest {
+        obj: obj.clone(),
+        stress,
+        tile,
+        world_wanted,
+        cam_override,
+        tod: opts.tod,
+        verify_rebuild: check,
+        bvh_builder: opts.bvh_builder.clone(),
+        c_trav: opts.c_trav,
+        split_axes: opts.split_axes,
+        max_leaf: opts.max_leaf,
     };
-    // The stress field (and a tiled OBJ field) keeps the default look
-    // direction but pulls the camera back/up to overlook the field; /8 (not
-    // the field half-extent itself) trades the nearest rows off the bottom of
-    // the frame for less sky.
-    let cam0 = cam_override.unwrap_or_else(|| match (stress, tile_fh) {
-        (Some(n), _) => scaled_camera((scene::stress_field_half(n) / 8.0).max(1.0)),
-        (None, Some(fh)) => scaled_camera((fh / 8.0).max(1.0)),
-        // The world overview reuses the tiled-field framing: pull back/up by
-        // the field half-extent so the opening frame reads the whole ring.
-        (None, None) => match &world_info {
-            Some(w) => scaled_camera((w.field_half / 8.0).max(1.0)),
-            None => default_camera(),
-        },
-    });
-    let t0 = Instant::now();
-    let mut bvh = prebuilt.unwrap_or_else(|| bvh::Bvh::build(&scene));
-    eprintln!(
-        "scene: {} tris | BVH: {} nodes ready in {:.0} ms",
-        scene.tri_count(),
-        bvh.nodes.len(),
-        t0.elapsed().as_secs_f64() * 1000.0
-    );
-    // SAH is always scored at the fixed reference C_trav so trees built at
-    // different C_trav stay comparable on one scale.
-    eprintln!(
-        "bvh quality (builder {} c_trav {} axes {} maxleaf {}): {}",
-        opts.bvh_builder,
-        opts.c_trav,
-        opts.split_axes,
-        opts.max_leaf,
-        bvh.quality(bvh::SAH_REF_C_TRAV).line(scene.tri_count())
-    );
-    if check {
-        // Determinism gate for the two-phase parallel build: a rebuild must
-        // be byte-identical (node order pinned across runs and thread
-        // counts — the property the scene cache and cross-run benchmarks
-        // lean on). On a cache hit this doubles as the cache-integrity gate:
-        // the loaded BVH must equal one built fresh from the loaded scene.
-        assert!(
-            bvh.identical(&bvh::Bvh::build(&scene)),
-            "BVH build is not deterministic (or the scene cache is corrupt)"
-        );
-        eprintln!("bvh: deterministic rebuild verified");
-    }
-
-    // --tod: applied strictly AFTER the cache load/store and the BVH build
-    // (the sun feeds neither), so the .fcache always holds the default day
-    // and the determinism gate compared like with like. Every downstream
-    // consumer — --spin, the check suites, run_window — sees the applied sun.
-    // Combining --tod with --check* is user's-own-risk: the same-seed and
-    // CPU-vs-GPU A/B gates are self-consistent under any sun, but structural
-    // must-fires and pinned bands assume the default (the --cam caveat class).
-    if let Some(h) = opts.tod {
-        scene::apply_tod(&mut scene, h);
-        eprintln!(
-            "tod: starting at {h:.2}h (sun y {:+.2}, sky scale {:.3}, night {:.2})",
-            scene.sun.dir.y, scene.sky_scale, scene.night
-        );
-    }
+    // Headless suites/benchmarks (--check*, --spin) load synchronously here
+    // and exit before any window, so the gates stay a pure function of the
+    // command line (the progress sink is never activated). Interactive
+    // sessions defer the SAME load into run_window's worker thread, behind the
+    // loading screen. Every branch inside this block exits the process.
+    if any_check || spin.is_some() {
+        let LoadedScene { scene, bvh, cam0, .. } = load_scene(&req);
 
     if let Some(mode) = &spin {
         let code = run_spin(&scene, &bvh, cam0, mode, spin_frames, &opts);
@@ -1838,53 +1709,195 @@ fn main() {
             std::process::exit(2);
         }
     }
-    // World auto-TOD attractors: one per island, unless an explicit --tod
-    // claimed the clock (an explicit hour is manual intent — starting a
-    // session that immediately eases away from the asked-for hour would make
-    // the flag a lie). Non-world sessions pass the empty vec — the flycam's
-    // structural off state.
-    let attractors: Vec<flycam::TodAttractor> = match (&world_info, opts.tod) {
-        (Some(w), None) => w
-            .islands
-            .iter()
-            .map(|i| flycam::TodAttractor {
-                pos: i.center,
-                hour: i.theme_hour,
-                radius: i.radius.max(1.0),
-            })
-            .collect(),
-        _ => Vec::new(),
-    };
-    // Ambience cues, the attractors' audio twin: world mode gets one
-    // positioned cue per island (crossfaded by proximity in audio::update);
-    // a directly-loaded curated scene gets its own loop at steady gain; an
-    // unmatched scene is wind-only. --no-audio kills the whole device in
-    // run_window, so the cues are built unconditionally here.
-    let cues: audio::Cues = match (&world_info, &obj) {
-        (Some(w), _) => audio::Cues::World(
-            w.islands
-                .iter()
-                .map(|i| audio::Cue {
-                    name: i.name.clone(),
-                    pos: i.center,
-                    radius: i.radius.max(1.0),
-                })
-                .collect(),
-        ),
-        (None, Some(p)) => match audio::match_scene_path(&scene::resolve_scene_path(p)) {
-            Some(name) => audio::Cues::Steady(name),
-            None => audio::Cues::None,
-        },
-        _ => audio::Cues::None,
-    };
+        // Every headless branch above exits the process; reaching here would
+        // mean `any_check || spin` held but matched no arm.
+        unreachable!("a headless run always spin-/check-exits");
+    }
+
+    // Interactive: hand the request to run_window, which brings the window +
+    // GpuContext + HUD up FIRST and loads the scene on a worker thread behind
+    // the loading screen. The TOD attractors and audio cues (which need the
+    // world layout the load produces) are derived there, post-join.
     #[cfg(windows)]
-    run_window(&mut scene, &mut bvh, &opts, cam0, attractors, file_settings, cues);
+    run_window(req, &opts, file_settings);
     #[cfg(not(windows))]
     {
-        let _ = (&opts, cam0, attractors, file_settings, cues);
+        let _ = (req, &opts, file_settings);
         eprintln!("the interactive window requires Windows (D3D12 + DLSS); use --check / --check-dlss");
         std::process::exit(2);
     }
+}
+
+/// The parse-time facts a scene load needs, bundled so it can travel to a
+/// worker thread (every field is `Send`). Built once in `main()`; the headless
+/// suites call `load_scene` inline with it, interactive sessions move it into
+/// `run_window`'s loader thread. `verify_rebuild` is the `--check`
+/// deterministic-rebuild gate; the `bvh_*` fields feed only the quality log
+/// line (the build itself reads the ambient `bvh::set_builder` levers).
+struct SceneRequest {
+    obj: Option<String>,
+    stress: Option<usize>,
+    tile: Option<(u32, u32)>,
+    world_wanted: bool,
+    cam_override: Option<Camera>,
+    tod: Option<f32>,
+    verify_rebuild: bool,
+    bvh_builder: String,
+    c_trav: f32,
+    split_axes: usize,
+    max_leaf: usize,
+}
+
+/// What a scene load produces. `world_info` is `Some` only for a world boot
+/// (it feeds the interactive TOD attractors + audio cues); `cam0` is the
+/// opening camera derived from the scene's framing.
+struct LoadedScene {
+    scene: scene::Scene,
+    bvh: bvh::Bvh,
+    world_info: Option<world::World>,
+    cam0: Camera,
+}
+
+/// Load (or cache-hit) the scene, build/adopt its BVH, run the `--check`
+/// determinism gate, and apply `--tod` — the ONE load code path shared by the
+/// headless suites (called inline in `main()`) and interactive sessions
+/// (called on `run_window`'s worker thread, behind the loading screen). Pure
+/// data in, pure data out — no window, no GPU, no globals beyond the ambient
+/// loader levers set before it runs and the progress sink it publishes to.
+fn load_scene(req: &SceneRequest) -> LoadedScene {
+    eprintln!("frustracer — loading scene...");
+    let mut tile_fh: Option<f32> = None;
+    // A cache hit hands back the untiled scene's BVH too; tiling replicates
+    // the geometry, so the tiled BVH is always a fresh (parallel) build.
+    let mut prebuilt: Option<bvh::Bvh> = None;
+    let mut world_info: Option<world::World> = None;
+    let mut scene = match (&req.obj, req.stress) {
+        (Some(p), _) => {
+            let resolved = scene::resolve_scene_path(p);
+            // Extension sniff: .gltf/.glb take the glTF loader, everything
+            // else the OBJ path. glTF scenes SKIP the per-scene sidecar cache
+            // (its texture table stores re-decodable file paths, and glTF
+            // images live inside GLB buffer views / data URIs).
+            let lower = resolved.to_ascii_lowercase();
+            let is_gltf = lower.ends_with(".gltf") || lower.ends_with(".glb");
+            let cached = if is_gltf { None } else { scene_cache::try_load(&resolved) };
+            let (s, b) = match cached {
+                Some((s, b)) => (s, Some(b)),
+                None => {
+                    let mut s = if is_gltf {
+                        gltf_loader::load_gltf_scene(&resolved)
+                    } else {
+                        scene::load_obj_scene(&resolved)
+                    };
+                    // Cold loads only — before the cache store, so the n2h
+                    // flags + height_amps persist; warm loads re-apply the
+                    // texture conversions from the cached flags.
+                    scene::derive_heights(&mut s);
+                    // Spray reclassification, same cold-load-only placement.
+                    scene::reclassify_spray(&mut s);
+                    // Under --tile the untiled build's ONLY use is feeding the
+                    // cache store (the tiled BVH is always a fresh build) — and
+                    // glTF skips the cache, so a tiled glTF run skips this.
+                    let b = if is_gltf && req.tile.is_some() {
+                        None
+                    } else {
+                        let b = bvh::Bvh::build(&s);
+                        if !is_gltf {
+                            scene_cache::store(&resolved, &s, &b);
+                        }
+                        Some(b)
+                    };
+                    (s, b)
+                }
+            };
+            match req.tile {
+                Some((tx, tz)) => {
+                    let (s, fh) = scene::tile_scene(s, tx, tz);
+                    tile_fh = Some(fh);
+                    s
+                }
+                None => {
+                    // b is always Some here: the None arm above requires
+                    // tile.is_some().
+                    prebuilt = b;
+                    s
+                }
+            }
+        }
+        (None, Some(n)) => scene::stress_scene(n),
+        (None, None) => {
+            if req.world_wanted {
+                match world::world_scene() {
+                    Some((s, w, b)) => {
+                        world_info = Some(w);
+                        // Cache hit or freshly built inside world_scene — the
+                        // shared build arm below must not rebuild it.
+                        prebuilt = Some(b);
+                        s
+                    }
+                    None => {
+                        eprintln!(
+                            "world: no curated scenes found on disk (git lfs pull?) — \
+                             falling back to the procedural scene"
+                        );
+                        scene::procedural_scene()
+                    }
+                }
+            } else {
+                scene::procedural_scene()
+            }
+        }
+    };
+    // The stress field (and a tiled OBJ field) keeps the default look
+    // direction but pulls the camera back/up to overlook the field; /8 trades
+    // the nearest rows off the bottom of the frame for less sky.
+    let cam0 = req.cam_override.unwrap_or_else(|| match (req.stress, tile_fh) {
+        (Some(n), _) => scaled_camera((scene::stress_field_half(n) / 8.0).max(1.0)),
+        (None, Some(fh)) => scaled_camera((fh / 8.0).max(1.0)),
+        // The world overview reuses the tiled-field framing.
+        (None, None) => match &world_info {
+            Some(w) => scaled_camera((w.field_half / 8.0).max(1.0)),
+            None => default_camera(),
+        },
+    });
+    progress::phase(progress::Phase::Bvh, "", 0);
+    let t0 = Instant::now();
+    let bvh = prebuilt.unwrap_or_else(|| bvh::Bvh::build(&scene));
+    eprintln!(
+        "scene: {} tris | BVH: {} nodes ready in {:.0} ms",
+        scene.tri_count(),
+        bvh.nodes.len(),
+        t0.elapsed().as_secs_f64() * 1000.0
+    );
+    eprintln!(
+        "bvh quality (builder {} c_trav {} axes {} maxleaf {}): {}",
+        req.bvh_builder,
+        req.c_trav,
+        req.split_axes,
+        req.max_leaf,
+        bvh.quality(bvh::SAH_REF_C_TRAV).line(scene.tri_count())
+    );
+    if req.verify_rebuild {
+        // Determinism gate for the two-phase parallel build (byte-identical
+        // across runs and thread counts); on a cache hit it doubles as the
+        // cache-integrity gate.
+        assert!(
+            bvh.identical(&bvh::Bvh::build(&scene)),
+            "BVH build is not deterministic (or the scene cache is corrupt)"
+        );
+        eprintln!("bvh: deterministic rebuild verified");
+    }
+    // --tod: applied strictly AFTER the cache load/store and the BVH build (so
+    // the .fcache always holds the default day and the determinism gate
+    // compared like with like).
+    if let Some(h) = req.tod {
+        scene::apply_tod(&mut scene, h);
+        eprintln!(
+            "tod: starting at {h:.2}h (sun y {:+.2}, sky scale {:.3}, night {:.2})",
+            scene.sun.dir.y, scene.sky_scale, scene.night
+        );
+    }
+    LoadedScene { scene, bvh, world_info, cam0 }
 }
 
 /// Headless DXR-pipeline gate suite (--check-dxr). Needs real hardware (RT
@@ -9137,6 +9150,20 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
     };
 
+    // Progress sink — pure math + the inactive-no-op contract (a headless run
+    // never activates it, so publishers cost one relaxed load and no loud line
+    // moves). Restores the inactive global before returning.
+    let progress_ok = match progress::self_test() {
+        Ok(()) => {
+            eprintln!("progress self-test: OK");
+            true
+        }
+        Err(e) => {
+            eprintln!("progress self-test: FAIL — {e}");
+            false
+        }
+    };
+
     let rep = render::verify(scene, bvh, &cam, q, rw, rh, &stats, None, &[], None);
     eprintln!(
         "verify full-depth ({} px): false-sky {} | tmin-overshoot {} | hybrid-extra {} | max rel t err {:.2e}",
@@ -11082,6 +11109,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         ("bc7", bc7_ok),
         ("world", world_ok),
         ("audio", audio_ok),
+        ("progress", progress_ok),
         ("quin", quin_ok),
         ("ngxfg-guides", ngxfg_guides_ok),
         ("hemi-ao", hemi_ok),
@@ -11401,15 +11429,7 @@ fn vendor_defaults(opts: &mut Opts, vendor: gpu::adapter::Vendor) {
 }
 
 #[cfg(windows)]
-fn run_window(
-    scene: &mut scene::Scene,
-    bvh: &mut bvh::Bvh,
-    opts: &Opts,
-    cam0: Camera,
-    attractors: Vec<flycam::TodAttractor>,
-    file_settings: settings::Settings,
-    cues: audio::Cues,
-) {
+fn run_window(req: SceneRequest, opts: &Opts, file_settings: settings::Settings) {
     // SDL3 is per-monitor-v2 DPI aware on Windows unconditionally (SDL2's
     // SDL_WINDOWS_DPI_AWARENESS hint is gone), so W×H stays W×H physical
     // pixels, matching the swapchain.
@@ -11500,15 +11520,131 @@ fn run_window(
         eprintln!("  --fsr         the same force-start, but allowed to fall through to XeSS/FSR3");
         std::process::exit(2);
     }
+    let (mut w, mut h) = (W, H);
+
+    // ── LOADING SCREEN. The window + swapchain + HUD are up, but the scene
+    // isn't loaded yet (this is the ~35 s cold-world cost). Load it on a
+    // worker thread and present a HUD-styled progress page here — present_cpu
+    // composites the HUD over a black frame with NO tracer, so it works before
+    // any tracer/upscaler exists. The progress sink is armed only now (headless
+    // never reaches run_window), so publishers stay a cheap relaxed load there.
+    progress::activate();
+    let req_obj = req.obj.clone(); // needed for the audio cues after the join
+    let worker = std::thread::Builder::new()
+        .name("scene-load".into())
+        .spawn(move || load_scene(&req))
+        .expect("failed to spawn scene-load thread");
+    {
+        // A black base in whatever colour space negotiated (CpuPresent's
+        // buffers start zeroed = black in all three); the loading page's
+        // near-opaque scrim covers it. `.blit` composites the staged HUD.
+        let load_bg = CpuPresent::new(w, h, gpu.encoding(), gpu.tone());
+        let load_start = Instant::now();
+        loop {
+            let edges = inp.poll(None);
+            if edges.quit {
+                // A long BLAS build / sidecar store can't be interrupted
+                // cleanly; the OS reclaims the device on exit, and a truncated
+                // world.fcache is a silent cache miss by construction.
+                eprintln!("frustracer: quit during load");
+                std::process::exit(0);
+            }
+            if worker.is_finished() {
+                break;
+            }
+            if let Some(hd) = hud.as_mut() {
+                let snap = progress::snapshot().unwrap_or_default();
+                // A ~1.6 s marquee sweep for the indeterminate phases (world
+                // BVH build) — its whole job is to show liveness there.
+                let marquee = (load_start.elapsed().as_secs_f32() / 1.6).fract();
+                if let Some(hf) = hd.loading_frame(&snap, marquee) {
+                    gpu.hud_stage(hf);
+                }
+            }
+            gpu.set_hud_visible(true);
+            let _ = load_bg.blit(&mut gpu);
+            std::thread::sleep(Duration::from_millis(33));
+        }
+    }
+    let loaded = match worker.join() {
+        Ok(l) => l,
+        Err(_) => {
+            eprintln!("frustracer: scene load failed (loader thread panicked)");
+            std::process::exit(1);
+        }
+    };
+    let mut scene = loaded.scene;
+    let mut bvh = loaded.bvh;
+    let cam0 = loaded.cam0;
+    let world_info = loaded.world_info;
+    // A resize DURING the load drained its size event into the loop above (we
+    // ignored it — DWM stretched the black page). Reconcile the swapchain to
+    // the window's real size now; the session's own resize path owns any later
+    // one.
+    {
+        let (dw, dh) = window.size_in_pixels();
+        if dw > 0 && dh > 0 && (dw as usize, dh as usize) != (w, h) {
+            if let Err(e) = gpu.resize_output(dw, dh, &gopts) {
+                eprintln!("resize during load: rebuild at {dw}x{dh} failed ({e})");
+            } else {
+                if let Some(hd) = hud.as_mut() {
+                    hd.set_size(dw, dh);
+                }
+                (w, h) = (dw as usize, dh as usize);
+            }
+        }
+    }
+    // One more loading frame for the GPU-upload phase: the eager --dxr init
+    // (BC7 encode + BLAS/TLAS build) runs synchronously inside the first
+    // session and blocks ~1 s with no event pump, so freeze this label on
+    // screen across it. The page clears on the session's first HUD frame.
+    progress::phase(progress::Phase::GpuUpload, "", 0);
+    {
+        let load_bg = CpuPresent::new(w, h, gpu.encoding(), gpu.tone());
+        if let Some(hd) = hud.as_mut() {
+            let snap = progress::snapshot().unwrap_or_default();
+            if let Some(hf) = hd.loading_frame(&snap, 0.0) {
+                gpu.hud_stage(hf);
+            }
+        }
+        gpu.set_hud_visible(true);
+        let _ = load_bg.blit(&mut gpu);
+    }
+    // World auto-TOD attractors + audio cues — both need the world layout the
+    // load produced, so they move here (from main()) after the join.
+    let attractors: Vec<flycam::TodAttractor> = match (&world_info, opts.tod) {
+        (Some(wi), None) => wi
+            .islands
+            .iter()
+            .map(|i| flycam::TodAttractor { pos: i.center, hour: i.theme_hour, radius: i.radius.max(1.0) })
+            .collect(),
+        _ => Vec::new(),
+    };
+    let cues: audio::Cues = match (&world_info, &req_obj) {
+        (Some(wi), _) => audio::Cues::World(
+            wi.islands
+                .iter()
+                .map(|i| audio::Cue { name: i.name.clone(), pos: i.center, radius: i.radius.max(1.0) })
+                .collect(),
+        ),
+        (None, Some(p)) => match audio::match_scene_path(&scene::resolve_scene_path(p)) {
+            Some(name) => audio::Cues::Steady(name),
+            None => audio::Cues::None,
+        },
+        _ => audio::Cues::None,
+    };
+    // Clear the loading page; the session's first hud.frame uploads its removal
+    // as a dirty rect (set_loading forces a full-window repaint of the reveal).
+    if let Some(hd) = hud.as_mut() {
+        hd.set_loading(false);
+    }
+    progress::phase(progress::Phase::Idle, "", 0);
+
     // The 500 Hz integrator owns the camera pose for the whole app lifetime
     // (spawned here, not per session, so the pose survives resize rebuilds —
     // re-entry continuity is automatic). Sessions only snapshot. It spawns
-    // PAUSED and each session resumes it once its frame loop is live: a long
-    // FRAME must integrate (the whole point), but a rebuild presents nothing,
-    // and flying through a seconds-long BLAS build with W held is flying
-    // blind.
-    // TOD seeds from --tod or the default sun's own derived hour; the thread
-    // owns it across sessions like the pose, so a scrub survives resizes.
+    // PAUSED and each session resumes it once its frame loop is live.
+    // TOD seeds from --tod or the default sun's own derived hour.
     let fly = flycam::FlyCam::spawn(
         sdl_hwnd(&window).0 as isize,
         cam0,
@@ -11519,23 +11655,19 @@ fn run_window(
     // Audio lives here beside the FlyCam for the same reason: a resize
     // re-enters session(), and the loops must keep playing through the
     // rebuild. The wind reads the integrator's 500 Hz speed atomic, so it
-    // stays responsive while the main thread is blocked in a trace (and
-    // decays to silence across a pause, since the integrator parks it at 0).
+    // stays responsive while the main thread is blocked in a trace.
     let audio_sys =
         if opts.audio { audio::AudioSys::new(&sdl, cues, fly.speed_handle(), scene.diag) } else { None };
 
     // A window resize exits the session and re-enters it at the new client
     // size: the session init code IS the rebuild path (every buffer,
-    // controller, history, and tracer pipeline re-derives from (w, h) —
-    // including the upscalers' render-res ranges, so a --lock-res scale
-    // stays the same PERCENTAGE of the new window). The GpuContext itself
-    // survives via resize_output; user-visible state crosses over in
-    // Persist.
-    let (mut w, mut h) = (W, H);
+    // controller, history, and tracer pipeline re-derives from (w, h)). The
+    // GpuContext itself survives via resize_output; user-visible state crosses
+    // over in Persist.
     let mut persist: Option<Persist> = None;
     loop {
         match session(
-            scene, bvh, opts, &fly, audio_sys.as_ref(), &mut window, &mut inp, &mut gpu,
+            &mut scene, &mut bvh, opts, &fly, audio_sys.as_ref(), &mut window, &mut inp, &mut gpu,
             &mut hud, &mut cfg, &mut persist, w, h,
         ) {
             SessionEnd::Quit => break,

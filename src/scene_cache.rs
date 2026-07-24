@@ -425,6 +425,7 @@ fn decode_tex_records(recs: Vec<TexRecord>) -> Vec<Texture> {
 /// Load the sidecar for an already-RESOLVED source path (see
 /// `scene::resolve_scene_path`). Silent None on any mismatch or read error.
 pub fn try_load(src_path: &str) -> Option<(Scene, Bvh)> {
+    crate::progress::phase(crate::progress::Phase::Cache, src_path, 0);
     let src = Path::new(src_path);
     let f = std::fs::File::open(sidecar(src)).ok()?;
     // The byte budget every payload read is capped against (see
@@ -560,6 +561,7 @@ pub fn try_load(src_path: &str) -> Option<(Scene, Bvh)> {
 /// Best-effort store (temp file + rename; a failure prints one line and the
 /// run continues uncached). `src_path` must be the RESOLVED source.
 pub fn store(src_path: &str, scene: &Scene, bvh: &Bvh) {
+    crate::progress::phase(crate::progress::Phase::Sidecar, src_path, 0);
     let src = Path::new(src_path);
     let dst = sidecar(src);
     // Pid-suffixed so two processes loading the same scene can't interleave

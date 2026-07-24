@@ -204,6 +204,15 @@ pub struct Hud {
     /// `edit-focus` callback): input.rs's gate for keyboard nav — typing
     /// "wasd" into a text field must not move the selection.
     text_editing: Rc<std::cell::Cell<bool>>,
+    /// Loading-screen last-set values (value-guarded like the compass/clock so
+    /// a steady phase re-raster dirties nothing). Seeded to sentinels the first
+    /// `loading_frame` can't match.
+    last_load_stage: String,
+    last_load_phase: String,
+    last_load_detail: String,
+    last_load_count: String,
+    last_load_frac: f32,
+    last_load_marquee: f32,
 }
 
 const CLEAR: PremultipliedRgbaColor =
@@ -300,6 +309,12 @@ impl Hud {
             sel: Sel::Main(0),
             rows_meta: Vec::new(),
             text_editing,
+            last_load_stage: String::new(),
+            last_load_phase: String::new(),
+            last_load_detail: String::new(),
+            last_load_count: String::new(),
+            last_load_frac: f32::NAN, // != any real fraction, so first set fires
+            last_load_marquee: -1.0,
         })
     }
 
@@ -723,6 +738,15 @@ impl Hud {
             }
         }
 
+        self.raster()
+    }
+
+    /// Advance Slint timers/animations, re-rasterize only the dirty region,
+    /// and pack it into a `HudFrame` (or `None` when nothing changed). The
+    /// pack layout is a cross-module contract with gpu/hud.rs — the ONE copy,
+    /// shared by `frame` (the session HUD) and `loading_frame` (the loading
+    /// screen), so the two can never disagree about a row's byte length.
+    fn raster(&mut self) -> Option<HudFrame> {
         slint::platform::update_timers_and_animations();
 
         let mut rects: Vec<DirtyRect> = Vec::new();
@@ -803,5 +827,82 @@ impl Hud {
             }
         }
         Some(HudFrame { rects, bytes })
+    }
+
+    /// Show or hide the loading page. Hiding it reveals the frame behind — a
+    /// full-window change (the page's scrim covers everything), so the next
+    /// `frame()`/`raster()` repaints wholesale.
+    pub fn set_loading(&mut self, on: bool) {
+        if self.ui.get_loading() != on {
+            self.ui.set_loading(on);
+            self.force_full = true;
+        }
+    }
+
+    /// Rasterize one loading-screen frame from a progress snapshot. `marquee`
+    /// is a Rust-driven `[0,1]` sweep, consumed only while the current phase
+    /// is indeterminate (`snap.frac < 0`). Every property write is value-
+    /// guarded like the compass/clock, so a steady phase between ticks dirties
+    /// nothing; the marquee is the one thing that legitimately animates (its
+    /// job is to show liveness through a long unmetered phase like the world
+    /// BVH build).
+    pub fn loading_frame(
+        &mut self,
+        snap: &crate::progress::Snapshot,
+        marquee: f32,
+    ) -> Option<HudFrame> {
+        if !self.ui.get_loading() {
+            self.ui.set_loading(true);
+            self.force_full = true;
+        }
+        // Outer stage row: "i / n  name" — only when the loader set a stage
+        // (a single-scene load leaves it blank).
+        let stage = if snap.stage_total > 0 {
+            format!("{} / {}  {}", snap.stage_done, snap.stage_total, snap.stage_name)
+        } else {
+            String::new()
+        };
+        if stage != self.last_load_stage {
+            self.ui.set_load_stage(stage.as_str().into());
+            self.last_load_stage = stage;
+        }
+        if self.last_load_phase != snap.phase_label {
+            self.ui.set_load_phase(snap.phase_label.into());
+            self.last_load_phase = snap.phase_label.to_string();
+        }
+        if self.last_load_detail != snap.detail {
+            self.ui.set_load_detail(snap.detail.as_str().into());
+            self.last_load_detail = snap.detail.clone();
+        }
+        let count = if snap.total > 0 {
+            format!("{} / {}", snap.done, snap.total)
+        } else {
+            String::new()
+        };
+        if count != self.last_load_count {
+            self.ui.set_load_count(count.as_str().into());
+            self.last_load_count = count;
+        }
+        if snap.frac < 0.0 {
+            // Indeterminate: sweep the marquee; flip frac to the marquee
+            // sentinel once on entry.
+            if self.last_load_frac >= 0.0 {
+                self.ui.set_load_frac(-1.0);
+                self.last_load_frac = -1.0;
+            }
+            if (marquee - self.last_load_marquee).abs() > 1.0 / 256.0 {
+                let m = marquee.clamp(0.0, 1.0);
+                self.ui.set_load_marquee(m);
+                self.last_load_marquee = m;
+            }
+        } else {
+            // Determinate: quantize to 1/256 so sub-pixel churn is idle.
+            let q = (snap.frac.clamp(0.0, 1.0) * 256.0).round() / 256.0;
+            if (q - self.last_load_frac).abs() > 0.5 / 256.0 {
+                self.ui.set_load_frac(q);
+                self.last_load_frac = q;
+            }
+        }
+        self.raster()
     }
 }

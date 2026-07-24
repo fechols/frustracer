@@ -518,6 +518,7 @@ pub fn derive_heights(scene: &mut Scene) {
             n2h_on && !t.h2n && !t.n2h
         })
         .collect();
+    crate::progress::phase(crate::progress::Phase::Heights, "", solve.len() as u32);
     let t0 = std::time::Instant::now();
     let amps: std::collections::HashMap<u32, f32> = {
         use rayon::prelude::*;
@@ -530,7 +531,11 @@ pub fn derive_heights(scene: &mut Scene) {
                 .par_iter_mut()
                 .enumerate()
                 .filter(|(i, _)| solve.contains(&(*i as u32)))
-                .map(|(i, t)| (i as u32, t.apply_n2h()))
+                .map(|(i, t)| {
+                    let r = (i as u32, t.apply_n2h());
+                    crate::progress::tick();
+                    r
+                })
                 .collect()
         };
         match rayon::ThreadPoolBuilder::new().num_threads(workers).build() {
@@ -1533,6 +1538,7 @@ fn parse_tf(v: &str) -> Option<[f32; 3]> {
 /// the documented `model.obj` commands keep working on a fresh checkout.
 pub fn load_obj_scene(path: &str) -> Scene {
     let path = &resolve_scene_path(path);
+    crate::progress::phase(crate::progress::Phase::Parse, path, 0);
     let opts = tobj::LoadOptions {
         triangulate: true,
         single_index: true,
@@ -1671,14 +1677,17 @@ pub fn load_obj_scene(path: &str) -> Scene {
         by_size.sort_by_key(|r| {
             std::cmp::Reverse(std::fs::metadata(&r.path).map_or(0, |m| m.len()))
         });
+        crate::progress::phase(crate::progress::Phase::Textures, "", by_size.len() as u32);
         by_size
             .par_iter()
             .with_max_len(1)
             .filter_map(|r| match image::open(&r.path) {
                 Ok(img) => {
+                    crate::progress::tick();
                     Some(((r.path.clone(), r.srgb), Texture::from_image(img, r.srgb)))
                 }
                 Err(e) => {
+                    crate::progress::tick();
                     eprintln!(
                         "warning: texture '{}' failed to load ({e}); using flat fallback",
                         r.path.display()

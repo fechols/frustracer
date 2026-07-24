@@ -432,13 +432,22 @@ pub fn world_scene() -> Option<(Scene, World, crate::bvh::Bvh)> {
     }
     let key = build_world_key(&probes);
     let cache_path = std::path::Path::new(WORLD_CACHE);
+    // The warm path: one sidecar read collapses every per-island load, the
+    // merge, and the world BVH build. Indeterminate — the ~4.6 s is one blob.
+    crate::progress::phase(crate::progress::Phase::Cache, "world sidecar", 0);
     if let Some((sc, bvh, world)) = crate::scene_cache::try_load_world(cache_path, &key) {
         return Some((sc, world, bvh));
     }
     eprintln!("world: rebuilding — {} miss/stale", cache_path.display());
     let mut parts: Vec<(&IslandSpec, Scene, LoadKind)> = Vec::new();
+    // The outer STAGE row tracks islands (i / n); each load_part publishes its
+    // own inner phases (parse, textures, per-island BVH).
+    let n_present = probes.iter().filter(|(_, r)| r.is_some()).count() as u32;
+    let mut loaded_idx = 0u32;
     for (spec, resolved) in &probes {
         if let Some(res) = resolved {
+            loaded_idx += 1;
+            crate::progress::stage(loaded_idx, n_present, spec.name);
             let (s, kind) = load_part(res);
             parts.push((spec, s, kind));
         }
@@ -478,6 +487,7 @@ pub fn world_scene() -> Option<(Scene, World, crate::bvh::Bvh)> {
         islands.push(isle);
         merge_in.push((s, centers[i]));
     }
+    crate::progress::phase(crate::progress::Phase::Merge, "", 0);
     let world = merge_scenes(merge_in, field_half);
     eprintln!(
         "world: {} islands | {:.1}M tris | field {:.0}x{:.0} | diag {:.1} | loaded+merged in {:.1} s",
@@ -490,6 +500,8 @@ pub fn world_scene() -> Option<(Scene, World, crate::bvh::Bvh)> {
     );
     // The world BVH builds HERE (not main.rs's shared arm) so the sidecar
     // can store it — the single-scene cold path's `prebuilt` precedent.
+    // Indeterminate (~8.8 s of parallel build — no per-node signal).
+    crate::progress::phase(crate::progress::Phase::Bvh, "", 0);
     let tb = std::time::Instant::now();
     let bvh = crate::bvh::Bvh::build(&world);
     eprintln!(
@@ -497,6 +509,7 @@ pub fn world_scene() -> Option<(Scene, World, crate::bvh::Bvh)> {
         bvh.nodes.len(),
         tb.elapsed().as_secs_f64() * 1000.0
     );
+    crate::progress::phase(crate::progress::Phase::Sidecar, "world sidecar", 0);
     let meta = World { islands, field_half };
     crate::scene_cache::store_world(cache_path, &key, &world, &bvh, &meta);
     Some((world, meta, bvh))

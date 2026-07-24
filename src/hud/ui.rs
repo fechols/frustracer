@@ -146,8 +146,21 @@ slint::slint! {
         in property <string> fps-now: "--";
         in property <string> ms-now: "";
 
+        // ── Loading screen (run_window's pre-session loop drives these; the
+        // page shows regardless of `hud-on` — a loading screen is not chrome).
+        // While `loading`, the compass/graph/keymap are gated off below so the
+        // screen owns the frame; a `set_loading(false)` clears it in one dirty
+        // rect. `load-frac < 0` => indeterminate (the marquee sweeps instead).
+        in property <bool> loading: false;
+        in property <string> load-stage: "";   // "island 5 / 7  san-miguel"
+        in property <string> load-phase: "";    // "decoding textures"
+        in property <string> load-detail: "";   // scene path / island name
+        in property <string> load-count: "";     // "128 / 512"
+        in property <float> load-frac: -1.0;     // [0,1], or <0 = marquee
+        in property <float> load-marquee: 0.0;   // [0,1] Rust-driven sweep
+
         compass := Rectangle {
-            visible: root.hud-on;
+            visible: root.hud-on && !root.loading;
             opacity: root.hud-live ? 1.0 : 0.0;
             animate opacity { duration: 400ms; easing: ease-in-out; }
             x: parent.width - 152px;
@@ -260,7 +273,7 @@ slint::slint! {
         // captions) — only the bar rows and the two readout strings change,
         // at most once per 125 ms and only while hud-live.
         fpsgraph := Rectangle {
-            visible: root.hud-on;
+            visible: root.hud-on && !root.loading;
             opacity: root.hud-live ? 1.0 : 0.0;
             animate opacity { duration: 400ms; easing: ease-in-out; }
             x: parent.width - 236px;
@@ -390,7 +403,7 @@ slint::slint! {
             background: #10141cC0;
             border-width: 1px;
             border-color: #ffffff30;
-            opacity: root.help-on ? 0.92 : 0.0;
+            opacity: (root.help-on && !root.loading) ? 0.92 : 0.0;
             animate opacity { duration: 350ms; easing: ease-in-out; }
 
             VerticalLayout {
@@ -618,6 +631,116 @@ slint::slint! {
                         }
                     }
                 }
+            }
+        }
+
+        // ── Loading screen: full-window scrim + a centered HUD-styled panel
+        // reusing the FPS graph's chrome (gradient body, L-bracket accents,
+        // radial glow). Topmost child so it covers everything; shown only
+        // while `loading`, so a settled session dirties none of it. The colors
+        // stay off any leading "0b"/"0x" token (the binary-literal trap above).
+        if root.loading : Rectangle {
+            width: 100%;
+            height: 100%;
+            background: #060810F0;
+            TouchArea {}
+
+            panel := Rectangle {
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                width: 480px;
+                height: 200px;
+                border-radius: 12px;
+                background: @linear-gradient(180deg, #16202cF0 0%, #0a0f18F0 100%);
+                border-width: 1px;
+                border-color: #58f0ff60;
+
+                // Soft radial glow (drop-shadow is a software-renderer no-op).
+                Rectangle {
+                    x: 0px;
+                    y: 0px;
+                    width: 100%;
+                    height: 100%;
+                    border-radius: 12px;
+                    background: @radial-gradient(circle, #1e7fa030 0%, #0a0f1800 70%);
+                }
+
+                Text {
+                    text: "F R U S T R A C E R";
+                    color: #7df3ff;
+                    font-size: 22px;
+                    font-weight: 700;
+                    x: 28px;
+                    y: 22px;
+                }
+                Text {
+                    text: root.load-phase;
+                    color: #e8f6ff;
+                    font-size: 15px;
+                    x: 28px;
+                    y: 62px;
+                }
+                Text {
+                    text: root.load-stage;
+                    color: #9fb4c4;
+                    font-size: 13px;
+                    horizontal-alignment: right;
+                    width: 240px;
+                    x: 212px;
+                    y: 64px;
+                }
+                Text {
+                    text: root.load-detail;
+                    color: #6f8496;
+                    font-size: 12px;
+                    x: 28px;
+                    y: 90px;
+                    width: 424px;
+                    overflow: elide;
+                }
+
+                // Progress track + fill (determinate) or a sweeping marquee
+                // segment (indeterminate: load-frac < 0).
+                track := Rectangle {
+                    x: 28px;
+                    y: 128px;
+                    width: 424px;
+                    height: 8px;
+                    border-radius: 4px;
+                    background: #1c222c;
+                    clip: true;
+                    Rectangle {
+                        x: root.load-frac >= 0.0
+                            ? 0px
+                            : (parent.width - 110px) * root.load-marquee;
+                        y: 0px;
+                        width: root.load-frac >= 0.0
+                            ? parent.width * Math.max(0.0, Math.min(root.load-frac, 1.0))
+                            : 110px;
+                        height: 100%;
+                        border-radius: 4px;
+                        background: @linear-gradient(90deg, #7df3ff 0%, #1e7fa0F0 100%);
+                    }
+                }
+                Text {
+                    text: root.load-count;
+                    color: #9fb4c4;
+                    font-size: 12px;
+                    horizontal-alignment: right;
+                    width: 424px;
+                    x: 28px;
+                    y: 150px;
+                }
+
+                // Angular corner accents — axis-aligned L-brackets.
+                Rectangle { x: -3px; y: -3px; width: 16px; height: 2px; background: #58f0ffC0; }
+                Rectangle { x: -3px; y: -3px; width: 2px; height: 16px; background: #58f0ffC0; }
+                Rectangle { x: parent.width - 13px; y: -3px; width: 16px; height: 2px; background: #58f0ffC0; }
+                Rectangle { x: parent.width + 1px; y: -3px; width: 2px; height: 16px; background: #58f0ffC0; }
+                Rectangle { x: -3px; y: parent.height + 1px; width: 16px; height: 2px; background: #58f0ffC0; }
+                Rectangle { x: -3px; y: parent.height - 13px; width: 2px; height: 16px; background: #58f0ffC0; }
+                Rectangle { x: parent.width - 13px; y: parent.height + 1px; width: 16px; height: 2px; background: #58f0ffC0; }
+                Rectangle { x: parent.width + 1px; y: parent.height - 13px; width: 2px; height: 16px; background: #58f0ffC0; }
             }
         }
     }
