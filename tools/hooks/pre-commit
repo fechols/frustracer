@@ -1,0 +1,108 @@
+#!/bin/sh
+#
+# Reject mojibake and UTF-8 BOMs in staged text content.
+#
+# WHY THIS EXISTS. ca1f9b6 read src/main.rs as cp1252 and saved it back as
+# UTF-8-with-BOM, double-encoding every non-ASCII character in the file: an
+# em-dash U+2014 became U+00E2 U+20AC U+201D ("a-euro-rightquote"), 837
+# occurrences across 29 distinct sequences, plus a leading BOM. It is comments
+# only, so it compiled and every gate passed -- the damage is that the source
+# reads as line noise, the RUNTIME prints it ("deferral never engages
+# a-euro-rightquote"), and it manufactures a conflict on every em-dash line in
+# a codebase whose comments are dense with them. Repairing it was c39b6f3.
+#
+# The cause is a tool, not a person: some editor or script in the authoring
+# path round-trips files through cp1252. It will do it again. This hook is the
+# door.
+#
+# INSTALL (per clone -- .git/hooks is not versioned):
+#     cp tools/hooks/pre-commit .git/hooks/pre-commit
+#     chmod +x .git/hooks/pre-commit
+#
+# Deliberately installed into .git/hooks rather than via core.hooksPath:
+# git-lfs owns post-checkout/post-commit/post-merge/pre-push here, and
+# core.hooksPath would orphan all four. Scene blobs reaching plain git is
+# permanent bloat, so LFS's hooks must keep working.
+#
+# DETECTOR. Mojibake is a UTF-8 lead byte reinterpreted as a cp1252 character
+# (U+00C2-U+00F4) followed by a reinterpreted continuation byte (U+0080-U+00BF,
+# or the cp1252 0x80-0x9F "smart punctuation" block, which decodes to scattered
+# code points and so must be listed). Matching CHARACTERS, not bytes, because
+# `git grep -P` runs PCRE in UTF-8 mode -- a byte-class pattern silently
+# matches nothing here, which is a mistake worth not repeating.
+#
+# Verified when written: 762 matching lines on the known-bad blob
+# (ca1f9b6:src/main.rs), 1 BOM; ZERO matches on the repaired HEAD, zero on both
+# pre-corruption revisions (6697f3b, 110b130), and zero false positives across
+# every text file in the tree. Re-check after editing the pattern:
+#     git grep -I -P -c -e "$MOJI" ca1f9b6 -- src/main.rs   # must be 762
+#     git grep -I -P -l -e "$MOJI" HEAD --                  # must be empty
+#
+# `-I` skips binary, so committed PNGs and LFS pointers are not scanned.
+
+LEAD='[\x{00C2}-\x{00F4}]'
+CONT='[\x{0080}-\x{00BF}\x{20AC}\x{201A}\x{0192}\x{201E}\x{2026}\x{2020}\x{2021}\x{02C6}\x{2030}\x{0160}\x{2039}\x{0152}\x{017D}\x{2018}\x{2019}\x{201C}\x{201D}\x{2022}\x{2013}\x{2014}\x{02DC}\x{2122}\x{0161}\x{203A}\x{0153}\x{017E}\x{0178}]'
+MOJI="$LEAD$CONT"
+BOM='^\x{FEFF}'
+
+# Added/copied/modified staged paths only -- renames and deletions carry no new
+# content, and an unrelated legacy file must not block an unrelated commit.
+# -z + xargs -0 so paths with spaces survive.
+list_staged() {
+    git diff --cached --name-only --diff-filter=ACM -z
+}
+
+# git grep exits 1 on "no match", which is the normal case -- never let that
+# status escape as a hook failure.
+moji_hits=$(list_staged | xargs -0 -r git grep --cached -I -n -P -e "$MOJI" -- 2>/dev/null) || true
+bom_hits=$(list_staged | xargs -0 -r git grep --cached -I -n -P -e "$BOM" -- 2>/dev/null) || true
+
+[ -z "$moji_hits" ] && [ -z "$bom_hits" ] && exit 0
+
+echo "pre-commit: BLOCKED -- staged content is mis-encoded." >&2
+echo >&2
+
+if [ -n "$moji_hits" ]; then
+    n=$(printf '%s\n' "$moji_hits" | wc -l | tr -d ' ')
+    echo "  MOJIBAKE ($n line(s)): UTF-8 text re-encoded through cp1252." >&2
+    echo "  A '--' became 'a-euro-rightquote' (U+00E2 U+20AC U+201D)." >&2
+    echo >&2
+    printf '%s\n' "$moji_hits" | head -10 | sed 's/^/    /' >&2
+    [ "$n" -gt 10 ] && echo "    ... and $((n - 10)) more" >&2
+    echo >&2
+fi
+
+if [ -n "$bom_hits" ]; then
+    echo "  UTF-8 BOM at start of file:" >&2
+    printf '%s\n' "$bom_hits" | cut -d: -f1 | sort -u | sed 's/^/    /' >&2
+    echo >&2
+fi
+
+cat >&2 <<'MSG'
+  FIX. Do not hand-edit the characters -- that fixes the symptom on the lines
+  you notice and leaves the rest. Apply the exact inverse (cp1252-encode each
+  non-ASCII run, decode it as UTF-8; runs that fail that round-trip are already
+  correct and must be left alone, which is what protects text that is fine):
+
+    python3 - <<'EOF'
+    import re, sys
+    for p in sys.argv[1:]:
+        t = open(p, 'rb').read().decode('utf-8')
+        t = t[1:] if t.startswith('﻿') else t
+        def r(m):
+            s = m.group(0)
+            try:    return s.encode('cp1252').decode('utf-8')
+            except Exception: return s
+        open(p, 'wb').write(re.sub(r'[^\x00-\x7f]+', r, t).encode('utf-8'))
+    EOF
+
+  Then confirm it changed ENCODING ONLY -- repairing the committed blob should
+  reproduce your working tree once line endings are normalized.
+
+  Then find the tool that did it (editor encoding default, or a script reading
+  without encoding='utf-8'), or it comes straight back.
+
+  To commit anyway: git commit --no-verify   (usually the wrong answer)
+MSG
+
+exit 1

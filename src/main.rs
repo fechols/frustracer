@@ -1,10 +1,10 @@
-﻿// Audio ambience: per-island biome loops (world mode) + a speed-scaled
+// Audio ambience: per-island biome loops (world mode) + a speed-scaled
 // procedural wind. The device half (SDL3 stream + lewton decode) is
 // Windows-only inside the module; the mixer/resampler/gain math is pure and
-// feeds --check. Display-only â€” no render-path or rng-stream contact.
+// feeds --check. Display-only — no render-path or rng-stream contact.
 mod audio;
 // BC7 block compression of OPAQUE scene textures (ON by default via the GPU
-// compute encoder; --no-bc7 kills, --bc7-cpu = the ispc A/B arm) â€” GPU upload
+// compute encoder; --no-bc7 kills, --bc7-cpu = the ispc A/B arm) — GPU upload
 // only; the CPU renderer keeps sampling the exact RGBA8 texels. Alpha-masked
 // cutout textures are deliberately excluded (see the module note).
 mod bc7;
@@ -14,7 +14,7 @@ mod camera;
 mod clouds;
 mod dlss;
 // Signal split, wire encoders, and demodulation/composite math for FSR Ray
-// Regeneration â€” pure CPU, feeds --check-fsr; the GPU seam is gpu/ffx*.
+// Regeneration — pure CPU, feeds --check-fsr; the GPU seam is gpu/ffx*.
 mod builders;
 mod fireflies;
 mod fsr;
@@ -65,10 +65,10 @@ mod settings;
 // it never touches accum, the temporal cache, or any upscaler guide.
 mod bloom;
 mod shade;
-// Order-2 SH sky irradiance â€” the smooth half of the one-sky model (the sharp
+// Order-2 SH sky irradiance — the smooth half of the one-sky model (the sharp
 // half, the sun disc, is an explicit light: SH cannot be shadow-rayed).
 mod sh;
-// The one sky: a scattering dome + a sun disc at infinity. Read its header â€”
+// The one sky: a scattering dome + a sun disc at infinity. Read its header —
 // the "the disc appears exactly once per light path" invariant governs every
 // sky call site in the renderer.
 mod sky;
@@ -78,11 +78,11 @@ mod prof;
 mod replay;
 mod temporal;
 mod texture;
-// The presentation curve â€” one source of truth for SDR and scRGB alike, shared
+// The presentation curve — one source of truth for SDR and scRGB alike, shared
 // by every CPU present arm and ported term-for-term into tonemap.hlsl.
 mod tone;
 // Pure chain-resolution data for the always-on temporal-upscaler fallback
-// (DLSS-RR â†’ FSR4-RR â†’ XeSS â†’ FSR3); the real probes live in GpuContext::new.
+// (DLSS-RR → FSR4-RR → XeSS → FSR3); the real probes live in GpuContext::new.
 mod upchain;
 mod world;
 // The loader half is Windows-only (LoadLibrary); the FFI structs, depth
@@ -111,7 +111,7 @@ const MAX_SAMPLES: u32 = 1024;
 const RENDER_BUDGET: Duration = Duration::from_millis(15);
 /// U cycles samples per pixel by doubling, wrapping at dlss::MAX_SPP (128):
 /// 1 -> 2 -> 4 -> ... -> 128 -> 1. Powers of two because the interesting axis
-/// is variance, which halves per doubling (error ~ 1/âˆšN).
+/// is variance, which halves per doubling (error ~ 1/√N).
 fn next_spp(cur: u32) -> u32 {
     let n = cur.saturating_mul(2);
     if n > dlss::MAX_SPP {
@@ -123,7 +123,7 @@ fn next_spp(cur: u32) -> u32 {
 
 /// Controller gain on the log4 error.
 const DEPTH_GAIN: f32 = 0.6;
-/// Max upward step per frame â€” creep up (>= 3 frames per level)...
+/// Max upward step per frame — creep up (>= 3 frames per level)...
 const STEP_UP_MAX: f32 = 0.4;
 /// ...but drop more than a full level in one step after a blown frame.
 const STEP_DOWN_MAX: f32 = 1.5;
@@ -137,49 +137,49 @@ const STEP_DOWN_MAX: f32 = 1.5;
 #[derive(Clone)]
 pub struct Opts {
     /// The temporal-upscaler fallback chain: which levels of
-    /// DLSS-RR â†’ FSR4-RR â†’ XeSS â†’ FSR3 may be probed (first supported level
+    /// DLSS-RR → FSR4-RR → XeSS → FSR3 may be probed (first supported level
     /// wins; upscaling is always on unless --no-upscale empties the chain).
     /// `--<x>` force-starts the chain at that level, `--no-<x>` skips it.
     pub chain: upchain::UpChain,
     /// D3D12 debug layer + Streamline verbose logging.
     pub gpu_debug: bool,
     /// Block-compress the OPAQUE scene textures to BC7 on upload (8 bpp vs
-    /// 32), GPU upload only â€” the CPU renderer keeps sampling the exact RGBA8
+    /// 32), GPU upload only — the CPU renderer keeps sampling the exact RGBA8
     /// texels, so this moves the GPU-vs-CPU statistical gates (albedo A/B,
     /// T2 radiance) and nothing else. Alpha-masked cutout textures are never
     /// compressed (src/bc7.rs). ON BY DEFAULT via the GPU compute encoder
-    /// (`Gpu(Fast)` â€” gpu/bc7gpu.rs; only GPU/DXR sessions ever read this,
+    /// (`Gpu(Fast)` — gpu/bc7gpu.rs; only GPU/DXR sessions ever read this,
     /// so CPU-only sessions are structurally unaffected): `--no-bc7` kills,
     /// `--bc7-cpu` is the ispc A/B arm (the old ~20 s-per-Sponza encode),
     /// `--bc7-quality` keys the current arm. There is still deliberately no
-    /// BC7 disk cache â€” the GPU encode is what made per-load affordable.
+    /// BC7 disk cache — the GPU encode is what made per-load affordable.
     pub bc7: bc7::Bc7Mode,
     /// Directory holding sl.interposer.dll + plugins (M3+).
     pub sl_path: String,
-    /// Audio ambience (biome loops + speed-scaled wind; default on â€”
+    /// Audio ambience (biome loops + speed-scaled wind; default on —
     /// interactive sessions only, headless paths never initialize audio).
     /// --no-audio is the kill lever: the subsystem is never constructed.
     pub audio: bool,
-    /// Start with OIDN denoising on (N toggles at runtime; default off â€”
+    /// Start with OIDN denoising on (N toggles at runtime; default off —
     /// DLSS-RR stays the primary denoiser).
     pub oidn: bool,
     /// Directory holding OpenImageDenoise.dll + its core/device DLLs.
     pub oidn_path: String,
     /// OIDN device type (oidn.h OIDNDeviceType; 0 = auto-pick fastest).
     pub oidn_device: i32,
-    /// OIDN RT-filter quality (`oidn::QUALITY_*`; default balanced â€” HIGH is
+    /// OIDN RT-filter quality (`oidn::QUALITY_*`; default balanced — HIGH is
     /// documented for final frames, the flag lets stills opt in).
     pub oidn_quality: i32,
-    /// Declare the OIDN albedo/normal guides noise-free (default on â€” they
+    /// Declare the OIDN albedo/normal guides noise-free (default on — they
     /// are deterministic primary-hit values; --oidn-no-clean-aux is the
     /// empirical escape hatch, same policy as the sign/flag constants).
     pub oidn_clean_aux: bool,
-    /// OIDN temporal reprojection history (M toggles at runtime; default on â€”
+    /// OIDN temporal reprojection history (M toggles at runtime; default on —
     /// off means the plain accumulation-average mode that shimmers while
     /// moving).
     pub oidn_temporal: bool,
     /// Start with NPPD neural denoising on (J toggles; mutually exclusive
-    /// with DLSS/OIDN/XeSS â€” NPPD is its own recurrent temporal integrator).
+    /// with DLSS/OIDN/XeSS — NPPD is its own recurrent temporal integrator).
     pub nppd: bool,
     /// Directory holding onnxruntime.dll (+ DirectML.dll).
     pub nppd_path: String,
@@ -192,19 +192,19 @@ pub struct Opts {
     pub xess_path: String,
     /// Directory holding amd_fidelityfx_loader_dx12.dll + the provider DLLs.
     pub ffx_path: String,
-    /// Frame generation for the session's wired upscaler family â€” ON BY
+    /// Frame generation for the session's wired upscaler family — ON BY
     /// DEFAULT (`--no-fg` is the kill lever; `--fg` spells the default
     /// explicitly and additionally arms the explicit-only SL DLSS-G
     /// fallback, see `fg_explicit`). Native sessions (FSR4-RR / FSR3) wrap
     /// the swapchain with the FidelityFX frame-interpolation proxy and
     /// insert one generated frame per rendered frame; unsupported pairings
-    /// fall through with a loud line. Interactive sessions only â€” headless
+    /// fall through with a loud line. Interactive sessions only — headless
     /// paths never consult it.
     pub fg: bool,
     /// Whether `--fg` was PASSED rather than defaulted (the `mode_explicit`
     /// pattern). Two consumers: `--quinlight` against the mere default
-    /// disarms fg with a loud line instead of exit(2) â€” a default must never
-    /// make another flag fatal on its own â€” and the Streamline DLSS-G
+    /// disarms fg with a loud line instead of exit(2) — a default must never
+    /// make another flag fatal on its own — and the Streamline DLSS-G
     /// fallback (non-NDA builds) stays explicit-only, because that path is
     /// the documented declines-to-insert open issue AND rejects the scRGB
     /// swapchain, so arming it by default would trade every flagless
@@ -217,18 +217,18 @@ pub struct Opts {
     /// `--fsr4`: the FSR4 + Ray Regeneration level is REQUIRED, not merely
     /// force-started. `--fsr` falls through to XeSS/FSR3 when the Ray
     /// Regeneration provider is absent (no RDNA4, wrong adapter); this makes
-    /// that a hard error instead â€” the one place in the codebase where an
+    /// that a hard error instead — the one place in the codebase where an
     /// unsupported feature is not a loud-line fallback, because the flag's
     /// whole point is to be told.
     pub fsr4_required: bool,
     /// Ray Regeneration tuning overrides (`--fsr-max-radiance` &c). All-None
     /// by default: a flagless session configures nothing and runs the
-    /// provider's own constants. A/B levers for dialing in cleanliness â€”
+    /// provider's own constants. A/B levers for dialing in cleanliness —
     /// `max_radiance` is the firefly clamp.
     pub fsr_tune: fsr::DenoiseTuning,
     /// `--quinlight`: wire EVERY supported chain level at once, run them all
     /// over the same traced frame, and present the registered-consensus fuse of
-    /// their outputs (gpu/quin.rs â€” LK registration + warp + winsorized mean;
+    /// their outputs (gpu/quin.rs — LK registration + warp + winsorized mean;
     /// a port of quinlight-player's consensus_registered.comp). GPU-fed only
     /// (--dxr or --gpu): there is no CPU-fed arm.
     pub quin: bool,
@@ -246,21 +246,21 @@ pub struct Opts {
     /// (requires --xess; N cycles placement at runtime).
     pub oidn_post: bool,
     /// XeSS internal autoexposure (XESS_INIT_FLAG_ENABLE_AUTOEXPOSURE;
-    /// default off â€” A/B lever, init-time only).
+    /// default off — A/B lever, init-time only).
     pub xess_autoexposure: bool,
     /// Adaptive shading rate on XeSS frames (default on; --no-adaptive forces
-    /// uniform per-pixel shading â€” visibility is per-pixel either way, only
-    /// the 2Ã—2-cell shadow/AO sharing and HOT top-ups are disabled).
+    /// uniform per-pixel shading — visibility is per-pixel either way, only
+    /// the 2×2-cell shadow/AO sharing and HOT top-ups are disabled).
     pub adaptive: bool,
     /// Lock the DLSS/XeSS render resolution to this fixed scale of the
     /// window (default quality 2/3; `--lock-res dynamic` -> None = the
     /// step-wise dynamic-resolution controller). CLI-only, no runtime
-    /// toggle â€” T prints the locked note. This is the CPU RENDERER's scale;
+    /// toggle — T prints the locked note. This is the CPU RENDERER's scale;
     /// the GPU tracers read `gpu_lock_scale`.
     pub lock_scale: Option<f32>,
     /// The GPU render modes' (`--gpu`, `--dxr`) counterpart of `lock_scale`:
     /// they trace at NATIVE (100%) by default while the CPU renderer defaults
-    /// to quality (2/3) â€” the CPU tracer needs the pixel discount, the GPU
+    /// to quality (2/3) — the CPU tracer needs the pixel discount, the GPU
     /// ones don't. The two are one flag: an explicit `--lock-res` sets BOTH,
     /// so a session that asks for a scale gets that scale in whichever arm it
     /// renders (F toggles between them; the res discontinuity is already a
@@ -268,13 +268,13 @@ pub struct Opts {
     pub gpu_lock_scale: Option<f32>,
     /// Primary samples per pixel per frame (--spp, 1..=dlss::MAX_SPP; U cycles
     /// it live). N jittered samples inside each pixel share the tile's
-    /// inherited t_start/cut (the quadtree cost amortizes over NÃ— the rays)
+    /// inherited t_start/cut (the quadtree cost amortizes over N× the rays)
     /// and are averaged into ONE splat, so the upscalers/denoisers get a
     /// ~1/N-variance frame at unchanged accum semantics. 1 = today's renderer,
     /// bit-identically.
     pub spp: u32,
     /// Master A/B lever (--no-temporal): disable ALL previous-frame quadtree
-    /// reuse â€” no temporal cache produced or consumed, no claim ring, no cut
+    /// reuse — no temporal cache produced or consumed, no claim ring, no cut
     /// store, no structure replay. Every frame proves its empty space from
     /// scratch. Default on.
     pub temporal: bool,
@@ -284,25 +284,25 @@ pub struct Opts {
     /// A/B lever (--no-adopt): keep temporal seeding but disable the
     /// query skip / cut adoption (and CutStore production). Default on.
     pub adopt: bool,
-    /// A/B/C lever (--discard-seeds): run the whole temporal pipeline â€”
-    /// lookups, ring retries, cache + cut-store production â€” but consume
+    /// A/B/C lever (--discard-seeds): run the whole temporal pipeline —
+    /// lookups, ring retries, cache + cut-store production — but consume
     /// nothing, so every frame traces exactly like --no-temporal while
     /// paying the machinery's full cost. With --spin this isolates cost
-    /// from benefit as wall-clock differences: (this âˆ’ --no-temporal) =
-    /// pure cost, (default âˆ’ this) = gross benefit. Default off.
+    /// from benefit as wall-clock differences: (this − --no-temporal) =
+    /// pure cost, (default − this) = gross benefit. Default off.
     pub discard_seeds: bool,
     /// Deferred material-sorted shading (--defer-shade): plain-path leaf
     /// tiles trace but defer shading; same-material runs merge up the
-    /// quadtree (â‰¤ 64Ã—64 px) and flush as single cache-coherent bursts.
+    /// quadtree (≤ 64×64 px) and flush as single cache-coherent bursts.
     pub defer_shade: bool,
     /// A/B lever (--no-hemi-share): disable the shared hemisphere capture
-    /// in fb (H) frames â€” every shading point runs its own bounce tree.
+    /// in fb (H) frames — every shading point runs its own bounce tree.
     /// Default on.
     pub hemi_share: bool,
     /// A/B lever (--no-cut-rays): cut-SEEDED rays (primary leaf-tile, hemi
     /// leaf, shaft) traverse from the BVH root instead of from their node
-    /// cut. The inherited t_start is UNAFFECTED â€” it is a scalar, not a node
-    /// reference â€” so this isolates what the CUT is worth to the ray path
+    /// cut. The inherited t_start is UNAFFECTED — it is a scalar, not a node
+    /// reference — so this isolates what the CUT is worth to the ray path
     /// from what the inherited distance bound is worth. That is the question
     /// that decides whether the frustum structure and the ray BVH can be
     /// separate trees (a cut over one tree cannot index another). On the GPU
@@ -311,7 +311,7 @@ pub struct Opts {
     pub cut_rays: bool,
     /// A/B lever (--sw-rays): the GPU WAVEFRONT tracer's rays traverse the
     /// software BVH (bvh.rs's loops ported to rt_sw.hlsli) instead of DXR
-    /// inline RayQuery, so primary leaf rays seed from the tile's node cut â€”
+    /// inline RayQuery, so primary leaf rays seed from the tile's node cut —
     /// the one product of the frustum recursion the RayQuery API cannot
     /// accept. Composes with --no-cut-rays (software from the root) and
     /// --no-ftree (binary cuts, no translation). Wavefront only; --dxr and
@@ -337,13 +337,13 @@ pub struct Opts {
     /// Default 0.0 pending the sweep; see bvh::C_TRAV_BITS.
     pub c_trav: f32,
     /// Hard ceiling on triangles per leaf (--bvh-maxleaf). Above this a node
-    /// splits regardless of what SAH says â€” phase 1 of the parallel build
+    /// splits regardless of what SAH says — phase 1 of the parallel build
     /// relies on a too-big node always splitting.
     pub max_leaf: usize,
     /// Axes the binned SAH searches (--bvh-axes 1|3). 1 = the historical build
     /// (widest centroid axis only); 3 = all axes, global best. A knob rather
     /// than a hardcode so the axis change and the C_trav change stay separately
-    /// attributable â€” they landed together.
+    /// attributable — they landed together.
     pub split_axes: usize,
     /// The M7 bake-off lever (--bvh-builder sah|lbvh|ploc|som): which
     /// algorithm builds the ray BVH. Every builder produces the same Bvh
@@ -354,25 +354,25 @@ pub struct Opts {
     /// TLAS (blas_split.rs). DEFAULT ON at `DEFAULT_MAX_PRIMS`; `None` =
     /// --no-blas-split = one BLAS over the whole scene (the pre-feature build).
     ///
-    /// It is the default for ROBUSTNESS, not throughput â€” on NVIDIA it is
+    /// It is the default for ROBUSTNESS, not throughput — on NVIDIA it is
     /// neutral (measured within +-1% on four world poses). BLAS scratch is
     /// sized by the largest single geometry, so one 34.4M-triangle BLAS made
     /// Intel's driver ask for 1891 MB of it and REMOVE THE DEVICE mid-boot on
     /// THE WORLD (NVIDIA asked 276 MB for the same build and survived); at a
-    /// 64k cap the scratch is a function of one chunk â€” 3 MB â€” and the same
+    /// 64k cap the scratch is a function of one chunk — 3 MB — and the same
     /// session runs. GPU-only and derived from the built BVH, so it keys
     /// nothing in the scene cache; the CPU tracer, the software BVH and the
     /// frustum cut never see it.
     pub blas_split: Option<u32>,
     /// A/B lever (--no-ftree disables): route ALL bound queries through the
-    /// 8-wide frustum tree lazily collapsed from the ray BVH (ftree.rs) â€” the
+    /// 8-wide frustum tree lazily collapsed from the ray BVH (ftree.rs) — the
     /// two-tree split. Rays always stay on the binary BVH.
     /// Default on: -15/-17% hemi-ao, -4/-8% hemi-gi (default scene + San
     /// Miguel), bounds bit-identical per the self-test.
     pub ftree: bool,
     /// Per-consumer A/B lever (--ftree-tiles): the primary tile recursion
     /// (tile_step/adopt_step bound queries + refines) on the wide tree, cuts
-    /// translated to binary ray roots once per leaf tile. Default OFF â€”
+    /// translated to binary ray roots once per leaf tile. Default OFF —
     /// measured wall-neutral on San Miguel, ~10% slower on stress no-temporal
     /// (see ftree::FTREE_TILES). Hemi keeps its own wiring; --no-ftree kills
     /// both; --check verifies the wired path regardless (the wide-tiles gate).
@@ -389,13 +389,13 @@ pub struct Opts {
     /// RT tier 1.1; falls back to the CPU path with a loud line otherwise.
     pub gpu: bool,
     /// The DXR DispatchRays pipeline as the session's render mode (default
-    /// ON â€” the F key toggles it live against the CPU tracer; --cpu opts
+    /// ON — the F key toggles it live against the CPU tracer; --cpu opts
     /// back into the CPU renderer). Requires the DXC DLL drop and RT tier
     /// 1.0; falls back to the CPU path with a loud line.
     pub dxr: bool,
     /// Did the user name a render mode at all (`--cpu` / `--gpu` / `--dxr`)?
     /// `dxr` defaults to true, so "is DXR on" cannot answer "did they ASK for
-    /// DXR" â€” and two places need that distinction: `--spin` (which drives the
+    /// DXR" — and two places need that distinction: `--spin` (which drives the
     /// CPU renderer unless a GPU arm was requested) and the vendor-default
     /// policy in `run_window`, which may only move a default the user left
     /// alone. `dxr_explicit` already existed as a parse-local for the
@@ -415,10 +415,10 @@ pub struct Opts {
     pub pix_path: String,
     /// D3D12 timestamp queries around the PIX marker brackets, printed as a
     /// per-region GPU-ms table (--gpu-timing; default off, zero-cost when
-    /// off â€” no query heap, no name allocation, byte-identical lists). The
+    /// off — no query heap, no name allocation, byte-identical lists). The
     /// vendor-neutral profiler, and vendor-neutrality is the whole point:
     /// PIX's capture ANALYSIS only replays on AMD/NVIDIA, so on an Intel
-    /// adapter this is the only way to get per-pass GPU numbers at all â€” and
+    /// adapter this is the only way to get per-pass GPU numbers at all — and
     /// the per-pass AMD-vs-NVIDIA diff it makes possible is what found the
     /// leaf kernel's wave64 bug.
     pub gpu_timing: bool,
@@ -431,23 +431,23 @@ pub struct Opts {
     /// monitor. On an HDR display it carries real highlights; on an SDR one it
     /// still removes our 8-bit quantization and lets DWM drive a 10-bit panel
     /// at full precision (deep colour) instead of banding at 8. `--no-hdr`
-    /// forces the legacy 8-bit swapchain â€” the A/B lever, and the automatic
+    /// forces the legacy 8-bit swapchain — the A/B lever, and the automatic
     /// fallback when the colour space is refused.
     pub hdr: bool,
     /// `--hdr10`: force the 10-bit PQ (R10G10B10A2 + G2084) swapchain in any
-    /// session â€” the A/B lever for the encode the wrapper-FG families take
+    /// session — the A/B lever for the encode the wrapper-FG families take
     /// automatically on an HDR-on display. Override-wins like `--hdr-peak`.
     /// Only meaningful with `hdr` (the parse arms keep the pair consistent:
-    /// `--hdr10` sets both, `--no-hdr`/`--hdr` clear this one â€” three states,
+    /// `--hdr10` sets both, `--no-hdr`/`--hdr` clear this one — three states,
     /// later flags win).
     pub hdr10: bool,
     /// `--hdr-paper-white <nits>`: where linear 1.0 lands. The scene is authored
-    /// so 1.0 â‰ˆ diffuse white; 200 is the usual desktop-HDR reference.
+    /// so 1.0 ≈ diffuse white; 200 is the usual desktop-HDR reference.
     pub hdr_paper_white: f32,
     /// `--hdr-peak <nits>`: override the display's reported peak. None = trust
     /// what the monitor says (`gpu::display::probe`).
     pub hdr_peak: Option<f32>,
-    /// `--tod <hour>`: start time-of-day (float hours, wrapped into 0..24 â€”
+    /// `--tod <hour>`: start time-of-day (float hours, wrapped into 0..24 —
     /// e.g. 17.5 = sunset light). None = the default sun, bit-identical to
     /// the pre-TOD renderer; the `,`/`.` keys and D-pad still scrub live.
     /// Applied AFTER the scene cache load/store so a `--tod` session can
@@ -455,10 +455,10 @@ pub struct Opts {
     pub tod: Option<f32>,
 }
 
-/// OIDN placement in XeSS mode (N cycles off â†’ pre â†’ post). Pre denoises the
-/// 1-spp frame at the dynamic render res before upscaling â€” the recommended
+/// OIDN placement in XeSS mode (N cycles off → pre → post). Pre denoises the
+/// 1-spp frame at the dynamic render res before upscaling — the recommended
 /// default (guides match, subpixel jitter detail preserved, cheaper). Post
-/// denoises the upscaled window-res frame â€” the A/B experiment; costs a
+/// denoises the upscaled window-res frame — the A/B experiment; costs a
 /// synchronous GPU readback plus a window-res denoise every frame and
 /// presents through the CPU blit path.
 #[derive(Clone, Copy, PartialEq)]
@@ -470,7 +470,7 @@ enum XessOidn {
 
 /// The presentation/denoise mode a frame renders for, resolved ONCE per frame
 /// from the toggle flags (precedence dlss > xess > oidn > plain). Every
-/// mode-dependent FrameCtx field reads this single value â€” the per-field
+/// mode-dependent FrameCtx field reads this single value — the per-field
 /// if/else chains it replaced each re-encoded the precedence by ordering and
 /// could silently disagree when a toggle handler missed a reset.
 #[derive(Clone, Copy, PartialEq)]
@@ -488,7 +488,7 @@ enum RenderMode {
     Oidn { temporal: bool },
     /// NPPD neural denoising: fresh 1-spp full-res frames on a free-running
     /// rng index; the network's own recurrent state (warped in Rust) is the
-    /// sole temporal integrator â€” no CPU accumulation, no History, no budget
+    /// sole temporal integrator — no CPU accumulation, no History, no budget
     /// frames. Fills its own window-res G-buffers with `prev_cam` set (the
     /// state warp consumes real motion vectors).
     Nppd,
@@ -628,8 +628,8 @@ fn main() {
     // resolving), Some(false) = --no-world (today's procedural boot). Later
     // flags win, the --heightfield/--no-heightfield pattern.
     let mut world_flag: Option<bool> = None;
-    // JSON settings: the file's values land here â€” after the defaults
-    // literal, BEFORE the parse loop â€” so every CLI flag parsed below simply
+    // JSON settings: the file's values land here — after the defaults
+    // literal, BEFORE the parse loop — so every CLI flag parsed below simply
     // overwrites them (defaults < file < flags, by ordering alone). Headless
     // gate/bench runs (--check*, --*-dump, --spin*) and --no-settings skip
     // the file entirely: the gates' value is that a command line fully
@@ -784,26 +784,26 @@ fn main() {
             "--defer-shade" => opts.defer_shade = true,
             // Before scene load by construction (the --bvh-ctrav knob
             // pattern): no chains are built, every trilinear sample falls
-            // back to mip-0 bilinear â€” the pre-mip renderer exactly.
+            // back to mip-0 bilinear — the pre-mip renderer exactly.
             "--no-mips" => texture::set_mips(false),
             // Load-time converter kill levers, same "knob before scene load"
             // pattern: --no-h2n restores the pre-conversion behavior exactly
             // (grayscale bump maps are dropped, normal_tex stays NO_TEX);
             // --no-n2h leaves real normal maps' alpha at 255 and height_amp
-            // at 0.0 â€” relief has no field to march, structurally off.
+            // at 0.0 — relief has no field to march, structurally off.
             "--no-h2n" => texture::set_h2n(false),
             "--no-n2h" => texture::set_n2h(false),
             // Tinted-shadows kill lever, same "knob before scene load"
             // pattern: finalize_scalars never arms any_transmissive, so
-            // every light-occlusion query binary-blocks on glass â€” the
+            // every light-occlusion query binary-blocks on glass — the
             // pre-feature renderer bit-identically (occlusion rays through
-            // transmissive surfaces otherwise carry a transmissionÃ—albedo
+            // transmissive surfaces otherwise carry a transmission×albedo
             // tint per interface).
             "--no-tinted-shadows" => scene::set_tinted_shadows(false),
             // Water-look levers: --no-spray keeps tiny transmissive islands
             // (fountain droplets) as clear glass instead of retagging them
             // white-scatter at load (keys the cache lever word);
-            // --no-depth-tint drops the Beerâ€“Lambert attenuation over the
+            // --no-depth-tint drops the Beer–Lambert attenuation over the
             // transmission chain's interior segments (runtime shading lever).
             "--no-spray" => scene::set_spray(false),
             "--no-depth-tint" => scene::set_depth_tint(false),
@@ -811,16 +811,16 @@ fn main() {
             // pre-water-class look) instead of the water refinement (blue-green
             // tint, IOR 1.33, ripple normals); keys the cache lever word.
             "--no-water" => scene::set_water(false),
-            // Relief rendering session levers. The DEFAULT is DISARMED â€”
+            // Relief rendering session levers. The DEFAULT is DISARMED —
             // structurally the pre-relief renderer (no AABB sweep at BVH
             // build, no march anywhere; the sweep's all-axis edge pad
             // measurably wrecks BVH quality on all-tris-carry-height scenes
-            // even with relief off â€” see bvh.rs's HEIGHT_ARMED header).
+            // even with relief off — see bvh.rs's HEIGHT_ARMED header).
             // --heightfield ARMS the session and starts relief ON (V then
             // toggles relief live within the armed session); --no-heightfield
             // is the explicit spelling of the default, kept as the
             // later-flags-win override. Both set BOTH statics so
-            // `--no-heightfield --heightfield` is a true arm â€” headless
+            // `--no-heightfield --heightfield` is a true arm — headless
             // --check* paths read height_on() directly, with no session()
             // to re-seed it. Armed state keys the scene cache.
             "--heightfield" => {
@@ -832,19 +832,19 @@ fn main() {
                 bvh::set_height_on(false);
             }
             // A/B lever: no glare. A display-stage pass, so this is a pure
-            // presentation change â€” accum, the temporal cache, every upscaler
+            // presentation change — accum, the temporal cache, every upscaler
             // guide and every radiance gate are untouched either way, and the
             // off path keeps the original alloc-free tonemap loop verbatim.
             "--no-bloom" => bloom::set_enabled(false),
             // A/B kill lever for the volumetric cloud layer (default ON).
             // Same "session constant before scene load" pattern: off takes
-            // guarded early returns everywhere â€” bit-identical to the
+            // guarded early returns everywhere — bit-identical to the
             // pre-cloud renderer (clouds::self_test pins it).
             "--no-clouds" => clouds::set_enabled(false),
-            // The slab-space cloud-shadow cache (default ON at 16 cells/Î») and
+            // The slab-space cloud-shadow cache (default ON at 16 cells/λ) and
             // the amortized sky-march lattice (default ON at K=4). Both are GPU
             // shading-cache levers; off is bit-identical (guarded arms). Same
-            // "knob before scene load" pattern â€” TraceGpu/DxrGpu snapshot them
+            // "knob before scene load" pattern — TraceGpu/DxrGpu snapshot them
             // in new(). 0 / 1 = the respective off spellings.
             "--no-cloud-shadow" => gpu::trace::set_cloud_shadow(0),
             "--cloud-shadow" => {
@@ -871,7 +871,7 @@ fn main() {
                 gpu::trace::set_sky_lod(k);
             }
             // Firefly point lights (default ON, but they only exist after
-            // dusk â€” a day session snapshots count = 0 and is bit-identical
+            // dusk — a day session snapshots count = 0 and is bit-identical
             // structurally). Same "session constant before scene load"
             // pattern; the count clamps to the CB row cap loudly.
             "--no-fireflies" => fireflies::set_enabled(false),
@@ -893,8 +893,8 @@ fn main() {
             }
             // Same "knob before scene load" pattern: the GPU reads it for the
             // static sampler's MaxAnisotropy, the CPU for Cone::aniso. 1 = off
-            // â‡’ the isotropic ray-cone lod path runs verbatim (bit-identical
-            // to the pre-aniso renderer). --no-mips forces it to 1 â€” mips are
+            // ⇒ the isotropic ray-cone lod path runs verbatim (bit-identical
+            // to the pre-aniso renderer). --no-mips forces it to 1 — mips are
             // the prerequisite (texture::set_aniso).
             "--no-aniso" => texture::set_aniso(1),
             "--aniso" => {
@@ -961,9 +961,9 @@ fn main() {
             "--blas-split" => {
                 // Optional value: a bare flag takes the conventional-band cap,
                 // an explicit N (e.g. 64) reaches the tiny-BLAS regime. The
-                // next token is only CONSUMED when it is all digits â€” so
+                // next token is only CONSUMED when it is all digits — so
                 // `--blas-split model.obj` and `--blas-split --stress 5000`
-                // leave their arguments alone â€” but a numeric token that is
+                // leave their arguments alone — but a numeric token that is
                 // not a legal cap (0, or past u32) is a typo, not a scene
                 // path, and exits rather than silently arming at the default
                 // and landing in the positional arm as an OBJ named "0".
@@ -986,7 +986,7 @@ fn main() {
             }
             "--no-blas-split" => opts.blas_split = None,
             // The DXR pipeline's ray-dispatch mode (gpu::dxr::dxr_inline_mode
-            // â€” the set_aniso knob idiom). DEFAULT 1 = primary TraceRay +
+            // — the set_aniso knob idiom). DEFAULT 1 = primary TraceRay +
             // inline RayQuery secondaries, which strictly dominates the
             // all-TraceRay pipeline (0) at every measured point on both
             // vendors; 2 = everything inline in raygen (the high-spp Intel
@@ -998,7 +998,7 @@ fn main() {
                     .filter(|&n| n <= 2)
                     .unwrap_or_else(|| {
                         eprintln!(
-                            "--dxr-inline needs 0 (all TraceRay), 1 (inline secondaries â€” \
+                            "--dxr-inline needs 0 (all TraceRay), 1 (inline secondaries — \
                              the default), or 2 (everything inline in raygen)"
                         );
                         std::process::exit(2);
@@ -1023,7 +1023,7 @@ fn main() {
             "--no-vsync" => opts.vsync = false,
             "--vsync" => opts.vsync = true,
             // The swapchain flags are a three-way choice (SDR | scRGB | HDR10)
-            // spelled as two toggles, so each arm writes BOTH fields â€” that is
+            // spelled as two toggles, so each arm writes BOTH fields — that is
             // what makes later-flags-win hold across the pairs (`--no-hdr
             // --hdr10` = PQ, `--hdr10 --no-hdr` = SDR). Mirrored in
             // settings.rs (display.hdr / display.hdr10).
@@ -1231,7 +1231,7 @@ fn main() {
                 })
             }
             // Consumed by the pre-parse settings scan (settings::headless_args)
-            // â€” this arm only keeps the token out of the positional fallback,
+            // — this arm only keeps the token out of the positional fallback,
             // which would read it as a scene path.
             "--no-settings" => {}
             "--world" => world_flag = Some(true),
@@ -1285,17 +1285,17 @@ fn main() {
                 eprintln!("                exclusive with a scene arg, --stress, --tile, --spin, and --check*)");
                 eprintln!("  --no-world    flagless boot uses the procedural default scene instead");
                 eprintln!("  --stress <n>  procedural stress field of n objects (perf test; composes with --check)");
-                eprintln!("  --tile <n|nxm>  replicate a loaded OBJ scene into an nÃ—n (or nÃ—m) grid of copies â€”");
+                eprintln!("  --tile <n|nxm>  replicate a loaded OBJ scene into an n×n (or n×m) grid of copies —");
                 eprintln!("                flattened geometry, shared materials/textures (composes with --check)");
                 eprintln!("  --cam <e,t>   start camera: ex,ey,ez,tx,ty,tz (reproducible benchmark viewpoints)");
                 eprintln!("  --check       headless: verify hybrid vs reference, benchmark, write check.png");
                 eprintln!("  --check-dlss  headless: G-buffer MV/depth/matrix self-test (no GPU needed)");
                 eprintln!("  --dlss-dump   --check-dlss plus G-buffer PNG dumps (albedo/spec_albedo/normal/misc/mv)");
                 eprintln!("  --no-dlss     skip the DLSS-RR level of the upscaler chain (falls to FSR4/XeSS/FSR3);");
-                eprintln!("                the chain DLSS-RR -> FSR4-RR -> XeSS -> FSR3 is always on â€” the first");
+                eprintln!("                the chain DLSS-RR -> FSR4-RR -> XeSS -> FSR3 is always on — the first");
                 eprintln!("                supported level wins; --<x> force-starts the chain at that level");
                 eprintln!("  --no-upscale  plain presentation: no temporal upscaler at all (benchmark escape)");
-                eprintln!("  --no-bc7      upload scene textures as raw RGBA8 â€” BC7 block compression is ON by");
+                eprintln!("  --no-bc7      upload scene textures as raw RGBA8 — BC7 block compression is ON by");
                 eprintln!("                default (8 bpp vs 32; GPU-compute encode at upload; alpha-masked cutout");
                 eprintln!("                textures stay exact RGBA8 always). --bc7-cpu forces the CPU ispc encode");
                 eprintln!("                (the A/B arm; slow). --bc7-quality <p>: ultrafast|fast|basic|slow");
@@ -1309,7 +1309,7 @@ fn main() {
                 eprintln!("  --oidn-quality OIDN RT-filter quality: fast|balanced|high (default balanced)");
                 eprintln!("  --oidn-no-clean-aux  don't declare the albedo/normal guides noise-free (A/B lever)");
                 eprintln!("  --nppd        NPPD neural denoising (J toggles; needs onnxruntime.dll + an exported");
-                eprintln!("                model â€” see tools/nppd-export). Implies --xess: NPPD denoises at the");
+                eprintln!("                model — see tools/nppd-export). Implies --xess: NPPD denoises at the");
                 eprintln!("                render res before the upscale; --no-xess keeps the standalone window-res mode");
                 eprintln!("  --check-nppd  headless: NPPD denoise self-test (needs onnxruntime.dll + the model)");
                 eprintln!("  --nppd-dump   --check-nppd plus before/after PNG dumps");
@@ -1320,12 +1320,12 @@ fn main() {
                 eprintln!("  --xess-dump   --check-xess plus G-buffer PNG dumps");
                 eprintln!("  --check-fsr   headless: FSR signal-split/encoding/MV contract self-test (no GPU or DLL)");
                 eprintln!("  --fsr         force-start the upscaler chain at FSR4 + Ray Regeneration (K toggles;");
-                eprintln!("                RDNA4 only â€” elsewhere the chain falls to XeSS then FSR 3.1)");
+                eprintln!("                RDNA4 only — elsewhere the chain falls to XeSS then FSR 3.1)");
                 eprintln!("  --fsr4        --fsr, but REQUIRED: exit(2) instead of falling through when FSR4 +");
                 eprintln!("                Ray Regeneration is unavailable (suggests --fsr3 / --prefer-amd)");
                 eprintln!("  --fsr3        force-start the chain at the FSR 3.1 upscale-only level (A/B lever)");
                 eprintln!("  --ffx-path    FidelityFX DLL directory (default: the FidelityFX-Samples-prebuilt drop)");
-                eprintln!("  --fg          FRAME GENERATION for the wired upscaler family â€” ON BY DEFAULT");
+                eprintln!("  --fg          FRAME GENERATION for the wired upscaler family — ON BY DEFAULT");
                 eprintln!("                (--no-fg disables): FSR sessions wrap the swapchain with the FidelityFX");
                 eprintln!("                frame-interpolation proxy, DLSS sessions run raw-NGX DLSS-G (SDK builds),");
                 eprintln!("                Intel XeSS sessions XeSS-FG; one generated frame per rendered frame;");
@@ -1335,7 +1335,7 @@ fn main() {
                 eprintln!("  --no-fg       kill lever: no frame generation (restores scRGB where a wrapper family");
                 eprintln!("                would have taken the HDR10/PQ or SDR arm)");
                 eprintln!("  --fg-path     directory holding amd_fidelityfx_framegeneration_dx12.dll (default: the");
-                eprintln!("                drop's FSR sample dir â€” the FG provider does NOT ship next to the loader)");
+                eprintln!("                drop's FSR sample dir — the FG provider does NOT ship next to the loader)");
                 eprintln!("  --quinlight   REGISTERED CONSENSUS: suspend the chain's first-hit-wins rule, wire");
                 eprintln!("                EVERY supported level at once (DLSS-RR + FSR4-RR + XeSS + FSR 3.1),");
                 eprintln!("                run them all over the SAME traced frame, and present the LK-registered");
@@ -1345,7 +1345,7 @@ fn main() {
                 eprintln!("  --gpu         GPU-resident tracing: quadtree + shading in D3D12 compute with DXR");
                 eprintln!("                RayQuery rays (needs the DXC DLLs and RT tier 1.1; falls back to CPU)");
                 eprintln!("  --check-gpu   headless: GPU tracer gate suite (needs a D3D12 GPU + the DXC DLLs)");
-                eprintln!("  --dxr         the DXR DispatchRays pipeline â€” the DEFAULT render mode (F toggles it");
+                eprintln!("  --dxr         the DXR DispatchRays pipeline — the DEFAULT render mode (F toggles it");
                 eprintln!("                against the CPU tracer live; needs the DXC DLLs and RT tier 1.0;");
                 eprintln!("                falls back to CPU with a loud line)");
                 eprintln!("  --cpu         the CPU frustum-tracer as the render mode (opts out of --dxr/--gpu)");
@@ -1357,54 +1357,54 @@ fn main() {
                 eprintln!("  --xess-autoexposure  let XeSS compute exposure internally (A/B lever)");
                 eprintln!("  --no-adaptive disable the adaptive shading rate in XeSS mode (uniform per-pixel shading;");
                 eprintln!("                visibility is per-pixel either way)");
-                eprintln!("  --no-hemi-share  disable the shared hemisphere capture in fb (H) frames â€” every");
+                eprintln!("  --no-hemi-share  disable the shared hemisphere capture in fb (H) frames — every");
                 eprintln!("                shading point runs its own bounce tree (A/B lever)");
                 eprintln!("  --no-clouds   disable the drifting volumetric cloud layer (on by default: raymarched");
-                eprintln!("                FBM slab â€” sky, reflections, glass, and cloud shadows on the direct sun;");
+                eprintln!("                FBM slab — sky, reflections, glass, and cloud shadows on the direct sun;");
                 eprintln!("                off is bit-identical to the pre-cloud renderer)");
                 eprintln!("  --cloud-shadow N  cells/wavelength for the slab-space cloud-shadow cache (default 16;");
                 eprintln!("                GPU sun-transmittance cache, ~-21%/sample of the cloud bill; the domain");
                 eprintln!("                reduction is EXACT, only bilinear interp approximates). --no-cloud-shadow = off");
                 eprintln!("  --sky-lod K   pixel pitch of the amortized cloud-march lattice, power of two (default 4;");
-                eprintln!("                sharp half â€” sun/stars â€” stays per-pixel; ~0.14% sky error). --no-sky-lod = off");
-                eprintln!("  --no-fireflies  disable the firefly point lights (on by default AFTER DUSK â€” under");
-                eprintln!("                --tod they fade in with the stars: curl-noise drift, real 1/dÂ² light");
+                eprintln!("                sharp half — sun/stars — stays per-pixel; ~0.14% sky error). --no-sky-lod = off");
+                eprintln!("  --no-fireflies  disable the firefly point lights (on by default AFTER DUSK — under");
+                eprintln!("                --tod they fade in with the stars: curl-noise drift, real 1/d² light");
                 eprintln!("                with hard shadow rays + a depth-tested glow; a day session has zero");
                 eprintln!("                fireflies and is bit-identical structurally)");
                 eprintln!("  --fireflies N   firefly count (default {}, max {})", fireflies::DEFAULT_COUNT, fireflies::MAX_FIREFLIES);
                 eprintln!("  --no-mips     no texture mip chains; every trilinear sample degenerates to the");
-                eprintln!("                pre-mip bilinear (A/B lever; mips are on by default â€” implies --no-aniso)");
+                eprintln!("                pre-mip bilinear (A/B lever; mips are on by default — implies --no-aniso)");
                 eprintln!("  --no-h2n      don't Sobel-convert grayscale bump maps into normal maps (they are");
                 eprintln!("                dropped, the pre-conversion behavior)");
-                eprintln!("  --no-n2h      don't derive heightfields from normal maps (Frankotâ€“Chellappa) â€” no");
+                eprintln!("  --no-n2h      don't derive heightfields from normal maps (Frankot–Chellappa) — no");
                 eprintln!("                alpha-channel height, height_amp stays 0");
                 eprintln!("  --no-tinted-shadows  shadow/AO rays binary-block on transmissive surfaces (the");
-                eprintln!("                pre-feature behavior; default: they pass with a transmissionÃ—albedo tint)");
+                eprintln!("                pre-feature behavior; default: they pass with a transmission×albedo tint)");
                 eprintln!("  --no-spray    keep tiny transmissive islands (fountain droplets) as clear glass");
                 eprintln!("                instead of white-scatter spray (load-time retag; keys the scene cache)");
-                eprintln!("  --no-depth-tint  no Beerâ€“Lambert attenuation over the transmission chain's interior");
+                eprintln!("  --no-depth-tint  no Beer–Lambert attenuation over the transmission chain's interior");
                 eprintln!("                segments (water loses its depth-graded tint)");
                 eprintln!("  --no-water    classify the fountain as generic glassware, not the water class");
                 eprintln!("                (no blue-green tint / IOR 1.33 / ripple normals; keys the scene cache)");
                 eprintln!("  --heightfield ARM relief rendering and start it ON where the scene carries height");
                 eprintln!("                data (V toggles relief vs normal-mapping live in the armed session).");
-                eprintln!("                The DEFAULT is unarmed: no swept AABBs, no march â€” the pre-relief");
+                eprintln!("                The DEFAULT is unarmed: no swept AABBs, no march — the pre-relief");
                 eprintln!("                renderer bit-exactly (the swept tree costs real BVH quality)");
                 eprintln!("  --no-heightfield  the default, spelled explicitly (later flags win)");
                 eprintln!("  --aniso N     max anisotropy for texture filtering, 1..=16 (default 16; 1 = off, i.e.");
                 eprintln!("                the isotropic ray-cone trilinear path verbatim). --no-aniso = --aniso 1");
                 eprintln!("  --spp <n>     primary samples per pixel per frame (1..=128, default 1; U doubles live).");
                 eprintln!("                The N jittered samples share the tile's inherited t_start/node cut, so");
-                eprintln!("                the quadtree's per-tile cost amortizes over NÃ— the rays (--cpu/--gpu;");
+                eprintln!("                the quadtree's per-tile cost amortizes over N× the rays (--cpu/--gpu;");
                 eprintln!("                --dxr traces from the TLAS root, so there it is plain supersampling).");
-                eprintln!("                They average into ONE per-pixel value â€” a ~1/N-variance frame for the");
+                eprintln!("                They average into ONE per-pixel value — a ~1/N-variance frame for the");
                 eprintln!("                upscaler/denoiser. Pinned to 1 on hemisphere-bounce (H) frames");
                 eprintln!("  --lock-res    DLSS/XeSS render res: quality|balanced|performance|ultra-performance|native,");
                 eprintln!("                a ratio in (0, 1], or dynamic (the step-wise DRS controller); default quality (2/3)");
                 eprintln!("  --xess-path   XeSS DLL directory (default: SDKs\\XeSS-SDK\\bin)");
                 eprintln!("  --prefer-nvidia | --prefer-intel | --prefer-amd");
                 eprintln!("                pick that vendor's adapter for the D3D12 device (default NVIDIA, or AMD");
-                eprintln!("                with --fsr; a preference, not a requirement â€” features the picked GPU");
+                eprintln!("                with --fsr; a preference, not a requirement — features the picked GPU");
                 eprintln!("                can't support fall back with a log line)");
                 eprintln!("  --gpu-debug   D3D12 debug layer + verbose Streamline logging");
                 eprintln!("  --sl-path     Streamline DLL directory (default: SDKs\\streamline-sdk\\bin\\x64)");
@@ -1421,7 +1421,7 @@ fn main() {
     // A file-forced FSR level flips the adapter-preference default exactly
     // like --fsr/--fsr3; the file's scene choice applies ONLY when the CLI
     // named no scene source at all (a CLI scene path, --world, or --stress
-    // replaces it outright â€” a file value must never turn into an
+    // replaces it outright — a file value must never turn into an
     // exclusivity error against a flag).
     if sfx.fsr_forced {
         fsr_forced = true;
@@ -1435,11 +1435,11 @@ fn main() {
     }
 
     if obj.is_some() && stress.is_some() {
-        eprintln!("--stress and an OBJ path are mutually exclusive â€” pick one scene source");
+        eprintln!("--stress and an OBJ path are mutually exclusive — pick one scene source");
         std::process::exit(2);
     }
     if tile.is_some() && obj.is_none() {
-        eprintln!("--tile needs a loaded model to replicate â€” pass an OBJ path");
+        eprintln!("--tile needs a loaded model to replicate — pass an OBJ path");
         std::process::exit(2);
     }
     if opts.nppd && !no_xess_explicit && !no_upscale && (opts.chain.dlss || opts.chain.fsr4) {
@@ -1458,22 +1458,22 @@ fn main() {
         opts.oidn_post = false;
     }
     // --fsr4 requires the level it forces, so a flag that removed it from the
-    // chain (--no-fsr / --no-upscale / a later --xess|--fsr3|--nppd force â€”
+    // chain (--no-fsr / --no-upscale / a later --xess|--fsr3|--nppd force —
     // --nppd force-starts at XeSS) leaves nothing to require. Say which shape
     // of failure this is: the level was never probed, so "unavailable" would
     // be a lie.
     if opts.fsr4_required && !opts.chain.fsr4 {
-        eprintln!("--fsr4: the FSR4 level was knocked out of the upscaler chain by another flag (--no-fsr / --no-upscale / a later --xess, --fsr3 or --nppd) â€” nothing left to require");
+        eprintln!("--fsr4: the FSR4 level was knocked out of the upscaler chain by another flag (--no-fsr / --no-upscale / a later --xess, --fsr3 or --nppd) — nothing left to require");
         std::process::exit(2);
     }
     // --quinlight is GPU-fed only: the engines read the tracer's G-buffer pack
     // through the feed kernels, and there is deliberately no CPU-upload arm
     // (the CPU rings feed ONE upscaler; N of them would be N window-res
-    // uploads per frame â€” the fuse exists to avoid exactly that traffic).
+    // uploads per frame — the fuse exists to avoid exactly that traffic).
     // --cpu clears both GPU modes, so this is the check.
     if opts.quin && !opts.gpu && !opts.dxr {
         eprintln!(
-            "--quinlight needs a GPU render mode (--dxr, the default, or --gpu) â€” \
+            "--quinlight needs a GPU render mode (--dxr, the default, or --gpu) — \
              there is no CPU-fed fuse arm"
         );
         std::process::exit(2);
@@ -1485,7 +1485,7 @@ fn main() {
     }
     // NPPD's present arm is the XeSS one (the frame SPLITS around the ORT run);
     // the fuse's is its own. A quinlight session would build the ORT session and
-    // its ~340 MB of staging and then never dispatch it â€” a silent no-op is
+    // its ~340 MB of staging and then never dispatch it — a silent no-op is
     // worse than being told, so this is the --fsr4 shape: exit, don't degrade.
     if opts.quin && opts.nppd {
         eprintln!(
@@ -1501,9 +1501,9 @@ fn main() {
     }
     // Frame generation wraps the swapchain with ONE family's frame-
     // interpolation proxy; the fuse wires every engine at once and its
-    // present arm is its own. Untested composition â€” the --nppd shape when
+    // present arm is its own. Untested composition — the --nppd shape when
     // EXPLICITLY requested: exit, don't degrade. But fg is on by DEFAULT,
-    // and a default must never make `--quinlight` alone fatal â€” the
+    // and a default must never make `--quinlight` alone fatal — the
     // defaulted arm disarms with a loud line instead.
     if opts.quin && opts.fg {
         if opts.fg_explicit {
@@ -1536,7 +1536,7 @@ fn main() {
         opts.oidn_post = false;
         if opts.nppd && !opts.chain.xess {
             // The GPU NPPD stage rides the XeSS composition only (RR is
-            // itself a denoiser â€” the same exclusion as the CPU paths).
+            // itself a denoiser — the same exclusion as the CPU paths).
             // Phase-C's implication normally forces XeSS; only an explicit
             // --no-xess lands here.
             eprintln!("gpu: NPPD under --gpu needs the XeSS composition; ignoring");
@@ -1553,18 +1553,18 @@ fn main() {
         }
     }
     if opts.dxr && !dxr_explicit && !opts.gpu && (opts.oidn || opts.oidn_post || opts.nppd) {
-        // OIDN and (CPU-side) NPPD denoise frames the CPU renderer produces â€”
+        // OIDN and (CPU-side) NPPD denoise frames the CPU renderer produces —
         // they cannot run under the DXR arm, which would silently switch them
         // back off at init. Asking for one opts out of the DXR default; an
         // explicit --dxr still wins (and F toggles either way live).
-        eprintln!("dxr: OIDN/NPPD are CPU-renderer denoisers â€” staying on the CPU tracer (--dxr forces the pipeline; F toggles live)");
+        eprintln!("dxr: OIDN/NPPD are CPU-renderer denoisers — staying on the CPU tracer (--dxr forces the pipeline; F toggles live)");
         opts.dxr = false;
     }
 
     // PIX command-list markers: opt-in, runtime-loaded; inert otherwise.
     gpu::pix::init(&opts.pix_path, opts.pix_markers);
     // The same marker brackets, timed with D3D12 timestamp queries. No DLL,
-    // every vendor â€” the only per-pass GPU numbers available on Intel. Armed
+    // every vendor — the only per-pass GPU numbers available on Intel. Armed
     // for interactive sessions (a table every REPORT_EVERY frames) AND for the
     // headless suites, whose bench is the deterministic workload.
     gpu::gputime::enable(opts.gpu_timing);
@@ -1574,7 +1574,7 @@ fn main() {
     // so setting the flag once here covers primary, hemi and shaft at a stroke.
     if !opts.cut_rays {
         bvh::CUT_SEED_RAYS.store(false, std::sync::atomic::Ordering::Relaxed);
-        eprintln!("bvh: --no-cut-rays â€” cut-seeded rays traverse from the root (inherited t_start unchanged)");
+        eprintln!("bvh: --no-cut-rays — cut-seeded rays traverse from the root (inherited t_start unchanged)");
     }
     // --sw-rays: the wavefront's rays on the software BVH (rt_sw.hlsli in
     // place of rt.hlsli), leaf primaries cut-seeded. Only a departure from
@@ -1582,7 +1582,7 @@ fn main() {
     if opts.sw_rays {
         gpu::trace::SW_RAYS.store(true, std::sync::atomic::Ordering::Relaxed);
         eprintln!(
-            "gpu: --sw-rays â€” wavefront rays traverse the software BVH (bvh.rs's \
+            "gpu: --sw-rays — wavefront rays traverse the software BVH (bvh.rs's \
              loops in HLSL; leaf primaries seed from the tile cut; no RayQuery). \
              Wavefront (--gpu) only; --dxr is untouched"
         );
@@ -1593,29 +1593,29 @@ fn main() {
     match gpu::trace::cloud_shadow_n() {
         16 => {}
         0 => eprintln!(
-            "clouds: --no-cloud-shadow â€” the sun-transmittance cache is off (per-pixel 2-eval march)"
+            "clouds: --no-cloud-shadow — the sun-transmittance cache is off (per-pixel 2-eval march)"
         ),
         n => eprintln!(
-            "clouds: --cloud-shadow {n} â€” slab-space sun-transmittance cache at {n} cells/wavelength (default 16)"
+            "clouds: --cloud-shadow {n} — slab-space sun-transmittance cache at {n} cells/wavelength (default 16)"
         ),
     }
     match gpu::trace::sky_lod() {
         4 => {}
         k if k <= 1 => {
-            eprintln!("clouds: --no-sky-lod â€” the cloud march runs per-pixel (no lattice)")
+            eprintln!("clouds: --no-sky-lod — the cloud march runs per-pixel (no lattice)")
         }
         k => eprintln!(
-            "clouds: --sky-lod {k} â€” cloud march amortized on a 1/{k} px screen lattice (default 4)"
+            "clouds: --sky-lod {k} — cloud march amortized on a 1/{k} px screen lattice (default 4)"
         ),
     }
     // Hemi leaf rays go root-first by default (the M1/M2 measurement); the
     // static's own default already matches, so only the opt-in stores.
     if opts.cut_hemi {
         bvh::CUT_SEED_HEMI.store(true, std::sync::atomic::Ordering::Relaxed);
-        eprintln!("bvh: --cut-hemi â€” hemi leaf rays seed from their bounce cut (the pre-M2 behavior)");
+        eprintln!("bvh: --cut-hemi — hemi leaf rays seed from their bounce cut (the pre-M2 behavior)");
     }
     // Must land before ANY Bvh::build (the loader's cold-miss build included)
-    // and before the scene cache is probed â€” build_key() is part of its key.
+    // and before the scene cache is probed — build_key() is part of its key.
     bvh::set_c_trav(opts.c_trav);
     bvh::set_max_leaf(opts.max_leaf);
     bvh::set_split_axes(opts.split_axes);
@@ -1624,19 +1624,19 @@ fn main() {
         std::process::exit(2);
     }
     // GPU-only and read at SceneGpu upload (both tracers), so it may land any
-    // time before a GPU tracer is built â€” but it belongs with the other
+    // time before a GPU tracer is built — but it belongs with the other
     // build-shape levers, and the startup line is the arming signal.
     blas_split::set_max_prims(opts.blas_split);
-    // Silent at the default â€” the `gpu scene:` line already reports the chunk
+    // Silent at the default — the `gpu scene:` line already reports the chunk
     // count, and this is now every GPU session. Only a DEPARTURE speaks.
     match opts.blas_split {
         Some(n) if n != blas_split::DEFAULT_MAX_PRIMS => eprintln!(
-            "blas-split: --blas-split {n} â€” one BLAS per maximal BVH subtree of <= {n} tris \
+            "blas-split: --blas-split {n} — one BLAS per maximal BVH subtree of <= {n} tris \
              (default {})",
             blas_split::DEFAULT_MAX_PRIMS
         ),
         None => eprintln!(
-            "blas-split: --no-blas-split â€” ONE BLAS over the whole scene. Note this is the \
+            "blas-split: --no-blas-split — ONE BLAS over the whole scene. Note this is the \
              configuration that removed the device on Intel at 34.4M tris (BLAS scratch is \
              sized by the largest geometry); it is the A/B arm, not a safe default"
         ),
@@ -1644,13 +1644,13 @@ fn main() {
     }
     if !opts.ftree {
         ftree::FTREE_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
-        eprintln!("ftree: --no-ftree â€” all bound queries stay on the binary BVH");
+        eprintln!("ftree: --no-ftree — all bound queries stay on the binary BVH");
     }
-    // Tile recursion on the wide tree is opt-in (default off â€” the static's
+    // Tile recursion on the wide tree is opt-in (default off — the static's
     // own default already matches, so only the opt-in stores).
     if opts.ftree_tiles {
         ftree::FTREE_TILES.store(true, std::sync::atomic::Ordering::Relaxed);
-        eprintln!("ftree: --ftree-tiles â€” the tile recursion runs on the 8-wide frustum tree");
+        eprintln!("ftree: --ftree-tiles — the tile recursion runs on the 8-wide frustum tree");
     }
     if !opts.wide_levels {
         gpu::trace::WIDE_LEVELS_ON.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -1662,18 +1662,30 @@ fn main() {
 
     // World selection: ONLY the flagless interactive path. Every headless
     // suite and benchmark keeps its own scene (flagless --check/--spin stay
-    // on the procedural scene â€” the structural must-fire gates are tuned to
+    // on the procedural scene — the structural must-fire gates are tuned to
     // its topology, and no gate may move), and a positional scene always
     // wins. An EXPLICIT --world in one of those combinations errors instead
-    // of silently resolving â€” being told is the feature (the --fsr4 shape).
-    let any_check = check
+    // of silently resolving — being told is the feature (the --fsr4 shape).
+    let any_check = (check
         || check_dlss
         || check_oidn
         || check_xess
         || check_fsr
         || check_nppd
         || check_gpu
-        || check_dxr;
+        || check_dxr)
+        // FR_WORLD_CHECK=1 (opt-in, off by default) lets the headless suites
+        // run ON the world. The world is the ONE scene no gate can otherwise
+        // reach, so a world-only regression is structurally invisible — this
+        // is the escape hatch for diagnosing one. No default gate moves: a
+        // flagless --check* is unchanged, so the structural must-fires stay
+        // tuned to the procedural scene's topology. Expect the world to trip
+        // the pose-sensitive gates (mv_selftest's fixed dolly, the sky/hemi
+        // must-fires) and the vacuous transmissive must-fire — the world has
+        // 3 transmissive tris, 2 of which spray-retagging turns opaque. Read
+        // the exact-zero counters (claim-violation / false-sky /
+        // tmin-overshoot), which are scene-independent.
+        && std::env::var("FR_WORLD_CHECK").is_err();
     if world_flag == Some(true)
         && (obj.is_some() || stress.is_some() || tile.is_some() || spin.is_some() || any_check)
     {
@@ -1714,7 +1726,7 @@ fn main() {
         let code = run_spin(&scene, &bvh, cam0, mode, spin_frames, &opts);
         std::process::exit(code);
     }
-    // Must-fire structural gates are tuned to the default scene's topology â€”
+    // Must-fire structural gates are tuned to the default scene's topology —
     // skipped for --stress AND loaded OBJ scenes (a real scene can lack the
     // required features outright: a skyless view can't fire sky-tiles, and a
     // dense one legitimately overflows the replay recording arena). The
@@ -1996,7 +2008,7 @@ fn load_scene(req: &SceneRequest) -> LoadedScene {
 /// tier 1.0) + the DXC DLLs, like --check-gpu. The DXR library pastes the
 /// SAME shade.hlsli as the compute tracer, so the gates mirror the
 /// --check-gpu reference gates: primary visibility vs the CPU plain
-/// reference (statistical â€” hardware watertight intersection differs from
+/// reference (statistical — hardware watertight intersection differs from
 /// moller_trumbore at edges, and the RNG streams differ by design), a
 /// 64-frame converged radiance A/B, and the resolve link the tonemap reads.
 /// Exit codes: 0 = pass, 1 = a gate failed, 2 = environment.
@@ -2041,7 +2053,7 @@ fn run_check_dxr(
 
     let (gw, gh) = (800usize, 600usize);
     let dev = hg.device.clone();
-    // ONE shared core for both DxrGpus this suite builds â€” the interactive
+    // ONE shared core for both DxrGpus this suite builds — the interactive
     // sessions' Rc-sharing shape (the --check-gpu twin).
     let core = match gpu::trace::SceneGpu::new_uploaded(&dev, scene, bvh, &mut hg, opts.bc7) {
         Ok(c) => std::rc::Rc::new(c),
@@ -2072,23 +2084,23 @@ fn run_check_dxr(
     );
     // Anti-vacuity: with blas-split armed (the DEFAULT), every gate below is
     // only a proof of the (InstanceID, PrimitiveIndex) remap if the scene
-    // actually split. A scene UNDER the cap legitimately builds one chunk â€”
+    // actually split. A scene UNDER the cap legitimately builds one chunk —
     // that is the single-BLAS shape reached through the split path, not a
-    // failure â€” so it says so instead of failing. Over the cap, one chunk
+    // failure — so it says so instead of failing. Over the cap, one chunk
     // means the planner stopped cutting and the remap went untested.
     if let Some(cap) = blas_split::max_prims() {
         if dg.scene.n_chunks < 2 {
             if scene.tri_count() as u32 > cap {
                 eprintln!(
                     "check-dxr: FAIL blas-split cap {cap} but the scene built {} chunk(s) \
-                     from {} tris â€” the remap is untested",
+                     from {} tris — the remap is untested",
                     dg.scene.n_chunks,
                     scene.tri_count()
                 );
                 return 1;
             }
             eprintln!(
-                "check-dxr: note â€” {} tris is under the {cap} cap, so the scene is ONE chunk; \
+                "check-dxr: note — {} tris is under the {cap} cap, so the scene is ONE chunk; \
                  the remap runs as the identity here (use --blas-split N to split it)",
                 scene.tri_count()
             );
@@ -2208,7 +2220,7 @@ fn run_check_dxr(
         rec
     };
 
-    // T1: one unjittered DispatchRays frame vs the CPU reference â€” primary
+    // T1: one unjittered DispatchRays frame vs the CPU reference — primary
     // visibility (t + hit/sky classification), plus the must-fire halves.
     if let Err(e) = gpu_frame(&mut hg, &dg, 0) {
         eprintln!("check-dxr: FAIL DispatchRays: {e}");
@@ -2266,7 +2278,7 @@ fn run_check_dxr(
 
     // T1c: the cloud shading caches (--cloud-shadow / --sky-lod), DXR port. The
     // frame above ran with the session's caches armed (the radiance A/B already
-    // gated that the DXR sky â€” now lattice-fed â€” still matches the CPU
+    // gated that the DXR sky — now lattice-fed — still matches the CPU
     // reference). Here a SECOND DxrGpu with both caches OFF renders the same
     // frame; the DXR fill kernels + u5/u6 wiring share the exact math the
     // wavefront's --check-gpu fill-vs-oracle / on-off gates pin, so this pins
@@ -2346,7 +2358,7 @@ fn run_check_dxr(
                                     ok = false;
                                 }
                                 if must_fire && mx == 0.0 {
-                                    eprintln!("check-dxr: FAIL cloud caches changed NOTHING vs off â€” vacuous (u5/u6 unbound? fill skipped?)");
+                                    eprintln!("check-dxr: FAIL cloud caches changed NOTHING vs off — vacuous (u5/u6 unbound? fill skipped?)");
                                     ok = false;
                                 }
                                 if off_acc.iter().any(|v| !v.is_finite()) {
@@ -2379,7 +2391,7 @@ fn run_check_dxr(
     // table that function fills in the CB. A packing or index error there puts
     // the GPU's ray somewhere else in the pixel and shows up here as t
     // disagreement at silhouettes. Same thresholds as T1 (watertight hardware
-    // intersection â‰  mÃ¶ller-trumbore at edges â€” statistical, not exact).
+    // intersection ≠ möller-trumbore at edges — statistical, not exact).
     {
         const SPP_GATE: u32 = 4;
         for probe in 0..SPP_GATE {
@@ -2437,7 +2449,7 @@ fn run_check_dxr(
         }
     }
 
-    // T2: 64-frame jittered accumulation both sides â€” converged radiance
+    // T2: 64-frame jittered accumulation both sides — converged radiance
     // A/B (different RNG streams; only the means are comparable). Also the
     // finiteness gate over the raw HDR sums.
     const AB_FRAMES: u32 = 64;
@@ -2491,7 +2503,7 @@ fn run_check_dxr(
         ok = false;
     }
 
-    // T3: the resolve pass (accum -> RGBA16F, the tonemap PS's input) â€”
+    // T3: the resolve pass (accum -> RGBA16F, the tonemap PS's input) —
     // texel == accum/samples within f16 precision; the present chain's only
     // compute link, verified headlessly.
     {
@@ -2573,10 +2585,10 @@ fn run_check_dxr(
     // --- T4: the G-buffer pack under the upscaler contract ---
     // A second pipeline with the full pack (gbuf_full), at odd dims like
     // --check-gpu's M7: frame A (no prev), a 0.02*diag forward dolly, frame B
-    // (prev = basis A) â€” both fresh 1-spp DispatchRays frames with zero
+    // (prev = basis A) — both fresh 1-spp DispatchRays frames with zero
     // frame-uniform jitter. The pack is read back, unpacked into CPU GBufs,
-    // and gated by the EXACT existing dlss::mv_selftest â€” zero new
-    // tolerances â€” plus structural coverage (every px view-z > 0, sky depth
+    // and gated by the EXACT existing dlss::mv_selftest — zero new
+    // tolerances — plus structural coverage (every px view-z > 0, sky depth
     // far BIT-EQUAL, sky must-fire).
     {
         let (pw, ph) = (533usize, 400usize);
@@ -3046,7 +3058,7 @@ fn run_check_dxr(
                 ) {
                     ok = false;
                 }
-                // The planes the GPU just wrote are the composite's inputs â€”
+                // The planes the GPU just wrote are the composite's inputs —
                 // gate the remodulation kernel on them while they are live.
                 if !gate_fsr_composite(
                     "check-dxr",
@@ -3194,7 +3206,7 @@ fn mono16(b: u16) -> i32 {
 }
 
 /// The XeSS feed gates: the depth plane vs `xess::view_z_to_clip_depth` of
-/// the pack's view-Z (hits <= 4 f32 ulp â€” D3D's fp32 divide is ~2.5 ulp even
+/// the pack's view-Z (hits <= 4 f32 ulp — D3D's fp32 divide is ~2.5 ulp even
 /// under `precise`; sky BIT-EQUAL 0.0 + anti-vacuity), the mvec plane vs the
 /// pack within 1 f16 ulp, the color plane vs the 1-spp accum store within
 /// 1 f16 ulp (alpha a constant 1.0). `tag` prefixes the report lines.
@@ -3242,7 +3254,7 @@ fn gate_xess_feed(
         }
         for ch in 0..2usize {
             let got16 = u16::from_le_bytes(mvec_bytes[i * 4 + ch * 2..][..2].try_into().unwrap());
-            // MV storage is f16 bits â€” the expected texture value IS the
+            // MV storage is f16 bits — the expected texture value IS the
             // stored word (both sides rounded the same pack f32 once);
             // 1 ulp of typed-store latitude stays.
             let expect16 = gb2.mvec[i * 2 + ch].load(Relaxed);
@@ -3281,7 +3293,7 @@ fn gate_xess_feed(
 }
 
 /// The RR feed gates: the linear-depth plane BIT-EQUAL to the pack's view-Z
-/// (R32F passthrough â€” no arithmetic, so no ulp allowance), every other
+/// (R32F passthrough — no arithmetic, so no ulp allowance), every other
 /// plane at its storage tolerance (f16 ulp / <= 2 UNORM LSB) so a
 /// plane-order swap in either wiring table cannot pass the suite. Plane
 /// byte slices in RR plane order (color, nr, depth, mvec, alb, spec,
@@ -3304,7 +3316,7 @@ fn gate_rr_feed(
 ) -> bool {
     let accf = |i: usize| f32::from_le_bytes(accum_bytes[i * 4..][..4].try_into().unwrap());
     // The CPU upload's UNORM encode; the hardware typed store rounds RTNE
-    // with the spec's 0.6-ULP latitude â€” gate at <= 1 LSB (+1 for the f16
+    // with the spec's 0.6-ULP latitude — gate at <= 1 LSB (+1 for the f16
     // hop, below).
     let to_unorm8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
     let (mut rd_bad, mut rmv_bad) = (0usize, 0usize);
@@ -3331,7 +3343,7 @@ fn gate_rr_feed(
             // RGBA8 albedo/spec-albedo vs the CPU encode. <= 2 LSB: the CPU
             // reference is double-rounded (pack f32 -> f16 storage ->
             // unorm8) while the GPU feed converts the pack f32 to unorm8
-            // directly â€” the f16 hop can move a value across a *.5 rounding
+            // directly — the f16 hop can move a value across a *.5 rounding
             // boundary (1 LSB), on top of the typed store's own 0.6-ULP
             // latitude (1 LSB).
             let a = rr_alb[i * 4 + ch];
@@ -3368,27 +3380,27 @@ fn gate_rr_feed(
 /// The FSR4-RR feed gates over a pack traced WITH the FsrRr wiring
 /// (FLAG_FSR_SIG armed): all eleven planes vs CPU oracles computed from the
 /// raw 88-B pack readback + accum. dd/ds/ao/indirect-spec are gated BIT-EQUAL
-/// to the pack's sig/sig2 f16 halves (pure widen â€” the indirect-specular
+/// to the pack's sig/sig2 f16 halves (pure widen — the indirect-specular
 /// plane's A channel likewise against the spec_hit_t lane), the linear-depth
 /// plane bit-equal to view-Z
 /// (DEPTH_SIGN = 1 passthrough), clip depth at the XeSS 4-ulp bound with
 /// sky bit-equal 0.0, the albedos at <= 1 LSB against the single explicit
-/// sqrt quantization (`fsr::sqrt_encode8` of the pack f32 â€” no f16 hop
+/// sqrt quantization (`fsr::sqrt_encode8` of the pack f32 — no f16 hop
 /// here, unlike gate_rr_feed's 2-LSB double-rounding allowance), the
 /// residual against the exact f32 remainder, and the sky contract (sig == 0,
 /// prev-Z == far bit-equal => mvec B exactly 0).
 ///
 /// The residual is the one plane whose tolerance is NOT an ulp count of its
-/// own value: it is a near-**cancellation** (`color âˆ’ ddâŠ—kd âˆ’ dsâŠ—f0 âˆ’
-/// aoÂ·AMBIENTâŠ—kd âˆ’ isâŠ—f0` â€” the products are the same magnitude as the
+/// own value: it is a near-**cancellation** (`color − dd⊗kd − ds⊗f0 −
+/// ao·AMBIENT⊗kd − is⊗f0` — the products are the same magnitude as the
 /// color), so the f32 arithmetic
 /// slop is bounded by the CANCELLED terms, not by the tiny result. Gating it
 /// at 1 f16 ulp of the remainder makes the limit shrink toward zero exactly
-/// where the error doesn't â€” a lit pixel whose residual lands near 0 then
+/// where the error doesn't — a lit pixel whose residual lands near 0 then
 /// fails on ordinary f32 rounding. The bound below is absolute: a few f32
 /// ulps of the largest cancelled term plus the residual's own f16 storage
-/// step. (Both sides evaluate the SAME expression on the SAME inputs â€” the
-/// wire factors come from the stored plane bytes â€” so this only forgives
+/// step. (Both sides evaluate the SAME expression on the SAME inputs — the
+/// wire factors come from the stored plane bytes — so this only forgives
 /// rounding, never a wiring or formula error, which moves the residual by
 /// the size of a whole term.)
 #[cfg(windows)]
@@ -3481,7 +3493,7 @@ fn gate_fsr_rr_feed(
             // Sky prev-Z is far bit-equal, so the depth delta is exactly 0.
             mv_bad += 1;
         }
-        // Normals: RGB10A2 â€” oct RG + rough B at <= 1 LSB, A == 0.
+        // Normals: RGB10A2 — oct RG + rough B at <= 1 LSB, A == 0.
         let got_n = u32::from_le_bytes(normals[i * 4..][..4].try_into().unwrap());
         let n = Vec3A::new(ext_f(i, 0), ext_f(i, 1), ext_f(i, 2));
         let (eu, ev) = fsr::oct_encode(n);
@@ -3515,12 +3527,12 @@ fn gate_fsr_rr_feed(
             }
         }
         // AO: R16F, one half per pixel. The indirect-specular plane's A
-        // channel carries the reflection ray's hit distance â€” the pack's
+        // channel carries the reflection ray's hit distance — the pack's
         // spec_hit_t lane, through the same f16 store.
         if h16(ao, i * 2) != ao16 {
             ao_bad += 1;
         }
-        // The A channel is the reflection ray's hit distance â€” the same f32
+        // The A channel is the reflection ray's hit distance — the same f32
         // through the same typed f16 store gate_rr_feed's spec-hit plane
         // takes, and at the same 1-ulp tolerance (a typed UAV store to a
         // FLOAT16 format has rounding latitude the CPU's from_f32 does not).
@@ -3551,11 +3563,11 @@ fn gate_fsr_rr_feed(
                 is_fired += 1;
             }
         }
-        // Albedos: ONE explicit sqrt quantization of the pack f32 â€” <= 1 LSB
+        // Albedos: ONE explicit sqrt quantization of the pack f32 — <= 1 LSB
         // vs the CPU encode (GPU sqrt has 1-ulp latitude, unlike Rust's
         // correctly-rounded sqrt). The residual oracle below therefore takes
         // its wire factors from the PLANE BYTES the GPU actually stored
-        // ((n/255)^2 â€” bit-identical to the kernel's own enc*enc), not from
+        // ((n/255)^2 — bit-identical to the kernel's own enc*enc), not from
         // a recompute that could land on the other side of a rounding
         // boundary.
         let mut wire = [Vec3A::ZERO; 2];
@@ -3588,7 +3600,7 @@ fn gate_fsr_rr_feed(
             half::f16::from_bits(is16[2]).to_f32(),
         );
         let aof = half::f16::from_bits(ao16).to_f32();
-        // The AO signal's remodulation factor â€” the sky's SH irradiance at the
+        // The AO signal's remodulation factor — the sky's SH irradiance at the
         // WIRE normal, decoded from the PLANE BYTES the GPU stored, for exactly
         // the reason the albedo wire factors are: the composite pass has only
         // those bytes, so an oracle built from the pack's full-precision normal
@@ -3601,7 +3613,7 @@ fn gate_fsr_rr_feed(
         for ch in 0..3 {
             let color = accf(i * 3 + ch);
             // Every remodulated term, in the kernel's order (feed.hlsl's
-            // cs_feed_fsr_rr â€” and fsr::split_signals' before it).
+            // cs_feed_fsr_rr — and fsr::split_signals' before it).
             let t_dd = ddf[ch] * wire[0][ch];
             let t_ds = dsf[ch] * wire[1][ch];
             let t_ao = aof * amb[ch] * wire[0][ch];
@@ -3615,7 +3627,7 @@ fn gate_fsr_rr_feed(
             // GPU's f32 remainder may differ from `e` by a few ulps of the
             // largest CANCELLED term (a magnitude the tiny result knows
             // nothing about), and its own f16 store rounds by half an ulp of
-            // what it holds. Anything past that is a real defect â€” a wiring
+            // what it holds. Anything past that is a real defect — a wiring
             // or formula error moves the residual by the size of a whole term.
             // Every subtracted term is a cancelled magnitude, so all four
             // enter the bound.
@@ -3659,11 +3671,11 @@ fn gate_fsr_rr_feed(
     true
 }
 
-/// `gpu/shaders/fsr_composite.hlsl` â€” the THIRD site of the composite identity,
+/// `gpu/shaders/fsr_composite.hlsl` — the THIRD site of the composite identity,
 /// and the only one whose arithmetic runs nowhere else. `fsr::composite` is
 /// gated by --check-fsr and `cs_feed_fsr_rr`'s residual by the feed gate above,
 /// but this kernel executes only inside a live FSR4-RR session, so for a long
-/// time nothing tested it â€” and it shipped with its root constants written to
+/// time nothing tested it — and it shipped with its root constants written to
 /// the wrong DWORDs (HLSL bumps a `float3` that would straddle a 16-byte
 /// boundary, so `ambient` sat at offset 16 while the CPU wrote it at 8; the
 /// pass read one channel of AMBIENT shifted and two undeclared DWORDs).
@@ -3672,13 +3684,13 @@ fn gate_fsr_rr_feed(
 /// signal's INPUT plane into its denoised-output UAV, making the denoiser an
 /// IDENTITY. `record_composite` must then remodulate back to what it started
 /// from. The oracle is built from the PLANE BYTES the GPU stored (the feed
-/// gate's discipline â€” never from a recompute that could drift), so what is
+/// gate's discipline — never from a recompute that could drift), so what is
 /// pinned here is exactly this kernel: its arithmetic, its albedo decode, its
 /// SRV table ORDER, and its root constants. A wrong ambient factor moves a lit
 /// pixel by ~0.03 = tens of f16 ulps; the tolerance is 2.
 ///
 /// That factor is the sky's SH irradiance at the pixel's normal now, not a
-/// constant â€” so this gate also pins that the pass reads the NORMALS plane
+/// constant — so this gate also pins that the pass reads the NORMALS plane
 /// (t7) and evaluates `sh_irr` against the same coefficients the CPU holds.
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
@@ -3759,7 +3771,7 @@ fn gate_fsr_composite(
             }
         }
         // The AO term is live wherever the surface has any diffuse albedo and
-        // the hemisphere is not fully closed â€” without such pixels a wrong
+        // the hemisphere is not fully closed — without such pixels a wrong
         // AMBIENT would be invisible, which is the whole point of this gate.
         if aoc > 0.0 && (0..3).any(|c| dec(diff_alb, i, c) > 0.0) {
             ao_fired += 1;
@@ -3776,16 +3788,16 @@ fn gate_fsr_composite(
         return false;
     }
     if must_fire && (ao_fired == 0 || is_fired == 0) {
-        eprintln!("{tag}: FAIL fsr composite gate vacuous (no live AO term / no reflection term â€” a wrong AMBIENT would pass)");
+        eprintln!("{tag}: FAIL fsr composite gate vacuous (no live AO term / no reflection term — a wrong AMBIENT would pass)");
         return false;
     }
     true
 }
 
 /// The locked per-session render resolution for a GPU-driven upscaler
-/// composition (`--gpu` and `--dxr` â€” no DRS on either path): quantize the
+/// composition (`--gpu` and `--dxr` — no DRS on either path): quantize the
 /// resolved `--lock-res` scale into the wired upscaler's queried input
-/// range. `fallback` answers a missing range â€” and, for RR
+/// range. `fallback` answers a missing range — and, for RR
 /// (`quantize_degenerate = false`), a degenerate opt == min == max range
 /// too (the SDK's "DRS off" signal; the fallback is the optimal/DLAA res).
 /// XeSS's queried range is always real, so its arm quantizes whenever the
@@ -3860,12 +3872,12 @@ fn run_check_gpu(
     println!("check-gpu: dispatch plumbing OK (seed -> prep-args -> ExecuteIndirect -> readback)");
 
     // --- M2: the vanilla GPU reference tracer vs the CPU plain reference ---
-    // Exact-zero gates are GPU-vs-GPU only (M3+); CPU-vs-GPU is statistical â€”
+    // Exact-zero gates are GPU-vs-GPU only (M3+); CPU-vs-GPU is statistical —
     // hardware watertight triangle intersection differs from moller_trumbore
     // at edges/grazing, and the RNG streams differ by design.
     let (gw, gh) = (800usize, 600usize);
     let dev = hg.device.clone();
-    // ONE shared core for every tracer this suite builds â€” the interactive
+    // ONE shared core for every tracer this suite builds — the interactive
     // sessions' Rc-sharing shape, so the suite's M2/M7/bench trio EXERCISES
     // the sharing rather than testing three private copies.
     let core = match gpu::trace::SceneGpu::new_uploaded(&dev, scene, bvh, &mut hg, opts.bc7) {
@@ -3896,21 +3908,21 @@ fn run_check_gpu(
     };
     eprintln!("check-gpu: scene uploaded, BLAS/TLAS built ({} tris)", scene.tri_count());
     // Anti-vacuity, the --check-dxr twin: an armed lever that produced one
-    // chunk has exercised nothing the unarmed run does not â€” unless the scene
+    // chunk has exercised nothing the unarmed run does not — unless the scene
     // is genuinely under the cap, which is a note, not a failure.
     if let Some(cap) = blas_split::max_prims() {
         if tg.scene.n_chunks < 2 {
             if scene.tri_count() as u32 > cap {
                 eprintln!(
                     "check-gpu: FAIL blas-split cap {cap} but the scene built {} chunk(s) \
-                     from {} tris â€” the remap is untested",
+                     from {} tris — the remap is untested",
                     tg.scene.n_chunks,
                     scene.tri_count()
                 );
                 return 1;
             }
             eprintln!(
-                "check-gpu: note â€” {} tris is under the {cap} cap, so the scene is ONE chunk; \
+                "check-gpu: note — {} tris is under the {cap} cap, so the scene is ONE chunk; \
                  the remap runs as the identity here (use --blas-split N to split it)",
                 scene.tri_count()
             );
@@ -3987,7 +3999,7 @@ fn run_check_gpu(
         hg.run(|l| tg.record_reference(l, 0))
     };
 
-    // T1: one unjittered frame each â€” primary-visibility compare (t + kind).
+    // T1: one unjittered frame each — primary-visibility compare (t + kind).
     if let Err(e) = gpu_frame(&mut hg, &tg, 0) {
         eprintln!("check-gpu: FAIL reference dispatch: {e}");
         return 1;
@@ -4008,9 +4020,9 @@ fn run_check_gpu(
     let mut class_mismatch = 0usize;
     let mut t_viol = 0usize;
     let mut max_rel = 0.0f32;
-    // Pixels where mÃ¶ller-trumbore and the hardware's watertight test disagree
+    // Pixels where möller-trumbore and the hardware's watertight test disagree
     // (a ray grazing a shared triangle edge). Expected, statistically bounded,
-    // and NOT evidence about the quadtree â€” but the reference's t is not
+    // and NOT evidence about the quadtree — but the reference's t is not
     // trustworthy ground truth at these pixels, so the wavefront/reference gate
     // below excludes them by this mask rather than by re-deriving them.
     let mut edge_mask = vec![false; px];
@@ -4053,7 +4065,7 @@ fn run_check_gpu(
         ok = false;
     }
 
-    // T2: 64-frame jittered accumulation both sides â€” radiance A/B.
+    // T2: 64-frame jittered accumulation both sides — radiance A/B.
     // Different RNG streams; only the converged means are comparable.
     const AB_FRAMES: u32 = 64;
     for f in 0..AB_FRAMES {
@@ -4098,7 +4110,7 @@ fn run_check_gpu(
         ok = false;
     }
 
-    // T3: the resolve pass (accum -> RGBA16F, the tonemap PS's input) â€”
+    // T3: the resolve pass (accum -> RGBA16F, the tonemap PS's input) —
     // texel == accum/samples within f16 precision. This is the present
     // chain's only compute link, verified headlessly.
     {
@@ -4179,9 +4191,16 @@ fn run_check_gpu(
     }
 
     // --- M3/M4: the wavefront quadtree vs the on-GPU reference -------------
-    // Same intersector on both sides, same seeds, same shading code â€” these
+    // Same intersector on both sides, same seeds, same shading code — these
     // are the transplanted exact-zero gates from the CPU --check.
     let read_u32 = |hg: &mut gpu::trace::HeadlessGpu, res, n: usize| -> Result<Vec<u32>, String> {
+        // A zero-element readback is legitimate — an enclosed interior pose
+        // proves no sky, so CTR_SKY is 0 — but CreateCommittedResource(0)
+        // is E_INVALIDARG, which used to abort the whole suite before the
+        // wavefront gates ran. Empty in, empty out.
+        if n == 0 {
+            return Ok(Vec::new());
+        }
         let b = hg.read_buffer(res, ua, n * 4)?;
         Ok(b.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect())
     };
@@ -4230,7 +4249,7 @@ fn run_check_gpu(
         (x1 - x0) as u64 * (y1 - y0) as u64
     };
     // One LeafRec = LEAF_REC_U32S u32s (xy0 | xy1 | t_start | depth |
-    // cut_slot | cut_len) â€” lockstep with queues.hlsli via LEAF_REC_BYTES.
+    // cut_slot | cut_len) — lockstep with queues.hlsli via LEAF_REC_BYTES.
     const LEAF_REC_U32S: usize = (gpu::trace::LEAF_REC_BYTES / 4) as usize;
     let leaf_recs =
         match read_u32(&mut hg, &tg.qleaf, n_leaf.min(tg.cap_leaf as usize) * LEAF_REC_U32S) {
@@ -4281,7 +4300,7 @@ fn run_check_gpu(
     // Alpha-cutout anti-vacuity: an alpha-masked scene's wavefront frame
     // must actually reject candidates, or the cutout path is dead code
     // (scene-derived, independent of `structural`). Caveat: a custom --cam
-    // pose whose view contains no masked geometry would trip this â€” the
+    // pose whose view contains no masked geometry would trip this — the
     // CLAUDE.md canopy-caveat class; the default OBJ poses see foliage.
     let alpha_rej = ctrs[gpu::trace::CTR_ALPHA_REJ as usize];
     if scene.any_alpha {
@@ -4317,7 +4336,7 @@ fn run_check_gpu(
     // occlusion rays must actually pass through glass somewhere, or the
     // TRANS_SHADOW path is dead code; a scene without transmissive materials
     // (or with --no-tinted-shadows) must count zero (compiled out). Same
-    // --cam caveat class â€” a pose whose shadow rays never cross glass would
+    // --cam caveat class — a pose whose shadow rays never cross glass would
     // trip the must-fire.
     let trans_pass = ctrs[gpu::trace::CTR_TRANS_PASS as usize];
     if scene.any_transmissive {
@@ -4334,10 +4353,10 @@ fn run_check_gpu(
     }
     // --sw-rays anti-vacuity: under the lever (with cut consumption armed)
     // leaf tiles must actually seed from non-root cuts, or the lever's whole
-    // point â€” trace_closest_multi â€” is dead code. Structural (default-scene
+    // point — trace_closest_multi — is dead code. Structural (default-scene
     // topology: a degenerate window or an all-sky pose has no real cuts), so
     // --stress skips via `must_fire`; without the lever the counter must be
-    // 0 (SW_RAYS_LEAF compiled out â€” the alpha-rej pattern).
+    // 0 (SW_RAYS_LEAF compiled out — the alpha-rej pattern).
     let sw_seeded = ctrs[gpu::trace::CTR_SW_CUT_SEED as usize];
     if opts.sw_rays && opts.cut_rays {
         eprintln!("check-gpu: sw cut-seeded leaf tiles: {sw_seeded}");
@@ -4402,12 +4421,12 @@ fn run_check_gpu(
     }
 
     // THE soundness contract, asserted directly instead of by proxy: the region
-    // a tile proved empty â€” frustum âˆ© ball(origin, t_start) â€” must not contain
+    // a tile proved empty — frustum ∩ ball(origin, t_start) — must not contain
     // the true nearest hit. Ground truth is the EARLIEST t either intersector
-    // reports (mÃ¶ller-trumbore or the hardware), which is the most pessimistic
+    // reports (möller-trumbore or the hardware), which is the most pessimistic
     // bar available; a hit either one finds is a real triangle inside the tile
     // frustum, so a sound t_start lower-bounds it. Exact-zero, and strictly
-    // stronger than the old `wave_t > ref_t` inference â€” that one is a
+    // stronger than the old `wave_t > ref_t` inference — that one is a
     // CONSEQUENCE of an overshoot, and a consequence can have other causes
     // (below), whereas this is the invariant itself.
     let mut claim_viol = 0usize;
@@ -4435,13 +4454,13 @@ fn run_check_gpu(
     }
 
     // Wavefront vs reference. Both run the hardware intersector, so identical
-    // hits are expected â€” EXCEPT at the two-intersector edge pixels, where a
+    // hits are expected — EXCEPT at the two-intersector edge pixels, where a
     // ray grazes a shared triangle edge. There the hardware's accept/reject is
     // sensitive to TMin (AMD re-origins the ray at TMin; measured on an R9700:
     // the reference at TMin=0 takes the edge, the leaf ray at TMin=t_start does
     // not, and the CPU agrees with the leaf ray). Those pixels are ALREADY
     // known-disagreeing from the CPU comparison above, so the reference's t is
-    // not ground truth there and they carry no information about the quadtree â€”
+    // not ground truth there and they carry no information about the quadtree —
     // `claim_viol` above is what guards the contract at them.
     let mut edge_skipped = 0usize;
     for i in 0..px {
@@ -4489,7 +4508,7 @@ fn run_check_gpu(
     // Same-seed same-shading image A/B: identical hits => identical RNG streams
     // => near-identical color (cross-kernel compilation fp only). A pixel that
     // legitimately hit DIFFERENT geometry (the TMin-sensitive edge above) has no
-    // business in the MAX â€” its color difference measures the two surfaces, not
+    // business in the MAX — its color difference measures the two surfaces, not
     // the shading. It stays in the mean, which is a whole-image gate.
     let mut img_sum = 0.0f64;
     let mut img_max = 0.0f32;
@@ -4525,7 +4544,7 @@ fn run_check_gpu(
         "check-gpu: wavefront vs reference ({px} px): claim-violation {claim_viol} | false-sky {false_sky} | tmin-overshoot {overshoot} | hybrid-extra {hybrid_extra} | hw-edge px {edge_skipped} | max rel t err {max_rel_t:.2e} | same-seed image mean |d| {img_mean:.2e} max {img_max:.2e} | hot ch {img_hot}"
     );
     if claim_viol != 0 {
-        eprintln!("check-gpu: FAIL inherited-tmin claim violated (t_start past real geometry â€” THE bug class)");
+        eprintln!("check-gpu: FAIL inherited-tmin claim violated (t_start past real geometry — THE bug class)");
         ok = false;
     }
     if false_sky != 0 || overshoot != 0 || hybrid_extra != 0 {
@@ -4538,7 +4557,7 @@ fn run_check_gpu(
         }
     }
     // The hardware-edge pixels are bounded by the SAME statistical allowance the
-    // reference-vs-CPU gate uses â€” they are the same phenomenon, seen from the
+    // reference-vs-CPU gate uses — they are the same phenomenon, seen from the
     // other side. A flood of them is a real signal (a broken cut would surface
     // as mass disagreement); one or two is grazing-edge fp.
     if edge_skipped as f64 > px as f64 * 5e-4 {
@@ -4546,17 +4565,17 @@ fn run_check_gpu(
         ok = false;
     }
     // The same-seed image A/B, in three parts that between them are strictly
-    // stronger than the old `mean || max` pair â€” and, unlike it, do not assume
+    // stronger than the old `mean || max` pair — and, unlike it, do not assume
     // the hardware returns a BIT-IDENTICAL t for one ray at two different TMins.
     // (NVIDIA does. AMD re-origins the ray at TMin and lands 1-2 ulp away;
     // measured on an R9700: the hit point shifts by ulps, which moves the
     // shadow/AO ray origin, which at a grazing angle flips a BINARY occlusion
-    // bit â€” 2 ulp of geometry becomes ~0.02 of color at a handful of pixels.
+    // bit — 2 ulp of geometry becomes ~0.02 of color at a handful of pixels.
     // No amount of correct code prevents that: a discrete decision on a
     // continuous input is discontinuous by construction.)
-    //   mean  â€” a systematic shading bug (wrong rng, lobe, albedo) moves it.
-    //   hot   â€” a localized bug lights up far more than the edge allowance.
-    //   finiteâ€” a catastrophic single pixel (NaN/inf) that the counts would miss.
+    //   mean  — a systematic shading bug (wrong rng, lobe, albedo) moves it.
+    //   hot   — a localized bug lights up far more than the edge allowance.
+    //   finite— a catastrophic single pixel (NaN/inf) that the counts would miss.
     let hot_limit = (px * 3) as f64 * 5e-4;
     let nonfinite = wave_acc.iter().filter(|v| !v.is_finite()).count();
     if img_mean > 1e-5 {
@@ -4565,7 +4584,7 @@ fn run_check_gpu(
     }
     if img_hot as f64 > hot_limit {
         eprintln!(
-            "check-gpu: FAIL {img_hot} same-seed channels past 1e-2 (limit {hot_limit:.0} = 0.05%) â€” beyond grazing-edge occlusion flips"
+            "check-gpu: FAIL {img_hot} same-seed channels past 1e-2 (limit {hot_limit:.0} = 0.05%) — beyond grazing-edge occlusion flips"
         );
         ok = false;
     }
@@ -4583,10 +4602,10 @@ fn run_check_gpu(
 
     // --- Cloud shading caches (--cloud-shadow / --sky-lod, default ON) ------
     // The lattice + shadow cache were armed for the wavefront frame above
-    // (wave_acc) and its reference â€” both read them, which is why the exact-zero
+    // (wave_acc) and its reference — both read them, which is why the exact-zero
     // A/B held at the default-ON K. Two gates: the cloud-shadow FILL kernel vs a
     // CPU oracle (the wiring), and an on-vs-off same-seed image A/B (end-to-end).
-    // The off arm is a SECOND TraceGpu with the statics flipped â€” snapshot-at-
+    // The off arm is a SECOND TraceGpu with the statics flipped — snapshot-at-
     // construction makes that safe (each instance's kernels + fills match its
     // OWN snapshot); the session's values are restored after.
     {
@@ -4641,7 +4660,7 @@ fn run_check_gpu(
                     // Wiring bound: a mapping bug lands ~0.5+; honest fp/exp
                     // cross-compiler noise is ~1e-3.
                     if worst > 0.02 {
-                        eprintln!("check-gpu: FAIL cloud-shadow fill disagrees with the CPU oracle ({worst:.4} > 0.02) â€” grid mapping / CB handshake");
+                        eprintln!("check-gpu: FAIL cloud-shadow fill disagrees with the CPU oracle ({worst:.4} > 0.02) — grid mapping / CB handshake");
                         ok = false;
                     }
                 }
@@ -4670,7 +4689,7 @@ fn run_check_gpu(
                     eprintln!("check-gpu: FAIL cache-off wavefront dispatch: {e}");
                     ok = false;
                 } else {
-                    // Inline readback (not the read_f32 closure â€” it fixed its
+                    // Inline readback (not the read_f32 closure — it fixed its
                     // resource lifetime to `tg` on first use, and `otg` is shorter).
                     let off = hg.read_buffer(&otg.accum, ua, px * 3 * 4).map(|b| {
                         b.chunks_exact(4)
@@ -4702,10 +4721,10 @@ fn run_check_gpu(
                                 "check-gpu: cloud caches on-vs-off ({px} px): sky mean-rel {sky_rel:.2e} | image mean-rel {all_rel:.2e} | max |d| {mx:.2e}"
                             );
                             if !(sky_on || shadow_on) {
-                                // Session ran both caches OFF â‡’ the two TraceGpus
-                                // are the same config â‡’ BIT-IDENTICAL.
+                                // Session ran both caches OFF ⇒ the two TraceGpus
+                                // are the same config ⇒ BIT-IDENTICAL.
                                 if mx != 0.0 {
-                                    eprintln!("check-gpu: FAIL off-vs-off not bit-identical (max |d| {mx:.2e}) â€” a cache-off path is not truly off");
+                                    eprintln!("check-gpu: FAIL off-vs-off not bit-identical (max |d| {mx:.2e}) — a cache-off path is not truly off");
                                     ok = false;
                                 }
                             } else {
@@ -4726,9 +4745,9 @@ fn run_check_gpu(
                                 }
                                 // Anti-vacuity: the check scene has clouds in
                                 // view (self_test G2), so the lattice MUST move
-                                // some sky pixel â€” else the gate proved nothing.
+                                // some sky pixel — else the gate proved nothing.
                                 if must_fire && mx == 0.0 {
-                                    eprintln!("check-gpu: FAIL cloud caches changed NOTHING vs off â€” the A/B is vacuous (lattice/cache not actually consumed?)");
+                                    eprintln!("check-gpu: FAIL cloud caches changed NOTHING vs off — the A/B is vacuous (lattice/cache not actually consumed?)");
                                     ok = false;
                                 }
                                 if off_acc.iter().any(|v| !v.is_finite()) {
@@ -4918,7 +4937,7 @@ fn run_check_gpu(
     // it gates EVERY sample's ray, not just sample 0's. The reference kernel
     // runs the same loop at the same spp/probe, so the same-seed image A/B
     // stays live too (a divergence there means the sample loops disagree).
-    // Fixed spp, like the CPU gate â€” plain --check-gpu can never stop gating.
+    // Fixed spp, like the CPU gate — plain --check-gpu can never stop gating.
     {
         const SPP_GATE: u32 = 4;
         // ...plus the top of the range: the LAST sample at spp = MAX_SPP, which
@@ -5030,7 +5049,7 @@ fn run_check_gpu(
             // per-sample fp rounding between two compile units' summations
             // (spp=1 is bit-identical; the error averages DOWN ~1/sqrt(N), the
             // signature of independent rounding noise, not a bias), so it
-            // scales with scene RADIANCE â€” an absolute limit tuned on the
+            // scales with scene RADIANCE — an absolute limit tuned on the
             // default scene is simply a different limit on a brighter one, and
             // upstream's 1e-5 fails --stress 5000 for that reason alone.
             let ref_mag = ra4.iter().map(|v| v.abs() as f64).sum::<f64>() / (px * 3) as f64;
@@ -5049,7 +5068,7 @@ fn run_check_gpu(
                 ok = false;
             }
             // 1e-4 relative: ~3.7x the worst fp noise measured across scenes and
-            // vendors (2.69e-5 â€” default 1.95e-5, San Miguel 1.93e-5, stress
+            // vendors (2.69e-5 — default 1.95e-5, San Miguel 1.93e-5, stress
             // 2.34e-5/2.69e-5, all at spp=4, the worst spp), and ~100x BELOW the
             // ~1e-2 a real shading divergence produces (wrong rng stream, lobe,
             // or albedo). The old absolute 1e-5 was passing on its own scene by
@@ -5058,7 +5077,7 @@ fn run_check_gpu(
                 eprintln!(
                     "check-gpu: FAIL same-seed wavefront/reference images diverge at spp={spp} (rel {rel:.2e} of limit 1e-4 | hot {hot} of limit {hot_limit:.0} | non-finite {nonfinite})"
                 );
-                // Only a FAILURE names its pixels â€” a passing AMD run
+                // Only a FAILURE names its pixels — a passing AMD run
                 // legitimately carries a few hot channels (the TMin
                 // re-origining class) and must not spam the log.
                 for h in &hot_diag {
@@ -5074,7 +5093,7 @@ fn run_check_gpu(
     // integrate at the exact same (o, n). The exact-zero claim gates run on
     // the GPU (FLAG_VERIFY: false-empty / tmin-overshoot re-validated with
     // RayQuery reference rays, PSA accounting in H.w, sampled cut-bound);
-    // the A/Bs compare against CPU cosine-sampled references (statistical â€”
+    // the A/Bs compare against CPU cosine-sampled references (statistical —
     // different RNG streams by design).
     let mut probes: Vec<(Vec3A, Vec3A)> = Vec::new();
     {
@@ -5102,7 +5121,7 @@ fn run_check_gpu(
         // the CPU suite's A/B. The verify/stat counters ACCUMULATE across
         // seeds (cs_seed_probes keeps them on the clear=false passes), so
         // the exact-zero gates observe every seed's rays, not just the
-        // last seed's; PSA totals SEEDSÂ·pi.
+        // last seed's; PSA totals SEEDS·pi.
         const SEEDS: u32 = 8;
         let hq = Quality { fb, ..q };
         for s in 0..SEEDS {
@@ -5224,7 +5243,7 @@ fn run_check_gpu(
                     let d = shade::cosine_dir(n, t1, t2, rng.f32(), rng.f32());
                     let ray = bvh::Ray::new(o, d);
                     sum += match bvh.intersect(scene, &ray, 0.0, f32::INFINITY, &mut vls.ray_nodes) {
-                        // gather, NOT radiance â€” this reference must integrate
+                        // gather, NOT radiance — this reference must integrate
                         // the same sky hemi.rs does (a GATHER path), or the GI
                         // A/B below is comparing two different functions. Same
                         // sky_scale AND night sources as hemi's leaf miss, same
@@ -5239,10 +5258,10 @@ fn run_check_gpu(
                             &hemi::BOUNCE_Q,
                             &mut rng,
                             sun,
-                            // The pinned check cloud state â€” the GPU frame this
+                            // The pinned check cloud state — the GPU frame this
                             // reference gates shades under the same sky.
                             &crate::clouds::Clouds::check(scene.diag),
-                            // Same bounce cone as hemi.rs's leaf shades â€” the
+                            // Same bounce cone as hemi.rs's leaf shades — the
                             // A/B needs both arms sampling textures alike.
                             shade::Cone::bounce(),
                             1,
@@ -5275,7 +5294,7 @@ fn run_check_gpu(
         ok = false;
     }
 
-    // Frame-level hemi: one full wavefront frame with GI on â€” the leaf pass
+    // Frame-level hemi: one full wavefront frame with GI on — the leaf pass
     // must append exactly one point per hit pixel, the batch loop must drain
     // them, and compose must produce finite radiance everywhere.
     {
@@ -5332,10 +5351,10 @@ fn run_check_gpu(
         }
     }
 
-    // --- M7: GPU-born G-buffers â€” MV/depth/matrix gates on the pack ---
+    // --- M7: GPU-born G-buffers — MV/depth/matrix gates on the pack ---
     // The GPU twin of mv_check_at: frame A (no prev), a 0.02*diag forward
     // dolly, frame B (prev = basis A). The pack is read back, unpacked into
-    // CPU GBufs, and gated by the EXACT existing dlss::mv_selftest â€” zero new
+    // CPU GBufs, and gated by the EXACT existing dlss::mv_selftest — zero new
     // tolerances. Odd render dims mirror --check-xess's odd-dimension sweep.
     {
         let (pw, ph) = (533usize, 400usize);
@@ -5448,24 +5467,24 @@ fn run_check_gpu(
             ok = false;
         }
         // Sky gate anti-vacuity: with zero sky pixels the bit-equal gate
-        // proves nothing â€” the default view must contain sky (mirrors M3's
+        // proves nothing — the default view must contain sky (mirrors M3's
         // n_sky must-fire; --stress skips).
         if must_fire && skies == 0 {
             eprintln!("check-gpu: FAIL gbuf sky gate vacuous (no sky pixels on the default scene)");
             ok = false;
         }
         // Textured scenes: the pack's albedo plane vs a CPU render (the
-        // guide-chain proof â€” RR/XeSS/FSR/NPPD all read this plane).
+        // guide-chain proof — RR/XeSS/FSR/NPPD all read this plane).
         if !albedo_ab_check(scene, bvh, cam0, &ga, &ta, pw, ph, "gpu") {
             ok = false;
         }
 
         // --- bc7-gpu: the GPU encoder's STRUCTURAL gate (synthetic textures,
-        // so it fires on every scene â€” including the untextured procedural
+        // so it fires on every scene — including the untextured procedural
         // default, where M11 below skips). Runs UNCONDITIONALLY, --no-bc7
         // included (the wide-tiles precedent: the default-path encoder must
         // not rot behind a lever), and a construction failure is a suite
-        // FAIL, never a skip â€” interactively the same failure is a loud
+        // FAIL, never a skip — interactively the same failure is a loud
         // RGBA8 fallback, and this is where it gets teeth.
         match gpu::trace::bc7_gpu_self_test(&mut hg) {
             Ok(()) => eprintln!(
@@ -5477,14 +5496,14 @@ fn run_check_gpu(
             }
         }
 
-        // --- M11: BC7 encode fidelity (GPU decode vs the CPU RGBA8 source) â€”
+        // --- M11: BC7 encode fidelity (GPU decode vs the CPU RGBA8 source) —
         // it measures the session's ENCODER (default: the GPU compute
         // encoder; --bc7-cpu: the ispc arm), per texel, through the
-        // spec-bit-exact hardware decoder â€” the number the statistical
+        // spec-bit-exact hardware decoder — the number the statistical
         // albedo/radiance gates can't give. The 25 dB limit is a WIRING
         // gate, not a quality bar: a pitch/footprint/format error lands
         // ~10-20 dB, while the worst honest texture measured 31.7 dB at
-        // ispc `fast` (San Miguel) â€” 25 separates the two without
+        // ispc `fast` (San Miguel) — 25 separates the two without
         // false-failing a hard texture at `ultrafast`.
         if opts.bc7.armed() {
             match gpu::trace::bc7_fidelity(scene, opts.bc7, &mut hg) {
@@ -5506,11 +5525,11 @@ fn run_check_gpu(
             }
         }
 
-        // --- M8: the XeSS feed kernel â€” depth-encode + mvec plumbing gates ---
+        // --- M8: the XeSS feed kernel — depth-encode + mvec plumbing gates ---
         // Wire a headless XessResources' planes as feed targets, run the feed
         // over frame B's pack (still resident on the GPU), read the planes
         // back, and gate against the CPU contracts: the depth plane vs
-        // xess::view_z_to_clip_depth of the pack's view_z (hits <= 4 f32 ulp â€”
+        // xess::view_z_to_clip_depth of the pack's view_z (hits <= 4 f32 ulp —
         // D3D's divide tolerance; sky BIT-EQUAL 0.0, the `precise` encode's
         // exact-zero numerator), the mvec plane vs the pack's mv within
         // 1 f16 ulp (plumbing + f16-rounding proof).
@@ -5571,7 +5590,7 @@ fn run_check_gpu(
                     return 1;
                 }
             };
-            // Frame B's 1-spp store â€” the feed's color source, read back once
+            // Frame B's 1-spp store — the feed's color source, read back once
             // for the color-plane gates here and in M9 (a plane-order swap in
             // the wiring tables would otherwise pass the depth/mvec gates and
             // surface only as image garbage).
@@ -5599,7 +5618,7 @@ fn run_check_gpu(
                 ok = false;
             }
 
-            // --- M8b: the FSR3 feed â€” the same kernel/encodes as the XeSS
+            // --- M8b: the FSR3 feed — the same kernel/encodes as the XeSS
             // trio (FeedKind::Fsr3 -> cs_feed_xess), rewired over the FSR
             // 3.1 flavor's UAV-capable planes and gated identically, so a
             // wiring-order swap in the FSR arm cannot pass the suite.
@@ -5668,10 +5687,10 @@ fn run_check_gpu(
                 }
             }
 
-            // --- M9: the RR feed kernel â€” depth plumbing gate ---
+            // --- M9: the RR feed kernel — depth plumbing gate ---
             // Rewire the same tracer to a headless RrResources' 7 planes,
             // re-run the feed, and gate the linear-depth plane BIT-EQUAL to
-            // the pack's view_z (R32F passthrough â€” no arithmetic, so no
+            // the pack's view_z (R32F passthrough — no arithmetic, so no
             // ulp allowance), plus the RR mvec plane at the same f16 bound.
             let rres = match gpu::rr::RrResources::new(
                 &hg.device,
@@ -5714,7 +5733,7 @@ fn run_check_gpu(
                 return 1;
             }
             // RR plane order: color(0), normal_rough(1), depth(2), mvec(3),
-            // albedo(4), spec_albedo(5), spec_hit(6) â€” every plane gated, so
+            // albedo(4), spec_albedo(5), spec_hit(6) — every plane gated, so
             // an order swap in either wiring table cannot pass the suite.
             let mut read_plane = |idx: usize, bpp: usize, what: &str| -> Option<Vec<u8>> {
                 match read_feed_tex(&mut hg, rpl[idx].0, rpl[idx].1, bpp, pw, ph) {
@@ -5903,7 +5922,7 @@ fn run_check_gpu(
                 ) {
                     ok = false;
                 }
-                // The planes the GPU just wrote are the composite's inputs â€”
+                // The planes the GPU just wrote are the composite's inputs —
                 // gate the remodulation kernel on them while they are live.
                 if !gate_fsr_composite(
                     "check-gpu",
@@ -5928,7 +5947,7 @@ fn run_check_gpu(
 
             // --- M10: the NPPD GPU staging kernels + DML interop ---
             // The pack/warp kernels are term-for-term ports of
-            // nppd::pack_inputs / nppd::warp_temporal â€” gate them against the
+            // nppd::pack_inputs / nppd::warp_temporal — gate them against the
             // CPU oracles running on the SAME readback inputs (gb2 = frame
             // B's pack, accum_bytes = its 1-spp store). DLL-free: the kernels
             // are plain compute. The end-to-end interop gate (ORT executing
@@ -5982,10 +6001,10 @@ fn run_check_gpu(
                 };
                 let mut cpu_frame = vec![0.0f32; nppd::CH_FRAME * npp];
                 nppd::pack_inputs(&accum_at, &gb2, &basis_b, far, npw, nph, &mut cpu_frame);
-                // ch0 (log-depth: ray_dir + divide + log â€” transcendental
+                // ch0 (log-depth: ray_dir + divide + log — transcendental
                 // slop) and ch1-3 (normal rotation: normalize slop) get small
                 // absolute tolerances; ch4-9 are pure copies of the same
-                // readback values â€” BIT-equal. Sky ch0 must be exactly 0 on
+                // readback values — BIT-equal. Sky ch0 must be exactly 0 on
                 // both sides.
                 let (mut p_d, mut p_n, mut p_c, mut p_sky, mut sky_n) =
                     (0usize, 0usize, 0usize, 0usize, 0usize);
@@ -6116,7 +6135,7 @@ fn run_check_gpu(
                 }
 
                 // End-to-end DML interop: ORT on hg's queue over these exact
-                // buffers vs the CPU-staged NppdContext on the same model â€”
+                // buffers vs the CPU-staged NppdContext on the same model —
                 // identical logical inputs (the pack gates above bound the
                 // input drift), so the outputs must agree closely. Runs only
                 // when the DLLs + model exist; one loud skip line otherwise.
@@ -6237,7 +6256,7 @@ fn run_check_gpu(
     // tonemap.hlsl is a term-for-term port of tone::map, and this is what stops
     // it drifting: the REAL pixel shader, through the REAL PSO and SRV slot, over
     // a synthetic linear-HDR ramp that deliberately spans the whole interesting
-    // range â€” below the knee, through the rolloff, and far past it (a physical
+    // range — below the knee, through the rolloff, and far past it (a physical
     // sun disc is ~44,000, so the tail is not hypothetical).
     //
     // All three encodings are gated: SDR 8-bit (the default, which must not
@@ -6249,7 +6268,7 @@ fn run_check_gpu(
         const TH: u32 = 32;
         // The tail is the point: a physical sun disc is ~44,000, so the ramp is
         // pinned to END at RAMP_HI rather than wherever a growth factor happens
-        // to land (an earlier `0.001 * 1.0002^(30i)` topped out near 215 â€” it
+        // to land (an earlier `0.001 * 1.0002^(30i)` topped out near 215 — it
         // never reached the regime this gate exists to cover). RAMP_HI stays
         // under f16::MAX (65504) because the source is a real RGBA16F texture.
         const RAMP_LO: f32 = 1e-3;
@@ -6270,7 +6289,7 @@ fn run_check_gpu(
         // arithmetic above to stay right.
         let top = radiance(n - 1);
         if !(top >= 4.4e4 && top <= 65504.0) {
-            eprintln!("check-gpu: FAIL M12 ramp tops out at {top:.0} â€” must span the sun-disc range");
+            eprintln!("check-gpu: FAIL M12 ramp tops out at {top:.0} — must span the sun-disc range");
             ok = false;
         }
         let src: Vec<f32> = (0..n * 3)
@@ -6282,7 +6301,7 @@ fn run_check_gpu(
                 "sdr",
                 gpu::d3d12::SWAPCHAIN_FORMAT,
                 tone::ToneParams::SDR,
-                1.0 / 255.0 + 1e-6, // one UNORM LSB â€” the wire quantizes
+                1.0 / 255.0 + 1e-6, // one UNORM LSB — the wire quantizes
             ),
             (
                 "scrgb",
@@ -6295,7 +6314,7 @@ fn run_check_gpu(
                 gpu::d3d12::SWAPCHAIN_FORMAT_HDR10,
                 tone::ToneParams::hdr10(200.0, 1000.0),
                 // ~2 ten-bit LSBs + fxc pow/exp slop through the ST 2084 pair.
-                // Never widen past 5e-3 without investigating â€” a wiring or
+                // Never widen past 5e-3 without investigating — a wiring or
                 // constant error moves this by tens of percent.
                 2.5e-3,
             ),
@@ -6308,7 +6327,7 @@ fn run_check_gpu(
                         // Feed the oracle what the SHADER actually reads: the
                         // source is a real RGBA16F texture, so the f32 ramp is
                         // f16-rounded on the way in. Comparing against the exact
-                        // f32 would charge the port for the wire's rounding â€”
+                        // f32 would charge the port for the wire's rounding —
                         // which at the top of the ramp is a step of 32 radiance,
                         // and this gate is about the curve, not the upload.
                         let q = |v: f32| half::f16::from_f32(v).to_f32();
@@ -6320,7 +6339,7 @@ fn run_check_gpu(
                         let want = tone::map(c, tp);
                         for ch in 0..3 {
                             // Relative for the big scRGB values, absolute for the
-                            // small ones â€” an absolute-only gate would be
+                            // small ones — an absolute-only gate would be
                             // meaningless at the top of the range.
                             let w = want[ch];
                             let d = (got[i][ch] - w).abs() / (1.0f32).max(w.abs());
@@ -6332,7 +6351,7 @@ fn run_check_gpu(
                     }
                     if worst > tol {
                         eprintln!(
-                            "check-gpu: FAIL M12 tonemap PS ({label}) vs tone::map â€” \
+                            "check-gpu: FAIL M12 tonemap PS ({label}) vs tone::map — \
                              worst {worst:.2e} > {tol:.2e} at radiance {worst_at:.3}"
                         );
                         ok = false;
@@ -6352,7 +6371,7 @@ fn run_check_gpu(
 
     // --- M13: the glare pyramid, GPU vs CPU ---
     // bloom.hlsl was the one CPU/GPU mirror in the renderer with no numeric gate
-    // â€” it PRESENTS, so a swapped octave weight or a bad barrier just looks
+    // — it PRESENTS, so a swapped octave weight or a bad barrier just looks
     // slightly wrong and no suite objects. This scores the halo (the whole
     // pyramid's product) against `bloom::Bloom`. Structure-free: it runs on a
     // synthetic probe image, so `--stress` and loaded scenes gate it exactly like
@@ -6367,10 +6386,10 @@ fn run_check_gpu(
     // over synthetic engine images. Three gates, each aimed at a different way
     // the port can be wrong: N==1 passthrough (the degenerate arm + the
     // SRV/UAV wiring), a two-identical-engine IDENTITY fuse (the LK must solve
-    // (0,0) and come back bit-exact â€” this is what catches the sampler's
+    // (0,0) and come back bit-exact — this is what catches the sampler's
     // texel-centre convention, the groupshared HALO indexing, a residual sign
     // flip, an inverted tensor solve), and a known (+1,0) SHIFT that the
-    // registration must recover â€” measured against an ITERS=0 control, because
+    // registration must recover — measured against an ITERS=0 control, because
     // a solve that always returns zero would sail through the first two.
     println!("check-gpu: M14 quinlight registered-consensus fuse");
     if let Err(e) = gpu::quin::gate(&mut hg, &dxc, opts.gpu_debug) {
@@ -6384,7 +6403,7 @@ fn run_check_gpu(
     }
 
     // --- Bench: full 1920x1080, GPU hybrid vs GPU vanilla vs CPU hybrid ---
-    // Wall-clock around synchronous submits (includes per-frame sync â€” the
+    // Wall-clock around synchronous submits (includes per-frame sync — the
     // interactive loop pays the same). Correctness gates above are the
     // point; this is the speedometer. (`tg` was already dropped above, before
     // the bloom gate borrowed `hg`.)
@@ -6414,7 +6433,7 @@ fn run_check_gpu(
     // --gpu-timing: the per-pass GPU breakdown of the LAST timed config, so
     // any bench row can be asked "where did that go".
     // (RefCell: `timed` writes it and `bench` reads it, and both are closures
-    // capturing the same local â€” a plain `&mut` capture in one would lock the
+    // capturing the same local — a plain `&mut` capture in one would lock the
     // other out.)
     let passes: std::cell::RefCell<Vec<(String, u32, f64)>> = std::cell::RefCell::new(Vec::new());
     let mut timed = |hybrid: bool, fb: shade::FrustumBounce, spp: u32| -> f64 {
@@ -6497,12 +6516,12 @@ fn run_check_gpu(
     // (RT-core root traversal is cheap enough that our software frustum
     // queries cost more than they save), so the number to watch is whether
     // multi-sampling narrows that gap: the hybrid's fixed cost is diluted
-    // sppÃ—, the reference's is not. Amortization = ms(N) / (N Â· ms(1)); 1.00
+    // spp×, the reference's is not. Amortization = ms(N) / (N · ms(1)); 1.00
     // means the extra samples paid full price.
     //
     // These rows are warm-clock noisy (a cold first row can "measure" a
     // speedup that is physically impossible), so the configurations are
-    // INTERLEAVED and reduced by median â€” the temporal-bench lesson.
+    // INTERLEAVED and reduced by median — the temporal-bench lesson.
     const SPP_SWEEP: [u32; 5] = [1, 2, 4, 8, 16];
     const REPS: usize = 3;
     let mut hs: Vec<Vec<f64>> = vec![Vec::new(); SPP_SWEEP.len()];
@@ -6521,7 +6540,7 @@ fn run_check_gpu(
     let p: Vec<f64> = ps.iter_mut().map(median).collect();
     for (i, &n) in SPP_SWEEP.iter().enumerate() {
         eprintln!(
-            "check-gpu: bench {bw}x{bh} spp={n:<2}: hybrid {:5.2} ms (amort {:.2}Ã—) | plain reference {:5.2} ms (amort {:.2}Ã—) | hybrid/plain {:.2}Ã—",
+            "check-gpu: bench {bw}x{bh} spp={n:<2}: hybrid {:5.2} ms (amort {:.2}×) | plain reference {:5.2} ms (amort {:.2}×) | hybrid/plain {:.2}×",
             h[i],
             h[i] / (n as f64 * h[0]),
             p[i],
@@ -6529,17 +6548,17 @@ fn run_check_gpu(
             h[i] / p[i],
         );
     }
-    // ms(n) = F + mÂ·n (see run_check's model): F is the once-per-frame
+    // ms(n) = F + m·n (see run_check's model): F is the once-per-frame
     // quadtree, m one sample's rays+shading. amortization(n) has an asymptote
-    // m/(F+m) approached as 1/n â€” half the fixed cost gone by spp 2, 90% by
-    // spp 10 â€” so the dilution is spent by ~8-16 spp. hybrid/plain therefore
+    // m/(F+m) approached as 1/n — half the fixed cost gone by spp 2, 90% by
+    // spp 10 — so the dilution is spent by ~8-16 spp. hybrid/plain therefore
     // settles at m_hybrid/m_plain: if THAT is > 1, no sample count ever makes
     // the software quadtree beat RT-core root traversal for primary rays.
     let (last, n_last) = (SPP_SWEEP.len() - 1, *SPP_SWEEP.last().unwrap() as f64);
     let mh = (h[last] - h[0]) / (n_last - 1.0);
     let mp = (p[last] - p[0]) / (n_last - 1.0);
     eprintln!(
-        "check-gpu: spp cost model: hybrid = {:.2} ms fixed + {mh:.3} ms/sample (floor {:.2}Ã—) | plain = {:.2} ms fixed + {mp:.3} ms/sample (floor {:.2}Ã—) | hybrid/plain -> {:.2}Ã— as spp -> inf",
+        "check-gpu: spp cost model: hybrid = {:.2} ms fixed + {mh:.3} ms/sample (floor {:.2}×) | plain = {:.2} ms fixed + {mp:.3} ms/sample (floor {:.2}×) | hybrid/plain -> {:.2}× as spp -> inf",
         (h[0] - mh).max(0.0),
         mh / h[0],
         (p[0] - mp).max(0.0),
@@ -6615,11 +6634,11 @@ fn run_check_gpu(
 }
 
 /// Headless DLSS G-buffer verification: renders two DLSS-style frames (a
-/// small forward dolly apart â€” the same move `--check` T2 uses), then checks
+/// small forward dolly apart — the same move `--check` T2 uses), then checks
 /// motion vectors, depth, and the camera matrices jointly by reconstructing
-/// world positions through both frames. No GPU or Streamline involved â€” this
+/// world positions through both frames. No GPU or Streamline involved — this
 /// validates the CPU capture before/without the denoiser.
-/// Headless FSR verification â€” DLL- and GPU-free (the pure half of fsr.rs
+/// Headless FSR verification — DLL- and GPU-free (the pure half of fsr.rs
 /// plus the same G-buffer machinery --check-dlss gates): proves the signal
 /// split, the wire encodings, and the MV depth-delta contract before the ffx
 /// runtime ever runs. Gates: the octahedral and sqrt-albedo encoders
@@ -6636,7 +6655,7 @@ fn run_check_fsr(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural:
     let mut all_ok = true;
 
     // 1. Octahedral normals through the R10G10B10A2 wire: decode(quant10(
-    // encode(n))) within 0.5Â° of n (10-bit octahedral worst case is ~0.2Â°).
+    // encode(n))) within 0.5° of n (10-bit octahedral worst case is ~0.2°).
     {
         let mut pass = true;
         let mut rng = fastrand::Rng::with_seed(7);
@@ -6662,16 +6681,16 @@ fn run_check_fsr(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural:
             worst = worst.max(ang);
         }
         if worst > 0.5 {
-            eprintln!("octahedral worst-case error {worst:.4}Â° exceeds 0.5Â°");
+            eprintln!("octahedral worst-case error {worst:.4}° exceeds 0.5°");
             pass = false;
         }
-        eprintln!("octahedral encode (worst {worst:.4}Â°): {}", if pass { "OK" } else { "FAIL" });
+        eprintln!("octahedral encode (worst {worst:.4}°): {}", if pass { "OK" } else { "FAIL" });
         all_ok &= pass;
     }
 
     // 2. sqrt-albedo wire: bounded roundtrip over [0,1], the sqrt advantage
     // in the darks, and idempotence (albedo_wire of an albedo_wire value is
-    // itself â€” what lets the frame gate below recompute wire albedos from
+    // itself — what lets the frame gate below recompute wire albedos from
     // the f16-stored G-buffer planes).
     {
         let mut pass = true;
@@ -6692,7 +6711,7 @@ fn run_check_fsr(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural:
         all_ok &= pass;
     }
 
-    // 2b. The GPU pack's wire twin (`sqrt_wire`, no leading f16 rounding â€”
+    // 2b. The GPU pack's wire twin (`sqrt_wire`, no leading f16 rounding —
     // the pack stores f32): same bounds, idempotence, exact endpoints, and
     // agreement with `albedo_wire` on already-f16 values (the CPU oracle for
     // the GPU FSR-RR feed gates relies on both properties).
@@ -6741,7 +6760,7 @@ fn run_check_fsr(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural:
             let f0 = Vec3A::splat(0.04).lerp(albedo, metallic);
             // The AO remodulation factor is now an arbitrary per-pixel RGB (the
             // sky's SH irradiance at the pixel's normal), so the identity is
-            // gated against a RANDOM one â€” strictly stronger than pinning it to
+            // gated against a RANDOM one — strictly stronger than pinning it to
             // whatever constant the renderer happens to use.
             let amb = Vec3A::new(rng.f32(), rng.f32(), rng.f32());
             let sig = fsr::split_signals(color, direct_d, direct_s, ao, ind_s, kd, f0, amb);
@@ -6754,12 +6773,12 @@ fn run_check_fsr(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural:
         }
         // The zero-wire-F0 regression: a saturated colored metal (albedo
         // channel 0 at metallic 1 -> wire F0 channel 0) under a hot specular
-        // spike hits the MIN_SPEC_ALB floor with direct_s/1e-4 â‰« f16::MAX;
+        // spike hits the MIN_SPEC_ALB floor with direct_s/1e-4 ≫ f16::MAX;
         // the saturating q16 must keep ds finite (an inf ds makes the
-        // residual infÂ·0 = NaN) and the identity must still hold exactly
+        // residual inf·0 = NaN) and the identity must still hold exactly
         // (residual is the remainder of the clamped wire products). The
         // reflection bounce divides by the same floor, so `is` is inside the
-        // regression too â€” a mirror-bright metal is exactly where it bites.
+        // regression too — a mirror-bright metal is exactly where it bites.
         {
             let albedo = Vec3A::new(1.0, 0.4, 0.0);
             let (kd, f0) = (Vec3A::ZERO, albedo); // metallic = 1
@@ -6830,7 +6849,7 @@ fn run_check_fsr(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural:
     }
 
     // 6. Provider pick (pure): the fsr::pick_version rules that decide the
-    // session flavor at init â€” the FSR4-default / FSR3.1-fallback / --fsr3
+    // session flavor at init — the FSR4-default / FSR3.1-fallback / --fsr3
     // force triangle, plus name-parse robustness. Ids are arbitrary but
     // distinct; only names carry meaning (matching the live enumeration).
     {
@@ -6847,7 +6866,7 @@ fn run_check_fsr(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural:
                 pass = false;
             }
         };
-        // RR available takes the FSR4 default (id 0 = no override â€” the
+        // RR available takes the FSR4 default (id 0 = no override — the
         // original create path bit-for-bit) REGARDLESS of what the upscaler
         // names parse to: the RR provider is itself the RDNA4/FSR4 signal
         // and the display names are not a contract (a renamed FSR4 provider
@@ -6858,7 +6877,7 @@ fn run_check_fsr(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural:
         case("all, no rr", fsr::pick_version(&all3, false, false), Some((id_315, Fsr3)));
         // Only 3.1 listed: highest patch wins whenever the pick reaches the
         // 3.x scan; with RR available (and not forced) the RR signal still
-        // wins even though no 4.x name parses â€” see above.
+        // wins even though no 4.x name parses — see above.
         let only3 = list(&["FSR 3.1.4", "FSR 3.1.5"]);
         let id_hi = only3[1].0;
         for force in [false, true] {
@@ -6872,7 +6891,7 @@ fn run_check_fsr(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural:
         case("only-3.1, rr, forced", fsr::pick_version(&only3, true, true), Some((id_hi, Fsr3)));
         case("unparseable, rr", fsr::pick_version(&list(&["FSR4"]), true, false), Some((0, Fsr4Rr)));
         // No pickable provider: only-4.x without RR, FSR2-only, empty, and
-        // forced-but-absent must all yield None (init fails loudly â€” the
+        // forced-but-absent must all yield None (init fails loudly — the
         // fallback is never FSR2 and a forced --fsr3 never silently
         // un-forces).
         let only4 = list(&["FSR 4.1.1"]);
@@ -6902,7 +6921,7 @@ fn run_check_fsr(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural:
         // The frame-generation pick: family coherence (FSR4 session prefers
         // the 4.x ML frame generation, everything else the 3.1 interpolation),
         // the other major as fallback rather than failure (the enumeration is
-        // device-filtered â€” anything in it is claimed to run), never id 0
+        // device-filtered — anything in it is claimed to run), never id 0
         // (FG picks are always explicit overrides), empty = None.
         let mut fg_case = |desc: &str, got: Option<(u64, String)>, want: Option<u64>| {
             if got.as_ref().map(|(id, _)| *id) != want {
@@ -6941,7 +6960,7 @@ fn run_check_fsr(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural:
 }
 
 /// The rendered-frame half of --check-fsr at one resolution: frame A at
-/// `cam0`, frame B a 0.02Â·diag dolly later with A as its previous frame, both
+/// `cam0`, frame B a 0.02·diag dolly later with A as its previous frame, both
 /// with the G-buffer AND signal capture on. Zero jitter (reconstructions
 /// assume pixel centers, as in mv_check_at).
 fn fsr_frame_check(
@@ -7028,7 +7047,7 @@ fn fsr_frame_check(
     }
 
     // Composite identity per pixel, recomputed purely from the stored planes
-    // (dd/ds f16, residual f32, wire albedos from the f16 G-buffer planes) â€”
+    // (dd/ds f16, residual f32, wire albedos from the f16 G-buffer planes) —
     // exactly what the GPU composite pass reads. Sky pixels must carry
     // (0, 0, sky color, prev_z = far) exactly.
     {
@@ -7062,7 +7081,7 @@ fn fsr_frame_check(
                     continue;
                 }
                 // An occluded AO ray (at the 1-sample preset the open
-                // fraction is binary, so this is exactly ao == 0) â€” a frame
+                // fraction is binary, so this is exactly ao == 0) — a frame
                 // of all-open AO would satisfy the identity trivially.
                 if sig.ao < 1.0 {
                     ao_fired += 1;
@@ -7088,7 +7107,7 @@ fn fsr_frame_check(
                 let amb = scene.sky_sh.irradiance(fsr::wire_normal(n16));
                 let re =
                     fsr::composite(&sig, l3(&ga.diff_alb, i), l3(&ga.spec_alb, i), amb);
-                // NaN/inf must fail loudly â€” f32::max would silently discard
+                // NaN/inf must fail loudly — f32::max would silently discard
                 // a NaN err, hiding an overflowed signal plane.
                 if !re.is_finite() {
                     worst = f32::INFINITY;
@@ -7120,7 +7139,7 @@ fn fsr_frame_check(
 
     // Frame B: dolly forward with A as previous. The captured prev_z must
     // agree with frame A's own depth buffer at the pixel the motion vector
-    // lands on (median/p90 gates â€” edges and disocclusions legitimately
+    // lands on (median/p90 gates — edges and disocclusions legitimately
     // disagree, as in dlss::mv_selftest).
     {
         let mut cam_b = cam0;
@@ -7191,15 +7210,15 @@ fn run_check_dlss(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, dump: bool
     }
     eprintln!("halton/jitter checks: {}", if halton_ok { "OK" } else { "FAIL" });
 
-    // Frame A at the given camera; frame B a 0.02Â·diag forward dolly later,
+    // Frame A at the given camera; frame B a 0.02·diag forward dolly later,
     // with A as its previous frame. Run once at the native test res and once
-    // at the Quality-mode render res stand-in (odd width â€” also exercises
+    // at the Quality-mode render res stand-in (odd width — also exercises
     // odd-dim quadtree splits), since the interactive DLSS path now traces
     // at a sub-native resolution.
     let mv_native_ok = mv_check_at(scene, bvh, cam0, 800, 600, if dump { Some("dlss_gbuf") } else { None });
     let (qw, qh) = dlss::headless_render_res(800, 600);
     let mv_quality_ok = mv_check_at(scene, bvh, cam0, qw, qh, None);
-    // Step-wise DRS: an arbitrary quantized size inside a typical RR range â€”
+    // Step-wise DRS: an arbitrary quantized size inside a typical RR range —
     // the varying-res MV/depth/matrix contract (the extent tagging itself is
     // SL-side and validated interactively; headless stays SL-free).
     let (dw, dh) = xess::quantize_res(0.55, (800, 600), (266, 200), (800, 600));
@@ -7215,19 +7234,19 @@ fn run_check_dlss(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, dump: bool
 }
 
 /// One MV/depth/matrix pass at an arbitrary render resolution: frame A at
-/// `cam0`, frame B a 0.02Â·diag forward dolly later with A as its previous
+/// `cam0`, frame B a 0.02·diag forward dolly later with A as its previous
 /// frame, gated by `dlss::mv_selftest`. Zero jitter so samples sit on pixel
-/// centers â€” the reconstruction in the self-test assumes centers. Shared by
+/// centers — the reconstruction in the self-test assumes centers. Shared by
 /// --check-dlss (the fixed DLSS-style resolutions) and --check-xess (a sweep
 /// of dynamic render resolutions).
 /// Textured-albedo A/B (check-gpu M7 / check-dxr T4, textured scenes only):
 /// the GPU pack's diffuse-albedo plane vs a CPU `GBufs` render at the same
 /// pose/contract, compared over class-matched hit pixels. Gates: mean |d|
 /// per channel <= 0.02 (hardware sRGB decode + bilinear filter vs the CPU
-/// LUT â€” precision slack, not a semantic gap) and > 64 distinct GPU albedo
+/// LUT — precision slack, not a semantic gap) and > 64 distinct GPU albedo
 /// values (a flat-Kd regression collapses to one value per material and
 /// cannot pass). Also prints the pose's transmissive-hit pixel count (a
-/// center-ray re-trace) â€” the per-pose glass anti-vacuity signal, unGated
+/// center-ray re-trace) — the per-pose glass anti-vacuity signal, unGated
 /// because it is pose-dependent. Returns gate pass; opaque untextured
 /// scenes return true silently.
 #[cfg(windows)]
@@ -7305,7 +7324,7 @@ fn albedo_ab_check(
         distinct.insert(key);
     }
     // Per-pose glass presence: center-ray re-trace (the GBufs don't store
-    // the hit tri). Printed, not gated â€” a pose can legitimately see none.
+    // the hit tri). Printed, not gated — a pose can legitimately see none.
     let glass_px: usize = (0..ph)
         .into_par_iter()
         .map(|y| {
@@ -7418,10 +7437,10 @@ fn mv_check_at(
     ok
 }
 
-/// Headless XeSS verification â€” DLL- and GPU-free (the pure half of xess.rs
+/// Headless XeSS verification — DLL- and GPU-free (the pure half of xess.rs
 /// plus the same G-buffer machinery --check-dlss gates): proves the
 /// dynamic-resolution contract before the SDK ever runs. Gates: the
-/// view-Z â†’ clip-depth encoding roundtrips and hits its endpoints exactly
+/// view-Z → clip-depth encoding roundtrips and hits its endpoints exactly
 /// (sky = far must land on 1.0), `quantize_res` respects the range clamps /
 /// height quantum / window aspect, the scale controller clamps, sheds fast,
 /// creeps slowly and respects the deadband on a scripted frame-time
@@ -7599,7 +7618,7 @@ fn run_check_xess(
             pass = false;
         }
         // Ramped limiter: an adoption starts a lerp from the previous
-        // endpoint â€” intermediates are weakly monotone in height, in-range,
+        // endpoint — intermediates are weakly monotone in height, in-range,
         // exact-aspect via width_for_height, and land exactly on the
         // endpoint; the dwell is not re-armed mid-ramp; an emergency shed
         // compares against the ramp's CURRENT output and snaps.
@@ -7618,7 +7637,7 @@ fn run_check_xess(
             pass = false;
         }
         // Walk the down-ramp while feeding a DIFFERENT non-emergency target
-        // every frame â€” none may adopt (the dwell holds mid-ramp).
+        // every frame — none may adopt (the dwell holds mid-ramp).
         let mut last_h = 720usize;
         let mut end = (0usize, 0usize);
         for i in 1..=xess::RAMP_FRAMES {
@@ -7681,7 +7700,7 @@ fn run_check_xess(
         let step = (648 - 540) / xess::RAMP_FRAMES as usize; // px height / frame
         if !lim.ramping() || cur.1 + step >= 612 {
             eprintln!(
-                "ramp: growth-guard premise broken (cur {cur:?}, ramping {}) â€” retune the gate",
+                "ramp: growth-guard premise broken (cur {cur:?}, ramping {}) — retune the gate",
                 lim.ramping()
             );
             pass = false;
@@ -7738,7 +7757,7 @@ fn run_check_xess(
     // 3b. Guide nearest-upscale (the post-OIDN placement feeds window-res
     // OIDN with albedo/normal guides pulled from the render-res G-buffers):
     // every destination texel of the three copied planes must bit-equal its
-    // nearest source texel â€” indexing/stride/plane-mix-up guard. Checked at
+    // nearest source texel — indexing/stride/plane-mix-up guard. Checked at
     // identity, integer, and non-integer ratios.
     {
         let mut pass = true;
@@ -7746,7 +7765,7 @@ fn run_check_xess(
         let src = dlss::GBufs::new(sw, sh);
         // Distinct u16 bit patterns per plane (the guides store f16 words):
         // diff_alb 0..6912, spec_alb 0x4000+.. tops out at 23295 < 0x7000,
-        // normal_rough 0x7000+.. (max index 9215) tops out at 37887 â€” the
+        // normal_rough 0x7000+.. (max index 9215) tops out at 37887 — the
         // ranges are disjoint, so every element is unique across planes and
         // a cross-plane wiring swap cannot alias.
         for i in 0..sw * sh {
@@ -7806,7 +7825,7 @@ fn run_check_xess(
 
     // 4. Adaptive shading rate: the same frame twice (identical seed, res,
     // frame-uniform jitter), BASE vs ADAPTIVE. Visibility must be
-    // bit-identical â€” adaptivity may never touch it (the transplanted
+    // bit-identical — adaptivity may never touch it (the transplanted
     // bug-class gate); radiance may differ only by the shared-visibility
     // approximation in coherent cells; the counters must fire (default
     // scene) and account for every leaf-shaded pixel.
@@ -7814,7 +7833,7 @@ fn run_check_xess(
         let (rw, rh) = (768usize, 432usize);
         // shadow_samples = 2 so the uniformity test has teeth: the penumbra
         // self-declassifier can only fire with >= 2 light samples (a single
-        // sample is trivially uniform). The interactive XeSS preset is 1/1 â€”
+        // sample is trivially uniform). The interactive XeSS preset is 1/1 —
         // there, penumbra correlation at cell scale is laundered temporally.
         let q = Quality {
             shadow_samples: 2,
@@ -7825,7 +7844,7 @@ fn run_check_xess(
         // Accumulate several jittered frames per side: two single 1-spp
         // frames differ only by the shared-visibility approximation (Apply
         // pixels reuse the rep's occlusion; the rng stream stays aligned via
-        // burned draws), which is noise, not bias â€” the averages expose the
+        // burned draws), which is noise, not bias — the averages expose the
         // actual approximation error, and the SIGNED mean is the bias
         // detector (noise cancels, systematic error doesn't). Rep rotation
         // across frames is part of the contract under test.
@@ -7891,7 +7910,7 @@ fn run_check_xess(
         );
         all_ok &= vis_ok;
 
-        // Every G-buffer guide plane must be bit-identical too â€” including
+        // Every G-buffer guide plane must be bit-identical too — including
         // spec_hit_t, the only rng-dependent plane (Apply burns the draws it
         // skips precisely so the GGX reflection sample stays aligned). This
         // holds per frame; the last frame's buffers are what's compared.
@@ -7943,11 +7962,11 @@ fn run_check_xess(
         }
         let rel = dsum / bsum.max(1e-9);
         let signed = ssum / bsum.max(1e-9);
-        // |Î”| bounds residual noise + local approximation; the signed mean is
+        // |Δ| bounds residual noise + local approximation; the signed mean is
         // the bias gate (shared visibility/AO must not brighten or darken).
         let rad_ok = rel < 0.02 && signed.abs() < 0.005;
         eprintln!(
-            "adaptive radiance A/B ({AB_FRAMES} frames): mean |Î”| {rel:.4} (limit 0.02) | signed {signed:+.4} (limit Â±0.005) -> {}",
+            "adaptive radiance A/B ({AB_FRAMES} frames): mean |Δ| {rel:.4} (limit 0.02) | signed {signed:+.4} (limit ±0.005) -> {}",
             if rad_ok { "OK" } else { "FAIL" }
         );
         all_ok &= rad_ok;
@@ -8006,26 +8025,26 @@ fn run_check_xess(
 
 /// Headless OIDN verification: accumulate a few jittered hybrid frames with
 /// G-buffer capture (the exact interactive OIDN-mode contract), denoise, and
-/// gate on structural properties of the output â€” finite everywhere, actually
+/// gate on structural properties of the output — finite everywhere, actually
 /// changed, measurably smoother (mean |Laplacian| of luminance must drop),
-/// mean value preserved within 2Ã—. A second denoise after one more
+/// mean value preserved within 2×. A second denoise after one more
 /// accumulated frame proves the commit-once/execute-many filter reuse.
 /// Unlike --check/--check-dlss this needs the (license-clean, gitignored)
 /// OIDN runtime DLLs on disk.
 #[cfg(windows)]
 /// The NPPD gate suite (--check-nppd): needs onnxruntime.dll and an exported
-/// model on disk â€” the only NPPD check with external dependencies (the pure
+/// model on disk — the only NPPD check with external dependencies (the pure
 /// staging math runs under --check via nppd::self_test, repeated here as G0).
 /// Renders fresh 1-spp frames through the exact interactive NPPD contract
 /// (accumulate = false, jitter = true, free-running seq, prev_cam set from
 /// the previous frame) and gates one recurrent step at a time: frame 0 from
-/// a reset state (output finite, â‰  input, smoother than input, mean
+/// a reset state (output finite, ≠ input, smoother than input, mean
 /// preserved, state populated), frame 1 static (recurrence engaged: the
-/// identity-warped state must not roughen the output â€” structural, default
+/// identity-warped state must not roughen the output — structural, default
 /// scene only), frame 2 under a small dolly with real motion vectors (state
 /// advances, gates hold), then a reset_temporal + re-denoise (the reset path).
 /// A --random-init plumbing export passes session/run wiring but fails the
-/// quality gates by design â€” gate against the real pretrained export.
+/// quality gates by design — gate against the real pretrained export.
 #[cfg(windows)]
 fn run_check_nppd(
     scene: &scene::Scene,
@@ -8043,7 +8062,7 @@ fn run_check_nppd(
     match nppd::self_test() {
         Ok(()) => eprintln!("nppd self-test: OK"),
         Err(e) => {
-            eprintln!("nppd self-test: FAIL â€” {e}");
+            eprintln!("nppd self-test: FAIL — {e}");
             ok = false;
         }
     }
@@ -8059,7 +8078,7 @@ fn run_check_nppd(
             eprintln!("{e}");
             eprintln!(
                 "onnxruntime.dll expected at {} (--nppd-path / FRUSTRACER_ORT_PATH); \
-                 model at {} (--nppd-model / FRUSTRACER_NPPD_MODEL â€” \
+                 model at {} (--nppd-model / FRUSTRACER_NPPD_MODEL — \
                  tools/nppd-export/export.py produces it)",
                 opts.nppd_path, opts.nppd_model
             );
@@ -8135,8 +8154,8 @@ fn run_check_nppd(
         s / ((rw - 2) * (rh - 2)) as f64
     };
     let mean = |b: &[f32]| b.iter().map(|&v| v as f64).sum::<f64>() / b.len() as f64;
-    // Shared output gates: finite, â‰  input, smoother than the 1-spp input,
-    // mean-value preserved within 2Ã—.
+    // Shared output gates: finite, ≠ input, smoother than the 1-spp input,
+    // mean-value preserved within 2×.
     let gate_output = |out: &[f32], input: &[f32], what: &str, ms: f64, ok: &mut bool| -> (f64, f64) {
         if !out.iter().all(|v| v.is_finite()) {
             eprintln!("nppd {what}: output contains non-finite values");
@@ -8189,7 +8208,7 @@ fn run_check_nppd(
         ok = false;
     }
 
-    // G2: frame 1 static â€” the identity-warped state feeds the second step;
+    // G2: frame 1 static — the identity-warped state feeds the second step;
     // recurrence must not roughen the output (structural: on the default
     // scene the temporal blend demonstrably engages and smooths further).
     render_fresh(&basis, 1, Some(basis));
@@ -8210,13 +8229,13 @@ fn run_check_nppd(
     }
     if structural && r_out1 > r_out0 * 1.05 {
         eprintln!(
-            "nppd static recurrence: frame-1 |laplacian| {r_out1:.4} > frame-0 {r_out0:.4} â€” temporal accumulation didn't engage"
+            "nppd static recurrence: frame-1 |laplacian| {r_out1:.4} > frame-0 {r_out0:.4} — temporal accumulation didn't engage"
         );
         ok = false;
     }
 
     // G3: frame 2 under a small forward dolly (the --check constant) with
-    // prev_cam set â€” real motion vectors drive the state warp.
+    // prev_cam set — real motion vectors drive the state warp.
     let mut cam_b = cam0;
     cam_b.pos += cam0.forward() * (0.02 * scene.diag);
     let basis_b = cam_b.basis(rw, rh);
@@ -8232,7 +8251,7 @@ fn run_check_nppd(
     };
     gate_output(&out2, &input2, "frame 2 (dolly)", nctx.last_ms, &mut ok);
 
-    // G4: reset + re-denoise â€” the reset path is exercised end to end.
+    // G4: reset + re-denoise — the reset path is exercised end to end.
     nctx.reset_temporal();
     if nctx.temporal_valid() {
         eprintln!("nppd: reset_temporal did not invalidate the state");
@@ -8369,7 +8388,7 @@ fn run_check_oidn(
     let max_diff =
         input.iter().zip(&out).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
     if max_diff <= 1e-6 {
-        eprintln!("oidn: output identical to input (max diff {max_diff:.2e}) â€” filter did nothing");
+        eprintln!("oidn: output identical to input (max diff {max_diff:.2e}) — filter did nothing");
         ok = false;
     }
 
@@ -8426,8 +8445,8 @@ fn run_check_oidn(
     // ---- Temporal reprojection gates (G0-G5): scene-level validation of
     // reproject::History against the exact interactive temporal contract
     // (fresh 1-spp frames: accumulate=false, jitter=true, free-running seq).
-    // Deterministic â€” the per-pixel RNG is seeded from (x, y, frame) only.
-    // Camera moves reuse the --check constants (0.02Â·diag dolly, +0.05 yaw,
+    // Deterministic — the per-pixel RNG is seeded from (x, y, frame) only.
+    // Camera moves reuse the --check constants (0.02·diag dolly, +0.05 yaw,
     // cap d=4). Pure CPU math on the shared buffers; the OIDN DLLs above are
     // the only external dependency of this check.
     let (_, far) = dlss::near_far(scene.diag);
@@ -8436,23 +8455,23 @@ fn run_check_oidn(
     match reproject::self_test() {
         Ok(()) => eprintln!("reproject self-test: OK"),
         Err(e) => {
-            eprintln!("reproject self-test: FAIL â€” {e}");
+            eprintln!("reproject self-test: FAIL — {e}");
             ok = false;
         }
     }
     // G2 thresholds, tuned on the default scene (structural-gated):
     // forward dolly keeps the screen edges on-screen, so rejections are
-    // silhouette disocclusions + sky/geom transitions â€” small but nonzero.
+    // silhouette disocclusions + sky/geom transitions — small but nonzero.
     const REJ_FRAC_MAX: f64 = 0.10;
     // World-point agreement is pure geometry (shading-noise-immune): the
     // point the previous frame stored at the fetched texel, projected back
     // into the CURRENT screen, must land within ~a texel of the consuming
-    // pixel. Screen-space pixels make the gate scale-invariant â€” a 3D
+    // pixel. Screen-space pixels make the gate scale-invariant — a 3D
     // distance gate has an error floor of one texel's world footprint, which
     // grows with depth/grazing angle and broke on the stress scene. The
     // error floor by construction: fresh frames jitter per-pixel, so both
     // depths belong to random points inside their pixels (~0.7 px each) plus
-    // 0.5 px nearest-tap rounding â€” median ~1 px is geometry agreeing; a
+    // 0.5 px nearest-tap rounding — median ~1 px is geometry agreeing; a
     // real reprojection defect (sign, basis) measures tens to hundreds.
     const WP_MEDIAN_PX: f32 = 1.5;
     const WP_P90_PX: f32 = 4.0;
@@ -8574,7 +8593,7 @@ fn run_check_oidn(
     let fresh_b: Vec<f32> = accum.iter().map(load).collect();
     let t_upd = Instant::now();
     let st_b = hist.update(&basis_b, &accum, &g, &info, far, MAX_SAMPLES as f32);
-    // Print-only perf diagnostic â€” the one wall-clock read in this check.
+    // Print-only perf diagnostic — the one wall-clock read in this check.
     // Never gate on it: everything gated must stay deterministic.
     let upd_ms = t_upd.elapsed().as_secs_f64() * 1000.0;
     // Dump snapshot here (post-dolly, pre-G4): the G4 budget frame legitimately
@@ -8598,7 +8617,7 @@ fn run_check_oidn(
         ok = false;
     }
     if structural && st_b.rejected == 0 {
-        eprintln!("reproject dolly: expected silhouette disocclusions > 0 â€” rejection never fired");
+        eprintln!("reproject dolly: expected silhouette disocclusions > 0 — rejection never fired");
         ok = false;
     }
     ok &= l_accounting(&hist, &st_b, "dolly");
@@ -8606,7 +8625,7 @@ fn run_check_oidn(
     // World-point agreement on a sparse deterministic subset of accepted
     // geometry pixels: the point this frame saw, reprojected, must be the
     // point the previous frame stored at that texel (both reconstructed from
-    // depth â€” immune to shading noise).
+    // depth — immune to shading noise).
     {
         let sky_z = 0.99 * far;
         let mut errs: Vec<f32> = Vec::new();
@@ -8738,7 +8757,7 @@ fn run_check_oidn(
             st.accepted, st.sky_accepted, st.rejected
         );
         if structural && st.sky_accepted == 0 {
-            eprintln!("reproject yaw: expected sky reprojection > 0 â€” the sky path didn't fire");
+            eprintln!("reproject yaw: expected sky reprojection > 0 — the sky path didn't fire");
             ok = false;
         }
         if structural && st.rejected == 0 {
@@ -8749,7 +8768,7 @@ fn run_check_oidn(
         ok &= finite(&h3, "yaw");
     }
 
-    // G4: a depth-capped budget frame while moving â€” coarse quads over
+    // G4: a depth-capped budget frame while moving — coarse quads over
     // previously-visible geometry must keep the history (blend weight 0),
     // and the moving-frame length cap must hold. Reuses the dolly history
     // (prev state = frame B); same d=4 cap as --check.
@@ -8770,20 +8789,20 @@ fn run_check_oidn(
             coarse_px, smp_c, st.coarse_kept, st.coarse_reset, st.len_min, st.len_max
         );
         if coarse_px == 0 {
-            eprintln!("reproject capped: no coarse pixels â€” the capped path didn't run");
+            eprintln!("reproject capped: no coarse pixels — the capped path didn't run");
             ok = false;
         }
         // Coarse pixels imply per-cell point samples on any scene: the
         // samples must have gone through the normal (non-coarse) blend path.
         if coarse_px > 0 && (smp_c == 0 || st.accepted + st.rejected == 0) {
             eprintln!(
-                "reproject capped: samples {} accepted {} rejected {} â€” sparse samples didn't blend",
+                "reproject capped: samples {} accepted {} rejected {} — sparse samples didn't blend",
                 smp_c, st.accepted, st.rejected
             );
             ok = false;
         }
         if structural && st.coarse_kept == 0 {
-            eprintln!("reproject capped: expected coarse-kept > 0 â€” the mask rule didn't fire");
+            eprintln!("reproject capped: expected coarse-kept > 0 — the mask rule didn't fire");
             ok = false;
         }
         if st.len_max > reproject::L_MAX {
@@ -8839,7 +8858,7 @@ struct Probe {
 }
 
 /// The deterministic probe sweep shared by the hemi-AO, hemi-GI, and shaft
-/// check sections â€” every section MUST run on this exact set (the A/B gates
+/// check sections — every section MUST run on this exact set (the A/B gates
 /// compare like-for-like only because integrator and reference share points).
 fn collect_probes(
     scene: &scene::Scene,
@@ -8876,7 +8895,7 @@ fn px_seed(x: usize, y: usize, s: u64) -> u64 {
         .wrapping_add(s)
 }
 
-/// Centripetal-free (uniform) Catmull-Rom through p1..p2 at t âˆˆ [0, 1).
+/// Centripetal-free (uniform) Catmull-Rom through p1..p2 at t ∈ [0, 1).
 fn catmull_rom(p0: Vec3A, p1: Vec3A, p2: Vec3A, p3: Vec3A, t: f32) -> Vec3A {
     ((p1 * 2.0)
         + (p2 - p0) * t
@@ -8891,7 +8910,7 @@ const SPIN_LAP: f32 = 600.0;
 /// Deterministic benchmark camera: a CLOSED-loop Catmull-Rom spline keyed
 /// relative to cam0 (offsets in units of scene.diag along cam0's
 /// forward/right/world-up, plus yaw/pitch offsets). The pose is a pure
-/// function of the frame index â€” no wall clock â€” so runs are bit-repeatable
+/// function of the frame index — no wall clock — so runs are bit-repeatable
 /// and A/B-comparable. The loop mixes dolly, strafe, climb, and yaw sweeps
 /// and returns near its start each lap, so every temporal regime (seeds,
 /// query skips, off-screen ring retries, pan-back) is exercised per lap.
@@ -8935,13 +8954,13 @@ fn spin_path_pose(cam0: &Camera, diag: f32, frame: u32) -> Camera {
 /// Ring depth: the last TRING producing frames' caches stay consultable.
 const TRING: usize = 3;
 
-/// The temporal claim ring's per-frame state machine â€” the last `TRING`
+/// The temporal claim ring's per-frame state machine — the last `TRING`
 /// producing frames' caches (+ the basis each traced with, newest first;
-/// older entries answer regions that panned off the newest screen and back â€”
+/// older entries answer regions that panned off the newest screen and back —
 /// a claim never goes stale in a static scene, only wrong-basis/wrong-res
 /// pairing could hurt, so each entry carries its basis and the whole ring
 /// drops on a res change), plus the cut stores double-buffered in lockstep:
-/// cur is produced this frame, prev pairs with ring[0] â€” the SAME frame,
+/// cur is produced this frame, prev pairs with ring[0] — the SAME frame,
 /// same basis, by construction (producing frames update both, replay frames
 /// freeze both, res changes / non-participating frames drop both).
 ///
@@ -8949,7 +8968,7 @@ const TRING: usize = 3;
 /// drift from the pipeline it claims to measure: `begin` before the render
 /// hands out the borrows FrameCtx needs, `end` after it rotates (producing
 /// frame) or drops (non-participating frame) the ring. Replay frames call
-/// neither â€” the ring freezes, per the temporal contract.
+/// neither — the ring freezes, per the temporal contract.
 struct TemporalRing {
     /// TRING + 1 buffers so a victim always exists outside the ring.
     caches: Vec<temporal::TemporalCache>,
@@ -8976,9 +8995,9 @@ impl TemporalRing {
     }
 
     /// Producing-frame setup: drop all entries on a res change (claims are
-    /// consumed at the res they were traced at â€” the documented contract),
+    /// consumed at the res they were traced at — the documented contract),
     /// pick a victim buffer outside the ring and clear it, clear the current
-    /// cut store, and hand out the borrows FrameCtx needs â€” the current
+    /// cut store, and hand out the borrows FrameCtx needs — the current
     /// cache, the ring (newest first), and the (cur, prev) cut pair (prev
     /// only when the last frame produced one and the ring is nonempty).
     #[allow(clippy::type_complexity)]
@@ -9030,9 +9049,9 @@ impl TemporalRing {
     /// Post-render bookkeeping for a NON-replay frame. Producing frame: the
     /// victim becomes the newest ring entry (the oldest rotates out and
     /// becomes the next frame's victim) and the cut store flips in lockstep
-    /// so prev always pairs with ring[0] â€” only a produced store may pair.
+    /// so prev always pairs with ring[0] — only a produced store may pair.
     /// Non-participating frame (plain / half-res): the ring drops wholesale
-    /// â€” the old `tprev_ok = false` contract.
+    /// — the old `tprev_ok = false` contract.
     fn end(&mut self, temporal_on: bool, adopt: bool, basis: camera::CamBasis) {
         if temporal_on {
             self.ring.insert(0, (self.victim, basis));
@@ -9047,8 +9066,8 @@ impl TemporalRing {
 }
 
 /// Headless deterministic workload driver (--spin still|path): replicates
-/// the interactive frame contract â€” the replay/trace arm split, temporal
-/// ring rotation, cut-store pairing, recording gate â€” at the interactive
+/// the interactive frame contract — the replay/trace arm split, temporal
+/// ring rotation, cut-store pairing, recording gate — at the interactive
 /// native res with the 1-spp upscaler quality and free-running Halton
 /// jitter, but with no window, no denoiser, and no wall-clock dependence in
 /// the workload. Composes with --no-temporal/--no-replay/--no-adopt, which
@@ -9072,7 +9091,7 @@ fn run_spin(
         }
     };
     // GPU arms: `--gpu` (the wavefront tracer) or an EXPLICIT `--dxr`.
-    // `opts.dxr` defaults ON, so its value cannot be read as a request â€”
+    // `opts.dxr` defaults ON, so its value cannot be read as a request —
     // `mode_explicit` is what separates "the user asked for the DispatchRays
     // pipeline" from "nobody said anything", and that is why a bare `--spin`
     // still drives the CPU renderer exactly as it always has.
@@ -9124,7 +9143,7 @@ fn run_spin(
             info: &info,
             tbuf: &tbuf,
             stats: &stats,
-            // --spin's cloud clock is a pure function of the frame index â€”
+            // --spin's cloud clock is a pure function of the frame index —
             // bit-repeatable A/Bs, like the pose itself.
             sun: render::sun_dir(scene), clouds: crate::clouds::Clouds::spin(scene.diag, idx),
             fireflies: crate::fireflies::Fireflies::spin(scene, idx),
@@ -9192,9 +9211,9 @@ fn run_spin(
 ///
 /// It exists because the GPU tracers had no deterministic wall-clock workload
 /// at all. `--check-gpu`'s bench rows are warm-clock noisy by their own
-/// admission â€” a cold row can "measure" a physically impossible speedup, which
+/// admission — a cold row can "measure" a physically impossible speedup, which
 /// is exactly why the spp sweep interleaves its configurations and reduces by
-/// median â€” and an interactive `--gpu-timing` table depends on wherever the
+/// median — and an interactive `--gpu-timing` table depends on wherever the
 /// user happened to be flying. Here the pose, the cloud clock and the firefly
 /// poses are all pure functions of the frame index, the same as on the CPU, so
 /// an A/B across a code change compares two byte-identical workloads. Because
@@ -9207,7 +9226,7 @@ fn run_spin(
 /// across tracer changes (measured on the Arc Pro B70: feed 0.53 + xess-eval
 /// 0.51 ms) and wiring them in would need a swapchain this path deliberately
 /// does not have. The wall clock therefore carries the per-frame submit+fence
-/// overhead the interactive loop hides behind FRAMES_IN_FLIGHT â€” compare GPU
+/// overhead the interactive loop hides behind FRAMES_IN_FLIGHT — compare GPU
 /// time to GPU time via `--gpu-timing`, whose per-pass table prints every 120
 /// frames and once more at exit. On Intel that table is the only per-pass
 /// profiler that exists (PIX cannot analyze an Arc capture).
@@ -9240,7 +9259,7 @@ fn run_spin_gpu(
         }
     };
     // Trace res = the GPU-mode lock scale (`--lock-res`, default native), so
-    // `--gpu --lock-res quality` is measurable here â€” which is precisely the
+    // `--gpu --lock-res quality` is measurable here — which is precisely the
     // claim the Intel default rests on. No upscaler range exists headlessly, so
     // this is a plain scale of the interactive native res rounded to even
     // rather than `quantize_res`'s SDK-clamped quantum.
@@ -9251,7 +9270,7 @@ fn run_spin_gpu(
     let q = Quality::upscaler_1spp();
 
     // One enum instead of two copies of the loop: the two tracers share the
-    // FrameParams contract but not a trait (DxrGpu::record_frame is fallible â€”
+    // FrameParams contract but not a trait (DxrGpu::record_frame is fallible —
     // it casts to ID3D12GraphicsCommandList4).
     enum Arm {
         Wave(gpu::trace::TraceGpu),
@@ -9381,7 +9400,7 @@ fn run_spin_gpu(
 /// Headless end-to-end check: correctness counters (must be 0), an A/B
 /// benchmark of hybrid vs plain, and a rendered check.png. `structural`
 /// additionally gates the scene-topology assertions (coarse pixels at fixed
-/// caps, temporal seeds/sky-tiles firing) â€” they are tuned to the default
+/// caps, temporal seeds/sky-tiles firing) — they are tuned to the default
 /// procedural scene; a `--stress` scene keeps only the scene-agnostic
 /// zero-counter invariants.
 fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: bool) -> i32 {
@@ -9392,34 +9411,34 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
 
     // Mip-chain / trilinear / aniso gates: chain shape, linear-space
     // filtering, sRGB roundtrip, level/lerp mechanics, the anisotropic tap
-    // mechanics, and the lod â‰¤ 0 bit-compat contract (magnified views
+    // mechanics, and the lod ≤ 0 bit-compat contract (magnified views
     // identical to the pre-mip renderer).
     let tex_ok = texture::self_test();
 
-    // SH sky irradiance â€” basis orthonormality (pins every constant), the
-    // uniform-sky convention pin (radiance L in, exactly L out â€” what makes it
-    // a drop-in for the old AMBIENT Â· ao), accuracy vs a brute-force
+    // SH sky irradiance — basis orthonormality (pins every constant), the
+    // uniform-sky convention pin (radiance L in, exactly L out — what makes it
+    // a drop-in for the old AMBIENT · ao), accuracy vs a brute-force
     // cosine-weighted reference, and projection determinism.
     let sh_ok = match sh::self_test() {
         Ok(()) => true,
         Err(e) => {
-            eprintln!("sh self-test: FAIL â€” {e}");
+            eprintln!("sh self-test: FAIL — {e}");
             false
         }
     };
 
     // Glare: normalized octave weights, ENERGY CONSERVATION (a uniform image
-    // must come back unchanged â€” glare redistributes light, never creates it),
+    // must come back unchanged — glare redistributes light, never creates it),
     // total-energy preservation on a point source, and a monotone heavy tail.
     let bloom_ok = match bloom::self_test() {
         Ok(()) => true,
         Err(e) => {
-            eprintln!("bloom self-test: FAIL â€” {e}");
+            eprintln!("bloom self-test: FAIL — {e}");
             false
         }
     };
 
-    // The one sky: the disc's radiance/irradiance round-trip (the classic 4Ï€
+    // The one sky: the disc's radiance/irradiance round-trip (the classic 4π
     // slip), cone sampling inside-and-covering the disc, the disc test agreeing
     // with the cone the sampler draws from, the DOME carrying no disc (the
     // invariant the hemi fixed-point accumulator depends on), and the resulting
@@ -9427,19 +9446,19 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     let sky_ok = match sky::self_test() {
         Ok(()) => true,
         Err(e) => {
-            eprintln!("sky self-test: FAIL â€” {e}");
+            eprintln!("sky self-test: FAIL — {e}");
             false
         }
     };
 
     // Clouds: the --no-clouds bit-identity sweep, T/scatter range+finiteness
-    // over a direction Ã— time sweep, Beer monotonicity in optical depth, the
+    // over a direction × time sweep, Beer monotonicity in optical depth, the
     // per-ray None arm's bit-passthrough, the cloudy/clear/shadow must-fires,
     // the exact advection identity, and the horizon-fade continuity.
     let clouds_ok = match clouds::self_test() {
         Ok(()) => true,
         Err(e) => {
-            eprintln!("clouds self-test: FAIL â€” {e}");
+            eprintln!("clouds self-test: FAIL — {e}");
             false
         }
     };
@@ -9452,7 +9471,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     let fireflies_ok = match fireflies::self_test() {
         Ok(()) => true,
         Err(e) => {
-            eprintln!("fireflies self-test: FAIL â€” {e}");
+            eprintln!("fireflies self-test: FAIL — {e}");
             false
         }
     };
@@ -9463,12 +9482,12 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     let tod_ok = match scene::tod_self_test() {
         Ok(()) => true,
         Err(e) => {
-            eprintln!("tod self-test: FAIL â€” {e}");
+            eprintln!("tod self-test: FAIL — {e}");
             false
         }
     };
 
-    // Relief-march gates â€” flat-field bitwise identity, closed-form marched
+    // Relief-march gates — flat-field bitwise identity, closed-form marched
     // hits, silhouette reject, interior escape / pit-wall occlusion, the
     // underside crossing, and the build-vs-march depth pin.
     let height_ok = match bvh::height_self_test() {
@@ -9477,12 +9496,12 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             true
         }
         Err(e) => {
-            eprintln!("height self-test: FAIL â€” {e}");
+            eprintln!("height self-test: FAIL — {e}");
             false
         }
     };
 
-    // Tinted-shadow gates â€” single/double-interface tint bitwise, opaque
+    // Tinted-shadow gates — single/double-interface tint bitwise, opaque
     // termination, the SHADOW_TP_MIN cutoff, the primary-visibility pin,
     // binary `occluded`'s geometric-oracle contract, the lever-off block.
     let tinted_ok = match bvh::tinted_shadow_self_test() {
@@ -9491,12 +9510,12 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             true
         }
         Err(e) => {
-            eprintln!("tinted-shadow self-test: FAIL â€” {e}");
+            eprintln!("tinted-shadow self-test: FAIL — {e}");
             false
         }
     };
 
-    // Spray-reclassification gates â€” tiny transmissive islands retag to one
+    // Spray-reclassification gates — tiny transmissive islands retag to one
     // deduped white-scatter clone; large/opaque components and the lever-off
     // arm untouched.
     let spray_ok = match scene::spray_self_test() {
@@ -9505,26 +9524,26 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             true
         }
         Err(e) => {
-            eprintln!("spray self-test: FAIL â€” {e}");
+            eprintln!("spray self-test: FAIL — {e}");
             false
         }
     };
 
-    // Depth-tint math gates â€” the Beerâ€“Lambert closed-form anchors (seg 0 â‡’
-    // exactly ONE, seg D_ref â‡’ exactly albedo, monotone, white passthrough).
+    // Depth-tint math gates — the Beer–Lambert closed-form anchors (seg 0 ⇒
+    // exactly ONE, seg D_ref ⇒ exactly albedo, monotone, white passthrough).
     let depth_tint_ok = match shade::depth_tint_self_test() {
         Ok(()) => {
             eprintln!("depth-tint self-test: OK");
             true
         }
         Err(e) => {
-            eprintln!("depth-tint self-test: FAIL â€” {e}");
+            eprintln!("depth-tint self-test: FAIL — {e}");
             false
         }
     };
 
-    // Spherical-cell math self-test â€” closed-form identities the hemisphere
-    // bounce integrator is built on (Î©/PSA anchors, exact partition,
+    // Spherical-cell math self-test — closed-form identities the hemisphere
+    // bounce integrator is built on (Ω/PSA anchors, exact partition,
     // in-cell sampling).
     let sph_ok = match sphcell::self_test() {
         Ok(()) => {
@@ -9532,36 +9551,36 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             true
         }
         Err(e) => {
-            eprintln!("sphcell self-test: FAIL â€” {e}");
+            eprintln!("sphcell self-test: FAIL — {e}");
             false
         }
     };
 
     // Wide frustum tree: structural audit (every slot box == its binary node's
     // box) + bound-equivalence sweep vs the binary query + cut translation.
-    // Runs on every --check regardless of --ftree â€” it builds its own tree â€”
+    // Runs on every --check regardless of --ftree — it builds its own tree —
     // so the structure can't rot while the lever is off.
     let ftree_ok = match ftree::self_test(scene, bvh) {
         Ok(()) => true,
         Err(e) => {
-            eprintln!("ftree self-test: FAIL â€” {e}");
+            eprintln!("ftree self-test: FAIL — {e}");
             false
         }
     };
 
     // BLAS chunk planner: the cut's structural contracts (cap, exact triangle
     // partition, antichain coverage, determinism) at several caps on the
-    // session's real tree. Runs on every --check regardless of --blas-split â€”
-    // it plans its own cuts â€” so the planner can't rot while the lever is off.
+    // session's real tree. Runs on every --check regardless of --blas-split —
+    // it plans its own cuts — so the planner can't rot while the lever is off.
     let blas_ok = match blas_split::self_test(bvh) {
         Ok(()) => true,
         Err(e) => {
-            eprintln!("blas-split self-test: FAIL â€” {e}");
+            eprintln!("blas-split self-test: FAIL — {e}");
             false
         }
     };
 
-    // Reprojection-history math self-test â€” closed-form gates the OIDN
+    // Reprojection-history math self-test — closed-form gates the OIDN
     // temporal mode is built on (projection roundtrip, static replay = exact
     // running mean, analytic strafe, behind-plane/depth rejection, coarse
     // keep/reset, L-accounting).
@@ -9571,12 +9590,12 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             true
         }
         Err(e) => {
-            eprintln!("reproject self-test: FAIL â€” {e}");
+            eprintln!("reproject self-test: FAIL — {e}");
             false
         }
     };
 
-    // NPPD staging math self-test â€” closed-form gates the neural-denoiser
+    // NPPD staging math self-test — closed-form gates the neural-denoiser
     // path is built on (pad table, NCHW pack/crop bit-identity, warp
     // identity/shift/midpoint/zeros-outside, MV-sign convention).
     let nppd_ok = match nppd::self_test() {
@@ -9585,12 +9604,12 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             true
         }
         Err(e) => {
-            eprintln!("nppd self-test: FAIL â€” {e}");
+            eprintln!("nppd self-test: FAIL — {e}");
             false
         }
     };
 
-    // Material-classifier self-test â€” deterministic spot checks over the
+    // Material-classifier self-test — deterministic spot checks over the
     // real San Miguel naming patterns (keyword precedence, whole-token
     // safety, the name/Ns/illum fallback tiers).
     let matclass_ok = match matclass::self_test() {
@@ -9599,12 +9618,12 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             true
         }
         Err(e) => {
-            eprintln!("matclass self-test: FAIL â€” {e}");
+            eprintln!("matclass self-test: FAIL — {e}");
             false
         }
     };
 
-    // Tangent-frame / normal-map decode self-test â€” analytic directions,
+    // Tangent-frame / normal-map decode self-test — analytic directions,
     // green-channel sign pin, mirrored-UV handedness, degenerate skip.
     let tangent_ok = match shade::tangent_self_test() {
         Ok(()) => {
@@ -9612,12 +9631,12 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             true
         }
         Err(e) => {
-            eprintln!("tangent self-test: FAIL â€” {e}");
+            eprintln!("tangent self-test: FAIL — {e}");
             false
         }
     };
 
-    // Water-ripple field self-test â€” off-state bit-identity, horizon guard,
+    // Water-ripple field self-test — off-state bit-identity, horizon guard,
     // closed-form anchor, animation.
     let ripple_ok = match shade::ripple_self_test() {
         Ok(()) => {
@@ -9625,12 +9644,12 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             true
         }
         Err(e) => {
-            eprintln!("ripple self-test: FAIL â€” {e}");
+            eprintln!("ripple self-test: FAIL — {e}");
             false
         }
     };
 
-    // Upscaler-chain self-test â€” the DLSSâ†’FSR4â†’XeSSâ†’FSR3 resolution order and
+    // Upscaler-chain self-test — the DLSS→FSR4→XeSS→FSR3 resolution order and
     // the force/skip flag algebra, with availability injected (DLL-free).
     let upchain_ok = match upchain::self_test() {
         Ok(()) => {
@@ -9638,12 +9657,12 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             true
         }
         Err(e) => {
-            eprintln!("upchain self-test: FAIL â€” {e}");
+            eprintln!("upchain self-test: FAIL — {e}");
             false
         }
     };
 
-    // Settings self-test â€” serde round-trip/sparseness/forward-compat of the
+    // Settings self-test — serde round-trip/sparseness/forward-compat of the
     // JSON schema, the enum vocabularies pinned against their consumers
     // (xess::lock_scale, bc7::Quality::parse, the parse_* mirrors of the CLI
     // arms), and the headless predicate that keeps this very suite blind to
@@ -9654,24 +9673,24 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             true
         }
         Err(e) => {
-            eprintln!("settings self-test: FAIL â€” {e}");
+            eprintln!("settings self-test: FAIL — {e}");
             false
         }
     };
 
-    // Presentation-curve self-test â€” the SDR degeneracy (bit-for-bit against
+    // Presentation-curve self-test — the SDR degeneracy (bit-for-bit against
     // the pre-HDR curve: the guard that --hdr did not move the default), the
-    // paper-white anchor, monotonicity, the headroom asymptote, and CÂ¹ at the
+    // paper-white anchor, monotonicity, the headroom asymptote, and C¹ at the
     // knee. The HLSL twin is gated against this same math by --check-gpu M12.
     let tone_ok = match tone::self_test() {
         Ok(()) => true,
         Err(e) => {
-            eprintln!("tone self-test: FAIL â€” {e}");
+            eprintln!("tone self-test: FAIL — {e}");
             false
         }
     };
 
-    // Registered-consensus self-test (--quinlight) â€” the winsorized reduce's
+    // Registered-consensus self-test (--quinlight) — the winsorized reduce's
     // identities: the m==2 plain-mean degeneracy (what makes a two-engine fuse a
     // PROVABLE registered mean), the m>=3 outlier rejection, median order
     // independence, and the non-finite-is-MISSING bit predicate. Pure math, the
@@ -9683,14 +9702,14 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             true
         }
         Err(e) => {
-            eprintln!("quin self-test: FAIL â€” {e}");
+            eprintln!("quin self-test: FAIL — {e}");
             false
         }
     };
     #[cfg(not(windows))]
     let quin_ok = true;
 
-    // Raw-NGX DLSS-G guide self-test â€” the two conversions the --fg
+    // Raw-NGX DLSS-G guide self-test — the two conversions the --fg
     // evaluate feeds the FG snippet: clip depth must be the exact z-mapping
     // of the perspective_lh matrix riding the same dispatch
     // (matrix-consistency sweep + the near/far/harmonic-midpoint anchors),
@@ -9703,14 +9722,14 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     let ngxfg_guides_ok = match gpu::ngxfg_guides::self_test() {
         Ok(()) => true,
         Err(e) => {
-            eprintln!("ngxfg-guides self-test: FAIL â€” {e}");
+            eprintln!("ngxfg-guides self-test: FAIL — {e}");
             false
         }
     };
     #[cfg(not(windows))]
     let ngxfg_guides_ok = true;
 
-    // glTF loader self-test â€” an in-code GLB exercises node flattening, the
+    // glTF loader self-test — an in-code GLB exercises node flattening, the
     // mirrored-winding flip, u16 index widening, and the factor mapping.
     let gltf_ok = match gltf_loader::self_test() {
         Ok(()) => {
@@ -9718,12 +9737,12 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             true
         }
         Err(e) => {
-            eprintln!("gltf self-test: FAIL â€” {e}");
+            eprintln!("gltf self-test: FAIL — {e}");
             false
         }
     };
 
-    // BC7 self-test â€” the STRUCTURAL half of --bc7 (block counts, the
+    // BC7 self-test — the STRUCTURAL half of --bc7 (block counts, the
     // mandatory edge-replicate pad, the cutout carve-out predicate, encode
     // determinism). Fidelity needs a decoder we don't have on the CPU, so it
     // is measured on the GPU by --check-gpu's M11 instead.
@@ -9733,12 +9752,12 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             true
         }
         Err(e) => {
-            eprintln!("bc7 self-test: FAIL â€” {e}");
+            eprintln!("bc7 self-test: FAIL — {e}");
             false
         }
     };
 
-    // World-merge self-test â€” pure math (id offsetting incl. the NO_TEX
+    // World-merge self-test — pure math (id offsetting incl. the NO_TEX
     // sentinel, ground-drop accounting, ring-layout determinism); the world
     // itself is never the --check scene (flagless --check stays procedural).
     let world_ok = match world::self_test() {
@@ -9747,21 +9766,21 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             true
         }
         Err(e) => {
-            eprintln!("world self-test: FAIL â€” {e}");
+            eprintln!("world self-test: FAIL — {e}");
             false
         }
     };
 
-    // Audio self-test â€” pure math only (resampler, loop seam, proximity and
+    // Audio self-test — pure math only (resampler, loop seam, proximity and
     // wind gain anchors, mixer must-fires, the curated-island loop mapping);
-    // no device, no DLL â€” the audio DEVICE never exists on a headless path.
+    // no device, no DLL — the audio DEVICE never exists on a headless path.
     let audio_ok = match audio::self_test() {
         Ok(()) => {
             eprintln!("audio self-test: OK");
             true
         }
         Err(e) => {
-            eprintln!("audio self-test: FAIL â€” {e}");
+            eprintln!("audio self-test: FAIL — {e}");
             false
         }
     };
@@ -9787,7 +9806,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     );
     // The wide-TILE wiring (tile_step/adopt_step dispatch, wide root_cut
     // seeding, the once-per-leaf-tile slot-ref -> binary ray-root translation)
-    // defaults OFF â€” measured wall-neutral on San Miguel and ~10% SLOWER on
+    // defaults OFF — measured wall-neutral on San Miguel and ~10% SLOWER on
     // the stress field's fat-cut/short-descent regime (the GPU-hemi lesson on
     // CPU tiles; --ftree-tiles re-enables, the quantized-box work re-measures).
     // So --check forces it ON for one full verify pass: the reference re-trace
@@ -9804,10 +9823,10 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     );
     // The capped driver is the uncapped one with an extra depth check (a cap
     // past the leaf depth is bit-identical by construction), so verify it at a
-    // cap that actually sparse-fills: every non-coarse pixel â€” including the
-    // per-cell point samples, which are KIND_LEAF and thus inside the gates â€”
+    // cap that actually sparse-fills: every non-coarse pixel — including the
+    // per-cell point samples, which are KIND_LEAF and thus inside the gates —
     // must still match the reference exactly, and both coarse pixels and
-    // samples must exist (deterministic â€” no wall clock involved).
+    // samples must exist (deterministic — no wall clock involved).
     let smp0 = stats.coarse_samples.load(Relaxed);
     let rep_c = render::verify(scene, bvh, &cam, q, rw, rh, &stats, Some(4), &[], None);
     let smp_c = stats.coarse_samples.load(Relaxed) - smp0;
@@ -9817,12 +9836,12 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     );
     let mut capped_ok = rep_c.ok() && (!structural || rep_c.coarse > 0);
     if structural && rep_c.coarse == 0 {
-        eprintln!("verify capped d=4: expected coarse pixels, found none â€” capped path not exercised");
+        eprintln!("verify capped d=4: expected coarse pixels, found none — capped path not exercised");
     }
-    // Coarse tiles exist above, so their per-cell samples must too â€” this is
+    // Coarse tiles exist above, so their per-cell samples must too — this is
     // sound on any scene, not just the default topology (no structural gate).
     if rep_c.coarse > 0 && smp_c == 0 {
-        eprintln!("verify capped d=4: coarse pixels without point samples â€” sparse fill didn't fire");
+        eprintln!("verify capped d=4: coarse pixels without point samples — sparse fill didn't fire");
         capped_ok = false;
     }
 
@@ -9830,7 +9849,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     // The claim: an extra sample lands inside the same pixel, hence inside
     // every ancestor tile frustum, so it may consume the tile's inherited
     // t_start and node cut exactly like sample 0 (the leaf-tile argument).
-    // That is the inherited-tmin bug class, so it gets the same proof â€” the
+    // That is the inherited-tmin bug class, so it gets the same proof — the
     // frame is rendered once per sample with `primary_sample` naming the
     // sample whose t lands in tbuf, and verify re-traces THAT sample's ray
     // from tmin=0. probe 0 is the historical pass; 1.. are the new rays.
@@ -9864,7 +9883,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         pts.dedup();
         eprintln!("spp jitter: {}/{} distinct sub-pixel positions over the full --spp range", pts.len(), n);
         if pts.len() != n {
-            eprintln!("spp jitter: FAIL â€” sample positions alias (the Halton index must not wrap)");
+            eprintln!("spp jitter: FAIL — sample positions alias (the Halton index must not wrap)");
             spp_ok = false;
         }
     }
@@ -9898,10 +9917,10 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         );
         spp_ok &= r.ok();
     }
-    // Accounting: the quadtree is a function of (scene, basis, res) â€” NOT of
+    // Accounting: the quadtree is a function of (scene, basis, res) — NOT of
     // the sample count. So spp must multiply the RAYS and leave the frustum
     // work bit-identical. That inequality IS the amortization claim (the
-    // per-tile query cost is paid once and spread over sppÃ— the rays); if it
+    // per-tile query cost is paid once and spread over spp× the rays); if it
     // ever stops holding, multi-sampling has started re-tracing the quadtree.
     let spp_frame = |n: u32| -> (u64, u64, u64, u64) {
         let accum: Vec<AtomicU32> = (0..rw * rh * 3).map(|_| AtomicU32::new(0)).collect();
@@ -9951,21 +9970,21 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     let (r1, fq1, fn1, ti1) = spp_frame(1);
     let (r4, fq4, fn4, ti4) = spp_frame(SPP_GATE);
     eprintln!(
-        "spp accounting: primary rays {r1} -> {r4} (Ã—{:.2}, want Ã—{SPP_GATE}) | frustum queries {fq1} -> {fq4} | frustum nodes {fn1} -> {fn4} | tiles {ti1} -> {ti4}",
+        "spp accounting: primary rays {r1} -> {r4} (×{:.2}, want ×{SPP_GATE}) | frustum queries {fq1} -> {fq4} | frustum nodes {fn1} -> {fn4} | tiles {ti1} -> {ti4}",
         r4 as f64 / r1.max(1) as f64
     );
     if r4 != r1 * SPP_GATE as u64 {
-        eprintln!("spp accounting: FAIL â€” spp={SPP_GATE} must trace exactly {SPP_GATE}Ã— the primary rays");
+        eprintln!("spp accounting: FAIL — spp={SPP_GATE} must trace exactly {SPP_GATE}× the primary rays");
         spp_ok = false;
     }
     if (fq4, fn4, ti4) != (fq1, fn1, ti1) {
-        eprintln!("spp accounting: FAIL â€” the quadtree must be bit-identical across spp (the amortization claim)");
+        eprintln!("spp accounting: FAIL — the quadtree must be bit-identical across spp (the amortization claim)");
         spp_ok = false;
     }
     // The quality claim, gated: multi-sampling exists to hand the temporal
     // upscaler a quieter frame, so a 4-spp frame pair must be measurably more
     // temporally stable than a 1-spp pair (the FRUSTRACER_STAB metric: mean
-    // |Î”| between consecutive fresh jittered frames). Structural â€” it reads
+    // |Δ| between consecutive fresh jittered frames). Structural — it reads
     // the default scene's noise level.
     let spp_noise = |n: u32| -> f64 {
         let info: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
@@ -10014,20 +10033,20 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     };
     let (n1, n4) = (spp_noise(1), spp_noise(SPP_GATE));
     eprintln!(
-        "spp stability: inter-frame mean |Î”| {n1:.4} (spp 1) -> {n4:.4} (spp {SPP_GATE}) â€” {:.2}Ã— quieter",
+        "spp stability: inter-frame mean |Δ| {n1:.4} (spp 1) -> {n4:.4} (spp {SPP_GATE}) — {:.2}× quieter",
         n1 / n4.max(1e-9)
     );
     if structural && !(n4 < n1) {
-        eprintln!("spp stability: FAIL â€” spp={SPP_GATE} must be measurably quieter than spp=1");
+        eprintln!("spp stability: FAIL — spp={SPP_GATE} must be measurably quieter than spp=1");
         spp_ok = false;
     }
 
     // Hemisphere frustum AO: soundness gates (reference rays re-validate
-    // every empty-cell claim and leaf-ray tmin on a deterministic probe set â€”
+    // every empty-cell claim and leaf-ray tmin on a deterministic probe set —
     // the false-sky / tmin-overshoot analogs) plus an A/B error measurement
     // against high-sample cosine AO at the same surface points. The
     // integrator is unbiased, so the signed mean is a bias detector.
-    // The hemi probe gates exist to validate the CUT MACHINERY â€” cut-miss
+    // The hemi probe gates exist to validate the CUT MACHINERY — cut-miss
     // re-traces every cut-seeded leaf ray against a root-traversal reference,
     // which is vacuous if the leaf rays themselves go root-first. So the probe
     // gates force cut-seeded rays regardless of the session default (root-first
@@ -10077,7 +10096,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                     let r2 = rng.f32();
                     let d = shade::cosine_dir(pr.n, t1, t2, r1, r2);
                     // `transmittance` in lockstep with the hemi estimator
-                    // (tinted shadows) â€” glass folds to its gray tint,
+                    // (tinted shadows) — glass folds to its gray tint,
                     // opaque scenes keep the old 0/1 counts exactly.
                     let tp =
                         bvh.transmittance(scene, &bvh::Ray::new(pr.p, d), 0.0, scene.ao_radius, &mut vis);
@@ -10105,23 +10124,23 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             q.fb.depth, hv.psa_violations, hv.false_empty, hv.tmin_overshoot, hv.cut_miss, hv.max_psa_err
         );
         eprintln!(
-            "hemi AO vs {REF_SAMPLES}-sample cosine: mean |Î”| {mean_abs:.4} (limit 0.02) | mean Î” {mean_signed:+.4} (limit Â±0.005) | worst {worst:.3} | per point: {:.1} queries, {:.1} rays, {:.1} cells empty",
+            "hemi AO vs {REF_SAMPLES}-sample cosine: mean |Δ| {mean_abs:.4} (limit 0.02) | mean Δ {mean_signed:+.4} (limit ±0.005) | worst {worst:.3} | per point: {:.1} queries, {:.1} rays, {:.1} cells empty",
             ls.hemi_queries as f64 / ls.hemi_points.max(1) as f64,
             ls.hemi_leaf_rays as f64 / ls.hemi_points.max(1) as f64,
             ls.hemi_cells_empty as f64 / ls.hemi_points.max(1) as f64,
         );
         let mut ok = hv.ok() && mean_abs < 0.02 && mean_signed.abs() < 0.005;
         if structural && (ls.hemi_cells_empty == 0 || ls.hemi_leaf_rays == 0) {
-            eprintln!("hemi AO: expected both empty cells and leaf rays > 0 â€” a path didn't fire");
+            eprintln!("hemi AO: expected both empty cells and leaf rays > 0 — a path didn't fire");
             ok = false;
         }
         ok
     };
 
-    // Hemisphere frustum GI: the same soundness gates (with t_limit = âˆž, so
+    // Hemisphere frustum GI: the same soundness gates (with t_limit = ∞, so
     // empty-cell claims are true sky claims) plus an A/B against a
     // cosine-sampled reference implementing the SAME depth-1 bounce policy
-    // (hemi::BOUNCE_Q) â€” the comparison isolates integrator error from policy
+    // (hemi::BOUNCE_Q) — the comparison isolates integrator error from policy
     // error. Luminance-relative gate; the signed mean detects bias.
     let gi_ok = {
         let sun = render::sun_dir(scene);
@@ -10158,7 +10177,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 }
                 let e_h = e_h / SEEDS as f32;
                 // Reference: cosine-sampled hemisphere, identical depth-1
-                // policy (miss â†’ sky, hit â†’ shade at BOUNCE_Q, depth 1).
+                // policy (miss → sky, hit → shade at BOUNCE_Q, depth 1).
                 let mut rng = fastrand::Rng::with_seed(px_seed(pr.x, pr.y, 0xE0));
                 let mut lsr = stats::LocalStats::default();
                 let mut e_r = Vec3A::ZERO;
@@ -10168,7 +10187,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                     let d = shade::cosine_dir(pr.n, t1, t2, r1, r2);
                     let bray = bvh::Ray::new(pr.p, d);
                     e_r += match bvh.intersect(scene, &bray, 0.0, f32::INFINITY, &mut vis) {
-                        // gather, NOT radiance â€” a GATHER path, mirroring
+                        // gather, NOT radiance — a GATHER path, mirroring
                         // hemi.rs's leaf-ray miss exactly (see sky.rs),
                         // including its sky_scale and night sources.
                         None => crate::sky::gather(d, sun, scene.sky_scale, scene.night),
@@ -10181,7 +10200,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                             &hemi::BOUNCE_Q,
                             &mut rng,
                             sun,
-                            // Pinned check clouds â€” both arms of the A/B shade
+                            // Pinned check clouds — both arms of the A/B shade
                             // the same sky (hemi::gi got the same state above).
                             &crate::clouds::Clouds::check(scene.diag),
                             shade::Cone::bounce(),
@@ -10209,13 +10228,13 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             ls.merge(pls);
             worst = worst.max(rel.abs() as f32);
         }
-        // Firefly-robust statistic â€” the documented unpaired-A/B fix (the
-        // CLAUDE.md canopy-caveat lesson): relative error is bounded âˆ’1
+        // Firefly-robust statistic — the documented unpaired-A/B fix (the
+        // CLAUDE.md canopy-caveat lesson): relative error is bounded −1
         // below but UNBOUNDED above (a hemi leaf ray that catches a bright
         // emitter or sun-glow lobe the 512-sample reference undersamples is
-        // a +NX outlier â€” DamagedHelmet's emissive visor trips it on real
+        // a +NX outlier — DamagedHelmet's emissive visor trips it on real
         // content), so the gate trims 2% from each tail before the means.
-        // The exact-zero soundness gates above stay untouched â€” this only
+        // The exact-zero soundness gates above stay untouched — this only
         // robustifies the estimator comparison; `worst` still prints raw.
         let mut rels: Vec<f64> = results.iter().map(|(rel, _, _)| *rel).collect();
         // total_cmp: a NaN rel (NaN radiance) must FAIL the gate (it sorts
@@ -10233,34 +10252,34 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             q.fb.depth, hv.psa_violations, hv.false_empty, hv.tmin_overshoot, hv.cut_miss, hv.max_psa_err
         );
         eprintln!(
-            "hemi GI vs {REF_SAMPLES}-sample cosine (same depth-1 policy, 2% trimmed): mean rel {mean_rel:.4} (limit 0.05) | signed {mean_signed:+.4} (limit Â±0.01) | worst raw {worst:.3} | per point: {:.1} queries, {:.1} rays, {:.1} cells empty",
+            "hemi GI vs {REF_SAMPLES}-sample cosine (same depth-1 policy, 2% trimmed): mean rel {mean_rel:.4} (limit 0.05) | signed {mean_signed:+.4} (limit ±0.01) | worst raw {worst:.3} | per point: {:.1} queries, {:.1} rays, {:.1} cells empty",
             ls.hemi_queries as f64 / ls.hemi_points.max(1) as f64,
             ls.hemi_leaf_rays as f64 / ls.hemi_points.max(1) as f64,
             ls.hemi_cells_empty as f64 / ls.hemi_points.max(1) as f64,
         );
         let mut ok = hv.ok() && mean_rel < 0.05 && mean_signed.abs() < 0.01;
         if structural && (ls.hemi_cells_empty == 0 || ls.hemi_leaf_rays == 0) {
-            eprintln!("hemi GI: expected both empty cells and leaf rays > 0 â€” a path didn't fire");
+            eprintln!("hemi GI: expected both empty cells and leaf rays > 0 — a path didn't fire");
             ok = false;
         }
         ok
     };
 
-    // Hemi sharing: one padded tree capture per coherent 2Ã—2 group, consumed
+    // Hemi sharing: one padded tree capture per coherent 2×2 group, consumed
     // by every member from its own apex (see hemi::share_capture). Gates: the
-    // transplanted exact-zero soundness counters run PER MEMBER â€” a member
+    // transplanted exact-zero soundness counters run PER MEMBER — a member
     // re-validates the rep's Open claim, every leaf-ray tmin, and every cut
     // traversal at ITS OWN origin (false-empty / tmin-overshoot / cut-miss /
-    // PSA) â€” plus shared-vs-unshared A/Bs on independent seed sets: both arms
+    // PSA) — plus shared-vs-unshared A/Bs on independent seed sets: both arms
     // estimate the same integral, so a nonzero mean difference is exactly the
     // bias a sharing soundness hole would introduce.
     let mut hemi_share_ok = {
         const SEEDS: u64 = 8;
         let sun = render::sun_dir(scene);
         let lum = |c: Vec3A| 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;
-        // 2Ã—2 groups anchored at each probe pixel, kept under the renderer's
+        // 2×2 groups anchored at each probe pixel, kept under the renderer's
         // exact predicate: same triangle, bit-equal shading normal, measured
-        // Î·/Î´ qualifiers (hemi::SHARE_*). Center rays, like collect_probes.
+        // η/δ qualifiers (hemi::SHARE_*). Center rays, like collect_probes.
         struct GProbe {
             x: usize,
             y: usize,
@@ -10269,8 +10288,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             eta: f32,
         }
         let mut groups: Vec<GProbe> = Vec::new();
-        // Probes that pass same-tri + bit-equal-normal but fail the Î·/Î´
-        // qualifiers â€” must-fired below (default scene: 61, from grazing-angle
+        // Probes that pass same-tri + bit-equal-normal but fail the η/δ
+        // qualifiers — must-fired below (default scene: 61, from grazing-angle
         // ground-plane probes) so the qualifier branch can't rot into dead
         // code; skipped under --stress like every topology-tuned assertion.
         let mut qual_reject = 0u64;
@@ -10365,7 +10384,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                     &mut gi_share,
                     &mut ls,
                 );
-                // Poison at a preset depth is a record-capacity bug â€” report
+                // Poison at a preset depth is a record-capacity bug — report
                 // it through the gate (a poisoned record must never be
                 // consumed, so this group's A/B is skipped).
                 if ao_share.poisoned || gi_share.poisoned {
@@ -10377,7 +10396,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                     let (x, y) = (g.x + (i & 1), g.y + (i >> 1));
                     // PAIRED same-seed arms: both draw the identical rng
                     // stream, so every ray the two trees have in common
-                    // cancels exactly in the difference â€” GI's heavy-tailed
+                    // cancels exactly in the difference — GI's heavy-tailed
                     // fireflies included (an unpaired construction was tried
                     // and measured the baseline estimator's skew, not the
                     // sharing: identical +2.4% with sharing disabled in both
@@ -10477,7 +10496,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             results.len(), qual_reject, hv.psa_violations, hv.false_empty, hv.tmin_overshoot, hv.cut_miss, hv.max_psa_err
         );
         eprintln!(
-            "hemi share paired A/B vs unshared (same seeds, per member): AO Î” {mean_ao:+.4} (limit Â±0.005) | GI rel Î” {mean_gi:+.4} (limit Â±0.01) | worst {worst:.3} | shared pts {} | share q/pt {:.2}",
+            "hemi share paired A/B vs unshared (same seeds, per member): AO Δ {mean_ao:+.4} (limit ±0.005) | GI rel Δ {mean_gi:+.4} (limit ±0.01) | worst {worst:.3} | shared pts {} | share q/pt {:.2}",
             ls.hemi_share_points,
             ls.hemi_queries as f64 / ls.hemi_points.max(1) as f64,
         );
@@ -10487,17 +10506,17 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             ok = false;
         }
         if structural && (results.is_empty() || ls.hemi_share_points == 0) {
-            eprintln!("hemi share: expected qualifying probe groups and shared points > 0 â€” the path didn't fire");
+            eprintln!("hemi share: expected qualifying probe groups and shared points > 0 — the path didn't fire");
             ok = false;
         }
         if structural && qual_reject == 0 {
-            eprintln!("hemi share: expected Î·/Î´ qualifier rejections > 0 â€” the qualifier branch didn't fire");
+            eprintln!("hemi share: expected η/δ qualifier rejections > 0 — the qualifier branch didn't fire");
             ok = false;
         }
         // Guard must-fire: a capture past FB_DEPTH_CAP must poison (and so
         // fall back per-pixel). At any legal depth the capacity math makes
-        // record overflow unreachable (â‰¤ 4^(FB_DEPTH_CAPâˆ’1) leaves, â‰¤ 21 cut
-        // slots), so the depth guard is the one live poison producer â€” this
+        // record overflow unreachable (≤ 4^(FB_DEPTH_CAP−1) leaves, ≤ 21 cut
+        // slots), so the depth guard is the one live poison producer — this
         // keeps it from rotting into dead code.
         if let Some(g) = groups.first() {
             let (rp, rn) = g.pts[0];
@@ -10522,7 +10541,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             );
             if !deep.poisoned {
                 eprintln!(
-                    "hemi share: a depth-{} capture did not poison â€” the FB_DEPTH_CAP guard is dead",
+                    "hemi share: a depth-{} capture did not poison — the FB_DEPTH_CAP guard is dead",
                     hemi::FB_DEPTH_CAP + 1
                 );
                 ok = false;
@@ -10531,7 +10550,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         ok
     };
 
-    // Probe gates done â€” the bench rows below measure the session defaults.
+    // Probe gates done — the bench rows below measure the session defaults.
     bvh::CUT_SEED_HEMI.store(cut_hemi_session, Relaxed);
 
     let accum: Vec<AtomicU32> = (0..rw * rh * 3).map(|_| AtomicU32::new(0)).collect();
@@ -10617,8 +10636,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
 
     // --spp bench: the honest measurement. The quadtree is traced ONCE per
     // frame no matter the sample count, so an N-spp frame should cost less
-    // than NÃ— a 1-spp frame; the printed AMORTIZATION factor is
-    // ms(N) / (N Â· ms(1)) â€” 1.00 means the extra samples paid full price
+    // than N× a 1-spp frame; the printed AMORTIZATION factor is
+    // ms(N) / (N · ms(1)) — 1.00 means the extra samples paid full price
     // (all cost is in the rays), below 1.00 is the frustum work being spread.
     // Both hybrid and plain run, because the DIFFERENCE between their factors
     // is the quadtree overhead this feature is trying to dilute.
@@ -10659,7 +10678,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             discard_seeds: false,
             defer_shade: false,
         };
-        // Frames scale down with spp â€” an spp=16 frame already does 16Ã— the
+        // Frames scale down with spp — an spp=16 frame already does 16× the
         // primary work of the spp=1 row.
         let frames = (BENCH_FRAMES / n).max(2);
         let t = Instant::now();
@@ -10673,22 +10692,22 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             "{} spp={n:<2}: {ms:6.1} ms/frame{}",
             if hybrid { "hybrid" } else { "plain " },
             match amort {
-                Some(a) => format!(" | amortization {a:.2}Ã— (1.00 = no saving)"),
+                Some(a) => format!(" | amortization {a:.2}× (1.00 = no saving)"),
                 None => String::new(),
             },
         );
         spp_bench.push((hybrid, n, ms));
     }
     // The cost model, and with it the answer to "when do the returns stop?".
-    // Frame time is affine in the sample count: ms(n) = F + mÂ·n, where F is
+    // Frame time is affine in the sample count: ms(n) = F + m·n, where F is
     // everything paid ONCE (the quadtree: bound queries + refine_cut) and m is
     // one sample's rays + shading. Two rows fix the line. Then
-    //   amortization(n) = ms(n) / (n Â· ms(1)) = m/(F+m) + F/((F+m)Â·n),
+    //   amortization(n) = ms(n) / (n · ms(1)) = m/(F+m) + F/((F+m)·n),
     // an asymptote plus a term that decays as 1/n: HALF the fixed cost is
-    // diluted away by spp=2, 90% by spp=10, 99% by spp=100 â€” so the
+    // diluted away by spp=2, 90% by spp=10, 99% by spp=100 — so the
     // amortization benefit is essentially spent by ~8-16 spp, and every sample
     // past that pays the full marginal price m. The QUALITY side meanwhile
-    // improves only as 1/âˆšn. Both curves are printed so the trade is visible.
+    // improves only as 1/√n. Both curves are printed so the trade is visible.
     let fit = |hybrid: bool| -> Option<(f64, f64, f64)> {
         let at = |k: u32| spp_bench.iter().find(|(h, n, _)| *h == hybrid && *n == k).map(|r| r.2);
         let (lo, hi) = (at(1)?, at(16)?);
@@ -10699,7 +10718,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     for hybrid in [true, false] {
         if let Some((f, m, asym)) = fit(hybrid) {
             eprintln!(
-                "{} spp cost model: fixed {f:.1} ms/frame + {m:.1} ms/sample => amortization floor {asym:.2}Ã— (1/n approach: 0.5 of the fixed cost gone at spp 2, 0.9 at spp 10)",
+                "{} spp cost model: fixed {f:.1} ms/frame + {m:.1} ms/sample => amortization floor {asym:.2}× (1/n approach: 0.5 of the fixed cost gone at spp 2, 0.9 at spp 10)",
                 if hybrid { "hybrid" } else { "plain " },
             );
         }
@@ -10709,7 +10728,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     // the shafts/adopt precedent: if share-on is not measurably faster on
     // both the default scene and --stress 5000, the feature does not merge):
     // share-on frames must form groups, must still fall back somewhere
-    // (curved geometry â€” proof the predicate rejects), and must run strictly
+    // (curved geometry — proof the predicate rejects), and must run strictly
     // fewer hemi queries than their share-off twin.
     for pair in share_rows.chunks(2) {
         let [(l0, s0, q0, _, _), (l1, s1, q1, g1, f1)] = pair else { continue };
@@ -10725,9 +10744,9 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             }
         }
     }
-    // Hemi-share frame gates: (a) determinism â€” two same-seed share-on fb
+    // Hemi-share frame gates: (a) determinism — two same-seed share-on fb
     // frames must be bit-identical (group formation and capture are pure
-    // functions of the frame inputs); (b) structure-replay coverage â€” the
+    // functions of the frame inputs); (b) structure-replay coverage — the
     // existing replay bit-identity gates run fb-OFF and prove nothing about
     // the share cell loop, so one fb-ao trace/replay pair is gated here, with
     // groups > 0 on both arms as the anti-vacuity check.
@@ -10785,18 +10804,18 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         let b = snap();
         let mut ok = true;
         if a != b {
-            eprintln!("hemi share: two same-seed share-on frames differ â€” nondeterministic grouping");
+            eprintln!("hemi share: two same-seed share-on frames differ — nondeterministic grouping");
             ok = false;
         }
         if !rcache.valid() {
             // The contract's lost-replay state (arena overflow): production
             // never replays a poisoned frame. Only the default scene must
-            // record validly â€” a dense OBJ scene overflows legitimately.
+            // record validly — a dense OBJ scene overflows legitimately.
             if structural {
-                eprintln!("hemi share: fb-ao recording frame poisoned â€” replay coverage not provable");
+                eprintln!("hemi share: fb-ao recording frame poisoned — replay coverage not provable");
                 ok = false;
             } else {
-                eprintln!("hemi share: fb-ao recording poisoned (arena overflow) â€” replay gate skipped");
+                eprintln!("hemi share: fb-ao recording poisoned (arena overflow) — replay gate skipped");
             }
         } else {
             stats.clear();
@@ -10870,7 +10889,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     // Temporal cache: warm it with one full-depth frame at camera A, then
     // verify frames that consume it. Every pixel still gets the tmin=0
     // reference-ray treatment, so a bad seed surfaces as false-sky/overshoot.
-    // All deterministic â€” no wall clock.
+    // All deterministic — no wall clock.
     // GATE THE ALGORITHM AT ITS OWN FRONTIER. The temporal family's structural
     // must-fires (seeds/sky-tiles/adopts/coarse > 0) are written against
     // `render::TEMPORAL_TILE`, and they mean less at a coarser one: at the
@@ -10949,32 +10968,32 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         );
         let mut ok = rep.ok();
         if structural && want_seeds && seeds == 0 {
-            eprintln!("verify temporal {label}: expected temporal seeds > 0 â€” the path didn't fire");
+            eprintln!("verify temporal {label}: expected temporal seeds > 0 — the path didn't fire");
             ok = false;
         }
         if structural && want_sky && sky == 0 {
-            eprintln!("verify temporal {label}: expected temporal sky-tiles > 0 â€” the sky path didn't fire");
+            eprintln!("verify temporal {label}: expected temporal sky-tiles > 0 — the sky path didn't fire");
             ok = false;
         }
         if structural && want_adopts && adopts == 0 {
-            eprintln!("verify temporal {label}: expected cut adoptions > 0 â€” the adoption path didn't fire");
+            eprintln!("verify temporal {label}: expected cut adoptions > 0 — the adoption path didn't fire");
             ok = false;
         }
         if structural && max_depth.is_some() && rep.coarse == 0 {
-            eprintln!("verify temporal {label}: expected coarse pixels, found none â€” capped path not exercised");
+            eprintln!("verify temporal {label}: expected coarse pixels, found none — capped path not exercised");
             ok = false;
         }
         temporal_ok &= ok;
     };
-    // T1: identical basis â€” the static-accumulation fast path. Every sky tile
+    // T1: identical basis — the static-accumulation fast path. Every sky tile
     // must come from the cache, at least one node must seed, and the verbatim
-    // cut-adoption arm must fire (identical cone â‡’ own old cut valid).
+    // cut-adoption arm must fire (identical cone ⇒ own old cut valid).
     temporal_pass("static", &cam, None, true, true, true);
     // T2: pure forward dolly. Seeds must fire (the root, at minimum: its
-    // extreme dirs are the old corners Â± fp on the old screen boundary plus
-    // the focus of expansion). Sky is NOT asserted: at this Î´ the Î»_max tilt
+    // extreme dirs are the old corners ± fp on the old screen boundary plus
+    // the focus of expansion). Sky is NOT asserted: at this δ the λ_max tilt
     // drags every sky tile's query box toward the FOE, across the sky
-    // boundary into finite cells â€” expected, not a regression.
+    // boundary into finite cells — expected, not a regression.
     let mut cam_b = cam0;
     cam_b.pos += cam0.forward() * (0.02 * scene.diag);
     let basis_b = cam_b.basis(rw, rh);
@@ -10984,15 +11003,15 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     // T3: the same dolly through the depth-capped driver (the root's seed is
     // cap-independent).
     temporal_pass("dolly capped d=4", &basis_b, Some(4), true, false, false);
-    // T4: translate + rotate â€” the root leaves the old screen and this
+    // T4: translate + rotate — the root leaves the old screen and this
     // scene's finite bound landscape is single-valued (the ground AABB blocks
     // everything at one distance), so only correctness is asserted.
     let mut cam_c = cam_b;
     cam_c.yaw += 0.05;
     temporal_pass("dolly+yaw", &cam_c.basis(rw, rh), None, false, false, false);
-    // T5: pure rotation â€” the region-min query's structural win: Î´ = 0, the
+    // T5: pure rotation — the region-min query's structural win: δ = 0, the
     // old proven-empty balls are unchanged in world space, and panned-into
-    // sky tiles overlap only old sky cells â†’ free. Seeds are NOT asserted:
+    // sky tiles overlap only old sky cells → free. Seeds are NOT asserted:
     // with a single-valued finite landscape, min == inherited everywhere.
     let mut cam_y = cam0;
     cam_y.yaw += 0.05;
@@ -11000,7 +11019,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     temporal_pass("yaw", &basis_y, None, false, true, false);
 
     // Informational A/B: static (the accumulation-frame path) and pure yaw
-    // (the rotation path), each cold vs seeded. Not gated â€” the win is
+    // (the rotation path), each cold vs seeded. Not gated — the win is
     // scene-dependent.
     let warm = [(&tcache, cam)];
     for (label, basis, prev) in [
@@ -11056,8 +11075,8 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     }
 
     // Structure replay (replay.rs): record one producing frame, then prove a
-    // replay is indistinguishable from a fresh trace â€” tbuf, info, AND accum
-    // bit-identical â€” first on the recording frame itself (frame 0,
+    // replay is indistinguishable from a fresh trace — tbuf, info, AND accum
+    // bit-identical — first on the recording frame itself (frame 0,
     // unjittered) and then on a warm jittered frame 1 through the interactive
     // wiring shape (which also proves the terminal structure is stable under
     // a warm identical-basis re-trace, the property the interactive replay
@@ -11133,11 +11152,11 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 eprintln!("replay record: recording poisoned on the default scene");
                 replay_ok = false;
             } else {
-                eprintln!("replay record: poisoned (arena overflow) â€” replay gates skipped (production traces fresh)");
+                eprintln!("replay record: poisoned (arena overflow) — replay gates skipped (production traces fresh)");
             }
         }
         if structural && (nl == 0 || ns == 0) {
-            eprintln!("replay record: expected both leaves and sky terminals > 0 â€” a path didn't fire");
+            eprintln!("replay record: expected both leaves and sky terminals > 0 — a path didn't fire");
             replay_ok = false;
         }
         // Same-seed replay of frame 0 vs the recording frame itself.
@@ -11254,12 +11273,12 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             rep_d.false_sky, rep_d.overshoot, rep_d.hybrid_extra,
         );
         if !rep_d.ok() || (structural && seeds_d == 0) {
-            eprintln!("replay frozen-prev dolly: gates failed â€” replay perturbed the temporal contract");
+            eprintln!("replay frozen-prev dolly: gates failed — replay perturbed the temporal contract");
             replay_ok = false;
         }
         // A/B: what a still frame costs cold, cold while recording (the
         // producer overhead), warm (seeded queries), and replayed (zero
-        // queries). Informational â€” the win is the point.
+        // queries). Informational — the win is the point.
         for (label, warm, do_replay, do_record) in [
             ("static cold    ", false, false, false),
             ("static cold+rec", false, false, true),
@@ -11267,7 +11286,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             ("static replay  ", false, true, false),
         ] {
             if do_replay && !rcache.valid() {
-                continue; // nothing to replay â€” production traces fresh
+                continue; // nothing to replay — production traces fresh
             }
             stats.clear();
             let ctx = FrameCtx {
@@ -11329,7 +11348,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     // an older ring entry. Produce cache B far off to the side (consuming
     // [A], which also exercises production on a warm ring), then verify near
     // A's pose with ring [B, A]: on the pan-back side the query extremes
-    // project off B's screen (an OffScreen miss) and A answers â€” and every
+    // project off B's screen (an OffScreen miss) and A answers — and every
     // consumed claim still passes the per-pixel reference re-trace.
     let mut ring_ok = true;
     {
@@ -11374,7 +11393,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             render::render_frame(&ctx, true);
         }
         // Exact pan-back (bit-equal to A's basis): tiles that project off
-        // B's screen retry A and take its verbatim identical-basis path â€”
+        // B's screen retry A and take its verbatim identical-basis path —
         // the structural must-fire. The near-pose pass below (not bit-equal)
         // exercises the general-query retry and is gated on correctness
         // only: whether an older general query beats "not useful" is
@@ -11391,7 +11410,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         );
         ring_ok &= rep_r.ok();
         if structural && hits == 0 {
-            eprintln!("verify temporal ring pan-back exact: expected ring hits > 0 â€” the ring path didn't fire");
+            eprintln!("verify temporal ring pan-back exact: expected ring hits > 0 — the ring path didn't fire");
             ring_ok = false;
         }
         let mut cam_back = cam0;
@@ -11413,9 +11432,9 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     // Cut-adoption multi-hop chain: 4 consecutive dolly steps, each frame
     // producing (claims, cuts) while consuming the previous pair with
     // adoption on, each consumer re-verified against the pair it consumed
-    // (per-pixel reference rays â€” a stale or too-small chained cut surfaces
+    // (per-pixel reference rays — a stale or too-small chained cut surfaces
     // as overshoot/false-sky). MAX_ADOPT_AGE = 3, so by step 4 age-capped
-    // nodes must appear and force requeries â€” the decay control must-fire.
+    // nodes must appear and force requeries — the decay control must-fire.
     let mut adopt_ok = true;
     {
         let chain_tc = [temporal::TemporalCache::new(rw, rh), temporal::TemporalCache::new(rw, rh)];
@@ -11518,18 +11537,18 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             prev_basis = basis_s;
         }
         if structural && adopts_total == 0 {
-            eprintln!("adopt chain: expected adoptions > 0 across the chain â€” the path didn't fire");
+            eprintln!("adopt chain: expected adoptions > 0 across the chain — the path didn't fire");
             adopt_ok = false;
         }
         if structural && requery_total == 0 {
-            eprintln!("adopt chain: expected age-capped requeries > 0 by step 4 â€” decay control didn't fire");
+            eprintln!("adopt chain: expected age-capped requeries > 0 by step 4 — decay control didn't fire");
             adopt_ok = false;
         }
 
         // A/B + KILL CRITERION (the shafts / specular-cone precedent): warm
         // dolly frames with adoption off vs on. If adopt-on is not
         // measurably faster on BOTH the default scene and --stress 5000, C
-        // does not merge â€” skipped bound queries must beat the containment
+        // does not merge — skipped bound queries must beat the containment
         // walk plus the (possibly coarser) adopted-cut refine.
         // The 1-spp rows are the workload the skip targets: DLSS/XeSS motion
         // frames trace full-depth at 1 shadow / 1 AO sample, where the
@@ -11600,16 +11619,16 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     render::set_leaf_tile(shipping_tile);
 
     // Deferred material-sorted shading (--defer-shade): a same-seed frame
-    // with deferral off vs on must be BIT-IDENTICAL â€” the records carry each
+    // with deferral off vs on must be BIT-IDENTICAL — the records carry each
     // pixel's rng stream and every accum/tbuf/info/G-buffer write is
     // single-writer, so reordering shading may not change one bit. The
     // off/on rows are the kill-criterion bench (the shaft precedent: the
     // tiled shader earns a default only by measuring faster on a real
-    // textured scene). Scenes with no textured material skip â€” deferral
+    // textured scene). Scenes with no textured material skip — deferral
     // structurally never engages there (the leaf probe shades inline).
     let mut defer_ok = true;
     if !scene.materials.iter().any(|m| m.any_tex()) {
-        eprintln!("defer gates: no textured materials â€” deferral never engages (skipped)");
+        eprintln!("defer gates: no textured materials — deferral never engages (skipped)");
     } else {
         let alloc3 = || (0..rw * rh * 3).map(|_| AtomicU32::new(0)).collect::<Vec<_>>();
         let alloc1 = || (0..rw * rh).map(|_| AtomicU32::new(0)).collect::<Vec<_>>();
@@ -11673,7 +11692,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         // ground quad), and the bit-identity half above is the soundness
         // signal that runs everywhere.
         if structural && dpx == 0 {
-            eprintln!("defer: textured scene deferred 0 px â€” the path didn't fire");
+            eprintln!("defer: textured scene deferred 0 px — the path didn't fire");
             defer_ok = false;
         }
         for (label, defer) in [("defer A/B (off)", false), ("defer A/B (on) ", true)] {
@@ -11822,7 +11841,7 @@ fn sdl_hwnd(window: &sdl3::video::Window) -> windows::Win32::Foundation::HWND {
 
 /// Adoption-only DRS logging: one line per adopted endpoint (ramp
 /// intermediates land silently), tracked via the caller's last-logged
-/// endpoint. `(0, 0)` marks "nothing logged yet" â€” the first adoption of a
+/// endpoint. `(0, 0)` marks "nothing logged yet" — the first adoption of a
 /// session is silent.
 #[cfg(windows)]
 fn log_drs_adoption(path: &str, lim: &xess::StepLimiter, last_ep: &mut (usize, usize)) {
@@ -11861,12 +11880,12 @@ enum GpuUp {
     Fsr4,
     Fsr3,
     /// --quinlight: several upscalers at once, presented through the
-    /// registered-consensus fuse (gpu/quin.rs). Not a chain level â€” a
+    /// registered-consensus fuse (gpu/quin.rs). Not a chain level — a
     /// composition of them.
     Quin,
 }
 
-/// The live render mode â€” SPACE cycles it (CPU -> GPU wavefront -> DXR).
+/// The live render mode — SPACE cycles it (CPU -> GPU wavefront -> DXR).
 /// Purely cycle arithmetic for the transition block: the stored truth stays
 /// the `gpu_trace`/`dxr_on` pair (never both true), which every arm guard
 /// and Persist site reads directly.
@@ -11887,11 +11906,11 @@ enum SessionEnd {
 }
 
 /// User-visible state that survives a window-resize session restart: mode
-/// toggles, denoiser intents, counters. The camera pose is NOT here â€” the
+/// toggles, denoiser intents, counters. The camera pose is NOT here — the
 /// flycam integrator thread owns it for the whole app lifetime (it keeps
 /// flying through the rebuild) and the next session just snapshots it.
-/// Everything else â€” every buffer, controller, history, and upscaler
-/// context â€” intentionally rebuilds at the new size by re-entering the
+/// Everything else — every buffer, controller, history, and upscaler
+/// context — intentionally rebuilds at the new size by re-entering the
 /// session init code (which is the same code that already handles every
 /// mode/fallback at any (w, h)).
 #[cfg(windows)]
@@ -11904,7 +11923,7 @@ struct Persist {
     bounce_mode: u32,
     /// Heightfield relief vs normal-mapped (V toggles; `--heightfield` /
     /// `--no-heightfield` seed it). Mirrored into `bvh::set_height_on` each
-    /// frame â€” a shading+visibility switch, never a rebuild.
+    /// frame — a shading+visibility switch, never a rebuild.
     height_on: bool,
     preset: u32,
     /// Samples per pixel per frame (U cycles it; --spp seeds it).
@@ -11927,7 +11946,7 @@ struct Persist {
     dxr_up_plain: bool,
     gpu_up_plain: bool,
     gpu_nppd_on: bool,
-    /// Failed-init latches: a missing DLL stays missing across a resize â€”
+    /// Failed-init latches: a missing DLL stays missing across a resize —
     /// don't retry per re-entry.
     oidn_failed: bool,
     nppd_failed: bool,
@@ -11936,18 +11955,18 @@ struct Persist {
     shot: u32,
     depth_est: f32,
     /// The cloud animation clock (seconds, f64 so long sessions don't lose
-    /// resolution) â€” carried across resize/F11 re-entries like the camera
+    /// resolution) — carried across resize/F11 re-entries like the camera
     /// pose: a rebuild is not a weather change.
     cloud_time: f64,
     /// The frozen frustum snapshot appended to the scene (Y captures, Z
-    /// clears), if any â€” its appended vert/tri/material counts, so a
+    /// clears), if any — its appended vert/tri/material counts, so a
     /// recapture/clear can truncate the tail. The geometry itself lives in the
     /// owned `Scene` (mutated in place) and survives resize with it; this is
     /// the bookkeeping that survives alongside.
     frust: Option<frustcap::FrustArtifact>,
 }
 
-/// "HH:MM" of a time-of-day hour â€” the window-title readout (doubles as the
+/// "HH:MM" of a time-of-day hour — the window-title readout (doubles as the
 /// manual-verification signal that a scrub actually landed).
 #[cfg(windows)]
 fn tod_hhmm(h: f32) -> String {
@@ -11957,7 +11976,7 @@ fn tod_hhmm(h: f32) -> String {
 
 /// The title's fps field. The frame loop counts RENDERED frames; frame
 /// generation presents more than that (a generated frame per rendered one),
-/// so an FG session shows both rates â€” "87 -> ~174 fps (fg x2)" â€” using the
+/// so an FG session shows both rates — "87 -> ~174 fps (fg x2)" — using the
 /// family's own measured multiplier (`GpuContext::fg_display_mult`). "x1"
 /// means FG is armed but not inserting (holds, unprimed reset frames, a
 /// declined DLSS-G session).
@@ -11973,7 +11992,7 @@ fn fps_title(fps: f64, fg_mult: Option<u32>) -> String {
 }
 
 /// Fold the PICKED adapter's measured preferences into the defaults the user
-/// left alone. Called once, from `run_window`, right after `GpuContext::new` â€”
+/// left alone. Called once, from `run_window`, right after `GpuContext::new` —
 /// the earliest moment the vendor is a FACT: `--prefer-*` is only a request,
 /// and a box without that vendor silently falls back to the first hardware
 /// adapter, so keying a default off the preference would be keying it off a
@@ -11983,7 +12002,7 @@ fn fps_title(fps: f64, fg_mult: Option<u32>) -> String {
 /// one whose right answer is a property of the HARDWARE BALANCE rather than of
 /// the scene, must be measured on more than one vendor, and must actually
 /// INVERT between them. A knob that merely wins a bit more on one vendor is a
-/// constant, not a policy â€” this function is where a wrong entry costs every
+/// constant, not a policy — this function is where a wrong entry costs every
 /// user of that vendor silently, so it stays small and each entry carries its
 /// numbers.
 ///
@@ -12007,7 +12026,7 @@ fn vendor_defaults(opts: &mut Opts, vendor: gpu::adapter::Vendor) {
     //   4090 default          2.582     1.383       0.54x
     //   4090 stress 5000      1.081     0.782       0.72x
     // ```
-    // The ratio does not merely shrink across vendors, it CROSSES ONE â€” which
+    // The ratio does not merely shrink across vendors, it CROSSES ONE — which
     // is the whole justification for a vendor-aware default rather than a
     // better global one. The mechanism is the one the quadtree analysis in
     // CLAUDE.md already established: Arc's RT cores are weak relative to its
@@ -12015,16 +12034,16 @@ fn vendor_defaults(opts: &mut Opts, vendor: gpu::adapter::Vendor) {
     // quadtree that proves space empty and traces no rays there is worth far
     // more; and it is worth MOST on the default scene, which is mostly sky.
     //
-    // W2 CAVEAT (2026-07-22): that table is the ALL-TRACERAY pipeline â€”
+    // W2 CAVEAT (2026-07-22): that table is the ALL-TRACERAY pipeline —
     // --dxr-inline 0. The mode-1 promotion (inline RayQuery secondaries, the
     // DXR default since W2) moved the DXR column to 2.35/1.64, so the Intel
     // ratio now STRADDLES 1.0 by scene at spp=1 (default 1.34x, stress
-    // 0.81x, san-miguel-lp 0.94x) â€” most of the old gap was secondary
+    // 0.81x, san-miguel-lp 0.94x) — most of the old gap was secondary
     // TraceRay dispatch, not RT-core weakness. THE WORLD RE-MEASURE (same
-    // day â€” the debt this paragraph used to record, now paid): interactive
+    // day — the debt this paragraph used to record, now paid): interactive
     // boot-pose sessions on the B70, native 1080p spp=1, --gpu-timing
     // running means over 6-30k frames, 2 interleaved reps (spread 1-5%; a
-    // live desktop never repeats to the headless loop's Â±0.1%):
+    // live desktop never repeats to the headless loop's ±0.1%):
     // ```text
     //                    tracer ms   frame span
     //   wavefront          4.15        5.21
@@ -12032,13 +12051,13 @@ fn vendor_defaults(opts: &mut Opts, vendor: gpu::adapter::Vendor) {
     //   DXR --dxr-inline 2 3.83        4.92
     //   DXR --dxr-inline 0 7.28        8.37     (matches the BLAS-era 7.27/8.34)
     // ```
-    // So at spp=1 the wavefront now LOSES on the flagless scene itself â€”
-    // and on stress (0.81x) and san-miguel-lp (0.94x) â€” keeping only the
+    // So at spp=1 the wavefront now LOSES on the flagless scene itself —
+    // and on stress (0.81x) and san-miguel-lp (0.94x) — keeping only the
     // sky-heavy procedural default scene (1.34x). This entry is
     // nevertheless KEPT, with its basis narrowed from "wavefront wins
     // spp=1" to: the ~8% span margin is imperceptible at 5 ms, while the
     // wavefront owns H/R/C/O and the >=spp-3 regime (the quadtree's
-    // marginal sample is the cheaper one â€” measured procedural; mode 1's
+    // marginal sample is the cheaper one — measured procedural; mode 1's
     // candidate-loop-fattened chs_shade pays occupancy per sample, and the
     // world arms cutout, so high spp should read WORSE there, though that
     // point is unmeasured). Flipping Intel flagless to DXR is a one-line
@@ -12048,16 +12067,16 @@ fn vendor_defaults(opts: &mut Opts, vendor: gpu::adapter::Vendor) {
     // AMD is deliberately absent: this box's only AMD adapter is an iGPU
     // (~22x slower, useless as a signal), so RDNA has no measurement here and
     // therefore keeps the cross-vendor default. Do not extend this to a vendor
-    // on inference â€” measure it or leave it out.
+    // on inference — measure it or leave it out.
     //
     // NOTE the pair this leaves behind: `gpu` AND `dxr` both true. That is not
     // the contradictory state the argument parser rejects ("--gpu --dxr", where
-    // one flag must win) â€” `session()` reads the pair as a PREFERENCE ORDER,
+    // one flag must win) — `session()` reads the pair as a PREFERENCE ORDER,
     // trying the wavefront first and taking the DXR arm only `if want_dxr &&
     // !dxr_failed && !gpu_trace`. So the DXR pipeline stays as the automatic
     // fallback, which matters: the wavefront additionally carries the software
     // BVH for its frustum queries, so on a small-VRAM Arc a scene DXR could
-    // hold (THE WORLD is 34.5M tris) may fail to init here â€” and falling to the
+    // hold (THE WORLD is 34.5M tris) may fail to init here — and falling to the
     // CPU tracer when a working GPU arm existed would be a real regression.
     // Only reached when the DXR default is actually in force, so the pair is
     // never manufactured against a user who already opted out (`--oidn` etc.
@@ -12065,7 +12084,7 @@ fn vendor_defaults(opts: &mut Opts, vendor: gpu::adapter::Vendor) {
     if vendor == Vendor::Intel && !opts.mode_explicit && opts.dxr && !opts.gpu {
         opts.gpu = true;
         eprintln!(
-            "gpu: Intel adapter â€” starting in the compute WAVEFRONT tracer (--dxr starts the \
+            "gpu: Intel adapter — starting in the compute WAVEFRONT tracer (--dxr starts the \
              DispatchRays pipeline instead, --cpu the CPU tracer, SPACE cycles all three live)"
         );
     }
@@ -12074,18 +12093,18 @@ fn vendor_defaults(opts: &mut Opts, vendor: gpu::adapter::Vendor) {
 #[cfg(windows)]
 fn run_window(req: SceneRequest, opts: &Opts, file_settings: settings::Settings) {
     // SDL3 is per-monitor-v2 DPI aware on Windows unconditionally (SDL2's
-    // SDL_WINDOWS_DPI_AWARENESS hint is gone), so WÃ—H stays WÃ—H physical
+    // SDL_WINDOWS_DPI_AWARENESS hint is gone), so W×H stays W×H physical
     // pixels, matching the swapchain.
     // Deliver the click that lands on an unfocused window instead of
     // swallowing it as an activation click (SDL's default). Standard for
-    // game windows â€” with a pause menu on screen, the first click back into
+    // game windows — with a pause menu on screen, the first click back into
     // the window should press the button it hit, not vanish.
     sdl3::hint::set("SDL_MOUSE_FOCUS_CLICKTHROUGH", "1");
     let sdl = sdl3::init().expect("SDL init failed");
     let video = sdl.video().expect("SDL video failed");
     let mut window = video
         .window(
-            "frustracer â€” SPACE: cpu/gpu/dxr  R: hybrid/plain  T: dynamic-res  O: overlay  B: gpu-tonemap  G: dlss  X: xess  N: oidn  H: hemi-bounce  1-3: quality  C: verify  P: screenshot  F1: hud",
+            "frustracer — SPACE: cpu/gpu/dxr  R: hybrid/plain  T: dynamic-res  O: overlay  B: gpu-tonemap  G: dlss  X: xess  N: oidn  H: hemi-bounce  1-3: quality  C: verify  P: screenshot  F1: hud",
             W as u32,
             H as u32,
         )
@@ -12117,11 +12136,11 @@ fn run_window(req: SceneRequest, opts: &Opts, file_settings: settings::Settings)
     };
     let mut gpu = gpu::GpuContext::new(sdl_hwnd(&window), W as u32, H as u32, &gopts)
         .expect("GPU init failed");
-    // The Slint HUD lives at run_window scope like `fly` â€” one per process
+    // The Slint HUD lives at run_window scope like `fly` — one per process
     // (set_platform is once), surviving session re-entries so menu/HUD state
     // needs no Persist mirror. Initial visibility from the settings file
     // (display.hud), default on. A failed init disables the HUD loudly and
-    // the session runs without it â€” the SDK-fallback shape.
+    // the session runs without it — the SDK-fallback shape.
     let mut hud = match hud::Hud::new(
         W as u32,
         H as u32,
@@ -12129,7 +12148,7 @@ fn run_window(req: SceneRequest, opts: &Opts, file_settings: settings::Settings)
     ) {
         Ok(h) => Some(h),
         Err(e) => {
-            eprintln!("hud: disabled â€” {e}");
+            eprintln!("hud: disabled — {e}");
             None
         }
     };
@@ -12149,7 +12168,7 @@ fn run_window(req: SceneRequest, opts: &Opts, file_settings: settings::Settings)
     // --fsr4: the FSR4 + Ray Regeneration level is a requirement, so the chain
     // falling through it is fatal here rather than a quiet downgrade. Checked
     // against the session's ACTUAL wiring (the probe already printed its own
-    // reason on the `fsr4:` line above) â€” it cannot disagree with what got
+    // reason on the `fsr4:` line above) — it cannot disagree with what got
     // wired. The two things worth trying are the fallback flavor and the
     // adapter, so name both.
     if opts.fsr4_required && gpu.fsr_flavor() != Some(fsr::Flavor::Fsr4Rr) {
@@ -12158,7 +12177,7 @@ fn run_window(req: SceneRequest, opts: &Opts, file_settings: settings::Settings)
              and the ffx-api Ray Regeneration provider; the fsr4: line above states the probe's reason)",
             gpu.adapter_name
         );
-        eprintln!("  --fsr3        FSR 3.1 upscale-only instead â€” cross-vendor, runs anywhere");
+        eprintln!("  --fsr3        FSR 3.1 upscale-only instead — cross-vendor, runs anywhere");
         eprintln!("  --prefer-amd  pick this box's AMD adapter, if it has one (--fsr4 already prefers AMD by default)");
         eprintln!("  --fsr         the same force-start, but allowed to fall through to XeSS/FSR3");
         std::process::exit(2);
@@ -12284,7 +12303,7 @@ fn run_window(req: SceneRequest, opts: &Opts, file_settings: settings::Settings)
     progress::phase(progress::Phase::Idle, "", 0);
 
     // The 500 Hz integrator owns the camera pose for the whole app lifetime
-    // (spawned here, not per session, so the pose survives resize rebuilds â€”
+    // (spawned here, not per session, so the pose survives resize rebuilds —
     // re-entry continuity is automatic). Sessions only snapshot. It spawns
     // PAUSED and each session resumes it once its frame loop is live.
     // TOD seeds from --tod or the default sun's own derived hour.
@@ -12333,7 +12352,7 @@ fn run_window(req: SceneRequest, opts: &Opts, file_settings: settings::Settings)
     }
     // --gpu-timing: the session-total table. The periodic one only fires every
     // REPORT_EVERY frames, so without this a session shorter than that (or one
-    // ending mid-interval â€” every session does) silently prints nothing, and an
+    // ending mid-interval — every session does) silently prints nothing, and an
     // asked-for flag that produces no output reads as broken. Survives the
     // resize path: `gputime` state lives in the module, not the session, and
     // the accumulator is never cleared here, so the table spans the whole run.
@@ -12364,7 +12383,7 @@ fn session(
     let p0: Option<Persist> = *persist;
     // Denoiser/pipeline intents: first entry from the CLI flags, re-entries
     // from the persisted runtime state (the CLI branches below double as the
-    // restore path â€” they rebuild the contexts at the new size).
+    // restore path — they rebuild the contexts at the new size).
     let want_oidn = p0.map_or(opts.oidn, |p| p.oidn_on || p.xess_oidn == XessOidn::Pre);
     let want_oidn_post = p0.map_or(opts.oidn_post, |p| p.xess_oidn == XessOidn::Post);
     let want_nppd = p0.map_or(opts.nppd, |p| p.nppd_on || p.xess_nppd);
@@ -12385,7 +12404,7 @@ fn session(
     let mut present = CpuPresent::new(w, h, gpu.encoding(), gpu.tone());
     let stats = Stats::default();
     // Temporal claim ring + lockstep cut stores: see TemporalRing. Half-res
-    // and plain frames don't participate and drop the ring â€” a cache from
+    // and plain frames don't participate and drop the ring — a cache from
     // any older frame or another resolution is never consulted.
     let mut tr = TemporalRing::new(w, h);
     // Static-frame structure replay (replay.rs): `replay_key` describes the
@@ -12405,16 +12424,16 @@ fn session(
     let mut dynamic = p0.map_or(true, |p| p.dynamic);
     let mut overlay_on = p0.map_or(false, |p| p.overlay_on);
     let mut gpu_tonemap = p0.map_or(false, |p| p.gpu_tonemap);
-    // Hemisphere frustum bounces (H cycles off â†’ AO â†’ GI): still-frame
-    // quality â€” moving/DLSS frames keep the sampled path.
+    // Hemisphere frustum bounces (H cycles off → AO → GI): still-frame
+    // quality — moving/DLSS frames keep the sampled path.
     let mut bounce_mode = p0.map_or_else(
         // First entry: the settings file's saved bounce (no CLI flag exists);
         // re-entries restore the live state like every other toggle.
         || cfg.renderer.bounce.as_deref().and_then(settings::parse_bounce).unwrap_or(0),
         |p| p.bounce_mode,
     );
-    // Heightfield relief vs normal-mapped (V; starts OFF â€” plain
-    // normal-mapping is the default mode â€” unless --heightfield opted in).
+    // Heightfield relief vs normal-mapped (V; starts OFF — plain
+    // normal-mapping is the default mode — unless --heightfield opted in).
     // Seeded from the flag-state static (height_on(), NOT height_armed():
     // armed stays true by default so V can enable relief live). The static
     // the intersector reads is stored here and at every V edge.
@@ -12434,14 +12453,14 @@ fn session(
     // + denoises to the window size) and RR is the only temporal integrator:
     // no CPU accumulation, no half-res moving mode, no depth-cap budget.
     let mut dlss_on = p0.map_or(gpu.dlss_ready(), |p| p.dlss_on && gpu.dlss_ready());
-    // Step-wise DRS (shares xess::ScaleCtl / quantize_res â€” pure controller
+    // Step-wise DRS (shares xess::ScaleCtl / quantize_res — pure controller
     // math common to both upscalers). Steps are made RARE (the quantization
     // plus the StepLimiter dwell is the hysteresis) because RR re-initializes
-    // its internal denoiser on an input-res change â€” but a step is a scale
+    // its internal denoiser on an input-res change — but a step is a scale
     // change, not a scene change: the res-step block below does NOT reset
     // (no dlss_reset, no prev drop; history survives via the extent tags).
     // A degenerate reported range (min == max) means the driver offers no
-    // DRS â€” fixed res, no controller. --lock-res (default quality = 2/3)
+    // DRS — fixed res, no controller. --lock-res (default quality = 2/3)
     // pins a fixed res inside the range instead; `--lock-res dynamic` opts
     // back into the controller.
     let dlss_range = gpu.rr_res_range();
@@ -12452,7 +12471,7 @@ fn session(
             (min.0 as usize, min.1 as usize),
             (max.0 as usize, max.1 as usize),
         ),
-        // No usable range: the lock can't be honored â€” keep the SDK
+        // No usable range: the lock can't be honored — keep the SDK
         // optimal / DLAA fallback (warned about at the startup print).
         _ => gpu.rr_render_res().map(|(a, b)| (a as usize, b as usize)).unwrap_or((w, h)),
     };
@@ -12478,11 +12497,11 @@ fn session(
     // RAMP_FRAMES instead of snapping (see xess::StepLimiter).
     let mut dlss_lim = xess::StepLimiter::new(xess::RAMP_FRAMES);
     let mut xess_lim = xess::StepLimiter::new(xess::RAMP_FRAMES);
-    // Last logged endpoints â€” adoption-only DRS logging (a ramp would
+    // Last logged endpoints — adoption-only DRS logging (a ramp would
     // otherwise print every intermediate res).
     let mut dlss_ep = (0usize, 0usize);
     let mut xess_ep = (0usize, 0usize);
-    // FRUSTRACER_STAB=1: numeric stability meter â€” every 15th upscaled frame
+    // FRUSTRACER_STAB=1: numeric stability meter — every 15th upscaled frame
     // is read back and diffed against the previous capture; a static camera
     // on a converged pipeline trends to ~0, temporal instability ("dancing")
     // shows as a persistently high mean.
@@ -12496,12 +12515,12 @@ fn session(
             if dlss_drs && opts.gpu {
                 // The GPU arm locks the render res; the `gpu:` line that
                 // follows states the resolution actually chosen.
-                "requested (--lock-res dynamic) â€” locked under --gpu, see the gpu: line".to_string()
+                "requested (--lock-res dynamic) — locked under --gpu, see the gpu: line".to_string()
             } else if dlss_drs {
                 "ON (step-wise; history survives steps)".to_string()
             } else if opts.gpu {
                 // The CPU renderer never runs under --gpu, so its lock (the
-                // quality default) is not this session's render res â€” the
+                // quality default) is not this session's render res — the
                 // gpu: line below states the tracer's own locked one.
                 "LOCKED under --gpu, see the gpu: line".to_string()
             } else if opts.lock_scale.is_some() {
@@ -12511,14 +12530,14 @@ fn session(
                         drw,
                         drh,
                         (drh * 100 + h / 2) / h,
-                        // No DRS under --gpu â€” don't advertise re-enabling it.
+                        // No DRS under --gpu — don't advertise re-enabling it.
                         if opts.gpu { "" } else { "; `--lock-res dynamic` re-enables" }
                     )
                 } else {
-                    format!("unavailable (no render-res range) â€” --lock-res not honorable, keeping {}x{}", drw, drh)
+                    format!("unavailable (no render-res range) — --lock-res not honorable, keeping {}x{}", drw, drh)
                 }
             } else {
-                "unavailable (degenerate range) â€” fixed render res".to_string()
+                "unavailable (degenerate range) — fixed render res".to_string()
             }
         );
     }
@@ -12528,17 +12547,17 @@ fn session(
     // trace at a dynamic render resolution picked by the scale controller
     // (quantized inside the SDK's queried input range), and XeSS's temporal
     // accumulation of the jittered sample stream is the ONLY spatial
-    // reconstruction â€” the depth-cap/quad-fill budget path, the half-res
+    // reconstruction — the depth-cap/quad-fill budget path, the half-res
     // moving mode, and CPU accumulation never run. N composes an OIDN
     // pre-denoise at the same dynamic render res (XeSS-SR is a TAA-upscaler,
     // not a denoiser); the render-res G-buffers are reinterpreted in place
     // on a res step (GBufs::set_res), and `xess_prev` is its own MV-basis
-    // contract â€” dropped on any res step, since the previous frame's pixel
+    // contract — dropped on any res step, since the previous frame's pixel
     // grid no longer matches.
     let mut xess_on = p0.map_or(gpu.xess_ready(), |p| p.xess_on && gpu.xess_ready());
     let xess_range = gpu.xess_res_range(); // (optimal, min, max)
     // --lock-res (default quality): one fixed render res for the whole
-    // session â€” the ScaleCtl/StepLimiter pair is never built/consulted.
+    // session — the ScaleCtl/StepLimiter pair is never built/consulted.
     // quantize_res clamps the requested scale into the SDK range.
     let xess_lock = opts.lock_scale.and_then(|r| {
         xess_range.map(|(_, min, max)| {
@@ -12552,7 +12571,7 @@ fn session(
     });
     let mut xess_ctl = xess_range.filter(|_| xess_lock.is_none()).map(|(_, min, max)| {
         // Start at ~2/3 scale (the DLSS-Quality neighborhood), not the SDK's
-        // "optimal" â€” with the ULTRA_PERFORMANCE init that widens the range,
+        // "optimal" — with the ULTRA_PERFORMANCE init that widens the range,
         // optimal is the 1/3-scale floor and would open blurry. The
         // controller corrects from here either way.
         let start_h = (h * 2 / 3).clamp(min.1 as usize, max.1 as usize);
@@ -12586,7 +12605,7 @@ fn session(
         } else if opts.gpu {
             // The GPU arm locks the render res; the `gpu:` line that follows
             // states the resolution actually chosen.
-            eprintln!("xess: super-resolution ON (X toggles) â€” dynamic res locked under --gpu, see the gpu: line");
+            eprintln!("xess: super-resolution ON (X toggles) — dynamic res locked under --gpu, see the gpu: line");
         } else {
             eprintln!("xess: dynamic super-resolution ON (X toggles; N cycles OIDN off/pre/post)");
         }
@@ -12595,7 +12614,7 @@ fn session(
         }
     }
 
-    // FSR state (--fsr sessions; K toggles â€” F belongs to DXR): the XeSS
+    // FSR state (--fsr sessions; K toggles — F belongs to DXR): the XeSS
     // dynamic-res frame contract with Ray Regeneration as the denoiser. Same
     // controller /
     // quantizer / step-limiter machinery; `fsr_prev` is its own prev-camera
@@ -12605,7 +12624,7 @@ fn session(
     let mut fsr_on = p0.map_or(gpu.fsr_ready(), |p| p.fsr_on && gpu.fsr_ready());
     // Which FSR pipeline initialized: FSR4 + Ray Regeneration (RDNA4) or
     // FSR 3.1 upscale-only (everything else / --fsr3). The flavor is fixed
-    // for the session â€” K toggles it against plain, never across flavors.
+    // for the session — K toggles it against plain, never across flavors.
     // Display strings come from fsr::Flavor::label/hud, never re-derived
     // per site (a hardcoded title-bar "FSR4" shipped wrong once).
     let fsr_flavor = gpu.fsr_flavor();
@@ -12624,7 +12643,7 @@ fn session(
         })
     });
     let mut fsr_ctl = fsr_range.filter(|_| fsr_lock.is_none()).map(|(opt, min, max)| {
-        // Seed from the Quality-mode query (the 2/3-scale neighborhood) â€”
+        // Seed from the Quality-mode query (the 2/3-scale neighborhood) —
         // unlike XeSS there is no widened-range "optimal" pitfall, so the
         // queried seed is used as-is. The controller corrects from here.
         let start_h = (opt.1 as usize).clamp(min.1 as usize, max.1 as usize);
@@ -12652,16 +12671,16 @@ fn session(
     }
 
     // --gpu: bring up the GPU-resident tracer (DXC compile, scene upload,
-    // BLAS/TLAS, and â€” in upscaler sessions â€” the feed wiring). The session
+    // BLAS/TLAS, and — in upscaler sessions — the feed wiring). The session
     // sub-mode mirrors the CPU defaults: DLSS-RR when supported, XeSS with
     // --xess, plain with --no-dlss. The render resolution is LOCKED for the
     // session (from --lock-res, default quality = 2/3, quantized into the
-    // upscaler's range) â€” the tracer's buffers are sized to it once; there
+    // upscaler's range) — the tracer's buffers are sized to it once; there
     // is no DRS on the GPU path. Any init failure falls back to the CPU
     // renderer with the reason on stderr. With Streamline live the tracer's
     // whole workload (ExecuteIndirect + DXR + AS builds) executes on the SL
-    // PROXY queue â€” validated in M7.
-    // Session sub-mode + locked trace res â€” computed UNCONDITIONALLY (the
+    // PROXY queue — validated in M7.
+    // Session sub-mode + locked trace res — computed UNCONDITIONALLY (the
     // dxw/dxh pattern below): the SPACE mode cycle can lazily build the
     // wavefront tracer in a session that started CPU or DXR, and the lazy
     // init must build at exactly the res/wiring the eager one would have.
@@ -12671,7 +12690,7 @@ fn session(
     let gpu_lock_note = opts.gpu_lock_scale.is_none() && (dlss_on || xess_on || fsr_on);
     // --quinlight wins over any single level: the fuse IS the presentation,
     // and every wired engine feeds it. The frame is traced ONCE, so the res
-    // must be legal for all of them at once â€” hence the intersected range.
+    // must be legal for all of them at once — hence the intersected range.
     let (gpu_wired_up, (grw, grh)) = if gpu.quin_planned() {
         (GpuUp::Quin, locked_render_res(gpu_lock, gpu.quin_res_range(), (w, h), (w, h), true))
     } else if dlss_on {
@@ -12731,7 +12750,7 @@ fn session(
                 true
             }
             Err(e) => {
-                eprintln!("gpu: falling back to CPU tracing â€” {e}");
+                eprintln!("gpu: falling back to CPU tracing — {e}");
                 trace_failed = true;
                 gpu_up = GpuUp::Plain;
                 false
@@ -12743,24 +12762,24 @@ fn session(
     }
     // Upscaler sub-mode per-frame state: free-running frame index (the RNG /
     // jitter phase must advance even though accumulate is off), the previous
-    // frame's camera (the MV contract â€” its own state, like dlss_prev), and
+    // frame's camera (the MV contract — its own state, like dlss_prev), and
     // the history-reset latch (set on discontinuities, never on motion).
     let mut gpu_up_idx: u32 = 0;
     let mut gpu_prev_cam: Option<Camera> = None;
     let mut gpu_reset = true;
     // Whether this session WIRED an upscaler feed (the G/X/K toggles can
     // only move between Plain and a WIRED upscaler). Wiring facts of the
-    // SESSION, not "the tracer is built" â€” the dxr_*_avail convention â€” so a
+    // SESSION, not "the tracer is built" — the dxr_*_avail convention — so a
     // lazily built (SPACE) wavefront arm gets the same sub-mode ladder the
     // eager one would.
     let gpu_xess_avail = gpu_wired_up == GpuUp::Xess;
     let gpu_rr_avail = gpu_wired_up == GpuUp::Rr;
     // --quinlight: the FUSE is this session's upscaler. G/X/K all toggle IT
-    // against plain â€” there is no single engine to switch to, since the engines
+    // against plain — there is no single engine to switch to, since the engines
     // exist only as fuse inputs (switching to one would strand the session: no
     // key restores the fuse).
     let gpu_quin_avail = gpu_wired_up == GpuUp::Quin;
-    // The wired FSR kind (captured before the plain-toggle restore below â€”
+    // The wired FSR kind (captured before the plain-toggle restore below —
     // the K toggle moves between Plain and exactly this).
     let gpu_fsr_kind = matches!(gpu_wired_up, GpuUp::Fsr4 | GpuUp::Fsr3).then_some(gpu_wired_up);
     // GPU-resident NPPD (wired at init in --gpu --nppd XeSS sessions; J
@@ -12773,12 +12792,12 @@ fn session(
         eprintln!("gpu: NPPD pre-upscale denoise ON (J toggles)");
     }
     // Restore the user's plain-presentation toggle (G/X inside the --gpu
-    // arm) â€” AFTER the avail flags, so the session's wiring is untouched.
+    // arm) — AFTER the avail flags, so the session's wiring is untouched.
     if p0.map_or(false, |p| p.gpu_up_plain) && gpu_trace {
         gpu_up = GpuUp::Plain;
     }
 
-    // OIDN state â€” the secondary denoiser (N toggles, mutually exclusive
+    // OIDN state — the secondary denoiser (N toggles, mutually exclusive
     // with DLSS). It keeps the normal render loop (temporal cache, budget
     // frames, hemi bounces) at forced full-res (the half-res moving mode
     // writes a half-res prefix that would misalign the full-res G-buffers)
@@ -12786,7 +12805,7 @@ fn session(
     // (default) renders fresh 1-spp frames and folds them into a reprojected
     // EMA history (reproject.rs) that is the sole accumulator and denoiser
     // input; plain denoises the accumulation average and shimmers while
-    // moving. Context, wÃ—h G-buffers (~116 MB) and history (~77 MB) are
+    // moving. Context, w×h G-buffers (~116 MB) and history (~77 MB) are
     // lazily created on first enable; a failed init is remembered and not
     // retried per keypress.
     let mut oidn_on = false;
@@ -12794,7 +12813,7 @@ fn session(
     let mut oidn_ctx: Option<oidn::OidnContext> = None;
     let mut oidn_gbufs: Option<dlss::GBufs> = None;
     let mut oidn_hist: Option<reproject::History> = None;
-    // Free-running frame index for the temporal mode's per-pixel RNG seed â€”
+    // Free-running frame index for the temporal mode's per-pixel RNG seed —
     // the dlss_idx pattern: `frame` is pinned to 0 while moving, which would
     // freeze the noise pattern and defeat the history average.
     let mut oidn_seq: u32 = 0;
@@ -12891,24 +12910,24 @@ fn session(
         }
     }
 
-    // NPPD state â€” the neural denoiser (J toggles, mutually exclusive with
+    // NPPD state — the neural denoiser (J toggles, mutually exclusive with
     // DLSS/OIDN/XeSS). It keeps the normal render loop at forced full-res
     // with fresh 1-spp frames (accumulate off, free-running nppd_seq) and
     // runs the recurrent network per frame: the state is backward-warped by
-    // this frame's motion vectors (so prev_cam is set â€” the first
+    // this frame's motion vectors (so prev_cam is set — the first
     // CPU-denoiser mode that needs it), the 10-channel stack packed from
     // accum + the G-buffers, and the ONNX session executed via DirectML (CPU
-    // EP fallback). Context (~800 MB staging at 1080p â€” the 38-channel
-    // recurrent state dominates) and wÃ—h G-buffers are lazily created on
+    // EP fallback). Context (~800 MB staging at 1080p — the 38-channel
+    // recurrent state dominates) and w×h G-buffers are lazily created on
     // first enable; a failed init is remembered and not retried per keypress.
     // nppd_prev is its own prev-camera contract (dlss_prev/xess_prev
     // precedent), cleared on toggle, set only after a rendered NPPD frame.
     let mut nppd_on = false;
     // XeSS composition: NPPD as the pre-upscale denoiser at the (locked)
-    // render res â€” the slot OIDN's Pre placement occupies, mutually
+    // render res — the slot OIDN's Pre placement occupies, mutually
     // exclusive with it (J toggles; N cycling to pre/post turns this off).
     // Under --lock-res dynamic every DRS step invalidates the recurrent
-    // state and re-specializes the DML graph â€” noted loudly, not forbidden.
+    // state and re-specializes the DML graph — noted loudly, not forbidden.
     let mut xess_nppd = false;
     let mut nppd_ctx: Option<nppd::NppdContext> = None;
     let mut nppd_gbufs: Option<dlss::GBufs> = None;
@@ -12918,7 +12937,7 @@ fn session(
     let nppd_drs_note = |lock: Option<f32>| {
         if lock.is_none() {
             eprintln!(
-                "nppd: --lock-res dynamic steps the render res â€” each step resets the \
+                "nppd: --lock-res dynamic steps the render res — each step resets the \
                  recurrent state and re-specializes the graph (a fixed --lock-res avoids it)"
             );
         }
@@ -12926,7 +12945,7 @@ fn session(
     // `want_gbufs`: the standalone mode fills its own window-res G-buffers;
     // the XeSS composition reads xess_gbufs at render res and must not
     // commit the ~116 MB window-res set. `(iw, ih)` is the res the FIRST
-    // denoise will run at â€” the session's frozen dims (opening anywhere else
+    // denoise will run at — the session's frozen dims (opening anywhere else
     // costs an immediate DML session rebuild, hundreds of ms); capacity is
     // always window-res, so a later set_res (X-off standalone J, dynamic-DRS
     // steps) stays within bounds.
@@ -12954,7 +12973,7 @@ fn session(
                     eprintln!("{e}");
                     eprintln!(
                         "nppd: DLLs expected at {} (--nppd-path / FRUSTRACER_ORT_PATH), \
-                         model at {} (--nppd-model / FRUSTRACER_NPPD_MODEL â€” \
+                         model at {} (--nppd-model / FRUSTRACER_NPPD_MODEL — \
                          tools/nppd-export/export.py produces it)",
                         opts.nppd_path, opts.nppd_model
                     );
@@ -12967,12 +12986,12 @@ fn session(
         nppd_ctx.is_some()
     };
     if want_nppd && !nppd_failed && !gpu_trace {
-        // (Under --gpu the NPPD stage is GPU-resident â€” nppd_gpu in
+        // (Under --gpu the NPPD stage is GPU-resident — nppd_gpu in
         // GpuContext, wired by init_trace; the CPU context never builds.)
         if xess_on {
             // XeSS session: --nppd lands the pre-upscale placement (the
             // NPPD context works at the render res; the window-res gbufs
-            // stay unallocated â€” XeSS mode fills xess_gbufs).
+            // stay unallocated — XeSS mode fills xess_gbufs).
             if nppd_try_enable(&mut nppd_ctx, &mut nppd_gbufs, false, xess_lock.unwrap_or((w, h)))
             {
                 xess_nppd = true;
@@ -13006,21 +13025,21 @@ fn session(
             nppd_failed = true;
         }
     }
-    // DXR pipeline state â€” the by-the-book DispatchRays mode (F toggles it
+    // DXR pipeline state — the by-the-book DispatchRays mode (F toggles it
     // against the CPU tracer live; unavailable under --gpu, which is its
     // own session). By default it COMPOSES with the session's wired
     // upscaler exactly like --gpu: DXR-fed DLSS-RR in an SL session,
     // DXR-fed XeSS in a XeSS session, plain otherwise (--no-dlss / FSR / no
     // support). Inside the mode G/X toggle wired-upscaler <-> plain; the
     // CPU-side denoisers (OIDN/NPPD) and the rival FSR presenter stay
-    // mutually exclusive. Lazily built on first enable â€” DXC load, RTPSO
+    // mutually exclusive. Lazily built on first enable — DXC load, RTPSO
     // compile, scene + BLAS/TLAS upload, feed wiring, all once; a failed
     // init is remembered and not retried per keypress. Plain sub-mode frame
     // semantics mirror the --gpu plain sub-mode.
     let mut dxr_on = false;
     let mut dxr_failed = p0.map_or(false, |p| p.dxr_failed);
     // Availability = the session's WIRING (an SL session's queue is the
-    // proxy queue; a XeSS session's context lives on the native device) â€”
+    // proxy queue; a XeSS session's context lives on the native device) —
     // the --gpu rule: you can't toggle into an upscaler the session didn't
     // wire. dlss_on/xess_on are the CPU arm's live flags and may be toggled
     // off without unwiring the session.
@@ -13031,7 +13050,7 @@ fn session(
     let dxr_fsr3_avail = gpu.fsr_flavor() == Some(fsr::Flavor::Fsr3);
     let dxr_fsr4_avail = gpu.fsr_flavor() == Some(fsr::Flavor::Fsr4Rr);
     // The DXR trace res: locked into the wired upscaler's range (the --gpu
-    // contract â€” DxrGpu's buffers are sized once, no DRS), window-res when
+    // contract — DxrGpu's buffers are sized once, no DRS), window-res when
     // plain. Computed once so the eager --dxr init and the lazy F init
     // build the pipeline at the same res. The scale is the GPU-mode one
     // (native by default); `--lock-res dynamic` can't be honored here, so it
@@ -13070,7 +13089,7 @@ fn session(
         }) {
             Ok(()) => {
                 dxr_on = true;
-                // The fuse wins over any single level â€” it consumes them all.
+                // The fuse wins over any single level — it consumes them all.
                 dxr_up = if dxr_quin_avail {
                     GpuUp::Quin
                 } else if dxr_rr_avail {
@@ -13089,8 +13108,8 @@ fn session(
                     dxr_up = GpuUp::Plain;
                 }
                 // The CPU-side denoisers can't run under the DXR arm; the
-                // CPU upscalers stay WIRED (fsr_on included â€” every FSR kind
-                // composes) â€” the DXR arm presents through the same session
+                // CPU upscalers stay WIRED (fsr_on included — every FSR kind
+                // composes) — the DXR arm presents through the same session
                 // contexts, and F-off resumes them intact.
                 if oidn_on {
                     oidn_on = false;
@@ -13114,7 +13133,7 @@ fn session(
                 );
             }
             Err(e) => {
-                eprintln!("dxr: falling back to CPU tracing â€” {e}");
+                eprintln!("dxr: falling back to CPU tracing — {e}");
                 dxr_failed = true;
             }
         }
@@ -13124,15 +13143,15 @@ fn session(
     let depth_full: f32 = ((w.max(h) as f32) / render::leaf_tile() as f32).log2().ceil();
     // Fractional depth-cap estimate for budget frames. Mid-range prior: one
     // slightly-coarse first frame beats a hitch. Deliberately not reset when
-    // the camera stops â€” the last value is the best prior for the same
+    // the camera stops — the last value is the best prior for the same
     // neighborhood, and the controller corrects within a frame on resume.
-    // A resize re-entry keeps the last estimate â€” cost scales with area,
+    // A resize re-entry keeps the last estimate — cost scales with area,
     // but the controller corrects within a frame either way.
     let mut depth_est: f32 = p0.map_or(4.0, |p| p.depth_est);
     // The cloud clock. Advanced by the last frame's measured render time at
     // each arm's fresh-frame predicate (upscaler/denoiser frames always;
     // plain accumulation only at frame 0, so a converging still frame keeps
-    // integrating ONE sky). No wall clock is read in the renderer â€” this is
+    // integrating ONE sky). No wall clock is read in the renderer — this is
     // main.rs's clock, like depth_est's.
     let mut cloud_time: f64 = p0.map_or(0.0, |p| p.cloud_time);
     let mut last_title = Instant::now();
@@ -13148,14 +13167,14 @@ fn session(
     // drag, one for maximize/F11) arm the timer; the session exits for a
     // rebuild only once the size has been quiet for RESIZE_SETTLE_MS.
     // Until then frames keep presenting into the old-size swapchain and
-    // DWM stretches them (DXGI_SCALING_STRETCH) â€” momentarily soft, never
+    // DWM stretches them (DXGI_SCALING_STRETCH) — momentarily soft, never
     // broken. A minimized window reports a 0 dimension and never commits.
     const RESIZE_SETTLE_MS: u128 = 250;
     let mut pending_resize: Option<Instant> = None;
 
     // Init is done and frames start now, so the integrator may fly again (it
     // spawned paused, and a resize re-entry paused it). Everything above this
-    // line â€” kernel compile, scene upload, BLAS build â€” presented nothing.
+    // line — kernel compile, scene upload, BLAS build — presented nothing.
     // No baseline re-sync is needed: a paused span integrates nothing, so the
     // pose `prev_snap` captured at init is still the shared camera's pose.
     // EXCEPT under an open pause menu (a resize/F11 re-entry can happen with
@@ -13183,7 +13202,7 @@ fn session(
         // hold-loop's `continue` below returns here at ~140 Hz for nav.
         let pe = pad.poll();
         if edges.toggle_fullscreen {
-            // Borderless desktop fullscreen (F11) â€” SDL3's set_fullscreen is
+            // Borderless desktop fullscreen (F11) — SDL3's set_fullscreen is
             // a bool, and fullscreen with no exclusive mode set IS borderless
             // desktop. The resulting size event flows through the same
             // debounce below.
@@ -13199,19 +13218,19 @@ fn session(
             if (now - t0).as_millis() >= RESIZE_SETTLE_MS {
                 pending_resize = None;
                 // size_in_pixels at settle time is authoritative (physical
-                // pixels â€” SDL3 is per-monitor DPI aware by default).
+                // pixels — SDL3 is per-monitor DPI aware by default).
                 let (dw, dh) = window.size_in_pixels();
                 if dw > 0 && dh > 0 && (dw as usize, dh as usize) != (w, h) {
                     break SessionEnd::Resize(dw, dh);
                 }
             }
         }
-        // â”€â”€ Pause menu (ESC): state machine + settings-row plumbing. Live
+        // ── Pause menu (ESC): state machine + settings-row plumbing. Live
         // rows apply through SYNTHESIZED Edges fields (the exact key-handler
-        // paths below â€” reset semantics cannot drift); restart rows edit the
+        // paths below — reset semantics cannot drift); restart rows edit the
         // settings file only. Every menu edit auto-saves; keyboard toggles
         // deliberately never persist. Opening pauses the flycam (it reads
-        // raw OS key state â€” typing in a text field must not fly the
+        // raw OS key state — typing in a text field must not fly the
         // camera); closing resumes it.
         let mut menu_live_edit = false;
         if let Some(hd) = hud.as_mut() {
@@ -13329,7 +13348,7 @@ fn session(
                         if let Some(item) = settings::item_by_id(&id) {
                             match settings::menu_adjust(item, dir, cfg, &live) {
                                 settings::MenuFx::Restart => {
-                                    eprintln!("settings: '{id}' saved â€” applies on next launch");
+                                    eprintln!("settings: '{id}' saved — applies on next launch");
                                 }
                                 settings::MenuFx::CycleMode => edges.cycle_mode = true,
                                 settings::MenuFx::ToggleHybrid => edges.toggle_hybrid = true,
@@ -13350,7 +13369,7 @@ fn session(
                                 settings::MenuFx::Quality(n) => edges.quality = Some(n),
                                 settings::MenuFx::SetTod(t) => fly.set_tod(t),
                                 settings::MenuFx::ToggleBloom => {
-                                    // Display-stage â€” deliberately NO reset
+                                    // Display-stage — deliberately NO reset
                                     // (the --no-bloom bit-identity argument).
                                     bloom::set_enabled(!bloom::enabled());
                                 }
@@ -13382,7 +13401,7 @@ fn session(
                                 settings::menu_text_edit(item, &v, cfg),
                                 settings::MenuFx::Restart
                             ) {
-                                eprintln!("settings: '{id}' saved â€” applies on next launch");
+                                eprintln!("settings: '{id}' saved — applies on next launch");
                                 settings::save(cfg);
                                 menu_rows_stale = true;
                             }
@@ -13417,18 +13436,18 @@ fn session(
         // Time-of-day scrub (`,`/`.`, D-pad L/R). A TOD delta is a SHADING
         // change, not camera motion: re-derive the sun/moon + SH ambient
         // (scene::apply_tod), push the new rows into the GPU pipelines'
-        // cached base CBs, and reset plain ACCUMULATION (frame = 0 â€” a
+        // cached base CBs, and reset plain ACCUMULATION (frame = 0 — a
         // converged still frame must not keep stale lighting). Deliberately
-        // KEPT: every upscaler/denoiser history (RR/FSR/XeSS/OIDN/NPPD) â€” a
+        // KEPT: every upscaler/denoiser history (RR/FSR/XeSS/OIDN/NPPD) — a
         // held scrub fires this block EVERY frame, so a per-tick history
         // reset left RR reconstructing 1-spp frames with zero temporal
         // context for the whole scrub, and its spatial prior smeared the
         // night-sky star field into drifting cloud-shaped blotches (worst on
         // the CPU arm's 66% lock-res input). The scrub is rate-limited
-        // (1 h/s â‡’ ~seconds of sky per frame), so lighting drift is the
+        // (1 h/s ⇒ ~seconds of sky per frame), so lighting drift is the
         // cloud/firefly precedent: a shading change the temporal integrators
         // absorb, never a discontinuity. Also KEPT: the temporal frustum
-        // cache, claim ring, and structure replay â€” geometry-only claims;
+        // cache, claim ring, and structure replay — geometry-only claims;
         // replay re-shades from the fresh ctx. An idle session never enters
         // this block (bit compare of an unwritten tod), which is the
         // untouched-session bit-identity guard.
@@ -13439,11 +13458,11 @@ fn session(
             gpu.refresh_sky(scene);
             frame = 0;
         }
-        // â”€â”€ HUD overlay (compass / clock / motion-gated keymap). Purely
+        // ── HUD overlay (compass / clock / motion-gated keymap). Purely
         // display-stage: Slint software-renders into its persistent CPU
         // buffer, only the DIRTY RECTS are staged for upload, and the
         // composite draw rides fullscreen_to_backbuffer in EVERY present arm
-        // below â€” no render/accum/temporal state is touched, so F1 needs no
+        // below — no render/accum/temporal state is touched, so F1 needs no
         // reset of any kind. An unchanged HUD stages nothing (zero raster,
         // zero bytes); staging continues while hidden so re-showing needs no
         // special case.
@@ -13453,9 +13472,9 @@ fn session(
                 eprintln!("hud: {} (F1 toggles)", if hd.visible() { "ON" } else { "OFF" });
             }
             // Mode label: derived from the stored truth (the gpu_trace/dxr_on
-            // pair â€” never both). The SPACE/F transition block runs LATER
+            // pair — never both). The SPACE/F transition block runs LATER
             // this iteration, so a mode-switch frame shows the old label for
-            // exactly one (pipeline-compile-stall) frame â€” invisible. last_ms
+            // exactly one (pipeline-compile-stall) frame — invisible. last_ms
             // is the PREVIOUS frame's render time (0.0 before the first
             // present), which is exactly the sample the FPS graph wants; the
             // FG multiplier is the same family-measured value the title bar
@@ -13476,9 +13495,9 @@ fn session(
             }
             gpu.set_hud_visible(hd.visible() || hd.menu_open());
         }
-        // â”€â”€ Pause-menu hold: while the menu is open, skip tracing/upscaler
+        // ── Pause-menu hold: while the menu is open, skip tracing/upscaler
         // evaluation entirely and re-present the last frame + the overlay at
-        // fast cadence â€” the menu repaints at ~140 Hz instead of the trace
+        // fast cadence — the menu repaints at ~140 Hz instead of the trace
         // cadence, and "pause" genuinely pauses (no history advances, no
         // accumulation, camera frozen by the flycam pause). Falls through to
         // a normal frame when: a live menu edit needs its key handler to run
@@ -13493,7 +13512,7 @@ fn session(
                 }
                 Err(_) => {
                     // First-open before any present, or the source was
-                    // dropped: fall through to a normal frame â€” and since a
+                    // dropped: fall through to a normal frame — and since a
                     // failed attempt may have consumed staged dirty rects,
                     // re-upload everything next frame.
                     if let Some(hd) = hud.as_mut() {
@@ -13502,7 +13521,7 @@ fn session(
                 }
             }
         }
-        // â”€â”€ Frozen frustum snapshot (Y captures / replaces, Z clears).
+        // ── Frozen frustum snapshot (Y captures / replaces, Z clears).
         // Freeze the current view's terminal quadtree as emissive near-plane
         // quads (one per leaf tile, at its inherited t_start, colored by
         // depth) so the user can fly around and see the projected tile
@@ -13606,7 +13625,7 @@ fn session(
         let scene: &scene::Scene = scene;
         let bvh: &bvh::Bvh = bvh;
 
-        // â”€â”€ Render-mode transitions: SPACE cycles CPU -> GPU wavefront ->
+        // ── Render-mode transitions: SPACE cycles CPU -> GPU wavefront ->
         // DXR; F keeps its historical toggle (CPU/GPU -> DXR, DXR -> CPU).
         // The ONLY writers of gpu_trace/dxr_on after session init (the DXR
         // present-failure fallback aside), so the pair can never be both
@@ -13615,11 +13634,11 @@ fn session(
         // built on first entry (DXC load, kernel/RTPSO compile) and then
         // stays RESIDENT: later switches are free. The SCENE half (streams +
         // BLAS/TLAS + textures) is a SHARED Rc<SceneGpu> cached in
-        // GpuContext â€” uploaded once by whichever tracer comes first (the
+        // GpuContext — uploaded once by whichever tracer comes first (the
         // one `gpu scene:` line per session), so the second tracer pays only
         // its kernels + window planes (+ the wavefront's own sw trees, the
         // `gpu sw-trees:` line). A failed init is memoized (trace_failed/dxr_failed) and the
-        // cycle SKIPS that mode â€” RT-tier-1.0-only hardware runs DXR but
+        // cycle SKIPS that mode — RT-tier-1.0-only hardware runs DXR but
         // not the wavefront (tier 1.1 / SM 6.5), so the cycle degrades to
         // CPU <-> DXR there, and to CPU-only with no DXC at all.
         if edges.cycle_mode || edges.toggle_dxr {
@@ -13642,7 +13661,7 @@ fn session(
                 }
             };
             // A failed target advances along the cycle (Gpu -> Dxr -> Cpu);
-            // landing back on mode_now exits with NO resets â€” the memoized-F
+            // landing back on mode_now exits with NO resets — the memoized-F
             // precedent: a refused press changes nothing.
             while want != mode_now {
                 match want {
@@ -13673,7 +13692,7 @@ fn session(
                                 )
                             });
                             if let Err(e) = built {
-                                eprintln!("gpu: unavailable â€” {e}");
+                                eprintln!("gpu: unavailable — {e}");
                                 trace_failed = true;
                                 want = RMode::Dxr;
                                 continue;
@@ -13689,7 +13708,7 @@ fn session(
                         gpu_reset = true;
                         gpu_prev_cam = None;
                         // CPU-side denoisers can't run under the GPU arms;
-                        // the CPU upscalers stay wired â€” returning to CPU
+                        // the CPU upscalers stay wired — returning to CPU
                         // mode resumes them intact.
                         if oidn_on {
                             oidn_on = false;
@@ -13736,7 +13755,7 @@ fn session(
                                 frame = 0;
                                 // Every enable restores the session default
                                 // sub-mode (a G/X/K plain-toggle doesn't outlive it).
-                                // The fuse is the session default wherever it came up â€”
+                                // The fuse is the session default wherever it came up —
                                 // this ladder must stay in lockstep with the init pick,
                                 // or an off/on would silently strand a --quinlight
                                 // session on a single engine with no way back.
@@ -13756,8 +13775,8 @@ fn session(
                                 dxr_reset = true;
                                 dxr_prev_cam = None;
                                 // CPU-side denoisers can't run under the DXR arm;
-                                // the CPU upscalers stay wired (fsr_on included â€”
-                                // every FSR kind composes) â€” the arm presents
+                                // the CPU upscalers stay wired (fsr_on included —
+                                // every FSR kind composes) — the arm presents
                                 // through the same session contexts, and a return
                                 // to CPU mode resumes them intact.
                                 if oidn_on {
@@ -13782,7 +13801,7 @@ fn session(
                                 );
                             }
                             Err(e) => {
-                                eprintln!("dxr: unavailable â€” {e}");
+                                eprintln!("dxr: unavailable — {e}");
                                 dxr_failed = true;
                                 want = RMode::Cpu;
                                 continue;
@@ -13796,7 +13815,7 @@ fn session(
                         frame = 0;
                         // The CPU upscalers resume with their own contracts;
                         // their histories just watched GPU/DXR frames at a
-                        // different res â€” declare the discontinuity
+                        // different res — declare the discontinuity
                         // (harmless when they're off).
                         dlss_prev = None;
                         dlss_reset = true;
@@ -13811,7 +13830,7 @@ fn session(
             }
         }
 
-        // GPU-resident tracing (--gpu): a self-contained arm â€” every frame is
+        // GPU-resident tracing (--gpu): a self-contained arm — every frame is
         // traced (and in upscaler sub-modes fed + upscaled), tonemapped, and
         // presented on the GPU; the CPU's only jobs are input, the frame
         // counter, and ~300 bytes of constants. The CPU mode machinery below
@@ -13831,7 +13850,7 @@ fn session(
                     eprintln!("quality preset {preset} (upscaler sub-mode traces the 1-spp preset; presets apply in plain)");
                 }
             }
-            // U: samples per pixel â€” the same shading-statistics reset as a
+            // U: samples per pixel — the same shading-statistics reset as a
             // preset change (never on motion). The kernels take it from the CB.
             if edges.cycle_spp {
                 spp = next_spp(spp);
@@ -13847,7 +13866,7 @@ fn session(
             }
             // --quinlight: every upscaler key toggles the fuse vs plain (see
             // gpu_quin_avail). Handled once, ahead of the per-level toggles,
-            // which are then suppressed â€” their "not wired" lines would be a
+            // which are then suppressed — their "not wired" lines would be a
             // lie about a session that wired every level there is.
             if gpu_quin_avail && (edges.toggle_dlss || edges.toggle_xess || edges.toggle_fsr) {
                 gpu_up = if gpu_up == GpuUp::Quin { GpuUp::Plain } else { GpuUp::Quin };
@@ -13914,8 +13933,8 @@ fn session(
                     );
                 }
             }
-            // V in the --gpu arm: same semantics as the CPU arm's handler â€”
-            // shading+visibility change â‡’ frame reset + upscaler history
+            // V in the --gpu arm: same semantics as the CPU arm's handler —
+            // shading+visibility change ⇒ frame reset + upscaler history
             // reset, works in every sub-mode.
             if edges.toggle_height {
                 if !bvh::height_armed() {
@@ -13971,7 +13990,7 @@ fn session(
             }
             let base_q = Quality::preset(preset);
             // C key first: verify clobbers accum/tbuf/info, so the frame
-            // presented below must be a frame-0 store â€” handling it after
+            // presented below must be a frame-0 store — handling it after
             // the present would let the next frame ADD onto the verify image.
             // The basis is the SESSION render res (the tracer's buffers are
             // sized to it), not the window.
@@ -13991,7 +14010,7 @@ fn session(
             }
             let t = Instant::now();
             // Cloud clock: upscaled frames are always fresh (the upscaler is
-            // the temporal integrator â€” clouds drift continuously); plain
+            // the temporal integrator — clouds drift continuously); plain
             // accumulation advances only at frame 0, so a converging still
             // frame keeps integrating ONE sky.
             if gpu_up != GpuUp::Plain || frame == 0 {
@@ -14001,8 +14020,8 @@ fn session(
                 // The upscaler contract (the CPU arms'): every frame is a
                 // fresh jittered 1-spp full-depth frame at the locked render
                 // res; the upscaler is the only temporal integrator. One
-                // camera pose feeds every consumer â€” the shader MVs
-                // (prev_cam basis) and, in RR mode, fc's prev matrices â€” so
+                // camera pose feeds every consumer — the shader MVs
+                // (prev_cam basis) and, in RR mode, fc's prev matrices — so
                 // they can never disagree.
                 let jit = dlss::jitter_for(gpu_up_idx);
                 let p = gpu::trace::FrameParams {
@@ -14017,7 +14036,7 @@ fn session(
                     // "1-spp" names the QUALITY preset, not the sample count:
                     // --spp/U multiplies the primary samples inside the frame
                     // and they average before the feed, so the upscaler still
-                    // sees one fresh jittered frame â€” a quieter one.
+                    // sees one fresh jittered frame — a quieter one.
                     spp,
                     probe_sample: 0,
                     clouds: crate::clouds::Clouds::live(scene.diag, cloud_time as f32),
@@ -14090,7 +14109,7 @@ fn session(
                         // against a structure the GPU never built.
                         gpu.invalidate_replay();
                         if gpu_up == GpuUp::Xess && gpu_nppd_on {
-                            // Shed the NPPD stage first â€” XeSS itself may be
+                            // Shed the NPPD stage first — XeSS itself may be
                             // fine (the run/split path is NPPD-only).
                             eprintln!("gpu: NPPD present failed ({e}); NPPD OFF (J to retry)");
                             gpu_nppd_on = false;
@@ -14128,11 +14147,11 @@ fn session(
                     verify: false,
                     // Plain accumulation: each frame still contributes one
                     // averaged sample of weight (resolve divides by frames),
-                    // so spp just converges the image sppÃ— faster per frame.
+                    // so spp just converges the image spp× faster per frame.
                     spp,
                     probe_sample: 0,
                     // Frozen mid-accumulation (the clock only advanced at
-                    // frame 0 above) â€” the still frames integrate one sky.
+                    // frame 0 above) — the still frames integrate one sky.
                     clouds: crate::clouds::Clouds::live(scene.diag, cloud_time as f32),
                     fireflies: crate::fireflies::Fireflies::live(scene, cloud_time as f32),
                     replay: opts.replay,
@@ -14158,7 +14177,7 @@ fn session(
                 }
             }
             // Stability meter (FRUSTRACER_STAB=1): the numeric dancing
-            // detector â€” hold the camera still and a healthy upscaled output
+            // detector — hold the camera still and a healthy upscaled output
             // trends toward ~0 (a wrong jitter sign or MV polarity holds a
             // high mean). Same meter as the CPU upscaler arms.
             if stab_on && gpu_up != GpuUp::Plain {
@@ -14167,7 +14186,7 @@ fn session(
                     let cap = match gpu_up {
                         GpuUp::Xess => gpu.read_xess_output(),
                         GpuUp::Fsr3 | GpuUp::Fsr4 => gpu.read_fsr_output(),
-                        // The meter must read what is PRESENTED â€” the fuse, not
+                        // The meter must read what is PRESENTED — the fuse, not
                         // any single engine (an engine's own output would report
                         // that engine's stability and silently ignore the fuse).
                         GpuUp::Quin => gpu.read_quin_output(),
@@ -14187,7 +14206,7 @@ fn session(
                                     })
                                     .sum();
                                 eprintln!(
-                                    "stab: mean |Î”| {:.2}/255 over 15 frames (window-res output; render {grw}x{grh})",
+                                    "stab: mean |Δ| {:.2}/255 over 15 frames (window-res output; render {grw}x{grh})",
                                     sum as f64 / (px.len() * 3) as f64,
                                 );
                             }
@@ -14199,7 +14218,7 @@ fn session(
             if edges.screenshot {
                 // Upscaler sub-modes: the presented image is the upscaler's
                 // window-res output; plain: the tracer's hdr (render-res in
-                // an upscaler SESSION â€” dims come back with the pixels).
+                // an upscaler SESSION — dims come back with the pixels).
                 let cap = match gpu_up {
                     GpuUp::Xess => gpu.read_xess_output().map(|px| (px, w, h)),
                     GpuUp::Rr => gpu.read_rr_output().map(|px| (px, w, h)),
@@ -14311,7 +14330,7 @@ fn session(
         }
         if edges.toggle_gpu_tone {
             gpu_tonemap = !gpu_tonemap;
-            let note = if oidn_on { " (no effect in OIDN mode â€” presents via the CPU resolve)" } else { "" };
+            let note = if oidn_on { " (no effect in OIDN mode — presents via the CPU resolve)" } else { "" };
             eprintln!("tonemap: {}{note}", if gpu_tonemap { "GPU" } else { "CPU" });
         }
         if edges.toggle_bounce {
@@ -14322,7 +14341,7 @@ fn session(
                 ["OFF", "AO (still frames)", "GI (still frames)"][bounce_mode as usize]
             );
         }
-        // V: heightfield relief vs normal-mapped â€” a shading+VISIBILITY
+        // V: heightfield relief vs normal-mapped — a shading+VISIBILITY
         // change, so it takes the quality-preset reset set (frame + every
         // upscaler/denoiser history via the predicates below), but NEVER the
         // temporal ring or replay_key: claims live on the swept AABBs in
@@ -14350,7 +14369,7 @@ fn session(
         // all toggle IT against plain DXR (the --gpu gpu_quin_avail semantics).
         // Handled once, ahead of the per-level toggles, which are suppressed
         // below: every level IS wired here, so letting G switch to DLSS-RR alone
-        // would strand the session â€” no key would bring the fuse back.
+        // would strand the session — no key would bring the fuse back.
         if dxr_on
             && dxr_quin_avail
             && (edges.toggle_dlss || edges.toggle_xess || edges.toggle_fsr)
@@ -14368,7 +14387,7 @@ fn session(
         if edges.toggle_dlss && !dxr_quin_key {
             if dxr_on {
                 // Inside DXR mode G toggles the wired upscaler vs plain
-                // DXR â€” the --gpu G semantics; the CPU DLSS state is
+                // DXR — the --gpu G semantics; the CPU DLSS state is
                 // untouched (F-off resumes it).
                 if dxr_rr_avail {
                     dxr_up = if dxr_up == GpuUp::Rr { GpuUp::Plain } else { GpuUp::Rr };
@@ -14503,7 +14522,7 @@ fn session(
                 fsr_lim = xess::StepLimiter::new(xess::RAMP_FRAMES);
                 fsr_ep = (0, 0);
                 // DLSS/XeSS never coexist with a live FSR session (one wired
-                // upscaler per session) â€” no cross-disable needed. OIDN/NPPD
+                // upscaler per session) — no cross-disable needed. OIDN/NPPD
                 // and DXR are toggleable live, so they do need it (the chain
                 // can wire FSR in an --oidn/--nppd session where the startup
                 // yield ran the other way).
@@ -14527,16 +14546,16 @@ fn session(
         }
         if edges.toggle_oidn {
             if dxr_on {
-                // CPU-side denoisers never run under the DXR arm â€” refuse
+                // CPU-side denoisers never run under the DXR arm — refuse
                 // instead of silently mutating latent CPU-mode state.
-                eprintln!("oidn: a CPU-mode denoiser â€” unavailable under the DXR pipeline (F toggles DXR off first)");
+                eprintln!("oidn: a CPU-mode denoiser — unavailable under the DXR pipeline (F toggles DXR off first)");
             } else if fsr_on {
                 // Enabling plain-mode OIDN under a live FSR present arm would
                 // only allocate its window-res G-buffers and lie in the logs
-                // (the FSR arm wins the mode arbitration) â€” refuse instead.
+                // (the FSR arm wins the mode arbitration) — refuse instead.
                 eprintln!("oidn: the FSR present arm owns the frame (K toggles FSR off first)");
             } else if xess_on {
-                // XeSS mode: N cycles the OIDN placement (off â†’ pre â†’ post).
+                // XeSS mode: N cycles the OIDN placement (off → pre → post).
                 let next = match xess_oidn {
                     XessOidn::Off => XessOidn::Pre,
                     XessOidn::Pre => XessOidn::Post,
@@ -14556,7 +14575,7 @@ fn session(
                         eprintln!("nppd: OFF (OIDN takes the XeSS pre-denoise slot)");
                     }
                     eprintln!(
-                        "oidn: {} the XeSS upscale (N cycles off â†’ pre â†’ post)",
+                        "oidn: {} the XeSS upscale (N cycles off → pre → post)",
                         if next == XessOidn::Pre {
                             "PRE-denoise at render res, before"
                         } else {
@@ -14598,10 +14617,10 @@ fn session(
         if edges.toggle_nppd {
             if dxr_on {
                 // Same refusal as N: CPU-mode denoisers don't run here.
-                eprintln!("nppd: a CPU-mode denoiser â€” unavailable under the DXR pipeline (F toggles DXR off first)");
+                eprintln!("nppd: a CPU-mode denoiser — unavailable under the DXR pipeline (F toggles DXR off first)");
             } else if fsr_on {
                 // Same refusal as N: the FSR arm wins the mode arbitration
-                // (flavor-neutral â€” the 3.1 flavor has no denoiser at all).
+                // (flavor-neutral — the 3.1 flavor has no denoiser at all).
                 eprintln!("nppd: the FSR present arm owns the frame (K toggles FSR off first)");
             } else if xess_on {
                 // XeSS mode: J toggles the NPPD pre-upscale placement
@@ -14670,10 +14689,10 @@ fn session(
                 nppd_failed = true;
             }
         }
-        // (The F/SPACE render-mode transitions live ABOVE the GPU arm â€” the
+        // (The F/SPACE render-mode transitions live ABOVE the GPU arm — the
         // one spot every mode reaches each frame.)
         // True only when M actually flipped oidn_temporal (not the Post/no-op
-        // arms) â€” the single source for the reset predicates below, so they
+        // arms) — the single source for the reset predicates below, so they
         // can't drift from the handler's own condition.
         let mut temporal_flipped = false;
         if edges.toggle_temporal {
@@ -14683,7 +14702,7 @@ fn session(
                 oidn_temporal = !oidn_temporal;
                 temporal_flipped = true;
                 // Required in BOTH directions: accum semantics flip between
-                // "last 1-spp frame" (temporal) and "pure sum" (plain) â€” a
+                // "last 1-spp frame" (temporal) and "pure sum" (plain) — a
                 // stale sample count would divide a 1-spp frame to near-black.
                 frame = 0;
                 eprintln!(
@@ -14702,7 +14721,7 @@ fn session(
         // U: samples per pixel. A sample-count change is a shading-statistics
         // change (the noise level of every pixel moves), so it resets
         // accumulation and every temporal history exactly like a quality
-        // preset â€” and, like a preset, never on camera motion.
+        // preset — and, like a preset, never on camera motion.
         if edges.cycle_spp {
             spp = next_spp(spp);
             frame = 0;
@@ -14711,7 +14730,7 @@ fn session(
         }
         // Any XeSS frame after this point sends reset_history = 1: the
         // upscaler's accumulated history mixes shading statistics, so every
-        // predicate that resets `frame`/the OIDN history also resets it â€”
+        // predicate that resets `frame`/the OIDN history also resets it —
         // EXCEPT camera motion, which is exactly what the temporal upscaler
         // exists to survive, and EXCEPT the TOD scrub (`sun_moved`), which
         // fires per frame while held: continuous lighting drift is the
@@ -14749,10 +14768,10 @@ fn session(
         }
         // Reprojection-history invalidation: any setting change that alters
         // shading or mode semantics drops the history; camera motion and the
-        // budgetâ†”normal transition deliberately do NOT (surviving motion is
+        // budget↔normal transition deliberately do NOT (surviving motion is
         // the history's whole purpose; coarse budget pixels are handled
         // per-pixel by the KIND_COARSE rule), and neither does the TOD scrub
-        // (per-frame while held â€” old lighting washes out at the EMA rate, a
+        // (per-frame while held — old lighting washes out at the EMA rate, a
         // brief crossfade instead of a per-tick history wipe). Over-
         // invalidating on no-op edges (e.g. T in DLSS mode) is accepted for
         // the simple predicate.
@@ -14774,7 +14793,7 @@ fn session(
             if let Some(h) = &mut oidn_hist {
                 h.invalidate();
             }
-            // The NPPD recurrent state follows the same staleness predicate â€”
+            // The NPPD recurrent state follows the same staleness predicate —
             // any shading/mode-semantics change, never camera motion
             // (surviving motion is exactly what the warped state is for).
             if let Some(c) = &mut nppd_ctx {
@@ -14782,7 +14801,7 @@ fn session(
             }
         }
 
-        // DXR mode: a self-contained arm â€” the frame is traced by
+        // DXR mode: a self-contained arm — the frame is traced by
         // DispatchRays and presented on the GPU; the CPU render machinery
         // below (budget frames, temporal ring, the denoiser modes)
         // deliberately doesn't run. In an upscaler sub-mode (the session
@@ -14802,7 +14821,7 @@ fn session(
                 eprintln!("dxr: C verify is a CPU-tracer feature; --check-dxr gates this pipeline");
             }
             let t = Instant::now();
-            // Cloud clock â€” the --gpu arm's rule: upscaled = always fresh,
+            // Cloud clock — the --gpu arm's rule: upscaled = always fresh,
             // plain accumulation advances only at frame 0.
             if dxr_up != GpuUp::Plain || frame == 0 {
                 cloud_time += (last_ms / 1000.0).clamp(0.0, 0.25);
@@ -14815,7 +14834,7 @@ fn session(
                     eprintln!("dxr: quality pinned at the 1-spp upscaler preset (plain DXR honors 1-3)");
                 }
                 // U: a sample-count change moves every pixel's noise level by
-                // 1/âˆšN â€” the same discontinuity class as a quality preset, and
+                // 1/√N — the same discontinuity class as a quality preset, and
                 // the upscaler history must not carry across it. The generic
                 // handler above resets `frame` and the CPU arm's latches; this
                 // arm's latch is dxr_reset (the --gpu twin does gpu_reset).
@@ -14835,7 +14854,7 @@ fn session(
                     // --spp/U: N samples per pixel inside the one fresh
                     // jittered frame the upscaler contract asks for. Raygen
                     // averages them before the feed. (This pipeline traces
-                    // from the TLAS root, so here it is plain supersampling â€”
+                    // from the TLAS root, so here it is plain supersampling —
                     // there is no tile claim to amortize.)
                     spp,
                     probe_sample: 0,
@@ -14915,7 +14934,7 @@ fn session(
                 // OFF here.
                 let q = if moved { base_q.while_moving() } else { base_q };
                 // The basis is the SESSION trace res (DxrGpu's buffers and
-                // DispatchRays dims are sized to it) â€” dxw x dxh, NOT the
+                // DispatchRays dims are sized to it) — dxw x dxh, NOT the
                 // window: a composed session toggled plain via G/X still
                 // traces at the locked render res.
                 let p = gpu::trace::FrameParams {
@@ -14957,16 +14976,16 @@ fn session(
                 }
             }
             // Stability meter (FRUSTRACER_STAB=1): the numeric dancing
-            // detector â€” same meter as the --gpu and CPU upscaler arms;
-            // healthy statics match their baselines (RR â‰ˆ 0.14/255,
-            // XeSS â‰ˆ 1.0/255).
+            // detector — same meter as the --gpu and CPU upscaler arms;
+            // healthy statics match their baselines (RR ≈ 0.14/255,
+            // XeSS ≈ 1.0/255).
             if stab_on && dxr_up != GpuUp::Plain {
                 stab_n = stab_n.wrapping_add(1);
                 if stab_n % 15 == 0 {
                     let cap = match dxr_up {
                         GpuUp::Xess => gpu.read_xess_output(),
                         GpuUp::Fsr3 | GpuUp::Fsr4 => gpu.read_fsr_output(),
-                        // The meter must read what is PRESENTED â€” the fuse, not
+                        // The meter must read what is PRESENTED — the fuse, not
                         // any single engine (an engine's own output would report
                         // that engine's stability and silently ignore the fuse).
                         GpuUp::Quin => gpu.read_quin_output(),
@@ -14986,7 +15005,7 @@ fn session(
                                     })
                                     .sum();
                                 eprintln!(
-                                    "stab: mean |Î”| {:.2}/255 over 15 frames (window-res output; render {dxw}x{dxh})",
+                                    "stab: mean |Δ| {:.2}/255 over 15 frames (window-res output; render {dxw}x{dxh})",
                                     sum as f64 / (px.len() * 3) as f64,
                                 );
                             }
@@ -14997,7 +15016,7 @@ fn session(
             }
             if edges.screenshot {
                 // Upscaler sub-modes save the window-res upscaled output;
-                // plain saves the render-res hdr at its own dims â€” the
+                // plain saves the render-res hdr at its own dims — the
                 // --gpu P behavior.
                 let grab = match dxr_up {
                     GpuUp::Rr => gpu.read_rr_output().map(|px| (px, w, h)),
@@ -15064,18 +15083,18 @@ fn session(
         } else {
             RenderMode::Plain
         };
-        // DLSS/FSR/XeSS: an upscaler owns temporal integration â€” fresh 1-spp
+        // DLSS/FSR/XeSS: an upscaler owns temporal integration — fresh 1-spp
         // frames, fixed cheap preset, no budget path, no CPU accumulation.
         let upscaled = matches!(mode, RenderMode::Dlss | RenderMode::Fsr | RenderMode::Xess);
         // `neural` extends the same frame contract to NPPD (a denoiser, not
-        // an upscaler â€” it presents through the CPU path at window res, but
+        // an upscaler — it presents through the CPU path at window res, but
         // its recurrent network owns temporal integration exactly like RR:
         // fresh 1-spp frames, fixed cheap preset, no budget frames, no CPU
         // accumulation, never idle).
         let neural = upscaled || mode == RenderMode::Nppd;
 
         // Cheap while moving, converge while still. Dynamic-res mode keeps
-        // full resolution buffers and full quality â€” the estimated depth cap
+        // full resolution buffers and full quality — the estimated depth cap
         // floats the effective resolution instead. DLSS mode traces every
         // frame uncapped at RR's fixed render resolution (RR requires clean
         // per-pixel G-buffers) with frame-stationary quality.
@@ -15115,7 +15134,7 @@ fn session(
             }
             RenderMode::Xess if xess_lock.is_some() => xess_lock.unwrap(),
             RenderMode::Xess => {
-                // XeSS mode: dynamic resolution, no block filling â€” the scale
+                // XeSS mode: dynamic resolution, no block filling — the scale
                 // controller's estimate quantized into the SDK's input range.
                 // Every frame is a full-depth per-pixel trace at this size.
                 let (_, min, max) = xess_range.unwrap();
@@ -15130,14 +15149,14 @@ fn session(
             // and a half-res frame renders into a prefix with a different
             // stride. Budget (dynamic-res) frames are full-res and fine.
             RenderMode::Oidn { .. } => (w, h),
-            // NPPD: fixed window res â€” the session's staging and the
+            // NPPD: fixed window res — the session's staging and the
             // recurrent state are laid out for it (no budget frames either).
             RenderMode::Nppd => (w, h),
             RenderMode::Plain if moved && !use_budget => (w / 2, h / 2),
             RenderMode::Plain => (w, h),
         };
         if rw != prev_rw {
-            // Fires on every distinct-res ramp frame by design â€” harmless in
+            // Fires on every distinct-res ramp frame by design — harmless in
             // the upscaler modes (accumulate = false, free-running RNG index,
             // no CPU accumulation runs).
             frame = 0;
@@ -15148,7 +15167,7 @@ fn session(
             // res change (per-frame during a ramp, otherwise rare) the
             // buffers are reinterpreted in place; the prev camera, the MV
             // contract, and XeSS's accumulation all survive the change (see
-            // the inner comment) â€” only the temporal cache drops, via
+            // the inner comment) — only the temporal cache drops, via
             // tprev_res.
             if xess_gbufs.is_none() {
                 let (_, _, max) = xess_range.unwrap();
@@ -15157,7 +15176,7 @@ fn session(
             let g = xess_gbufs.as_mut().unwrap();
             if (g.rw, g.rh) != (rw, rh) {
                 // A step is a scale change, not a scene change: no
-                // reset_history, no prev drop â€” the MV basis is derived from
+                // reset_history, no prev drop — the MV basis is derived from
                 // the prev CAMERA at each frame's own res, so it stays
                 // correct across the step, and XeSS's DRS carries its
                 // accumulation across extent changes by design. (Resetting
@@ -15169,13 +15188,13 @@ fn session(
         }
         if fsr_on {
             // Same in-place reinterpretation for the FSR buffers (G-buffers
-            // + the signal planes) â€” the XeSS step contract verbatim: no
+            // + the signal planes) — the XeSS step contract verbatim: no
             // reset, no prev drop; both ffx histories survive a renderSize
             // change by design, and the temporal cache drops via tprev_res.
             if fsr_gbufs.is_none() {
                 let (_, _, max) = fsr_range.unwrap();
                 // The 3.1 flavor consumes only mvec + depth (ffx_up uploads
-                // exactly those; no denoiser to feed) â€” the slim variant
+                // exactly those; no denoiser to feed) — the slim variant
                 // skips the guide planes' allocation AND their per-pixel
                 // encodes at the fill sites. Signal planes are likewise
                 // RR-only (~52 B/px skipped).
@@ -15200,7 +15219,7 @@ fn session(
             // Same contract for RR: rebuild the previous frame's basis and
             // matrices at the NEW resolution (same pose, new pixel mapping)
             // so MVs land in current-res pixels; history survives via the
-            // extents. The temporal cache still drops itself via tprev_res â€”
+            // extents. The temporal cache still drops itself via tprev_res —
             // that one is a correctness contract, not a quality choice.
             gbufs.set_res(rw, rh);
             if let Some(p) = &mut dlss_prev {
@@ -15209,7 +15228,7 @@ fn session(
             }
         }
         if use_budget != prev_budget {
-            frame = 0; // budget frames hold coarse fills â€” never accumulate onto them
+            frame = 0; // budget frames hold coarse fills — never accumulate onto them
             prev_budget = use_budget;
         }
         let base_q = Quality::preset(preset);
@@ -15236,7 +15255,7 @@ fn session(
         // the reprojected history in the present chain is the accumulator.
         let oidn_t = mode == RenderMode::Oidn { temporal: true };
         // DLSS, XeSS, and NPPD modes never idle: fresh jittered 1-spp frames
-        // are what their temporal accumulators integrate â€” super-resolution
+        // are what their temporal accumulators integrate — super-resolution
         // in XeSS's case, which converges while "still" instead of on the
         // CPU; NPPD's recurrent state wants a steady stream.
         let rendered = neural || frame < MAX_SAMPLES;
@@ -15247,10 +15266,10 @@ fn session(
             stats.clear();
             // Static-frame structure replay: bit-equal basis at the same res,
             // and the previous rendered frame recorded a full-depth uncapped
-            // hybrid structure â€” re-shade it with zero frustum queries
+            // hybrid structure — re-shade it with zero frustum queries
             // (replay.rs). Camera motion, res steps, budget frames, and plain
             // mode all miss or clear the key; quality/denoiser toggles do NOT
-            // (the structure is a function of scene/BVH/basis/res only â€”
+            // (the structure is a function of scene/BVH/basis/res only —
             // shading params come from this frame's ctx). Everything temporal
             // is FROZEN across replay frames: no cache clear, no rotation, so
             // tcache_prev stays the last PRODUCING frame and motion resume
@@ -15273,7 +15292,7 @@ fn session(
                 replay_cache.begin(rw, rh);
             }
             // Budget (moving) frames are full-res, so the cache stays live
-            // through motion and across the movingâ†’static transition. In
+            // through motion and across the moving→static transition. In
             // DLSS mode "full participation res" is RR's render resolution;
             // the tprev_res check drops the cache whenever the resolution
             // changes (e.g. the G toggle), per the temporal invariant.
@@ -15287,11 +15306,11 @@ fn session(
                 && (upscaled || (rw, rh) == (w, h));
             let (tcache_cur, tprev_vec, cut_cur, cut_prev) =
                 tr.begin(temporal_on, opts.adopt, rw, rh);
-            // Cloud clock â€” the CPU arm's rule: the fresh-1-spp modes (DLSS/
+            // Cloud clock — the CPU arm's rule: the fresh-1-spp modes (DLSS/
             // XeSS/FSR/NPPD/temporal-OIDN) advance every frame (their
             // upscaler/denoiser is the temporal integrator, clouds drift
             // continuously); plain accumulation advances only at frame 0, so
-            // a converging still frame â€” and every replay of it â€” keeps
+            // a converging still frame — and every replay of it — keeps
             // integrating ONE sky.
             let cpu_accumulate = !neural && !oidn_t;
             if !cpu_accumulate || frame == 0 {
@@ -15343,11 +15362,11 @@ fn session(
                 },
                 prev_cam: match mode {
                     RenderMode::Dlss => dlss_prev.as_ref().map(|p| p.basis),
-                    // Basis derived at THIS frame's res â€” correct across
+                    // Basis derived at THIS frame's res — correct across
                     // DRS steps by construction.
                     RenderMode::Fsr => fsr_prev.map(|c| c.basis(rw, rh)),
                     RenderMode::Xess => xess_prev.map(|c| c.basis(rw, rh)),
-                    // Window res always â€” the state warp consumes these MVs.
+                    // Window res always — the state warp consumes these MVs.
                     RenderMode::Nppd => nppd_prev.map(|c| c.basis(rw, rh)),
                     _ => None,
                 },
@@ -15361,9 +15380,9 @@ fn session(
                 // FrameCtx::spp() pins it to 1 on fb frames.
                 spp,
                 primary_sample: 0,
-                // Adaptive shading rate: XeSS only â€” its temporal
+                // Adaptive shading rate: XeSS only — its temporal
                 // accumulation launders the spatially varying sampling. On
-                // RR the 2Ã—2-correlated shadow noise and per-frame cell
+                // RR the 2×2-correlated shadow noise and per-frame cell
                 // reclassification presented as patchy "dancing" (RR's
                 // network preserves block-correlated noise as structure
                 // instead of integrating it). Revisit with an RR-friendly
@@ -15372,7 +15391,7 @@ fn session(
                 // either way).
                 adaptive: mode == RenderMode::Xess && opts.adaptive,
                 // Hemi sharing only ever fires on fb frames (still,
-                // non-upscaled â€” the shade_tile branch checks q.fb);
+                // non-upscaled — the shade_tile branch checks q.fb);
                 // --no-hemi-share is the per-session kill switch.
                 hemi_share: opts.hemi_share,
                 replay_rec: if record { Some(&replay_cache) } else { None },
@@ -15401,20 +15420,20 @@ fn session(
                 };
             }
             if use_budget {
-                // Update the cap estimate from this frame only â€” non-budget
+                // Update the cap estimate from this frame only — non-budget
                 // frames (half-res, plain, converging) have incomparable cost.
                 let target = RENDER_BUDGET.as_secs_f32() * 1000.0;
                 let err = (target / (last_ms as f32).max(0.1)).log2() * 0.5; // log4
                 let step = (DEPTH_GAIN * err).clamp(-STEP_DOWN_MAX, STEP_UP_MAX);
                 // Deadband: don't climb while already using >60% of the budget
-                // (the next level costs ~4x) â€” parks at the deepest cap that
+                // (the next level costs ~4x) — parks at the deepest cap that
                 // fits instead of flapping across the boundary.
                 if step < 0.0 || (last_ms as f32) < 0.6 * target {
                     depth_est = (depth_est + step).clamp(render::MIN_BUDGET_DEPTH as f32, depth_full);
                 }
             }
             if xess_on {
-                // The scale controller only ever sees XeSS frames â€” a
+                // The scale controller only ever sees XeSS frames — a
                 // comparable cost model (full-depth trace, cost ~ area).
                 // While still, the temporal cache makes frames cheaper and
                 // the scale creeps toward the range max: super-resolution.
@@ -15447,11 +15466,11 @@ fn session(
             oidn_seq = oidn_seq.wrapping_add(1);
             nppd_seq = nppd_seq.wrapping_add(1);
         } else {
-            std::thread::sleep(Duration::from_millis(8)); // converged â€” idle
+            std::thread::sleep(Duration::from_millis(8)); // converged — idle
         }
 
         // GPU tonemap consumes the raw HDR accumulation directly, but only
-        // for full-res frames without the overlay â€” half-res upscale and the
+        // for full-res frames without the overlay — half-res upscale and the
         // overlay composite live in the CPU resolve. OIDN mode presents its
         // denoised output through the CPU path, so it excludes the GPU tonemap.
         let use_gpu_tone =
@@ -15459,7 +15478,7 @@ fn session(
         if dlss_on {
             // DLSS-RR: hand the 1-spp radiance + G-buffers to the denoiser;
             // it outputs denoised HDR which the GPU tonemap presents.
-            // Everything SL sees â€” matrices, jitter, MVs, mvec_scale â€” lives
+            // Everything SL sees — matrices, jitter, MVs, mvec_scale — lives
             // in render-res pixel space; only the RR output is window-sized.
             let mats = dlss::cam_matrices(&cam, rw, rh, dlss_near, dlss_far);
             let fc = dlss::frame_constants(
@@ -15536,7 +15555,7 @@ fn session(
                 }
                 Err(e) => {
                     // An ffx failure shouldn't kill the app: the aborted
-                    // frame never reached the GPU â€” fall back to the plain
+                    // frame never reached the GPU — fall back to the plain
                     // pipeline; K retries.
                     eprintln!("fsr: present failed ({e}); FSR disabled (K to retry)");
                     fsr_on = false;
@@ -15556,13 +15575,13 @@ fn session(
             let n = rw * rh * 3;
             let jit = dlss::jitter_for(xess_idx);
             if xess_oidn == XessOidn::Post {
-                // POST placement (the A/B experiment): raw 1-spp â†’ XeSS
-                // upscale â†’ readback â†’ OIDN at window res with
-                // nearest-upscaled guides â†’ CPU tonemap â†’ present_cpu (the
+                // POST placement (the A/B experiment): raw 1-spp → XeSS
+                // upscale → readback → OIDN at window res with
+                // nearest-upscaled guides → CPU tonemap → present_cpu (the
                 // frame's single Present). Costs a synchronous readback and
                 // a window-res denoise; no pre-EMA history in this ordering.
                 // Post's denoise is window-res (constant, not area-
-                // proportional) â€” shedding render resolution wouldn't reduce
+                // proportional) — shedding render resolution wouldn't reduce
                 // it, so the scale controller must not see it.
                 pre_ms = 0.0;
                 if xess_hdr.len() != w * h * 3 {
@@ -15614,7 +15633,7 @@ fn session(
                 }
             } else {
                 // OFF / PRE placements: the GPU tonemap present path. The
-                // pre-pass is resolution-agile â€” set_res rebinds the filter
+                // pre-pass is resolution-agile — set_res rebinds the filter
                 // on a res step (cheap; the weights stay loaded), and the
                 // reprojected history reinterprets in place within its
                 // window-res capacity, invalidating itself (a fresh history
@@ -15628,7 +15647,7 @@ fn session(
                 }
                 let denoised = if xess_nppd {
                     // NPPD pre-denoise at the render res: one recurrent step
-                    // on the 1-spp frame â€” the state warp reads xess_gbufs'
+                    // on the 1-spp frame — the state warp reads xess_gbufs'
                     // motion vectors (the same xess_prev contract the
                     // upscaler consumes). set_res is a no-op at a locked res;
                     // under dynamic DRS each step invalidates the state (the
@@ -15645,7 +15664,7 @@ fn session(
                             eprintln!("nppd: pre-denoise failed ({e}); raw XeSS input (J to retry)");
                             xess_nppd = false;
                             pre_ms = 0.0;
-                            // Statistics flip denoisedâ†’raw mid-stream: the
+                            // Statistics flip denoised→raw mid-stream: the
                             // upscaler must not integrate across it.
                             xess_reset = true;
                             None
@@ -15671,7 +15690,7 @@ fn session(
                             octx.denoise_hdr(hist.color(), xg).map(drop)
                         } else {
                             // accum holds exactly the last 1-spp frame (store
-                            // semantics in XeSS mode) â€” denoise it per-frame.
+                            // semantics in XeSS mode) — denoise it per-frame.
                             octx.denoise(&accum[..n], 1, xg).map(drop)
                         }
                     });
@@ -15682,10 +15701,10 @@ fn session(
                             eprintln!("oidn: pre-denoise failed ({e}); raw XeSS input (N to retry)");
                             xess_oidn = XessOidn::Off;
                             pre_ms = 0.0;
-                            // The color source flips denoisedâ†’raw this same
+                            // The color source flips denoised→raw this same
                             // frame; the upscaler must not integrate across
                             // the statistics flip (mirrors the keyboard
-                            // Preâ†’Off transition, which resets via the
+                            // Pre→Off transition, which resets via the
                             // toggle_oidn edge).
                             xess_reset = true;
                             None
@@ -15731,7 +15750,7 @@ fn session(
                         xess_idx = xess_idx.wrapping_add(1);
                     }
                     Err(e) => {
-                        // Nothing reached the GPU (abort_frame) â€” fall back to
+                        // Nothing reached the GPU (abort_frame) — fall back to
                         // the CPU pipeline next iteration; X retries.
                         eprintln!("xess: present failed ({e}); XeSS disabled (X to retry)");
                         xess_on = false;
@@ -15742,7 +15761,7 @@ fn session(
                 }
             }
         } else if oidn_on {
-            // OIDN: denoise on the CPU-resolve path â€” temporal mode folds the
+            // OIDN: denoise on the CPU-resolve path — temporal mode folds the
             // fresh 1-spp frame into the reprojected history and denoises
             // that; plain mode denoises the accumulation average. The
             // denoised HDR is never written back into accum or the history.
@@ -15753,7 +15772,7 @@ fn session(
             if rendered {
                 let og = oidn_gbufs.as_ref().expect("oidn_on without gbufs");
                 // Returning from XeSS mode leaves the filter/history bound at
-                // a render res â€” rebind at window res (no-op otherwise).
+                // a render res — rebind at window res (no-op otherwise).
                 let result = octx.set_res(w, h).and_then(|()| {
                     if oidn_t {
                         let hist = oidn_hist.as_mut().expect("oidn_on without history");
@@ -15815,7 +15834,7 @@ fn session(
             }
             present.blit(gpu).expect("GPU present failed");
         } else if nppd_on {
-            // NPPD: one recurrent network step on the CPU-resolve path â€” the
+            // NPPD: one recurrent network step on the CPU-resolve path — the
             // state is warped by this frame's motion vectors, the 1-spp frame
             // + G-buffers packed, the graph run (DirectML or CPU EP), and the
             // denoised HDR tonemapped into the present buffer. The output is
@@ -15881,7 +15900,7 @@ fn session(
             present.blit(gpu).expect("GPU present failed");
         }
         // Stability meter (FRUSTRACER_STAB=1): quantifies temporal
-        // instability of the upscaled output â€” hold the camera still and a
+        // instability of the upscaled output — hold the camera still and a
         // healthy pipeline trends toward ~0; "dancing" holds a high mean.
         // Reads back the GPU output synchronously; diagnostics only.
         if stab_on && upscaled && rendered {
@@ -15908,7 +15927,7 @@ fn session(
                                 })
                                 .sum();
                             eprintln!(
-                                "stab: mean |Î”| {:.2}/255 over 15 frames (window-res output; render {}x{})",
+                                "stab: mean |Δ| {:.2}/255 over 15 frames (window-res output; render {}x{})",
                                 sum as f64 / (px.len() * 3) as f64,
                                 rw,
                                 rh
@@ -15936,12 +15955,12 @@ fn session(
 
         // The window may now be over a different monitor, or the same monitor's
         // HDR may have been switched on or off underneath us. Re-probe on the
-        // window events that CAN signal it, and once a second regardless â€”
+        // window events that CAN signal it, and once a second regardless —
         // toggling Windows HDR in place fires no window event at all, so the
         // poll is the only thing that sees it. Both funnel into one refresh.
         //
         // This is deliberately cheap: a GetDesc1 and a root-constant retune.
-        // No ResizeBuffers, no PSO rebuild, no resource realloc â€” and no
+        // No ResizeBuffers, no PSO rebuild, no resource realloc — and no
         // upscaler-history reset, because a change of output device is not a
         // change of scene (the same reason camera motion never resets it).
         if edges.display_changed || tick_1hz {
@@ -15949,7 +15968,7 @@ fn session(
                 let t = gpu.tone();
                 if d.enabled {
                     eprintln!(
-                        "hdr: display changed â€” peak {:.0} nits (full-frame {:.0}), \
+                        "hdr: display changed — peak {:.0} nits (full-frame {:.0}), \
                          headroom {:.1}x at {:.0}-nit paper white",
                         d.max_nits,
                         d.max_full_frame_nits,
@@ -15957,19 +15976,19 @@ fn session(
                         opts.hdr_paper_white
                     );
                 } else {
-                    eprintln!("hdr: display changed â€” HDR is OFF on this monitor; SDR levels");
+                    eprintln!("hdr: display changed — HDR is OFF on this monitor; SDR levels");
                 }
             }
         }
 
         if edges.screenshot {
             // A PNG is 8-bit and has nowhere to put a nit, so a screenshot is
-            // always the SDR curve â€” even in an --hdr session. The GPU readback
+            // always the SDR curve — even in an --hdr session. The GPU readback
             // paths already tonemap to SDR (read_hdr_output); the CPU-presented
             // arms hold f16 scRGB under --hdr, so they re-resolve from the same
             // linear source rather than trying to invert the display encode.
             if dlss_on {
-                // The denoised image exists only on the GPU â€” read the RR
+                // The denoised image exists only on the GPU — read the RR
                 // output back and tonemap it (same curve, 1 spp). On failure
                 // fall back to a fresh CPU resolve of the noisy input.
                 match gpu.read_rr_output() {
@@ -15991,7 +16010,7 @@ fn session(
                 }
             } else if xess_on && xess_oidn != XessOidn::Post {
                 // Same story as DLSS: the upscaled image lives only on the
-                // GPU. (POST placement presents via the CPU path â€” it is
+                // GPU. (POST placement presents via the CPU path — it is
                 // handled with the other CPU arms below.)
                 match gpu.read_xess_output() {
                     Ok(px) => present.sdr.copy_from_slice(&px),
@@ -16006,7 +16025,7 @@ fn session(
                 present.resolve_sdr(&accum, &info, frame.max(1), false, rw, rh, w, h);
             } else if present.is_hdr() {
                 // The CPU arms hold scRGB f16 (or packed PQ), which a PNG
-                // cannot carry â€” so
+                // cannot carry — so
                 // re-resolve each arm's OWN linear source through the SDR curve.
                 // The overlay rides along exactly as it does on screen (an SDR
                 // session saves the present buffer verbatim, overlay included;
@@ -16022,7 +16041,7 @@ fn session(
                 } else if xess_on {
                     // Only POST placement reaches here (the others took the GPU
                     // readback arm), and POST presents the OIDN-denoised
-                    // window-res image â€” NOT the raw upscale in `xess_hdr`.
+                    // window-res image — NOT the raw upscale in `xess_hdr`.
                     // Saving xess_hdr would write a visibly noisier PNG than the
                     // window showed. A failed denoise sets xess_oidn = Off, which
                     // routes to the readback arm instead, so `Post` here really
@@ -16199,7 +16218,7 @@ fn session(
     };
 
     // Carry user-visible state into the next session (resize re-entry) or
-    // just record it on quit â€” cheap either way.
+    // just record it on quit — cheap either way.
     *persist = Some(Persist {
         hybrid,
         dynamic,
@@ -16240,19 +16259,19 @@ fn session(
 /// Three encodings, one curve. An SDR session fills `sdr` (u32 0x00RRGGBB);
 /// an scRGB session fills `hdr` ([f16; 4], already curve+overlay+encode); an
 /// HDR10 session fills `pq` (packed 10-bit PQ u32, R low). Which one is a
-/// property of the SWAPCHAIN (`GpuContext::encoding()`), decided once â€” so an
+/// property of the SWAPCHAIN (`GpuContext::encoding()`), decided once — so an
 /// arm cannot accidentally present the wrong wire into the backbuffer.
 ///
 /// `sdr` is allocated in every mode because screenshots are always 8-bit PNG:
 /// a file has nowhere to put a nit. In an HDR session the screenshot path
 /// re-resolves into it (`resolve_*_sdr`) rather than trying to invert the
-/// display-referred output â€” that inversion is not well-defined, and a
+/// display-referred output — that inversion is not well-defined, and a
 /// screenshot is rare enough that a second tonemap costs nothing.
 struct CpuPresent {
     sdr: Vec<u32>,
     hdr: Vec<[half::f16; 4]>,
     pq: Vec<u32>,
-    /// Refreshed from `gpu.tone()` each frame â€” this is how a display change
+    /// Refreshed from `gpu.tone()` each frame — this is how a display change
     /// reaches the CPU arms.
     tone: tone::ToneParams,
     enc: gpu::d3d12::PresentSpace,
@@ -16330,7 +16349,7 @@ impl CpuPresent {
         }
     }
 
-    /// Force the SDR encoding regardless of the session â€” the screenshot path,
+    /// Force the SDR encoding regardless of the session — the screenshot path,
     /// where the destination is always an 8-bit PNG. The `resolve_*` pair above
     /// picks its encoding from the swapchain; these two never do.
     #[allow(clippy::too_many_arguments)]
