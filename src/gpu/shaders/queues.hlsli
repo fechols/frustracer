@@ -77,6 +77,35 @@ RWStructuredBuffer<uint>    cut_pool : register(u9); // 64 x u32 slots
 // (4 x u32 fixed-point 2^18: AO mass / GI rgb + verify PSA in .w).
 RWStructuredBuffer<float> partial : register(u10);
 RWStructuredBuffer<float> ambw    : register(u11);
+
+// THE fb-OFF SPLAT. With no hemisphere pass there is no ambient term to fold
+// in later, so `compose` degenerates to `accum[i] = partial[i]` — a
+// full-screen 12 B read + 12 B write, its own dispatch and its own barrier,
+// moving data between two buffers for nothing (and `ambw` is 12 B/px of zeros
+// that compose.hlsl already declines to read). So leaf and sky write accum
+// DIRECTLY and trace.rs does not dispatch compose at all.
+//
+// This is compose.hlsl's store-or-add rule verbatim, and it lives here so the
+// two cannot drift. BIT-IDENTICAL to going through partial: an f32 store
+// followed by an f32 load returns the same bits, which is what the replay
+// gate's zero-tolerance accum compare confirms.
+//
+// Safe for the same reason compose's own += is: leaf and sky rects partition
+// the screen exactly (the --check-gpu exactly-once coverage gate), so every
+// pixel has a single writer and the read-modify-write needs no atomic.
+// reference.hlsl has always written accum this way.
+void accum_splat(uint pi, float3 c) {
+    uint i3 = pi * 3u;
+    if (frame == 0u || (flags & FLAG_ACCUM) == 0u) {
+        accum[i3 + 0u] = c.x;
+        accum[i3 + 1u] = c.y;
+        accum[i3 + 2u] = c.z;
+    } else {
+        accum[i3 + 0u] += c.x;
+        accum[i3 + 1u] += c.y;
+        accum[i3 + 2u] += c.z;
+    }
+}
 RWStructuredBuffer<uint>  hbuf    : register(u12);
 RWStructuredBuffer<HemiPointRec> hemi_pts : register(u13);
 

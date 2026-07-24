@@ -163,14 +163,22 @@ void cs_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
         }
     }
 
-    uint i3 = pi * 3u;
     float inv = 1.0 / float(spp);
-    // The compose pass is the single accum splat site.
+#ifdef LEAF_NO_FB
+    // fb OFF (this kernel IS the fb-off PSO): straight into accum, and
+    // trace.rs skips the compose dispatch entirely — see `accum_splat`.
+    // `awsum` is identically zero on this arm, so nothing is lost.
+    accum_splat(pi, csum * inv);
+#else
+    // fb ON: the hemi wavefront runs after this pass and compose folds its
+    // ambient in, so the handoff through partial/ambw stays.
+    uint i3 = pi * 3u;
     partial[i3 + 0u] = csum.x * inv;
     partial[i3 + 1u] = csum.y * inv;
     partial[i3 + 2u] = csum.z * inv;
     ambw[i3 + 0u] = awsum.x * inv;
     ambw[i3 + 1u] = awsum.y * inv;
     ambw[i3 + 2u] = awsum.z * inv;
+#endif
     } // grid-stride over the tile's pixels
 }

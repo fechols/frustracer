@@ -1937,6 +1937,21 @@ fn load_scene(req: &SceneRequest) -> LoadedScene {
             None => default_camera(),
         },
     });
+    // Echo the derived pose as a paste-ready `--cam`. The world overview is a
+    // function of `world.field_half`, i.e. of which curated islands happened to
+    // be on disk — so a benchmark that just "uses the boot pose" silently moves
+    // when the scene set changes, and two runs stop comparing. `--cam` overrides
+    // this same value (it is the `unwrap_or_else` above), so the line is
+    // literally the flag that reproduces the run. Target is pos + forward:
+    // Camera stores yaw/pitch, and `look_at` re-derives them from any point
+    // along the ray, so unit distance round-trips exactly.
+    if req.cam_override.is_none() {
+        let t = cam0.pos + cam0.forward();
+        eprintln!(
+            "camera: --cam {:.4},{:.4},{:.4},{:.4},{:.4},{:.4}",
+            cam0.pos.x, cam0.pos.y, cam0.pos.z, t.x, t.y, t.z
+        );
+    }
     progress::phase(progress::Phase::Bvh, "", 0);
     let t0 = Instant::now();
     let bvh = prebuilt.unwrap_or_else(|| bvh::Bvh::build(&scene));
@@ -2583,6 +2598,8 @@ fn run_check_dxr(
             }
         };
         let ua = windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        // See the --check-gpu twin: the readback IS the consumer here.
+        dg2.force_gbuf_ext(true);
         let (near, far) = dlss::near_far(scene.diag);
         let uq = Quality::upscaler_1spp();
         let dxr_gbuf_frame = |hg: &mut gpu::trace::HeadlessGpu,
@@ -2611,10 +2628,12 @@ fn run_check_dxr(
             hg.run(|l| rec = dg2.record_frame(l, 0))?;
             rec?;
             let bytes = hg.read_buffer(&dg2.gbuf, ua, pw * ph * gpu::trace::GBUF_STRIDE as usize)?;
+            let ext =
+                hg.read_buffer(&dg2.gbuf_ext, ua, pw * ph * gpu::trace::GBUF_EXT_STRIDE as usize)?;
             let tb = hg.read_buffer(&dg2.tbuf, ua, pw * ph * 4)?;
             let t: Vec<f32> =
                 tb.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
-            Ok((unpack_gbuf_bytes(&bytes, pw, ph), t))
+            Ok((unpack_gbuf_bytes(&bytes, Some(&ext), pw, ph), t))
         };
         let basis_a = cam0.basis(pw, ph);
         let mut cam_b = cam0;
@@ -2941,11 +2960,16 @@ fn run_check_dxr(
                     eprintln!("check-dxr: FAIL FSR4-RR re-trace");
                     return 1;
                 }
-                let (pack2, accum2) = match (
+                let (pack2, pack2_ext, accum2) = match (
                     hg.read_buffer(&dg2.gbuf, ua, pw * ph * gpu::trace::GBUF_STRIDE as usize),
+                    hg.read_buffer(
+                        &dg2.gbuf_ext,
+                        ua,
+                        pw * ph * gpu::trace::GBUF_EXT_STRIDE as usize,
+                    ),
                     hg.read_buffer(&dg2.accum, ua, pw * ph * 12),
                 ) {
-                    (Ok(a), Ok(b)) => (a, b),
+                    (Ok(a), Ok(e), Ok(b)) => (a, e, b),
                     _ => {
                         eprintln!("check-dxr: FAIL FSR4-RR pack/accum readback");
                         return 1;
@@ -3013,6 +3037,7 @@ fn run_check_dxr(
                     &f_ao,
                     &f_is,
                     &pack2,
+                    &pack2_ext,
                     &accum2,
                     near,
                     far,
@@ -3071,30 +3096,43 @@ fn run_check_dxr(
     }
 }
 
-/// Unpack a GPU `GBufPx` pack readback (GBUF_STRIDE = 88 B/px, 22 lanes:
-/// nr | alb+z | spec | mv | sig | sig2) into a CPU `dlss::GBufs` so the
-/// existing CPU gates (`dlss::mv_selftest`) consume it unmodified â€” the six
-/// sig/sig2 lanes and mv.zw are FSR-RR extras the GBufs shape doesn't carry
-/// (their own gates read the raw bytes). Shared by --check-gpu (M7) and
-/// --check-dxr (T4).
+/// Unpack a GPU pack readback into a CPU `dlss::GBufs` so the existing CPU
+/// gates (`dlss::mv_selftest`) consume it unmodified.
+///
+/// The pack is TWO buffers (see `GBufCore`/`GBufExt` in trace_common.hlsli):
+/// core = 4 lanes (mv.xy | view_z | prev_z), ext = 18 lanes
+/// (nr | alb | spec | sig | sig2). `ext` is `None` for a session that never
+/// stored it (XeSS/FSR 3.1 without NPPD) — the guide fields then read as zero
+/// rather than as stale memory, which is what keeps a gate honest about what
+/// the session actually produced. The prev-Z lane and the six sig/sig2 lanes
+/// are FSR-RR extras the `GBufs` shape doesn't carry (their own gates read the
+/// raw bytes). Shared by --check-gpu (M7) and --check-dxr (T4).
 #[cfg(windows)]
-fn unpack_gbuf_bytes(bytes: &[u8], pw: usize, ph: usize) -> dlss::GBufs {
-    let f = |i: usize| f32::from_le_bytes(bytes[i * 4..][..4].try_into().unwrap());
+fn unpack_gbuf_bytes(
+    core: &[u8],
+    ext: Option<&[u8]>,
+    pw: usize,
+    ph: usize,
+) -> dlss::GBufs {
+    let fc = |b: &[u8], i: usize| f32::from_le_bytes(b[i * 4..][..4].try_into().unwrap());
     let g = dlss::GBufs::new(pw, ph);
-    let lanes = gpu::trace::GBUF_STRIDE as usize / 4;
+    let cl = gpu::trace::GBUF_STRIDE as usize / 4;
+    let el = gpu::trace::GBUF_EXT_STRIDE as usize / 4;
     for i in 0..pw * ph {
-        let b = i * lanes;
+        let c = i * cl;
+        let e = ext.map(|b| (b, i * el));
+        let ef = |k: usize| e.map_or(0.0, |(b, o)| fc(b, o + k));
         g.write(
             i % pw,
             i / pw,
             &dlss::GPixel {
-                normal: Vec3A::new(f(b), f(b + 1), f(b + 2)),
-                rough: f(b + 3),
-                diff_alb: Vec3A::new(f(b + 4), f(b + 5), f(b + 6)),
-                view_z: f(b + 7),
-                spec_alb: Vec3A::new(f(b + 8), f(b + 9), f(b + 10)),
-                spec_hit_t: f(b + 11),
-                mv: (f(b + 12), f(b + 13)),
+                normal: Vec3A::new(ef(0), ef(1), ef(2)),
+                rough: ef(3),
+                diff_alb: Vec3A::new(ef(4), ef(5), ef(6)),
+                view_z: fc(core, c + 2),
+                spec_alb: Vec3A::new(ef(8), ef(9), ef(10)),
+                spec_hit_t: ef(11),
+                mv: (fc(core, c), fc(core, c + 1)),
             },
         );
     }
@@ -3371,18 +3409,30 @@ fn gate_fsr_rr_feed(
     ao: &[u8],
     ind_s: &[u8],
     pack: &[u8],
+    pack_ext: &[u8],
     accum_bytes: &[u8],
     near: f32,
     far: f32,
     sky_sh: &sh::Sh9,
     must_fire: bool,
 ) -> bool {
-    let lanes = gpu::trace::GBUF_STRIDE as usize / 4;
-    let lane_f = |i: usize, l: usize| {
-        f32::from_le_bytes(pack[(i * lanes + l) * 4..][..4].try_into().unwrap())
+    // The pack is two buffers now (GBufCore | GBufExt in trace_common.hlsli).
+    // core lanes: 0 mv.x | 1 mv.y | 2 view_z | 3 prev_z
+    // ext  lanes: 0-2 normal | 3 rough | 4-6 diff_alb | 8-10 F0 | 11 spec_hit_t
+    //             12-14 sig | 16-17 sig2
+    // Deliberately renamed from `lane_*`: the old names took a lane index into
+    // one flat 22-lane record, so a missed call site would have compiled and
+    // read the wrong field. `core_f`/`ext_f` cannot.
+    let clanes = gpu::trace::GBUF_STRIDE as usize / 4;
+    let elanes = gpu::trace::GBUF_EXT_STRIDE as usize / 4;
+    let core_f = |i: usize, l: usize| {
+        f32::from_le_bytes(pack[(i * clanes + l) * 4..][..4].try_into().unwrap())
     };
-    let lane_u = |i: usize, l: usize| {
-        u32::from_le_bytes(pack[(i * lanes + l) * 4..][..4].try_into().unwrap())
+    let ext_f = |i: usize, l: usize| {
+        f32::from_le_bytes(pack_ext[(i * elanes + l) * 4..][..4].try_into().unwrap())
+    };
+    let ext_u = |i: usize, l: usize| {
+        u32::from_le_bytes(pack_ext[(i * elanes + l) * 4..][..4].try_into().unwrap())
     };
     let accf = |i: usize| f32::from_le_bytes(accum_bytes[i * 4..][..4].try_into().unwrap());
     let h16 = |bytes: &[u8], off: usize| u16::from_le_bytes(bytes[off..][..2].try_into().unwrap());
@@ -3397,7 +3447,7 @@ fn gate_fsr_rr_feed(
     // (negative = inside tolerance); -inf when none did.
     let mut worst_res = f32::NEG_INFINITY;
     for i in 0..pw * ph {
-        let view_z = lane_f(i, 7);
+        let view_z = core_f(i, 2);
         let sky = view_z.to_bits() == far.to_bits();
         // Linear depth: R32F passthrough (DEPTH_SIGN = 1), bit-equal.
         if u32::from_le_bytes(depth_lin[i * 4..][..4].try_into().unwrap()) != view_z.to_bits() {
@@ -3418,7 +3468,7 @@ fn gate_fsr_rr_feed(
             }
         }
         // MVs: RG = pixel MV / render dims, B = prev_z - view_z, all f16.
-        let (mvx, mvy, prev_z) = (lane_f(i, 12), lane_f(i, 13), lane_f(i, 14));
+        let (mvx, mvy, prev_z) = (core_f(i, 0), core_f(i, 1), core_f(i, 3));
         let expect = [mvx / pw as f32, mvy / ph as f32, prev_z - view_z];
         for (ch, e) in expect.iter().enumerate() {
             let got16 = h16(mvec, i * 8 + ch * 2);
@@ -3433,13 +3483,13 @@ fn gate_fsr_rr_feed(
         }
         // Normals: RGB10A2 â€” oct RG + rough B at <= 1 LSB, A == 0.
         let got_n = u32::from_le_bytes(normals[i * 4..][..4].try_into().unwrap());
-        let n = Vec3A::new(lane_f(i, 0), lane_f(i, 1), lane_f(i, 2));
+        let n = Vec3A::new(ext_f(i, 0), ext_f(i, 1), ext_f(i, 2));
         let (eu, ev) = fsr::oct_encode(n);
         let q10 = |v: f32| (v.clamp(0.0, 1.0) * 1023.0 + 0.5) as u32;
         let l10 = |w: u32, s: u32| (w >> s) & 0x3ff;
         if l10(got_n, 0).abs_diff(q10(eu)) > 1
             || l10(got_n, 10).abs_diff(q10(ev)) > 1
-            || l10(got_n, 20).abs_diff(q10(lane_f(i, 3))) > 1
+            || l10(got_n, 20).abs_diff(q10(ext_f(i, 3))) > 1
             || (got_n >> 30) != 0
         {
             nrm_bad += 1;
@@ -3447,8 +3497,8 @@ fn gate_fsr_rr_feed(
         // Signals: the planes are pure widens of the pack's sig/sig2 f16
         // halves. sig = (dd.x|dd.y, dd.z|ds.x, ds.y|ds.z, 0); sig2 =
         // (ao|is.x, is.y|is.z).
-        let sig = [lane_u(i, 16), lane_u(i, 17), lane_u(i, 18)];
-        let sig2 = [lane_u(i, 20), lane_u(i, 21)];
+        let sig = [ext_u(i, 12), ext_u(i, 13), ext_u(i, 14)];
+        let sig2 = [ext_u(i, 16), ext_u(i, 17)];
         let dd16 = [sig[0] as u16, (sig[0] >> 16) as u16, sig[1] as u16];
         let ds16 = [(sig[1] >> 16) as u16, sig[2] as u16, (sig[2] >> 16) as u16];
         let ao16 = sig2[0] as u16;
@@ -3476,7 +3526,7 @@ fn gate_fsr_rr_feed(
         // FLOAT16 format has rounding latitude the CPU's from_f32 does not).
         {
             let got = h16(ind_s, i * 8 + 6);
-            let want = half::f16::from_f32(lane_f(i, 11)).to_bits();
+            let want = half::f16::from_f32(ext_f(i, 11)).to_bits();
             let d = (mono16(got) - mono16(want)).unsigned_abs();
             max_ish_ulp = max_ish_ulp.max(d);
             if d > 1 {
@@ -3511,7 +3561,7 @@ fn gate_fsr_rr_feed(
         let mut wire = [Vec3A::ZERO; 2];
         for (k, (plane, base)) in [(alb, 4usize), (spec, 8usize)].into_iter().enumerate() {
             for ch in 0..3 {
-                let v = lane_f(i, base + ch);
+                let v = ext_f(i, base + ch);
                 let b = plane[i * 4 + ch];
                 if b.abs_diff(fsr::sqrt_encode8(v)) > 1 {
                     alb_bad += 1;
@@ -5309,6 +5359,10 @@ fn run_check_gpu(
                 return 1;
             }
         };
+        // The pack gates' consumer is the CPU readback below, not a feed
+        // kernel, and they trace before any wire_feed call — so ask for the
+        // guide/signal half explicitly (see TraceGpu::force_gbuf_ext).
+        ptg.force_gbuf_ext(true);
         let (near, far) = dlss::near_far(scene.diag);
         let uq = Quality::upscaler_1spp();
         // One fresh 1-spp wavefront frame at the upscaler contract
@@ -5338,10 +5392,12 @@ fn run_check_gpu(
             ptg.write_cb(0, &p);
             hg.run(|l| ptg.record_wavefront(l, 0, &p, false))?;
             let bytes = hg.read_buffer(&ptg.gbuf, ua, pw * ph * gpu::trace::GBUF_STRIDE as usize)?;
+            let ext =
+                hg.read_buffer(&ptg.gbuf_ext, ua, pw * ph * gpu::trace::GBUF_EXT_STRIDE as usize)?;
             let tb = hg.read_buffer(&ptg.tbuf, ua, pw * ph * 4)?;
             let t: Vec<f32> =
                 tb.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
-            Ok((unpack_gbuf_bytes(&bytes, pw, ph), t))
+            Ok((unpack_gbuf_bytes(&bytes, Some(&ext), pw, ph), t))
         };
         let basis_a = cam0.basis(pw, ph);
         let mut cam_b = cam0;
@@ -5761,11 +5817,16 @@ fn run_check_gpu(
                     eprintln!("check-gpu: FAIL FSR4-RR re-trace: {e}");
                     return 1;
                 }
-                let (pack2, accum2) = match (
+                let (pack2, pack2_ext, accum2) = match (
                     hg.read_buffer(&ptg.gbuf, ua, pw * ph * gpu::trace::GBUF_STRIDE as usize),
+                    hg.read_buffer(
+                        &ptg.gbuf_ext,
+                        ua,
+                        pw * ph * gpu::trace::GBUF_EXT_STRIDE as usize,
+                    ),
                     hg.read_buffer(&ptg.accum, ua, pw * ph * 12),
                 ) {
-                    (Ok(a), Ok(b)) => (a, b),
+                    (Ok(a), Ok(e), Ok(b)) => (a, e, b),
                     _ => {
                         eprintln!("check-gpu: FAIL FSR4-RR pack/accum readback");
                         return 1;
@@ -5833,6 +5894,7 @@ fn run_check_gpu(
                     &f_ao,
                     &f_is,
                     &pack2,
+                    &pack2_ext,
                     &accum2,
                     near,
                     far,
@@ -10809,6 +10871,30 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     // verify frames that consume it. Every pixel still gets the tmin=0
     // reference-ray treatment, so a bad seed surfaces as false-sky/overshoot.
     // All deterministic â€” no wall clock.
+    // GATE THE ALGORITHM AT ITS OWN FRONTIER. The temporal family's structural
+    // must-fires (seeds/sky-tiles/adopts/coarse > 0) are written against
+    // `render::TEMPORAL_TILE`, and they mean less at a coarser one: at the
+    // shipping LEAF_TILE=32 a tile's query region is 4x wider per axis, so it
+    // far less often lies WHOLLY inside the old sky region and `verify temporal
+    // yaw` reports sky-tiles 0 — the sky path legitimately cannot fire on an
+    // 800x600 check scene, so the must-fire would be asserting nothing.
+    //
+    // Gating the ALGORITHM and gating the SHIPPING CONFIG are two jobs.
+    // Conflating them leaves only bad options: relax the must-fire (and lose
+    // the guard against a real sky-path regression) or freeze LEAF_TILE. So
+    // this block pins the frontier the gates were tuned for and restores the
+    // shipping one after; every soundness counter (false-sky, tmin-overshoot,
+    // hybrid-extra) is frontier-INDEPENDENT and runs at both, here and in
+    // `--check-gpu`, which passes at the shipping frontier unmodified.
+    let shipping_tile = render::leaf_tile();
+    render::set_leaf_tile(render::TEMPORAL_TILE);
+    if shipping_tile != render::TEMPORAL_TILE {
+        eprintln!(
+            "temporal gates: leaf frontier pinned at {} (shipping {shipping_tile}) — \
+             the structural must-fires are tuned to it",
+            render::TEMPORAL_TILE
+        );
+    }
     let tcache = temporal::TemporalCache::new(rw, rh);
     let cuts_a = temporal::CutStore::new(rw, rh);
     {
@@ -11509,6 +11595,9 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             );
         }
     }
+    // End of the temporal family — back to the frontier that ships, so every
+    // gate below (defer, spp, hemi, the benches) measures the real config.
+    render::set_leaf_tile(shipping_tile);
 
     // Deferred material-sorted shading (--defer-shade): a same-seed frame
     // with deferral off vs on must be BIT-IDENTICAL â€” the records carry each

@@ -44,10 +44,22 @@ void cs_feed_xess(uint3 id : SV_DispatchThreadID) {
     if (id.x >= rw || id.y >= rh) return;
     uint pi = id.y * rw + id.x;
     uint i3 = pi * 3u;
-    GBufPx g = gbuf[pi];
+#ifdef ABL_NOPACK
+    // Cost probe (see trace::abl_defs): skip the pack load entirely and write
+    // constants, so the delta against the real kernel is exactly the 88 B/px
+    // read. The accum load and all three stores stay, so only the pack's
+    // traffic moves. Image is wrong by design.
     feed_color[id.xy] = float4(accum[i3], accum[i3 + 1u], accum[i3 + 2u], 1.0);
-    feed_mvec[id.xy] = g.mv.xy;
-    feed_depth[id.xy] = view_z_to_clip_depth(g.alb_z.w, CAM_NEAR, CAM_FAR);
+    feed_mvec[id.xy] = float2(0.0, 0.0);
+    feed_depth[id.xy] = 0.5;
+#else
+    // Core only — this kernel is the reason the pack is split (XeSS and
+    // FSR 3.1 read 12 of the old 88 B/px).
+    GBufCore g = gbuf[pi];
+    feed_color[id.xy] = float4(accum[i3], accum[i3 + 1u], accum[i3 + 2u], 1.0);
+    feed_mvec[id.xy] = g.core.xy;
+    feed_depth[id.xy] = view_z_to_clip_depth(g.core.z, CAM_NEAR, CAM_FAR);
+#endif
 }
 
 // NPPD pre-denoise frames (--gpu --nppd): the color plane comes from
@@ -55,9 +67,9 @@ void cs_feed_xess(uint3 id : SV_DispatchThreadID) {
 [numthreads(8, 8, 1)]
 void cs_feed_xess_dm(uint3 id : SV_DispatchThreadID) {
     if (id.x >= rw || id.y >= rh) return;
-    GBufPx g = gbuf[id.y * rw + id.x];
-    feed_mvec[id.xy] = g.mv.xy;
-    feed_depth[id.xy] = view_z_to_clip_depth(g.alb_z.w, CAM_NEAR, CAM_FAR);
+    GBufCore g = gbuf[id.y * rw + id.x];
+    feed_mvec[id.xy] = g.core.xy;
+    feed_depth[id.xy] = view_z_to_clip_depth(g.core.z, CAM_NEAR, CAM_FAR);
 }
 
 [numthreads(8, 8, 1)]
@@ -65,13 +77,14 @@ void cs_feed_rr(uint3 id : SV_DispatchThreadID) {
     if (id.x >= rw || id.y >= rh) return;
     uint pi = id.y * rw + id.x;
     uint i3 = pi * 3u;
-    GBufPx g = gbuf[pi];
+    GBufCore c = gbuf[pi];
+    GBufExt g = gbuf_ext[pi]; // FLAG_GBUF_EXT is set whenever this kernel runs
     feed_color[id.xy] = float4(accum[i3], accum[i3 + 1u], accum[i3 + 2u], 1.0);
     feed_nr[id.xy] = g.nr;
-    feed_depth[id.xy] = g.alb_z.w; // linear view-Z, RR's LINEAR_DEPTH contract
-    feed_mvec[id.xy] = g.mv.xy;
+    feed_depth[id.xy] = c.core.z; // linear view-Z, RR's LINEAR_DEPTH contract
+    feed_mvec[id.xy] = c.core.xy;
     // UNORM stores clamp to [0,1] in hardware (the CPU path's to_unorm8).
-    feed_alb[id.xy] = float4(g.alb_z.xyz, 1.0);
+    feed_alb[id.xy] = float4(g.alb.xyz, 1.0);
     feed_spec[id.xy] = float4(g.spec.xyz, 1.0);
     feed_spechit[id.xy] = g.spec.w;
 }
@@ -97,7 +110,8 @@ void cs_feed_fsr_rr(uint3 id : SV_DispatchThreadID) {
     if (id.x >= rw || id.y >= rh) return;
     uint pi = id.y * rw + id.x;
     uint i3 = pi * 3u;
-    GBufPx g = gbuf[pi];
+    GBufCore c = gbuf[pi];
+    GBufExt g = gbuf_ext[pi];
     // Demodulated signals from the pack's f16x2 lanes (exact widen).
     float3 dd = float3(f16tof32(g.sig.x & 0xffffu), f16tof32(g.sig.x >> 16u),
                        f16tof32(g.sig.y & 0xffffu));
@@ -115,7 +129,7 @@ void cs_feed_fsr_rr(uint3 id : SV_DispatchThreadID) {
     feed_aux4[id.xy] = float4(is, g.spec.w);
     // sqrt-encoded albedos; enc is exactly representable as n/255, so the
     // UNORM8 store round-trips to the same byte the wire factors assume.
-    float3 kd_enc = float3(sqrt_enc8(g.alb_z.x), sqrt_enc8(g.alb_z.y), sqrt_enc8(g.alb_z.z));
+    float3 kd_enc = float3(sqrt_enc8(g.alb.x), sqrt_enc8(g.alb.y), sqrt_enc8(g.alb.z));
     float3 f0_enc = float3(sqrt_enc8(g.spec.x), sqrt_enc8(g.spec.y), sqrt_enc8(g.spec.z));
     feed_alb[id.xy] = float4(kd_enc, 1.0);
     feed_spec[id.xy] = float4(f0_enc, 1.0);
@@ -141,10 +155,10 @@ void cs_feed_fsr_rr(uint3 id : SV_DispatchThreadID) {
     feed_nr[id.xy] = float4(n_enc, g.nr.w, FSR_MAT_TYPE);
     // Denoiser MVs: UV-delta RG (the pixel-space MV over the render dims),
     // linear-depth delta B from the pack's prev-Z lane (sky: far - far = 0).
-    feed_aux0[id.xy] = float4(g.mv.x / float(rw), g.mv.y / float(rh),
-                              g.mv.z - g.alb_z.w, 0.0);
+    feed_aux0[id.xy] = float4(c.core.x / float(rw), c.core.y / float(rh),
+                              c.core.w - c.core.z, 0.0);
     // Both depth encodes: reversed-Z clip for the upscaler, signed linear
     // view-Z for the denoiser.
-    feed_depth[id.xy] = view_z_to_clip_depth(g.alb_z.w, CAM_NEAR, CAM_FAR);
-    feed_spechit[id.xy] = FSR_DEPTH_SIGN * g.alb_z.w;
+    feed_depth[id.xy] = view_z_to_clip_depth(c.core.z, CAM_NEAR, CAM_FAR);
+    feed_spechit[id.xy] = FSR_DEPTH_SIGN * c.core.z;
 }

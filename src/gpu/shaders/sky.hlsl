@@ -143,15 +143,25 @@ void cs_sky(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
             c *= 1.0 / float(spp);
         }
         uint pi = y * rw + x;
-        uint i3 = pi * 3u;
-        // The compose pass is the single accum splat site; sky pixels carry
-        // their full color in `partial` with zero ambient weight.
-        partial[i3 + 0u] = c.x;
-        partial[i3 + 1u] = c.y;
-        partial[i3 + 2u] = c.z;
-        ambw[i3 + 0u] = 0.0;
-        ambw[i3 + 1u] = 0.0;
-        ambw[i3 + 2u] = 0.0;
+        // Sky pixels have no ambient weight in either mode. With fb OFF that
+        // makes compose a pure copy, so splat straight into accum (see
+        // `accum_splat`); the branch is on a cbuffer value, uniform across the
+        // dispatch. cs_sky is ONE PSO — unlike cs_leaf it has no fb-off
+        // compile arm to hang this on.
+        if (fb_mode == 0u) {
+            accum_splat(pi, c);
+        } else {
+            // fb ON: compose still runs over EVERY pixel, so sky must keep
+            // feeding it — a sky pixel that skipped `partial` would have
+            // compose read whatever was there last frame.
+            uint i3 = pi * 3u;
+            partial[i3 + 0u] = c.x;
+            partial[i3 + 1u] = c.y;
+            partial[i3 + 2u] = c.z;
+            ambw[i3 + 0u] = 0.0;
+            ambw[i3 + 1u] = 0.0;
+            ambw[i3 + 2u] = 0.0;
+        }
         tbuf[pi] = INF;
         info[pi] = pack_info(rec.depth, KIND_SKY);
         // Pixel centers, matching the CPU sky-tile flood (leaf-tile sky

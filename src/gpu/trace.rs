@@ -95,6 +95,21 @@ pub const NPPD_REG_BASE: u32 = NUM_UAVS + 2 + NUM_FEED; // u26
 /// as the u14/feed slots (only one CBV_SRV_UAV heap is bindable at a time),
 /// starting at slot TEX_HEAP_BASE.
 pub const RP_SCENE_TEX: u32 = RP_NPPD_OUT + 1;
+/// The G-buffer pack's guide/signal half (register u32), appended LAST so no
+/// established param index renumbers. See `GBufExt` in trace_common.hlsli for
+/// why the pack is two buffers rather than one struct with skipped members —
+/// short version: a partial member store of the old 88-byte record measured
+/// SLOWER than storing all of it (unaligned scatter / write-allocate), while
+/// a separate 16 B/px core buffer stores contiguous and coalesced.
+///
+/// **THIS CLOSES THE ROOT SIGNATURE AT 64/64 DWORDs.** It was 62. A root UAV
+/// costs 2, and there is now no slack: any future root parameter must displace
+/// one or move into a descriptor table. That was a deliberate trade — several
+/// designs here reused registers specifically to avoid spending it (the cloud
+/// caches on u5/u6, the feed descriptor SETS) — bought here because `gbuf` is
+/// a root UAV with no bounds checking, so typed structs turn an offset mistake
+/// into a compile error instead of silent memory corruption.
+pub const RP_GBUF_EXT: u32 = RP_SCENE_TEX + 1;
 /// First heap slot of the scene-texture table (after every feed set).
 pub const TEX_HEAP_BASE: u32 = FEED_SETS * FEED_SET_STRIDE;
 /// Buffer-SRV descriptors preceding the Texture2D array in the table
@@ -220,24 +235,27 @@ pub(crate) const CB_STRIDE: usize = 2560;
 /// takes a second full lap, which is the same lane utilization a 64-wide group
 /// would have had.
 ///
-/// AND 32 IS RIGHT ON INTEL TOO — do not read the FR_LEAF/FR_LGROUP 2-D
-/// sweep's (32, 256) optimum as "Intel wants group 256" and adopt the group
-/// axis alone. Measured at the SHIPPING LEAF_TILE=8 (interleaved medians,
-/// rep 1 discarded, `--spin path` 1080p GPU frame span vs group 32):
+/// **THE GROUP WIDTH IS PAIRED WITH `render::LEAF_TILE` AND MUST MOVE WITH
+/// IT.** Everything above is the reasoning at the OLD 8-px frontier, where a
+/// leaf rect was ~32 px and one wave covered it. The frontier is now 32 px
+/// (`render::LEAF_TILE`, whose doc carries the world measurement), a leaf rect
+/// is ~540 px, and it genuinely feeds 256 lanes.
+///
+/// The pairing is not a preference, it is the whole effect. Measured at the
+/// OLD LEAF_TILE=8 (interleaved medians, rep 1 discarded, `--spin path` 1080p
+/// GPU frame span vs group 32):
 /// ```text
 ///            g16     g64    g128    g256
 ///   B70 default   +0.1%   +0.9%   +6.3%  +21.1%
 ///   B70 stress    +1.3%   -0.4%   +1.6%   +9.5%
 ///   4090 stress     --    +7.6%  +23.2%     --
 /// ```
-/// The 256-group appetite is a property of the COARSE frontier: a TILE=32
-/// leaf is ~540 px and genuinely feeds 256 lanes, while a TILE=8 leaf is
-/// ~32 px and wider groups only idle lanes — on every vendor. So the whole
-/// (32, 256) win stays gated behind re-tuning the temporal must-fires for a
-/// coarser frontier (see CLAUDE.md), and there is no group-only vendor
-/// default to take (`main::vendor_defaults` stays mode-only). Intel's SIMD16
-/// does not rescue g16 either.
-const LEAF_GROUP: u32 = 32;
+/// i.e. 256 lanes at an 8-px frontier is a 21% REGRESSION — wider groups only
+/// idle lanes when the tile cannot fill them, on every vendor. Take one
+/// constant without the other and you get the worst of both. Intel's SIMD16
+/// does not rescue g16 either, and there is still no group-only vendor default
+/// to take (`main::vendor_defaults` stays mode-only).
+const LEAF_GROUP: u32 = 256;
 
 /// R&D lever (FR_LGROUP): the leaf kernel's group width. Swept together with
 /// FR_LEAF because the two INTERACT — a leaf rect is ~(rw*rh)/4^depth_full
@@ -702,6 +720,15 @@ pub fn create_root_signature(device: &ID3D12Device) -> Result<ID3D12RootSignatur
                 NumDescriptorRanges: 2,
                 pDescriptorRanges: tex_ranges.as_ptr(),
             },
+        },
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+    });
+    // RP_GBUF_EXT: the pack's guide/signal half (u32), appended LAST. This is
+    // the parameter that takes the signature to 64/64 DWORDs — see the const.
+    params.push(D3D12_ROOT_PARAMETER {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+        Anonymous: D3D12_ROOT_PARAMETER_0 {
+            Descriptor: D3D12_ROOT_DESCRIPTOR { ShaderRegister: 32, RegisterSpace: 0 },
         },
         ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
     });
@@ -1737,9 +1764,9 @@ impl SceneGpu {
         // OPAQUE drops when ANY conditional-hit feature is armed — the
         // any-hit/candidate machinery is shared (candidate_reject), and the
         // tinted-shadow pass needs candidates to surface in `transmit_q`.
-        let non_opaque = scene.any_alpha
-            || (scene.any_height && crate::bvh::height_armed())
-            || scene.any_transmissive;
+        // Derived from the same three predicates that compile those arms in,
+        // so the flag and the shaders cannot disagree (see `non_opaque`).
+        let non_opaque = non_opaque(scene);
 
         // --blas-split: one BLAS per maximal BVH subtree under the cap, each
         // instanced identity into the TLAS. Everything below this block is the
@@ -2145,7 +2172,7 @@ impl SceneGpu {
 /// loops / any-hit shaders in; opaque scenes compile byte-identical sources
 /// to the pre-cutout tracer. Shared with dxr.rs (the DXR library concat).
 pub(crate) fn alpha_defs(scene: &Scene) -> &'static str {
-    if scene.any_alpha { "#define ALPHA_CUTOUT 1" } else { "" }
+    if scene.any_alpha && !abl_has("noalpha") { "#define ALPHA_CUTOUT 1" } else { "" }
 }
 
 /// The relief twin of `alpha_defs`: height-carrying scenes compile the march
@@ -2153,7 +2180,11 @@ pub(crate) fn alpha_defs(scene: &Scene) -> &'static str {
 /// the V toggle); scenes without height data compile byte-identical sources
 /// to the pre-relief tracer. Shared with dxr.rs.
 pub(crate) fn height_defs(scene: &Scene) -> &'static str {
-    if scene.any_height && crate::bvh::height_armed() { "#define HEIGHTFIELD 1" } else { "" }
+    if scene.any_height && crate::bvh::height_armed() && !abl_has("noheight") {
+        "#define HEIGHTFIELD 1"
+    } else {
+        ""
+    }
 }
 
 /// The tinted-shadows twin: transmissive scenes compile `transmit_q`'s
@@ -2162,7 +2193,33 @@ pub(crate) fn height_defs(scene: &Scene) -> &'static str {
 /// transmissive materials compile byte-identical sources to the binary
 /// occlusion tracer. Shared with dxr.rs.
 pub(crate) fn trans_defs(scene: &Scene) -> &'static str {
-    if scene.any_transmissive { "#define TRANS_SHADOW 1" } else { "" }
+    if scene.any_transmissive && !abl_has("notrans") { "#define TRANS_SHADOW 1" } else { "" }
+}
+
+/// Does the BLAS have to drop `GEOMETRY_FLAG_OPAQUE`?
+///
+/// Exactly when some conditional-hit feature compiled in — so it is DERIVED
+/// from the three predicates above rather than re-deriving `scene.any_*`. Both
+/// tracers used to spell this out separately (trace.rs's AS sizing and
+/// dxr.rs's library defs), which meant the flag and the shaders could drift,
+/// and an `FR_ABL` neutralization would have compiled the candidate loops out
+/// while still building a non-opaque AS — measuring nothing.
+///
+/// It also states the real invariant: the AS flag and the shader arms are two
+/// halves of one decision. The `bc7::should_compress` discipline — two
+/// predicates that MUST stay identical are better written once.
+pub(crate) fn non_opaque(scene: &Scene) -> bool {
+    !alpha_defs(scene).is_empty()
+        || !height_defs(scene).is_empty()
+        || !trans_defs(scene).is_empty()
+}
+
+/// Is `tag` present in `FR_ABL`? Read once — the ablations are session
+/// constants, and a per-call `env::var` inside a predicate that runs per
+/// chunk would be a syscall per BLAS.
+fn abl_has(tag: &str) -> bool {
+    static ABL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ABL.get_or_init(|| std::env::var("FR_ABL").unwrap_or_default()).contains(tag)
 }
 
 /// The `--blas-split` twin: armed sessions compile `tri_of()` as the chunk
@@ -2172,6 +2229,42 @@ pub(crate) fn trans_defs(scene: &Scene) -> &'static str {
 /// a per-scene one — hence no `scene` argument.
 pub(crate) fn blas_defs() -> &'static str {
     if crate::blas_split::max_prims().is_some() { "#define BLAS_SPLIT 1" } else { "" }
+}
+
+/// Dev cost-attribution ablations (`FR_ABL=sunt|rough|...`): neutralize one
+/// consumer at a time to find where a layer's cost actually lands. NOT shipping
+/// levers — every one of them changes the image, which is the point (you are
+/// measuring a feature against its own absence, the `--no-wide-levels` idiom).
+///
+/// Shared with dxr.rs deliberately. This used to be read inline in
+/// `TraceGpu::new` only, so the DXR library — which builds its own defs — never
+/// saw an ablation at all, and any cost attribution was silently
+/// non-comparable across the two arms. That comparison is exactly what an
+/// Intel campaign turns on (the wavefront-vs-DXR default), so the string has
+/// one home now.
+/// Tags that neutralize a cloud consumer. The `no*` tags are NOT here — they
+/// suppress a `#define` rather than adding one, so they live in the three
+/// per-scene predicates above (and, through `non_opaque`, in the BLAS flag).
+pub(crate) fn abl_defs() -> String {
+    let mut out = String::new();
+    for (tag, def) in [
+        ("sunt", "ABL_SUNT"),
+        ("rough", "ABL_ROUGH"),
+        // The G-buffer pack's two halves, priced separately. `nogbuf`
+        // neutralizes the WRITE (gbuf_write_hit/_sky store nothing, so leaf
+        // and sky stop moving 88 B/px); `nopack` neutralizes the READ
+        // (cs_feed_xess skips the load and writes constants). Both leave the
+        // dispatch shape untouched, so the delta is memory traffic and
+        // nothing else. Under `nogbuf` the feed reads uninitialized memory —
+        // the image is garbage BY DESIGN; these are cost probes, never levers.
+        ("nogbuf", "ABL_NOGBUF"),
+        ("nopack", "ABL_NOPACK"),
+    ] {
+        if abl_has(tag) {
+            out.push_str(&format!("#define {def} 1\n"));
+        }
+    }
+    out
 }
 
 /// HLSL prelude every compile unit takes: the `--spp` jitter table's row count
@@ -2219,6 +2312,11 @@ pub(crate) fn spp_defs() -> String {
 /// suppressed); it traces nothing, so no frustum/rt machinery.
 pub(crate) fn sky_unit_src(k: u32, n: u32) -> String {
     [
+        // Ablations must reach THIS unit too — see the feed_src note. A
+        // `nogbuf` probe once measured `sky` as unchanged and it was read as
+        // "the sky pack write is free"; the define had simply never arrived,
+        // and cs_sky kept storing all 88 B/px. Real number: 0.736 -> 0.099 ms.
+        abl_defs(),
         format!(
             "#define SKY_UNIT 1\n#define SKY_LOD {k}\n#define SKY_LOD_LOG {}",
             k.trailing_zeros()
@@ -2605,7 +2703,8 @@ pub const FLAG_VERIFY: u32 = 8;
 pub const FLAG_GBUF: u32 = 16;
 pub const FLAG_HAS_PREV: u32 = 32;
 /// FSR-RR sessions: the pack additionally carries the demodulated
-/// direct-light signals (GBufPx.sig) and the prev-camera view-Z (mv.z);
+/// direct-light signals (GBufExt.sig) and the prev-camera view-Z
+/// (GBufCore.core.w);
 /// zeros under every other wiring — RR/XeSS packs stay byte-identical.
 pub const FLAG_FSR_SIG: u32 = 64;
 /// Anisotropic texture filtering on (the session's `--aniso` > 1). A session
@@ -2638,9 +2737,24 @@ pub const FLAG_FIREFLIES: u32 = 1024;
 /// define needed).
 pub const FLAG_DEPTH_TINT: u32 = 2048;
 
-/// GBufPx stride in bytes — lockstep with trace_common.hlsli's struct
-/// (nr | alb_z | spec | mv | sig | sig2 = 4 float4 + 1 uint4 + 1 uint2).
-pub const GBUF_STRIDE: u64 = 88;
+/// The pack's guide/signal half is stored this frame — set when any WIRED feed
+/// kind consumes it (RR, FSR-RR) or GPU-resident NPPD is live. XeSS and
+/// FSR 3.1 read only the core (mv + view_z), so their sessions skip 72 of the
+/// old 88 B/px: measured 0.411 ms of pure store cost in `leaf` on the world,
+/// of which this recovers ~0.34. Derived per frame like `fsr_sig` (one
+/// subscriber is enough — `--quinlight` wires several kinds at once), never a
+/// construction-time constant: the tracer is built BEFORE `wire_feed` runs.
+///
+/// FLAG_FSR_SIG implies this — FSR-RR reads the sig lanes, which live in ext.
+pub const FLAG_GBUF_EXT: u32 = 4096;
+
+/// `GBufCore` stride in bytes — lockstep with trace_common.hlsli (one float4:
+/// mv.xy | view_z | prev_z).
+pub const GBUF_STRIDE: u64 = 16;
+
+/// `GBufExt` stride in bytes — lockstep with trace_common.hlsli
+/// (nr | alb | spec | sig | sig2 = 3 float4 + 1 uint4 + 1 uint2).
+pub const GBUF_EXT_STRIDE: u64 = 72;
 
 /// Mirror of `cbuffer Frame` in trace_common.hlsli (304 bytes, 16-aligned
 /// rows — float3s ride in float4 slots with scalars packed in .w).
@@ -2732,8 +2846,8 @@ pub(crate) struct FrameCb {
 // The HLSL cbuffer is hand-mirrored across 7 concatenated compile units —
 // a size drift here corrupts every field after the drift point.
 // 304 (the pre-sun size) − 32 (two rect-light rows dropped) + 16 (the spp
-// block) + 8·MAX_SPP (the jitter table) + 16·9 (the SH sky) +
-// 16·MAX_FIREFLIES (the firefly pose rows).
+// block) + 8Â·MAX_SPP (the jitter table) + 16Â·9 (the SH sky) +
+// 16Â·MAX_FIREFLIES (the firefly pose rows).
 const _: () = assert!(
     std::mem::size_of::<FrameCb>()
         == 320 - 32
@@ -2820,7 +2934,13 @@ impl FrameCb {
 
     /// The per-frame fields folded onto the static base — the single source
     /// for the FrameParams -> cbuffer mapping (both dispatch flavors).
-    pub(crate) fn with_frame(&self, p: &FrameParams, gbuf_full: bool, fsr_sig: bool) -> FrameCb {
+    pub(crate) fn with_frame(
+        &self,
+        p: &FrameParams,
+        gbuf_full: bool,
+        fsr_sig: bool,
+        gbuf_ext: bool,
+    ) -> FrameCb {
         let (origin, forward, right, up, inv_w, inv_h) = p.cam.gpu_fields();
         let mut cb = *self;
         cb.cam_origin = [origin.x, origin.y, origin.z, inv_w];
@@ -2837,6 +2957,9 @@ impl FrameCb {
             | (gbuf_full as u32 * FLAG_GBUF)
             | (p.prev_cam.is_some() as u32 * FLAG_HAS_PREV)
             | ((gbuf_full && fsr_sig) as u32 * FLAG_FSR_SIG)
+            // FSR-RR reads the sig lanes, which live in ext — so the sig flag
+            // implies the ext flag by construction, not by convention.
+            | ((gbuf_full && (gbuf_ext || fsr_sig)) as u32 * FLAG_GBUF_EXT)
             | ((crate::texture::max_aniso() > 1.0) as u32 * FLAG_ANISO)
             | (p.clouds.enabled as u32 * FLAG_CLOUDS)
             // count > 0 already folds in the session enable + the night fade
@@ -3117,10 +3240,18 @@ pub struct TraceGpu {
     /// RGBA16F resolve target; rests in PIXEL_SHADER_RESOURCE between frames
     /// (the tonemap PS reads it via SRV_SLOT_GPU).
     pub hdr: ID3D12Resource,
-    /// The G-buffer pack (GBufPx, 64 B/px) — full-size in upscaler sessions,
-    /// a 64-byte dummy otherwise (`gbuf_full` gates FLAG_GBUF, which is what
-    /// keeps the write helpers from scribbling past the dummy).
+    /// The G-buffer pack's CORE half (`GBufCore`, GBUF_STRIDE = 16 B/px) —
+    /// full-size in upscaler sessions, a stride-sized dummy otherwise
+    /// (`gbuf_full` gates FLAG_GBUF, which is what keeps the write helpers
+    /// from scribbling past the dummy).
     pub gbuf: ID3D12Resource,
+    /// The pack's guide/signal half (`GBufExt`, GBUF_EXT_STRIDE = 72 B/px).
+    /// Allocated whenever `gbuf` is, but WRITTEN only under FLAG_GBUF_EXT —
+    /// see that flag for why the split exists and what it measured.
+    pub gbuf_ext: ID3D12Resource,
+    /// Test hook — see `force_gbuf_ext`. `Cell` because the record/write
+    /// methods take `&self` (the `last_struct` precedent).
+    force_gbuf_ext: std::cell::Cell<bool>,
     gbuf_full: bool,
     uav_heap: ID3D12DescriptorHeap,
     /// GPU handle of the RP_SCENE_TEX table's first descriptor (heap slot
@@ -3161,18 +3292,15 @@ impl TraceGpu {
         // loop in (TRANS_SHADOW). Scenes with none compile the FORCE_OPAQUE
         // originals verbatim (modulo leading blank lines) — procedural/stress
         // sessions are structurally untouched (the bit gates rely on that).
-        // Dev cost-attribution ablations (FR_ABL=sunt|rough|both): neutralize
-        // one cloud consumer at a time to find where the layer's cost lands.
-        // Not shipping levers — they change the image.
-        let abl = std::env::var("FR_ABL").unwrap_or_default();
+        // Dev cost-attribution ablations ride `abl_defs()`, which dxr.rs pastes
+        // too so the two arms stay comparable.
         let defs = format!(
-            "{}\n{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}",
             alpha_defs(scene),
             height_defs(scene),
             trans_defs(scene),
             blas_defs(),
-            if abl.contains("sunt") { "#define ABL_SUNT 1" } else { "" },
-            if abl.contains("rough") { "#define ABL_ROUGH 1" } else { "" }
+            abl_defs()
         );
         let defs = defs.as_str();
         // The session's frustum structure: `#define FTREE` swaps frustum.hlsli's
@@ -3334,7 +3462,15 @@ impl TraceGpu {
         ]
         .join("\n");
         let compose_src = [sd, TRACE_COMMON_HLSLI, CTR_HLSLI, QUEUES_HLSLI, COMPOSE_HLSL].join("\n");
-        let feed_src = [sd, TRACE_COMMON_HLSLI, FSR_WIRE_HLSLI, FEED_HLSL].join("\n");
+        // abl_defs FIRST so a feed ablation is not silently inert. It was:
+        // an `FR_ABL=nopack` probe reported `feed` unchanged and that was read
+        // as "the pack read is free" — but the define never reached this unit,
+        // so the probe compared identical code against itself. The shipping
+        // split then measured feed 0.544 -> 0.231 ms, i.e. the read very much
+        // is not free. An ablation that cannot reach its target is worse than
+        // no ablation, because it answers confidently.
+        let feed_src =
+            [abl_defs().as_str(), sd, TRACE_COMMON_HLSLI, FSR_WIRE_HLSLI, FEED_HLSL].join("\n");
         let pso = |src: &str, entry: &str, what: &str| -> Result<ID3D12PipelineState> {
             compute_pso(device, &root_sig, &dxc.compile(src, entry, "cs_6_5", what, debug)?, what)
         };
@@ -3483,6 +3619,17 @@ impl TraceGpu {
         // dummy and never set FLAG_GBUF (root UAVs have no bounds check).
         let gbuf =
             committed_buffer(device, if gbuf_full { px * GBUF_STRIDE } else { GBUF_STRIDE }, uaf, ua)?;
+        // The guide/signal half. Allocated full-size whenever the pack is
+        // full-size, NOT only when a guide-consuming kind is wired: the kind
+        // arrives after construction (and `--check-gpu` rewires one tracer
+        // across all four), so the buffer must always be able to receive the
+        // stores. FLAG_GBUF_EXT gates the WRITES, which is where the cost is.
+        let gbuf_ext = committed_buffer(
+            device,
+            if gbuf_full { px * GBUF_EXT_STRIDE } else { GBUF_EXT_STRIDE },
+            uaf,
+            ua,
+        )?;
         // NPPD plane buffers at the /32-padded dims (~340 MB at 1080p/quality
         // — the recurrent state dominates, same as the CPU path's staging).
         let nppd_res = match nppd_psos {
@@ -3648,6 +3795,8 @@ impl TraceGpu {
             hemi_cut,
             hdr,
             gbuf,
+            gbuf_ext,
+            force_gbuf_ext: std::cell::Cell::new(false),
             gbuf_full,
             uav_heap,
             tex_table,
@@ -3679,7 +3828,8 @@ impl TraceGpu {
     }
 
     pub fn write_cb(&self, slot: usize, p: &FrameParams) {
-        let mut cb = self.cb_base.with_frame(p, self.gbuf_full, self.fsr_sig());
+        let mut cb =
+            self.cb_base.with_frame(p, self.gbuf_full, self.fsr_sig(), self.gbuf_ext_needed());
         cb.cloud_grid = self.cloud_grid_row(p);
         cb.store(unsafe { self.frame_cb.ptr.add(slot * CB_STRIDE) });
     }
@@ -3697,6 +3847,29 @@ impl TraceGpu {
     /// other engines' frames stay bit-identical).
     fn fsr_sig(&self) -> bool {
         self.feed.iter().any(|(k, _)| matches!(k, FeedKind::FsrRr))
+    }
+
+    /// Whether ANY consumer reads the pack's guide/signal half this frame.
+    /// Same one-subscriber-is-enough shape as `fsr_sig` (and for the same
+    /// `--quinlight` reason), plus NPPD, whose staging kernels read the
+    /// normal and albedo lanes even though its feed kind is XeSS.
+    ///
+    /// XeSS and FSR 3.1 alone answer FALSE, which is the whole win: their
+    /// sessions store 16 B/px instead of 88.
+    fn gbuf_ext_needed(&self) -> bool {
+        self.force_gbuf_ext.get()
+            || self.nppd.is_some()
+            || self.feed.iter().any(|(k, _)| matches!(k, FeedKind::Rr | FeedKind::FsrRr))
+    }
+
+    /// Force the guide/signal half to be stored even with no guide-consuming
+    /// feed wired. For the `--check-gpu`/`--check-dxr` pack gates ONLY: their
+    /// consumer is a CPU READBACK, not a feed kernel, and they trace their
+    /// coverage frames before any `wire_feed` call — so without this the
+    /// normals/albedo they gate would be unwritten. Never set in a session;
+    /// production sessions derive the flag from what is actually wired.
+    pub fn force_gbuf_ext(&self, on: bool) {
+        self.force_gbuf_ext.set(on);
     }
 
     /// Bind the shared root signature + everything every kernel might read.
@@ -3756,6 +3929,10 @@ impl TraceGpu {
                 self.hemi_pts.GetGPUVirtualAddress(),
             );
             list.SetComputeRootUnorderedAccessView(RP_GBUF, self.gbuf.GetGPUVirtualAddress());
+            list.SetComputeRootUnorderedAccessView(
+                RP_GBUF_EXT,
+                self.gbuf_ext.GetGPUVirtualAddress(),
+            );
             if let Some(n) = &self.nppd {
                 list.SetComputeRootUnorderedAccessView(
                     RP_NPPD_FRAME,
@@ -4043,7 +4220,14 @@ impl TraceGpu {
                 // worst case (all of them).
                 self.record_hemi(list, self.rw * self.rh, p.q.fb.depth);
             }
-            self.record_compose(list);
+            // fb OFF: leaf/sky already splatted into accum (see
+            // queues.hlsli::accum_splat), so compose would be a pure
+            // buffer-to-buffer copy. record_terminal_fills' args_to_uav
+            // already ends with a GLOBAL uav barrier, so dropping the
+            // dispatch drops nothing the resolve/feed depended on.
+            if fb_mode > 0 {
+                self.record_compose(list);
+            }
         }
         // The queues now hold this basis's terminal structure — a later
         // bit-equal-basis frame under `p.replay` can re-dispatch it (record_frame
@@ -4158,8 +4342,8 @@ impl TraceGpu {
             self.record_terminal_fills(list, fb_mode);
             if fb_mode > 0 {
                 self.record_hemi(list, self.rw * self.rh, p.q.fb.depth);
+                self.record_compose(list); // see the record_wavefront twin
             }
-            self.record_compose(list);
         }
     }
 

@@ -15,24 +15,76 @@ use rayon::prelude::*;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
 /// Tiles at or below this size stop subdividing and trace per-pixel rays.
-/// Caps quadtree overhead at ~(pixels/64)·4/3 frustum queries per frame.
-pub const LEAF_TILE: usize = 8;
+///
+/// **32, not 8** — measured on THE WORLD (34.4M tris) on an Arc Pro B70 at
+/// native 1080p, `--gpu-timing` medians over ~100 windows of 120 frames:
+/// ```text
+///                        (8, 32)   (32, 256)
+///   at rest (replay)      4.257      3.615     -15.1%   frame span
+///     leaf                2.029      1.668     -17.8%
+///     sky                 0.914      0.664     -27.4%
+///   moving (producing)    5.590      4.383     -21.6%   frame span
+///     level 0..7 -> 0..5  1.372      0.674     -51%
+/// ```
+/// and NEUTRAL on a 4090 (3.883 -> 3.907, inside a 0.25 ms IQR; its frame is
+/// dominated by DLSS-RR at 2.4 ms, so the tracer barely moves the span).
+///
+/// The mechanism is dispatch shape, not the quadtree's product. A coarser
+/// frontier proves LESS space empty — and still wins, because `depth_full`
+/// drops from 8 to 6, halving the ladder, while a ~540-px leaf rect genuinely
+/// feeds `LEAF_GROUP` = 256 lanes where a ~32-px one only idles them. `sky`
+/// gains for the same reason: fewer, larger proven-empty rects amortize
+/// `cs_sky` better. **The two constants MUST move together** — 256 lanes at
+/// the old 8-px frontier measured +21% on the B70 (see trace::LEAF_GROUP).
+///
+/// KNOWN COST, measured not assumed: temporal sky reuse under PURE YAW stops
+/// firing at this frontier (a tile's query region is 4x wider per axis, so it
+/// far less often lies wholly inside the old sky region). Static sky reuse is
+/// unaffected. `--check` therefore pins the temporal family at `TEMPORAL_TILE`
+/// — see `set_leaf_tile`.
+pub const LEAF_TILE: usize = 32;
+
+/// The frontier the temporal algorithm's structural must-fires are written
+/// against. `--check` pins the temporal family here so those gates keep their
+/// teeth at the frontier they were tuned for, while the rest of the suite runs
+/// the shipping `LEAF_TILE`. Gating the algorithm and gating the shipping
+/// config are two different jobs; conflating them would either weaken the
+/// must-fires or freeze the constant.
+pub const TEMPORAL_TILE: usize = 8;
+
+static LEAF_TILE_N: AtomicU32 = AtomicU32::new(0);
+
+/// Set the quadtree's leaf-rect cutoff (0 = "not yet resolved", which makes the
+/// first `leaf_tile()` read FR_LEAF / the default).
+///
+/// An atomic rather than a `OnceLock` — the `texture::set_aniso` /
+/// `dxr::set_inline_mode` knob idiom — because `--check` legitimately needs to
+/// re-pin it between passes. Everything that consumes the frontier derives it
+/// per call (`depth_full`, the temporal cell tree, the injected
+/// `#define LEAF_TILE`), so a re-pin between passes is coherent; do NOT move
+/// it while a tracer built against an injected value is live.
+pub fn set_leaf_tile(n: usize) {
+    LEAF_TILE_N.store(n as u32, Relaxed);
+}
 
 /// R&D lever (FR_LEAF, default LEAF_TILE): the quadtree's leaf-rect cutoff, so
 /// the subdivision depth can be swept without a rebuild. Smaller = narrower
 /// leaf frustums (deeper distance penetration, more tiles provable as sky) at
 /// 4x the tiles per level down and 1/4 the pixels to amortize each tile's
-/// bound-query + refine_cut over. Read once; the GPU gets the same number as an
-/// injected `#define LEAF_TILE` so both intersectors agree on the frontier.
+/// bound-query + refine_cut over. The GPU gets the same number as an injected
+/// `#define LEAF_TILE` so both intersectors agree on the frontier.
 pub fn leaf_tile() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("FR_LEAF")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|n| n.is_power_of_two() && *n >= 1 && *n <= 64)
-            .unwrap_or(LEAF_TILE)
-    })
+    let n = LEAF_TILE_N.load(Relaxed);
+    if n != 0 {
+        return n as usize;
+    }
+    let v = std::env::var("FR_LEAF")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| n.is_power_of_two() && *n >= 1 && *n <= 64)
+        .unwrap_or(LEAF_TILE);
+    LEAF_TILE_N.store(v as u32, Relaxed);
+    v
 }
 /// Tiles larger than this spawn their quadrants as rayon tasks; smaller ones
 /// recurse sequentially (task granularity, not correctness).

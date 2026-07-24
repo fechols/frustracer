@@ -54,6 +54,11 @@ struct Acc {
     max_ms: f64,
     calls: u64,
     frames: u64,
+    /// `sum_ms` as of the last printed table — the windowed column's baseline.
+    /// See `Timer::last_frames` for why the window exists at all.
+    last_sum_ms: f64,
+    /// `max_ms` within the current window, reset at every report.
+    win_max_ms: f64,
 }
 
 struct Timer {
@@ -74,6 +79,22 @@ struct Timer {
     stats: Vec<(String, Acc)>,
     /// Frames whose timings we have actually collected.
     frames: u64,
+    /// `frames` as of the last printed table. Two jobs: it is the windowed
+    /// column's baseline, and comparing against it is what schedules the next
+    /// report (which is why there is no "bump frames so we don't re-report"
+    /// hack — that hack cost the window one frame in every REPORT_EVERY).
+    ///
+    /// THE WINDOW IS THE POINT. The cumulative mean divides by every frame
+    /// since the first, so on Intel it permanently carries the async-compile
+    /// fallback: a fresh DXIL variant runs ~4.7x on the span (~7.6x on the
+    /// leaf kernel) for the 5-8 s before the driver's background recompile
+    /// lands, which at ~190 fps is 1200-1500 frames — +80% over a 6k-frame
+    /// run, +7% over 30k, and UNEVEN per region, so it distorts the shape and
+    /// not just the total. A per-window column makes each table an independent
+    /// sample (median + IQR across ~90 of them per minute) and makes the
+    /// fallback self-diagnosing: it reads as a step down to a flat floor
+    /// rather than a slow drift no single number can reveal.
+    last_frames: u64,
     /// Dropped because a frame blew MAX_TS — reported, never silent.
     dropped: u64,
 }
@@ -117,6 +138,7 @@ impl Timer {
             pending: Default::default(),
             stats: Vec::new(),
             frames: 0,
+            last_frames: 0,
             dropped: 0,
         })
     }
@@ -168,6 +190,7 @@ impl Timer {
             Some((_, a)) => {
                 a.sum_ms += ms;
                 a.max_ms = a.max_ms.max(ms);
+                a.win_max_ms = a.win_max_ms.max(ms);
                 a.calls += 1;
                 a.frames += 1;
             }
@@ -175,35 +198,68 @@ impl Timer {
                 let order = self.stats.len();
                 self.stats.push((
                     name.to_string(),
-                    Acc { order, depth, sum_ms: ms, max_ms: ms, calls: 1, frames: 1 },
+                    Acc {
+                        order,
+                        depth,
+                        sum_ms: ms,
+                        max_ms: ms,
+                        calls: 1,
+                        frames: 1,
+                        last_sum_ms: 0.0,
+                        win_max_ms: ms,
+                    },
                 ));
             }
         }
     }
 
-    fn report(&self) {
+    /// Print the table and roll the window forward. `&mut` because the window
+    /// baselines are snapshotted here — reporting IS what closes a window.
+    ///
+    /// Both columns divide by the FRAME count (not the region's own call
+    /// count), so a region that fires on only some frames reads as its share
+    /// of the frame, and the children of a bracket still sum toward it. That
+    /// also means a region which stops firing — `wavefront` once structure
+    /// replay takes over — correctly windows to 0.000 while its cumulative
+    /// column keeps the history.
+    fn report(&mut self) {
         if self.frames == 0 {
             return;
         }
-        eprintln!("\ngputime: per-region GPU ms, mean over {} frames", self.frames);
-        eprintln!("  {:<28} {:>9} {:>9} {:>9}", "region", "ms/frame", "max ms", "calls/f");
-        let mut rows: Vec<&(String, Acc)> = self.stats.iter().collect();
-        rows.sort_by_key(|(_, a)| a.order);
-        for (name, a) in rows {
+        let win_frames = self.frames.saturating_sub(self.last_frames);
+        eprintln!(
+            "\ngputime: per-region GPU ms | win = last {} frames, mean = all {} frames",
+            win_frames.max(1),
+            self.frames
+        );
+        eprintln!(
+            "  {:<28} {:>9} {:>9} {:>9} {:>9} {:>9}",
+            "region", "win ms", "win max", "mean ms", "max ms", "calls/f"
+        );
+        let mut idx: Vec<usize> = (0..self.stats.len()).collect();
+        idx.sort_by_key(|&i| self.stats[i].1.order);
+        let wf = win_frames.max(1) as f64;
+        for &i in &idx {
+            let (name, a) = &self.stats[i];
             let indent = "  ".repeat(a.depth as usize);
-            let per_frame = a.sum_ms / self.frames as f64;
-            let calls_per_frame = a.calls as f64 / self.frames as f64;
             eprintln!(
-                "  {:<28} {:>9.3} {:>9.3} {:>9.1}",
+                "  {:<28} {:>9.3} {:>9.3} {:>9.3} {:>9.3} {:>9.1}",
                 format!("{indent}{name}"),
-                per_frame,
+                (a.sum_ms - a.last_sum_ms) / wf,
+                a.win_max_ms,
+                a.sum_ms / self.frames as f64,
                 a.max_ms,
-                calls_per_frame
+                a.calls as f64 / self.frames as f64
             );
         }
         if self.dropped > 0 {
             eprintln!("  (dropped {} regions over MAX_TS={MAX_TS})", self.dropped);
         }
+        for (_, a) in self.stats.iter_mut() {
+            a.last_sum_ms = a.sum_ms;
+            a.win_max_ms = 0.0;
+        }
+        self.last_frames = self.frames;
     }
 }
 
@@ -229,6 +285,7 @@ pub fn take_regions() -> Vec<(String, u32, f64)> {
     let mut rows: Vec<(String, Acc)> = std::mem::take(&mut t.stats);
     rows.sort_by_key(|(_, a)| a.order);
     t.frames = 0;
+    t.last_frames = 0;
     t.pending = Default::default();
     rows.into_iter().map(|(n, a)| (n, a.depth, a.sum_ms / frames)).collect()
 }
@@ -253,9 +310,11 @@ pub fn begin_frame(device: &ID3D12Device, queue: &ID3D12CommandQueue, slot: usiz
     }
     let t = guard.as_mut().unwrap();
     t.collect(slot);
-    if t.frames > 0 && t.frames % REPORT_EVERY == 0 {
+    // Scheduled off the last report's frame count, not off a modulus: `report`
+    // closes the window, so this can never fire twice on one count and every
+    // window is exactly REPORT_EVERY collected frames wide.
+    if t.frames >= t.last_frames + REPORT_EVERY {
         t.report();
-        t.frames += 1; // don't re-report the same frame count next slot
     }
     t.regions = Vec::new();
     t.used = 0;
@@ -289,12 +348,14 @@ pub fn resolve(list: &ID3D12GraphicsCommandList, slot: usize) {
     t.pending[slot] = Some(regions);
 }
 
-/// Print the final table (session exit).
+/// Print the final table (session exit). The window it closes is the tail
+/// since the last periodic report, so a session killed on a timer still banks
+/// every completed window — losing at most the partial tail.
 pub fn report() {
     if !on() {
         return;
     }
-    if let Some(t) = TIMER.lock().unwrap().as_ref() {
+    if let Some(t) = TIMER.lock().unwrap().as_mut() {
         t.report();
     }
 }

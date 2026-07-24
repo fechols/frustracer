@@ -35,7 +35,7 @@
                                // memory safety, not an optimization)
 #define FLAG_HAS_PREV     32u  // the prev_* rows carry last frame's camera basis
 #define FLAG_FSR_SIG      64u  // FSR-RR sessions: demodulated direct-light
-                               // signals in GBufPx.sig + the prev-camera
+                               // signals in GBufExt.sig + the prev-camera
                                // view-Z in mv.z (zeros otherwise — RR/XeSS
                                // sessions keep their pack bytes unchanged)
 #define FLAG_ANISO        128u // anisotropic filtering on (--aniso > 1; a
@@ -51,6 +51,10 @@
                                // bit is the per-frame runtime gate — the
                                // LEAF_NO_FB pattern)
 #define FLAG_FIREFLIES   1024u // firefly point lights live this frame
+#define FLAG_GBUF_EXT    4096u // store the pack's guide/signal half (gbuf_ext):
+                               // a wired RR/FSR-RR feed, or NPPD. XeSS/FSR 3.1
+                               // read only the core, so their sessions skip
+                               // 72 of the old 88 B/px. Implied by FSR_SIG.
 #define FLAG_DEPTH_TINT  2048u // Beer–Lambert over transmission-chain
                                // interior segments (--no-depth-tint clears;
                                // the branch lives inside the transmission
@@ -1100,23 +1104,59 @@ struct PrimSurf {
 // dlss::GBufs re-hosted as one interleaved plane; the feed kernels fan it out
 // into the upscalers' input textures. 88 B/px (GBUF_STRIDE in trace.rs —
 // keep in lockstep).
-struct GBufPx {
+// THE PACK IS SPLIT BY CONSUMER, and the split is a bandwidth decision made on
+// measurements (Arc Pro B70, THE WORLD, 1080p, --gpu-timing medians):
+//
+//   leaf 1.486 ms baseline | 1.075 with the pack store ablated out  => the
+//   88 B/px store costs 0.411 ms, 12% of the frame, and it is ALL store: a
+//   probe that wrote the same 88 B of CONSTANTS measured 1.515, i.e. the
+//   pack's arithmetic (project_prev, the F0 lerp) is free. 182 MB / 0.411 ms
+//   = 443 GB/s — saturated.
+//
+// An XeSS or FSR 3.1 session consumes 12 of those 88 bytes (feed.hlsl's
+// cs_feed_xess reads mv.xy and view_z, nothing else), so the rest is pure
+// waste there — including 24 B/px of literal zeros for sig/sig2 whenever
+// FLAG_FSR_SIG is off.
+//
+// TWO BUFFERS, NOT ONE STRUCT WITH SKIPPED MEMBERS. Storing a single 16-byte
+// member of the old 88-byte record measured **1.791 ms — WORSE than writing
+// the whole thing** (a 16 B store at offset 48 of an 88 B stride is an
+// unaligned scatter). A separate 16 B/px buffer is contiguous and coalesced;
+// that is why this is a split and not a mask. Do not "simplify" it back.
+//
+// The READ side is deliberately NOT optimized: ablating the pack load out of
+// cs_feed_xess entirely moved `feed` by +0.003 ms (0.544 -> 0.547), because
+// that kernel's one load is fully hidden by its occupancy. Reads are free;
+// only stores cost.
+
+// Core — 16 B/px, stored by EVERY upscaler session. `view_z` and `prev_z`
+// stay f32: they carry bit-equality contracts (gate_rr_feed's depth plane,
+// gate_fsr_rr_feed's depth_lin, sky depth == far bit-equal, and the sky
+// prev-Z delta that must be exactly 0).
+struct GBufCore {
+    float4 core;  // xy = motion vector in render-res pixels (y-down, current ->
+                  // previous); z = view_z = t*dot(dir, forward); w = prev-camera
+                  // linear view-Z of the SAME hit point (FLAG_FSR_SIG — the
+                  // denoiser MV's B channel differences it against .z; sky
+                  // stores CAM_FAR so the delta is 0), else 0.
+};
+RWStructuredBuffer<GBufCore> gbuf : register(u15);
+
+// Ext — 72 B/px, stored ONLY under FLAG_GBUF_EXT (a wired RR/FSR-RR feed, or
+// GPU-resident NPPD). Every field keeps its old name, type and precision.
+struct GBufExt {
     float4 nr;    // normal.xyz, roughness
-    float4 alb_z; // diff_alb.xyz = albedo*(1-metallic), view_z = t*dot(dir, forward)
+    float4 alb;   // diff_alb.xyz = albedo*(1-metallic); w unused (view_z moved
+                  // to core.z — this is the ONE field that changed home)
     float4 spec;  // spec_alb.xyz = lerp(0.04, albedo, metallic) (RGB F0), spec_hit_t
                   // (also the INDIRECT_SPECULAR signal's ray-hit-distance channel)
-    float4 mv;    // xy = motion vector in render-res pixels (y-down, current ->
-                  // previous); z = prev-camera linear view-Z of the SAME hit
-                  // point (FLAG_FSR_SIG — the denoiser MV's B channel differences
-                  // it against alb_z.w; sky stores CAM_FAR so the delta is 0);
-                  // else 0. w = 0.
     uint4 sig;    // f16x2 packs (dd.x|dd.y, dd.z|ds.x, ds.y|ds.z, 0) of the
                   // DEMODULATED FSR-RR signals — fsr::split_signals' twin,
                   // f16 IS the wire precision. FLAG_FSR_SIG; else 0.
     uint2 sig2;   // the other two FSR-RR signals, same f16x2 packing:
                   // (ao|is.x, is.y|is.z). FLAG_FSR_SIG; else 0.
 };
-RWStructuredBuffer<GBufPx> gbuf : register(u15);
+RWStructuredBuffer<GBufExt> gbuf_ext : register(u32);
 
 // f32 -> f16 bits with round-to-nearest-even — NOT the f32tof16 intrinsic
 // (the legacy DXIL op truncates). The CPU twin is half::f16::from_f32;
@@ -1189,22 +1229,36 @@ float2 gbuf_mv(float3 d, float fx, float fy) {
 // point lies on the jittered ray).
 void gbuf_write_hit(uint pi, float fx, float fy, float3 dir, float t, PrimSurf ps) {
     if ((flags & FLAG_GBUF) == 0u) return;
-    GBufPx g;
+#ifdef ABL_NOGBUF
+    return; // cost probe: price the pack store out of leaf/sky (see abl_defs)
+#endif
+    float view_z = t * dot(dir, cam_forward.xyz);
+    float3 hit_rel = cam_origin.xyz + dir * t - prev_origin.xyz;
+    // render.rs's fsr_buf fill: prev-camera linear view-Z of the SAME hit
+    // point (no prev camera degrades to "no depth motion"). FSR-RR only, so
+    // every other wiring stores 0 here exactly as the pre-split pack did.
+    float prev_z = (flags & FLAG_FSR_SIG)
+        ? ((flags & FLAG_HAS_PREV) ? dot(hit_rel, prev_forward.xyz) : view_z)
+        : 0.0;
+    GBufCore c;
+    c.core = float4(gbuf_mv(hit_rel, fx, fy), view_z, prev_z);
+    gbuf[pi] = c;
+    // Below here is guide/signal data that only an RR/FSR-RR feed or NPPD
+    // reads. Skipping the store is the entire point of the split — it is
+    // 72 of the old 88 B/px, measured at 0.34 ms on the world.
+    if ((flags & FLAG_GBUF_EXT) == 0u) return;
+
+    GBufExt g;
     g.nr = float4(ps.n, ps.rough);
-    g.alb_z = float4(ps.albedo * (1.0 - ps.metallic), t * dot(dir, cam_forward.xyz));
+    g.alb = float4(ps.albedo * (1.0 - ps.metallic), 0.0);
     float3 spec_alb = lerp(float3(0.04, 0.04, 0.04), ps.albedo, ps.metallic);
     g.spec = float4(spec_alb, isinf(ps.spec_t) ? CAM_FAR : ps.spec_t);
-    float3 hit_rel = cam_origin.xyz + dir * t - prev_origin.xyz;
-    g.mv = float4(gbuf_mv(hit_rel, fx, fy), 0.0, 0.0);
     g.sig = uint4(0u, 0u, 0u, 0u);
     g.sig2 = uint2(0u, 0u);
     if (flags & FLAG_FSR_SIG) {
-        // render.rs's fsr_buf fill: prev-camera linear view-Z of the SAME
-        // hit point (no prev camera degrades to "no depth motion"); the
-        // demodulation divides direct_s / ind_s by the un-floored WIRE F0 —
-        // fsr::split_signals with sqrt_wire in place of albedo_wire (the
+        // The demodulation divides direct_s / ind_s by the un-floored WIRE F0
+        // — fsr::split_signals with sqrt_wire in place of albedo_wire (the
         // pack stores f32; the wire quantization happens exactly once).
-        g.mv.z = (flags & FLAG_HAS_PREV) ? dot(hit_rel, prev_forward.xyz) : g.alb_z.w;
         float3 sf0w = sqrt_wire3(spec_alb);
         float3 f0_floor = max(sf0w, float3(1e-4, 1e-4, 1e-4));
         float3 dd = ps.direct_d;
@@ -1213,7 +1267,7 @@ void gbuf_write_hit(uint pi, float fx, float fy, float3 dir, float t, PrimSurf p
         g.sig = uint4(pack_h2(dd.x, dd.y), pack_h2(dd.z, ds.x), pack_h2(ds.y, ds.z), 0u);
         g.sig2 = uint2(pack_h2(ps.ao, is.x), pack_h2(is.y, is.z));
     }
-    gbuf[pi] = g;
+    gbuf_ext[pi] = g;
 }
 
 // render.rs::write_gbuf_sky: depth = far (finite, f16-safe); MV = direction-
@@ -1222,17 +1276,24 @@ void gbuf_write_hit(uint pi, float fx, float fy, float3 dir, float t, PrimSurf p
 // the depth delta is exactly 0 — the sky contract --check-fsr pins.
 void gbuf_write_sky(uint pi, float fx, float fy, float3 dir) {
     if ((flags & FLAG_GBUF) == 0u) return;
-    GBufPx g;
+#ifdef ABL_NOGBUF
+    return; // cost probe — see gbuf_write_hit
+#endif
+    GBufCore c;
+    // prev-Z = far under FSR-RR so `prev_z - view_z` is exactly 0; else 0, as
+    // before the split.
+    c.core = float4(gbuf_mv(dir, fx, fy), CAM_FAR,
+                    (flags & FLAG_FSR_SIG) ? CAM_FAR : 0.0);
+    gbuf[pi] = c;
+    if ((flags & FLAG_GBUF_EXT) == 0u) return;
+
+    GBufExt g;
     g.nr = float4(-dir, 1.0);
-    g.alb_z = float4(1.0, 1.0, 1.0, CAM_FAR);
+    g.alb = float4(1.0, 1.0, 1.0, 0.0);
     g.spec = float4(0.0, 0.0, 0.0, 0.0);
-    g.mv = float4(gbuf_mv(dir, fx, fy), 0.0, 0.0);
     g.sig = uint4(0u, 0u, 0u, 0u);
     g.sig2 = uint2(0u, 0u);
-    if (flags & FLAG_FSR_SIG) {
-        g.mv.z = CAM_FAR;
-    }
-    gbuf[pi] = g;
+    gbuf_ext[pi] = g;
 }
 
 // sh.rs::Sh9::irradiance — cosine-weighted sky irradiance at `n`, DIVIDED BY PI

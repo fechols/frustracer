@@ -55,9 +55,10 @@ void cs_nppd_pack(uint3 id : SV_DispatchThreadID) {
     uint si = sy * rw + sx;
     uint pp = pw * ph;
     uint o = id.y * pw + id.x;
-    GBufPx g = gbuf[si];
+    GBufCore c = gbuf[si];
+    GBufExt g = gbuf_ext[si]; // NPPD sets FLAG_GBUF_EXT, so ext is written
 
-    float view_z = g.alb_z.w;
+    float view_z = c.core.z;
     float d0 = 0.0;
     if (view_z < CAM_FAR * 0.99) {
         float3 dir = ray_dir(float(sx) + 0.5, float(sy) + 0.5);
@@ -77,9 +78,9 @@ void cs_nppd_pack(uint3 id : SV_DispatchThreadID) {
     nppd_frame[o + 2u * pp] = dot(n, r);
     nppd_frame[o + 3u * pp] = dot(n, u);
 
-    nppd_frame[o + 4u * pp] = q16(g.alb_z.x);
-    nppd_frame[o + 5u * pp] = q16(g.alb_z.y);
-    nppd_frame[o + 6u * pp] = q16(g.alb_z.z);
+    nppd_frame[o + 4u * pp] = q16(g.alb.x);
+    nppd_frame[o + 5u * pp] = q16(g.alb.y);
+    nppd_frame[o + 6u * pp] = q16(g.alb.z);
 
     uint i3 = si * 3u;
     nppd_frame[o + 7u * pp] = accum[i3];
@@ -88,7 +89,7 @@ void cs_nppd_pack(uint3 id : SV_DispatchThreadID) {
 }
 
 // nppd::warp_temporal: backward-warp state -> warped through this frame's
-// motion vectors (MV_SIGN = (1,1): GBufPx.mv IS the fetch offset), bilinear
+// motion vectors (MV_SIGN = (1,1): GBufCore.core.xy IS the fetch offset), bilinear
 // with grid_sample-style ZEROS padding outside the logical rw x rh interior;
 // the padded border writes 0 (a stale buffer never leaks). Tap order and
 // weight formulas mirror the CPU loop exactly.
@@ -102,10 +103,10 @@ void cs_nppd_warp(uint3 id : SV_DispatchThreadID) {
         for (uint c = 0u; c < NPPD_CT; c++) nppd_warped[o + c * pp] = 0.0;
         return;
     }
-    GBufPx g = gbuf[id.y * rw + id.x];
+    GBufCore g = gbuf[id.y * rw + id.x];
     // q16: warp_temporal fetches the offset through ld16 (f16 mvec plane).
-    float px = float(id.x) + q16(g.mv.x);
-    float py = float(id.y) + q16(g.mv.y);
+    float px = float(id.x) + q16(g.core.x);
+    float py = float(id.y) + q16(g.core.y);
     float x0f = floor(px), y0f = floor(py);
     float fx = px - x0f, fy = py - y0f;
     int x0 = int(x0f), y0 = int(y0f);

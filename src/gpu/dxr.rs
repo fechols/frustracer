@@ -23,7 +23,7 @@
 use super::d3d12::{self, committed_buffer, transition, uav_barrier, Result};
 use super::dxc::Dxc;
 use super::trace::{
-    self, FrameCb, FrameParams, SceneGpu, CB_STRIDE, RP_FRAME_CBV, RP_GBUF, RP_PUSH,
+    self, FrameCb, FrameParams, SceneGpu, CB_STRIDE, RP_FRAME_CBV, RP_GBUF, RP_GBUF_EXT, RP_PUSH,
     RP_SCENE_TEX, RP_SRV0, RP_TEX, RP_UAV0, SRV_INDICES, SRV_MATERIALS, SRV_NORMALS,
     SRV_POSITIONS, SRV_TLAS, SRV_TRI_MAT, TEX_HEAP_BASE, TEX_TABLE_BUFS, UAV_ACCUM, UAV_INFO,
     UAV_QIN, UAV_QOUT, UAV_TBUF,
@@ -133,12 +133,19 @@ pub struct DxrGpu {
     pub accum: ID3D12Resource,
     pub tbuf: ID3D12Resource,
     pub info: ID3D12Resource,
-    /// The G-buffer pack at RP_GBUF: 64 B/px `GBufPx` when the session
-    /// composes with an upscaler (`gbuf_full`), a 64-byte dummy otherwise —
-    /// FLAG_GBUF is clear then, but root-descriptor UAVs have no bounds
-    /// check, so the plain-mode dummy is memory safety, not an optimization
-    /// (the trace.rs precedent).
+    /// The G-buffer pack's CORE half at RP_GBUF: `GBufCore`, 16 B/px when the
+    /// session composes with an upscaler (`gbuf_full`), a stride-sized dummy
+    /// otherwise — FLAG_GBUF is clear then, but root-descriptor UAVs have no
+    /// bounds check, so the plain-mode dummy is memory safety, not an
+    /// optimization (the trace.rs precedent).
     pub gbuf: ID3D12Resource,
+    /// The pack's guide/signal half at RP_GBUF_EXT (`GBufExt`, 72 B/px),
+    /// written only under FLAG_GBUF_EXT. Same allocation rule as `gbuf`.
+    pub gbuf_ext: ID3D12Resource,
+    /// Test hook — the twin of `TraceGpu::force_gbuf_ext`; see it for why the
+    /// pack gates need it (their consumer is a CPU readback, and they trace
+    /// before any feed is wired).
+    force_gbuf_ext: std::cell::Cell<bool>,
     gbuf_full: bool,
     /// RGBA16F resolve target; rests in PIXEL_SHADER_RESOURCE between frames
     /// (the tonemap PS reads it via SRV_SLOT_DXR).
@@ -219,18 +226,22 @@ impl DxrGpu {
         // shaders + non-opaque ray flags in (trace.rs::alpha_defs /
         // height_defs — the same per-scene predicates that drop OPAQUE from
         // the BLAS); scenes with neither compile verbatim.
-        let non_opaque = scene.any_alpha
-            || (scene.any_height && crate::bvh::height_armed())
-            || scene.any_transmissive;
+        // Derived from the three per-scene predicates rather than re-deriving
+        // `scene.any_*`, so this arm's AS flag and its any-hit shaders are one
+        // decision — and an FR_ABL neutralization moves both together.
+        let non_opaque = trace::non_opaque(scene);
         // The cbuffer's --spp jitter-table size, injected like alpha_defs.
         let sd = trace::spp_defs();
         let sd = sd.as_str();
         let defs = format!(
-            "{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}",
             trace::alpha_defs(scene),
             trace::height_defs(scene),
             trace::trans_defs(scene),
-            trace::blas_defs()
+            trace::blas_defs(),
+            // FR_ABL, shared with the wavefront — without it every cloud cost
+            // attribution was wavefront-only and silently incomparable here.
+            trace::abl_defs()
         );
         // The cloud shading caches, snapshotted at construction like TraceGpu:
         // the library is compiled against these, the buffers sized against them,
@@ -472,6 +483,12 @@ impl DxrGpu {
             uaf,
             ua,
         )?;
+        let gbuf_ext = committed_buffer(
+            device,
+            if gbuf_full { px * trace::GBUF_EXT_STRIDE } else { trace::GBUF_EXT_STRIDE },
+            uaf,
+            ua,
+        )?;
         let hdr = d3d12::committed_tex(
             device,
             rw,
@@ -526,6 +543,7 @@ impl DxrGpu {
         name(&info, "dxr.info");
         name(&hdr, "dxr.hdr");
         name(&gbuf, if gbuf_full { "dxr.gbuf" } else { "dxr.gbuf_dummy" });
+        name(&gbuf_ext, if gbuf_full { "dxr.gbuf_ext" } else { "dxr.gbuf_ext_dummy" });
 
         name(&cloud_lod, "dxr.cloud_lod");
         name(&cloud_shadow, "dxr.cloud_shadow");
@@ -547,6 +565,8 @@ impl DxrGpu {
             tbuf,
             info,
             gbuf,
+            gbuf_ext,
+            force_gbuf_ext: std::cell::Cell::new(false),
             gbuf_full,
             hdr,
             uav_heap,
@@ -563,11 +583,24 @@ impl DxrGpu {
         })
     }
 
+    /// See `TraceGpu::force_gbuf_ext` — gates only.
+    pub fn force_gbuf_ext(&self, on: bool) {
+        self.force_gbuf_ext.set(on);
+    }
+
     pub fn write_cb(&self, slot: usize, p: &FrameParams) {
         // One FSR4-RR subscriber among the wired engines is enough to arm the
         // pack's signal lanes (--quinlight can wire several).
         let fsr_sig = self.feed.iter().any(|(k, _)| matches!(k, trace::FeedKind::FsrRr));
-        let mut cb = self.cb_base.with_frame(p, self.gbuf_full, fsr_sig);
+        // ...and one RR/FSR-RR subscriber is enough to require the pack's
+        // guide/signal half. DXR has no NPPD arm, so unlike TraceGpu's
+        // `gbuf_ext_needed` there is no nppd term here.
+        let gbuf_ext = self.force_gbuf_ext.get()
+            || self
+                .feed
+                .iter()
+                .any(|(k, _)| matches!(k, trace::FeedKind::Rr | trace::FeedKind::FsrRr));
+        let mut cb = self.cb_base.with_frame(p, self.gbuf_full, fsr_sig, gbuf_ext);
         // The per-frame slab-space shadow grid (the shared shadow_grid_row —
         // one source of truth with TraceGpu); zero when the cache is off or
         // clouds are disabled (cloud_sun_transmittance then takes its exact arm).
@@ -669,6 +702,10 @@ impl DxrGpu {
                 self.info.GetGPUVirtualAddress(),
             );
             list.SetComputeRootUnorderedAccessView(RP_GBUF, self.gbuf.GetGPUVirtualAddress());
+            list.SetComputeRootUnorderedAccessView(
+                RP_GBUF_EXT,
+                self.gbuf_ext.GetGPUVirtualAddress(),
+            );
             let s = &self.scene;
             list.SetComputeRootShaderResourceView(
                 RP_SRV0 + SRV_POSITIONS,
@@ -763,7 +800,16 @@ impl DxrGpu {
                 Height: self.rh,
                 Depth: 1,
             };
-            list4.DispatchRays(&desc);
+            // The ray dispatch alone. Without this bracket `dxr` conflates it
+            // with bind_common + SetPipelineState1 (a real cost on Arc), and
+            // the decision this instrument exists for — optimize the wavefront
+            // or flip the Intel world default to DXR — turns on whether the
+            // DXR arm's time is rays or setup. The residual
+            // `dxr - dxr-rays - the two cache fills` is now exactly that setup.
+            {
+                let _e = super::pix::scope(list, c"dxr-rays");
+                list4.DispatchRays(&desc);
+            }
             list.ResourceBarrier(&[uav_barrier(None)]);
         }
         Ok(())
