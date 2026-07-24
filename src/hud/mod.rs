@@ -13,8 +13,11 @@
 //! dirty region, whose rectangles come back from `render()`; a frame where
 //! nothing changed returns from `draw_if_needed` without rendering at all —
 //! zero raster, zero bytes packed, zero upload. `Hud::frame` additionally
-//! quantizes its inputs (whole degrees, whole minutes) so property churn
-//! only happens on visibly-different values.
+//! quantizes its inputs (whole degrees, whole minutes, the SPACE/F-only
+//! render-mode string, 125 ms frame-time buckets) so property churn only
+//! happens on visibly-different values — and the FPS graph's Slint writes
+//! gate on the hud-live fade besides, so a FADED graph freezes (the ring
+//! keeps sampling Rust-side) and a settled HUD still uploads nothing.
 //!
 //! Lifetime: one `Hud` per PROCESS, owned by `run_window` beside `fly` — it
 //! survives session re-entries (resize/F11), so menu/HUD state needs no
@@ -42,6 +45,13 @@ const HELP_LINGER: std::time::Duration = std::time::Duration::from_millis(2500);
 /// activity and fade when both go idle. Longer than HELP_LINGER — heading
 /// and hour are exactly what you glance at just AFTER stopping.
 const HUD_LINGER: std::time::Duration = std::time::Duration::from_millis(4000);
+
+/// FPS graph: `GRAPH_BARS` buckets of `GRAPH_TICK` each — a 5 s window. Bars
+/// carry bucket-average FPS on the markup's fixed 0..120 scale, so the 60-fps
+/// reference line sits statically at mid-strip and a spike clamps instead of
+/// rescaling the whole history (auto-range would churn a static element).
+const GRAPH_BARS: usize = 40;
+const GRAPH_TICK: std::time::Duration = std::time::Duration::from_millis(125);
 
 /// One changed region of the HUD buffer, in pixels.
 #[derive(Clone, Copy, Debug)]
@@ -133,6 +143,20 @@ pub struct Hud {
     last_help: bool,
     last_hud_on: bool,
     last_hud_live: bool,
+    /// Render-mode label last pushed ("" so the first frame sets it).
+    last_mode: &'static str,
+    /// FPS graph: ring of bucket-average FPS (oldest first), the open
+    /// bucket's accumulators, and the persistent VecModel whose rows mirror
+    /// `hist` while the HUD is live (`push_graph_rows`). The ring samples
+    /// even while faded — only the Slint writes gate on hud_live — so a
+    /// woken graph shows live recent history, not a stale pre-fade picture.
+    hist: [f32; GRAPH_BARS],
+    acc_sum: f32,
+    acc_n: u32,
+    last_bucket: Option<Instant>,
+    graph: Rc<slint::VecModel<f32>>,
+    last_fps_txt: String,
+    last_ms_txt: String,
     /// Last time the camera was moving (drives the keymap panel's fade).
     last_move: Option<Instant>,
     /// Last camera OR time-of-day activity (drives the compass/clock fade).
@@ -195,6 +219,11 @@ impl Hud {
         ui.set_groups(slint::ModelRc::new(slint::VecModel::from(
             crate::settings::GROUPS.iter().map(|g| slint::SharedString::from(*g)).collect::<Vec<_>>(),
         )));
+        // The graph model is created ONCE and updated via set_row_data —
+        // re-setting a fresh ModelRc per tick would tear down and rebuild
+        // all GRAPH_BARS for-items instead of dirtying their properties.
+        let graph = Rc::new(slint::VecModel::from(vec![0.0f32; GRAPH_BARS]));
+        ui.set_fps_bars(slint::ModelRc::from(graph.clone()));
         Ok(Self {
             ui,
             window,
@@ -208,6 +237,14 @@ impl Hud {
             last_help: false,
             last_hud_on: !visible, // != visible so the first frame sets it
             last_hud_live: true,   // the markup default; first frame reconciles
+            last_mode: "",
+            hist: [0.0; GRAPH_BARS],
+            acc_sum: 0.0,
+            acc_n: 0,
+            last_bucket: None,
+            graph,
+            last_fps_txt: String::new(),
+            last_ms_txt: String::new(),
             last_move: None,
             last_active: Some(Instant::now()), // show once at boot, then fade
             menu_open: false,
@@ -326,17 +363,49 @@ impl Hud {
         self.force_full = true;
     }
 
+    /// Mirror the FPS ring + readouts into the Slint properties, per row and
+    /// guarded by value, so an unchanged row/string dirties nothing (the
+    /// wake resync would otherwise repaint a frozen graph for free).
+    fn push_graph_rows(&mut self) {
+        use slint::Model;
+        for (i, v) in self.hist.iter().enumerate() {
+            if self.graph.row_data(i) != Some(*v) {
+                self.graph.set_row_data(i, *v);
+            }
+        }
+        let fps = self.hist[GRAPH_BARS - 1];
+        let (fps_txt, ms_txt) = if fps > 0.0 {
+            (format!("{:.0}", fps.min(999.0)), format!("{:.1} ms", 1000.0 / fps))
+        } else {
+            ("--".to_string(), String::new())
+        };
+        if fps_txt != self.last_fps_txt {
+            self.ui.set_fps_now(fps_txt.as_str().into());
+            self.last_fps_txt = fps_txt;
+        }
+        if ms_txt != self.last_ms_txt {
+            self.ui.set_ms_now(ms_txt.as_str().into());
+            self.last_ms_txt = ms_txt;
+        }
+    }
+
     /// Once per frame: feed the pose/clock/motion state, tick Slint's
     /// timers/animations, render if anything is dirty, and return the changed
     /// rects + their pixels (None = nothing changed, upload nothing).
     /// `tod_moved` = the clock changed this frame (scrub / attractors / menu)
-    /// — it wakes the compass+clock fade like camera motion does.
+    /// — it wakes the compass+clock fade like camera motion does. `mode` is
+    /// the render-mode label ("CPU" | "GPU" | "DXR"), quantized by nature
+    /// (SPACE/F only) and a WAKE source like motion; `last_ms` is the
+    /// PREVIOUS frame's render wall-clock ms (`<= 0.0` before the first
+    /// present — skipped, never a fake bar).
     pub fn frame(
         &mut self,
         cam: &Camera,
         tod: f32,
         moving: bool,
         tod_moved: bool,
+        mode: &'static str,
+        last_ms: f32,
     ) -> Option<HudFrame> {
         // Compass heading: the camera's forward projected to the ground
         // plane; north = +Z, east = +X (the sun-arc azimuth convention),
@@ -352,6 +421,14 @@ impl Hud {
         if minute != self.last_minute {
             self.last_minute = minute;
             self.ui.set_clock(format!("{:02}:{:02}", minute / 60, minute % 60).into());
+        }
+        // Render mode: changes only on SPACE/F transitions (quantized by
+        // nature), and a change WAKES the compass HUD — a faded label update
+        // would upload invisible pixels and the switch would go unseen.
+        if mode != self.last_mode {
+            self.last_mode = mode;
+            self.ui.set_mode_label(mode.into());
+            self.last_active = Some(Instant::now());
         }
         // Keymap panel: on while moving, lingering HELP_LINGER after.
         if moving {
@@ -376,10 +453,37 @@ impl Hud {
         if hud_live != self.last_hud_live {
             self.last_hud_live = hud_live;
             self.ui.set_hud_live(hud_live);
+            // Waking: snap the graph to the ring sampled while faded (the
+            // fade-in repaints the panel anyway, so this costs nothing new).
+            if hud_live && self.visible {
+                self.push_graph_rows();
+            }
         }
         if self.visible != self.last_hud_on {
             self.last_hud_on = self.visible;
             self.ui.set_hud_on(self.visible);
+        }
+        // FPS graph. Rust-side sampling is always-on (a GRAPH_BARS-float
+        // rotate per tick) so the graph is CURRENT the instant the HUD
+        // wakes; the Slint row writes gate on hud_live + visible — the
+        // idle-clean contract — and sampling pauses under the menu hold
+        // (present_again re-enters at ~140 Hz with a STALE last_ms: pause
+        // means pause). A frame slower than GRAPH_TICK closes its own
+        // bucket (the acc_n > 0 guard), degrading tick cadence to frame
+        // cadence instead of dropping data.
+        if last_ms > 0.0 && !self.menu_open {
+            self.acc_sum += last_ms;
+            self.acc_n += 1;
+        }
+        if self.acc_n > 0 && self.last_bucket.map_or(true, |t| t.elapsed() >= GRAPH_TICK) {
+            self.last_bucket = Some(Instant::now());
+            self.hist.rotate_left(1);
+            self.hist[GRAPH_BARS - 1] = 1000.0 * self.acc_n as f32 / self.acc_sum;
+            self.acc_sum = 0.0;
+            self.acc_n = 0;
+            if hud_live && self.visible {
+                self.push_graph_rows();
+            }
         }
 
         slint::platform::update_timers_and_animations();

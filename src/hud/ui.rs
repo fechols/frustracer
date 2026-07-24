@@ -10,7 +10,14 @@
 //!   keymap panel fades via ONE animated opacity — while settled (0 or
 //!   target) it dirties nothing.
 //! - No element rotation (the software renderer's rotation support is
-//!   Image-only): the compass letters orbit by explicit sin/cos positioning.
+//!   Image-only): the compass letters orbit by explicit sin/cos positioning,
+//!   and the FPS graph's "angular" accents are axis-aligned L-brackets. Its
+//!   glow is a radial-gradient rect — the software renderer silently ignores
+//!   drop-shadow-*, so a shadow property here would render NOTHING.
+//! - The FPS graph rewrites only its bar rows + two readout strings, at most
+//!   once per 125 ms and only while hud-live (mod.rs gates the writes); all
+//!   its chrome (glow, brackets, 60-fps line, captions) is static. The mode
+//!   pill churns only on SPACE/F render-mode transitions.
 //! - Keymap text mirrors src/flycam.rs's actual bindings (WASD/arrows, drag
 //!   look, E/Q up/down, Shift/Ctrl+bumpers slow, ,/. + D-pad time of day) —
 //!   update BOTH when a binding changes.
@@ -77,6 +84,9 @@ slint::slint! {
         // to whole degrees by the caller.
         in property <float> heading: 0.0;
         in property <string> clock: "12:00";
+        // Render mode pill ("CPU" | "GPU" | "DXR") — churns only on the
+        // SPACE/F transitions (mod.rs guards it like heading/clock).
+        in property <string> mode-label: "CPU";
         // The F1/menu HUD toggle (compass + clock).
         in property <bool> hud-on: true;
         // The keymap/controller panel: on while the camera moves (+linger).
@@ -101,6 +111,15 @@ slint::slint! {
         // the hard gate; one animated opacity — settled states dirty nothing.
         in property <bool> hud-live: true;
 
+        // FPS graph rows: bucket-average FPS, oldest first, on a FIXED
+        // 0..120 scale (60 = the static mid-strip reference line). mod.rs
+        // rewrites the rows of ONE persistent VecModel at most once per
+        // 125 ms tick, and only while hud-live — a faded HUD's graph is
+        // frozen and dirties nothing.
+        in property <[float]> fps-bars: [];
+        in property <string> fps-now: "--";
+        in property <string> ms-now: "";
+
         compass := Rectangle {
             visible: root.hud-on;
             opacity: root.hud-live ? 1.0 : 0.0;
@@ -108,7 +127,7 @@ slint::slint! {
             x: parent.width - 152px;
             y: 16px;
             width: 136px;
-            height: 170px;
+            height: 206px;
 
             rose := Rectangle {
                 x: 8px;
@@ -189,6 +208,132 @@ slint::slint! {
                     vertical-alignment: center;
                 }
             }
+
+            modebg := Rectangle {
+                x: 68px - self.width / 2;
+                y: 170px;
+                width: 84px;
+                height: 26px;
+                border-radius: 6px;
+                background: #10141cB0;
+                border-width: 1px;
+                border-color: #58f0ff40;
+                Text {
+                    text: root.mode-label;
+                    color: #7df3ff;
+                    font-size: 13px;
+                    font-weight: 700;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        // FPS graph: a sci-fi frame-rate sparkline under the compass. ALL
+        // chrome is STATIC (glow halo, corner brackets, 60-fps line, header
+        // captions) — only the bar rows and the two readout strings change,
+        // at most once per 125 ms and only while hud-live.
+        fpsgraph := Rectangle {
+            visible: root.hud-on;
+            opacity: root.hud-live ? 1.0 : 0.0;
+            animate opacity { duration: 400ms; easing: ease-in-out; }
+            x: parent.width - 236px;
+            y: 238px;
+            width: 220px;
+            height: 74px;
+
+            // Fake glow: drop-shadow-* is a no-op in the software renderer,
+            // so the halo is an oversized radial-gradient rect behind the
+            // body (fpsgraph itself must NOT clip for this to show).
+            glow := Rectangle {
+                x: -12px;
+                y: -12px;
+                width: parent.width + 24px;
+                height: parent.height + 24px;
+                background: @radial-gradient(circle, #58f0ff26 0%, #58f0ff00 70%);
+            }
+            body := Rectangle {
+                width: 100%;
+                height: 100%;
+                border-radius: 8px;
+                background: @linear-gradient(180deg, #16202cC8 0%, #0a0f18C8 100%);
+                border-width: 1px;
+                border-color: #58f0ff50;
+                clip: true;
+
+                Text {
+                    text: "FRAME";
+                    color: #58f0ff90;
+                    font-size: 9px;
+                    x: 10px;
+                    y: 7px;
+                }
+                Text {
+                    text: root.ms-now;
+                    color: #b8c0cc;
+                    font-size: 10px;
+                    x: 52px;
+                    y: 6px;
+                }
+                Text {
+                    text: root.fps-now;
+                    color: #7df3ff;
+                    font-size: 15px;
+                    font-weight: 700;
+                    horizontal-alignment: right;
+                    width: 56px;
+                    x: 138px;
+                    y: 2px;
+                }
+                Text {
+                    text: "FPS";
+                    color: #58f0ff90;
+                    font-size: 9px;
+                    x: 198px;
+                    y: 8px;
+                }
+
+                // Bars: 40 x 4px on a 5px pitch (strip x 10..210), baseline
+                // y 66, 44px full scale. v <= 0 (unfilled boot slots) draws
+                // nothing; anything faster than 120 fps clamps full-height.
+                for v[i] in root.fps-bars : Rectangle {
+                    x: 10px + i * 5px;
+                    width: 4px;
+                    height: v <= 0.0 ? 0px : Math.max(2px, Math.min(v / 120.0, 1.0) * 44px);
+                    y: 66px - self.height;
+                    background: v >= 60.0
+                        ? @linear-gradient(180deg, #7df3ff 0%, #1e7fa0F0 100%)
+                        : (v >= 30.0
+                            ? @linear-gradient(180deg, #ffd24d 0%, #a06a1eF0 100%)
+                            : @linear-gradient(180deg, #ff6060 0%, #a01e2eF0 100%));
+                }
+                // 60-fps reference: mid-strip of the FIXED 0..120 scale —
+                // the fixed scale is what keeps this element static.
+                budget := Rectangle {
+                    x: 10px;
+                    y: 44px;
+                    width: 200px;
+                    height: 1px;
+                    background: #ffd24d60;
+                }
+                Text {
+                    text: "60";
+                    color: #ffd24d80;
+                    font-size: 8px;
+                    x: 199px;
+                    y: 35px;
+                }
+            }
+            // Angular corner accents: axis-aligned L-brackets (per-element
+            // rotation is a no-op in the software renderer).
+            Rectangle { x: -3px; y: -3px; width: 14px; height: 2px; background: #58f0ffC0; }
+            Rectangle { x: -3px; y: -3px; width: 2px; height: 14px; background: #58f0ffC0; }
+            Rectangle { x: parent.width - 11px; y: -3px; width: 14px; height: 2px; background: #58f0ffC0; }
+            Rectangle { x: parent.width + 1px; y: -3px; width: 2px; height: 14px; background: #58f0ffC0; }
+            Rectangle { x: -3px; y: parent.height + 1px; width: 14px; height: 2px; background: #58f0ffC0; }
+            Rectangle { x: -3px; y: parent.height - 11px; width: 2px; height: 14px; background: #58f0ffC0; }
+            Rectangle { x: parent.width - 11px; y: parent.height + 1px; width: 14px; height: 2px; background: #58f0ffC0; }
+            Rectangle { x: parent.width + 1px; y: parent.height - 11px; width: 2px; height: 14px; background: #58f0ffC0; }
         }
 
         // Keymap / controller layout: fades IN while the camera is moving

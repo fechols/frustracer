@@ -12535,7 +12535,16 @@ fn session(
                 hd.set_visible(!hd.visible());
                 eprintln!("hud: {} (F1 toggles)", if hd.visible() { "ON" } else { "OFF" });
             }
-            if let Some(hf) = hd.frame(&cam, cur_tod, moved, sun_moved) {
+            // Mode label: derived from the stored truth (the gpu_trace/dxr_on
+            // pair — never both). The SPACE/F transition block runs LATER
+            // this iteration, so a mode-switch frame shows the old label for
+            // exactly one (pipeline-compile-stall) frame — invisible. last_ms
+            // is the PREVIOUS frame's render time (0.0 before the first
+            // present), which is exactly the sample the FPS graph wants.
+            let mode_label: &'static str =
+                if gpu_trace { "GPU" } else if dxr_on { "DXR" } else { "CPU" };
+            if let Some(hf) = hd.frame(&cam, cur_tod, moved, sun_moved, mode_label, last_ms as f32)
+            {
                 gpu.hud_stage(hf);
             }
             gpu.set_hud_visible(hd.visible() || hd.menu_open());
