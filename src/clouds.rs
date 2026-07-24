@@ -94,6 +94,13 @@ pub const CLOUD_SUN_MIN_Y: f32 = 0.05;
 /// dominate the coverage decision, and it can only do that if a single
 /// wavelength spans a good slice of sky.
 pub const CLOUD_SCALE_K: f32 = 2.6;
+/// Grid-side cap for the slab-space cloud-shadow cache. The footprint-to-
+/// wavelength ratio is scale-INVARIANT (both the span and `l0 = CLOUD_SCALE_K *
+/// diag` scale with `diag`), so the derived side is small in practice — this
+/// only bites when a low sun spreads the projection, where the shadow is fading
+/// out anyway (`CLOUD_SUN_MIN_Y` + `CLOUD_FADE_BAND`). Lives here (not the GPU
+/// module) so `shadow_grid_row` and the `--check` grid gates are DLL-free.
+pub const CLOUD_SHADOW_MAX: u32 = 512;
 /// Wind speed in diagonals/second: a cloud crosses its own wavelength in
 /// ~130 s, so something is always visibly passing overhead without the sky
 /// reading as time-lapse.
@@ -1012,6 +1019,52 @@ pub fn along_rough(o: Vec3A, d: Vec3A, sun: &Sun, amb: Vec3A, cl: &Clouds) -> Op
     Some(CloudSample { t: 1.0 + (t_acc - 1.0) * fade, scatter: sc * fade })
 }
 
+/// The slab-space cloud-shadow grid row `[org_x, org_z, 1/cell, side]` for a
+/// frame: map the scene AABB's 8 corners through the shadow projection
+/// `M(p) = p + sun*(base + 0.5*thick - p.y)/sun.y` (the plane
+/// `cloud_sun_transmittance` is EXACTLY a function of), bound them, pin the cell
+/// to the FIELD resolution (`l0/n`, not the footprint size), derive the side
+/// from the footprint and cap it at [`CLOUD_SHADOW_MAX`], then snap the origin
+/// to a whole cell so the lattice is FRAME-STATIC (a grid that slid with the
+/// camera would move its own interpolation error every frame, which the
+/// temporal upscalers read as shimmer). The caller supplies `sun` as
+/// `[x, y, z, _]`, `aabb` as content∪ground min/max, and `diag = Clouds::diag`;
+/// callers guard `n == 0` / clouds-off themselves (returning a zero row). One
+/// source of truth for the grid geometry the GPU tracer, the DXR pipeline, and
+/// the `--check` interpolation gates all consume.
+pub fn shadow_grid_row(sun: [f32; 4], aabb: ([f32; 3], [f32; 3]), diag: f32, n: u32) -> [f32; 4] {
+    let base = CLOUD_BASE_K * diag;
+    let thick = CLOUD_THICK_K * diag;
+    let sy = sun[1].max(CLOUD_SUN_MIN_Y);
+    let (mn, mx) = aabb;
+    let (mut lx, mut lz) = (f32::INFINITY, f32::INFINITY);
+    let (mut hx, mut hz) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for i in 0..8 {
+        let c = [
+            if i & 1 == 0 { mn[0] } else { mx[0] },
+            if i & 2 == 0 { mn[1] } else { mx[1] },
+            if i & 4 == 0 { mn[2] } else { mx[2] },
+        ];
+        let m = (base + 0.5 * thick - c[1]) / sy;
+        let (px, pz) = (c[0] + sun[0] * m, c[2] + sun[2] * m);
+        lx = lx.min(px);
+        lz = lz.min(pz);
+        hx = hx.max(px);
+        hz = hz.max(pz);
+    }
+    let span = (hx - lx).max(hz - lz).max(1e-3);
+    let l0 = CLOUD_SCALE_K * diag;
+    let mut cell = l0 / n as f32;
+    let mut side = (span / cell).ceil() as u32 + 3;
+    if side > CLOUD_SHADOW_MAX {
+        side = CLOUD_SHADOW_MAX;
+        cell = span / (side as f32 - 3.0);
+    }
+    let org_x = (lx / cell).floor() * cell - cell;
+    let org_z = (lz / cell).floor() * cell - cell;
+    [org_x, org_z, 1.0 / cell, side as f32]
+}
+
 /// Cloud transmittance from a surface point toward the sun — the shadow term.
 /// Exactly TWO density evals (the slab's quarter and three-quarter heights
 /// along the sun ray), Beer over the slant path. Multiplies the WHOLE direct
@@ -1384,6 +1437,139 @@ pub fn self_test() -> Result<(), String> {
                 ));
             }
         }
+    }
+
+    // G13: the slab-space cloud-shadow grid geometry (shadow_grid_row) — the
+    // pure-Rust half of the cloud-shadow cache gates (the GPU fill/fetch consume
+    // exactly this row). Coverage, the pinned cell, the cap, and the FRAME-
+    // STATIC origin snap.
+    {
+        let base = CLOUD_BASE_K * diag;
+        let thick = CLOUD_THICK_K * diag;
+        let l0 = CLOUD_SCALE_K * diag;
+        // Every projected AABB corner must land inside the grid WITH its four
+        // bilinear neighbours (else a fetch edge-clamps to a wrong cell).
+        let covered = |row: [f32; 4], aabb: ([f32; 3], [f32; 3]), sd: Vec3A| -> bool {
+            let (org_x, org_z, inv_cell, side) = (row[0], row[1], row[2], row[3] as u32);
+            let sy = sd.y.max(CLOUD_SUN_MIN_Y);
+            (0..8).all(|i| {
+                let c = [
+                    if i & 1 == 0 { aabb.0[0] } else { aabb.1[0] },
+                    if i & 2 == 0 { aabb.0[1] } else { aabb.1[1] },
+                    if i & 4 == 0 { aabb.0[2] } else { aabb.1[2] },
+                ];
+                let m = (base + 0.5 * thick - c[1]) / sy;
+                let (gx, gz) = ((c[0] + sd.x * m - org_x) * inv_cell, (c[2] + sd.z * m - org_z) * inv_cell);
+                gx >= 0.0 && gx <= (side - 1) as f32 && gz >= 0.0 && gz <= (side - 1) as f32
+            })
+        };
+        let aabb = ([-5.0_f32, 0.0, -5.0], [5.0_f32, 3.0, 5.0]);
+        for &n in &[8u32, 16, 32, 64] {
+            let row = shadow_grid_row([sun.dir.x, sun.dir.y, sun.dir.z, 0.0], aabb, diag, n);
+            let cell = 1.0 / row[2];
+            if row[3] as u32 >= CLOUD_SHADOW_MAX {
+                return Err(format!("G13: an ordinary sun hit the side cap at n={n}"));
+            }
+            // uncapped ⇒ cell is EXACTLY l0/n (the field-resolution pin)
+            if (cell - l0 / n as f32).abs() > 1e-4 * cell {
+                return Err(format!("G13: cell {cell} != l0/n {} at n={n}", l0 / n as f32));
+            }
+            // origin snapped to a whole cell (FRAME-STATIC anchoring)
+            for &o in &[row[0], row[1]] {
+                if ((o / cell).round() - o / cell).abs() > 1e-3 {
+                    return Err(format!("G13: origin {o} not cell-snapped (cell {cell}) at n={n}"));
+                }
+            }
+            if !covered(row, aabb, sun.dir) {
+                return Err(format!("G13: a projected AABB corner falls outside the grid at n={n}"));
+            }
+        }
+        // The cap: a grazing sun over a tall box forces side == CLOUD_SHADOW_MAX,
+        // and the cap must GROW the cell (never break coverage).
+        let tall = ([-5.0_f32, 0.0, -5.0], [5.0_f32, 60.0, 5.0]);
+        let low = Sun::new(Vec3A::new(1.0, 0.05, 0.0));
+        let row = shadow_grid_row([low.dir.x, low.dir.y, low.dir.z, 0.0], tall, diag, 64);
+        if row[3] as u32 != CLOUD_SHADOW_MAX {
+            return Err(format!("G13: grazing sun over a tall box did not hit the cap (side {})", row[3]));
+        }
+        if !covered(row, tall, low.dir) {
+            return Err("G13: the capped grid lost coverage (cap did not grow the cell)".into());
+        }
+    }
+
+    // G14: the cloud-shadow interpolation-error probe — the executable form of
+    // the "owed large-cloudy-scene probe". The domain reduction to F(M.x, M.z)
+    // is EXACT (trace_common.hlsli); only the bilinear FETCH approximates. On a
+    // check scene (smaller than one field feature 1.3*diag) the shadow is nearly
+    // constant, so the error is ~0 and gating there is vacuous — this synthetic
+    // grid deliberately spans SEVERAL features so the shadow varies (anti-
+    // vacuity) and the fetch's real worst case shows.
+    //
+    // THE NUMBER: at the shipped N=16 the worst-case midpoint error is ~0.066 —
+    // and it is SCALE-INVARIANT (cell = l0/N, feature = l0/2, so cell/feature =
+    // 2/N regardless of CLOUD_SCALE_K or diag). So a scene LARGER than one cloud
+    // feature sees ~6.6% error in the sun-transmittance term at a cloud edge
+    // (a soft penumbra gradient — the accepted cost of the cache; raise --cloud-
+    // shadow N to shrink it). The MEAN is far smaller (edges are sparse). The
+    // gate is a REGRESSION bound: a cell-mapping / grid-plumbing bug lands the
+    // error at 0.5+, an order past this. Do NOT tighten it toward the ~0 that
+    // only the vacuous check-scene regime produces.
+    {
+        let n = 16u32;
+        let aabb = ([-30.0_f32, 0.0, -30.0], [30.0_f32, 5.0, 30.0]);
+        let sd = Sun::new(Vec3A::new(3.0, 6.0, 2.0)).dir;
+        let sy = sd.y.max(CLOUD_SUN_MIN_Y);
+        let m0 = (CLOUD_BASE_K * diag + 0.5 * CLOUD_THICK_K * diag) / sy;
+        let row = shadow_grid_row([sd.x, sd.y, sd.z, 0.0], aabb, diag, n);
+        let (org_x, org_z, cell, side) = (row[0], row[1], 1.0 / row[2], row[3] as u32);
+        let mut best_var = 0.0_f32;
+        let (mut worst, mut mean, mut mean_n) = (0.0_f32, 0.0_f64, 0u32);
+        for &t in &[CLOUD_CHECK_TIME, 50.0, 150.0, 300.0] {
+            let cl = Clouds::new(true, diag, t);
+            // F(mx, mz): the exact transmittance of the y=0 point projecting there.
+            let f = |mx: f32, mz: f32| -> f32 {
+                sun_transmittance(Vec3A::new(mx - sd.x * m0, 0.0, mz - sd.z * m0), sd, &cl)
+            };
+            let (mut lo, mut hi) = (1.0_f32, 0.0_f32);
+            let (mut w, mut m_sum, mut m_cnt) = (0.0_f32, 0.0_f64, 0u32);
+            for j in 2..side - 2 {
+                for i in 2..side - 2 {
+                    let (mx, mz) = (org_x + i as f32 * cell, org_z + j as f32 * cell);
+                    let bil = 0.25
+                        * (f(mx, mz) + f(mx + cell, mz) + f(mx, mz + cell) + f(mx + cell, mz + cell));
+                    let exact = f(mx + 0.5 * cell, mz + 0.5 * cell);
+                    let e = (bil - exact).abs();
+                    w = w.max(e);
+                    m_sum += e as f64;
+                    m_cnt += 1;
+                    let c = f(mx, mz);
+                    lo = lo.min(c);
+                    hi = hi.max(c);
+                }
+            }
+            if hi - lo > best_var {
+                best_var = hi - lo;
+                worst = w;
+                mean = m_sum;
+                mean_n = m_cnt;
+            }
+        }
+        let mean = if mean_n > 0 { mean / mean_n as f64 } else { 0.0 };
+        // Anti-vacuity: the shadow must genuinely vary across the grid at SOME
+        // sampled time, else the gate proves nothing.
+        if best_var < 0.05 {
+            return Err(format!(
+                "G14: cloud shadow never varies across the grid ({best_var}) — the interpolation probe is vacuous"
+            ));
+        }
+        // Regression bound (~2x the measured 0.066 worst). A wiring bug blows
+        // this to 0.5+; the honest N=16 fetch error stays well under it.
+        if worst > 0.15 {
+            return Err(format!(
+                "G14: cloud-shadow bilinear WORST error {worst} exceeds 0.15 (mean {mean:.4}) — grid mapping / fetch regression (do NOT widen; fix the wiring)"
+            ));
+        }
+        eprintln!("clouds G14: N=16 cloud-shadow fetch error worst {worst:.4} / mean {mean:.4} over a multi-feature grid (var {best_var:.3})");
     }
 
     // G7: the horizon fade is continuous — just above CLOUD_MIN_DY the layer

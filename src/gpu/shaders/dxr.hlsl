@@ -52,8 +52,12 @@ void raygen() {
             if (s == probe_sample)
                 gbuf_write_hit(pi, sp.x, sp.y, dir, t, ps);
         } else {
+#if SKY_LOD > 1
+            col = sky_radiance_lod(dir, id.x, id.y);
+#else
             col = sky_radiance(cam_origin.xyz, dir, pixel_cone * 0.5, frame,
                                cloud_dither_k(id, frame, s, spp));
+#endif
             t = INF;
             if (s == probe_sample)
                 gbuf_write_sky(pi, sp.x, sp.y, dir);
@@ -166,8 +170,16 @@ void miss_radiance(inout RayPayload p) {
     // are handled inside shade.hlsli, per the sky.rs invariant. The cloud
     // march phase is per (pixel, frame, SAMPLE) — the sample index rides
     // prim's high bits (raygen packs `(s << 1) | probe`).
+#if SKY_LOD > 1
+    // The amortized cloud lattice (record_frame fills it before DispatchRays),
+    // read through the same sky_radiance_lod cs_leaf uses. DispatchRaysIndex()
+    // is legal in a miss shader (used on the line below already).
+    uint2 mid = DispatchRaysIndex().xy;
+    p.color = sky_radiance_lod(WorldRayDirection(), mid.x, mid.y);
+#else
     p.color = sky_radiance(WorldRayOrigin(), WorldRayDirection(), pixel_cone * 0.5, frame,
                            cloud_dither_k(DispatchRaysIndex().xy, frame, p.prim >> 1u, spp));
+#endif
     p.t = INF;
 }
 

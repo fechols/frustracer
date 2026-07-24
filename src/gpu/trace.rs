@@ -158,7 +158,16 @@ pub const CTR_HEIGHT_REJ: u32 = 19;
 /// Tinted-shadow candidate passes (TRANS_SHADOW scenes) — the anti-vacuity
 /// stat proving occlusion rays really crossed transmissive surfaces.
 pub const CTR_TRANS_PASS: u32 = 20;
+/// --sw-rays anti-vacuity stat: leaf tiles whose software rays seeded from a
+/// non-root cut (counted once per record in leaf.hlsl; --check-gpu must-fires
+/// it under the lever — proof cut-seeding is not dead code).
+pub const CTR_SW_CUT_SEED: u32 = 21;
 pub const CTR_COUNT: u32 = 24;
+
+/// queues.hlsli::LeafRec's stride — the qleaf allocation and main.rs's
+/// check-gpu readback move in lockstep with the HLSL struct through this one
+/// value (xy0 | xy1 | t_start | depth | cut_slot | cut_len).
+pub const LEAF_REC_BYTES: u64 = 24;
 
 // Indirect-args buffer slots: level d at slot d (depth_full <= 11 asserted
 // at init); hemi + leaf/sky passes at the top.
@@ -297,7 +306,7 @@ fn leaf_group() -> u32 {
 /// The defines are built from these two at kernel-assembly time, and SKY_SPLIT
 /// is ALSO the multiplying prep's push constant — one number, never a pair that
 /// can drift.
-/// R&D lever (FR_CLOUD_SHADOW, default 0 = OFF and bit-identical): CELLS PER
+/// `--cloud-shadow N` (default ON at 16; 0 = `--no-cloud-shadow`): CELLS PER
 /// CLOUD WAVELENGTH for the slab-space cloud-shadow grid.
 ///
 /// It is deliberately NOT a grid side. The resolution the field needs is set by
@@ -312,41 +321,41 @@ fn leaf_group() -> u32 {
 /// function of the shading point's shadow-projection onto the cloud slab (see
 /// trace_common.hlsli), so caching it there has no depth discontinuity to
 /// filter — unlike a screen-space cache. Measured share of the cloud bill on
-/// the B70: sun_transmittance 65%, sky march 26%, along_rough 5%.
-fn cloud_shadow_n() -> u32 {
-    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("FR_CLOUD_SHADOW")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .filter(|n| *n == 0 || (*n >= 2 && *n <= 64))
-            .unwrap_or(0)
-    })
+/// the B70: sun_transmittance 65%, sky march 26%, along_rough 5%; the cache
+/// buys -21%/sample there. The domain reduction to F(M.x, M.z) is EXACT — only
+/// the bilinear interpolation approximates, and the field's finest feature is
+/// wider than any scene, so the shipped error is ~0. Set once at parse (the
+/// `set_inline_mode` knob idiom); TraceGpu/DxrGpu SNAPSHOT it in `new()` so a
+/// mid-process A/B (the gate flips the static between two constructions) can
+/// never dispatch a fill for a cache its kernels don't compile.
+pub static CLOUD_SHADOW: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(16);
+
+/// Set the cloud-shadow cache resolution (cells per cloud wavelength; 0 = off).
+pub fn set_cloud_shadow(n: u32) {
+    CLOUD_SHADOW.store(n, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Grid-side cap. The footprint-to-wavelength ratio is scale-INVARIANT (both
-/// the span and `l0` scale with `diag`), so the derived side is small in
-/// practice — this only bites when a low sun spreads the projection, and there
-/// the shadow is fading out anyway (CLOUD_SUN_MIN_Y + CLOUD_FADE_BAND).
-const CLOUD_SHADOW_MAX: u32 = 512;
+pub(crate) fn cloud_shadow_n() -> u32 {
+    CLOUD_SHADOW.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 const SKY_GROUP: u32 = 64;
 
-/// R&D lever (FR_SKY_LOD, power of two, default 1 = OFF and bit-identical):
-/// the pixel pitch of the amortized cloud lattice in proven-empty tiles. See
-/// sky.hlsl — the sharp half of the sky integral (sun limb, stars) stays
-/// per-pixel; only the march is evaluated at 1/K^2 rate and interpolated.
-/// Aimed at the 35% of a sample the cloud march costs, not at the 7.8% of ray
-/// headroom every other lever in this tracer competes for.
-fn sky_lod() -> u32 {
-    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("FR_SKY_LOD")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .filter(|n| n.is_power_of_two() && *n >= 1 && *n <= 32)
-            .unwrap_or(1)
-    })
+/// `--sky-lod K` (power of two, default ON at 4; 1 = `--no-sky-lod`): the pixel
+/// pitch of the amortized cloud lattice. See sky.hlsl — the sharp half of the
+/// sky integral (sun limb, stars) stays per-pixel; only the march is evaluated
+/// at 1/K^2 rate and interpolated (measured 0.14% mean sky error, -9.8% frame
+/// at spp=16 / -1.0% at spp=1). Snapshotted in `new()` for the same A/B reason
+/// as CLOUD_SHADOW.
+pub static SKY_LOD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(4);
+
+/// Set the sky-march lattice pitch (power of two; 1 = off).
+pub fn set_sky_lod(k: u32) {
+    SKY_LOD.store(k, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn sky_lod() -> u32 {
+    SKY_LOD.load(std::sync::atomic::Ordering::Relaxed)
 }
 const SKY_SPLIT: u32 = 128;
 
@@ -405,6 +414,30 @@ pub fn depth_full(rw: u32, rh: u32) -> u32 {
     d
 }
 
+/// --sw-rays: the wavefront tracer's rays traverse the SOFTWARE BVH
+/// (bvh.rs's loops, ported to rt_sw.hlsli) instead of DXR inline RayQuery,
+/// so primary leaf rays can seed from the tile's inherited node cut — the
+/// one product of the frustum recursion the RayQuery API structurally cannot
+/// accept (it takes origin/dir/TMin/TMax and nothing else). Default OFF; the
+/// off arm assembles the exact pre-lever kernel sources (the --dxr-inline 0
+/// pattern, modulo the blank lines empty define segments join as — the defs
+/// block's existing tolerance). Wavefront only: the DXR pipeline never reads
+/// it. Set once at parse (the `set_inline_mode` knob idiom).
+pub static SW_RAYS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn sw_rays() -> bool {
+    SW_RAYS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The leaf CUT consumption arm: --sw-rays composed with the cut-rays lever
+/// exactly as the CPU's `intersect_multi` short-circuit is (`--no-cut-rays`
+/// keeps software traversal but seeds from the root). One predicate, four
+/// consumers in lockstep: the SW_RAYS_LEAF define (leaf + wavefront units),
+/// the ft_bnode upload, its ladder t1 binding, and the cut-pool headroom.
+fn sw_rays_leaf() -> bool {
+    sw_rays() && crate::bvh::CUT_SEED_RAYS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 const SMOKE_HLSL: &str = include_str!("shaders/smoke.hlsl");
 /// Order-2 SH irradiance, standalone (no cbuffer of its own — the coefficients
 /// are a parameter). pub(crate) because gpu/ffx_rr.rs prepends it to the FSR
@@ -436,13 +469,18 @@ const FTREE_HLSLI: &str = include_str!("shaders/ftree.hlsli");
 /// pub for gpu/dxr.rs: FR_DXR_INLINE pastes the inline-RayQuery primitives
 /// into the DXR library in place of rt_dxr.hlsli's TraceRay flavors.
 pub const RT_HLSLI: &str = include_str!("shaders/rt.hlsli");
+/// bvh.rs's traversal loops in HLSL — pasted IN PLACE of RT_HLSLI into every
+/// ray-shooting wavefront unit when --sw-rays is armed (same three primitive
+/// signatures + the cut-seeded trace_closest_multi), so rays traverse the
+/// software BVH and leaf primaries seed from the tile's node cut.
+const RT_SW_HLSLI: &str = include_str!("shaders/rt_sw.hlsli");
 pub(crate) const SHADE_HLSLI: &str = include_str!("shaders/shade.hlsli");
 const HEMI_HLSLI: &str = include_str!("shaders/hemi.hlsli");
 const REFERENCE_HLSL: &str = include_str!("shaders/reference.hlsl");
 pub(crate) const RESOLVE_HLSL: &str = include_str!("shaders/resolve.hlsl");
 const WAVEFRONT_HLSL: &str = include_str!("shaders/wavefront.hlsl");
 const SKY_HLSL: &str = include_str!("shaders/sky.hlsl");
-const SKYLOD_HLSLI: &str = include_str!("shaders/skylod.hlsli");
+pub(crate) const SKYLOD_HLSLI: &str = include_str!("shaders/skylod.hlsli");
 const LEAF_HLSL: &str = include_str!("shaders/leaf.hlsl");
 const HEMI_WAVE_HLSL: &str = include_str!("shaders/hemi_wave.hlsl");
 const HEMI_LEAF_HLSL: &str = include_str!("shaders/hemi_leaf.hlsl");
@@ -1038,6 +1076,12 @@ pub struct SwTreesGpu {
     /// f32 nodes, the GPU trades decode ALU for -56% tree bandwidth/VRAM.
     /// None when the ftree lever is off.
     pub ftree_nodes: Option<ID3D12Resource>,
+    /// --sw-rays + FTREE only: the wide-tree slot→binary-node map (flat
+    /// nodes × 8 u32s — the FNode.bnode field the quantized wire format
+    /// deliberately drops), bound at t1 during the level ladder so
+    /// level_finish can translate a slot-ref leaf cut into the binary node
+    /// ids the software ray traversal seeds from.
+    pub ft_bnode: Option<ID3D12Resource>,
 }
 
 impl SwTreesGpu {
@@ -1077,11 +1121,30 @@ impl SwTreesGpu {
             }
             None => None,
         };
-        eprintln!("gpu sw-trees: {} MB (binary bvh + tri idx{})", bytes >> 20, match ft {
-            Some(f) => format!(", ftree {} MB", f.quantized_bytes() >> 20),
-            None => String::new(),
-        });
-        Ok(Self { bvh_nodes, tri_idx, ftree_nodes })
+        // --sw-rays leaf-cut translation map (cut-consuming lever + ftree
+        // sessions only — --no-cut-rays compiles the translation out too).
+        let ft_bnode = match ft {
+            Some(f) if sw_rays_leaf() => {
+                let flat = f.bnode_flat();
+                Some(stream_buffer(device, sub, &ring, &flat, |t| *t, srv)?)
+            }
+            _ => None,
+        };
+        let bnode_bytes = ft_bnode.as_ref().map_or(0, |_| ft.map_or(0, |f| f.nodes.len() * 32));
+        eprintln!(
+            "gpu sw-trees: {} MB (binary bvh + tri idx{}{})",
+            (bytes + bnode_bytes) >> 20,
+            match ft {
+                Some(f) => format!(", ftree {} MB", f.quantized_bytes() >> 20),
+                None => String::new(),
+            },
+            if ft_bnode.is_some() {
+                format!(", sw-rays bnode {} MB", bnode_bytes >> 20)
+            } else {
+                String::new()
+            }
+        );
+        Ok(Self { bvh_nodes, tri_idx, ftree_nodes, ft_bnode })
     }
 }
 
@@ -2148,6 +2211,46 @@ pub(crate) fn spp_defs() -> String {
     )
 }
 
+/// The sky-fill compile unit (`cs_sky_lod` + `cs_cloud_shadow`), assembled once
+/// so the wavefront tracer AND the DXR pipeline compile byte-identical fill
+/// kernels — the two cannot drift. `k` = the SKY_LOD pitch (1 = lattice
+/// compiled out), `n` = the CLOUD_SHADOW cells/wavelength (0 = cache compiled
+/// out). SKY_UNIT gives `cloud_lod` register u5 (queues.hlsli's tile queues
+/// suppressed); it traces nothing, so no frustum/rt machinery.
+pub(crate) fn sky_unit_src(k: u32, n: u32) -> String {
+    [
+        format!(
+            "#define SKY_UNIT 1\n#define SKY_LOD {k}\n#define SKY_LOD_LOG {}",
+            k.trailing_zeros()
+        ),
+        format!("#define CLOUD_SHADOW_N {n}"),
+        format!(
+            "#define SKY_GROUP {SKY_GROUP}\n#define SKY_SPLIT {SKY_SPLIT}\n#define LEAF_TILE {}",
+            crate::render::leaf_tile()
+        ),
+        spp_defs(),
+        TRACE_COMMON_HLSLI.to_string(),
+        CTR_HLSLI.to_string(),
+        QUEUES_HLSLI.to_string(),
+        SKYLOD_HLSLI.to_string(),
+        SKY_HLSL.to_string(),
+    ]
+    .join("\n")
+}
+
+/// The scene AABB the slab-space cloud-shadow grid spans: the content box
+/// unioned with the ground quad's first few vertices (the ground is what a low
+/// sun's shadow footprint actually covers). Shared by TraceGpu/DxrGpu so both
+/// derive the same grid.
+pub(crate) fn scene_shadow_aabb(scene: &Scene) -> ([f32; 3], [f32; 3]) {
+    let (mut amn, mut amx) = (scene.content_min, scene.content_max);
+    for p in scene.positions.iter().take(6) {
+        amn = amn.min(*p);
+        amx = amx.max(*p);
+    }
+    ([amn.x, amn.y, amn.z], [amx.x, amx.y, amx.z])
+}
+
 /// D3D12 requires every acceleration structure to start on a 256-byte boundary
 /// (`D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT`), which is what
 /// lets all chunk BLASes share ONE committed arena instead of one resource
@@ -2555,7 +2658,7 @@ pub(crate) struct FrameCb {
     /// center/u/v/color): a disc at infinity needs a direction, a cone, and two
     /// radiometric values. `scene.eps` / `ao_radius` used to ride in
     /// `light_center.w` / `light_u.w`; they are rehomed onto these rows' w slots.
-    sun: [f32; 4],   // xyz = unit dir; w = cos(angular radius)
+    pub(crate) sun: [f32; 4], // xyz = unit dir; w = cos(angular radius)
     sun_e: [f32; 4], // xyz = irradiance/π (the direct loop's multiplier); w = scene eps
     sun_l: [f32; 4], // xyz = DISC radiance (what an escaping ray sees); w = ao_radius
     rw: u32,
@@ -2621,9 +2724,10 @@ pub(crate) struct FrameCb {
     /// from bit-equal positions. Appended LAST (the sky_sh precedent); rows
     /// past `ff_count` are zero and never read (the HLSL loops on the count).
     ff: [[f32; 4]; crate::fireflies::MAX_FIREFLIES],
-    /// Cloud shadow cache transform: [origin.x, origin.z, 1/cell, unused].
+    /// Cloud shadow cache transform: [origin.x, origin.z, 1/cell, side].
     /// Appended LAST (the sky_sh / ff precedent) so no offset above moves.
-    cloud_grid: [f32; 4],
+    /// pub(crate) so DxrGpu::write_cb can fill it (the shared shadow_grid_row).
+    pub(crate) cloud_grid: [f32; 4],
 }
 // The HLSL cbuffer is hand-mirrored across 7 concatenated compile units —
 // a size drift here corrupts every field after the drift point.
@@ -2827,6 +2931,13 @@ pub struct FrameParams {
     /// onto FLAG_FIREFLIES + the `ff`/`ff_count` CB rows by `with_frame`
     /// (count 0 — every day session — writes neither).
     pub fireflies: crate::fireflies::Fireflies,
+    /// Structure-replay enable (opts.replay). When true AND this frame's basis
+    /// bit-equals the previous producing frame's, `record_frame` re-dispatches
+    /// the persisted terminal queues instead of re-running seed + the ladder
+    /// (the GPU mirror of src/replay.rs). NOT a global atomic: every headless
+    /// gate/bench sets it false so nothing silently switches paths under a
+    /// measurement.
+    pub replay: bool,
 }
 
 /// Which upscaler the feed pass targets — selects the kernel (and thereby
@@ -2902,6 +3013,16 @@ pub struct TraceGpu {
     pso_reference: ID3D12PipelineState,
     pso_resolve: ID3D12PipelineState,
     pso_seed: ID3D12PipelineState,
+    /// The replay seed (cs_seed_replay): zeroes every counter EXCEPT the
+    /// terminal counts, so a bit-equal-basis frame re-dispatches the persisted
+    /// leaf/sky queues without re-running the ladder.
+    pso_seed_replay: ID3D12PipelineState,
+    /// The basis whose terminal structure the queues currently hold — set by
+    /// EVERY record_wavefront (incl. verify/check callers), cleared by
+    /// invalidate_replay (aborts, hemi-probe seeds) and by TraceGpu recreation.
+    /// `Cell` because the record_* methods take `&self`. record_frame replays
+    /// only when `p.replay && last_struct == Some(p.cam)`.
+    last_struct: std::cell::Cell<Option<CamBasis>>,
     /// The live SKY_SPLIT (see the const): the shader define and the
     /// multiplying prep's push constant MUST be the same number, so it is read
     /// once at kernel assembly and stored, never re-derived at the dispatch.
@@ -2921,13 +3042,21 @@ pub struct TraceGpu {
     pso_cloud_shadow: ID3D12PipelineState,
     /// (scatter.rgb, transmittance) at 1/SKY_LOD pixel pitch, bound at u5 for
     /// the sky passes — the tile queue's register, dead by then.
-    cloud_lod: ID3D12Resource,
+    pub(crate) cloud_lod: ID3D12Resource,
     /// Slab-space cloud shadow cache (u6 during shading — the qout register,
-    /// dead by then and suppressed in the shading units by SKY_UNIT).
-    cloud_shadow: ID3D12Resource,
+    /// dead by then and suppressed in the shading units by SKY_UNIT). pub(crate)
+    /// so --check-gpu reads it back for the fill-vs-oracle gate.
+    pub(crate) cloud_shadow: ID3D12Resource,
     /// Scene AABB (content box unioned with the ground quad), for the per-frame
     /// slab-space grid extent.
     scene_aabb: ([f32; 3], [f32; 3]),
+    /// The cloud-cache levers SNAPSHOTTED at construction (see CLOUD_SHADOW /
+    /// SKY_LOD): the kernels are compiled and the buffers sized against these,
+    /// so every per-frame record path must read the field — never the live
+    /// static, which a mid-process A/B (two TraceGpu instances) can have flipped
+    /// out from under a kernel that doesn't compile the fill.
+    cloud_shadow_n: u32,
+    sky_lod_k: u32,
     pso_leaf: ID3D12PipelineState,
     /// The same kernel with the hemi arm compiled IN — used only by fb frames
     /// (H). See leaf.hlsl's LEAF_NO_FB note: keeping the two apart is what
@@ -3055,18 +3184,66 @@ impl TraceGpu {
         // The cbuffer's jitter-table size (--spp) — every unit sees the cbuffer.
         let sd = spp_defs();
         let sd = sd.as_str();
-        // The cloud-shadow cache is compiled ONLY into the units that shade
-        // (leaf, reference) plus the unit that fills it (sky). wavefront/hemi
-        // and the DXR library get 0 and keep the exact per-pixel expression —
-        // they must not declare u6, which is the tile queue there, and DXR
-        // neither fills nor binds the grid.
-        let csn = format!("#define CLOUD_SHADOW_N {}", cloud_shadow_n());
+        // --sw-rays: rt_sw.hlsli pastes in place of rt.hlsli in every
+        // ray-shooting unit (leaf x2, reference, hemi_wave, hemi_leaf); the
+        // wavefront unit gets the SW_RAYS define too (level_finish's leaf-cut
+        // translation arm). SW_TRAV_STACK rides in from bvh::TRAV_STACK so
+        // the HLSL stacks stay in lockstep with the build's max_depth assert.
+        let sw_on = sw_rays();
+        let rt_src: &str = if sw_on { RT_SW_HLSLI } else { RT_HLSLI };
+        let sw_defs = if sw_on {
+            format!(
+                "#define SW_RAYS 1\n#define SW_TRAV_STACK {}u",
+                crate::bvh::TRAV_STACK
+            )
+        } else {
+            String::new()
+        };
+        let sw_defs = sw_defs.as_str();
+        // The leaf unit's cut consumption composes with --no-cut-rays exactly
+        // as the CPU's intersect_multi short-circuit does: software traversal
+        // from the root, the scalar t_start kept. The wavefront unit shares
+        // the define (level_finish's leaf-cut translation compiles only when
+        // the leaf actually consumes it).
+        let sw_leaf_defs = if sw_rays_leaf() { "#define SW_RAYS_LEAF 1" } else { "" };
+        // Snapshot the cloud-cache levers ONCE: the kernels below are compiled
+        // against these values and the buffers sized against them, and every
+        // per-frame record path reads the stored fields — so a mid-process A/B
+        // that flips the static between two constructions can never desync a
+        // kernel from its fill dispatch (the device-hang class record_cloud_shadow
+        // documents).
+        let cloud_shadow_v = cloud_shadow_n();
+        let sky_lod_v = sky_lod();
+        // The cloud-shadow cache is compiled into every unit that shades (leaf,
+        // reference) plus the unit that fills it (sky). wavefront/hemi get 0 and
+        // keep the exact per-pixel expression — they must not declare u6, which
+        // is the tile queue there. (DXR compiles it in through its own assembly.)
+        let csn = format!("#define CLOUD_SHADOW_N {cloud_shadow_v}");
+        // The sky-lod lattice defines, shared by the sky-fill unit, both leaf
+        // kernels, AND the reference kernel — so reference's sky pixels compose
+        // through the identical `sky_radiance_lod` and the exact-zero
+        // wavefront-vs-reference image A/B stays bit-identical at the default-ON
+        // K. SKY_UNIT is a harmless no-op in a unit that pastes no queues.hlsli
+        // (reference), where u5 is free anyway.
+        let sky_lod_defs = format!(
+            "#define SKY_UNIT 1\n#define SKY_LOD {sky_lod_v}\n#define SKY_LOD_LOG {}",
+            sky_lod_v.trailing_zeros()
+        );
+        // The reference kernel swaps to rt_sw with the wavefront: the
+        // exact-zero wavefront-vs-reference gates require ONE intersector on
+        // both sides (the "same intersector, same seeds" contract). It also
+        // reads the cloud lattice (SKYLOD_HLSLI at u5, filled by record_sky_lod)
+        // and the cloud-shadow cache (csn, filled by record_cloud_shadow), so it
+        // shades sky exactly as the leaf kernel does.
         let reference_src = [
             csn.as_str(),
+            sky_lod_defs.as_str(),
             defs,
+            sw_defs,
             sd,
             TRACE_COMMON_HLSLI,
-            RT_HLSLI,
+            SKYLOD_HLSLI,
+            rt_src,
             SHADE_HLSLI,
             REFERENCE_HLSL,
         ]
@@ -3080,6 +3257,8 @@ impl TraceGpu {
         let wavefront_src = [
             sky_defs.as_str(),
             ft_defs,
+            sw_defs,
+            sw_leaf_defs,
             sd,
             TRACE_COMMON_HLSLI,
             CTR_HLSLI,
@@ -3090,24 +3269,10 @@ impl TraceGpu {
         ]
         .join("\n");
         // The sky fill is its own unit so `cloud_lod` can take u5 (SKY_UNIT
-        // suppresses queues.hlsli's tile-queue declarations there). It needs no
-        // frustum machinery — it traces nothing.
-        let k = sky_lod();
-        let sky_src = [
-            &format!(
-                "#define SKY_UNIT 1\n#define SKY_LOD {k}\n#define SKY_LOD_LOG {}",
-                k.trailing_zeros()
-            ),
-            csn.as_str(),
-            sky_defs.as_str(),
-            sd,
-            TRACE_COMMON_HLSLI,
-            CTR_HLSLI,
-            QUEUES_HLSLI,
-            SKYLOD_HLSLI,
-            SKY_HLSL,
-        ]
-        .join("\n");
+        // suppresses queues.hlsli's tile-queue declarations there). Assembled by
+        // the shared `sky_unit_src` so the DXR pipeline's fill kernels cannot
+        // drift from these.
+        let sky_src = sky_unit_src(sky_lod_v, cloud_shadow_v);
         // Two leaf kernels from the one source. `fb_mode` is a cbuffer value,
         // so leaving the hemi arm as a runtime branch inlines shade_split at
         // both call sites and the kernel's register allocation is the MAX of
@@ -3117,10 +3282,6 @@ impl TraceGpu {
         // The leaf kernel shades the sky pixels inside leaf tiles, so it reads
         // the same lattice: SKY_UNIT yields u5 (it never touches the tile
         // queues) and skylod.hlsli supplies the accessors.
-        let sky_lod_defs = format!(
-            "#define SKY_UNIT 1\n#define SKY_LOD {k}\n#define SKY_LOD_LOG {}",
-            k.trailing_zeros()
-        );
         let leaf_of = |extra: &str| {
             [
                 &format!("#define LEAF_GROUP {}", leaf_group()),
@@ -3128,12 +3289,14 @@ impl TraceGpu {
                 csn.as_str(),
                 sky_lod_defs.as_str(),
                 defs,
+                sw_defs,
+                sw_leaf_defs,
                 sd,
                 TRACE_COMMON_HLSLI,
                 CTR_HLSLI,
                 QUEUES_HLSLI,
                 SKYLOD_HLSLI,
-                RT_HLSLI,
+                rt_src,
                 SHADE_HLSLI,
                 LEAF_HLSL,
             ]
@@ -3148,22 +3311,24 @@ impl TraceGpu {
         // the tile path. record_hemi rebinds the binary buffer at t0.
         let hemi_wave_src = [
             defs,
+            sw_defs,
             sd,
             TRACE_COMMON_HLSLI,
             CTR_HLSLI,
             HEMI_HLSLI,
             FRUSTUM_HLSLI,
-            RT_HLSLI,
+            rt_src,
             HEMI_WAVE_HLSL,
         ]
         .join("\n");
         let hemi_leaf_src = [
             defs,
+            sw_defs,
             sd,
             TRACE_COMMON_HLSLI,
             CTR_HLSLI,
             HEMI_HLSLI,
-            RT_HLSLI,
+            rt_src,
             SHADE_HLSLI,
             HEMI_LEAF_HLSL,
         ]
@@ -3176,6 +3341,7 @@ impl TraceGpu {
         let pso_reference = pso(&reference_src, "cs_reference", "reference")?;
         let pso_resolve = pso(&resolve_src, "cs_resolve", "resolve")?;
         let pso_seed = pso(&wavefront_src, "cs_seed", "seed")?;
+        let pso_seed_replay = pso(&wavefront_src, "cs_seed_replay", "seed_replay")?;
         let pso_prep = pso(&wavefront_src, "cs_prep", "prep")?;
         let pso_prep_mul = pso(&wavefront_src, "cs_prep_mul", "prep_mul")?;
         let pso_clear_info = pso(&wavefront_src, "cs_clear_info", "clear_info")?;
@@ -3260,31 +3426,33 @@ impl TraceGpu {
         let cap_leaf = 1u64 << (2 * dd);
         let cap_sky = cap_leaf;
         let cap_cut = ((1u64 << (2 * dd)) - 1) / 3 + 1;
+        // --sw-rays + FTREE: level_finish translates each leaf-emitting
+        // split's slot-ref cut into a SECOND fresh slot of binary node ids —
+        // at most one extra slot per split, so doubling keeps the pool
+        // structurally overflow-free (CTR_OVERFLOW stays gated == 0; the
+        // exhaustion arm degrades to root seeding, counted, never wrong).
+        let cap_cut = if sw_rays_leaf() && ftree_on { cap_cut * 2 } else { cap_cut };
         let counters = committed_buffer(device, CTR_COUNT as u64 * 4, uaf, ua)?;
         let args = committed_buffer(device, 16 * 12, uaf, ua)?;
         let qa = committed_buffer(device, cap_tile * 24, uaf, ua)?;
         let qb = committed_buffer(device, cap_tile * 24, uaf, ua)?;
-        let qleaf = committed_buffer(device, cap_leaf * 16, uaf, ua)?;
+        let qleaf = committed_buffer(device, cap_leaf * LEAF_REC_BYTES, uaf, ua)?;
         let qsky = committed_buffer(device, cap_sky * 16, uaf, ua)?;
         let cut_pool = committed_buffer(device, cap_cut * 256, uaf, ua)?;
         // The amortized cloud lattice (sky.hlsl): one float4 per lattice point,
         // one point of border past each far edge. 2.1 MB at 1080p/K=4; a single
         // float4 at K=1, where the kernel compiles the lattice out entirely.
-        let lw = (rw >> sky_lod().trailing_zeros()) as u64 + 2;
-        let lh = (rh >> sky_lod().trailing_zeros()) as u64 + 2;
+        let lw = (rw >> sky_lod_v.trailing_zeros()) as u64 + 2;
+        let lh = (rh >> sky_lod_v.trailing_zeros()) as u64 + 2;
         let cloud_lod = committed_buffer(device, (lw * lh).max(1) * 16, uaf, ua)?;
         // Slab-space cloud shadow cache: N*N scalar transmittances. 16 KB at
         // N=64 — the field's finest feature is 1.3*diag (wider than the scene),
         // so a coarse grid is nearly exact. See cloud_shadow_n.
-        let (mut amn, mut amx) = (scene.content_min, scene.content_max);
-        for p in scene.positions.iter().take(6) {
-            amn = amn.min(*p);
-            amx = amx.max(*p);
-        }
-        let scene_aabb = ([amn.x, amn.y, amn.z], [amx.x, amx.y, amx.z]);
+        let scene_aabb = scene_shadow_aabb(scene);
         // Sized at the cap (1 MB): the side is derived per frame, so the
         // allocation cannot track it.
-        let csn_n = if cloud_shadow_n() > 0 { CLOUD_SHADOW_MAX as u64 } else { 1 };
+        let csn_n =
+            if cloud_shadow_v > 0 { crate::clouds::CLOUD_SHADOW_MAX as u64 } else { 1 };
         let cloud_shadow = committed_buffer(device, csn_n * csn_n * 4, uaf, ua)?;
 
         // Compose planes + hemisphere wavefront (batch-bounded transients:
@@ -3427,6 +3595,8 @@ impl TraceGpu {
             pso_reference,
             pso_resolve,
             pso_seed,
+            pso_seed_replay,
+            last_struct: std::cell::Cell::new(None),
             sky_split,
             pso_prep,
             pso_prep_mul,
@@ -3439,6 +3609,8 @@ impl TraceGpu {
             cloud_lod,
             cloud_shadow,
             scene_aabb,
+            cloud_shadow_n: cloud_shadow_v,
+            sky_lod_k: sky_lod_v,
             pso_leaf,
             pso_leaf_fb,
             pso_clear_h,
@@ -3498,51 +3670,12 @@ impl TraceGpu {
     /// interpolation error every frame, which the temporal upscalers read as
     /// shimmer (the sky fill's frame-independent offsets, same lesson).
     fn cloud_grid_row(&self, p: &FrameParams) -> [f32; 4] {
-        let n = cloud_shadow_n();
-        if n == 0 || !p.clouds.enabled {
+        // Read the SNAPSHOT (not the live static): the buffer was sized and the
+        // fill kernel compiled against this value in `new()`.
+        if self.cloud_shadow_n == 0 || !p.clouds.enabled {
             return [0.0; 4];
         }
-        let diag = p.clouds.diag;
-        let base = crate::clouds::CLOUD_BASE_K * diag;
-        let thick = crate::clouds::CLOUD_THICK_K * diag;
-        let s = self.cb_base.sun;
-        let sy = s[1].max(crate::clouds::CLOUD_SUN_MIN_Y);
-        let (mn, mx) = self.scene_aabb;
-        let (mut lx, mut lz) = (f32::INFINITY, f32::INFINITY);
-        let (mut hx, mut hz) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
-        for i in 0..8 {
-            let c = [
-                if i & 1 == 0 { mn[0] } else { mx[0] },
-                if i & 2 == 0 { mn[1] } else { mx[1] },
-                if i & 4 == 0 { mn[2] } else { mx[2] },
-            ];
-            let m = (base + 0.5 * thick - c[1]) / sy;
-            let (px, pz) = (c[0] + s[0] * m, c[2] + s[2] * m);
-            lx = lx.min(px);
-            lz = lz.min(pz);
-            hx = hx.max(px);
-            hz = hz.max(pz);
-        }
-        // The cell is pinned to the FIELD's resolution, not the footprint's
-        // size: l0 = CLOUD_SCALE_K*diag is cloud_cover's coarsest octave and
-        // l0/2 its finest, so `n` cells per l0 resolves it regardless of how
-        // far the projection spreads.
-        let span = (hx - lx).max(hz - lz).max(1e-3);
-        let l0 = crate::clouds::CLOUD_SCALE_K * diag;
-        let mut cell = l0 / n as f32;
-        // Derive the side from the footprint, then cap. Only a cap forces a
-        // coarser cell — and there the shadow is already fading out.
-        let mut side = (span / cell).ceil() as u32 + 3;
-        if side > CLOUD_SHADOW_MAX {
-            side = CLOUD_SHADOW_MAX;
-            cell = span / (side as f32 - 3.0);
-        }
-        // Snap the origin to a whole cell: FRAME-STATIC anchoring, so the
-        // interpolation error does not slide with the camera (the temporal
-        // upscalers read a moving error as shimmer).
-        let org_x = (lx / cell).floor() * cell - cell;
-        let org_z = (lz / cell).floor() * cell - cell;
-        [org_x, org_z, 1.0 / cell, side as f32]
+        crate::clouds::shadow_grid_row(self.cb_base.sun, self.scene_aabb, p.clouds.diag, self.cloud_shadow_n)
     }
 
     pub fn write_cb(&self, slot: usize, p: &FrameParams) {
@@ -3693,7 +3826,21 @@ impl TraceGpu {
         let _ev = super::pix::scope(list, c"reference");
         unsafe {
             self.bind_common(list, slot);
+            // --sw-rays: the reference kernel's software traversal walks the
+            // BINARY tree at t0 (bind_common binds the wide one in ftree
+            // sessions — a structure the ray loops can't descend).
+            if sw_rays() {
+                list.SetComputeRootShaderResourceView(
+                    RP_SRV0 + SRV_BVH_NODES,
+                    self.sw.bvh_nodes.GetGPUVirtualAddress(),
+                );
+            }
             self.record_cloud_shadow(list);
+            // The reference kernel shades its own sky pixels through
+            // sky_radiance_lod when SKY_LOD > 1 (mirroring cs_leaf), so it needs
+            // the lattice filled + bound too — this is what keeps the exact-zero
+            // wavefront-vs-reference image A/B bit-identical at the default-ON K.
+            self.record_sky_lod(list);
             list.SetPipelineState(&self.pso_reference);
             list.Dispatch(self.rw.div_ceil(8), self.rh.div_ceil(8), 1);
             list.ResourceBarrier(&[uav_barrier(None)]);
@@ -3708,8 +3855,7 @@ impl TraceGpu {
     /// way — and it hid until a `--tod` pose made the shadow non-trivial enough
     /// to reach the fetch at all).
     unsafe fn record_cloud_shadow(&self, list: &ID3D12GraphicsCommandList) {
-        let n = cloud_shadow_n();
-        if n == 0 {
+        if self.cloud_shadow_n == 0 {
             return;
         }
         unsafe {
@@ -3720,8 +3866,35 @@ impl TraceGpu {
             );
             // The live side rides the CB (it is derived per frame), so dispatch
             // the cap and let the kernel retire the tail.
-            let groups = (CLOUD_SHADOW_MAX * CLOUD_SHADOW_MAX).div_ceil(64);
+            let groups =
+                (crate::clouds::CLOUD_SHADOW_MAX * crate::clouds::CLOUD_SHADOW_MAX).div_ceil(64);
             list.SetPipelineState(&self.pso_cloud_shadow);
+            list.Dispatch(groups.min(32768), groups.div_ceil(32768), 1);
+            list.ResourceBarrier(&[uav_barrier(None)]);
+        }
+    }
+
+    /// Fill the amortized cloud lattice (full-screen) and leave it bound at u5
+    /// for the sky passes. Both `cs_sky` (proven-empty rects) and `cs_leaf`'s
+    /// miss branch read it, AND the reference kernel does — so, like
+    /// record_cloud_shadow, EVERY unit that compiles the lattice in must call
+    /// this or its u5 (the tile queue's register, dead by shading) reads garbage
+    /// as float4 (the same device-hang class). Snapshotted k: the buffer was
+    /// sized and the kernel compiled against it in `new()`.
+    unsafe fn record_sky_lod(&self, list: &ID3D12GraphicsCommandList) {
+        let k = self.sky_lod_k;
+        if k <= 1 {
+            return;
+        }
+        unsafe {
+            let _e = super::pix::scope(list, c"sky-lod");
+            list.SetComputeRootUnorderedAccessView(
+                RP_UAV0 + UAV_QIN,
+                self.cloud_lod.GetGPUVirtualAddress(),
+            );
+            let pts = ((self.rw / k) + 2) * ((self.rh / k) + 2);
+            let groups = pts.div_ceil(64);
+            list.SetPipelineState(&self.pso_sky_lod);
             list.Dispatch(groups.min(32768), groups.div_ceil(32768), 1);
             list.ResourceBarrier(&[uav_barrier(None)]);
         }
@@ -3774,6 +3947,17 @@ impl TraceGpu {
         let _ev = super::pix::scope(list, c"wavefront");
         unsafe {
             self.bind_common(list, slot);
+            // --sw-rays + cut consumption: the ladder reads ft_bnode at t1
+            // (tri_idx's register — dead in every ladder kernel) for
+            // level_finish's leaf-cut translation; the leaf/sky block below
+            // rebinds the real tri_idx before any ray fires (the SKY_UNIT
+            // register-remeaning idiom, phase-scoped).
+            if let Some(bn) = &self.sw.ft_bnode {
+                list.SetComputeRootShaderResourceView(
+                    RP_SRV0 + SRV_TRI_IDX,
+                    bn.GetGPUVirtualAddress(),
+                );
+            }
             // Seed sees level 0's queue arrangement (qin = A).
             list.SetComputeRootUnorderedAccessView(RP_UAV0 + UAV_QIN, self.qa.GetGPUVirtualAddress());
             list.SetComputeRootUnorderedAccessView(RP_UAV0 + UAV_QOUT, self.qb.GetGPUVirtualAddress());
@@ -3850,69 +4034,9 @@ impl TraceGpu {
                 self.args_to_uav(list);
             }
 
-            // Leaf + sky fills (disjoint pixels — no barrier between them).
-            {
-                let _ev = super::pix::scope(list, c"leaf+sky");
-                list.SetPipelineState(&self.pso_prep);
-                self.push(list, [CTR_LEAF, NO_RESET, 1, ARG_LEAF]);
-                list.Dispatch(1, 1, 1);
-                // Sky takes the MULTIPLYING prep: SKY_SPLIT groups share each
-                // record so one huge proven-empty rect can't serialize on one
-                // group (see SKY_SPLIT — this was ~70% of the tracer's frame).
-                list.SetPipelineState(&self.pso_prep_mul);
-                self.push(list, [CTR_SKY, NO_RESET, self.sky_split, ARG_SKY]);
-                list.Dispatch(1, 1, 1);
-                self.args_to_indirect(list);
-                // fb frames need the hemi arm; every other frame takes the
-                // slim kernel (leaf.hlsl's LEAF_NO_FB).
-                // The sky passes take u5 for the cloud lattice — the tile
-                // queue's register, dead once the ladder has drained (sky.hlsl
-                // re-declares it; leaf.hlsl keeps `qin` there and never reads
-                // it, so one binding serves both).
-                // The slab-space cloud shadow cache, ahead of ALL shading and
-                // left bound at u6 (the qout register, dead once the ladder has
-                // drained and suppressed in the shading units by SKY_UNIT).
-                self.record_cloud_shadow(list);
-                // The cloud lattice, full-screen and ahead of BOTH consumers:
-                // `cs_sky` (proven-empty rects) and `cs_leaf`'s miss branch
-                // (sky inside leaf tiles) now read it, so it can no longer hide
-                // behind the leaf pass. u5 = the tile queue's register, dead
-                // once the ladder has drained; leaf.hlsl and sky.hlsl both
-                // re-declare it as the lattice (SKY_UNIT), and nothing in
-                // either kernel touches the queues.
-                if sky_lod() > 1 {
-                    let _e = super::pix::scope(list, c"sky-lod");
-                    list.SetComputeRootUnorderedAccessView(
-                        RP_UAV0 + UAV_QIN,
-                        self.cloud_lod.GetGPUVirtualAddress(),
-                    );
-                    let k = sky_lod();
-                    let pts = ((self.rw / k) + 2) * ((self.rh / k) + 2);
-                    let groups = pts.div_ceil(64);
-                    list.SetPipelineState(&self.pso_sky_lod);
-                    list.Dispatch(groups.min(32768), groups.div_ceil(32768), 1);
-                    list.ResourceBarrier(&[uav_barrier(None)]);
-                }
-                let leaf_pso =
-                    if fb_mode > 0 { &self.pso_leaf_fb } else { &self.pso_leaf };
-                list.SetPipelineState(leaf_pso);
-                self.push(list, [CTR_LEAF, 0, 0, 0]);
-                {
-                    // Nested sub-brackets (the level-ladder idiom). No barrier
-                    // separates the two EIs, so `sky` under-reports whatever
-                    // overlapped `leaf`; `leaf` is honest — its end timestamp
-                    // is bottom-of-pipe at the leaf EI's drain.
-                    let _e = super::pix::scope(list, c"leaf");
-                    list.ExecuteIndirect(&self.cmd_sig, 1, &self.args, ARG_LEAF as u64 * 12, None, 0);
-                }
-                list.SetPipelineState(&self.pso_sky);
-                self.push(list, [CTR_SKY, 0, 0, 0]);
-                {
-                    let _e = super::pix::scope(list, c"sky");
-                    list.ExecuteIndirect(&self.cmd_sig, 1, &self.args, ARG_SKY as u64 * 12, None, 0);
-                }
-                self.args_to_uav(list);
-            }
+            // Leaf + sky fills: shared with the replay path, so the two cannot
+            // drift (the level_finish shared-tail idiom).
+            self.record_terminal_fills(list, fb_mode);
 
             if fb_mode > 0 {
                 // Every hit pixel appended a shading point; batch over the
@@ -3921,6 +4045,130 @@ impl TraceGpu {
             }
             self.record_compose(list);
         }
+        // The queues now hold this basis's terminal structure — a later
+        // bit-equal-basis frame under `p.replay` can re-dispatch it (record_frame
+        // decides). Truthful for every producer, verify/check callers included.
+        self.last_struct.set(Some(p.cam));
+    }
+
+    /// The leaf + sky fills (disjoint pixels — no barrier between them) plus the
+    /// per-frame cloud caches they consume. Shared by record_wavefront and
+    /// record_wavefront_replay; must be preceded by the seed (real or replay)
+    /// that set CTR_LEAF/CTR_SKY and by a UAV barrier.
+    unsafe fn record_terminal_fills(&self, list: &ID3D12GraphicsCommandList, fb_mode: u32) {
+        unsafe {
+            let _ev = super::pix::scope(list, c"leaf+sky");
+            list.SetPipelineState(&self.pso_prep);
+            self.push(list, [CTR_LEAF, NO_RESET, 1, ARG_LEAF]);
+            list.Dispatch(1, 1, 1);
+            // Sky takes the MULTIPLYING prep: SKY_SPLIT groups share each
+            // record so one huge proven-empty rect can't serialize on one
+            // group (see SKY_SPLIT — this was ~70% of the tracer's frame).
+            list.SetPipelineState(&self.pso_prep_mul);
+            self.push(list, [CTR_SKY, NO_RESET, self.sky_split, ARG_SKY]);
+            list.Dispatch(1, 1, 1);
+            self.args_to_indirect(list);
+            // fb frames need the hemi arm; every other frame takes the
+            // slim kernel (leaf.hlsl's LEAF_NO_FB).
+            // The slab-space cloud shadow cache, ahead of ALL shading and
+            // left bound at u6 (the qout register, dead once the ladder has
+            // drained and suppressed in the shading units by SKY_UNIT).
+            self.record_cloud_shadow(list);
+            // The cloud lattice, full-screen and ahead of BOTH consumers:
+            // `cs_sky` (proven-empty rects) and `cs_leaf`'s miss branch
+            // (sky inside leaf tiles). u5 = the tile queue's register, dead
+            // once the ladder has drained; both re-declare it (SKY_UNIT).
+            self.record_sky_lod(list);
+            // --sw-rays: the leaf kernel's software ray traversal walks
+            // the BINARY tree at t0 (bind_common bound the wide one for
+            // the ladder — a structure the ray loops can't descend) and
+            // the real tri_idx at t1 (the ladder may hold ft_bnode there)
+            // — the record_hemi rebind precedent.
+            if sw_rays() {
+                list.SetComputeRootShaderResourceView(
+                    RP_SRV0 + SRV_BVH_NODES,
+                    self.sw.bvh_nodes.GetGPUVirtualAddress(),
+                );
+                list.SetComputeRootShaderResourceView(
+                    RP_SRV0 + SRV_TRI_IDX,
+                    self.sw.tri_idx.GetGPUVirtualAddress(),
+                );
+            }
+            let leaf_pso = if fb_mode > 0 { &self.pso_leaf_fb } else { &self.pso_leaf };
+            list.SetPipelineState(leaf_pso);
+            self.push(list, [CTR_LEAF, 0, 0, 0]);
+            {
+                // Nested sub-brackets (the level-ladder idiom). No barrier
+                // separates the two EIs, so `sky` under-reports whatever
+                // overlapped `leaf`; `leaf` is honest — its end timestamp
+                // is bottom-of-pipe at the leaf EI's drain.
+                let _e = super::pix::scope(list, c"leaf");
+                list.ExecuteIndirect(&self.cmd_sig, 1, &self.args, ARG_LEAF as u64 * 12, None, 0);
+            }
+            list.SetPipelineState(&self.pso_sky);
+            self.push(list, [CTR_SKY, 0, 0, 0]);
+            {
+                let _e = super::pix::scope(list, c"sky");
+                list.ExecuteIndirect(&self.cmd_sig, 1, &self.args, ARG_SKY as u64 * 12, None, 0);
+            }
+            self.args_to_uav(list);
+        }
+    }
+
+    /// Structure replay: a frame whose basis bit-equals the previous producing
+    /// frame's re-dispatches the persisted terminal queues (qleaf/qsky/cut_pool
+    /// + CTR_LEAF/CTR_SKY/CTR_CUT) and skips seed + the whole level ladder — the
+    /// GPU mirror of render::render_frame_replay. The structure is a pure
+    /// function of (scene, BVH, basis, rw, rh); spp/jitter/frame/fb/quality/
+    /// clouds all ride the CB, so a replay frame's shading is fresh. The CALLER
+    /// (record_frame) proves the bit-equality; this leaves last_struct untouched
+    /// (a replay does not change what the queues hold).
+    pub fn record_wavefront_replay(
+        &self,
+        list: &ID3D12GraphicsCommandList,
+        slot: usize,
+        p: &FrameParams,
+        clear_sentinel: bool,
+    ) {
+        let fb_mode = fb_mode_of(&p.q);
+        let _ev = super::pix::scope(list, c"wavefront-replay");
+        unsafe {
+            self.bind_common(list, slot);
+            // Root UAVs u5/u6 are NOT bound by bind_common; the replay list is
+            // fresh, so bind qa/qb before any dispatch (the cloud passes below
+            // rebind them as the lattice/cache, exactly as the full path does).
+            list.SetComputeRootUnorderedAccessView(RP_UAV0 + UAV_QIN, self.qa.GetGPUVirtualAddress());
+            list.SetComputeRootUnorderedAccessView(RP_UAV0 + UAV_QOUT, self.qb.GetGPUVirtualAddress());
+            // Keep CTR_LEAF/CTR_SKY/CTR_CUT (the persisted terminal counts),
+            // zero everything else the fills/hemi would otherwise accumulate.
+            list.SetPipelineState(&self.pso_seed_replay);
+            list.Dispatch(1, 1, 1);
+            if clear_sentinel {
+                let px = self.rw * self.rh;
+                let groups = px.div_ceil(256);
+                list.SetPipelineState(&self.pso_clear_info);
+                list.Dispatch(groups.min(32768), groups.div_ceil(32768), 1);
+            }
+            if fb_mode > 0 {
+                let groups = (self.rw * self.rh * 4).div_ceil(256);
+                list.SetPipelineState(&self.pso_clear_h);
+                list.Dispatch(groups.min(32768), groups.div_ceil(32768), 1);
+            }
+            list.ResourceBarrier(&[uav_barrier(None)]);
+            self.record_terminal_fills(list, fb_mode);
+            if fb_mode > 0 {
+                self.record_hemi(list, self.rw * self.rh, p.q.fb.depth);
+            }
+            self.record_compose(list);
+        }
+    }
+
+    /// Drop the replay key. Called when a recorded-but-never-executed producing
+    /// frame is aborted (the queues then hold the OLD basis while `last_struct`
+    /// would claim the NEW one), and when a hemi-probe seed zeroes the terminal
+    /// counts out from under the persisted structure.
+    pub fn invalidate_replay(&self) {
+        self.last_struct.set(None);
     }
 
     /// The hemisphere wavefront over the points in the hemi queue, in
@@ -4022,7 +4270,15 @@ impl TraceGpu {
     /// it renders the sampled-ambient path.)
     pub fn record_frame(&self, list: &ID3D12GraphicsCommandList, slot: usize, p: &FrameParams, hybrid: bool) {
         if hybrid {
-            self.record_wavefront(list, slot, p, false);
+            // Structure replay: a bit-equal basis under `p.replay` re-dispatches
+            // the persisted terminal queues instead of re-running seed + the
+            // ladder. record_reference is a verified non-clobber (its unit
+            // declares no counters/queues), so the R toggle round-trips free.
+            if p.replay && self.last_struct.get() == Some(p.cam) {
+                self.record_wavefront_replay(list, slot, p, false);
+            } else {
+                self.record_wavefront(list, slot, p, false);
+            }
         } else {
             self.record_reference(list, slot);
         }
@@ -4044,6 +4300,9 @@ impl TraceGpu {
         fb_depth: u32,
         clear: bool,
     ) -> Result<()> {
+        // cs_seed_probes zeroes CTR_LEAF/CTR_SKY, so the persisted terminal
+        // structure is no longer valid after this — drop the replay key.
+        self.invalidate_replay();
         assert!(probes.len() <= (self.rw * self.rh) as usize);
         let mut bytes = Vec::with_capacity(probes.len() * 32);
         for (i, (o, n)) in probes.iter().enumerate() {
@@ -4613,7 +4872,7 @@ pub fn bc7_fidelity(
         let mse = sq / (t.texels.len() as f64 * 3.0);
         let psnr = if mse > 0.0 { 10.0 * (255.0f64 * 255.0 / mse).log10() } else { 99.0 };
         // Per-texture diagnostic (which texture holds the worst PSNR): the
-        // FR_SKY_LOD env-lever idiom, read-only and off by default.
+        // FR_ABL read-only-probe idiom, off by default.
         if std::env::var_os("FR_BC7_DUMP").is_some() {
             eprintln!(
                 "bc7 fid: {:>7.1} dB  {}x{} srgb={} {}",

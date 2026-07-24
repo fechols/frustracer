@@ -17,14 +17,21 @@ struct TileRec {
     uint path;     // 2 bits/level quadrant path (TL=0 TR=1 BL=2 BR=3)
 };
 
-// A leaf tile (both dims <= LEAF_TILE): per-pixel RayQuery with
-// TMin = t_start. No cut — hardware traversal from the root subsumes
-// cut-seeding; the inherited ball claim rides in t_start alone. 16 bytes.
+// A leaf tile (both dims <= LEAF_TILE): per-pixel rays with TMin = t_start.
+// The cut rides along for --sw-rays (SW_RAYS_LEAF: trace_closest_multi seeds
+// traversal from these BINARY node ids — under FTREE the emitter translates
+// the slot-ref cut via ft_bnode at enqueue); RayQuery arms ignore it —
+// hardware traversal from the root subsumes cut-seeding there and the
+// inherited ball claim rides in t_start alone. 24 bytes (one struct, no
+// lever-forked stride — the fields are always written, read only under the
+// lever; trace.rs::LEAF_REC_BYTES and main.rs's readback move in lockstep).
 struct LeafRec {
     uint xy0;
     uint xy1;
     float t_start;
     uint depth;
+    uint cut_slot; // ROOT_CUT_SLOT = traverse from the binary root
+    uint cut_len;
 };
 
 // A tile whose whole frustum was proven empty. 16 bytes.

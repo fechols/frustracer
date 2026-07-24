@@ -4,6 +4,18 @@
 // ExecuteIndirect. Requires trace_common.hlsli + queues.hlsli +
 // frustum.hlsli pasted first.
 
+// --sw-rays under FTREE: the wide-tree slot->binary-node map (ftree.rs
+// FNode.bnode, which the quantized QFNode wire format deliberately drops),
+// flat nodes x 8, bound at t1 for the level ladder ONLY — t1 (tri_idx) is
+// dead in every ladder kernel, and record_wavefront rebinds the real
+// tri_idx before the leaf/sky dispatches (the SKY_UNIT register-remeaning
+// idiom). Read exclusively by the leaf-cut translation in level_finish.
+// SW_RAYS_LEAF (not SW_RAYS): under --sw-rays --no-cut-rays the leaf never
+// consumes a cut, so neither the map nor the translation compiles.
+#if defined(SW_RAYS_LEAF) && defined(FTREE)
+StructuredBuffer<uint> ft_bnode : register(t1);
+#endif
+
 // --- seed: reset counters + cut pool bump, enqueue the whole-screen root ---
 
 [numthreads(1, 1, 1)]
@@ -16,6 +28,8 @@ void cs_seed(uint3 id : SV_DispatchThreadID) {
         lf.xy1 = pack_xy(rw, rh);
         lf.t_start = 0.0;
         lf.depth = 0;
+        lf.cut_slot = ROOT_CUT_SLOT; // the root cut [0]
+        lf.cut_len = 1u;
         qleaf[0] = lf;
         counters[CTR_LEAF] = 1;
         return;
@@ -29,6 +43,24 @@ void cs_seed(uint3 id : SV_DispatchThreadID) {
     root.path = 0u;
     qin[0] = root;
     counters[CTR_TILE_A] = 1;
+}
+
+// --- replay seed: a bit-equal-basis frame skips seed + the whole ladder -----
+// The previous producing frame's TERMINAL structure — qleaf/qsky/cut_pool and
+// their counts CTR_LEAF/CTR_SKY/CTR_CUT — is byte-intact between producing
+// frames (only cs_seed + the ladder ever write it; the leaf/sky/hemi passes
+// only read it, hemi rebinds transient buffers at u7/u9, and the reference/
+// feed/nppd units declare no counters or queues). So a replay frame re-runs
+// ONLY the terminal fills. Zero every OTHER counter — the tile counts, the
+// stats, the verify slots, and CTR_HEMI_PT, which the fb leaf pass is about to
+// append into again — but KEEP the three the fills consume. (The keep-set is
+// the cs_seed_probes pattern; the caller proves basis bit-equality.)
+[numthreads(1, 1, 1)]
+void cs_seed_replay(uint3 id : SV_DispatchThreadID) {
+    for (uint i = 0; i < CTR_COUNT; ++i) {
+        bool keep = i == CTR_LEAF || i == CTR_SKY || i == CTR_CUT;
+        if (!keep) counters[i] = 0;
+    }
 }
 
 // --- prep-args: counter -> DispatchIndirect groups (2D split past 32768) ---
@@ -298,6 +330,44 @@ void level_finish(TileRec rec, uint2 p0, uint2 p1, uint depth, uint cut_len, TF 
     uint cy0[4] = { p0.y, p0.y, ym, ym };
     uint cx1[4] = { xm, p1.x, xm, p1.x };
     uint cy1[4] = { ym, ym, p1.y, p1.y };
+
+    // The cut a leaf child consumes: the SAME (out_slot, out_len) its sibling
+    // TileRecs inherit — the CPU's "leaf tiles use the inherited cut without
+    // re-culling". Under --sw-rays + FTREE the refined entries are wide
+    // slot-refs, but rays seed from BINARY node ids, so translate ONCE per
+    // split (only when a leaf child exists) into a fresh pool slot via
+    // ft_bnode — a pure relabeling: every occupied slot IS a binary node
+    // (ftree self-test's slot audit). ROOT_CUT_SLOT passes through (rays
+    // then traverse from the binary root) and pool exhaustion falls back to
+    // it — coarse, never wrong (the refine fallback's own shape).
+    uint leaf_slot = out_slot;
+    uint leaf_len = out_len;
+#if defined(SW_RAYS_LEAF) && defined(FTREE)
+    if (out_slot != ROOT_CUT_SLOT) {
+        bool any_leaf = false;
+        [unroll] for (uint lc = 0; lc < 4; ++lc) {
+            uint lw = cx1[lc] - cx0[lc];
+            uint lh = cy1[lc] - cy0[lc];
+            if (lw != 0 && lh != 0 && lw <= LEAF_TILE && lh <= LEAF_TILE)
+                any_leaf = true;
+        }
+        if (any_leaf) {
+            uint ts;
+            InterlockedAdd(counters[CTR_CUT], 1, ts);
+            if (ts < cap_cut) {
+                for (uint i = 0; i < leaf_len; ++i) {
+                    uint e = cut_pool[out_slot * 64u + i];
+                    cut_pool[ts * 64u + i] = ft_bnode[(e >> 3u) * 8u + (e & 7u)];
+                }
+                leaf_slot = ts;
+            } else {
+                InterlockedAdd(counters[CTR_CUT_FALLBACK], 1, ts);
+                leaf_slot = ROOT_CUT_SLOT;
+            }
+        }
+    }
+#endif
+
     [unroll] for (uint c = 0; c < 4; ++c) {
         uint w = cx1[c] - cx0[c];
         uint h = cy1[c] - cy0[c];
@@ -310,6 +380,8 @@ void level_finish(TileRec rec, uint2 p0, uint2 p1, uint depth, uint cut_len, TF 
                 lf.xy1 = pack_xy(cx1[c], cy1[c]);
                 lf.t_start = tc;
                 lf.depth = d;
+                lf.cut_slot = leaf_slot;
+                lf.cut_len = leaf_len;
                 qleaf[s] = lf;
             } else {
                 InterlockedAdd(counters[CTR_OVERFLOW], 1, s);

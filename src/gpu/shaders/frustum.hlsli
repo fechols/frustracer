@@ -27,6 +27,10 @@ struct BvhNode {
     uint count;      // > 0: leaf over tri_idx[left_first..+count]
 };
 StructuredBuffer<BvhNode> bvh_nodes : register(t0);
+// rt_sw.hlsli (--sw-rays) re-declares these when a unit pastes it without
+// this file (leaf/reference/hemi_leaf); the guard keeps hemi_wave — which
+// pastes both — from declaring t0 twice.
+#define HAVE_BVH_NODES 1
 #endif
 
 #define LANE_STACK 64u

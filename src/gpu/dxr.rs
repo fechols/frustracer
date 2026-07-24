@@ -26,7 +26,7 @@ use super::trace::{
     self, FrameCb, FrameParams, SceneGpu, CB_STRIDE, RP_FRAME_CBV, RP_GBUF, RP_PUSH,
     RP_SCENE_TEX, RP_SRV0, RP_TEX, RP_UAV0, SRV_INDICES, SRV_MATERIALS, SRV_NORMALS,
     SRV_POSITIONS, SRV_TLAS, SRV_TRI_MAT, TEX_HEAP_BASE, TEX_TABLE_BUFS, UAV_ACCUM, UAV_INFO,
-    UAV_TBUF,
+    UAV_QIN, UAV_QOUT, UAV_TBUF,
 };
 use crate::scene::Scene;
 use windows::core::{Interface, PCWSTR};
@@ -113,6 +113,18 @@ pub struct DxrGpu {
     state: ID3D12StateObject,
     sbt: d3d12::UploadBuffer,
     pso_resolve: ID3D12PipelineState,
+    /// The cloud-cache fill kernels + their buffers (u5/u6), armed per the
+    /// snapshotted levers. `None` when the respective cache is off. bound before
+    /// DispatchRays and left resident for the whole ray dispatch.
+    pso_sky_lod: Option<ID3D12PipelineState>,
+    pso_cloud_shadow: Option<ID3D12PipelineState>,
+    cloud_lod: ID3D12Resource,
+    cloud_shadow: ID3D12Resource,
+    /// Snapshotted cloud-cache levers (see the assembly comment) + the scene
+    /// AABB the slab-space shadow grid spans.
+    sky_lod_k: u32,
+    cloud_shadow_n: u32,
+    scene_aabb: ([f32; 3], [f32; 3]),
     /// The shared scene core — the SAME Rc the wavefront tracer holds (cached
     /// in GpuContext), so a session running both pays the scene VRAM once.
     pub scene: std::rc::Rc<SceneGpu>,
@@ -220,17 +232,38 @@ impl DxrGpu {
             trace::trans_defs(scene),
             trace::blas_defs()
         );
+        // The cloud shading caches, snapshotted at construction like TraceGpu:
+        // the library is compiled against these, the buffers sized against them,
+        // and record_frame's fills / write_cb's grid all read the fields, so a
+        // mid-process A/B (the --check-dxr on/off gate flips the static between
+        // two DxrGpu builds) can never desync a shader from its fill dispatch.
+        let sky_lod_k = trace::sky_lod();
+        let cloud_shadow_n = trace::cloud_shadow_n();
+        // The two cache defines arm trace_common's cached cloud_sun_transmittance
+        // (u6) + skylod.hlsli's sky_radiance_lod (u5) for EVERY shade path in the
+        // library — parity inherited, not re-ported. u5/u6 are unbound in the DXR
+        // root signature today (the wavefront's tile queues), so binding dedicated
+        // buffers there needs no root-signature change.
+        let cloud_defs = format!(
+            "#define CLOUD_SHADOW_N {cloud_shadow_n}\n#define SKY_LOD {sky_lod_k}\n#define SKY_LOD_LOG {}",
+            sky_lod_k.trailing_zeros()
+        );
         // Mode 0 assembles EXACTLY the shipping sequence (the lever's
         // off-state is byte-identical source, not merely equivalent); armed
         // modes prepend the define and paste rt.hlsli's RayQuery primitives
         // ahead of rt_dxr.hlsli, whose TraceRay flavors + tlas/HitInfo
-        // compile out under DXR_INLINE_SEC.
+        // compile out under DXR_INLINE_SEC. The two cache defines ride in every
+        // mode (the shipping sequence now carries them; mode 0 stays
+        // byte-identical ACROSS inline modes, the lever's actual contract).
         let inline_def = format!("#define DXR_INLINE_SEC {inline_mode}");
-        let mut parts = vec![defs.as_str(), sd];
+        let mut parts = vec![defs.as_str(), sd, cloud_defs.as_str()];
         if inline_mode > 0 {
             parts.push(inline_def.as_str());
         }
         parts.push(trace::TRACE_COMMON_HLSLI);
+        // skylod.hlsli after trace_common (needs sky_compose/sky_backdrop/rw); no
+        // SKY_UNIT — this unit pastes no queues.hlsli, so u5 is free anyway.
+        parts.push(trace::SKYLOD_HLSLI);
         if inline_mode > 0 {
             parts.push(trace::RT_HLSLI);
         }
@@ -245,6 +278,27 @@ impl DxrGpu {
             &dxc.compile(&resolve_src, "cs_resolve", "cs_6_3", "dxr resolve", debug)?,
             "dxr resolve",
         )?;
+        // The cloud-cache FILL kernels (cs_sky_lod / cs_cloud_shadow), from the
+        // SHARED sky_unit_src so they cannot drift from the wavefront's — plain
+        // compute (no rays), so cs_6_3 like the resolve/feed kernels. Compiled
+        // only when the respective cache is armed; None otherwise.
+        let (pso_sky_lod, pso_cloud_shadow) = if sky_lod_k > 1 || cloud_shadow_n > 0 {
+            let sky_unit = trace::sky_unit_src(sky_lod_k, cloud_shadow_n);
+            let mk = |entry: &str, name: &str| -> Result<Option<ID3D12PipelineState>> {
+                Ok(Some(trace::compute_pso(
+                    device,
+                    &root_sig,
+                    &dxc.compile(&sky_unit, entry, "cs_6_3", name, debug)?,
+                    name,
+                )?))
+            };
+            (
+                if sky_lod_k > 1 { mk("cs_sky_lod", "dxr sky_lod")? } else { None },
+                if cloud_shadow_n > 0 { mk("cs_cloud_shadow", "dxr cloud_shadow")? } else { None },
+            )
+        } else {
+            (None, None)
+        };
         // Upscaler sessions: the same feed kernels the wavefront runs, at
         // this pipeline's cs_6_3 cap floor (feed.hlsl needs nothing newer).
         let (pso_feed_xess, pso_feed_rr, pso_feed_fsr_rr) = if gbuf_full {
@@ -426,6 +480,15 @@ impl DxrGpu {
             uaf,
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
         )?;
+        // The cloud caches (sized exactly as TraceGpu's). One float4 per lattice
+        // point + a one-point border; N*N scalar transmittances at the cap.
+        let lw = (rw >> sky_lod_k.trailing_zeros()) as u64 + 2;
+        let lh = (rh >> sky_lod_k.trailing_zeros()) as u64 + 2;
+        let cloud_lod = committed_buffer(device, (lw * lh).max(1) * 16, uaf, ua)?;
+        let csn_n =
+            if cloud_shadow_n > 0 { crate::clouds::CLOUD_SHADOW_MAX as u64 } else { 1 };
+        let cloud_shadow = committed_buffer(device, csn_n * csn_n * 4, uaf, ua)?;
+        let scene_aabb = trace::scene_shadow_aabb(scene);
         // FEED_SETS copies of the RP_TEX table (hdr resolve target at each set's
         // offset 0, then that set's feed planes — wired later), then slots
         // TEX_HEAP_BASE.. = the RP_SCENE_TEX scene table — the tracer's heap
@@ -464,11 +527,21 @@ impl DxrGpu {
         name(&hdr, "dxr.hdr");
         name(&gbuf, if gbuf_full { "dxr.gbuf" } else { "dxr.gbuf_dummy" });
 
+        name(&cloud_lod, "dxr.cloud_lod");
+        name(&cloud_shadow, "dxr.cloud_shadow");
+
         Ok(Self {
             root_sig,
             state,
             sbt,
             pso_resolve,
+            pso_sky_lod,
+            pso_cloud_shadow,
+            cloud_lod,
+            cloud_shadow,
+            sky_lod_k,
+            cloud_shadow_n,
+            scene_aabb,
             scene: scene_gpu,
             accum,
             tbuf,
@@ -494,9 +567,19 @@ impl DxrGpu {
         // One FSR4-RR subscriber among the wired engines is enough to arm the
         // pack's signal lanes (--quinlight can wire several).
         let fsr_sig = self.feed.iter().any(|(k, _)| matches!(k, trace::FeedKind::FsrRr));
-        self.cb_base
-            .with_frame(p, self.gbuf_full, fsr_sig)
-            .store(unsafe { self.frame_cb.ptr.add(slot * CB_STRIDE) });
+        let mut cb = self.cb_base.with_frame(p, self.gbuf_full, fsr_sig);
+        // The per-frame slab-space shadow grid (the shared shadow_grid_row —
+        // one source of truth with TraceGpu); zero when the cache is off or
+        // clouds are disabled (cloud_sun_transmittance then takes its exact arm).
+        if self.cloud_shadow_n > 0 && p.clouds.enabled {
+            cb.cloud_grid = crate::clouds::shadow_grid_row(
+                self.cb_base.sun,
+                self.scene_aabb,
+                p.clouds.diag,
+                self.cloud_shadow_n,
+            );
+        }
+        cb.store(unsafe { self.frame_cb.ptr.add(slot * CB_STRIDE) });
     }
 
     /// Re-derive the base CB's sun/sky rows after a TOD change —
@@ -626,6 +709,38 @@ impl DxrGpu {
         let _ev = super::pix::scope(list, c"dxr");
         unsafe {
             self.bind_common(list, slot);
+            // The cloud caches, ahead of the ray dispatch and left bound at
+            // u6/u5 for the whole DispatchRays. record_frame is the ONE dispatch
+            // site (session chains AND --check-dxr route through it), so the
+            // "every compiling path must fill or the shader reads garbage as
+            // float4 = device hang" contract (trace.rs::record_cloud_shadow's
+            // war story) holds structurally. The root-descriptor bindings
+            // persist on the list, so the DispatchRays below reads them.
+            if let Some(pso) = &self.pso_cloud_shadow {
+                let _e = super::pix::scope(list, c"dxr-cloud-shadow");
+                list.SetComputeRootUnorderedAccessView(
+                    RP_UAV0 + UAV_QOUT,
+                    self.cloud_shadow.GetGPUVirtualAddress(),
+                );
+                let groups = (crate::clouds::CLOUD_SHADOW_MAX * crate::clouds::CLOUD_SHADOW_MAX)
+                    .div_ceil(64);
+                list.SetPipelineState(pso);
+                list.Dispatch(groups.min(32768), groups.div_ceil(32768), 1);
+                list.ResourceBarrier(&[uav_barrier(None)]);
+            }
+            if let Some(pso) = &self.pso_sky_lod {
+                let _e = super::pix::scope(list, c"dxr-sky-lod");
+                list.SetComputeRootUnorderedAccessView(
+                    RP_UAV0 + UAV_QIN,
+                    self.cloud_lod.GetGPUVirtualAddress(),
+                );
+                let k = self.sky_lod_k;
+                let pts = ((self.rw / k) + 2) * ((self.rh / k) + 2);
+                let groups = pts.div_ceil(64);
+                list.SetPipelineState(pso);
+                list.Dispatch(groups.min(32768), groups.div_ceil(32768), 1);
+                list.ResourceBarrier(&[uav_barrier(None)]);
+            }
             list4.SetPipelineState1(&self.state);
             let va = self.sbt.resource.GetGPUVirtualAddress();
             let desc = D3D12_DISPATCH_RAYS_DESC {

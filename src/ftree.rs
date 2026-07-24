@@ -165,6 +165,17 @@ impl FTree {
         self.nodes.len() * std::mem::size_of::<QFNode>()
     }
 
+    /// Flat `nodes × 8` slot→binary-node map for the GPU's `--sw-rays`
+    /// leaf-cut translation (`ft_bnode[(e >> 3) * 8 + (e & 7)]` — the HLSL
+    /// mirror of `to_bvh_roots`' `bnode[slot]` lookup). Uploaded only under
+    /// that lever; the quantized QFNode wire format deliberately keeps
+    /// dropping `bnode` for every other session. `INVALID` lanes ride along
+    /// unread — cut entries only ever reference occupied slots by
+    /// construction (`refine_cut` emits from the occupancy set).
+    pub fn bnode_flat(&self) -> Vec<u32> {
+        self.nodes.iter().flat_map(|n| n.bnode).collect()
+    }
+
     /// Convert to the GPU wire format (QFNode): per node, a frame over the
     /// occupied slots' f32 boxes and every face quantized OUTWARD against
     /// the exact decode expression. Node ids (and so slot-ref cuts) are

@@ -181,6 +181,12 @@ opt_fields! {
         pub tod: f32,
         /// --aniso 1..=16 (restart: baked into the GPU static sampler)
         pub aniso: u32,
+        /// --cloud-shadow N (restart: 0 = off; 2..=64 cells/λ; GPU shading
+        /// cache, snapshotted at TraceGpu/DxrGpu construction)
+        pub cloud_shadow: u32,
+        /// --sky-lod K (restart: 1 = off; power of two 2..=32; GPU sky-march
+        /// lattice pitch)
+        pub sky_lod: u32,
         /// --no-mips inverse (restart: load-time)
         pub mips: bool,
         /// --no-h2n inverse (restart: load-time, keys the scene cache)
@@ -789,6 +795,20 @@ pub fn apply_globals(s: &Settings) {
             warn("effects.aniso", &n.to_string());
         }
     }
+    if let Some(n) = e.cloud_shadow {
+        if n == 0 || (2..=64).contains(&n) {
+            crate::gpu::trace::set_cloud_shadow(n);
+        } else {
+            warn("effects.cloud_shadow", &n.to_string());
+        }
+    }
+    if let Some(k) = e.sky_lod {
+        if k.is_power_of_two() && (1..=32).contains(&k) {
+            crate::gpu::trace::set_sky_lod(k);
+        } else {
+            warn("effects.sky_lod", &k.to_string());
+        }
+    }
     if let Some(v) = e.h2n {
         crate::texture::set_h2n(v);
     }
@@ -991,6 +1011,12 @@ pub fn menu_items() -> &'static [MenuItem] {
             item!("fireflies", "fireflies (night)", "Effects", Live, Toggle { default: true }, acc_bool!(effects.fireflies)),
             item!("fireflies_count", "firefly count", "Effects", Live, StepU { min: 8, max: 64, step: 8, default: 32 }, acc_u32!(effects.fireflies_count)),
             item!("aniso", "max anisotropy", "Effects", Restart, Cycle { options: &["1", "2", "4", "8", "16"], default_ix: 4 }, acc_u32!(effects.aniso)),
+            item!("cloud_shadow", "cloud shadow cache (cells/λ; off)", "Effects", Restart, Cycle { options: &["off", "8", "16", "32", "64"], default_ix: 2 }, ((|s: &Settings| s.effects.cloud_shadow.map(|v| if v == 0 { "off".into() } else { v.to_string() })), (|s: &mut Settings, v: &str| {
+                s.effects.cloud_shadow = if v == "off" { Some(0) } else { v.parse().ok() };
+            }))),
+            item!("sky_lod", "sky march lattice (1/K px; off)", "Effects", Restart, Cycle { options: &["off", "2", "4", "8", "16"], default_ix: 2 }, ((|s: &Settings| s.effects.sky_lod.map(|v| if v <= 1 { "off".into() } else { v.to_string() })), (|s: &mut Settings, v: &str| {
+                s.effects.sky_lod = if v == "off" { Some(1) } else { v.parse().ok() };
+            }))),
             item!("mips", "texture mip chains", "Effects", Restart, Toggle { default: true }, acc_bool!(effects.mips)),
             item!("h2n", "height-to-normal convert", "Effects", Restart, Toggle { default: true }, acc_bool!(effects.h2n)),
             item!("n2h", "normal-to-height derive", "Effects", Restart, Toggle { default: true }, acc_bool!(effects.n2h)),
@@ -1310,6 +1336,8 @@ pub fn self_test() -> Result<(), String> {
     full.upscaler.chain = Some("fsr3".into());
     full.upscaler.fg = Some(false);
     full.effects.fireflies_count = Some(24);
+    full.effects.cloud_shadow = Some(0);
+    full.effects.sky_lod = Some(8);
     full.advanced.blas_split = Some(0);
     let j = serde_json::to_string(&full).map_err(|e| format!("serialize full: {e}"))?;
     let back: Settings = serde_json::from_str(&j).map_err(|e| format!("full parse: {e}"))?;
@@ -1398,6 +1426,14 @@ pub fn self_test() -> Result<(), String> {
             ("bvh_builder", Control::Cycle { options, .. }) => {
                 options.iter().all(|o| matches!(*o, "sah" | "lbvh" | "ploc" | "som"))
             }
+            // The cloud-cache Cycles map "off" ↔ 0/1 and otherwise carry a
+            // value apply_globals accepts (the vocab-vs-validation drift guard).
+            ("cloud_shadow", Control::Cycle { options, .. }) => options
+                .iter()
+                .all(|o| *o == "off" || o.parse::<u32>().is_ok_and(|n| (2..=64).contains(&n))),
+            ("sky_lod", Control::Cycle { options, .. }) => options.iter().all(|o| {
+                *o == "off" || o.parse::<u32>().is_ok_and(|k| k.is_power_of_two() && (2..=32).contains(&k))
+            }),
             _ => true,
         };
         if !ok {

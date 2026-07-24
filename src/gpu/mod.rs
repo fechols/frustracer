@@ -1068,7 +1068,7 @@ impl GpuContext {
                         "fg: raw-NGX DLSS-G armed (no Streamline pacer — pair-present; feature \
                          created on the first frame)"
                     );
-                    // Empirical-settling levers (env vars, the FR_SKY_LOD
+                    // Empirical-settling levers (env vars, the FR_ABL
                     // idiom — quinlight settled the snippet's conventions
                     // against zero MVs / zero jitter / [0,1] luma-depth, so
                     // the motion-dependent ones are settled HERE instead).
@@ -2289,6 +2289,18 @@ impl GpuContext {
         }
     }
 
+    /// Drop the wavefront tracer's structure-replay key. main.rs calls this on
+    /// every GPU-present error arm: a present chain that recorded a producing
+    /// frame and then aborted it (the list never executed) would leave the key
+    /// claiming a structure the GPU never built. Invalidating on ANY present
+    /// error covers that from one place — harmless when the frame replayed or
+    /// aborted before recording (it only forces the next frame to re-produce).
+    pub fn invalidate_replay(&self) {
+        if let Some(t) = &self.trace {
+            t.invalidate_replay();
+        }
+    }
+
     /// Build the DXR DispatchRays pipeline (the F key / --dxr). Idempotent —
     /// a live pipeline is kept. `(rw, rh)` is the session's fixed DXR trace
     /// resolution (the locked render res when `gbuf` composes with the wired
@@ -3023,6 +3035,9 @@ impl GpuContext {
             // C verify then exercises the cloud code the session actually runs.
             clouds,
             fireflies,
+            // verify_trace calls record_wavefront directly (not record_frame),
+            // so this is dead — but the field must be set.
+            replay: false,
         };
         {
             // Field-split borrow: run_once needs d3d mutably, the recorder

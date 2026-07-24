@@ -35,8 +35,17 @@ void cs_reference(uint3 id : SV_DispatchThreadID) {
         } else {
             // A DISPLAY path: the camera's own miss sees the sun DISC (sky.rs).
             // Cloud phase per (pixel, frame, SAMPLE) — the leaf kernel's twin.
+#if SKY_LOD > 1
+            // The amortized cloud lattice (record_sky_lod fills it before this
+            // dispatch), read through the EXACT same sky_radiance_lod cs_leaf
+            // uses — this is what keeps the wavefront-vs-reference image A/B
+            // bit-identical at the default-ON K. Keep textually in lockstep with
+            // leaf.hlsl's arm.
+            c = sky_radiance_lod(dir, id.x, id.y);
+#else
             c = sky_radiance(cam_origin.xyz, dir, pixel_cone * 0.5, frame,
                              cloud_dither_k(id.xy, frame, s, spp));
+#endif
             t = INF;
             if (prim) gbuf_write_sky(pi, sp.x, sp.y, dir);
         }

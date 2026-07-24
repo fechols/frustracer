@@ -24,6 +24,15 @@ void cs_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     uint rec_i = flat_group(gid);
     if (rec_i >= counters[push0]) return;
     LeafRec rec = qleaf[rec_i];
+#ifdef SW_RAYS_LEAF
+    // Anti-vacuity stat (--check-gpu must-fires it): counted once per RECORD,
+    // not per ray — the per-ray InterlockedAdd would tax the very path the
+    // lever exists to measure.
+    if (gtid.x == 0u && rec.cut_slot != ROOT_CUT_SLOT) {
+        uint _c;
+        InterlockedAdd(counters[CTR_SW_CUT_SEED], 1u, _c);
+    }
+#endif
     uint2 p0 = rect_min(rec.xy0);
     uint2 p1 = rect_max(rec.xy1);
     uint w = p1.x - p0.x;
@@ -79,7 +88,17 @@ void cs_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
         // the --spp cost model), the inherited bound explains only 7-21% of
         // that advantage; the rest is tiles proven empty tracing NO rays.
         // Re-run by making this a 0.0 and rebuilding.
+#ifdef SW_RAYS_LEAF
+        // --sw-rays: the software walk can accept what RayQuery cannot — the
+        // tile's node cut. bvh.rs::intersect_multi's semantics: same hit set,
+        // traversal seeded from the surviving frontier instead of the root.
+        // (--sw-rays --no-cut-rays leaves SW_RAYS_LEAF undefined: software
+        // traversal from the root, t_start kept — the CPU's exact compose.)
+        if (trace_closest_multi(cam_origin.xyz, dir, rec.t_start, FLT_MAX,
+                                rec.cut_slot, rec.cut_len, hit)) {
+#else
         if (trace_closest(cam_origin.xyz, dir, rec.t_start, FLT_MAX, hit)) {
+#endif
 #ifdef LEAF_NO_FB
             {
                 c = shade_full(cam_origin.xyz, dir, hit, rng, ps);
