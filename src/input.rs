@@ -9,6 +9,13 @@
 //! events (quit/resize/display/F11) and ESC keep their edges, and EVERY
 //! other event is translated + dispatched into the Slint menu
 //! (hud/events.rs) — toggle keys structurally cannot fire under the menu.
+//! The open mode has two sub-modes, gated by `Hud::text_editing()`: while a
+//! settings TextInput has focus, arrows/Enter forward to Slint (cursor
+//! movement, `accepted`) and WASD arrives as TextInput characters; otherwise
+//! arrows + WASD + Enter become the `menu_*` NAVIGATION edges (consumed, not
+//! forwarded — the session drives Hud::nav/adjust/activate with them, the
+//! same cursor the controller's D-pad moves). Key REPEAT is deliberately
+//! allowed on the nav keys — free OS auto-repeat for held navigation.
 //! Note this only silences SDL-side toggles: the flycam thread reads raw OS
 //! key state and is separately paused by the menu's state machine.
 
@@ -45,6 +52,13 @@ pub struct Edges {
     pub quality: Option<u32>,  // 1/2/3
     pub toggle_hud: bool,      // F1 (compass/clock/keymap overlay)
     pub toggle_fullscreen: bool, // F11 (borderless desktop fullscreen)
+    // Menu-open navigation edges (arrows/WASD/Enter while no text field has
+    // focus — see the module header). The session ORs them with the pad's.
+    pub menu_up: bool,
+    pub menu_down: bool,
+    pub menu_left: bool,
+    pub menu_right: bool,
+    pub menu_activate: bool,
     /// Newest window client size from this frame's Resized/PixelSizeChanged
     /// events (maximize, restore, fullscreen, drag — the last event in the
     /// drain wins). The consumer debounces and commits via `size_in_pixels()`.
@@ -89,9 +103,31 @@ impl Edges {
         self.quality = self.quality.or(o.quality);
         self.toggle_hud |= o.toggle_hud;
         self.toggle_fullscreen |= o.toggle_fullscreen;
+        self.menu_up |= o.menu_up;
+        self.menu_down |= o.menu_down;
+        self.menu_left |= o.menu_left;
+        self.menu_right |= o.menu_right;
+        self.menu_activate |= o.menu_activate;
         self.size_changed = self.size_changed.or(o.size_changed);
         self.display_changed |= o.display_changed;
     }
+}
+
+/// The menu-open navigation keys (arrows + WASD + Enter).
+fn nav_key(k: Keycode) -> bool {
+    matches!(
+        k,
+        Keycode::Up
+            | Keycode::Down
+            | Keycode::Left
+            | Keycode::Right
+            | Keycode::W
+            | Keycode::A
+            | Keycode::S
+            | Keycode::D
+            | Keycode::Return
+            | Keycode::KpEnter
+    )
 }
 
 pub struct Input {
@@ -140,7 +176,10 @@ impl Input {
                 _ => {}
             }
             if let Some(hud) = menu {
-                // Menu open: ESC/F11 stay ours, everything else goes to Slint.
+                // Menu open: ESC/F11 stay ours, nav keys become menu edges
+                // unless a text field owns the keyboard, everything else
+                // goes to Slint.
+                let editing = hud.text_editing();
                 match &ev {
                     Event::KeyDown { keycode: Some(Keycode::Escape), repeat: false, .. } => {
                         e.esc = true
@@ -148,6 +187,23 @@ impl Input {
                     Event::KeyDown { keycode: Some(Keycode::F11), repeat: false, .. } => {
                         e.toggle_fullscreen = true
                     }
+                    // Navigation (repeat ALLOWED — OS auto-repeat drives held
+                    // keys). Consumed here, never also forwarded; the matching
+                    // KeyUps are consumed below for symmetry. While a text
+                    // field is focused these fall through to forward: arrows
+                    // move the cursor, Enter fires `accepted`, and the "wasd"
+                    // characters arrive as TextInput events (letter KeyDowns
+                    // were always dropped by events.rs's `special`).
+                    Event::KeyDown { keycode: Some(k), .. } if !editing && nav_key(*k) => {
+                        match k {
+                            Keycode::Up | Keycode::W => e.menu_up = true,
+                            Keycode::Down | Keycode::S => e.menu_down = true,
+                            Keycode::Left | Keycode::A => e.menu_left = true,
+                            Keycode::Right | Keycode::D => e.menu_right = true,
+                            _ => e.menu_activate = true, // Return | KpEnter
+                        }
+                    }
+                    Event::KeyUp { keycode: Some(k), .. } if !editing && nav_key(*k) => {}
                     _ => {
                         if matches!(
                             &ev,

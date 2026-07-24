@@ -104,6 +104,27 @@ enum MenuPage {
     Settings,
 }
 
+/// Menu selection cursor (controller/keyboard navigation). Rust owns it like
+/// the rest of the menu state; the ui's `sel-*` properties mirror it for the
+/// highlight styling. Mouse hover is deliberately a SEPARATE visual (tint vs
+/// the selection's gold border) — the two input methods never fight.
+#[derive(Clone, Copy, PartialEq)]
+enum Sel {
+    /// Main page: 0 Resume, 1 Settings, 2 Exit.
+    Main(usize),
+    /// Settings page, CATEGORIES column: group tab index (into
+    /// settings::GROUPS). Up/Down walks the tabs and switches the group live;
+    /// Right/A crosses into the rows.
+    Tab(usize),
+    /// Settings page, CATEGORIES column: the Back button, below the tabs
+    /// (Down past the last tab lands here; A returns to the main page).
+    BackBtn,
+    /// Settings page, ROWS column: row index in the current group. Up/Down
+    /// moves between settings; Left/Right changes the value; B returns to the
+    /// categories column.
+    Row(usize),
+}
+
 struct FrustPlatform {
     start: Instant,
 }
@@ -174,6 +195,15 @@ pub struct Hud {
     page: MenuPage,
     group: String,
     actions: Rc<RefCell<Vec<HudAction>>>,
+    /// Navigation cursor (pad/keyboard); `sync_sel` mirrors it to the ui.
+    sel: Sel,
+    /// (id, control tag) per current row — `adjust`/`activate` dispatch on
+    /// the control tag exactly like the row TouchArea/ArrowButton handlers.
+    rows_meta: Vec<(String, &'static str)>,
+    /// True while the settings TextInput has focus (mirrored from the ui's
+    /// `edit-focus` callback): input.rs's gate for keyboard nav — typing
+    /// "wasd" into a text field must not move the selection.
+    text_editing: Rc<std::cell::Cell<bool>>,
 }
 
 const CLEAR: PremultipliedRgbaColor =
@@ -223,6 +253,11 @@ impl Hud {
                 a.borrow_mut().push(HudAction::TextEdit(id.to_string(), text.to_string()));
             });
         }
+        let text_editing = Rc::new(std::cell::Cell::new(false));
+        {
+            let t = text_editing.clone();
+            ui.on_edit_focus(move |f| t.set(f));
+        }
         ui.set_groups(slint::ModelRc::new(slint::VecModel::from(
             crate::settings::GROUPS.iter().map(|g| slint::SharedString::from(*g)).collect::<Vec<_>>(),
         )));
@@ -262,6 +297,9 @@ impl Hud {
             page: MenuPage::Main,
             group: "Display".to_string(),
             actions,
+            sel: Sel::Main(0),
+            rows_meta: Vec::new(),
+            text_editing,
         })
     }
 
@@ -277,6 +315,8 @@ impl Hud {
         self.page = MenuPage::Main;
         self.ui.set_menu_open(true);
         self.ui.set_menu_page("main".into());
+        self.set_sel(Sel::Main(0));
+        self.text_editing.set(false);
         // FRUSTRACER_MENU_PROBE=1 (dev): drive the action queue as if the
         // user clicked Settings and stepped a restart-tier row — the
         // synthetic-input E2E (SDL rewrites posted click coordinates to the
@@ -292,15 +332,30 @@ impl Hud {
     pub fn close_menu(&mut self) {
         self.menu_open = false;
         self.ui.set_menu_open(false);
+        self.text_editing.set(false);
     }
 
-    /// ESC while the menu is open: settings page backs out to the main page
-    /// (returns true = consumed); on the main page it is unconsumed and the
-    /// session closes the menu.
+    /// ESC / pad-B while the menu is open — a hierarchical back-out matching
+    /// the two-column settings model: rows focus -> categories, categories
+    /// focus -> main page, main page -> unconsumed (the session closes the
+    /// menu). Returns true = consumed (stay open).
     pub fn escape(&mut self) -> bool {
         if self.page == MenuPage::Settings {
+            // Rows -> categories: land back on the active group's tab.
+            if let Sel::Row(_) = self.sel {
+                let g = crate::settings::GROUPS
+                    .iter()
+                    .position(|g| *g == self.group)
+                    .unwrap_or(0);
+                self.set_sel(Sel::Tab(g));
+                self.text_editing.set(false);
+                return true;
+            }
+            // Categories (tabs / Back) -> main page.
             self.page = MenuPage::Main;
             self.ui.set_menu_page("main".into());
+            self.set_sel(Sel::Main(0));
+            self.text_editing.set(false);
             return true;
         }
         false
@@ -309,11 +364,18 @@ impl Hud {
     pub fn open_settings_page(&mut self) {
         self.page = MenuPage::Settings;
         self.ui.set_menu_page("settings".into());
+        // Land on the active group's tab — NOT Row(0): the rows rebuild one
+        // session-loop iteration later (menu_rows_stale), so the row list is
+        // stale at this instant.
+        let g = crate::settings::GROUPS.iter().position(|g| *g == self.group).unwrap_or(0);
+        self.set_sel(Sel::Tab(g));
     }
 
     pub fn back_to_main(&mut self) {
         self.page = MenuPage::Main;
         self.ui.set_menu_page("main".into());
+        self.set_sel(Sel::Main(0));
+        self.text_editing.set(false);
     }
 
     pub fn group(&self) -> &str {
@@ -326,6 +388,7 @@ impl Hud {
     }
 
     pub fn set_rows(&mut self, rows: Vec<MenuRow>) {
+        self.rows_meta = rows.iter().map(|r| (r.id.clone(), r.control)).collect();
         let converted: Vec<ui::SettingRow> = rows
             .into_iter()
             .map(|r| ui::SettingRow {
@@ -337,6 +400,155 @@ impl Hud {
             })
             .collect();
         self.ui.set_rows(slint::ModelRc::new(slint::VecModel::from(converted)));
+        // A rebuild recreates every row element: clamp a row cursor to the
+        // new length (a group switch can shrink the list) and clear any
+        // text-focus latch (the focused TextInput no longer exists).
+        if let Sel::Row(i) = self.sel {
+            let n = self.rows_meta.len();
+            let sel = if n == 0 { Sel::BackBtn } else { Sel::Row(i.min(n - 1)) };
+            self.set_sel(sel);
+        }
+        self.text_editing.set(false);
+    }
+
+    // ── Controller/keyboard menu navigation (src/pad.rs edges + input.rs's
+    // menu_* key edges). Rust owns the cursor; activation pushes the SAME
+    // HudAction variants the TouchArea callbacks push, onto the same queue —
+    // one action path, no semantics drift.
+
+    /// True while the settings TextInput has focus — input.rs's keyboard-nav
+    /// gate (WASD/arrows must edit text, not move the selection).
+    pub fn text_editing(&self) -> bool {
+        self.text_editing.get()
+    }
+
+    /// Mirror the cursor to the ui's `sel-*` properties. Equal-value sets
+    /// are Slint no-ops, so an unchanged cursor dirties nothing.
+    fn set_sel(&mut self, sel: Sel) {
+        self.sel = sel;
+        self.ui.set_sel_main(if let Sel::Main(i) = sel { i as i32 } else { -1 });
+        self.ui.set_sel_tab(if let Sel::Tab(i) = sel { i as i32 } else { -1 });
+        self.ui.set_sel_back(sel == Sel::BackBtn);
+        self.ui.set_sel_row(if let Sel::Row(i) = sel { i as i32 } else { -1 });
+    }
+
+    /// Focus a category tab AND switch the displayed group to it live, so the
+    /// highlight and the rows panel never desync (the old up/down-through-tabs
+    /// bug left them out of sync). A redundant switch — the group is already
+    /// active — pushes no action.
+    fn select_tab(&mut self, j: usize) {
+        self.set_sel(Sel::Tab(j));
+        let g = crate::settings::GROUPS[j];
+        if g != self.group {
+            self.actions.borrow_mut().push(HudAction::Group(g.to_string()));
+        }
+    }
+
+    /// Cross from the categories column into the rows column (Right / A on a
+    /// tab). No-op if the current group has no rows.
+    fn enter_rows(&mut self) {
+        if !self.rows_meta.is_empty() {
+            self.set_sel(Sel::Row(0));
+        }
+    }
+
+    /// Up (-1) / Down (+1). Main page: 3-item cyclic menu. Settings page is a
+    /// TWO-COLUMN model, so up/down stays WITHIN the focused column:
+    ///   Categories (left): Tab(0)..Tab(G-1) then the Back button; landing on
+    ///     a tab switches the group so the rows panel updates live.
+    ///   Rows (right): Row(0)..Row(N-1).
+    /// Both columns CLAMP at their ends — Left/Right/B cross columns, not
+    /// up/down (held auto-repeat wants a stop, not a teleport across columns).
+    pub fn nav(&mut self, dy: i32) {
+        match self.page {
+            MenuPage::Main => {
+                let i = if let Sel::Main(i) = self.sel { i } else { 0 };
+                self.set_sel(Sel::Main((i as i32 + dy).rem_euclid(3) as usize));
+            }
+            MenuPage::Settings => {
+                let g = crate::settings::GROUPS.len();
+                match self.sel {
+                    // Categories column: tabs, then the Back button, clamped.
+                    Sel::Tab(i) => {
+                        let next = i.min(g - 1) as i32 + dy;
+                        if next < 0 {
+                            self.select_tab(0);
+                        } else if (next as usize) < g {
+                            self.select_tab(next as usize);
+                        } else {
+                            self.set_sel(Sel::BackBtn);
+                        }
+                    }
+                    Sel::BackBtn => {
+                        if dy < 0 {
+                            self.select_tab(g - 1);
+                        }
+                    }
+                    // Rows column, clamped.
+                    Sel::Row(i) => {
+                        let n = self.rows_meta.len();
+                        if n == 0 {
+                            self.set_sel(Sel::BackBtn);
+                        } else {
+                            self.set_sel(Sel::Row((i as i32 + dy).clamp(0, n as i32 - 1) as usize));
+                        }
+                    }
+                    Sel::Main(_) => self.select_tab(0),
+                }
+            }
+        }
+    }
+
+    /// Left (-1) / Right (+1). Categories column: Right crosses into the rows
+    /// (Left is a no-op — nothing further left; use B to leave the page).
+    /// Rows column: change the highlighted setting's value (the row's < / >
+    /// arrows).
+    pub fn adjust(&mut self, dir: i32) {
+        match self.sel {
+            Sel::Tab(_) | Sel::BackBtn => {
+                if dir > 0 {
+                    self.enter_rows();
+                }
+            }
+            Sel::Row(i) => {
+                if let Some((id, control)) = self.rows_meta.get(i) {
+                    // Mirror the arrow buttons: cycle/step take both
+                    // directions, cyclefwd only its lone ">" arrow, toggle
+                    // flips on either direction, text has no arrows.
+                    let push = match *control {
+                        "cycle" | "step" => Some(dir),
+                        "toggle" => Some(1),
+                        "cyclefwd" if dir > 0 => Some(1),
+                        _ => None,
+                    };
+                    if let Some(d) = push {
+                        self.actions.borrow_mut().push(HudAction::Adjust(id.clone(), d));
+                    }
+                }
+            }
+            Sel::Main(_) => {}
+        }
+    }
+
+    /// A / Enter on the selected item. Main page: the button's own action.
+    /// Settings page: a category tab crosses into the rows (like Right); the
+    /// Back button returns to main; a row toggles/steps its value. Text rows
+    /// stay mouse-edited (v1 — no programmatic TextInput focus).
+    pub fn activate(&mut self) {
+        match self.sel {
+            Sel::Main(0) => self.actions.borrow_mut().push(HudAction::Resume),
+            Sel::Main(1) => self.actions.borrow_mut().push(HudAction::OpenSettings),
+            Sel::Main(_) => self.actions.borrow_mut().push(HudAction::Quit),
+            Sel::Tab(_) => self.enter_rows(),
+            Sel::BackBtn => self.actions.borrow_mut().push(HudAction::Back),
+            Sel::Row(i) => {
+                if let Some((id, control)) = self.rows_meta.get(i) {
+                    if matches!(*control, "toggle" | "cyclefwd" | "cycle" | "step") {
+                        self.actions.borrow_mut().push(HudAction::Adjust(id.clone(), 1));
+                    }
+                }
+            }
+        }
     }
 
     pub fn take_actions(&mut self) -> Vec<HudAction> {

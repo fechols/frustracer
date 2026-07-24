@@ -20,7 +20,12 @@
 //!   pill churns only on SPACE/F render-mode transitions.
 //! - Keymap text mirrors src/flycam.rs's actual bindings (WASD/arrows, drag
 //!   look, E/Q up/down, Shift/Ctrl+bumpers slow, ,/. + D-pad time of day) —
-//!   update BOTH when a binding changes.
+//!   update BOTH when a binding changes. The pad line also carries the menu
+//!   bindings (src/pad.rs: Start toggle; in-menu D-pad/stick nav, A, B).
+//! - The menu's `sel-*` properties are the pad/keyboard navigation cursor
+//!   (hud/mod.rs owns it): a cursor move flips exactly two elements'
+//!   `sel == i` comparisons, so only those two rows/buttons re-rasterize —
+//!   the dirty-rect discipline holds under held-repeat navigation.
 
 slint::slint! {
     // One settings row (built by settings::menu_items + menu_value in Rust).
@@ -44,12 +49,15 @@ slint::slint! {
 
     component MenuButton inherits Rectangle {
         in property <string> label;
+        // Pad/keyboard navigation cursor (gold border) — independent of the
+        // mouse hover tint, so the two input methods never fight.
+        in property <bool> selected;
         callback clicked;
         height: 44px;
         border-radius: 8px;
-        background: ta.has-hover ? #3a444ce0 : #262c38e0;
-        border-width: 1px;
-        border-color: #ffffff30;
+        background: (ta.has-hover || root.selected) ? #3a444ce0 : #262c38e0;
+        border-width: root.selected ? 2px : 1px;
+        border-color: root.selected ? #ffd24d : #ffffff30;
         ta := TouchArea {
             clicked => {
                 root.clicked();
@@ -113,6 +121,16 @@ slint::slint! {
         callback row-adjust(string, int);
         // (row id, new text) — Text rows, committed on Enter.
         callback text-edited(string, string);
+        // ── Pad/keyboard navigation cursor (Rust owns it — hud/mod.rs's Sel;
+        // -1 / false = no selection in that region). Gold-border highlights;
+        // only the elements whose comparison flips get dirtied.
+        in property <int> sel-main: -1;
+        in property <int> sel-tab: -1;
+        in property <bool> sel-back: false;
+        in property <int> sel-row: -1;
+        // The settings TextInput's focus, mirrored out (input.rs gates
+        // keyboard nav on it: typing must not move the selection).
+        callback edit-focus(bool);
 
         // Compass + clock fade like the keymap panel: awake on camera/TOD
         // activity (mod.rs's linger), asleep when idle. `hud-on` (F1) stays
@@ -366,7 +384,7 @@ slint::slint! {
         help := Rectangle {
             x: (parent.width - self.width) / 2;
             y: parent.height - 96px;
-            width: 660px;
+            width: 720px;
             height: 76px;
             border-radius: 10px;
             background: #10141cC0;
@@ -385,7 +403,7 @@ slint::slint! {
                     horizontal-alignment: center;
                 }
                 Text {
-                    text: "pad:  L stick  fly      R stick  look      triggers  up / down      bumpers  slow      D-pad L / R  time of day";
+                    text: "pad:  L stick  fly      R stick  look      triggers  up / down      bumpers  slow      D-pad L / R  time of day      Start  menu";
                     color: #b8c0cc;
                     font-size: 13px;
                     horizontal-alignment: center;
@@ -423,14 +441,17 @@ slint::slint! {
                     }
                     MenuButton {
                         label: "Resume";
+                        selected: root.sel-main == 0;
                         clicked => { root.menu-action("resume"); }
                     }
                     MenuButton {
                         label: "Settings";
+                        selected: root.sel-main == 1;
                         clicked => { root.menu-action("settings"); }
                     }
                     MenuButton {
                         label: "Exit";
+                        selected: root.sel-main == 2;
                         clicked => { root.menu-action("exit"); }
                     }
                 }
@@ -458,11 +479,15 @@ slint::slint! {
                             font-size: 20px;
                             font-weight: 700;
                         }
-                        for g in root.groups : Rectangle {
+                        for g[i] in root.groups : Rectangle {
                             height: 36px;
                             border-radius: 7px;
                             background: g == root.menu-group ? #3a444ce0
                                 : (gta.has-hover ? #2a323ce0 : #1c222c00);
+                            // Nav cursor: gold border, distinct from the
+                            // active-group background above.
+                            border-width: root.sel-tab == i ? 2px : 0px;
+                            border-color: #ffd24d;
                             gta := TouchArea {
                                 clicked => { root.menu-action("group:" + g); }
                             }
@@ -478,6 +503,7 @@ slint::slint! {
                         Rectangle {}
                         MenuButton {
                             label: "Back";
+                            selected: root.sel-back;
                             clicked => { root.menu-action("back"); }
                         }
                     }
@@ -486,15 +512,34 @@ slint::slint! {
                         // inside the slint! macro — keep hex colors off 0b/0x)
                         background: #0d1018c0;
                         border-radius: 10px;
-                        Flickable {
+                        flick := Flickable {
                             viewport-height: rowscol.preferred-height + 20px;
+                            // Scroll the nav-selected row into view. Row i
+                            // spans y = 10px + i*36px .. +34px (the layout's
+                            // padding 10 / height 34 / spacing 2 below —
+                            // keep in lockstep). Only fires when the cursor
+                            // actually crosses a viewport edge.
+                            property <int> sr: root.sel-row;
+                            changed sr => {
+                                if (self.sr >= 0) {
+                                    if (10px + self.sr * 36px + self.viewport-y < 0px) {
+                                        self.viewport-y = -(10px + self.sr * 36px);
+                                    }
+                                    if (10px + self.sr * 36px + 34px + self.viewport-y > self.height) {
+                                        self.viewport-y = self.height - (10px + self.sr * 36px + 34px);
+                                    }
+                                }
+                            }
                             rowscol := VerticalLayout {
                                 padding: 10px;
                                 spacing: 2px;
-                                for row in root.rows : Rectangle {
+                                for row[i] in root.rows : Rectangle {
                                     height: 34px;
                                     border-radius: 6px;
-                                    background: rta.has-hover ? #1c222c80 : transparent;
+                                    background: (rta.has-hover || root.sel-row == i)
+                                        ? #1c222c80 : transparent;
+                                    border-width: root.sel-row == i ? 1px : 0px;
+                                    border-color: #ffd24d80;
                                     rta := TouchArea {
                                         clicked => {
                                             if (row.control == "toggle" || row.control == "cyclefwd") {
@@ -561,6 +606,9 @@ slint::slint! {
                                                 vertical-alignment: center;
                                                 accepted => {
                                                     root.text-edited(row.id, self.text);
+                                                }
+                                                changed has-focus => {
+                                                    root.edit-focus(self.has-focus);
                                                 }
                                             }
                                         }

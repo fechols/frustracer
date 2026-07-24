@@ -46,6 +46,8 @@ mod oidn;
 mod nppd;
 mod frustcap;
 mod overlay;
+#[cfg(windows)]
+mod pad;
 mod render;
 mod reproject;
 mod scene;
@@ -12389,6 +12391,10 @@ fn session(
     // Settings rows need (re)building: menu open, group/page change, or an
     // edit whose live effect lands a frame later (rebuild after handlers ran).
     let mut menu_rows_stale = true;
+    // Main-thread controller edges for the pause menu (src/pad.rs): Start
+    // toggles from anywhere, A/B/D-pad/stick navigate while open. Session-
+    // local — losing repeat state across a resize re-entry is harmless.
+    let mut pad = pad::MenuPad::new(sdl_hwnd(window));
 
     let end = loop {
         let now = Instant::now();
@@ -12397,6 +12403,10 @@ fn session(
         // quit check moves BELOW the menu drain so the menu's Exit button
         // (which arrives as a drained action) breaks the same way.
         let mut edges = inp.poll(hud.as_ref().filter(|hd| hd.menu_open()));
+        // Controller edges every iteration: Start's toggle must fire while
+        // the menu is CLOSED too (a press outlasts any frame), and the menu
+        // hold-loop's `continue` below returns here at ~140 Hz for nav.
+        let pe = pad.poll();
         if edges.toggle_fullscreen {
             // Borderless desktop fullscreen (F11) — SDL3's set_fullscreen is
             // a bool, and fullscreen with no exclusive mode set IS borderless
@@ -12430,7 +12440,23 @@ fn session(
         // camera); closing resumes it.
         let mut menu_live_edit = false;
         if let Some(hd) = hud.as_mut() {
-            if edges.esc {
+            // Pad Start = hard toggle: opens from anywhere, and dismisses
+            // OUTRIGHT from any page (unlike ESC/B's back-out) — the console
+            // pause-button convention. Same open/close arms as ESC below.
+            if pe.start {
+                if hd.menu_open() {
+                    hd.close_menu();
+                    fly.resume();
+                    window.subsystem().text_input().stop(window);
+                } else {
+                    hd.open_menu();
+                    menu_rows_stale = true;
+                    fly.pause();
+                    window.subsystem().text_input().start(window);
+                }
+            }
+            // ESC, and pad B while open (B must never OPEN the menu).
+            if edges.esc || (pe.b && hd.menu_open()) {
                 if hd.menu_open() {
                     if !hd.escape() {
                         hd.close_menu();
@@ -12443,6 +12469,26 @@ fn session(
                     fly.pause();
                     // Printable characters reach Slint via SDL TextInput.
                     window.subsystem().text_input().start(window);
+                }
+            }
+            // Navigation cursor (pad D-pad/left-stick + the keyboard's
+            // arrows/WASD/Enter edges): before the take_actions drain, so a
+            // press and the action it pushes land in the same iteration.
+            if hd.menu_open() {
+                if pe.up || edges.menu_up {
+                    hd.nav(-1);
+                }
+                if pe.down || edges.menu_down {
+                    hd.nav(1);
+                }
+                if pe.left || edges.menu_left {
+                    hd.adjust(-1);
+                }
+                if pe.right || edges.menu_right {
+                    hd.adjust(1);
+                }
+                if pe.a || edges.menu_activate {
+                    hd.activate();
                 }
             }
             // Live state snapshot for row display + adjust baselines.
