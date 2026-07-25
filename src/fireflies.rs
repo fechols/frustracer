@@ -186,6 +186,20 @@ impl Fireflies {
             idx as f32 * crate::clouds::CLOUD_SPIN_DT,
         )
     }
+    /// --cinematic's clock — the `clouds::Clouds::cine` twin, on the SHARED
+    /// cloud clock (the swarm drifts through the same curl field). Read
+    /// `scene.night` AFTER the frame's `apply_tod`, so the swarm fades in with
+    /// the stars over a time-of-day sweep.
+    pub fn cine(scene: &crate::scene::Scene, out_frame: u32, fps: u32) -> Fireflies {
+        Fireflies::new(
+            enabled(),
+            count(),
+            scene.night,
+            scene.content_min,
+            scene.content_max,
+            out_frame as f32 / fps.max(1) as f32,
+        )
+    }
 }
 
 /// The curl field as a unit-bounded direction: `clouds::curl_offset` rescaled

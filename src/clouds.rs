@@ -234,6 +234,20 @@ impl Clouds {
     pub fn spin(diag: f32, idx: u32) -> Clouds {
         Clouds::new(enabled(), diag, idx as f32 * CLOUD_SPIN_DT)
     }
+    /// --cinematic's clock: a pure function of the OUTPUT frame index and the
+    /// output frame RATE, so the sky advances in real time (a 30 fps film gets
+    /// 1 s of drift per 30 frames) and any single frame is re-renderable in
+    /// isolation.
+    ///
+    /// Deliberately NOT `spin`'s `CLOUD_SPIN_DT`: that is a benchmark cadence
+    /// (1/120), which at 30 fps would run the sky at a quarter speed. And
+    /// deliberately a function of the OUTPUT frame only — a cinematic frame
+    /// accumulates N sub-frames at one pose, and if this took the sub-frame
+    /// index those N samples would integrate N different skies and smear the
+    /// clouds inside a single image (see cinematic.rs invariant 1).
+    pub fn cine(diag: f32, out_frame: u32, fps: u32) -> Clouds {
+        Clouds::new(enabled(), diag, out_frame as f32 / fps.max(1) as f32)
+    }
 }
 
 /// The wind, in world units/second over the (x, z) plane. The direction

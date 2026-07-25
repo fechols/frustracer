@@ -644,7 +644,9 @@ pub fn store(src_path: &str, scene: &Scene, bvh: &Bvh) {
 
 /// Bump on world-format layout changes (the key blob's shape included);
 /// `CACHE_VERSION` bumps invalidate the world sidecar too (shared repr).
-pub const WORLD_VERSION: u32 = 1;
+// 2: Island gained `height` (the content y extent) — the world layout record
+//    grew a field, so every v1 sidecar must miss rather than deserialize short.
+pub const WORLD_VERSION: u32 = 2;
 const WORLD_MAGIC: [u8; 8] = *b"FRWORLD\x01";
 
 /// One curated entry's contribution to the world key. `deps` holds the
@@ -773,6 +775,7 @@ pub fn try_load_world(
             name: String::from_utf8(name).ok()?,
             center: center[0],
             radius: read_f32(&mut r).ok()?,
+            height: read_f32(&mut r).ok()?,
             theme_hour: read_f32(&mut r).ok()?,
         });
     }
@@ -913,6 +916,7 @@ pub fn store_world(
             w.write_all(isle.name.as_bytes())?;
             write_pod(&mut w, &[isle.center])?;
             write_f32(&mut w, isle.radius)?;
+            write_f32(&mut w, isle.height)?;
             write_f32(&mut w, isle.theme_hour)?;
         }
         write_f32(&mut w, world.field_half)?;

@@ -1,22 +1,377 @@
 # frustracer
 
-A **frustum-tracer**: a hybrid between beam tracing and ray tracing.
+**A frustum tracer: beam tracing crossed with ray tracing.** The screen is a
+quadtree, and empty space is proven empty *once per tile* instead of once per
+pixel.
 
-The screen is a **quadtree**. One frustum covers the whole screen; it is traced
-forward until it *could* hit geometry, that conservative distance is recorded,
-and the tile splits into 4 quadrants. Each child frustum inherits the parent's
-proven-empty distance and starts there — empty space is skipped once per tile
-instead of once per pixel. Recursion bottoms out at 8×8 tiles, which trace
-ordinary per-pixel rays with `tmin` set to the inherited distance. A tile whose
-frustum intersects nothing is filled with sky immediately, **zero rays traced**.
+![The Bistro island at golden hour](docs/media/hero.webp)
+
+[![licence: MIT](https://img.shields.io/badge/licence-MIT-blue.svg)](LICENSE)
+![platform: Windows x64](https://img.shields.io/badge/platform-Windows%20x64-lightgrey.svg)
+![renderer: D3D12 / DXR](https://img.shields.io/badge/renderer-D3D12%20%2F%20DXR-green.svg)
+
+One frustum covers the whole screen; it is traced forward until it *could* hit
+geometry, that conservative distance is recorded, and the tile splits into 4
+quadrants. Each child frustum inherits the parent's proven-empty distance and
+starts there. Recursion bottoms out at small tiles, which trace ordinary
+per-pixel rays with `tmin` set to the inherited distance. A tile whose frustum
+intersects nothing is filled with sky immediately, **zero rays traced**.
 
 Children also inherit a **node cut**: the parent's list of surviving BVH nodes,
-re-culled and refined level by level (`frustum.rs::refine_cut`), so a tile's
-frustum query descends the parent's frontier instead of the BVH root, and leaf
-pixel rays seed their traversal from the cut (`Bvh::intersect_multi`).
+re-culled and refined level by level, so a tile's frustum query descends the
+parent's frontier instead of the BVH root, and leaf pixel rays seed their
+traversal from the cut.
 
-Related prior art: cone marching, and the beam optimization in Laine & Karras'
-sparse-voxel-octree paper.
+There is a full engineering write-up in the [technical appendix](#technical-appendix)
+below — the algorithm, the correctness invariants, the measurements, and the
+things that were tried and thrown away. The first half of this page is the
+manual. If you mean to change something, read
+[CONTRIBUTING.md](CONTRIBUTING.md) first (there is one Windows-specific trap
+that will bite you silently).
+
+---
+
+## INSERT DISK ONE — build it and fly
+
+```
+git clone https://github.com/fechols/frustracer && cd frustracer
+install-prerequisites.bat dxc          # the one component the default render mode needs
+cargo run --release
+```
+
+That boots **THE WORLD**: seven curated benchmark scenes merged into one
+34.4-million-triangle archipelago. Fly with **WASD**, look with the **left
+mouse button**, and press **F1** for the heads-up display.
+
+### What you need
+
+| | |
+|---|---|
+| **OS** | Windows 10/11, x64. (The renderer is D3D12; there is no other backend.) |
+| **Toolchain** | Rust (stable) + MSVC build tools & the Windows SDK — `build.rs` compiles three small C++ shims. CMake, because SDL3 builds from source. |
+| **git-lfs** | Only if you want the scenes. `git lfs install` once per clone, or you get pointer files. |
+| **GPU** | Anything D3D12. Ray tracing (tier 1.0+) unlocks `--dxr`, the default render mode; without it you fall back to the CPU tracer with a loud line, and it still works. |
+
+**Building never needs any SDK.** The vendored headers are enough, and every
+vendor library is `LoadLibrary`'d at runtime, so a bare checkout compiles and
+passes the whole DLL-free gate suite. `install-prerequisites.bat` fetches the
+optional runtimes (~700 MB for all of them) from each vendor's own release page.
+
+### If you only have five minutes
+
+No scene data, no SDKs, no waiting:
+
+```
+set GIT_LFS_SKIP_SMUDGE=1
+git clone https://github.com/fechols/frustracer && cd frustracer
+cargo run --release -- --no-world       # the procedural scene: boxes, spheres,
+                                        # a marble bunny and a gold teapot
+cargo run --release -- --check          # the test suite: headless, no DLLs, ~1 min
+```
+
+---
+
+## YOUR MISSION — what this thing actually is
+
+Most ray tracers ask the same question 2 million times a frame: *what does this
+pixel see?* Almost every one of those queries spends its first few hundred
+nanoseconds proving the same thing its neighbour just proved — that the first
+several metres in front of the camera are empty air.
+
+frustracer asks a cheaper question first. It takes the **whole screen** as one
+frustum and asks *how far can I travel before I could possibly hit anything?*
+That distance is inherited by four child tiles, which ask again, and again,
+until the tiles are a few pixels across. By the time a real ray is fired, the
+empty space in front of it has already been paid for — once, by an ancestor,
+on behalf of thousands of pixels. A tile that provably sees nothing at all
+becomes sky and fires **no rays whatsoever**.
+
+That is the whole idea. Everything else in this repository is a consequence of
+taking it seriously: what a conservative distance bound has to mean for the
+answer to stay correct, how to keep it correct on a GPU, and what happens when
+you point the same divide-and-conquer at the *light* integral instead of the
+camera.
+
+![A lap of the archipelago](docs/media/tour.webp)
+
+*A lap of the world, sunrise to moonlit night. Rendered with `--cinematic`;
+the full 4K60 version is on the [releases page](../../releases).*
+
+---
+
+## THE SEVEN ISLES — one world, seven scenes, one lap of the day
+
+The flagless boot merges every curated scene it can find into a single flat
+scene under one sky, arranged as islands on a ring. The ring is **ordered by
+hour**, so flying a lap sweeps the day from an industrial dawn to a moonlit
+night — and flying *toward* an island eases the global clock toward that
+island's own theme hour.
+
+| # | Isle | Hour | Tris | What it is there to stress |
+|---|---|---|---|---|
+| 1 | **Powerplant** | 06:30 | 12.8 M | Raw geometric density — the classic worst case |
+| 2 | **Sponza** | 08:30 | 0.26 M | The reference courtyard; glTF materials |
+| 3 | **Rungholt** | 11:00 | 6.7 M | A whole Minecraft city: tiny triangles, wide open |
+| 4 | **Damaged Helmet** | 13:00 | 15 k | All four glTF PBR map types at once |
+| 5 | **San Miguel** | 15:30 | 10.0 M | Alpha-cutout foliage, glass, water, tinted shadows |
+| 6 | **Bistro** | 17:30 | 2.8 M | Golden hour: 38 normal + 16 emissive maps |
+| 7 | **Vokselia** | 22:00 | 1.9 M | Full night — moonlight, stars, fireflies |
+
+<table>
+<tr>
+<td><img src="docs/media/islands/01-powerplant.webp" alt="Powerplant, 06:30"></td>
+<td><img src="docs/media/islands/02-sponza.webp" alt="Sponza, 08:30"></td>
+</tr>
+<tr>
+<td><img src="docs/media/islands/03-rungholt.webp" alt="Rungholt, 11:00"></td>
+<td><img src="docs/media/islands/04-helmet.webp" alt="Damaged Helmet, 13:00"></td>
+</tr>
+<tr>
+<td><img src="docs/media/islands/05-san-miguel.webp" alt="San Miguel, 15:30"></td>
+<td><img src="docs/media/islands/06-bistro.webp" alt="Bistro, 17:30"></td>
+</tr>
+<tr>
+<td colspan="2"><img src="docs/media/islands/07-vokselia.webp" alt="Vokselia, 22:00"></td>
+</tr>
+</table>
+
+A missing scene is not an error — it prints one line and the ring is built from
+whatever is on disk. A fresh checkout with no LFS data falls back to the
+procedural scene and says so.
+
+```
+cargo run --release                  # the world (the default)
+cargo run --release -- --no-world    # the procedural scene instead
+cargo run --release -- --tod 17.5    # start at a given hour; disarms the attractors
+cargo run --release -- model.obj     # or just load your own OBJ / glTF / GLB
+```
+
+---
+
+## FLIGHT CONTROLS
+
+| Key | Pad | Action |
+|---|---|---|
+| **W A S D** / arrows | left stick | fly |
+| **Q** / **E** | triggers | down / up |
+| hold left mouse | right stick | look |
+| **Shift** / **Ctrl** | bumpers | slower (÷8 / ÷16) |
+| **,** / **.** | D-pad ← → | scrub time of day (1 hour per second) |
+| **Esc** | Start | pause menu (Resume / Settings / Exit) |
+| **F1** | | toggle the HUD |
+| **F11** | | borderless fullscreen |
+| **P** | | screenshot |
+
+### Render modes and image quality
+
+| Key | Action |
+|---|---|
+| **Space** | cycle render mode: CPU → GPU wavefront → DXR |
+| **F** | jump straight between the CPU tracer and DXR |
+| **G** / **K** / **X** | toggle the wired upscaler (DLSS-RR / FSR / XeSS) against plain |
+| **N** / **M** | OIDN denoising; its temporal history |
+| **J** | NPPD neural denoising |
+| **U** | double samples per pixel (1 → 2 → … → 128 → 1) |
+| **1 2 3** | quality presets |
+| **H** | hemisphere bounces: off → AO → GI (still frames) |
+| **V** | heightfield relief vs plain normal mapping (`--heightfield` sessions) |
+
+### Debug
+
+| Key | Action |
+|---|---|
+| **O** | quadtree overlay — subdivision-depth heatmap + tile borders |
+| **R** | hybrid frustum tracer vs plain per-pixel (the A/B) |
+| **T** | dynamic resolution vs fixed half-res while moving |
+| **C** | verify the current view against a reference trace |
+| **B** | GPU vs CPU tonemap |
+| **Y** / **Z** | freeze the view's quadtree into the scene / clear it |
+
+---
+
+## THE OPTIONS SCREEN — HUD, pause menu, and saved settings
+
+**F1** raises a heads-up display: a compass, the world clock, the live render
+mode, an FPS graph (the violet band is frame-generation surplus), and a keymap
+panel that fades in while you fly and out a couple of seconds after you stop.
+An idle screen is clean; a faded HUD costs zero repaints.
+
+**Esc** opens a pause menu with full settings pages. While it is open the
+camera is frozen and the renderer stops tracing entirely — it re-presents the
+last frame, so nothing accumulates and closing the menu needs no reset.
+
+<table>
+<tr>
+<td><img src="docs/media/ui/hud.webp" alt="The heads-up display"></td>
+<td><img src="docs/media/ui/menu.webp" alt="The pause menu"></td>
+</tr>
+</table>
+
+Settings are saved to `frustracer-settings.json` next to the executable. The
+precedence rule is worth knowing: **compiled defaults < settings file < command
+line**, by ordering alone. Live rows apply through the same code paths the
+keyboard shortcuts use, so the menu and the keys can never disagree; rows that
+can only be decided at startup are badged *restart*. Headless runs ignore the
+file entirely — a gate has to be a pure function of its command line.
+
+---
+
+## POWER-UPS — what you can switch on
+
+Everything here is on by default unless marked. Each has a kill switch, because
+each one's A/B is how its cost was measured in the first place.
+
+| Feature | Off switch | In-app |
+|---|---|---|
+| Volumetric clouds — a drifting, curl-warped slab that shadows the sun | `--no-clouds` | |
+| Time of day, moon, and stars — the sun sets, the moon becomes the light, the star field lights the scene | `--tod <h>` to pin | **,** / **.** |
+| Fireflies after dusk — real point lights with hard shadows | `--no-fireflies` | |
+| Hemisphere-bounce GI / AO — the quadtree idea aimed at the light integral | (opt-in) | **H** |
+| Heightfield relief — real displaced geometry at the intersector | (opt-in `--heightfield`) | **V** |
+| The upscaler chain — DLSS-RR → FSR4-RR → XeSS → FSR 3.1, first supported wins | `--no-upscale` | **G** / **K** / **X** |
+| Frame generation — four families, whichever the adapter supports | `--no-fg` | |
+| HDR output — scRGB by default, HDR10/PQ where a wrapper needs it | `--no-hdr` | |
+| Glare — the reason the sun looks like a sun | `--no-bloom` | |
+| BC7 texture compression, encoded on the GPU at load | `--no-bc7` | |
+| Per-island ambience + procedural wind | `--no-audio` | |
+
+<table>
+<tr>
+<td><img src="docs/media/ab/clouds-on.webp" alt="Clouds on"><br><sub>clouds on (default)</sub></td>
+<td><img src="docs/media/ab/clouds-off.webp" alt="Clouds off"><br><sub><code>--no-clouds</code></sub></td>
+</tr>
+</table>
+
+![The quadtree overlay](docs/media/ab/overlay.webp)
+
+*The **O** overlay, tinting each pixel by how its tile resolved. The blue band
+is sky **proven empty and traced with zero rays**; the warm region is where
+tiles reached the leaf level and fired real rays. (It needs the quadtree, so
+it runs on the CPU or `--gpu` arm — `--dxr` traces from the TLAS root and has
+no subdivision to show.)*
+
+---
+
+## THE CAMERA CREW — `--cinematic`
+
+Every image on this page was rendered by the program itself, headlessly and
+deterministically:
+
+```
+cargo run --release -- --cinematic list                    # the shot catalogue
+cargo run --release -- --cinematic hero                    # one still, seconds
+cargo run --release -- --cinematic islands                 # one still per isle
+cargo run --release -- --cinematic tour --cinematic-frames 1200 --cinematic-fps 60 \
+                        --cinematic-res 3840x2160 --cinematic-hdr
+```
+
+`--cinematic` renders stills and camera-spline sequences (closed-loop
+Catmull-Rom, so a lap loops seamlessly), writes a numbered PNG sequence plus a
+manifest, and prints the exact `ffmpeg` commands to encode it — HDR10 HEVC for
+the release, an animated WebP for a README. `--cinematic-hdr` adds 16-bit
+PQ/Rec.2020 frames, a linear OpenEXR master, and a properly tagged HDR AVIF.
+
+It is not just a screenshot key. Because every output frame is a **static
+pose** that accumulates N sub-frames, it is the only path in the tree that can
+render a moving camera *with* hemisphere-bounce global illumination — the
+interactive renderer can't, because that integrator is still-frames-only. And
+with no upscaler available headlessly, all antialiasing comes from
+accumulation, which for a still is better than what the window shows: converged
+ground truth with no reconstruction artefacts.
+
+---
+
+## SECRET CODES
+
+Real flags, all of them measured rather than guessed.
+
+| Code | Effect |
+|---|---|
+| `--quinlight` | Wire **every** supported upscaler at once and present the Lucas-Kanade-registered, winsorized consensus of their outputs |
+| `--dxr-inline 0\|1\|2` | How much of the DXR pipeline is recursive `TraceRay` vs inline `RayQuery`. See the appendix — this one changed the default |
+| `--sw-rays` | Trace the wavefront's rays on our *own* BVH instead of the hardware's |
+| `--spin path` | The deterministic benchmark: a closed camera loop, pose a pure function of frame index |
+| `--stress 5000` | A procedural field of 5000 objects |
+| `--tile 4x2` | Replicate a loaded scene into a grid — the 100-million-triangle path |
+| `--bvh-builder sah\|lbvh\|ploc\|som` | Swap the BVH builder, including a self-organising-map "learned space-filling curve" (it loses) |
+| `--spp 16` | Samples per pixel per frame; the quadtree is traced once regardless |
+| `--check`, `--check-gpu`, `--check-dxr` | The test suite (see below) |
+| `--gpu-timing` | Per-pass GPU milliseconds, every vendor — the only per-pass profiler that works on Arc |
+| `FRUSTRACER_STAB=1` | Print inter-frame stability of the presented image |
+| `FRUSTRACER_HUD_STATS=1` | Dirty-rect accounting for the HUD, plus a ground-truth buffer dump |
+
+### `--check` is the test suite
+
+There are no unit tests. `--check` renders a frame, re-traces **every pixel**
+with a `tmin = 0` reference ray, and exits nonzero unless the false-sky and
+tmin-overshoot counters are exactly zero — then does it again through the
+depth-capped driver, the temporal cache, the replay path, the bounce
+integrators, and about twenty pure-math module self-tests. It needs no GPU and
+no DLLs. `--check-gpu` and `--check-dxr` carry the same contracts onto the two
+GPU pipelines.
+
+---
+
+## TROUBLESHOOTING
+
+**It says "dxr: falling back to CPU tracing".** DXC is missing — run
+`install-prerequisites.bat dxc`. Everything still works, just on the CPU.
+
+**The scenes are 1 KB text files.** That is git-lfs. `git lfs install`, then
+`git lfs pull`.
+
+**The world didn't load.** It prints one line per missing island. Without any
+of them it falls back to the procedural scene, which is fine.
+
+**Builds are slow.** Exclude `target/` from Windows Defender — every link
+writes ~50 MB past the real-time scanner:
+`Add-MpPreference -ExclusionPath '<repo>\target'`. Use `--profile quick` to
+iterate (a one-line touch is ~25 s instead of ~45 s), but **never benchmark
+under it** — every number this project reports assumes `release`'s LTO
+settings.
+
+**`--fsr4` exits with code 2.** That is deliberate: `--fsr4` *requires* FSR4 +
+Ray Regeneration (RDNA4). It tells you why and what to try instead. Use
+`--fsr` if you want it to fall through.
+
+**A binary I built elsewhere crashes.** `.cargo/config.toml` sets
+`-C target-cpu=native`. Build with `-C target-cpu=x86-64-v3` to distribute.
+
+---
+
+## THE FINE PRINT
+
+The **source** is [MIT](LICENSE). The scenes are not: each carries its own
+licence (some are non-commercial, some require attribution), and the vendor
+SDKs are downloaded from their owners rather than redistributed here. See
+[LICENSE](LICENSE) for the scope.
+
+Scenes from the [McGuire Computer Graphics Archive](https://casual-effects.com/data/),
+the [Khronos glTF sample assets](https://github.com/KhronosGroup/glTF-Sample-Assets),
+Intel, and Amazon Lumberyard. Ambience is CC0. Slint is used under its
+Royalty-Free licence. The Stanford bunny and the Utah teapot are where they
+always are.
+
+---
+---
+
+# TECHNICAL APPENDIX
+
+The manual is over. What follows is the engineering write-up: how it works,
+what was measured, and what was tried and removed.
+
+## The developer's notebook — `CLAUDE.md`
+
+`CLAUDE.md` at the repository root is the real design document — around 400 KB
+of it, organised by subsystem. It records *why* each decision was made, what
+was measured, and what was tried and thrown away, and it is written for
+whoever, or whatever, edits the code next.
+
+It is too large to browse blind. The useful entry points are `## Commands` (the
+complete flag reference, with the reasoning behind each default), `##
+Correctness invariants (the bug class to guard)` (the rules that must not
+break), and `## Architecture notes` (the module map). Each subsystem then has
+its own section.
 
 ## Why a BVH for the scene?
 
@@ -117,9 +472,9 @@ one ray's traversal.
 
 ## The lighting model: one sky, split by frequency
 
-There is exactly one light: a **sky sphere at infinity**, of which the sun is a
-bright patch. It is *stored* in two representations, and the split is by
-frequency, because the two bands need different sampling strategies:
+The **environment** is a single light: a sky sphere at infinity, of which the
+sun is a bright patch. It is *stored* in two representations, and the split is
+by frequency, because the two bands need different sampling strategies:
 
 | band | representation | sampled how |
 |---|---|---|
@@ -153,6 +508,25 @@ It also rescues the hemisphere integrator: its empty cells are evaluated by
 disc entirely or splat the whole cell at sun radiance. Excluding the disc removes
 the sharp feature outright — the frequency split isn't a convenience, it's what
 makes the analytic path correct.
+
+Two later additions extend that model without weakening the invariant. After
+sunset **the one disc becomes the moon** (the same `Sun` struct at the
+antipodal direction, so shadows, MIS and the dome tint all keep working), and
+the **star field lights the scene**: the points you see are display-only, but
+the field's smooth analytic mean is delivered to every gather path, so night
+has an ambient floor that does not depend on the moon's elevation. Same rule,
+one representation to the eye and another to the gathers, with the energy
+matched between them.
+
+The **fireflies** are the documented exception, and they are exceptions in the
+opposite direction. They are genuine point lights — up to 64 of them, windowed
+`1/d²`, each with its own hard shadow ray — so the scene after dusk is no
+longer lit by the environment alone. What keeps the invariant intact is that
+they are excluded from *every* gather path: the SH projection, the hemisphere
+cells, the GI bounce misses and both reference estimators all pass no
+fireflies. Direct lighting already delivers them with a shadow ray, so a gather
+that also saw them would double-count — the same argument as the sun, applied
+to a local light.
 
 The renderer previously had *two* suns that disagreed: a soft `dot^32` glow in
 the sky (a backdrop, too bright to be a light) and, separately, a 4×4 rectangular
@@ -195,147 +569,34 @@ suite is structurally blind to it.
 ## Parallelism
 
 Rayon's work-stealing pool is the "task list + pool of listener threads":
-each quadrant split is a recursive `rayon::join` (tiles ≤ 32 px recurse
+each quadrant split is a recursive `rayon::join` (small tiles recurse
 sequentially for granularity). The framebuffer is a `Vec<AtomicU32>` of
 f32-bit linear RGB with relaxed stores — tile writes are disjoint, so this is
 the idiomatic safe shared buffer.
 
-## Running
-
-```
-cargo run --release                   # procedural scene (boxes, spheres, marble bunny, gold teapot);
-                                      # the DXR DispatchRays pipeline + the first supported upscaler
-cargo run --release -- model.obj      # load an OBJ (auto-fitted onto the ground)
-cargo run --release -- --stress 5000  # perf test: field of n objects (boxes/spheres/bunnies/teapots)
-cargo run --release -- --check        # headless: verify vs reference, benchmark, write check.png
-cargo run --release -- --check-dlss   # headless: DLSS G-buffer MV/depth/matrix self-test
-cargo run --release -- --cpu          # the CPU frustum-tracer as the render mode (opts out of --dxr/--gpu)
-cargo run --release -- --no-dlss      # skip the DLSS-RR level of the always-on upscaler chain
-                                      # (DLSS-RR -> FSR4-RR -> XeSS -> FSR3; the first supported
-                                      # level wins, and --<x> force-starts the chain at level x)
-cargo run --release -- --no-upscale   # plain presentation: no temporal upscaler at all
-cargo run --release -- --nppd         # NPPD neural denoising before an XeSS upscale (needs
-                                      # onnxruntime.dll + an exported model — see
-                                      # tools/nppd-export/README.md; --no-xess = standalone)
-cargo run --release -- --gpu --nppd   # the same composition GPU-resident: ONNX Runtime executes
-                                      # on the tracer's own D3D12 queue, zero per-frame CPU traffic
-```
-
-Debug builds are ~10× too slow to judge anything — always use `--release`.
-
-### Build times, and the `quick` profile
+## Build times, and the `quick` profile
 
 `.cargo/config.toml` links with **`rust-lld`** (LLVM's LLD in its `link.exe`-compatible
 COFF mode). It ships inside the rustup toolchain, so there is nothing to install
-and no new prerequisite. Measured on a one-line touch of `main.rs`: ~26 s → ~21 s
-per link, and the variance collapses (±0.2 s vs ±2.8 s).
+and no new prerequisite.
 
 (**mold is not an option on Windows** — it is an ELF linker and cannot produce a PE
-binary. Windows support is an aspirational goal for a hypothetical mold 3.0. The
-question keeps coming up; `rust-lld` is the answer.)
+binary. The question keeps coming up; `rust-lld` is the answer.)
 
-The linker is not the bottleneck, though — the `release` profile's `lto = "thin"` +
-`codegen-units = 1` whole-program pass is. The same one-line touch costs **~123 s**
-under `release` and **~25 s** under `quick`:
-
-```
-cargo build --profile quick
-cargo run --profile quick -- --check
-```
+The linker is not the bottleneck, though — the `release` profile's whole-program
+LTO pass is. `release` is `lto = "thin"` + `codegen-units = 16`; the 16 was a 1
+until 2026-07-23, which serialised ThinLTO into a fat-LTO-shaped single pass. A
+one-line touch of `main.rs` went **198 s → 45 s** when it changed, at a measured
+cost of **+1–2% CPU-tracer ms/frame** — which means CPU benchmark numbers
+recorded before that date carry that offset, including some quoted below.
+`[profile.quick]` (`lto = false`) takes the same touch to ~25 s.
 
 > **Never benchmark under `quick`.** Every performance number this project reports —
-> `--check`'s A/B bench rows, the hemi-share kill criterion, the adopt on/off
+> the `--check` A/B bench rows, the hemi-share kill criterion, the adopt on/off
 > regression guards — is only meaningful under `release`'s `lto`/`codegen-units`
 > settings. Use `quick` to find compile errors and to exercise the exact-zero
 > correctness gates (which are perf-independent); use `--release` for anything that
 > prints a number.
-
-One local step this repo cannot make for you: **exclude `target/` from Windows
-Defender**. Every link writes an 18 MB exe and a 33 MB PDB past the real-time
-scanner, and the cost is invisible in `cargo --timings` — it just looks like slow
-linking.
-
-```powershell
-Add-MpPreference -ExclusionPath '<repo>\target'   # elevated; narrows AV coverage on build output
-```
-
-### Runtime SDKs (optional features)
-
-Building never needs any SDK: the MIT headers the shims compile against are
-vendored, and every SDK below is `LoadLibrary`'d at runtime, so a bare checkout
-builds and passes every DLL-free `--check*` gate. The interactive features want
-runtime DLLs, which are license-restricted and therefore not committed —
-`install-prerequisites.bat` downloads them from each vendor's own release page
-into the directories the defaults already point at:
-
-```
-install-prerequisites.bat              # everything below (~700 MB)
-install-prerequisites.bat dxc xess     # just those; /force re-installs, /clean drops the cache
-```
-
-| Component | Enables | Lands in |
-|---|---|---|
-| `dxc` | `--dxr` (the **default** render mode) and `--gpu` | `SDKs\dxc\bin\x64` |
-| `dlss` | DLSS-RR (`G`) | `SDKs\streamline-sdk\bin\x64` |
-| `fsr` | FSR4-RR / FSR 3.1 (`K`) | `SDKs\FidelityFX-Samples-prebuilt\...` |
-| `xess` | XeSS-SR (`X`) | `SDKs\XeSS-SDK\bin` |
-| `nppd` | NPPD neural denoising (`J`) | `SDKs\onnxruntime\bin` |
-| `oidn` | OIDN denoising (`N`) | `SDKs\oidn.x64.windows\bin` |
-| `pix` | `--pix-markers` | `SDKs\pix\bin\x64` |
-
-Each is also overridable with the matching `--*-path` flag / `FRUSTRACER_*_PATH`
-env var. The one thing the script cannot fetch is the NPPD **model weights**
-(the upstream checkpoint carries no license grant) — export those yourself with
-`tools/nppd-export/export.py --fp16`; it prints the command.
-
-### DLSS Ray Reconstruction setup (optional)
-
-The renderer can hand its 1-spp frames to NVIDIA's DLSS Ray Reconstruction
-denoiser (RTX GPU required). Only the MIT-licensed Streamline headers and
-docs are vendored in `SDKs/streamline-sdk` — the runtime DLLs are
-license-restricted and are **not** in this repo. To enable DLSS, download
-the Streamline SDK 2.12.0 release zip from
-<https://github.com/NVIDIA-RTX/Streamline/releases> and extract it over
-`SDKs/streamline-sdk` so that `SDKs/streamline-sdk/bin/x64/sl.interposer.dll`
-exists (or point `--sl-path` / `FRUSTRACER_SL_PATH` at any directory holding
-the DLLs). Without the DLLs the app logs a note and runs with native D3D12
-presentation; building never needs them.
-
-### NPPD neural denoising setup (optional)
-
-The renderer can also run NPPD (*Neural Partitioning Pyramids for Denoising
-Monte Carlo Renderings*, Bálint et al., SIGGRAPH 2023) as a vendor-neutral
-neural denoiser through ONNX Runtime + DirectML (any D3D12 GPU — NVIDIA, AMD,
-or Intel; CPU fallback). Nothing ships in this repo: drop `onnxruntime.dll`
-from the [Microsoft.ML.OnnxRuntime.DirectML NuGet](https://www.nuget.org/packages/Microsoft.ML.OnnxRuntime.DirectML)
-(≥ 1.22) and `DirectML.dll` from [Microsoft.AI.DirectML](https://www.nuget.org/packages/Microsoft.AI.DirectML)
-(≥ 1.15) into `SDKs/onnxruntime/bin`, then export the pretrained model with
-`tools/nppd-export/export.py --fp16` (see its README — the upstream weights
-carry no explicit license, so neither the checkpoint nor the exported `.onnx`
-may be committed). Run with `--nppd` or toggle with **J**. By default `--nppd`
-composes with XeSS: the frame is traced at 2/3 resolution, NPPD denoises at
-that resolution, and XeSS upscales to the window; under `--gpu` the whole
-stage is GPU-resident (ONNX Runtime executes on the tracer's queue with the
-staging buffers bound directly as tensors — no per-frame CPU traffic).
-
-### Controls
-
-| Input | Action |
-|---|---|
-| WASD / QE | fly (Shift = fast) |
-| hold left mouse | look around |
-| **SPACE** | cycle render mode: CPU → GPU wavefront → DXR |
-| **R** | toggle hybrid frustum-tracer vs plain per-pixel (A/B benchmark) |
-| **T** | toggle dynamic resolution vs fixed half-res while moving |
-| **O** | quadtree debug overlay: subdivision-depth heatmap + tile borders |
-| **G** | toggle DLSS Ray Reconstruction (when available) |
-| **J** | toggle NPPD neural denoising (in XeSS mode: the pre-upscale slot) |
-| **H** | hemisphere frustum bounces: off → AO → GI (still frames) |
-| **B** | toggle GPU vs CPU tonemap (non-DLSS mode) |
-| **1 / 2 / 3** | quality presets (shadow/AO samples, reflections) |
-| **C** | verify current view against the reference (prints counters) |
-| **P** | screenshot (in DLSS mode: reads the denoised output back from the GPU) |
-| Esc | quit |
 
 ## Dynamic resolution (60 FPS target)
 
@@ -533,10 +794,27 @@ closest-hit / SBT machinery doing its real job for the primary ray.
 `--dxr-inline 2` remains the right manual pick for a high-spp Intel DXR
 session. The numbers were the product; the default is the dividend.
 
+## What the quadtree is actually worth
+
+Worth stating plainly, because the framing invites overclaiming. Against a
+control that traces one ray per pixel from the BVH root with the same shader,
+the quadtree's marginal cost per sample is **0.87–0.93× on Intel** (it wins)
+and **1.31–1.37× on NVIDIA** (it loses) — and that ratio is *flat* across
+80 k to 12.8 M triangles, a 160× range. It is a property of the hardware
+balance, not of scene complexity: the quadtree trades RT-core work for
+shader-core work, which is a good trade exactly where RT cores are weak
+relative to shader cores.
+
+Of the Intel advantage, the inherited distance bound explains only 7–21%;
+ablating `t_start` to zero while keeping the quadtree costs 1.1–1.7% there and
+straddles zero on a 4090. **The other ~80–93% is tiles proven empty tracing no
+rays at all** — which is to say the valuable product is the empty-space proof,
+not the distance. And none of it helps the configuration that ships: at 1 spp
+the quadtree still loses on Intel; the win needs the once-per-frame cost
+amortised and crosses over around 16 spp.
+
 ## Future work
 
 Cut-aware leaf ordering (sort the cut by distance once per leaf tile so all 64
 rays shrink `tmax` early), and adapting the frame budget from measured
-resolve/present cost. (The GPU compute BC7 encoder that used to live here
-shipped: `src/gpu/bc7gpu.rs` — Intel Sponza's ~20 s ispc encode is now 280 ms
-on the GPU, which is what let BC7 become the default.)
+resolve/present cost.

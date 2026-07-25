@@ -829,6 +829,67 @@ impl Hud {
         Some(HudFrame { rects, bytes })
     }
 
+    /// Composite the HUD over an SDR `0x00RRGGBB` present buffer, premultiplied
+    /// `over`, in DISPLAY space — the same compromise `hud.hlsl`'s SDR arm
+    /// makes when it blends against a gamma-encoded backbuffer.
+    ///
+    /// `--cinematic` only, and the ONE path in the tree that puts the HUD into
+    /// a saved image (P screenshots and `--check` PNGs deliberately read
+    /// pre-composite sources). The whole buffer composites: dirty rects are a
+    /// GPU-upload optimization, and a capture has no persistent target to be
+    /// incremental against.
+    pub fn composite_sdr(&self, present: &mut [u32], w: usize, h: usize) {
+        if w != self.w as usize || h != self.h as usize {
+            eprintln!(
+                "hud: composite of a {}x{} overlay into a {w}x{h} frame — skipped",
+                self.w, self.h
+            );
+            return;
+        }
+        if present.len() < w * h || self.buf.len() < w * h {
+            return;
+        }
+        for (dst, p) in present.iter_mut().zip(self.buf.iter()) {
+            *dst = crate::cinematic::over_sdr(*dst, p.red, p.green, p.blue, p.alpha);
+        }
+    }
+
+    /// Run the wall-clock fade animations to rest, so a capture never catches
+    /// the HUD mid-fade-in. Slint's animations are driven by real time, so a
+    /// cold first frame is always partway through one; this pumps frames until
+    /// two consecutive ones report nothing dirty (capped, so a permanently
+    /// animating element can never hang a render).
+    /// `fill_secs` additionally pumps the FPS graph. The graph is 40 bars of
+    /// 125 ms of WALL CLOCK, so a HUD that has only just been settled shows an
+    /// empty one — the fades finish in ~0.3 s and there is nothing to draw. A
+    /// capture wants a populated graph, and 5 s of pumping (once, at
+    /// construction — the capture caches the Hud) is the only way to get one.
+    /// The frame times fed are plausible and slightly varied so the bars read
+    /// as a live trace rather than a flat wall.
+    pub fn settle(&mut self, cam: &Camera, tod: f32, mode: &'static str, fill_secs: f32) {
+        let t0 = Instant::now();
+        let mut quiet = 0;
+        while quiet < 2 && t0.elapsed() < std::time::Duration::from_secs(2) {
+            match self.frame(cam, tod, true, true, mode, 1000.0 / 60.0, 1.0) {
+                Some(_) => quiet = 0,
+                None => quiet += 1,
+            }
+            std::thread::sleep(std::time::Duration::from_millis(8));
+        }
+        if fill_secs <= 0.0 {
+            return;
+        }
+        let t1 = Instant::now();
+        let mut i = 0u32;
+        while t1.elapsed().as_secs_f32() < fill_secs {
+            // ~55-70 fps, gently varying: a believable trace.
+            let ms = 15.5 + 2.5 * (i as f32 * 0.21).sin() + 1.0 * (i as f32 * 0.07).cos();
+            let _ = self.frame(cam, tod, true, true, mode, ms, 1.0);
+            std::thread::sleep(std::time::Duration::from_millis(8));
+            i += 1;
+        }
+    }
+
     /// Show or hide the loading page. Hiding it reveals the frame behind — a
     /// full-window change (the page's scrim covers everything), so the next
     /// `frame()`/`raster()` repaints wholesale.

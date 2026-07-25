@@ -20,12 +20,23 @@
 # artifacts, rebuilt on any source/version change. Never commit or LFS them.
 *.fcache
 *.fcache.*
-check.png
 screenshot_*.png
 dlss_gbuf_*.png
 oidn_*.png
 nppd_*.png
 xess_gbuf_*.png
+# --cinematic output: PNG/PNG16 sequences, EXR masters and encoded video. These
+# are working files — often tens of GB for one 4K60 sequence. Only the curated,
+# downscaled results under docs/media/ are committed.
+/capture/
+/capture-preview/
+/cap-test/
+*.mp4
+*.webm
+*.mov
+tour-run.log
+tour-run.err
+gpucheck.log
 # ONNX Runtime session-profiling dumps (--check-nppd experiments)
 onnxruntime_profile*.json
 __pycache__/

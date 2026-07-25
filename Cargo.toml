@@ -2,6 +2,17 @@
 name = "frustracer"
 version = "0.1.0"
 edition = "2024"
+description = "A frustum tracer: beam tracing crossed with ray tracing. The screen is a quadtree; empty space is proven once per tile instead of once per pixel."
+license = "MIT"
+repository = "https://github.com/fechols/frustracer"
+readme = "README.md"
+keywords = ["raytracing", "renderer", "dxr", "direct3d12", "graphics"]
+categories = ["graphics", "rendering"]
+# Windows-only, and it LoadLibrary's vendor SDKs at runtime — this is an
+# application, not a library anyone should depend on. `publish = false` makes an
+# accidental `cargo publish` impossible while keeping the metadata above useful
+# to the dependency graph and licence tooling.
+publish = false
 
 [dependencies]
 glam = "0.30"

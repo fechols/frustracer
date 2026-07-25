@@ -37,3 +37,11 @@ scenes/**/*.flac filter=lfs diff=lfs merge=lfs -text
 # CRLF has "#!/bin/sh\r" as its shebang, which is a "bad interpreter" failure
 # on every non-Windows clone. eol=lf overrides core.autocrlf for these.
 tools/hooks/* text eol=lf
+# Curated README/release media, rendered by --cinematic. Deliberately PLAIN GIT
+# and NOT covered by the scenes/ LFS rules above: github.com renders these on
+# the front page, so they must survive a GIT_LFS_SKIP_SMUDGE clone, a fork, and
+# an exhausted LFS bandwidth quota — and the LFS budget belongs to scenes/.
+# Kept small on purpose (~6 MB total, downscaled WebP). Video is NEVER
+# committed: the 4K60 HDR10 master is a GitHub Release asset, and a repo-hosted
+# .mp4 does not play inline in a README anyway.
+docs/media/** binary

@@ -11,6 +11,10 @@ mod bc7;
 mod blas_split;
 mod bvh;
 mod camera;
+// --cinematic: the offline beauty path (stills + camera-spline sequences).
+// Pure half — spline, presets, HUD composite, gates; the drivers that render
+// live in this file beside run_spin/run_spin_gpu, whose contract they mirror.
+mod cinematic;
 mod clouds;
 mod dlss;
 // Signal split, wire encoders, and demodulation/composite math for FSR Ray
@@ -623,6 +627,11 @@ fn main() {
     let mut cam_override: Option<Camera> = None;
     let mut spin: Option<String> = None;
     let mut spin_frames = 2000u32;
+    // --cinematic: the media mode. A parse local, not an Opts field, like
+    // every other mode selector (--spin, --check*, --stress, --tile). `None` =
+    // not asked for; `Some(sel)` = a preset name or a shot-list path.
+    let mut cinematic: Option<String> = None;
+    let mut cine = cinematic::CineOpts::default();
     // World mode: None = the default (interactive flagless boots the world),
     // Some(true) = explicit --world (exclusivity ERRORS instead of silently
     // resolving), Some(false) = --no-world (today's procedural boot). Later
@@ -1020,6 +1029,109 @@ fn main() {
                         std::process::exit(2);
                     });
             }
+            // --cinematic takes an OPTIONAL value (the peek idiom the parse
+            // loop is Peekable for): a bare --cinematic is the `hero` still, so
+            // the mode always does something useful and self-describing rather
+            // than erroring or starting a 20-minute render.
+            "--cinematic" => {
+                let sel = match args.peek() {
+                    Some(v) if !v.starts_with("--") => args.next(),
+                    _ => None,
+                };
+                cinematic = Some(sel.unwrap_or_else(|| "hero".to_string()));
+            }
+            "--cinematic-out" => {
+                cine.out = args.next().unwrap_or_else(|| {
+                    eprintln!("--cinematic-out needs a directory");
+                    std::process::exit(2);
+                });
+            }
+            "--cinematic-res" => {
+                let v = args.next().unwrap_or_else(|| {
+                    eprintln!("--cinematic-res needs WxH, e.g. 1920x1080");
+                    std::process::exit(2);
+                });
+                let parts: Vec<&str> = v.split(['x', 'X']).collect();
+                let wh = if parts.len() == 2 {
+                    match (parts[0].trim().parse::<usize>(), parts[1].trim().parse::<usize>()) {
+                        (Ok(w), Ok(h)) if w >= 2 && h >= 2 && w <= 16384 && h <= 16384 => {
+                            Some((w, h))
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                cine.res = Some(wh.unwrap_or_else(|| {
+                    eprintln!("--cinematic-res: bad size '{v}' (want WxH, 2..16384 each)");
+                    std::process::exit(2);
+                }));
+            }
+            "--cinematic-samples" => {
+                cine.samples = Some(
+                    args.next()
+                        .and_then(|v| v.parse::<u32>().ok())
+                        .filter(|n| (1..=4096).contains(n))
+                        .unwrap_or_else(|| {
+                            eprintln!("--cinematic-samples needs 1..=4096");
+                            std::process::exit(2);
+                        }),
+                );
+            }
+            "--cinematic-frames" => {
+                cine.frames = Some(
+                    args.next()
+                        .and_then(|v| v.parse::<u32>().ok())
+                        .filter(|n| (1..=100_000).contains(n))
+                        .unwrap_or_else(|| {
+                            eprintln!("--cinematic-frames needs 1..=100000");
+                            std::process::exit(2);
+                        }),
+                );
+            }
+            "--cinematic-fps" => {
+                cine.fps = args
+                    .next()
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .filter(|n| (1..=240).contains(n))
+                    .unwrap_or_else(|| {
+                        eprintln!("--cinematic-fps needs 1..=240");
+                        std::process::exit(2);
+                    });
+            }
+            "--cinematic-island" => {
+                cine.island = Some(args.next().unwrap_or_else(|| {
+                    eprintln!("--cinematic-island needs an island name");
+                    std::process::exit(2);
+                }));
+            }
+            "--cinematic-gi" => cine.gi = Some(true),
+            "--no-cinematic-gi" => cine.gi = Some(false),
+            "--cinematic-overlay" => cine.overlay = true,
+            // off | hud | menu | settings:<Group>
+            "--cinematic-hud" => {
+                let spec = args.next().unwrap_or_else(|| "hud".to_string());
+                cine.hud = match spec.as_str() {
+                    "off" => None,
+                    "hud" => Some(None),
+                    "menu" => Some(Some(String::new())),
+                    s if s.starts_with("settings:") => {
+                        Some(Some(s["settings:".len()..].to_string()))
+                    }
+                    "settings" => Some(Some(settings::GROUPS[0].to_string())),
+                    other => {
+                        eprintln!(
+                            "--cinematic-hud: unknown '{other}' \
+                             (want off | hud | menu | settings | settings:<Group>)"
+                        );
+                        std::process::exit(2);
+                    }
+                };
+            }
+            "--cinematic-encode" => cine.encode = true,
+            "--cinematic-dry-run" => cine.dry_run = true,
+            "--cinematic-hdr" => cine.hdr = true,
+            "--no-cinematic-hdr" => cine.hdr = false,
             "--no-vsync" => opts.vsync = false,
             "--vsync" => opts.vsync = true,
             // The swapchain flags are a three-way choice (SDR | scRGB | HDR10)
@@ -1288,6 +1400,37 @@ fn main() {
                 eprintln!("  --tile <n|nxm>  replicate a loaded OBJ scene into an n×n (or n×m) grid of copies —");
                 eprintln!("                flattened geometry, shared materials/textures (composes with --check)");
                 eprintln!("  --cam <e,t>   start camera: ex,ey,ez,tx,ty,tz (reproducible benchmark viewpoints)");
+                eprintln!("  --cinematic [p]  MEDIA MODE: render stills / camera-spline video sequences");
+                eprintln!("                headlessly. Presets: hero (default, one still) | islands |");
+                eprintln!("                tour (the island lap, dawn -> moonlit night) | orbit | hud |");
+                eprintln!("                list. Anything else is read as a JSON shot list. Writes a PNG");
+                eprintln!("                sequence + manifest.json and PRINTS the ffmpeg commands");
+                eprintln!("                (--cinematic-encode runs them). Loads the world by default.");
+                eprintln!("    --cinematic-res WxH        default 1920x1080 (odd dims round down: yuv420p)");
+                eprintln!("    --cinematic-samples N      accumulated sub-frames per OUTPUT frame");
+                eprintln!("                               (default 256 still / 32 sequence). This is the");
+                eprintln!("                               ONLY quality knob: no upscaler exists headlessly,");
+                eprintln!("                               so all AA/denoise comes from accumulation.");
+                eprintln!("                               Composes with --spp, which is a different axis:");
+                eprintln!("                               --spp shares the tile's inherited cut, so");
+                eprintln!("                               `--spp 4 --cinematic-samples 16` is cheaper than");
+                eprintln!("                               `--cinematic-samples 64` for the same 64 samples");
+                eprintln!("                               (on --cpu/--gpu; on --dxr it is a wash).");
+                eprintln!("    --cinematic-frames N       output frames for a sequence (default 900)");
+                eprintln!("    --cinematic-fps N          default 30 — drives the cloud clock AND the");
+                eprintln!("                               printed ffmpeg commands");
+                eprintln!("    --cinematic-island <name>  orbit target");
+                eprintln!("    --cinematic-gi             hemisphere-bounce GI (--cpu/--gpu only)");
+                eprintln!("    --cinematic-overlay        the quadtree debug overlay");
+                eprintln!("    --cinematic-hud <spec>     off | hud | menu | settings | settings:<Group>");
+                eprintln!("    --cinematic-out <dir>      default capture/");
+                eprintln!("    --cinematic-hdr            HDR output: sequences become 16-bit PQ/Rec.2020");
+                eprintln!("                               frames encoded to HDR10 HEVC; stills also write a");
+                eprintln!("                               linear OpenEXR master + a PQ PNG (and the ffmpeg");
+                eprintln!("                               line for a viewable HDR AVIF). The SDR PNG is");
+                eprintln!("                               always written as well.");
+                eprintln!("    --cinematic-encode         run ffmpeg (default: just print the commands)");
+                eprintln!("    --cinematic-dry-run        resolve + print the plan, render nothing");
                 eprintln!("  --check       headless: verify hybrid vs reference, benchmark, write check.png");
                 eprintln!("  --check-dlss  headless: G-buffer MV/depth/matrix self-test (no GPU needed)");
                 eprintln!("  --dlss-dump   --check-dlss plus G-buffer PNG dumps (albedo/spec_albedo/normal/misc/mv)");
@@ -1695,6 +1838,30 @@ fn main() {
         );
         std::process::exit(2);
     }
+    // --cinematic is a MEDIA mode, not a gate or a benchmark: it exists to
+    // photograph the renderer, and the thing worth photographing is the world.
+    // But it must not become a back door into the gates' scene either, so it is
+    // exclusive with them — being told beats silently resolving (the --fsr4
+    // shape), and the two modes want opposite scenes for opposite reasons.
+    if cinematic.is_some() && (spin.is_some() || any_check) {
+        eprintln!(
+            "--cinematic is exclusive with --spin and --check* (those are \
+             benchmarks and gates on their own fixed scenes; --cinematic is the \
+             media mode and loads the world)"
+        );
+        std::process::exit(2);
+    }
+    // `--cinematic list` is pure text — answer it before the scene load rather
+    // than booting a 34M-triangle world to print a catalogue.
+    if cinematic.as_deref() == Some("list") {
+        cinematic::print_catalogue();
+        std::process::exit(0);
+    }
+    // NOTE the deliberate absence of `cinematic` from both the exclusivity list
+    // above and the conjunction below: that absence IS how --cinematic gets the
+    // world by default while `--check*`/`--spin` still never load it, so every
+    // structural must-fire gate stays tuned to the procedural scene's topology
+    // and no gate moves. Do not "fix" the asymmetry by adding it here.
     let world_wanted = world_flag.unwrap_or(true)
         && obj.is_none()
         && stress.is_none()
@@ -1719,9 +1886,21 @@ fn main() {
     // command line (the progress sink is never activated). Interactive
     // sessions defer the SAME load into run_window's worker thread, behind the
     // loading screen. Every branch inside this block exits the process.
-    if any_check || spin.is_some() {
-        let LoadedScene { scene, bvh, cam0, .. } = load_scene(&req);
+    if any_check || spin.is_some() || cinematic.is_some() {
+        let LoadedScene { mut scene, bvh, cam0, world_info } = load_scene(&req);
 
+    if let Some(sel) = &cinematic {
+        let code = run_cinematic(
+            &mut scene,
+            &bvh,
+            cam0,
+            world_info.as_ref(),
+            sel,
+            &cine,
+            &opts,
+        );
+        std::process::exit(code);
+    }
     if let Some(mode) = &spin {
         let code = run_spin(&scene, &bvh, cam0, mode, spin_frames, &opts);
         std::process::exit(code);
@@ -8896,7 +9075,9 @@ fn px_seed(x: usize, y: usize, s: u64) -> u64 {
 }
 
 /// Centripetal-free (uniform) Catmull-Rom through p1..p2 at t ∈ [0, 1).
-fn catmull_rom(p0: Vec3A, p1: Vec3A, p2: Vec3A, p3: Vec3A, t: f32) -> Vec3A {
+/// `cinematic.rs` carries the same four lines and `cinematic::self_test` pins
+/// the two against each other — one spline, two consumers, one gate.
+pub(crate) fn catmull_rom(p0: Vec3A, p1: Vec3A, p2: Vec3A, p3: Vec3A, t: f32) -> Vec3A {
     ((p1 * 2.0)
         + (p2 - p0) * t
         + (p0 * 2.0 - p1 * 5.0 + p2 * 4.0 - p3) * (t * t)
@@ -9063,6 +9244,782 @@ impl TemporalRing {
             self.cut_prev_ok = false;
         }
     }
+}
+
+/// `--cinematic`: resolve the selector into shots, print the plan, and hand the
+/// shots to whichever arm the session picked.
+///
+/// Arm policy differs from `--spin` on purpose. A bare `--spin` drives the CPU
+/// renderer because that is what it always did and a benchmark must not move
+/// under its users. `--cinematic` is a new mode whose job is to finish, and the
+/// GPU arms are two orders of magnitude faster, so it takes the best available
+/// arm by default and degrades loudly: `--gpu` picks the wavefront tracer,
+/// otherwise DXR (still the default `opts.dxr`), falling back to the CPU tracer
+/// with one line if the device or DXC is missing. `--cpu` clears both and pins
+/// the CPU arm, exactly as everywhere else.
+fn run_cinematic(
+    scene: &mut scene::Scene,
+    bvh: &bvh::Bvh,
+    cam0: Camera,
+    world: Option<&world::World>,
+    sel: &str,
+    cine: &cinematic::CineOpts,
+    opts: &Opts,
+) -> i32 {
+    if sel == "list" {
+        cinematic::print_catalogue();
+        return 0;
+    }
+    // A bare `--cinematic` resolved to "hero" at parse time; show the catalogue
+    // so the mode is self-describing, then render something real anyway.
+    if sel == "hero" {
+        cinematic::print_catalogue();
+        eprintln!();
+    }
+
+    // Frame non-world scenes off the CONTENT box (the geometry minus the
+    // standard ground quad) — `Scene::diag` is inflated ~17x by the procedural
+    // ground plane, which would push an orbit into the next county.
+    let center = (scene.content_min + scene.content_max) * 0.5;
+    let radius = ((scene.content_max - scene.content_min).length() * 0.5).max(1e-3) * 2.2;
+
+    let shots = if cinematic::is_preset(sel) {
+        match cinematic::resolve_shots(sel, cine, world, cam0, center, radius) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("cinematic: {e}");
+                return 2;
+            }
+        }
+    } else {
+        let path = std::path::Path::new(sel);
+        if !path.exists() {
+            eprintln!("cinematic: '{sel}' is neither a preset nor an existing file");
+            cinematic::print_catalogue();
+            return 2;
+        }
+        match std::fs::read_to_string(path)
+            .map_err(|e| e.to_string())
+            .and_then(|t| serde_json::from_str::<Vec<cinematic::Shot>>(&t).map_err(|e| e.to_string()))
+        {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("cinematic: could not read shot list '{sel}': {e}");
+                return 2;
+            }
+        }
+    };
+    if shots.is_empty() {
+        eprintln!("cinematic: nothing to render");
+        return 2;
+    }
+
+    // Attractor-driven time of day, unless --tod pinned the clock (in which
+    // case load_scene already applied it and we must not touch it again — the
+    // documented interactive rule: an explicit --tod disarms the attractors).
+    let attractors: Vec<world::TodAttractor> = match (world, opts.tod) {
+        (Some(w), None) => world::attractors(w),
+        _ => Vec::new(),
+    };
+
+    let arm = if opts.gpu {
+        "gpu"
+    } else if opts.dxr {
+        "dxr"
+    } else {
+        "cpu"
+    };
+    eprintln!(
+        "cinematic: {} shot(s) [{arm}] | out {} | fps {} | tod {} | pid {}",
+        shots.len(),
+        cine.out,
+        cine.fps,
+        match opts.tod {
+            Some(h) => format!("pinned {h:.2}"),
+            None if !attractors.is_empty() => "world attractors".to_string(),
+            None => "scene default".to_string(),
+        },
+        std::process::id()
+    );
+    for s in &shots {
+        let (w, h) = s.res;
+        let extra = format!(
+            "{}{}{}",
+            if s.gi { " gi" } else { "" },
+            if s.overlay { " overlay" } else { "" },
+            match &s.hud {
+                Some(None) => " hud",
+                Some(Some(_)) => " menu",
+                None => "",
+            }
+        );
+        match s.kind {
+            cinematic::ShotKind::Still => eprintln!(
+                "  still    {:<28} {w}x{h}  {} samples{extra}",
+                s.name, s.samples
+            ),
+            cinematic::ShotKind::Sequence { frames, fps } => eprintln!(
+                "  sequence {:<28} {w}x{h}  {frames} frames @ {fps} fps, {} samples/frame{extra}",
+                s.name, s.samples
+            ),
+        }
+        if let (Some(w), true) = (world, s.kind.is_sequence()) {
+            let c = cinematic::min_clearance(s, w);
+            if c.is_finite() {
+                eprintln!("           closest approach: {c:.2}x island radius");
+            }
+        }
+    }
+    if cine.dry_run {
+        eprintln!("cinematic: --cinematic-dry-run, nothing rendered");
+        return 0;
+    }
+
+    #[cfg(windows)]
+    if opts.gpu || opts.dxr {
+        match run_cinematic_gpu(scene, bvh, world, &shots, &attractors, cine, opts) {
+            Ok(code) => return code,
+            Err(e) => eprintln!("cinematic: GPU arm unavailable ({e}) — falling back to the CPU tracer"),
+        }
+    }
+    run_cinematic_cpu(scene, bvh, &shots, &attractors, cine, opts)
+}
+
+/// Where a shot's output lands, and the per-shot scratch layout. Sequences get
+/// a `frames/` subdir; stills are written straight into the run dir.
+fn cine_prepare_dir(cine: &cinematic::CineOpts, shot: &cinematic::Shot) -> Result<String, String> {
+    let dir = format!("{}/{}", cine.out, shot.name);
+    let frames = format!("{dir}/frames");
+    if shot.kind.is_sequence() {
+        std::fs::create_dir_all(&frames).map_err(|e| format!("{frames}: {e}"))?;
+        // A re-render at FEWER frames that leaves a stale tail silently corrupts
+        // the encode (ffmpeg happily reads the old frames past the new end), and
+        // that is a quiet, expensive failure. Clear the sequence first.
+        let mut removed = 0u32;
+        if let Ok(rd) = std::fs::read_dir(&frames) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.extension().is_some_and(|x| x == "png")
+                    && p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("f_"))
+                {
+                    let _ = std::fs::remove_file(&p);
+                    removed += 1;
+                }
+            }
+        }
+        if removed > 0 {
+            eprintln!("cinematic: cleared {removed} stale frame(s) from {frames}");
+        }
+    } else {
+        std::fs::create_dir_all(&dir).map_err(|e| format!("{dir}: {e}"))?;
+    }
+    Ok(dir)
+}
+
+fn cine_frame_path(dir: &str, shot: &cinematic::Shot, f: u32) -> String {
+    if shot.kind.is_sequence() {
+        format!("{dir}/frames/f_{f:05}.png")
+    } else {
+        format!("{dir}/{}.png", shot.name)
+    }
+}
+
+/// The per-output-frame state. Built from the OUTPUT frame index only — see
+/// cinematic.rs invariant 1. Returning it as one value is the firewall: the
+/// sub-frame loop below gets a `&CineFrame` and has nothing else to reach for.
+struct CineFrame {
+    cam: Camera,
+    hour: Option<f32>,
+    clouds: clouds::Clouds,
+    fireflies: fireflies::Fireflies,
+}
+
+/// Bake one output frame's world state. `scene` is mutated iff the hour moved,
+/// so a `--tod`-pinned or non-world capture pays nothing.
+fn cine_frame_state(
+    scene: &mut scene::Scene,
+    shot: &cinematic::Shot,
+    attractors: &[world::TodAttractor],
+    cine: &cinematic::CineOpts,
+    f: u32,
+    prev_hour: &mut Option<f32>,
+) -> CineFrame {
+    let n = shot.kind.frames();
+    let u = if n <= 1 { 0.0 } else { f as f32 / n as f32 };
+    let (cam, key_tod) = cinematic::pose_at(&shot.keys, shot.closed, u);
+    // Priority: an authored keyframe hour, else the world's attractor field.
+    // (An explicit --tod never reaches here — it empties `attractors` and
+    // load_scene already applied it.)
+    let hour = key_tod.or_else(|| cinematic::path_hour(shot, attractors, f));
+    if let Some(h) = hour {
+        if prev_hour.map(|p| p.to_bits()) != Some(h.to_bits()) {
+            scene::apply_tod(scene, h);
+            *prev_hour = Some(h);
+        }
+    }
+    CineFrame {
+        cam,
+        hour,
+        // Real-seconds clock, and a function of the OUTPUT frame only.
+        clouds: clouds::Clouds::cine(scene.diag, f, cine.fps),
+        fireflies: fireflies::Fireflies::cine(scene, f, cine.fps),
+    }
+}
+
+/// The quality a capture renders at. Preset 3 (4 shadow / 4 AO / reflections),
+/// NOT `upscaler_1spp`: that preset exists to hand frame-stationary noise to a
+/// temporal denoiser, and no denoiser can run headlessly.
+fn cine_quality(shot: &cinematic::Shot) -> Quality {
+    let mut q = Quality::preset(3);
+    if shot.gi {
+        q.fb = shade::FrustumBounce { ao: false, gi: true, depth: q.fb.depth };
+    }
+    q
+}
+
+/// Print the ffmpeg block for a rendered sequence, and run it under
+/// `--cinematic-encode`. Never fatal: the PNG sequence is the artifact of
+/// record, and a missing ffmpeg is a loud line, not a failed render.
+fn cine_encode(dir: &str, shot: &cinematic::Shot, cine: &cinematic::CineOpts) {
+    if !shot.kind.is_sequence() {
+        // A still's only optional step is turning the PQ PNG into a viewable
+        // HDR image — EXR is the master, but no browser renders one.
+        if cine.hdr {
+            let png16 = format!("{dir}/{}-pq.png", shot.name);
+            let avif = format!("{dir}/{}.avif", shot.name);
+            let args = cinematic::ffmpeg_still_hdr(&png16, &avif);
+            eprintln!("cinematic: make a viewable HDR still with:");
+            eprintln!("  ffmpeg {}", args.join(" "));
+            if cine.encode {
+                match std::process::Command::new("ffmpeg").args(&args).status() {
+                    Ok(s) if s.success() => {}
+                    Ok(s) => eprintln!("cinematic: ffmpeg exited {s} (the EXR/PQ PNG are still valid)"),
+                    Err(e) => eprintln!("cinematic: could not run ffmpeg ({e})"),
+                }
+            }
+        }
+        return;
+    }
+    let cmds = cinematic::ffmpeg_cmds(dir, &shot.name, shot.kind.fps(), shot.res.0, cine.hdr);
+    eprintln!("cinematic: encode {} with:", shot.name);
+    for (label, args) in &cmds {
+        let line = args
+            .iter()
+            .map(|a| if a.contains(' ') || a.contains('%') { format!("\"{a}\"") } else { a.clone() })
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!("  # {label}");
+        eprintln!("  ffmpeg {line}");
+    }
+    if !cine.encode {
+        return;
+    }
+    for (label, args) in &cmds {
+        eprintln!("cinematic: running ffmpeg ({label})...");
+        match std::process::Command::new("ffmpeg").args(args).status() {
+            Ok(s) if s.success() => {}
+            Ok(s) => eprintln!("cinematic: ffmpeg exited {s} — the PNG sequence is still valid"),
+            Err(e) => {
+                eprintln!("cinematic: could not run ffmpeg ({e}) — run the commands above by hand");
+                return;
+            }
+        }
+    }
+}
+
+/// The CPU arm. Mirrors `run_spin`'s frame construction, with two differences
+/// that define the mode: `accumulate: true` over `shot.samples` sub-frames at a
+/// FIXED pose, and structure replay across those sub-frames.
+///
+/// Replay is a pure win here and is why high sample counts are affordable: the
+/// terminal quadtree is a function of (scene, BVH, basis, rw, rh) only, so
+/// sub-frames 1..N-1 skip every frustum query while re-shading from a fresh
+/// ctx — and `--check`'s replay family already gates replay-vs-trace
+/// bit-identity of tbuf/info/accum at frame 0 AND at a warm jittered frame 1,
+/// which is exactly this configuration.
+fn run_cinematic_cpu(
+    scene: &mut scene::Scene,
+    bvh: &bvh::Bvh,
+    shots: &[cinematic::Shot],
+    attractors: &[world::TodAttractor],
+    cine: &cinematic::CineOpts,
+    opts: &Opts,
+) -> i32 {
+    for shot in shots {
+        let (rw, rh) = shot.res;
+        let dir = match cine_prepare_dir(cine, shot) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("cinematic: {e}");
+                return 1;
+            }
+        };
+        let q = cine_quality(shot);
+        let stats = Stats::default();
+        let accum: Vec<AtomicU32> = (0..rw * rh * 3).map(|_| AtomicU32::new(0)).collect();
+        let info: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
+        let tbuf: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
+        let mut present = vec![0u32; rw * rh];
+        let replay_cache = replay::ReplayCache::new(rw, rh);
+        let frames = shot.kind.frames();
+        let mut prev_hour: Option<f32> = None;
+        let t_shot = Instant::now();
+
+        for f in 0..frames {
+            let fs = cine_frame_state(scene, shot, attractors, cine, f, &mut prev_hour);
+            let basis = fs.cam.basis(rw, rh);
+            let sun = render::sun_dir(scene);
+            let mut replay_ready = false;
+            for k in 0..shot.samples {
+                // k == 0 traces and records; k > 0 replays that structure.
+                let can_replay = opts.replay && replay_ready;
+                if !can_replay && opts.replay {
+                    replay_cache.begin(rw, rh);
+                }
+                let ctx = FrameCtx {
+                    scene,
+                    bvh,
+                    cam: basis,
+                    q,
+                    // k: the accumulation slot and the rng decorrelation index.
+                    frame: k,
+                    // Sub-frame 0 is the pixel CENTRE, 1.. are jittered — the
+                    // codebase's accumulation convention.
+                    jitter: k > 0,
+                    rw,
+                    rh,
+                    accum: &accum,
+                    info: &info,
+                    tbuf: &tbuf,
+                    stats: &stats,
+                    sun,
+                    // n: fixed for every sub-frame of this output frame.
+                    clouds: fs.clouds,
+                    fireflies: fs.fireflies,
+                    tcache_cur: None,
+                    tcache_prev: &[],
+                    accumulate: true,
+                    gbuf: None,
+                    fsr_buf: None,
+                    prev_cam: None,
+                    frame_jitter: None,
+                    spp: opts.spp,
+                    primary_sample: 0,
+                    adaptive: false,
+                    hemi_share: true,
+                    replay_rec: (opts.replay && !can_replay).then_some(&replay_cache),
+                    cut_cur: None,
+                    cut_prev: None,
+                    discard_seeds: false,
+                    defer_shade: opts.defer_shade,
+                };
+                if can_replay {
+                    render::render_frame_replay(&ctx, &replay_cache);
+                } else {
+                    render::render_frame(&ctx, true);
+                    replay_ready = opts.replay && replay_cache.valid();
+                }
+            }
+            // One averaged LINEAR image, then the shared writer — the same
+            // entry the GPU arms use, so all three tonemap identically.
+            let inv = 1.0 / shot.samples.max(1) as f32;
+            let hdr: Vec<f32> =
+                accum.iter().map(|a| f32::from_bits(a.load(Relaxed)) * inv).collect();
+            cine_write_frame(
+                &dir, shot, cine, f, &hdr, &info, &mut present, &fs, rw, rh, "CPU",
+            );
+            cine_progress(shot, f, frames, t_shot, fs.hour);
+        }
+        cine_finish(&dir, shot, t_shot);
+        cine_encode(&dir, shot, cine);
+    }
+    0
+}
+
+/// Write one output frame's files from the averaged LINEAR image.
+///
+/// One presentation path for all three arms — CPU, wavefront and DXR all land
+/// here with a linear f32 image, so the arms cannot drift onto different tone
+/// curves. (Nothing goes through `record_resolve`/`hdr`/the tonemap PS, which
+/// would put the GPU arms on the shader's curve and the CPU arm on `tone.rs`'s.)
+///
+/// Output policy:
+/// - SDR 8-bit PNG always — a README has to have something every browser shows.
+/// - `--cinematic-hdr` on a SEQUENCE replaces the frames with 16-bit PQ /
+///   Rec.2020, because that is what the HDR10 encode consumes; the SDR sibling
+///   video is tone-mapped back down by ffmpeg rather than rendered twice.
+/// - `--cinematic-hdr` on a STILL writes all three: the SDR PNG, a `-pq.png`
+///   16-bit PQ still, and a linear `.exr` master (no tonemap, no clamp — the
+///   radiance as computed, sun disc and all).
+///
+/// Glare is applied by each consumer (`resolve_hdr` internally, `with_glare`
+/// for the HDR encodes) rather than once up front: they are separate output
+/// images, so this is not a double-bloom of one image — and the second pass is
+/// only paid under `--cinematic-hdr`.
+#[allow(clippy::too_many_arguments)]
+fn cine_write_frame(
+    dir: &str,
+    shot: &cinematic::Shot,
+    cine: &cinematic::CineOpts,
+    f: u32,
+    hdr: &[f32],
+    info: &[AtomicU32],
+    present: &mut [u32],
+    fs: &CineFrame,
+    rw: usize,
+    rh: usize,
+    mode: &'static str,
+) {
+    let seq = shot.kind.is_sequence();
+    let hdr_frames = cine.hdr && seq;
+    if !hdr_frames {
+        render::resolve_hdr(hdr, info, shot.overlay, present, rw, rh, rw, rh);
+        #[cfg(windows)]
+        cine_composite_hud(present, shot, fs, rw, rh, mode);
+        #[cfg(not(windows))]
+        let _ = (fs, mode);
+        save_png(&cine_frame_path(dir, shot, f), present, rw, rh);
+    }
+    if cine.hdr {
+        bloom::with_glare(hdr, rw, rh, |g| {
+            let px = cinematic::pq_rgb16(g, cine.paper_white, cinematic::HDR_MASTER_NITS);
+            if hdr_frames {
+                save_png16(&cine_frame_path(dir, shot, f), &px, rw, rh);
+            } else {
+                save_png16(&format!("{dir}/{}-pq.png", shot.name), &px, rw, rh);
+                save_exr(&format!("{dir}/{}.exr", shot.name), g, rw, rh);
+            }
+        });
+    }
+}
+
+/// Progress, at a cadence that is useful without being noisy: every frame for a
+/// still or a short shot, every 30 (one second of film) for a long one.
+fn cine_progress(shot: &cinematic::Shot, f: u32, frames: u32, t0: Instant, hour: Option<f32>) {
+    let step = if frames <= 60 { 1 } else { 30 };
+    if (f + 1) % step != 0 && f + 1 != frames {
+        return;
+    }
+    let el = t0.elapsed().as_secs_f64();
+    let per = el / (f + 1) as f64;
+    let eta = per * (frames - f - 1) as f64;
+    let clock = hour.map(|h| {
+        format!(" | {:02}:{:02}", h.floor() as u32 % 24, ((h.fract() * 60.0) as u32).min(59))
+    });
+    eprintln!(
+        "cinematic [{}] {}/{}: {:.2} s/frame{}{}",
+        shot.name,
+        f + 1,
+        frames,
+        per,
+        clock.unwrap_or_default(),
+        if frames > 1 { format!(" | eta {:.0} s", eta) } else { String::new() }
+    );
+}
+
+fn cine_finish(dir: &str, shot: &cinematic::Shot, t0: Instant) {
+    let el = t0.elapsed().as_secs_f64();
+    eprintln!(
+        "cinematic: wrote {} ({} frame(s), {:.1} s total, {:.2} s/frame) -> {dir}",
+        shot.name,
+        shot.kind.frames(),
+        el,
+        el / shot.kind.frames().max(1) as f64
+    );
+}
+
+/// The GPU arms of `--cinematic`: the `run_spin_gpu` skeleton (HeadlessGpu +
+/// one shared `SceneGpu` + either tracer), with the accumulate-N-sub-frames
+/// contract and ONE readback per OUTPUT frame.
+///
+/// Returns `Err` only for setup failures the caller can degrade from (no DXC,
+/// no device, scene upload) — a per-frame failure is fatal and returns `Ok(1)`.
+///
+/// Presentation deliberately does NOT go through `record_resolve`/`hdr`/the
+/// tonemap PS: every arm hands a linear f32 image to the same
+/// `render::resolve_hdr` -> `tone::ToneParams::SDR` -> `save_png` path the CPU
+/// arm uses, so the three arms cannot drift onto different curves. The cost is
+/// one w*h*12-byte copy per output frame — not per sub-frame.
+#[cfg(windows)]
+fn run_cinematic_gpu(
+    scene: &mut scene::Scene,
+    bvh: &bvh::Bvh,
+    _world: Option<&world::World>,
+    shots: &[cinematic::Shot],
+    attractors: &[world::TodAttractor],
+    cine: &cinematic::CineOpts,
+    opts: &Opts,
+) -> Result<i32, String> {
+    use std::rc::Rc;
+    let ua = windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+
+    // The DXR pipeline has no hemisphere stage, so a GI shot must ride the
+    // wavefront tracer. Switch rather than silently dropping the feature.
+    // The DXR pipeline has neither a hemisphere stage nor a quadtree, so a GI
+    // shot and a quadtree-overlay shot both have to ride the wavefront tracer.
+    // The overlay case is the quiet one: DXR traces from the TLAS root, so its
+    // `info` plane carries no subdivision depth and the "overlay" renders as a
+    // flat tint over the whole frame — a picture of nothing, with no error.
+    let wants_gi = shots.iter().any(|s| s.gi);
+    let wants_overlay = shots.iter().any(|s| s.overlay);
+    let use_wave = opts.gpu || wants_gi || wants_overlay;
+    if wants_gi && !opts.gpu {
+        eprintln!(
+            "cinematic: --cinematic-gi needs the hemisphere stage, which the DXR \
+             pipeline does not have — using the GPU wavefront tracer"
+        );
+    }
+    if wants_overlay && !opts.gpu && !wants_gi {
+        eprintln!(
+            "cinematic: --cinematic-overlay draws the QUADTREE, which the DXR \
+             pipeline does not build — using the GPU wavefront tracer"
+        );
+    }
+
+    let dxc = gpu::dxc::Dxc::load(&opts.dxc_path).map_err(|e| e.to_string())?;
+    let mut hg = gpu::trace::HeadlessGpu::new(
+        opts.gpu_debug,
+        opts.prefer.unwrap_or(gpu::adapter::Prefer::Nvidia),
+    )?;
+    let dev = hg.device.clone();
+    let core = Rc::new(gpu::trace::SceneGpu::new_uploaded(&dev, scene, bvh, &mut hg, opts.bc7)?);
+    eprintln!(
+        "cinematic: {} arm on \"{}\"",
+        if use_wave { "wavefront" } else { "dxr" },
+        hg.adapter_name
+    );
+
+    enum Arm {
+        Wave(gpu::trace::TraceGpu),
+        Dxr(gpu::dxr::DxrGpu),
+    }
+    // Kernel/RTPSO compilation is per resolution, so cache the arm and rebuild
+    // only when a shot changes it (the `islands` preset is 7 shots at one res).
+    let mut built: Option<((usize, usize), Arm)> = None;
+
+    for shot in shots {
+        let (rw, rh) = shot.res;
+        if built.as_ref().map(|(r, _)| *r) != Some((rw, rh)) {
+            // Free the old tracer's window-sized buffers BEFORE allocating the
+            // new ones — at 4K the two sets together are a real VRAM spike.
+            drop(built.take());
+            let a = if use_wave {
+                Arm::Wave(gpu::trace::TraceGpu::new(
+                    &dev,
+                    &dxc,
+                    scene,
+                    bvh,
+                    core.clone(),
+                    rw as u32,
+                    rh as u32,
+                    false, // no G-buffer pack: nothing headless consumes one
+                    false, // no NPPD stage
+                    opts.gpu_debug,
+                    &mut hg,
+                )?)
+            } else {
+                Arm::Dxr(gpu::dxr::DxrGpu::new(
+                    &dev,
+                    &dxc,
+                    scene,
+                    core.clone(),
+                    rw as u32,
+                    rh as u32,
+                    false,
+                    opts.gpu_debug,
+                )?)
+            };
+            built = Some(((rw, rh), a));
+        }
+        let armv = &mut built.as_mut().expect("just built").1;
+
+        let dir = match cine_prepare_dir(cine, shot) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("cinematic: {e}");
+                return Ok(1);
+            }
+        };
+        let q = cine_quality(shot);
+        let frames = shot.kind.frames();
+        let mut present = vec![0u32; rw * rh];
+        // resolve_hdr consults `info` only when the overlay is on; a zeroed
+        // buffer stands in otherwise so no readback is paid for nothing.
+        let mut info: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
+        let mut prev_hour: Option<f32> = None;
+        let t_shot = Instant::now();
+
+        for f in 0..frames {
+            let fs = cine_frame_state(scene, shot, attractors, cine, f, &mut prev_hour);
+            // The sky rows live in the tracer's constant buffer, so a moved
+            // hour has to be pushed before this frame's first write_cb.
+            if fs.hour.is_some() && prev_hour.is_some() {
+                match armv {
+                    Arm::Wave(tg) => tg.refresh_sky(scene),
+                    Arm::Dxr(dg) => dg.refresh_sky(scene),
+                }
+            }
+            let basis = fs.cam.basis(rw, rh);
+            for k in 0..shot.samples {
+                let p = gpu::trace::FrameParams {
+                    cam: basis,
+                    frame: k,
+                    accumulate: true,
+                    jitter: k > 0,
+                    frame_jitter: None,
+                    prev_cam: None,
+                    q,
+                    verify: false,
+                    spp: opts.spp,
+                    probe_sample: 0,
+                    clouds: fs.clouds,
+                    fireflies: fs.fireflies,
+                    // Structure replay across the sub-frames of one output
+                    // frame: the pose is bit-identical, so k > 0 re-dispatches
+                    // the persisted terminal queues and skips the whole level
+                    // ladder. `--check-gpu` gates this exact configuration
+                    // (accum bit-identity, replay vs trace, at a warm frame).
+                    // DXR has no quadtree to persist.
+                    replay: opts.replay && use_wave,
+                };
+                let r = match armv {
+                    Arm::Wave(tg) => {
+                        tg.write_cb(0, &p);
+                        hg.run(|l| tg.record_frame(l, 0, &p, true))
+                    }
+                    Arm::Dxr(dg) => {
+                        dg.write_cb(0, &p);
+                        let mut rec = Ok(());
+                        hg.run(|l| rec = dg.record_frame(l, 0)).and(rec)
+                    }
+                };
+                if let Err(e) = r {
+                    eprintln!("cinematic: frame {f} sub-frame {k} failed: {e}");
+                    return Ok(1);
+                }
+            }
+            let (acc_res, info_res) = match armv {
+                Arm::Wave(tg) => (&tg.accum, &tg.info),
+                Arm::Dxr(dg) => (&dg.accum, &dg.info),
+            };
+            let bytes = hg.read_buffer(acc_res, ua, rw * rh * 3 * 4)?;
+            let inv = 1.0 / shot.samples as f32;
+            let hdr: Vec<f32> = bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()) * inv)
+                .collect();
+            if shot.overlay {
+                let ib = hg.read_buffer(info_res, ua, rw * rh * 4)?;
+                for (dst, c) in info.iter_mut().zip(ib.chunks_exact(4)) {
+                    dst.store(u32::from_le_bytes(c.try_into().unwrap()), Relaxed);
+                }
+            }
+            cine_write_frame(
+                &dir,
+                shot,
+                cine,
+                f,
+                &hdr,
+                &info,
+                &mut present,
+                &fs,
+                rw,
+                rh,
+                if use_wave { "GPU" } else { "DXR" },
+            );
+            cine_progress(shot, f, frames, t_shot, fs.hour);
+        }
+        cine_finish(&dir, shot, t_shot);
+        cine_encode(&dir, shot, cine);
+    }
+    Ok(0)
+}
+
+/// Render the HUD (or the pause menu) into this frame and composite it.
+///
+/// This is the ONE path in the tree that puts the HUD into a saved image: P
+/// screenshots and `--check` PNGs deliberately read pre-composite sources. A
+/// capture is the exception because the HUD is a shipped feature that a release
+/// README has to be able to show.
+///
+/// The HUD is activity-gated and its fades are wall-clock, so a cold first
+/// frame would be caught mid-fade-in. `moving`/`tod_moved` are passed true to
+/// hold every element awake, and `Hud::settle` runs the animation to rest
+/// before the first captured frame.
+#[cfg(windows)]
+fn cine_composite_hud(
+    present: &mut [u32],
+    shot: &cinematic::Shot,
+    fs: &CineFrame,
+    rw: usize,
+    rh: usize,
+    mode: &'static str,
+) {
+    use std::cell::RefCell;
+    thread_local! {
+        static HUD: RefCell<Option<(usize, usize, hud::Hud)>> = const { RefCell::new(None) };
+    }
+    let spec = match &shot.hud {
+        Some(s) => s.clone(),
+        None => return,
+    };
+    HUD.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.as_ref().map(|(w, h, _)| (*w, *h)) != Some((rw, rh)) {
+            match hud::Hud::new(rw as u32, rh as u32, true) {
+                Ok(mut h) => {
+                    if let Some(group) = &spec {
+                        h.open_menu();
+                        if !group.is_empty() {
+                            h.open_settings_page();
+                            h.set_group(group);
+                            // The rows are NOT implied by the group — opening a
+                            // settings page without this captures an empty
+                            // pane, which is a poor advertisement for a
+                            // settings menu. `build_menu_rows` is the same
+                            // source the live menu uses, so the shot shows the
+                            // real thing rather than a mock-up.
+                            let cfg = settings::Settings::default();
+                            let live = settings::LiveView {
+                                mode: 2, // DXR — the label the pill also shows
+                                spp: 1,
+                                preset: 2,
+                                hud: true,
+                                ..Default::default()
+                            };
+                            h.set_rows(build_menu_rows(&cfg, &live, group));
+                        }
+                    }
+                    // 5.2 s fills all 40 of the FPS graph's 125 ms buckets, so
+                    // a captured HUD shows a live trace rather than an empty
+                    // chart. Paid once — the Hud is cached across frames.
+                    h.settle(&fs.cam, fs.hour.unwrap_or(12.0), mode, 5.2);
+                    *slot = Some((rw, rh, h));
+                }
+                Err(e) => {
+                    eprintln!("cinematic: HUD unavailable ({e}) — capturing without it");
+                    return;
+                }
+            }
+        }
+        if let Some((_, _, h)) = slot.as_mut() {
+            // A capture has no persistent target to be incremental against, so
+            // the whole buffer composites — dirty rects are a GPU-upload
+            // optimization, not a correctness rule.
+            let _ = h.frame(
+                &fs.cam,
+                fs.hour.unwrap_or(12.0),
+                true,  // moving: hold the keymap panel on
+                true,  // tod_moved: hold the compass/clock/graph awake
+                mode,
+                1000.0 / 60.0, // a plausible frame time: this is a media artifact,
+                // not a benchmark, and feeding the real seconds-per-frame would
+                // render an FPS graph reading 0.3 in a showcase image.
+                1.0,
+            );
+            h.composite_sdr(present, rw, rh);
+        }
+    });
 }
 
 /// Headless deterministic workload driver (--spin still|path): replicates
@@ -9753,6 +10710,21 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
         Err(e) => {
             eprintln!("bc7 self-test: FAIL — {e}");
+            false
+        }
+    };
+
+    // Cinematic self-test — pure math (spline determinism and closed-loop
+    // seam continuity, the hour circle, the HUD composite, the ffmpeg command
+    // construction, and the clearance gate that proves a generated island lap
+    // never flies THROUGH an island). No GPU, no scene, no file I/O.
+    let cinematic_ok = match cinematic::self_test() {
+        Ok(()) => {
+            eprintln!("cinematic self-test: OK");
+            true
+        }
+        Err(e) => {
+            eprintln!("cinematic self-test: FAIL — {e}");
             false
         }
     };
@@ -11770,6 +12742,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         ("gltf", gltf_ok),
         ("bc7", bc7_ok),
         ("world", world_ok),
+        ("cinematic", cinematic_ok),
         ("audio", audio_ok),
         ("progress", progress_ok),
         ("quin", quin_ok),
@@ -16390,7 +17363,34 @@ impl CpuPresent {
     }
 }
 
-fn save_png(name: &str, present: &[u32], w: usize, h: usize) {
+/// A 16-bit PNG — the PQ/Rec.2020 wire for HDR stills and HDR video frames.
+/// `px` is RGB16, three values per pixel.
+pub(crate) fn save_png16(name: &str, px: &[u16], w: usize, h: usize) {
+    match image::ImageBuffer::<image::Rgb<u16>, _>::from_raw(w as u32, h as u32, px.to_vec()) {
+        Some(buf) => {
+            if let Err(e) = buf.save(name) {
+                eprintln!("failed to save {name}: {e}");
+            }
+        }
+        None => eprintln!("failed to save {name}: buffer is not {w}x{h}"),
+    }
+}
+
+/// A linear OpenEXR — the archival HDR master. No tonemap, no clamp: the
+/// radiance the renderer actually computed, including a sun disc four orders of
+/// magnitude above paper white that every display format has to crush.
+pub(crate) fn save_exr(name: &str, hdr: &[f32], w: usize, h: usize) {
+    match image::ImageBuffer::<image::Rgb<f32>, _>::from_raw(w as u32, h as u32, hdr.to_vec()) {
+        Some(buf) => {
+            if let Err(e) = buf.save(name) {
+                eprintln!("failed to save {name}: {e}");
+            }
+        }
+        None => eprintln!("failed to save {name}: buffer is not {w}x{h}"),
+    }
+}
+
+pub(crate) fn save_png(name: &str, present: &[u32], w: usize, h: usize) {
     let mut rgb = Vec::with_capacity(w * h * 3);
     for px in present {
         rgb.push((px >> 16) as u8);

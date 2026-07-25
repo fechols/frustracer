@@ -1,0 +1,49 @@
+name: check
+
+# Manual-only for now. Flip to `on: [push, pull_request]` when the repository
+# is public: Windows runners bill at 2x against a private repo's minutes
+# allowance and a cold build here is ~10-18 minutes (571 crates, SDL3 and Slint
+# both from source), but public repositories get standard runners free.
+on:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      # lfs defaults to false, and that is deliberate: the flagless --check runs
+      # on the PROCEDURAL scene, and assets/{bunny,teapot}.obj are plain git. So
+      # CI never downloads a byte of the ~4 GB of LFS scene data, and the scene
+      # blobs stay as pointer files that nothing opens.
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # `quick` is the right profile here and the repo argues why: it exercises
+      # every exact-zero correctness gate (which are perf-independent) without
+      # the ThinLTO whole-program pass. Never put a benchmark in CI — the
+      # numbers this project reports are only meaningful under `release`.
+      - name: Build
+        run: cargo build --profile quick
+
+      # No GPU on the runner and no vendor DLLs, so this is the DLL-free half:
+      # the reference-ray verification, the temporal/replay families, and ~20
+      # pure-math module self-tests. --check-gpu / --check-dxr need real
+      # hardware and are run locally.
+      - name: Gates
+        run: |
+          cargo run --profile quick -- --check
+          cargo run --profile quick -- --check-dlss
+          cargo run --profile quick -- --check-xess
+          cargo run --profile quick -- --check-fsr
+
+      # The render CI actually produced, so a failure can be looked at.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: check-images
+          path: |
+            check.png
+            check_gi.png
+          if-no-files-found: warn

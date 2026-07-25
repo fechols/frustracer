@@ -1,0 +1,43 @@
+MIT License
+
+Copyright (c) 2026 fechols
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+SCOPE. The grant above covers the contents of this repository authored here:
+`src/`, `shim/`, `tools/`, `build.rs`, and the build configuration.
+
+It does NOT cover the third-party content this repository references or
+redistributes, each of which carries its own terms:
+
+  * Benchmark scenes under `scenes/` — Powerplant, San Miguel, Rungholt,
+    Bistro, Sponza, Intel Sponza, Vokselia Spawn, Damaged Helmet and the
+    ambience audio. See the license/credit file in each scene directory.
+    NOTE: some of these are non-commercial or attribution-required; at least
+    one (`scenes/powerplant/copyright.txt`) forbids commercial use outright.
+    The MIT grant above does not and cannot relicense them.
+  * `assets/bunny.obj`, `assets/teapot.obj` — the Stanford bunny and the Utah
+    teapot, from their respective sources.
+  * Runtime SDKs (DLSS/Streamline, FidelityFX, XeSS, OIDN, ONNX Runtime,
+    DirectML, DXC, PIX). None are redistributed here; each is downloaded from
+    its vendor by `install-prerequisites.bat` under that vendor's licence.
+  * Slint, used under its Royalty-Free licence (not MIT — see the note in
+    Cargo.toml above the `slint` dependency).

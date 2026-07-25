@@ -81,43 +81,12 @@ pub struct FlyState {
     pub tod: f32,
 }
 
-/// A world island's time-of-day attractor (world mode only): flying toward
-/// an island eases the GLOBAL tod toward its theme hour at the manual-scrub
-/// rate, so every downstream contract is the held-scrub one (accumulation
-/// reset per delta, histories kept). An empty list = the feature off — every
-/// non-world session passes `vec![]` and is structurally unchanged.
-pub struct TodAttractor {
-    pub pos: Vec3A,
-    /// Theme hour, [0, 24).
-    pub hour: f32,
-    /// Falloff scale (the island's content half-footprint): weight is
-    /// 1 / (d² + radius²), so the blend is finite ON the island and fades
-    /// with the square of distance off it.
-    pub radius: f32,
-}
-
-/// Distance-weighted CIRCULAR mean of the attractor hours at `pos` (x/z
-/// distance — altitude must not drag the blend). Circular because hours wrap:
-/// 22h and 2h must blend toward midnight, never toward noon; each hour maps
-/// to a point on the unit circle, the weighted vector sum is averaged, and
-/// atan2 maps back. Returns [0, 24). Pure — world::self_test pins it.
-pub(crate) fn attractor_hour(attractors: &[TodAttractor], pos: Vec3A) -> f32 {
-    use std::f32::consts::TAU;
-    let (mut sx, mut sy) = (0.0f64, 0.0f64);
-    for a in attractors {
-        let d = pos - a.pos;
-        let d2 = d.x * d.x + d.z * d.z;
-        let w = 1.0 / (d2 + a.radius * a.radius).max(1e-6) as f64;
-        let th = (a.hour / 24.0 * TAU) as f64;
-        sx += w * th.cos();
-        sy += w * th.sin();
-    }
-    if sx == 0.0 && sy == 0.0 {
-        return 0.0; // fully antipodal cancellation — pick midnight over NaN
-    }
-    let h = (sy.atan2(sx) / TAU as f64 * 24.0) as f32;
-    h.rem_euclid(24.0)
-}
+// The attractor type and its circular mean moved to world.rs, where the data
+// they are derived from lives and where `--cinematic` (which has no window and
+// so cannot depend on this Windows-only module) can reach them. Re-exported
+// here so every existing call site — and the module's own doc comments — keep
+// reading as they did.
+pub use crate::world::{attractor_hour, TodAttractor};
 
 pub struct FlyCam {
     shared: Arc<Shared>,

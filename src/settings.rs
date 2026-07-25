@@ -292,6 +292,10 @@ pub fn headless_args<I: IntoIterator<Item = S>, S: AsRef<str>>(args: I) -> bool 
             || a.ends_with("-dump")
             || a == "--spin"
             || a == "--spin-frames"
+            // One clause covers the whole --cinematic-* family, which is why
+            // every sub-flag carries that prefix. (--spin needed two arms
+            // because --spin-frames does not extend "--spin" as a prefix.)
+            || a.starts_with("--cinematic")
     })
 }
 
@@ -1462,6 +1466,8 @@ pub fn self_test() -> Result<(), String> {
         vec!["--check-gpu", "--stress"],
         vec!["--dlss-dump"],
         vec!["--spin", "path"],
+        vec!["--cinematic", "tour"],
+        vec!["--cinematic-samples", "64"],
         vec!["--no-settings"],
     ] {
         if !headless_args(probe.iter().copied()) {

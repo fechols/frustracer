@@ -108,6 +108,12 @@ pub struct Island {
     pub center: Vec3A,
     /// Half the island's content x/z footprint — the attractor falloff scale.
     pub radius: f32,
+    /// The island's content HEIGHT (full y extent). Carried separately because
+    /// `radius` is an x/z measure and says nothing about how tall a subject is:
+    /// framing a camera off the footprint alone puts the Damaged Helmet — as
+    /// tall as it is wide — half out of frame while a flat city sits correctly.
+    /// `--cinematic` uses it to fit the whole subject.
+    pub height: f32,
     pub theme_hour: f32,
 }
 
@@ -115,6 +121,60 @@ pub struct World {
     pub islands: Vec<Island>,
     /// Field half-extent for camera framing (the `tile_fh` shape).
     pub field_half: f32,
+}
+
+/// A world island's time-of-day attractor (world mode only): flying toward
+/// an island eases the GLOBAL tod toward its theme hour at the manual-scrub
+/// rate, so every downstream contract is the held-scrub one (accumulation
+/// reset per delta, histories kept). An empty list = the feature off — every
+/// non-world session passes `vec![]` and is structurally unchanged.
+///
+/// Lives here rather than in flycam.rs because it is derived from `Island` and
+/// has two consumers with different platform reach: the flycam integrator
+/// (`#[cfg(windows)]`, eases toward it at `TOD_RATE`) and `--cinematic`
+/// (headless, samples it directly per output frame — see cinematic.rs's
+/// invariant 3). `world::self_test` pins the circular mean, and used to have to
+/// reach into a Windows-only module to do it.
+pub struct TodAttractor {
+    pub pos: Vec3A,
+    /// Theme hour, [0, 24).
+    pub hour: f32,
+    /// Falloff scale (the island's content half-footprint): weight is
+    /// 1 / (d² + radius²), so the blend is finite ON the island and fades
+    /// with the square of distance off it.
+    pub radius: f32,
+}
+
+/// Distance-weighted CIRCULAR mean of the attractor hours at `pos` (x/z
+/// distance — altitude must not drag the blend). Circular because hours wrap:
+/// 22h and 2h must blend toward midnight, never toward noon; each hour maps
+/// to a point on the unit circle, the weighted vector sum is averaged, and
+/// atan2 maps back. Returns [0, 24). Pure — `self_test` pins it.
+pub fn attractor_hour(attractors: &[TodAttractor], pos: Vec3A) -> f32 {
+    use std::f32::consts::TAU;
+    let (mut sx, mut sy) = (0.0f64, 0.0f64);
+    for a in attractors {
+        let d = pos - a.pos;
+        let d2 = d.x * d.x + d.z * d.z;
+        let w = 1.0 / (d2 + a.radius * a.radius).max(1e-6) as f64;
+        let th = (a.hour / 24.0 * TAU) as f64;
+        sx += w * th.cos();
+        sy += w * th.sin();
+    }
+    if sx == 0.0 && sy == 0.0 {
+        return 0.0; // fully antipodal cancellation — pick midnight over NaN
+    }
+    let h = (sy.atan2(sx) / TAU as f64 * 24.0) as f32;
+    h.rem_euclid(24.0)
+}
+
+/// Build the attractor set for a loaded world — the ONE construction site,
+/// shared by the interactive flycam and `--cinematic`.
+pub fn attractors(w: &World) -> Vec<TodAttractor> {
+    w.islands
+        .iter()
+        .map(|i| TodAttractor { pos: i.center, hour: i.theme_hour, radius: i.radius.max(1.0) })
+        .collect()
 }
 
 /// Islands-per-ring gap factor over the largest content footprint — the
@@ -455,6 +515,10 @@ pub fn world_scene() -> Option<(Scene, World, crate::bvh::Bvh)> {
     // Hour order = ring order (the table is already sorted; the sort makes
     // that a property, not a convention).
     parts.sort_by(|a, b| a.0.theme_hour.total_cmp(&b.0.theme_hour));
+    let heights: Vec<f32> = parts
+        .iter()
+        .map(|(_, s, _)| (s.content_max.y - s.content_min.y).max(1e-3))
+        .collect();
     let footprints: Vec<f32> = parts
         .iter()
         .map(|(_, s, _)| {
@@ -471,15 +535,18 @@ pub fn world_scene() -> Option<(Scene, World, crate::bvh::Bvh)> {
             name: spec.name.to_string(),
             center: centers[i],
             radius: 0.5 * footprints[i],
+            height: heights[i],
             theme_hour: spec.theme_hour,
         };
         eprintln!(
-            "world: island '{}' {:>5.1}M tris ({}) at ({:+6.1},{:+6.1}) theme {:02}:{:02}",
+            "world: island '{}' {:>5.1}M tris ({}) at ({:+6.1},{:+6.1}) r {:.1} h {:.1} theme {:02}:{:02}",
             isle.name,
             s.tri_count() as f64 / 1e6,
             kind.label(),
             isle.center.x,
             isle.center.z,
+            isle.radius,
+            isle.height,
             isle.theme_hour as u32,
             ((isle.theme_hour.fract()) * 60.0) as u32,
         );
@@ -707,10 +774,9 @@ pub fn self_test() -> Result<(), String> {
         return err("merge_scenes nondeterministic".into());
     }
 
-    // --- attractor blend (flycam auto-TOD): the CIRCULAR mean pin. 22h and
-    // 2h at equal distance must blend to MIDNIGHT — a linear mean says noon,
-    // which is exactly the bug the sin/cos vector average exists to prevent.
-    use crate::flycam::{attractor_hour, TodAttractor};
+    // --- attractor blend (flycam auto-TOD + --cinematic): the CIRCULAR mean
+    // pin. 22h and 2h at equal distance must blend to MIDNIGHT — a linear mean
+    // says noon, which is exactly the bug the sin/cos vector average prevents.
     let wrap = |h: f32| {
         let d = h.rem_euclid(24.0);
         d.min(24.0 - d) // circular distance to hour 0
@@ -798,12 +864,14 @@ pub fn self_test() -> Result<(), String> {
                     name: "alpha".into(),
                     center: Vec3A::new(8.0, 0.0, 0.0),
                     radius: 3.0,
+                    height: 2.0,
                     theme_hour: 9.0,
                 },
                 Island {
                     name: "beta".into(),
                     center: Vec3A::new(-8.0, 0.0, 0.0),
                     radius: 4.0,
+                    height: 11.0, // taller than wide — the round-trip must carry it
                     theme_hour: 22.0,
                 },
             ],
@@ -908,6 +976,7 @@ pub fn self_test() -> Result<(), String> {
             if a.name != b.name
                 || a.center != b.center
                 || a.radius.to_bits() != b.radius.to_bits()
+                || a.height.to_bits() != b.height.to_bits()
                 || a.theme_hour.to_bits() != b.theme_hour.to_bits()
             {
                 return err("world cache: island meta drift".into());
