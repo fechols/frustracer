@@ -25,6 +25,24 @@ SOFTWARE.
 SCOPE. The grant above covers the contents of this repository authored here:
 `src/`, `shim/`, `tools/`, `build.rs`, and the build configuration.
 
+THIS IS A NON-COMMERCIAL RESEARCH AND EDUCATIONAL PROJECT. It is not sold or
+offered as a product. The benchmark scenes under `scenes/` are redistributed
+for research and educational use, which is the use their own licences describe
+and the use the archives that publish them (the McGuire Computer Graphics
+Archive, the Khronos glTF Sample Assets) exist to serve. Attribution is given
+in each scene directory's credit file.
+
+If you own an asset here and would prefer it not be redistributed, please open
+an issue; it will be removed promptly. Nothing depends on any single scene —
+the loader skips a missing one with a single line of output.
+
+Note that redistributing an asset and using it are distinct acts, and a licence
+permitting the second does not automatically grant the first. Anyone forking,
+mirroring or vendoring this repository — and especially anyone doing so for a
+commercial purpose, which several of these scenes forbid outright — is
+responsible for satisfying themselves about the terms below, not for relying on
+this file's summary of them.
+
 It does NOT cover the third-party content this repository references or
 redistributes, each of which carries its own terms:
 

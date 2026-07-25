@@ -1,10 +1,13 @@
 name: check
 
-# Manual-only for now. Flip to `on: [push, pull_request]` when the repository
-# is public: Windows runners bill at 2x against a private repo's minutes
-# allowance and a cold build here is ~10-18 minutes (571 crates, SDL3 and Slint
-# both from source), but public repositories get standard runners free.
+# Public repositories get standard runners free, which is what makes a Windows
+# job affordable here: a cold build is ~10-18 minutes (571 crates, with SDL3 and
+# Slint both compiled from source). Warm, with the cache below, it lands around
+# 2-5. workflow_dispatch stays so the suite can be kicked off by hand.
 on:
+  push:
+    branches: [master]
+  pull_request:
   workflow_dispatch:
 
 jobs:

@@ -341,10 +341,25 @@ Ray Regeneration (RDNA4). It tells you why and what to try instead. Use
 
 ## THE FINE PRINT
 
+**This is a non-commercial research and educational project.** It is not sold,
+it carries no advertising, and nothing here is offered as a product. The
+benchmark scenes under `scenes/` are redistributed for that purpose — they are
+the standard research assets this kind of renderer is measured against, and
+they come from archives that publish them to the research community for exactly
+this use. Each scene keeps its own licence and credit file, and the required
+attribution is stated there.
+
+> **Rights holders:** if you own any asset here and would prefer it not be
+> redistributed, open an issue (or email the address in the repo owner's
+> profile) and it will be removed promptly, no argument. The renderer already
+> degrades gracefully without any given scene — a missing island prints one
+> line and the world is simply smaller.
+
 The **source** is [MIT](LICENSE). The scenes are not: each carries its own
-licence (some are non-commercial, some require attribution), and the vendor
-SDKs are downloaded from their owners rather than redistributed here. See
-[LICENSE](LICENSE) for the scope.
+licence — several are non-commercial, several require attribution, and one
+(`scenes/sponza-khronos/`) is a proprietary CryEngine agreement rather than a
+Creative Commons one. The vendor SDKs are downloaded from their owners rather
+than redistributed here. See [LICENSE](LICENSE) for the full scope.
 
 Scenes from the [McGuire Computer Graphics Archive](https://casual-effects.com/data/),
 the [Khronos glTF sample assets](https://github.com/KhronosGroup/glTF-Sample-Assets),
