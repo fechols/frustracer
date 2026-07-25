@@ -348,9 +348,15 @@ SDKs are downloaded from their owners rather than redistributed here. See
 
 Scenes from the [McGuire Computer Graphics Archive](https://casual-effects.com/data/),
 the [Khronos glTF sample assets](https://github.com/KhronosGroup/glTF-Sample-Assets),
-Intel, and Amazon Lumberyard. Ambience is CC0. Slint is used under its
-Royalty-Free licence. The Stanford bunny and the Utah teapot are where they
-always are.
+and Amazon Lumberyard. Ambience is CC0. Slint is used under its Royalty-Free
+licence. The Stanford bunny and the Utah teapot are where they always are.
+
+**Intel Sponza is referenced but not shipped.** Several measurements in the
+appendix were taken on it, and it is still supported as a scene argument — but
+its terms grant personal and educational use rather than redistribution, so it
+is not in this repository. Download it from
+[Intel's graphics-research samples](https://www.intel.com/content/www/us/en/developer/topic-technology/graphics-research/samples.html)
+and extract to `scenes/intel-sponza/` if you want to reproduce those numbers.
 
 ---
 ---

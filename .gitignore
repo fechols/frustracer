@@ -16,6 +16,18 @@
 /scenes/**/*.usda
 /scenes/**/*.usd
 /scenes/**/*.usdc
+# Intel Sponza is NOT committed. Two independent reasons, either sufficient:
+# its terms ("for personal use and educational use", credits_license.txt) do
+# not grant redistribution, and at 2.05 GB across 147 files it was 56% of this
+# repo's entire LFS payload. It is also the one committed scene the default
+# world never loads — world.rs's CURATED table skips it deliberately (2.7 GB of
+# 4K PNGs is a texture-memory wall, not a place), so dropping it costs the
+# default experience nothing. It remains fully supported as a positional scene
+# argument; download it from Intel and drop it here to get the texture-memory
+# stress case back:
+#   cargo run --release -- scenes/intel-sponza/main_sponza/NewSponza_Main_glTF_003.gltf
+# https://www.intel.com/content/www/us/en/developer/topic-technology/graphics-research/samples.html
+/scenes/intel-sponza/
 # Scene+BVH sidecar caches (src/scene_cache.rs) — per-machine derived
 # artifacts, rebuilt on any source/version change. Never commit or LFS them.
 *.fcache
