@@ -1,0 +1,24 @@
+Hairball
+========
+
+Licence:   Creative Commons Attribution 3.0 Unported (CC BY 3.0)
+           https://creativecommons.org/licenses/by/3.0/
+Copyright: (c) 2010 NVIDIA Research
+Author:    Samuli Laine
+
+Obtained via the McGuire Computer Graphics Archive:
+  https://casual-effects.com/data/
+
+REQUIRED ATTRIBUTION (CC BY 3.0): credit "Hairball, (c) 2010 NVIDIA
+Research, CC BY 3.0" in any use or redistribution.
+
+CC BY 3.0 permits redistribution, including commercially, provided
+attribution is given and changes are indicated.
+
+Changes made in this repository, for the record: the OBJ mesh is stored
+zstd-compressed (.obj.zst); the loader decodes it transparently and a
+plain .obj still loads. No geometry or material values were altered.
+
+Not part of the default world -- world.rs's CURATED table skips it
+deliberately (pathological BVH depth: it is the traversal-stack margin
+stress case, not a place). Loadable as a scene argument.

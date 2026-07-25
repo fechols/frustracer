@@ -1,0 +1,37 @@
+Sponza (Khronos glTF Sample Assets edition)
+===========================================
+
+*** READ THIS BEFORE REDISTRIBUTING ***
+
+Licence:   Cryengine Limited License Agreement
+           SPDX: LicenseRef-CRYENGINE-Agreement
+           Full terms: https://www.cryengine.com/ce-terms
+Copyright: (c) 2016 Crytek
+           (The LICENSE/metadata files alone are CC BY 4.0; the MODEL is
+           not.)
+
+Attribution required by the upstream licence file: "Crytek for
+Everything".
+
+Provenance: originally modelled by Marko Dabrovic (2002), modified by
+Frank Meinl and by Morgan McGuire (2011-07-14). PBR textures derived
+from work by Alexandre Pestana. Packaged as glTF by Khronos:
+  https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/Sponza
+
+THIS IS NOT A CREATIVE COMMONS LICENCE. Unlike the other scenes here
+that carry CC BY terms, the CryEngine Limited License Agreement is a
+proprietary licence and it does not obviously grant the right to
+redistribute the model as part of a third-party repository. Anyone
+publishing a fork, mirror or release that includes this directory
+should read https://www.cryengine.com/ce-terms and satisfy themselves
+that it is permitted, or remove the directory. The renderer degrades
+gracefully without it: world.rs's CURATED table skips a missing island
+with one loud line, and the world simply has one fewer isle.
+
+Changes made in this repository, for the record:
+  * external .bin buffers are stored zstd-compressed (.bin.zst); the
+    loader decodes them transparently and a plain .bin still loads
+  * three PNG textures were converted to LOSSLESS WebP (bit-identical
+    RGBA; the .gltf keeps its .png URIs and the loader falls back to
+    the .webp sibling). The 68 JPEG textures were left as JPEG.
+No geometry, material or texel values were altered.

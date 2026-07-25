@@ -1,0 +1,28 @@
+Amazon Lumberyard Bistro
+========================
+
+Licence:   Creative Commons Attribution 4.0 International (CC BY 4.0)
+           https://creativecommons.org/licenses/by/4.0/
+Copyright: (c) 2017 Amazon Lumberyard
+
+Released to the research community through the NVIDIA ORCA library:
+  https://developer.nvidia.com/orca/amazon-lumberyard-bistro
+Obtained here via the McGuire Computer Graphics Archive:
+  https://casual-effects.com/data/
+
+REQUIRED ATTRIBUTION (CC BY 4.0): credit "Amazon Lumberyard Bistro,
+(c) 2017 Amazon Lumberyard, CC BY 4.0" in any use or redistribution.
+
+CC BY 4.0 permits redistribution, including commercially, provided
+attribution is given and changes are indicated.
+
+Changes made in this repository, for the record:
+  * the OBJ meshes are stored zstd-compressed (.obj.zst); the loader
+    decodes them transparently and a plain .obj still loads
+  * PNG textures were converted to LOSSLESS WebP (bit-identical RGBA;
+    the manifests keep their .png names and the loader falls back to
+    the .webp sibling). JPEGs were left as JPEG.
+No geometry, material or texel values were altered.
+
+Only the Exterior scene is used by the default world; Interior ships
+too and is loadable as a scene argument.

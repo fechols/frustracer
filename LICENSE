@@ -28,12 +28,29 @@ SCOPE. The grant above covers the contents of this repository authored here:
 It does NOT cover the third-party content this repository references or
 redistributes, each of which carries its own terms:
 
-  * Benchmark scenes under `scenes/` — Powerplant, San Miguel, Rungholt,
-    Bistro, Sponza, Intel Sponza, Vokselia Spawn, Damaged Helmet and the
-    ambience audio. See the license/credit file in each scene directory.
-    NOTE: some of these are non-commercial or attribution-required; at least
-    one (`scenes/powerplant/copyright.txt`) forbids commercial use outright.
-    The MIT grant above does not and cannot relicense them.
+  * Benchmark scenes under `scenes/`. Every scene directory carries its own
+    license/credit file; read it. The MIT grant above does not and cannot
+    relicense any of them. They are NOT uniform, and three in particular do
+    not grant redistribution:
+
+      - `scenes/powerplant/`      "No commercial use of this model is
+                                  allowed" (UNC Chapel Hill, 1999).
+      - `scenes/sponza-khronos/`  Cryengine Limited License Agreement
+                                  (LicenseRef-CRYENGINE-Agreement, (c) 2016
+                                  Crytek) — a proprietary licence, not a
+                                  Creative Commons one.
+      - `scenes/san-miguel/`      "free for research and educational use
+                                  with attribution" — a narrow grant.
+
+    The remainder are Creative Commons Attribution (Bistro CC BY 4.0,
+    Vokselia Spawn CC BY 3.0, Hairball CC BY 3.0, Damaged Helmet CC BY 4.0)
+    or an explicit permissive grant (Rungholt), and the ambience audio is
+    CC0. Those permit redistribution provided attribution is given — see
+    each directory's credit file for the required wording.
+
+    Intel Sponza is referenced by the docs and supported as a scene argument
+    but is NOT in this repository: its terms grant personal and educational
+    use rather than redistribution.
   * `assets/bunny.obj`, `assets/teapot.obj` — the Stanford bunny and the Utah
     teapot, from their respective sources.
   * Runtime SDKs (DLSS/Streamline, FidelityFX, XeSS, OIDN, ONNX Runtime,
