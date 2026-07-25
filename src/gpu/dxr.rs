@@ -104,7 +104,7 @@ pub fn set_inline_mode(n: u32) {
     INLINE_MODE.store(n, std::sync::atomic::Ordering::Relaxed);
 }
 
-fn dxr_inline_mode() -> u32 {
+pub(crate) fn dxr_inline_mode() -> u32 {
     INLINE_MODE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
