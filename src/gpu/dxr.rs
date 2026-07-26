@@ -234,7 +234,14 @@ impl DxrGpu {
         let sd = trace::spp_defs();
         let sd = sd.as_str();
         let defs = format!(
-            "{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}",
+            // SCENE_EMPTY is INERT in this pipeline and is carried only so the
+            // two arms' define sets stay comparable: the guards it gates live in
+            // frustum.hlsli and rt_sw.hlsli, neither of which this library
+            // pastes, and DXR rays go through the TLAS (an empty TLAS is the
+            // driver's problem, not ours). It becomes load-bearing the moment
+            // this pipeline ever pastes a software-BVH consumer.
+            trace::empty_defs(scene),
             trace::alpha_defs(scene),
             trace::height_defs(scene),
             trace::trans_defs(scene),

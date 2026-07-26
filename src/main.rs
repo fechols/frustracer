@@ -9160,6 +9160,20 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
     };
 
+    // Empty BVH: construction/quality plus every scalar and cut-seeded
+    // traversal entry point must take the clear-space identity without
+    // descending through the sentinel root.
+    let empty_bvh_ok = match bvh::empty_self_test() {
+        Ok(()) => {
+            eprintln!("empty-bvh self-test: OK");
+            true
+        }
+        Err(e) => {
+            eprintln!("empty-bvh self-test: FAIL — {e}");
+            false
+        }
+    };
+
     // Relief-march gates — flat-field bitwise identity, closed-form marched
     // hits, silhouette reject, interior escape / pit-wall occlusion, the
     // underside crossing, and the build-vs-march depth pin.
@@ -11451,6 +11465,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
 
     let gates = [
         ("texture", tex_ok),
+        ("empty-bvh", empty_bvh_ok),
         ("height", height_ok),
         ("tinted-shadow", tinted_ok),
         ("spray", spray_ok),

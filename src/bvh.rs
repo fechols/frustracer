@@ -396,6 +396,11 @@ impl Bvh {
         Bvh { nodes, tri_idx, ftree: OnceLock::new() }
     }
 
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.tri_idx.is_empty()
+    }
+
     /// Deterministic two-phase parallel build. Phase 1 splits sequentially
     /// until ranges fall under `par_threshold` (node allocation order is
     /// sequential ⇒ the top of the tree is pinned); phase 2 builds each
@@ -531,13 +536,16 @@ impl Bvh {
     /// cost is node count and box tightness, not surface-area-weighted triangle
     /// tests. Do not tune the frustum side against this number.
     pub fn quality(&self, c_trav: f32) -> BvhQuality {
-        let root_area = self.nodes[0].aabb.area().max(1e-20);
         let mut q = BvhQuality {
             nodes: self.nodes.len(),
             bytes: self.nodes.len() * std::mem::size_of::<BvhNode>()
                 + self.tri_idx.len() * 4,
             ..Default::default()
         };
+        if self.is_empty() {
+            return q;
+        }
+        let root_area = self.nodes[0].aabb.area().max(1e-20);
         // Split the two SAH terms. `node_term` = SUM_internal A(n)/A(root) is the
         // model's PREDICTED internal-node visits per random ray; it is the number
         // to hold against the measured `ray_nodes` counter when asking whether
@@ -568,7 +576,7 @@ impl Bvh {
     /// Max node depth (root = 1). Iterative — O(nodes), run once at build so
     /// the traversal loops can stay branch-free (see TRAV_STACK).
     pub fn max_depth(&self) -> usize {
-        if self.nodes.is_empty() {
+        if self.is_empty() || self.nodes.is_empty() {
             return 0;
         }
         let mut max = 0usize;
@@ -593,6 +601,9 @@ impl Bvh {
         mut tmax: f32,
         visits: &mut u64,
     ) -> Option<Hit> {
+        if self.is_empty() {
+            return None;
+        }
         let mut best: Option<Hit> = None;
         self.intersect_from(scene, ray, tmin, &mut tmax, 0, &mut best, visits);
         best
@@ -620,6 +631,9 @@ impl Bvh {
         roots: &[u32],
         visits: &mut u64,
     ) -> Option<Hit> {
+        if self.is_empty() {
+            return None;
+        }
         if !cut_seed_rays() {
             return self.intersect(scene, ray, tmin, tmax, visits);
         }
@@ -739,6 +753,9 @@ impl Bvh {
         tmax: f32,
         visits: &mut u64,
     ) -> bool {
+        if self.is_empty() {
+            return false;
+        }
         if !slab_t(&self.nodes[0].aabb, ray, tmin, tmax).is_finite() {
             return false;
         }
@@ -757,6 +774,9 @@ impl Bvh {
         roots: &[u32],
         visits: &mut u64,
     ) -> bool {
+        if self.is_empty() {
+            return false;
+        }
         if !cut_seed_rays() {
             return self.occluded(scene, ray, tmin, tmax, visits);
         }
@@ -837,6 +857,9 @@ impl Bvh {
         tmax: f32,
         visits: &mut u64,
     ) -> Vec3A {
+        if self.is_empty() {
+            return Vec3A::ONE;
+        }
         if !scene.any_transmissive {
             return if self.occluded(scene, ray, tmin, tmax, visits) {
                 Vec3A::ZERO
@@ -867,6 +890,9 @@ impl Bvh {
         roots: &[u32],
         visits: &mut u64,
     ) -> Vec3A {
+        if self.is_empty() {
+            return Vec3A::ONE;
+        }
         if !scene.any_transmissive {
             return if self.occluded_multi(scene, ray, tmin, tmax, roots, visits) {
                 Vec3A::ZERO
@@ -1442,12 +1468,86 @@ fn height_march(
     None
 }
 
+/// Empty-scene traversal gates, run by `--check`: construction must not
+/// descend through the sentinel root, and every query must return its clear
+/// identity without touching either that root or a supplied cut.
+pub fn empty_self_test() -> Result<(), String> {
+    let mut scene = crate::scene::SceneBuilder::new().finish(crate::scene::default_sun());
+    // Exercise the dedicated transmissive arms too. An empty scene has no
+    // material to derive this bit naturally, but clear space remains ONE
+    // regardless of the scene-level fast-path selector.
+    scene.any_transmissive = true;
+    let bvh = Bvh::build(&scene);
+    if !bvh.is_empty() || bvh.max_depth() != 0 {
+        return Err("empty build is not an empty depth-0 hierarchy".into());
+    }
+    let q = bvh.quality(SAH_REF_C_TRAV);
+    if q.max_depth != 0 || q.internal != 0 || q.leaves != 0 || q.tri_refs != 0 {
+        return Err("empty quality report contains hierarchy work".into());
+    }
+
+    let ray = Ray::new(Vec3A::ZERO, Vec3A::Z);
+    // Deliberately invalid roots prove multi-root entry points take the empty
+    // identity before dereferencing a caller-supplied node id.
+    let roots = [u32::MAX];
+    let mut visits = 0;
+    if bvh.intersect(&scene, &ray, 0.0, 10.0, &mut visits).is_some()
+        || bvh
+            .intersect_multi(&scene, &ray, 0.0, 10.0, &roots, &mut visits)
+            .is_some()
+        || bvh.occluded(&scene, &ray, 0.0, 10.0, &mut visits)
+        || bvh.occluded_multi(&scene, &ray, 0.0, 10.0, &roots, &mut visits)
+    {
+        return Err("empty visibility query reported a hit".into());
+    }
+    if bvh.transmittance(&scene, &ray, 0.0, 10.0, &mut visits) != Vec3A::ONE
+        || bvh.transmittance_multi(&scene, &ray, 0.0, 10.0, &roots, &mut visits)
+            != Vec3A::ONE
+    {
+        return Err("empty transmittance query did not return ONE".into());
+    }
+    let f = crate::frustum::TileFrustum::half_space(Vec3A::ZERO, Vec3A::Y);
+    if crate::frustum::nearest_geometry_distance_within(
+        &bvh,
+        &f,
+        0.0,
+        f32::INFINITY,
+        &roots,
+        &mut visits,
+    )
+    .is_some()
+    {
+        return Err("empty frustum bound query reported geometry".into());
+    }
+    let mut cut = [0u32; crate::frustum::MAX_CUT];
+    let mut overflows = 0;
+    if crate::frustum::refine_cut(
+        &bvh,
+        &f,
+        0.0,
+        f32::INFINITY,
+        &roots,
+        &mut cut,
+        &mut visits,
+        &mut overflows,
+    ) != 0
+        || overflows != 0
+    {
+        return Err("empty frustum cut was not empty".into());
+    }
+    if visits != 0 {
+        return Err(format!("empty traversal visited {visits} nodes"));
+    }
+    Ok(())
+}
+
 /// Relief-march gates, run by `--check` (the sphcell precedent — analytic
 /// single-triangle scenes, closed-form expectations): the flat-field bitwise
 /// identity, marched-hit closed forms (vertical + oblique, incl. the bary
 /// rates), the silhouette/side-exit reject must-fire, interior-entry escape
-/// and pit-wall occlusion, the underside crossing, prism containment, the
-/// build-vs-march depth pin, and the toggle-off bitwise identity.
+/// and pit-wall occlusion, the underside crossing, grazing finite-interval
+/// regressions, prism containment, the build-vs-march depth pin, and the
+/// toggle-off bitwise identity.
 pub fn height_self_test() -> Result<(), String> {
     use crate::scene::{MatKind, Material, NO_TEX, Scene};
     use crate::texture::Texture;

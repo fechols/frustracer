@@ -227,6 +227,9 @@ bool sw_occluded_from(float3 o, float3 d, float3 inv_d, float tmin, float tmax, 
 
 bool trace_closest(float3 o, float3 d, float tmin, float tmax, out HitInfo h) {
     h = (HitInfo)0;
+#ifdef SCENE_EMPTY
+    return false;
+#endif
     float3 inv_d = 1.0 / d; // Ray::new's d.recip() — ±inf on zero lanes
     bool found = false;
     sw_intersect_from(o, d, inv_d, tmin, tmax, 0u, found, h);
@@ -234,6 +237,9 @@ bool trace_closest(float3 o, float3 d, float tmin, float tmax, out HitInfo h) {
 }
 
 bool occluded_q(float3 o, float3 d, float tmin, float tmax) {
+#ifdef SCENE_EMPTY
+    return false;
+#endif
     if (tmax <= tmin) return false; // rt.hlsli:113 parity (degenerate segments)
     float3 inv_d = 1.0 / d;
     BvhNode root = bvh_nodes[0];
@@ -309,6 +315,9 @@ bool sw_transmit_from(float3 o, float3 d, float3 inv_d, float tmin, float tmax,
 }
 
 float3 transmit_q(float3 o, float3 d, float tmin, float tmax) {
+#ifdef SCENE_EMPTY
+    return float3(1.0, 1.0, 1.0);
+#endif
     if (tmax <= tmin) return float3(1.0, 1.0, 1.0);
     float3 inv_d = 1.0 / d;
     BvhNode root = bvh_nodes[0];
@@ -344,8 +353,11 @@ float3 transmit_q(float3 o, float3 d, float tmin, float tmax) {
 #ifdef SW_RAYS_LEAF
 bool trace_closest_multi(float3 o, float3 d, float tmin, float tmax,
                          uint cut_slot, uint cut_len, out HitInfo h) {
-    if (cut_slot == ROOT_CUT_SLOT) return trace_closest(o, d, tmin, tmax, h);
     h = (HitInfo)0;
+#ifdef SCENE_EMPTY
+    return false;
+#endif
+    if (cut_slot == ROOT_CUT_SLOT) return trace_closest(o, d, tmin, tmax, h);
     float3 inv_d = 1.0 / d;
     bool found = false;
     for (uint r = 0u; r < cut_len; ++r) {

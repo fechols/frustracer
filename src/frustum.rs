@@ -356,6 +356,9 @@ pub fn nearest_geometry_distance_within(
     roots: &[u32],
     visits: &mut u64,
 ) -> Option<f32> {
+    if bvh.is_empty() {
+        return None;
+    }
     let mut best = t_limit;
     for &r in roots {
         visit(bvh, f, t_start, r, &mut best, visits);

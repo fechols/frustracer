@@ -138,10 +138,25 @@ fn quantize_max(v: f32, org: f32, sca: f32) -> u8 {
 pub struct FTree {
     pub nodes: Vec<FNode>,
     /// The whole-tree cut (the analog of the binary `[0]`): the root node's
-    /// occupied slots. Empty scene ⇒ `root_len == 0` ⇒ every query returns
-    /// None/empty, matching the binary n == 0 guard.
+    /// occupied slots. Empty scene ⇒ `root_len == 0` and `nodes[0].occ == 0`
+    /// after quantization ⇒ every CPU/GPU query returns empty. The physical
+    /// zero-occupancy root is required because GPU root queries always read
+    /// node zero before occupancy rejects its eight slots.
     root_cut: [u32; WIDTH],
     root_len: usize,
+}
+
+fn empty_fnode() -> FNode {
+    FNode {
+        min_x: [f32::INFINITY; WIDTH],
+        min_y: [f32::INFINITY; WIDTH],
+        min_z: [f32::INFINITY; WIDTH],
+        max_x: [f32::NEG_INFINITY; WIDTH],
+        max_y: [f32::NEG_INFINITY; WIDTH],
+        max_z: [f32::NEG_INFINITY; WIDTH],
+        child: [INVALID; WIDTH],
+        bnode: [INVALID; WIDTH],
+    }
 }
 
 #[inline]
@@ -238,6 +253,11 @@ impl FTree {
     pub fn build(bvh: &Bvh) -> FTree {
         let mut t = FTree { nodes: Vec::new(), root_cut: [0; WIDTH], root_len: 0 };
         if bvh.tri_idx.is_empty() {
+            // The HLSL ROOT_CUT_SLOT path expands entries 0..7 and reads
+            // ft_nodes[0] before testing occupancy. Keep one real uploaded
+            // node whose occ mask quantizes to zero; an empty Vec would make
+            // that otherwise-correct empty query an out-of-bounds GPU read.
+            t.nodes.push(empty_fnode());
             return t;
         }
         // Estimate: one wide node per ~7 binary internals, padded.
@@ -257,7 +277,7 @@ impl FTree {
     /// Max wide-node depth (root = 1), iterative — the FT_STACK assert's input,
     /// run once at build like `Bvh::max_depth`.
     pub fn max_depth(&self) -> usize {
-        if self.nodes.is_empty() {
+        if self.root_len == 0 || self.nodes.is_empty() {
             return 0;
         }
         let mut work: Vec<(u32, usize)> = vec![(0, 1)];
@@ -316,16 +336,7 @@ impl FTree {
         }
 
         let id = self.nodes.len() as u32;
-        self.nodes.push(FNode {
-            min_x: [f32::INFINITY; WIDTH],
-            min_y: [f32::INFINITY; WIDTH],
-            min_z: [f32::INFINITY; WIDTH],
-            max_x: [f32::NEG_INFINITY; WIDTH],
-            max_y: [f32::NEG_INFINITY; WIDTH],
-            max_z: [f32::NEG_INFINITY; WIDTH],
-            child: [INVALID; WIDTH],
-            bnode: [INVALID; WIDTH],
-        });
+        self.nodes.push(empty_fnode());
         for s in 0..n_slots {
             let bn = slots[s];
             let aabb = bvh.nodes[bn as usize].aabb;
@@ -720,6 +731,27 @@ fn point_aabb_max_dist(p: Vec3A, aabb: &Aabb) -> f32 {
 /// and tile-shaped queries — same apexes, same frustums, both directions of
 /// clamp — and its cuts must translate to valid binary roots.
 pub fn self_test(scene: &crate::scene::Scene, bvh: &Bvh) -> Result<(), String> {
+    // Empty-scene GPU contract: ROOT_CUT_SLOT always reads ft_nodes[0], so
+    // the uploaded stream must contain one zero-occupancy sentinel even
+    // though the logical root cut is empty.
+    let empty_bvh = Bvh::from_parts(
+        vec![crate::bvh::BvhNode {
+            aabb: Aabb::EMPTY,
+            left_first: 0,
+            count: 0,
+        }],
+        Vec::new(),
+    );
+    let empty_ft = FTree::build(&empty_bvh);
+    let empty_q = empty_ft.quantized();
+    if !empty_ft.root_cut().is_empty()
+        || empty_ft.max_depth() != 0
+        || empty_q.len() != 1
+        || empty_q[0].occ != 0
+    {
+        return Err("ftree empty root is not one zero-occupancy GPU node".into());
+    }
+
     // Lifecycle regression: two simultaneously live BVHs must initialize
     // distinct auxiliary trees whose slot boxes come from their own owners.
     // This is the live snapshot-rebuild bug in miniature; a process-global
