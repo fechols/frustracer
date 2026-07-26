@@ -111,10 +111,10 @@ cbuffer Frame : register(b0) {
     // session; sky_stars' guard is a BRANCH on it, so day kernels are
     // bit-identical by construction).
     // height_max: the scene-wide maximum relief depth in world units (0.0 =
-    // no height data) — the wavefront TMin widening under FLAG_HEIGHT (a
-    // below/interior marched hit can land up to one depth EARLIER than its
-    // plane t, and the hardware would cull the candidate at an inherited
-    // TMin the CPU accepts).
+    // no height data). The CPU uses it to derive FLAG_HEIGHT; it remains in
+    // the wire layout as the availability/depth diagnostic. It is NOT a safe
+    // ray-t widening: the plane-to-relief delta is
+    // depth / abs(dot(ray_dir, geometric_normal)), unbounded at grazing.
     uint spp; uint probe_sample; float night; float height_max;
     // Sub-pixel offsets for samples 1.. (dlss::jitter_for_sample, computed on
     // the CPU — one Halton source of truth), packed two per row. The row count
@@ -146,6 +146,29 @@ cbuffer Frame : register(b0) {
 // (trace.rs::with_frame) — scene diag + the animation clock in seconds.
 #define SCENE_DIAG (cam_right.w)
 #define CLOUD_TIME (cam_up.w)
+
+// Hardware triangles surface a relief candidate at its BASE-PLANE t, while
+// candidate_reject/height_march decides at the displaced t. A finite
+// +/-height_max widening is therefore unsound at grazing incidence: the
+// world-space depth maps to an arbitrarily large ray-t delta. When relief is
+// live, enumerate the complete positive base-triangle ray and let every
+// caller re-apply its ORIGINAL logical (tmin, tmax) to the marched t.
+//
+// TMin=0 matches bvh.rs::moller_trumbore's positive-plane-candidate domain.
+// A base plane behind the ray origin is not a candidate in either tracer.
+float height_tmin(float logical_tmin) {
+#ifdef HEIGHTFIELD
+    if (flags & FLAG_HEIGHT) return 0.0;
+#endif
+    return logical_tmin;
+}
+
+float height_tmax(float logical_tmax) {
+#ifdef HEIGHTFIELD
+    if (flags & FLAG_HEIGHT) return FLT_MAX;
+#endif
+    return logical_tmax;
+}
 
 uint pack_info(uint depth, uint kind) { return (depth & 0xffu) | (kind << 8); }
 

@@ -25,31 +25,14 @@ struct HitInfo {
     float u, v; // moller-trumbore == DXR convention: p = (1-u-v)p0 + u·p1 + v·p2
 };
 
-// Relief widens the hardware ray interval on BOTH ends — the hardware culls
-// candidates at the PLANE t, and a marched hit can sit up to one relief
-// depth on the far side of its plane t in either direction: a below/interior
-// hit lands EARLIER than its plane t (so an inherited t_start ∈ (t_plane,
-// t'] would drop a candidate the CPU accepts — the TMin side), and a hit
-// with marched t' < tmax can belong to a candidate whose plane t lies BEYOND
-// tmax (an underside hit just inside an AO/shadow segment's far end — the
-// TMax side). The marched t is re-checked against the ORIGINAL bounds
-// explicitly in the loops (mirroring intersect_from's `tt > tmin &&
-// tt < tmax`), so the widening only ever surfaces candidates, never accepts
-// out-of-range hits.
-float height_tmin(float tmin) {
-#ifdef HEIGHTFIELD
-    if (flags & FLAG_HEIGHT) return max(0.0, tmin - height_max);
-#endif
-    return tmin;
-}
-
-float height_tmax(float tmax) {
-#ifdef HEIGHTFIELD
-    // +height_max saturates INF/FLT_MAX harmlessly (the unbounded rays).
-    if (flags & FLAG_HEIGHT) return tmax + height_max;
-#endif
-    return tmax;
-}
+// Relief uses trace_common.hlsli's height_tmin/height_tmax hardware interval:
+// the full positive ray while the live height toggle is on. The hardware
+// culls at the BASE-PLANE t, but the displaced t can differ by
+// depth/abs(dot(d,n)), so no finite world-depth widening is conservative at
+// grazing incidence. Every candidate loop below re-checks the marched `ct`
+// against the ORIGINAL logical bounds (`ct > tmin && ct < tmax`), mirroring
+// intersect_from and preventing the wider enumeration from accepting an
+// out-of-segment hit.
 
 #if defined(ALPHA_CUTOUT) || defined(HEIGHTFIELD)
 
@@ -81,9 +64,11 @@ bool trace_closest(float3 o, float3 d, float tmin, float tmax, out HitInfo h) {
         // alpha/height scenes). Committing shrinks TMax; rejecting leaves it
         // unshrunk — exactly moller_trumbore returning None. A marched hit
         // COMMITS AT THE PLANE t (the only t a RayQuery can commit):
-        // candidates whose plane-t's interleave within one relief depth can
-        // mis-sort — bounded, the documented known-accept — and the winner
-        // is re-marched below for its true (t', u', v').
+        // candidates whose plane-t's interleave within one relief prism's
+        // displaced ray interval can mis-sort — spatially bounded, although
+        // its ray-t width grows at grazing — and the winner is re-marched
+        // below for its true (t', u', v'). This is the documented plane-order
+        // known-accept; full hardware interval enumeration does not repair it.
         float ct = q.CandidateTriangleRayT();
         float cu = q.CandidateTriangleBarycentrics().x;
         float cv = q.CandidateTriangleBarycentrics().y;

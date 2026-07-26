@@ -104,7 +104,7 @@ pub fn set_inline_mode(n: u32) {
     INLINE_MODE.store(n, std::sync::atomic::Ordering::Relaxed);
 }
 
-fn dxr_inline_mode() -> u32 {
+pub(crate) fn dxr_inline_mode() -> u32 {
     INLINE_MODE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
@@ -234,7 +234,14 @@ impl DxrGpu {
         let sd = trace::spp_defs();
         let sd = sd.as_str();
         let defs = format!(
-            "{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}",
+            // SCENE_EMPTY is INERT in this pipeline and is carried only so the
+            // two arms' define sets stay comparable: the guards it gates live in
+            // frustum.hlsli and rt_sw.hlsli, neither of which this library
+            // pastes, and DXR rays go through the TLAS (an empty TLAS is the
+            // driver's problem, not ours). It becomes load-bearing the moment
+            // this pipeline ever pastes a software-BVH consumer.
+            trace::empty_defs(scene),
             trace::alpha_defs(scene),
             trace::height_defs(scene),
             trace::trans_defs(scene),
@@ -384,7 +391,9 @@ impl DxrGpu {
         // largest payload (the float2/uint tail is --spp: the sample's own
         // position, and prim = `(sample << 1) | probe_bit` — the index rides
         // the high bits so the miss shader can key the per-sample cloud march
-        // phase without growing the payload); triangle barycentrics = 8 B.
+        // phase without growing the payload). HitPayload and ShadowPayload are
+        // each 24 B after adding the relief ray's logical tmin/tmax, so they
+        // remain below that ceiling; triangle barycentrics = 8 B.
         let shader_cfg = D3D12_RAYTRACING_SHADER_CONFIG {
             MaxPayloadSizeInBytes: 32,
             MaxAttributeSizeInBytes: 8,

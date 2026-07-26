@@ -67,6 +67,12 @@ pub fn max_aniso() -> f32 {
 static H2N_ENABLED: AtomicBool = AtomicBool::new(true);
 static N2H_ENABLED: AtomicBool = AtomicBool::new(true);
 
+/// Read side of `set_mips`. Exists for `cli::self_test`, whose purity gate has
+/// to prove the parse loop did NOT store here.
+pub fn mips_enabled() -> bool {
+    MIPS_ENABLED.load(Relaxed)
+}
+
 pub fn set_h2n(on: bool) {
     H2N_ENABLED.store(on, Relaxed);
 }

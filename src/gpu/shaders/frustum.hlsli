@@ -126,6 +126,11 @@ uint cut_node(uint slot, uint i) {
 // exactly t_limit. Never a planar near clip: nodes are skipped only when
 // fully inside ball(origin, t_start); candidates clamp UP to t_start.
 float bound_query(TF f, float t_start, float t_limit, uint cut_slot, uint cut_len, uint lane) {
+#ifdef SCENE_EMPTY
+    // The binary empty root is a count-zero sentinel, which otherwise looks
+    // internal. Match Bvh::is_empty before reading it or either fake child.
+    return t_limit;
+#endif
     float best = t_limit;
     uint base = lane * LANE_STACK;
     for (uint r = 0; r < cut_len; ++r) {
@@ -180,6 +185,9 @@ float bound_query(TF f, float t_start, float t_limit, uint cut_slot, uint cut_le
 // uses t_limit <= t_far and every ray tmax <= t_far); the primary path and
 // GI pass FLT_MAX, which never drops; hemi AO passes ao_radius.
 uint refine_cut(TF f, float t_ball, float t_far, uint parent_slot, uint parent_len, uint out_slot, uint lane) {
+#ifdef SCENE_EMPTY
+    return 0u;
+#endif
     uint base = lane * LANE_STACK;
     uint wlen = min(parent_len, LANE_STACK);
     for (uint i = 0; i < wlen; ++i) {

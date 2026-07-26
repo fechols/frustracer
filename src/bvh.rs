@@ -2,6 +2,7 @@ use crate::scene::Scene;
 use glam::Vec3A;
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::OnceLock;
 
 /// A/B lever (`--no-cut-rays`): when off, cut-SEEDED rays traverse from the root
 /// instead of from the tile's node cut. The inherited `tmin` (the tile's proven
@@ -161,6 +162,13 @@ pub struct BvhNode {
 pub struct Bvh {
     pub nodes: Vec<BvhNode>,
     pub tri_idx: Vec<u32>,
+    /// Lazily built wide tree for frustum/hemisphere bound queries.
+    ///
+    /// This cache belongs to the binary tree whose node ids it mirrors. A
+    /// scene rebuild therefore drops both structures together; keeping it on
+    /// `Bvh` prevents cuts or slot-to-node mappings from surviving into a
+    /// replacement hierarchy.
+    pub(crate) ftree: OnceLock<crate::ftree::FTree>,
 }
 
 pub struct Ray {
@@ -379,6 +387,20 @@ fn par_threshold(n: usize) -> usize {
 }
 
 impl Bvh {
+    /// Assemble a binary tree and its empty per-tree auxiliary cache.
+    ///
+    /// All builders and cache loaders pass through here so a deserialized or
+    /// alternative-builder BVH has the same lifetime coupling as the SAH
+    /// builder.
+    pub(crate) fn from_parts(nodes: Vec<BvhNode>, tri_idx: Vec<u32>) -> Bvh {
+        Bvh { nodes, tri_idx, ftree: OnceLock::new() }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.tri_idx.is_empty()
+    }
+
     /// Deterministic two-phase parallel build. Phase 1 splits sequentially
     /// until ranges fall under `par_threshold` (node allocation order is
     /// sequential ⇒ the top of the tree is pinned); phase 2 builds each
@@ -482,7 +504,7 @@ impl Bvh {
             }
         }
 
-        Bvh { nodes, tri_idx }
+        Bvh::from_parts(nodes, tri_idx)
     }
 
     /// Byte-equality of two builds — the determinism gate: `--check` rebuilds
@@ -514,13 +536,16 @@ impl Bvh {
     /// cost is node count and box tightness, not surface-area-weighted triangle
     /// tests. Do not tune the frustum side against this number.
     pub fn quality(&self, c_trav: f32) -> BvhQuality {
-        let root_area = self.nodes[0].aabb.area().max(1e-20);
         let mut q = BvhQuality {
             nodes: self.nodes.len(),
             bytes: self.nodes.len() * std::mem::size_of::<BvhNode>()
                 + self.tri_idx.len() * 4,
             ..Default::default()
         };
+        if self.is_empty() {
+            return q;
+        }
+        let root_area = self.nodes[0].aabb.area().max(1e-20);
         // Split the two SAH terms. `node_term` = SUM_internal A(n)/A(root) is the
         // model's PREDICTED internal-node visits per random ray; it is the number
         // to hold against the measured `ray_nodes` counter when asking whether
@@ -551,7 +576,7 @@ impl Bvh {
     /// Max node depth (root = 1). Iterative — O(nodes), run once at build so
     /// the traversal loops can stay branch-free (see TRAV_STACK).
     pub fn max_depth(&self) -> usize {
-        if self.nodes.is_empty() {
+        if self.is_empty() || self.nodes.is_empty() {
             return 0;
         }
         let mut max = 0usize;
@@ -576,6 +601,9 @@ impl Bvh {
         mut tmax: f32,
         visits: &mut u64,
     ) -> Option<Hit> {
+        if self.is_empty() {
+            return None;
+        }
         let mut best: Option<Hit> = None;
         self.intersect_from(scene, ray, tmin, &mut tmax, 0, &mut best, visits);
         best
@@ -603,6 +631,9 @@ impl Bvh {
         roots: &[u32],
         visits: &mut u64,
     ) -> Option<Hit> {
+        if self.is_empty() {
+            return None;
+        }
         if !cut_seed_rays() {
             return self.intersect(scene, ray, tmin, tmax, visits);
         }
@@ -722,6 +753,9 @@ impl Bvh {
         tmax: f32,
         visits: &mut u64,
     ) -> bool {
+        if self.is_empty() {
+            return false;
+        }
         if !slab_t(&self.nodes[0].aabb, ray, tmin, tmax).is_finite() {
             return false;
         }
@@ -740,6 +774,9 @@ impl Bvh {
         roots: &[u32],
         visits: &mut u64,
     ) -> bool {
+        if self.is_empty() {
+            return false;
+        }
         if !cut_seed_rays() {
             return self.occluded(scene, ray, tmin, tmax, visits);
         }
@@ -820,6 +857,9 @@ impl Bvh {
         tmax: f32,
         visits: &mut u64,
     ) -> Vec3A {
+        if self.is_empty() {
+            return Vec3A::ONE;
+        }
         if !scene.any_transmissive {
             return if self.occluded(scene, ray, tmin, tmax, visits) {
                 Vec3A::ZERO
@@ -850,6 +890,9 @@ impl Bvh {
         roots: &[u32],
         visits: &mut u64,
     ) -> Vec3A {
+        if self.is_empty() {
+            return Vec3A::ONE;
+        }
         if !scene.any_transmissive {
             return if self.occluded_multi(scene, ray, tmin, tmax, roots, visits) {
                 Vec3A::ZERO
@@ -1237,10 +1280,11 @@ pub(crate) fn tri_height_depth(scene: &Scene, tri: u32) -> f32 {
     if !ts.is_finite() { 0.0 } else { m.height_amp * ts }
 }
 
-/// Scene-wide maximum relief depth in world units — the wavefront TMin
-/// widening constant (`FrameCb::height_max`; 0.0 = no height data, which is
-/// also how the CB encodes `any_height` for FLAG_HEIGHT). One parallel pass
-/// at GPU-session init.
+/// Scene-wide maximum relief depth in world units (`FrameCb::height_max`;
+/// 0.0 = no height data, which is also how the CB encodes `any_height` for
+/// FLAG_HEIGHT). This is metadata, NOT a conservative ray-t widening:
+/// plane-to-relief `dt = depth / abs(dot(ray_dir, normal))` is unbounded at
+/// grazing incidence. One parallel pass at GPU-session init.
 pub fn height_max_world(scene: &Scene) -> f32 {
     if !scene.any_height || !height_armed() {
         return 0.0;
@@ -1425,12 +1469,86 @@ fn height_march(
     None
 }
 
+/// Empty-scene traversal gates, run by `--check`: construction must not
+/// descend through the sentinel root, and every query must return its clear
+/// identity without touching either that root or a supplied cut.
+pub fn empty_self_test() -> Result<(), String> {
+    let mut scene = crate::scene::SceneBuilder::new().finish(crate::scene::default_sun());
+    // Exercise the dedicated transmissive arms too. An empty scene has no
+    // material to derive this bit naturally, but clear space remains ONE
+    // regardless of the scene-level fast-path selector.
+    scene.any_transmissive = true;
+    let bvh = Bvh::build(&scene);
+    if !bvh.is_empty() || bvh.max_depth() != 0 {
+        return Err("empty build is not an empty depth-0 hierarchy".into());
+    }
+    let q = bvh.quality(SAH_REF_C_TRAV);
+    if q.max_depth != 0 || q.internal != 0 || q.leaves != 0 || q.tri_refs != 0 {
+        return Err("empty quality report contains hierarchy work".into());
+    }
+
+    let ray = Ray::new(Vec3A::ZERO, Vec3A::Z);
+    // Deliberately invalid roots prove multi-root entry points take the empty
+    // identity before dereferencing a caller-supplied node id.
+    let roots = [u32::MAX];
+    let mut visits = 0;
+    if bvh.intersect(&scene, &ray, 0.0, 10.0, &mut visits).is_some()
+        || bvh
+            .intersect_multi(&scene, &ray, 0.0, 10.0, &roots, &mut visits)
+            .is_some()
+        || bvh.occluded(&scene, &ray, 0.0, 10.0, &mut visits)
+        || bvh.occluded_multi(&scene, &ray, 0.0, 10.0, &roots, &mut visits)
+    {
+        return Err("empty visibility query reported a hit".into());
+    }
+    if bvh.transmittance(&scene, &ray, 0.0, 10.0, &mut visits) != Vec3A::ONE
+        || bvh.transmittance_multi(&scene, &ray, 0.0, 10.0, &roots, &mut visits)
+            != Vec3A::ONE
+    {
+        return Err("empty transmittance query did not return ONE".into());
+    }
+    let f = crate::frustum::TileFrustum::half_space(Vec3A::ZERO, Vec3A::Y);
+    if crate::frustum::nearest_geometry_distance_within(
+        &bvh,
+        &f,
+        0.0,
+        f32::INFINITY,
+        &roots,
+        &mut visits,
+    )
+    .is_some()
+    {
+        return Err("empty frustum bound query reported geometry".into());
+    }
+    let mut cut = [0u32; crate::frustum::MAX_CUT];
+    let mut overflows = 0;
+    if crate::frustum::refine_cut(
+        &bvh,
+        &f,
+        0.0,
+        f32::INFINITY,
+        &roots,
+        &mut cut,
+        &mut visits,
+        &mut overflows,
+    ) != 0
+        || overflows != 0
+    {
+        return Err("empty frustum cut was not empty".into());
+    }
+    if visits != 0 {
+        return Err(format!("empty traversal visited {visits} nodes"));
+    }
+    Ok(())
+}
+
 /// Relief-march gates, run by `--check` (the sphcell precedent — analytic
 /// single-triangle scenes, closed-form expectations): the flat-field bitwise
 /// identity, marched-hit closed forms (vertical + oblique, incl. the bary
 /// rates), the silhouette/side-exit reject must-fire, interior-entry escape
-/// and pit-wall occlusion, the underside crossing, prism containment, the
-/// build-vs-march depth pin, and the toggle-off bitwise identity.
+/// and pit-wall occlusion, the underside crossing, grazing finite-interval
+/// regressions, prism containment, the build-vs-march depth pin, and the
+/// toggle-off bitwise identity.
 pub fn height_self_test() -> Result<(), String> {
     use crate::scene::{MatKind, Material, NO_TEX, Scene};
     use crate::texture::Texture;
@@ -1613,6 +1731,60 @@ pub fn height_self_test() -> Result<(), String> {
         let want_b = 1.0 + f; // t_h0 = 1 (z −2→−1), t_p = 2, ĥ spans [0,1]
         if ((hb.t - want_b) / want_b).abs() > 1e-5 {
             return Err(format!("underside: t' {} want {want_b}", hb.t));
+        }
+        // (f2) A world-depth +/- widening is NOT a ray-t bound. At grazing
+        // incidence, dt = depth/|d.n| exceeds the one-unit depth. Pin both
+        // interval ends against the CPU reference:
+        //   * descending: plane t is BEFORE old (tmin-depth), marched t is in;
+        //   * ascending:  plane t is AFTER old (tmax+depth), marched t is in.
+        // The GPU must enumerate the full positive base-triangle ray and
+        // apply these logical bounds only after candidate_reject marches t.
+        {
+            let dg_down = Vec3A::new(1.0, 0.0, -0.4).normalize();
+            let rg_down = Ray::new(Vec3A::new(0.2, 0.2, 0.8), dg_down);
+            let hg_down = bvhh
+                .intersect(&half, &rg_down, 0.0, f32::INFINITY, &mut vis)
+                .ok_or("grazing tmin: no full-interval hit")?;
+            let tp_down = 0.8 / -dg_down.z;
+            let logical_tmin = hg_down.t - 0.05;
+            if !(tp_down < logical_tmin - 1.0 && hg_down.t > logical_tmin) {
+                return Err(format!(
+                    "grazing tmin setup invalid: plane {tp_down}, hit {}, logical {logical_tmin}",
+                    hg_down.t
+                ));
+            }
+            let bounded = bvhh
+                .intersect(&half, &rg_down, logical_tmin, f32::INFINITY, &mut vis)
+                .ok_or("grazing tmin: marched in-range hit was culled")?;
+            if (bounded.t - hg_down.t).abs() > 1e-5 {
+                return Err(format!(
+                    "grazing tmin: bounded hit {} != full hit {}",
+                    bounded.t, hg_down.t
+                ));
+            }
+
+            let dg_up = Vec3A::new(1.0, 0.0, 0.4).normalize();
+            let rg_up = Ray::new(Vec3A::new(0.2, 0.2, -1.1), dg_up);
+            let hg_up = bvhh
+                .intersect(&half, &rg_up, 0.0, f32::INFINITY, &mut vis)
+                .ok_or("grazing tmax: no full-interval hit")?;
+            let tp_up = 1.1 / dg_up.z;
+            let logical_tmax = hg_up.t + 0.05;
+            if !(tp_up > logical_tmax + 1.0 && hg_up.t < logical_tmax) {
+                return Err(format!(
+                    "grazing tmax setup invalid: plane {tp_up}, hit {}, logical {logical_tmax}",
+                    hg_up.t
+                ));
+            }
+            let bounded = bvhh
+                .intersect(&half, &rg_up, 0.0, logical_tmax, &mut vis)
+                .ok_or("grazing tmax: marched in-range hit was culled")?;
+            if (bounded.t - hg_up.t).abs() > 1e-5 {
+                return Err(format!(
+                    "grazing tmax: bounded hit {} != full hit {}",
+                    bounded.t, hg_up.t
+                ));
+            }
         }
         // (g) Edge-crack fill (HEIGHT_EDGE_EXTEND): two coplanar triangles
         // sharing an edge on one continuous chart, constant mid field

@@ -2175,6 +2175,15 @@ pub(crate) fn alpha_defs(scene: &Scene) -> &'static str {
     if scene.any_alpha && !abl_has("noalpha") { "#define ALPHA_CUTOUT 1" } else { "" }
 }
 
+/// Empty-scene compile-time guard for every shader unit that can consume the
+/// binary software BVH. The CPU keeps a count-zero sentinel root so buffers
+/// remain non-empty, but that shape is indistinguishable from an internal
+/// node to HLSL; these consumers must return their clear-space identities
+/// before reading it.
+pub(crate) fn empty_defs(scene: &Scene) -> &'static str {
+    if scene.indices.is_empty() { "#define SCENE_EMPTY 1" } else { "" }
+}
+
 /// The relief twin of `alpha_defs`: height-carrying scenes compile the march
 /// + candidate loops / any-hit shaders in (runtime-gated by FLAG_HEIGHT —
 /// the V toggle); scenes without height data compile byte-identical sources
@@ -2846,8 +2855,8 @@ pub(crate) struct FrameCb {
 // The HLSL cbuffer is hand-mirrored across 7 concatenated compile units —
 // a size drift here corrupts every field after the drift point.
 // 304 (the pre-sun size) − 32 (two rect-light rows dropped) + 16 (the spp
-// block) + 8Â·MAX_SPP (the jitter table) + 16Â·9 (the SH sky) +
-// 16Â·MAX_FIREFLIES (the firefly pose rows).
+// block) + 8·MAX_SPP (the jitter table) + 16·9 (the SH sky) +
+// 16·MAX_FIREFLIES (the firefly pose rows).
 const _: () = assert!(
     std::mem::size_of::<FrameCb>()
         == 320 - 32
@@ -3294,8 +3303,10 @@ impl TraceGpu {
         // sessions are structurally untouched (the bit gates rely on that).
         // Dev cost-attribution ablations ride `abl_defs()`, which dxr.rs pastes
         // too so the two arms stay comparable.
+        let empty_def = empty_defs(scene);
         let defs = format!(
-            "{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}",
+            empty_def,
             alpha_defs(scene),
             height_defs(scene),
             trans_defs(scene),
@@ -3384,6 +3395,7 @@ impl TraceGpu {
         );
         let wavefront_src = [
             sky_defs.as_str(),
+            empty_def,
             ft_defs,
             sw_defs,
             sw_leaf_defs,
@@ -5370,4 +5382,149 @@ pub fn bc7_gpu_self_test(hg: &mut HeadlessGpu) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+// --- Shader-source gates -----------------------------------------------
+//
+// The HLSL below is the executable specification; these tests pin the few
+// invariants in it that are load-bearing for soundness but that no CPU-only
+// gate can reach (`--check-gpu`/`--check-dxr` need a real adapter). They are
+// deliberately narrow: each asserts an ordering or a monotonicity statement,
+// never formatting.
+
+#[cfg(test)]
+mod ftree_shader_source_tests {
+    use super::FTREE_HLSLI;
+
+    /// The serial wide-node loop caches internal-slot distances before all
+    /// terminal slots have tightened `best`. Its overflow fallback must first
+    /// reject those stale distances and must only ever lower the bound. This
+    /// source-level gate is deliberately hardware-free: the live HLSL remains
+    /// the executable specification, while `cargo test` pins the two ordering
+    /// and monotonicity statements on which conservative empty-space proof
+    /// depends.
+    #[test]
+    fn overflow_fallback_cannot_raise_best() {
+        let expand = FTREE_HLSLI
+            .split_once("void ft_expand")
+            .expect("ft_expand must remain in the FTree shader")
+            .1
+            .split_once("// frustum.rs::nearest_geometry_distance")
+            .expect("ft_expand must end before bound_query")
+            .0;
+        let stale_check = expand
+            .find("if (pd >= best) continue;")
+            .expect("cached distances must be rechecked after terminals tighten best");
+        let overflow = expand
+            .find("if (sp + 1 > LANE_STACK)")
+            .expect("ft_expand must retain a conservative stack-overflow fallback");
+        let coarse_min = expand
+            .find("best = min(best, pd);")
+            .expect("stack overflow must lower best with min");
+
+        assert!(stale_check < overflow && overflow < coarse_min);
+        assert!(!expand.contains("best = pd;"));
+    }
+}
+
+#[cfg(test)]
+mod empty_bvh_shader_source_tests {
+    use super::{empty_defs, FRUSTUM_HLSLI, RT_SW_HLSLI};
+
+    /// Empty binary BVHs use a count-zero sentinel root on the CPU. GPU
+    /// binary consumers must take their identities before interpreting that
+    /// sentinel as an internal node; unlike the wide tree, it has no child
+    /// occupancy mask to stop a descent.
+    #[test]
+    fn empty_binary_consumers_short_circuit_before_node_reads() {
+        let empty = crate::scene::SceneBuilder::new().finish(crate::scene::default_sun());
+        assert_eq!(empty_defs(&empty), "#define SCENE_EMPTY 1");
+
+        let bound = FRUSTUM_HLSLI
+            .split_once("float bound_query")
+            .expect("binary bound_query must exist")
+            .1
+            .split_once("// frustum.rs::refine_cut")
+            .expect("bound_query must precede refine_cut")
+            .0;
+        assert!(bound.contains("#ifdef SCENE_EMPTY"));
+        assert!(bound.contains("return t_limit;"));
+        assert!(
+            bound.find("return t_limit;").unwrap()
+                < bound.find("BvhNode node = bvh_nodes[idx];").unwrap()
+        );
+
+        let refine = FRUSTUM_HLSLI
+            .split_once("uint refine_cut")
+            .expect("binary refine_cut must exist")
+            .1
+            .split_once("#endif // !FTREE")
+            .expect("binary refine_cut must end before the FTREE guard")
+            .0;
+        assert!(refine.contains("#ifdef SCENE_EMPTY"));
+        assert!(refine.contains("return 0u;"));
+        assert!(
+            refine.find("return 0u;").unwrap()
+                < refine.find("BvhNode node = bvh_nodes[idx];").unwrap()
+        );
+
+        for (signature, identity) in [
+            ("bool trace_closest(", "return false;"),
+            ("bool occluded_q(", "return false;"),
+            ("float3 transmit_q(", "return float3(1.0, 1.0, 1.0);"),
+            ("bool trace_closest_multi(", "return false;"),
+        ] {
+            let body = RT_SW_HLSLI
+                .split_once(signature)
+                .unwrap_or_else(|| panic!("{signature} must exist"))
+                .1;
+            let empty_guard = body
+                .find("#ifdef SCENE_EMPTY")
+                .unwrap_or_else(|| panic!("{signature} must guard an empty scene"));
+            let identity_at = body[empty_guard..]
+                .find(identity)
+                .unwrap_or_else(|| panic!("{signature} must return its empty identity"));
+            let first_node = body.find("bvh_nodes[").unwrap_or(usize::MAX);
+            assert!(empty_guard + identity_at < first_node);
+        }
+    }
+}
+
+#[cfg(test)]
+mod height_interval_shader_source_tests {
+    use super::{RT_HLSLI, TRACE_COMMON_HLSLI};
+
+    const RT_DXR_HLSLI: &str = include_str!("shaders/rt_dxr.hlsli");
+    const DXR_HLSL: &str = include_str!("shaders/dxr.hlsl");
+
+    /// Relief displacement is bounded in world-normal distance, not in ray t.
+    /// Pin the shader-side half of the grazing-interval regression without
+    /// requiring an RT-capable adapter: hardware enumeration must cover the
+    /// full positive base-triangle ray, and both intersectors must retain the
+    /// caller's logical bounds for the post-march test.
+    #[test]
+    fn relief_candidates_use_full_hardware_interval_and_logical_marched_bounds() {
+        let helpers = TRACE_COMMON_HLSLI
+            .split_once("float height_tmin")
+            .expect("height_tmin helper must exist")
+            .1
+            .split_once("uint pack_info")
+            .expect("height interval helpers must precede pack_info")
+            .0;
+        assert!(helpers.contains("if (flags & FLAG_HEIGHT) return 0.0;"));
+        assert!(helpers.contains("if (flags & FLAG_HEIGHT) return FLT_MAX;"));
+
+        for src in [RT_HLSLI, RT_DXR_HLSLI] {
+            assert!(!src.contains("tmin - height_max"));
+            assert!(!src.contains("tmax + height_max"));
+            assert!(src.contains("height_tmin(tmin)"));
+            assert!(src.contains("height_tmax(tmax)"));
+        }
+
+        assert!(RT_HLSLI.contains("ct > tmin && ct < tmax"));
+        assert!(RT_DXR_HLSLI.contains("p.tmin = tmin"));
+        assert!(RT_DXR_HLSLI.contains("p.tmax = tmax"));
+        assert!(DXR_HLSL.contains("t <= tmin || t >= tmax"));
+        assert!(DXR_HLSL.contains("t <= p.tmin || t >= p.tmax"));
+    }
 }

@@ -545,8 +545,7 @@ pub fn apply_to_opts(s: &Settings, opts: &mut crate::Opts) -> AppliedFx {
         }
     }
     if let Some(v) = r.heightfield {
-        crate::bvh::set_height_armed(v);
-        crate::bvh::set_height_on(v);
+        opts.heightfield = v;
     }
     // r.preset / r.bounce: session-start state, consumed by run_window.
 
@@ -779,66 +778,64 @@ pub fn apply_to_opts(s: &Settings, opts: &mut crate::Opts) -> AppliedFx {
         opts.pix_path = p;
     }
 
-    fx
-}
-
-/// The process-global "knob before scene load" statics, set through the SAME
-/// setters the flag arms call (a later flag arm stores over them — CLI wins).
-/// Ordering note: mips before aniso — `set_mips(false)` forces aniso to 1 and
-/// `set_aniso` re-checks the mips switch, the CLI's own ordering contract
-/// (texture.rs).
-pub fn apply_globals(s: &Settings) {
+    // Effects: the "knob before scene load" levers. These used to be written
+    // STRAIGHT into their process-global statics by a separate `apply_globals`,
+    // moments before the parse loop wrote the same statics again through the
+    // same setters — two writers, layered by call ordering alone. They are
+    // ordinary `Opts` fields now (see cli.rs's header), so the file simply
+    // seeds them and a CLI flag simply overwrites them; `main`'s lever block is
+    // the one place any of it reaches a global.
     let e = &s.effects;
     if let Some(v) = e.mips {
-        crate::texture::set_mips(v);
+        opts.mips = v;
     }
     if let Some(n) = e.aniso {
         if (1..=crate::texture::MAX_ANISO_CAP).contains(&n) {
-            crate::texture::set_aniso(n);
+            opts.aniso = n;
         } else {
             warn("effects.aniso", &n.to_string());
         }
     }
     if let Some(n) = e.cloud_shadow {
         if n == 0 || (2..=64).contains(&n) {
-            crate::gpu::trace::set_cloud_shadow(n);
+            opts.cloud_shadow = n;
         } else {
             warn("effects.cloud_shadow", &n.to_string());
         }
     }
     if let Some(k) = e.sky_lod {
         if k.is_power_of_two() && (1..=32).contains(&k) {
-            crate::gpu::trace::set_sky_lod(k);
+            opts.sky_lod = k;
         } else {
             warn("effects.sky_lod", &k.to_string());
         }
     }
     if let Some(v) = e.h2n {
-        crate::texture::set_h2n(v);
+        opts.h2n = v;
     }
     if let Some(v) = e.n2h {
-        crate::texture::set_n2h(v);
+        opts.n2h = v;
     }
     if let Some(v) = e.tinted_shadows {
-        crate::scene::set_tinted_shadows(v);
+        opts.tinted_shadows = v;
     }
     if let Some(v) = e.spray {
-        crate::scene::set_spray(v);
+        opts.spray = v;
     }
     if let Some(v) = e.depth_tint {
-        crate::scene::set_depth_tint(v);
+        opts.depth_tint = v;
     }
     if let Some(v) = e.water {
-        crate::scene::set_water(v);
+        opts.water = v;
     }
     if let Some(v) = e.bloom {
-        crate::bloom::set_enabled(v);
+        opts.bloom = v;
     }
     if let Some(v) = e.clouds {
-        crate::clouds::set_enabled(v);
+        opts.clouds = v;
     }
     if let Some(v) = e.fireflies {
-        crate::fireflies::set_enabled(v);
+        opts.fireflies = v;
     }
     if let Some(n) = e.fireflies_count {
         if n > crate::fireflies::MAX_FIREFLIES as u32 {
@@ -847,15 +844,17 @@ pub fn apply_globals(s: &Settings) {
                 crate::fireflies::MAX_FIREFLIES
             );
         }
-        crate::fireflies::set_count(n);
+        opts.fireflies_count = n;
     }
     if let Some(n) = s.advanced.dxr_inline {
         if n <= 2 {
-            crate::gpu::dxr::set_inline_mode(n);
+            opts.dxr_inline = n;
         } else {
             warn("advanced.dxr_inline", &n.to_string());
         }
     }
+
+    fx
 }
 
 // ---------------------------------------------------------------------------

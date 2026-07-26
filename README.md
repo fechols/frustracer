@@ -19,8 +19,10 @@ intersects nothing is filled with sky immediately, **zero rays traced**.
 
 Children also inherit a **node cut**: the parent's list of surviving BVH nodes,
 re-culled and refined level by level, so a tile's frustum query descends the
-parent's frontier instead of the BVH root, and leaf pixel rays seed their
-traversal from the cut.
+parent's frontier instead of the BVH root. CPU and `--sw-rays` leaf rays also
+seed their traversal from that cut. Default hardware `RayQuery` leaf rays
+cannot accept an arbitrary BVH frontier, so they restart at the TLAS root and
+consume only the inherited `tmin`.
 
 There is a full engineering write-up in the [technical appendix](#technical-appendix)
 below — the algorithm, the correctness invariants, the measurements, and the
@@ -817,22 +819,20 @@ session. The numbers were the product; the default is the dividend.
 
 ## What the quadtree is actually worth
 
-Worth stating plainly, because the framing invites overclaiming. Against a
-control that traces one ray per pixel from the BVH root with the same shader,
-the quadtree's marginal cost per sample is **0.87–0.93× on Intel** (it wins)
-and **1.31–1.37× on NVIDIA** (it loses) — and that ratio is *flat* across
-80 k to 12.8 M triangles, a 160× range. It is a property of the hardware
-balance, not of scene complexity: the quadtree trades RT-core work for
-shader-core work, which is a good trade exactly where RT cores are weak
-relative to shader cores.
+Worth stating plainly, because the framing invites overclaiming. The published
+0.87–0.93× Intel and 1.31–1.37× NVIDIA marginal ratios were measured with the
+old `(LEAF_TILE, LEAF_GROUP) = (8, 32)` frontier. The shipping frontier is now
+`(32, 256)`, and the timing instrumentation that produced the old table was
+subsequently found to include uneven asynchronous-compilation bias. Those
+ratios—and the old ~16-spp Intel crossover—are historical results, not current
+claims. A new cross-vendor sweep is required before quoting replacements.
 
-Of the Intel advantage, the inherited distance bound explains only 7–21%;
-ablating `t_start` to zero while keeping the quadtree costs 1.1–1.7% there and
-straddles zero on a 4090. **The other ~80–93% is tiles proven empty tracing no
-rays at all** — which is to say the valuable product is the empty-space proof,
-not the distance. And none of it helps the configuration that ships: at 1 spp
-the quadtree still loses on Intel; the win needs the once-per-frame cost
-amortised and crosses over around 16 spp.
+One conclusion survived every ablation: tightening the inherited distance
+changed ray traversal very little. Setting leaf `t_start` to zero cost only
+1.1–1.7% on the measured Intel runs and straddled zero on a 4090. Most of the
+useful work was **tiles proven empty tracing no rays at all**. The valuable
+product is the shared empty-space proof (and, for custom traversal, the
+inherited node frontier), not physical ray length.
 
 ## Future work
 

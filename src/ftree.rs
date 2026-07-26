@@ -138,10 +138,25 @@ fn quantize_max(v: f32, org: f32, sca: f32) -> u8 {
 pub struct FTree {
     pub nodes: Vec<FNode>,
     /// The whole-tree cut (the analog of the binary `[0]`): the root node's
-    /// occupied slots. Empty scene ⇒ `root_len == 0` ⇒ every query returns
-    /// None/empty, matching the binary n == 0 guard.
+    /// occupied slots. Empty scene ⇒ `root_len == 0` and `nodes[0].occ == 0`
+    /// after quantization ⇒ every CPU/GPU query returns empty. The physical
+    /// zero-occupancy root is required because GPU root queries always read
+    /// node zero before occupancy rejects its eight slots.
     root_cut: [u32; WIDTH],
     root_len: usize,
+}
+
+fn empty_fnode() -> FNode {
+    FNode {
+        min_x: [f32::INFINITY; WIDTH],
+        min_y: [f32::INFINITY; WIDTH],
+        min_z: [f32::INFINITY; WIDTH],
+        max_x: [f32::NEG_INFINITY; WIDTH],
+        max_y: [f32::NEG_INFINITY; WIDTH],
+        max_z: [f32::NEG_INFINITY; WIDTH],
+        child: [INVALID; WIDTH],
+        bnode: [INVALID; WIDTH],
+    }
 }
 
 #[inline]
@@ -238,6 +253,11 @@ impl FTree {
     pub fn build(bvh: &Bvh) -> FTree {
         let mut t = FTree { nodes: Vec::new(), root_cut: [0; WIDTH], root_len: 0 };
         if bvh.tri_idx.is_empty() {
+            // The HLSL ROOT_CUT_SLOT path expands entries 0..7 and reads
+            // ft_nodes[0] before testing occupancy. Keep one real uploaded
+            // node whose occ mask quantizes to zero; an empty Vec would make
+            // that otherwise-correct empty query an out-of-bounds GPU read.
+            t.nodes.push(empty_fnode());
             return t;
         }
         // Estimate: one wide node per ~7 binary internals, padded.
@@ -257,7 +277,7 @@ impl FTree {
     /// Max wide-node depth (root = 1), iterative — the FT_STACK assert's input,
     /// run once at build like `Bvh::max_depth`.
     pub fn max_depth(&self) -> usize {
-        if self.nodes.is_empty() {
+        if self.root_len == 0 || self.nodes.is_empty() {
             return 0;
         }
         let mut work: Vec<(u32, usize)> = vec![(0, 1)];
@@ -316,16 +336,7 @@ impl FTree {
         }
 
         let id = self.nodes.len() as u32;
-        self.nodes.push(FNode {
-            min_x: [f32::INFINITY; WIDTH],
-            min_y: [f32::INFINITY; WIDTH],
-            min_z: [f32::INFINITY; WIDTH],
-            max_x: [f32::NEG_INFINITY; WIDTH],
-            max_y: [f32::NEG_INFINITY; WIDTH],
-            max_z: [f32::NEG_INFINITY; WIDTH],
-            child: [INVALID; WIDTH],
-            bnode: [INVALID; WIDTH],
-        });
+        self.nodes.push(empty_fnode());
         for s in 0..n_slots {
             let bn = slots[s];
             let aabb = bvh.nodes[bn as usize].aabb;
@@ -562,25 +573,20 @@ impl FTree {
     }
 }
 
-/// The session's wide tree, built LAZILY on the first bound query (the first
+/// A BVH's wide tree is built LAZILY on its first bound query (the first
 /// hybrid tile step or hemi entry) and read by `Accel::of`/`Accel::for_tiles`.
-/// A process-global for the same reason the `CUT_SEED_*` levers are: exactly
-/// one scene+BVH is live per process (resize re-enters `session()` around the
-/// same borrow; `--check`'s determinism rebuild is compared, never queried),
-/// so per-site `Accel::of` calls — two relaxed loads + a OnceLock get, noise
-/// against a bound query — beat threading a field through 25 `FrameCtx`
-/// literals.
+/// The `OnceLock` lives on `Bvh`: wide slot ids and slot-to-binary-node maps
+/// can never outlive the exact hierarchy from which they were derived. Live
+/// scene rebuilds therefore drop the old pair atomically through normal Rust
+/// ownership, and the replacement BVH starts with an empty cache.
 ///
 /// Lazy so GPU-tracer sessions (which build their own local FTree for upload
 /// and drop it) and `--no-*` sessions never pay the collapse (26-42 ms on
 /// multi-million-node trees) or the memory (~256 B per ~7 binary internals —
 /// ~1.5 GB at the 90M-tri tiled scale). The first consuming frame pays the
-/// build once, inside whichever rayon task gets there first (OnceLock blocks
-/// the racers — a one-time hitch). Cut ids stay in one space per session
-/// because `installed` always get_or_inits: from the first tile step onward
-/// every producer and consumer (temporal CutStore, replay records) sees the
-/// same Some/None answer.
-static INSTALLED: std::sync::OnceLock<&'static FTree> = std::sync::OnceLock::new();
+/// build once, inside whichever rayon task gets there first (`OnceLock`
+/// blocks the racers — a one-time hitch). Every producer and consumer
+/// borrowing that BVH (temporal CutStore, replay records) sees the same tree.
 
 /// Kill switch (`--no-ftree`): ALL bound queries fall back to the binary
 /// BVH — the A/B lever for the two-tree split. Default on: measured -15/-17%
@@ -599,16 +605,13 @@ pub static FTREE_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 /// this. Hemi keeps its own default via `Accel::of`; `--no-ftree` kills both.
 pub static FTREE_TILES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn installed(bvh: &Bvh) -> Option<&'static FTree> {
+fn installed(bvh: &Bvh) -> Option<&FTree> {
     if !FTREE_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
         return None;
     }
-    // Leak-once: the tree lives to process exit. Sound because exactly one
-    // BVH is live per process (see above) — the first caller's `bvh` IS the
-    // session tree every later caller holds.
-    Some(INSTALLED.get_or_init(|| {
+    Some(bvh.ftree.get_or_init(|| {
         let t0 = std::time::Instant::now();
-        let t = Box::leak(Box::new(FTree::build(bvh)));
+        let t = FTree::build(bvh);
         eprintln!(
             "ftree: {} wide nodes ({:.1} MB) from {} binary in {:.0} ms",
             t.nodes.len(),
@@ -631,8 +634,8 @@ pub struct Accel<'a> {
 
 impl<'a> Accel<'a> {
     /// The session handle: the live BVH plus the (lazily built) wide tree.
-    /// Every hemi entry point's callers use this — the one-BVH-per-process
-    /// invariant is what makes the global sound (see `INSTALLED`).
+    /// Every hemi entry point's callers use this; the wide tree is owned by
+    /// this exact `bvh`, so replacing a scene cannot retain stale slot ids.
     #[inline]
     pub fn of(bvh: &'a Bvh) -> Accel<'a> {
         Accel { bvh, ft: installed(bvh) }
@@ -641,7 +644,7 @@ impl<'a> Accel<'a> {
     /// The TILE-path handle (`tile_step`/`adopt_step`/the leaf-tile cut
     /// translation): `of` gated by the `FTREE_TILES` lever, so tiles and hemi
     /// A/B independently. Every site in one frame agrees (both levers are
-    /// set once at startup; `installed` is monotonic-Some).
+    /// set once at startup; each BVH's cache is monotonic-Some).
     #[inline]
     pub fn for_tiles(bvh: &'a Bvh) -> Accel<'a> {
         if FTREE_TILES.load(std::sync::atomic::Ordering::Relaxed) {
@@ -728,6 +731,54 @@ fn point_aabb_max_dist(p: Vec3A, aabb: &Aabb) -> f32 {
 /// and tile-shaped queries — same apexes, same frustums, both directions of
 /// clamp — and its cuts must translate to valid binary roots.
 pub fn self_test(scene: &crate::scene::Scene, bvh: &Bvh) -> Result<(), String> {
+    // Empty-scene GPU contract: ROOT_CUT_SLOT always reads ft_nodes[0], so
+    // the uploaded stream must contain one zero-occupancy sentinel even
+    // though the logical root cut is empty.
+    let empty_bvh = Bvh::from_parts(
+        vec![crate::bvh::BvhNode {
+            aabb: Aabb::EMPTY,
+            left_first: 0,
+            count: 0,
+        }],
+        Vec::new(),
+    );
+    let empty_ft = FTree::build(&empty_bvh);
+    let empty_q = empty_ft.quantized();
+    if !empty_ft.root_cut().is_empty()
+        || empty_ft.max_depth() != 0
+        || empty_q.len() != 1
+        || empty_q[0].occ != 0
+    {
+        return Err("ftree empty root is not one zero-occupancy GPU node".into());
+    }
+
+    // Lifecycle regression: two simultaneously live BVHs must initialize
+    // distinct auxiliary trees whose slot boxes come from their own owners.
+    // This is the live snapshot-rebuild bug in miniature; a process-global
+    // OnceLock makes the second x value incorrectly remain 1.
+    let one_leaf = |x: f32| {
+        Bvh::from_parts(
+            vec![crate::bvh::BvhNode {
+                aabb: Aabb {
+                    min: Vec3A::new(x, 0.0, 0.0),
+                    max: Vec3A::new(x + 1.0, 1.0, 1.0),
+                },
+                left_first: 0,
+                count: 1,
+            }],
+            vec![0],
+        )
+    };
+    let (a, b) = (one_leaf(1.0), one_leaf(10.0));
+    let fa = a.ftree.get_or_init(|| FTree::build(&a));
+    let fb = b.ftree.get_or_init(|| FTree::build(&b));
+    if std::ptr::eq(fa, fb)
+        || fa.slot_aabb(fa.root_cut()[0]).min.x != 1.0
+        || fb.slot_aabb(fb.root_cut()[0]).min.x != 10.0
+    {
+        return Err("ftree cache does not follow its owning BVH".into());
+    }
+
     let ft = FTree::build(bvh);
     // Structural audit: every occupied slot's box equals its binary node's box.
     for (i, nd) in ft.nodes.iter().enumerate() {
