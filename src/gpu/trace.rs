@@ -2846,8 +2846,8 @@ pub(crate) struct FrameCb {
 // The HLSL cbuffer is hand-mirrored across 7 concatenated compile units —
 // a size drift here corrupts every field after the drift point.
 // 304 (the pre-sun size) − 32 (two rect-light rows dropped) + 16 (the spp
-// block) + 8Â·MAX_SPP (the jitter table) + 16Â·9 (the SH sky) +
-// 16Â·MAX_FIREFLIES (the firefly pose rows).
+// block) + 8·MAX_SPP (the jitter table) + 16·9 (the SH sky) +
+// 16·MAX_FIREFLIES (the firefly pose rows).
 const _: () = assert!(
     std::mem::size_of::<FrameCb>()
         == 320 - 32
