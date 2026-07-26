@@ -59,10 +59,10 @@ pub fn build_alt(scene: &Scene, which: Builder) -> Bvh {
         .unzip();
     if n == 0 {
         // Mirror the SAH build's empty-scene shape: one empty leaf root.
-        return Bvh {
-            nodes: vec![BvhNode { aabb: Aabb::EMPTY, left_first: 0, count: 0 }],
-            tri_idx: Vec::new(),
-        };
+        return Bvh::from_parts(
+            vec![BvhNode { aabb: Aabb::EMPTY, left_first: 0, count: 0 }],
+            Vec::new(),
+        );
     }
 
     match which {
@@ -179,7 +179,7 @@ fn code_split_build(tri_aabb: &[Aabb], codes_in: &[u64]) -> Bvh {
         work.push((l + 1, mid, hi, depth + 1));
         work.push((l, lo, mid, depth + 1));
     }
-    Bvh { nodes, tri_idx: order }
+    Bvh::from_parts(nodes, order)
 }
 
 /// First index in (lo, hi) where the highest differing bit of
@@ -496,7 +496,7 @@ fn ploc_build(tri_aabb: &[Aabb], centroids: &[Vec3A]) -> Bvh {
     if rebalanced > 0 {
         eprintln!("ploc: {rebalanced} over-deep subtrees re-emitted as median treelets");
     }
-    Bvh { nodes, tri_idx }
+    Bvh::from_parts(nodes, tri_idx)
 }
 
 /// Balanced median-split emit over tri_idx[first..] (a rebalanced PLOC

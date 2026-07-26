@@ -555,7 +555,7 @@ pub fn try_load(src_path: &str) -> Option<(Scene, Bvh)> {
         sc.textures.len(),
         t0.elapsed().as_secs_f64() * 1000.0
     );
-    Some((sc, Bvh { nodes, tri_idx }))
+    Some((sc, Bvh::from_parts(nodes, tri_idx)))
 }
 
 /// Best-effort store (temp file + rename; a failure prints one line and the
@@ -875,7 +875,7 @@ pub fn try_load_world(
     );
     Some((
         sc,
-        Bvh { nodes, tri_idx },
+        Bvh::from_parts(nodes, tri_idx),
         crate::world::World { islands, field_half },
     ))
 }

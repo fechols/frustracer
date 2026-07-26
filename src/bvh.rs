@@ -2,6 +2,7 @@ use crate::scene::Scene;
 use glam::Vec3A;
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::OnceLock;
 
 /// A/B lever (`--no-cut-rays`): when off, cut-SEEDED rays traverse from the root
 /// instead of from the tile's node cut. The inherited `tmin` (the tile's proven
@@ -161,6 +162,13 @@ pub struct BvhNode {
 pub struct Bvh {
     pub nodes: Vec<BvhNode>,
     pub tri_idx: Vec<u32>,
+    /// Lazily built wide tree for frustum/hemisphere bound queries.
+    ///
+    /// This cache belongs to the binary tree whose node ids it mirrors. A
+    /// scene rebuild therefore drops both structures together; keeping it on
+    /// `Bvh` prevents cuts or slot-to-node mappings from surviving into a
+    /// replacement hierarchy.
+    pub(crate) ftree: OnceLock<crate::ftree::FTree>,
 }
 
 pub struct Ray {
@@ -379,6 +387,15 @@ fn par_threshold(n: usize) -> usize {
 }
 
 impl Bvh {
+    /// Assemble a binary tree and its empty per-tree auxiliary cache.
+    ///
+    /// All builders and cache loaders pass through here so a deserialized or
+    /// alternative-builder BVH has the same lifetime coupling as the SAH
+    /// builder.
+    pub(crate) fn from_parts(nodes: Vec<BvhNode>, tri_idx: Vec<u32>) -> Bvh {
+        Bvh { nodes, tri_idx, ftree: OnceLock::new() }
+    }
+
     /// Deterministic two-phase parallel build. Phase 1 splits sequentially
     /// until ranges fall under `par_threshold` (node allocation order is
     /// sequential ⇒ the top of the tree is pinned); phase 2 builds each
@@ -482,7 +499,7 @@ impl Bvh {
             }
         }
 
-        Bvh { nodes, tri_idx }
+        Bvh::from_parts(nodes, tri_idx)
     }
 
     /// Byte-equality of two builds — the determinism gate: `--check` rebuilds
