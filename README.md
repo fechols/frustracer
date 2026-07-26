@@ -19,10 +19,106 @@ intersects nothing is filled with sky immediately, **zero rays traced**.
 
 Children also inherit a **node cut**: the parent's list of surviving BVH nodes,
 re-culled and refined level by level, so a tile's frustum query descends the
-parent's frontier instead of the BVH root. CPU and `--sw-rays` leaf rays also
-seed their traversal from that cut. Default hardware `RayQuery` leaf rays
-cannot accept an arbitrary BVH frontier, so they restart at the TLAS root and
-consume only the inherited `tmin`.
+parent's frontier instead of the BVH root. CPU and `--continuation-rays` leaf
+rays also seed their traversal from that cut. Default hardware
+[`RayQuery`](https://microsoft.github.io/DirectX-Specs/d3d/Raytracing.html#inline-raytracing)
+leaf rays cannot accept an arbitrary BVH frontier, so they restart at the TLAS
+root and consume only the inherited `tmin`.
+
+### Result so far
+
+This is a research prototype, not a claim that a quadtree universally beats
+hardware root traversal. The durable result is more specific:
+
+- proving a whole tile empty is valuable because it eliminates every ray in
+  that tile;
+- an inherited BVH cut can help custom software traversal;
+- merely increasing a hardware ray's `tmin` changes traversal cost very little.
+
+A July 2026 Arc Pro B70 pass at 1080p measured the moving procedural workload at
+0.74 ms/frame for the plain hardware-RayQuery reference and 1.07–1.08 ms/frame
+for the original quadtree hybrid. Removing terminal cut refinement that hardware
+rays could not consume reduced materialized cut records from 257 to 65; batching
+homogeneous child-queue reservations removed more global atomics. Together they
+reduced the hybrid to 1.02–1.03 ms—about 5% across these laps—without changing
+a pixel or visibility counter. These are engineering A/Bs over deterministic
+camera laps after a 1,600-frame Intel shader warm-up, not publication-grade
+cross-vendor results.
+
+### Relation to prior work
+
+The closest antecedent is Reshetov, Soupikov, and Hurley's 2005 Intel paper
+**Multi-Level Ray Tracing Algorithm**
+([in-repo copy](docs/papers/mlrta105.pdf) ·
+[publisher](https://dl.acm.org/doi/10.1145/1073204.1073329) ·
+[public PDF](https://www.eng.utah.edu/~cs6965/papers/p1176-reshetov.pdf)),
+which uses image-space beams, adaptive tile subdivision, and deep hierarchy
+entry points. Later work includes [Traversing a BVH Cut to Exploit Ray
+Coherence](https://www.scitepress.org/PublishedPapers/2011/33634/) and
+[Faster Ray Tracing through Hierarchy Cut
+Code](https://diglib.eg.org/items/960d265d-7380-4fcf-aaf9-fd428fa0aeef).
+frustracer's contribution is a modern D3D12/DXR implementation and an explicit
+measurement of which products of the shared probe—empty tiles, `tmin`, and
+inherited cuts—actually pay on current hardware.
+
+### Software prototype of a hardware traversal continuation
+
+`--continuation-rays` is an executable sketch of an RT API that does not exist
+yet. Conceptually, that API has two operations:
+
+```text
+TraversalFrontier ProbeBeam(AccelerationStructure, beam, parent_frontier)
+Hit TraceFromFrontier(AccelerationStructure, frontier, ray, tmin, tmax)
+```
+
+The wavefront quadtree is the producer. When a tile reaches its terminal size,
+it publishes one 64-bit, provider-cookie-tagged `TraversalFrontier`. The leaf
+shader cannot inspect a node ID, pool slot, or frontier length; it can only
+hand the token to `trace_closest_frontier`. The current provider decodes the
+token and walks frustracer's software BVH from every surviving subtree. Every
+pixel and every SPP sample in that tile reuses the same token. An invalid token,
+an exhausted arena, or an unavailable provider falls back conservatively to
+the root.
+
+This is a **semantic prototype**, not emulation of a vendor RT core's private
+stack and not a speed claim. Software traversal is expected to lose to current
+fixed-function traversal on many scenes. What it demonstrates is the contract
+a future native implementation would need:
+
+- the handle is opaque, immutable, forkable, and reusable by many rays;
+- it is valid only for the same AS build, visibility domain, producing beam,
+  and certified distance interval;
+- `t_start` remains separate, because the empty-space proof is still valid
+  when a frontier coarsens to an ancestor or root;
+- capacity pressure may return an ancestor/root handle, but may never drop a
+  candidate or turn overflow into “sky”;
+- exact-basis replay may retain handles; a new producing pass or AS rebuild
+  invalidates them.
+
+The first B70 software-vs-software ABBA is nevertheless encouraging. At
+1080p/SPP=1 on the moving procedural path (1,600 warm-up + 600 measured frames,
+two fresh processes per arm), both repeats rounded to the following:
+
+| B70 traversal arm | wall ms/frame | GPU frame span | leaf shader |
+|---|---:|---:|---:|
+| same software BVH, start at root | 1.90–1.91 | 1.739 | 1.393–1.394 |
+| reuse opaque beam frontier | 1.85 | 1.683 | 1.302–1.303 |
+
+That is about 6.5% off the direct ray consumer and 3.2% off the GPU frame after
+paying to produce/translate the handles. It does **not** say software beats the
+B70's RT hardware; it says traversal state itself has measurable value under a
+controlled identical-intersector comparison—the premise a native experiment
+would build on.
+
+`--check-gpu --continuation-rays` audits the opaque wire cookie, requires the
+non-root consumer to fire, reports handles/rays/frontier entries and reuse per
+handle, then compares visibility and same-seed pixels against root traversal.
+The clean performance control is `--continuation-rays --no-cut-rays`: it keeps
+the same software intersector, shading, and inherited `t_start`, but starts
+rays at the root. It also skips terminal cut refinement, since nothing in that
+arm consumes it — so the control does strictly less quadtree work and the
+measured delta is a conservative bound on what the frontier is worth. `--spin-plain` is a useful whole-renderer reference,
+not the continuation isolation.
 
 There is a full engineering write-up in the [technical appendix](#technical-appendix)
 below — the algorithm, the correctness invariants, the measurements, and the
@@ -35,9 +131,10 @@ that will bite you silently).
 
 ## INSERT DISK ONE — build it and fly
 
-```
-git clone https://github.com/fechols/frustracer && cd frustracer
-install-prerequisites.bat dxc          # the one component the default render mode needs
+```powershell
+git clone https://github.com/fechols/frustracer
+Set-Location .\frustracer
+.\install-prerequisites.bat dxc
 cargo run --release
 ```
 
@@ -52,7 +149,10 @@ mouse button**, and press **F1** for the heads-up display.
 | **OS** | Windows 10/11, x64. (The renderer is D3D12; there is no other backend.) |
 | **Toolchain** | Rust (stable) + MSVC build tools & the Windows SDK — `build.rs` compiles three small C++ shims. CMake, because SDL3 builds from source. |
 | **git-lfs** | Only if you want the scenes. `git lfs install` once per clone, or you get pointer files. |
-| **GPU** | Anything D3D12. Ray tracing (tier 1.0+) unlocks `--dxr`, the default render mode; without it you fall back to the CPU tracer with a loud line, and it still works. |
+| **GPU** | D3D12 feature level 12_0. NVIDIA/AMD start in DXR when available; Intel RT 1.1 adapters start in the compute-wavefront tracer. `--cpu` selects the CPU tracer explicitly. |
+
+The source code is MIT-licensed. Scene assets retain their upstream terms; see
+[LICENSE](LICENSE) before redistributing a checkout or binary bundle.
 
 **Building never needs any SDK.** The vendored headers are enough, and every
 vendor library is `LoadLibrary`'d at runtime, so a bare checkout compiles and
@@ -63,13 +163,71 @@ optional runtimes (~700 MB for all of them) from each vendor's own release page.
 
 No scene data, no SDKs, no waiting:
 
+```powershell
+$env:GIT_LFS_SKIP_SMUDGE = "1"
+git clone https://github.com/fechols/frustracer
+Set-Location .\frustracer
+
+# Procedural scene: no downloaded benchmark worlds required.
+cargo run --release -- --no-world
+
+# Headless CPU correctness suite.
+cargo run --release -- --check
 ```
-set GIT_LFS_SKIP_SMUDGE=1
-git clone https://github.com/fechols/frustracer && cd frustracer
-cargo run --release -- --no-world       # the procedural scene: boxes, spheres,
-                                        # a marble bunny and a gold teapot
-cargo run --release -- --check          # the test suite: headless, no DLLs, ~1 min
+
+### Intel Arc / B70 validation recipe
+
+The four flows are `.\demo-intel.ps1 demo`, `check`, `bench`, and
+`continuation`. The helper always performs an incremental release build.
+`bench` runs the pre-pass hybrid, current hybrid, and plain reference;
+`continuation` gates the opaque handle and then compares continuation vs
+software-root traversal in fresh processes. Expanded commands:
+
+```powershell
+.\install-prerequisites.bat dxc
+cargo build --release
+
+# Dependency-light interactive algorithm demo.
+.\target\release\frustracer.exe --no-world --gpu --prefer-intel `
+  --no-upscale --no-fg --no-hdr --no-settings
+
+# Hardware correctness gates.
+.\target\release\frustracer.exe --check-gpu --prefer-intel
+.\target\release\frustracer.exe --check-dxr --prefer-intel
+
+# Deterministic hybrid/plain A/B. Explicitly exclude 1,600 warm-up frames;
+# the remaining 600 frames are exactly one camera lap.
+$env:FR_ABL = "oldcut,nobatch"
+.\target\release\frustracer.exe --no-world --spin path --gpu --prefer-intel `
+  --gpu-timing --spin-frames 2200 --spin-warmup 1600 --spin-hybrid
+Remove-Item Env:FR_ABL
+
+.\target\release\frustracer.exe --no-world --spin path --gpu --prefer-intel `
+  --gpu-timing --spin-frames 2200 --spin-warmup 1600 --spin-hybrid
+.\target\release\frustracer.exe --no-world --spin path --gpu --prefer-intel `
+  --gpu-timing --spin-frames 2200 --spin-warmup 1600 --spin-plain
+
+# Proposed RT-core continuation contract, simulated in shaders.
+.\target\release\frustracer.exe --check-gpu --prefer-intel --continuation-rays
+.\target\release\frustracer.exe --no-world --spin path --gpu --prefer-intel `
+  --gpu-timing --no-replay --spin-frames 2200 --spin-warmup 1600 `
+  --spin-hybrid --continuation-rays
+.\target\release\frustracer.exe --no-world --spin path --gpu --prefer-intel `
+  --gpu-timing --no-replay --spin-frames 2200 --spin-warmup 1600 `
+  --spin-hybrid --continuation-rays --no-cut-rays
 ```
+
+`--prefer-intel` is a preference, not a hard requirement: DXGI falls back to
+another hardware adapter when no Intel device is available. For B70 results,
+verify that every run's start line names `Intel(R) Arc(TM) Pro B70 Graphics`.
+The reported values are the post-warm-up **wall-clock summaries**
+(submit + fence included); `--gpu-timing` supplies the per-stage GPU breakdown
+over that same timed interval.
+
+One visible wart remains: this B70 currently spends roughly 22–24 seconds
+building the procedural scene's BLAS in each fresh process. The three-arm
+`bench` helper therefore takes about two minutes; that pause is not a hang, and
+AS startup is now the largest unresolved demo cost.
 
 ---
 
@@ -291,8 +449,12 @@ Real flags, all of them measured rather than guessed.
 |---|---|
 | `--quinlight` | Wire **every** supported upscaler at once and present the Lucas-Kanade-registered, winsorized consensus of their outputs |
 | `--dxr-inline 0\|1\|2` | How much of the DXR pipeline is recursive `TraceRay` vs inline `RayQuery`. See the appendix — this one changed the default |
-| `--sw-rays` | Trace the wavefront's rays on our *own* BVH instead of the hardware's |
+| `--continuation-rays` | Software prototype: beam-produced opaque traversal frontier reused by leaf rays (`--sw-rays` is the technical alias) |
+| `--continuation-rays --no-cut-rays` | Direct control: same software intersector and `t_start`, but start every leaf ray at the root (and skip the terminal cut nothing there consumes) |
 | `--spin path` | The deterministic benchmark: a closed camera loop, pose a pure function of frame index |
+| `--spin-hybrid`, `--spin-plain` | Select the quadtree or root-traversal arm for CPU/`--gpu` benchmarks (`--dxr` has only its DXR arm) |
+| `--spin-warmup N` | Exclude leading frames; defaults to 1600 on Intel and 20 elsewhere. A *defaulted* `--spin-frames` is extended so the timed span still covers a whole 600-frame lap |
+| `FR_ABL=oldcut,nobatch` | Reconstruct the pre-B70-pass wavefront queue code for a pixel-identical performance A/B |
 | `--stress 5000` | A procedural field of 5000 objects |
 | `--tile 4x2` | Replicate a loaded scene into a grid — the 100-million-triangle path |
 | `--bvh-builder sah\|lbvh\|ploc\|som` | Swap the BVH builder, including a self-organising-map "learned space-filling curve" (it loses) |
@@ -304,7 +466,8 @@ Real flags, all of them measured rather than guessed.
 
 ### `--check` is the test suite
 
-There are no unit tests. `--check` renders a frame, re-traces **every pixel**
+Four narrow Rust tests pin load-bearing shader-source invariants, and CI runs
+them. The main suite is still executable: `--check` renders a frame, re-traces **every pixel**
 with a `tmin = 0` reference ray, and exits nonzero unless the false-sky and
 tmin-overshoot counters are exactly zero — then does it again through the
 depth-capped driver, the temporal cache, the replay path, the bounce
@@ -779,7 +942,11 @@ bare launch grid over the reference loop. Every mode passes the full
 (same hardware traversal, same shading), so the A/B is dispatch and nothing
 else.
 
-| `--spin path` 1080p, spp=1, tracer ms | all TraceRay | inline secondaries | all inline | wavefront |
+This older campaign predates the current `(LEAF_TILE, LEAF_GROUP) = (32, 256)`
+frontier and post-warm-up wall-clock harness; retain it as a dispatch-shape
+ablation, not as a direct comparison to the current table below.
+
+| Historical `--spin path` 1080p, spp=1, tracer ms | all TraceRay | inline secondaries | all inline | wavefront |
 |---|---|---|---|---|
 | B70 default | 9.05 | 2.35 | 1.41 | 1.76 |
 | B70 `--stress 5000` | 5.30 | 1.64 | 1.22 | 2.02 |
@@ -826,6 +993,35 @@ old `(LEAF_TILE, LEAF_GROUP) = (8, 32)` frontier. The shipping frontier is now
 subsequently found to include uneven asynchronous-compilation bias. Those
 ratios—and the old ~16-spp Intel crossover—are historical results, not current
 claims. A new cross-vendor sweep is required before quoting replacements.
+
+The current B70 harness makes the remaining gap explicit. Over one
+deterministic 600-frame camera lap at 1920×1080 and 1 spp, after 1,600 warm-up
+frames:
+
+| Arm | Wall-clock ms/frame | Relative to plain |
+|---|---:|---:|
+| Plain hardware `RayQuery` | 0.74 | 1.00× |
+| Hybrid before this B70 pass | 1.07–1.08 | 1.45–1.46× |
+| Hybrid, current | 1.02–1.03 | 1.38–1.39× |
+
+The independent in-suite, interleaved `--check-gpu` speedometer tells the same
+story. These are synchronous wall-clock values; its two local warm-up frames
+are not the 1,600-frame spin protocol:
+
+| SPP | Hybrid wall ms | Plain wall ms | Hybrid / plain |
+|---:|---:|---:|---:|
+| 1 | 1.40 | 1.01 | 1.39× |
+| 2 | 2.13 | 1.79 | 1.19× |
+| 4 | 3.62 | 3.33 | 1.09× |
+| 8 | 6.63 | 6.35 | 1.04× |
+| 16 | 12.65 | 12.39 | 1.02× |
+
+Its endpoint cost model (derived from spp 1 and 16) is
+`0.65 + 0.750 × spp` ms for the hybrid and
+`0.25 + 0.758 × spp` ms for plain traversal. The near-identical per-sample
+slopes—and 0.99× asymptotic ratio—say that the current implementation nearly
+amortizes its fixed front-end cost at high SPP; it does not yet recover that
+cost in the measured range.
 
 One conclusion survived every ablation: tightening the inherited distance
 changed ray traversal very little. Setting leaf `t_start` to zero cost only

@@ -716,6 +716,13 @@ impl GpuContext {
         }
 
         let device = d3d12::create_device(&pick.adapter, opts.debug)?;
+        // Resolve the native upscaler chain before choosing a frame-generation
+        // swapchain. In particular, XeSS-FG must not force HDR10/SDR merely
+        // because XeSS was requested: the XeSS level itself has to initialize
+        // and win the chain first. Descriptor wiring waits until the
+        // format-dependent tonemap/bloom heaps exist below.
+        let (xess_state, fsr_state, fsr3_state) =
+            Self::probe_native(&device, opts, w, h, sl.is_some());
 
         // Frame generation, DLSS family (DLSS-G through the SL proxy
         // swapchain the session already presents on). Probed here — before
@@ -753,7 +760,7 @@ impl GpuContext {
             && sl.is_none()
             && !opts.quin
             && pick.vendor == adapter::Vendor::Intel
-            && opts.chain.xess;
+            && xess_state.is_some();
 
         // Both DLSS-G and XeSS-FG reject the scRGB fp16 swapchain (DLSS-G by
         // documented policy, XeSS-FG measured: InitFromSwapChain returns
@@ -768,29 +775,32 @@ impl GpuContext {
         // D3d::with_queue rebuilds at SDR and wraps again — FG is why the
         // session exists, so SDR with FG beats HDR10 without it.
         let fg_wrapper = fg_dlssg || try_xefg;
-        let want = if !opts.hdr {
+        let without_fg = if !opts.hdr {
             d3d12::PresentSpace::Sdr
         } else if opts.hdr10 {
             d3d12::PresentSpace::Hdr10
-        } else if fg_wrapper {
+        } else {
+            d3d12::PresentSpace::Scrgb
+        };
+        let want = if fg_wrapper && opts.hdr && !opts.hdr10 {
             if display::probe(&pick.adapter, hwnd).enabled {
                 d3d12::PresentSpace::Hdr10
             } else {
                 d3d12::PresentSpace::Sdr
             }
         } else {
-            d3d12::PresentSpace::Scrgb
+            without_fg
         };
         if fg_wrapper && opts.hdr {
             let family = if fg_dlssg { "DLSS-G" } else { "XeSS-FG" };
             match want {
                 d3d12::PresentSpace::Hdr10 => eprintln!(
-                    "fg: {family} rejects the scRGB fp16 swapchain — presenting HDR10/PQ \
+                    "fg: {family} rejects the scRGB fp16 swapchain — requesting HDR10/PQ \
                      (R10G10B10A2, G2084; --no-fg restores scRGB)"
                 ),
                 _ => eprintln!(
                     "fg: {family} rejects the scRGB fp16 swapchain and the display reports \
-                     HDR off — presenting SDR 8-bit (--no-fg restores scRGB; --hdr10 forces PQ)"
+                     HDR off — requesting SDR 8-bit (--no-fg restores scRGB; --hdr10 forces PQ)"
                 ),
             }
         }
@@ -914,7 +924,11 @@ impl GpuContext {
                 };
                 D3d::with_queue(
                     &factory, device, queue, hwnd, w, h, opts.vsync, want,
-                    Some(d3d12::FgHook { wrap: &mut wrap, unwind: &mut unwind }),
+                    Some(d3d12::FgHook {
+                        fallback: without_fg,
+                        wrap: &mut wrap,
+                        unwind: &mut unwind,
+                    }),
                     false,
                 )?
             } else if fg_versions.is_empty() {
@@ -940,7 +954,11 @@ impl GpuContext {
                 };
                 D3d::with_queue(
                     &factory, device, queue, hwnd, w, h, opts.vsync, want,
-                    Some(d3d12::FgHook { wrap: &mut wrap, unwind: &mut unwind }),
+                    Some(d3d12::FgHook {
+                        fallback: without_fg,
+                        wrap: &mut wrap,
+                        unwind: &mut unwind,
+                    }),
                     false,
                 )?
             }
@@ -1000,6 +1018,13 @@ impl GpuContext {
             bloom.glare_srv_source(),
             windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
             tonemap::SRV_SLOT_BLOOM,
+        );
+        Self::wire_native_outputs(
+            &d3d.device,
+            &passes,
+            &bloom,
+            xess_state.as_ref(),
+            fsr_state.as_ref(),
         );
         // The blit texture matches the SWAPCHAIN, not the CLI flag: under scRGB
         // the CPU arms hand over f16, under HDR10 packed 10-bit PQ, under SDR
@@ -1245,9 +1270,6 @@ impl GpuContext {
             None
         };
 
-        let (xess_state, fsr_state, fsr3_state) =
-            Self::probe_native(&passes, &bloom, &d3d.device, opts, w, h, sl.is_some());
-
         // Frame generation, part 2: the display-size FG effect context. The
         // provider pick keys on the session's resolved upscaler family (an
         // FSR4-RR session prefers the 4.x ML frame generation; everything
@@ -1406,10 +1428,8 @@ impl GpuContext {
     ///     hold both.
     /// A level that fails to come up is just not an engine: the fuse is
     /// N-generic, so --quinlight degrades to whatever actually wired.
-    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
+    #[allow(clippy::type_complexity)]
     fn probe_native(
-        passes: &tonemap::Passes,
-        bloom: &bloom::BloomGpu,
         device: &ID3D12Device,
         opts: &GpuOptions,
         w: u32,
@@ -1421,17 +1441,6 @@ impl GpuContext {
         if sl_live && !all {
             return (xess, fsr, fsr3);
         }
-        let wire_fsr = |s: FsrState| {
-            wire_tonemap_src(
-                device,
-                passes,
-                bloom,
-                s.res.upscaled(),
-                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
-                tonemap::SRV_SLOT_FSR,
-            );
-            s
-        };
         if opts.chain.fsr4 {
             match Self::init_fsr(
                 &opts.ffx_dir,
@@ -1442,7 +1451,7 @@ impl GpuContext {
                 crate::fsr::Flavor::Fsr4Rr,
                 &opts.fsr_tune,
             ) {
-                Ok(s) => fsr = Some(wire_fsr(s)),
+                Ok(s) => fsr = Some(s),
                 Err(e) => eprintln!("fsr4: level unavailable ({e}) — falling through the chain"),
             }
         }
@@ -1450,17 +1459,7 @@ impl GpuContext {
             // Input planes are allocated once at the range MAX; every frame
             // uploads and names its own sub-rect (dynamic res).
             match Self::init_xess(&opts.xess_dir, device, w, h, opts.xess_autoexposure) {
-                Ok(s) => {
-                    wire_tonemap_src(
-                        device,
-                        passes,
-                        bloom,
-                        &s.res.output,
-                        windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
-                        tonemap::SRV_SLOT_XESS,
-                    );
-                    xess = Some(s);
-                }
+                Ok(s) => xess = Some(s),
                 Err(e) => eprintln!("xess: level unavailable ({e}) — falling through the chain"),
             }
         }
@@ -1476,7 +1475,7 @@ impl GpuContext {
             ) {
                 Ok(s) => {
                     if fsr.is_none() {
-                        fsr = Some(wire_fsr(s));
+                        fsr = Some(s);
                     } else {
                         // --quinlight with BOTH ffx flavors: FSR4-RR already owns
                         // SRV_SLOT_FSR (there is one standalone-FSR present slot),
@@ -1500,6 +1499,39 @@ impl GpuContext {
             );
         }
         (xess, fsr, fsr3)
+    }
+
+    /// Install the presentation descriptors for the native chain selected by
+    /// `probe_native`. Kept separate because engine initialization must happen
+    /// before the FG swapchain decision, while these heaps exist only after
+    /// that swapchain has fixed the presentation format.
+    fn wire_native_outputs(
+        device: &ID3D12Device,
+        passes: &tonemap::Passes,
+        bloom: &bloom::BloomGpu,
+        xess: Option<&XessState>,
+        fsr: Option<&FsrState>,
+    ) {
+        if let Some(s) = xess {
+            wire_tonemap_src(
+                device,
+                passes,
+                bloom,
+                &s.res.output,
+                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+                tonemap::SRV_SLOT_XESS,
+            );
+        }
+        if let Some(s) = fsr {
+            wire_tonemap_src(
+                device,
+                passes,
+                bloom,
+                s.res.upscaled(),
+                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+                tonemap::SRV_SLOT_FSR,
+            );
+        }
     }
 
     /// Query DLSS-RR's optimal Quality-mode render resolution and its
@@ -1728,15 +1760,14 @@ impl GpuContext {
             // which a resize already forces.
             WiredUpscaler::Quin => {
                 let (x, f, f3) =
-                    Self::probe_native(
-                        &self.passes,
-                        &self.bloom,
-                        &self.d3d.device,
-                        opts,
-                        w,
-                        h,
-                        self.sl.is_some(),
-                    );
+                    Self::probe_native(&self.d3d.device, opts, w, h, self.sl.is_some());
+                Self::wire_native_outputs(
+                    &self.d3d.device,
+                    &self.passes,
+                    &self.bloom,
+                    x.as_ref(),
+                    f.as_ref(),
+                );
                 self.xess = x;
                 self.fsr = f;
                 self.fsr3 = f3;

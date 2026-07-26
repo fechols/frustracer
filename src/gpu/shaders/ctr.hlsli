@@ -24,7 +24,9 @@
 #define CTR_ALPHA_REJ     18u // stat: alpha-cutout candidate rejections (ALPHA_CUTOUT scenes)
 #define CTR_HEIGHT_REJ    19u // stat: relief-march candidate rejections (HEIGHTFIELD scenes)
 #define CTR_TRANS_PASS    20u // stat: tinted-shadow candidate passes (TRANS_SHADOW scenes)
-#define CTR_SW_CUT_SEED   21u // stat: leaf tiles whose sw rays seeded from a non-root cut (--sw-rays anti-vacuity)
+#define CTR_FRONTIER_HANDLES 21u // non-root opaque handles consumed (once/leaf record)
+#define CTR_FRONTIER_RAYS    22u // primary ray samples reusing those handles
+#define CTR_FRONTIER_ENTRIES 23u // summed software-frontier widths
 #define CTR_COUNT        24u
 
 // Compile units that paste this file bind `counters` — rt.hlsli's cutout

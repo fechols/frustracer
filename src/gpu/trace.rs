@@ -173,16 +173,23 @@ pub const CTR_HEIGHT_REJ: u32 = 19;
 /// Tinted-shadow candidate passes (TRANS_SHADOW scenes) — the anti-vacuity
 /// stat proving occlusion rays really crossed transmissive surfaces.
 pub const CTR_TRANS_PASS: u32 = 20;
-/// --sw-rays anti-vacuity stat: leaf tiles whose software rays seeded from a
-/// non-root cut (counted once per record in leaf.hlsl; --check-gpu must-fires
-/// it under the lever — proof cut-seeding is not dead code).
-pub const CTR_SW_CUT_SEED: u32 = 21;
+/// Opaque software-continuation telemetry. All three are accumulated once per
+/// non-root leaf record, so their cost does not scale with pixel count/SPP.
+pub const CTR_FRONTIER_HANDLES: u32 = 21;
+pub const CTR_FRONTIER_RAYS: u32 = 22;
+pub const CTR_FRONTIER_ENTRIES: u32 = 23;
 pub const CTR_COUNT: u32 = 24;
 
 /// queues.hlsli::LeafRec's stride — the qleaf allocation and main.rs's
 /// check-gpu readback move in lockstep with the HLSL struct through this one
-/// value (xy0 | xy1 | t_start | depth | cut_slot | cut_len).
+/// value (xy0 | xy1 | t_start | depth | TraversalFrontier::opaque.xy).
 pub const LEAF_REC_BYTES: u64 = 24;
+
+/// continuation.hlsli's software-provider wire values. The ray call site
+/// treats both words as opaque; these mirrors exist only so --check-gpu can
+/// reject a malformed producer record before trusting the consumer.
+pub const FRONTIER_COOKIE_V1: u32 = 0x4652_4301;
+pub const FRONTIER_ROOT_TOKEN: u32 = 0xffff_ffff;
 
 // Indirect-args buffer slots: level d at slot d (depth_full <= 11 asserted
 // at init); hemi + leaf/sky passes at the top.
@@ -432,11 +439,13 @@ pub fn depth_full(rw: u32, rh: u32) -> u32 {
     d
 }
 
-/// --sw-rays: the wavefront tracer's rays traverse the SOFTWARE BVH
+/// --continuation-rays / --sw-rays: the wavefront tracer's rays traverse the
+/// SOFTWARE BVH
 /// (bvh.rs's loops, ported to rt_sw.hlsli) instead of DXR inline RayQuery,
 /// so primary leaf rays can seed from the tile's inherited node cut — the
 /// one product of the frustum recursion the RayQuery API structurally cannot
-/// accept (it takes origin/dir/TMin/TMax and nothing else). Default OFF; the
+/// accept. Leaf records expose only an opaque TraversalFrontier token; the
+/// software provider is solely responsible for decoding it. Default OFF; the
 /// off arm assembles the exact pre-lever kernel sources (the --dxr-inline 0
 /// pattern, modulo the blank lines empty define segments join as — the defs
 /// block's existing tolerance). Wavefront only: the DXR pipeline never reads
@@ -478,7 +487,16 @@ pub(crate) const TRACE_COMMON_HLSLI: &str = concat!(
     include_str!("shaders/trace_common.hlsli")
 );
 const CTR_HLSLI: &str = include_str!("shaders/ctr.hlsli");
-const QUEUES_HLSLI: &str = include_str!("shaders/queues.hlsli");
+#[cfg(test)]
+const CONTINUATION_HLSLI: &str = include_str!("shaders/continuation.hlsli");
+// Every queue consumer gets the opaque-handle ABI before LeafRec declares
+// TraversalFrontier. Keeping this one concatenation site prevents a shader
+// unit from accidentally compiling a different producer/consumer contract.
+const QUEUES_HLSLI: &str = concat!(
+    include_str!("shaders/continuation.hlsli"),
+    "\n",
+    include_str!("shaders/queues.hlsli")
+);
 const FRUSTUM_HLSLI: &str = include_str!("shaders/frustum.hlsli");
 // The 8-wide frustum tree's bound_query/refine_cut, `#ifdef FTREE`-guarded —
 // pasted right after FRUSTUM_HLSLI (whose binary halves are `#ifndef FTREE`);
@@ -489,7 +507,7 @@ const FTREE_HLSLI: &str = include_str!("shaders/ftree.hlsli");
 pub const RT_HLSLI: &str = include_str!("shaders/rt.hlsli");
 /// bvh.rs's traversal loops in HLSL — pasted IN PLACE of RT_HLSLI into every
 /// ray-shooting wavefront unit when --sw-rays is armed (same three primitive
-/// signatures + the cut-seeded trace_closest_multi), so rays traverse the
+/// signatures + the opaque trace_closest_frontier), so rays traverse the
 /// software BVH and leaf primaries seed from the tile's node cut.
 const RT_SW_HLSLI: &str = include_str!("shaders/rt_sw.hlsli");
 pub(crate) const SHADE_HLSLI: &str = include_str!("shaders/shade.hlsli");
@@ -2276,6 +2294,21 @@ pub(crate) fn abl_defs() -> String {
     out
 }
 
+/// Pixel-identical wavefront performance ablations. Unlike `abl_defs`, these
+/// are pasted only into the tile-recursion unit so toggling one cannot perturb
+/// the reference/leaf shader cache. `FR_ABL=oldcut,nobatch` reconstructs the
+/// pre-B70-pass queue code for an executable A/B without editing HLSL.
+fn wavefront_ablation_defs() -> String {
+    let mut out = String::new();
+    if abl_has("oldcut") {
+        out.push_str("#define ABL_KEEP_TERMINAL_CUT 1\n");
+    }
+    if abl_has("nobatch") {
+        out.push_str("#define ABL_NO_QUEUE_BATCH 1\n");
+    }
+    out
+}
+
 /// HLSL prelude every compile unit takes: the `--spp` jitter table's row count
 /// (`FrameCb::jitters`, hand-mirrored in trace_common.hlsli's cbuffer). The
 /// SIZE is derived from `dlss::MAX_SPP` rather than written twice — a literal
@@ -3393,8 +3426,10 @@ impl TraceGpu {
             "#define SKY_GROUP {sky_group}\n#define SKY_SPLIT {sky_split}\n#define LEAF_TILE {}",
             crate::render::leaf_tile()
         );
+        let wavefront_ablation_defs = wavefront_ablation_defs();
         let wavefront_src = [
             sky_defs.as_str(),
+            wavefront_ablation_defs.as_str(),
             empty_def,
             ft_defs,
             sw_defs,
@@ -3580,6 +3615,13 @@ impl TraceGpu {
         // structurally overflow-free (CTR_OVERFLOW stays gated == 0; the
         // exhaustion arm degrades to root seeding, counted, never wrong).
         let cap_cut = if sw_rays_leaf() && ftree_on { cap_cut * 2 } else { cap_cut };
+        // continuation.hlsli packs slot<<6 | (len-1) and reserves all-ones
+        // for root. This is enormously above the structural depth-11 cap,
+        // but keep the opaque provider's wire proof beside the allocation.
+        assert!(
+            cap_cut < (1u64 << 26),
+            "cut arena exceeds the traversal-frontier token domain"
+        );
         let counters = committed_buffer(device, CTR_COUNT as u64 * 4, uaf, ua)?;
         let args = committed_buffer(device, 16 * 12, uaf, ua)?;
         let qa = committed_buffer(device, cap_tile * 24, uaf, ua)?;
@@ -5428,6 +5470,56 @@ mod ftree_shader_source_tests {
 }
 
 #[cfg(test)]
+mod continuation_shader_source_tests {
+    use super::{
+        CONTINUATION_HLSLI, LEAF_HLSL, QUEUES_HLSLI, RT_SW_HLSLI, WAVEFRONT_HLSL,
+    };
+
+    /// Pin the public producer/consumer seam: terminal records carry only an
+    /// opaque token, leaf rays pass it through untouched, and the software
+    /// provider validates it before reading its private cut arena.
+    #[test]
+    fn leaf_frontier_is_opaque_and_invalid_tokens_fall_back_to_root() {
+        let leaf_rec = QUEUES_HLSLI
+            .split_once("struct LeafRec")
+            .expect("LeafRec must exist")
+            .1
+            .split_once("struct SkyRec")
+            .expect("LeafRec must precede SkyRec")
+            .0;
+        assert!(leaf_rec.contains("TraversalFrontier frontier;"));
+        assert!(!leaf_rec.contains("cut_slot"));
+        assert!(!leaf_rec.contains("cut_len"));
+
+        assert!(CONTINUATION_HLSLI.contains("struct TraversalFrontier"));
+        assert!(CONTINUATION_HLSLI.contains("FRONTIER_COOKIE_V1"));
+        assert!(CONTINUATION_HLSLI.contains("(slot << 6u) | (len - 1u)"));
+        assert!(CONTINUATION_HLSLI.contains("(h.opaque.x >> 6u) >= cap_cut"));
+        assert!(WAVEFRONT_HLSL.contains(
+            "lf.frontier = frontier_from_binary_cut(leaf_slot, leaf_len);"
+        ));
+        assert!(LEAF_HLSL.contains(
+            "trace_closest_frontier(rec.frontier, cam_origin.xyz, dir,"
+        ));
+        assert!(!LEAF_HLSL.contains("rec.cut_slot"));
+        assert!(!LEAF_HLSL.contains("rec.cut_len"));
+
+        let provider = RT_SW_HLSLI
+            .split_once("bool trace_closest_frontier(")
+            .expect("software frontier provider must exist")
+            .1;
+        let validate = provider
+            .find("frontier_backend_is_root(frontier)")
+            .expect("provider must validate/fallback the opaque handle");
+        let arena_read = provider
+            .find("cut_pool[")
+            .expect("software provider must consume the private cut arena");
+        assert!(validate < arena_read);
+        assert!(provider[validate..arena_read].contains("trace_closest("));
+    }
+}
+
+#[cfg(test)]
 mod empty_bvh_shader_source_tests {
     use super::{empty_defs, FRUSTUM_HLSLI, RT_SW_HLSLI};
 
@@ -5472,7 +5564,7 @@ mod empty_bvh_shader_source_tests {
             ("bool trace_closest(", "return false;"),
             ("bool occluded_q(", "return false;"),
             ("float3 transmit_q(", "return float3(1.0, 1.0, 1.0);"),
-            ("bool trace_closest_multi(", "return false;"),
+            ("bool trace_closest_frontier(", "return false;"),
         ] {
             let body = RT_SW_HLSLI
                 .split_once(signature)

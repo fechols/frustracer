@@ -4,8 +4,8 @@
 // Same three primitive signatures (trace_closest / occluded_q / transmit_q)
 // over the already-uploaded software BVH (SwTreesGpu: bvh_nodes at t0,
 // bvh.tri_idx at t1 — the buffers the frustum bound queries ride; rays were
-// their missing consumer), plus the cut-seeded trace_closest_multi (leaf
-// unit only) — bvh.rs::intersect_multi, the primitive RayQuery structurally
+// their missing consumer), plus trace_closest_frontier (leaf unit only) —
+// bvh.rs::intersect_multi behind an opaque provider seam, which RayQuery
 // cannot express: DXR accepts (o, d, TMin, TMax) and nothing else, so the
 // quadtree's node cut never reached a GPU ray before this file.
 // Requires trace_common.hlsli pasted first; the consuming unit must inject
@@ -339,11 +339,12 @@ float3 transmit_q(float3 o, float3 d, float tmin, float tmax) {
 
 #endif // TRANS_SHADOW
 
-// bvh.rs::intersect_multi — closest hit with traversal seeded from a tile's
-// node cut instead of the root: the leaf-tile argument (every leaf-pixel
-// sample lies inside the tile frustum, so the refine_cut output at the
-// tile's own tc covers everything its ancestors didn't cull). Leaf unit
-// only: cut_pool/ROOT_CUT_SLOT come from queues.hlsli, pasted there.
+// Software provider for the opaque traversal-frontier API. This is
+// bvh.rs::intersect_multi — closest hit seeded from a tile's node cut instead
+// of the root. Every leaf-pixel sample lies inside the tile frustum, so the
+// refine_cut output at the tile's own tc covers everything its ancestors did
+// not cull. Leaf unit only: TraversalFrontier/cut_pool come from
+// continuation+queues, pasted there.
 //
 // v1 iterates roots in POOL ORDER with the per-root slab gate + the running
 // tmax shrinking across roots. Every root is visited — the bvh.rs:629
@@ -351,13 +352,18 @@ float3 transmit_q(float3 o, float3 d, float tmin, float tmax) {
 // order is PERF-only. The CPU's ascending slab_t sort (bvh.rs:611-628,
 // measured worth 5.4% on San Miguel CPU-side) is the documented follow-up.
 #ifdef SW_RAYS_LEAF
-bool trace_closest_multi(float3 o, float3 d, float tmin, float tmax,
-                         uint cut_slot, uint cut_len, out HitInfo h) {
+bool trace_closest_frontier(TraversalFrontier frontier,
+                            float3 o, float3 d, float tmin, float tmax,
+                            out HitInfo h) {
     h = (HitInfo)0;
 #ifdef SCENE_EMPTY
     return false;
 #endif
-    if (cut_slot == ROOT_CUT_SLOT) return trace_closest(o, d, tmin, tmax, h);
+    // Invalid provider/cookie and explicit root both degrade conservatively.
+    if (frontier_backend_is_root(frontier))
+        return trace_closest(o, d, tmin, tmax, h);
+    uint cut_slot = frontier_backend_slot(frontier);
+    uint cut_len = frontier_backend_len(frontier);
     float3 inv_d = 1.0 / d;
     bool found = false;
     for (uint r = 0u; r < cut_len; ++r) {

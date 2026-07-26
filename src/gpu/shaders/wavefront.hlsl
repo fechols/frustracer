@@ -28,8 +28,7 @@ void cs_seed(uint3 id : SV_DispatchThreadID) {
         lf.xy1 = pack_xy(rw, rh);
         lf.t_start = 0.0;
         lf.depth = 0;
-        lf.cut_slot = ROOT_CUT_SLOT; // the root cut [0]
-        lf.cut_len = 1u;
+        lf.frontier = frontier_root();
         qleaf[0] = lf;
         counters[CTR_LEAF] = 1;
         return;
@@ -302,6 +301,75 @@ void level_finish(TileRec rec, uint2 p0, uint2 p1, uint depth, uint cut_len, TF 
     }
     InterlockedAdd(counters[CTR_SPLIT], 1, s);
 
+#if !defined(SW_RAYS_LEAF) && !defined(ABL_KEEP_TERMINAL_CUT)
+    // The final split has no TileRec children, so its refined cut has no
+    // consumer: hardware RayQuery accepts only TMin (tc), and the software
+    // root-seeded arm deliberately ignores LeafRec's cut fields too. Emit the
+    // terminal children before allocating/writing a dead cut-pool slot.
+    //
+    // ceil(parent_extent / 2) is the largest child extent. This also handles
+    // odd and one-pixel dimensions; empty quadrants retain the normal guard.
+    uint pw = p1.x - p0.x;
+    uint ph = p1.y - p0.y;
+    if ((pw + 1u) / 2u <= LEAF_TILE && (ph + 1u) / 2u <= LEAF_TILE) {
+        uint lxm = p0.x + pw / 2u;
+        uint lym = p0.y + ph / 2u;
+        uint ld = depth + 1u;
+        uint lx0[4] = { p0.x, lxm, p0.x, lxm };
+        uint ly0[4] = { p0.y, p0.y, lym, lym };
+        uint lx1[4] = { lxm, p1.x, lxm, p1.x };
+        uint ly1[4] = { lym, lym, p1.y, p1.y };
+#if !defined(ABL_NO_QUEUE_BATCH)
+        // B70 HOMOGENEOUS-BATCH BEGIN: independently revertible treatment.
+        // One reservation preserves the same counter total and per-child
+        // overflow reporting while avoiding four contended global atomics.
+        uint live_count = 0u;
+        [unroll] for (uint lc = 0; lc < 4; ++lc) {
+            if (lx0[lc] != lx1[lc] && ly0[lc] != ly1[lc]) live_count++;
+        }
+        uint leaf_base;
+        InterlockedAdd(counters[CTR_LEAF], live_count, leaf_base);
+        uint live_rank = 0u;
+        [unroll] for (uint lc = 0; lc < 4; ++lc) {
+            if (lx0[lc] == lx1[lc] || ly0[lc] == ly1[lc]) continue;
+            uint leaf_at = leaf_base + live_rank++;
+            if (leaf_at < cap_leaf) {
+                LeafRec lf;
+                lf.xy0 = pack_xy(lx0[lc], ly0[lc]);
+                lf.xy1 = pack_xy(lx1[lc], ly1[lc]);
+                lf.t_start = tc;
+                lf.depth = ld;
+                // Placeholders only: this compile-time arm's leaf rays do not
+                // consume cuts. ROOT_CUT_SLOT/1 remains conservative if the
+                // record is inspected or its layout is shared by replay.
+                lf.frontier = frontier_root();
+                qleaf[leaf_at] = lf;
+            } else {
+                InterlockedAdd(counters[CTR_OVERFLOW], 1, s);
+            }
+        }
+        // B70 HOMOGENEOUS-BATCH END.
+#else
+        [unroll] for (uint lc = 0; lc < 4; ++lc) {
+            if (lx0[lc] == lx1[lc] || ly0[lc] == ly1[lc]) continue;
+            InterlockedAdd(counters[CTR_LEAF], 1, s);
+            if (s < cap_leaf) {
+                LeafRec lf;
+                lf.xy0 = pack_xy(lx0[lc], ly0[lc]);
+                lf.xy1 = pack_xy(lx1[lc], ly1[lc]);
+                lf.t_start = tc;
+                lf.depth = ld;
+                lf.frontier = frontier_root();
+                qleaf[s] = lf;
+            } else {
+                InterlockedAdd(counters[CTR_OVERFLOW], 1, s);
+            }
+        }
+#endif
+        return;
+    }
+#endif
+
     // Refine the cut into a fresh pool slot; on pool exhaustion the children
     // inherit the PARENT's slot — an ancestor cut is valid for any descendant
     // frustum (coarse, never wrong) — the refine_cut coarse-emit analog.
@@ -368,6 +436,70 @@ void level_finish(TileRec rec, uint2 p0, uint2 p1, uint depth, uint cut_len, TF 
     }
 #endif
 
+#if !defined(ABL_NO_QUEUE_BATCH)
+    // B70 HOMOGENEOUS-BATCH BEGIN: independently revertible treatment.
+    // Regular quadtree levels emit either four internal children or four
+    // leaves. Reserve their contiguous queue range with one atomic; unusual
+    // odd/aspect-ratio splits that mix the two retain the original loop below.
+    uint live_children = 0u;
+    uint leaf_children = 0u;
+    [unroll] for (uint bc = 0; bc < 4; ++bc) {
+        uint bw = cx1[bc] - cx0[bc];
+        uint bh = cy1[bc] - cy0[bc];
+        if (bw == 0u || bh == 0u) continue;
+        live_children++;
+        if (bw <= LEAF_TILE && bh <= LEAF_TILE) leaf_children++;
+    }
+    if (live_children != 0u && leaf_children == live_children) {
+        uint leaf_base;
+        InterlockedAdd(counters[CTR_LEAF], live_children, leaf_base);
+        uint live_rank = 0u;
+        [unroll] for (uint bc = 0; bc < 4; ++bc) {
+            uint bw = cx1[bc] - cx0[bc];
+            uint bh = cy1[bc] - cy0[bc];
+            if (bw == 0u || bh == 0u) continue;
+            uint leaf_at = leaf_base + live_rank++;
+            if (leaf_at < cap_leaf) {
+                LeafRec lf;
+                lf.xy0 = pack_xy(cx0[bc], cy0[bc]);
+                lf.xy1 = pack_xy(cx1[bc], cy1[bc]);
+                lf.t_start = tc;
+                lf.depth = d;
+                lf.frontier = frontier_from_binary_cut(leaf_slot, leaf_len);
+                qleaf[leaf_at] = lf;
+            } else {
+                InterlockedAdd(counters[CTR_OVERFLOW], 1, s);
+            }
+        }
+        return;
+    }
+    if (live_children != 0u && leaf_children == 0u) {
+        uint tile_base;
+        InterlockedAdd(counters[push1], live_children, tile_base);
+        uint live_rank = 0u;
+        [unroll] for (uint bc = 0; bc < 4; ++bc) {
+            uint bw = cx1[bc] - cx0[bc];
+            uint bh = cy1[bc] - cy0[bc];
+            if (bw == 0u || bh == 0u) continue;
+            uint tile_at = tile_base + live_rank++;
+            if (tile_at < cap_tile) {
+                TileRec child;
+                child.xy0 = pack_xy(cx0[bc], cy0[bc]);
+                child.xy1 = pack_xy(cx1[bc], cy1[bc]);
+                child.t_start = tc;
+                child.cut_slot = out_slot;
+                child.meta = out_len | (d << 8);
+                child.path = cpath | bc;
+                qout[tile_at] = child;
+            } else {
+                InterlockedAdd(counters[CTR_OVERFLOW], 1, s);
+            }
+        }
+        return;
+    }
+    // B70 HOMOGENEOUS-BATCH END.
+#endif
+
     [unroll] for (uint c = 0; c < 4; ++c) {
         uint w = cx1[c] - cx0[c];
         uint h = cy1[c] - cy0[c];
@@ -380,8 +512,7 @@ void level_finish(TileRec rec, uint2 p0, uint2 p1, uint depth, uint cut_len, TF 
                 lf.xy1 = pack_xy(cx1[c], cy1[c]);
                 lf.t_start = tc;
                 lf.depth = d;
-                lf.cut_slot = leaf_slot;
-                lf.cut_len = leaf_len;
+                lf.frontier = frontier_from_binary_cut(leaf_slot, leaf_len);
                 qleaf[s] = lf;
             } else {
                 InterlockedAdd(counters[CTR_OVERFLOW], 1, s);

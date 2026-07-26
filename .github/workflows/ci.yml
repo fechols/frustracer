@@ -30,6 +30,11 @@ jobs:
       - name: Build
         run: cargo build --profile quick
 
+      # The narrow shader-source soundness tests are ordinary Rust tests. Keep
+      # them in CI as well as the larger executable gate suite below.
+      - name: Unit tests
+        run: cargo test --profile quick
+
       # No GPU on the runner and no vendor DLLs, so this is the DLL-free half:
       # the reference-ray verification, the temporal/replay families, and ~20
       # pure-math module self-tests. --check-gpu / --check-dxr need real

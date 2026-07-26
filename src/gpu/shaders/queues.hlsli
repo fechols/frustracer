@@ -1,5 +1,5 @@
 // Primary-quadtree queue records + per-pixel planes. Requires
-// trace_common.hlsli + ctr.hlsli pasted first.
+// trace_common.hlsli + ctr.hlsli + continuation.hlsli pasted first.
 //
 // Records are fixed-size self-contained POD (work-graph-shaped: a future
 // SM 6.8 backend consumes these same structs as node records; the counters/
@@ -18,20 +18,18 @@ struct TileRec {
 };
 
 // A leaf tile (both dims <= LEAF_TILE): per-pixel rays with TMin = t_start.
-// The cut rides along for --sw-rays (SW_RAYS_LEAF: trace_closest_multi seeds
-// traversal from these BINARY node ids — under FTREE the emitter translates
-// the slot-ref cut via ft_bnode at enqueue); RayQuery arms ignore it —
-// hardware traversal from the root subsumes cut-seeding there and the
-// inherited ball claim rides in t_start alone. 24 bytes (one struct, no
-// lever-forked stride — the fields are always written, read only under the
-// lever; trace.rs::LEAF_REC_BYTES and main.rs's readback move in lockstep).
+// The opaque frontier rides along for --continuation-rays / --sw-rays.
+// SW_RAYS_LEAF consumes it through trace_closest_frontier; RayQuery arms
+// ignore it because current DXR exposes no traversal-resume input. Under
+// FTREE the producer translates wide slots to the binary ray-BVH domain
+// before minting the token. 24 bytes (one struct, no lever-forked stride;
+// trace.rs::LEAF_REC_BYTES and main.rs's readback move in lockstep).
 struct LeafRec {
     uint xy0;
     uint xy1;
     float t_start;
     uint depth;
-    uint cut_slot; // ROOT_CUT_SLOT = traverse from the binary root
-    uint cut_len;
+    TraversalFrontier frontier;
 };
 
 // A tile whose whole frustum was proven empty. 16 bytes.
@@ -109,7 +107,6 @@ void accum_splat(uint pi, float3 c) {
 RWStructuredBuffer<uint>  hbuf    : register(u12);
 RWStructuredBuffer<HemiPointRec> hemi_pts : register(u13);
 
-#define ROOT_CUT_SLOT 0xffffffffu
 #define HEMI_FIXED 262144.0 // 2^18 fixed-point scale for hbuf
 
 uint2 rect_min(uint xy0) { return uint2(xy0 & 0xffffu, xy0 >> 16); }

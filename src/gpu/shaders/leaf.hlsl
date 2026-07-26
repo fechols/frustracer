@@ -24,19 +24,16 @@ void cs_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     uint rec_i = flat_group(gid);
     if (rec_i >= counters[push0]) return;
     LeafRec rec = qleaf[rec_i];
-#ifdef SW_RAYS_LEAF
-    // Anti-vacuity stat (--check-gpu must-fires it): counted once per RECORD,
-    // not per ray — the per-ray InterlockedAdd would tax the very path the
-    // lever exists to measure.
-    if (gtid.x == 0u && rec.cut_slot != ROOT_CUT_SLOT) {
-        uint _c;
-        InterlockedAdd(counters[CTR_SW_CUT_SEED], 1u, _c);
-    }
-#endif
     uint2 p0 = rect_min(rec.xy0);
     uint2 p1 = rect_max(rec.xy1);
     uint w = p1.x - p0.x;
     uint npx = w * (p1.y - p0.y);
+#ifdef SW_RAYS
+    // One beam-produced opaque handle is shared by every ray/sample in this
+    // record. The root control executes the same telemetry atomics with zero
+    // values, keeping the continuation-vs-root timing comparison symmetric.
+    if (gtid.x == 0u) frontier_record_reuse(rec.frontier, npx * spp);
+#endif
     // Grid-stride over the tile's pixels, so LEAF_GROUP is a knob instead of
     // being welded to "64 >= the largest tile". A leaf tile is NOT 8x8:
     // depth_full is driven by the WIDER screen axis, so at 1920x1080 a leaf is
@@ -89,13 +86,12 @@ void cs_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
         // that advantage; the rest is tiles proven empty tracing NO rays.
         // Re-run by making this a 0.0 and rebuilding.
 #ifdef SW_RAYS_LEAF
-        // --sw-rays: the software walk can accept what RayQuery cannot — the
-        // tile's node cut. bvh.rs::intersect_multi's semantics: same hit set,
-        // traversal seeded from the surviving frontier instead of the root.
-        // (--sw-rays --no-cut-rays leaves SW_RAYS_LEAF undefined: software
-        // traversal from the root, t_start kept — the CPU's exact compose.)
-        if (trace_closest_multi(cam_origin.xyz, dir, rec.t_start, FLT_MAX,
-                                rec.cut_slot, rec.cut_len, hit)) {
+        // Software simulation of the proposed hardware seam: the ray stage
+        // consumes an opaque, beam-produced traversal frontier. It cannot
+        // inspect the cut arena or BVH ids. --no-cut-rays leaves this define
+        // absent and gives the same SW intersector a root traversal instead.
+        if (trace_closest_frontier(rec.frontier, cam_origin.xyz, dir,
+                                   rec.t_start, FLT_MAX, hit)) {
 #else
         if (trace_closest(cam_origin.xyz, dir, rec.t_start, FLT_MAX, hit)) {
 #endif

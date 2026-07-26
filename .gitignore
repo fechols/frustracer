@@ -1,4 +1,7 @@
 /target
+# Local Codex/Claude worktrees and machine-specific settings. Never include
+# these when packaging or sharing the repository.
+/.claude/
 # Benchmark scenes (San Miguel etc., CC-licensed — keep the archive's license
 # txt next to the data) live in git LFS (see .gitattributes), with the OBJs
 # stored zstd-compressed (.obj.zst — the loader decodes transparently). The

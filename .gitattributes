@@ -45,3 +45,12 @@ tools/hooks/* text eol=lf
 # committed: the 4K60 HDR10 master is a GitHub Release asset, and a repo-hosted
 # .mp4 does not play inline in a README anyway.
 docs/media/** binary
+# Reference papers the design is measured against (docs/papers/). PLAIN GIT for
+# the same reason as docs/media/ above: the README links them, so a reader
+# clicking through on github.com must get the file itself — not an LFS
+# "stored with Git LFS" interstitial, and not a broken link on a fork, a
+# GIT_LFS_SKIP_SMUDGE clone, or an exhausted LFS bandwidth quota. `binary`
+# only stops git from trying to diff them as text. Keep this directory small
+# and additive: a paper or two, never a library. They are third-party
+# publications — see docs/papers/README.md for provenance.
+docs/papers/** binary

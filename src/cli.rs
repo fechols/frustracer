@@ -214,13 +214,13 @@ pub struct Opts {
     /// the cut already seeds nothing, so the answer there is already zero.
     /// Default on.
     pub cut_rays: bool,
-    /// A/B lever (--sw-rays): the GPU WAVEFRONT tracer's rays traverse the
-    /// software BVH (bvh.rs's loops ported to rt_sw.hlsli) instead of DXR
-    /// inline RayQuery, so primary leaf rays seed from the tile's node cut —
-    /// the one product of the frustum recursion the RayQuery API cannot
-    /// accept. Composes with --no-cut-rays (software from the root) and
-    /// --no-ftree (binary cuts, no translation). Wavefront only; --dxr and
-    /// the CPU renderer are untouched. Default off.
+    /// A/B lever (--continuation-rays; --sw-rays is the technical alias): the
+    /// GPU WAVEFRONT tracer's rays traverse the software BVH instead of DXR
+    /// inline RayQuery. A terminal beam query mints an opaque TraversalFrontier
+    /// that every leaf ray/sample reuses — the input current RayQuery cannot
+    /// accept. Composes with --no-cut-rays (same software traversal from the
+    /// root) and --no-ftree (binary cuts, no translation). Wavefront only;
+    /// --dxr and the CPU renderer are untouched. Default off.
     pub sw_rays: bool,
     /// A/B lever (--cut-hemi re-enables, --no-cut-hemi is the default): HEMI
     /// leaf rays traverse from the root instead of from their bounce cut.
@@ -448,6 +448,20 @@ pub struct Cli {
     pub cam_override: Option<Camera>,
     pub spin: Option<String>,
     pub spin_frames: u32,
+    /// Whether `--spin-frames` was actually typed. A DEFAULTED count is
+    /// extended to cover a whole camera lap past the resolved warm-up (which
+    /// is vendor-derived, so the runner cannot know it here); an explicit one
+    /// is obeyed verbatim, because a benchmark's frame count must never move
+    /// under the person who set it.
+    pub spin_frames_explicit: bool,
+    /// Which software/wavefront tracing arm `--spin` executes. `true` is the
+    /// quadtree hybrid; `false` is the per-pixel root-traversal reference.
+    /// Later `--spin-hybrid` / `--spin-plain` flags win.
+    pub spin_hybrid: bool,
+    /// Explicit number of leading `--spin` frames to exclude. `None` lets the
+    /// runner choose a device-appropriate default (longer on Intel because its
+    /// optimized shader can replace the initial variant asynchronously).
+    pub spin_warmup: Option<u32>,
     /// `--cinematic`: `None` = not asked for, `Some(sel)` = a preset name or a
     /// shot-list path.
     pub cinematic: Option<String>,
@@ -620,6 +634,9 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
     let mut cam_override: Option<Camera> = None;
     let mut spin: Option<String> = None;
     let mut spin_frames = 2000u32;
+    let mut spin_frames_explicit = false;
+    let mut spin_hybrid = true;
+    let mut spin_warmup: Option<u32> = None;
     let mut cinematic: Option<String> = None;
     let mut cine = cinematic::CineOpts::default();
     let mut world_flag: Option<bool> = None;
@@ -891,6 +908,10 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
             }
             "--no-hemi-share" => opts.hemi_share = false,
             "--no-cut-rays" => opts.cut_rays = false,
+            "--continuation-rays" => {
+                opts.sw_rays = true;
+                opts.cut_rays = true;
+            }
             "--sw-rays" => opts.sw_rays = true,
             "--no-sw-rays" => opts.sw_rays = false,
             "--no-cut-hemi" => opts.cut_hemi = false,
@@ -997,6 +1018,19 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
                         eprintln!("--spin-frames needs a frame count");
                         std::process::exit(2);
                     });
+                spin_frames_explicit = true;
+            }
+            "--spin-hybrid" => spin_hybrid = true,
+            "--spin-plain" => spin_hybrid = false,
+            "--spin-warmup" => {
+                spin_warmup = Some(
+                    args.next()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or_else(|| {
+                            eprintln!("--spin-warmup needs a frame count");
+                            std::process::exit(2);
+                        }),
+                );
             }
             // --cinematic takes an OPTIONAL value (the peek idiom the parse
             // loop is Peekable for): a bare --cinematic is the `hero` still, so
@@ -1393,6 +1427,9 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
         cam_override,
         spin,
         spin_frames,
+        spin_frames_explicit,
+        spin_hybrid,
+        spin_warmup,
         cinematic,
         cine,
         world_flag,
@@ -1411,6 +1448,13 @@ pub fn usage() {
                 eprintln!("  --tile <n|nxm>  replicate a loaded OBJ scene into an n×n (or n×m) grid of copies —");
                 eprintln!("                flattened geometry, shared materials/textures (composes with --check)");
                 eprintln!("  --cam <e,t>   start camera: ex,ey,ez,tx,ty,tz (reproducible benchmark viewpoints)");
+                eprintln!("  --spin <still|path>  deterministic headless tracer benchmark");
+                eprintln!("    --spin-frames N    total frames (default 2000)");
+                eprintln!("    --spin-warmup N    excluded leading frames (Intel default 1600; otherwise 20)");
+                eprintln!("    --spin-hybrid | --spin-plain  quadtree vs root-traversal A/B");
+                eprintln!("                                  (CPU/--gpu only; --dxr has one DXR arm)");
+                eprintln!("    --continuation-rays  software prototype: beam-produced opaque frontier");
+                eprintln!("                           reused by leaf rays (--no-cut-rays = SW root control)");
                 eprintln!("  --cinematic [p]  MEDIA MODE: render stills / camera-spline video sequences");
                 eprintln!("                headlessly. Presets: hero (default, one still) | islands |");
                 eprintln!("                tour (the island lap, dawn -> moonlit night) | orbit | hud |");
@@ -1699,6 +1743,16 @@ pub fn self_test() -> Result<(), String> {
     if parse_argv(&["--sw-rays", "--no-sw-rays"]).opts.sw_rays {
         return Err("--sw-rays --no-sw-rays must disable".into());
     }
+    let continuation = parse_argv(&["--no-cut-rays", "--continuation-rays"]).opts;
+    if !continuation.sw_rays || !continuation.cut_rays {
+        return Err("--continuation-rays must arm software rays and frontier consumption".into());
+    }
+    if parse_argv(&["--continuation-rays", "--no-cut-rays"])
+        .opts
+        .cut_rays
+    {
+        return Err("--no-cut-rays must remain the continuation-vs-root control".into());
+    }
     if parse_argv(&["--fg", "--no-fg"]).opts.fg {
         return Err("--fg --no-fg must disable frame generation".into());
     }
@@ -1742,7 +1796,18 @@ pub fn self_test() -> Result<(), String> {
     }
 
     // ---- 5. the selectors reach Cli ---------------------------------------
-    let c = parse_argv(&["model.obj", "--tile", "4x2", "--spp", "4", "--spin", "path"]);
+    let c = parse_argv(&[
+        "model.obj",
+        "--tile",
+        "4x2",
+        "--spp",
+        "4",
+        "--spin",
+        "path",
+        "--spin-plain",
+        "--spin-warmup",
+        "1600",
+    ]);
     if c.obj.as_deref() != Some("model.obj") {
         return Err("the positional scene argument did not reach Cli::obj".into());
     }
@@ -1754,6 +1819,23 @@ pub fn self_test() -> Result<(), String> {
     }
     if c.spin.as_deref() != Some("path") {
         return Err("--spin path did not reach Cli::spin".into());
+    }
+    if c.spin_hybrid || c.spin_warmup != Some(1600) {
+        return Err("--spin-plain/--spin-warmup did not reach Cli".into());
+    }
+    // A typed frame count is obeyed verbatim; a defaulted one the runner may
+    // extend to cover a whole lap past a vendor-derived warm-up. Conflating
+    // the two would let the extension rewrite a count somebody set up an A/B
+    // around, so the flag's presence — not its value — is the signal.
+    if c.spin_frames_explicit {
+        return Err("--spin-frames was not passed; explicit must stay false".into());
+    }
+    let sf = parse_argv(&["--spin", "path", "--spin-frames", "2200"]);
+    if sf.spin_frames != 2200 || !sf.spin_frames_explicit {
+        return Err("--spin-frames 2200 did not reach Cli as an explicit count".into());
+    }
+    if !parse_argv(&["--spin-plain", "--spin-hybrid"]).spin_hybrid {
+        return Err("--spin-plain --spin-hybrid must select hybrid (later flags win)".into());
     }
     if !parse_argv(&["--stress", "5000"]).stress.is_some_and(|n| n == 5000) {
         return Err("--stress 5000 did not reach Cli::stress".into());

@@ -277,7 +277,9 @@ pub fn create_queue(device: &ID3D12Device) -> Result<ID3D12CommandQueue> {
 /// the present queue and the fully negotiated swapchain (post colour-space
 /// fallback) and returns the frame-interpolation proxy the session presents
 /// through from then on; Err hands the ORIGINAL swapchain back so a failed
-/// wrap degrades to a normal session (the hook owns its loud line). `unwind`
+/// wrap degrades to a normal session. `fallback` is the presentation space
+/// that normal session would have requested before the FG wrapper forced
+/// HDR10/SDR; `with_queue` restores it if every wrap attempt fails. `unwind`
 /// destroys whatever FG context the last successful `wrap` created — called
 /// only after every proxy reference has been released, when the post-wrap
 /// colour-space re-declare fails and the session must rebuild at SDR (a
@@ -285,6 +287,7 @@ pub fn create_queue(device: &ID3D12Device) -> Result<ID3D12CommandQueue> {
 /// stays SDK-agnostic — both closures live with the FG runtime that owns the
 /// proxy.
 pub struct FgHook<'a> {
+    pub fallback: PresentSpace,
     pub wrap: &'a mut dyn FnMut(
         &ID3D12CommandQueue,
         IDXGISwapChain3,
@@ -413,8 +416,8 @@ impl D3d {
         //    format (XeSS-FG's InitFromSwapChain is format-picky). FG is the
         //    reason this session exists, so rebuild at SDR and wrap AGAIN —
         //    SDR with FG beats HDR10 without it.
-        //  - wrap fails otherwise: keep the original chain, session runs
-        //    without FG (the hook owns its loud line) — today's shape.
+        //  - wrap fails otherwise: restore the non-FG presentation request
+        //    (including its normal SDR fallback) and run without FG.
         //  - wrap succeeds but the colour-space re-declare through the proxy
         //    fails: NEVER present mis-declared. Drop the proxy, `unwind` the
         //    FG context (every proxy ref must be gone before the FG runtime
@@ -422,7 +425,53 @@ impl D3d {
         //    must run before a new chain can exist on this HWND), rebuild at
         //    SDR, wrap again.
         if let Some(hook) = fg_hook {
-            let mut rebuild_sdr_and_rewrap =
+            // If the wrapper did not force a different request, initial
+            // negotiation has already told us the effective non-FG space.
+            // Retrying a colour space DXGI just refused buys only another
+            // swapchain rebuild and duplicate error line.
+            let fallback = if hook.fallback == want { space } else { hook.fallback };
+            // A wrapper-only format must not survive when the wrapper does
+            // not. XeSS-FG is attempted by default on Intel before its
+            // optional DLLs are known to exist: if both wraps fail, rebuild
+            // the plain session in the scRGB space `--hdr` originally
+            // requested. Negotiate that space exactly like the initial path,
+            // including the safe SDR fallback if DXGI refuses it.
+            let restore_without_fg =
+                |sc: IDXGISwapChain3,
+                 current: PresentSpace,
+                 target: PresentSpace|
+                 -> Result<(IDXGISwapChain3, PresentSpace)> {
+                    if current == target {
+                        return Ok((sc, current));
+                    }
+                    drop(sc);
+                    let fresh = match create(target.format()) {
+                        Ok(sc) => sc,
+                        Err(e) if target != PresentSpace::Sdr => {
+                            eprintln!(
+                                "present: could not restore the non-FG {target:?} swapchain \
+                                 ({e}) — using SDR"
+                            );
+                            return Ok((create(PresentSpace::Sdr.format())?, PresentSpace::Sdr));
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    if target != PresentSpace::Sdr {
+                        if let Err(e) = declare_colorspace(&fresh, target) {
+                            eprintln!(
+                                "present: non-FG {target:?} colour space refused ({e}) — using SDR"
+                            );
+                            drop(fresh);
+                            return Ok((create(PresentSpace::Sdr.format())?, PresentSpace::Sdr));
+                        }
+                    }
+                    eprintln!(
+                        "present: frame generation unavailable — restored the requested \
+                         non-FG {target:?} swapchain"
+                    );
+                    Ok((fresh, target))
+                };
+            let rebuild_sdr_and_rewrap =
                 |sc: IDXGISwapChain3,
                  unwind: bool,
                  hook_wrap: &mut dyn FnMut(
@@ -431,20 +480,20 @@ impl D3d {
                 )
                     -> std::result::Result<IDXGISwapChain3, (IDXGISwapChain3, String)>,
                  hook_unwind: &mut dyn FnMut()|
-                 -> Result<IDXGISwapChain3> {
+                 -> Result<(IDXGISwapChain3, bool)> {
                     drop(sc);
                     if unwind {
                         hook_unwind();
                     }
                     let fresh = create(PresentSpace::Sdr.format())?;
                     Ok(match hook_wrap(&queue, fresh) {
-                        Ok(proxy) => proxy,
+                        Ok(proxy) => (proxy, true),
                         Err((orig, e2)) => {
                             eprintln!(
                                 "fg: swapchain wrap failed at SDR too ({e2}) — \
                                  frame generation disabled"
                             );
-                            orig
+                            (orig, false)
                         }
                     })
                 };
@@ -462,7 +511,16 @@ impl D3d {
                                  rebuilding at SDR (never a mis-declared present)"
                             );
                             space = PresentSpace::Sdr;
-                            rebuild_sdr_and_rewrap(proxy, true, hook.wrap, hook.unwind)?
+                            let (candidate, wrapped) =
+                                rebuild_sdr_and_rewrap(proxy, true, hook.wrap, hook.unwind)?;
+                            if wrapped {
+                                candidate
+                            } else {
+                                let (plain, restored) =
+                                    restore_without_fg(candidate, space, fallback)?;
+                                space = restored;
+                                plain
+                            }
                         }
                     }
                 }
@@ -472,10 +530,21 @@ impl D3d {
                             "fg: swapchain wrap rejects the HDR10 chain ({e}) — rebuilding at SDR"
                         );
                         space = PresentSpace::Sdr;
-                        rebuild_sdr_and_rewrap(orig, false, hook.wrap, hook.unwind)?
+                        let (candidate, wrapped) =
+                            rebuild_sdr_and_rewrap(orig, false, hook.wrap, hook.unwind)?;
+                        if wrapped {
+                            candidate
+                        } else {
+                            let (plain, restored) =
+                                restore_without_fg(candidate, space, fallback)?;
+                            space = restored;
+                            plain
+                        }
                     } else {
                         eprintln!("fg: swapchain wrap failed ({e}) — frame generation disabled");
-                        orig
+                        let (plain, restored) = restore_without_fg(orig, space, fallback)?;
+                        space = restored;
+                        plain
                     }
                 }
             };

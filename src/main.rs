@@ -235,6 +235,9 @@ fn main() {
         cam_override,
         spin,
         spin_frames,
+        spin_frames_explicit,
+        spin_hybrid,
+        spin_warmup,
         cinematic,
         cine,
         mut world_flag,
@@ -435,16 +438,27 @@ fn main() {
         bvh::CUT_SEED_RAYS.store(false, std::sync::atomic::Ordering::Relaxed);
         eprintln!("bvh: --no-cut-rays — cut-seeded rays traverse from the root (inherited t_start unchanged)");
     }
-    // --sw-rays: the wavefront's rays on the software BVH (rt_sw.hlsli in
-    // place of rt.hlsli), leaf primaries cut-seeded. Only a departure from
+    // --continuation-rays / --sw-rays: a software semantic prototype of the
+    // missing hardware seam. The beam producer publishes an opaque frontier;
+    // leaf primaries consume it through rt_sw.hlsli. Only a departure from
     // the default prints (the blas-split lever-line rule).
     if opts.sw_rays {
         gpu::trace::SW_RAYS.store(true, std::sync::atomic::Ordering::Relaxed);
-        eprintln!(
-            "gpu: --sw-rays — wavefront rays traverse the software BVH (bvh.rs's \
-             loops in HLSL; leaf primaries seed from the tile cut; no RayQuery). \
-             Wavefront (--gpu) only; --dxr is untouched"
-        );
+        if opts.cut_rays {
+            eprintln!(
+                "gpu: --continuation-rays — software prototype: each terminal beam \
+                 publishes an opaque traversal frontier reused by its leaf rays/samples \
+                 (rt_sw.hlsli; no RayQuery). Wavefront (--gpu) only; --dxr is untouched"
+            );
+        } else {
+            eprintln!(
+                "gpu: --continuation-rays --no-cut-rays — software root control: same \
+                 intersector, shading, and inherited t_start; no frontier resume. NOTE \
+                 the control ALSO skips terminal cut refinement (nothing consumes it \
+                 here), so it does strictly less quadtree work — the A/B is \
+                 produce-and-resume vs neither, and the delta is conservative"
+            );
+        }
     }
     // The cloud shading caches (default ON: cloud-shadow 16, sky-lod 4). The
     // lever block above already stored the statics; only a DEPARTURE from the
@@ -525,28 +539,35 @@ fn main() {
     // its topology, and no gate may move), and a positional scene always
     // wins. An EXPLICIT --world in one of those combinations errors instead
     // of silently resolving — being told is the feature (the --fsr4 shape).
-    let any_check = (check
+    let check_requested = check
         || check_dlss
         || check_oidn
         || check_xess
         || check_fsr
         || check_nppd
         || check_gpu
-        || check_dxr)
-        // FR_WORLD_CHECK=1 (opt-in, off by default) lets the headless suites
-        // run ON the world. The world is the ONE scene no gate can otherwise
-        // reach, so a world-only regression is structurally invisible — this
-        // is the escape hatch for diagnosing one. No default gate moves: a
-        // flagless --check* is unchanged, so the structural must-fires stay
-        // tuned to the procedural scene's topology. Expect the world to trip
-        // the pose-sensitive gates (mv_selftest's fixed dolly, the sky/hemi
-        // must-fires) and the vacuous transmissive must-fire — the world has
-        // 3 transmissive tris, 2 of which spray-retagging turns opaque. Read
-        // the exact-zero counters (claim-violation / false-sky /
-        // tmin-overshoot), which are scene-independent.
-        && std::env::var("FR_WORLD_CHECK").is_err();
+        || check_dxr;
+    // FR_WORLD_CHECK=1 (opt-in, off by default) lets the headless suites run
+    // ON the world. Keep that scene-selection override separate from whether a
+    // check was requested: conflating the two makes the environment variable
+    // disable the headless branch instead of changing its scene.
+    //
+    // The world is the ONE scene no gate can otherwise reach, so a world-only
+    // regression is structurally invisible — this is the escape hatch for
+    // diagnosing one. No default gate moves: a flagless --check* is unchanged,
+    // so the structural must-fires stay tuned to the procedural scene's
+    // topology. Expect the world to trip the pose-sensitive gates
+    // (mv_selftest's fixed dolly, the sky/hemi must-fires) and the vacuous
+    // transmissive must-fire — the world has 3 transmissive tris, 2 of which
+    // spray-retagging turns opaque. Read the exact-zero counters
+    // (claim-violation / false-sky / tmin-overshoot), which are scene-independent.
+    let world_check = check_requested && std::env::var("FR_WORLD_CHECK").is_ok();
     if world_flag == Some(true)
-        && (obj.is_some() || stress.is_some() || tile.is_some() || spin.is_some() || any_check)
+        && (obj.is_some()
+            || stress.is_some()
+            || tile.is_some()
+            || spin.is_some()
+            || (check_requested && !world_check))
     {
         eprintln!(
             "--world is exclusive with a scene argument, --stress, --tile, --spin, and --check* \
@@ -559,7 +580,7 @@ fn main() {
     // But it must not become a back door into the gates' scene either, so it is
     // exclusive with them — being told beats silently resolving (the --fsr4
     // shape), and the two modes want opposite scenes for opposite reasons.
-    if cinematic.is_some() && (spin.is_some() || any_check) {
+    if cinematic.is_some() && (spin.is_some() || check_requested) {
         eprintln!(
             "--cinematic is exclusive with --spin and --check* (those are \
              benchmarks and gates on their own fixed scenes; --cinematic is the \
@@ -583,7 +604,7 @@ fn main() {
         && stress.is_none()
         && tile.is_none()
         && spin.is_none()
-        && !any_check;
+        && (!check_requested || world_check);
     let req = SceneRequest {
         obj: obj.clone(),
         stress,
@@ -602,7 +623,7 @@ fn main() {
     // command line (the progress sink is never activated). Interactive
     // sessions defer the SAME load into run_window's worker thread, behind the
     // loading screen. Every branch inside this block exits the process.
-    if any_check || spin.is_some() || cinematic.is_some() {
+    if check_requested || spin.is_some() || cinematic.is_some() {
         let LoadedScene { mut scene, bvh, cam0, world_info } = load_scene(&req);
 
     if let Some(sel) = &cinematic {
@@ -618,15 +639,26 @@ fn main() {
         std::process::exit(code);
     }
     if let Some(mode) = &spin {
-        let code = run_spin(&scene, &bvh, cam0, mode, spin_frames, &opts);
+        let code = run_spin(
+            &scene,
+            &bvh,
+            cam0,
+            mode,
+            spin_frames,
+            spin_frames_explicit,
+            spin_hybrid,
+            spin_warmup,
+            &opts,
+        );
         std::process::exit(code);
     }
-    // Must-fire structural gates are tuned to the default scene's topology —
-    // skipped for --stress AND loaded OBJ scenes (a real scene can lack the
-    // required features outright: a skyless view can't fire sky-tiles, and a
-    // dense one legitimately overflows the replay recording arena). The
-    // scene-agnostic zero-counter gates always run.
-    let structural = stress.is_none() && obj.is_none();
+    // Must-fire structural gates are tuned to the default procedural scene's
+    // topology — skip them for --stress, loaded OBJ scenes, and the opt-in
+    // FR_WORLD_CHECK world. Any real scene can lack the required features
+    // outright: a skyless view cannot fire sky tiles, and a dense one can
+    // legitimately overflow the replay recording arena. The scene-independent
+    // zero-counter gates always run.
+    let structural = stress.is_none() && obj.is_none() && !world_wanted;
     if check {
         let code = run_check(&scene, &bvh, cam0, structural);
         std::process::exit(code);
@@ -658,7 +690,7 @@ fn main() {
     if check_dxr {
         #[cfg(windows)]
         {
-            let code = run_check_dxr(&scene, &bvh, cam0, &opts, stress.is_none());
+            let code = run_check_dxr(&scene, &bvh, cam0, &opts, structural);
             std::process::exit(code);
         }
         #[cfg(not(windows))]
@@ -3144,7 +3176,8 @@ fn run_check_gpu(
         (x1 - x0) as u64 * (y1 - y0) as u64
     };
     // One LeafRec = LEAF_REC_U32S u32s (xy0 | xy1 | t_start | depth |
-    // cut_slot | cut_len) — lockstep with queues.hlsli via LEAF_REC_BYTES.
+    // opaque frontier token | provider cookie) — lockstep with queues.hlsli
+    // via LEAF_REC_BYTES.
     const LEAF_REC_U32S: usize = (gpu::trace::LEAF_REC_BYTES / 4) as usize;
     let leaf_recs =
         match read_u32(&mut hg, &tg.qleaf, n_leaf.min(tg.cap_leaf as usize) * LEAF_REC_U32S) {
@@ -3165,8 +3198,20 @@ fn run_check_gpu(
     // record writes, and the point is to reach the CTR_OVERFLOW FAIL line
     // below with a diagnostic, not to die on an out-of-bounds index here.
     let mut covered: u64 = 0;
+    let mut malformed_frontiers = 0usize;
     for r in 0..n_leaf.min(leaf_recs.len() / LEAF_REC_U32S) {
-        covered += rect_px(leaf_recs[r * LEAF_REC_U32S], leaf_recs[r * LEAF_REC_U32S + 1]);
+        let base = r * LEAF_REC_U32S;
+        covered += rect_px(leaf_recs[base], leaf_recs[base + 1]);
+        // CPU-side ABI audit only. The shader ray call site never interprets
+        // either word; it hands them to the software provider unchanged.
+        let token = leaf_recs[base + 4];
+        let cookie = leaf_recs[base + 5];
+        if cookie != gpu::trace::FRONTIER_COOKIE_V1
+            || (token != gpu::trace::FRONTIER_ROOT_TOKEN
+                && (token >> 6) >= ctrs[gpu::trace::CTR_CUT as usize])
+        {
+            malformed_frontiers += 1;
+        }
     }
     for r in 0..n_sky.min(sky_recs.len() / 4) {
         covered += rect_px(sky_recs[r * 4], sky_recs[r * 4 + 1]);
@@ -3246,24 +3291,47 @@ fn run_check_gpu(
         );
         ok = false;
     }
-    // --sw-rays anti-vacuity: under the lever (with cut consumption armed)
-    // leaf tiles must actually seed from non-root cuts, or the lever's whole
-    // point — trace_closest_multi — is dead code. Structural (default-scene
-    // topology: a degenerate window or an all-sky pose has no real cuts), so
-    // --stress skips via `must_fire`; without the lever the counter must be
-    // 0 (SW_RAYS_LEAF compiled out — the alpha-rej pattern).
-    let sw_seeded = ctrs[gpu::trace::CTR_SW_CUT_SEED as usize];
+    // Opaque-continuation anti-vacuity and reuse accounting. These counters
+    // fire once per CONSUMED non-root LeafRec, not once per ray; the ray total
+    // is added by that one lane from the record's rectangle and SPP. The
+    // root-control arm (--no-cut-rays) still executes all three atomics but
+    // contributes zero by construction — see frontier_record_reuse, which
+    // zeroes the flag on !SW_RAYS_LEAF precisely so the "without the lever"
+    // branch below is structural rather than a property of this gate's 800x600
+    // split ladder (a mixed split mints a frontier no arm-independent producer
+    // can suppress).
+    let frontier_handles = ctrs[gpu::trace::CTR_FRONTIER_HANDLES as usize];
+    let frontier_rays = ctrs[gpu::trace::CTR_FRONTIER_RAYS as usize];
+    let frontier_entries = ctrs[gpu::trace::CTR_FRONTIER_ENTRIES as usize];
     if opts.sw_rays && opts.cut_rays {
-        eprintln!("check-gpu: sw cut-seeded leaf tiles: {sw_seeded}");
-        if must_fire && sw_seeded == 0 {
+        let root_records = (n_leaf as u32).saturating_sub(frontier_handles);
+        let reuse = frontier_rays as f64 / frontier_handles.max(1) as f64;
+        let width = frontier_entries as f64 / frontier_handles.max(1) as f64;
+        eprintln!(
+            "check-gpu: opaque frontiers: {frontier_handles}/{n_leaf} non-root handles | \
+             {frontier_rays} rays ({reuse:.1}/handle) | {frontier_entries} entries \
+             ({width:.1}/handle) | {root_records} root records"
+        );
+        if must_fire
+            && (frontier_handles == 0
+                || frontier_rays <= frontier_handles
+                || frontier_entries < frontier_handles
+                || frontier_entries > frontier_handles.saturating_mul(64))
+        {
             eprintln!(
-                "check-gpu: FAIL --sw-rays seeded 0 leaf tiles from a cut (trace_closest_multi is dead code)"
+                "check-gpu: FAIL continuation reuse/shape counters are vacuous or malformed"
             );
             ok = false;
         }
-    } else if sw_seeded != 0 {
+    } else if frontier_handles != 0 || frontier_rays != 0 || frontier_entries != 0 {
         eprintln!(
-            "check-gpu: FAIL {sw_seeded} sw cut-seed counts without the lever (SW_RAYS_LEAF must be compiled out)"
+            "check-gpu: FAIL opaque-frontier counters fired without the continuation lever"
+        );
+        ok = false;
+    }
+    if malformed_frontiers != 0 {
+        eprintln!(
+            "check-gpu: FAIL {malformed_frontiers} LeafRec continuation handles have an invalid provider cookie/token domain"
         );
         ok = false;
     }
@@ -5331,7 +5399,8 @@ fn run_check_gpu(
     // capturing the same local — a plain `&mut` capture in one would lock the
     // other out.)
     let passes: std::cell::RefCell<Vec<(String, u32, f64)>> = std::cell::RefCell::new(Vec::new());
-    let mut timed = |hybrid: bool, fb: shade::FrustumBounce, spp: u32| -> f64 {
+    let mut timed =
+        |hybrid: bool, fb: shade::FrustumBounce, spp: u32| -> Result<f64, String> {
         let bq = Quality { fb, ..q };
         let n = 60u32;
         // Warm once (PSO/cache effects), then time.
@@ -5352,7 +5421,12 @@ fn run_check_gpu(
             replay: false,
             };
             btg.write_cb(0, &p);
-            let _ = hg.run(|l| btg.record_frame(l, 0, &p, hybrid));
+            hg.run(|l| btg.record_frame(l, 0, &p, hybrid))
+                .map_err(|e| {
+                    format!(
+                        "bench warm frame {warm} failed (hybrid={hybrid}, spp={spp}): {e}"
+                    )
+                })?;
         }
         // Discard whatever the correctness gates / warm frames left behind, so
         // this row's table covers exactly this row's frames.
@@ -5375,18 +5449,26 @@ fn run_check_gpu(
             replay: false,
             };
             btg.write_cb(0, &p);
-            let _ = hg.run(|l| btg.record_frame(l, 0, &p, hybrid));
+            hg.run(|l| btg.record_frame(l, 0, &p, hybrid))
+                .map_err(|e| {
+                    format!("bench frame {f} failed (hybrid={hybrid}, spp={spp}): {e}")
+                })?;
         }
         let ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
         // HeadlessGpu::run collects each frame's timestamps at the START of the
         // next one, so the last frame is still pending here; take_regions drops
         // it rather than letting it leak into the next row.
         *passes.borrow_mut() = gpu::gputime::take_regions();
-        ms
+        Ok(ms)
     };
     let fb_off = shade::FrustumBounce::OFF;
-    let mut bench = |label: &str, hybrid: bool, fb: shade::FrustumBounce, spp: u32| -> f64 {
-        let ms = timed(hybrid, fb, spp);
+    let mut bench =
+        |label: &str,
+         hybrid: bool,
+         fb: shade::FrustumBounce,
+         spp: u32|
+         -> Result<f64, String> {
+        let ms = timed(hybrid, fb, spp)?;
         eprintln!("check-gpu: bench {bw}x{bh} {label}: {ms:6.2} ms/frame");
         for (name, depth, pms) in passes.borrow().iter() {
             let pad = "  ".repeat(*depth as usize);
@@ -5395,16 +5477,26 @@ fn run_check_gpu(
                 100.0 * pms / ms.max(1e-9)
             );
         }
-        ms
+        Ok(ms)
     };
-    bench("gpu hybrid          ", true, fb_off, 1);
-    bench("gpu plain reference ", false, fb_off, 1);
-    bench(
+    if let Err(e) = bench("gpu hybrid          ", true, fb_off, 1) {
+        eprintln!("check-gpu: {e}");
+        return 1;
+    }
+    if let Err(e) = bench("gpu plain reference ", false, fb_off, 1) {
+        eprintln!("check-gpu: {e}");
+        return 1;
+    }
+    if let Err(e) = bench(
         "gpu hybrid + hemi-gi",
         true,
         shade::FrustumBounce { ao: false, gi: true, depth: 3 },
         1,
-    );
+    ) {
+        eprintln!("check-gpu: {e}");
+        return 1;
+    }
+    drop(bench);
     // --spp on the GPU: the wavefront pays its quadtree ONCE per frame no
     // matter the sample count, while the reference kernel pays per ray. The
     // plain-reference row BEATS the hybrid row for primary visibility today
@@ -5423,8 +5515,22 @@ fn run_check_gpu(
     let mut ps: Vec<Vec<f64>> = vec![Vec::new(); SPP_SWEEP.len()];
     for _ in 0..REPS {
         for (i, &n) in SPP_SWEEP.iter().enumerate() {
-            hs[i].push(timed(true, fb_off, n));
-            ps[i].push(timed(false, fb_off, n));
+            let h = match timed(true, fb_off, n) {
+                Ok(ms) => ms,
+                Err(e) => {
+                    eprintln!("check-gpu: {e}");
+                    return 1;
+                }
+            };
+            let p = match timed(false, fb_off, n) {
+                Ok(ms) => ms,
+                Err(e) => {
+                    eprintln!("check-gpu: {e}");
+                    return 1;
+                }
+            };
+            hs[i].push(h);
+            ps[i].push(p);
         }
     }
     let median = |v: &mut Vec<f64>| -> f64 {
@@ -5466,7 +5572,13 @@ fn run_check_gpu(
     // breakdown says WHICH kernel the marginal sample is spent in.
     if opts.gpu_timing {
         for (label, hybrid) in [("gpu hybrid spp=16   ", true), ("gpu plain ref spp=16", false)] {
-            let ms = timed(hybrid, fb_off, 16);
+            let ms = match timed(hybrid, fb_off, 16) {
+                Ok(ms) => ms,
+                Err(e) => {
+                    eprintln!("check-gpu: {e}");
+                    return 1;
+                }
+            };
             eprintln!("check-gpu: bench {bw}x{bh} {label}: {ms:6.2} ms/frame");
             for (name, depth, pms) in passes.borrow().iter() {
                 let pad = "  ".repeat(*depth as usize);
@@ -7803,6 +7915,42 @@ pub(crate) fn catmull_rom(p0: Vec3A, p1: Vec3A, p2: Vec3A, p3: Vec3A, t: f32) ->
 
 /// Frames per full lap of the benchmark path.
 const SPIN_LAP: f32 = 600.0;
+/// Ordinary CPU/non-Intel frames excluded from `--spin` summaries.
+const SPIN_WARMUP: u32 = 20;
+
+/// Resolve the frame count against the warm-up so a DEFAULTED `--spin path`
+/// still times a whole closed lap.
+///
+/// The path pose is periodic in `SPIN_LAP`, so a mean taken over a partial lap
+/// is a mean over one ARC of the camera loop — comparable only against another
+/// run that happened to stop at the same pose. That was harmless while the
+/// warm-up was 20 (the 2000-frame default left 3.3 laps and the fractional lap
+/// was a small perturbation on three whole ones), and is not harmless at the
+/// Intel warm-up of 1600, where the default leaves 400 frames — two thirds of
+/// one lap, starting mid-path.
+///
+/// An EXPLICIT `--spin-frames` is returned untouched: the warm-up is only
+/// known after the device is created, so this cannot run at parse time, and
+/// silently growing a count somebody typed would corrupt exactly the A/B they
+/// were setting up. `still` mode has no lap to complete.
+fn spin_lap_frames(frames: u32, explicit: bool, warmup: u32, moving: bool, arm: &str) -> u32 {
+    let want = warmup.saturating_add(SPIN_LAP as u32);
+    if explicit || !moving || frames >= want {
+        return frames;
+    }
+    eprintln!(
+        "spin {arm}: the default {frames} frames leave {} timed frames, under one \
+         {SPIN_LAP:.0}-frame lap past the {warmup}-frame warm-up — extending to {want} so the \
+         mean covers a closed loop (--spin-frames {frames} to force the short run)",
+        frames.saturating_sub(warmup)
+    );
+    want
+}
+/// Arc's driver initially executes a fallback shader while compiling its
+/// optimized replacement in the background. The measured landing window is
+/// roughly 600-1500 frames, so begin Intel measurements after 1600 unless the
+/// caller explicitly selects another `--spin-warmup`.
+const INTEL_SPIN_WARMUP: u32 = 1600;
 
 /// Deterministic benchmark camera: a CLOSED-loop Catmull-Rom spline keyed
 /// relative to cam0 (offsets in units of scene.diag along cam0's
@@ -8753,6 +8901,9 @@ fn run_spin(
     cam0: Camera,
     mode: &str,
     frames: u32,
+    frames_explicit: bool,
+    hybrid: bool,
+    warmup_override: Option<u32>,
     opts: &Opts,
 ) -> i32 {
     let moving = match mode {
@@ -8770,8 +8921,32 @@ fn run_spin(
     // still drives the CPU renderer exactly as it always has.
     #[cfg(windows)]
     if opts.gpu || (opts.dxr && opts.mode_explicit) {
-        return run_spin_gpu(scene, bvh, cam0, mode, moving, frames, opts);
+        return run_spin_gpu(
+            scene,
+            bvh,
+            cam0,
+            mode,
+            moving,
+            frames,
+            frames_explicit,
+            hybrid,
+            warmup_override,
+            opts,
+        );
     }
+    let warmup = warmup_override.unwrap_or(SPIN_WARMUP);
+    if frames <= warmup {
+        eprintln!(
+            "--spin-frames must be greater than the {warmup}-frame warmup \
+             (got {frames})"
+        );
+        return 2;
+    }
+    let trace_arm = if hybrid { "hybrid" } else { "plain" };
+    // No-op at the CPU arm's own default (2000 frames past a 20-frame warm-up
+    // is already 3.3 laps), so every recorded CPU number stands; it engages
+    // only for an explicit --spin-warmup large enough to eat the lap.
+    let frames = spin_lap_frames(frames, frames_explicit, warmup, moving, trace_arm);
     let (rw, rh) = (W, H);
     let q = Quality::upscaler_1spp();
     let stats = Stats::default();
@@ -8783,10 +8958,10 @@ fn run_spin(
     let mut replay_key: Option<camera::CamBasis> = None;
 
     eprintln!(
-        "spin {mode}: {frames} frames at {rw}x{rh}, 1-spp quality | temporal {} replay {} adopt {} discard {} | pid {}",
+        "spin {mode} [{}]: {frames} frames ({warmup} warmup) at {rw}x{rh}, 1-spp quality | temporal {} replay {} adopt {} discard {} | pid {}",
+        trace_arm,
         opts.temporal, opts.replay, opts.adopt, opts.discard_seeds, std::process::id()
     );
-    const WARMUP: u32 = 20;
     let mut total_ms = 0.0f64;
     let mut peak_ms = 0.0f64;
     let mut replay_frames = 0u64;
@@ -8794,9 +8969,11 @@ fn run_spin(
     for idx in 0..frames {
         let cam = if moving { spin_path_pose(&cam0, scene.diag, idx) } else { cam0 };
         let basis = cam.basis(rw, rh);
-        let can_replay =
-            opts.temporal && opts.replay && replay_key.as_ref().is_some_and(|b| *b == basis);
-        let record = opts.temporal && opts.replay && !can_replay;
+        let can_replay = hybrid
+            && opts.temporal
+            && opts.replay
+            && replay_key.as_ref().is_some_and(|b| *b == basis);
+        let record = hybrid && opts.temporal && opts.replay && !can_replay;
         if record {
             replay_cache.begin(rw, rh);
         }
@@ -8844,7 +9021,7 @@ fn run_spin(
             render::render_frame_replay(&ctx, &replay_cache);
             replay_frames += 1;
         } else {
-            render::render_frame(&ctx, true);
+            render::render_frame(&ctx, hybrid);
         }
         let ms = t.elapsed().as_secs_f64() * 1000.0;
         prof::frame_mark();
@@ -8852,13 +9029,13 @@ fn run_spin(
             tr.end(temporal_on, opts.adopt, basis);
             replay_key = if record && replay_cache.valid() { Some(basis) } else { None };
         }
-        if idx >= WARMUP {
+        if idx >= warmup {
             total_ms += ms;
             peak_ms = peak_ms.max(ms);
         }
         if (idx + 1) % 200 == 0 {
             eprintln!(
-                "spin {mode} [{:4}]: {:6.2} ms/frame over the last 200 | {}",
+                "spin {mode} [{trace_arm}] [{:4}]: {:6.2} ms/frame over the last 200 | {}",
                 idx + 1,
                 window.elapsed().as_secs_f64() * 1000.0 / 200.0,
                 stats.summary_line()
@@ -8867,9 +9044,9 @@ fn run_spin(
             window = Instant::now();
         }
     }
-    let timed = frames.saturating_sub(WARMUP).max(1) as f64;
+    let timed = (frames - warmup) as f64;
     eprintln!(
-        "spin {mode} summary: {:.2} ms/frame mean (peak {:.2}) over {} timed frames | replay frames {replay_frames}",
+        "spin {mode} [{trace_arm}] summary: {:.2} ms/frame mean (peak {:.2}) over {} timed frames | replay frames {replay_frames}",
         total_ms / timed,
         peak_ms,
         timed as u64,
@@ -8891,8 +9068,8 @@ fn run_spin(
 /// poses are all pure functions of the frame index, the same as on the CPU, so
 /// an A/B across a code change compares two byte-identical workloads. Because
 /// the contract matches `run_spin`'s line for line (1-spp upscaler quality,
-/// `accumulate` off, frame-uniform Halton jitter), `--cpu` / `--gpu` / `--dxr`
-/// spin rows are directly comparable to each other.
+/// `accumulate` off, frame-uniform Halton jitter). CPU/GPU/DXR comparisons
+/// must select the same explicit warm-up and timed-frame interval.
 ///
 /// What it measures is the TRACER, not the presented frame: `gbuf_full` is off,
 /// so there is no G-buffer pack and no feed/upscale pass. Those are constant
@@ -8901,8 +9078,8 @@ fn run_spin(
 /// does not have. The wall clock therefore carries the per-frame submit+fence
 /// overhead the interactive loop hides behind FRAMES_IN_FLIGHT — compare GPU
 /// time to GPU time via `--gpu-timing`, whose per-pass table prints every 120
-/// frames and once more at exit. On Intel that table is the only per-pass
-/// profiler that exists (PIX cannot analyze an Arc capture).
+/// frames and once more at exit. On Intel the timestamp table is the only
+/// per-pass profiler that exists (PIX cannot analyze an Arc capture).
 #[cfg(windows)]
 fn run_spin_gpu(
     scene: &scene::Scene,
@@ -8911,9 +9088,34 @@ fn run_spin_gpu(
     mode: &str,
     moving: bool,
     frames: u32,
+    frames_explicit: bool,
+    hybrid: bool,
+    warmup_override: Option<u32>,
     opts: &Opts,
 ) -> i32 {
-    let arm = if opts.gpu { "gpu" } else { "dxr" };
+    let arm = if opts.gpu {
+        if hybrid { "gpu-hybrid" } else { "gpu-plain" }
+    } else {
+        // The DXR pipeline has no quadtree arm to select — DispatchRays traces
+        // per-pixel from the TLAS root either way. Say so rather than letting a
+        // --spin-plain row silently be the same run as its --spin-hybrid pair.
+        if !hybrid {
+            eprintln!(
+                "spin dxr: --spin-plain has no effect under --dxr (that pipeline has one \
+                 arm); use --gpu for the quadtree-vs-root A/B"
+            );
+        }
+        "dxr"
+    };
+    // An EXPLICIT warm-up is knowable now; the defaulted one is vendor-derived
+    // and has to wait for the adapter pick below. Reject the cheap case before
+    // paying for DXC + device + (on a big scene) the BLAS build.
+    if let Some(w) = warmup_override {
+        if frames <= w {
+            eprintln!("--spin-frames must be greater than the {w}-frame warmup (got {frames})");
+            return 2;
+        }
+    }
     let dxc = match gpu::dxc::Dxc::load(&opts.dxc_path) {
         Ok(d) => d,
         Err(e) => {
@@ -8931,6 +9133,22 @@ fn run_spin_gpu(
             return 2;
         }
     };
+    let intel = gpu::adapter::picked_vendor() == gpu::adapter::Vendor::Intel;
+    let warmup = warmup_override.unwrap_or(if intel {
+        INTEL_SPIN_WARMUP
+    } else {
+        SPIN_WARMUP
+    });
+    if frames <= warmup {
+        eprintln!(
+            "--spin-frames must be greater than the {warmup}-frame warmup \
+             (got {frames}; override with --spin-warmup)"
+        );
+        return 2;
+    }
+    // The Intel warm-up is 1600, so the 2000-frame default would otherwise time
+    // 400 frames — two thirds of a lap, starting mid-path.
+    let frames = spin_lap_frames(frames, frames_explicit, warmup, moving, arm);
     // Trace res = the GPU-mode lock scale (`--lock-res`, default native), so
     // `--gpu --lock-res quality` is measurable here — which is precisely the
     // claim the Intel default rests on. No upscaler range exists headlessly, so
@@ -8996,17 +9214,23 @@ fn run_spin_gpu(
     };
 
     eprintln!(
-        "spin {mode} [{arm}]: {frames} frames at {rw}x{rh} ({:.0}% of {W}x{H}), 1-spp quality, spp {} | adapter \"{}\" | pid {}",
+        "spin {mode} [{arm}]: {frames} frames ({warmup} warmup) at {rw}x{rh} ({:.0}% of {W}x{H}), 1-spp quality, spp {} | adapter \"{}\" | pid {}",
         lock * 100.0,
         opts.spp,
         hg.adapter_name,
         std::process::id()
     );
-    const WARMUP: u32 = 20;
     let mut total_ms = 0.0f64;
     let mut peak_ms = 0.0f64;
     let mut window = Instant::now();
     for idx in 0..frames {
+        // The timer's cumulative mean must describe the same post-warmup
+        // interval as the wall-clock summary. Clear both collected samples and
+        // pending in-flight warmup queries before recording the first timed
+        // frame; `take_regions` is an inert no-op without --gpu-timing.
+        if idx == warmup {
+            let _ = gpu::gputime::take_regions();
+        }
         let cam = if moving { spin_path_pose(&cam0, scene.diag, idx) } else { cam0 };
         let p = gpu::trace::FrameParams {
             cam: cam.basis(rw, rh),
@@ -9025,13 +9249,13 @@ fn run_spin_gpu(
             probe_sample: 0,
             clouds: crate::clouds::Clouds::spin(scene.diag, idx),
             fireflies: crate::fireflies::Fireflies::spin(scene, idx),
-            replay: opts.replay && !moving,
+            replay: hybrid && opts.replay && !moving,
         };
         let t = Instant::now();
         let r = match &armv {
             Arm::Wave(tg) => {
                 tg.write_cb(0, &p);
-                hg.run(|l| tg.record_frame(l, 0, &p, true))
+                hg.run(|l| tg.record_frame(l, 0, &p, hybrid))
             }
             Arm::Dxr(dg) => {
                 dg.write_cb(0, &p);
@@ -9045,7 +9269,7 @@ fn run_spin_gpu(
         }
         let ms = t.elapsed().as_secs_f64() * 1000.0;
         prof::frame_mark();
-        if idx >= WARMUP {
+        if idx >= warmup {
             total_ms += ms;
             peak_ms = peak_ms.max(ms);
         }
@@ -9058,7 +9282,7 @@ fn run_spin_gpu(
             window = Instant::now();
         }
     }
-    let timed = frames.saturating_sub(WARMUP).max(1) as f64;
+    let timed = (frames - warmup) as f64;
     eprintln!(
         "spin {mode} [{arm}] summary: {:.2} ms/frame mean (peak {:.2}) over {} timed frames \
          (wall clock, includes per-frame submit+fence; --gpu-timing for GPU time)",
