@@ -19,8 +19,10 @@ intersects nothing is filled with sky immediately, **zero rays traced**.
 
 Children also inherit a **node cut**: the parent's list of surviving BVH nodes,
 re-culled and refined level by level, so a tile's frustum query descends the
-parent's frontier instead of the BVH root, and leaf pixel rays seed their
-traversal from the cut.
+parent's frontier instead of the BVH root. CPU and `--sw-rays` leaf rays also
+seed their traversal from that cut. Default hardware `RayQuery` leaf rays
+cannot accept an arbitrary BVH frontier, so they restart at the TLAS root and
+consume only the inherited `tmin`.
 
 There is a full engineering write-up in the [technical appendix](#technical-appendix)
 below — the algorithm, the correctness invariants, the measurements, and the
