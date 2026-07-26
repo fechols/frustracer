@@ -5393,6 +5393,41 @@ pub fn bc7_gpu_self_test(hg: &mut HeadlessGpu) -> Result<()> {
 // never formatting.
 
 #[cfg(test)]
+mod ftree_shader_source_tests {
+    use super::FTREE_HLSLI;
+
+    /// The serial wide-node loop caches internal-slot distances before all
+    /// terminal slots have tightened `best`. Its overflow fallback must first
+    /// reject those stale distances and must only ever lower the bound. This
+    /// source-level gate is deliberately hardware-free: the live HLSL remains
+    /// the executable specification, while `cargo test` pins the two ordering
+    /// and monotonicity statements on which conservative empty-space proof
+    /// depends.
+    #[test]
+    fn overflow_fallback_cannot_raise_best() {
+        let expand = FTREE_HLSLI
+            .split_once("void ft_expand")
+            .expect("ft_expand must remain in the FTree shader")
+            .1
+            .split_once("// frustum.rs::nearest_geometry_distance")
+            .expect("ft_expand must end before bound_query")
+            .0;
+        let stale_check = expand
+            .find("if (pd >= best) continue;")
+            .expect("cached distances must be rechecked after terminals tighten best");
+        let overflow = expand
+            .find("if (sp + 1 > LANE_STACK)")
+            .expect("ft_expand must retain a conservative stack-overflow fallback");
+        let coarse_min = expand
+            .find("best = min(best, pd);")
+            .expect("stack overflow must lower best with min");
+
+        assert!(stale_check < overflow && overflow < coarse_min);
+        assert!(!expand.contains("best = pd;"));
+    }
+}
+
+#[cfg(test)]
 mod empty_bvh_shader_source_tests {
     use super::{empty_defs, FRUSTUM_HLSLI, RT_SW_HLSLI};
 

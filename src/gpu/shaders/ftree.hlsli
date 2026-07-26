@@ -19,9 +19,12 @@
 // holding child node ids only (no stored distance): 8-way expansion can hold
 // up to depth*7 pending siblings, so survivors push FAR->NEAR (an 8-slot
 // insertion sort in registers keeps the nearest popping first) and stack
-// pressure falls back to the coarse bound `best = d` — a valid lower bound,
-// exactly the binary version's overflow rule. A dead node popped without a
-// stored-d skip just re-tests 8 slot boxes and dies; the ftree can afford it.
+// pressure falls back to the coarse bound `best = min(best, d)` — a valid
+// lower bound, exactly the binary version's overflow rule. Distances cached
+// during an expansion are rechecked after terminal slots tighten `best`, so
+// stale entries can neither consume stack space nor raise the bound. A dead
+// node popped without a stored-d skip just re-tests 8 slot boxes and dies; the
+// ftree can afford it.
 
 #ifdef FTREE
 
@@ -93,6 +96,8 @@ bool ft_slot(TF f, FtNode nd, uint s, float t_start, out float d) {
 // insertion sort's dynamic shuffle indices demote them to scratch memory,
 // which measured +58% on the hemi bench (hemi_cell is the hottest caller).
 // Stack pressure takes the slot's own d as a coarse leaf — sound, see header.
+// Every write to `best` is explicitly a min: monotonicity is a correctness
+// invariant, not merely a consequence of an earlier prune.
 void ft_expand(TF f, uint ni, float t_start, inout float best, uint base, inout uint sp) {
     FtNode nd = ft_nodes[ni];
     float sd[8];
@@ -104,7 +109,7 @@ void ft_expand(TF f, uint ni, float t_start, inout float best, uint base, inout 
         float d;
         if (!ft_slot(f, nd, s, t_start, d) || d >= best) continue;
         if (nd.child[s] == FT_INVALID) {
-            best = d; // terminal slot: a binary leaf's box distance
+            best = min(best, d); // terminal slot: a binary leaf's box distance
             continue;
         }
         sd[s] = d;
@@ -125,8 +130,12 @@ void ft_expand(TF f, uint ni, float t_start, inout float best, uint base, inout 
             }
         }
         live &= ~(1u << pick);
+        // `pd` was cached before all terminal slots had a chance to tighten
+        // `best`. Recheck it now: a stale subtree cannot improve the result
+        // and, critically, must not drive the stack-overflow fallback.
+        if (pd >= best) continue;
         if (sp + 1 > LANE_STACK) {
-            best = pd; // coarse: the slot's d lower-bounds its subtree
+            best = min(best, pd); // coarse: the slot's d lower-bounds its subtree
             continue;
         }
         g_stack[base + sp++] = pc;
@@ -150,11 +159,11 @@ float bound_query(TF f, float t_start, float t_limit, uint cut_slot, uint cut_le
         float d;
         if (!ft_slot(f, nd, s, t_start, d) || d >= best) continue;
         if (nd.child[s] == FT_INVALID) {
-            best = d;
+            best = min(best, d);
             continue;
         }
         if (sp + 1 > LANE_STACK) {
-            best = d;
+            best = min(best, d);
             continue;
         }
         g_stack[base + sp++] = nd.child[s];
