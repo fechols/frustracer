@@ -391,7 +391,9 @@ impl DxrGpu {
         // largest payload (the float2/uint tail is --spp: the sample's own
         // position, and prim = `(sample << 1) | probe_bit` — the index rides
         // the high bits so the miss shader can key the per-sample cloud march
-        // phase without growing the payload); triangle barycentrics = 8 B.
+        // phase without growing the payload). HitPayload and ShadowPayload are
+        // each 24 B after adding the relief ray's logical tmin/tmax, so they
+        // remain below that ceiling; triangle barycentrics = 8 B.
         let shader_cfg = D3D12_RAYTRACING_SHADER_CONFIG {
             MaxPayloadSizeInBytes: 32,
             MaxAttributeSizeInBytes: 8,

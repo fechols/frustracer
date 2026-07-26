@@ -76,12 +76,13 @@ struct RayPayload {
 
 struct ShadowPayload {
     uint hit;
-    // The segment's LOGICAL far bound. Relief widens the hardware TMax below
-    // (a marched underside hit inside tmax can belong to a candidate whose
-    // PLANE t lies beyond it — the hardware culls at the plane t), so
-    // ah_shadow re-checks the MARCHED t against this — the mirror of the
-    // RayQuery loops' explicit `ct < tmax`. Opaque scenes never run an
-    // any-hit and ignore the field.
+    // The segment's LOGICAL bounds. With relief live, the hardware interval is
+    // the full positive ray: a marched hit inside either bound can belong to
+    // a base-plane candidate arbitrarily far outside it at grazing incidence.
+    // ah_shadow re-checks the MARCHED t against these — the mirror of the
+    // RayQuery loops' explicit `ct > tmin && ct < tmax`. Opaque scenes never
+    // run an any-hit and ignore the fields.
+    float tmin;
     float tmax;
     // Tinted shadows (TRANS_SHADOW): the running product of glass tints
     // ah_shadow accumulates while IgnoreHit()-ing transmissive candidates
@@ -99,6 +100,9 @@ struct HitPayload {
     uint tri;
     float u;
     float v;
+    // Logical interval, consumed by ah_hit after relief moves the candidate t.
+    float tmin;
+    float tmax;
 };
 
 // The three TraceRay-flavor primitives. Compiled out under FR_DXR_INLINE —
@@ -112,17 +116,18 @@ struct HitPayload {
 // reflected surface itself (the CPU's depth-1 recursion), so routing it to
 // chs_shade would double-shade.
 //
-// Relief TMax contract: every trace_closest call in this pipeline passes
-// tmax = FLT_MAX (shade.hlsli), so the relief TMax widening lives on the
-// occlusion path only. A future FINITE-tmax closest-hit ray would need the
-// ShadowPayload treatment (widen + payload-carried logical bound), because
-// the hardware culls candidates at the PLANE t while the marched t can land
-// one relief depth earlier.
+// Relief interval contract: hardware enumeration uses the complete positive
+// base-triangle ray (trace_common.hlsli::height_tmin/height_tmax), while the
+// payload carries the caller's logical bounds for ah_hit to apply to the
+// MARCHED t. Current reflection callers use tmax=FLT_MAX, but this also keeps
+// future finite-tmax and nonzero-tmin calls sound at grazing incidence.
 bool trace_closest(float3 o, float3 d, float tmin, float tmax, out HitInfo h) {
     RayDesc r;
-    r.Origin = o; r.Direction = d; r.TMin = tmin; r.TMax = tmax;
+    r.Origin = o; r.Direction = d;
+    r.TMin = height_tmin(tmin); r.TMax = height_tmax(tmax);
     HitPayload p;
     p.t = -1.0; p.tri = 0u; p.u = 0.0; p.v = 0.0;
+    p.tmin = tmin; p.tmax = tmax;
     TraceRay(tlas, OPAQUE_RF, 0xffu, 1u, 0u, 2u, r, p);
     h.t = max(p.t, 0.0); h.tri = p.tri; h.u = p.u; h.v = p.v;
     return p.t >= 0.0;
@@ -131,21 +136,19 @@ bool trace_closest(float3 o, float3 d, float tmin, float tmax, out HitInfo h) {
 // rt.hlsli::occluded_q. The closest-hit stage is skipped — only miss_shadow
 // (and, in ALPHA_CUTOUT/HEIGHTFIELD scenes, HgOcclude's any-hit rejecting
 // masked/escaped candidates) can run, so an untouched payload IS the hit
-// answer. Relief widens the hardware TMax by one relief depth (rt.hlsli's
-// height_tmax rationale — the AO segment is this pipeline's finite-tmax
-// case); ah_shadow re-checks the marched t against the LOGICAL bound riding
-// the payload. TMin stays unwidened: every occluded_q call here passes
-// tmin = 0 (shade.hlsli), so there is nothing to widen.
+// answer. Relief enumerates the full positive hardware ray (a finite
+// world-depth widening is not conservative at grazing); ah_shadow re-checks
+// the marched t against BOTH logical bounds riding the payload. Today's
+// shade.hlsli occlusion calls pass tmin=0, while carrying it explicitly keeps
+// this primitive correct for a future nonzero-tmin caller.
 bool occluded_q(float3 o, float3 d, float tmin, float tmax) {
     if (tmax <= tmin) return false;
     RayDesc r;
-    r.Origin = o; r.Direction = d; r.TMin = tmin;
-    r.TMax = tmax;
-#ifdef HEIGHTFIELD
-    if (flags & FLAG_HEIGHT) r.TMax = tmax + height_max;
-#endif
+    r.Origin = o; r.Direction = d;
+    r.TMin = height_tmin(tmin); r.TMax = height_tmax(tmax);
     ShadowPayload p;
     p.hit = 1u;
+    p.tmin = tmin;
     p.tmax = tmax;
     p.tint = float3(1.0, 1.0, 1.0);
     // NOTE: under TRANS_SHADOW ah_shadow passes transmissive candidates, so
@@ -167,13 +170,11 @@ bool occluded_q(float3 o, float3 d, float tmin, float tmax) {
 float3 transmit_q(float3 o, float3 d, float tmin, float tmax) {
     if (tmax <= tmin) return float3(1.0, 1.0, 1.0);
     RayDesc r;
-    r.Origin = o; r.Direction = d; r.TMin = tmin;
-    r.TMax = tmax;
-#ifdef HEIGHTFIELD
-    if (flags & FLAG_HEIGHT) r.TMax = tmax + height_max;
-#endif
+    r.Origin = o; r.Direction = d;
+    r.TMin = height_tmin(tmin); r.TMax = height_tmax(tmax);
     ShadowPayload p;
     p.hit = 1u;
+    p.tmin = tmin;
     p.tmax = tmax;
     p.tint = float3(1.0, 1.0, 1.0);
     TraceRay(tlas,

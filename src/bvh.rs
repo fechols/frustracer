@@ -1280,10 +1280,11 @@ pub(crate) fn tri_height_depth(scene: &Scene, tri: u32) -> f32 {
     if !ts.is_finite() { 0.0 } else { m.height_amp * ts }
 }
 
-/// Scene-wide maximum relief depth in world units — the wavefront TMin
-/// widening constant (`FrameCb::height_max`; 0.0 = no height data, which is
-/// also how the CB encodes `any_height` for FLAG_HEIGHT). One parallel pass
-/// at GPU-session init.
+/// Scene-wide maximum relief depth in world units (`FrameCb::height_max`;
+/// 0.0 = no height data, which is also how the CB encodes `any_height` for
+/// FLAG_HEIGHT). This is metadata, NOT a conservative ray-t widening:
+/// plane-to-relief `dt = depth / abs(dot(ray_dir, normal))` is unbounded at
+/// grazing incidence. One parallel pass at GPU-session init.
 pub fn height_max_world(scene: &Scene) -> f32 {
     if !scene.any_height || !height_armed() {
         return 0.0;
@@ -1730,6 +1731,60 @@ pub fn height_self_test() -> Result<(), String> {
         let want_b = 1.0 + f; // t_h0 = 1 (z −2→−1), t_p = 2, ĥ spans [0,1]
         if ((hb.t - want_b) / want_b).abs() > 1e-5 {
             return Err(format!("underside: t' {} want {want_b}", hb.t));
+        }
+        // (f2) A world-depth +/- widening is NOT a ray-t bound. At grazing
+        // incidence, dt = depth/|d.n| exceeds the one-unit depth. Pin both
+        // interval ends against the CPU reference:
+        //   * descending: plane t is BEFORE old (tmin-depth), marched t is in;
+        //   * ascending:  plane t is AFTER old (tmax+depth), marched t is in.
+        // The GPU must enumerate the full positive base-triangle ray and
+        // apply these logical bounds only after candidate_reject marches t.
+        {
+            let dg_down = Vec3A::new(1.0, 0.0, -0.4).normalize();
+            let rg_down = Ray::new(Vec3A::new(0.2, 0.2, 0.8), dg_down);
+            let hg_down = bvhh
+                .intersect(&half, &rg_down, 0.0, f32::INFINITY, &mut vis)
+                .ok_or("grazing tmin: no full-interval hit")?;
+            let tp_down = 0.8 / -dg_down.z;
+            let logical_tmin = hg_down.t - 0.05;
+            if !(tp_down < logical_tmin - 1.0 && hg_down.t > logical_tmin) {
+                return Err(format!(
+                    "grazing tmin setup invalid: plane {tp_down}, hit {}, logical {logical_tmin}",
+                    hg_down.t
+                ));
+            }
+            let bounded = bvhh
+                .intersect(&half, &rg_down, logical_tmin, f32::INFINITY, &mut vis)
+                .ok_or("grazing tmin: marched in-range hit was culled")?;
+            if (bounded.t - hg_down.t).abs() > 1e-5 {
+                return Err(format!(
+                    "grazing tmin: bounded hit {} != full hit {}",
+                    bounded.t, hg_down.t
+                ));
+            }
+
+            let dg_up = Vec3A::new(1.0, 0.0, 0.4).normalize();
+            let rg_up = Ray::new(Vec3A::new(0.2, 0.2, -1.1), dg_up);
+            let hg_up = bvhh
+                .intersect(&half, &rg_up, 0.0, f32::INFINITY, &mut vis)
+                .ok_or("grazing tmax: no full-interval hit")?;
+            let tp_up = 1.1 / dg_up.z;
+            let logical_tmax = hg_up.t + 0.05;
+            if !(tp_up > logical_tmax + 1.0 && hg_up.t < logical_tmax) {
+                return Err(format!(
+                    "grazing tmax setup invalid: plane {tp_up}, hit {}, logical {logical_tmax}",
+                    hg_up.t
+                ));
+            }
+            let bounded = bvhh
+                .intersect(&half, &rg_up, 0.0, logical_tmax, &mut vis)
+                .ok_or("grazing tmax: marched in-range hit was culled")?;
+            if (bounded.t - hg_up.t).abs() > 1e-5 {
+                return Err(format!(
+                    "grazing tmax: bounded hit {} != full hit {}",
+                    bounded.t, hg_up.t
+                ));
+            }
         }
         // (g) Edge-crack fill (HEIGHT_EDGE_EXTEND): two coplanar triangles
         // sharing an edge on one continuous chart, constant mid field

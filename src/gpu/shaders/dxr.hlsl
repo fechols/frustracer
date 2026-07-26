@@ -206,33 +206,36 @@ void miss_hit(inout HitPayload p) {
 // unshrunk — which is exactly what makes relief silhouettes real on this
 // pipeline too. The marched t'/bary are discarded here (an any-hit cannot
 // move the committed t); chs_shade/chs_hit re-derive them. ah_shadow keeps
-// its own body below: it consumes the marched t for the logical-tmax
+// its own body below: it consumes the marched t for the logical interval
 // re-check and accumulates the tinted-shadow throughput.
-bool ah_reject(uint tri, float u, float v) {
+bool ah_reject(uint tri, float u, float v, float tmin, float tmax) {
     float t = RayTCurrent();
-    return candidate_reject(tri, WorldRayOrigin(), WorldRayDirection(), t, u, v) != 0u;
+    return candidate_reject(tri, WorldRayOrigin(), WorldRayDirection(), t, u, v) != 0u
+        || t <= tmin || t >= tmax;
 }
 
 [shader("anyhit")]
 void ah_shade(inout RayPayload p, in BuiltInTriangleIntersectionAttributes a) {
-    if (ah_reject(tri_of(InstanceID(), PrimitiveIndex()), a.barycentrics.x, a.barycentrics.y))
+    // Raygen primaries are logically the complete positive ray.
+    if (ah_reject(tri_of(InstanceID(), PrimitiveIndex()), a.barycentrics.x,
+                  a.barycentrics.y, 0.0, FLT_MAX))
         IgnoreHit();
 }
 
 [shader("anyhit")]
 void ah_hit(inout HitPayload p, in BuiltInTriangleIntersectionAttributes a) {
-    if (ah_reject(tri_of(InstanceID(), PrimitiveIndex()), a.barycentrics.x, a.barycentrics.y))
+    if (ah_reject(tri_of(InstanceID(), PrimitiveIndex()), a.barycentrics.x,
+                  a.barycentrics.y, p.tmin, p.tmax))
         IgnoreHit();
 }
 
 // The shadow flavor additionally re-checks the MARCHED t against the
-// segment's LOGICAL far bound (ShadowPayload::tmax): occluded_q widens the
-// hardware TMax by one relief depth so underside candidates whose plane t
-// lies just beyond the segment still surface (rt_dxr.hlsli), and this test —
-// the mirror of the RayQuery loops' explicit `ct < tmax` — is what keeps a
-// marched hit BEYOND the segment from occluding it. Unwidened rays never
-// trip it (their candidates already satisfy plane t <= tmax and, without a
-// live march, t' == plane t).
+// segment's LOGICAL bounds (ShadowPayload::tmin/tmax). With relief live,
+// occluded_q/transmit_q enumerate the full positive base-triangle ray because
+// no finite +/-world-depth widening covers grazing incidence. These tests —
+// the mirror of the RayQuery loops' explicit `ct > tmin && ct < tmax` — keep
+// displaced hits outside the segment from occluding it. Without a live march,
+// the helpers preserve the original hardware interval and t == plane t.
 [shader("anyhit")]
 void ah_shadow(inout ShadowPayload p, in BuiltInTriangleIntersectionAttributes a) {
     float t = RayTCurrent();
@@ -240,7 +243,7 @@ void ah_shadow(inout ShadowPayload p, in BuiltInTriangleIntersectionAttributes a
     float v = a.barycentrics.y;
     uint tri = tri_of(InstanceID(), PrimitiveIndex());
     if (candidate_reject(tri, WorldRayOrigin(), WorldRayDirection(), t, u, v) != 0u
-        || t >= p.tmax)
+        || t <= p.tmin || t >= p.tmax)
         IgnoreHit();
 #ifdef TRANS_SHADOW
     // Tinted shadows: a transmissive candidate multiplies the payload tint

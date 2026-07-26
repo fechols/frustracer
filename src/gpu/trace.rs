@@ -5490,3 +5490,41 @@ mod empty_bvh_shader_source_tests {
     }
 }
 
+#[cfg(test)]
+mod height_interval_shader_source_tests {
+    use super::{RT_HLSLI, TRACE_COMMON_HLSLI};
+
+    const RT_DXR_HLSLI: &str = include_str!("shaders/rt_dxr.hlsli");
+    const DXR_HLSL: &str = include_str!("shaders/dxr.hlsl");
+
+    /// Relief displacement is bounded in world-normal distance, not in ray t.
+    /// Pin the shader-side half of the grazing-interval regression without
+    /// requiring an RT-capable adapter: hardware enumeration must cover the
+    /// full positive base-triangle ray, and both intersectors must retain the
+    /// caller's logical bounds for the post-march test.
+    #[test]
+    fn relief_candidates_use_full_hardware_interval_and_logical_marched_bounds() {
+        let helpers = TRACE_COMMON_HLSLI
+            .split_once("float height_tmin")
+            .expect("height_tmin helper must exist")
+            .1
+            .split_once("uint pack_info")
+            .expect("height interval helpers must precede pack_info")
+            .0;
+        assert!(helpers.contains("if (flags & FLAG_HEIGHT) return 0.0;"));
+        assert!(helpers.contains("if (flags & FLAG_HEIGHT) return FLT_MAX;"));
+
+        for src in [RT_HLSLI, RT_DXR_HLSLI] {
+            assert!(!src.contains("tmin - height_max"));
+            assert!(!src.contains("tmax + height_max"));
+            assert!(src.contains("height_tmin(tmin)"));
+            assert!(src.contains("height_tmax(tmax)"));
+        }
+
+        assert!(RT_HLSLI.contains("ct > tmin && ct < tmax"));
+        assert!(RT_DXR_HLSLI.contains("p.tmin = tmin"));
+        assert!(RT_DXR_HLSLI.contains("p.tmax = tmax"));
+        assert!(DXR_HLSL.contains("t <= tmin || t >= tmax"));
+        assert!(DXR_HLSL.contains("t <= p.tmin || t >= p.tmax"));
+    }
+}
