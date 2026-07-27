@@ -917,11 +917,17 @@ impl Hud {
             self.force_full = true;
         }
         // Outer stage row: "i / n  name" — only when the loader set a stage
-        // (a single-scene load leaves it blank).
-        let stage = if snap.stage_total > 0 {
-            format!("{} / {}  {}", snap.stage_done, snap.stage_total, snap.stage_name)
-        } else {
+        // (a single-scene load leaves it blank). The name is dropped WITH its
+        // separator when empty, which is the world loader's opening state: it
+        // arms the row at (0, n, "") and the name is whichever island finished
+        // LAST, so there is no honest one to show until the first lands. A
+        // bare "0 / 7" is the truth there; "0 / 7  " trailed two spaces.
+        let stage = if snap.stage_total == 0 {
             String::new()
+        } else if snap.stage_name.is_empty() {
+            format!("{} / {}", snap.stage_done, snap.stage_total)
+        } else {
+            format!("{} / {}  {}", snap.stage_done, snap.stage_total, snap.stage_name)
         };
         if stage != self.last_load_stage {
             self.ui.set_load_stage(stage.as_str().into());

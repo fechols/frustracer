@@ -23,7 +23,68 @@ cargo run --release                   # interactive window (DLSS-RR on when supp
                                       # antipodal moon is ~60 deg up as the one light, stars and
                                       # fireflies at full strength, so a lap sweeps sunrise ->
                                       # moonlit night; the old 18:45 civil-dusk cap left the moon
-                                      # grazing the horizon at ~11 deg)
+                                      # grazing the horizon at ~11 deg).
+                                      # The per-island loads run CONCURRENTLY on the GLOBAL rayon
+                                      # pool — one task per island, deliberately NEVER a pool of
+                                      # their own, which every inner par_iter (texture decode, the
+                                      # n2h solve, Bvh::build) would inherit through install,
+                                      # narrowing the passes that do the real parallel work.
+                                      # Results collect by INDEX off an INDEXED par_iter, so ring
+                                      # order stays a function of the table and never of finish
+                                      # order; world::self_test pins CURATED's hours STRICTLY
+                                      # increasing (which makes the ring sort a TOTAL order, so a
+                                      # stable sort can't fall through to load order) and its
+                                      # paths UNALIASED (concurrent scene_cache::store calls are
+                                      # safe per-FILE only — the tmp name is pid-suffixed, which
+                                      # separates processes, not two entries resolving to one
+                                      # file). That alias gate compares the RESOLVED form, which
+                                      # is where the collision lands: resolve_scene_path maps p to
+                                      # p.zst when p is absent AND NOTHING ELSE, so two entries
+                                      # share a sidecar iff their paths are equal after stripping
+                                      # one trailing .zst — an x.obj entry beside an x.obj.zst
+                                      # entry are distinct strings naming one file, which a raw
+                                      # string compare would miss. Stripping keeps the gate a pure
+                                      # function of the table (calling the real resolver would
+                                      # make it depend on which files are materialized).
+                                      # The n2h solve's ~0.5 GB-per-4K-solve cap became ONE
+                                      # process-wide pool for this (scene::n2h_pool); a per-call
+                                      # pool multiplied the bound by the parts in flight.
+                                      # progress::MultiGuard brackets the fan-out: its DROP is
+                                      # what leaves multi mode, so a worker panic propagating out
+                                      # of the collect can't leave that process-global armed for
+                                      # whatever publishes next (set_multi is private — the guard
+                                      # is the only way in).
+                                      # Known-accept: per-part loud lines now INTERLEAVE on stderr
+                                      # (nothing parses them, and --check* never loads the world);
+                                      # the ring-ordered island summary still doesn't. MEASURED
+                                      # (7950X3D, all 5 OBJ sidecars warm): load+merge 6.8 -> 4.6
+                                      # s, whole cold-world boot 15.3 -> 13.5 s, and the
+                                      # regenerated world.fcache BYTE-IDENTICAL — the determinism
+                                      # gate (identical merge, id assignment, ring layout, world
+                                      # BVH). The floor is the SLOWEST SINGLE ISLAND (bistro,
+                                      # ~4.7 s of texture decode), so any further win lives INSIDE
+                                      # a part, not in more fan-out.
+                                      # MEMORY, measured the same config (`--cinematic
+                                      # --cinematic-dry-run --cpu` returns AFTER the load and
+                                      # BEFORE any render, and --cpu keeps the GPU BC7/BLAS spike
+                                      # out of the sample; 100 ms working-set sampler): peak
+                                      # 9.49 -> 10.13 GB, +6.7%. BOTH arms peak INSIDE THE LOAD
+                                      # (t=3.9 s sequential, 3.0 s parallel of a ~5-6 s load), NOT
+                                      # in the merge/world-BVH/sidecar phase after it, which tops
+                                      # out ~9.1 GB either way. Read the cost against the SAME
+                                      # RUN's post-fan-out resident floor — 7.86 GB, arm-
+                                      # independent (it IS the merged parts): transient headroom
+                                      # 1.63 -> 2.27 GB, +39%. So concurrent transients DO sum
+                                      # where sequential ones only had to max, but the resident
+                                      # floor dominates both, which is why the process ceiling
+                                      # moves 6.7% and not a multiple — the pre-measurement guess
+                                      # that this was a "sum not max" blow-up was wrong by an
+                                      # order of magnitude, and the n2h pool being process-wide is
+                                      # a large part of why. TRAP: a naive whole-process peak
+                                      # sampler carries ~1 GB of run-to-run noise (seq 9.6/10.7,
+                                      # par 10.3/9.9 — the arms OVERLAP and "measure" no effect at
+                                      # all), which swamps the 0.64 GB signal; difference against
+                                      # the same run's own baseline, never across runs
                                       # — and the flycam gains per-island TOD
                                       # ATTRACTORS: flying toward an island eases the GLOBAL tod
                                       # toward its theme hour at the manual-scrub rate (circular

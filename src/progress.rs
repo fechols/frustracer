@@ -89,10 +89,57 @@ static STAGE_DONE: AtomicU32 = AtomicU32::new(0);
 static STAGE_TOTAL: AtomicU32 = AtomicU32::new(0);
 static STAGE: Mutex<String> = Mutex::new(String::new());
 static DETAIL: Mutex<String> = Mutex::new(String::new());
+/// Set while several scenes load AT ONCE (the world loader's parallel
+/// per-island block). The inner phase row's counters then come from whichever
+/// part published last, so a fraction built from them would MIX PARTS and run
+/// backwards on screen. Under this flag `phase()` keeps the LABEL — still
+/// honest, it names whatever step some part is in — but forces the row
+/// INDETERMINATE and leaves the DETAIL the caller set on entry, so the row
+/// reads "decoding textures — 7 islands at once" over a marquee. The one
+/// truthful fraction during the fan-out is then the STAGE row, which
+/// `stage_done` advances once per FINISHED island.
+static MULTI: AtomicBool = AtomicBool::new(false);
 
 /// Arm the sink. Interactive-only — see the module note. Idempotent.
 pub fn activate() {
     ACTIVE.store(true, Relaxed);
+}
+
+/// Enter/leave concurrent-load mode. PRIVATE on purpose — `multi_guard()` is
+/// the only way in, so the leave can never be skipped (see `MultiGuard`).
+/// Leaving also clears the counters the concurrent phases left behind, so the
+/// next sequential `phase()` starts from a clean row.
+fn set_multi(on: bool) {
+    MULTI.store(on, Relaxed);
+    if !on {
+        DONE.store(0, Relaxed);
+        TOTAL.store(0, Relaxed);
+    }
+}
+
+/// Scope handle for concurrent-load mode: hold one across a parallel load
+/// block and leaving the scope — by RETURN OR PANIC — restores sequential
+/// publishing. A plain set/clear pair was written first and rejected: the
+/// clear sat after the `collect()` that PROPAGATES a worker's panic, so a
+/// failed island load would have left this process-global armed for whatever
+/// published next. Today that is unobservable (the scene-load thread's panic
+/// is caught by `worker.join()` in `run_window`, which exits), but the flag's
+/// reset should not rest on the happy path plus a caller two modules away.
+/// Deliberately NOT re-entrant — one fan-out is live at a time, and a nested
+/// guard would clear the flag at the INNER drop.
+pub struct MultiGuard(());
+
+impl Drop for MultiGuard {
+    fn drop(&mut self) {
+        set_multi(false);
+    }
+}
+
+/// Enter concurrent-load mode until the returned guard drops.
+#[must_use = "multi mode ends when the guard drops — bind it to a named local"]
+pub fn multi_guard() -> MultiGuard {
+    set_multi(true);
+    MultiGuard(())
 }
 
 /// True once `activate()` has run. Publishers gate on this so an inactive
@@ -102,8 +149,9 @@ pub fn active() -> bool {
     ACTIVE.load(Relaxed)
 }
 
-/// Set the outer stage row: "step `i` of `n` — `name`" (1-based `i`). Used by
-/// the world loader's per-island loop; a single-scene load leaves it unset.
+/// ARM the outer stage row: `i` done out of `n`, labelled `name`. The world
+/// loader arms it at `(0, n, "")` and then lets `stage_done` count; a
+/// single-scene load leaves the row unset.
 pub fn stage(i: u32, n: u32, name: &str) {
     if !active() {
         return;
@@ -116,18 +164,42 @@ pub fn stage(i: u32, n: u32, name: &str) {
     }
 }
 
+/// Count one island DONE against the stage row, and name the finisher. The
+/// world loader's per-island loads run CONCURRENTLY, so "step i of n, now
+/// starting X" has no referent — the honest reading is a completion count plus
+/// whatever just landed, which is exactly what the HUD's "{done} / {total}
+/// {name}" row then says. Called from rayon workers: the count is a relaxed
+/// fetch_add and the name a short `Mutex` write, the `tick()` discipline.
+pub fn stage_done(name: &str) {
+    if !active() {
+        return;
+    }
+    STAGE_DONE.fetch_add(1, Relaxed);
+    if let Ok(mut s) = STAGE.lock() {
+        s.clear();
+        s.push_str(name);
+    }
+}
+
 /// Enter a sub-phase. `total == 0` means indeterminate (the UI shows a marquee
 /// instead of a fraction). Resets the `DONE` counter that `tick()` advances.
+///
+/// Under a live `multi_guard` the label still lands, but `total` is forced to
+/// 0 and the detail is left alone — see `MULTI` for why a fraction is a lie
+/// there.
 pub fn phase(p: Phase, detail: &str, total: u32) {
     if !active() {
         return;
     }
+    let multi = MULTI.load(Relaxed);
     PHASE.store(p.as_u32(), Relaxed);
     DONE.store(0, Relaxed);
-    TOTAL.store(total, Relaxed);
-    if let Ok(mut d) = DETAIL.lock() {
-        d.clear();
-        d.push_str(detail);
+    TOTAL.store(if multi { 0 } else { total }, Relaxed);
+    if !multi {
+        if let Ok(mut d) = DETAIL.lock() {
+            d.clear();
+            d.push_str(detail);
+        }
     }
 }
 
@@ -192,8 +264,12 @@ pub fn self_test() -> Result<(), String> {
     if active() {
         return Err("progress sink already active in a headless run".into());
     }
+    if MULTI.load(Relaxed) {
+        return Err("progress sink left in multi mode".into());
+    }
     phase(Phase::Bvh, "should be ignored", 10);
     stage(3, 7, "ignored");
+    stage_done("ignored");
     tick();
     if snapshot().is_some() {
         return Err("inactive sink produced a snapshot".into());
@@ -242,8 +318,40 @@ pub fn self_test() -> Result<(), String> {
     tick();
     tick();
     let ok = snapshot().is_some_and(|s| s.done == 2 && s.total == 4 && (s.frac - 0.5).abs() < 1e-6);
+
+    // The stage row COUNTS completions: arm at 0/n, then one bump per island,
+    // and the row names whichever finished last (the parallel contract).
+    stage(0, 7, "");
+    stage_done("alpha");
+    stage_done("beta");
+    let ok_stage = snapshot()
+        .is_some_and(|s| s.stage_done == 2 && s.stage_total == 7 && s.stage_name == "beta");
+
+    // Multi mode: a concurrent part's `phase()` may set the label but must NOT
+    // publish a fraction (it would mix parts) nor overwrite the detail the
+    // fan-out set on entry. `-1.0` is the HUD's marquee case. The call order
+    // mirrors world.rs's: the fan-out sets its detail, THEN arms multi — and
+    // it arms it through the GUARD, so the shipped entry/leave path is what
+    // gets tested rather than a hand-written pair of stores.
+    phase(Phase::Parse, "7 islands at once", 0);
+    let ok_multi = {
+        let _multi = multi_guard();
+        phase(Phase::Textures, "some part's detail", 4);
+        snapshot().is_some_and(|s| {
+            s.total == 0
+                && s.frac < 0.0
+                && s.detail == "7 islands at once"
+                && s.phase_label == label(Phase::Textures)
+        })
+    };
+    // The guard's drop left multi mode and cleared the counters the concurrent
+    // phases left behind.
+    let ok_multi_off =
+        !MULTI.load(Relaxed) && snapshot().is_some_and(|s| s.done == 0 && s.total == 0);
+
     // Restore inactive + clear the counters we dirtied.
     ACTIVE.store(false, Relaxed);
+    MULTI.store(false, Relaxed);
     PHASE.store(0, Relaxed);
     DONE.store(0, Relaxed);
     TOTAL.store(0, Relaxed);
@@ -257,6 +365,15 @@ pub fn self_test() -> Result<(), String> {
     }
     if !ok {
         return Err("active tick/fraction did not track".into());
+    }
+    if !ok_stage {
+        return Err("stage_done did not count completions".into());
+    }
+    if !ok_multi {
+        return Err("multi-mode phase published a fraction or clobbered the detail".into());
+    }
+    if !ok_multi_off {
+        return Err("leaving multi mode left the phase counters dirty".into());
     }
     Ok(())
 }

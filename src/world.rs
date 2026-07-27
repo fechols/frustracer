@@ -499,19 +499,60 @@ pub fn world_scene() -> Option<(Scene, World, crate::bvh::Bvh)> {
         return Some((sc, world, bvh));
     }
     eprintln!("world: rebuilding — {} miss/stale", cache_path.display());
-    let mut parts: Vec<(&IslandSpec, Scene, LoadKind)> = Vec::new();
-    // The outer STAGE row tracks islands (i / n); each load_part publishes its
-    // own inner phases (parse, textures, per-island BVH).
+    // Per-island loads run CONCURRENTLY. `load_part` is a pure producer of an
+    // OWNED Scene: both loaders return one, material/texture ids are
+    // per-SceneBuilder counters (never global), no loader draws rng, and every
+    // loader lever (texture::set_mips/set_aniso/set_h2n/set_n2h,
+    // scene::set_spray/set_water/…, bvh::set_height_armed) was stored ONCE in
+    // main's apply block BEFORE any load and is only read from here on.
+    //
+    // The fan-out rides the GLOBAL rayon pool deliberately. A pool of its own
+    // — the obvious way to bound concurrency — would be INHERITED by every
+    // inner par_iter (texture decode, the n2h solve, Bvh::build) through
+    // `install`, narrowing the passes that already do the real parallel work;
+    // that costs far more than the fan-out wins. The one place memory would
+    // genuinely multiply is the n2h solve, and that is bounded structurally
+    // instead, by scene.rs's shared `n2h_pool`.
+    //
+    // Determinism: `probes.par_iter()` is an INDEXED iterator, so map+collect
+    // writes slot i from item i — positional order is a type-level property
+    // here, not a reliance on collect's ordering lore (which is why this is
+    // Vec<Option<_>> + flatten rather than filter_map). Ring order then comes
+    // from the theme-hour sort below, which self_test pins as a STRICT order,
+    // so it can never fall through to whatever order the loads finished in.
+    // `with_max_len(1)` is the per-item idiom the decode sites already use:
+    // one task per island, so the 12.8M-tri part never queues behind another.
+    //
+    // Cost: the per-part loud lines (obj materials, heightfield, spray, cache
+    // hit/write) now INTERLEAVE on stderr. Nothing parses them, and the
+    // readable per-island summary is the ring-ordered block below.
     let n_present = probes.iter().filter(|(_, r)| r.is_some()).count() as u32;
-    let mut loaded_idx = 0u32;
-    for (spec, resolved) in &probes {
-        if let Some(res) = resolved {
-            loaded_idx += 1;
-            crate::progress::stage(loaded_idx, n_present, spec.name);
-            let (s, kind) = load_part(res);
-            parts.push((spec, s, kind));
-        }
-    }
+    // One STAGE row over the whole fan-out — a COMPLETION count, not "now
+    // starting i", which has no referent when N loads are in flight. The inner
+    // phase row goes indeterminate for the duration (see progress::MultiGuard,
+    // whose drop is what restores sequential publishing — including when a
+    // worker's panic propagates out of the `collect()` below).
+    crate::progress::stage(0, n_present, "");
+    crate::progress::phase(
+        crate::progress::Phase::Parse,
+        &format!("{n_present} islands at once"),
+        0,
+    );
+    let loaded: Vec<Option<(&IslandSpec, Scene, LoadKind)>> = {
+        use rayon::prelude::*;
+        let _multi = crate::progress::multi_guard();
+        probes
+            .par_iter()
+            .with_max_len(1)
+            .map(|(spec, resolved)| {
+                let res = resolved.as_ref()?;
+                let (s, kind) = load_part(res);
+                crate::progress::stage_done(spec.name);
+                Some((*spec, s, kind))
+            })
+            .collect()
+    };
+    let mut parts: Vec<(&IslandSpec, Scene, LoadKind)> = loaded.into_iter().flatten().collect();
     // Hour order = ring order (the table is already sorted; the sort makes
     // that a property, not a convention).
     parts.sort_by(|a, b| a.0.theme_hour.total_cmp(&b.0.theme_hour));
@@ -641,10 +682,80 @@ fn test_part(n_tex: u32, albedo_tex: u32, normal_tex: u32) -> Scene {
     b.finish(scene::default_sun())
 }
 
+/// The two table properties the PARALLEL per-island load rests on.
+///
+/// (1) STRICTLY INCREASING theme hours make `world_scene`'s ring sort a TOTAL
+/// order, so a stable sort can never fall through to whatever order the
+/// concurrent collect produced. (2) NO TWO ENTRIES MAY NAME ONE SIDECAR:
+/// concurrent loads mean concurrent `scene_cache::store` calls, and that tmp
+/// name is pid-suffixed — which separates PROCESSES, not two entries inside
+/// one process resolving to the same file.
+///
+/// (2) is checked on the RESOLVED form, which is where the collision would
+/// land (`probe_part` resolves, and `store`'s tmp name derives from the
+/// resolved path). Comparing the raw `path` strings would MISS the one
+/// aliasing this table can express: `scene::resolve_scene_path` maps `p` to
+/// `p.zst` when `p` is absent AND NOTHING ELSE, so two entries resolve to one
+/// file iff their paths are equal after stripping a single trailing `.zst` —
+/// an `x.obj` entry alongside an `x.obj.zst` entry are distinct strings that
+/// name the same sidecar. Stripping keeps this a pure function of the table;
+/// calling the real resolver would make the gate depend on which files happen
+/// to be materialized.
+///
+/// Takes a SLICE rather than reading `CURATED` directly so `self_test` can
+/// prove both checks FIRE. A gate that only ever sees the real (correct)
+/// table passes whether or not it means anything, and the `.zst` case is one
+/// no real table exercises.
+fn check_table(t: &[IslandSpec]) -> Result<(), String> {
+    for i in 1..t.len() {
+        if !(t[i].theme_hour > t[i - 1].theme_hour) {
+            return Err(format!(
+                "theme hours must strictly increase: '{}' {} follows '{}' {}",
+                t[i].name,
+                t[i].theme_hour,
+                t[i - 1].name,
+                t[i - 1].theme_hour
+            ));
+        }
+    }
+    let unzst = |p: &str| p.strip_suffix(".zst").unwrap_or(p).to_string();
+    for i in 0..t.len() {
+        for j in (i + 1)..t.len() {
+            if unzst(t[i].path) == unzst(t[j].path) {
+                return Err(format!(
+                    "path aliased at {i}/{j}: '{}' and '{}' resolve to one sidecar",
+                    t[i].path, t[j].path
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn self_test() -> Result<(), String> {
     let gv = scene::GROUND_VERTS;
     let gt = scene::GROUND_TRIS;
     let err = |m: String| Err(m);
+
+    // --- CURATED: the two properties the PARALLEL per-island load rests on,
+    // plus the TEETH proving each check fires (see `check_table`).
+    check_table(CURATED)?;
+    let spec = |path: &'static str, hour: f32| IslandSpec { name: "t", path, theme_hour: hour, mtris: 0.0 };
+    let must_fail = |what: &str, t: &[IslandSpec]| match check_table(t) {
+        Err(_) => Ok(()),
+        Ok(()) => Err(format!("CURATED table gate did not fire on {what}")),
+    };
+    must_fail("equal hours", &[spec("a.obj", 1.0), spec("b.obj", 1.0)])?;
+    must_fail("decreasing hours", &[spec("a.obj", 2.0), spec("b.obj", 1.0)])?;
+    must_fail("an identical path", &[spec("a.obj", 1.0), spec("a.obj", 2.0)])?;
+    // THE case no real table can exercise, and the whole reason the check
+    // strips before comparing: two DISTINCT strings naming one sidecar.
+    must_fail(".zst sibling aliasing", &[spec("a.obj", 1.0), spec("a.obj.zst", 2.0)])?;
+    must_fail(".zst sibling aliasing (reversed)", &[spec("a.obj.zst", 1.0), spec("a.obj", 2.0)])?;
+    // ...and the near-misses it must NOT fire on, or the strip is too eager.
+    check_table(&[spec("a.obj", 1.0), spec("ab.obj", 2.0)])?;
+    check_table(&[spec("a.obj.zst", 1.0), spec("b.obj.zst", 2.0)])?;
+    check_table(&[spec("a.zst", 1.0), spec("a.obj", 2.0)])?;
 
     // --- ring_layout: determinism, disjointness, single-island centering.
     for n in 1..=8usize {

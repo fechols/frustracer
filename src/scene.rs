@@ -487,6 +487,37 @@ impl SceneBuilder {
     }
 }
 
+/// Solve-width cap for the n2h heightfield derivation: one 4K Frankot–
+/// Chellappa solve holds ~0.5 GB of complex scratch, so the full rayon width
+/// would spike memory on 4K-heavy scenes.
+const N2H_POOL_MAX: usize = 8;
+
+/// The n2h solver's ONE shared, bounded pool. The cap has to be PROCESS-WIDE,
+/// not per call: the world loader runs several islands' loads at once
+/// (`world.rs`), and a fresh pool per `derive_heights` would multiply the
+/// memory bound by the number of in-flight parts — 5 x 8 concurrent 4K solves
+/// is exactly what the cap exists to prevent. `install` from any number of
+/// callers queues into this one pool, so the ceiling is `N2H_POOL_MAX` solves
+/// in flight no matter how many scenes are loading.
+///
+/// No wait cycle exists: `apply_n2h` -> `n2h_solve` -> `build_mips` is
+/// straight-line sequential and never submits back into the global pool, so a
+/// global worker blocked in `install` here is only parked, never deadlocked.
+/// Lazy — a session that derives no heights builds no pool; after first use
+/// `N2H_POOL_MAX` idle threads live for the process, which is the only
+/// observable difference on the single-scene path.
+fn n2h_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let workers = rayon::current_num_threads().min(N2H_POOL_MAX);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .build()
+            .ok()
+    })
+    .as_ref()
+}
+
 /// Post-load heightfield derivation, shared by the OBJ and glTF loaders
 /// (COLD loads only — run before `scene_cache::store`, so the per-texture
 /// `n2h` flags and the materials' `height_amp` persist; warm loads re-apply
@@ -522,9 +553,8 @@ pub fn derive_heights(scene: &mut Scene) {
     let t0 = std::time::Instant::now();
     let amps: std::collections::HashMap<u32, f32> = {
         use rayon::prelude::*;
-        // Bounded pool: one 4K solve holds ~0.5 GB of complex scratch, so
-        // the full rayon width would spike memory on 4K-heavy scenes.
-        let workers = rayon::current_num_threads().min(8);
+        // Bounded pool — see `n2h_pool`: the cap is shared process-wide so
+        // concurrent island loads can't multiply it.
         let mut run = || {
             scene
                 .textures
@@ -538,9 +568,9 @@ pub fn derive_heights(scene: &mut Scene) {
                 })
                 .collect()
         };
-        match rayon::ThreadPoolBuilder::new().num_threads(workers).build() {
-            Ok(pool) => pool.install(run),
-            Err(_) => run(),
+        match n2h_pool() {
+            Some(pool) => pool.install(run),
+            None => run(),
         }
     };
     let (mut n_mats, mut amp_max) = (0u32, 0.0f32);
