@@ -1414,6 +1414,15 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
                 break;
             }
 
+            // A mistyped long flag must not fall through to the positional
+            // scene argument: `--preferIntel` used to reach the OBJ loader and
+            // panic there ("failed to load OBJ '--preferIntel'"), which reads
+            // as a renderer crash rather than a typo. Scene paths never start
+            // with `--`, so this arm costs nothing legitimate.
+            a if a.starts_with("--") => {
+                eprintln!("unknown flag '{a}' — run --help for the flag list");
+                std::process::exit(2);
+            }
             _ => obj = Some(a),
         }
     }

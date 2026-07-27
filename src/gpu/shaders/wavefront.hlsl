@@ -17,6 +17,13 @@ StructuredBuffer<uint> ft_bnode : register(t1);
 #endif
 
 // --- seed: reset counters + cut pool bump, enqueue the whole-screen root ---
+//
+// push0 = 1 suppresses the root ENQUEUE only (the counter reset and the
+// degenerate-window leaf still run, and the work-graph arm depends on both).
+// A graph takes its root as CPU input, so a queued one would never be
+// consumed and CTR_TILE_A would sit at 1 for the whole frame — a dangling
+// tile record that `--check-gpu`'s depth accounting reports, and which its
+// parity-selected counter would hide at odd depth_full and expose at even.
 
 [numthreads(1, 1, 1)]
 void cs_seed(uint3 id : SV_DispatchThreadID) {
@@ -33,6 +40,7 @@ void cs_seed(uint3 id : SV_DispatchThreadID) {
         counters[CTR_LEAF] = 1;
         return;
     }
+    if (push0 != 0u) return; // the caller supplies its own root (work graph)
     TileRec root;
     root.xy0 = pack_xy(0, 0);
     root.xy1 = pack_xy(rw, rh);
@@ -170,12 +178,78 @@ void cs_seed_probes(uint3 id : SV_DispatchThreadID) {
 groupshared uint gw_len[2];
 groupshared uint gw_best;
 
+// WAVE-AGGREGATED SHARED-MEMORY TRAFFIC (revert: FR_ABL=nowave).
+//
+// Both primitives below used to be one LDS atomic PER LANE PER CANDIDATE. In
+// the FTREE round that is up to 8 per lane (the unrolled slot loop), so a
+// 32-lane group could issue ~256 atomics to ONE address per BFS round. Intel's
+// RT developer guide (v4, p.26) prescribes exactly this fix — "keep data within
+// a wave and use wave intrinsics instead of barriers", accumulating in
+// registers and combining with a wave op — and it matters more on Intel than
+// elsewhere, because groupshared is carved out of the same L1 that services the
+// RT unit. Measured on an Arc Pro B70: `cs_level_wide`'s 32-thread group is
+// EXACTLY ONE WAVE (WaveGetLaneCount() == 32 at every group width we dispatch),
+// so this collapses to a single atomic.
+//
+// WHY THIS IS NOT A BEHAVIOUR CHANGE. Both helpers are called at the SAME
+// program points as the per-lane atomics they replace, and lanes of one wave
+// reach a given point together, so the aggregate is over exactly the lanes that
+// would have raced there anyway. `best` is an order-independent min and the
+// queue is a SET whose slot assignment order was already unspecified (the old
+// atomics raced), so only cross-WAVE interleaving changes — and on a group that
+// is one wave, nothing does. Counted frustum nodes may still move where a group
+// spans several waves; the image may not. Same contract as WIDE_LEVELS.
+//
+// CALL THEM UNCONDITIONALLY. Each takes a participation flag rather than
+// sitting inside an `if`, so the wave op is never reached by a subset of lanes
+// that a later edit might change. Non-participants carry an identity.
+
 // float-min via InterlockedMin on the IEEE bit pattern: exact for NON-NEGATIVE
 // finite floats, whose bit patterns order exactly as their values. Every
 // candidate here is `max(distance, t_start) >= 0` or the FLT_MAX seed.
-void gw_min(float d) {
-    uint prev;
-    InterlockedMin(gw_best, asuint(d), prev);
+// Bit-domain core. 0xFFFFFFFF is the "no contribution" identity — it is above
+// asuint(FLT_MAX), and no real candidate can collide with it because every one
+// is a non-negative finite float (0xFFFFFFFF is -NaN). Callers that accumulate
+// across several candidates use this directly rather than round-tripping the
+// accumulator through asfloat(), which would put a NaN bit pattern in a float
+// register where hardware is permitted to canonicalise it.
+void gw_min_bits(uint v) {
+#if defined(ABL_NO_WAVE_OPS)
+    if (v != 0xFFFFFFFFu) {
+        uint prev;
+        InterlockedMin(gw_best, v, prev);
+    }
+#else
+    uint m = WaveActiveMin(v);
+    if (WaveIsFirstLane() && m != 0xFFFFFFFFu) {
+        uint prev;
+        InterlockedMin(gw_best, m, prev);
+    }
+#endif
+}
+
+void gw_min_if(bool take, float d) { gw_min_bits(take ? asuint(d) : 0xFFFFFFFFu); }
+
+// Reserve `n` frontier slots for this lane (n == 0 participates but takes
+// nothing). Returns the lane's base offset.
+//
+// The PARITY INVARIANT the binary path depends on survives: its callers pass
+// n == 2, so every prefix sum is even and the wave's own base comes from an
+// even total added to an even counter — accepted offsets stay even exactly as
+// they did when each lane added 2 on its own.
+uint gw_alloc(uint slot, uint n) {
+#if defined(ABL_NO_WAVE_OPS)
+    uint w = 0;
+    if (n != 0) InterlockedAdd(gw_len[slot], n, w);
+    return w;
+#else
+    uint pre = WavePrefixSum(n);
+    uint sum = WaveActiveSum(n);
+    uint base = 0;
+    if (WaveIsFirstLane() && sum != 0) InterlockedAdd(gw_len[slot], sum, base);
+    // Only the first lane's `base` is meaningful; broadcast it to the wave.
+    return WaveReadLaneFirst(base) + pre;
+#endif
 }
 
 float bound_query_wave(TF f, float t_start, float t_limit, uint cut_slot, uint cut_len, uint tid) {
@@ -192,18 +266,21 @@ float bound_query_wave(TF f, float t_start, float t_limit, uint cut_slot, uint c
     for (uint r = tid; r < n0; r += 32u) {
         uint e = cut_slot == ROOT_CUT_SLOT ? r : cut_pool[cut_slot * 64u + r];
         FtNode nd = ft_nodes[e >> 3];
+        // `d` is 0-initialised by ft_slot on every early-out, so it is safe to
+        // read on the non-participating path below.
         float d;
-        if (!ft_slot(f, nd, e & 7u, t_start, d) || d >= asfloat(gw_best)) continue;
+        bool live = ft_slot(f, nd, e & 7u, t_start, d) && d < asfloat(gw_best);
         uint c = nd.child[e & 7u];
-        if (c == FT_INVALID) { gw_min(d); continue; } // terminal: a leaf's box
-        uint w;
-        InterlockedAdd(gw_len[0], 1u, w);
-        if (w < WQ_CAP) g_stack[w] = c; else gw_min(d);
+        bool push = live && c != FT_INVALID;      // internal: goes on the frontier
+        uint w = gw_alloc(0, push ? 1u : 0u);
+        bool over = push && w >= WQ_CAP;
+        if (push && !over) g_stack[w] = c;
+        // Terminal (a leaf's box) or frontier-full: fold in as a coarse bound.
+        gw_min_if(live && (!push || over), d);
     }
 #else
     for (uint r = tid; r < cut_len; r += 32u) {
-        uint w;
-        InterlockedAdd(gw_len[0], 1u, w);
+        uint w = gw_alloc(0, 1u);
         if (w < WQ_CAP) g_stack[w] = cut_node(cut_slot, r);
     }
 #endif
@@ -222,35 +299,64 @@ float bound_query_wave(TF f, float t_start, float t_limit, uint cut_slot, uint c
             uint idx = g_stack[bin + i];
 #ifdef FTREE
             FtNode nd = ft_nodes[idx];
+            // TWO PASSES, so a node costs ONE aggregated allocation and ONE
+            // aggregated min instead of eight of each. Pass 1 classifies the 8
+            // slots into a bitmask and a per-lane running min; pass 2 writes
+            // the survivors at base + rank.
+            //
+            // `kid[]` and `dist[]` are indexed only by the UNROLLED loop
+            // counter, so every access has a compile-time index and the arrays
+            // stay in registers. That is the same rule ft_expand's selection
+            // scan follows — what it measured at +58% was a DYNAMIC shuffle
+            // index demoting them to scratch, which is why `rank` below is a
+            // popcount of a mask rather than a running counter into an array.
+            uint push_mask = 0u;
+            uint kid[8];
+            float dist[8];
+            uint bl = 0xFFFFFFFFu;          // identity: above asuint(FLT_MAX)
             [unroll] for (uint s = 0; s < 8; ++s) {
                 float d;
-                if (!ft_slot(f, nd, s, t_start, d) || d >= asfloat(gw_best)) continue;
+                bool live = ft_slot(f, nd, s, t_start, d) && d < asfloat(gw_best);
                 uint c = nd.child[s];
-                if (c == FT_INVALID) { gw_min(d); continue; }
-                uint w;
-                InterlockedAdd(gw_len[1u - cur], 1u, w);
-                if (w < WQ_CAP) g_stack[bout + w] = c; else gw_min(d);
+                bool push = live && c != FT_INVALID;
+                kid[s] = c;
+                dist[s] = d;
+                if (push) push_mask |= (1u << s);
+                // Terminal (a leaf's box): fold in now. An overflowing survivor
+                // is folded in by pass 2 instead.
+                if (live && !push) bl = min(bl, asuint(d));
             }
+            uint base = gw_alloc(1u - cur, countbits(push_mask));
+            [unroll] for (uint s2 = 0; s2 < 8; ++s2) {
+                if ((push_mask & (1u << s2)) == 0) continue;
+                // Rank among THIS lane's survivors — a popcount of the bits
+                // below s2, so no array is indexed dynamically.
+                uint w = base + countbits(push_mask & ((1u << s2) - 1u));
+                if (w < WQ_CAP) g_stack[bout + w] = kid[s2];
+                else bl = min(bl, asuint(dist[s2]));
+            }
+            gw_min_bits(bl);
 #else
             BvhNode node = bvh_nodes[idx];
-            if (aabb_outside(f, node.mn, node.mx)) continue;
-            if (point_aabb_max_dist(f.origin, node.mn, node.mx) <= t_start) continue;
-            float d = max(point_aabb_dist(f.origin, node.mn, node.mx), t_start);
-            if (d >= asfloat(gw_best)) continue;
-            if (node.count > 0) { gw_min(d); continue; }
-            uint w;
-            InterlockedAdd(gw_len[1u - cur], 2u, w);
+            // Flattened from three `continue`s so the wave ops below are
+            // reached by every lane in this iteration (see the helper header).
+            bool live = !aabb_outside(f, node.mn, node.mx)
+                     && point_aabb_max_dist(f.origin, node.mn, node.mx) > t_start;
+            float d = live ? max(point_aabb_dist(f.origin, node.mn, node.mx), t_start) : 0.0;
+            live = live && d < asfloat(gw_best);
+            bool inner = live && node.count == 0;
             // Adds are all +2 from a zeroed base, so accepted w are even and
             // slots [0, WQ_CAP) are fully written whenever the clamp bites.
-            if (w + 1u < WQ_CAP) {
+            uint w = gw_alloc(1u - cur, inner ? 2u : 0u);
+            bool over = inner && (w + 1u >= WQ_CAP);
+            if (inner && !over) {
                 g_stack[bout + w] = node.left_first;
                 g_stack[bout + w + 1u] = node.left_first + 1u;
-            } else {
-                // Frontier full: take this node's own distance as if it were a
-                // leaf — a valid lower bound for everything inside it. The
-                // serial path's stack-pressure fallback, verbatim.
-                gw_min(d);
             }
+            // A leaf, or frontier full: take this node's own distance as if it
+            // were a leaf — a valid lower bound for everything inside it. The
+            // serial path's stack-pressure fallback, verbatim.
+            gw_min_if(live && (!inner || over), d);
 #endif
         }
         GroupMemoryBarrierWithGroupSync();
@@ -271,13 +377,48 @@ float bound_query_wave(TF f, float t_start, float t_limit, uint cut_slot, uint c
 // per-thread and per-group flavors so the two can never drift apart; only the
 // bound query differs, and `lane` says which g_stack slab refine_cut owns.
 
+// ctr_add / ctr_bump (the global-counter twins of gw_alloc/gw_min_if) live in
+// ctr.hlsli beside `counters`, because leaf.hlsl aggregates its per-pixel
+// hemi-point counter with the same primitives. This composes with — and does
+// not replace — the HOMOGENEOUS-BATCH treatment below, which already folds a
+// tile's own 4 quadrants into 1: together, 4 x 32 becomes 1. Called from
+// `cs_level_wide` they run with a single active lane (level_finish is lane 0's
+// job there), which is correct and simply buys nothing.
+#if defined(WORKGRAPH)
+// WORK-GRAPH ARM (FR_WORKGRAPH=1). Everything except the TILE children is
+// unchanged: sky and leaf records still go to their UAV queues through the same
+// counters, and the cut pool is still bump-allocated here — only `qout`/`push1`
+// have no meaning, because a graph node hands its children to the scheduler
+// instead of to a ping-pong queue. (The ping-pong is precisely what a graph
+// breaks: it assumes levels SERIALISE, and the whole point of the graph is that
+// they do not.)
+//
+// Children come back as a 4-slot array plus a live MASK rather than a packed
+// list, so every write is `wg_kids[c]` under an unrolled loop counter — a
+// compile-time index. A running `wg_kids[n++]` would be a dynamic index and
+// would demote the array to scratch, the +58% ft_expand lesson. The caller
+// compacts with a popcount rank.
+void level_finish(TileRec rec, uint2 p0, uint2 p1, uint depth, uint cut_len, TF f,
+                  float best, uint lane, out TileRec wg_kids[4], out uint wg_mask) {
+    wg_mask = 0u;
+    // Fully initialise: HLSL `out` parameters are undefined on paths that do
+    // not write them, and the caller reads slots by mask.
+    [unroll] for (uint wi = 0; wi < 4; ++wi) {
+        TileRec z;
+        z.xy0 = 0; z.xy1 = 0; z.t_start = 0.0;
+        z.cut_slot = ROOT_CUT_SLOT; z.meta = 0; z.path = 0;
+        wg_kids[wi] = z;
+    }
+    uint s;
+#else
 void level_finish(TileRec rec, uint2 p0, uint2 p1, uint depth, uint cut_len, TF f,
                   float best, uint lane) {
     uint s;
+#endif
     if (best == FLT_MAX) {
         // Sky: the whole frustum (beyond the inherited ball, which the
         // ancestor claim covers) is empty.
-        InterlockedAdd(counters[CTR_SKY], 1, s);
+        s = ctr_add(CTR_SKY, 1u);
         if (s < cap_sky) {
             SkyRec sky;
             sky.xy0 = rec.xy0;
@@ -294,12 +435,11 @@ void level_finish(TileRec rec, uint2 p0, uint2 p1, uint depth, uint cut_len, TF 
     // frustum.rs::advance_tc — the shared advance/slack rule.
     bool advanced = best > rec.t_start + max(rec.t_start * 1e-4, SCENE_EPS);
     float tc = advanced ? max(best * (1.0 - 1e-4), rec.t_start) : rec.t_start;
-    if (!advanced) {
-        // Blocked at the inherited distance — still subdivide (children's
-        // smaller frustums may exclude the blocker; that is how sky emerges).
-        InterlockedAdd(counters[CTR_BLOCKED], 1, s);
-    }
-    InterlockedAdd(counters[CTR_SPLIT], 1, s);
+    // Blocked at the inherited distance — still subdivide (children's smaller
+    // frustums may exclude the blocker; that is how sky emerges). Hoisted out
+    // of the `if` so the whole wave reaches the reduction.
+    ctr_bump(CTR_BLOCKED, !advanced);
+    ctr_bump(CTR_SPLIT, true);
 
 #if !defined(SW_RAYS_LEAF) && !defined(ABL_KEEP_TERMINAL_CUT)
     // The final split has no TileRec children, so its refined cut has no
@@ -327,8 +467,7 @@ void level_finish(TileRec rec, uint2 p0, uint2 p1, uint depth, uint cut_len, TF 
         [unroll] for (uint lc = 0; lc < 4; ++lc) {
             if (lx0[lc] != lx1[lc] && ly0[lc] != ly1[lc]) live_count++;
         }
-        uint leaf_base;
-        InterlockedAdd(counters[CTR_LEAF], live_count, leaf_base);
+        uint leaf_base = ctr_add(CTR_LEAF, live_count);
         uint live_rank = 0u;
         [unroll] for (uint lc = 0; lc < 4; ++lc) {
             if (lx0[lc] == lx1[lc] || ly0[lc] == ly1[lc]) continue;
@@ -373,8 +512,7 @@ void level_finish(TileRec rec, uint2 p0, uint2 p1, uint depth, uint cut_len, TF 
     // Refine the cut into a fresh pool slot; on pool exhaustion the children
     // inherit the PARENT's slot — an ancestor cut is valid for any descendant
     // frustum (coarse, never wrong) — the refine_cut coarse-emit analog.
-    uint out_slot;
-    InterlockedAdd(counters[CTR_CUT], 1, out_slot);
+    uint out_slot = ctr_add(CTR_CUT, 1u);
     uint out_len = 0;
     if (out_slot < cap_cut) {
         out_len = refine_cut(f, tc, FLT_MAX, rec.cut_slot, cut_len, out_slot, lane);
@@ -451,8 +589,7 @@ void level_finish(TileRec rec, uint2 p0, uint2 p1, uint depth, uint cut_len, TF 
         if (bw <= LEAF_TILE && bh <= LEAF_TILE) leaf_children++;
     }
     if (live_children != 0u && leaf_children == live_children) {
-        uint leaf_base;
-        InterlockedAdd(counters[CTR_LEAF], live_children, leaf_base);
+        uint leaf_base = ctr_add(CTR_LEAF, live_children);
         uint live_rank = 0u;
         [unroll] for (uint bc = 0; bc < 4; ++bc) {
             uint bw = cx1[bc] - cx0[bc];
@@ -473,9 +610,13 @@ void level_finish(TileRec rec, uint2 p0, uint2 p1, uint depth, uint cut_len, TF 
         }
         return;
     }
+    // No all-tile batch arm under WORKGRAPH: there is no `push1` queue to
+    // reserve from, so the mixed loop below (which forks per child) handles
+    // that case with no loss — the batch existed only to fold four contended
+    // atomics into one.
+#if !defined(WORKGRAPH)
     if (live_children != 0u && leaf_children == 0u) {
-        uint tile_base;
-        InterlockedAdd(counters[push1], live_children, tile_base);
+        uint tile_base = ctr_add(push1, live_children);
         uint live_rank = 0u;
         [unroll] for (uint bc = 0; bc < 4; ++bc) {
             uint bw = cx1[bc] - cx0[bc];
@@ -497,6 +638,7 @@ void level_finish(TileRec rec, uint2 p0, uint2 p1, uint depth, uint cut_len, TF 
         }
         return;
     }
+#endif
     // B70 HOMOGENEOUS-BATCH END.
 #endif
 
@@ -518,22 +660,35 @@ void level_finish(TileRec rec, uint2 p0, uint2 p1, uint depth, uint cut_len, TF 
                 InterlockedAdd(counters[CTR_OVERFLOW], 1, s);
             }
         } else {
+            TileRec child;
+            child.xy0 = pack_xy(cx0[c], cy0[c]);
+            child.xy1 = pack_xy(cx1[c], cy1[c]);
+            child.t_start = tc;
+            child.cut_slot = out_slot;
+            child.meta = out_len | (d << 8);
+            child.path = cpath | c;
+#if defined(WORKGRAPH)
+            // `c` is the unrolled loop counter, so this is a compile-time
+            // index. The graph's record storage is what bounds fanout here —
+            // there is no cap_tile to overflow against.
+            wg_kids[c] = child;
+            wg_mask |= (1u << c);
+#else
             InterlockedAdd(counters[push1], 1, s);
             if (s < cap_tile) {
-                TileRec child;
-                child.xy0 = pack_xy(cx0[c], cy0[c]);
-                child.xy1 = pack_xy(cx1[c], cy1[c]);
-                child.t_start = tc;
-                child.cut_slot = out_slot;
-                child.meta = out_len | (d << 8);
-                child.path = cpath | c;
                 qout[s] = child;
             } else {
                 InterlockedAdd(counters[CTR_OVERFLOW], 1, s);
             }
+#endif
         }
     }
 }
+
+// The ExecuteIndirect ladder's two kernels. Compiled out of the work-graph
+// unit, which reaches level_finish through its own node shaders and gets a
+// different (children-out) signature — see workgraph.hlsl.
+#if !defined(WORKGRAPH)
 
 // One thread per tile — the deep-level flavor, where tiles are many and each
 // one's inherited cut is tight enough that a private DFS is the right shape.
@@ -568,6 +723,8 @@ void cs_level_wide(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     if (gtid.x != 0) return;
     level_finish(rec, p0, p1, rec.meta >> 8, cut_len, f, best, 0u);
 }
+
+#endif // !WORKGRAPH
 
 // --- sky fill: moved to sky.hlsl -----------------------------------------
 // `cs_sky` and its lattice pass live in their own compile unit so the cloud

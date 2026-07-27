@@ -2808,6 +2808,76 @@ fn run_check_gpu(
         caps.shader_model >> 4,
         caps.shader_model & 0xf
     );
+    eprintln!(
+        "check-gpu: wave ops {}, lane count {}..{}, total lanes {}, work graphs tier {}",
+        if caps.wave_ops { "yes" } else { "NO" },
+        caps.wave_lane_min,
+        caps.wave_lane_max,
+        caps.total_lanes,
+        if caps.work_graphs_tier == 0 {
+            "none".to_string()
+        } else {
+            format!("{}.{}", caps.work_graphs_tier / 10, caps.work_graphs_tier % 10)
+        }
+    );
+    // The wave-aggregated atomics in wavefront.hlsl/leaf.hlsl are unconditional
+    // (no ABL_NO_WAVE_OPS in a shipping build), so WaveOps is load-bearing, not
+    // decorative. It has been core since SM 6.0 and we already require 6.5, so
+    // this can only fire on a driver that misreports — which is exactly the
+    // case worth failing loudly on rather than rendering garbage.
+    if !caps.wave_ops {
+        eprintln!(
+            "check-gpu: FAIL device reports WaveOps=false at shader model {}.{} — \
+             the wave-aggregated queue/counter paths require SM 6.0 wave intrinsics",
+            caps.shader_model >> 4,
+            caps.shader_model & 0xf
+        );
+        return 1;
+    }
+    // Which lane count the driver actually picked per shipping group width.
+    // Diagnostic, not a gate: the wave-aggregated paths are correct at any
+    // width. The one thing worth failing on is an INCONSISTENT report, since
+    // that would mean the aggregation is reasoning about a partition the
+    // hardware does not use.
+    match gpu::trace::wave_probe(&mut hg, &dxc, opts.gpu_debug) {
+        Ok(rows) => {
+            for (group, lanes, waves) in &rows {
+                eprintln!(
+                    "check-gpu: group {group:>3} -> wave {lanes} lanes, {waves} wave(s) per group"
+                );
+                // CEILING, not exact division: a group NARROWER than the wave
+                // is one PARTIAL wave, which is a legitimate configuration
+                // (a 32-thread group on wave64 hardware — and 32 is a shipping
+                // width: cs_level, cs_level_wide, cs_hemi_*). The aggregated
+                // paths are correct there, so demanding group % lanes == 0
+                // would fail the suite on AMD RDNA for no defect.
+                let expect = if *lanes == 0 { 0 } else { group.div_ceil(*lanes) };
+                if *lanes == 0 || *waves != expect {
+                    eprintln!(
+                        "check-gpu: FAIL wave probe inconsistent — group {group} of {lanes}-lane \
+                         waves should be {expect} wave(s), device counted {waves}"
+                    );
+                    return 1;
+                }
+                if *lanes < caps.wave_lane_min || *lanes > caps.wave_lane_max {
+                    eprintln!(
+                        "check-gpu: FAIL wave probe reports {lanes} lanes, outside the \
+                         device's own reported range {}..{}",
+                        caps.wave_lane_min, caps.wave_lane_max
+                    );
+                    return 1;
+                }
+            }
+        }
+        // ENVIRONMENT (exit 2), not a failed gate: the probe not compiling or
+        // dispatching is a DXC/driver story, the same class as the caps and
+        // smoke-test failures above it. A gate failure (exit 1) is reserved
+        // for a probe that RAN and disagreed with itself, handled above.
+        Err(e) => {
+            eprintln!("check-gpu: wave probe unavailable: {e}");
+            return 2;
+        }
+    }
     if let Err(e) = gpu::trace::smoke_test(&mut hg, &dxc, opts.gpu_debug) {
         eprintln!("check-gpu: FAIL {e}");
         return 1;

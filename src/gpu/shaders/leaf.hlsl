@@ -18,6 +18,20 @@
 // every fb-OFF frame its latency hiding. Measured (--gpu-timing, leaf+sky at
 // spp=16): -11% on AMD, -16% on NVIDIA — a real win on BOTH, so this is not
 // an AMD-specific hack. fb frames take the untouched `pso_leaf_fb`.
+//
+// THIS KERNEL HAS ZERO GROUPSHARED, AND THAT IS LOAD-BEARING ON INTEL.
+// It does not paste frustum.hlsli (see trace.rs's `leaf_of` source list), so
+// unlike the level kernels it carries no LDS at all — and Intel's Arc RT
+// developer guide (v4, p.26) states that groupshared is allocated out of the
+// same L1 that services the ray-tracing unit, so LDS in a RayQuery kernel
+// degrades ray throughput directly, "even if [it] is running on a different
+// queue". Every ray this renderer traces comes from here or hemi_leaf.hlsl,
+// and neither has any. Do NOT introduce a groupshared scratchpad here as a
+// tiling/caching optimisation without measuring ray cost on Arc first; the
+// per-lane software traversal stacks under --sw-rays were kept in private
+// scratch for the register/occupancy reason (rt_sw.hlsli's header), and this
+// is the second, independent reason that was the right call. Cross-lane work
+// belongs in wave intrinsics, which need no LDS — see ctr.hlsli's ctr_add.
 
 [numthreads(LEAF_GROUP, 1, 1)]
 void cs_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
@@ -109,17 +123,22 @@ void cs_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
                 c = shade_split(cam_origin.xyz, dir, hit, rng, shadow_samples, ao_samples,
                                 reflections != 0u, true, 0.0, pixel_cone, true, true,
                                 aw, o_h, n_h, ps);
-                if (prim) {
-                    uint q;
-                    InterlockedAdd(counters[CTR_HEMI_PT], 1, q);
-                    if (q < cap_hemi_pt) {
+                // Wave-aggregated: this fires once per HIT PIXEL, ~2M times to
+                // a single address at 1080p, from a 256-thread group. The
+                // reservation is hoisted out of the `if (prim)` so the whole
+                // wave reaches it — non-participants take 0 slots.
+                {
+                    uint q = ctr_add(CTR_HEMI_PT, prim ? 1u : 0u);
+                    if (prim && q < cap_hemi_pt) {
                         HemiPointRec pt;
                         pt.o = o_h;
                         pt.pixel = pi;
                         pt.n = n_h;
                         pt._pad = 0;
                         hemi_pts[q] = pt;
-                    } else {
+                    } else if (prim) {
+                        // Overflow only — a lane that reserved nothing is not
+                        // an overflow, so `prim` has to be re-tested here.
                         InterlockedAdd(counters[CTR_OVERFLOW], 1, q);
                     }
                 }

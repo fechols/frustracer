@@ -523,14 +523,36 @@ const HEMI_LEAF_HLSL: &str = include_str!("shaders/hemi_leaf.hlsl");
 const COMPOSE_HLSL: &str = include_str!("shaders/compose.hlsl");
 pub(crate) const FEED_HLSL: &str = include_str!("shaders/feed.hlsl");
 const NPPD_HLSL: &str = include_str!("shaders/nppd.hlsl");
+const WAVEPROBE_HLSL: &str = include_str!("shaders/waveprobe.hlsl");
+const WORKGRAPH_HLSL: &str = include_str!("shaders/workgraph.hlsl");
 
 /// What the GPU tracer requires, queried once. RayQuery in compute needs
 /// RaytracingTier 1.1 AND shader model 6.5; missing either is a clean
 /// "use the CPU path" story, never a degraded half-mode.
+///
+/// The wave/work-graph fields below are REPORTING ONLY — nothing in
+/// `require_caps` gates on them. `WaveOps` is true on every device that can
+/// reach this code (it has been core since SM 6.0, and we require 6.5), so
+/// making it a requirement would add a fallback path that can never run;
+/// `--check-gpu` asserts it instead. `work_graphs_tier` exists so the
+/// `FR_WORKGRAPH` spike can refuse to arm on a runtime that lacks the feature
+/// rather than failing at state-object creation.
 pub struct Caps {
     pub rt_tier: i32,
     pub shader_model: i32,
     pub binding_tier: i32,
+    /// D3D12_OPTIONS1. The lane count is a RANGE, not a width: the driver
+    /// picks per shader inside it, so this bounds what `WaveGetLaneCount()`
+    /// can return and never predicts it. Measured spread that matters here:
+    /// Arc A-series reports [8, 32], Arc B-series (Xe2 dropped SIMD8) [16, 32],
+    /// NVIDIA [32, 32], AMD RDNA [32, 64].
+    pub wave_ops: bool,
+    pub wave_lane_min: u32,
+    pub wave_lane_max: u32,
+    pub total_lanes: u32,
+    /// D3D12_OPTIONS21, 0 when the runtime predates the struct (the query
+    /// itself errors there, which is not a failure — see `query_caps`).
+    pub work_graphs_tier: i32,
 }
 
 pub fn query_caps(device: &ID3D12Device) -> Result<Caps> {
@@ -544,26 +566,41 @@ pub fn query_caps(device: &ID3D12Device) -> Result<Caps> {
     }
     .map_err(|e| format!("CheckFeatureSupport(OPTIONS5): {e}"))?;
     // Highest-supported query: seed with the max we understand; the runtime
-    // clamps DOWN to what it supports (an old runtime errors on unknown
-    // values, so retry with the floor before giving up).
-    let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL { HighestShaderModel: D3D_SHADER_MODEL_6_7 };
-    let sm_probe = unsafe {
-        device.CheckFeatureSupport(
-            D3D12_FEATURE_SHADER_MODEL,
-            &mut sm as *mut _ as *mut _,
-            std::mem::size_of::<D3D12_FEATURE_DATA_SHADER_MODEL>() as u32,
-        )
-    };
-    if sm_probe.is_err() {
-        sm.HighestShaderModel = D3D_SHADER_MODEL_6_5;
-        unsafe {
+    // clamps DOWN to what it supports (an old runtime ERRORS on an enum value
+    // it does not know, rather than clamping, so walk the seed down).
+    //
+    // THE SEED IS A CEILING, NOT A QUESTION — this reported 6.7 on an Arc Pro
+    // B70 purely because 6.7 was what we asked about. That is fine while the
+    // only consumers are `>= 6.5` / `>= 6.3` gates, and actively wrong once
+    // anything wants SM 6.8 (work graphs compile at `lib_6_8`), so the ladder
+    // starts above what we currently use. Keep 6.5 as the last rung: it is the
+    // wavefront tracer's own floor, so a runtime that rejects even that is a
+    // clean CPU-fallback story.
+    let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL::default();
+    let mut sm_err = None;
+    for seed in [
+        D3D_SHADER_MODEL_6_9,
+        D3D_SHADER_MODEL_6_8,
+        D3D_SHADER_MODEL_6_7,
+        D3D_SHADER_MODEL_6_5,
+    ] {
+        sm.HighestShaderModel = seed;
+        match unsafe {
             device.CheckFeatureSupport(
                 D3D12_FEATURE_SHADER_MODEL,
                 &mut sm as *mut _ as *mut _,
                 std::mem::size_of::<D3D12_FEATURE_DATA_SHADER_MODEL>() as u32,
             )
+        } {
+            Ok(()) => {
+                sm_err = None;
+                break;
+            }
+            Err(e) => sm_err = Some(e),
         }
-        .map_err(|e| format!("CheckFeatureSupport(SHADER_MODEL): {e}"))?;
+    }
+    if let Some(e) = sm_err {
+        return Err(format!("CheckFeatureSupport(SHADER_MODEL): {e}"));
     }
     // Resource binding tier: the root signature's unbounded scene-texture
     // SRV range needs tier 2+ (tier 3 on all RT-capable hardware in
@@ -577,10 +614,45 @@ pub fn query_caps(device: &ID3D12Device) -> Result<Caps> {
         )
     }
     .map_err(|e| format!("CheckFeatureSupport(OPTIONS): {e}"))?;
+    // Wave ops + lane-count range. Reporting only (see Caps), so a failure
+    // here must not sink a session that would otherwise run: fall back to the
+    // all-zero default, which reads as "unknown" everywhere it is printed.
+    let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    if unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS1,
+            &mut o1 as *mut _ as *mut _,
+            std::mem::size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS1>() as u32,
+        )
+    }
+    .is_err()
+    {
+        o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    }
+    // OPTIONS21 postdates the D3D12 runtimes we still support, and an unknown
+    // feature enum ERRORS rather than zero-filling — so this query failing is
+    // the ordinary "no work graphs here" answer, not a problem to report.
+    let mut o21 = D3D12_FEATURE_DATA_D3D12_OPTIONS21::default();
+    if unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS21,
+            &mut o21 as *mut _ as *mut _,
+            std::mem::size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS21>() as u32,
+        )
+    }
+    .is_err()
+    {
+        o21 = D3D12_FEATURE_DATA_D3D12_OPTIONS21::default();
+    }
     Ok(Caps {
         rt_tier: o5.RaytracingTier.0,
         shader_model: sm.HighestShaderModel.0,
         binding_tier: o.ResourceBindingTier.0,
+        wave_ops: o1.WaveOps.as_bool(),
+        wave_lane_min: o1.WaveLaneCountMin,
+        wave_lane_max: o1.WaveLaneCountMax,
+        total_lanes: o1.TotalLaneCount,
+        work_graphs_tier: o21.WorkGraphsTier.0,
     })
 }
 
@@ -972,6 +1044,255 @@ impl Drop for HeadlessGpu {
 /// readback verifies every element and the exact group roundup. This is the
 /// same seed → prep → indirect-consume shape every level of the real
 /// wavefront uses.
+/// One row per distinct thread-group width the tracer dispatches:
+/// `(group_width, wave_lane_count, waves_per_group)`.
+///
+/// Answers the question `D3D12_OPTIONS1` cannot: the caps report a lane-count
+/// RANGE, and the driver picks inside it per shader. The widths probed are the
+/// ones that actually ship — `cs_level*`/`cs_hemi_*` at 32, `cs_sky` at
+/// `SKY_GROUP`, `cs_leaf` at `LEAF_GROUP` — so the table lines up with the
+/// `--gpu-timing` regions rather than describing hypothetical kernels.
+///
+/// Reporting only. Nothing branches on the result: the wave-aggregated paths
+/// in wavefront.hlsl/leaf.hlsl are correct at ANY lane count (they aggregate
+/// over whatever the active wave turns out to be), which is exactly why this
+/// is a diagnostic and not a tuning input.
+pub fn wave_probe(hg: &mut HeadlessGpu, dxc: &Dxc, debug: bool) -> Result<Vec<(u32, u32, u32)>> {
+    let root_sig = create_root_signature(&hg.device)?;
+    let uaf = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    let ua = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+
+    let mut widths = vec![32u32, SKY_GROUP, leaf_group()];
+    widths.sort_unstable();
+    widths.dedup();
+
+    let mut rows = Vec::with_capacity(widths.len());
+    for w in widths {
+        let src = format!("#define PROBE_GROUP {w}\n{WAVEPROBE_HLSL}");
+        let what = format!("wave probe g{w}");
+        let pso = compute_pso(
+            &hg.device,
+            &root_sig,
+            &dxc.compile(&src, "cs_wave_probe", "cs_6_5", &what, debug)?,
+            &what,
+        )?;
+        let out = committed_buffer(&hg.device, 3 * 4, uaf, ua)?;
+        hg.run(|list| unsafe {
+            list.SetComputeRootSignature(&root_sig);
+            let push = [0u32; 4];
+            list.SetComputeRoot32BitConstants(RP_PUSH, 4, push.as_ptr() as *const _, 0);
+            list.SetComputeRootUnorderedAccessView(RP_UAV0, out.GetGPUVirtualAddress());
+            list.SetPipelineState(&pso);
+            list.Dispatch(1, 1, 1);
+            list.ResourceBarrier(&[uav_barrier(None)]);
+        })?;
+        let b = hg.read_buffer(&out, ua, 12)?;
+        let v: Vec<u32> =
+            b.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+        rows.push((v[1], v[0], v[2]));
+    }
+    Ok(rows)
+}
+
+/// `FR_WORKGRAPH=1` — run the quadtree ladder as a D3D12 work graph instead of
+/// `cs_seed` + depth_full x (`cs_prep` + ExecuteIndirect). R&D lever, never a
+/// CLI flag (the `FR_LEAF`/`FR_ABL` idiom): shipped features get flags, spikes
+/// get env levers. Read once per session.
+pub(crate) fn work_graph_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FR_WORKGRAPH").map(|v| v == "1").unwrap_or(false))
+}
+
+/// queues.hlsli's `ROOT_CUT_SLOT` — the sentinel meaning "the root cut [0]".
+/// Only the work-graph entry record needs it CPU-side; the ladder's root is
+/// built by `cs_seed` on the GPU.
+const WG_ROOT_CUT_SLOT: u32 = 0xffff_ffff;
+
+/// The CPU twin of queues.hlsli's `TileRec` — the graph's entry record is
+/// handed to `DispatchGraph` from CPU memory, so this layout is load-bearing
+/// (24 B, packed like C). `cs_seed` builds the same record on the GPU for the
+/// ladder; keep the two in step.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TileRecCpu {
+    xy0: u32,
+    xy1: u32,
+    t_start: f32,
+    cut_slot: u32,
+    meta: u32,
+    path: u32,
+}
+
+/// The ladder as a work graph (spike). Owns its state object and the opaque
+/// backing memory the scheduler needs.
+pub(crate) struct WorkGraph {
+    _so: ID3D12StateObject,
+    ident: D3D12_PROGRAM_IDENTIFIER,
+    backing: ID3D12Resource,
+    backing_size: u64,
+    entry: u32,
+    /// The first use of a backing allocation must carry
+    /// `SET_WORK_GRAPH_FLAG_INITIALIZE` so the driver can prepare its opaque
+    /// contents; afterwards it must NOT, because re-initialising every frame
+    /// would redo that work. The memory is opaque — never clear it by hand.
+    initialized: std::cell::Cell<bool>,
+}
+
+impl WorkGraph {
+    const PROGRAM: windows::core::PCWSTR = windows::core::w!("QuadtreeGraph");
+    const ENTRY_NODE: windows::core::PCWSTR = windows::core::w!("TileWide");
+
+    /// Compile + create. `wide`/`deep` are the recursion depths each node may
+    /// reach; they are DECLARED, and exceeding them at runtime is memory
+    /// corruption rather than a caught error (work-graphs spec), so they come
+    /// from the same `depth_full` the ladder uses, never a guess.
+    fn create(
+        device: &ID3D12Device,
+        root_sig: &ID3D12RootSignature,
+        dxc: &Dxc,
+        src: &str,
+        debug: bool,
+    ) -> Result<WorkGraph> {
+        let dxil = dxc.compile(src, "", "lib_6_8", "work graph", debug)?;
+
+        let lib = D3D12_DXIL_LIBRARY_DESC {
+            DXILLibrary: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: dxil.as_ptr() as *const _,
+                BytecodeLength: dxil.len(),
+            },
+            NumExports: 0, // export everything
+            pExports: std::ptr::null_mut(),
+        };
+        let grs = D3D12_GLOBAL_ROOT_SIGNATURE { pGlobalRootSignature: unsafe { std::mem::transmute_copy(root_sig) } };
+        let wg = D3D12_WORK_GRAPH_DESC {
+            ProgramName: Self::PROGRAM,
+            Flags: D3D12_WORK_GRAPH_FLAG_INCLUDE_ALL_AVAILABLE_NODES,
+            NumEntrypoints: 0,
+            pEntrypoints: std::ptr::null(),
+            NumExplicitlyDefinedNodes: 0,
+            pExplicitlyDefinedNodes: std::ptr::null(),
+        };
+        let subs = [
+            D3D12_STATE_SUBOBJECT {
+                Type: D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY,
+                pDesc: &lib as *const _ as *const _,
+            },
+            D3D12_STATE_SUBOBJECT {
+                Type: D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE,
+                pDesc: &grs as *const _ as *const _,
+            },
+            D3D12_STATE_SUBOBJECT {
+                Type: D3D12_STATE_SUBOBJECT_TYPE_WORK_GRAPH,
+                pDesc: &wg as *const _ as *const _,
+            },
+        ];
+        let so_desc = D3D12_STATE_OBJECT_DESC {
+            Type: D3D12_STATE_OBJECT_TYPE_EXECUTABLE,
+            NumSubobjects: subs.len() as u32,
+            pSubobjects: subs.as_ptr(),
+        };
+        let dev9: ID3D12Device9 = device
+            .cast()
+            .map_err(|e| format!("work graph: ID3D12Device9 unavailable: {e}"))?;
+        let so: ID3D12StateObject = unsafe { dev9.CreateStateObject(&so_desc) }
+            .map_err(|e| format!("work graph: CreateStateObject: {e}"))?;
+
+        let props: ID3D12StateObjectProperties1 = so
+            .cast()
+            .map_err(|e| format!("work graph: ID3D12StateObjectProperties1: {e}"))?;
+        let wgp: ID3D12WorkGraphProperties = so
+            .cast()
+            .map_err(|e| format!("work graph: ID3D12WorkGraphProperties: {e}"))?;
+
+        let index = unsafe { wgp.GetWorkGraphIndex(Self::PROGRAM) };
+        let mut req = D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS::default();
+        unsafe { wgp.GetWorkGraphMemoryRequirements(index, &mut req) };
+        let entry = unsafe {
+            wgp.GetEntrypointIndex(
+                index,
+                D3D12_NODE_ID { Name: Self::ENTRY_NODE, ArrayIndex: 0 },
+            )
+        };
+        // An export-list or node-name mistake yields an EMPTY graph that
+        // creates SUCCESSFULLY and whose identifier is zeroed — so the entry
+        // lookup, not creation, is where a typo actually surfaces.
+        if entry == u32::MAX {
+            return Err("work graph: entry node \"TileWide\" not found (empty graph?)".into());
+        }
+
+        // Zero is a legal requirement (the driver may need none), in which
+        // case a null range is passed at SetProgram time.
+        let backing_size = req.MinSizeInBytes.max(1);
+        let backing = committed_buffer(
+            device,
+            backing_size,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        )?;
+        eprintln!(
+            "gpu work-graph: armed (backing {:.2} MB, min {} / max {} / gran {})",
+            backing_size as f64 / (1024.0 * 1024.0),
+            req.MinSizeInBytes,
+            req.MaxSizeInBytes,
+            req.SizeGranularityInBytes
+        );
+        Ok(WorkGraph {
+            ident: unsafe { props.GetProgramIdentifier(Self::PROGRAM) },
+            _so: so,
+            backing,
+            backing_size,
+            entry,
+            initialized: std::cell::Cell::new(false),
+        })
+    }
+
+    /// Record the ladder. The caller has already bound the root signature and
+    /// every root argument — `SetProgram` is a successor to `SetPipelineState`
+    /// and does not reset root arguments, but the ORDER (root signature, then
+    /// arguments, then program) is the one the spec leaves unambiguous.
+    unsafe fn record(&self, list: &ID3D12GraphicsCommandList, root: TileRecCpu) -> Result<()> {
+        let l10: ID3D12GraphicsCommandList10 = list
+            .cast()
+            .map_err(|e| format!("work graph: ID3D12GraphicsCommandList10: {e}"))?;
+        unsafe {
+            let mut set = D3D12_SET_PROGRAM_DESC {
+                Type: D3D12_PROGRAM_TYPE_WORK_GRAPH,
+                ..Default::default()
+            };
+            set.Anonymous.WorkGraph = D3D12_SET_WORK_GRAPH_DESC {
+                ProgramIdentifier: self.ident,
+                Flags: if self.initialized.get() {
+                    D3D12_SET_WORK_GRAPH_FLAGS(0)
+                } else {
+                    D3D12_SET_WORK_GRAPH_FLAG_INITIALIZE
+                },
+                BackingMemory: D3D12_GPU_VIRTUAL_ADDRESS_RANGE {
+                    StartAddress: self.backing.GetGPUVirtualAddress(),
+                    SizeInBytes: self.backing_size,
+                },
+                NodeLocalRootArgumentsTable: Default::default(),
+            };
+            l10.SetProgram(&set);
+            self.initialized.set(true);
+
+            let mut dg = D3D12_DISPATCH_GRAPH_DESC {
+                Mode: D3D12_DISPATCH_MODE_NODE_CPU_INPUT,
+                ..Default::default()
+            };
+            dg.Anonymous.NodeCPUInput = D3D12_NODE_CPU_INPUT {
+                EntrypointIndex: self.entry,
+                NumRecords: 1,
+                // Copied by the driver during recording, so a stack local is
+                // fine — it is not referenced after DispatchGraph returns.
+                pRecords: &root as *const _ as *const _,
+                RecordStrideInBytes: std::mem::size_of::<TileRecCpu>() as u64,
+            };
+            l10.DispatchGraph(&dg);
+        }
+        Ok(())
+    }
+}
+
 pub fn smoke_test(hg: &mut HeadlessGpu, dxc: &Dxc, debug: bool) -> Result<()> {
     const FILL_N: u32 = 555; // deliberately not a multiple of 64
 
@@ -2286,6 +2607,19 @@ pub(crate) fn abl_defs() -> String {
         // the image is garbage BY DESIGN; these are cost probes, never levers.
         ("nogbuf", "ABL_NOGBUF"),
         ("nopack", "ABL_NOPACK"),
+        // Back to one LDS/global atomic per lane per candidate, in place of
+        // the wave-aggregated primitives (ctr.hlsli's ctr_add/ctr_bump and
+        // wavefront.hlsl's gw_alloc/gw_min_if). `FR_ABL=nobatch,nowave` is the
+        // full pre-wave-pass queue code.
+        //
+        // This lives HERE rather than in wavefront_ablation_defs, whose whole
+        // point is not to perturb the leaf/reference shader cache: the
+        // aggregation reaches leaf.hlsl's per-pixel hemi-point counter too, so
+        // an arm that recompiled only the tile unit would leave half the
+        // feature armed and silently mis-measure it. Unlike its neighbours
+        // this is a PERF arm, not a cost probe — both sides publish identical
+        // counter totals and an identical `best`, so the image is unmoved.
+        ("nowave", "ABL_NO_WAVE_OPS"),
     ] {
         if abl_has(tag) {
             out.push_str(&format!("#define {def} 1\n"));
@@ -3201,6 +3535,11 @@ pub struct TraceGpu {
     /// The wave-cooperative level kernel (one GROUP per tile) used for the
     /// shallow levels — see WIDE_LEVELS.
     pso_level_wide: ID3D12PipelineState,
+    /// The ladder as a work graph (`FR_WORKGRAPH=1`). None on every ordinary
+    /// session, and also whenever the runtime/driver lacks work graphs or the
+    /// state object fails to build — a spike must degrade to the shipping
+    /// ladder with one loud line, never take the session down.
+    work_graph: Option<WorkGraph>,
     pso_sky: ID3D12PipelineState,
     /// The amortized cloud lattice pass (sky.hlsl); only dispatched at SKY_LOD > 1.
     pso_sky_lod: ID3D12PipelineState,
@@ -3530,6 +3869,81 @@ impl TraceGpu {
         let pso_clear_info = pso(&wavefront_src, "cs_clear_info", "clear_info")?;
         let pso_level = pso(&wavefront_src, "cs_level", "level")?;
         let pso_level_wide = pso(&wavefront_src, "cs_level_wide", "level_wide")?;
+        // The work-graph ladder (FR_WORKGRAPH=1). Same pasted sources as the
+        // ladder plus its node shaders, with WORKGRAPH switching level_finish's
+        // child emission from `qout` to out-params — the tile logic is NOT
+        // forked. Any failure here (no OPTIONS21 support, no lib_6_8, a state
+        // object the driver rejects) falls back to the ladder with one loud
+        // line: a spike must never cost a session.
+        let work_graph = if work_graph_on() {
+            let caps = query_caps(device)?;
+            // MEASURED REFUSAL, not a guess, and the first real use of
+            // `adapter::picked_vendor()`. Intel driver 32.0.101.8515 reports
+            // WorkGraphsTier 1.0 and builds the state object happily — then
+            // takes an access violation inside DispatchGraph, with the debug
+            // layer AND GPU-based validation silent. The identical graph runs
+            // on NVIDIA and passes every gate bit-identically, so this is the
+            // driver, not the shader. The backing-memory ask is the corroborating
+            // tell: 517 MB on Arc against 82 MB on NVIDIA for the same graph.
+            // Re-test on a driver newer than 8515 and delete this arm if it
+            // passes; keying on the PICKED adapter (a fact) rather than
+            // --prefer-* (a request that can fall back) is the vendor_defaults
+            // rule.
+            let vendor = adapter::picked_vendor();
+            if caps.work_graphs_tier == 0 {
+                eprintln!(
+                    "gpu work-graph: FR_WORKGRAPH=1 but the device reports no work-graph \
+                     support — running the ExecuteIndirect ladder"
+                );
+                None
+            } else if vendor == adapter::Vendor::Intel {
+                eprintln!(
+                    "gpu work-graph: FR_WORKGRAPH=1 refused on Intel — driver 8515 reports \
+                     WorkGraphsTier 1.0 but faults inside DispatchGraph (the same graph passes \
+                     every gate on NVIDIA). Running the ExecuteIndirect ladder; retry on a \
+                     newer driver by deleting this arm in trace.rs"
+                );
+                None
+            } else {
+                // Levels 0..WIDE_LEVELS run one group per tile, the rest one
+                // thread per tile — the ladder's own split. Each node recurses
+                // (levels - 1) times; declared depths are clamped to >= 1
+                // because 0 means "not recursive at all" to the compiler, which
+                // would make the node's self-output an illegal cycle.
+                let dfull = depth_full(rw, rh);
+                let wl = if WIDE_LEVELS_ON.load(std::sync::atomic::Ordering::Relaxed) {
+                    WIDE_LEVELS
+                } else {
+                    0
+                };
+                let wide = dfull.min(wl).max(1);
+                // A node declaring N may recurse N times, i.e. run N+1 levels,
+                // so the wide node hands off after `wide` launches. DEEP is
+                // deliberately GENEROUS (the whole depth): over-declaring only
+                // reserves more backing memory, whereas under-declaring makes
+                // the deepest node drop its children — which the shader counts
+                // into CTR_OVERFLOW, so it fails a gate rather than corrupting
+                // an image, but it is still a failure worth not courting. Both
+                // are >= 1 because 0 reads as "not recursive" to the compiler
+                // and would make the node's self-output an illegal cycle.
+                let wg_src = format!(
+                    "#define WORKGRAPH 1\n#define WG_WIDE_LEVELS {}\n#define WG_DEEP_LEVELS {}\n{}\n{}",
+                    wide.saturating_sub(1).max(1),
+                    dfull.saturating_sub(1).max(1),
+                    wavefront_src,
+                    WORKGRAPH_HLSL
+                );
+                match WorkGraph::create(device, &root_sig, dxc, &wg_src, debug) {
+                    Ok(g) => Some(g),
+                    Err(e) => {
+                        eprintln!("gpu work-graph: {e} — running the ExecuteIndirect ladder");
+                        None
+                    }
+                }
+            }
+        } else {
+            None
+        };
         let pso_sky = pso(&sky_src, "cs_sky", "sky")?;
         let pso_sky_lod = pso(&sky_src, "cs_sky_lod", "sky_lod")?;
         let pso_cloud_shadow = pso(&sky_src, "cs_cloud_shadow", "cloud_shadow")?;
@@ -3804,6 +4218,7 @@ impl TraceGpu {
             pso_clear_info,
             pso_level,
             pso_level_wide,
+            work_graph,
             pso_sky,
             pso_sky_lod,
             pso_cloud_shadow,
@@ -4192,6 +4607,12 @@ impl TraceGpu {
             // Seed sees level 0's queue arrangement (qin = A).
             list.SetComputeRootUnorderedAccessView(RP_UAV0 + UAV_QIN, self.qa.GetGPUVirtualAddress());
             list.SetComputeRootUnorderedAccessView(RP_UAV0 + UAV_QOUT, self.qb.GetGPUVirtualAddress());
+            // push0 = 1 tells the seed to skip the root ENQUEUE: the work
+            // graph's root arrives as CPU input, so a queued one would never
+            // be consumed and would leave CTR_TILE_A dangling all frame. Set
+            // explicitly rather than inherited — root constants are undefined
+            // until written, so the ladder arm needs the 0 just as much.
+            self.push(list, [self.work_graph.is_some() as u32, 0, 0, 0]);
             list.SetPipelineState(&self.pso_seed);
             list.Dispatch(1, 1, 1);
             if clear_sentinel {
@@ -4207,7 +4628,40 @@ impl TraceGpu {
             }
             list.ResourceBarrier(&[uav_barrier(None)]);
 
-            for d in 0..self.depth_full {
+            // THE WORK-GRAPH LADDER (FR_WORKGRAPH=1). One DispatchGraph in
+            // place of depth_full x (prep + ExecuteIndirect). cs_seed above
+            // still ran and is still needed: it zeroes the counters and handles
+            // the degenerate rw,rh <= LEAF_TILE window. It does NOT enqueue a
+            // root here (push0 = 1 above) — the graph's root is CPU input, and
+            // an unconsumed queued one would leave CTR_TILE_A at 1 for the
+            // whole frame. Everything downstream — leaf, sky, hemi, compose —
+            // is untouched and reads the same queues, which is what keeps the
+            // terminal accounting and coverage gates in force.
+            if let Some(wg) = &self.work_graph {
+                let _ev = super::pix::scope(list, c"workgraph");
+                // Degenerate window: cs_seed already emitted the single leaf,
+                // so there is no tile to expand and the graph must not run.
+                let lt = crate::render::leaf_tile() as u32;
+                if self.rw > lt || self.rh > lt {
+                    let root = TileRecCpu {
+                        xy0: 0,
+                        xy1: (self.rw & 0xffff) | (self.rh << 16),
+                        t_start: 0.0,
+                        cut_slot: WG_ROOT_CUT_SLOT,
+                        meta: 1, // cut_len 1, depth 0 — cs_seed's own root
+                        path: 0,
+                    };
+                    if let Err(e) = wg.record(list, root) {
+                        eprintln!("gpu work-graph: {e}");
+                    }
+                }
+                list.ResourceBarrier(&[uav_barrier(None)]);
+            }
+
+            // The graph ran the whole ladder in one dispatch, so this loop is
+            // empty there — no level kernels, no prep, no ExecuteIndirect.
+            let ladder_levels = if self.work_graph.is_some() { 0 } else { self.depth_full };
+            for d in 0..ladder_levels {
                 let _ev = super::pix::scope_fmt(list, format_args!("level {d}"));
                 let (in_ctr, out_ctr) = if d % 2 == 0 {
                     (CTR_TILE_A, CTR_TILE_B)

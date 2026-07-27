@@ -44,3 +44,59 @@ cbuffer Push : register(b1) { uint push0; uint push1; uint push2; uint push3; }
 // prep writes 2D groups with x capped at 32768 (the 65,535 groups/dim
 // limit), so flat = gy * 32768 + gx everywhere.
 uint flat_group(uint3 gid) { return gid.y * 32768u + gid.x; }
+
+// --- wave-aggregated counter bumps (revert: FR_ABL=nowave) -----------------
+//
+// Every queue slot and statistic here used to cost one global atomic PER
+// THREAD, all landing on the same handful of addresses: `cs_level` gives each
+// tile its own thread, and leaf.hlsl's hemi-point counter fires once per hit
+// PIXEL (~2M to a single address at 1080p). Folding a wave into one atomic is
+// Intel's own prescription — their RT developer guide (v4, p.26) says to keep
+// data within a wave and use wave intrinsics rather than shared-memory traffic,
+// which matters more on Intel because groupshared is carved from the same L1
+// that services the RT unit — and it is a win on every vendor.
+//
+// NOT A BEHAVIOUR CHANGE. These are called at the same program points as the
+// per-lane atomics they replace, so the aggregate covers exactly the lanes that
+// would have raced there anyway; the totals published are identical and queue
+// slot ORDER was already unspecified (the old atomics raced). Measured on an
+// Arc Pro B70, WaveGetLaneCount() is 32 at every group width we dispatch.
+//
+// `slot` MUST be wave-uniform — every caller passes a compile-time CTR_*
+// constant or the `push1` cbuffer value. A per-lane slot would silently
+// aggregate across different counters.
+
+// Allocating bump: returns this lane's base, same total as the per-lane form.
+// Pass n == 0 to participate without reserving (that is how callers keep the
+// wave op out of divergent control flow).
+uint ctr_add(uint slot, uint n) {
+#if defined(ABL_NO_WAVE_OPS)
+    uint w = 0;
+    if (n != 0) InterlockedAdd(counters[slot], n, w);
+    return w;
+#else
+    uint pre = WavePrefixSum(n);
+    uint sum = WaveActiveSum(n);
+    uint base = 0;
+    if (WaveIsFirstLane() && sum != 0) InterlockedAdd(counters[slot], sum, base);
+    // Only the first lane's `base` is meaningful; broadcast it to the wave.
+    return WaveReadLaneFirst(base) + pre;
+#endif
+}
+
+// Statistics bump: the result is never read, so this wants a count, not a
+// prefix. Kept separate so the cheaper reduction is the one that gets used.
+void ctr_bump(uint slot, bool take) {
+#if defined(ABL_NO_WAVE_OPS)
+    if (take) {
+        uint s;
+        InterlockedAdd(counters[slot], 1u, s);
+    }
+#else
+    uint n = WaveActiveCountBits(take);
+    if (WaveIsFirstLane() && n != 0) {
+        uint s;
+        InterlockedAdd(counters[slot], n, s);
+    }
+#endif
+}

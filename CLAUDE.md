@@ -1988,7 +1988,168 @@ CPU tracer −2.2%/−3.3% (`--spin path`, default / san-miguel-lp) — no mode 
 
 **With that gone, the level ladder became the wavefront's dominant cost, exactly as originally claimed** — on `--stress 5000` the 8 level kernels were **1.78 ms of 2.81 (63%)** while `leaf+sky` was 0.83, and the cost did not track tile count. Two candidate explanations, and **the measurement killed the popular one**: nested timing regions around the two halves of each level put the `cs_prep` dispatch plus BOTH args transitions at **0.011 ms across all 8 levels** against the kernels' 1.817. Barriers and resource transitions are cheap here; the ~24 "pipeline drain points" that look so damning in the recording loop are worth eleven microseconds, and per-level counters + a static Dispatch (the obvious refactor) would buy exactly that. **Do not re-derive this** — the comment at the ladder in `record_wavefront` carries the numbers.
 
-The ladder was **under-occupied**, not dispatch-bound: level d holds at most 4^d tiles, so under one-thread-per-tile levels 0-4 are ≤ 256 threads, while each of those tiles does the MOST work of any level (a shallow frustum covers a large fraction of the screen and its inherited cut has barely been refined). Level 0 is literally one lane descending a 1.8M-node BVH. **`cs_level_wide`** (`trace::WIDE_LEVELS`) gives the shallowest levels ONE GROUP PER TILE: 32 lanes share a breadth-first frontier that aliases frustum.hlsli's per-lane stack slab (zero extra groupshared — the phase and refine_cut's never overlap, the same argument the serial path already makes), `best` reduced by `InterlockedMin` on the float bit pattern (exact for non-negative floats), with the serial path's stack-pressure fallback preserved verbatim on frontier overflow. It is a BFS, so the *pruning order* differs and node counts differ — but `best` is a min over the same candidate set and is order-independent, which is why the same-seed image A/B comes back at its old value to the digit. Deep levels keep the per-thread kernel: thousands of tiles with tight cuts and short descents, where a whole group per tile would waste 31 lanes (WIDE 8 measured WORSE than not doing it at all on Intel). Both frustum structures are implemented, so `--no-ftree` is gated too. Measured (interleaved, 3 reps, medians): **B70 −7.4% / −30.4% / −2.4%** and **4090 −1.5% / −11.1% / −23.1%** on default / `--stress 5000` / San Miguel. A naive single-shot sweep "showed" a 9-16% NVIDIA regression that the interleaved reps erase entirely — the 4090 spans 1.42-1.98 ms for one unchanged config while the B70 repeats within 0.002.
+The ladder was **under-occupied**, not dispatch-bound: level d holds at most 4^d tiles, so under one-thread-per-tile levels 0-4 are ≤ 256 threads, while each of those tiles does the MOST work of any level (a shallow frustum covers a large fraction of the screen and its inherited cut has barely been refined). Level 0 is literally one lane descending a 1.8M-node BVH. **`cs_level_wide`** (`trace::WIDE_LEVELS`) gives the shallowest levels ONE GROUP PER TILE: 32 lanes share a breadth-first frontier that aliases frustum.hlsli's per-lane stack slab (zero extra groupshared — the phase and refine_cut's never overlap, the same argument the serial path already makes), `best` reduced by a min on the float bit pattern (exact for non-negative floats — `gw_min_if`, wave-reduced then one `InterlockedMin` per wave), with the serial path's stack-pressure fallback preserved verbatim on frontier overflow. It is a BFS, so the *pruning order* differs and node counts differ — but `best` is a min over the same candidate set and is order-independent, which is why the same-seed image A/B comes back at its old value to the digit. Deep levels keep the per-thread kernel: thousands of tiles with tight cuts and short descents, where a whole group per tile would waste 31 lanes (WIDE 8 measured WORSE than not doing it at all on Intel). Both frustum structures are implemented, so `--no-ftree` is gated too. Measured (interleaved, 3 reps, medians): **B70 −7.4% / −30.4% / −2.4%** and **4090 −1.5% / −11.1% / −23.1%** on default / `--stress 5000` / San Miguel. A naive single-shot sweep "showed" a 9-16% NVIDIA regression that the interleaved reps erase entirely — the 4090 spans 1.42-1.98 ms for one unchanged config while the B70 repeats within 0.002.
+
+## Intel Arc / Xe2 (Battlemage): what the hardware actually offers
+
+Researched 2026-07-26 against primary sources (Intel's *Arc Graphics Developer Guide for
+Real-time Ray Tracing in Games* v4, the `igdext.h` public header, Microsoft's DXR 1.2 / SER /
+OMM / work-graph specs, and 1438 real `d3d12info` capability dumps including two Arc Pro B70).
+**The vendor-specific surface is narrower than it looks, and most of it this tree already
+satisfies.** Recorded so it is not re-researched.
+
+**Ruled out — do not spend time here again.**
+- **Intel Extensions for DirectX (`igdext`) cannot control SIMD/wave width.** The only `SIMD`
+  token in the 1326-line header is a read-only `SIMD16Required` query;
+  `INTC_D3D12_CreateComputePipelineState` is a shader-BYPASS path (CM/SPIR-V/ESIMD instead of
+  DXIL) with no width field. Its D3D12 HLSL surface is 9 functions, all 64-bit atomics. There is
+  no public SDK repo any more (headers survive vendored in `intel/gits`, v4.20.5).
+- **Its 64-bit typed-atomics extension is obsolete on Battlemage**:
+  `AtomicInt64OnTypedResourceSupported` is false on A770 but **true** on B-series, so the
+  standard SM 6.6 path covers it. (Groupshared 64-bit atomics remain unsupported on both.)
+- **Opacity Micromaps: not supported on Intel** ("actively evaluating" — Microsoft). Our
+  `ALPHA_CUTOUT` candidate loops stay the answer, and `FR_ABL=noalpha,notrans` already measured
+  that whole ceiling at −2.3%, so this costs nothing.
+- **SER gates on Shader Model 6.9, not `RaytracingTier`.** Measured here: the B70 reports SM 6.8
+  and the 4090 SM 6.8, so neither can run it today — and SER accelerates *many divergent hit
+  shaders*, which a one-shader-record SBT does not have.
+- **XMX is dead weight** without a neural stage of our own (XeSS already uses it through Intel's
+  DLL). `WaveMMA` never shipped in any Shader Model; the D3D12 door is Cooperative Vectors, which
+  Microsoft has already deprecated in favour of an SM 6.10 redesign.
+
+**Already satisfied — three facts that explain existing decisions, and one rule not to break.**
+- **THE RULE: groupshared memory is allocated out of the same L1 that services the RT unit**
+  (RT guide v4, p.26), so LDS in a ray-tracing kernel degrades ray throughput — "even if the
+  groupshared memory is running on a different queue (e.g. an Async compute queue)". This tree is
+  compliant by construction and that is worth keeping: the two kernels that trace rays
+  (`cs_leaf`, `cs_hemi_leaf`) have **zero** groupshared — neither pastes `frustum.hlsli`, see
+  `trace.rs`'s `leaf_of`/`hemi_leaf_src` — while the 8 KB-LDS kernels (`cs_level*`,
+  `cs_hemi_root/cell`) trace no rays; and with one DIRECT queue and barriers between the ladder
+  and the terminal fills, LDS-heavy and RT-heavy work never overlap. `leaf.hlsl`'s header carries
+  the warning. Intel's prescribed alternative to LDS traffic — **wave intrinsics** — is what
+  `ctr.hlsli`'s `ctr_add`/`ctr_bump` and `wavefront.hlsl`'s `gw_alloc`/`gw_min_if` now use.
+  (Caveat: Intel's statement is Xe-HPG-era. Xe2 unified L1/SLM further, 192 → 256 KB, so the
+  structural premise is if anything more true — but the penalty is not re-confirmed for Xe2.)
+- **The Thread Sorting Unit sorts by shader RECORD, not shader function**, and it is disabled by
+  RayQuery. That is why `--dxr-inline 1` beat recursive TraceRay 4–6× here rather than losing to
+  it: our SBT has effectively one record ("identifier-only SBT records, no local root
+  signatures"), so the DXR 1.0 path paid the full repacking cost — live state spilled to the ray
+  stack, thread terminated, continuation dispatched, payload through memory, 256 B/ray minimum —
+  for **zero** coherence benefit. Intel's own document predicts that outcome, and the guidance
+  would only flip if we grew many materially different hit records.
+- **Xe2 made `ExecuteIndirect` a hardware block** (Intel quote: up to 12.5× vs Alchemist's
+  software emulation), which retroactively justifies the wavefront ladder on Intel and matches
+  our own measured ~11 µs of ladder dispatch overhead across 8 levels. Intel's "avoid
+  ExecuteIndirect on buffers of size 0 or 1" rule is **A-series-era guidance for the emulated
+  path** — do not act on it for Xe2 without measuring.
+
+**Measured caps on this box** (printed by `--check-gpu`; `query_caps` now walks the shader-model
+seed down from 6.9, having previously reported 6.7 purely because 6.7 was what it asked about):
+
+| | Arc Pro B70 | RTX 4090 |
+|---|---|---|
+| RT tier | 1.1 | **1.2** |
+| shader model | 6.8 | 6.8 |
+| wave lane count | **16..32** (A-series: 8..32) | 32..32 |
+| total lanes | 8192 | 16384 |
+| work graphs | **Tier 1.0** | Tier 1.0 |
+| `WaveGetLaneCount()` @ group 32 / 64 / 256 | **32 / 32 / 32** | 32 / 32 / 32 |
+
+Two things follow. The lane count is a **range the driver picks inside per shader**, so the caps
+never predict it — `trace::wave_probe` asks a kernel of each shipping group width and
+`--check-gpu` prints the table (it also FAILS on an inconsistent report, since aggregation that
+reasoned about the wrong partition would be silently wrong). That consistency check is a
+**ceiling**, `waves == ceil(group / lanes)`, never exact division: a group NARROWER than the wave
+is one PARTIAL wave, which is exactly what a 32-thread group is on wave64 hardware — and 32 is a
+shipping width (`cs_level`, `cs_level_wide`, `cs_hemi_*`), so an exact-division predicate would
+fail the suite on AMD RDNA for no defect at all. And Xe2 dropped SIMD8, which is the
+8 → 16 minimum above. **`LEAF_GROUP = 256` was never a wave-matching result** — at 32 lanes it is
+8 waves — it is an occupancy/dispatch-shape result, exactly as its own doc comment concluded.
+
+**Wave-aggregated atomics — SHIPPED, and MEASURED NEUTRAL. Do not re-derive this.** Intel's
+guide prescribes wave intrinsics over shared-memory traffic, and the tree used ZERO of them, so
+the three atomic hot spots were converted: `bound_query_wave`'s `gw_min_if`/`gw_alloc` (the FTREE
+round was issuing up to 8 LDS atomics per lane per node — ~256 per group iteration to one
+address; it is now one wave reduction and one atomic per node, via a per-lane bitmask compacted
+by popcount rank), `level_finish`'s counter bumps through `ctr.hlsli`'s `ctr_add`/`ctr_bump`
+(layered ON TOP of the HOMOGENEOUS-BATCH quadrant folding: 4 x 32 becomes 1), and `leaf.hlsl`'s
+per-pixel `CTR_HEMI_PT`. Revert arm: `FR_ABL=nowave` (`nobatch,nowave` is the full pre-wave-pass
+queue code).
+
+Measured `--spin path` 1080p, interleaved, rep 1 discarded, median of 3, windowed `gpu frame
+span`: **B70 default 0.780 vs 0.780 (0.0%), B70 stress 1.045 vs 1.045 (0.0%), 4090 default 0.246
+vs 0.246 (0.0%), 4090 stress 0.505 vs 0.510 (-1.0%)**. The B70 repeats to ±0.001 ms, so those
+zeros are real, not noise. **The atomics were simply never the bottleneck** — the same conclusion
+the ladder's own comment already reached about prep dispatches and barriers (0.011 ms across 8
+levels): the cost is the level KERNEL descending the BVH, not the bookkeeping around it. Kept
+because it is strictly less shared-memory traffic, is what Intel documents, and costs nothing;
+but do not expect it to buy anything, and do not spend further effort on atomic contention in
+this ladder without new evidence.
+
+*Measurement trap this campaign re-learned the hard way:* `--gpu-timing` prints a table every 120
+frames AND at exit, and a parser that takes the FIRST match reads frames 0-119 — the coldest
+window there is, where `win ms` == `mean ms` by construction. That alone manufactured ±20%
+"noise" and an apparent 19% NVIDIA win, in a region (`leaf+sky`) the change cannot even touch.
+Always parse the LAST table.
+
+**Work graphs (`FR_WORKGRAPH=1`) — the ladder as a D3D12 work graph.** The one genuinely NEW
+Xe2 capability, and the queue records were already "work-graph-shaped". `src/gpu/shaders/
+workgraph.hlsl` replaces `cs_seed` + depth_full x (`cs_prep` + ExecuteIndirect) with ONE
+`DispatchGraph`: a broadcasting node per shallow tile (the `bound_query_wave` frontier) handing
+off to a coalescing node for deep levels (32 tiles per group — the `WIDE_LEVELS` split, which
+work graphs express natively). Leaf and sky records keep their UAV queues, so every terminal
+gate is untouched; only the ping-pong tile queues go, because they assume levels SERIALISE and
+that is exactly what a graph breaks. `level_finish` is NOT forked — `#if defined(WORKGRAPH)`
+swaps its child emission from `qout` to an `out TileRec[4] + mask` the node compacts by
+popcount rank.
+
+**Status: correct, and blocked on Intel's driver.** On the 4090 the whole `--check-gpu` suite
+passes with the graph armed and the result is **bit-identical** to the ladder (`leaves 768 |
+sky-tiles 4 | splits 257 | blocked 256 | cuts 65 | overflow 0`, same-seed image `mean |d| 0.00e0
+max 0.00e0`). That took a fix worth recording, because the gate that caught it only fires at
+half the resolutions: `cs_seed` used to enqueue a root TileRec unconditionally, and the graph
+takes ITS root as CPU input, so `CTR_TILE_A` sat at 1 for the whole frame with no ladder level
+to consume it. The depth-accounting gate reads A or B **by `depth_full` parity** (the last
+level's INPUT counter is legitimately non-zero, which is why it cannot just check both), so at
+800x600 with `LEAF_TILE` 32 — `depth_full` 5, odd — it read B and passed, while `FR_LEAF=16`
+(`depth_full` 6) failed it outright with `1 tile records left`. `cs_seed` now takes `push0 = 1`
+to skip the enqueue. **A parity-selected gate is only half a gate: prove an arm against BOTH
+parities before believing it.** On the B70 the state object builds and reports `WorkGraphsTier 1.0`, then
+`DispatchGraph` takes an access violation with the debug layer and GPU-based validation both
+silent — so `FR_WORKGRAPH=1` is REFUSED on Intel with a loud line (`trace.rs`, the first real
+caller of `adapter::picked_vendor()`; delete that arm and re-test on a driver newer than
+32.0.101.8515). The corroborating tell is the backing-memory ask for the identical graph:
+**517 MB on Arc against 82 MB on NVIDIA**.
+
+**Performance: a WASH on NVIDIA, and scene-dependent** (`--spin path` 1080p, same discipline,
+windowed span): **default 0.262 graph vs 0.245 ladder (+6.9%), `--stress 5000` 0.486 vs 0.505
+(-3.8%)**; `leaf+sky` is unmoved (0.0% / +3.3%), so the delta really is the ladder. That fits
+the mechanism: the graph deletes ~6 prep dispatches and lets levels OVERLAP, which pays on a
+deep many-tile stress field and loses on the shallow sky-heavy default scene where the ladder's
+own dispatch overhead was already only ~11 µs and Xe2/Ada both accelerate `ExecuteIndirect` in
+hardware. **It is therefore an env lever and never a default** — and note it is worth exactly
+ZERO on a resting frame either way, because structure replay skips the ladder entirely.
+
+Three spec rules that shaped the design and are easy to get wrong:
+- **Output allocation must be THREAD-GROUP uniform, and "varying includes threads exiting."**
+  `cs_level_wide`'s `if (gtid.x != 0) return;` before `level_finish` would therefore be
+  undefined behaviour in a node. The wide node keeps all 32 lanes alive: lane 0 computes the
+  split into groupshared, a barrier publishes it, then every lane calls
+  `GetThreadNodeOutputRecords` with a per-thread count of 0 or 1 (a varying COUNT is explicitly
+  allowed; varying control flow is not). `OutputComplete()` is mandatory even for a 0-record thread.
+- **Only self-recursion exists** (a node may not target an ancestor), the longest chain is 32
+  with recursion levels counted individually, and `[NodeMaxRecursionDepth(0)]` means "not
+  recursive" — which would make a self-output an illegal cycle, hence the `.max(1)` clamps.
+- **Exceeding `[MaxRecords]` or the declared recursion depth is memory corruption or device
+  removal, NOT a caught error.** So the deepest node counts any child it must drop into
+  `CTR_OVERFLOW`, which every suite already gates at exactly 0 — a silent drop would be a hole
+  in the image, i.e. the false-sky class.
+
+**`[WaveSize]` is deliberately unused.** It is a *validated constraint* that fails PSO creation
+out of range, it is compute-only (so it can never reach `dxr.hlsl`), and forcing 32 on a
+register-heavy kernel converts a compiler-avoided spill into a mandatory one — Intel's compiler
+picks the narrower width precisely to avoid spilling. If it is ever wanted, `[WaveSize(16,32,32)]`
+(SM 6.8, range form) is the portable spelling; a bare `[WaveSize(32)]` fails on AMD wave64 parts.
 
 ## Cinematic capture (`--cinematic`): the offline beauty path
 
