@@ -86,11 +86,13 @@ pub struct GpuOptions {
     /// `--hdr10`: force the 10-bit PQ (R10G10B10A2 + G2084) swapchain in ANY
     /// session — the A/B lever, and override-wins like `--hdr-peak` (it fires
     /// even where the display probe says HDR is off; the probe can be wrong,
-    /// and a lever that no-ops exactly then is no escape hatch). Without it
-    /// the PQ arm is taken automatically only by the swapchain-wrapper FG
-    /// families on an HDR-on display. Read `GpuContext::encoding()` for what
-    /// actually happened.
+    /// and a lever that no-ops exactly then is no escape hatch). Read
+    /// `GpuContext::encoding()` for what actually happened.
     pub hdr10: bool,
+    /// `--no-hdr10`: force scRGB f16 — "wide, but NOT PQ". Needed since PQ
+    /// became the default on an HDR-on display; without it the fp16 arm is
+    /// unreachable from the command line.
+    pub scrgb: bool,
     /// Where linear 1.0 lands, in nits (`--hdr-paper-white`, default 200). The
     /// scene is authored so 1.0 ≈ diffuse white (see `scene::default_light`).
     pub paper_white: f32,
@@ -810,15 +812,38 @@ impl GpuContext {
         // D3d::with_queue rebuilds at SDR and wraps again — FG is why the
         // session exists, so SDR with FG beats HDR10 without it.
         let fg_wrapper = fg_dlssg || try_xefg;
+        // PQ IS THE DEFAULT ON AN HDR-ON DISPLAY (2026-07-26). 10-bit
+        // R10G10B10A2 is HALF the bytes of scRGB fp16 per present, and the
+        // present is the whole frame budget whenever the display hangs off a
+        // different GPU than the renderer: DWM must then COPY every frame
+        // across, which at 7680x3969 is 244 MB at fp16 vs 122 MB at PQ.
+        // Measured on this box (world, 8K, display on an Intel B70 while a
+        // 4090 renders): 6.1 -> 10.0 rendered fps, ~80 -> ~51 ms per present,
+        // while the GPU itself was only doing 14.7 ms of work per frame. PQ is
+        // also what HDR titles ship, so quality is not the trade it looks like
+        // — and on an HDR-OFF display scRGB still wins (f16 beats 8-bit, and
+        // tone_pq would only degenerate to the SDR rolloff there), so the
+        // probe decides. `--no-hdr10` is the explicit scRGB spelling.
+        //
+        // The probe runs ONCE: it needs the HWND (which exists — the swapchain
+        // is created for it) and both the wrapper-FG rule and this default
+        // read the same verdict.
+        let hdr_on = opts.hdr && !opts.hdr10 && display::probe(&pick.adapter, hwnd).enabled;
         let without_fg = if !opts.hdr {
             d3d12::PresentSpace::Sdr
         } else if opts.hdr10 {
+            d3d12::PresentSpace::Hdr10
+        } else if opts.scrgb {
+            d3d12::PresentSpace::Scrgb
+        } else if hdr_on {
             d3d12::PresentSpace::Hdr10
         } else {
             d3d12::PresentSpace::Scrgb
         };
         let want = if fg_wrapper && opts.hdr && !opts.hdr10 {
-            if display::probe(&pick.adapter, hwnd).enabled {
+            // A wrapper-FG family cannot take scRGB at all, so an HDR-off
+            // display drops it to SDR rather than to f16.
+            if hdr_on {
                 d3d12::PresentSpace::Hdr10
             } else {
                 d3d12::PresentSpace::Sdr
@@ -826,6 +851,12 @@ impl GpuContext {
         } else {
             without_fg
         };
+        if !fg_wrapper && want == d3d12::PresentSpace::Hdr10 && !opts.hdr10 {
+            eprintln!(
+                "present: HDR display — defaulting to 10-bit PQ (half the bytes per present; \
+                 --no-hdr10 forces scRGB f16, --no-hdr forces 8-bit SDR)"
+            );
+        }
         if fg_wrapper && opts.hdr {
             let family = if fg_dlssg { "DLSS-G" } else { "XeSS-FG" };
             match want {

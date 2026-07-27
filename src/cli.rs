@@ -346,6 +346,14 @@ pub struct Opts {
     /// `--hdr10` sets both, `--no-hdr`/`--hdr` clear this one — three states,
     /// later flags win).
     pub hdr10: bool,
+    /// `--no-hdr10`: force scRGB f16 — "wide, but NOT PQ". This exists because
+    /// PQ is now the DEFAULT on an HDR-on display (10-bit is half the bytes per
+    /// present, which is the whole frame budget when the display hangs off a
+    /// different GPU than the renderer and every present is a DWM copy), so
+    /// scRGB stopped being reachable as "neither flag" and needs its own
+    /// spelling — otherwise the fp16 A/B arm the HDR gates rest on would be
+    /// unreachable. `hdr && !hdr10 && !scrgb` = auto-pick by the display probe.
+    pub scrgb: bool,
     /// `--hdr-paper-white <nits>`: where linear 1.0 lands. The scene is authored
     /// so 1.0 ≈ diffuse white; 200 is the usual desktop-HDR reference.
     pub hdr_paper_white: f32,
@@ -580,6 +588,7 @@ pub fn defaults() -> Opts {
         // as --no-hdr and as the automatic fallback.
         hdr: true,
         hdr10: false,
+        scrgb: false,
         hdr_paper_white: tone::DEFAULT_PAPER_WHITE,
         hdr_peak: None,
         tod: None,
@@ -1145,16 +1154,26 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
             "--hdr" => {
                 opts.hdr = true;
                 opts.hdr10 = false;
+                opts.scrgb = false;
             }
             "--no-hdr" => {
                 opts.hdr = false;
                 opts.hdr10 = false;
+                opts.scrgb = false;
             }
             "--hdr10" => {
                 opts.hdr = true;
                 opts.hdr10 = true;
+                opts.scrgb = false;
             }
-            "--no-hdr10" => opts.hdr10 = false,
+            // "wide, but NOT PQ" — the explicit spelling of scRGB, which stopped
+            // being reachable as "neither flag" when PQ became the HDR-display
+            // default. Implies the wide swapchain (the --hdr10 arm's shape).
+            "--no-hdr10" => {
+                opts.hdr = true;
+                opts.hdr10 = false;
+                opts.scrgb = true;
+            }
             "--hdr-paper-white" => {
                 opts.hdr_paper_white = args
                     .next()
@@ -1772,8 +1791,26 @@ pub fn self_test() -> Result<(), String> {
         return Err("--no-hdr --hdr10 must select the PQ swapchain".into());
     }
     let sdr = parse_argv(&["--hdr10", "--no-hdr"]).opts;
-    if sdr.hdr || sdr.hdr10 {
+    if sdr.hdr || sdr.hdr10 || sdr.scrgb {
         return Err("--hdr10 --no-hdr must select the 8-bit SDR swapchain".into());
+    }
+    // scRGB must stay REACHABLE. It is no longer "neither flag" — PQ is the
+    // default on an HDR-on display — so `--no-hdr10` is its spelling, and the
+    // three-way stays a three-way. Without this the fp16 arm the HDR gates
+    // (tone::self_test's degeneracy pin, M12's scRGB comparison) rest on would
+    // be un-selectable from the command line.
+    let wide = parse_argv(&["--no-hdr10"]).opts;
+    if !(wide.hdr && !wide.hdr10 && wide.scrgb) {
+        return Err("--no-hdr10 must select scRGB (wide, not PQ)".into());
+    }
+    // ...and each of the three must still win from any predecessor.
+    let back_to_pq = parse_argv(&["--no-hdr10", "--hdr10"]).opts;
+    if !(back_to_pq.hdr10 && !back_to_pq.scrgb) {
+        return Err("--no-hdr10 --hdr10 must select PQ".into());
+    }
+    let auto = parse_argv(&["--hdr10", "--hdr"]).opts;
+    if !(auto.hdr && !auto.hdr10 && !auto.scrgb) {
+        return Err("--hdr10 --hdr must return to the display-probed default".into());
     }
 
     // ---- 4. the precedence seam -------------------------------------------

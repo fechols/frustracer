@@ -372,14 +372,16 @@ impl D3d {
         // a misinterpreted buffer (which would wash the whole image out). Loud
         // line, full fallback, no degraded half-mode.
         //
-        // scRGB is the DEFAULT, not an HDR-only path: handing Windows an f16
-        // linear surface is the right thing on any monitor. On an HDR display it
-        // carries real highlights; on an SDR one DWM tone-maps/clamps it and can
-        // still drive a 10-bit panel at full precision, where the old 8-bit
-        // backbuffer would have banded. What varies with the display is the
-        // CURVE (crate::tone), not the swapchain. HDR10 is the wrapper-FG arm
-        // (+ the --hdr10 lever): the FG proxies reject scRGB fp16 but take
-        // 10-bit PQ, the format HDR FG titles ship.
+        // PQ is the DEFAULT on an HDR-ON display, scRGB f16 everywhere else
+        // (the caller decides — see GpuContext::new). PQ wins on BYTES: 4 B/px
+        // vs fp16's 8, and the present is the whole frame budget when the
+        // display hangs off a different GPU than the renderer and DWM has to
+        // copy every frame across. On an SDR/HDR-off display f16 still beats
+        // 8-bit (DWM tone-maps/clamps it and can drive a 10-bit panel at full
+        // precision, where the old 8-bit backbuffer banded), so scRGB keeps
+        // that case. What varies with the display is the CURVE (crate::tone) as
+        // well as the swapchain now. The wrapper-FG families force PQ for a
+        // different reason: they reject scRGB fp16 outright.
         if space != PresentSpace::Sdr {
             match declare_colorspace(&swapchain, space) {
                 Ok(()) => match space {

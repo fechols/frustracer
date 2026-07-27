@@ -12075,6 +12075,7 @@ fn run_window(req: SceneRequest, opts: &Opts, file_settings: settings::Settings)
         vsync: opts.vsync,
         hdr: opts.hdr,
         hdr10: opts.hdr10,
+        scrgb: opts.scrgb,
         paper_white: opts.hdr_paper_white,
         peak_nits: opts.hdr_peak,
         quin: opts.quin,

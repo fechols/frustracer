@@ -1600,16 +1600,27 @@ cargo run --release -- --no-vsync     # uncapped presentation (Present sync inte
                                       # (the scRGB swapchain is ON BY DEFAULT — see the HDR section)
 cargo run --release -- --no-hdr       # A/B lever: force the legacy 8-bit B8G8R8A8 swapchain (also the
                                       # automatic fallback when the scRGB colour space is refused)
-cargo run --release -- --hdr10        # A/B lever: force the HDR10/PQ swapchain (R10G10B10A2 +
+cargo run --release -- --hdr10        # force the HDR10/PQ swapchain (R10G10B10A2 +
                                       # G2084, tone::ToneMode::Pq — 709->2020 matrix + ST 2084 at
-                                      # the end of the one curve) in ANY session. Override-wins
+                                      # the end of the one curve) in ANY session — which since
+                                      # 2026-07-26 only ADDS the HDR-off case, because PQ is
+                                      # the DEFAULT on an HDR-ON display (half the bytes per
+                                      # present; see the HDR section for the measurement and
+                                      # for why an HDR-off display keeps scRGB). Override-wins
                                       # like --hdr-peak, including over an "HDR off" probe
                                       # verdict. The swapchain flags are a THREE-way (SDR |
-                                      # scRGB | HDR10) spelled as two toggles, later flags win
+                                      # scRGB | HDR10) spelled as toggles, later flags win
                                       # across the pairs: `--no-hdr --hdr10` = PQ, `--hdr10
-                                      # --no-hdr` = SDR. Exposed in the settings menu as the
-                                      # Display page's hdr10 row (restart-tier).
-                                      # Without it PQ is taken AUTOMATICALLY only by the
+                                      # --no-hdr` = SDR, and `--no-hdr10` = scRGB — that last
+                                      # one is scRGB's EXPLICIT spelling, needed since PQ took
+                                      # the default and "neither flag" stopped meaning f16
+                                      # (cli::self_test pins the three-way and the fact that
+                                      # each arm still wins from any predecessor). `--hdr`
+                                      # returns to the display-probed default. Exposed in the
+                                      # settings menu as the
+                                      # Display page's hdr10 row (restart-tier; its OFF state
+                                      # means scRGB, mirroring --no-hdr10).
+                                      # PQ is ALSO taken automatically by the
                                       # swapchain-wrapper FG families (SL DLSS-G, XeSS-FG — both
                                       # reject scRGB fp16, both take 10-bit PQ; XeSS-FG VERIFIED
                                       # GENERATING at HDR10 on the B70) on an HDR-on display —
@@ -1664,7 +1675,9 @@ Known-accepts: P screenshots and `--check` PNGs contain NO HUD (they read pre-co
 
 The renderer was always HDR internally and only SDR at the very last step: every upscaler output (DLSS-RR, both FSR flavors, XeSS), the GPU tracer's resolve target, the DXR output, and the CPU `HdrUpload` are linear `R16G16B16A16_FLOAT`, and all **16 present arms funnel through one function** (`GpuContext::fullscreen_to_backbuffer`) and **one shader** (`tonemap.hlsl`) — which then crushed that signal into an 8-bit `B8G8R8A8_UNORM` backbuffer. The scRGB swapchain replaces that last step; nothing upstream changes.
 
-**The f16 swapchain is the default on every monitor, not an HDR-only mode.** Handing Windows a linear f16 surface is simply the right thing to present: on an HDR display DWM has real highlights to work with; on an SDR one it tone-maps/clamps and can still drive a **10-bit "deep colour" panel at full precision**, where our 8-bit backbuffer used to band. It also deletes the last 8-bit quantization in the pipeline (the CPU arms used to pack `u32 0x00RRGGBB`) and the `pow(1/2.2)` fake-sRGB encode, since scRGB is linear and the display pipeline applies the true EOTF. **What varies with the display is the CURVE, never the swapchain.** `--no-hdr` forces the legacy 8-bit path (the A/B lever, and the automatic fallback if `SetColorSpace1` is refused — loud line, full rebuild at SDR, never a degraded half-mode). Note the on-screen result is therefore NOT bit-identical to the pre-HDR build: it is *more* correct (the pow-2.2-vs-true-sRGB mismatch in the darks is gone). `--check`'s PNGs are unaffected — they are still written through `ToneParams::SDR`.
+**PQ is the default on an HDR-ON display; scRGB f16 is the default everywhere else** (2026-07-26 — this used to read "the f16 swapchain is the default on every monitor"). The reason is BYTES PER PRESENT, not colour: `R10G10B10A2` is 4 B/px against fp16's 8, and the present is the entire frame budget whenever the display hangs off a **different GPU than the renderer** — DWM must then COPY every frame across, which at 7680×3969 is 244 MB at fp16 vs 122 MB at PQ. Measured on this box (world, 8K, display driven by an Intel B70 while a 4090 renders): **6.1 → 10.0 rendered fps, ~80 → ~51 ms per present**, while the GPU itself was doing only 14.7 ms of work per frame — i.e. the wire, not the renderer, was the ceiling. PQ is also the format HDR titles ship, so it is not the quality trade it looks like. Two honest caveats: the win is ~nothing when the display hangs off the RENDER GPU (that present is a flip, no copy), and the scRGB numbers above came from a sample polluted by a resize transition, so treat the ratio as "meaningfully faster", not as a pinned 2×. **`--no-hdr10` is scRGB's explicit spelling** — it stopped being reachable as "neither flag" and the fp16 arm the HDR gates rest on must stay selectable (`cli::self_test` pins exactly that, plus that each of the three still wins from any predecessor).
+
+Handing Windows a linear f16 surface remains the right thing wherever the copy does not dominate: on an SDR display DWM tone-maps/clamps it and can still drive a **10-bit "deep colour" panel at full precision**, where our 8-bit backbuffer used to band — which is why an HDR-off display keeps scRGB rather than falling to PQ (whose `tone_pq` would only degenerate to the SDR rolloff there) or to 8-bit. It also deletes the last 8-bit quantization in the pipeline (the CPU arms used to pack `u32 0x00RRGGBB`) and the `pow(1/2.2)` fake-sRGB encode, since scRGB is linear and the display pipeline applies the true EOTF. **What varies with the display is the CURVE, never the swapchain.** `--no-hdr` forces the legacy 8-bit path (the A/B lever, and the automatic fallback if `SetColorSpace1` is refused — loud line, full rebuild at SDR, never a degraded half-mode). Note the on-screen result is therefore NOT bit-identical to the pre-HDR build: it is *more* correct (the pow-2.2-vs-true-sRGB mismatch in the darks is gone). `--check`'s PNGs are unaffected — they are still written through `ToneParams::SDR`.
 
 **The curve** (`src/tone.rs` — the single source of truth, ported term-for-term into `tonemap.hlsl`). Everything is in units of **paper white** (`--hdr-paper-white`, default 200 nits — the scene is authored so linear 1.0 ≈ diffuse white; the exposure anchor is now the sun's own irradiance plus `sky::DOME_SCALE`, which `sky::self_test` pins into a physically sane band), with a knee `k` and headroom `w = peak_nits / paper_white`:
 

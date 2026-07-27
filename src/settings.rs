@@ -480,6 +480,7 @@ pub fn apply_to_opts(s: &Settings, opts: &mut crate::Opts) -> AppliedFx {
         opts.hdr = v;
         if !v {
             opts.hdr10 = false;
+            opts.scrgb = false;
         }
     }
     if let Some(v) = d.hdr10 {
@@ -490,6 +491,13 @@ pub fn apply_to_opts(s: &Settings, opts: &mut crate::Opts) -> AppliedFx {
             // as "the PQ flavor", not a contradiction — hdr10 is the more
             // specific choice and wins).
             opts.hdr = true;
+            opts.scrgb = false;
+        } else {
+            // `hdr10: false` in the file is the menu's OFF state, and since PQ
+            // became the HDR-display default that has to mean "scRGB", not
+            // "whatever the probe picks" — otherwise the row could not turn PQ
+            // off at all. Mirrors the `--no-hdr10` arm.
+            opts.scrgb = true;
         }
     }
     if let Some(v) = d.hdr_paper_white {
