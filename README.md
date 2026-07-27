@@ -47,19 +47,36 @@ cross-vendor results.
 
 ### Relation to prior work
 
-The closest antecedent is Reshetov, Soupikov, and Hurley's 2005 Intel paper
-**Multi-Level Ray Tracing Algorithm**
+The closest antecedent **structurally** is Teller and Alex's 1998 MIT technical
+report **Frustum Casting for Arbitrary Polyhedral Environments**
+([in-repo copy](docs/papers/MIT-LCS-TR-740.pdf)), whose frustum descriptor —
+a shared point of view, four extreme rays, and four bounding planes — is the
+same object as this renderer's `TileFrustum`, subdivided by the same screen
+quadtree. Reshetov, Soupikov, and Hurley's 2005 Intel paper **Multi-Level Ray
+Tracing Algorithm**
 ([in-repo copy](docs/papers/mlrta105.pdf) ·
 [publisher](https://dl.acm.org/doi/10.1145/1073204.1073329) ·
-[public PDF](https://www.eng.utah.edu/~cs6965/papers/p1176-reshetov.pdf)),
-which uses image-space beams, adaptive tile subdivision, and deep hierarchy
-entry points. Later work includes [Traversing a BVH Cut to Exploit Ray
-Coherence](https://www.scitepress.org/PublishedPapers/2011/33634/) and
-[Faster Ray Tracing through Hierarchy Cut
+[public PDF](https://www.eng.utah.edu/~cs6965/papers/p1176-reshetov.pdf))
+contributes the other half: a **deep hierarchy entry point** found by descending
+with the beam. frustracer's cut is a strengthening of that entry point — an
+antichain of surviving nodes (~10 in practice) rather than the single node an
+MLRTA bifurcation stack yields. Later work includes [Traversing a BVH Cut to
+Exploit Ray Coherence](https://www.scitepress.org/PublishedPapers/2011/33634/)
+and [Faster Ray Tracing through Hierarchy Cut
 Code](https://diglib.eg.org/items/960d265d-7380-4fcf-aaf9-fd428fa0aeef).
 frustracer's contribution is a modern D3D12/DXR implementation and an explicit
 measurement of which products of the shared probe—empty tiles, `tmin`, and
 inherited cuts—actually pay on current hardware.
+
+That measurement now extends to the papers' own remaining ideas, and the
+result is mostly negative — which is the useful part. Teller's covering test
+(§4 opt 2) fires on 19.7% of San Miguel's pixels but is worth ~0.7% of frame
+time; his straddle-mask inheritance (§4 opt 3), MLRTA's Kay–Kajiya interval
+reject, and MLRTA's adaptive tile termination all optimize the frustum ladder,
+which is **0.22% of CPU node visits** on all three test scenes and 0% of a
+resting GPU frame (structure replay deletes it). Teller's frustum advance is
+structurally unavailable: it needs cell adjacency, which a BVH does not carry.
+See `src/oracle.rs` for the harness these came from.
 
 ### Software prototype of a hardware traversal continuation
 

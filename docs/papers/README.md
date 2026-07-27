@@ -15,7 +15,14 @@ to build or run the tracer.
 | File | Paper |
 |---|---|
 | `mlrta105.pdf` | Reshetov, Soupikov & Hurley, *Multi-Level Ray Tracing Algorithm*, ACM SIGGRAPH 2005 — [public copy](https://www.eng.utah.edu/~cs6965/papers/p1176-reshetov.pdf) |
+| `MIT-LCS-TR-740.pdf` | Teller & Alex, *Frustum Casting for Arbitrary Polyhedral Environments*, MIT LCS TR-740, 1998 |
 
-The closest antecedent to this renderer: image-space beams, adaptive tile
-subdivision, and deep hierarchy entry points. See "Relation to prior work" in
-the top-level README for what frustracer adds and what it merely re-measures.
+Between them these are the antecedents, and they contribute different halves.
+**TR-740 is the structural match**: its frustum descriptor — a shared point of
+view, four extreme rays, four bounding planes — is the same object as
+`TileFrustum`, subdivided by the same screen quadtree. **MLRTA contributes the
+deep hierarchy entry point**, of which this renderer's node cut is a
+strengthening (an antichain, not a single node). See "Relation to prior work"
+in the top-level README for what frustracer adds, what it merely re-measures,
+and which of the papers' remaining ideas were measured and found too small to
+build.
