@@ -1,4 +1,6 @@
-name: check
+# The workflow NAME is what GitHub prints on the status badge, so it is "CI"
+# rather than "check" — the badge reads "CI | passing".
+name: CI
 
 # Public repositories get standard runners free, which is what makes a Windows
 # job affordable here: a cold build is ~10-18 minutes (571 crates, with SDL3 and

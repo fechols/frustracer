@@ -1136,6 +1136,18 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
                     }
                 };
             }
+            // Stops, signed. Bounded at +/-8 because past that the tonemap is
+            // either a white field or black — a typo, not an intent.
+            "--cinematic-exposure" => {
+                let v = args.next().unwrap_or_default();
+                match v.parse::<f32>() {
+                    Ok(ev) if ev.is_finite() && ev.abs() <= 8.0 => cine.exposure = Some(ev),
+                    _ => {
+                        eprintln!("--cinematic-exposure needs stops in -8..=8 (got '{v}')");
+                        std::process::exit(2);
+                    }
+                }
+            }
             "--cinematic-encode" => cine.encode = true,
             "--cinematic-dry-run" => cine.dry_run = true,
             "--cinematic-hdr" => cine.hdr = true,
@@ -1502,6 +1514,10 @@ pub fn usage() {
                 eprintln!("    --cinematic-overlay        the quadtree debug overlay");
                 eprintln!("    --cinematic-hud <spec>     off | hud | menu | settings | settings:<Group>");
                 eprintln!("    --cinematic-out <dir>      default capture/");
+                eprintln!("    --cinematic-exposure <ev>  exposure compensation in stops (-8..=8). The");
+                eprintln!("                               enclosures — Sponza's atrium, San Miguel's patio,");
+                eprintln!("                               Bistro's street — are correctly in shadow and want");
+                eprintln!("                               +2 to +3, exactly as a camera would");
                 eprintln!("    --cinematic-hdr            HDR output: sequences become 16-bit PQ/Rec.2020");
                 eprintln!("                               frames encoded to HDR10 HEVC; stills also write a");
                 eprintln!("                               linear OpenEXR master + a PQ PNG (and the ffmpeg");

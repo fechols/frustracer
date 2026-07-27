@@ -95,6 +95,13 @@ impl Keyframe {
         self.tod = Some(hour);
         self
     }
+    /// Vertical FOV in degrees. Interiors want more than the 55-degree default:
+    /// an atrium or a street is framed by how much of the enclosure fits, not
+    /// by how large the subject is.
+    pub fn with_fov(mut self, deg: f32) -> Keyframe {
+        self.fov_deg = deg;
+        self
+    }
     pub fn eye_v(&self) -> Vec3A {
         Vec3A::from_array(self.eye)
     }
@@ -155,6 +162,23 @@ pub struct Shot {
     /// the pause menu opened on that settings page.
     #[serde(default)]
     pub hud: Option<Option<String>>,
+    /// Exposure compensation in STOPS, applied to linear radiance immediately
+    /// before the tonemap — the shutter/ISO control a real camera has and the
+    /// renderer did not.
+    ///
+    /// It exists because the tonemap is anchored at a fixed paper white and the
+    /// interesting parts of these scenes are ENCLOSURES: Sponza's atrium, San
+    /// Miguel's patio, Bistro's street. The sun is occluded there by
+    /// construction, so a physically correct render of a courtyard at 15:30 is
+    /// two or three stops under a sunlit exterior — correct, and unpublishable.
+    /// Brightening the sky or the tonemap instead would be a lie about the
+    /// lighting; opening the aperture is what a photographer does.
+    ///
+    /// 0.0 is EXACTLY unchanged (`scale()` returns 1.0 and the call site
+    /// branches around the copy entirely), so every existing capture and the
+    /// whole `--check` surface are bit-identical.
+    #[serde(default)]
+    pub exposure: f32,
 }
 
 impl Shot {
@@ -169,6 +193,17 @@ impl Shot {
             gi: false,
             overlay: false,
             hud: None,
+            exposure: 0.0,
+        }
+    }
+
+    /// Linear multiplier for `exposure` stops. Exactly 1.0 at 0 stops — the
+    /// off-state the bit-identity contract above rests on.
+    pub fn exposure_scale(&self) -> f32 {
+        if self.exposure == 0.0 {
+            1.0
+        } else {
+            self.exposure.exp2()
         }
     }
 }
@@ -342,8 +377,16 @@ pub fn world_lap(w: &World, frames: u32, fps: u32, res: (usize, usize), samples:
     // plain. An aerial three-quarter view is what makes an island read as a
     // PLACE. Standoff stays >= ~1.5r so the lap is still comfortably outside
     // every island (the clearance gate measures it).
-    let stand = |i: &crate::world::Island| i.radius * 1.35 + rmax * 0.15;
-    let up = |i: &crate::world::Island| i.radius * 0.85 + rmax * 0.12;
+    //
+    // HEIGHT COMES OFF `height`, NOT `radius`. Both terms used to scale with the
+    // footprint, which flies the camera at a fixed multiple of how WIDE an
+    // island is and has nothing to do with how tall it is: the lap cleared
+    // Sponza (3.4 high) by the same margin it cleared Rungholt (0.8), so a city
+    // and a cathedral both read as models on a table. Keyed to height the eye
+    // sits a little above each subject's own roofline, which is the altitude at
+    // which a place looks like a place.
+    let stand = |i: &crate::world::Island| i.radius * 1.90 + i.height * 0.60;
+    let up = |i: &crate::world::Island| i.height * 0.75 + i.radius * 0.45;
     // Per-island viewing key, plus a TRANSIT key on the ring arc between each
     // pair. The transit keys are what keep the lap outside the ring: a spline
     // straight from one island's eye to the next chords ACROSS the ring, and at
@@ -357,10 +400,20 @@ pub fn world_lap(w: &World, frames: u32, fps: u32, res: (usize, usize), samples:
     // own attractor field, sampled per output frame (invariant 3), which is the
     // same signal the interactive flycam eases toward — so a lap sweeps the day
     // exactly as flying it by hand does.
+    //
+    // THE LAP STAYS OUTSIDE, and that is a decision rather than an oversight.
+    // Threading it through the authored interiors was built and measured and is
+    // worse: the transits between enclosures have to clear both rooflines, so
+    // the camera spends most of its frames high regardless; the climbs in and
+    // out clip walls on the way through; and swinging between floor level and
+    // above the ring seven times makes the attractor clock lurch, so the day
+    // sweep — the whole point of the lap — stops reading as one continuous
+    // sunrise. An aerial lap is the honest shape for a ring of dioramas. The
+    // interiors are what the `islands` series is for.
     let mut keys: Vec<Keyframe> = Vec::with_capacity(n * 2);
     for (idx, isl) in w.islands.iter().enumerate() {
         let eye = isl.center + outward(isl.center) * stand(isl) + Vec3A::Y * up(isl);
-        keys.push(Keyframe::new(eye, isl.center + Vec3A::Y * (isl.radius * 0.18)));
+        keys.push(Keyframe::new(eye, isl.center + Vec3A::Y * (isl.height * 0.45)));
         if n < 2 {
             continue;
         }
@@ -380,12 +433,18 @@ pub fn world_lap(w: &World, frames: u32, fps: u32, res: (usize, usize), samples:
         let am = a0 + d * 0.5;
         let r0 = Vec3A::new(isl.center.x, 0.0, isl.center.z).length();
         let r1 = Vec3A::new(next.center.x, 0.0, next.center.z).length();
-        let rm = 0.5 * (r0 + r1) + 0.5 * (stand(isl) + stand(next));
-        let hm = 0.65 * (up(isl) + up(next));
+        // Transits ride WIDER and HIGHER than the island keys they sit between,
+        // which is what turns the lap into a series of dips: the camera climbs
+        // away over the empty apron, then drops toward the next island so it
+        // grows in frame on approach. Pushing the radius past the plain mean
+        // also counters the inward scallop a Catmull-Rom takes across a convex
+        // ring (the clearance gate measures what survives).
+        let rm = 0.5 * (r0 + r1) + 0.62 * (stand(isl) + stand(next));
+        let hm = 0.80 * (up(isl) + up(next)) + rmax * 0.10;
         let eye = Vec3A::new(rm * am.cos(), hm, rm * am.sin());
         // Look ahead to where the lap is going, so the camera arrives already
         // framing the next island instead of whipping round on approach.
-        keys.push(Keyframe::new(eye, next.center + Vec3A::Y * (next.radius * 0.18)));
+        keys.push(Keyframe::new(eye, next.center + Vec3A::Y * (next.height * 0.45)));
     }
     Shot {
         name: "tour".to_string(),
@@ -394,22 +453,93 @@ pub fn world_lap(w: &World, frames: u32, fps: u32, res: (usize, usize), samples:
         closed: true,
         res,
         samples,
+        exposure: 0.0,
         gi: false,
         overlay: false,
         hud: None,
     }
 }
 
+/// Authored framing for the curated islands: `(name, eye, target, fov, stops)`,
+/// where eye/target are offsets from the island centre in units of its own
+/// `radius` (x/z) and `height` (y), so an entry survives a scene being refitted
+/// or the ring being re-laid.
+///
+/// THE RULE THIS EXISTS TO BREAK. The bounding-sphere fit below is correct for
+/// a SUBJECT and wrong for an ENCLOSURE. Framing a whole sphere from outside at
+/// a 30-degree depression photographs the Damaged Helmet beautifully and
+/// photographs Sponza's ROOF — and roofs are what shipped: the most famous
+/// atrium in computer graphics as a rectangle of tiles, San Miguel's patio as a
+/// grey box, Bistro's street as a smudge two hundred metres up. An enclosure has
+/// to be shot from INSIDE, at eye level, which is a fact about the building and
+/// not something a formula over a bounding box can recover.
+///
+/// So the five enclosures are authored and the two subjects are not: Rungholt
+/// is a landscape and reads from above, the helmet is an object and the sphere
+/// fit is exactly right for it. Anything absent — a user's own scene, an island
+/// added later — falls through to the generic rule unchanged.
+///
+/// The hours are `CURATED`'s own, and each entry shoots what that table already
+/// SAYS the island is for: "morning courtyard", "afternoon patio",
+/// "golden-hour street", "moonlit night garden".
+///
+/// `stops` is exposure compensation (see `Shot::exposure`). It belongs here
+/// rather than in a flag because it is a property of the subject: a courtyard
+/// with the sun behind a wall is genuinely two stops under a lit exterior, and
+/// every photographer opens up for the same reason. The two exteriors take 0.
+const ISLAND_FRAMING: &[(&str, [f32; 3], [f32; 3], f32, f32)] = &[
+    // Down the length of the atrium from the west end, tilted up so the
+    // colonnade and the open sky above it carry the frame.
+    ("sponza", [-0.425, 0.103, 0.025], [0.575, 0.324, 0.025], 70.0, 2.0),
+    // The patio: fountain anchoring the centre, the arcade sweeping up on the
+    // right, the ficus canopy framing the top and a gap of sky between them.
+    // The eye sits LOW and the target HIGH on purpose — a level camera renders
+    // the same courtyard as a furniture catalogue, and tilting up is what makes
+    // the arcade tower instead of merely stand there.
+    ("san-miguel", [0.261, 0.170, 0.043], [-0.391, 0.380, 0.043], 66.0, 2.0),
+    // Street level at the corner, looking across the plaza to the tree and the
+    // lamps, with the wet cobbles taking the low sun.
+    ("bistro", [0.222, 0.225, 0.222], [0.639, 0.300, 0.556], 65.0, 2.0),
+    // Shooting INTO the low sun, so the plant is rim-lit and the cranes and
+    // chimney read as silhouette. The obvious sun-behind-camera angle is
+    // technically better exposed and looks like nothing: at 06:30 the long
+    // optical path makes the Mie haze the brightest thing in frame and the
+    // whole image goes milky. -1 stop puts the contrast back.
+    ("powerplant", [-0.700, 0.236, -0.656], [-0.378, 0.264, -0.098], 65.0, -1.0),
+    // Low in the voxel garden so the fireflies sit against the star field.
+    // Night stays night: +2 is legibility at README thumbnail size, not daylight.
+    ("vokselia", [0.657, 0.375, 0.0], [-0.486, 0.750, 0.0], 75.0, 2.0),
+];
+
 /// One framed still per island, named so they sort in ring/hour order.
 ///
-/// The framing reuses the project's own default look direction (the
-/// `scaled_camera` offset), scaled to the island's radius, so an island still
-/// reads like the app's boot pose rather than an arbitrary angle.
+/// Authored framing wins where `ISLAND_FRAMING` has an entry; everything else
+/// takes the bounding-sphere fit below.
 pub fn island_shots(w: &World, res: (usize, usize), samples: u32) -> Vec<Shot> {
     w.islands
         .iter()
         .enumerate()
         .map(|(i, isl)| {
+            if let Some(&(_, eye, tgt, fov, stops)) =
+                ISLAND_FRAMING.iter().find(|f| f.0 == isl.name)
+            {
+                let at = |o: [f32; 3]| {
+                    isl.center + Vec3A::new(o[0] * isl.radius, o[1] * isl.height, o[2] * isl.radius)
+                };
+                let hh = (isl.theme_hour.floor() as u32).min(23);
+                let mm = ((isl.theme_hour.fract() * 60.0).round() as u32).min(59);
+                let key = Keyframe::new(at(eye), at(tgt))
+                    .with_fov(fov)
+                    .with_tod(isl.theme_hour);
+                let mut s = Shot::still(
+                    &format!("island-{:02}-{}-{:02}{:02}", i + 1, isl.name, hh, mm),
+                    key,
+                    res,
+                    samples,
+                );
+                s.exposure = stops;
+                return s;
+            }
             // Frame from INSIDE the ring looking outward, at a ~30 degree
             // depression. Two deliberate choices, both learned from the first
             // 4K pass:
@@ -485,6 +615,7 @@ pub fn orbit_shot(
         closed: true,
         res,
         samples,
+        exposure: 0.0,
         gi: false,
         overlay: false,
         hud: None,
@@ -544,6 +675,9 @@ pub struct CineOpts {
     pub hdr: bool,
     /// Where linear 1.0 lands, in nits. Lower = more highlight headroom.
     pub paper_white: f32,
+    /// Exposure compensation in stops — see `Shot::exposure`. `None` leaves
+    /// each shot's own value alone (presets author their own for enclosures).
+    pub exposure: Option<f32>,
 }
 
 impl Default for CineOpts {
@@ -562,6 +696,7 @@ impl Default for CineOpts {
             island: None,
             hdr: false,
             paper_white: 200.0,
+            exposure: None,
         }
     }
 }
@@ -659,10 +794,20 @@ pub fn resolve_shots(
                 // island from the sun's azimuth, keeping the same distance and
                 // depression, so the sun sits beyond the subject: rim light,
                 // long shadows toward camera, the disc and its glare in frame.
+                //
+                // ...unless the island is AUTHORED. The relocation below is a
+                // rule for framing a subject from outside, and an authored
+                // entry means the subject is an enclosure whose shot was
+                // composed by eye from within it — moving that eye out to the
+                // island's sunward apron discards the composition and puts the
+                // camera back outside the building looking at a wall. Where an
+                // author already made the call, honour it (powerplant's entry
+                // shoots into the sun on its own terms).
                 let isl = &w.islands[idx];
+                let authored = ISLAND_FRAMING.iter().any(|f| f.0 == isl.name);
                 let sun = crate::scene::sun_dir_for_tod(isl.theme_hour);
                 let az = Vec3A::new(sun.x, 0.0, sun.z);
-                if az.length_squared() > 1e-6 {
+                if !authored && az.length_squared() > 1e-6 {
                     let target = s.keys[0].target_v();
                     let fit = (isl.radius * 0.75).max(isl.height * 0.5).max(1e-3);
                     let d = fit * 2.6;
@@ -770,6 +915,9 @@ pub fn resolve_shots(
         if c.hud.is_some() {
             s.hud = c.hud.clone();
         }
+        if let Some(ev) = c.exposure {
+            s.exposure = ev;
+        }
     }
     Ok(shots)
 }
@@ -856,14 +1004,30 @@ pub fn ffmpeg_cmds(
         ));
         // An SDR sibling, tone-mapped from the PQ frames, so there is something
         // every player and every README can actually show.
+        //
+        // THE INPUT COLOUR TAGS ARE LOAD-BEARING AND GO BEFORE `-i`. A PNG
+        // carries no colour metadata, so a bare `zscale=t=linear` has no input
+        // transfer function to convert FROM and the whole filter graph dies
+        // with "code 3074: no path between colorspaces" — which is an ffmpeg
+        // library error, so it surfaces as a failed encode and a zero-byte mp4
+        // rather than anything that names the cause. Declaring the frames as
+        // PQ/Rec.2020 on the INPUT side is what fixes it; the same properties
+        // written into the filter as `tin=`/`pin=` do NOT (zscale still refuses
+        // the RGB-matrix conversion), which is worth knowing before anyone
+        // "tidies" this back into the filter string.
         out.push((
             "SDR HEVC (tone-mapped from the HDR frames, for players without HDR)".to_string(),
             vec![
                 s("-y"), s("-framerate"), fps.to_string(), s("-start_number"), s("0"),
+                s("-color_primaries"), s("bt2020"), s("-color_trc"), s("smpte2084"),
+                s("-colorspace"), s("bt2020nc"),
                 s("-i"), pattern.clone(),
                 s("-vf"),
-                s("zscale=t=linear:npl=100,tonemap=hable:desat=0,\
-                   zscale=p=bt709:t=bt709:m=bt709:r=limited,format=yuv420p"),
+                format!(
+                    "zscale=t=linear:npl={},format=gbrpf32le,zscale=p=bt709,\
+                     tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=limited,format=yuv420p",
+                    HDR_MASTER_NITS as u32 / 5
+                ),
                 s("-c:v"), s("libx265"), s("-preset"), s("slow"), s("-crf"), s("20"),
                 s("-tag:v"), s("hvc1"), s("-movflags"), s("+faststart"),
                 format!("{dir}/{name}.mp4"),
@@ -964,6 +1128,51 @@ pub fn composite_premul(present: &mut [u32], hud: &[[u8; 4]], w: usize, h: usize
 
 /// Closed-form gates, run by `--check`. Pure — no rng, no GPU, no DLLs.
 pub fn self_test() -> Result<(), String> {
+    // ISLAND_FRAMING is keyed by island NAME, and a key that matches nothing
+    // fails SILENTLY into the bounding-sphere rule — which is the exact bug the
+    // table exists to fix, so a rename would quietly restore roof photos of
+    // Sponza with every gate still green. Pin the keys against the curated set.
+    {
+        for (name, eye, tgt, fov, ev) in ISLAND_FRAMING {
+            if !crate::world::CURATED.iter().any(|s| s.name == *name) {
+                return Err(format!(
+                    "ISLAND_FRAMING references '{name}', which is not a CURATED island"
+                ));
+            }
+            // Offsets are in units of radius/height; past a few island radii the
+            // camera is out over the ring and framing something else entirely.
+            for v in eye.iter().chain(tgt.iter()) {
+                if !v.is_finite() || v.abs() > 4.0 {
+                    return Err(format!("ISLAND_FRAMING '{name}': offset {v} out of range"));
+                }
+            }
+            if !(20.0..=110.0).contains(fov) {
+                return Err(format!("ISLAND_FRAMING '{name}': fov {fov} out of range"));
+            }
+            if !ev.is_finite() || ev.abs() > 8.0 {
+                return Err(format!("ISLAND_FRAMING '{name}': exposure {ev} out of range"));
+            }
+            // An eye that coincides with its target has no look direction.
+            let d = (0..3).map(|i| (eye[i] - tgt[i]).powi(2)).sum::<f32>();
+            if d < 1e-6 {
+                return Err(format!("ISLAND_FRAMING '{name}': eye and target coincide"));
+            }
+        }
+        // Exposure must be structurally inert at 0 — the bit-identity contract
+        // every pre-exposure capture rests on.
+        let mut s = Shot::still("t", Keyframe::new(Vec3A::ZERO, Vec3A::X), (4, 4), 1);
+        if s.exposure_scale() != 1.0 {
+            return Err("exposure 0 must scale by exactly 1.0".into());
+        }
+        s.exposure = 1.0;
+        if s.exposure_scale() != 2.0 {
+            return Err("exposure +1 stop must scale by exactly 2.0".into());
+        }
+        s.exposure = -1.0;
+        if s.exposure_scale() != 0.5 {
+            return Err("exposure -1 stop must scale by exactly 0.5".into());
+        }
+    }
     // The spline must agree with main.rs's copy at an arbitrary interior point.
     {
         let (p0, p1, p2, p3) = (
@@ -1284,6 +1493,26 @@ pub fn self_test() -> Result<(), String> {
         }
         if !h10.iter().any(|a| a.contains("-hdr10.mp4")) {
             return Err("HDR10 output must be named distinctly from the SDR sibling".into());
+        }
+        // The SDR sibling tone-maps FROM those PQ frames, and a PNG carries no
+        // colour metadata — so the input transfer/primaries must be declared
+        // BEFORE `-i` or zscale has nothing to convert from and the encode dies
+        // with "no path between colorspaces", leaving a zero-byte mp4. This
+        // shipped broken; the position of the tags is the whole fix, so pin it.
+        let sdr = &hdr[1].1;
+        let i_at = sdr
+            .iter()
+            .position(|a| a == "-i")
+            .ok_or("SDR sibling has no input")?;
+        for tag in ["-color_trc", "-color_primaries"] {
+            match sdr.iter().position(|a| a == tag) {
+                Some(p) if p < i_at => {}
+                Some(_) => return Err(format!("SDR tone-map: {tag} must precede -i")),
+                None => return Err(format!("SDR tone-map must declare {tag} on the input")),
+            }
+        }
+        if !sdr.iter().any(|a| a.contains("tonemap=")) {
+            return Err("SDR sibling must actually tone-map".into());
         }
         // A still's HDR path must produce a VIEWABLE, PQ-TAGGED file — and the
         // tag must go through `setparams`, since the output-option form writes

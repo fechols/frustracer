@@ -4,8 +4,9 @@
 quadtree, and empty space is proven empty *once per tile* instead of once per
 pixel.
 
-![The Bistro island at golden hour](docs/media/hero.webp)
+![San Miguel's courtyard, rendered with hemisphere-bounce global illumination](docs/media/hero.webp)
 
+[![CI](https://github.com/fechols/frustracer/actions/workflows/ci.yml/badge.svg)](https://github.com/fechols/frustracer/actions/workflows/ci.yml)
 [![licence: MIT](https://img.shields.io/badge/licence-MIT-blue.svg)](LICENSE)
 ![platform: Windows x64](https://img.shields.io/badge/platform-Windows%20x64-lightgrey.svg)
 ![renderer: D3D12 / DXR](https://img.shields.io/badge/renderer-D3D12%20%2F%20DXR-green.svg)
@@ -423,9 +424,13 @@ each one's A/B is how its cost was measured in the first place.
 
 *The **O** overlay, tinting each pixel by how its tile resolved. The blue band
 is sky **proven empty and traced with zero rays**; the warm region is where
-tiles reached the leaf level and fired real rays. (It needs the quadtree, so
-it runs on the CPU or `--gpu` arm — `--dxr` traces from the TLAS root and has
-no subdivision to show.)*
+tiles reached the leaf level and fired real rays. Shot on the procedural scene
+(`--no-world`) on purpose: the world's islands all stand on one enormous ground
+quad whose bounding box reaches nearly every frustum, so almost nothing is
+provable as empty until deep in the tree and the overlay flattens to a single
+tint. Sparse geometry against open sky is where the algorithm's product is
+visible. (It needs the quadtree, so it runs on the CPU or `--gpu` arm —
+`--dxr` traces from the TLAS root and has no subdivision to show.)*
 
 ---
 
@@ -1001,15 +1006,101 @@ closest-hit / SBT machinery doing its real job for the primary ray.
 `--dxr-inline 2` remains the right manual pick for a high-spp Intel DXR
 session. The numbers were the product; the default is the dividend.
 
+## On Intel Arc
+
+Most of this renderer was developed with an Arc Pro B70 in the same machine as
+an RTX 4090, and running every change on both is where a surprising share of
+the findings came from. These are the Arc-specific ones, with the numbers
+attached. Some are properties of the hardware, some of the *driver*, and some
+of the *tooling* — the distinction matters, so each one says which it is.
+
+**A single large BLAS is a vendor cliff.** Acceleration-structure scratch is
+sized by the largest single geometry, so THE WORLD's one 34.4-million-triangle
+BLAS made the B70's driver ask for **1891 MB of scratch and then remove the
+device** mid-boot (`0x887A0005`, followed by a fall back to CPU tracing and a
+panic at `Present`). The same build asks an RTX 4090 for **276 MB** and
+survives. Splitting the ray BVH into maximal subtrees of ≤ 64k triangles makes
+the scratch a function of one chunk — 3 MB — and the session runs. That it is
+BLAS *size* and nothing else is proven by `--blas-split 40000000`, which routes
+one chunk through the armed path and reproduces the removal at the same
+1891 MB. Compaction diverges too: 4624 → 1576 MB where NVIDIA goes
+1844 → 668. This is why `--no-blas-split` is a lever and splitting is the
+default — for robustness, not speed. On NVIDIA the split is performance-neutral.
+
+**Benchmarking Arc requires a warm-up run, and the failure is silent.** The
+driver compiles each new DXIL variant twice: PSO creation returns a
+fast-to-produce unoptimised binary, and a background recompile replaces it on a
+**wall-clock** schedule, measured at ~5–8 seconds, caching the result in
+`%LOCALAPPDATA%\D3DSCache`. So a 140-frame `--spin` run — about 4 seconds —
+*ends before the optimised binary lands* and is 100% fallback. Measured on a
+fresh kernel variant over 1200 frames in 120-frame windows:
+7.20 / 6.40 / 5.82 / 5.62 / 2.84 / 1.62 ms, then flat. That is **~4.7× on the
+frame span and ~7.6× on the leaf kernel**, dead stable across the whole first
+run, with the next run reading 1.5 ms off the cache. The trap is that a
+fallback read *repeats*, so two agreeing back-to-back runs prove nothing. Every
+point in a configuration sweep is a new variant; discard one run per variant,
+and re-run any anomalous cell after a ≥ 10 second pause. The B70 then repeats
+to ±0.002 ms — far tighter than the 4090, which spans 1.42–1.98 ms for one
+unchanged configuration.
+
+**PIX cannot analyse an Arc capture at all.** Its replay engine fails
+`D3D12EnableExperimentalFeatures` — with Developer Mode on, and with
+`--disable-gpu-plugins` — so there is no way to get numbers out of a `.wpix` on
+this hardware. That is why `--gpu-timing` exists: D3D12 timestamp queries
+around the same brackets the PIX markers use, vendor-neutral, and the only
+per-pass GPU profiler available on Arc. Its being vendor-neutral is load-bearing
+in the other direction too, because it makes a **per-pass diff between vendors**
+possible, and that diff is what found the next two bugs.
+
+**`LEAF_GROUP = 256`, which the other two vendors would never suggest.** The
+leaf kernel's group width was 32, reasoned from wave32/wave64. A 2-D sweep of
+`(LEAF_TILE, LEAF_GROUP)` on the B70 put the optimum at `(32, 256)` — 1.652 →
+1.291 ms on the default scene (−21.9%) and 2.009 → 1.457 on `--stress 5000`
+(−27.5%) — with `LEAF_GROUP = 8` bad everywhere, which is the SIMD16 floor
+showing through directly. The pair was adopted as the cross-vendor default: it
+is worth −15% at rest and −21.6% moving on the world for the B70, and −28% to
+−42% on `--spin` for the 4090. Note that the two constants must move together;
+the group width alone is worth nothing.
+
+**The `cs_sky` load-balance bug, which only a cross-vendor diff could find.**
+The wavefront tracer was paying +6.9 to +9.2 ms for clouds while the DXR
+pipeline paid +0.2 — for the *same* pasted march. A 30× discrepancy on shared
+code can only be dispatch shape, never the shader. `cs_sky` was running one
+64-lane group per sky record and grid-striding the whole rect inside it, and a
+sky rect is emitted at whatever depth the quadtree proved empty, so a depth-2
+rect at 1080p is 480×270 = 129,600 pixels marched by one group. The fix is
+dispatch-only: **B70 8.95 → 1.56 ms** on the default scene and 13.07 → 2.81 on
+stress; 4090 4.99 → 1.25 and 7.32 → 1.96. The generalisable lesson is that when
+one pipeline pays for a shared shader and the other does not, suspect the
+dispatch shape — and the instrument that exposes it is the per-pass timing diff
+across two vendors.
+
+**One negative result worth recording.** `--sw-rays` replaces the wavefront's
+hardware `RayQuery` with this project's own BVH traversal in HLSL, which lets
+leaf primaries seed from the tile's node cut — the one product of the frustum
+recursion the RayQuery API cannot accept. Hardware traversal wins anyway, on
+the vendor whose RT cores are weakest: B70 at 1 spp reads 1.76 ms hardware
+against 2.54 software, and the cut seed recovers about 1% of that 44% gap. At
+16 spp it is 13.54 against 26.35. So the shared empty-space proof, not custom
+traversal, is what the quadtree is actually for on a GPU.
+
+**XeSS frame generation is verified working here**, including at HDR10: the
+library's own `GetLastPresentStatus` reports two frames presented per present
+with a SUCCESS generation result, and PresentMon shows ~174 presents/s over ~87
+rendered. One API-shape note for anyone wiring it: the XeSS-FG proxy
+*delegates* to the application's swapchain, where the AMD FidelityFX one
+*consumes* it — so the app-side reference must stay alive until
+`xefgSwapChainDestroy`, and releasing it early is a silent native crash.
+
 ## What the quadtree is actually worth
 
-Worth stating plainly, because the framing invites overclaiming. The published
-0.87–0.93× Intel and 1.31–1.37× NVIDIA marginal ratios were measured with the
-old `(LEAF_TILE, LEAF_GROUP) = (8, 32)` frontier. The shipping frontier is now
-`(32, 256)`, and the timing instrumentation that produced the old table was
-subsequently found to include uneven asynchronous-compilation bias. Those
-ratios—and the old ~16-spp Intel crossover—are historical results, not current
-claims. A new cross-vendor sweep is required before quoting replacements.
+Worth stating plainly, because the framing invites overclaiming. This project
+used to publish 0.87–0.93× Intel and 1.31–1.37× NVIDIA marginal ratios, and an
+Intel crossover at about 16 spp. **Those numbers are retracted.** They were
+measured at the old `(LEAF_TILE, LEAF_GROUP) = (8, 32)` frontier — the shipping
+one is `(32, 256)` — and the instrumentation behind them carried uneven
+asynchronous-compilation bias. What follows replaces them, measured on the
+shipping build.
 
 The current B70 harness makes the remaining gap explicit. Over one
 deterministic 600-frame camera lap at 1920×1080 and 1 spp, after 1,600 warm-up
@@ -1039,6 +1130,27 @@ Its endpoint cost model (derived from spp 1 and 16) is
 slopes—and 0.99× asymptotic ratio—say that the current implementation nearly
 amortizes its fixed front-end cost at high SPP; it does not yet recover that
 cost in the measured range.
+
+**The same sweep on an RTX 4090** (same build, same suite, a warm-up run
+discarded on each adapter) gives `0.37 + 0.231 × spp` for the hybrid against
+`0.13 + 0.222 × spp` for plain, a 1.03–1.04× asymptote, and 1.69× at 1 spp
+falling to 1.10× at 16. Put beside the Arc row, that is the honest replacement
+for the retracted table, and it is a **simpler and less flattering** result
+than the one it replaces:
+
+| | fixed ms | ms per sample | quadtree vs plain, per sample | asymptote |
+|---|---:|---:|---:|---:|
+| Arc Pro B70 | 0.65 vs 0.26 | 0.749 vs 0.758 | 1.2% **cheaper** | 0.99× |
+| RTX 4090 | 0.37 vs 0.13 | 0.231 vs 0.223 | 3.6% dearer | 1.03× |
+
+The old story was that the quadtree made each sample meaningfully cheaper on
+Intel and dearer on NVIDIA — a genuine hardware-balance inversion. **At the
+shipping frontier that inversion is gone.** The marginal sample now costs
+within a few percent of hardware root traversal on both vendors, so what
+separates the arms is almost entirely the fixed front-end cost the quadtree
+pays once per frame and does not earn back between 1 and 16 spp. Intel still
+comes out very slightly ahead, but 1.2% is not a crossover and should not be
+sold as one.
 
 One conclusion survived every ablation: tightening the inherited distance
 changed ray traversal very little. Setting leaf `t_start` to zero cost only

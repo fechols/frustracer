@@ -8294,6 +8294,33 @@ fn run_cinematic(
         },
         std::process::id()
     );
+    // The geometry every world shot is framed against. The per-island load
+    // lines carry this too, but ONLY on a cache rebuild — a warm boot (the
+    // normal case) prints nothing, so authoring a pose meant deleting the
+    // sidecar or guessing. Cheap, and it is exactly the table you need open
+    // while writing `--cam` coordinates or a framing entry.
+    if let Some(w) = world {
+        for isl in &w.islands {
+            // The sun at this island's own hour, because framing is mostly a
+            // question of where the light is: a contre-jour eye goes at
+            // `target - az * d` (looking back along the azimuth, sun beyond the
+            // subject), and the elevation says whether that puts the disc in
+            // frame or behind the roofline.
+            let sun = scene::sun_dir_for_tod(isl.theme_hour);
+            let az = Vec3A::new(sun.x, 0.0, sun.z);
+            let (azn, elev) = if az.length_squared() > 1e-6 {
+                (az.normalize(), sun.y.asin().to_degrees())
+            } else {
+                (Vec3A::X, 90.0)
+            };
+            eprintln!(
+                "  isle     {:<12} center ({:+7.1},{:+7.1},{:+7.1})  r {:5.1}  h {:5.1}  \
+                 theme {:05.2}h  sun az ({:+.3},{:+.3}) elev {:+5.1}°",
+                isl.name, isl.center.x, isl.center.y, isl.center.z, isl.radius, isl.height,
+                isl.theme_hour, azn.x, azn.z, elev
+            );
+        }
+    }
     for s in &shots {
         let (w, h) = s.res;
         let extra = format!(
@@ -8625,6 +8652,19 @@ fn cine_write_frame(
 ) {
     let seq = shot.kind.is_sequence();
     let hdr_frames = cine.hdr && seq;
+    // Exposure: a linear scale on radiance, applied ONCE here so the SDR PNG,
+    // the PQ frames and the EXR master are all the same exposure by
+    // construction. At 0 stops the scale is exactly 1.0 and we keep using the
+    // caller's slice — no copy, no multiply, bit-identical to the pre-exposure
+    // renderer (the `--no-*` lever discipline).
+    let ev = shot.exposure_scale();
+    let scaled: Vec<f32>;
+    let hdr: &[f32] = if ev == 1.0 {
+        hdr
+    } else {
+        scaled = hdr.iter().map(|v| v * ev).collect();
+        &scaled
+    };
     if !hdr_frames {
         render::resolve_hdr(hdr, info, shot.overlay, present, rw, rh, rw, rh);
         #[cfg(windows)]
