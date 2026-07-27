@@ -303,10 +303,20 @@ mod ngxfg {
         ) -> i32;
         pub fn frdlssg_dispatch(handle: *mut c_void, d: *const FrDlssgDispatch) -> i32;
         /// FEATURE-scoped res move: ReleaseFeature + CreateFeature at the new
-        /// render res — params/init untouched (destroy's DestroyParameters
-        /// killed the SHARED SL NGX parameter map mid-session and every
-        /// subsequent sl.dlss_d evaluate failed 0xBAD00004 FeatureNotFound).
-        pub fn frdlssg_recreate(handle: *mut c_void, rend_w: u32, rend_h: u32) -> i32;
+        /// display AND render res — params/init untouched (destroy's
+        /// DestroyParameters killed the SHARED SL NGX parameter map
+        /// mid-session and every subsequent sl.dlss_d evaluate failed
+        /// 0xBAD00004 FeatureNotFound). Both sizes travel because a WINDOW
+        /// resize routes through here too: rend-only left the feature at the
+        /// old display with a larger render res, which NGX rejects at
+        /// evaluate with 0xBAD00005 FAIL_InvalidParameter.
+        pub fn frdlssg_recreate(
+            handle: *mut c_void,
+            disp_w: u32,
+            disp_h: u32,
+            rend_w: u32,
+            rend_h: u32,
+        ) -> i32;
         pub fn frdlssg_destroy(handle: *mut c_void);
     }
 
@@ -332,7 +342,13 @@ mod ngxfg {
     }
     #[cfg(not(dlssg_ngx))]
     #[allow(clippy::missing_safety_doc)]
-    pub unsafe fn frdlssg_recreate(_h: *mut c_void, _rw: u32, _rh: u32) -> i32 {
+    pub unsafe fn frdlssg_recreate(
+        _h: *mut c_void,
+        _dw: u32,
+        _dh: u32,
+        _rw: u32,
+        _rh: u32,
+    ) -> i32 {
         ERR_UNSUPPORTED
     }
     #[cfg(not(dlssg_ngx))]
@@ -401,9 +417,28 @@ struct NgxFgState {
     /// FR_NGXFG_RMV=off — hand the evaluate the raw SURFACE-MV plane (the
     /// A/B arm that brings the reflection swimming back on demand).
     rmv_off: bool,
-    /// FR_NGXFG_JITTER: 0 = the SL-negated default, 1 = zero, 2 = raw
-    /// (un-negated). Empirical-settling lever — quinlight validated the
-    /// snippet with jitter (0,0) only.
+    /// FR_NGXFG_JITTER: 0 = RAW (un-negated) — THE DEFAULT, settled by
+    /// measurement; 1 = zero; 2 = "neg", the SL-negated convention this used
+    /// to default to.
+    ///
+    /// THE NEGATION WAS WRONG, and it shipped because it was reasoned by
+    /// analogy instead of measured: Streamline's RR wants a NEGATED sample
+    /// offset (settled empirically, and documented as such), so "same NGX
+    /// family, one sign" looked safe. It is not — raw NGX wants the offset
+    /// AS IS. quinlight could never have caught it (its jitter was 0,0, so
+    /// every sign is identical), which is the same blind spot that hid traps
+    /// 4-6.
+    ///
+    /// A sign error misplaces content by TWICE the jitter (~1 px), which is
+    /// invisible on diffuse geometry and blatant on a small, extremely bright
+    /// specular highlight — the sun reflecting off DamagedHelmet's metal,
+    /// where the disc's ~44,000 radiance against a ~1.0 scene turns a 1 px
+    /// warp into a strobing smear. Diagnosed by elimination on 2026-07-26:
+    /// resolution, frame rate, the resize path, the virtual-image MVs,
+    /// PAIR_BACKBUFFERS and the scene were each ruled out by measurement,
+    /// and the FidelityFX interpolator was CLEAN on the identical frame —
+    /// which localized it to what we hand NGX. Both `raw` and `0` look clean
+    /// (they differ by only half a pixel); `raw` is the one that is true.
     jitter_mode: u8,
     /// FR_NGXFG_MV: 0 = pixel scale {1,1} — THE DEFAULT, settled from
     /// dlssg-to-fsr3, which passes DLSSG.MvecScale STRAIGHT into FSR3's
@@ -1146,10 +1181,13 @@ impl GpuContext {
                             }
                         }
                     };
-                    let jitter_mode = lever("FR_NGXFG_JITTER", &["0", "raw"]);
+                    let jitter_mode = lever("FR_NGXFG_JITTER", &["0", "neg"]);
                     match jitter_mode {
                         1 => eprintln!("fg: FR_NGXFG_JITTER=0 — zero jitter to the evaluate"),
-                        2 => eprintln!("fg: FR_NGXFG_JITTER=raw — un-negated jitter"),
+                        2 => eprintln!(
+                            "fg: FR_NGXFG_JITTER=neg — SL-negated jitter (the pre-2026-07-26 \
+                             default; expect specular highlights to strobe)"
+                        ),
                         _ => {}
                     }
                     let mv_mode = lever("FR_NGXFG_MV", &["norm", "neg", "normneg"]);
@@ -1672,12 +1710,41 @@ impl GpuContext {
         // old window dims) — release it now (queue just drained) and let the
         // first frame at the new size lazy-recreate; the interpolated-frame
         // target rebuilds below with the other window-sized textures.
+        //
+        // THE FEATURE SURVIVES THE RESIZE, and that is load-bearing rather
+        // than an optimization. Destroying it here CRASHED the process, every
+        // time, and the mechanism is the one frdlssg_recreate already documents
+        // one level up: frdlssg_destroy tears at NGX state an in-process
+        // Streamline SHARES, so the RR rebuild immediately below it could no
+        // longer even query NGX (slDLSSDGetOptimalSettings -> eErrorNGXFailed),
+        // and SL's Present hook then indexed NGX's feature table with a garbage
+        // id (rcx = fffffffa12121206, bit-identical across processes) and took
+        // an access violation inside _nvngx — swallowed by its SEH and surfacing
+        // to us as Present returning E_ABORT, after which the session shed RR,
+        // shed DXR, and panicked at the plain present. MEASURED: reproduces with
+        // 418 MB of scene VRAM as readily as with 5.8 GB (so it is not memory
+        // pressure), and disappears entirely when the feature is kept — the RR
+        // query then succeeds and 8K comes up clean. quinlight, the raw-NGX
+        // blueprint, cannot exhibit any of this: it has exactly ONE NGX client
+        // and no Streamline at all.
+        //
+        // dims is deliberately NOT cleared: the res-follow recreate above wants
+        // to see the OLD size so it recognizes the move and rebuilds the feature
+        // at the new display AND render res (a rend-only rebuild is 0xBAD00005).
+        // FR_FG_RESIZE_DESTROY=1 restores the destroying path for A/B only.
+        let fg_destroy = std::env::var("FR_FG_RESIZE_DESTROY").ok().as_deref() == Some("1");
         if let Some(n) = &self.fg_n {
-            let h = n.handle.replace(std::ptr::null_mut());
-            if !h.is_null() {
-                unsafe { ngxfg::frdlssg_destroy(h) };
+            if fg_destroy {
+                eprintln!(
+                    "fg: FR_FG_RESIZE_DESTROY=1 — destroying the NGX feature across the \
+                     resize (the known-crashing path; A/B only)"
+                );
+                let h = n.handle.replace(std::ptr::null_mut());
+                if !h.is_null() {
+                    unsafe { ngxfg::frdlssg_destroy(h) };
+                }
+                n.dims.set((0, 0));
             }
-            n.dims.set((0, 0));
             n.primed.set(false);
             n.res_pend.set(((0, 0), 0));
         }
@@ -4619,7 +4686,7 @@ impl GpuContext {
             // with the in-process Streamline NGX state — the first attempt
             // did exactly that and every subsequent sl.dlss_d (RR) evaluate
             // failed 0xBAD00004 FeatureNotFound.
-            let r = unsafe { ngxfg::frdlssg_recreate(n.handle.get(), rw, rh) };
+            let r = unsafe { ngxfg::frdlssg_recreate(n.handle.get(), rr.ow, rr.oh, rw, rh) };
             if r != 0 {
                 eprintln!("fg: NGX feature recreate failed ({r}) — frame generation off");
                 n.failed.set(true);
@@ -4721,7 +4788,12 @@ impl GpuContext {
                 rgt: v4(fc.right * (tanh * fc.aspect)),
                 upv: v4(fc.up * tanh),
                 rmv: (!n.rmv_off) as u32,
-                _pad: [0.0; 3],
+                // The SAME far the pack clamps a missed reflection to
+                // (`spec_hit_t`), so the kernel can recognize "reflected sky"
+                // and reproject it as a direction instead of a point 2*diag
+                // away. Both come from dlss::near_far — keep them one source.
+                cam_far: far,
+                _pad: [0.0; 2],
             };
             gp.record(list, &p);
         }
@@ -4768,13 +4840,13 @@ impl GpuContext {
             clip_to_view: mat(&fc.clip_to_view),
             clip_to_prev_clip: mat(&fc.clip_to_prev_clip),
             prev_clip_to_clip: mat(&fc.prev_clip_to_clip),
-            // Default: the SL-negated jitter convention — same NGX family,
-            // one sign. FR_NGXFG_JITTER walks the alternatives (unvalidated
-            // in quinlight, whose jitter was 0,0).
+            // Default: the RAW sample offset. Raw NGX does NOT want
+            // Streamline's negation — see `jitter_mode` for how that
+            // assumption shipped and how it was caught.
             jitter: match n.jitter_mode {
                 1 => [0.0, 0.0],
-                2 => [fc.jitter.0, fc.jitter.1],
-                _ => [-fc.jitter.0, -fc.jitter.1],
+                2 => [-fc.jitter.0, -fc.jitter.1], // "neg": the old, wrong default
+                _ => [fc.jitter.0, fc.jitter.1],
             },
             // PIXEL scale — settled from dlssg-to-fsr3, which hands
             // DLSSG.MvecScale straight to FSR3's motionVectorScale (unit:

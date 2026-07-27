@@ -244,8 +244,10 @@ extern "C" int32_t frdlssg_create(void* device_v, uint32_t disp_w, uint32_t disp
     return FRDLSSG_OK;
 }
 
-extern "C" int32_t frdlssg_recreate(void* handle, uint32_t rend_w, uint32_t rend_h) {
-    if (!handle || rend_w == 0 || rend_h == 0) return FRDLSSG_ERR_INTERNAL;
+extern "C" int32_t frdlssg_recreate(void* handle, uint32_t disp_w, uint32_t disp_h,
+                                    uint32_t rend_w, uint32_t rend_h) {
+    if (!handle || disp_w == 0 || disp_h == 0 || rend_w == 0 || rend_h == 0)
+        return FRDLSSG_ERR_INTERNAL;
     auto* s = static_cast<Ctx*>(handle);
     // FEATURE-scoped by contract: ReleaseFeature + CreateFeature at the new
     // render res, params/init/device untouched. The first attempt at this
@@ -260,6 +262,14 @@ extern "C" int32_t frdlssg_recreate(void* handle, uint32_t rend_w, uint32_t rend
         NVSDK_NGX_D3D12_ReleaseFeature(s->feature);
         s->feature = nullptr;
     }
+    // DISPLAY dims move too, and must: this is the ONLY teardown a WINDOW
+    // resize may use (frdlssg_destroy breaks the shared SL NGX state — see
+    // above), and a resize changes both sizes. Updating rend alone rebuilt
+    // the feature as cp.Width/Height = the OLD display with the NEW, larger
+    // RenderWidth/Height, which NGX rejects at evaluate with
+    // FAIL_InvalidParameter (0xBAD00005) — measured on an 8K resize.
+    s->disp_w = disp_w;
+    s->disp_h = disp_h;
     s->rend_w = rend_w;
     s->rend_h = rend_h;
     // Failure leaves the Ctx alive (params/init still serve a later retry or
@@ -361,10 +371,20 @@ extern "C" void frdlssg_destroy(void* handle) {
         NVSDK_NGX_D3D12_ReleaseFeature(s->feature);
         s->feature = nullptr;
     }
-    if (s->params) {
-        NVSDK_NGX_D3D12_DestroyParameters(s->params);
-        s->params = nullptr;
-    }
+    // params is DELIBERATELY not destroyed: it always comes from
+    // GetCapabilityParameters (above — never AllocateParameters), so the map
+    // is NGX's own and is SHARED with every other in-process NGX client, i.e.
+    // Streamline. Destroying it is the exact ownership mistake `owns_init`
+    // guards on the init side, and it cost a crash: on an 8K resize this ran,
+    // the RR rebuild's slDLSSDGetOptimalSettings then failed eErrorNGXFailed,
+    // and SL's Present hook read the freed map — an access violation inside
+    // _nvngx's feature-table lookup, swallowed by its SEH and surfacing to us
+    // as Present returning E_ABORT. Releasing the FEATURE above is the whole
+    // of what this Ctx exclusively owns (the frdlssg_recreate contract, which
+    // routed around this instead of fixing it). Should a future path ever
+    // AllocateParameters, THAT map would be ours — track it with an
+    // owns_params flag then, mirroring owns_init.
+    s->params = nullptr;
     if (s->device) {
         if (s->owns_init) {
             ngx_shared_shutdown();

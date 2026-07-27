@@ -62,7 +62,9 @@ typedef struct FrDlssgDispatch {
     float clip_to_view[16];
     float clip_to_prev_clip[16];
     float prev_clip_to_clip[16];
-    float jitter[2];      // the SL-negated sample offset (one convention, one place)
+    float jitter[2];      // the RAW sample offset — raw NGX does NOT want SL's
+                          // negation (measured 2026-07-26: the negated form
+                          // strobes specular highlights). One convention, one place.
     float mv_scale[2];    // pixel MVs -> [-1,1]: {1/rend_w, 1/rend_h}
     float cam_pos[3];
     float cam_up[3];

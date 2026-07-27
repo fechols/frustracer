@@ -614,6 +614,34 @@ cargo run --release -- --fg           # FRAME GENERATION, DLSS family (W4 leg 2)
                                       # jitter, and a synthetic [0,1] luma-depth, so NOTHING
                                       # motion-dependent in the blueprint was ever validated;
                                       # treat every "quinlight-settled" constant that way.
+                                      # THAT ROOT BIT AGAIN on 2026-07-26 — TRAP 9, JITTER
+                                      # SIGN: the evaluate was handed the NEGATED sample
+                                      # offset, reasoned by analogy from Streamline's RR
+                                      # (which does want it negated) on "same NGX family, one
+                                      # sign". RAW NGX WANTS IT AS IS. quinlight's jitter was
+                                      # (0,0), so every sign is identical there and the
+                                      # blueprint could never disagree. A sign error misplaces
+                                      # content by TWICE the jitter (~1 px) — invisible on
+                                      # diffuse geometry, BLATANT on a small ultra-bright
+                                      # specular highlight (the sun off DamagedHelmet's metal:
+                                      # ~44,000 radiance against a ~1.0 scene turns 1 px into
+                                      # a strobe). It predates the c66417d "swim FIXED"
+                                      # commit — that binary reproduces it — so it was never a
+                                      # regression, just never caught: the swim fix addressed
+                                      # reflections DRAGGING, this is the highlight JUMPING.
+                                      # Now `raw` by default; FR_NGXFG_JITTER=neg restores it.
+                                      # HOW IT WAS FOUND, because the method transfers: every
+                                      # environmental variable was eliminated by measurement
+                                      # (resolution, frame rate, the resize path, the
+                                      # virtual-image MVs, PAIR_BACKBUFFERS, the scene, and a
+                                      # c66417d-era build), and then the SAME FRAME through
+                                      # the ffx FI interpolator came back CLEAN — which
+                                      # localized it to our NGX inputs and left the FR_NGXFG_*
+                                      # levers to walk it down in two runs. A cross-vendor
+                                      # A/B beats another mechanism hypothesis: three
+                                      # plausible ones (DestroyParameters, the virtual-MV
+                                      # blend, the sky-reflection distance) each explained the
+                                      # symptom and each measured wrong.
                                       # (4) DEPTH: the snippet's Depth slot has DLSS-SR's
                                       # contract — a [0,1] buffer CONSISTENT WITH THE SUPPLIED
                                       # MATRICES — while RR's plane holds unbounded linear
@@ -629,9 +657,10 @@ cargo run --release -- --fg           # FRAME GENERATION, DLSS family (W4 leg 2)
                                       # (6) REFLECTION MVs: surface MVs describe the SURFACE,
                                       # but a mirror pixel's CONTENT is the reflection — a
                                       # VIRTUAL IMAGE at path depth t_surf + t_refl (planar
-                                      # unfold along the primary ray; reflected sky ⇒ ~far ⇒
-                                      # near-zero translation parallax — the "reflection
-                                      # drifts opposite the surface" strafe observation), so
+                                      # unfold along the primary ray; a MISSED reflection is
+                                      # the SKY, i.e. a virtual image at INFINITY with EXACTLY
+                                      # zero translation parallax — the "reflection drifts
+                                      # opposite the surface" strafe observation), so
                                       # warping with surface MVs drags the reflection with the
                                       # helmet on every generated frame. Both conversions run
                                       # in ONE fused pass, gpu/ngxfg_guides.rs (fxc cs_5_0,
@@ -646,14 +675,36 @@ cargo run --release -- --fg           # FRAME GENERATION, DLSS family (W4 leg 2)
                                       # ROUGH_LO..ROUGH_HI (metal helmet ⇒ w≈1; RR's own MV
                                       # plane untouched — RR is trained for surface MVs + the
                                       # spec-hit guide; spec_hit_t is the reflection distance
-                                      # source, 0 = no ray ⇒ passthrough). True RADIANCE-
+                                      # source, 0 = no ray ⇒ passthrough). ONE LANE, TWO JOBS:
+                                      # the pack clamps a MISSED reflection to CAM_FAR because
+                                      # that lane's OTHER consumer is RR's depth delta, which
+                                      # wants far — but "far" is a LIE as a reflection
+                                      # distance (2*diag ≈ 138 world units is not infinity),
+                                      # and feeding it the point form gave the sky real
+                                      # parallax. The kernel now takes the analytic LIMIT for
+                                      # t_r >= cam_far: as t_r → ∞ the virtual point becomes a
+                                      # DIRECTION, so it projects with the translation column
+                                      # dropped (w = 0) ⇒ rotation-only, exactly right.
+                                      # True RADIANCE-
                                       # weighted w needs a dd/ds/ind_s-style capture in DLSS
                                       # sessions (the FLAG_FSR_SIG precedent) — the follow-on
                                       # if albedo-weighting leaves residue. Gated in --check as
                                       # `ngxfg-guides` (clip-depth matrix-consistency sweep;
                                       # virtual-MV: static-camera zero, t_r=0 continuity vs
                                       # CamBasis::project itself, the strafe reflected-sky
-                                      # collapse, weight anchors). A SEVENTH trap, structural:
+                                      # collapse, weight anchors). THE STRAFE GATE'S OWN
+                                      # LESSON: it was RELATIVE (`mv_virt <= 0.05 * mv_surf`)
+                                      # where the correct answer is EXACTLY ZERO, so any
+                                      # percentage of a large surface MV passed; and it ran at
+                                      # far = 5000 while the renderer ships far = 2*diag —
+                                      # 36x more distant, making "reflection at far"
+                                      # impersonate infinity far better in the gate than in
+                                      # the product. It is now ABSOLUTE, sweeps
+                                      # production-scale far values, and carries a TEETH pin
+                                      # (the pre-fix point form must blow the bound). Note
+                                      # this is the mirror of the --spp image A/B lesson,
+                                      # where an ABSOLUTE limit was the wrong shape: pick the
+                                      # form from what the true value is, not by habit. A SEVENTH trap, structural:
                                       # pair-present consumes TWO backbuffers per frame, so at
                                       # the shipped BACKBUFFERS=3 a buffer came back around
                                       # 1.5 frames later — under vsync with the DXGI present
@@ -711,11 +762,37 @@ cargo run --release -- --fg           # FRAME GENERATION, DLSS family (W4 leg 2)
                                       # only). A --lock-res dynamic RAMP changes res per
                                       # frame, never qualifies, and skips with a note (the
                                       # recreate-storm guard; a completed DRS step holds the
-                                      # 90-frame dwell = one recreate per adoption); resize
-                                      # destroys + lazy-recreates as before. Known-accepts: HUD
-                                      # interpolated with
-                                      # the frame (pHudless/pUI null); latency +~half frame
-                                      # (the interpolation cost, W5 owns measurement).
+                                      # 90-frame dwell = one recreate per adoption).
+                                      # RESIZE KEEPS THE FEATURE ALIVE and lets the
+                                      # res-follow recreate adopt the new size — it does NOT
+                                      # destroy (2026-07-26; FR_FG_RESIZE_DESTROY=1 restores
+                                      # the old path for A/B). The claim this paragraph used
+                                      # to make — that destroying is safe on resize "because
+                                      # it rebuilds the RR context too" — IS FALSE, and it
+                                      # crashed every 8K resize: destroy tears at NGX state an
+                                      # in-process SL SHARES, so the RR rebuild immediately
+                                      # after could no longer even query NGX
+                                      # (slDLSSDGetOptimalSettings -> eErrorNGXFailed), SL's
+                                      # Present hook then indexed NGX's feature table with a
+                                      # garbage id (rcx = fffffffa12121206, bit-identical
+                                      # across processes) and took an AV inside _nvngx —
+                                      # swallowed by its SEH and surfacing as Present
+                                      # returning E_ABORT, after which the session shed RR,
+                                      # shed DXR, and panicked at the plain present. NOT VRAM:
+                                      # it reproduces at 418 MB of scene VRAM (--no-world) as
+                                      # readily as at 5.8 GB. frdlssg_recreate therefore takes
+                                      # DISPLAY dims as well as render dims — a window resize
+                                      # moves both, and rend-only rebuilt the feature as old
+                                      # display x new render, which NGX rejects at evaluate
+                                      # with 0xBAD00005 FAIL_InvalidParameter.
+                                      # Known-accepts: latency +~half frame
+                                      # (the interpolation cost, W5 owns measurement). NOTE
+                                      # the HUD is NOT among them on THIS path (it is on the
+                                      # ffx one): NGX is handed `color: rr.output` — linear,
+                                      # pre-tonemap, PRE-HUD — and both pair halves composite
+                                      # the HUD themselves inside fullscreen_to_backbuffer, so
+                                      # the UI is never interpolated and pHudless/pUI being
+                                      # null costs nothing here.
                                       # (B) STREAMLINE DLSS-G — the fallback when built
                                       # WITHOUT the SDK: contract-complete but SL's closed
                                       # dlfg layer DECLINES TO INSERT on the dev box (the
@@ -1619,6 +1696,8 @@ Screenshots (P) and `--check` PNGs stay **SDR 8-bit** regardless of the session 
 ## The upscaler chain (always-on temporal upscaling)
 
 **Temporal upscaling is always on.** Every session probes the chain **DLSS-RR → FSR4-RR → XeSS → FSR3** in that fixed order and wires the FIRST level whose support probe passes; exactly one upscaler is wired per session (`GpuContext::wired()` derives it from the live state, so it can never disagree with the contexts actually held). Reaching the end of the chain is a LOUD line + plain presentation, the same shape as any other unsupported-feature fallback — the only quiet plain path is the explicit `--no-upscale`.
+
+**The rung BELOW the whole ladder is the present itself, and it degrades too** (`present_or_shed!` in `session()`). Every level above sheds loudly and keeps rendering — RR/FSR/XeSS fall to plain, DXR falls to the CPU tracer, NPPD/OIDN switch themselves off — and each of those landings ends at one of five present sites that used to be `.expect("GPU present failed")`, i.e. a panic at the one rung with nothing beneath it. That is not hypothetical: an 8K resize wedged Present at `E_ABORT`, the session correctly shed RR and then DXR, arrived at the plain CPU present, and killed the process with every other fallback already spent — and the panic then unwound through Streamline's teardown and took a SECOND access violation on the way out, so the crash the user saw had nothing to do with the cause. A failed present now costs THAT FRAME only (nothing is advanced by presenting); `PRESENT_FAIL_LIMIT = 120` consecutive failures end the session as a clean `SessionEnd::Quit`, never a panic, and the loud line names which arm failed (`xess`/`oidn`/`nppd`/`gpu-tonemap`/`plain`).
 
 The intent half is pure data (`src/upchain.rs::UpChain`, gated DLL-free by `upchain::self_test` in `--check` — availability is *injected*, never probed there). Flag algebra: `--<x>` **forces** the chain to start at level x (every level above is disabled; the levels below stay as fall-through), `--no-<x>` **skips** that one level (`--no-fsr` skips both FSR levels), `--no-upscale` is the empty chain. Later flags win, matching left-to-right parse order — so `--xess --fsr` resolves FSR4 (with XeSS still below it), and `--fsr --no-fsr` resolves XeSS. The one flag outside this algebra is **`--fsr4`**: it forces level 2 like `--fsr`, but also *requires* it — a fall-through exits 2 instead of resolving the next level (see the FSR section).
 

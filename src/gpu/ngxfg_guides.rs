@@ -78,7 +78,7 @@ cbuffer C : register(b0) {
     float4 fwd;  // unit forward
     float4 rgt;  // right * tan(fov/2) * aspect (CamBasis pre-scaling)
     float4 upv;  // up * tan(fov/2)
-    uint   rmv; float3 _pad;
+    uint   rmv; float cam_far; float2 _pad;
 }
 [numthreads(8, 8, 1)]
 void cs_guides(uint3 id : SV_DispatchThreadID) {
@@ -96,8 +96,27 @@ void cs_guides(uint3 id : SV_DispatchThreadID) {
         float ndy = 1.0f - c.y * (2.0f / h);
         float3 du = normalize(fwd.xyz + rgt.xyz * ndx + upv.xyz * ndy);
         float ray_t = z / dot(du, fwd.xyz); // view-Z -> Euclidean ray t
+        // A MISSED reflection is the SKY — a virtual image at INFINITY, whose
+        // translation parallax is exactly zero (only rotation moves it). The
+        // pack cannot say "infinity" though: it clamps a missed reflection to
+        // CAM_FAR because that lane's OTHER consumer is the depth delta, which
+        // wants far. Feeding that finite distance into the point form below
+        // gives the sky real parallax it does not have — at far = 2*diag (~138
+        // world units) and a 3841 px render width that is ~28 px of motion
+        // error per world unit of camera translation, which warps the sun's
+        // specular highlight tens of pixels on every generated frame and snaps
+        // it back on the next real one. Measured on the world's DamagedHelmet:
+        // strafing is far worse than rotating, which is the signature.
+        //
+        // So take the analytic LIMIT of the same formula instead of a finite
+        // stand-in: as t_r -> inf, V -> org + du*inf, i.e. a pure DIRECTION.
+        // Projecting a direction is the point projection with the translation
+        // column dropped (a w = 0 homogeneous point), which yields exactly the
+        // rotation-only reprojection the sky deserves.
+        bool sky_refl = t_r >= cam_far;
         float3 V = org.xyz + du * (ray_t + t_r); // planar-unfold virtual point
-        float4 pc = m0 * V.x + m1 * V.y + m2 * V.z + m3;
+        float4 pc = sky_refl ? (m0 * du.x + m1 * du.y + m2 * du.z)
+                             : (m0 * V.x + m1 * V.y + m2 * V.z + m3);
         if (pc.w > 1e-6f) {
             float2 pndc = pc.xy / pc.w;
             float2 ppx = float2((pndc.x + 1.0f) * 0.5f * w,
@@ -131,6 +150,7 @@ pub fn clip_depth(view_z: f32, near: f32, far: f32) -> f32 {
 /// carry the CamBasis pre-scaling (tan(fov/2)·aspect / tan(fov/2));
 /// `m` = world → previous clip (glam column-vector convention).
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn virtual_prev_px(
     cx: f32,
     cy: f32,
@@ -138,6 +158,7 @@ pub fn virtual_prev_px(
     h: f32,
     view_z: f32,
     t_r: f32,
+    cam_far: f32,
     origin: Vec3A,
     fwd: Vec3A,
     right_s: Vec3A,
@@ -149,7 +170,15 @@ pub fn virtual_prev_px(
     let du = (fwd + right_s * ndx + up_s * ndy).normalize();
     let ray_t = view_z / du.dot(fwd);
     let v = origin + du * (ray_t + t_r);
-    let pc = *m * Vec4::new(v.x, v.y, v.z, 1.0);
+    // t_r >= cam_far IS the pack's "reflection missed" encoding: the sky is at
+    // infinity, so project the DIRECTION (w = 0 — the translation column drops
+    // out) for rotation-only parallax. See the cs_guides twin for why a finite
+    // stand-in warps the sun's highlight.
+    let pc = if t_r >= cam_far {
+        *m * Vec4::new(du.x, du.y, du.z, 0.0)
+    } else {
+        *m * Vec4::new(v.x, v.y, v.z, 1.0)
+    };
     if pc.w <= 1e-6 {
         return None;
     }
@@ -181,7 +210,12 @@ pub struct GuideParams {
     pub rgt: [f32; 4],
     pub upv: [f32; 4],
     pub rmv: u32,
-    pub _pad: [f32; 3],
+    /// The far plane the pack clamps a MISSED reflection to (`spec_hit_t`'s
+    /// "reflected sky" value). The kernel needs it to tell a genuine hit at
+    /// distance from a miss, because one lane carries both — see the sky-miss
+    /// branch in `cs_guides`. Rides the old `_pad`, so the layout is unmoved.
+    pub cam_far: f32,
+    pub _pad: [f32; 2],
 }
 const PARAM_DWORDS: u32 = (std::mem::size_of::<GuideParams>() / 4) as u32;
 const _: () = assert!(std::mem::size_of::<GuideParams>() == 40 * 4);
@@ -544,7 +578,7 @@ pub fn self_test() -> std::result::Result<(), String> {
         &[(216.5f32, 162.5f32, 0.0f32), (40.5, 300.5, 3.0), (400.5, 20.5, far)]
     {
         let (px, py) = virtual_prev_px(
-            cx, cy, rw as f32, rh as f32, 7.0, t_r, org, fwd, rgt, upv, &world_to_clip,
+            cx, cy, rw as f32, rh as f32, 7.0, t_r, far, org, fwd, rgt, upv, &world_to_clip,
         )
         .ok_or("static virtual point behind its own camera")?;
         if (px - cx).abs() > 2e-2 || (py - cy).abs() > 2e-2 {
@@ -579,7 +613,8 @@ pub fn self_test() -> std::result::Result<(), String> {
             .project(p - prev_basis.origin)
             .ok_or("surface point behind prev camera")?;
         let (px, py) = virtual_prev_px(
-            cx, cy, rw as f32, rh as f32, view_z, 0.0, org, fwd, rgt, upv, &world_to_prev_clip,
+            cx, cy, rw as f32, rh as f32, view_z, 0.0, far, org, fwd, rgt, upv,
+            &world_to_prev_clip,
         )
         .ok_or("virtual point behind prev camera")?;
         if (px - ex).abs() > 0.05 || (py - ey).abs() > 0.05 {
@@ -589,37 +624,75 @@ pub fn self_test() -> std::result::Result<(), String> {
         }
     }
 
-    // (d) PURE LATERAL STRAFE, reflection at far: the virtual pixel must
-    // move far less than the surface pixel — the observed "reflection
-    // drifts opposite the surface" datum, as a gate.
-    let strafe_cam = Camera { pos: cam.pos + rgt.normalize() * 0.3, ..cam };
-    let strafe_mats = crate::dlss::cam_matrices(&strafe_cam, rw, rh, near, far);
-    let world_to_strafe_clip = strafe_mats.view_to_clip * strafe_mats.world_to_view;
-    let strafe_basis = strafe_cam.basis(rw, rh);
-    let (cx, cy, view_z) = (216.5f32, 162.5f32, 2.5f32);
-    let ndx = cx * (2.0 / rw as f32) - 1.0;
-    let ndy = 1.0 - cy * (2.0 / rh as f32);
-    let du = (fwd + rgt * ndx + upv * ndy).normalize();
-    let p = org + du * (view_z / du.dot(fwd));
-    let (sx, sy) = strafe_basis
-        .project(p - strafe_basis.origin)
-        .ok_or("strafe: surface point behind camera")?;
-    let mv_surf = ((sx - cx).powi(2) + (sy - cy).powi(2)).sqrt();
-    let (vx, vy) = virtual_prev_px(
-        cx, cy, rw as f32, rh as f32, view_z, far, org, fwd, rgt, upv, &world_to_strafe_clip,
-    )
-    .ok_or("strafe: virtual point behind camera")?;
-    let mv_virt = ((vx - cx).powi(2) + (vy - cy).powi(2)).sqrt();
-    if mv_surf < 5.0 {
-        return Err(format!(
-            "strafe gate is vacuous — surface MV only {mv_surf} px (probe too gentle)"
-        ));
-    }
-    if mv_virt > 0.05 * mv_surf {
-        return Err(format!(
-            "strafe: virtual MV {mv_virt} px not << surface MV {mv_surf} px — the \
-             reflection would still swim"
-        ));
+    // (d) PURE LATERAL STRAFE with a MISSED reflection (the sky). The camera
+    // only translates, and the sky is at infinity, so the correct virtual MV
+    // is EXACTLY ZERO — hence an ABSOLUTE bound, not a fraction of the surface
+    // MV. That distinction is the whole gate: the old `mv_virt <= 0.05 *
+    // mv_surf` form passed while production visibly warped, because zero is
+    // the right answer and any percentage of a large surface MV clears a
+    // percentage bar. It also ran at far = 5000 while the renderer ships
+    // far = 2*diag (~138 on the world) — 36x more distant, so "reflection at
+    // far" impersonated infinity in the gate far better than it ever did in
+    // the product. Both halves are fixed here: the bound is absolute, and the
+    // sweep includes a PRODUCTION-scale far.
+    //
+    // The sky-miss branch makes this exact rather than merely small: a
+    // direction reprojected under a pure translation is unchanged.
+    for &far_probe in &[far, 2.0 * 69.0, 2.0 * 10.0] {
+        let strafe_cam = Camera { pos: cam.pos + rgt.normalize() * 0.3, ..cam };
+        let strafe_mats = crate::dlss::cam_matrices(&strafe_cam, rw, rh, near, far_probe);
+        let world_to_strafe_clip = strafe_mats.view_to_clip * strafe_mats.world_to_view;
+        let strafe_basis = strafe_cam.basis(rw, rh);
+        let (cx, cy, view_z) = (216.5f32, 162.5f32, 2.5f32);
+        let ndx = cx * (2.0 / rw as f32) - 1.0;
+        let ndy = 1.0 - cy * (2.0 / rh as f32);
+        let du = (fwd + rgt * ndx + upv * ndy).normalize();
+        let p = org + du * (view_z / du.dot(fwd));
+        let (sx, sy) = strafe_basis
+            .project(p - strafe_basis.origin)
+            .ok_or("strafe: surface point behind camera")?;
+        let mv_surf = ((sx - cx).powi(2) + (sy - cy).powi(2)).sqrt();
+        // t_r == far_probe IS the miss encoding the pack produces.
+        let (vx, vy) = virtual_prev_px(
+            cx, cy, rw as f32, rh as f32, view_z, far_probe, far_probe, org, fwd, rgt, upv,
+            &world_to_strafe_clip,
+        )
+        .ok_or("strafe: virtual point behind camera")?;
+        let mv_virt = ((vx - cx).powi(2) + (vy - cy).powi(2)).sqrt();
+        if mv_surf < 5.0 {
+            return Err(format!(
+                "strafe gate is vacuous — surface MV only {mv_surf} px (probe too gentle)"
+            ));
+        }
+        if mv_virt > 0.05 {
+            return Err(format!(
+                "strafe (far={far_probe}): reflected-sky virtual MV {mv_virt} px, want ~0 \
+                 (surface MV {mv_surf} px) — a missed reflection is at INFINITY and must \
+                 not translate; this is the sun-highlight jump on generated frames"
+            ));
+        }
+        // GATE TEETH. The pre-fix behaviour is still reachable: cam_far =
+        // INFINITY makes the miss branch unreachable, leaving the old point
+        // form that placed the sky at a finite `far`. At a PRODUCTION-scale
+        // far that must BLOW this bound — if it does not, the probe is too
+        // gentle to have caught the bug that shipped, and a future regression
+        // would pass unnoticed. (At the old test's far = 5000 it legitimately
+        // does not fire, which is precisely why that value hid the defect.)
+        if far_probe < 1000.0 {
+            let (ox, oy) = virtual_prev_px(
+                cx, cy, rw as f32, rh as f32, view_z, far_probe, f32::INFINITY, org, fwd, rgt,
+                upv, &world_to_strafe_clip,
+            )
+            .ok_or("strafe: pre-fix virtual point behind camera")?;
+            let mv_old = ((ox - cx).powi(2) + (oy - cy).powi(2)).sqrt();
+            if mv_old <= 0.05 {
+                return Err(format!(
+                    "strafe (far={far_probe}) gate is TOOTHLESS: the pre-fix point form \
+                     also lands at {mv_old} px, so this probe could never have caught the \
+                     sky-reflection warp"
+                ));
+            }
+        }
     }
 
     // (e) blend-weight anchors: metal (diffuse ~0) ⇒ ~1; white dielectric ⇒

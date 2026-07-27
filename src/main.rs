@@ -13136,8 +13136,64 @@ fn session(
     // local — losing repeat state across a resize re-entry is harmless.
     let mut pad = pad::MenuPad::new(sdl_hwnd(window));
 
+    // PRESENTATION IS THE BOTTOM OF THE FALLBACK LADDER, and until this it was
+    // the one rung that could not degrade. Everything above sheds loudly and
+    // keeps rendering — RR/FSR/XeSS fall to plain, DXR falls to the CPU tracer,
+    // NPPD and OIDN switch themselves off — and each of those landings ends at
+    // one of the `present_or_shed!` sites below. A `.expect()` there turned a
+    // wedged swapchain into a process kill: an 8K resize with frame generation
+    // live wedged Present at E_ABORT, the session correctly shed RR and then
+    // DXR, arrived at the plain CPU present, and panicked with everything else
+    // already spent. Worse, the panic then unwound through Streamline's
+    // teardown and took a second access violation on the way out, so the
+    // symptom the user saw had nothing to do with the cause.
+    //
+    // A failed present now costs THAT FRAME and nothing else (the frame is
+    // simply not shown; no state is advanced by presenting). A persistently
+    // wedged swapchain would otherwise spin forever printing, so N consecutive
+    // failures end the session the same way the window's X does — a clean
+    // SessionEnd::Quit, never a panic. One line per EPISODE, not per frame: at
+    // 8K a wedged present can fail hundreds of times a second.
+    const PRESENT_FAIL_LIMIT: u32 = 120;
+    let mut present_fails: u32 = 0;
+    let mut present_dead = false;
+    macro_rules! present_or_shed {
+        ($what:literal, $e:expr) => {{
+            // Bound first: `match $e { .. }` would hold the &mut gpu borrow
+            // across the arms, which need it back for invalidate_replay.
+            let r = $e;
+            match r {
+                Ok(()) => present_fails = 0,
+                Err(e) => {
+                    // A recorded-but-aborted producing frame: the wavefront's
+                    // persisted structure claims a frame the GPU never
+                    // finished (the existing GPU present-error discipline).
+                    gpu.invalidate_replay();
+                    present_fails += 1;
+                    if present_fails == 1 {
+                        eprintln!(
+                            "present: {} failed ({e}); skipping the frame — every other \
+                             fallback is already spent, so this is the last rung",
+                            $what
+                        );
+                    }
+                    if present_fails >= PRESENT_FAIL_LIMIT {
+                        eprintln!(
+                            "present: {PRESENT_FAIL_LIMIT} consecutive failures — the \
+                             swapchain is wedged; ending the session cleanly"
+                        );
+                        present_dead = true;
+                    }
+                }
+            }
+        }};
+    }
+
     let end = loop {
         let now = Instant::now();
+        if present_dead {
+            break SessionEnd::Quit;
+        }
 
         // Menu OPEN routes events to Slint (toggle keys can't fire); the
         // quit check moves BELOW the menu drain so the menu's Exit button
@@ -15567,7 +15623,7 @@ fn session(
                                 present.resolve_hdr(&xess_hdr, &info, false, w, h, w, h);
                             }
                         }
-                        present.blit(gpu).expect("GPU present failed");
+                        present_or_shed!("xess", present.blit(gpu));
                     }
                     Err(e) => {
                         eprintln!("xess: upscale failed ({e}); XeSS disabled (X to retry)");
@@ -15778,7 +15834,7 @@ fn session(
                     h,
                 );
             }
-            present.blit(gpu).expect("GPU present failed");
+            present_or_shed!("oidn", present.blit(gpu));
         } else if nppd_on {
             // NPPD: one recurrent network step on the CPU-resolve path — the
             // state is warped by this frame's motion vectors, the 1-spp frame
@@ -15828,9 +15884,9 @@ fn session(
                     }
                 }
             }
-            present.blit(gpu).expect("GPU present failed");
+            present_or_shed!("nppd", present.blit(gpu));
         } else if use_gpu_tone {
-            gpu.present_hdr(&accum, frame.max(1)).expect("GPU present failed");
+            present_or_shed!("gpu-tonemap", gpu.present_hdr(&accum, frame.max(1)));
         } else {
             present.tone = gpu.tone();
             present.resolve(
@@ -15843,7 +15899,7 @@ fn session(
                 w,
                 h,
             );
-            present.blit(gpu).expect("GPU present failed");
+            present_or_shed!("plain", present.blit(gpu));
         }
         // Stability meter (FRUSTRACER_STAB=1): quantifies temporal
         // instability of the upscaled output — hold the camera still and a
