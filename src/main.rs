@@ -52,6 +52,9 @@ mod oidn;
 // NCHW packing, and temporal-warp math are pure and feed --check.
 mod nppd;
 mod frustcap;
+// Step-0 measurement harness (FR_ORACLE=1): read-only probes that size the
+// candidate frustum-query changes. Default OFF and behaviour-free.
+mod oracle;
 mod overlay;
 #[cfg(windows)]
 mod pad;

@@ -142,6 +142,61 @@ pub struct PrimarySurface {
 /// Capacity of a `VisRecord` (the presets top out at 4 shadow samples).
 pub const VIS_MAX: usize = 8;
 
+/// Dev cost-attribution ablations for the CPU shade path — the twin of
+/// `gpu::trace`'s `abl_has`, and read from the same `FR_ABL` variable.
+///
+/// `FR_ABL=noshadow,noao,norefl,noglass` neutralize one secondary-ray consumer
+/// each; `nosec` arms all four. **NOT shipping levers**: every arm changes the
+/// image, which is the point — you are measuring a term against its own
+/// absence (the `--no-wide-levels` idiom). Unset is bit-identical, and the
+/// per-ray cost when unset is one already-initialized `OnceLock` deref.
+///
+/// Why they exist: the primary/secondary split in `ray_nodes` says secondary
+/// rays are 86-93% of ray traversal, but a counter is not a millisecond — the
+/// quadtree removes 26% of ray-node visits on the default scene and the frame
+/// does not get faster. These measure the TIME each consumer is worth, which is
+/// the only number that can justify building sharing machinery for it.
+///
+/// Every arm keeps its rng draws and its `secondary_rays` increment: the point
+/// is to remove the TRAVERSAL, not to change the sample pattern or make the
+/// counters lie about how many rays the shading logic asked for.
+#[derive(Default)]
+pub struct Abl {
+    /// Sun shadow ray -> unoccluded (`Vec3A::ONE`), no trace.
+    pub noshadow: bool,
+    /// Each AO sample -> fully open, no trace. Draws still burned.
+    pub noao: bool,
+    /// Skip the GGX reflection continuation (ray + recursive shade).
+    pub norefl: bool,
+    /// Skip the refraction/TIR continuation chain.
+    pub noglass: bool,
+}
+
+pub fn abl() -> &'static Abl {
+    static A: std::sync::OnceLock<Abl> = std::sync::OnceLock::new();
+    A.get_or_init(|| {
+        let v = std::env::var("FR_ABL").unwrap_or_default();
+        let all = v.contains("nosec");
+        let a = Abl {
+            noshadow: all || v.contains("noshadow"),
+            noao: all || v.contains("noao"),
+            norefl: all || v.contains("norefl"),
+            noglass: all || v.contains("noglass"),
+        };
+        // Loud on departure from the default — a silent ablation is how a
+        // measurement gets attributed to the wrong thing (the probe-reach trap
+        // recorded in CLAUDE.md's pack-split section).
+        if a.noshadow || a.noao || a.norefl || a.noglass {
+            eprintln!(
+                "FR_ABL (cpu shade): noshadow={} noao={} norefl={} noglass={} \
+                 — THE IMAGE IS DELIBERATELY WRONG, this is a cost probe",
+                a.noshadow, a.noao, a.norefl, a.noglass
+            );
+        }
+        a
+    })
+}
+
 /// Captured view-independent visibility of one shading point: the light
 /// sample points with their occlusion results, plus the sampled-AO scalar.
 /// The adaptive 2×2 cells (render.rs, XeSS mode) trace this once at a
@@ -731,10 +786,14 @@ pub fn shade(
             }
             _ => {
                 ls.secondary_rays += 1;
-                // tmax = INFINITY — the sun is at infinity. `transmittance`,
-                // not `occluded`: the sun ray carries a tint through glass
-                // (ONE when clear — `x * 1.0` keeps opaque scenes bitwise).
-                bvh.transmittance(scene, &Ray::new(p, wi), 0.0, f32::INFINITY, &mut ls.ray_nodes)
+                if abl().noshadow {
+                    Vec3A::ONE // FR_ABL=noshadow: unoccluded, no traversal
+                } else {
+                    // tmax = INFINITY — the sun is at infinity. `transmittance`,
+                    // not `occluded`: the sun ray carries a tint through glass
+                    // (ONE when clear — `x * 1.0` keeps opaque scenes bitwise).
+                    bvh.transmittance(scene, &Ray::new(p, wi), 0.0, f32::INFINITY, &mut ls.ray_nodes)
+                }
             }
         };
         if let VisCtl::Capture(r) = &mut vis {
@@ -951,13 +1010,19 @@ pub fn shade(
                     // (a true divide): 3.0/3.0 == 1.0 and 0.0/3.0 == 0.0
                     // exactly, so opaque scenes accumulate the old integer
                     // counts bit-identically.
-                    let tp = bvh.transmittance(
-                        scene,
-                        &Ray::new(p, dir),
-                        0.0,
-                        scene.ao_radius,
-                        &mut ls.ray_nodes,
-                    );
+                    let tp = if abl().noao {
+                        Vec3A::ONE // FR_ABL=noao: fully open, no traversal.
+                                   // The draws above still ran, so the stream
+                                   // and the sample directions are unchanged.
+                    } else {
+                        bvh.transmittance(
+                            scene,
+                            &Ray::new(p, dir),
+                            0.0,
+                            scene.ao_radius,
+                            &mut ls.ray_nodes,
+                        )
+                    };
                     open += (tp.x + tp.y + tp.z) / 3.0;
                 }
                 ao = open / q.ao_samples as f32;
@@ -1039,7 +1104,9 @@ pub fn shade(
         // geometric n — a perturbed lobe must not fire a ray that starts at
         // hit + eps·n but immediately re-enters the surface. Degenerates to
         // the old single test when n_s ≡ n.
-        if rdir.dot(n_s) > 0.0 && rdir.dot(n) > 0.0 {
+        // `!norefl` drops the ray AND the recursive shade behind it — the same
+        // shape the `reflections: false` preset already produces.
+        if rdir.dot(n_s) > 0.0 && rdir.dot(n) > 0.0 && !abl().norefl {
             let g2_over_g1 = (1.0 + lambda_v)
                 / (1.0 + lambda_v + ggx_lambda(to_local(rdir), ax, ay));
             let tput = schlick(f0, v.dot(h).max(0.0)) * g2_over_g1;
@@ -1194,7 +1261,7 @@ pub fn shade(
         } else {
             snell(n)
         };
-        if tput > 1e-3 {
+        if tput > 1e-3 && !abl().noglass {
             let tray = Ray::new(torig, tdir);
             ls.secondary_rays += 1;
             let rq = Quality { fb: FrustumBounce::OFF, ..*q };

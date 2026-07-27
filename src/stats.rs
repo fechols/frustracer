@@ -7,6 +7,17 @@ pub struct Stats {
     pub frustum_queries: AtomicU64,
     pub frustum_nodes: AtomicU64,
     pub ray_nodes: AtomicU64,
+    /// The PRIMARY share of `ray_nodes` (camera rays only). `ray_nodes` stays
+    /// the TOTAL — the builder bake-off scores against it meaning "all node
+    /// visits" (see the two-tree bullet in CLAUDE.md, `builders.rs`, `bvh.rs`)
+    /// and the adopt bench divides it — so secondary is `ray_nodes - this`.
+    ///
+    /// It exists because ray count and ray COST are very different things here:
+    /// shadow/AO rays outnumber primaries 2.7-4.2x, but they stop at the first
+    /// blocker, so what they cost in traversal cannot be inferred from the
+    /// counts. Anything that removes primary traversal (a proven-covered tile,
+    /// say) is bounded by this share.
+    pub ray_nodes_prim: AtomicU64,
     pub primary_rays: AtomicU64,
     pub secondary_rays: AtomicU64,
     pub sky_pixels: AtomicU64,
@@ -92,6 +103,8 @@ pub struct LocalStats {
     pub frustum_queries: u64,
     pub frustum_nodes: u64,
     pub ray_nodes: u64,
+    /// Primary-only share of `ray_nodes`; see `Stats::ray_nodes_prim`.
+    pub ray_nodes_prim: u64,
     pub primary_rays: u64,
     pub secondary_rays: u64,
     pub sky_pixels: u64,
@@ -143,6 +156,7 @@ impl LocalStats {
         self.frustum_queries += o.frustum_queries;
         self.frustum_nodes += o.frustum_nodes;
         self.ray_nodes += o.ray_nodes;
+        self.ray_nodes_prim += o.ray_nodes_prim;
         self.primary_rays += o.primary_rays;
         self.secondary_rays += o.secondary_rays;
         self.sky_pixels += o.sky_pixels;
@@ -193,6 +207,7 @@ impl Stats {
         self.frustum_queries.store(0, Relaxed);
         self.frustum_nodes.store(0, Relaxed);
         self.ray_nodes.store(0, Relaxed);
+        self.ray_nodes_prim.store(0, Relaxed);
         self.primary_rays.store(0, Relaxed);
         self.secondary_rays.store(0, Relaxed);
         self.sky_pixels.store(0, Relaxed);
@@ -246,6 +261,9 @@ impl Stats {
         }
         if l.ray_nodes > 0 {
             self.ray_nodes.fetch_add(l.ray_nodes, Relaxed);
+        }
+        if l.ray_nodes_prim > 0 {
+            self.ray_nodes_prim.fetch_add(l.ray_nodes_prim, Relaxed);
         }
         if l.primary_rays > 0 {
             self.primary_rays.fetch_add(l.primary_rays, Relaxed);
@@ -379,6 +397,18 @@ impl Stats {
         let fq = self.frustum_queries.load(Relaxed);
         let fnodes = self.frustum_nodes.load(Relaxed);
         let rnodes = self.ray_nodes.load(Relaxed);
+        // Primary vs secondary node COST, which the ray counts do not predict.
+        // Empty when nothing traced, so an unchanged line stays unchanged.
+        let rn_prim = self.ray_nodes_prim.load(Relaxed);
+        let rsplit = if rnodes > 0 {
+            format!(
+                " (prim {rn_prim} = {:.0}%, sec {})",
+                100.0 * rn_prim as f64 / rnodes as f64,
+                rnodes - rn_prim
+            )
+        } else {
+            String::new()
+        };
         let prim = self.primary_rays.load(Relaxed);
         let sec = self.secondary_rays.load(Relaxed);
         let sky = self.sky_pixels.load(Relaxed);
@@ -479,7 +509,7 @@ impl Stats {
             String::new()
         };
         format!(
-            "tiles {tiles} | fr-queries {fq} (blocked {blocked}) | cut mean {cut_mean:.1} (ovf {ovf}) | nodes: frustum {fnodes} + ray {rnodes} = {} | rays: {prim} prim + {sec} sec | sky-px (0 rays) {sky} | coarse-px {coarse} (smp {csmp}) | temporal: seeds {tseeds} sky {tsky} cells {ttests} | mean t_start/t_hit {skip:.2}{adopt}{tring}{replay}{hemi}{share}{adapt}{defer}",
+            "tiles {tiles} | fr-queries {fq} (blocked {blocked}) | cut mean {cut_mean:.1} (ovf {ovf}) | nodes: frustum {fnodes} + ray {rnodes}{rsplit} = {} | rays: {prim} prim + {sec} sec | sky-px (0 rays) {sky} | coarse-px {coarse} (smp {csmp}) | temporal: seeds {tseeds} sky {tsky} cells {ttests} | mean t_start/t_hit {skip:.2}{adopt}{tring}{replay}{hemi}{share}{adapt}{defer}",
             fnodes + rnodes
         )
     }

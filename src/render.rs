@@ -248,6 +248,7 @@ pub fn render_frame(ctx: &FrameCtx, hybrid: bool) {
         // space, translated back to binary ids only where a ray seeds.
         let root = crate::ftree::Accel::for_tiles(ctx.bvh).root_cut();
         flush_pend(ctx, trace_tile(ctx, 0, 0, ctx.rw, ctx.rh, 0.0, 0, 0, root, u32::MAX));
+        crate::oracle::frame_end(ctx.rw, ctx.rh);
     } else {
         crate::zone!("trace-plain");
         // Plain per-pixel reference: the ground truth and the A/B baseline.
@@ -278,6 +279,7 @@ fn tile_step(
     x1: usize,
     y1: usize,
     t_start: f32,
+    depth: u32,
     cut_in: &[u32],
     ls: &mut LocalStats,
 ) -> TileStep {
@@ -304,6 +306,17 @@ fn tile_step(
             let mut cut = [0u32; MAX_CUT];
             let len = accel.refine_cut(&f, tc, f32::INFINITY, cut_in, &mut cut, &mut visits, &mut ls.cut_overflows);
             ls.cut_len_sum += len as u64;
+            if crate::oracle::armed() {
+                // Read-only sizing probe (Q1/Q4/Q5), taken after the real
+                // refine on exactly what the children will inherit. Cut ids
+                // live in the live accel's id space; the probe reads binary
+                // node boxes, so translate them the way a ray seed does.
+                let mut roots = [0u32; MAX_CUT];
+                let roots = accel.ray_roots(&cut[..len], &mut roots);
+                crate::oracle::probe_split(
+                    &ctx.cam, ctx.scene, ctx.bvh, &f, x0, y0, x1, y1, depth, roots,
+                );
+            }
             TileStep::Split { tc, cut, len }
         }
     };
@@ -351,6 +364,24 @@ fn trace_tile(
             return defer_leaf(ctx, x0, y0, x1, y1, t_start, depth, cut_in);
         }
         shade_tile(ctx, x0, y0, x1, y1, t_start, depth, KIND_LEAF, cut_in);
+        if crate::oracle::armed() {
+            // Q3, after shading: tbuf now holds this tile's own hit distances,
+            // so the farthest of them is the tile's occlusion frontier, and a
+            // cut entry beyond it was carried down the ladder for nothing.
+            let mut t_max = 0.0f32;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let t = f32::from_bits(ctx.tbuf[y * ctx.rw + x].load(Relaxed));
+                    if t.is_finite() {
+                        t_max = t_max.max(t);
+                    }
+                }
+            }
+            let f = ctx.cam.tile_frustum(x0, y0, x1, y1);
+            let mut roots = [0u32; MAX_CUT];
+            let roots = crate::ftree::Accel::for_tiles(ctx.bvh).ray_roots(cut_in, &mut roots);
+            crate::oracle::probe_leaf(ctx.bvh, &f, depth, roots, t_max);
+        }
         return TilePend::Done;
     }
     // After the leaf check, so a cap >= the leaf depth is exactly uncapped.
@@ -434,7 +465,7 @@ fn trace_tile(
     // un-advanced claims decay.
     let (step, cut_age) = match adopted {
         Some((old, age)) => (adopt_step(ctx, x0, y0, x1, y1, t0, old, cut_in, &mut ls), age + 1),
-        None => (tile_step(ctx, x0, y0, x1, y1, t0, cut_in, &mut ls), 0),
+        None => (tile_step(ctx, x0, y0, x1, y1, t0, depth, cut_in, &mut ls), 0),
     };
     match step {
         TileStep::Sky => {
@@ -1450,12 +1481,18 @@ fn trace_primary(
     let dir = ctx.cam.ray_dir(fx, fy);
     let ray = Ray::new(ctx.cam.origin, dir);
     ls.primary_rays += 1;
+    // Counted into a local and added to BOTH: `ray_nodes` stays the total (the
+    // builder bake-off and the adopt bench read it that way), `ray_nodes_prim`
+    // is the camera-ray share. This is the only site that traces primaries.
+    let mut pn = 0u64;
     let hit = match cut {
         // Quadtree leaf: seed the traversal from the tile's inherited cut.
-        Some(roots) => ctx.bvh.intersect_multi(ctx.scene, &ray, t_start, f32::INFINITY, roots, &mut ls.ray_nodes),
+        Some(roots) => ctx.bvh.intersect_multi(ctx.scene, &ray, t_start, f32::INFINITY, roots, &mut pn),
         // Plain reference path: full traversal from the root.
-        None => ctx.bvh.intersect(ctx.scene, &ray, t_start, f32::INFINITY, &mut ls.ray_nodes),
+        None => ctx.bvh.intersect(ctx.scene, &ray, t_start, f32::INFINITY, &mut pn),
     };
+    ls.ray_nodes += pn;
+    ls.ray_nodes_prim += pn;
     let k = match sample {
         SampleId::Extra(k) => k,
         SampleId::First | SampleId::Topup => 0,
