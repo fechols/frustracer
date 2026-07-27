@@ -437,12 +437,20 @@ visible. (It needs the quadtree, so it runs on the CPU or `--gpu` arm —
 ## THE CAMERA CREW — `--cinematic`
 
 Every image on this page was rendered by the program itself, headlessly and
-deterministically:
+deterministically — these are the exact commands, so you can check:
 
 ```
 cargo run --release -- --cinematic list                    # the shot catalogue
 cargo run --release -- --cinematic hero                    # one still, seconds
-cargo run --release -- --cinematic islands                 # one still per isle
+
+# the seven isle stills, and the banner at the top of this page
+cargo run --release -- --cinematic islands --cinematic-gi \
+                        --cinematic-res 1280x720 --cinematic-samples 96
+cargo run --release -- --cinematic hero --cinematic-island san-miguel \
+                        --cinematic-gi --cinematic-res 2560x1072 \
+                        --cinematic-samples 320 --cinematic-hdr
+
+# the lap, as released: 4K, 60 fps, HDR10
 cargo run --release -- --cinematic tour --cinematic-frames 1200 --cinematic-fps 60 \
                         --cinematic-res 3840x2160 --cinematic-hdr
 ```
@@ -452,6 +460,20 @@ Catmull-Rom, so a lap loops seamlessly), writes a numbered PNG sequence plus a
 manifest, and prints the exact `ffmpeg` commands to encode it — HDR10 HEVC for
 the release, an animated WebP for a README. `--cinematic-hdr` adds 16-bit
 PQ/Rec.2020 frames, a linear OpenEXR master, and a properly tagged HDR AVIF.
+
+The framing for the seven isles is **authored**, not fitted, and the reason is
+worth a sentence. Fitting a subject's bounding sphere from outside is right for
+an object — the Damaged Helmet — and photographs the *roof* of an enclosure;
+the first version of this page had Sponza, the most famous atrium in computer
+graphics, as a rectangle of tiles. So `cinematic::ISLAND_FRAMING` carries a
+composed eye/target/FOV per isle and anything without an entry falls through to
+the sphere fit. It also carries an exposure, because an enclosure's sun is
+occluded *by construction*: a physically correct patio at 15:30 sits two or
+three stops under a lit exterior, which is correct and unpublishable.
+`--cinematic-exposure <stops>` is that control, and it is a camera control —
+brightening the sky or bending the tonemap would be a lie about the lighting,
+whereas opening the aperture is what a photographer does. Zero stops is exactly
+a no-op, so every capture that predates it is unchanged.
 
 It is not just a screenshot key. Because every output frame is a **static
 pose** that accumulates N sub-frames, it is the only path in the tree that can
