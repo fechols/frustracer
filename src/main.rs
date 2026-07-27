@@ -2748,6 +2748,22 @@ fn locked_render_res(
     }
 }
 
+/// The `--lock-res dynamic`-is-not-honorable line, for the two GPU arms that
+/// have no DRS (`--gpu`, `--dxr`). ONE source for a message with FOUR call
+/// sites (each arm prints it from both its eager init and its lazy SPACE/F
+/// init), and it names the RESOLVED res rather than the default scale: the
+/// scale is quantized into the upscaler's queried range by
+/// `locked_render_res`, so a percentage printed off `DEFAULT_LOCK_SCALE`
+/// would be approximate exactly where the resolved pair is exact.
+#[cfg(windows)]
+fn lock_dynamic_note(arm: &str, res: (usize, usize)) {
+    eprintln!(
+        "{arm}: dynamic render res is unsupported on this path (no DRS); locking at {}x{} (the \
+         default quality scale)",
+        res.0, res.1
+    );
+}
+
 /// Headless GPU-tracer gate suite (M1: toolchain + dispatch plumbing).
 /// Unlike --check/--check-dlss/--check-xess this needs real hardware: a
 /// D3D12 device with RT tier 1.1 and the DXC DLL drop. Exit codes: 0 = all
@@ -9149,12 +9165,22 @@ fn run_spin_gpu(
     // The Intel warm-up is 1600, so the 2000-frame default would otherwise time
     // 400 frames — two thirds of a lap, starting mid-path.
     let frames = spin_lap_frames(frames, frames_explicit, warmup, moving, arm);
-    // Trace res = the GPU-mode lock scale (`--lock-res`, default native), so
-    // `--gpu --lock-res quality` is measurable here — which is precisely the
-    // claim the Intel default rests on. No upscaler range exists headlessly, so
-    // this is a plain scale of the interactive native res rounded to even
-    // rather than `quantize_res`'s SDK-clamped quantum.
-    let lock = opts.gpu_lock_scale.unwrap_or(1.0).clamp(0.1, 1.0);
+    // Trace res = an EXPLICIT `--lock-res`, else NATIVE — deliberately not the
+    // interactive default (quality 2/3), because this is a benchmark and every
+    // GPU `--spin` number on record was taken at native 1080p; a default that
+    // moved under it would make those non-reproducible and ~2.25x flattering
+    // (2/3 is a LINEAR scale). Same rule the vendor mode default follows:
+    // headless paths don't consult it. `--gpu --lock-res quality` is still
+    // measurable here, which is what the Intel default's claim rests on. No
+    // upscaler range exists headlessly, so this is a plain scale of the
+    // interactive native res rounded to even rather than `quantize_res`'s
+    // SDK-clamped quantum.
+    let lock = if opts.lock_res_explicit {
+        opts.lock_scale.unwrap_or(1.0)
+    } else {
+        1.0
+    }
+    .clamp(0.1, 1.0);
     let rw = (((W as f32 * lock).round() as usize) & !1usize).max(8);
     let rh = (((H as f32 * lock).round() as usize) & !1usize).max(8);
     let dev = hg.device.clone();
@@ -12010,6 +12036,26 @@ fn vendor_defaults(opts: &mut Opts, vendor: gpu::adapter::Vendor) {
     // change if that trade ever reads the other way; make it on these
     // numbers, not the table above.
     //
+    // OPEN DEBT (2026-07-26): every number above was taken at NATIVE 1080p,
+    // and that is no longer the resolution a flagless session traces — the
+    // per-mode `--lock-res` default died with `Opts::gpu_lock_scale`, so both
+    // GPU arms now trace at quality 2/3, which is a LINEAR scale: 1280x720 =
+    // 0.444x the PIXELS. The two arms do NOT scale together, so this is not a
+    // uniform shrink of both columns: `trace::depth_full` is 6 at 1920 AND at
+    // 1280 (32*2^D >= max(rw,rh)), so the wavefront's level ladder walks the
+    // same tile count either way and its ~1.4 ms is essentially
+    // res-INDEPENDENT, while leaf/sky and DXR's whole `dxr-rays` are
+    // per-pixel. Scaling the recorded decomposition by hand puts the moving
+    // frame near wavefront ~2.75 vs DXR ~1.90 — the margin inverting from ~8%
+    // ahead to ~45% behind — while the RESTING frame should still favor the
+    // wavefront outright, since replay deletes the ladder (3.07 vs 4.30 at
+    // native was already 29% ahead). That is arithmetic on the old table, NOT
+    // a measurement; do not quote it. If it survives a re-measure at the new
+    // default, this entry's stated basis ("the ~8% span margin is
+    // imperceptible") is the part that has to be rewritten — the feature
+    // grounds (H/R/C/O, >=spp-3, the replay win at rest) are untouched by
+    // resolution and are what would keep it.
+    //
     // AMD is deliberately absent: this box's only AMD adapter is an iGPU
     // (~22x slower, useless as a signal), so RDNA has no measurement here and
     // therefore keeps the cross-vendor default. Do not extend this to a vendor
@@ -12425,7 +12471,15 @@ fn session(
     let dlss_drs = opts.lock_scale.is_none()
         && dlss_range.map(|(_, min, max)| min != max).unwrap_or(false);
     let mut dlss_ctl = dlss_range.filter(|_| dlss_drs).map(|(_, min, max)| {
-        let start_h = (h * 2 / 3).clamp(min.1 as usize, max.1 as usize);
+        // The controller opens where the LOCK would have sat, so `--lock-res
+        // dynamic` starts where the default would and only moves from there —
+        // one number, one source. Not the quantized lock res: `start_h` is
+        // the controller's own state, which `quantize_res` rounds to a
+        // RES_STEP quantum per frame anyway, so the two coincide exactly only
+        // where the quantum divides (1080 -> 720 = 20x36; it does at every
+        // 16:9 height the quantum was chosen for).
+        let start_h = ((h as f32 * xess::DEFAULT_LOCK_SCALE) as usize)
+            .clamp(min.1 as usize, max.1 as usize);
         xess::ScaleCtl::new(start_h, min.1 as usize, max.1 as usize, h)
     });
     // G-buffer capacity = the range max; reinterpreted per step via set_res.
@@ -12521,7 +12575,8 @@ fn session(
         // "optimal" — with the ULTRA_PERFORMANCE init that widens the range,
         // optimal is the 1/3-scale floor and would open blurry. The
         // controller corrects from here either way.
-        let start_h = (h * 2 / 3).clamp(min.1 as usize, max.1 as usize);
+        let start_h = ((h as f32 * xess::DEFAULT_LOCK_SCALE) as usize)
+            .clamp(min.1 as usize, max.1 as usize);
         xess::ScaleCtl::new(start_h, min.1 as usize, max.1 as usize, h)
     });
     let mut xess_gbufs: Option<dlss::GBufs> = None; // capacity = range max, lazily allocated
@@ -12632,9 +12687,9 @@ fn session(
     // wavefront tracer in a session that started CPU or DXR, and the lazy
     // init must build at exactly the res/wiring the eager one would have.
     // `--lock-res dynamic` can't be honored here (no DRS on the GPU path):
-    // lock at the mode default; the note prints where GPU mode is entered.
-    let gpu_lock = opts.gpu_lock_scale.unwrap_or(1.0);
-    let gpu_lock_note = opts.gpu_lock_scale.is_none() && (dlss_on || xess_on || fsr_on);
+    // lock at the default scale; the note prints where GPU mode is entered.
+    let gpu_lock = opts.lock_scale.unwrap_or(xess::DEFAULT_LOCK_SCALE);
+    let gpu_lock_note = opts.lock_scale.is_none() && (dlss_on || xess_on || fsr_on);
     // --quinlight wins over any single level: the fuse IS the presentation,
     // and every wired engine feeds it. The frame is traced ONCE, so the res
     // must be legal for all of them at once — hence the intersected range.
@@ -12664,7 +12719,7 @@ fn session(
     let want_gpu = p0.map_or(opts.gpu, |p| p.gpu_on);
     if want_gpu && !trace_failed {
         if gpu_lock_note {
-            eprintln!("gpu: dynamic render res is unsupported under --gpu; locking at native (100%)");
+            lock_dynamic_note("gpu", (grw, grh));
         }
         gpu_trace = match gpu::dxc::Dxc::load(&opts.dxc_path).and_then(|dxc| {
             gpu.init_trace(
@@ -13003,7 +13058,7 @@ fn session(
     // (native by default); `--lock-res dynamic` can't be honored here, so it
     // falls back to that same default.
     let dxr_quin_avail = gpu.quin_planned();
-    let dxr_lock = opts.gpu_lock_scale.unwrap_or(1.0);
+    let dxr_lock = opts.lock_scale.unwrap_or(xess::DEFAULT_LOCK_SCALE);
     let (dxw, dxh) = if dxr_quin_avail {
         // One trace feeds every engine, so the res must sit inside ALL their
         // ranges (the --gpu quinlight rule).
@@ -13028,8 +13083,8 @@ fn session(
     if want_dxr && !dxr_failed && !gpu_trace {
         let compose =
             dxr_quin_avail || dxr_rr_avail || dxr_xess_avail || dxr_fsr3_avail || dxr_fsr4_avail;
-        if compose && opts.gpu_lock_scale.is_none() {
-            eprintln!("dxr: dynamic render res is unsupported on the DXR pipeline; locking at native (100%)");
+        if compose && opts.lock_scale.is_none() {
+            lock_dynamic_note("dxr", (dxw, dxh));
         }
         match gpu::dxc::Dxc::load(&opts.dxc_path).and_then(|dxc| {
             gpu.init_dxr(&dxc, scene, bvh, dxw as u32, dxh as u32, compose, opts.gpu_debug, opts.bc7)
@@ -13676,7 +13731,7 @@ fn session(
                         }
                         if !gpu.trace_ready() {
                             if gpu_lock_note {
-                                eprintln!("gpu: dynamic render res is unsupported under --gpu; locking at native (100%)");
+                                lock_dynamic_note("gpu", (grw, grh));
                             }
                             let built = gpu::dxc::Dxc::load(&opts.dxc_path).and_then(|dxc| {
                                 gpu.init_trace(
@@ -13746,8 +13801,8 @@ fn session(
                             || dxr_xess_avail
                             || dxr_fsr3_avail
                             || dxr_fsr4_avail;
-                        if compose && opts.gpu_lock_scale.is_none() {
-                            eprintln!("dxr: dynamic render res is unsupported on the DXR pipeline; locking at native (100%)");
+                        if compose && opts.lock_scale.is_none() {
+                            lock_dynamic_note("dxr", (dxw, dxh));
                         }
                         match gpu::dxc::Dxc::load(&opts.dxc_path).and_then(|dxc| {
                             gpu.init_dxr(&dxc, scene, bvh, dxw as u32, dxh as u32, compose, opts.gpu_debug, opts.bc7)

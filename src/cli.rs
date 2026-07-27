@@ -158,19 +158,16 @@ pub struct Opts {
     /// the 2×2-cell shadow/AO sharing and HOT top-ups are disabled).
     pub adaptive: bool,
     /// Lock the DLSS/XeSS render resolution to this fixed scale of the
-    /// window (default quality 2/3; `--lock-res dynamic` -> None = the
-    /// step-wise dynamic-resolution controller). CLI-only, no runtime
-    /// toggle — T prints the locked note. This is the CPU RENDERER's scale;
-    /// the GPU tracers read `gpu_lock_scale`.
+    /// window (default `xess::DEFAULT_LOCK_SCALE` = quality 2/3;
+    /// `--lock-res dynamic` -> None = the step-wise dynamic-resolution
+    /// controller). CLI-only, no runtime toggle — T prints the locked note.
+    /// ONE scale for every render mode: the CPU tracer, `--gpu` and `--dxr`
+    /// all trace at it, so F/SPACE cycling arms never moves the render res.
+    /// (The GPU arms used to default to native 100% through a second
+    /// `gpu_lock_scale` field; that split is gone.) `--lock-res dynamic` is
+    /// not honorable on the GPU arms, which lock at the default instead with
+    /// a loud line.
     pub lock_scale: Option<f32>,
-    /// The GPU render modes' (`--gpu`, `--dxr`) counterpart of `lock_scale`:
-    /// they trace at NATIVE (100%) by default while the CPU renderer defaults
-    /// to quality (2/3) — the CPU tracer needs the pixel discount, the GPU
-    /// ones don't. The two are one flag: an explicit `--lock-res` sets BOTH,
-    /// so a session that asks for a scale gets that scale in whichever arm it
-    /// renders (F toggles between them; the res discontinuity is already a
-    /// history-reset latch).
-    pub gpu_lock_scale: Option<f32>,
     /// Primary samples per pixel per frame (--spp, 1..=dlss::MAX_SPP; U cycles
     /// it live). N jittered samples inside each pixel share the tile's
     /// inherited t_start/cut (the quadtree cost amortizes over N× the rays)
@@ -306,7 +303,7 @@ pub struct Opts {
     /// alone. `dxr_explicit` already existed as a parse-local for the
     /// OIDN/NPPD opt-out; this is the same idea, promoted so it survives parse.
     pub mode_explicit: bool,
-    /// Did the user pass `--lock-res`? Same reason: `gpu_lock_scale` has a
+    /// Did the user pass `--lock-res`? Same reason: `lock_scale` has a
     /// non-None default, so its value cannot report whether it was chosen.
     pub lock_res_explicit: bool,
     /// Directory holding dxcompiler.dll + dxil.dll.
@@ -543,8 +540,7 @@ pub fn defaults() -> Opts {
         oidn_post: false,
         xess_autoexposure: false,
         adaptive: true,
-        lock_scale: xess::lock_scale("quality"),
-        gpu_lock_scale: xess::lock_scale("native"),
+        lock_scale: Some(xess::DEFAULT_LOCK_SCALE),
         spp: 1,
         temporal: true,
         replay: true,
@@ -1241,8 +1237,8 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
                 }
             }
             "--lock-res" => {
-                // One flag, both scales: an explicit request overrides the
-                // per-mode defaults (CPU quality, GPU native) in every arm.
+                // One flag, one scale, every arm — the per-mode defaults
+                // (CPU quality, GPU native) are gone.
                 opts.lock_scale = match args.next().as_deref() {
                     Some("dynamic") => None,
                     Some(s) => match xess::lock_scale(s) {
@@ -1257,7 +1253,6 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
                         std::process::exit(2);
                     }
                 };
-                opts.gpu_lock_scale = opts.lock_scale;
                 opts.lock_res_explicit = true;
             }
             // Ray Regeneration tuning overrides (FfxApiConfigureDenoiserKey).

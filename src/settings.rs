@@ -528,17 +528,15 @@ pub fn apply_to_opts(s: &Settings, opts: &mut crate::Opts) -> AppliedFx {
         }
     }
     if let Some(l) = r.lock_res.as_deref() {
-        // Mirrors --lock-res: one value, BOTH scales, and it counts as an
-        // explicit choice for the vendor-default policy.
+        // Mirrors --lock-res: one value, every render mode, and it counts as
+        // an explicit choice for the vendor-default policy.
         if l == "dynamic" {
             opts.lock_scale = None;
-            opts.gpu_lock_scale = None;
             opts.lock_res_explicit = true;
         } else {
             match crate::xess::lock_scale(l) {
                 Some(scale) => {
                     opts.lock_scale = Some(scale);
-                    opts.gpu_lock_scale = Some(scale);
                     opts.lock_res_explicit = true;
                 }
                 None => warn("renderer.lock_res", l),

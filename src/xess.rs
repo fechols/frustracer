@@ -214,13 +214,20 @@ pub fn quantize_res(
     (width_for_height(rh, out, min.0, max.0), rh)
 }
 
+/// The render scale every mode locks at by default — the standard DLSS
+/// "quality" ratio. ONE value for the CPU tracer, `--gpu` and `--dxr` alike:
+/// the upscalers are the reconstruction stage in all three, so the arm that
+/// happens to be live is not a reason to change how many pixels get traced
+/// (F/SPACE cycling between arms therefore no longer moves the render res).
+pub const DEFAULT_LOCK_SCALE: f32 = 2.0 / 3.0;
+
 /// --lock-res argument -> fixed render scale (both upscaler paths consume it
 /// through `quantize_res`, which range-clamps). Named presets are the
 /// standard DLSS ratios; a bare number is accepted as a ratio in (0, 1] —
 /// the filter also rejects NaN.
 pub fn lock_scale(arg: &str) -> Option<f32> {
     match arg {
-        "quality" => Some(2.0 / 3.0),
+        "quality" => Some(DEFAULT_LOCK_SCALE),
         "balanced" => Some(0.58),
         "performance" => Some(0.5),
         "ultra-performance" => Some(1.0 / 3.0),
