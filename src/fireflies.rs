@@ -34,8 +34,14 @@
 //!   light/glow math is term-for-term mirrored (`shade.hlsli::ff_light`,
 //!   `trace_common.hlsli::ff_glow`).
 //!
-//! Known-accepts (documented, deliberate): no motion vectors (drift reads as
-//! shading change to the upscalers — the clouds accept); the glow is a
+//! Known-accepts (documented, deliberate): no motion vectors in the RENDER
+//! G-buffers (drift reads as shading change to the upscalers — the clouds
+//! accept; note the caveat: cloud drift is SLOW, firefly drift is fast and
+//! high-contrast, which is why raw-NGX FRAME GENERATION now carries its own
+//! exception — `ngxfg_guides.rs` round 3 bakes closed-form firefly MVs into
+//! the FG-ONLY MV plane at glow-dominated pixels, `FR_NGXFG_FFMV=off` the
+//! A/B; RR's own MV plane and the ffx/XeSS-FG families still see no firefly
+//! motion, and firefly SPECULAR highlights still ride surface MVs); the glow is a
 //! primary-camera-path feature (no glow in reflections or through glass — a
 //! per-continuation N-scan buys a near-invisible payoff at glossy roughness);
 //! fireflies cast no light through translucency; a converging still frame

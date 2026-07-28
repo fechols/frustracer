@@ -468,6 +468,18 @@ struct NgxFgState {
     /// so the raw-NGX matrix majority was never validated (SL may transpose
     /// internally before setting the DLSSG params).
     mat_col: bool,
+    /// FR_NGXFG_FFMV=off — skip the round-3 firefly-MV bake (the guide
+    /// pass's FF table uploads `ffc = 0`, the provably-identical A/B): the
+    /// FG MV plane keeps surface/virtual MVs at glow pixels, and the night
+    /// swarm strobes on generated frames again on demand.
+    ffmv_off: bool,
+    /// LAST SUCCESSFULLY EVALUATED frame's baked swarm — the prev half of
+    /// the round-3 MV pair, updated beside `primed` so it stays aligned with
+    /// the frame the NGX feature actually retained across skipped/failed
+    /// dispatches. Starts `Fireflies::off()`: the bake's count-mismatch
+    /// fallback then reprojects the CURRENT pose (camera-motion-only MV),
+    /// and the first evaluate presents real-only anyway (`primed`).
+    prev_ff: std::cell::Cell<crate::fireflies::Fireflies>,
 }
 
 /// XeSS-FG frame generation (Intel XeSS sessions — the third `--fg` family).
@@ -1257,6 +1269,13 @@ impl GpuContext {
                     if mat_col {
                         eprintln!("fg: FR_NGXFG_MAT=col — column-major matrices to the evaluate");
                     }
+                    let ffmv_off = lever("FR_NGXFG_FFMV", &["off"]) == 1;
+                    if ffmv_off {
+                        eprintln!(
+                            "fg: FR_NGXFG_FFMV=off — firefly glow keeps surface MVs on \
+                             generated frames (expect the night swarm to strobe under motion)"
+                        );
+                    }
                     Some(NgxFgState {
                         out,
                         handle: std::cell::Cell::new(std::ptr::null_mut()),
@@ -1276,6 +1295,8 @@ impl GpuContext {
                         show_mode,
                         cam_identity,
                         mat_col,
+                        ffmv_off,
+                        prev_ff: std::cell::Cell::new(crate::fireflies::Fireflies::off()),
                     })
                 }
                 Err(e) => {
@@ -2622,7 +2643,7 @@ impl GpuContext {
         // Raw-NGX frame generation owns the tail when armed (pair-present);
         // the SL-G marker bracket below is its fallback sibling.
         if self.fg_n.is_some() {
-            return self.ngxfg_tail(slot, fc);
+            return self.ngxfg_tail(slot, fc, &p.fireflies);
         }
         // The tonemap pass re-binds root sig/PSO/heaps/viewport from
         // scratch — the post-evaluate state restore
@@ -4135,6 +4156,11 @@ impl GpuContext {
         g: &dlss::GBufs,
         fc: &dlss::FrameConstants,
         frame_idx: u32,
+        // The frame's baked swarm — the raw-NGX FG tail's round-3 firefly
+        // MVs (the GPU-fed arms read it off FrameParams; this CPU-fed arm
+        // is handed the same `Fireflies::live` value the RenderCtx traced
+        // with). Unused when FG is not armed.
+        ff: &crate::fireflies::Fireflies,
     ) -> Result<()> {
         crate::zone!("present-rr");
         self.dlssg_frame_begin(frame_idx);
@@ -4181,7 +4207,7 @@ impl GpuContext {
             )]);
         }
         if self.fg_n.is_some() {
-            return self.ngxfg_tail(slot, fc);
+            return self.ngxfg_tail(slot, fc, ff);
         }
         // The tonemap pass re-binds root sig/PSO/heaps/viewport from scratch,
         // which is exactly the post-evaluate state restore that
@@ -4253,7 +4279,7 @@ impl GpuContext {
             }
         }
         if self.fg_n.is_some() {
-            return self.ngxfg_tail(slot, fc);
+            return self.ngxfg_tail(slot, fc, &p.fireflies);
         }
         // The tonemap pass re-binds root sig/PSO/heaps/viewport from scratch —
         // the post-evaluate state restore eDisableCLStateTracking makes the
@@ -4664,7 +4690,15 @@ impl GpuContext {
     /// frame BETWEEN them into `fg_n.out`. Returns true when that output is
     /// presentable (a prior frame primed the pair and this one is no reset).
     /// The feature is created lazily at the frame's locked render res.
-    fn ngxfg_dispatch(&mut self, fc: &dlss::FrameConstants) -> bool {
+    /// `slot` = the frame's in-flight slot (the guide pass's firefly CB ring
+    /// writes into it); `ff` = the frame's baked swarm (`Fireflies::off()`
+    /// shape on day frames — count 0 skips the whole round-3 bake).
+    fn ngxfg_dispatch(
+        &mut self,
+        slot: usize,
+        fc: &dlss::FrameConstants,
+        ff: &crate::fireflies::Fireflies,
+    ) -> bool {
         let (Some(n), Some(rr)) = (&self.fg_n, &self.rr) else { return false };
         if !n.enabled || n.failed.get() {
             return false;
@@ -4801,11 +4835,30 @@ impl GpuContext {
         if let Some(gp) = &guide_pass {
             // world -> PREVIOUS clip: column-vector composition, right to
             // left (world -> view -> clip -> prev clip).
-            let m = (fc.clip_to_prev_clip * fc.view_to_clip * fc.world_to_view)
-                .to_cols_array_2d();
+            let m_prev = fc.clip_to_prev_clip * fc.view_to_clip * fc.world_to_view;
+            let m = m_prev.to_cols_array_2d();
             let (near, far) = (fc.near, fc.far);
             let tanh = (fc.fov_y * 0.5).tan();
             let v4 = |v: glam::Vec3A| [v.x, v.y, v.z, 0.0];
+            // Round 3: bake this frame's firefly splat rows (screen-space —
+            // see ngxfg_guides.rs). ffc = 0 is the structural off: day
+            // frames, --no-fireflies, and the FR_NGXFG_FFMV=off A/B all
+            // execute the pre-round-3 kernel stream bit-identically.
+            let ff_table = if n.ffmv_off || ff.count == 0 {
+                ngxfg_guides::FfTable::empty()
+            } else {
+                ngxfg_guides::ff_guide_rows(
+                    ff,
+                    &n.prev_ff.get(),
+                    rw as f32,
+                    rh as f32,
+                    fc.fov_y,
+                    fc.pos,
+                    fc.forward,
+                    &(fc.view_to_clip * fc.world_to_view),
+                    &m_prev,
+                )
+            };
             let p = ngxfg_guides::GuideParams {
                 w: rw,
                 h: rh,
@@ -4826,7 +4879,7 @@ impl GpuContext {
                 cam_far: far,
                 _pad: [0.0; 2],
             };
-            gp.record(list, &p);
+            gp.record(list, &p, slot, &ff_table);
         }
         let depth_res = match &guide_pass {
             Some(gp) if !n.depth_linear => gp.clip().as_raw(),
@@ -4931,6 +4984,11 @@ impl GpuContext {
         // a stale frame — present real-only this frame, pairs from the next.
         let show = n.primed.get() && !fc.reset;
         n.primed.set(true);
+        // The swarm NGX now retains — next frame's prev half of the round-3
+        // MV pair. Set only on a SUCCESSFUL evaluate (beside `primed`), so a
+        // skipped/failed dispatch keeps the pairing aligned with the frame
+        // the feature actually holds.
+        n.prev_ff.set(*ff);
         show
     }
 
@@ -4939,8 +4997,13 @@ impl GpuContext {
     /// and current in time), then the real frame. Under vsync the two
     /// presents land a vblank apart — that IS the pacing; no handshake is
     /// needed because nothing generates behind our back.
-    fn ngxfg_tail(&mut self, slot: usize, fc: &dlss::FrameConstants) -> Result<()> {
-        let show = self.ngxfg_dispatch(fc);
+    fn ngxfg_tail(
+        &mut self,
+        slot: usize,
+        fc: &dlss::FrameConstants,
+        ff: &crate::fireflies::Fireflies,
+    ) -> Result<()> {
+        let show = self.ngxfg_dispatch(slot, fc, ff);
         if let Some(n) = &self.fg_n {
             n.pair.set(show);
         }

@@ -238,8 +238,14 @@ cargo run --release -- --tod 22 --fireflies 24  # FIREFLIES (src/fireflies.rs, d
                                       # recursion, hemi.rs, and both estimators pass ff=None
                                       # (hemi_leaf.hlsl passes fireflies=false); like emissive,
                                       # they do not light bounce surfaces. Shading-only: no
-                                      # visibility change, no MVs (drift = shading change to the
-                                      # upscalers, the clouds accept), temporal cache/replay KEPT.
+                                      # visibility change, no MVs in the render G-buffers (drift =
+                                      # shading change to the upscalers, the clouds accept — BUT
+                                      # cloud drift is slow and firefly drift is fast+bright, so
+                                      # raw-NGX FRAME GENERATION carries the one exception:
+                                      # ngxfg_guides round 3 bakes closed-form firefly MVs into
+                                      # the FG-ONLY MV plane at glow-dominated pixels — see the
+                                      # --fg block; RR's plane and the ffx/XeSS-FG families still
+                                      # see no firefly motion), temporal cache/replay KEPT.
                                       # Known-accepts: glow on the primary camera path only (none
                                       # in reflections/glass); no light through translucency; a
                                       # converging still freezes them mid-flight; slight RR ghost
@@ -749,11 +755,45 @@ cargo run --release -- --fg           # FRAME GENERATION, DLSS family (W4 leg 2)
                                       # True RADIANCE-
                                       # weighted w needs a dd/ds/ind_s-style capture in DLSS
                                       # sessions (the FLAG_FSR_SIG precedent) — the follow-on
-                                      # if albedo-weighting leaves residue. Gated in --check as
+                                      # if albedo-weighting leaves residue. ROUND 3 of the same
+                                      # pass (the night-swarm strobe fix): fireflies move every
+                                      # rendered frame with NO MVs anywhere (the glow is a
+                                      # color-only add after the G-buffer capture), so FG warped
+                                      # the bright blobs with the BACKGROUND's MV — and on
+                                      # smooth/metal pixels the round-2 material-driven blend
+                                      # confidently handed it the virtual-reflection MV at
+                                      # exactly those pixels. Poses are closed-form, so the CPU
+                                      # bakes per-firefly SCREEN-SPACE splat rows (ff_guide_rows:
+                                      # cur px, prev px through the same world->prev-clip matrix,
+                                      # view-Z, sigma-px, center lum — prev poses = the LAST
+                                      # SUCCESSFULLY EVALUATED frame's swarm, retained beside
+                                      # `primed`; a count mismatch reprojects the current pose,
+                                      # camera-motion-only, never wrong-signed) and the kernel
+                                      # lerps toward mv_i = prev_px - cur_px where glow luminance
+                                      # dominates (w = S/(S+FF_MV_L_REF); analytic weight, never
+                                      # an accum read — a 1-spp denominator would flicker the MV
+                                      # plane; the exp-reject rides the fireflies +34 ms lesson
+                                      # with a 1e-4 skirt so the weight is continuous at the
+                                      # cut). MV constant across a splat (rigid translation —
+                                      # per-pixel reprojection would contract the blob). The
+                                      # table rides a root CBV (b1) on a FRAMES_IN_FLIGHT upload
+                                      # ring; ffc=0 (day / --no-fireflies / lever-off) executes
+                                      # the pre-round-3 kernel stream bit-identically.
+                                      # FR_NGXFG_FFMV=off is the A/B (strobe returns on demand).
+                                      # FG-ONLY: RR's MV plane, ffx FI and XeSS-FG unchanged
+                                      # (their zero-MV glow drag is a documented accept); firefly
+                                      # SPECULAR highlights still ride surface/virtual MVs
+                                      # (half-vector geometry, out of scope). Gated in --check as
                                       # `ngxfg-guides` (clip-depth matrix-consistency sweep;
                                       # virtual-MV: static-camera zero, t_r=0 continuity vs
                                       # CamBasis::project itself, the strafe reflected-sky
-                                      # collapse, weight anchors). THE STRAFE GATE'S OWN
+                                      # collapse, weight anchors; round 3: off arms exact +
+                                      # empty-table blend bit-identity, the moving-firefly gate
+                                      # with anti-vacuity and TEETH pins — the pass-through
+                                      # surface MV must FAIL the bound — occlusion/behind-camera
+                                      # drops, the weight-continuity skirt pin, and the
+                                      # projection-route/sigma-lum anchors vs CamBasis::project
+                                      # and the shipped fireflies::glow). THE STRAFE GATE'S OWN
                                       # LESSON: it was RELATIVE (`mv_virt <= 0.05 * mv_surf`)
                                       # where the correct answer is EXACTLY ZERO, so any
                                       # percentage of a large surface MV passed; and it ran at
@@ -781,7 +821,9 @@ cargo run --release -- --fg           # FRAME GENERATION, DLSS family (W4 leg 2)
                                       # FR_NGXFG_DEPTH=linear, FR_NGXFG_RMV=off (surface MVs —
                                       # brings the reflection swim back on demand),
                                       # FR_NGXFG_JITTER=0|raw, FR_NGXFG_MV=norm|neg|normneg
-                                      # (scale/polarity walks), FR_NGXFG_CAM=identity
+                                      # (scale/polarity walks), FR_NGXFG_FFMV=off (surface MVs
+                                      # at firefly glow pixels — the night-swarm strobe A/B,
+                                      # see round 3 above), FR_NGXFG_CAM=identity
                                       # (quinlight's proven identity-camera block — isolates
                                       # our matrix plumbing), FR_NGXFG_MAT=col (column-major
                                       # matrices — the majority was never validated: quinlight's

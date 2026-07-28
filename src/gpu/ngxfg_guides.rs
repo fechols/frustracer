@@ -38,6 +38,35 @@
 //!    plane is FG-ONLY — RR keeps its own MV plane untouched (RR is trained
 //!    for surface MVs + the spec-hit guide).
 //!
+//! 3. **Firefly glow motion vectors** (round 3 — the night-swarm strobe on
+//!    generated frames): the glow splat is a color-only add applied AFTER the
+//!    G-buffer capture (render.rs `shade_traced`, leaf/sky/dxr twins), so a
+//!    glow-dominated pixel carries the MV of the surface (or sky) BEHIND it
+//!    while its bright CONTENT translates several pixels per rendered frame
+//!    (`fireflies::pose` on the shared cloud clock). Worse, on smooth/metal
+//!    pixels round 2's material-driven weight confidently hands FG the
+//!    virtual-reflection MV at exactly those pixels. Poses are CLOSED-FORM,
+//!    so the fix is exact: the CPU bakes per-firefly SCREEN-SPACE splat rows
+//!    (`ff_guide_rows` — current pixel, prev-frame pixel through the same
+//!    world→prev-clip matrix `GuideParams` carries, view-Z, sigma in pixels,
+//!    center luminance) and the kernel lerps toward the firefly's own
+//!    `mv_i = prev_px − cur_px` where glow luminance dominates
+//!    (`w_ff = S/(S + FF_MV_L_REF)`). The MV is CONSTANT across a splat
+//!    (rigid translation — exact at the center, and the right first-order
+//!    warp for a translating blob; per-pixel reprojection would contract the
+//!    splat toward a point). The weight is analytic, never an accum read: a
+//!    1-spp color denominator is stochastic and would flicker the MV plane
+//!    frame to frame (the round-2 radiance-weighted-w follow-on note applies
+//!    here too). Splat rows pair prev↔cur BY INDEX; a count mismatch (first
+//!    armed frame, a live count edit) reprojects the CURRENT pose instead —
+//!    camera-motion-only MV, coarser never wrong-signed. `ffc == 0` (day /
+//!    `--no-fireflies` / FR_NGXFG_FFMV=off) skips the whole block: the
+//!    pre-round-3 instruction stream bit-identically. Known-accepts:
+//!    firefly SPECULAR highlights on surfaces still ride the surface/virtual
+//!    blend (highlight motion is half-vector geometry); RR itself still sees
+//!    no firefly MVs (its plane is untouched by contract); ffx/XeSS-FG
+//!    families unchanged.
+//!
 //! Compiled with D3DCompile (fxc, cs_5_0) like `gpu/bloom.rs` — a CPU-fed RR
 //! session never loads DXC, and this pass must run in all three RR arms
 //! (CPU-fed, wavefront-fed, DXR-fed): it records inside `ngxfg_dispatch`,
@@ -60,6 +89,16 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 pub const ROUGH_LO: f32 = 0.25;
 pub const ROUGH_HI: f32 = 0.6;
 
+/// The firefly-MV dominance reference (round 3): a pixel whose summed glow
+/// luminance S reaches this value takes half the firefly MV, and a bright
+/// splat core (lum near the `FF_GLOW_L_MAX` cap, ~446 in luminance) lands at
+/// w ≈ 0.999. A night-scene constant — tune once on the 4090 with
+/// FR_NGXFG_SHOW=interp if the skirt still strobes (raise = tighter cores,
+/// lower = wider capture that starts stealing genuinely-moving background
+/// pixels in the halo). Uploaded through the FF cbuffer so this const is the
+/// one source (no HLSL literal to co-edit).
+pub const FF_MV_L_REF: f32 = 0.25;
+
 // The Rust twins are `clip_depth` / `virtual_prev_px` / `rmv_weight` below —
 // change both together.
 const HLSL: &str = r#"
@@ -79,6 +118,15 @@ cbuffer C : register(b0) {
     float4 rgt;  // right * tan(fov/2) * aspect (CamBasis pre-scaling)
     float4 upv;  // up * tan(fov/2)
     uint   rmv; float cam_far; float2 _pad;
+}
+// Round 3: the CPU-baked firefly splat table (FfTable — layout in lockstep,
+// see the size assert beside it). ffc == 0 is the structural off.
+cbuffer FF : register(b1) {
+    uint   ffc;      // live compacted rows
+    float  ff_lref;  // FF_MV_L_REF (Rust is the one source)
+    float2 _ffpad;
+    float4 ffa[64];  // cur_px.x, cur_px.y, view_z, sigma_px
+    float4 ffb[64];  // mv.x, mv.y, lum_center, 0
 }
 [numthreads(8, 8, 1)]
 void cs_guides(uint3 id : SV_DispatchThreadID) {
@@ -129,6 +177,33 @@ void cs_guides(uint3 id : SV_DispatchThreadID) {
             float wgt = saturate(ls / (ld + ls + 1e-4f))
                       * (1.0f - smoothstep(0.25f, 0.6f, rough)); // ROUGH_LO..ROUGH_HI
             mv = lerp(mv, mv_v, wgt);
+        }
+    }
+    // Round 3 (firefly glow MVs): a glow-dominated pixel's CONTENT is the
+    // firefly, not the surface behind it — the Rust twin is ff_mv_blend,
+    // change both together. Runs AFTER the virtual-reflection blend: the
+    // glow overlays surface and sky alike, and the blend above is exactly
+    // the confident wrong answer at a bright highlight on smooth metal.
+    if (ffc != 0) {
+        float S = 0.0f;
+        float2 mv_ff = float2(0.0f, 0.0f);
+        float2 cpx = float2(id.xy) + 0.5f;
+        for (uint i = 0; i < ffc; i++) {
+            float4 fa = ffa[i];
+            if (fa.z >= z) continue; // occluded by the primary hit (sky z = far passes)
+            float2 dpx = cpx - fa.xy;
+            float ax = dot(dpx, dpx) / (2.0f * fa.w * fa.w);
+            if (ax > 9.22f) continue; // reject BEFORE exp (the fireflies +34 ms lesson)
+            // The 1e-4 skirt makes the reject EXACT (9.22 > -ln(1e-4)), so
+            // the weight is continuous at the cut instead of stepping.
+            float g = exp(-ax) - 1e-4f;
+            if (g <= 0.0f) continue;
+            float wi = ffb[i].z * g;
+            S += wi;
+            mv_ff += wi * ffb[i].xy;
+        }
+        if (S > 0.0f) {
+            mv = lerp(mv, mv_ff / S, S / (S + ff_lref));
         }
     }
     mvdst[id.xy] = mv;
@@ -195,6 +270,160 @@ pub fn rmv_weight(lum_diff: f32, lum_spec: f32, rough: f32) -> f32 {
     (lum_spec / (lum_diff + lum_spec + 1e-4)).clamp(0.0, 1.0) * smooth
 }
 
+/// Round 3: the CPU-baked firefly splat table — the `FF` cbuffer's exact
+/// byte layout (16-byte header + two float4 rows per `MAX_FIREFLIES` slot;
+/// the HLSL declares `ffa[64]`/`ffb[64]`, in lockstep with the array bound
+/// here). Rows are COMPACTED at bake: `ffc` counts live rows only, and 0 is
+/// the structural off every day / `--no-fireflies` / lever-off frame takes.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FfTable {
+    pub ffc: u32,
+    /// `FF_MV_L_REF`, uploaded so the Rust const is the one source.
+    pub lref: f32,
+    pub _pad: [f32; 2],
+    /// cur_px.x, cur_px.y, view_z, sigma_px.
+    pub a: [[f32; 4]; crate::fireflies::MAX_FIREFLIES],
+    /// mv.x, mv.y (prev − cur, pixels — the plane's convention), center
+    /// luminance, 0.
+    pub b: [[f32; 4]; crate::fireflies::MAX_FIREFLIES],
+}
+const _: () = assert!(std::mem::size_of::<FfTable>() == 16 + 2 * 64 * 16);
+/// Per-slot stride in the upload ring: the table size rounded up to the
+/// 256-byte CBV placement alignment.
+pub const FF_CB_STRIDE: usize = 2304;
+const _: () =
+    assert!(FF_CB_STRIDE >= std::mem::size_of::<FfTable>() && FF_CB_STRIDE % 256 == 0);
+
+impl FfTable {
+    pub fn empty() -> FfTable {
+        FfTable {
+            ffc: 0,
+            lref: FF_MV_L_REF,
+            _pad: [0.0; 2],
+            a: [[0.0; 4]; crate::fireflies::MAX_FIREFLIES],
+            b: [[0.0; 4]; crate::fireflies::MAX_FIREFLIES],
+        }
+    }
+}
+
+/// World point → pixel through a world→clip matrix, the kernel's own NDC →
+/// pixel mapping (and `virtual_prev_px`'s — one convention, three users).
+/// None = at/behind the camera plane; the caller DROPS the row so the
+/// surface MV survives rather than inventing one.
+fn px_of(m: &Mat4, p: Vec3A, w: f32, h: f32) -> Option<(f32, f32)> {
+    let pc = *m * Vec4::new(p.x, p.y, p.z, 1.0);
+    if pc.w <= 1e-6 {
+        return None;
+    }
+    Some(((pc.x / pc.w + 1.0) * 0.5 * w, (1.0 - pc.y / pc.w) * 0.5 * h))
+}
+
+/// Bake the frame's firefly splat rows in SCREEN space — everything the
+/// kernel needs per firefly is a per-frame constant, so the per-pixel loop
+/// degenerates to a 2-D Gaussian test and no third copy of `ff_glow` exists
+/// (CPU `fireflies::glow` + `trace_common.hlsli::ff_glow` stay the only
+/// twins; the σ/lum parity gate in `self_test` ties this bake to them).
+/// `world_to_clip` = current frame, `world_to_prev_clip` = the same `m` the
+/// GuideParams carry. Pure — zero rng, zero statics.
+#[allow(clippy::too_many_arguments)]
+pub fn ff_guide_rows(
+    cur: &crate::fireflies::Fireflies,
+    prev: &crate::fireflies::Fireflies,
+    w: f32,
+    h: f32,
+    fov_y: f32,
+    org: Vec3A,
+    fwd: Vec3A,
+    world_to_clip: &Mat4,
+    world_to_prev_clip: &Mat4,
+) -> FfTable {
+    use crate::fireflies::{FF_COLOR, FF_E_K, FF_GLOW_L_MAX, FF_SRC_K};
+    let mut t = FfTable::empty();
+    if cur.count == 0 {
+        return t;
+    }
+    // Prev poses pair by INDEX (bake writes row i from pose(i) — the roster
+    // is fixed). A count mismatch (first frame after arming, a live count
+    // edit) reprojects the CURRENT pose instead: the camera-motion-only MV
+    // of a momentarily stationary firefly — coarser, never wrong-signed.
+    let prev = if prev.count == cur.count { prev } else { cur };
+    // camera.rs::pixel_cone — the angular pitch of one pixel, the unit the
+    // glow's σ converts through.
+    let pixel_cone = 2.0 * (fov_y * 0.5).tan() / h;
+    let e = FF_E_K * cur.scale * cur.scale;
+    let src_r = FF_SRC_K * cur.scale;
+    let lum709 = 0.2126 * FF_COLOR.x + 0.7152 * FF_COLOR.y + 0.0722 * FF_COLOR.z;
+    let mut n = 0usize;
+    for i in 0..cur.count as usize {
+        let wgt = cur.pos[i][3];
+        if wgt <= 0.0 {
+            continue;
+        }
+        let p = Vec3A::from_slice(&cur.pos[i]);
+        let z = (p - org).dot(fwd);
+        if z <= 0.0 {
+            continue;
+        }
+        let Some((cx, cy)) = px_of(world_to_clip, p, w, h) else { continue };
+        let Some((px, py)) =
+            px_of(world_to_prev_clip, Vec3A::from_slice(&prev.pos[i]), w, h)
+        else {
+            continue;
+        };
+        // ff_glow's exact σ/radiance, converted to pixels/luminance: σ_ang =
+        // max(pixel_cone/4, src_r/s) — callers hand glow half_angle =
+        // pixel_cone/2 and it halves again — and the FF_GLOW_L_MAX cap.
+        let s = (p - org).length();
+        let sigma_ang = (pixel_cone * 0.25).max(src_r / s);
+        let lum = lum709
+            * (e * wgt / (s * s * std::f32::consts::TAU * sigma_ang * sigma_ang))
+                .min(FF_GLOW_L_MAX);
+        if lum <= 1e-3 * FF_MV_L_REF {
+            continue;
+        }
+        t.a[n] = [cx, cy, z, sigma_ang / pixel_cone];
+        t.b[n] = [px - cx, py - cy, lum, 0.0];
+        n += 1;
+    }
+    t.ffc = n as u32;
+    t
+}
+
+/// The CPU mirror of `cs_guides`' round-3 loop — change both together. An
+/// `ffc == 0` table (and an all-rejected pixel) returns `mv` BIT-identically,
+/// which is what the off-arm gate pins.
+pub fn ff_mv_blend(mv: (f32, f32), cx: f32, cy: f32, z_pixel: f32, t: &FfTable) -> (f32, f32) {
+    if t.ffc == 0 {
+        return mv;
+    }
+    let (mut s, mut ax, mut ay) = (0.0f32, 0.0f32, 0.0f32);
+    for i in 0..t.ffc as usize {
+        let fa = t.a[i];
+        if fa[2] >= z_pixel {
+            continue;
+        }
+        let (dx, dy) = (cx - fa[0], cy - fa[1]);
+        let a = (dx * dx + dy * dy) / (2.0 * fa[3] * fa[3]);
+        if a > 9.22 {
+            continue;
+        }
+        let g = (-a).exp() - 1e-4;
+        if g <= 0.0 {
+            continue;
+        }
+        let wi = t.b[i][2] * g;
+        s += wi;
+        ax += wi * t.b[i][0];
+        ay += wi * t.b[i][1];
+    }
+    if s <= 0.0 {
+        return mv;
+    }
+    let wff = s / (s + t.lref);
+    (mv.0 + (ax / s - mv.0) * wff, mv.1 + (ay / s - mv.1) * wff)
+}
+
 /// Root constants for `cs_guides` — field order IS the cbuffer layout.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -251,6 +480,13 @@ pub struct GuidePass {
     mv: Option<ID3D12Resource>,
     w: u32,
     h: u32,
+    /// Round 3's firefly table ring: `FRAMES_IN_FLIGHT × FF_CB_STRIDE` on an
+    /// upload heap, persistently mapped, bound as root CBV b1. Res-
+    /// independent, so `ensure` never touches it. The frame slot's fence was
+    /// waited in `begin_frame`, so writing slot k's region never races an
+    /// in-flight read.
+    ff_cb: ID3D12Resource,
+    ff_ptr: *mut u8,
 }
 
 impl GuidePass {
@@ -301,6 +537,16 @@ impl GuidePass {
                         RegisterSpace: 0,
                         Num32BitValues: PARAM_DWORDS,
                     },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+            // [3] the firefly splat table (round 3) — a root CBV: 2 KB of
+            // rows is far past the root-constant budget, and a root
+            // descriptor needs only a GPU VA (no heap change).
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_CBV,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR { ShaderRegister: 1, RegisterSpace: 0 },
                 },
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             },
@@ -359,7 +605,37 @@ impl GuidePass {
             device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
         };
 
-        Ok(GuidePass { root_sig, pso, heap, inc, clip: None, mv: None, w: 0, h: 0 })
+        let ff_cb = {
+            let mut res: Option<ID3D12Resource> = None;
+            unsafe {
+                device.CreateCommittedResource(
+                    &d3d12::upload_heap(),
+                    D3D12_HEAP_FLAG_NONE,
+                    &d3d12::buffer_desc((FF_CB_STRIDE * d3d12::FRAMES_IN_FLIGHT) as u64),
+                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                    None,
+                    &mut res,
+                )
+            }
+            .map_err(|e| format!("ngxfg-guides: firefly CB ring: {e}"))?;
+            res.unwrap()
+        };
+        let mut ff_ptr = std::ptr::null_mut();
+        unsafe { ff_cb.Map(0, None, Some(&mut ff_ptr)) }
+            .map_err(|e| format!("ngxfg-guides: firefly CB map: {e}"))?;
+
+        Ok(GuidePass {
+            root_sig,
+            pso,
+            heap,
+            inc,
+            clip: None,
+            mv: None,
+            w: 0,
+            h: 0,
+            ff_cb,
+            ff_ptr: ff_ptr as *mut u8,
+        })
     }
 
     /// (Re)build the output planes at the feature's render res and rewrite
@@ -442,19 +718,37 @@ impl GuidePass {
     /// Record the conversion. The source planes already rest
     /// NON_PIXEL_SHADER_RESOURCE (the state a compute SRV read wants); both
     /// output planes go UAV → NON_PIXEL_SHADER_RESOURCE for the evaluate
-    /// that follows. Pair with `restore` after the evaluate.
-    pub fn record(&self, list: &ID3D12GraphicsCommandList, p: &GuideParams) {
+    /// that follows. Pair with `restore` after the evaluate. `slot` is the
+    /// frame's in-flight slot (its ring region is fence-free by
+    /// `begin_frame`); `ff` is the frame's baked splat table — pass
+    /// `FfTable::empty()` for the structural off.
+    pub fn record(
+        &self,
+        list: &ID3D12GraphicsCommandList,
+        p: &GuideParams,
+        slot: usize,
+        ff: &FfTable,
+    ) {
         let gpu0 = unsafe { self.heap.GetGPUDescriptorHandleForHeapStart() };
         let uavs = D3D12_GPU_DESCRIPTOR_HANDLE {
             ptr: gpu0.ptr + (SRC_PLANES as u32 * self.inc) as u64,
         };
         unsafe {
+            std::ptr::copy_nonoverlapping(
+                ff as *const FfTable as *const u8,
+                self.ff_ptr.add(slot * FF_CB_STRIDE),
+                std::mem::size_of::<FfTable>(),
+            );
             list.SetComputeRootSignature(&self.root_sig);
             list.SetDescriptorHeaps(&[Some(self.heap.clone())]);
             list.SetPipelineState(&self.pso);
             list.SetComputeRootDescriptorTable(0, gpu0);
             list.SetComputeRootDescriptorTable(1, uavs);
             list.SetComputeRoot32BitConstants(2, PARAM_DWORDS, p as *const _ as *const _, 0);
+            list.SetComputeRootConstantBufferView(
+                3,
+                self.ff_cb.GetGPUVirtualAddress() + (slot * FF_CB_STRIDE) as u64,
+            );
             list.Dispatch(self.w.div_ceil(8), self.h.div_ceil(8), 1);
             list.ResourceBarrier(&[
                 d3d12::transition(
@@ -512,6 +806,14 @@ impl GuidePass {
 /// (d) lateral strafe with the reflection at `far` moves the virtual pixel
 /// far less than the surface pixel — the user's strafe observation, as a
 /// gate; (e) the blend-weight anchors.
+///
+/// Round-3 (firefly MV) half, on the `ff_guide_rows`/`ff_mv_blend` twins:
+/// off arms exact (day/disabled/zero-count bake ffc 0; empty-table blend
+/// bit-identical), the moving-firefly gate with its anti-vacuity and TEETH
+/// pins (the pass-through surface MV must FAIL the bound), occlusion +
+/// behind-camera drops, the weight-continuity sweep (the skirt pin), and
+/// the projection-route/σ-lum anchors against `CamBasis::project` and the
+/// shipped `fireflies::glow`.
 pub fn self_test() -> std::result::Result<(), String> {
     use crate::camera::Camera;
     // ---- depth half ----
@@ -708,6 +1010,235 @@ pub fn self_test() -> std::result::Result<(), String> {
     if rmv_weight(0.0, 0.55, ROUGH_HI + 0.01) != 0.0 {
         return Err("rmv_weight past ROUGH_HI must be exactly 0".into());
     }
+
+    // ---- round 3: firefly glow MVs ----
+    use crate::fireflies::{Fireflies, FF_COLOR, FF_GLOW_L_MAX};
+    let lum709 = |c: glam::Vec3A| 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;
+    let (fcmin, fcmax) = (Vec3A::new(-6.0, 0.0, -6.0), Vec3A::new(6.0, 4.0, 6.0));
+
+    // (b) OFF ARMS EXACT: day / disabled / zero count all bake ffc == 0, and
+    // an empty table's blend returns the input BIT-identically — the
+    // structural-off proof the kernel's `if (ffc != 0)` guard mirrors.
+    for (en, night, cnt) in [(true, 0.0f32, 8u32), (false, 1.0, 8), (true, 1.0, 0)] {
+        let ff = Fireflies::new(en, cnt, night, fcmin, fcmax, 5.0);
+        let t = ff_guide_rows(
+            &ff, &ff, rw as f32, rh as f32, cam.fov_y, org, fwd, &world_to_clip,
+            &world_to_clip,
+        );
+        if t.ffc != 0 {
+            return Err(format!(
+                "ff off arm (en={en} night={night} n={cnt}): ffc = {}, want 0",
+                t.ffc
+            ));
+        }
+    }
+    {
+        let mv_in = (0.123f32, -4.56f32);
+        let out = ff_mv_blend(mv_in, 100.5, 100.5, 3.0, &FfTable::empty());
+        if out != mv_in {
+            return Err(format!("ff empty-table blend must be bit-identical: {out:?}"));
+        }
+    }
+
+    // (a) MOVING FIREFLY, STATIC CAMERA: the blend at a splat center must
+    // land on the firefly's own closed-form displacement. Real bakes (the
+    // same `pose` production runs); dt scanned so the probe is never
+    // vacuous — the anti-vacuity assert fails loudly if no firefly moves
+    // >= 5 px, rather than the gate silently passing on nothing.
+    {
+        let bake_at = |dt: f32| {
+            let cur = Fireflies::new(true, 6, 1.0, fcmin, fcmax, 9.0);
+            let prv = Fireflies::new(true, 6, 1.0, fcmin, fcmax, 9.0 - dt);
+            ff_guide_rows(
+                &cur, &prv, rw as f32, rh as f32, cam.fov_y, org, fwd, &world_to_clip,
+                &world_to_clip,
+            )
+        };
+        let scan = |t: &FfTable| {
+            let mut best = (0usize, 0.0f32);
+            for i in 0..t.ffc as usize {
+                let m = (t.b[i][0].powi(2) + t.b[i][1].powi(2)).sqrt();
+                if m > best.1 {
+                    best = (i, m);
+                }
+            }
+            best
+        };
+        let mut table = bake_at(0.5);
+        let mut best = scan(&table);
+        for dt in [1.0f32, 2.0, 4.0, 8.0] {
+            if best.1 >= 5.0 {
+                break;
+            }
+            table = bake_at(dt);
+            best = scan(&table);
+        }
+        if best.1 < 5.0 {
+            return Err(format!(
+                "ff moving gate is vacuous — max firefly MV {} px after the dt scan \
+                 (probe too gentle)",
+                best.1
+            ));
+        }
+        let i = best.0;
+        let (cx, cy) = (table.a[i][0], table.a[i][1]);
+        let want = (table.b[i][0], table.b[i][1]);
+        let got = ff_mv_blend((0.0, 0.0), cx, cy, far, &table);
+        let err = ((got.0 - want.0).powi(2) + (got.1 - want.1).powi(2)).sqrt();
+        // The asymptotic weight never quite reaches 1 (w = S/(S+lref)), so
+        // the bound carries a relative and an absolute term.
+        let bound = 0.1 * best.1 + 0.5;
+        if err > bound {
+            return Err(format!(
+                "ff moving: blend ({},{}) vs closed-form MV ({},{}) — err {err} px > {bound}",
+                got.0, got.1, want.0, want.1
+            ));
+        }
+        // GATE TEETH: the pre-fix answer — the pass-through surface MV
+        // (0,0) — must FAIL the same bound, or this probe could never have
+        // caught the strobe it exists for.
+        if best.1 <= bound {
+            return Err(format!(
+                "ff moving gate is TOOTHLESS: the pass-through (0,0) also lands within \
+                 {bound} px of the {won} px displacement",
+                won = best.1
+            ));
+        }
+    }
+
+    // (c) OCCLUSION + BEHIND-CAMERA: a firefly behind the primary hit leaves
+    // the surface MV bit-identical; a firefly behind the CURRENT camera —
+    // or one whose PREVIOUS projection fails — is dropped at bake, so the
+    // surface MV survives rather than an invented one.
+    {
+        let mut t = FfTable::empty();
+        t.ffc = 1;
+        t.a[0] = [200.5, 150.5, 10.0, 3.0];
+        t.b[0] = [8.0, -3.0, 400.0, 0.0];
+        let mv_in = (1.25f32, -0.5f32);
+        let occ = ff_mv_blend(mv_in, 200.5, 150.5, 5.0, &t);
+        if occ != mv_in {
+            return Err(format!("ff occluded blend must be bit-identical: {occ:?}"));
+        }
+        let vis = ff_mv_blend(mv_in, 200.5, 150.5, far, &t);
+        if (vis.0 - mv_in.0).abs() < 1.0 {
+            return Err(format!("ff visible blend did not move: {vis:?}"));
+        }
+
+        let mut one = Fireflies::off();
+        one.count = 1;
+        one.scale = (fcmax - fcmin).length();
+        // Behind the CURRENT camera (cam at (4,2,4) looking at the origin).
+        one.pos[0] = [8.0, 3.0, 8.0, 1.0];
+        let tb = ff_guide_rows(
+            &one, &one, rw as f32, rh as f32, cam.fov_y, org, fwd, &world_to_clip,
+            &world_to_clip,
+        );
+        if tb.ffc != 0 {
+            return Err("ff behind current camera must drop at bake".into());
+        }
+        // Visible now, but the PREV camera faces away — the prev projection
+        // fails and the row drops.
+        one.pos[0] = [0.4, 1.3, -0.2, 1.0];
+        let away = Camera::look_at(cam.pos, cam.pos + Vec3A::new(4.0, 1.0, 4.0), cam.fov_y);
+        let away_mats = crate::dlss::cam_matrices(&away, rw, rh, near, far);
+        let away_clip = away_mats.view_to_clip * away_mats.world_to_view;
+        let tb = ff_guide_rows(
+            &one, &one, rw as f32, rh as f32, cam.fov_y, org, fwd, &world_to_clip, &away_clip,
+        );
+        if tb.ffc != 0 {
+            return Err("ff prev-projection failure must drop at bake".into());
+        }
+    }
+
+    // (d) WEIGHT CONTINUITY: radial sweep across a capped-brightness splat —
+    // monotone, near-1 core, EXACTLY 0 past the 9.22 cut, and no step: the
+    // pin the (exp − 1e-4)⁺ skirt exists for (drop the skirt and the reject
+    // boundary steps the weight by ~0.17 on a bright splat).
+    {
+        let mut t = FfTable::empty();
+        let sigma = 3.0f32;
+        t.ffc = 1;
+        t.a[0] = [200.5, 150.5, 1.0, sigma];
+        t.b[0] = [10.0, 0.0, lum709(FF_COLOR) * FF_GLOW_L_MAX, 0.0];
+        let mut prev_w = f32::INFINITY;
+        // 0.005σ spacing: the smooth tail's per-step delta stays ~0.005,
+        // half the 0.01 bound, while the skirt-less cut discontinuity is
+        // ~0.17 at ANY spacing — the pin separates slope from step.
+        for k in 0..=1100 {
+            let r = k as f32 * 0.005 * sigma;
+            let out = ff_mv_blend((0.0, 0.0), 200.5 + r, 150.5, far, &t);
+            let wk = out.0 / 10.0;
+            if k == 0 && wk <= 0.99 {
+                return Err(format!("ff weight core w(0) = {wk}, want > 0.99"));
+            }
+            if wk > prev_w + 1e-6 {
+                return Err(format!("ff weight not monotone at r = {r} px ({wk} > {prev_w})"));
+            }
+            if prev_w.is_finite() && (prev_w - wk).abs() >= 0.01 {
+                return Err(format!(
+                    "ff weight steps {} at r = {r} px — the skirt pin",
+                    prev_w - wk
+                ));
+            }
+            if r >= 4.35 * sigma && wk != 0.0 {
+                return Err(format!("ff weight past the 9.22 cut must be exactly 0 ({wk})"));
+            }
+            prev_w = wk;
+        }
+    }
+
+    // (e) PROJECTION-ROUTE ANCHOR + (f) σ/LUM PARITY: one synthetic firefly
+    // at a known point — the bake's matrix projections must agree with
+    // CamBasis::project (the MV fill sites' own function) in the plane's
+    // pixel convention, and the baked center luminance must equal the
+    // shipped `fireflies::glow` evaluated on-axis (ties the σ/pixel_cone
+    // conversion to the one glow implementation; drift here = the splat and
+    // its MV capture disagree about where the glow IS).
+    {
+        let p = Vec3A::new(0.4, 1.3, -0.2);
+        let mut one = Fireflies::off();
+        one.count = 1;
+        one.scale = (fcmax - fcmin).length();
+        one.pos[0] = [p.x, p.y, p.z, 1.0];
+        let tb = ff_guide_rows(
+            &one, &one, rw as f32, rh as f32, cam.fov_y, org, fwd, &world_to_clip,
+            &world_to_prev_clip,
+        );
+        if tb.ffc != 1 {
+            return Err(format!("ff anchor: ffc = {}, want 1", tb.ffc));
+        }
+        let basis = cam.basis(rw, rh);
+        let (ex, ey) =
+            basis.project(p - basis.origin).ok_or("ff anchor point behind camera")?;
+        if (tb.a[0][0] - ex).abs() > 0.05 || (tb.a[0][1] - ey).abs() > 0.05 {
+            return Err(format!(
+                "ff anchor cur px: bake ({},{}) vs CamBasis::project ({ex},{ey})",
+                tb.a[0][0], tb.a[0][1]
+            ));
+        }
+        let (px, py) = prev_basis
+            .project(p - prev_basis.origin)
+            .ok_or("ff anchor point behind prev camera")?;
+        let (wmx, wmy) = (px - ex, py - ey);
+        if (tb.b[0][0] - wmx).abs() > 0.1 || (tb.b[0][1] - wmy).abs() > 0.1 {
+            return Err(format!(
+                "ff anchor mv: bake ({},{}) vs basis route ({wmx},{wmy})",
+                tb.b[0][0], tb.b[0][1]
+            ));
+        }
+        let pixel_cone = 2.0 * (cam.fov_y * 0.5).tan() / rh as f32;
+        let d = (p - org).normalize();
+        let g = crate::fireflies::glow(&one, org, d, f32::INFINITY, pixel_cone * 0.5);
+        let want_lum = lum709(g);
+        let got_lum = tb.b[0][2];
+        if (got_lum - want_lum).abs() > 1e-3 * want_lum.max(1e-6) {
+            return Err(format!(
+                "ff σ/lum parity: bake {got_lum} vs fireflies::glow {want_lum}"
+            ));
+        }
+    }
+
     eprintln!("ngxfg-guides self-test: OK");
     Ok(())
 }

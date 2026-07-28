@@ -15663,7 +15663,16 @@ fn session(
                 rw,
                 rh,
             );
-            match gpu.present_rr(&accum, &gbufs, &fc, dlss_idx) {
+            // The same swarm the frame's RenderCtx traced with (pure in
+            // cloud_time, which has not advanced since) — the raw-NGX FG
+            // tail's round-3 firefly MVs ride it.
+            match gpu.present_rr(
+                &accum,
+                &gbufs,
+                &fc,
+                dlss_idx,
+                &crate::fireflies::Fireflies::live(scene, cloud_time as f32),
+            ) {
                 Ok(()) => {
                     dlss_prev = Some(dlss::DlssPrev { basis: cam.basis(rw, rh), mats, cam });
                     dlss_reset = false;
