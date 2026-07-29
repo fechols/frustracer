@@ -151,6 +151,16 @@ pub struct Material {
     /// Emissive map (sRGB); effective = `emissive` × sample (map present
     /// with Ke absent ⇒ factor 1.0, the map_Kd precedent).
     pub emissive_tex: u32,
+    /// The matclass classify verdict (index into `matclass::NAMES`),
+    /// `matclass::IDX_DEFAULT` everywhere the classifier does not run
+    /// (procedural builders, glTF — the structural off state). Retained
+    /// because the classify inputs (texture stem, MATERIAL NAME) do not
+    /// survive the load: the Minecraft scenes carry their foliage signal
+    /// only on the `newmtl` name (one shared atlas texture), so
+    /// `foliage::leaf_materials` reads this byte instead of re-deriving from
+    /// `Texture::source`. Shading never reads it — the Pbr fields already
+    /// carry the class's consequences.
+    pub class: u8,
     pub kind: MatKind,
 }
 
@@ -333,6 +343,7 @@ impl SceneBuilder {
             rough_tex: NO_TEX,
             metal_tex: NO_TEX,
             emissive_tex: NO_TEX,
+            class: crate::matclass::IDX_DEFAULT as u8,
             kind,
         })
     }
@@ -757,6 +768,7 @@ pub fn reclassify_spray(scene: &mut Scene) {
                     rough_tex: s.rough_tex,
                     metal_tex: s.metal_tex,
                     emissive_tex: s.emissive_tex,
+                    class: s.class,
                     kind: s.kind,
                 }
             };
@@ -799,6 +811,7 @@ pub fn spray_self_test() -> Result<(), String> {
         rough_tex: NO_TEX,
         metal_tex: NO_TEX,
         emissive_tex: NO_TEX,
+        class: crate::matclass::IDX_DEFAULT as u8,
         kind: MatKind::Diffuse,
     };
     // Island A: a unit-scale glass quad (2 tris sharing vertices — one
@@ -1908,6 +1921,7 @@ pub fn load_obj_scene(path: &str) -> Scene {
                 rough_tex,
                 metal_tex,
                 emissive_tex,
+                class: class as u8,
                 kind,
             })
         })

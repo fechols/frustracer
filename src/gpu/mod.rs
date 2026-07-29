@@ -2451,6 +2451,19 @@ impl GpuContext {
         }
     }
 
+    /// The foliage-sway twin of `invalidate_replay`: forget every animated-
+    /// TLAS slot's baked clock. main.rs calls this on every DXR present-error
+    /// arm — a recorded-but-aborted frame marked its slot baked, but the TLAS
+    /// build never executed, and the skip fast-path would bind a TLAS that
+    /// was never written. Harmless when sway is off/absent.
+    pub fn invalidate_sway(&self) {
+        if let Some(d) = &self.dxr {
+            if let Some(sw) = d.scene.sway.as_ref() {
+                sw.invalidate();
+            }
+        }
+    }
+
     /// Build the DXR DispatchRays pipeline (the F key / --dxr). Idempotent —
     /// a live pipeline is kept. `(rw, rh)` is the session's fixed DXR trace
     /// resolution (the locked render res when `gbuf` composes with the wired
@@ -3185,6 +3198,9 @@ impl GpuContext {
             // C verify then exercises the cloud code the session actually runs.
             clouds,
             fireflies,
+            // Wavefront-only path: sway is DXR-only and the C verify compares
+            // against the static TLAS both sides.
+            sway_time: None,
             // verify_trace calls record_wavefront directly (not record_frame),
             // so this is dead — but the field must be set.
             replay: false,

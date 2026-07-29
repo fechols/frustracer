@@ -1511,6 +1511,7 @@ pub fn tangent_self_test() -> Result<(), String> {
                 rough_tex: NO_TEX,
                 metal_tex: NO_TEX,
                 emissive_tex: NO_TEX,
+                class: crate::matclass::IDX_DEFAULT as u8,
                 kind: MatKind::Diffuse,
             }],
             textures: vec![tex],

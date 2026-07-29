@@ -1585,6 +1585,12 @@ pub struct SceneGpu {
     #[allow(dead_code)]
     pub blas: ID3D12Resource,
     pub tlas: ID3D12Resource,
+    /// `--foliage-sway` with leaf cells present (else None — every other
+    /// session is structurally the pre-sway build): the animated-TLAS ring a
+    /// DXR frame rebuilds per clock tick. The STATIC `tlas` above stays the
+    /// rest pose and keeps serving the wavefront tracer + every gate — the
+    /// frustum/temporal machinery never sees a moving triangle.
+    pub sway: Option<SwayGpu>,
     /// `--blas-split` only (4-byte dummies otherwise): the reordered index
     /// stream the chunk BLASes were built over, and the remap the shaders read
     /// to recover a triangle id from `(InstanceID, PrimitiveIndex)` —
@@ -2114,7 +2120,33 @@ impl SceneGpu {
         // baseline valid.
         if let Some(cap) = crate::blas_split::max_prims() {
             let t0 = std::time::Instant::now();
-            let plan = crate::blas_split::plan(bvh, cap);
+            let mut plan = crate::blas_split::plan(bvh, cap);
+            // --foliage-sway: pull leaf triangles (foliage-classified +
+            // alpha-masked) out of the antichain chunks into per-cell chunks
+            // appended at the tail — each cell is one animated TLAS instance
+            // (src/foliage.rs; the static TLAS below still holds them at
+            // identity, so the wavefront tracer and every gate see the rest
+            // pose bit-for-bit).
+            let sway_split = if crate::foliage::armed() {
+                let mask = crate::foliage::leaf_materials(scene);
+                let sp = crate::foliage::split_plan(&mut plan, scene, &mask, cap);
+                match &sp {
+                    Some(s) => eprintln!(
+                        "foliage-sway: {} leaf tris -> {} cells (grid {:.3}, {} static chunks kept)",
+                        plan.packed_tris.len() as u32 - plan.chunk_base[s.first_chunk as usize],
+                        s.cells.len(),
+                        s.cell,
+                        s.first_chunk
+                    ),
+                    None => eprintln!(
+                        "foliage-sway: no leaf-classified (foliage + cutout) materials in this \
+                         scene — sway idle"
+                    ),
+                }
+                sp
+            } else {
+                None
+            };
             // The chunk index rides InstanceID (24 bits). No real scene comes
             // near this at a 64k cap; a tiny cap on a huge scene could, and a
             // silent wrap would remap every triangle in the overflowing chunks.
@@ -2147,7 +2179,7 @@ impl SceneGpu {
             let blas_tri_b = stream_buffer(device, sub, &ring, &plan.packed_tris, |t| *t, srv)?;
             let chunk_base_b = stream_buffer(device, sub, &ring, &plan.chunk_base, |b| *b, srv)?;
 
-            let (blas, tlas, report) = build_split_blas(
+            let split = build_split_blas(
                 device,
                 &device5,
                 sub,
@@ -2158,6 +2190,20 @@ impl SceneGpu {
                 non_opaque,
                 scene.any_transmissive,
             )?;
+            // The animated-TLAS ring (--foliage-sway with leaf cells): rest
+            // template + FRAMES_IN_FLIGHT instance/TLAS slots + one scratch,
+            // all beside the static TLAS — never replacing it.
+            let sway = match sway_split {
+                Some(sp) => Some(SwayGpu::new(
+                    device,
+                    sp,
+                    &split.instances,
+                    split.tlas_size,
+                    split.tlas_scratch,
+                )?),
+                None => None,
+            };
+            let (blas, tlas, report) = (split.arena, split.tlas, split.report);
             // A built AS is self-contained: the reordered index stream existed
             // only to feed the builds (which `sub` ran to completion), so it
             // goes back now rather than resting for the session. `indices_b`
@@ -2185,6 +2231,7 @@ impl SceneGpu {
                 materials: materials_b,
                 blas,
                 tlas,
+                sway,
                 blas_tri: blas_tri_b,
                 chunk_base: chunk_base_b,
                 n_packed: plan.packed_tris.len() as u32,
@@ -2401,6 +2448,10 @@ impl SceneGpu {
             materials: materials_b,
             blas,
             tlas,
+            // Sway needs per-cell instances, which only the split path has —
+            // `--no-blas-split --foliage-sway` already printed its note in
+            // main's lever block.
+            sway: None,
             // Unarmed: no remap exists and the kernels compile without
             // BLAS_SPLIT, so these are never read — 4-byte dummies keep the
             // descriptor table's shape uniform across both paths.
@@ -2735,9 +2786,175 @@ fn align_as(x: u64) -> u64 {
     (x + AS_ALIGN - 1) & !(AS_ALIGN - 1)
 }
 
+/// `--foliage-sway`'s GPU half (src/foliage.rs owns the math, the design doc
+/// is docs/design/animated-foliage.md): an animated-TLAS ring BESIDE the
+/// static TLAS. Per animated frame the rest-pose instance template is copied
+/// into this ring's slot, the sway rows' translations are patched in
+/// (translation-only — normals/UVs/barycentrics untouched, hit points are
+/// `o + t·d` on both GPU paths), and a full TLAS rebuild is recorded on the
+/// frame's own list (`PREFER_FAST_TRACE` at a few hundred to ~2k instances —
+/// three orders under the paper's measured 2.8M-instance/9.66 ms point).
+/// The static TLAS is never touched: the wavefront tracer, the CPU arm, and
+/// every gate keep binding the rest pose, which is what keeps the frustum
+/// claims / temporal ring / structure replay sound with zero new
+/// invalidation. Ring depth = FRAMES_IN_FLIGHT (the frame_cb contract);
+/// scratch is ONE buffer — successive builds are serialized by each frame's
+/// trailing queue-level UAV barrier.
+pub struct SwayGpu {
+    /// Chunks (== instances) `first_chunk..` are the sway cells.
+    first_chunk: u32,
+    cells: Vec<crate::foliage::SwayCell>,
+    scale: f32,
+    /// Rest-pose instance descs — identity transforms, compacted-BLAS VAs
+    /// baked, InstanceID = chunk index; the per-frame patch source.
+    tpl: Vec<D3D12_RAYTRACING_INSTANCE_DESC>,
+    /// FRAMES_IN_FLIGHT slots of `tpl.len()` instance descs, persistently
+    /// mapped (the frame_cb ring shape).
+    inst_ring: d3d12::UploadBuffer,
+    /// One animated TLAS per in-flight slot.
+    tlas: Vec<ID3D12Resource>,
+    scratch: ID3D12Resource,
+    /// The clock each slot's TLAS was last built at (NAN = never): a frozen
+    /// clock — a converging still — records NOTHING after the first two
+    /// frames, so accumulation integrates one pose at zero rebuild cost.
+    baked: Vec<std::cell::Cell<f32>>,
+}
+
+impl SwayGpu {
+    fn new(
+        device: &ID3D12Device,
+        sp: crate::foliage::SwaySplit,
+        tpl: &[D3D12_RAYTRACING_INSTANCE_DESC],
+        tlas_size: u64,
+        tlas_scratch: u64,
+    ) -> Result<Self> {
+        let uaf = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        let as_state = D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE;
+        let n = tpl.len();
+        let sz = std::mem::size_of::<D3D12_RAYTRACING_INSTANCE_DESC>();
+        let inst_ring = d3d12::UploadBuffer::new(device, d3d12::FRAMES_IN_FLIGHT * n * sz)?;
+        let mut tlas = Vec::with_capacity(d3d12::FRAMES_IN_FLIGHT);
+        for _ in 0..d3d12::FRAMES_IN_FLIGHT {
+            tlas.push(committed_buffer(device, tlas_size, uaf, as_state)?);
+        }
+        let scratch = committed_buffer(
+            device,
+            tlas_scratch,
+            uaf,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        )?;
+        eprintln!(
+            "foliage-sway: animated-TLAS ring armed — {} instances ({} sway cells), {} KB x {} \
+             slots + {} KB scratch",
+            n,
+            sp.cells.len(),
+            tlas_size >> 10,
+            d3d12::FRAMES_IN_FLIGHT,
+            tlas_scratch >> 10,
+        );
+        Ok(SwayGpu {
+            first_chunk: sp.first_chunk,
+            cells: sp.cells,
+            scale: sp.scale,
+            tpl: tpl.to_vec(),
+            inst_ring,
+            tlas,
+            scratch,
+            baked: (0..d3d12::FRAMES_IN_FLIGHT).map(|_| std::cell::Cell::new(f32::NAN)).collect(),
+        })
+    }
+
+    /// The TLAS a frame binding slot `slot` should trace — valid only after
+    /// `record_rebuild` ran for that slot at least once this session.
+    pub fn tlas_va(&self, slot: usize) -> u64 {
+        unsafe { self.tlas[slot].GetGPUVirtualAddress() }
+    }
+
+    /// Forget every slot's baked clock — the replay-invalidation class: a
+    /// frame recorded-but-aborted (present error) marked its slot baked at
+    /// RECORD time, but the build never executed, and the skip fast-path
+    /// would then bind a TLAS that was never written. Call from every DXR
+    /// present-error arm.
+    pub fn invalidate(&self) {
+        for b in &self.baked {
+            b.set(f32::NAN);
+        }
+    }
+
+    /// Bake this clock's translations, patch the slot's instance descs, and
+    /// record the TLAS rebuild — a bit-equal clock whose slot already holds
+    /// this pose records nothing (the converging-still fast path). Call
+    /// BEFORE any ray dispatch that binds `tlas_va(slot)`.
+    pub fn record_rebuild(
+        &self,
+        list: &ID3D12GraphicsCommandList,
+        slot: usize,
+        time: f32,
+    ) -> Result<()> {
+        if self.baked[slot].get().to_bits() == time.to_bits() {
+            return Ok(());
+        }
+        let list4: ID3D12GraphicsCommandList4 =
+            list.cast().map_err(|e| format!("ID3D12GraphicsCommandList4: {e}"))?;
+        let n = self.tpl.len();
+        let sz = std::mem::size_of::<D3D12_RAYTRACING_INSTANCE_DESC>();
+        let d = crate::foliage::translations(&self.cells, self.scale, time);
+        // Slot-fenced by begin_frame (the frame_cb contract), so the CPU
+        // write cannot race the GPU read from 2 frames ago.
+        unsafe {
+            let dst =
+                self.inst_ring.ptr.add(slot * n * sz) as *mut D3D12_RAYTRACING_INSTANCE_DESC;
+            std::ptr::copy_nonoverlapping(self.tpl.as_ptr(), dst, n);
+            for (j, t) in d.iter().enumerate() {
+                let inst = dst.add(self.first_chunk as usize + j);
+                (*inst).Transform[3] = t.x;
+                (*inst).Transform[7] = t.y;
+                (*inst).Transform[11] = t.z;
+            }
+        }
+        let desc = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
+            DestAccelerationStructureData: unsafe { self.tlas[slot].GetGPUVirtualAddress() },
+            Inputs: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
+                Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL,
+                Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE,
+                NumDescs: n as u32,
+                DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
+                Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+                    InstanceDescs: unsafe { self.inst_ring.resource.GetGPUVirtualAddress() }
+                        + (slot * n * sz) as u64,
+                },
+            },
+            SourceAccelerationStructureData: 0,
+            ScratchAccelerationStructureData: unsafe { self.scratch.GetGPUVirtualAddress() },
+        };
+        unsafe { list4.BuildRaytracingAccelerationStructure(&desc, None) };
+        // One queue-level UAV barrier carries BOTH orderings: this build
+        // completes before the frame's rays read the TLAS, and before the
+        // next frame's build rewrites the shared scratch.
+        unsafe { list.ResourceBarrier(&[uav_barrier(None)]) };
+        self.baked[slot].set(time);
+        Ok(())
+    }
+}
+
+/// `build_split_blas`'s product. `instances` is the rest-pose instance-desc
+/// array (identity transforms, compacted-BLAS VAs baked, InstanceID = chunk
+/// index) — the static TLAS was built from exactly these bytes, and the
+/// foliage-sway ring patches a copy per frame; `tlas_size`/`tlas_scratch` are
+/// the prebuild numbers a per-frame rebuild allocates by (same NumDescs).
+struct SplitBuild {
+    arena: ID3D12Resource,
+    tlas: ID3D12Resource,
+    report: String,
+    instances: Vec<D3D12_RAYTRACING_INSTANCE_DESC>,
+    tlas_size: u64,
+    tlas_scratch: u64,
+}
+
 /// `--blas-split`: build one BLAS per plan chunk and a TLAS instancing them all
-/// identity. Returns (arena holding every compacted chunk BLAS, TLAS, the
-/// `gpu scene:` line's size report).
+/// identity. Returns the arena holding every compacted chunk BLAS, the TLAS,
+/// the `gpu scene:` line's size report, and the rest-pose instance template
+/// (see `SplitBuild`).
 ///
 /// Shape mirrors the single-BLAS build one level up — build worst-case with
 /// ALLOW_COMPACTION emitting postbuild sizes, read them back, compact into an
@@ -2758,7 +2975,7 @@ fn build_split_blas(
     n_verts: u32,
     non_opaque: bool,
     any_transmissive: bool,
-) -> Result<(ID3D12Resource, ID3D12Resource, String)> {
+) -> Result<SplitBuild> {
     let n = plan.chunks();
     let uaf = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     let as_state = D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE;
@@ -2948,26 +3165,27 @@ fn build_split_blas(
     // Identity instances, InstanceID = chunk index — the (InstanceID,
     // PrimitiveIndex) -> tri remap's first coordinate, and the stable handle a
     // cut-driven TLAS rebuild would address chunks by.
+    let idescs: Vec<D3D12_RAYTRACING_INSTANCE_DESC> = (0..n)
+        .map(|i| {
+            let mut idesc: D3D12_RAYTRACING_INSTANCE_DESC = unsafe { std::mem::zeroed() };
+            idesc.Transform = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+            idesc._bitfield1 = (0xffu32 << 24) | (i as u32 & 0x00ff_ffff);
+            idesc._bitfield2 = 0;
+            idesc.AccelerationStructure = arena_va + final_off[i];
+            idesc
+        })
+        .collect();
     let instances = d3d12::UploadBuffer::new(
         device,
         n * std::mem::size_of::<D3D12_RAYTRACING_INSTANCE_DESC>(),
     )?;
-    for i in 0..n {
-        let mut idesc: D3D12_RAYTRACING_INSTANCE_DESC = unsafe { std::mem::zeroed() };
-        idesc.Transform = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
-        idesc._bitfield1 = (0xffu32 << 24) | (i as u32 & 0x00ff_ffff);
-        idesc._bitfield2 = 0;
-        idesc.AccelerationStructure = arena_va + final_off[i];
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                &idesc as *const _ as *const u8,
-                instances
-                    .ptr
-                    .add(i * std::mem::size_of::<D3D12_RAYTRACING_INSTANCE_DESC>()),
-                std::mem::size_of::<D3D12_RAYTRACING_INSTANCE_DESC>(),
-            )
-        };
-    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            idescs.as_ptr() as *const u8,
+            instances.ptr,
+            n * std::mem::size_of::<D3D12_RAYTRACING_INSTANCE_DESC>(),
+        )
+    };
     let tlas = committed_buffer(device, tlas_info.ResultDataMaxSizeInBytes, uaf, as_state)?;
     let instances_va = unsafe { instances.resource.GetGPUVirtualAddress() };
 
@@ -3016,7 +3234,14 @@ fn build_split_blas(
         tlas_info.ResultDataMaxSizeInBytes >> 20,
         scratch_max.max(tlas_info.ScratchDataSizeInBytes) >> 20,
     );
-    Ok((arena, tlas, report))
+    Ok(SplitBuild {
+        arena,
+        tlas,
+        report,
+        instances: idescs,
+        tlas_size: tlas_info.ResultDataMaxSizeInBytes,
+        tlas_scratch: tlas_info.ScratchDataSizeInBytes,
+    })
 }
 
 fn geometry_desc(
@@ -3430,6 +3655,13 @@ pub struct FrameParams {
     /// onto FLAG_FIREFLIES + the `ff`/`ff_count` CB rows by `with_frame`
     /// (count 0 — every day session — writes neither).
     pub fireflies: crate::fireflies::Fireflies,
+    /// --foliage-sway clock for THIS frame (the shared cloud_time), or None =
+    /// trace the static rest-pose TLAS. Consumed ONLY by the DXR pipeline
+    /// (DxrGpu rebuilds `SceneGpu::sway`'s ring TLAS and binds it); the
+    /// wavefront tracer ignores it, and every headless gate/bench passes
+    /// None — which, plus `sway: None` on unarmed uploads, is the structural
+    /// off-state (src/foliage.rs).
+    pub sway_time: Option<f32>,
     /// Structure-replay enable (opts.replay). When true AND this frame's basis
     /// bit-equals the previous producing frame's, `record_frame` re-dispatches
     /// the persisted terminal queues instead of re-running seed + the ladder

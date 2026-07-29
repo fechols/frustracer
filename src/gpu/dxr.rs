@@ -146,6 +146,12 @@ pub struct DxrGpu {
     /// pack gates need it (their consumer is a CPU readback, and they trace
     /// before any feed is wired).
     force_gbuf_ext: std::cell::Cell<bool>,
+    /// The frame's sway clock, stashed by `write_cb` (which sees FrameParams)
+    /// for `record_frame`/`bind_common` (which don't): Some = rebuild + bind
+    /// the animated-TLAS ring slot, None = the static rest-pose TLAS. Only
+    /// meaningful when `SceneGpu::sway` exists (--foliage-sway with leaf
+    /// cells) — the pair is checked together at both consumers.
+    sway_t: std::cell::Cell<Option<f32>>,
     gbuf_full: bool,
     /// RGBA16F resolve target; rests in PIXEL_SHADER_RESOURCE between frames
     /// (the tonemap PS reads it via SRV_SLOT_DXR).
@@ -576,6 +582,7 @@ impl DxrGpu {
             gbuf,
             gbuf_ext,
             force_gbuf_ext: std::cell::Cell::new(false),
+            sway_t: std::cell::Cell::new(None),
             gbuf_full,
             hdr,
             uav_heap,
@@ -598,6 +605,10 @@ impl DxrGpu {
     }
 
     pub fn write_cb(&self, slot: usize, p: &FrameParams) {
+        // Stash the sway clock for record_frame/bind_common — write_cb is the
+        // one per-frame site that sees FrameParams, and every present chain
+        // calls it before record_frame (the --check-dxr paths pass None).
+        self.sway_t.set(p.sway_time);
         // One FSR4-RR subscriber among the wired engines is enough to arm the
         // pack's signal lanes (--quinlight can wire several).
         let fsr_sig = self.feed.iter().any(|(k, _)| matches!(k, trace::FeedKind::FsrRr));
@@ -736,9 +747,16 @@ impl DxrGpu {
                 RP_SRV0 + SRV_MATERIALS,
                 s.materials.GetGPUVirtualAddress(),
             );
+            // --foliage-sway: an animated frame traces the ring slot's TLAS;
+            // everything else (plain sessions, gates, None-clock frames) the
+            // static rest pose. record_frame rebuilt the slot BEFORE this
+            // bind takes effect at DispatchRays.
             list.SetComputeRootShaderResourceView(
                 RP_SRV0 + SRV_TLAS,
-                s.tlas.GetGPUVirtualAddress(),
+                match (self.sway_t.get(), s.sway.as_ref()) {
+                    (Some(_), Some(sw)) => sw.tlas_va(slot),
+                    _ => s.tlas.GetGPUVirtualAddress(),
+                },
             );
             // The scene-texture table (t0..t3 + texs[] in space1) — heap
             // before table, same as the tracer's bind_common.
@@ -753,6 +771,14 @@ impl DxrGpu {
         let list4: ID3D12GraphicsCommandList4 =
             list.cast().map_err(|e| format!("ID3D12GraphicsCommandList4: {e}"))?;
         let _ev = super::pix::scope(list, c"dxr");
+        // --foliage-sway: rebuild this slot's animated TLAS at the frame's
+        // clock BEFORE anything binds it (bind_common below picks the ring
+        // slot when the clock is Some). A bit-equal clock records nothing —
+        // the converging-still fast path.
+        if let (Some(t), Some(sw)) = (self.sway_t.get(), self.scene.sway.as_ref()) {
+            let _sv = super::pix::scope(list, c"dxr-sway-tlas");
+            sw.record_rebuild(list, slot, t)?;
+        }
         unsafe {
             self.bind_common(list, slot);
             // The cloud caches, ahead of the ray dispatch and left bound at

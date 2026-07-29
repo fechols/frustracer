@@ -55,7 +55,11 @@ use std::path::{Path, PathBuf};
 // and the loader stamps water params + skips the dark-glass albedo lift for
 // the fountain, so a v9 sidecar's materials are stale (the --no-water lever
 // also joins the lever word, bit 4).
-pub const CACHE_VERSION: u32 = 10;
+// v11: Material/DiskMat gained the `class` byte (the retained matclass
+// verdict, the foliage-sway mask's signal) + the foliage/stone keyword-table
+// extension moved classify results for bistro/rungholt/vokselia, so a v10
+// sidecar's materials are stale both ways.
+pub const CACHE_VERSION: u32 = 11;
 const MAGIC: [u8; 8] = *b"FRSCACH\x01";
 
 /// Fixed on-disk material, `MatKind` flattened into (kind, param) — Marble
@@ -82,6 +86,9 @@ struct DiskMat {
     trans_tint: [f32; 3],
     ior: f32,
     ripple_amp: f32,
+    /// `Material::class` widened to u32 (repr(C) — a bare u8 would serialize
+    /// struct padding).
+    class: u32,
 }
 
 /// Fixed on-disk BVH node: 32 B, no padding (the in-memory `BvhNode` is
@@ -261,6 +268,7 @@ fn mat_to_disk(m: &Material) -> DiskMat {
         trans_tint: m.trans_tint.to_array(),
         ior: m.ior,
         ripple_amp: m.ripple_amp,
+        class: m.class as u32,
     }
 }
 
@@ -283,6 +291,7 @@ fn mat_from_disk(m: &DiskMat) -> Material {
         rough_tex: m.rough_tex,
         metal_tex: m.metal_tex,
         emissive_tex: m.emissive_tex,
+        class: m.class as u8,
         kind: match m.kind {
             1 => MatKind::Marble { scale: f32::from_bits(m.param) },
             2 => MatKind::Textured { tex: m.param },

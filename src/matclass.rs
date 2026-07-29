@@ -129,6 +129,13 @@ const CLASSES: &[ClassDef] = &[
             Tok("bwk"),
             Tok("terresable"),
             Sub("moldur"),
+            // Bistro pavement: these STEMS must classify before the name is
+            // ever consulted, because `Pavement_Cobble_Leaves_BLENDSHADER`
+            // (leaf-LITTER pavement) would otherwise fall through its
+            // cobblestone stem to a name hit on the foliage "leaves" token.
+            Tok("pavement"),
+            Tok("cobblestone"),
+            Tok("cobble"),
         ],
         pbr: opaque(0.88, 0.0),
     },
@@ -138,6 +145,14 @@ const CLASSES: &[ClassDef] = &[
         // ...) — every latin genus file carries one of these; `caballo` covers
         // the lone exception (Cola_Caballo horsetail). Roughness deliberately
         // stays >= 0.45: 10M foliage tris must not take the bounce ray.
+        // The plain-English row (leaves/foliage/sapling/plants) is the
+        // bistro + Minecraft vocabulary: bistro's stems say `Leaves_A_diff` /
+        // `Paris_Foliage_01a_diff` and its material names all start
+        // `Foliage_`; rungholt/vokselia carry the signal ONLY on the material
+        // NAME (`Leaves`, `Sapling` — one shared atlas texture). Deliberately
+        // NO "grass": Minecraft's `Grass` is the GROUND block, and the sway
+        // mask must never mark terrain (`Tall_Grass`, the real cutout plant,
+        // is the accepted miss).
         keys: &[
             Tok("lef"),
             Tok("leaf"),
@@ -156,6 +171,10 @@ const CLASSES: &[ClassDef] = &[
             Tok("tronco"),
             Tok("seca"),
             Tok("caballo"),
+            Tok("leaves"),
+            Tok("foliage"),
+            Tok("sapling"),
+            Tok("plants"),
         ],
         // 0.3 ≈ measured leaf transmittance (chlorophyll passes ~20-30% in
         // the visible band). 0.5 was tried: visually fine, but the brighter
@@ -184,10 +203,16 @@ pub const NAMES: &[&str] = &[
     "rust", "metal", "wood", "ceramic", "clay", "fabric", "leather", "stone", "foliage",
     "glass", "water", "glossy", "default",
 ];
+/// Public for `foliage::leaf_materials` — the classify verdict is retained as
+/// `Material::class` (a `u8` index into `NAMES`), and the sway mask compares
+/// against this constant.
+pub const IDX_FOLIAGE: usize = 8;
 const IDX_GLASS: usize = 9;
 const IDX_WATER: usize = 10;
 const IDX_GLOSSY: usize = 11;
-const IDX_DEFAULT: usize = 12;
+/// Public because it is the `Material::class` byte everywhere the classifier
+/// does NOT run (procedural builders, the glTF loader).
+pub const IDX_DEFAULT: usize = 12;
 
 /// Blinn-Phong exponent -> perceptual GGX roughness (Brian Karis' mapping),
 /// clamped to the plausible glossy band.
@@ -314,8 +339,31 @@ pub fn self_test() -> Result<(), String> {
     tex("silla_d_piel", "leather")?;
     tex("quercus_rubra_bark", "foliage")?;
     tex("d30_smiguel_2003_7758", "default")?;
+    // The bistro/Minecraft vocabulary (foliage-sway coverage):
+    tex("leaves_a_diff", "foliage")?; // linden — "leaves" plural, not "leaf"
+    tex("paris_foliage_01a_diff", "foliage")?;
+    tex("paris_interior_plants_01_diff", "foliage")?;
+    tex("plastic_01_planters_diff", "default")?; // `planters` != `plants` (whole-token)
+    tex("pavement_cobblestone_01_b_diff", "stone")?;
     // Name tier: CafeChair_Metal is untextured.
     expect(None, "CafeChair_Metal", 256.0, 2, "metal")?;
+    // Minecraft atlas scenes: ONE shared texture, so the stem carries no
+    // signal and the material NAME is the whole vocabulary.
+    expect(Some("rungholt-rgba"), "Leaves", 0.0, 2, "foliage")?;
+    expect(Some("vokselia_spawn"), "Sapling", 0.0, 2, "foliage")?;
+    // The GROUND block must never classify foliage — the sway mask marks
+    // foliage-classed cutout materials, and terrain must not sway.
+    expect(Some("rungholt-rgba"), "Grass", 0.0, 2, "default")?;
+    expect(None, "Foliage_Bux_Hedges46", 100.0, 2, "foliage")?;
+    // Stem beats name: leaf-LITTER pavement classifies by its cobblestone
+    // stem before the "leaves" name token is ever consulted.
+    expect(
+        Some("pavement_cobblestone_01_b_diff"),
+        "Pavement_Cobble_Leaves_BLENDSHADER",
+        100.0,
+        2,
+        "stone",
+    )?;
     // Ns tiers: glassware (illum 4 or Ns >= 500) vs untextured opaque glossy.
     // material_79/materialn are neutral-Tf illum-4 glassware — must STAY glass.
     expect(None, "material_79", 1024.0, 4, "glass")?;

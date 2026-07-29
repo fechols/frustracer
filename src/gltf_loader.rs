@@ -410,6 +410,11 @@ fn build_scene(
                 rough_tex: mr_tex, // glTF packs roughness = G ...
                 metal_tex: mr_tex, // ... and metallic = B of the SAME map
                 emissive_tex,
+                // glTF bypasses matclass (real PBR data), so no class verdict
+                // exists; classifying glTF material NAMES for the foliage
+                // sway mask is a noted follow-on (no committed glTF scene
+                // carries foliage).
+                class: crate::matclass::IDX_DEFAULT as u8,
                 kind,
             })
         })

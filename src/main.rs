@@ -24,6 +24,7 @@ mod dlss;
 // Regeneration — pure CPU, feeds --check-fsr; the GPU seam is gpu/ffx*.
 mod builders;
 mod fireflies;
+mod foliage;
 mod fsr;
 mod frustum;
 mod ftree;
@@ -422,6 +423,32 @@ fn main() {
     fireflies::set_enabled(opts.fireflies);
     // set_count is what CLAMPS to the CB row cap; the parse only noted it.
     fireflies::set_count(opts.fireflies_count);
+    // Leaf sway (src/foliage.rs; the design doc is docs/design/
+    // animated-foliage.md). Read at SceneGpu upload — the blas_split timing
+    // class. DEFAULT ON: only a departure prints (the lever-line convention);
+    // the `foliage-sway: N leaf tris -> M cells` upload line is the on-state
+    // announce, and a scene with no foliage-classed materials is structurally
+    // the pre-feature renderer (split_plan returns None).
+    foliage::set_armed(opts.foliage_sway);
+    foliage::set_amp_mult(opts.foliage_amp);
+    if opts.foliage_amp != 1.0 {
+        eprintln!("foliage: --foliage-amp {} (sway amplitude multiplier)", opts.foliage_amp);
+    }
+    if !opts.foliage_sway {
+        eprintln!("foliage: --no-foliage-sway (leaf sway disabled — rest pose everywhere)");
+    } else {
+        if opts.blas_split.is_none() {
+            eprintln!(
+                "foliage: --no-blas-split leaves no per-cell instances — sway is IDLE this session"
+            );
+        }
+        if opts.heightfield {
+            eprintln!(
+                "foliage: NOTE --heightfield relief re-marches REST-space geometry — swayed leaf \
+                 materials that carry height maps will mismatch (v0 known-accept; disarm one)"
+            );
+        }
+    }
     gpu::trace::set_cloud_shadow(opts.cloud_shadow);
     gpu::trace::set_sky_lod(opts.sky_lod);
     gpu::dxr::set_inline_mode(opts.dxr_inline);
@@ -1142,6 +1169,7 @@ fn run_check_dxr(
                 probe_sample: 0,
                 clouds: crate::clouds::Clouds::check(scene.diag),
             fireflies: crate::fireflies::Fireflies::check(scene),
+            sway_time: None,
             replay: false,
             },
         );
@@ -1238,6 +1266,7 @@ fn run_check_dxr(
                     probe_sample: 0,
                     clouds: crate::clouds::Clouds::check(scene.diag),
                     fireflies: crate::fireflies::Fireflies::check(scene),
+                    sway_time: None,
                     replay: false,
                 };
                 dg_off.write_cb(0, &p0);
@@ -1338,6 +1367,7 @@ fn run_check_dxr(
                 probe_sample: probe,
                 clouds: crate::clouds::Clouds::check(scene.diag),
             fireflies: crate::fireflies::Fireflies::check(scene),
+            sway_time: None,
             replay: false,
             };
             dg.write_cb(0, &p);
@@ -1563,6 +1593,7 @@ fn run_check_dxr(
                 probe_sample: 0,
                 clouds: crate::clouds::Clouds::check(scene.diag),
             fireflies: crate::fireflies::Fireflies::check(scene),
+            sway_time: None,
             replay: false,
             };
             dg2.write_cb(0, &p);
@@ -1894,6 +1925,7 @@ fn run_check_dxr(
                     probe_sample: 0,
                     clouds: crate::clouds::Clouds::check(scene.diag),
             fireflies: crate::fireflies::Fireflies::check(scene),
+            sway_time: None,
             replay: false,
                 };
                 dg2.write_cb(0, &p);
@@ -3010,6 +3042,7 @@ fn run_check_gpu(
             probe_sample: 0,
             clouds: crate::clouds::Clouds::check(scene.diag),
             fireflies: crate::fireflies::Fireflies::check(scene),
+            sway_time: None,
             replay: false,
         });
         hg.run(|l| tg.record_reference(l, 0))
@@ -3235,6 +3268,7 @@ fn run_check_gpu(
         probe_sample: 0,
         clouds: crate::clouds::Clouds::check(scene.diag),
             fireflies: crate::fireflies::Fireflies::check(scene),
+            sway_time: None,
             replay: false,
     };
     tg.write_cb(0, &wf_params);
@@ -3845,6 +3879,7 @@ fn run_check_gpu(
             probe_sample: 0,
             clouds: crate::clouds::Clouds::check(scene.diag),
             fireflies: crate::fireflies::Fireflies::check(scene),
+            sway_time: None,
             replay,
         };
         let read4 = |hg: &mut gpu::trace::HeadlessGpu| -> Result<(Vec<f32>, Vec<u32>, Vec<f32>, Vec<u32>), String> {
@@ -4012,6 +4047,7 @@ fn run_check_gpu(
                 probe_sample: probe,
                 clouds: crate::clouds::Clouds::check(scene.diag),
             fireflies: crate::fireflies::Fireflies::check(scene),
+            sway_time: None,
             replay: false,
             };
             tg.write_cb(0, &p);
@@ -4190,6 +4226,7 @@ fn run_check_gpu(
                 probe_sample: 0,
                 clouds: crate::clouds::Clouds::check(scene.diag),
             fireflies: crate::fireflies::Fireflies::check(scene),
+            sway_time: None,
             replay: false,
             });
             if let Err(e) = tg.run_hemi_probes(&mut hg, 0, &probes, fb.depth, s == 0) {
@@ -4367,6 +4404,7 @@ fn run_check_gpu(
             probe_sample: 0,
             clouds: crate::clouds::Clouds::check(scene.diag),
             fireflies: crate::fireflies::Fireflies::check(scene),
+            sway_time: None,
             replay: false,
         };
         tg.write_cb(0, &p);
@@ -4458,6 +4496,7 @@ fn run_check_gpu(
                 probe_sample: 0,
                 clouds: crate::clouds::Clouds::check(scene.diag),
             fireflies: crate::fireflies::Fireflies::check(scene),
+            sway_time: None,
             replay: false,
             };
             ptg.write_cb(0, &p);
@@ -4881,6 +4920,7 @@ fn run_check_gpu(
                     probe_sample: 0,
                     clouds: crate::clouds::Clouds::check(scene.diag),
             fireflies: crate::fireflies::Fireflies::check(scene),
+            sway_time: None,
             replay: false,
                 };
                 ptg.write_cb(0, &p);
@@ -5507,6 +5547,7 @@ fn run_check_gpu(
                 probe_sample: 0,
                 clouds: crate::clouds::Clouds::check(scene.diag),
             fireflies: crate::fireflies::Fireflies::check(scene),
+            sway_time: None,
             replay: false,
             };
             btg.write_cb(0, &p);
@@ -5535,6 +5576,7 @@ fn run_check_gpu(
                 probe_sample: 0,
                 clouds: crate::clouds::Clouds::check(scene.diag),
             fireflies: crate::fireflies::Fireflies::check(scene),
+            sway_time: None,
             replay: false,
             };
             btg.write_cb(0, &p);
@@ -8867,6 +8909,10 @@ fn run_cinematic_gpu(
                     probe_sample: 0,
                     clouds: fs.clouds,
                     fireflies: fs.fireflies,
+                    // Cinematic renders the rest pose in v0: an accumulating
+                    // output frame wants ONE pose, and the sway freeze rule
+                    // for media frames is the follow-on (the design doc).
+                    sway_time: None,
                     // Structure replay across the sub-frames of one output
                     // frame: the pose is bit-identical, so k > 0 re-dispatches
                     // the persisted terminal queues and skips the whole level
@@ -9388,6 +9434,10 @@ fn run_spin_gpu(
             probe_sample: 0,
             clouds: crate::clouds::Clouds::spin(scene.diag, idx),
             fireflies: crate::fireflies::Fireflies::spin(scene, idx),
+            // --spin is a deterministic benchmark: rest pose (the wavefront
+            // ignores sway anyway, and an explicit --dxr spin must not move
+            // geometry under a measurement).
+            sway_time: None,
             replay: hybrid && opts.replay && !moving,
         };
         let t = Instant::now();
@@ -9626,6 +9676,20 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         Ok(()) => true,
         Err(e) => {
             eprintln!("blas-split self-test: FAIL — {e}");
+            false
+        }
+    };
+
+    // Foliage sway (the v0 leaf-sway prototype): the leaf-mask anchors, the
+    // split's partition/routing/determinism contracts on a synthetic mask
+    // over the session's real tree, the empty-mask byte-identity off arm,
+    // and the motion model's displacement bound / floor pinning / time
+    // variation. Runs on every --check regardless of --foliage-sway — the
+    // blas-split rule, so the machinery can't rot while the lever is off.
+    let foliage_ok = match foliage::self_test(scene, bvh) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("foliage self-test: FAIL — {e}");
             false
         }
     };
@@ -11842,6 +11906,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         ("sphcell", sph_ok),
         ("ftree", ftree_ok),
         ("blas-split", blas_ok),
+        ("foliage", foliage_ok),
         ("reproject", reproj_ok),
         ("nppd", nppd_ok),
         ("matclass", matclass_ok),
@@ -14212,6 +14277,9 @@ fn session(
                     probe_sample: 0,
                     clouds: crate::clouds::Clouds::live(scene.diag, cloud_time as f32),
                     fireflies: crate::fireflies::Fireflies::live(scene, cloud_time as f32),
+                    // The wavefront tracer traces the STATIC TLAS — sway is
+                    // DXR-only in v0 (src/foliage.rs).
+                    sway_time: None,
                     replay: opts.replay,
                 };
                 // The prev matrices are recomputed from the stored
@@ -14325,6 +14393,9 @@ fn session(
                     // frame 0 above) — the still frames integrate one sky.
                     clouds: crate::clouds::Clouds::live(scene.diag, cloud_time as f32),
                     fireflies: crate::fireflies::Fireflies::live(scene, cloud_time as f32),
+                    // The wavefront tracer traces the STATIC TLAS — sway is
+                    // DXR-only in v0 (src/foliage.rs).
+                    sway_time: None,
                     replay: opts.replay,
                 };
                 if frame < MAX_SAMPLES {
@@ -15031,6 +15102,10 @@ fn session(
                     probe_sample: 0,
                     clouds: crate::clouds::Clouds::live(scene.diag, cloud_time as f32),
                     fireflies: crate::fireflies::Fireflies::live(scene, cloud_time as f32),
+                    // --foliage-sway: the DXR arm consumes the shared cloud
+                    // clock (frozen mid-accumulation in the plain sub-mode —
+                    // the rebuild fast-path then records nothing).
+                    sway_time: Some(cloud_time as f32),
                     replay: false,
                 };
                 // The prev matrices are recomputed from the stored
@@ -15094,6 +15169,9 @@ fn session(
                             _ => ("DLSS-RR", 'G'),
                         };
                         eprintln!("dxr: {name} present failed ({e}); presenting plain ({key} to retry)");
+                        // A recorded-but-aborted frame may have marked its
+                        // sway-TLAS slot baked without the build executing.
+                        gpu.invalidate_sway();
                         dxr_up = GpuUp::Plain;
                         frame = 0;
                     }
@@ -15122,6 +15200,10 @@ fn session(
                     // Frozen mid-accumulation (clock advanced at frame 0 only).
                     clouds: crate::clouds::Clouds::live(scene.diag, cloud_time as f32),
                     fireflies: crate::fireflies::Fireflies::live(scene, cloud_time as f32),
+                    // --foliage-sway: the DXR arm consumes the shared cloud
+                    // clock (frozen mid-accumulation in the plain sub-mode —
+                    // the rebuild fast-path then records nothing).
+                    sway_time: Some(cloud_time as f32),
                     replay: false,
                 };
                 if frame < MAX_SAMPLES {
@@ -15138,6 +15220,8 @@ fn session(
                         }
                         Err(e) => {
                             eprintln!("dxr: present failed ({e}); DXR OFF (F to retry)");
+                            // The sway-slot bake may be recorded-but-aborted.
+                            gpu.invalidate_sway();
                             dxr_on = false;
                             frame = 0;
                         }

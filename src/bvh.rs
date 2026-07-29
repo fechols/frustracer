@@ -1581,6 +1581,7 @@ pub fn height_self_test() -> Result<(), String> {
                 rough_tex: NO_TEX,
                 metal_tex: NO_TEX,
                 emissive_tex: NO_TEX,
+                class: crate::matclass::IDX_DEFAULT as u8,
                 kind: MatKind::Diffuse,
             }],
             textures: vec![Texture {
@@ -1886,6 +1887,7 @@ pub fn tinted_shadow_self_test() -> Result<(), String> {
         rough_tex: NO_TEX,
         metal_tex: NO_TEX,
         emissive_tex: NO_TEX,
+        class: crate::matclass::IDX_DEFAULT as u8,
         kind: MatKind::Diffuse,
     };
     // Sentinel tint = "use albedo" — the bit-identity path every existing

@@ -415,6 +415,23 @@ pub struct Opts {
     pub fireflies_count: u32,
     /// `--dxr-inline 0|1|2` (`gpu::dxr::set_inline_mode`).
     pub dxr_inline: u32,
+    /// `--no-foliage-sway` clears (`foliage::set_armed`) — leaf sway, the v0
+    /// prototype of the tetrahedral-cage epic (docs/design/animated-foliage.md):
+    /// leaf triangles (foliage-classified + alpha-masked) bucket into per-cell
+    /// BLAS chunks and their TLAS instances TRANSLATE on the cloud clock in
+    /// DXR sessions. DEFAULT ON since 2026-07-28 (`--foliage-sway` spells the
+    /// default; the flip is safe because a scene with no leaf-classified
+    /// materials is STRUCTURALLY untouched — `split_plan` returns None, the
+    /// plan stays bit-identical — and every headless `--check*`/`--spin`/
+    /// cinematic path pins `sway_time: None`, so benchmarks and gates never
+    /// have geometry move under them). Off is bit-identical by construction.
+    /// Needs --blas-split (the default); the wavefront/CPU arms render the
+    /// rest pose.
+    pub foliage_sway: bool,
+    /// `--foliage-amp <x>` (`foliage::set_amp_mult`) — taste multiplier on
+    /// the sway amplitude (both curl and flutter halves), default 1.0;
+    /// finite, 0.0..=8.0 (0 = armed machinery, zero motion — the null A/B).
+    pub foliage_amp: f32,
 }
 
 
@@ -604,7 +621,8 @@ pub fn defaults() -> Opts {
         fireflies: true,
         fireflies_count: fireflies::DEFAULT_COUNT,
         dxr_inline: 1,
-
+        foliage_sway: true,
+        foliage_amp: 1.0,
     }
 }
 
@@ -937,6 +955,20 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
                     .filter(|&n: &usize| n >= 2)
                     .unwrap_or_else(|| {
                         eprintln!("--bvh-maxleaf needs an integer >= 2");
+                        std::process::exit(2);
+                    });
+            }
+            // Leaf sway (src/foliage.rs) — DEFAULT ON; --no-foliage-sway is
+            // the kill lever, the clouds/fireflies shape; later flags win.
+            "--foliage-sway" => opts.foliage_sway = true,
+            "--no-foliage-sway" => opts.foliage_sway = false,
+            "--foliage-amp" => {
+                opts.foliage_amp = args
+                    .next()
+                    .and_then(|s| s.parse::<f32>().ok())
+                    .filter(|v| v.is_finite() && (0.0..=8.0).contains(v))
+                    .unwrap_or_else(|| {
+                        eprintln!("--foliage-amp needs a multiplier in 0..=8 (default 1)");
                         std::process::exit(2);
                     });
             }
@@ -1609,6 +1641,11 @@ pub fn usage() {
                 eprintln!("                with hard shadow rays + a depth-tested glow; a day session has zero");
                 eprintln!("                fireflies and is bit-identical structurally)");
                 eprintln!("  --fireflies N   firefly count (default {}, max {})", fireflies::DEFAULT_COUNT, fireflies::MAX_FIREFLIES);
+                eprintln!("  --no-foliage-sway  disable wind-swayed foliage (ON by default: alpha-cutout leaves");
+                eprintln!("                bucket into per-cell BLAS chunks whose TLAS instances translate on the");
+                eprintln!("                cloud clock — DXR sessions only; a scene with no foliage-classified");
+                eprintln!("                materials is structurally untouched; off is bit-identical)");
+                eprintln!("  --foliage-amp X sway amplitude multiplier, 0..=8 (default 1)");
                 eprintln!("  --no-mips     no texture mip chains; every trilinear sample degenerates to the");
                 eprintln!("                pre-mip bilinear (A/B lever; mips are on by default — implies --no-aniso)");
                 eprintln!("  --no-h2n      don't Sobel-convert grayscale bump maps into normal maps (they are");
@@ -1663,7 +1700,8 @@ pub fn usage() {
 fn lever_snapshot() -> String {
     format!(
         "mips={} aniso={} h2n={} n2h={} tint={} spray={} depth={} water={} \
-         harm={} hon={} bloom={} clouds={} ff={} ffn={} cshadow={} skylod={} dxrinline={}",
+         harm={} hon={} bloom={} clouds={} ff={} ffn={} cshadow={} skylod={} dxrinline={} \
+         fsway={} famp={}",
         texture::mips_enabled(),
         texture::max_aniso(),
         texture::h2n_enabled(),
@@ -1681,6 +1719,8 @@ fn lever_snapshot() -> String {
         gpu::trace::cloud_shadow_n(),
         gpu::trace::sky_lod(),
         gpu::dxr::dxr_inline_mode(),
+        crate::foliage::armed(),
+        crate::foliage::amp_mult(),
     )
 }
 
@@ -1722,6 +1762,9 @@ pub fn self_test() -> Result<(), String> {
         "7",
         "--dxr-inline",
         "2",
+        "--no-foliage-sway",
+        "--foliage-amp",
+        "2",
     ]);
     let after = lever_snapshot();
     if after != before {
@@ -1749,6 +1792,8 @@ pub fn self_test() -> Result<(), String> {
         ("fireflies", !o.fireflies),
         ("fireflies_count", o.fireflies_count == 7),
         ("dxr_inline", o.dxr_inline == 2),
+        ("foliage_sway", !o.foliage_sway),
+        ("foliage_amp", o.foliage_amp == 2.0),
     ] {
         if !took {
             return Err(format!("lever field `{name}` did not take its flag"));
@@ -1778,6 +1823,17 @@ pub fn self_test() -> Result<(), String> {
     }
     if !parse_argv(&["--no-ftree", "--ftree"]).opts.ftree {
         return Err("--no-ftree --ftree must re-enable".into());
+    }
+    if !parse_argv(&["--no-foliage-sway", "--foliage-sway"]).opts.foliage_sway
+        || parse_argv(&["--foliage-sway", "--no-foliage-sway"]).opts.foliage_sway
+        || !parse_argv(&[]).opts.foliage_sway
+    {
+        return Err("foliage sway must default ON and obey later-flags-win".into());
+    }
+    if parse_argv(&["--foliage-amp", "0.5"]).opts.foliage_amp != 0.5
+        || parse_argv(&[]).opts.foliage_amp != 1.0
+    {
+        return Err("--foliage-amp must parse its value and default to 1.0".into());
     }
     if parse_argv(&["--sw-rays", "--no-sw-rays"]).opts.sw_rays {
         return Err("--sw-rays --no-sw-rays must disable".into());

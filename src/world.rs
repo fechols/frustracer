@@ -292,6 +292,7 @@ fn merge_scenes(parts: Vec<(Scene, Vec3A)>, field_half: f32) -> Scene {
         rough_tex: NO_TEX,
         metal_tex: NO_TEX,
         emissive_tex: NO_TEX,
+        class: crate::matclass::IDX_DEFAULT as u8,
         kind: MatKind::Diffuse,
     });
     tri_mat.extend_from_slice(&[0, 0]);
@@ -672,6 +673,7 @@ fn test_part(n_tex: u32, albedo_tex: u32, normal_tex: u32) -> Scene {
         rough_tex: NO_TEX, // must survive the merge verbatim
         metal_tex: NO_TEX,
         emissive_tex: NO_TEX,
+        class: crate::matclass::IDX_DEFAULT as u8,
         kind: if albedo_tex == NO_TEX {
             MatKind::Diffuse
         } else {
