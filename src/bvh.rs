@@ -211,6 +211,31 @@ impl Ray {
     }
 }
 
+/// Map a world-space ray into a sway cell's REST space — the exact inverse
+/// of the cell's affine pose `M(p) = p + u·(a + b·p.y)` (foliage v0.4).
+/// `u.y ≡ 0` makes M unipotent (det = 1), so the inverse is closed-form:
+/// `M⁻¹(q) = q − u·(a + b·q.y)` (exact — q.y is untouched, so the weight
+/// the forward map used is recomputable verbatim). The rest-space direction
+/// is DELIBERATELY left unnormalized: `o_r + t·d_r = M⁻¹(o + t·d)`, so the
+/// world-space hit parameter t is preserved and `o + t·d` lands on the
+/// DISPLACED surface — distance == t keeps holding where the claims live
+/// (world space). `inv_d` is recomputed only when the direction actually
+/// shears (`b·d.y ≠ 0` — above-the-band cells have b = 0 and horizontal
+/// rays d.y = 0, both keep the v0.3 translation cost); one `recip` per
+/// gateway entry otherwise, amortized over the whole subtree descent.
+#[inline]
+pub(crate) fn shear_ray(ray: &Ray, s: &crate::foliage::CellShear) -> Ray {
+    // u.y == 0 (the wind_with contract), so `- u * w` leaves o.y/d.y alone.
+    let o = ray.o - s.u * (s.a + s.b * ray.o.y);
+    let bd = s.b * ray.d.y;
+    if bd == 0.0 {
+        Ray { o, d: ray.d, inv_d: ray.inv_d }
+    } else {
+        let d = ray.d - s.u * bd;
+        Ray { o, d, inv_d: d.recip() }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Hit {
     pub t: f32,
@@ -585,8 +610,8 @@ impl Bvh {
                         .iter()
                         .map(|cl| {
                             crate::foliage::displacement_bound_with(
-                                cl.amp,
-                                sw.scale,
+                                cl.w_max,
+                                cl.scale,
                                 crate::foliage::sweep_mult(),
                             )
                         })
@@ -611,7 +636,9 @@ impl Bvh {
                     bb.grow_aabb(&tri_aabb[t as usize]);
                 }
                 centroids.push(0.5 * (bb.min + bb.max));
-                let p = Vec3A::splat(ctx.pad[c]);
+                // x/z only: the v0.4 shear has NO y component (u.y ≡ 0), so
+                // the swept box is exact in y for free.
+                let p = Vec3A::new(ctx.pad[c], 0.0, ctx.pad[c]);
                 tri_aabb.push(Aabb { min: bb.min - p, max: bb.max + p });
             }
         }
@@ -916,19 +943,22 @@ impl Bvh {
         best
     }
 
-    /// A gateway's CURRENT cell translation — ZERO (the rest pose) when the
-    /// scene carries no sway (a defensive impossibility: gateways only build
-    /// with `Scene::sway` attached) or the `FR_SWAY_ABL=noshift` cost probe
-    /// is armed. The cell id is derived, never stored: the gateway's
-    /// truthful range is one cell by construction, so its first tri's
-    /// `tri_cell` entry IS the cell.
+    /// A gateway's CURRENT cell pose — `None` (the rest pose) when the scene
+    /// carries no sway (a defensive impossibility: gateways only build with
+    /// `Scene::sway` attached), the `FR_SWAY_ABL=noshift` cost probe is
+    /// armed, or the baked wind is exactly zero (headless paths, dead
+    /// cells). The cell id is derived, never stored: the gateway's truthful
+    /// range is one cell by construction, so its first tri's `tri_cell`
+    /// entry IS the cell.
     #[inline]
-    fn gateway_offset(&self, scene: &Scene, node: &BvhNode) -> Vec3A {
+    fn gateway_shear(&self, scene: &Scene, node: &BvhNode) -> Option<crate::foliage::CellShear> {
         match &scene.sway {
             Some(sw) if !crate::foliage::sway_abl().noshift => {
-                sw.offset(sw.tri_cell[self.tri_idx[node.left_first as usize] as usize])
+                let s =
+                    sw.shear(sw.tri_cell[self.tri_idx[node.left_first as usize] as usize]);
+                (s.u != Vec3A::ZERO).then_some(s)
             }
-            _ => Vec3A::ZERO,
+            _ => None,
         }
     }
 
@@ -957,20 +987,20 @@ impl Bvh {
             if node.count > 0 {
                 if node.is_gateway() {
                     // GATEWAY (foliage sway): descend the cell's rest-space
-                    // subtree at +1 with the ray shifted into cell-rest space
-                    // — ONE shift per cell entry instead of the old per-test
-                    // head (t preserved, inv_d shift-invariant). Nested call
-                    // = fresh stack; gateways never nest, so recursion depth
-                    // is 1. Masked count 0 = the E filler: no subtree, fall
-                    // straight to the pop tail. tmax/best merge through the
-                    // &mut params.
+                    // subtree at +1 with the ray mapped into cell-rest space
+                    // — ONE shear per cell entry instead of the old per-test
+                    // head (`shear_ray`: the exact unipotent inverse, t
+                    // preserved, inv_d recomputed only when b·d.y ≠ 0).
+                    // Nested call = fresh stack; gateways never nest, so
+                    // recursion depth is 1. Masked count 0 = the E filler:
+                    // no subtree, fall straight to the pop tail. tmax/best
+                    // merge through the &mut params.
                     if node.leaf_count() > 0 {
                         if tri_probe() {
                             GATEWAY_ENTRIES.fetch_add(1, Ordering::Relaxed);
                         }
-                        let off = self.gateway_offset(scene, node);
-                        if off != Vec3A::ZERO {
-                            let sray = Ray { o: ray.o - off, d: ray.d, inv_d: ray.inv_d };
+                        if let Some(s) = self.gateway_shear(scene, node) {
+                            let sray = shear_ray(ray, &s);
                             self.intersect_from(scene, &sray, tmin, tmax, node_idx + 1, best, visits);
                         } else {
                             self.intersect_from(scene, ray, tmin, tmax, node_idx + 1, best, visits);
@@ -1097,14 +1127,13 @@ impl Bvh {
             *visits += 1;
             if node.count > 0 {
                 if node.is_gateway() {
-                    // GATEWAY: one shift per cell entry (see intersect_from).
+                    // GATEWAY: one shear per cell entry (see intersect_from).
                     if node.leaf_count() > 0 {
                         if tri_probe() {
                             GATEWAY_ENTRIES.fetch_add(1, Ordering::Relaxed);
                         }
-                        let off = self.gateway_offset(scene, node);
-                        let hit = if off != Vec3A::ZERO {
-                            let sray = Ray { o: ray.o - off, d: ray.d, inv_d: ray.inv_d };
+                        let hit = if let Some(s) = self.gateway_shear(scene, node) {
+                            let sray = shear_ray(ray, &s);
                             self.occluded_from(scene, &sray, tmin, tmax, node_idx + 1, visits)
                         } else {
                             self.occluded_from(scene, ray, tmin, tmax, node_idx + 1, visits)
@@ -1251,16 +1280,15 @@ impl Bvh {
             *visits += 1;
             if node.count > 0 {
                 if node.is_gateway() {
-                    // GATEWAY: one shift per cell entry (see intersect_from);
+                    // GATEWAY: one shear per cell entry (see intersect_from);
                     // `tp` threads through the nested call, so per-interface
                     // tints inside a cell multiply exactly as before.
                     if node.leaf_count() > 0 {
                         if tri_probe() {
                             GATEWAY_ENTRIES.fetch_add(1, Ordering::Relaxed);
                         }
-                        let off = self.gateway_offset(scene, node);
-                        let opaque = if off != Vec3A::ZERO {
-                            let sray = Ray { o: ray.o - off, d: ray.d, inv_d: ray.inv_d };
+                        let opaque = if let Some(s) = self.gateway_shear(scene, node) {
+                            let sray = shear_ray(ray, &s);
                             self.transmittance_from(scene, &sray, tmin, tmax, node_idx + 1, tp, visits)
                         } else {
                             self.transmittance_from(scene, ray, tmin, tmax, node_idx + 1, tp, visits)
@@ -1381,7 +1409,7 @@ fn emit_gateway(
     let sub_i = gw_i + 1;
     let tb: &mut [u32] = g.tribuf;
     subdivide_range(nodes, sub_i, tb, tri_aabb, centroids, &mut None, &mut None, 0);
-    let p = Vec3A::splat(g.ctx.pad[c]);
+    let p = Vec3A::new(g.ctx.pad[c], 0.0, g.ctx.pad[c]);
     let sub_bb = nodes[sub_i].aabb;
     let bb = Aabb { min: sub_bb.min - p, max: sub_bb.max + p };
     debug_assert_eq!(
@@ -1755,7 +1783,8 @@ pub(crate) fn grow_height_sweep(
 /// Sway sweep of a leaf triangle's AABB (`--foliage-sway` v0.2, the swept-box
 /// phase): pad BOTH directions by `foliage::sway_pad` — the cell's
 /// displacement bound at the sweep multiplier — so the box contains the
-/// triangle at EVERY reachable pose (translation is signed). Every claim
+/// triangle at EVERY reachable pose (the shear is signed; v0.4 pads x/z
+/// only, since `u.y ≡ 0` means no pose ever moves a vertex vertically). Every claim
 /// consumer (frustum queries, temporal cache, hemi bounds, structure replay,
 /// the ftree, the GPU's uploaded software trees) inherits soundness from
 /// this one site, exactly like `grow_height_sweep` above; the containment
@@ -1769,8 +1798,10 @@ pub(crate) fn grow_sway_sweep(scene: &Scene, tri: u32, bb: &mut Aabb) {
     let Some(sw) = &scene.sway else { return };
     let pad = crate::foliage::sway_pad(sw, tri);
     if pad > 0.0 {
-        bb.min -= Vec3A::splat(pad);
-        bb.max += Vec3A::splat(pad);
+        // x/z only — the v0.4 shear has no y component (u.y ≡ 0).
+        let p = Vec3A::new(pad, 0.0, pad);
+        bb.min -= p;
+        bb.max += p;
     }
 }
 
@@ -2134,6 +2165,7 @@ pub fn height_self_test() -> Result<(), String> {
             sky_scale: 1.0,
             night: 0.0,
             sway: None,
+            sway_regions: Vec::new(),
             diag: 1.0,
             eps: 1e-4,
             ao_radius: 0.03,
@@ -2453,6 +2485,7 @@ pub fn tinted_shadow_self_test() -> Result<(), String> {
             sky_scale: 1.0,
             night: 0.0,
             sway: None,
+            sway_regions: Vec::new(),
             diag: 1.0,
             eps: 1e-4,
             ao_radius: 0.03,
@@ -2612,12 +2645,16 @@ fn moller_trumbore(scene: &Scene, tri: u32, ray: &Ray) -> Option<(f32, f32, f32)
                 && !crate::foliage::sway_abl().noshift
                 && sw.tri_cell[tri as usize] != crate::foliage::STATIC_CELL =>
         {
-            let off = sw.offset(sw.tri_cell[tri as usize]);
-            if off != Vec3A::ZERO {
+            let s = sw.shear(sw.tri_cell[tri as usize]);
+            if s.u != Vec3A::ZERO {
                 if tri_probe() {
                     TRI_TESTS_SHIFTED.fetch_add(1, Ordering::Relaxed);
                 }
-                shifted = Ray { o: ray.o - off, d: ray.d, inv_d: ray.inv_d };
+                // The MT test itself never reads inv_d, but the shadowed
+                // binding must still carry a consistent one for the tail
+                // (relief is a leaf-material known-incompatible; keep it
+                // honest anyway).
+                shifted = shear_ray(ray, &s);
                 &shifted
             } else {
                 ray

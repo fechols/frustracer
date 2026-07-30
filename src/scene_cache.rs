@@ -76,7 +76,40 @@ use std::path::{Path, PathBuf};
 // v15: the pavement tokens moved from the STONE row to FOLIAGE_GUARD (the
 // foliage-v0.1 reflection regression) — bistro's cobbles re-classify
 // glossy, so the serialized class byte + pbr move.
-pub const CACHE_VERSION: u32 = 15;
+// v16: foliage sway v0.4 rooted shear — the serialized tree's swept boxes
+// move under an IDENTICAL lever/sway word (the v13 class): the γ-ramp
+// replaces height_factor (SWAY_GROUND_K deleted), pads become x/z-only
+// (`u.y ≡ 0`), and the bound is `√2·w_max·(AMP+BOB)·scale + eps` with the
+// retuned SWAY_AMP_K/SWAY_BOB_K.
+// v17: foliage v0.5 whole-plant sway — the matclass table gained the `bark`
+// class BEFORE foliage (the serialized `class` byte's MEANING shifts for
+// every index >= the insertion, and bark/stm/tronco/Log materials
+// re-class), and the sway partition became the composite (plant, voxel)
+// key, so the serialized tree's gateway layout moves under identical
+// lever/sway words (the v13 class) on every scene with woody geometry.
+// (v16/v17 forked in parallel with v15 and were renumbered onto it at
+// merge — no sidecar was ever written under the other numbering's key.)
+// v18: foliage v0.6 per-region sway — MAX_CELLS 2048 → 4096 and MAX_PLANTS
+// 1024 → 2048, so any scene that hit either cap (rungholt's 1206 plants,
+// its coarsened field grid) repartitions and the serialized tree's gateway
+// layout moves under identical lever/sway words (the v13 class). The
+// region machinery itself is bit-neutral on region-less scenes; regions
+// only serialize in the WORLD sidecar (WORLD_VERSION 3).
+// v19: the v0.6 amplitude retune (SWAY_AMP_K 0.001 → 0.002, SWAY_BOB_K in
+// ratio) — the displacement bound doubles, so every swept gateway box in a
+// serialized tree moves under an IDENTICAL lever/sway word (the v16
+// class: sway_word carries the --foliage-amp MULTIPLIER, not the base
+// constant).
+// v20: NOT a layout change — the spray union-find welds by position bits
+// instead of vertex index (per-block-unwelded Minecraft water survives as
+// one ocean component), and glass-NAMED materials classify glass (Tf-veto
+// on the water cue + transmission-tier admission: rungholt/vokselia panes,
+// bistro MASTER_Glass_*). A v19 sidecar's tri_mat/materials/class bytes
+// are stale under the same key (the v8/v9 precedent: the retag verdict and
+// the class byte both persist in the sidecar). (Authored as v16 in
+// parallel with the foliage v16-v19 lineage and renumbered onto it at
+// rebase — no sidecar was ever written under the other numbering's key.)
+pub const CACHE_VERSION: u32 = 20;
 const MAGIC: [u8; 8] = *b"FRSCACH\x01";
 
 /// Fixed on-disk material, `MatKind` flattened into (kind, param) — Marble
@@ -117,6 +150,17 @@ struct DiskNode {
     max: [f32; 3],
     left_first: u32,
     count: u32,
+}
+
+/// Fixed on-disk sway region (foliage v0.6, WORLD sidecar only — per-scene
+/// scenes never carry regions): 32 B, no padding.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DiskRegion {
+    tri_start: u32,
+    tri_end: u32,
+    cmin: [f32; 3],
+    cmax: [f32; 3],
 }
 
 /// The load-time lever word, part of the cache key: the h2n/n2h converters
@@ -590,6 +634,7 @@ pub fn try_load(src_path: &str) -> Option<(Scene, Bvh)> {
         sky_scale: 1.0,
         night: 0.0,
         sway: None,
+        sway_regions: Vec::new(),
         diag: 0.0,
         eps: 0.0,
         ao_radius: 0.0,
@@ -696,7 +741,12 @@ pub fn store(src_path: &str, scene: &Scene, bvh: &Bvh) {
 /// `CACHE_VERSION` bumps invalidate the world sidecar too (shared repr).
 // 2: Island gained `height` (the content y extent) — the world layout record
 //    grew a field, so every v1 sidecar must miss rather than deserialize short.
-pub const WORLD_VERSION: u32 = 2;
+// 3: foliage v0.6 sway regions — the merged Scene carries per-island
+//    `sway_regions` (tri range + island content box), serialized after the
+//    layout meta; `foliage::attach` derives the partition from them, so a v2
+//    sidecar (empty regions ⇒ world-scale fused plants) is stale under the
+//    same key.
+pub const WORLD_VERSION: u32 = 3;
 const WORLD_MAGIC: [u8; 8] = *b"FRWORLD\x01";
 
 /// One curated entry's contribution to the world key. `deps` holds the
@@ -833,6 +883,32 @@ pub fn try_load_world(
         });
     }
     let field_half = read_f32(&mut r).ok()?;
+    // Foliage sway regions (v0.6) — validated before anything trusts them:
+    // ascending disjoint tri ranges within the tri count (`region_of`'s
+    // binary-search contract), finite boxes. Any violation = corrupt miss.
+    let n_regions = read_u32(&mut r).ok()? as usize;
+    if n_regions > n_islands {
+        return None;
+    }
+    let disk_regions: Vec<DiskRegion> = read_pod_vec_checked(&mut r, n_regions, &mut remaining)?;
+    let mut sway_regions = Vec::with_capacity(n_regions);
+    let mut prev_end = 0u32;
+    for d in &disk_regions {
+        let ok = d.tri_start >= prev_end
+            && d.tri_start <= d.tri_end
+            && (d.tri_end as usize) <= n_tris
+            && d.cmin.iter().chain(&d.cmax).all(|v| v.is_finite());
+        if !ok {
+            return None;
+        }
+        prev_end = d.tri_end;
+        sway_regions.push(crate::foliage::SwayRegion {
+            tri_start: d.tri_start,
+            tri_end: d.tri_end,
+            cmin: Vec3A::from_array(d.cmin),
+            cmax: Vec3A::from_array(d.cmax),
+        });
+    }
     let sun_v: Vec<Vec3A> = read_pod_vec_checked(&mut r, 1, &mut remaining)?;
 
     let positions: Vec<Vec3A> = read_pod_vec_checked(&mut r, n_verts, &mut remaining)?;
@@ -912,6 +988,7 @@ pub fn try_load_world(
         sky_scale: 1.0,
         night: 0.0,
         sway: None,
+        sway_regions,
         diag: 0.0,
         eps: 0.0,
         ao_radius: 0.0,
@@ -975,6 +1052,21 @@ pub fn store_world(
             write_f32(&mut w, isle.theme_hour)?;
         }
         write_f32(&mut w, world.field_half)?;
+        // Foliage sway regions (v0.6): per-island tri ranges + content boxes
+        // — `foliage::attach` on the warm-loaded scene must see the same
+        // regions the stored swept BVH was built from.
+        write_u32(&mut w, scene.sway_regions.len() as u32)?;
+        let disk_regions: Vec<DiskRegion> = scene
+            .sway_regions
+            .iter()
+            .map(|r| DiskRegion {
+                tri_start: r.tri_start,
+                tri_end: r.tri_end,
+                cmin: [r.cmin.x, r.cmin.y, r.cmin.z],
+                cmax: [r.cmax.x, r.cmax.y, r.cmax.z],
+            })
+            .collect();
+        write_pod(&mut w, &disk_regions)?;
         write_pod(&mut w, &[scene.sun.dir])?;
 
         write_pod(&mut w, &scene.positions)?;

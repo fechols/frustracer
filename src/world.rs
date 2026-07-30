@@ -299,10 +299,20 @@ fn merge_scenes(parts: Vec<(Scene, Vec3A)>, field_half: f32) -> Scene {
 
     // Parts are consumed one at a time and dropped after their copy, so the
     // transient footprint is ~one part + the accumulating world.
+    let mut sway_regions: Vec<crate::foliage::SwayRegion> = Vec::new();
     for (mut part, off) in parts {
         let vbase = positions.len() as u32;
         let mat_base = materials.len() as u32;
         let tex_base = textures.len() as u32;
+        // Foliage v0.6 sway region: this part's tri range in the merged
+        // stream + its content box AT THE RING OFFSET, so `foliage::attach`
+        // derives plants and cells at the ISLAND's scale — the world's ~10×
+        // content diagonal used to fuse whole Minecraft forests into single
+        // rigidly-translating plants. Recorded for EVERY part (a region with
+        // no foliage-masked tris produces no cells); ranges are ascending and
+        // disjoint by construction (`region_of`'s contract).
+        let tri_start = indices.len() as u32;
+        let region_box = (part.content_min + off, part.content_max + off);
         positions.extend(part.positions[gv..].iter().map(|&p| p + off));
         normals.extend_from_slice(&part.normals[gv..]);
         texcoords.extend_from_slice(&part.texcoords[gv..]);
@@ -326,6 +336,12 @@ fn merge_scenes(parts: Vec<(Scene, Vec3A)>, field_half: f32) -> Scene {
             materials.push(m);
         }
         textures.append(&mut part.textures);
+        sway_regions.push(crate::foliage::SwayRegion {
+            tri_start,
+            tri_end: indices.len() as u32,
+            cmin: region_box.0,
+            cmax: region_box.1,
+        });
     }
 
     let mut world = Scene {
@@ -346,6 +362,7 @@ fn merge_scenes(parts: Vec<(Scene, Vec3A)>, field_half: f32) -> Scene {
         sky_scale: 1.0,
         night: 0.0,
         sway: None,
+        sway_regions,
         diag: 0.0,
         eps: 0.0,
         ao_radius: 0.0,
@@ -813,6 +830,9 @@ pub fn self_test() -> Result<(), String> {
     // Reference copies for the bit-exact position check (merge consumes).
     let ref_a: Vec<Vec3A> = parts[0].0.positions[gv..].to_vec();
     let ref_b: Vec<Vec3A> = parts[1].0.positions[gv..].to_vec();
+    // Part content boxes for the sway-region pin (merge consumes the parts).
+    let a_cbox = (parts[0].0.content_min, parts[0].0.content_max);
+    let b_cbox = (parts[1].0.content_min, parts[1].0.content_max);
     let m = merge_scenes(parts, 30.0);
 
     if m.positions.len() != gv + (av - gv) + (bv - gv) {
@@ -887,12 +907,42 @@ pub fn self_test() -> Result<(), String> {
             m.content_min.x, m.content_max.x
         ));
     }
+    // Sway regions (foliage v0.6): one per part, ranges exactly partitioning
+    // [ground, end) in part order, boxes = the part's content box AT ITS
+    // OFFSET bitwise — the data `foliage::attach` derives island-scale
+    // plants/cells from, so a drifted range or box silently re-fuses the
+    // world's forests.
+    {
+        let r = &m.sway_regions;
+        if r.len() != 2 {
+            return err(format!("merge: {} sway regions, wanted 2", r.len()));
+        }
+        if r[0].tri_start as usize != gt
+            || r[0].tri_end != r[1].tri_start
+            || r[1].tri_end as usize != m.indices.len()
+        {
+            return err("merge: sway-region ranges do not partition the tri stream".into());
+        }
+        if r[0].tri_end as usize - gt != at - gt {
+            return err("merge: region A range != part A tri count".into());
+        }
+        let off_a = Vec3A::new(10.0, 0.0, 0.0);
+        let off_b = Vec3A::new(-10.0, 0.0, 0.0);
+        if r[0].cmin != a_cbox.0 + off_a
+            || r[0].cmax != a_cbox.1 + off_a
+            || r[1].cmin != b_cbox.0 + off_b
+            || r[1].cmax != b_cbox.1 + off_b
+        {
+            return err("merge: sway-region boxes != part content boxes at offset".into());
+        }
+    }
     // Merge determinism: fresh inputs, byte-equal outputs.
     let m2 = merge_scenes(build(), 30.0);
     if m.positions != m2.positions
         || m.indices != m2.indices
         || m.tri_mat != m2.tri_mat
         || m.diag.to_bits() != m2.diag.to_bits()
+        || m.sway_regions != m2.sway_regions
     {
         return err("merge_scenes nondeterministic".into());
     }
@@ -1042,6 +1092,12 @@ pub fn self_test() -> Result<(), String> {
         }
         if sc2.sun.dir != world_sc.sun.dir {
             return err("world cache: sun direction drift".into());
+        }
+        // Foliage v0.6: the regions must round-trip byte-faithfully — the
+        // warm-loaded scene's attach derives the same island-scale partition
+        // the stored swept BVH was built from.
+        if sc2.sway_regions != world_sc.sway_regions || sc2.sway_regions.len() != 2 {
+            return err("world cache: sway regions drift".into());
         }
         if sc2.materials.len() != world_sc.materials.len() {
             return err("world cache: material count drift".into());

@@ -133,10 +133,45 @@ const CLASSES: &[ClassDef] = &[
         pbr: opaque(0.88, 0.0),
     },
     ClassDef {
+        name: "bark",
+        // Woody plant matter — the foliage-sway WHOLE-PLANT vocabulary (v0.5:
+        // `foliage::woody_materials` keys on this class byte to group trunks
+        // and branches into plants). The plant-library woody stems moved here
+        // FROM the foliage row (brk/bark/tronco/twg/stm — BS04brk,
+        // quercus_rubra_bark, sm_tronco, HP07stm, …); trunk/branch/branches
+        // are the bistro vocabulary (Foliage_Trunk's TEXTURE stem
+        // `italian_cypress_bark_diff` hits Tok("bark") at tier 1, and even at
+        // the name tier bark-before-foliage resolves a name carrying both
+        // `foliage` and `trunk` tokens correctly — which is why this row must
+        // precede the foliage row); `log` is the Minecraft trunk block
+        // (whole-token: `Wooden_Plank`'s tokens are `wooden`,`plank` — no
+        // hit, so every building block stays static). Placed AFTER stone so
+        // every higher class keeps precedence (`Rose_Wood_Table` → wood,
+        // `madera_*`/`WOOD08` → wood, the leaf-litter BLENDSHADERs → stone
+        // via their pavement stems).
+        keys: &[
+            Tok("brk"),
+            Tok("bark"),
+            Tok("tronco"),
+            Tok("twg"),
+            Tok("stm"),
+            Tok("trunk"),
+            Tok("branch"),
+            Tok("branches"),
+            Tok("log"),
+        ],
+        // Wood-like: opaque, NO translucency (deliberately not foliage's 0.3
+        // — a trunk is not backlit like a leaf, and Log/tronco changing
+        // shading class should move the look minimally), roughness above the
+        // 0.45 bounce gate like foliage.
+        pbr: opaque(0.7, 0.0),
+    },
+    ClassDef {
         name: "foliage",
-        // Plant-library tokens (BS01lef, FL19pe13, HP07stm, quercus_rubra_bark
-        // ...) — every latin genus file carries one of these; `caballo` covers
-        // the lone exception (Cola_Caballo horsetail). Roughness deliberately
+        // Plant-library tokens (BS01lef, FL19pe13, ...) — every latin genus
+        // file carries one of these; `caballo` covers the lone exception
+        // (Cola_Caballo horsetail). The WOODY stems (brk/bark/tronco/twg/stm)
+        // live in the `bark` row above since v0.5. Roughness deliberately
         // stays >= 0.45: 10M foliage tris must not take the bounce ray.
         // The plain-English row (leaves/foliage/sapling/plants) is the
         // bistro + Minecraft vocabulary: bistro's stems say `Leaves_A_diff` /
@@ -156,17 +191,12 @@ const CLASSES: &[ClassDef] = &[
             Tok("leaf"),
             Tok("pet"),
             Tok("petal"),
-            Tok("stm"),
-            Tok("brk"),
-            Tok("bark"),
             Tok("flo"),
             Tok("cnt"),
-            Tok("twg"),
             Tok("sta"),
             Tok("pe"),
             Tok("pis"),
             Tok("hoja"),
-            Tok("tronco"),
             Tok("seca"),
             Tok("caballo"),
             Tok("leaves"),
@@ -203,19 +233,22 @@ pub const FABRIC_SHEEN: f32 = 0.5;
 /// Class names in report order: the keyword classes, then the Ns tiers and
 /// the default — indices returned by `classify` point in here.
 pub const NAMES: &[&str] = &[
-    "rust", "metal", "wood", "ceramic", "clay", "fabric", "leather", "stone", "foliage",
-    "glass", "water", "glossy", "default",
+    "rust", "metal", "wood", "ceramic", "clay", "fabric", "leather", "stone", "bark",
+    "foliage", "glass", "water", "glossy", "default",
 ];
+/// Public for `foliage::woody_materials` — woody plant matter (trunks,
+/// branches, stems), the v0.5 whole-plant grouping anchor.
+pub const IDX_BARK: usize = 8;
 /// Public for `foliage::leaf_materials` — the classify verdict is retained as
 /// `Material::class` (a `u8` index into `NAMES`), and the sway mask compares
 /// against this constant.
-pub const IDX_FOLIAGE: usize = 8;
-const IDX_GLASS: usize = 9;
-const IDX_WATER: usize = 10;
-const IDX_GLOSSY: usize = 11;
+pub const IDX_FOLIAGE: usize = 9;
+const IDX_GLASS: usize = 10;
+const IDX_WATER: usize = 11;
+const IDX_GLOSSY: usize = 12;
 /// Public because it is the `Material::class` byte everywhere the classifier
 /// does NOT run (procedural builders, the glTF loader).
-pub const IDX_DEFAULT: usize = 12;
+pub const IDX_DEFAULT: usize = 13;
 
 /// Blinn-Phong exponent -> perceptual GGX roughness (Brian Karis' mapping),
 /// clamped to the plausible glossy band.
@@ -234,6 +267,21 @@ fn tokens(s: &str) -> impl Iterator<Item = &str> {
 pub fn water_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     tokens(&lower).any(|t| t == "water" || t == "agua")
+}
+
+/// Whole-token `glass`/`pane`/`portal` match (the `water_name` shape;
+/// `glassware`/`fiberglass`/`panels` stay safe). Two consumers in
+/// `classify`, both on the material NAME (the Minecraft atlas scenes carry
+/// no stem signal): it VETOES the untrusted Tf-chromatic water cue
+/// (vokselia's `Glass`/`Glass_Pane`/`Portal` are illum 4 with chromatic Tf
+/// — without the veto they classify water and ripple), and it ADMITS a
+/// named material into the transmission tier (rungholt's `Glass` is
+/// illum 2 / Ns 0 — an exporter that never writes illum 4 — and rendered
+/// opaque matte without it; bistro's `MASTER_Glass_*` at illum 2/7 are the
+/// same shape).
+fn glass_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    tokens(&lower).any(|t| t == "glass" || t == "pane" || t == "portal")
 }
 
 /// A chromatic MTL transmission filter (`Tf`) on an illum-4 material is the
@@ -309,15 +357,21 @@ pub fn classify(
     // the mid band (the untextured café-chair metal at Ns 256) stays an
     // opaque glossy dielectric — transmission there would dissolve chairs.
     let ns = ns.unwrap_or(0.0);
-    if illum == Some(4) || ns >= 500.0 {
+    // A glass NAME also opens the transmission tier: Minecraft-style
+    // exporters write their windows as illum 2 / Ns 0 (rungholt's `Glass`,
+    // bistro's `MASTER_Glass_*` at illum 2/7), which no Ns/illum signal can
+    // ever admit — they rendered opaque matte.
+    if illum == Some(4) || ns >= 500.0 || glass_name(mat_name) {
         // A water REFINEMENT of the glass tier — only a material that already
         // classifies glassware can become water, so transmission stays
         // shading-only and every soundness property is unchanged. Signals:
-        // an OBJ `water`/`agua` object/stem/material name, or a chromatic Tf.
+        // an OBJ `water`/`agua` object/stem/material name, or a chromatic Tf
+        // — the latter VETOED by a glass name (Tf is untrusted color;
+        // vokselia's chromatic-Tf `Glass` panes must not ripple).
         let is_water = water_hint
             || tex_stem.is_some_and(water_name)
             || water_name(mat_name)
-            || tf_chromatic(tf);
+            || (tf_chromatic(tf) && !glass_name(mat_name));
         if is_water {
             return (IDX_WATER, WATER);
         }
@@ -356,7 +410,22 @@ pub fn self_test() -> Result<(), String> {
     tex("detmoldura_01_color", "stone")?; // fused compounds via Sub("moldur")
     tex("molduraterraza__color", "stone")?;
     tex("silla_d_piel", "leather")?;
-    tex("quercus_rubra_bark", "foliage")?;
+    // The bark class (v0.5 whole-plant sway): woody stems moved out of the
+    // foliage row — plant-library bark/stm, the bistro tree textures, the
+    // Minecraft Log block.
+    tex("quercus_rubra_bark", "bark")?;
+    tex("hp07stm", "bark")?; // stm moved from foliage
+    tex("italian_cypress_bark_diff", "bark")?; // bistro Foliage_Trunk's stem
+    tex("linden_bark_a_diff", "bark")?; // bistro linden trunk's stem
+    tex("paris_ivy_branch_diff", "bark")?; // bistro ivy branches' stem
+    // Name-tier bark: `Foliage_Trunk` carries BOTH the `foliage` and `trunk`
+    // tokens — bark-before-foliage table order resolves it (the reason the
+    // bark row's position is load-bearing).
+    expect(None, "Foliage_Trunk", 100.0, 2, "bark")?;
+    expect(Some("rungholt-rgba"), "Log", 0.0, 2, "bark")?;
+    expect(Some("vokselia_spawn"), "Log", 0.0, 2, "bark")?;
+    // ...and the whole-token guard: every wooden BUILDING block stays static.
+    expect(Some("rungholt-rgba"), "Wooden_Plank", 0.0, 2, "default")?;
     tex("d30_smiguel_2003_7758", "default")?;
     // The bistro/Minecraft vocabulary (foliage-sway coverage):
     tex("leaves_a_diff", "foliage")?; // linden — "leaves" plural, not "leaf"
@@ -434,6 +503,16 @@ pub fn self_test() -> Result<(), String> {
     if l.translucency != 0.3 || l.roughness < 0.45 {
         return Err(format!("foliage: translucency {} roughness {}", l.translucency, l.roughness));
     }
+    // Bark Pbr: wood-like — opaque (NO leaf translucency), above the bounce
+    // gate, dielectric.
+    let (_, bk) = classify(Some("linden_bark_a_diff"), "material_4", Some(16.0), Some(2), false, None);
+    if bk.translucency != 0.0 || bk.roughness < 0.45 || bk.transmission != 0.0 || bk.metallic != 0.0
+    {
+        return Err(format!(
+            "bark pbr: translucency {} roughness {} transmission {} metallic {}",
+            bk.translucency, bk.roughness, bk.transmission, bk.metallic
+        ));
+    }
     // Water is a glass-tier refinement, not a rival to the keyword/glossy
     // tiers. Signals, each in isolation:
     let water_named = |stem: Option<&str>, name: &str, hint: bool, tf: Option<[f32; 3]>| {
@@ -464,6 +543,33 @@ pub fn self_test() -> Result<(), String> {
     // Token safety: `watercolor` is not water; `Water` is.
     if !water_name("Water") || water_name("watercolor_paper") {
         return Err("water_name token match wrong".into());
+    }
+    // Glass-NAMED materials are glass, never water: the Tf-chromatic cue is
+    // untrusted color and a trusted name vetoes it (vokselia's `Glass` panes
+    // carry `Tf 0.376 0.482 0.498` — chromatic Δ 0.122 — and its `Portal`
+    // `Tf 0.668 0.398 0.8`; both are illum 4, and without the veto they
+    // classify water and RIPPLE).
+    if water_named(None, "Glass", false, Some([0.376, 0.482, 0.498])) != "glass" {
+        return Err("glass-named chromatic-Tf material must stay glass".into());
+    }
+    if water_named(None, "Portal", false, Some([0.668, 0.398, 0.8])) != "glass" {
+        return Err("portal-named chromatic-Tf material must stay glass".into());
+    }
+    // ...and a glass name ADMITS an illum-2/Ns-0 material into the
+    // transmission tier (rungholt's Minecraft exporter never writes illum 4
+    // on glass — those windows rendered opaque matte; bistro's `MASTER_Glass_*`
+    // at illum 2/7, Ns 80-200 are the same shape). Water-named materials keep
+    // NOT being admitted (the water_chair pin above): water is a refinement
+    // of a tier the material must reach on its own or via a GLASS name.
+    expect(Some("rungholt-rgba"), "Glass", 0.0, 2, "glass")?;
+    expect(Some("rungholt-rgba"), "Glass_Pane", 0.0, 2, "glass")?;
+    expect(None, "MASTER_Glass_Exterior", 80.0, 2, "glass")?;
+    // Glass-token safety: compounds don't fire, the real names do.
+    if glass_name("glassware_shelf") || glass_name("fiberglass_panel") || glass_name("panels") {
+        return Err("glass_name compound token must not match".into());
+    }
+    if !glass_name("Glass_Pane") || !glass_name("Portal") {
+        return Err("glass_name must match Glass_Pane/Portal".into());
     }
     // The water params: transmission near 1, mirror-smooth, flagged.
     let (_, w) = classify(None, "materialo", Some(1024.0), Some(4), true, None);

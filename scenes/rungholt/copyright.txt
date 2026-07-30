@@ -6,8 +6,31 @@ http://www.planetminecraft.com/project/neu-rungholt/
 
 
 6,704,264 faces
-12,308,528 vertices 
+12,308,528 vertices
 after loading and welding colocated vertices
 
 ------------------
 Converted to OBJ by Morgan McGuire using Mineways (http://mineways.com)
+
+------------------
+TEXTURES (rungholt-*.webp, house-*.webp): the texture atlases in this
+directory are NOT the ones from the original conversion. The original
+Mineways export embedded Mojang's default Minecraft block textures, which
+may not be redistributed. They have been rebuilt cell-for-cell (same
+Mineways atlas layout, so the OBJ UVs are unchanged) from:
+
+  Pixel Perfection, by Hugh "XSSheep" Rutland and contributors
+  (Community Edition continuation: https://github.com/Athemis/PixelPerfectionCE;
+   Minetest port used for a few tiles: https://github.com/minetest-texture-packs/Pixel-Perfection)
+  License: CC BY-SA 4.0 (https://creativecommons.org/licenses/by-sa/4.0/)
+
+A handful of blocks with no Pixel Perfection equivalent (redstone wire,
+repeaters, pistons, melon, portal, nether wart, jack-o-lantern face,
+enchantment-table top, jukebox top) are simple original drawings or
+recompositions of Pixel Perfection art made for this repository. Flat
+single-color material swatch cells and per-cell average-color fills are
+retained/derived as uncopyrightable flat colors. Biome-tinted foliage
+tiles carry constant color multipliers.
+
+The derived atlas images are themselves licensed CC BY-SA 4.0.
+Attribution: "Pixel Perfection by XSSheep and contributors, CC BY-SA 4.0".
