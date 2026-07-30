@@ -73,7 +73,10 @@ use std::path::{Path, PathBuf};
 // `class` byte moves on rungholt/vokselia) and `height_factor` gained the
 // SWAY_GROUND_K floor (per-cell amps grow → the swept gateway boxes in the
 // serialized tree move too).
-pub const CACHE_VERSION: u32 = 14;
+// v15: the pavement tokens moved from the STONE row to FOLIAGE_GUARD (the
+// foliage-v0.1 reflection regression) — bistro's cobbles re-classify
+// glossy, so the serialized class byte + pbr move.
+pub const CACHE_VERSION: u32 = 15;
 const MAGIC: [u8; 8] = *b"FRSCACH\x01";
 
 /// Fixed on-disk material, `MatKind` flattened into (kind, param) — Marble

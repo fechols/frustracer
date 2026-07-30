@@ -129,13 +129,6 @@ const CLASSES: &[ClassDef] = &[
             Tok("bwk"),
             Tok("terresable"),
             Sub("moldur"),
-            // Bistro pavement: these STEMS must classify before the name is
-            // ever consulted, because `Pavement_Cobble_Leaves_BLENDSHADER`
-            // (leaf-LITTER pavement) would otherwise fall through its
-            // cobblestone stem to a name hit on the foliage "leaves" token.
-            Tok("pavement"),
-            Tok("cobblestone"),
-            Tok("cobble"),
         ],
         pbr: opaque(0.88, 0.0),
     },
@@ -255,20 +248,29 @@ fn tf_chromatic(tf: Option<[f32; 3]>) -> bool {
     }
 }
 
-fn keyword_class(key: &str) -> Option<usize> {
-    for (ci, c) in CLASSES.iter().enumerate() {
-        for k in c.keys {
-            let hit = match k {
-                Tok(t) => tokens(key).any(|tok| tok == *t),
-                Sub(sub) => key.contains(sub),
-            };
-            if hit {
-                return Some(ci);
-            }
-        }
-    }
-    None
+fn key_hits(keys: &[Key], key: &str) -> bool {
+    keys.iter().any(|k| match k {
+        Tok(t) => tokens(key).any(|tok| tok == *t),
+        Sub(sub) => key.contains(sub),
+    })
 }
+
+fn keyword_class(key: &str) -> Option<usize> {
+    CLASSES.iter().position(|c| key_hits(c.keys, key))
+}
+
+/// A foliage BLOCK, not a class. Pavement carries leaf-litter names
+/// (bistro's `Pavement_Cobble_Leaves_BLENDSHADER`), and the sway mask must
+/// never mark a street — but the material must otherwise classify exactly as
+/// if the foliage vocabulary had never matched. Foliage v0.1 instead pinned
+/// these tokens to STONE, and that broke the night street: bistro's Ns-100
+/// cobbles went glossy (Ns tier, rough ~0.14) → stone (0.88), crossing the
+/// 0.45 reflection-ray gate in shade.rs — the emissive lamp/sign reflections
+/// on the wet cobblestones vanished, and with no map_Pr in the MTL the flat
+/// 0.88 also flattened the GGX highlights. A guarded material skips ONLY the
+/// foliage row (either tier) and falls through to whatever tier it hit
+/// before the foliage vocabulary existed.
+const FOLIAGE_GUARD: &[Key] = &[Tok("pavement"), Tok("cobblestone"), Tok("cobble")];
 
 /// Classify one MTL material. `tex_stem` is the lowercase filename stem of
 /// map_Kd (no directory, no extension); `mat_name` the `newmtl` name;
@@ -284,9 +286,16 @@ pub fn classify(
     tf: Option<[f32; 3]>,
 ) -> (usize, Pbr) {
     // Tier 1: texture filename stem. Tier 2: material name, same table.
-    let hit = tex_stem
-        .and_then(keyword_class)
-        .or_else(|| keyword_class(&mat_name.to_ascii_lowercase()));
+    // FOLIAGE_GUARD suppresses the foliage row only (see the const): a
+    // guarded material classifies as if the foliage vocabulary never matched
+    // — bistro's Ns-100 cobbles land in the Ns tier's glossy, under the
+    // reflection gate, which is what mirrors the night street's lamps.
+    let name_lower = mat_name.to_ascii_lowercase();
+    let guarded = tex_stem.is_some_and(|s| key_hits(FOLIAGE_GUARD, s))
+        || key_hits(FOLIAGE_GUARD, &name_lower);
+    let class_at =
+        |key: &str| keyword_class(key).filter(|&ci| !(guarded && ci == IDX_FOLIAGE));
+    let hit = tex_stem.and_then(class_at).or_else(|| class_at(&name_lower));
     if let Some(ci) = hit {
         let mut pbr = CLASSES[ci].pbr;
         if CLASSES[ci].name == "fabric" {
@@ -354,7 +363,9 @@ pub fn self_test() -> Result<(), String> {
     tex("paris_foliage_01a_diff", "foliage")?;
     tex("paris_interior_plants_01_diff", "foliage")?;
     tex("plastic_01_planters_diff", "default")?; // `planters` != `plants` (whole-token)
-    tex("pavement_cobblestone_01_b_diff", "stone")?;
+    // Guarded pavement is NOT stone (the foliage-v0.1 regression): it falls
+    // through the keyword tiers entirely (here to the Ns default).
+    tex("pavement_cobblestone_01_b_diff", "default")?;
     // Name tier: CafeChair_Metal is untextured.
     expect(None, "CafeChair_Metal", 256.0, 2, "metal")?;
     // Minecraft atlas scenes: ONE shared texture, so the stem carries no
@@ -378,15 +389,33 @@ pub fn self_test() -> Result<(), String> {
     // before the foliage "rose" token is ever consulted.
     expect(None, "Rose_Wood_Table", 16.0, 2, "wood")?;
     expect(None, "Foliage_Bux_Hedges46", 100.0, 2, "foliage")?;
-    // Stem beats name: leaf-LITTER pavement classifies by its cobblestone
-    // stem before the "leaves" name token is ever consulted.
+    // Leaf-LITTER pavement: the guard suppresses the foliage "leaves" name
+    // token and the material falls through to the Ns tier — bistro's Ns-100
+    // cobbles are GLOSSY, which is the night street's whole look (the
+    // reflection-ray gate reads the flat class roughness).
     expect(
         Some("pavement_cobblestone_01_b_diff"),
         "Pavement_Cobble_Leaves_BLENDSHADER",
         100.0,
         2,
-        "stone",
+        "glossy",
     )?;
+    // ...and the roughness must stay under shade.rs's 0.45 reflection gate,
+    // or the emissive lamp reflections on the cobbles die again.
+    let (_, pave) = classify(
+        Some("pavement_cobblestone_01_b_diff"),
+        "Pavement_Cobble_Leaves_BLENDSHADER",
+        Some(100.0),
+        Some(2),
+        false,
+        None,
+    );
+    if pave.roughness >= 0.45 {
+        return Err(format!("pavement roughness {} crossed the reflection gate", pave.roughness));
+    }
+    // The guard must block foliage on the NAME tier too (an untextured or
+    // atlas-textured cobble material with a leafy name must never sway).
+    expect(None, "Cobble_Leaves_Litter", 16.0, 2, "default")?;
     // Ns tiers: glassware (illum 4 or Ns >= 500) vs untextured opaque glossy.
     // material_79/materialn are neutral-Tf illum-4 glassware — must STAY glass.
     expect(None, "material_79", 1024.0, 4, "glass")?;
