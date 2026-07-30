@@ -403,6 +403,7 @@ each one's A/B is how its cost was measured in the first place.
 |---|---|---|
 | Volumetric clouds — a drifting, curl-warped slab that shadows the sun | `--no-clouds` | |
 | Time of day, moon, and stars — the sun sets, the moon becomes the light, the star field lights the scene | `--tod <h>` to pin | **,** / **.** |
+| Wind-swayed foliage — 5.1 M leaf triangles moving as real geometry | `--no-foliage-sway` | |
 | Fireflies after dusk — real point lights with hard shadows | `--no-fireflies` | |
 | Hemisphere-bounce GI / AO — the quadtree idea aimed at the light integral | (opt-in) | **H** |
 | Heightfield relief — real displaced geometry at the intersector | (opt-in `--heightfield`) | **V** |
@@ -412,6 +413,18 @@ each one's A/B is how its cost was measured in the first place.
 | Glare — the reason the sun looks like a sun | `--no-bloom` | |
 | BC7 texture compression, encoded on the GPU at load | `--no-bc7` | |
 | Per-island ambience + procedural wind | `--no-audio` | |
+
+![Wind through San Miguel's ficus](docs/media/foliage.webp)
+
+*Wind in the leaves — and the leaves are **geometry**, not a shader trick.
+Foliage-classified alpha-masked triangles are bucketed by locality at load
+(5.1 M of them across the world, into 132 cells), each cell becomes an instance
+in a top-level acceleration structure rebuilt every frame, and the ray BVH
+grows one **gateway** node per cell so a ray shifts into that cell's rest space
+once on entry instead of paying for the displacement per triangle. Because the
+motion lives in the structure rather than in a vertex program, every ray sees
+it: swaying leaves cast swaying shadows, occlude bounce rays, and dapple the
+courtyard. All three tracers animate. `--no-foliage-sway` pins the rest pose.*
 
 <table>
 <tr>
@@ -450,6 +463,10 @@ cargo run --release -- --cinematic hero --cinematic-island san-miguel \
                         --cinematic-gi --cinematic-res 2560x1072 \
                         --cinematic-samples 320 --cinematic-hdr
 
+# the wind in the leaves: a locked-off clip, because a still cannot show it
+cargo run --release -- --cinematic foliage --cinematic-gi \
+                        --cinematic-res 1280x536 --cinematic-samples 32
+
 # the lap, as released: 4K, 60 fps, HDR10
 cargo run --release -- --cinematic tour --cinematic-frames 1200 --cinematic-fps 60 \
                         --cinematic-res 3840x2160 --cinematic-hdr
@@ -482,6 +499,13 @@ interactive renderer can't, because that integrator is still-frames-only. And
 with no upscaler available headlessly, all antialiasing comes from
 accumulation, which for a still is better than what the window shows: converged
 ground truth with no reconstruction artefacts.
+
+The `foliage` preset is the one shot in the catalogue that *cannot* be a still,
+and it is the only one with a locked-off camera. Leaf sway is a per-frame
+displacement of real geometry, so a single frame of it is indistinguishable
+from the rest pose; and a moving camera would make it ambiguous, because
+parallax over a static tree looks much like sway under a static camera. So it
+reuses the `islands` framing verbatim and simply lets the clock run.
 
 ---
 

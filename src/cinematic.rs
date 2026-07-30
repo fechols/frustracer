@@ -53,7 +53,7 @@ use crate::world::World;
 /// (`--no-clouds`, `--heightfield`, …) which is read once at load, so a pair is
 /// two runs of the same preset with different flags — not one run of a special
 /// preset. That keeps the levers composable instead of duplicating each one.
-pub const PRESETS: &[&str] = &["hero", "tour", "islands", "orbit", "hud", "list"];
+pub const PRESETS: &[&str] = &["hero", "tour", "islands", "orbit", "foliage", "hud", "list"];
 
 /// Default output frames for a sequence: 30 s at 30 fps.
 pub const DEFAULT_FRAMES: u32 = 900;
@@ -63,6 +63,23 @@ pub const DEFAULT_FPS: u32 = 30;
 /// reading as noise at 30 fps.
 pub const DEFAULT_STILL_SAMPLES: u32 = 256;
 pub const DEFAULT_SEQ_SAMPLES: u32 = 32;
+
+/// The `foliage` preset's defaults: 4 s at 30 fps, on San Miguel's ficus.
+///
+/// It is the one shot in the catalogue whose SUBJECT IS MOTION, so it is the
+/// one that cannot be a still — leaf sway is a per-frame displacement of real
+/// geometry (`src/foliage.rs`), and a still can only ever show one pose of it,
+/// indistinguishable from the rest pose. Everything else in the media set is
+/// framed to hold still and converge; this one is framed to be watched.
+///
+/// The camera is LOCKED OFF, deliberately: a moving camera muddies the reading
+/// (parallax on a static tree looks much like sway on a static camera, which is
+/// exactly the ambiguity the shot exists to remove). A one-key `Shot` is how
+/// that is expressed — `pose_at` returns key 0 verbatim at every `u`, with its
+/// pinned hour, so no spline runs and the pose is bit-identical every frame
+/// while the sway/cloud/firefly clocks advance underneath it.
+pub const FOLIAGE_FRAMES: u32 = 120;
+pub const FOLIAGE_ISLAND: &str = "san-miguel";
 
 /// One authored camera key. Positions, not angles — see invariant 2.
 ///
@@ -727,7 +744,11 @@ pub fn print_catalogue() {
     eprintln!("  tour     THE LAP: closed-loop flight over every island; the");
     eprintln!("           time-of-day attractors sweep dawn -> moonlit night");
     eprintln!("  orbit    a closed orbit of one island (--cinematic-island) or the scene");
-    eprintln!("  hud      a still with the HUD composited (--cinematic-hud)");
+    eprintln!("  foliage  a LOCKED-OFF clip at an island's framing — the wind in the");
+    eprintln!("           leaves is the subject, so this is the one shot that cannot");
+    eprintln!("           be a still (--cinematic-island, default san-miguel)");
+    eprintln!("  hud      a hero still with the HUD composited (--cinematic-hud,");
+    eprintln!("           --cinematic-island — it is `hero` wearing a hat)");
     eprintln!("  list     print this and exit");
     eprintln!("  <path>   anything else is read as a JSON shot list");
 }
@@ -766,11 +787,14 @@ pub fn resolve_shots(
         s
     };
 
-    let mut shots = match sel {
-        // `--cinematic hero --cinematic-island bistro` frames that island with
-        // the same rig the `islands` series uses, so a hero shot is a member of
-        // the series rather than a one-off pose that has to be re-found by hand.
-        "hero" => match (world, &c.island) {
+    // `hero` as a function rather than a match arm, because `hud` IS a hero
+    // shot with the HUD forced on and used to be a SECOND, simpler expression
+    // of that — one that read `cam0` directly and so silently ignored
+    // `--cinematic-island`. `--cinematic hud --cinematic-island bistro` framed
+    // the boot overview instead, produced a plausible-looking screenshot of an
+    // empty plane, and nothing anywhere said no. One definition, two callers.
+    let hero_shot = |sel: &str| -> Result<Shot, String> {
+        Ok(match (world, &c.island) {
             (Some(w), Some(name)) => {
                 let all = island_shots(w, still_res, still_s);
                 let idx = w
@@ -784,7 +808,7 @@ pub fn resolve_shots(
                         )
                     })?;
                 let mut s = all.into_iter().nth(idx).expect("index in range");
-                s.name = "hero".to_string();
+                s.name = sel.to_string();
                 s.gi = gi_still;
                 // A hero shot SHOOTS INTO THE LIGHT. The series framing looks
                 // radially outward, which isolates a subject cleanly but points
@@ -834,12 +858,19 @@ pub fn resolve_shots(
                     let fov = s.keys[0].fov_deg;
                     s.keys[0] = Keyframe { fov_deg: fov, tod, ..Keyframe::new(e, target) };
                 }
-                vec![s]
+                s
             }
-            _ => vec![hero("hero")],
-        },
+            _ => hero(sel),
+        })
+    };
+
+    let mut shots = match sel {
+        // `--cinematic hero --cinematic-island bistro` frames that island with
+        // the same rig the `islands` series uses, so a hero shot is a member of
+        // the series rather than a one-off pose that has to be re-found by hand.
+        "hero" => vec![hero_shot("hero")?],
         "hud" => {
-            let mut s = hero("hud");
+            let mut s = hero_shot("hud")?;
             // The hud preset implies the HUD even without --cinematic-hud;
             // otherwise the preset name would be a lie.
             s.hud = Some(c.hud.clone().flatten());
@@ -900,6 +931,53 @@ pub fn resolve_shots(
                 _ => (scene_center, scene_radius),
             };
             vec![orbit_shot(center, radius, frames, c.fps, seq_res, seq_s)]
+        }
+        // A LOCKED-OFF sequence at an island's authored framing — see
+        // FOLIAGE_FRAMES for why this preset exists and why it does not move.
+        // It reuses `island_shots`' pose rather than authoring a second one, so
+        // the clip is literally the `islands` still with time running.
+        "foliage" => {
+            let frames = c.frames_or(FOLIAGE_FRAMES);
+            match world {
+                Some(w) if !w.islands.is_empty() => {
+                    let name = c.island.clone().unwrap_or_else(|| FOLIAGE_ISLAND.to_string());
+                    let idx = w
+                        .islands
+                        .iter()
+                        .position(|i| i.name.eq_ignore_ascii_case(&name))
+                        .ok_or_else(|| {
+                            format!(
+                                "unknown island '{name}' (have: {})",
+                                w.islands
+                                    .iter()
+                                    .map(|i| i.name.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )
+                        })?;
+                    // Sequence res/samples, not the stills': this pays its cost
+                    // once per output frame, 120 times over.
+                    let mut s = island_shots(w, seq_res, seq_s)
+                        .into_iter()
+                        .nth(idx)
+                        .expect("index in range");
+                    s.name = "foliage".to_string();
+                    s.kind = ShotKind::Sequence { frames, fps: c.fps };
+                    s.keys.truncate(1);
+                    vec![s]
+                }
+                _ => {
+                    eprintln!(
+                        "cinematic: 'foliage' needs the world (git lfs pull?) — \
+                         falling back to a locked-off clip of this scene"
+                    );
+                    let mut s = hero("foliage");
+                    s.kind = ShotKind::Sequence { frames, fps: c.fps };
+                    s.res = seq_res;
+                    s.samples = seq_s;
+                    vec![s]
+                }
+            }
         }
         other => return Err(format!("unknown preset '{other}'")),
     };
@@ -1171,6 +1249,115 @@ pub fn self_test() -> Result<(), String> {
         s.exposure = -1.0;
         if s.exposure_scale() != 0.5 {
             return Err("exposure -1 stop must scale by exactly 0.5".into());
+        }
+    }
+    // The `foliage` preset, whose two claims are both silently breakable.
+    {
+        // (a) Its default island must be CURATED *and* AUTHORED. A non-curated
+        // name errors loudly, but an un-authored one does not: the shot would
+        // fall through to the bounding-sphere fit and produce a 120-frame clip
+        // of a roof, where the leaves are a few pixels wide and the whole point
+        // of the preset is lost. Same silent-failure class as the table above.
+        if !crate::world::CURATED.iter().any(|s| s.name == FOLIAGE_ISLAND) {
+            return Err(format!("FOLIAGE_ISLAND '{FOLIAGE_ISLAND}' is not a CURATED island"));
+        }
+        if !ISLAND_FRAMING.iter().any(|f| f.0 == FOLIAGE_ISLAND) {
+            return Err(format!(
+                "FOLIAGE_ISLAND '{FOLIAGE_ISLAND}' has no ISLAND_FRAMING entry — the clip \
+                 would take the bounding-sphere fit and film a roof"
+            ));
+        }
+        // (b) LOCKED OFF. The preset expresses a static camera as a one-key
+        // Sequence, which is only a static camera because `pose_at` short-
+        // circuits at len 1; a future spline that interpolated a single key
+        // against itself would still be static, but one that clamped into a
+        // 4-point window would not. Pin the pose AND the pinned hour across u.
+        let key = Keyframe { tod: Some(15.5), ..Keyframe::new(Vec3A::new(3.0, 2.0, 1.0), Vec3A::X) };
+        let (c0, t0) = pose_at(std::slice::from_ref(&key), true, 0.0);
+        for u in [0.25, 0.5, 0.75, 1.0] {
+            let (c, t) = pose_at(std::slice::from_ref(&key), true, u);
+            if c != c0 || t != t0 {
+                return Err(format!("foliage: one-key pose moved at u={u} — camera not locked off"));
+            }
+        }
+        if t0 != Some(15.5) {
+            return Err("foliage: one-key pose dropped its pinned hour".into());
+        }
+    }
+    // `hud` and `foliage` must both honour --cinematic-island, because both are
+    // `hero` wearing a different hat. `hud` did NOT: it read the boot camera
+    // directly, so `--cinematic hud --cinematic-island bistro` rendered the
+    // overview pose — a perfectly plausible screenshot of the wrong thing, with
+    // no error anywhere. Pin all three against one synthetic world.
+    {
+        let w = World {
+            islands: vec![crate::world::Island {
+                name: "probe-a".into(),
+                center: Vec3A::new(10.0, 0.0, 0.0),
+                radius: 4.0,
+                height: 3.0,
+                theme_hour: 9.0,
+            }],
+            field_half: 30.0,
+        };
+        let c = CineOpts {
+            out: String::new(),
+            res: Some((64, 64)),
+            samples: Some(1),
+            frames: Some(2),
+            fps: 30,
+            gi: None,
+            overlay: false,
+            hud: None,
+            encode: false,
+            dry_run: true,
+            island: Some("probe-a".into()),
+            hdr: false,
+            paper_white: 200.0,
+            exposure: None,
+        };
+        let cam = Camera::look_at(Vec3A::ZERO, Vec3A::X, 1.0);
+        let key_of = |sel: &str| -> Result<Keyframe, String> {
+            let s = resolve_shots(sel, &c, Some(&w), cam, Vec3A::ZERO, 1.0)?;
+            let s = s.into_iter().next().ok_or_else(|| format!("{sel}: no shot"))?;
+            s.keys.first().copied().ok_or_else(|| format!("{sel}: no keys"))
+        };
+        let same = |a: &Keyframe, b: &Keyframe| a.eye == b.eye && a.target == b.target;
+        // `hud` IS `hero` — including the sunward relocation an un-authored
+        // island gets, which is why this compares against hero and not islands.
+        let hero_key = key_of("hero")?;
+        let hud_key = key_of("hud")?;
+        if !same(&hud_key, &hero_key) || hud_key.tod != hero_key.tod {
+            return Err(format!(
+                "preset 'hud' ignored --cinematic-island: eye {:?} vs hero's {:?}",
+                hud_key.eye, hero_key.eye
+            ));
+        }
+        // `foliage` is the ISLANDS framing with the clock running — deliberately
+        // NOT hero's, which re-places the eye to shoot into the sun and would
+        // discard the composition the clip is framed on.
+        let isl_key = *resolve_shots("islands", &c, Some(&w), cam, Vec3A::ZERO, 1.0)?[0]
+            .keys
+            .first()
+            .ok_or("islands: no keys")?;
+        let fol_key = key_of("foliage")?;
+        if !same(&fol_key, &isl_key) || fol_key.tod != isl_key.tod {
+            return Err(format!(
+                "preset 'foliage' is not the islands framing: eye {:?} vs {:?}",
+                fol_key.eye, isl_key.eye
+            ));
+        }
+        // Anti-vacuity: both comparisons must be able to fail. If the island
+        // pose coincided with the no-island fallback, a preset that ignored
+        // --cinematic-island entirely would still pass.
+        let mut c0 = c.clone();
+        c0.island = None;
+        let fb = *resolve_shots("hero", &c0, Some(&w), cam, Vec3A::ZERO, 1.0)?[0]
+            .keys
+            .first()
+            .ok_or("hero: no keys")?;
+        if same(&fb, &hero_key) || same(&fb, &isl_key) {
+            return Err("island framing coincides with the fallback pose — gate is vacuous".into());
         }
     }
     // The spline must agree with main.rs's copy at an arbitrary interior point.

@@ -45,7 +45,9 @@ xess_gbuf_*.png
 # downscaled results under docs/media/ are committed.
 /capture/
 /capture-preview/
+/capture-reshoot/
 /cap-test/
+/capture-*.log
 *.mp4
 *.webm
 *.mov
