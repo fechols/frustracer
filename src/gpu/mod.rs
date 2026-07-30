@@ -2122,7 +2122,7 @@ impl GpuContext {
         if self.quin_engines().0.len() > 1 {
             if let Some(rr) = &self.rr {
                 if self.sl.is_some() {
-                    self.wire_rr_feed(rr, rw, rh, &mut wire)?;
+                    Self::wire_rr_feed(rr, rw, rh, &mut wire)?;
                 }
             }
             // The sharing keys on the FLAVOR, not on the field. probe_native
@@ -2140,19 +2140,19 @@ impl GpuContext {
                     fsr_range_check(fs, rw, rh)?;
                     continue;
                 }
-                self.wire_fsr_feed(fs, rw, rh, &mut wire)?;
+                Self::wire_fsr_feed(fs, rw, rh, &mut wire)?;
             }
             if let Some(x) = &self.xess {
-                self.wire_xess_feed(x, rw, rh, &mut wire)?;
+                Self::wire_xess_feed(x, rw, rh, &mut wire)?;
             }
             return Ok(());
         }
         if let Some(rr) = &self.rr {
-            self.wire_rr_feed(rr, rw, rh, &mut wire)
+            Self::wire_rr_feed(rr, rw, rh, &mut wire)
         } else if let Some(x) = &self.xess {
-            self.wire_xess_feed(x, rw, rh, &mut wire)
+            Self::wire_xess_feed(x, rw, rh, &mut wire)
         } else if let Some(fs) = &self.fsr {
-            self.wire_fsr_feed(fs, rw, rh, &mut wire)
+            Self::wire_fsr_feed(fs, rw, rh, &mut wire)
         } else {
             Err("gbuf session with no live upscaler".into())
         }
@@ -2165,7 +2165,6 @@ impl GpuContext {
     /// engine at once — main.rs intersects the ranges, and these are what
     /// enforce it.)
     fn wire_rr_feed(
-        &self,
         rr: &rr::RrResources,
         rw: u32,
         rh: u32,
@@ -2196,7 +2195,6 @@ impl GpuContext {
     }
 
     fn wire_xess_feed(
-        &self,
         x: &XessState,
         rw: u32,
         rh: u32,
@@ -2223,7 +2221,6 @@ impl GpuContext {
     }
 
     fn wire_fsr_feed(
-        &self,
         fs: &FsrState,
         rw: u32,
         rh: u32,
@@ -2795,7 +2792,7 @@ impl GpuContext {
         }
         {
             let fs = self.fsr.as_ref().unwrap();
-            if let Err(e) = Self::record_fsr3_upscale(fs, &self.d3d, fc, frame_ms, None) {
+            if let Err(e) = Self::record_fsr3_upscale(fs, &self.d3d.list, fc, frame_ms, None) {
                 self.d3d.abort_frame();
                 return Err(e);
             }
@@ -2909,7 +2906,7 @@ impl GpuContext {
             let d3d = &mut self.d3d;
             let tg = self.trace.as_ref().unwrap();
             let x = self.xess.as_ref().unwrap();
-            if let Err(e) = Self::record_xess_eval(x, d3d, tg.rw, tg.rh, jitter, reset) {
+            if let Err(e) = Self::record_xess_eval(x, &d3d.list, tg.rw, tg.rh, jitter, reset) {
                 d3d.abort_frame();
                 return Err(e);
             }
@@ -2977,16 +2974,16 @@ impl GpuContext {
         for fs in [self.fsr.as_ref(), self.fsr3.as_ref()].into_iter().flatten() {
             match &fs.res {
                 FsrRes::Rr(_) => Self::record_fsr_rr_sequence(
-                    fs, &self.d3d, fc, prev_pos, frame_idx, frame_ms, sky_sh,
+                    fs, &self.d3d.list, fc, prev_pos, frame_idx, frame_ms, sky_sh,
                 )?,
                 FsrRes::Up(_) => {
-                    Self::record_fsr3_upscale(fs, &self.d3d, fc, frame_ms, shared.as_ref())?
+                    Self::record_fsr3_upscale(fs, &self.d3d.list, fc, frame_ms, shared.as_ref())?
                 }
             }
         }
         // XeSS.
         if let Some(x) = self.xess.as_ref() {
-            Self::record_xess_eval(x, &self.d3d, rw, rh, jitter, reset)?;
+            Self::record_xess_eval(x, &self.d3d.list, rw, rh, jitter, reset)?;
         }
         // The fuse: N engine outputs -> one image at SRV_SLOT_QUIN.
         self.quin.as_ref().ok_or("quinlight fuse not built")?.record(&self.d3d.list);
@@ -3124,7 +3121,7 @@ impl GpuContext {
         }
         {
             let fs = self.fsr.as_ref().unwrap();
-            if let Err(e) = Self::record_fsr3_upscale(fs, &self.d3d, fc, frame_ms, None) {
+            if let Err(e) = Self::record_fsr3_upscale(fs, &self.d3d.list, fc, frame_ms, None) {
                 self.d3d.abort_frame();
                 return Err(e);
             }
@@ -3555,7 +3552,7 @@ impl GpuContext {
         }
 
         if let Err(e) =
-            Self::record_fsr_rr_sequence(fs, &self.d3d, fc, prev_pos, frame_idx, frame_ms, sky_sh)
+            Self::record_fsr_rr_sequence(fs, &self.d3d.list, fc, prev_pos, frame_idx, frame_ms, sky_sh)
         {
             self.d3d.abort_frame();
             return Err(e);
@@ -3587,7 +3584,7 @@ impl GpuContext {
     #[allow(clippy::too_many_arguments)]
     fn record_fsr_rr_sequence(
         fs: &FsrState,
-        d3d: &D3d,
+        list: &ID3D12GraphicsCommandList,
         fc: &dlss::FrameConstants,
         prev_pos: Option<glam::Vec3A>,
         frame_idx: u32,
@@ -3606,10 +3603,10 @@ impl GpuContext {
         }
         // Ray Regeneration: signals in UAV state, one ffxDispatch with the
         // common desc + both signal descs chained (built in the shim).
-        res.barrier_denoise_begin(&d3d.list);
+        res.barrier_denoise_begin(list);
         let r = res.denoise_res();
         let dd_desc = ffx::FfxShimDenoiseDesc {
-            cmdlist: d3d.list.as_raw(),
+            cmdlist: list.as_raw(),
             // The dispatch's signal set must equal the context's creation set
             // (the ffx header's if-and-only-if rule) — one constant, both.
             signal_flags: ffx_sys::SIGNALS,
@@ -3652,20 +3649,20 @@ impl GpuContext {
             non_gamma_albedo: 0, // albedos are sqrt-encoded (fsr.rs wire)
         };
         {
-            let _ev = pix::scope(&d3d.list, c"fsr-denoise");
+            let _ev = pix::scope(list, c"fsr-denoise");
             fs.ctx.denoise(&dd_desc)?;
         }
-        res.barrier_denoise_end(&d3d.list);
+        res.barrier_denoise_end(list);
 
         // Remodulate (binds from scratch — the post-ffx state restore).
-        res.record_composite(&d3d.list, rw, rh, sky_sh);
+        res.record_composite(list, rw, rh, sky_sh);
 
         // FSR4 upscale: composite -> window-res output. The shared MV plane
         // holds UV-deltas here, so the scale multiplies the render dims back
         // in to hand FSR pixel-space MVs (polarity knob: fsr::UPSCALE_MV_SIGN).
-        res.barrier_upscale_begin(&d3d.list);
+        res.barrier_upscale_begin(list);
         let up_desc = Self::fsr_upscale_desc(
-            d3d.list.as_raw(),
+            list.as_raw(),
             res.upscale_res(),
             fc,
             fs.max,
@@ -3676,10 +3673,10 @@ impl GpuContext {
             ],
         );
         {
-            let _ev = pix::scope(&d3d.list, c"fsr-upscale");
+            let _ev = pix::scope(list, c"fsr-upscale");
             fs.ctx.upscale(&up_desc)?;
         }
-        res.barrier_upscale_end(&d3d.list);
+        res.barrier_upscale_end(list);
         Ok(())
     }
 
@@ -3723,7 +3720,7 @@ impl GpuContext {
         {
             let fs = self.fsr.as_ref().unwrap();
             if let Err(e) =
-                Self::record_fsr_rr_sequence(fs, &self.d3d, fc, prev_pos, frame_idx, frame_ms, sky_sh)
+                Self::record_fsr_rr_sequence(fs, &self.d3d.list, fc, prev_pos, frame_idx, frame_ms, sky_sh)
             {
                 self.d3d.abort_frame();
                 return Err(e);
@@ -3779,7 +3776,7 @@ impl GpuContext {
         {
             let fs = self.fsr.as_ref().unwrap();
             if let Err(e) =
-                Self::record_fsr_rr_sequence(fs, &self.d3d, fc, prev_pos, frame_idx, frame_ms, sky_sh)
+                Self::record_fsr_rr_sequence(fs, &self.d3d.list, fc, prev_pos, frame_idx, frame_ms, sky_sh)
             {
                 self.d3d.abort_frame();
                 return Err(e);
@@ -3883,7 +3880,7 @@ impl GpuContext {
             return Err(e);
         }
 
-        if let Err(e) = Self::record_fsr3_upscale(fs, &self.d3d, fc, frame_ms, None) {
+        if let Err(e) = Self::record_fsr3_upscale(fs, &self.d3d.list, fc, frame_ms, None) {
             self.d3d.abort_frame();
             return Err(e);
         }
@@ -3911,7 +3908,7 @@ impl GpuContext {
     /// this context's own planes, the single-engine path.
     fn record_fsr3_upscale(
         fs: &FsrState,
-        d3d: &D3d,
+        list: &ID3D12GraphicsCommandList,
         fc: &dlss::FrameConstants,
         frame_ms: f32,
         src: Option<&[(&ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT); 3]>,
@@ -3926,9 +3923,9 @@ impl GpuContext {
                 rw, rh, fs.min.0, fs.min.1, fs.max.0, fs.max.1
             ));
         }
-        res.barrier_upscale_begin(&d3d.list);
+        res.barrier_upscale_begin(list);
         let up_desc = Self::fsr_upscale_desc(
-            d3d.list.as_raw(),
+            list.as_raw(),
             match src {
                 Some(p) => res.upscale_res_shared(p),
                 None => res.upscale_res(),
@@ -3939,10 +3936,10 @@ impl GpuContext {
             [crate::fsr::UPSCALE_MV_SIGN.0, crate::fsr::UPSCALE_MV_SIGN.1],
         );
         {
-            let _ev = pix::scope(&d3d.list, c"fsr-upscale");
+            let _ev = pix::scope(list, c"fsr-upscale");
             fs.ctx.upscale(&up_desc)?;
         }
-        res.barrier_upscale_end(&d3d.list);
+        res.barrier_upscale_end(list);
         Ok(())
     }
 
@@ -3955,14 +3952,14 @@ impl GpuContext {
     /// fuse both expect their inputs).
     fn record_xess_eval(
         x: &XessState,
-        d3d: &D3d,
+        list: &ID3D12GraphicsCommandList,
         rw: u32,
         rh: u32,
         jitter: (f32, f32),
         reset: bool,
     ) -> Result<()> {
         unsafe {
-            d3d.list.ResourceBarrier(&[transition(
+            list.ResourceBarrier(&[transition(
                 &x.res.output,
                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -3992,11 +3989,11 @@ impl GpuContext {
             descriptor_heap_offset: 0,
         };
         {
-            let _ev = pix::scope(&d3d.list, c"xess-eval");
-            x.ctx.execute(d3d.list.as_raw(), &params)?;
+            let _ev = pix::scope(list, c"xess-eval");
+            x.ctx.execute(list.as_raw(), &params)?;
         }
         unsafe {
-            d3d.list.ResourceBarrier(&[transition(
+            list.ResourceBarrier(&[transition(
                 &x.res.output,
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
@@ -5646,5 +5643,224 @@ fn shim_options(fc: &dlss::FrameConstants, ow: u32, oh: u32) -> streamline::SlSh
         use_camera_matrices: 1,
         world_to_view: row_major(&fc.world_to_view),
         view_to_world: row_major(&fc.view_to_world),
+    }
+}
+
+/// A headless upscaler session for the cinematic capture mode: ONE chain
+/// level's SDK context + resource set at 100% render scale (render res ==
+/// output res — DLAA-grade reconstruction), hosted on a `HeadlessGpu` instead
+/// of a swapchain. The engine states and eval middles are the interactive
+/// session's own (`probe_native`, `record_xess_eval`, `record_fsr3_upscale`,
+/// `record_fsr_rr_sequence`, `rr_sl_sequence`), so the two paths cannot
+/// drift; what this type adds is only the narrow driver API — probe, wire,
+/// per-sub-frame eval, and a linear-f32 readback of the reconstructed output.
+///
+/// Drop discipline: drop this BEFORE the `HeadlessGpu` (locals in reverse
+/// declaration order do it naturally) — the XeSS/ffx context destructors need
+/// a live device, and every harness submit already blocked, so "completed
+/// command lists" holds by construction.
+pub struct CineUp {
+    rr: Option<rr::RrResources>,
+    xess: Option<XessState>,
+    fsr: Option<FsrState>,
+    /// Which chain level won: "dlss-rr" | "fsr4-rr" | "xess" | "fsr3".
+    pub name: &'static str,
+    ow: u32,
+    oh: u32,
+    readback: Option<d3d12::ReadbackBuffer>,
+}
+
+impl CineUp {
+    /// Probe the chain (DLSS-RR -> FSR4-RR -> XeSS -> FSR3, honoring
+    /// `opts.chain`) for an output size, at 100% render scale. `sl` is the
+    /// harness's Streamline context (`HeadlessGpu::new_sl`) — Some means the
+    /// DLSS level already passed its adapter + RR-support probes, so it wins
+    /// the chain. None = chain exhausted (the caller falls back to
+    /// accumulation, loudly).
+    pub fn probe(
+        device: &ID3D12Device,
+        sl: Option<&streamline::SlContext>,
+        opts: &GpuOptions,
+        w: u32,
+        h: u32,
+    ) -> Option<CineUp> {
+        let up = |rr, xess, fsr, name| CineUp {
+            rr,
+            xess,
+            fsr,
+            name,
+            ow: w,
+            oh: h,
+            readback: None,
+        };
+        if sl.is_some() {
+            // DLAA by construction: planes at the output size, opt == min ==
+            // max == output — the degenerate range `shim_options` reads as
+            // DLSS_MODE_DLAA. No optimal-settings query: native is the point.
+            match rr::RrResources::new(device, (w, h), (w, h), (w, h), w, h) {
+                Ok(r) => {
+                    return Some(up(Some(r), None, None, "dlss-rr"));
+                }
+                Err(e) => eprintln!(
+                    "dlss: RR resource allocation failed ({e}) — falling through the chain"
+                ),
+            }
+        }
+        // First-hit-wins over the native levels, exactly the interactive
+        // probe: `fsr` holds FSR4-RR where the RDNA4 provider exists, else
+        // XeSS came up, else `fsr` holds the FSR 3.1 flavor (quin is off, so
+        // the states are mutually exclusive and `fsr3` stays None).
+        let (xess, fsr, _fsr3) = GpuContext::probe_native(device, opts, w, h, false);
+        if let Some(fs) = fsr {
+            let name = match fs.res {
+                FsrRes::Rr(_) => "fsr4-rr",
+                FsrRes::Up(_) => "fsr3",
+            };
+            return Some(up(None, None, Some(fs), name));
+        }
+        if let Some(x) = xess {
+            return Some(up(None, Some(x), None, "xess"));
+        }
+        None
+    }
+
+    /// Wire this engine's input planes as a tracer's feed targets (`wire` =
+    /// `TraceGpu::wire_feed` / `DxrGpu::wire_feed`). The per-engine helpers
+    /// re-check the trace res against the SDK range, so a 100% res an engine
+    /// cannot host fails loudly here — the caller falls back to accumulation.
+    pub fn wire(
+        &self,
+        rw: u32,
+        rh: u32,
+        mut wire: impl FnMut(
+            trace::FeedKind,
+            &[(u32, &ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT)],
+        ) -> Result<()>,
+    ) -> Result<()> {
+        if let Some(rr) = &self.rr {
+            GpuContext::wire_rr_feed(rr, rw, rh, &mut wire)
+        } else if let Some(x) = &self.xess {
+            GpuContext::wire_xess_feed(x, rw, rh, &mut wire)
+        } else if let Some(fs) = &self.fsr {
+            GpuContext::wire_fsr_feed(fs, rw, rh, &mut wire)
+        } else {
+            Err("cinematic upscaler with no engine".into())
+        }
+    }
+
+    /// Record this engine's evaluate on the harness's list — the exact middle
+    /// the present arms record, minus the swapchain around it. Call AFTER the
+    /// frame's `record_feed` on the same list.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_eval(
+        &self,
+        sl: Option<&streamline::SlContext>,
+        list: &ID3D12GraphicsCommandList,
+        fc: &dlss::FrameConstants,
+        jitter: (f32, f32),
+        reset: bool,
+        frame_idx: u32,
+        frame_ms: f32,
+        prev_pos: Option<glam::Vec3A>,
+        sky_sh: &crate::sh::Sh9,
+    ) -> Result<()> {
+        if let Some(rr) = &self.rr {
+            let sl = sl.ok_or("DLSS-RR engine without a Streamline harness")?;
+            unsafe {
+                list.ResourceBarrier(&[transition(
+                    &rr.output,
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+            }
+            rr_sl_sequence(sl, rr, list, fc, frame_idx, false)?;
+            unsafe {
+                list.ResourceBarrier(&[transition(
+                    &rr.output,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                )]);
+            }
+            Ok(())
+        } else if let Some(x) = &self.xess {
+            GpuContext::record_xess_eval(x, list, fc.rw as u32, fc.rh as u32, jitter, reset)
+        } else if let Some(fs) = &self.fsr {
+            match &fs.res {
+                FsrRes::Rr(_) => GpuContext::record_fsr_rr_sequence(
+                    fs, list, fc, prev_pos, frame_idx, frame_ms, sky_sh,
+                ),
+                FsrRes::Up(_) => GpuContext::record_fsr3_upscale(fs, list, fc, frame_ms, None),
+            }
+        } else {
+            Err("cinematic upscaler with no engine".into())
+        }
+    }
+
+    /// Read the reconstructed output back as linear-RGB f32 triples — the
+    /// cinematic writer's contract (`cine_write_frame` owns the ONE tone
+    /// curve, so this must hand it linear light; `read_hdr_output` would
+    /// SDR-tonemap on the way out). Runs once per OUTPUT frame; the readback
+    /// buffer is persistent, allocated on first use.
+    pub fn read_output(&mut self, hg: &mut trace::HeadlessGpu, out: &mut [f32]) -> Result<()> {
+        let (w, h) = (self.ow as usize, self.oh as usize);
+        assert_eq!(out.len(), w * h * 3);
+        let pitch = d3d12::aligned_pitch(w * 8);
+        if self.readback.is_none() {
+            self.readback = Some(d3d12::ReadbackBuffer::new(&hg.device, pitch * h)?);
+        }
+        let rb = self.readback.as_ref().unwrap();
+        let output = if let Some(rr) = &self.rr {
+            &rr.output
+        } else if let Some(x) = &self.xess {
+            &x.res.output
+        } else if let Some(fs) = &self.fsr {
+            fs.res.upscaled()
+        } else {
+            return Err("cinematic upscaler with no engine".into());
+        };
+        let fp = d3d12::footprint(
+            windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+            self.ow,
+            self.oh,
+            8,
+            0,
+        );
+        hg.run(|list| unsafe {
+            list.ResourceBarrier(&[transition(
+                output,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            list.CopyTextureRegion(
+                &d3d12::loc_footprint(&rb.resource, fp),
+                0,
+                0,
+                0,
+                &d3d12::loc_subresource(output),
+                None,
+            );
+            list.ResourceBarrier(&[transition(
+                output,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            )]);
+        })?;
+        let mut ptr = std::ptr::null_mut();
+        unsafe { rb.resource.Map(0, None, Some(&mut ptr)) }
+            .map_err(|e| format!("readback Map: {e}"))?;
+        let base = ptr as usize; // usize crosses the rayon closure; rows are disjoint
+        use rayon::prelude::*;
+        out.par_chunks_mut(w * 3).enumerate().for_each(|(y, row)| {
+            let src: &[[half::f16; 4]] = unsafe {
+                std::slice::from_raw_parts((base as *const u8).add(y * pitch) as *const _, w)
+            };
+            for (x, px) in src.iter().enumerate() {
+                row[x * 3] = f32::from(px[0]);
+                row[x * 3 + 1] = f32::from(px[1]);
+                row[x * 3 + 2] = f32::from(px[2]);
+            }
+        });
+        unsafe { rb.resource.Unmap(0, None) };
+        Ok(())
     }
 }

@@ -8556,8 +8556,10 @@ fn cine_frame_state(
 }
 
 /// The quality a capture renders at. Preset 3 (4 shadow / 4 AO / reflections),
-/// NOT `upscaler_1spp`: that preset exists to hand frame-stationary noise to a
-/// temporal denoiser, and no denoiser can run headlessly.
+/// NOT `upscaler_1spp`: that preset exists to keep interactive upscaler frames
+/// cheap, and a capture wants maximum-quality input — cleaner frames only help
+/// the reconstruction (the default GPU path runs the chain's model headlessly
+/// via `gpu::CineUp`; accumulation arms integrate the same preset directly).
 fn cine_quality(shot: &cinematic::Shot) -> Quality {
     let mut q = Quality::preset(3);
     if shot.gi {
@@ -8841,9 +8843,84 @@ fn cine_finish(dir: &str, shot: &cinematic::Shot, t0: Instant) {
     }
 }
 
+/// One enum instead of two copies of every capture loop below: the two GPU
+/// tracers share the FrameParams contract but not a trait
+/// (`DxrGpu::record_frame` is fallible — it casts to
+/// ID3D12GraphicsCommandList4).
+#[cfg(windows)]
+enum CineArm {
+    Wave(gpu::trace::TraceGpu),
+    Dxr(gpu::dxr::DxrGpu),
+}
+
+/// The sky rows live in the tracer's constant buffer, so a moved hour has to
+/// be pushed before the frame's first `write_cb`. ONE definition for both
+/// capture arms (reconstructed and accumulation) so the TOD contract cannot
+/// drift between them.
+#[cfg(windows)]
+fn cine_push_sky(arm: &mut CineArm, scene: &scene::Scene, fs: &CineFrame, prev_hour: Option<f32>) {
+    if fs.hour.is_some() && prev_hour.is_some() {
+        match arm {
+            CineArm::Wave(tg) => tg.refresh_sky(scene),
+            CineArm::Dxr(dg) => dg.refresh_sky(scene),
+        }
+    }
+}
+
+/// The per-output-frame tail both capture arms share: the overlay's `info`
+/// readback (paid only when the shot draws it), the ONE write path
+/// (`cine_write_frame` owns the tone curve), and the progress line.
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn cine_emit_frame(
+    hg: &mut gpu::trace::HeadlessGpu,
+    arm: &CineArm,
+    dir: &str,
+    shot: &cinematic::Shot,
+    cine: &cinematic::CineOpts,
+    f: u32,
+    frames: u32,
+    hdr: &[f32],
+    info: &[AtomicU32],
+    present: &mut [u32],
+    fs: &CineFrame,
+    rw: usize,
+    rh: usize,
+    use_wave: bool,
+    t_shot: Instant,
+) -> Result<(), String> {
+    if shot.overlay {
+        let ua = windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        let info_res = match arm {
+            CineArm::Wave(tg) => &tg.info,
+            CineArm::Dxr(dg) => &dg.info,
+        };
+        let ib = hg.read_buffer(info_res, ua, rw * rh * 4)?;
+        for (dst, c) in info.iter().zip(ib.chunks_exact(4)) {
+            dst.store(u32::from_le_bytes(c.try_into().unwrap()), Relaxed);
+        }
+    }
+    cine_write_frame(
+        dir,
+        shot,
+        cine,
+        f,
+        hdr,
+        info,
+        present,
+        fs,
+        rw,
+        rh,
+        if use_wave { "GPU" } else { "DXR" },
+    );
+    cine_progress(shot, f, frames, t_shot, fs.hour);
+    Ok(())
+}
+
 /// The GPU arms of `--cinematic`: the `run_spin_gpu` skeleton (HeadlessGpu +
-/// one shared `SceneGpu` + either tracer), with the accumulate-N-sub-frames
-/// contract and ONE readback per OUTPUT frame.
+/// one shared `SceneGpu` + either tracer), with the per-shot capture loops
+/// (reconstructed through the wired upscaler by default, accumulation on the
+/// fallback arms) and ONE readback per OUTPUT frame.
 ///
 /// Returns `Err` only for setup failures the caller can degrade from (no DXC,
 /// no device, scene upload) — a per-frame failure is fatal and returns `Ok(1)`.
@@ -8890,10 +8967,44 @@ fn run_cinematic_gpu(
     }
 
     let dxc = gpu::dxc::Dxc::load(&opts.dxc_path).map_err(|e| e.to_string())?;
-    let mut hg = gpu::trace::HeadlessGpu::new(
+    // The upscaler chain, headless (the DEFAULT capture pipeline): probe
+    // DLSS-RR -> FSR4-RR -> XeSS -> FSR3 at 100% render scale and capture the
+    // RECONSTRUCTED output, with the temporal model as the integrator.
+    // `--no-upscale` (the empty chain) and the per-level flags steer it
+    // exactly as they steer a window session; chain exhausted = the
+    // accumulation loop, loudly. DLSS needs Streamline initialized BEFORE the
+    // DXGI factory and a queue created through the SL proxy device — the
+    // `new_sl` harness flavor. Tuple order is drop order: `hg` (and the proxy
+    // queue) release before `sl` runs slShutdown.
+    let up_wanted = opts.chain != upchain::UpChain::NONE;
+    let (sl, mut hg) = gpu::trace::HeadlessGpu::new_sl(
         opts.gpu_debug,
         opts.prefer.unwrap_or(gpu::adapter::Prefer::Nvidia),
+        (up_wanted && opts.chain.dlss).then_some(opts.sl_path.as_str()),
     )?;
+    // The native-level probe wants the interactive session's options shape;
+    // everything swapchain-adjacent (vsync/hdr/fg/quin) is off — headless.
+    let gopts = gpu::GpuOptions {
+        chain: opts.chain,
+        sl_dir: opts.sl_path.clone(),
+        xess_dir: opts.xess_path.clone(),
+        xess_autoexposure: opts.xess_autoexposure,
+        ffx_dir: opts.ffx_path.clone(),
+        fg: false,
+        fg_explicit: false,
+        fg_dir: String::new(),
+        fsr_tune: opts.fsr_tune,
+        prefer: opts.prefer,
+        debug: opts.gpu_debug,
+        vsync: false,
+        hdr: false,
+        hdr10: false,
+        scrgb: false,
+        paper_white: 200.0,
+        peak_nits: None,
+        quin: false,
+        quin_anchor: None,
+    };
     let dev = hg.device.clone();
     let core = Rc::new(gpu::trace::SceneGpu::new_uploaded(&dev, scene, bvh, &mut hg, opts.bc7)?);
     eprintln!(
@@ -8902,49 +9013,88 @@ fn run_cinematic_gpu(
         hg.adapter_name
     );
 
-    enum Arm {
-        Wave(gpu::trace::TraceGpu),
-        Dxr(gpu::dxr::DxrGpu),
-    }
     // Kernel/RTPSO compilation is per resolution, so cache the arm and rebuild
     // only when a shot changes it (the `islands` preset is 7 shots at one res).
-    let mut built: Option<((usize, usize), Arm)> = None;
+    // The upscaler session rides the same cache — its contexts and planes are
+    // output-size-bound too. None = accumulation for shots at that res.
+    let mut built: Option<((usize, usize), CineArm, Option<gpu::CineUp>)> = None;
 
     for shot in shots {
         let (rw, rh) = shot.res;
-        if built.as_ref().map(|(r, _)| *r) != Some((rw, rh)) {
+        if built.as_ref().map(|(r, _, _)| *r) != Some((rw, rh)) {
             // Free the old tracer's window-sized buffers BEFORE allocating the
             // new ones — at 4K the two sets together are a real VRAM spike.
             drop(built.take());
-            let a = if use_wave {
-                Arm::Wave(gpu::trace::TraceGpu::new(
-                    &dev,
-                    &dxc,
-                    scene,
-                    bvh,
-                    core.clone(),
-                    rw as u32,
-                    rh as u32,
-                    false, // no G-buffer pack: nothing headless consumes one
-                    false, // no NPPD stage
-                    opts.gpu_debug,
-                    &mut hg,
-                )?)
+            // Probe the chain for THIS output size, at 100% (render == output
+            // — DLAA-grade). A failed probe/wiring is a loud line + the
+            // accumulation loop, never fatal.
+            let mut up = if up_wanted {
+                gpu::CineUp::probe(&dev, sl.as_ref(), &gopts, rw as u32, rh as u32)
             } else {
-                Arm::Dxr(gpu::dxr::DxrGpu::new(
-                    &dev,
-                    &dxc,
-                    scene,
-                    core.clone(),
-                    rw as u32,
-                    rh as u32,
-                    false,
-                    opts.gpu_debug,
-                )?)
+                None
             };
-            built = Some(((rw, rh), a));
+            // The upscaler consumes the G-buffer pack + feed kernels, so the
+            // tracer arms them only when a level actually came up — and is
+            // REBUILT plain if the wiring then fails below, so the fallback's
+            // accumulation frames never store a pack nothing reads.
+            let build = |gbuf: bool, hg: &mut gpu::trace::HeadlessGpu| -> Result<CineArm, String> {
+                Ok(if use_wave {
+                    CineArm::Wave(gpu::trace::TraceGpu::new(
+                        &dev,
+                        &dxc,
+                        scene,
+                        bvh,
+                        core.clone(),
+                        rw as u32,
+                        rh as u32,
+                        gbuf,
+                        false, // no NPPD stage
+                        opts.gpu_debug,
+                        hg,
+                    )?)
+                } else {
+                    CineArm::Dxr(gpu::dxr::DxrGpu::new(
+                        &dev,
+                        &dxc,
+                        scene,
+                        core.clone(),
+                        rw as u32,
+                        rh as u32,
+                        gbuf,
+                        opts.gpu_debug,
+                    )?)
+                })
+            };
+            let mut a = build(up.is_some(), &mut hg)?;
+            if let Some(u) = &up {
+                let wired = match &mut a {
+                    CineArm::Wave(tg) => {
+                        u.wire(rw as u32, rh as u32, |k, t| tg.wire_feed(&dev, k, t))
+                    }
+                    CineArm::Dxr(dg) => {
+                        u.wire(rw as u32, rh as u32, |k, t| dg.wire_feed(&dev, k, t))
+                    }
+                };
+                match wired {
+                    Ok(()) => eprintln!(
+                        "cinematic: {} reconstruction at 100% (DLAA-grade), {}x{}",
+                        u.name, rw, rh
+                    ),
+                    Err(e) => {
+                        eprintln!(
+                            "cinematic: {} feed wiring failed ({e}) — accumulation fallback",
+                            u.name
+                        );
+                        up = None;
+                        a = build(false, &mut hg)?;
+                    }
+                }
+            } else if up_wanted {
+                eprintln!("cinematic: no upscaler level came up — accumulation fallback");
+            }
+            built = Some(((rw, rh), a, up));
         }
-        let armv = &mut built.as_mut().expect("just built").1;
+        let (_, armv, upv) = built.as_mut().expect("just built");
 
         let dir = match cine_prepare_dir(cine, shot) {
             Ok(d) => d,
@@ -8958,94 +9108,210 @@ fn run_cinematic_gpu(
         let mut present = vec![0u32; rw * rh];
         // resolve_hdr consults `info` only when the overlay is on; a zeroed
         // buffer stands in otherwise so no readback is paid for nothing.
-        let mut info: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
+        let info: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
         let mut prev_hour: Option<f32> = None;
         let t_shot = Instant::now();
 
-        for f in 0..frames {
-            let fs = cine_frame_state(scene, shot, attractors, cine, f, &mut prev_hour);
-            // The sky rows live in the tracer's constant buffer, so a moved
-            // hour has to be pushed before this frame's first write_cb.
-            if fs.hour.is_some() && prev_hour.is_some() {
-                match armv {
-                    Arm::Wave(tg) => tg.refresh_sky(scene),
-                    Arm::Dxr(dg) => dg.refresh_sky(scene),
-                }
+        // GI shots integrate the hemisphere — the still-frame accumulation
+        // machinery, structurally incompatible with the fresh-1-spp upscaler
+        // contract — so they keep the accumulation loop per shot. That
+        // preserves cinematic's unique moving-camera-with-GI capability
+        // alongside the reconstruction default.
+        let up: Option<&mut gpu::CineUp> = if shot.gi {
+            if let Some(u) = upv.as_ref() {
+                eprintln!(
+                    "cinematic: \"{}\" is a GI shot — hemisphere bounces need the \
+                     accumulation path ({} skipped for this shot)",
+                    shot.name, u.name
+                );
             }
-            let basis = fs.cam.basis(rw, rh);
-            for k in 0..shot.samples {
-                let p = gpu::trace::FrameParams {
-                    cam: basis,
-                    frame: k,
-                    accumulate: true,
-                    jitter: k > 0,
-                    frame_jitter: None,
-                    prev_cam: None,
-                    q,
-                    verify: false,
-                    spp: opts.spp,
-                    probe_sample: 0,
-                    clouds: fs.clouds,
-                    fireflies: fs.fireflies,
-                    // Foliage-sway (v0.2): ONE pose per output frame — the
-                    // same clock the CPU arm baked, so both arms capture the
-                    // identical gust; sub-frames share it (the ring rebuild
-                    // is a bit-equal skip after the first).
-                    sway_time: Some(fs.sway_time),
-                    // Structure replay across the sub-frames of one output
-                    // frame: the pose is bit-identical, so k > 0 re-dispatches
-                    // the persisted terminal queues and skips the whole level
-                    // ladder. `--check-gpu` gates this exact configuration
-                    // (accum bit-identity, replay vs trace, at a warm frame).
-                    // DXR has no quadtree to persist.
-                    replay: opts.replay && use_wave,
-                };
-                let r = match armv {
-                    Arm::Wave(tg) => {
-                        tg.write_cb(0, &p);
-                        hg.run(|l| tg.record_frame(l, 0, &p, true))
+            None
+        } else {
+            upv.as_mut()
+        };
+
+        if let Some(u) = up {
+            // === Reconstructed capture (the default): every sub-frame is a
+            // fresh jittered 1-spp-contract frame with real MVs, fed through
+            // the wired engine; the output frame is the engine's RECONSTRUCTED
+            // image after `shot.samples` warm/converge passes. `seq` free-runs
+            // across the whole shot so the Halton phase never restarts and the
+            // temporal history carries across output frames (a spline step is
+            // ordinary camera motion to the model); reset fires once per shot.
+            let (near, far) = dlss::near_far(scene.diag);
+            let frame_ms = 1000.0 / shot.kind.fps().max(1) as f32;
+            let mut hdr = vec![0f32; rw * rh * 3];
+            let mut seq: u32 = 0;
+            let mut prev_cam: Option<Camera> = None;
+            for f in 0..frames {
+                let fs = cine_frame_state(scene, shot, attractors, cine, f, &mut prev_hour);
+                cine_push_sky(armv, scene, &fs, prev_hour);
+                let basis = fs.cam.basis(rw, rh);
+                for _k in 0..shot.samples {
+                    let jit = dlss::jitter_for(seq);
+                    let reset = seq == 0;
+                    let p = gpu::trace::FrameParams {
+                        cam: basis,
+                        frame: seq,
+                        accumulate: false,
+                        jitter: false,
+                        frame_jitter: Some(jit),
+                        // Static within an output frame, the spline step at
+                        // frame boundaries — real MVs either way, and the ONE
+                        // pose feeds both the shader MVs and fc's prev
+                        // matrices (the interactive contract).
+                        prev_cam: prev_cam.map(|c| c.basis(rw, rh)),
+                        q,
+                        verify: false,
+                        spp: opts.spp,
+                        probe_sample: 0,
+                        clouds: fs.clouds,
+                        fireflies: fs.fireflies,
+                        sway_time: Some(fs.sway_time),
+                        // The pose is bit-identical across one output frame's
+                        // sub-frames, so structure replay still deletes the
+                        // level ladder for sub-frames 1..N-1.
+                        replay: opts.replay && use_wave,
+                    };
+                    let mats = dlss::cam_matrices(&fs.cam, rw, rh, near, far);
+                    let prev_mats =
+                        prev_cam.map(|c| dlss::cam_matrices(&c, rw, rh, near, far));
+                    let fc = dlss::frame_constants(
+                        &fs.cam,
+                        &mats,
+                        prev_mats.as_ref(),
+                        jit,
+                        reset,
+                        near,
+                        far,
+                        rw,
+                        rh,
+                    );
+                    let prev_pos = prev_cam.map(|c| c.pos);
+                    let r = match armv {
+                        CineArm::Wave(tg) => {
+                            tg.write_cb(0, &p);
+                            let mut rec = Ok(());
+                            hg.run(|l| {
+                                tg.record_frame(l, 0, &p, true);
+                                rec = tg.record_feed(l, 0, false).and_then(|()| {
+                                    u.record_eval(
+                                        sl.as_ref(),
+                                        l,
+                                        &fc,
+                                        jit,
+                                        reset,
+                                        seq,
+                                        frame_ms,
+                                        prev_pos,
+                                        &scene.sky_sh,
+                                    )
+                                });
+                            })
+                            .and(rec)
+                        }
+                        CineArm::Dxr(dg) => {
+                            dg.write_cb(0, &p);
+                            let mut rec = Ok(());
+                            hg.run(|l| {
+                                rec = dg
+                                    .record_frame(l, 0)
+                                    .and_then(|()| dg.record_feed(l, 0))
+                                    .and_then(|()| {
+                                        u.record_eval(
+                                            sl.as_ref(),
+                                            l,
+                                            &fc,
+                                            jit,
+                                            reset,
+                                            seq,
+                                            frame_ms,
+                                            prev_pos,
+                                            &scene.sky_sh,
+                                        )
+                                    });
+                            })
+                            .and(rec)
+                        }
+                    };
+                    if let Err(e) = r {
+                        eprintln!("cinematic: frame {f} sub-frame {seq} failed: {e}");
+                        return Ok(1);
                     }
-                    Arm::Dxr(dg) => {
-                        dg.write_cb(0, &p);
-                        let mut rec = Ok(());
-                        hg.run(|l| rec = dg.record_frame(l, 0)).and(rec)
+                    prev_cam = Some(fs.cam);
+                    seq = seq.wrapping_add(1);
+                }
+                // The frame the file gets is the ENGINE's output, linear f32 —
+                // cine_write_frame keeps owning the one tone curve.
+                u.read_output(&mut hg, &mut hdr)?;
+                cine_emit_frame(
+                    &mut hg, armv, &dir, shot, cine, f, frames, &hdr, &info,
+                    &mut present, &fs, rw, rh, use_wave, t_shot,
+                )?;
+            }
+        } else {
+            for f in 0..frames {
+                let fs = cine_frame_state(scene, shot, attractors, cine, f, &mut prev_hour);
+                cine_push_sky(armv, scene, &fs, prev_hour);
+                let basis = fs.cam.basis(rw, rh);
+                for k in 0..shot.samples {
+                    let p = gpu::trace::FrameParams {
+                        cam: basis,
+                        frame: k,
+                        accumulate: true,
+                        jitter: k > 0,
+                        frame_jitter: None,
+                        prev_cam: None,
+                        q,
+                        verify: false,
+                        spp: opts.spp,
+                        probe_sample: 0,
+                        clouds: fs.clouds,
+                        fireflies: fs.fireflies,
+                        // Foliage-sway (v0.2): ONE pose per output frame — the
+                        // same clock the CPU arm baked, so both arms capture the
+                        // identical gust; sub-frames share it (the ring rebuild
+                        // is a bit-equal skip after the first).
+                        sway_time: Some(fs.sway_time),
+                        // Structure replay across the sub-frames of one output
+                        // frame: the pose is bit-identical, so k > 0 re-dispatches
+                        // the persisted terminal queues and skips the whole level
+                        // ladder. `--check-gpu` gates this exact configuration
+                        // (accum bit-identity, replay vs trace, at a warm frame).
+                        // DXR has no quadtree to persist.
+                        replay: opts.replay && use_wave,
+                    };
+                    let r = match armv {
+                        CineArm::Wave(tg) => {
+                            tg.write_cb(0, &p);
+                            hg.run(|l| tg.record_frame(l, 0, &p, true))
+                        }
+                        CineArm::Dxr(dg) => {
+                            dg.write_cb(0, &p);
+                            let mut rec = Ok(());
+                            hg.run(|l| rec = dg.record_frame(l, 0)).and(rec)
+                        }
+                    };
+                    if let Err(e) = r {
+                        eprintln!("cinematic: frame {f} sub-frame {k} failed: {e}");
+                        return Ok(1);
                     }
+                }
+                let acc_res = match armv {
+                    CineArm::Wave(tg) => &tg.accum,
+                    CineArm::Dxr(dg) => &dg.accum,
                 };
-                if let Err(e) = r {
-                    eprintln!("cinematic: frame {f} sub-frame {k} failed: {e}");
-                    return Ok(1);
-                }
+                let bytes = hg.read_buffer(acc_res, ua, rw * rh * 3 * 4)?;
+                let inv = 1.0 / shot.samples as f32;
+                let hdr: Vec<f32> = bytes
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes(c.try_into().unwrap()) * inv)
+                    .collect();
+                cine_emit_frame(
+                    &mut hg, armv, &dir, shot, cine, f, frames, &hdr, &info,
+                    &mut present, &fs, rw, rh, use_wave, t_shot,
+                )?;
             }
-            let (acc_res, info_res) = match armv {
-                Arm::Wave(tg) => (&tg.accum, &tg.info),
-                Arm::Dxr(dg) => (&dg.accum, &dg.info),
-            };
-            let bytes = hg.read_buffer(acc_res, ua, rw * rh * 3 * 4)?;
-            let inv = 1.0 / shot.samples as f32;
-            let hdr: Vec<f32> = bytes
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes(c.try_into().unwrap()) * inv)
-                .collect();
-            if shot.overlay {
-                let ib = hg.read_buffer(info_res, ua, rw * rh * 4)?;
-                for (dst, c) in info.iter_mut().zip(ib.chunks_exact(4)) {
-                    dst.store(u32::from_le_bytes(c.try_into().unwrap()), Relaxed);
-                }
-            }
-            cine_write_frame(
-                &dir,
-                shot,
-                cine,
-                f,
-                &hdr,
-                &info,
-                &mut present,
-                &fs,
-                rw,
-                rh,
-                if use_wave { "GPU" } else { "DXR" },
-            );
-            cine_progress(shot, f, frames, t_shot, fs.hour);
         }
         cine_finish(&dir, shot, t_shot);
         cine_encode(&dir, shot, cine);
