@@ -258,6 +258,19 @@ pub struct Scene {
     /// (`foliage::attach`), NEVER serialized (the sky_sh precedent); `None`
     /// is the structural off-state every headless path keeps.
     pub sway: Option<Box<crate::foliage::SceneSway>>,
+    /// Foliage SWAY REGIONS (foliage v0.6): disjoint ascending tri ranges,
+    /// each carrying ITS OWN content box, so `foliage::attach` derives every
+    /// sway length (contact tolerance, cell pitch, ramp band, curl
+    /// wavelength, amplitude) at the REGION's scale instead of the scene's.
+    /// Empty = one implicit whole-scene region (every non-world scene —
+    /// bit-identical to the pre-region partition). Set ONLY by
+    /// `world::merge_scenes` (one region per island, the part's content box
+    /// at its ring offset) and serialized ONLY in the WORLD sidecar: without
+    /// this the world's ~10× content diagonal fused whole Minecraft forests
+    /// into single plants whose chords span the forest — a trunk then sat on
+    /// a nearly flat slice of the ramp and translated rigidly (the
+    /// "world trees aren't grounded" report).
+    pub sway_regions: Vec<crate::foliage::SwayRegion>,
     /// Bounding diagonal — the scale reference for all epsilons.
     pub diag: f32,
     /// Self-intersection offset for secondary rays.
@@ -495,6 +508,7 @@ impl SceneBuilder {
             sky_scale: 1.0,
             night: 0.0,
             sway: None,
+            sway_regions: Vec::new(),
             diag: 0.0,
             eps: 0.0,
             ao_radius: 0.0,
@@ -866,6 +880,7 @@ pub fn spray_self_test() -> Result<(), String> {
             sky_scale: 1.0,
             night: 0.0,
             sway: None,
+            sway_regions: Vec::new(),
             diag: 1.0,
             eps: 1e-4,
             ao_radius: 0.03,
@@ -1389,6 +1404,7 @@ pub fn tile_scene(base: Scene, nx: u32, nz: u32) -> (Scene, f32) {
         // Tiling re-derives the content box, so a stale partition would be
         // wrong; the caller re-attaches (foliage::attach) after tile_scene.
         sway: None,
+        sway_regions: Vec::new(),
         diag: 0.0,
         eps: 0.0,
         ao_radius: 0.0,

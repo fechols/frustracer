@@ -1,5 +1,170 @@
 # Animated foliage via tetrahedral cages — design doc
 
+**Status: v0.6, PER-REGION PARTITION SCALE (2026-07-30, user report: "the
+minecraft world trees don't seem to be grounded — the trunk at the bottom
+moves as much as the trunk farther up")** — the v0.5 known-accept below
+("THE WORLD's 7×-bigger diagonal re-fuses dense Minecraft forests into
+per-forest plants") was exactly that symptom's mechanism: a fused forest's
+chord spans the FOREST, so one tree occupies a nearly flat slice of the
+ramp and translates rigidly. The fix is the named follow-on, now shipped:
+`Scene::sway_regions` — one `SwayRegion { tri_start, tri_end, cmin, cmax }`
+per world island, recorded by `world::merge_scenes` (the part's tri range +
+its content box AT the ring offset) and serialized in the WORLD sidecar
+(WORLD_VERSION 2 → 3; per-scene sidecars never carry regions). Every sway
+length — PLANT_MERGE_K contact tolerance, leaf-attach pitch, SWAY_CELL_K
+voxel pitch, the SWAY_HEIGHT_BAND ramp band, SWAY_FIELD_K/WIND_K curl
+wavelength + scroll, SWAY_AMP_K/BOB_K amplitude — now derives from the
+tri's REGION scale: `derive_plants`/`cell_partition` take the region list
+(one global union-find — parts can't share vertices — then per-region
+merge/attach/finalize with region-keyed grid voxels, so cross-region fusing
+is STRUCTURAL, not distance luck), the composite key becomes (plant |
+FIELD, region, region-local voxel), and `SwayCell` gained `scale` (bitwise
+= the region's content diagonal; `SceneSway::scale`/`SwaySplit::scale` are
+gone — `wind`/`winds`/`bake`/`sway_pad`/the gateway pads all read the
+cell's). A region-less scene takes one implicit whole-scene region,
+BIT-IDENTICAL to the v0.5 partition (pinned). MAX_CELLS 2048 → 4096 and
+MAX_PLANTS 1024 → 2048 (CACHE_VERSION 16 → 17): the world's ~2.2k real
+trees must survive as PLANTS — a demoted tree is a FIELD member whose base
+rides the ramp at its terrain height, i.e. exactly the ungrounded look
+being fixed — and it also un-demotes rungholt solo's 182 capped trees;
+`bake`/`winds` went rayon-parallel (indexed, order-preserving —
+determinism holds) so the per-frame wind bill stays flat at the doubled
+cap. Gates: a two-region synthetic (two bark trunks CONTACT-close across a
+region boundary: 2 plants with a TEETH pin — the region-blind derivation
+must FUSE them to 1, proving the premise; per-region scale bitwise in the
+cells; chords on the REGION ramp band, bitwise; out-of-region masked tris
+static; implicit-vs-explicit whole-scene bit-equality; determinism),
+world::self_test merge pins (regions partition the tri stream, boxes =
+part content boxes at offset, bitwise; determinism; sidecar round-trip
+byte-fidelity + the n_regions ≤ n_islands corruption guard). Known-accept
+RETIRED: the world-forest fusing paragraph below. Still open: per-leaf
+shimmer within a plant (v0.5.1), and world FIELD grass now animates at its
+island's scale (a strict improvement — it used to ride the world's).
+AMPLITUDE RETUNE (same day, user: the whole-plant motion read "a little
+too subtle"): SWAY_AMP_K 0.001 → 0.002 and SWAY_BOB_K 0.00015 → 0.0003
+(constant flutter:gust ratio) — with bases pinned and plants posing as one
+body, 2× tip amplitude stays plausible. CACHE_VERSION 17 → 18 (the swept
+gateway boxes double their pad under identical lever/sway words);
+`--foliage-amp` remains the live dial on top.**
+
+**Status: v0.5, WHOLE-PLANT POSE GROUPS (2026-07-30, user request: "the
+leaves are swaying but the branches aren't… identify all foliage geometry
+and try for whole plant animation that includes the trunk")** — sway
+participation grows from leaves to LEAF ∪ WOODY, and geometry is grouped
+into PLANTS that pose coherently. CLASSIFICATION: a new matclass `bark`
+class (IDX 8, foliage shifted to 9 — the row sits between stone and
+foliage so all higher precedence holds) owns the woody vocabulary — the
+plant-library stems moved from the foliage row (brk/bark/tronco/twg/stm)
+plus trunk/branch/branches (bistro's three bark materials, all caught at
+tier 1 by their `*_bark_*`/`*_branch_*` texture stems) and `log`
+(Minecraft; whole-token, so Wooden_Plank/Fence/Bookshelf stay buildings);
+bark Pbr is wood-like (opaque 0.7, NO leaf translucency).
+`foliage::woody_materials` = the bark byte alone (no alpha leg — vokselia
+has no alpha signal anywhere). GROUPING (`derive_plants`, deterministic at
+every step — index-keyed vecs, ascending orders, min-id union
+representatives; the reclassify_spray union-find pattern): connected
+components over shared vertices of the masked tris (trunks ARE connected
+meshes — the v0.4 "per-plant is impossible" verdict is RETRACTED; it was
+scoped to disconnected leaf-only masks), woody components proximity-merged
+by grid closure at PLANT_MERGE_K (= one voxel pitch; inflated-AABB voxel
+sharing), leaf components attached to the max-overlap plant, the rest
+FIELD. Plant extents finalize AFTER leaf attach (the chord must cover the
+canopy); MAX_PLANTS = MAX_CELLS/2 demotes the smallest plants to FIELD on
+overflow (which is also the partition-coarsening termination proof). THE
+POSE-GROUP/SPATIAL-CELL SPLIT is the design spine: the partition key
+becomes (plant | FIELD, voxel) — cells stay voxel-sized (gateway/BVH bound
+quality, MAX_CELLS coarsening untouched) but every cell of one plant
+copies the plant's curl anchor, chord (a, b), and flutter hash key
+BITWISE (`SwayCell` gained `key`; `center` became `anchor`;
+`wind_with` lost its index arg — the key and anchor ride IN the cell, so
+`winds_keyed` became `winds`), and bitwise-equal pose parameters give the
+bitwise-equal affine map: a trunk crossing many cells CANNOT tear, which
+is what makes moving OPAQUE CONNECTED geometry sound where v0.1-v0.4
+could only move disconnected cutout leaves. The plant chord roots at the
+plant's OWN base (`a = −b·y0`, bitwise) over its own height with
+`w_max = global_ramp(plant.y1)` (tall plants still move more) — retiring
+the v0.4 potted-plant known-accept; per-cell `w_max = fl(a + b·cell.y1)`
+VERBATIM (never clamped — bitwise-pinnable, provably ≥ every member's
+w_lin since b ≥ 0). FIELD cells are the v0.4 arm bit-exactly (zero-plant
+scenes reproduce the v0.4 partition, chords, anchors AND flutter keys, so
+every synthetic gateway must-fire fires unchanged). Everything downstream
+is untouched: shear_rows/instance patch/shear_ray/gateway machinery/pads/
+`displacement_bound_with`/all HLSL. Gates: matclass bark pins (incl. the
+Foliage_Trunk name-tier precedence pin and the Wooden_Plank inverse), the
+mask trio anchors, a synthetic whole-plant scene (floor + vertex-chained
+bark trunk strip + attached leaf cluster + far FIELD billboard: plant
+formation/routing, ≥2-cell coherence with differing w_max, bitwise plant
+rooting ABOVE the content floor, a slanted displaced-TRUNK hit — the
+first opaque moving geometry — field fallback, determinism), and
+real-partition plant-cell pins (w_max verbatim, shared-key pose
+equality). CACHE_VERSION 15 → 16 (class-byte meaning + gateway layout).
+Known-accepts: ivy on walls leans into/away from the facade; plants
+touching buildings can clip at amp extremes (≤ ~1e-3·scale); an
+exporter-welded multi-tree mesh becomes ONE plant (the attach startup
+line — plants + woody/leaf/field tri counts — is the runtime
+measurement); trees closer than ~1.5 merge pitches fuse — and because the
+pitch is CONTENT-DIAG-relative, THE WORLD's 7×-bigger diagonal re-fuses
+dense Minecraft forests into per-forest plants (measured: rungholt solo
+1206 plants → the whole merged world 230; coherent, never torn, the
+per-island-partition-scale follow-on's newest customer); MEASURED
+PERF-NEUTRAL (SM-lp `--spin` still 31.6 vs 31.6, path 33.2 vs 33.1
+ms/frame armed-vs-unarmed — cells stay voxel-sized by design, and an
+early 5×-regression scare was the documented background-load measurement
+trap, not the tree); a plant's canopy
+flutters in unison (per-leaf-cell shimmer is the v0.5.1 follow-on: a
+`shimmer` flag for cells whose tris all come from leaf-only components, an
+extra cell-keyed bob term in the bound, and a coherence-gate carve-out);
+attach pays the union-find (~reclassify_spray's bill) per island + merged
+world.
+
+**Status: v0.4, ROOTED SHEAR + SCROLLING OCTAVES (2026-07-30, user request:
+"sway from the base of the model on up… more random… a scrolling 3D curl
+noise field")** — the per-cell RIGID translation (v0.1-v0.3.1's documented
+known-accept, and exactly the artifact the user reported: plants drifting
+in random 3D directions as units, billboard bases sliding) is replaced by a
+per-cell affine HORIZONTAL SHEAR about a global rooting ramp. The pose is
+`p' = p + u·(a + b·p.y)`: `u` is the baked per-cell WIND vector with
+`u.y ≡ 0`, and `(a, b)` is the cell's base-anchored CHORD of
+`w(y) = clamp((y − content_floor)/band, 0, 1)^γ`, γ = 0.5 —
+`SWAY_RAMP_GAMMA`, CONCAVE so short Minecraft grass stays visibly alive
+(the linear ramp put a 1 m tip at w ≈ 0.03, the regression SWAY_GROUND_K
+was added to hide; the floor is DELETED and both its known-accepts — the
+sliding base and the curl sink/lift — are retired). The chord is derived
+in `cell_partition` from the cell's geometric VERTEX y-extent (y0/y1 on
+`SwayCell`; base-anchored `a = w0 − b·y0` so a floor-touching cell roots
+BITWISE), `w_max = w(y1)` feeds the ONE `displacement_bound_with`
+(√2 — two live axes — with a 1e-6·scale eps for absolute-y fp slop), and
+every pad is now x/z-only (`(pad, 0, pad)` — y is exact for free).
+CONSUMPTION: `u.y ≡ 0` makes the map unipotent (det = 1, exact closed-form
+inverse), so the CPU gateway arm generalizes from an origin shift to
+`bvh::shear_ray` (`o_r = o − u·(a + b·o.y)`, `d_r = d − u·(b·d.y)`, t
+preserved because d_r stays unnormalized; `inv_d` recomputed only when
+`b·d.y ≠ 0` — above-band cells have b = 0 and keep the v0.3 cost), and the
+GPU/DXR arms write the four non-identity slots of the instance matrix they
+always carried (`foliage::shear_rows` → Transform[1]/[3]/[9]/[11], ONE
+shared derivation with the self-test's CPU↔GPU pose gate). "More random":
+a SECOND scrolling curl octave at ¼ wavelength and 2.5× scroll speed
+(SWAY_FIELD2_K/SWAY_WIND2_K), blended CONVEXLY (SWAY_OCT2_K = 0.35, so
+per-axis |v| ≤ 1 and the pad algebra survive) — chosen over the per-cell
+hash offset the SWAY_FIELD_K comment already rejected (tearing) — plus 3×
+flutter (SWAY_BOB_K, safe now that it rides the ramp) with the y sine
+deleted (the six-hash chain kept so x/z phases survive). SWAY_AMP_K
+0.0003 → 0.001: rooting roughly halves plant-average motion, so tip motion
+stays in the user-approved band. Per-plant bases were REJECTED, not
+deferred: Minecraft leaf blocks and San Miguel billboards are disconnected
+geometry, so union-find finds no plants — height-above-content-floor is
+the honest proxy (known-accept: a potted plant roots to the scene floor).
+Gates moved in lockstep: chord pins (bitwise root, endpoint-rejoins-ramp,
+concavity — the guard that a future convex γ can't silently break w_max),
+u.y ≡ 0 bitwise everywhere (wind sweep + baked lanes), endpoint-form
+bound/containment (linear in y ⇒ endpoint max is a proof), the displaced-
+hit pin grew a SLANTED ray through a floor cell (b ≠ 0 — a horizontal ray
+leaves d_r == d and would gate the d-shear vacuously) and a bitwise
+rooted-base-vertex pin, and `gateway_audit`'s swept-box identity is
+`± (pad, 0, pad)`. `--sw-rays` still renders the rest pose; FR_SWAY_ABL
+unchanged. CACHE_VERSION 14 → 15 (same lever/sway words, different swept
+boxes). Follow-ons unchanged (per-tet affine, per-island amplitude).
+
 **Status: v0.3, GATEWAY SUBTREES — the CPU cost fix (2026-07-29, same day)**
 — §"Pad at TET granularity, never per-triangle" is now the implementation,
 not a warning: on the default SAH builder each sway cell's triangles build

@@ -2822,7 +2822,6 @@ pub struct SwayGpu {
     /// runs of one overflowed cell translate identically, bit-equal to the
     /// CPU bake of that cell).
     cell_of: Vec<u32>,
-    scale: f32,
     /// Rest-pose instance descs — identity transforms, compacted-BLAS VAs
     /// baked, InstanceID = chunk index; the per-frame patch source.
     tpl: Vec<D3D12_RAYTRACING_INSTANCE_DESC>,
@@ -2874,7 +2873,6 @@ impl SwayGpu {
             first_chunk: sp.first_chunk,
             cells: sp.cells,
             cell_of: sp.cell_of,
-            scale: sp.scale,
             tpl: tpl.to_vec(),
             inst_ring,
             tlas,
@@ -2900,10 +2898,16 @@ impl SwayGpu {
         }
     }
 
-    /// Bake this clock's translations, patch the slot's instance descs, and
+    /// Bake this clock's winds, patch the slot's instance descs with each
+    /// run's rooted-shear rows (foliage v0.4 — the affine `p' = p + u·(a +
+    /// b·p.y)` rides the four non-identity slots of the row-major 3×4;
+    /// row 1 stays identity from the `tpl` copy because `u.y ≡ 0`), and
     /// record the TLAS rebuild — a bit-equal clock whose slot already holds
     /// this pose records nothing (the converging-still fast path). Call
-    /// BEFORE any ray dispatch that binds `tlas_va(slot)`.
+    /// BEFORE any ray dispatch that binds `tlas_va(slot)`. DXR transforms
+    /// the ray into object space without renormalizing, so hit t and
+    /// PrimitiveIndex are unaffected — the same argument as the CPU's
+    /// `shear_ray`.
     pub fn record_rebuild(
         &self,
         list: &ID3D12GraphicsCommandList,
@@ -2917,18 +2921,25 @@ impl SwayGpu {
             list.cast().map_err(|e| format!("ID3D12GraphicsCommandList4: {e}"))?;
         let n = self.tpl.len();
         let sz = std::mem::size_of::<D3D12_RAYTRACING_INSTANCE_DESC>();
-        let d = crate::foliage::translations_keyed(&self.cells, &self.cell_of, self.scale, time);
+        let d = crate::foliage::winds(&self.cells, time);
         // Slot-fenced by begin_frame (the frame_cb contract), so the CPU
         // write cannot race the GPU read from 2 frames ago.
         unsafe {
             let dst =
                 self.inst_ring.ptr.add(slot * n * sz) as *mut D3D12_RAYTRACING_INSTANCE_DESC;
             std::ptr::copy_nonoverlapping(self.tpl.as_ptr(), dst, n);
-            for (j, t) in d.iter().enumerate() {
+            for (j, u) in d.iter().enumerate() {
+                // ONE shared derivation with the CPU↔GPU pose gate
+                // (foliage::shear_rows) — the matrix cannot fork from the
+                // self_test's oracle. Runs re-key onto partition cells, so
+                // runs of one overflowed cell get bit-identical rows.
+                let cl = &self.cells[j];
+                let [uxb, uxa, uzb, uza] = crate::foliage::shear_rows(*u, cl.a, cl.b);
                 let inst = dst.add(self.first_chunk as usize + j);
-                (*inst).Transform[3] = t.x;
-                (*inst).Transform[7] = t.y;
-                (*inst).Transform[11] = t.z;
+                (*inst).Transform[1] = uxb;
+                (*inst).Transform[3] = uxa;
+                (*inst).Transform[9] = uzb;
+                (*inst).Transform[11] = uza;
             }
         }
         let desc = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {

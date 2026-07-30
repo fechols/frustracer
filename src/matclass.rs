@@ -133,10 +133,45 @@ const CLASSES: &[ClassDef] = &[
         pbr: opaque(0.88, 0.0),
     },
     ClassDef {
+        name: "bark",
+        // Woody plant matter — the foliage-sway WHOLE-PLANT vocabulary (v0.5:
+        // `foliage::woody_materials` keys on this class byte to group trunks
+        // and branches into plants). The plant-library woody stems moved here
+        // FROM the foliage row (brk/bark/tronco/twg/stm — BS04brk,
+        // quercus_rubra_bark, sm_tronco, HP07stm, …); trunk/branch/branches
+        // are the bistro vocabulary (Foliage_Trunk's TEXTURE stem
+        // `italian_cypress_bark_diff` hits Tok("bark") at tier 1, and even at
+        // the name tier bark-before-foliage resolves a name carrying both
+        // `foliage` and `trunk` tokens correctly — which is why this row must
+        // precede the foliage row); `log` is the Minecraft trunk block
+        // (whole-token: `Wooden_Plank`'s tokens are `wooden`,`plank` — no
+        // hit, so every building block stays static). Placed AFTER stone so
+        // every higher class keeps precedence (`Rose_Wood_Table` → wood,
+        // `madera_*`/`WOOD08` → wood, the leaf-litter BLENDSHADERs → stone
+        // via their pavement stems).
+        keys: &[
+            Tok("brk"),
+            Tok("bark"),
+            Tok("tronco"),
+            Tok("twg"),
+            Tok("stm"),
+            Tok("trunk"),
+            Tok("branch"),
+            Tok("branches"),
+            Tok("log"),
+        ],
+        // Wood-like: opaque, NO translucency (deliberately not foliage's 0.3
+        // — a trunk is not backlit like a leaf, and Log/tronco changing
+        // shading class should move the look minimally), roughness above the
+        // 0.45 bounce gate like foliage.
+        pbr: opaque(0.7, 0.0),
+    },
+    ClassDef {
         name: "foliage",
-        // Plant-library tokens (BS01lef, FL19pe13, HP07stm, quercus_rubra_bark
-        // ...) — every latin genus file carries one of these; `caballo` covers
-        // the lone exception (Cola_Caballo horsetail). Roughness deliberately
+        // Plant-library tokens (BS01lef, FL19pe13, ...) — every latin genus
+        // file carries one of these; `caballo` covers the lone exception
+        // (Cola_Caballo horsetail). The WOODY stems (brk/bark/tronco/twg/stm)
+        // live in the `bark` row above since v0.5. Roughness deliberately
         // stays >= 0.45: 10M foliage tris must not take the bounce ray.
         // The plain-English row (leaves/foliage/sapling/plants) is the
         // bistro + Minecraft vocabulary: bistro's stems say `Leaves_A_diff` /
@@ -156,17 +191,12 @@ const CLASSES: &[ClassDef] = &[
             Tok("leaf"),
             Tok("pet"),
             Tok("petal"),
-            Tok("stm"),
-            Tok("brk"),
-            Tok("bark"),
             Tok("flo"),
             Tok("cnt"),
-            Tok("twg"),
             Tok("sta"),
             Tok("pe"),
             Tok("pis"),
             Tok("hoja"),
-            Tok("tronco"),
             Tok("seca"),
             Tok("caballo"),
             Tok("leaves"),
@@ -203,19 +233,22 @@ pub const FABRIC_SHEEN: f32 = 0.5;
 /// Class names in report order: the keyword classes, then the Ns tiers and
 /// the default — indices returned by `classify` point in here.
 pub const NAMES: &[&str] = &[
-    "rust", "metal", "wood", "ceramic", "clay", "fabric", "leather", "stone", "foliage",
-    "glass", "water", "glossy", "default",
+    "rust", "metal", "wood", "ceramic", "clay", "fabric", "leather", "stone", "bark",
+    "foliage", "glass", "water", "glossy", "default",
 ];
+/// Public for `foliage::woody_materials` — woody plant matter (trunks,
+/// branches, stems), the v0.5 whole-plant grouping anchor.
+pub const IDX_BARK: usize = 8;
 /// Public for `foliage::leaf_materials` — the classify verdict is retained as
 /// `Material::class` (a `u8` index into `NAMES`), and the sway mask compares
 /// against this constant.
-pub const IDX_FOLIAGE: usize = 8;
-const IDX_GLASS: usize = 9;
-const IDX_WATER: usize = 10;
-const IDX_GLOSSY: usize = 11;
+pub const IDX_FOLIAGE: usize = 9;
+const IDX_GLASS: usize = 10;
+const IDX_WATER: usize = 11;
+const IDX_GLOSSY: usize = 12;
 /// Public because it is the `Material::class` byte everywhere the classifier
 /// does NOT run (procedural builders, the glTF loader).
-pub const IDX_DEFAULT: usize = 12;
+pub const IDX_DEFAULT: usize = 13;
 
 /// Blinn-Phong exponent -> perceptual GGX roughness (Brian Karis' mapping),
 /// clamped to the plausible glossy band.
@@ -356,7 +389,22 @@ pub fn self_test() -> Result<(), String> {
     tex("detmoldura_01_color", "stone")?; // fused compounds via Sub("moldur")
     tex("molduraterraza__color", "stone")?;
     tex("silla_d_piel", "leather")?;
-    tex("quercus_rubra_bark", "foliage")?;
+    // The bark class (v0.5 whole-plant sway): woody stems moved out of the
+    // foliage row — plant-library bark/stm, the bistro tree textures, the
+    // Minecraft Log block.
+    tex("quercus_rubra_bark", "bark")?;
+    tex("hp07stm", "bark")?; // stm moved from foliage
+    tex("italian_cypress_bark_diff", "bark")?; // bistro Foliage_Trunk's stem
+    tex("linden_bark_a_diff", "bark")?; // bistro linden trunk's stem
+    tex("paris_ivy_branch_diff", "bark")?; // bistro ivy branches' stem
+    // Name-tier bark: `Foliage_Trunk` carries BOTH the `foliage` and `trunk`
+    // tokens — bark-before-foliage table order resolves it (the reason the
+    // bark row's position is load-bearing).
+    expect(None, "Foliage_Trunk", 100.0, 2, "bark")?;
+    expect(Some("rungholt-rgba"), "Log", 0.0, 2, "bark")?;
+    expect(Some("vokselia_spawn"), "Log", 0.0, 2, "bark")?;
+    // ...and the whole-token guard: every wooden BUILDING block stays static.
+    expect(Some("rungholt-rgba"), "Wooden_Plank", 0.0, 2, "default")?;
     tex("d30_smiguel_2003_7758", "default")?;
     // The bistro/Minecraft vocabulary (foliage-sway coverage):
     tex("leaves_a_diff", "foliage")?; // linden — "leaves" plural, not "leaf"
@@ -433,6 +481,16 @@ pub fn self_test() -> Result<(), String> {
     let (_, l) = classify(Some("bs01lef"), "material_3", Some(16.0), Some(2), false, None);
     if l.translucency != 0.3 || l.roughness < 0.45 {
         return Err(format!("foliage: translucency {} roughness {}", l.translucency, l.roughness));
+    }
+    // Bark Pbr: wood-like — opaque (NO leaf translucency), above the bounce
+    // gate, dielectric.
+    let (_, bk) = classify(Some("linden_bark_a_diff"), "material_4", Some(16.0), Some(2), false, None);
+    if bk.translucency != 0.0 || bk.roughness < 0.45 || bk.transmission != 0.0 || bk.metallic != 0.0
+    {
+        return Err(format!(
+            "bark pbr: translucency {} roughness {} transmission {} metallic {}",
+            bk.translucency, bk.roughness, bk.transmission, bk.metallic
+        ));
     }
     // Water is a glass-tier refinement, not a rival to the keyword/glossy
     // tiers. Signals, each in isolation:
