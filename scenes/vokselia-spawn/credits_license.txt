@@ -21,4 +21,17 @@ Changes made in this repository, for the record:
   * PNG textures were converted to LOSSLESS WebP (bit-identical RGBA;
     the manifest keeps its .png names and the loader falls back to the
     .webp sibling)
-No geometry, material or texel values were altered.
+  * the texture atlas (vokselia_spawn.webp) was REBUILT cell-for-cell:
+    the original Mineways export embedded Mojang's default Minecraft
+    block textures, which may not be redistributed. Replacement art is
+    from Pixel Perfection by Hugh "XSSheep" Rutland and contributors
+    (CC BY-SA 4.0; Community Edition:
+    https://github.com/Athemis/PixelPerfectionCE, Minetest port for a
+    few tiles: https://github.com/minetest-texture-packs/Pixel-Perfection),
+    plus simple original drawings for blocks with no Pixel Perfection
+    equivalent, flat average-color fills for unreferenced cells, and
+    constant tint multipliers on biome-colored foliage. The atlas
+    LAYOUT (and therefore the OBJ UVs) is unchanged.
+    The derived atlas image is licensed CC BY-SA 4.0; credit
+    "Pixel Perfection by XSSheep and contributors, CC BY-SA 4.0".
+No geometry or material values were altered.
