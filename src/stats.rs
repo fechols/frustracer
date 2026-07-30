@@ -497,6 +497,18 @@ impl Stats {
         } else {
             String::new()
         };
+        // FR_SWAY_TRI probe (bvh::TRI_TESTS) — CUMULATIVE process totals, not
+        // per-frame (the probe deliberately bypasses the LocalStats batching;
+        // see its doc in bvh.rs). Zero and absent when unarmed.
+        let tt = crate::bvh::TRI_TESTS.load(Relaxed);
+        let tri = if tt > 0 {
+            format!(
+                " | tri-tests {tt} (shifted {}, cumulative)",
+                crate::bvh::TRI_TESTS_SHIFTED.load(Relaxed)
+            )
+        } else {
+            String::new()
+        };
         let dpx = self.defer_px.load(Relaxed);
         let dmx = self.defer_mixed.load(Relaxed);
         let defer = if dpx + dmx > 0 {
@@ -509,7 +521,7 @@ impl Stats {
             String::new()
         };
         format!(
-            "tiles {tiles} | fr-queries {fq} (blocked {blocked}) | cut mean {cut_mean:.1} (ovf {ovf}) | nodes: frustum {fnodes} + ray {rnodes}{rsplit} = {} | rays: {prim} prim + {sec} sec | sky-px (0 rays) {sky} | coarse-px {coarse} (smp {csmp}) | temporal: seeds {tseeds} sky {tsky} cells {ttests} | mean t_start/t_hit {skip:.2}{adopt}{tring}{replay}{hemi}{share}{adapt}{defer}",
+            "tiles {tiles} | fr-queries {fq} (blocked {blocked}) | cut mean {cut_mean:.1} (ovf {ovf}) | nodes: frustum {fnodes} + ray {rnodes}{rsplit} = {} | rays: {prim} prim + {sec} sec | sky-px (0 rays) {sky} | coarse-px {coarse} (smp {csmp}) | temporal: seeds {tseeds} sky {tsky} cells {ttests} | mean t_start/t_hit {skip:.2}{adopt}{tring}{replay}{hemi}{share}{adapt}{defer}{tri}",
             fnodes + rnodes
         )
     }

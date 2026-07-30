@@ -251,6 +251,13 @@ pub struct Scene {
     /// Star visibility (`sky::stars`' gate): exactly 0.0 in an untouched
     /// session, ramping to 1.0 after sunset. Derived, never serialized.
     pub night: f32,
+    /// Wind-swayed foliage (src/foliage.rs): the ONE cell partition every
+    /// consumer shares — the CPU intersector's per-triangle displacement,
+    /// the BVH build sweep, and the GPU BLAS split — plus the per-frame
+    /// offsets main.rs bakes. Derived at load under `foliage::sweep_armed()`
+    /// (`foliage::attach`), NEVER serialized (the sky_sh precedent); `None`
+    /// is the structural off-state every headless path keeps.
+    pub sway: Option<Box<crate::foliage::SceneSway>>,
     /// Bounding diagonal — the scale reference for all epsilons.
     pub diag: f32,
     /// Self-intersection offset for secondary rays.
@@ -487,6 +494,7 @@ impl SceneBuilder {
             sky_sh: crate::sh::Sh9::ZERO,
             sky_scale: 1.0,
             night: 0.0,
+            sway: None,
             diag: 0.0,
             eps: 0.0,
             ao_radius: 0.0,
@@ -857,6 +865,7 @@ pub fn spray_self_test() -> Result<(), String> {
             sky_sh: crate::sh::Sh9::ZERO,
             sky_scale: 1.0,
             night: 0.0,
+            sway: None,
             diag: 1.0,
             eps: 1e-4,
             ao_radius: 0.03,
@@ -1377,6 +1386,9 @@ pub fn tile_scene(base: Scene, nx: u32, nz: u32) -> (Scene, f32) {
         sky_sh: crate::sh::Sh9::ZERO,
         sky_scale: base.sky_scale,
         night: base.night,
+        // Tiling re-derives the content box, so a stale partition would be
+        // wrong; the caller re-attaches (foliage::attach) after tile_scene.
+        sway: None,
         diag: 0.0,
         eps: 0.0,
         ao_radius: 0.0,

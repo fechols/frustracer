@@ -356,7 +356,7 @@ pub fn probe_split(
         // holding the covering triangle. An overflow-emitted internal node
         // carries no triangle list, so it is conservatively an interferer.
         let holds = n.count > 0
-            && bvh.tri_idx[n.left_first as usize..(n.left_first + n.count) as usize]
+            && bvh.tri_idx[n.left_first as usize..(n.left_first + n.leaf_count()) as usize]
                 .contains(&tri);
         if holds {
             continue;

@@ -150,9 +150,14 @@ const CLASSES: &[ClassDef] = &[
         // `Paris_Foliage_01a_diff` and its material names all start
         // `Foliage_`; rungholt/vokselia carry the signal ONLY on the material
         // NAME (`Leaves`, `Sapling` — one shared atlas texture). Deliberately
-        // NO "grass": Minecraft's `Grass` is the GROUND block, and the sway
-        // mask must never mark terrain (`Tall_Grass`, the real cutout plant,
-        // is the accepted miss).
+        // NO bare "grass": Minecraft's `Grass` is the GROUND block, and the
+        // sway mask must never mark terrain. The billboard PLANTS are named
+        // exactly instead (2026-07-29 — `Tall_Grass` was the accepted miss
+        // until the user asked for grass sway): `Sub` on the underscored
+        // block names (`tall_grass`, `sugar_cane` — effectively exact, since
+        // `tokens()` splits on `_` and a bare grass/cane token would be the
+        // terrain hazard) + whole-token flower/crop names. `rose_wood`-style
+        // compounds stay safe by TABLE ORDER (wood classifies first).
         keys: &[
             Tok("lef"),
             Tok("leaf"),
@@ -175,6 +180,11 @@ const CLASSES: &[ClassDef] = &[
             Tok("foliage"),
             Tok("sapling"),
             Tok("plants"),
+            Sub("tall_grass"),
+            Sub("sugar_cane"),
+            Tok("dandelion"),
+            Tok("rose"),
+            Tok("crops"),
         ],
         // 0.3 ≈ measured leaf transmittance (chlorophyll passes ~20-30% in
         // the visible band). 0.5 was tried: visually fine, but the brighter
@@ -352,8 +362,21 @@ pub fn self_test() -> Result<(), String> {
     expect(Some("rungholt-rgba"), "Leaves", 0.0, 2, "foliage")?;
     expect(Some("vokselia_spawn"), "Sapling", 0.0, 2, "foliage")?;
     // The GROUND block must never classify foliage — the sway mask marks
-    // foliage-classed cutout materials, and terrain must not sway.
+    // foliage-classed cutout materials, and terrain must not sway. This pin
+    // is load-bearing on VOKSELIA, whose single atlas is alpha-masked for
+    // every material (rungholt's `Grass` also fails the mask gate — it maps
+    // the RGB atlas — but the class byte must hold alone).
     expect(Some("rungholt-rgba"), "Grass", 0.0, 2, "default")?;
+    expect(Some("vokselia_spawn"), "Grass", 0.0, 2, "default")?;
+    // The billboard plants (the exact-name vocabulary — grass sway): every
+    // cutout cross-plant classifies foliage on BOTH atlas scenes.
+    for plant in ["Tall_Grass", "Dandelion", "Rose", "Crops", "Sugar_Cane"] {
+        expect(Some("rungholt-rgba"), plant, 0.0, 2, "foliage")?;
+        expect(Some("vokselia_spawn"), plant, 0.0, 2, "foliage")?;
+    }
+    // Table order keeps compounds out: a rose-named WOOD hits the wood row
+    // before the foliage "rose" token is ever consulted.
+    expect(None, "Rose_Wood_Table", 16.0, 2, "wood")?;
     expect(None, "Foliage_Bux_Hedges46", 100.0, 2, "foliage")?;
     // Stem beats name: leaf-LITTER pavement classifies by its cobblestone
     // stem before the "leaves" name token is ever consulted.

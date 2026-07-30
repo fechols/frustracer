@@ -38,6 +38,17 @@ use rayon::prelude::*;
 const BALANCE_DEPTH: u32 = 64;
 
 pub fn build_alt(scene: &Scene, which: Builder) -> Bvh {
+    // Foliage sway on a bake-off builder keeps the v0.2 per-tri-sweep +
+    // per-test-shift path (`grow_sway_sweep` below + `moller_trumbore`'s
+    // head, both gated on `!gateway_mode()`): gateway subtrees are SAH-only,
+    // and this arm doubles as the built-in A/B against them. Loud, since the
+    // per-tri sweep is the measured ~80%-of-the-bill regime.
+    if scene.sway.is_some() {
+        eprintln!(
+            "foliage sway: per-tri sweep path ({which:?} bake-off builder) — \
+             gateway subtrees are SAH-only"
+        );
+    }
     let n = scene.indices.len();
     let (tri_aabb, centroids): (Vec<Aabb>, Vec<Vec3A>) = scene
         .indices
@@ -54,6 +65,7 @@ pub fn build_alt(scene: &Scene, which: Builder) -> Bvh {
             bb.grow(b);
             bb.grow(c);
             crate::bvh::grow_height_sweep(scene, i as u32, a, b, c, &mut bb);
+            crate::bvh::grow_sway_sweep(scene, i as u32, &mut bb);
             (bb, (a + b + c) / 3.0)
         })
         .unzip();

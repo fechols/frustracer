@@ -1,7 +1,7 @@
 use crate::scene::Scene;
 use glam::Vec3A;
 use rayon::prelude::*;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
 /// A/B lever (`--no-cut-rays`): when off, cut-SEEDED rays traverse from the root
@@ -152,11 +152,39 @@ impl Aabb {
 
 /// count > 0: leaf over tri_idx[left_first .. left_first+count].
 /// count == 0: internal, children at left_first and left_first + 1.
+///
+/// GATEWAY (foliage sway, SAH gateway mode): `count & GATEWAY_BIT` marks a
+/// sway cell's TRUTHFUL FAT LEAF — `left_first .. left_first+leaf_count()`
+/// is the cell's whole contiguous tri range, its aabb is the ONLY box swept
+/// by the motion bound, and the cell's rest-space-TIGHT subtree sits
+/// implicitly at `gateway_index + 1`. Bound/cut consumers read it as a leaf
+/// (box distance, emit-don't-descend — conservative for every pose because
+/// the box is swept); ONLY the ray loops descend, through a nested call
+/// with the ray origin shifted into cell-rest space. `leaf_count() == 0` is
+/// the E FILLER (EMPTY box, no subtree — the cherry expansion's second-slot
+/// spacer): leaf-shaped everywhere, skipped by the ray arm, a guaranteed
+/// slab miss. Every consumer that reads `count` AS A RANGE must go through
+/// `leaf_count()` — a raw read of a gateway's count is a 2^31-sized range.
+pub const GATEWAY_BIT: u32 = 1 << 31;
+
 #[derive(Clone, Copy)]
 pub struct BvhNode {
     pub aabb: Aabb,
     pub left_first: u32,
     pub count: u32,
+}
+
+impl BvhNode {
+    #[inline(always)]
+    pub fn is_gateway(&self) -> bool {
+        self.count & GATEWAY_BIT != 0
+    }
+    /// The triangle count with the gateway bit masked off — the ONLY correct
+    /// way to read `count` as a range length.
+    #[inline(always)]
+    pub fn leaf_count(&self) -> u32 {
+        self.count & !GATEWAY_BIT
+    }
 }
 
 pub struct Bvh {
@@ -333,6 +361,8 @@ pub struct BvhQuality {
     pub nodes: usize,
     pub internal: usize,
     pub leaves: usize,
+    /// Sway gateway nodes (incl. E fillers) — see `quality`'s gateway arm.
+    pub gateways: usize,
     pub tri_refs: usize,
     pub mean_leaf: f32,
     pub max_depth: usize,
@@ -349,8 +379,9 @@ pub struct BvhQuality {
 impl BvhQuality {
     pub fn line(&self, tris: usize) -> String {
         let h: Vec<String> = (1..=8).map(|i| format!("{}", self.leaf_hist[i])).collect();
+        let gw = if self.gateways > 0 { format!(" | gateways {}", self.gateways) } else { String::new() };
         format!(
-            "nodes {} ({:.2}/tri, {:.0} MB) | leaves {} mean {:.2} tris | depth {} | SAH@1 {:.1} (nodes {:.2} + tris {:.2}) | leaf-hist[1..8] {}",
+            "nodes {} ({:.2}/tri, {:.0} MB) | leaves {} mean {:.2} tris | depth {} | SAH@1 {:.1} (nodes {:.2} + tris {:.2}) | leaf-hist[1..8] {}{gw}",
             self.nodes,
             self.nodes as f32 / tris.max(1) as f32,
             self.bytes as f32 / (1024.0 * 1024.0),
@@ -372,11 +403,80 @@ impl BvhQuality {
 const ROOT_SORT: usize = 64;
 
 /// Subtree handed to phase 2 of the build: `nodes[node_i]` still holds its
-/// (first, count) leaf-form range over `tri_idx` until the stitch replaces it.
+/// (first, count) leaf-form range over the ITEM array until the stitch
+/// replaces it. `tri_first`/`tri_count` locate the range's slice of the
+/// FINAL tri buffer — equal to (first, count) when no gateway ctx is live,
+/// since every item then has width 1 and the item array IS the tri buffer.
 struct Pending {
     node_i: u32,
     first: u32,
     count: u32,
+    tri_first: u32,
+    tri_count: u32,
+}
+
+/// Build-time context for GATEWAY mode (`foliage::gateway_mode()` — sway on
+/// the SAH builder): each sway cell rides the top-level build as ONE
+/// pseudo-prim (id `n + c`, indexing the extended `tri_aabb`/`centroids`
+/// tails with the cell's SWEPT box) and is materialized as a gateway + a
+/// rest-space-TIGHT subtree at child emission (`emit_gateway`). This is the
+/// design doc's "pad at cell granularity, never per-triangle": profiling
+/// measured the per-tri sweep at ~80% of the CPU sway bill (canopy triangle
+/// tests +107%), and here the ONLY swept boxes are the ≤ MAX_CELLS
+/// gateways'. Everything is a pure function of the partition + levers (CSR
+/// in ascending tri order, sequential unions, a fixed second-slot rule), so
+/// the build stays byte-deterministic — `Bvh::identical` gates it.
+struct GatewayCtx {
+    /// CSR cell -> tris, ascending tri id within a cell — the canonical
+    /// order the range is EMITTED in (the cell subtree's own SAH build then
+    /// permutes it in place, so a built gateway's range is a permutation of
+    /// the cell), and the order both rest-box unions accumulate in (the
+    /// pseudo-prim's entry and the subtree root's bounds loop both run over
+    /// the ascending sequence — the root bounds are computed BEFORE any
+    /// partition swap — so the gateway box debug-assert can demand
+    /// bit-equality).
+    cell_off: Vec<u32>,
+    cell_tris: Vec<u32>,
+    /// Per-cell displacement pad (`foliage::displacement_bound_with` at
+    /// `sweep_mult()` — exactly `foliage::sway_pad`'s value for any tri of
+    /// the cell).
+    pad: Vec<f32>,
+    /// Real-triangle count; pseudo ids are `n .. n + cells`.
+    n: u32,
+}
+
+impl GatewayCtx {
+    #[inline]
+    fn is_pseudo(&self, id: u32) -> bool {
+        id >= self.n
+    }
+    #[inline]
+    fn cell(&self, id: u32) -> usize {
+        (id - self.n) as usize
+    }
+    #[inline]
+    fn cell_range(&self, c: usize) -> &[u32] {
+        &self.cell_tris[self.cell_off[c] as usize..self.cell_off[c + 1] as usize]
+    }
+    /// How many FINAL tri_idx slots this item occupies.
+    #[inline]
+    fn width(&self, id: u32) -> u32 {
+        if self.is_pseudo(id) {
+            let c = self.cell(id);
+            self.cell_off[c + 1] - self.cell_off[c]
+        } else {
+            1
+        }
+    }
+}
+
+/// The mutable half of gateway mode threaded through `subdivide_range`:
+/// the ctx plus the tri buffer leaf/gateway emission writes into (the item
+/// array being subdivided is a PERMUTATION WORK ARRAY in this mode, never
+/// the final `tri_idx`).
+struct GwPhase<'a> {
+    ctx: &'a GatewayCtx,
+    tribuf: &'a mut [u32],
 }
 
 /// Phase-1 stop size — a pure function of n ONLY (never the thread count):
@@ -430,7 +530,7 @@ impl Bvh {
 
     fn build_sah(scene: &Scene) -> Bvh {
         let n = scene.indices.len();
-        let (tri_aabb, centroids): (Vec<Aabb>, Vec<Vec3A>) = scene
+        let (mut tri_aabb, mut centroids): (Vec<Aabb>, Vec<Vec3A>) = scene
             .indices
             .par_iter()
             .enumerate()
@@ -445,34 +545,132 @@ impl Bvh {
                 bb.grow(b);
                 bb.grow(c);
                 grow_height_sweep(scene, i as u32, a, b, c, &mut bb);
+                // NO grow_sway_sweep here (unlike builders.rs): in gateway
+                // mode the pad lives on the ≤ MAX_CELLS gateway boxes and
+                // per-tri boxes stay rest-space TIGHT — the measured ~80% of
+                // the CPU sway bill was exactly this per-tri pad. Without
+                // sway the call was a no-op, so its removal is bit-neutral.
                 (bb, (a + b + c) / 3.0)
             })
             .unzip();
 
+        // GATEWAY mode: derive the build ctx from the ONE shared partition.
+        let gw_ctx: Option<GatewayCtx> = match &scene.sway {
+            Some(sw) if crate::foliage::gateway_mode() && !sw.cells.is_empty() => {
+                let k = sw.cells.len();
+                // Counting sort: cell -> tris, ascending tri id per cell.
+                let mut off = vec![0u32; k + 1];
+                for &c in sw.tri_cell.iter() {
+                    if c != crate::foliage::STATIC_CELL {
+                        off[c as usize + 1] += 1;
+                    }
+                }
+                for i in 0..k {
+                    off[i + 1] += off[i];
+                }
+                let total = off[k] as usize;
+                if total == 0 {
+                    None
+                } else {
+                    let mut cur = off.clone();
+                    let mut cell_tris = vec![0u32; total];
+                    for (t, &c) in sw.tri_cell.iter().enumerate() {
+                        if c != crate::foliage::STATIC_CELL {
+                            cell_tris[cur[c as usize] as usize] = t as u32;
+                            cur[c as usize] += 1;
+                        }
+                    }
+                    let pad: Vec<f32> = sw
+                        .cells
+                        .iter()
+                        .map(|cl| {
+                            crate::foliage::displacement_bound_with(
+                                cl.amp,
+                                sw.scale,
+                                crate::foliage::sweep_mult(),
+                            )
+                        })
+                        .collect();
+                    Some(GatewayCtx { cell_off: off, cell_tris, pad, n: n as u32 })
+                }
+            }
+            _ => None,
+        };
+
+        // Pseudo-prim tails: one entry per cell — the SWEPT box (the rest
+        // union in CSR order ± the pad; `emit_gateway` re-derives the same
+        // box from the subtree root and debug-asserts bit-equality) and its
+        // rest-box center as the binning centroid.
+        if let Some(ctx) = &gw_ctx {
+            let k = ctx.cell_off.len() - 1;
+            tri_aabb.reserve_exact(k);
+            centroids.reserve_exact(k);
+            for c in 0..k {
+                let mut bb = Aabb::EMPTY;
+                for &t in ctx.cell_range(c) {
+                    bb.grow_aabb(&tri_aabb[t as usize]);
+                }
+                centroids.push(0.5 * (bb.min + bb.max));
+                let p = Vec3A::splat(ctx.pad[c]);
+                tri_aabb.push(Aabb { min: bb.min - p, max: bb.max + p });
+            }
+        }
+
+        // The item array phase 1/2 subdivide: without ctx it IS the final
+        // tri buffer (identity permutation, today's path bit-identically);
+        // with ctx it is [static tris ascending | pseudo ids] and the final
+        // tri buffer is written separately at leaf/gateway emission.
+        let (mut items, mut tribuf): (Vec<u32>, Vec<u32>) = match (&gw_ctx, &scene.sway) {
+            (Some(ctx), Some(sw)) => {
+                let k = ctx.cell_off.len() - 1;
+                let mut v = Vec::with_capacity(n - ctx.cell_tris.len() + k);
+                for t in 0..n as u32 {
+                    if sw.tri_cell[t as usize] == crate::foliage::STATIC_CELL {
+                        v.push(t);
+                    }
+                }
+                for c in 0..k as u32 {
+                    v.push(n as u32 + c);
+                }
+                (v, vec![u32::MAX; n])
+            }
+            _ => ((0..n as u32).collect(), Vec::new()),
+        };
+
         // No 2n up-front node reserve (8 GB at 100M tris): phase 1 grows
         // organically (small) and the stitch reserves the exact total.
         let mut nodes = Vec::new();
-        let mut tri_idx: Vec<u32> = (0..n as u32).collect();
         nodes.push(BvhNode {
             aabb: Aabb::EMPTY,
             left_first: 0,
-            count: n as u32,
+            count: items.len() as u32,
         });
 
         if n > 0 {
             let threshold = par_threshold(n);
             let mut pending = Vec::new();
-            subdivide_range(
-                &mut nodes,
-                0,
-                &mut tri_idx,
-                &tri_aabb,
-                &centroids,
-                &mut Some((&mut pending, threshold)),
-            );
+            {
+                let mut gphase = gw_ctx
+                    .as_ref()
+                    .map(|ctx| GwPhase { ctx, tribuf: &mut tribuf });
+                subdivide_range(
+                    &mut nodes,
+                    0,
+                    &mut items,
+                    &tri_aabb,
+                    &centroids,
+                    &mut Some((&mut pending, threshold)),
+                    &mut gphase,
+                    0,
+                );
+            }
 
+            // Phase-2 slicing: the same disjoint-ascending walk, over the
+            // ITEM array and (in gateway mode) the tri buffer too — gaps
+            // (phase-1 inline gateway blocks) fall out of the `- consumed`
+            // arithmetic exactly like they always did for the item walk.
             let mut slices: Vec<(&mut [u32], u32)> = Vec::with_capacity(pending.len());
-            let mut rest: &mut [u32] = &mut tri_idx;
+            let mut rest: &mut [u32] = &mut items;
             let mut consumed = 0u32;
             for p in &pending {
                 let (_, r) = rest.split_at_mut((p.first - consumed) as usize);
@@ -481,16 +679,41 @@ impl Bvh {
                 rest = r2;
                 consumed = p.first + p.count;
             }
-            let arenas: Vec<Vec<BvhNode>> = slices
-                .into_par_iter()
-                .map(|(slice, base)| build_subtree(slice, base, &tri_aabb, &centroids))
-                .collect();
+            let arenas: Vec<Vec<BvhNode>> = if let Some(ctx) = &gw_ctx {
+                let mut tslices: Vec<(&mut [u32], u32)> = Vec::with_capacity(pending.len());
+                let mut trest: &mut [u32] = &mut tribuf;
+                let mut tconsumed = 0u32;
+                for p in &pending {
+                    let (_, r) = trest.split_at_mut((p.tri_first - tconsumed) as usize);
+                    let (s, r2) = r.split_at_mut(p.tri_count as usize);
+                    tslices.push((s, p.tri_first));
+                    trest = r2;
+                    tconsumed = p.tri_first + p.tri_count;
+                }
+                slices
+                    .into_par_iter()
+                    .zip(tslices)
+                    .map(|((islice, _ibase), (tslice, tbase))| {
+                        build_subtree(islice, tbase, &tri_aabb, &centroids, Some((ctx, tslice)))
+                    })
+                    .collect()
+            } else {
+                slices
+                    .into_par_iter()
+                    .map(|(slice, base)| build_subtree(slice, base, &tri_aabb, &centroids, None))
+                    .collect()
+            };
 
             // Stitch: arena local 0 lands in the pending node's slot and
             // local i>0 at off+i, so every internal link rebases by one
             // uniform +off — child pairs stay adjacent (count==0 ⇒ children
-            // at left_first, left_first+1). Leaf ranges were lifted to global
-            // tri_idx positions inside build_subtree.
+            // at left_first, left_first+1), and a gateway's implicit +1
+            // subtree survives because the splice is contiguous and a
+            // pending range is never gateway-ROOTED (a singleton pseudo is
+            // materialized at child emission, never pended). Leaf AND
+            // gateway ranges were lifted to global tri positions inside
+            // build_subtree (count > 0 covers both), so the rebase leaves
+            // them alone.
             let extra: usize = arenas.iter().map(|a| a.len() - 1).sum();
             nodes.reserve_exact(extra);
             for (p, arena) in pending.iter().zip(&arenas) {
@@ -504,7 +727,15 @@ impl Bvh {
             }
         }
 
-        Bvh::from_parts(nodes, tri_idx)
+        if gw_ctx.is_some() {
+            debug_assert!(
+                tribuf.iter().all(|&t| t != u32::MAX),
+                "gateway build left tri buffer slots unwritten"
+            );
+            Bvh::from_parts(nodes, tribuf)
+        } else {
+            Bvh::from_parts(nodes, items)
+        }
     }
 
     /// Byte-equality of two builds — the determinism gate: `--check` rebuilds
@@ -557,6 +788,19 @@ impl Bvh {
             if n.count == 0 {
                 q.internal += 1;
                 node_term += p;
+            } else if n.is_gateway() {
+                // A sway gateway is traversal overhead, not a triangle test:
+                // a ray pays its (swept) box before the subtree, so its area
+                // rides node_term; its span must NOT enter tri_refs/tri_term
+                // — the +1 subtree's real leaves already carry those tris,
+                // and double-counting would corrupt the builder A/B readout.
+                // The E filler (masked count 0) lands here too, carrying a
+                // COPY of its sibling gateway's box — so a cherry's box area
+                // enters node_term twice, which is honest: a ray really does
+                // slab-test both. Counted in `gateways` for the diagnostic
+                // line.
+                q.gateways += 1;
+                node_term += p;
             } else {
                 q.leaves += 1;
                 q.tri_refs += n.count as usize;
@@ -587,6 +831,13 @@ impl Bvh {
             if node.count == 0 {
                 stack.push((node.left_first, d + 1));
                 stack.push((node.left_first + 1, d + 1));
+            } else if node.is_gateway() && node.leaf_count() > 0 {
+                // Descend the gateway's implicit +1 subtree: the TRAV_STACK
+                // assert must cover the WHOLE path (top + cell subtree) —
+                // conservative for the nested-call ray arms (which get a
+                // fresh stack each) and exactly right for the single-stack
+                // HLSL software descent in rt_sw.hlsli.
+                stack.push((i + 1, d + 1));
             }
         }
         max
@@ -665,6 +916,22 @@ impl Bvh {
         best
     }
 
+    /// A gateway's CURRENT cell translation — ZERO (the rest pose) when the
+    /// scene carries no sway (a defensive impossibility: gateways only build
+    /// with `Scene::sway` attached) or the `FR_SWAY_ABL=noshift` cost probe
+    /// is armed. The cell id is derived, never stored: the gateway's
+    /// truthful range is one cell by construction, so its first tri's
+    /// `tri_cell` entry IS the cell.
+    #[inline]
+    fn gateway_offset(&self, scene: &Scene, node: &BvhNode) -> Vec3A {
+        match &scene.sway {
+            Some(sw) if !crate::foliage::sway_abl().noshift => {
+                sw.offset(sw.tri_cell[self.tri_idx[node.left_first as usize] as usize])
+            }
+            _ => Vec3A::ZERO,
+        }
+    }
+
     fn intersect_from(
         &self,
         scene: &Scene,
@@ -688,12 +955,35 @@ impl Bvh {
             let node = &self.nodes[node_idx as usize];
             *visits += 1;
             if node.count > 0 {
-                let first = node.left_first as usize;
-                for &t in &self.tri_idx[first..first + node.count as usize] {
-                    if let Some((tt, u, v)) = moller_trumbore(scene, t, ray) {
-                        if tt > tmin && tt < *tmax {
-                            *tmax = tt;
-                            *best = Some(Hit { t: tt, tri: t, u, v });
+                if node.is_gateway() {
+                    // GATEWAY (foliage sway): descend the cell's rest-space
+                    // subtree at +1 with the ray shifted into cell-rest space
+                    // — ONE shift per cell entry instead of the old per-test
+                    // head (t preserved, inv_d shift-invariant). Nested call
+                    // = fresh stack; gateways never nest, so recursion depth
+                    // is 1. Masked count 0 = the E filler: no subtree, fall
+                    // straight to the pop tail. tmax/best merge through the
+                    // &mut params.
+                    if node.leaf_count() > 0 {
+                        if tri_probe() {
+                            GATEWAY_ENTRIES.fetch_add(1, Ordering::Relaxed);
+                        }
+                        let off = self.gateway_offset(scene, node);
+                        if off != Vec3A::ZERO {
+                            let sray = Ray { o: ray.o - off, d: ray.d, inv_d: ray.inv_d };
+                            self.intersect_from(scene, &sray, tmin, tmax, node_idx + 1, best, visits);
+                        } else {
+                            self.intersect_from(scene, ray, tmin, tmax, node_idx + 1, best, visits);
+                        }
+                    }
+                } else {
+                    let first = node.left_first as usize;
+                    for &t in &self.tri_idx[first..first + node.count as usize] {
+                        if let Some((tt, u, v)) = moller_trumbore(scene, t, ray) {
+                            if tt > tmin && tt < *tmax {
+                                *tmax = tt;
+                                *best = Some(Hit { t: tt, tri: t, u, v });
+                            }
                         }
                     }
                 }
@@ -806,11 +1096,30 @@ impl Bvh {
             let node = &self.nodes[node_idx as usize];
             *visits += 1;
             if node.count > 0 {
-                let first = node.left_first as usize;
-                for &t in &self.tri_idx[first..first + node.count as usize] {
-                    if let Some((tt, _, _)) = moller_trumbore(scene, t, ray) {
-                        if tt > tmin && tt < tmax {
+                if node.is_gateway() {
+                    // GATEWAY: one shift per cell entry (see intersect_from).
+                    if node.leaf_count() > 0 {
+                        if tri_probe() {
+                            GATEWAY_ENTRIES.fetch_add(1, Ordering::Relaxed);
+                        }
+                        let off = self.gateway_offset(scene, node);
+                        let hit = if off != Vec3A::ZERO {
+                            let sray = Ray { o: ray.o - off, d: ray.d, inv_d: ray.inv_d };
+                            self.occluded_from(scene, &sray, tmin, tmax, node_idx + 1, visits)
+                        } else {
+                            self.occluded_from(scene, ray, tmin, tmax, node_idx + 1, visits)
+                        };
+                        if hit {
                             return true;
+                        }
+                    }
+                } else {
+                    let first = node.left_first as usize;
+                    for &t in &self.tri_idx[first..first + node.count as usize] {
+                        if let Some((tt, _, _)) = moller_trumbore(scene, t, ray) {
+                            if tt > tmin && tt < tmax {
+                                return true;
+                            }
                         }
                     }
                 }
@@ -941,17 +1250,38 @@ impl Bvh {
             let node = &self.nodes[node_idx as usize];
             *visits += 1;
             if node.count > 0 {
-                let first = node.left_first as usize;
-                for &t in &self.tri_idx[first..first + node.count as usize] {
-                    if let Some((tt, _, _)) = moller_trumbore(scene, t, ray) {
-                        if tt > tmin && tt < tmax {
-                            let m = &scene.materials[scene.tri_mat[t as usize] as usize];
-                            if m.transmission <= 0.0 {
-                                return true;
-                            }
-                            *tp *= m.shadow_tint();
-                            if tp.max_element() < SHADOW_TP_MIN {
-                                return true;
+                if node.is_gateway() {
+                    // GATEWAY: one shift per cell entry (see intersect_from);
+                    // `tp` threads through the nested call, so per-interface
+                    // tints inside a cell multiply exactly as before.
+                    if node.leaf_count() > 0 {
+                        if tri_probe() {
+                            GATEWAY_ENTRIES.fetch_add(1, Ordering::Relaxed);
+                        }
+                        let off = self.gateway_offset(scene, node);
+                        let opaque = if off != Vec3A::ZERO {
+                            let sray = Ray { o: ray.o - off, d: ray.d, inv_d: ray.inv_d };
+                            self.transmittance_from(scene, &sray, tmin, tmax, node_idx + 1, tp, visits)
+                        } else {
+                            self.transmittance_from(scene, ray, tmin, tmax, node_idx + 1, tp, visits)
+                        };
+                        if opaque {
+                            return true;
+                        }
+                    }
+                } else {
+                    let first = node.left_first as usize;
+                    for &t in &self.tri_idx[first..first + node.count as usize] {
+                        if let Some((tt, _, _)) = moller_trumbore(scene, t, ray) {
+                            if tt > tmin && tt < tmax {
+                                let m = &scene.materials[scene.tri_mat[t as usize] as usize];
+                                if m.transmission <= 0.0 {
+                                    return true;
+                                }
+                                *tp *= m.shadow_tint();
+                                if tp.max_element() < SHADOW_TP_MIN {
+                                    return true;
+                                }
                             }
                         }
                     }
@@ -988,14 +1318,20 @@ pub const SHADOW_TP_MIN: f32 = 1e-3;
 
 /// Build one pending subtree into a local arena: root at local 0, internal
 /// `left_first` = LOCAL node index (the stitch rebases them by one uniform
-/// +off), leaf ranges lifted to GLOBAL `tri_idx` positions here so the stitch
-/// never touches them. `tri_idx` is this subtree's disjoint slice; `base` is
-/// the slice's global start.
+/// +off), leaf ranges lifted to GLOBAL tri-buffer positions here so the
+/// stitch never touches them. `tri_idx` is this subtree's disjoint ITEM
+/// slice; `base` is the slice's global TRI-BUFFER start (== its item start
+/// when `gw` is None, since the item array is the tri buffer then). With
+/// `gw` Some, `gw.1` is the range's disjoint tri-buffer slice and leaf/
+/// gateway emission writes into it at LOCAL offsets; the `count > 0` lift
+/// below lands leaves, gateways AND the E filler (harmless — never
+/// dereferenced) at their global positions in one pass.
 fn build_subtree(
     tri_idx: &mut [u32],
     base: u32,
     tri_aabb: &[Aabb],
     centroids: &[Vec3A],
+    gw: Option<(&GatewayCtx, &mut [u32])>,
 ) -> Vec<BvhNode> {
     let mut nodes = Vec::new();
     nodes.push(BvhNode {
@@ -1003,7 +1339,8 @@ fn build_subtree(
         left_first: 0,
         count: tri_idx.len() as u32,
     });
-    subdivide_range(&mut nodes, 0, tri_idx, tri_aabb, centroids, &mut None);
+    let mut gphase = gw.map(|(ctx, tribuf)| GwPhase { ctx, tribuf });
+    subdivide_range(&mut nodes, 0, tri_idx, tri_aabb, centroids, &mut None, &mut gphase, 0);
     for nd in &mut nodes {
         if nd.count > 0 {
             nd.left_first += base;
@@ -1012,11 +1349,81 @@ fn build_subtree(
     nodes
 }
 
+/// Materialize one sway cell: the gateway node at `gw_i` (which MUST be the
+/// arena's current tail — the subtree lands implicitly at `gw_i + 1`) over
+/// the cell's truthful tri range, written to `tribuf` at `tri_first` in CSR
+/// (ascending-tri) order, then the rest-space-TIGHT subtree via the classic
+/// ctx-None recursion (inside a cell there are no pseudos, and `tri_aabb`'s
+/// first n entries are the unpadded rest boxes). The gateway's box is the
+/// subtree root's rest box padded by the cell's displacement bound — the
+/// ONE swept box — and must come out bit-equal to the pseudo-prim entry the
+/// parent binned with (same union, same order), which the debug_assert pins.
+fn emit_gateway(
+    nodes: &mut Vec<BvhNode>,
+    gw_i: usize,
+    pseudo: u32,
+    tri_first: u32,
+    tri_aabb: &[Aabb],
+    centroids: &[Vec3A],
+    g: &mut GwPhase<'_>,
+) {
+    debug_assert_eq!(gw_i + 1, nodes.len(), "gateway subtree must start at gw_i + 1");
+    let c = g.ctx.cell(pseudo);
+    let range = g.ctx.cell_range(c);
+    let cc = range.len();
+    debug_assert!(cc > 0, "empty sway cell reached the build");
+    g.tribuf[tri_first as usize..tri_first as usize + cc].copy_from_slice(range);
+    nodes.push(BvhNode {
+        aabb: Aabb::EMPTY,
+        left_first: tri_first,
+        count: cc as u32,
+    });
+    let sub_i = gw_i + 1;
+    let tb: &mut [u32] = g.tribuf;
+    subdivide_range(nodes, sub_i, tb, tri_aabb, centroids, &mut None, &mut None, 0);
+    let p = Vec3A::splat(g.ctx.pad[c]);
+    let sub_bb = nodes[sub_i].aabb;
+    let bb = Aabb { min: sub_bb.min - p, max: sub_bb.max + p };
+    debug_assert_eq!(
+        bb.min.to_array().map(f32::to_bits),
+        tri_aabb[pseudo as usize].min.to_array().map(f32::to_bits),
+        "gateway box drifted from its pseudo-prim entry"
+    );
+    nodes[gw_i] = BvhNode {
+        aabb: bb,
+        left_first: tri_first,
+        count: GATEWAY_BIT | cc as u32,
+    };
+}
+
+/// Gateway-mode leaf emission: the item range (all static tris here) is
+/// copied to its tri-buffer slot and the node's `left_first` moves from
+/// ITEM to TRI coordinates. `count` is already the tri count (static items
+/// have width 1). Without a ctx the item array IS the tri buffer and no
+/// copy exists — the classic path.
+fn emit_static_leaf(nodes: &mut [BvhNode], node_i: usize, items: &[u32], tri_first: u32, g: &mut GwPhase<'_>) {
+    g.tribuf[tri_first as usize..tri_first as usize + items.len()].copy_from_slice(items);
+    nodes[node_i].left_first = tri_first;
+}
+
 /// The recursive SAH subdivide, shared by both build phases. `first` in the
 /// node being subdivided is relative to `tri_idx` (phase 1 passes the whole
 /// array, so relative == global; phase 2 passes its subtree slice). With
 /// `pend` set (phase 1), a range at or under the threshold is recorded and
 /// left for phase 2 instead of being split.
+///
+/// GATEWAY mode (`gw` Some): `tri_idx` is the ITEM permutation (static tris
+/// + cell pseudo-prims) and `tri_first` is this range's cursor into the
+/// final tri buffer (`g.tribuf`), advanced by item WIDTHS. The rules, each
+/// load-bearing for the `gateway+1` adjacency: a range containing a pseudo
+/// NEVER becomes a leaf (force-split — the median fallback guarantees
+/// separation); a singleton-pseudo CHILD is materialized inline at child
+/// emission (never recursed, never pended) into the SECOND slot of its pair
+/// (child order in a pair is semantically free — traversal reorders by
+/// distance); a two-pseudo pair takes the CHERRY expansion `P(Q, G_B)`,
+/// `Q(E, G_A)` with E the empty filler leaf. The entry arm below only ever
+/// fires for a gateway ROOT (an all-one-cell build). With `gw` None every
+/// branch here collapses to the historical code path bit-identically.
 fn subdivide_range(
     nodes: &mut Vec<BvhNode>,
     node_i: usize,
@@ -1024,17 +1431,45 @@ fn subdivide_range(
     tri_aabb: &[Aabb],
     centroids: &[Vec3A],
     pend: &mut Option<(&mut Vec<Pending>, usize)>,
+    gw: &mut Option<GwPhase<'_>>,
+    tri_first: u32,
 ) {
     let (first, count) = {
         let node = &nodes[node_i];
         (node.left_first as usize, node.count as usize)
     };
+
+    // Gateway ROOT: the whole range is one cell. Must precede the pending
+    // check (a pended gateway root would tear the +1 adjacency at stitch).
+    if let Some(g) = gw.as_mut() {
+        if count == 1 && g.ctx.is_pseudo(tri_idx[first]) {
+            emit_gateway(nodes, node_i, tri_idx[first], tri_first, tri_aabb, centroids, g);
+            return;
+        }
+    }
+
+    // Width-sum (= tri count) of the range: the pending threshold and the
+    // child tri cursors live in TRI space. Equal to `count` without a ctx.
+    let (has_pseudo, wsum) = if let Some(g) = gw.as_ref() {
+        let mut hp = false;
+        let mut w = 0u32;
+        for &t in &tri_idx[first..first + count] {
+            hp |= g.ctx.is_pseudo(t);
+            w += g.ctx.width(t);
+        }
+        (hp, w as usize)
+    } else {
+        (false, count)
+    };
+
     if let Some((pending, threshold)) = pend {
-        if count <= *threshold {
+        if wsum <= *threshold {
             pending.push(Pending {
                 node_i: node_i as u32,
                 first: first as u32,
                 count: count as u32,
+                tri_first,
+                tri_count: wsum as u32,
             });
             return;
         }
@@ -1048,7 +1483,10 @@ fn subdivide_range(
     }
     nodes[node_i].aabb = bounds;
 
-    if count <= 2 {
+    if count <= 2 && !has_pseudo {
+        if let Some(g) = gw.as_mut() {
+            emit_static_leaf(nodes, node_i, &tri_idx[first..first + count], tri_first, g);
+        }
         return; // leaf
     }
 
@@ -1133,7 +1571,7 @@ fn subdivide_range(
     }
 
     let mut split_at = usize::MAX;
-    if best_axis != usize::MAX && (best_cost < leaf_cost || count > max_leaf) {
+    if best_axis != usize::MAX && (best_cost < leaf_cost || count > max_leaf || has_pseudo) {
         // In-place partition by bin threshold on the winning axis.
         let (axis, k, cmin) = (best_axis, best_k, best_cmin);
         let mut i = first;
@@ -1156,12 +1594,17 @@ fn subdivide_range(
     }
 
     if split_at == usize::MAX {
-        if count <= max_leaf {
+        if count <= max_leaf && !has_pseudo {
+            if let Some(g) = gw.as_mut() {
+                emit_static_leaf(nodes, node_i, &tri_idx[first..first + count], tri_first, g);
+            }
             return; // leaf
         }
         // Degenerate SAH (e.g., identical centroids) — median split on the
         // widest centroid axis. Phase 1 relies on a too-big node ALWAYS
-        // splitting, so this arm must stay unconditional above max_leaf.
+        // splitting, so this arm must stay unconditional above max_leaf —
+        // and a pseudo-carrying range relies on it the same way (count >= 2
+        // always yields two non-empty halves here).
         let axis = if ext.x >= ext.y && ext.x >= ext.z {
             0
         } else if ext.y >= ext.z {
@@ -1177,21 +1620,85 @@ fn subdivide_range(
         split_at = first + count / 2;
     }
 
+    // Child ranges in ITEM space and their TRI-buffer cursors (A's = ours;
+    // B's = ours + A's width-sum — cursors follow ITEM order regardless of
+    // which SLOT a range lands in below).
+    let (a_first, a_count) = (first, split_at - first);
+    let (b_first, b_count) = (split_at, first + count - split_at);
+    let (a_tri, b_tri) = if let Some(g) = gw.as_ref() {
+        let wa: u32 = tri_idx[a_first..a_first + a_count]
+            .iter()
+            .map(|&t| g.ctx.width(t))
+            .sum();
+        (tri_first, tri_first + wa)
+    } else {
+        // Without a ctx the item array IS the tri buffer: cursors unused by
+        // the classic arms below, kept in item coords for uniformity.
+        (a_first as u32, b_first as u32)
+    };
+
     let l = nodes.len();
     nodes.push(BvhNode {
         aabb: Aabb::EMPTY,
-        left_first: first as u32,
-        count: (split_at - first) as u32,
+        left_first: a_first as u32,
+        count: a_count as u32,
     });
     nodes.push(BvhNode {
         aabb: Aabb::EMPTY,
-        left_first: split_at as u32,
-        count: (first + count - split_at) as u32,
+        left_first: b_first as u32,
+        count: b_count as u32,
     });
     nodes[node_i].left_first = l as u32;
     nodes[node_i].count = 0;
-    subdivide_range(nodes, l, tri_idx, tri_aabb, centroids, pend);
-    subdivide_range(nodes, l + 1, tri_idx, tri_aabb, centroids, pend);
+
+    // Singleton-pseudo children are materialized HERE (never recursed, never
+    // pended): the gateway must sit in the SECOND slot of its pair so its
+    // subtree at +1 doesn't collide with the sibling, and it must be emitted
+    // BEFORE the sibling recursion so the subtree really lands at +1.
+    let a_sp = gw.as_ref().is_some_and(|g| a_count == 1 && g.ctx.is_pseudo(tri_idx[a_first]));
+    let b_sp = gw.as_ref().is_some_and(|g| b_count == 1 && g.ctx.is_pseudo(tri_idx[b_first]));
+    match (a_sp, b_sp) {
+        (false, false) => {
+            subdivide_range(nodes, l, tri_idx, tri_aabb, centroids, pend, gw, a_tri);
+            subdivide_range(nodes, l + 1, tri_idx, tri_aabb, centroids, pend, gw, b_tri);
+        }
+        (false, true) => {
+            // B is the gateway — already in the second slot.
+            let g = gw.as_mut().unwrap();
+            emit_gateway(nodes, l + 1, tri_idx[b_first], b_tri, tri_aabb, centroids, g);
+            subdivide_range(nodes, l, tri_idx, tri_aabb, centroids, pend, gw, a_tri);
+        }
+        (true, false) => {
+            // SWAP: slot l takes B (recursed), slot l+1 the gateway A. Child
+            // order within a pair is semantically free; the tri cursors keep
+            // following ITEM order (A's block precedes B's in the buffer).
+            nodes[l] = BvhNode { aabb: Aabb::EMPTY, left_first: b_first as u32, count: b_count as u32 };
+            nodes[l + 1] = BvhNode { aabb: Aabb::EMPTY, left_first: a_first as u32, count: 1 };
+            let g = gw.as_mut().unwrap();
+            emit_gateway(nodes, l + 1, tri_idx[a_first], a_tri, tri_aabb, centroids, g);
+            subdivide_range(nodes, l, tri_idx, tri_aabb, centroids, pend, gw, b_tri);
+        }
+        (true, true) => {
+            // CHERRY: two gateways can't be siblings (each needs its subtree
+            // at +1). Emit P(Q, G_B), Q(E, G_A) — E is the zero-tri filler
+            // leaf (leaf-shaped to every consumer, masked count 0 so the ray
+            // arm skips it). E deliberately carries a COPY of its sibling
+            // gateway's box, NOT Aabb::EMPTY: an inverted box's quantized
+            // ftree slot decodes to inf slack (measured — the self-test
+            // rejects it) and inverted-box distance math is a NaN hazard in
+            // every other consumer; a duplicate box costs one redundant slab
+            // test and can never lower a bound below what G_A itself reports.
+            let g = gw.as_mut().unwrap();
+            emit_gateway(nodes, l + 1, tri_idx[b_first], b_tri, tri_aabb, centroids, g);
+            let m = nodes.len();
+            nodes.push(BvhNode { aabb: Aabb::EMPTY, left_first: 0, count: GATEWAY_BIT });
+            nodes.push(BvhNode { aabb: Aabb::EMPTY, left_first: a_first as u32, count: 1 });
+            emit_gateway(nodes, m + 1, tri_idx[a_first], a_tri, tri_aabb, centroids, g);
+            let ga_box = nodes[m + 1].aabb;
+            nodes[m].aabb = ga_box;
+            nodes[l] = BvhNode { aabb: ga_box, left_first: m as u32, count: 0 };
+        }
+    }
 }
 
 /// Slab test: entry t if the ray hits the box within (tmin, tmax), else +INF.
@@ -1242,6 +1749,28 @@ pub(crate) fn grow_height_sweep(
         let pad = Vec3A::splat(HEIGHT_EDGE_EXTEND * d);
         bb.min -= pad;
         bb.max += pad;
+    }
+}
+
+/// Sway sweep of a leaf triangle's AABB (`--foliage-sway` v0.2, the swept-box
+/// phase): pad BOTH directions by `foliage::sway_pad` — the cell's
+/// displacement bound at the sweep multiplier — so the box contains the
+/// triangle at EVERY reachable pose (translation is signed). Every claim
+/// consumer (frustum queries, temporal cache, hemi bounds, structure replay,
+/// the ftree, the GPU's uploaded software trees) inherits soundness from
+/// this one site, exactly like `grow_height_sweep` above; the containment
+/// pin lives in `foliage::self_test` (one `sway_pad` serves the build and
+/// the pin — the `tri_height_depth` discipline). Gated on `Scene::sway`,
+/// which only exists under `foliage::sweep_armed()` — unarmed sessions and
+/// foliage-free scenes build the exact pre-sway tree, and the lever keys the
+/// .fcache (`scene_cache::lever_word` bit 5 + the sway word).
+#[inline]
+pub(crate) fn grow_sway_sweep(scene: &Scene, tri: u32, bb: &mut Aabb) {
+    let Some(sw) = &scene.sway else { return };
+    let pad = crate::foliage::sway_pad(sw, tri);
+    if pad > 0.0 {
+        bb.min -= Vec3A::splat(pad);
+        bb.max += Vec3A::splat(pad);
     }
 }
 
@@ -1604,6 +2133,7 @@ pub fn height_self_test() -> Result<(), String> {
             sky_sh: crate::sh::Sh9::ZERO,
             sky_scale: 1.0,
             night: 0.0,
+            sway: None,
             diag: 1.0,
             eps: 1e-4,
             ao_radius: 0.03,
@@ -1922,6 +2452,7 @@ pub fn tinted_shadow_self_test() -> Result<(), String> {
             sky_sh: crate::sh::Sh9::ZERO,
             sky_scale: 1.0,
             night: 0.0,
+            sway: None,
             diag: 1.0,
             eps: 1e-4,
             ao_radius: 0.03,
@@ -2027,8 +2558,73 @@ pub fn tinted_shadow_self_test() -> Result<(), String> {
     restore(r)
 }
 
+/// `FR_SWAY_TRI=1` — a SILENT read-only probe (the `FR_ORACLE` arming shape):
+/// count möller-trumbore triangle tests, and the subset that took a nonzero
+/// sway shift. Deliberately global CUMULATIVE relaxed atomics rather than the
+/// `LocalStats` batching discipline: the traversal loops thread a bare
+/// `visits: &mut u64`, so a batched test counter would mean a second
+/// out-param through every entry point and dozens of call sites — for a
+/// probe. The cost trade is documented instead: an ARMED run pays measurable
+/// per-test counting contention, so take COUNTS from an armed run and
+/// MILLISECONDS from an unarmed one — sound because `--spin` is
+/// deterministic (counters are bit-identical across runs). Unarmed cost is
+/// one initialized-OnceLock deref + a predictable branch per test, identical
+/// across every A/B arm, so it cancels in every delta.
+pub static TRI_TESTS: AtomicU64 = AtomicU64::new(0);
+pub static TRI_TESTS_SHIFTED: AtomicU64 = AtomicU64::new(0);
+/// Gateway subtree entries (nested descents), same probe discipline.
+pub static GATEWAY_ENTRIES: AtomicU64 = AtomicU64::new(0);
+pub fn tri_probe() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FR_SWAY_TRI").is_ok_and(|v| v != "0"))
+}
+
 #[inline(always)]
 fn moller_trumbore(scene: &Scene, tri: u32, ray: &Ray) -> Option<(f32, f32, f32)> {
+    if tri_probe() {
+        TRI_TESTS.fetch_add(1, Ordering::Relaxed);
+    }
+    // --foliage-sway: translate the ray into the leaf cell's REST space
+    // (equivalent to translating the triangle by +offset; t is preserved, so
+    // the caller's `o + t·d` lands on the DISPLACED surface, and a secondary
+    // ray re-entering here is shifted again — consistent by construction).
+    // Shadows the `ray` binding so the WHOLE tail — the MT test, the relief
+    // march, the alpha cutout — sees one space. Sound against every
+    // frustum/tmin claim because the build swept leaf AABBs by the
+    // displacement bound (`grow_sway_sweep`); every ray type funnels through
+    // here (the cutout argument verbatim), so the exact-zero verify gates
+    // stay like-for-like. `Scene::sway` is None on unarmed/foliage-free
+    // scenes and `offsets` are all-zero at the rest pose (headless paths) —
+    // both take the untouched original ray.
+    // GATEWAY MODE (the SAH default with sway armed) NEVER runs this head:
+    // the shift happened ONCE at the gateway entry (the traversal arms
+    // above), the ray is already in cell-rest space, and shifting again
+    // here would double-displace — plus this per-test `tri_cell` load is
+    // exactly the 20-69 MB random access the gateway restructure evicted
+    // from the hot loop. The head stays LIVE for the alt builders
+    // (lbvh/ploc/som keep the v0.2 per-tri-sweep + per-test-shift path).
+    // `FR_SWAY_ABL=noshift` skips the shift at run time in either mode —
+    // the cost probe. Unset = initialized-deref checks only.
+    let shifted;
+    let ray = match &scene.sway {
+        Some(sw)
+            if !crate::foliage::gateway_mode()
+                && !crate::foliage::sway_abl().noshift
+                && sw.tri_cell[tri as usize] != crate::foliage::STATIC_CELL =>
+        {
+            let off = sw.offset(sw.tri_cell[tri as usize]);
+            if off != Vec3A::ZERO {
+                if tri_probe() {
+                    TRI_TESTS_SHIFTED.fetch_add(1, Ordering::Relaxed);
+                }
+                shifted = Ray { o: ray.o - off, d: ray.d, inv_d: ray.inv_d };
+                &shifted
+            } else {
+                ray
+            }
+        }
+        _ => ray,
+    };
     let [i0, i1, i2] = scene.indices[tri as usize];
     let v0 = scene.positions[i0 as usize];
     let e1 = scene.positions[i1 as usize] - v0;

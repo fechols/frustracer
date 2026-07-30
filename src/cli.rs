@@ -415,18 +415,20 @@ pub struct Opts {
     pub fireflies_count: u32,
     /// `--dxr-inline 0|1|2` (`gpu::dxr::set_inline_mode`).
     pub dxr_inline: u32,
-    /// `--no-foliage-sway` clears (`foliage::set_armed`) — leaf sway, the v0
+    /// `--no-foliage-sway` clears (`foliage::set_armed`) — leaf sway, the
     /// prototype of the tetrahedral-cage epic (docs/design/animated-foliage.md):
     /// leaf triangles (foliage-classified + alpha-masked) bucket into per-cell
-    /// BLAS chunks and their TLAS instances TRANSLATE on the cloud clock in
-    /// DXR sessions. DEFAULT ON since 2026-07-28 (`--foliage-sway` spells the
-    /// default; the flip is safe because a scene with no leaf-classified
-    /// materials is STRUCTURALLY untouched — `split_plan` returns None, the
-    /// plan stays bit-identical — and every headless `--check*`/`--spin`/
-    /// cinematic path pins `sway_time: None`, so benchmarks and gates never
-    /// have geometry move under them). Off is bit-identical by construction.
-    /// Needs --blas-split (the default); the wavefront/CPU arms render the
-    /// rest pose.
+    /// chunks that TRANSLATE on the cloud clock — in ALL THREE render modes
+    /// since v0.2 (CPU rays displace at the intersector, wavefront + DXR bind
+    /// the animated TLAS ring; soundness from build-time swept leaf AABBs,
+    /// `bvh::grow_sway_sweep`). DEFAULT ON since 2026-07-28 (`--foliage-sway`
+    /// spells the default; safe because a scene with no leaf-classified
+    /// materials is STRUCTURALLY untouched — no partition attaches, the tree
+    /// and plan stay bit-identical — and every headless `--check*`/`--spin`
+    /// path stays at the rest pose, so benchmarks and gates never have
+    /// geometry move under them). Off is bit-identical by construction.
+    /// Needs --blas-split (the default — the attach predicate,
+    /// `foliage::sweep_armed`).
     pub foliage_sway: bool,
     /// `--foliage-amp <x>` (`foliage::set_amp_mult`) — taste multiplier on
     /// the sway amplitude (both curl and flutter halves), default 1.0;
@@ -1642,10 +1644,11 @@ pub fn usage() {
                 eprintln!("                fireflies and is bit-identical structurally)");
                 eprintln!("  --fireflies N   firefly count (default {}, max {})", fireflies::DEFAULT_COUNT, fireflies::MAX_FIREFLIES);
                 eprintln!("  --no-foliage-sway  disable wind-swayed foliage (ON by default: alpha-cutout leaves");
-                eprintln!("                bucket into per-cell BLAS chunks whose TLAS instances translate on the");
-                eprintln!("                cloud clock — DXR sessions only; a scene with no foliage-classified");
-                eprintln!("                materials is structurally untouched; off is bit-identical)");
-                eprintln!("  --foliage-amp X sway amplitude multiplier, 0..=8 (default 1)");
+                eprintln!("                bucket into per-cell chunks translated on the cloud clock — ALL render");
+                eprintln!("                modes (CPU/GPU/DXR; swept leaf AABBs keep every claim sound); a scene");
+                eprintln!("                with no foliage-classified materials is structurally untouched; off is");
+                eprintln!("                bit-identical)");
+                eprintln!("  --foliage-amp X sway amplitude multiplier, 0..=8 (default 1; >1 = one cold BVH rebuild)");
                 eprintln!("  --no-mips     no texture mip chains; every trilinear sample degenerates to the");
                 eprintln!("                pre-mip bilinear (A/B lever; mips are on by default — implies --no-aniso)");
                 eprintln!("  --no-h2n      don't Sobel-convert grayscale bump maps into normal maps (they are");

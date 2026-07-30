@@ -1,6 +1,197 @@
 # Animated foliage via tetrahedral cages — design doc
 
-**Status: v0.1, DEFAULT ON (2026-07-28)** — src/foliage.rs: the leaves-only /
+**Status: v0.3, GATEWAY SUBTREES — the CPU cost fix (2026-07-29, same day)**
+— §"Pad at TET granularity, never per-triangle" is now the implementation,
+not a warning: on the default SAH builder each sway cell's triangles build
+as a rest-space-TIGHT subtree behind ONE **gateway** node (`bvh::
+GATEWAY_BIT`, bit 31 of `count` — a TRUTHFUL FAT LEAF over the cell's
+contiguous `tri_idx` range, subtree implicitly at `gateway_idx + 1`, cell id
+derived from `tri_cell[tri_idx[left_first]]`), and the displacement pad
+lives on those ≤ MAX_CELLS gateway boxes instead of millions of leaf-tri
+boxes. Every bound/cut consumer (frustum `visit`/`refine_cut`, ftree,
+frustum.hlsli, temporal, oracle) reads a gateway as a LEAF — box distance,
+emit-don't-descend, conservative for every pose, and no rest-space
+descendant id can ever enter a cross-frame cut — with ZERO changes; only
+the three CPU ray loops descend, shifting the ray origin into cell-rest
+space ONCE per cell entry (`Bvh::gateway_offset` + a nested call — the
+paper's ray-transform trick at the cell boundary), which also deleted
+`moller_trumbore`'s per-test `tri_cell` load from the hot loop. Structural
+rules the build enforces (each gate-audited): a gateway only ever occupies
+the SECOND slot of its sibling pair; a two-gateway pair takes the CHERRY
+expansion `P(Q, G_B)`, `Q(E, G_A)` where the E filler is a zero-tri
+gateway-shaped leaf carrying a COPY of its sibling's box (an inverted EMPTY
+box measured `slack inf` in the quantized-ftree audit); pending build
+ranges are never gateway-rooted; `--sw-rays` descends gateways UNSHIFTED
+(the rest-pose known-accept, one mirrored arm in rt_sw.hlsli's three
+loops). The v0.2 per-tri sweep + per-test shift SURVIVES as the alt-builder
+(lbvh/ploc/som) fallback with a loud line — the built-in A/B.
+CACHE_VERSION 12 → 13 (same levers, different tree bytes).
+**MEASURED — the regression is gone** (min-of-N + cooldown, the FR_SWAY_ABL
+arms): SM-lp `--spin path` armed-vs-off 33.38 vs 32.99 ms (**+1.2%**, was
++13.0%), triangle tests 827.3M vs 828.9M (**−0.2%**, was +17.2% — cells
+make good SAH clusters); world canopy (cine hero 640×360×32, CPU) ANIMATED
+0.32 vs off 0.32 s/frame (**~0%**, was +27%), tests 32.10M vs 32.13M (was
++107%). Gates, all green ON THE GATEWAY TREE: flagless/stress `--check`
+(PNGs byte-identical; the sway-less zero-gateway pin), SM-lp `--check`
+(gateway audit 291/291 cells + 35 cherries, T5 cross-pose exact zeros),
+`--check-gpu` + `--check-dxr` animated (claim-violation 0, same-seed
+0.00e0, class-mismatch 0), `--check-gpu --sw-rays` (frontier must-fires
+through gateway descent), `--no-blas-split` (inverse pin), ploc smoke (the
+fallback arm), `cargo test`, plus the new synthetic all-foliage
+cherry/root-gateway scenes and the displaced-hit pin in
+`foliage::self_test`. The v0.2 "+28% canopy known-accept" below is
+HISTORICAL, and the per-island partition-scale follow-on is no longer a
+perf item — it survives purely as the world-amplitude LOOK question.
+
+**v0.3.1 — GRASS SWAY (2026-07-29, user request: "the trees sway but not
+the grass")**. Two independent gates were stopping the Minecraft ground
+plants, and both moved. (1) CLASSIFICATION: `Tall_Grass` was matclass's
+documented "accepted miss" — a bare `grass` token would mark the terrain
+block (on vokselia the single alpha-masked atlas leaves the class byte as
+the ONLY separator; rungholt's `Grass` also fails the mask gate via its
+RGB atlas, but the byte must hold alone). The foliage row now names the
+billboard plants EXACTLY — `Sub("tall_grass")`/`Sub("sugar_cane")`
+(underscored block names: effectively exact, `tokens()` splits on `_`) +
+`Tok` dandelion/rose/crops — with self-test pins on both atlas stems, the
+terrain inverse pins, and a `Rose_Wood_Table` table-order pin. Mushrooms
+stay static (Minecraft doesn't animate them). (2) AMPLITUDE:
+`height_factor` was 0 at the content floor ("grass barely stirs" was the
+design), so even classified grass froze; it is now floored at
+`SWAY_GROUND_K = 0.3`. Known-accepts, both texel-scale: a rigid billboard's
+base slides laterally (~30% of canopy amplitude — the in-game look) and the
+curl's vertical component can sink/lift it mm-to-cm. Soundness untouched by
+construction: the factor stays in [0.3, 1] and per-cell amp still feeds the
+one `displacement_bound_with`, so sweep pads / gateway boxes / audits track
+automatically. CACHE_VERSION 13 → 14 (the serialized class byte moves on
+rungholt/vokselia AND every armed tree's gateway pads grow).
+GATES: flagless `--check` (new matclass pins incl. the vokselia terrain
+inverse and `Rose_Wood_Table` table-order pin), rungholt/vokselia/SM-lp
+`--check` (foliage 2→7 / →6 materials, 495/728/291 cells, audits OK, T5
+zeros), SM-lp `--check-gpu` + `--check-dxr` ANIMATED at v14 (primary-t
+8/48, claim-violation 0, same-seed 0.00e0), `cargo test`, debug `--check`.
+**TWO PRE-EXISTING rungholt `--check-gpu` caveats, measured and attributed
+— NOT grass regressions** (rungholt's committed promise is `--check`, which
+passes; the GPU suites were never run on it): (1) `primary-t disagreement`
+FAILs animated at 520/480000 rel-t>1e-3 px (limit 48; class-mismatch 0,
+radiance A/B 0.025%) — displaced-canopy crack lips at grazing silhouette
+bands, where a mm-scale cell-seam step divided by sin(~1°) becomes a
+0.1-1.2-unit t split between the two intersectors. Attribution: rest pose
+= 3 px, sway-off = 0 FAILs, and a floor=0 probe (grass frozen, canopy
+moving) reproduces **exactly 520** — the set is 100% Leaves-canopy
+displacement, v0.2-class behavior, and the grass change moves it by ZERO.
+(2) the tinted-shadow must-fire is structurally unsatisfiable there:
+`reclassify_spray` retags ALL 150,723 water components at load (Minecraft
+water is per-block unwelded, every component under SPRAY_MAX_K), so zero
+transmissive triangles remain while `any_transmissive` still arms the
+gate. Both belong to the documented pose/scene caveat class; the mandated
+animated GPU proof stays SM-lp, which is green.
+
+**Status: v0.2, ALL THREE RENDER MODES, DEFAULT ON (2026-07-29)** — the
+design's "swept-box phase" landed: leaf-triangle AABBs are PADDED at BVH
+build by the displacement bound (`bvh::grow_sway_sweep` ←
+`foliage::sway_pad`, at `sweep_mult = max(1, --foliage-amp)`), which makes
+every frustum bound, temporal claim, structure-replay record and hemi query
+— all pure functions of node AABBs — conservative for EVERY pose. On that
+foundation each arm consumes motion at its intersector: the CPU shifts the
+ray into cell-rest space at the one `moller_trumbore` choke point
+(`Scene::sway` — ONE partition shared by the intersector, the sweep and the
+GPU split; per-frame offsets in relaxed atomics, baked by main.rs between
+traces — t is preserved so `o + t·d` lands on the displaced surface, and
+every downstream vertex read is a translation-invariant difference); the
+wavefront and DXR pipelines both bind the animated-TLAS ring
+(`TraceGpu::record_sway` / DxrGpu's stash — the reference kernel shares the
+bind, so R/C compares stay same-TLAS). THE FLUTTER RE-KEY was the
+correctness hole found in design validation: v0 hashed the BLAS RUN index,
+so cap-overflow runs of one cell fluttered apart and CPU/GPU poses could
+never agree — flutter now keys the PARTITION cell (`SwaySplit::cell_of`),
+and `foliage::self_test` pins runs-identical + CPU-bake ==
+GPU-keyed-translations bit-equality. Cache: the sweep changes the BUILT
+tree, so `lever_word` bit 5 (the attach predicate — armed AND blas-split
+on) + a `sway_word` (sweep-mult bits) key the sidecars, CACHE_VERSION 12;
+amp ≤ 1 shares the default cache, amp > 1 is one cold rebuild. Cinematic
+now animates too (one pose per OUTPUT frame at the clouds' f/fps clock —
+sub-frame replay stays bit-identical); `--spin` and headless gates stay at
+the rest pose EXCEPT the sway gates: `--check` bakes the WHOLE suite at the
+pinned check clock on foliage scenes and adds a CROSS-POSE temporal pass
+(cache produced at pose A, verified at pose B — false-sky/tmin-overshoot
+exactly 0, the sweep's direct proof), and `--check-gpu`/`--check-dxr` run
+their ENTIRE suites animated (CPU truth baked + ring on the same clock:
+claim-violation 0, same-seed wavefront-vs-reference exactly 0.00e0, DXR
+class-mismatch 0 — at amp 1 AND amp 8, where displacement is ~2 px, which
+pins instance translation == CPU translation through real silhouettes).
+MEASURED COST (4090, THE WORLD flagless config, ~90-window medians): DXR
+span 1.83 → 1.99 ms and wavefront 1.63 → 1.81 — in BOTH arms virtually all
+of it is the per-frame animated-TLAS rebuild (`dxr-sway-tlas` 0.175 ms;
+leaf kernel +0.013), NOT tree quality; the driver BLAS never sweeps. The
+CPU tracer pays the pad for real — see "CPU COST, DECOMPOSED" below (the
+2026-07-29 profiling campaign; it supersedes the ship gate's 2-rep +6% SM
+read, which was thermally lucky — min-of-5 interleaved says +13%).
+KNOWN-ACCEPT: shipped as-is because the CPU is not the flagless mode and
+the interactive budget controller absorbs it as resolution. The follow-on
+that would fix it — partition `scale` per leaf-cluster/island instead of
+the merged content diag — would ALSO shrink world sway amplitude ~6×, i.e.
+change the look the user approved, so it is deliberately deferred until the
+look is retuned with it. `--sw-rays` renders the rest pose (HLSL software
+rays read rest positions). Older history below.
+
+**CPU COST, DECOMPOSED (2026-07-29)** — the "mysteriously slow" CPU canopy
+bill, attributed by ablation algebra over four arms: A0 =
+`--no-foliage-sway` (tight tree, no lookup), A1 = armed +
+`FR_SWAY_ABL=noshift` (SWEPT tree, intersector arm skipped), A2 = armed +
+`FR_SWAY_ABL=rest` (swept tree + per-test `tri_cell` lookup, offsets zero —
+`--spin`'s own state), A3 = armed animated. The instruments are permanent:
+`foliage::sway_abl` (the `FR_ABL` idiom — loud on departure, one
+initialized-OnceLock deref unset) and the `FR_SWAY_TRI=1` triangle-test
+probe (`bvh::TRI_TESTS`/`TRI_TESTS_SHIFTED` — CUMULATIVE globals that
+deliberately bypass the `LocalStats` batching, so take COUNTS from an armed
+run and MILLISECONDS from an unarmed one; sound because `--spin` is
+deterministic. Printed as the stats line's `tri:` segment and a
+`cinematic tri-probe:` line). Measured (7950X3D, min-of-N + cooldown):
+
+| arm | SM-lp `--spin path` 1080p (min-of-5) | world canopy, cine hero 640×360×32 (min-of-3) |
+|---|---|---|
+| A0 tight tree | 33.19 ms | 0.33 s/frame |
+| A1 swept, no lookup | 36.69 (**+10.5%**) | 0.40 (**+21%**) |
+| A2 swept + lookup | 37.51 (+13.0%) | 0.40 |
+| A3 animated | — (spin pins rest) | 0.42 (+27%) |
+
+**THE VERDICT: the swept-box tree is ~80% of the bill everywhere; the
+intersector arm is ~2.5% (SM) to invisible (world); live animation adds at
+most ~5% (the resolution floor).** The mechanism the counters hid: the
+pad's damage lands BELOW `ray_nodes` — node visits rise only +3.3% while
+TRIANGLE TESTS rise **+17.2%** on SM (829M → 971M) and **+107%** on the
+canopy (32.1M → 66.7M, tests DOUBLE) — overlapping swept leaf boxes admit
+rays into many more leaves without proportionally more internal-node
+traffic, which is why `ray_nodes` under-predicted the wall cost (the
+"node counters are not milliseconds" maxim, demonstrated again; A1 == A2
+counts bit-equal prove the rest-pose lookup changes no traversal, and A3's
+tests are +0.4% vs A2 — animation barely moves counts, 53% of canopy tests
+land on animated leaf tris). The per-test lookup is cheap because SM-lp's
+11 MB `tri_cell` is V-cache-resident (~0.85 ns/test measured as A2−A1 =
+0.82 ms / 971M); do NOT build the leaf-tag/range-compare lookup fix — its
+whole ceiling is 2.5%. Tracy zone captures (v0.11.1 CLI tools; the
+machine's newer `C:\Tracy` install refuses the pinned 0.17.6 client)
+reconcile the attribution: the canopy delta is entirely inside
+`trace-full`/`replay` (sub-frame replay mean 9.71 → 12.78 ms, +32%; every
+other zone unmoved). RANKED FIXES, by the numbers: (1) the per-island/
+cluster partition scale already deferred above — it shrinks the PAD by the
+same ~6× it shrinks amplitude, attacking the 80% directly, and is the only
+fix that doesn't touch claim soundness (needs the look re-approved);
+(2) per-frame TIGHT boxes via a Gruen-style refit top level over cells
+(https://doi.org/10.1145/3820014) — deletes the sweep entirely but breaks
+the pose-INDEPENDENT box premise the temporal cache/replay cross-pose
+soundness rests on (the T5 gate), so it is an epic, not a patch;
+(3) nothing else measured is worth building.
+RESOLUTION (same day): neither ranked fix — v0.3's GATEWAY SUBTREES (the
+status paragraph at the top) took a third road that keeps the pose-
+independent-box premise AND the look: pads on ≤2048 pose-independent
+gateway boxes, tight rest-space interiors, the shift hoisted to one per
+cell entry. Re-measured on the same arms: SM +13.0% → +1.2%, canopy +27% →
+~0%, tests +17.2%/+107% → −0.2%/−0.1%. The probes (FR_SWAY_ABL /
+FR_SWAY_TRI / the `tri:` stats segment / `cinematic tri-probe:`) stay in
+the tree — they are how this table gets re-derived.
+
+**v0.1, DEFAULT ON (2026-07-28)** — src/foliage.rs: the leaves-only /
 translation-per-cell / DXR-only cut described under "Phase 1", minus tets and
 clipping (leaves are disconnected cutout geometry, so nothing can tear — the
 clipping machinery is deferred with the per-tet affine).

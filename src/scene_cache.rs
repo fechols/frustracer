@@ -59,7 +59,21 @@ use std::path::{Path, PathBuf};
 // verdict, the foliage-sway mask's signal) + the foliage/stone keyword-table
 // extension moved classify results for bistro/rungholt/vokselia, so a v10
 // sidecar's materials are stale both ways.
-pub const CACHE_VERSION: u32 = 11;
+// v12: foliage sway v0.2 (all render modes) — the BUILT tree's leaf-triangle
+// AABBs are swept by the displacement bound (`bvh::grow_sway_sweep`), so the
+// sidecar layout gains the `sway_word` u32 (the sweep multiplier's f32 bits,
+// 0 when unarmed) beside the lever word, and lever bit 5 keys the attach
+// predicate.
+// v13: foliage sway v0.3 gateway subtrees — the SAH build hosts sway cells
+// as GATEWAY fat leaves (bit 31 of `count`) with rest-space-tight subtrees
+// at +1, replacing the per-tri sweep (same levers, different tree bytes:
+// the shape changes under an IDENTICAL lever/sway word, hence the bump).
+// v14: grass sway — the matclass foliage row gained the Minecraft billboard
+// vocabulary (tall_grass/sugar_cane/dandelion/rose/crops → the serialized
+// `class` byte moves on rungholt/vokselia) and `height_factor` gained the
+// SWAY_GROUND_K floor (per-cell amps grow → the swept gateway boxes in the
+// serialized tree move too).
+pub const CACHE_VERSION: u32 = 14;
 const MAGIC: [u8; 8] = *b"FRSCACH\x01";
 
 /// Fixed on-disk material, `MatKind` flattened into (kind, param) — Marble
@@ -117,6 +131,19 @@ fn lever_word() -> u32 {
         // The water class refines the fountain's material (tint/ior/ripple +
         // no albedo lift), baked into the cached materials.
         | (crate::scene::water_enabled() as u32) << 4
+        // Foliage sway (the attach predicate): the sweep pads the BUILT
+        // tree's leaf AABBs — the height_armed class. The sweep MAGNITUDE
+        // additionally rides `sway_word` below (an f32 doesn't fit a bit).
+        | (crate::foliage::sweep_armed() as u32) << 5
+}
+
+/// The sway-sweep magnitude half of the cache key: `foliage::sweep_mult()`'s
+/// f32 bits when the attach predicate holds, 0 otherwise — an `--foliage-amp`
+/// above 1 pads the built tree wider, so a sidecar written under one
+/// multiplier must never be served under another (amp <= 1 all share the
+/// mult-1.0 pad, which contains their poses).
+fn sway_word() -> u32 {
+    if crate::foliage::sweep_armed() { crate::foliage::sweep_mult().to_bits() } else { 0 }
 }
 
 /// (size, mtime-ns) of a file, (0, 0) if absent — the staleness key.
@@ -226,8 +253,14 @@ fn validate_links(
         .all(|t| t.iter().all(|&i| (i as usize) < n_verts))
         && tri_mat.par_iter().all(|&m| (m as usize) < n_mats)
         && tri_idx.par_iter().all(|&t| (t as usize) < n_tris)
-        && disk_nodes.par_iter().all(|n| {
-            if n.count > 0 {
+        && disk_nodes.par_iter().enumerate().all(|(i, n)| {
+            if n.count & crate::bvh::GATEWAY_BIT != 0 {
+                // Sway gateway (truthful fat leaf): masked range in bounds,
+                // and a non-empty gateway's implicit +1 subtree must exist.
+                // The E filler (masked count 0) has no subtree by design.
+                let cc = (n.count & !crate::bvh::GATEWAY_BIT) as usize;
+                (cc == 0 || i + 1 < n_nodes) && n.left_first as usize + cc <= n_tri_idx
+            } else if n.count > 0 {
                 n.left_first as usize + n.count as usize <= n_tri_idx
             } else {
                 (n.left_first as usize) + 1 < n_nodes
@@ -457,6 +490,9 @@ pub fn try_load(src_path: &str) -> Option<(Scene, Bvh)> {
     if read_u32(&mut r).ok()? != lever_word() {
         return None;
     }
+    if read_u32(&mut r).ok()? != sway_word() {
+        return None;
+    }
     let (src_size, src_mtime) = stat_key(src);
     let (mtl_size, mtl_mtime) = stat_key(&mtl_sibling(src));
     if read_u64(&mut r).ok()? != src_size
@@ -550,6 +586,7 @@ pub fn try_load(src_path: &str) -> Option<(Scene, Bvh)> {
         sky_sh: crate::sh::Sh9::ZERO,
         sky_scale: 1.0,
         night: 0.0,
+        sway: None,
         diag: 0.0,
         eps: 0.0,
         ao_radius: 0.0,
@@ -587,6 +624,7 @@ pub fn store(src_path: &str, scene: &Scene, bvh: &Bvh) {
         // which versions the format.
         write_u64(&mut w, crate::bvh::build_key())?;
         write_u32(&mut w, lever_word())?;
+        write_u32(&mut w, sway_word())?;
         let (src_size, src_mtime) = stat_key(src);
         let (mtl_size, mtl_mtime) = stat_key(&mtl_sibling(src));
         write_u64(&mut w, src_size)?;
@@ -740,7 +778,10 @@ pub fn try_load_world(
     if read_u32(&mut r).ok()? != lever_word() {
         return None;
     }
-    // Counts at a FIXED offset (28), before the variable-length key blob —
+    if read_u32(&mut r).ok()? != sway_word() {
+        return None;
+    }
+    // Counts at a FIXED offset (32), before the variable-length key blob —
     // the zero-guard corruption test patches them by offset.
     let n_verts = read_u64(&mut r).ok()? as usize;
     let n_tris = read_u64(&mut r).ok()? as usize;
@@ -867,6 +908,7 @@ pub fn try_load_world(
         sky_sh: crate::sh::Sh9::ZERO,
         sky_scale: 1.0,
         night: 0.0,
+        sway: None,
         diag: 0.0,
         eps: 0.0,
         ao_radius: 0.0,
@@ -909,6 +951,7 @@ pub fn store_world(
         write_u32(&mut w, CACHE_VERSION)?;
         write_u64(&mut w, crate::bvh::build_key())?;
         write_u32(&mut w, lever_word())?;
+        write_u32(&mut w, sway_word())?;
         write_u64(&mut w, scene.positions.len() as u64)?;
         write_u64(&mut w, scene.indices.len() as u64)?;
         write_u64(&mut w, scene.materials.len() as u64)?;

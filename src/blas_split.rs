@@ -117,9 +117,14 @@ impl BlasPlan {
         while let Some(n) = stack.pop() {
             let node = &bvh.nodes[n as usize];
             if node.count > 0 {
+                // `leaf_count` masks the sway GATEWAY bit: a gateway is a
+                // truthful fat leaf whose range IS its whole cell (its +1
+                // subtree re-tiles the same tris, and is unreachable via
+                // child links, so nothing double-packs); the E filler's
+                // masked count is 0 and contributes nothing.
                 let f = node.left_first as usize;
                 self.packed_tris
-                    .extend_from_slice(&bvh.tri_idx[f..f + node.count as usize]);
+                    .extend_from_slice(&bvh.tri_idx[f..f + node.leaf_count() as usize]);
             } else {
                 // Right first so the left child pops first: DFS order, hence a
                 // deterministic plan for a fixed tree (the `Bvh::identical`
@@ -142,7 +147,7 @@ fn subtree_tris(bvh: &Bvh) -> Vec<u32> {
     while let Some((n, up)) = stack.pop() {
         let node = &bvh.nodes[n as usize];
         if node.count > 0 {
-            cnt[n as usize] = node.count;
+            cnt[n as usize] = node.leaf_count(); // gateway = its cell; E = 0
         } else if up {
             cnt[n as usize] =
                 cnt[node.left_first as usize] + cnt[node.left_first as usize + 1];
@@ -175,6 +180,12 @@ pub fn plan(bvh: &Bvh, max_prims: u32) -> BlasPlan {
     let mut scratch: Vec<u32> = Vec::new();
     while let Some(n) = stack.pop() {
         let node = &bvh.nodes[n as usize];
+        if cnt[n as usize] == 0 {
+            // The sway cherry's E filler (a zero-tri gateway-shaped spacer):
+            // skipping it here is what keeps a zero-prim chunk from ever
+            // being minted — `self_test` gates `prims == 0` at every cap.
+            continue;
+        }
         if cnt[n as usize] <= max_prims {
             p.emit(bvh, n, &mut scratch);
         } else if node.count > 0 {
@@ -184,7 +195,7 @@ pub fn plan(bvh: &Bvh, max_prims: u32) -> BlasPlan {
             // (all of them tagged with the same node id: the cut hook stays
             // truthful, one node simply owns several instances).
             let f = node.left_first as usize;
-            let total = node.count as usize;
+            let total = node.leaf_count() as usize; // gateway spans split too
             let mut off = 0;
             while off < total {
                 let take = (total - off).min(max_prims as usize);
@@ -237,7 +248,8 @@ pub fn self_test(bvh: &Bvh) -> Result<(), String> {
     // largest cap that PROVABLY forces the oversized-leaf split — see the
     // dedicated must-fire below, which is the only thing standing between that
     // branch and a silently vacuous gate.
-    let max_leaf = bvh.nodes.iter().filter(|n| n.count > 0).map(|n| n.count).max().unwrap_or(0);
+    let max_leaf =
+        bvh.nodes.iter().filter(|n| n.count > 0).map(|n| n.leaf_count()).max().unwrap_or(0);
 
     // Small caps exercise many chunks even on a small probe tree; the last is
     // the whole scene, which must degenerate to one chunk.
@@ -306,6 +318,8 @@ pub fn self_test(bvh: &Bvh) -> Result<(), String> {
             if marked[n as usize] {
                 reached += 1;
                 covered += cnt[n as usize] as usize;
+            } else if node.is_gateway() && node.leaf_count() == 0 {
+                // The E filler: zero tris, deliberately never a chunk.
             } else if node.count > 0 {
                 return Err(format!("cap {cap}: leaf {n} under no chunk"));
             } else {

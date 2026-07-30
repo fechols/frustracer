@@ -2452,13 +2452,16 @@ impl GpuContext {
     }
 
     /// The foliage-sway twin of `invalidate_replay`: forget every animated-
-    /// TLAS slot's baked clock. main.rs calls this on every DXR present-error
-    /// arm — a recorded-but-aborted frame marked its slot baked, but the TLAS
-    /// build never executed, and the skip fast-path would bind a TLAS that
-    /// was never written. Harmless when sway is off/absent.
+    /// TLAS slot's baked clock. main.rs calls this on every GPU present-error
+    /// arm (wavefront AND DXR since v0.2) — a recorded-but-aborted frame
+    /// marked its slot baked, but the TLAS build never executed, and the
+    /// skip fast-path would bind a TLAS that was never written. Routed
+    /// through the SHARED scene core, so one site covers both pipelines
+    /// (via `self.dxr` alone, a wavefront-only session was a silent no-op).
+    /// Harmless when sway is off/absent.
     pub fn invalidate_sway(&self) {
-        if let Some(d) = &self.dxr {
-            if let Some(sw) = d.scene.sway.as_ref() {
+        if let Some(s) = &self.scene_gpu {
+            if let Some(sw) = s.sway.as_ref() {
                 sw.invalidate();
             }
         }
@@ -3175,6 +3178,7 @@ impl GpuContext {
         q: crate::shade::Quality,
         clouds: crate::clouds::Clouds,
         fireflies: crate::fireflies::Fireflies,
+        sway_time: Option<f32>,
     ) -> Result<String> {
         let (tbuf, info, counters, px) = {
             let Some(tg) = &self.trace else {
@@ -3198,9 +3202,12 @@ impl GpuContext {
             // C verify then exercises the cloud code the session actually runs.
             clouds,
             fireflies,
-            // Wavefront-only path: sway is DXR-only and the C verify compares
-            // against the static TLAS both sides.
-            sway_time: None,
+            // The session's clock: BOTH lists bind the same (possibly
+            // animated) TLAS — record_wavefront rebuilds slot 0's ring TLAS
+            // and stashes the clock; record_reference reuses the stash, and
+            // its own record_rebuild would be a free bit-equal skip. The
+            // comparison stays same-intersector, same-TLAS.
+            sway_time,
             // verify_trace calls record_wavefront directly (not record_frame),
             // so this is dead — but the field must be set.
             replay: false,

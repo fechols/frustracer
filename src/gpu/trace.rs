@@ -1586,10 +1586,12 @@ pub struct SceneGpu {
     pub blas: ID3D12Resource,
     pub tlas: ID3D12Resource,
     /// `--foliage-sway` with leaf cells present (else None — every other
-    /// session is structurally the pre-sway build): the animated-TLAS ring a
-    /// DXR frame rebuilds per clock tick. The STATIC `tlas` above stays the
-    /// rest pose and keeps serving the wavefront tracer + every gate — the
-    /// frustum/temporal machinery never sees a moving triangle.
+    /// session is structurally the pre-sway build): the animated-TLAS ring
+    /// an animated frame rebuilds per clock tick — BOTH pipelines since
+    /// v0.2. The STATIC `tlas` above stays the rest pose and keeps serving
+    /// every headless gate/bench (sway_time None); the frustum/temporal
+    /// machinery is sound under motion because the uploaded software BVH's
+    /// leaf boxes are swept (`bvh::grow_sway_sweep`).
     pub sway: Option<SwayGpu>,
     /// `--blas-split` only (4-byte dummies otherwise): the reordered index
     /// stream the chunk BLASes were built over, and the remap the shaders read
@@ -2121,31 +2123,39 @@ impl SceneGpu {
         if let Some(cap) = crate::blas_split::max_prims() {
             let t0 = std::time::Instant::now();
             let mut plan = crate::blas_split::plan(bvh, cap);
-            // --foliage-sway: pull leaf triangles (foliage-classified +
-            // alpha-masked) out of the antichain chunks into per-cell chunks
-            // appended at the tail — each cell is one animated TLAS instance
-            // (src/foliage.rs; the static TLAS below still holds them at
-            // identity, so the wavefront tracer and every gate see the rest
-            // pose bit-for-bit).
-            let sway_split = if crate::foliage::armed() {
-                let mask = crate::foliage::leaf_materials(scene);
-                let sp = crate::foliage::split_plan(&mut plan, scene, &mask, cap);
-                match &sp {
-                    Some(s) => eprintln!(
-                        "foliage-sway: {} leaf tris -> {} cells (grid {:.3}, {} static chunks kept)",
-                        plan.packed_tris.len() as u32 - plan.chunk_base[s.first_chunk as usize],
-                        s.cells.len(),
-                        s.cell,
-                        s.first_chunk
-                    ),
-                    None => eprintln!(
-                        "foliage-sway: no leaf-classified (foliage + cutout) materials in this \
-                         scene — sway idle"
-                    ),
+            // --foliage-sway: pull leaf triangles out of the antichain chunks
+            // into per-cell chunks appended at the tail — each cell is one
+            // animated TLAS instance (src/foliage.rs). The partition comes
+            // ATTACHED on the scene (`Scene::sway`, the one partition the CPU
+            // intersector and BVH sweep already consumed — the cross-arm pose
+            // contract); the static TLAS below still holds every chunk at
+            // identity, the rest pose the headless gates trace.
+            let sway_split = match &scene.sway {
+                Some(sw) => {
+                    let sp = crate::foliage::split_plan(&mut plan, sw, cap);
+                    match &sp {
+                        Some(s) => eprintln!(
+                            "foliage-sway: {} leaf tris -> {} cells (grid {:.3}, {} static chunks kept)",
+                            plan.packed_tris.len() as u32 - plan.chunk_base[s.first_chunk as usize],
+                            s.cells.len(),
+                            s.cell,
+                            s.first_chunk
+                        ),
+                        None => eprintln!(
+                            "foliage-sway: attached partition maps no plan triangle — sway idle"
+                        ),
+                    }
+                    sp
                 }
-                sp
-            } else {
-                None
+                None => {
+                    if crate::foliage::sweep_armed() {
+                        eprintln!(
+                            "foliage-sway: no leaf-classified (foliage + cutout) materials in \
+                             this scene — sway idle"
+                        );
+                    }
+                    None
+                }
             };
             // The chunk index rides InstanceID (24 bits). No real scene comes
             // near this at a 64k cap; a tiny cap on a huge scene could, and a
@@ -2794,16 +2804,24 @@ fn align_as(x: u64) -> u64 {
 /// `o + t·d` on both GPU paths), and a full TLAS rebuild is recorded on the
 /// frame's own list (`PREFER_FAST_TRACE` at a few hundred to ~2k instances —
 /// three orders under the paper's measured 2.8M-instance/9.66 ms point).
-/// The static TLAS is never touched: the wavefront tracer, the CPU arm, and
-/// every gate keep binding the rest pose, which is what keeps the frustum
-/// claims / temporal ring / structure replay sound with zero new
-/// invalidation. Ring depth = FRAMES_IN_FLIGHT (the frame_cb contract);
-/// scratch is ONE buffer — successive builds are serialized by each frame's
-/// trailing queue-level UAV barrier.
+/// The static TLAS is never touched: it is the rest pose every headless
+/// gate/bench traces (sway_time None). Since v0.2 BOTH ray pipelines consume
+/// the ring (wavefront `TraceGpu` and DXR `DxrGpu` — each stashes the
+/// frame's clock and binds `tlas_va(slot)` when Some); frustum claims /
+/// temporal ring / structure replay stay sound because the software BVH's
+/// leaf boxes are SWEPT by the displacement bound at build
+/// (`bvh::grow_sway_sweep`), not because the pose is static. Ring depth =
+/// FRAMES_IN_FLIGHT (the frame_cb contract); scratch is ONE buffer —
+/// successive builds are serialized by each frame's trailing queue-level
+/// UAV barrier.
 pub struct SwayGpu {
     /// Chunks (== instances) `first_chunk..` are the sway cells.
     first_chunk: u32,
     cells: Vec<crate::foliage::SwayCell>,
+    /// Per-run PARTITION cell index — the flutter hash key (the v0.2 re-key:
+    /// runs of one overflowed cell translate identically, bit-equal to the
+    /// CPU bake of that cell).
+    cell_of: Vec<u32>,
     scale: f32,
     /// Rest-pose instance descs — identity transforms, compacted-BLAS VAs
     /// baked, InstanceID = chunk index; the per-frame patch source.
@@ -2855,6 +2873,7 @@ impl SwayGpu {
         Ok(SwayGpu {
             first_chunk: sp.first_chunk,
             cells: sp.cells,
+            cell_of: sp.cell_of,
             scale: sp.scale,
             tpl: tpl.to_vec(),
             inst_ring,
@@ -2873,8 +2892,8 @@ impl SwayGpu {
     /// Forget every slot's baked clock — the replay-invalidation class: a
     /// frame recorded-but-aborted (present error) marked its slot baked at
     /// RECORD time, but the build never executed, and the skip fast-path
-    /// would then bind a TLAS that was never written. Call from every DXR
-    /// present-error arm.
+    /// would then bind a TLAS that was never written. Call from every GPU
+    /// (wavefront AND DXR) present-error arm.
     pub fn invalidate(&self) {
         for b in &self.baked {
             b.set(f32::NAN);
@@ -2898,7 +2917,7 @@ impl SwayGpu {
             list.cast().map_err(|e| format!("ID3D12GraphicsCommandList4: {e}"))?;
         let n = self.tpl.len();
         let sz = std::mem::size_of::<D3D12_RAYTRACING_INSTANCE_DESC>();
-        let d = crate::foliage::translations(&self.cells, self.scale, time);
+        let d = crate::foliage::translations_keyed(&self.cells, &self.cell_of, self.scale, time);
         // Slot-fenced by begin_frame (the frame_cb contract), so the CPU
         // write cannot race the GPU read from 2 frames ago.
         unsafe {
@@ -3656,11 +3675,11 @@ pub struct FrameParams {
     /// (count 0 — every day session — writes neither).
     pub fireflies: crate::fireflies::Fireflies,
     /// --foliage-sway clock for THIS frame (the shared cloud_time), or None =
-    /// trace the static rest-pose TLAS. Consumed ONLY by the DXR pipeline
-    /// (DxrGpu rebuilds `SceneGpu::sway`'s ring TLAS and binds it); the
-    /// wavefront tracer ignores it, and every headless gate/bench passes
-    /// None — which, plus `sway: None` on unarmed uploads, is the structural
-    /// off-state (src/foliage.rs).
+    /// trace the static rest-pose TLAS. Consumed by BOTH ray pipelines since
+    /// v0.2 (each rebuilds `SceneGpu::sway`'s ring TLAS on its list and
+    /// binds it — DxrGpu via its sway_t stash, TraceGpu via `record_sway`);
+    /// every headless gate/bench passes None — which, plus `sway: None` on
+    /// unarmed uploads, is the structural off-state (src/foliage.rs).
     pub sway_time: Option<f32>,
     /// Structure-replay enable (opts.replay). When true AND this frame's basis
     /// bit-equals the previous producing frame's, `record_frame` re-dispatches
@@ -3754,6 +3773,14 @@ pub struct TraceGpu {
     /// `Cell` because the record_* methods take `&self`. record_frame replays
     /// only when `p.replay && last_struct == Some(p.cam)`.
     last_struct: std::cell::Cell<Option<CamBasis>>,
+    /// --foliage-sway clock for the frame being recorded (the DxrGpu shape,
+    /// but set by record_wavefront/record_wavefront_replay from their OWN
+    /// FrameParams — never write_cb, so the check/bench sites that skip
+    /// write_cb can't read a stale value). bind_common picks the animated
+    /// ring slot's TLAS when (this, scene.sway) are both Some; the reference
+    /// kernel shares bind_common, so an R/C comparison is same-TLAS by
+    /// construction.
+    sway_t: std::cell::Cell<Option<f32>>,
     /// The live SKY_SPLIT (see the const): the shader define and the
     /// multiplying prep's push constant MUST be the same number, so it is read
     /// once at kernel assembly and stored, never re-derived at the dispatch.
@@ -4444,6 +4471,7 @@ impl TraceGpu {
             pso_seed,
             pso_seed_replay,
             last_struct: std::cell::Cell::new(None),
+            sway_t: std::cell::Cell::new(None),
             sky_split,
             pso_prep,
             pso_prep_mul,
@@ -4686,10 +4714,15 @@ impl TraceGpu {
                 RP_SRV0 + SRV_MATERIALS,
                 s.materials.GetGPUVirtualAddress(),
             );
-            list.SetComputeRootShaderResourceView(
-                RP_SRV0 + SRV_TLAS,
-                s.tlas.GetGPUVirtualAddress(),
-            );
+            // --foliage-sway: an animated frame traces the ring slot's TLAS;
+            // everything else (rest-pose gates, None-clock frames, scenes
+            // with no sway cells) the pristine static TLAS. The rebuild was
+            // recorded by record_wavefront/_replay BEFORE this bind.
+            let tlas_va = match (self.sway_t.get(), &s.sway) {
+                (Some(_), Some(sw)) => sw.tlas_va(slot),
+                _ => s.tlas.GetGPUVirtualAddress(),
+            };
+            list.SetComputeRootShaderResourceView(RP_SRV0 + SRV_TLAS, tlas_va);
             // The scene-texture table (t0..t3 + texs[] in space1). The heap
             // must be set before the table; resolve/feed re-setting the same
             // heap later is redundant-but-legal.
@@ -4698,8 +4731,28 @@ impl TraceGpu {
         }
     }
 
+    /// --foliage-sway: stash the frame's clock and record the ring rebuild
+    /// (a bit-equal clock records nothing — the converging-still fast path).
+    /// MUST run before `bind_common`, which reads the stash to pick the
+    /// TLAS. Set from the record path's OWN FrameParams (never write_cb —
+    /// the check/bench sites that skip write_cb must not read stale). A
+    /// rebuild failure degrades THIS frame to the static rest pose with one
+    /// loud line, never a dead session.
+    fn record_sway(&self, list: &ID3D12GraphicsCommandList, slot: usize, p: &FrameParams) {
+        self.sway_t.set(p.sway_time);
+        if let (Some(t), Some(sw)) = (p.sway_time, &self.scene.sway) {
+            if let Err(e) = sw.record_rebuild(list, slot, t) {
+                eprintln!("foliage-sway: ring rebuild failed ({e}) — rest pose this frame");
+                self.sway_t.set(None);
+            }
+        }
+    }
+
     /// Record the vanilla full-screen reference trace (M2; also the on-GPU
     /// reference for the wavefront gates). Ends with a global UAV barrier.
+    /// Takes no FrameParams, so it traces whatever TLAS the last
+    /// `record_sway` stash selects — in a verify/R pair that is the SAME
+    /// (possibly animated) TLAS the wavefront half traced, by construction.
     pub fn record_reference(&self, list: &ID3D12GraphicsCommandList, slot: usize) {
         let _ev = super::pix::scope(list, c"reference");
         unsafe {
@@ -4823,6 +4876,7 @@ impl TraceGpu {
     ) {
         let fb_mode = fb_mode_of(&p.q);
         let _ev = super::pix::scope(list, c"wavefront");
+        self.record_sway(list, slot, p);
         unsafe {
             self.bind_common(list, slot);
             // --sw-rays + cut consumption: the ladder reads ft_bnode at t1
@@ -5056,6 +5110,10 @@ impl TraceGpu {
     ) {
         let fb_mode = fb_mode_of(&p.q);
         let _ev = super::pix::scope(list, c"wavefront-replay");
+        // Replay skips the ladder, NOT the rays: leaf fills re-trace against
+        // whatever TLAS is bound, so the ring rebuild records here too (free
+        // on a frozen clock — the bit-equal skip).
+        self.record_sway(list, slot, p);
         unsafe {
             self.bind_common(list, slot);
             // Root UAVs u5/u6 are NOT bound by bind_common; the replay list is
@@ -5204,6 +5262,9 @@ impl TraceGpu {
                 self.record_wavefront(list, slot, p, false);
             }
         } else {
+            // The R-toggle reference frame consumes the SAME clock the
+            // wavefront would (record_reference itself takes no params).
+            self.record_sway(list, slot, p);
             self.record_reference(list, slot);
         }
     }

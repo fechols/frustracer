@@ -345,6 +345,7 @@ fn merge_scenes(parts: Vec<(Scene, Vec3A)>, field_half: f32) -> Scene {
         sky_sh: crate::sh::Sh9::ZERO,
         sky_scale: 1.0,
         night: 0.0,
+        sway: None,
         diag: 0.0,
         eps: 0.0,
         ao_radius: 0.0,
@@ -470,6 +471,10 @@ fn load_part(resolved: &str) -> (Scene, LoadKind) {
     // v8 world cold boots skipped the retag and wrote WRONG sidecars under
     // the same key (the v9 bump invalidated them).
     scene::reclassify_spray(&mut s);
+    // Foliage-sway partition, byte-interchangeability again: the per-island
+    // sidecar must hold the SAME swept tree a direct single-scene load of
+    // this part would store under the identical sway_word key.
+    crate::foliage::attach(&mut s);
     let bvh = crate::bvh::Bvh::build(&s);
     crate::scene_cache::store(resolved, &s, &bvh);
     (s, LoadKind::Cold)
@@ -597,7 +602,7 @@ pub fn world_scene() -> Option<(Scene, World, crate::bvh::Bvh)> {
         merge_in.push((s, centers[i]));
     }
     crate::progress::phase(crate::progress::Phase::Merge, "", 0);
-    let world = merge_scenes(merge_in, field_half);
+    let mut world = merge_scenes(merge_in, field_half);
     eprintln!(
         "world: {} islands | {:.1}M tris | field {:.0}x{:.0} | diag {:.1} | loaded+merged in {:.1} s",
         islands.len(),
@@ -607,6 +612,11 @@ pub fn world_scene() -> Option<(Scene, World, crate::bvh::Bvh)> {
         world.diag,
         t0.elapsed().as_secs_f64(),
     );
+    // Foliage-sway partition over the MERGED scene (world-scale content box)
+    // — before the world BVH build below, whose leaf boxes sweep by it.
+    // main.rs's post-match attach recomputes the identical partition (pure
+    // function of the merged geometry + class bytes).
+    crate::foliage::attach(&mut world);
     // The world BVH builds HERE (not main.rs's shared arm) so the sidecar
     // can store it — the single-scene cold path's `prebuilt` precedent.
     // Indeterminate (~8.8 s of parallel build — no per-node signal).
@@ -1120,7 +1130,8 @@ pub fn self_test() -> Result<(), String> {
         }
 
         // Corruption: bad magic, wrong WORLD_VERSION (offset 8), a zeroed
-        // count (fixed offset 28), truncations — every one a silent miss.
+        // count (fixed offset 32 — after magic 8 + version 8 + build_key 8 +
+        // lever 4 + sway 4), truncations — every one a silent miss.
         let bytes = std::fs::read(&cache).map_err(|e| format!("worldtest read-back: {e}"))?;
         let patched = dir.join("world-patched.fcache");
         let mut b2 = bytes.clone();
@@ -1136,7 +1147,7 @@ pub fn self_test() -> Result<(), String> {
             return err("world cache: served despite a WORLD_VERSION change".into());
         }
         let mut b2 = bytes.clone();
-        b2[28..36].fill(0); // n_verts = 0 — the zero-count guard
+        b2[32..40].fill(0); // n_verts = 0 — the zero-count guard
         std::fs::write(&patched, &b2).map_err(|e| e.to_string())?;
         if scene_cache::try_load_world(&patched, &key).is_some() {
             return err("world cache: served despite a zeroed count".into());

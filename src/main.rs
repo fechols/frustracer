@@ -526,9 +526,10 @@ fn main() {
         eprintln!("--bvh-builder: unknown builder '{}' (sah | lbvh | ploc | som)", opts.bvh_builder);
         std::process::exit(2);
     }
-    // GPU-only and read at SceneGpu upload (both tracers), so it may land any
-    // time before a GPU tracer is built — but it belongs with the other
-    // build-shape levers, and the startup line is the arming signal.
+    // Read at SceneGpu upload (both tracers) AND — since foliage-sway v0.2 —
+    // at scene load (`foliage::sweep_armed` gates the partition attach and
+    // the cache's lever bit 5 on it), so it MUST land before load_scene,
+    // with the other loader levers.
     blas_split::set_max_prims(opts.blas_split);
     // Silent at the default — the `gpu scene:` line already reports the chunk
     // count, and this is now every GPU session. Only a DEPARTURE speaks.
@@ -841,6 +842,11 @@ fn load_scene(req: &SceneRequest) -> LoadedScene {
                     scene::derive_heights(&mut s);
                     // Spray reclassification, same cold-load-only placement.
                     scene::reclassify_spray(&mut s);
+                    // Foliage-sway partition: AFTER the class bytes/spray
+                    // settle, BEFORE the build below — the sweep
+                    // (bvh::grow_sway_sweep) reads it, and the stored sidecar
+                    // must hold the swept tree its sway_word key claims.
+                    foliage::attach(&mut s);
                     // Under --tile the untiled build's ONLY use is feeding the
                     // cache store (the tiled BVH is always a fresh build) — and
                     // glTF skips the cache, so a tiled glTF run skips this.
@@ -921,6 +927,15 @@ fn load_scene(req: &SceneRequest) -> LoadedScene {
             cam0.pos.x, cam0.pos.y, cam0.pos.z, t.x, t.y, t.z
         );
     }
+    // Foliage-sway partition, the post-match site: warm sidecar loads hand
+    // back a SWEPT tree (the sway_word key) but a partition-less Scene —
+    // recompute it (deterministic, one linear pass) so the CPU intersector
+    // and the GPU split see the cells the cached sweep was built from. Also
+    // covers --tile (fresh geometry, fresh build below), the world's merged
+    // scene (world_scene attached before ITS build — this recomputes the
+    // identical partition), and is a structural no-op on procedural/stress
+    // scenes (no foliage classes) and unarmed sessions.
+    foliage::attach(&mut scene);
     progress::phase(progress::Phase::Bvh, "", 0);
     let t0 = Instant::now();
     let bvh = prebuilt.unwrap_or_else(|| bvh::Bvh::build(&scene));
@@ -999,6 +1014,23 @@ fn run_check_dxr(
         eprintln!("check-dxr: {e}");
         return 2;
     }
+    // Foliage-sway (v0.2): on a foliage scene the ENTIRE suite runs ANIMATED
+    // — the CPU truth bakes at the pinned check clock and every DispatchRays
+    // frame hands the SAME clock to the animated-TLAS ring, so the two poses
+    // are bit-equal by the flutter re-key contract and every existing gate
+    // (primary-visibility class-mismatch, the 64-frame radiance A/B, the
+    // feed/pack gates) doubles as the animated-config gate. Procedural/
+    // stress scenes (no partition) and --no-blas-split stay at rest.
+    let check_sway: Option<f32> = scene.sway.as_deref().map(|sw| {
+        foliage::bake(sw, clouds::CLOUD_CHECK_TIME);
+        eprintln!(
+            "check-dxr: foliage-sway ANIMATED at t={} ({} cells) — CPU baked, ring on the \
+             same clock",
+            clouds::CLOUD_CHECK_TIME,
+            sw.cells.len()
+        );
+        clouds::CLOUD_CHECK_TIME
+    });
     let caps = gpu::trace::query_caps(&hg.device).unwrap();
     eprintln!(
         "check-dxr: RT tier {}.{}, shader model {}.{}",
@@ -1169,7 +1201,7 @@ fn run_check_dxr(
                 probe_sample: 0,
                 clouds: crate::clouds::Clouds::check(scene.diag),
             fireflies: crate::fireflies::Fireflies::check(scene),
-            sway_time: None,
+            sway_time: check_sway,
             replay: false,
             },
         );
@@ -1266,7 +1298,7 @@ fn run_check_dxr(
                     probe_sample: 0,
                     clouds: crate::clouds::Clouds::check(scene.diag),
                     fireflies: crate::fireflies::Fireflies::check(scene),
-                    sway_time: None,
+                    sway_time: check_sway,
                     replay: false,
                 };
                 dg_off.write_cb(0, &p0);
@@ -1367,7 +1399,7 @@ fn run_check_dxr(
                 probe_sample: probe,
                 clouds: crate::clouds::Clouds::check(scene.diag),
             fireflies: crate::fireflies::Fireflies::check(scene),
-            sway_time: None,
+            sway_time: check_sway,
             replay: false,
             };
             dg.write_cb(0, &p);
@@ -1593,7 +1625,7 @@ fn run_check_dxr(
                 probe_sample: 0,
                 clouds: crate::clouds::Clouds::check(scene.diag),
             fireflies: crate::fireflies::Fireflies::check(scene),
-            sway_time: None,
+            sway_time: check_sway,
             replay: false,
             };
             dg2.write_cb(0, &p);
@@ -1925,7 +1957,7 @@ fn run_check_dxr(
                     probe_sample: 0,
                     clouds: crate::clouds::Clouds::check(scene.diag),
             fireflies: crate::fireflies::Fireflies::check(scene),
-            sway_time: None,
+            sway_time: check_sway,
             replay: false,
                 };
                 dg2.write_cb(0, &p);
@@ -2829,6 +2861,26 @@ fn run_check_gpu(
         }
     };
     eprintln!("check-gpu: adapter \"{}\"", hg.adapter_name);
+    // Foliage-sway (v0.2): on a foliage scene the ENTIRE suite runs ANIMATED
+    // — the CPU truth (tbuf oracles, hemi probe sets) bakes at the pinned
+    // check clock, and every wavefront/reference record hands the SAME clock
+    // to the animated-TLAS ring via record_sway, so the claim-violation /
+    // false-sky / tmin-overshoot exact-zeros and the same-seed
+    // wavefront-vs-reference image A/B all gate the animated configuration
+    // (both kernels bind the SAME animated TLAS). Poses are bit-equal
+    // cross-arm by the flutter re-key contract. Procedural/stress scenes
+    // (no partition) and --no-blas-split sessions stay at the rest pose —
+    // the pre-v0.2 suite verbatim.
+    let check_sway: Option<f32> = scene.sway.as_deref().map(|sw| {
+        foliage::bake(sw, clouds::CLOUD_CHECK_TIME);
+        eprintln!(
+            "check-gpu: foliage-sway ANIMATED at t={} ({} cells) — CPU baked, ring on the \
+             same clock",
+            clouds::CLOUD_CHECK_TIME,
+            sw.cells.len()
+        );
+        clouds::CLOUD_CHECK_TIME
+    });
     let caps = match gpu::trace::require_caps(&hg.device) {
         Ok(c) => c,
         Err(e) => {
@@ -3042,7 +3094,7 @@ fn run_check_gpu(
             probe_sample: 0,
             clouds: crate::clouds::Clouds::check(scene.diag),
             fireflies: crate::fireflies::Fireflies::check(scene),
-            sway_time: None,
+            sway_time: check_sway,
             replay: false,
         });
         hg.run(|l| tg.record_reference(l, 0))
@@ -3268,7 +3320,7 @@ fn run_check_gpu(
         probe_sample: 0,
         clouds: crate::clouds::Clouds::check(scene.diag),
             fireflies: crate::fireflies::Fireflies::check(scene),
-            sway_time: None,
+            sway_time: check_sway,
             replay: false,
     };
     tg.write_cb(0, &wf_params);
@@ -3879,7 +3931,7 @@ fn run_check_gpu(
             probe_sample: 0,
             clouds: crate::clouds::Clouds::check(scene.diag),
             fireflies: crate::fireflies::Fireflies::check(scene),
-            sway_time: None,
+            sway_time: check_sway,
             replay,
         };
         let read4 = |hg: &mut gpu::trace::HeadlessGpu| -> Result<(Vec<f32>, Vec<u32>, Vec<f32>, Vec<u32>), String> {
@@ -4047,7 +4099,7 @@ fn run_check_gpu(
                 probe_sample: probe,
                 clouds: crate::clouds::Clouds::check(scene.diag),
             fireflies: crate::fireflies::Fireflies::check(scene),
-            sway_time: None,
+            sway_time: check_sway,
             replay: false,
             };
             tg.write_cb(0, &p);
@@ -4226,7 +4278,7 @@ fn run_check_gpu(
                 probe_sample: 0,
                 clouds: crate::clouds::Clouds::check(scene.diag),
             fireflies: crate::fireflies::Fireflies::check(scene),
-            sway_time: None,
+            sway_time: check_sway,
             replay: false,
             });
             if let Err(e) = tg.run_hemi_probes(&mut hg, 0, &probes, fb.depth, s == 0) {
@@ -4404,7 +4456,7 @@ fn run_check_gpu(
             probe_sample: 0,
             clouds: crate::clouds::Clouds::check(scene.diag),
             fireflies: crate::fireflies::Fireflies::check(scene),
-            sway_time: None,
+            sway_time: check_sway,
             replay: false,
         };
         tg.write_cb(0, &p);
@@ -4496,7 +4548,7 @@ fn run_check_gpu(
                 probe_sample: 0,
                 clouds: crate::clouds::Clouds::check(scene.diag),
             fireflies: crate::fireflies::Fireflies::check(scene),
-            sway_time: None,
+            sway_time: check_sway,
             replay: false,
             };
             ptg.write_cb(0, &p);
@@ -4920,7 +4972,7 @@ fn run_check_gpu(
                     probe_sample: 0,
                     clouds: crate::clouds::Clouds::check(scene.diag),
             fireflies: crate::fireflies::Fireflies::check(scene),
-            sway_time: None,
+            sway_time: check_sway,
             replay: false,
                 };
                 ptg.write_cb(0, &p);
@@ -5547,7 +5599,7 @@ fn run_check_gpu(
                 probe_sample: 0,
                 clouds: crate::clouds::Clouds::check(scene.diag),
             fireflies: crate::fireflies::Fireflies::check(scene),
-            sway_time: None,
+            sway_time: check_sway,
             replay: false,
             };
             btg.write_cb(0, &p);
@@ -5576,7 +5628,7 @@ fn run_check_gpu(
                 probe_sample: 0,
                 clouds: crate::clouds::Clouds::check(scene.diag),
             fireflies: crate::fireflies::Fireflies::check(scene),
-            sway_time: None,
+            sway_time: check_sway,
             replay: false,
             };
             btg.write_cb(0, &p);
@@ -8454,6 +8506,12 @@ struct CineFrame {
     hour: Option<f32>,
     clouds: clouds::Clouds,
     fireflies: fireflies::Fireflies,
+    /// The foliage-sway clock — the SAME real-seconds output-frame value the
+    /// clouds take, so wind and leaves move on one clock. `cine_frame_state`
+    /// baked `Scene::sway` at it (CPU arm); the GPU arm hands it to
+    /// `FrameParams::sway_time`. One pose per OUTPUT frame — invariant 1's
+    /// shape, which is what keeps sub-frame replay bit-identical.
+    sway_time: f32,
 }
 
 /// Bake one output frame's world state. `scene` is mutated iff the hour moved,
@@ -8479,12 +8537,21 @@ fn cine_frame_state(
             *prev_hour = Some(h);
         }
     }
+    // Foliage-sway: bake the pose at the clouds' own real-seconds clock
+    // (v0.2 — media frames animate; the pose is a pure function of the
+    // OUTPUT frame, so any frame re-renders in isolation, invariant 3's
+    // rule). No-op when unarmed / no foliage.
+    let sway_time = f as f32 / cine.fps.max(1) as f32;
+    if let Some(sw) = scene.sway.as_deref() {
+        foliage::bake(sw, sway_time);
+    }
     CineFrame {
         cam,
         hour,
         // Real-seconds clock, and a function of the OUTPUT frame only.
         clouds: clouds::Clouds::cine(scene.diag, f, cine.fps),
         fireflies: fireflies::Fireflies::cine(scene, f, cine.fps),
+        sway_time,
     }
 }
 
@@ -8761,6 +8828,17 @@ fn cine_finish(dir: &str, shot: &cinematic::Shot, t0: Instant) {
         el,
         el / shot.kind.frames().max(1) as f64
     );
+    // FR_SWAY_TRI probe surface — cinematic never prints a stats line, and
+    // the world canopy shot is the sway cost's home workload (see bvh.rs's
+    // probe doc). Silent unarmed.
+    if bvh::tri_probe() {
+        use std::sync::atomic::Ordering::Relaxed;
+        eprintln!(
+            "cinematic tri-probe: tests {} shifted {} (cumulative)",
+            bvh::TRI_TESTS.load(Relaxed),
+            bvh::TRI_TESTS_SHIFTED.load(Relaxed)
+        );
+    }
 }
 
 /// The GPU arms of `--cinematic`: the `run_spin_gpu` skeleton (HeadlessGpu +
@@ -8909,10 +8987,11 @@ fn run_cinematic_gpu(
                     probe_sample: 0,
                     clouds: fs.clouds,
                     fireflies: fs.fireflies,
-                    // Cinematic renders the rest pose in v0: an accumulating
-                    // output frame wants ONE pose, and the sway freeze rule
-                    // for media frames is the follow-on (the design doc).
-                    sway_time: None,
+                    // Foliage-sway (v0.2): ONE pose per output frame — the
+                    // same clock the CPU arm baked, so both arms capture the
+                    // identical gust; sub-frames share it (the ring rebuild
+                    // is a bit-equal skip after the first).
+                    sway_time: Some(fs.sway_time),
                     // Structure replay across the sub-frames of one output
                     // frame: the pose is bit-identical, so k > 0 re-dispatches
                     // the persisted terminal queues and skips the whole level
@@ -9494,6 +9573,22 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     let cam = cam0.basis(rw, rh);
     let q = Quality::preset(2);
     let stats = Stats::default();
+
+    // Foliage-sway pose for the WHOLE suite (v0.2): bake at the pinned check
+    // clock — NONZERO, so every gate that follows (verify's reference
+    // re-trace, replay bit-identity, the temporal family, hemi, spp) runs
+    // against DISPLACED leaves, not the rest pose that exercises nothing.
+    // Sound like-for-like because the reference rays share the intersector
+    // choke point; structural no-op when no partition is attached
+    // (procedural/stress scenes, unarmed sessions).
+    if let Some(sw) = scene.sway.as_deref() {
+        foliage::bake(sw, clouds::CLOUD_CHECK_TIME);
+        eprintln!(
+            "foliage: check pose baked at t={} ({} cells)",
+            clouds::CLOUD_CHECK_TIME,
+            sw.cells.len()
+        );
+    }
 
     // Mip-chain / trilinear / aniso gates: chain shape, linear-space
     // filtering, sRGB roundtrip, level/lerp mechanics, the anisotropic tap
@@ -11155,6 +11250,16 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     let mut cam_c = cam_b;
     cam_c.yaw += 0.05;
     temporal_pass("dolly+yaw", &cam_c.basis(rw, rh), None, false, false, false);
+    // T5 (foliage scenes only): CROSS-POSE claim reuse — re-bake the sway
+    // pose to a DIFFERENT clock and consume the pose-A cache under the
+    // dolly. The build-time sweep is what makes a claim valid for EVERY
+    // pose; a pad regression surfaces here as false-sky / tmin-overshoot.
+    // Restored after, so the rest of the suite keeps the one check pose.
+    if let Some(sw) = scene.sway.as_deref() {
+        foliage::bake(sw, clouds::CLOUD_CHECK_TIME + 2.0);
+        temporal_pass("sway cross-pose dolly", &basis_b, None, true, false, false);
+        foliage::bake(sw, clouds::CLOUD_CHECK_TIME);
+    }
     // T5: pure rotation — the region-min query's structural win: δ = 0, the
     // old proven-empty balls are unchanged in world space, and panned-into
     // sky tiles overlap only old sky cells → free. Seeds are NOT asserted:
@@ -13401,8 +13506,11 @@ fn session(
                 Err(e) => {
                     // A recorded-but-aborted producing frame: the wavefront's
                     // persisted structure claims a frame the GPU never
-                    // finished (the existing GPU present-error discipline).
+                    // finished (the existing GPU present-error discipline),
+                    // and the sway ring's baked clocks claim builds that
+                    // never executed.
                     gpu.invalidate_replay();
+                    gpu.invalidate_sway();
                     present_fails += 1;
                     if present_fails == 1 {
                         eprintln!(
@@ -13774,6 +13882,10 @@ fn session(
             //    capture trace never sees the old wireframe as geometry.
             if let Some(a) = frust.take() {
                 frustcap::clear(scene, a);
+                // Re-attach the foliage partition BEFORE the rebuild: the
+                // tri set changed, and a stale tri_cell (wrong length) would
+                // index out of bounds in the intersector.
+                foliage::attach(scene);
                 *bvh = bvh::Bvh::build(scene);
             }
             if edges.capture_frustum {
@@ -13823,6 +13935,10 @@ fn session(
                 // 3. Build the near-quad wireframe, append it, rebuild the BVH.
                 let (n_leaves, _) = cap_cache.counts();
                 let art = frustcap::build(scene, &cap_basis, &cap_cache, n_leaves);
+                // Appended wireframe tris lengthen the tri set — re-attach
+                // (the wireframe material is not foliage-classed, so the
+                // cells themselves don't move; tri_cell must cover them).
+                foliage::attach(scene);
                 *bvh = bvh::Bvh::build(scene);
                 frust = Some(art);
                 eprintln!(
@@ -14237,6 +14353,9 @@ fn session(
                     base_q,
                     crate::clouds::Clouds::live(scene.diag, cloud_time as f32),
                     crate::fireflies::Fireflies::live(scene, cloud_time as f32),
+                    // The session pose: both verify lists bind the animated
+                    // slot, so C verifies the frame the user is looking at.
+                    Some(cloud_time as f32),
                 ) {
                     Ok(report) => eprintln!("{report}"),
                     Err(e) => eprintln!("gpu: verify failed to run: {e}"),
@@ -14277,9 +14396,11 @@ fn session(
                     probe_sample: 0,
                     clouds: crate::clouds::Clouds::live(scene.diag, cloud_time as f32),
                     fireflies: crate::fireflies::Fireflies::live(scene, cloud_time as f32),
-                    // The wavefront tracer traces the STATIC TLAS — sway is
-                    // DXR-only in v0 (src/foliage.rs).
-                    sway_time: None,
+                    // --foliage-sway: the wavefront consumes the shared cloud
+                    // clock (v0.2 — record_sway rebuilds the ring slot; a
+                    // frozen accumulating clock records nothing, and replay
+                    // frames re-trace their leaf rays at the same pose).
+                    sway_time: Some(cloud_time as f32),
                     replay: opts.replay,
                 };
                 // The prev matrices are recomputed from the stored
@@ -14345,8 +14466,10 @@ fn session(
                         // The present chain recorded a producing frame and then
                         // aborted it (the list never executed) — drop the replay
                         // key so the next frame re-produces instead of replaying
-                        // against a structure the GPU never built.
+                        // against a structure the GPU never built, and the sway
+                        // ring's baked clocks (the build never executed either).
                         gpu.invalidate_replay();
+                        gpu.invalidate_sway();
                         if gpu_up == GpuUp::Xess && gpu_nppd_on {
                             // Shed the NPPD stage first — XeSS itself may be
                             // fine (the run/split path is NPPD-only).
@@ -14393,14 +14516,17 @@ fn session(
                     // frame 0 above) — the still frames integrate one sky.
                     clouds: crate::clouds::Clouds::live(scene.diag, cloud_time as f32),
                     fireflies: crate::fireflies::Fireflies::live(scene, cloud_time as f32),
-                    // The wavefront tracer traces the STATIC TLAS — sway is
-                    // DXR-only in v0 (src/foliage.rs).
-                    sway_time: None,
+                    // --foliage-sway: the wavefront consumes the shared cloud
+                    // clock (v0.2 — record_sway rebuilds the ring slot; a
+                    // frozen accumulating clock records nothing, and replay
+                    // frames re-trace their leaf rays at the same pose).
+                    sway_time: Some(cloud_time as f32),
                     replay: opts.replay,
                 };
                 if frame < MAX_SAMPLES {
                     if let Err(e) = gpu.present_trace(&p, frame + 1, hybrid) {
                         gpu.invalidate_replay(); // recorded-but-aborted producing frame
+                        gpu.invalidate_sway(); // the ring build never executed either
                         eprintln!("gpu: present failed: {e}");
                     }
                     // Moving frames stay at frame 0: every one is a fresh
@@ -15570,6 +15696,15 @@ fn session(
             let cpu_accumulate = !neural && !oidn_t;
             if !cpu_accumulate || frame == 0 {
                 cloud_time += (last_ms / 1000.0).clamp(0.0, 0.25);
+            }
+            // Foliage-sway pose for this frame: bake the per-cell offsets at
+            // the same clock (bit-equal fast path — a frozen accumulating
+            // clock re-bakes nothing, so a converging still keeps ONE pose
+            // and structure replay re-traces bit-identically). The
+            // intersector reads Scene::sway.offsets; unarmed/foliage-free
+            // scenes carry None and skip.
+            if let Some(sw) = scene.sway.as_deref() {
+                foliage::bake(sw, cloud_time as f32);
             }
             let ctx = FrameCtx {
                 scene,

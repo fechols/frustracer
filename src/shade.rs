@@ -1522,6 +1522,7 @@ pub fn tangent_self_test() -> Result<(), String> {
             sky_sh: crate::sh::Sh9::ZERO,
             sky_scale: 1.0,
             night: 0.0,
+            sway: None,
             diag: 1.0,
             eps: 1e-4,
             ao_radius: 0.03,

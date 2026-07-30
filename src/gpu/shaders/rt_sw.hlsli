@@ -46,6 +46,16 @@ struct BvhNode {
 };
 StructuredBuffer<BvhNode> bvh_nodes : register(t0);
 #endif
+// Sway GATEWAY bit (bvh.rs::GATEWAY_BIT, lockstep): a truthful fat leaf over
+// its cell's whole tri range, rest-space-tight subtree implicitly at +1.
+// The frustum/bound consumers stop at it as a leaf (count > 0) — ONLY these
+// software-ray loops descend, UNSHIFTED, so `--sw-rays` renders the rest
+// pose (the documented known-accept; the CPU's per-cell origin shift has no
+// HLSL twin). A raw `count`-sized loop over a gateway would iterate 2^31
+// times — every leaf loop below must branch on the bit FIRST.
+#ifndef SW_GATEWAY_BIT
+#define SW_GATEWAY_BIT 0x80000000u
+#endif
 // bvh.tri_idx — scene triangle ids in leaf slices (SwTreesGpu's t1; dead in
 // every kernel until this file). Each tri lives in exactly ONE leaf slice
 // (bvh.rs:880) — the transmittance product needs no NO_DUPLICATE_ANYHIT
@@ -131,6 +141,11 @@ void sw_intersect_from(float3 o, float3 d, float3 inv_d, float tmin,
     for (;;) {
         BvhNode node = bvh_nodes[node_idx];
         if (node.count > 0u) {
+            if (node.count & SW_GATEWAY_BIT) {
+                // Gateway: descend the +1 subtree (rest pose); the E filler
+                // (masked count 0) has no subtree and falls to the pop.
+                if ((node.count & ~SW_GATEWAY_BIT) != 0u) { node_idx += 1u; continue; }
+            } else {
             for (uint i = 0u; i < node.count; ++i) {
                 uint tri = sw_tri[node.left_first + i];
                 float tt, uu, vv;
@@ -148,6 +163,7 @@ void sw_intersect_from(float3 o, float3 d, float3 inv_d, float tmin,
                         count_height_rej();
                     }
                 }
+            }
             }
             // Pop the nearest deferred node tmax has not already killed.
             for (;;) {
@@ -192,6 +208,10 @@ bool sw_occluded_from(float3 o, float3 d, float3 inv_d, float tmin, float tmax, 
     for (;;) {
         BvhNode node = bvh_nodes[node_idx];
         if (node.count > 0u) {
+            if (node.count & SW_GATEWAY_BIT) {
+                // Gateway: descend the +1 subtree (rest pose); E falls to pop.
+                if ((node.count & ~SW_GATEWAY_BIT) != 0u) { node_idx += 1u; continue; }
+            } else {
             for (uint i = 0u; i < node.count; ++i) {
                 uint tri = sw_tri[node.left_first + i];
                 float tt, uu, vv;
@@ -205,6 +225,7 @@ bool sw_occluded_from(float3 o, float3 d, float3 inv_d, float tmin, float tmax, 
                         count_height_rej();
                     }
                 }
+            }
             }
         } else {
             uint l = node.left_first;
@@ -274,6 +295,10 @@ bool sw_transmit_from(float3 o, float3 d, float3 inv_d, float tmin, float tmax,
     for (;;) {
         BvhNode node = bvh_nodes[node_idx];
         if (node.count > 0u) {
+            if (node.count & SW_GATEWAY_BIT) {
+                // Gateway: descend the +1 subtree (rest pose); E falls to pop.
+                if ((node.count & ~SW_GATEWAY_BIT) != 0u) { node_idx += 1u; continue; }
+            } else {
             for (uint i = 0u; i < node.count; ++i) {
                 uint tri = sw_tri[node.left_first + i];
                 float tt, uu, vv;
@@ -294,6 +319,7 @@ bool sw_transmit_from(float3 o, float3 d, float3 inv_d, float tmin, float tmax,
                         count_height_rej();
                     }
                 }
+            }
             }
         } else {
             uint l = node.left_first;
