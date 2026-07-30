@@ -244,11 +244,15 @@ bands, where a mm-scale cell-seam step divided by sin(~1°) becomes a
 = 3 px, sway-off = 0 FAILs, and a floor=0 probe (grass frozen, canopy
 moving) reproduces **exactly 520** — the set is 100% Leaves-canopy
 displacement, v0.2-class behavior, and the grass change moves it by ZERO.
-(2) the tinted-shadow must-fire is structurally unsatisfiable there:
-`reclassify_spray` retags ALL 150,723 water components at load (Minecraft
+(2) [RESOLVED since the spray position-weld] the tinted-shadow must-fire
+used to be structurally unsatisfiable there: `reclassify_spray` welded by
+vertex INDEX and retagged ALL 150,723 water components at load (Minecraft
 water is per-block unwelded, every component under SPRAY_MAX_K), so zero
-transmissive triangles remain while `any_transmissive` still arms the
-gate. Both belong to the documented pose/scene caveat class; the mandated
+transmissive triangles remained while `any_transmissive` still armed the
+gate. The union-find now welds by position bits (CACHE_VERSION 20), the
+ocean survives as one over-limit water component, and transmissive
+triangles exist again — re-measure before citing this caveat. Both
+belonged to the documented pose/scene caveat class; the mandated
 animated GPU proof stays SM-lp, which is green.
 
 **Status: v0.2, ALL THREE RENDER MODES, DEFAULT ON (2026-07-29)** — the

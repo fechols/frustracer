@@ -100,7 +100,16 @@ use std::path::{Path, PathBuf};
 // serialized tree moves under an IDENTICAL lever/sway word (the v16
 // class: sway_word carries the --foliage-amp MULTIPLIER, not the base
 // constant).
-pub const CACHE_VERSION: u32 = 19;
+// v20: NOT a layout change — the spray union-find welds by position bits
+// instead of vertex index (per-block-unwelded Minecraft water survives as
+// one ocean component), and glass-NAMED materials classify glass (Tf-veto
+// on the water cue + transmission-tier admission: rungholt/vokselia panes,
+// bistro MASTER_Glass_*). A v19 sidecar's tri_mat/materials/class bytes
+// are stale under the same key (the v8/v9 precedent: the retag verdict and
+// the class byte both persist in the sidecar). (Authored as v16 in
+// parallel with the foliage v16-v19 lineage and renumbered onto it at
+// rebase — no sidecar was ever written under the other numbering's key.)
+pub const CACHE_VERSION: u32 = 20;
 const MAGIC: [u8; 8] = *b"FRSCACH\x01";
 
 /// Fixed on-disk material, `MatKind` flattened into (kind, param) — Marble

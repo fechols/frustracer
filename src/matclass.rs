@@ -269,6 +269,21 @@ pub fn water_name(name: &str) -> bool {
     tokens(&lower).any(|t| t == "water" || t == "agua")
 }
 
+/// Whole-token `glass`/`pane`/`portal` match (the `water_name` shape;
+/// `glassware`/`fiberglass`/`panels` stay safe). Two consumers in
+/// `classify`, both on the material NAME (the Minecraft atlas scenes carry
+/// no stem signal): it VETOES the untrusted Tf-chromatic water cue
+/// (vokselia's `Glass`/`Glass_Pane`/`Portal` are illum 4 with chromatic Tf
+/// — without the veto they classify water and ripple), and it ADMITS a
+/// named material into the transmission tier (rungholt's `Glass` is
+/// illum 2 / Ns 0 — an exporter that never writes illum 4 — and rendered
+/// opaque matte without it; bistro's `MASTER_Glass_*` at illum 2/7 are the
+/// same shape).
+fn glass_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    tokens(&lower).any(|t| t == "glass" || t == "pane" || t == "portal")
+}
+
 /// A chromatic MTL transmission filter (`Tf`) on an illum-4 material is the
 /// structural "colored liquid, not clear glassware" signal — `materialo`'s
 /// `Tf 0.5 0.4 0.2` fires; neutral glassware (`Tf 0.1 0.1 0.1`) does not. The
@@ -342,15 +357,21 @@ pub fn classify(
     // the mid band (the untextured café-chair metal at Ns 256) stays an
     // opaque glossy dielectric — transmission there would dissolve chairs.
     let ns = ns.unwrap_or(0.0);
-    if illum == Some(4) || ns >= 500.0 {
+    // A glass NAME also opens the transmission tier: Minecraft-style
+    // exporters write their windows as illum 2 / Ns 0 (rungholt's `Glass`,
+    // bistro's `MASTER_Glass_*` at illum 2/7), which no Ns/illum signal can
+    // ever admit — they rendered opaque matte.
+    if illum == Some(4) || ns >= 500.0 || glass_name(mat_name) {
         // A water REFINEMENT of the glass tier — only a material that already
         // classifies glassware can become water, so transmission stays
         // shading-only and every soundness property is unchanged. Signals:
-        // an OBJ `water`/`agua` object/stem/material name, or a chromatic Tf.
+        // an OBJ `water`/`agua` object/stem/material name, or a chromatic Tf
+        // — the latter VETOED by a glass name (Tf is untrusted color;
+        // vokselia's chromatic-Tf `Glass` panes must not ripple).
         let is_water = water_hint
             || tex_stem.is_some_and(water_name)
             || water_name(mat_name)
-            || tf_chromatic(tf);
+            || (tf_chromatic(tf) && !glass_name(mat_name));
         if is_water {
             return (IDX_WATER, WATER);
         }
@@ -522,6 +543,33 @@ pub fn self_test() -> Result<(), String> {
     // Token safety: `watercolor` is not water; `Water` is.
     if !water_name("Water") || water_name("watercolor_paper") {
         return Err("water_name token match wrong".into());
+    }
+    // Glass-NAMED materials are glass, never water: the Tf-chromatic cue is
+    // untrusted color and a trusted name vetoes it (vokselia's `Glass` panes
+    // carry `Tf 0.376 0.482 0.498` — chromatic Δ 0.122 — and its `Portal`
+    // `Tf 0.668 0.398 0.8`; both are illum 4, and without the veto they
+    // classify water and RIPPLE).
+    if water_named(None, "Glass", false, Some([0.376, 0.482, 0.498])) != "glass" {
+        return Err("glass-named chromatic-Tf material must stay glass".into());
+    }
+    if water_named(None, "Portal", false, Some([0.668, 0.398, 0.8])) != "glass" {
+        return Err("portal-named chromatic-Tf material must stay glass".into());
+    }
+    // ...and a glass name ADMITS an illum-2/Ns-0 material into the
+    // transmission tier (rungholt's Minecraft exporter never writes illum 4
+    // on glass — those windows rendered opaque matte; bistro's `MASTER_Glass_*`
+    // at illum 2/7, Ns 80-200 are the same shape). Water-named materials keep
+    // NOT being admitted (the water_chair pin above): water is a refinement
+    // of a tier the material must reach on its own or via a GLASS name.
+    expect(Some("rungholt-rgba"), "Glass", 0.0, 2, "glass")?;
+    expect(Some("rungholt-rgba"), "Glass_Pane", 0.0, 2, "glass")?;
+    expect(None, "MASTER_Glass_Exterior", 80.0, 2, "glass")?;
+    // Glass-token safety: compounds don't fire, the real names do.
+    if glass_name("glassware_shelf") || glass_name("fiberglass_panel") || glass_name("panels") {
+        return Err("glass_name compound token must not match".into());
+    }
+    if !glass_name("Glass_Pane") || !glass_name("Portal") {
+        return Err("glass_name must match Glass_Pane/Portal".into());
     }
     // The water params: transmission near 1, mirror-smooth, flagged.
     let (_, w) = classify(None, "materialo", Some(1024.0), Some(4), true, None);

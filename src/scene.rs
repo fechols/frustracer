@@ -670,12 +670,20 @@ pub const WATER_RIPPLE_AMP: f32 = 0.25;
 /// Post-load spray reclassification (shared OBJ+glTF, the `derive_heights`
 /// pass family — cold loads only, BEFORE the cache store, so warm loads
 /// inherit the retag from the sidecar; `--no-spray` kills it and keys the
-/// cache lever word). Union-find over shared vertex indices, restricted to
-/// transmissive-material triangles: tiny disconnected islands (the airborne
-/// droplets of a fountain) become a white scattering "spray" clone of their
-/// source material, while pools/streams/glassware (large components) stay
-/// glass. Purely load-time — no per-ray cost, zero rng, and a scene with no
-/// transmissive materials is structurally untouched.
+/// cache lever word). Union-find over shared vertex POSITIONS (exact f32
+/// bits), restricted to transmissive-material triangles: tiny disconnected
+/// islands (the airborne droplets of a fountain) become a white scattering
+/// "spray" clone of their source material, while pools/streams/glassware
+/// (large components) stay glass. Position welding, not index sharing, is
+/// load-bearing: Minecraft-style exporters emit water per block, UNWELDED —
+/// every face has private indices — so index connectivity saw rungholt's
+/// ocean as ~150k one-block "droplets" and retagged the whole sea to matte
+/// spray. Grid exports repeat the same coordinate per shared corner ⇒ same
+/// bits ⇒ the ocean welds into one over-limit component. A missed weld
+/// (-0.0 vs 0.0, real float drift) only degrades toward the index-based
+/// status quo on that fragment — never a new failure class. Purely
+/// load-time — no per-ray cost, zero rng, and a scene with no transmissive
+/// materials is structurally untouched.
 pub fn reclassify_spray(scene: &mut Scene) {
     if !spray_enabled() {
         return;
@@ -690,15 +698,25 @@ pub fn reclassify_spray(scene: &mut Scene) {
         }
         x
     }
+    // Canonical id per POSITION: the first vertex index seen at those exact
+    // bits, in the fixed triangle scan order — a pure function of the scene.
+    // Lookup-only after insert (never iterated), so HashMap order cannot
+    // reach the output and the .fcache/world-sidecar bytes stay
+    // run-to-run identical.
+    let mut canon: HashMap<[u32; 3], u32> = HashMap::new();
+    fn cid(canon: &mut HashMap<[u32; 3], u32>, positions: &[Vec3A], i: u32) -> u32 {
+        let p = positions[i as usize];
+        *canon.entry([p.x.to_bits(), p.y.to_bits(), p.z.to_bits()]).or_insert(i)
+    }
     let mut any = false;
     for (t, idx) in scene.indices.iter().enumerate() {
         if scene.materials[scene.tri_mat[t] as usize].transmission <= 0.0 {
             continue;
         }
         any = true;
-        let r0 = find(&mut parent, idx[0]);
-        let r1 = find(&mut parent, idx[1]);
-        let r2 = find(&mut parent, idx[2]);
+        let r0 = find(&mut parent, cid(&mut canon, &scene.positions, idx[0]));
+        let r1 = find(&mut parent, cid(&mut canon, &scene.positions, idx[1]));
+        let r2 = find(&mut parent, cid(&mut canon, &scene.positions, idx[2]));
         parent[r1 as usize] = r0;
         parent[r2 as usize] = r0;
     }
@@ -711,7 +729,7 @@ pub fn reclassify_spray(scene: &mut Scene) {
         if scene.materials[scene.tri_mat[t] as usize].transmission <= 0.0 {
             continue;
         }
-        let root = find(&mut parent, idx[0]);
+        let root = find(&mut parent, cid(&mut canon, &scene.positions, idx[0]));
         let e = boxes.entry(root).or_insert((
             Vec3A::splat(f32::INFINITY),
             Vec3A::splat(f32::NEG_INFINITY),
@@ -756,7 +774,7 @@ pub fn reclassify_spray(scene: &mut Scene) {
         if scene.materials[m as usize].transmission <= 0.0 {
             continue;
         }
-        let root = find(&mut parent, scene.indices[t][0]);
+        let root = find(&mut parent, cid(&mut canon, &scene.positions, scene.indices[t][0]));
         if !spray_roots.contains_key(&root) {
             continue;
         }
@@ -814,6 +832,10 @@ pub fn reclassify_spray(scene: &mut Scene) {
 /// components retag, the clone's overrides are pinned bitwise, two islands
 /// of one source material share one deduped clone, large components and
 /// tiny opaque islands are untouched, and the lever-off arm is a no-op.
+/// Islands E/F pin the POSITION weld: an unwelded edge-to-edge strip whose
+/// welded extent exceeds the limit must stay glass (the Minecraft-export
+/// ocean shape), while coincident-position tiny tris still weld and retag
+/// (the droplet feature survives the weld).
 pub fn spray_self_test() -> Result<(), String> {
     let glass = |transmission: f32| Material {
         albedo: Vec3A::new(0.8, 0.85, 0.9),
@@ -863,6 +885,42 @@ pub fn spray_self_test() -> Result<(), String> {
         tiny(Vec3A::new(0.2, 0.2, 0.5), 0, &mut positions, &mut indices, &mut tri_mat);
         tiny(Vec3A::new(0.7, 0.7, 0.5), 0, &mut positions, &mut indices, &mut tri_mat);
         tiny(Vec3A::new(0.5, 0.5, 0.7), 1, &mut positions, &mut indices, &mut tri_mat);
+        // Island E (tris 5..13): an unwelded "ocean" strip — 4 transmissive
+        // quads edge-to-edge by POSITION only (each pushes its own 4 verts,
+        // private indices — the Minecraft export shape). One quad's diag
+        // ≈ 5.7e-4 sits UNDER the limit (≈ 9.5e-4 at this scene's diag);
+        // the welded strip ≈ 1.65e-3 sits OVER it. Index connectivity
+        // retags all four as droplets; position welding must keep them
+        // glass. The shared corners derive from the SAME `(col as f32)*S`
+        // expression on both sides — bit-identity by construction,
+        // mirroring a grid exporter's repeated coordinate text.
+        const S: f32 = 0.4e-3;
+        let base = Vec3A::new(0.3, 0.3, 0.5);
+        for q in 0..4u32 {
+            let b = positions.len() as u32;
+            let xl = base.x + q as f32 * S;
+            let xr = base.x + (q + 1) as f32 * S;
+            positions.push(Vec3A::new(xl, base.y, base.z));
+            positions.push(Vec3A::new(xr, base.y, base.z));
+            positions.push(Vec3A::new(xl, base.y + S, base.z));
+            positions.push(Vec3A::new(xr, base.y + S, base.z));
+            indices.push([b, b + 1, b + 2]);
+            indices.push([b + 1, b + 3, b + 2]);
+            tri_mat.push(0);
+            tri_mat.push(0);
+        }
+        // Island F (tris 13..15): the weld must not LOSE the droplet
+        // feature — two copies of one tiny tri, positions bit-equal but
+        // indices private, detached from everything else: they weld into
+        // ONE still-under-limit component and retag onto the shared clone.
+        for _ in 0..2 {
+            let b = positions.len() as u32;
+            positions.push(Vec3A::new(0.9, 0.1, 0.5));
+            positions.push(Vec3A::new(0.9 + 1e-4, 0.1, 0.5));
+            positions.push(Vec3A::new(0.9, 0.1 + 1e-4, 0.5));
+            indices.push([b, b + 1, b + 2]);
+            tri_mat.push(0);
+        }
         let n = positions.len();
         let mut sc = Scene {
             positions,
@@ -915,6 +973,22 @@ pub fn spray_self_test() -> Result<(), String> {
         if sc.tri_mat[4] != 1 {
             return Err("tiny OPAQUE island must not retag".into());
         }
+        // Island E: unwelded-but-position-connected over-limit strip stays
+        // glass (the rungholt ocean shape — index-based union retags it).
+        if (5..13).any(|t| sc.tri_mat[t] != 0) {
+            return Err(format!(
+                "unwelded over-limit strip must stay glass (tri_mat {:?})",
+                &sc.tri_mat[5..13]
+            ));
+        }
+        // Island F: coincident-position tris weld into one still-tiny
+        // component and retag onto the SAME deduped clone.
+        if sc.tri_mat[13] != 2 || sc.tri_mat[14] != 2 {
+            return Err(format!(
+                "coincident tiny tris must weld and retag onto the shared clone (got {}, {})",
+                sc.tri_mat[13], sc.tri_mat[14]
+            ));
+        }
         let s = &sc.materials[2];
         // Sentinel-tint glass source ⇒ lift from albedo verbatim (the water
         // path is covered by the tint-source arm below).
@@ -940,7 +1014,9 @@ pub fn spray_self_test() -> Result<(), String> {
         set_spray(false);
         reclassify_spray(&mut off);
         set_spray(true);
-        if off.materials.len() != 2 || off.tri_mat != vec![0, 0, 0, 0, 1] {
+        let mut want_off = vec![0u32, 0, 0, 0, 1];
+        want_off.extend([0; 10]); // islands E (8 tris) + F (2 tris)
+        if off.materials.len() != 2 || off.tri_mat != want_off {
             return Err("lever off must be a structural no-op".into());
         }
         Ok(())
