@@ -304,7 +304,12 @@ impl DxrGpu {
         if inline_mode > 0 {
             parts.push(trace::RT_HLSLI);
         }
-        parts.extend([RT_DXR_HLSLI, trace::SHADE_HLSLI, DXR_HLSL]);
+        parts.extend([
+            RT_DXR_HLSLI,
+            trace::RIPPLE_HLSLI,
+            trace::SHADE_HLSLI,
+            DXR_HLSL,
+        ]);
         let lib_src = parts.join("\n");
         let lib_target = if inline_mode > 0 { "lib_6_5" } else { "lib_6_3" };
         let dxil = dxc.compile(&lib_src, "", lib_target, "dxr library", debug)?;

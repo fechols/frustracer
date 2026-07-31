@@ -323,29 +323,10 @@ float3 perturb_normal(float3 n, Mat mat, float2 uv, TexFilt filt,
     return outn;
 }
 
-// shade.rs::ripple_grad / ripple_normal — the procedural water ripple field,
-// a sum of 3 directional sinusoid gradients (an integrable field ⇒ a
-// consistent virtual heightfield). Constants are LITERALS matching shade.rs,
-// so this is identical by construction (only cos ulps differ). Pure ALU, no
-// rng. Animated on CLOUD_TIME; every length SCENE_DIAG-relative.
-static const float2 RIPPLE_DIR[3] = {
-    float2(0.932, 0.362), float2(-0.588, 0.809), float2(0.259, -0.966)
-};
-static const float3 RIPPLE_LAMBDA_K = float3(5.2e-3, 2.9e-3, 1.6e-3);
-static const float3 RIPPLE_W = float3(2.1, 3.4, 4.9);
-static const float3 RIPPLE_A = float3(0.45, 0.32, 0.23);
-
-float2 ripple_grad(float3 p, float t, float diag) {
-    float2 g = float2(0.0, 0.0);
-    float2 pxz = float2(p.x, p.z);
-    [unroll]
-    for (int i = 0; i < 3; i++) {
-        float ph = TAU * (dot(RIPPLE_DIR[i], pxz) / (RIPPLE_LAMBDA_K[i] * diag)) - RIPPLE_W[i] * t;
-        g += RIPPLE_DIR[i] * (RIPPLE_A[i] * cos(ph));
-    }
-    return g;
-}
-
+// The ripple FIELD itself (`ripple_grad` + its constants) lives in
+// ripple.hlsli, pasted ahead of this file — it has a third consumer, the fxc
+// frame-generation guide kernel. Only the shading glue stays here.
+//
 // Tilt `base` by the ripple slope (× amp), unit on the +n side; a
 // degenerate/below-horizon result falls back to base. `n` is the geometric
 // normal (horizon guard + projection axis).

@@ -1433,7 +1433,12 @@ const RIPPLE_W: [f32; 3] = [2.1, 3.4, 4.9]; // rad/s; shorter waves faster (disp
 const RIPPLE_A: [f32; 3] = [0.45, 0.32, 0.23]; // slope weights (sum 1.0)
 
 /// ∂h/∂x, ∂h/∂z of the virtual ripple height at world point `p`, time `t`.
-fn ripple_grad(p: Vec3A, t: f32, diag: f32) -> glam::Vec2 {
+///
+/// `pub(crate)` for the frame-generation guide pass, which evaluates the field
+/// at two times to derive the previous frame's mirror normal
+/// (`gpu::ngxfg_guides`). One CPU source of truth; the GPU twin is
+/// shaders/ripple.hlsli.
+pub(crate) fn ripple_grad(p: Vec3A, t: f32, diag: f32) -> glam::Vec2 {
     let mut g = glam::Vec2::ZERO;
     let pxz = glam::Vec2::new(p.x, p.z);
     for i in 0..3 {

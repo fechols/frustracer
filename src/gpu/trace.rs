@@ -701,6 +701,10 @@ pub const RT_HLSLI: &str = include_str!("shaders/rt.hlsli");
 /// signatures + the opaque trace_closest_frontier), so rays traverse the
 /// software BVH and leaf primaries seed from the tile's node cut.
 const RT_SW_HLSLI: &str = include_str!("shaders/rt_sw.hlsli");
+/// The water ripple FIELD, pasted immediately ahead of SHADE_HLSLI at every
+/// site (shade.hlsli's `ripple_normal` calls into it). Its own file because
+/// the fxc frame-generation guide kernel pastes it too — see ngxfg_guides.rs.
+pub(crate) const RIPPLE_HLSLI: &str = include_str!("shaders/ripple.hlsli");
 pub(crate) const SHADE_HLSLI: &str = include_str!("shaders/shade.hlsli");
 const HEMI_HLSLI: &str = include_str!("shaders/hemi.hlsli");
 const REFERENCE_HLSL: &str = include_str!("shaders/reference.hlsl");
@@ -4494,6 +4498,7 @@ impl TraceGpu {
             TRACE_COMMON_HLSLI,
             SKYLOD_HLSLI,
             rt_src,
+            RIPPLE_HLSLI,
             SHADE_HLSLI,
             REFERENCE_HLSL,
         ]
@@ -4551,6 +4556,7 @@ impl TraceGpu {
                 QUEUES_HLSLI,
                 SKYLOD_HLSLI,
                 rt_src,
+                RIPPLE_HLSLI,
                 SHADE_HLSLI,
                 LEAF_HLSL,
             ]
@@ -4584,6 +4590,7 @@ impl TraceGpu {
             CTR_HLSLI,
             HEMI_HLSLI,
             rt_src,
+            RIPPLE_HLSLI,
             SHADE_HLSLI,
             HEMI_LEAF_HLSL,
         ]
