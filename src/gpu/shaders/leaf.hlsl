@@ -147,7 +147,7 @@ void cs_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
             }
 #endif
             t = hit.t;
-            if (prim) gbuf_write_hit(pi, sp.x, sp.y, dir, hit.t, ps);
+            if (prim) gbuf_write_hit(pi, sp.x, sp.y, dir, hit.t, ps SWAY_ARG(hit.inst));
         } else {
             // A DISPLAY path (the camera looking at the sky), so it sees the sun
             // DISC — sky.rs's disc-exactly-once rule. The half-angle is the ray's

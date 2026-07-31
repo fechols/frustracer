@@ -141,6 +141,13 @@ pub struct FrameCtx<'a> {
     /// Previous frame's camera basis for motion vectors (independent of the
     /// temporal cache's tprev_basis — different contract).
     pub prev_cam: Option<CamBasis>,
+    /// Foliage-sway MV deltas for THIS frame (`foliage::mv_rows` — per-cell
+    /// prev−cur shear rows, paired with `prev_cam`'s frame by the caller).
+    /// None = camera-only MVs, today's path STRUCTURALLY: every legacy /
+    /// gate / frozen-clock context passes None and never branches per pixel
+    /// beyond the one never-taken check. Only meaningful with `prev_cam`
+    /// Some and `scene.sway` Some.
+    pub sway_mv: Option<&'a crate::foliage::SwayMv>,
     /// Frame-uniform sub-pixel jitter offset in [-0.5, 0.5) (DLSS mode);
     /// None => the legacy per-pixel rng jitter controlled by `jitter`.
     pub frame_jitter: Option<(f32, f32)>,
@@ -1228,6 +1235,28 @@ fn shade_cell(
     }
 }
 
+/// The prev-POSE position of a current-pose hit point: `p` shifted by its
+/// sway cell's prev−cur shear rows (`foliage::prev_point` — the one Rust
+/// application site), or `p` verbatim on static geometry / camera-only
+/// frames. Both MV consumers (`write_gbuf_hit`'s projection and
+/// `write_fsr`'s prev-Z dot) reproject THIS point, so the MV's RG and its
+/// depth-delta B lane describe one motion by construction — the same
+/// single-`hit_rel` argument the HLSL twin makes.
+#[inline]
+fn sway_prev_pos(ctx: &FrameCtx, tri: u32, p: Vec3A) -> Vec3A {
+    match (ctx.sway_mv, ctx.scene.sway.as_deref()) {
+        (Some(m), Some(sw)) => {
+            let cell = sw.tri_cell[tri as usize];
+            if cell == crate::foliage::STATIC_CELL {
+                p
+            } else {
+                crate::foliage::prev_point(&m.rows[cell as usize], p)
+            }
+        }
+        _ => p,
+    }
+}
+
 /// G-buffer write for a primary hit at continuous sample position (fx, fy).
 /// The motion vector reprojects the exact hit point through the previous
 /// frame's basis: `project` takes a direction relative to that origin, and
@@ -1242,12 +1271,16 @@ fn write_gbuf_hit(
     fy: f32,
     dir: Vec3A,
     t: f32,
+    tri: u32,
     prim: &shade::PrimarySurface,
     c: Vec3A,
 ) {
     let Some(g) = ctx.gbuf else { return };
     let (_, far) = dlss::near_far(ctx.scene.diag);
-    let p = ctx.cam.origin + dir * t;
+    // Swayed geometry reprojects its PREV-pose point — the surface's own
+    // motion enters the MV, not just the camera's (sway_prev_pos is the
+    // identity everywhere else).
+    let p = sway_prev_pos(ctx, tri, ctx.cam.origin + dir * t);
     let mv = match &ctx.prev_cam {
         Some(prev) => match prev.project(p - prev.origin) {
             Some((px, py)) => (px - fx, py - fy),
@@ -1268,7 +1301,7 @@ fn write_gbuf_hit(
             spec_hit_t: if prim.spec_t.is_infinite() { far } else { prim.spec_t },
         },
     );
-    write_fsr(ctx, x, y, dir, t, prim, c);
+    write_fsr(ctx, x, y, dir, t, tri, prim, c);
 }
 
 /// The FSR (Ray Regeneration) signal write — split out of the G-buffer writes
@@ -1285,6 +1318,7 @@ fn write_fsr(
     y: usize,
     dir: Vec3A,
     t: f32,
+    tri: u32,
     prim: &shade::PrimarySurface,
     c: Vec3A,
 ) {
@@ -1309,7 +1343,9 @@ fn write_fsr(
     // "no depth motion"; a point behind the old image plane keeps its
     // true (negative) prev view-Z — the large delta marks the
     // disocclusion for history rejection (RG is (0,0) there, above).
-    let p = ctx.cam.origin + dir * t;
+    // Swayed geometry takes its PREV-pose point (sway_prev_pos — the same
+    // point the MV's RG reprojected), so the depth delta tracks the sway.
+    let p = sway_prev_pos(ctx, tri, ctx.cam.origin + dir * t);
     let prev_z = match &ctx.prev_cam {
         Some(prev) => (p - prev.origin).dot(prev.forward()),
         None => t * dir.dot(ctx.cam.forward()),
@@ -1369,7 +1405,9 @@ fn write_gbuf_sky(ctx: &FrameCtx, x: usize, y: usize, fx: f32, fy: f32, dir: Vec
     // radiance (bit-identically at spp == 1 — the caller passes what
     // `sky::radiance` returned for this same dir). Passing it rather than
     // recomputing is what lets the --spp average reach the residual.
-    write_fsr(ctx, x, y, dir, f32::INFINITY, &shade::PrimarySurface::default(), c);
+    // tri is dead here — the infinite t takes write_fsr's sky arm before any
+    // cell lookup.
+    write_fsr(ctx, x, y, dir, f32::INFINITY, u32::MAX, &shade::PrimarySurface::default(), c);
 }
 
 /// The traced result of one `shade_pixel` sample — returned so `sparse_fill`
@@ -1382,6 +1420,11 @@ struct Sample {
     /// Primary-surface capture; default when the ray missed (unused — sky
     /// pixels take `write_gbuf_sky`) or when `ctx.gbuf` is None.
     prim: shade::PrimarySurface,
+    /// Primary-hit triangle id (u32::MAX on sky — never read there): the
+    /// sway-MV cell lookup's key, carried so `sparse_fill`'s flood and the
+    /// `--spp` residual rewrite reproject through the SAME cell the sampled
+    /// surface belongs to.
+    tri: u32,
 }
 
 /// A traced-but-not-yet-shaded primary sample: `trace_primary`'s output,
@@ -1572,9 +1615,9 @@ fn shade_traced(
                 ctx.splat(x, y, c);
             }
             if primary {
-                write_gbuf_hit(ctx, x, y, tr.fx, tr.fy, tr.dir, hit.t, &prim, c);
+                write_gbuf_hit(ctx, x, y, tr.fx, tr.fy, tr.dir, hit.t, hit.tri, &prim, c);
             }
-            Sample { c, t: hit.t, dir: tr.dir, prim }
+            Sample { c, t: hit.t, dir: tr.dir, prim, tri: hit.tri }
         }
         None => {
             if primary {
@@ -1613,7 +1656,13 @@ fn shade_traced(
             if primary {
                 write_gbuf_sky(ctx, x, y, tr.fx, tr.fy, tr.dir, c);
             }
-            Sample { c, t: f32::INFINITY, dir: tr.dir, prim: shade::PrimarySurface::default() }
+            Sample {
+                c,
+                t: f32::INFINITY,
+                dir: tr.dir,
+                prim: shade::PrimarySurface::default(),
+                tri: u32::MAX,
+            }
         }
     }
 }
@@ -1679,7 +1728,7 @@ fn shade_pixel(
     // kernel likewise takes the residual against averaged accum, so both feeds
     // mean exactly the same thing.
     if spp > 1 {
-        write_fsr(ctx, x, y, s.dir, s.t, &s.prim, s.c);
+        write_fsr(ctx, x, y, s.dir, s.t, s.tri, &s.prim, s.c);
     }
     ctx.splat(x, y, s.c);
     s
@@ -1766,7 +1815,7 @@ fn sparse_fill(
                     // coarse cells.
                     let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
                     if s.t.is_finite() {
-                        write_gbuf_hit(ctx, x, y, fx, fy, s.dir, s.t, &s.prim, s.c);
+                        write_gbuf_hit(ctx, x, y, fx, fy, s.dir, s.t, s.tri, &s.prim, s.c);
                     } else {
                         write_gbuf_sky(ctx, x, y, fx, fy, s.dir, s.c);
                     }
@@ -2416,6 +2465,7 @@ pub fn verify_sampled(
     let info: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
     let tbuf: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
     let ctx = FrameCtx {
+        sway_mv: None,
         scene,
         bvh,
         cam: *cam,

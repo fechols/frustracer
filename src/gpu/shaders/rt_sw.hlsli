@@ -66,6 +66,15 @@ struct HitInfo {
     float t;
     uint tri;
     float u, v; // moller-trumbore == DXR convention: p = (1-u-v)p0 + u·p1 + v·p2
+#ifdef SWAY_MV
+    // Present only for signature parity with rt.hlsli (the SWAY_ARG call
+    // sites) — DEAD here: the software walk has no instances and renders the
+    // rest pose, so the wavefront suppresses the SWAY_MV define under
+    // --sw-rays and this field never actually compiles. Kept so a future
+    // arm that lifts that suppression fails loudly at the (HitInfo)0 zero
+    // (flag never set ⇒ never read) rather than at a missing field.
+    uint inst;
+#endif
 };
 
 // bvh.rs::slab_t — entry t if the ray hits the box within (tmin, tmax), else

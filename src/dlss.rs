@@ -299,6 +299,10 @@ pub struct DlssPrev {
     pub basis: CamBasis,
     pub mats: CamMatrices,
     pub cam: Camera,
+    /// The sway clock of the SAME frame (main.rs's `PrevPose` pairing rule —
+    /// the sway-MV deltas must describe the exact pose pair the retained
+    /// camera does). None = no sway partition in the scene.
+    pub sway_t: Option<f32>,
 }
 
 /// Everything the denoiser needs per frame besides the buffers themselves.

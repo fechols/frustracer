@@ -113,11 +113,11 @@ pub const RP_GBUF_EXT: u32 = RP_SCENE_TEX + 1;
 /// First heap slot of the scene-texture table (after every feed set).
 pub const TEX_HEAP_BASE: u32 = FEED_SETS * FEED_SET_STRIDE;
 /// Buffer-SRV descriptors preceding the Texture2D array in the table
-/// (t0..t8 space1: texcoords, indices alias, tri_mat alias, mat_cutout,
-/// positions alias, mat_height, mat_shadow, blas_tri, chunk_base — texs[]
-/// starts at t9). Must stay in lockstep with trace_common.hlsli's space1
-/// declarations: this const IS the texs[] base register.
-pub const TEX_TABLE_BUFS: u32 = 9;
+/// (t0..t9 space1: texcoords, indices alias, tri_mat alias, mat_cutout,
+/// positions alias, mat_height, mat_shadow, blas_tri, chunk_base, sway_dmv —
+/// texs[] starts at t10). Must stay in lockstep with trace_common.hlsli's
+/// space1 declarations: this const IS the texs[] base register.
+pub const TEX_TABLE_BUFS: u32 = 10;
 
 // SRV register assignments (t0..t7) — shared across every kernel; a kernel
 // declares only what it reads, DXC strips the rest.
@@ -1899,6 +1899,14 @@ pub struct SceneGpu {
     /// samples bilinear with no mip chain — parity over aliasing); _SRGB for
     /// color textures, _UNORM for linear-data maps (Texture::srgb).
     pub textures: Vec<ID3D12Resource>,
+    /// The sway-MV delta table's stand-in when `sway` is None: 16 bytes so
+    /// the t9 space1 slot always has a describable float4 (the blas_tri
+    /// 4-byte-dummy discipline — the table's shape never moves with the
+    /// feature; the kernels compile without SWAY_MV and never read it).
+    /// Deliberately NOT one of the per-material buffers: those degrade to
+    /// 4-byte dummies on material-free scenes, and a 16-byte view over one
+    /// is the over-long-view device removal.
+    dmv_dummy: ID3D12Resource,
     n_verts: u32,
     n_tris: u32,
     n_mats: u32,
@@ -2529,6 +2537,7 @@ impl SceneGpu {
                 mat_height: mat_height_b,
                 mat_shadow: mat_shadow_b,
                 textures: textures_v,
+                dmv_dummy: committed_buffer(device, 16, D3D12_RESOURCE_FLAG_NONE, srv)?,
                 n_verts,
                 n_tris,
                 n_mats: scene.materials.len() as u32,
@@ -2757,6 +2766,7 @@ impl SceneGpu {
             mat_height: mat_height_b,
             mat_shadow: mat_shadow_b,
             textures: textures_v,
+            dmv_dummy: committed_buffer(device, 16, D3D12_RESOURCE_FLAG_NONE, srv)?,
             n_verts,
             n_tris,
             n_mats: scene.materials.len() as u32,
@@ -2764,10 +2774,11 @@ impl SceneGpu {
     }
 
     /// Write the RP_SCENE_TEX table's descriptors into `heap` at slots
-    /// `base..`: 9 buffer SRVs (texcoords, indices, tri_mat, mat_cutout,
-    /// positions, mat_height, mat_shadow, blas_tri, chunk_base — t0..t8
-    /// space1) then one Texture2D SRV per scene texture (t9.. space1).
-    /// The heap must be sized `base + TEX_TABLE_BUFS + textures.len()`.
+    /// `base..`: 10 buffer SRVs (texcoords, indices, tri_mat, mat_cutout,
+    /// positions, mat_height, mat_shadow, blas_tri, chunk_base, sway_dmv —
+    /// t0..t9 space1) then one Texture2D SRV per scene texture (t10..
+    /// space1). The heap must be sized `base + TEX_TABLE_BUFS +
+    /// textures.len()`.
     pub fn write_scene_descriptors(
         &self,
         device: &ID3D12Device,
@@ -2816,6 +2827,15 @@ impl SceneGpu {
         // time (n_chunks + 1 with n_chunks = 1 did exactly that once).
         buf_srv(&self.blas_tri, 4, self.n_packed, 7);
         buf_srv(&self.chunk_base, 4, self.n_chunks + 1, 8);
+        // Foliage-sway MV deltas: the whole FRAMES_IN_FLIGHT × n_inst float4
+        // ring (the frame's slot base rides the CB's sway_mv_base). Unarmed
+        // scenes bind the 16-byte dummy — the kernels compile without SWAY_MV
+        // and never read it, the blas_tri discipline.
+        let (dmv_res, dmv_elems) = match &self.sway {
+            Some(sw) => (&sw.dmv_ring.resource, sw.dmv_elems()),
+            None => (&self.dmv_dummy, 1),
+        };
+        buf_srv(dmv_res, 16, dmv_elems, 9);
         for (i, tex) in self.textures.iter().enumerate() {
             let tex_desc = unsafe { tex.GetDesc() };
             let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
@@ -2951,6 +2971,34 @@ fn abl_has(tag: &str) -> bool {
 /// a per-scene one — hence no `scene` argument.
 pub(crate) fn blas_defs() -> &'static str {
     if crate::blas_split::max_prims().is_some() { "#define BLAS_SPLIT 1" } else { "" }
+}
+
+/// The sway-MV twin of `blas_defs`: sessions whose UPLOADED scene armed the
+/// animated-TLAS ring compile the prev-pose MV correction into
+/// `gbuf_write_hit` (+ `HitInfo::inst`); every other session — no foliage,
+/// `--no-foliage-sway`, `--no-blas-split` — compiles byte-identical sources
+/// to the pre-feature tracer. Takes the SceneGpu FACT (`sway.is_some()`)
+/// rather than re-deriving the partition/lever/split chain — the define and
+/// the ring it reads are one decision (the `non_opaque` discipline). The
+/// wavefront additionally suppresses it under `--sw-rays` (the software rays
+/// render the REST pose — sway MVs would describe motion that is not on
+/// screen); DXR never software-rays and takes this verbatim.
+pub(crate) fn sway_defs(scene_gpu: &SceneGpu) -> &'static str {
+    if scene_gpu.sway.is_some() { "#define SWAY_MV 1" } else { "" }
+}
+
+/// The sway-MV arming pair: `Some((t_cur, t_prev))` iff this frame renders an
+/// animated pose AND holds a paired prev pose to reproject into — sway clock
+/// present, prev sway clock present and BIT-different (a frozen still /
+/// pinned gate has du = 0 structurally), prev camera present (an MV is only
+/// defined against one). ONE predicate for the CB flag and the dmv-ring fill
+/// (both tracers), so the two cannot disagree.
+pub(crate) fn sway_mv_pair(p: &FrameParams) -> Option<(f32, f32)> {
+    let (tc, tp) = (p.sway_time?, p.sway_prev_time?);
+    if tc.to_bits() == tp.to_bits() || p.prev_cam.is_none() {
+        return None;
+    }
+    Some((tc, tp))
 }
 
 /// Dev cost-attribution ablations (`FR_ABL=sunt|rough|...`): neutralize one
@@ -3141,6 +3189,13 @@ pub struct SwayGpu {
     /// FRAMES_IN_FLIGHT slots of `tpl.len()` instance descs, persistently
     /// mapped (the frame_cb ring shape).
     inst_ring: d3d12::UploadBuffer,
+    /// Sway-MV deltas: FRAMES_IN_FLIGHT slots × tpl.len() float4 shear-row
+    /// deltas (`foliage::shear_rows(u_prev − u_cur, a, b)` per sway chunk),
+    /// persistently mapped (the inst_ring shape), zero-filled once at init so
+    /// static chunks' rows stay the exact-identity zeros forever. Read by
+    /// `gbuf_write_hit`'s SWAY_MV arm through the space1 t9 SRV at
+    /// `sway_mv_base.x + InstanceID`.
+    dmv_ring: d3d12::UploadBuffer,
     /// One animated TLAS per in-flight slot.
     tlas: Vec<ID3D12Resource>,
     scratch: ID3D12Resource,
@@ -3163,6 +3218,11 @@ impl SwayGpu {
         let n = tpl.len();
         let sz = std::mem::size_of::<D3D12_RAYTRACING_INSTANCE_DESC>();
         let inst_ring = d3d12::UploadBuffer::new(device, d3d12::FRAMES_IN_FLIGHT * n * sz)?;
+        let dmv_ring = d3d12::UploadBuffer::new(device, d3d12::FRAMES_IN_FLIGHT * n * 16)?;
+        // Zero-fill EXPLICITLY (never lean on fresh-commit zeroing): static
+        // chunks' rows are the identity by being zero, and `write_mv_rows`
+        // only ever rewrites the sway chunks' tail.
+        unsafe { std::ptr::write_bytes(dmv_ring.ptr, 0, d3d12::FRAMES_IN_FLIGHT * n * 16) };
         let mut tlas = Vec::with_capacity(d3d12::FRAMES_IN_FLIGHT);
         for _ in 0..d3d12::FRAMES_IN_FLIGHT {
             tlas.push(committed_buffer(device, tlas_size, uaf, as_state)?);
@@ -3188,6 +3248,7 @@ impl SwayGpu {
             cell_of: sp.cell_of,
             tpl: tpl.to_vec(),
             inst_ring,
+            dmv_ring,
             tlas,
             scratch,
             baked: (0..d3d12::FRAMES_IN_FLIGHT).map(|_| std::cell::Cell::new(f32::NAN)).collect(),
@@ -3277,6 +3338,45 @@ impl SwayGpu {
         unsafe { list.ResourceBarrier(&[uav_barrier(None)]) };
         self.baked[slot].set(time);
         Ok(())
+    }
+
+    /// The dmv ring's SRV element count (whole ring — the frame picks its
+    /// slot via the CB's sway_mv_base).
+    pub fn dmv_elems(&self) -> u32 {
+        (d3d12::FRAMES_IN_FLIGHT * self.tpl.len()) as u32
+    }
+
+    /// Instances per ring slot — the CB `sway_mv_base` multiplier
+    /// (`slot · n_inst`), pub because DxrGpu computes its base too.
+    pub fn n_inst(&self) -> u32 {
+        self.tpl.len() as u32
+    }
+
+    /// This frame's per-chunk prev−cur shear rows into `slot`'s ring section
+    /// — the sway-MV delta table (`foliage::mv_rows`' per-run form: runs of
+    /// one cap-overflow cell get bit-identical rows through the same pure
+    /// `wind`, the record_rebuild re-key contract). Bit-equal clocks write
+    /// nothing and return false — the caller must then NOT arm FLAG_SWAY_MV
+    /// (du = 0 structurally). Slot-fenced like inst_ring; static chunks'
+    /// zeros persist from init, only the sway tail is rewritten. Keyless on
+    /// purpose (recomputed whenever armed): ~2×cells closed-form wind evals,
+    /// and a skip cache would be a second `baked` to invalidate.
+    pub fn write_mv_rows(&self, slot: usize, t_cur: f32, t_prev: f32) -> bool {
+        if t_cur.to_bits() == t_prev.to_bits() {
+            return false;
+        }
+        let up = crate::foliage::winds(&self.cells, t_prev);
+        let uc = crate::foliage::winds(&self.cells, t_cur);
+        let n = self.tpl.len();
+        unsafe {
+            let base = self.dmv_ring.ptr.add(slot * n * 16) as *mut [f32; 4];
+            for (j, (p, c)) in up.iter().zip(uc.iter()).enumerate() {
+                let cl = &self.cells[j];
+                *base.add(self.first_chunk as usize + j) =
+                    crate::foliage::shear_rows(*p - *c, cl.a, cl.b);
+            }
+        }
+        true
     }
 }
 
@@ -3692,6 +3792,16 @@ pub const FLAG_DEPTH_TINT: u32 = 2048;
 /// FLAG_FSR_SIG implies this — FSR-RR reads the sig lanes, which live in ext.
 pub const FLAG_GBUF_EXT: u32 = 4096;
 
+/// Foliage-sway MVs live this frame: the pack's MV/prev-Z reproject each
+/// hit's PREV-POSE point (`p + du·(a + b·p.y)` off the sway_dmv table)
+/// instead of the current one. Armed only when the SWAY_MV compile-in is
+/// present AND `sway_mv_pair` holds (prev clock present, bit-different, prev
+/// camera present) AND the frame's `write_mv_rows` filled the slot — every
+/// pinned-clock gate and frozen still runs the flag-off branch, which is
+/// today's expressions verbatim (a branch, never an add-zero: −0.0 + 0.0 =
+/// +0.0, the fireflies lesson).
+pub const FLAG_SWAY_MV: u32 = 8192;
+
 /// `GBufCore` stride in bytes — lockstep with trace_common.hlsli (one float4:
 /// mv.xy | view_z | prev_z).
 pub const GBUF_STRIDE: u64 = 16;
@@ -3786,6 +3896,12 @@ pub(crate) struct FrameCb {
     /// Appended LAST (the sky_sh / ff precedent) so no offset above moves.
     /// pub(crate) so DxrGpu::write_cb can fill it (the shared shadow_grid_row).
     pub(crate) cloud_grid: [f32; 4],
+    /// Sway-MV delta table base: x = the frame's ring-slot offset in float4
+    /// elements (`slot · n_inst` — the shader reads `sway_dmv[x +
+    /// InstanceID]`), yzw unused. Appended LAST (the cloud_grid precedent).
+    /// Set through `arm_sway_mv` beside FLAG_SWAY_MV so the pair cannot
+    /// split.
+    sway_mv_base: [u32; 4],
 }
 // The HLSL cbuffer is hand-mirrored across 7 concatenated compile units —
 // a size drift here corrupts every field after the drift point.
@@ -3799,6 +3915,7 @@ const _: () = assert!(
             + 16 * crate::sh::N
             + 16 * crate::fireflies::MAX_FIREFLIES
             + 16 // cloud_grid
+            + 16 // sway_mv_base
 );
 // ...and the whole thing must still fit a CB ring slot.
 const _: () = assert!(std::mem::size_of::<FrameCb>() <= CB_STRIDE);
@@ -3849,6 +3966,7 @@ impl FrameCb {
             ff_count: 0,
             ff: [[0.0; 4]; crate::fireflies::MAX_FIREFLIES],
             cloud_grid: [0.0; 4],
+            sway_mv_base: [0; 4],
             prev_origin: [0.0; 4],
             prev_forward: [0.0; 4],
             prev_right: [0.0, 0.0, 0.0, near],
@@ -3959,6 +4077,16 @@ impl FrameCb {
         cb
     }
 
+    /// Arm the sway-MV correction for this frame: FLAG_SWAY_MV + the frame's
+    /// dmv-ring slot base, one call so the pair cannot split (a flag without
+    /// its base indexes slot 0's stale rows). Callers (both tracers'
+    /// write_cb) gate on `sway_mv_pair` + the session's SWAY_MV compile-in +
+    /// the slot fill having run.
+    pub(crate) fn arm_sway_mv(&mut self, base: u32) {
+        self.flags |= FLAG_SWAY_MV;
+        self.sway_mv_base = [base, 0, 0, 0];
+    }
+
     /// Copy into a persistently-mapped CB ring slot.
     pub(crate) fn store(&self, ptr: *mut u8) {
         unsafe {
@@ -4005,12 +4133,21 @@ pub struct FrameParams {
     /// every headless gate/bench passes None — which, plus `sway: None` on
     /// unarmed uploads, is the structural off-state (src/foliage.rs).
     pub sway_time: Option<f32>,
+    /// The PREVIOUS frame's sway clock, paired with `prev_cam`'s frame by
+    /// main.rs (the PrevPose rule — set beside the camera after a successful
+    /// present, cleared with it, so the pair cannot desync). Some + bit-
+    /// different from `sway_time` + `prev_cam` Some arms the sway-MV
+    /// correction (`sway_mv_pair`); None — every headless gate/bench/spin
+    /// site — is the structural camera-only arm.
+    pub sway_prev_time: Option<f32>,
     /// Structure-replay enable (opts.replay). When true AND this frame's basis
     /// bit-equals the previous producing frame's, `record_frame` re-dispatches
     /// the persisted terminal queues instead of re-running seed + the ladder
-    /// (the GPU mirror of src/replay.rs). NOT a global atomic: every headless
-    /// gate/bench sets it false so nothing silently switches paths under a
-    /// measurement.
+    /// (the GPU mirror of src/replay.rs). Replay frames re-shade fresh — the
+    /// leaf shader's MV write included — so the sway-MV fill and CB arming
+    /// run on them like any producing frame. NOT a global atomic: every
+    /// headless gate/bench sets it false so nothing silently switches paths
+    /// under a measurement.
     pub replay: bool,
 }
 
@@ -4105,6 +4242,11 @@ pub struct TraceGpu {
     /// kernel shares bind_common, so an R/C comparison is same-TLAS by
     /// construction.
     sway_t: std::cell::Cell<Option<f32>>,
+    /// Whether SWAY_MV compiled into this tracer's kernels (ring armed AND
+    /// not --sw-rays — see `sway_defs`). The write_cb/record_sway arming
+    /// gate: a flag the kernels never read is one thing, a flag armed
+    /// without the compile-in is a stale-slot-0 read.
+    sway_mv_on: bool,
     /// The live SKY_SPLIT (see the const): the shader define and the
     /// multiplying prep's push constant MUST be the same number, so it is read
     /// once at kernel assembly and stored, never re-derived at the dispatch.
@@ -4259,6 +4401,10 @@ impl TraceGpu {
         // Dev cost-attribution ablations ride `abl_defs()`, which dxr.rs pastes
         // too so the two arms stay comparable.
         let empty_def = empty_defs(scene);
+        // SWAY_MV: suppressed under --sw-rays — the software rays render the
+        // REST pose, so sway MVs would describe motion that is not on screen
+        // (sway_defs' doc). DXR takes sway_defs verbatim.
+        let sway_def = if sw_rays() { "" } else { sway_defs(&scene_gpu) };
         let defs = format!(
             "{}\n{}\n{}\n{}\n{}\n{}\n{}",
             empty_def,
@@ -4267,6 +4413,7 @@ impl TraceGpu {
             trans_defs(scene),
             cand_defs(),
             blas_defs(),
+            sway_def,
             abl_defs()
         );
         let defs = defs.as_str();
@@ -4807,6 +4954,7 @@ impl TraceGpu {
             pso_seed_replay,
             last_struct: std::cell::Cell::new(None),
             sway_t: std::cell::Cell::new(None),
+            sway_mv_on: !sway_def.is_empty(),
             sky_split,
             pso_prep,
             pso_prep_mul,
@@ -4895,6 +5043,16 @@ impl TraceGpu {
         let mut cb =
             self.cb_base.with_frame(p, self.gbuf_full, self.fsr_sig(), self.gbuf_ext_needed());
         cb.cloud_grid = self.cloud_grid_row(p);
+        // Sway MVs: the SAME predicate record_sway's fill uses (sway_mv_pair
+        // + the compile-in), so the flag and the slot's rows cannot disagree.
+        // Known-accept: a record_rebuild FAILURE after this CB was written
+        // leaves one degraded rest-pose frame with sway MVs armed — the
+        // already-loud rebuild-failure path.
+        if self.sway_mv_on && sway_mv_pair(p).is_some() {
+            if let Some(sw) = &self.scene.sway {
+                cb.arm_sway_mv(slot as u32 * sw.n_inst());
+            }
+        }
         cb.store(unsafe { self.frame_cb.ptr.add(slot * CB_STRIDE) });
     }
 
@@ -5079,6 +5237,14 @@ impl TraceGpu {
             if let Err(e) = sw.record_rebuild(list, slot, t) {
                 eprintln!("foliage-sway: ring rebuild failed ({e}) — rest pose this frame");
                 self.sway_t.set(None);
+            } else if self.sway_mv_on {
+                // Sway MVs: fill the slot's prev−cur rows under the same
+                // predicate write_cb arms FLAG_SWAY_MV with. Runs on replay
+                // frames too (record_wavefront_replay calls record_sway —
+                // replays re-shade fresh, MV write included).
+                if let Some((tc, tp)) = sway_mv_pair(p) {
+                    sw.write_mv_rows(slot, tc, tp);
+                }
             }
         }
     }

@@ -50,7 +50,7 @@ void raygen() {
             col = shade_full(cam_origin.xyz, dir, h, rng, ps);
             t = h.t;
             if (s == probe_sample)
-                gbuf_write_hit(pi, sp.x, sp.y, dir, t, ps);
+                gbuf_write_hit(pi, sp.x, sp.y, dir, t, ps SWAY_ARG(h.inst));
         } else {
 #if SKY_LOD > 1
             col = sky_radiance_lod(dir, id.x, id.y);
@@ -148,7 +148,10 @@ void chs_shade(inout RayPayload p, in BuiltInTriangleIntersectionAttributes a) {
     // the high bits carry the sample index for the miss shader's cloud phase.
     if ((p.prim & 1u) == 0u) return;
     uint2 id = DispatchRaysIndex().xy;
-    gbuf_write_hit(id.y * rw + id.x, p.sp.x, p.sp.y, WorldRayDirection(), h.t, ps);
+    // SWAY_ARG: the CHS has the instance intrinsic directly (the same id
+    // tri_of consumed above) — no HitInfo hop needed on this path.
+    gbuf_write_hit(id.y * rw + id.x, p.sp.x, p.sp.y, WorldRayDirection(), h.t, ps
+                   SWAY_ARG(InstanceID()));
 }
 
 [shader("closesthit")]

@@ -152,6 +152,14 @@ pub struct DxrGpu {
     /// meaningful when `SceneGpu::sway` exists (--foliage-sway with leaf
     /// cells) — the pair is checked together at both consumers.
     sway_t: std::cell::Cell<Option<f32>>,
+    /// The frame's sway-MV clock pair (`trace::sway_mv_pair`), stashed by
+    /// `write_cb` beside `sway_t` for `record_frame`'s dmv-ring fill — one
+    /// predicate site, so the CB flag and the slot's rows cannot disagree.
+    /// None on every camera-only frame (headless gates, frozen stills).
+    sway_mv_t: std::cell::Cell<Option<(f32, f32)>>,
+    /// Whether SWAY_MV compiled into this library (`trace::sway_defs` — ring
+    /// armed; DXR has no --sw-rays carve-out). The arming gate.
+    sway_mv_on: bool,
     gbuf_full: bool,
     /// RGBA16F resolve target; rests in PIXEL_SHADER_RESOURCE between frames
     /// (the tonemap PS reads it via SRV_SLOT_DXR).
@@ -239,8 +247,9 @@ impl DxrGpu {
         // The cbuffer's --spp jitter-table size, injected like alpha_defs.
         let sd = trace::spp_defs();
         let sd = sd.as_str();
+        let sway_def = trace::sway_defs(&scene_gpu);
         let defs = format!(
-            "{}\n{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}",
             // SCENE_EMPTY is INERT in this pipeline and is carried only so the
             // two arms' define sets stay comparable: the guards it gates live in
             // frustum.hlsli and rt_sw.hlsli, neither of which this library
@@ -252,6 +261,10 @@ impl DxrGpu {
             trace::height_defs(scene),
             trace::trans_defs(scene),
             trace::blas_defs(),
+            // SWAY_MV: the prev-pose MV correction in gbuf_write_hit, off the
+            // uploaded ring's existence (trace::sway_defs — no --sw-rays
+            // carve-out here, DXR never software-rays).
+            sway_def,
             // FR_ABL, shared with the wavefront — without it every cloud cost
             // attribution was wavefront-only and silently incomparable here.
             trace::abl_defs()
@@ -583,6 +596,8 @@ impl DxrGpu {
             gbuf_ext,
             force_gbuf_ext: std::cell::Cell::new(false),
             sway_t: std::cell::Cell::new(None),
+            sway_mv_t: std::cell::Cell::new(None),
+            sway_mv_on: !sway_def.is_empty(),
             gbuf_full,
             hdr,
             uav_heap,
@@ -621,6 +636,16 @@ impl DxrGpu {
                 .iter()
                 .any(|(k, _)| matches!(k, trace::FeedKind::Rr | trace::FeedKind::FsrRr));
         let mut cb = self.cb_base.with_frame(p, self.gbuf_full, fsr_sig, gbuf_ext);
+        // Sway MVs: arm the flag + the ring-slot base, and stash the clock
+        // pair for record_frame's dmv fill — one predicate (sway_mv_pair +
+        // the compile-in) drives both, the TraceGpu discipline.
+        let pair = if self.sway_mv_on { trace::sway_mv_pair(p) } else { None };
+        self.sway_mv_t.set(pair);
+        if pair.is_some() {
+            if let Some(sw) = &self.scene.sway {
+                cb.arm_sway_mv(slot as u32 * sw.n_inst());
+            }
+        }
         // The per-frame slab-space shadow grid (the shared shadow_grid_row —
         // one source of truth with TraceGpu); zero when the cache is off or
         // clouds are disabled (cloud_sun_transmittance then takes its exact arm).
@@ -778,6 +803,11 @@ impl DxrGpu {
         if let (Some(t), Some(sw)) = (self.sway_t.get(), self.scene.sway.as_ref()) {
             let _sv = super::pix::scope(list, c"dxr-sway-tlas");
             sw.record_rebuild(list, slot, t)?;
+            // Sway MVs: fill the slot's prev−cur rows under write_cb's own
+            // stashed predicate (the TraceGpu::record_sway shape).
+            if let Some((tc, tp)) = self.sway_mv_t.get() {
+                sw.write_mv_rows(slot, tc, tp);
+            }
         }
         unsafe {
             self.bind_common(list, slot);

@@ -3184,6 +3184,7 @@ impl GpuContext {
             (tg.tbuf.clone(), tg.info.clone(), tg.counters.clone(), (tg.rw * tg.rh) as usize)
         };
         let p = trace::FrameParams {
+            sway_prev_time: None,
             cam: *cam,
             frame: 0,
             accumulate: true,

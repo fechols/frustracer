@@ -23,6 +23,11 @@ struct HitInfo {
     float t;
     uint tri;
     float u, v; // moller-trumbore == DXR convention: p = (1-u-v)p0 + u·p1 + v·p2
+#ifdef SWAY_MV
+    // The committed instance id (== chunk index) — gbuf_write_hit's sway_dmv
+    // key. #ifdef'd so no-sway scenes' sources stay byte-identical.
+    uint inst;
+#endif
 };
 
 // Relief uses trace_common.hlsli's height_tmin/height_tmax hardware interval:
@@ -141,6 +146,9 @@ bool trace_closest(float3 o, float3 d, float tmin, float tmax, out HitInfo h) {
     if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
         h.t = q.CommittedRayT();
         h.tri = tri_of(q.CommittedInstanceID(), q.CommittedPrimitiveIndex());
+#ifdef SWAY_MV
+        h.inst = q.CommittedInstanceID();
+#endif
         float2 b = q.CommittedTriangleBarycentrics();
         h.u = b.x; h.v = b.y;
         // Re-march the committed winner for the displaced (t', u', v') the
@@ -185,6 +193,9 @@ bool trace_closest(float3 o, float3 d, float tmin, float tmax, out HitInfo h) {
     if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
         h.t = q.CommittedRayT();
         h.tri = tri_of(q.CommittedInstanceID(), q.CommittedPrimitiveIndex());
+#ifdef SWAY_MV
+        h.inst = q.CommittedInstanceID();
+#endif
         float2 b = q.CommittedTriangleBarycentrics();
         h.u = b.x; h.v = b.y;
         return true;

@@ -120,13 +120,34 @@
 //! the BLAS run index, so cap-overflow runs of one cell fluttered apart and
 //! the CPU/GPU poses could not agree). ZERO rng draws anywhere — poses are
 //! pure functions of (cell, time), so every same-seed / replay contract
-//! holds structurally. Known-accepts (the design doc's list): no MVs on
-//! sway (bounded upscaler ghosting), a converging still freezes mid-gust,
-//! `--sw-rays` renders the rest pose (the HLSL software rays read rest
-//! positions), incompatible with `--heightfield` relief on leaf materials
-//! (the relief re-march reads rest-space fields; both sweeps would compound
-//! on one box). v0.4 RETIRES two v0.3.1 accepts: the rigid billboard base
-//! slide and the curl's vertical sink/lift (`u.y ≡ 0` + the rooted ramp).
+//! holds structurally.
+//!
+//! SWAY CARRIES REAL MOTION VECTORS (v0.7 — retiring the v0.1 "no MVs on
+//! sway" accept): because the pose is a unipotent shear with `u.y ≡ 0`, the
+//! PREV-pose position of a current hit is closed form in the hit point alone
+//! — `p_prev = p + du·(a + b·p.y)`, `du = u_prev − u_cur` — so every MV
+//! write reprojects the prev-POSE point (and FSR-RR's prev-Z lane rides the
+//! same point): `SwayMv`/`mv_rows`/`prev_point` here, `render::
+//! sway_prev_pos` on the CPU, `gbuf_write_hit`'s SWAY_MV arm + the per-chunk
+//! `sway_dmv` ring (`SwayGpu::write_mv_rows`) on both GPU pipelines. The
+//! prev sway clock PAIRS with each retained prev camera (main.rs `PrevPose`
+//! — set after a successful present, cleared together, so the pair cannot
+//! desync); pinned/frozen clocks have du = 0 STRUCTURALLY (bit-equal ⇒
+//! `mv_rows` None / FLAG_SWAY_MV clear), which is what keeps every
+//! pinned-clock gate bit-identical. Gated by --check's `sway-mv` cross-pose
+//! oracle (with camera-only-imposter teeth) + --check-gpu/--check-dxr
+//! wiring twins on foliage scenes.
+//!
+//! Known-accepts (the design doc's list): a converging still freezes
+//! mid-gust, `--sw-rays` renders the rest pose (the HLSL software rays read
+//! rest positions — sway MVs are SUPPRESSED there, `trace::sway_defs`, or
+//! they would describe motion that is not on screen), incompatible with
+//! `--heightfield` relief on leaf materials (the relief re-march reads
+//! rest-space fields; both sweeps would compound on one box), and OIDN's
+//! temporal mode still ghosts sway (reproject.rs reprojects from DEPTH, not
+//! MVs — its own documented design). v0.4 RETIRES two v0.3.1 accepts: the
+//! rigid billboard base slide and the curl's vertical sink/lift (`u.y ≡ 0`
+//! + the rooted ramp).
 
 use crate::scene::{MatKind, Scene};
 use glam::Vec3A;
@@ -729,6 +750,89 @@ pub fn winds(cells: &[SwayCell], time: f32) -> Vec<Vec3A> {
     // scale rides IN each cell; rayon for the MAX_CELLS doubling).
     use rayon::prelude::*;
     cells.par_iter().map(|c| wind(c, time)).collect()
+}
+
+/// Per-PARTITION-cell prev−cur shear-row deltas for one frame's MV write —
+/// the sway half of "proper motion vectors" (the fireflies round-3 shape,
+/// but into the MAIN MV planes: sway is true surface motion, exactly what
+/// the upscalers are trained on). Because the pose is a unipotent shear
+/// with `u.y ≡ 0`, the PREV-pose position of a CURRENT hit point is closed
+/// form in the hit point alone — no rest position, no barycentrics:
+/// `p_prev = p + du·(a + b·p.y)`, `du = u_prev − u_cur`. `rows[c]` is
+/// `shear_rows(du, a, b)`, applied by `prev_point`.
+pub struct SwayMv {
+    pub rows: Vec<[f32; 4]>,
+}
+
+/// Build one frame's MV deltas: `rows[c] = shear_rows(wind(c, t_prev) −
+/// wind(c, t_cur), a, b)`. `None` on bit-equal clocks (the `bake` fast-path
+/// idiom) — a frozen still / pinned gate has du = 0 STRUCTURALLY, which is
+/// what keeps every pinned-clock MV gate bit-identical: the consumer never
+/// even branches on a zero delta, it takes the pre-feature path outright.
+/// Built as `shear_rows(u_prev − u_cur, ..)` — ONE derivation shared with
+/// the GPU instance patch, never `rows(u_prev) − rows(u_cur)` — so du = 0
+/// yields exact zero rows and the linearity pin below stays a documentation
+/// of equivalence, not a load-bearing identity. Pure function of the two
+/// clocks; zero rng draws (every same-seed/replay contract holds).
+pub fn mv_rows(sway: &SceneSway, t_cur: f32, t_prev: f32) -> Option<SwayMv> {
+    if t_cur.to_bits() == t_prev.to_bits() {
+        return None;
+    }
+    use rayon::prelude::*;
+    let rows = sway
+        .cells
+        .par_iter()
+        .map(|c| {
+            let du = wind(c, t_prev) - wind(c, t_cur);
+            shear_rows(du, c.a, c.b)
+        })
+        .collect();
+    Some(SwayMv { rows })
+}
+
+/// Apply one cell's prev−cur rows to a CURRENT-pose point (exact: y is
+/// shear-invariant, so the rows evaluate at the hit's own y verbatim). The
+/// ONE Rust-side application site — the MV write (`render.rs`) and the
+/// cross-pose gate oracle both call this, so the derivation cannot fork;
+/// `trace_common.hlsli`'s `gbuf_write_hit` SWAY_MV arm is its term-for-term
+/// HLSL twin.
+#[inline]
+pub fn prev_point(rows: &[f32; 4], p: Vec3A) -> Vec3A {
+    Vec3A::new(p.x + rows[0] * p.y + rows[1], p.y, p.z + rows[2] * p.y + rows[3])
+}
+
+/// Synthetic all-foliage micro-scene, `per` tiny tris per cluster — ONE
+/// construction serving `self_test`'s gateway/displaced-hit pins AND
+/// main.rs's sway-MV cross-pose gate (`sway_mv_check`), so the two gates
+/// always exercise the same partition shape. `attach` runs, so `sway` is
+/// Some whenever the session lever arms (an armed run on this scene always
+/// partitions: every tri is leaf-classed).
+pub fn synth_sway_scene(clusters: &[Vec3A], per: usize) -> Scene {
+    let mut b = crate::scene::SceneBuilder::new();
+    // alpha_masked arms the leaf predicate; the OPAQUE texel keeps the
+    // cutout from rejecting the displaced-hit pin's ray.
+    let t = b.add_texture(crate::texture::Texture {
+        w: 1,
+        h: 1,
+        texels: vec![[255, 255, 255, 255]],
+        alpha_masked: true,
+        srgb: true,
+        source: String::new(),
+        h2n: false,
+        n2h: false,
+        mips: Vec::new(),
+    });
+    let m = b.material_kind(Vec3A::ONE, 0.5, 0.0, 0.0, MatKind::Textured { tex: t });
+    for &c in clusters {
+        for j in 0..per {
+            let o = c + Vec3A::new(j as f32 * 0.1, 0.0, 0.0);
+            b.tri([o, o + 0.05 * Vec3A::X, o + 0.05 * Vec3A::Y], [Vec3A::Z; 3], m);
+        }
+    }
+    let mut s = b.finish(crate::sky::Sun::new(Vec3A::Y));
+    s.materials[m as usize].class = crate::matclass::IDX_FOLIAGE as u8;
+    attach(&mut s);
+    s
 }
 
 /// Per-material leaf mask: foliage-classified (`Material::class` — the
@@ -1926,6 +2030,69 @@ pub fn self_test(scene: &Scene, bvh: &crate::bvh::Bvh) -> Result<(), String> {
     // must-fires it instead.
     let _ = rooted_seen;
 
+    // -- MV deltas (`mv_rows`/`prev_point`): the closed-form prev-pose map
+    // the sway MVs ride on. Three pins:
+    //   (1) round trip — displacing a rest point by pose(t1) and applying
+    //       the (t0 − t1) delta must land on the pose(t0) displacement of
+    //       the same rest point (y bitwise-invariant; x/z to fp association);
+    //   (2) bit-equal clocks ⇒ None (the frozen-still / pinned-gate off arm);
+    //   (3) shear_rows linearity — rows(u0 − u1) == rows(u0) − rows(u1)
+    //       elementwise, documenting why building from the difference is the
+    //       same map (and exact at du = 0 where the subtraction form isn't
+    //       guaranteed to cancel bitwise).
+    {
+        let (t0, t1) = (7.5f32, 9.5f32);
+        if mv_rows(&part, t0, t0).is_some() {
+            return Err("mv_rows: bit-equal clocks must return None".into());
+        }
+        let Some(mv) = mv_rows(&part, t1, t0) else {
+            return Err("mv_rows: distinct clocks returned None".into());
+        };
+        if mv.rows.len() != part.cells.len() {
+            return Err("mv_rows: row count != cell count".into());
+        }
+        let mut mv_moved = false;
+        for (i, c) in part.cells.iter().enumerate().take(64) {
+            let u0 = wind(c, t0);
+            let u1 = wind(c, t1);
+            // Linearity pin (elementwise, ulp-scale slack on the products).
+            let direct = shear_rows(u0 - u1, c.a, c.b);
+            let r0 = shear_rows(u0, c.a, c.b);
+            let r1 = shear_rows(u1, c.a, c.b);
+            for k in 0..4 {
+                let diff = r0[k] - r1[k];
+                if (direct[k] - diff).abs() > 1e-6 * (1.0 + direct[k].abs().max(diff.abs())) {
+                    return Err(format!("cell {i}: shear_rows linearity broken at lane {k}"));
+                }
+            }
+            // Round trip at both y endpoints (displacement linear in y ⇒
+            // endpoints are a proof): rest r → pose(t1) point q1, then the
+            // delta must carry q1 to pose(t0)'s q0.
+            for &y in &[c.y0, c.y1] {
+                let r = Vec3A::new(c.anchor.x + 0.25 * c.scale, y, c.anchor.z - 0.125 * c.scale);
+                let w = c.a + c.b * y;
+                let q1 = r + u1 * w;
+                let q0 = r + u0 * w;
+                let got = prev_point(&mv.rows[i], q1);
+                if got.y.to_bits() != q1.y.to_bits() {
+                    return Err(format!("cell {i}: prev_point moved y"));
+                }
+                if (got - q0).length() > 1e-5 * (1.0 + c.scale) {
+                    return Err(format!(
+                        "cell {i}: prev-pose round trip off by {} at y={y}",
+                        (got - q0).length()
+                    ));
+                }
+                if (q0 - q1).length() > 1e-9 * c.scale {
+                    mv_moved = true;
+                }
+            }
+        }
+        if !mv_moved {
+            return Err("mv_rows: no cell moved between the two clocks — dead delta".into());
+        }
+    }
+
     // The swept-containment pin (build-vs-motion, the height_self_test
     // shape): every pose reachable at mult <= sweep_mult() lies inside the
     // box the BVH build pads by `sway_pad` — |u·w_lin(y)| <= pad at BOTH y
@@ -1990,33 +2157,7 @@ pub fn self_test(scene: &Scene, bvh: &crate::bvh::Bvh) -> Result<(), String> {
     // builder / --no-blas-split sessions — the audit's inverse pin covers
     // those trees instead).
     if gateway_mode() {
-        let synth = |clusters: &[Vec3A], per: usize| -> Scene {
-            let mut b = crate::scene::SceneBuilder::new();
-            // alpha_masked arms the leaf predicate; the OPAQUE texel keeps
-            // the cutout from rejecting the displaced-hit pin's ray.
-            let t = b.add_texture(crate::texture::Texture {
-                w: 1,
-                h: 1,
-                texels: vec![[255, 255, 255, 255]],
-                alpha_masked: true,
-                srgb: true,
-                source: String::new(),
-                h2n: false,
-                n2h: false,
-                mips: Vec::new(),
-            });
-            let m = b.material_kind(Vec3A::ONE, 0.5, 0.0, 0.0, MatKind::Textured { tex: t });
-            for &c in clusters {
-                for j in 0..per {
-                    let o = c + Vec3A::new(j as f32 * 0.1, 0.0, 0.0);
-                    b.tri([o, o + 0.05 * Vec3A::X, o + 0.05 * Vec3A::Y], [Vec3A::Z; 3], m);
-                }
-            }
-            let mut s = b.finish(crate::sky::Sun::new(Vec3A::Y));
-            s.materials[m as usize].class = crate::matclass::IDX_FOLIAGE as u8;
-            attach(&mut s);
-            s
-        };
+        let synth = synth_sway_scene;
         // Two clusters far apart and vertically spread: the FLOOR cluster
         // (y ∈ [0, 0.05]) sits in the ramp's steep base — its cell roots at
         // the content floor (w0 = 0, b ≠ 0), which is what the rooted-base

@@ -62,6 +62,11 @@
                                // (src/fireflies.rs — count > 0 folds in the
                                // session enable AND the night fade, so day
                                // kernels are bit-identical by construction)
+#define FLAG_SWAY_MV     8192u // foliage-sway MVs live this frame: the pack's
+                               // MV/prev-Z reproject each hit's PREV-POSE
+                               // point off sway_dmv (SWAY_MV scenes only;
+                               // pinned/frozen clocks run the flag-off branch
+                               // — today's expressions verbatim)
 
 cbuffer Frame : register(b0) {
     float4 cam_origin;   // xyz; w = inv_w
@@ -136,6 +141,10 @@ cbuffer Frame : register(b0) {
     // Cloud shadow cache transform: xy = grid origin in world (x,z), z = 1/cell,
     // w unused. Appended LAST (the sky_sh / ff precedent) so no offset moves.
     float4 cloud_grid;
+    // Sway-MV delta table base: x = the frame's dmv-ring slot offset in
+    // float4 elements (gbuf_write_hit reads sway_dmv[x + inst]), yzw unused.
+    // Appended LAST (the cloud_grid precedent) so no offset above moves.
+    uint4 sway_mv_base;
 }
 
 #define SCENE_EPS  (sun_e.w)
@@ -1247,16 +1256,58 @@ float2 gbuf_mv(float3 d, float fx, float fy) {
     return ok ? p - float2(fx, fy) : float2(0.0, 0.0);
 }
 
+// SWAY_MV call-site adapter: armed kernels pass the hit's instance id (the
+// sway chunk index) into gbuf_write_hit; unarmed kernels compile the exact
+// pre-feature call — the parameter itself is #ifdef'd so no-sway scenes'
+// sources stay byte-identical (the ALPHA_CUTOUT discipline).
+#ifdef SWAY_MV
+#define SWAY_ARG(inst) , (inst)
+#else
+#define SWAY_ARG(inst)
+#endif
+
+// Foliage-sway MV deltas (SWAY_MV): per-CHUNK prev−cur shear rows
+// [du.x·b, du.x·a, du.z·b, du.z·a] for this frame's ring slot at
+// sway_mv_base.x + InstanceID (foliage::shear_rows of u_prev − u_cur —
+// SwayGpu::write_mv_rows fills it beside the TLAS rebuild). Static chunks
+// hold zero rows (the exact identity). Declared HERE, ahead of
+// gbuf_write_hit's read (the rest of the space1 table sits below by the
+// register-wall comment there — textual position never moves a register);
+// unconditional (a 16-byte dummy binds when unarmed — the blas_tri
+// discipline), READ only under SWAY_MV + FLAG_SWAY_MV.
+StructuredBuffer<float4> sway_dmv : register(t9, space1);
+
 // render.rs::write_gbuf_hit. (fx, fy) is the jittered sample position — the
 // MV is unjittered by construction (both bases are jitter-free and the hit
 // point lies on the jittered ray).
-void gbuf_write_hit(uint pi, float fx, float fy, float3 dir, float t, PrimSurf ps) {
+void gbuf_write_hit(uint pi, float fx, float fy, float3 dir, float t, PrimSurf ps
+#ifdef SWAY_MV
+                    , uint inst
+#endif
+) {
     if ((flags & FLAG_GBUF) == 0u) return;
 #ifdef ABL_NOGBUF
     return; // cost probe: price the pack store out of leaf/sky (see abl_defs)
 #endif
     float view_z = t * dot(dir, cam_forward.xyz);
     float3 hit_rel = cam_origin.xyz + dir * t - prev_origin.xyz;
+#ifdef SWAY_MV
+    // render.rs::sway_prev_pos, term for term: shift to the hit's PREV-POSE
+    // point, p += du·(a + b·p.y) off the chunk's shear-row delta (y is
+    // shear-invariant, so the CURRENT hit's own y evaluates the rows
+    // exactly). hit_rel feeds BOTH gbuf_mv and the prev_z dot below, so the
+    // MV's RG and its FSR-RR depth-delta lane describe one motion by
+    // construction. Static chunks hold zero rows (identity up to −0.0+0.0
+    // sign, unobserved: no gate compares an ARMED frame against an unarmed
+    // one — every pinned-clock gate runs flag-off, which skips this block
+    // outright and is today's expressions verbatim).
+    if (flags & FLAG_SWAY_MV) {
+        float4 r = sway_dmv[sway_mv_base.x + inst];
+        float hy = cam_origin.y + dir.y * t;
+        hit_rel.x += r.x * hy + r.y;
+        hit_rel.z += r.z * hy + r.w;
+    }
+#endif
     // render.rs's fsr_buf fill: prev-camera linear view-Z of the SAME hit
     // point (no prev camera degrades to "no depth motion"). FSR-RR only, so
     // every other wiring stores 0 here exactly as the pre-split pack did.
@@ -1392,6 +1443,10 @@ StructuredBuffer<float4> mat_shadow : register(t6, space1);
 // does not move with the lever, but READ only under BLAS_SPLIT.
 StructuredBuffer<uint>   blas_tri   : register(t7, space1);
 StructuredBuffer<uint>   chunk_base : register(t8, space1);
+// (t9 space1 is sway_dmv — the foliage-sway MV delta table, declared EARLIER
+// in this file because gbuf_write_hit reads it; see the decl beside
+// SWAY_ARG. The table slot lives between chunk_base and texs[] regardless of
+// textual position.)
 
 // The one (InstanceID, PrimitiveIndex) -> triangle id reconstruction. Without
 // the lever every intersector's primitive index IS the triangle id (one BLAS
@@ -1411,7 +1466,7 @@ uint tri_of(uint inst, uint prim) { return prim; }
 // maps — Texture::srgb), carrying the FULL CPU-generated mip chain (built in
 // texture.rs::build_mips, uploaded verbatim — CPU-trilinear parity: both
 // samplers read identical texels at identical ray-cone lods).
-Texture2D<float4>        texs[]     : register(t9, space1);
+Texture2D<float4>        texs[]     : register(t10, space1);
 // Static: trilinear, repeat wrap — texture.rs::sample_trilinear in hardware
 // (sRGB decode per texel via the SRGB SRV format, texel centers at i + 0.5;
 // every sample passes an explicit ray-cone lod to SampleLevel, and lod <= 0

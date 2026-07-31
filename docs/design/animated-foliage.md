@@ -613,15 +613,28 @@ triangle BLASes, so the any-hit/candidate cutout path applies verbatim; the
 care point is UV/attribute interpolation through clipped triangles (clipping
 must interpolate texcoords exactly or cutout masks crawl at tet boundaries).
 
-### 9. Motion vectors — worse than the clouds accept, and bounded
+### 9. Motion vectors — RESOLVED (v0.7): real sway MVs in the main planes
 
-Sway is a VISIBILITY change with no MVs, which is a harder ask of the
-upscalers than cloud drift (shading-only). v1 accepts ghosting at a bounded
-amplitude — the sway constant is authored small (a foliage flutter, not a
-storm), and the amplitude constant is simultaneously the BVH sweep pad, so
-taste and cost push the same direction. The follow-on is nearly free by
-construction: per-tet MVs fall out of the prev/cur instance transform pair
-the animation already computes (project the rest-space hit through both).
+The v1 accept ("sway is a VISIBILITY change with no MVs — bounded ghosting")
+is retired. The follow-on turned out even cheaper than the "project the
+rest-space hit through both transforms" sketch below anticipated: the
+shipped pose is a unipotent shear with `u.y ≡ 0`, so the prev-pose position
+of a CURRENT hit needs no rest-space hit at all —
+
+    p_prev = p_hit + du·(a + b·p_hit.y),   du = u_prev − u_cur   (per cell)
+
+one `float4` of shear-row deltas per cell (`foliage::mv_rows` /
+`prev_point`; per-chunk `sway_dmv` ring + `gbuf_write_hit`'s SWAY_MV arm on
+the GPU — the FSR-RR prev-Z lane shares the corrected `hit_rel`, so depth
+delta and MV describe one motion by construction). The prev sway clock pairs
+with each retained prev camera (main.rs `PrevPose` — one value set after a
+successful present, cleared together, so a present error can never desync
+the pair), and bit-equal clocks are the structural du = 0 off arm that keeps
+every pinned-clock gate bit-identical. Gates: `--check`'s `sway-mv`
+cross-pose oracle (closed-form, with camera-only-imposter teeth) and the
+`--check-gpu`/`--check-dxr` wiring twins on foliage scenes. Residual
+accepts: `--sw-rays` suppresses sway MVs (it renders the rest pose), and
+OIDN's temporal mode still ghosts sway (depth-reprojection by design).
 
 ### 10. Preprocess and caching
 
@@ -684,7 +697,8 @@ BVH-quality tax of the swept proxy boxes and the upscaler ghosting.
 
 - CPU arm renders the rest pose (world/interactive-only feature, loud line).
 - A converging still freezes the sway mid-gust (the fireflies accept).
-- No MVs on sway → bounded upscaler ghosting (follow-on: per-tet MVs).
+- ~~No MVs on sway~~ RETIRED v0.7 — real sway MVs in the main planes (§9;
+  residual: `--sw-rays` suppresses them, OIDN temporal mode is depth-driven).
 - Bounded-count watertightness allowance on rays crossing animated geometry
   (static geometry keeps exact-zero).
 - Foliage triangle count inflates 1.3–2.3× after clipping (foliage subset

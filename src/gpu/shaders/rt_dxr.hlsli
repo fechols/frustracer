@@ -52,6 +52,12 @@ struct HitInfo {
     float t;
     uint tri;
     float u, v; // DXR barycentrics == moller-trumbore: p = (1-u-v)p0 + u·p1 + v·p2
+#ifdef SWAY_MV
+    // Signature parity with rt.hlsli. This TraceRay flavor serves only the
+    // reflection continuations inside chs_shade — never the G-buffer write,
+    // whose chs_shade call passes InstanceID() directly — so 0 is fine.
+    uint inst;
+#endif
 };
 #endif
 
@@ -130,6 +136,9 @@ bool trace_closest(float3 o, float3 d, float tmin, float tmax, out HitInfo h) {
     p.tmin = tmin; p.tmax = tmax;
     TraceRay(tlas, OPAQUE_RF, 0xffu, 1u, 0u, 2u, r, p);
     h.t = max(p.t, 0.0); h.tri = p.tri; h.u = p.u; h.v = p.v;
+#ifdef SWAY_MV
+    h.inst = 0u; // dead — see the field's comment
+#endif
     return p.t >= 0.0;
 }
 

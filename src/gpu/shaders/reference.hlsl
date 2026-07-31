@@ -31,7 +31,7 @@ void cs_reference(uint3 id : SV_DispatchThreadID) {
         if (trace_closest(cam_origin.xyz, dir, 0.0, FLT_MAX, hit)) {
             c = shade_full(cam_origin.xyz, dir, hit, rng, ps);
             t = hit.t;
-            if (prim) gbuf_write_hit(pi, sp.x, sp.y, dir, hit.t, ps);
+            if (prim) gbuf_write_hit(pi, sp.x, sp.y, dir, hit.t, ps SWAY_ARG(hit.inst));
         } else {
             // A DISPLAY path: the camera's own miss sees the sun DISC (sky.rs).
             // Cloud phase per (pixel, frame, SAMPLE) — the leaf kernel's twin.

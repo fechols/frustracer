@@ -184,6 +184,21 @@ enum RenderMode {
     Plain,
 }
 
+/// A retained previous-frame pose for MV reprojection: the camera PLUS the
+/// sway clock of the SAME frame (`cloud_time` at its present; None = the
+/// scene carries no sway partition). One value, set only after a successful
+/// present and cleared by the same `= None` reset arms the camera always
+/// was — which is what makes a desync structurally impossible: a
+/// present-error frame retains both or neither, so the sway MV deltas
+/// (`foliage::mv_rows(cur, prev)`) always describe exactly the pose pair
+/// the upscaler holds history for. The `dlss::DlssPrev` shape for the
+/// paths that retained a bare `Camera`.
+#[derive(Clone, Copy)]
+struct PrevPose {
+    cam: Camera,
+    sway_t: Option<f32>,
+}
+
 fn main() {
     prof::init(); // before any zone can fire; inert without --features tracy
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -1111,6 +1126,7 @@ fn run_check_dxr(
     let tbuf: Vec<AtomicU32> = (0..gw * gh).map(|_| AtomicU32::new(0)).collect();
     let cpu_frame = |frame: u32| {
         let ctx = FrameCtx {
+            sway_mv: None,
             scene,
             bvh,
             cam: basis,
@@ -1149,6 +1165,7 @@ fn run_check_dxr(
     // per-sample rays. (1, 0) above is the historical single-sample frame.
     let cpu_frame_spp = |frame: u32, spp: u32, probe: u32| {
         let ctx = FrameCtx {
+            sway_mv: None,
             scene,
             bvh,
             cam: basis,
@@ -1189,6 +1206,7 @@ fn run_check_dxr(
         dg.write_cb(
             0,
             &gpu::trace::FrameParams {
+                sway_prev_time: None,
                 cam: basis,
                 frame,
                 accumulate: true,
@@ -1286,6 +1304,7 @@ fn run_check_dxr(
         match (on_acc, off_built) {
             (Ok(on_acc), Ok(dg_off)) => {
                 let p0 = gpu::trace::FrameParams {
+                    sway_prev_time: None,
                     cam: basis,
                     frame: 0,
                     accumulate: true,
@@ -1387,6 +1406,7 @@ fn run_check_dxr(
         const SPP_GATE: u32 = 4;
         for probe in 0..SPP_GATE {
             let p = gpu::trace::FrameParams {
+                sway_prev_time: None,
                 cam: basis,
                 frame: 0,
                 accumulate: true,
@@ -1610,9 +1630,11 @@ fn run_check_dxr(
                               dg2: &gpu::dxr::DxrGpu,
                               basis: camera::CamBasis,
                               prev: Option<camera::CamBasis>,
-                              frame: u32|
+                              frame: u32,
+                              sway: (Option<f32>, Option<f32>)|
          -> Result<(dlss::GBufs, Vec<f32>), String> {
             let p = gpu::trace::FrameParams {
+                sway_prev_time: sway.1,
                 cam: basis,
                 frame,
                 accumulate: false,
@@ -1625,7 +1647,7 @@ fn run_check_dxr(
                 probe_sample: 0,
                 clouds: crate::clouds::Clouds::check(scene.diag),
             fireflies: crate::fireflies::Fireflies::check(scene),
-            sway_time: check_sway,
+            sway_time: sway.0,
             replay: false,
             };
             dg2.write_cb(0, &p);
@@ -1644,20 +1666,21 @@ fn run_check_dxr(
         let mut cam_b = cam0;
         cam_b.pos += cam0.forward() * (0.02 * scene.diag);
         let basis_b = cam_b.basis(pw, ph);
-        let (ga, ta) = match dxr_gbuf_frame(&mut hg, &dg2, basis_a, None, 0) {
+        let (ga, ta) = match dxr_gbuf_frame(&mut hg, &dg2, basis_a, None, 0, (check_sway, None)) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("check-dxr: FAIL gbuf frame A: {e}");
                 return 1;
             }
         };
-        let (gb2, tb2) = match dxr_gbuf_frame(&mut hg, &dg2, basis_b, Some(basis_a), 1) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("check-dxr: FAIL gbuf frame B: {e}");
-                return 1;
-            }
-        };
+        let (gb2, tb2) =
+            match dxr_gbuf_frame(&mut hg, &dg2, basis_b, Some(basis_a), 1, (check_sway, None)) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("check-dxr: FAIL gbuf frame B: {e}");
+                    return 1;
+                }
+            };
         let loadz = |g: &dlss::GBufs, i: usize| {
             f32::from_bits(g.depth[i].load(std::sync::atomic::Ordering::Relaxed))
         };
@@ -1945,6 +1968,7 @@ fn run_check_dxr(
                     return 1;
                 }
                 let p = gpu::trace::FrameParams {
+                    sway_prev_time: None,
                     cam: basis_b,
                     frame: 1,
                     accumulate: false,
@@ -2091,6 +2115,65 @@ fn run_check_dxr(
             ) {
                 ok = false;
             }
+        }
+
+        // Sway-MV cross-pose — the check-gpu twin's DXR flavor (see it for
+        // the design: WIRING gate, foliage close-up pose with prev == cur
+        // camera so the MV is pure object motion; the authored-motion teeth
+        // live in --check's synthetic gate). Runs LAST in this block for the
+        // same reason as the wavefront twin: it re-traces into the resident
+        // pack/accum every feed gate above reads as "frame B". No --sw-rays
+        // carve-out: this pipeline never software-rays.
+        match (check_sway, core.sway.is_some()) {
+            (Some(t0s), true) => {
+                let sw = scene.sway.as_deref().expect("core.sway implies scene.sway");
+                let t1s = t0s + 2.0;
+                let basis_p = sway_mv_pose(scene, sw, bvh).basis(pw, ph);
+                let r =
+                    dxr_gbuf_frame(&mut hg, &dg2, basis_p, Some(basis_p), 2, (Some(t1s), Some(t0s)));
+                match r {
+                    Ok((gb3, tb3)) => {
+                        foliage::bake(sw, t1s);
+                        let v = sway_mv_verify(
+                            scene, sw, bvh, basis_p, basis_p, &gb3, &|i| tb3[i], None, t0s, t1s,
+                            pw, ph, 0.25,
+                        );
+                        foliage::bake(sw, t0s); // restore the suite's pose
+                        eprintln!(
+                            "check-dxr: sway-mv ({pw}x{ph}): {} foliage px | mv err median \
+                             {:.4} p90 {:.4} px | moving > 0.25 px: {} (teeth median {:.3}) \
+                             | static {} px bad {}",
+                            v.n, v.med, v.p90, v.fired, v.teeth_med, v.static_px, v.static_bad
+                        );
+                        if v.n == 0 || v.med > 0.05 || v.p90 > 0.3 || v.static_bad > 0 {
+                            eprintln!("check-dxr: FAIL sway-mv off the prev-pose oracle");
+                            ok = false;
+                        }
+                        if v.fired == 0 {
+                            eprintln!(
+                                "check-dxr: FAIL sway-mv vacuous — no foliage px moved \
+                                 > 0.25 px between the gate clocks"
+                            );
+                            ok = false;
+                        } else if v.teeth_med <= 0.15 {
+                            eprintln!(
+                                "check-dxr: FAIL sway-mv teeth — written MVs sit on the \
+                                 camera-only imposter"
+                            );
+                            ok = false;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("check-dxr: FAIL sway-mv frame: {e}");
+                        ok = false;
+                    }
+                }
+            }
+            (Some(_), false) => eprintln!(
+                "check-dxr: sway-mv skipped — partition attached but the GPU ring is unarmed \
+                 (--no-blas-split?)"
+            ),
+            _ => eprintln!("check-dxr: sway-mv skipped (no foliage partition on this scene)"),
         }
     }
 
@@ -3044,6 +3127,7 @@ fn run_check_gpu(
     let tbuf: Vec<AtomicU32> = (0..gw * gh).map(|_| AtomicU32::new(0)).collect();
     let cpu_frame = |frame: u32| {
         let ctx = FrameCtx {
+            sway_mv: None,
             scene,
             bvh,
             cam: basis,
@@ -3082,6 +3166,7 @@ fn run_check_gpu(
                      frame: u32|
      -> Result<(), String> {
         tg.write_cb(0, &gpu::trace::FrameParams {
+            sway_prev_time: None,
             cam: basis,
             frame,
             accumulate: true,
@@ -3308,6 +3393,7 @@ fn run_check_gpu(
 
     // One unjittered wavefront frame with the coverage sentinel flooded.
     let wf_params = gpu::trace::FrameParams {
+        sway_prev_time: None,
         cam: basis,
         frame: 0,
         accumulate: true,
@@ -3919,6 +4005,7 @@ fn run_check_gpu(
         // FrameParams builders sharing wf_params' shading contract (frame 0,
         // accumulate, unjittered, 1-spp), with the two axes the gate varies.
         let mk = |frame: u32, cam: camera::CamBasis, replay: bool| gpu::trace::FrameParams {
+            sway_prev_time: None,
             cam,
             frame,
             accumulate: true,
@@ -4087,6 +4174,7 @@ fn run_check_gpu(
             (0..SPP_GATE).map(|k| (SPP_GATE, k)).chain([(top, top - 1)]).collect();
         for (spp, probe) in probes {
             let p = gpu::trace::FrameParams {
+                sway_prev_time: None,
                 cam: basis,
                 frame: 0,
                 accumulate: true,
@@ -4266,6 +4354,7 @@ fn run_check_gpu(
         let hq = Quality { fb, ..q };
         for s in 0..SEEDS {
             tg.write_cb(0, &gpu::trace::FrameParams {
+                sway_prev_time: None,
                 cam: basis,
                 frame: s,
                 accumulate: true,
@@ -4444,6 +4533,7 @@ fn run_check_gpu(
             ..q
         };
         let p = gpu::trace::FrameParams {
+            sway_prev_time: None,
             cam: basis,
             frame: 0,
             accumulate: true,
@@ -4533,9 +4623,11 @@ fn run_check_gpu(
         let gpu_gbuf_frame = |hg: &mut gpu::trace::HeadlessGpu,
                               basis: camera::CamBasis,
                               prev: Option<camera::CamBasis>,
-                              frame: u32|
+                              frame: u32,
+                              sway: (Option<f32>, Option<f32>)|
          -> Result<(dlss::GBufs, Vec<f32>), String> {
             let p = gpu::trace::FrameParams {
+                sway_prev_time: sway.1,
                 cam: basis,
                 frame,
                 accumulate: false,
@@ -4548,7 +4640,7 @@ fn run_check_gpu(
                 probe_sample: 0,
                 clouds: crate::clouds::Clouds::check(scene.diag),
             fireflies: crate::fireflies::Fireflies::check(scene),
-            sway_time: check_sway,
+            sway_time: sway.0,
             replay: false,
             };
             ptg.write_cb(0, &p);
@@ -4565,20 +4657,21 @@ fn run_check_gpu(
         let mut cam_b = cam0;
         cam_b.pos += cam0.forward() * (0.02 * scene.diag);
         let basis_b = cam_b.basis(pw, ph);
-        let (ga, ta) = match gpu_gbuf_frame(&mut hg, basis_a, None, 0) {
+        let (ga, ta) = match gpu_gbuf_frame(&mut hg, basis_a, None, 0, (check_sway, None)) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("check-gpu: FAIL gbuf frame A: {e}");
                 return 1;
             }
         };
-        let (gb2, tb2) = match gpu_gbuf_frame(&mut hg, basis_b, Some(basis_a), 1) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("check-gpu: FAIL gbuf frame B: {e}");
-                return 1;
-            }
-        };
+        let (gb2, tb2) =
+            match gpu_gbuf_frame(&mut hg, basis_b, Some(basis_a), 1, (check_sway, None)) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("check-gpu: FAIL gbuf frame B: {e}");
+                    return 1;
+                }
+            };
         // Structural pack coverage: every pixel carries a positive view-Z
         // (exactly-once coverage rides the sentinel gates; this proves the
         // gbuf writes ran everywhere), and sky depth is far BIT-EQUAL (the
@@ -4621,6 +4714,7 @@ fn run_check_gpu(
         if !albedo_ab_check(scene, bvh, cam0, &ga, &ta, pw, ph, "gpu") {
             ok = false;
         }
+
 
         // --- bc7-gpu: the GPU encoder's STRUCTURAL gate (synthetic textures,
         // so it fires on every scene — including the untextured procedural
@@ -4960,6 +5054,7 @@ fn run_check_gpu(
                     return 1;
                 }
                 let p = gpu::trace::FrameParams {
+                    sway_prev_time: None,
                     cam: basis_b,
                     frame: 1,
                     accumulate: false,
@@ -5391,6 +5486,104 @@ fn run_check_gpu(
                 }
             }
         }
+
+        // Sway-MV cross-pose (foliage scenes only — the ring must be armed):
+        // one frame at gust t1 with (prev pose, prev clock t0) wired arms
+        // FLAG_SWAY_MV, and the pack's foliage MVs must land on the closed-
+        // form prev-pose oracle — the WIRING gate (a lost flag, dead dmv
+        // buffer, or wrong InstanceID base moves every foliage px). Runs
+        // LAST in this block, deliberately: it re-traces into the RESIDENT
+        // pack/accum every earlier feed/sig/NPPD gate reads as "frame B" —
+        // an earlier placement failed exactly those gates on the swaying
+        // pixels. The pose is a CLOSE-UP over the strongest sway cell with
+        // prev == cur camera (pure object motion; the camera-only imposter
+        // is ~0 there), because the session pose can legitimately see
+        // foliage only at sub-quarter-pixel gust range — measured 37 px /
+        // 0 moving on san-miguel's default pose. The strong authored-motion
+        // teeth live in --check's synthetic sway-mv gate.
+        let sway_mv_live = core.sway.is_some()
+            && !gpu::trace::SW_RAYS.load(std::sync::atomic::Ordering::Relaxed);
+        match (check_sway, sway_mv_live) {
+            (Some(t0s), true) => {
+                let sw = scene.sway.as_deref().expect("core.sway implies scene.sway");
+                let t1s = t0s + 2.0;
+                let basis_p = sway_mv_pose(scene, sw, bvh).basis(pw, ph);
+                // Inline frame (not gpu_gbuf_frame — that closure's ptg
+                // borrow would span M8-M10's wire_feed &mut borrows); ext is
+                // skipped, the verifier reads only the core's mvec.
+                let r = (|| -> Result<(dlss::GBufs, Vec<f32>), String> {
+                    let p = gpu::trace::FrameParams {
+                        sway_prev_time: Some(t0s),
+                        cam: basis_p,
+                        frame: 2,
+                        accumulate: false,
+                        jitter: false,
+                        frame_jitter: Some((0.0, 0.0)),
+                        prev_cam: Some(basis_p),
+                        q: uq,
+                        verify: false,
+                        spp: 1,
+                        probe_sample: 0,
+                        clouds: crate::clouds::Clouds::check(scene.diag),
+                        fireflies: crate::fireflies::Fireflies::check(scene),
+                        sway_time: Some(t1s),
+                        replay: false,
+                    };
+                    ptg.write_cb(0, &p);
+                    hg.run(|l| ptg.record_wavefront(l, 0, &p, false))?;
+                    let bytes =
+                        hg.read_buffer(&ptg.gbuf, ua, pw * ph * gpu::trace::GBUF_STRIDE as usize)?;
+                    let tb = hg.read_buffer(&ptg.tbuf, ua, pw * ph * 4)?;
+                    let t: Vec<f32> = tb
+                        .chunks_exact(4)
+                        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                        .collect();
+                    Ok((unpack_gbuf_bytes(&bytes, None, pw, ph), t))
+                })();
+                match r {
+                    Ok((gb3, tb3)) => {
+                        foliage::bake(sw, t1s);
+                        let v = sway_mv_verify(
+                            scene, sw, bvh, basis_p, basis_p, &gb3, &|i| tb3[i], None, t0s, t1s,
+                            pw, ph, 0.25,
+                        );
+                        foliage::bake(sw, t0s); // restore the suite's pose
+                        eprintln!(
+                            "check-gpu: sway-mv ({pw}x{ph}): {} foliage px | mv err median \
+                             {:.4} p90 {:.4} px | moving > 0.25 px: {} (teeth median {:.3}) \
+                             | static {} px bad {}",
+                            v.n, v.med, v.p90, v.fired, v.teeth_med, v.static_px, v.static_bad
+                        );
+                        if v.n == 0 || v.med > 0.05 || v.p90 > 0.3 || v.static_bad > 0 {
+                            eprintln!("check-gpu: FAIL sway-mv off the prev-pose oracle");
+                            ok = false;
+                        }
+                        if v.fired == 0 {
+                            eprintln!(
+                                "check-gpu: FAIL sway-mv vacuous — no foliage px moved \
+                                 > 0.25 px between the gate clocks"
+                            );
+                            ok = false;
+                        } else if v.teeth_med <= 0.15 {
+                            eprintln!(
+                                "check-gpu: FAIL sway-mv teeth — written MVs sit on the \
+                                 camera-only imposter"
+                            );
+                            ok = false;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("check-gpu: FAIL sway-mv frame: {e}");
+                        ok = false;
+                    }
+                }
+            }
+            (Some(_), false) => eprintln!(
+                "check-gpu: sway-mv skipped — ring unarmed or software rays (--no-blas-split / \
+                 --sw-rays render the rest pose)"
+            ),
+            _ => eprintln!("check-gpu: sway-mv skipped (no foliage partition on this scene)"),
+        }
     }
 
     // Both remaining gates borrow `hg` mutably and neither needs the tracer.
@@ -5587,6 +5780,7 @@ fn run_check_gpu(
         // Warm once (PSO/cache effects), then time.
         for warm in 0..2u32 {
             let p = gpu::trace::FrameParams {
+                sway_prev_time: None,
                 cam: bbasis,
                 frame: warm,
                 accumulate: true,
@@ -5616,6 +5810,7 @@ fn run_check_gpu(
         let t0 = Instant::now();
         for f in 0..n {
             let p = gpu::trace::FrameParams {
+                sway_prev_time: None,
                 cam: bbasis,
                 frame: f,
                 accumulate: true,
@@ -5781,6 +5976,7 @@ fn run_check_gpu(
         let mut cpu_ms = 0.0;
         for f in 0..8u32 {
             let ctx = FrameCtx {
+                sway_mv: None,
                 scene,
                 bvh,
                 cam: bbasis,
@@ -6185,6 +6381,7 @@ fn fsr_frame_check(
                   prev: Option<camera::CamBasis>,
                   frame: u32| {
         let ctx = FrameCtx {
+            sway_mv: None,
             scene,
             bvh,
             cam: basis,
@@ -6462,6 +6659,7 @@ fn albedo_ab_check(
     let basis = cam0.basis(pw, ph);
     let cg = dlss::GBufs::new(pw, ph);
     let ctx = FrameCtx {
+        sway_mv: None,
         scene,
         bvh,
         cam: basis,
@@ -6552,6 +6750,342 @@ fn albedo_ab_check(
     pass
 }
 
+/// The sway-MV cross-pose gate (CPU arm). One frame of a SYNTHETIC all-
+/// foliage scene (`foliage::synth_sway_scene` — the self_test construction)
+/// renders at pose B / gust t1 with (prev camera A, prev sway clock t0)
+/// wired, and every foliage pixel's written MV is gated against the CLOSED-
+/// FORM oracle: reproject `foliage::prev_point(shear_rows(wind(t0) −
+/// wind(t1)), p)` through basis A. Three halves:
+///   correctness — |mv − mv_want| median < 0.05 px, p90 < 0.25 px (f16
+///     plane + projection association slack);
+///   anti-vacuity — enough foliage pixels whose TRUE motion beats the
+///     camera-only MV by > 0.5 px (deterministic: pinned clocks, fixed
+///     pose — a retuned wind constant that kills the motion fails LOUDLY
+///     here instead of letting the gate go vacuous);
+///   teeth — on that set the written MV must differ from the camera-only
+///     IMPOSTER by > 0.4 px median, so a regression to camera-only MVs
+///     (lost pairing, dead rows, wrong cell) fails even if the correctness
+///     half were somehow fooled.
+/// The FSR prev-Z lane (`write_fsr`) is gated against the same prev-pose
+/// point. Static pixels keep today's camera-only MV. Runs on every --check
+/// (session-scene-independent); `--no-foliage-sway` skips loudly.
+fn sway_mv_check() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let scene = foliage::synth_sway_scene(&[Vec3A::ZERO, Vec3A::new(9.0, 9.0, 9.0)], 3);
+    let Some(sw) = scene.sway.as_deref() else {
+        eprintln!("sway-mv gate: no sway partition (--no-foliage-sway) — skipped");
+        return true;
+    };
+    let bvh = bvh::Bvh::build(&scene);
+    let (t0, t1) = (clouds::CLOUD_CHECK_TIME, clouds::CLOUD_CHECK_TIME + 2.0);
+    let (rw, rh) = (320usize, 180usize);
+    // Close over the ELEVATED cluster (w_lin == 1 — full translation), so
+    // centimeter-scale gust deltas span whole pixels; A is a small dolly
+    // back from B (the T4 shape).
+    let target = Vec3A::new(9.08, 9.02, 9.0);
+    let eye_b = target + Vec3A::new(0.15, 0.1, 0.75);
+    let eye_a = eye_b + Vec3A::new(0.02, 0.01, 0.05);
+    let basis_a = Camera::look_at(eye_a, target, 0.8).basis(rw, rh);
+    let basis_b = Camera::look_at(eye_b, target, 0.8).basis(rw, rh);
+    foliage::bake(sw, t1);
+    let Some(rows) = foliage::mv_rows(sw, t1, t0) else {
+        eprintln!("sway-mv gate: FAIL — mv_rows None for distinct clocks");
+        return false;
+    };
+    let stats = Stats::default();
+    let accum: Vec<AtomicU32> = (0..rw * rh * 3).map(|_| AtomicU32::new(0)).collect();
+    let info: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
+    let tbuf: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
+    let g = dlss::GBufs::new(rw, rh);
+    let f = crate::fsr::FsrBufs::new(rw, rh);
+    let ctx = FrameCtx {
+        sway_mv: Some(&rows),
+        scene: &scene,
+        bvh: &bvh,
+        cam: basis_b,
+        q: Quality::upscaler_1spp(),
+        frame: 0,
+        jitter: false,
+        rw,
+        rh,
+        accum: &accum,
+        info: &info,
+        tbuf: &tbuf,
+        stats: &stats,
+        sun: render::sun_dir(&scene),
+        clouds: crate::clouds::Clouds::check(scene.diag),
+        fireflies: crate::fireflies::Fireflies::check(&scene),
+        tcache_cur: None,
+        tcache_prev: &[],
+        accumulate: false,
+        gbuf: Some(&g),
+        fsr_buf: Some(&f),
+        prev_cam: Some(basis_a),
+        frame_jitter: Some((0.0, 0.0)),
+        spp: 1,
+        primary_sample: 0,
+        adaptive: false,
+        hemi_share: false,
+        replay_rec: None,
+        cut_cur: None,
+        cut_prev: None,
+        discard_seeds: false,
+        defer_shade: false,
+    };
+    render::render_frame(&ctx, true);
+    let v = sway_mv_verify(
+        &scene,
+        sw,
+        &bvh,
+        basis_a,
+        basis_b,
+        &g,
+        &|i| f32::from_bits(tbuf[i].load(Relaxed)),
+        Some(&f),
+        t0,
+        t1,
+        rw,
+        rh,
+        0.5,
+    );
+    eprintln!(
+        "sway-mv gate ({rw}x{rh}): {} foliage px | mv err median {:.4} p90 {:.4} px \
+         | moving > 0.5 px: {} (teeth median {:.3}) | prev-z bad {} | static {} px bad {}",
+        v.n, v.med, v.p90, v.fired, v.teeth_med, v.prevz_bad, v.static_px, v.static_bad
+    );
+    let mut pass = true;
+    if v.n < 200 {
+        eprintln!("sway-mv gate: FAIL — too few foliage pixels ({}); the framing regressed", v.n);
+        pass = false;
+    }
+    if v.med > 0.05 || v.p90 > 0.25 {
+        eprintln!("sway-mv gate: FAIL — written MVs off the prev-pose oracle");
+        pass = false;
+    }
+    if v.fired < 200 {
+        eprintln!(
+            "sway-mv gate: FAIL — only {} px with true sway motion > 0.5 px (vacuous; \
+             wind retune or clock pair regressed)",
+            v.fired
+        );
+        pass = false;
+    }
+    if v.teeth_med <= 0.4 {
+        eprintln!(
+            "sway-mv gate: FAIL — written MVs sit on the camera-only imposter (teeth): \
+             sway motion never reached the plane"
+        );
+        pass = false;
+    }
+    if v.prevz_bad > 0 {
+        eprintln!("sway-mv gate: FAIL — FSR prev-Z lane off the prev-pose point");
+        pass = false;
+    }
+    if v.static_bad > 0 {
+        eprintln!("sway-mv gate: FAIL — static pixels moved off the camera-only MV");
+        pass = false;
+    }
+    pass
+}
+
+/// `sway_mv_check`'s verification loop, shared with the --check-gpu /
+/// --check-dxr twins (which read a PACK-READBACK `GBufs` and the arm's own
+/// tbuf): per finite-t pixel, classify the surface by a CPU re-trace at the
+/// DISPLACED pose (the caller must have `foliage::bake`d the scene at t1 —
+/// and restores after), then gate the written MV against the closed-form
+/// prev-pose oracle (`foliage::prev_point` — the write's own map) projected
+/// through basis A. `fire_px` is the true-motion threshold for the
+/// anti-vacuity/teeth set (the synthetic CPU gate authors its motion and
+/// uses 0.5; the real-scene GPU twins use a lower bar — their pose's motion
+/// is whatever the wind gives). `fsr` gates the prev-Z plane (CPU arm only —
+/// the GPU pack's prev_z shares `hit_rel` with the MV by construction).
+struct SwayMvStats {
+    n: usize,
+    med: f32,
+    p90: f32,
+    fired: usize,
+    teeth_med: f32,
+    static_px: usize,
+    static_bad: usize,
+    prevz_bad: usize,
+}
+
+/// A close-up pose that PROVABLY sees swaying foliage — the GPU twins'
+/// framing. Candidate poses frame the member-triangle bounding boxes of the
+/// biggest strong-swaying cells (never the anchor: a plant cell's anchor is
+/// its trunk BASE — aiming there put every pixel on static architecture,
+/// the measured 0-foliage-px failure) from several diagonal directions, and
+/// a cheap CPU probe (64×36 rays) picks the first whose view actually
+/// lands on sway cells — a bbox alone measured 2 foliage px on san-miguel
+/// (occlusion + cutout thinning). Deterministic: cells, directions, and
+/// probe are pure functions of the scene. Used with prev == cur camera, so
+/// the written MV is PURE object motion and the camera-only imposter is ~0
+/// by construction.
+fn sway_mv_pose(scene: &scene::Scene, sw: &foliage::SceneSway, bvh: &bvh::Bvh) -> Camera {
+    let mut count = vec![0u32; sw.cells.len()];
+    for &c in &sw.tri_cell {
+        if c != foliage::STATIC_CELL {
+            count[c as usize] += 1;
+        }
+    }
+    // Strong swayers (>= half the max displacement bound), biggest first.
+    let wmax = sw.cells.iter().map(|c| c.w_max * c.scale).fold(0.0f32, f32::max);
+    let mut cand: Vec<usize> = (0..sw.cells.len())
+        .filter(|&i| count[i] > 0 && sw.cells[i].w_max * sw.cells[i].scale >= 0.5 * wmax)
+        .collect();
+    cand.sort_by_key(|&i| std::cmp::Reverse(count[i]));
+    cand.truncate(8);
+    let dirs = [
+        Vec3A::new(0.55, 0.45, 0.7),
+        Vec3A::new(-0.6, 0.5, 0.62),
+        Vec3A::new(0.7, 0.35, -0.62),
+        Vec3A::new(-0.5, 0.6, -0.63),
+    ];
+    let probe = |cam: &Camera| -> usize {
+        let b = cam.basis(64, 36);
+        let mut ls = stats::LocalStats::default();
+        let mut hits = 0usize;
+        for y in 0..36 {
+            for x in 0..64 {
+                let ray =
+                    bvh::Ray::new(b.origin, b.ray_dir(x as f32 + 0.5, y as f32 + 0.5));
+                if let Some(h) = bvh.intersect(scene, &ray, 0.0, f32::INFINITY, &mut ls.ray_nodes)
+                {
+                    if sw.tri_cell[h.tri as usize] != foliage::STATIC_CELL {
+                        hits += 1;
+                    }
+                }
+            }
+        }
+        hits
+    };
+    let mut best: Option<(usize, Camera)> = None;
+    for &ci in &cand {
+        let (mut mn, mut mx) = (Vec3A::splat(f32::INFINITY), Vec3A::splat(f32::NEG_INFINITY));
+        for (t, &c) in sw.tri_cell.iter().enumerate() {
+            if c as usize == ci {
+                for &vi in &scene.indices[t] {
+                    let p = scene.positions[vi as usize];
+                    mn = mn.min(p);
+                    mx = mx.max(p);
+                }
+            }
+        }
+        let center = 0.5 * (mn + mx);
+        let radius = 0.5 * (mx - mn).length();
+        let dist = (2.0 * radius).max(3.0 * sw.cell);
+        for d in dirs {
+            let cam = Camera::look_at(center + d.normalize() * dist, center, 0.8);
+            let hits = probe(&cam);
+            // >= 20% of the probe on foliage: good enough, stop searching.
+            if hits >= 460 {
+                return cam;
+            }
+            if best.as_ref().map_or(true, |(bh, _)| hits > *bh) {
+                best = Some((hits, cam));
+            }
+        }
+    }
+    best.map(|(_, c)| c).expect("sway partition has populated cells")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sway_mv_verify(
+    scene: &scene::Scene,
+    sw: &foliage::SceneSway,
+    bvh: &bvh::Bvh,
+    basis_a: camera::CamBasis,
+    basis_b: camera::CamBasis,
+    g: &dlss::GBufs,
+    tget: &dyn Fn(usize) -> f32,
+    fsr: Option<&crate::fsr::FsrBufs>,
+    t0: f32,
+    t1: f32,
+    rw: usize,
+    rh: usize,
+    fire_px: f32,
+) -> SwayMvStats {
+    use std::sync::atomic::Ordering::Relaxed;
+    let median = |v: &mut Vec<f32>| -> f32 {
+        if v.is_empty() {
+            return 0.0;
+        }
+        v.sort_by(f32::total_cmp);
+        v[v.len() / 2]
+    };
+    let mut e_want: Vec<f32> = Vec::new(); // |mv − oracle| on foliage px
+    let mut e_teeth: Vec<f32> = Vec::new(); // |mv − imposter| on the fired set
+    let mut fired = 0usize;
+    let mut prevz_bad = 0usize;
+    let mut static_bad = 0usize;
+    let mut static_px = 0usize;
+    let mut ls = stats::LocalStats::default();
+    for y in 0..rh {
+        for x in 0..rw {
+            let i = y * rw + x;
+            let t = tget(i);
+            if !t.is_finite() {
+                continue;
+            }
+            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
+            let dir = basis_b.ray_dir(fx, fy);
+            // Classify the pixel's surface by re-trace (the GBufs don't
+            // store the tri — the albedo_ab_check idiom); the caller baked
+            // the pose at t1, so this is the rendered surface. A t mismatch
+            // (hardware-vs-möller edge, quadtree edge case) skips the px —
+            // not this gate's subject.
+            let ray = bvh::Ray::new(basis_b.origin, dir);
+            let Some(h) = bvh.intersect(scene, &ray, 0.0, f32::INFINITY, &mut ls.ray_nodes)
+            else {
+                continue;
+            };
+            if (h.t - t).abs() > 1e-3 * t.max(1.0) {
+                continue;
+            }
+            let p = basis_b.origin + dir * t;
+            let mv = (dlss::ld16(&g.mvec[i * 2]), dlss::ld16(&g.mvec[i * 2 + 1]));
+            let Some((cpx, cpy)) = basis_a.project(p - basis_a.origin) else { continue };
+            let mv_cam = (cpx - fx, cpy - fy);
+            let cell = sw.tri_cell[h.tri as usize];
+            if cell == foliage::STATIC_CELL {
+                // Static geometry keeps today's camera-only MV (f16 slack,
+                // relative for large-dolly MVs).
+                static_px += 1;
+                let tol = 0.05 + 2e-3 * (mv_cam.0.abs() + mv_cam.1.abs());
+                if (mv.0 - mv_cam.0).abs() > tol || (mv.1 - mv_cam.1).abs() > tol {
+                    static_bad += 1;
+                }
+                continue;
+            }
+            let c = &sw.cells[cell as usize];
+            let rc = foliage::shear_rows(foliage::wind(c, t0) - foliage::wind(c, t1), c.a, c.b);
+            let q = foliage::prev_point(&rc, p);
+            let Some((wpx, wpy)) = basis_a.project(q - basis_a.origin) else { continue };
+            let mv_want = (wpx - fx, wpy - fy);
+            e_want.push(((mv.0 - mv_want.0).powi(2) + (mv.1 - mv_want.1).powi(2)).sqrt());
+            let true_motion =
+                ((mv_want.0 - mv_cam.0).powi(2) + (mv_want.1 - mv_cam.1).powi(2)).sqrt();
+            if true_motion > fire_px {
+                fired += 1;
+                e_teeth.push(((mv.0 - mv_cam.0).powi(2) + (mv.1 - mv_cam.1).powi(2)).sqrt());
+            }
+            // The FSR prev-Z lane must be the SAME prev-pose point's view-Z.
+            if let Some(f) = fsr {
+                let pz = f32::from_bits(f.prev_z[i].load(Relaxed));
+                let pz_want = (q - basis_a.origin).dot(basis_a.forward());
+                if (pz - pz_want).abs() > 1e-3 * (1.0 + pz_want.abs()) {
+                    prevz_bad += 1;
+                }
+            }
+        }
+    }
+    let n = e_want.len();
+    let med = median(&mut e_want);
+    let p90 = if n > 0 { e_want[((n * 9) / 10).min(n - 1)] } else { 0.0 };
+    let teeth_med = median(&mut e_teeth);
+    SwayMvStats { n, med, p90, fired, teeth_med, static_px, static_bad, prevz_bad }
+}
+
 fn mv_check_at(
     scene: &scene::Scene,
     bvh: &bvh::Bvh,
@@ -6578,6 +7112,7 @@ fn mv_check_at(
     let render_dlss_frame =
         |g: &dlss::GBufs, basis: camera::CamBasis, prev: Option<camera::CamBasis>, frame: u32| {
             let ctx = FrameCtx {
+                sway_mv: None,
                 scene,
                 bvh,
                 cam: basis,
@@ -7046,6 +7581,7 @@ fn run_check_xess(
             let g = dlss::GBufs::new(rw, rh);
             for f in 0..AB_FRAMES {
                 let ctx = FrameCtx {
+                    sway_mv: None,
                     scene,
                     bvh,
                     cam: cam0.basis(rw, rh),
@@ -7291,6 +7827,7 @@ fn run_check_nppd(
     let (_, far) = dlss::near_far(scene.diag);
     let render_fresh = |basis: &camera::CamBasis, seq: u32, prev: Option<camera::CamBasis>| {
         let ctx = FrameCtx {
+            sway_mv: None,
             scene,
             bvh,
             cam: *basis,
@@ -7519,6 +8056,7 @@ fn run_check_oidn(
     let basis = cam0.basis(rw, rh);
     let render_accum_frame = |frame: u32| {
         let ctx = FrameCtx {
+            sway_mv: None,
             scene,
             bvh,
             cam: basis,
@@ -7672,6 +8210,7 @@ fn run_check_oidn(
 
     let render_fresh = |basis: &camera::CamBasis, seq: u32, cap: Option<u32>| {
         let ctx = FrameCtx {
+            sway_mv: None,
             scene,
             bvh,
             cam: *basis,
@@ -7866,6 +8405,7 @@ fn run_check_oidn(
     if structural {
         for f in 0..16u32 {
             let ctx = FrameCtx {
+                sway_mv: None,
                 scene,
                 bvh,
                 cam: basis_b,
@@ -8668,6 +9208,7 @@ fn run_cinematic_cpu(
                     replay_cache.begin(rw, rh);
                 }
                 let ctx = FrameCtx {
+                    sway_mv: None,
                     scene,
                     bvh,
                     cam: basis,
@@ -9143,6 +9684,12 @@ fn run_cinematic_gpu(
             let mut hdr = vec![0f32; rw * rh * 3];
             let mut seq: u32 = 0;
             let mut prev_cam: Option<Camera> = None;
+            // Paired with prev_cam (set together after a successful sub-frame),
+            // so the sway-MV prev clock can never desync from the prev pose.
+            // Within an output frame it bit-equals fs.sway_time (feature off);
+            // at the spline step it carries the previous OUTPUT frame's clock,
+            // so the reconstruction sees real object MVs on swayed foliage.
+            let mut prev_sway: Option<f32> = None;
             for f in 0..frames {
                 let fs = cine_frame_state(scene, shot, attractors, cine, f, &mut prev_hour);
                 cine_push_sky(armv, scene, &fs, prev_hour);
@@ -9168,6 +9715,7 @@ fn run_cinematic_gpu(
                         clouds: fs.clouds,
                         fireflies: fs.fireflies,
                         sway_time: Some(fs.sway_time),
+                        sway_prev_time: prev_sway,
                         // The pose is bit-identical across one output frame's
                         // sub-frames, so structure replay still deletes the
                         // level ladder for sub-frames 1..N-1.
@@ -9239,6 +9787,7 @@ fn run_cinematic_gpu(
                         return Ok(1);
                     }
                     prev_cam = Some(fs.cam);
+                    prev_sway = Some(fs.sway_time);
                     seq = seq.wrapping_add(1);
                 }
                 // The frame the file gets is the ENGINE's output, linear f32 —
@@ -9273,6 +9822,9 @@ fn run_cinematic_gpu(
                         // identical gust; sub-frames share it (the ring rebuild
                         // is a bit-equal skip after the first).
                         sway_time: Some(fs.sway_time),
+                        // Accumulation path: no prev pose, camera pinned per
+                        // output frame — sway MVs structurally off.
+                        sway_prev_time: None,
                         // Structure replay across the sub-frames of one output
                         // frame: the pose is bit-identical, so k > 0 re-dispatches
                         // the persisted terminal queues and skips the whole level
@@ -9501,6 +10053,7 @@ fn run_spin(
         let (tcache_cur, tprev_vec, cut_cur, cut_prev) =
             tr.begin(temporal_on, opts.adopt, rw, rh);
         let ctx = FrameCtx {
+            sway_mv: None,
             scene,
             bvh,
             cam: basis,
@@ -9763,6 +10316,7 @@ fn run_spin_gpu(
         }
         let cam = if moving { spin_path_pose(&cam0, scene.diag, idx) } else { cam0 };
         let p = gpu::trace::FrameParams {
+            sway_prev_time: None,
             cam: cam.basis(rw, rh),
             frame: idx,
             // The upscaler frame contract, matching run_spin's CPU ctx exactly:
@@ -10054,6 +10608,13 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             false
         }
     };
+
+    // The sway-MV cross-pose gate: one rendered frame on a SYNTHETIC sway
+    // scene with (prev camera, prev sway clock) wired for a different pose
+    // AND a different gust, MVs gated per-pixel against the closed-form
+    // prev-pose oracle — with teeth (the camera-only imposter must fail the
+    // bound). Session-scene-independent, so it runs on every --check.
+    let sway_mv_ok = sway_mv_check();
 
     // Reprojection-history math self-test — closed-form gates the OIDN
     // temporal mode is built on (projection roundtrip, static replay = exact
@@ -10435,6 +10996,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         let tbuf: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
         let s = Stats::default();
         let ctx = FrameCtx {
+            sway_mv: None,
             scene,
             bvh,
             cam,
@@ -10500,6 +11062,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         for f in 0..2u32 {
             let accum: Vec<AtomicU32> = (0..rw * rh * 3).map(|_| AtomicU32::new(0)).collect();
             let ctx = FrameCtx {
+                sway_mv: None,
                 scene,
                 bvh,
                 cam,
@@ -11081,6 +11644,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         bq.fb.ao = hemi_ao;
         bq.fb.gi = hemi_gi;
         let ctx = FrameCtx {
+            sway_mv: None,
             scene,
             bvh,
             cam,
@@ -11154,6 +11718,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     {
         stats.clear();
         let ctx = FrameCtx {
+            sway_mv: None,
             scene,
             bvh,
             cam,
@@ -11270,6 +11835,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         let rcache = replay::ReplayCache::new(rw, rh);
         rcache.begin(rw, rh);
         let ctx_rec = FrameCtx {
+            sway_mv: None,
             scene,
             bvh,
             cam,
@@ -11352,6 +11918,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     for cap in [3u32, 5, 7] {
         stats.clear();
         let ctx = FrameCtx {
+            sway_mv: None,
             scene,
             bvh,
             cam,
@@ -11425,6 +11992,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     let cuts_a = temporal::CutStore::new(rw, rh);
     {
         let ctx = FrameCtx {
+            sway_mv: None,
             scene,
             bvh,
             cam,
@@ -11547,6 +12115,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     ] {
         stats.clear();
         let ctx = FrameCtx {
+            sway_mv: None,
             scene,
             bvh,
             cam: basis,
@@ -11614,6 +12183,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         rcache.begin(rw, rh);
         {
             let ctx = FrameCtx {
+                sway_mv: None,
                 scene,
                 bvh,
                 cam,
@@ -11680,6 +12250,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         let (accum_r, info_r, tbuf_r) = (alloc3(), alloc1(), alloc1());
         if rcache.valid() {
             let ctx = FrameCtx {
+                sway_mv: None,
                 scene,
                 bvh,
                 cam,
@@ -11732,6 +12303,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                 continue;
             }
             let ctx = FrameCtx {
+                sway_mv: None,
                 scene,
                 bvh,
                 cam,
@@ -11807,6 +12379,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             }
             stats.clear();
             let ctx = FrameCtx {
+                sway_mv: None,
                 scene,
                 bvh,
                 cam,
@@ -11876,6 +12449,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         {
             let warm_a = [(&tcache, cam)];
             let ctx = FrameCtx {
+                sway_mv: None,
                 scene,
                 bvh,
                 cam: basis_far,
@@ -11961,6 +12535,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         {
             // Step 0: cold producer at cam0.
             let ctx = FrameCtx {
+                sway_mv: None,
                 scene,
                 bvh,
                 cam,
@@ -12005,6 +12580,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
             {
                 let prev_ring = [(&chain_tc[pi], prev_basis)];
                 let ctx = FrameCtx {
+                    sway_mv: None,
                     scene,
                     bvh,
                     cam: basis_s,
@@ -12080,6 +12656,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         ] {
             stats.clear();
             let ctx = FrameCtx {
+                sway_mv: None,
                 scene,
                 bvh,
                 cam: basis_b,
@@ -12160,6 +12737,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         ] {
             stats.clear();
             let ctx = FrameCtx {
+                sway_mv: None,
                 scene,
                 bvh,
                 cam,
@@ -12215,6 +12793,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         for (label, defer) in [("defer A/B (off)", false), ("defer A/B (on) ", true)] {
             stats.clear();
             let ctx = FrameCtx {
+                sway_mv: None,
                 scene,
                 bvh,
                 cam,
@@ -12278,6 +12857,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         ("ftree", ftree_ok),
         ("blas-split", blas_ok),
         ("foliage", foliage_ok),
+        ("sway-mv", sway_mv_ok),
         ("reproject", reproj_ok),
         ("nppd", nppd_ok),
         ("matclass", matclass_ok),
@@ -13163,7 +13743,7 @@ fn session(
     // The previous frame's CAMERA (not basis): the MV basis is derived at
     // each frame's own resolution, so it stays correct across DRS steps
     // without dropping history.
-    let mut xess_prev: Option<Camera> = None;
+    let mut xess_prev: Option<PrevPose> = None;
     let mut xess_reset = true;
     // OIDN placement in XeSS mode (independent of the plain-mode `oidn_on`);
     // xess_hdr is the post-placement's window-res readback staging.
@@ -13235,7 +13815,7 @@ fn session(
     let mut fsr_gbufs: Option<dlss::GBufs> = None; // capacity = range max, lazily allocated
     let mut fsr_bufs: Option<fsr::FsrBufs> = None; // ditto (signal planes)
     let mut fsr_idx: u32 = 0;
-    let mut fsr_prev: Option<Camera> = None;
+    let mut fsr_prev: Option<PrevPose> = None;
     let mut fsr_reset = true;
     if fsr_on {
         if let Some((lw, lh)) = fsr_lock {
@@ -13346,7 +13926,7 @@ fn session(
     // frame's camera (the MV contract — its own state, like dlss_prev), and
     // the history-reset latch (set on discontinuities, never on motion).
     let mut gpu_up_idx: u32 = 0;
-    let mut gpu_prev_cam: Option<Camera> = None;
+    let mut gpu_prev_cam: Option<PrevPose> = None;
     let mut gpu_reset = true;
     // Whether this session WIRED an upscaler feed (the G/X/K toggles can
     // only move between Plain and a WIRED upscaler). Wiring facts of the
@@ -13512,7 +14092,7 @@ fn session(
     let mut xess_nppd = false;
     let mut nppd_ctx: Option<nppd::NppdContext> = None;
     let mut nppd_gbufs: Option<dlss::GBufs> = None;
-    let mut nppd_prev: Option<Camera> = None;
+    let mut nppd_prev: Option<PrevPose> = None;
     let mut nppd_seq: u32 = 0;
     let mut nppd_failed = p0.map_or(false, |p| p.nppd_failed);
     let nppd_drs_note = |lock: Option<f32>| {
@@ -13657,7 +14237,7 @@ fn session(
     // never motion), and the sub-mode itself (set at each F enable).
     let mut dxr_up = GpuUp::Plain;
     let mut dxr_up_idx: u32 = 0;
-    let mut dxr_prev_cam: Option<Camera> = None;
+    let mut dxr_prev_cam: Option<PrevPose> = None;
     let mut dxr_reset = true;
     if want_dxr && !dxr_failed && !gpu_trace {
         let compose =
@@ -14194,6 +14774,7 @@ fn session(
                     let scene_ref: &scene::Scene = scene;
                     let bvh_ref: &bvh::Bvh = bvh;
                     let ctx = FrameCtx {
+                        sway_mv: None,
                         scene: scene_ref,
                         bvh: bvh_ref,
                         cam: cap_basis,
@@ -14676,12 +15257,16 @@ fn session(
                 // they can never disagree.
                 let jit = dlss::jitter_for(gpu_up_idx);
                 let p = gpu::trace::FrameParams {
+                    // The prev sway clock rides the retained PrevPose beside
+                    // the camera the MVs reproject through — the pairing that
+                    // keeps the sway-MV deltas honest (trace::sway_mv_pair).
+                    sway_prev_time: gpu_prev_cam.and_then(|p| p.sway_t),
                     cam: cam.basis(grw, grh),
                     frame: gpu_up_idx,
                     accumulate: false,
                     jitter: false,
                     frame_jitter: Some(jit),
-                    prev_cam: gpu_prev_cam.map(|c| c.basis(grw, grh)),
+                    prev_cam: gpu_prev_cam.map(|p| p.cam.basis(grw, grh)),
                     q: Quality::upscaler_1spp(),
                     verify: false,
                     // "1-spp" names the QUALITY preset, not the sample count:
@@ -14705,7 +15290,7 @@ fn session(
                 // needs fc too now (the XeSS-FG prepare's camera data).
                 let mats = dlss::cam_matrices(&cam, grw, grh, dlss_near, dlss_far);
                 let prev_mats = gpu_prev_cam
-                    .map(|c| dlss::cam_matrices(&c, grw, grh, dlss_near, dlss_far));
+                    .map(|p| dlss::cam_matrices(&p.cam, grw, grh, dlss_near, dlss_far));
                 let fc = dlss::frame_constants(
                     &cam,
                     &mats,
@@ -14734,7 +15319,7 @@ fn session(
                             jit,
                             gpu_reset,
                             &fc,
-                            gpu_prev_cam.map(|c| c.pos),
+                            gpu_prev_cam.map(|p| p.cam.pos),
                             gpu_up_idx,
                             last_ms as f32,
                             &scene.sky_sh,
@@ -14743,7 +15328,7 @@ fn session(
                             &p,
                             hybrid,
                             &fc,
-                            gpu_prev_cam.map(|c| c.pos),
+                            gpu_prev_cam.map(|p| p.cam.pos),
                             gpu_up_idx,
                             last_ms as f32,
                             &scene.sky_sh,
@@ -14754,7 +15339,13 @@ fn session(
                 match presented {
                     Ok(()) => {
                         last_ms = t.elapsed().as_secs_f64() * 1000.0;
-                        gpu_prev_cam = Some(cam);
+                        // The sway clock pairs with the camera (PrevPose):
+                        // this frame's FrameParams traced at cloud_time, and
+                        // cloud_time has not advanced since.
+                        gpu_prev_cam = Some(PrevPose {
+                            cam,
+                            sway_t: scene.sway.as_deref().map(|_| cloud_time as f32),
+                        });
                         gpu_reset = false;
                         gpu_up_idx = gpu_up_idx.wrapping_add(1);
                     }
@@ -14795,6 +15386,7 @@ fn session(
                     q.fb.gi = bounce_mode == 2;
                 }
                 let p = gpu::trace::FrameParams {
+                    sway_prev_time: None,
                     cam: cam.basis(grw, grh),
                     frame,
                     accumulate: true,
@@ -15507,12 +16099,15 @@ fn session(
                 }
                 let jit = dlss::jitter_for(dxr_up_idx);
                 let p = gpu::trace::FrameParams {
+                    // Paired with prev_cam via the retained PrevPose (the
+                    // wavefront arm's rule — trace::sway_mv_pair).
+                    sway_prev_time: dxr_prev_cam.and_then(|p| p.sway_t),
                     cam: cam.basis(dxw, dxh),
                     frame: dxr_up_idx,
                     accumulate: false,
                     jitter: false,
                     frame_jitter: Some(jit),
-                    prev_cam: dxr_prev_cam.map(|c| c.basis(dxw, dxh)),
+                    prev_cam: dxr_prev_cam.map(|p| p.cam.basis(dxw, dxh)),
                     q: Quality::upscaler_1spp(),
                     verify: false,
                     // --spp/U: N samples per pixel inside the one fresh
@@ -15536,7 +16131,7 @@ fn session(
                 // needs fc too now (the XeSS-FG prepare's camera data).
                 let mats = dlss::cam_matrices(&cam, dxw, dxh, dlss_near, dlss_far);
                 let prev_mats =
-                    dxr_prev_cam.map(|c| dlss::cam_matrices(&c, dxw, dxh, dlss_near, dlss_far));
+                    dxr_prev_cam.map(|p| dlss::cam_matrices(&p.cam, dxw, dxh, dlss_near, dlss_far));
                 let fc = dlss::frame_constants(
                     &cam,
                     &mats,
@@ -15559,7 +16154,7 @@ fn session(
                             jit,
                             dxr_reset,
                             &fc,
-                            dxr_prev_cam.map(|c| c.pos),
+                            dxr_prev_cam.map(|p| p.cam.pos),
                             dxr_up_idx,
                             last_ms as f32,
                             &scene.sky_sh,
@@ -15567,7 +16162,7 @@ fn session(
                         GpuUp::Fsr4 => gpu.present_dxr_fsr_rr(
                             &p,
                             &fc,
-                            dxr_prev_cam.map(|c| c.pos),
+                            dxr_prev_cam.map(|p| p.cam.pos),
                             dxr_up_idx,
                             last_ms as f32,
                             &scene.sky_sh,
@@ -15578,7 +16173,11 @@ fn session(
                 match presented {
                     Ok(()) => {
                         last_ms = t.elapsed().as_secs_f64() * 1000.0;
-                        dxr_prev_cam = Some(cam);
+                        // The sway clock pairs with the camera (PrevPose).
+                        dxr_prev_cam = Some(PrevPose {
+                            cam,
+                            sway_t: scene.sway.as_deref().map(|_| cloud_time as f32),
+                        });
                         dxr_reset = false;
                         dxr_up_idx = dxr_up_idx.wrapping_add(1);
                     }
@@ -15609,6 +16208,7 @@ fn session(
                 // window: a composed session toggled plain via G/X still
                 // traces at the locked render res.
                 let p = gpu::trace::FrameParams {
+                    sway_prev_time: None,
                     cam: cam.basis(dxw, dxh),
                     frame,
                     accumulate: true,
@@ -16002,7 +16602,25 @@ fn session(
             if let Some(sw) = scene.sway.as_deref() {
                 foliage::bake(sw, cloud_time as f32);
             }
+            // Sway MV deltas: pair THIS frame's clock with the retained prev
+            // pose's, from the SAME per-mode source `prev_cam` reads below —
+            // the PrevPose/DlssPrev pairing, so the two can never desync (a
+            // present error clears both together). None everywhere else
+            // (no sway partition, no prev, bit-equal clocks — mv_rows'
+            // structural du = 0 arm) = camera-only MVs, today's bytes.
+            let prev_sway_t = match mode {
+                RenderMode::Dlss => dlss_prev.as_ref().and_then(|p| p.sway_t),
+                RenderMode::Fsr => fsr_prev.and_then(|p| p.sway_t),
+                RenderMode::Xess => xess_prev.and_then(|p| p.sway_t),
+                RenderMode::Nppd => nppd_prev.and_then(|p| p.sway_t),
+                _ => None,
+            };
+            let sway_rows = match (scene.sway.as_deref(), prev_sway_t) {
+                (Some(sw), Some(tp)) => foliage::mv_rows(sw, cloud_time as f32, tp),
+                _ => None,
+            };
             let ctx = FrameCtx {
+                sway_mv: sway_rows.as_ref(),
                 scene,
                 bvh,
                 cam: basis,
@@ -16050,10 +16668,10 @@ fn session(
                     RenderMode::Dlss => dlss_prev.as_ref().map(|p| p.basis),
                     // Basis derived at THIS frame's res — correct across
                     // DRS steps by construction.
-                    RenderMode::Fsr => fsr_prev.map(|c| c.basis(rw, rh)),
-                    RenderMode::Xess => xess_prev.map(|c| c.basis(rw, rh)),
+                    RenderMode::Fsr => fsr_prev.map(|p| p.cam.basis(rw, rh)),
+                    RenderMode::Xess => xess_prev.map(|p| p.cam.basis(rw, rh)),
                     // Window res always — the state warp consumes these MVs.
-                    RenderMode::Nppd => nppd_prev.map(|c| c.basis(rw, rh)),
+                    RenderMode::Nppd => nppd_prev.map(|p| p.cam.basis(rw, rh)),
                     _ => None,
                 },
                 frame_jitter: match mode {
@@ -16189,7 +16807,14 @@ fn session(
                 &crate::fireflies::Fireflies::live(scene, cloud_time as f32),
             ) {
                 Ok(()) => {
-                    dlss_prev = Some(dlss::DlssPrev { basis: cam.basis(rw, rh), mats, cam });
+                    dlss_prev = Some(dlss::DlssPrev {
+                        basis: cam.basis(rw, rh),
+                        mats,
+                        cam,
+                        // Pairs with the camera (the PrevPose rule): this
+                        // frame baked/traced at cloud_time, unadvanced since.
+                        sway_t: scene.sway.as_deref().map(|_| cloud_time as f32),
+                    });
                     dlss_reset = false;
                     dlss_idx = dlss_idx.wrapping_add(1);
                 }
@@ -16216,7 +16841,8 @@ fn session(
             // accum.
             let fg = fsr_gbufs.as_ref().expect("fsr_on without gbufs");
             let mats = dlss::cam_matrices(&cam, rw, rh, dlss_near, dlss_far);
-            let prev_mats = fsr_prev.map(|c| dlss::cam_matrices(&c, rw, rh, dlss_near, dlss_far));
+            let prev_mats =
+                fsr_prev.map(|p| dlss::cam_matrices(&p.cam, rw, rh, dlss_near, dlss_far));
             let fc = dlss::frame_constants(
                 &cam,
                 &mats,
@@ -16234,7 +16860,7 @@ fn session(
                     fg,
                     fb,
                     &fc,
-                    fsr_prev.map(|c| c.pos),
+                    fsr_prev.map(|p| p.cam.pos),
                     fsr_idx,
                     last_ms as f32,
                     &scene.sky_sh,
@@ -16244,7 +16870,10 @@ fn session(
             };
             match presented {
                 Ok(()) => {
-                    fsr_prev = Some(cam);
+                    fsr_prev = Some(PrevPose {
+                        cam,
+                        sway_t: scene.sway.as_deref().map(|_| cloud_time as f32),
+                    });
                     fsr_reset = false;
                     fsr_idx = fsr_idx.wrapping_add(1);
                 }
@@ -16294,7 +16923,10 @@ fn session(
                     &mut xess_hdr,
                 ) {
                     Ok(()) => {
-                        xess_prev = Some(cam);
+                        xess_prev = Some(PrevPose {
+                            cam,
+                            sway_t: scene.sway.as_deref().map(|_| cloud_time as f32),
+                        });
                         xess_reset = false;
                         xess_idx = xess_idx.wrapping_add(1);
                         let octx = oidn_ctx.as_mut().expect("xess_oidn without context");
@@ -16423,7 +17055,7 @@ fn session(
                 // FG is not wired).
                 let xmats = dlss::cam_matrices(&cam, rw, rh, dlss_near, dlss_far);
                 let xprev_mats =
-                    xess_prev.map(|c| dlss::cam_matrices(&c, rw, rh, dlss_near, dlss_far));
+                    xess_prev.map(|p| dlss::cam_matrices(&p.cam, rw, rh, dlss_near, dlss_far));
                 let xfc = dlss::frame_constants(
                     &cam,
                     &xmats,
@@ -16440,7 +17072,10 @@ fn session(
                     last_ms as f32,
                 ) {
                     Ok(()) => {
-                        xess_prev = Some(cam);
+                        xess_prev = Some(PrevPose {
+                            cam,
+                            sway_t: scene.sway.as_deref().map(|_| cloud_time as f32),
+                        });
                         xess_reset = false;
                         xess_idx = xess_idx.wrapping_add(1);
                     }
@@ -16555,7 +17190,10 @@ fn session(
                         );
                         // The MV contract: prev is the camera of the last
                         // frame the recurrent state actually saw.
-                        nppd_prev = Some(cam);
+                        nppd_prev = Some(PrevPose {
+                            cam,
+                            sway_t: scene.sway.as_deref().map(|_| cloud_time as f32),
+                        });
                     }
                     Err(e) => {
                         eprintln!("nppd: denoise failed ({e}); OFF (J to retry)");
