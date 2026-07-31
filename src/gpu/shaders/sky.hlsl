@@ -95,7 +95,20 @@ void cs_sky(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     for (uint i = sub * SKY_GROUP + gtid.x; i < total; i += SKY_GROUP * SKY_SPLIT) {
         uint x = p0.x + i % w;
         uint y = p0.y + i / w;
-        float3 dir = ray_dir(float(x) + 0.5, float(y) + 0.5);
+        // Sample 0 sits where the FRAME SAYS it sits — render.rs::fill_sky_rows
+        // term for term, and the same `sample_pos` rule cs_leaf / reference /
+        // dxr already use. A proven-empty tile traces no rays but still writes
+        // this pixel's color and G-buffers, and every temporal consumer is told
+        // ONE sub-pixel offset per frame; hard-coding the center here while
+        // declaring a Halton offset anyway is a registration lie (the MV stays
+        // correct — it subtracts whatever position we pass — but the
+        // reconstructor places the content at center+jitter when it was sampled
+        // at center, and the jitter moves every frame). Same rng stream a leaf
+        // pixel at these coordinates would take, so the legacy-jitter arm now
+        // agrees with reference.hlsl too.
+        uint srng = rng_init(x, y, frame, 0u);
+        float2 sp = sample_pos(x, y, 0u, srng);
+        float3 dir = ray_dir(sp.x, sp.y);
         // March-phase dither per (pixel, frame, SAMPLE) — the center rides
         // sample 0's stratum, mirroring render.rs::fill_sky_rows verbatim.
         float cj = cloud_dither_k(uint2(x, y), frame, 0u, spp);
@@ -116,15 +129,26 @@ void cs_sky(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
             c += ff_glow(cam_origin.xyz, dir, INF, pixel_cone * 0.5);
         // Under CLOUDS the sky has sub-pixel structure (a cover-ramp edge
         // crosses a pixel), so a multi-sampled frame averages spp sample
-        // positions — render.rs::fill_sky_rows, term for term (sample 0 stays
-        // the center; still zero rays). The DIRECTION offsets are the PHASE-0
-        // Halton table (SKY_J, injected by trace::spp_defs), frame-independent
-        // like the center itself: a static function's antialias must not
-        // dither across frames (the spp stability gate at night is the proof
-        // — a direction-SET lesson; the march PHASE is per-sample and
-        // frame-keyed, symmetric across spp levels, which that gate accepts).
-        // The guard keeps spp == 1 and cloudless skies on the old path
-        // verbatim.
+        // positions — render.rs::fill_sky_rows, term for term (still zero
+        // rays; side channels stay sample 0's). The DIRECTION offsets are the
+        // PHASE-0 Halton table (SKY_J, injected by trace::spp_defs),
+        // frame-independent AND ANCHORED TO THE PIXEL CENTER — deliberately
+        // NOT translated with sample 0's declared position above.
+        //
+        // Both halves matter at night, where the spp stability gate (spp=4
+        // strictly quieter than spp=1) has teeth. Writing d for the per-frame
+        // offset and G for the sky's screen gradient, the first-order
+        // inter-frame difference is:
+        //
+        //   extras move, sample 0 fixed    spp1 0          spp4 (d0-d1)*G
+        //   whole set translated rigidly   spp1 (d0-d1)*G  spp4 (d0-d1)*G
+        //   THIS: sample 0 moves, anchored spp1 (d0-d1)*G  spp4 (d0-d1)*G/4
+        //
+        // Only the last row leaves spp=4 quieter: averaging over a rigidly
+        // translated stratified set does not attenuate a translation, only the
+        // aliasing residual. The march PHASE is per-sample and frame-keyed,
+        // symmetric across spp levels, which that gate accepts. The guard
+        // keeps spp == 1 and cloudless skies on the old path verbatim.
         if ((flags & FLAG_CLOUDS) && spp > 1u) {
             for (uint s = 1u; s < spp; ++s) {
                 float2 o = SKY_J[s];
@@ -164,9 +188,10 @@ void cs_sky(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
         }
         tbuf[pi] = INF;
         info[pi] = pack_info(rec.depth, KIND_SKY);
-        // Pixel centers, matching the CPU sky-tile flood (leaf-tile sky
-        // pixels get the jittered position in leaf.hlsl instead).
-        gbuf_write_sky(pi, float(x) + 0.5, float(y) + 0.5, dir);
+        // Sample 0's DECLARED position, matching the CPU sky-tile flood and
+        // leaf.hlsl alike — one convention, and `dir` is its exact preimage,
+        // which is what makes the direction-reprojection MV self-consistent.
+        gbuf_write_sky(pi, sp.x, sp.y, dir);
     }
 }
 

@@ -332,6 +332,7 @@ pub fn classify(
     illum: Option<u8>,
     water_hint: bool,
     tf: Option<[f32; 3]>,
+    water_on: bool,
 ) -> (usize, Pbr) {
     // Tier 1: texture filename stem. Tier 2: material name, same table.
     // FOLIAGE_GUARD suppresses the foliage row only (see the const): a
@@ -367,11 +368,15 @@ pub fn classify(
         // shading-only and every soundness property is unchanged. Signals:
         // an OBJ `water`/`agua` object/stem/material name, or a chromatic Tf
         // — the latter VETOED by a glass name (Tf is untrusted color;
-        // vokselia's chromatic-Tf `Glass` panes must not ripple).
-        let is_water = water_hint
-            || tex_stem.is_some_and(water_name)
-            || water_name(mat_name)
-            || (tf_chromatic(tf) && !glass_name(mat_name));
+        // vokselia's chromatic-Tf `Glass` panes must not ripple). `water_on`
+        // (the --no-water lever) gates ALL FOUR signals — it once gated only
+        // hint+Tf at the call site, and rungholt/vokselia water (classified
+        // by the NAME cue) ignored the lever entirely.
+        let is_water = water_on
+            && (water_hint
+                || tex_stem.is_some_and(water_name)
+                || water_name(mat_name)
+                || (tf_chromatic(tf) && !glass_name(mat_name)));
         if is_water {
             return (IDX_WATER, WATER);
         }
@@ -391,7 +396,7 @@ pub fn classify(
 /// compounds, the untextured name/Ns/illum tiers.
 pub fn self_test() -> Result<(), String> {
     let expect = |stem: Option<&str>, name: &str, ns: f32, illum: u8, want: &str| {
-        let got = NAMES[classify(stem, name, Some(ns), Some(illum), false, None).0];
+        let got = NAMES[classify(stem, name, Some(ns), Some(illum), false, None, true).0];
         if got == want {
             Ok(())
         } else {
@@ -478,6 +483,7 @@ pub fn self_test() -> Result<(), String> {
         Some(2),
         false,
         None,
+        true,
     );
     if pave.roughness >= 0.45 {
         return Err(format!("pavement roughness {} crossed the reflection gate", pave.roughness));
@@ -491,21 +497,21 @@ pub fn self_test() -> Result<(), String> {
     expect(None, "materialn", 100.0, 4, "glass")?;
     expect(None, "material_267", 256.0, 2, "glossy")?;
     expect(None, "material_9", 16.0, 2, "default")?;
-    let (_, g) = classify(None, "material_0", Some(4096.0), Some(2), false, None);
+    let (_, g) = classify(None, "material_0", Some(4096.0), Some(2), false, None, true);
     if !(g.transmission > 0.0 && g.roughness <= 0.06) {
         return Err(format!("Ns 4096: transmission {} roughness {}", g.transmission, g.roughness));
     }
-    let (_, f) = classify(Some("tela_mesa_b"), "material_2", Some(16.0), Some(2), false, None);
+    let (_, f) = classify(Some("tela_mesa_b"), "material_2", Some(16.0), Some(2), false, None, true);
     if f.sheen != FABRIC_SHEEN || f.transmission != 0.0 {
         return Err(format!("fabric: sheen {} transmission {}", f.sheen, f.transmission));
     }
-    let (_, l) = classify(Some("bs01lef"), "material_3", Some(16.0), Some(2), false, None);
+    let (_, l) = classify(Some("bs01lef"), "material_3", Some(16.0), Some(2), false, None, true);
     if l.translucency != 0.3 || l.roughness < 0.45 {
         return Err(format!("foliage: translucency {} roughness {}", l.translucency, l.roughness));
     }
     // Bark Pbr: wood-like — opaque (NO leaf translucency), above the bounce
     // gate, dielectric.
-    let (_, bk) = classify(Some("linden_bark_a_diff"), "material_4", Some(16.0), Some(2), false, None);
+    let (_, bk) = classify(Some("linden_bark_a_diff"), "material_4", Some(16.0), Some(2), false, None, true);
     if bk.translucency != 0.0 || bk.roughness < 0.45 || bk.transmission != 0.0 || bk.metallic != 0.0
     {
         return Err(format!(
@@ -516,7 +522,7 @@ pub fn self_test() -> Result<(), String> {
     // Water is a glass-tier refinement, not a rival to the keyword/glossy
     // tiers. Signals, each in isolation:
     let water_named = |stem: Option<&str>, name: &str, hint: bool, tf: Option<[f32; 3]>| {
-        NAMES[classify(stem, name, Some(1024.0), Some(4), hint, tf).0]
+        NAMES[classify(stem, name, Some(1024.0), Some(4), hint, tf, true).0]
     };
     // (a) the OBJ object name (`o Water` → materialo), no texture, no Tf.
     if water_named(None, "materialo", true, None) != "water" {
@@ -537,7 +543,7 @@ pub fn self_test() -> Result<(), String> {
     }
     // Refinement-only: a water name on an illum-2 opaque material does NOT
     // pull it into the glass tier.
-    if NAMES[classify(None, "water_chair", Some(256.0), Some(2), true, None).0] != "glossy" {
+    if NAMES[classify(None, "water_chair", Some(256.0), Some(2), true, None, true).0] != "glossy" {
         return Err("water hint must not override the opaque glossy tier".into());
     }
     // Token safety: `watercolor` is not water; `Water` is.
@@ -571,8 +577,22 @@ pub fn self_test() -> Result<(), String> {
     if !glass_name("Glass_Pane") || !glass_name("Portal") {
         return Err("glass_name must match Glass_Pane/Portal".into());
     }
+    // The lever (`--no-water` -> water_on = false) suppresses EVERY water
+    // signal — name, stem, object hint, AND chromatic Tf — regressing the
+    // material to plain glassware. Pinned on the rungholt shape (a
+    // name-classified `Stationary_Water`) because the lever once gated only
+    // hint+Tf at the call site and name-classified Minecraft water ignored
+    // `--no-water` entirely.
+    if NAMES[classify(None, "Stationary_Water", Some(0.0), Some(4), true, Some([0.9, 0.8, 0.4]), false).0]
+        != "glass"
+    {
+        return Err("--no-water must suppress every water signal (name incl.)".into());
+    }
+    if water_named(None, "Stationary_Water", false, None) != "water" {
+        return Err("water material name should classify water when armed".into());
+    }
     // The water params: transmission near 1, mirror-smooth, flagged.
-    let (_, w) = classify(None, "materialo", Some(1024.0), Some(4), true, None);
+    let (_, w) = classify(None, "materialo", Some(1024.0), Some(4), true, None, true);
     if !(w.water && w.transmission > 0.95 && w.roughness <= 0.06 && w.metallic == 0.0) {
         return Err(format!(
             "water pbr: water {} T {} rough {} metal {}",

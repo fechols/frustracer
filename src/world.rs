@@ -262,12 +262,14 @@ fn merge_scenes(parts: Vec<(Scene, Vec3A)>, field_half: f32) -> Scene {
     // derivation and tile_scene both rely on ground = the first GROUND_VERTS
     // verts), same construction as tile_scene's rewrite, with its own fresh
     // ground material at index 0 (the loaders' neutral color).
+    // GROUND_DROP: the covering quad must not share the islands' rest plane
+    // (each part's own y = 0 seabed/floor faces land there) — see scene.rs.
     let s = field_half + GROUND_MARGIN;
     let (a, b, c, d) = (
-        Vec3A::new(-s, 0.0, -s),
-        Vec3A::new(-s, 0.0, s),
-        Vec3A::new(s, 0.0, s),
-        Vec3A::new(s, 0.0, -s),
+        Vec3A::new(-s, -scene::GROUND_DROP, -s),
+        Vec3A::new(-s, -scene::GROUND_DROP, s),
+        Vec3A::new(s, -scene::GROUND_DROP, s),
+        Vec3A::new(s, -scene::GROUND_DROP, -s),
     );
     positions.extend_from_slice(&[a, b, c, a, c, d]);
     normals.extend_from_slice(&[Vec3A::Y; scene::GROUND_VERTS]);
@@ -488,6 +490,9 @@ fn load_part(resolved: &str) -> (Scene, LoadKind) {
     // v8 world cold boots skipped the retag and wrote WRONG sidecars under
     // the same key (the v9 bump invalidated them).
     scene::reclassify_spray(&mut s);
+    // Coincident-cull, same byte-interchangeability contract (main.rs's
+    // positional-arg load order).
+    scene::cull_coincident(&mut s);
     // Foliage-sway partition, byte-interchangeability again: the per-island
     // sidecar must hold the SAME swept tree a direct single-scene load of
     // this part would store under the identical sway_word key.

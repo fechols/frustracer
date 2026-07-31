@@ -47,6 +47,22 @@ pub fn water_enabled() -> bool {
     WATER.load(Relaxed)
 }
 
+/// Coincident-cull switch (`--no-coincident-cull`), same knob-before-load
+/// family. Off = `cull_coincident` is a no-op — transmissive faces exactly
+/// coincident with opaque faces survive (the pre-cull behavior, where the
+/// CPU and GPU intersectors break the z-fight tie DIFFERENTLY and the
+/// transmission chain can eps-tunnel past the coincident opaque surface).
+/// Keys the scene cache's lever word: the pass rewrites cached indices.
+static COINCIDENT_CULL: AtomicBool = AtomicBool::new(true);
+
+pub fn set_coincident_cull(on: bool) {
+    COINCIDENT_CULL.store(on, Relaxed);
+}
+
+pub fn coincident_cull_enabled() -> bool {
+    COINCIDENT_CULL.load(Relaxed)
+}
+
 /// Depth-tint switch (`--no-depth-tint`): Beer–Lambert attenuation over the
 /// transmission chain's interior segments. Runtime shading lever (no scene
 /// data changes — reads live in shade.rs / the GPU FLAG_DEPTH_TINT bit).
@@ -827,6 +843,111 @@ pub fn reclassify_spray(scene: &mut Scene) {
     );
 }
 
+/// Drop TRANSMISSIVE triangles exactly coincident with an OPAQUE triangle —
+/// same three vertex POSITIONS by f32 bits, any winding/rotation (grid
+/// exporters repeat coordinates exactly, the `reclassify_spray` weld
+/// precedent). Minecraft exports carry the case at scale: rungholt's ocean
+/// VOLUME has ~66k bottom faces coplanar-coincident with the seabed block
+/// tops (and the loader's ground quad used to share the same plane — see
+/// `GROUND_DROP`). A transmissive face flush against a solid transmits
+/// nothing physically, and keeping it is worse than redundant: the CPU and
+/// GPU intersectors break the exact-t tie DIFFERENTLY, and when the
+/// transmissive face wins, the transmission chain's eps-advanced
+/// continuation starts INSIDE the solid and tunnels past it (on rungholt the
+/// CPU tunneled clean through the world's floor to sky while the GPU shaded
+/// the ground quad — the "water is more transparent on the CPU path"
+/// report; measured 4.1% converged CPU-vs-GPU radiance at a water-dominant
+/// pose, ~9% on water pixels). Culling makes both tracers shade the lit
+/// seabed — agreeing AND correct. Runs at cold load beside
+/// `reclassify_spray` (direct load + per world island), rides the .fcache;
+/// `--no-coincident-cull` restores the pre-cull geometry and keys the cache
+/// lever word. Coincident transmissive-over-TRANSMISSIVE pairs (internal
+/// faces between adjacent water blocks) are deliberately KEPT — same
+/// material either way, so the tie is invisible; dropping them is a
+/// follow-on with its own soundness argument.
+pub fn cull_coincident(scene: &mut Scene) {
+    if !coincident_cull_enabled() {
+        return;
+    }
+    // Structural off-state: no transmissive materials ⇒ untouched (the
+    // procedural/stress scenes never reach the hashing below).
+    if !scene.materials.iter().any(|m| m.transmission > 0.0) {
+        return;
+    }
+    let key_of = |idx: &[u32; 3], positions: &[Vec3A]| -> [u32; 9] {
+        let mut vk = [[0u32; 3]; 3];
+        for (k, &i) in idx.iter().enumerate() {
+            let p = positions[i as usize];
+            vk[k] = [p.x.to_bits(), p.y.to_bits(), p.z.to_bits()];
+        }
+        vk.sort_unstable();
+        [
+            vk[0][0], vk[0][1], vk[0][2], vk[1][0], vk[1][1], vk[1][2], vk[2][0], vk[2][1],
+            vk[2][2],
+        ]
+    };
+    // Small map (transmissive tris only), scanned against by the opaque
+    // pass — never the other way around: hashing all 6.7M opaque tris of a
+    // Minecraft city would cost ~400 MB for nothing.
+    let mut trans: HashMap<[u32; 9], Vec<u32>> = HashMap::new();
+    for (t, idx) in scene.indices.iter().enumerate() {
+        if scene.materials[scene.tri_mat[t] as usize].transmission > 0.0 {
+            trans.entry(key_of(idx, &scene.positions)).or_default().push(t as u32);
+        }
+    }
+    if trans.is_empty() {
+        return;
+    }
+    // The opaque scan is the pass's whole cost — the map holds only the
+    // transmissive tris, but a LOOKUP still hashes the key, so every opaque
+    // tri pays key_of + SipHash (~10M on San Miguel) — hence the fan-out on
+    // the global rayon pool (the load-time idiom; a world island's inner
+    // par_iter deliberately inherits the one pool). Determinism: the drop
+    // SET is order-independent (matches collected, deduped serially after),
+    // so the culled scene — and therefore the sidecar bytes — are identical
+    // to a serial scan's at any thread count.
+    let matched: Vec<u32> = {
+        use rayon::prelude::*;
+        scene
+            .indices
+            .par_iter()
+            .enumerate()
+            .filter(|&(t, _)| scene.materials[scene.tri_mat[t] as usize].transmission <= 0.0)
+            .filter_map(|(_, idx)| trans.get(&key_of(idx, &scene.positions)))
+            .flat_map_iter(|list| list.iter().copied())
+            .collect()
+    };
+    let mut drop = vec![false; scene.indices.len()];
+    let mut n_drop = 0usize;
+    for tt in matched {
+        if !drop[tt as usize] {
+            drop[tt as usize] = true;
+            n_drop += 1;
+        }
+    }
+    let n_trans: usize = trans.values().map(Vec::len).sum();
+    if n_drop == 0 {
+        eprintln!("coincident-cull: 0 of {n_trans} transmissive faces coincide with opaque geometry");
+        return;
+    }
+    // Rebuild the index/material streams without the dropped faces (vertex
+    // streams stay — unreferenced positions are harmless and keep every
+    // other index stable).
+    let mut indices = Vec::with_capacity(scene.indices.len() - n_drop);
+    let mut tri_mat = Vec::with_capacity(scene.indices.len() - n_drop);
+    for t in 0..scene.indices.len() {
+        if !drop[t] {
+            indices.push(scene.indices[t]);
+            tri_mat.push(scene.tri_mat[t]);
+        }
+    }
+    scene.indices = indices;
+    scene.tri_mat = tri_mat;
+    eprintln!(
+        "coincident-cull: dropped {n_drop} of {n_trans} transmissive faces coincident with opaque geometry"
+    );
+}
+
 /// Spray gates, run by `--check` (the tinted_shadow_self_test pattern —
 /// hand-built islands, closed-form expectations): only tiny TRANSMISSIVE
 /// components retag, the clone's overrides are pinned bitwise, two islands
@@ -1017,6 +1138,124 @@ pub fn spray_self_test() -> Result<(), String> {
         let mut want_off = vec![0u32, 0, 0, 0, 1];
         want_off.extend([0; 10]); // islands E (8 tris) + F (2 tris)
         if off.materials.len() != 2 || off.tri_mat != want_off {
+            return Err("lever off must be a structural no-op".into());
+        }
+        Ok(())
+    };
+    let r = run();
+    restore(r)
+}
+
+/// Coincident-cull gates, run by `--check` (the spray_self_test pattern):
+/// a transmissive tri whose three positions bit-equal an opaque tri's (any
+/// winding) is dropped; transmissive-over-transmissive and non-coincident
+/// pairs survive; opaque tris are never dropped; the lever-off arm is a
+/// structural no-op.
+pub fn coincident_self_test() -> Result<(), String> {
+    let saved = coincident_cull_enabled();
+    let restore = |r: Result<(), String>| -> Result<(), String> {
+        set_coincident_cull(saved);
+        r
+    };
+    set_coincident_cull(true);
+    let run = || -> Result<(), String> {
+        let mk = || -> (Vec<Vec3A>, Vec<[u32; 3]>, Vec<u32>) {
+            // Tri 0: opaque base at exact grid positions. Tri 1: transmissive,
+            // SAME positions, rotated winding + private verts (the Minecraft
+            // water-bottom-over-seabed shape). Tri 2: transmissive, elsewhere.
+            // Tri 3: transmissive, coincident with tri 2 (trans-over-trans —
+            // must be KEPT). Tri 4: opaque coincident with tri 0 (opaque pair
+            // — nothing drops).
+            let a = Vec3A::new(0.0, 0.0, 0.0);
+            let b = Vec3A::new(1.0, 0.0, 0.0);
+            let c = Vec3A::new(0.0, 0.0, 1.0);
+            let d = Vec3A::new(3.0, 0.5, 0.0);
+            let e = Vec3A::new(4.0, 0.5, 0.0);
+            let f = Vec3A::new(3.0, 0.5, 1.0);
+            let mut positions = Vec::new();
+            let mut indices = Vec::new();
+            let mut push = |p0: Vec3A, p1: Vec3A, p2: Vec3A,
+                            positions: &mut Vec<Vec3A>,
+                            indices: &mut Vec<[u32; 3]>| {
+                let b0 = positions.len() as u32;
+                positions.extend_from_slice(&[p0, p1, p2]);
+                indices.push([b0, b0 + 1, b0 + 2]);
+            };
+            push(a, b, c, &mut positions, &mut indices); // 0 opaque
+            push(c, a, b, &mut positions, &mut indices); // 1 trans, rotated
+            push(d, e, f, &mut positions, &mut indices); // 2 trans
+            push(f, e, d, &mut positions, &mut indices); // 3 trans, coincident w/ 2
+            push(b, a, c, &mut positions, &mut indices); // 4 opaque, coincident w/ 0
+            (positions, indices, vec![1, 0, 0, 0, 1])
+        };
+        let glass = |transmission: f32| Material {
+            albedo: Vec3A::new(0.8, 0.85, 0.9),
+            roughness: 0.05,
+            metallic: 0.0,
+            anisotropy: 0.0,
+            sheen: 0.0,
+            translucency: 0.0,
+            transmission,
+            trans_tint: Vec3A::splat(-1.0),
+            ior: 1.5,
+            ripple_amp: 0.0,
+            emissive: Vec3A::ZERO,
+            normal_tex: NO_TEX,
+            normal_scale: 1.0,
+            height_amp: 0.0,
+            rough_tex: NO_TEX,
+            metal_tex: NO_TEX,
+            emissive_tex: NO_TEX,
+            class: crate::matclass::IDX_DEFAULT as u8,
+            kind: MatKind::Diffuse,
+        };
+        let scene_of = |cull: bool| -> Scene {
+            let (positions, indices, tri_mat) = mk();
+            let n = positions.len();
+            let mut sc = Scene {
+                positions,
+                normals: vec![Vec3A::Y; n],
+                texcoords: vec![Vec2::ZERO; n],
+                indices,
+                tri_mat,
+                materials: vec![glass(0.9), glass(0.0)],
+                textures: Vec::new(),
+                any_alpha: false,
+                any_height: false,
+                any_transmissive: false,
+                sun: crate::sky::Sun::new(Vec3A::Y),
+                sky_sh: crate::sh::Sh9::ZERO,
+                sky_scale: 1.0,
+                night: 0.0,
+                sway: None,
+                sway_regions: Vec::new(),
+                diag: 1.0,
+                eps: 1e-4,
+                ao_radius: 0.03,
+                content_min: Vec3A::ZERO,
+                content_max: Vec3A::ZERO,
+            };
+            set_coincident_cull(cull);
+            cull_coincident(&mut sc);
+            set_coincident_cull(true);
+            sc
+        };
+        let sc = scene_of(true);
+        // Tri 1 (trans coincident with opaque 0) dropped; everything else
+        // kept in order.
+        if sc.tri_mat != vec![1u32, 0, 0, 1] {
+            return Err(format!(
+                "cull kept the wrong faces: tri_mat {:?} (want [1, 0, 0, 1])",
+                sc.tri_mat
+            ));
+        }
+        // The survivors' first vertex indices prove tri identity (streams
+        // rebuilt, verts untouched): 0, 6(d..), 9(f..), 12(b..).
+        if sc.indices.iter().map(|i| i[0]).collect::<Vec<_>>() != vec![0, 6, 9, 12] {
+            return Err(format!("cull dropped the wrong tri: indices {:?}", sc.indices));
+        }
+        let off = scene_of(false);
+        if off.tri_mat != vec![1u32, 0, 0, 0, 1] || off.indices.len() != 5 {
             return Err("lever off must be a structural no-op".into());
         }
         Ok(())
@@ -1375,6 +1614,18 @@ pub fn procedural_scene() -> Scene {
 pub(crate) const GROUND_VERTS: usize = 6;
 pub(crate) const GROUND_TRIS: usize = 2;
 
+/// How far BELOW the model's rest plane (y = 0 after the diag-10 fit) the
+/// LOADED-scene ground quad sits. It used to sit exactly AT y = 0, which
+/// z-fights every model face on the rest plane — rungholt's entire seabed —
+/// and the CPU/GPU intersectors break an exact-t tie DIFFERENTLY, so the
+/// same scene shaded a different surface per render mode (the water-
+/// transparency report; see `cull_coincident`). 1e-4 of the fit diagonal
+/// (1e-3 units ≈ a tenth of a Minecraft block) is far above f32 t-rounding
+/// at ±60 coordinates and far below anything visible. The PROCEDURAL and
+/// stress scenes deliberately keep y = 0 — no transmissive geometry, and
+/// their gate images are pinned byte-identical.
+pub(crate) const GROUND_DROP: f32 = 1e-3;
+
 /// Tile a loaded (already diag-10-fitted) OBJ scene into an `nx`×`nz` grid by
 /// duplicating the transformed geometry — flattened replication, deliberately
 /// NOT instancing (two-level instancing is a deferred epic; the whole
@@ -1417,13 +1668,14 @@ pub fn tile_scene(base: Scene, nx: u32, nz: u32) -> (Scene, f32) {
     tri_mat.reserve_exact(GROUND_TRIS + tiles * mt);
 
     // Ground quad rewritten to cover the grid — same construction as the
-    // loaders' `quad()` (two fan triangles, 6 duplicated verts, +y normal).
+    // loaders' `quad()` (two fan triangles, 6 duplicated verts, +y normal),
+    // at the loaded-scene GROUND_DROP (never on the models' rest plane).
     let s = fh + 6.0;
     let (a, b, c, d) = (
-        Vec3A::new(-s, 0.0, -s),
-        Vec3A::new(-s, 0.0, s),
-        Vec3A::new(s, 0.0, s),
-        Vec3A::new(s, 0.0, -s),
+        Vec3A::new(-s, -GROUND_DROP, -s),
+        Vec3A::new(-s, -GROUND_DROP, s),
+        Vec3A::new(s, -GROUND_DROP, s),
+        Vec3A::new(s, -GROUND_DROP, -s),
     );
     positions.extend_from_slice(&[a, b, c, a, c, d]);
     normals.extend_from_slice(&[Vec3A::Y; GROUND_VERTS]);
@@ -1733,12 +1985,14 @@ pub fn load_obj_scene(path: &str) -> Scene {
 
     let mut b = SceneBuilder::new();
     let ground = b.material(Vec3A::new(0.42, 0.46, 0.40), 0.55, 0.0);
+    // GROUND_DROP: the quad must not share the fitted model's rest plane
+    // (y = 0) — see the const.
     let s = 60.0;
     b.quad(
-        Vec3A::new(-s, 0.0, -s),
-        Vec3A::new(-s, 0.0, s),
-        Vec3A::new(s, 0.0, s),
-        Vec3A::new(s, 0.0, -s),
+        Vec3A::new(-s, -GROUND_DROP, -s),
+        Vec3A::new(-s, -GROUND_DROP, s),
+        Vec3A::new(s, -GROUND_DROP, s),
+        Vec3A::new(s, -GROUND_DROP, -s),
         ground,
     );
 
@@ -1910,7 +2164,9 @@ pub fn load_obj_scene(path: &str) -> Scene {
             // Water refines the glass tier only: `water_hint` from the OBJ
             // object name, `tf` the parsed MTL transmission filter (tobj has
             // no first-class Tf — it rides unknown_param, the `norm`/`Pr`
-            // precedent). Both suppressed under --no-water.
+            // precedent). `water_on` reaches classify itself, which gates the
+            // stem/material-name cues too — gating only hint+tf here left
+            // name-classified Minecraft water immune to --no-water.
             let tf = if water_on { m.unknown_param.get("Tf").and_then(|v| parse_tf(v)) } else { None };
             let (class, pbr) = crate::matclass::classify(
                 stem.as_deref(),
@@ -1919,6 +2175,7 @@ pub fn load_obj_scene(path: &str) -> Scene {
                 m.illumination_model,
                 water_on && water_named[mi],
                 tf,
+                water_on,
             );
             class_counts[class] += 1;
             if pbr.transmission > 0.0 && !pbr.water {

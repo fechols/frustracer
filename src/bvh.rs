@@ -1307,6 +1307,7 @@ impl Bvh {
                                     return true;
                                 }
                                 *tp *= m.shadow_tint();
+                                TRANS_PASS.fetch_add(1, Ordering::Relaxed);
                                 if tp.max_element() < SHADOW_TP_MIN {
                                     return true;
                                 }
@@ -1343,6 +1344,14 @@ impl Bvh {
 /// opaque (ZERO) — the deterministic early-out that keeps a deep glass stack
 /// from costing unbounded leaf visits. Mirrored in trace_common.hlsli.
 pub const SHADOW_TP_MIN: f32 = 1e-3;
+
+/// Diagnostic twin of the GPU's `CTR_TRANS_PASS`: tinted-shadow interface
+/// crossings (`shadow_tint` multiplies) since process start. Relaxed adds at
+/// transmissive crossings only — rare enough to be free. Read by the check
+/// harness's FR_CHECK_AB_DUMP decomposition to compare crossing COUNTS
+/// against the GPU counter: a duplicate-candidate divergence multiplies the
+/// same tint twice, which is invisible to every value gate but doubles this.
+pub static TRANS_PASS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Build one pending subtree into a local arena: root at local 0, internal
 /// `left_first` = LOCAL node index (the stitch rebases them by one uniform

@@ -524,5 +524,89 @@ pub fn mv_selftest(
     if ident_ok {
         eprintln!("mv_selftest: matrix/ray identity OK");
     }
-    ok && ident_ok
+
+    // SKY ARM. The loop above `continue`s on sky (there is no world point to
+    // reconstruct), so nothing here ever validated a sky pixel — which is how
+    // `sparse_fill` shipped writing each coarse sky pixel's MV and normal from
+    // a DIFFERENT pixel's direction (the cell's random sample, up to
+    // SAMPLE_CELL away and re-randomized every frame).
+    //
+    // What is checkable exactly: `write_gbuf_sky` stores `normal = -dir`, and
+    // `dir` must be the preimage of the (fx, fy) the same call subtracts to
+    // form the MV. So reconstruct the pixel's own direction and compare. The
+    // bound is set by the f16 normal plane (~5e-4 per component), and the
+    // defect it targets is ~2e-2 rad — nearly two orders clear.
+    //
+    // NOTE what this deliberately does NOT claim to catch: sub-pixel
+    // REGISTRATION. A half-pixel error is ~1e-3 rad here, at the plane's own
+    // noise floor, and under pure translation the sky MV is exactly zero
+    // whether or not the sample position is declared honestly. That defect is
+    // observable only in color — see the `sky registration` gate in main.rs.
+    //
+    // must_fire = false: a skyless pose passes VACUOUSLY here (with the note),
+    // per the loaded-scene/--stress structural-skip convention — mv_selftest
+    // has no structural flag of its own, and its check-gpu/-dxr callers
+    // already carry a structural-gated `skies == 0` must-fire beside this
+    // call, so sky-presence teeth are not lost where they are mandated.
+    let sky_ok = sky_dir_check("mv_selftest sky", gb, basis_b, far, false);
+    ok && ident_ok && sky_ok
+}
+
+/// The sky half of the G-buffer contract, factored out so both `mv_selftest`
+/// (full-depth frames) and the capped-frame gate in main.rs (which is what
+/// reaches `sparse_fill`'s coarse flood) run the identical check.
+///
+/// `write_gbuf_sky` stores `normal = -dir` and forms the MV by subtracting the
+/// (fx, fy) that `dir` came from, so the two must stay a matched pair: `dir`
+/// is the preimage of the position. Reconstructing the pixel's own direction
+/// and comparing catches any path that pairs them wrongly — which is exactly
+/// what `sparse_fill` did, reusing a cell sample's direction from a pixel up
+/// to SAMPLE_CELL away against this pixel's own position.
+///
+/// Limit 5e-3 rad against an f16 plane whose own quantization is ~3.5e-4
+/// (measured) — 14x of headroom, and the defect class it targets is ~2e-2.
+///
+/// `must_fire` is the anti-vacuity policy: a pose with zero sky pixels proves
+/// nothing, and whether that FAILS (structural runs — the default scenes have
+/// sky by construction) or passes with a note (loaded scenes / --stress, the
+/// suite-wide structural-skip convention) is the CALLER's decision, exactly
+/// like every other must-fire in the check suites. The mismatch half
+/// (`bad == 0`) gates unconditionally either way.
+pub fn sky_dir_check(label: &str, gb: &GBufs, basis: &CamBasis, far: f32, must_fire: bool) -> bool {
+    const LIMIT: f32 = 5e-3;
+    let (rw, rh) = (gb.rw, gb.rh);
+    let (mut px, mut bad, mut worst) = (0u64, 0u64, 0.0f32);
+    for y in 0..rh {
+        for x in 0..rw {
+            let i = y * rw + x;
+            if f32::from_bits(gb.depth[i].load(Relaxed)) < far * 0.99 {
+                continue;
+            }
+            px += 1;
+            let want = basis.ray_dir(x as f32 + 0.5, y as f32 + 0.5);
+            let got = Vec3A::new(
+                -ld16(&gb.normal_rough[i * 4]),
+                -ld16(&gb.normal_rough[i * 4 + 1]),
+                -ld16(&gb.normal_rough[i * 4 + 2]),
+            );
+            // Both are unit, so the chord length is the angle to first order.
+            let err = (want - got).length();
+            if err > LIMIT {
+                bad += 1;
+            }
+            worst = worst.max(err);
+        }
+    }
+    let ok = bad == 0 && (px > 0 || !must_fire);
+    eprintln!(
+        "{label}: {px} px | dir mismatch {bad} | worst {worst:.3e} (limit {LIMIT:.1e}) -> {}",
+        if !ok {
+            "FAIL"
+        } else if px == 0 {
+            "OK (vacuous — no sky px, structural skip)"
+        } else {
+            "OK"
+        }
+    );
+    ok
 }

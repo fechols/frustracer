@@ -190,12 +190,13 @@ fn build_scene(
 ) -> Scene {
     let mut b = SceneBuilder::new();
     let ground = b.material(Vec3A::new(0.42, 0.46, 0.40), 0.55, 0.0);
+    // GROUND_DROP: never on the fitted model's rest plane (see scene.rs).
     let s = 60.0;
     b.quad(
-        Vec3A::new(-s, 0.0, -s),
-        Vec3A::new(-s, 0.0, s),
-        Vec3A::new(s, 0.0, s),
-        Vec3A::new(s, 0.0, -s),
+        Vec3A::new(-s, -crate::scene::GROUND_DROP, -s),
+        Vec3A::new(-s, -crate::scene::GROUND_DROP, s),
+        Vec3A::new(s, -crate::scene::GROUND_DROP, s),
+        Vec3A::new(s, -crate::scene::GROUND_DROP, -s),
         ground,
     );
     let _ = ground;

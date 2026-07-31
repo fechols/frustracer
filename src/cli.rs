@@ -393,6 +393,11 @@ pub struct Opts {
     pub depth_tint: bool,
     /// `--no-water` clears (`scene::set_water`). Keys the cache lever word.
     pub water: bool,
+    /// `--no-coincident-cull` clears (`scene::set_coincident_cull`): keep
+    /// transmissive faces exactly coincident with opaque faces (the
+    /// pre-cull z-fight, where CPU and GPU break the tie differently —
+    /// rungholt's water bottoms over the seabed). Keys the cache lever word.
+    pub coincident_cull: bool,
     /// `--heightfield` arms relief rendering and starts it ON; the default is
     /// UNARMED. ONE field, TWO statics: `main` stores `set_height_armed` AND
     /// `set_height_on` together, which is what keeps `--no-heightfield
@@ -615,6 +620,7 @@ pub fn defaults() -> Opts {
         spray: true,
         depth_tint: true,
         water: true,
+        coincident_cull: true,
         heightfield: false,
         bloom: true,
         clouds: true,
@@ -837,6 +843,9 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
             // pre-water-class look) instead of the water refinement (blue-green
             // tint, IOR 1.33, ripple normals); keys the cache lever word.
             "--no-water" => opts.water = false,
+            // --no-coincident-cull: keep transmissive faces coincident with
+            // opaque faces (the pre-cull z-fight); keys the cache lever word.
+            "--no-coincident-cull" => opts.coincident_cull = false,
             // Relief rendering session levers. The DEFAULT is DISARMED —
             // structurally the pre-relief renderer (no AABB sweep at BVH
             // build, no march anywhere; the sweep's all-axis edge pad
@@ -1673,6 +1682,9 @@ pub fn usage() {
                 eprintln!("                segments (water loses its depth-graded tint)");
                 eprintln!("  --no-water    classify the fountain as generic glassware, not the water class");
                 eprintln!("                (no blue-green tint / IOR 1.33 / ripple normals; keys the scene cache)");
+                eprintln!("  --no-coincident-cull  keep transmissive faces exactly coincident with opaque faces");
+                eprintln!("                (the pre-cull z-fight: CPU and GPU break the tie differently, and the");
+                eprintln!("                transmission chain can tunnel past the opaque face; keys the scene cache)");
                 eprintln!("  --heightfield ARM relief rendering and start it ON where the scene carries height");
                 eprintln!("                data (V toggles relief vs normal-mapping live in the armed session).");
                 eprintln!("                The DEFAULT is unarmed: no swept AABBs, no march — the pre-relief");
@@ -1712,7 +1724,7 @@ pub fn usage() {
 /// contract and gets applied in one order.
 fn lever_snapshot() -> String {
     format!(
-        "mips={} aniso={} h2n={} n2h={} tint={} spray={} depth={} water={} \
+        "mips={} aniso={} h2n={} n2h={} tint={} spray={} depth={} water={} ccull={} \
          harm={} hon={} bloom={} clouds={} ff={} ffn={} cshadow={} skylod={} dxrinline={} \
          fsway={} famp={}",
         texture::mips_enabled(),
@@ -1723,6 +1735,7 @@ fn lever_snapshot() -> String {
         scene::spray_enabled(),
         scene::depth_tint(),
         scene::water_enabled(),
+        scene::coincident_cull_enabled(),
         bvh::height_armed(),
         bvh::height_on(),
         bloom::enabled(),
@@ -1765,6 +1778,7 @@ pub fn self_test() -> Result<(), String> {
         "--no-spray",
         "--no-depth-tint",
         "--no-water",
+        "--no-coincident-cull",
         "--heightfield",
         "--no-bloom",
         "--no-clouds",
@@ -1797,6 +1811,7 @@ pub fn self_test() -> Result<(), String> {
         ("spray", !o.spray),
         ("depth_tint", !o.depth_tint),
         ("water", !o.water),
+        ("coincident_cull", !o.coincident_cull),
         ("heightfield", o.heightfield),
         ("bloom", !o.bloom),
         ("clouds", !o.clouds),

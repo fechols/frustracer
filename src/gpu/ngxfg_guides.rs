@@ -981,6 +981,394 @@ impl GuidePass {
     }
 }
 
+/// `TONE_HLSL`'s two kernels: compress the color handed to NGX, then expand
+/// its output back. Kept beside the guide kernel because it shares that
+/// pass's fxc `cs_5_0` toolchain and its dispatch site.
+const TONE_HLSL: &str = r#"
+Texture2D<float4>   src : register(t0);
+RWTexture2D<float4> dst : register(u0);
+cbuffer C : register(b0) { uint tw; uint th; uint mode; float k; };
+
+// mode 1 = linear scale (exact round trip, isolates absolute MAGNITUDE),
+// 3 = log2(1+v)*k (compresses ratios like Reinhard but stays WELL
+// CONDITIONED — its inverse's relative error is constant instead of
+// exploding at the ceiling), anything else = Reinhard v/(1+v).
+float3 tone_fwd(float3 v) {
+    if (mode == 1u) return v * k;
+    if (mode == 3u) return log2(1.0f + v) * k;
+    return v / (1.0f + v);
+}
+float3 tone_inv(float3 v) {
+    if (mode == 1u) return v / max(k, 1e-8f);
+    if (mode == 3u) return exp2(v / max(k, 1e-8f)) - 1.0f;
+    // Reinhard's inverse blows up as v -> 1; clamp so a saturated texel comes
+    // back large-but-finite instead of inf (which would poison the tonemap).
+    float3 s = min(v, 0.9995f);
+    return s / max(1.0f - s, 1e-6f);
+}
+
+[numthreads(8, 8, 1)]
+void cs_tone_compress(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= tw || id.y >= th) return;
+    float4 c = src[id.xy];
+    dst[id.xy] = float4(tone_fwd(max(c.rgb, 0.0f)), c.a);
+}
+
+// In place on the NGX output: one texel per thread, so the read-write is
+// safe without a copy.
+[numthreads(8, 8, 1)]
+void cs_tone_expand(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= tw || id.y >= th) return;
+    float4 c = dst[id.xy];
+    dst[id.xy] = float4(tone_inv(max(c.rgb, 0.0f)), c.a);
+}
+"#;
+
+/// The linear-scale mode's factor. 810 (the sun disc) -> ~3.2, so a squared
+/// difference lands ~10 instead of ~6.6e5.
+pub const TONE_SCALE_K: f32 = 1.0 / 256.0;
+
+/// The log mode's factor: `log2(1 + 810)/16` ~ 0.60, so the whole scene lands
+/// in roughly [0, 0.7]. Chosen for CONDITIONING, not range — the inverse's
+/// derivative is `ln2 * exp2(c/k) / k`, i.e. proportional to the VALUE, so
+/// one f16 quantum costs a constant ~0.5% relative error everywhere instead
+/// of Reinhard's blow-up near the ceiling (which is what banded the outer
+/// bloom edge).
+pub const TONE_LOG_K: f32 = 1.0 / 16.0;
+
+/// `FR_NGXFG_TONEMAP` — the input curve for raw-NGX frame generation.
+/// **DEFAULT `reinhard`** (shipped 2026-07-31, promoted from the diagnostic it
+/// started as): every `--fg` session compresses the color handed to NGX and
+/// expands its output in place. `off` is the kill arm — raw linear
+/// `rr.output`, the sun-disc strobe returns on demand — and `scale`/`log`
+/// remain the diagnostic arms whose measurements are recorded below.
+///
+/// WHY IT EXISTS. Frame generation warps the sun disc's neighborhood into
+/// smooth "heat haze" on GENERATED frames only, at a parked camera, in every
+/// render arm. Diagnosed by elimination (2026-07-31): the camera block
+/// (including a full `FR_NGXFG_CAM=identity` substitution), matrix majority,
+/// jitter, resolution, HDR declaration, depth convention, MV convention,
+/// magnitude (the far dimmer MOON does it too), per-frame variance
+/// (`--spp 16`), clouds, bloom and DRS were each ruled out by MEASUREMENT —
+/// and the ffx FI interpolator is CLEAN on identical content, which localizes
+/// it to what we hand NGX. (That cross-interpolator A/B is the same move that
+/// cracked the reflection-swim bug; see `jitter_mode`.)
+///
+/// The one uncontrolled difference that survives: ffx FI interpolates the
+/// POST-tonemap backbuffer (display-range), while raw NGX is handed
+/// `rr.output` — scene-referred LINEAR radiance, where the sun disc is ~810
+/// against a scene of order 1. `colorBuffersHDR` tells NGX the buffer is HDR;
+/// it does not tell it the values are unbounded.
+///
+/// SHAPE. Compress `rr.output` into a scratch, hand THAT to NGX, then expand
+/// its output IN PLACE. Presentation is therefore untouched — the tonemap
+/// reads `n.out` and sees linear values exactly as it does with the pass off —
+/// so the lever is an A/B of ONE variable with no second code path downstream,
+/// and the REAL half of every present pair is bit-identical in every mode
+/// (compress only READS `rr.output`; expand only writes `n.out`).
+///
+/// MEASURED (2026-07-31, 4090, parked and rotating): `scale` converges at a
+/// parked camera but DOUBLE-GHOSTS the disc under rotation; `reinhard` is
+/// correct in both. So the defect is the unbounded RATIOS, not the absolute
+/// magnitude — reducing magnitude while preserving every ratio does not give
+/// NGX's flow what it needs. That is the ffx-vs-NGX difference, confirmed
+/// from the other side, and it says the permanent fix is to hand FG a
+/// display-range image (as standard DLSS-G integrations do) rather than
+/// scene-referred linear.
+///
+/// `log` MEASURED WORSE than `reinhard` (ghosting + banding), and the reason
+/// is MIDTONE PLACEMENT, not precision: at `TONE_LOG_K` a scene value of 1
+/// lands at 0.0625 where Reinhard puts it at 0.5, so ordinary content is
+/// crushed against black and the flow estimator has almost no signal. Log
+/// cannot retune out of this — placing 1 at 0.5 needs k = 0.5, which sends
+/// 810 back above 1 and unbounds it again. So the answer to this probe's
+/// second question is: **NGX wants a display-CURVE-shaped input, not merely a
+/// bounded one** — and Reinhard working is not luck, `v/(1+v)` IS a classic
+/// tonemap operator. The permanent fix should hand FG a genuinely tonemapped
+/// image (the standard DLSS-G integration), not any cheap compression.
+///
+/// A SECOND, DISTINCT ARTIFACT survives every mode and is NOT ours: straight
+/// piecewise-linear banding in the smooth aureole, ONLY under camera motion,
+/// settling when the camera stops. That rules out this probe's round-trip
+/// quantization, which is a function of the VALUE and would be identical
+/// parked (and which would band along iso-radiance contours — curved, not
+/// straight). It is NGX's own optical flow hitting the aperture problem: flow
+/// is unconstrained in a textureless gradient, so per-block estimates drift
+/// independently and the block boundaries become visible steps. Parked, the
+/// frames are near-identical, flow converges to zero, and it vanishes.
+/// UNTESTED: whether ffx FI bands in the same region (if it does, the smooth
+/// HDR gradient is simply hard for any interpolator and this is not worth
+/// chasing).
+///
+/// THREE MODES, testing three different sub-hypotheses:
+/// - `scale`: a pure linear scale by `TONE_SCALE_K`. Preserves every contrast
+///   RATIO and moves only absolute magnitude, so it isolates numeric overflow
+///   inside NGX — a squared difference of ~810 is 6.6e5, past f16's 65504
+///   ceiling. Round trip exact up to f16 rounding.
+/// - `reinhard`: `v/(1+v)`, compressing the ratios themselves — the arm the
+///   ffx comparison points at, the one that WORKS, and THE SHIPPING DEFAULT.
+///   KNOWN-ACCEPT it carries: its inverse is ill-conditioned near the ceiling
+///   (`1/(1-v)^2` reaches ~1e6, so one f16 quantum of the stored value expands
+///   to ~490 radiance), which can band the outer bloom edge on GENERATED
+///   frames only. The tracked follow-on that would delete it — hand FG a
+///   genuinely display-referred image and present its output through a
+///   matching curve, i.e. no inverse pass at all — is blocked on
+///   `fullscreen_to_backbuffer` not being parameterized on a render target and
+///   on the bloom pyramid running on linear input; reinhard-by-default is the
+///   measured-correct answer until then.
+/// - `log`: `log2(1+v)*TONE_LOG_K`, same ratio compression with CONSTANT
+///   relative error, so it should match `reinhard` without the banding. It is
+///   also the experiment that distinguishes "NGX needs a specific tonemap
+///   curve" from "NGX needs merely bounded input" — if a curve this unlike
+///   Reinhard works equally well, any monotone compression suffices and the
+///   permanent fix does not have to route the real tonemap through FG.
+pub struct TonePass {
+    root_sig: ID3D12RootSignature,
+    pso_compress: ID3D12PipelineState,
+    pso_expand: ID3D12PipelineState,
+    /// [0] = SRV of the linear color, [1] = UAV of `scratch`, [2] = UAV of
+    /// the NGX output (the in-place expand target).
+    heap: ID3D12DescriptorHeap,
+    inc: u32,
+    /// Display-res RGBA16F, matching `rr.output` — NGX reads it as `color`.
+    scratch: Option<ID3D12Resource>,
+    w: u32,
+    h: u32,
+    /// COM identities of the (src, out) pair the heap's descriptors currently
+    /// name — what lets the per-dispatch `ensure` skip the descriptor rewrite
+    /// on the steady state (see the method).
+    described: (usize, usize),
+}
+
+impl TonePass {
+    pub fn new(device: &ID3D12Device) -> Result<TonePass> {
+        // [0] SRV table (t0), [1] UAV table (u0), [2] root constants (b0).
+        // The GuidePass shape with one descriptor per table: the UAV table's
+        // base is what selects scratch-vs-output between the two dispatches.
+        let srv_range = [D3D12_DESCRIPTOR_RANGE {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+            NumDescriptors: 1,
+            BaseShaderRegister: 0,
+            RegisterSpace: 0,
+            OffsetInDescriptorsFromTableStart: 0,
+        }];
+        let uav_range = [D3D12_DESCRIPTOR_RANGE {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+            NumDescriptors: 1,
+            BaseShaderRegister: 0,
+            RegisterSpace: 0,
+            OffsetInDescriptorsFromTableStart: 0,
+        }];
+        let params = [
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                        NumDescriptorRanges: 1,
+                        pDescriptorRanges: srv_range.as_ptr(),
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                        NumDescriptorRanges: 1,
+                        pDescriptorRanges: uav_range.as_ptr(),
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    Constants: D3D12_ROOT_CONSTANTS {
+                        ShaderRegister: 0,
+                        RegisterSpace: 0,
+                        Num32BitValues: 4,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+        ];
+        let rs_desc = D3D12_ROOT_SIGNATURE_DESC {
+            NumParameters: params.len() as u32,
+            pParameters: params.as_ptr(),
+            ..Default::default()
+        };
+        let mut blob: Option<ID3DBlob> = None;
+        let mut errb: Option<ID3DBlob> = None;
+        unsafe {
+            D3D12SerializeRootSignature(
+                &rs_desc,
+                D3D_ROOT_SIGNATURE_VERSION_1,
+                &mut blob,
+                Some(&mut errb),
+            )
+        }
+        .map_err(|e| format!("ngxfg-tone: D3D12SerializeRootSignature: {e}"))?;
+        let blob = blob.unwrap();
+        let root_sig: ID3D12RootSignature = unsafe {
+            device.CreateRootSignature(
+                0,
+                std::slice::from_raw_parts(
+                    blob.GetBufferPointer() as *const u8,
+                    blob.GetBufferSize(),
+                ),
+            )
+        }
+        .map_err(|e| format!("ngxfg-tone: CreateRootSignature: {e}"))?;
+
+        let mut pso_of = |entry: windows::core::PCSTR,
+                          what: &str|
+         -> Result<ID3D12PipelineState> {
+            let cs = compile(TONE_HLSL, entry, s!("cs_5_0"), what)?;
+            unsafe {
+                device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root_sig),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: cs.GetBufferPointer(),
+                        BytecodeLength: cs.GetBufferSize(),
+                    },
+                    ..Default::default()
+                })
+            }
+            .map_err(|e| format!("ngxfg-tone: CreateComputePipelineState({what}): {e}").into())
+        };
+        let pso_compress = pso_of(s!("cs_tone_compress"), "ngxfg-tone cs_tone_compress")?;
+        let pso_expand = pso_of(s!("cs_tone_expand"), "ngxfg-tone cs_tone_expand")?;
+
+        let heap: ID3D12DescriptorHeap = unsafe {
+            device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 3,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                ..Default::default()
+            })
+        }
+        .map_err(|e| format!("ngxfg-tone: CreateDescriptorHeap: {e}"))?;
+        let inc = unsafe {
+            device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+        };
+
+        Ok(TonePass {
+            root_sig,
+            pso_compress,
+            pso_expand,
+            heap,
+            inc,
+            scratch: None,
+            w: 0,
+            h: 0,
+            described: (0, 0),
+        })
+    }
+
+    /// Idempotent per-dispatch prologue — called EVERY frame, unlike
+    /// `GuidePass::ensure` (which runs only at feature create/recreate): this
+    /// pass has no recreate hook of its own, so it re-checks here. The scratch
+    /// rebuilds when the DISPLAY dims move, and the three descriptors rewrite
+    /// only when the scratch or the (src, out) COM identities changed — a
+    /// descriptor in a shader-visible heap is read at EXECUTE time, so
+    /// editing one the steady state's in-flight frames still reference would
+    /// be a race; the identities only ever move across drained points
+    /// (feature creation, or resize_output's `wait_idle` rebuilding
+    /// `rr.output`/the FG out), which is what makes the rewrite safe exactly
+    /// when it happens. The steady-state frame is two pointer compares.
+    pub fn ensure(
+        &mut self,
+        device: &ID3D12Device,
+        w: u32,
+        h: u32,
+        src: &ID3D12Resource,
+        out: &ID3D12Resource,
+    ) -> Result<()> {
+        let key = (
+            windows::core::Interface::as_raw(src) as usize,
+            windows::core::Interface::as_raw(out) as usize,
+        );
+        let mut rewrite = self.described != key;
+        if self.scratch.is_none() || self.w != w || self.h != h {
+            self.scratch = Some(d3d12::committed_tex(
+                device,
+                w,
+                h,
+                DXGI_FORMAT_R16G16B16A16_FLOAT,
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            )?);
+            self.w = w;
+            self.h = h;
+            rewrite = true;
+        }
+        if rewrite {
+            let base = unsafe { self.heap.GetCPUDescriptorHandleForHeapStart() };
+            let at =
+                |i: u32| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: base.ptr + (i * self.inc) as usize };
+            unsafe {
+                device.CreateShaderResourceView(src, None, at(0));
+                device.CreateUnorderedAccessView(self.scratch.as_ref().unwrap(), None, None, at(1));
+                device.CreateUnorderedAccessView(out, None, None, at(2));
+            }
+            self.described = key;
+        }
+        Ok(())
+    }
+
+    pub fn scratch(&self) -> &ID3D12Resource {
+        self.scratch.as_ref().expect("ensure before scratch")
+    }
+
+    fn dispatch(&self, list: &ID3D12GraphicsCommandList, pso: &ID3D12PipelineState, uav: u32, mode: u8) {
+        let gpu = unsafe { self.heap.GetGPUDescriptorHandleForHeapStart() };
+        let at = |i: u32| D3D12_GPU_DESCRIPTOR_HANDLE { ptr: gpu.ptr + (i * self.inc) as u64 };
+        unsafe {
+            list.SetDescriptorHeaps(&[Some(self.heap.clone())]);
+            list.SetComputeRootSignature(&self.root_sig);
+            list.SetPipelineState(pso);
+            list.SetComputeRootDescriptorTable(0, at(0));
+            list.SetComputeRootDescriptorTable(1, at(uav));
+            list.SetComputeRoot32BitConstant(2, self.w, 0);
+            list.SetComputeRoot32BitConstant(2, self.h, 1);
+            list.SetComputeRoot32BitConstant(2, mode as u32, 2);
+            // Per-mode factor: Reinhard takes none (it is parameter-free).
+            let k = match mode {
+                1 => TONE_SCALE_K,
+                3 => TONE_LOG_K,
+                _ => 0.0,
+            };
+            list.SetComputeRoot32BitConstant(2, k.to_bits(), 3);
+            list.Dispatch(self.w.div_ceil(8), self.h.div_ceil(8), 1);
+        }
+    }
+
+    /// `rr.output` (NON_PIXEL_SHADER_RESOURCE, as the NGX pre-barrier already
+    /// leaves it) -> `scratch` (UNORDERED_ACCESS). Caller transitions scratch
+    /// to NON_PIXEL_SHADER_RESOURCE before the evaluate reads it.
+    pub fn record_compress(&self, list: &ID3D12GraphicsCommandList, mode: u8) {
+        self.dispatch(list, &self.pso_compress, 1, mode);
+    }
+
+    /// The NGX output, in place, while it is still UNORDERED_ACCESS. The UAV
+    /// barrier is issued HERE rather than by the caller: it is what orders the
+    /// evaluate's writes before this read, and separating it from the dispatch
+    /// it protects is how that gets dropped in a later edit.
+    pub fn record_expand(&self, list: &ID3D12GraphicsCommandList, out: &ID3D12Resource, mode: u8) {
+        let b = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                    pResource: unsafe { std::mem::transmute_copy(out) },
+                }),
+            },
+        };
+        unsafe { list.ResourceBarrier(&[b]) };
+        self.dispatch(list, &self.pso_expand, 2, mode);
+    }
+}
+
 /// Pure-math gates (run by `--check`, DLL- and GPU-free).
 ///
 /// Depth half: `clip_depth` IS the z-mapping of the `perspective_lh` matrix

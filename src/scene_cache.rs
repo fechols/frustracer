@@ -109,7 +109,11 @@ use std::path::{Path, PathBuf};
 // the class byte both persist in the sidecar). (Authored as v16 in
 // parallel with the foliage v16-v19 lineage and renumbered onto it at
 // rebase — no sidecar was ever written under the other numbering's key.)
-pub const CACHE_VERSION: u32 = 20;
+// v20 -> v21: the loaded-scene ground quad moved to -GROUND_DROP (it used to
+// z-fight every model face on the rest plane), so cached positions are stale
+// under the same key; the coincident-cull's index rewrite rides the lever
+// word (bit 6), not this bump.
+pub const CACHE_VERSION: u32 = 21;
 const MAGIC: [u8; 8] = *b"FRSCACH\x01";
 
 /// Fixed on-disk material, `MatKind` flattened into (kind, param) — Marble
@@ -178,6 +182,9 @@ fn lever_word() -> u32 {
         // The water class refines the fountain's material (tint/ior/ripple +
         // no albedo lift), baked into the cached materials.
         | (crate::scene::water_enabled() as u32) << 4
+        // Coincident-cull rewrites the cached index/tri_mat streams (drops
+        // transmissive faces coincident with opaque ones).
+        | (crate::scene::coincident_cull_enabled() as u32) << 6
         // Foliage sway (the attach predicate): the sweep pads the BUILT
         // tree's leaf AABBs — the height_armed class. The sweep MAGNITUDE
         // additionally rides `sway_word` below (an f32 doesn't fit a bit).

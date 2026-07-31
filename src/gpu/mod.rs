@@ -485,6 +485,13 @@ struct NgxFgState {
     /// bit-for-bit, so water reflections strobe on generated frames again on
     /// demand.
     ripplemv_off: bool,
+    /// FR_NGXFG_TONEMAP — the range-compression probe (see
+    /// `ngxfg_guides::TonePass` for the full diagnosis this exists to settle).
+    /// 0 = off (the shipped stream, byte-identical), 1 = `scale`, 2 =
+    /// `reinhard`. `tone` is None whenever the mode is 0 or the pass failed to
+    /// build, so the dispatch site needs only the one Option check.
+    tone_mode: u8,
+    tone: Option<std::cell::RefCell<ngxfg_guides::TonePass>>,
     /// LAST SUCCESSFULLY EVALUATED frame's ripple clock — the prev half of
     /// the round-4 pair, updated beside `primed` for exactly the reason
     /// `prev_ff` is: it must name the frame the NGX feature actually
@@ -1299,6 +1306,65 @@ impl GpuContext {
                              generated frames (expect rippling reflections to strobe)"
                         );
                     }
+                    // FR_NGXFG_TONEMAP — which curve shapes the color handed
+                    // to NGX. DEFAULT reinhard (2026-07-31): the flow
+                    // estimator needs a display-curve-shaped input, and
+                    // reinhard is the measured-correct arm parked AND rotating
+                    // (see ngxfg_guides::TonePass for the elimination record).
+                    // `off` is the kill arm — raw linear rr.output, the
+                    // sun-disc strobe returns on demand; `scale`/`log` stay as
+                    // the diagnostic arms. Parsed by hand rather than through
+                    // `lever` above: that closure's 0 means
+                    // unset-or-unrecognized, which cannot express a nonzero
+                    // default. The numeric modes are pinned to the HLSL
+                    // (1 = scale, 3 = log, else reinhard; 0 never reaches the
+                    // shader — `tone` is None).
+                    let tone_mode: u8 = match std::env::var("FR_NGXFG_TONEMAP") {
+                        Err(_) => 2,
+                        Ok(s) => match s.to_ascii_lowercase().as_str() {
+                            "off" => 0,
+                            "scale" => 1,
+                            "reinhard" => 2,
+                            "log" => 3,
+                            other => {
+                                eprintln!(
+                                    "fg: FR_NGXFG_TONEMAP={other} unrecognized (legal: \
+                                     off|scale|reinhard|log) — using the default (reinhard)"
+                                );
+                                2
+                            }
+                        },
+                    };
+                    let tone = if tone_mode == 0 {
+                        eprintln!(
+                            "fg: FR_NGXFG_TONEMAP=off — raw linear radiance to the NGX \
+                             evaluate (expect the sun disc to strobe on generated frames)"
+                        );
+                        None
+                    } else {
+                        match tone_mode {
+                            1 => eprintln!(
+                                "fg: FR_NGXFG_TONEMAP=scale — linear range scale to the \
+                                 evaluate (expect the disc to double-ghost under rotation)"
+                            ),
+                            3 => eprintln!(
+                                "fg: FR_NGXFG_TONEMAP=log — log compression to the \
+                                 evaluate (expect ghosting + banding)"
+                            ),
+                            _ => {} // reinhard — the default, silent
+                        }
+                        match ngxfg_guides::TonePass::new(&d3d.device) {
+                            Ok(t) => Some(std::cell::RefCell::new(t)),
+                            Err(e) => {
+                                eprintln!(
+                                    "fg: tone pass creation failed ({e}) — raw linear \
+                                     radiance to the evaluate (expect the sun disc to \
+                                     strobe on generated frames)"
+                                );
+                                None
+                            }
+                        }
+                    };
                     Some(NgxFgState {
                         out,
                         handle: std::cell::Cell::new(std::ptr::null_mut()),
@@ -1322,6 +1388,8 @@ impl GpuContext {
                         prev_ff: std::cell::Cell::new(crate::fireflies::Fireflies::off()),
                         ripplemv_off,
                         prev_clock: std::cell::Cell::new(None),
+                        tone_mode,
+                        tone,
                     })
                 }
                 Err(e) => {
@@ -4957,6 +5025,30 @@ impl GpuContext {
                 transition(&n.out, psr, uav),
             ]);
         }
+        // FR_NGXFG_TONEMAP probe: compress rr.output into the scratch and hand
+        // NGX that instead. Deliberately AFTER the barrier above — that is what
+        // puts rr.output into NON_PIXEL_SHADER_RESOURCE, the state a COMPUTE
+        // SRV read requires (leaving it PSR is the exact debug-layer error the
+        // bloom pyramid documents, and GBV-only, so it would go unnoticed).
+        let tone_color = match &n.tone {
+            Some(tp) => {
+                let mut tpm = tp.borrow_mut();
+                match tpm.ensure(&self.d3d.device, rr.ow, rr.oh, &rr.output, &n.out) {
+                    Ok(()) => {
+                        tpm.record_compress(list, n.tone_mode);
+                        unsafe {
+                            list.ResourceBarrier(&[transition(tpm.scratch(), uav, npsr)]);
+                        }
+                        Some(tpm.scratch().as_raw())
+                    }
+                    Err(e) => {
+                        eprintln!("fg: FR_NGXFG_TONEMAP ensure failed ({e}) — probe off this frame");
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
         // Matrix majority: `row_major` matches what shim_constants hands SL,
         // but SL's closed plugin may itself transpose before setting the
         // DLSSG params — quinlight's identity matrices were transpose-
@@ -4976,7 +5068,10 @@ impl GpuContext {
         };
         let d = ngxfg::FrDlssgDispatch {
             cmdlist: list.as_raw(),
-            color: rr.output.as_raw(),
+            // The probe swaps ONLY this: the compressed scratch in place of the
+            // linear rr.output. Every other field is byte-identical, which is
+            // what makes it an A/B of one variable.
+            color: tone_color.unwrap_or_else(|| rr.output.as_raw()),
             motion: motion_res,
             depth: depth_res,
             output: n.out.as_raw(),
@@ -5027,6 +5122,19 @@ impl GpuContext {
             depth_inverted: 0,
         };
         let r = unsafe { ngxfg::frdlssg_dispatch(n.handle.get(), &d) };
+        // Undo the compression IN PLACE on the NGX output, while it is still
+        // UNORDERED_ACCESS. Presentation therefore needs no second path: the
+        // tonemap reads n.out and sees linear values exactly as it does with
+        // the probe off. Also hands the scratch back to UAV for next frame.
+        if tone_color.is_some() {
+            if let Some(tp) = &n.tone {
+                let tpm = tp.borrow();
+                tpm.record_expand(list, &n.out, n.tone_mode);
+                unsafe {
+                    list.ResourceBarrier(&[transition(tpm.scratch(), npsr, uav)]);
+                }
+            }
+        }
         unsafe {
             list.ResourceBarrier(&[
                 transition(&rr.output, npsr, psr),

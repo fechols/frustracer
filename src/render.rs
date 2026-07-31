@@ -1482,6 +1482,45 @@ impl SampleId {
     }
 }
 
+/// The per-pixel rng seed for a primary sample: a pure function of (pixel,
+/// frame, sample), so no two pixels share a stream and a replay at the same
+/// frame reproduces it exactly. Shared with `fill_sky_rows`, which must draw
+/// from the SAME stream a leaf tile would at that pixel — that is what keeps
+/// `cs_sky` and `reference.hlsl` (which has no sky tiles and traces every
+/// pixel through `sample_pos`) in agreement in the legacy-jitter arm.
+fn primary_seed(x: usize, y: usize, frame: u32, sample: SampleId) -> u64 {
+    (x as u64)
+        .wrapping_mul(0x9E3779B97F4A7C15)
+        .wrapping_add((y as u64).wrapping_mul(0xC2B2AE3D27D4EB4F))
+        .wrapping_add(frame as u64)
+        .wrapping_add(sample.salt())
+}
+
+/// Sample 0's sub-pixel offset — THE declared-position rule, and the reason
+/// this is a function rather than an inlined match: every temporal consumer is
+/// told ONE jitter offset for the whole frame, so every path that writes
+/// meta/G-buffers must place its sample where that offset says. Sky tiles used
+/// to hard-code the pixel center here while the frame declared a Halton offset
+/// anyway; a reconstructor told a sample moved sub-pixel when it did not places
+/// that content differently every frame (see `fill_sky_rows`).
+///
+/// The rng arm declares nothing to anyone — it is plain accumulation's own
+/// antialiasing — but it stays in the shared rule so there is exactly one
+/// convention to reason about, and `verify_sampled`'s registration gate can
+/// check every path against it.
+fn first_sample_offset(ctx: &FrameCtx, rng: &mut fastrand::Rng) -> (f32, f32) {
+    match ctx.frame_jitter {
+        Some((ox, oy)) => (0.5 + ox, 0.5 + oy),
+        None => {
+            if ctx.jitter {
+                (rng.f32(), rng.f32())
+            } else {
+                (0.5, 0.5)
+            }
+        }
+    }
+}
+
 fn trace_primary(
     ctx: &FrameCtx,
     x: usize,
@@ -1491,11 +1530,7 @@ fn trace_primary(
     ls: &mut LocalStats,
     sample: SampleId,
 ) -> Traced {
-    let seed = (x as u64)
-        .wrapping_mul(0x9E3779B97F4A7C15)
-        .wrapping_add((y as u64).wrapping_mul(0xC2B2AE3D27D4EB4F))
-        .wrapping_add(ctx.frame as u64)
-        .wrapping_add(sample.salt());
+    let seed = primary_seed(x, y, ctx.frame, sample);
     let mut rng = fastrand::Rng::with_seed(seed);
     // DLSS mode: one frame-uniform low-discrepancy offset for every pixel
     // (the denoiser is told this exact offset). Legacy: per-pixel rng.
@@ -1511,16 +1546,7 @@ fn trace_primary(
             (0.5 + ox, 0.5 + oy)
         }
         SampleId::Topup => (rng.f32(), rng.f32()),
-        SampleId::First => match ctx.frame_jitter {
-            Some((ox, oy)) => (0.5 + ox, 0.5 + oy),
-            None => {
-                if ctx.jitter {
-                    (rng.f32(), rng.f32())
-                } else {
-                    (0.5, 0.5)
-                }
-            }
-        },
+        SampleId::First => first_sample_offset(ctx, &mut rng),
     };
     let (fx, fy) = (x as f32 + jx, y as f32 + jy);
     let dir = ctx.cam.ray_dir(fx, fy);
@@ -1815,11 +1841,23 @@ fn sparse_fill(
                     // — the write helpers subtract (fx, fy), so the camera-
                     // motion part of the MV stays per-pixel-correct even in
                     // coarse cells.
+                    //
+                    // The two branches need DIFFERENT directions, and the
+                    // asymmetry is the point. A hit reprojects a shared WORLD
+                    // POINT, so the cell sample's `s.dir` (which is what located
+                    // that point) is correct and each pixel's own (fx, fy)
+                    // supplies the per-pixel part. A sky pixel has no world
+                    // point: its MV is a pure function of ITS OWN direction, so
+                    // `dir` must stay the preimage of the (fx, fy) being
+                    // subtracted. Passing `s.dir` there — a direction from a
+                    // pixel up to SAMPLE_CELL away, re-randomized every frame —
+                    // made the MV (and the stored `-dir` normal) wrong by a
+                    // per-frame-random multi-pixel offset.
                     let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
                     if s.t.is_finite() {
                         write_gbuf_hit(ctx, x, y, fx, fy, s.dir, s.t, s.tri, &s.prim, s.c);
                     } else {
-                        write_gbuf_sky(ctx, x, y, fx, fy, s.dir, s.c);
+                        write_gbuf_sky(ctx, x, y, fx, fy, ctx.cam.ray_dir(fx, fy), s.c);
                     }
                 }
             }
@@ -1844,7 +1882,23 @@ fn fill_sky_rows(ctx: &FrameCtx, x0: usize, y0: usize, x1: usize, y1: usize, dep
     let spp = ctx.spp();
     for y in y0..y1 {
         for x in x0..x1 {
-            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
+            // Sample 0 sits where the FRAME SAYS it sits. A proven-empty tile
+            // traces no rays, but it still writes this pixel's color and
+            // G-buffers, and every temporal consumer (RR / XeSS / FSR / the NGX
+            // frame-generation evaluate) is told one sub-pixel offset for the
+            // whole frame. Hard-coding the center here while declaring a Halton
+            // offset anyway is a REGISTRATION lie: the motion vector stays
+            // correct (it subtracts whatever position we pass), but the
+            // reconstructor places this content at center+jitter when it was
+            // sampled at center, and the jitter moves every frame. Same rule,
+            // same rng stream, as a leaf pixel at these coordinates.
+            let mut rng =
+                fastrand::Rng::with_seed(primary_seed(x, y, ctx.frame, SampleId::First));
+            let (jx, jy) = first_sample_offset(ctx, &mut rng);
+            let (fx, fy) = (x as f32 + jx, y as f32 + jy);
+            // The pixel CENTER, kept separately: the extra --spp samples stay
+            // anchored to it (see the SKY_J block below).
+            let (cx, cy) = (x as f32 + 0.5, y as f32 + 0.5);
             let dir = ctx.cam.ray_dir(fx, fy);
             // The pixel's cloud march phase — per (pixel, frame, SAMPLE),
             // mirroring the per-pixel sample loops: the center rides sample
@@ -1882,27 +1936,42 @@ fn fill_sky_rows(ctx: &FrameCtx, x0: usize, y0: usize, x1: usize, y1: usize, dep
                     ctx.cam.pixel_cone() * 0.5,
                 );
             }
-            // A proven-empty tile has always shaded ONE center direction, spp
-            // or not — sound while the sky was smooth at sub-pixel scale. The
-            // cloud layer broke that premise (a cover-ramp edge crosses a
-            // pixel), so under clouds a multi-sampled frame averages spp
-            // sample positions — still ZERO rays, sample 0 still the center,
-            // side channels still the center's. The extra DIRECTION offsets
-            // are the PHASE-0 Halton set, deliberately frame-INDEPENDENT like
-            // the center itself (the sky fill antialiases a static function;
-            // per-frame offsets put inter-frame dither on cloud edges, which
-            // the spp stability gate rightly rejects at night, where nothing
-            // louder masks it — a lesson about the direction SET only: the
-            // march PHASE below is per-sample and frame-keyed, symmetric
-            // across spp levels, which that gate accepts). The guard keeps
-            // spp == 1 and --no-clouds on the old path VERBATIM, and the GPU
-            // twin (cs_sky + the injected SKY_J table) mirrors the loop term
-            // for term — the spp wavefront-vs-reference image A/B at frame 0
-            // is the gate.
+            // A proven-empty tile has always shaded ONE direction, spp or not
+            // — sound while the sky was smooth at sub-pixel scale. The cloud
+            // layer broke that premise (a cover-ramp edge crosses a pixel), so
+            // under clouds a multi-sampled frame averages spp sample positions
+            // — still ZERO rays, and side channels still sample 0's.
+            //
+            // The extras are the PHASE-0 Halton set, frame-INDEPENDENT and
+            // ANCHORED TO THE CENTER (`cx, cy`), deliberately NOT translated
+            // with sample 0. Both halves of that are load-bearing at night,
+            // where nothing louder masks the sky and the spp stability gate
+            // (spp=4 must be strictly quieter than spp=1) has teeth. Writing d
+            // for the per-frame offset and \/f for the sky's screen gradient,
+            // the first-order inter-frame difference is:
+            //
+            //   extras move, sample 0 fixed   spp1 0            spp4 (d0-d1)*\/f
+            //   whole set translated rigidly  spp1 (d0-d1)*\/f  spp4 (d0-d1)*\/f
+            //   THIS: sample 0 moves, anchored spp1 (d0-d1)*\/f spp4 (d0-d1)*\/f / 4
+            //
+            // Only the last row leaves spp=4 quieter: averaging over a rigidly
+            // translated stratified set does not attenuate a translation, it
+            // only attenuates the aliasing residual. The first row is the
+            // configuration this comment used to record as rejected — and it
+            // is rejected for the same arithmetic, not for a different reason.
+            // It also matches the multi-sampling contract: sample 0 owns every
+            // side channel, the extras are footprint supersamples that declare
+            // nothing. The march PHASE below is per-sample and frame-keyed,
+            // symmetric across spp levels, which that gate accepts.
+            //
+            // The guard keeps spp == 1 and --no-clouds on the old path
+            // VERBATIM, and the GPU twin (cs_sky + the injected SKY_J table)
+            // mirrors the loop term for term — the spp wavefront-vs-reference
+            // image A/B at frame 0 is the gate.
             if ctx.clouds.enabled && spp > 1 {
                 for k in 1..spp {
                     let (ox, oy) = dlss::jitter_for_sample(0, k);
-                    let dk = ctx.cam.ray_dir(fx + ox, fy + oy);
+                    let dk = ctx.cam.ray_dir(cx + ox, cy + oy);
                     c += crate::sky::radiance(
                         ctx.cam.origin,
                         dk,

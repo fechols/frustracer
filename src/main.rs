@@ -428,6 +428,7 @@ fn main() {
     scene::set_spray(opts.spray);
     scene::set_depth_tint(opts.depth_tint);
     scene::set_water(opts.water);
+    scene::set_coincident_cull(opts.coincident_cull);
     // One field, BOTH statics — which is what keeps `--no-heightfield
     // --heightfield` a true arm, and what the headless `--check*` paths depend
     // on (they read `height_on()` directly, with no session() to re-seed it).
@@ -857,6 +858,9 @@ fn load_scene(req: &SceneRequest) -> LoadedScene {
                     scene::derive_heights(&mut s);
                     // Spray reclassification, same cold-load-only placement.
                     scene::reclassify_spray(&mut s);
+                    // Coincident-cull AFTER spray (a retagged-opaque droplet
+                    // can then legitimately absorb a coincident glass twin).
+                    scene::cull_coincident(&mut s);
                     // Foliage-sway partition: AFTER the class bytes/spray
                     // settle, BEFORE the build below — the sweep
                     // (bvh::grow_sway_sweep) reads it, and the stored sidecar
@@ -3419,6 +3423,44 @@ fn run_check_gpu(
         eprintln!("check-gpu: FAIL converged radiance means differ by more than 2%");
         ok = false;
     }
+    // FR_CHECK_AB_DUMP=1 — read-only diagnostic (the FR_ABL probe idiom):
+    // dump the converged CPU/GPU images + a per-pixel relative-diff heatmap,
+    // so a failing mean can be ATTRIBUTED spatially (which material/region
+    // diverges) instead of guessed at. No gate reads these files.
+    if std::env::var_os("FR_CHECK_AB_DUMP").is_some() {
+        let tone8 = |v: f32| {
+            let t = (1.0 - (-v.max(0.0)).exp()).powf(1.0 / 2.2);
+            (t * 255.0 + 0.5) as u8
+        };
+        let mut cimg = Vec::with_capacity(px * 3);
+        let mut gimg = Vec::with_capacity(px * 3);
+        let mut dimg = Vec::with_capacity(px * 3);
+        for p in 0..px {
+            let mut da = 0.0f32;
+            let mut ma = 0.0f32;
+            for ch in 0..3 {
+                let c = f32::from_bits(accum[p * 3 + ch].load(Relaxed)) * inv;
+                let g = gpu_acc[p * 3 + ch] * inv;
+                cimg.push(tone8(c));
+                gimg.push(tone8(g));
+                da += (c - g).abs();
+                ma += c.abs() + g.abs();
+            }
+            // Relative diff, x4 gain: 25% divergence saturates the heatmap.
+            let r = ((da / (ma * 0.5).max(1e-3)) * 4.0 * 255.0).min(255.0) as u8;
+            dimg.extend_from_slice(&[r, r, r]);
+        }
+        for (name, buf) in
+            [("check_ab_cpu.png", &cimg), ("check_ab_gpu.png", &gimg), ("check_ab_diff.png", &dimg)]
+        {
+            if let Err(e) =
+                image::save_buffer(name, buf, gw as u32, gh as u32, image::ColorType::Rgb8)
+            {
+                eprintln!("check-gpu: ab dump {name} failed: {e}");
+            }
+        }
+        eprintln!("check-gpu: ab dump written (check_ab_cpu/gpu/diff.png)");
+    }
 
     // T3: the resolve pass (accum -> RGBA16F, the tonemap PS's input) —
     // texel == accum/samples within f16 precision. This is the present
@@ -5333,6 +5375,226 @@ fn run_check_gpu(
                 ) {
                     ok = false;
                 }
+                // FR_CHECK_AB_DUMP — read-only diagnostic (the radiance-dump
+                // family): render the SAME frame on the CPU with the FSR
+                // signal capture armed and print per-term means over the
+                // ripple-live (water) pixels — dd/ds/ao/is/residual/color,
+                // CPU vs GPU. Splits a water shading divergence into the
+                // estimator that carries it. Not a gate.
+                if std::env::var_os("FR_CHECK_AB_DUMP").is_some() {
+                    // Frame B (the fixed 0.02*diag dolly) can be ALL SKY at a
+                    // custom --cam pose (the mv_selftest caveat class), so the
+                    // decomposition re-traces FRAME A with the sig capture
+                    // still armed and compares against a CPU frame at the
+                    // same pose.
+                    let pa = gpu::trace::FrameParams {
+                        sway_prev_time: None,
+                        cam: basis_a,
+                        frame: 0,
+                        accumulate: false,
+                        jitter: false,
+                        frame_jitter: Some((0.0, 0.0)),
+                        prev_cam: None,
+                        q: uq,
+                        verify: false,
+                        spp: 1,
+                        probe_sample: 0,
+                        clouds: crate::clouds::Clouds::check(scene.diag),
+                        fireflies: crate::fireflies::Fireflies::check(scene),
+                        sway_time: check_sway,
+                        replay: false,
+                    };
+                    ptg.write_cb(0, &pa);
+                    if let Err(e) = hg.run(|l| ptg.record_wavefront(l, 0, &pa, false)) {
+                        eprintln!("check-gpu: ab dump frame-A re-trace failed: {e}");
+                        return 1;
+                    }
+                    let (pack2, pack2_ext, accum2) = match (
+                        hg.read_buffer(&ptg.gbuf, ua, pw * ph * gpu::trace::GBUF_STRIDE as usize),
+                        hg.read_buffer(
+                            &ptg.gbuf_ext,
+                            ua,
+                            pw * ph * gpu::trace::GBUF_EXT_STRIDE as usize,
+                        ),
+                        hg.read_buffer(&ptg.accum, ua, pw * ph * 12),
+                    ) {
+                        (Ok(a), Ok(e), Ok(b)) => (a, e, b),
+                        _ => {
+                            eprintln!("check-gpu: ab dump frame-A readback failed");
+                            return 1;
+                        }
+                    };
+                    // Re-run the feed so f_res matches frame A's pack.
+                    let mut f_rec = Ok(());
+                    if let Err(e) = hg.run(|l| f_rec = ptg.record_feed(l, 0, false)) {
+                        eprintln!("check-gpu: ab dump frame-A feed submit failed: {e}");
+                        return 1;
+                    }
+                    if let Err(e) = f_rec {
+                        eprintln!("check-gpu: ab dump frame-A feed failed: {e}");
+                        return 1;
+                    }
+                    let f_res = match read_feed_tex(&mut hg, fpl[8].0, fpl[8].1, 8, pw, ph) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("check-gpu: ab dump residual readback failed: {e}");
+                            return 1;
+                        }
+                    };
+                    let stats = Stats::default();
+                    let c_accum: Vec<AtomicU32> =
+                        (0..pw * ph * 3).map(|_| AtomicU32::new(0)).collect();
+                    let c_info: Vec<AtomicU32> = (0..pw * ph).map(|_| AtomicU32::new(0)).collect();
+                    let c_tbuf: Vec<AtomicU32> = (0..pw * ph).map(|_| AtomicU32::new(0)).collect();
+                    let cg2 = dlss::GBufs::new(pw, ph);
+                    let cfb = fsr::FsrBufs::new(pw, ph);
+                    let cctx = FrameCtx {
+                        sway_mv: None,
+                        scene,
+                        bvh,
+                        cam: basis_a,
+                        q: uq,
+                        frame: 0,
+                        jitter: false,
+                        rw: pw,
+                        rh: ph,
+                        accum: &c_accum,
+                        info: &c_info,
+                        tbuf: &c_tbuf,
+                        stats: &stats,
+                        sun: render::sun_dir(scene),
+                        clouds: crate::clouds::Clouds::check(scene.diag),
+                        fireflies: crate::fireflies::Fireflies::check(scene),
+                        tcache_cur: None,
+                        tcache_prev: &[],
+                        accumulate: false,
+                        gbuf: Some(&cg2),
+                        fsr_buf: Some(&cfb),
+                        prev_cam: None,
+                        frame_jitter: Some((0.0, 0.0)),
+                        spp: 1,
+                        primary_sample: 0,
+                        adaptive: false,
+                        hemi_share: false,
+                        replay_rec: None,
+                        cut_cur: None,
+                        cut_prev: None,
+                        discard_seeds: false,
+                        defer_shade: false,
+                    };
+                    // Crossing-count parity: the GPU's CTR_TRANS_PASS from
+                    // the frame-A re-trace vs the CPU twin over its frame.
+                    // Structurally both fire the same occlusion rays, so the
+                    // totals compare raw; a duplicate-candidate class shows
+                    // as a GPU/CPU ratio well above 1.
+                    let gpu_tp = match read_u32(&mut hg, &ptg.counters, gpu::trace::CTR_COUNT as usize)
+                    {
+                        Ok(c) => c[gpu::trace::CTR_TRANS_PASS as usize] as u64,
+                        Err(_) => 0,
+                    };
+                    let cpu_tp0 = bvh::TRANS_PASS.load(Relaxed);
+                    render::render_frame(&cctx, true);
+                    let cpu_tp = bvh::TRANS_PASS.load(Relaxed) - cpu_tp0;
+                    eprintln!(
+                        "check-gpu: ab dump trans-pass counts: cpu {cpu_tp} | gpu {gpu_tp} | ratio {:.3}",
+                        gpu_tp as f64 / cpu_tp.max(1) as f64
+                    );
+                    let elanes = gpu::trace::GBUF_EXT_STRIDE as usize / 4;
+                    let clanes = gpu::trace::GBUF_STRIDE as usize / 4;
+                    let ext_u = |i: usize, l: usize| {
+                        u32::from_le_bytes(pack2_ext[(i * elanes + l) * 4..][..4].try_into().unwrap())
+                    };
+                    let ext_f = |i: usize, l: usize| f32::from_bits(ext_u(i, l));
+                    let core_f = |i: usize, l: usize| {
+                        f32::from_le_bytes(pack2[(i * clanes + l) * 4..][..4].try_into().unwrap())
+                    };
+                    let accf = |b: &[u8], i: usize| {
+                        f32::from_le_bytes(b[i * 4..][..4].try_into().unwrap())
+                    };
+                    let h = |w: u32, hi: bool| {
+                        half::f16::from_bits(if hi { (w >> 16) as u16 } else { w as u16 }).to_f32()
+                            as f64
+                    };
+                    // [cpu, gpu] per term, channel-summed over water px.
+                    let mut m = [[0.0f64; 2]; 6]; // dd ds ao is residual color
+                    let mut wpx = 0usize;
+                    let (mut n_sky, mut n_rip0) = (0usize, 0usize);
+                    let mut peek = 0usize;
+                    for i in 0..pw * ph {
+                        if core_f(i, 2).to_bits() == far.to_bits() {
+                            n_sky += 1;
+                            continue;
+                        }
+                        if ext_f(i, 7) <= 0.0 {
+                            n_rip0 += 1;
+                            if peek < 4 && i % 977 == 0 {
+                                peek += 1;
+                                eprintln!(
+                                    "  ab dump water terms peek px {i}: lane7 raw {:#010x} | alb {:.3},{:.3},{:.3} | view_z {:.3}",
+                                    ext_u(i, 7), ext_f(i, 4), ext_f(i, 5), ext_f(i, 6), core_f(i, 2)
+                                );
+                            }
+                            continue;
+                        }
+                        wpx += 1;
+                        let sig = [ext_u(i, 12), ext_u(i, 13), ext_u(i, 14)];
+                        let sig2 = [ext_u(i, 16), ext_u(i, 17)];
+                        for ch in 0..3 {
+                            m[0][0] += dlss::ld16(&cfb.dd[i * 3 + ch]) as f64;
+                            m[1][0] += dlss::ld16(&cfb.ds[i * 3 + ch]) as f64;
+                            m[3][0] += dlss::ld16(&cfb.is[i * 3 + ch]) as f64;
+                            m[4][0] += f32::from_bits(cfb.residual[i * 3 + ch].load(Relaxed)) as f64;
+                            m[5][0] += f32::from_bits(c_accum[i * 3 + ch].load(Relaxed)) as f64;
+                            m[4][1] += half::f16::from_bits(u16::from_le_bytes(
+                                f_res[i * 8 + ch * 2..][..2].try_into().unwrap(),
+                            ))
+                            .to_f32() as f64;
+                            m[5][1] += accf(&accum2, i * 3 + ch) as f64;
+                        }
+                        m[0][1] += h(sig[0], false) + h(sig[0], true) + h(sig[1], false);
+                        m[1][1] += h(sig[1], true) + h(sig[2], false) + h(sig[2], true);
+                        m[2][0] += dlss::ld16(&cfb.ao[i]) as f64;
+                        m[2][1] += h(sig2[0], false);
+                        m[3][1] += h(sig2[0], true) + h(sig2[1], false) + h(sig2[1], true);
+                    }
+                    // Spatial map of the transmitted-term divergence:
+                    // |residual_cpu - residual_gpu| per pixel, x8 gain.
+                    let mut rimg = Vec::with_capacity(pw * ph * 3);
+                    for i in 0..pw * ph {
+                        let mut da = 0.0f32;
+                        for ch in 0..3 {
+                            let rc = f32::from_bits(cfb.residual[i * 3 + ch].load(Relaxed));
+                            let rg = half::f16::from_bits(u16::from_le_bytes(
+                                f_res[i * 8 + ch * 2..][..2].try_into().unwrap(),
+                            ))
+                            .to_f32();
+                            da += (rc - rg).abs();
+                        }
+                        let v = (da * 8.0 * 255.0).min(255.0) as u8;
+                        rimg.extend_from_slice(&[v, v, v]);
+                    }
+                    if let Err(e) = image::save_buffer(
+                        "check_ab_resdiff.png",
+                        &rimg,
+                        pw as u32,
+                        ph as u32,
+                        image::ColorType::Rgb8,
+                    ) {
+                        eprintln!("check-gpu: resdiff dump failed: {e}");
+                    }
+                    let d = (wpx.max(1) * 3) as f64;
+                    let d1 = wpx.max(1) as f64;
+                    eprintln!("  ab dump water terms: sky {n_sky} | ripple0 {n_rip0}");
+                    eprintln!(
+                        "check-gpu: ab dump water terms ({wpx} px, mean cpu | gpu): dd {:.4}|{:.4} ds {:.4}|{:.4} ao {:.4}|{:.4} is {:.4}|{:.4} residual {:.4}|{:.4} color {:.4}|{:.4}",
+                        m[0][0] / d, m[0][1] / d,
+                        m[1][0] / d, m[1][1] / d,
+                        m[2][0] / d1, m[2][1] / d1,
+                        m[3][0] / d, m[3][1] / d,
+                        m[4][0] / d, m[4][1] / d,
+                        m[5][0] / d, m[5][1] / d,
+                    );
+                }
             }
 
             // --- M10: the NPPD GPU staging kernels + DML interop ---
@@ -6907,6 +7169,46 @@ fn albedo_ab_check(
         "check-{tag}: albedo A/B ({pw}x{ph}): mean |d| {:.4}/{:.4}/{:.4} over {n} px | distinct GPU albedos {} | glass px {glass_px}",
         mean(0), mean(1), mean(2), distinct.len(),
     );
+    // FR_CHECK_AB_DUMP — read-only diagnostic beside the radiance dump: on
+    // ripple-lane-live (water) pixels, compare the pack's SHADING normal
+    // (n_s post-ripple) against the CPU's, plus each side's own tilt off the
+    // geometric up. Splits "the GPU ripple field is flat/mismatched" from
+    // "normals agree, the divergence is in the rays". Not a gate.
+    if std::env::var_os("FR_CHECK_AB_DUMP").is_some() && !gpu_g.ripple_amp.is_empty() {
+        let ldn = |g: &dlss::GBufs, i: usize| {
+            glam::Vec3A::new(
+                dlss::ld16(&g.normal_rough[i * 4]),
+                dlss::ld16(&g.normal_rough[i * 4 + 1]),
+                dlss::ld16(&g.normal_rough[i * 4 + 2]),
+            )
+            .normalize_or_zero()
+        };
+        let (mut wpx, mut d_ang, mut c_tilt, mut g_tilt) = (0usize, 0.0f64, 0.0f64, 0.0f64);
+        for i in 0..pw * ph {
+            if dlss::ld16(&gpu_g.ripple_amp[i]) <= 0.0 || !gpu_t[i].is_finite() {
+                continue;
+            }
+            let cn = ldn(&cg, i);
+            let gn = ldn(gpu_g, i);
+            if cn == glam::Vec3A::ZERO || gn == glam::Vec3A::ZERO {
+                continue;
+            }
+            wpx += 1;
+            let up = glam::Vec3A::Y;
+            d_ang += cn.dot(gn).clamp(-1.0, 1.0).acos() as f64;
+            c_tilt += cn.dot(up).clamp(-1.0, 1.0).acos() as f64;
+            g_tilt += gn.dot(up).clamp(-1.0, 1.0).acos() as f64;
+        }
+        if wpx > 0 {
+            let m = wpx as f64;
+            eprintln!(
+                "check-{tag}: ab dump ripple normals ({wpx} px): mean cpu-vs-gpu angle {:.4} rad | mean tilt cpu {:.4} gpu {:.4}",
+                d_ang / m, c_tilt / m, g_tilt / m
+            );
+        } else {
+            eprintln!("check-{tag}: ab dump ripple normals: no ripple-live px");
+        }
+    }
     let mut pass = true;
     if mean(0) > 0.02 || mean(1) > 0.02 || mean(2) > 0.02 {
         eprintln!("check-{tag}: FAIL textured albedo off the CPU render (flat-Kd regression?)");
@@ -10721,6 +11023,20 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
     };
 
+    // Coincident-cull gates — a transmissive face bit-coincident with an
+    // opaque face drops (any winding); trans-over-trans and non-coincident
+    // faces survive; lever-off is a structural no-op.
+    let ccull_ok = match scene::coincident_self_test() {
+        Ok(()) => {
+            eprintln!("coincident-cull self-test: OK");
+            true
+        }
+        Err(e) => {
+            eprintln!("coincident-cull self-test: FAIL — {e}");
+            false
+        }
+    };
+
     // Depth-tint math gates — the Beer–Lambert closed-form anchors (seg 0 ⇒
     // exactly ONE, seg D_ref ⇒ exactly albedo, monotone, white passthrough).
     let depth_tint_ok = match shade::depth_tint_self_test() {
@@ -11287,6 +11603,177 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         eprintln!("spp stability: FAIL — spp={SPP_GATE} must be measurably quieter than spp=1");
         spp_ok = false;
     }
+
+    // SAMPLE-POSITION REGISTRATION. Every temporal consumer (DLSS-RR, XeSS,
+    // FSR, the NGX frame-generation evaluate) is told ONE sub-pixel jitter for
+    // the whole frame, so every path that shades a pixel must place sample 0
+    // where that offset says. Proven-empty sky tiles used to hard-code the
+    // pixel center while the frame declared a Halton offset anyway — the
+    // motion vector stayed correct (it subtracts whatever position it is
+    // handed) but the reconstructor placed the content at center+jitter when
+    // it was sampled at center, and the jitter moves every frame.
+    //
+    // NO MOTION-VECTOR GATE CAN SEE THIS, which is why it sat here: under a
+    // pure translation the direction reprojection of a sky ray is the identity,
+    // so the center-shading renderer writes `c - c = 0` and a correctly
+    // registered one writes `d - d = 0`. Both are zero. It is observable only
+    // in COLOR — and exactly observable, because the hybrid sky-tile flood
+    // (`fill_sky_rows`) and the plain per-pixel path (`shade_pixel`'s miss arm)
+    // hand `sky::radiance` byte-identical arguments. At spp == 1 the two are
+    // therefore BIT-IDENTICAL on any pixel both call sky iff their sample
+    // positions agree, so this compares the two arms under a real nonzero
+    // declared jitter and demands exact equality. The plain arm has no sky
+    // tiles at all, which is what makes it the oracle.
+    //
+    // spp == 1 deliberately: above it the two arms' EXTRA samples legitimately
+    // differ (the sky fill anchors SKY_J to the pixel center, the plain path
+    // takes the frame's own Halton phase), and those samples declare nothing.
+    //
+    // TEETH, MEASURED: pinning the sky fill back to (0.5, 0.5) — the pre-fix
+    // behavior — fails this at 120000 of 138954 sky px, worst rel 2.49e-1.
+    // Not a marginal gate; a center-shading arm cannot sneak past it.
+    let sky_reg_ok = {
+        // A real offset, both axes, neither zero nor symmetric — a center-
+        // shading arm must not pass by landing back on the center.
+        const JIT: (f32, f32) = (0.3125, -0.4375);
+        let render = |hybrid: bool| -> (Vec<f32>, Vec<f32>) {
+            let accum: Vec<AtomicU32> = (0..rw * rh * 3).map(|_| AtomicU32::new(0)).collect();
+            let info: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
+            let tbuf: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
+            let ctx = FrameCtx {
+                sway_mv: None,
+                scene,
+                bvh,
+                cam,
+                q,
+                frame: 0,
+                jitter: false,
+                rw,
+                rh,
+                accum: &accum,
+                info: &info,
+                tbuf: &tbuf,
+                stats: &stats,
+                sun: render::sun_dir(scene),
+                clouds: crate::clouds::Clouds::check(scene.diag),
+                fireflies: crate::fireflies::Fireflies::check(scene),
+                tcache_cur: None,
+                tcache_prev: &[],
+                accumulate: false,
+                gbuf: None,
+                fsr_buf: None,
+                prev_cam: None,
+                frame_jitter: Some(JIT),
+                spp: 1,
+                primary_sample: 0,
+                adaptive: false,
+                hemi_share: false,
+                replay_rec: None,
+                cut_cur: None,
+                cut_prev: None,
+                discard_seeds: false,
+                defer_shade: false,
+            };
+            render::render_frame(&ctx, hybrid);
+            (
+                accum.iter().map(|a| f32::from_bits(a.load(Relaxed))).collect(),
+                tbuf.iter().map(|a| f32::from_bits(a.load(Relaxed))).collect(),
+            )
+        };
+        let (ah, th) = render(true);
+        let (ap, tp) = render(false);
+        let (mut sky_px, mut bad, mut worst) = (0u64, 0u64, 0.0f32);
+        for i in 0..rw * rh {
+            // Sky in BOTH arms — classification agreement is the false-sky /
+            // hybrid-extra gates' job, not this one's.
+            if th[i].is_finite() || tp[i].is_finite() {
+                continue;
+            }
+            sky_px += 1;
+            let mut px_bad = false;
+            for c in 0..3 {
+                let (x, y) = (ah[i * 3 + c], ap[i * 3 + c]);
+                if x.to_bits() != y.to_bits() {
+                    px_bad = true;
+                    worst = worst.max((x - y).abs() / y.abs().max(1e-6));
+                }
+            }
+            bad += px_bad as u64;
+        }
+        eprintln!(
+            "sky registration (jitter {:+.4},{:+.4}): {sky_px} sky px | mismatched {bad} | worst rel {worst:.3e} -> {}",
+            JIT.0,
+            JIT.1,
+            if bad == 0 { "OK" } else { "FAIL" }
+        );
+        // Anti-vacuity: a pose with no proven-empty sky would pass this while
+        // proving nothing. The default check pose has sky by construction.
+        if structural && sky_px == 0 {
+            eprintln!("sky registration: FAIL — no sky pixels (gate would be vacuous)");
+            false
+        } else {
+            bad == 0
+        }
+    };
+    spp_ok &= sky_reg_ok;
+
+    // The same contract on a CAPPED frame, which is the only way to reach
+    // `sparse_fill`'s coarse flood — the path that used to write each coarse
+    // sky pixel's MV and `-dir` normal from the cell sample's direction (a
+    // pixel up to SAMPLE_CELL away, re-randomized every frame) against this
+    // pixel's own position. Full-depth frames never build a coarse cell, so
+    // `mv_selftest`'s own sky arm cannot see it.
+    //
+    // TEETH, MEASURED: restoring the `s.dir` pass-through fails this at 15107
+    // of 137636 coarse sky px, worst 3.46e-2 rad — 7x the limit, and the ~2e-2
+    // the +/-SAMPLE_CELL displacement predicts.
+    let sky_coarse_ok = {
+        let accum: Vec<AtomicU32> = (0..rw * rh * 3).map(|_| AtomicU32::new(0)).collect();
+        let info: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
+        let tbuf: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
+        let g = dlss::GBufs::new(rw, rh);
+        let ctx = FrameCtx {
+            sway_mv: None,
+            scene,
+            bvh,
+            cam,
+            q,
+            frame: 0,
+            jitter: false,
+            rw,
+            rh,
+            accum: &accum,
+            info: &info,
+            tbuf: &tbuf,
+            stats: &stats,
+            sun: render::sun_dir(scene),
+            clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
+            tcache_cur: None,
+            tcache_prev: &[],
+            accumulate: false,
+            gbuf: Some(&g),
+            fsr_buf: None,
+            prev_cam: None,
+            frame_jitter: None,
+            spp: 1,
+            primary_sample: 0,
+            adaptive: false,
+            hemi_share: false,
+            replay_rec: None,
+            cut_cur: None,
+            cut_prev: None,
+            discard_seeds: false,
+            defer_shade: false,
+        };
+        render::render_frame_capped(&ctx, 4);
+        let (_, far) = dlss::near_far(scene.diag);
+        // must_fire = structural: the sky-px anti-vacuity half follows the
+        // suite convention (the registration gate above makes the same
+        // choice) — a skyless loaded-scene/--cam pose skips, never fails.
+        dlss::sky_dir_check("sky coarse dir (capped d=4)", &g, &cam, far, structural)
+    };
+    spp_ok &= sky_coarse_ok;
 
     // Hemisphere frustum AO: soundness gates (reference rays re-validate
     // every empty-cell claim and leaf-ray tmin on a deterministic probe set —
@@ -13023,6 +13510,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         ("height", height_ok),
         ("tinted-shadow", tinted_ok),
         ("spray", spray_ok),
+        ("coincident-cull", ccull_ok),
         ("depth-tint", depth_tint_ok),
         ("sh", sh_ok),
         ("sky", sky_ok),
