@@ -12605,10 +12605,40 @@ fn vendor_defaults(opts: &mut Opts, vendor: gpu::adapter::Vendor) {
     // grounds (H/R/C/O, >=spp-3, the replay win at rest) are untouched by
     // resolution and are what would keep it.
     //
-    // AMD is deliberately absent: this box's only AMD adapter is an iGPU
-    // (~22x slower, useless as a signal), so RDNA has no measurement here and
-    // therefore keeps the cross-vendor default. Do not extend this to a vendor
-    // on inference — measure it or leave it out.
+    // AMD: MEASURED, and it keeps the cross-vendor DXR default — so there is
+    // no arm for it below. This paragraph used to say "RDNA has no measurement
+    // here" because the box had only an AMD iGPU; it has since gained a Radeon
+    // AI PRO R9700 (Navi 48, RDNA4), so that debt is paid with numbers.
+    // `--spin path` 1080p, GPU frame span, medians (the R9700 repeats within
+    // 0.0-0.6%, B70-class determinism, nothing like the NVIDIA spread):
+    // ```text
+    //                      wavefront    DXR(inline 1)   DXR/wavefront
+    //   spp=1  default        0.638        0.370            0.58x
+    //   spp=1  stress 5000    0.901        0.484            0.54x
+    //   spp=1  san-miguel-lp  0.663        0.396            0.60x
+    //   spp=16 default        6.966        4.715            0.68x
+    //   spp=16 stress 5000   10.420        6.621            0.64x
+    //   spp=16 san-miguel-lp  7.509        4.954            0.66x
+    // ```
+    // DXR wins on every scene at every spp, by 1.5x-1.9x, so there is no vendor
+    // rule to add. The Intel entry below exists because its ratio CROSSES one;
+    // AMD's is not close on any scene.
+    //
+    // TWO CORRECTIONS worth keeping, because both were natural inferences and
+    // both were wrong. (1) The 2026-07-24 numbers put san-miguel-lp at 0.29x,
+    // far outside the other rows; that outlier was the AMD candidate-loop TMin
+    // defect (`gpu::trace::cand_defs`) inflating the WAVEFRONT column ~2x on
+    // textured scenes, and it closes to 0.60x once fixed — in line with the
+    // rest. Any AMD wavefront number on a textured scene taken before that fix
+    // is contaminated. (2) The coarse leaf frontier (LEAF_TILE 8 -> 32,
+    // LEAF_GROUP 32 -> 256) roughly halved wavefront cost on Intel, so it
+    // looked like these ratios must have moved toward 1; re-measured, they did
+    // not move on the untextured scenes at all. Do not interpolate this table
+    // across a tracer change — re-run it (`--spin path --gpu/--dxr
+    // --prefer-amd`, 600-frame multiples, `--gpu-timing`).
+    //
+    // The standing rule is unchanged and still applies to the next vendor: do
+    // not extend this to a vendor on inference — measure it or leave it out.
     //
     // NOTE the pair this leaves behind: `gpu` AND `dxr` both true. That is not
     // the contradictory state the argument parser rejects ("--gpu --dxr", where

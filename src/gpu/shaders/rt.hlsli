@@ -34,6 +34,63 @@ struct HitInfo {
 // intersect_from and preventing the wider enumeration from accepting an
 // out-of-segment hit.
 
+// CAND_TMIN0 — the AMD candidate-loop TMin workaround (trace.rs injects it on
+// an AMD adapter; see cand_defs there for the vendor gate and the measurement).
+//
+// IT LIVES OUTSIDE THE CUTOUT/RELIEF GUARD BELOW ON PURPOSE. Its callers do
+// not share one condition: trace_closest/occluded_q are inside that guard, but
+// transmit_q is under `#ifdef TRANS_SHADOW` — an INDEPENDENT per-scene arm — so
+// defining it inside would leave a glass-bearing scene with no alpha-masked
+// texture (an ordinary architectural OBJ: windows, opaque materials) failing to
+// compile every ray-shooting kernel on `undeclared identifier 'cand_tmin'`.
+// That shipped for exactly as long as it took to review, because every gated
+// scene happens to carry BOTH arms or NEITHER (san-miguel and THE WORLD have
+// foliage; procedural/stress/powerplant have no transmissive material at all),
+// and `FR_ABL=noalpha` on san-miguel is what reproduces it. The shader-source
+// test in trace.rs pins the ordering so it cannot come back.
+//
+// THE BUG, measured on a Radeon AI PRO R9700: in an inline RayQuery driven by
+// a Proceed() candidate loop, a NONZERO r.TMin makes the reported hit distance
+// come back as `t_true + TMin`. AMD's RT hardware re-origins the ray at TMin
+// (documented in CLAUDE.md, and normally invisible); on this path the driver
+// appears to add that offset back to a value that already carried it, so the
+// error is exactly +TMin and shows up in CandidateTriangleRayT/CommittedRayT
+// alike. NVIDIA, same source, same scene, is bit-exact.
+//
+// It is not cosmetic: the wavefront's leaf primaries pass the tile's inherited
+// t_start as TMin, so on any alpha-cutout or relief scene EVERY hit pixel got
+// a t that was ~6.5 units long on san-miguel-low-poly — which moves the shading
+// point (p = o + d*t), the G-buffer view-z, and the motion vectors. It read as
+// `tmin-overshoot 341393 | max rel t err 8.70e-1 | mv_selftest median 8.428e-1`
+// in --check-gpu --prefer-amd, with `claim-violation 0` throughout: the
+// empty-space proof was always sound, only the reported distance was wrong.
+//
+// THE FIX is the one this file already implements for relief: hand the hardware
+// the full positive ray and let the loop's own `ct > tmin && ct < tmax` re-check
+// enforce the logical interval. With TMin = 0 there is no re-origining, so
+// there is no offset to get wrong — which makes this robust to whatever the
+// driver does rather than a compensation that would silently invert if AMD
+// fixes it (subtracting TMin back off would then read t TOO SMALL, the
+// false-near-hit direction). TMax is left alone: it is not implicated, and
+// keeping it bounds traversal.
+//
+// The cost is the near-prune: candidates in [0, tmin) now surface and are
+// rejected by the loop instead of being culled by the hardware. That is
+// affordable precisely HERE, because the inherited bound is already measured
+// "free and worth nothing" on AMD (it re-origins rather than prunes) — the
+// same hardware property that causes the bug pays for the workaround.
+//
+// Unarmed it is `height_tmin` verbatim, so the FORCE_OPAQUE arms below (which
+// take the raw tmin, having no candidate loop to re-check anything) stay the
+// only paths that bypass the relief interval — as before.
+float cand_tmin(float logical_tmin) {
+#ifdef CAND_TMIN0
+    return 0.0;
+#else
+    return height_tmin(logical_tmin);
+#endif
+}
+
 #if defined(ALPHA_CUTOUT) || defined(HEIGHTFIELD)
 
 // Anti-vacuity stat: cutout/relief rejections, counted only by compile units
@@ -56,7 +113,7 @@ void count_height_rej() {
 bool trace_closest(float3 o, float3 d, float tmin, float tmax, out HitInfo h) {
     h = (HitInfo)0;
     RayDesc r;
-    r.Origin = o; r.Direction = d; r.TMin = height_tmin(tmin); r.TMax = height_tmax(tmax);
+    r.Origin = o; r.Direction = d; r.TMin = cand_tmin(tmin); r.TMax = height_tmax(tmax);
     RayQuery<RAY_FLAG_NONE> q;
     q.TraceRayInline(tlas, RAY_FLAG_NONE, 0xffu, r);
     while (q.Proceed()) {
@@ -97,7 +154,7 @@ bool trace_closest(float3 o, float3 d, float tmin, float tmax, out HitInfo h) {
 bool occluded_q(float3 o, float3 d, float tmin, float tmax) {
     if (tmax <= tmin) return false;
     RayDesc r;
-    r.Origin = o; r.Direction = d; r.TMin = height_tmin(tmin); r.TMax = height_tmax(tmax);
+    r.Origin = o; r.Direction = d; r.TMin = cand_tmin(tmin); r.TMax = height_tmax(tmax);
     RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
     q.TraceRayInline(tlas, RAY_FLAG_NONE, 0xffu, r);
     while (q.Proceed()) {
@@ -168,7 +225,7 @@ void count_trans_pass() {
 float3 transmit_q(float3 o, float3 d, float tmin, float tmax) {
     if (tmax <= tmin) return float3(1.0, 1.0, 1.0);
     RayDesc r;
-    r.Origin = o; r.Direction = d; r.TMin = height_tmin(tmin); r.TMax = height_tmax(tmax);
+    r.Origin = o; r.Direction = d; r.TMin = cand_tmin(tmin); r.TMax = height_tmax(tmax);
     // ACCEPT_FIRST_HIT still applies — but only to COMMITTED hits, and only
     // opaque candidates commit: a transmissive candidate multiplies the
     // running tint and is NOT committed, so traversal keeps enumerating.

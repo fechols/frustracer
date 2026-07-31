@@ -2781,6 +2781,41 @@ pub(crate) fn trans_defs(scene: &Scene) -> &'static str {
     if scene.any_transmissive && !abl_has("notrans") { "#define TRANS_SHADOW 1" } else { "" }
 }
 
+/// The AMD candidate-loop TMin workaround — see `rt.hlsli::cand_tmin` for the
+/// bug, the evidence, and why the fix is shaped this way. This is the gate.
+///
+/// Vendor-keyed, and deliberately NOT routed through `main::vendor_defaults`:
+/// that table is for PREFERENCES (which render mode a vendor starts in) and its
+/// bar is "measure it or leave it out". This is a correctness workaround for a
+/// driver defect; it keys off the PICKED adapter rather than a `--prefer-*`
+/// request that can fall back, and it costs nothing to arm on a scene that
+/// cannot hit the bug — the helper it feeds is `height_tmin` verbatim unarmed,
+/// and the FORCE_OPAQUE arms it never reaches compile byte-identically.
+///
+/// `FR_ABL=nocandtmin` disarms it, which reproduces the bug on demand: that is
+/// the A/B that produced the +TMin evidence, and it is the first thing to run
+/// if a future driver claims to have fixed this.
+///
+/// SCOPE, and why the DXR pipeline deliberately does NOT take it (dxr.rs builds
+/// its own define list and omits this one). The error is +TMin, so it only
+/// matters where TMin is materially large — and the ONLY such rays in the tree
+/// are the wavefront's leaf primaries, which pass the tile's inherited t_start.
+/// Every other candidate-loop ray (shadow, AO, the reflection/glass
+/// continuations, DXR's inline secondaries) passes an eps-scale tmin, so the
+/// offset is eps-scale too, and the hardware still culls below TMin correctly,
+/// so nothing is mis-classified. Measured, not assumed: `--check-dxr
+/// --prefer-amd` on san-miguel-low-poly reads `max rel t err 8.70e-6` — clean —
+/// against the wavefront's 8.70e-1 on the same scene and adapter. Arming DXR
+/// would make every secondary enumerate candidates from 0 instead of eps, a
+/// real cost on AMD's DEFAULT render mode, to fix nothing measurable.
+pub(crate) fn cand_defs() -> &'static str {
+    if adapter::picked_vendor() == adapter::Vendor::Amd && !abl_has("nocandtmin") {
+        "#define CAND_TMIN0 1"
+    } else {
+        ""
+    }
+}
+
 /// Does the BLAS have to drop `GEOMETRY_FLAG_OPAQUE`?
 ///
 /// Exactly when some conditional-hit feature compiled in — so it is DERIVED
@@ -4123,11 +4158,12 @@ impl TraceGpu {
         // too so the two arms stay comparable.
         let empty_def = empty_defs(scene);
         let defs = format!(
-            "{}\n{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}",
             empty_def,
             alpha_defs(scene),
             height_defs(scene),
             trans_defs(scene),
+            cand_defs(),
             blas_defs(),
             abl_defs()
         );
@@ -6553,9 +6589,58 @@ mod height_interval_shader_source_tests {
         for src in [RT_HLSLI, RT_DXR_HLSLI] {
             assert!(!src.contains("tmin - height_max"));
             assert!(!src.contains("tmax + height_max"));
-            assert!(src.contains("height_tmin(tmin)"));
             assert!(src.contains("height_tmax(tmax)"));
         }
+        // rt.hlsli reaches the relief interval through `cand_tmin`, which the
+        // AMD candidate-loop workaround also hooks. The relief arm must survive
+        // that indirection: the unarmed fallback has to BE height_tmin, or a
+        // non-AMD build silently loses the widened interval and relief regresses
+        // at grazing incidence with every gate still green.
+        assert!(RT_HLSLI.contains("r.TMin = cand_tmin(tmin);"));
+        let cand = RT_HLSLI
+            .split_once("float cand_tmin(float logical_tmin) {")
+            .expect("cand_tmin helper must exist")
+            .1
+            .split_once('}')
+            .expect("cand_tmin must have a body")
+            .0;
+        assert!(cand.contains("#ifdef CAND_TMIN0"));
+        assert!(cand.contains("return 0.0;"));
+        assert!(cand.contains("return height_tmin(logical_tmin);"));
+        assert!(RT_DXR_HLSLI.contains("height_tmin(tmin)"));
+
+        // SCOPE, not merely existence — and this one shipped broken. The three
+        // callers do NOT share a preprocessor condition: trace_closest and
+        // occluded_q live inside `#if defined(ALPHA_CUTOUT) || defined(HEIGHTFIELD)`,
+        // but transmit_q is under the INDEPENDENT `#ifdef TRANS_SHADOW`. Defining
+        // the helper inside the first guard therefore compiles fine for every
+        // scene that carries both arms or neither — which is every gated scene
+        // (san-miguel and THE WORLD have foliage; procedural/stress/powerplant
+        // have no transmissive material) — and fails on the ordinary
+        // glass-without-cutout scene with `undeclared identifier 'cand_tmin'`,
+        // taking out every ray-shooting kernel at TraceGpu init.
+        // `FR_ABL=noalpha` on san-miguel is the repro.
+        let def = RT_HLSLI
+            .find("float cand_tmin(float logical_tmin) {")
+            .expect("cand_tmin helper must exist");
+        let guard = RT_HLSLI
+            .find("#if defined(ALPHA_CUTOUT) || defined(HEIGHTFIELD)")
+            .expect("the cutout/relief guard must exist");
+        assert!(
+            def < guard,
+            "cand_tmin must be defined AHEAD of the cutout/relief guard — \
+             transmit_q calls it from the independent TRANS_SHADOW arm"
+        );
+        let calls: Vec<usize> = RT_HLSLI
+            .match_indices("r.TMin = cand_tmin(tmin);")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            calls.len(),
+            3,
+            "trace_closest, occluded_q and transmit_q must all route TMin through cand_tmin"
+        );
+        assert!(calls[0] > def, "every cand_tmin call must follow its definition");
 
         assert!(RT_HLSLI.contains("ct > tmin && ct < tmax"));
         assert!(RT_DXR_HLSLI.contains("p.tmin = tmin"));
