@@ -414,7 +414,59 @@ const SKY_SPLIT: u32 = 128;
 /// but the 4090 spread is 1.42-1.98 for one unchanged config, and a naive
 /// single-shot sweep "showed" a 9-16% NVIDIA REGRESSION that three interleaved
 /// reps erase completely. Same lesson the spp bench row already carries.
-const WIDE_LEVELS: u32 = 6;
+///
+/// 6 -> 7 (2026-07-31). The old value was UNFALSIFIABLE at the resolution it
+/// was measured at, which is the part worth not repeating: at 1920x1080 on the
+/// shipping `LEAF_TILE` = 32, `depth_full` is 6, so the ladder runs levels 0..5
+/// and `d < 6`, `d < 7`, `d < 99` are the SAME PREDICATE. Every value >= 6 is
+/// one config there. The constant only bites at 4K (`depth_full` 7) and 8K (8),
+/// where level 6 — and only level 6 — falls off the cooperative kernel.
+///
+/// THE MEASUREMENT ROUTE, because `--spin` cannot reach 4K (`W`/`H` are consts
+/// and `run_spin_gpu` clamps `--lock-res` to <= 1.0): move the FRONTIER instead
+/// of the resolution. `depth_full` is the smallest D with
+/// max(rw,rh)/2^D <= leaf_tile(), so the two enter ONLY through that ratio, and
+/// a level-d tile's frustum is a pure function of (d, camera, aspect) — its
+/// rect spans rw/2^d and `ray_dir` divides by rw — with a count of <= 4^d. So
+/// `FR_LEAF=16` at 1080p reproduces the 4K LADDER exactly (same levels, same
+/// tile counts, same frustums) and `FR_LEAF=8` the 8K one; only the leaf/sky
+/// pixel work below differs, and that is a separate timing region held fixed
+/// across the A/B. Confirmed empirically: levels 0..4 measure BYTE-IDENTICAL
+/// across all three frontiers, and levels 0..5 across the whole `FR_WIDE`
+/// sweep — the lever moves only the level it names.
+///
+/// Ladder ms, 3 reps interleaved, medians (R9700 repeats within 0.3%):
+/// ```text
+///   FR_LEAF=16 (== 4K, levels 0..6)      WIDE 6   WIDE 7
+///     R9700 default                       0.147    0.133    -9.5%
+///     R9700 stress 5000                   0.229    0.178   -22.3%
+///     R9700 san-miguel-lp                 0.119    0.104   -12.6%
+///     4070 Ti default                     0.212    0.195    -8.0%
+///     4070 Ti stress 5000                 0.362    0.276   -23.8%
+///     4070 Ti san-miguel-lp               0.162    0.145   -10.5%
+/// ```
+/// Level 6 ALONE goes 0.029 -> 0.015 / 0.067 -> 0.016 / 0.029 -> 0.014 on the
+/// R9700 (2-4x), with `leaf` unmoved to within 0.6% — the built-in control that
+/// pins the win to the ladder. Frame span follows at -1.7/-4.7/-2.3%.
+///
+/// WHY NOT 8, measured on the same route (`FR_LEAF=8`, levels 0..7): level 7 is
+/// SCENE-DEPENDENT where level 6 is not. R9700 level 7 serial -> wide reads
+/// 0.119 -> 0.032 on stress but 0.018 -> 0.031 on default and 0.011 -> 0.028 on
+/// san-miguel — wide LOSES on two of three. That is the crossover this constant
+/// exists to name, and the mechanism is the one the doc above argues: level 7
+/// holds up to 4^7 = 16384 tiles, which already fills the machine one-thread-per
+/// -tile, so a whole group each only pays where the per-tile descent stays long
+/// (`--stress`'s 5000 sparse objects). It is also exactly where the B70
+/// collapse recorded above lives — that row was necessarily taken at the old
+/// `LEAF_TILE` = 8 frontier, since 1080p/32 cannot tell 6 from 8 apart.
+///
+/// SO THE RISK LEDGER: at 1080p this is a PROVABLE no-op on every vendor (same
+/// predicate; measured identical ladder, span within 0.5%), and it deliberately
+/// leaves level 7 serial. Unmeasured: Intel at `depth_full` >= 7 — no B70 in
+/// the box at the time — so a 4K Arc session is the one arm running on the
+/// cross-vendor level-6 result rather than its own. Re-sweep with `FR_LEAF=16`
+/// if one is available; that is the whole experiment.
+const WIDE_LEVELS: u32 = 7;
 
 /// R&D lever (`FR_WIDE`): the crossover LEVEL itself, not just on/off.
 ///
@@ -423,22 +475,33 @@ const WIDE_LEVELS: u32 = 6;
 /// the doc above argues a crossover EXISTS and pins it with a two-point sweep
 /// (0 vs 6) that never tested the levels either side of the value it shipped.
 ///
-/// **This needs re-sweeping, and the reason is instructive.** That two-point
-/// table, and an RDNA4 sweep done on top of it (which found 7 better than 6 by
-/// 5.6-10.1% on an R9700, by halving what was then the ladder's most expensive
-/// level), were both measured when `LEAF_TILE` was 8 — i.e. `depth_full` = 8 at
-/// 1080p, so levels 6 and 7 existed and were the first two to fall off the wide
-/// kernel. At today's `LEAF_TILE` = 32, `depth_full(1920, 1080)` is **6**: the
-/// levels are 0..5, `d < 6` and `d < 99` are the SAME PREDICATE, "7" would be a
-/// literal no-op, and where the crossover sits under a coarse frontier is
-/// simply unmeasured. Sweep it here rather than reasoning about it.
+/// **It has now been swept, and the reason it needed to be is instructive.**
+/// The 0-vs-6 table above, and an RDNA4 sweep done on top of it (which found 7
+/// better than 6 by 5.6-10.1% on an R9700, by halving what was then the
+/// ladder's most expensive level), were both measured when `LEAF_TILE` was 8 —
+/// i.e. `depth_full` = 8 at 1080p, so levels 6 and 7 existed and were the first
+/// two to fall off the wide kernel. At today's `LEAF_TILE` = 32,
+/// `depth_full(1920, 1080)` is **6**: the levels are 0..5, and every value >= 6
+/// is one indistinguishable config. So the shipped value was a ceiling nothing
+/// reached at 1080p and the crossover under a coarse frontier was unmeasured.
 ///
-/// The crossover is an ABSOLUTE level, not `depth_full - 1`: what decides a
-/// level is its TILE COUNT (a level holds at most 4^d tiles, and the private
-/// DFS starts winning once the serial kernel has enough tiles to fill the
-/// machine with short descents), not its distance from the leaf frontier.
-/// Deriving it from `depth_full` would make the deepest level serial at every
-/// resolution, which measured -15.8% WORSE at 960x540.
+/// That old sweep turns out to have been RIGHT and merely inapplicable: this
+/// lever composed with `FR_LEAF` reproduces its exact configuration
+/// (`FR_LEAF=8`), and level 6 there still measures 0.095 -> 0.041 ms wide on
+/// R9700 stress — the halving it reported. What had changed was not the
+/// hardware's preference but which levels the shipping frontier creates. A perf
+/// constant is only as good as the tree it was measured on, and the cheapest
+/// guard is to make the lever able to RECREATE the old tree: `FR_LEAF` +
+/// `FR_WIDE` together span every ladder depth the renderer can produce, at one
+/// resolution, with no 4K path required. See `WIDE_LEVELS` for the route and
+/// the resulting 6 -> 7.
+///
+/// The crossover is an ABSOLUTE level, not `depth_full - 1`, and that much did
+/// survive: what decides a level is its TILE COUNT (a level holds at most 4^d
+/// tiles, and the private DFS starts winning once the serial kernel has enough
+/// tiles to fill the machine with short descents), not its distance from the
+/// leaf frontier. Deriving it from `depth_full` would make the deepest level
+/// serial at every resolution, which measured -15.8% WORSE at 960x540.
 ///
 /// 0 == `--no-wide-levels`; a value past `depth_full` makes every level wide.
 /// Read by both consumers — the ExecuteIndirect ladder and the work graph's
