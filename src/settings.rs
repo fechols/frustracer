@@ -987,7 +987,7 @@ pub fn menu_items() -> &'static [MenuItem] {
             item!("hybrid", "hybrid tracer (R)", "Renderer", Live, Toggle { default: true }, ((|_| None), (|_, _| {}))),
             item!("dynamic", "dynamic res (T, CPU mode)", "Renderer", Live, Toggle { default: true }, ((|_| None), (|_, _| {}))),
             item!("height_on", "relief rendering (V, armed only)", "Renderer", Live, Toggle { default: false }, ((|_| None), (|_, _| {}))),
-            item!("lock_res", "render res lock", "Renderer", Restart, Cycle { options: &["quality", "balanced", "performance", "ultra-performance", "native", "dynamic"], default_ix: 0 }, acc_str!(renderer.lock_res)),
+            item!("lock_res", "render res lock", "Renderer", Restart, Cycle { options: &["quality", "balanced", "performance", "ultra-performance", "native", "dynamic"], default_ix: 4 }, acc_str!(renderer.lock_res)),
             item!("heightfield", "arm heightfield relief", "Renderer", Restart, Toggle { default: false }, acc_bool!(renderer.heightfield)),
             // ── Upscaler
             item!("chain", "upscaler chain start", "Upscaler", Restart, Cycle { options: &["auto", "dlss", "fsr4", "fsr3", "xess", "none"], default_ix: 0 }, acc_str!(upscaler.chain)),

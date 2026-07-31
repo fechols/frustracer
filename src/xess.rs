@@ -58,8 +58,8 @@ pub const INIT_FLAGS: u32 = XESS_INIT_FLAG_INVERTED_DEPTH;
 /// init-time setting fixes the LOWER end of the dynamic input range —
 /// measured on SDK 2.0.2: QUALITY yields min == its own 1.7x scale (no
 /// downward headroom for heavy scenes), ULTRA_PERFORMANCE opens the full
-/// [~1/3 scale .. native] span. The controller starts at ~2/3 scale
-/// regardless (main.rs), so this only widens the relief valve.
+/// [~1/3 scale .. native] span. The controller starts where the default lock
+/// would sit regardless (main.rs), so this only widens the relief valve.
 pub const QUALITY_SETTING: i32 = 100;
 
 // ---------------------------------------------------------------------------
@@ -214,20 +214,26 @@ pub fn quantize_res(
     (width_for_height(rh, out, min.0, max.0), rh)
 }
 
-/// The render scale every mode locks at by default — the standard DLSS
-/// "quality" ratio. ONE value for the CPU tracer, `--gpu` and `--dxr` alike:
+/// The render scale every mode locks at by default — native 100%
+/// (DLAA-shaped: the wired upscaler still denoises/antialiases, it just
+/// doesn't upscale). ONE value for the CPU tracer, `--gpu` and `--dxr` alike:
 /// the upscalers are the reconstruction stage in all three, so the arm that
 /// happens to be live is not a reason to change how many pixels get traced
 /// (F/SPACE cycling between arms therefore no longer moves the render res).
-pub const DEFAULT_LOCK_SCALE: f32 = 2.0 / 3.0;
+/// Was the DLSS "quality" 2/3 ratio until 2026-07-31; `--lock-res quality`
+/// spells that arm now, and every perf number recorded at "the quality
+/// default" between 2026-07-26 and then carries the 0.444x-pixels offset.
+pub const DEFAULT_LOCK_SCALE: f32 = 1.0;
 
 /// --lock-res argument -> fixed render scale (both upscaler paths consume it
 /// through `quantize_res`, which range-clamps). Named presets are the
-/// standard DLSS ratios; a bare number is accepted as a ratio in (0, 1] —
+/// standard DLSS ratios — "quality" is deliberately the literal 2/3, NOT
+/// `DEFAULT_LOCK_SCALE` (the default moved to native; the preset vocabulary
+/// must not move with it); a bare number is accepted as a ratio in (0, 1] —
 /// the filter also rejects NaN.
 pub fn lock_scale(arg: &str) -> Option<f32> {
     match arg {
-        "quality" => Some(DEFAULT_LOCK_SCALE),
+        "quality" => Some(2.0 / 3.0),
         "balanced" => Some(0.58),
         "performance" => Some(0.5),
         "ultra-performance" => Some(1.0 / 3.0),

@@ -158,7 +158,7 @@ pub struct Opts {
     /// the 2×2-cell shadow/AO sharing and HOT top-ups are disabled).
     pub adaptive: bool,
     /// Lock the DLSS/XeSS render resolution to this fixed scale of the
-    /// window (default `xess::DEFAULT_LOCK_SCALE` = quality 2/3;
+    /// window (default `xess::DEFAULT_LOCK_SCALE` = native 100%;
     /// `--lock-res dynamic` -> None = the step-wise dynamic-resolution
     /// controller). CLI-only, no runtime toggle — T prints the locked note.
     /// ONE scale for every render mode: the CPU tracer, `--gpu` and `--dxr`
@@ -1699,7 +1699,7 @@ pub fn usage() {
                 eprintln!("                They average into ONE per-pixel value — a ~1/N-variance frame for the");
                 eprintln!("                upscaler/denoiser. Pinned to 1 on hemisphere-bounce (H) frames");
                 eprintln!("  --lock-res    DLSS/XeSS render res: quality|balanced|performance|ultra-performance|native,");
-                eprintln!("                a ratio in (0, 1], or dynamic (the step-wise DRS controller); default quality (2/3)");
+                eprintln!("                a ratio in (0, 1], or dynamic (the step-wise DRS controller); default native (100%)");
                 eprintln!("  --xess-path   XeSS DLL directory (default: SDKs\\XeSS-SDK\\bin)");
                 eprintln!("  --prefer-nvidia | --prefer-intel | --prefer-amd");
                 eprintln!("                pick that vendor's adapter for the D3D12 device (default NVIDIA, or AMD");
