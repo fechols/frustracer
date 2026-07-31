@@ -1299,6 +1299,7 @@ fn write_gbuf_hit(
             view_z: t * dir.dot(ctx.cam.forward()),
             mv,
             spec_hit_t: if prim.spec_t.is_infinite() { far } else { prim.spec_t },
+            ripple_amp: prim.ripple_amp,
         },
     );
     write_fsr(ctx, x, y, dir, t, tri, prim, c);
@@ -1399,6 +1400,7 @@ fn write_gbuf_sky(ctx: &FrameCtx, x: usize, y: usize, fx: f32, fy: f32, dir: Vec
             view_z: far,
             mv,
             spec_hit_t: 0.0,
+            ripple_amp: 0.0,
         },
     );
     // `c` is this pixel's presented color, which for a sky pixel IS the sky

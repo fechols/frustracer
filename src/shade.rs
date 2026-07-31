@@ -112,6 +112,13 @@ pub struct PrimarySurface {
     /// Specular-reflection ray hit t; INFINITY when the reflection ray
     /// missed; 0.0 when no reflection was traced.
     pub spec_t: f32,
+    /// The material's ripple amplitude (0.0 for everything but water). It is
+    /// carried purely so the frame-generation guide pass can tell which
+    /// pixels have a MOVING mirror normal: water's reflected image slides
+    /// across the surface every frame with no motion in the geometry, and a
+    /// guide pass that cannot see that warps it with the (zero) surface MV.
+    /// Riding the pack costs nothing — `GBufExt.alb.w` was an unused lane.
+    pub ripple_amp: f32,
     /// Open fraction of the ambient-occlusion tier, i.e. the `ao` that
     /// `ambient = AMBIENT * ao` was built from — FSR Ray Regeneration's
     /// AMBIENT_OCCLUSION signal (0 = fully occluded, 1 = fully exposed).
@@ -631,6 +638,7 @@ pub fn shade(
             roughness: rough_eff,
             metallic: metal_eff,
             spec_t: 0.0,
+            ripple_amp: mat.ripple_amp,
             direct_d: Vec3A::ZERO,
             direct_s: Vec3A::ZERO,
             // Both are filled below, when their tier runs; the zeros are the

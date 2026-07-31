@@ -44,6 +44,10 @@ pub struct GPixel {
     /// Specular (mirror reflection) hit distance in world units; `far` when
     /// the reflection ray missed, 0 when no reflection was traced.
     pub spec_hit_t: f32,
+    /// The material's ripple amplitude — nonzero only on water. Read by the
+    /// frame-generation guide pass, which needs to know the mirror normal is
+    /// MOVING; every other consumer ignores it. See `shade::PrimarySurface`.
+    pub ripple_amp: f32,
 }
 
 /// Per-pixel G-buffers as atomic bit patterns — writes are tile-disjoint, so
@@ -77,6 +81,9 @@ pub struct GBufs {
     pub mvec: Vec<AtomicU16>,
     /// 1/px specular hit distance.
     pub spec_hit_t: Vec<AtomicU16>,
+    /// 1/px ripple amplitude (water tag for the FG guide pass). A guide
+    /// plane, so the slim variant leaves it zero-length like the rest.
+    pub ripple_amp: Vec<AtomicU16>,
 }
 
 impl GBufs {
@@ -102,6 +109,7 @@ impl GBufs {
             depth: (0..rw * rh).map(|_| AtomicU32::new(0)).collect(),
             mvec: alloc(rw * rh * 2),
             spec_hit_t: guide(rw * rh),
+            ripple_amp: guide(rw * rh),
         }
     }
 
@@ -164,6 +172,7 @@ impl GBufs {
             st16(&self.spec_alb[i * 3 + 1], p.spec_alb.y);
             st16(&self.spec_alb[i * 3 + 2], p.spec_alb.z);
             st16(&self.spec_hit_t[i], p.spec_hit_t);
+            st16(&self.ripple_amp[i], p.ripple_amp);
         }
         self.depth[i].store(p.view_z.to_bits(), Relaxed);
         st16(&self.mvec[i * 2], p.mv.0);

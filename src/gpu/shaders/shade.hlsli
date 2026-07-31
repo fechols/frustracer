@@ -491,6 +491,7 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
             prim.rough = rough_eff;
             prim.albedo = albedo;
             prim.metallic = metal_eff;
+            prim.ripple_amp = mat.ripple_amp;
         }
 
         float3 f0 = lerp(float3(0.04, 0.04, 0.04), albedo, metal_eff);

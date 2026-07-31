@@ -108,6 +108,7 @@ Texture2D<float>  hitsrc : register(t2); // reflection-ray hit distance (P_SPEC_
 Texture2D<float4> dalb   : register(t3); // diffuse albedo, linear (P_ALBEDO)
 Texture2D<float4> salb   : register(t4); // specular albedo / F0, linear (P_SPEC_ALBEDO)
 Texture2D<float4> nrough : register(t5); // normal.xyz + roughness.w (P_NORMAL_ROUGH)
+Texture2D<float>  ripsrc : register(t6); // water ripple amplitude, 0 elsewhere (P_RIPPLE)
 RWTexture2D<float>  zdst  : register(u0); // [0,1] clip depth out
 RWTexture2D<float2> mvdst : register(u1); // FG motion vectors out
 cbuffer C : register(b0) {
@@ -117,7 +118,8 @@ cbuffer C : register(b0) {
     float4 fwd;  // unit forward
     float4 rgt;  // right * tan(fov/2) * aspect (CamBasis pre-scaling)
     float4 upv;  // up * tan(fov/2)
-    uint   rmv; float cam_far; float2 _pad;
+    uint   rmv; float cam_far; float t_cur; float t_prev; // ripple clock (rides the old _pad)
+    float  diag; uint ripplemv; float2 _pad2;
 }
 // Round 3: the CPU-baked firefly splat table (FfTable — layout in lockstep,
 // see the size assert beside it). ffc == 0 is the structural off.
@@ -162,8 +164,56 @@ void cs_guides(uint3 id : SV_DispatchThreadID) {
         // column dropped (a w = 0 homogeneous point), which yields exactly the
         // rotation-only reprojection the sky deserves.
         bool sky_refl = t_r >= cam_far;
-        float3 V = org.xyz + du * (ray_t + t_r); // planar-unfold virtual point
-        float4 pc = sky_refl ? (m0 * du.x + m1 * du.y + m2 * du.z)
+        float3 hit_p = org.xyz + du * ray_t;
+        // ROUND 4 — the mirror itself MOVES on water.
+        //
+        // The unfold above is normal-FREE because mirroring the reflected
+        // point across the surface plane sends it back down the primary ray;
+        // that is only true while the normal HOLDS STILL. Water's ripple
+        // tilts the shading normal every rendered frame on the cloud clock,
+        // so the reflected skyline slides across the surface with ZERO motion
+        // in the geometry — and the MV plane, which only knows camera motion,
+        // reports zero. A parked camera over rippling water therefore hands
+        // FG two different reflections and no reason to think anything moved,
+        // which is the half-cadence strobe. (Same shape as the firefly
+        // strobe below, and the opposite of the reflection swim, which was a
+        // wrong MV rather than a missing one.)
+        //
+        // The field is closed-form, so the PREVIOUS frame's normal is
+        // computable rather than remembered. Reflect the current content
+        // direction back off it and the whole thing collapses to one
+        // expression covering both branches:
+        //
+        //   d = reflect(reflect(du, n_c), n_p)
+        //
+        // At n_p == n_c this is EXACTLY du (reflect is an involution), so the
+        // finite arm reduces to org + du*(ray_t + t_r) and the sky arm to du
+        // — today's kernel, bit-for-bit. That identity is the whole safety
+        // argument, and the Rust twin gates it.
+        float3 d = du;
+        float amp = ripsrc[id.xy];
+        if (ripplemv != 0 && amp > 0.0f) {
+            float3 n_c = normalize(nrough[id.xy].xyz);
+            // First-order previous normal: the ripple perturbs by SUBTRACTING
+            // the in-plane height gradient, so stepping the gradient back in
+            // time steps the normal back with it. Exact at dt = 0; the error
+            // is second order in amp*|g| (<= ~0.8 deg on water's ~14 deg
+            // tilt), well under the 1-3 deg/frame being corrected.
+            float2 gd = amp * (ripple_grad(hit_p, t_prev, diag)
+                             - ripple_grad(hit_p, t_cur, diag));
+            float3 g3 = float3(gd.x, 0.0f, gd.y);
+            float3 n_p = n_c - (g3 - n_c * dot(g3, n_c));
+            float nl = dot(n_p, n_p);
+            // A degenerate or horizon-crossing reconstruction falls back to
+            // n_c, i.e. to the exact pre-round-4 unfold. Coarser, never
+            // wrong-signed — the humble arm.
+            if (nl > 1e-12f) {
+                n_p *= rsqrt(nl);
+                if (dot(n_p, n_c) > 0.0f) d = reflect(reflect(du, n_c), n_p);
+            }
+        }
+        float3 V = hit_p + d * t_r; // planar-unfold virtual point
+        float4 pc = sky_refl ? (m0 * d.x + m1 * d.y + m2 * d.z)
                              : (m0 * V.x + m1 * V.y + m2 * V.z + m3);
         if (pc.w > 1e-6f) {
             float2 pndc = pc.xy / pc.w;
@@ -174,6 +224,26 @@ void cs_guides(uint3 id : SV_DispatchThreadID) {
             float ld = dot(dalb[id.xy].rgb, LUM);
             float ls = dot(salb[id.xy].rgb, LUM);
             float rough = nrough[id.xy].w;
+            // ROUND 4b — Fresnel, on ripple pixels only.
+            //
+            // ls/(ld+ls) is an F0-luminance PROXY for "how much of this pixel
+            // is the mirror image", and on water it is wrong in both
+            // directions at once: F0 is a flat 0.04 while the actual
+            // reflectance runs from ~2% face-on to ~100% at grazing. Water
+            // also keeps its dark unlifted Kd (the class exists to avoid the
+            // neutral wash), so the proxy lands at a middling 0.15-0.45
+            // EVERYWHERE — which would apply a fraction of the correct MV at
+            // exactly the grazing angles where the sliding skyline lives, and
+            // halve the strobe instead of killing it.
+            //
+            // Scoped inside amp > 0: every non-water pixel keeps the proxy
+            // and stays bit-identical to rounds 2/3.
+            if (amp > 0.0f) {
+                float cos_i = saturate(abs(dot(du, normalize(nrough[id.xy].xyz))));
+                float f = 1.0f - cos_i;
+                float f5 = f * f * f * f * f;
+                ls *= (0.04f + 0.96f * f5) / 0.04f; // Schlick / F0 -> reflectance ratio
+            }
             float wgt = saturate(ls / (ld + ls + 1e-4f))
                       * (1.0f - smoothstep(0.25f, 0.6f, rough)); // ROUGH_LO..ROUGH_HI
             mv = lerp(mv, mv_v, wgt);
@@ -259,6 +329,107 @@ pub fn virtual_prev_px(
     }
     let (px, py) = (pc.x / pc.w, pc.y / pc.w);
     Some(((px + 1.0) * 0.5 * w, (1.0 - py) * 0.5 * h))
+}
+
+/// Round 4: the previous frame's ripple-perturbed shading normal, first
+/// order — the CPU mirror of the `n_p` block in `cs_guides`.
+///
+/// `ripple_normal` tilts by SUBTRACTING the in-plane height gradient, so
+/// stepping the gradient back in time steps the normal back with it. Exact at
+/// `t_prev == t_cur` (returns `n_c` bitwise, which is what makes the whole
+/// round-4 path collapse to round 2/3); second-order in `amp·|g|` otherwise.
+/// A degenerate or horizon-crossing result falls back to `n_c` — coarser,
+/// never wrong-signed.
+pub fn ripple_prev_normal(
+    n_c: Vec3A,
+    hit_p: Vec3A,
+    t_cur: f32,
+    t_prev: f32,
+    amp: f32,
+    diag: f32,
+) -> Vec3A {
+    if amp <= 0.0 {
+        return n_c;
+    }
+    let gd = (crate::shade::ripple_grad(hit_p, t_prev, diag)
+        - crate::shade::ripple_grad(hit_p, t_cur, diag))
+        * amp;
+    let g3 = Vec3A::new(gd.x, 0.0, gd.y);
+    let n_p = n_c - (g3 - n_c * g3.dot(n_c));
+    let nl = n_p.length_squared();
+    if nl <= 1e-12 {
+        return n_c;
+    }
+    let n_p = n_p / nl.sqrt();
+    if n_p.dot(n_c) > 0.0 { n_p } else { n_c }
+}
+
+/// Round 4: `virtual_prev_px` for a mirror that MOVED between frames.
+///
+/// The still-mirror form is normal-free because reflecting a point across the
+/// surface plane and back sends it down the primary ray; once the normal
+/// moves that no longer holds. Reflecting the current content direction off
+/// the PREVIOUS normal generalizes both branches into one expression, and
+/// `reflect` being an involution makes `n_p == n_c` reduce to `du` exactly —
+/// so at `amp == 0` or `t_prev == t_cur` this IS `virtual_prev_px`, which the
+/// gates assert bitwise rather than approximately.
+#[allow(clippy::too_many_arguments)]
+pub fn ripple_virtual_prev_px(
+    cx: f32,
+    cy: f32,
+    w: f32,
+    h: f32,
+    view_z: f32,
+    t_r: f32,
+    cam_far: f32,
+    origin: Vec3A,
+    fwd: Vec3A,
+    right_s: Vec3A,
+    up_s: Vec3A,
+    m: &Mat4,
+    n_c: Vec3A,
+    t_cur: f32,
+    t_prev: f32,
+    amp: f32,
+    diag: f32,
+) -> Option<(f32, f32)> {
+    // The off arm CALLS the still-mirror twin, so "bit-identical when the
+    // feature is off" is true by construction and not by re-derivation.
+    if amp <= 0.0 {
+        return virtual_prev_px(
+            cx, cy, w, h, view_z, t_r, cam_far, origin, fwd, right_s, up_s, m,
+        );
+    }
+    let ndx = cx * (2.0 / w) - 1.0;
+    let ndy = 1.0 - cy * (2.0 / h);
+    let du = (fwd + right_s * ndx + up_s * ndy).normalize();
+    let ray_t = view_z / du.dot(fwd);
+    let hit_p = origin + du * ray_t;
+    let n_p = ripple_prev_normal(n_c, hit_p, t_cur, t_prev, amp, diag);
+    let refl = |i: Vec3A, n: Vec3A| i - n * (2.0 * i.dot(n));
+    let d = refl(refl(du, n_c), n_p);
+    let v = hit_p + d * t_r;
+    let pc = if t_r >= cam_far {
+        *m * Vec4::new(d.x, d.y, d.z, 0.0)
+    } else {
+        *m * Vec4::new(v.x, v.y, v.z, 1.0)
+    };
+    if pc.w <= 1e-6 {
+        return None;
+    }
+    let (px, py) = (pc.x / pc.w, pc.y / pc.w);
+    Some(((px + 1.0) * 0.5 * w, (1.0 - py) * 0.5 * h))
+}
+
+/// Round 4b: the Fresnel scale the kernel applies to the specular luminance
+/// on ripple pixels only. F0 = 0.04 is a flat proxy for a reflectance that
+/// actually runs ~2% face-on to ~100% at grazing, and water's dark unlifted
+/// albedo puts the raw proxy at a middling value everywhere — which would
+/// apply a fraction of the correct MV exactly where the sliding skyline is.
+pub fn fresnel_spec_scale(cos_i: f32) -> f32 {
+    let f = (1.0 - cos_i.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+    let f5 = f * f * f * f * f;
+    (0.04 + 0.96 * f5) / 0.04
 }
 
 /// The CPU mirror of `cs_guides`' blend weight: how much of the pixel's look
@@ -444,14 +615,27 @@ pub struct GuideParams {
     /// distance from a miss, because one lane carries both — see the sky-miss
     /// branch in `cs_guides`. Rides the old `_pad`, so the layout is unmoved.
     pub cam_far: f32,
-    pub _pad: [f32; 2],
+    /// The ripple clock, current and previous EVALUATED frame (round 4).
+    /// Equal values are the structural off state: the gradient delta is then
+    /// exactly zero, the reconstructed previous normal is `n_c`, and the
+    /// kernel reduces to the round-2/3 unfold bit-for-bit. That is also the
+    /// first-frame default — `t_prev` is never 0.0 on a frame with no
+    /// history, because a bogus multi-second delta is precisely the confident
+    /// wrong MV this pass exists to avoid. Rides the old `_pad`.
+    pub t_cur: f32,
+    pub t_prev: f32,
+    /// `Scene::diag` — every ripple length is scale-relative.
+    pub diag: f32,
+    /// `FR_NGXFG_RIPPLEMV=off` clears it (0 = the pre-round-4 kernel stream).
+    pub ripplemv: u32,
+    pub _pad2: [f32; 2],
 }
 const PARAM_DWORDS: u32 = (std::mem::size_of::<GuideParams>() / 4) as u32;
-const _: () = assert!(std::mem::size_of::<GuideParams>() == 40 * 4);
+const _: () = assert!(std::mem::size_of::<GuideParams>() == 44 * 4);
 
 /// Kernel-order indices into the source-plane array `ensure` takes — must
 /// match `rr::RrResources::guide_inputs` (which returns them in this order).
-pub const SRC_PLANES: usize = 6;
+pub const SRC_PLANES: usize = 7;
 const SRC_FORMATS: [DXGI_FORMAT; SRC_PLANES] = [
     DXGI_FORMAT_R32_FLOAT,          // linear view-Z
     DXGI_FORMAT_R16G16_FLOAT,       // surface MVs
@@ -459,6 +643,7 @@ const SRC_FORMATS: [DXGI_FORMAT; SRC_PLANES] = [
     DXGI_FORMAT_R8G8B8A8_UNORM,     // diffuse albedo
     DXGI_FORMAT_R8G8B8A8_UNORM,     // specular albedo
     DXGI_FORMAT_R16G16B16A16_FLOAT, // normal + roughness
+    DXGI_FORMAT_R16_FLOAT,          // ripple amplitude (round 4)
 ];
 
 /// One dispatch: read six RR planes, write the [0,1] clip-depth plane and
@@ -579,7 +764,12 @@ impl GuidePass {
         }
         .map_err(|e| format!("ngxfg-guides: CreateRootSignature: {e}"))?;
 
-        let cs = compile(HLSL, s!("cs_guides"), s!("cs_5_0"), "ngxfg-guides cs_guides")?;
+        // ripple.hlsli AHEAD of the kernel: the ONE GPU copy of the field,
+        // shared with the dxc shading units (see its header). It is written
+        // cs_5_0-clean and self-defines TAU, so it pastes standalone here —
+        // there is no trace_common.hlsli prelude on this pass.
+        let src = format!("{}\n{}", super::trace::RIPPLE_HLSLI, HLSL);
+        let cs = compile(&src, s!("cs_guides"), s!("cs_5_0"), "ngxfg-guides cs_guides")?;
         let pso: ID3D12PipelineState = unsafe {
             device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root_sig),
@@ -1236,6 +1426,226 @@ pub fn self_test() -> std::result::Result<(), String> {
             return Err(format!(
                 "ff σ/lum parity: bake {got_lum} vs fireflies::glow {want_lum}"
             ));
+        }
+    }
+
+    // ---- ROUND 4: ripple-aware virtual MVs (water) ----
+    //
+    // The bug: water's mirror normal moves every frame on the cloud clock, so
+    // its reflected image slides across a surface whose geometry — and
+    // therefore whose MV — is perfectly still. A parked camera hands frame
+    // generation two different reflections and a zero MV.
+    let diag = 69.0f32; // the world's scale; every ripple length is diag-relative
+    let amp = crate::scene::WATER_RIPPLE_AMP;
+    let n_flat = Vec3A::Y; // an ocean: flat geometry, all the motion in the field
+
+    // (r-a) OFF-ARM BIT-IDENTITY. amp == 0 must be the still-mirror twin
+    // BITWISE, not approximately — the round-4 path is opt-in per pixel and
+    // every non-water pixel in the world takes this arm.
+    for &(cx, cy, view_z, t_r) in &[
+        (10.5f32, 20.5f32, 3.0f32, 4.0f32),
+        (216.5, 162.5, 12.0, 0.5),
+        (400.5, 300.5, 2.0, far),
+    ] {
+        let want = virtual_prev_px(
+            cx, cy, rw as f32, rh as f32, view_z, t_r, far, org, fwd, rgt, upv,
+            &world_to_prev_clip,
+        );
+        let got = ripple_virtual_prev_px(
+            cx, cy, rw as f32, rh as f32, view_z, t_r, far, org, fwd, rgt, upv,
+            &world_to_prev_clip, n_flat, 1.0, 2.0, 0.0, diag,
+        );
+        if want.map(|(a, b)| (a.to_bits(), b.to_bits()))
+            != got.map(|(a, b)| (a.to_bits(), b.to_bits()))
+        {
+            return Err(format!("ripple off-arm not bit-identical: {want:?} vs {got:?}"));
+        }
+    }
+
+    // (r-b) THE GENERALIZATION PIN. At t_prev == t_cur the reconstructed
+    // previous normal is n_c, and reflect() being an involution makes the
+    // content direction exactly du — so the whole thing must collapse onto
+    // the still-mirror unfold even with the ripple ARMED. Both branches
+    // (finite hit and reflected sky) and several depths, since one expression
+    // now serves both.
+    for &(view_z, t_r) in &[(3.0f32, 4.0f32), (12.0, 0.5), (2.0, far), (7.0, far * 0.999)] {
+        let want = virtual_prev_px(
+            216.5, 162.5, rw as f32, rh as f32, view_z, t_r, far, org, fwd, rgt, upv,
+            &world_to_prev_clip,
+        );
+        let got = ripple_virtual_prev_px(
+            216.5, 162.5, rw as f32, rh as f32, view_z, t_r, far, org, fwd, rgt, upv,
+            &world_to_prev_clip, n_flat, 5.0, 5.0, amp, diag,
+        );
+        match (want, got) {
+            (Some((wx, wy)), Some((gx, gy))) => {
+                if (wx - gx).abs() > 1e-3 || (wy - gy).abs() > 1e-3 {
+                    return Err(format!(
+                        "ripple dt=0 must equal the still-mirror unfold: \
+                         ({wx},{wy}) vs ({gx},{gy}) at view_z={view_z} t_r={t_r}"
+                    ));
+                }
+            }
+            (a, b) => return Err(format!("ripple dt=0 branch mismatch: {a:?} vs {b:?}")),
+        }
+    }
+
+    // (r-c) THE MUST-FIRE, WITH TEETH. A PARKED camera (prev == current
+    // matrices) over rippling water: the surface MV is exactly zero, the
+    // still-mirror unfold is exactly zero — and the true content motion is
+    // not. Scan dt until the reconstruction reports real motion; never
+    // reaching it means the probe is vacuous, which is itself a failure.
+    {
+        let (cx, cy, view_z, t_r) = (216.5f32, 162.5f32, 6.0f32, 30.0f32);
+        let mut fired = None;
+        for k in 1..=24 {
+            let dt = k as f32 / 60.0;
+            let (mx, my) = ripple_virtual_prev_px(
+                cx, cy, rw as f32, rh as f32, view_z, t_r, far, org, fwd, rgt, upv,
+                &world_to_clip, // PARKED: prev matrices == current
+                n_flat, dt, 0.0, amp, diag,
+            )
+            .ok_or("ripple parked probe went behind the image plane")?;
+            let mv = ((mx - cx).powi(2) + (my - cy).powi(2)).sqrt();
+            if mv >= 5.0 {
+                fired = Some((dt, mv));
+                break;
+            }
+        }
+        let Some((dt, mv)) = fired else {
+            return Err(
+                "ripple parked probe never reached 5 px of motion — the gate is vacuous".into(),
+            );
+        };
+        // TEETH: the still-mirror answer at the SAME parked pose. It is the
+        // pre-round-4 behavior AND the surface MV, and both are ~0 — if this
+        // passed the bound the probe would be measuring nothing.
+        let (ox, oy) = virtual_prev_px(
+            cx, cy, rw as f32, rh as f32, view_z, t_r, far, org, fwd, rgt, upv, &world_to_clip,
+        )
+        .ok_or("ripple teeth probe behind the image plane")?;
+        let mv_old = ((ox - cx).powi(2) + (oy - cy).powi(2)).sqrt();
+        if mv_old >= 1.0 {
+            return Err(format!(
+                "ripple teeth: the still-mirror unfold moved {mv_old} px at a PARKED \
+                 camera — it must be ~0, so this probe cannot show round 4 works"
+            ));
+        }
+        // ORACLE: an inverse round-trip, not a re-derivation of the same
+        // formula. Rebuild the ray through the answer pixel, reflect it off
+        // the reconstructed previous normal, and it must return the CURRENT
+        // content direction. A sign error or a wrong normal fails this while
+        // a duplicated formula would not.
+        let ndx = cx * (2.0 / rw as f32) - 1.0;
+        let ndy = 1.0 - cy * (2.0 / rh as f32);
+        let du = (fwd + rgt * ndx + upv * ndy).normalize();
+        let hit_p = org + du * (view_z / du.dot(fwd));
+        let n_p = ripple_prev_normal(n_flat, hit_p, dt, 0.0, amp, diag);
+        let refl = |i: Vec3A, n: Vec3A| i - n * (2.0 * i.dot(n));
+        let r_cur = refl(du, n_flat);
+        let back = refl(refl(r_cur, n_p), n_p); // reflect off n_p and back
+        if (back - r_cur).length() > 1e-5 {
+            return Err(format!(
+                "ripple oracle: reflecting off n_p twice did not return the current \
+                 content direction (err {})",
+                (back - r_cur).length()
+            ));
+        }
+        if n_p.dot(n_flat) > 0.999_999 {
+            return Err("ripple oracle: n_p never left n_c — the field is not animating".into());
+        }
+        eprintln!(
+            "ngxfg-guides: ripple parked-camera MV fires at dt={dt:.3}s \
+             ({mv:.2} px vs still-mirror {mv_old:.4})"
+        );
+    }
+
+    // (r-d) CONTINUITY AT THE STRUCTURAL CUT. The kernel branches on
+    // amp > 0, so the blend must approach the off arm as amp shrinks rather
+    // than stepping at the boundary.
+    {
+        let (cx, cy, view_z, t_r) = (216.5f32, 162.5f32, 6.0f32, 30.0f32);
+        let at = |a: f32| {
+            ripple_virtual_prev_px(
+                cx, cy, rw as f32, rh as f32, view_z, t_r, far, org, fwd, rgt, upv,
+                &world_to_clip, n_flat, 0.05, 0.0, a, diag,
+            )
+        };
+        let (bx, by) = at(0.0).ok_or("ripple continuity: off arm missing")?;
+        let mut prev_d = f32::INFINITY;
+        for k in 0..6 {
+            let a = amp * 0.5f32.powi(k);
+            let (px, py) = at(a).ok_or("ripple continuity: armed arm missing")?;
+            let d = ((px - bx).powi(2) + (py - by).powi(2)).sqrt();
+            if d > prev_d + 1e-3 {
+                return Err(format!("ripple continuity not monotone in amp at amp={a}"));
+            }
+            prev_d = d;
+        }
+        if prev_d > 0.5 {
+            return Err(format!("ripple amp -> 0 left a {prev_d} px step at the cut"));
+        }
+    }
+
+    // (r-e) HUMILITY. An adversarial gradient that would flip the normal
+    // through the horizon must fall back to n_c exactly — coarser, never
+    // wrong-signed. (A huge amp is the cheap way to force it.)
+    {
+        let hit_p = org + fwd * 5.0;
+        let n_p = ripple_prev_normal(n_flat, hit_p, 0.0, 40.0, 1.0e6, diag);
+        if n_p.dot(n_flat) <= 0.0 {
+            return Err("ripple humility: n_p crossed the horizon instead of falling back".into());
+        }
+    }
+
+    // (r-f) THE MODE BOUNDARY. t_r just under cam_far (a real, very distant
+    // hit) and t_r == cam_far (the sky encoding) take DIFFERENT projection
+    // routes — point vs direction. They must not disagree wildly, or a
+    // ripple that nudges a reflection across the boundary snaps the MV.
+    {
+        let (cx, cy, view_z) = (216.5f32, 162.5f32, 6.0f32);
+        let near_far = ripple_virtual_prev_px(
+            cx, cy, rw as f32, rh as f32, view_z, far * (1.0 - 1e-4), far, org, fwd, rgt, upv,
+            &world_to_clip, n_flat, 0.05, 0.0, amp, diag,
+        )
+        .ok_or("ripple boundary: finite arm missing")?;
+        let at_far = ripple_virtual_prev_px(
+            cx, cy, rw as f32, rh as f32, view_z, far, far, org, fwd, rgt, upv,
+            &world_to_clip, n_flat, 0.05, 0.0, amp, diag,
+        )
+        .ok_or("ripple boundary: sky arm missing")?;
+        let d = ((near_far.0 - at_far.0).powi(2) + (near_far.1 - at_far.1).powi(2)).sqrt();
+        // The two differ by the parallax of a point at `far` vs one at
+        // infinity, which is bounded by |hit_p - org| / far in angle.
+        if d > 2.0 {
+            return Err(format!("ripple finite/sky boundary jumps {d} px"));
+        }
+    }
+
+    // (r-g) FRESNEL ANCHORS (round 4b). Grazing water is nearly all mirror;
+    // face-on is nearly none of it. The proxy this replaces is flat.
+    {
+        if (fresnel_spec_scale(1.0) - 1.0).abs() > 1e-6 {
+            return Err("fresnel_spec_scale(face-on) must be exactly 1 (F0/F0)".into());
+        }
+        let grazing = fresnel_spec_scale(0.0);
+        if (grazing - 25.0).abs() > 1e-3 {
+            return Err(format!("fresnel_spec_scale(grazing) = {grazing}, want 1/0.04 = 25"));
+        }
+        // The point of the change: a dark-albedo water pixel at grazing must
+        // hand the MV over almost entirely, where the flat proxy did not.
+        let (ld, ls) = (0.10f32, 0.04f32);
+        let w_flat = rmv_weight(ld, ls, 0.05);
+        let w_graze = rmv_weight(ld, ls * fresnel_spec_scale(0.05), 0.05);
+        if w_flat > 0.5 {
+            return Err(format!("water proxy weight {w_flat} — probe no longer representative"));
+        }
+        if w_graze < 0.85 {
+            return Err(format!("fresnel grazing weight {w_graze}, want ~1"));
+        }
+        // Past ROUGH_HI the damping still wins outright, Fresnel or not.
+        if rmv_weight(ld, ls * fresnel_spec_scale(0.0), ROUGH_HI + 0.01) != 0.0 {
+            return Err("fresnel must not resurrect the past-ROUGH_HI zero".into());
         }
     }
 

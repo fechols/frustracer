@@ -23,7 +23,12 @@ RWTexture2D<float>  feed_spechit : register(u22); // R16F     spec hit distance 
 RWTexture2D<float4> feed_aux0    : register(u23); // RGBA16F  FSR-RR mvec (UV-delta RG + depth-delta B)
 RWTexture2D<float4> feed_aux1    : register(u24); // RGBA16F  FSR-RR demodulated direct diffuse
 RWTexture2D<float4> feed_aux2    : register(u25); // RGBA16F  FSR-RR demodulated direct specular
-RWTexture2D<float>  feed_aux3    : register(u26); // R16F     FSR-RR ambient-occlusion open fraction
+RWTexture2D<float>  feed_aux3    : register(u26); // R16F     FSR-RR ambient-occlusion open fraction;
+                                                  //          RR: the FG guide pass's ripple tag.
+                                                  //          Same HLSL type + format, and the two
+                                                  //          sessions are mutually exclusive per
+                                                  //          descriptor set — the register's VALUE
+                                                  //          may differ per kernel, its TYPE may not.
 RWTexture2D<float4> feed_aux4    : register(u27); // RGBA16F  FSR-RR indirect specular (A = ray hit t)
 
 // xess.rs::view_z_to_clip_depth: linear view-Z -> [0,1] reversed-Z clip
@@ -87,6 +92,10 @@ void cs_feed_rr(uint3 id : SV_DispatchThreadID) {
     feed_alb[id.xy] = float4(g.alb.xyz, 1.0);
     feed_spec[id.xy] = float4(g.spec.xyz, 1.0);
     feed_spechit[id.xy] = g.spec.w;
+    // Pack lane 7 (alb.w) -> the guide pass's ripple plane. Not an RR input:
+    // RR is never tagged with it. Zero on every non-water pixel, which is the
+    // guide kernel's structural "nothing moves here" arm.
+    feed_aux3[id.xy] = g.alb.w;
 }
 
 // --- FSR4 + Ray Regeneration (ffx_rr.rs::record_upload's GPU replacement) ---

@@ -84,7 +84,7 @@ pub const RP_NPPD_FRAME: u32 = RP_GBUF + 1;
 pub const RP_NPPD_STATE: u32 = RP_GBUF + 2;
 pub const RP_NPPD_WARPED: u32 = RP_GBUF + 3;
 pub const RP_NPPD_OUT: u32 = RP_GBUF + 4;
-pub const NPPD_REG_BASE: u32 = NUM_UAVS + 2 + NUM_FEED; // u26
+pub const NPPD_REG_BASE: u32 = NUM_UAVS + 2 + NUM_FEED; // u28 (feed ends at u27)
 /// Scene textures + UV stream: one SRV descriptor table in register space1
 /// (collision-free with every space0 register above), appended after the
 /// NPPD params so nothing renumbers (62/64 root-signature DWORDs). Range 0 =

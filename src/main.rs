@@ -1697,6 +1697,25 @@ fn run_check_dxr(
                 }
             }
         }
+        // Ext lane 7 = the FG guide pass's ripple tag — see the check-gpu twin.
+        let (mut rip_bad, mut rip_live, mut rip_sky_bad) = (0usize, 0usize, 0usize);
+        for i in 0..pw * ph {
+            let a = dlss::ld16(&ga.ripple_amp[i]);
+            if !ta[i].is_finite() {
+                if a != 0.0 {
+                    rip_sky_bad += 1;
+                }
+                continue;
+            }
+            if a == 0.0 {
+                continue;
+            }
+            if (a - scene::WATER_RIPPLE_AMP).abs() > 1e-3 {
+                rip_bad += 1;
+            } else {
+                rip_live += 1;
+            }
+        }
         let mv_ok = dlss::mv_selftest(
             &ga,
             &basis_a,
@@ -1707,9 +1726,13 @@ fn run_check_dxr(
             far,
         );
         eprintln!(
-            "check-dxr: gbuf pack ({pw}x{ph}): view-z<=0 {bad_z} | sky-depth-off {sky_off} (sky px {skies}) | mv/depth/matrix {}",
+            "check-dxr: gbuf pack ({pw}x{ph}): view-z<=0 {bad_z} | sky-depth-off {sky_off} (sky px {skies}) | ripple-lane bad {rip_bad} sky-nonzero {rip_sky_bad} (water px {rip_live}) | mv/depth/matrix {}",
             if mv_ok { "OK" } else { "FAIL" },
         );
+        if rip_bad != 0 || rip_sky_bad != 0 {
+            eprintln!("check-dxr: FAIL ripple lane (pack lane 7) carries unexpected values");
+            ok = false;
+        }
         if !mv_ok || bad_z != 0 || sky_off != 0 {
             eprintln!("check-dxr: FAIL DXR G-buffer pack gates");
             ok = false;
@@ -2221,6 +2244,10 @@ fn unpack_gbuf_bytes(
                 view_z: fc(core, c + 2),
                 spec_alb: Vec3A::new(ef(8), ef(9), ef(10)),
                 spec_hit_t: ef(11),
+                // Lane 7 = alb.w, previously unread: the FG guide pass's
+                // ripple tag. Reading it here is what lets the pack gates
+                // see it at all.
+                ripple_amp: ef(7),
                 mv: (fc(core, c), fc(core, c + 1)),
             },
         );
@@ -4692,12 +4719,39 @@ fn run_check_gpu(
                 }
             }
         }
+        // Ext lane 7 (alb.w) = the FG guide pass's ripple tag. It was an
+        // unused lane and no gate read it, so this is what proves the pack
+        // write and the readback agree: every pixel must carry either 0 or
+        // the material's own WATER_RIPPLE_AMP, and sky must be 0.
+        let (mut rip_bad, mut rip_live, mut rip_sky_bad) = (0usize, 0usize, 0usize);
+        for i in 0..pw * ph {
+            let a = dlss::ld16(&ga.ripple_amp[i]);
+            let is_sky = !ta[i].is_finite();
+            if is_sky {
+                if a != 0.0 {
+                    rip_sky_bad += 1;
+                }
+                continue;
+            }
+            if a == 0.0 {
+                continue;
+            }
+            if (a - scene::WATER_RIPPLE_AMP).abs() > 1e-3 {
+                rip_bad += 1;
+            } else {
+                rip_live += 1;
+            }
+        }
         let mv_ok =
             dlss::mv_selftest(&ga, &basis_a, &gb2, &basis_b, &dlss::cam_matrices(&cam_b, pw, ph, near, far), scene.diag, far);
         eprintln!(
-            "check-gpu: gbuf pack ({pw}x{ph}): view-z<=0 {bad_z} | sky-depth-off {sky_off} (sky px {skies}) | mv/depth/matrix {}",
+            "check-gpu: gbuf pack ({pw}x{ph}): view-z<=0 {bad_z} | sky-depth-off {sky_off} (sky px {skies}) | ripple-lane bad {rip_bad} sky-nonzero {rip_sky_bad} (water px {rip_live}) | mv/depth/matrix {}",
             if mv_ok { "OK" } else { "FAIL" },
         );
+        if rip_bad != 0 || rip_sky_bad != 0 {
+            eprintln!("check-gpu: FAIL ripple lane (pack lane 7) carries unexpected values");
+            ok = false;
+        }
         if !mv_ok || bad_z != 0 || sky_off != 0 {
             eprintln!("check-gpu: FAIL GPU-born G-buffer gates");
             ok = false;
@@ -16805,6 +16859,8 @@ fn session(
                 &fc,
                 dlss_idx,
                 &crate::fireflies::Fireflies::live(scene, cloud_time as f32),
+                // Likewise the ripple clock, for the round-4 water MVs.
+                &clouds::Clouds::live(scene.diag, cloud_time as f32),
             ) {
                 Ok(()) => {
                     dlss_prev = Some(dlss::DlssPrev {

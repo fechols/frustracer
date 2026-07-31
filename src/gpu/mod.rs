@@ -480,6 +480,22 @@ struct NgxFgState {
     /// fallback then reprojects the CURRENT pose (camera-motion-only MV),
     /// and the first evaluate presents real-only anyway (`primed`).
     prev_ff: std::cell::Cell<crate::fireflies::Fireflies>,
+    /// FR_NGXFG_RIPPLEMV=off — skip the round-4 ripple-MV reconstruction: the
+    /// guide kernel takes `n_p = n_c` and reduces to the round-2/3 unfold
+    /// bit-for-bit, so water reflections strobe on generated frames again on
+    /// demand.
+    ripplemv_off: bool,
+    /// LAST SUCCESSFULLY EVALUATED frame's ripple clock — the prev half of
+    /// the round-4 pair, updated beside `primed` for exactly the reason
+    /// `prev_ff` is: it must name the frame the NGX feature actually
+    /// retained, not the last one we recorded.
+    ///
+    /// `None` (no history yet) yields `t_prev = t_cur`, i.e. a zero gradient
+    /// delta and today's kernel. It deliberately does NOT default to 0.0: a
+    /// session whose clock is already minutes in would inject a huge bogus
+    /// delta on the first armed frame — a confident wrong MV, which is worse
+    /// than the missing one this round exists to fix.
+    prev_clock: std::cell::Cell<Option<f32>>,
 }
 
 /// XeSS-FG frame generation (Intel XeSS sessions — the third `--fg` family).
@@ -1276,6 +1292,13 @@ impl GpuContext {
                              generated frames (expect the night swarm to strobe under motion)"
                         );
                     }
+                    let ripplemv_off = lever("FR_NGXFG_RIPPLEMV", &["off"]) == 1;
+                    if ripplemv_off {
+                        eprintln!(
+                            "fg: FR_NGXFG_RIPPLEMV=off — water keeps a still-mirror unfold on \
+                             generated frames (expect rippling reflections to strobe)"
+                        );
+                    }
                     Some(NgxFgState {
                         out,
                         handle: std::cell::Cell::new(std::ptr::null_mut()),
@@ -1297,6 +1320,8 @@ impl GpuContext {
                         mat_col,
                         ffmv_off,
                         prev_ff: std::cell::Cell::new(crate::fireflies::Fireflies::off()),
+                        ripplemv_off,
+                        prev_clock: std::cell::Cell::new(None),
                     })
                 }
                 Err(e) => {
@@ -2190,6 +2215,10 @@ impl GpuContext {
                 (trace::FEED_ALB, pl[4].0, pl[4].1),
                 (trace::FEED_SPEC, pl[5].0, pl[5].1),
                 (trace::FEED_SPECHIT, pl[6].0, pl[6].1),
+                // The FG guide pass's ripple plane rides FEED_FSR_AO (u26):
+                // same R16F/RWTexture2D<float>, and an RR session never runs
+                // the FSR-RR kernel that owns it. Not an RR input.
+                (trace::FEED_FSR_AO, pl[7].0, pl[7].1),
             ],
         )
     }
@@ -2656,7 +2685,7 @@ impl GpuContext {
         // Raw-NGX frame generation owns the tail when armed (pair-present);
         // the SL-G marker bracket below is its fallback sibling.
         if self.fg_n.is_some() {
-            return self.ngxfg_tail(slot, fc, &p.fireflies);
+            return self.ngxfg_tail(slot, fc, &p.fireflies, &p.clouds);
         }
         // The tonemap pass re-binds root sig/PSO/heaps/viewport from
         // scratch — the post-evaluate state restore
@@ -4182,6 +4211,9 @@ impl GpuContext {
         // is handed the same `Fireflies::live` value the RenderCtx traced
         // with). Unused when FG is not armed.
         ff: &crate::fireflies::Fireflies,
+        // Same shape, for the round-4 ripple MVs: the clock the RenderCtx
+        // traced this frame with. Unused when FG is not armed.
+        cl: &crate::clouds::Clouds,
     ) -> Result<()> {
         crate::zone!("present-rr");
         self.dlssg_frame_begin(frame_idx);
@@ -4228,7 +4260,7 @@ impl GpuContext {
             )]);
         }
         if self.fg_n.is_some() {
-            return self.ngxfg_tail(slot, fc, ff);
+            return self.ngxfg_tail(slot, fc, ff, cl);
         }
         // The tonemap pass re-binds root sig/PSO/heaps/viewport from scratch,
         // which is exactly the post-evaluate state restore that
@@ -4300,7 +4332,7 @@ impl GpuContext {
             }
         }
         if self.fg_n.is_some() {
-            return self.ngxfg_tail(slot, fc, &p.fireflies);
+            return self.ngxfg_tail(slot, fc, &p.fireflies, &p.clouds);
         }
         // The tonemap pass re-binds root sig/PSO/heaps/viewport from scratch —
         // the post-evaluate state restore eDisableCLStateTracking makes the
@@ -4719,6 +4751,7 @@ impl GpuContext {
         slot: usize,
         fc: &dlss::FrameConstants,
         ff: &crate::fireflies::Fireflies,
+        cl: &crate::clouds::Clouds,
     ) -> bool {
         let (Some(n), Some(rr)) = (&self.fg_n, &self.rr) else { return false };
         if !n.enabled || n.failed.get() {
@@ -4898,7 +4931,15 @@ impl GpuContext {
                 // and reproject it as a direction instead of a point 2*diag
                 // away. Both come from dlss::near_far — keep them one source.
                 cam_far: far,
-                _pad: [0.0; 2],
+                // Round 4. `t_prev == t_cur` whenever there is no retained
+                // frame yet, when the clock is pinned (--check*'s
+                // CLOUD_CHECK_TIME), or when the lever is off — all three
+                // give a zero gradient delta, i.e. the round-2/3 kernel.
+                t_cur: cl.time,
+                t_prev: n.prev_clock.get().unwrap_or(cl.time),
+                diag: cl.diag,
+                ripplemv: (!n.ripplemv_off) as u32,
+                _pad2: [0.0; 2],
             };
             gp.record(list, &p, slot, &ff_table);
         }
@@ -5010,6 +5051,9 @@ impl GpuContext {
         // skipped/failed dispatch keeps the pairing aligned with the frame
         // the feature actually holds.
         n.prev_ff.set(*ff);
+        // Same rule, same reason, for the round-4 ripple clock: it must name
+        // the frame the feature retained, not the last one we recorded.
+        n.prev_clock.set(Some(cl.time));
         show
     }
 
@@ -5023,8 +5067,9 @@ impl GpuContext {
         slot: usize,
         fc: &dlss::FrameConstants,
         ff: &crate::fireflies::Fireflies,
+        cl: &crate::clouds::Clouds,
     ) -> Result<()> {
-        let show = self.ngxfg_dispatch(slot, fc, ff);
+        let show = self.ngxfg_dispatch(slot, fc, ff, cl);
         if let Some(n) = &self.fg_n {
             n.pair.set(show);
         }

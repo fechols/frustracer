@@ -1127,6 +1127,7 @@ struct PrimSurf {
     float3 albedo; // raw material albedo (diffuse/specular split at the write)
     float metallic;
     float spec_t;
+    float ripple_amp; // water only; the FG guide pass's "this mirror MOVES" tag
     float3 direct_d; // albedo-free direct diffuse (kd multiplies later)
     float3 direct_s; // direct specular incl. per-sample Fresnel
     float ao;        // AO open fraction, the `ambient = AMBIENT * ao` factor
@@ -1324,7 +1325,10 @@ void gbuf_write_hit(uint pi, float fx, float fy, float3 dir, float t, PrimSurf p
 
     GBufExt g;
     g.nr = float4(ps.n, ps.rough);
-    g.alb = float4(ps.albedo * (1.0 - ps.metallic), 0.0);
+    // .w was the ONE free lane in the ext record (view_z moved to core.z), so
+    // the FG guide pass's ripple tag rides it: no stride change, and the
+    // ext-lane gates that skip lane 7 keep passing unmodified.
+    g.alb = float4(ps.albedo * (1.0 - ps.metallic), ps.ripple_amp);
     float3 spec_alb = lerp(float3(0.04, 0.04, 0.04), ps.albedo, ps.metallic);
     g.spec = float4(spec_alb, isinf(ps.spec_t) ? CAM_FAR : ps.spec_t);
     g.sig = uint4(0u, 0u, 0u, 0u);

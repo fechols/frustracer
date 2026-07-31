@@ -41,7 +41,11 @@ pub struct RrResources {
     pub opt: (u32, u32),
     pub min: (u32, u32),
     pub max: (u32, u32),
-    planes: [Plane; 7], // upload order: color, normal_rough, depth, mvec, albedo, spec_albedo, spec_hit
+    // upload order: color, normal_rough, depth, mvec, albedo, spec_albedo,
+    // spec_hit, ripple. The last is NOT an RR input — RR is never tagged with
+    // it and never reads it; it exists so the frame-generation guide pass can
+    // see which pixels carry a moving (rippling) mirror normal.
+    planes: [Plane; 8],
     pub output: ID3D12Resource, // RGBA16F UAV, written by RR, read by the tonemap
     /// CPU-upload ring, lazily allocated on first `record_upload` — a --gpu
     /// feed session never touches it (the feed kernel writes the planes in
@@ -58,6 +62,8 @@ const P_MVEC: usize = 3;
 const P_ALBEDO: usize = 4;
 const P_SPEC_ALBEDO: usize = 5;
 const P_SPEC_HIT: usize = 6;
+/// Water ripple amplitude — a guide-pass-only plane (see the `planes` doc).
+const P_RIPPLE: usize = 7;
 
 impl RrResources {
     pub fn new(
@@ -69,7 +75,7 @@ impl RrResources {
         oh: u32,
     ) -> Result<Self> {
         let (max_w, max_h) = max;
-        let specs: [(DXGI_FORMAT, usize); 7] = [
+        let specs: [(DXGI_FORMAT, usize); 8] = [
             (DXGI_FORMAT_R16G16B16A16_FLOAT, 8), // noisy color
             (DXGI_FORMAT_R16G16B16A16_FLOAT, 8), // normal.xyz + roughness.w (packed mode)
             (DXGI_FORMAT_R32_FLOAT, 4),          // linear view-Z
@@ -77,9 +83,10 @@ impl RrResources {
             (DXGI_FORMAT_R8G8B8A8_UNORM, 4),     // diffuse albedo (linear)
             (DXGI_FORMAT_R8G8B8A8_UNORM, 4),     // specular albedo (linear)
             (DXGI_FORMAT_R16_FLOAT, 2),          // specular hit distance
+            (DXGI_FORMAT_R16_FLOAT, 2),          // ripple amp (FG guide pass only)
         ];
         let mut offset = 0usize;
-        let mut planes = Vec::with_capacity(7);
+        let mut planes = Vec::with_capacity(8);
         for (format, bpp) in specs {
             // ALLOW_UNORDERED_ACCESS: the --gpu feed kernel writes these
             // planes directly (the CPU path keeps the upload copies — the
@@ -105,7 +112,7 @@ impl RrResources {
             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
         )?;
-        let planes: [Plane; 7] = planes.try_into().map_err(|_| "plane count".to_string())?;
+        let planes: [Plane; 8] = planes.try_into().map_err(|_| "plane count".to_string())?;
         Ok(Self {
             max_w,
             max_h,
@@ -132,7 +139,7 @@ impl RrResources {
     /// The input planes as (resource, format) in the FEED register order
     /// (color, normal_rough, depth, mvec, albedo, spec_albedo, spec_hit —
     /// u16..u22) — the --gpu feed path's wiring/barrier handle.
-    pub fn plane_resources(&self) -> [(&ID3D12Resource, DXGI_FORMAT); 7] {
+    pub fn plane_resources(&self) -> [(&ID3D12Resource, DXGI_FORMAT); 8] {
         [
             (&self.planes[P_COLOR].tex, self.planes[P_COLOR].format),
             (&self.planes[P_NORMAL_ROUGH].tex, self.planes[P_NORMAL_ROUGH].format),
@@ -141,6 +148,7 @@ impl RrResources {
             (&self.planes[P_ALBEDO].tex, self.planes[P_ALBEDO].format),
             (&self.planes[P_SPEC_ALBEDO].tex, self.planes[P_SPEC_ALBEDO].format),
             (&self.planes[P_SPEC_HIT].tex, self.planes[P_SPEC_HIT].format),
+            (&self.planes[P_RIPPLE].tex, self.planes[P_RIPPLE].format),
         ]
     }
 
@@ -283,6 +291,21 @@ impl RrResources {
                 }
             });
 
+        // Ripple amplitude: f16 storage -> R16F, bit copy. RR never reads
+        // this (it is not among the tags) — the frame-generation guide pass
+        // does, to find the pixels whose mirror normal moves between frames.
+        plane_mem(&self.planes[P_RIPPLE])
+            .par_chunks_mut(aligned_pitch(w * 2))
+            .take(h)
+            .enumerate()
+            .for_each(|(y, row)| {
+                let px: &mut [f16] =
+                    unsafe { std::slice::from_raw_parts_mut(row.as_mut_ptr() as *mut _, w) };
+                for (x, p) in px.iter_mut().enumerate() {
+                    *p = bits16(&g.ripple_amp, y * w + x);
+                }
+            });
+
         // Batch barriers to COPY_DEST, record all copies, batch back.
         let to_copy: Vec<_> = self
             .planes
@@ -343,6 +366,7 @@ impl RrResources {
             &self.planes[P_ALBEDO].tex,
             &self.planes[P_SPEC_ALBEDO].tex,
             &self.planes[P_NORMAL_ROUGH].tex,
+            &self.planes[P_RIPPLE].tex,
         ]
     }
 
