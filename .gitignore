@@ -46,6 +46,7 @@ xess_gbuf_*.png
 /capture/
 /capture-preview/
 /capture-reshoot/
+/capture-v2/
 /cap-test/
 /capture-*.log
 *.mp4

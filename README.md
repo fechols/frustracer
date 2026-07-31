@@ -289,7 +289,7 @@ island's own theme hour.
 |---|---|---|---|---|
 | 1 | **Powerplant** | 06:30 | 12.8 M | Raw geometric density — the classic worst case |
 | 2 | **Sponza** | 08:30 | 0.26 M | The reference courtyard; glTF materials |
-| 3 | **Rungholt** | 11:00 | 6.7 M | A whole Minecraft city: tiny triangles, wide open |
+| 3 | **Rungholt** | 11:00 | 6.7 M | A whole Minecraft city on an open sea: tiny triangles, a swaying forest |
 | 4 | **Damaged Helmet** | 13:00 | 15 k | All four glTF PBR map types at once |
 | 5 | **San Miguel** | 15:30 | 10.0 M | Alpha-cutout foliage, glass, water, tinted shadows |
 | 6 | **Bistro** | 17:30 | 2.8 M | Golden hour: 38 normal + 16 emissive maps |
@@ -403,7 +403,7 @@ each one's A/B is how its cost was measured in the first place.
 |---|---|---|
 | Volumetric clouds — a drifting, curl-warped slab that shadows the sun | `--no-clouds` | |
 | Time of day, moon, and stars — the sun sets, the moon becomes the light, the star field lights the scene | `--tod <h>` to pin | **,** / **.** |
-| Wind-swayed foliage — 5.1 M leaf triangles moving as real geometry | `--no-foliage-sway` | |
+| Wind-swayed foliage — 7.3 M triangles moving as real geometry, with real motion vectors | `--no-foliage-sway`, `--foliage-amp <x>` | |
 | Fireflies after dusk — real point lights with hard shadows | `--no-fireflies` | |
 | Hemisphere-bounce GI / AO — the quadtree idea aimed at the light integral | (opt-in) | **H** |
 | Heightfield relief — real displaced geometry at the intersector | (opt-in `--heightfield`) | **V** |
@@ -416,15 +416,19 @@ each one's A/B is how its cost was measured in the first place.
 
 ![Wind through San Miguel's ficus](docs/media/foliage.webp)
 
-*Wind in the leaves — and the leaves are **geometry**, not a shader trick.
-Foliage-classified alpha-masked triangles are bucketed by locality at load
-(5.1 M of them across the world, into 132 cells), each cell becomes an instance
-in a top-level acceleration structure rebuilt every frame, and the ray BVH
-grows one **gateway** node per cell so a ray shifts into that cell's rest space
-once on entry instead of paying for the displacement per triangle. Because the
-motion lives in the structure rather than in a vertex program, every ray sees
-it: swaying leaves cast swaying shadows, occlude bounce rays, and dapple the
-courtyard. All three tracers animate. `--no-foliage-sway` pins the rest pose.*
+*Wind in the leaves — and the leaves are **geometry**, not a shader trick. Leaf and
+bark triangles are welded and grouped into **plants** at load — 2,048 of them across
+the world's seven islands — then bucketed by locality into 3,086 cells, 7.3 M
+triangles in all. Each cell becomes an instance in a top-level acceleration structure
+rebuilt every frame, and the ray BVH grows one **gateway** node per cell so a ray
+shifts into that cell's rest space once on entry instead of paying for the
+displacement per triangle. The pose is a rooted horizontal shear, so a plant bends
+from its base rather than sliding, and its trunk, branches and canopy move as one
+body. Because the motion lives in the structure rather than in a vertex program,
+every ray sees it: swaying leaves cast swaying shadows, occlude bounce rays, and
+dapple the courtyard — and it carries real motion vectors, so the temporal upscalers
+see it too. All three tracers animate. `--no-foliage-sway` pins the rest pose;
+`--foliage-amp 0.5` halves the wind.*
 
 <table>
 <tr>
@@ -467,9 +471,22 @@ cargo run --release -- --cinematic hero --cinematic-island san-miguel \
 cargo run --release -- --cinematic foliage --cinematic-gi \
                         --cinematic-res 1280x536 --cinematic-samples 32
 
-# the lap, as released: 4K, 60 fps, HDR10
+# the lap, as released: 4K, 60 fps, HDR10. No --cinematic-gi, so this one
+# reconstructs through the upscaler chain at 100% scale — see below
 cargo run --release -- --cinematic tour --cinematic-frames 1200 --cinematic-fps 60 \
                         --cinematic-res 3840x2160 --cinematic-hdr
+
+# the clouds A/B pair — the same shot twice, one flag apart
+cargo run --release -- --cinematic hero --cinematic-island rungholt --cinematic-gi \
+                        --cinematic-res 1280x720 --cinematic-samples 96 [--no-clouds]
+
+# the HUD and the pause menu, over Bistro's street
+cargo run --release -- --cinematic hud --cinematic-island bistro --cinematic-gi \
+                        --cinematic-res 1280x720 [--cinematic-hud settings:Renderer]
+
+# the quadtree overlay, on the procedural scene
+cargo run --release -- --cinematic hero --no-world --cinematic-overlay \
+                        --cinematic-res 1600x900 --cinematic-samples 96
 ```
 
 `--cinematic` renders stills and camera-spline sequences (closed-loop
@@ -492,13 +509,24 @@ brightening the sky or bending the tonemap would be a lie about the lighting,
 whereas opening the aperture is what a photographer does. Zero stops is exactly
 a no-op, so every capture that predates it is unchanged.
 
-It is not just a screenshot key. Because every output frame is a **static
-pose** that accumulates N sub-frames, it is the only path in the tree that can
-render a moving camera *with* hemisphere-bounce global illumination — the
-interactive renderer can't, because that integrator is still-frames-only. And
-with no upscaler available headlessly, all antialiasing comes from
-accumulation, which for a still is better than what the window shows: converged
-ground truth with no reconstruction artefacts.
+It is not just a screenshot key. Every output frame is a **static pose** rendered
+as N sub-frames, and that buys two things a live session cannot have. The first is
+hemisphere-bounce global illumination under a *moving camera* — the interactive
+renderer can't, because that integrator is still-frames-only, and `--cinematic-gi`
+is the only way to get it on a spline.
+
+The second is the upscaler chain, which is no longer a window-only feature: the GPU
+arms probe DLSS-RR → FSR4-RR → XeSS → FSR 3.1 headlessly and run the winner at
+**100% render scale**, so it reconstructs rather than upscales and the frame written
+out is the model's own output. Every sub-frame is a fresh jittered frame with real
+motion vectors — including the foliage's — and the model integrates them, which is
+what a temporal model is for. The chain flags steer it; `--no-upscale`, `--cpu`, or
+an exhausted chain fall back to plain sub-frame accumulation, loudly. A **GI shot
+always takes the accumulation path**, because the bounce integrator needs
+accumulating stills — which is precisely what preserves the first capability. One
+honest consequence: a reconstructed shot depends on which level the adapter supports
+(DLSS-RR here, XeSS on Arc), so the lap above is reproducible on the same hardware
+rather than universally bit-identical. Every still on this page is accumulated.
 
 The `foliage` preset is the one shot in the catalogue that *cannot* be a still,
 and it is the only one with a locked-off camera. Leaf sway is a per-frame
@@ -589,15 +617,26 @@ attribution is stated there.
 > line and the world is simply smaller.
 
 The **source** is [MIT](LICENSE). The scenes are not: each carries its own
-licence — several are non-commercial, several require attribution, and one
-(`scenes/sponza-khronos/`) is a proprietary CryEngine agreement rather than a
-Creative Commons one. The vendor SDKs are downloaded from their owners rather
-than redistributed here. See [LICENSE](LICENSE) for the full scope.
+licence — several are non-commercial, several require attribution, two carry a
+**share-alike** term, and one (`scenes/sponza-khronos/`) is a proprietary
+CryEngine agreement rather than a Creative Commons one. The vendor SDKs are
+downloaded from their owners rather than redistributed here. See
+[LICENSE](LICENSE) for the full scope.
 
 Scenes from the [McGuire Computer Graphics Archive](https://casual-effects.com/data/),
 the [Khronos glTF sample assets](https://github.com/KhronosGroup/glTF-Sample-Assets),
 and Amazon Lumberyard. Ambience is CC0. Slint is used under its Royalty-Free
 licence. The Stanford bunny and the Utah teapot are where they always are.
+
+**The two Minecraft scenes wear borrowed clothes, deliberately.** Rungholt and
+Vokselia arrived as Mineways exports with Mojang's default block textures baked
+into their atlases — copyrighted art whose usage guidelines do not permit
+redistribution. Both atlases were rebuilt cell-for-cell from
+[Pixel Perfection](https://github.com/Athemis/PixelPerfectionCE) by Hugh
+"XSSheep" Rutland and contributors (CC BY-SA 4.0), on the identical layout so
+the OBJ UVs never moved. The derived atlases are CC BY-SA 4.0 in turn — credit
+*"Pixel Perfection by XSSheep and contributors, CC BY-SA 4.0"* and keep the
+licence if you redistribute them.
 
 **Intel Sponza is referenced but not shipped.** Several measurements in the
 appendix were taken on it, and it is still supported as a scene argument — but

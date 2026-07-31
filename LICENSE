@@ -64,7 +64,22 @@ redistributes, each of which carries its own terms:
     Vokselia Spawn CC BY 3.0, Hairball CC BY 3.0, Damaged Helmet CC BY 4.0)
     or an explicit permissive grant (Rungholt), and the ambience audio is
     CC0. Those permit redistribution provided attribution is given — see
-    each directory's credit file for the required wording.
+    each directory's credit file for the required wording. Vokselia's
+    CC BY 3.0 also requires that changes be INDICATED; they are listed in
+    `scenes/vokselia-spawn/credits_license.txt`.
+
+    SHARE-ALIKE, and it applies to two scenes. The Rungholt and Vokselia
+    Spawn TEXTURE ATLASES are not the ones their Mineways conversions
+    shipped: those embedded Mojang's default block textures, which may not
+    be redistributed. They were rebuilt cell-for-cell (same atlas layout,
+    so the OBJ UVs are unchanged) from Pixel Perfection, by Hugh "XSSheep"
+    Rutland and contributors, under CC BY-SA 4.0. The derived atlases are
+    therefore themselves CC BY-SA 4.0 — a copyleft term, stronger than
+    attribution alone — and anything redistributing them must credit
+    "Pixel Perfection by XSSheep and contributors, CC BY-SA 4.0" and keep
+    the same licence on the atlas images. This affects the atlas images
+    only: Rungholt's geometry keeps kescha's permissive grant and
+    Vokselia's keeps CC BY 3.0, so both scenes are dual-licensed.
 
     Intel Sponza is referenced by the docs and supported as a scene argument
     but is NOT in this repository: its terms grant personal and educational
