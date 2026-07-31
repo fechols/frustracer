@@ -416,6 +416,95 @@ const SKY_SPLIT: u32 = 128;
 /// reps erase completely. Same lesson the spp bench row already carries.
 const WIDE_LEVELS: u32 = 6;
 
+/// R&D lever (`FR_WIDE`): the crossover LEVEL itself, not just on/off.
+///
+/// `--no-wide-levels` can only answer "is the cooperative kernel worth it at
+/// all"; it cannot find the boundary, and the boundary is the whole design —
+/// the doc above argues a crossover EXISTS and pins it with a two-point sweep
+/// (0 vs 6) that never tested the levels either side of the value it shipped.
+///
+/// **This needs re-sweeping, and the reason is instructive.** That two-point
+/// table, and an RDNA4 sweep done on top of it (which found 7 better than 6 by
+/// 5.6-10.1% on an R9700, by halving what was then the ladder's most expensive
+/// level), were both measured when `LEAF_TILE` was 8 — i.e. `depth_full` = 8 at
+/// 1080p, so levels 6 and 7 existed and were the first two to fall off the wide
+/// kernel. At today's `LEAF_TILE` = 32, `depth_full(1920, 1080)` is **6**: the
+/// levels are 0..5, `d < 6` and `d < 99` are the SAME PREDICATE, "7" would be a
+/// literal no-op, and where the crossover sits under a coarse frontier is
+/// simply unmeasured. Sweep it here rather than reasoning about it.
+///
+/// The crossover is an ABSOLUTE level, not `depth_full - 1`: what decides a
+/// level is its TILE COUNT (a level holds at most 4^d tiles, and the private
+/// DFS starts winning once the serial kernel has enough tiles to fill the
+/// machine with short descents), not its distance from the leaf frontier.
+/// Deriving it from `depth_full` would make the deepest level serial at every
+/// resolution, which measured -15.8% WORSE at 960x540.
+///
+/// 0 == `--no-wide-levels`; a value past `depth_full` makes every level wide.
+/// Read by both consumers — the ExecuteIndirect ladder and the work graph's
+/// `WG_WIDE_LEVELS` — so the two arms cannot disagree about the crossover.
+fn wide_levels() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| match std::env::var("FR_WIDE") {
+        Err(_) => WIDE_LEVELS,
+        Ok(v) => match v.parse::<u32>() {
+            Ok(n) => {
+                eprintln!("gpu: FR_WIDE={n} (default {WIDE_LEVELS}) — wide levels 0..{n}");
+                n
+            }
+            // Never fall back silently: a sweep that measures the shipping
+            // config while believing it measured the lever is the exact
+            // failure mode these levers exist to prevent.
+            Err(e) => {
+                eprintln!("gpu: FR_WIDE={v:?} is not a level ({e}) — using {WIDE_LEVELS}");
+                WIDE_LEVELS
+            }
+        },
+    })
+}
+
+/// R&D lever (`FR_LSTACK`): the per-lane frustum traversal-stack depth
+/// (`LANE_STACK` in frustum.hlsli), and with it the tracer's ONLY groupshared
+/// allocation — `groupshared uint g_stack[32 * LANE_STACK]`, 8 KB/group at the
+/// shipping 64.
+///
+/// Worth a lever because RGA on gfx1201 says the kernels carrying the slab are
+/// nowhere near VGPR-limited (`cs_level_wide` 54 VGPR, `cs_level` 65, against
+/// `cs_leaf`'s 216), so LDS — this slab — is what caps their resident groups,
+/// and nothing had ever measured what shrinking it buys.
+///
+/// A power of two in 8..=64. **64 is a hard ceiling**: refine_cut emits its
+/// surviving cut into one 64-u32 `cut_pool` slot, and its `olen + wlen <=
+/// LANE_STACK` invariant is what keeps that write in bounds. Going lower is
+/// always SOUND — the stack-pressure arm folds the node in as a coarse lower
+/// bound, and a smaller t_start can only trace MORE rays, never miss a hit — so
+/// it is a pure occupancy-vs-pruning trade. It is not image-neutral on AMD,
+/// which re-origins at TMin: a 1-2 ulp shift in reported t can flip a grazing
+/// occlusion bit, the documented class. NVIDIA stays bit-exact. It also shrinks
+/// the wide kernel's frontier, `WQ_CAP = 16 * LANE_STACK`, which keeps its 16x
+/// headroom over `cut_len <= LANE_STACK` at any setting — that ratio is why the
+/// seed loop's silent-drop arm stays unreachable, so scale the two together if
+/// either ever moves.
+fn lane_stack() -> u32 {
+    const DEFAULT: u32 = 64;
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| match std::env::var("FR_LSTACK") {
+        Err(_) => DEFAULT,
+        Ok(v) => match v.parse::<u32>() {
+            Ok(n) if n.is_power_of_two() && (8..=64).contains(&n) => {
+                eprintln!("gpu: FR_LSTACK={n} (default {DEFAULT}) — {} B/group", 32 * n * 4);
+                n
+            }
+            _ => {
+                eprintln!(
+                    "gpu: FR_LSTACK={v:?} is not a power of two in 8..=64 — using {DEFAULT}"
+                );
+                DEFAULT
+            }
+        },
+    })
+}
+
 /// The `--no-wide-levels` A/B lever. When false, every quadtree level runs the
 /// one-thread-per-tile `cs_level` (the pre-cooperative ladder), so the feature
 /// can be measured against its own absence — the codebase's standard perf A/B.
@@ -4049,6 +4138,14 @@ impl TraceGpu {
         // at t0 in place of the binary nodes. --no-ftree keeps the binary path.
         let ftree_on = crate::ftree::FTREE_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
         let ft_defs = if ftree_on { "#define FTREE 1" } else { "" };
+        // The per-lane frustum stack depth — the tracer's ONLY groupshared, and
+        // therefore the only thing that can cap resident GROUPS in the level and
+        // hemi kernels, which RGA shows are nowhere near VGPR-limited
+        // (cs_level_wide 54 VGPR against cs_leaf's 216). Injected into exactly
+        // the units that paste frustum.hlsli; the work graph inherits it through
+        // wavefront_src. See lane_stack() before sweeping it.
+        let ls_defs = format!("#define LANE_STACK {}u", lane_stack());
+        let ls_defs = ls_defs.as_str();
         // The cbuffer's jitter-table size (--spp) — every unit sees the cbuffer.
         let sd = spp_defs();
         let sd = sd.as_str();
@@ -4128,6 +4225,7 @@ impl TraceGpu {
             wavefront_ablation_defs.as_str(),
             empty_def,
             ft_defs,
+            ls_defs,
             sw_defs,
             sw_leaf_defs,
             sd,
@@ -4182,6 +4280,7 @@ impl TraceGpu {
         // the tile path. record_hemi rebinds the binary buffer at t0.
         let hemi_wave_src = [
             defs,
+            ls_defs,
             sw_defs,
             sd,
             TRACE_COMMON_HLSLI,
@@ -4269,7 +4368,7 @@ impl TraceGpu {
                 // would make the node's self-output an illegal cycle.
                 let dfull = depth_full(rw, rh);
                 let wl = if WIDE_LEVELS_ON.load(std::sync::atomic::Ordering::Relaxed) {
-                    WIDE_LEVELS
+                    wide_levels()
                 } else {
                     0
                 };
@@ -5079,7 +5178,7 @@ impl TraceGpu {
                 // (32). See WIDE_LEVELS for why the crossover exists at all;
                 // --no-wide-levels (WIDE_LEVELS_ON) forces the serial ladder.
                 let wide = WIDE_LEVELS_ON.load(std::sync::atomic::Ordering::Relaxed)
-                    && d < WIDE_LEVELS;
+                    && d < wide_levels();
                 let per_group = if wide { 1 } else { 32 };
                 list.SetPipelineState(&self.pso_prep);
                 self.push(list, [in_ctr, out_ctr, per_group, d]);

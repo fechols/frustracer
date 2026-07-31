@@ -33,7 +33,21 @@ StructuredBuffer<BvhNode> bvh_nodes : register(t0);
 #define HAVE_BVH_NODES 1
 #endif
 
+// Per-lane traversal-stack depth, in u32. trace.rs::lane_stack() is the source
+// of truth and injects it (swept with FR_LSTACK); this fallback only serves a
+// unit that pastes this file without injecting, and is kept in lockstep.
+//
+// 64 is the CEILING, not a free knob: refine_cut writes its surviving cut into
+// one `cut_pool` slot, and a slot is 64 u32, so LANE_STACK > 64 would run off
+// the end of it. Going BELOW is always SOUND — the stack-pressure arm folds the
+// node in as a coarse lower bound, and a smaller t_start can only trace MORE
+// rays, never miss a hit — so it is a pure occupancy-vs-pruning trade. It is
+// NOT image-neutral on AMD, whose RT hardware re-origins the ray at TMin: a
+// different t_start moves the reported t by 1-2 ulp, which can flip a grazing
+// occlusion bit (see CLAUDE.md's --check-gpu AMD note). NVIDIA is bit-exact.
+#ifndef LANE_STACK
 #define LANE_STACK 64u
+#endif
 groupshared uint g_stack[32 * LANE_STACK];
 
 // Screen-tile frustum: apex + 4 inward unit normals through it.

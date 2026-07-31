@@ -36,6 +36,56 @@ fn load_dll(dir: &str, name: &str) -> Result<HMODULE> {
 
 type CreateFn = unsafe extern "system" fn(*const GUID, *const GUID, *mut *mut c_void) -> HRESULT;
 
+/// R&D lever (`FR_DUMP_HLSL=<dir>`): write every assembled kernel source to
+/// disk just before it is compiled.
+///
+/// The kernels do not exist as files. `trace.rs` and `dxr.rs` build each
+/// compile unit by concatenating `.hlsli` fragments with injected `#define`s —
+/// the per-scene alpha-cutout / tinted-shadow / BLAS-split arms, the frustum
+/// structure (`FTREE`), `LANE_STACK`, `LEAF_GROUP`, `SKY_GROUP`/`SKY_SPLIT`,
+/// `MAX_SPP`, `SKY_LOD`, `CLOUD_SHADOW_N`, `LEAF_NO_FB`, the work-graph arm —
+/// so what DXC actually sees is not any file under `src/gpu/shaders/`. That
+/// leaves offline tooling with nothing to point at: Radeon GPU Analyzer (RDNA
+/// VGPR/SGPR/LDS/occupancy per kernel — the numbers behind leaf.hlsl's "VGPR
+/// count sets occupancy directly on RDNA"), or any DXIL disassembler. This
+/// dumps the real thing.
+///
+/// One file per (unit, entry, target), named so the RGA invocation is
+/// mechanical:
+/// ```text
+///     rga -s dxil -c gfx1201 --function <entry> -p <target> \
+///         --additional-args "-HV 2021 -O3" <file>
+/// ```
+/// The HLSL-version flag is NOT optional: `compile` below passes `-HV 2021`
+/// and the kernels use 2021-only constructs (`frustum.hlsli`'s `select()`),
+/// which a default DXC front end rejects — every unit that pastes that file,
+/// i.e. every unit worth profiling, fails to build offline without it. `-O3`
+/// matches the shipping arm; RGA's own default is not the same shader.
+///
+/// Compilation is unaffected — the dump is a side effect on the way in, and a
+/// write failure is one loud line, never fatal. Off by default and inert:
+/// `var_os` is read once, so an unset lever costs one `OnceLock` load.
+fn dump_dir() -> Option<&'static std::path::PathBuf> {
+    static D: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    D.get_or_init(|| {
+        let p = std::path::PathBuf::from(std::env::var_os("FR_DUMP_HLSL")?);
+        match std::fs::create_dir_all(&p) {
+            Ok(()) => {
+                eprintln!(
+                    "gpu: FR_DUMP_HLSL — dumping assembled kernel sources to {}",
+                    p.display()
+                );
+                Some(p)
+            }
+            Err(e) => {
+                eprintln!("gpu: FR_DUMP_HLSL={} unusable ({e}) — not dumping", p.display());
+                None
+            }
+        }
+    })
+    .as_ref()
+}
+
 pub struct Dxc {
     /// Load order matters and both stay resident: dxil.dll first (dxcompiler
     /// finds the already-loaded validator in the module list — unsigned DXIL
@@ -89,6 +139,22 @@ impl Dxc {
         what: &str,
         debug: bool,
     ) -> Result<Vec<u8>> {
+        if let Some(dir) = dump_dir() {
+            // Filenames must survive being handed to a shell and to RGA, and
+            // `what` carries hyphens/spaces in places ("dxr-lib"), so keep the
+            // charset boring rather than trusting every call site.
+            let safe = |s: &str| -> String {
+                s.chars()
+                    .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+                    .collect()
+            };
+            // A library target (the DXR RTPSO) compiles with no entry point.
+            let e = if entry.is_empty() { "lib" } else { entry };
+            let path = dir.join(format!("{}.{}.{}.hlsl", safe(what), safe(e), safe(target)));
+            if let Err(err) = std::fs::write(&path, src) {
+                eprintln!("gpu: FR_DUMP_HLSL: writing {} failed: {err}", path.display());
+            }
+        }
         let mut args: Vec<String> = vec![
             "-T".into(),
             target.into(),

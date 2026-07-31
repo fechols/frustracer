@@ -2114,6 +2114,25 @@ CPU tracer −2.2%/−3.3% (`--spin path`, default / san-miguel-lp) — no mode 
 
 The ladder was **under-occupied**, not dispatch-bound: level d holds at most 4^d tiles, so under one-thread-per-tile levels 0-4 are ≤ 256 threads, while each of those tiles does the MOST work of any level (a shallow frustum covers a large fraction of the screen and its inherited cut has barely been refined). Level 0 is literally one lane descending a 1.8M-node BVH. **`cs_level_wide`** (`trace::WIDE_LEVELS`) gives the shallowest levels ONE GROUP PER TILE: 32 lanes share a breadth-first frontier that aliases frustum.hlsli's per-lane stack slab (zero extra groupshared — the phase and refine_cut's never overlap, the same argument the serial path already makes), `best` reduced by a min on the float bit pattern (exact for non-negative floats — `gw_min_if`, wave-reduced then one `InterlockedMin` per wave), with the serial path's stack-pressure fallback preserved verbatim on frontier overflow. It is a BFS, so the *pruning order* differs and node counts differ — but `best` is a min over the same candidate set and is order-independent, which is why the same-seed image A/B comes back at its old value to the digit. Deep levels keep the per-thread kernel: thousands of tiles with tight cuts and short descents, where a whole group per tile would waste 31 lanes (WIDE 8 measured WORSE than not doing it at all on Intel). Both frustum structures are implemented, so `--no-ftree` is gated too. Measured (interleaved, 3 reps, medians): **B70 −7.4% / −30.4% / −2.4%** and **4090 −1.5% / −11.1% / −23.1%** on default / `--stress 5000` / San Miguel. A naive single-shot sweep "showed" a 9-16% NVIDIA regression that the interleaved reps erase entirely — the 4090 spans 1.42-1.98 ms for one unchanged config while the B70 repeats within 0.002.
 
+**The AMD (RDNA4) campaign, 2026-07-24 — the R9700 row every table was missing, and two constants held back pending a re-sweep.** The box gained a **Radeon AI PRO R9700** (Navi 48, RDNA4) beside the 4070 Ti, which retires the standing "RDNA has no measurement here" excuse in `main::vendor_defaults`. Two facts made the campaign cheap and are worth keeping. First, **the R9700 is a metrology-grade card**: 6 repeats of one config span **0.933-0.935 ms (±0.2%)**, B70-class determinism, so a single 600-frame run resolves anything above ~1% — the opposite of the 4070 Ti, whose spread reaches 15-22% on the same rows and where only the *ladder* (which is what these constants move) is readable at all. Second, **`--spin-frames` must be a multiple of `SPIN_LAP` = 600**: the pose is a pure function of the frame index, so a 200-frame run samples a third of the camera loop and is a *different workload*, not a noisier sample of the same one.
+
+Two instruments came out of it and are IN. **`FR_DUMP_HLSL=<dir>`** (dxc.rs) writes every *assembled* kernel to disk, since kernels are built by string concatenation and no file on disk is what DXC sees; with the dump, **Radeon GPU Analyzer** (`SDKs/rga`, gitignored with the rest of `SDKs/*`) compiles them offline for `gfx1201`. Note the recipe needs the HLSL version passed through — `frustum.hlsli` uses `select()`, an HLSL 2021 intrinsic, so a default DXC front end rejects exactly the units worth profiling (the doc comment carries the full invocation). **`FR_WIDE`** and **`FR_LSTACK`** sweep `WIDE_LEVELS` and `LANE_STACK`, which `--no-wide-levels` could only turn off, never place. RGA finally answers the question `leaf.hlsl` has always asserted:
+
+```text
+  kernel        grp  VGPR   LDS   waves/SIMD (VGPR-limited, of 16)
+  leaf-fb        32   240   2048    6      <- the arm LEAF_NO_FB compiles out
+  hemi_cell      32   240  10240    6
+  leaf           32   216   2048    7      <- 44% occupancy, the hot kernel
+  reference       8   214   4096    7
+  level          32    65   8192   16
+  level_wide     32    54   8704   16      <- NOT VGPR-limited; LDS is its cap
+  sky            64    40      0   16
+```
+
+So "VGPR count sets occupancy directly on RDNA" is measured, not asserted: `cs_leaf` runs at 7 of 16 waves and `leaf-fb`'s extra 24 VGPRs cost a whole wave slot — the mechanism behind `LEAF_NO_FB`'s documented -11%. It also **refutes** the natural follow-on guess: the level kernels are nowhere near register-bound, so anything throttling the ladder is the LDS slab, not registers.
+
+**Both constants the sweeps proposed (`WIDE_LEVELS` 6 → 7, `LANE_STACK` 64 → 32) were measured on a tree that predates the coarse leaf frontier** (`LEAF_TILE` 8 → 32, `LEAF_GROUP` 32 → 256), which moves the ground under both — so neither is adopted here. The levers exist so the re-sweep is one command rather than an argument.
+
 ## Intel Arc / Xe2 (Battlemage): what the hardware actually offers
 
 Researched 2026-07-26 against primary sources (Intel's *Arc Graphics Developer Guide for
