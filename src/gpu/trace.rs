@@ -463,30 +463,69 @@ fn wide_levels() -> u32 {
     })
 }
 
-/// R&D lever (`FR_LSTACK`): the per-lane frustum traversal-stack depth
-/// (`LANE_STACK` in frustum.hlsli), and with it the tracer's ONLY groupshared
-/// allocation — `groupshared uint g_stack[32 * LANE_STACK]`, 8 KB/group at the
-/// shipping 64.
+/// The per-lane frustum traversal-stack depth (`LANE_STACK` in frustum.hlsli),
+/// and with it the tracer's ONLY groupshared allocation:
+/// `groupshared uint g_stack[32 * LANE_STACK]` — 8 KB/group at 64, 2 KB at 16.
 ///
-/// Worth a lever because RGA on gfx1201 says the kernels carrying the slab are
-/// nowhere near VGPR-limited (`cs_level_wide` 54 VGPR, `cs_level` 65, against
-/// `cs_leaf`'s 216), so LDS — this slab — is what caps their resident groups,
-/// and nothing had ever measured what shrinking it buys.
+/// **16, was 64 (2026-07-31).** RGA on gfx1201 says the kernels carrying the
+/// slab are nowhere near VGPR-limited (`cs_level_wide` 54 VGPR, `cs_level` 65,
+/// against `cs_leaf`'s 216), so LDS — this slab — is what caps their resident
+/// groups. Quartering it roughly quadruples resident groups and the ladder
+/// responds almost linearly. `--spin path` 1080p spp=1, GPU frame span, R9700
+/// medians of 2 at 600 frames (spread ±0.2%), 4070 Ti medians of 3 at 1200
+/// frames INTERLEAVED (spread 15-25% otherwise — never read a single sample):
+/// ```text
+///                        64      32      16       8      64 -> 16
+///   R9700 default      0.728   0.672   0.637   0.616      -12.5%
+///   R9700 stress 5000  1.066   0.974   0.903   0.861      -15.3%
+///   R9700 san-miguel   0.750   0.700   0.662   0.651      -11.7%
+///   R9700 powerplant   0.725   0.665   0.629   0.618      -13.2%
+///   4070Ti default     0.982   0.936   0.891   0.877       -9.3%
+///   4070Ti stress      1.149   1.039   0.906   0.805      -21.1%
+///   4070Ti san-miguel    --      --    0.990   0.938         --
+///   4070Ti powerplant  0.921     --    0.774   0.802      -16.0%
+/// ```
+/// The R9700 san-miguel row is a RE-MEASUREMENT: the first pass read
+/// 1.429/1.388/1.347/1.333 because the AMD candidate-loop TMin defect
+/// (`rt.hlsli::cand_tmin`) was still live and cost that scene ~2x. Every AMD
+/// number taken on a TEXTURED scene before that fix is contaminated the same
+/// way; the untextured rows are unaffected (no candidate loop compiles).
+/// The `leaf` region is the built-in control — it pastes neither frustum.hlsli
+/// nor the slab — and on the R9700 it does not move at any setting (default
+/// 0.501/0.506/0.500/0.500), which is what pins the win to LDS occupancy and
+/// not to some second effect.
 ///
-/// A power of two in 8..=64. **64 is a hard ceiling**: refine_cut emits its
-/// surviving cut into one 64-u32 `cut_pool` slot, and its `olen + wlen <=
-/// LANE_STACK` invariant is what keeps that write in bounds. Going lower is
-/// always SOUND — the stack-pressure arm folds the node in as a coarse lower
-/// bound, and a smaller t_start can only trace MORE rays, never miss a hit — so
-/// it is a pure occupancy-vs-pruning trade. It is not image-neutral on AMD,
-/// which re-origins at TMin: a 1-2 ulp shift in reported t can flip a grazing
-/// occlusion bit, the documented class. NVIDIA stays bit-exact. It also shrinks
+/// WHY 16 AND NOT 8, WHICH IS FASTER ON 5 OF THE 8 CELLS ABOVE. A shorter stack
+/// coarsens the bound (the pressure arm folds the node in as `best = d`), so
+/// t_start shrinks and leaf rays traverse more. On the R9700 that costs
+/// ~nothing — AMD re-origins the ray at TMin, so the inherited bound is already
+/// "free and worth nothing" there — but on the 4070 Ti TMin really prunes, and
+/// on POWERPLANT (12.8M tris, the case where the bound has the most to prune)
+/// 8 sends `leaf` 0.579 -> 0.637 (+10.0%), which outweighs the extra 0.020 ms
+/// of ladder and makes 8 a net 3.6% REGRESSION there. 16 is the largest step
+/// that never regresses any measured (vendor, scene) pair. The occupancy-vs-
+/// pruning trade is vendor-asymmetric *because the value of the inherited bound
+/// is*, and the crossover moves with the leaf frontier: on the pre-`LEAF_TILE`
+/// 8 -> 32 tree the same wall sat between 32 and 16 (16 measured +44% leaf on a
+/// 4070 Ti); the coarse frontier made the leaf kernel less TMin-sensitive and
+/// moved it down one notch. Expect it to move again — always sweep BOTH vendors
+/// and score `leaf` as well as the ladder.
+///
+/// R&D lever (`FR_LSTACK`), a power of two in 8..=64. **64 is a hard ceiling**:
+/// refine_cut emits its surviving cut into one 64-u32 `cut_pool` slot, and its
+/// `olen + wlen <= LANE_STACK` invariant is what keeps that write in bounds.
+/// Going lower is always SOUND — a smaller t_start can only trace MORE rays,
+/// never miss a hit — and gated: `--check-gpu` passes at 8 and 16 on both
+/// vendors with every exact-zero counter at 0, and NVIDIA stays BIT-EXACT
+/// (`max rel t err 0.00e0`, same-seed image mean 0.00e0). It is not
+/// image-neutral on AMD, which re-origins at TMin — a 1-2 ulp shift in reported
+/// t can flip a grazing occlusion bit, the documented class. It also shrinks
 /// the wide kernel's frontier, `WQ_CAP = 16 * LANE_STACK`, which keeps its 16x
 /// headroom over `cut_len <= LANE_STACK` at any setting — that ratio is why the
 /// seed loop's silent-drop arm stays unreachable, so scale the two together if
 /// either ever moves.
 fn lane_stack() -> u32 {
-    const DEFAULT: u32 = 64;
+    const DEFAULT: u32 = 16;
     static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *N.get_or_init(|| match std::env::var("FR_LSTACK") {
         Err(_) => DEFAULT,

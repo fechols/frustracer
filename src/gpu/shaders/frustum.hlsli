@@ -10,7 +10,8 @@
 // DXC's fast-math from re-associating the slacks away.
 //
 // The CPU `visit` is recursive nearer-child-first; here it's an explicit
-// stack in groupshared, partitioned per lane (32 x 64 x 4 B = 8 KB/group).
+// stack in groupshared, partitioned per lane (32 x LANE_STACK x 4 B = 2 KB per
+// group at the shipping 16; see trace.rs::lane_stack for why that depth).
 // Visit ORDER differs from the CPU (correctness is order-independent; node
 // counts differ). The same per-lane slab is reused by refine_cut's work
 // stack — the two phases never overlap in time.
@@ -46,7 +47,7 @@ StructuredBuffer<BvhNode> bvh_nodes : register(t0);
 // different t_start moves the reported t by 1-2 ulp, which can flip a grazing
 // occlusion bit (see CLAUDE.md's --check-gpu AMD note). NVIDIA is bit-exact.
 #ifndef LANE_STACK
-#define LANE_STACK 64u
+#define LANE_STACK 16u
 #endif
 groupshared uint g_stack[32 * LANE_STACK];
 
