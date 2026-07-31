@@ -1435,25 +1435,87 @@ fn perturb_normal(
 /// normalize) so the twin is identical by construction — the clouds-wind
 /// precedent. Animated on the shared cloud clock; every length is
 /// `Scene::diag`-relative (the scale-relative rule).
-const RIPPLE_DIR: [[f32; 2]; 3] = [[0.932, 0.362], [-0.588, 0.809], [0.259, -0.966]];
-const RIPPLE_LAMBDA_K: [f32; 3] = [5.2e-3, 2.9e-3, 1.6e-3]; // wavelength / diag
-const RIPPLE_W: [f32; 3] = [2.1, 3.4, 4.9]; // rad/s; shorter waves faster (dispersion)
-const RIPPLE_A: [f32; 3] = [0.45, 0.32, 0.23]; // slope weights (sum 1.0)
+/// ONE domain-warped directional swell + three octaves of scrolling
+/// gradient-noise chop.
+///
+/// The old field was three fixed sinusoids, and three plane waves beat
+/// against each other on a fixed lattice: the interference pattern repeats,
+/// and on a large expanse (the Minecraft ocean) it reads as tiling. Noise
+/// breaks the repeat; the swell is kept because pure noise has no wave
+/// DIRECTION and open water does.
+///
+/// Everything stays the analytic gradient of a scalar height (`ripple_height`
+/// is that scalar, and the integrability gate differentiates it numerically
+/// and compares). NOT curl noise, which is divergence-free — the exact
+/// opposite property, and it would give normals no consistent heightfield.
+/// A sum of scalars is still a scalar, so the four layers may each scroll at
+/// their own velocity (which is what stops the whole field sliding rigidly)
+/// without costing integrability at any instant.
+const RIPPLE_SWELL_DIR: [f32; 2] = [0.932, 0.362]; // the cloud-wind direction
+const RIPPLE_SWELL_LK: f32 = 5.2e-3; // swell wavelength / diag
+const RIPPLE_SWELL_W: f32 = 2.1; // rad/s
+const RIPPLE_SWELL_A: f32 = 0.42; // slope weight
+const RIPPLE_WARP_LK: f32 = 2.4e-2; // warp wavelength / diag (low frequency)
+const RIPPLE_WARP_PHI: f32 = 2.6; // radians of phase the warp can bend a crest
+/// Chop octaves: wavelength/diag, slope weight, and scroll velocity in
+/// wavelengths/s. Distinct directions AND rates — equal ones re-alias.
+const RIPPLE_CHOP: [(f32, f32, [f32; 2]); 3] = [
+    (3.3e-3, 0.30, [-0.31, 0.42]),
+    (1.7e-3, 0.22, [0.55, -0.24]),
+    (8.5e-4, 0.15, [-0.18, -0.61]),
+];
 
-/// ∂h/∂x, ∂h/∂z of the virtual ripple height at world point `p`, time `t`.
+/// The scalar virtual ripple HEIGHT at world point `p`, time `t`.
+///
+/// Only the self-test consumes this — shading needs the gradient, not the
+/// height — but it is the definition `ripple_grad` differentiates, and the
+/// gate numerically differentiates THIS and compares, which is a mechanized
+/// proof of integrability the old sinusoids never had.
+pub(crate) fn ripple_height(p: Vec3A, t: f32, diag: f32) -> f32 {
+    let pxz = glam::Vec2::new(p.x, p.z);
+    let d0 = glam::Vec2::from(RIPPLE_SWELL_DIR);
+    let l_sw = RIPPLE_SWELL_LK * diag;
+    let (nw, _) = crate::clouds::vnoise_vg(pxz / (RIPPLE_WARP_LK * diag), 16);
+    let theta = std::f32::consts::TAU * (d0.dot(pxz) / l_sw) - RIPPLE_SWELL_W * t
+        + RIPPLE_WARP_PHI * nw;
+    let mut h = RIPPLE_SWELL_A * (l_sw / std::f32::consts::TAU) * theta.sin();
+    for (k, &(lk, a, v)) in RIPPLE_CHOP.iter().enumerate() {
+        let l = lk * diag;
+        let q = pxz / l - glam::Vec2::from(v) * t;
+        let (n, _) = crate::clouds::vnoise_vg(q, 17 + k as u32);
+        h += a * l * n;
+    }
+    h
+}
+
+/// ∂h/∂x, ∂h/∂z of `ripple_height` — the analytic gradient, in closed form.
 ///
 /// `pub(crate)` for the frame-generation guide pass, which evaluates the field
 /// at two times to derive the previous frame's mirror normal
 /// (`gpu::ngxfg_guides`). One CPU source of truth; the GPU twin is
 /// shaders/ripple.hlsli.
 pub(crate) fn ripple_grad(p: Vec3A, t: f32, diag: f32) -> glam::Vec2 {
-    let mut g = glam::Vec2::ZERO;
     let pxz = glam::Vec2::new(p.x, p.z);
-    for i in 0..3 {
-        let d = glam::Vec2::from(RIPPLE_DIR[i]);
-        let ph = std::f32::consts::TAU * (d.dot(pxz) / (RIPPLE_LAMBDA_K[i] * diag))
-            - RIPPLE_W[i] * t;
-        g += d * (RIPPLE_A[i] * ph.cos());
+    let d0 = glam::Vec2::from(RIPPLE_SWELL_DIR);
+    let l_sw = RIPPLE_SWELL_LK * diag;
+    let l_wp = RIPPLE_WARP_LK * diag;
+    // Swell, differentiated through the warp by the chain rule: the crest
+    // direction picks up the warp's own gradient, which is what bends each
+    // wave uniquely instead of repeating it.
+    let (nw, gw) = crate::clouds::vnoise_vg(pxz / l_wp, 16);
+    let theta = std::f32::consts::TAU * (d0.dot(pxz) / l_sw) - RIPPLE_SWELL_W * t
+        + RIPPLE_WARP_PHI * nw;
+    // d(theta)/dp = TAU/l_sw * d0 + PHI * gw / l_wp; the leading
+    // A*(l_sw/TAU) of the height cancels the TAU/l_sw, leaving A*cos*d0.
+    let dtheta = d0 * (std::f32::consts::TAU / l_sw) + gw * (RIPPLE_WARP_PHI / l_wp);
+    let mut g = dtheta * (RIPPLE_SWELL_A * (l_sw / std::f32::consts::TAU) * theta.cos());
+    // Chop: h_k = a*l*n(p/l - v t) ⇒ ∇h_k = a*∇n (the l cancels), so the
+    // slope weights stay scale-free exactly like the old sinusoids'.
+    for (k, &(lk, a, v)) in RIPPLE_CHOP.iter().enumerate() {
+        let l = lk * diag;
+        let q = pxz / l - glam::Vec2::from(v) * t;
+        let (_, gn) = crate::clouds::vnoise_vg(q, 17 + k as u32);
+        g += gn * a;
     }
     g
 }
@@ -1703,20 +1765,80 @@ pub fn ripple_self_test() -> Result<(), String> {
             }
         }
     }
-    // (c) Closed-form anchor: the gradient is Σ dir_i·A_i·cos(phase_i). At
-    // p = 0, t = 0 every phase is 0 ⇒ cos = 1, so grad = Σ dir_i·A_i, and the
-    // flat +Y normal tilts to normalize(−grad.x, 1, −grad.y).
-    let mut gx = 0.0f32;
-    let mut gz = 0.0f32;
-    for i in 0..3 {
-        gx += RIPPLE_DIR[i][0] * RIPPLE_A[i];
-        gz += RIPPLE_DIR[i][1] * RIPPLE_A[i];
-    }
     let amp = crate::scene::WATER_RIPPLE_AMP;
-    let want = Vec3A::new(-gx * amp, 1.0, -gz * amp).normalize();
-    let got = ripple_normal(n, n, Vec3A::ZERO, 0.0, amp, diag);
-    if (got - want).length() > 1e-5 {
-        return Err(format!("closed-form anchor: {got:?} != {want:?}"));
+    // (c) INTEGRABILITY, the gate the sinusoid field never had and the one
+    // that matters: `ripple_grad` must be the true gradient of the scalar
+    // `ripple_height`. If it ever stops being one — a stray term, a chain
+    // rule dropped through the domain warp, someone reaching for curl noise —
+    // the normals no longer describe any heightfield and the surface shimmers
+    // with impossible normals, which no image gate would catch as a defect.
+    // Central differences against the analytic gradient, over points and
+    // times, at a step chosen well above f32 cancellation and well below the
+    // shortest wavelength (8.5e-4·diag).
+    {
+        let h = 1e-3f32 * diag * 0.05;
+        let mut worst = 0.0f32;
+        for i in 0..16 {
+            let p = Vec3A::new(i as f32 * 0.41 - 3.0, 0.0, i as f32 * -0.29 + 1.7);
+            for &t in &[0.0f32, 0.8, 3.3] {
+                let dx = (ripple_height(p + Vec3A::new(h, 0.0, 0.0), t, diag)
+                    - ripple_height(p - Vec3A::new(h, 0.0, 0.0), t, diag))
+                    / (2.0 * h);
+                let dz = (ripple_height(p + Vec3A::new(0.0, 0.0, h), t, diag)
+                    - ripple_height(p - Vec3A::new(0.0, 0.0, h), t, diag))
+                    / (2.0 * h);
+                let g = ripple_grad(p, t, diag);
+                worst = worst.max((g.x - dx).abs()).max((g.y - dz).abs());
+            }
+        }
+        if worst > 5e-3 {
+            return Err(format!(
+                "ripple_grad is not the gradient of ripple_height (worst |Δ| {worst}) — \
+                 the field is no longer integrable"
+            ));
+        }
+    }
+    // (c2) Determinism + bounded slope. The amplitude bound is what keeps the
+    // tilt inside the horizon guard by construction rather than by luck.
+    {
+        let mut worst = 0.0f32;
+        for i in 0..64 {
+            let p = Vec3A::new(i as f32 * 1.7 - 50.0, 0.0, i as f32 * -2.3 + 30.0);
+            let t = i as f32 * 0.37;
+            let g = ripple_grad(p, t, diag);
+            if !g.is_finite() {
+                return Err(format!("ripple_grad non-finite at {p:?} t={t}"));
+            }
+            worst = worst.max(g.length());
+            if ripple_grad(p, t, diag) != g {
+                return Err("ripple_grad is not deterministic".into());
+            }
+        }
+        // Σ of the slope weights (0.42 + 0.30 + 0.22 + 0.15) plus the warp's
+        // chain-rule contribution; 2.0 is the design ceiling.
+        if worst > 2.0 {
+            return Err(format!("ripple slope {worst} exceeds the design bound 2.0"));
+        }
+    }
+    // (c3) APERIODICITY — the whole point of the change. The old field was a
+    // sum of plane waves, so translating by a common multiple of the
+    // wavelengths reproduced it; the warp and the noise octaves must not.
+    // Probe a translation that IS a whole number of swell wavelengths: the
+    // pure-sinusoid field would repeat exactly there.
+    {
+        let lam = RIPPLE_SWELL_LK * diag;
+        let d0 = glam::Vec2::from(RIPPLE_SWELL_DIR);
+        let p = Vec3A::new(0.3, 0.0, -0.7);
+        let shift = 32.0 * lam; // 32 swell periods along the crest normal
+        let q = p + Vec3A::new(d0.x * shift, 0.0, d0.y * shift);
+        let a = ripple_grad(p, 0.0, diag);
+        let b = ripple_grad(q, 0.0, diag);
+        if (a - b).length() < 1e-3 {
+            return Err(format!(
+                "field repeats after {shift} (a whole number of swell wavelengths) — \
+                 the warp/noise is not breaking periodicity"
+            ));
+        }
     }
     // (d) Animation: the same point at two times gives different normals (the
     // field advects — a still frame would freeze, which is the known accept).

@@ -512,6 +512,36 @@ fn vnoise(q: Vec2, oct: u32) -> f32 {
     a + (b - a) * uy
 }
 
+/// `vnoise` plus its ANALYTIC gradient — the 2D reduction of `vnoise3_grad`.
+///
+/// Returns (value, d/dq). The water ripple field is built from this because
+/// a ripple normal must be the gradient of a scalar height or the surface
+/// shimmers with impossible normals; taking the derivative in closed form is
+/// what keeps that exact (and lets the frame-generation guide pass evaluate
+/// the same field at two times without a finite difference). Same corner
+/// hashes as `vnoise`, so it shares the AVX2 batch path and stays u32-exact
+/// between CPU and GPU.
+///
+/// d/dt of the smoothstep t²(3−2t) is 6t(1−t).
+pub(crate) fn vnoise_vg(q: Vec2, oct: u32) -> (f32, Vec2) {
+    let fx = q.x.floor();
+    let fy = q.y.floor();
+    let (i, j) = (fx as i32, fy as i32);
+    let (tx, ty) = (q.x - fx, q.y - fy);
+    let ux = tx * tx * (3.0 - 2.0 * tx);
+    let uy = ty * ty * (3.0 - 2.0 * ty);
+    let dux = 6.0 * tx * (1.0 - tx);
+    let duy = 6.0 * ty * (1.0 - ty);
+    let [h00, h10, h01, h11] = corner_hashes(i, j, oct);
+    let a = h00 + (h10 - h00) * ux;
+    let b = h01 + (h11 - h01) * ux;
+    let v = a + (b - a) * uy;
+    // ∂/∂x: the x-lerps' slopes, blended in y. ∂/∂y: the y-lerp's own slope.
+    let gx = ((h10 - h00) + ((h11 - h01) - (h10 - h00)) * uy) * dux;
+    let gy = (b - a) * duy;
+    (v, Vec2::new(gx, gy))
+}
+
 /// 3D value noise in [0, 1): smoothstep-faded trilerp of 8 corner hashes.
 /// This is the erosion field's noise — genuinely varying in all three axes,
 /// which is what breaks the nested-level-set structure a 2D field is stuck
