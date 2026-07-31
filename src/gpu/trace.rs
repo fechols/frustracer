@@ -4410,7 +4410,7 @@ impl TraceGpu {
         // (sway_defs' doc). DXR takes sway_defs verbatim.
         let sway_def = if sw_rays() { "" } else { sway_defs(&scene_gpu) };
         let defs = format!(
-            "{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
             empty_def,
             alpha_defs(scene),
             height_defs(scene),
