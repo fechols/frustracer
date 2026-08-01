@@ -581,6 +581,18 @@ impl DxrGpu {
         name(&cloud_lod, "dxr.cloud_lod");
         name(&cloud_shadow, "dxr.cloud_shadow");
 
+        // The DXR twin of the wavefront's construction vram line (trace.rs):
+        // in a SPACE-cycled session this pipeline's planes land beside a live
+        // TraceGpu and the shared scene core, and WDDM demotes over-budget
+        // commits silently — print where the commit landed.
+        if let Some((usage, budget)) = super::adapter::vram_info(device) {
+            eprintln!(
+                "gpu tracer: dxr planes committed | vram {} / {} MB",
+                usage >> 20,
+                budget >> 20
+            );
+        }
+
         Ok(Self {
             root_sig,
             state,

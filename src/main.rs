@@ -15630,75 +15630,79 @@ fn session(
                             want = RMode::Cpu;
                             continue;
                         }
-                        let compose = dxr_quin_avail
-                            || dxr_rr_avail
-                            || dxr_xess_avail
-                            || dxr_fsr3_avail
-                            || dxr_fsr4_avail;
-                        if compose && opts.lock_scale.is_none() {
-                            lock_dynamic_note("dxr", (dxw, dxh));
-                        }
-                        match gpu::dxc::Dxc::load(&opts.dxc_path).and_then(|dxc| {
-                            gpu.init_dxr(&dxc, scene, bvh, dxw as u32, dxh as u32, compose, opts.gpu_debug, opts.bc7)
-                        }) {
-                            Ok(()) => {
-                                gpu_trace = false;
-                                dxr_on = true;
-                                frame = 0;
-                                // Every enable restores the session default
-                                // sub-mode (a G/X/K plain-toggle doesn't outlive it).
-                                // The fuse is the session default wherever it came up —
-                                // this ladder must stay in lockstep with the init pick,
-                                // or an off/on would silently strand a --quinlight
-                                // session on a single engine with no way back.
-                                dxr_up = if dxr_quin_avail {
-                                    GpuUp::Quin
-                                } else if dxr_rr_avail {
-                                    GpuUp::Rr
-                                } else if dxr_xess_avail {
-                                    GpuUp::Xess
-                                } else if dxr_fsr4_avail {
-                                    GpuUp::Fsr4
-                                } else if dxr_fsr3_avail {
-                                    GpuUp::Fsr3
-                                } else {
-                                    GpuUp::Plain
-                                };
-                                dxr_reset = true;
-                                dxr_prev_cam = None;
-                                // CPU-side denoisers can't run under the DXR arm;
-                                // the CPU upscalers stay wired (fsr_on included —
-                                // every FSR kind composes) — the arm presents
-                                // through the same session contexts, and a return
-                                // to CPU mode resumes them intact.
-                                if oidn_on {
-                                    oidn_on = false;
-                                    eprintln!("oidn: OFF (DXR enabled)");
-                                }
-                                if nppd_on {
-                                    nppd_on = false;
-                                    nppd_prev = None;
-                                    eprintln!("nppd: OFF (DXR enabled)");
-                                }
-                                eprintln!(
-                                    "dxr: DispatchRays pipeline ON at {dxw}x{dxh}{} (SPACE cycles CPU -> GPU -> DXR)",
-                                    match dxr_up {
-                                        GpuUp::Rr => format!(" -> DLSS-RR {w}x{h} (G toggles plain)"),
-                                        GpuUp::Xess => format!(" -> XeSS-SR {w}x{h} (X toggles plain)"),
-                                        GpuUp::Fsr4 => format!(" -> FSR4-RR {w}x{h} (K toggles plain)"),
-                                        GpuUp::Fsr3 => format!(" -> FSR3 {w}x{h} (K toggles plain)"),
-                                        GpuUp::Quin => format!(" -> quinlight fuse {w}x{h}"),
-                                        GpuUp::Plain => String::new(),
-                                    }
-                                );
+                        if !gpu.dxr_ready() {
+                            // First build only — a re-entry into the resident
+                            // pipeline must not re-run Dxc::load (each load is
+                            // a dxil/dxcompiler LoadLibrary pair nothing ever
+                            // frees, plus a per-press hitch), mirroring the
+                            // GPU arm's trace_ready() guard above.
+                            let compose = dxr_quin_avail
+                                || dxr_rr_avail
+                                || dxr_xess_avail
+                                || dxr_fsr3_avail
+                                || dxr_fsr4_avail;
+                            if compose && opts.lock_scale.is_none() {
+                                lock_dynamic_note("dxr", (dxw, dxh));
                             }
-                            Err(e) => {
+                            let built = gpu::dxc::Dxc::load(&opts.dxc_path).and_then(|dxc| {
+                                gpu.init_dxr(&dxc, scene, bvh, dxw as u32, dxh as u32, compose, opts.gpu_debug, opts.bc7)
+                            });
+                            if let Err(e) = built {
                                 eprintln!("dxr: unavailable — {e}");
                                 dxr_failed = true;
                                 want = RMode::Cpu;
                                 continue;
                             }
                         }
+                        gpu_trace = false;
+                        dxr_on = true;
+                        frame = 0;
+                        // Every enable restores the session default
+                        // sub-mode (a G/X/K plain-toggle doesn't outlive it).
+                        // The fuse is the session default wherever it came up —
+                        // this ladder must stay in lockstep with the init pick,
+                        // or an off/on would silently strand a --quinlight
+                        // session on a single engine with no way back.
+                        dxr_up = if dxr_quin_avail {
+                            GpuUp::Quin
+                        } else if dxr_rr_avail {
+                            GpuUp::Rr
+                        } else if dxr_xess_avail {
+                            GpuUp::Xess
+                        } else if dxr_fsr4_avail {
+                            GpuUp::Fsr4
+                        } else if dxr_fsr3_avail {
+                            GpuUp::Fsr3
+                        } else {
+                            GpuUp::Plain
+                        };
+                        dxr_reset = true;
+                        dxr_prev_cam = None;
+                        // CPU-side denoisers can't run under the DXR arm;
+                        // the CPU upscalers stay wired (fsr_on included —
+                        // every FSR kind composes) — the arm presents
+                        // through the same session contexts, and a return
+                        // to CPU mode resumes them intact.
+                        if oidn_on {
+                            oidn_on = false;
+                            eprintln!("oidn: OFF (DXR enabled)");
+                        }
+                        if nppd_on {
+                            nppd_on = false;
+                            nppd_prev = None;
+                            eprintln!("nppd: OFF (DXR enabled)");
+                        }
+                        eprintln!(
+                            "dxr: DispatchRays pipeline ON at {dxw}x{dxh}{} (SPACE cycles CPU -> GPU -> DXR)",
+                            match dxr_up {
+                                GpuUp::Rr => format!(" -> DLSS-RR {w}x{h} (G toggles plain)"),
+                                GpuUp::Xess => format!(" -> XeSS-SR {w}x{h} (X toggles plain)"),
+                                GpuUp::Fsr4 => format!(" -> FSR4-RR {w}x{h} (K toggles plain)"),
+                                GpuUp::Fsr3 => format!(" -> FSR3 {w}x{h} (K toggles plain)"),
+                                GpuUp::Quin => format!(" -> quinlight fuse {w}x{h}"),
+                                GpuUp::Plain => String::new(),
+                            }
+                        );
                         break;
                     }
                     RMode::Cpu => {
@@ -15719,6 +15723,28 @@ fn session(
                         break;
                     }
                 }
+            }
+            // Both hooks fire only when a switch actually LANDED — a refused
+            // press changes nothing, so it neither straddles nor logs.
+            let mode_after = if gpu_trace {
+                RMode::Gpu
+            } else if dxr_on {
+                RMode::Dxr
+            } else {
+                RMode::Cpu
+            };
+            if mode_after != mode_now {
+                // Mode-cycle diagnostic: tracers stay resident once built (the
+                // design above), so the second one lands on top of the first
+                // and the shared scene core. Usage at/over budget here is
+                // WDDM's silent-demotion regime — the 10-100×-no-error
+                // slowdown class (adapter::vram_info's note).
+                if let Some((u, b)) = gpu.vram_now() {
+                    eprintln!("mode: vram {} / {} MB", u >> 20, b >> 20);
+                }
+                // The FG mode-switch straddle (the AMD mode-cycle-slowdown
+                // fix — see GpuContext::fg_mode_switch).
+                gpu.fg_mode_switch(opts.gpu_debug);
             }
         }
 

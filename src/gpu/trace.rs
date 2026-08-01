@@ -4952,6 +4952,19 @@ impl TraceGpu {
         cb_base.cap_hemi_leaf = cap_hemi_cell as u32;
         cb_base.cap_hemi_cut = cap_hemi_cut as u32;
 
+        // Where this construction left the local segment: the window planes +
+        // sw trees land on top of whatever is already committed — the shared
+        // scene core, and in a SPACE-cycled session the OTHER tracer too.
+        // WDDM demotes over-budget commits silently (10-100× slowdown, no
+        // error — the adapter::vram_info note), so the number prints here.
+        if let Some((usage, budget)) = adapter::vram_info(device) {
+            eprintln!(
+                "gpu tracer: wavefront planes+trees committed | vram {} / {} MB",
+                usage >> 20,
+                budget >> 20
+            );
+        }
+
         Ok(Self {
             root_sig,
             cmd_sig,

@@ -247,6 +247,22 @@ struct FgState {
     /// The picked provider (override id + display name) — the boot line and
     /// the title bar read the name.
     version: (u64, String),
+    /// FR_FG_TRACE=1: per-prepare diagnostics (reset prepares, depth/MV
+    /// resource-set swaps) — the AMD mode-cycle-slowdown investigation lever.
+    trace: bool,
+    /// Last prepare's (depth, mvec) resource pointers — a change is the
+    /// render-mode-switch signature the trace reports (each arm feeds FG its
+    /// own planes: CPU-upload vs wavefront-pack vs DXR-pack).
+    last_res: std::cell::Cell<(usize, usize)>,
+    /// Count of live→disabled transitions (the pause/resume lines).
+    pauses: std::cell::Cell<u32>,
+    /// The mode-switch straddle (set by `fg_mode_switch`, consumed by
+    /// `fg_prepare`): skip exactly ONE prepare so the funnel presents one
+    /// frame with the FI proxy configured disabled — the K-toggle sequence
+    /// compressed to a single frame, which is MEASURED (R9700, 2026-07-31) to
+    /// clear the AMD provider's wedged pacing state instead of carrying it
+    /// across the switch's reset+resource+cadence discontinuity.
+    skip_prepare: std::cell::Cell<bool>,
 }
 
 /// Raw-NGX DLSS-G FFI (shim/dlssg_shim.cpp — the quinlight-player blueprint).
@@ -1521,6 +1537,10 @@ impl GpuContext {
                 frame_ms: std::cell::Cell::new(16.6),
                 luminance,
                 version: version.unwrap_or((0, String::new())),
+                trace: std::env::var("FR_FG_TRACE").ok().as_deref() == Some("1"),
+                last_res: std::cell::Cell::new((0, 0)),
+                pauses: std::cell::Cell::new(0),
+                skip_prepare: std::cell::Cell::new(false),
             }
         });
 
@@ -2472,6 +2492,22 @@ impl GpuContext {
 
     pub fn trace_ready(&self) -> bool {
         self.trace.is_some()
+    }
+
+    /// The DXR twin of `trace_ready` — the SPACE/F entry guard, so a re-entry
+    /// into an already-built pipeline skips the per-press `Dxc::load`
+    /// (`init_dxr` is idempotent, but the DXC load at its call site was not:
+    /// each one is a LoadLibrary pair that nothing ever frees).
+    pub fn dxr_ready(&self) -> bool {
+        self.dxr.is_some()
+    }
+
+    /// (usage, budget) of the render adapter's LOCAL segment — the mode-cycle
+    /// diagnostic. A session whose usage sits at/over budget after the second
+    /// tracer lands is in WDDM's silent-demotion regime (the 10-100×-no-error
+    /// slowdown class — `adapter::vram_info`'s note).
+    pub fn vram_now(&self) -> Option<(u64, u64)> {
+        adapter::vram_info(&self.d3d.device)
     }
 
     /// Build-or-fetch the SHARED scene core — the upload + BLAS/TLAS build
@@ -4707,6 +4743,86 @@ impl GpuContext {
         }
     }
 
+    /// The render-mode-switch FG straddle (the AMD mode-cycle-slowdown fix,
+    /// diagnosed 2026-07-31 on the R9700): carrying the ffx FG prepare stream
+    /// seamlessly across a SPACE/F mode switch — a reset=1 prepare + a
+    /// depth/MV resource-set swap + a frame-time cadence jump, all while
+    /// generation stays enabled — wedges the AMD provider's pacing into a
+    /// massive persistent slowdown. Both a window resize (context rebuild)
+    /// and a K plain-toggle round trip (configure disabled → passthrough
+    /// presents → configure enabled, NO rebuild) were measured to clear it,
+    /// so the DEFAULT here is the cheapest cure as prevention: skip the next
+    /// prepare, giving the FI proxy exactly one disabled passthrough present
+    /// at the switch seam. FR_FG_CYCLE=off restores the old
+    /// carry-straight-across behavior (the repro arm); FR_FG_CYCLE=recreate
+    /// is the heavy A/B arm — rebuild the display-size effect context (the
+    /// resize path's straddle; the FI SWAPCHAIN context survives throughout).
+    pub fn fg_mode_switch(&mut self, debug: bool) {
+        let recreate = match std::env::var("FR_FG_CYCLE").ok().as_deref() {
+            Some("recreate") => true,
+            Some("off") => return,
+            Some(other) => {
+                // A silent no-op A/B walk is the failure mode levers exist to
+                // prevent — loud, then the default.
+                eprintln!(
+                    "fg: FR_FG_CYCLE={other} unrecognized (expected off|recreate) — \
+                     taking the default (pause straddle)"
+                );
+                false
+            }
+            None => false,
+        };
+        if !recreate {
+            // The default: one-frame pause straddle. Nothing to do when no
+            // effect context exists (passthrough proxy or FG-less session).
+            if let Some(fg) = &self.fg {
+                if fg.ctx.is_some() {
+                    fg.skip_prepare.set(true);
+                }
+            }
+            return;
+        }
+        {
+            let Some(fg) = &self.fg else { return };
+            if fg.ctx.is_none() || fg.version.0 == 0 {
+                return;
+            }
+        }
+        // The teardown discipline, in its order: UNREGISTER first (the
+        // disable configure, while the effect context the proxy's callback
+        // points into is still alive — idempotent via `live`), THEN retire
+        // pending paced presents (they can actually retire with generation
+        // off), and only then drop the context. The resize straddle skips
+        // the unregister and survives, but hygiene is free here.
+        self.fg_disable_now();
+        let Some(fg) = &mut self.fg else { return };
+        fg.sc.wait_for_presents();
+        fg.prepared.set(false);
+        fg.ctx = None;
+        let (w, h) = (self.d3d.width, self.d3d.height);
+        match ffx::FgContext::create(
+            &self.d3d.device,
+            (w, h),
+            (w, h),
+            match self.d3d.space {
+                d3d12::PresentSpace::Scrgb => ffx_sys::SURFACE_FORMAT_R16G16B16A16_FLOAT,
+                d3d12::PresentSpace::Hdr10 => ffx_sys::SURFACE_FORMAT_R10G10B10A2_UNORM,
+                d3d12::PresentSpace::Sdr => ffx_sys::SURFACE_FORMAT_B8G8R8A8_UNORM,
+            },
+            self.d3d.space != d3d12::PresentSpace::Sdr,
+            debug,
+            fg.version.0,
+        ) {
+            Ok(ctx) => {
+                fg.ctx = Some(ctx);
+                eprintln!("fg: FR_FG_CYCLE=recreate — effect context rebuilt on mode switch");
+            }
+            Err(e) => eprintln!(
+                "fg: FR_FG_CYCLE=recreate rebuild failed ({e}) — generation off until resize"
+            ),
+        }
+    }
+
     /// XeSS-FG per-frame work — call in the XeSS arms AFTER the feed/upload
     /// (planes final, resting NON_PIXEL_SHADER_RESOURCE), BEFORE the funnel:
     /// XeLL sleep + first markers, the depth/MV tags and frame constants for
@@ -5400,6 +5516,15 @@ impl GpuContext {
             eprintln!("fg: disable configure failed ({e})");
         }
         fg.live.set(false);
+        // Transition-only (the early-return above latches on `live`), so this
+        // is keypress-rate at most — the pause/resume pair is what makes the
+        // FI layer's on/off cadence visible in a session log.
+        let n = fg.pauses.get() + 1;
+        fg.pauses.set(n);
+        eprintln!(
+            "fg: interpolation paused (mode-switch straddle / plain toggle / hold / teardown; pause #{n}, frame_id {})",
+            fg.frame_id.get()
+        );
     }
 
     /// Record this frame's FG work: advance the frame id by exactly one (the
@@ -5424,6 +5549,15 @@ impl GpuContext {
         if !fg.enabled {
             return;
         }
+        // The mode-switch straddle: consume the flag and prepare NOTHING this
+        // frame — the funnel then finds `prepared` unset and configures the
+        // FI proxy disabled for exactly one passthrough present, after which
+        // the next frame's prepare resumes generation. frame_id deliberately
+        // does not advance (the disable configure reuses the last id, the
+        // K-toggle sequence bit-for-bit).
+        if fg.skip_prepare.replace(false) {
+            return;
+        }
         let frame_ms = fg.frame_ms.get();
         let id = fg.frame_id.get() + 1;
         fg.frame_id.set(id);
@@ -5445,7 +5579,25 @@ impl GpuContext {
             eprintln!("fg: configure failed ({e})");
             return;
         }
+        if !fg.live.get() {
+            eprintln!("fg: interpolation resumed (frame_id {id})");
+        }
         fg.live.set(true);
+        if fg.trace {
+            let res = (depth.as_raw() as usize, mvec.as_raw() as usize);
+            if fg.last_res.replace(res) != res {
+                eprintln!(
+                    "fg-trace: prepare resource set changed (depth {:#x}, mvec {:#x}) at frame_id {id}",
+                    res.0, res.1
+                );
+            }
+            if fc.reset {
+                eprintln!(
+                    "fg-trace: prepare reset=1 at frame_id {id} (render {}x{}, mv_scale {:?}, dt {:.1} ms)",
+                    fc.rw, fc.rh, mv_scale, frame_ms
+                );
+            }
+        }
         let prep = ffx::FfxShimFgPrepare {
             cmdlist: list.as_raw(),
             frame_id: id,

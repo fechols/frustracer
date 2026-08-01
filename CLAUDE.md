@@ -612,7 +612,41 @@ cargo run --release -- --fsr3 --fg    # FRAME GENERATION, ffx family (W4 leg 1 o
                                       # prepare (plain arms, SPACE mode switches, the pause-menu
                                       # present_again hold) finds `prepared` unset and configures
                                       # the proxy DISABLED first (idempotent via `live`), so
-                                      # pacing never runs against stale motion. Resize: pending
+                                      # pacing never runs against stale motion.
+                                      # THE MODE-SWITCH STRADDLE (2026-07-31 — the AMD
+                                      # mode-cycle-slowdown fix): carrying the prepare stream
+                                      # SEAMLESSLY across a SPACE/F render-mode switch — a
+                                      # reset=1 prepare + the depth/MV resource-set swap (each
+                                      # arm feeds FG its OWN planes: CPU-upload vs
+                                      # wavefront-pack vs DXR-pack) + a frame-time cadence jump
+                                      # (66 -> ~5 ms in the trace that caught it), generation
+                                      # enabled throughout — wedges the AMD provider's pacing
+                                      # into a MASSIVE persistent slowdown after a few SPACE
+                                      # laps (R9700, THE WORLD; NVIDIA/Intel never — they run
+                                      # different FG families). NOT VRAM: measured 8.4/31.7 GB
+                                      # while slow (the mode: vram line exists from this hunt).
+                                      # Diagnosed by elimination, each arm user-measured:
+                                      # --no-fg clean, F11 resize CURES (context rebuild), K
+                                      # plain-toggle round trip CURES (disable/enable configures
+                                      # with NO rebuild), FR_FG_CYCLE=recreate prevents. So
+                                      # GpuContext::fg_mode_switch (fired from main.rs's
+                                      # landed-switch hook only — a refused press straddles
+                                      # nothing) DEFAULTS to the cheapest cure as prevention:
+                                      # skip the next prepare, so the funnel hands the FI proxy
+                                      # exactly ONE disabled passthrough present at the seam
+                                      # (the K sequence compressed to a frame; frame_id
+                                      # deliberately does not advance — the disable configure
+                                      # reuses the last id, bit-identical to the K path).
+                                      # FR_FG_CYCLE=off restores the carry-across repro arm,
+                                      # =recreate is the heavy A/B (effect-context rebuild, the
+                                      # resize straddle — also proven curative). Instruments
+                                      # from the hunt, all shipped: the always-on
+                                      # `fg: interpolation paused/resumed` transition lines
+                                      # (pause counts + frame_id), FR_FG_TRACE=1 (reset
+                                      # prepares + resource-set-swap lines), `mode: vram` per
+                                      # switch, and per-tracer construction vram lines. NGX and
+                                      # XeSS-FG deliberately keep their existing seam handling —
+                                      # the wedge is ffx-family-only as measured. Resize: pending
                                       # paced presents retire, the display-size-bound FG effect
                                       # context rebuilds, the swapchain context survives
                                       # (ResizeBuffers forwards). Teardown: GpuContext::drop
