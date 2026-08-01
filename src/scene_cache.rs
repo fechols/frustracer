@@ -113,7 +113,12 @@ use std::path::{Path, PathBuf};
 // z-fight every model face on the rest plane), so cached positions are stale
 // under the same key; the coincident-cull's index rewrite rides the lever
 // word (bit 6), not this bump.
-pub const CACHE_VERSION: u32 = 21;
+// v21 -> v22: the matclass `pavement` keyword class (bistro's whole
+// `Pavement_*` street classifies uniformly wet at rough 0.14 instead of
+// splitting wet/dry on the exporter's scattered Ns) — the insertion also
+// shifts every class index from `stone` up, so a v21 sidecar's class bytes
+// mean different NAMES under the same key (the v20 stale-class shape).
+pub const CACHE_VERSION: u32 = 22;
 const MAGIC: [u8; 8] = *b"FRSCACH\x01";
 
 /// Fixed on-disk material, `MatKind` flattened into (kind, param) — Marble

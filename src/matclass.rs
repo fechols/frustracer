@@ -112,6 +112,23 @@ const CLASSES: &[ClassDef] = &[
         pbr: opaque(0.72, 0.0),
     },
     ClassDef {
+        name: "pavement",
+        // Bistro's street is ONE authored wet surface (every material is
+        // named `Pavement_*`), but the exporter's Ns values are scattered
+        // (100/50/30/10/1), so the Ns-tier `>= 100` bar sliced the street
+        // into wet-vs-dry patches — `Pavement_Ground_Wet` and
+        // `Pavement_Cobblestone_Wet_Leaves` (Ns 30/1!) rendered bone dry at
+        // the 0.8 default while their Ns-100 siblings mirrored the lamps.
+        // 0.14 == ns_to_rough(100), the parameters the wet half already had,
+        // below shade.rs's 0.45 reflection-ray gate. Keyed on `pavement` and
+        // `curbstones` ONLY — never `cobble`/`cobblestone`, which are
+        // Minecraft BLOCK names (rungholt/vokselia `Cobblestone`,
+        // `Cobblestone_Stairs`) that must stay dry-default: a wet Minecraft
+        // street is wrong AND puts 6M+ tris under the reflection gate.
+        keys: &[Tok("pavement"), Tok("curbstones")],
+        pbr: opaque(0.14, 0.0),
+    },
+    ClassDef {
         name: "stone",
         keys: &[
             Tok("muros"),
@@ -233,22 +250,22 @@ pub const FABRIC_SHEEN: f32 = 0.5;
 /// Class names in report order: the keyword classes, then the Ns tiers and
 /// the default — indices returned by `classify` point in here.
 pub const NAMES: &[&str] = &[
-    "rust", "metal", "wood", "ceramic", "clay", "fabric", "leather", "stone", "bark",
-    "foliage", "glass", "water", "glossy", "default",
+    "rust", "metal", "wood", "ceramic", "clay", "fabric", "leather", "pavement", "stone",
+    "bark", "foliage", "glass", "water", "glossy", "default",
 ];
 /// Public for `foliage::woody_materials` — woody plant matter (trunks,
 /// branches, stems), the v0.5 whole-plant grouping anchor.
-pub const IDX_BARK: usize = 8;
+pub const IDX_BARK: usize = 9;
 /// Public for `foliage::leaf_materials` — the classify verdict is retained as
 /// `Material::class` (a `u8` index into `NAMES`), and the sway mask compares
 /// against this constant.
-pub const IDX_FOLIAGE: usize = 9;
-const IDX_GLASS: usize = 10;
-const IDX_WATER: usize = 11;
-const IDX_GLOSSY: usize = 12;
+pub const IDX_FOLIAGE: usize = 10;
+const IDX_GLASS: usize = 11;
+const IDX_WATER: usize = 12;
+const IDX_GLOSSY: usize = 13;
 /// Public because it is the `Material::class` byte everywhere the classifier
 /// does NOT run (procedural builders, the glTF loader).
-pub const IDX_DEFAULT: usize = 13;
+pub const IDX_DEFAULT: usize = 14;
 
 /// Blinn-Phong exponent -> perceptual GGX roughness (Brian Karis' mapping),
 /// clamped to the plausible glossy band.
@@ -317,7 +334,12 @@ fn keyword_class(key: &str) -> Option<usize> {
 /// on the wet cobblestones vanished, and with no map_Pr in the MTL the flat
 /// 0.88 also flattened the GGX highlights. A guarded material skips ONLY the
 /// foliage row (either tier) and falls through to whatever tier it hit
-/// before the foliage vocabulary existed.
+/// before the foliage vocabulary existed. The `pavement`-token materials now
+/// land in the pavement row (which precedes foliage, so table order already
+/// resolves their leafy names); the guard remains load-bearing for the
+/// CROSS-TIER case (a foliage-textured stem under a cobble name must not
+/// sway) and for cobble names without the pavement token
+/// (`Cobble_Leaves_Litter` stays default).
 const FOLIAGE_GUARD: &[Key] = &[Tok("pavement"), Tok("cobblestone"), Tok("cobble")];
 
 /// Classify one MTL material. `tex_stem` is the lowercase filename stem of
@@ -437,9 +459,24 @@ pub fn self_test() -> Result<(), String> {
     tex("paris_foliage_01a_diff", "foliage")?;
     tex("paris_interior_plants_01_diff", "foliage")?;
     tex("plastic_01_planters_diff", "default")?; // `planters` != `plants` (whole-token)
-    // Guarded pavement is NOT stone (the foliage-v0.1 regression): it falls
-    // through the keyword tiers entirely (here to the Ns default).
-    tex("pavement_cobblestone_01_b_diff", "default")?;
+    // The pavement class: bistro's whole `Pavement_*` street family is ONE
+    // authored wet surface — every member classifies pavement regardless of
+    // the exporter's scattered Ns (100/50/30/10/1), which used to slice the
+    // street into wet-vs-dry patches at the Ns tier's >= 100 bar.
+    tex("pavement_cobblestone_01_b_diff", "pavement")?;
+    // Name tier: stems without a pavement token (`ground_wet_01_diff`,
+    // `cobble_02b_diff`) reach the row via their `Pavement_*` names — the
+    // two that rendered DRY while literally named Wet.
+    expect(None, "Pavement_Ground_Wet", 30.0, 2, "pavement")?;
+    expect(None, "Pavement_Cobblestone_Wet_Leaves_BLENDSHADER", 1.0, 2, "pavement")?;
+    expect(Some("pavement_cobblestone_03_diff"), "Pavement_Cobblestone_02", 10.0, 2, "pavement")?;
+    expect(Some("paris_curbstones_01_diff"), "Pavement_Curbstones", 100.0, 2, "pavement")?;
+    // Minecraft BLOCK safety: `cobble`/`cobblestone` are deliberately NOT
+    // pavement keys — rungholt/vokselia's blocks must stay dry-default (a
+    // wet Minecraft street is wrong AND crosses the reflection gate on 6M+
+    // tris). Do not add those tokens to the pavement row.
+    expect(Some("rungholt-rgba"), "Cobblestone", 0.0, 2, "default")?;
+    expect(Some("vokselia_spawn"), "Cobblestone_Stairs", 0.0, 2, "default")?;
     // Name tier: CafeChair_Metal is untextured.
     expect(None, "CafeChair_Metal", 256.0, 2, "metal")?;
     // Minecraft atlas scenes: ONE shared texture, so the stem carries no
@@ -463,16 +500,15 @@ pub fn self_test() -> Result<(), String> {
     // before the foliage "rose" token is ever consulted.
     expect(None, "Rose_Wood_Table", 16.0, 2, "wood")?;
     expect(None, "Foliage_Bux_Hedges46", 100.0, 2, "foliage")?;
-    // Leaf-LITTER pavement: the guard suppresses the foliage "leaves" name
-    // token and the material falls through to the Ns tier — bistro's Ns-100
-    // cobbles are GLOSSY, which is the night street's whole look (the
-    // reflection-ray gate reads the flat class roughness).
+    // Leaf-LITTER pavement: the stem's pavement token wins at tier 1 (and
+    // the pavement row precedes foliage, so even the leafy NAME resolves) —
+    // never foliage, never stone.
     expect(
         Some("pavement_cobblestone_01_b_diff"),
         "Pavement_Cobble_Leaves_BLENDSHADER",
         100.0,
         2,
-        "glossy",
+        "pavement",
     )?;
     // ...and the roughness must stay under shade.rs's 0.45 reflection gate,
     // or the emissive lamp reflections on the cobbles die again.
