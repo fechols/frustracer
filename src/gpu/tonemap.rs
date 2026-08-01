@@ -57,9 +57,9 @@ pub const SRV_HEAP_CAPACITY: u32 = 12;
 ///
 /// Headless (no swapchain), so it renders into an offscreen target of whichever
 /// format the caller names: `SWAPCHAIN_FORMAT` gates the 8-bit SDR encode,
-/// `SWAPCHAIN_FORMAT_HDR` the scRGB one, `SWAPCHAIN_FORMAT_HDR10` the PQ one.
-/// All three curves come out of the same shader, so gating any would catch a
-/// drifted port — gating all three also pins each encode.
+/// `SWAPCHAIN_FORMAT_10BIT` the Sdr10 (Gamma22 through a 10-bit RTV) and
+/// HDR10/PQ ones. All the curves come out of the same shader, so gating any
+/// would catch a drifted port — gating each wire also pins each encode.
 ///
 /// `src` is w*h*3 linear f32; returns w*h RGB read back from the target.
 pub fn selftest(
@@ -76,8 +76,7 @@ pub fn selftest(
     };
     use half::f16;
     assert_eq!(src.len(), (w * h * 3) as usize);
-    let hdr = format == DXGI_FORMAT_R16G16B16A16_FLOAT;
-    let bpp = if hdr { 8usize } else { 4usize };
+    let bpp = 4usize; // every present format is 4 B/px now (BGRA8 / R10G10B10A2)
 
     let passes = Passes::new(&hg.device, format)?;
 
@@ -180,10 +179,7 @@ pub fn selftest(
     for y in 0..h as usize {
         let row = unsafe { (ptr as *const u8).add(y * pitch) };
         for x in 0..sw {
-            out[y * sw + x] = if hdr {
-                let px: &[f16; 4] = unsafe { &*(row.add(x * 8) as *const [f16; 4]) };
-                [px[0].into(), px[1].into(), px[2].into()]
-            } else if format == DXGI_FORMAT_R10G10B10A2_UNORM {
+            out[y * sw + x] = if format == DXGI_FORMAT_R10G10B10A2_UNORM {
                 // R10G10B10A2 — R is the LOW 10 bits (unlike BGRA8's byte
                 // order, where B leads).
                 let px: &[u8; 4] = unsafe { &*(row.add(x * 4) as *const [u8; 4]) };
@@ -500,8 +496,9 @@ impl Passes {
                 tone.knee,
                 tone.headroom,
                 tone.scale,
+                // Mode literals shared with tonemap.hlsl / hud.hlsl (change
+                // all three together). 0 was scRGB-linear, retired with f16.
                 match tone.mode {
-                    crate::tone::ToneMode::Linear => 0.0,
                     crate::tone::ToneMode::Gamma22 => 1.0,
                     crate::tone::ToneMode::Pq => 2.0,
                 },

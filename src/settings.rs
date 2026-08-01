@@ -80,11 +80,14 @@ opt_fields! {
     pub struct Display {
         /// --vsync / --no-vsync
         pub vsync: bool,
-        /// --hdr / --no-hdr (the scRGB f16 swapchain)
+        /// --hdr / --no-hdr (the 10-bit R10G10B10A2 swapchain; off = 8-bit)
         pub hdr: bool,
-        /// --hdr10 / --no-hdr10 (force the 10-bit PQ swapchain — the encode
-        /// the wrapper-FG families take automatically on an HDR-on display).
-        /// True implies `hdr` at apply time, the CLI arm's own semantics.
+        /// --hdr10 / --no-hdr10 (true = force the PQ declaration; false =
+        /// force the 10-bit gamma-2.2 Sdr10 arm). True implies `hdr` at apply
+        /// time, the CLI arm's own semantics. NOTE: files written before the
+        /// scRGB retirement used false to mean "scRGB f16"; it now means
+        /// Sdr10 — visually near-identical on an SDR display, deliberately
+        /// not migrated.
         pub hdr10: bool,
         /// --hdr-paper-white <nits>
         pub hdr_paper_white: f32,
@@ -477,24 +480,24 @@ pub fn apply_to_opts(s: &Settings, opts: &mut crate::Opts) -> AppliedFx {
         opts.hdr = v;
         if !v {
             opts.hdr10 = false;
-            opts.scrgb = false;
+            opts.sdr10 = false;
         }
     }
     if let Some(v) = d.hdr10 {
         opts.hdr10 = v;
         if v {
-            // The CLI arm's semantics: PQ is an HDR mode, so forcing it turns
-            // the wide swapchain on (a file with hdr=false + hdr10=true reads
-            // as "the PQ flavor", not a contradiction — hdr10 is the more
-            // specific choice and wins).
+            // The CLI arm's semantics: PQ is a 10-bit mode, so forcing it
+            // turns the wide swapchain on (a file with hdr=false + hdr10=true
+            // reads as "the PQ flavor", not a contradiction — hdr10 is the
+            // more specific choice and wins).
             opts.hdr = true;
-            opts.scrgb = false;
+            opts.sdr10 = false;
         } else {
-            // `hdr10: false` in the file is the menu's OFF state, and since PQ
-            // became the HDR-display default that has to mean "scRGB", not
-            // "whatever the probe picks" — otherwise the row could not turn PQ
-            // off at all. Mirrors the `--no-hdr10` arm.
-            opts.scrgb = true;
+            // `hdr10: false` in the file is the menu's OFF state, and since
+            // PQ is the HDR-display default that has to mean "Sdr10 (10-bit
+            // gamma)", not "whatever the probe picks" — otherwise the row
+            // could not turn PQ off at all. Mirrors the `--no-hdr10` arm.
+            opts.sdr10 = true;
         }
     }
     if let Some(v) = d.hdr_paper_white {
@@ -969,8 +972,8 @@ pub fn menu_items() -> &'static [MenuItem] {
             item!("overlay", "quadtree overlay (O, CPU mode)", "Display", Live, Toggle { default: false }, ((|_| None), (|_, _| {}))),
             item!("gpu_tone", "GPU tonemap A/B (B)", "Display", Live, Toggle { default: false }, ((|_| None), (|_, _| {}))),
             item!("vsync", "v-sync", "Display", Restart, Toggle { default: true }, acc_bool!(display.vsync)),
-            item!("hdr", "scRGB (HDR) swapchain", "Display", Restart, Toggle { default: true }, acc_bool!(display.hdr)),
-            item!("hdr10", "HDR10 (PQ) swapchain", "Display", Restart, Toggle { default: false }, acc_bool!(display.hdr10)),
+            item!("hdr", "10-bit swapchain", "Display", Restart, Toggle { default: true }, acc_bool!(display.hdr)),
+            item!("hdr10", "HDR10 (PQ) vs 10-bit gamma", "Display", Restart, Toggle { default: false }, acc_bool!(display.hdr10)),
             item!("hdr_paper_white", "paper white (nits)", "Display", Restart, StepF { min: 80.0, max: 1000.0, step: 20.0, default: 200.0 }, acc_f32!(display.hdr_paper_white)),
             item!("hdr_peak", "peak override (nits)", "Display", Restart, StepF { min: 400.0, max: 4000.0, step: 100.0, default: 1000.0 }, acc_f32!(display.hdr_peak)),
             // ── Renderer

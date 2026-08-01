@@ -1,5 +1,5 @@
 //! What the display can actually do — the only place the renderer learns real
-//! luminance numbers, and the input to `tone::ToneParams::hdr`.
+//! luminance numbers, and the input to `tone::ToneParams::hdr10`.
 //!
 //! Everything upstream of the fullscreen pass is scene-referred: unitless linear
 //! radiance where 1.0 ≈ diffuse white. Turning that into light requires two
@@ -21,9 +21,9 @@
 //! the AMD adapter's output list does not contain that monitor at all. DWM
 //! cross-adapter-copies the presented frame to the display, so presentation
 //! works fine — but a probe that searched only the render adapter found
-//! nothing, returned `SDR`, and handed the scRGB swapchain the flat SDR
-//! rolloff: an HDR panel driven at 80-nit paper white with zero highlight
-//! headroom. So the search falls THROUGH to every adapter on the box. Reading
+//! nothing, returned `SDR`, and handed an HDR panel the flat SDR rolloff:
+//! driven at paper white with zero highlight headroom. So the search falls
+//! THROUGH to every adapter on the box. Reading
 //! `GetDesc1` off the adapter that owns the output is not a workaround — that
 //! adapter is the authority on that display, and the luminance numbers are a
 //! property of the panel, not of whatever device we happen to be drawing with.
@@ -42,7 +42,7 @@ use windows::Win32::Graphics::Gdi::{MonitorFromWindow, HMONITOR, MONITOR_DEFAULT
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct DisplayHdr {
     /// Windows HDR is switched on for this output. When false the output is
-    /// SDR and no amount of scRGB will produce a highlight.
+    /// SDR and no swapchain encoding will produce a highlight.
     pub enabled: bool,
     /// Peak luminance in nits (`MaxLuminance`) — a small-window highlight peak.
     pub max_nits: f32,
@@ -57,7 +57,8 @@ impl DisplayHdr {
     pub const SDR: DisplayHdr =
         DisplayHdr { enabled: false, max_nits: 80.0, max_full_frame_nits: 80.0 };
 
-    /// The presentation curve for this display.
+    /// The presentation curve for the HDR10/PQ swapchain (the HDR-on-display
+    /// default + `--hdr10`).
     ///
     /// `peak_override` is `--hdr-peak`, and it **wins over the probe** — including
     /// over `enabled == false`. That is the point of the lever: the probe can be
@@ -70,22 +71,13 @@ impl DisplayHdr {
     /// highlights — exactly the regime `MaxLuminance` describes. Aiming at
     /// `max_full_frame_nits` instead would throw away most of the headroom the
     /// panel has for precisely this content.
-    pub fn tone(&self, paper_white: f32, peak_override: Option<f32>) -> ToneParams {
-        match peak_override {
-            Some(peak) => ToneParams::hdr(paper_white, peak),
-            // scRGB on an SDR output: same rolloff as the 8-bit path, linear-
-            // encoded at scRGB's own 80-nit white. Displays identically to SDR.
-            None if !self.enabled => ToneParams::SCRGB_SDR,
-            None => ToneParams::hdr(paper_white, self.max_nits),
-        }
-    }
-
-    /// `tone()` for the HDR10/PQ swapchain (the wrapper-FG arm + `--hdr10`).
-    /// Same override doctrine — `--hdr-peak` wins, including over an "HDR off"
-    /// verdict. HDR-off gets the SDR rolloff anchored at paper white
+    ///
+    /// HDR-off gets the SDR rolloff anchored at paper white
     /// (`hdr10(paper, paper)` is the degenerate knee-0 curve, PQ-encoded), so
     /// a `--hdr10` session on an SDR output displays like SDR through DWM's
-    /// own PQ handling rather than blowing highlights.
+    /// own PQ handling rather than blowing highlights. (The Sdr/Sdr10 arms use
+    /// `ToneParams::SDR` directly and never call here — a gamma encode has no
+    /// peak to retune.)
     pub fn tone_pq(&self, paper_white: f32, peak_override: Option<f32>) -> ToneParams {
         match peak_override {
             Some(peak) => ToneParams::hdr10(paper_white, peak),
@@ -95,7 +87,7 @@ impl DisplayHdr {
     }
 
     fn from_desc(d: &DXGI_OUTPUT_DESC1) -> DisplayHdr {
-        // A non-finite luminance would ride straight into `ToneParams::hdr` and
+        // A non-finite luminance would ride straight into `ToneParams::hdr10` and
         // come out as a NaN headroom — `NaN <= HDR_KNEE` is false, so the
         // degeneracy guard there does NOT catch it, and every pixel above the
         // knee would map to NaN (a black frame, silently). Zero is fine and IS
@@ -114,7 +106,7 @@ impl DisplayHdr {
         };
         DisplayHdr {
             // G2084 (PQ) is how Windows reports "HDR is on for this output",
-            // regardless of the colour space *we* present in — an scRGB
+            // regardless of the colour space *we* present in — an SDR-declared
             // swapchain on an HDR output still reads back as G2084 here.
             enabled: d.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020,
             max_nits,

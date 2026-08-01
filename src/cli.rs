@@ -323,29 +323,26 @@ pub struct Opts {
     /// interval 0 on a tearing swapchain so interactive frame times measure
     /// the renderer, not the monitor refresh.
     pub vsync: bool,
-    /// Present scRGB (R16G16B16A16_FLOAT + G10_NONE_P709). **On by default**:
-    /// an f16 swapchain is the right thing to hand Windows regardless of the
-    /// monitor. On an HDR display it carries real highlights; on an SDR one it
-    /// still removes our 8-bit quantization and lets DWM drive a 10-bit panel
-    /// at full precision (deep colour) instead of banding at 8. `--no-hdr`
-    /// forces the legacy 8-bit swapchain — the A/B lever, and the automatic
-    /// fallback when the colour space is refused.
+    /// Present through the 10-bit swapchain (R10G10B10A2, 4 B/px — the ONE
+    /// format; PQ on an HDR-on display, gamma-2.2 "deep colour" on an HDR-off
+    /// one, the probe decides). **On by default**: half the bytes per present
+    /// of the retired scRGB f16 chain — which is the whole frame budget when
+    /// the display hangs off a different GPU than the renderer and every
+    /// present is a DWM copy — while 10-bit gamma keeps the no-banding
+    /// quality f16 bought on SDR panels. `--no-hdr` forces the legacy 8-bit
+    /// swapchain — the A/B lever, and the ladders' last rung.
     pub hdr: bool,
-    /// `--hdr10`: force the 10-bit PQ (R10G10B10A2 + G2084) swapchain in any
-    /// session — the A/B lever for the encode the wrapper-FG families take
-    /// automatically on an HDR-on display. Override-wins like `--hdr-peak`.
-    /// Only meaningful with `hdr` (the parse arms keep the pair consistent:
-    /// `--hdr10` sets both, `--no-hdr`/`--hdr` clear this one — three states,
-    /// later flags win).
+    /// `--hdr10`: force the PQ (G2084) declaration in any session — the A/B
+    /// lever. Override-wins like `--hdr-peak` (it fires even where the
+    /// display probe says HDR is off). Only meaningful with `hdr` (the parse
+    /// arms keep the trio consistent — later flags win).
     pub hdr10: bool,
-    /// `--no-hdr10`: force scRGB f16 — "wide, but NOT PQ". This exists because
-    /// PQ is now the DEFAULT on an HDR-on display (10-bit is half the bytes per
-    /// present, which is the whole frame budget when the display hangs off a
-    /// different GPU than the renderer and every present is a DWM copy), so
-    /// scRGB stopped being reachable as "neither flag" and needs its own
-    /// spelling — otherwise the fp16 A/B arm the HDR gates rest on would be
-    /// unreachable. `hdr && !hdr10 && !scrgb` = auto-pick by the display probe.
-    pub scrgb: bool,
+    /// `--no-hdr10`: force the 10-bit gamma-2.2 (Sdr10) arm — "10-bit, but
+    /// NOT PQ" — even on an HDR-on display. PQ is the default there, so Sdr10
+    /// needs its own spelling or the arm the gates rest on would be
+    /// unreachable from the command line on an HDR box.
+    /// `hdr && !hdr10 && !sdr10` = auto-pick by the display probe.
+    pub sdr10: bool,
     /// `--hdr-paper-white <nits>`: where linear 1.0 lands. The scene is authored
     /// so 1.0 ≈ diffuse white; 200 is the usual desktop-HDR reference.
     pub hdr_paper_white: f32,
@@ -596,11 +593,12 @@ pub fn defaults() -> Opts {
         }),
         gpu_timing: false,
         vsync: true,
-        // scRGB is the default swapchain: see Opts::hdr. The 8-bit path survives
-        // as --no-hdr and as the automatic fallback.
+        // The 10-bit swapchain is the default: see Opts::hdr (the probe picks
+        // PQ vs gamma). The 8-bit path survives as --no-hdr and as the FG
+        // wrap-failure fallback.
         hdr: true,
         hdr10: false,
-        scrgb: false,
+        sdr10: false,
         hdr_paper_white: tone::DEFAULT_PAPER_WHITE,
         hdr_peak: None,
         tod: None,
@@ -1189,33 +1187,35 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
             "--no-cinematic-hdr" => cine.hdr = false,
             "--no-vsync" => opts.vsync = false,
             "--vsync" => opts.vsync = true,
-            // The swapchain flags are a three-way choice (SDR | scRGB | HDR10)
-            // spelled as two toggles, so each arm writes BOTH fields — that is
-            // what makes later-flags-win hold across the pairs (`--no-hdr
-            // --hdr10` = PQ, `--hdr10 --no-hdr` = SDR). Mirrored in
-            // settings.rs (display.hdr / display.hdr10).
+            // The swapchain flags are a three-way choice (8-bit SDR | Sdr10 |
+            // HDR10 — one 10-bit format, two curves) spelled as two toggles,
+            // so each arm writes ALL the fields — that is what makes
+            // later-flags-win hold across the pairs (`--no-hdr --hdr10` = PQ,
+            // `--hdr10 --no-hdr` = 8-bit SDR). Mirrored in settings.rs
+            // (display.hdr / display.hdr10).
             "--hdr" => {
                 opts.hdr = true;
                 opts.hdr10 = false;
-                opts.scrgb = false;
+                opts.sdr10 = false;
             }
             "--no-hdr" => {
                 opts.hdr = false;
                 opts.hdr10 = false;
-                opts.scrgb = false;
+                opts.sdr10 = false;
             }
             "--hdr10" => {
                 opts.hdr = true;
                 opts.hdr10 = true;
-                opts.scrgb = false;
+                opts.sdr10 = false;
             }
-            // "wide, but NOT PQ" — the explicit spelling of scRGB, which stopped
-            // being reachable as "neither flag" when PQ became the HDR-display
-            // default. Implies the wide swapchain (the --hdr10 arm's shape).
+            // "10-bit, but NOT PQ" — the explicit spelling of Sdr10 (gamma-2.2
+            // deep colour), which is not reachable as "neither flag" on an
+            // HDR-on display where PQ is the default. Implies the 10-bit
+            // swapchain (the --hdr10 arm's shape).
             "--no-hdr10" => {
                 opts.hdr = true;
                 opts.hdr10 = false;
-                opts.scrgb = true;
+                opts.sdr10 = true;
             }
             "--hdr-paper-white" => {
                 opts.hdr_paper_white = args
@@ -1606,8 +1606,7 @@ pub fn usage() {
                 eprintln!("                frame-interpolation proxy, DLSS sessions run raw-NGX DLSS-G (SDK builds),");
                 eprintln!("                Intel XeSS sessions XeSS-FG; one generated frame per rendered frame;");
                 eprintln!("                unsupported pairings fall through loudly");
-                eprintln!("  --no-fg       kill lever: no frame generation (restores scRGB where a wrapper family");
-                eprintln!("                would have taken the HDR10/PQ or SDR arm)");
+                eprintln!("  --no-fg       kill lever: no frame generation");
                 eprintln!("  --fg-path     directory holding amd_fidelityfx_framegeneration_dx12.dll (default: the");
                 eprintln!("                drop's FSR sample dir — the FG provider does NOT ship next to the loader)");
                 eprintln!("  --quinlight   REGISTERED CONSENSUS: suspend the chain's first-hit-wins rule, wire");
@@ -1870,33 +1869,34 @@ pub fn self_test() -> Result<(), String> {
     }
 
     // ---- 3. the swapchain three-way ---------------------------------------
-    // SDR | scRGB | HDR10 spelled as two toggles: each arm writes BOTH fields,
-    // which is the only way later-flags-win holds ACROSS the pair. CLAUDE.md
-    // states both of these outcomes explicitly.
+    // 8-bit SDR | Sdr10 | HDR10 (one 10-bit format, two curves) spelled as
+    // two toggles: each arm writes ALL the fields, which is the only way
+    // later-flags-win holds ACROSS the pair. CLAUDE.md states both of these
+    // outcomes explicitly.
     let pq = parse_argv(&["--no-hdr", "--hdr10"]).opts;
     if !(pq.hdr && pq.hdr10) {
         return Err("--no-hdr --hdr10 must select the PQ swapchain".into());
     }
     let sdr = parse_argv(&["--hdr10", "--no-hdr"]).opts;
-    if sdr.hdr || sdr.hdr10 || sdr.scrgb {
+    if sdr.hdr || sdr.hdr10 || sdr.sdr10 {
         return Err("--hdr10 --no-hdr must select the 8-bit SDR swapchain".into());
     }
-    // scRGB must stay REACHABLE. It is no longer "neither flag" — PQ is the
-    // default on an HDR-on display — so `--no-hdr10` is its spelling, and the
-    // three-way stays a three-way. Without this the fp16 arm the HDR gates
-    // (tone::self_test's degeneracy pin, M12's scRGB comparison) rest on would
-    // be un-selectable from the command line.
+    // Sdr10 must stay REACHABLE on an HDR-on box (where PQ is the default) —
+    // `--no-hdr10` is its spelling, and the three-way stays a three-way.
+    // Without this the gamma-through-10-bit arm the gates rest on
+    // (tone::self_test's Sdr10 range pin, M12's sdr10 wire comparison) would
+    // be un-selectable from the command line there.
     let wide = parse_argv(&["--no-hdr10"]).opts;
-    if !(wide.hdr && !wide.hdr10 && wide.scrgb) {
-        return Err("--no-hdr10 must select scRGB (wide, not PQ)".into());
+    if !(wide.hdr && !wide.hdr10 && wide.sdr10) {
+        return Err("--no-hdr10 must select Sdr10 (10-bit gamma, not PQ)".into());
     }
     // ...and each of the three must still win from any predecessor.
     let back_to_pq = parse_argv(&["--no-hdr10", "--hdr10"]).opts;
-    if !(back_to_pq.hdr10 && !back_to_pq.scrgb) {
+    if !(back_to_pq.hdr10 && !back_to_pq.sdr10) {
         return Err("--no-hdr10 --hdr10 must select PQ".into());
     }
     let auto = parse_argv(&["--hdr10", "--hdr"]).opts;
-    if !(auto.hdr && !auto.hdr10 && !auto.scrgb) {
+    if !(auto.hdr && !auto.hdr10 && !auto.sdr10) {
         return Err("--hdr10 --hdr must return to the display-probed default".into());
     }
 

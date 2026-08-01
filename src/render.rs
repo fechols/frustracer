@@ -10,7 +10,6 @@ use crate::stats::{LocalStats, Stats};
 use crate::temporal::{self, TemporalCache};
 use crate::tone;
 use glam::Vec3A;
-use half::f16;
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
@@ -2150,27 +2149,28 @@ fn tonemap_to(
     });
 }
 
-/// `resolve` for the scRGB f16 swapchain — same average, same overlay, same
-/// nearest upscale; only the encode differs.
-pub fn resolve_scrgb(
+/// `resolve` for the Sdr10 (R10G10B10A2, gamma-2.2) swapchain — same average,
+/// same curve, same overlay composite as `resolve`; only the pack is 10-bit.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_sdr10(
     accum: &[AtomicU32],
     info: &[AtomicU32],
     samples: u32,
     overlay_on: bool,
-    p: tone::ToneParams,
-    present: &mut [[f16; 4]],
+    present: &mut [u32],
     rw: usize,
     rh: usize,
     ww: usize,
     wh: usize,
 ) {
-    crate::zone!("resolve-scrgb");
+    crate::zone!("resolve-sdr10");
     let inv = 1.0 / samples.max(1) as f32;
-    // Glare is a DISPLAY-stage pass on whatever the tonemap is about to read, so
-    // it applies to the scRGB encode exactly as it does to the SDR one — the
-    // swapchain format is not a reason to have or not have bloom. (It matters
-    // more here, if anything: scRGB is the default, so a miss would silently
-    // delete glare from every CPU-presented frame.) Same structure as `resolve`.
+    // Glare is a DISPLAY-stage pass on whatever the tonemap is about to read,
+    // so it applies to the 10-bit encode exactly as it does to the 8-bit one —
+    // the swapchain format is not a reason to have or not have bloom. (It
+    // matters more here, if anything: Sdr10 is the HDR-off default, so a miss
+    // would silently delete glare from every CPU-presented frame.) Same
+    // structure as `resolve`.
     if crate::bloom::enabled() {
         crate::bloom::with_glare_filled(
             rw,
@@ -2182,7 +2182,7 @@ pub fn resolve_scrgb(
                     }
                 });
             },
-            |hdr| tonemap_to_scrgb(hdr, info, overlay_on, p, present, rw, rh, ww, wh),
+            |hdr| tonemap_to_sdr10(hdr, info, overlay_on, present, rw, rh, ww, wh),
         );
         return;
     }
@@ -2197,41 +2197,38 @@ pub fn resolve_scrgb(
                 f32::from_bits(accum[i + 1].load(Relaxed)),
                 f32::from_bits(accum[i + 2].load(Relaxed)),
             ) * inv;
-            *out = present_px_scrgb(c, p, info, overlay_on, sx, sy, rw, rh);
+            *out = present_px_sdr10(c, info, overlay_on, sx, sy, rw, rh);
         }
     });
 }
 
-/// `resolve_hdr` for the scRGB f16 swapchain — the OIDN / NPPD / XeSS-post
-/// output path, which hands over an already-averaged linear HDR buffer.
-pub fn resolve_hdr_scrgb(
+/// `resolve_hdr` for the Sdr10 swapchain — the OIDN / NPPD / XeSS-post output
+/// path, which hands over an already-averaged linear HDR buffer.
+pub fn resolve_hdr_sdr10(
     hdr: &[f32],
     info: &[AtomicU32],
     overlay_on: bool,
-    p: tone::ToneParams,
-    present: &mut [[f16; 4]],
+    present: &mut [u32],
     rw: usize,
     rh: usize,
     ww: usize,
     wh: usize,
 ) {
-    crate::zone!("resolve-hdr-scrgb");
-    // The scRGB twin of `resolve_hdr`: the CPU denoisers' glare comes from here.
+    crate::zone!("resolve-hdr-sdr10");
+    // The Sdr10 twin of `resolve_hdr`: the CPU denoisers' glare comes from here.
     crate::bloom::with_glare(hdr, rw, rh, |hdr| {
-        tonemap_to_scrgb(hdr, info, overlay_on, p, present, rw, rh, ww, wh)
+        tonemap_to_sdr10(hdr, info, overlay_on, present, rw, rh, ww, wh)
     });
 }
 
-/// `tonemap_to` for the scRGB f16 swapchain — the one scRGB present loop,
-/// shared by `resolve_scrgb` and `resolve_hdr_scrgb`. Glare is the caller's
-/// business, so this can never apply it twice.
-#[allow(clippy::too_many_arguments)]
-fn tonemap_to_scrgb(
+/// `tonemap_to` for the Sdr10 swapchain — the one Sdr10 present loop, shared
+/// by `resolve_sdr10` and `resolve_hdr_sdr10`. Glare is the caller's business,
+/// so this can never apply it twice.
+fn tonemap_to_sdr10(
     hdr: &[f32],
     info: &[AtomicU32],
     overlay_on: bool,
-    p: tone::ToneParams,
-    present: &mut [[f16; 4]],
+    present: &mut [u32],
     rw: usize,
     rh: usize,
     ww: usize,
@@ -2243,7 +2240,7 @@ fn tonemap_to_scrgb(
             let sx = (wx * rw / ww).min(rw - 1);
             let i = (sy * rw + sx) * 3;
             let c = Vec3A::new(hdr[i], hdr[i + 1], hdr[i + 2]);
-            *out = present_px_scrgb(c, p, info, overlay_on, sx, sy, rw, rh);
+            *out = present_px_sdr10(c, info, overlay_on, sx, sy, rw, rh);
         }
     });
 }
@@ -2266,7 +2263,7 @@ pub fn resolve_pq(
 ) {
     crate::zone!("resolve-pq");
     let inv = 1.0 / samples.max(1) as f32;
-    // Glare before the curve, exactly as in `resolve_scrgb` — the swapchain
+    // Glare before the curve, exactly as in `resolve_sdr10` — the swapchain
     // encode is never a reason to have or not have bloom.
     if crate::bloom::enabled() {
         crate::bloom::with_glare_filled(
@@ -2347,11 +2344,11 @@ fn tonemap_to_pq(
 /// Blend the quadtree debug overlay: tint by kind, darken tile borders.
 ///
 /// The tints are **display-space [0,1] colours** — authored to look right
-/// against a gamma-encoded image — so both callers composite them in that space
-/// and nowhere else. The scRGB path pays a gamma round-trip to do so, which is
-/// the whole reason this is factored out: compositing in linear instead would
-/// tint highlights in proportion to their magnitude rather than uniformly, and
-/// the overlay would not match the SDR build.
+/// against a gamma-encoded image — so every caller composites them in that
+/// space and nowhere else. The PQ path pays a gamma round-trip to do so, which
+/// is the whole reason this is factored out: compositing in linear instead
+/// would tint highlights in proportion to their magnitude rather than
+/// uniformly, and the overlay would not match the SDR build.
 #[inline]
 fn overlay_px(
     mut c: Vec3A,
@@ -2372,11 +2369,10 @@ fn overlay_px(
     c
 }
 
-/// Tonemap and pack to 0x00RRGGBB for the 8-bit SDR swapchain (the fallback
-/// path when the scRGB colour space is refused). `ToneParams::SDR` is the
-/// pre-HDR curve exactly — gated bit-for-bit by `tone::self_test` — and
-/// `shape` has already applied the gamma, so the overlay lands in display
-/// space with no extra work.
+/// Tonemap and pack to 0x00RRGGBB for the 8-bit SDR swapchain (`--no-hdr` and
+/// the ladders' last rung). `ToneParams::SDR` is the pre-HDR curve exactly —
+/// gated bit-for-bit by `tone::self_test` — and `shape` has already applied
+/// the gamma, so the overlay lands in display space with no extra work.
 #[inline]
 fn present_px(
     c: Vec3A,
@@ -2395,42 +2391,36 @@ fn present_px(
     ((c.x as u32) << 16) | ((c.y as u32) << 8) | c.z as u32
 }
 
-/// Tonemap and encode to scRGB f16 for the `R16G16B16A16_FLOAT` swapchain.
-///
-/// scRGB is linear, so `shape` applies no gamma — which means the overlay must
-/// be taken INTO display space and back out again to composite where its tints
-/// were authored. The round-trip runs only when the overlay is on, so the
-/// normal path costs nothing and is not perturbed by a pow/pow⁻¹ pair.
-///
-/// Deliberately **not** clamped above: values over 1.0 are legal scRGB and are
-/// precisely the highlight headroom this path exists to carry. The lower clamp
-/// stays — negative scRGB is out of gamut and we never intend to emit it.
+/// Tonemap and pack to 10-bit for the Sdr10 (`R10G10B10A2_UNORM`, gamma-2.2)
+/// swapchain: `present_px` with a wider pack. `shape(_, SDR)` has already
+/// applied the gamma, so the overlay composites DIRECTLY in display space —
+/// copying the PQ path's pow/pow⁻¹ round-trip here would double-encode. Pack
+/// is `r | g<<10 | b<<20 | 3<<30` (R in the LOW bits, R10G10B10A2's lane
+/// order, opposite the SDR pack's BGRA8).
 #[inline]
-fn present_px_scrgb(
+fn present_px_sdr10(
     c: Vec3A,
-    p: tone::ToneParams,
     info: &[AtomicU32],
     overlay_on: bool,
     sx: usize,
     sy: usize,
     rw: usize,
     rh: usize,
-) -> [f16; 4] {
-    let mut v = tone::shape(c, p);
+) -> u32 {
+    let mut c = tone::shape(c, tone::ToneParams::SDR);
     if overlay_on {
-        let g = overlay_px(v.max(Vec3A::ZERO).powf(1.0 / 2.2), info, sx, sy, rw, rh);
-        v = g.max(Vec3A::ZERO).powf(2.2);
+        c = overlay_px(c, info, sx, sy, rw, rh);
     }
-    let v = tone::encode(v, p).max(Vec3A::ZERO);
-    [f16::from_f32(v.x), f16::from_f32(v.y), f16::from_f32(v.z), f16::from_f32(1.0)]
+    let q = (c.clamp(Vec3A::ZERO, Vec3A::ONE) * 1023.0 + 0.5).floor();
+    (q.x as u32) | ((q.y as u32) << 10) | ((q.z as u32) << 20) | (3 << 30)
 }
 
-/// Tonemap and encode to packed 10-bit PQ for the `R10G10B10A2_UNORM`
+/// Tonemap and encode to packed 10-bit PQ for the `R10G10B10A2_UNORM` + G2084
 /// swapchain (`r | g<<10 | b<<20 | 3<<30` — R in the LOW bits, R10G10B10A2's
-/// lane order, opposite the SDR pack's BGRA8). The overlay composite reuses
-/// the scRGB path's display-space round-trip: `shape` under PQ is still
-/// paper-white-relative *light* (the ST 2084 encode lives in `tone::encode`),
-/// so the same pow pair lands the tints where they were authored.
+/// lane order, opposite the SDR pack's BGRA8). The overlay composite pays a
+/// display-space round-trip: `shape` under PQ is still paper-white-relative
+/// *light* (the ST 2084 encode lives in `tone::encode`), so the pow pair —
+/// only when the overlay is on — lands the tints where they were authored.
 #[inline]
 fn present_px_pq(
     c: Vec3A,

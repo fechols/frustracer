@@ -26,35 +26,31 @@
 //! The load-bearing property: at `k = 0, w = 1` this collapses to
 //! `1 - exp(-x)`, **the curve the renderer has always shipped**. SDR is not a
 //! separate path, it is the degenerate case — which is what lets one curve serve
-//! the 8-bit swapchain and the scRGB one without a behavioural fork.
-//! `self_test` gates that degeneracy bit-for-bit; it is the regression guard
-//! that the SDR default did not move.
+//! the 8-bit and 10-bit swapchains without a behavioural fork. `self_test`
+//! gates that degeneracy bit-for-bit; it is the regression guard that the SDR
+//! default did not move.
 //!
 //! # Encodings
 //!
-//! - **SDR** (`B8G8R8A8_UNORM` swapchain): `k=0, w=1`, then `^(1/2.2)`. The
-//!   buffer is display-encoded, so the gamma is ours to apply.
-//! - **scRGB** (`R16G16B16A16_FLOAT` + `DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709`):
-//!   linear (G10) — **never** apply gamma, the display pipeline owns the EOTF.
-//!   scRGB is *defined* so that 1.0 = 80 nits, hence `scale = paper_white / 80`.
-//!   Values above 1.0 are legal and are exactly what buys us the highlights.
+//! - **SDR** (`B8G8R8A8_UNORM` swapchain, the `--no-hdr` lever/fallback):
+//!   `k=0, w=1`, then `^(1/2.2)`. The buffer is display-encoded, so the gamma
+//!   is ours to apply.
+//! - **Sdr10** (`R10G10B10A2_UNORM`, NO colour space declared — DXGI's default
+//!   reading of a UNORM chain is gamma-2.2/G22_NONE_P709): the SAME curve and
+//!   gamma as SDR, only the pack is 10-bit — deep-colour SDR at 4 B/px. The
+//!   default on an HDR-off display.
 //! - **HDR10** (`R10G10B10A2_UNORM` + `DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020`):
 //!   the same rolloff, then the Rec.709 → Rec.2020 gamut matrix and the SMPTE
 //!   ST 2084 (PQ) inverse EOTF, whose signal is normalized so encoded 1.0 =
-//!   10000 nits — hence `scale = paper_white / 10000`. This is the arm the
-//!   swapchain-wrapper FG families take (DLSS-G and XeSS-FG both reject the
-//!   scRGB fp16 swapchain but accept 10-bit PQ, the format HDR titles ship).
+//!   10000 nits — hence `scale = paper_white / 10000`. The default on an
+//!   HDR-on display, and the arm the swapchain-wrapper FG families take.
 //!
-//! An SDR display under an scRGB swapchain is therefore not a special case
-//! either — it is `paper_white = 80, w = 1`, i.e. the same `1 - exp(-x)` rolloff
-//! landing in [0, 1]. That is why moving the window between an HDR and an SDR
-//! monitor is a two-float retune and not a swapchain rebuild.
+//! One physical format (`R10G10B10A2`) therefore serves both display classes;
+//! only the transfer curve varies. The old scRGB f16 swapchain is gone — it was
+//! 8 B/px, and the present is the whole frame budget when the display hangs off
+//! a different GPU than the renderer (DWM copies every frame across).
 
 use glam::Vec3A;
-
-/// scRGB's definition: a value of 1.0 is 80 nits. Not tunable — it is the
-/// colour space, not a preference.
-pub const SCRGB_NITS: f32 = 80.0;
 
 /// Default paper white under `--hdr`. 200 nits is the usual desktop-HDR
 /// reference; `--hdr-paper-white` overrides.
@@ -105,9 +101,8 @@ pub fn pq_encode(y: f32) -> f32 {
 /// the negotiated swapchain, never of the scene.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ToneMode {
-    /// Linear output (scRGB) — the display pipeline owns the EOTF.
-    Linear,
-    /// `^(1/2.2)` display encode — the 8-bit UNORM swapchain.
+    /// `^(1/2.2)` display encode — the 8-bit UNORM swapchain AND the 10-bit
+    /// Sdr10 one (same encode; only the pack width differs).
     Gamma22,
     /// Rec.709→2020 matrix + ST 2084 (PQ) — the HDR10 R10G10B10A2 swapchain.
     Pq,
@@ -121,48 +116,26 @@ pub struct ToneParams {
     pub knee: f32,
     /// Asymptote, in paper-white units: `peak_nits / paper_white`. Always >= 1.
     pub headroom: f32,
-    /// Output scale applied after the curve (scRGB: `paper_white / 80`;
-    /// HDR10: `paper_white / 10000`).
+    /// Output scale applied after the curve (Gamma22: 1.0 — the buffer is
+    /// display-encoded; HDR10: `paper_white / 10000`).
     pub scale: f32,
-    /// The display encode (see `ToneMode`). `Gamma22` only for the 8-bit UNORM
-    /// swapchain — an scRGB buffer is linear and the display applies the EOTF
-    /// itself; `Pq` for the HDR10 swapchain.
+    /// The display encode (see `ToneMode`). `Gamma22` for the 8-bit and Sdr10
+    /// swapchains; `Pq` for the HDR10 one.
     pub mode: ToneMode,
 }
 
 impl ToneParams {
-    /// The 8-bit SDR swapchain. Reproduces the pre-HDR renderer bit-for-bit.
+    /// The SDR gamma-2.2 curve — the 8-bit swapchain AND Sdr10 (the pack width
+    /// is the caller's business). Reproduces the pre-HDR renderer bit-for-bit.
     pub const SDR: ToneParams =
         ToneParams { knee: 0.0, headroom: 1.0, scale: 1.0, mode: ToneMode::Gamma22 };
 
-    /// scRGB output on a display whose HDR is *off* (or unknown). Same rolloff
-    /// as `SDR`, but linear-encoded and anchored at scRGB's own 80-nit white —
-    /// so the displayed image matches `SDR` while the buffer stays f16.
-    pub const SCRGB_SDR: ToneParams =
-        ToneParams { knee: 0.0, headroom: 1.0, scale: 1.0, mode: ToneMode::Linear };
-
-    /// scRGB output on an HDR display. `peak_nits` is what the display actually
-    /// reports (see `gpu::hdr`), `paper_white` is where linear 1.0 lands.
-    ///
-    /// A display with no real headroom (`peak <= paper`) degenerates to the
-    /// `SCRGB_SDR` rolloff rather than hard-clipping at the knee — a zero-width
-    /// rolloff band is a divide-by-zero, and clipping would look worse than the
-    /// curve we already ship.
-    pub fn hdr(paper_white: f32, peak_nits: f32) -> ToneParams {
-        let paper = paper_white.max(1.0);
-        let scale = paper / SCRGB_NITS;
-        let headroom = peak_nits / paper;
-        if headroom <= HDR_KNEE {
-            return ToneParams { scale, ..ToneParams::SCRGB_SDR };
-        }
-        ToneParams { knee: HDR_KNEE, headroom, scale, mode: ToneMode::Linear }
-    }
-
-    /// HDR10/PQ output — the arm the swapchain-wrapper FG families take. Same
-    /// rolloff as `hdr()`, but the scale anchors paper white against PQ's
-    /// 10000-nit signal ceiling and the encode is matrix + ST 2084. The same
-    /// no-headroom degeneracy applies (a `peak <= paper` display gets the SDR
-    /// rolloff, PQ-encoded).
+    /// HDR10/PQ output — the HDR-on-display default and the arm the
+    /// swapchain-wrapper FG families take. The scale anchors paper white
+    /// against PQ's 10000-nit signal ceiling and the encode is matrix +
+    /// ST 2084. A display with no real headroom (`peak <= paper`) degenerates
+    /// to the SDR rolloff, PQ-encoded — a zero-width rolloff band is a
+    /// divide-by-zero, and clipping would look worse than the curve we ship.
     pub fn hdr10(paper_white: f32, peak_nits: f32) -> ToneParams {
         let paper = paper_white.max(1.0);
         let scale = paper / PQ_MAX_NITS;
@@ -174,9 +147,11 @@ impl ToneParams {
     }
 
     /// Peak luminance this parameterisation will actually emit, in nits.
+    /// Only meaningful for `Pq` (a gamma encode has no absolute luminance —
+    /// its callers are Hdr10-gated).
     pub fn peak_nits(&self) -> f32 {
-        let anchor = if self.mode == ToneMode::Pq { PQ_MAX_NITS } else { SCRGB_NITS };
-        self.headroom * self.scale * anchor
+        debug_assert_eq!(self.mode, ToneMode::Pq, "peak_nits is a PQ-only question");
+        self.headroom * self.scale * PQ_MAX_NITS
     }
 }
 
@@ -216,9 +191,9 @@ pub fn shape(c: Vec3A, p: ToneParams) -> Vec3A {
 }
 
 /// Paper-white-relative display value -> the value the swapchain wants. For
-/// scRGB that is the 80-nit anchor; for the 8-bit path `scale` is 1.0 and this
-/// is the identity; for HDR10 the scale lands in PQ's 10000-nit-normalized
-/// domain and the value goes through the gamut matrix + ST 2084 encode.
+/// the Gamma22 paths (8-bit and Sdr10) `scale` is 1.0 and this is the
+/// identity; for HDR10 the scale lands in PQ's 10000-nit-normalized domain and
+/// the value goes through the gamut matrix + ST 2084 encode.
 #[inline]
 pub fn encode(v: Vec3A, p: ToneParams) -> Vec3A {
     match p.mode {
@@ -258,39 +233,39 @@ pub fn self_test() -> Result<(), String> {
         }
     }
 
-    // (2) The scRGB-on-an-SDR-display params are the same rolloff, ungamma'd
-    // and inside [0, 1] — that is what makes a monitor move a retune.
-    for i in 0..=500 {
-        let x = i as f32 * 0.04;
-        let got = map(Vec3A::splat(x), ToneParams::SCRGB_SDR).x;
-        let want = 1.0 - (-x).exp();
-        if got.to_bits() != want.to_bits() {
-            return Err(format!("SCRGB_SDR: c={x} -> {got}, want {want}"));
-        }
-        if !(0.0..=1.0).contains(&got) {
-            return Err(format!("SCRGB_SDR: c={x} -> {got} outside [0,1]"));
+    // (2) The Sdr10 range pin: `shape(_, SDR)` must land in [0,1] across the
+    // whole radiance sweep — the precondition BOTH integer packs
+    // (`render::present_px` at 8 bits, `present_px_sdr10` at 10) quantize
+    // against clamp-free. That is the testable half of the deep-colour claim;
+    // the other half — the 10-bit wire refining and never diverging from the
+    // 8-bit one — is structural, not gateable here: the two packs quantize the
+    // SAME `shape()` output (one curve, two step widths), and rounding one
+    // value at two step widths cannot diverge by more than half the coarse
+    // step. The wires themselves are gated where they exist: `--check-gpu` M12
+    // runs the real shader into real BGRA8 and R10G10B10A2 RTVs against this
+    // module's `map()`.
+    for i in 0..=2000 {
+        let x = i as f32 * 0.01;
+        let v = shape(Vec3A::splat(x), ToneParams::SDR).x;
+        if !(0.0..=1.0).contains(&v) {
+            return Err(format!("Gamma22 shape: c={x} -> {v} outside [0,1]"));
         }
     }
 
-    let p = ToneParams::hdr(200.0, 1000.0);
+    let p = ToneParams::hdr10(200.0, 1000.0);
     if p.headroom != 5.0 {
-        return Err(format!("hdr(200, 1000) headroom {} != 5", p.headroom));
+        return Err(format!("hdr10(200, 1000) headroom {} != 5", p.headroom));
     }
 
-    // (3) Paper-white anchor: linear 1.0 displays at exactly paper_white nits.
-    // This is the whole point of the knee sitting at 1.0 — diffuse white is
-    // reproduced, not rolled off.
-    let white = map(Vec3A::ONE, p).x * SCRGB_NITS;
-    if (white - 200.0).abs() > 1e-3 {
-        return Err(format!("paper-white anchor: linear 1.0 -> {white} nits, want 200"));
-    }
-    // ... and everything below the knee is exact, not merely close.
+    // (3) Everything below the knee is exact, not merely close — diffuse white
+    // and below are reproduced, only highlights roll off. `shape` is the
+    // pre-encode half, so the pin is against the raw curve (the PQ encode's
+    // own anchor is arm (8)).
     for i in 0..=100 {
         let x = i as f32 * 0.01;
-        let got = map(Vec3A::splat(x), p).x;
-        let want = x * p.scale;
-        if (got - want).abs() > 1e-6 {
-            return Err(format!("below-knee response not exact: c={x} -> {got}, want {want}"));
+        let got = shape(Vec3A::splat(x), p).x;
+        if (got - x).abs() > 1e-6 {
+            return Err(format!("below-knee response not exact: c={x} -> {got}, want {x}"));
         }
     }
 
@@ -335,16 +310,8 @@ pub fn self_test() -> Result<(), String> {
         return Err(format!("slope above knee {d_hi} != 1 (C1 break at the knee)"));
     }
 
-    // (6) A display with no headroom must not divide by a zero-width rolloff
-    // band; it degenerates to the SDR rolloff.
-    let flat = ToneParams::hdr(200.0, 200.0);
-    if flat.knee != 0.0 || flat.headroom != 1.0 {
-        return Err("hdr(200, 200) must degenerate to the SDR rolloff".into());
-    }
-    let v = map(Vec3A::splat(3.0), flat).x;
-    if !v.is_finite() {
-        return Err(format!("no-headroom display produced {v}"));
-    }
+    // (6) The no-headroom degeneracy is arm (8)'s `flat10` — one construction
+    // path exists now, so one pin suffices.
 
     // (7) The PQ encode — closed-form ST 2084 anchors. Signal 1.0 is exact by
     // construction (c1 + c2 == 1 + c3 == 19.6875, all dyadic), the 100-nit

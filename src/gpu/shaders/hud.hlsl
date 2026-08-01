@@ -5,21 +5,16 @@
 //
 // The PSO blends ONE / INV_SRC_ALPHA (premultiplied), so this shader's only
 // job is to hand the blender the texel in the BACKBUFFER's space:
-//  - SDR (B8G8R8A8, mode == 1): the backbuffer is display space, which is
-//    exactly what Slint authored — pass through.
-//  - scRGB (RGBA16F, mode == 0): the backbuffer is LINEAR with 1.0 = 80
-//    nits / `scale` = paper_white/80 (see tone.rs) — un-premultiply, decode
-//    the sRGB-ish 2.2 curve, scale so UI white lands at paper white, and
-//    re-premultiply. The blend then runs in linear space; the slight
-//    AA-fringe difference vs the SDR path's display-space blend is the same
-//    accepted compromise `render::present_px_scrgb` documents for the debug
-//    overlay.
-//  - HDR10 (R10G10B10A2, mode == 2): the backbuffer is PQ-encoded — same
-//    un-premultiply/decode as scRGB into paper-white-relative light, scale
-//    into PQ's 10000-nit domain (`scale` = paper_white/10000), gamut matrix +
-//    ST 2084 (literals mirror tone.rs), re-premultiply. Blending premultiplied
-//    PQ values is the display-space-blend compromise the SDR arm already
-//    makes, at HDR10's own encoding.
+//  - Gamma 2.2 (B8G8R8A8 SDR AND R10G10B10A2 Sdr10, mode == 1): the
+//    backbuffer is display space, which is exactly what Slint authored —
+//    pass through (the RTV width is the PSO's business, not this shader's).
+//  - HDR10 (R10G10B10A2 + G2084, mode == 2): the backbuffer is PQ-encoded —
+//    un-premultiply, decode the sRGB-ish 2.2 curve into paper-white-relative
+//    light, scale into PQ's 10000-nit domain (`scale` = paper_white/10000),
+//    gamut matrix + ST 2084 (literals mirror tone.rs), re-premultiply.
+//    Blending premultiplied PQ values is the display-space-blend compromise
+//    the SDR arm already makes, at HDR10's own encoding.
+//  (mode == 0 was the scRGB-linear arm, retired with the f16 swapchain.)
 //
 // The cbuffer DECLARATION mirrors tonemap.hlsl's Params exactly — this pass
 // reuses the tonemap root signature and is recorded through `Passes::record`,
@@ -33,7 +28,7 @@ cbuffer Params : register(b0) {
     float knee;
     float headroom;
     float scale;
-    float mode; // 0 = scRGB linear, 1 = 8-bit gamma 2.2, 2 = HDR10 PQ
+    float mode; // 1 = gamma 2.2 (SDR/Sdr10), 2 = HDR10 PQ (0 retired with scRGB)
 }
 
 // tone.rs twins (see tonemap.hlsl — same literals, change all three together).
@@ -56,19 +51,14 @@ float4 vsmain(uint id : SV_VertexID) : SV_Position {
 
 float4 psmain(float4 pos : SV_Position) : SV_Target {
     float4 c = src.Load(int3(pos.xy, 0));
-    if (mode < 0.5) {
-        // scRGB: linear backbuffer, UI white at paper white.
-        float3 rgb = c.a > 0.0 ? c.rgb / c.a : float3(0.0, 0.0, 0.0);
-        rgb = pow(max(rgb, 0.0), 2.2) * scale;
-        c = float4(rgb * c.a, c.a);
-    } else if (mode > 1.5) {
-        // HDR10: same decode into paper-white-relative light, then the PQ
-        // encode chain (scale = paper_white / 10000).
+    if (mode > 1.5) {
+        // HDR10: un-premultiply, decode into paper-white-relative light, then
+        // the PQ encode chain (scale = paper_white / 10000).
         float3 rgb = c.a > 0.0 ? c.rgb / c.a : float3(0.0, 0.0, 0.0);
         rgb = pow(max(rgb, 0.0), 2.2) * scale;
         rgb = pq_encode(m709_to_2020(rgb));
         c = float4(rgb * c.a, c.a);
     }
-    // mode == 1 (SDR): the backbuffer is display space — pass through.
+    // mode == 1 (SDR/Sdr10): the backbuffer is display space — pass through.
     return c;
 }

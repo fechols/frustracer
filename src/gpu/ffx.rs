@@ -422,9 +422,10 @@ pub struct FgContext {
 
 impl FgContext {
     /// `backbuffer_format`: sys::SURFACE_FORMAT_* ordinal of the swapchain.
-    /// `hdr` arms FG_HDR (linear scRGB backbuffer). `version_id` 0 = provider
-    /// default + API pin; nonzero = the enumerated override
-    /// (`fsr::pick_fg_version`).
+    /// `hdr` arms FG_HDR — Hdr10/PQ only (Sdr10 is a gamma SDR backbuffer; the
+    /// FI swapchain reads the transfer function off the chain's own declared
+    /// colour space). `version_id` 0 = provider default + API pin; nonzero =
+    /// the enumerated override (`fsr::pick_fg_version`).
     pub fn create(
         device: &ID3D12Device,
         display: (u32, u32),

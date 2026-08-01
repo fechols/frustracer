@@ -89,8 +89,8 @@ mod prof;
 mod replay;
 mod temporal;
 mod texture;
-// The presentation curve — one source of truth for SDR and scRGB alike, shared
-// by every CPU present arm and ported term-for-term into tonemap.hlsl.
+// The presentation curve — one source of truth for every swapchain encode,
+// shared by every CPU present arm and ported term-for-term into tonemap.hlsl.
 mod tone;
 // Pure chain-resolution data for the always-on temporal-upscaler fallback
 // (DLSS-RR → FSR4-RR → XeSS → FSR3); the real probes live in GpuContext::new.
@@ -6016,10 +6016,10 @@ fn run_check_gpu(
     // range — below the knee, through the rolloff, and far past it (a physical
     // sun disc is ~44,000, so the tail is not hypothetical).
     //
-    // All three encodings are gated: SDR 8-bit (the default, which must not
-    // move), scRGB f16 (the --hdr path), and HDR10/PQ 10-bit (the wrapper-FG
-    // arm + --hdr10). One shader produces all of them, so gating each pins the
-    // curve AND its encode.
+    // All three wires are gated: SDR 8-bit (the --no-hdr lever, which must not
+    // move), Sdr10 (the same Gamma22 curve through a 10-bit RTV — the HDR-off
+    // default), and HDR10/PQ 10-bit (the HDR-on default + --hdr10). One shader
+    // produces all of them, so gating each pins the curve AND its encode.
     {
         const TW: u32 = 64;
         const TH: u32 = 32;
@@ -6061,14 +6061,16 @@ fn run_check_gpu(
                 1.0 / 255.0 + 1e-6, // one UNORM LSB — the wire quantizes
             ),
             (
-                "scrgb",
-                gpu::d3d12::SWAPCHAIN_FORMAT_HDR,
-                tone::ToneParams::hdr(200.0, 1000.0),
-                2e-3, // f16 wire + fp differences between HLSL exp/pow and Rust's
+                "sdr10",
+                gpu::d3d12::SWAPCHAIN_FORMAT_10BIT,
+                tone::ToneParams::SDR,
+                // The same Gamma22 curve through a 10-bit RTV — the Sdr10
+                // wire. One ten-bit LSB plus fxc pow slop.
+                1.0 / 1023.0 + 1e-4,
             ),
             (
                 "hdr10",
-                gpu::d3d12::SWAPCHAIN_FORMAT_HDR10,
+                gpu::d3d12::SWAPCHAIN_FORMAT_10BIT,
                 tone::ToneParams::hdr10(200.0, 1000.0),
                 // ~2 ten-bit LSBs + fxc pow/exp slop through the ST 2084 pair.
                 // Never widen past 5e-3 without investigating — a wiring or
@@ -6095,9 +6097,9 @@ fn run_check_gpu(
                         );
                         let want = tone::map(c, tp);
                         for ch in 0..3 {
-                            // Relative for the big scRGB values, absolute for the
-                            // small ones — an absolute-only gate would be
-                            // meaningless at the top of the range.
+                            // Relative above 1.0, absolute below — every wire
+                            // lands in [0,1] now, so the max() is belt and
+                            // braces, kept in case a wide encode returns.
                             let w = want[ch];
                             let d = (got[i][ch] - w).abs() / (1.0f32).max(w.abs());
                             if d > worst {
@@ -10027,7 +10029,7 @@ fn run_cinematic_gpu(
         vsync: false,
         hdr: false,
         hdr10: false,
-        scrgb: false,
+        sdr10: false,
         paper_white: 200.0,
         peak_nits: None,
         quin: false,
@@ -13968,7 +13970,7 @@ fn run_window(req: SceneRequest, opts: &Opts, file_settings: settings::Settings)
         vsync: opts.vsync,
         hdr: opts.hdr,
         hdr10: opts.hdr10,
-        scrgb: opts.scrgb,
+        sdr10: opts.sdr10,
         paper_white: opts.hdr_paper_white,
         peak_nits: opts.hdr_peak,
         quin: opts.quin,
@@ -18032,10 +18034,11 @@ fn session(
 
         if edges.screenshot {
             // A PNG is 8-bit and has nowhere to put a nit, so a screenshot is
-            // always the SDR curve — even in an --hdr session. The GPU readback
-            // paths already tonemap to SDR (read_hdr_output); the CPU-presented
-            // arms hold f16 scRGB under --hdr, so they re-resolve from the same
-            // linear source rather than trying to invert the display encode.
+            // always the SDR curve — even in a 10-bit session. The GPU
+            // readback paths already tonemap to SDR (read_hdr_output); the
+            // CPU-presented arms hold the packed 10-bit wire, so they
+            // re-resolve from the same linear source rather than trying to
+            // invert the display encode.
             if dlss_on {
                 // The denoised image exists only on the GPU — read the RR
                 // output back and tonemap it (same curve, 1 spp). On failure
@@ -18073,8 +18076,8 @@ fn session(
                 // fresh for the screenshot.
                 present.resolve_sdr(&accum, &info, frame.max(1), false, rw, rh, w, h);
             } else if present.is_hdr() {
-                // The CPU arms hold scRGB f16 (or packed PQ), which a PNG
-                // cannot carry — so
+                // The CPU arms hold the packed 10-bit wire, which is not a
+                // PNG's bytes — so
                 // re-resolve each arm's OWN linear source through the SDR curve.
                 // The overlay rides along exactly as it does on screen (an SDR
                 // session saves the present buffer verbatim, overlay included;
@@ -18305,23 +18308,22 @@ fn session(
 /// The CPU present buffer for the arms that tonemap on the CPU (OIDN, NPPD,
 /// XeSS-post, and the plain resolve).
 ///
-/// Three encodings, one curve. An SDR session fills `sdr` (u32 0x00RRGGBB);
-/// an scRGB session fills `hdr` ([f16; 4], already curve+overlay+encode); an
-/// HDR10 session fills `pq` (packed 10-bit PQ u32, R low). Which one is a
-/// property of the SWAPCHAIN (`GpuContext::encoding()`), decided once — so an
-/// arm cannot accidentally present the wrong wire into the backbuffer.
+/// Two wires, one curve. An SDR session fills `sdr` (u32 0x00RRGGBB); the
+/// 10-bit sessions fill `wire10` (packed 10-bit u32, R low — gamma-2.2 under
+/// Sdr10, matrix+PQ under Hdr10). Which one is a property of the SWAPCHAIN
+/// (`GpuContext::encoding()`), decided once — so an arm cannot accidentally
+/// present the wrong wire into the backbuffer.
 ///
 /// `sdr` is allocated in every mode because screenshots are always 8-bit PNG:
-/// a file has nowhere to put a nit. In an HDR session the screenshot path
+/// a file has nowhere to put a nit. In a 10-bit session the screenshot path
 /// re-resolves into it (`resolve_*_sdr`) rather than trying to invert the
 /// display-referred output — that inversion is not well-defined, and a
 /// screenshot is rare enough that a second tonemap costs nothing.
 struct CpuPresent {
     sdr: Vec<u32>,
-    hdr: Vec<[half::f16; 4]>,
-    pq: Vec<u32>,
+    wire10: Vec<u32>,
     /// Refreshed from `gpu.tone()` each frame — this is how a display change
-    /// reaches the CPU arms.
+    /// reaches the CPU arms (only Hdr10 retunes; the gamma curve is static).
     tone: tone::ToneParams,
     enc: gpu::d3d12::PresentSpace,
 }
@@ -18331,20 +18333,16 @@ impl CpuPresent {
         use gpu::d3d12::PresentSpace;
         Self {
             sdr: vec![0u32; w * h],
-            hdr: if enc == PresentSpace::Scrgb {
-                vec![[half::f16::ZERO; 4]; w * h]
-            } else {
-                Vec::new()
-            },
-            pq: if enc == PresentSpace::Hdr10 { vec![0u32; w * h] } else { Vec::new() },
+            wire10: if enc != PresentSpace::Sdr { vec![0u32; w * h] } else { Vec::new() },
             tone,
             enc,
         }
     }
 
-    /// Was the presented frame display-referred wide-gamut (scRGB or HDR10)?
-    /// The screenshot path keys its "re-resolve the linear source through the
-    /// SDR curve" decision on this.
+    /// Was the presented frame something other than the 8-bit SDR wire? The
+    /// screenshot path keys its "re-resolve the linear source through the SDR
+    /// curve" decision on this. (Sdr10's IMAGE matches the SDR one, but its
+    /// wire10 pack is not a PNG's bytes, so it re-resolves too.)
     fn is_hdr(&self) -> bool {
         self.enc != gpu::d3d12::PresentSpace::Sdr
     }
@@ -18362,11 +18360,11 @@ impl CpuPresent {
         h: usize,
     ) {
         match self.enc {
-            gpu::d3d12::PresentSpace::Scrgb => render::resolve_scrgb(
-                accum, info, samples, overlay, self.tone, &mut self.hdr, rw, rh, w, h,
+            gpu::d3d12::PresentSpace::Sdr10 => render::resolve_sdr10(
+                accum, info, samples, overlay, &mut self.wire10, rw, rh, w, h,
             ),
             gpu::d3d12::PresentSpace::Hdr10 => render::resolve_pq(
-                accum, info, samples, overlay, self.tone, &mut self.pq, rw, rh, w, h,
+                accum, info, samples, overlay, self.tone, &mut self.wire10, rw, rh, w, h,
             ),
             gpu::d3d12::PresentSpace::Sdr => {
                 render::resolve(accum, info, samples, overlay, &mut self.sdr, rw, rh, w, h)
@@ -18386,12 +18384,12 @@ impl CpuPresent {
         h: usize,
     ) {
         match self.enc {
-            gpu::d3d12::PresentSpace::Scrgb => render::resolve_hdr_scrgb(
-                src, info, overlay, self.tone, &mut self.hdr, rw, rh, w, h,
-            ),
-            gpu::d3d12::PresentSpace::Hdr10 => {
-                render::resolve_hdr_pq(src, info, overlay, self.tone, &mut self.pq, rw, rh, w, h)
+            gpu::d3d12::PresentSpace::Sdr10 => {
+                render::resolve_hdr_sdr10(src, info, overlay, &mut self.wire10, rw, rh, w, h)
             }
+            gpu::d3d12::PresentSpace::Hdr10 => render::resolve_hdr_pq(
+                src, info, overlay, self.tone, &mut self.wire10, rw, rh, w, h,
+            ),
             gpu::d3d12::PresentSpace::Sdr => {
                 render::resolve_hdr(src, info, overlay, &mut self.sdr, rw, rh, w, h)
             }
@@ -18432,8 +18430,9 @@ impl CpuPresent {
 
     fn blit(&self, gpu: &mut gpu::GpuContext) -> gpu::d3d12::Result<()> {
         match self.enc {
-            gpu::d3d12::PresentSpace::Scrgb => gpu.present_cpu_hdr(&self.hdr),
-            gpu::d3d12::PresentSpace::Hdr10 => gpu.present_cpu_pq(&self.pq),
+            gpu::d3d12::PresentSpace::Sdr10 | gpu::d3d12::PresentSpace::Hdr10 => {
+                gpu.present_cpu_10bit(&self.wire10)
+            }
             gpu::d3d12::PresentSpace::Sdr => gpu.present_cpu(&self.sdr),
         }
     }

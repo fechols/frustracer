@@ -75,9 +75,10 @@ pub struct GpuOptions {
     /// uncapped benchmark presentation (tearing swapchain when DXGI
     /// supports it).
     pub vsync: bool,
-    /// `--hdr`: ask for an scRGB f16 swapchain instead of the 8-bit SDR one.
-    /// A *request* — the swapchain may refuse the colour space, so read
-    /// `GpuContext::hdr()` for what actually happened, never this.
+    /// `--hdr`: ask for the 10-bit R10G10B10A2 swapchain (PQ or gamma-2.2 by
+    /// the display probe) instead of the 8-bit SDR one. A *request* — the
+    /// G2084 declare may be refused, so read `GpuContext::encoding()` for
+    /// what actually happened, never this.
     pub hdr: bool,
     /// `--hdr10`: force the 10-bit PQ (R10G10B10A2 + G2084) swapchain in ANY
     /// session — the A/B lever, and override-wins like `--hdr-peak` (it fires
@@ -85,10 +86,10 @@ pub struct GpuOptions {
     /// and a lever that no-ops exactly then is no escape hatch). Read
     /// `GpuContext::encoding()` for what actually happened.
     pub hdr10: bool,
-    /// `--no-hdr10`: force scRGB f16 — "wide, but NOT PQ". Needed since PQ
-    /// became the default on an HDR-on display; without it the fp16 arm is
-    /// unreachable from the command line.
-    pub scrgb: bool,
+    /// `--no-hdr10`: force the 10-bit gamma-2.2 (Sdr10) arm — "10-bit, but
+    /// NOT PQ" — even on an HDR-on display. The A/B lever; without it the
+    /// Sdr10 arm would be unreachable from the command line on an HDR box.
+    pub sdr10: bool,
     /// Where linear 1.0 lands, in nits (`--hdr-paper-white`, default 200). The
     /// scene is authored so 1.0 ≈ diffuse white (see `scene::default_light`).
     pub paper_white: f32,
@@ -776,76 +777,47 @@ impl GpuContext {
             && pick.vendor == adapter::Vendor::Intel
             && xess_state.is_some();
 
-        // XeSS-FG rejects the scRGB fp16 swapchain (measured:
-        // InitFromSwapChain returns INVALID_ARGUMENT on R16G16B16A16_FLOAT)
-        // — but 10-bit PQ is the format HDR FG titles actually ship, so on
-        // an HDR-on display those sessions take the HDR10 arm instead of
-        // dropping to SDR 8-bit (the probe needs only adapter+hwnd, so it
-        // can run before the swapchain exists). The ffx family supports
-        // scRGB and keeps it; raw-NGX DLSS-G has no swapchain hook at all
-        // and polices nothing. `--hdr10` forces the PQ arm in any session
-        // (the A/B lever; override-wins, including over an "HDR off" probe
-        // verdict — the --hdr-peak doctrine). If the wrap still rejects the
-        // 10-bit chain, D3d::with_queue rebuilds at SDR and wraps again —
-        // FG is why the session exists, so SDR with FG beats HDR10 without
-        // it.
-        let fg_wrapper = try_xefg;
-        // PQ IS THE DEFAULT ON AN HDR-ON DISPLAY (2026-07-26). 10-bit
-        // R10G10B10A2 is HALF the bytes of scRGB fp16 per present, and the
+        // ONE 10-bit format (R10G10B10A2, 4 B/px), two curves: PQ on an
+        // HDR-ON display, gamma-2.2 (Sdr10) everywhere else — the probe
+        // decides, `--hdr10`/`--no-hdr10` force an arm, `--no-hdr` keeps the
+        // legacy 8-bit chain. The old scRGB fp16 chain (8 B/px) is GONE: the
         // present is the whole frame budget whenever the display hangs off a
-        // different GPU than the renderer: DWM must then COPY every frame
-        // across, which at 7680x3969 is 244 MB at fp16 vs 122 MB at PQ.
+        // different GPU than the renderer — DWM must then COPY every frame
+        // across, which at 7680x3969 is 244 MB at fp16 vs 122 MB at 10-bit.
         // Measured on this box (world, 8K, display on an Intel B70 while a
         // 4090 renders): 6.1 -> 10.0 rendered fps, ~80 -> ~51 ms per present,
-        // while the GPU itself was only doing 14.7 ms of work per frame. PQ is
-        // also what HDR titles ship, so quality is not the trade it looks like
-        // — and on an HDR-OFF display scRGB still wins (f16 beats 8-bit, and
-        // tone_pq would only degenerate to the SDR rolloff there), so the
-        // probe decides. `--no-hdr10` is the explicit scRGB spelling.
+        // while the GPU itself was only doing 14.7 ms of work per frame.
+        // 10-bit gamma keeps the deep-colour quality f16 bought on SDR panels
+        // (the 8-bit backbuffer banded), so nothing is traded away there.
+        //
+        // The wrapper-FG families need no special-casing any more: XeSS-FG
+        // rejected scRGB fp16 outright (measured: InitFromSwapChain returns
+        // INVALID_ARGUMENT on R16G16B16A16_FLOAT), which used to force those
+        // sessions onto PQ-or-8-bit; both defaults are now R10G10B10A2, the
+        // format it verifiably wraps. If a wrap still refuses,
+        // D3d::with_queue rebuilds at 8-bit and wraps again — FG is why the
+        // session exists.
         //
         // The probe runs ONCE: it needs the HWND (which exists — the swapchain
-        // is created for it) and both the wrapper-FG rule and this default
-        // read the same verdict.
-        let hdr_on = opts.hdr && !opts.hdr10 && display::probe(&pick.adapter, hwnd).enabled;
-        let without_fg = if !opts.hdr {
+        // is created for it).
+        let hdr_on =
+            opts.hdr && !opts.hdr10 && !opts.sdr10 && display::probe(&pick.adapter, hwnd).enabled;
+        let want = if !opts.hdr {
             d3d12::PresentSpace::Sdr
         } else if opts.hdr10 {
             d3d12::PresentSpace::Hdr10
-        } else if opts.scrgb {
-            d3d12::PresentSpace::Scrgb
+        } else if opts.sdr10 {
+            d3d12::PresentSpace::Sdr10
         } else if hdr_on {
             d3d12::PresentSpace::Hdr10
         } else {
-            d3d12::PresentSpace::Scrgb
+            d3d12::PresentSpace::Sdr10
         };
-        let want = if fg_wrapper && opts.hdr && !opts.hdr10 {
-            // A wrapper-FG family cannot take scRGB at all, so an HDR-off
-            // display drops it to SDR rather than to f16.
-            if hdr_on {
-                d3d12::PresentSpace::Hdr10
-            } else {
-                d3d12::PresentSpace::Sdr
-            }
-        } else {
-            without_fg
-        };
-        if !fg_wrapper && want == d3d12::PresentSpace::Hdr10 && !opts.hdr10 {
+        if want == d3d12::PresentSpace::Hdr10 && !opts.hdr10 {
             eprintln!(
-                "present: HDR display — defaulting to 10-bit PQ (half the bytes per present; \
-                 --no-hdr10 forces scRGB f16, --no-hdr forces 8-bit SDR)"
+                "present: HDR display — defaulting to 10-bit PQ (--no-hdr10 forces 10-bit \
+                 gamma-2.2 SDR, --no-hdr forces 8-bit SDR)"
             );
-        }
-        if fg_wrapper && opts.hdr {
-            match want {
-                d3d12::PresentSpace::Hdr10 => eprintln!(
-                    "fg: XeSS-FG rejects the scRGB fp16 swapchain — requesting HDR10/PQ \
-                     (R10G10B10A2, G2084; --no-fg restores scRGB)"
-                ),
-                _ => eprintln!(
-                    "fg: XeSS-FG rejects the scRGB fp16 swapchain and the display reports \
-                     HDR off — requesting SDR 8-bit (--no-fg restores scRGB; --hdr10 forces PQ)"
-                ),
-            }
         }
 
         // Frame generation, native family (the ffx frame-interpolation
@@ -874,9 +846,9 @@ impl GpuContext {
             }
         }
 
-        // RefCells, not `let mut`: the wrap AND unwind closures of one FgHook
-        // both need to write the context slot, and two &mut captures of one
-        // local can't coexist. `into_inner` right after the d3d block.
+        // RefCells, not `let mut`: the wrap closure writes the context slot
+        // while the surrounding scope still holds the binding. `into_inner`
+        // right after the d3d block.
         let fg_sc: std::cell::RefCell<Option<ffx::FgSwapchain>> = std::cell::RefCell::new(None);
         let fg_xefg: std::cell::RefCell<Option<crate::xess_fg::XefgSwapchain>> =
             std::cell::RefCell::new(None);
@@ -919,20 +891,9 @@ impl GpuContext {
                         )),
                     }
                 };
-                // Unwind: dropping the XefgSwapchain destroys the xefg context
-                // and releases its app-chain ref LAST (the ownership trap —
-                // the proxy DELEGATES to the app chain, so that ref must
-                // outlive xefgSwapChainDestroy).
-                let mut unwind = || {
-                    *fg_xefg.borrow_mut() = None;
-                };
                 D3d::with_queue(
                     &factory, device, queue, hwnd, w, h, opts.vsync, want,
-                    Some(d3d12::FgHook {
-                        fallback: without_fg,
-                        wrap: &mut wrap,
-                        unwind: &mut unwind,
-                    }),
+                    Some(d3d12::FgHook { wrap: &mut wrap }),
                     false,
                 )?
             } else if fg_versions.is_empty() {
@@ -949,20 +910,9 @@ impl GpuContext {
                     *fg_sc.borrow_mut() = Some(sc_ctx);
                     Ok(proxy)
                 };
-                // Unwind: FgSwapchain::drop = wait_for_presents +
-                // ffxshim_destroy, which releases the app chain the wrap
-                // consumed — required before a new chain can exist on this
-                // HWND (one flip-model swapchain per HWND).
-                let mut unwind = || {
-                    *fg_sc.borrow_mut() = None;
-                };
                 D3d::with_queue(
                     &factory, device, queue, hwnd, w, h, opts.vsync, want,
-                    Some(d3d12::FgHook {
-                        fallback: without_fg,
-                        wrap: &mut wrap,
-                        unwind: &mut unwind,
-                    }),
+                    Some(d3d12::FgHook { wrap: &mut wrap }),
                     false,
                 )?
             }
@@ -970,21 +920,18 @@ impl GpuContext {
         let fg_sc = fg_sc.into_inner();
         let fg_xefg = fg_xefg.into_inner();
 
-        // The display probe and the curve it implies. Only meaningful once the
-        // swapchain actually carries a wide colour space — on the 8-bit path
-        // there is one curve (ToneParams::SDR) and nothing to ask the monitor.
-        let disp = if d3d.space != d3d12::PresentSpace::Sdr {
+        // The display probe and the curve it implies. Only the PQ arm has a
+        // curve to aim (peak/paper-white) — the Sdr and Sdr10 arms are
+        // display-encoded gamma with one static curve (ToneParams::SDR) and
+        // nothing to ask the monitor.
+        let disp = if d3d.space == d3d12::PresentSpace::Hdr10 {
             Some(display::probe(&pick.adapter, hwnd))
         } else {
             None
         };
         let tone = match disp {
             Some(d) => {
-                let t = if d3d.space == d3d12::PresentSpace::Hdr10 {
-                    d.tone_pq(opts.paper_white, opts.peak_nits)
-                } else {
-                    d.tone(opts.paper_white, opts.peak_nits)
-                };
+                let t = d.tone_pq(opts.paper_white, opts.peak_nits);
                 // Report the curve we ACTUALLY installed, not the probe's opinion:
                 // --hdr-peak overrides the probe (including an "HDR off" verdict),
                 // so keying the message off `d.enabled` could announce SDR levels
@@ -1000,11 +947,10 @@ impl GpuContext {
                         t.headroom
                     );
                 } else {
-                    // Not a failure — the common case. Windows maps our linear
-                    // f16 onto the panel; we just have no headroom above white,
-                    // so the curve is the same rolloff the SDR build used.
+                    // Not a failure — a --hdr10 session on an HDR-off output:
+                    // the degenerate SDR rolloff, PQ-encoded at paper white.
                     eprintln!(
-                        "hdr: display reports HDR off — SDR levels, full panel bit depth \
+                        "hdr: display reports HDR off — SDR levels through the PQ encode \
                          (enable Windows HDR on this monitor for highlights)"
                     );
                 }
@@ -1030,13 +976,14 @@ impl GpuContext {
             xess_state.as_ref(),
             fsr_state.as_ref(),
         );
-        // The blit texture matches the SWAPCHAIN, not the CLI flag: under scRGB
-        // the CPU arms hand over f16, under HDR10 packed 10-bit PQ, under SDR
+        // The blit texture matches the SWAPCHAIN, not the CLI flag: under the
+        // 10-bit spaces the CPU arms hand over packed 10-bit u32, under SDR
         // u32 0RGB. Keyed off `d3d.space` so a refused colour space (or an FG
         // rebuild) can't leave them mismatched.
         let blit = match d3d.space {
-            d3d12::PresentSpace::Scrgb => upload::BlitUpload::new_hdr(&d3d, w, h)?,
-            d3d12::PresentSpace::Hdr10 => upload::BlitUpload::new_pq(&d3d, w, h)?,
+            d3d12::PresentSpace::Sdr10 | d3d12::PresentSpace::Hdr10 => {
+                upload::BlitUpload::new_10bit(&d3d, w, h)?
+            }
             d3d12::PresentSpace::Sdr => upload::BlitUpload::new(&d3d, w, h)?,
         };
         let hdr = upload::HdrUpload::new(&d3d, w, h)?;
@@ -1093,8 +1040,9 @@ impl GpuContext {
         );
 
         // Raw-NGX DLSS-G (preferred when built): the interpolated-frame
-        // target + lazy-created feature. scRGB fp16 is fine on this path —
-        // there is no swapchain policing because there is no swapchain hook.
+        // target + lazy-created feature. The swapchain format is irrelevant
+        // on this path — there is no swapchain policing because there is no
+        // swapchain hook (NGX sees only internal fp16 textures).
         let fg_n = if opts.fg && ngxfg::BUILT && rr_res.is_some() {
             match d3d12::committed_tex(
                 &d3d.device,
@@ -1353,14 +1301,17 @@ impl GpuContext {
                     (w, h),
                     (w, h),
                     match d3d.space {
-                        d3d12::PresentSpace::Scrgb => ffx_sys::SURFACE_FORMAT_R16G16B16A16_FLOAT,
-                        d3d12::PresentSpace::Hdr10 => ffx_sys::SURFACE_FORMAT_R10G10B10A2_UNORM,
+                        d3d12::PresentSpace::Sdr10 | d3d12::PresentSpace::Hdr10 => {
+                            ffx_sys::SURFACE_FORMAT_R10G10B10A2_UNORM
+                        }
                         d3d12::PresentSpace::Sdr => ffx_sys::SURFACE_FORMAT_B8G8R8A8_UNORM,
                     },
-                    // FG_HDR = "the backbuffer is high dynamic range"; the FI
-                    // swapchain reads the transfer function off the chain's own
-                    // declared colour space, so PQ needs no extra plumbing.
-                    d3d.space != d3d12::PresentSpace::Sdr,
+                    // FG_HDR = "the backbuffer is high dynamic range" — Hdr10
+                    // ONLY: Sdr10 is a gamma-encoded SDR buffer that happens
+                    // to be 10 bits wide. The FI swapchain reads the transfer
+                    // function off the chain's own declared colour space, so
+                    // PQ needs no extra plumbing (undeclared = sRGB/G22).
+                    d3d.space == d3d12::PresentSpace::Hdr10,
                     opts.debug,
                     *id,
                 ) {
@@ -1377,7 +1328,9 @@ impl GpuContext {
             if version.is_none() {
                 eprintln!("fg: no provider version parseable — swapchain proxy presents passthrough");
             }
-            let luminance = if d3d.space != d3d12::PresentSpace::Sdr {
+            // Only the PQ arm has real nits to report — Sdr10 is gamma SDR
+            // (and its ToneParams has no meaningful peak).
+            let luminance = if d3d.space == d3d12::PresentSpace::Hdr10 {
                 [0.0, tone.peak_nits()]
             } else {
                 [0.0, 0.0]
@@ -1760,8 +1713,9 @@ impl GpuContext {
         self.rr = None;
         self.d3d.resize(w, h)?;
         self.blit = match self.d3d.space {
-            d3d12::PresentSpace::Scrgb => upload::BlitUpload::new_hdr(&self.d3d, w, h)?,
-            d3d12::PresentSpace::Hdr10 => upload::BlitUpload::new_pq(&self.d3d, w, h)?,
+            d3d12::PresentSpace::Sdr10 | d3d12::PresentSpace::Hdr10 => {
+                upload::BlitUpload::new_10bit(&self.d3d, w, h)?
+            }
             d3d12::PresentSpace::Sdr => upload::BlitUpload::new(&self.d3d, w, h)?,
         };
         self.hdr = upload::HdrUpload::new(&self.d3d, w, h)?;
@@ -1936,11 +1890,12 @@ impl GpuContext {
                     (w, h),
                     (w, h),
                     match self.d3d.space {
-                        d3d12::PresentSpace::Scrgb => ffx_sys::SURFACE_FORMAT_R16G16B16A16_FLOAT,
-                        d3d12::PresentSpace::Hdr10 => ffx_sys::SURFACE_FORMAT_R10G10B10A2_UNORM,
+                        d3d12::PresentSpace::Sdr10 | d3d12::PresentSpace::Hdr10 => {
+                            ffx_sys::SURFACE_FORMAT_R10G10B10A2_UNORM
+                        }
                         d3d12::PresentSpace::Sdr => ffx_sys::SURFACE_FORMAT_B8G8R8A8_UNORM,
                     },
-                    self.d3d.space != d3d12::PresentSpace::Sdr,
+                    self.d3d.space == d3d12::PresentSpace::Hdr10,
                     opts.debug,
                     fg.version.0,
                 ) {
@@ -4431,39 +4386,23 @@ impl GpuContext {
         self.d3d.end_frame(slot)
     }
 
-    /// `present_cpu` for the scRGB swapchain: the CPU produced final scRGB f16
-    /// (`render::present_px_scrgb` applied the curve, the overlay, and the
-    /// encode), so this is still a straight blit — the blit PS stays a
-    /// passthrough and never learns about colour spaces.
-    pub fn present_cpu_hdr(&mut self, pixels: &[[half::f16; 4]]) -> Result<()> {
-        crate::zone!("present-cpu-hdr");
+    /// `present_cpu` for the 10-bit swapchain (Sdr10 or Hdr10): the CPU
+    /// produced the final packed 10-bit u32 (`render::present_px_sdr10` /
+    /// `present_px_pq` applied the curve, the overlay, the encode, and the
+    /// R10G10B10A2 pack), so this is still a straight blit — the blit PS
+    /// stays a passthrough and never learns about colour spaces.
+    pub fn present_cpu_10bit(&mut self, pixels: &[u32]) -> Result<()> {
+        crate::zone!("present-cpu-10bit");
         let slot = self.d3d.begin_frame()?;
-        self.blit.record_hdr(&self.d3d, slot, pixels);
+        self.blit.record_10bit(&self.d3d, slot, pixels);
         self.fullscreen_to_backbuffer(false, tonemap::SRV_SLOT_BLIT, 1.0);
         self.d3d.end_frame(slot)
     }
 
-    /// `present_cpu` for the HDR10 swapchain: the CPU produced final packed
-    /// 10-bit PQ (`render::present_px_pq` applied the curve, the overlay, the
-    /// matrix + ST 2084 encode, and the R10G10B10A2 pack), so this is still a
-    /// straight blit.
-    pub fn present_cpu_pq(&mut self, pixels: &[u32]) -> Result<()> {
-        crate::zone!("present-cpu-pq");
-        let slot = self.d3d.begin_frame()?;
-        self.blit.record_pq(&self.d3d, slot, pixels);
-        self.fullscreen_to_backbuffer(false, tonemap::SRV_SLOT_BLIT, 1.0);
-        self.d3d.end_frame(slot)
-    }
-
-    /// True when the swapchain actually came up as scRGB — NOT merely what
-    /// `--hdr` asked for (the colour space can be refused; see `D3d::with_queue`).
-    /// Callers pick their present arm and their `resolve*` on this.
-    pub fn is_hdr(&self) -> bool {
-        self.d3d.hdr()
-    }
-
-    /// Which colour space presentation actually negotiated — the three-way
-    /// fact `is_hdr()` collapses. The CPU arms pick their encode on this.
+    /// Which colour space presentation actually negotiated — NOT merely what
+    /// the flags asked for (the G2084 declare can be refused and the FG wrap
+    /// can force a rebuild; see `D3d::with_queue`). The CPU arms pick their
+    /// encode on this.
     pub fn encoding(&self) -> d3d12::PresentSpace {
         self.d3d.space
     }
@@ -4475,20 +4414,18 @@ impl GpuContext {
     /// Cheap by construction: this is a `GetDesc1` and a field write. It is NOT
     /// a swapchain rebuild, and it deliberately does not reset the upscaler
     /// history — a display change is a change of output device, not of scene.
+    /// Only the Hdr10 arm has anything to retune (peak/paper aim the PQ
+    /// rolloff); the gamma arms' curve is the static `ToneParams::SDR`.
     pub fn refresh_display(&mut self, paper_white: f32, peak: Option<f32>) -> Option<display::DisplayHdr> {
-        if self.d3d.space == d3d12::PresentSpace::Sdr {
-            return None; // the 8-bit path has one curve and no display to ask
+        if self.d3d.space != d3d12::PresentSpace::Hdr10 {
+            return None; // one static curve, no display to ask
         }
         let d = display::probe(&self.adapter, self.hwnd);
         if Some(d) == self.display {
             return None;
         }
         self.display = Some(d);
-        self.tone = if self.d3d.space == d3d12::PresentSpace::Hdr10 {
-            d.tone_pq(paper_white, peak)
-        } else {
-            d.tone(paper_white, peak)
-        };
+        self.tone = d.tone_pq(paper_white, peak);
         Some(d)
     }
 
@@ -4685,11 +4622,12 @@ impl GpuContext {
             (w, h),
             (w, h),
             match self.d3d.space {
-                d3d12::PresentSpace::Scrgb => ffx_sys::SURFACE_FORMAT_R16G16B16A16_FLOAT,
-                d3d12::PresentSpace::Hdr10 => ffx_sys::SURFACE_FORMAT_R10G10B10A2_UNORM,
+                d3d12::PresentSpace::Sdr10 | d3d12::PresentSpace::Hdr10 => {
+                    ffx_sys::SURFACE_FORMAT_R10G10B10A2_UNORM
+                }
                 d3d12::PresentSpace::Sdr => ffx_sys::SURFACE_FORMAT_B8G8R8A8_UNORM,
             },
-            self.d3d.space != d3d12::PresentSpace::Sdr,
+            self.d3d.space == d3d12::PresentSpace::Hdr10,
             debug,
             fg.version.0,
         ) {
@@ -5652,9 +5590,10 @@ impl Drop for GpuContext {
                 // exactly nothing the OS is not about to reclaim, and it turns
                 // a crash-or-hang on every FG session into a clean exit. It is
                 // scoped to process teardown ON PURPOSE: `FgSwapchain::drop`
-                // still destroys normally on the colour-space unwind path,
-                // where the context genuinely must go before a new chain can
-                // exist on the HWND.
+                // still destroys normally wherever a context must go before a
+                // new chain can exist on the HWND. (The old colour-space
+                // unwind path is gone — a refused G2084 re-declare now
+                // relabels the session Sdr10 and keeps the proxy.)
                 //
                 // NOT the real fix, which is architectural: quinlight-player
                 // drives frame interpolation itself

@@ -413,7 +413,7 @@ each one's A/B is how its cost was measured in the first place.
 | Heightfield relief — real displaced geometry at the intersector | (opt-in `--heightfield`) | **V** |
 | The upscaler chain — DLSS-RR → FSR4-RR → XeSS → FSR 3.1, first supported wins | `--no-upscale` | **G** / **K** / **X** |
 | Frame generation — three families, whichever the adapter supports | `--no-fg` | |
-| HDR output — HDR10/PQ on an HDR-on display, scRGB f16 elsewhere | `--no-hdr` | |
+| HDR output — one 10-bit swapchain: HDR10/PQ on an HDR-on display, deep-colour gamma elsewhere | `--no-hdr` | |
 | Glare — the reason the sun looks like a sun | `--no-bloom` | |
 | BC7 texture compression, encoded on the GPU at load | `--no-bc7` | |
 | Per-island ambience + procedural wind | `--no-audio` | |

@@ -28,8 +28,9 @@ cbuffer Params : register(b0) {
     float2 bloom_texel;   // 1 / glare dims (the tent's tap spacing)
     float knee;      // rolloff start, in paper-white units
     float headroom;  // asymptote = peak_nits / paper_white; 1.0 on SDR
-    float scale;     // scRGB: paper_white / 80. SDR: 1.0. HDR10: paper_white / 10000
-    float mode;      // 0 = scRGB linear, 1 = 8-bit gamma 2.2, 2 = HDR10 PQ (tone::ToneMode)
+    float scale;     // Gamma22 (SDR/Sdr10): 1.0. HDR10: paper_white / 10000
+    float mode;      // 1 = gamma 2.2 (8-bit AND Sdr10), 2 = HDR10 PQ (tone::ToneMode;
+                     // 0 was scRGB-linear, retired with the f16 swapchain)
 };
 
 // Rec.709 -> Rec.2020 primaries. Literals mirror tone::m709_to_2020
@@ -103,8 +104,8 @@ float4 psmain(float4 pos : SV_Position) : SV_Target {
         // then gamut matrix + ST 2084 — tone::encode's Pq arm verbatim.
         return float4(pq_encode(m709_to_2020(f * scale)), 1.0);
     }
-    if (mode > 0.5) f = pow(f, 1.0 / 2.2);
-    // No saturate: under scRGB, values above 1.0 are legal and ARE the highlight
-    // headroom. The curve is bounded by `headroom` on its own.
-    return float4(f * scale, 1.0);
+    // Gamma 2.2, display-encoded — both the 8-bit and Sdr10 wires (the RTV
+    // format quantizes; the curve is bounded by headroom = 1, and the UNORM
+    // ROP clamps anyway).
+    return float4(pow(f, 1.0 / 2.2) * scale, 1.0);
 }
