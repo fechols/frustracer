@@ -354,13 +354,41 @@ fn capture_cell(
 const LEAF_LEVELS: u32 = 1;
 
 /// Shading quality for radiance carried back by GI leaf rays (the depth-1
-/// policy): one shadow sample, no AO, no further reflections or hemispheres —
-/// same spirit as the specular bounce, and structurally recursion-free.
+/// policy): one shadow sample, no further reflections or hemispheres — same
+/// spirit as the specular bounce, and structurally recursion-free.
 /// pub(crate): the `--check` GI reference must implement the SAME policy so
 /// the A/B isolates integrator error from policy error.
+///
+/// `ao_samples` IS THE WHOLE DIFFERENCE BETWEEN GI AND A FLAT AMBIENT, and it
+/// used to be 0. A bounce surface's own ambient is `sky_sh.irradiance(n) * ao`
+/// (shade.rs), so at 0 the `ao` factor is 1.0 and every bounce surface is lit
+/// as though it stood in an open field under the full sky — including a wall
+/// deep under an arcade that can see almost none of it. Each occluded
+/// direction then hands the integral a full-sky-lit surface, so `gi()`
+/// collapses toward the unoccluded sky value EVERYWHERE: a uniform lift with
+/// no structure, which reads on screen as exactly the flat ambient constant
+/// this tier exists to replace — brighter than no GI at all, and visibly
+/// WORSE, which is why it survived every gate (they bound error against a
+/// reference running this same policy, so both sides were flat together).
+///
+/// MEASURED, San Miguel's patio at 15:30 (1280x720, 96 spp, luminance):
+///
+/// | `ao_samples` | mean | shadowed | contrast p90/p10 |
+/// |---|---|---|---|
+/// | 0 (the bug) | 46.30 | 35.68 | 2.34 |
+/// | **1** | **26.15** | **14.45** | **4.70** |
+/// | 2 | 26.15 | 14.45 | 4.70 |
+/// | fb OFF (no GI) | 22.45 | 6.17 | 10.01 |
+///
+/// One ray is enough: 2 measured 0.19% different — variance the accumulation
+/// path launders — for 21% more time, and 1 is symmetric with
+/// `shadow_samples`. Shadowed regions stay 2.3x above the fb-OFF tier, which
+/// IS the bounce light; what returns is the falloff. Whole-frame cost on that
+/// probe 28.4 -> 37.1 s (+31%), far cheaper than a second bounce and it keeps
+/// the tier recursion-free.
 pub(crate) const BOUNCE_Q: shade::Quality = shade::Quality {
     shadow_samples: 1,
-    ao_samples: 0,
+    ao_samples: 1,
     reflections: false,
     fb: shade::FrustumBounce::OFF,
 };

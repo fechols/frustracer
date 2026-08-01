@@ -84,7 +84,12 @@ void cs_hemi_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
             // would buy nothing.
             // fireflies false — bounce surfaces take no firefly light (the
             // CPU hemi tier's ff = None; the emissive precedent).
-            float3 l = shade_split(pt.o, d, h, rng, 1u, 0u, false, false,
+            // n_ao MIRRORS hemi.rs::BOUNCE_Q.ao_samples and is not optional
+            // detail: at 0 the bounce surface's own sky ambient is unoccluded
+            // (shade.hlsli leaves `ao` at 1.0), so an arcade interior returns
+            // open-field radiance and the whole GI integral flattens to a
+            // constant. Keep these two in lockstep.
+            float3 l = shade_split(pt.o, d, h, rng, 1u, 1u, false, false,
                                    0.0, HEMI_CONE_SPREAD, false, false, w3, o3, n3, ps_unused);
             hemi_add3(pt.pixel, l * weight);
         } else {

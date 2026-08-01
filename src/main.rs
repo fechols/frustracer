@@ -10173,7 +10173,28 @@ fn run_cinematic_gpu(
                 let fs = cine_frame_state(scene, shot, attractors, cine, f, &mut prev_hour);
                 cine_push_sky(armv, scene, &fs, prev_hour);
                 let basis = fs.cam.basis(rw, rh);
-                for _k in 0..shot.samples {
+                // WARM-UP, output frame 0 only. `seq` free-runs, so frame f
+                // is reconstructed from its own `samples` passes PLUS every
+                // pass since the shot's one `reset` — (f+1)·samples of
+                // accumulated evidence. Frame 0 has only its own, which at the
+                // sequence default of 32 is under HALF a jitter phase: it is
+                // both history-starved and sampled on a biased lattice, and it
+                // gets written to disk like any other frame. In a looping clip
+                // that discontinuity shows once per lap.
+                //
+                // Topping frame 0 up to a full phase costs nothing where it is
+                // not needed (a 256-sample still is already 3.5 phases, so the
+                // sub is 0) and lands frame 0 between frames 1 and 2 in
+                // accumulated evidence, which is the continuity we want. The
+                // extra passes emit nothing — only the model state after the
+                // final pass is read back, below — and `reset` stays
+                // `seq == 0`, so it self-consistently lands on the first
+                // warm-up pass. Deliberately NOT applied to the accumulation
+                // arm: N sub-frames in, one unweighted mean out, and frame 0
+                // is statistically identical to frame 5 there.
+                let warm =
+                    if f == 0 { dlss::JITTER_PHASE.saturating_sub(shot.samples) } else { 0 };
+                for _k in 0..shot.samples + warm {
                     let jit = dlss::jitter_for(seq);
                     let reset = seq == 0;
                     let p = gpu::trace::FrameParams {

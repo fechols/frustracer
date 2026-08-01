@@ -507,13 +507,25 @@ pub fn world_lap(w: &World, frames: u32, fps: u32, res: (usize, usize), samples:
 const ISLAND_FRAMING: &[(&str, [f32; 3], [f32; 3], f32, f32)] = &[
     // Down the length of the atrium from the west end, tilted up so the
     // colonnade and the open sky above it carry the frame.
-    ("sponza", [-0.425, 0.103, 0.025], [0.575, 0.324, 0.025], 70.0, 2.0),
+    //
+    // +3, not the +2 this row carried until the hemi bounce tier was fixed.
+    // `BOUNCE_Q.ao_samples` was 0, so bounce surfaces were lit as if
+    // unoccluded and GI over-brightened enclosures ~2x while flattening them
+    // (see hemi.rs). These stops were calibrated against that, so correcting
+    // the tier means the camera has to open up — which is what a photographer
+    // does when the light really is dimmer. At +3 this frame returns to the
+    // old mean (47.0 vs 52.5) with the restored structure intact (contrast
+    // 3.74 vs 2.78) and 0.4% of pixels clipped.
+    ("sponza", [-0.425, 0.103, 0.025], [0.575, 0.324, 0.025], 70.0, 3.0),
     // The patio: fountain anchoring the centre, the arcade sweeping up on the
     // right, the ficus canopy framing the top and a gap of sky between them.
     // The eye sits LOW and the target HIGH on purpose — a level camera renders
     // the same courtyard as a furniture catalogue, and tilting up is what makes
     // the arcade tower instead of merely stand there.
-    ("san-miguel", [0.261, 0.170, 0.043], [-0.391, 0.380, 0.043], 66.0, 2.0),
+    // +3 for the same reason as sponza above — the deepest enclosure in the
+    // set, so it moved the most when the bounce tier stopped over-brightening
+    // (mean 46.3 -> 26.1, contrast 2.32 -> 4.70).
+    ("san-miguel", [0.261, 0.170, 0.043], [-0.391, 0.380, 0.043], 66.0, 3.0),
     // Street level at the corner, looking across the plaza to the tree and the
     // lamps, with the wet cobbles taking the low sun.
     ("bistro", [0.222, 0.225, 0.222], [0.639, 0.300, 0.556], 65.0, 2.0),
