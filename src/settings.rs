@@ -178,6 +178,12 @@ opt_fields! {
         pub fireflies: bool,
         /// --fireflies N (1..=64; live)
         pub fireflies_count: u32,
+        /// --emissive-lights arming (DEFAULT OFF — the heightfield shape;
+        /// live: frame=0, histories kept)
+        pub emissive_lights: bool,
+        /// --emissive-lights N (1..=64; restart — the budget keys the
+        /// load-time cluster derivation)
+        pub emissive_lights_count: u32,
         /// --tod <hour> (live: the scrub keys / menu slider)
         pub tod: f32,
         /// --aniso 1..=16 (restart: baked into the GPU static sampler)
@@ -849,6 +855,18 @@ pub fn apply_to_opts(s: &Settings, opts: &mut crate::Opts) -> AppliedFx {
         }
         opts.fireflies_count = n;
     }
+    if let Some(v) = e.emissive_lights {
+        opts.emissive_lights = v;
+    }
+    if let Some(n) = e.emissive_lights_count {
+        if n > crate::emissive::MAX_EMISSIVE_LIGHTS as u32 {
+            eprintln!(
+                "settings: effects.emissive_lights_count {n} clamped to {} (the CB row cap)",
+                crate::emissive::MAX_EMISSIVE_LIGHTS
+            );
+        }
+        opts.emissive_lights_count = n;
+    }
     if let Some(n) = s.advanced.dxr_inline {
         if n <= 2 {
             opts.dxr_inline = n;
@@ -1016,6 +1034,8 @@ pub fn menu_items() -> &'static [MenuItem] {
             item!("clouds", "volumetric clouds", "Effects", Live, Toggle { default: true }, acc_bool!(effects.clouds)),
             item!("fireflies", "fireflies (night)", "Effects", Live, Toggle { default: true }, acc_bool!(effects.fireflies)),
             item!("fireflies_count", "firefly count", "Effects", Live, StepU { min: 8, max: 64, step: 8, default: 32 }, acc_u32!(effects.fireflies_count)),
+            item!("emissive_lights", "emissive lights", "Effects", Live, Toggle { default: false }, acc_bool!(effects.emissive_lights)),
+            item!("emissive_lights_count", "emissive light budget", "Effects", Restart, StepU { min: 8, max: 64, step: 8, default: 32 }, acc_u32!(effects.emissive_lights_count)),
             item!("aniso", "max anisotropy", "Effects", Restart, Cycle { options: &["1", "2", "4", "8", "16"], default_ix: 4 }, acc_u32!(effects.aniso)),
             item!("cloud_shadow", "cloud shadow cache (cells/λ; off)", "Effects", Restart, Cycle { options: &["off", "8", "16", "32", "64"], default_ix: 2 }, ((|s: &Settings| s.effects.cloud_shadow.map(|v| if v == 0 { "off".into() } else { v.to_string() })), (|s: &mut Settings, v: &str| {
                 s.effects.cloud_shadow = if v == "off" { Some(0) } else { v.parse().ok() };
@@ -1098,6 +1118,7 @@ pub struct LiveView {
     pub clouds: bool,
     pub fireflies: bool,
     pub fireflies_count: u32,
+    pub emissive_lights: bool,
 }
 
 /// What a Live-tier adjust does to the session — main.rs maps these onto the
@@ -1127,6 +1148,7 @@ pub enum MenuFx {
     ToggleClouds,
     ToggleFireflies,
     FirefliesCount(u32),
+    ToggleEmissive,
     ToggleHud,
     None,
 }
@@ -1158,6 +1180,7 @@ pub fn menu_value(item: &MenuItem, s: &Settings, live: &LiveView) -> String {
             "clouds" => onoff(live.clouds),
             "fireflies" => onoff(live.fireflies),
             "fireflies_count" => live.fireflies_count.to_string(),
+            "emissive_lights" => onoff(live.emissive_lights),
             _ => "?".into(),
         };
     }
@@ -1249,6 +1272,10 @@ pub fn menu_adjust(item: &MenuItem, dir: i32, s: &mut Settings, live: &LiveView)
             "fireflies" => {
                 (item.set)(s, &onoff(!live.fireflies));
                 MenuFx::ToggleFireflies
+            }
+            "emissive_lights" => {
+                (item.set)(s, &onoff(!live.emissive_lights));
+                MenuFx::ToggleEmissive
             }
             "fireflies_count" => {
                 let (min, max, step) = match &item.control {

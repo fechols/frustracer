@@ -632,6 +632,7 @@ pub fn try_load(src_path: &str) -> Option<(Scene, Bvh)> {
         any_alpha: false,
         any_height: false,
         any_transmissive: false,
+        emissive: crate::emissive::EmissiveLights::off(),
         sun: crate::sky::Sun::new(sun_v[0]),
         // Derived from the sun by finalize_scalars below — deliberately not in
         // the on-disk format, so the SH sky costs the cache nothing. The TOD
@@ -989,6 +990,7 @@ pub fn try_load_world(
         any_alpha: false,
         any_height: false,
         any_transmissive: false,
+        emissive: crate::emissive::EmissiveLights::off(),
         sun: crate::sky::Sun::new(sun_v[0]),
         // Derived-only fields, exactly the per-scene rule (see try_load).
         sky_sh: crate::sh::Sh9::ZERO,

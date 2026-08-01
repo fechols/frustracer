@@ -878,7 +878,14 @@ fn leaf_rays(
                     shade::VisCtl::Off,
                     None,
                     // Fireflies never light bounce surfaces (the gather
-                    // exclusion — the emissive precedent).
+                    // exclusion — the stars rule).
+                    None,
+                    // Emissive cluster lights: None — the GI gather IS the
+                    // emissive transport here (the display `color += e` on
+                    // this very shade call delivers a hit emitter's
+                    // radiance), and the NEE tier is off under fb.gi by the
+                    // same rule (src/emissive.rs's inverted once-per-path
+                    // argument). A Some here would double-count.
                     None,
                 ),
             };

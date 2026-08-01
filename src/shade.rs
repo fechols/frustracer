@@ -523,6 +523,14 @@ pub fn shade(
     // materials, fireflies do not light bounce surfaces (the one-sky gather
     // exclusion — the stars rule).
     ff: Option<&crate::fireflies::Fireflies>,
+    // Emissive cluster lights (src/emissive.rs) — Some ONLY on the primary
+    // camera path, and NEVER under fb.gi (the once-per-path rule INVERTED:
+    // the GI gather already delivers emissive transport exactly — real
+    // geometry, real soft shadows, textured emission — so GI frames keep the
+    // gather and drop the lossy-cluster NEE instead; render.rs's one Some
+    // site gates on !q.fb.gi). The recursion, the hemi tier, and both GI
+    // references pass None like ff.
+    el: Option<&crate::emissive::EmissiveLights>,
 ) -> Vec3A {
     // Capture/Apply only exist for the sampled shadow/AO paths; the
     // frustum-bounce tiers would silently bypass the record.
@@ -942,6 +950,58 @@ pub fn shade(
             }
         }
     }
+    // Emissive cluster lights (src/emissive.rs) — the direct tier's third
+    // entry, the firefly block's exact shape: AFTER the cloud scaling (a
+    // lamp under the slab is a local light — the sun's cloud transmittance
+    // must not dim it) and BEFORE the prim capture (the light rides FSR-RR's
+    // denoised dd lobe; albedo-free radiance like the sun's `li`, so the
+    // composite identity closes untouched). ZERO rng draws — deterministic
+    // iteration, one HARD shadow ray per in-range light. DIFFUSE-ONLY, and
+    // that is a correctness decision, not a shortcut: an emitter has real
+    // geometry, so its specular highlight is DELIVERED by the traced VNDF
+    // ray hitting the glowing surface (the display `color += e` at every
+    // depth) — a firefly-shaped `w_l = 1` specular term here would
+    // double-count it, and the mirror image cannot be down-weighted (MIS'd
+    // specular is the documented follow-on). The shadow ray stops
+    // rc + 2·eps SHORT of the cluster center so the emitter's own bulb/
+    // lamp-glass geometry cannot occlude its own light (known-accept:
+    // non-emissive geometry inside the cluster sphere doesn't occlude it
+    // either). Emissive-free scenes hand shade a structural None — the
+    // pre-feature renderer bit-identically.
+    if let Some(el) = el {
+        for i in 0..el.count as usize {
+            let l = &el.lights[i];
+            let to = Vec3A::from(l.pos) - p;
+            let d2 = to.length_squared();
+            // The rejection test — a far light's only cost.
+            if d2 >= l.r_infl2 {
+                continue;
+            }
+            let dist = d2.sqrt();
+            let wi = to / dist;
+            let ndl = n_s.dot(wi);
+            if ndl <= 0.0 {
+                continue;
+            }
+            let e = crate::emissive::irradiance(l, d2);
+            if e == Vec3A::ZERO {
+                continue;
+            }
+            ls.secondary_rays += 1;
+            ls.emissive_rays += 1;
+            let vis_t = bvh.transmittance(
+                scene,
+                &Ray::new(p, wi),
+                0.0,
+                (dist - l.rc2.sqrt() - 2.0 * scene.eps).max(0.0),
+                &mut ls.ray_nodes,
+            );
+            if vis_t == Vec3A::ZERO {
+                continue;
+            }
+            direct_d += e * ndl * vis_t;
+        }
+    }
     if let Some(prim) = prim.as_deref_mut() {
         prim.direct_d = direct_d;
         prim.direct_s = direct_s;
@@ -1067,8 +1127,13 @@ pub fn shade(
     // Emitted radiance — additive, OUTSIDE the kd·(1−transmission) factor,
     // at every depth (so emitters appear in reflections and through glass).
     // Guarded, not an unconditional `+ ZERO`: -0.0 + 0.0 = +0.0 would break
-    // the default-material bit-identity contract. Emitters do NOT light
-    // other surfaces — only the analytic area light + sky do.
+    // the default-material bit-identity contract. This is the DISPLAY half
+    // of emissive transport (the sky::radiance analogue); the GATHER half is
+    // the cluster-light NEE loop above (src/emissive.rs — direct tier, lap
+    // 0, ARMED by --emissive-lights) and, under fb.gi, the hemi gather
+    // picking this very term up off bounce hits. At most one of those two
+    // lights other surfaces per frame (FLAG/fb gating), and this add is
+    // never conditional on either.
     if mat.emissive != Vec3A::ZERO || mat.emissive_tex != NO_TEX {
         let e = match (mat.emissive_tex != NO_TEX, map_uv) {
             (true, Some(uv)) => {
@@ -1135,7 +1200,7 @@ pub fn shade(
                     // The child cone starts at this hit's width — reflected
                     // hits read footprints grown by the full path length.
                     let rcone = Cone { w0: cone_w, spread: cone.spread, aniso: cone.aniso };
-                    shade(scene, bvh, &rray, &rh, None, &rq, rng, sun, cl, rcone, depth + 1, ls, None, VisCtl::Off, None, None)
+                    shade(scene, bvh, &rray, &rh, None, &rq, rng, sun, cl, rcone, depth + 1, ls, None, VisCtl::Off, None, None, None)
                 }
                 None => {
                     if let Some(prim) = prim.as_deref_mut() {
@@ -1283,7 +1348,7 @@ pub fn shade(
                     Some(th) => (
                         shade(
                             scene, bvh, &tray, &th, None, &rq, rng, sun, cl, tcone, depth + 1,
-                            ls, None, VisCtl::Off, None, None,
+                            ls, None, VisCtl::Off, None, None, None,
                         ),
                         th.t,
                     ),
@@ -1593,6 +1658,7 @@ pub fn tangent_self_test() -> Result<(), String> {
             any_alpha: false,
             any_height: false,
             any_transmissive: false,
+            emissive: crate::emissive::EmissiveLights::off(),
             sun: crate::sky::Sun::new(Vec3A::Y),
             sky_sh: crate::sh::Sh9::ZERO,
             sky_scale: 1.0,

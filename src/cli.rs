@@ -28,8 +28,8 @@
 
 use crate::camera::Camera;
 use crate::{
-    bc7, blas_split, bloom, bvh, cinematic, clouds, dlss, fireflies, fsr, gpu, oidn, scene,
-    settings, texture, tone, upchain, xess,
+    bc7, blas_split, bloom, bvh, cinematic, clouds, dlss, emissive, fireflies, fsr, gpu, oidn,
+    scene, settings, texture, tone, upchain, xess,
 };
 use glam::Vec3A;
 
@@ -410,6 +410,14 @@ pub struct Opts {
     /// `--fireflies N`. `fireflies::set_count` is what CLAMPS to MAX_FIREFLIES;
     /// the parse only NOTES the clamp, so this field carries the raw request.
     pub fireflies_count: u32,
+    /// `--emissive-lights [N]` ARMS the direct-tier NEE for emissive
+    /// surfaces (src/emissive.rs) — DEFAULT OFF, the heightfield shape;
+    /// `--no-emissive-lights` spells the default (later flags win).
+    pub emissive_lights: bool,
+    /// The `--emissive-lights` budget (bare flag keeps the default).
+    /// `emissive::set_budget` owns the clamp to MAX_EMISSIVE_LIGHTS; the
+    /// parse only NOTES it (the fireflies shape).
+    pub emissive_lights_count: u32,
     /// `--dxr-inline 0|1|2` (`gpu::dxr::set_inline_mode`).
     pub dxr_inline: u32,
     /// `--no-foliage-sway` clears (`foliage::set_armed`) — leaf sway, the
@@ -618,6 +626,8 @@ pub fn defaults() -> Opts {
         sky_lod: 4,
         fireflies: true,
         fireflies_count: fireflies::DEFAULT_COUNT,
+        emissive_lights: false,
+        emissive_lights_count: emissive::EL_DEFAULT,
         dxr_inline: 1,
         foliage_sway: true,
         foliage_amp: 1.0,
@@ -909,6 +919,38 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
                     ));
                 }
                 opts.fireflies_count = n;
+            }
+            // Emissive cluster lights — DEFAULT OFF (the heightfield arming
+            // shape; the CPU shadow-ray cost is real and the physical
+            // calibration's pools are faint, see emissive.rs's header).
+            // Optional value, the --blas-split idiom: the next token is
+            // consumed only when it is all digits, so `--emissive-lights
+            // model.obj` leaves the scene path alone — but a numeric token
+            // that is not a legal budget (0) is a typo and exits rather than
+            // arming at the default and landing in the positional arm.
+            "--no-emissive-lights" => opts.emissive_lights = false,
+            "--emissive-lights" => {
+                opts.emissive_lights = true;
+                let numeric = args.peek().is_some_and(|v| {
+                    !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit())
+                });
+                if numeric {
+                    let v = args.next().unwrap();
+                    let n = v.parse::<u32>().ok().filter(|n| *n >= 1).unwrap_or_else(|| {
+                        eprintln!(
+                            "--emissive-lights: '{v}' is not a budget (1..={})",
+                            emissive::MAX_EMISSIVE_LIGHTS
+                        );
+                        std::process::exit(2);
+                    });
+                    if n > emissive::MAX_EMISSIVE_LIGHTS as u32 {
+                        notes.push(format!(
+                            "emissive-lights: budget {n} clamped to {} (the CB row cap)",
+                            emissive::MAX_EMISSIVE_LIGHTS
+                        ));
+                    }
+                    opts.emissive_lights_count = n;
+                }
             }
             // Same "knob before scene load" pattern: the GPU reads it for the
             // static sampler's MaxAnisotropy, the CPU for Cone::aniso. 1 = off
@@ -1645,6 +1687,13 @@ pub fn usage() {
                 eprintln!("                with hard shadow rays + a depth-tested glow; a day session has zero");
                 eprintln!("                fireflies and is bit-identical structurally)");
                 eprintln!("  --fireflies N   firefly count (default {}, max {})", fireflies::DEFAULT_COUNT, fireflies::MAX_FIREFLIES);
+                eprintln!("  --emissive-lights [N]  ARM emissive surfaces lighting the scene (OFF by default —");
+                eprintln!("                the CPU shadow-ray cost is real; measured bistro +5.5 ms at N=32):");
+                eprintln!("                Ke/map_Ke/glTF-emissive triangles cluster into <= {} virtual disc", emissive::MAX_EMISSIVE_LIGHTS);
+                eprintln!("                lights sampled in the direct tier — windowed falloff, one hard shadow");
+                eprintln!("                ray each, zero rng; bare flag = budget {}, N overrides; GI (H) frames", emissive::EL_DEFAULT);
+                eprintln!("                keep the exact gather instead and skip the clusters");
+                eprintln!("  --no-emissive-lights  the default, spelled explicitly (later flags win)");
                 eprintln!("  --no-foliage-sway  disable wind-swayed foliage (ON by default: alpha-cutout leaves");
                 eprintln!("                bucket into per-cell chunks translated on the cloud clock — ALL render");
                 eprintln!("                modes (CPU/GPU/DXR; swept leaf AABBs keep every claim sound); a scene");
@@ -1707,8 +1756,8 @@ pub fn usage() {
 fn lever_snapshot() -> String {
     format!(
         "mips={} aniso={} h2n={} n2h={} tint={} spray={} depth={} water={} ccull={} \
-         harm={} hon={} bloom={} clouds={} ff={} ffn={} cshadow={} skylod={} dxrinline={} \
-         fsway={} famp={}",
+         harm={} hon={} bloom={} clouds={} ff={} ffn={} el={} eln={} cshadow={} skylod={} \
+         dxrinline={} fsway={} famp={}",
         texture::mips_enabled(),
         texture::max_aniso(),
         texture::h2n_enabled(),
@@ -1724,6 +1773,8 @@ fn lever_snapshot() -> String {
         clouds::enabled(),
         fireflies::enabled(),
         fireflies::count(),
+        emissive::enabled(),
+        emissive::budget(),
         gpu::trace::cloud_shadow_n(),
         gpu::trace::sky_lod(),
         gpu::dxr::dxr_inline_mode(),
@@ -1769,6 +1820,9 @@ pub fn self_test() -> Result<(), String> {
         "--no-fireflies",
         "--fireflies",
         "7",
+        "--no-emissive-lights",
+        "--emissive-lights",
+        "9",
         "--dxr-inline",
         "2",
         "--no-foliage-sway",
@@ -1801,6 +1855,10 @@ pub fn self_test() -> Result<(), String> {
         ("sky_lod", o.sky_lod == 1),
         ("fireflies", !o.fireflies),
         ("fireflies_count", o.fireflies_count == 7),
+        // Default OFF: "moved" means ARMED (the trailing --emissive-lights 9
+        // wins over the earlier --no-emissive-lights in the argv above).
+        ("emissive_lights", o.emissive_lights),
+        ("emissive_lights_count", o.emissive_lights_count == 9),
         ("dxr_inline", o.dxr_inline == 2),
         ("foliage_sway", !o.foliage_sway),
         ("foliage_amp", o.foliage_amp == 2.0),
@@ -1974,6 +2032,15 @@ pub fn self_test() -> Result<(), String> {
         || bare.obj.as_deref() != Some("model.obj")
     {
         return Err("--blas-split must not swallow a following scene path".into());
+    }
+    // Same optional-value contract for the emissive arming flag: bare arms
+    // at the default budget without eating a scene path.
+    let el_bare = parse_argv(&["--emissive-lights", "model.obj"]);
+    if !el_bare.opts.emissive_lights
+        || el_bare.opts.emissive_lights_count != emissive::EL_DEFAULT
+        || el_bare.obj.as_deref() != Some("model.obj")
+    {
+        return Err("--emissive-lights (bare) must arm at the default budget without swallowing a scene path".into());
     }
 
     // ---- 6. --help stops the parse ----------------------------------------

@@ -357,6 +357,7 @@ fn merge_scenes(parts: Vec<(Scene, Vec3A)>, field_half: f32) -> Scene {
         any_alpha: false,
         any_height: false,
         any_transmissive: false,
+        emissive: crate::emissive::EmissiveLights::off(),
         // ONE sun at infinity for the whole archipelago — the one-sky
         // invariant. --tod / the flycam attractors move it globally later.
         sun: scene::default_sun(),

@@ -210,11 +210,12 @@ pub const HEMI_BATCH: u32 = 16384;
 /// Max fb.depth the hemi queue sizing supports (presets top out at 4).
 const HEMI_MAX_DEPTH: u32 = 4;
 
-// Root-CBV alignment (256 B). FrameCb is 2480 bytes — 288 of struct plus the
-// MAX_SPP-entry jitter table (--spp), the SH sky rows, and the MAX_FIREFLIES
-// pose rows, which are what set the size (raise the stride in lockstep with
-// either cap; the const asserts below police both directions).
-pub(crate) const CB_STRIDE: usize = 2560;
+// Root-CBV alignment (256 B). FrameCb is 4576 bytes — 288 of struct plus the
+// MAX_SPP-entry jitter table (--spp), the SH sky rows, the MAX_FIREFLIES
+// pose rows, and the MAX_EMISSIVE_LIGHTS cluster-light row pairs, which are
+// what set the size (raise the stride in lockstep with any cap; the const
+// asserts below police both directions).
+pub(crate) const CB_STRIDE: usize = 4608;
 
 /// The leaf kernel's thread-group width — ONE WAVE on both vendors, and that
 /// is the whole point.
@@ -3161,7 +3162,7 @@ pub(crate) fn spp_defs() -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "#define MAX_SPP {}u\n#define JITTER_ROWS {}\n#define MAX_FIREFLIES {}\nstatic const float2 SKY_J[MAX_SPP] = {{ {} }};",
+        "#define MAX_SPP {}u\n#define JITTER_ROWS {}\n#define MAX_FIREFLIES {}\n#define MAX_EMISSIVE_LIGHTS {}\nstatic const float2 SKY_J[MAX_SPP] = {{ {} }};",
         crate::dlss::MAX_SPP,
         crate::dlss::MAX_SPP / 2,
         // The firefly pose-row count (fireflies.rs::MAX_FIREFLIES), injected
@@ -3169,6 +3170,8 @@ pub(crate) fn spp_defs() -> String {
         // be a second constant to raise in lockstep, and a shader reading
         // past a too-small cbuffer array is silent.
         crate::fireflies::MAX_FIREFLIES,
+        // The emissive cluster-row count (emissive.rs) — same argument.
+        crate::emissive::MAX_EMISSIVE_LIGHTS,
         sky_j
     )
 }
@@ -3894,6 +3897,15 @@ pub const FLAG_GBUF_EXT: u32 = 4096;
 /// +0.0, the fireflies lesson).
 pub const FLAG_SWAY_MV: u32 = 8192;
 
+/// Emissive cluster lights live this frame (src/emissive.rs): the scene
+/// derived clusters AND the session lever is on AND the frame is not GI
+/// (`fb_mode != 2` — the GI gather already delivers emissive transport
+/// exactly, so GI frames keep the gather and drop the cluster NEE; the
+/// inverted once-per-path rule). An emissive-free scene never sets the bit,
+/// so its kernels are bit-identical by construction (the FLAG_FIREFLIES
+/// shape).
+pub const FLAG_EMISSIVE: u32 = 16384;
+
 /// `GBufCore` stride in bytes — lockstep with trace_common.hlsli (one float4:
 /// mv.xy | view_z | prev_z).
 pub const GBUF_STRIDE: u64 = 16;
@@ -3994,12 +4006,25 @@ pub(crate) struct FrameCb {
     /// Set through `arm_sway_mv` beside FLAG_SWAY_MV so the pair cannot
     /// split.
     sway_mv_base: [u32; 4],
+    /// Emissive cluster lights (src/emissive.rs): x = count, yzw unused.
+    /// Scene-static — filled by `base` from `Scene::emissive`; FLAG_EMISSIVE
+    /// mirrors it per frame (× the live lever × fb_mode != 2).
+    el_meta: [u32; 4],
+    /// Cluster row a: xyz = power-weighted centroid, w = rc² (source
+    /// radius²) — the CPU's derived f32s VERBATIM, so both renderers light
+    /// from bit-equal clusters (parity BY DATA, the ff precedent). Rows past
+    /// the count are zero and never read (the HLSL loops on the count).
+    el_a: [[f32; 4]; crate::emissive::MAX_EMISSIVE_LIGHTS],
+    /// Cluster row b: xyz = C/π (radiance·area over π), w = r_infl²
+    /// (the window's exact zero). Appended LAST so no offset above moves.
+    el_b: [[f32; 4]; crate::emissive::MAX_EMISSIVE_LIGHTS],
 }
 // The HLSL cbuffer is hand-mirrored across 7 concatenated compile units —
 // a size drift here corrupts every field after the drift point.
 // 304 (the pre-sun size) − 32 (two rect-light rows dropped) + 16 (the spp
 // block) + 8·MAX_SPP (the jitter table) + 16·9 (the SH sky) +
-// 16·MAX_FIREFLIES (the firefly pose rows).
+// 16·MAX_FIREFLIES (the firefly pose rows) + 16 + 32·MAX_EMISSIVE_LIGHTS
+// (the emissive cluster meta + row pairs).
 const _: () = assert!(
     std::mem::size_of::<FrameCb>()
         == 320 - 32
@@ -4008,6 +4033,8 @@ const _: () = assert!(
             + 16 * crate::fireflies::MAX_FIREFLIES
             + 16 // cloud_grid
             + 16 // sway_mv_base
+            + 16 // el_meta
+            + 32 * crate::emissive::MAX_EMISSIVE_LIGHTS
 );
 // ...and the whole thing must still fit a CB ring slot.
 const _: () = assert!(std::mem::size_of::<FrameCb>() <= CB_STRIDE);
@@ -4023,6 +4050,16 @@ impl FrameCb {
         let mut sky_sh = [[0.0f32; 4]; crate::sh::N];
         for (dst, c) in sky_sh.iter_mut().zip(scene.sky_sh.c.iter()) {
             *dst = [c.x, c.y, c.z, 0.0];
+        }
+        // Emissive cluster rows: the CPU's derived f32s verbatim — both
+        // renderers light from bit-equal clusters (parity BY DATA, the ff
+        // precedent). Scene-static, so they ride the base.
+        let mut el_a = [[0.0f32; 4]; crate::emissive::MAX_EMISSIVE_LIGHTS];
+        let mut el_b = [[0.0f32; 4]; crate::emissive::MAX_EMISSIVE_LIGHTS];
+        for i in 0..scene.emissive.count as usize {
+            let l = &scene.emissive.lights[i];
+            el_a[i] = [l.pos[0], l.pos[1], l.pos[2], l.rc2];
+            el_b[i] = [l.color[0], l.color[1], l.color[2], l.r_infl2];
         }
         FrameCb {
             sky_sh,
@@ -4059,6 +4096,9 @@ impl FrameCb {
             ff: [[0.0; 4]; crate::fireflies::MAX_FIREFLIES],
             cloud_grid: [0.0; 4],
             sway_mv_base: [0; 4],
+            el_meta: [scene.emissive.count, 0, 0, 0],
+            el_a,
+            el_b,
             prev_origin: [0.0; 4],
             prev_forward: [0.0; 4],
             prev_right: [0.0, 0.0, 0.0, near],
@@ -4127,7 +4167,16 @@ impl FrameCb {
             // The --no-depth-tint lever, read at CB-build time like the V
             // toggle — the branch lives inside shade.hlsli's transmission
             // arm, which non-transmissive scenes never enter.
-            | (crate::scene::depth_tint() as u32 * FLAG_DEPTH_TINT);
+            | (crate::scene::depth_tint() as u32 * FLAG_DEPTH_TINT)
+            // Emissive cluster NEE: the scene derived clusters (el rows ride
+            // the base) × the live lever × NOT a GI frame — under fb.gi the
+            // hemi gather already delivers emissive transport exactly, so
+            // the cluster tier stands down (the inverted once-per-path
+            // rule). Emissive-free scenes never set the bit.
+            | ((self.el_meta[0] > 0
+                && crate::emissive::enabled()
+                && fb_mode_of(&p.q) != 2) as u32
+                * FLAG_EMISSIVE);
         cb.shadow_samples = p.q.shadow_samples;
         cb.ao_samples = p.q.ao_samples;
         cb.reflections = p.q.reflections as u32;

@@ -67,6 +67,12 @@
                                // point off sway_dmv (SWAY_MV scenes only;
                                // pinned/frozen clocks run the flag-off branch
                                // — today's expressions verbatim)
+#define FLAG_EMISSIVE   16384u // emissive cluster lights live this frame
+                               // (src/emissive.rs — scene clusters exist AND
+                               // the lever is on AND fb_mode != 2: GI frames
+                               // keep the exact gather instead; an
+                               // emissive-free scene never sets the bit, so
+                               // its kernels are bit-identical)
 
 cbuffer Frame : register(b0) {
     float4 cam_origin;   // xyz; w = inv_w
@@ -145,6 +151,15 @@ cbuffer Frame : register(b0) {
     // float4 elements (gbuf_write_hit reads sway_dmv[x + inst]), yzw unused.
     // Appended LAST (the cloud_grid precedent) so no offset above moves.
     uint4 sway_mv_base;
+    // Emissive cluster lights (src/emissive.rs): el_meta.x = count (yzw
+    // unused); per light row a = centroid.xyz | rc^2, row b = C/pi rgb |
+    // r_infl^2 — the CPU's derived f32s verbatim (parity BY DATA, the ff
+    // precedent). MAX_EMISSIVE_LIGHTS is injected by trace::spp_defs (the
+    // MAX_FIREFLIES pattern); rows past the count are zero and never read.
+    // Appended LAST so no offset above moves.
+    uint4 el_meta;
+    float4 el_a[MAX_EMISSIVE_LIGHTS];
+    float4 el_b[MAX_EMISSIVE_LIGHTS];
 }
 
 #define SCENE_EPS  (sun_e.w)
@@ -440,6 +455,13 @@ static const float  FF_RMIN_K     = 0.005;
 static const float  FF_SRC_K      = 1.0e-3;
 static const float  FF_GLOW_L_MAX = 512.0;
 static const float3 FF_COLOR      = float3(0.65, 1.0, 0.25);
+
+// Emissive cluster lights (src/emissive.rs — EL_E_MAX, the near-field
+// lum-irradiance clamp; the Rec.709 luma weights the CPU's emissive::lum
+// uses). Literal mirrors, the clouds-wind constant discipline.
+static const float  EL_E_MAX = 1000.0;
+static const float3 EL_LUM_W = float3(0.2126, 0.7152, 0.0722);
+#define EL_COUNT (el_meta.x)
 
 float3 ff_glow(float3 o, float3 d, float t_max, float half_angle) {
     float3 acc = 0.0;

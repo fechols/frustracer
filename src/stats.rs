@@ -20,6 +20,10 @@ pub struct Stats {
     pub ray_nodes_prim: AtomicU64,
     pub primary_rays: AtomicU64,
     pub secondary_rays: AtomicU64,
+    /// Shadow rays traced by the emissive cluster-light NEE loop (a subset of
+    /// `secondary_rays`) — the `--check-gpu`/`--check-dxr` must-fire signal on
+    /// emissive scenes (src/emissive.rs).
+    pub emissive_rays: AtomicU64,
     pub sky_pixels: AtomicU64,
     pub sky_tiles: AtomicU64,
     pub blocked_queries: AtomicU64,
@@ -107,6 +111,8 @@ pub struct LocalStats {
     pub ray_nodes_prim: u64,
     pub primary_rays: u64,
     pub secondary_rays: u64,
+    /// Emissive-NEE subset of `secondary_rays` (see `Stats::emissive_rays`).
+    pub emissive_rays: u64,
     pub sky_pixels: u64,
     pub sky_tiles: u64,
     pub blocked_queries: u64,
@@ -159,6 +165,7 @@ impl LocalStats {
         self.ray_nodes_prim += o.ray_nodes_prim;
         self.primary_rays += o.primary_rays;
         self.secondary_rays += o.secondary_rays;
+        self.emissive_rays += o.emissive_rays;
         self.sky_pixels += o.sky_pixels;
         self.sky_tiles += o.sky_tiles;
         self.blocked_queries += o.blocked_queries;
@@ -210,6 +217,7 @@ impl Stats {
         self.ray_nodes_prim.store(0, Relaxed);
         self.primary_rays.store(0, Relaxed);
         self.secondary_rays.store(0, Relaxed);
+        self.emissive_rays.store(0, Relaxed);
         self.sky_pixels.store(0, Relaxed);
         self.sky_tiles.store(0, Relaxed);
         self.blocked_queries.store(0, Relaxed);
@@ -270,6 +278,9 @@ impl Stats {
         }
         if l.secondary_rays > 0 {
             self.secondary_rays.fetch_add(l.secondary_rays, Relaxed);
+        }
+        if l.emissive_rays > 0 {
+            self.emissive_rays.fetch_add(l.emissive_rays, Relaxed);
         }
         if l.sky_pixels > 0 {
             self.sky_pixels.fetch_add(l.sky_pixels, Relaxed);

@@ -1621,6 +1621,19 @@ fn shade_traced(
                 // The ONE Some site: fireflies light the primary camera path
                 // only. Day sessions (count 0) hand shade a structural None.
                 (ctx.fireflies.count > 0).then_some(&ctx.fireflies),
+                // The ONE Some site for emissive cluster lights: primary
+                // camera path only, and NEVER under fb.gi — the GI gather
+                // already delivers emissive transport exactly (real geometry,
+                // real soft shadows), so GI frames keep the gather and drop
+                // the lossy-cluster NEE (the once-per-path rule, inverted).
+                // Emissive-free scenes and UNARMED sessions (the default —
+                // --emissive-lights arms) hand a structural None. fb.ao
+                // keeps NEE on: its ambient is sky × openness, no emissive
+                // in it.
+                (!ctx.q.fb.gi
+                    && ctx.scene.emissive.count > 0
+                    && crate::emissive::enabled())
+                .then_some(&ctx.scene.emissive),
             );
             // Firefly glow, depth-tested against the primary hit — a firefly
             // between the camera and the surface splats over the shaded

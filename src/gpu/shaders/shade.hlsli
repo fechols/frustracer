@@ -384,14 +384,17 @@ void glass_snell(float3 rd, float3 v, float3 ns, float3 n, float3 hit_p,
 // `aniso`: may THIS ray's footprint be resolved anisotropically (the CPU's
 // Cone::aniso > 1)? Primary/reflection/glass laps yes, hemi-GI bounce laps no
 // (their cone is octant-coarse by design). Gated by FLAG_ANISO on top.
-// `fireflies`: may the PRIMARY surface (lap 0) take firefly point light
-// (the CPU's `ff: Option<&Fireflies>` — Some only on the camera path)?
-// Camera laps yes, hemi bounce laps no — like emissive, fireflies never
-// light bounce surfaces. FLAG_FIREFLIES (count > 0) gates on top, so day
-// kernels are bit-identical whatever the call site passes.
+// `cam_lights`: may the PRIMARY surface (lap 0) take camera-path point/
+// cluster light NEE — fireflies AND emissive cluster lights (the CPU's
+// `ff: Option<&Fireflies>` / `el: Option<&EmissiveLights>` pair — Some only
+// on the camera path)? Camera laps yes, hemi bounce laps no — fireflies
+// never light bounce surfaces (the gather exclusion), and under GI the
+// gather IS the emissive transport. FLAG_FIREFLIES / FLAG_EMISSIVE gate on
+// top per family, so day / emissive-free kernels are bit-identical whatever
+// the call site passes.
 float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                    uint n_shadow, uint n_ao, bool refl, bool split_ambient,
-                   float cone_w0, float cone_spread, bool aniso, bool fireflies,
+                   float cone_w0, float cone_spread, bool aniso, bool cam_lights,
                    out float3 amb_w, out float3 amb_o, out float3 amb_n,
                    out PrimSurf prim) {
     amb_w = 0.0;
@@ -622,7 +625,7 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
         // in-radius firefly, finite tmax (stop 2·eps short of the light
         // point). `w_l = 1` on the specular — a point light has zero solid
         // angle, so the VNDF ray can never deliver it; MIS does not apply.
-        if (fireflies && lap == 0u && (flags & FLAG_FIREFLIES)) {
+        if (cam_lights && lap == 0u && (flags & FLAG_FIREFLIES)) {
             float r_inf = FF_RADIUS_K * ff_scale;
             float ff_r2 = r_inf * r_inf;
             float ff_rmin2 = (FF_RMIN_K * ff_scale) * (FF_RMIN_K * ff_scale);
@@ -657,6 +660,44 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                     // the sun loop's exact term shape, at full weight.
                     direct_s += fli * ffr * (PI * fdn * fg2 / (4.0 * vl.z * fndl));
                 }
+            }
+        }
+        // Emissive cluster lights (shade.rs, same insertion point): the
+        // direct tier's third entry, AFTER the cloud scaling (a lamp under
+        // the slab is a local light) and BEFORE the lap-0 prim export (the
+        // light rides FSR-RR's denoised dd lobe). Lap 0 only — the CPU
+        // recursion passes el = None. ZERO rng draws: deterministic
+        // iteration, one HARD shadow ray per in-range light, stopping
+        // rc + 2·eps short of the cluster center so the emitter's own bulb
+        // geometry cannot occlude its own light. DIFFUSE-ONLY: the traced
+        // VNDF ray already delivers the emitter's specular image (the
+        // display `total += emis` at every lap), so a w_l = 1 specular term
+        // here would double-count it (src/emissive.rs).
+        if (cam_lights && lap == 0u && (flags & FLAG_EMISSIVE)) {
+            for (uint ei = 0u; ei < EL_COUNT; ++ei) {
+                float3 eto = el_a[ei].xyz - p;
+                float ed2 = dot(eto, eto);
+                float er2 = el_b[ei].w;
+                // The rejection test — a far light's only cost.
+                if (ed2 >= er2) continue;
+                float edist = sqrt(ed2);
+                float3 ewi = eto / edist;
+                float endl = dot(n_s, ewi);
+                if (endl <= 0.0) continue;
+                // Windowed disc irradiance (emissive.rs::irradiance — the
+                // +rc² denominator is the near-field softening, the window
+                // exactly 0 at r_infl, lum clamped under EL_E_MAX).
+                float3 ecol = el_b[ei].xyz;
+                float elum = dot(ecol, EL_LUM_W);
+                if (elum <= 0.0) continue;
+                float einv = min(1.0 / (ed2 + el_a[ei].w), EL_E_MAX / elum);
+                float ex = 1.0 - ed2 / er2;
+                float3 ee = ecol * (einv * ex * ex);
+                float3 evis = transmit_q(
+                    p, ewi, 0.0,
+                    max(edist - sqrt(el_a[ei].w) - 2.0 * SCENE_EPS, 0.0));
+                if (all(evis == 0.0)) continue;
+                direct_d += ee * endl * evis;
             }
         }
         if (lap == 0u) {

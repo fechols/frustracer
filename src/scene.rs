@@ -137,9 +137,11 @@ pub struct Material {
     /// the shared cloud clock (`shade::ripple_normal`); zero rng draws.
     pub ripple_amp: f32,
     /// Emitted radiance (Ke / glTF emissiveFactor). Added to color at every
-    /// shading depth, OUTSIDE the kd·(1−transmission) factor; emitters do
-    /// NOT light other surfaces — only the analytic sun + sky do (the
-    /// stars/fireflies gather-exclusion class). Default ZERO.
+    /// shading depth, OUTSIDE the kd·(1−transmission) factor — the DISPLAY
+    /// half. Emitters CAN also light other surfaces: `--emissive-lights`
+    /// arms the direct tier's clustered-light NEE (src/emissive.rs, default
+    /// OFF), and under fb.gi the hemi gather delivers the transport exactly
+    /// instead. Default ZERO.
     pub emissive: Vec3A,
     /// Tangent-space normal map (NO_TEX = none; linear data). Perturbs the
     /// SHADING normal only — the geometric normal keeps driving ray offsets,
@@ -252,6 +254,13 @@ pub struct Scene {
     /// and under `--no-tinted-shadows`, keeping those paths bit-identical).
     /// Derived by `finalize_scalars`.
     pub any_transmissive: bool,
+    /// Clustered emissive virtual lights (src/emissive.rs — the direct-tier
+    /// NEE set derived from Ke/map_Ke/glTF-emissive triangles). Derived by
+    /// `finalize_scalars`, NEVER serialized (the `sky_sh` precedent: both
+    /// cache load paths and the world merge re-run finalize, so warm loads
+    /// re-derive and CACHE_VERSION does not move). `count == 0` is the
+    /// structural off state every emissive-free scene keeps.
+    pub emissive: crate::emissive::EmissiveLights,
     /// The sun: a disc at infinity, the sharp half of the one sky.
     pub sun: crate::sky::Sun,
     /// The sky's smooth dome, projected into order-2 SH once at load — the
@@ -519,6 +528,7 @@ impl SceneBuilder {
             any_alpha: false,
             any_height: false,
             any_transmissive: false,
+            emissive: crate::emissive::EmissiveLights::off(),
             sun,
             sky_sh: crate::sh::Sh9::ZERO,
             sky_scale: 1.0,
@@ -1054,6 +1064,7 @@ pub fn spray_self_test() -> Result<(), String> {
             any_alpha: false,
             any_height: false,
             any_transmissive: false,
+            emissive: crate::emissive::EmissiveLights::off(),
             sun: crate::sky::Sun::new(Vec3A::Y),
             sky_sh: crate::sh::Sh9::ZERO,
             sky_scale: 1.0,
@@ -1223,6 +1234,7 @@ pub fn coincident_self_test() -> Result<(), String> {
                 any_alpha: false,
                 any_height: false,
                 any_transmissive: false,
+                emissive: crate::emissive::EmissiveLights::off(),
                 sun: crate::sky::Sun::new(Vec3A::Y),
                 sky_sh: crate::sh::Sh9::ZERO,
                 sky_scale: 1.0,
@@ -1301,6 +1313,27 @@ pub fn finalize_scalars(scene: &mut Scene) {
         scene.materials.iter().any(|m| m.height_amp > 0.0 && m.normal_tex != NO_TEX);
     scene.any_transmissive =
         tinted_shadows() && scene.materials.iter().any(|m| m.transmission > 0.0);
+    // Clustered emissive lights (src/emissive.rs) — derived HERE so every
+    // load path (cold, warm sidecar, tile replication, world merge) gets
+    // them re-derived for free, like sky_sh. Serial + index-ordered ⇒
+    // byte-deterministic; emissive-free scenes pay O(materials) and keep
+    // the structural count-0 off state. One loud line iff lights exist.
+    scene.emissive = crate::emissive::derive(scene, crate::emissive::budget());
+    if scene.emissive.count > 0 {
+        let total: f32 = (0..scene.emissive.count as usize)
+            .map(|i| {
+                crate::emissive::lum(Vec3A::from(scene.emissive.lights[i].color))
+                    * std::f32::consts::PI
+            })
+            .sum();
+        eprintln!(
+            "emissive lights: {} clusters (budget {}, total power {:.3}){}",
+            scene.emissive.count,
+            crate::emissive::budget(),
+            total,
+            if crate::emissive::enabled() { "" } else { " — OFF (arm with --emissive-lights)" }
+        );
+    }
 
     refresh_sky_sh(scene);
 }
@@ -1723,6 +1756,7 @@ pub fn tile_scene(base: Scene, nx: u32, nz: u32) -> (Scene, f32) {
         any_alpha: false,
         any_height: false,
         any_transmissive: false,
+        emissive: crate::emissive::EmissiveLights::off(),
         // The sun is at infinity: a replicated field sees the SAME sun, at the
         // same angle, with the same irradiance, everywhere. Nothing to rescale.
         sun: base.sun,

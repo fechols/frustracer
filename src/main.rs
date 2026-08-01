@@ -20,6 +20,7 @@ mod cli;
 mod cinematic;
 mod clouds;
 mod dlss;
+mod emissive;
 // Signal split, wire encoders, and demodulation/composite math for FSR Ray
 // Regeneration — pure CPU, feeds --check-fsr; the GPU seam is gpu/ffx*.
 mod builders;
@@ -428,6 +429,11 @@ fn main() {
     fireflies::set_enabled(opts.fireflies);
     // set_count is what CLAMPS to the CB row cap; the parse only noted it.
     fireflies::set_count(opts.fireflies_count);
+    // Emissive cluster lights (src/emissive.rs) — the budget MUST land
+    // before any scene load: finalize_scalars derives the clusters through
+    // it (restart-tier); the enable is live (consumers read it per frame).
+    emissive::set_enabled(opts.emissive_lights);
+    emissive::set_budget(opts.emissive_lights_count);
     // Leaf sway (src/foliage.rs; the design doc is docs/design/
     // animated-foliage.md). Read at SceneGpu upload — the blas_split timing
     // class. DEFAULT ON: only a departure prints (the lever-line convention);
@@ -1505,6 +1511,25 @@ fn run_check_dxr(
     }
     if mean_rel > 0.02 {
         eprintln!("check-dxr: FAIL converged radiance means differ by more than 2%");
+        ok = false;
+    }
+    // Emissive-NEE anti-vacuity (the check-gpu twin — CPU-side counter; the
+    // GPU tier's liveness rides the radiance A/B above): cluster lights must
+    // trace NEE shadow rays on an emissive scene, zero on an emissive-free/
+    // lever-off session. Same --cam caveat class as the alpha must-fire.
+    let em_rays = stats.emissive_rays.load(Relaxed);
+    if scene.emissive.count > 0 && emissive::enabled() {
+        eprintln!("check-dxr: emissive NEE shadow rays: {em_rays}");
+        if em_rays == 0 {
+            eprintln!(
+                "check-dxr: FAIL emissive scene traced 0 NEE shadow rays (the cluster tier must fire)"
+            );
+            ok = false;
+        }
+    } else if em_rays != 0 {
+        eprintln!(
+            "check-dxr: FAIL {em_rays} emissive NEE rays on an emissive-free/lever-off session"
+        );
         ok = false;
     }
 
@@ -3671,6 +3696,29 @@ fn run_check_gpu(
         );
         ok = false;
     }
+    // Emissive-NEE anti-vacuity (CPU-side counter — the GPU tier's liveness
+    // rides the radiance A/B above, which the CPU arm's emissive light would
+    // fail if the GPU flag were dead): a scene that derived cluster lights
+    // must actually trace NEE shadow rays, or the tier is dead code. Zero
+    // rays on an emissive-free / lever-off session is the inverse gate.
+    // Same --cam caveat class as the alpha must-fire: a pose with no pixel
+    // inside any light's influence radius would trip it — the default
+    // helmet/bistro poses see their emitters.
+    let em_rays = stats.emissive_rays.load(Relaxed);
+    if scene.emissive.count > 0 && emissive::enabled() {
+        eprintln!("check-gpu: emissive NEE shadow rays: {em_rays}");
+        if em_rays == 0 {
+            eprintln!(
+                "check-gpu: FAIL emissive scene traced 0 NEE shadow rays (the cluster tier must fire)"
+            );
+            ok = false;
+        }
+    } else if em_rays != 0 {
+        eprintln!(
+            "check-gpu: FAIL {em_rays} emissive NEE rays on an emissive-free/lever-off session"
+        );
+        ok = false;
+    }
     // Relief anti-vacuity, the cutout's twin: a height-carrying scene with
     // the toggle on must actually reject candidates somewhere (silhouettes/
     // side exits); a height-free scene must count zero (HEIGHTFIELD compiled
@@ -4656,6 +4704,9 @@ fn run_check_gpu(
                             None,
                             // Gather reference: fireflies excluded, like the
                             // hemi leaf shades it gates against.
+                            None,
+                            // Emissive NEE excluded too — the gather IS the
+                            // emissive transport (src/emissive.rs).
                             None,
                         ),
                     };
@@ -10989,6 +11040,19 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
     };
 
+    // Emissive cluster lights: the structural off arms (emissive-free mesh /
+    // zero budget), derivation determinism + power conservation (fixed-order
+    // sums, exact through the merges), the budget cap, the windowed disc
+    // falloff's exact zero + monotonicity + the EL_E_MAX near-field clamp,
+    // and the 4-tap map estimate's constant-map identity.
+    let emissive_ok = match emissive::self_test() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("emissive self-test: FAIL — {e}");
+            false
+        }
+    };
+
     // Time-of-day: the sun arc's anchors, the fade's exact identities (the
     // untouched-session bit-identity guards), the sunset channel ordering, the
     // moon handoff, and the star field's day-guard/determinism/clamp.
@@ -11978,6 +12042,9 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
                             None,
                             // Gather reference: fireflies excluded, like the
                             // hemi leaf shades it gates against.
+                            None,
+                            // Emissive NEE excluded too — the gather IS the
+                            // emissive transport (src/emissive.rs).
                             None,
                         ),
                     };
@@ -13549,6 +13616,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         ("sky", sky_ok),
         ("clouds", clouds_ok),
         ("fireflies", fireflies_ok),
+        ("emissive", emissive_ok),
         ("tod", tod_ok),
         ("bloom", bloom_ok),
         ("sphcell", sph_ok),
@@ -15230,6 +15298,7 @@ fn session(
                 clouds: clouds::enabled(),
                 fireflies: fireflies::enabled(),
                 fireflies_count: fireflies::count(),
+                emissive_lights: emissive::enabled(),
             };
             if hd.menu_open() && menu_rows_stale {
                 menu_rows_stale = false;
@@ -15294,6 +15363,12 @@ fn session(
                                 }
                                 settings::MenuFx::FirefliesCount(n) => {
                                     fireflies::set_count(n);
+                                    frame = 0;
+                                }
+                                settings::MenuFx::ToggleEmissive => {
+                                    // Shading change: plain accumulation only,
+                                    // histories kept (the clouds precedent).
+                                    emissive::set_enabled(!emissive::enabled());
                                     frame = 0;
                                 }
                                 settings::MenuFx::ToggleHud => edges.toggle_hud = true,
