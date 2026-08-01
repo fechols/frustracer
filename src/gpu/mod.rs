@@ -25,6 +25,7 @@ pub mod hud;
 /// Raw-NGX DLSS-G's guide conversion (`--fg` DLSS sessions): clip depth +
 /// reflection-aware motion vectors.
 pub mod ngxfg_guides;
+pub mod ngxrr;
 pub mod pix;
 /// `--quinlight`: the registered-consensus fuse of every wired upscaler.
 pub mod quin;
@@ -306,9 +307,9 @@ mod ngxfg {
     const _: () = assert!(std::mem::offset_of!(FrDlssgDispatch, view_to_clip) == 52);
     const _: () = assert!(std::mem::size_of::<FrDlssgDispatch>() == 400);
 
-    #[cfg(dlssg_ngx)]
+    #[cfg(dlss_ngx)]
     pub const BUILT: bool = true;
-    #[cfg(dlssg_ngx)]
+    #[cfg(dlss_ngx)]
     unsafe extern "C" {
         pub fn frdlssg_create(
             device: *mut c_void,
@@ -338,9 +339,9 @@ mod ngxfg {
         pub fn frdlssg_destroy(handle: *mut c_void);
     }
 
-    #[cfg(not(dlssg_ngx))]
+    #[cfg(not(dlss_ngx))]
     pub const BUILT: bool = false;
-    #[cfg(not(dlssg_ngx))]
+    #[cfg(not(dlss_ngx))]
     #[allow(clippy::missing_safety_doc)]
     pub unsafe fn frdlssg_create(
         _device: *mut c_void,
@@ -353,12 +354,12 @@ mod ngxfg {
     ) -> i32 {
         ERR_UNSUPPORTED
     }
-    #[cfg(not(dlssg_ngx))]
+    #[cfg(not(dlss_ngx))]
     #[allow(clippy::missing_safety_doc)]
     pub unsafe fn frdlssg_dispatch(_h: *mut c_void, _d: *const FrDlssgDispatch) -> i32 {
         ERR_UNSUPPORTED
     }
-    #[cfg(not(dlssg_ngx))]
+    #[cfg(not(dlss_ngx))]
     #[allow(clippy::missing_safety_doc)]
     pub unsafe fn frdlssg_recreate(
         _h: *mut c_void,
@@ -369,7 +370,7 @@ mod ngxfg {
     ) -> i32 {
         ERR_UNSUPPORTED
     }
-    #[cfg(not(dlssg_ngx))]
+    #[cfg(not(dlss_ngx))]
     #[allow(clippy::missing_safety_doc)]
     pub unsafe fn frdlssg_destroy(_h: *mut c_void) {}
 }

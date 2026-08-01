@@ -65,7 +65,10 @@ typedef struct FrDlssgDispatch {
     float jitter[2];      // the RAW sample offset — raw NGX does NOT want SL's
                           // negation (measured 2026-07-26: the negated form
                           // strobes specular highlights). One convention, one place.
-    float mv_scale[2];    // pixel MVs -> [-1,1]: {1/rend_w, 1/rend_h}
+    float mv_scale[2];    // {1,1}: MvecScale converts stored MVs to PIXELS and
+                          // ours already are (CLAUDE.md trap 5 — the {1/rend}
+                          // form starved the snippet of motion ~2000x; the
+                          // Rust side owns the lever-controlled value)
     float cam_pos[3];
     float cam_up[3];
     float cam_right[3];
@@ -75,6 +78,13 @@ typedef struct FrDlssgDispatch {
     int32_t depth_inverted;
 } FrDlssgDispatch;
 int32_t frdlssg_dispatch(void* handle, const FrDlssgDispatch* d);
+
+// FEATURE-scoped rebuild at new dims (ReleaseFeature + CreateFeature ONLY —
+// params/init/device untouched; the caller drains the queue first). The only
+// mid-session teardown: frdlssg_destroy tears at state shared with other
+// in-process NGX clients (see the .cpp's ownership notes).
+int32_t frdlssg_recreate(void* handle, uint32_t disp_w, uint32_t disp_h,
+                         uint32_t rend_w, uint32_t rend_h);
 
 // GPU idle required (the caller waits the queue). Pairs the shared NGX init.
 void frdlssg_destroy(void* handle);

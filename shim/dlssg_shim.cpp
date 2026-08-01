@@ -12,14 +12,11 @@
 // video player passed identity transforms.
 
 #include "dlssg_shim.h"
+#include "ngx_shared.h"
 
 #include <cfloat>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
-#include <filesystem>
-#include <mutex>
-#include <string>
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -33,53 +30,8 @@
 
 namespace {
 
-// One NGX init per device, refcounted (the quinlight lesson: two
-// differently-keyed NGX inits on one device silently break each other —
-// whichever runs second sees the first's app identity and its own feature
-// snippet stays unloaded). frustracer has one raw-NGX consumer today, but
-// the refcount keeps a future TrueHDR/SR addition from re-learning it.
-constexpr const char* kProjectId     = "b3c1a4d8-52fe-4a0f-9d31-8e7c6f2ab914";
-constexpr const char* kEngineVersion = "0.1.0";
-
-std::mutex    g_ngx_mutex;
-int           g_ngx_refcount = 0;
-ID3D12Device* g_ngx_device   = nullptr;
-
-int ngx_shared_init(ID3D12Device* device) {
-    std::lock_guard<std::mutex> lk(g_ngx_mutex);
-    if (g_ngx_refcount > 0) {
-        g_ngx_refcount++;
-        return 0;
-    }
-    // NGX wants a WRITABLE app-data path (logs/model cache) — a null path
-    // fails with 0xBAD0000F FAIL_UnableToWriteToAppDataPath (measured).
-    std::wstring app_data;
-    if (const char* lad = std::getenv("LOCALAPPDATA")) {
-        std::error_code ec;
-        std::filesystem::path p = std::filesystem::path(lad) / "frustracer" / "ngx";
-        std::filesystem::create_directories(p, ec);
-        if (!ec) app_data = p.wstring();
-    }
-    NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Init_with_ProjectID(
-        kProjectId, NVSDK_NGX_ENGINE_TYPE_CUSTOM, kEngineVersion,
-        app_data.empty() ? nullptr : app_data.c_str(), device);
-    if (NVSDK_NGX_FAILED(r)) {
-        std::fprintf(stderr, "[fr-dlssg] NGX D3D12 init failed: 0x%08X\n", (unsigned)r);
-        return -1;
-    }
-    g_ngx_device   = device;
-    g_ngx_refcount = 1;
-    return 0;
-}
-
-void ngx_shared_shutdown() {
-    std::lock_guard<std::mutex> lk(g_ngx_mutex);
-    if (g_ngx_refcount <= 0) return;
-    if (--g_ngx_refcount == 0 && g_ngx_device) {
-        NVSDK_NGX_D3D12_Shutdown1(g_ngx_device);
-        g_ngx_device = nullptr;
-    }
-}
+// The refcounted one-init-per-device NGX bring-up lives in ngx_shared.{h,cpp}
+// — shared with the DLSSD (ray reconstruction) consumer.
 
 struct Ctx {
     ID3D12Device*        device  = nullptr;
