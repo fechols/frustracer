@@ -1099,6 +1099,58 @@ the findings came from. These are the Arc-specific ones, with the numbers
 attached. Some are properties of the hardware, some of the *driver*, and some
 of the *tooling* — the distinction matters, so each one says which it is.
 
+**The wavefront default, measured end-to-end.** A July 2026 whole-session
+pass on THE WORLD read the compute-wavefront hybrid against the DXR pipeline
+at four islands, each parked at its own attractor time-of-day and measured in
+both render modes: 1920×1080 window, XeSS wired at native (100%) scale,
+1 spp, vsync off. The figures are the title bar's **rendered** frame rate —
+the XeSS-FG ×2 presented surplus is excluded:
+
+| B70, THE WORLD, rendered FPS | wavefront hybrid | DXR |
+|---|---:|---:|
+| Sponza, 09:01 | 101 | 57 |
+| San Miguel, 15:17 | 107 | 63 |
+| Bistro, 17:16 | 76 | 50 |
+| Rungholt, 11:01 | 131 | 81 |
+| **average** | **103.75** | **62.75** |
+
+That is the hybrid **1.5–1.8× faster at every island, ~65% on average** — a
+larger gap than the per-pass tracer spans alone predict (mode-1 DXR is
+slightly *ahead* on producing frames there), consistent in direction with
+structure replay deleting the level ladder on parked frames while the DXR
+pipeline has no replay at all. These are interactive spot checks, not the
+deterministic `--spin` harness, but they are what a user flying the world
+actually gets — and they are why Intel adapters start in the wavefront
+tracer.
+
+**This is specifically Intel Arc Pro B70 hardware; results vary — and
+invert — on other GPUs.** On an RTX 4090 the same comparison prefers DXR
+(see the `--dxr-inline` table above), which is exactly why the render-mode
+default is vendor-keyed rather than universal.
+
+The two tracers produce the same image from the same pose; only the frame
+rate differs. Hybrid on the left, DXR on the right, rendered fps in each
+title bar:
+
+<table>
+<tr>
+<td><img src="docs/media/ab/b70-sponza-hybrid.webp" alt="Sponza, wavefront hybrid, 101 fps"><br><sub>Sponza — hybrid, <b>101 fps</b></sub></td>
+<td><img src="docs/media/ab/b70-sponza-dxr.webp" alt="Sponza, DXR, 57 fps"><br><sub>Sponza — DXR, 57 fps</sub></td>
+</tr>
+<tr>
+<td><img src="docs/media/ab/b70-san-miguel-hybrid.webp" alt="San Miguel, wavefront hybrid, 107 fps"><br><sub>San Miguel — hybrid, <b>107 fps</b></sub></td>
+<td><img src="docs/media/ab/b70-san-miguel-dxr.webp" alt="San Miguel, DXR, 63 fps"><br><sub>San Miguel — DXR, 63 fps</sub></td>
+</tr>
+<tr>
+<td><img src="docs/media/ab/b70-bistro-hybrid.webp" alt="Bistro, wavefront hybrid, 76 fps"><br><sub>Bistro — hybrid, <b>76 fps</b></sub></td>
+<td><img src="docs/media/ab/b70-bistro-dxr.webp" alt="Bistro, DXR, 50 fps"><br><sub>Bistro — DXR, 50 fps</sub></td>
+</tr>
+<tr>
+<td><img src="docs/media/ab/b70-rungholt-hybrid.webp" alt="Rungholt, wavefront hybrid, 131 fps"><br><sub>Rungholt — hybrid, <b>131 fps</b></sub></td>
+<td><img src="docs/media/ab/b70-rungholt-dxr.webp" alt="Rungholt, DXR, 81 fps"><br><sub>Rungholt — DXR, 81 fps</sub></td>
+</tr>
+</table>
+
 **A single large BLAS is a vendor cliff.** Acceleration-structure scratch is
 sized by the largest single geometry, so THE WORLD's one 34.4-million-triangle
 BLAS made the B70's driver ask for **1891 MB of scratch and then remove the
