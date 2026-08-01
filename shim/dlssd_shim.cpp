@@ -92,7 +92,16 @@ int32_t create_on_transient_queue(ID3D12Device* dev, NVSDK_NGX_Parameter* params
         return fail(FRDLSSD_ERR_UNSUPPORTED);
     }
 
-    if (FAILED(cmd->Close())) return fail(FRDLSSD_ERR_D3D12);
+    // Past this point *out_handle is a live NGX feature: a failed submit must
+    // release it (releasing a feature whose warm-up list never executed is the
+    // same thing frdlssg_destroy does) or it leaks driver-side.
+    auto fail_created = [&](int32_t code) {
+        NVSDK_NGX_D3D12_ReleaseFeature(*out_handle);
+        *out_handle = nullptr;
+        return fail(code);
+    };
+
+    if (FAILED(cmd->Close())) return fail_created(FRDLSSD_ERR_D3D12);
     ID3D12CommandList* lists[] = {cmd};
     queue->ExecuteCommandLists(1, lists);
     HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -100,7 +109,7 @@ int32_t create_on_transient_queue(ID3D12Device* dev, NVSDK_NGX_Parameter* params
         FAILED(fence->SetEventOnCompletion(1, event))) {
         if (event) CloseHandle(event);
         std::fprintf(stderr, "[fr-dlssd] warm-up fence submit failed\n");
-        return fail(FRDLSSD_ERR_D3D12);
+        return fail_created(FRDLSSD_ERR_D3D12);
     }
     WaitForSingleObject(event, INFINITE);
     CloseHandle(event);
@@ -270,7 +279,11 @@ extern "C" int32_t frdlssd_evaluate(void* session, void* feature,
     auto* s = static_cast<Session*>(session);
     auto* f = static_cast<Feature*>(feature);
     if (!f->handle) return FRDLSSD_ERR_INTERNAL;
-    if (!d->cmdlist || !d->color || !d->output || !d->depth || !d->motion)
+    // DLUnified requires the guide planes too (albedos/normals/spec-hit) —
+    // check them beside the classic five rather than letting NGX turn a null
+    // into an opaque evaluate failure.
+    if (!d->cmdlist || !d->color || !d->output || !d->depth || !d->motion ||
+        !d->diff_albedo || !d->spec_albedo || !d->normal_rough || !d->spec_hit)
         return FRDLSSD_ERR_INTERNAL;
 
     auto* cmd = static_cast<ID3D12GraphicsCommandList*>(d->cmdlist);

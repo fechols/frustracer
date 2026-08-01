@@ -4,7 +4,6 @@
 //! instead of trusting adapter 0.
 
 use windows::core::{Interface, Result};
-use windows::Win32::Foundation::LUID;
 use windows::Win32::Graphics::Dxgi::*;
 
 const VENDOR_NVIDIA: u32 = 0x10DE;
@@ -94,7 +93,6 @@ pub enum Prefer {
 
 pub struct AdapterPick {
     pub adapter: IDXGIAdapter4,
-    pub luid: LUID,
     pub name: String,
     pub vendor: Vendor,
 }
@@ -144,7 +142,7 @@ pub fn pick(factory: &IDXGIFactory6, prefer: Prefer) -> std::result::Result<Adap
     let name = desc_name(&picked.1);
     let vendor = Vendor::of(picked.1.VendorId);
     record_picked(vendor);
-    Ok(AdapterPick { adapter: picked.0, luid: picked.1.AdapterLuid, name, vendor })
+    Ok(AdapterPick { adapter: picked.0, name, vendor })
 }
 
 pub fn create_factory(debug: bool) -> Result<IDXGIFactory6> {

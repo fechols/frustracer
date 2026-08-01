@@ -65,8 +65,8 @@ __pycache__/
 # them or their derivatives; see tools/nppd-export/README.md).
 /tools/nppd-export/nppd-upstream/
 
-# Nothing under SDKs/ is committed except the FidelityFX and XeSS header
-# subsets whitelisted below. (The Streamline SDK vendoring died with the SL
+# Nothing under SDKs/ is committed except the FidelityFX header subset
+# whitelisted below. (The Streamline SDK vendoring died with the SL
 # retirement — DLSS rides the raw-NGX shims against the non-redistributable
 # DLSS SDK at FRUSTRACER_DLSS_SDK, never committed; a stray SL extract here
 # stays ignored by the blanket rule.)

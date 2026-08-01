@@ -165,17 +165,21 @@ mouse button**, and press **F1** for the heads-up display.
 | | |
 |---|---|
 | **OS** | Windows 10/11, x64. (The renderer is D3D12; there is no other backend.) |
-| **Toolchain** | Rust (stable) + MSVC build tools & the Windows SDK — `build.rs` compiles three small C++ shims. CMake, because SDL3 builds from source. |
+| **Toolchain** | Rust (stable) + MSVC build tools & the Windows SDK — `build.rs` compiles a few small C++ shims. CMake, because SDL3 builds from source. |
 | **git-lfs** | Only if you want the scenes. `git lfs install` once per clone, or you get pointer files. |
 | **GPU** | D3D12 feature level 12_0. NVIDIA/AMD start in DXR when available; Intel RT 1.1 adapters start in the compute-wavefront tracer. `--cpu` selects the CPU tracer explicitly. |
 
 The source code is MIT-licensed. Scene assets retain their upstream terms; see
 [LICENSE](LICENSE) before redistributing a checkout or binary bundle.
 
-**Building never needs any SDK.** The vendored headers are enough, and every
-vendor library is `LoadLibrary`'d at runtime, so a bare checkout compiles and
+**Building never needs any SDK.** The vendored headers are enough, and the
+vendor libraries are `LoadLibrary`'d at runtime, so a bare checkout compiles and
 passes the whole DLL-free gate suite. `install-prerequisites.bat` fetches the
 optional runtimes (~700 MB for all of them) from each vendor's own release page.
+The one exception is **DLSS** (ray reconstruction + frame generation): it builds
+against NVIDIA's non-redistributable DLSS SDK, so it exists only in a build made
+with `FRUSTRACER_DLSS_SDK` pointing at one. Without it everything else still
+works — the upscaler chain simply starts at FSR4 / XeSS / FSR 3.1.
 
 ### If you only have five minutes
 
@@ -408,7 +412,7 @@ each one's A/B is how its cost was measured in the first place.
 | Hemisphere-bounce GI / AO — the quadtree idea aimed at the light integral | (opt-in) | **H** |
 | Heightfield relief — real displaced geometry at the intersector | (opt-in `--heightfield`) | **V** |
 | The upscaler chain — DLSS-RR → FSR4-RR → XeSS → FSR 3.1, first supported wins | `--no-upscale` | **G** / **K** / **X** |
-| Frame generation — four families, whichever the adapter supports | `--no-fg` | |
+| Frame generation — three families, whichever the adapter supports | `--no-fg` | |
 | HDR output — HDR10/PQ on an HDR-on display, scRGB f16 elsewhere | `--no-hdr` | |
 | Glare — the reason the sun looks like a sun | `--no-bloom` | |
 | BC7 texture compression, encoded on the GPU at load | `--no-bc7` | |

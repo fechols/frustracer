@@ -80,11 +80,27 @@ fn main() {
                 }
             }
         } else {
+            // Say WHICH file is missing: "not found" for an SDK that exists but
+            // predates the DLSSD headers sends someone checking the path
+            // instead of the SDK version (and that shape disables FG too).
+            let why = if !sdk.exists() {
+                format!("DLSS SDK not found at {}", sdk.display())
+            } else {
+                let missing = [&dlssg_header, &dlssd_header, &import_lib_dir.join("nvsdk_ngx_d.lib")]
+                    .into_iter()
+                    .find(|p| !p.exists())
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                format!(
+                    "DLSS SDK at {} is missing {} (an SDK predating the DLSSD \
+                     ray-reconstruction headers? both features gate on one SDK)",
+                    sdk.display(),
+                    missing
+                )
+            };
             println!(
-                "cargo:warning=DLSS SDK not found at {} — raw-NGX DLSS (ray \
-                 reconstruction + frame generation) disabled (set \
-                 FRUSTRACER_DLSS_SDK to enable)",
-                sdk.display()
+                "cargo:warning={why} — raw-NGX DLSS (ray reconstruction + frame \
+                 generation) disabled (set FRUSTRACER_DLSS_SDK to enable)"
             );
         }
     }

@@ -216,8 +216,14 @@ impl NgxRr {
         }
         let mut session: *mut c_void = std::ptr::null_mut();
         let r = unsafe { frdlssd_open(device.as_raw(), &mut session) };
+        if r == ERR_UNSUPPORTED {
+            // The shim's fall-through code: pre-RTX hardware / old driver
+            // (details already on stderr) — the ordinary chain fall-through,
+            // distinct from a real init error.
+            return Err("ray reconstruction not supported on this adapter/driver".into());
+        }
         if r != 0 || session.is_null() {
-            return Err(format!("raw-NGX RR unavailable (shim code {r})"));
+            return Err(format!("raw-NGX RR init failed (shim code {r})"));
         }
 
         // The FR_ABL lever idiom: loud on departure, loud + default on an
@@ -273,7 +279,7 @@ impl NgxRr {
             flags |= FLAG_AUTO_EXPOSURE;
         }
 
-        Ok(Self { session: session, _device: device.clone(), jitter_mul, mv_mode, depth_hw, flags })
+        Ok(Self { session, _device: device.clone(), jitter_mul, mv_mode, depth_hw, flags })
     }
 
     /// The DLSSD optimal-settings triple for a target resolution:

@@ -321,7 +321,6 @@ pub struct FrameConstants {
     pub clip_to_prev_clip: Mat4,
     pub prev_clip_to_clip: Mat4,
     pub world_to_view: Mat4,
-    pub view_to_world: Mat4,
     /// The sample-position jitter offset the renderer actually used, pixels.
     pub jitter: (f32, f32),
     /// No usable history: first frame, mode/quality change, teleport.
@@ -368,7 +367,6 @@ pub fn frame_constants(
         clip_to_prev_clip,
         prev_clip_to_clip: clip_to_prev_clip.inverse(),
         world_to_view,
-        view_to_world,
         jitter,
         reset,
         pos: cam.pos,

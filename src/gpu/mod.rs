@@ -114,9 +114,6 @@ pub struct GpuOptions {
     /// error; --quinlight sessions compose (the fuse's own arms carry the
     /// per-family per-frame contract).
     pub fg: bool,
-    /// Whether `--fg` was PASSED rather than defaulted (informational since
-    /// fg learned to compose with --quinlight).
-    pub fg_explicit: bool,
     /// Directory holding amd_fidelityfx_framegeneration_dx12.dll (`--fg-path`;
     /// the prebuilt drop ships it in the FSR sample dir, NOT next to the
     /// loader the default --ffx-path points at).
@@ -632,15 +629,17 @@ pub struct GpuContext {
     /// NgxFgState). The NGX handle is destroyed explicitly in Drop /
     /// resize_output after a queue drain — no COM field-order constraint.
     fg_n: Option<NgxFgState>,
-    /// The raw-NGX DLSS-RR session (Some = the chain's DLSS level is live —
-    /// the availability probe passed on this adapter). Replaces the retired
-    /// Streamline context; holds its own device clone, so no field-order
-    /// constraint. The refcounted NGX shutdown runs on drop.
-    ngxrr: Option<ngxrr::NgxRr>,
     /// The created DLSSD feature (allocation dims = the DRS range max;
     /// per-frame subrects carry the real render res). Destroyed explicitly
-    /// in Drop / recreated across resize with the queue drained.
+    /// in Drop / recreated across resize with the queue drained. Declared
+    /// BEFORE `ngxrr` so plain field-order drop is a correct backstop: the
+    /// feature must release before the session's refcounted NGX shutdown.
     rr_feature: Option<ngxrr::RrFeature>,
+    /// The raw-NGX DLSS-RR session (Some = the chain's DLSS level is live —
+    /// the availability probe passed on this adapter). Replaces the retired
+    /// Streamline context; holds its own device clone. The refcounted NGX
+    /// shutdown runs on drop — see `rr_feature`'s ordering note above.
+    ngxrr: Option<ngxrr::NgxRr>,
     pub adapter_name: String,
     /// What the picked adapter IS (not what `--prefer-*` asked for) — the input
     /// to `main::vendor_defaults`.
@@ -2881,8 +2880,8 @@ impl GpuContext {
     /// same G-buffer-derived planes (they are read-only consumers, so no barrier
     /// between them) and writes its own window-res output; the fuse then reads
     /// those N outputs as SRVs and writes the one image the tonemap presents.
-    /// Under DLSS the whole list executes on the SL proxy queue, exactly as
-    /// present_trace_rr's does.
+    /// Everything — the raw-NGX RR evaluate included — executes on the one
+    /// native queue, exactly as present_trace_rr's list does.
     ///
     /// An engine that errors here fails the frame — by this point it is wired,
     /// fed, and counted in the fuse's N, so silently skipping it would fuse a
@@ -4921,7 +4920,14 @@ impl GpuContext {
                 ngxfg::frdlssg_create(self.d3d.device.as_raw(), rr.ow, rr.oh, rw, rh, 1, &mut h)
             };
             if r != 0 || h.is_null() {
-                eprintln!("fg: raw-NGX DLSS-G create failed ({r}) — frame generation off");
+                if r == ngxfg::ERR_UNSUPPORTED {
+                    // The shim's fall-through code (FrameGeneration.Available=0
+                    // — old driver / unsupported hardware; details already on
+                    // stderr), distinct from a real create error.
+                    eprintln!("fg: DLSS-G unsupported on this adapter/driver — frame generation off");
+                } else {
+                    eprintln!("fg: raw-NGX DLSS-G create failed ({r}) — frame generation off");
+                }
                 n.failed.set(true);
                 return false;
             }

@@ -32,17 +32,37 @@ ID3D12Device* g_ngx_device   = nullptr;
 int ngx_shared_init(ID3D12Device* device) {
     std::lock_guard<std::mutex> lk(g_ngx_mutex);
     if (g_ngx_refcount > 0) {
+        if (device != g_ngx_device) {
+            // One NGX init per process, keyed to the FIRST consumer's device;
+            // a second device would silently ride (and later Shutdown1) the
+            // wrong one — the cross-keying class this module exists to
+            // prevent. Loud because today's consumers share one device by
+            // construction; if this ever prints, that assumption broke.
+            std::fprintf(stderr,
+                "[fr-ngx] WARNING: consumer passed a different ID3D12Device "
+                "(%p, NGX keyed to %p) — sharing the existing init\n",
+                static_cast<void*>(device), static_cast<void*>(g_ngx_device));
+        }
         g_ngx_refcount++;
         return 0;
     }
     // NGX wants a WRITABLE app-data path (logs/model cache) — a null path
     // fails with 0xBAD0000F FAIL_UnableToWriteToAppDataPath (measured).
+    // Read the env var WIDE: getenv is the ANSI codepage, which mangles a
+    // non-ASCII username into a path create_directories then fails on.
     std::wstring app_data;
-    if (const char* lad = std::getenv("LOCALAPPDATA")) {
+    if (const wchar_t* lad = _wgetenv(L"LOCALAPPDATA")) {
         std::error_code ec;
-        std::filesystem::path p = std::filesystem::path(lad) / "frustracer" / "ngx";
+        std::filesystem::path p = std::filesystem::path(lad) / L"frustracer" / L"ngx";
         std::filesystem::create_directories(p, ec);
         if (!ec) app_data = p.wstring();
+    }
+    if (app_data.empty()) {
+        // The null fallback is the GUARANTEED 0xBAD0000F failure — name the
+        // real cause here rather than letting the generic init line carry it.
+        std::fprintf(stderr,
+            "[fr-ngx] no writable %%LOCALAPPDATA%%\\frustracer\\ngx (env var "
+            "missing or directory creation failed) — NGX init will fail\n");
     }
     NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Init_with_ProjectID(
         kProjectId, NVSDK_NGX_ENGINE_TYPE_CUSTOM, kEngineVersion,

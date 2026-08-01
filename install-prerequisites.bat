@@ -61,6 +61,7 @@ if not exist "%TAR%"  (echo [x] %TAR% not found ^(needs Windows 10 1803+^)& exit
 rem --- args ----------------------------------------------------------------
 set "FORCE="
 set "SEL="
+set "KNOWN="
 for %%A in (%*) do (
     if /i "%%~A"=="/force" (set "FORCE=1") else (
     if /i "%%~A"=="/clean" (
@@ -69,10 +70,36 @@ for %%A in (%*) do (
         exit /b 0
     ) else (
     if /i "%%~A"=="all" (set "SEL=") else (
-        set "SEL=!SEL! %%~A"
-    )))
+    if /i "%%~A"=="dlss" (goto :arg_dlss) else (
+    if /i "%%~A"=="dxc" set "KNOWN=1"
+    if /i "%%~A"=="fsr" set "KNOWN=1"
+    if /i "%%~A"=="xess" set "KNOWN=1"
+    if /i "%%~A"=="nppd" set "KNOWN=1"
+    if /i "%%~A"=="oidn" set "KNOWN=1"
+    if /i "%%~A"=="pix" set "KNOWN=1"
+    rem  Reject via goto, not an in-block exit /b: exiting from inside this
+    rem  parenthesized loop body terminates the script but does NOT reliably
+    rem  propagate the exit code to the caller (measured: cmd /c saw 0).
+    if not defined KNOWN (set "BAD=%%~A" & goto :arg_unknown)
+    set "KNOWN="
+    set "SEL=!SEL! %%~A"
+    ))))
 )
 if not defined SEL (set "SEL= dxc fsr xess nppd oidn pix")
+goto :args_done
+
+rem `dlss` was a valid component in the Streamline era; say why it is gone
+rem instead of silently installing nothing.
+:arg_dlss
+echo [x] dlss is no longer fetchable: DLSS builds against the NDA DLSS
+echo     SDK at BUILD time ^(set FRUSTRACER_DLSS_SDK; see the header^).
+exit /b 2
+
+:arg_unknown
+echo [x] unknown component "%BAD%" ^(valid: dxc fsr xess nppd oidn pix all^)
+exit /b 2
+
+:args_done
 
 if not exist "%CACHE%" mkdir "%CACHE%"
 set "FAILED="
@@ -101,6 +128,19 @@ call :check "NPPD (--nppd / J)"                      "%SDKS%\onnxruntime\bin\onn
 call :check "  (DirectML EP)"                        "%SDKS%\onnxruntime\bin\DirectML.dll"
 call :check "OIDN (--oidn / N)"                      "%SDKS%\oidn.x64.windows\bin\OpenImageDenoise.dll"
 call :check "PIX markers (--pix-markers)"            "%SDKS%\pix\bin\x64\WinPixEventRuntime.dll"
+
+rem DLSS is decided at BUILD time, not here (see the header) — but say so in
+rem the summary, where someone looking for the missing DLSS-RR row will look.
+rem The staged snippet DLL is the truthful signal: build.rs copies it next to
+rem the binary exactly when the SDK was present at `cargo build --release`.
+echo.
+if exist "%ROOT%\target\release\nvngx_dlssd.dll" (
+    echo  [ok] DLSS ^(RR+FG^)   built in ^(nvngx_dlssd.dll staged by build.rs^)
+) else (
+    echo  [i] DLSS ^(RR+FG^)   build-time only — needs the NDA DLSS SDK at
+    echo                      FRUSTRACER_DLSS_SDK when `cargo build` runs; not
+    echo                      fetchable here. Without it the chain starts at FSR/XeSS.
+)
 
 rem The NPPD weights are the one thing no installer may fetch: the pretrained
 rem checkpoint carries no license grant (see tools/nppd-export/README.md), so
