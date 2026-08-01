@@ -1210,6 +1210,9 @@ struct PrimSurf {
     float rough;
     float3 albedo; // raw material albedo (diffuse/specular split at the write)
     float metallic;
+    float trans;   // material transmission — the wire diff_alb is the
+                   // EFFECTIVE albedo*(1-metallic)*(1-trans) color multiplies
+                   // (shade.rs::PrimarySurface::diff_albedo, same order)
     float spec_t;
     float ripple_amp; // water only; the FG guide pass's "this mirror MOVES" tag
     float3 direct_d; // albedo-free direct diffuse (kd multiplies later)
@@ -1263,8 +1266,10 @@ RWStructuredBuffer<GBufCore> gbuf : register(u15);
 // GPU-resident NPPD). Every field keeps its old name, type and precision.
 struct GBufExt {
     float4 nr;    // normal.xyz, roughness
-    float4 alb;   // diff_alb.xyz = albedo*(1-metallic); w unused (view_z moved
-                  // to core.z — this is the ONE field that changed home)
+    float4 alb;   // diff_alb.xyz = albedo*(1-metallic)*(1-trans) — the
+                  // EFFECTIVE diffuse albedo (PrimarySurface::diff_albedo);
+                  // w = ripple tag (view_z moved to core.z — the ONE field
+                  // that changed home)
     float4 spec;  // spec_alb.xyz = lerp(0.04, albedo, metallic) (RGB F0), spec_hit_t
                   // (also the INDIRECT_SPECULAR signal's ray-hit-distance channel)
     uint4 sig;    // f16x2 packs (dd.x|dd.y, dd.z|ds.x, ds.y|ds.z, 0) of the
@@ -1412,7 +1417,12 @@ void gbuf_write_hit(uint pi, float fx, float fy, float3 dir, float t, PrimSurf p
     // .w was the ONE free lane in the ext record (view_z moved to core.z), so
     // the FG guide pass's ripple tag rides it: no stride change, and the
     // ext-lane gates that skip lane 7 keep passing unmodified.
-    g.alb = float4(ps.albedo * (1.0 - ps.metallic), ps.ripple_amp);
+    // Wire diff_alb = the EFFECTIVE diffuse albedo (×(1-trans)) — the exact
+    // factor shade's color multiplies its diffuse terms by, so the denoised
+    // dd/ao remodulate at their physical weight on glass/water (raw kd here
+    // amplified every denoiser delta 33x on water — the FSR-RR terrain-smear
+    // bug). Multiply order matches PrimarySurface::diff_albedo bit-for-bit.
+    g.alb = float4(ps.albedo * (1.0 - ps.metallic) * (1.0 - ps.trans), ps.ripple_amp);
     float3 spec_alb = lerp(float3(0.04, 0.04, 0.04), ps.albedo, ps.metallic);
     g.spec = float4(spec_alb, isinf(ps.spec_t) ? CAM_FAR : ps.spec_t);
     g.sig = uint4(0u, 0u, 0u, 0u);

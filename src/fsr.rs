@@ -215,10 +215,17 @@ pub struct Signals {
 /// products), and `albedo_wire3`'s leading f16 rounding makes it insensitive
 /// to whether the caller hands raw f32 or the GBufs' f16-stored albedos.
 ///
-/// Note `color` multiplies the diffuse terms by `kd*(1-transmission)` while
-/// the wire carries only `kd`: on glass the remainder absorbs the difference.
-/// That approximation predates the AO signal (it already applied to `dd`) and
-/// `ao` deliberately inherits the same convention.
+/// The wire `kd` is the EFFECTIVE diffuse albedo `albedo*(1-metallic)*
+/// (1-transmission)` (`PrimarySurface::diff_albedo`) — the exact factor
+/// `color` multiplies its diffuse terms by. It used to be the raw
+/// `albedo*(1-metallic)` with the remainder absorbing the difference, which
+/// meant every denoiser delta on `dd`/`ao` remodulated at `kd` instead of the
+/// physical `kd*(1-transmission)` — a 33x amplifier on water (transmission
+/// 0.97) that smeared terrain-colored diffuse bleed across the surface in
+/// FSR-RR sessions. The remaining wire approximations are sheen's
+/// `(1-0.157*sheen)` energy factor and translucency's `(1-tl)` split (which
+/// does NOT scale ambient, so it cannot be folded into a kd shared by the
+/// `dd` and `ao` signals); both land in the residual, both zero on water.
 ///
 /// `amb` is the AO signal's remodulation factor — `sky_sh.irradiance` at the
 /// pixel's `wire_normal`. It is passed in rather than computed here so fsr.rs

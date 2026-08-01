@@ -502,6 +502,7 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
             prim.rough = rough_eff;
             prim.albedo = albedo;
             prim.metallic = metal_eff;
+            prim.trans = mat.transmission;
             prim.ripple_amp = mat.ripple_amp;
         }
 

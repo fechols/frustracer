@@ -1344,7 +1344,7 @@ fn write_gbuf_hit(
         &dlss::GPixel {
             normal: prim.n,
             rough: prim.roughness,
-            diff_alb: prim.albedo * (1.0 - prim.metallic),
+            diff_alb: prim.diff_albedo(),
             spec_alb: Vec3A::splat(0.04).lerp(prim.albedo, prim.metallic),
             view_z: t * dir.dot(ctx.cam.forward()),
             mv,
@@ -1419,7 +1419,7 @@ fn write_fsr(
         prim.direct_s,
         prim.ao,
         prim.ind_s,
-        prim.albedo * (1.0 - prim.metallic),
+        prim.diff_albedo(),
         Vec3A::splat(0.04).lerp(prim.albedo, prim.metallic),
         amb,
     );

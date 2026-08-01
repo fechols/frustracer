@@ -104,11 +104,16 @@ pub struct PrimarySurface {
     /// The exact world-space normal used for shading (post face-flip).
     pub n: Vec3A,
     /// Raw material albedo (the diffuse/specular split happens at the
-    /// G-buffer write site).
+    /// G-buffer write site, via `diff_albedo`).
     pub albedo: Vec3A,
     /// Perceptual roughness and metalness, straight from the material.
     pub roughness: f32,
     pub metallic: f32,
+    /// The material's transmission — carried so the wire diffuse albedo can
+    /// be the EFFECTIVE `kd·(1−transmission)` the shader's color actually
+    /// multiplies (see `diff_albedo`). Default 0.0 keeps every opaque
+    /// material's wire byte-identical.
+    pub trans: f32,
     /// Specular-reflection ray hit t; INFINITY when the reflection ray
     /// missed; 0.0 when no reflection was traced.
     pub spec_t: f32,
@@ -144,6 +149,24 @@ pub struct PrimarySurface {
     /// direct_s`-style remainder, so capture changes no shading math.
     pub direct_d: Vec3A,
     pub direct_s: Vec3A,
+}
+
+impl PrimarySurface {
+    /// The wire diffuse albedo — the factor `color`'s diffuse terms are
+    /// ACTUALLY multiplied by, `albedo·(1−metallic)·(1−transmission)`
+    /// (shade's `kd·(1−transmission)`; sheen/translucency remainders stay in
+    /// the residual — see `fsr::split_signals`). Both CPU wire derivation
+    /// sites (the G-buffer diff_alb plane and the `split_signals` kd) MUST go
+    /// through this one method: the composite identity requires them equal,
+    /// and the GPU pack (`trace_common.hlsli::gbuf_write_hit`) mirrors the
+    /// exact multiply order. Folding `(1−transmission)` in is what keeps the
+    /// denoiser's diffuse/AO deltas remodulating at their PHYSICAL weight on
+    /// glass and water — with raw kd on the wire, water (transmission 0.97)
+    /// amplified every denoiser delta 33×, which smeared terrain-colored
+    /// bleed across the surface in FSR-RR sessions.
+    pub fn diff_albedo(&self) -> Vec3A {
+        self.albedo * (1.0 - self.metallic) * (1.0 - self.trans)
+    }
 }
 
 /// Capacity of a `VisRecord` (the presets top out at 4 shadow samples).
@@ -645,6 +668,7 @@ pub fn shade(
             albedo,
             roughness: rough_eff,
             metallic: metal_eff,
+            trans: mat.transmission,
             spec_t: 0.0,
             ripple_amp: mat.ripple_amp,
             direct_d: Vec3A::ZERO,
