@@ -105,9 +105,10 @@ pub struct Opts {
     /// paths never consult it.
     pub fg: bool,
     /// Whether `--fg` was PASSED rather than defaulted (the `mode_explicit`
-    /// pattern). One consumer: `--quinlight` against the mere default
-    /// disarms fg with a loud line instead of exit(2) — a default must never
-    /// make another flag fatal on its own.
+    /// pattern). Currently informational — its last consumer (the
+    /// --quinlight exit-2) died when frame generation learned to compose
+    /// with the fuse; kept because the passed-vs-defaulted fact is cheap to
+    /// carry and expensive to reconstruct.
     pub fg_explicit: bool,
     /// Directory holding amd_fidelityfx_framegeneration_dx12.dll (`--fg-path`;
     /// the prebuilt drop ships it in the FSR sample dir, not next to the
@@ -1862,7 +1863,7 @@ pub fn self_test() -> Result<(), String> {
         return Err("--fg --no-fg must disable frame generation".into());
     }
     if !parse_argv(&["--no-fg", "--fg"]).opts.fg_explicit {
-        return Err("a trailing --fg must set fg_explicit (the --quinlight interplay reads it)".into());
+        return Err("a trailing --fg must set fg_explicit".into());
     }
     if parse_argv(&["--world", "--no-world"]).world_flag != Some(false) {
         return Err("--world --no-world must resolve to Some(false)".into());

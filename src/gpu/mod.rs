@@ -111,11 +111,11 @@ pub struct GpuOptions {
     /// FSR3 / XeSS) take the FidelityFX frame-interpolation swapchain built
     /// here; DLSS sessions take raw-NGX DLSS-G when the shim is built in.
     /// Unsupported combinations fall through with a loud line, never an
-    /// error (except explicit `--fg --quinlight`, rejected at parse).
+    /// error; --quinlight sessions compose (the fuse's own arms carry the
+    /// per-family per-frame contract).
     pub fg: bool,
-    /// Whether `--fg` was PASSED rather than defaulted (main.rs's
-    /// `--quinlight` interplay reads it: an explicit pair exits 2, the mere
-    /// default disarms with a loud line).
+    /// Whether `--fg` was PASSED rather than defaulted (informational since
+    /// fg learned to compose with --quinlight).
     pub fg_explicit: bool,
     /// Directory holding amd_fidelityfx_framegeneration_dx12.dll (`--fg-path`;
     /// the prebuilt drop ships it in the FSR sample dir, NOT next to the
@@ -774,7 +774,6 @@ impl GpuContext {
         // loud line + a normal session.
         let try_xefg = opts.fg
             && ngxrr.is_none()
-            && !opts.quin
             && pick.vendor == adapter::Vendor::Intel
             && xess_state.is_some();
 
@@ -858,7 +857,7 @@ impl GpuContext {
         // version actually enumerates; every failure is a loud line + a
         // normal session (the chain-fallback shape).
         let mut fg_versions: Vec<ffx::Version> = Vec::new();
-        if opts.fg && ngxrr.is_none() && !opts.quin && !try_xefg {
+        if opts.fg && ngxrr.is_none() && !try_xefg {
             match ffx::fg_load(&opts.ffx_dir, &opts.fg_dir) {
                 Ok(()) => match ffx::fg_versions(&device) {
                     Ok(v) if !v.is_empty() => {
@@ -888,7 +887,7 @@ impl GpuContext {
         // it: an NGX-FG session is a DLSS session, and a DLSS session never
         // takes a swapchain wrapper (try_xefg and the ffx enumeration both
         // require ngxrr.is_none()).
-        let pair = opts.fg && !opts.quin && ngxfg::BUILT && ngxrr.is_some();
+        let pair = opts.fg && ngxfg::BUILT && ngxrr.is_some();
         let d3d = {
             let queue = d3d12::create_queue(&device)?;
             if try_xefg {
@@ -1097,7 +1096,7 @@ impl GpuContext {
         // Raw-NGX DLSS-G (preferred when built): the interpolated-frame
         // target + lazy-created feature. scRGB fp16 is fine on this path —
         // there is no swapchain policing because there is no swapchain hook.
-        let fg_n = if opts.fg && !opts.quin && ngxfg::BUILT && rr_res.is_some() {
+        let fg_n = if opts.fg && ngxfg::BUILT && rr_res.is_some() {
             match d3d12::committed_tex(
                 &d3d.device,
                 w,
@@ -2947,10 +2946,84 @@ impl GpuContext {
         Ok(())
     }
 
+    /// The --quinlight ffx prepare inputs: the depth/MV planes actually
+    /// WRITTEN this frame. An FSR4-RR flavor always has its own fed
+    /// eleven-plane set (reversed-Z clip depth + UV-delta MVs, mv_scale =
+    /// SIGN*(rw,rh) — the standalone present_trace_fsr_rr pick, and what the
+    /// 4.x ML provider pairs with). A SHARED FSR 3.1 upscales from the XeSS
+    /// trio and its OWN planes are never fed (wire_session_feed skips them)
+    /// — handing fg_prepare FsrRes::Up's planes there would be STALE data;
+    /// the XeSS trio is byte-identical to the Up trio (R32F reversed-Z clip
+    /// depth, RG16F pixel MVs, NPSR rest), so mv_scale = UPSCALE_MV_SIGN
+    /// pixels. No XeSS wired = the Up planes WERE fed (the else arm).
+    fn quin_ffx_fg_inputs(
+        &self,
+        rw: u32,
+        rh: u32,
+    ) -> Option<(&ID3D12Resource, &ID3D12Resource, [f32; 2])> {
+        for fs in [self.fsr.as_ref(), self.fsr3.as_ref()].into_iter().flatten() {
+            if matches!(fs.res, FsrRes::Rr(_)) {
+                return Some(fs.res.fg_inputs(rw, rh));
+            }
+        }
+        if let Some(x) = &self.xess {
+            let p = x.res.plane_resources();
+            return Some((
+                p[2].0,
+                p[1].0,
+                [crate::fsr::UPSCALE_MV_SIGN.0, crate::fsr::UPSCALE_MV_SIGN.1],
+            ));
+        }
+        [self.fsr.as_ref(), self.fsr3.as_ref()]
+            .into_iter()
+            .flatten()
+            .next()
+            .map(|fs| fs.res.fg_inputs(rw, rh))
+    }
+
+    /// The quin arms' presentation tail — exactly one FG family can be armed
+    /// (fg_n / fg / fg_x are mutually exclusive by construction in `new`),
+    /// and each gets its per-frame contract over the FUSED present: raw NGX
+    /// pair-presents (interpolating quin.output via `ngxfg_target`), ffx FI
+    /// gets its PrepareV2 from the planes actually fed, XeSS-FG its
+    /// tag+marker prepare. The fuse<->plain toggles and the pause-menu hold
+    /// keep working through the same funnel handshake / reset latches every
+    /// other arm uses (a plain frame simply never prepares).
+    fn quin_fg_tail(
+        &mut self,
+        slot: usize,
+        fc: &dlss::FrameConstants,
+        frame_ms: f32,
+        ff: &crate::fireflies::Fireflies,
+        cl: &crate::clouds::Clouds,
+    ) -> Result<()> {
+        // Raw NGX owns the tail when armed (pair-present; no handshake).
+        if self.fg_n.is_some() {
+            return self.ngxfg_tail(slot, fc, ff, cl);
+        }
+        // ffx FI: frame_ms + PrepareV2 with the planes actually fed.
+        self.fg_set_frame_ms(frame_ms);
+        if self.fg.is_some() {
+            if let Some((dep, mv, scale)) = self.quin_ffx_fg_inputs(fc.rw as u32, fc.rh as u32)
+            {
+                self.fg_prepare(&self.d3d.list, fc, dep, mv, scale);
+            }
+        }
+        // XeSS-FG: prepare BEFORE the funnel (no-op when fg_x is None);
+        // xefg_end_frame consumes `prepared` after the XeLL present markers
+        // and degenerates to a plain end_frame otherwise — the universal
+        // tail for the ffx/none cases too.
+        self.xefg_prepare(fc, frame_ms);
+        self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_QUIN, 1.0);
+        self.xefg_end_frame(slot)
+    }
+
     /// The registered-consensus fuse fed by the GPU-resident tracer
     /// (`--gpu --quinlight`): trace -> one feed dispatch per engine -> every
     /// wired upscaler -> the LK-registered winsorized fuse -> tonemap
-    /// (SRV_SLOT_QUIN) -> present. One command list, one Present.
+    /// (SRV_SLOT_QUIN) -> present (with the session's FG family's per-frame
+    /// contract in the tail — see `quin_fg_tail`). One command list; one
+    /// Present, or two under raw-NGX pair-present.
     #[allow(clippy::too_many_arguments)]
     pub fn present_trace_quin(
         &mut self,
@@ -2986,8 +3059,7 @@ impl GpuContext {
             self.d3d.abort_frame();
             return Err(e);
         }
-        self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_QUIN, 1.0);
-        self.d3d.end_frame(slot)
+        self.quin_fg_tail(slot, fc, frame_ms, &p.fireflies, &p.clouds)
     }
 
     /// The DXR twin of `present_trace_quin` (the `--dxr` default + --quinlight):
@@ -3029,8 +3101,7 @@ impl GpuContext {
             self.d3d.abort_frame();
             return Err(e);
         }
-        self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_QUIN, 1.0);
-        self.d3d.end_frame(slot)
+        self.quin_fg_tail(slot, fc, frame_ms, &p.fireflies, &p.clouds)
     }
 
     /// Screenshot path for --quinlight: the fused image exists only on the GPU.
@@ -4731,8 +4802,24 @@ impl GpuContext {
         r
     }
 
+    /// What raw-NGX FG interpolates and which tonemap slot presents the REAL
+    /// half: a quinlight session hands NGX the FUSED image (`quin.output` —
+    /// same window-res RGBA16F, same PIXEL_SHADER_RESOURCE rest state as
+    /// `rr.output`, written by `Quin::record` earlier on this very list),
+    /// every other session the RR output. Resolved per frame — the clone is
+    /// an AddRef, which dodges the `&mut self` borrows inside the dispatch —
+    /// and per frame is also what makes a resize safe: the rebuilt
+    /// `quin.output` is picked up on the next dispatch.
+    fn ngxfg_target(&self) -> Option<(ID3D12Resource, u32)> {
+        if let Some(q) = &self.quin {
+            return Some((q.output.clone(), tonemap::SRV_SLOT_QUIN));
+        }
+        self.rr.as_ref().map(|rr| (rr.output.clone(), tonemap::SRV_SLOT_RR))
+    }
+
     /// Raw-NGX DLSS-G: record this frame's interpolation evaluate into the
-    /// open list. `rr.output` is the CURRENT denoised frame; the NGX feature
+    /// open list. `ngxfg_target()`'s color is the CURRENT frame (the RR
+    /// output, or the fused image under --quinlight); the NGX feature
     /// retains the previous one internally, so the evaluate produces the
     /// frame BETWEEN them into `fg_n.out`. Returns true when that output is
     /// presentable (a prior frame primed the pair and this one is no reset).
@@ -4751,6 +4838,10 @@ impl GpuContext {
         if !n.enabled || n.failed.get() {
             return false;
         }
+        // The interpolation color source (the one field the quin session
+        // swaps); guide planes/dims stay on `rr` — its planes are fed in
+        // quin sessions too, and quin.output's dims ARE rr.ow x rr.oh.
+        let Some((tgt_color, _)) = self.ngxfg_target() else { return false };
         let (rw, rh) = (fc.rw as u32, fc.rh as u32);
         // A render-res MOVE recreates the feature instead of skipping
         // forever: the CPU renderer fills the same MV/depth/guide planes the
@@ -4947,19 +5038,19 @@ impl GpuContext {
         };
         unsafe {
             list.ResourceBarrier(&[
-                transition(&rr.output, psr, npsr),
+                transition(&tgt_color, psr, npsr),
                 transition(&n.out, psr, uav),
             ]);
         }
-        // FR_NGXFG_TONEMAP probe: compress rr.output into the scratch and hand
-        // NGX that instead. Deliberately AFTER the barrier above — that is what
-        // puts rr.output into NON_PIXEL_SHADER_RESOURCE, the state a COMPUTE
+        // FR_NGXFG_TONEMAP probe: compress the color source into the scratch and
+        // hand NGX that instead. Deliberately AFTER the barrier above — that is
+        // what puts it into NON_PIXEL_SHADER_RESOURCE, the state a COMPUTE
         // SRV read requires (leaving it PSR is the exact debug-layer error the
         // bloom pyramid documents, and GBV-only, so it would go unnoticed).
         let tone_color = match &n.tone {
             Some(tp) => {
                 let mut tpm = tp.borrow_mut();
-                match tpm.ensure(&self.d3d.device, rr.ow, rr.oh, &rr.output, &n.out) {
+                match tpm.ensure(&self.d3d.device, rr.ow, rr.oh, &tgt_color, &n.out) {
                     Ok(()) => {
                         tpm.record_compress(list, n.tone_mode);
                         unsafe {
@@ -4995,9 +5086,9 @@ impl GpuContext {
         let d = ngxfg::FrDlssgDispatch {
             cmdlist: list.as_raw(),
             // The probe swaps ONLY this: the compressed scratch in place of the
-            // linear rr.output. Every other field is byte-identical, which is
-            // what makes it an A/B of one variable.
-            color: tone_color.unwrap_or_else(|| rr.output.as_raw()),
+            // linear color source. Every other field is byte-identical, which
+            // is what makes it an A/B of one variable.
+            color: tone_color.unwrap_or_else(|| tgt_color.as_raw()),
             motion: motion_res,
             depth: depth_res,
             output: n.out.as_raw(),
@@ -5063,7 +5154,7 @@ impl GpuContext {
         }
         unsafe {
             list.ResourceBarrier(&[
-                transition(&rr.output, npsr, psr),
+                transition(&tgt_color, npsr, psr),
                 transition(&n.out, uav, psr),
             ]);
         }
@@ -5112,10 +5203,14 @@ impl GpuContext {
         // generated frames at full rate), 2 = real twice (nothing NGX-made
         // on screen — artifacts that survive are the present path's).
         let show_mode = self.fg_n.as_ref().map_or(0, |n| n.show_mode);
+        // The REAL half's tonemap slot follows the session's interpolation
+        // source (SRV_SLOT_QUIN under --quinlight, SRV_SLOT_RR otherwise).
+        let real_slot =
+            self.ngxfg_target().map_or(tonemap::SRV_SLOT_RR, |(_, s)| s);
         let (mid_slot, mut end_slot) = match show_mode {
             1 => (tonemap::SRV_SLOT_NGXFG, tonemap::SRV_SLOT_NGXFG),
-            2 => (tonemap::SRV_SLOT_RR, tonemap::SRV_SLOT_RR),
-            _ => (tonemap::SRV_SLOT_NGXFG, tonemap::SRV_SLOT_RR),
+            2 => (real_slot, real_slot),
+            _ => (tonemap::SRV_SLOT_NGXFG, real_slot),
         };
         // A non-generating frame (unprimed reset, res-moved skip — which
         // returns BEFORE the evaluate — or a failed evaluate) has nothing
@@ -5123,7 +5218,7 @@ impl GpuContext {
         // back to the real frame, or a failed session re-presents a stale /
         // never-written texture indefinitely.
         if !show {
-            end_slot = tonemap::SRV_SLOT_RR;
+            end_slot = real_slot;
         }
         // FR_NGXFG_PACE=1: per-frame pacing probe (kept diagnostic lever, the
         // FR_DLSSG_NO_RR class) — logs the backbuffer indices both halves

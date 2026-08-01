@@ -345,23 +345,12 @@ fn main() {
         eprintln!("--quin-anchor selects the fuse's anchor engine, but --quinlight was not passed");
         std::process::exit(2);
     }
-    // Frame generation wraps the swapchain with ONE family's frame-
-    // interpolation proxy; the fuse wires every engine at once and its
-    // present arm is its own. Untested composition — the --nppd shape when
-    // EXPLICITLY requested: exit, don't degrade. But fg is on by DEFAULT,
-    // and a default must never make `--quinlight` alone fatal — the
-    // defaulted arm disarms with a loud line instead.
-    if opts.quin && opts.fg {
-        if opts.fg_explicit {
-            eprintln!("--quinlight cannot compose with --fg. Drop one.");
-            std::process::exit(2);
-        }
-        eprintln!(
-            "fg: off under --quinlight (frame generation is on by default, but the fuse \
-             presents through its own arm; pass --fg explicitly to be told instead)"
-        );
-        opts.fg = false;
-    }
+    // Frame generation COMPOSES with --quinlight (2026-08-01): the family
+    // follows the session exactly as in single-upscaler sessions (raw NGX
+    // interpolates the FUSED image in DLSS sessions; ffx FI / XeSS-FG wrap
+    // the swapchain the fused present rides), and the quin present arms
+    // carry the per-family per-frame contract (gpu/mod.rs::quin_fg_tail).
+    // The old exit-2/disarm block died with the composition.
     // Adapter preference default: AMD when FSR was explicitly requested
     // (--fsr/--fsr3), NVIDIA otherwise. An explicit --prefer-* always wins;
     // the chain then probes whatever adapter got picked.

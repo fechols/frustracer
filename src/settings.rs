@@ -129,12 +129,10 @@ opt_fields! {
         /// "nvidia" | "amd" | "intel" (--prefer-*; restart)
         pub prefer: String,
         /// --fg / --no-fg (frame generation for the wired upscaler family;
-        /// ON by default). Restart-tier — the swapchain wrap happens at
-        /// creation. The file drives the DEFAULT arm only: it never sets
-        /// `fg_explicit`, so fg=true here neither arms the explicit-only
-        /// SL DLSS-G fallback nor makes a CLI --quinlight fatal (it disarms
-        /// with the loud line instead) — a menu click is a preference, not
-        /// a being-told.
+        /// ON by default, --quinlight sessions included). Restart-tier — the
+        /// swapchain wrap happens at creation. The file drives the DEFAULT
+        /// arm only: it never sets `fg_explicit` — a menu click is a
+        /// preference, not a being-told.
         pub fg: bool,
         /// --oidn (live: N toggles)
         pub oidn: bool,
@@ -582,10 +580,10 @@ pub fn apply_to_opts(s: &Settings, opts: &mut crate::Opts) -> AppliedFx {
         }
     }
     if let Some(v) = u.fg {
-        // The DEFAULT arm only — deliberately never `fg_explicit`: the
-        // explicit-only consumers (the SL DLSS-G fallback, the --quinlight
-        // exit(2)) key on being TOLD on the command line. CLI --fg/--no-fg
-        // parse after this and override per the precedence rule.
+        // The DEFAULT arm only — deliberately never `fg_explicit` (the
+        // passed-vs-defaulted fact belongs to the command line). CLI
+        // --fg/--no-fg parse after this and override per the precedence
+        // rule.
         opts.fg = v;
     }
     if let Some(v) = u.oidn {
