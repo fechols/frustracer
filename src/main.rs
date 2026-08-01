@@ -9992,16 +9992,37 @@ fn run_cinematic_gpu(
     // RECONSTRUCTED output, with the temporal model as the integrator.
     // `--no-upscale` (the empty chain) and the per-level flags steer it
     // exactly as they steer a window session; chain exhausted = the
-    // accumulation loop, loudly. DLSS needs Streamline initialized BEFORE the
-    // DXGI factory and a queue created through the SL proxy device — the
-    // `new_sl` harness flavor. Tuple order is drop order: `hg` (and the proxy
-    // queue) release before `sl` runs slShutdown.
+    // accumulation loop, loudly. DLSS is raw NGX now — no queue hook, no
+    // interposer, so the plain harness serves every level; the session opens
+    // on the harness's own device (drop order: `ngxrr` declared after `hg`
+    // is fine — it holds a device clone).
     let up_wanted = opts.chain != upchain::UpChain::NONE;
-    let (sl, mut hg) = gpu::trace::HeadlessGpu::new_sl(
+    let mut hg = gpu::trace::HeadlessGpu::new(
         opts.gpu_debug,
         opts.prefer.unwrap_or(gpu::adapter::Prefer::Nvidia),
-        (up_wanted && opts.chain.dlss).then_some(opts.sl_path.as_str()),
     )?;
+    let ngxrr = if up_wanted && opts.chain.dlss {
+        if hg.vendor != gpu::adapter::Vendor::Nvidia {
+            eprintln!("dlss: level unavailable (no NVIDIA adapter) — falling through the chain");
+            None
+        } else if !gpu::ngxrr::BUILT {
+            eprintln!(
+                "dlss: built without the DLSS SDK — set FRUSTRACER_DLSS_SDK and rebuild \
+                 (chain falls to FSR4/XeSS/FSR3)"
+            );
+            None
+        } else {
+            match gpu::ngxrr::NgxRr::open(&hg.device) {
+                Ok(nx) => Some(nx),
+                Err(e) => {
+                    eprintln!("dlss: level unavailable ({e}) — falling through the chain");
+                    None
+                }
+            }
+        }
+    } else {
+        None
+    };
     // The native-level probe wants the interactive session's options shape;
     // everything swapchain-adjacent (vsync/hdr/fg/quin) is off — headless.
     let gopts = gpu::GpuOptions {
@@ -10049,7 +10070,7 @@ fn run_cinematic_gpu(
             // — DLAA-grade). A failed probe/wiring is a loud line + the
             // accumulation loop, never fatal.
             let mut up = if up_wanted {
-                gpu::CineUp::probe(&dev, sl.as_ref(), &gopts, rw as u32, rh as u32)
+                gpu::CineUp::probe(&dev, ngxrr.as_ref(), &gopts, rw as u32, rh as u32)
             } else {
                 None
             };
@@ -10244,7 +10265,7 @@ fn run_cinematic_gpu(
                                 tg.record_frame(l, 0, &p, true);
                                 rec = tg.record_feed(l, 0, false).and_then(|()| {
                                     u.record_eval(
-                                        sl.as_ref(),
+                                        ngxrr.as_ref(),
                                         l,
                                         &fc,
                                         jit,
@@ -10267,7 +10288,7 @@ fn run_cinematic_gpu(
                                     .and_then(|()| dg.record_feed(l, 0))
                                     .and_then(|()| {
                                         u.record_eval(
-                                            sl.as_ref(),
+                                            ngxrr.as_ref(),
                                             l,
                                             &fc,
                                             jit,

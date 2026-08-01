@@ -143,21 +143,19 @@ extern "C" int32_t frdlssg_create(void* device_v, uint32_t disp_w, uint32_t disp
     s->rend_h = rend_h;
     s->color_hdr = color_hdr != 0;
 
-    // NGX may ALREADY be initialized in this process by Streamline (the RR
-    // session) — a second, differently-keyed init is the documented identity
-    // clash (whichever runs second sees the first's identity and its own
-    // snippets stay unloaded). So probe FIRST: an initialized NGX answers
-    // GetCapabilityParameters; only key our own init when it does not, and
-    // only ever Shutdown1 the init WE own.
-    NVSDK_NGX_Result cap_r = NVSDK_NGX_D3D12_GetCapabilityParameters(&s->params);
-    if (NVSDK_NGX_FAILED(cap_r)) {
-        if (ngx_shared_init(dev) != 0) {
-            frdlssg_destroy(s);
-            return FRDLSSG_ERR_INIT;
-        }
-        s->owns_init = true;
-        cap_r = NVSDK_NGX_D3D12_GetCapabilityParameters(&s->params);
+    // Unconditional refcounted init — every raw-NGX consumer (this and the
+    // DLSSD/RR session) takes its OWN ref through ngx_shared, so teardown
+    // order between the two cannot matter: Shutdown1 runs only when the last
+    // ref drops. (The probe-first/owns_init dance this replaces existed to
+    // detect a Streamline-owned in-process NGX; with SL retired it became a
+    // hazard — a consumer that merely rode another's init would see NGX shut
+    // down under its live feature if the owner died first.)
+    if (ngx_shared_init(dev) != 0) {
+        frdlssg_destroy(s); // owns_init still false — no ref to drop
+        return FRDLSSG_ERR_INIT;
     }
+    s->owns_init = true;
+    NVSDK_NGX_Result cap_r = NVSDK_NGX_D3D12_GetCapabilityParameters(&s->params);
     if (NVSDK_NGX_FAILED(cap_r)) {
         std::fprintf(stderr, "[fr-dlssg] GetCapabilityParameters failed: 0x%08X\n",
                      (unsigned)cap_r);

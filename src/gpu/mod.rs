@@ -45,7 +45,6 @@ use std::sync::atomic::AtomicU32;
 use windows::core::Interface;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::Win32::Graphics::Dxgi::IDXGIFactory6;
 
 pub struct GpuOptions {
     /// The temporal-upscaler fallback chain: which levels of
@@ -544,36 +543,6 @@ struct XefgState {
     mult: std::cell::Cell<u32>,
 }
 
-/// DLSS-G frame generation (DLSS sessions — the SL-family counterpart of
-/// `FgState`; exactly one family per session). The SL proxy swapchain does
-/// the interpolation at Present; this side owns the mode transitions and the
-/// Reflex/PCL contract. Same handshake discipline as FgState with one twist:
-/// the funnel READS `prepared` without consuming (an unprepared present
-/// turns DLSS-G's mode off) and `dlssg_end_frame` consumes it after the
-/// present markers — the markers bracket the Present itself, which happens
-/// AFTER the funnel.
-struct DlssgState {
-    /// The user-facing toggle (`--fg` starts true).
-    enabled: bool,
-    /// What SL was last told (mode eOn/eOff) — mode flips are edges.
-    on: std::cell::Cell<bool>,
-    /// Set by dlssg_frame_begin; read by the funnel; consumed by
-    /// dlssg_end_frame.
-    prepared: std::cell::Cell<bool>,
-    /// Status poll tripped (HAGS off, resolution too low, HDR format…) —
-    /// sticky off + one loud line, the pink-overlay guard.
-    failed: std::cell::Cell<bool>,
-    /// Prepared-frame counter driving the periodic status poll.
-    poll: std::cell::Cell<u32>,
-    /// First successful poll logged the presented/rendered ratio (the
-    /// headless proof generation is happening).
-    logged: std::cell::Cell<bool>,
-    /// Last healthy second-interval poll's numFramesActuallyPresented — the
-    /// per-present multiplier (0 = not yet measured; 1 = generated frames
-    /// not landing). The title bar reads it.
-    mult: std::cell::Cell<u32>,
-}
-
 /// The trace res must sit inside this context's SDK range. The caller already
 /// quantize_res-clamped it, but the range is the SDK's contract, so a drift
 /// fails loudly at init rather than quietly at execute. Split out of
@@ -589,11 +558,11 @@ fn fsr_range_check(fs: &FsrState, rw: u32, rh: u32) -> Result<()> {
     Ok(())
 }
 
-/// Field order is drop order (Rust drops in declaration order), and teardown
-/// must mirror Streamline's documented shutdown sequence: release the proxied
-/// queue/swapchain (`d3d`, which also waits the GPU idle) and both proxy
-/// wrappers BEFORE `sl` runs slShutdown + FreeLibrary — the proxies' vtables
-/// live in sl.interposer.dll, so releasing them after unload is UB.
+/// Field order is drop order (Rust drops in declaration order). The old
+/// Streamline teardown ordering (proxies before slShutdown) died with SL —
+/// the raw-NGX session holds its own device clone, so it may drop anywhere;
+/// the surviving constraints are the FG swapchain-wrapper ones on `fg`/`fg_x`
+/// (declared after `d3d`).
 pub struct GpuContext {
     d3d: D3d,
     passes: tonemap::Passes,
@@ -661,10 +630,6 @@ pub struct GpuContext {
     /// deliberately: d3d's swapchain/backbuffer refs on the FI proxy must
     /// release before FgState's drop destroys the swapchain context.
     fg: Option<FgState>,
-    /// DLSS-G frame generation (DLSS sessions; see DlssgState). No drop
-    /// constraint — it holds no COM refs, and `sl` (declared last) outlives
-    /// it by the existing field order.
-    fg_g: Option<DlssgState>,
     /// XeSS-FG frame generation (Intel XeSS sessions; see XefgState).
     /// Declared AFTER `d3d` like `fg`: destroying the xefg context tears the
     /// FI proxy down, so d3d's proxy refs must release first.
@@ -673,11 +638,15 @@ pub struct GpuContext {
     /// NgxFgState). The NGX handle is destroyed explicitly in Drop /
     /// resize_output after a queue drain — no COM field-order constraint.
     fg_n: Option<NgxFgState>,
-    /// Kept alive for the app lifetime: the hooked CreateCommandQueue /
-    /// CreateSwapChain entry points live on these (Frame Gen will need them
-    /// again), and dropping them to refcount 0 destroys the SL wrappers.
-    _proxy_device: Option<ID3D12Device>,
-    _proxy_factory: Option<IDXGIFactory6>,
+    /// The raw-NGX DLSS-RR session (Some = the chain's DLSS level is live —
+    /// the availability probe passed on this adapter). Replaces the retired
+    /// Streamline context; holds its own device clone, so no field-order
+    /// constraint. The refcounted NGX shutdown runs on drop.
+    ngxrr: Option<ngxrr::NgxRr>,
+    /// The created DLSSD feature (allocation dims = the DRS range max;
+    /// per-frame subrects carry the real render res). Destroyed explicitly
+    /// in Drop / recreated across resize with the queue drained.
+    rr_feature: Option<ngxrr::RrFeature>,
     pub adapter_name: String,
     /// What the picked adapter IS (not what `--prefer-*` asked for) — the input
     /// to `main::vendor_defaults`.
@@ -691,34 +660,45 @@ pub struct GpuContext {
     adapter: windows::Win32::Graphics::Dxgi::IDXGIAdapter4,
     hwnd: windows::Win32::Foundation::HWND,
     display: Option<display::DisplayHdr>,
-    /// Some(_) when Streamline is live; the queue and swapchain are then SL
-    /// proxies and every present goes through Streamline (a manual-hooking
-    /// requirement, and what makes Frame Generation possible later).
-    /// Declared LAST so slShutdown runs after every proxy is released.
-    sl: Option<streamline::SlContext>,
 }
 
-/// The per-frame Streamline sequence shared by the CPU-fed (`present_rr`) and
-/// GPU-fed (`present_trace_rr`) RR paths: token -> constants -> options (the
-/// world<->view matrices feed the SpecularHitDistance path, so they refresh
-/// every frame) -> tags -> evaluate. Same token + viewport 0 throughout; the
-/// jitter sign reported to SL is settled inside shim_constants, nowhere else.
-fn rr_sl_sequence(
-    sl: &streamline::SlContext,
+/// The per-frame raw-NGX RR evaluate shared by the CPU-fed (`present_rr`) and
+/// GPU-fed (`present_trace_rr`/`present_dxr_rr`/quin) paths — the retired
+/// `rr_sl_sequence`'s successor, between the same output PSR->UAV->PSR
+/// barriers the callers keep. The world<->view matrices ride EVERY evaluate
+/// (they feed the SpecularHitDistance path — the reason the SL path re-sent
+/// options per frame); jitter polarity and mv_scale come lever-resolved off
+/// the session (`ngxrr::NgxRr` — the ONE place those conventions live);
+/// `{fc.rw, fc.rh}` is the DRS subrect (the sl::Extent replacement).
+fn rr_ngx_sequence(
+    nx: &ngxrr::NgxRr,
+    feat: &ngxrr::RrFeature,
     rr: &rr::RrResources,
     list: &ID3D12GraphicsCommandList,
     fc: &dlss::FrameConstants,
-    frame_idx: u32,
-    dlssg: bool,
 ) -> Result<()> {
     let _ev = pix::scope(list, c"rr-eval");
-    let list_raw = list.as_raw();
-    let token = sl.new_frame_token(frame_idx)?;
-    sl.set_constants(token, 0, &shim_constants(fc))?;
-    sl.dlssd_set_options(0, &shim_options(fc, rr.ow, rr.oh))?;
-    sl.tag_resources(token, 0, &rr.tags(fc.rw, fc.rh, dlssg), list_raw)?;
-    sl.evaluate(streamline_sys::FEATURE_DLSS_RR, token, 0, list_raw)?;
-    Ok(())
+    let p = rr.plane_resources();
+    let d = ngxrr::FrDlssdDispatch {
+        cmdlist: list.as_raw(),
+        color: p[0].0.as_raw(),
+        output: rr.output.as_raw(),
+        depth: p[2].0.as_raw(),
+        motion: p[3].0.as_raw(),
+        diff_albedo: p[4].0.as_raw(),
+        spec_albedo: p[5].0.as_raw(),
+        normal_rough: p[1].0.as_raw(),
+        spec_hit: p[6].0.as_raw(),
+        world_to_view: row_major(&fc.world_to_view),
+        view_to_clip: row_major(&fc.view_to_clip),
+        jitter: [nx.jitter_mul * fc.jitter.0, nx.jitter_mul * fc.jitter.1],
+        mv_scale: nx.mv_scale(fc.rw as u32, fc.rh as u32),
+        rend_w: fc.rw as u32,
+        rend_h: fc.rh as u32,
+        reset: fc.reset as i32,
+        frame_time_ms: 0.0, // unset — the helper defaults it
+    };
+    feat.evaluate(nx, &d)
 }
 
 /// Register a texture the tonemap can present FROM: its SRV goes into the
@@ -749,121 +729,75 @@ fn wire_tonemap_src(
 
 impl GpuContext {
     pub fn new(hwnd: HWND, w: u32, h: u32, opts: &GpuOptions) -> Result<Self> {
-        // Chain level 1 (DLSS-RR). Streamline must initialize before any
-        // DXGI factory exists — which is why DLSS is structurally the top of
-        // the chain: it decides the SL-proxy-vs-native device split before
-        // anything else can be probed.
-        // --fg in a DLSS session = DLSS-G. When the raw-NGX shim is built in
-        // (the quinlight-player blueprint — see `ngxfg`), that path owns
-        // frame generation and the Streamline DLSS-G feature is NOT
-        // requested (SL's dlfg present layer is the declines-to-insert open
-        // issue the NGX path exists to bypass); Reflex/PCL likewise stay
-        // unloaded. Without the SDK, the SL attempt remains (with its hard
-        // Reflex prerequisite) — features cannot be loaded after slInit —
-        // but only under an EXPLICIT --fg: fg is on by default now, and the
-        // defaulted arm must not swap the scRGB swapchain for a present
-        // layer that has never been seen inserting (`fg_explicit`).
-        let fg_sl = opts.fg && opts.fg_explicit && !opts.quin && !ngxfg::BUILT;
-        let sl_features: &[u32] = if fg_sl {
-            &[
-                streamline_sys::FEATURE_DLSS_RR,
-                streamline_sys::FEATURE_DLSS_G,
-                streamline_sys::FEATURE_REFLEX,
-            ]
+        let factory =
+            adapter::create_factory(opts.debug).map_err(|e| format!("CreateDXGIFactory2: {e}"))?;
+        let prefer = opts.prefer.unwrap_or(adapter::Prefer::Nvidia);
+        let pick = adapter::pick(&factory, prefer)?;
+        eprintln!("gpu: using adapter \"{}\"", pick.name);
+        let device = d3d12::create_device(&pick.adapter, opts.debug)?;
+
+        // Chain level 1 (DLSS-RR), via raw NGX. DLSS is the top of the chain
+        // by POLICY only now — the retired Streamline interposer's
+        // init-before-any-DXGI-factory constraint died with it, so the probe
+        // runs on the ordinary device like every native level's. Both DLSS
+        // features (RR + frame generation) ride one build gate: without the
+        // DLSS SDK there is NO DLSS at all and the chain falls through.
+        let mut ngxrr = if !opts.chain.dlss {
+            None
+        } else if pick.vendor != adapter::Vendor::Nvidia {
+            eprintln!("dlss: level unavailable (no NVIDIA adapter) — falling through the chain");
+            None
+        } else if !ngxrr::BUILT {
+            eprintln!(
+                "dlss: built without the DLSS SDK — set FRUSTRACER_DLSS_SDK and rebuild \
+                 (chain falls to FSR4/XeSS/FSR3)"
+            );
+            None
         } else {
-            &[streamline_sys::FEATURE_DLSS_RR]
-        };
-        let mut sl = if opts.chain.dlss {
-            match streamline::SlContext::init(&opts.sl_dir, sl_features, opts.debug) {
-                Ok(s) => {
-                    eprintln!("dlss: Streamline initialized ({})", opts.sl_dir);
-                    Some(s)
+            match ngxrr::NgxRr::open(&device) {
+                Ok(nx) => {
+                    eprintln!("dlss: raw-NGX Ray Reconstruction available");
+                    Some(nx)
                 }
                 Err(e) => {
                     eprintln!("dlss: level unavailable ({e}) — falling through the chain");
                     None
                 }
             }
-        } else {
-            None
         };
-
-        let factory =
-            adapter::create_factory(opts.debug).map_err(|e| format!("CreateDXGIFactory2: {e}"))?;
-        let prefer = opts.prefer.unwrap_or(adapter::Prefer::Nvidia);
-        let pick = adapter::pick(&factory, prefer)?;
-        eprintln!("gpu: using adapter \"{}\"", pick.name);
-        if sl.is_some() && pick.vendor != adapter::Vendor::Nvidia {
-            eprintln!("dlss: level unavailable (no NVIDIA adapter) — falling through the chain");
-            sl = None;
-        }
-        if let Some(s) = &sl {
-            if let Err(e) = s.is_feature_supported(streamline_sys::FEATURE_DLSS_RR, pick.luid) {
-                eprintln!("dlss: level unavailable (Ray Reconstruction unsupported: {e}) — falling through the chain");
-                sl = None;
-            }
-        }
-
-        let device = d3d12::create_device(&pick.adapter, opts.debug)?;
         // Resolve the native upscaler chain before choosing a frame-generation
         // swapchain. In particular, XeSS-FG must not force HDR10/SDR merely
         // because XeSS was requested: the XeSS level itself has to initialize
         // and win the chain first. Descriptor wiring waits until the
         // format-dependent tonemap/bloom heaps exist below.
         let (xess_state, fsr_state, fsr3_state) =
-            Self::probe_native(&device, opts, w, h, sl.is_some());
+            Self::probe_native(&device, opts, w, h, ngxrr.is_some());
 
-        // Frame generation, DLSS family (DLSS-G through the SL proxy
-        // swapchain the session already presents on). Probed here — before
-        // the swapchain exists — because DLSS-G's one hard swapchain
-        // constraint must shape the format choice below: it rejects the
-        // scRGB fp16 swapchain outright (guide §11, runtime
-        // eFailHDRFormatNotSupported), so a G session presents SDR 8-bit.
-        // G's absence never affects RR.
-        let mut fg_dlssg = false;
-        if fg_sl {
-            if let Some(s) = &sl {
-                match s.is_feature_supported(streamline_sys::FEATURE_DLSS_G, pick.luid) {
-                    Ok(()) => fg_dlssg = true,
-                    Err(e) => eprintln!(
-                        "fg: DLSS-G unavailable ({e}) — frame generation off (RR unaffected)"
-                    ),
-                }
-            }
-        } else if opts.fg && !opts.quin && !ngxfg::BUILT && sl.is_some() {
-            // Defaulted fg in a DLSS session on a non-SDK build: the SL
-            // DLSS-G fallback is deliberately not armed (see fg_sl above) —
-            // say so once instead of silently presenting without generation.
-            eprintln!(
-                "fg: on by default, but the Streamline DLSS-G fallback is explicit-only \
-                 (declines-to-insert open issue; it would also cost the scRGB swapchain) — \
-                 pass --fg to arm it, or build with the DLSS SDK for the raw-NGX path"
-            );
-        }
         // Frame generation, Intel family (the XeSS-FG swapchain, XeLL
         // linked): taken when the chain is headed for the XeSS level on an
         // Intel adapter — the family follows the upscaler. The wrap happens
         // inside D3d::with_queue like the ffx one; a failed wrap/init is a
         // loud line + a normal session.
         let try_xefg = opts.fg
-            && sl.is_none()
+            && ngxrr.is_none()
             && !opts.quin
             && pick.vendor == adapter::Vendor::Intel
             && xess_state.is_some();
 
-        // Both DLSS-G and XeSS-FG reject the scRGB fp16 swapchain (DLSS-G by
-        // documented policy, XeSS-FG measured: InitFromSwapChain returns
-        // INVALID_ARGUMENT on R16G16B16A16_FLOAT) — but 10-bit PQ is the
-        // format HDR FG titles actually ship, so on an HDR-on display those
-        // sessions take the HDR10 arm instead of dropping to SDR 8-bit (the
-        // probe needs only adapter+hwnd, so it can run before the swapchain
-        // exists). The ffx family supports scRGB and keeps it. `--hdr10`
-        // forces the PQ arm in any session (the A/B lever; override-wins,
-        // including over an "HDR off" probe verdict — the --hdr-peak
-        // doctrine). If the wrap still rejects the 10-bit chain,
-        // D3d::with_queue rebuilds at SDR and wraps again — FG is why the
-        // session exists, so SDR with FG beats HDR10 without it.
-        let fg_wrapper = fg_dlssg || try_xefg;
+        // XeSS-FG rejects the scRGB fp16 swapchain (measured:
+        // InitFromSwapChain returns INVALID_ARGUMENT on R16G16B16A16_FLOAT)
+        // — but 10-bit PQ is the format HDR FG titles actually ship, so on
+        // an HDR-on display those sessions take the HDR10 arm instead of
+        // dropping to SDR 8-bit (the probe needs only adapter+hwnd, so it
+        // can run before the swapchain exists). The ffx family supports
+        // scRGB and keeps it; raw-NGX DLSS-G has no swapchain hook at all
+        // and polices nothing. `--hdr10` forces the PQ arm in any session
+        // (the A/B lever; override-wins, including over an "HDR off" probe
+        // verdict — the --hdr-peak doctrine). If the wrap still rejects the
+        // 10-bit chain, D3d::with_queue rebuilds at SDR and wraps again —
+        // FG is why the session exists, so SDR with FG beats HDR10 without
+        // it.
+        let fg_wrapper = try_xefg;
         // PQ IS THE DEFAULT ON AN HDR-ON DISPLAY (2026-07-26). 10-bit
         // R10G10B10A2 is HALF the bytes of scRGB fp16 per present, and the
         // present is the whole frame budget whenever the display hangs off a
@@ -910,32 +844,15 @@ impl GpuContext {
             );
         }
         if fg_wrapper && opts.hdr {
-            let family = if fg_dlssg { "DLSS-G" } else { "XeSS-FG" };
             match want {
                 d3d12::PresentSpace::Hdr10 => eprintln!(
-                    "fg: {family} rejects the scRGB fp16 swapchain — requesting HDR10/PQ \
+                    "fg: XeSS-FG rejects the scRGB fp16 swapchain — requesting HDR10/PQ \
                      (R10G10B10A2, G2084; --no-fg restores scRGB)"
                 ),
                 _ => eprintln!(
-                    "fg: {family} rejects the scRGB fp16 swapchain and the display reports \
+                    "fg: XeSS-FG rejects the scRGB fp16 swapchain and the display reports \
                      HDR off — requesting SDR 8-bit (--no-fg restores scRGB; --hdr10 forces PQ)"
                 ),
-            }
-        }
-        if fg_dlssg {
-            // Hardware-accelerated GPU scheduling is a hard DLSS-G
-            // requirement the support probe does NOT surface. Ask the DRIVER
-            // (D3DKMT — the query the Settings page reads); a registry
-            // heuristic misreads Windows 11's default-on-with-absent-key
-            // common case, which shipped here once.
-            match adapter::hags_enabled(pick.luid) {
-                Some(true) => eprintln!("fg: hardware-accelerated GPU scheduling on (driver-confirmed)"),
-                Some(false) => eprintln!(
-                    "fg: hardware-accelerated GPU scheduling is OFF — DLSS-G will validate but \
-                     DROP every generated frame. Enable it (Settings > System > Display > \
-                     Graphics > Default graphics settings) and reboot."
-                ),
-                None => eprintln!("fg: hardware-accelerated GPU scheduling state unknown (query failed)"),
             }
         }
 
@@ -947,7 +864,7 @@ impl GpuContext {
         // version actually enumerates; every failure is a loud line + a
         // normal session (the chain-fallback shape).
         let mut fg_versions: Vec<ffx::Version> = Vec::new();
-        if opts.fg && sl.is_none() && !opts.quin && !try_xefg {
+        if opts.fg && ngxrr.is_none() && !opts.quin && !try_xefg {
             match ffx::fg_load(&opts.ffx_dir, &opts.fg_dir) {
                 Ok(()) => match ffx::fg_versions(&device) {
                     Ok(v) if !v.is_empty() => {
@@ -965,43 +882,20 @@ impl GpuContext {
             }
         }
 
-        // Manual-hooking proxy plumbing: queue from the proxy DEVICE,
-        // swapchain from the proxy FACTORY — both required so present and
-        // queue submissions are visible to SL (presentCommon fires every
-        // frame from day one; DLSS-G later needs exactly these hooks).
-        let mut proxy_device: Option<ID3D12Device> = None;
-        let mut proxy_factory: Option<IDXGIFactory6> = None;
         // RefCells, not `let mut`: the wrap AND unwind closures of one FgHook
         // both need to write the context slot, and two &mut captures of one
         // local can't coexist. `into_inner` right after the d3d block.
         let fg_sc: std::cell::RefCell<Option<ffx::FgSwapchain>> = std::cell::RefCell::new(None);
         let fg_xefg: std::cell::RefCell<Option<crate::xess_fg::XefgSwapchain>> =
             std::cell::RefCell::new(None);
-        let d3d = if let Some(s) = &sl {
-            s.set_d3d_device(&device)?;
-            let pdev: ID3D12Device = s.upgrade(&device)?;
-            let queue = d3d12::create_queue(&pdev)?;
-            let pfac: IDXGIFactory6 = s.upgrade(&factory)?;
-            // Pair-present arms only in raw-NGX FG sessions — extra
-            // backbuffers so a buffer never comes back around while still
-            // queued for scanout (see d3d12::PAIR_BACKBUFFERS).
-            let pair = opts.fg && !opts.quin && ngxfg::BUILT;
-            let d3d = D3d::with_queue(&pfac, device, queue, hwnd, w, h, opts.vsync, want, None, pair)?;
-            // The swapchain we hold MUST be the SL proxy — every present has
-            // to route through presentCommon under manual hooking. A proxy
-            // resolves to a distinct native interface; verify loudly.
-            match s.native_of_raw(d3d.swapchain.as_raw()) {
-                Ok(native) if native != d3d.swapchain.as_raw() => {
-                    eprintln!("dlss: swapchain is SL-proxied (present hooked)");
-                    // native_of_raw hands back a borrowed pointer; no release needed
-                }
-                Ok(_) => eprintln!("dlss: WARNING — swapchain proxy check inconclusive (same pointer)"),
-                Err(e) => eprintln!("dlss: WARNING — swapchain is NOT an SL proxy ({e}); Frame Gen and RR may misbehave"),
-            }
-            proxy_device = Some(pdev);
-            proxy_factory = Some(pfac);
-            d3d
-        } else {
+        // Pair-present arms only in raw-NGX FG sessions — extra backbuffers
+        // so a buffer never comes back around while still queued for scanout
+        // (see d3d12::PAIR_BACKBUFFERS). Only the plain arm below can carry
+        // it: an NGX-FG session is a DLSS session, and a DLSS session never
+        // takes a swapchain wrapper (try_xefg and the ffx enumeration both
+        // require ngxrr.is_none()).
+        let pair = opts.fg && !opts.quin && ngxfg::BUILT && ngxrr.is_some();
+        let d3d = {
             let queue = d3d12::create_queue(&device)?;
             if try_xefg {
                 // The XeFG wrap needs the DEVICE at hook time (context
@@ -1050,7 +944,7 @@ impl GpuContext {
                     false,
                 )?
             } else if fg_versions.is_empty() {
-                D3d::with_queue(&factory, device, queue, hwnd, w, h, opts.vsync, want, None, false)?
+                D3d::with_queue(&factory, device, queue, hwnd, w, h, opts.vsync, want, None, pair)?
             } else {
                 let mut wrap = |q: &ID3D12CommandQueue,
                                 sc: windows::Win32::Graphics::Dxgi::IDXGISwapChain3|
@@ -1127,7 +1021,7 @@ impl GpuContext {
             None => crate::tone::ToneParams::SDR,
         };
 
-        let (rr_opt, rr_min, rr_max) = Self::query_rr_res(sl.as_ref(), w, h);
+        let (rr_opt, rr_min, rr_max) = Self::query_rr_res(ngxrr.as_ref(), w, h);
 
         let passes = tonemap::Passes::new(&d3d.device, d3d.format)?;
         let bloom = bloom::BloomGpu::new(&d3d.device, w as u32, h as u32)?;
@@ -1158,20 +1052,40 @@ impl GpuContext {
         // reads it — so a plain create_srv inside HudGpu::new, never
         // wire_tonemap_src.
         let hud = hud::HudGpu::new(&d3d.device, &passes, d3d.format, w, h)?;
-        let rr_res = if sl.is_some() {
-            let r = rr::RrResources::new(&d3d.device, rr_opt, rr_min, rr_max, w, h)?;
-            wire_tonemap_src(
-                &d3d.device,
-                &passes,
-                &bloom,
-                &r.output,
-                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
-                tonemap::SRV_SLOT_RR,
-            );
-            Some(r)
+        // The DLSSD feature is created EAGERLY here (the SL path created
+        // lazily at first evaluate) — a create failure surfaces at session
+        // start, the better place; the transient-queue warm-up is a one-time
+        // ~100 ms. Allocation dims = the DRS range max; DLAA when the
+        // optimal-settings query degenerated (opt == min == max == output).
+        let mut rr_feature: Option<ngxrr::RrFeature> = None;
+        let rr_res = if let Some(nx) = &ngxrr {
+            let dlaa = rr_opt == (w, h) && rr_min == rr_opt && rr_max == rr_opt;
+            match nx.create_feature(rr_max, (w, h), dlaa) {
+                Ok(f) => {
+                    rr_feature = Some(f);
+                    let r = rr::RrResources::new(&d3d.device, rr_opt, rr_min, rr_max, w, h)?;
+                    wire_tonemap_src(
+                        &d3d.device,
+                        &passes,
+                        &bloom,
+                        &r.output,
+                        windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+                        tonemap::SRV_SLOT_RR,
+                    );
+                    Some(r)
+                }
+                Err(e) => {
+                    eprintln!("dlss: {e} — level dropped (plain presentation unless a native level wired)");
+                    None
+                }
+            }
         } else {
             None
         };
+        if rr_res.is_none() {
+            // A dead feature must not leave dlss_ready() half-true anywhere.
+            ngxrr = None;
+        }
         // The blit arm takes the blit PSO, which `fullscreen_to_backbuffer`
         // never blooms (its source is an already-encoded, CPU-tonemapped image —
         // the CPU applied glare in `render::resolve`). So it gets a plain
@@ -1189,7 +1103,7 @@ impl GpuContext {
         // Raw-NGX DLSS-G (preferred when built): the interpolated-frame
         // target + lazy-created feature. scRGB fp16 is fine on this path —
         // there is no swapchain policing because there is no swapchain hook.
-        let fg_n = if opts.fg && !opts.quin && ngxfg::BUILT && sl.is_some() && rr_res.is_some() {
+        let fg_n = if opts.fg && !opts.quin && ngxfg::BUILT && rr_res.is_some() {
             match d3d12::committed_tex(
                 &d3d.device,
                 w,
@@ -1418,58 +1332,6 @@ impl GpuContext {
             None
         };
 
-        // DLSS-G, part 2 (the Streamline attempt — reachable only when the
-        // raw-NGX shim is NOT built in): Reflex must be configured at least
-        // once BEFORE the first frame with G on (the runtime enforces its
-        // presence: eFailReflexNotDetectedAtRuntime). Low-latency mode — the
-        // whole point of pairing Reflex with generation is clawing the
-        // latency back. Mode eOn itself is set lazily by the first RR frame's
-        // dlssg_frame_begin (options take effect at the next Present, and
-        // that keeps the enable on the present thread by construction).
-        let fg_g = if fg_dlssg && rr_res.is_some() {
-            let s = sl.as_ref().unwrap();
-            match s.reflex_set_options(streamline_sys::REFLEX_MODE_LOW_LATENCY) {
-                Ok(()) => {
-                    // Enable BEFORE the first present: a mode toggle after
-                    // presents have begun restructures the live swapchain
-                    // into the degraded off-screen-copy path (§18 is why the
-                    // guide wants a swapchain recreate on toggles) — armed
-                    // from frame 0, the FG buffer topology is native.
-                    let o = streamline_sys::SlShimDlssgOptions {
-                        mode: streamline_sys::DLSSG_MODE_ON,
-                        num_frames_to_generate: 1,
-                        flags: 0,
-                    };
-                    let on = match s.dlssg_set_options(0, &o) {
-                        Ok(()) => true,
-                        Err(e) => {
-                            eprintln!("fg: DLSS-G init enable failed ({e}) — will retry on the first frame");
-                            false
-                        }
-                    };
-                    eprintln!(
-                        "fg: DLSS-G live — Reflex low-latency armed, 1 generated frame per \
-                         rendered frame"
-                    );
-                    Some(DlssgState {
-                        enabled: true,
-                        on: std::cell::Cell::new(on),
-                        prepared: std::cell::Cell::new(false),
-                        failed: std::cell::Cell::new(false),
-                        poll: std::cell::Cell::new(0),
-                        logged: std::cell::Cell::new(false),
-                        mult: std::cell::Cell::new(0),
-                    })
-                }
-                Err(e) => {
-                    eprintln!("fg: Reflex init failed ({e}) — DLSS-G off (it requires Reflex)");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
         // Frame generation, part 2: the display-size FG effect context. The
         // provider pick keys on the session's resolved upscaler family (an
         // FSR4-RR session prefers the 4.x ML frame generation; everything
@@ -1576,9 +1438,8 @@ impl GpuContext {
         });
 
         Ok(Self {
-            sl,
-            _proxy_device: proxy_device,
-            _proxy_factory: proxy_factory,
+            ngxrr,
+            rr_feature,
             d3d,
             passes,
             bloom,
@@ -1598,7 +1459,6 @@ impl GpuContext {
             nppd_gpu: None,
             nppd_state_valid: false,
             fg: fg_state,
-            fg_g,
             fg_x,
             fg_n,
             adapter_name: pick.name,
@@ -1638,11 +1498,11 @@ impl GpuContext {
         opts: &GpuOptions,
         w: u32,
         h: u32,
-        sl_live: bool,
+        dlss_live: bool,
     ) -> (Option<XessState>, Option<FsrState>, Option<FsrState>) {
         let (mut xess, mut fsr, mut fsr3) = (None, None, None);
         let all = opts.quin;
-        if sl_live && !all {
+        if dlss_live && !all {
             return (xess, fsr, fsr3);
         }
         if opts.chain.fsr4 {
@@ -1692,7 +1552,7 @@ impl GpuContext {
                 Err(e) => eprintln!("fsr3: level unavailable ({e})"),
             }
         }
-        if !sl_live
+        if !dlss_live
             && fsr.is_none()
             && xess.is_none()
             && opts.chain != crate::upchain::UpChain::NONE
@@ -1740,58 +1600,35 @@ impl GpuContext {
 
     /// Query DLSS-RR's optimal Quality-mode render resolution and its
     /// dynamic range for an output size — the CPU renders inside [min, max]
-    /// and RR upscales + denoises to the window size (step-wise DRS via
-    /// sl::Extent tags). A failed or degenerate query falls back to DLAA
-    /// (opt == min == max == output), which main.rs reads as "DRS off,
-    /// fixed res". Re-callable — a window resize re-queries at the new
-    /// output size.
+    /// and RR upscales + denoises to the window size (step-wise DRS via the
+    /// per-evaluate InRenderSubrectDimensions). A failed or degenerate query
+    /// falls back to DLAA (opt == min == max == output), which main.rs reads
+    /// as "DRS off, fixed res". Re-callable — a window resize re-queries at
+    /// the new output size.
     #[allow(clippy::type_complexity)]
     fn query_rr_res(
-        sl: Option<&streamline::SlContext>,
+        ngxrr: Option<&ngxrr::NgxRr>,
         w: u32,
         h: u32,
     ) -> ((u32, u32), (u32, u32), (u32, u32)) {
-        let Some(s) = sl else {
+        let Some(nx) = ngxrr else {
             return ((w, h), (w, h), (w, h));
         };
-        let opt = streamline::SlShimDlssdOptions {
-            mode: streamline_sys::DLSS_MODE_MAX_QUALITY,
-            output_width: w,
-            output_height: h,
-            preset: streamline_sys::DLSSD_PRESET_E,
-            normal_roughness_packed: 1,
-            use_camera_matrices: 0,
-            world_to_view: [0.0; 16],
-            view_to_world: [0.0; 16],
-        };
-        match s.dlssd_optimal_settings(&opt) {
-            Ok(o) if o.render_width > 0 && o.render_height > 0 => {
+        match nx.optimal(w, h) {
+            Ok((opt, min, max)) if opt.0 > 0 && opt.1 > 0 => {
                 eprintln!(
                     "dlss: RR Quality {}x{} -> render {}x{} (range {}x{}..{}x{})",
-                    w, h, o.render_width, o.render_height,
-                    o.render_width_min, o.render_height_min,
-                    o.render_width_max, o.render_height_max,
+                    w, h, opt.0, opt.1, min.0, min.1, max.0, max.1,
                 );
                 // Malformed halves of the range collapse to the optimal
                 // size — never invent a range the driver didn't report.
-                let po = (o.render_width, o.render_height);
-                let pmin = if o.render_width_min > 0
-                    && o.render_height_min > 0
-                    && o.render_width_min <= o.render_width
-                    && o.render_height_min <= o.render_height
-                {
-                    (o.render_width_min, o.render_height_min)
+                let pmin = if min.0 > 0 && min.1 > 0 && min.0 <= opt.0 && min.1 <= opt.1 {
+                    min
                 } else {
-                    po
+                    opt
                 };
-                let pmax = if o.render_width_max >= o.render_width
-                    && o.render_height_max >= o.render_height
-                {
-                    (o.render_width_max, o.render_height_max)
-                } else {
-                    po
-                };
-                (po, pmin, pmax)
+                let pmax = if max.0 >= opt.0 && max.1 >= opt.1 { max } else { opt };
+                (opt, pmin, pmax)
             }
             Ok(_) => {
                 eprintln!("dlss: optimal-settings degenerate — falling back to DLAA at native res");
@@ -1971,8 +1808,8 @@ impl GpuContext {
             windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
             tonemap::SRV_SLOT_HDR,
         );
-        if self.sl.is_some() {
-            let (opt, min, max) = Self::query_rr_res(self.sl.as_ref(), w, h);
+        if self.ngxrr.is_some() {
+            let (opt, min, max) = Self::query_rr_res(self.ngxrr.as_ref(), w, h);
             let r = rr::RrResources::new(&self.d3d.device, opt, min, max, w, h)?;
             wire_tonemap_src(
                 &self.d3d.device,
@@ -1983,6 +1820,27 @@ impl GpuContext {
                 tonemap::SRV_SLOT_RR,
             );
             self.rr = Some(r);
+            // The DLSSD feature follows: ReleaseFeature + CreateFeature at
+            // the new dims (the queue was drained at the top of this
+            // function — the recreate contract). BOTH dim pairs move: a
+            // window resize changes render and target together, and the
+            // old-target x new-render rebuild is the measured
+            // FAIL_InvalidParameter class. A failed recreate sheds RR loud —
+            // dlss_ready() must not stay half-true on a dead feature.
+            let nx = self.ngxrr.as_ref().unwrap();
+            let dlaa = opt == (w, h) && min == opt && max == opt;
+            let ok = match &mut self.rr_feature {
+                Some(f) => f.recreate(nx, max, (w, h), dlaa),
+                None => nx.create_feature(max, (w, h), dlaa).map(|f| {
+                    self.rr_feature = Some(f);
+                }),
+            };
+            if let Err(e) = ok {
+                eprintln!("dlss: {e} after resize — RR dropped for this session");
+                self.rr_feature = None;
+                self.rr = None;
+                self.ngxrr = None;
+            }
         }
         match wired {
             // --quinlight: the session's engines ARE "what was wired", so the
@@ -1993,7 +1851,7 @@ impl GpuContext {
             // which a resize already forces.
             WiredUpscaler::Quin => {
                 let (x, f, f3) =
-                    Self::probe_native(&self.d3d.device, opts, w, h, self.sl.is_some());
+                    Self::probe_native(&self.d3d.device, opts, w, h, self.ngxrr.is_some());
                 Self::wire_native_outputs(
                     &self.d3d.device,
                     &self.passes,
@@ -2235,7 +2093,7 @@ impl GpuContext {
         // a quinlight session.
         if self.quin_engines().0.len() > 1 {
             if let Some(rr) = &self.rr {
-                if self.sl.is_some() {
+                if self.ngxrr.is_some() {
                     Self::wire_rr_feed(rr, rw, rh, &mut wire)?;
                 }
             }
@@ -2705,10 +2563,10 @@ impl GpuContext {
         frame_idx: u32,
     ) -> Result<()> {
         crate::zone!("present-dxr-rr");
-        if self.dxr.is_none() || self.sl.is_none() || self.rr.is_none() {
+        let _ = frame_idx; // was the SL frame token's index; the raw evaluate needs none
+        if self.dxr.is_none() || self.ngxrr.is_none() || self.rr.is_none() {
             return Err("DXR pipeline + DLSS-RR not both initialized".into());
         }
-        self.dlssg_frame_begin(frame_idx);
         let slot = self.d3d.begin_frame()?;
         {
             let d3d = &mut self.d3d;
@@ -2732,24 +2590,13 @@ impl GpuContext {
                 return Err(e);
             }
         }
-        // FR_DLSSG_NO_RR=1: the RR+G ISOLATION EXPERIMENT. DLSS-G's full
-        // contract stays — token, constants, options, tags (type-0 depth
-        // included), markers, mode — but the RR EVALUATE is removed from the
-        // frame and the DXR pipeline's own resolve presents instead. If G
-        // inserts here and not in the normal arm, the RR coexistence is the
-        // blocker; if it still declines, RR is exonerated. Diagnostic lever,
-        // not a mode: the image loses RR's denoise while it is set.
-        static ISOLATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let isolate = *ISOLATE.get_or_init(|| {
-            let on = std::env::var("FR_DLSSG_NO_RR").is_ok();
-            if on {
-                eprintln!("fg: FR_DLSSG_NO_RR — RR evaluate SKIPPED (DLSS-G isolation experiment)");
-            }
-            on
-        });
         {
             let d3d = &mut self.d3d;
-            let sl = self.sl.as_ref().unwrap();
+            let nx = self.ngxrr.as_ref().unwrap();
+            let Some(feat) = self.rr_feature.as_ref() else {
+                d3d.abort_frame();
+                return Err("DLSSD feature not created".into());
+            };
             let rr = self.rr.as_ref().unwrap();
             unsafe {
                 d3d.list.ResourceBarrier(&[transition(
@@ -2758,18 +2605,7 @@ impl GpuContext {
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 )]);
             }
-            let dlssg = self.fg_g.as_ref().is_some_and(|g| g.enabled && !g.failed.get());
-            let r = if isolate {
-                let list_raw = d3d.list.as_raw();
-                sl.new_frame_token(frame_idx).and_then(|token| {
-                    sl.set_constants(token, 0, &shim_constants(fc))?;
-                    sl.dlssd_set_options(0, &shim_options(fc, rr.ow, rr.oh))?;
-                    sl.tag_resources(token, 0, &rr.tags(fc.rw, fc.rh, dlssg), list_raw)
-                })
-            } else {
-                rr_sl_sequence(sl, rr, &d3d.list, fc, frame_idx, dlssg)
-            };
-            if let Err(e) = r {
+            if let Err(e) = rr_ngx_sequence(nx, feat, rr, &d3d.list, fc) {
                 d3d.abort_frame();
                 return Err(e);
             }
@@ -2781,22 +2617,12 @@ impl GpuContext {
                 )]);
             }
         }
-        if isolate {
-            let d = self.dxr.as_ref().unwrap();
-            d.record_resolve(&self.d3d.list, slot, 1);
-            self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_DXR, 1.0);
-            return self.dlssg_end_frame(slot, frame_idx);
-        }
-        // Raw-NGX frame generation owns the tail when armed (pair-present);
-        // the SL-G marker bracket below is its fallback sibling.
+        // Raw-NGX frame generation owns the tail when armed (pair-present).
         if self.fg_n.is_some() {
             return self.ngxfg_tail(slot, fc, &p.fireflies, &p.clouds);
         }
-        // The tonemap pass re-binds root sig/PSO/heaps/viewport from
-        // scratch — the post-evaluate state restore
-        // eDisableCLStateTracking makes the host's responsibility.
         self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_RR, 1.0);
-        self.dlssg_end_frame(slot, frame_idx)
+        self.d3d.end_frame(slot)
     }
 
     /// XeSS-SR fed by the DXR pipeline (`--dxr --xess`): DispatchRays ->
@@ -2900,7 +2726,7 @@ impl GpuContext {
         if self.dxr.is_none() || self.fsr.is_none() {
             return Err("DXR pipeline + FSR not both initialized".into());
         }
-        debug_assert!(self.sl.is_none());
+        debug_assert!(self.ngxrr.is_none());
         let slot = self.d3d.begin_frame()?;
         {
             let d3d = &mut self.d3d;
@@ -3082,8 +2908,10 @@ impl GpuContext {
         frame_ms: f32,
         sky_sh: &crate::sh::Sh9,
     ) -> Result<()> {
-        // DLSS-RR (engine 0 when Streamline is live).
-        if let (Some(sl), Some(rr)) = (self.sl.as_ref(), self.rr.as_ref()) {
+        // DLSS-RR (engine 0 when the raw-NGX session is live).
+        if let (Some(nx), Some(feat), Some(rr)) =
+            (self.ngxrr.as_ref(), self.rr_feature.as_ref(), self.rr.as_ref())
+        {
             let d3d = &self.d3d;
             unsafe {
                 d3d.list.ResourceBarrier(&[transition(
@@ -3092,7 +2920,7 @@ impl GpuContext {
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 )]);
             }
-            rr_sl_sequence(sl, rr, &d3d.list, fc, frame_idx, self.fg_g.as_ref().is_some_and(|g| g.enabled && !g.failed.get()))?;
+            rr_ngx_sequence(nx, feat, rr, &d3d.list, fc)?;
             unsafe {
                 d3d.list.ResourceBarrier(&[transition(
                     &rr.output,
@@ -3234,7 +3062,7 @@ impl GpuContext {
         if self.trace.is_none() || self.fsr.is_none() {
             return Err("GPU tracer + FSR not both initialized".into());
         }
-        debug_assert!(self.sl.is_none());
+        debug_assert!(self.ngxrr.is_none());
         let slot = self.d3d.begin_frame()?;
         {
             let d3d = &mut self.d3d;
@@ -3399,9 +3227,10 @@ impl GpuContext {
         ))
     }
 
-    /// Streamline live => RR evaluate is available (M4).
+    /// Raw-NGX RR session + feature + planes live => the evaluate is
+    /// available (M4).
     pub fn dlss_ready(&self) -> bool {
-        self.sl.is_some() && self.rr.is_some()
+        self.ngxrr.is_some() && self.rr_feature.is_some() && self.rr.is_some()
     }
 
     /// Which chain level this session wired — derived from the live state
@@ -3438,7 +3267,7 @@ impl GpuContext {
         let mut res: Vec<&ID3D12Resource> = Vec::new();
         let mut names: Vec<&'static str> = Vec::new();
         if let Some(r) = &self.rr {
-            if self.sl.is_some() {
+            if self.ngxrr.is_some() {
                 res.push(&r.output);
                 names.push("dlss-rr");
             }
@@ -3598,7 +3427,7 @@ impl GpuContext {
     /// None = no engine wired.
     pub fn quin_res_range(&self) -> Option<((u32, u32), (u32, u32), (u32, u32))> {
         let mut it = [
-            self.rr.as_ref().filter(|_| self.sl.is_some()).map(|r| (r.opt, r.min, r.max)),
+            self.rr.as_ref().filter(|_| self.ngxrr.is_some()).map(|r| (r.opt, r.min, r.max)),
             self.fsr.as_ref().map(|f| (f.opt, f.min, f.max)),
             self.fsr3.as_ref().map(|f| (f.opt, f.min, f.max)),
             self.xess.as_ref().map(|x| (x.opt, x.min, x.max)),
@@ -3833,7 +3662,7 @@ impl GpuContext {
         if self.trace.is_none() || self.fsr.is_none() {
             return Err("GPU tracer + FSR not both initialized".into());
         }
-        debug_assert!(self.sl.is_none());
+        debug_assert!(self.ngxrr.is_none());
         let slot = self.d3d.begin_frame()?;
         {
             let d3d = &mut self.d3d;
@@ -3886,7 +3715,7 @@ impl GpuContext {
         if self.dxr.is_none() || self.fsr.is_none() {
             return Err("DXR pipeline + FSR not both initialized".into());
         }
-        debug_assert!(self.sl.is_none());
+        debug_assert!(self.ngxrr.is_none());
         let slot = self.d3d.begin_frame()?;
         {
             let d3d = &mut self.d3d;
@@ -4321,8 +4150,10 @@ impl GpuContext {
         cl: &crate::clouds::Clouds,
     ) -> Result<()> {
         crate::zone!("present-rr");
-        self.dlssg_frame_begin(frame_idx);
-        let (Some(sl), Some(rr)) = (&self.sl, &self.rr) else {
+        let _ = frame_idx; // was the SL frame token's index; the raw evaluate needs none
+        let (Some(nx), Some(feat), Some(rr)) =
+            (&self.ngxrr, &self.rr_feature, &self.rr)
+        else {
             return Err("DLSS-RR not initialized".into());
         };
         // Release-build cover for record_upload's dimension debug_asserts:
@@ -4348,7 +4179,7 @@ impl GpuContext {
             )]);
         }
 
-        if let Err(e) = rr_sl_sequence(sl, rr, &self.d3d.list, fc, frame_idx, self.fg_g.as_ref().is_some_and(|g| g.enabled && !g.failed.get())) {
+        if let Err(e) = rr_ngx_sequence(nx, feat, rr, &self.d3d.list, fc) {
             // Abandon the recorded-but-unexecuted frame: nothing reached the
             // GPU, so tracked resource states are unchanged, and closing the
             // list lets the next present's begin_frame Reset it. The caller
@@ -4367,11 +4198,8 @@ impl GpuContext {
         if self.fg_n.is_some() {
             return self.ngxfg_tail(slot, fc, ff, cl);
         }
-        // The tonemap pass re-binds root sig/PSO/heaps/viewport from scratch,
-        // which is exactly the post-evaluate state restore that
-        // eDisableCLStateTracking makes the host's responsibility.
         self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_RR, 1.0);
-        self.dlssg_end_frame(slot, frame_idx)
+        self.d3d.end_frame(slot)
     }
 
     /// DLSS-RR fed by the GPU-resident tracer (`--gpu` default): one command
@@ -4389,10 +4217,10 @@ impl GpuContext {
         frame_idx: u32,
     ) -> Result<()> {
         crate::zone!("present-trace-rr");
-        if self.trace.is_none() || self.sl.is_none() || self.rr.is_none() {
+        let _ = frame_idx; // was the SL frame token's index; the raw evaluate needs none
+        if self.trace.is_none() || self.ngxrr.is_none() || self.rr.is_none() {
             return Err("GPU tracer + DLSS-RR not both initialized".into());
         }
-        self.dlssg_frame_begin(frame_idx);
         let slot = self.d3d.begin_frame()?;
         {
             let d3d = &mut self.d3d;
@@ -4415,7 +4243,11 @@ impl GpuContext {
         }
         {
             let d3d = &mut self.d3d;
-            let sl = self.sl.as_ref().unwrap();
+            let nx = self.ngxrr.as_ref().unwrap();
+            let Some(feat) = self.rr_feature.as_ref() else {
+                d3d.abort_frame();
+                return Err("DLSSD feature not created".into());
+            };
             let rr = self.rr.as_ref().unwrap();
             unsafe {
                 d3d.list.ResourceBarrier(&[transition(
@@ -4424,7 +4256,7 @@ impl GpuContext {
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 )]);
             }
-            if let Err(e) = rr_sl_sequence(sl, rr, &d3d.list, fc, frame_idx, self.fg_g.as_ref().is_some_and(|g| g.enabled && !g.failed.get())) {
+            if let Err(e) = rr_ngx_sequence(nx, feat, rr, &d3d.list, fc) {
                 d3d.abort_frame();
                 return Err(e);
             }
@@ -4439,11 +4271,8 @@ impl GpuContext {
         if self.fg_n.is_some() {
             return self.ngxfg_tail(slot, fc, &p.fireflies, &p.clouds);
         }
-        // The tonemap pass re-binds root sig/PSO/heaps/viewport from scratch —
-        // the post-evaluate state restore eDisableCLStateTracking makes the
-        // host's responsibility.
         self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_RR, 1.0);
-        self.dlssg_end_frame(slot, frame_idx)
+        self.d3d.end_frame(slot)
     }
 
     /// Read back the denoised RR output and tonemap it on the CPU with the
@@ -4644,10 +4473,9 @@ impl GpuContext {
     // ---- frame generation (both families' per-frame protocols) ----
 
     /// True when a frame-generation family is wired: the ffx FI proxy with a
-    /// live FG effect context, DLSS-G in an SL session, or the XeSS-FG proxy.
+    /// live FG effect context, raw-NGX DLSS-G, or the XeSS-FG proxy.
     pub fn fg_wired(&self) -> bool {
         self.fg.as_ref().is_some_and(|f| f.ctx.is_some())
-            || self.fg_g.is_some()
             || self.fg_x.as_ref().is_some_and(|x| !x.failed.get())
             || self.fg_n.as_ref().is_some_and(|n| !n.failed.get())
     }
@@ -4656,7 +4484,6 @@ impl GpuContext {
     /// state, not the per-frame handshake).
     pub fn fg_enabled(&self) -> bool {
         self.fg.as_ref().is_some_and(|f| f.ctx.is_some() && f.enabled)
-            || self.fg_g.as_ref().is_some_and(|g| g.enabled && !g.failed.get())
             || self.fg_x.as_ref().is_some_and(|x| x.enabled && !x.failed.get())
             || self.fg_n.as_ref().is_some_and(|n| n.enabled && !n.failed.get())
     }
@@ -4665,9 +4492,6 @@ impl GpuContext {
     pub fn fg_label(&self) -> Option<&str> {
         if self.fg_n.as_ref().is_some_and(|n| !n.failed.get()) {
             return Some("DLSS-G (NGX)");
-        }
-        if self.fg_g.is_some() {
-            return Some("DLSS-G");
         }
         if self.fg_x.as_ref().is_some_and(|x| !x.failed.get()) {
             return Some("XeSS-FG");
@@ -4680,21 +4504,14 @@ impl GpuContext {
     /// frame loop counts RENDERED frames, so an FG session's displayed fps
     /// under-reports what the monitor receives by this factor. m is measured
     /// wherever the family can be asked — raw NGX pair-presents itself (exact
-    /// by construction), XeSS-FG and SL DLSS-G read their status polls'
-    /// frames-presented (XeSS-FG assumes 2 until the first poll lands; SL
-    /// claims nothing until measured — the declines-to-insert history), ffx
-    /// FI has no query and reports 2 by configuration when live. m == 1 is
-    /// meaningful: armed but not inserting (holds, unprimed reset frames, a
-    /// declined SL session).
+    /// by construction), XeSS-FG reads its status poll's frames-presented
+    /// (assumes 2 until the first poll lands), ffx FI has no query and
+    /// reports 2 by configuration when live. m == 1 is meaningful: armed but
+    /// not inserting (holds, unprimed reset frames).
     pub fn fg_display_mult(&self) -> Option<u32> {
         if let Some(n) = &self.fg_n {
             if n.enabled && !n.failed.get() {
                 return Some(if n.pair.get() { 2 } else { 1 });
-            }
-        }
-        if let Some(g) = &self.fg_g {
-            if g.enabled && !g.failed.get() {
-                return Some(g.mult.get().max(1));
             }
         }
         if let Some(x) = &self.fg_x {
@@ -4725,9 +4542,6 @@ impl GpuContext {
                 n.primed.set(false);
                 n.pair.set(false);
             }
-        }
-        if let Some(g) = &mut self.fg_g {
-            g.enabled = on;
         }
         if let Some(x) = &mut self.fg_x {
             x.enabled = on;
@@ -5358,130 +5172,6 @@ impl GpuContext {
         r
     }
 
-    /// DLSS-G per-frame bracket, first half — the top of an RR arm: Reflex
-    /// sleep, the simulation/render-submit markers, and the lazy mode-eOn
-    /// edge (options take effect at the next Present, and this thread IS the
-    /// present thread). The marker token is fetched by the SAME frame index
-    /// rr_sl_sequence hands slSetConstants — SL keys them together, and
-    /// index drift is the documented "common constants cannot be found for
-    /// frame N" failure.
-    fn dlssg_frame_begin(&self, frame_idx: u32) {
-        let (Some(sl), Some(g)) = (&self.sl, &self.fg_g) else { return };
-        if !g.enabled || g.failed.get() {
-            return;
-        }
-        let Ok(token) = sl.new_frame_token(frame_idx) else { return };
-        // First-frame diagnostics: marker plumbing failures are otherwise
-        // invisible (the calls are fire-and-forget by design), and a silent
-        // marker failure is exactly how "DLSS-G validates but never
-        // generates" presents itself.
-        let dbg = !g.on.get();
-        let chk = |name: &str, r: std::result::Result<(), String>| {
-            if dbg {
-                match r {
-                    Ok(()) => eprintln!("fg: {name} ok"),
-                    Err(e) => eprintln!("fg: {name} FAILED: {e}"),
-                }
-            }
-        };
-        chk("reflex_sleep", sl.reflex_sleep(token));
-        chk("pcl sim-start", sl.pcl_marker(streamline_sys::PCL_SIMULATION_START, token));
-        chk("pcl sim-end", sl.pcl_marker(streamline_sys::PCL_SIMULATION_END, token));
-        chk("pcl rsubmit-start", sl.pcl_marker(streamline_sys::PCL_RENDERSUBMIT_START, token));
-        if !g.on.get() {
-            let o = streamline_sys::SlShimDlssgOptions {
-                mode: streamline_sys::DLSSG_MODE_ON,
-                num_frames_to_generate: 1,
-                flags: 0,
-            };
-            match sl.dlssg_set_options(0, &o) {
-                Ok(()) => g.on.set(true),
-                Err(e) => {
-                    eprintln!("fg: DLSS-G enable failed ({e}) — frame generation off");
-                    g.failed.set(true);
-                    return;
-                }
-            }
-        }
-        g.prepared.set(true);
-    }
-
-    /// Second half — replaces `d3d.end_frame` at the tail of the RR arms:
-    /// render-submit-end + the REQUIRED present markers bracketing the
-    /// Execute+Present, then the periodic status poll. A failing status is
-    /// the sticky-off pink-overlay guard; the first healthy poll logs the
-    /// presented-per-rendered ratio (the headless proof generation is live).
-    fn dlssg_end_frame(&mut self, slot: usize, frame_idx: u32) -> Result<()> {
-        let bracket =
-            self.fg_g.as_ref().is_some_and(|g| g.prepared.replace(false)) && self.sl.is_some();
-        if !bracket {
-            return self.d3d.end_frame(slot);
-        }
-        let token = self.sl.as_ref().unwrap().new_frame_token(frame_idx)?;
-        let dbg = self.fg_g.as_ref().unwrap().poll.get() == 0;
-        let chk = |name: &str, r: std::result::Result<(), String>| {
-            if dbg {
-                match r {
-                    Ok(()) => eprintln!("fg: {name} ok"),
-                    Err(e) => eprintln!("fg: {name} FAILED: {e}"),
-                }
-            }
-        };
-        {
-            let sl = self.sl.as_ref().unwrap();
-            chk("pcl rsubmit-end", sl.pcl_marker(streamline_sys::PCL_RENDERSUBMIT_END, token));
-            chk("pcl present-start", sl.pcl_marker(streamline_sys::PCL_PRESENT_START, token));
-        }
-        let r = self.d3d.end_frame(slot);
-        let sl = self.sl.as_ref().unwrap();
-        chk("pcl present-end", sl.pcl_marker(streamline_sys::PCL_PRESENT_END, token));
-        let g = self.fg_g.as_ref().unwrap();
-        let n = g.poll.get() + 1;
-        g.poll.set(n);
-        if n % 120 == 0 {
-            match sl.dlssg_state(0) {
-                Ok(st) if st.status != 0 => {
-                    eprintln!(
-                        "fg: DLSS-G status 0x{:x} (bits: 1 res too low, 2 no Reflex, 4 HDR \
-                         format, 8 constants, 16 backbuffer-index) — frame generation off",
-                        st.status
-                    );
-                    let o = streamline_sys::SlShimDlssgOptions {
-                        mode: streamline_sys::DLSSG_MODE_OFF,
-                        num_frames_to_generate: 1,
-                        flags: 0,
-                    };
-                    let _ = sl.dlssg_set_options(0, &o);
-                    g.on.set(false);
-                    g.failed.set(true);
-                }
-                // numFramesActuallyPresented reads as the per-present
-                // MULTIPLIER (guide §13 "read the multiplier back"): 2 =
-                // generation landing, 1 = real frames only (the HAGS-off
-                // symptom — measured: status stays eOk while every generated
-                // frame is dropped). Second interval — the first poll has no
-                // baseline.
-                Ok(st) if n >= 240 => {
-                    g.mult.set(st.frames_presented.max(1));
-                    if !g.logged.get() {
-                        g.logged.set(true);
-                        eprintln!(
-                            "fg: DLSS-G present multiplier x{} {}",
-                            st.frames_presented,
-                            if st.frames_presented >= 2 {
-                                "— generated frames presenting"
-                            } else {
-                                "— generated frames NOT landing (see the HAGS note above if printed)"
-                            }
-                        );
-                    }
-                }
-                _ => {}
-            }
-        }
-        r
-    }
-
     /// Stash last frame's wall-clock ms for this loop's prepare (main.rs owns
     /// the clock; pacing quality follows this number).
     pub fn fg_set_frame_ms(&self, ms: f32) {
@@ -5652,25 +5342,9 @@ impl GpuContext {
                 self.fg_disable_now();
             }
         }
-        // DLSS-G's half of the same handshake: READ prepared without
-        // consuming (dlssg_end_frame consumes it after the present markers,
-        // which bracket the Present — AFTER this funnel). An unprepared
-        // present in a G session flips the mode off so the SL pacer never
-        // interpolates a plain or held frame.
-        if let (Some(sl), Some(g)) = (&self.sl, &self.fg_g) {
-            if g.on.get() && !g.prepared.get() {
-                let o = streamline_sys::SlShimDlssgOptions {
-                    mode: streamline_sys::DLSSG_MODE_OFF,
-                    num_frames_to_generate: 1,
-                    flags: 0,
-                };
-                if sl.dlssg_set_options(0, &o).is_ok() {
-                    g.on.set(false);
-                }
-            }
-        }
-        // XeSS-FG's half — same READ-not-consume shape (xefg_end_frame
-        // consumes after the XeLL present markers).
+        // XeSS-FG's half — READ prepared without consuming (xefg_end_frame
+        // consumes after the XeLL present markers, which bracket the Present
+        // — AFTER this funnel).
         if let Some(x) = &self.fg_x {
             if x.on.get() && !x.prepared.get() {
                 x.sc.set_enabled(false);
@@ -5820,6 +5494,7 @@ impl Drop for GpuContext {
             || self.fg.is_some()
             || self.fg_x.is_some()
             || self.fg_n.is_some()
+            || self.rr_feature.is_some()
         {
             let _ = self.d3d.wait_idle();
             self.xess = None;
@@ -5831,6 +5506,12 @@ impl Drop for GpuContext {
                 if !h.is_null() {
                     unsafe { ngxfg::frdlssg_destroy(h) };
                 }
+            }
+            // Raw-NGX DLSS-RR: same discipline — feature released with the
+            // queue drained; the session (ngxrr) drops by field order and
+            // releases its refcounted NGX init.
+            if let Some(f) = self.rr_feature.take() {
+                f.destroy();
             }
             // FG, in three ordered steps.
             //
@@ -5900,74 +5581,25 @@ fn v3(v: glam::Vec3A) -> [f32; 3] {
     [v.x, v.y, v.z]
 }
 
-fn shim_constants(fc: &dlss::FrameConstants) -> streamline::SlShimConstants {
-    streamline::SlShimConstants {
-        view_to_clip: row_major(&fc.view_to_clip),
-        clip_to_view: row_major(&fc.clip_to_view),
-        clip_to_prev_clip: row_major(&fc.clip_to_prev_clip),
-        prev_clip_to_clip: row_major(&fc.prev_clip_to_clip),
-        // fc.jitter is the sample-position offset the renderer used, in
-        // pixels; SL's (undocumented) polarity is the NEGATED offset —
-        // settled empirically 2026-07: this sign gives a rock-stable static
-        // image, the others wobble by 2x the jitter. The flip lives HERE,
-        // nowhere else.
-        jitter: [-fc.jitter.0, -fc.jitter.1],
-        // MV values are pixels; this scale normalizes them for SL.
-        mvec_scale: [1.0 / fc.rw as f32, 1.0 / fc.rh as f32],
-        cam_pos: v3(fc.pos),
-        cam_up: v3(fc.up),
-        cam_right: v3(fc.right),
-        cam_fwd: v3(fc.forward),
-        cam_near: fc.near,
-        cam_far: fc.far,
-        cam_fov: fc.fov_y,
-        cam_aspect: fc.aspect,
-        depth_inverted: 0,
-        camera_motion_included: 1,
-        mvec_3d: 0,
-        reset: fc.reset as i32,
-        ortho: 0,
-        mvec_jittered: 0,
-    }
-}
-
-fn shim_options(fc: &dlss::FrameConstants, ow: u32, oh: u32) -> streamline::SlShimDlssdOptions {
-    streamline::SlShimDlssdOptions {
-        // Render res == output res only when the optimal-settings query fell
-        // back to native; otherwise the frame was traced at the Quality-mode
-        // render size and RR upscales.
-        mode: if (fc.rw as u32, fc.rh as u32) == (ow, oh) {
-            streamline_sys::DLSS_MODE_DLAA
-        } else {
-            streamline_sys::DLSS_MODE_MAX_QUALITY
-        },
-        output_width: ow,
-        output_height: oh,
-        // Preset E = the latest transformer model (sl_dlss_d.h:38); fall
-        // back to DLSSD_PRESET_D / _DEFAULT if E misbehaves.
-        preset: streamline_sys::DLSSD_PRESET_E,
-        normal_roughness_packed: 1,
-        use_camera_matrices: 1,
-        world_to_view: row_major(&fc.world_to_view),
-        view_to_world: row_major(&fc.view_to_world),
-    }
-}
-
 /// A headless upscaler session for the cinematic capture mode: ONE chain
 /// level's SDK context + resource set at 100% render scale (render res ==
 /// output res — DLAA-grade reconstruction), hosted on a `HeadlessGpu` instead
 /// of a swapchain. The engine states and eval middles are the interactive
 /// session's own (`probe_native`, `record_xess_eval`, `record_fsr3_upscale`,
-/// `record_fsr_rr_sequence`, `rr_sl_sequence`), so the two paths cannot
+/// `record_fsr_rr_sequence`, `rr_ngx_sequence`), so the two paths cannot
 /// drift; what this type adds is only the narrow driver API — probe, wire,
 /// per-sub-frame eval, and a linear-f32 readback of the reconstructed output.
 ///
 /// Drop discipline: drop this BEFORE the `HeadlessGpu` (locals in reverse
 /// declaration order do it naturally) — the XeSS/ffx context destructors need
 /// a live device, and every harness submit already blocked, so "completed
-/// command lists" holds by construction.
+/// command lists" holds by construction (the DLSSD feature release rides the
+/// same argument).
 pub struct CineUp {
     rr: Option<rr::RrResources>,
+    /// The DLSSD feature paired with `rr` (created per shot resolution —
+    /// the caller drops the whole CineUp on a res change, harness idle).
+    rr_feat: Option<ngxrr::RrFeature>,
     xess: Option<XessState>,
     fsr: Option<FsrState>,
     /// Which chain level won: "dlss-rr" | "fsr4-rr" | "xess" | "fsr3".
@@ -5979,20 +5611,20 @@ pub struct CineUp {
 
 impl CineUp {
     /// Probe the chain (DLSS-RR -> FSR4-RR -> XeSS -> FSR3, honoring
-    /// `opts.chain`) for an output size, at 100% render scale. `sl` is the
-    /// harness's Streamline context (`HeadlessGpu::new_sl`) — Some means the
-    /// DLSS level already passed its adapter + RR-support probes, so it wins
-    /// the chain. None = chain exhausted (the caller falls back to
-    /// accumulation, loudly).
+    /// `opts.chain`) for an output size, at 100% render scale. `ngxrr` is the
+    /// harness's raw-NGX RR session — Some means the DLSS level already
+    /// passed its adapter + availability probes, so it wins the chain. None =
+    /// chain exhausted (the caller falls back to accumulation, loudly).
     pub fn probe(
         device: &ID3D12Device,
-        sl: Option<&streamline::SlContext>,
+        ngxrr: Option<&ngxrr::NgxRr>,
         opts: &GpuOptions,
         w: u32,
         h: u32,
     ) -> Option<CineUp> {
-        let up = |rr, xess, fsr, name| CineUp {
+        let up = |rr, rr_feat, xess, fsr, name| CineUp {
             rr,
+            rr_feat,
             xess,
             fsr,
             name,
@@ -6000,16 +5632,19 @@ impl CineUp {
             oh: h,
             readback: None,
         };
-        if sl.is_some() {
-            // DLAA by construction: planes at the output size, opt == min ==
-            // max == output — the degenerate range `shim_options` reads as
-            // DLSS_MODE_DLAA. No optimal-settings query: native is the point.
-            match rr::RrResources::new(device, (w, h), (w, h), (w, h), w, h) {
-                Ok(r) => {
-                    return Some(up(Some(r), None, None, "dlss-rr"));
+        if let Some(nx) = ngxrr {
+            // DLAA by construction: planes at the output size, feature
+            // created with dlaa = true (the retired SL path expressed this
+            // as a degenerate opt == min == max range; the raw create says
+            // it honestly). No optimal-settings query: native is the point.
+            match rr::RrResources::new(device, (w, h), (w, h), (w, h), w, h)
+                .and_then(|r| Ok((nx.create_feature((w, h), (w, h), true)?, r)))
+            {
+                Ok((f, r)) => {
+                    return Some(up(Some(r), Some(f), None, None, "dlss-rr"));
                 }
                 Err(e) => eprintln!(
-                    "dlss: RR resource allocation failed ({e}) — falling through the chain"
+                    "dlss: RR resource/feature creation failed ({e}) — falling through the chain"
                 ),
             }
         }
@@ -6023,10 +5658,10 @@ impl CineUp {
                 FsrRes::Rr(_) => "fsr4-rr",
                 FsrRes::Up(_) => "fsr3",
             };
-            return Some(up(None, None, Some(fs), name));
+            return Some(up(None, None, None, Some(fs), name));
         }
         if let Some(x) = xess {
-            return Some(up(None, Some(x), None, "xess"));
+            return Some(up(None, None, Some(x), None, "xess"));
         }
         None
     }
@@ -6061,7 +5696,7 @@ impl CineUp {
     #[allow(clippy::too_many_arguments)]
     pub fn record_eval(
         &self,
-        sl: Option<&streamline::SlContext>,
+        ngxrr: Option<&ngxrr::NgxRr>,
         list: &ID3D12GraphicsCommandList,
         fc: &dlss::FrameConstants,
         jitter: (f32, f32),
@@ -6072,7 +5707,8 @@ impl CineUp {
         sky_sh: &crate::sh::Sh9,
     ) -> Result<()> {
         if let Some(rr) = &self.rr {
-            let sl = sl.ok_or("DLSS-RR engine without a Streamline harness")?;
+            let nx = ngxrr.ok_or("DLSS-RR engine without a raw-NGX session")?;
+            let feat = self.rr_feat.as_ref().ok_or("DLSS-RR engine without a feature")?;
             unsafe {
                 list.ResourceBarrier(&[transition(
                     &rr.output,
@@ -6080,7 +5716,7 @@ impl CineUp {
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 )]);
             }
-            rr_sl_sequence(sl, rr, list, fc, frame_idx, false)?;
+            rr_ngx_sequence(nx, feat, rr, list, fc)?;
             unsafe {
                 list.ResourceBarrier(&[transition(
                     &rr.output,

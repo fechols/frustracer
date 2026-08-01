@@ -1117,12 +1117,11 @@ pub fn compute_pso(
         .map_err(|e| format!("CreateComputePipelineState({what}): {e}"))
 }
 
-/// Minimal device/queue/list/fence harness for `--check-gpu` — no window, no
-/// swapchain, no Streamline. Interactive mode uses `D3d` instead; everything
-/// recorded against this harness records identically against that one.
-/// (`new_sl` is the one exception to "no Streamline": the cinematic capture
-/// mode routes the queue through the SL proxy so DLSS-RR can evaluate
-/// headlessly — still no window, no swapchain.)
+/// Minimal device/queue/list/fence harness for `--check-gpu` and the
+/// cinematic capture — no window, no swapchain. Interactive mode uses `D3d`
+/// instead; everything recorded against this harness records identically
+/// against that one. Raw-NGX DLSS-RR evaluates on it directly (no queue hook
+/// needed — the retired Streamline flavor existed only for SL's proxy).
 pub struct HeadlessGpu {
     pub device: ID3D12Device,
     pub queue: ID3D12CommandQueue,
@@ -1132,85 +1131,19 @@ pub struct HeadlessGpu {
     event: HANDLE,
     next: u64,
     pub adapter_name: String,
-    /// `new_sl` only: the SL proxy device the queue was created through. Kept
-    /// alive because the hooked CreateCommandQueue entry point lives on it —
-    /// dropping it to refcount 0 destroys the SL wrapper under a live queue
-    /// (the GpuContext `_proxy_device` discipline).
-    _proxy_device: Option<ID3D12Device>,
+    /// What the picked adapter IS — the cinematic caller's vendor gate for
+    /// the raw-NGX DLSS probe (raw NGX needs no queue hook, so the harness
+    /// carries no upscaler plumbing of its own; the retired `new_sl` flavor
+    /// existed only to hook the queue for SL's evaluate).
+    pub vendor: adapter::Vendor,
 }
 
 impl HeadlessGpu {
     pub fn new(debug: bool, prefer: adapter::Prefer) -> Result<Self> {
-        Ok(Self::new_sl(debug, prefer, None)?.1)
-    }
-
-    /// The DLSS-capable flavor: initialize Streamline BEFORE the DXGI factory
-    /// exists (the hard SL ordering constraint — `GpuContext::new`'s comment),
-    /// and when the picked adapter supports Ray Reconstruction, create the
-    /// queue THROUGH the SL proxy device so every ExecuteCommandLists is
-    /// SL-visible (the `D3d::with_queue` precedent; resources stay
-    /// native-device objects). No swapchain, no factory proxy — RR's evaluate
-    /// needs only the queue hook.
-    ///
-    /// Returns the `SlContext` FIRST so a caller's `let (sl, hg) = ...`
-    /// destructuring drops the harness — and with it the proxy queue — BEFORE
-    /// slShutdown/FreeLibrary run (the GpuContext field-order discipline,
-    /// expressed as tuple order). Every DLSS-level failure is a loud line +
-    /// a plain native harness, the chain's fall-through shape.
-    pub fn new_sl(
-        debug: bool,
-        prefer: adapter::Prefer,
-        sl_dir: Option<&str>,
-    ) -> Result<(Option<super::streamline::SlContext>, Self)> {
-        let mut sl = match sl_dir {
-            Some(dir) => match super::streamline::SlContext::init(
-                dir,
-                &[super::streamline_sys::FEATURE_DLSS_RR],
-                debug,
-            ) {
-                Ok(s) => {
-                    eprintln!("dlss: Streamline initialized ({dir})");
-                    Some(s)
-                }
-                Err(e) => {
-                    eprintln!("dlss: level unavailable ({e}) — falling through the chain");
-                    None
-                }
-            },
-            None => None,
-        };
         let factory = adapter::create_factory(debug).map_err(|e| format!("factory: {e}"))?;
         let pick = adapter::pick(&factory, prefer)?;
-        if sl.is_some() && pick.vendor != adapter::Vendor::Nvidia {
-            eprintln!("dlss: level unavailable (no NVIDIA adapter) — falling through the chain");
-            sl = None;
-        }
-        if let Some(s) = &sl {
-            if let Err(e) =
-                s.is_feature_supported(super::streamline_sys::FEATURE_DLSS_RR, pick.luid)
-            {
-                eprintln!(
-                    "dlss: level unavailable (Ray Reconstruction unsupported: {e}) — \
-                     falling through the chain"
-                );
-                sl = None;
-            }
-        }
         let device = d3d12::create_device(&pick.adapter, debug)?;
-        let mut proxy_device = None;
-        if let Some(s) = &sl {
-            match s
-                .set_d3d_device(&device)
-                .and_then(|()| s.upgrade(&device))
-            {
-                Ok(pdev) => proxy_device = Some(pdev),
-                Err(e) => {
-                    eprintln!("dlss: level unavailable (device hookup: {e}) — falling through the chain");
-                    sl = None;
-                }
-            }
-        }
-        let queue = d3d12::create_queue(proxy_device.as_ref().unwrap_or(&device))?;
+        let queue = d3d12::create_queue(&device)?;
         let alloc: ID3D12CommandAllocator =
             unsafe { device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT) }
                 .map_err(|e| format!("CreateCommandAllocator: {e}"))?;
@@ -1222,20 +1155,17 @@ impl HeadlessGpu {
             .map_err(|e| format!("CreateFence: {e}"))?;
         let event =
             unsafe { CreateEventW(None, false, false, None) }.map_err(|e| format!("event: {e}"))?;
-        Ok((
-            sl,
-            Self {
-                device,
-                queue,
-                alloc,
-                list,
-                fence,
-                event,
-                next: 1,
-                adapter_name: pick.name,
-                _proxy_device: proxy_device,
-            },
-        ))
+        Ok(Self {
+            device,
+            queue,
+            alloc,
+            list,
+            fence,
+            event,
+            next: 1,
+            adapter_name: pick.name,
+            vendor: pick.vendor,
+        })
     }
 
     /// Record + execute + block. The `--check-gpu` cadence: correctness

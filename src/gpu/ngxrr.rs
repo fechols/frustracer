@@ -6,21 +6,25 @@
 //! PSR->UAV->PSR barriers, over the same `rr::RrResources` planes.
 //!
 //! CONVENTION LEVERS (the FR_ABL read-only-probe idiom: loud on departure,
-//! loud + default on an unrecognized value). Raw DLSSD was never validated in
-//! this codebase, and the two priors point in OPPOSITE directions — SL wanted
-//! NEGATED jitter + mvec_scale {1/rw,1/rh}, raw NGX frame generation wants
-//! RAW jitter + {1,1} pixels (trap 9: each feature keys its OWN polarity,
-//! never reason one from the other). Defaults follow the raw family; the
-//! levers exist to walk the polarity empirically:
-//!   FR_NGXRR_JITTER=neg|0  (default: the raw sample offset)
-//!   FR_NGXRR_MV=norm|neg|normneg  (default: {1,1} — our MVs are pixels)
+//! loud + default on an unrecognized value). The two priors pointed in
+//! OPPOSITE directions — SL wanted NEGATED jitter + mvec_scale {1/rw,1/rh},
+//! raw NGX frame generation wants RAW jitter + {1,1} pixels — and trap 9's
+//! rule (each feature keys its OWN polarity, never reason one from the
+//! other) cut BOTH ways here, measured 2026-08-01 on the 4090:
+//!   JITTER: raw DLSSD wants the NEGATED offset, like SL and UNLIKE raw-NGX
+//!   FG. FRUSTRACER_STAB=1 static view: negated 0.12-0.16/255 (the healthy
+//!   RR band), raw 0.26-0.50 (the wrong-polarity wobble). NEGATED IS THE
+//!   DEFAULT; `raw` restores the wrong arm for the A/B.
+//!   MV: {1,1} — the DLSSD eval's InMVScale converts stored MVs TO PIXEL
+//!   SPACE per its own header contract and ours already are pixels (a wrong
+//!   arm is a directional smear under strafe, invisible parked; walk
+//!   FR_NGXRR_MV if one appears).
+//!   FR_NGXRR_JITTER=raw|0  (default: negated)
+//!   FR_NGXRR_MV=norm|neg|normneg  (default: {1,1} pixels)
 //!   FR_NGXRR_DEPTH=hw  (default: linear view-Z, Depth_Type_Linear — the
 //!                       plane rr.rs has always carried)
 //!   FR_NGXRR_EXPO=auto (default: no AutoExposure — the SL path set no
 //!                       exposure, and the helper defaults pre-exposure 1.0)
-//! Settling recipe: static view — wrong jitter polarity wobbles by 2x the
-//! jitter (~1 px), FRUSTRACER_STAB=1 healthy RR reads ~0.14/255; strafe —
-//! wrong MV polarity/scale is a directional smear.
 
 use std::ffi::c_void;
 
@@ -188,7 +192,8 @@ pub struct NgxRr {
     session: *mut c_void,
     _device: ID3D12Device,
     /// Multiplier applied to the frame's sample offset before the evaluate
-    /// (1.0 = raw, the default; -1.0 = the SL polarity; 0.0 = the null arm).
+    /// (-1.0 = negated, the MEASURED default — see the module doc; 1.0 = the
+    /// raw A/B arm; 0.0 = the null arm).
     pub jitter_mul: f32,
     /// FR_NGXRR_MV arm: 0 = {1,1} pixels (default), 1 = {1/rw,1/rh} (the SL
     /// scale), 2 = {-1,-1}, 3 = {-1/rw,-1/rh}.
@@ -232,19 +237,20 @@ impl NgxRr {
                 }
             }
         };
-        let jitter_mul = match lever("FR_NGXRR_JITTER", &["neg", "0"]) {
+        let jitter_mul = match lever("FR_NGXRR_JITTER", &["raw", "0"]) {
             1 => {
                 eprintln!(
-                    "dlss-rr: FR_NGXRR_JITTER=neg — the SL-era negated jitter (wrong \
-                     polarity wobbles a static view by 2x the jitter)"
+                    "dlss-rr: FR_NGXRR_JITTER=raw — the un-negated sample offset (the \
+                     measured-wrong polarity: a static view wobbles, STAB ~0.33/255 \
+                     vs the negated default's ~0.13)"
                 );
-                -1.0
+                1.0
             }
             2 => {
                 eprintln!("dlss-rr: FR_NGXRR_JITTER=0 — zero jitter to the evaluate");
                 0.0
             }
-            _ => 1.0,
+            _ => -1.0,
         };
         let mv_mode = lever("FR_NGXRR_MV", &["norm", "neg", "normneg"]);
         if mv_mode != 0 {
