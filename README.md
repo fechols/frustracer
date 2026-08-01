@@ -1118,15 +1118,24 @@ the XeSS-FG ×2 presented surplus is excluded:
 | Rungholt, 11:01 | 131 | 81 |
 | **average** | **103.75** | **62.75** |
 
-That is the hybrid **1.5–1.8× faster at every island, ~65% on average** — a
-larger gap than tracer-only timings alone explain, consistent with
-structure replay deleting the level ladder on parked frames while the DXR
-pipeline has no replay at all. It is a property of the *hardware* balance —
-Arc's RT throughput is weak relative to its shader cores — compounded by
-that structural difference between the two pipelines. These are interactive
-spot checks, not the deterministic `--spin` harness, but they are what a
-user flying the world actually gets — and they are why Intel adapters start
-in the wavefront tracer.
+That is the hybrid **1.5–1.8× faster at every island, ~65% on average** — and
+it holds **moving or parked**. A per-pass `--gpu-timing` A/B at the world
+boot pose (same protocol: `--prefer-intel --no-vsync --no-settings --no-fg`,
+steady-state windows, both arms tracing the *same* chunked TLAS and paying
+the same ~1.4 ms foliage-sway refit) reproduces the band at the GPU level:
+frame span 3.30 vs 5.36 ms parked (1.62×), and 3.4–3.5 vs the same 5.36
+under a live strafe (~1.5×). The wavefront barely notices motion because the
+level ladder costs only ~0.2 ms at the shipping leaf frontier and structure
+replay deletes even that on parked frames, while `dxr-rays` re-traces every
+pixel from the TLAS root each frame at 3.13 ms against the wavefront's
+1.15 ms leaf+sky. (A July 22 re-measure had mode-1 DXR slightly ahead on
+producing frames; the leaf-frontier and pack-split optimizations that landed
+July 24 were wavefront-side and retired that result.) The margin is that
+structure compounded with the *hardware* balance — Arc's RT throughput is
+weak relative to its shader cores, so rays not traced are worth more there.
+These are interactive spot checks, not the deterministic `--spin` harness,
+but they are what a user flying the world actually gets — and they are why
+Intel adapters start in the wavefront tracer.
 
 **This is specifically Intel Arc Pro B70 hardware; results vary — and
 invert — on other GPUs.** On an RTX 4090 the same comparison prefers DXR

@@ -13980,6 +13980,21 @@ fn vendor_defaults(opts: &mut Opts, vendor: gpu::adapter::Vendor) {
     // The feature grounds (H/R/C/O, >=spp-3, the replay win at rest) are
     // untouched by resolution either way.
     //
+    // 2026-08-01 RE-MEASURE — the 0.92x producing-frame parity above is
+    // RETIRED. It predates the (32,256) leaf frontier, the G-buffer pack
+    // split, and the compose skip — all wavefront-side; DXR gained only the
+    // feed share. On today's tree (world boot pose, B70, native 1080p, XeSS,
+    // --no-fg, steady-state --gpu-timing windows): wavefront span 3.30 ms
+    // parked (replay) / 3.42-3.53 under a live strafe / 3.49 with
+    // --no-replay (the producing proxy — the ladder now costs ~0.22 ms), vs
+    // mode-1 DXR 5.36 in either state (dxr-rays 3.13 + sway-tlas 1.36; DXR
+    // has no replay, so its cost is state-independent; both arms trace the
+    // same chunked TLAS and pay the same sway refit). The wavefront wins
+    // spp=1 on the world again, moving or parked (1.5-1.6x) — this entry's
+    // basis is no longer the narrowed feature-grounds argument alone; the
+    // perf grounds are back. The README's world FPS table (~65%) is the
+    // end-to-end face of the same numbers.
+    //
     // AMD: MEASURED, and it keeps the cross-vendor DXR default — so there is
     // no arm for it below. This paragraph used to say "RDNA has no measurement
     // here" because the box had only an AMD iGPU; it has since gained a Radeon
