@@ -463,8 +463,8 @@ impl Passes {
 
     /// Record a fullscreen pass: PSO + root sig + SRV slot + the inv_samples and
     /// `ToneParams` root constants, drawing 3 vertices to the bound RTV.
-    /// Re-binds everything each call — this doubles as the post-Streamline
-    /// state restore required by eDisableCLStateTracking.
+    /// Re-binds everything each call — this doubles as the state restore
+    /// after an upscaler/denoiser evaluate clobbered the list's bindings.
     ///
     /// `bloom` is `(strength, texel_w, texel_h)`; strength 0 disables the arm and
     /// the halo SRV is never sampled (but the table is still bound — the PS

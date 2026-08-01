@@ -46,7 +46,7 @@ pub struct Opts {
     /// wins; upscaling is always on unless --no-upscale empties the chain).
     /// `--<x>` force-starts the chain at that level, `--no-<x>` skips it.
     pub chain: upchain::UpChain,
-    /// D3D12 debug layer + Streamline verbose logging.
+    /// D3D12 debug layer + GPU-based validation.
     pub gpu_debug: bool,
     /// Block-compress the OPAQUE scene textures to BC7 on upload (8 bpp vs
     /// 32), GPU upload only — the CPU renderer keeps sampling the exact RGBA8
@@ -59,8 +59,6 @@ pub struct Opts {
     /// `--bc7-quality` keys the current arm. There is still deliberately no
     /// BC7 disk cache — the GPU encode is what made per-load affordable.
     pub bc7: bc7::Bc7Mode,
-    /// Directory holding sl.interposer.dll + plugins (M3+).
-    pub sl_path: String,
     /// Audio ambience (biome loops + speed-scaled wind; default on —
     /// interactive sessions only, headless paths never initialize audio).
     /// --no-audio is the kill lever: the subsystem is never constructed.
@@ -99,21 +97,17 @@ pub struct Opts {
     pub ffx_path: String,
     /// Frame generation for the session's wired upscaler family — ON BY
     /// DEFAULT (`--no-fg` is the kill lever; `--fg` spells the default
-    /// explicitly and additionally arms the explicit-only SL DLSS-G
-    /// fallback, see `fg_explicit`). Native sessions (FSR4-RR / FSR3) wrap
-    /// the swapchain with the FidelityFX frame-interpolation proxy and
-    /// insert one generated frame per rendered frame; unsupported pairings
-    /// fall through with a loud line. Interactive sessions only — headless
+    /// explicitly). DLSS sessions run raw-NGX DLSS-G (SDK builds); FSR
+    /// sessions (FSR4-RR / FSR3) wrap the swapchain with the FidelityFX
+    /// frame-interpolation proxy; Intel XeSS sessions XeSS-FG — one
+    /// generated frame per rendered frame; unsupported pairings fall
+    /// through with a loud line. Interactive sessions only — headless
     /// paths never consult it.
     pub fg: bool,
     /// Whether `--fg` was PASSED rather than defaulted (the `mode_explicit`
-    /// pattern). Two consumers: `--quinlight` against the mere default
+    /// pattern). One consumer: `--quinlight` against the mere default
     /// disarms fg with a loud line instead of exit(2) — a default must never
-    /// make another flag fatal on its own — and the Streamline DLSS-G
-    /// fallback (non-NDA builds) stays explicit-only, because that path is
-    /// the documented declines-to-insert open issue AND rejects the scRGB
-    /// swapchain, so arming it by default would trade every flagless
-    /// non-SDK NVIDIA session's fp16 presentation for nothing.
+    /// make another flag fatal on its own.
     pub fg_explicit: bool,
     /// Directory holding amd_fidelityfx_framegeneration_dx12.dll (`--fg-path`;
     /// the prebuilt drop ships it in the FSR sample dir, not next to the
@@ -517,9 +511,6 @@ pub fn defaults() -> Opts {
         chain: upchain::UpChain::ALL,
         gpu_debug: false,
         bc7: bc7::Bc7Mode::Gpu(bc7::Quality::Fast),
-        sl_path: std::env::var("FRUSTRACER_SL_PATH").unwrap_or_else(|_| {
-            concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\streamline-sdk\bin\x64").to_string()
-        }),
         audio: true,
         oidn: false,
         oidn_path: std::env::var("FRUSTRACER_OIDN_PATH").unwrap_or_else(|_| {
@@ -1408,12 +1399,6 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
                 });
                 opts.bc7 = opts.bc7.with_quality(q);
             }
-            "--sl-path" => {
-                opts.sl_path = args.next().unwrap_or_else(|| {
-                    eprintln!("--sl-path needs a directory argument");
-                    std::process::exit(2);
-                })
-            }
             // Consumed by the pre-parse settings scan (settings::headless_args)
             // — this arm only keeps the token out of the positional fallback,
             // which would read it as a scene path.
@@ -1518,7 +1503,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
 
 /// The `--help` text, printed by `main` when `Cli::helped` is set.
 pub fn usage() {
-                eprintln!("usage: frustracer [model.obj|.gltf|.glb] [--stress <n>] [--check] [--check-dlss] [--dlss-dump] [--no-dlss] [--check-oidn] [--oidn-dump] [--oidn] [--check-xess] [--xess-dump] [--xess] [--lock-res <r>] [--gpu-debug] [--sl-path <dir>] [--oidn-path <dir>] [--oidn-device <d>] [--xess-path <dir>]");
+                eprintln!("usage: frustracer [model.obj|.gltf|.glb] [--stress <n>] [--check] [--check-dlss] [--dlss-dump] [--no-dlss] [--check-oidn] [--oidn-dump] [--oidn] [--check-xess] [--xess-dump] [--xess] [--lock-res <r>] [--gpu-debug] [--oidn-path <dir>] [--oidn-device <d>] [--xess-path <dir>]");
                 eprintln!("  --world       boot the curated multi-scene world (the flagless interactive default;");
                 eprintln!("                exclusive with a scene arg, --stress, --tile, --spin, and --check*)");
                 eprintln!("  --no-world    flagless boot uses the procedural default scene instead");
@@ -1619,9 +1604,7 @@ pub fn usage() {
                 eprintln!("                (--no-fg disables): FSR sessions wrap the swapchain with the FidelityFX");
                 eprintln!("                frame-interpolation proxy, DLSS sessions run raw-NGX DLSS-G (SDK builds),");
                 eprintln!("                Intel XeSS sessions XeSS-FG; one generated frame per rendered frame;");
-                eprintln!("                unsupported pairings fall through loudly. Passing --fg explicitly also");
-                eprintln!("                arms the Streamline DLSS-G fallback on non-SDK builds (explicit-only:");
-                eprintln!("                it rejects scRGB and is the declines-to-insert open issue)");
+                eprintln!("                unsupported pairings fall through loudly");
                 eprintln!("  --no-fg       kill lever: no frame generation (restores scRGB where a wrapper family");
                 eprintln!("                would have taken the HDR10/PQ or SDR arm)");
                 eprintln!("  --fg-path     directory holding amd_fidelityfx_framegeneration_dx12.dll (default: the");
@@ -1705,8 +1688,7 @@ pub fn usage() {
                 eprintln!("                pick that vendor's adapter for the D3D12 device (default NVIDIA, or AMD");
                 eprintln!("                with --fsr; a preference, not a requirement — features the picked GPU");
                 eprintln!("                can't support fall back with a log line)");
-                eprintln!("  --gpu-debug   D3D12 debug layer + verbose Streamline logging");
-                eprintln!("  --sl-path     Streamline DLL directory (default: SDKs\\streamline-sdk\\bin\\x64)");
+                eprintln!("  --gpu-debug   D3D12 debug layer + GPU-based validation");
                 eprintln!("  --no-settings ignore {} for this run (the pause menu's", settings::FILE_NAME);
                 eprintln!("                saved settings, read as defaults that CLI flags override;");
                 eprintln!("                headless --check*/--spin runs always ignore it)");
@@ -1880,7 +1862,7 @@ pub fn self_test() -> Result<(), String> {
         return Err("--fg --no-fg must disable frame generation".into());
     }
     if !parse_argv(&["--no-fg", "--fg"]).opts.fg_explicit {
-        return Err("a trailing --fg must set fg_explicit (it arms the SL fallback)".into());
+        return Err("a trailing --fg must set fg_explicit (the --quinlight interplay reads it)".into());
     }
     if parse_argv(&["--world", "--no-world"]).world_flag != Some(false) {
         return Err("--world --no-world must resolve to Some(false)".into());

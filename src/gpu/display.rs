@@ -8,10 +8,11 @@
 //! probed here). Without the probe the highlight rolloff would be aimed at a
 //! guess, and would clip or crush on any display that disagreed.
 //!
-//! We deliberately do **not** use `IDXGISwapChain::GetContainingOutput`: under
-//! DLSS the swapchain is a Streamline proxy, and whether SL forwards that call
-//! is not a question worth depending on. `MonitorFromWindow` on the HWND we
-//! already own, matched against `DXGI_OUTPUT_DESC1::Monitor`, sidesteps it.
+//! We deliberately do **not** use `IDXGISwapChain::GetContainingOutput`: an
+//! FG-family session's swapchain is a wrapper proxy (ffx FI / XeSS-FG), and
+//! whether a proxy forwards that call is not a question worth depending on.
+//! `MonitorFromWindow` on the HWND we already own, matched against
+//! `DXGI_OUTPUT_DESC1::Monitor`, sidesteps it.
 //!
 //! **The monitor need not hang off the adapter we render on.** A display is
 //! enumerated by the adapter it is PHYSICALLY PLUGGED INTO, and on a

@@ -1,6 +1,6 @@
 //! Runtime DXC loader — the SM 6.x compiler for the GPU tracer's compute
 //! kernels (RayQuery needs cs_6_5; FXC tops out at SM 5.0). Same footprint
-//! policy as Streamline/OIDN/XeSS: nothing links the compiler —
+//! policy as OIDN/XeSS: nothing links the compiler —
 //! `dxcompiler.dll` (and `dxil.dll`, the DXIL validator/signer it lazily
 //! loads) are `LoadLibraryExW`'d at runtime from a gitignored SDK drop
 //! (default `SDKs/dxc/bin/x64`), and the single entry point

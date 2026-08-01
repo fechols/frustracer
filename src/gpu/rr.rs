@@ -1,23 +1,21 @@
-//! DLSS Ray Reconstruction resources: one texture per SL buffer tag, a
-//! single persistently-mapped upload ring (per-frame slots, allocated
-//! lazily on first CPU upload — --gpu feed sessions write the planes in
-//! place and never pay for it), the CPU→GPU conversion loops, and the
-//! ResourceTag table handed to Streamline each frame. Input planes are allocated once at the optimal-settings query's
-//! range MAX; every frame uploads (and tags, via sl::Extent) only the
-//! top-left `rw×rh` sub-rect — step-wise dynamic resolution, the same
-//! allocate-max/name-a-sub-rect pattern as gpu/xr.rs. The output stays at
-//! the window resolution with its own full extent.
+//! DLSS Ray Reconstruction resources: one texture per raw-NGX DLSSD eval
+//! input, a single persistently-mapped upload ring (per-frame slots,
+//! allocated lazily on first CPU upload — --gpu feed sessions write the
+//! planes in place and never pay for it), and the CPU→GPU conversion loops.
+//! Input planes are allocated once at the optimal-settings query's range
+//! MAX; every frame uploads (and evaluates, via InRenderSubrectDimensions)
+//! only the top-left `rw×rh` sub-rect — step-wise dynamic resolution, the
+//! same allocate-max/name-a-sub-rect pattern as gpu/xr.rs. The output stays
+//! at the window resolution.
 
 use super::d3d12::{
     aligned_pitch, committed_tex, footprint, get_or_try_init, loc_footprint, loc_subresource,
     transition, D3d, Result, UploadBuffer, FRAMES_IN_FLIGHT,
 };
-use super::streamline_sys as sl;
 use crate::dlss::{ld16, GBufs};
 use half::f16;
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicU16, AtomicU32, Ordering::Relaxed};
-use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
@@ -370,50 +368,4 @@ impl RrResources {
         ]
     }
 
-    /// The full tag table for slEvaluateFeature(DLSS-RR). States must be the
-    /// states the resources are in when SL *uses* them (manual hooking).
-    /// Under DRS every input tag carries the current render-size extent
-    /// `{0,0,rw,rh}` (the RR guide tags ALL inputs with the input extent)
-    /// and the output its full window-size extent — SL derives the ratio
-    /// and low-res-MV handling from these, not from the texture dims.
-    ///
-    /// `dlssg`: DLSS-G's REQUIRED depth tag is `kBufferTypeDepth (0)`, a
-    /// DIFFERENT slot from RR's `kBufferTypeLinearDepth (49)` — a G frame
-    /// with only the 49 tag has no depth in G's eyes, and there is no status
-    /// bit for a missing tag: generation just silently never inserts
-    /// (measured — multiplier pinned at 1 with every marker accepted). The
-    /// same linear view-Z plane rides both slots; interpolation's dilation
-    /// needs monotone-with-distance, which linear view-Z is
-    /// (Constants::depthInverted = 0).
-    pub fn tags(&self, rw: usize, rh: usize, dlssg: bool) -> Vec<sl::SlShimResourceTag> {
-        let npsr = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0 as u32;
-        let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32;
-        let tag = |tex: &ID3D12Resource, buffer_type: u32, state: u32, w: u32, h: u32| {
-            sl::SlShimResourceTag {
-                resource: tex.as_raw(),
-                state,
-                buffer_type,
-                lifecycle: sl::LIFECYCLE_VALID_UNTIL_PRESENT,
-                extent_top: 0,
-                extent_left: 0,
-                extent_width: w,
-                extent_height: h,
-            }
-        };
-        let (rw, rh) = (rw as u32, rh as u32);
-        let mut tags = vec![
-            tag(&self.planes[P_COLOR].tex, sl::BUFFER_SCALING_INPUT_COLOR, npsr, rw, rh),
-            tag(&self.output, sl::BUFFER_SCALING_OUTPUT_COLOR, uav, self.ow, self.oh),
-            tag(&self.planes[P_DEPTH].tex, sl::BUFFER_LINEAR_DEPTH, npsr, rw, rh),
-            tag(&self.planes[P_MVEC].tex, sl::BUFFER_MOTION_VECTORS, npsr, rw, rh),
-            tag(&self.planes[P_ALBEDO].tex, sl::BUFFER_ALBEDO, npsr, rw, rh),
-            tag(&self.planes[P_SPEC_ALBEDO].tex, sl::BUFFER_SPECULAR_ALBEDO, npsr, rw, rh),
-            tag(&self.planes[P_NORMAL_ROUGH].tex, sl::BUFFER_NORMAL_ROUGHNESS, npsr, rw, rh),
-            tag(&self.planes[P_SPEC_HIT].tex, sl::BUFFER_SPECULAR_HIT_DISTANCE, npsr, rw, rh),
-        ];
-        if dlssg {
-            tags.push(tag(&self.planes[P_DEPTH].tex, sl::BUFFER_DEPTH, npsr, rw, rh));
-        }
-        tags
-    }
 }

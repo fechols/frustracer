@@ -152,65 +152,6 @@ pub fn create_factory(debug: bool) -> Result<IDXGIFactory6> {
     unsafe { CreateDXGIFactory2(flags) }
 }
 
-/// Whether hardware-accelerated GPU scheduling (HAGS) is ENABLED on this
-/// adapter — asked of the driver itself (D3DKMT WDDM 2.7 caps, the same
-/// query the Settings page reads), never the registry: on Windows 11 the
-/// HwSchMode key only exists after a manual toggle, and its ABSENCE means
-/// "OS default", which is ON for supported GPUs — a registry heuristic
-/// misreads exactly the common case (shipped once). None = the query itself
-/// failed (old OS/driver); callers treat that as unknown, not off.
-pub fn hags_enabled(luid: LUID) -> Option<bool> {
-    use std::ffi::c_void;
-    #[repr(C)]
-    struct OpenFromLuid {
-        luid: LUID,
-        adapter: u32,
-    }
-    #[repr(C)]
-    struct QueryInfo {
-        adapter: u32,
-        ty: u32,
-        data: *mut c_void,
-        size: u32,
-    }
-    #[repr(C)]
-    struct CloseAdapter {
-        adapter: u32,
-    }
-    const KMTQAITYPE_WDDM_2_7_CAPS: u32 = 70;
-    type OpenFn = unsafe extern "system" fn(*mut OpenFromLuid) -> i32;
-    type QueryFn = unsafe extern "system" fn(*mut QueryInfo) -> i32;
-    type CloseFn = unsafe extern "system" fn(*const CloseAdapter) -> i32;
-    unsafe {
-        use windows::core::{s, PCWSTR};
-        use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
-        let wide: Vec<u16> = "gdi32.dll".encode_utf16().chain(std::iter::once(0)).collect();
-        let gdi = GetModuleHandleW(PCWSTR(wide.as_ptr())).ok()?;
-        let open: OpenFn = std::mem::transmute(GetProcAddress(gdi, s!("D3DKMTOpenAdapterFromLuid"))?);
-        let query: QueryFn = std::mem::transmute(GetProcAddress(gdi, s!("D3DKMTQueryAdapterInfo"))?);
-        let close: CloseFn = std::mem::transmute(GetProcAddress(gdi, s!("D3DKMTCloseAdapter"))?);
-        let mut o = OpenFromLuid { luid, adapter: 0 };
-        if open(&mut o) != 0 {
-            return None;
-        }
-        // D3DKMT_WDDM_2_7_CAPS: bit 0 HwSchSupported, bit 1 HwSchEnabled,
-        // bit 2 HwSchEnabledByDefault, bit 3 IsHwSchStateStable.
-        let mut caps: u32 = 0;
-        let mut q = QueryInfo {
-            adapter: o.adapter,
-            ty: KMTQAITYPE_WDDM_2_7_CAPS,
-            data: &mut caps as *mut u32 as *mut c_void,
-            size: std::mem::size_of::<u32>() as u32,
-        };
-        let qr = query(&mut q);
-        let c = CloseAdapter { adapter: o.adapter };
-        let _ = close(&c);
-        if qr != 0 {
-            return None;
-        }
-        Some(caps & 0x2 != 0)
-    }
-}
 
 /// (current usage, budget) of the device's adapter's LOCAL memory segment —
 /// the scene-upload diagnostic: WDDM demotes over-budget commits silently

@@ -30,7 +30,7 @@ mod frustum;
 mod ftree;
 mod gltf_loader;
 mod hemi;
-// The presentation stack (D3D12 + Streamline) is Windows-only; everything
+// The presentation stack (D3D12) is Windows-only; everything
 // headless (--check, --check-dlss) stays cross-platform.
 #[cfg(windows)]
 mod gpu;
@@ -6453,7 +6453,7 @@ fn run_check_gpu(
 /// Headless DLSS G-buffer verification: renders two DLSS-style frames (a
 /// small forward dolly apart — the same move `--check` T2 uses), then checks
 /// motion vectors, depth, and the camera matrices jointly by reconstructing
-/// world positions through both frames. No GPU or Streamline involved — this
+/// world positions through both frames. No GPU involved — this
 /// validates the CPU capture before/without the denoiser.
 /// Headless FSR verification — DLL- and GPU-free (the pure half of fsr.rs
 /// plus the same G-buffer machinery --check-dlss gates): proves the signal
@@ -10027,7 +10027,6 @@ fn run_cinematic_gpu(
     // everything swapchain-adjacent (vsync/hdr/fg/quin) is off — headless.
     let gopts = gpu::GpuOptions {
         chain: opts.chain,
-        sl_dir: opts.sl_path.clone(),
         xess_dir: opts.xess_path.clone(),
         xess_autoexposure: opts.xess_autoexposure,
         ffx_dir: opts.ffx_path.clone(),
@@ -13970,7 +13969,6 @@ fn run_window(req: SceneRequest, opts: &Opts, file_settings: settings::Settings)
     // Hoisted so GpuContext::new and every resize_output share one value.
     let gopts = gpu::GpuOptions {
         chain: opts.chain,
-        sl_dir: opts.sl_path.clone(),
         xess_dir: opts.xess_path.clone(),
         xess_autoexposure: opts.xess_autoexposure,
         ffx_dir: opts.ffx_path.clone(),
@@ -14542,9 +14540,7 @@ fn session(
     // session (from --lock-res, default native = 100%, quantized into the
     // upscaler's range) — the tracer's buffers are sized to it once; there
     // is no DRS on the GPU path. Any init failure falls back to the CPU
-    // renderer with the reason on stderr. With Streamline live the tracer's
-    // whole workload (ExecuteIndirect + DXR + AS builds) executes on the SL
-    // PROXY queue — validated in M7.
+    // renderer with the reason on stderr.
     // Session sub-mode + locked trace res — computed UNCONDITIONALLY (the
     // dxw/dxh pattern below): the SPACE mode cycle can lazily build the
     // wavefront tracer in a session that started CPU or DXR, and the lazy
@@ -17552,7 +17548,7 @@ fn session(
                     dlss_idx = dlss_idx.wrapping_add(1);
                 }
                 Err(e) => {
-                    // A Streamline failure (e.g. out of VRAM) shouldn't kill
+                    // An RR evaluate failure (e.g. out of VRAM) shouldn't kill
                     // the app: the aborted frame never reached the GPU, so
                     // fall back to the CPU pipeline; the next loop iteration
                     // presents normally. G retries.

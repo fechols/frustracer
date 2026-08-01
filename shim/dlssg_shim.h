@@ -1,23 +1,25 @@
-// DLSS Frame Generation via RAW NGX (no Streamline) — flat C API for Rust FFI.
+// DLSS Frame Generation via RAW NGX — flat C API for Rust FFI.
 //
-// Why this exists: the Streamline DLSS-G integration (sl_shim) validates
-// end-to-end on this project yet SL's closed dlfg present layer declines to
-// insert generated frames, with no diagnostic surface (see CLAUDE.md's --fg
-// open-issue record). ../quinlight-player proved the escape on this same
-// machine: drive NVSDK_NGX_Feature_FrameGeneration DIRECTLY — the app
-// evaluates interpolation into ITS OWN texture on ITS OWN command list and
-// presents real + generated frames itself (pair-present). Nothing can
-// silently decline. This shim is an adaptation of quinlight-player's
+// Why raw NGX: the retired Streamline DLSS-G integration validated
+// end-to-end yet SL's closed dlfg present layer declined to insert generated
+// frames, with no diagnostic surface (git history keeps the record; the SL
+// retirement then deleted the interposer entirely). ../quinlight-player
+// proved the escape on this same machine: drive
+// NVSDK_NGX_Feature_FrameGeneration DIRECTLY — the app evaluates
+// interpolation into ITS OWN texture on ITS OWN command list and presents
+// real + generated frames itself (pair-present). Nothing can silently
+// decline. This shim is an adaptation of quinlight-player's
 // cpp/dlssg_shim_d3d12.cpp (same author's project) with one substantive
 // change: frustracer HAS a real camera, so the dispatch ABI carries the
 // actual matrices/basis/jitter instead of quinlight's video-player identity
 // transforms.
 //
-// BUILD-OPTIONAL: the NDA-tier DLSS SDK (nvsdk_ngx_*_dlssg.h + the
-// nvsdk_ngx_d import lib + nvngx_dlssg.dll) is NOT redistributable and never
-// committed. build.rs compiles this TU only when FRUSTRACER_DLSS_SDK points
-// at an SDK (default: ..\quinlight-player\SDKs\DLSS-SDK) and emits
-// cfg(dlssg_ngx); without it the Rust side stubs to "unavailable".
+// BUILD-OPTIONAL: the DLSS SDK (nvsdk_ngx_*_dlssg.h + the nvsdk_ngx_d
+// import lib + nvngx_dlssg.dll) is NOT redistributable and never committed.
+// build.rs compiles this TU (beside dlssd_shim — one SDK, one gate) only
+// when FRUSTRACER_DLSS_SDK points at an SDK (default:
+// ..\quinlight-player\SDKs\DLSS-SDK) and emits cfg(dlss_ngx); without it
+// the Rust side stubs BOTH DLSS features to "unavailable".
 //
 // All functions return 0 on success; negative shim-private codes below.
 

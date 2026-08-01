@@ -255,7 +255,6 @@ opt_fields! {
         pub gpu_debug: bool,
         pub pix_markers: bool,
         pub gpu_timing: bool,
-        pub sl_path: String,
         pub oidn_path: String,
         pub nppd_path: String,
         pub nppd_model: String,
@@ -759,9 +758,6 @@ pub fn apply_to_opts(s: &Settings, opts: &mut crate::Opts) -> AppliedFx {
     if let Some(v) = a.gpu_timing {
         opts.gpu_timing = v;
     }
-    if let Some(p) = a.sl_path.clone() {
-        opts.sl_path = p;
-    }
     if let Some(p) = a.oidn_path.clone() {
         opts.oidn_path = p;
     }
@@ -1061,7 +1057,6 @@ pub fn menu_items() -> &'static [MenuItem] {
             item!("gpu_debug", "D3D12 debug layer", "Advanced", Restart, Toggle { default: false }, acc_bool!(advanced.gpu_debug)),
             item!("pix_markers", "PIX markers", "Advanced", Restart, Toggle { default: false }, acc_bool!(advanced.pix_markers)),
             item!("gpu_timing", "GPU timestamp table", "Advanced", Restart, Toggle { default: false }, acc_bool!(advanced.gpu_timing)),
-            item!("sl_path", "Streamline DLL dir", "Advanced", Restart, Text, acc_str!(advanced.sl_path)),
             item!("oidn_path", "OIDN DLL dir", "Advanced", Restart, Text, acc_str!(advanced.oidn_path)),
             item!("nppd_path", "ONNX Runtime DLL dir", "Advanced", Restart, Text, acc_str!(advanced.nppd_path)),
             item!("nppd_model", "NPPD model path", "Advanced", Restart, Text, acc_str!(advanced.nppd_model)),

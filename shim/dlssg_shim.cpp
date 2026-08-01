@@ -39,8 +39,10 @@ struct Ctx {
     NVSDK_NGX_Handle*    feature = nullptr;
     uint32_t disp_w = 0, disp_h = 0, rend_w = 0, rend_h = 0;
     bool color_hdr = false;
-    /// Whether OUR init keyed NGX (false = an in-process Streamline session
-    /// already had NGX initialized and we rode it — never Shutdown1 then).
+    /// Whether this Ctx holds a ref on the shared refcounted init (false
+    /// only before frdlssg_create's init succeeds — the destroy-on-failure
+    /// guard). Always true on a live handle since the SL retirement made the
+    /// init unconditional.
     bool owns_init = false;
 };
 
@@ -60,7 +62,7 @@ void copy4x4(float dst[4][4], const float src[16]) {
 // (the C ABI takes no command list), submitted + fence-waited before return.
 // FEATURE-scoped by design: touches nothing but s->feature, so
 // frdlssg_recreate (a render-res move) can reuse it MID-SESSION while the
-// in-process Streamline NGX state (params map, sl.dlss_d) stays live.
+// shared NGX state (the params map, the DLSSD session's feature) stays live.
 // Failure returns the error code and leaves the Ctx intact — the CALLER
 // decides between full teardown (create) and failed-but-alive (recreate).
 int32_t create_feature(Ctx* s) {

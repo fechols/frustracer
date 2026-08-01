@@ -1,7 +1,7 @@
 //! XeSS-SR resources: three input planes (color, motion vectors, depth), a
 //! window-res output UAV, and the persistently-mapped upload ring (lazily
-//! allocated — --gpu feed sessions never touch it) — the `rr.rs` structure
-//! minus Streamline. The defining difference from DLSS-RR:
+//! allocated — --gpu feed sessions never touch it) — the `rr.rs` structure.
+//! The defining difference from DLSS-RR:
 //! the input planes are allocated once at the *maximum* input resolution the
 //! range query allows, and every frame uploads (and XeSS reads, via
 //! `input_width/height`) only the top-left `rw×rh` sub-rect — dynamic

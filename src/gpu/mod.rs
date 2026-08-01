@@ -30,8 +30,6 @@ pub mod pix;
 /// `--quinlight`: the registered-consensus fuse of every wired upscaler.
 pub mod quin;
 pub mod rr;
-pub mod streamline;
-pub mod streamline_sys;
 pub mod bc7gpu;
 pub mod bloom;
 pub mod tonemap;
@@ -54,8 +52,6 @@ pub struct GpuOptions {
     /// device split up front, and the native levels are first-hit-wins).
     /// Every level exhausted = plain presentation with a loud line.
     pub chain: crate::upchain::UpChain,
-    /// Directory holding sl.interposer.dll and the SL plugins.
-    pub sl_dir: String,
     /// Directory holding libxess.dll.
     pub xess_dir: String,
     /// Directory holding amd_fidelityfx_loader_dx12.dll + provider DLLs.
@@ -117,12 +113,9 @@ pub struct GpuOptions {
     /// Unsupported combinations fall through with a loud line, never an
     /// error (except explicit `--fg --quinlight`, rejected at parse).
     pub fg: bool,
-    /// Whether `--fg` was PASSED rather than defaulted. One consumer: the
-    /// Streamline DLSS-G fallback (non-NDA builds, `!ngxfg::BUILT`) arms
-    /// only when explicit — it is the declines-to-insert open issue AND
-    /// rejects the scRGB swapchain, so the mere default must not trade a
-    /// flagless session's fp16 presentation for a frame generator that has
-    /// never been seen inserting.
+    /// Whether `--fg` was PASSED rather than defaulted (main.rs's
+    /// `--quinlight` interplay reads it: an explicit pair exits 2, the mere
+    /// default disarms with a loud line).
     pub fg_explicit: bool,
     /// Directory holding amd_fidelityfx_framegeneration_dx12.dll (`--fg-path`;
     /// the prebuilt drop ships it in the FSR sample dir, NOT next to the
@@ -267,8 +260,9 @@ struct FgState {
 
 /// Raw-NGX DLSS-G FFI (shim/dlssg_shim.cpp — the quinlight-player blueprint).
 /// The dispatch struct exists in BOTH cfg arms so the call sites typecheck;
-/// without the NDA-tier SDK at build time the fns stub to UNSUPPORTED and
-/// the session falls back to the Streamline DLSS-G attempt.
+/// without the DLSS SDK at build time the fns stub to UNSUPPORTED and the
+/// session runs without frame generation (a non-SDK build has no DLSS at
+/// all — RR rides the same gate).
 mod ngxfg {
     use std::ffi::c_void;
 
@@ -1483,11 +1477,10 @@ impl GpuContext {
     /// session. Under `--quinlight` that rule is deliberately suspended and
     /// EVERY supported level is wired, because the fuse's inputs ARE the engines
     /// (gpu/quin.rs). Two things make the coexistence legal, and neither is new:
-    ///   * `d3d.device` is the NATIVE device even under Streamline — only the
-    ///     queue and swapchain are SL proxies (see `D3d::with_queue`), so the
-    ///     XeSS/ffx contexts are created exactly where they always were. Their
-    ///     dispatches record into the same native command list, and SL's queue
-    ///     proxy simply forwards the ExecuteCommandLists.
+    ///   * every context lives on the one native device — DLSS-RR is a raw-NGX
+    ///     evaluate on the session queue (no interposer since the SL
+    ///     retirement), so the XeSS/ffx contexts record into the same native
+    ///     command list beside it.
     ///   * FSR4-RR and FSR 3.1 are independent ffx CONTEXTS, so one session can
     ///     hold both.
     /// A level that fails to come up is just not an engine: the fuse is
@@ -1717,8 +1710,10 @@ impl GpuContext {
         // THE FEATURE SURVIVES THE RESIZE, and that is load-bearing rather
         // than an optimization. Destroying it here CRASHED the process, every
         // time, and the mechanism is the one frdlssg_recreate already documents
-        // one level up: frdlssg_destroy tears at NGX state an in-process
-        // Streamline SHARES, so the RR rebuild immediately below it could no
+        // one level up (SL-era — the sharer was the in-process Streamline;
+        // structurally impossible since the retirement, the cheap recreate
+        // shape kept): frdlssg_destroy tore at NGX state Streamline
+        // SHARED, so the RR rebuild immediately below it could no
         // longer even query NGX (slDLSSDGetOptimalSettings -> eErrorNGXFailed),
         // and SL's Present hook then indexed NGX's feature table with a garbage
         // id (rcx = fffffffa12121206, bit-identical across processes) and took
@@ -4799,11 +4794,11 @@ impl GpuContext {
                 return false;
             }
             // FEATURE-scoped recreate — deliberately NOT destroy + lazy
-            // create: frdlssg_destroy calls DestroyParameters on the map
-            // GetCapabilityParameters returned, which an SL session SHARES
-            // with the in-process Streamline NGX state — the first attempt
-            // did exactly that and every subsequent sl.dlss_d (RR) evaluate
-            // failed 0xBAD00004 FeatureNotFound.
+            // create (an SL-era lesson kept for its cheapness: destroy tore
+            // at the NGX parameter map the in-process Streamline SHARED and
+            // every subsequent RR evaluate failed 0xBAD00004 FeatureNotFound;
+            // today the DLSSD session shares the same map, so the discipline
+            // still holds).
             let r = unsafe { ngxfg::frdlssg_recreate(n.handle.get(), rr.ow, rr.oh, rw, rh) };
             if r != 0 {
                 eprintln!("fg: NGX feature recreate failed ({r}) — frame generation off");
@@ -5571,8 +5566,8 @@ impl Drop for GpuContext {
     }
 }
 
-/// glam Mat4 (column-major) -> Streamline row-major float[16]. This is THE
-/// transpose boundary — nothing else in the codebase reorders matrices.
+/// glam Mat4 (column-major) -> the NGX-family row-major float[16]. This is
+/// THE transpose boundary — nothing else in the codebase reorders matrices.
 fn row_major(m: &glam::Mat4) -> [f32; 16] {
     m.transpose().to_cols_array()
 }

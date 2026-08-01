@@ -1,6 +1,6 @@
 //! NPPD (Neural Partitioning Pyramids for Denoising Monte Carlo Renderings,
 //! Bálint et al., SIGGRAPH 2023) — the neural denoiser path next to OIDN and
-//! DLSS-RR. Same footprint policy as Streamline/OIDN/XeSS: nothing links any
+//! DLSS-RR. Same footprint policy as OIDN/XeSS: nothing links any
 //! SDK; `onnxruntime.dll` (+ `DirectML.dll`) is loaded at runtime from the
 //! SDK bin directory (default `SDKs\onnxruntime\bin`), every entry point goes
 //! through a fn-pointer table, and headless builds / DLL-free machines are

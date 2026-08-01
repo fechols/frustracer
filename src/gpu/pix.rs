@@ -1,7 +1,7 @@
 //! Runtime PIX event loader — named Begin/End brackets on D3D12 command
 //! lists so PIX GPU captures (and RenderDoc) show the wavefront levels,
 //! feeds, and upscaler evaluates by name. Same footprint policy as
-//! Streamline/OIDN/XeSS/DXC: nothing links — `WinPixEventRuntime.dll` (from
+//! OIDN/XeSS/DXC: nothing links — `WinPixEventRuntime.dll` (from
 //! a PIX install or the WinPixEventRuntime NuGet, dropped under the
 //! gitignored `SDKs/pix/bin/x64`) is `LoadLibraryExW`'d at runtime and three
 //! exports are resolved with GetProcAddress. Markers are opt-in

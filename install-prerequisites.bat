@@ -3,12 +3,17 @@ rem ===========================================================================
 rem  frustracer — runtime SDK installer
 rem
 rem  Building NEVER needs any of this: the MIT headers the shims compile
-rem  against (Streamline, FidelityFX) are committed, and every SDK below is
+rem  against (FidelityFX) are committed, and every SDK below is
 rem  LoadLibrary'd at runtime, so `cargo build --release` and every DLL-free
 rem  `--check*` gate work on a bare checkout. This script fetches the runtime
 rem  DLLs the *interactive* features need, into the directories the defaults in
 rem  src/main.rs already point at (each is also overridable with the matching
 rem  --*-path flag / FRUSTRACER_*_PATH env var).
+rem
+rem  DLSS is the one feature this script CANNOT fetch: ray reconstruction and
+rem  frame generation both ride the raw-NGX shims, which need the (non-
+rem  redistributable, non-fetchable) DLSS SDK present at BUILD time --
+rem  FRUSTRACER_DLSS_SDK points at it; build.rs stages the snippet DLLs.
 rem
 rem  The binaries are license-restricted (that is why they are gitignored and
 rem  not committed) — this downloads them from each vendor's own release page
@@ -16,11 +21,11 @@ rem  onto YOUR machine. Nothing here redistributes them.
 rem
 rem  Usage:
 rem    install-prerequisites.bat                 all components
-rem    install-prerequisites.bat dxc dlss        only those
+rem    install-prerequisites.bat dxc fsr         only those
 rem    install-prerequisites.bat all /force      re-download and re-extract
 rem    install-prerequisites.bat /clean          delete the download cache
 rem
-rem  Components: dxc dlss fsr xess nppd oidn pix
+rem  Components: dxc fsr xess nppd oidn pix
 rem  Needs: Windows 10 1803+ (curl.exe + tar.exe are in-box). ~700 MB of
 rem  downloads, ~2 GB on disk after extraction.
 rem ===========================================================================
@@ -35,7 +40,6 @@ rem  Bump deliberately: the ORT/DirectML pair below is the one CLAUDE.md pins
 rem  as verified (an old DirectML under a new ORT fails the NPPD U-Net's Resize
 rem  node at run time), and XeSS stays on the 2.x line the code was written and
 rem  gated against (3.0.1 exists and is untested here).
-set "SL_VER=2.12.0"
 set "OIDN_VER=2.5.0"
 set "XESS_VER=2.1.1"
 set "DXC_TAG=v1.9.2602.24"
@@ -68,7 +72,7 @@ for %%A in (%*) do (
         set "SEL=!SEL! %%~A"
     )))
 )
-if not defined SEL (set "SEL= dxc dlss fsr xess nppd oidn pix")
+if not defined SEL (set "SEL= dxc fsr xess nppd oidn pix")
 
 if not exist "%CACHE%" mkdir "%CACHE%"
 set "FAILED="
@@ -80,7 +84,6 @@ echo cache:     %CACHE%   ^(reused across runs; /clean to drop^)
 echo.
 
 call :want dxc  && call :do_dxc
-call :want dlss && call :do_dlss
 call :want fsr  && call :do_fsr
 call :want xess && call :do_xess
 call :want nppd && call :do_nppd
@@ -92,8 +95,6 @@ echo.
 echo ---- installed ----
 call :check "DXR/GPU tracing (--dxr default, --gpu)" "%SDKS%\dxc\bin\x64\dxcompiler.dll"
 call :check "  (validator)"                          "%SDKS%\dxc\bin\x64\dxil.dll"
-call :check "DLSS-RR (--dlss / G)"                   "%SDKS%\streamline-sdk\bin\x64\sl.interposer.dll"
-call :check "  (RR plugin)"                          "%SDKS%\streamline-sdk\bin\x64\sl.dlss_d.dll"
 call :check "FSR4-RR / FSR3 (--fsr / K)"             "%SDKS%\FidelityFX-Samples-prebuilt\Samples\Denoisers\FidelityFX_Denoiser\dx12\x64\Release\amd_fidelityfx_loader_dx12.dll"
 call :check "XeSS (--xess / X)"                      "%SDKS%\XeSS-SDK\bin\libxess.dll"
 call :check "NPPD (--nppd / J)"                      "%SDKS%\onnxruntime\bin\onnxruntime.dll"
@@ -131,19 +132,6 @@ call :skip "%SDKS%\dxc\bin\x64\dxcompiler.dll" dxc && exit /b 0
 call :fetch dxc.zip "https://github.com/microsoft/DirectXShaderCompiler/releases/download/%DXC_TAG%/%DXC_ZIP%" || exit /b 0
 rem archive root is bin/ inc/ lib/ — extracts straight over SDKs\dxc
 call :unzip dxc.zip "%SDKS%\dxc" || exit /b 0
-exit /b 0
-
-:do_dlss
-rem Streamline: bin/ include/ lib/ docs/ at the archive root. We extract ONLY
-rem bin/x64 — that is the whole runtime need (sl.interposer.dll, which
-rem gpu/streamline.rs LoadLibraryW's, plus the plugin + NGX DLLs it resolves
-rem from the same dir it gets as Preferences::pathsToPlugins). The headers and
-rem docs are already vendored in-repo, and nothing links SL, so a full extract
-rem would only overwrite tracked files with the SDK's copies and leave the
-rem working tree dirty — which it did, before this was narrowed.
-call :skip "%SDKS%\streamline-sdk\bin\x64\sl.interposer.dll" dlss && exit /b 0
-call :fetch streamline.zip "https://github.com/NVIDIA-RTX/Streamline/releases/download/v%SL_VER%/streamline-sdk-v%SL_VER%.zip" || exit /b 0
-call :unzip streamline.zip "%SDKS%\streamline-sdk" "bin/x64" || exit /b 0
 exit /b 0
 
 :do_fsr

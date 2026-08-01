@@ -1,5 +1,5 @@
 //! Intel Open Image Denoise (OIDN 2.x) — the secondary denoiser next to DLSS
-//! Ray Reconstruction. Same footprint policy as Streamline: nothing links the
+//! Ray Reconstruction. Same runtime-DLL footprint policy: nothing links the
 //! SDK; `OpenImageDenoise.dll` is loaded at runtime from the SDK bin directory
 //! (default `SDKs/oidn.x64.windows/bin`), so builds and DLL-free machines are
 //! unaffected and every entry point is resolved into a fn-pointer table.

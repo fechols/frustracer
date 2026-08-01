@@ -193,7 +193,7 @@ pub fn halton(mut index: u32, base: u32) -> f32 {
     r
 }
 
-/// Streamline guidance: phase length ≈ 8·(upscale ratio)². Both DRS paths
+/// DLSS guidance: phase length ≈ 8·(upscale ratio)². Both DRS paths
 /// (DLSS-RR and XeSS) can shed to a 3× ratio at their range floor, which
 /// needs 8·3² = 72; a longer phase is benign at shallow ratios (finer
 /// coverage, slower cycle), a too-short one causes convergence artifacts
@@ -269,8 +269,8 @@ pub fn headless_render_res(w: usize, h: usize) -> (usize, usize) {
 /// `Camera::basis` uses (camera.rs:33-35), so the matrix camera is the ray
 /// camera: f = forward, r = f × Y normalized, u = r × f. Camera space is
 /// (x=r, y=u, z=f), z positive forward — left-handed D3D-style. glam is
-/// column-major; the transpose to Streamline's row-major float4x4 happens at
-/// the shim boundary (gpu/mod.rs), nowhere else.
+/// column-major; the transpose to the NGX family's row-major float4x4
+/// happens at the shim boundary (gpu/mod.rs), nowhere else.
 #[derive(Clone, Copy)]
 pub struct CamMatrices {
     pub world_to_view: Mat4,

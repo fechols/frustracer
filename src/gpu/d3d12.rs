@@ -260,9 +260,7 @@ pub fn create_device(adapter: &IDXGIAdapter4, debug: bool) -> Result<ID3D12Devic
     Ok(device.unwrap())
 }
 
-/// Create a direct command queue. In the Streamline path the `device` passed
-/// here is the SL *proxy* device — that hook is what lets DLSS Frame
-/// Generation own presentation pacing later.
+/// Create a direct command queue.
 pub fn create_queue(device: &ID3D12Device) -> Result<ID3D12CommandQueue> {
     unsafe {
         device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
@@ -296,8 +294,7 @@ pub struct FgHook<'a> {
 }
 
 impl D3d {
-    /// Build the swapchain + frame machinery around an existing device/queue
-    /// (M3 passes the Streamline proxy queue here so present is hooked).
+    /// Build the swapchain + frame machinery around an existing device/queue.
     pub fn with_queue(
         factory: &IDXGIFactory6,
         device: ID3D12Device,
@@ -639,8 +636,8 @@ impl D3d {
     /// `nbuf` descriptors — overwritten, never reallocated).
     /// `frame_index` needs no reset: it is only the frames-in-flight slot
     /// counter; the backbuffer index is queried fresh at every present.
-    /// Works through the Streamline proxy swapchain too — ResizeBuffers is
-    /// an SL hook and the manual-hooking guide's documented resize pattern.
+    /// Works through the FG-family proxy swapchains too — they forward
+    /// ResizeBuffers to the chain they wrap.
     pub fn resize(&mut self, w: u32, h: u32) -> Result<()> {
         self.wait_idle()?;
         self.backbuffers.clear();
