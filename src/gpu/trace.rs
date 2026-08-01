@@ -23,6 +23,7 @@ use super::adapter;
 use super::d3d12::{self, committed_buffer, transition, uav_barrier, Result};
 use super::dxc::Dxc;
 use crate::bc7;
+use crate::blas_split::ChunkWindow;
 use crate::bvh::Bvh;
 use crate::camera::CamBasis;
 use crate::scene::{MatKind, Scene};
@@ -1732,6 +1733,11 @@ impl SwTreesGpu {
 /// Each chunk is one blocking `Submit::run_list`; the final chunk's list also
 /// records the COPY_DEST→`after` transition. Empty streams get a 4-byte dummy
 /// created directly in `after`.
+///
+/// CONTRACT: `map` is called exactly ONCE per element, in `src` order — the
+/// `blas_indices` stream's chunk cursor (SceneGpu::new_uploaded) depends on
+/// it. Parallelizing the map or retrying a ring chunk would silently desync
+/// that cursor into wrong BLAS geometry.
 fn stream_buffer<T: Copy, U: Copy>(
     device: &ID3D12Device,
     sub: &mut dyn d3d12::Submit,
@@ -1775,6 +1781,56 @@ fn stream_buffer<T: Copy, U: Copy>(
         e += n;
     }
     Ok(dst)
+}
+
+/// FR_SPLIT_AUDIT=1 helper: copy a whole u32 stream buffer back to the CPU and
+/// diff it against the source slice it was streamed from. Diagnostic-only —
+/// never in a shipping path; the state round-trip mirrors stream_buffer's
+/// `after` (NON_PIXEL_SHADER_RESOURCE).
+fn audit_split_streams(
+    device: &ID3D12Device,
+    sub: &mut dyn d3d12::Submit,
+    buf: &ID3D12Resource,
+    want: &[u32],
+    name: &str,
+) -> Result<()> {
+    let bytes = want.len() * 4;
+    let rb = d3d12::ReadbackBuffer::new(device, bytes)?;
+    sub.run_list(&mut |l| {
+        unsafe {
+            l.ResourceBarrier(&[transition(
+                buf,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            l.CopyBufferRegion(&rb.resource, 0, buf, 0, bytes as u64);
+            l.ResourceBarrier(&[transition(
+                buf,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            )]);
+        }
+        Ok(())
+    })?;
+    let mut ptr = std::ptr::null_mut();
+    unsafe { rb.resource.Map(0, None, Some(&mut ptr)) }
+        .map_err(|e| format!("split-audit Map: {e}"))?;
+    let got = unsafe { std::slice::from_raw_parts(ptr as *const u32, want.len()) };
+    let bad = got.iter().zip(want).filter(|(g, w)| g != w).count();
+    if bad == 0 {
+        eprintln!("split-audit: {name} MATCHES the CPU plan ({} u32s)", want.len());
+    } else {
+        let first = got.iter().zip(want).position(|(g, w)| g != w).unwrap();
+        eprintln!(
+            "split-audit: {name} DIVERGES — {bad} of {} u32s differ, first at [{first}] \
+             (gpu {} vs plan {})",
+            want.len(),
+            got[first],
+            want[first]
+        );
+    }
+    unsafe { rb.resource.Unmap(0, None) };
+    Ok(())
 }
 
 /// The SHARED scene core: everything both GPU tracers read — streams,
@@ -2394,20 +2450,96 @@ impl SceneGpu {
             if plan.chunks() == 0 {
                 return Err("--blas-split: the scene has no triangles to chunk".into());
             }
+            // PER-CHUNK VERTEX WINDOWING (2026-08-01 — the bistro-dusk shard
+            // fix; the planner and the defect write-up live at
+            // blas_split::plan_windows / SPLIT_INDEX_CEILING, pinned by
+            // blas_split::self_test). Every chunk's BLAS indices are kept
+            // under the ceiling — REBASE slides the vertex window to the
+            // chunk's min id (free, the common case); a chunk whose id RANGE
+            // itself clears the ceiling GATHERS its ≤ 3·cap used vertices
+            // into a small transient side buffer (tile seams / the world's
+            // cross-island chunks — 9 chunks / 1.5 MB on tiled san-miguel, 1
+            // chunk / 201 KB on THE WORLD). build_split_blas windows each
+            // geometry desc to match. FR_SPLIT_NOREBASE=1 restores absolute
+            // index values — the repro arm; FR_SPLIT_AUDIT=1 memcmps all
+            // three streamed buffers against the CPU plan.
+            //
+            // The stream stays transient-free (no 12 B/tri CPU copy): the map
+            // closure walks a chunk cursor instead, sound because
+            // stream_buffer maps elements STRICTLY IN ORDER (the ring loop is
+            // sequential and each ring chunk zips in order).
+            let no_rebase = std::env::var("FR_SPLIT_NOREBASE").map_or(false, |v| v == "1");
+            if no_rebase {
+                eprintln!("blas-split: FR_SPLIT_NOREBASE=1 — absolute BLAS index values");
+            }
+            let wins = crate::blas_split::plan_windows(
+                &plan,
+                &scene.indices,
+                |v| {
+                    let p = scene.positions[v as usize];
+                    [p.x, p.y, p.z]
+                },
+                no_rebase,
+            );
+            if wins.gathered() > 0 {
+                eprintln!(
+                    "blas-split: {} chunk(s) vertex-gathered ({} KB side buffer) — id range \
+                     over the {} ceiling (the RDNA4 index-value workaround)",
+                    wins.gathered(),
+                    (wins.aux.len() * 12) >> 10,
+                    crate::blas_split::SPLIT_INDEX_CEILING,
+                );
+            }
+            // The gathered side buffer, like the reordered index stream below,
+            // feeds only the builds (a built AS is self-contained).
+            let aux_positions = if wins.aux.is_empty() {
+                None
+            } else {
+                Some(stream_buffer(device, sub, &ring, &wins.aux, |v| *v, srv)?)
+            };
             // The reordered index stream, mapped straight out of the plan — no
             // transient CPU copy of the whole buffer (12 B/tri would be 1 GB on
             // a tiled scene). Positions are SHARED with the single-BLAS path:
             // chunks reference the one vertex buffer, so nothing duplicates.
+            let cursor = std::cell::Cell::new((0usize, 0usize)); // (element idx, chunk)
             let blas_indices = stream_buffer(
                 device,
                 sub,
                 &ring,
                 &plan.packed_tris,
-                |&t| scene.indices[t as usize],
+                |&t| {
+                    let (idx, mut c) = cursor.get();
+                    while idx >= plan.chunk_base[c + 1] as usize {
+                        c += 1;
+                    }
+                    cursor.set((idx + 1, c));
+                    wins.tri(c, scene.indices[t as usize])
+                },
                 srv,
             )?;
             let blas_tri_b = stream_buffer(device, sub, &ring, &plan.packed_tris, |t| *t, srv)?;
             let chunk_base_b = stream_buffer(device, sub, &ring, &plan.chunk_base, |b| *b, srv)?;
+            // FR_SPLIT_AUDIT=1 — one-shot diagnostic (the bistro-dusk shard
+            // hunt): read the two remap buffers straight back and memcmp
+            // against the CPU plan, so "the GPU sees wrong remap DATA" can be
+            // ruled in/out without touching a shader. Loud either way.
+            if std::env::var("FR_SPLIT_AUDIT").map_or(false, |v| v == "1") {
+                audit_split_streams(device, sub, &blas_tri_b, &plan.packed_tris, "blas_tri")?;
+                audit_split_streams(device, sub, &chunk_base_b, &plan.chunk_base, "chunk_base")?;
+                // The reordered index stream too — the buffer the BLAS builds
+                // actually consume (transiently ~413 MB of expected values;
+                // diagnostic-only). Expected carries the same per-chunk rebase
+                // the stream applied.
+                let expected: Vec<u32> = (0..plan.chunks())
+                    .flat_map(|i| {
+                        plan.tris(i)
+                            .iter()
+                            .flat_map(|&t| wins.tri(i, scene.indices[t as usize]))
+                            .collect::<Vec<u32>>()
+                    })
+                    .collect();
+                audit_split_streams(device, sub, &blas_indices, &expected, "blas_indices")?;
+            }
 
             let split = build_split_blas(
                 device,
@@ -2416,10 +2548,15 @@ impl SceneGpu {
                 &positions_b,
                 &blas_indices,
                 &plan,
+                &wins.win,
+                aux_positions.as_ref(),
                 n_verts,
                 non_opaque,
                 scene.any_transmissive,
             )?;
+            // The gathered side buffer fed only the builds, exactly like the
+            // reordered index stream below.
+            drop(aux_positions);
             // The animated-TLAS ring (--foliage-sway with leaf cells): rest
             // template + FRAMES_IN_FLIGHT instance/TLAS slots + one scratch,
             // all beside the static TLAS — never replacing it.
@@ -3349,6 +3486,12 @@ fn build_split_blas(
     positions: &ID3D12Resource,
     blas_indices: &ID3D12Resource,
     plan: &crate::blas_split::BlasPlan,
+    // Per-chunk vertex windowing (the RDNA4 index-value workaround — see the
+    // rebase comment at the blas_indices stream): the chunk's indices were
+    // rebased/gathered per this, so its geometry desc must window the same
+    // way. All Rebase(0) under FR_SPLIT_NOREBASE.
+    chunk_win: &[ChunkWindow],
+    aux_positions: Option<&ID3D12Resource>,
     n_verts: u32,
     non_opaque: bool,
     any_transmissive: bool,
@@ -3363,18 +3506,31 @@ fn build_split_blas(
     // the reordered index stream. Held for the whole function — the build descs
     // point at them.
     let index_va = unsafe { blas_indices.GetGPUVirtualAddress() };
+    let pos_va = unsafe { positions.GetGPUVirtualAddress() };
+    let aux_va = aux_positions.map(|r| unsafe { r.GetGPUVirtualAddress() });
     let geoms: Vec<D3D12_RAYTRACING_GEOMETRY_DESC> = (0..n)
         .map(|i| {
+            let (vcount, vstart) = match chunk_win[i] {
+                // The window opens at the rebase base (12 B/vertex; 4-byte
+                // alignment holds — the format's component size) …
+                ChunkWindow::Rebase(base) => (n_verts - base, pos_va + base as u64 * 12),
+                // … or at the chunk's slice of the gathered side buffer.
+                ChunkWindow::Gather { base, count } => (
+                    count,
+                    aux_va.expect("gather chunks imply an aux buffer") + base as u64 * 12,
+                ),
+            };
             let mut g = geometry_desc(
                 positions,
                 blas_indices,
-                n_verts,
+                vcount,
                 plan.prims(i),
                 non_opaque,
                 any_transmissive,
             );
             g.Anonymous.Triangles.IndexBuffer =
                 index_va + plan.chunk_base[i] as u64 * 12;
+            g.Anonymous.Triangles.VertexBuffer.StartAddress = vstart;
             g
         })
         .collect();
@@ -3494,7 +3650,9 @@ fn build_split_blas(
             unsafe { list4.BuildRaytracingAccelerationStructure(&desc, Some(&[postbuild])) };
             // The scratch buffer is shared, so consecutive builds MUST NOT
             // overlap — this barrier is the serialization, not an optimization
-            // to remove.
+            // to remove. (The bistro-dusk shard hunt proved this sync SOUND on
+            // RDNA4 by fencing every build individually and measuring no
+            // change — the shards were the index-value defect, not a race.)
             unsafe { list.ResourceBarrier(&[uav_barrier(None)]) };
         }
         unsafe {

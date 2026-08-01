@@ -1337,7 +1337,43 @@ cargo run --release -- --no-blas-split  # A/B lever (GPU only) BACK to ONE BLAS 
                                         # reproduces the removal with the same 1891 MB. Intel's
                                         # compaction differs wildly too (4624->1576 MB vs NVIDIA's
                                         # 1844->668), so treat single-BLAS scratch as a vendor
-                                        # cliff, not a constant. COSTS, paid on every GPU session:
+                                        # cliff, not a constant.
+                                        # THE RDNA4 INDEX-VALUE DEFECT (2026-08-01 — the
+                                        # bistro-dusk shards): on the R9700 (driver
+                                        # 32.0.31035.1003) a chunk BLAS whose index VALUES reach
+                                        # past ~2^24 into the big shared vertex buffer builds
+                                        # WRONG TRIANGLES — scattered sliver geometry,
+                                        # deterministic per scene, BOTH GPU pipelines (they share
+                                        # the one SceneGpu core), NVIDIA bit-clean on identical
+                                        # inputs, the single-BLAS build (one huge geometry) never
+                                        # trips it. Only scenes past ~16.7M VERTICES can reach it
+                                        # (THE WORLD, big --tile runs), which is why every
+                                        # committed-scene suite run missed it for a month. The
+                                        # split therefore WINDOWS every chunk under
+                                        # blas_split::SPLIT_INDEX_CEILING: REBASE to the chunk's
+                                        # min id (free — nearly all chunks; the desc's
+                                        # VertexBuffer.StartAddress slides to match) or GATHER
+                                        # the <= 3*cap used vertices into a transient side buffer
+                                        # (chunks whose id RANGE clears the ceiling — tile seams,
+                                        # cross-island chunks; 9 chunks / 1.5 MB on tiled SM-lp,
+                                        # 1 / 201 KB on the world). plan_windows is PURE and
+                                        # pinned DLL-free by blas_split::self_test in --check
+                                        # (rebase/gather dichotomy, bijective gather map, bit-
+                                        # copied positions, every emitted value under the
+                                        # ceiling, the disabled arm absolute). FR_SPLIT_NOREBASE=1
+                                        # is the repro arm; FR_SPLIT_AUDIT=1 memcmps all three
+                                        # streamed remap/index buffers against the CPU plan. The
+                                        # hardware repro gate: `san-miguel-low-poly.obj --tile 3
+                                        # --check-dxr --prefer-amd` read 287 divergent-t px
+                                        # (max rel 1.04e-1) before, 0 (1.1e-5, NVIDIA-class)
+                                        # after; T1's 0.01% threshold means a `--tile 2` dose
+                                        # sits under the gate (16 px) — do not shrink the tile in
+                                        # that repro. Eliminated on the way, each by measurement:
+                                        # candidate loops (FR_ABL=noalpha,notrans still dirty),
+                                        # foliage sway, remap-data corruption (audit bit-exact),
+                                        # compaction, build serialization (per-build fences — the
+                                        # shared-scratch UAV barrier is SOUND), arena overrun
+                                        # (64 KB guard gaps). COSTS, paid on every GPU session:
                                         # a permanent 4 B/tri remap (+146 MB on the world), a
                                         # transient 12 B/tri reordered index stream during the
                                         # builds, and ~1 s of build time at 34.4M tris — against

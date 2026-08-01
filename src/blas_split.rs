@@ -80,6 +80,110 @@ pub struct BlasPlan {
     pub chunk_node: Vec<u32>,
 }
 
+/// The largest vertex-index VALUE a chunk BLAS geometry may hand the driver
+/// (2^24 — the bistro-dusk shard fix, 2026-08-01). On RDNA4 (R9700, driver
+/// 32.0.31035.1003) a SMALL geometry whose index values reach past this into
+/// a large shared vertex buffer builds a BLAS containing wrong triangles —
+/// scattered sliver geometry, deterministic per scene, both GPU pipelines
+/// (they share the one `SceneGpu`), NVIDIA bit-clean at identical inputs.
+/// Measured dose-response on tiled san-miguel-lp (`--tile 2|3 --check-dxr
+/// --prefer-amd`): 16 divergent px barely past the line, 287 well past it, 0
+/// after windowing; the single-BLAS build (one huge geometry) never trips it.
+/// Eliminated first, each by an A/B: candidate loops, foliage sway, the remap
+/// data (FR_SPLIT_AUDIT bit-exact), compaction, build serialization, arena
+/// overrun.
+pub const SPLIT_INDEX_CEILING: u32 = 1 << 24;
+
+/// How a chunk's geometry desc windows the vertex buffer so its index values
+/// stay under `SPLIT_INDEX_CEILING`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ChunkWindow {
+    /// Indices rebased by the chunk's min vertex id; the desc's
+    /// `VertexBuffer.StartAddress` slides by the same amount. The common
+    /// case — free, no data copied.
+    Rebase(u32),
+    /// Indices renumbered into a gathered side buffer (`base`/`count` are
+    /// vertex offsets into `Windows::aux`). Taken by chunks whose id RANGE
+    /// itself clears the ceiling (tile seams, the rewritten ground quad
+    /// beside early-buffer geometry — ranges to 49M measured on tiled
+    /// san-miguel), where no single subtraction can help. A chunk's ≤ 3·cap
+    /// distinct vertices copy bit-identically, so the side buffer stays
+    /// small and, like the reordered index stream, feeds only the builds.
+    Gather { base: u32, count: u32 },
+}
+
+/// `plan_windows`' product: per-chunk windowing + the gathered side buffer.
+pub struct Windows {
+    pub win: Vec<ChunkWindow>,
+    /// Per gather chunk: original vertex id -> local id (None for rebased).
+    pub map: Vec<Option<std::collections::HashMap<u32, u32>>>,
+    /// Gathered vertex positions, chunk-major, bit-copied from the source.
+    pub aux: Vec<[f32; 3]>,
+}
+
+/// Window every chunk of `plan` under `SPLIT_INDEX_CEILING`. Pure — the
+/// GPU-free half of the RDNA4 index-value workaround, so `self_test` can pin
+/// it without an adapter. `disabled` (FR_SPLIT_NOREBASE=1) yields absolute
+/// indices — `Rebase(0)` everywhere, the repro arm.
+pub fn plan_windows(
+    plan: &BlasPlan,
+    indices: &[[u32; 3]],
+    position: impl Fn(u32) -> [f32; 3],
+    disabled: bool,
+) -> Windows {
+    let n = plan.chunks();
+    let mut w = Windows {
+        win: Vec::with_capacity(n),
+        map: Vec::with_capacity(n),
+        aux: Vec::new(),
+    };
+    for i in 0..n {
+        let ids = || plan.tris(i).iter().flat_map(|&t| indices[t as usize]);
+        let min = ids().min().unwrap_or(0);
+        let max = ids().max().unwrap_or(0);
+        if disabled {
+            w.win.push(ChunkWindow::Rebase(0));
+            w.map.push(None);
+        } else if max - min < SPLIT_INDEX_CEILING {
+            w.win.push(ChunkWindow::Rebase(min));
+            w.map.push(None);
+        } else {
+            let base = w.aux.len() as u32;
+            let mut map = std::collections::HashMap::new();
+            for v in ids() {
+                map.entry(v).or_insert_with(|| {
+                    w.aux.push(position(v));
+                    w.aux.len() as u32 - 1 - base
+                });
+            }
+            w.win.push(ChunkWindow::Gather {
+                base,
+                count: w.aux.len() as u32 - base,
+            });
+            w.map.push(Some(map));
+        }
+    }
+    w
+}
+
+impl Windows {
+    /// Chunk `i`'s BLAS index triple for original tri `t` — the one rule the
+    /// index stream, the FR_SPLIT_AUDIT oracle, and the self-test all share.
+    pub fn tri(&self, i: usize, tri: [u32; 3]) -> [u32; 3] {
+        match self.win[i] {
+            ChunkWindow::Rebase(base) => tri.map(|v| v - base),
+            ChunkWindow::Gather { .. } => {
+                let map = self.map[i].as_ref().expect("gather chunk has a map");
+                tri.map(|v| map[&v])
+            }
+        }
+    }
+
+    pub fn gathered(&self) -> usize {
+        self.win.iter().filter(|w| matches!(w, ChunkWindow::Gather { .. })).count()
+    }
+}
+
 impl BlasPlan {
     pub fn chunks(&self) -> usize {
         self.chunk_node.len()
@@ -393,6 +497,72 @@ pub fn self_test(bvh: &Bvh) -> Result<(), String> {
             return Err("plan is not deterministic".into());
         }
     }
+    // Vertex windowing (the RDNA4 index-value workaround — SPLIT_INDEX_CEILING's
+    // doc carries the defect write-up). A synthetic 2-chunk plan over a sparse
+    // id space, sized so chunk 0 rebases and chunk 1 must gather:
+    //   chunk 0: tris over ids {10, 11, 12, 13} — range 3, Rebase(10).
+    //   chunk 1: tris over ids {5, CEILING+5, CEILING+6, 7} — range > CEILING,
+    //            Gather with 4 distinct vertices in first-appearance order.
+    // Deliberately synthetic rather than derived from the probe tree: no sane
+    // test scene reaches 2^24 vertices, and the gate must fire on every run.
+    {
+        let c = SPLIT_INDEX_CEILING;
+        let indices: Vec<[u32; 3]> = vec![
+            [10, 11, 12],
+            [11, 12, 13],
+            [5, c + 5, c + 6],
+            [c + 5, 7, c + 6],
+        ];
+        let wplan = BlasPlan {
+            packed_tris: vec![0, 1, 2, 3],
+            chunk_base: vec![0, 2, 4],
+            chunk_node: vec![0, 1],
+        };
+        let pos = |v: u32| [v as f32, v as f32 + 0.5, -(v as f32)];
+        let w = plan_windows(&wplan, &indices, pos, false);
+        if w.win[0] != ChunkWindow::Rebase(10) {
+            return Err(format!("windows: chunk 0 {:?}, expected Rebase(10)", w.win[0]));
+        }
+        let (base, count) = match w.win[1] {
+            ChunkWindow::Gather { base, count } => (base, count),
+            other => return Err(format!("windows: chunk 1 {other:?}, expected Gather")),
+        };
+        if base != 0 || count != 4 || w.aux.len() != 4 {
+            return Err(format!("windows: gather base {base} count {count} aux {}", w.aux.len()));
+        }
+        // Every emitted index value must sit under the ceiling, tri by tri,
+        // through the same `Windows::tri` the stream and the audit use — and
+        // gathered ids must be dense in [0, count).
+        for (i, chunk_tris) in [(0usize, 0..2usize), (1, 2..4)] {
+            for t in chunk_tris {
+                for v in w.tri(i, indices[t]) {
+                    if v >= SPLIT_INDEX_CEILING {
+                        return Err(format!("windows: chunk {i} emits index {v} over the ceiling"));
+                    }
+                    if i == 1 && v >= count {
+                        return Err(format!("windows: gathered id {v} outside [0, {count})"));
+                    }
+                }
+            }
+        }
+        // Gathered positions are the source's, bit-copied, at the local ids
+        // the map assigned.
+        let map = w.map[1].as_ref().ok_or("windows: gather chunk carries no map")?;
+        for (&orig, &local) in map {
+            if w.aux[(base + local) as usize] != pos(orig) {
+                return Err(format!("windows: gathered vertex {orig} not bit-copied"));
+            }
+        }
+        // The disabled arm (FR_SPLIT_NOREBASE) is absolute indices everywhere.
+        let raw = plan_windows(&wplan, &indices, pos, true);
+        if raw.win != vec![ChunkWindow::Rebase(0); 2] || !raw.aux.is_empty() {
+            return Err("windows: disabled arm is not Rebase(0) everywhere".into());
+        }
+        if (0..4).any(|t| raw.tri(usize::from(t >= 2), indices[t]) != indices[t]) {
+            return Err("windows: disabled arm rewrote an index".into());
+        }
+    }
+
     let (lo, mean, hi) = d.stats();
     eprintln!(
         "blas-split self-test: OK — {} tris -> {} chunks at cap {} (prims min {lo} mean {mean:.0} max {hi})",
