@@ -48,6 +48,31 @@ void cs_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     // values, keeping the continuation-vs-root timing comparison symmetric.
     if (gtid.x == 0u) frontier_record_reuse(rec.frontier, npx * spp);
 #endif
+    // Per-TILE emissive light cull (emissive::cull_tile's GPU twin): one
+    // conservative uint2 mask over the ≤64 cluster lights, from the tile
+    // RECT + inherited t_start — group-uniform inputs, so every thread
+    // computes the identical mask. Placed HERE, before the grid-stride loop,
+    // where control flow is still group-uniform (npx can be < LEAF_GROUP, so
+    // some lanes never enter the loop). Deliberately a SERIAL uniform loop,
+    // not a wave-cooperative build: a lane-strided WaveActiveBitOr silently
+    // drops lights at FR_LGROUP below the wave width (inactive lanes), and
+    // ≤64 iterations of pure ALU once per ~LEAF_TILE²·spp pixels is noise
+    // (the wave-aggregation campaign's own verdict on micro-coordination).
+    // The cull is EXACT — a culled light fails every pixel's d2 >= r_infl2
+    // test — so the reference kernel's full mask stays the bit-identical
+    // A/B oracle. ABL_NO_EL_CULL (FR_ABL=noelcull) is the full-mask probe.
+    uint2 el_mask = uint2(0xffffffffu, 0xffffffffu);
+#ifndef ABL_NO_EL_CULL
+    if (flags & FLAG_EMISSIVE) {
+        TF tf = tile_frustum(p0.x, p0.y, p1.x, p1.y);
+        el_mask = uint2(0u, 0u);
+        for (uint ei = 0u; ei < EL_COUNT; ++ei) {
+            if (el_tile_culled(tf, rec.t_start, ei)) continue;
+            if (ei < 32u) el_mask.x |= 1u << ei;
+            else         el_mask.y |= 1u << (ei - 32u);
+        }
+    }
+#endif
     // Grid-stride over the tile's pixels, so LEAF_GROUP is a knob instead of
     // being welded to "64 >= the largest tile". A leaf tile is NOT 8x8:
     // depth_full is driven by the WIDER screen axis, so at 1920x1080 a leaf is
@@ -111,7 +136,7 @@ void cs_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
 #endif
 #ifdef LEAF_NO_FB
             {
-                c = shade_full(cam_origin.xyz, dir, hit, rng, ps);
+                c = shade_full(cam_origin.xyz, dir, hit, rng, el_mask, ps);
             }
 #else
             if (fb_mode > 0u) {
@@ -122,7 +147,7 @@ void cs_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
                 float3 o_h, n_h;
                 c = shade_split(cam_origin.xyz, dir, hit, rng, shadow_samples, ao_samples,
                                 reflections != 0u, true, 0.0, pixel_cone, true, true,
-                                aw, o_h, n_h, ps);
+                                el_mask, aw, o_h, n_h, ps);
                 // Wave-aggregated: this fires once per HIT PIXEL, ~2M times to
                 // a single address at 1080p, from a 256-thread group. The
                 // reservation is hoisted out of the `if (prim)` so the whole
@@ -143,7 +168,7 @@ void cs_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
                     }
                 }
             } else {
-                c = shade_full(cam_origin.xyz, dir, hit, rng, ps);
+                c = shade_full(cam_origin.xyz, dir, hit, rng, el_mask, ps);
             }
 #endif
             t = hit.t;

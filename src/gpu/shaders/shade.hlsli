@@ -392,9 +392,17 @@ void glass_snell(float3 rd, float3 v, float3 ns, float3 n, float3 hit_p,
 // gather IS the emissive transport. FLAG_FIREFLIES / FLAG_EMISSIVE gate on
 // top per family, so day / emissive-free kernels are bit-identical whatever
 // the call site passes.
+// `el_mask`: which emissive cluster lights (bit ei = light ei) this pixel's
+// NEE may sample — the wavefront leaf kernel's per-TILE conservative cull
+// (trace_common::el_tile_culled; the CPU's cull_tile twin), full ~0 from
+// every tile-less path (reference, DXR, hemi). EXACT, not approximate: a
+// culled light would have failed every pixel's own d2 >= r_infl2 test, so
+// any conservative mask shades bit-identically — which is what keeps the
+// same-seed wavefront(culled)-vs-reference(full) A/B at 0.00e0.
 float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                    uint n_shadow, uint n_ao, bool refl, bool split_ambient,
                    float cone_w0, float cone_spread, bool aniso, bool cam_lights,
+                   uint2 el_mask,
                    out float3 amb_w, out float3 amb_o, out float3 amb_n,
                    out PrimSurf prim) {
     amb_w = 0.0;
@@ -675,6 +683,11 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
         // here would double-count it (src/emissive.rs).
         if (cam_lights && lap == 0u && (flags & FLAG_EMISSIVE)) {
             for (uint ei = 0u; ei < EL_COUNT; ++ei) {
+                // Tile-culled lights: skipped before the CB fetch. Ascending
+                // order preserved, so the kept lights' direct_d sums are the
+                // full loop's exact subsequence — bit-identical.
+                if (((ei < 32u ? el_mask.x >> ei : el_mask.y >> (ei - 32u)) & 1u) == 0u)
+                    continue;
                 float3 eto = el_a[ei].xyz - p;
                 float ed2 = dot(eto, eto);
                 float er2 = el_b[ei].w;
@@ -998,10 +1011,13 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
 
 // The plain (non-hemi) entry: quality straight from the frame constants;
 // the ray cone is the primary one (apex at the camera, one-pixel spread).
-float3 shade_full(float3 ro, float3 rd, HitInfo hit, inout uint rng, out PrimSurf prim) {
+// `el_mask` forwards verbatim — the leaf kernel passes its tile cull, every
+// tile-less caller (reference, DXR raygen/chs) the full ~0 mask.
+float3 shade_full(float3 ro, float3 rd, HitInfo hit, inout uint rng, uint2 el_mask,
+                  out PrimSurf prim) {
     float3 w, o, n;
     // Camera rays (and their reflection/glass continuations) resolve their
     // footprint anisotropically when the session asks for it — FLAG_ANISO.
     return shade_split(ro, rd, hit, rng, shadow_samples, ao_samples, reflections != 0u,
-                       false, 0.0, pixel_cone, true, true, w, o, n, prim);
+                       false, 0.0, pixel_cone, true, true, el_mask, w, o, n, prim);
 }

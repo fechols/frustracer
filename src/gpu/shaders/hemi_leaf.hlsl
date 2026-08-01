@@ -89,8 +89,12 @@ void cs_hemi_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
             // (shade.hlsli leaves `ao` at 1.0), so an arcade interior returns
             // open-field radiance and the whole GI integral flattens to a
             // constant. Keep these two in lockstep.
+            // Full emissive mask — inert: cam_lights=false means the
+            // emissive block never runs on bounce laps (the gather IS the
+            // emissive transport under GI).
             float3 l = shade_split(pt.o, d, h, rng, 1u, 1u, false, false,
-                                   0.0, HEMI_CONE_SPREAD, false, false, w3, o3, n3, ps_unused);
+                                   0.0, HEMI_CONE_SPREAD, false, false,
+                                   uint2(0xffffffffu, 0xffffffffu), w3, o3, n3, ps_unused);
             hemi_add3(pt.pixel, l * weight);
         } else {
             // GATHER, not the full sky: a GI leaf ray landing in the sun disc

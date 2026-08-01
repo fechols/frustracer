@@ -24,6 +24,14 @@ pub struct Stats {
     /// `secondary_rays`) — the `--check-gpu`/`--check-dxr` must-fire signal on
     /// emissive scenes (src/emissive.rs).
     pub emissive_rays: AtomicU64,
+    /// Leaf/capped tiles that ran the emissive per-tile light cull
+    /// (`emissive::cull_tile`) — the run_check must-fire that the cull is
+    /// live on armed emissive scenes (hybrid arms only; the plain reference
+    /// deliberately never culls).
+    pub el_cull_tiles: AtomicU64,
+    /// Σ lights culled by those tiles (out of tiles × scene count) — the
+    /// cull's effectiveness gauge, printed as the `el-cull:` segment.
+    pub el_cull_culled: AtomicU64,
     pub sky_pixels: AtomicU64,
     pub sky_tiles: AtomicU64,
     pub blocked_queries: AtomicU64,
@@ -113,6 +121,10 @@ pub struct LocalStats {
     pub secondary_rays: u64,
     /// Emissive-NEE subset of `secondary_rays` (see `Stats::emissive_rays`).
     pub emissive_rays: u64,
+    /// Tiles that ran the emissive light cull (see `Stats::el_cull_tiles`).
+    pub el_cull_tiles: u64,
+    /// Lights culled by those tiles (see `Stats::el_cull_culled`).
+    pub el_cull_culled: u64,
     pub sky_pixels: u64,
     pub sky_tiles: u64,
     pub blocked_queries: u64,
@@ -166,6 +178,8 @@ impl LocalStats {
         self.primary_rays += o.primary_rays;
         self.secondary_rays += o.secondary_rays;
         self.emissive_rays += o.emissive_rays;
+        self.el_cull_tiles += o.el_cull_tiles;
+        self.el_cull_culled += o.el_cull_culled;
         self.sky_pixels += o.sky_pixels;
         self.sky_tiles += o.sky_tiles;
         self.blocked_queries += o.blocked_queries;
@@ -218,6 +232,8 @@ impl Stats {
         self.primary_rays.store(0, Relaxed);
         self.secondary_rays.store(0, Relaxed);
         self.emissive_rays.store(0, Relaxed);
+        self.el_cull_tiles.store(0, Relaxed);
+        self.el_cull_culled.store(0, Relaxed);
         self.sky_pixels.store(0, Relaxed);
         self.sky_tiles.store(0, Relaxed);
         self.blocked_queries.store(0, Relaxed);
@@ -281,6 +297,12 @@ impl Stats {
         }
         if l.emissive_rays > 0 {
             self.emissive_rays.fetch_add(l.emissive_rays, Relaxed);
+        }
+        if l.el_cull_tiles > 0 {
+            self.el_cull_tiles.fetch_add(l.el_cull_tiles, Relaxed);
+        }
+        if l.el_cull_culled > 0 {
+            self.el_cull_culled.fetch_add(l.el_cull_culled, Relaxed);
         }
         if l.sky_pixels > 0 {
             self.sky_pixels.fetch_add(l.sky_pixels, Relaxed);
@@ -531,8 +553,17 @@ impl Stats {
         } else {
             String::new()
         };
+        // Emissive per-tile light cull — absent on unarmed/emissive-free
+        // sessions (the defer/adapt conditional-segment precedent).
+        let ect = self.el_cull_tiles.load(Relaxed);
+        let elcull = if ect > 0 {
+            let ecc = self.el_cull_culled.load(Relaxed);
+            format!(" | el-cull: {ect}t culled {ecc} (mean {:.1}/t)", ecc as f64 / ect as f64)
+        } else {
+            String::new()
+        };
         format!(
-            "tiles {tiles} | fr-queries {fq} (blocked {blocked}) | cut mean {cut_mean:.1} (ovf {ovf}) | nodes: frustum {fnodes} + ray {rnodes}{rsplit} = {} | rays: {prim} prim + {sec} sec | sky-px (0 rays) {sky} | coarse-px {coarse} (smp {csmp}) | temporal: seeds {tseeds} sky {tsky} cells {ttests} | mean t_start/t_hit {skip:.2}{adopt}{tring}{replay}{hemi}{share}{adapt}{defer}{tri}",
+            "tiles {tiles} | fr-queries {fq} (blocked {blocked}) | cut mean {cut_mean:.1} (ovf {ovf}) | nodes: frustum {fnodes} + ray {rnodes}{rsplit} = {} | rays: {prim} prim + {sec} sec | sky-px (0 rays) {sky} | coarse-px {coarse} (smp {csmp}) | temporal: seeds {tseeds} sky {tsky} cells {ttests} | mean t_start/t_hit {skip:.2}{adopt}{tring}{replay}{hemi}{share}{adapt}{defer}{tri}{elcull}",
             fnodes + rnodes
         )
     }

@@ -9,7 +9,9 @@
 //! `--no-emissive-lights` spells the default. Off by default because the
 //! cost is real on the CPU tracer (measured bistro: +5.5 ms at N=32, of
 //! which ~3.3 ms is the shadow rays themselves — irreducible, they ARE the
-//! feature; the ~2.2 ms per-pixel scan is the cullable half) while the
+//! feature; the ~2.2 ms per-pixel scan half is RECOVERED by the per-leaf-
+//! tile cull since 2026-08-01 — `cull_tile` below, measured nocull 54.71 →
+//! cull 52.46 ms on the same workload) while the
 //! PHYSICAL calibration's pools are faint before true nightfall; if a
 //! feel-test lands an artistic boost (the MOON_E_OVER_PI precedent) the
 //! default is one constant to revisit. Either way a scene with no emissive
@@ -102,9 +104,10 @@ pub fn budget() -> u32 {
 }
 
 /// Hard cap — sizes the `FrameCb` emissive rows (raise `CB_STRIDE` in
-/// lockstep). The per-pixel scan is linear in the IN-RANGE count, so past
-/// ~64 the right move is the per-leaf-tile cull + SRV-table follow-ons (the
-/// fireflies' own documented next step), never a bare cap raise.
+/// lockstep). The per-TILE cull (`cull_tile`, shipped 2026-08-01) bounds
+/// the per-pixel scan by the in-range count on the hybrid arms; past ~64
+/// the remaining move is the SRV-table follow-on (the CB rows are the
+/// 64/64-full root signature's ceiling), never a bare cap raise.
 pub const MAX_EMISSIVE_LIGHTS: usize = 64;
 pub const EL_DEFAULT: u32 = 32;
 
@@ -197,6 +200,75 @@ pub fn irradiance(l: &EmissiveLight, d2: f32) -> Vec3A {
     // the shading point stands (window ≤ 1 only tightens it).
     let inv = (1.0 / (d2 + l.rc2)).min(EL_E_MAX / lc);
     c * (inv * crate::fireflies::window(d2, l.r_infl2))
+}
+
+/// The per-leaf-tile light cull's A/B lever: `FR_ABL=noelcull` skips the
+/// cull and hands every tile the full set. The `foliage::sway_abl`
+/// image-NEUTRAL idiom, deliberately NOT `shade::abl`'s "the image is
+/// deliberately wrong" wording — the cull is EXACT (a rejected influence
+/// sphere contains no tile hit, and the windowed falloff is exactly 0 at
+/// `r_infl`), so this arm is bit-identical by construction: a pure cost
+/// probe, loud on departure.
+pub fn cull_abl() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| {
+        let off = std::env::var("FR_ABL").unwrap_or_default().contains("noelcull");
+        if off {
+            eprintln!("FR_ABL (emissive): noelcull — per-tile light cull off (bit-identical cost probe)");
+        }
+        off
+    })
+}
+
+/// Conservative per-leaf-tile cull: a COMPACTED copy holding only the
+/// lights whose influence sphere can contain a hit of this tile, plus the
+/// culled count (for the `el-cull` stats segment). THREE rejection tests,
+/// each independently erring toward KEEP:
+/// 1. the tile-frustum plane test (`TileFrustum::sphere_outside` — apex
+///    planes, no far plane, so it bounds exactly the PRIMARY hits this tier
+///    serves; degenerate zero normals never cull);
+/// 2. the inherited-claim near ball (hits satisfy `t >= t_start`, so a
+///    light with `|c − o| + r` short of the ball cannot reach one);
+/// 3. the camera FORWARD half-space — `dot(forward, c − o) < −r` culls,
+///    sound because forward ⊥ right/up makes `dot(forward, d) > 0` for
+///    every primary direction, so every hit lies strictly forward of the
+///    apex. This arm exists because (1) alone cannot exclude the ANTIPODAL
+///    cone: a narrow tile's side-plane dots against a behind-the-camera
+///    point are only ≈ −dist·sin(half-angle), so the common
+///    walked-past-the-lamp case would otherwise never cull.
+/// EXACT by the window's exact zero: a culled light would have failed every
+/// pixel's `d2 >= r_infl2` test — contributing nothing, drawing no rng,
+/// bumping no counter — and kept lights stay in ascending order (the same
+/// subsequence ⇒ bit-identical `direct_d` sums). CPU and GPU (leaf.hlsl's
+/// `el_mask` via trace_common's `el_tile_culled`) cull independently — each
+/// side only needs its own conservativeness, so no bit-parity contract
+/// links the two masks.
+pub fn cull_tile(
+    el: &EmissiveLights,
+    tf: &crate::frustum::TileFrustum,
+    forward: Vec3A,
+    t_start: f32,
+) -> (EmissiveLights, u32) {
+    let mut out = EmissiveLights::off();
+    let mut culled = 0u32;
+    for i in 0..el.count as usize {
+        let l = &el.lights[i];
+        let c = Vec3A::from(l.pos);
+        let r = l.r_infl2.sqrt();
+        let rel = c - tf.origin;
+        // Near ball + forward half-space: strict with a safety margin in
+        // the KEEP direction (a light AT a boundary is kept).
+        let near_out = rel.length() + r < t_start * (1.0 - 1e-5);
+        let eps = 1e-5 * (1.0 + rel.abs().max_element());
+        let behind = forward.dot(rel) < -r - eps;
+        if near_out || behind || tf.sphere_outside(c, r) {
+            culled += 1;
+            continue;
+        }
+        out.lights[out.count as usize] = *l;
+        out.count += 1;
+    }
+    (out, culled)
 }
 
 /// Mean emitted radiance of triangle (i0,i1,i2) for material `mat`: the flat
@@ -656,6 +728,108 @@ pub fn self_test() -> Result<(), String> {
         let el = derive_parts(&pos, &idx, &tm, &mats, &[], &[], cmin, cmax, eps, 999);
         if el.count != 1 {
             return Err("over-cap budget mishandled".into());
+        }
+    }
+
+    // 7. The per-leaf-tile cull (cull_tile + TileFrustum::sphere_outside),
+    //    against the REAL camera construction the renderer culls with — a
+    //    center tile of a 1920x1080 basis. Six lights exercising every
+    //    rejection arm, then the CONSERVATIVENESS pin: at every sample
+    //    point a tile ray can shade (grid of pixels × t >= t_start), every
+    //    CULLED light's irradiance must be exactly ZERO — the property that
+    //    makes the cull bit-identical rather than approximate.
+    {
+        let cam = crate::camera::Camera::look_at(
+            Vec3A::ZERO,
+            Vec3A::new(0.0, 0.0, 10.0),
+            60f32.to_radians(),
+        );
+        let basis = cam.basis(1920, 1080);
+        let (x0, y0, x1, y1) = (944, 532, 976, 564); // 32-px center tile
+        let tf = basis.tile_frustum(x0, y0, x1, y1);
+        let mk = |p: [f32; 3], r_infl2: f32| EmissiveLight {
+            pos: p,
+            rc2: 1e-4,
+            color: [1.0, 1.0, 1.0],
+            r_infl2,
+        };
+        let mut el = EmissiveLights::off();
+        // 0: on-axis in front — KEPT. 1: far off-axis — plane-culled.
+        // 2: behind the camera — FORWARD-culled (the side planes provably
+        // cannot: their dots are only ≈ −dist·sin(half-angle), the
+        // antipodal-cone hole the third test exists for). 3: on-axis but
+        // inside the inherited near ball (t_start 5) — near-ball-culled.
+        // 4: center just outside the narrow tile frustum, sphere straddling
+        // back in — must be KEPT (err-toward-keep). 5: on-axis far — KEPT
+        // (order).
+        let lights = [
+            mk([0.0, 0.0, 10.0], 1.0),
+            mk([100.0, 0.0, 10.0], 1.0),
+            mk([0.0, 0.0, -10.0], 1.0),
+            mk([0.0, 0.0, 1.0], 0.25),
+            mk([0.5, 0.0, 10.0], 4.0),
+            mk([0.0, 0.0, 40.0], 1.0),
+        ];
+        for (i, l) in lights.iter().enumerate() {
+            el.lights[i] = *l;
+            el.count = (i + 1) as u32;
+        }
+        let fwd = basis.forward();
+        let t_start = 5.0f32;
+        let (kept, culled) = cull_tile(&el, &tf, fwd, t_start);
+        if culled == 0 || kept.count == 0 {
+            return Err(format!(
+                "cull anti-vacuity: kept {} culled {culled} — the layout must exercise both",
+                kept.count
+            ));
+        }
+        // The known verdicts: 0/4/5 kept in ORDER (the fp-subsequence
+        // contract), 1/2/3 culled.
+        let want = [lights[0], lights[4], lights[5]];
+        if kept.count != 3
+            || (0..3).any(|i| kept.lights[i] != want[i])
+        {
+            return Err(format!("cull verdicts wrong: kept {} of 6", kept.count));
+        }
+        // Conservativeness: every culled light invisible from every point a
+        // tile ray can shade. (Culled = in `el` but not in `kept`.)
+        for l in [&lights[1], &lights[2], &lights[3]] {
+            for py in (y0..y1).step_by(8) {
+                for px in (x0..x1).step_by(8) {
+                    for t in [t_start, 6.0, 10.0, 50.0, 400.0] {
+                        let p = basis.ray_dir(px as f32 + 0.5, py as f32 + 0.5) * t;
+                        let d2 = (p - Vec3A::from(l.pos)).length_squared();
+                        if irradiance(l, d2) != Vec3A::ZERO {
+                            return Err(format!(
+                                "over-cull: light at {:?} reaches a tile point at t {t}",
+                                l.pos
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        // t_start 0 disarms the near ball: light 3 comes back (light 2 stays
+        // forward-culled).
+        let (kept0, _) = cull_tile(&el, &tf, fwd, 0.0);
+        if kept0.count != 4 {
+            return Err(format!("near-ball arm: t_start 0 kept {} (want 4)", kept0.count));
+        }
+        // A zero-area tile degenerates every plane to a zero normal, which
+        // never culls (the frustum.rs contract) — only the plane-independent
+        // forward arm still fires, so exactly the behind light is culled.
+        let tf0 = basis.tile_frustum(x0, y0, x0, y0);
+        let (kept_d, culled_d) = cull_tile(&el, &tf0, fwd, 0.0);
+        if kept_d.count != 5 || culled_d != 1 {
+            return Err(format!(
+                "degenerate frustum must keep all but the behind light: kept {} culled {culled_d}",
+                kept_d.count
+            ));
+        }
+        // Structural off in = structural off out.
+        let (kept_e, culled_e) = cull_tile(&EmissiveLights::off(), &tf, fwd, t_start);
+        if kept_e.count != 0 || culled_e != 0 {
+            return Err("empty set culled something".into());
         }
     }
 

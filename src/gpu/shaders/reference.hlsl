@@ -29,7 +29,11 @@ void cs_reference(uint3 id : SV_DispatchThreadID) {
         float t;
         PrimSurf ps;
         if (trace_closest(cam_origin.xyz, dir, 0.0, FLT_MAX, hit)) {
-            c = shade_full(cam_origin.xyz, dir, hit, rng, ps);
+            // Full emissive mask: the reference deliberately never culls —
+            // it is the unculled oracle the leaf kernel's tile mask is
+            // proven against (the same-seed A/B stays exact because a
+            // culled light contributes exactly zero).
+            c = shade_full(cam_origin.xyz, dir, hit, rng, uint2(0xffffffffu, 0xffffffffu), ps);
             t = hit.t;
             if (prim) gbuf_write_hit(pi, sp.x, sp.y, dir, hit.t, ps SWAY_ARG(hit.inst));
         } else {

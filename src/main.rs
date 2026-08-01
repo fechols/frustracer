@@ -12391,6 +12391,40 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     let info: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
     let tbuf: Vec<AtomicU32> = (0..rw * rh).map(|_| AtomicU32::new(0)).collect();
 
+    // Emissive per-tile light cull liveness (scene-derived, the alpha-rej
+    // shape — independent of `structural`), snapshotted HERE because the
+    // bench loop below is the first `stats.clear()` since run_check's
+    // Stats was born: everything the verify phases traced is still in the
+    // counters. An ARMED emissive scene must have run the cull
+    // (`el_cull_tiles > 0` — the verify hybrid frames shade every leaf
+    // tile; run `--check --emissive-lights` on helmet/bistro for this arm,
+    // checks-follow-the-session-flags), and an unarmed/emissive-free
+    // session must count exactly 0 (the whole path is behind the arming
+    // gate). Cull EFFECTIVENESS (something actually culled + bit-equal
+    // radiance) is pinned closed-form in emissive::self_test — a real pose
+    // can legitimately keep every light. FR_ABL=noelcull legitimately
+    // zeroes the tile count (the full-set cost probe), so the armed
+    // must-fire stands down under it.
+    let el_cull_ok = {
+        let ect = stats.el_cull_tiles.load(Relaxed);
+        let armed = scene.emissive.count > 0 && emissive::enabled();
+        if armed && !emissive::cull_abl() {
+            eprintln!(
+                "check: el-cull tiles {ect}, lights culled {}",
+                stats.el_cull_culled.load(Relaxed)
+            );
+            if ect == 0 {
+                eprintln!("check: FAIL armed emissive scene ran the per-tile cull on 0 tiles");
+            }
+            ect > 0
+        } else if !armed && ect != 0 {
+            eprintln!("check: FAIL {ect} el-cull tiles on an unarmed/emissive-free session");
+            false
+        } else {
+            true
+        }
+    };
+
     const BENCH_FRAMES: u32 = 8;
     // (hemi_queries, share groups, share fallback) per row, for the
     // hemi-share must-fires below (share-on must run strictly fewer queries).
@@ -13617,6 +13651,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         ("clouds", clouds_ok),
         ("fireflies", fireflies_ok),
         ("emissive", emissive_ok),
+        ("el-cull", el_cull_ok),
         ("tod", tod_ok),
         ("bloom", bloom_ok),
         ("sphcell", sph_ok),

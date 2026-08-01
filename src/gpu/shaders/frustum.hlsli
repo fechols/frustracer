@@ -51,35 +51,11 @@ StructuredBuffer<BvhNode> bvh_nodes : register(t0);
 #endif
 groupshared uint g_stack[32 * LANE_STACK];
 
-// Screen-tile frustum: apex + 4 inward unit normals through it.
-struct TF {
-    float3 origin;
-    float3 nrm[4];
-};
-
-float3 frustum_plane(float3 a, float3 b, float3 center) {
-    precise float3 n = cross(a, b);
-    n = dot(n, center) < 0.0 ? -n : n;
-    // Degenerate (near-parallel corner rays) -> zero normal -> never culls.
-    return normalize_or_zero(n);
-}
-
-// camera.rs::tile_frustum: planes through the tile's continuous pixel-grid
-// EDGES (footprints, not centers) so jittered samples stay inside.
-TF tile_frustum(uint x0, uint y0, uint x1, uint y1) {
-    float3 c0 = ray_dir(float(x0), float(y0));
-    float3 c1 = ray_dir(float(x1), float(y0));
-    float3 c2 = ray_dir(float(x1), float(y1));
-    float3 c3 = ray_dir(float(x0), float(y1));
-    float3 center = c0 + c1 + c2 + c3;
-    TF f;
-    f.origin = cam_origin.xyz;
-    f.nrm[0] = frustum_plane(c0, c1, center);
-    f.nrm[1] = frustum_plane(c1, c2, center);
-    f.nrm[2] = frustum_plane(c2, c3, center);
-    f.nrm[3] = frustum_plane(c3, c0, center);
-    return f;
-}
+// TF / frustum_plane / tile_frustum moved to trace_common.hlsli (pasted
+// before this file in every unit): leaf.hlsl's per-tile emissive-light cull
+// needs them, and leaf deliberately does NOT paste this file — the
+// groupshared slab above would put LDS into the one RayQuery kernel the
+// Intel L1 rule keeps LDS-free. One source, no drift.
 
 // frustum.rs::tri_cell — a spherical-triangle hemisphere cell: 3 planes
 // through the apex; the 4th is zero (a zero normal never culls).

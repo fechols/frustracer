@@ -147,6 +147,27 @@ impl TileFrustum {
         }
         false
     }
+
+    /// Conservative sphere-vs-frustum: true only if the sphere lies fully
+    /// outside some side plane — `aabb_outside`'s exact shape with the
+    /// radius in place of the positive-vertex walk (same relative-eps slack,
+    /// pushed in the inclusive direction; a zero degenerate normal gives
+    /// `0 < -r - eps` = false, so it never culls, and `pads` relax further
+    /// on the shared-apex paths, zero on screen tiles). Serves the emissive
+    /// per-leaf-tile light cull (src/emissive.rs::cull_tile): the planes
+    /// pass through the apex with NO far plane, so a rejected influence
+    /// sphere provably contains no primary hit of this tile.
+    #[inline]
+    pub fn sphere_outside(&self, center: Vec3A, r: f32) -> bool {
+        let rel = center - self.origin;
+        let eps = 1e-5 * (1.0 + rel.abs().max_element());
+        for (n, pad) in self.normals[..self.n_planes].iter().zip(&self.pads) {
+            if n.dot(rel) < -r - eps - pad {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 /// CPU R&D lever (`FR_RANGE=1` enables frustum-clipped AABB ranging).

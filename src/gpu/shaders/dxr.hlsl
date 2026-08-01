@@ -47,7 +47,9 @@ void raygen() {
         float t;
         if (trace_closest(cam_origin.xyz, dir, 0.0, FLT_MAX, h)) {
             PrimSurf ps;
-            col = shade_full(cam_origin.xyz, dir, h, rng, ps);
+            // Full emissive mask — the DXR pipeline has no quadtree tile to
+            // cull from (and measures the whole feature in the noise band).
+            col = shade_full(cam_origin.xyz, dir, h, rng, uint2(0xffffffffu, 0xffffffffu), ps);
             t = h.t;
             if (s == probe_sample)
                 gbuf_write_hit(pi, sp.x, sp.y, dir, t, ps SWAY_ARG(h.inst));
@@ -135,7 +137,8 @@ void chs_shade(inout RayPayload p, in BuiltInTriangleIntersectionAttributes a) {
         height_march(h.tri, WorldRayOrigin(), WorldRayDirection(), h.t, h.u, h.v);
 #endif
     PrimSurf ps;
-    p.color = shade_full(WorldRayOrigin(), WorldRayDirection(), h, p.rng, ps);
+    // Full emissive mask — no tile exists on this pipeline (see raygen).
+    p.color = shade_full(WorldRayOrigin(), WorldRayDirection(), h, p.rng, uint2(0xffffffffu, 0xffffffffu), ps);
     p.t = h.t;
     // G-buffer capture: a pure copy of already-computed values, zero rng
     // draws, FLAG_GBUF-gated inside the helper. Under --spp chs_shade fires

@@ -326,8 +326,9 @@ cargo run --release -- --emissive-lights  # ARM emissive surfaces lighting the s
                                       # LAST after sway_mv_base; CB_STRIDE 2560→4608, the
                                       # MAX_SPP-lockstep class; MAX_EMISSIVE_LIGHTS injected by
                                       # spp_defs) — the root signature is 64/64 FULL, so an SRV
-                                      # table + per-leaf-tile cull is the documented follow-on
-                                      # before the cap ever rises. CPU↔GPU parity BY DATA (the
+                                      # table is the documented follow-on before the cap ever
+                                      # rises (the PER-LEAF-TILE CULL half shipped, next
+                                      # paragraph). CPU↔GPU parity BY DATA (the
                                       # ff precedent); shade.hlsli's `fireflies` bool became
                                       # `cam_lights` (one camera-path-NEE gate for both light
                                       # families). An emissive-free scene (procedural, --stress,
@@ -346,6 +347,50 @@ cargo run --release -- --emissive-lights  # ARM emissive surfaces lighting the s
                                       # exactly 0 unarmed (the alpha-rej pattern, same --cam
                                       # caveat class — an armed pose outside every influence
                                       # radius trips it).
+                                      # PER-LEAF-TILE CULL (2026-08-01, IN — the scan half of
+                                      # the cost, recovered): armed HYBRID arms cull the light
+                                      # set ONCE per leaf/capped tile instead of testing all N
+                                      # per pixel — CPU emissive::cull_tile (a compacted copy
+                                      # hoisted in shade_tile/sparse_fill beside ray_roots; the
+                                      # frustum rebuilt from ctx.cam INSIDE the tile, which is
+                                      # what keeps structure replay bit-identical for free),
+                                      # GPU a group-uniform uint2 mask in leaf.hlsl (trace_
+                                      # common::el_tile_culled; TF/tile_frustum HOISTED from
+                                      # frustum.hlsli into trace_common so the zero-LDS leaf
+                                      # kernel can build one — deliberately a SERIAL uniform
+                                      # loop, NOT wave-cooperative: a lane-strided BitOr build
+                                      # silently over-culls at FR_LGROUP below the wave width).
+                                      # THREE tests, each independently conservative: the 4
+                                      # side planes (TileFrustum::sphere_outside — zero
+                                      # degenerate normals never cull), the inherited-claim
+                                      # near ball (t >= t_start), and the camera FORWARD
+                                      # half-space — the third exists because narrow side
+                                      # planes provably cannot exclude the ANTIPODAL cone (dots
+                                      # ≈ −dist·sin(half-angle)), so walked-past lamps never
+                                      # culled without it. EXACT, not approximate: the windowed
+                                      # falloff is exactly 0 at r_infl, so a culled light
+                                      # contributed nothing (no rng, no counter) — CPU and GPU
+                                      # cull INDEPENDENTLY (no bit-parity contract), the plain
+                                      # reference / DXR / --defer-shade arms keep the full set
+                                      # as unculled oracles, and the same-seed wavefront-vs-
+                                      # reference A/B on armed helmet reads EXACT 0.00e0 with
+                                      # the 3,006,754-ray anchor unchanged — the shipped proof.
+                                      # FR_ABL=noelcull is the bit-identical cost probe (CPU
+                                      # emissive::cull_abl + ABL_NO_EL_CULL in abl_defs — NOT
+                                      # wavefront_ablation_defs, the probe-reach rule). Gates:
+                                      # the self_test cull family (verdicts incl. the
+                                      # antipodal-cone pin, conservativeness over a tile-ray
+                                      # point grid, order preservation, degenerate-frustum
+                                      # keep, near-ball disarm) + --check's `el-cull` must-fire
+                                      # (armed: tiles > 0, snapshotted BEFORE the bench loop's
+                                      # stats.clear; unarmed: exactly 0; stands down under the
+                                      # lever). MEASURED (bistro armed N=32, --spin path 120f
+                                      # prefix, interleaved min-of-3 with cooldowns): nocull
+                                      # 54.71 -> cull 52.46 ms — the predicted ~2.2 ms scan
+                                      # half; helmet check counters read ~30.5/32 culled per
+                                      # tile. GPU wavefront: arms OVERLAP (medians 0.79 vs
+                                      # 0.85 — noise band, per the wave-aggregation verdict on
+                                      # micro-work; do not chase it).
                                       # Showcases: bistro dusk street lamps, DamagedHelmet's
                                       # visor. Calibration instrument the fireflies never had:
                                       # the same pose as a GI still frame IS ground truth for

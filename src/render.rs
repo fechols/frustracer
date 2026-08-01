@@ -258,10 +258,13 @@ pub fn render_frame(ctx: &FrameCtx, hybrid: bool) {
     } else {
         crate::zone!("trace-plain");
         // Plain per-pixel reference: the ground truth and the A/B baseline.
+        // Full (unculled) emissive set by design — this arm is the A/B
+        // baseline the culled hybrid arms are proven against.
+        let el = full_el(ctx);
         (0..ctx.rh).into_par_iter().for_each(|y| {
             let mut ls = LocalStats::default();
             for x in 0..ctx.rw {
-                shade_pixel(ctx, x, y, 0.0, 0, KIND_LEAF, None, &mut ls);
+                shade_pixel(ctx, x, y, 0.0, 0, KIND_LEAF, None, el, &mut ls);
             }
             ctx.stats.add(&ls);
         });
@@ -590,6 +593,20 @@ enum TilePend {
 /// material. Mixed-material or sky-containing leaves shade inline from the
 /// already-traced records (the shade_cell trace-first precedent), which is
 /// bit-identical because each pixel's rng is self-contained in its Traced.
+/// The UNCULLED emissive set under the arming gate (!fb.gi × derived
+/// clusters × the live lever) — what the tile-less shading paths pass where
+/// shade_tile/sparse_fill pass their per-tile `cull_tile` subset: the plain
+/// reference arm (deliberately unculled — it is the ground-truth/A-B
+/// baseline, and what check-gpu's CPU frames run, so its ray counts anchor
+/// the must-fires) and the --defer-shade paths (tile identity is lost at
+/// the material-sorted flush; an experimental lever, not worth plumbing).
+/// Sound because the cull is an OPTIMIZATION of an exact predicate — full
+/// set and culled set shade bit-identically.
+fn full_el<'c>(ctx: &'c FrameCtx) -> Option<&'c crate::emissive::EmissiveLights> {
+    (!ctx.q.fb.gi && ctx.scene.emissive.count > 0 && crate::emissive::enabled())
+        .then_some(&ctx.scene.emissive)
+}
+
 fn defer_leaf(
     ctx: &FrameCtx,
     x0: usize,
@@ -621,7 +638,7 @@ fn defer_leaf(
     let deferrable = mat != u32::MAX && ctx.scene.materials[mat as usize].any_tex();
     let shade_one = |i: usize, tr: &mut Traced, ls: &mut LocalStats| {
         let (x, y) = (x0 + i % w, y0 + i / w);
-        shade_traced(ctx, x, y, t_start, depth, KIND_LEAF, tr, None, ls, true, true, shade::VisCtl::Off, None);
+        shade_traced(ctx, x, y, t_start, depth, KIND_LEAF, tr, None, ls, true, true, shade::VisCtl::Off, None, full_el(ctx));
     };
     if !deferrable {
         // Counted like any other inline-shaded leaf (`defer_mixed` is "shaded
@@ -633,7 +650,7 @@ fn defer_leaf(
         for y in y0..y1 {
             for x in x0..x1 {
                 if (x, y) != (x0, y0) {
-                    shade_pixel(ctx, x, y, t_start, depth, KIND_LEAF, Some(cut), &mut ls);
+                    shade_pixel(ctx, x, y, t_start, depth, KIND_LEAF, Some(cut), full_el(ctx), &mut ls);
                 }
             }
         }
@@ -687,7 +704,7 @@ fn defer_leaf(
     }
     for i in staged..n {
         let (x, y) = (x0 + i % w, y0 + i / w);
-        shade_pixel(ctx, x, y, t_start, depth, KIND_LEAF, Some(cut), &mut ls);
+        shade_pixel(ctx, x, y, t_start, depth, KIND_LEAF, Some(cut), full_el(ctx), &mut ls);
     }
     ctx.stats.add(&ls);
     TilePend::Done
@@ -725,6 +742,9 @@ fn shade_deferred(ctx: &FrameCtx, px: &mut [DeferPx], ls: &mut LocalStats) {
             true,
             shade::VisCtl::Off,
             None,
+            // Full set: the material-sorted flush has no tile to cull from
+            // (see full_el — bit-identical to the culled path by design).
+            full_el(ctx),
         );
     }
 }
@@ -881,6 +901,31 @@ fn shade_tile(
     // top-ups, replayed leaves) sees only the translated roots.
     let mut rbuf = [0u32; MAX_CUT];
     let cut = crate::ftree::Accel::for_tiles(ctx.bvh).ray_roots(cut, &mut rbuf);
+    // Emissive cluster lights, culled ONCE per tile (emissive::cull_tile —
+    // the second per-tile hoist beside ray_roots; the arming gate moved here
+    // from shade_traced, evaluated per tile instead of per pixel, and
+    // unarmed sessions build no frustum at all). Rebuilding the frustum
+    // from ctx.cam INSIDE the tile is what keeps structure REPLAY
+    // bit-identical for free: replay only fires on a bit-equal basis, so
+    // the rebuilt frustum — hence the culled set — is the producing
+    // frame's exactly. The cull is EXACT (see cull_tile's header), so the
+    // FR_ABL=noelcull full-set arm is a pure cost probe.
+    let tile_el = (!ctx.q.fb.gi
+        && ctx.scene.emissive.count > 0
+        && crate::emissive::enabled())
+    .then(|| {
+        if crate::emissive::cull_abl() {
+            (ctx.scene.emissive, 0)
+        } else {
+            let tf = ctx.cam.tile_frustum(x0, y0, x1, y1);
+            let r =
+                crate::emissive::cull_tile(&ctx.scene.emissive, &tf, ctx.cam.forward(), t_start);
+            ls.el_cull_tiles += 1;
+            ls.el_cull_culled += r.1 as u64;
+            r
+        }
+    });
+    let el = tile_el.as_ref().map(|(e, _)| e);
     // adaptive (XeSS) and fb never co-occur (fb is pinned OFF on upscaler
     // frames), so the two cell loops can share the branch without a tiebreak.
     debug_assert!(!(ctx.adaptive && (ctx.q.fb.ao || ctx.q.fb.gi)));
@@ -891,7 +936,7 @@ fn shade_tile(
             let mut cx = x0;
             while cx < x1 {
                 let cx1 = (cx + ADAPT_CELL).min(x1);
-                shade_cell(ctx, cx, cy, cx1, cy1, t_start, depth, kind, cut, &mut ls);
+                shade_cell(ctx, cx, cy, cx1, cy1, t_start, depth, kind, cut, el, &mut ls);
                 cx = cx1;
             }
             cy = cy1;
@@ -906,7 +951,7 @@ fn shade_tile(
             let mut cx = x0;
             while cx < x1 {
                 let cx1 = (cx + ADAPT_CELL).min(x1);
-                shade_hemi_cell(ctx, cx, cy, cx1, cy1, t_start, depth, kind, cut, &mut hrec, &mut ls);
+                shade_hemi_cell(ctx, cx, cy, cx1, cy1, t_start, depth, kind, cut, el, &mut hrec, &mut ls);
                 cx = cx1;
             }
             cy = cy1;
@@ -914,7 +959,7 @@ fn shade_tile(
     } else {
         for y in y0..y1 {
             for x in x0..x1 {
-                shade_pixel(ctx, x, y, t_start, depth, kind, Some(cut), &mut ls);
+                shade_pixel(ctx, x, y, t_start, depth, kind, Some(cut), el, &mut ls);
             }
         }
     }
@@ -940,6 +985,7 @@ fn shade_hemi_cell(
     depth: u32,
     kind: u32,
     cut: &[u32],
+    el: Option<&crate::emissive::EmissiveLights>,
     rec: &mut crate::hemi::HemiShare,
     ls: &mut LocalStats,
 ) {
@@ -947,7 +993,7 @@ fn shade_hemi_cell(
         // Odd-edge remainder: nothing to share within, plain per-pixel.
         for y in cy..cy1 {
             for x in cx..cx1 {
-                shade_pixel(ctx, x, y, t_start, depth, kind, Some(cut), ls);
+                shade_pixel(ctx, x, y, t_start, depth, kind, Some(cut), el, ls);
             }
         }
         return;
@@ -1034,6 +1080,7 @@ fn shade_hemi_cell(
             true,
             shade::VisCtl::Off,
             if shared { Some(&*rec) } else { None },
+            el,
         );
     }
 }
@@ -1071,13 +1118,14 @@ fn shade_cell(
     depth: u32,
     kind: u32,
     cut: &[u32],
+    el: Option<&crate::emissive::EmissiveLights>,
     ls: &mut LocalStats,
 ) {
     if (cx1 - cx, cy1 - cy) != (ADAPT_CELL, ADAPT_CELL) {
         // Odd-edge remainder: nothing to share within, plain per-pixel.
         for y in cy..cy1 {
             for x in cx..cx1 {
-                shade_pixel(ctx, x, y, t_start, depth, kind, Some(cut), ls);
+                shade_pixel(ctx, x, y, t_start, depth, kind, Some(cut), el, ls);
                 ls.adapt_partial_px += 1;
             }
         }
@@ -1114,6 +1162,7 @@ fn shade_cell(
         false,
         shade::VisCtl::Capture(&mut vis),
         None,
+        el,
     )
     .c;
 
@@ -1144,7 +1193,7 @@ fn shade_cell(
             shade::VisCtl::Off
         };
         out[i] = shade_traced(
-            ctx, x, y, t_start, depth, kind, &mut tr[i], sp[i], ls, true, false, v, None,
+            ctx, x, y, t_start, depth, kind, &mut tr[i], sp[i], ls, true, false, v, None, el,
         )
         .c;
     }
@@ -1177,6 +1226,7 @@ fn shade_cell(
                     false,
                     shade::VisCtl::Off,
                     None,
+                    el,
                 );
                 sum += s2.c;
             }
@@ -1219,6 +1269,7 @@ fn shade_cell(
                 false,
                 shade::VisCtl::Off,
                 None,
+                el,
             );
             out[i] = (out[i] + s2.c) * 0.5;
             ls.adapt_topup += 1;
@@ -1590,6 +1641,12 @@ fn shade_traced(
     do_splat: bool,
     vis: shade::VisCtl,
     hemi_share: Option<&crate::hemi::HemiShare>,
+    // The emissive cluster set THIS pixel's NEE may sample — the tile-culled
+    // subset from shade_tile/sparse_fill on the hybrid arms, the full
+    // (gate-checked) set from the plain reference and --defer-shade arms.
+    // The caller owns the arming gate (!fb.gi × count > 0 × enabled), which
+    // used to live here per pixel; None is the structural off.
+    el: Option<&crate::emissive::EmissiveLights>,
 ) -> Sample {
     match tr.hit {
         Some(hit) => {
@@ -1621,19 +1678,13 @@ fn shade_traced(
                 // The ONE Some site: fireflies light the primary camera path
                 // only. Day sessions (count 0) hand shade a structural None.
                 (ctx.fireflies.count > 0).then_some(&ctx.fireflies),
-                // The ONE Some site for emissive cluster lights: primary
-                // camera path only, and NEVER under fb.gi — the GI gather
-                // already delivers emissive transport exactly (real geometry,
-                // real soft shadows), so GI frames keep the gather and drop
-                // the lossy-cluster NEE (the once-per-path rule, inverted).
-                // Emissive-free scenes and UNARMED sessions (the default —
-                // --emissive-lights arms) hand a structural None. fb.ao
-                // keeps NEE on: its ambient is sky × openness, no emissive
-                // in it.
-                (!ctx.q.fb.gi
-                    && ctx.scene.emissive.count > 0
-                    && crate::emissive::enabled())
-                .then_some(&ctx.scene.emissive),
+                // Emissive cluster lights: primary camera path only, NEVER
+                // under fb.gi (the once-per-path rule, inverted — the gather
+                // delivers emissive transport exactly there). The gate AND
+                // the per-tile cull live at the callers now (shade_tile /
+                // sparse_fill cull, plain/defer pass the full set); unarmed
+                // and emissive-free sessions arrive here as structural None.
+                el,
             );
             // Firefly glow, depth-tested against the primary hit — a firefly
             // between the camera and the surface splats over the shaded
@@ -1726,6 +1777,7 @@ fn shade_pixel(
     depth: u32,
     kind: u32,
     cut: Option<&[u32]>,
+    el: Option<&crate::emissive::EmissiveLights>,
     ls: &mut LocalStats,
 ) -> Sample {
     let spp = ctx.spp();
@@ -1748,6 +1800,7 @@ fn shade_pixel(
             false,                   // average locally, splat once below
             shade::VisCtl::Off,
             None,
+            el,
         );
         sum += s.c;
         if k == ctx.primary_sample {
@@ -1824,6 +1877,26 @@ fn sparse_fill(
     // convention — sparse samples are ordinary cut-seeded primary rays).
     let mut rbuf = [0u32; MAX_CUT];
     let cut = crate::ftree::Accel::for_tiles(ctx.bvh).ray_roots(cut, &mut rbuf);
+    // Emissive per-tile light cull, the shade_tile hoist verbatim — sound
+    // here by the same leaf-tile argument the samples ride (every sample
+    // pixel lies inside this capped tile's frustum); a capped tile is WIDE,
+    // so the cull is weaker, never wrong.
+    let tile_el = (!ctx.q.fb.gi
+        && ctx.scene.emissive.count > 0
+        && crate::emissive::enabled())
+    .then(|| {
+        if crate::emissive::cull_abl() {
+            (ctx.scene.emissive, 0)
+        } else {
+            let tf = ctx.cam.tile_frustum(x0, y0, x1, y1);
+            let r =
+                crate::emissive::cull_tile(&ctx.scene.emissive, &tf, ctx.cam.forward(), t_start);
+            ls.el_cull_tiles += 1;
+            ls.el_cull_culled += r.1 as u64;
+            r
+        }
+    });
+    let el = tile_el.as_ref().map(|(e, _)| e);
     // Sample-position RNG: per-quad, per-frame (the old flat-fill seed recipe).
     let seed = (x0 as u64)
         .wrapping_mul(0x9E3779B97F4A7C15)
@@ -1839,7 +1912,7 @@ fn sparse_fill(
             let cx1 = (cx + SAMPLE_CELL).min(x1);
             let sx = cx + rng.usize(..cx1 - cx);
             let sy = cy + rng.usize(..cy1 - cy);
-            let s = shade_pixel(ctx, sx, sy, t_start, depth, KIND_LEAF, Some(cut), ls);
+            let s = shade_pixel(ctx, sx, sy, t_start, depth, KIND_LEAF, Some(cut), el, ls);
             ls.coarse_samples += 1;
             ls.coarse_pixels += ((cx1 - cx) * (cy1 - cy) - 1) as u64;
             for y in cy..cy1 {

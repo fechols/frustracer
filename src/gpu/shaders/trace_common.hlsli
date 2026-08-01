@@ -1136,6 +1136,68 @@ float3 normalize_or_zero(float3 v) {
     return l2 > 1e-30 ? v * rsqrt(l2) : float3(0.0, 0.0, 0.0);
 }
 
+// --- Tile frustum (pure half — hoisted from frustum.hlsli) -------------------
+// Lives HERE, not in frustum.hlsli, because leaf.hlsl's per-tile emissive
+// light cull needs tile_frustum and leaf deliberately never pastes
+// frustum.hlsli (its groupshared stack slab would put LDS into the one
+// RayQuery kernel the Intel L1 rule keeps LDS-free). trace_common precedes
+// frustum.hlsli in every unit, so the frustum machinery keeps using these
+// verbatim — one source, no drift.
+
+// Screen-tile frustum: apex + 4 inward unit normals through it.
+struct TF {
+    float3 origin;
+    float3 nrm[4];
+};
+
+float3 frustum_plane(float3 a, float3 b, float3 center) {
+    precise float3 n = cross(a, b);
+    n = dot(n, center) < 0.0 ? -n : n;
+    // Degenerate (near-parallel corner rays) -> zero normal -> never culls.
+    return normalize_or_zero(n);
+}
+
+// camera.rs::tile_frustum: planes through the tile's continuous pixel-grid
+// EDGES (footprints, not centers) so jittered samples stay inside.
+TF tile_frustum(uint x0, uint y0, uint x1, uint y1) {
+    float3 c0 = ray_dir(float(x0), float(y0));
+    float3 c1 = ray_dir(float(x1), float(y0));
+    float3 c2 = ray_dir(float(x1), float(y1));
+    float3 c3 = ray_dir(float(x0), float(y1));
+    float3 center = c0 + c1 + c2 + c3;
+    TF f;
+    f.origin = cam_origin.xyz;
+    f.nrm[0] = frustum_plane(c0, c1, center);
+    f.nrm[1] = frustum_plane(c1, c2, center);
+    f.nrm[2] = frustum_plane(c2, c3, center);
+    f.nrm[3] = frustum_plane(c3, c0, center);
+    return f;
+}
+
+// Conservative cull test for ONE emissive cluster light — emissive.rs's
+// cull_tile twin, three independently conservative arms (independently of
+// the CPU's cull too: no bit-parity contract links the two masks, since a
+// culled light contributes exactly zero either way — the window's
+// exact-zero property). true = the light can touch NO primary hit of this
+// tile: (1) the inherited near ball (hits are at t >= t_start); (2) the
+// camera FORWARD half-space (dot(forward, d) > 0 for every primary dir —
+// the arm that kills the ANTIPODAL cone the narrow side planes cannot);
+// (3) the 4 side planes (zero degenerate normals never cull:
+// 0 < -r - eps is false).
+bool el_tile_culled(TF f, float t_start, uint ei) {
+    float3 c = el_a[ei].xyz;
+    float r = sqrt(el_b[ei].w);
+    precise float3 rel = c - f.origin;
+    if (length(rel) + r < t_start * (1.0 - 1e-5)) return true;
+    float3 ar = abs(rel);
+    precise float eps = 1e-5 * (1.0 + max(ar.x, max(ar.y, ar.z)));
+    if (dot(cam_forward.xyz, rel) < -r - eps) return true;
+    [unroll] for (uint i = 0; i < 4; ++i) {
+        if (dot(f.nrm[i], rel) < -r - eps) return true;
+    }
+    return false;
+}
+
 // --- G-buffer pack (upscaler sessions; dlss.rs::GPixel on the GPU) ------------
 
 // Primary-hit surface capture — the shade.rs::PrimarySurface mirror. spec_t:

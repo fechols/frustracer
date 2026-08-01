@@ -3119,6 +3119,13 @@ pub(crate) fn abl_defs() -> String {
         // this is a PERF arm, not a cost probe — both sides publish identical
         // counter totals and an identical `best`, so the image is unmoved.
         ("nowave", "ABL_NO_WAVE_OPS"),
+        // The leaf kernel's per-tile emissive light cull back to the full
+        // mask (leaf.hlsl's el_mask block; emissive::cull_abl is the CPU
+        // twin of the same FR_ABL tag). BIT-IDENTICAL by construction — a
+        // culled light fails every pixel's own d2 >= r_infl2 test — so this
+        // is a pure cost probe like nowave, never image-changing. Lives HERE
+        // because it reaches leaf.hlsl (the probe-reach rule).
+        ("noelcull", "ABL_NO_EL_CULL"),
     ] {
         if abl_has(tag) {
             out.push_str(&format!("#define {def} 1\n"));
