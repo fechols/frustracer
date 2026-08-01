@@ -2387,6 +2387,18 @@ measured those exact two regions at −87% and −57%. The projection built on t
 off by 3.5× *against* the change. Both units now paste `abl_defs()`; when a probe reports "no
 effect", prove the define arrived before believing it. The one probe that DID reach its target
 (`nogbuf` into `cs_leaf`, 1.486 → 1.075) was correct, as was the partial-store finding above.
+THE TRAP FIRED TWICE MORE, found by audit 2026-08-01: (3) `nowave` never reached wavefront.hlsl —
+the tile unit takes only `wavefront_ablation_defs`, so `gw_alloc`/`gw_min_bits` stayed
+wave-cooperative in every "revert" arm ever run (the arm is DUAL-HOMED now, emitted by both defs
+fns; see the wave-aggregated-atomics paragraph below for what that contaminated); and (4) the DXR
+pipeline's own `feed_src` pasted no `abl_defs()` at all, so a `nopack` probe under `--dxr`
+compared identical code against itself (now a CONDITIONAL paste — dxr.rs — so the unarmed source
+stays byte-equal). Two structural guards shipped with the repairs: `FR_ABL (gpu):` announces the
+raw value + the matched GPU arms once per process ("matched GPU arms: (none)" on a non-empty
+FR_ABL IS the probe-reach alarm — trace.rs's `abl_announce`/`ABL_GPU_TAGS`, kept in lockstep with
+every `abl_has` consumer), and FR_LEAF/FR_LGROUP now print loud on departure AND on an illegal
+value instead of silently reverting to the shipping config (the FR_WIDE rule — a mistyped sweep
+cell used to measure the default while believing it measured the lever).
 
 **`compose` IS NOT DISPATCHED ON fb-OFF FRAMES (2026-07-24).** With no hemisphere pass there is
 no ambient term to fold in, so `compose.hlsl` degenerated to `accum[i] = partial[i]` — a full-screen
@@ -2579,7 +2591,11 @@ the ladder's own comment already reached about prep dispatches and barriers (0.0
 levels): the cost is the level KERNEL descending the BVH, not the bookkeeping around it. Kept
 because it is strictly less shared-memory traffic, is what Intel documents, and costs nothing;
 but do not expect it to buy anything, and do not spend further effort on atomic contention in
-this ladder without new evidence.
+this ladder without new evidence. CAVEAT ON THAT TABLE (2026-08-01): those A/Bs were taken while
+`nowave` reached only the ctr.hlsli half — wavefront.hlsl's `gw_*` frontier aggregation stayed
+ARMED in the "revert" arm (the probe-reach trap, instance 3; the arm is dual-homed now). The
+leaf/sky/counter halves really were neutral as measured; the LADDER half of the feature was never
+actually A/B'd until the repair — the re-run's verdict lives in the B70 campaign table below.
 
 *Measurement trap this campaign re-learned the hard way:* `--gpu-timing` prints a table every 120
 frames AND at exit, and a parser that takes the FIRST match reads frames 0-119 — the coldest

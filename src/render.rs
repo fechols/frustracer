@@ -71,17 +71,35 @@ pub fn set_leaf_tile(n: usize) {
 /// leaf frustums (deeper distance penetration, more tiles provable as sky) at
 /// 4x the tiles per level down and 1/4 the pixels to amortize each tile's
 /// bound-query + refine_cut over. The GPU gets the same number as an injected
-/// `#define LEAF_TILE` so both intersectors agree on the frontier.
+/// `#define LEAF_TILE` so both intersectors agree on the frontier. Loud on
+/// departure AND on an illegal value (the FR_WIDE rule, 2026-08-01 — this
+/// lever used to revert silently, so a mistyped sweep cell measured the
+/// shipping config while believing it measured the lever). Only the env
+/// branch prints; the `set_leaf_tile` re-pin path (--check's TEMPORAL_TILE
+/// swap) never reaches it.
 pub fn leaf_tile() -> usize {
     let n = LEAF_TILE_N.load(Relaxed);
     if n != 0 {
         return n as usize;
     }
-    let v = std::env::var("FR_LEAF")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|n| n.is_power_of_two() && *n >= 1 && *n <= 64)
-        .unwrap_or(LEAF_TILE);
+    let v = match std::env::var("FR_LEAF") {
+        Err(_) => LEAF_TILE,
+        Ok(v) => match v.parse::<usize>() {
+            Ok(n) if n.is_power_of_two() && (1..=64).contains(&n) => {
+                eprintln!("render: FR_LEAF={n} (default {LEAF_TILE}) — quadtree leaf-rect cutoff");
+                n
+            }
+            // Never fall back silently — the FR_WIDE rule (gpu/trace.rs): a
+            // sweep that measures the shipping config while believing it
+            // measured the lever is the failure these levers exist to prevent.
+            _ => {
+                eprintln!(
+                    "render: FR_LEAF={v:?} is not a power of two in 1..=64 — using {LEAF_TILE}"
+                );
+                LEAF_TILE
+            }
+        },
+    };
     LEAF_TILE_N.store(v as u32, Relaxed);
     v
 }

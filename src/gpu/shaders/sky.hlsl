@@ -124,9 +124,12 @@ void cs_sky(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
 #endif
         // Firefly glow against a proven-empty tile — still zero rays (t_max
         // ∞, nothing occludes a sky direction). render.rs::fill_sky_rows,
-        // term for term; the flag guard keeps day frames bit-identical.
+        // term for term; the flag guard keeps day frames bit-identical;
+        // ABL_NO_FF_CODE additionally compiles it out (the pressure probe).
+#ifndef ABL_NO_FF_CODE
         if (flags & FLAG_FIREFLIES)
             c += ff_glow(cam_origin.xyz, dir, INF, pixel_cone * 0.5);
+#endif
         // Under CLOUDS the sky has sub-pixel structure (a cover-ramp edge
         // crosses a pixel), so a multi-sampled frame averages spp sample
         // positions — render.rs::fill_sky_rows, term for term (still zero
@@ -161,8 +164,10 @@ void cs_sky(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
 #endif
                 // Each extra sample carries its own glow along its own
                 // direction, exactly like a leaf pixel's sample loop.
+#ifndef ABL_NO_FF_CODE
                 if (flags & FLAG_FIREFLIES)
                     c += ff_glow(cam_origin.xyz, ds, INF, pixel_cone * 0.5);
+#endif
             }
             c *= 1.0 / float(spp);
         }

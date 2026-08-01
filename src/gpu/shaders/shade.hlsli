@@ -634,6 +634,11 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
         // in-radius firefly, finite tmax (stop 2·eps short of the light
         // point). `w_l = 1` on the specular — a point light has zero solid
         // angle, so the VNDF ray can never deliver it; MIS does not apply.
+        // ABL_NO_FF_CODE (FR_ABL=noffcode) compiles the block out — the
+        // register-pressure probe: a day frame executes none of this either
+        // way, so the A/B isolates the allocation the dead arm reserves
+        // (trace.rs's abl_defs row carries the contract).
+#ifndef ABL_NO_FF_CODE
         if (cam_lights && lap == 0u && (flags & FLAG_FIREFLIES)) {
             float r_inf = FF_RADIUS_K * ff_scale;
             float ff_r2 = r_inf * r_inf;
@@ -671,6 +676,7 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                 }
             }
         }
+#endif
         // Emissive cluster lights (shade.rs, same insertion point): the
         // direct tier's third entry, AFTER the cloud scaling (a lamp under
         // the slab is a local light) and BEFORE the lap-0 prim export (the
@@ -682,6 +688,12 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
         // VNDF ray already delivers the emitter's specular image (the
         // display `total += emis` at every lap), so a w_l = 1 specular term
         // here would double-count it (src/emissive.rs).
+        // ABL_NO_EL_CODE (FR_ABL=noelcode) compiles the block out — the
+        // register-pressure probe, the noffcode shape; the same tag also
+        // emits ABL_NO_EL_CULL so leaf.hlsl's hoist goes with it (the
+        // subsumption lives in trace.rs's abl_defs table). el_mask then goes
+        // unused here — an unused parameter is legal, signatures stable.
+#ifndef ABL_NO_EL_CODE
         if (cam_lights && lap == 0u && (flags & FLAG_EMISSIVE)) {
             for (uint ei = 0u; ei < EL_COUNT; ++ei) {
                 // Tile-culled lights: skipped before the CB fetch. Ascending
@@ -714,6 +726,7 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                 direct_d += ee * endl * evis;
             }
         }
+#endif
         if (lap == 0u) {
             // shade.rs's post-average lobe export (the FSR-RR signal split
             // demodulates these at the G-buffer write) — pure copies, zero

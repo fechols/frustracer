@@ -64,8 +64,10 @@ void raygen() {
             if (s == probe_sample)
                 gbuf_write_sky(pi, sp.x, sp.y, dir);
         }
+#ifndef ABL_NO_FF_CODE
         if (flags & FLAG_FIREFLIES)
             col += ff_glow(cam_origin.xyz, dir, t, pixel_cone * 0.5);
+#endif
         csum += col;
         if (s == probe_sample) {
             tbuf[pi] = t;
@@ -90,8 +92,10 @@ void raygen() {
 
         // Firefly glow, depth-tested against the payload's t (INF on a miss)
         // — the wavefront kernels' composite, term for term.
+#ifndef ABL_NO_FF_CODE
         if (flags & FLAG_FIREFLIES)
             p.color += ff_glow(cam_origin.xyz, dir, p.t, pixel_cone * 0.5);
+#endif
         csum += p.color;
         if ((p.prim & 1u) != 0u) {
             tbuf[pi] = p.t;

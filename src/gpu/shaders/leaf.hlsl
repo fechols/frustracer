@@ -193,8 +193,11 @@ void cs_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
         }
         // Firefly glow, depth-tested against this sample's own hit (INF on a
         // miss) — render.rs::shade_traced's composite, term for term. Guarded
-        // by the flag, so day frames add nothing (bit-identity).
+        // by the flag, so day frames add nothing (bit-identity);
+        // ABL_NO_FF_CODE additionally compiles it out (the pressure probe).
+#ifndef ABL_NO_FF_CODE
         if (flags & FLAG_FIREFLIES) c += ff_glow(cam_origin.xyz, dir, t, pixel_cone * 0.5);
+#endif
         csum += c;
         awsum += aw;
         if (prim) {

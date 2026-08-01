@@ -275,15 +275,29 @@ const LEAF_GROUP: u32 = 256;
 /// FR_LEAF because the two INTERACT — a leaf rect is ~(rw*rh)/4^depth_full
 /// pixels, so shrinking LEAF_TILE shrinks the tile below the group width and
 /// idles lanes, which is the wave-utilization trap this constant exists to
-/// document. Neither axis can be read alone.
+/// document. Neither axis can be read alone. Loud on departure AND on an
+/// illegal value (the FR_WIDE rule, 2026-08-01 — this lever used to revert
+/// silently, so a mistyped sweep cell measured the shipping config while
+/// believing it measured the lever).
 fn leaf_group() -> u32 {
     static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("FR_LGROUP")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .filter(|n| n.is_power_of_two() && *n >= 8 && *n <= 256)
-            .unwrap_or(LEAF_GROUP)
+    *N.get_or_init(|| match std::env::var("FR_LGROUP") {
+        Err(_) => LEAF_GROUP,
+        Ok(v) => match v.parse::<u32>() {
+            Ok(n) if n.is_power_of_two() && (8..=256).contains(&n) => {
+                eprintln!("gpu: FR_LGROUP={n} (default {LEAF_GROUP}) — leaf kernel group width");
+                n
+            }
+            // Never fall back silently: a sweep that measures the shipping
+            // config while believing it measured the lever is the exact
+            // failure mode these levers exist to prevent.
+            _ => {
+                eprintln!(
+                    "gpu: FR_LGROUP={v:?} is not a power of two in 8..=256 — using {LEAF_GROUP}"
+                );
+                LEAF_GROUP
+            }
+        },
     })
 }
 
@@ -3041,6 +3055,42 @@ fn abl_has(tag: &str) -> bool {
     ABL.get_or_init(|| std::env::var("FR_ABL").unwrap_or_default()).contains(tag)
 }
 
+/// Every FR_ABL tag any GPU-side `abl_has` consumer recognizes — the announce
+/// line's vocabulary. LOCKSTEP: an `abl_has("x")` call added anywhere in the
+/// GPU pipelines without appending "x" here makes the announce report
+/// "matched GPU arms: (none)" for it — a false ALARM, deliberately the loud
+/// direction (the operator investigates a working arm instead of trusting a
+/// dead one), but keep the list current.
+const ABL_GPU_TAGS: &[&str] = &[
+    "sunt", "rough", "nogbuf", "nopack", "nowave", "noelcull", "noffcode", "noelcode", "oldcut",
+    "nobatch", "nocandtmin", "noalpha", "noheight", "notrans",
+];
+
+/// One loud line per process when FR_ABL is set at all — the GPU twin of
+/// `shade::abl`'s and `emissive::cull_abl`'s announces. The GPU side printed
+/// NOTHING until 2026-08-01: an unmatched tag (typo, or an arm that reaches
+/// no unit) ran the shipping config while the operator believed otherwise —
+/// the silent-A/B failure the CPU announces already guard against, and
+/// "matched GPU arms: (none)" on a non-empty FR_ABL IS the probe-reach alarm.
+/// Called from TraceGpu::new and DxrGpu::new right after require_caps —
+/// deliberately NOT from inside abl_has's OnceLock init (calling abl_has from
+/// there re-enters the lock, and the first abl_has call today comes from the
+/// BLAS predicates with non-obvious timing). Substring semantics untouched —
+/// no tokenizer, matching `abl_has` exactly.
+pub(crate) fn abl_announce() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let raw = std::env::var("FR_ABL").unwrap_or_default();
+        if raw.is_empty() {
+            return;
+        }
+        let matched: Vec<&str> = ABL_GPU_TAGS.iter().copied().filter(|t| abl_has(t)).collect();
+        let list =
+            if matched.is_empty() { "(none)".to_string() } else { matched.join(",") };
+        eprintln!("FR_ABL (gpu): {raw:?} — matched GPU arms: {list}");
+    });
+}
+
 /// The `--blas-split` twin: armed sessions compile `tri_of()` as the chunk
 /// remap (`blas_tri[chunk_base[inst] + prim]`), unarmed ones as the identity,
 /// so every unarmed kernel is byte-identical to the pre-feature source. A
@@ -3111,11 +3161,17 @@ pub(crate) fn abl_defs() -> String {
         // wavefront.hlsl's gw_alloc/gw_min_if). `FR_ABL=nobatch,nowave` is the
         // full pre-wave-pass queue code.
         //
-        // This lives HERE rather than in wavefront_ablation_defs, whose whole
-        // point is not to perturb the leaf/reference shader cache: the
-        // aggregation reaches leaf.hlsl's per-pixel hemi-point counter too, so
-        // an arm that recompiled only the tile unit would leave half the
-        // feature armed and silently mis-measure it. Unlike its neighbours
+        // DUAL-HOMED (2026-08-01): this row reaches ctr.hlsli's consumers
+        // (leaf/sky/hemi/reference, via `defs`), and wavefront_ablation_defs
+        // emits the SAME define for the tile unit, whose gw_alloc/gw_min_bits
+        // are the feature's other half. The consumers straddle the
+        // shader-cache split, so nowave is the one arm that legitimately
+        // churns BOTH caches when flipped. Until the dual-homing the tile
+        // unit never saw the define at all, and every recorded nowave A/B —
+        // the "wave aggregation measured neutral" verdict included — compared
+        // a HALF-ARMED configuration (leaf-side neutralized, tile-side still
+        // wave-cooperative): the probe-reach trap's third instance, from
+        // inside the very comment that warned about it. Unlike its neighbours
         // this is a PERF arm, not a cost probe — both sides publish identical
         // counter totals and an identical `best`, so the image is unmoved.
         ("nowave", "ABL_NO_WAVE_OPS"),
@@ -3126,6 +3182,28 @@ pub(crate) fn abl_defs() -> String {
         // is a pure cost probe like nowave, never image-changing. Lives HERE
         // because it reaches leaf.hlsl (the probe-reach rule).
         ("noelcull", "ABL_NO_EL_CULL"),
+        // REGISTER-PRESSURE PROBES (2026-08-01, the B70 campaign): compile
+        // the CODE out, not just the execution. Fireflies/emissive are
+        // runtime-flag branches present in every shading kernel; a day or
+        // unarmed frame executes none of it, but register allocation is the
+        // MAX over both arms (the LEAF_NO_FB lesson — splitting ONE such
+        // branch measured -11% AMD / -16% NVIDIA). The A/B against "flag
+        // off, code present" therefore isolates pure occupancy cost: same
+        // execution, different allocation. Every guarded block draws ZERO
+        // rng, so armed same-seed A/Bs stay exact — both kernels lose
+        // identical code. Image-changing wherever the feature is LIVE
+        // (night fireflies, armed emissive) — cost probes, never levers.
+        ("noffcode", "ABL_NO_FF_CODE"),
+        ("noelcode", "ABL_NO_EL_CODE"),
+        // noelcode SUBSUMES noelcull: leaf.hlsl's cull hoist already
+        // compiles out under ABL_NO_EL_CULL, so emit that too rather than
+        // teaching the shader a compound guard. `noelcull,noelcode` together
+        // emits ABL_NO_EL_CULL twice — an identical object-like
+        // redefinition, legal HLSL, probe-only. (The CPU cull twin
+        // `emissive::cull_abl` matches only the literal "noelcull" —
+        // correct: noelcode is a GPU code-presence probe, not a cull-policy
+        // flip.)
+        ("noelcode", "ABL_NO_EL_CULL"),
     ] {
         if abl_has(tag) {
             out.push_str(&format!("#define {def} 1\n"));
@@ -3135,9 +3213,15 @@ pub(crate) fn abl_defs() -> String {
 }
 
 /// Pixel-identical wavefront performance ablations. Unlike `abl_defs`, these
-/// are pasted only into the tile-recursion unit so toggling one cannot perturb
-/// the reference/leaf shader cache. `FR_ABL=oldcut,nobatch` reconstructs the
-/// pre-B70-pass queue code for an executable A/B without editing HLSL.
+/// are pasted only into the tile-recursion unit, so toggling `oldcut`/`nobatch`
+/// cannot perturb the reference/leaf shader cache. `FR_ABL=oldcut,nobatch`
+/// reconstructs the pre-B70-pass queue code for an executable A/B without
+/// editing HLSL. `nowave` is the deliberate exception — emitted BOTH here and
+/// in `abl_defs`, because its consumers straddle the cache split (gw_alloc/
+/// gw_min_bits live in wavefront.hlsl, ctr_add/ctr_bump in ctr.hlsli): an arm
+/// that reaches only one side measures half a feature while reporting the
+/// whole one, which is exactly what happened until 2026-08-01 (see the
+/// abl_defs row's comment).
 fn wavefront_ablation_defs() -> String {
     let mut out = String::new();
     if abl_has("oldcut") {
@@ -3145,6 +3229,12 @@ fn wavefront_ablation_defs() -> String {
     }
     if abl_has("nobatch") {
         out.push_str("#define ABL_NO_QUEUE_BATCH 1\n");
+    }
+    // The tile-unit half of `nowave` — see the fn doc. abl_defs carries the
+    // leaf/sky/hemi/reference half; no compile unit pastes both fns, so the
+    // define is never emitted twice into one source.
+    if abl_has("nowave") {
+        out.push_str("#define ABL_NO_WAVE_OPS 1\n");
     }
     out
 }
@@ -4544,6 +4634,7 @@ impl TraceGpu {
         sub: &mut dyn d3d12::Submit,
     ) -> Result<Self> {
         require_caps(device)?;
+        abl_announce();
         let root_sig = create_root_signature(device)?;
         let cmd_sig = create_dispatch_signature(device)?;
 

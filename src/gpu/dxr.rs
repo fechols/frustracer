@@ -196,6 +196,7 @@ impl DxrGpu {
         debug: bool,
     ) -> Result<Self> {
         require_caps(device)?;
+        trace::abl_announce();
         let device5: ID3D12Device5 =
             device.cast().map_err(|e| format!("ID3D12Device5: {e}"))?;
         let root_sig = trace::create_root_signature(device)?;
@@ -344,8 +345,29 @@ impl DxrGpu {
         // Upscaler sessions: the same feed kernels the wavefront runs, at
         // this pipeline's cs_6_3 cap floor (feed.hlsl needs nothing newer).
         let (pso_feed_xess, pso_feed_rr, pso_feed_fsr_rr) = if gbuf_full {
-            let feed_src =
-                [sd, trace::TRACE_COMMON_HLSLI, trace::FSR_WIRE_HLSLI, trace::FEED_HLSL].join("\n");
+            // abl_defs FIRST so a feed ablation is not silently inert — the
+            // library's `defs` above already carries it, but this unit did
+            // not, so an `FR_ABL=nopack` probe under --dxr compared identical
+            // code against itself (feed.hlsl consumes ABL_NOPACK; trace.rs's
+            // feed_src learned the same lesson — "an ablation that cannot
+            // reach its target answers confidently"). Pushed CONDITIONALLY,
+            // unlike trace.rs's unconditional first element: this unit's
+            // unarmed baseline has no leading blank line, and an empty first
+            // segment + join("\n") would prepend one — the unarmed source
+            // stays byte-identical. Armed, both pipelines' feed units
+            // assemble identical leading text (abl_defs ends in '\n').
+            let feed_abl = trace::abl_defs();
+            let mut feed_parts: Vec<&str> = Vec::new();
+            if !feed_abl.is_empty() {
+                feed_parts.push(feed_abl.as_str());
+            }
+            feed_parts.extend([
+                sd,
+                trace::TRACE_COMMON_HLSLI,
+                trace::FSR_WIRE_HLSLI,
+                trace::FEED_HLSL,
+            ]);
+            let feed_src = feed_parts.join("\n");
             let pso = |entry: &str, name: &str| -> Result<ID3D12PipelineState> {
                 trace::compute_pso(
                     device,
