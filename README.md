@@ -113,20 +113,22 @@ a future native implementation would need:
 - exact-basis replay may retain handles; a new producing pass or AS rebuild
   invalidates them.
 
-The first B70 software-vs-software ABBA is nevertheless encouraging. At
-1080p/SPP=1 on the moving procedural path (1,600 warm-up + 600 measured frames,
-two fresh processes per arm), both repeats rounded to the following:
-
-| B70 traversal arm | wall ms/frame | GPU frame span | leaf shader |
-|---|---:|---:|---:|
-| same software BVH, start at root | 1.90–1.91 | 1.739 | 1.393–1.394 |
-| reuse opaque beam frontier | 1.85 | 1.683 | 1.302–1.303 |
-
-That is about 6.5% off the direct ray consumer and 3.2% off the GPU frame after
-paying to produce/translate the handles. It does **not** say software beats the
-B70's RT hardware; it says traversal state itself has measurable value under a
-controlled identical-intersector comparison—the premise a native experiment
-would build on.
+The first B70 software-vs-software ABBA (July 26) read the frontier arm ahead —
+root 1.90–1.91 wall / 1.739 span / 1.393–1.394 leaf against 1.85 / 1.683 /
+1.302–1.303, about 6.5% off the direct ray consumer and 3.2% off the GPU frame.
+**A re-run of the identical protocol on the August 1 tree retires that
+margin.** At 1080p/SPP=1 on the moving procedural path (1,600 warm-up + 600
+measured frames, fresh process per run, root/frontier/frontier/root order),
+the two arms agree window-by-window to ±0.004 ms across the whole camera lap —
+statistically identical — while both run ~7–11% faster than the July numbers
+(the wave-aggregated queue atomics and later leaf-kernel restructurings landed
+in between and moved both arms). The frontier is provably still doing its job
+— the same day's `--check-gpu --continuation-rays` reads 768/768 non-root
+handles at 468.8 rays reused per handle, zero root fallbacks — the reused
+traversal state just no longer buys measurable time on this workload. The
+honest surviving claims are architectural: the opaque handle seam works, the
+conservative fallbacks hold, and the images stay bit-identical; "traversal
+state has measurable value" is, on the current kernels, unsupported.
 
 `--check-gpu --continuation-rays` audits the opaque wire cookie, requires the
 non-root consumer to fire, reports handles/rays/frontier entries and reuse per
@@ -1133,6 +1135,10 @@ producing frames; the leaf-frontier and pack-split optimizations that landed
 July 24 were wavefront-side and retired that result.) The margin is that
 structure compounded with the *hardware* balance — Arc's RT throughput is
 weak relative to its shader cores, so rays not traced are worth more there.
+Note the baseline: this is against the DXR *pipeline*, most of whose margin
+is Arc running the same traversal far better as a compute kernel — for what
+the quadtree itself contributes over a bare compute baseline (much less),
+see "What the quadtree is actually worth" below.
 These are interactive spot checks, not the deterministic `--spin` harness,
 but they are what a user flying the world actually gets — and they are why
 Intel adapters start in the wavefront tracer.
@@ -1313,6 +1319,24 @@ changed ray traversal very little. Setting leaf `t_start` to zero cost only
 useful work was **tiles proven empty tracing no rays at all**. The valuable
 product is the shared empty-space proof (and, for custom traversal, the
 inherited node frontier), not physical ray length.
+
+**How this squares with the ~65% B70 world result above — the baseline is
+the whole difference.** This section measures the quadtree against the
+*plain compute reference* — the same RayQuery traversal in a bare compute
+kernel, the cheapest arm that exists — and on THE WORLD that comparison
+comes out the same way as here: at the boot pose the hybrid's trace costs
+1.15 ms replayed / ~1.4 ms producing against the reference's 1.28, a ±10%
+wash. The ~65% headline is measured against the **DXR pipeline**, and an
+August 2026 same-day sweep decomposed the gap: the *identical* full-screen
+traversal costs 1.28 ms as a compute kernel, 2.59 ms as a mode-2
+`DispatchRays` raygen, and 3.13 ms through the shipping mode-1 pipeline —
+i.e. on Arc, with the world's fat alpha-cutout shaders, the DXR execution
+model itself costs 2–2.4× over compute for the same work on the same TLAS.
+(On the small procedural scene that same tax measured ≈ zero, which is why
+it went unnoticed; it is scene-dependent, and it is a driver/hardware
+property — the shader source is byte-identical between the arms.) So the
+world margin is real end-to-end, but it is roughly nine parts "Arc prefers
+this workload as compute" to one part quadtree.
 
 ## Future work
 
