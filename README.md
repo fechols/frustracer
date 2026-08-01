@@ -409,7 +409,7 @@ each one's A/B is how its cost was measured in the first place.
 | Heightfield relief — real displaced geometry at the intersector | (opt-in `--heightfield`) | **V** |
 | The upscaler chain — DLSS-RR → FSR4-RR → XeSS → FSR 3.1, first supported wins | `--no-upscale` | **G** / **K** / **X** |
 | Frame generation — four families, whichever the adapter supports | `--no-fg` | |
-| HDR output — scRGB by default, HDR10/PQ where a wrapper needs it | `--no-hdr` | |
+| HDR output — HDR10/PQ on an HDR-on display, scRGB f16 elsewhere | `--no-hdr` | |
 | Glare — the reason the sun looks like a sun | `--no-bloom` | |
 | BC7 texture compression, encoded on the GPU at load | `--no-bc7` | |
 | Per-island ambience + procedural wind | `--no-audio` | |
@@ -1115,13 +1115,14 @@ the XeSS-FG ×2 presented surplus is excluded:
 | **average** | **103.75** | **62.75** |
 
 That is the hybrid **1.5–1.8× faster at every island, ~65% on average** — a
-larger gap than the per-pass tracer spans alone predict (mode-1 DXR is
-slightly *ahead* on producing frames there), consistent in direction with
+larger gap than tracer-only timings alone explain, consistent with
 structure replay deleting the level ladder on parked frames while the DXR
-pipeline has no replay at all. These are interactive spot checks, not the
-deterministic `--spin` harness, but they are what a user flying the world
-actually gets — and they are why Intel adapters start in the wavefront
-tracer.
+pipeline has no replay at all. It is a property of the *hardware* balance —
+Arc's RT throughput is weak relative to its shader cores — compounded by
+that structural difference between the two pipelines. These are interactive
+spot checks, not the deterministic `--spin` harness, but they are what a
+user flying the world actually gets — and they are why Intel adapters start
+in the wavefront tracer.
 
 **This is specifically Intel Arc Pro B70 hardware; results vary — and
 invert — on other GPUs.** On an RTX 4090 the same comparison prefers DXR
@@ -1218,8 +1219,12 @@ leaf primaries seed from the tile's node cut — the one product of the frustum
 recursion the RayQuery API cannot accept. Hardware traversal wins anyway, on
 the vendor whose RT cores are weakest: B70 at 1 spp reads 1.76 ms hardware
 against 2.54 software, and the cut seed recovers about 1% of that 44% gap. At
-16 spp it is 13.54 against 26.35. So the shared empty-space proof, not custom
-traversal, is what the quadtree is actually for on a GPU.
+16 spp it is 13.54 against 26.35. Like the historical `--dxr-inline` table,
+those absolute figures predate the current `(32, 256)` leaf frontier — the
+continuation-rays ABBA near the top of this page is the same software-root
+arm on the current harness, at 1.90 ms — but the verdict is the durable
+part: the shared empty-space proof, not custom traversal, is what the
+quadtree is actually for on a GPU.
 
 **XeSS frame generation is verified working here**, including at HDR10: the
 library's own `GetLastPresentStatus` reports two frames presented per present
