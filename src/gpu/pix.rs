@@ -94,7 +94,12 @@ fn table() -> Option<&'static Pix> {
 /// Intel adapter at all, so the timestamps are the only numbers available
 /// there, and a marker that wasn't timed would be a silent hole in the table.
 /// Both are independently opt-in and both are inert when off.
-pub struct PixScope(Option<ID3D12GraphicsCommandList>, super::gputime::TimeScope);
+pub struct PixScope(
+    Option<ID3D12GraphicsCommandList>,
+    // Held for Drop only (never read): its Drop closes the gputime timestamp
+    // region when the bracket ends.
+    #[allow(dead_code)] super::gputime::TimeScope,
+);
 
 impl Drop for PixScope {
     fn drop(&mut self) {

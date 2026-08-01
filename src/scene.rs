@@ -1002,10 +1002,10 @@ pub fn spray_self_test() -> Result<(), String> {
         ];
         let mut indices = vec![[0u32, 1, 2], [1, 3, 2]];
         let mut tri_mat = vec![0u32, 0];
-        let mut tiny = |at: Vec3A, mat: u32,
-                        positions: &mut Vec<Vec3A>,
-                        indices: &mut Vec<[u32; 3]>,
-                        tri_mat: &mut Vec<u32>| {
+        let tiny = |at: Vec3A, mat: u32,
+                    positions: &mut Vec<Vec3A>,
+                    indices: &mut Vec<[u32; 3]>,
+                    tri_mat: &mut Vec<u32>| {
             let b = positions.len() as u32;
             positions.push(at);
             positions.push(at + Vec3A::new(1e-4, 0.0, 0.0));
@@ -1185,9 +1185,9 @@ pub fn coincident_self_test() -> Result<(), String> {
             let f = Vec3A::new(3.0, 0.5, 1.0);
             let mut positions = Vec::new();
             let mut indices = Vec::new();
-            let mut push = |p0: Vec3A, p1: Vec3A, p2: Vec3A,
-                            positions: &mut Vec<Vec3A>,
-                            indices: &mut Vec<[u32; 3]>| {
+            let push = |p0: Vec3A, p1: Vec3A, p2: Vec3A,
+                        positions: &mut Vec<Vec3A>,
+                        indices: &mut Vec<[u32; 3]>| {
                 let b0 = positions.len() as u32;
                 positions.extend_from_slice(&[p0, p1, p2]);
                 indices.push([b0, b0 + 1, b0 + 2]);

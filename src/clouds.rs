@@ -812,6 +812,11 @@ pub(crate) fn density_f(p: Vec3A, cl: &Clouds, w: f32) -> f32 {
 /// the 3D carving bought nothing here and its cost stays off the hot path.
 /// It sees the SAME curl warp as the visible field — the shadow must track
 /// the cloud that casts it (and G8 requires the shared domain).
+///
+/// Unused from Rust (every caller goes through `density_lo_f`/`_at`); kept as
+/// the term-for-term mirror of trace_common.hlsli's live `cloud_density_lo`
+/// wrapper, so the CPU/HLSL twin surfaces stay 1:1.
+#[allow(dead_code)]
 pub(crate) fn density_lo(p: Vec3A, cl: &Clouds) -> f32 {
     density_lo_f(p, cl, 0.0)
 }

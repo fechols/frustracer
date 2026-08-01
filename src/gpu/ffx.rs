@@ -392,6 +392,10 @@ impl FgSwapchain {
 
     /// Register the premultiplied-alpha UI texture (the HUD) the proxy
     /// composites onto BOTH real and generated frames. Null = unregister.
+    /// UNWIRED — the documented ffx-FG known-accept: the HUD is baked
+    /// pre-present (interpolated with the frame) and this registration is
+    /// plumbed through the shim but never called; kept for that follow-on.
+    #[allow(dead_code)]
     pub fn register_ui(&self, resource: *mut c_void, state: u32) -> Result<(), String> {
         let ui = sys::FfxShimRes { resource, state };
         let r = unsafe { sys::ffxshim_fg_swapchain_ui(self.ctx, &ui, 1) };

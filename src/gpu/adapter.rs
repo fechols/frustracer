@@ -37,15 +37,6 @@ impl Vendor {
             _ => Vendor::Other,
         }
     }
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Vendor::Nvidia => "NVIDIA",
-            Vendor::Amd => "AMD",
-            Vendor::Intel => "Intel",
-            Vendor::Other => "unknown-vendor",
-        }
-    }
 }
 
 /// The last `pick()`'s vendor, as a process-global so consumers that never see

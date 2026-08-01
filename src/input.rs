@@ -75,44 +75,6 @@ pub struct Edges {
     pub display_changed: bool,
 }
 
-impl Edges {
-    /// OR another frame's edges in (the pause menu synthesizes key edges so
-    /// its rows ride the exact key-handler reset semantics).
-    pub fn merge(&mut self, o: &Edges) {
-        self.quit |= o.quit;
-        self.esc |= o.esc;
-        self.toggle_hybrid |= o.toggle_hybrid;
-        self.toggle_dynamic |= o.toggle_dynamic;
-        self.toggle_overlay |= o.toggle_overlay;
-        self.toggle_gpu_tone |= o.toggle_gpu_tone;
-        self.toggle_dlss |= o.toggle_dlss;
-        self.toggle_xess |= o.toggle_xess;
-        self.toggle_fsr |= o.toggle_fsr;
-        self.toggle_oidn |= o.toggle_oidn;
-        self.toggle_nppd |= o.toggle_nppd;
-        self.toggle_dxr |= o.toggle_dxr;
-        self.cycle_mode |= o.cycle_mode;
-        self.toggle_temporal |= o.toggle_temporal;
-        self.toggle_bounce |= o.toggle_bounce;
-        self.toggle_height |= o.toggle_height;
-        self.verify |= o.verify;
-        self.screenshot |= o.screenshot;
-        self.cycle_spp |= o.cycle_spp;
-        self.capture_frustum |= o.capture_frustum;
-        self.clear_frustum |= o.clear_frustum;
-        self.quality = self.quality.or(o.quality);
-        self.toggle_hud |= o.toggle_hud;
-        self.toggle_fullscreen |= o.toggle_fullscreen;
-        self.menu_up |= o.menu_up;
-        self.menu_down |= o.menu_down;
-        self.menu_left |= o.menu_left;
-        self.menu_right |= o.menu_right;
-        self.menu_activate |= o.menu_activate;
-        self.size_changed = self.size_changed.or(o.size_changed);
-        self.display_changed |= o.display_changed;
-    }
-}
-
 /// The menu-open navigation keys (arrows + WASD + Enter).
 fn nav_key(k: Keycode) -> bool {
     matches!(

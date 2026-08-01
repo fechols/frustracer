@@ -1559,7 +1559,11 @@ pub fn displacement_bound_with(w_max: f32, scale: f32, mult: f32) -> f32 {
     2f32.sqrt() * mult * w_max * (SWAY_AMP_K + SWAY_BOB_K) * scale + eps
 }
 
-/// `displacement_bound_with` at the session's `--foliage-amp`.
+/// `displacement_bound_with` at the session's `--foliage-amp`. Currently
+/// unwired — the build sweep and the self-tests pass their own mult
+/// (`sway_pad`/`sweep_mult`) — but this is the session-amp shape the module
+/// docs reason in, so it stays as the named form of that bound.
+#[allow(dead_code)]
 pub fn displacement_bound(w_max: f32, scale: f32) -> f32 {
     displacement_bound_with(w_max, scale, amp_mult())
 }

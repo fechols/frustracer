@@ -4473,9 +4473,18 @@ impl GpuContext {
     }
 
     // ---- frame generation (both families' per-frame protocols) ----
+    //
+    // The four dead_code-allowed accessors below are the LIVE-toggle API a
+    // runtime FG switch would consume. Nothing consumes it today — the
+    // settings menu's frame-generation row shipped restart-tier (the file
+    // drives the DEFAULT arm; no key toggles FG live) — but the disable
+    // choreography in `set_fg_enabled` (funnel handshake / passthrough
+    // configure / SetEnabled, per family) is exactly what a live row needs
+    // and is not obvious to rederive, so the group stays wired-shaped.
 
     /// True when a frame-generation family is wired: the ffx FI proxy with a
     /// live FG effect context, raw-NGX DLSS-G, or the XeSS-FG proxy.
+    #[allow(dead_code)]
     pub fn fg_wired(&self) -> bool {
         self.fg.as_ref().is_some_and(|f| f.ctx.is_some())
             || self.fg_x.as_ref().is_some_and(|x| !x.failed.get())
@@ -4484,6 +4493,7 @@ impl GpuContext {
 
     /// Whether generated frames are currently being inserted (the toggle
     /// state, not the per-frame handshake).
+    #[allow(dead_code)]
     pub fn fg_enabled(&self) -> bool {
         self.fg.as_ref().is_some_and(|f| f.ctx.is_some() && f.enabled)
             || self.fg_x.as_ref().is_some_and(|x| x.enabled && !x.failed.get())
@@ -4491,6 +4501,7 @@ impl GpuContext {
     }
 
     /// The wired FG family's display name (the boot line / title bar).
+    #[allow(dead_code)]
     pub fn fg_label(&self) -> Option<&str> {
         if self.fg_n.as_ref().is_some_and(|n| !n.failed.get()) {
             return Some("DLSS-G (NGX)");
@@ -4537,6 +4548,7 @@ impl GpuContext {
     /// The live toggle. Turning off disables generation immediately (the ffx
     /// proxy configures passthrough; DLSS-G's mode-off edge lands via the
     /// funnel handshake on the very next present; XeSS-FG flips SetEnabled).
+    #[allow(dead_code)]
     pub fn set_fg_enabled(&mut self, on: bool) {
         if let Some(n) = &mut self.fg_n {
             n.enabled = on;

@@ -117,6 +117,10 @@ pub fn sqrt_wire(v: f32) -> f32 {
     sqrt_decode8(sqrt_encode8(v))
 }
 
+/// Unused from Rust (the CPU capture demodulates per channel inline); kept as
+/// the mirror of trace_common.hlsli's live `sqrt_wire3`, so the wire-helper
+/// surfaces stay 1:1 across the twins.
+#[allow(dead_code)]
 #[inline(always)]
 pub fn sqrt_wire3(v: Vec3A) -> Vec3A {
     Vec3A::new(sqrt_wire(v.x), sqrt_wire(v.y), sqrt_wire(v.z))

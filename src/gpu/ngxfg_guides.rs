@@ -1220,8 +1220,8 @@ impl TonePass {
         }
         .map_err(|e| format!("ngxfg-tone: CreateRootSignature: {e}"))?;
 
-        let mut pso_of = |entry: windows::core::PCSTR,
-                          what: &str|
+        let pso_of = |entry: windows::core::PCSTR,
+                      what: &str|
          -> Result<ID3D12PipelineState> {
             let cs = compile(TONE_HLSL, entry, s!("cs_5_0"), what)?;
             unsafe {

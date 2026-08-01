@@ -164,6 +164,11 @@ pub const CTR_HEMI_PT: u32 = 9;
 pub const CTR_HEMI_A: u32 = 10;
 pub const CTR_HEMI_B: u32 = 11;
 pub const CTR_HEMI_LEAF: u32 = 12;
+// Never read back on the CPU (the hemi cut pool is transient per batch), but
+// the HLSL twin — ctr.hlsli slot 13 — is live (bumped in hemi_wave, zeroed in
+// cs_seed), so the const stays: this table is the shared counter LAYOUT, and a
+// hole in it would invite reusing 13 for something else.
+#[allow(dead_code)]
 pub const CTR_HEMI_CUT: u32 = 13;
 pub const CTR_HEMI_EMPTY: u32 = 14;
 pub const CTR_HEMI_RAYS: u32 = 15;
@@ -3255,7 +3260,10 @@ pub struct SwayGpu {
     cells: Vec<crate::foliage::SwayCell>,
     /// Per-run PARTITION cell index — the flutter hash key (the v0.2 re-key:
     /// runs of one overflowed cell translate identically, bit-equal to the
-    /// CPU bake of that cell).
+    /// CPU bake of that cell). Never read on THIS side — the per-frame wind
+    /// bake keys off `cells`, whose entries already carry the re-key — kept
+    /// as the run → partition-cell map of the split plan.
+    #[allow(dead_code)]
     cell_of: Vec<u32>,
     /// Rest-pose instance descs — identity transforms, compacted-BLAS VAs
     /// baked, InstanceID = chunk index; the per-frame patch source.
