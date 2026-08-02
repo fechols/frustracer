@@ -254,8 +254,11 @@ opt_fields! {
         pub bc7: bool,
         /// "ultrafast" | "fast" | "basic" | "slow" (implies bc7 on)
         pub bc7_quality: String,
-        /// --dxr-inline 0|1|2 (the DXR ray-dispatch mode; default 1 = inline
-        /// RayQuery secondaries)
+        /// --dxr-inline 0|1|2 (the DXR ray-dispatch mode; cross-vendor
+        /// default 1 = inline RayQuery secondaries, Intel vendor default 2).
+        /// A file value sets `dxr_inline_explicit` — it VETOES the Intel
+        /// vendor default, the renderer.mode/lock_res precedent (the menu
+        /// writes this field, and a saved preference must win the policy).
         pub dxr_inline: u32,
         /// --fsr4's REQUIRED semantics for a "fsr4" chain force
         pub fsr4_required: bool,
@@ -870,6 +873,12 @@ pub fn apply_to_opts(s: &Settings, opts: &mut crate::Opts) -> AppliedFx {
     if let Some(n) = s.advanced.dxr_inline {
         if n <= 2 {
             opts.dxr_inline = n;
+            // The renderer.mode / lock_res precedent, deliberately NOT the
+            // fg one: the menu writes advanced.dxr_inline, and a saved
+            // preference must veto the Intel vendor default (mode 2 —
+            // main::vendor_defaults). Set only on a LEGAL parse, like
+            // mode's; the illegal arm warns and moves neither field.
+            opts.dxr_inline_explicit = true;
         } else {
             warn("advanced.dxr_inline", &n.to_string());
         }
@@ -1358,6 +1367,26 @@ pub fn self_test() -> Result<(), String> {
             .map_err(|e| format!("partial parse: {e}"))?;
     if partial.renderer.spp != Some(4) || partial.display.vsync.is_some() {
         return Err("partial file did not default correctly".into());
+    }
+
+    // The dxr_inline explicit veto (the renderer.mode precedent): a LEGAL
+    // file value must set `dxr_inline_explicit` — it vetoes the Intel vendor
+    // default (main::vendor_defaults' mode-2 arm) — and an untouched schema
+    // must not. Legal values only: the illegal arm warns straight to stderr
+    // mid-gate, so it stays review-verified rather than pinned.
+    {
+        let mut o = crate::cli::defaults();
+        let mut s = Settings::default();
+        s.advanced.dxr_inline = Some(1);
+        let _ = apply_to_opts(&s, &mut o);
+        if o.dxr_inline != 1 || !o.dxr_inline_explicit {
+            return Err("settings advanced.dxr_inline=1 must set the explicit veto".into());
+        }
+        let mut o2 = crate::cli::defaults();
+        let _ = apply_to_opts(&Settings::default(), &mut o2);
+        if o2.dxr_inline_explicit {
+            return Err("a default Settings must not set dxr_inline_explicit".into());
+        }
     }
 
     // A populated file round-trips value-exactly.

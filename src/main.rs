@@ -13911,7 +13911,9 @@ fn fps_title(fps: f64, fg_mult: Option<u32>) -> String {
 /// Nothing here may override an explicit flag. `mode_explicit` exists for
 /// precisely this: `opts.dxr` defaults ON, so its value cannot answer "did the
 /// user ASK for DXR", and a policy that cannot tell the difference would quietly
-/// countermand the command line.
+/// countermand the command line. `dxr_inline_explicit` is the second member of
+/// that family (the settings file counts as explicit for both — a saved menu
+/// preference must veto the policy, the renderer.mode/lock_res precedent).
 #[cfg(windows)]
 fn vendor_defaults(opts: &mut Opts, vendor: gpu::adapter::Vendor) {
     use gpu::adapter::Vendor;
@@ -14049,6 +14051,39 @@ fn vendor_defaults(opts: &mut Opts, vendor: gpu::adapter::Vendor) {
              DispatchRays pipeline instead, --cpu the CPU tracer, SPACE cycles all three live)"
         );
     }
+
+    // --- DXR ray-dispatch mode: --dxr-inline 2 on Intel ---------------------
+    //
+    // Mode 2 (everything inline in raygen) beats the cross-vendor mode-1
+    // default on the B70 at EVERY measured point while NVIDIA prefers 1 —
+    // the ratio crosses one, this function's own bar. `--spin path` 1080p
+    // spp=1 GPU frame span (the dxr.rs ablation table, 2026-07-22):
+    // ```text
+    //                    mode 1    mode 2
+    //   B70  default      2.353     1.411
+    //   B70  stress       1.635     1.215
+    //   B70  san-miguel   1.938     1.292   (2 wins all three)
+    //   4090 default      0.261     0.289
+    //   4090 stress       0.253     0.267
+    //   4090 san-miguel   0.338     0.343   (1 wins all three)
+    // ```
+    // THE WORLD re-measure (2026-08-01, B70 boot pose, interactive): mode 2
+    // span 4.77 vs mode 1's 5.36 — and mode 1's marginal sample is ~2x mode
+    // 2's on Arc (the candidate-loop-fattened chs_shade pays occupancy per
+    // sample), so high spp widens the gap. The docs have called mode 2 "the
+    // manual Intel pick" since W2; this automates exactly that pick. It
+    // fires even when the arm above just started the session in the
+    // wavefront: dxr stays the fallback PREFERENCE, and a later F/SPACE DXR
+    // build must get the right mode — delivered by the set_inline_mode
+    // re-store at this function's call site (the knob global was published
+    // from the pre-policy value in main()'s lever block).
+    if vendor == Vendor::Intel && !opts.dxr_inline_explicit && opts.dxr_inline == 1 {
+        opts.dxr_inline = 2;
+        eprintln!(
+            "gpu: Intel adapter — DXR rays run --dxr-inline 2 (everything inline in raygen; \
+             pass --dxr-inline 1 for the cross-vendor inline-secondaries default)"
+        );
+    }
 }
 
 #[cfg(windows)]
@@ -14125,6 +14160,16 @@ fn run_window(req: SceneRequest, opts: &Opts, file_settings: settings::Settings)
         vendor_defaults(&mut o, gpu.adapter_vendor);
         o
     };
+    // vendor_defaults may have moved --dxr-inline; the knob global was
+    // published from the PRE-policy value at main()'s lever block, and
+    // DxrGpu::new snapshots it lazily at construction. Re-store so both the
+    // eager --dxr init and the lazy F/SPACE build read the policy value.
+    // INVARIANT: every DxrGpu::new in run_window stays BELOW this line. The
+    // headless harnesses never run vendor_defaults and deliberately keep the
+    // parse-time store — gates stay a pure function of the command line.
+    // (Lives at the call site, not inside vendor_defaults, so the policy fn
+    // stays a pure &mut Opts — the cli lever_snapshot purity discipline.)
+    gpu::dxr::set_inline_mode(opts.dxr_inline);
     // --fsr4: the FSR4 + Ray Regeneration level is a requirement, so the chain
     // falling through it is fatal here rather than a quiet downgrade. Checked
     // against the session's ACTUAL wiring (the probe already printed its own

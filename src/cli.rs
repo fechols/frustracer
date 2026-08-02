@@ -420,6 +420,17 @@ pub struct Opts {
     pub emissive_lights_count: u32,
     /// `--dxr-inline 0|1|2` (`gpu::dxr::set_inline_mode`).
     pub dxr_inline: u32,
+    /// Did the user pick a `--dxr-inline` mode at all (flag or settings
+    /// file)? 1 is a real default, so the value cannot report whether it was
+    /// chosen — and the Intel vendor default (mode 2, `main::vendor_defaults`)
+    /// may only move a default the user left alone. Any LEGAL `--dxr-inline
+    /// N` sets it, including 1: the flag's presence, not its value, is the
+    /// signal (the `spin_frames_explicit` doctrine), which makes
+    /// `--dxr-inline 1` the spelled opt-out on Intel. The settings file sets
+    /// it too — the `renderer.mode`/`lock_res` precedent, NOT the fg one: the
+    /// menu writes `advanced.dxr_inline`, and a saved preference must veto
+    /// the policy.
+    pub dxr_inline_explicit: bool,
     /// `--no-foliage-sway` clears (`foliage::set_armed`) — leaf sway, the
     /// prototype of the tetrahedral-cage epic (docs/design/animated-foliage.md):
     /// leaf triangles (foliage-classified + alpha-masked) bucket into per-cell
@@ -629,6 +640,7 @@ pub fn defaults() -> Opts {
         emissive_lights: false,
         emissive_lights_count: emissive::EL_DEFAULT,
         dxr_inline: 1,
+        dxr_inline_explicit: false,
         foliage_sway: true,
         foliage_amp: 1.0,
     }
@@ -1068,8 +1080,11 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
             // gpu::dxr::set_inline_mode). DEFAULT 1 = primary TraceRay +
             // inline RayQuery secondaries, which strictly dominates the
             // all-TraceRay pipeline (0) at every measured point on both
-            // vendors; 2 = everything inline in raygen (the high-spp Intel
-            // pick). See the DXR section's ablation table in CLAUDE.md.
+            // vendors; 2 = everything inline in raygen — and the INTEL
+            // vendor default (`main::vendor_defaults`; any legal value here
+            // sets `dxr_inline_explicit`, the policy's veto, so
+            // `--dxr-inline 1` pins the cross-vendor default on Arc). See
+            // the DXR section's ablation table in CLAUDE.md.
             "--dxr-inline" => {
                 let n: u32 = args
                     .next()
@@ -1078,11 +1093,13 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
                     .unwrap_or_else(|| {
                         eprintln!(
                             "--dxr-inline needs 0 (all TraceRay), 1 (inline secondaries — \
-                             the default), or 2 (everything inline in raygen)"
+                             the cross-vendor default), or 2 (everything inline in raygen — \
+                             the Intel default)"
                         );
                         std::process::exit(2);
                     });
                 opts.dxr_inline = n;
+                opts.dxr_inline_explicit = true;
             }
             "--spin" => {
                 spin = Some(args.next().unwrap_or_else(|| {
@@ -1860,6 +1877,7 @@ pub fn self_test() -> Result<(), String> {
         ("emissive_lights", o.emissive_lights),
         ("emissive_lights_count", o.emissive_lights_count == 9),
         ("dxr_inline", o.dxr_inline == 2),
+        ("dxr_inline_explicit", o.dxr_inline_explicit),
         ("foliage_sway", !o.foliage_sway),
         ("foliage_amp", o.foliage_amp == 2.0),
     ] {
@@ -1921,6 +1939,17 @@ pub fn self_test() -> Result<(), String> {
     }
     if !parse_argv(&["--no-fg", "--fg"]).opts.fg_explicit {
         return Err("a trailing --fg must set fg_explicit".into());
+    }
+    if parse_argv(&[]).opts.dxr_inline_explicit {
+        return Err("--dxr-inline was not passed; explicit must stay false".into());
+    }
+    // The load-bearing veto pin: `--dxr-inline 1` is a real CHOICE even
+    // though 1 is also the compiled default — presence, not value, is the
+    // signal (the spin_frames doctrine), and it is what lets an Intel user
+    // pin the cross-vendor mode against the vendor default.
+    let di = parse_argv(&["--dxr-inline", "1"]).opts;
+    if di.dxr_inline != 1 || !di.dxr_inline_explicit {
+        return Err("--dxr-inline 1 must set dxr_inline_explicit (the vendor-default veto)".into());
     }
     if parse_argv(&["--world", "--no-world"]).world_flag != Some(false) {
         return Err("--world --no-world must resolve to Some(false)".into());

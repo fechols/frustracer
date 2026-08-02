@@ -550,7 +550,7 @@ Real flags, all of them measured rather than guessed.
 | Code | Effect |
 |---|---|
 | `--quinlight` | Wire **every** supported upscaler at once and present the Lucas-Kanade-registered, winsorized consensus of their outputs |
-| `--dxr-inline 0\|1\|2` | How much of the DXR pipeline is recursive `TraceRay` vs inline `RayQuery`. See the appendix — this one changed the default |
+| `--dxr-inline 0\|1\|2` | How much of the DXR pipeline is recursive `TraceRay` vs inline `RayQuery`. See the appendix — this one changed the default (1 cross-vendor, 2 on Intel; passing any value, `1` included, pins your choice against the vendor policy) |
 | `--continuation-rays` | Software prototype: beam-produced opaque traversal frontier reused by leaf rays (`--sw-rays` is the technical alias) |
 | `--continuation-rays --no-cut-rays` | Direct control: same software intersector and `t_start`, but start every leaf ray at the root (and skip the terminal cut nothing there consumes) |
 | `--spin path` | The deterministic benchmark: a closed camera loop, pose a pure function of frame index |
@@ -1090,12 +1090,16 @@ reference-shaped 1.11), while on the 4090 inline DXR wins at every spp
 measured.
 
 The measurement became the default: **mode 1 now ships as the DXR
-pipeline's dispatch mode** — it strictly dominates the all-TraceRay build
-at every measured (vendor, scene, spp) point while keeping the payload /
-closest-hit / SBT machinery doing its real job for the primary ray.
-`--dxr-inline 0` is the A/B escape back to the by-the-book pipeline, and
-`--dxr-inline 2` remains the right manual pick for a high-spp Intel DXR
-session. The numbers were the product; the default is the dividend.
+pipeline's cross-vendor dispatch mode** — it strictly dominates the
+all-TraceRay build at every measured (vendor, scene, spp) point while
+keeping the payload / closest-hit / SBT machinery doing its real job for
+the primary ray. `--dxr-inline 0` is the A/B escape back to the by-the-book
+pipeline. And the Intel half of the table became a default of its own:
+mode 2 beats mode 1 on the B70 at every measured point (spp=1 and the
+world alike, and its per-sample marginal is half of mode 1's), so since
+2026-08-01 **an Intel adapter defaults to `--dxr-inline 2`** — passing any
+explicit value, `1` included, pins your choice against the vendor policy.
+The numbers were the product; the defaults are the dividend.
 
 ## On Intel Arc
 

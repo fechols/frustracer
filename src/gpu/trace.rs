@@ -268,7 +268,8 @@ pub(crate) const CB_STRIDE: usize = 4608;
 /// idle lanes when the tile cannot fill them, on every vendor. Take one
 /// constant without the other and you get the worst of both. Intel's SIMD16
 /// does not rescue g16 either, and there is still no group-only vendor default
-/// to take (`main::vendor_defaults` stays mode-only).
+/// to take (`main::vendor_defaults` carries mode + dxr-inline, never a group
+/// width — the two leaf constants must move TOGETHER or not at all).
 const LEAF_GROUP: u32 = 256;
 
 /// R&D lever (FR_LGROUP): the leaf kernel's group width. Swept together with

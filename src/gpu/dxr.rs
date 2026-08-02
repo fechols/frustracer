@@ -69,9 +69,10 @@ pub fn require_caps(device: &ID3D12Device) -> Result<()> {
     }
 }
 
-/// `--dxr-inline` (default **1** — the W2 promotion): which of this
-/// pipeline's rays ride recursive TraceRay vs inline RayQuery, without
-/// leaving DispatchRays.
+/// `--dxr-inline` (cross-vendor default **1** — the W2 promotion; **2 on an
+/// Intel adapter** via `main::vendor_defaults`, the B70-campaign promotion,
+/// unless `dxr_inline_explicit` vetoes): which of this pipeline's rays ride
+/// recursive TraceRay vs inline RayQuery, without leaving DispatchRays.
 ///   0 — all TraceRay: the original by-the-book pipeline, kept as the A/B
 ///       escape (bit-identical library to the pre-lever build).
 ///   1 — THE DEFAULT: primary TraceRay -> chs_shade, every secondary
@@ -85,9 +86,12 @@ pub fn require_caps(device: &ID3D12Device) -> Result<()> {
 ///   2 — everything inline in raygen (dxr.hlsl's DXR_INLINE_SEC == 2 arm):
 ///       no TraceRay anywhere, DispatchRays as a bare launch grid over the
 ///       reference loop. The measurement arm that proved launch overhead is
-///       ≈ zero — and the right MANUAL pick for a high-spp Intel DXR
-///       session (mode 1's fat hit shader pays occupancy per sample: B70
-///       marginal 2.2 ms/sample vs mode 2's 1.11).
+///       ≈ zero — and since 2026-08-01 the INTEL DEFAULT (it beats mode 1 on
+///       the B70 at every measured point: the spp=1 table below, world span
+///       4.77 vs 5.36, and mode 1's fat hit shader pays occupancy per sample
+///       — B70 marginal 2.2 ms/sample vs mode 2's 1.11 — so high spp widens
+///       the gap; it was "the manual Intel pick" until vendor_defaults
+///       automated it).
 /// Measured (--spin path 1080p spp=1, GPU frame span ms, default/stress/
 /// SM-lp): B70 mode 0 9.05/5.30/6.75 -> mode 1 2.35/1.64/1.94 -> mode 2
 /// 1.41/1.22/1.29; 4090 1.34/0.79/1.18 -> 0.26/0.25/0.34 -> 0.29/0.27/0.34.
@@ -96,8 +100,13 @@ pub fn require_caps(device: &ID3D12Device) -> Result<()> {
 /// a preference, never a requirement (NOT the --fsr4 shape). The RTPSO/SBT
 /// layout is identical in every mode: unreached hit groups and misses stay
 /// exported (identifier-only records, no cost). Set from main's parse via
-/// `set_inline_mode` (the texture::set_aniso knob-before-anything idiom);
-/// legal values 0..=2, main exits 2 on anything else.
+/// `set_inline_mode` (the texture::set_aniso knob-before-anything idiom),
+/// then RE-STORED in run_window right after `main::vendor_defaults` (which
+/// moves an Intel session to 2 unless `dxr_inline_explicit` vetoes — every
+/// interactive DxrGpu::new sits below that re-store; the headless harnesses
+/// never run the policy and keep the parse-time store, so gates stay a pure
+/// function of the command line). The CLI exits 2 on an illegal value; the
+/// settings file warns instead and sets the explicit veto on legal ones.
 static INLINE_MODE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
 pub fn set_inline_mode(n: u32) {
@@ -204,9 +213,10 @@ impl DxrGpu {
         // --dxr-inline (see dxr_inline_mode): armed modes compile RayQuery
         // into the library, which needs the wavefront's caps floor, not this
         // pipeline's — gate here so a tier-1.0 box degrades to the TraceRay
-        // path with one loud line instead of a DXC error. The default (1)
-        // stays QUIET; only a departure prints a lever line (the blas-split
-        // precedent).
+        // path with one loud line instead of a DXC error. The cross-vendor
+        // default (1) stays QUIET; 0 and 2 print — and on Intel, 2 is an
+        // ARRIVAL (the vendor default), not a departure, so its line names
+        // both routes and the opt-out rather than claiming "the default".
         let inline_mode = {
             let m = dxr_inline_mode();
             if m > 0 {
@@ -223,7 +233,8 @@ impl DxrGpu {
                     if m == 2 {
                         eprintln!(
                             "dxr: --dxr-inline 2 — everything inline in raygen (DispatchRays \
-                             as a bare launch grid; the default is 1, inline secondaries)"
+                             as a bare launch grid; cross-vendor default 1, Intel sessions \
+                             default here — --dxr-inline 1 opts out)"
                         );
                     }
                     m
@@ -231,7 +242,8 @@ impl DxrGpu {
             } else {
                 eprintln!(
                     "dxr: --dxr-inline 0 — all-TraceRay dispatch (the pre-lever pipeline; \
-                     the default is 1, inline RayQuery secondaries)"
+                     the cross-vendor default is 1, inline RayQuery secondaries — Intel \
+                     defaults to 2)"
                 );
                 0
             }
