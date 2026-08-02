@@ -596,6 +596,22 @@ fn wide_levels() -> u32 {
 /// moved it down one notch. Expect it to move again — always sweep BOTH vendors
 /// and score `leaf` as well as the ladder.
 ///
+/// THE B70 ROW (2026-08-01, `--spin path` 1080p, 2 reps repeating to ±0.002):
+/// Intel wants 8 OUTRIGHT — monotone 8 < 16 < 32 on span AND ladder across
+/// all four scenes, with NO leaf regression anywhere:
+/// ```text
+///                 span@8   span@16  span@32   ladder@8/16   leaf@8/16
+///   default        0.599    0.635    0.694    0.074/0.111   0.418/0.418
+///   stress 5000    0.701    0.774    0.889    0.129/0.200   0.461/0.462
+///   san-miguel-lp  0.770    0.783    0.831    0.064/0.076   0.613/0.612
+///   powerplant     0.611    0.643    0.696    0.064/0.083   0.449/0.461
+/// ```
+/// (powerplant's leaf IMPROVES at 8 — the inherited bound is near-worthless
+/// on Arc, the t_start-ablation verdict again, so the occupancy side wins
+/// with nothing to trade.) The 16 default therefore survives on the 4070
+/// Ti's powerplant regression ALONE; an Intel-keyed 8 (the `cand_defs`
+/// vendor-compile precedent) is the measured, unshipped follow-on.
+///
 /// R&D lever (`FR_LSTACK`), a power of two in 8..=64. **64 is a hard ceiling**:
 /// refine_cut emits its surviving cut into one 64-u32 `cut_pool` slot, and its
 /// `olen + wlen <= LANE_STACK` invariant is what keeps that write in bounds.
@@ -4877,10 +4893,13 @@ impl TraceGpu {
             // on NVIDIA and passes every gate bit-identically, so this is the
             // driver, not the shader. The backing-memory ask is the corroborating
             // tell: 517 MB on Arc against 82 MB on NVIDIA for the same graph.
-            // Re-test on a driver newer than 8515 and delete this arm if it
-            // passes; keying on the PICKED adapter (a fact) rather than
-            // --prefer-* (a request that can fall back) is the vendor_defaults
-            // rule.
+            // RE-TESTED 2026-08-01 on 32.0.101.8805 (arm deleted locally, the
+            // procedure below): the IDENTICAL AV — exit 0xC0000005 at the
+            // first graph dispatch of --check-gpu, backing ask still
+            // 517.62 MB, state object still builds. Re-test on a driver newer
+            // than 8805 and delete this arm if it passes; keying on the
+            // PICKED adapter (a fact) rather than --prefer-* (a request that
+            // can fall back) is the vendor_defaults rule.
             let vendor = adapter::picked_vendor();
             if caps.work_graphs_tier == 0 {
                 eprintln!(
@@ -4890,10 +4909,10 @@ impl TraceGpu {
                 None
             } else if vendor == adapter::Vendor::Intel {
                 eprintln!(
-                    "gpu work-graph: FR_WORKGRAPH=1 refused on Intel — driver 8515 reports \
-                     WorkGraphsTier 1.0 but faults inside DispatchGraph (the same graph passes \
-                     every gate on NVIDIA). Running the ExecuteIndirect ladder; retry on a \
-                     newer driver by deleting this arm in trace.rs"
+                    "gpu work-graph: FR_WORKGRAPH=1 refused on Intel — drivers 8515 AND 8805 \
+                     report WorkGraphsTier 1.0 but fault inside DispatchGraph (the same graph \
+                     passes every gate on NVIDIA). Running the ExecuteIndirect ladder; retry on \
+                     a newer driver by deleting this arm in trace.rs"
                 );
                 None
             } else {

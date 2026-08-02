@@ -2499,7 +2499,7 @@ The fix (`rt.hlsli::cand_tmin`, gated by `trace::cand_defs` on the PICKED adapte
 
 Level 6 alone goes 2–4× cheaper (R9700 0.029→0.015 / 0.067→0.016 / 0.029→0.014); frame span −1.7/−4.7/−2.3%. At 1080p the change is a **provable** no-op (`d < 6` ≡ `d < 7` for d ∈ 0..5, both consumers, measured identical ladder and span within 0.5%), so every shipping session today is untouched.
 
-**WHY NOT 8:** level 7 is SCENE-DEPENDENT where level 6 is not — R9700 serial → wide reads 0.119 → 0.032 on `--stress` but 0.018 → **0.031** on default and 0.011 → **0.028** on san-miguel, i.e. wide LOSES on two of three. That is the crossover, and the mechanism is the documented one: level 7 holds up to 4^7 = 16384 tiles, which already fills the machine one-thread-per-tile, so a whole group each only pays where the per-tile descent stays long (`--stress`'s 5000 sparse objects). It is also exactly where the recorded B70 collapse at `FR_WIDE=8` lives — that row was necessarily taken at the old `LEAF_TILE` = 8 frontier, since 1080p/32 cannot tell 6 from 8 apart. **Unmeasured:** Intel at `depth_full` ≥ 7 (no B70 in the box), so a 4K Arc session rides the cross-vendor level-6 result; re-sweep with `FR_LEAF=16` if one is available. Gated: `--check-gpu` at 800×600 has `depth_full` 5 and never creates a level 6, so the changed path is exercised by **`FR_LEAF=8 --check-gpu`**, which passes on both vendors (NVIDIA bit-exact: `max rel t err 0.00e0`, image `0.00e0`).
+**WHY NOT 8:** level 7 is SCENE-DEPENDENT where level 6 is not — R9700 serial → wide reads 0.119 → 0.032 on `--stress` but 0.018 → **0.031** on default and 0.011 → **0.028** on san-miguel, i.e. wide LOSES on two of three. That is the crossover, and the mechanism is the documented one: level 7 holds up to 4^7 = 16384 tiles, which already fills the machine one-thread-per-tile, so a whole group each only pays where the per-tile descent stays long (`--stress`'s 5000 sparse objects). It is also exactly where the recorded B70 collapse at `FR_WIDE=8` lives — that row was necessarily taken at the old `LEAF_TILE` = 8 frontier, since 1080p/32 cannot tell 6 from 8 apart. **MEASURED ON INTEL 2026-08-01** (B70, `FR_LEAF=16`/`FR_LEAF=8` recreating the depth-7/8 ladders at 1080p, 2 reps ±0.002): the hole is filled and the B70 is MIXED where the other two vendors were uniform — at depth-7, wide-7 wins only `--stress` (span 0.910 vs 0.930; level 6 wide 0.041 vs serial 0.067) and LOSES default (0.809 vs 0.761 — level 6 wide 0.078 vs serial 0.030) and san-miguel-lp (0.922 vs 0.898 by span), the same scene-dependence the other vendors only show one level deeper; and at depth-8 the old `FR_WIDE=8` collapse REPRODUCES on the current tree (default level 7: wide 0.488 vs serial 0.018, 27×; stress 0.242 vs 0.146), so the shipping 7 is exactly right there. Verdict: WIDE_LEVELS stays 7 (cross-vendor uniform win at depth-7 on AMD/NVIDIA, stress win + depth-8 safety on Intel); a 4K Arc session leaves ~0.05 ms on the table on sky-heavy scenes, documented rather than vendor-keyed. Gated: `--check-gpu` at 800×600 has `depth_full` 5 and never creates a level 6, so the changed path is exercised by **`FR_LEAF=8 --check-gpu`**, which passes on both vendors (NVIDIA bit-exact: `max rel t err 0.00e0`, image `0.00e0`).
 
 **The transferable lesson**, and it is the second time this campaign taught it: the old RDNA4 sweep that first proposed 7 was RIGHT and merely inapplicable — `FR_LEAF=8` recreates its exact tree and level 6 still halves there, as it reported. What changed was not the hardware's preference but which levels the shipping frontier creates. **A perf constant is only as good as the tree it was measured on, and the cheapest guard is to make the levers able to recreate the old tree**: `FR_LEAF` + `FR_WIDE` together span every ladder depth the renderer can produce, at one resolution, with no 4K path required.
 
@@ -2607,7 +2607,34 @@ this ladder without new evidence. CAVEAT ON THAT TABLE (2026-08-01): those A/Bs 
 `nowave` reached only the ctr.hlsli half — wavefront.hlsl's `gw_*` frontier aggregation stayed
 ARMED in the "revert" arm (the probe-reach trap, instance 3; the arm is dual-homed now). The
 leaf/sky/counter halves really were neutral as measured; the LADDER half of the feature was never
-actually A/B'd until the repair — the re-run's verdict lives in the B70 campaign table below.
+actually A/B'd until the repair. RE-MEASURED 2026-08-01 with both halves armed (`--spin path`
+1080p, current tree; B70 2 reps ±0.002, 4090 3 reps), and THE VERDICT INVERTS: `FR_ABL=nowave`
+BEATS the shipping code on BOTH vendors — B70 span 0.637 → 0.628 default / 0.775 → 0.752 stress
+(ladder 0.110 → 0.102 / 0.200 → 0.180, −7%/−10%), 4090 span 0.255 → 0.252 / 0.350 → 0.345
+(ladder −5%). `nobatch,nowave` lands BETWEEN baseline and nowave (B70 stress 0.759), which
+decomposes the pair cleanly: the HOMOGENEOUS-BATCH half is a keeper, and the `gw_*` frontier
+aggregation is the whole regression — small (~1-3% span, 5-10% ladder), cross-vendor, and
+invisible for a month because the revert arm never reached it. The "costs nothing" premise above
+is retired; flipping the gw half back to plain atomics (keeping ctr.hlsli's, which the old
+half-armed A/B measured correctly as neutral) is the open follow-on.
+
+**THE 2026-08-01 PRESSURE/OCCUPANCY CAMPAIGN — the remaining questions answered behaviorally.**
+(1) DEAD-ARM REGISTER PRESSURE (the LEAF_NO_FB class) is real but MARGINAL on Xe2:
+`FR_ABL=noffcode,noelcode` (compile the firefly + emissive code OUT — a day frame executes
+identically either way, so the A/B isolates pure allocation) reads leaf −2.1%/−3.2%
+(default/stress spin — ~9 µs absolute) and **~0 on THE WORLD** (leaf 1.011 baseline vs 1.01-1.03
+across arms — the world's leaf is ray-bound, not allocation-bound). So the 2×2 leaf-PSO ship —
+plus the sky/reference/DXR variants the firefly axis would drag in, each paying Arc's
+async-compile warm-up — is NOT taken; the probe arms stay as documented instruments. (2) The
+IGC ISA route is BLOCKED on driver 8805: `IGC_ShaderDumpEnable`/`IGC_DumpToCustomDir` (plus the
+EnableAll/PidDisable variants) produce ZERO files from the D3D12 UMD, no default dump dir
+appears, and the HKLM registry route needs elevation — the occupancy question got its answer
+behaviorally instead (finding 1: cs_leaf is not allocation-crippled; don't spend more on ISA
+archaeology without a new symptom). (3) Reference points on the current tree for future diffs
+(2 reps, ±0.002): procedural spin span **0.636 ms** (leaf 0.419, ladder 0.110), stress **0.775**
+(0.462/0.200); parked WORLD XeSS session span **3.23** = leaf 1.011 + sky/caches ~0.15 + feed
+0.231 + xess-eval 0.522 inside the replay bracket — reconciling exactly with the recorded 3.30
+baseline.
 
 *Measurement trap this campaign re-learned the hard way:* `--gpu-timing` prints a table every 120
 frames AND at exit, and a parser that takes the FIRST match reads frames 0-119 — the coldest
@@ -2626,7 +2653,10 @@ that is exactly what a graph breaks. `level_finish` is NOT forked — `#if defin
 swaps its child emission from `qout` to an `out TileRec[4] + mask` the node compacts by
 popcount rank.
 
-**Status: correct, and blocked on Intel's driver.** On the 4090 the whole `--check-gpu` suite
+**Status: correct, and blocked on Intel's driver — re-confirmed on 32.0.101.8805 (2026-08-01):
+the refusal arm was deleted locally per its own instruction and the IDENTICAL 0xC0000005 landed
+at the first graph dispatch, backing ask still 517.62 MB, state object still building happily;
+the arm now records both driver versions.** On the 4090 the whole `--check-gpu` suite
 passes with the graph armed and the result is **bit-identical** to the ladder (`leaves 768 |
 sky-tiles 4 | splits 257 | blocked 256 | cuts 65 | overflow 0`, same-seed image `mean |d| 0.00e0
 max 0.00e0`). That took a fix worth recording, because the gate that caught it only fires at
