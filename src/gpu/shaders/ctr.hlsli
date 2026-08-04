@@ -30,9 +30,29 @@
 #define CTR_SKY_PX       24u // stat: pixels inside proven-empty sky rects (zero rays)
 #define CTR_COUNT        25u
 
+// --- WIDTH_PROBE slots (FR_WIDTH=1 — trace::width_defs) --------------------
+// Each kernel reports its COMPILED wave width (WaveGetLaneCount()) — the
+// per-shader SIMD choice IGC makes from register pressure, i.e. the visible
+// half of the occupancy story the FR_ABL probes measure behaviorally.
+// DELIBERATELY >= CTR_COUNT: every zero loop (cs_seed / cs_seed_replay /
+// cs_seed_probes) runs `i < CTR_COUNT`, and every gate readback reads
+// CTR_COUNT*4 bytes — so these slots are never zeroed, never gated, and
+// survive to the end-of-session readback BY CONSTRUCTION. LOCKSTEP with
+// trace.rs's consts AND the counters buffer size (CTR_TOTAL * 4).
+#define CTR_W_LEAF      25u // cs_leaf (leaf vs leaf-fb: whichever ran last)
+#define CTR_W_SKY       26u // cs_sky
+#define CTR_W_LEVEL     27u // cs_level / cs_level_wide (last writer wins)
+#define CTR_W_HEMI      28u // cs_hemi_leaf
+#define CTR_W_REFERENCE 29u // cs_reference (declares its OWN u3 view — below)
+#define CTR_TOTAL       30u
+
 // Compile units that paste this file bind `counters` — rt.hlsli's cutout
 // loop keys its stat increment on this (the reference kernel and the DXR
-// library never declare the buffer and must not touch the slot).
+// library never declare HAVE_COUNTERS and must not touch the GATED stat
+// slots < CTR_COUNT; the WIDTH_PROBE exception lets the reference unit
+// declare its own u3 view writing width slots >= CTR_COUNT ONLY, which no
+// gate reads — the invariant this note protects is the stat slots, not the
+// register).
 #define HAVE_COUNTERS 1
 
 RWStructuredBuffer<uint>  counters : register(u3);

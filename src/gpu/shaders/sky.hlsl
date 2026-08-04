@@ -80,6 +80,10 @@ void cs_sky_lod(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
 
 [numthreads(SKY_GROUP, 1, 1)]
 void cs_sky(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
+#ifdef WIDTH_PROBE
+    // FR_WIDTH: compiled wave width, once (see leaf.hlsl's note).
+    if (all(gid == 0u) && gtid.x == 0u) counters[CTR_W_SKY] = WaveGetLaneCount();
+#endif
     uint g = flat_group(gid);
     uint rec_i = g / SKY_SPLIT;
     uint sub = g % SKY_SPLIT;

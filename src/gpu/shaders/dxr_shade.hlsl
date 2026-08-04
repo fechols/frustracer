@@ -43,8 +43,20 @@ RWStructuredBuffer<float>  csum   : register(u8); // rw*rh*3 cross-pass sum
 
 cbuffer Push : register(b1) { uint push0; uint push1; uint push2; uint push3; }
 
+#ifdef WIDTH_PROBE
+// FR_WIDTH: the DXR width sink (dxr.rs's width_buf at the u3 root param,
+// bound only when armed). Slot 1 = this kernel; slot 0 = the raygen.
+RWStructuredBuffer<uint> dxr_width : register(u3);
+#endif
+
 [numthreads(8, 8, 1)]
 void cs_dxr_shade(uint3 id : SV_DispatchThreadID) {
+#ifdef WIDTH_PROBE
+    // The deferred kernel's compiled wave width — THE number of the cliff
+    // hunt: this is the cs_6_5 unit that measured 1.9x the reference kernel
+    // doing less work, before the early-out so it always reports.
+    if (id.x == 0u && id.y == 0u) dxr_width[1] = WaveGetLaneCount();
+#endif
     if (id.x >= rw || id.y >= rh)
         return;
     uint pi = id.y * rw + id.x;

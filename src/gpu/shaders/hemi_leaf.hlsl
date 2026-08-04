@@ -12,6 +12,10 @@
 
 [numthreads(32, 1, 1)]
 void cs_hemi_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
+#ifdef WIDTH_PROBE
+    // FR_WIDTH: compiled wave width, once (see leaf.hlsl's note).
+    if (all(gid == 0u) && gtid.x == 0u) counters[CTR_W_HEMI] = WaveGetLaneCount();
+#endif
     uint tid = flat_group(gid) * 32u + gtid.x;
     uint rec_i = tid >> 2;
     if (rec_i >= counters[CTR_HEMI_LEAF]) return;

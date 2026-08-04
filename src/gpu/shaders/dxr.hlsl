@@ -18,6 +18,16 @@ RWStructuredBuffer<float> accum : register(u0); // rw*rh*3, CPU layout parity
 RWStructuredBuffer<float> tbuf  : register(u1); // primary-hit t, INF = sky
 RWStructuredBuffer<uint>  info  : register(u2); // pack_info(depth, kind)
 
+#ifdef WIDTH_PROBE_RAYGEN
+// FR_WIDTH: the DXR width sink (dxr.rs's width_buf, bound at the otherwise-
+// unbound u3 root param only when armed). Slot 0 = raygen, slot 1 =
+// cs_dxr_shade (that unit re-declares its own view). WaveGetLaneCount() in a
+// raygen is spec-legal (lib_6_5 — the armed modes' floor); the value is the
+// COMPILED SIMD width, which is the prize — mode 2's raygen IS the codegen
+// lottery victim.
+RWStructuredBuffer<uint> dxr_width : register(u3);
+#endif
+
 #if defined(DXR_INLINE_SEC) && DXR_INLINE_SEC == 3
 // Mode 3 (thin CHS + deferred compute shade — the W4 Intel finding: Arc
 // executes a fat shader inside an RT pipeline stage at 3-4.5x its compute
@@ -48,6 +58,10 @@ cbuffer Push : register(b1) { uint push0; uint push1; uint push2; uint push3; }
 void raygen() {
     uint2 id = DispatchRaysIndex().xy;
     uint pi = id.y * rw + id.x;
+#ifdef WIDTH_PROBE_RAYGEN
+    // FR_WIDTH: this raygen's compiled wave width, once per dispatch.
+    if (all(id == 0u)) dxr_width[0] = WaveGetLaneCount();
+#endif
 
 #if defined(DXR_INLINE_SEC) && DXR_INLINE_SEC == 3
     // The THIN arm: derive the sample's ray (rng/jitter re-derived here

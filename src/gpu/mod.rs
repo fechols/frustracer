@@ -3206,7 +3206,8 @@ impl GpuContext {
         }
         let wave_t = self.read_trace_buffer(&tbuf, px * 4)?;
         let wave_info = self.read_trace_buffer(&info, px * 4)?;
-        let ctrs = self.read_trace_buffer(&counters, trace::CTR_COUNT as usize * 4)?;
+        // CTR_TOTAL: the tail holds the FR_WIDTH slots (unread unless armed).
+        let ctrs = self.read_trace_buffer(&counters, trace::CTR_TOTAL as usize * 4)?;
         {
             let d3d = &mut self.d3d;
             let tg = self.trace.as_ref().unwrap();
@@ -3241,8 +3242,16 @@ impl GpuContext {
         // rays) as a fraction of the frame — the C key is the only way to
         // read it for a scene --spin can't load (THE WORLD).
         let sky_px = u(&ctrs, trace::CTR_SKY_PX as usize) as u64;
+        // FR_WIDTH: append the per-kernel compiled-width line — the C key is
+        // the interactive read of the report (the sky-px precedent).
+        let width_line = if trace::width_probe_on() {
+            let c: Vec<u32> = (0..trace::CTR_TOTAL as usize).map(|i| u(&ctrs, i)).collect();
+            format!(" | {}", trace::format_width_report(&c))
+        } else {
+            String::new()
+        };
         Ok(format!(
-            "gpu verify ({px} px): false-sky {false_sky} | tmin-overshoot {overshoot} | hybrid-extra {extra} | unwritten {sentinel} | max rel t err {max_rel:.2e} | tiles: {} splits, {} sky, {} leaves, {} blocked | sky-px {} ({:.1}%) -> {}",
+            "gpu verify ({px} px): false-sky {false_sky} | tmin-overshoot {overshoot} | hybrid-extra {extra} | unwritten {sentinel} | max rel t err {max_rel:.2e} | tiles: {} splits, {} sky, {} leaves, {} blocked | sky-px {} ({:.1}%){width_line} -> {}",
             u(&ctrs, trace::CTR_SPLIT as usize),
             u(&ctrs, trace::CTR_SKY as usize),
             u(&ctrs, trace::CTR_LEAF as usize),

@@ -2504,6 +2504,19 @@ fn run_check_dxr(
         }
     }
 
+    // FR_WIDTH: the pipeline's compiled widths (raygen + the mode-3 deferred
+    // kernel when built) — the check-suite flavor of the spin report.
+    if gpu::trace::width_probe_on() {
+        if let Some(wb) = dg.width_buf() {
+            let ua = windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            if let Ok(b) = hg.read_buffer(wb, ua, 16) {
+                let c: Vec<u32> =
+                    b.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+                eprintln!("check-dxr: width (dxr): raygen={} shade={}", c[0], c[1]);
+            }
+        }
+    }
+
     if ok {
         println!("check-dxr: PASS (DispatchRays pipeline vs the CPU plain reference)");
         0
@@ -6765,6 +6778,17 @@ fn run_check_gpu(
             cpu_ms += t0.elapsed().as_secs_f64() * 1000.0;
         }
         eprintln!("check-gpu: bench {bw}x{bh} cpu hybrid          : {:6.2} ms/frame", cpu_ms / 8.0);
+    }
+
+    // FR_WIDTH: the bench tracer ran every kernel family (hybrid, reference,
+    // hemi AO/GI), so its counter tail carries the full compiled-width table
+    // — the check-suite flavor of the spin/C-key report.
+    if gpu::trace::width_probe_on() {
+        if let Ok(b) = hg.read_buffer(&btg.counters, ua, gpu::trace::CTR_TOTAL as usize * 4) {
+            let c: Vec<u32> =
+                b.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+            eprintln!("check-gpu: {}", gpu::trace::format_width_report(&c));
+        }
     }
 
     println!("check-gpu: wavefront quadtree + hemi AO/GI OK");
@@ -11230,7 +11254,10 @@ fn run_spin_gpu(
     if hybrid {
         if let Arm::Wave(tg) = &armv {
             let ua = windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-            match hg.read_buffer(&tg.counters, ua, gpu::trace::CTR_COUNT as usize * 4) {
+            // CTR_TOTAL, not CTR_COUNT: the tail carries the FR_WIDTH slots
+            // (never zeroed by any seed kernel, so they hold whatever the
+            // session's kernels reported).
+            match hg.read_buffer(&tg.counters, ua, gpu::trace::CTR_TOTAL as usize * 4) {
                 Ok(b) => {
                     let c: Vec<u32> = b
                         .chunks_exact(4)
@@ -11246,9 +11273,42 @@ fn run_spin_gpu(
                         rw,
                         rh,
                     );
+                    if gpu::trace::width_probe_on() {
+                        eprintln!("{}", gpu::trace::format_width_report(&c));
+                    }
                 }
                 Err(e) => eprintln!("spin accounting: counter readback failed: {e}"),
             }
+        }
+    }
+    // FR_WIDTH, the plain-reference and DXR arms: the wavefront block above
+    // only runs `hybrid`, and the DXR pipeline's sink is its own buffer.
+    if gpu::trace::width_probe_on() {
+        let ua = windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        match &armv {
+            Arm::Wave(tg) if !hybrid => {
+                if let Ok(b) =
+                    hg.read_buffer(&tg.counters, ua, gpu::trace::CTR_TOTAL as usize * 4)
+                {
+                    let c: Vec<u32> = b
+                        .chunks_exact(4)
+                        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                        .collect();
+                    eprintln!("{}", gpu::trace::format_width_report(&c));
+                }
+            }
+            Arm::Dxr(dg) => {
+                if let Some(wb) = dg.width_buf() {
+                    if let Ok(b) = hg.read_buffer(wb, ua, 16) {
+                        let c: Vec<u32> = b
+                            .chunks_exact(4)
+                            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                            .collect();
+                        eprintln!("width (dxr): raygen={} shade={}", c[0], c[1]);
+                    }
+                }
+            }
+            _ => {}
         }
     }
     gpu::gputime::report();

@@ -35,6 +35,12 @@
 
 [numthreads(LEAF_GROUP, 1, 1)]
 void cs_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
+#ifdef WIDTH_PROBE
+    // FR_WIDTH: this kernel's COMPILED wave width, once, before the
+    // early-out (an empty frame still reports). Slot >= CTR_COUNT — never
+    // zeroed, never gated. leaf vs leaf-fb share the slot (last ran wins).
+    if (all(gid == 0u) && gtid.x == 0u) counters[CTR_W_LEAF] = WaveGetLaneCount();
+#endif
     uint rec_i = flat_group(gid);
     if (rec_i >= counters[push0]) return;
     LeafRec rec = qleaf[rec_i];

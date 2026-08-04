@@ -25,8 +25,8 @@ use super::dxc::Dxc;
 use super::trace::{
     self, FrameCb, FrameParams, SceneGpu, CB_STRIDE, RP_FRAME_CBV, RP_GBUF, RP_GBUF_EXT, RP_PUSH,
     RP_SCENE_TEX, RP_SRV0, RP_TEX, RP_UAV0, SRV_INDICES, SRV_MATERIALS, SRV_NORMALS,
-    SRV_POSITIONS, SRV_TLAS, SRV_TRI_MAT, TEX_HEAP_BASE, TEX_TABLE_BUFS, UAV_ACCUM, UAV_INFO,
-    UAV_QIN, UAV_QLEAF, UAV_QOUT, UAV_QSKY, UAV_TBUF,
+    SRV_POSITIONS, SRV_TLAS, SRV_TRI_MAT, TEX_HEAP_BASE, TEX_TABLE_BUFS, UAV_ACCUM, UAV_COUNTERS,
+    UAV_INFO, UAV_QIN, UAV_QLEAF, UAV_QOUT, UAV_QSKY, UAV_TBUF,
 };
 use crate::scene::Scene;
 use windows::core::{Interface, PCWSTR};
@@ -336,6 +336,13 @@ pub struct DxrGpu {
     /// tier-1.0 degrade path and the check harness's between-builds static
     /// flips would otherwise run the pass loop against a non-thin library).
     mode3: Option<Mode3>,
+    /// FR_WIDTH: the DXR pipeline's width-report sink (slot 0 = raygen,
+    /// slot 1 = cs_dxr_shade). Some iff the lever was armed at construction;
+    /// bound at the u3 root param — which this pipeline otherwise leaves
+    /// UNBOUND (the wavefront's counters register) — so unarmed sessions
+    /// bind exactly what they bind today. Read back by the spin/check width
+    /// prints via `width_buf()`.
+    width_buf: Option<ID3D12Resource>,
     /// The frame's spp, stashed by `write_cb` (which sees FrameParams) for
     /// `record_frame`'s mode-3 pass-pair loop (which doesn't) — the `sway_t`
     /// idiom; every caller including all --check-dxr sites writes the CB
@@ -618,6 +625,14 @@ impl DxrGpu {
         if recurse {
             parts.push("#define DXR_SBT_RECURSE 1");
         }
+        // FR_WIDTH: the raygen wave-width report (dxr_width[0]) — armed only
+        // where the library compiles at lib_6_5 (the inline modes' floor;
+        // wave ops in a 6_3 library are off the table, and mode 0's raygen
+        // is not the lottery victim anyway). The deferred-shade unit below
+        // carries its own WIDTH_PROBE define.
+        if trace::width_probe_on() && (inline_mode > 0 || recurse) {
+            parts.push("#define WIDTH_PROBE_RAYGEN 1");
+        }
         parts.push(trace::TRACE_COMMON_HLSLI);
         // skylod.hlsli after trace_common (needs sky_compose/sky_backdrop/rw); no
         // SKY_UNIT — this unit pastes no queues.hlsli, so u5 is free anyway.
@@ -745,7 +760,14 @@ impl DxrGpu {
         // dxr.hlsl — this unit must never contain a TraceRay (cargo test pins
         // the kernel source for one).
         let pso_dxr_shade = if inline_mode == 3 {
-            let shade_src = [
+            // FR_WIDTH pushed conditionally (the trace.rs unit rule): arms
+            // dxr_shade.hlsl's guarded u3 view + width write (slot 1).
+            let wd = trace::width_defs();
+            let mut shade_parts: Vec<&str> = Vec::new();
+            if !wd.is_empty() {
+                shade_parts.push(wd.as_str());
+            }
+            shade_parts.extend([
                 defs.as_str(),
                 sd,
                 cloud_defs.as_str(),
@@ -756,8 +778,8 @@ impl DxrGpu {
                 trace::RIPPLE_HLSLI,
                 trace::SHADE_HLSLI,
                 DXR_SHADE_HLSL,
-            ]
-            .join("\n");
+            ]);
+            let shade_src = shade_parts.join("\n");
             Some(trace::compute_pso(
                 device,
                 &root_sig,
@@ -1236,6 +1258,11 @@ impl DxrGpu {
             sway_mv_t: std::cell::Cell::new(None),
             sway_mv_on: !sway_def.is_empty(),
             mode3,
+            width_buf: if trace::width_probe_on() {
+                Some(committed_buffer(device, 16, uaf, ua)?)
+            } else {
+                None
+            },
             spp: std::cell::Cell::new(1),
             gbuf_full,
             hdr,
@@ -1256,6 +1283,12 @@ impl DxrGpu {
     /// See `TraceGpu::force_gbuf_ext` — gates only.
     pub fn force_gbuf_ext(&self, on: bool) {
         self.force_gbuf_ext.set(on);
+    }
+
+    /// FR_WIDTH: the DXR width sink (slot 0 = raygen, slot 1 = cs_dxr_shade),
+    /// Some iff the lever was armed at construction. Readback-only consumers.
+    pub fn width_buf(&self) -> Option<&ID3D12Resource> {
+        self.width_buf.as_ref()
     }
 
     pub fn write_cb(&self, slot: usize, p: &FrameParams) {
@@ -1388,6 +1421,15 @@ impl DxrGpu {
                 RP_UAV0 + UAV_INFO,
                 self.info.GetGPUVirtualAddress(),
             );
+            // FR_WIDTH: the width sink at the otherwise-unbound u3 root param
+            // (writing through an unset root descriptor is UB — the buffer
+            // exists exactly when the shaders that write it compiled in).
+            if let Some(wb) = &self.width_buf {
+                list.SetComputeRootUnorderedAccessView(
+                    RP_UAV0 + UAV_COUNTERS,
+                    wb.GetGPUVirtualAddress(),
+                );
+            }
             list.SetComputeRootUnorderedAccessView(RP_GBUF, self.gbuf.GetGPUVirtualAddress());
             list.SetComputeRootUnorderedAccessView(
                 RP_GBUF_EXT,
@@ -1604,6 +1646,28 @@ impl DxrGpu {
 #[cfg(test)]
 mod mode3_shader_source_tests {
     use super::{DXR_HLSL, DXR_SHADE_HLSL, RT_DXR_HLSLI};
+
+    /// FR_WIDTH's DXR halves stay behind their guards: an unguarded
+    /// `dxr_width` would declare/write u3 in every session — a register this
+    /// pipeline deliberately leaves unbound unless the lever armed a sink
+    /// (writing through an unset root descriptor is UB).
+    #[test]
+    fn width_writes_are_guarded() {
+        for (name, src, guard) in [
+            ("dxr.hlsl", DXR_HLSL, "#ifdef WIDTH_PROBE_RAYGEN"),
+            ("dxr_shade.hlsl", DXR_SHADE_HLSL, "#ifdef WIDTH_PROBE"),
+        ] {
+            for (i, _) in src.match_indices("dxr_width") {
+                let last_open = src[..i]
+                    .rfind(guard)
+                    .unwrap_or_else(|| panic!("{name}: dxr_width used before any {guard}"));
+                assert!(
+                    !src[last_open..i].contains("#endif"),
+                    "{name}: dxr_width use at byte {i} escaped its guard"
+                );
+            }
+        }
+    }
 
     /// The record's miss convention is `t < 0` (miss_hit's wire format);
     /// tbuf's is INF, and ff_glow/T1 classify on it. The deferred kernel must

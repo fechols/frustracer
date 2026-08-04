@@ -697,6 +697,11 @@ void level_finish(TileRec rec, uint2 p0, uint2 p1, uint depth, uint cut_len, TF 
 // one's inherited cut is tight enough that a private DFS is the right shape.
 [numthreads(32, 1, 1)]
 void cs_level(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
+#ifdef WIDTH_PROBE
+    // FR_WIDTH: compiled wave width, once (see leaf.hlsl's note). cs_level
+    // and cs_level_wide share the slot — last writer wins.
+    if (all(gid == 0u) && gtid.x == 0u) counters[CTR_W_LEVEL] = WaveGetLaneCount();
+#endif
     uint idx = flat_group(gid) * 32u + gtid.x;
     if (idx >= counters[push0]) return;
     TileRec rec = qin[idx];
@@ -715,6 +720,9 @@ void cs_level(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
 // owns g_stack slab 0 for refine_cut.
 [numthreads(32, 1, 1)]
 void cs_level_wide(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
+#ifdef WIDTH_PROBE
+    if (all(gid == 0u) && gtid.x == 0u) counters[CTR_W_LEVEL] = WaveGetLaneCount();
+#endif
     uint idx = flat_group(gid);
     if (idx >= counters[push0]) return;
     TileRec rec = qin[idx];

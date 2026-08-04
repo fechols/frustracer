@@ -190,6 +190,18 @@ pub const CTR_FRONTIER_ENTRIES: u32 = 23;
 /// CTR_LEAF/CTR_SKY/CTR_CUT.
 pub const CTR_SKY_PX: u32 = 24;
 pub const CTR_COUNT: u32 = 25;
+// WIDTH_PROBE slots (FR_WIDTH=1 — `width_defs`): each kernel reports its
+// COMPILED wave width (WaveGetLaneCount()). DELIBERATELY >= CTR_COUNT: every
+// zero loop runs `i < CTR_COUNT` and every gate readback reads CTR_COUNT*4
+// bytes, so these slots are never zeroed and never gated by construction.
+// LOCKSTEP with ctr.hlsli's block AND the counters buffer size (CTR_TOTAL*4).
+pub const CTR_W_LEAF: u32 = 25;
+pub const CTR_W_SKY: u32 = 26;
+pub const CTR_W_LEVEL: u32 = 27;
+pub const CTR_W_HEMI: u32 = 28;
+pub const CTR_W_REFERENCE: u32 = 29;
+pub const CTR_TOTAL: u32 = 30;
+const _: () = assert!(CTR_W_LEAF >= CTR_COUNT && CTR_TOTAL == CTR_W_REFERENCE + 1);
 
 /// queues.hlsli::LeafRec's stride — the qleaf allocation and main.rs's
 /// check-gpu readback move in lockstep with the HLSL struct through this one
@@ -3193,6 +3205,102 @@ pub(crate) fn abl_announce() {
     });
 }
 
+/// FR_WIDTH=1 — arm the in-kernel wave-width report: each real kernel writes
+/// its COMPILED WaveGetLaneCount() to a WIDTH_PROBE counter slot (>=
+/// CTR_COUNT, so no zero loop or gate ever touches it). This exists because
+/// `wave_probe` deliberately measures a TRIVIAL kernel per group width, while
+/// the driver picks SIMD width PER SHADER from register pressure — the real
+/// kernels' widths are the visible half of the occupancy story (Xe2: 16 vs
+/// 32). Loud on arm AND on an unrecognized value (the FR_WIDE rule — a
+/// silent no-op walk is the failure mode env levers exist to prevent).
+pub(crate) fn width_probe_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("FR_WIDTH") {
+        Err(_) => false,
+        Ok(v) if v == "1" => {
+            eprintln!(
+                "gpu: FR_WIDTH=1 — in-kernel wave-width report armed (writes \
+                 counter slots >= CTR_COUNT only; no gate reads them)"
+            );
+            true
+        }
+        Ok(v) => {
+            eprintln!("gpu: FR_WIDTH={v:?} unrecognized (legal: 1) — off");
+            false
+        }
+    })
+}
+
+/// The WIDTH_PROBE defines, "" when off (callers push CONDITIONALLY — an
+/// empty join element would prepend a blank line and break the unarmed
+/// sources' byte-identity, the dxr.rs feed-unit lesson). Carries the
+/// CTR_W_REFERENCE literal because the reference unit pastes no ctr.hlsli;
+/// units that DO paste it see an identical object-like redefinition, legal
+/// HLSL (the noelcode precedent).
+pub(crate) fn width_defs() -> String {
+    if width_probe_on() {
+        format!("#define WIDTH_PROBE 1\n#define CTR_W_REFERENCE {CTR_W_REFERENCE}u")
+    } else {
+        String::new()
+    }
+}
+
+/// FR_BALLAST=N — inject N synthetic LIVE floats into cs_reference (the
+/// register-cliff bisection lever; see reference.hlsl's liveness argument).
+/// Legal 1..=256; anything else is loud + off; a `dxr:N` spelling is
+/// RESERVED and refused loudly (the deferred-kernel variant is unbuilt — a
+/// lever that silently no-ops is the failure mode these announces prevent).
+/// Image bit-identical at every real spp (the fold is branch-dead at
+/// runtime); a PROBE, never a lever — pair with FR_WIDTH=1 and sweep N to
+/// find the width flip / ms step.
+pub(crate) fn ballast_ref_n() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        let Ok(v) = std::env::var("FR_BALLAST") else { return 0 };
+        if let Some(rest) = v.strip_prefix("dxr:") {
+            eprintln!(
+                "gpu: FR_BALLAST=dxr:{rest} — the cs_dxr_shade variant is not \
+                 built (reference-kernel bisection only) — off"
+            );
+            return 0;
+        }
+        match v.parse::<u32>() {
+            Ok(n) if (1..=256).contains(&n) => {
+                eprintln!(
+                    "gpu: FR_BALLAST={n} — {n} synthetic live floats in \
+                     cs_reference (register-cliff probe; image bit-identical)"
+                );
+                n
+            }
+            _ => {
+                eprintln!("gpu: FR_BALLAST={v:?} illegal (N in 1..=256) — off");
+                0
+            }
+        }
+    })
+}
+
+/// The BALLAST_N define, "" when off (pushed conditionally, like width_defs).
+pub(crate) fn ballast_defs() -> String {
+    match ballast_ref_n() {
+        0 => String::new(),
+        n => format!("#define BALLAST_N {n}u"),
+    }
+}
+
+/// One line from a CTR_TOTAL-sized counter readback. 0 = that kernel never
+/// ran this session (e.g. hemi without an H cycle, level under replay).
+pub fn format_width_report(c: &[u32]) -> String {
+    format!(
+        "width (gpu): leaf={} sky={} level={} hemi={} reference={}",
+        c[CTR_W_LEAF as usize],
+        c[CTR_W_SKY as usize],
+        c[CTR_W_LEVEL as usize],
+        c[CTR_W_HEMI as usize],
+        c[CTR_W_REFERENCE as usize]
+    )
+}
+
 /// The `--blas-split` twin: armed sessions compile `tri_of()` as the chunk
 /// remap (`blas_tri[chunk_base[inst] + prim]`), unarmed ones as the identity,
 /// so every unarmed kernel is byte-identical to the pre-feature source. A
@@ -3404,7 +3512,15 @@ pub(crate) fn spp_defs() -> String {
 /// out). SKY_UNIT gives `cloud_lod` register u5 (queues.hlsli's tile queues
 /// suppressed); it traces nothing, so no frustum/rt machinery.
 pub(crate) fn sky_unit_src(k: u32, n: u32) -> String {
-    [
+    // WIDTH_PROBE pushed conditionally (cs_sky's width slot); the DXR
+    // pipeline compiles only the fill entries from this unit, whose armed
+    // epilogue lives in cs_sky alone, so DXR's u3-unbound state is untouched.
+    let mut parts: Vec<String> = Vec::new();
+    let wd = width_defs();
+    if !wd.is_empty() {
+        parts.push(wd);
+    }
+    parts.extend([
         // Ablations must reach THIS unit too — see the feed_src note. A
         // `nogbuf` probe once measured `sky` as unchanged and it was read as
         // "the sky pack write is free"; the define had simply never arrived,
@@ -3425,8 +3541,8 @@ pub(crate) fn sky_unit_src(k: u32, n: u32) -> String {
         QUEUES_HLSLI.to_string(),
         SKYLOD_HLSLI.to_string(),
         SKY_HLSL.to_string(),
-    ]
-    .join("\n")
+    ]);
+    parts.join("\n")
 }
 
 /// The scene AABB the slab-space cloud-shadow grid spans: the content box
@@ -4864,7 +4980,19 @@ impl TraceGpu {
         // reads the cloud lattice (SKYLOD_HLSLI at u5, filled by record_sky_lod)
         // and the cloud-shadow cache (csn, filled by record_cloud_shadow), so it
         // shades sky exactly as the leaf kernel does.
-        let reference_src = [
+        // WIDTH_PROBE defines, pushed CONDITIONALLY into every unit below —
+        // never as an empty join element (the feed-unit byte-identity rule):
+        // unarmed assemblies must be byte-identical to the pre-lever sources.
+        let wd = width_defs();
+        let bd = ballast_defs();
+        let mut reference_parts: Vec<&str> = Vec::new();
+        if !wd.is_empty() {
+            reference_parts.push(wd.as_str());
+        }
+        if !bd.is_empty() {
+            reference_parts.push(bd.as_str());
+        }
+        reference_parts.extend([
             csn.as_str(),
             sky_lod_defs.as_str(),
             defs,
@@ -4876,8 +5004,8 @@ impl TraceGpu {
             RIPPLE_HLSLI,
             SHADE_HLSLI,
             REFERENCE_HLSL,
-        ]
-        .join("\n");
+        ]);
+        let reference_src = reference_parts.join("\n");
         let resolve_src = [sd, TRACE_COMMON_HLSLI, RESOLVE_HLSL].join("\n");
         let (sky_group, sky_split) = (SKY_GROUP, SKY_SPLIT);
         let sky_defs = format!(
@@ -4885,7 +5013,11 @@ impl TraceGpu {
             crate::render::leaf_tile()
         );
         let wavefront_ablation_defs = wavefront_ablation_defs();
-        let wavefront_src = [
+        let mut wavefront_parts: Vec<&str> = Vec::new();
+        if !wd.is_empty() {
+            wavefront_parts.push(wd.as_str());
+        }
+        wavefront_parts.extend([
             sky_defs.as_str(),
             wavefront_ablation_defs.as_str(),
             empty_def,
@@ -4900,8 +5032,8 @@ impl TraceGpu {
             FRUSTUM_HLSLI,
             FTREE_HLSLI,
             WAVEFRONT_HLSL,
-        ]
-        .join("\n");
+        ]);
+        let wavefront_src = wavefront_parts.join("\n");
         // The sky fill is its own unit so `cloud_lod` can take u5 (SKY_UNIT
         // suppresses queues.hlsli's tile-queue declarations there). Assembled by
         // the shared `sky_unit_src` so the DXR pipeline's fill kernels cannot
@@ -4917,8 +5049,13 @@ impl TraceGpu {
         // the same lattice: SKY_UNIT yields u5 (it never touches the tile
         // queues) and skylod.hlsli supplies the accessors.
         let leaf_of = |extra: &str| {
-            [
-                &format!("#define LEAF_GROUP {}", leaf_group()),
+            let lg = format!("#define LEAF_GROUP {}", leaf_group());
+            let mut parts: Vec<&str> = Vec::new();
+            if !wd.is_empty() {
+                parts.push(wd.as_str());
+            }
+            parts.extend([
+                lg.as_str(),
                 extra,
                 csn.as_str(),
                 sky_lod_defs.as_str(),
@@ -4934,8 +5071,8 @@ impl TraceGpu {
                 RIPPLE_HLSLI,
                 SHADE_HLSLI,
                 LEAF_HLSL,
-            ]
-            .join("\n")
+            ]);
+            parts.join("\n")
         };
         let leaf_src = leaf_of("#define LEAF_NO_FB 1");
         let leaf_fb_src = leaf_of("");
@@ -4957,7 +5094,11 @@ impl TraceGpu {
             HEMI_WAVE_HLSL,
         ]
         .join("\n");
-        let hemi_leaf_src = [
+        let mut hemi_leaf_parts: Vec<&str> = Vec::new();
+        if !wd.is_empty() {
+            hemi_leaf_parts.push(wd.as_str());
+        }
+        hemi_leaf_parts.extend([
             defs,
             sw_defs,
             sd,
@@ -4968,8 +5109,8 @@ impl TraceGpu {
             RIPPLE_HLSLI,
             SHADE_HLSLI,
             HEMI_LEAF_HLSL,
-        ]
-        .join("\n");
+        ]);
+        let hemi_leaf_src = hemi_leaf_parts.join("\n");
         let compose_src = [sd, TRACE_COMMON_HLSLI, CTR_HLSLI, QUEUES_HLSLI, COMPOSE_HLSL].join("\n");
         // abl_defs FIRST so a feed ablation is not silently inert. It was:
         // an `FR_ABL=nopack` probe reported `feed` unchanged and that was read
@@ -5162,7 +5303,10 @@ impl TraceGpu {
             cap_cut < (1u64 << 26),
             "cut arena exceeds the traversal-frontier token domain"
         );
-        let counters = committed_buffer(device, CTR_COUNT as u64 * 4, uaf, ua)?;
+        // CTR_TOTAL, not CTR_COUNT: the tail holds the WIDTH_PROBE slots.
+        // Unconditional — 20 bytes buys a lever-independent buffer shape (an
+        // FR_WIDTH session and a plain one bind identical resources).
+        let counters = committed_buffer(device, CTR_TOTAL as u64 * 4, uaf, ua)?;
         let args = committed_buffer(device, 16 * 12, uaf, ua)?;
         let qa = committed_buffer(device, cap_tile * 24, uaf, ua)?;
         let qb = committed_buffer(device, cap_tile * 24, uaf, ua)?;
@@ -7079,6 +7223,73 @@ pub fn bc7_gpu_self_test(hg: &mut HeadlessGpu) -> Result<()> {
 // gate can reach (`--check-gpu`/`--check-dxr` need a real adapter). They are
 // deliberately narrow: each asserts an ordering or a monotonicity statement,
 // never formatting.
+
+#[cfg(test)]
+mod width_ballast_shader_source_tests {
+    use super::{CTR_COUNT, CTR_HLSLI, CTR_TOTAL, CTR_W_LEAF, LEAF_HLSL, WAVEFRONT_HLSL};
+    const REFERENCE: &str = super::REFERENCE_HLSL;
+    const SKY: &str = super::SKY_HLSL;
+    const HEMI_LEAF: &str = super::HEMI_LEAF_HLSL;
+
+    /// Every WaveGetLaneCount() the FR_WIDTH probe added must sit inside a
+    /// WIDTH_PROBE guard — an unguarded one would ship in every session and
+    /// break the unarmed byte-identity contract. (ctr.hlsli's wave-aggregated
+    /// bumps legitimately call it unguarded; the pin covers the PROBE files.)
+    #[test]
+    fn width_writes_are_guarded_and_slots_survive_zeroing() {
+        for (name, src, slot) in [
+            ("leaf", LEAF_HLSL, "CTR_W_LEAF"),
+            ("sky", SKY, "CTR_W_SKY"),
+            ("wavefront", WAVEFRONT_HLSL, "CTR_W_LEVEL"),
+            ("hemi_leaf", HEMI_LEAF, "CTR_W_HEMI"),
+            ("reference", REFERENCE, "CTR_W_REFERENCE"),
+        ] {
+            for (i, _) in src.match_indices(slot) {
+                // Every use must sit between a `#ifdef WIDTH_PROBE` and its
+                // `#endif`: the nearest preceding open must exist, with no
+                // intervening close. (The probe epilogues are one-liners, so
+                // no nested preprocessor blocks live inside the guards.)
+                let last_open = src[..i]
+                    .rfind("#ifdef WIDTH_PROBE")
+                    .unwrap_or_else(|| panic!("{name}: {slot} used before any WIDTH_PROBE guard"));
+                assert!(
+                    !src[last_open..i].contains("#endif"),
+                    "{name}: {slot} use at byte {i} escaped its WIDTH_PROBE guard"
+                );
+            }
+        }
+        // The survival-by-construction premise: the seed kernels still zero
+        // exactly `i < CTR_COUNT`, so the width tail is never wiped.
+        assert!(WAVEFRONT_HLSL.contains("i < CTR_COUNT"));
+        assert!(!WAVEFRONT_HLSL.contains("i < CTR_TOTAL"));
+        assert!(CTR_W_LEAF >= CTR_COUNT && CTR_TOTAL > CTR_W_LEAF);
+        // ctr.hlsli's literal block mirrors the Rust consts.
+        assert!(CTR_HLSLI.contains("#define CTR_W_LEAF      25u"));
+        assert!(CTR_HLSLI.contains("#define CTR_TOTAL       30u"));
+    }
+
+    /// The FR_BALLAST array must be confined to its guarded blocks and its
+    /// fold must hide behind the never-true `spp == 0xdeadu` branch — that
+    /// branch is the whole image-bit-identity argument.
+    #[test]
+    fn ballast_confined_and_fold_branch_dead() {
+        let n_guards = REFERENCE.matches("#if defined(BALLAST_N) && (BALLAST_N > 0)").count();
+        assert_eq!(n_guards, 3, "reference.hlsl must carry exactly the 3 ballast blocks");
+        for (i, _) in REFERENCE.match_indices("ballast") {
+            let before = &REFERENCE[..i];
+            let last_open = before
+                .rfind("#if defined(BALLAST_N)")
+                .expect("ballast text before any BALLAST_N guard");
+            assert!(
+                !REFERENCE[last_open..i].contains("#endif"),
+                "ballast use at byte {i} escaped its guard"
+            );
+        }
+        let fold = REFERENCE.find("bacc").expect("the fold accumulator must exist");
+        let branch = REFERENCE.find("if (spp == 0xdeadu)").expect("the dead branch must exist");
+        assert!(branch < fold, "the fold must sit under the never-true spp branch");
+    }
+}
 
 #[cfg(test)]
 mod ftree_shader_source_tests {

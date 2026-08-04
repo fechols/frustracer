@@ -9,8 +9,22 @@ RWStructuredBuffer<float> accum : register(u0); // rw*rh*3, CPU layout parity
 RWStructuredBuffer<float> tbuf  : register(u1); // primary-hit t, INF = sky
 RWStructuredBuffer<uint>  info  : register(u2); // pack_info(depth, kind)
 
+#ifdef WIDTH_PROBE
+// FR_WIDTH: the counters buffer, bound at u3 by bind_common for every
+// dispatch on this pipeline (record_reference included). Width slots
+// (>= CTR_COUNT) ONLY — deliberately NOT ctr.hlsli and NOT HAVE_COUNTERS,
+// so rt.hlsli's gated stat increments stay compiled out of this unit (the
+// ctr.hlsli contract note; CTR_W_REFERENCE is injected by trace::width_defs).
+RWStructuredBuffer<uint> width_ctr : register(u3);
+#endif
+
 [numthreads(8, 8, 1)]
 void cs_reference(uint3 id : SV_DispatchThreadID) {
+#ifdef WIDTH_PROBE
+    // Report this kernel's COMPILED wave width once (thread 0,0) — the
+    // per-shader SIMD choice the driver made for THIS kernel's pressure.
+    if (id.x == 0u && id.y == 0u) width_ctr[CTR_W_REFERENCE] = WaveGetLaneCount();
+#endif
     if (id.x >= rw || id.y >= rh) return;
 
     uint pi = id.y * rw + id.x;
@@ -18,6 +32,26 @@ void cs_reference(uint3 id : SV_DispatchThreadID) {
     // traces from the root with TMin = 0). Same seeding, same probe rule — the
     // same-seed wavefront-vs-reference A/B has to keep holding at every spp.
     float3 csum = 0.0;
+#if defined(BALLAST_N) && (BALLAST_N > 0)
+    // FR_BALLAST: BALLAST_N synthetic live floats — the register-cliff
+    // bisection lever. The liveness argument, one part per compiler escape:
+    //  (a) NOT DEAD: the fold below reads every element under a branch on a
+    //      cbuffer value (spp == 0xdead) the compiler cannot disprove; spp
+    //      is clamped to 1..=MAX_SPP at write_cb, so the branch never runs
+    //      and the image stays BIT-IDENTICAL at every real spp.
+    //  (b) NOT SINKABLE / REMATERIALIZABLE: each element is a LOOP
+    //      RECURRENCE whose increment consumes `t` — the traced distance —
+    //      so reconstructing an element after the loop would require
+    //      re-tracing, and sinking the chain out of the loop would mean
+    //      distributing the loop across a RayQuery, which neither DXC nor
+    //      IGC performs.
+    //  (c) NOT MEMORY-DEMOTED: [unroll] makes every index compile-time, so
+    //      the array lives in registers unless the compiler SPILLS — which
+    //      is exactly the pressure being simulated.
+    float ballast[BALLAST_N];
+    [unroll] for (uint bi = 0u; bi < BALLAST_N; ++bi)
+        ballast[bi] = float(bi + 1u) * 0.618034 + float(id.x * 7919u + id.y) * 1e-6;
+#endif
     for (uint s = 0u; s < spp; ++s) {
         uint rng = rng_init(id.x, id.y, frame, s);
         float2 sp = sample_pos(id.x, id.y, s, rng);
@@ -59,6 +93,13 @@ void cs_reference(uint3 id : SV_DispatchThreadID) {
 #ifndef ABL_NO_FF_CODE
         if (flags & FLAG_FIREFLIES) c += ff_glow(cam_origin.xyz, dir, t, pixel_cone * 0.5);
 #endif
+#if defined(BALLAST_N) && (BALLAST_N > 0)
+        // The recurrence: every element's PREVIOUS value is consumed after
+        // the next iteration's trace_closest, i.e. all BALLAST_N floats are
+        // loop-carried across the traversal — the footprint being simulated.
+        [unroll] for (uint bi = 0u; bi < BALLAST_N; ++bi)
+            ballast[bi] = ballast[bi] * 1.0000001 + (t + float(bi)) * 1e-30;
+#endif
         csum += c;
         if (prim) {
             tbuf[pi] = t;
@@ -66,6 +107,16 @@ void cs_reference(uint3 id : SV_DispatchThreadID) {
         }
     }
     float3 c = csum * (1.0 / float(spp));
+#if defined(BALLAST_N) && (BALLAST_N > 0)
+    // Never true — write_cb clamps spp to 1..=MAX_SPP (128) — but the
+    // compiler cannot prove that, so the array is not dead. Bit-identical
+    // image at every real spp.
+    if (spp == 0xdeadu) {
+        float bacc = 0.0;
+        [unroll] for (uint bi = 0u; bi < BALLAST_N; ++bi) bacc += ballast[bi];
+        c += bacc;
+    }
+#endif
 
     uint i3 = pi * 3u;
     // splat: frame 0 (or non-accumulating) stores — the implicit clear.
