@@ -193,8 +193,19 @@ pub(crate) fn dxr_inline_mode() -> u32 {
 ///   2 — SPECIALIZED records: one extra DXIL library per class PRESENT in
 ///       the scene (k ≠ uber), compiled with `shadeclass::strip_defines(k)`
 ///       prepended — the SHADE_MAT_* seams in shade.hlsli fold that class's
-///       provably-dead arms out (the STRIPS table is the soundness argument;
-///       `verify_strips` re-proved it on this scene's materials at upload).
+///       provably-dead arms out (the STRIPS table is the soundness argument
+///       FOR THE RECORD'S OWN SURFACE; `verify_strips` re-proved it on this
+///       scene's materials at upload). KNOWN APPROXIMATION, measured: the
+///       flattened lap loop also shades the record's CONTINUATION surfaces
+///       (reflected/refracted children), which can be a DIFFERENT class —
+///       a specialized parent then shades a child with the parent's strips
+///       (a tex-opaque record's glass child loses its transmission). At the
+///       SM-lp glassware pose the mode-2-vs-mode-1 drift reads max |d|
+///       9.61e-3 (~3% of channels) against the 5.96e-8 fp-noise floor —
+///       real, bounded under T2's statistical gates, and the documented
+///       price of an occupancy INSTRUMENT. Mode 3 closes it BY CONSTRUCTION
+///       (every surface shades in its own class's record) — an unplanned
+///       second reason that rung exists.
 ///       Each library exports exactly `{chs_shade_ck ← chs_shade}`; absent
 ///       classes + uber stay lib-0 aliases (absent records are never
 ///       addressed, uber IS the unstripped fallback). Adds primary-hit

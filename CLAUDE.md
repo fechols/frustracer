@@ -2154,6 +2154,51 @@ cargo run --release -- --dxr-sbt 1    # EXPERIMENT lever (default 0 = off): the 
                                       # the documented mv_selftest close-up caveat (median
                                       # 3.156 vs 0.17 limit, vendor-independent, pre-existing
                                       # — read the log, not the exit code, at that pose).
+                                      # MODE 2'S KNOWN APPROXIMATION, measured at that same
+                                      # pose: a specialized record's lap loop also shades its
+                                      # CONTINUATION surfaces, which can be a different class
+                                      # (a tex-opaque parent's strips drop a glass child's
+                                      # transmission) — mode-2-vs-mode-1 drift max |d| 9.61e-3
+                                      # (~3% of channels) vs the 5.96e-8 fp floor; real,
+                                      # bounded under T2, the documented price of an occupancy
+                                      # instrument. Mode 3 closes it BY CONSTRUCTION (every
+                                      # surface shades in its own class record) — the second
+                                      # reason that rung exists.
+                                      # THE LADDER, MEASURED (2026-08-04, --spin path 1080p,
+                                      # min of 2 reps forward/reversed, spans in ms at
+                                      # default/stress/SM-lp; CSVs + protocol in the session
+                                      # scratchpad's matrix1): at --dxr-inline 0 — the
+                                      # by-the-book all-TraceRay pipeline, the TSU's regime —
+                                      # B70 spp=1 reads sbt0 8.02/5.31/6.79 → sbt1
+                                      # 8.60/5.39/6.67 (FLAT with 8 genuinely distinct sort
+                                      # keys) → sbt2 2.51/2.38/2.17 (−55..−69%) → sbt3
+                                      # 1.49/1.78/1.29 (−66..−81%); 4090 1.17/0.83/1.15 →
+                                      # flat → 0.25/0.34/0.24 → 0.19/0.27/0.20. Per-sample
+                                      # marginals (spp16−spp1)/15: B70 7.02/4.54/5.92 → sbt3
+                                      # 0.93/1.03/0.81 (5-7x); 4090 1.26/1.48/1.00 → sbt3
+                                      # 0.15/0.29/0.14. At --dxr-inline 1, sbt2 is −20..−30%
+                                      # on the 4090 (0.186/0.228/0.202) and −50..−60% on the
+                                      # B70 (1.05/0.87/0.97) — which BEATS the same-day
+                                      # inline-2 (1.80/1.40/1.94) and inline-3 (1.40/1.44/
+                                      # 2.20) bars: `--dxr-inline 1 --dxr-sbt 2` is the
+                                      # fastest DXR configuration measured on Arc (the
+                                      # wavefront still wins outright — 0.64/0.78 recorded).
+                                      # FOUR READINGS: (1) sort keys ALONE buy ~0 on both
+                                      # vendors — mode 1 is flat even where the TSU has 8
+                                      # distinct keys, because sorting identical fat shaders
+                                      # has nothing to gain; (2) SPECIALIZATION is the prize —
+                                      # thin per-class hit shaders recover 55-80% of the
+                                      # by-the-book pipeline's cost, refining the launch-tax
+                                      # story: most of the tax was the FAT UBER SHADER hosted
+                                      # in RT pipeline stages, not TraceRay itself; (3) the
+                                      # recursion rung lands the textbook pipeline at parity
+                                      # with the inline hybrids (B70 sbt3 1.49 vs the same-day
+                                      # inline-3 1.40; 4090 0.19 vs inline-1-sbt-2's 0.186) —
+                                      # noting sbt3-vs-sbt2-at-inline-0 confounds recursion
+                                      # with inline occlusion; (4) specialization also
+                                      # STABILIZES Arc codegen — the >15%-spread rows in the
+                                      # rep-trust check are all fat-shader configs (mode 0/1
+                                      # SM-lp), the specialized rows repeat tight.
                                       # ENVIRONMENT (2026-08-04): the AMD iGPU ("Radeon(TM)
                                       # Graphics", driver 32.0.21018.14) AVs 0xC0000005 inside
                                       # CreateStateObject/identifier query on ANY armed mode —

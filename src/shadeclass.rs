@@ -8,12 +8,25 @@
 //!
 //! THE SOUNDNESS SPINE: a class may STRIP a shade arm only when its
 //! MEMBERSHIP PREDICATE forces that arm's runtime guard data-false for every
-//! member. Stripped code is then provably never executed, so a specialized
-//! shader is semantically identical to the uber one for its own geometry.
-//! `STRIPS` is the one table; `classify_materials`, `strip_defines`, and
-//! `self_test`'s must-fire all derive from it, so the table cannot drift
-//! from its own soundness argument. Anything not provably strippable lands
-//! in `CK_UBER` — coarser, never wrong.
+//! member. Stripped code is then provably never executed FOR THE RECORD'S
+//! OWN SURFACE, so a specialized shader is semantically identical to the
+//! uber one for its own geometry. `STRIPS` is the one table;
+//! `classify_materials`, `strip_defines`, and `self_test`'s must-fire all
+//! derive from it, so the table cannot drift from its own soundness
+//! argument. Anything not provably strippable lands in `CK_UBER` — coarser,
+//! never wrong.
+//!
+//! THE SCOPE OF THAT CLAIM, measured (2026-08-04): under `--dxr-sbt 2` the
+//! flattened lap loop in a specialized record ALSO shades the record's
+//! continuation surfaces (reflected/refracted children), which can belong
+//! to a DIFFERENT class — a tex-opaque parent's strips drop a glass child's
+//! transmission. Mode-2-vs-mode-1 drift at the SM-lp glassware pose: max
+//! |d| 9.61e-3 (~3% of channels) vs the 5.96e-8 fp-noise floor — real,
+//! bounded under the statistical suites, documented as the price of an
+//! occupancy INSTRUMENT (gpu/dxr.rs's SBT_MODE doc carries the same note).
+//! `--dxr-sbt 3` closes it BY CONSTRUCTION: every continuation TraceRays
+//! into the child's OWN class record, so each surface shades under its own
+//! strips and the per-member claim is the whole story again.
 //!
 //! Deliberately NOT keyed on `Material::class` (the matclass verdict):
 //! shading never reads it and it is `IDX_DEFAULT` on every non-OBJ load
