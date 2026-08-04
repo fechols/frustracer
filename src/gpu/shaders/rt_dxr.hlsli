@@ -109,6 +109,15 @@ struct HitPayload {
     // Logical interval, consumed by ah_hit after relief moves the candidate t.
     float tmin;
     float tmax;
+#if defined(DXR_INLINE_SEC) && DXR_INLINE_SEC == 3
+    // Mode 3 (thin CHS): the committed InstanceID, carried into the hit
+    // record so the deferred compute kernel can feed the sway-MV G-buffer
+    // lane (reference.hlsl's `hit.inst` form — the payload hop is the only
+    // way out of the pipeline, raygen has no InstanceID()). 24 -> 28 B, under
+    // the RTPSO's 32 B MaxPayloadSizeInBytes; guarded so modes 0-2
+    // preprocess to today's bytes.
+    uint inst;
+#endif
 };
 
 // The three TraceRay-flavor primitives. Compiled out under FR_DXR_INLINE —

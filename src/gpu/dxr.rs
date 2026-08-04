@@ -26,7 +26,7 @@ use super::trace::{
     self, FrameCb, FrameParams, SceneGpu, CB_STRIDE, RP_FRAME_CBV, RP_GBUF, RP_GBUF_EXT, RP_PUSH,
     RP_SCENE_TEX, RP_SRV0, RP_TEX, RP_UAV0, SRV_INDICES, SRV_MATERIALS, SRV_NORMALS,
     SRV_POSITIONS, SRV_TLAS, SRV_TRI_MAT, TEX_HEAP_BASE, TEX_TABLE_BUFS, UAV_ACCUM, UAV_INFO,
-    UAV_QIN, UAV_QOUT, UAV_TBUF,
+    UAV_QIN, UAV_QLEAF, UAV_QOUT, UAV_QSKY, UAV_TBUF,
 };
 use crate::scene::Scene;
 use windows::core::{Interface, PCWSTR};
@@ -35,6 +35,7 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT;
 
 const RT_DXR_HLSLI: &str = include_str!("shaders/rt_dxr.hlsli");
 const DXR_HLSL: &str = include_str!("shaders/dxr.hlsl");
+const DXR_SHADE_HLSL: &str = include_str!("shaders/dxr_shade.hlsl");
 
 const IDENT: usize = D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as usize; // 32
 /// Table starts are 64-aligned (D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT);
@@ -95,9 +96,48 @@ pub fn require_caps(device: &ID3D12Device) -> Result<()> {
 ///       — B70 marginal 2.2 ms/sample vs mode 2's 1.11 — so high spp widens
 ///       the gap; it was "the manual Intel pick" until vendor_defaults
 ///       automated it).
+///   3 — THIN CHS + deferred compute shade (the 2026-08 Intel-campaign
+///       finding: Arc executes a fat shader hosted in a raygen/closest-hit
+///       stage at 3-4.5x its compute cost — an occupancy/spill tax nearly
+///       independent of the rays cast; FR_ABL=nosec collapsed mode 1 from
+///       2.395 to 0.478 ms, BELOW the compute reference's 0.604 — the
+///       existence proof). Raygen fires ONLY the bare-hit primary (HgHit —
+///       cutout any-hit + relief re-march inherited) and writes a 20 B
+///       record at u7; dxr_shade.hlsl (cs_6_5, this file's `Mode3`) shades
+///       from the record with rt.hlsli's inline secondaries. One sample per
+///       pass pair, index in the b1 push constants; cross-pass sum at u8.
+///       MEASURED (2026-08-03, spin path 1080p spp=1, dxr core row,
+///       default/stress/SM-lp): B70 1.39/1.56/1.56 vs mode 1's 2.51/1.67/2.20
+///       — THE BEST DXR ARM ON ARC (−45%/−7%/−29%), and the thin dispatch
+///       itself is finally cheap (dxr-rays 0.23-0.35; THE WORLD 0.54 vs mode
+///       1's 2.87). NOT the default, two measured reasons: on the 4090 mode 1
+///       still edges it (0.224 vs 0.243 default; at spp=16 mode 2's in-shader
+///       loop crushes the pass pairs, 2.31 vs 3.53 — 2N RTPSO rebinds), and
+///       on Arc the deferred kernel ITSELF now pays the codegen tax the CHS
+///       used to (dxr-shade 1.124 vs the reference kernel's 0.603 for
+///       strictly MORE work there) — so the wavefront keeps winning
+///       (0.745 spin / 3.25 world vs D3's 1.39 / 4.73) and neither promotion
+///       bar cleared. The identified follow-on: split the deferred kernel
+///       (hit/sky, the wavefront's own leaf+sky lesson) or hunt its register
+///       cliff — dxr-shade < reference is the target that would make DXR-3
+///       the first DXR arm to threaten the wavefront on Arc.
+///       KNOWN REFUSAL: mode 3 + HEIGHTFIELD on Intel driver 32.0.101.8805
+///       hangs the device (GBV silent, 4090 clean) — degraded to mode 1 with
+///       a loud line below; re-test on a newer driver.
+///       COMPARISON-TARGET NOTE: vendor_defaults has since made mode 2 the
+///       Intel DXR default, so mode 2 is now D3's Arc bar. On the default
+///       scene the campaign's builds put D3 (1.39) below every recorded
+///       mode-2 sample (1.77/2.46 same-day, 1.41 July/8515); on stress and
+///       SM-lp the only mode-2 samples are July/8515 (1.22/1.29, BELOW D3's
+///       1.56) — that ordering is unmeasured on a current binary, and the
+///       mode-2 build lottery means it must be judged per binary, not from
+///       this table.
 /// Measured (--spin path 1080p spp=1, GPU frame span ms, default/stress/
 /// SM-lp): B70 mode 0 9.05/5.30/6.75 -> mode 1 2.35/1.64/1.94 -> mode 2
 /// 1.41/1.22/1.29; 4090 1.34/0.79/1.18 -> 0.26/0.25/0.34 -> 0.29/0.27/0.34.
+/// (Mode-2 caveat: Arc's RT-stage codegen is build-unstable — the same mode-2
+/// program later read 2.46 and 1.77 across semantically identical builds;
+/// compare same-binary deltas only.)
 /// Armed modes compile lib_6_5 and need RT tier 1.1 (the wavefront's own
 /// floor); lesser hardware degrades to 0 with one loud line — the default is
 /// a preference, never a requirement (NOT the --fsr4 shape). The RTPSO/SBT
@@ -108,8 +148,9 @@ pub fn require_caps(device: &ID3D12Device) -> Result<()> {
 /// moves an Intel session to 2 unless `dxr_inline_explicit` vetoes — every
 /// interactive DxrGpu::new sits below that re-store; the headless harnesses
 /// never run the policy and keep the parse-time store, so gates stay a pure
-/// function of the command line). The CLI exits 2 on an illegal value; the
-/// settings file warns instead and sets the explicit veto on legal ones.
+/// function of the command line). Legal values 0..=3: the CLI exits 2 on an
+/// illegal value; the settings file warns instead and sets the explicit veto
+/// on legal ones.
 static INLINE_MODE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
 pub fn set_inline_mode(n: u32) {
@@ -156,6 +197,16 @@ pub fn set_sbt_mode(n: u32) {
 
 pub(crate) fn dxr_sbt_mode() -> u32 {
     SBT_MODE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `--dxr-inline 3`'s deferred half: the cs_6_5 shade kernel plus the two
+/// pass-pair buffers — hit records at u7 and the cross-pass color sum at u8
+/// (the wavefront's qleaf/qsky registers, undeclared in every other DXR
+/// unit, so no root-signature change — the cloud-cache u5/u6 precedent).
+struct Mode3 {
+    pso_shade: ID3D12PipelineState,
+    hitrec: ID3D12Resource,
+    csum: ID3D12Resource,
 }
 
 pub struct DxrGpu {
@@ -219,6 +270,17 @@ pub struct DxrGpu {
     /// Whether SWAY_MV compiled into this library (`trace::sway_defs` — ring
     /// armed; DXR has no --sw-rays carve-out). The arming gate.
     sway_mv_on: bool,
+    /// Mode-3 (thin CHS) state — Some iff the DEGRADED-LOCAL inline mode was
+    /// 3 at construction, i.e. the library really compiled the thin raygen.
+    /// `record_frame` branches on THIS, never on `dxr_inline_mode()` (the
+    /// tier-1.0 degrade path and the check harness's between-builds static
+    /// flips would otherwise run the pass loop against a non-thin library).
+    mode3: Option<Mode3>,
+    /// The frame's spp, stashed by `write_cb` (which sees FrameParams) for
+    /// `record_frame`'s mode-3 pass-pair loop (which doesn't) — the `sway_t`
+    /// idiom; every caller including all --check-dxr sites writes the CB
+    /// first.
+    spp: std::cell::Cell<u32>,
     gbuf_full: bool,
     /// RGBA16F resolve target; rests in PIXEL_SHADER_RESOURCE between frames
     /// (the tonemap PS reads it via SRV_SLOT_DXR).
@@ -287,6 +349,13 @@ impl DxrGpu {
                              default here — --dxr-inline 1 opts out)"
                         );
                     }
+                    if m == 3 {
+                        eprintln!(
+                            "dxr: --dxr-inline 3 — thin closest-hit + deferred compute shade \
+                             (bare-hit DispatchRays writes records, cs_dxr_shade shades; the \
+                             default is 1, inline secondaries)"
+                        );
+                    }
                     m
                 }
             } else {
@@ -297,6 +366,30 @@ impl DxrGpu {
                 );
                 0
             }
+        };
+        // MEASURED REFUSAL, the FR_WORKGRAPH-on-Intel class (trace.rs:4580's
+        // war story, same shape): mode 3 + a HEIGHTFIELD-armed scene hangs the
+        // Arc driver — DXGI_ERROR_DEVICE_HUNG at the --check-dxr spp gate,
+        // deterministic, with the debug layer AND GPU-based validation silent
+        // (Intel driver 32.0.101.8805). The IDENTICAL suite passes on the
+        // 4090 (all four spp probes, rel-t <= 2.1e-4), and Arc itself runs
+        // modes 0/1 + relief AND mode 3 without relief clean — so this is the
+        // driver's (non-opaque-anyhit RTPSO x thin-raygen pass pairs) combo,
+        // not the shader. Degrade to mode 1 (the proven-with-relief default),
+        // never 0; keyed on the PICKED adapter (a fact), the vendor_defaults
+        // rule. Re-test on a newer driver and delete this arm if it passes.
+        let inline_mode = if inline_mode == 3
+            && !trace::height_defs(scene).is_empty()
+            && super::adapter::picked_vendor() == super::adapter::Vendor::Intel
+        {
+            eprintln!(
+                "dxr: --dxr-inline 3 + --heightfield hangs this Intel driver \
+                 (DXGI_ERROR_DEVICE_HUNG, 32.0.101.8805; GBV silent, 4090 clean) — \
+                 degrading to --dxr-inline 1 for this session"
+            );
+            1
+        } else {
+            inline_mode
         };
 
         // --dxr-sbt snapshot (see the SBT_MODE doc). Degrades: to 0 when the
@@ -488,6 +581,35 @@ impl DxrGpu {
             )
         } else {
             (None, None, None)
+        };
+        // --dxr-inline 3: the deferred-shade kernel. cs_6_5 — it fires
+        // rt.hlsli's inline RayQuery secondaries, the same SM 6.5 / tier 1.1
+        // floor the armed-mode gate above already enforced. Sources mirror
+        // the library's minus its DispatchRays halves: NO rt_dxr.hlsli and NO
+        // dxr.hlsl — this unit must never contain a TraceRay (cargo test pins
+        // the kernel source for one).
+        let pso_dxr_shade = if inline_mode == 3 {
+            let shade_src = [
+                defs.as_str(),
+                sd,
+                cloud_defs.as_str(),
+                inline_def.as_str(),
+                trace::TRACE_COMMON_HLSLI,
+                trace::SKYLOD_HLSLI,
+                trace::RT_HLSLI,
+                trace::RIPPLE_HLSLI,
+                trace::SHADE_HLSLI,
+                DXR_SHADE_HLSL,
+            ]
+            .join("\n");
+            Some(trace::compute_pso(
+                device,
+                &root_sig,
+                &dxc.compile(&shade_src, "cs_dxr_shade", "cs_6_5", "dxr deferred shade", debug)?,
+                "dxr deferred shade",
+            )?)
+        } else {
+            None
         };
 
         // --- RTPSO. Every pDesc payload (and every name string) lives in a
@@ -777,6 +899,16 @@ impl DxrGpu {
         let csn_n =
             if cloud_shadow_n > 0 { crate::clouds::CLOUD_SHADOW_MAX as u64 } else { 1 };
         let cloud_shadow = committed_buffer(device, csn_n * csn_n * 4, uaf, ua)?;
+        // Mode-3 pass-pair buffers: 20 B/px hit records + 12 B/px cross-pass
+        // color sum (~66 MB at 1080p), only when the thin arm compiled.
+        let mode3 = match pso_dxr_shade {
+            Some(pso_shade) => Some(Mode3 {
+                pso_shade,
+                hitrec: committed_buffer(device, px * 20, uaf, ua)?,
+                csum: committed_buffer(device, px * 12, uaf, ua)?,
+            }),
+            None => None,
+        };
         let scene_aabb = trace::scene_shadow_aabb(scene);
         // FEED_SETS copies of the RP_TEX table (hdr resolve target at each set's
         // offset 0, then that set's feed planes — wired later), then slots
@@ -857,6 +989,8 @@ impl DxrGpu {
             sway_t: std::cell::Cell::new(None),
             sway_mv_t: std::cell::Cell::new(None),
             sway_mv_on: !sway_def.is_empty(),
+            mode3,
+            spp: std::cell::Cell::new(1),
             gbuf_full,
             hdr,
             uav_heap,
@@ -883,6 +1017,9 @@ impl DxrGpu {
         // one per-frame site that sees FrameParams, and every present chain
         // calls it before record_frame (the --check-dxr paths pass None).
         self.sway_t.set(p.sway_time);
+        // ...and the frame's spp for the mode-3 pass-pair loop (same idiom;
+        // U-key live changes and every check path route through here).
+        self.spp.set(p.spp.max(1));
         // One FSR4-RR subscriber among the wired engines is enough to arm the
         // pack's signal lanes (--quinlight can wire several).
         let fsr_sig = self.feed.iter().any(|(k, _)| matches!(k, trace::FeedKind::FsrRr));
@@ -1102,7 +1239,6 @@ impl DxrGpu {
                 list.Dispatch(groups.min(32768), groups.div_ceil(32768), 1);
                 list.ResourceBarrier(&[uav_barrier(None)]);
             }
-            list4.SetPipelineState1(&self.state);
             let va = self.sbt.resource.GetGPUVirtualAddress();
             let desc = D3D12_DISPATCH_RAYS_DESC {
                 RayGenerationShaderRecord: D3D12_GPU_VIRTUAL_ADDRESS_RANGE {
@@ -1127,17 +1263,63 @@ impl DxrGpu {
                 Height: self.rh,
                 Depth: 1,
             };
-            // The ray dispatch alone. Without this bracket `dxr` conflates it
-            // with bind_common + SetPipelineState1 (a real cost on Arc), and
-            // the decision this instrument exists for — optimize the wavefront
-            // or flip the Intel world default to DXR — turns on whether the
-            // DXR arm's time is rays or setup. The residual
-            // `dxr - dxr-rays - the two cache fills` is now exactly that setup.
-            {
-                let _e = super::pix::scope(list, c"dxr-rays");
-                list4.DispatchRays(&desc);
+            if let Some(m3) = &self.mode3 {
+                // Mode 3: thin pass pairs — for each sample, a bare-hit
+                // DispatchRays (records only) fenced against a cs_dxr_shade
+                // dispatch that does the fat shading in COMPUTE, which is the
+                // whole point (see the mode doc at the top). The sample index
+                // rides the b1 push constants; root arguments persist across
+                // SetPipelineState/SetPipelineState1, so bind_common above
+                // covers both halves — and must NOT be re-issued per pass (a
+                // root-signature re-set would wipe the pushed constant). The
+                // per-pass gputime scopes overflow MAX_TS at spp ≳ 30 —
+                // graceful (dropped counter), and spp=1 is the regime the
+                // mode exists for. The final barrier is the same trailing
+                // fence record_feed/record_resolve have always relied on.
+                let spp = self.spp.get().max(1);
+                list.SetComputeRootUnorderedAccessView(
+                    RP_UAV0 + UAV_QLEAF,
+                    m3.hitrec.GetGPUVirtualAddress(),
+                );
+                list.SetComputeRootUnorderedAccessView(
+                    RP_UAV0 + UAV_QSKY,
+                    m3.csum.GetGPUVirtualAddress(),
+                );
+                for s in 0..spp {
+                    list.SetComputeRoot32BitConstants(
+                        RP_PUSH,
+                        1,
+                        &s as *const u32 as *const _,
+                        0,
+                    );
+                    list4.SetPipelineState1(&self.state);
+                    {
+                        let _e = super::pix::scope(list, c"dxr-rays");
+                        list4.DispatchRays(&desc);
+                    }
+                    list.ResourceBarrier(&[uav_barrier(None)]);
+                    {
+                        let _e = super::pix::scope(list, c"dxr-shade");
+                        list.SetPipelineState(&m3.pso_shade);
+                        list.Dispatch(self.rw.div_ceil(8), self.rh.div_ceil(8), 1);
+                    }
+                    list.ResourceBarrier(&[uav_barrier(None)]);
+                }
+            } else {
+                list4.SetPipelineState1(&self.state);
+                // The ray dispatch alone. Without this bracket `dxr` conflates
+                // it with bind_common + SetPipelineState1 (a real cost on Arc),
+                // and the decision this instrument exists for — optimize the
+                // wavefront or flip the Intel world default to DXR — turns on
+                // whether the DXR arm's time is rays or setup. The residual
+                // `dxr - dxr-rays - the two cache fills` is now exactly that
+                // setup.
+                {
+                    let _e = super::pix::scope(list, c"dxr-rays");
+                    list4.DispatchRays(&desc);
+                }
+                list.ResourceBarrier(&[uav_barrier(None)]);
             }
-            list.ResourceBarrier(&[uav_barrier(None)]);
         }
         Ok(())
     }
@@ -1168,5 +1350,78 @@ impl DxrGpu {
                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
             )]);
         }
+    }
+}
+
+#[cfg(test)]
+mod mode3_shader_source_tests {
+    use super::{DXR_HLSL, DXR_SHADE_HLSL, RT_DXR_HLSLI};
+
+    /// The record's miss convention is `t < 0` (miss_hit's wire format);
+    /// tbuf's is INF, and ff_glow/T1 classify on it. The deferred kernel must
+    /// convert BEFORE any consumer — a raw -1 reaching tbuf flips every sky
+    /// pixel to "hit". Source-ordering pin, the house style: the live HLSL
+    /// stays the executable specification.
+    #[test]
+    fn deferred_kernel_converts_miss_sentinel_before_consumers() {
+        let src = DXR_SHADE_HLSL;
+        let sentinel = src.find("rec.t < 0.0").expect("miss-sentinel branch missing");
+        let rebuild = src.find("h.tri = rec.tri").expect("HitInfo rebuild missing");
+        let tb = src.find("tbuf[pi]").expect("tbuf write missing");
+        assert!(
+            sentinel < rebuild && sentinel < tb,
+            "the miss-sentinel branch must precede the HitInfo rebuild and the tbuf write"
+        );
+    }
+
+    /// The deferred kernel is a COMPUTE unit: a TraceRay in it would fail PSO
+    /// creation at best and silently miscompile at worst. Its rays are
+    /// rt.hlsli's inline RayQuery only.
+    #[test]
+    fn deferred_kernel_never_traces() {
+        assert!(
+            !DXR_SHADE_HLSL.contains("TraceRay("),
+            "dxr_shade.hlsl must never contain a TraceRay — it is a cs_6_5 unit"
+        );
+    }
+
+    /// Modes 0-2 must preprocess to today's bytes: rt_dxr.hlsli keeps exactly
+    /// its two `#ifndef DXR_INLINE_SEC` guards (changing them double-defines
+    /// the trace primitives against rt.hlsli — the review finding), and the
+    /// HitPayload's mode-3 `inst` field sits behind the mode-3 guard.
+    #[test]
+    fn rt_dxr_guards_intact_and_inst_guarded() {
+        let src = RT_DXR_HLSLI;
+        assert_eq!(
+            src.matches("#ifndef DXR_INLINE_SEC").count(),
+            2,
+            "rt_dxr.hlsli's DXR_INLINE_SEC guards must stay exactly as shipped"
+        );
+        let hp = src.find("struct HitPayload").expect("HitPayload missing");
+        let hp_end = hp + src[hp..].find("};").expect("HitPayload unterminated");
+        let body = &src[hp..hp_end];
+        let guard = body
+            .find("DXR_INLINE_SEC == 3")
+            .expect("HitPayload's inst field must be mode-3-guarded");
+        let inst = body.find("uint inst;").expect("HitPayload inst field missing");
+        assert!(guard < inst, "the mode-3 guard must precede the inst field");
+    }
+
+    /// The thin raygen writes ONLY the hit record — accum/tbuf/info belong to
+    /// the deferred kernel (two writers would break the one-splat-per-frame
+    /// contract). Slice the mode-3 arm out of raygen by its landmarks.
+    #[test]
+    fn thin_raygen_writes_no_shading_outputs() {
+        let src = DXR_HLSL;
+        let start = src.find("The THIN arm:").expect("mode-3 raygen arm missing");
+        let end = start + src[start..].find("#else").expect("mode-3 arm unterminated");
+        let arm = &src[start..end];
+        for w in ["accum[", "tbuf[", "info["] {
+            assert!(
+                !arm.contains(w),
+                "the thin raygen arm must not write {w} — the deferred kernel owns it"
+            );
+        }
+        assert!(arm.contains("hitrec[pi]"), "the thin arm must write the hit record");
     }
 }

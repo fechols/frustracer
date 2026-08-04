@@ -1090,18 +1090,22 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
             // vendors; 2 = everything inline in raygen — and the INTEL
             // vendor default (`main::vendor_defaults`; any legal value here
             // sets `dxr_inline_explicit`, the policy's veto, so
-            // `--dxr-inline 1` pins the cross-vendor default on Arc). See
-            // the DXR section's ablation table in CLAUDE.md.
+            // `--dxr-inline 1` pins the cross-vendor default on Arc);
+            // 3 = thin closest-hit + deferred compute shade (the 2026-08
+            // Intel fat-CHS-hosting finding — bare-hit DispatchRays writes
+            // records, cs_dxr_shade shades in compute). See the DXR
+            // section's ablation table in CLAUDE.md.
             "--dxr-inline" => {
                 let n: u32 = args
                     .next()
                     .and_then(|s| s.parse().ok())
-                    .filter(|&n| n <= 2)
+                    .filter(|&n| n <= 3)
                     .unwrap_or_else(|| {
                         eprintln!(
                             "--dxr-inline needs 0 (all TraceRay), 1 (inline secondaries — \
-                             the cross-vendor default), or 2 (everything inline in raygen — \
-                             the Intel default)"
+                             the cross-vendor default), 2 (everything inline in raygen — \
+                             the Intel default), or 3 (thin closest-hit + deferred compute \
+                             shade)"
                         );
                         std::process::exit(2);
                     });

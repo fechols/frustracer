@@ -871,7 +871,7 @@ pub fn apply_to_opts(s: &Settings, opts: &mut crate::Opts) -> AppliedFx {
         opts.emissive_lights_count = n;
     }
     if let Some(n) = s.advanced.dxr_inline {
-        if n <= 2 {
+        if n <= 3 {
             opts.dxr_inline = n;
             // The renderer.mode / lock_res precedent, deliberately NOT the
             // fg one: the menu writes advanced.dxr_inline, and a saved
@@ -1082,7 +1082,7 @@ pub fn menu_items() -> &'static [MenuItem] {
             item!("cut_hemi", "cut-seeded hemi rays", "Advanced", Restart, Toggle { default: false }, acc_bool!(advanced.cut_hemi)),
             item!("bc7", "BC7 texture compression", "Advanced", Restart, Toggle { default: true }, acc_bool!(advanced.bc7)),
             item!("bc7_quality", "BC7 quality", "Advanced", Restart, Cycle { options: &["ultrafast", "fast", "basic", "slow"], default_ix: 1 }, acc_str!(advanced.bc7_quality)),
-            item!("dxr_inline", "DXR dispatch mode (0/1/2)", "Advanced", Restart, Cycle { options: &["0", "1", "2"], default_ix: 1 }, acc_u32!(advanced.dxr_inline)),
+            item!("dxr_inline", "DXR dispatch mode (0/1/2/3)", "Advanced", Restart, Cycle { options: &["0", "1", "2", "3"], default_ix: 1 }, acc_u32!(advanced.dxr_inline)),
             item!("fsr4_required", "require FSR4 (exit if absent)", "Advanced", Restart, Toggle { default: false }, acc_bool!(advanced.fsr4_required)),
             item!("gpu_debug", "D3D12 debug layer", "Advanced", Restart, Toggle { default: false }, acc_bool!(advanced.gpu_debug)),
             item!("pix_markers", "PIX markers", "Advanced", Restart, Toggle { default: false }, acc_bool!(advanced.pix_markers)),

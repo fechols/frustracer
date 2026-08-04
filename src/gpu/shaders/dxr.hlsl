@@ -9,17 +9,78 @@
 // TraceRay but the pasted trace primitives are rt.hlsli's inline RayQuery,
 // so chs_shade's secondaries never re-enter the pipeline (recursion depth 1);
 // mode 2 additionally takes the DXR_INLINE_SEC == 2 arm in raygen below —
-// no TraceRay anywhere, DispatchRays as a bare launch grid.
+// no TraceRay anywhere, DispatchRays as a bare launch grid; mode 3 (thin
+// CHS) inverts the split — raygen fires ONLY the bare-hit primary and writes
+// a hit record, and dxr_shade.hlsl (a separate cs_6_5 unit) shades from the
+// record, one sample per pass pair (see the mode-3 block below).
 
 RWStructuredBuffer<float> accum : register(u0); // rw*rh*3, CPU layout parity
 RWStructuredBuffer<float> tbuf  : register(u1); // primary-hit t, INF = sky
 RWStructuredBuffer<uint>  info  : register(u2); // pack_info(depth, kind)
+
+#if defined(DXR_INLINE_SEC) && DXR_INLINE_SEC == 3
+// Mode 3 (thin CHS + deferred compute shade — the W4 Intel finding: Arc
+// executes a fat shader inside an RT pipeline stage at 3-4.5x its compute
+// cost, so the pipeline does ONLY what it is uniquely good at — the coherent
+// hardware primary — and the fat shade_full + inline-RayQuery secondaries run
+// in a compute pass, dxr_shade.hlsl). One sample per PASS: the sample index
+// arrives in push0 (the b1 root constants — gpu/dxr.rs sets it before each
+// pass pair), never a loop here.
+//
+// u7 is the wavefront's qleaf register — never declared in any DXR unit, so
+// reusing it needs no root-signature change (the cloud-cache u5/u6
+// precedent). LOCKSTEP: dxr_shade.hlsl re-declares HitRec/hitrec verbatim —
+// the two units share the buffer bytes, and a field skew reads garbage.
+struct HitRec {
+    float t; // < 0 = miss (the HitPayload wire convention, NOT tbuf's INF)
+    uint tri;
+    float u;
+    float v;
+    uint inst; // committed InstanceID (sway-MV lane); 0 on miss
+};
+RWStructuredBuffer<HitRec> hitrec : register(u7);
+// Per-pass sample index. resolve.hlsl declares the same cbuffer in its own
+// compile unit; nothing else in the LIB assembly declares b1.
+cbuffer Push : register(b1) { uint push0; uint push1; uint push2; uint push3; }
+#endif
 
 [shader("raygeneration")]
 void raygen() {
     uint2 id = DispatchRaysIndex().xy;
     uint pi = id.y * rw + id.x;
 
+#if defined(DXR_INLINE_SEC) && DXR_INLINE_SEC == 3
+    // The THIN arm: derive the sample's ray (rng/jitter re-derived here
+    // solely to reproduce it — the deferred kernel re-derives the identical
+    // stream for shading), fire the bare-hit TraceRay (hit group 1 = HgHit,
+    // miss 2 = miss_hit — textually rt_dxr.hlsli's trace_closest, which is
+    // compiled out in inline modes), and store the record. No shading, no
+    // accum/tbuf/info writes — the deferred kernel owns every output.
+    // Cutout + relief correctness is inherited: HgHit carries the ah_hit
+    // any-hit and chs_hit re-marches relief, exactly as the mode-0
+    // continuation path always did.
+    uint s = push0;
+    uint rng = rng_init(id.x, id.y, frame, s);
+    float2 sp = sample_pos(id.x, id.y, s, rng);
+    float3 dir = ray_dir(sp.x, sp.y);
+    RayDesc r;
+    r.Origin = cam_origin.xyz;
+    r.Direction = dir;
+    r.TMin = height_tmin(0.0);
+    r.TMax = height_tmax(FLT_MAX);
+    HitPayload p;
+    p.t = -1.0; p.tri = 0u; p.u = 0.0; p.v = 0.0;
+    p.tmin = 0.0; p.tmax = FLT_MAX;
+    p.inst = 0u;
+    TraceRay(tlas, OPAQUE_RF, 0xffu, 1u, 0u, 2u, r, p);
+    HitRec rec;
+    rec.t = p.t;
+    rec.tri = p.tri;
+    rec.u = p.u;
+    rec.v = p.v;
+    rec.inst = p.inst;
+    hitrec[pi] = rec;
+#else
     // --spp: one TraceRay per sample, averaged into a single accum
     // store-or-add (two splats would break the accum semantics, exactly as on
     // the CPU). No tile claim exists in this pipeline — every ray starts at
@@ -121,6 +182,7 @@ void raygen() {
         accum[i3 + 1u] += c.y;
         accum[i3 + 2u] += c.z;
     }
+#endif // DXR_INLINE_SEC == 3 (thin arm)
 }
 
 [shader("closesthit")]
@@ -167,6 +229,9 @@ void chs_hit(inout HitPayload p, in BuiltInTriangleIntersectionAttributes a) {
     p.tri = tri_of(InstanceID(), PrimitiveIndex());
     p.u = a.barycentrics.x;
     p.v = a.barycentrics.y;
+#if defined(DXR_INLINE_SEC) && DXR_INLINE_SEC == 3
+    p.inst = InstanceID();
+#endif
 #ifdef HEIGHTFIELD
     if (flags & FLAG_HEIGHT)
         height_march(p.tri, WorldRayOrigin(), WorldRayDirection(), p.t, p.u, p.v);

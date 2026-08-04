@@ -1958,7 +1958,55 @@ cargo run --release -- --dxr-inline 0 # A/B lever: the DXR pipeline back on ALL-
                                       # the opt-out); an illegal value exits 2 (CLI) / warns
                                       # (settings file). Headless (--check*/--spin) never runs
                                       # the vendor policy — gates stay a pure function of the
-                                      # command line. See the DXR section's ablation table
+                                      # command line. See the DXR section's ablation table.
+                                      # 3 = THIN CHS + DEFERRED COMPUTE SHADE (2026-08-03, built on
+                                      # the mechanism campaign's finding that Arc executes a fat
+                                      # shader hosted in a raygen/CHS stage at 3-4.5x its compute
+                                      # cost — FR_ABL=nosec collapsed mode-1 DXR 2.395 -> 0.478 ms,
+                                      # BELOW the compute reference's 0.604, with the component
+                                      # ablations sub-additive and `noglass` "saving" 0.28 on a
+                                      # glassless scene: an occupancy/spill tax, not ray work; the
+                                      # inherited t_start measured EXACTLY 0.000 via the new
+                                      # FR_ABL=tzero lever). Raygen fires ONLY the bare-hit primary
+                                      # (HgHit — cutout any-hit + relief re-march inherited) and
+                                      # writes a 20 B record at u7 (the wavefront's dead qleaf
+                                      # register, the cloud-cache u5/u6 precedent); dxr_shade.hlsl
+                                      # (cs_6_5) shades from the record with rt.hlsli's inline
+                                      # secondaries; one sample per pass pair (index in the b1 push
+                                      # constants), cross-pass sum at u8, one store-or-add splat on
+                                      # the last pass. MEASURED (spin path 1080p spp=1, dxr core,
+                                      # default/stress/SM-lp): B70 1.39/1.56/1.56 vs mode 1's
+                                      # 2.51/1.67/2.20 — THE BEST DXR ARM ON ARC, and the thin
+                                      # dispatch is finally cheap (dxr-rays 0.23-0.35; THE WORLD
+                                      # 0.54 vs mode 1's 2.87). NOT promoted, two measured reasons:
+                                      # 4090 mode 1 still edges it (0.224 vs 0.243; spp=16 mode 2
+                                      # 2.31 vs 3.53 — 2N RTPSO rebinds), and on Arc the DEFERRED
+                                      # KERNEL now pays the codegen tax the CHS used to (dxr-shade
+                                      # 1.124 vs the reference kernel's 0.603 for strictly MORE
+                                      # work there — Arc compute codegen is knife-edged; the D2
+                                      # lottery read 1.41/1.77/2.46 across identical builds), so
+                                      # the wavefront still wins every Arc point (0.745 spin /
+                                      # 3.25 world vs D3 1.39/4.73) and the Intel vendor default
+                                      # STANDS (see vendor_defaults' 2026-08-03 paragraph).
+                                      # Follow-on that would change that: split the deferred
+                                      # kernel (hit/sky — the wavefront's own leaf+sky lesson) or
+                                      # find its register cliff; dxr-shade < reference is the bar.
+                                      # KNOWN REFUSAL: mode 3 + --heightfield on Intel driver
+                                      # 32.0.101.8805 hangs the device (DEVICE_HUNG, GBV silent,
+                                      # 4090 passes the identical suite) — DxrGpu::new degrades
+                                      # the combo to mode 1 with a loud line; re-test on newer
+                                      # drivers. COMPARISON-TARGET NOTE: with mode 2 now the Intel
+                                      # DXR default, mode 2 is D3's Arc bar — on the default scene
+                                      # D3 (1.39) sits below every recorded mode-2 sample
+                                      # (1.77/2.46 same-day, 1.41 July/8515), but the only
+                                      # stress/SM-lp mode-2 samples are July/8515 (1.22/1.29,
+                                      # BELOW D3's 1.56) — unmeasured on a current binary; the D2
+                                      # lottery means judge it per binary, never across builds.
+                                      # Gates: --check-dxr --dxr-inline 3 green on
+                                      # default/smlp/stress (B70) and smlp+relief (4090); 4 new
+                                      # cargo-test source pins (miss-sentinel-before-consumers,
+                                      # no-TraceRay-in-the-cs-unit, rt_dxr guards intact + inst
+                                      # guarded, thin-raygen-writes-only-the-record)
 cargo run --release -- --dxr-sbt 1    # EXPERIMENT lever (default 0 = off): the many-record,
                                       # MATERIAL-SORTED SBT ladder — the Intel-brief Q4
                                       # counterfactual (the TSU sorts by shader RECORD; our SBT
