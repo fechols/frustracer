@@ -77,6 +77,9 @@ mod settings;
 // it never touches accum, the temporal cache, or any upscaler guide.
 mod bloom;
 mod shade;
+// Shading-class taxonomy for the --dxr-sbt many-record SBT ladder (pure;
+// the strip table + its soundness gate — see the module doc).
+mod shadeclass;
 // Order-2 SH sky irradiance — the smooth half of the one-sky model (the sharp
 // half, the sun disc, is an explicit light: SH cannot be shadow-rayed).
 mod sh;
@@ -463,6 +466,10 @@ fn main() {
     gpu::trace::set_cloud_shadow(opts.cloud_shadow);
     gpu::trace::set_sky_lod(opts.sky_lod);
     gpu::dxr::set_inline_mode(opts.dxr_inline);
+    // --dxr-sbt: parse-time only (no vendor policy, so no run_window
+    // re-store) — and it MUST land before any SceneGpu upload, which bakes
+    // the per-class instance contributions off this knob.
+    gpu::dxr::set_sbt_mode(opts.dxr_sbt);
 
     // PIX command-list markers: opt-in, runtime-loaded; inert otherwise.
     gpu::pix::init(&opts.pix_path, opts.pix_markers);
@@ -1391,6 +1398,175 @@ fn run_check_dxr(
         }
         gpu::trace::set_sky_lod(sky0);
         gpu::trace::set_cloud_shadow(shadow0);
+    }
+
+    // T1d: --dxr-sbt, the many-record SBT ladder — ARMED runs only (invoke
+    // as `--check-dxr --dxr-sbt 1`, the `--dxr-inline 0` pattern). Two
+    // halves. (1) CONSTRUCTION AUDIT: the shared core carries the class
+    // partition, ≥2 classes are live (must-fire — one class gives the sort
+    // nothing to sort), and the driver minted PAIRWISE-DISTINCT identifiers
+    // for the 8 aliases of the one chs_shade (a driver that dedupes them
+    // leaves the TSU one sort key — the rung would run vacuously and
+    // "measure" zero forever; failing here converts that to a recorded
+    // finding). (2) ALIAS-VS-OFF SAME-SEED A/B through a SECOND SceneGpu
+    // CORE — the T1c one-core static-flip is insufficient because the
+    // partition changes the plan itself (sub-chunk instances +
+    // contributions). Rung 1's records alias ONE chs_shade: identical code,
+    // identical rng, identical rays — so accum/tbuf/info must come back
+    // BIT-identical wherever the hardware permits bit identity. The one
+    // legitimate escape is TRANS_SHADOW's any-hit tint accumulation (order
+    // hardware-arbitrary by contract) plus partition-changed exact-t ties,
+    // so transmissive scenes print the diff ungated. NOTE the contribution
+    // wiring's real teeth arrive with rung 2: under ALIASING a mis-routed
+    // class is image-neutral by construction (every record is the same
+    // shader), which is exactly why this gate claims bit-identity rather
+    // than pretending to prove routing — specialized records make a
+    // mis-route fail T2 loudly.
+    if dg.sbt_mode >= 1 {
+        let mut sbt_ok = true;
+        if let Some(info_c) = core.sbt_class.as_ref() {
+            let nonzero = info_c.histo.iter().filter(|&&n| n > 0).count();
+            eprintln!(
+                "check-dxr: dxr-sbt audit: mode {} | {} chunks | {} live classes | {} of {} \
+                 distinct alias identifiers",
+                dg.sbt_mode,
+                info_c.chunk_class.len(),
+                nonzero,
+                dg.sbt_distinct_idents,
+                shadeclass::N_CLASSES
+            );
+            if must_fire && nonzero < 2 {
+                eprintln!(
+                    "check-dxr: FAIL dxr-sbt: fewer than 2 live classes on the structural \
+                     scene — the sort has nothing to sort"
+                );
+                sbt_ok = false;
+            }
+            // MEASURED FINDING (2026-08-04, the gate's own first run):
+            // NVIDIA dedupes ExportToRename aliases of one function to ONE
+            // shader identifier (1 of 8 distinct, every scene) while the
+            // Intel B70 mints all 8 distinct. Rung 1 is therefore an
+            // INTEL-ONLY instrument — exactly the vendor the TSU experiment
+            // exists for — and NVIDIA joins the ladder at rung 2, where
+            // genuinely different libraries cannot be deduped. So the
+            // distinctness gate is HARD on Intel (a dedupe there would make
+            // the whole rung silently measure zero) and a loud recorded
+            // note elsewhere (the alias arm still validates the
+            // partition/SBT plumbing as a bit-identical control).
+            if dg.sbt_distinct_idents != shadeclass::N_CLASSES as u32 {
+                if gpu::adapter::picked_vendor() == gpu::adapter::Vendor::Intel {
+                    eprintln!(
+                        "check-dxr: FAIL dxr-sbt: Intel minted {} distinct alias identifiers \
+                         of {} — the TSU sort keys collapsed and the rung is vacuous on the \
+                         one vendor it exists for",
+                        dg.sbt_distinct_idents,
+                        shadeclass::N_CLASSES
+                    );
+                    sbt_ok = false;
+                } else {
+                    eprintln!(
+                        "check-dxr: NOTE dxr-sbt: this driver deduped the aliases ({} of {} \
+                         distinct) — rung 1 is vacuous here by the recorded NVIDIA finding; \
+                         the bit A/B below still validates the partition/SBT plumbing, and \
+                         this vendor joins the ladder at rung 2",
+                        dg.sbt_distinct_idents,
+                        shadeclass::N_CLASSES
+                    );
+                }
+            }
+        } else {
+            eprintln!("check-dxr: FAIL dxr-sbt: armed pipeline but no class partition on the core");
+            sbt_ok = false;
+        }
+
+        // The off arm: flip the knob, upload a SECOND core, build its
+        // pipeline, render the SAME frame-0, restore the knob.
+        let m0 = gpu::dxr::dxr_sbt_mode();
+        gpu::dxr::set_sbt_mode(0);
+        let off_run = (|| -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
+            let core_off = std::rc::Rc::new(
+                gpu::trace::SceneGpu::new_uploaded(&dev, scene, bvh, &mut hg, opts.bc7)
+                    .map_err(|e| format!("off-core upload: {e}"))?,
+            );
+            let dg_off = gpu::dxr::DxrGpu::new(
+                &dev, &dxc, scene, core_off, gw as u32, gh as u32, false, opts.gpu_debug,
+            )
+            .map_err(|e| format!("off DxrGpu: {e}"))?;
+            if dg_off.sbt_mode != 0 {
+                return Err("off arm still reports an armed sbt_mode".into());
+            }
+            let p0 = gpu::trace::FrameParams {
+                sway_prev_time: None,
+                cam: basis,
+                frame: 0,
+                accumulate: true,
+                jitter: false,
+                frame_jitter: None,
+                prev_cam: None,
+                q,
+                verify: false,
+                spp: 1,
+                probe_sample: 0,
+                clouds: crate::clouds::Clouds::check(scene.diag),
+                fireflies: crate::fireflies::Fireflies::check(scene),
+                sway_time: check_sway,
+                replay: false,
+            };
+            dg_off.write_cb(0, &p0);
+            let mut rec = Ok(());
+            hg.run(|l| rec = dg_off.record_frame(l, 0))
+                .map_err(|e| format!("off frame submit: {e}"))?;
+            rec.map_err(|e| format!("off record_frame: {e}"))?;
+            let acc = hg.read_buffer(&dg_off.accum, ua, px * 3 * 4)?;
+            let tb = hg.read_buffer(&dg_off.tbuf, ua, px * 4)?;
+            let inf = hg.read_buffer(&dg_off.info, ua, px * 4)?;
+            Ok((acc, tb, inf))
+        })();
+        gpu::dxr::set_sbt_mode(m0);
+
+        match off_run {
+            Ok((off_acc, off_tb, off_inf)) => {
+                let on_acc = hg.read_buffer(&dg.accum, ua, px * 3 * 4);
+                let on_tb = hg.read_buffer(&dg.tbuf, ua, px * 4);
+                let on_inf = hg.read_buffer(&dg.info, ua, px * 4);
+                match (on_acc, on_tb, on_inf) {
+                    (Ok(on_acc), Ok(on_tb), Ok(on_inf)) => {
+                        let bit = on_acc == off_acc && on_tb == off_tb && on_inf == off_inf;
+                        // Worst accum delta for the loud line either way.
+                        let mut mx = 0.0f32;
+                        for (a, b) in on_acc.chunks_exact(4).zip(off_acc.chunks_exact(4)) {
+                            let a = f32::from_le_bytes(a.try_into().unwrap());
+                            let b = f32::from_le_bytes(b.try_into().unwrap());
+                            if a.is_finite() && b.is_finite() {
+                                mx = mx.max((a - b).abs());
+                            }
+                        }
+                        eprintln!(
+                            "check-dxr: dxr-sbt alias-vs-off ({px} px): bit-identical {bit} | \
+                             max |d| {mx:.2e}"
+                        );
+                        if !scene.any_transmissive && !bit {
+                            eprintln!(
+                                "check-dxr: FAIL dxr-sbt alias arm not bit-identical to the \
+                                 one-record SBT on a tint-free scene"
+                            );
+                            sbt_ok = false;
+                        }
+                    }
+                    _ => {
+                        eprintln!("check-dxr: FAIL dxr-sbt: armed-arm readback failed");
+                        sbt_ok = false;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("check-dxr: FAIL dxr-sbt off arm: {e}");
+                sbt_ok = false;
+            }
+        }
+        if !sbt_ok {
+            ok = false;
+        }
     }
 
     // T1b: multi-sampling (--spp). This pipeline has no tile claim to break
@@ -11185,6 +11361,18 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
     };
 
+    // Shading-class taxonomy (--dxr-sbt): membership/strip soundness on a
+    // synthetic all-classes set, all-8 anti-vacuity, determinism, and
+    // defines-derive-from-the-table. Pure and lever-independent — the
+    // blas-split rule, so the taxonomy can't rot while the lever is off.
+    let shadeclass_ok = match shadeclass::self_test() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("shadeclass self-test: FAIL — {e}");
+            false
+        }
+    };
+
     // Foliage sway (the v0 leaf-sway prototype): the leaf-mask anchors, the
     // split's partition/routing/determinism contracts on a synthetic mask
     // over the session's real tree, the empty-mask byte-identity off arm,
@@ -13657,6 +13845,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         ("sphcell", sph_ok),
         ("ftree", ftree_ok),
         ("blas-split", blas_ok),
+        ("shadeclass", shadeclass_ok),
         ("foliage", foliage_ok),
         ("sway-mv", sway_mv_ok),
         ("reproject", reproj_ok),

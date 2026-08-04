@@ -431,6 +431,12 @@ pub struct Opts {
     /// menu writes `advanced.dxr_inline`, and a saved preference must veto
     /// the policy.
     pub dxr_inline_explicit: bool,
+    /// `--dxr-sbt 0|1|2|3` (`gpu::dxr::set_sbt_mode`) — the many-record,
+    /// material-sorted SBT ladder (the Intel-brief Q4 counterfactual). A dev
+    /// MEASUREMENT lever, the `--sw-rays` class: default 0 = off, no vendor
+    /// policy, no settings exposure; ladder rungs not yet built degrade
+    /// loudly at DxrGpu construction. See gpu/dxr.rs's SBT_MODE doc.
+    pub dxr_sbt: u32,
     /// `--no-foliage-sway` clears (`foliage::set_armed`) — leaf sway, the
     /// prototype of the tetrahedral-cage epic (docs/design/animated-foliage.md):
     /// leaf triangles (foliage-classified + alpha-masked) bucket into per-cell
@@ -641,6 +647,7 @@ pub fn defaults() -> Opts {
         emissive_lights_count: emissive::EL_DEFAULT,
         dxr_inline: 1,
         dxr_inline_explicit: false,
+        dxr_sbt: 0,
         foliage_sway: true,
         foliage_amp: 1.0,
     }
@@ -1100,6 +1107,25 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
                     });
                 opts.dxr_inline = n;
                 opts.dxr_inline_explicit = true;
+            }
+            // The many-record material-sorted SBT ladder (gpu/dxr.rs's
+            // SBT_MODE doc): 0 = off (today's one-record SBT), 1 = alias
+            // records (identical code, distinct sort keys), 2 = class-
+            // specialized, 3 = recursive class dispatch. A measurement
+            // lever, never a default — no vendor policy, no settings row.
+            "--dxr-sbt" => {
+                let n: u32 = args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .filter(|&n| n <= 3)
+                    .unwrap_or_else(|| {
+                        eprintln!(
+                            "--dxr-sbt needs 0 (off — one shading record), 1 (alias records), \
+                             2 (class-specialized), or 3 (recursive class dispatch)"
+                        );
+                        std::process::exit(2);
+                    });
+                opts.dxr_sbt = n;
             }
             "--spin" => {
                 spin = Some(args.next().unwrap_or_else(|| {
@@ -1774,7 +1800,7 @@ fn lever_snapshot() -> String {
     format!(
         "mips={} aniso={} h2n={} n2h={} tint={} spray={} depth={} water={} ccull={} \
          harm={} hon={} bloom={} clouds={} ff={} ffn={} el={} eln={} cshadow={} skylod={} \
-         dxrinline={} fsway={} famp={}",
+         dxrinline={} dxrsbt={} fsway={} famp={}",
         texture::mips_enabled(),
         texture::max_aniso(),
         texture::h2n_enabled(),
@@ -1795,6 +1821,7 @@ fn lever_snapshot() -> String {
         gpu::trace::cloud_shadow_n(),
         gpu::trace::sky_lod(),
         gpu::dxr::dxr_inline_mode(),
+        gpu::dxr::dxr_sbt_mode(),
         crate::foliage::armed(),
         crate::foliage::amp_mult(),
     )
@@ -1842,6 +1869,8 @@ pub fn self_test() -> Result<(), String> {
         "9",
         "--dxr-inline",
         "2",
+        "--dxr-sbt",
+        "3",
         "--no-foliage-sway",
         "--foliage-amp",
         "2",
@@ -1878,6 +1907,9 @@ pub fn self_test() -> Result<(), String> {
         ("emissive_lights_count", o.emissive_lights_count == 9),
         ("dxr_inline", o.dxr_inline == 2),
         ("dxr_inline_explicit", o.dxr_inline_explicit),
+        // A field, not a process global — the purity gate's lever_snapshot
+        // additionally proves the parse never called set_sbt_mode.
+        ("dxr_sbt", o.dxr_sbt == 3),
         ("foliage_sway", !o.foliage_sway),
         ("foliage_amp", o.foliage_amp == 2.0),
     ] {

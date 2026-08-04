@@ -317,6 +317,88 @@ pub fn plan(bvh: &Bvh, max_prims: u32) -> BlasPlan {
     p
 }
 
+/// `refine_by_class`'s product: the per-(new-)chunk class labels that become
+/// `InstanceContributionToHitGroupIndex` (× ray types) in the TLAS, plus the
+/// sway tail's relocated start.
+pub struct ClassRefine {
+    /// One class byte per chunk, parallel to the refined plan's chunks().
+    pub chunk_class: Vec<u8>,
+    /// Where the (unsplit, relabeled) sway tail now starts — the patched
+    /// `SwaySplit::first_chunk`. `None` when the caller passed no tail.
+    pub first_tail: Option<u32>,
+}
+
+/// Refine a plan's chunks into per-class SUB-CHUNKS for the `--dxr-sbt`
+/// many-record SBT (shadeclass.rs owns the taxonomy; this function only
+/// permutes and re-bases).
+///
+/// Each head chunk's contiguous `packed_tris` span is stable-partitioned by
+/// `class_of` (ascending class, original packed order inside a class) and one
+/// sub-chunk is emitted per class PRESENT — `chunk_node` duplicated across
+/// them, the oversized-leaf precedent: one node truthfully owns several
+/// instances. The SWAY TAIL (chunks at/after `tail_from`) is never split —
+/// the sway cells must stay parallel to the tail (foliage.rs's contract) —
+/// so each tail chunk keeps its span and takes the uniform class of its
+/// members, or `uber_class` when mixed (coarser, never wrong: uber's record
+/// is the full shader).
+///
+/// Everything downstream stays coherent BY CONSTRUCTION because this mutates
+/// the plan itself before `plan_windows`/the index stream/the FR_SPLIT_AUDIT
+/// oracle run: all three derive from the mutated `packed_tris`/`chunk_base`
+/// through the same accessors, and windowing decisions are per (new) chunk
+/// over its own span. `tri_of(inst, prim)` is untouched — that is the whole
+/// point of instance-keyed (rather than multi-geometry) class records: the
+/// remap contract survives on BOTH GPU pipelines with zero shader edits.
+pub fn refine_by_class(
+    plan: &mut BlasPlan,
+    tail_from: Option<u32>,
+    uber_class: u8,
+    n_classes: usize,
+    class_of: impl Fn(u32) -> u8,
+) -> ClassRefine {
+    let n = plan.chunks();
+    let split_end = tail_from.map_or(n, |t| t as usize);
+    let mut packed = Vec::with_capacity(plan.packed_tris.len());
+    let mut base: Vec<u32> = Vec::with_capacity(n + 1);
+    let mut node: Vec<u32> = Vec::with_capacity(n);
+    let mut chunk_class: Vec<u8> = Vec::with_capacity(n);
+    base.push(0);
+    // Reused per-class buckets — ascending class order is what makes the
+    // refinement deterministic independent of the material table's layout.
+    let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); n_classes];
+    for i in 0..split_end {
+        for b in &mut buckets {
+            b.clear();
+        }
+        for &t in plan.tris(i) {
+            buckets[class_of(t) as usize].push(t);
+        }
+        for (k, b) in buckets.iter().enumerate() {
+            if b.is_empty() {
+                continue;
+            }
+            packed.extend_from_slice(b);
+            base.push(packed.len() as u32);
+            node.push(plan.chunk_node[i]);
+            chunk_class.push(k as u8);
+        }
+    }
+    let first_tail = tail_from.map(|_| node.len() as u32);
+    for i in split_end..n {
+        let tris = plan.tris(i);
+        packed.extend_from_slice(tris);
+        base.push(packed.len() as u32);
+        node.push(plan.chunk_node[i]);
+        let mut it = tris.iter().map(|&t| class_of(t));
+        let k0 = it.next().unwrap_or(uber_class);
+        chunk_class.push(if it.all(|k| k == k0) { k0 } else { uber_class });
+    }
+    plan.packed_tris = packed;
+    plan.chunk_base = base;
+    plan.chunk_node = node;
+    ClassRefine { chunk_class, first_tail }
+}
+
 /// Above this triangle count the sub-64 caps are SKIPPED (loudly). A plan holds
 /// `packed_tris` (4 B/tri) plus a `chunk_base`/`chunk_node` pair that are 4 B
 /// per CHUNK — negligible at the shipping cap, but cap 1 means one chunk per
@@ -497,6 +579,90 @@ pub fn self_test(bvh: &Bvh) -> Result<(), String> {
             return Err("plan is not deterministic".into());
         }
     }
+
+    // --dxr-sbt class refinement (`refine_by_class`): proven against an
+    // INDEPENDENTLY replayed spec — per head chunk, stable partition by class
+    // ascending, one sub-chunk per class present, node id duplicated; tail
+    // relabeled, never split. Synthetic 2-of-3-class labeling (tri id parity,
+    // class 2 deliberately EMPTY so absent buckets are exercised) over the
+    // shipping-cap plan, so the gate owns the PERMUTATION while shadeclass's
+    // own gate owns the taxonomy. Plus the grow MUST-FIRE (a refine that
+    // never splits is vacuous) and run-twice determinism.
+    {
+        let class_of = |t: u32| (t % 2) as u8;
+        let orig = plan(bvh, DEFAULT_MAX_PRIMS);
+        let n0 = orig.chunks();
+        let tail_from = if n0 >= 2 { Some((n0 - 1) as u32) } else { None };
+        let head_end = tail_from.map_or(n0, |t| t as usize);
+
+        // The replayed spec.
+        let mut exp_packed: Vec<u32> = Vec::with_capacity(orig.packed_tris.len());
+        let mut exp_base: Vec<u32> = vec![0];
+        let mut exp_node: Vec<u32> = Vec::new();
+        let mut exp_class: Vec<u8> = Vec::new();
+        let mut mixed = false;
+        for i in 0..head_end {
+            let mut present = 0usize;
+            for k in 0..3u8 {
+                let run: Vec<u32> =
+                    orig.tris(i).iter().copied().filter(|&t| class_of(t) == k).collect();
+                if run.is_empty() {
+                    continue;
+                }
+                present += 1;
+                exp_packed.extend_from_slice(&run);
+                exp_base.push(exp_packed.len() as u32);
+                exp_node.push(orig.chunk_node[i]);
+                exp_class.push(k);
+            }
+            mixed |= present > 1;
+        }
+        let exp_first_tail = tail_from.map(|_| exp_node.len() as u32);
+        for i in head_end..n0 {
+            exp_packed.extend_from_slice(orig.tris(i));
+            exp_base.push(exp_packed.len() as u32);
+            exp_node.push(orig.chunk_node[i]);
+            let mut it = orig.tris(i).iter().map(|&t| class_of(t));
+            let k0 = it.next().unwrap_or(2);
+            exp_class.push(if it.all(|k| k == k0) { k0 } else { 2 });
+        }
+
+        let mut refined = plan(bvh, DEFAULT_MAX_PRIMS);
+        let r = refine_by_class(&mut refined, tail_from, 2, 3, class_of);
+        if refined.packed_tris != exp_packed
+            || refined.chunk_base != exp_base
+            || refined.chunk_node != exp_node
+            || r.chunk_class != exp_class
+            || r.first_tail != exp_first_tail
+        {
+            return Err("refine_by_class diverged from the replayed spec".into());
+        }
+        if mixed && refined.chunks() <= n0 {
+            return Err(format!(
+                "refine must-fire: mixed-class chunks existed but the chunk count did not \
+                 grow ({n0} -> {})",
+                refined.chunks()
+            ));
+        }
+        if !mixed {
+            eprintln!(
+                "blas-split self-test: no mixed-class chunk at parity labeling — the refine \
+                 grow must-fire is vacuous on this tree (tiny scene), NOT tested"
+            );
+        }
+        // Run-twice determinism (the plan-level check above does not cover
+        // the refinement's own walk).
+        let mut again = plan(bvh, DEFAULT_MAX_PRIMS);
+        let r2 = refine_by_class(&mut again, tail_from, 2, 3, class_of);
+        if again.packed_tris != refined.packed_tris
+            || again.chunk_base != refined.chunk_base
+            || again.chunk_node != refined.chunk_node
+            || r2.chunk_class != r.chunk_class
+        {
+            return Err("refine_by_class is not deterministic".into());
+        }
+    }
+
     // Vertex windowing (the RDNA4 index-value workaround — SPLIT_INDEX_CEILING's
     // doc carries the defect write-up). A synthetic 2-chunk plan over a sparse
     // id space, sized so chunk 0 rebases and chunk 1 must gather:

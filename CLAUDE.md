@@ -1959,6 +1959,68 @@ cargo run --release -- --dxr-inline 0 # A/B lever: the DXR pipeline back on ALL-
                                       # (settings file). Headless (--check*/--spin) never runs
                                       # the vendor policy — gates stay a pure function of the
                                       # command line. See the DXR section's ablation table
+cargo run --release -- --dxr-sbt 1    # EXPERIMENT lever (default 0 = off): the many-record,
+                                      # MATERIAL-SORTED SBT ladder — the Intel-brief Q4
+                                      # counterfactual (the TSU sorts by shader RECORD; our SBT
+                                      # had effectively one). 8 field-derived shading classes
+                                      # (src/shadeclass.rs — the STRIPS table IS the soundness
+                                      # argument: a class may strip a shade arm only when its
+                                      # membership predicate forces that arm's guard data-false,
+                                      # self-tested in --check + re-verified on the LIVE scene
+                                      # at upload; anything not provably strippable lands in
+                                      # uber) partition every blas-split chunk into per-class
+                                      # SUB-CHUNK instances (blas_split::refine_by_class —
+                                      # INSTANCE-keyed, never multi-geometry: PrimitiveIndex()
+                                      # restarts per GEOMETRY, which would break tri_of on BOTH
+                                      # pipelines and drag GeometryIndex()'s SM 6.5 floor into
+                                      # the lib_6_3 mode-0 path; instance-keying keeps the remap
+                                      # contract with ZERO shader edits, and the wavefront
+                                      # ignores hit groups entirely so the grown TLAS is
+                                      # transparent to it). Each instance carries
+                                      # InstanceContributionToHitGroupIndex = class*3 into a
+                                      # class-major [HgShade_ck, HgHit, HgOcclude]x8 SBT — every
+                                      # TraceRay call site untouched (multipliers stay literal
+                                      # 0). The sway tail is RELABELED, never split (the
+                                      # cells-parallel contract); sub-chunks stay under the cap
+                                      # by construction; windows/stream/FR_SPLIT_AUDIT derive
+                                      # from the mutated plan and need no changes. MODE 1 =
+                                      # ALIAS records: 8 ExportToRename aliases of the ONE
+                                      # chs_shade — identical code, distinct sort keys, zero new
+                                      # compiles — isolating the PURE record-sort/repack effect
+                                      # (plus the sibling sub-chunk AABB overlap cost, the
+                                      # structural price of instance-keying). Modes 2 (class-
+                                      # specialized strip-define libraries) and 3 (recursive
+                                      # class dispatch) are the next ladder rungs; unbuilt rungs
+                                      # degrade loudly at DxrGpu construction. A dev MEASUREMENT
+                                      # lever, the --sw-rays class: no vendor policy, no
+                                      # settings row, loud on every armed mode, off-state
+                                      # byte-identical (source AND instance descs). Must be set
+                                      # at parse — the SceneGpu core bakes contributions at
+                                      # UPLOAD (a partition-free core degrades the pipeline to
+                                      # the one-record SBT with one loud line); --dxr-inline 2
+                                      # composition is VACUOUS (zero TraceRay dispatches no
+                                      # record) and says so. Gates: shadeclass::self_test (the
+                                      # strip-soundness must-fire + all-8 anti-vacuity) and
+                                      # blas_split's refine spec-replay + grow must-fire in
+                                      # --check; `--check-dxr --dxr-sbt 1` adds T1d — the
+                                      # construction audit (>=2 live classes; PAIRWISE-DISTINCT
+                                      # alias identifiers — MEASURED 2026-08-04: NVIDIA DEDUPES
+                                      # the 8 aliases to ONE identifier on every scene while
+                                      # the Intel B70 mints all 8 distinct, so rung 1 is an
+                                      # INTEL-ONLY instrument (the vendor the TSU experiment
+                                      # exists for) and NVIDIA joins at rung 2 where genuinely
+                                      # different libraries cannot dedupe; the gate is HARD on
+                                      # Intel, a recorded loud note elsewhere) and the
+                                      # alias-vs-off same-seed A/B through a
+                                      # SECOND SceneGpu core (the partition changes the plan, so
+                                      # the T1c one-core flip is insufficient): BIT-identical
+                                      # accum/tbuf/info on tint-free scenes — aliases run
+                                      # identical code — with transmissive scenes printed
+                                      # ungated (any-hit tint order is hardware-arbitrary by
+                                      # contract, and the partition moves exact-t ties). NOTE
+                                      # the routing wiring's real teeth arrive with rung 2:
+                                      # under aliasing a mis-routed class is image-neutral by
+                                      # construction; specialized records make it fail T2.
 cargo run --release -- --check-dxr    # DXR pipeline gate suite (needs a real RT GPU + the DXC DLLs;
                                       # composes with --stress; exit 2 = environment, 1 = a gate failed)
 cargo run --release -- --dxc-path <d> # DXC DLL directory (default SDKs\dxc\bin\x64; or FRUSTRACER_DXC_PATH)

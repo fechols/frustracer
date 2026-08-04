@@ -1873,6 +1873,17 @@ fn audit_split_streams(
 /// The SHARED scene core: everything both GPU tracers read — streams,
 /// materials, textures, the driver BLAS/TLAS, the blas-split remap.
 /// Immutable after upload; held as `Rc<SceneGpu>` by TraceGpu AND DxrGpu
+/// `--dxr-sbt`'s per-chunk class labels (see `SceneGpu::sbt_class`).
+pub struct SbtClassInfo {
+    /// One shading class per chunk, parallel to the refined plan's chunks —
+    /// `blas_split::ClassRefine::chunk_class`, kept CPU-side for the audit
+    /// (the contribution itself is baked into the TLAS instance descs).
+    pub chunk_class: Vec<u8>,
+    /// Per-class chunk counts (`shadeclass::histogram`) — the arrival line
+    /// + the `--check-dxr` ≥2-classes must-fire.
+    pub histo: [u32; crate::shadeclass::N_CLASSES],
+}
+
 /// (cached in GpuContext, so the second tracer and every resize re-entry
 /// skip the upload + BLAS build entirely). The wavefront-only software
 /// trees live in `SwTreesGpu`, deliberately outside the core.
@@ -1898,6 +1909,16 @@ pub struct SceneGpu {
     /// machinery is sound under motion because the uploaded software BVH's
     /// leaf boxes are swept (`bvh::grow_sway_sweep`).
     pub sway: Option<SwayGpu>,
+    /// `--dxr-sbt` armed on a `--blas-split` upload (else None — the
+    /// `sway: None` structural-off shape): the per-chunk shading classes the
+    /// TLAS instances carry as `InstanceContributionToHitGroupIndex` (× the
+    /// 3 ray types), plus the histogram the `--check-dxr` construction audit
+    /// and the `gpu scene:` line read. The wavefront pipeline ignores hit
+    /// groups entirely (RayQuery), so the grown TLAS is transparent to it —
+    /// the remap contract is untouched by construction (instance-keyed, not
+    /// multi-geometry: PrimitiveIndex() restarts per GEOMETRY, which would
+    /// have broken `tri_of` on both pipelines).
+    pub sbt_class: Option<SbtClassInfo>,
     /// `--blas-split` only (4-byte dummies otherwise): the reordered index
     /// stream the chunk BLASes were built over, and the remap the shaders read
     /// to recover a triangle id from `(InstanceID, PrimitiveIndex)` —
@@ -2443,7 +2464,7 @@ impl SceneGpu {
             // intersector and BVH sweep already consumed — the cross-arm pose
             // contract); the static TLAS below still holds every chunk at
             // identity, the rest pose the headless gates trace.
-            let sway_split = match &scene.sway {
+            let mut sway_split = match &scene.sway {
                 Some(sw) => {
                     let sp = crate::foliage::split_plan(&mut plan, sw, cap);
                     match &sp {
@@ -2469,6 +2490,59 @@ impl SceneGpu {
                     }
                     None
                 }
+            };
+            // --dxr-sbt: refine the antichain chunks into per-class
+            // SUB-CHUNKS (blas_split::refine_by_class) so each TLAS instance
+            // carries its shading class as InstanceContributionToHitGroupIndex
+            // (× the 3 ray types — dxr.rs's class-major SBT). INSTANCE-keyed
+            // rather than multi-geometry because PrimitiveIndex() restarts
+            // per GEOMETRY: per-class geometry descs would have broken
+            // `tri_of(inst, prim)` on BOTH pipelines and dragged a
+            // GeometryIndex() SM 6.5 floor into the lib_6_3 mode-0 path;
+            // this way the remap contract survives with zero shader edits.
+            // Runs AFTER split_plan (the sway tail is RELABELED, never split
+            // — the cells-parallel-to-tail contract, foliage.rs; the moved
+            // tail start is patched back before SwayGpu::new below) and
+            // BEFORE the 2^24 ceiling check, so the ceiling validates the
+            // GROWN count. Head sub-chunks stay under the cap by
+            // construction (a sub-span of an under-cap span); windows/the
+            // index stream/FR_SPLIT_AUDIT all derive from the MUTATED plan
+            // through the same accessors, so they stay coherent with no
+            // further changes (`Windows::tri` is the one rewrite rule).
+            let sbt_class = if crate::gpu::dxr::dxr_sbt_mode() > 0 {
+                let mat_class =
+                    crate::shadeclass::classify_materials(&scene.materials, &scene.textures);
+                // The live-scene soundness audit — the same must-fire
+                // shadeclass::self_test runs synthetically. A taxonomy bug
+                // here would otherwise surface as a wrong image three
+                // suites later; fail the upload instead.
+                crate::shadeclass::verify_strips(&scene.materials, &mat_class)
+                    .map_err(|e| format!("--dxr-sbt: {e}"))?;
+                let n_before = plan.chunks();
+                let r = crate::blas_split::refine_by_class(
+                    &mut plan,
+                    sway_split.as_ref().map(|s| s.first_chunk),
+                    crate::shadeclass::CK_UBER,
+                    crate::shadeclass::N_CLASSES,
+                    |t| mat_class[scene.tri_mat[t as usize] as usize],
+                );
+                if let (Some(sp), Some(ft)) = (sway_split.as_mut(), r.first_tail) {
+                    sp.first_chunk = ft;
+                }
+                let histo = crate::shadeclass::histogram(&r.chunk_class);
+                let mut parts = String::new();
+                for (k, n) in histo.iter().enumerate() {
+                    if *n > 0 {
+                        parts.push_str(&format!(" {}:{n}", crate::shadeclass::NAMES[k]));
+                    }
+                }
+                eprintln!(
+                    "dxr-sbt: {n_before} chunks -> {} class sub-chunks |{parts}",
+                    plan.chunks()
+                );
+                Some(SbtClassInfo { chunk_class: r.chunk_class, histo })
+            } else {
+                None
             };
             // The chunk index rides InstanceID (24 bits). No real scene comes
             // near this at a 64k cap; a tiny cap on a huge scene could, and a
@@ -2590,6 +2664,7 @@ impl SceneGpu {
                 n_verts,
                 non_opaque,
                 scene.any_transmissive,
+                sbt_class.as_ref().map(|c| c.chunk_class.as_slice()),
             )?;
             // The gathered side buffer fed only the builds, exactly like the
             // reordered index stream below.
@@ -2636,6 +2711,7 @@ impl SceneGpu {
                 blas,
                 tlas,
                 sway,
+                sbt_class,
                 blas_tri: blas_tri_b,
                 chunk_base: chunk_base_b,
                 n_packed: plan.packed_tris.len() as u32,
@@ -2857,6 +2933,9 @@ impl SceneGpu {
             // `--no-blas-split --foliage-sway` already printed its note in
             // main's lever block.
             sway: None,
+            // --dxr-sbt likewise needs per-chunk instances: DxrGpu::new sees
+            // None and degrades the lever loudly (the sway note precedent).
+            sbt_class: None,
             // Unarmed: no remap exists and the kernels compile without
             // BLAS_SPLIT, so these are never read — 4-byte dummies keep the
             // descriptor table's shape uniform across both paths.
@@ -3620,6 +3699,12 @@ fn build_split_blas(
     n_verts: u32,
     non_opaque: bool,
     any_transmissive: bool,
+    // --dxr-sbt: per-chunk shading class, baked into each instance's
+    // InstanceContributionToHitGroupIndex as `class * 3` (the class-major
+    // [shade, hit, occlude] SBT stride in dxr.rs — keep in lockstep). None
+    // (the lever off) leaves `_bitfield2 = 0`, the byte-identical off-state
+    // instance template.
+    chunk_class: Option<&[u8]>,
 ) -> Result<SplitBuild> {
     let n = plan.chunks();
     let uaf = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
@@ -3824,13 +3909,20 @@ fn build_split_blas(
 
     // Identity instances, InstanceID = chunk index — the (InstanceID,
     // PrimitiveIndex) -> tri remap's first coordinate, and the stable handle a
-    // cut-driven TLAS rebuild would address chunks by.
+    // cut-driven TLAS rebuild would address chunks by. Under --dxr-sbt,
+    // `_bitfield2`'s low 24 bits carry InstanceContributionToHitGroupIndex =
+    // class * 3 (flags stay 0 in the high 8); record address = hit-table
+    // start + stride * (RayContribution + InstanceContribution), multipliers
+    // are literal 0 at every TraceRay site, so the ray-type indices {0,1,2}
+    // keep their meaning inside each class's triplet. The sway ring copies
+    // these descs verbatim per slot, so animated instances inherit their
+    // contribution for free.
     let idescs: Vec<D3D12_RAYTRACING_INSTANCE_DESC> = (0..n)
         .map(|i| {
             let mut idesc: D3D12_RAYTRACING_INSTANCE_DESC = unsafe { std::mem::zeroed() };
             idesc.Transform = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
             idesc._bitfield1 = (0xffu32 << 24) | (i as u32 & 0x00ff_ffff);
-            idesc._bitfield2 = 0;
+            idesc._bitfield2 = chunk_class.map_or(0, |c| c[i] as u32 * 3);
             idesc.AccelerationStructure = arena_va + final_off[i];
             idesc
         })

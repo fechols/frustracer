@@ -39,9 +39,12 @@ const DXR_HLSL: &str = include_str!("shaders/dxr.hlsl");
 const IDENT: usize = D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as usize; // 32
 /// Table starts are 64-aligned (D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT);
 /// identifier-only records make the stride the 32-byte identifier itself.
+/// The hit-table RECORD COUNT is runtime since --dxr-sbt (3 off-lever,
+/// class-major 8×3 on the alias arm) — `DxrGpu::sbt_hit_records` snapshots
+/// it so the fill and DispatchRays cannot disagree; SBT_HIT itself never
+/// moves (192 stays 64-aligned, the miss table's 96 bytes fit beneath it).
 const SBT_MISS: usize = 64;
 const SBT_HIT: usize = 192;
-const SBT_SIZE: usize = SBT_HIT + 3 * IDENT;
 
 /// What DispatchRays needs, queried once. Tier 1.0 suffices (the compute
 /// tracer's RayQuery needs 1.1; this pipeline predates it) and the library
@@ -117,10 +120,57 @@ pub(crate) fn dxr_inline_mode() -> u32 {
     INLINE_MODE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// `--dxr-sbt 0|1|2|3` (default **0** = off, today's one-record SBT): the
+/// many-record, MATERIAL-SORTED SBT ladder — the counterfactual the Intel
+/// brief's Q4 promised ("the TSU sorts by shader RECORD… the guidance would
+/// only flip if we grew many materially different hit records"). A DEV
+/// MEASUREMENT lever, the `--sw-rays` class: no vendor policy, no settings
+/// exposure, loud on every armed mode, off-state assembles the byte-identical
+/// mode-0 source and the byte-identical instance descs.
+///   1 — ALIAS records: the 8 shading classes (shadeclass.rs) get 8 export
+///       ALIASES of the ONE `chs_shade` (ExportToRename — zero new compiles,
+///       IDENTICAL code), the SBT grows to class-major
+///       [HgShade_ck, HgHit, HgOcclude] × 8, and each TLAS instance carries
+///       `InstanceContributionToHitGroupIndex = class * 3` (baked at upload —
+///       the lever must be set BEFORE the SceneGpu core uploads, the
+///       knob-before-anything rule; a core without the partition degrades
+///       this to 0 with one loud line). Isolates the PURE record-sort /
+///       repacking effect (± the sibling sub-chunk AABB overlap cost, the
+///       structural price of instance-keyed sorting) — radiance-identical to
+///       mode 0 by construction, gated bit-exact on default/stress.
+///   2 — SPECIALIZED records (Commit B): per-class strip-define libraries.
+///   3 — RECURSIVE class dispatch (Commit C): continuations TraceRay into
+///       their class's CHS. Modes not yet built degrade to the highest built
+///       rung with a loud line.
+/// Composition: the contribution only matters where hit-group records
+/// DISPATCH — every mode-0 TraceRay and mode-1's primary; under
+/// `--dxr-inline 2` (zero TraceRay) the arm is VACUOUS and says so loudly
+/// (kept runnable for A/B matrix hygiene). Set from main's parse via
+/// `set_sbt_mode` (the set_inline_mode idiom; headless keeps the parse-time
+/// store).
+static SBT_MODE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub fn set_sbt_mode(n: u32) {
+    SBT_MODE.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn dxr_sbt_mode() -> u32 {
+    SBT_MODE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub struct DxrGpu {
     root_sig: ID3D12RootSignature,
     state: ID3D12StateObject,
     sbt: d3d12::UploadBuffer,
+    /// Hit-table record count (3 off-lever; classes × 3 on the --dxr-sbt
+    /// alias arm) — the fill and DispatchRays read this ONE snapshot.
+    sbt_hit_records: u32,
+    /// The armed --dxr-sbt rung this pipeline was BUILT at (post-degrade),
+    /// and how many pairwise-distinct per-class shader identifiers the
+    /// driver actually minted (== N_CLASSES, or the loud dedupe finding).
+    /// Both read by --check-dxr's construction audit.
+    pub sbt_mode: u32,
+    pub sbt_distinct_idents: u32,
     pso_resolve: ID3D12PipelineState,
     /// The cloud-cache fill kernels + their buffers (u5/u6), armed per the
     /// snapshotted levers. `None` when the respective cache is off. bound before
@@ -246,6 +296,49 @@ impl DxrGpu {
                      defaults to 2)"
                 );
                 0
+            }
+        };
+
+        // --dxr-sbt snapshot (see the SBT_MODE doc). Degrades: to 0 when the
+        // shared core carries no class partition (the lever must precede the
+        // upload — --no-blas-split, or a core cached before arming), and to
+        // the highest BUILT ladder rung (1, this commit) when a later mode is
+        // asked for. The --dxr-inline 2 composition is VACUOUS (zero TraceRay
+        // ⇒ no record ever dispatches) — runnable for matrix hygiene, said
+        // loudly. Snapshotted once like inline_mode: a mid-process A/B can
+        // never desync the RTPSO from its SBT.
+        let sbt_mode = {
+            let m = dxr_sbt_mode();
+            if m == 0 {
+                0
+            } else if scene_gpu.sbt_class.is_none() {
+                eprintln!(
+                    "dxr-sbt: mode {m} armed but the scene core carries no class partition \
+                     (--no-blas-split, or the core uploaded before the lever) — running the \
+                     one-record SBT"
+                );
+                0
+            } else {
+                let built = m.min(1);
+                if m > built {
+                    eprintln!(
+                        "dxr-sbt: mode {m} is a later ladder rung (specialized/recursive — \
+                         not built yet) — running mode {built} (alias records)"
+                    );
+                }
+                if inline_mode == 2 {
+                    eprintln!(
+                        "dxr-sbt: NOTE --dxr-inline 2 dispatches no hit-group records at all \
+                         — the sorted SBT is VACUOUS in this composition (kept runnable for \
+                         A/B matrix hygiene)"
+                    );
+                }
+                eprintln!(
+                    "dxr-sbt: mode {built} — {} class records (alias arm: 8 renames of one \
+                     chs_shade; identical code, distinct sort keys)",
+                    crate::shadeclass::N_CLASSES * 3
+                );
+                built
             }
         };
 
@@ -409,14 +502,62 @@ impl DxrGpu {
         let ah_hit_name = wname("ah_hit");
         let ah_shadow_name = wname("ah_shadow");
 
+        // --dxr-sbt name storage: per-class hit-group + alias export names.
+        // Vec<Vec<u16>>: the OUTER vec may move, the inner heap buffers the
+        // PCWSTRs point into do not — but the desc vecs below are still
+        // fully built before any pointer is taken (the :400-402 rule).
+        let n_classes = crate::shadeclass::N_CLASSES;
+        let hg_class_names: Vec<Vec<u16>> =
+            (0..n_classes).map(|k| wname(&format!("HgShade_c{k}"))).collect();
+        let chs_alias_names: Vec<Vec<u16>> =
+            (0..n_classes).map(|k| wname(&format!("chs_shade_c{k}"))).collect();
+
+        // Alias arm: the library takes an EXPLICIT export list — every base
+        // [shader(...)] entry re-exported under its own name (NumExports 0
+        // means "export all", so naming any means naming ALL that the SBT or
+        // the hit groups will look up), plus 8 ExportToRename ALIASES of the
+        // one chs_shade. 8 renames of one function = 8 distinct shader
+        // identifiers = the TSU's sort keys, zero new compiles — the whole
+        // point of ladder rung 1. Off (sbt_mode 0): NumExports stays 0, the
+        // pre-lever library subobject verbatim.
+        let base_export_names: Vec<Vec<u16>> = {
+            let mut v: Vec<&str> =
+                vec!["raygen", "chs_shade", "chs_hit", "miss_radiance", "miss_shadow", "miss_hit"];
+            if non_opaque {
+                v.extend(["ah_shade", "ah_hit", "ah_shadow"]);
+            }
+            v.into_iter().map(wname).collect()
+        };
+        let mut exports: Vec<D3D12_EXPORT_DESC> = Vec::new();
+        if sbt_mode >= 1 {
+            exports.reserve_exact(base_export_names.len() + n_classes);
+            for n in &base_export_names {
+                exports.push(D3D12_EXPORT_DESC {
+                    Name: PCWSTR(n.as_ptr()),
+                    ExportToRename: PCWSTR::null(),
+                    Flags: D3D12_EXPORT_FLAG_NONE,
+                });
+            }
+            for k in 0..n_classes {
+                exports.push(D3D12_EXPORT_DESC {
+                    Name: PCWSTR(chs_alias_names[k].as_ptr()),
+                    ExportToRename: PCWSTR(chs_shade_name.as_ptr()),
+                    Flags: D3D12_EXPORT_FLAG_NONE,
+                });
+            }
+        }
         let lib_desc = D3D12_DXIL_LIBRARY_DESC {
             DXILLibrary: D3D12_SHADER_BYTECODE {
                 pShaderBytecode: dxil.as_ptr() as *const _,
                 BytecodeLength: dxil.len(),
             },
-            // No export list: every [shader("...")] entry exports.
-            NumExports: 0,
-            pExports: std::ptr::null_mut(),
+            // No export list off-lever: every [shader("...")] entry exports.
+            NumExports: exports.len() as u32,
+            pExports: if exports.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                exports.as_ptr() as *mut _
+            },
         };
         // ALPHA_CUTOUT scenes attach the cutout any-hit to every hit group;
         // HgOcclude carries ONLY an any-hit (legal — SKIP_CLOSEST_HIT skips
@@ -433,18 +574,39 @@ impl DxrGpu {
             ClosestHitShaderImport: chs,
             IntersectionShaderImport: PCWSTR::null(),
         };
-        let hg_shade = hit_group(
-            &hg_shade_name,
-            PCWSTR(chs_shade_name.as_ptr()),
-            ahs(&ah_shade_name),
-        );
-        let hg_hit =
-            hit_group(&hg_hit_name, PCWSTR(chs_hit_name.as_ptr()), ahs(&ah_hit_name));
-        let hg_occlude = hit_group(
-            &hg_occlude_name,
-            PCWSTR::null(),
-            PCWSTR(ah_shadow_name.as_ptr()),
-        );
+        // Hit groups as ONE pre-sized Vec: the subobject array stores raw
+        // pointers INTO it, so it is fully populated here and NEVER pushed
+        // to again (a realloc would invalidate every stored pDesc — the
+        // documented RTPSO-lifetime footgun). Off-lever the contents are
+        // exactly the legacy three; the alias arm swaps the single HgShade
+        // for 8 per-class groups whose chs imports are the renamed aliases
+        // (every class shares ah_shade under non_opaque — the payload-type
+        // pairing is per group KIND, so the per-class surface is only the
+        // chs column).
+        let mut hit_groups: Vec<D3D12_HIT_GROUP_DESC> = Vec::with_capacity(n_classes + 2);
+        if sbt_mode >= 1 {
+            for k in 0..n_classes {
+                hit_groups.push(hit_group(
+                    &hg_class_names[k],
+                    PCWSTR(chs_alias_names[k].as_ptr()),
+                    ahs(&ah_shade_name),
+                ));
+            }
+        } else {
+            hit_groups.push(hit_group(
+                &hg_shade_name,
+                PCWSTR(chs_shade_name.as_ptr()),
+                ahs(&ah_shade_name),
+            ));
+        }
+        hit_groups.push(hit_group(&hg_hit_name, PCWSTR(chs_hit_name.as_ptr()), ahs(&ah_hit_name)));
+        if non_opaque {
+            hit_groups.push(hit_group(
+                &hg_occlude_name,
+                PCWSTR::null(),
+                PCWSTR(ah_shadow_name.as_ptr()),
+            ));
+        }
         // RayPayload {float3 + float + uint + float2 + uint} = 32 B is the
         // largest payload (the float2/uint tail is --spp: the sample's own
         // position, and prim = `(sample << 1) | probe_bit` — the index rides
@@ -474,8 +636,6 @@ impl DxrGpu {
         };
         let mut subobjects = vec![
             sub(D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY, &lib_desc as *const _ as *const _),
-            sub(D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hg_shade as *const _ as *const _),
-            sub(D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &hg_hit as *const _ as *const _),
             sub(
                 D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG,
                 &shader_cfg as *const _ as *const _,
@@ -486,14 +646,13 @@ impl DxrGpu {
             ),
             sub(D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE, &grs as *const _ as *const _),
         ];
-        // HgOcclude imports ah_shadow, which only exports under
-        // ALPHA_CUTOUT/HEIGHTFIELD — the subobject exists exactly when the
-        // library exports it.
-        if non_opaque {
-            subobjects.push(sub(
-                D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP,
-                &hg_occlude as *const _ as *const _,
-            ));
+        // Hit groups by reference into the (now frozen) Vec — one per class
+        // + HgHit (+ HgOcclude, which imports ah_shadow and only exports
+        // under ALPHA_CUTOUT/HEIGHTFIELD/TRANS_SHADOW, so its group exists
+        // exactly when the library exports it). Subobject ORDER is not
+        // significant to CreateStateObject.
+        for hg in &hit_groups {
+            subobjects.push(sub(D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, hg as *const _ as *const _));
         }
         let so_desc = D3D12_STATE_OBJECT_DESC {
             Type: D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE,
@@ -515,8 +674,16 @@ impl DxrGpu {
             }
             Ok(unsafe { *(p as *const [u8; IDENT]) })
         };
-        let sbt = d3d12::UploadBuffer::new(device, SBT_SIZE)?;
-        unsafe { std::ptr::write_bytes(sbt.ptr, 0, SBT_SIZE) };
+        // Hit-table records: 3 off-lever (the pre-feature layout verbatim),
+        // class-major [HgShade_ck, HgHit, HgOcclude] × 8 on the alias arm —
+        // repeating HgHit/HgOcclude per class slot is free at identifier-only
+        // stride and is what keeps RayContribution's {0,1,2} meaning inside
+        // every class triplet with ZERO TraceRay call-site changes.
+        let sbt_hit_records: u32 =
+            if sbt_mode >= 1 { (n_classes * 3) as u32 } else { 3 };
+        let sbt_size = SBT_HIT + sbt_hit_records as usize * IDENT;
+        let sbt = d3d12::UploadBuffer::new(device, sbt_size)?;
+        unsafe { std::ptr::write_bytes(sbt.ptr, 0, sbt_size) };
         let put = |off: usize, id: [u8; IDENT]| unsafe {
             std::ptr::copy_nonoverlapping(id.as_ptr(), sbt.ptr.add(off), IDENT);
         };
@@ -524,13 +691,51 @@ impl DxrGpu {
         put(SBT_MISS, ident("miss_radiance")?);
         put(SBT_MISS + IDENT, ident("miss_shadow")?);
         put(SBT_MISS + 2 * IDENT, ident("miss_hit")?);
-        put(SBT_HIT, ident("HgShade")?);
-        put(SBT_HIT + IDENT, ident("HgHit")?);
-        // Hit group 2 (occlusion rays): the zeroed null record on opaque
-        // scenes (SKIP_CLOSEST_HIT + FORCE_OPAQUE never run a shader from
-        // it); the any-hit-only HgOcclude on alpha-masked/height scenes.
-        if non_opaque {
-            put(SBT_HIT + 2 * IDENT, ident("HgOcclude")?);
+        let mut sbt_distinct_idents: u32 = 1;
+        if sbt_mode >= 1 {
+            // Per-class identifiers. PAIRWISE DISTINCTNESS is the alias
+            // arm's anti-vacuity: if a driver dedupes renames of one
+            // function to one identifier, the TSU has one sort key and the
+            // rung proves nothing — loud here (a real Q4 data point), GATED
+            // in --check-dxr's construction audit via `sbt_distinct_idents`.
+            let ids: Vec<[u8; IDENT]> = (0..n_classes)
+                .map(|k| ident(&format!("HgShade_c{k}")))
+                .collect::<Result<_>>()?;
+            let mut uniq: Vec<&[u8; IDENT]> = Vec::new();
+            for id in &ids {
+                if !uniq.contains(&id) {
+                    uniq.push(id);
+                }
+            }
+            sbt_distinct_idents = uniq.len() as u32;
+            if sbt_distinct_idents != n_classes as u32 {
+                eprintln!(
+                    "dxr-sbt: DRIVER DEDUPED the alias identifiers — {} distinct of {} \
+                     (the TSU has that many sort keys; the alias rung is vacuous here, \
+                     which is itself a finding)",
+                    sbt_distinct_idents, n_classes
+                );
+            }
+            let hit_id = ident("HgHit")?;
+            let occl_id = if non_opaque { Some(ident("HgOcclude")?) } else { None };
+            for (k, id) in ids.iter().enumerate() {
+                put(SBT_HIT + (3 * k) * IDENT, *id);
+                put(SBT_HIT + (3 * k + 1) * IDENT, hit_id);
+                // Slot 3k+2: the zeroed null record on opaque scenes (the
+                // legacy convention, repeated per class); HgOcclude armed.
+                if let Some(o) = occl_id {
+                    put(SBT_HIT + (3 * k + 2) * IDENT, o);
+                }
+            }
+        } else {
+            put(SBT_HIT, ident("HgShade")?);
+            put(SBT_HIT + IDENT, ident("HgHit")?);
+            // Hit group 2 (occlusion rays): the zeroed null record on opaque
+            // scenes (SKIP_CLOSEST_HIT + FORCE_OPAQUE never run a shader from
+            // it); the any-hit-only HgOcclude on alpha-masked/height scenes.
+            if non_opaque {
+                put(SBT_HIT + 2 * IDENT, ident("HgOcclude")?);
+            }
         }
 
         // The shared core arrived pre-uploaded (Rc from GpuContext's cache).
@@ -631,6 +836,9 @@ impl DxrGpu {
             root_sig,
             state,
             sbt,
+            sbt_hit_records,
+            sbt_mode,
+            sbt_distinct_idents,
             pso_resolve,
             pso_sky_lod,
             pso_cloud_shadow,
@@ -908,7 +1116,10 @@ impl DxrGpu {
                 },
                 HitGroupTable: D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE {
                     StartAddress: va + SBT_HIT as u64,
-                    SizeInBytes: (3 * IDENT) as u64,
+                    // Runtime record count (--dxr-sbt) — snapshotted at
+                    // construction beside the fill, so the two cannot
+                    // disagree.
+                    SizeInBytes: (self.sbt_hit_records as usize * IDENT) as u64,
                     StrideInBytes: IDENT as u64,
                 },
                 CallableShaderTable: Default::default(),
