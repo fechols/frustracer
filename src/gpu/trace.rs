@@ -3245,44 +3245,63 @@ pub(crate) fn width_defs() -> String {
     }
 }
 
-/// FR_BALLAST=N — inject N synthetic LIVE floats into cs_reference (the
-/// register-cliff bisection lever; see reference.hlsl's liveness argument).
-/// Legal 1..=256; anything else is loud + off; a `dxr:N` spelling is
-/// RESERVED and refused loudly (the deferred-kernel variant is unbuilt — a
-/// lever that silently no-ops is the failure mode these announces prevent).
-/// Image bit-identical at every real spp (the fold is branch-dead at
-/// runtime); a PROBE, never a lever — pair with FR_WIDTH=1 and sweep N to
-/// find the width flip / ms step.
-pub(crate) fn ballast_ref_n() -> u32 {
-    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+/// FR_BALLAST=N | dxr:N — inject N synthetic LIVE floats into cs_reference
+/// (bare N) or the mode-2 DXR raygen (`dxr:N` — dxr.hlsl's DXR_INLINE_SEC==2
+/// arm, needs --dxr-inline 2; dxr.rs refuses other modes loudly). The
+/// register-cliff bisection lever; see reference.hlsl's liveness argument,
+/// mirrored term-for-term in the raygen arm. The two targets carry the SAME
+/// code at the SAME compiled width (FR_WIDTH: both SIMD16 on the B70), so
+/// sweeping both knees on one scene measures the RT launch regime's
+/// confiscated live state IN FLOATS — the knee-vs-knee host comparison.
+/// Legal 1..=256, one target per run; anything else is loud + off. Image
+/// bit-identical at every real spp (the fold is branch-dead at runtime); a
+/// PROBE, never a lever — pair with FR_WIDTH=1 and sweep N to find the
+/// width flip / ms step.
+fn ballast_parsed() -> (u32, u32) {
+    static N: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
-        let Ok(v) = std::env::var("FR_BALLAST") else { return 0 };
-        if let Some(rest) = v.strip_prefix("dxr:") {
-            eprintln!(
-                "gpu: FR_BALLAST=dxr:{rest} — the cs_dxr_shade variant is not \
-                 built (reference-kernel bisection only) — off"
-            );
-            return 0;
-        }
-        match v.parse::<u32>() {
+        let Ok(v) = std::env::var("FR_BALLAST") else { return (0, 0) };
+        let (target, num) = match v.strip_prefix("dxr:") {
+            Some(rest) => ("the mode-2 DXR raygen", rest),
+            None => ("cs_reference", v.as_str()),
+        };
+        match num.parse::<u32>() {
             Ok(n) if (1..=256).contains(&n) => {
                 eprintln!(
-                    "gpu: FR_BALLAST={n} — {n} synthetic live floats in \
-                     cs_reference (register-cliff probe; image bit-identical)"
+                    "gpu: FR_BALLAST={v} — {n} synthetic live floats in \
+                     {target} (register-cliff probe; image bit-identical)"
                 );
-                n
+                if target == "cs_reference" { (n, 0) } else { (0, n) }
             }
             _ => {
-                eprintln!("gpu: FR_BALLAST={v:?} illegal (N in 1..=256) — off");
-                0
+                eprintln!("gpu: FR_BALLAST={v:?} illegal (N or dxr:N, N in 1..=256) — off");
+                (0, 0)
             }
         }
     })
 }
 
+/// The bare-N arm: ballast in cs_reference (0 under `dxr:N`).
+pub(crate) fn ballast_ref_n() -> u32 {
+    ballast_parsed().0
+}
+
+/// The `dxr:N` arm: ballast in the mode-2 raygen (0 under bare N).
+pub(crate) fn ballast_dxr_n() -> u32 {
+    ballast_parsed().1
+}
+
 /// The BALLAST_N define, "" when off (pushed conditionally, like width_defs).
 pub(crate) fn ballast_defs() -> String {
     match ballast_ref_n() {
+        0 => String::new(),
+        n => format!("#define BALLAST_N {n}u"),
+    }
+}
+
+/// The raygen twin — consumed only by dxr.rs's library assembly.
+pub(crate) fn ballast_dxr_defs() -> String {
+    match ballast_dxr_n() {
         0 => String::new(),
         n => format!("#define BALLAST_N {n}u"),
     }

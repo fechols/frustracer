@@ -180,6 +180,53 @@ pub fn set_inline_mode(n: u32) {
     INLINE_MODE.store(n, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// FR_DXR_STACK=min|<bytes> — override the RTPSO's pipeline stack via
+/// SetPipelineStackSize (the DispatchRays hunt: the driver's DEFAULT is the
+/// spec's conservative formula over its own per-shader GetShaderStackSize
+/// numbers plus whatever it pads on top — the work-graph 517-vs-82 MB
+/// backing tell says Intel pads RT regimes generously). `min` recomputes
+/// from those same driver numbers against OUR known call graph — mode 2 has
+/// no TraceRay at all, so its true bound is the raygen frame alone, a fact
+/// the spec formula cannot see; other modes take raygen + declared-depth ×
+/// the largest callee frame. `<bytes>` is the raw bisection arm. SAFETY:
+/// undershooting real usage is DEVICE REMOVAL by spec, not an error — `min`
+/// derives from the driver's own numbers, never guesses; use `<bytes>` only
+/// to bisect a suspected over-reservation. Loud on arm AND on an illegal
+/// value (the FR_WIDE rule); default off = the driver default, untouched.
+#[derive(Clone, Copy, PartialEq)]
+enum StackOverride {
+    Off,
+    Min,
+    Bytes(u64),
+}
+
+fn stack_override() -> StackOverride {
+    static OV: std::sync::OnceLock<StackOverride> = std::sync::OnceLock::new();
+    *OV.get_or_init(|| match std::env::var("FR_DXR_STACK") {
+        Err(_) => StackOverride::Off,
+        Ok(v) if v == "min" => {
+            eprintln!(
+                "gpu: FR_DXR_STACK=min — pipeline stack clamped to the \
+                 call-graph bound (SetPipelineStackSize)"
+            );
+            StackOverride::Min
+        }
+        Ok(v) => match v.parse::<u64>() {
+            Ok(n) if n > 0 => {
+                eprintln!(
+                    "gpu: FR_DXR_STACK={n} — raw pipeline stack override \
+                     (undershooting real usage is device removal by spec)"
+                );
+                StackOverride::Bytes(n)
+            }
+            _ => {
+                eprintln!("gpu: FR_DXR_STACK={v:?} illegal (min or bytes > 0) — off");
+                StackOverride::Off
+            }
+        },
+    })
+}
+
 pub(crate) fn dxr_inline_mode() -> u32 {
     INLINE_MODE.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -644,6 +691,24 @@ impl DxrGpu {
         // carries its own WIDTH_PROBE define.
         if trace::width_probe_on() && (inline_mode > 0 || recurse) {
             parts.push("#define WIDTH_PROBE_RAYGEN 1");
+        }
+        // FR_BALLAST=dxr:N — the raygen ballast (the knee-vs-knee host
+        // comparison; reference.hlsl's liveness argument, mirrored in
+        // dxr.hlsl's mode-2 arm). The blocks' compound guard already
+        // confines them to DXR_INLINE_SEC == 2, but pushing the define into
+        // a mode whose arm compiles out would leave the SEED live and the
+        // update dead — a ballast that "measures" a flat curve — so any
+        // other mode refuses loudly instead (the FR_WIDE rule).
+        let bd = trace::ballast_dxr_defs();
+        if !bd.is_empty() {
+            if inline_mode == 2 {
+                parts.push(bd.as_str());
+            } else {
+                eprintln!(
+                    "gpu: FR_BALLAST=dxr:N needs --dxr-inline 2 (this session is \
+                     mode {inline_mode}) — off"
+                );
+            }
         }
         parts.push(trace::TRACE_COMMON_HLSLI);
         // skylod.hlsli after trace_common (needs sky_compose/sky_backdrop/rw); no
@@ -1136,6 +1201,88 @@ impl DxrGpu {
             // it); the any-hit-only HgOcclude on alpha-masked/height scenes.
             if non_opaque {
                 put(SBT_HIT + 2 * IDENT, ident("HgOcclude")?);
+            }
+        }
+
+        // --- Stack introspection (the DispatchRays hunt): the ONE
+        // register-adjacent number D3D12 exposes for RT pipelines. Per-shader
+        // frames via GetShaderStackSize (hit-group members take the spec's
+        // qualified "group::stage" spelling; 0xFFFFFFFF = not queryable,
+        // printed '-') plus the driver's default GetPipelineStackSize — the
+        // reservation the work-graph backing tell (B70 517 MB vs NVIDIA
+        // 82 MB, identical graph) suggests Intel pads. Always-on one-liner
+        // (the vram-line precedent): a fat shader's spill lives in this
+        // stack on drivers that scratch-back it, so the B70-vs-4090 diff of
+        // this line is the DXR-side twin of the FR_WIDTH report.
+        let sstack = |name: &str| -> u64 {
+            let wn = wname(name);
+            unsafe { props.GetShaderStackSize(PCWSTR(wn.as_ptr())) }
+        };
+        const STACK_NA: u64 = 0xFFFFFFFF;
+        let sfmt =
+            |v: u64| if v >= STACK_NA { "-".to_string() } else { v.to_string() };
+        let pipe_default = unsafe { props.GetPipelineStackSize() };
+        let mut stack_rows: Vec<(String, u64)> = vec![
+            ("raygen".into(), sstack("raygen")),
+            ("miss".into(), sstack("miss_radiance")),
+            ("miss_sh".into(), sstack("miss_shadow")),
+            ("miss_hit".into(), sstack("miss_hit")),
+        ];
+        if recurse {
+            stack_rows.push(("miss_rec".into(), sstack("miss_rec")));
+        }
+        let shade_group = if sbt_mode >= 1 { "HgShade_c0" } else { "HgShade" };
+        if sbt_mode >= 1 {
+            // Per-class frames — under sbt 2 a specialized thin CHS should
+            // report a smaller frame than uber's, a real per-class datum.
+            for k in 0..n_classes {
+                stack_rows
+                    .push((format!("c{k}"), sstack(&format!("HgShade_c{k}::closesthit"))));
+            }
+        } else {
+            stack_rows.push(("chs".into(), sstack("HgShade::closesthit")));
+        }
+        stack_rows.push(("hit".into(), sstack("HgHit::closesthit")));
+        if non_opaque {
+            stack_rows.push(("ah".into(), sstack(&format!("{shade_group}::anyhit"))));
+            stack_rows.push(("occl".into(), sstack("HgOcclude::anyhit")));
+        }
+        eprintln!(
+            "dxr stack: pipeline-default={pipe_default} | {}",
+            stack_rows
+                .iter()
+                .map(|(l, v)| format!("{l}={}", sfmt(*v)))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        match stack_override() {
+            StackOverride::Off => {}
+            ov => {
+                let rg = stack_rows[0].1;
+                if rg >= STACK_NA {
+                    eprintln!("dxr stack: raygen frame not queryable — FR_DXR_STACK skipped");
+                } else {
+                    // Callee frame = max over every non-raygen shader the
+                    // graph can invoke; raygen + declared-depth × that is
+                    // sufficient for every mode (mode 2 invokes NOTHING
+                    // below raygen — its bound is the raygen frame alone).
+                    let callee_max = stack_rows[1..]
+                        .iter()
+                        .map(|&(_, v)| v)
+                        .filter(|&v| v < STACK_NA)
+                        .max()
+                        .unwrap_or(0);
+                    let v = match ov {
+                        StackOverride::Bytes(n) => n,
+                        _ if inline_mode == 2 => rg,
+                        _ => rg + u64::from(pipe_cfg.MaxTraceRecursionDepth) * callee_max,
+                    };
+                    unsafe { props.SetPipelineStackSize(v) };
+                    eprintln!(
+                        "dxr stack: SetPipelineStackSize({v}) — FR_DXR_STACK armed \
+                         (driver default {pipe_default})"
+                    );
+                }
             }
         }
 
@@ -1679,6 +1826,36 @@ mod mode3_shader_source_tests {
                 );
             }
         }
+    }
+
+    /// FR_BALLAST=dxr:N (the knee-vs-knee host comparison): dxr.hlsl must
+    /// carry exactly reference.hlsl's three ballast blocks — seed, loop
+    /// recurrence, dead fold — each under the COMPOUND guard that confines
+    /// them to the mode-2 arm (a seed compiled without its update would
+    /// "measure" a flat curve), every `ballast` use inside a guard, and the
+    /// fold branch-dead on the spp sentinel.
+    #[test]
+    fn dxr_ballast_confined_and_fold_branch_dead() {
+        const GUARD: &str = "#if defined(BALLAST_N) && (BALLAST_N > 0) && \
+                             defined(DXR_INLINE_SEC) && (DXR_INLINE_SEC == 2)";
+        // The literal above is wrapped for rustfmt; rebuild the one-line form
+        // the shader actually carries.
+        let guard = GUARD.split_whitespace().collect::<Vec<_>>().join(" ");
+        let n_guards = DXR_HLSL.matches(guard.as_str()).count();
+        assert_eq!(n_guards, 3, "dxr.hlsl must carry exactly the 3 ballast blocks");
+        for (i, _) in DXR_HLSL.match_indices("ballast") {
+            let g = DXR_HLSL[..i]
+                .rfind(guard.as_str())
+                .expect("ballast text before any compound BALLAST_N guard");
+            assert!(
+                !DXR_HLSL[g..i].contains("#endif"),
+                "ballast use at byte {i} escaped its guard"
+            );
+        }
+        assert!(
+            DXR_HLSL.contains("if (spp == 0xdeadu)"),
+            "the dead fold must branch on the spp sentinel"
+        );
     }
 
     /// The record's miss convention is `t < 0` (miss_hit's wire format);

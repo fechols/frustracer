@@ -102,6 +102,19 @@ void raygen() {
     // the ~1/N variance the upscaler wants, not the quadtree amortization the
     // --cpu/--gpu paths get.
     float3 csum = 0.0;
+#if defined(BALLAST_N) && (BALLAST_N > 0) && defined(DXR_INLINE_SEC) && (DXR_INLINE_SEC == 2)
+    // FR_BALLAST=dxr:N — reference.hlsl's ballast, mirrored into the mode-2
+    // raygen (identical code, identical compiled width — FR_WIDTH reads 16
+    // for both on the B70), so the two knee curves' offset measures what the
+    // RT launch regime confiscates, in floats. Same three-part liveness
+    // argument as reference.hlsl's blocks: fold branch-dead on a cbuffer
+    // value, loop recurrence consuming the traced t, [unroll] compile-time
+    // indices. The compound guard confines all three blocks to the mode-2
+    // arm — a ballast whose update compiled out would "measure" a flat curve.
+    float ballast[BALLAST_N];
+    [unroll] for (uint bi = 0u; bi < BALLAST_N; ++bi)
+        ballast[bi] = float(bi + 1u) * 0.618034 + float(id.x * 7919u + id.y) * 1e-6;
+#endif
     for (uint s = 0u; s < spp; ++s) {
         uint rng = rng_init(id.x, id.y, frame, s);
         float2 sp = sample_pos(id.x, id.y, s, rng);
@@ -142,6 +155,12 @@ void raygen() {
 #ifndef ABL_NO_FF_CODE
         if (flags & FLAG_FIREFLIES)
             col += ff_glow(cam_origin.xyz, dir, t, pixel_cone * 0.5);
+#endif
+#if defined(BALLAST_N) && (BALLAST_N > 0) && defined(DXR_INLINE_SEC) && (DXR_INLINE_SEC == 2)
+        // The recurrence — every element loop-carried across the next
+        // iteration's trace_closest (reference.hlsl's update, verbatim).
+        [unroll] for (uint bi = 0u; bi < BALLAST_N; ++bi)
+            ballast[bi] = ballast[bi] * 1.0000001 + (t + float(bi)) * 1e-30;
 #endif
         csum += col;
         if (s == probe_sample) {
@@ -184,6 +203,15 @@ void raygen() {
 #endif // DXR_INLINE_SEC == 2
     }
     float3 c = csum * (1.0 / float(spp));
+#if defined(BALLAST_N) && (BALLAST_N > 0) && defined(DXR_INLINE_SEC) && (DXR_INLINE_SEC == 2)
+    // Never true — write_cb clamps spp to 1..=MAX_SPP — but the compiler
+    // cannot prove that, so the array is not dead (reference.hlsl's fold).
+    if (spp == 0xdeadu) {
+        float bacc = 0.0;
+        [unroll] for (uint bi = 0u; bi < BALLAST_N; ++bi) bacc += ballast[bi];
+        c += bacc;
+    }
+#endif
 
     uint i3 = pi * 3u;
     // splat: frame 0 (or non-accumulating) stores — the implicit clear.
