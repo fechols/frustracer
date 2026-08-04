@@ -11117,6 +11117,37 @@ fn run_spin_gpu(
         peak_ms,
         timed as u64,
     );
+    // Terminal-structure accounting (wavefront only; the reference kernel and
+    // DXR never bind counters). One readback AFTER the loop, so no timed
+    // frame pays a stall. Counters reset per producing frame in cs_seed, so
+    // this is the LAST frame's tile/pixel partition — valid on a replaying
+    // still run too, since cs_seed_replay preserves the terminal slots
+    // (CTR_LEAF/CTR_SKY/CTR_CUT/CTR_SKY_PX). sky-px is the empty-space
+    // proof's product: pixels resolved with ZERO rays.
+    if hybrid {
+        if let Arm::Wave(tg) = &armv {
+            let ua = windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            match hg.read_buffer(&tg.counters, ua, gpu::trace::CTR_COUNT as usize * 4) {
+                Ok(b) => {
+                    let c: Vec<u32> = b
+                        .chunks_exact(4)
+                        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                        .collect();
+                    let sky_px = c[gpu::trace::CTR_SKY_PX as usize] as u64;
+                    eprintln!(
+                        "spin accounting (last frame): leaf-tiles {} | sky-tiles {} | sky-px {} ({:.1}% of {}x{})",
+                        c[gpu::trace::CTR_LEAF as usize],
+                        c[gpu::trace::CTR_SKY as usize],
+                        sky_px,
+                        sky_px as f64 * 100.0 / (rw as f64 * rh as f64),
+                        rw,
+                        rh,
+                    );
+                }
+                Err(e) => eprintln!("spin accounting: counter readback failed: {e}"),
+            }
+        }
+    }
     gpu::gputime::report();
     0
 }
@@ -14185,6 +14216,22 @@ fn vendor_defaults(opts: &mut Opts, vendor: gpu::adapter::Vendor) {
     // basis is no longer the narrowed feature-grounds argument alone; the
     // perf grounds are back. The README's world FPS table (~65%) is the
     // end-to-end face of the same numbers.
+    //
+    // 2026-08-03 RE-JUSTIFICATION + THE DXR-3 TEST OF IT. The mechanism
+    // attribution campaign (see CLAUDE.md's dxr-inline block) showed the
+    // Intel gap was never "RT cores weak / empty-space proving" — it is Arc
+    // executing a FAT SHADER hosted in an RT pipeline stage at 3-4.5x its
+    // compute cost (FR_ABL=nosec collapses mode-1 DXR 2.395 -> 0.478,
+    // BELOW the compute reference's 0.604; t_start measured worth exactly
+    // 0.000). --dxr-inline 3 (thin CHS + deferred compute shade) was built
+    // to test whether that tax was the WHOLE story: it is now the best DXR
+    // arm on Arc (spin default 2.51 -> 1.39; THE WORLD span 5.09 -> 4.73,
+    // thin dxr-rays 0.54 vs 2.87) — but the deferred kernel itself pays the
+    // Arc compute-codegen tax next (dxr-shade 1.124 vs the reference
+    // kernel's 0.603 for strictly more work), so the wavefront still wins
+    // everywhere on Arc (0.745 spin / 3.25 world) and THIS ENTRY STANDS,
+    // now on measured perf again, not only features. Re-run the flip
+    // arithmetic if dxr-shade ever drops below the reference kernel.
     //
     // AMD: MEASURED, and it keeps the cross-vendor DXR default — so there is
     // no arm for it below. This paragraph used to say "RDNA has no measurement

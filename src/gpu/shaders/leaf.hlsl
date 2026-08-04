@@ -123,16 +123,26 @@ void cs_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
         // beats a plain per-pixel reference (Intel, see trace::WIDE_LEVELS and
         // the --spp cost model), the inherited bound explains only 7-21% of
         // that advantage; the rest is tiles proven empty tracing NO rays.
-        // Re-run by making this a 0.0 and rebuilding.
+        // Re-run via FR_ABL=tzero (trace::abl_defs) — no source edit needed.
+        // 2026-08-03 re-measure (B70, driver 8805, LEAF_TILE 32): worth
+        // EXACTLY 0.000 ms — spin default 0.743 vs 0.743/0.742, and THE
+        // WORLD's leaf+sky 1.207 vs 1.215 (inside the window IQR). The bound
+        // is free and buys nothing; the 2026-07 "+1.1..1.7%" above was taken
+        // at the (8,32) frontier and is superseded on this hardware.
+#ifdef ABL_TZERO
+        const float t_seed = 0.0;
+#else
+        const float t_seed = rec.t_start;
+#endif
 #ifdef SW_RAYS_LEAF
         // Software simulation of the proposed hardware seam: the ray stage
         // consumes an opaque, beam-produced traversal frontier. It cannot
         // inspect the cut arena or BVH ids. --no-cut-rays leaves this define
         // absent and gives the same SW intersector a root traversal instead.
         if (trace_closest_frontier(rec.frontier, cam_origin.xyz, dir,
-                                   rec.t_start, FLT_MAX, hit)) {
+                                   t_seed, FLT_MAX, hit)) {
 #else
-        if (trace_closest(cam_origin.xyz, dir, rec.t_start, FLT_MAX, hit)) {
+        if (trace_closest(cam_origin.xyz, dir, t_seed, FLT_MAX, hit)) {
 #endif
 #ifdef LEAF_NO_FB
             {

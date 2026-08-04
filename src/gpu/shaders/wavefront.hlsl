@@ -65,7 +65,7 @@ void cs_seed(uint3 id : SV_DispatchThreadID) {
 [numthreads(1, 1, 1)]
 void cs_seed_replay(uint3 id : SV_DispatchThreadID) {
     for (uint i = 0; i < CTR_COUNT; ++i) {
-        bool keep = i == CTR_LEAF || i == CTR_SKY || i == CTR_CUT;
+        bool keep = i == CTR_LEAF || i == CTR_SKY || i == CTR_CUT || i == CTR_SKY_PX;
         if (!keep) counters[i] = 0;
     }
 }
@@ -418,6 +418,9 @@ void level_finish(TileRec rec, uint2 p0, uint2 p1, uint depth, uint cut_len, TF 
     if (best == FLT_MAX) {
         // Sky: the whole frustum (beyond the inherited ball, which the
         // ancestor claim covers) is empty.
+        // Stat: the rect's pixel area — the empty-space proof's product
+        // (pixels that will trace ZERO rays). Wave-uniform slot, per-lane n.
+        ctr_add(CTR_SKY_PX, (p1.x - p0.x) * (p1.y - p0.y));
         s = ctr_add(CTR_SKY, 1u);
         if (s < cap_sky) {
             SkyRec sky;

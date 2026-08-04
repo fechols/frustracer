@@ -3237,12 +3237,18 @@ impl GpuContext {
             }
         }
         let ok = false_sky == 0 && overshoot == 0 && extra == 0 && sentinel == 0;
+        // sky-px: the empty-space proof's product (pixels resolved with ZERO
+        // rays) as a fraction of the frame — the C key is the only way to
+        // read it for a scene --spin can't load (THE WORLD).
+        let sky_px = u(&ctrs, trace::CTR_SKY_PX as usize) as u64;
         Ok(format!(
-            "gpu verify ({px} px): false-sky {false_sky} | tmin-overshoot {overshoot} | hybrid-extra {extra} | unwritten {sentinel} | max rel t err {max_rel:.2e} | tiles: {} splits, {} sky, {} leaves, {} blocked -> {}",
+            "gpu verify ({px} px): false-sky {false_sky} | tmin-overshoot {overshoot} | hybrid-extra {extra} | unwritten {sentinel} | max rel t err {max_rel:.2e} | tiles: {} splits, {} sky, {} leaves, {} blocked | sky-px {} ({:.1}%) -> {}",
             u(&ctrs, trace::CTR_SPLIT as usize),
             u(&ctrs, trace::CTR_SKY as usize),
             u(&ctrs, trace::CTR_LEAF as usize),
             u(&ctrs, trace::CTR_BLOCKED as usize),
+            sky_px,
+            sky_px as f64 * 100.0 / px as f64,
             if ok { "OK" } else { "FAILED" },
         ))
     }

@@ -20,6 +20,36 @@
 // lap shades with its own sampled ambient (the CPU forces fb OFF past depth
 // 0).
 
+// Dev cost-attribution ablations (FR_ABL=noshadow|noao|norefl|noglass|nosec —
+// trace::abl_defs): neutralize ONE secondary-ray consumer's TRAVERSAL while
+// keeping every rng draw and all control flow (shade.rs::Abl's discipline —
+// the delta prices the rays and nothing else). Cost probes, never levers: the
+// image changes by design (the nogbuf class). They reach every unit that
+// pastes this file — leaf, reference, AND the DXR library — which is what
+// makes a primary-vs-secondary split inside the one opaque DispatchRays
+// region measurable at all. The off arm of every wrapper is the verbatim
+// call, so an unarmed session compiles byte-identical sources.
+#if defined(ABL_NOSEC) || defined(ABL_NOSHADOW)
+#define ABL_TQ_SHADOW(o, d, t0, t1) (float3(1.0, 1.0, 1.0))
+#else
+#define ABL_TQ_SHADOW(o, d, t0, t1) transmit_q(o, d, t0, t1)
+#endif
+#if defined(ABL_NOSEC) || defined(ABL_NOAO)
+#define ABL_TQ_AO(o, d, t0, t1) (float3(1.0, 1.0, 1.0))
+#else
+#define ABL_TQ_AO(o, d, t0, t1) transmit_q(o, d, t0, t1)
+#endif
+#if defined(ABL_NOSEC) || defined(ABL_NOREFL)
+#define ABL_TRACE_REFL(o, d, t0, t1, h) false
+#else
+#define ABL_TRACE_REFL(o, d, t0, t1, h) trace_closest(o, d, t0, t1, h)
+#endif
+#if defined(ABL_NOSEC) || defined(ABL_NOGLASS)
+#define ABL_TRACE_GLASS(o, d, t0, t1, h) false
+#else
+#define ABL_TRACE_GLASS(o, d, t0, t1, h) trace_closest(o, d, t0, t1, h)
+#endif
+
 // t0 (bvh nodes) and t1 (tri_idx) belong to the frustum kernels.
 StructuredBuffer<float3> positions : register(t2);
 StructuredBuffer<float3> normals   : register(t3);
@@ -566,7 +596,7 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                     // transmit_q (shade.rs's tinted-shadows twin): the back
                     // ray carries a tint through glass; ONE when clear, so
                     // `x * 1.0` keeps opaque scenes bitwise.
-                    float3 back_vis = transmit_q(p - n * (2.0 * SCENE_EPS), wi, 0.0, INF);
+                    float3 back_vis = ABL_TQ_SHADOW(p - n * (2.0 * SCENE_EPS), wi, 0.0, INF);
                     if (any(back_vis != 0.0)) {
                         direct_t += sun_e.xyz * (-ndl) * back_vis;
                     }
@@ -577,7 +607,7 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
             // occludes it. transmit_q: the sun ray carries a tint through
             // glass (tinted shadows); the throughput rides `li`, so the
             // GGX/sheen terms inherit it componentwise (shade.rs).
-            float3 vis_t = transmit_q(p, wi, 0.0, INF);
+            float3 vis_t = ABL_TQ_SHADOW(p, wi, 0.0, INF);
             if (any(vis_t != 0.0)) {
                 float3 li = sun_e.xyz * ndl * vis_t;
                 direct_d += li;
@@ -658,7 +688,7 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                 float fe = FF_E_K * ff_scale * ff_scale * ff[fi].w
                            / max(fd2, ff_rmin2) * (fx * fx);
                 if (fe <= 0.0) continue;
-                float3 fvis = transmit_q(p, fwi, 0.0, max(fdist - 2.0 * SCENE_EPS, 0.0));
+                float3 fvis = ABL_TQ_SHADOW(p, fwi, 0.0, max(fdist - 2.0 * SCENE_EPS, 0.0));
                 if (all(fvis == 0.0))
                     continue;
                 float3 fli = FF_COLOR * (fe * fndl) * fvis;
@@ -779,7 +809,7 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                     // divide keeps 3.0/3.0 == 1.0 and 0.0/3.0 == 0.0 exact —
                     // opaque scenes accumulate the old integer counts
                     // bit-identically.
-                    float3 tp = transmit_q(p, cosine_dir(n, at1, at2, r1, r2), 0.0, AO_RADIUS);
+                    float3 tp = ABL_TQ_AO(p, cosine_dir(n, at1, at2, r1, r2), 0.0, AO_RADIUS);
                     open += (tp.x + tp.y + tp.z) / 3.0;
                 }
                 ao = open / float(n_ao);
@@ -852,7 +882,7 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                     (1.0 + lambda_v) / (1.0 + lambda_v + ggx_lambda(rdl, ax, ay));
                 float3 rtput = tput * schlick(f0, max(dot(v, h), 0.0)) * g2_over_g1;
                 HitInfo rh;
-                if (trace_closest(p, rdir, 0.0, FLT_MAX, rh)) {
+                if (ABL_TRACE_REFL(p, rdir, 0.0, FLT_MAX, rh)) {
                     prim.spec_t = rh.t; // depth 0 == the captured surface
                     nx_o = p;
                     nx_d = rdir;
@@ -950,7 +980,7 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                 // the albedo the classifier lifts toward white).
                 float3 t_tput = tput * trans_tint_or(mat, albedo) * ttw;
                 HitInfo th;
-                if (trace_closest(torig, tdir, 0.0, FLT_MAX, th)) {
+                if (ABL_TRACE_GLASS(torig, tdir, 0.0, FLT_MAX, th)) {
                     // Beer–Lambert over the interior segment (shade.rs's
                     // depth_attenuation twin — the flattened DFS folds it
                     // into the child's THROUGHPUT, since the child hit is

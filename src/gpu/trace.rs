@@ -184,7 +184,12 @@ pub const CTR_TRANS_PASS: u32 = 20;
 pub const CTR_FRONTIER_HANDLES: u32 = 21;
 pub const CTR_FRONTIER_RAYS: u32 = 22;
 pub const CTR_FRONTIER_ENTRIES: u32 = 23;
-pub const CTR_COUNT: u32 = 24;
+/// Pixels inside proven-empty sky rects (zero rays traced) — the empty-space
+/// proof's product as a per-frame pixel count. Part of the TERMINAL structure
+/// (the qsky rect-area sum), so `cs_seed_replay` preserves it with
+/// CTR_LEAF/CTR_SKY/CTR_CUT.
+pub const CTR_SKY_PX: u32 = 24;
+pub const CTR_COUNT: u32 = 25;
 
 /// queues.hlsli::LeafRec's stride — the qleaf allocation and main.rs's
 /// check-gpu readback move in lockstep with the HLSL struct through this one
@@ -3159,7 +3164,8 @@ fn abl_has(tag: &str) -> bool {
 /// dead one), but keep the list current.
 const ABL_GPU_TAGS: &[&str] = &[
     "sunt", "rough", "nogbuf", "nopack", "nowave", "noelcull", "noffcode", "noelcode", "oldcut",
-    "nobatch", "nocandtmin", "noalpha", "noheight", "notrans",
+    "nobatch", "nocandtmin", "noalpha", "noheight", "notrans", "tzero", "noshadow", "noao",
+    "norefl", "noglass", "nosec",
 ];
 
 /// One loud line per process when FR_ABL is set at all — the GPU twin of
@@ -3300,6 +3306,23 @@ pub(crate) fn abl_defs() -> String {
         // correct: noelcode is a GPU code-presence probe, not a cull-policy
         // flip.)
         ("noelcode", "ABL_NO_EL_CULL"),
+        // The inherited-t_start lever (leaf.hlsl's long-standing source-edit
+        // ablation, made repeatable): leaf primaries trace from 0. Sound —
+        // t_start lower-bounds the nearest hit, so the same hit is found and
+        // only traversal is paid; --check-gpu passes with it armed.
+        ("tzero", "ABL_TZERO"),
+        // Secondary-ray cost probes, the GPU twins of shade.rs::Abl and the
+        // ONLY primary-vs-secondary scalpel inside the DXR pipeline's one
+        // opaque DispatchRays region: shade.hlsli neutralizes the TRAVERSAL
+        // at each consumer while keeping every rng draw and all control flow,
+        // so the delta prices the rays and nothing else. `nosec` arms all
+        // four (the OR lives in shade.hlsli's ABL_OFF_* block). Image changes
+        // by design — cost probes, never levers (the nogbuf class).
+        ("noshadow", "ABL_NOSHADOW"),
+        ("noao", "ABL_NOAO"),
+        ("norefl", "ABL_NOREFL"),
+        ("noglass", "ABL_NOGLASS"),
+        ("nosec", "ABL_NOSEC"),
     ] {
         if abl_has(tag) {
             out.push_str(&format!("#define {def} 1\n"));

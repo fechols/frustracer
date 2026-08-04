@@ -27,7 +27,8 @@
 #define CTR_FRONTIER_HANDLES 21u // non-root opaque handles consumed (once/leaf record)
 #define CTR_FRONTIER_RAYS    22u // primary ray samples reusing those handles
 #define CTR_FRONTIER_ENTRIES 23u // summed software-frontier widths
-#define CTR_COUNT        24u
+#define CTR_SKY_PX       24u // stat: pixels inside proven-empty sky rects (zero rays)
+#define CTR_COUNT        25u
 
 // Compile units that paste this file bind `counters` — rt.hlsli's cutout
 // loop keys its stat increment on this (the reference kernel and the DXR
