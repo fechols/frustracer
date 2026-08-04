@@ -202,6 +202,25 @@ void chs_shade(inout RayPayload p, in BuiltInTriangleIntersectionAttributes a) {
     if (flags & FLAG_HEIGHT)
         height_march(h.tri, WorldRayOrigin(), WorldRayDirection(), h.t, h.u, h.v);
 #endif
+#ifdef DXR_SBT_RECURSE
+    // A recursion-tagged continuation (--dxr-sbt 3, trace_shade): shade THIS
+    // surface at the payload's own depth and cone (the sp lanes, bit-punned),
+    // return the radiance, and touch NO side channel — the probe bit is 0 by
+    // construction, so the guard below skips them, but the early return also
+    // keeps the flow shape obvious. This invocation ran in the SURFACE'S OWN
+    // class record — the recursive dispatch is the SBT arithmetic, not code.
+    if ((p.prim & 0x80000000u) != 0u) {
+        PrimSurf psr;
+        float3 w3, o3, n3;
+        p.color = shade_split(WorldRayOrigin(), WorldRayDirection(), h, p.rng,
+                              shadow_samples, ao_samples, reflections != 0u, false,
+                              p.sp.y, pixel_cone, true, true,
+                              uint2(0xffffffffu, 0xffffffffu), w3, o3, n3, psr,
+                              asuint(p.sp.x));
+        p.t = h.t;
+        return;
+    }
+#endif
     PrimSurf ps;
     // Full emissive mask — no tile exists on this pipeline (see raygen).
     p.color = shade_full(WorldRayOrigin(), WorldRayDirection(), h, p.rng, uint2(0xffffffffu, 0xffffffffu), ps);
@@ -262,6 +281,18 @@ void miss_radiance(inout RayPayload p) {
 void miss_shadow(inout ShadowPayload p) {
     p.hit = 0u;
 }
+
+#ifdef DXR_SBT_RECURSE
+// The recursion continuations' miss (index 3): a SENTINEL, nothing more —
+// t = INF and the color untouched. The PARENT owns its miss arm (a
+// reflection miss needs the parent lobe's MIS weight, a glass miss the
+// fixed-phase sky), so computing any sky here would be wasted work at best
+// and a double count at worst.
+[shader("miss")]
+void miss_rec(inout RayPayload p) {
+    p.t = INF;
+}
+#endif
 
 [shader("miss")]
 void miss_hit(inout HitPayload p) {

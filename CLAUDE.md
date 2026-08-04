@@ -2068,8 +2068,36 @@ cargo run --release -- --dxr-sbt 1    # EXPERIMENT lever (default 0 = off): the 
                                       # channels at max |d| 7.6e-6 — noise-scale, which is why
                                       # that compare is REPORT-ONLY and the statistical suite
                                       # is specialization's gate: a mis-routed class strips a
-                                      # LIVE arm and blows T2's 2% loudly). Mode 3 (recursive
-                                      # class dispatch) is the next rung; unbuilt rungs
+                                      # LIVE arm and blows T2's 2% loudly). MODE 3 = RECURSIVE
+                                      # class dispatch: rung 2's records dispatched the way
+                                      # production titles feed the TSU — every reflection/
+                                      # glass continuation is a REAL TraceRay at
+                                      # RayContribution 0, so the hit instance's class*3
+                                      # contribution lands it in the hit surface's OWN
+                                      # specialized closest-hit (routing = SBT arithmetic,
+                                      # zero shader-side dispatch; rt_dxr.hlsli::trace_shade).
+                                      # shade_split's DXR_SBT_RECURSE arm collapses the lap
+                                      # loop to one iteration — the hardware ray stack
+                                      # replaces the stash; Beer–Lambert multiplies the
+                                      # RETURNED radiance (the CPU's own association); ind_s
+                                      # becomes the literal rtput*child_color; rng round-trips
+                                      # through the payload so the stream keeps the CPU DFS
+                                      # draw order; depth+cone ride the repurposed sp lanes
+                                      # (no payload growth past the 32 B config). HYBRID:
+                                      # shadow/AO occlusion stays inline RayQuery (rt.hlsli
+                                      # rides along; lib_6_5 + tier 1.1 or degrade to 2),
+                                      # which is what caps MaxTraceRecursionDepth at 5
+                                      # (primary 1 + refl 1 + the depth<TRANS_MAX_DEPTH=4
+                                      # chain's 3 — the pipe_cfg derivation; exceeding a
+                                      # declared depth is device removal, so the bound is
+                                      # soundness, not tuning). Continuation misses take the
+                                      # miss_rec SENTINEL (miss index 3 — the 4th record
+                                      # fills the SBT's [64,192) miss gap to the byte): t=INF
+                                      # and NO sky, because a reflection miss needs the
+                                      # PARENT lobe's MIS weight — the parent keeps its own
+                                      # miss arms. Arms only at --dxr-inline 0 (inline modes
+                                      # have no TraceRay continuations to redirect; asked-for
+                                      # anyway degrades to 2 loudly). Unbuilt/unarmed rungs
                                       # degrade loudly at DxrGpu construction. A dev MEASUREMENT
                                       # lever, the --sw-rays class: no vendor policy, no
                                       # settings row, loud on every armed mode, off-state
@@ -2110,6 +2138,22 @@ cargo run --release -- --dxr-sbt 1    # EXPERIMENT lever (default 0 = off): the 
                                       # reproduce accum/tbuf/info to the byte — and (b) the
                                       # mode-1 comparison, report-only (above). Both suites
                                       # pass armed on default/stress/SM-lp, NVIDIA + B70.
+                                      # `--check-dxr --dxr-inline 0 --dxr-sbt 3` gates mode 3
+                                      # the same way (armed rows REQUIRE the explicit
+                                      # --dxr-inline 0 — the parse default is 1 and headless
+                                      # never runs the vendor policy, so without it the row
+                                      # silently gates rung 2) — green on default/stress/
+                                      # SM-lp × NVIDIA + B70 + the GBV run. DEEP-CHAIN
+                                      # LIVENESS is pose-bound (the committed poses recurse
+                                      # only to depth 2 — the SM-lp default frame's drift
+                                      # report is bit-equal mode 2's, the tell): the glassware
+                                      # close-up (--cam 0.71,1.55,0.45,0.71,1.25,-0.35,
+                                      # SM-lp) is the depth-proof pose — radiance A/B 0.031%
+                                      # NV / 0.054% B70 with 444800 hit px of glass chains
+                                      # live and no depth violation; its exit 1 is ENTIRELY
+                                      # the documented mv_selftest close-up caveat (median
+                                      # 3.156 vs 0.17 limit, vendor-independent, pre-existing
+                                      # — read the log, not the exit code, at that pose).
                                       # ENVIRONMENT (2026-08-04): the AMD iGPU ("Radeon(TM)
                                       # Graphics", driver 32.0.21018.14) AVs 0xC0000005 inside
                                       # CreateStateObject/identifier query on ANY armed mode —

@@ -1615,8 +1615,9 @@ fn run_check_dxr(
                                 }
                             }
                             eprintln!(
-                                "check-dxr: dxr-sbt mode-2-vs-mode-1 ({px} px): {nd} of {} \
+                                "check-dxr: dxr-sbt mode-{}-vs-mode-1 ({px} px): {nd} of {} \
                                  accum channels differ | max |d| {mx:.2e} (report only)",
+                                dg.sbt_mode,
                                 px * 3
                             );
                         }

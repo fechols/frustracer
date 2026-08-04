@@ -45,7 +45,14 @@
 // payload structs + ray flags the DispatchRays stages still need (raygen's
 // primary TraceRay in mode 1; in mode 2 the chs_*/miss_*/ah_* entry points
 // are dead-but-exported and no ray can reach them).
-#ifndef DXR_INLINE_SEC
+// DXR_SBT_RECURSE (--dxr-sbt 3, gpu/dxr.rs) is the HYBRID paste: rt.hlsli
+// rides along for the inline-RayQuery occlusion primitives (shadow/AO rays
+// never re-enter the pipeline — that is what caps MaxTraceRecursionDepth at
+// 5), so tlas/HitInfo and the three TraceRay-flavor primitives below compile
+// out exactly as under the inline modes, and this file contributes the
+// payload structs + `trace_shade` — the recursive shading TraceRay the
+// class-sorted continuations ride.
+#if !defined(DXR_INLINE_SEC) && !defined(DXR_SBT_RECURSE)
 RaytracingAccelerationStructure tlas : register(t7);
 
 struct HitInfo {
@@ -120,11 +127,47 @@ struct HitPayload {
 #endif
 };
 
+// Recursive shading TraceRay (--dxr-sbt 3): the continuation fires at
+// RayContribution 0, so the instance's InstanceContributionToHitGroupIndex
+// (= class * 3, baked at upload) lands it in the HIT SURFACE'S OWN class
+// shading record — the per-class recursive dispatch IS the SBT arithmetic,
+// zero multipliers. The miss is miss_rec (index 3): t = INF and NOTHING
+// else — the PARENT owns its miss arm, because a reflection miss needs the
+// PARENT lobe's MIS weight and a glass miss the fixed-phase sky, neither of
+// which a miss shader can know. depth and the cone origin ride the sp lanes
+// (bit-punned — no payload growth past the 32 B config), prim carries only
+// the recursion tag (bit 31; probe bit 0, so the child CHS skips every
+// side channel through the existing guard). rng rides in AND back out —
+// the payload round-trip is what keeps the stream in the CPU DFS's exact
+// draw order.
+#ifdef DXR_SBT_RECURSE
+float3 trace_shade(float3 o, float3 d, inout uint rng, uint depth, float cone_o,
+                   out float t_out) {
+    RayDesc r;
+    r.Origin = o;
+    r.Direction = d;
+    r.TMin = height_tmin(0.0);
+    r.TMax = height_tmax(FLT_MAX);
+    RayPayload p;
+    p.color = float3(0.0, 0.0, 0.0);
+    p.t = INF;
+    p.rng = rng;
+    p.sp = float2(asfloat(depth), cone_o);
+    p.prim = 0x80000000u;
+    TraceRay(tlas, OPAQUE_RF, 0xffu, 0u, 0u, 3u, r, p);
+    rng = p.rng;
+    t_out = p.t;
+    return p.color;
+}
+#endif // DXR_SBT_RECURSE
+
 // The three TraceRay-flavor primitives. Compiled out under FR_DXR_INLINE —
 // rt.hlsli's inline RayQuery bodies (pasted above) serve shade.hlsli instead,
 // so every secondary runs inline inside chs_shade (mode 1) or raygen (mode 2)
-// and the SBT's HgHit/miss/occlusion machinery goes dead-but-exported.
-#ifndef DXR_INLINE_SEC
+// and the SBT's HgHit/miss/occlusion machinery goes dead-but-exported — and
+// under DXR_SBT_RECURSE, whose occlusion is inline (rt.hlsli again) and whose
+// closest continuations are trace_shade above, never these.
+#if !defined(DXR_INLINE_SEC) && !defined(DXR_SBT_RECURSE)
 
 // rt.hlsli::trace_closest, DispatchRays flavor — the reflection ray inside
 // shade_split. Hit group 1 records bare hit info: the lap loop shades the
@@ -207,4 +250,4 @@ float3 transmit_q(float3 o, float3 d, float tmin, float tmax) {
     return p.tint;
 }
 
-#endif // DXR_INLINE_SEC
+#endif // !DXR_INLINE_SEC && !DXR_SBT_RECURSE

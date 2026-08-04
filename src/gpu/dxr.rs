@@ -41,9 +41,11 @@ const IDENT: usize = D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as usize; // 32
 /// Table starts are 64-aligned (D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT);
 /// identifier-only records make the stride the 32-byte identifier itself.
 /// The hit-table RECORD COUNT is runtime since --dxr-sbt (3 off-lever,
-/// class-major 8×3 on the alias arm) — `DxrGpu::sbt_hit_records` snapshots
+/// class-major 8×3 on the armed rungs) — `DxrGpu::sbt_hit_records` snapshots
 /// it so the fill and DispatchRays cannot disagree; SBT_HIT itself never
-/// moves (192 stays 64-aligned, the miss table's 96 bytes fit beneath it).
+/// moves (192 stays 64-aligned, and the miss table fits beneath it at 96
+/// bytes — or at EXACTLY 128 under --dxr-sbt 3, whose 4th record, miss_rec,
+/// fills the [64, 192) gap to the byte).
 const SBT_MISS: usize = 64;
 const SBT_HIT: usize = 192;
 
@@ -203,9 +205,27 @@ pub(crate) fn dxr_inline_mode() -> u32 {
 ///       per class, but DXC reschedules the survivors — fp association
 ///       drift, tracked by report, gated statistically); rebuild-vs-rebuild
 ///       IS bit-exact and gated (T1d's determinism arm).
-///   3 — RECURSIVE class dispatch (Commit C): continuations TraceRay into
-///       their class's CHS. Modes not yet built degrade to the highest built
-///       rung with a loud line.
+///   3 — RECURSIVE class dispatch: rung 2's records, dispatched the way the
+///       TSU's sorter is fed in production titles — every reflection/glass
+///       continuation is a REAL `TraceRay` at RayContribution 0, so the hit
+///       instance's `class * 3` contribution lands it in the hit surface's
+///       OWN specialized closest-hit (the routing is SBT arithmetic, zero
+///       shader-side dispatch). The flattened DFS lap loop collapses to one
+///       iteration; the hardware ray stack replaces the stash
+///       (shade.hlsli's DXR_SBT_RECURSE arm — Beer–Lambert multiplies the
+///       RETURNED radiance, the CPU's own association; ind_s becomes the
+///       literal `rtput * child_color`; rng round-trips through the payload
+///       so the stream keeps the CPU DFS draw order; depth + cone ride the
+///       repurposed sp lanes, no payload growth). The HYBRID half: shadow/AO
+///       occlusion stays inline RayQuery (rt.hlsli rides along, lib_6_5 +
+///       tier 1.1 required — lesser devices degrade to 2), which caps
+///       MaxTraceRecursionDepth at 5 (see the pipe_cfg derivation). Misses
+///       of continuation rays hit the miss_rec SENTINEL (index 3, t = INF,
+///       no sky) because a reflection miss needs the PARENT lobe's MIS
+///       weight — the parent keeps its own miss arms. Arms only at
+///       --dxr-inline 0 (inline modes have no TraceRay continuations to
+///       redirect — asked-for anyway degrades to 2, loudly). A
+///       mode-0-descendant measurement arm, never a default candidate.
 /// Composition: the contribution only matters where hit-group records
 /// DISPATCH — every mode-0 TraceRay and the inline-0/1 primary; under
 /// `--dxr-inline 2` (zero TraceRay) the arm is VACUOUS, and under
@@ -423,17 +443,19 @@ impl DxrGpu {
 
         // --dxr-sbt snapshot (see the SBT_MODE doc). Degrades: to 0 when the
         // shared core carries no class partition (the lever must precede the
-        // upload — --no-blas-split, or a core cached before arming), and to
-        // the highest BUILT ladder rung (2 — specialization) when a later
-        // mode is asked for. The --dxr-inline 2 composition is VACUOUS (zero
-        // TraceRay ⇒ no record ever dispatches), and --dxr-inline 3 nearly
-        // so (only the thin bare-hit record dispatches — the SHADING records
-        // this ladder sorts never run; per-class HgHit copies share one
-        // identifier, one sort key) — both runnable for matrix hygiene, said
-        // loudly. Snapshotted once like inline_mode — reading the LOCAL,
-        // post-degrade binding (the heightfield-Intel arm above can move
-        // 3 → 1) — so a mid-process A/B can never desync the RTPSO from its
-        // SBT.
+        // upload — --no-blas-split, or a core cached before arming); mode 3
+        // to 2 when the inline mode isn't 0 (recursive dispatch is the
+        // all-TraceRay pipeline's descendant — inline modes have no TraceRay
+        // continuations to redirect) or the device lacks tier 1.1/SM 6.5
+        // (the hybrid's inline occlusion needs RayQuery in a lib target).
+        // The --dxr-inline 2 composition is VACUOUS (zero TraceRay ⇒ no
+        // record ever dispatches), and --dxr-inline 3 nearly so (only the
+        // thin bare-hit record dispatches — the SHADING records this ladder
+        // sorts never run; per-class HgHit copies share one identifier, one
+        // sort key) — both runnable for matrix hygiene, said loudly.
+        // Snapshotted once like inline_mode — reading the LOCAL, post-degrade
+        // binding (the heightfield-Intel arm above can move 3 → 1) — so a
+        // mid-process A/B can never desync the RTPSO from its SBT.
         let sbt_mode = {
             let m = dxr_sbt_mode();
             if m == 0 {
@@ -446,12 +468,26 @@ impl DxrGpu {
                 );
                 0
             } else {
-                let built = m.min(2);
-                if m > built {
+                let mut built = m.min(3);
+                if built == 3 && inline_mode != 0 {
                     eprintln!(
-                        "dxr-sbt: mode {m} is a later ladder rung (recursive class dispatch \
-                         — not built yet) — running mode {built} (specialized records)"
+                        "dxr-sbt: mode 3 (recursive class dispatch) descends from the \
+                         all-TraceRay pipeline — --dxr-inline {inline_mode} has no TraceRay \
+                         continuations to redirect; running mode 2 (specialized records). \
+                         Pass --dxr-inline 0 to arm it"
                     );
+                    built = 2;
+                }
+                if built == 3 {
+                    let caps = trace::query_caps(device)?;
+                    if caps.rt_tier < D3D12_RAYTRACING_TIER_1_1.0 || caps.shader_model < 0x65 {
+                        eprintln!(
+                            "dxr-sbt: mode 3's inline-occlusion hybrid needs RT tier 1.1 + \
+                             SM 6.5 (device: tier {}, SM 0x{:x}) — running mode 2",
+                            caps.rt_tier, caps.shader_model
+                        );
+                        built = 2;
+                    }
                 }
                 if inline_mode == 2 {
                     eprintln!(
@@ -482,10 +518,16 @@ impl DxrGpu {
                             .count()
                     });
                     eprintln!(
-                        "dxr-sbt: mode 2 — {} class records, {live} specialized \
-                         librar{} + the uber fallback (strip-defines folded per class)",
+                        "dxr-sbt: mode {built} — {} class records, {live} specialized \
+                         librar{} + the uber fallback (strip-defines folded per class{})",
                         crate::shadeclass::N_CLASSES * 3,
-                        if live == 1 { "y" } else { "ies" }
+                        if live == 1 { "y" } else { "ies" },
+                        if built == 3 {
+                            "; continuations TraceRay into their class's CHS, occlusion \
+                             inline, MaxTraceRecursionDepth 5"
+                        } else {
+                            ""
+                        }
                     );
                 }
                 built
@@ -548,16 +590,28 @@ impl DxrGpu {
         // compile out under DXR_INLINE_SEC. The two cache defines ride in every
         // mode (the shipping sequence now carries them; mode 0 stays
         // byte-identical ACROSS inline modes, the lever's actual contract).
+        // --dxr-sbt 3 (recurse — arms only at inline 0, the snapshot's
+        // degrade) is the HYBRID paste: rt.hlsli rides along for INLINE
+        // occlusion (shadow/AO rays never re-enter the pipeline, which is
+        // what caps the recursion at 5) while DXR_SBT_RECURSE reshapes
+        // rt_dxr.hlsli (tlas/HitInfo/TraceRay primitives out, trace_shade in)
+        // and shade_split's continuations (recursive TraceRay in place of the
+        // lap loop). An unarmed sbt mode leaves every push identical — the
+        // mode-0 byte-identity contract holds across the WHOLE ladder.
+        let recurse = sbt_mode == 3;
         let inline_def = format!("#define DXR_INLINE_SEC {inline_mode}");
         let mut parts = vec![defs.as_str(), sd, cloud_defs.as_str()];
         if inline_mode > 0 {
             parts.push(inline_def.as_str());
         }
+        if recurse {
+            parts.push("#define DXR_SBT_RECURSE 1");
+        }
         parts.push(trace::TRACE_COMMON_HLSLI);
         // skylod.hlsli after trace_common (needs sky_compose/sky_backdrop/rw); no
         // SKY_UNIT — this unit pastes no queues.hlsli, so u5 is free anyway.
         parts.push(trace::SKYLOD_HLSLI);
-        if inline_mode > 0 {
+        if inline_mode > 0 || recurse {
             parts.push(trace::RT_HLSLI);
         }
         parts.extend([
@@ -567,7 +621,10 @@ impl DxrGpu {
             DXR_HLSL,
         ]);
         let lib_src = parts.join("\n");
-        let lib_target = if inline_mode > 0 { "lib_6_5" } else { "lib_6_3" };
+        // rt.hlsli's RayQuery in a library target needs SM 6.5 — the inline
+        // modes' floor, and mode 3's (the snapshot degraded to 2 if the
+        // device lacks it).
+        let lib_target = if inline_mode > 0 || recurse { "lib_6_5" } else { "lib_6_3" };
         let dxil = dxc.compile(&lib_src, "", lib_target, "dxr library", debug)?;
         // --dxr-sbt 2: one SPECIALIZED library per PRESENT class (k ≠ uber) —
         // shadeclass::strip_defines(k) prepended to the IDENTICAL source, so
@@ -736,6 +793,12 @@ impl DxrGpu {
             if non_opaque {
                 v.extend(["ah_shade", "ah_hit", "ah_shadow"]);
             }
+            // Mode 3's continuation-miss sentinel (miss index 3) — the shader
+            // only exists in source under DXR_SBT_RECURSE, so exporting it in
+            // any other mode would fail CreateStateObject.
+            if recurse {
+                v.push("miss_rec");
+            }
             v.into_iter().map(wname).collect()
         };
         let mut exports: Vec<D3D12_EXPORT_DESC> = Vec::new();
@@ -874,8 +937,23 @@ impl DxrGpu {
         // TraceRay is raygen's primary (mode 1) or none at all (mode 2 —
         // depth 1 stays declared: 0 is legal but is a separate micro-variant,
         // not worth a DispatchRays-validation seam until mode 2 shows a win).
+        // --dxr-sbt 3 makes the continuations REAL payload recursion, and the
+        // depth derives from the CPU policy the lap arithmetic encodes:
+        // raygen's primary (1) → the depth-0 reflection (2) → that surface's
+        // transmission chain, which fires while depth < TRANS_MAX_DEPTH = 4,
+        // i.e. from surfaces at depths 1, 2, 3 (+3) = 5; the root's own chain
+        // reaches the same 5 without the reflection hop. Occlusion is inline
+        // RayQuery (the hybrid), so shadow/AO rays add NOTHING — exceeding
+        // the declared depth is device removal, not an error, so this
+        // arithmetic is a soundness bound, not a tuning knob.
         let pipe_cfg = D3D12_RAYTRACING_PIPELINE_CONFIG {
-            MaxTraceRecursionDepth: if inline_mode > 0 { 1 } else { 2 },
+            MaxTraceRecursionDepth: if recurse {
+                5
+            } else if inline_mode > 0 {
+                1
+            } else {
+                2
+            },
         };
         let grs = D3D12_GLOBAL_ROOT_SIGNATURE {
             pGlobalRootSignature: unsafe { std::mem::transmute_copy(&root_sig) },
@@ -945,6 +1023,12 @@ impl DxrGpu {
         put(SBT_MISS, ident("miss_radiance")?);
         put(SBT_MISS + IDENT, ident("miss_shadow")?);
         put(SBT_MISS + 2 * IDENT, ident("miss_hit")?);
+        // Mode 3's continuation sentinel at miss index 3: 64 + 4·32 = 192 —
+        // the fourth record fills the miss region to EXACTLY SBT_HIT, no
+        // layout move (the const's own doc says the table fits beneath it).
+        if recurse {
+            put(SBT_MISS + 3 * IDENT, ident("miss_rec")?);
+        }
         let mut sbt_distinct_idents: u32 = 1;
         let mut sbt_required_idents: u32 = 1;
         if sbt_mode >= 1 {
@@ -1398,7 +1482,9 @@ impl DxrGpu {
                 },
                 MissShaderTable: D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE {
                     StartAddress: va + SBT_MISS as u64,
-                    SizeInBytes: (3 * IDENT) as u64,
+                    // 4 records under --dxr-sbt 3 (miss_rec, the continuation
+                    // sentinel at index 3 — trace_shade names it); 3 otherwise.
+                    SizeInBytes: (if self.sbt_mode == 3 { 4 } else { 3 } * IDENT) as u64,
                     StrideInBytes: IDENT as u64,
                 },
                 HitGroupTable: D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE {
@@ -1537,16 +1623,19 @@ mod mode3_shader_source_tests {
     }
 
     /// Modes 0-2 must preprocess to today's bytes: rt_dxr.hlsli keeps exactly
-    /// its two `#ifndef DXR_INLINE_SEC` guards (changing them double-defines
-    /// the trace primitives against rt.hlsli — the review finding), and the
-    /// HitPayload's mode-3 `inst` field sits behind the mode-3 guard.
+    /// its two tlas/primitive guards (changing them double-defines the trace
+    /// primitives against rt.hlsli — the review finding). The guard form is
+    /// `!defined(DXR_INLINE_SEC) && !defined(DXR_SBT_RECURSE)` since the
+    /// --dxr-sbt 3 hybrid ALSO pastes rt.hlsli (inline occlusion) — the same
+    /// double-define hazard from a second define, so both must key both.
+    /// The HitPayload's mode-3 `inst` field sits behind the mode-3 guard.
     #[test]
     fn rt_dxr_guards_intact_and_inst_guarded() {
         let src = RT_DXR_HLSLI;
         assert_eq!(
-            src.matches("#ifndef DXR_INLINE_SEC").count(),
+            src.matches("#if !defined(DXR_INLINE_SEC) && !defined(DXR_SBT_RECURSE)").count(),
             2,
-            "rt_dxr.hlsli's DXR_INLINE_SEC guards must stay exactly as shipped"
+            "rt_dxr.hlsli's tlas/primitive guards must key BOTH rt.hlsli-pasting defines"
         );
         let hp = src.find("struct HitPayload").expect("HitPayload missing");
         let hp_end = hp + src[hp..].find("};").expect("HitPayload unterminated");
@@ -1574,5 +1663,82 @@ mod mode3_shader_source_tests {
             );
         }
         assert!(arm.contains("hitrec[pi]"), "the thin arm must write the hit record");
+    }
+}
+
+#[cfg(test)]
+mod sbt_recurse_shader_source_tests {
+    use super::{trace, DXR_HLSL, RT_DXR_HLSLI};
+
+    /// The recursion's whole routing contract is ONE TraceRay line:
+    /// RayContribution 0 (the class-major triplet's SHADING slot — the
+    /// instance's `class * 3` contribution does the per-class dispatch, no
+    /// shader-side routing exists to get wrong) and MissShaderIndex 3 (the
+    /// miss_rec sentinel — a continuation must NEVER take miss_radiance's
+    /// display sky: a reflection miss needs the PARENT lobe's MIS weight).
+    #[test]
+    fn trace_shade_routes_contribution_zero_and_sentinel_miss() {
+        let src = RT_DXR_HLSLI;
+        let f = src.find("float3 trace_shade(").expect("trace_shade missing");
+        let body = &src[f..f + src[f..].find("\n}").expect("trace_shade unterminated")];
+        assert!(
+            body.contains("TraceRay(tlas, OPAQUE_RF, 0xffu, 0u, 0u, 3u, r, p)"),
+            "trace_shade must fire at RayContribution 0 with MissShaderIndex 3"
+        );
+        assert!(
+            body.contains("p.prim = 0x80000000u"),
+            "trace_shade must tag the payload as a recursion continuation (probe bit 0)"
+        );
+    }
+
+    /// BOTH continuation branches must recurse with depth + 1 — the
+    /// probe-reach lesson's shape: a define that rewires only one branch
+    /// leaves the other on the flattened lap loop, whose nx_* feeds are dead
+    /// under the single-lap recursion arm, i.e. that branch's radiance
+    /// silently vanishes. And the increment IS the recursion bound: the
+    /// depth-gated chain (depth < TRANS_MAX_DEPTH) is what keeps the
+    /// declared MaxTraceRecursionDepth = 5 sound — a dropped increment
+    /// recurses flat past it, which is device removal, not an error.
+    #[test]
+    fn both_continuations_recurse_with_incremented_depth() {
+        let src = trace::SHADE_HLSLI;
+        assert!(
+            src.contains("trace_shade(p, rdir, rng, depth + 1u, cone_w, rec_t)"),
+            "the reflection continuation must recurse at depth + 1"
+        );
+        assert!(
+            src.contains("trace_shade(torig, tdir, rng, depth + 1u, cone_w, trec_t)"),
+            "the transmission continuation must recurse at depth + 1"
+        );
+    }
+
+    /// miss_rec is a SENTINEL: t = INF and NOTHING else. A color write there
+    /// would double-count against the parent's own miss arms (the MIS-
+    /// weighted reflection sky / the fixed-phase glass sky).
+    #[test]
+    fn miss_rec_writes_only_the_sentinel() {
+        let src = DXR_HLSL;
+        let f = src.find("void miss_rec(").expect("miss_rec missing");
+        let body = &src[f..f + src[f..].find('}').expect("miss_rec unterminated")];
+        assert!(body.contains("p.t = INF"), "miss_rec must write the INF sentinel");
+        assert!(!body.contains("p.color"), "miss_rec must never write color");
+    }
+
+    /// chs_shade's recursion branch must be decided BEFORE the primary-path
+    /// shade_full call and must consume the payload's depth (sp.x, bit-punned)
+    /// — a branch after shade_full would shade continuations twice, and one
+    /// ignoring the depth would give every recursive surface the root policy
+    /// (reflection re-arming at every level: unbounded recursion again).
+    #[test]
+    fn chs_recursion_branch_precedes_primary_and_carries_depth() {
+        let src = DXR_HLSL;
+        let rec = src.find("p.prim & 0x80000000u").expect("chs recursion tag test missing");
+        let full = src.find("p.color = shade_full(").expect("chs primary shade_full missing");
+        assert!(rec < full, "the recursion branch must precede the primary shade_full path");
+        let arm = &src[rec..full];
+        assert!(
+            arm.contains("asuint(p.sp.x)"),
+            "the recursion branch must pass the payload's depth into shade_split"
+        );
     }
 }

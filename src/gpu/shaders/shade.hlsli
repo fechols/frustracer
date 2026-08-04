@@ -490,12 +490,25 @@ void glass_snell(float3 rd, float3 v, float3 ns, float3 n, float3 hit_p,
 // culled light would have failed every pixel's own d2 >= r_infl2 test, so
 // any conservative mask shades bit-identically — which is what keeps the
 // same-seed wavefront(culled)-vs-reference(full) A/B at 0.00e0.
+// DXR_SBT_RECURSE (--dxr-sbt 3, the DXR library only — no other unit defines
+// it): the flattened DFS below becomes a TRUE recursion. Both continuation
+// branches fire rt_dxr.hlsli's trace_shade — a TraceRay whose SBT arithmetic
+// lands the child in ITS OWN class's closest-hit — and consume the returned
+// radiance, so the lap loop degenerates to one iteration (next_set is never
+// set; the stash is dead code the compiler folds) and the hardware ray stack
+// replaces it. The invocation's own recursion depth arrives as `depth0`
+// (payload-carried), so the depth-0-only gates (refl_ray, the TRANS_MAX_DEPTH
+// chain bound) keep the CPU's exact policy per surface.
 float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                    uint n_shadow, uint n_ao, bool refl, bool split_ambient,
                    float cone_w0, float cone_spread, bool aniso, bool cam_lights,
                    uint2 el_mask,
                    out float3 amb_w, out float3 amb_o, out float3 amb_n,
-                   out PrimSurf prim) {
+                   out PrimSurf prim
+#ifdef DXR_SBT_RECURSE
+                   , uint depth0
+#endif
+) {
     amb_w = 0.0;
     amb_o = 0.0;
     amb_n = 0.0;
@@ -511,7 +524,11 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
     // children — reflection is depth-0-only). Max laps = 1 root +
     // TRANS_MAX_DEPTH reflection-branch nodes + TRANS_MAX_DEPTH root-chain
     // nodes = 9, the CPU's exact DFS order.
+#ifdef DXR_SBT_RECURSE
+    uint depth = depth0;
+#else
     uint depth = 0u;
+#endif
     bool have_stash = false;
     float3 st_o = 0.0, st_d = 0.0, st_tput = 0.0;
     HitInfo st_hit = (HitInfo)0;
@@ -945,6 +962,24 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                 float g2_over_g1 =
                     (1.0 + lambda_v) / (1.0 + lambda_v + ggx_lambda(rdl, ax, ay));
                 float3 rtput = tput * schlick(f0, max(dot(v, h), 0.0)) * g2_over_g1;
+#ifdef DXR_SBT_RECURSE
+                // Recursive class dispatch: the reflected surface shades in
+                // ITS OWN class's closest-hit (trace_shade — miss_rec hands
+                // back t = INF and NO sky, because the MIS weight below is
+                // THIS lobe's and only this invocation can compute it).
+                // ind_s = rtput × the child's whole returned radiance — the
+                // CPU's literal `tput * rcol`, one multiply at the return
+                // (the recursion's own fp association; the statistical
+                // suites absorb the reassociation vs the flattened fold).
+                float rec_t;
+                float3 rcol = trace_shade(p, rdir, rng, depth + 1u, cone_w, rec_t);
+                if (!isinf(rec_t)) {
+                    prim.spec_t = rec_t; // depth 0 == the captured surface
+                    float3 rc = rtput * rcol;
+                    total += rc;
+                    prim.ind_s += rc;
+                } else {
+#else
                 HitInfo rh;
                 if (ABL_TRACE_REFL(p, rdir, 0.0, FLT_MAX, rh)) {
                     prim.spec_t = rh.t; // depth 0 == the captured surface
@@ -956,6 +991,7 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                     next_set = true;
                     nx_in_refl = true; // everything below this is ind_s
                 } else {
+#endif
                     prim.spec_t = INF; // reflection missed (shade.rs)
                     // The BSDF-sampling half of the MIS pair. The DOME passes
                     // through un-weighted (only this strategy sees it); the DISC
@@ -1043,6 +1079,31 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                 // Tinted by the ONE tint source (trans_tint for water, else
                 // the albedo the classifier lifts toward white).
                 float3 t_tput = tput * trans_tint_or(mat, albedo) * ttw;
+#ifdef DXR_SBT_RECURSE
+                // Recursive: the chain continues in the child's own class
+                // CHS; Beer–Lambert multiplies the RETURNED radiance over
+                // the child's reported segment — the CPU's exact
+                // association ("multiplies the child's returned radiance"),
+                // where the flattened arm below folds it into the child's
+                // throughput instead. The miss arm is the parent's (fixed
+                // fixed-phase sky, unattenuated — CPU parity), never
+                // miss_rec's.
+                float trec_t;
+                float3 tcol = trace_shade(torig, tdir, rng, depth + 1u, cone_w, trec_t);
+                if (!isinf(trec_t)) {
+                    if ((entering || is_tir) && (flags & FLAG_DEPTH_TINT)) {
+                        t_tput *= pow(max(trans_tint_or(mat, albedo), 1e-6),
+                                      trec_t / (TRANS_DEPTH_K * SCENE_DIAG));
+                    }
+                    float3 tc = t_tput * tcol;
+                    total += tc;
+                    if (in_refl) prim.ind_s += tc;
+                } else {
+                    float3 tc = t_tput * sky_radiance(torig, tdir, cone_spread * 0.5, 0u, 0.5);
+                    total += tc;
+                    if (in_refl) prim.ind_s += tc;
+                }
+#else
                 HitInfo th;
                 if (ABL_TRACE_GLASS(torig, tdir, 0.0, FLT_MAX, th)) {
                     // Beer–Lambert over the interior segment (shade.rs's
@@ -1089,6 +1150,7 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                     total += tc;
                     if (in_refl) prim.ind_s += tc;
                 }
+#endif // !DXR_SBT_RECURSE (the flattened transmission arm)
             }
         }
 
@@ -1127,5 +1189,12 @@ float3 shade_full(float3 ro, float3 rd, HitInfo hit, inout uint rng, uint2 el_ma
     // Camera rays (and their reflection/glass continuations) resolve their
     // footprint anisotropically when the session asks for it — FLAG_ANISO.
     return shade_split(ro, rd, hit, rng, shadow_samples, ao_samples, reflections != 0u,
-                       false, 0.0, pixel_cone, true, true, el_mask, w, o, n, prim);
+                       false, 0.0, pixel_cone, true, true, el_mask, w, o, n, prim
+#ifdef DXR_SBT_RECURSE
+                       // The DEPTH-0 root: chs_shade's recursion-tagged
+                       // continuations bypass this entry and call shade_split
+                       // with the payload's own depth.
+                       , 0u
+#endif
+    );
 }
