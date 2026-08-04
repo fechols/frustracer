@@ -125,13 +125,22 @@ pub fn require_caps(device: &ID3D12Device) -> Result<()> {
 ///       hangs the device (GBV silent, 4090 clean) — degraded to mode 1 with
 ///       a loud line below; re-test on a newer driver.
 ///       COMPARISON-TARGET NOTE: vendor_defaults has since made mode 2 the
-///       Intel DXR default, so mode 2 is now D3's Arc bar. On the default
-///       scene the campaign's builds put D3 (1.39) below every recorded
-///       mode-2 sample (1.77/2.46 same-day, 1.41 July/8515); on stress and
-///       SM-lp the only mode-2 samples are July/8515 (1.22/1.29, BELOW D3's
-///       1.56) — that ordering is unmeasured on a current binary, and the
-///       mode-2 build lottery means it must be judged per binary, not from
-///       this table.
+///       Intel DXR default, so mode 2 is D3's Arc bar — and it was JUDGED
+///       PER BINARY on 2026-08-04 (the merged tree, B70, same binary both
+///       arms, ABBA reps repeating to ±0.01): D3 wins ONLY the default
+///       scene (span 1.40 vs 1.80, −22%); D2 wins stress (1.40 vs 1.44),
+///       SM-lp (1.94 vs 2.20), THE WORLD parked at the boot pose (4.93 vs
+///       5.08), and every spp=16 point by 26-85% (wall 13.45 vs 17.08
+///       default, 10.67 vs 19.74 stress — the per-sample pass pair vs the
+///       in-shader loop). The thin half works AS DESIGNED everywhere
+///       (dxr-rays 0.25/0.31/0.35/0.52 incl. the world's 2.70 → 0.52); the
+///       deferred kernel is the WHOLE loss (dxr-shade 1.12/1.10/1.81/2.35
+///       across default/stress/smlp/world vs the ~0.60 reference-kernel
+///       class) — so NO promotion, mode 2 keeps the Intel default, and
+///       `dxr-shade < reference` stays the bar. Note BOTH arms sit on
+///       codegen cliffs (this binary's D2 default drew 1.80 where earlier
+///       builds drew 1.41-2.46), so the per-scene ordering can flip with
+///       any rebuild — re-judge on the binary in hand, never from tables.
 /// Measured (--spin path 1080p spp=1, GPU frame span ms, default/stress/
 /// SM-lp): B70 mode 0 9.05/5.30/6.75 -> mode 1 2.35/1.64/1.94 -> mode 2
 /// 1.41/1.22/1.29; 4090 1.34/0.79/1.18 -> 0.26/0.25/0.34 -> 0.29/0.27/0.34.

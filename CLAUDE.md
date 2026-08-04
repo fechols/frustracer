@@ -1996,12 +1996,17 @@ cargo run --release -- --dxr-inline 0 # A/B lever: the DXR pipeline back on ALL-
                                       # 4090 passes the identical suite) — DxrGpu::new degrades
                                       # the combo to mode 1 with a loud line; re-test on newer
                                       # drivers. COMPARISON-TARGET NOTE: with mode 2 now the Intel
-                                      # DXR default, mode 2 is D3's Arc bar — on the default scene
-                                      # D3 (1.39) sits below every recorded mode-2 sample
-                                      # (1.77/2.46 same-day, 1.41 July/8515), but the only
-                                      # stress/SM-lp mode-2 samples are July/8515 (1.22/1.29,
-                                      # BELOW D3's 1.56) — unmeasured on a current binary; the D2
-                                      # lottery means judge it per binary, never across builds.
+                                      # DXR default, mode 2 is D3's Arc bar — JUDGED PER BINARY
+                                      # 2026-08-04 (merged tree, B70, same binary, ABBA ±0.01):
+                                      # D3 wins ONLY the default scene (span 1.40 vs 1.80, −22%);
+                                      # D2 wins stress (1.40 vs 1.44), SM-lp (1.94 vs 2.20), THE
+                                      # WORLD parked (4.93 vs 5.08), and every spp=16 point by
+                                      # 26-85%. The thin half works everywhere (dxr-rays
+                                      # 0.25-0.52, world 2.70 -> 0.52); the deferred kernel is
+                                      # the whole loss (dxr-shade 1.12/1.10/1.81/2.35 vs the
+                                      # ~0.60 reference class) — NO promotion, mode 2 keeps the
+                                      # Intel default, dxr-shade < reference stays the bar; both
+                                      # arms are lottery-prone, re-judge per binary.
                                       # Gates: --check-dxr --dxr-inline 3 green on
                                       # default/smlp/stress (B70) and smlp+relief (4090); 4 new
                                       # cargo-test source pins (miss-sentinel-before-consumers,
