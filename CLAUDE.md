@@ -2036,9 +2036,35 @@ cargo run --release -- --dxr-sbt 1    # EXPERIMENT lever (default 0 = off): the 
                                       # chs_shade — identical code, distinct sort keys, zero new
                                       # compiles — isolating the PURE record-sort/repack effect
                                       # (plus the sibling sub-chunk AABB overlap cost, the
-                                      # structural price of instance-keying). Modes 2 (class-
-                                      # specialized strip-define libraries) and 3 (recursive
-                                      # class dispatch) are the next ladder rungs; unbuilt rungs
+                                      # structural price of instance-keying). MODE 2 =
+                                      # SPECIALIZED records: one extra DXIL library per class
+                                      # PRESENT in the scene (k != uber), compiled with
+                                      # shadeclass::strip_defines(k) prepended — shade.hlsli
+                                      # gained SHADE_MAT_* macro seams over every material-
+                                      # feature guard whose #ifndef defaults ARE the verbatim
+                                      # expressions (all five pasting units stay semantically
+                                      # identical unarmed — the same-seed wavefront-vs-reference
+                                      # bit A/B is the drift tooth; REFL's seam carries the MIS
+                                      # coupling: refl_ray feeds the VNDF block AND the w_l
+                                      # reweight, so a strip keeps w_l=1 and light sampling
+                                      # delivers the whole sun specular, rng pair inside the
+                                      # gate so streams never need a burn). Each specialized
+                                      # library exports exactly {chs_shade_ck <- chs_shade};
+                                      # lib 0 aliases only uber + ABSENT classes (exported
+                                      # names are state-object-unique; ah_*/misses resolve
+                                      # cross-library). The identifier audit's REQUIRED set
+                                      # narrows to specialized ∪ uber, and a dedupe there fails
+                                      # HARD on every vendor (different libraries folding is a
+                                      # defect, not a quirk) — MEASURED 2026-08-04: NVIDIA
+                                      # mints DISTINCT identifiers for specialized libraries
+                                      # (3/3 default scene), so it genuinely joins the ladder
+                                      # at this rung; mode-2-vs-mode-1 accum drift is the
+                                      # predicted DXC-rescheduling class (default scene: ~1% of
+                                      # channels at max |d| 7.6e-6 — noise-scale, which is why
+                                      # that compare is REPORT-ONLY and the statistical suite
+                                      # is specialization's gate: a mis-routed class strips a
+                                      # LIVE arm and blows T2's 2% loudly). Mode 3 (recursive
+                                      # class dispatch) is the next rung; unbuilt rungs
                                       # degrade loudly at DxrGpu construction. A dev MEASUREMENT
                                       # lever, the --sw-rays class: no vendor policy, no
                                       # settings row, loud on every armed mode, off-state
@@ -2047,7 +2073,9 @@ cargo run --release -- --dxr-sbt 1    # EXPERIMENT lever (default 0 = off): the 
                                       # UPLOAD (a partition-free core degrades the pipeline to
                                       # the one-record SBT with one loud line); --dxr-inline 2
                                       # composition is VACUOUS (zero TraceRay dispatches no
-                                      # record) and says so. Gates: shadeclass::self_test (the
+                                      # record) and --dxr-inline 3 nearly so (only the thin
+                                      # bare-hit record dispatches — the sorted SHADING records
+                                      # never run), both said loudly. Gates: shadeclass::self_test (the
                                       # strip-soundness must-fire + all-8 anti-vacuity) and
                                       # blas_split's refine spec-replay + grow must-fire in
                                       # --check; `--check-dxr --dxr-sbt 1` adds T1d — the
@@ -2069,6 +2097,28 @@ cargo run --release -- --dxr-sbt 1    # EXPERIMENT lever (default 0 = off): the 
                                       # the routing wiring's real teeth arrive with rung 2:
                                       # under aliasing a mis-routed class is image-neutral by
                                       # construction; specialized records make it fail T2.
+                                      # `--check-dxr --dxr-sbt 2` swaps T1d's image arms (the
+                                      # off-core bit A/B cannot hold under rescheduling): (a)
+                                      # rebuild DETERMINISM, bit-exact and HARD — a second
+                                      # armed pipeline on the SAME core (partition identical
+                                      # across armed modes; only RTPSO/SBT differ) must
+                                      # reproduce accum/tbuf/info to the byte — and (b) the
+                                      # mode-1 comparison, report-only (above). Both suites
+                                      # pass armed on default/stress/SM-lp, NVIDIA + B70.
+                                      # ENVIRONMENT (2026-08-04): the AMD iGPU ("Radeon(TM)
+                                      # Graphics", driver 32.0.21018.14) AVs 0xC0000005 inside
+                                      # CreateStateObject/identifier query on ANY armed mode —
+                                      # mode 1 (Commit A code, single library) crashes
+                                      # identically, mode 0 passes, the SAME run passes under
+                                      # --gpu-debug (the debug layer masks it), and NVIDIA's
+                                      # debug layer validates the identical descs clean — so
+                                      # the driver chokes on ExportToRename itself, the
+                                      # pre-existing-iGPU-environment class (the spp-readback
+                                      # precedent). Deterministic (2/2 reps). The vendor
+                                      # rename triptych: NVIDIA dedupes, Intel mints distinct,
+                                      # this AMD iGPU crashes. Not coded around — the ladder
+                                      # is a dev lever and the iGPU is not a measurement
+                                      # target; re-probe when an RDNA4 discrete card returns.
 cargo run --release -- --check-dxr    # DXR pipeline gate suite (needs a real RT GPU + the DXC DLLs;
                                       # composes with --stress; exit 2 = environment, 1 = a gate failed)
 cargo run --release -- --dxc-path <d> # DXC DLL directory (default SDKs\dxc\bin\x64; or FRUSTRACER_DXC_PATH)

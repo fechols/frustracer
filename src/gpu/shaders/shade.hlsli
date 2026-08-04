@@ -399,6 +399,67 @@ void glass_snell(float3 rd, float3 v, float3 ns, float3 n, float3 hit_p,
 
 // --- The shade() port ----------------------------------------------------------
 
+// --dxr-sbt rung-2 SPECIALIZATION SEAMS (the SHADE_MAT_* macros): every
+// material-arm guard below routes through ONE overridable function-like
+// macro whose DEFAULT is the verbatim data expression — an unarmed compile
+// is therefore semantically identical in all five pasting units (the
+// wavefront/reference/hemi kernels never override these), and a
+// class-specialized DXR library (shadeclass::strip_defines) force-folds
+// exactly its provably-dead arms to (false)/(0.0). Soundness is the STRIPS
+// table's membership contract: a class only strips arms whose guards are
+// data-false for every member, so the fold removes code that never ran —
+// same image, fewer registers. Guard and dependents fold off the SAME
+// macro, lockstep by construction; float-valued seams return the field
+// (force (0.0)), bool-valued ones the predicate (force (false)).
+#ifndef SHADE_MAT_TEXKIND
+#define SHADE_MAT_TEXKIND(m) ((m).kind == MAT_TEXTURED)
+#endif
+#ifndef SHADE_MAT_MARBLE
+#define SHADE_MAT_MARBLE(m) ((m).kind == MAT_MARBLE)
+#endif
+#ifndef SHADE_MAT_NORMAL
+#define SHADE_MAT_NORMAL(m) ((m).normal_tex != TEX_NONE)
+#endif
+#ifndef SHADE_MAT_ROUGHTEX
+#define SHADE_MAT_ROUGHTEX(m) ((m).rough_tex != TEX_NONE)
+#endif
+#ifndef SHADE_MAT_METALTEX
+#define SHADE_MAT_METALTEX(m) ((m).metal_tex != TEX_NONE)
+#endif
+#ifndef SHADE_MAT_EMISTEX
+#define SHADE_MAT_EMISTEX(m) ((m).emissive_tex != TEX_NONE)
+#endif
+#ifndef SHADE_MAT_RIPPLE
+#define SHADE_MAT_RIPPLE(m) ((m).ripple_amp)
+#endif
+#ifndef SHADE_MAT_SHEEN
+#define SHADE_MAT_SHEEN(m) ((m).sheen)
+#endif
+#ifndef SHADE_MAT_TRANSLUCENCY
+#define SHADE_MAT_TRANSLUCENCY(m) ((m).translucency)
+#endif
+#ifndef SHADE_MAT_TRANSMISSION
+#define SHADE_MAT_TRANSMISSION(m) ((m).transmission)
+#endif
+#ifndef SHADE_MAT_ANISO
+#define SHADE_MAT_ANISO(m) ((m).anisotropy)
+#endif
+// THE MIS-COUPLED SEAM — the one-sky invariant's shipped-bug class: this
+// macro feeds BOTH the VNDF bounce block AND the direct loop's MIS reweight
+// (`refl_ray` is the one gate both read). Stripping the bounce without
+// forcing w_l = 1.0 would delete the light-sampled specular highlight;
+// routing both through ONE macro makes that split impossible. Classes may
+// strip it only when their predicate forces metallic <= 0.04 AND
+// roughness >= 0.45 (the gate's own expression) — and the rng pair draws
+// INSIDE the gate on both CPU and GPU, so the strip is same-seed
+// stream-identical, no burn.
+#ifndef SHADE_MAT_REFL
+#define SHADE_MAT_REFL(m) ((m).metallic > 0.04 || (m).roughness < 0.45)
+#endif
+#ifndef SHADE_MAT_EMISSIVE
+#define SHADE_MAT_EMISSIVE(m) (any((m).emissive != 0.0) || SHADE_MAT_EMISTEX(m))
+#endif
+
 // Whitted shading of a committed primary hit, reflection bounce included.
 // (ro, rd) is the ray that produced `hit`; rd unit-length. RNG draw order
 // matches shade.rs exactly per lap: shadow pairs, AO pairs, reflection pair.
@@ -470,16 +531,16 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
         // Cone width at this hit + the per-hit lod base term shared by every
         // map on this material (shade.rs's cone_w / lod_base pair).
         float cone_w = cone_o + hit.t * cone_spread;
-        bool mat_tex = mat.kind == MAT_TEXTURED || mat.normal_tex != TEX_NONE ||
-                       mat.rough_tex != TEX_NONE || mat.metal_tex != TEX_NONE ||
-                       mat.emissive_tex != TEX_NONE;
+        bool mat_tex = SHADE_MAT_TEXKIND(mat) || SHADE_MAT_NORMAL(mat) ||
+                       SHADE_MAT_ROUGHTEX(mat) || SHADE_MAT_METALTEX(mat) ||
+                       SHADE_MAT_EMISTEX(mat);
         // dP/du, dP/dv — derived at most ONCE per lap and shared by its two
         // consumers, the anisotropic footprint and the tangent frame. Neither
         // is reached without a texture, and the isotropic path with no normal
         // map needs no basis at all (the shade.rs `uv_basis` factoring).
         float3 tu = 0.0, tv = 0.0;
         bool has_basis = false;
-        if (mat_tex && (aniso || mat.normal_tex != TEX_NONE)) {
+        if (mat_tex && (aniso || SHADE_MAT_NORMAL(mat))) {
             has_basis = tri_uv_basis(hit.tri, tu, tv);
         }
         TexFilt filt = tex_filter(hit.tri, n, rd, cone_w, mat_tex, aniso, has_basis, tu, tv);
@@ -489,24 +550,24 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
         // filter — precision-level differences only, absorbed by the
         // statistical CPU-vs-GPU gates).
         float3 albedo =
-            mat.kind == MAT_MARBLE   ? marble(ro + rd * hit.t, mat.scale)
-          : mat.kind == MAT_TEXTURED ? tex_sample(mat.tex, tri_uv(hit.tri, hit.u, hit.v), filt)
+            SHADE_MAT_MARBLE(mat)  ? marble(ro + rd * hit.t, mat.scale)
+          : SHADE_MAT_TEXKIND(mat) ? tex_sample(mat.tex, tri_uv(hit.tri, hit.u, hit.v), filt)
           : mat.albedo;
         // Map-driven material terms — the shade.rs block, ZERO rng draws
         // (materials with every map at TEX_NONE run bit-identically to the
         // pre-map kernel; the same-seed wavefront-vs-reference gates rely on
         // that). Linear maps ride UNORM SRVs (no sRGB decode).
         float2 map_uv = float2(0.0, 0.0);
-        if (mat.normal_tex != TEX_NONE || mat.rough_tex != TEX_NONE ||
-            mat.metal_tex != TEX_NONE || mat.emissive_tex != TEX_NONE) {
+        if (SHADE_MAT_NORMAL(mat) || SHADE_MAT_ROUGHTEX(mat) ||
+            SHADE_MAT_METALTEX(mat) || SHADE_MAT_EMISTEX(mat)) {
             map_uv = tri_uv(hit.tri, hit.u, hit.v);
         }
         float rough_eff = mat.roughness;
         float metal_eff = mat.metallic;
-        if (mat.rough_tex != TEX_NONE) {
+        if (SHADE_MAT_ROUGHTEX(mat)) {
             rough_eff = clamp(rough_eff * tex_sample(mat.rough_tex, map_uv, filt).g, 0.02, 1.0);
         }
-        if (mat.metal_tex != TEX_NONE) {
+        if (SHADE_MAT_METALTEX(mat)) {
             metal_eff = clamp(metal_eff * tex_sample(mat.metal_tex, map_uv, filt).b, 0.0, 1.0);
         }
         // Shading normal n_s (n_s == n when unmapped): the BRDF frame, N·L,
@@ -516,34 +577,36 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
         // A degenerate UV basis is exactly the case perturb_normal used to
         // bail on internally — no tangent frame, so n_s stays n.
         float3 n_s = n;
-        if (mat.normal_tex != TEX_NONE && has_basis) {
+        if (SHADE_MAT_NORMAL(mat) && has_basis) {
             n_s = perturb_normal(n, mat, map_uv, filt, tu, tv);
         }
         // Water ripples tilt the SHADING normal on the shared cloud clock
         // (pure ALU, no rng). Composes on the normal map; geometric n
         // untouched. Off (ripple_amp 0) leaves n_s exactly as selected.
-        if (mat.ripple_amp > 0.0) {
+        if (SHADE_MAT_RIPPLE(mat) > 0.0) {
             n_s = ripple_normal(n_s, n, ro + rd * hit.t, CLOUD_TIME, mat.ripple_amp, SCENE_DIAG);
         }
         if (lap == 0u) {
             // shade.rs — spec_t stays 0 unless the lap-0 reflection below
-            // traces (hit t / INF on miss).
+            // traces (hit t / INF on miss). trans/ripple ride the seams so a
+            // stripped class folds the export to its (data-identical) zero.
             prim.n = n_s;
             prim.rough = rough_eff;
             prim.albedo = albedo;
             prim.metallic = metal_eff;
-            prim.trans = mat.transmission;
-            prim.ripple_amp = mat.ripple_amp;
+            prim.trans = SHADE_MAT_TRANSMISSION(mat);
+            prim.ripple_amp = SHADE_MAT_RIPPLE(mat);
         }
 
         float3 f0 = lerp(float3(0.04, 0.04, 0.04), albedo, metal_eff);
-        // 0.157 = Charlie peak directional albedo (shade.rs energy comp).
-        float3 kd = albedo * (1.0 - metal_eff) * (1.0 - 0.157 * mat.sheen);
+        // 0.157 = Charlie peak directional albedo (shade.rs energy comp) —
+        // the kd factor and the direct sheen arm fold off the ONE seam.
+        float3 kd = albedo * (1.0 - metal_eff) * (1.0 - 0.157 * SHADE_MAT_SHEEN(mat));
 
         // Tangent frame on the SHADING normal: anisotropic materials brush
         // circumferentially around world-up; onb covers poles and isotropic.
         float3 t1, t2;
-        if (mat.anisotropy > 0.0) {
+        if (SHADE_MAT_ANISO(mat) > 0.0) {
             float3 t = cross(float3(0.0, 1.0, 0.0), n_s);
             if (dot(t, t) > 1e-8) {
                 t1 = normalize(t);
@@ -555,7 +618,7 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
             onb(n_s, t1, t2);
         }
         float ax, ay;
-        ggx_alphas(rough_eff, mat.anisotropy, ax, ay);
+        ggx_alphas(rough_eff, SHADE_MAT_ANISO(mat), ax, ay);
         float3 v = -rd;
         // The face-flip guarantees n·v >= 0 for the GEOMETRIC normal; a
         // perturbed n_s can dip below — the grazing guard covers both.
@@ -570,7 +633,7 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
         // `w_l` deletes energy nobody else delivers (shade.rs::refl_ray, same
         // expression, same FLAT roughness/metallic). False for the low preset
         // and at every depth > 0.
-        bool refl_ray = (depth == 0u && refl && (mat.metallic > 0.04 || mat.roughness < 0.45));
+        bool refl_ray = (depth == 0u && refl && SHADE_MAT_REFL(mat));
 
         // Direct light: N cone samples toward the SUN DISC at infinity (no
         // position, no 1/d^2 — sky.rs). Lambert (1/pi omitted by convention,
@@ -592,7 +655,7 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                 // light through itself; the occlusion ray starts on the
                 // transmitted side (p - 2*eps*n = hit - n*eps). The rng
                 // draws above already happened — order matches the CPU.
-                if (mat.translucency > 0.0 && ndl < 0.0) {
+                if (SHADE_MAT_TRANSLUCENCY(mat) > 0.0 && ndl < 0.0) {
                     // transmit_q (shade.rs's tinted-shadows twin): the back
                     // ray carries a tint through glass; ONE when clear, so
                     // `x * 1.0` keeps opaque scenes bitwise.
@@ -630,12 +693,12 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                         w_l = 1.0 - sky_mis_weight(p_b, sky_light_pdf());
                     }
                     direct_s += li * f * (PI * dn * g2 * w_l / (4.0 * vl.z * ndl));
-                    if (mat.sheen > 0.0) {
+                    if (SHADE_MAT_SHEEN(mat) > 0.0) {
                         // Charlie NDF + Ashikhmin visibility (shade.rs).
                         float sin2 = max(1.0 - hl.z * hl.z, 0.0);
                         float d_c = (2.0 + sheen_inv_a) * pow(sin2, sheen_inv_a * 0.5) / TAU;
                         float v_ash = 1.0 / max(4.0 * (ndl + vl.z - ndl * vl.z), 1e-4);
-                        direct_s += li * (PI * mat.sheen * d_c * v_ash);
+                        direct_s += li * (PI * SHADE_MAT_SHEEN(mat) * d_c * v_ash);
                     }
                 }
             }
@@ -770,8 +833,9 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
         // the GGX highlight stays unscaled. kt == 1.0 exactly when
         // transmission == 0 (every procedural/stress material), so the
         // multiply is bit-neutral there.
-        float3 diffuse_d = direct_d * (1.0 - mat.translucency) + direct_t * mat.translucency;
-        float kt = 1.0 - mat.transmission;
+        float3 diffuse_d = direct_d * (1.0 - SHADE_MAT_TRANSLUCENCY(mat))
+                         + direct_t * SHADE_MAT_TRANSLUCENCY(mat);
+        float kt = 1.0 - SHADE_MAT_TRANSMISSION(mat);
 
         if (split_ambient && lap == 0u) {
             // Hemi mode: the primary ambient is integrated by the hemisphere
@@ -828,9 +892,9 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
         // Emitted radiance — additive per lap, OUTSIDE the kd*kt factor, so
         // emitters appear in reflections and through glass (shade.rs). The
         // guard keeps emissive-free materials bit-identical.
-        if (any(mat.emissive != 0.0) || mat.emissive_tex != TEX_NONE) {
+        if (SHADE_MAT_EMISSIVE(mat)) {
             float3 emis = mat.emissive;
-            if (mat.emissive_tex != TEX_NONE) {
+            if (SHADE_MAT_EMISTEX(mat)) {
                 emis *= tex_sample(mat.emissive_tex, map_uv, filt);
             }
             total += tput * emis;
@@ -940,7 +1004,7 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
         // fraction at the root is the VNDF bounce above; at interior
         // interfaces it is dropped — dimming, never gaining. TIR continues
         // as an internal mirror bounce.
-        if (refl && mat.transmission > 0.0 && depth < TRANS_MAX_DEPTH) {
+        if (refl && SHADE_MAT_TRANSMISSION(mat) > 0.0 && depth < TRANS_MAX_DEPTH) {
             // Entering or exiting? Re-derive the pre-flip normal orientation
             // (surface_point returns only the viewer-facing normal).
             uint3 idx = uint3(indices[hit.tri * 3u], indices[hit.tri * 3u + 1u],
@@ -965,7 +1029,7 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
             // on the near side (tdir·n > 0). A ripple that flips the side is
             // rejected and the arm recomputes on geometric n (which always
             // passes both). Off (ripple_amp 0) runs geometric-n verbatim.
-            if (mat.ripple_amp > 0.0) {
+            if (SHADE_MAT_RIPPLE(mat) > 0.0) {
                 float3 n_snell = ripple_normal(n, n, hit_p, CLOUD_TIME, mat.ripple_amp, SCENE_DIAG);
                 glass_snell(rd, v, n_snell, n, hit_p, eta, mat.transmission, tdir, torig, ttw, is_tir);
                 bool ok = is_tir ? (dot(tdir, n) > 0.0) : (dot(tdir, n) < 0.0);

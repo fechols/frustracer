@@ -179,13 +179,29 @@ pub(crate) fn dxr_inline_mode() -> u32 {
 ///       repacking effect (± the sibling sub-chunk AABB overlap cost, the
 ///       structural price of instance-keyed sorting) — radiance-identical to
 ///       mode 0 by construction, gated bit-exact on default/stress.
-///   2 — SPECIALIZED records (Commit B): per-class strip-define libraries.
+///   2 — SPECIALIZED records: one extra DXIL library per class PRESENT in
+///       the scene (k ≠ uber), compiled with `shadeclass::strip_defines(k)`
+///       prepended — the SHADE_MAT_* seams in shade.hlsli fold that class's
+///       provably-dead arms out (the STRIPS table is the soundness argument;
+///       `verify_strips` re-proved it on this scene's materials at upload).
+///       Each library exports exactly `{chs_shade_ck ← chs_shade}`; absent
+///       classes + uber stay lib-0 aliases (absent records are never
+///       addressed, uber IS the unstripped fallback). Adds primary-hit
+///       register/occupancy relief on top of rung 1's sort keys — and it is
+///       where NVIDIA joins the ladder (genuinely different libraries cannot
+///       dedupe; the recorded finding is that it folds rung 1's renames).
+///       NOT bit-comparable to modes 0/1 (the stripped code is provably dead
+///       per class, but DXC reschedules the survivors — fp association
+///       drift, tracked by report, gated statistically); rebuild-vs-rebuild
+///       IS bit-exact and gated (T1d's determinism arm).
 ///   3 — RECURSIVE class dispatch (Commit C): continuations TraceRay into
 ///       their class's CHS. Modes not yet built degrade to the highest built
 ///       rung with a loud line.
 /// Composition: the contribution only matters where hit-group records
-/// DISPATCH — every mode-0 TraceRay and mode-1's primary; under
-/// `--dxr-inline 2` (zero TraceRay) the arm is VACUOUS and says so loudly
+/// DISPATCH — every mode-0 TraceRay and the inline-0/1 primary; under
+/// `--dxr-inline 2` (zero TraceRay) the arm is VACUOUS, and under
+/// `--dxr-inline 3` nearly so (only the thin bare-hit record dispatches —
+/// the SHADING records this ladder sorts never run) — both say so loudly
 /// (kept runnable for A/B matrix hygiene). Set from main's parse via
 /// `set_sbt_mode` (the set_inline_mode idiom; headless keeps the parse-time
 /// store).
@@ -217,11 +233,15 @@ pub struct DxrGpu {
     /// alias arm) — the fill and DispatchRays read this ONE snapshot.
     sbt_hit_records: u32,
     /// The armed --dxr-sbt rung this pipeline was BUILT at (post-degrade),
-    /// and how many pairwise-distinct per-class shader identifiers the
-    /// driver actually minted (== N_CLASSES, or the loud dedupe finding).
-    /// Both read by --check-dxr's construction audit.
+    /// how many pairwise-distinct per-class shader identifiers the driver
+    /// actually minted, and how many the rung REQUIRES distinct (mode 1: all
+    /// 8 — the rename experiment; mode 2: the specialized set ∪ uber —
+    /// absent classes alias uber and legitimately dedupe on drivers that
+    /// fold renames). distinct != required is the dedupe finding. All read
+    /// by --check-dxr's construction audit.
     pub sbt_mode: u32,
     pub sbt_distinct_idents: u32,
+    pub sbt_required_idents: u32,
     pso_resolve: ID3D12PipelineState,
     /// The cloud-cache fill kernels + their buffers (u5/u6), armed per the
     /// snapshotted levers. `None` when the respective cache is off. bound before
@@ -395,11 +415,16 @@ impl DxrGpu {
         // --dxr-sbt snapshot (see the SBT_MODE doc). Degrades: to 0 when the
         // shared core carries no class partition (the lever must precede the
         // upload — --no-blas-split, or a core cached before arming), and to
-        // the highest BUILT ladder rung (1, this commit) when a later mode is
-        // asked for. The --dxr-inline 2 composition is VACUOUS (zero TraceRay
-        // ⇒ no record ever dispatches) — runnable for matrix hygiene, said
-        // loudly. Snapshotted once like inline_mode: a mid-process A/B can
-        // never desync the RTPSO from its SBT.
+        // the highest BUILT ladder rung (2 — specialization) when a later
+        // mode is asked for. The --dxr-inline 2 composition is VACUOUS (zero
+        // TraceRay ⇒ no record ever dispatches), and --dxr-inline 3 nearly
+        // so (only the thin bare-hit record dispatches — the SHADING records
+        // this ladder sorts never run; per-class HgHit copies share one
+        // identifier, one sort key) — both runnable for matrix hygiene, said
+        // loudly. Snapshotted once like inline_mode — reading the LOCAL,
+        // post-degrade binding (the heightfield-Intel arm above can move
+        // 3 → 1) — so a mid-process A/B can never desync the RTPSO from its
+        // SBT.
         let sbt_mode = {
             let m = dxr_sbt_mode();
             if m == 0 {
@@ -412,11 +437,11 @@ impl DxrGpu {
                 );
                 0
             } else {
-                let built = m.min(1);
+                let built = m.min(2);
                 if m > built {
                     eprintln!(
-                        "dxr-sbt: mode {m} is a later ladder rung (specialized/recursive — \
-                         not built yet) — running mode {built} (alias records)"
+                        "dxr-sbt: mode {m} is a later ladder rung (recursive class dispatch \
+                         — not built yet) — running mode {built} (specialized records)"
                     );
                 }
                 if inline_mode == 2 {
@@ -425,12 +450,35 @@ impl DxrGpu {
                          — the sorted SBT is VACUOUS in this composition (kept runnable for \
                          A/B matrix hygiene)"
                     );
+                } else if inline_mode == 3 {
+                    eprintln!(
+                        "dxr-sbt: NOTE --dxr-inline 3 dispatches only the thin bare-hit \
+                         record (shading is the deferred compute pass) — the sorted SHADING \
+                         records never run, so the ladder is VACUOUS in this composition \
+                         (kept runnable for A/B matrix hygiene)"
+                    );
                 }
-                eprintln!(
-                    "dxr-sbt: mode {built} — {} class records (alias arm: 8 renames of one \
-                     chs_shade; identical code, distinct sort keys)",
-                    crate::shadeclass::N_CLASSES * 3
-                );
+                if built == 1 {
+                    eprintln!(
+                        "dxr-sbt: mode 1 — {} class records (alias arm: 8 renames of one \
+                         chs_shade; identical code, distinct sort keys)",
+                        crate::shadeclass::N_CLASSES * 3
+                    );
+                } else {
+                    let live = scene_gpu.sbt_class.as_ref().map_or(0, |c| {
+                        (0..crate::shadeclass::N_CLASSES)
+                            .filter(|&k| {
+                                k != crate::shadeclass::CK_UBER as usize && c.histo[k] > 0
+                            })
+                            .count()
+                    });
+                    eprintln!(
+                        "dxr-sbt: mode 2 — {} class records, {live} specialized \
+                         librar{} + the uber fallback (strip-defines folded per class)",
+                        crate::shadeclass::N_CLASSES * 3,
+                        if live == 1 { "y" } else { "ies" }
+                    );
+                }
                 built
             }
         };
@@ -512,6 +560,37 @@ impl DxrGpu {
         let lib_src = parts.join("\n");
         let lib_target = if inline_mode > 0 { "lib_6_5" } else { "lib_6_3" };
         let dxil = dxc.compile(&lib_src, "", lib_target, "dxr library", debug)?;
+        // --dxr-sbt 2: one SPECIALIZED library per PRESENT class (k ≠ uber) —
+        // shadeclass::strip_defines(k) prepended to the IDENTICAL source, so
+        // that class's chs_shade compiles with its provably-dead arms folded
+        // out at the SHADE_MAT_* seams (the STRIPS table is the soundness
+        // argument; verify_strips re-proved every obligation on this scene's
+        // own materials at upload). The k enumeration is 0..N in order —
+        // deterministic library set, which the T1d determinism arm gates
+        // bit-exact. Distinct `what` per class: FR_DUMP_HLSL keys its dump
+        // files on it, and eight libraries sharing "dxr library" would
+        // overwrite each other's dumps.
+        let spec_classes: Vec<usize> = if sbt_mode >= 2 {
+            let histo = &scene_gpu.sbt_class.as_ref().unwrap().histo;
+            (0..crate::shadeclass::N_CLASSES)
+                .filter(|&k| k != crate::shadeclass::CK_UBER as usize && histo[k] > 0)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let class_dxil: Vec<Vec<u8>> = spec_classes
+            .iter()
+            .map(|&k| {
+                let src_k = format!("{}{}", crate::shadeclass::strip_defines(k as u8), lib_src);
+                dxc.compile(
+                    &src_k,
+                    "",
+                    lib_target,
+                    &format!("dxr library c{k} ({})", crate::shadeclass::NAMES[k]),
+                    debug,
+                )
+            })
+            .collect::<Result<_>>()?;
         let resolve_src = [sd, trace::TRACE_COMMON_HLSLI, trace::RESOLVE_HLSL].join("\n");
         let pso_resolve = trace::compute_pso(
             device,
@@ -660,7 +739,14 @@ impl DxrGpu {
                     Flags: D3D12_EXPORT_FLAG_NONE,
                 });
             }
+            // Mode 1: all 8 chs_shade_ck alias lib 0's chs_shade. Mode 2: a
+            // class with its own specialized library exports its name THERE
+            // (exported names are unique state-object-wide), so lib 0
+            // aliases only uber + the absent classes.
             for k in 0..n_classes {
+                if spec_classes.contains(&k) {
+                    continue;
+                }
                 exports.push(D3D12_EXPORT_DESC {
                     Name: PCWSTR(chs_alias_names[k].as_ptr()),
                     ExportToRename: PCWSTR(chs_shade_name.as_ptr()),
@@ -668,7 +754,29 @@ impl DxrGpu {
                 });
             }
         }
-        let lib_desc = D3D12_DXIL_LIBRARY_DESC {
+        // Per-specialized-library export lists (mode 2): exactly ONE entry —
+        // chs_shade_ck renamed from that library's own (stripped) chs_shade.
+        // Nothing else exports: raygen/misses/chs_hit/ah_* must exist ONCE in
+        // the state object and resolve from lib 0's pool (hit groups compose
+        // imports across libraries). Built FULLY before any lib desc takes a
+        // pointer; the outer Vec never grows after collect, so the inline
+        // [_; 1] buffers are stable.
+        let class_exports: Vec<[D3D12_EXPORT_DESC; 1]> = spec_classes
+            .iter()
+            .map(|&k| {
+                [D3D12_EXPORT_DESC {
+                    Name: PCWSTR(chs_alias_names[k].as_ptr()),
+                    ExportToRename: PCWSTR(chs_shade_name.as_ptr()),
+                    Flags: D3D12_EXPORT_FLAG_NONE,
+                }]
+            })
+            .collect();
+        // The library descs as ONE pre-sized Vec (lib 0 + the per-class
+        // specializations), frozen before the subobject array stores raw
+        // pointers into it — the hit-group lifetime rule again.
+        let mut lib_descs: Vec<D3D12_DXIL_LIBRARY_DESC> =
+            Vec::with_capacity(1 + class_dxil.len());
+        lib_descs.push(D3D12_DXIL_LIBRARY_DESC {
             DXILLibrary: D3D12_SHADER_BYTECODE {
                 pShaderBytecode: dxil.as_ptr() as *const _,
                 BytecodeLength: dxil.len(),
@@ -680,7 +788,17 @@ impl DxrGpu {
             } else {
                 exports.as_ptr() as *mut _
             },
-        };
+        });
+        for (i, blob) in class_dxil.iter().enumerate() {
+            lib_descs.push(D3D12_DXIL_LIBRARY_DESC {
+                DXILLibrary: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: blob.as_ptr() as *const _,
+                    BytecodeLength: blob.len(),
+                },
+                NumExports: 1,
+                pExports: class_exports[i].as_ptr() as *mut _,
+            });
+        }
         // ALPHA_CUTOUT scenes attach the cutout any-hit to every hit group;
         // HgOcclude carries ONLY an any-hit (legal — SKIP_CLOSEST_HIT skips
         // just that stage, any-hit still runs during traversal: the standard
@@ -757,7 +875,6 @@ impl DxrGpu {
             D3D12_STATE_SUBOBJECT { Type: t, pDesc: p }
         };
         let mut subobjects = vec![
-            sub(D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY, &lib_desc as *const _ as *const _),
             sub(
                 D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG,
                 &shader_cfg as *const _ as *const _,
@@ -768,6 +885,12 @@ impl DxrGpu {
             ),
             sub(D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE, &grs as *const _ as *const _),
         ];
+        // Every DXIL library — lib 0 + the mode-2 per-class specializations —
+        // by reference into the frozen Vec (off/mode-1: exactly one entry).
+        for ld in &lib_descs {
+            subobjects
+                .push(sub(D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY, ld as *const _ as *const _));
+        }
         // Hit groups by reference into the (now frozen) Vec — one per class
         // + HgHit (+ HgOcclude, which imports ah_shadow and only exports
         // under ALPHA_CUTOUT/HEIGHTFIELD/TRANS_SHADOW, so its group exists
@@ -814,28 +937,46 @@ impl DxrGpu {
         put(SBT_MISS + IDENT, ident("miss_shadow")?);
         put(SBT_MISS + 2 * IDENT, ident("miss_hit")?);
         let mut sbt_distinct_idents: u32 = 1;
+        let mut sbt_required_idents: u32 = 1;
         if sbt_mode >= 1 {
-            // Per-class identifiers. PAIRWISE DISTINCTNESS is the alias
-            // arm's anti-vacuity: if a driver dedupes renames of one
-            // function to one identifier, the TSU has one sort key and the
-            // rung proves nothing — loud here (a real Q4 data point), GATED
-            // in --check-dxr's construction audit via `sbt_distinct_idents`.
+            // Per-class identifiers. PAIRWISE DISTINCTNESS over the mode's
+            // REQUIRED set is the anti-vacuity — mode 1: all 8 (the rename
+            // experiment IS "does the driver mint distinct keys for
+            // renames"); mode 2: the specialized set ∪ uber (absent classes
+            // alias uber by construction and legitimately dedupe on drivers
+            // that fold renames — the recorded NVIDIA finding — while a
+            // SPECIALIZED library colliding with anything is a defect on any
+            // vendor). Loud here (a real Q4 data point), GATED in
+            // --check-dxr's construction audit via the two counts.
             let ids: Vec<[u8; IDENT]> = (0..n_classes)
                 .map(|k| ident(&format!("HgShade_c{k}")))
                 .collect::<Result<_>>()?;
+            let req: Vec<usize> = if sbt_mode >= 2 {
+                let mut v = spec_classes.clone();
+                v.push(crate::shadeclass::CK_UBER as usize);
+                v
+            } else {
+                (0..n_classes).collect()
+            };
+            sbt_required_idents = req.len() as u32;
             let mut uniq: Vec<&[u8; IDENT]> = Vec::new();
-            for id in &ids {
-                if !uniq.contains(&id) {
-                    uniq.push(id);
+            for &k in &req {
+                if !uniq.contains(&&ids[k]) {
+                    uniq.push(&ids[k]);
                 }
             }
             sbt_distinct_idents = uniq.len() as u32;
-            if sbt_distinct_idents != n_classes as u32 {
+            if sbt_distinct_idents != sbt_required_idents {
                 eprintln!(
-                    "dxr-sbt: DRIVER DEDUPED the alias identifiers — {} distinct of {} \
-                     (the TSU has that many sort keys; the alias rung is vacuous here, \
-                     which is itself a finding)",
-                    sbt_distinct_idents, n_classes
+                    "dxr-sbt: DRIVER DEDUPED shading records — {} distinct of {} required \
+                     (the TSU has that many sort keys{})",
+                    sbt_distinct_idents,
+                    sbt_required_idents,
+                    if sbt_mode >= 2 {
+                        "; two DIFFERENT libraries folded — a finding on any vendor"
+                    } else {
+                        "; the alias rung is vacuous here, which is itself a finding"
+                    }
                 );
             }
             let hit_id = ident("HgHit")?;
@@ -971,6 +1112,7 @@ impl DxrGpu {
             sbt_hit_records,
             sbt_mode,
             sbt_distinct_idents,
+            sbt_required_idents,
             pso_resolve,
             pso_sky_lod,
             pso_cloud_shadow,

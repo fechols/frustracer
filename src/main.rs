@@ -1422,18 +1422,34 @@ fn run_check_dxr(
     // shader), which is exactly why this gate claims bit-identity rather
     // than pretending to prove routing — specialized records make a
     // mis-route fail T2 loudly.
+    //   MODE ≥ 2 (specialized records) swaps the image arms: the off-core
+    // bit A/B is REPLACED by (a) rebuild DETERMINISM, bit-exact and hard —
+    // a second armed pipeline on the SAME shared core (the partition and
+    // contributions are identical across armed modes; only the RTPSO/SBT
+    // differ, so no second upload) must reproduce accum/tbuf/info to the
+    // byte, the tooth against nondeterministic class-library assembly —
+    // and (b) a mode-1 comparison on the same core, REPORT-ONLY: stripped
+    // code is provably dead per the STRIPS soundness gate, but DXC
+    // reschedules the survivors (fp association drift), so specialization's
+    // correctness claim is the statistical suite (a mis-routed class strips
+    // a LIVE arm and blows T2's 2% radiance bound, never a bit wiggle) and
+    // the bit-diff is recorded, not gated. The identifier audit's required
+    // set also narrows to specialized ∪ uber (absent classes alias uber and
+    // legitimately dedupe — the NVIDIA finding), and a dedupe THERE fails
+    // hard on every vendor: two genuinely different libraries folding to
+    // one identifier is a defect, not a vendor quirk.
     if dg.sbt_mode >= 1 {
         let mut sbt_ok = true;
         if let Some(info_c) = core.sbt_class.as_ref() {
             let nonzero = info_c.histo.iter().filter(|&&n| n > 0).count();
             eprintln!(
                 "check-dxr: dxr-sbt audit: mode {} | {} chunks | {} live classes | {} of {} \
-                 distinct alias identifiers",
+                 required shading-record identifiers distinct",
                 dg.sbt_mode,
                 info_c.chunk_class.len(),
                 nonzero,
                 dg.sbt_distinct_idents,
-                shadeclass::N_CLASSES
+                dg.sbt_required_idents
             );
             if must_fire && nonzero < 2 {
                 eprintln!(
@@ -1448,19 +1464,28 @@ fn run_check_dxr(
             // Intel B70 mints all 8 distinct. Rung 1 is therefore an
             // INTEL-ONLY instrument — exactly the vendor the TSU experiment
             // exists for — and NVIDIA joins the ladder at rung 2, where
-            // genuinely different libraries cannot be deduped. So the
+            // genuinely different libraries cannot be deduped. So MODE 1's
             // distinctness gate is HARD on Intel (a dedupe there would make
             // the whole rung silently measure zero) and a loud recorded
             // note elsewhere (the alias arm still validates the
-            // partition/SBT plumbing as a bit-identical control).
-            if dg.sbt_distinct_idents != shadeclass::N_CLASSES as u32 {
-                if gpu::adapter::picked_vendor() == gpu::adapter::Vendor::Intel {
+            // partition/SBT plumbing as a bit-identical control). MODE ≥ 2's
+            // required set is specialized ∪ uber — genuinely different
+            // libraries — so a dedupe there fails hard on EVERY vendor.
+            if dg.sbt_distinct_idents != dg.sbt_required_idents {
+                let intel = gpu::adapter::picked_vendor() == gpu::adapter::Vendor::Intel;
+                if dg.sbt_mode >= 2 || intel {
                     eprintln!(
-                        "check-dxr: FAIL dxr-sbt: Intel minted {} distinct alias identifiers \
-                         of {} — the TSU sort keys collapsed and the rung is vacuous on the \
-                         one vendor it exists for",
+                        "check-dxr: FAIL dxr-sbt: {} distinct shading-record identifiers of \
+                         {} required — {}",
                         dg.sbt_distinct_idents,
-                        shadeclass::N_CLASSES
+                        dg.sbt_required_idents,
+                        if dg.sbt_mode >= 2 {
+                            "two DIFFERENT specialized libraries folded to one identifier \
+                             (a defect on any vendor)"
+                        } else {
+                            "the TSU sort keys collapsed and the rung is vacuous on the one \
+                             vendor it exists for"
+                        }
                     );
                     sbt_ok = false;
                 } else {
@@ -1470,7 +1495,7 @@ fn run_check_dxr(
                          the bit A/B below still validates the partition/SBT plumbing, and \
                          this vendor joins the ladder at rung 2",
                         dg.sbt_distinct_idents,
-                        shadeclass::N_CLASSES
+                        dg.sbt_required_idents
                     );
                 }
             }
@@ -1479,88 +1504,165 @@ fn run_check_dxr(
             sbt_ok = false;
         }
 
-        // The off arm: flip the knob, upload a SECOND core, build its
-        // pipeline, render the SAME frame-0, restore the knob.
-        let m0 = gpu::dxr::dxr_sbt_mode();
-        gpu::dxr::set_sbt_mode(0);
-        let off_run = (|| -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
-            let core_off = std::rc::Rc::new(
-                gpu::trace::SceneGpu::new_uploaded(&dev, scene, bvh, &mut hg, opts.bc7)
-                    .map_err(|e| format!("off-core upload: {e}"))?,
-            );
-            let dg_off = gpu::dxr::DxrGpu::new(
-                &dev, &dxc, scene, core_off, gw as u32, gh as u32, false, opts.gpu_debug,
-            )
-            .map_err(|e| format!("off DxrGpu: {e}"))?;
-            if dg_off.sbt_mode != 0 {
-                return Err("off arm still reports an armed sbt_mode".into());
-            }
-            let p0 = gpu::trace::FrameParams {
-                sway_prev_time: None,
-                cam: basis,
-                frame: 0,
-                accumulate: true,
-                jitter: false,
-                frame_jitter: None,
-                prev_cam: None,
-                q,
-                verify: false,
-                spp: 1,
-                probe_sample: 0,
-                clouds: crate::clouds::Clouds::check(scene.diag),
-                fireflies: crate::fireflies::Fireflies::check(scene),
-                sway_time: check_sway,
-                replay: false,
-            };
-            dg_off.write_cb(0, &p0);
-            let mut rec = Ok(());
-            hg.run(|l| rec = dg_off.record_frame(l, 0))
-                .map_err(|e| format!("off frame submit: {e}"))?;
-            rec.map_err(|e| format!("off record_frame: {e}"))?;
-            let acc = hg.read_buffer(&dg_off.accum, ua, px * 3 * 4)?;
-            let tb = hg.read_buffer(&dg_off.tbuf, ua, px * 4)?;
-            let inf = hg.read_buffer(&dg_off.info, ua, px * 4)?;
-            Ok((acc, tb, inf))
-        })();
-        gpu::dxr::set_sbt_mode(m0);
-
-        match off_run {
-            Ok((off_acc, off_tb, off_inf)) => {
-                let on_acc = hg.read_buffer(&dg.accum, ua, px * 3 * 4);
-                let on_tb = hg.read_buffer(&dg.tbuf, ua, px * 4);
-                let on_inf = hg.read_buffer(&dg.info, ua, px * 4);
-                match (on_acc, on_tb, on_inf) {
-                    (Ok(on_acc), Ok(on_tb), Ok(on_inf)) => {
-                        let bit = on_acc == off_acc && on_tb == off_tb && on_inf == off_inf;
-                        // Worst accum delta for the loud line either way.
-                        let mut mx = 0.0f32;
-                        for (a, b) in on_acc.chunks_exact(4).zip(off_acc.chunks_exact(4)) {
-                            let a = f32::from_le_bytes(a.try_into().unwrap());
-                            let b = f32::from_le_bytes(b.try_into().unwrap());
-                            if a.is_finite() && b.is_finite() {
-                                mx = mx.max((a - b).abs());
+        // ONE armed-side readback + ONE arm runner shared by both shapes:
+        // run_arm builds a pipeline at `mode` (on the given core, or a
+        // freshly-uploaded knob-off core for mode 0 — the partition and
+        // contributions bake at upload), renders the exact p0 frame the
+        // preceding suite left in dg's accum, reads the three buffers back,
+        // and restores the knob on every path.
+        let on = (
+            hg.read_buffer(&dg.accum, ua, px * 3 * 4),
+            hg.read_buffer(&dg.tbuf, ua, px * 4),
+            hg.read_buffer(&dg.info, ua, px * 4),
+        );
+        let mut run_arm = |mode: u32,
+                           label: &str,
+                           arm_core: Option<std::rc::Rc<gpu::trace::SceneGpu>>|
+         -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
+            let m0 = gpu::dxr::dxr_sbt_mode();
+            gpu::dxr::set_sbt_mode(mode);
+            let r = (|| {
+                let arm_core = match arm_core {
+                    Some(c) => c,
+                    None => std::rc::Rc::new(
+                        gpu::trace::SceneGpu::new_uploaded(&dev, scene, bvh, &mut hg, opts.bc7)
+                            .map_err(|e| format!("{label}-core upload: {e}"))?,
+                    ),
+                };
+                let dg_x = gpu::dxr::DxrGpu::new(
+                    &dev, &dxc, scene, arm_core, gw as u32, gh as u32, false, opts.gpu_debug,
+                )
+                .map_err(|e| format!("{label} DxrGpu: {e}"))?;
+                if dg_x.sbt_mode != mode {
+                    return Err(format!(
+                        "{label} arm reports sbt_mode {} (wanted {mode})",
+                        dg_x.sbt_mode
+                    ));
+                }
+                let p0 = gpu::trace::FrameParams {
+                    sway_prev_time: None,
+                    cam: basis,
+                    frame: 0,
+                    accumulate: true,
+                    jitter: false,
+                    frame_jitter: None,
+                    prev_cam: None,
+                    q,
+                    verify: false,
+                    spp: 1,
+                    probe_sample: 0,
+                    clouds: crate::clouds::Clouds::check(scene.diag),
+                    fireflies: crate::fireflies::Fireflies::check(scene),
+                    sway_time: check_sway,
+                    replay: false,
+                };
+                dg_x.write_cb(0, &p0);
+                let mut rec = Ok(());
+                hg.run(|l| rec = dg_x.record_frame(l, 0))
+                    .map_err(|e| format!("{label} frame submit: {e}"))?;
+                rec.map_err(|e| format!("{label} record_frame: {e}"))?;
+                let acc = hg.read_buffer(&dg_x.accum, ua, px * 3 * 4)?;
+                let tb = hg.read_buffer(&dg_x.tbuf, ua, px * 4)?;
+                let inf = hg.read_buffer(&dg_x.info, ua, px * 4)?;
+                Ok((acc, tb, inf))
+            })();
+            gpu::dxr::set_sbt_mode(m0);
+            r
+        };
+        match on {
+            (Ok(on_acc), Ok(on_tb), Ok(on_inf)) => {
+                if dg.sbt_mode >= 2 {
+                    // (a) Rebuild determinism, bit-exact and HARD: same core,
+                    // same mode — the class-library set enumerates 0..N in
+                    // order and DXC is deterministic, so any divergence is
+                    // nondeterministic assembly.
+                    match run_arm(dg.sbt_mode, "determinism", Some(core.clone())) {
+                        Ok((d_acc, d_tb, d_inf)) => {
+                            let bit = d_acc == on_acc && d_tb == on_tb && d_inf == on_inf;
+                            eprintln!(
+                                "check-dxr: dxr-sbt mode-{} rebuild determinism ({px} px): \
+                                 bit-identical {bit}",
+                                dg.sbt_mode
+                            );
+                            if !bit {
+                                eprintln!(
+                                    "check-dxr: FAIL dxr-sbt: specialized rebuild not \
+                                     bit-identical — nondeterministic class-library assembly"
+                                );
+                                sbt_ok = false;
                             }
                         }
-                        eprintln!(
-                            "check-dxr: dxr-sbt alias-vs-off ({px} px): bit-identical {bit} | \
-                             max |d| {mx:.2e}"
-                        );
-                        if !scene.any_transmissive && !bit {
-                            eprintln!(
-                                "check-dxr: FAIL dxr-sbt alias arm not bit-identical to the \
-                                 one-record SBT on a tint-free scene"
-                            );
+                        Err(e) => {
+                            eprintln!("check-dxr: FAIL dxr-sbt determinism arm: {e}");
                             sbt_ok = false;
                         }
                     }
-                    _ => {
-                        eprintln!("check-dxr: FAIL dxr-sbt: armed-arm readback failed");
-                        sbt_ok = false;
+                    // (b) vs mode 1, REPORT-ONLY: same core, alias records —
+                    // the diff is DXC's rescheduling of the surviving code
+                    // under folded strip-defines; the statistical suite is
+                    // specialization's gate (see the block comment).
+                    match run_arm(1, "mode-1", Some(core.clone())) {
+                        Ok((a_acc, _a_tb, _a_inf)) => {
+                            let (mut mx, mut nd) = (0.0f32, 0usize);
+                            for (a, b) in on_acc.chunks_exact(4).zip(a_acc.chunks_exact(4)) {
+                                let a = f32::from_le_bytes(a.try_into().unwrap());
+                                let b = f32::from_le_bytes(b.try_into().unwrap());
+                                if a.to_bits() != b.to_bits() {
+                                    nd += 1;
+                                }
+                                if a.is_finite() && b.is_finite() {
+                                    mx = mx.max((a - b).abs());
+                                }
+                            }
+                            eprintln!(
+                                "check-dxr: dxr-sbt mode-2-vs-mode-1 ({px} px): {nd} of {} \
+                                 accum channels differ | max |d| {mx:.2e} (report only)",
+                                px * 3
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("check-dxr: FAIL dxr-sbt mode-1 comparison arm: {e}");
+                            sbt_ok = false;
+                        }
+                    }
+                } else {
+                    // Mode 1: the alias-vs-off bit A/B through a SECOND core
+                    // (the off partition differs — the T1c one-core flip is
+                    // insufficient).
+                    match run_arm(0, "off", None) {
+                        Ok((off_acc, off_tb, off_inf)) => {
+                            let bit =
+                                on_acc == off_acc && on_tb == off_tb && on_inf == off_inf;
+                            // Worst accum delta for the loud line either way.
+                            let mut mx = 0.0f32;
+                            for (a, b) in on_acc.chunks_exact(4).zip(off_acc.chunks_exact(4)) {
+                                let a = f32::from_le_bytes(a.try_into().unwrap());
+                                let b = f32::from_le_bytes(b.try_into().unwrap());
+                                if a.is_finite() && b.is_finite() {
+                                    mx = mx.max((a - b).abs());
+                                }
+                            }
+                            eprintln!(
+                                "check-dxr: dxr-sbt alias-vs-off ({px} px): bit-identical \
+                                 {bit} | max |d| {mx:.2e}"
+                            );
+                            if !scene.any_transmissive && !bit {
+                                eprintln!(
+                                    "check-dxr: FAIL dxr-sbt alias arm not bit-identical to \
+                                     the one-record SBT on a tint-free scene"
+                                );
+                                sbt_ok = false;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("check-dxr: FAIL dxr-sbt off arm: {e}");
+                            sbt_ok = false;
+                        }
                     }
                 }
             }
-            Err(e) => {
-                eprintln!("check-dxr: FAIL dxr-sbt off arm: {e}");
+            _ => {
+                eprintln!("check-dxr: FAIL dxr-sbt: armed-arm readback failed");
                 sbt_ok = false;
             }
         }
