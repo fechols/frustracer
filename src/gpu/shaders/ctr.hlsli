@@ -80,8 +80,12 @@ uint flat_group(uint3 gid) { return gid.y * 32768u + gid.x; }
 // NOT A BEHAVIOUR CHANGE. These are called at the same program points as the
 // per-lane atomics they replace, so the aggregate covers exactly the lanes that
 // would have raced there anyway; the totals published are identical and queue
-// slot ORDER was already unspecified (the old atomics raced). Measured on an
-// Arc Pro B70, WaveGetLaneCount() is 32 at every group width we dispatch.
+// slot ORDER was already unspecified (the old atomics raced). WIDTH CAVEAT
+// (2026-08-04): "WaveGetLaneCount() is 32 at every group width" was the
+// TRIVIAL wave_probe's answer; FR_WIDTH's in-kernel report shows the REAL fat
+// kernels compile SIMD16 on the B70 (leaf/hemi/reference — the per-shader
+// pressure choice). Correctness here never depended on 32 — the intrinsics
+// are width-agnostic — but do not cite this comment for occupancy math.
 //
 // `slot` MUST be wave-uniform — every caller passes a compile-time CTR_*
 // constant or the `push1` cbuffer value. A per-lane slot would silently

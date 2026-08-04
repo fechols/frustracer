@@ -2882,13 +2882,52 @@ plus the sky/reference/DXR variants the firefly axis would drag in, each paying 
 async-compile warm-up — is NOT taken; the probe arms stay as documented instruments. (2) The
 IGC ISA route is BLOCKED on driver 8805: `IGC_ShaderDumpEnable`/`IGC_DumpToCustomDir` (plus the
 EnableAll/PidDisable variants) produce ZERO files from the D3D12 UMD, no default dump dir
-appears, and the HKLM registry route needs elevation — the occupancy question got its answer
-behaviorally instead (finding 1: cs_leaf is not allocation-crippled; don't spend more on ISA
-archaeology without a new symptom). (3) Reference points on the current tree for future diffs
+appears — and the registry route is NOW ALSO PROVEN DEAD (2026-08-04, elevation obtained): the
+same value names verified present under BOTH `HKLM\SOFTWARE\INTEL\IGFX\IGC` and the adapter's
+class key (`...\Control\Class\{4d36e968-*}\0002\IGC`), a GENUINELY FRESH kernel variant forced
+past the D3DSCache (`FR_BALLAST=7` — the width report proved it compiled and ran), zero files
+anywhere. ISA dumps are unavailable on 8805 by every documented route; the occupancy question
+is answered behaviorally instead — see the FR_WIDTH paragraph below, which supersedes
+"finding 1: cs_leaf is not allocation-crippled" with the direct width readings. (3) Reference
+points on the current tree for future diffs
 (2 reps, ±0.002): procedural spin span **0.636 ms** (leaf 0.419, ladder 0.110), stress **0.775**
 (0.462/0.200); parked WORLD XeSS session span **3.23** = leaf 1.011 + sky/caches ~0.15 + feed
 0.231 + xess-eval 0.522 inside the replay bracket — reconciling exactly with the recorded 3.30
 baseline.
+
+**THE 2026-08-04 REGISTER-CLIFF CAMPAIGN — the pressure story MEASURED, not inferred**
+(`FR_WIDTH=1` + `FR_BALLAST=N`, both default-off, unarmed sessions untouched — the tzero
+class; gates green armed and unarmed on B70 + 4090, check.png byte-identical). **FR_WIDTH**
+arms a WIDTH_PROBE epilogue in every real kernel (counter slots ≥ CTR_COUNT — never zeroed,
+never gated, by construction; DXR gets a dedicated `width_buf` at its otherwise-unbound u3):
+each kernel reports its COMPILED `WaveGetLaneCount()` — the per-shader SIMD width IGC picks
+from register pressure, printed at the spin accounting site, both check suites, and the C-key
+verify. THE TABLE (B70, driver 8805): **leaf=16 hemi=16 reference=16 dxr-raygen=16
+dxr-shade=16 vs sky=32 level=32**; the 4090 control reads 32 everywhere. Three readings:
+(1) every RayQuery-carrying kernel compiles SIMD16 — ctr.hlsli's old "32 at every group
+width" note was the TRIVIAL wave_probe talking (that probe measures group shape, not the real
+kernels; note amended); (2) the DXR raygen reads 16 even THIN (mode 3's bare-hit raygen) —
+the RT launch regime itself narrows, independent of footprint (the brief's hypothesis 1,
+half-confirmed from inside); (3) reference=16 == dxr-shade=16 means the 1.9× deferred-kernel
+penalty is NOT width — it is SPILL AT SIMD16. **FR_BALLAST=N** proves that directly: N
+synthetic live floats (loop recurrence on the traced t — not dead, not rematerializable,
+[unroll] register-resident; folded under a never-true `spp == 0xdead` branch so the image is
+bit-identical) injected into cs_reference. THE KNEE: per-float cost runs ~1.5-2 µs to N=48
+(occupancy dilution), breaks 3× between 56 and 60 (0.704 → 0.785 ms — a +0.08 step where
+4-float steps cost ~0.01), and accelerates past it (N=160 = 1.613 ms, 2.6× baseline) — **the
+reference kernel's own live state sits ~56-60 floats below IGC's spill edge**, and dxr-shade's
+1.9× is bracketed by reference + O(100) ballast floats. THE STRIP SWEEP (FR_ABL × FR_WIDTH on
+dxr-shade, base 1.238 ms): nosec 0.463 (−0.775), norefl 0.750, **noglass 0.749 — −0.489 on a
+scene with ZERO transmissive geometry** — and the single-strip savings SUM to 1.22 vs nosec's
+joint 0.78: **cost near the cliff is a THRESHOLD, not a per-feature sum** — removing EITHER
+big arm's live state clears the same spill edge (the CHS campaign's sub-additivity, reproduced
+in plain compute; noffcode −0.05 = lottery noise). No strip flips 16→32 — SIMD16 is sticky for
+RayQuery kernels; the lever is spill traffic at 16, not width. CONSEQUENCE for the mode-3
+follow-on: `dxr-shade < reference` is reachable by getting the deferred kernel's live state
+under the knee — the norefl/noglass overlap says the reflection+glass DFS stash is the hog, so
+splitting the reflection lap (or hit/sky) out of the kernel is the measured route, not a guess.
+Sweep discipline: every N and every strip is a NEW kernel variant (maiden discard), width read
+from the report line, ms from the LAST gputime table.
 
 *Measurement trap this campaign re-learned the hard way:* `--gpu-timing` prints a table every 120
 frames AND at exit, and a parser that takes the FIRST match reads frames 0-119 — the coldest

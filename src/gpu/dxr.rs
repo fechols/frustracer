@@ -123,6 +123,18 @@ pub fn require_caps(device: &ID3D12Device) -> Result<()> {
 ///       (hit/sky, the wavefront's own leaf+sky lesson) or hunt its register
 ///       cliff — dxr-shade < reference is the target that would make DXR-3
 ///       the first DXR arm to threaten the wavefront on Arc.
+///       THE CLIFF WAS HUNTED AND FOUND (2026-08-04, FR_WIDTH + FR_BALLAST
+///       — CLAUDE.md's register-cliff campaign block): reference AND
+///       dxr-shade both compile SIMD16 on the B70 (width is NOT the gap),
+///       the reference kernel sits ~56-60 live floats below IGC's spill
+///       knee (per-float cost breaks 3× there, N=160 = 2.6× baseline —
+///       bracketing this kernel's 1.9×), and the FR_ABL×FR_WIDTH strip
+///       sweep on THIS kernel reads norefl −0.49 / noglass −0.49 (on a
+///       glassless scene) / nosec −0.78 with the singles summing to 1.22 —
+///       a THRESHOLD, not a sum: shedding EITHER the reflection or the
+///       glass DFS live state clears the same spill edge. So the follow-on
+///       has a mechanism: split the reflection/glass lap (or hit/sky) out
+///       of this kernel and its live state drops under the knee.
 ///       KNOWN REFUSAL: mode 3 + HEIGHTFIELD on Intel driver 32.0.101.8805
 ///       hangs the device (GBV silent, 4090 clean) — degraded to mode 1 with
 ///       a loud line below; re-test on a newer driver.
