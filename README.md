@@ -558,6 +558,8 @@ Real flags, all of them measured rather than guessed.
 | `--spin-hybrid`, `--spin-plain` | Select the quadtree or root-traversal arm for CPU/`--gpu` benchmarks (`--dxr` has only its DXR arm) |
 | `--spin-warmup N` | Exclude leading frames; defaults to 1600 on Intel and 20 elsewhere. A *defaulted* `--spin-frames` is extended so the timed span still covers a whole 600-frame lap |
 | `FR_ABL=oldcut,nobatch` | Reconstruct the pre-B70-pass wavefront queue code for a pixel-identical performance A/B |
+| `FR_WIDTH=1` | Every real kernel reports its **compiled** SIMD width (`WaveGetLaneCount()` from inside the kernel — the register-pressure choice a trivial probe can't see); printed at the spin accounting line, the check suites, and the C-key verify |
+| `FR_BALLAST=N` | Inject N provably-live floats into the reference kernel (image bit-identical) — sweep N to locate the compiler's spill knee; see the register-cliff paragraph |
 | `--stress 5000` | A procedural field of 5000 objects |
 | `--tile 4x2` | Replicate a loaded scene into a grid — the 100-million-triangle path |
 | `--bvh-builder sah\|lbvh\|ploc\|som` | Swap the BVH builder, including a self-organising-map "learned space-filling curve" (it loses) |
@@ -1092,7 +1094,9 @@ hardware pipeline is worth a few percent), while the B70 always prefers
 zero TraceRay. And mode 1's *marginal sample* on the B70 is 2.2 ms against
 mode 2's 1.11 — the candidate-loop-fattened closest-hit shader pays
 occupancy per sample where the all-TraceRay pipeline paid per dispatch, so
-a fat hit shader is fine at 1 spp and ruinous at 16. The spp sweep also
+a fat hit shader is fine at 1 spp and ruinous at 16 (later pinned down as
+spill at SIMD16, not width — see the register-cliff paragraph in "On Intel
+Arc"). The spp sweep also
 places the wavefront: on the B70 the all-inline DXR only beats the quadtree
 below ~3 spp (the quadtree's marginal sample is 0.86 ms vs the
 reference-shaped 1.11), while on the 4090 inline DXR wins at every spp
@@ -1123,7 +1127,10 @@ every TraceRay call site untouched — the routing is record arithmetic).
 Rung 1 keeps the one fat closest-hit and gives it 8 `ExportToRename`
 aliases: identical code, distinct shader identifiers, i.e. pure sort keys.
 Rung 2 compiles one specialized DXIL library per class, each class's
-provably-dead shading arms stripped — thin records, real register relief.
+provably-dead shading arms stripped — thin records, real register relief
+(measured, not asserted: see the register-cliff paragraph in "On Intel Arc" —
+the fat kernels sit ~56–60 live floats past a 3× spill knee that thin records
+duck under).
 Rung 3 turns the reflection/glass continuations into real `TraceRay`s that
 land in the hit surface's *own* class record (occlusion stays inline;
 declared recursion depth 5) — the shape the TSU is designed around. (A
@@ -1288,14 +1295,57 @@ this hardware. That is why `--gpu-timing` exists: D3D12 timestamp queries
 around the same brackets the PIX markers use, vendor-neutral, and the only
 per-pass GPU profiler available on Arc. Its being vendor-neutral is load-bearing
 in the other direction too, because it makes a **per-pass diff between vendors**
-possible, and that diff is what found the next two bugs.
+possible, and that diff is what found the next two bugs. The compiler is even
+more opaque than the capture path: Intel's own shader-dump switches
+(`IGC_ShaderDumpEnable` and friends) produce zero output on driver 8805 by
+every documented route — the environment variables, and both registry
+locations with verified-present keys and a cache-proof fresh compile — so
+per-shader ISA, GRF, and spill counts are simply unavailable on shipping
+drivers. That dead end is why the in-kernel width report (`FR_WIDTH`, below)
+exists: a kernel asking *itself* `WaveGetLaneCount()` is the only per-shader
+compiler visibility Arc currently offers.
+
+**The register cliff, measured from inside the shaders.** Every claim above
+about "occupancy" and "register pressure" was inference from timing shapes
+until two levers made it printable. `FR_WIDTH=1` has each real kernel report
+its own **compiled** `WaveGetLaneCount()` — the per-shader SIMD width the
+compiler actually chose, which a trivial probe kernel cannot see (it reads 32
+at every group shape). The table is stark: on the B70, **every
+RayQuery-carrying kernel compiles SIMD16** — the leaf, hemisphere, and
+reference kernels, the deferred-shade kernel, and even the *thin* bare-hit
+raygen of `--dxr-inline 3`, twenty lines that trace one ray and store 20
+bytes — while the slim no-ray kernels (sky fill, tile recursion) get SIMD32
+and the 4090 control reads 32 everywhere. A raygen that narrows with almost
+nothing live says the RT launch regime narrows by *regime*, not just by
+footprint. And since the reference and deferred-shade kernels are **both**
+SIMD16, the 1.9× between them cannot be width — which leaves spill.
+`FR_BALLAST=N` then locates the spill edge exactly: it injects N provably-live
+floats into the reference kernel (a loop recurrence on the traced hit
+distance, folded under a branch that can never run — the image is
+bit-identical), and the cost curve breaks. Each live float costs ~1.5–2 µs up
+to +48; between **+56 and +60** the per-float price jumps ~3× in a single
+4-float step, and by +160 the kernel runs at 2.6× its baseline. So the
+reference kernel's own live state sits about 56–60 floats below the
+allocator's edge — and the deferred kernel behaves like the reference plus
+~100 ballast floats. The strip probes complete the picture: on the deferred
+kernel, removing the reflection arm saves 0.49 ms, removing the glass chain
+saves 0.49 ms *on a scene with no glass*, yet removing everything saves only
+0.78 — the individual savings sum to 1.22 because **cost near the cliff is a
+threshold, not a per-feature sum**: shedding *either* arm's live state clears
+the same spill edge. That threshold is also the best available explanation for
+the build lottery (comment-level rebuilds moving a kernel 2.46 → 1.77 ms): a
+kernel sitting *at* the edge tips either way on any allocation-order change,
+which is why the sorted-SBT ladder found specialization *stabilizes* Arc
+codegen — thin records sit safely below the cliff.
 
 **`LEAF_GROUP = 256`, which the other two vendors would never suggest.** The
 leaf kernel's group width was 32, reasoned from wave32/wave64. A 2-D sweep of
 `(LEAF_TILE, LEAF_GROUP)` on the B70 put the optimum at `(32, 256)` — 1.652 →
 1.291 ms on the default scene (−21.9%) and 2.009 → 1.457 on `--stress 5000`
 (−27.5%) — with `LEAF_GROUP = 8` bad everywhere, which is the SIMD16 floor
-showing through directly. The pair was adopted as the cross-vendor default: it
+showing through directly (an inference at the time; `FR_WIDTH` has since read
+the leaf kernel's compiled width directly, and it is indeed 16). The pair was
+adopted as the cross-vendor default: it
 is worth −15% at rest and −21.6% moving on the world for the B70, and −28% to
 −42% on `--spin` for the 4090. Note that the two constants must move together;
 the group width alone is worth nothing.
