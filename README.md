@@ -550,7 +550,8 @@ Real flags, all of them measured rather than guessed.
 | Code | Effect |
 |---|---|
 | `--quinlight` | Wire **every** supported upscaler at once and present the Lucas-Kanade-registered, winsorized consensus of their outputs |
-| `--dxr-inline 0\|1\|2` | How much of the DXR pipeline is recursive `TraceRay` vs inline `RayQuery`. See the appendix — this one changed the default (1 cross-vendor, 2 on Intel; passing any value, `1` included, pins your choice against the vendor policy) |
+| `--dxr-inline 0\|1\|2\|3` | How much of the DXR pipeline is recursive `TraceRay` vs inline `RayQuery` (3 = thin closest-hit + deferred compute shade, an unpromoted experiment). See the appendix — this one changed the default (1 cross-vendor, 2 on Intel; passing any value, `1` included, pins your choice against the vendor policy) |
+| `--dxr-sbt 0\|1\|2\|3` | The material-sorted SBT ladder: 8 material classes as per-class TLAS instances into a class-major SBT — 1 = alias records (sort keys only), 2 = per-class specialized hit shaders, 3 = recursive per-class dispatch (needs `--dxr-inline 0`). See the sorted-SBT ladder section |
 | `--continuation-rays` | Software prototype: beam-produced opaque traversal frontier reused by leaf rays (`--sw-rays` is the technical alias) |
 | `--continuation-rays --no-cut-rays` | Direct control: same software intersector and `t_start`, but start every leaf ray at the root (and skip the terminal cut nothing there consumes) |
 | `--spin path` | The deterministic benchmark: a closed camera loop, pose a pure function of frame index |
@@ -969,6 +970,11 @@ Miguel interior 7.49 → 8.89 ms, Intel Sponza 32.6 → 38.8. Mips shrink the
 *working set*, which helps the fused path just as much; they don't manufacture
 inter-pixel reuse that a reorder could newly exploit. The feature stays
 off-by-default behind `--defer-shade`, gates and `defer:` counters intact.
+The GPU later returned the same verdict from the other side: the DXR
+sorted-SBT ladder (see the DXR section) handed the hardware 8 distinct sort
+keys over identical shading code and measured ~0 — there as here, ordering
+a uniform workload has nothing to win, and what finally paid was compiling
+per-class *thin* shaders, not sorting.
 
 ## Mip-mapping, trilinear, and 16× anisotropic filtering
 
@@ -1075,7 +1081,10 @@ Arc quirk but a cross-vendor property: the 4090 pays 3.0–4.6× on the same
 scenes. Arc's penalty is ~1.4–1.5× NVIDIA's, and it lands on top of a
 weaker RT-core baseline; the two *compound* into the 5× that started the
 investigation. DispatchRays launch overhead itself is ≈ zero — mode 2 lands
-at the compute reference kernel's own cost on both vendors.
+at the compute reference kernel's own cost on both vendors. (A later
+campaign sharpened this claim — see the sorted-SBT ladder below: most of
+the secondary-TraceRay bill turns out to be the fat shader hosted at every
+re-entry, not the re-entry itself.)
 
 Two riders worth keeping. The primary ray is the one place TraceRay earns
 anything: on the 4090, mode 1 beats mode 2 (a coherent primary on the
@@ -1100,6 +1109,74 @@ world alike, and its per-sample marginal is half of mode 1's), so since
 2026-08-01 **an Intel adapter defaults to `--dxr-inline 2`** — passing any
 explicit value, `1` included, pins your choice against the vendor policy.
 The numbers were the product; the defaults are the dividend.
+
+### The sorted-SBT ladder: where the tax actually lives
+
+The table above was measured with **one** shading record in the SBT — the
+degenerate case for hardware that sorts rays by shader record (Intel's
+Thread Sorting Unit), and not the way production titles feed a DXR
+pipeline. `--dxr-sbt 0|1|2|3` runs the counterfactual as a ladder, each
+rung isolating one mechanism. Eight field-derived material classes
+partition the scene into per-class TLAS instances
+(`InstanceContributionToHitGroupIndex = class × 3` into a class-major SBT;
+every TraceRay call site untouched — the routing is record arithmetic).
+Rung 1 keeps the one fat closest-hit and gives it 8 `ExportToRename`
+aliases: identical code, distinct shader identifiers, i.e. pure sort keys.
+Rung 2 compiles one specialized DXIL library per class, each class's
+provably-dead shading arms stripped — thin records, real register relief.
+Rung 3 turns the reflection/glass continuations into real `TraceRay`s that
+land in the hit surface's *own* class record (occlusion stays inline;
+declared recursion depth 5) — the shape the TSU is designed around. (A
+fourth dispatch mode also exists by now and appears below as a bar:
+`--dxr-inline 3`, a thin closest-hit that defers shading to a compute
+pass — an experiment that stays unpromoted.)
+
+Measured on the current tree and harness (2026-08-04; minimum of two reps
+run forward-then-reversed, Arc after its 1,600-frame warm-up; drivers B70
+32.0.101.8805, 4090 32.0.16.1062). Frame span in ms at `--dxr-inline 0` —
+the all-TraceRay pipeline, i.e. the TSU's regime — on
+default / stress / San Miguel low-poly:
+
+| rung | B70 spp=1 | B70 marginal ms/sample | 4090 spp=1 |
+|---|---|---|---|
+| 0 — one fat record | 8.02 / 5.31 / 6.79 | 7.02 / 4.54 / 5.92 | 1.17 / 0.83 / 1.15 |
+| 1 — alias (sort keys only) | 8.60 / 5.39 / 6.67 | 7.61 / 4.64 / 5.82 | 1.18 / 0.84 / 1.16 |
+| 2 — specialized | 2.51 / 2.38 / 2.17 | 1.93 / 1.74 / 1.65 | 0.25 / 0.34 / 0.24 |
+| 3 — recursive per-class | **1.49 / 1.78 / 1.29** | **0.93 / 1.03 / 0.81** | 0.19 / 0.27 / 0.20 |
+
+Four readings. **Sort keys alone bought ~0 on both vendors** — rung 1 is
+flat on the B70 even with 8 genuinely distinct identifiers in flight;
+sorting identical fat shaders has nothing to gain. **Specialization is the
+prize** — thin per-class hit shaders recover 55–80% of the pipeline's cost
+on *both* vendors, which revises the distilled claim above: the tax was
+never the scheduler hop itself so much as the fat uber shader hosted at
+every hop, and it largely vanishes when the records the pipeline hosts are
+thin. **Recursive per-class dispatch lands the textbook pipeline at parity
+with the best inline hybrids** (B70 1.49 vs the same-day inline-3's 1.40 on
+the default scene, and it wins the San Miguel column; per-sample marginals
+improve 5–7×) — with one confound flagged: rung 3 over rung 2 at inline 0
+also moves occlusion inline, so part of its margin restates the
+secondary-TraceRay finding. And **specialization stabilizes Arc codegen**:
+every configuration whose repeats spread more than 15% is a fat-record one;
+the specialized rows repeat tight.
+
+The practical residue: at the shipping `--dxr-inline 1`, specializing the
+one record the primary dispatches is still worth −50 to −60% on the B70
+(2.22/1.72/2.44 → **1.05/0.87/0.97**), beating the same-day inline-2
+(1.80/1.40/1.94) and inline-3 (1.40/1.44/2.20) bars — `--dxr-inline 1
+--dxr-sbt 2` is the fastest DXR configuration measured on Arc (the 4090
+gains −20 to −30% there too: 0.186/0.228/0.202), though the compute
+wavefront still wins outright (0.64/0.78 recorded on default/stress). The
+ladder stays a measurement lever, off by default; note that a rung-2
+record's flattened loop also shades its reflected/refracted continuation
+surfaces, which can belong to another class (worst measured error 9.6e-3
+radiance at a glass-heavy pose — rung 3 is exact by construction, every
+surface shading in its own record).
+
+Rename semantics turned out to be vendor trivia worth recording: the NVIDIA
+driver folds the 8 aliases into ONE shader identifier, the B70 mints all 8
+distinct, and an AMD iGPU driver (32.0.21018.14) access-violates in
+`CreateStateObject` on any renamed export.
 
 ## On Intel Arc
 
@@ -1338,7 +1415,11 @@ i.e. on Arc, with the world's fat alpha-cutout shaders, the DXR execution
 model itself costs 2–2.4× over compute for the same work on the same TLAS.
 (On the small procedural scene that same tax measured ≈ zero, which is why
 it went unnoticed; it is scene-dependent, and it is a driver/hardware
-property — the shader source is byte-identical between the arms.) So the
+property — the shader source is byte-identical between the arms.) The
+sorted-SBT ladder later localized most of that tax to the one fat shading
+record — per-class thin records dissolve the bulk of it on the spin
+scenes — though the world itself ships the one-record pipeline and was not
+re-measured under the ladder. So the
 world margin is real end-to-end, but it is roughly nine parts "Arc prefers
 this workload as compute" to one part quadtree.
 
