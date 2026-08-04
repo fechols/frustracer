@@ -749,7 +749,7 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                 float einv = min(1.0 / (ed2 + el_a[ei].w), EL_E_MAX / elum);
                 float ex = 1.0 - ed2 / er2;
                 float3 ee = ecol * (einv * ex * ex);
-                float3 evis = transmit_q(
+                float3 evis = ABL_TQ_SHADOW(
                     p, ewi, 0.0,
                     max(edist - sqrt(el_a[ei].w) - 2.0 * SCENE_EPS, 0.0));
                 if (all(evis == 0.0)) continue;
