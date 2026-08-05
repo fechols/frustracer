@@ -73,6 +73,11 @@
                                // keep the exact gather instead; an
                                // emissive-free scene never sets the bit, so
                                // its kernels are bit-identical)
+#define FLAG_WAVEVIZ    32768u // FR_WAVEVIZ live overlay: covered kernels
+                               // overwrite tbuf with their wave ticket and
+                               // the resolve stage blends the ticket hash
+                               // (only consumed inside #ifdef WAVEVIZ blocks
+                               // — unarmed kernels never read the bit)
 
 cbuffer Frame : register(b0) {
     float4 cam_origin;   // xyz; w = inv_w

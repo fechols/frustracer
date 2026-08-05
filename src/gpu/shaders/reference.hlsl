@@ -9,12 +9,13 @@ RWStructuredBuffer<float> accum : register(u0); // rw*rh*3, CPU layout parity
 RWStructuredBuffer<float> tbuf  : register(u1); // primary-hit t, INF = sky
 RWStructuredBuffer<uint>  info  : register(u2); // pack_info(depth, kind)
 
-#ifdef WIDTH_PROBE
-// FR_WIDTH: the counters buffer, bound at u3 by bind_common for every
-// dispatch on this pipeline (record_reference included). Width slots
+#if defined(WIDTH_PROBE) || defined(WAVEVIZ)
+// FR_WIDTH / FR_WAVEVIZ: the counters buffer, bound at u3 by bind_common for
+// every dispatch on this pipeline (record_reference included). Slots
 // (>= CTR_COUNT) ONLY — deliberately NOT ctr.hlsli and NOT HAVE_COUNTERS,
 // so rt.hlsli's gated stat increments stay compiled out of this unit (the
-// ctr.hlsli contract note; CTR_W_REFERENCE is injected by trace::width_defs).
+// ctr.hlsli contract note; CTR_W_REFERENCE / CTR_WV_TICKET are injected by
+// trace::width_defs / waveviz_defs).
 RWStructuredBuffer<uint> width_ctr : register(u3);
 #endif
 
@@ -24,6 +25,16 @@ void cs_reference(uint3 id : SV_DispatchThreadID) {
     // Report this kernel's COMPILED wave width once (thread 0,0) — the
     // per-shader SIMD choice the driver made for THIS kernel's pressure.
     if (id.x == 0u && id.y == 0u) width_ctr[CTR_W_REFERENCE] = WaveGetLaneCount();
+#endif
+#ifdef WAVEVIZ
+    // FR_WAVEVIZ: mint this wave's TICKET here, before any early-out or
+    // divergence — the wave is still converged, so one bump identifies it and
+    // the broadcast reaches every lane. Wave-uniform by construction.
+    uint wv_t = 0u;
+    if (flags & FLAG_WAVEVIZ) {
+        if (WaveIsFirstLane()) InterlockedAdd(width_ctr[CTR_WV_TICKET], 1u, wv_t);
+        wv_t = WaveReadLaneFirst(wv_t);
+    }
 #endif
     if (id.x >= rw || id.y >= rh) return;
 
@@ -116,6 +127,12 @@ void cs_reference(uint3 id : SV_DispatchThreadID) {
         [unroll] for (uint bi = 0u; bi < BALLAST_N; ++bi) bacc += ballast[bi];
         c += bacc;
     }
+#endif
+#ifdef WAVEVIZ
+    // The kernel's LAST tbuf touch: this pixel now carries its wave's ticket
+    // (asfloat bit-cast — float(t) would quantize past 2^24) for the resolve
+    // colorizer. accum keeps the real image, so toggling off is clean.
+    if (flags & FLAG_WAVEVIZ) tbuf[pi] = asfloat(wv_t);
 #endif
 
     uint i3 = pi * 3u;

@@ -3032,6 +3032,41 @@ scripted protocol can fire. Verdict shipped in the brief v1.7: heading re-scoped
 the same code", the "register-fat" qualifier retired (finding 5: the kernel's own ~50 live
 floats price from float zero — slim scenes pay too), and the audit block added to finding 1.
 
+**FR_WAVEVIZ (2026-08-05) — wave footprints made visible, and the launch-packing question
+closed.** `FR_WAVEVIZ=1` arms the wave-ticket overlay: each covered kernel's wave mints ONE
+ticket (`InterlockedAdd` + `WaveReadLaneFirst`, minted converged at kernel entry — per wave,
+never per stride iteration), every pixel stores its wave's ticket as its LAST tbuf touch
+(`asfloat` bit-cast — tbuf has no live-frame consumer), and the resolve stage hashes
+ticket→color under the runtime `FLAG_WAVEVIZ` bit (32768). **I** toggles it live in GPU
+arms (display-stage only, NO resets either way; plain presentation only; C-verify stands
+down while live — tbuf holds tickets); headless `--spin` runs arm it for the whole run and
+dump `waveviz-<arm>.png` + a compactness line (waves, px/wave, bbox stats — main.rs's
+`waveviz_dump`, whose Rust hash mirrors resolve.hlsl's `wv_hash_color` term for term).
+Covered: reference, leaf+sky (full wavefront coverage), the DXR raygen at inline 1/2
+(mode 0 = lib_6_3 no wave ops, mode 3's thin raygen is pinned to write no tbuf — both
+refuse loudly); `FR_WAVEVIZ=chs` (mode 1 only) tickets `chs_shade` instead, with the raygen
+sentineling misses 0xFFFFFFFE (rendered dark). Compute units bump `counters[CTR_WV_TICKET]`
+(= 30; CTR_TOTAL 31 — the never-zeroed ≥ CTR_COUNT class); the DXR pipeline uses
+`width_buf` slot 2 (created for either probe now). Unarmed sessions byte-identical
+(conditional defs pushes; `waveviz_blocks_are_guarded` + the widened dxr guard test pin it);
+both check suites green unarmed on the 4090. THE ANSWER (60-frame parked spins, 1080p,
+means over all waves): **launch packing is screen-tiled and FULL on BOTH vendors** —
+reference / mode-2 raygen / mode-1 raygen-end all read bbox exactly 32 (4090, 8×4 at
+SIMD32) or 16 (B70, 8×2 at SIMD16) at 100% compact with every lane live, so the
+DispatchRays grid is packed exactly like the compute grid and the folklore is now a
+measured row — **and the BTD-scatters-waves hypothesis is REFUTED, corroborating the
+regime-pricing attribution** (the mode-2 tax cannot be packing). THE NEW FINDING: **Intel
+fragments waves at TraceRay boundaries; NVIDIA does not.** B70 mode-1 raygen-end reads
+195,203 wave executions for 129,600 waves' worth of pixels at **10.6/16 live lanes** (mean
+bbox 132, 96.9% compact — mostly tiled, ~3% scattered shards), and the chs arm reads
+163,284 hit waves at **8.9/16** — while the 4090's continuation and hit waves stay full
+(31.9-32.0/32) and perfectly tiled. So mode 1 on Arc pays a SECOND mechanism beside the
+live-state pricing: ~1/3 of post-TraceRay lanes are dead, i.e. TraceRay-heavy pipelines
+lose wave occupancy at every stage boundary — consistent with finding 2's mode-0 column
+and worth a brief row. The wavefront arm reads 1.5% compact BY DESIGN (our own grid-stride
+spreads each wave across its whole ~540-px tile — the instrument documenting our dispatch
+shape, not the driver's; do not read that row as a driver finding).
+
 **Work graphs (`FR_WORKGRAPH=1`) — the ladder as a D3D12 work graph.** The one genuinely NEW
 Xe2 capability, and the queue records were already "work-graph-shaped". `src/gpu/shaders/
 workgraph.hlsl` replaces `cs_seed` + depth_full x (`cs_prep` + ExecuteIndirect) with ONE

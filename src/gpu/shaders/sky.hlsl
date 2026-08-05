@@ -84,6 +84,14 @@ void cs_sky(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     // FR_WIDTH: compiled wave width, once (see leaf.hlsl's note).
     if (all(gid == 0u) && gtid.x == 0u) counters[CTR_W_SKY] = WaveGetLaneCount();
 #endif
+#ifdef WAVEVIZ
+    // FR_WAVEVIZ: one ticket per wave, minted converged (leaf.hlsl's note).
+    uint wv_t = 0u;
+    if (flags & FLAG_WAVEVIZ) {
+        if (WaveIsFirstLane()) InterlockedAdd(counters[CTR_WV_TICKET], 1u, wv_t);
+        wv_t = WaveReadLaneFirst(wv_t);
+    }
+#endif
     uint g = flat_group(gid);
     uint rec_i = g / SKY_SPLIT;
     uint sub = g % SKY_SPLIT;
@@ -196,6 +204,10 @@ void cs_sky(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
             ambw[i3 + 2u] = 0.0;
         }
         tbuf[pi] = INF;
+#ifdef WAVEVIZ
+        // The wave's ticket overwrites the INF (the LAST tbuf touch).
+        if (flags & FLAG_WAVEVIZ) tbuf[pi] = asfloat(wv_t);
+#endif
         info[pi] = pack_info(rec.depth, KIND_SKY);
         // Sample 0's DECLARED position, matching the CPU sky-tile flood and
         // leaf.hlsl alike — one convention, and `dir` is its exact preimage,

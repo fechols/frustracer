@@ -44,6 +44,7 @@ pub struct Edges {
     pub toggle_temporal: bool, // M (OIDN temporal reprojection)
     pub toggle_bounce: bool,   // H (hemisphere frustum bounces)
     pub toggle_height: bool,   // V (heightfield relief vs normal-mapped)
+    pub toggle_waveviz: bool,  // I (FR_WAVEVIZ wave-footprint overlay; armed sessions only)
     pub verify: bool,          // C
     pub screenshot: bool,      // P
     pub cycle_spp: bool,       // U (samples per pixel: 1 -> 2 -> 4 -> 8 -> 1)
@@ -196,6 +197,7 @@ impl Input {
                     Keycode::M => e.toggle_temporal = true,
                     Keycode::H => e.toggle_bounce = true,
                     Keycode::V => e.toggle_height = true,
+                    Keycode::I => e.toggle_waveviz = true,
                     Keycode::C => e.verify = true,
                     Keycode::P => e.screenshot = true,
                     Keycode::U => e.cycle_spp = true,

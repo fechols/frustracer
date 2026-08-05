@@ -771,6 +771,37 @@ impl DxrGpu {
                 );
             }
         }
+        // FR_WAVEVIZ — the wave-ticket overlay's DXR half. Modes 1/2 only:
+        // mode 0's raygen is lib_6_3 (no wave ops) and mode 3's thin raygen
+        // is PINNED to write no tbuf (the deferred kernel is plain compute —
+        // its packing is the dispatch grid's, nothing to discover). The
+        // `chs` sub-mode additionally needs mode 1 (the one mode whose
+        // primary runs a closest-hit).
+        let wv = trace::waveviz_defs();
+        let wv_armed = if !wv.is_empty() {
+            if inline_mode == 1 || inline_mode == 2 {
+                parts.push(wv.as_str());
+                if trace::waveviz_chs() {
+                    if inline_mode == 1 {
+                        parts.push("#define WAVEVIZ_CHS 1");
+                    } else {
+                        eprintln!(
+                            "gpu: FR_WAVEVIZ=chs needs --dxr-inline 1 (this session \
+                             is mode {inline_mode}) — raygen tickets instead"
+                        );
+                    }
+                }
+                true
+            } else {
+                eprintln!(
+                    "gpu: FR_WAVEVIZ needs --dxr-inline 1|2 (this session is mode \
+                     {inline_mode}) — off on this pipeline"
+                );
+                false
+            }
+        } else {
+            false
+        };
         parts.push(trace::TRACE_COMMON_HLSLI);
         // skylod.hlsli after trace_common (needs sky_compose/sky_backdrop/rw); no
         // SKY_UNIT — this unit pastes no queues.hlsli, so u5 is free anyway.
@@ -821,7 +852,16 @@ impl DxrGpu {
                 )
             })
             .collect::<Result<_>>()?;
-        let resolve_src = [sd, trace::TRACE_COMMON_HLSLI, trace::RESOLVE_HLSL].join("\n");
+        // The resolve unit's WAVEVIZ arm keys on wv_armed (not waveviz_on):
+        // in a refused mode the kernels write no tickets, so a colorizing
+        // resolve would hash stale t values — the define stays out and the
+        // flag bit is ignored, the conditional-push rule either way.
+        let mut resolve_parts: Vec<&str> = Vec::new();
+        if wv_armed {
+            resolve_parts.push(wv.as_str());
+        }
+        resolve_parts.extend([sd, trace::TRACE_COMMON_HLSLI, trace::RESOLVE_HLSL]);
+        let resolve_src = resolve_parts.join("\n");
         let pso_resolve = trace::compute_pso(
             device,
             &root_sig,
@@ -1510,7 +1550,9 @@ impl DxrGpu {
             sway_mv_t: std::cell::Cell::new(None),
             sway_mv_on: !sway_def.is_empty(),
             mode3,
-            width_buf: if trace::width_probe_on() {
+            // 16 B = 4 u32 slots: 0/1 = the FR_WIDTH report, 2 = the
+            // FR_WAVEVIZ ticket counter, 3 spare. Created for either probe.
+            width_buf: if trace::width_probe_on() || wv_armed {
                 Some(committed_buffer(device, 16, uaf, ua)?)
             } else {
                 None
@@ -1917,14 +1959,26 @@ mod mode3_shader_source_tests {
     /// (writing through an unset root descriptor is UB).
     #[test]
     fn width_writes_are_guarded() {
-        for (name, src, guard) in [
-            ("dxr.hlsl", DXR_HLSL, "#ifdef WIDTH_PROBE_RAYGEN"),
-            ("dxr_shade.hlsl", DXR_SHADE_HLSL, "#ifdef WIDTH_PROBE"),
+        // dxr.hlsl's probe buffer now has THREE legal guards (the decl's
+        // WIDTH_PROBE_RAYGEN||WAVEVIZ, the width epilogue's, and the two
+        // WAVEVIZ ticket arms); a use is guarded iff the NEAREST preceding
+        // guard-open of ANY spelling has no #endif between it and the use.
+        let guards_dxr: &[&str] = &[
+            "#ifdef WIDTH_PROBE_RAYGEN",
+            "#if defined(WIDTH_PROBE_RAYGEN) || defined(WAVEVIZ)",
+            "#if defined(WAVEVIZ) && defined(WAVEVIZ_CHS)",
+            "#if defined(WAVEVIZ) && !defined(WAVEVIZ_CHS)",
+        ];
+        for (name, src, guards) in [
+            ("dxr.hlsl", DXR_HLSL, guards_dxr),
+            ("dxr_shade.hlsl", DXR_SHADE_HLSL, &["#ifdef WIDTH_PROBE"][..]),
         ] {
             for (i, _) in src.match_indices("dxr_width") {
-                let last_open = src[..i]
-                    .rfind(guard)
-                    .unwrap_or_else(|| panic!("{name}: dxr_width used before any {guard}"));
+                let last_open = guards
+                    .iter()
+                    .filter_map(|g| src[..i].rfind(g))
+                    .max()
+                    .unwrap_or_else(|| panic!("{name}: dxr_width used before any guard"));
                 assert!(
                     !src[last_open..i].contains("#endif"),
                     "{name}: dxr_width use at byte {i} escaped its guard"
