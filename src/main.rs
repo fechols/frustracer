@@ -16508,6 +16508,33 @@ fn session(
                 gpu_reset = true;
                 eprintln!("gpu: {}", if hybrid { "hybrid (wavefront quadtree)" } else { "plain (per-pixel reference)" });
             }
+            // I: the FR_WAVEVIZ overlay — THIS arm's copy (the gpu_trace arm
+            // `continue`s before the shared toggle block below, the same
+            // reason it has its own quality/spp/hybrid handlers). frame = 0
+            // because a CONVERGED still frame re-presents without tracing —
+            // no trace, no tickets, and the resolve never re-runs — so the
+            // toggle restarts plain accumulation; every history is untouched.
+            if edges.toggle_waveviz {
+                if !gpu::trace::waveviz_on() {
+                    eprintln!(
+                        "waveviz: not armed — relaunch with FR_WAVEVIZ=1 (or =chs \
+                         for mode-1 closest-hit tickets)"
+                    );
+                } else {
+                    let on = !gpu::trace::waveviz_live();
+                    gpu::trace::set_waveviz_live(on);
+                    frame = 0;
+                    eprintln!(
+                        "waveviz: {}{}",
+                        if on { "ON (wave-ticket overlay)" } else { "OFF" },
+                        if on && gpu_up != GpuUp::Plain {
+                            " — visible in plain presentation only; toggle the upscaler off (G/X/K)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+            }
             // --quinlight: every upscaler key toggles the fuse vs plain (see
             // gpu_quin_avail). Handled once, ahead of the per-level toggles,
             // which are then suppressed — their "not wired" lines would be a
@@ -17041,28 +17068,28 @@ fn session(
                 );
             }
         }
-        // I: the FR_WAVEVIZ wave-footprint overlay — display-stage only (the
-        // resolve blends the ticket hash; accum and every history untouched,
-        // so NO resets in either direction — toggling off is clean next
-        // frame). GPU arms only; visible in PLAIN presentation (the resolve
-        // path — upscaler sub-modes present the upscaler's output).
+        // I: the FR_WAVEVIZ wave-footprint overlay, the DXR/CPU arms' copy
+        // (the gpu_trace arm `continue`s before this block and carries its
+        // own — the quality/spp handler pattern). Display-stage only, but
+        // frame = 0 on toggle: a CONVERGED still frame re-presents without
+        // tracing, so without the reset no ticket is ever traced and the
+        // resolve never re-runs. Every history is untouched.
         if edges.toggle_waveviz {
             if !gpu::trace::waveviz_on() {
                 eprintln!(
                     "waveviz: not armed — relaunch with FR_WAVEVIZ=1 (or =chs \
                      for mode-1 closest-hit tickets)"
                 );
-            } else if !(gpu_trace || dxr_on) {
+            } else if !dxr_on {
                 eprintln!("waveviz: GPU modes only (SPACE into the wavefront or DXR arm)");
             } else {
                 let on = !gpu::trace::waveviz_live();
                 gpu::trace::set_waveviz_live(on);
-                let plain =
-                    if dxr_on { dxr_up == GpuUp::Plain } else { gpu_up == GpuUp::Plain };
+                frame = 0;
                 eprintln!(
                     "waveviz: {}{}",
                     if on { "ON (wave-ticket overlay)" } else { "OFF" },
-                    if on && !plain {
+                    if on && dxr_up != GpuUp::Plain {
                         " — visible in plain presentation only; toggle the upscaler off (G/X/K)"
                     } else {
                         ""

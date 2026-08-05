@@ -3038,8 +3038,12 @@ ticket (`InterlockedAdd` + `WaveReadLaneFirst`, minted converged at kernel entry
 never per stride iteration), every pixel stores its wave's ticket as its LAST tbuf touch
 (`asfloat` bit-cast — tbuf has no live-frame consumer), and the resolve stage hashes
 ticket→color under the runtime `FLAG_WAVEVIZ` bit (32768). **I** toggles it live in GPU
-arms (display-stage only, NO resets either way; plain presentation only; C-verify stands
-down while live — tbuf holds tickets); headless `--spin` runs arm it for the whole run and
+arms — TWO handler copies by structure: the gpu_trace arm `continue`s before the shared
+toggle block, so it carries its own (the quality/spp pattern; a shared-block-only handler
+shipped first and was dead code in --gpu sessions). The toggle sets `frame = 0` (a
+CONVERGED still frame re-presents without tracing — no trace, no tickets, no resolve —
+so plain accumulation restarts; every history untouched; plain presentation only;
+C-verify stands down while live — tbuf holds tickets); headless `--spin` runs arm it for the whole run and
 dump `waveviz-<arm>.png` + a compactness line (waves, px/wave, bbox stats — main.rs's
 `waveviz_dump`, whose Rust hash mirrors resolve.hlsl's `wv_hash_color` term for term).
 Covered: reference, leaf+sky (full wavefront coverage), the DXR raygen at inline 1/2
