@@ -437,6 +437,10 @@ pub struct DxrGpu {
     /// bind exactly what they bind today. Read back by the spin/check width
     /// prints via `width_buf()`.
     width_buf: Option<ID3D12Resource>,
+    /// --waveviz: the 4-byte zero upload record_frame copies over
+    /// width_buf slot 2 (the ticket counter) each frame — per-frame-stable
+    /// ticket colors, TraceGpu::wv_zero's twin.
+    wv_zero: Option<d3d12::UploadBuffer>,
     /// The frame's spp, stashed by `write_cb` (which sees FrameParams) for
     /// `record_frame`'s mode-3 pass-pair loop (which doesn't) — the `sway_t`
     /// idiom; every caller including all --check-dxr sites writes the CB
@@ -852,16 +856,9 @@ impl DxrGpu {
                 )
             })
             .collect::<Result<_>>()?;
-        // The resolve unit's WAVEVIZ arm keys on wv_armed (not waveviz_on):
-        // in a refused mode the kernels write no tickets, so a colorizing
-        // resolve would hash stale t values — the define stays out and the
-        // flag bit is ignored, the conditional-push rule either way.
-        let mut resolve_parts: Vec<&str> = Vec::new();
-        if wv_armed {
-            resolve_parts.push(wv.as_str());
-        }
-        resolve_parts.extend([sd, trace::TRACE_COMMON_HLSLI, trace::RESOLVE_HLSL]);
-        let resolve_src = resolve_parts.join("\n");
+        // The waveviz overlay composites at the present funnel, not here —
+        // this resolve runs only on the plain arm and stays lever-free.
+        let resolve_src = [sd, trace::TRACE_COMMON_HLSLI, trace::RESOLVE_HLSL].join("\n");
         let pso_resolve = trace::compute_pso(
             device,
             &root_sig,
@@ -1551,9 +1548,16 @@ impl DxrGpu {
             sway_mv_on: !sway_def.is_empty(),
             mode3,
             // 16 B = 4 u32 slots: 0/1 = the FR_WIDTH report, 2 = the
-            // FR_WAVEVIZ ticket counter, 3 spare. Created for either probe.
+            // waveviz ticket counter, 3 spare. Created for either probe.
             width_buf: if trace::width_probe_on() || wv_armed {
                 Some(committed_buffer(device, 16, uaf, ua)?)
+            } else {
+                None
+            },
+            wv_zero: if wv_armed {
+                let z = d3d12::UploadBuffer::new(device, 4)?;
+                unsafe { std::ptr::write_bytes(z.ptr, 0, 4) };
+                Some(z)
             } else {
                 None
             },
@@ -1774,6 +1778,23 @@ impl DxrGpu {
         let list4: ID3D12GraphicsCommandList4 =
             list.cast().map_err(|e| format!("ID3D12GraphicsCommandList4: {e}"))?;
         let _ev = super::pix::scope(list, c"dxr");
+        // --waveviz: per-frame ticket-counter zero (TraceGpu::record_frame's
+        // twin — width_buf slot 2, offset 8).
+        if let (Some(z), Some(wb)) = (&self.wv_zero, &self.width_buf) {
+            unsafe {
+                list.ResourceBarrier(&[transition(
+                    wb,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                )]);
+                list.CopyBufferRegion(wb, 8, &z.resource, 0, 4);
+                list.ResourceBarrier(&[transition(
+                    wb,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+            }
+        }
         // --foliage-sway: rebuild this slot's animated TLAS at the frame's
         // clock BEFORE anything binds it (bind_common below picks the ring
         // slot when the clock is Some). A bit-equal clock records nothing —

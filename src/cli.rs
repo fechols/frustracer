@@ -431,6 +431,13 @@ pub struct Opts {
     /// menu writes `advanced.dxr_inline`, and a saved preference must veto
     /// the policy.
     pub dxr_inline_explicit: bool,
+    /// `--waveviz [chs]` (`gpu::trace::set_waveviz`) — the wave-footprint
+    /// overlay instrument: 0 off, 1 on, 2 = the mode-1 closest-hit variant.
+    /// The optional `chs` token is consumed only when it matches exactly
+    /// (the `--blas-split` optional-value idiom — a following scene path is
+    /// safe). `FR_WAVEVIZ` stays as the env alias; the CLI wins (main's
+    /// lever block owns the precedence).
+    pub waveviz: u8,
     /// `--dxr-sbt 0|1|2|3` (`gpu::dxr::set_sbt_mode`) — the many-record,
     /// material-sorted SBT ladder (the Intel-brief Q4 counterfactual). A dev
     /// MEASUREMENT lever, the `--sw-rays` class: default 0 = off, no vendor
@@ -647,6 +654,7 @@ pub fn defaults() -> Opts {
         emissive_lights_count: emissive::EL_DEFAULT,
         dxr_inline: 1,
         dxr_inline_explicit: false,
+        waveviz: 0,
         dxr_sbt: 0,
         foliage_sway: true,
         foliage_amp: 1.0,
@@ -1055,6 +1063,17 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
                     eprintln!("--bvh-builder needs one of: sah | lbvh | ploc | som");
                     std::process::exit(2);
                 });
+            }
+            "--waveviz" => {
+                // Optional value: bare = the overlay, `chs` = the mode-1
+                // closest-hit variant. Consumed only on an exact match, so a
+                // following scene path is safe (the --blas-split idiom).
+                opts.waveviz = if args.peek().is_some_and(|v| v == "chs") {
+                    args.next();
+                    2
+                } else {
+                    1
+                };
             }
             "--blas-split" => {
                 // Optional value: a bare flag takes the conventional-band cap,
@@ -1608,6 +1627,10 @@ pub fn usage() {
                 eprintln!("                                  (CPU/--gpu only; --dxr has one DXR arm)");
                 eprintln!("    --continuation-rays  software prototype: beam-produced opaque frontier");
                 eprintln!("                           reused by leaf rays (--no-cut-rays = SW root control)");
+                eprintln!("  --waveviz [chs]  wave-footprint overlay: every pixel wears its wave's hash");
+                eprintln!("                color (I toggles live in GPU arms, every upscaler included;");
+                eprintln!("                --spin runs dump waveviz-<arm>.png + compactness stats;");
+                eprintln!("                chs = mode-1 closest-hit tickets, the hit-stage packing view)");
                 eprintln!("  --cinematic [p]  MEDIA MODE: render stills / camera-spline video sequences");
                 eprintln!("                headlessly. Presets: hero (default, one still) | islands |");
                 eprintln!("                tour (the island lap, dawn -> moonlit night) | orbit | hud |");
@@ -1875,6 +1898,8 @@ pub fn self_test() -> Result<(), String> {
         "2",
         "--dxr-sbt",
         "3",
+        "--waveviz",
+        "chs",
         "--no-foliage-sway",
         "--foliage-amp",
         "2",
@@ -1914,6 +1939,7 @@ pub fn self_test() -> Result<(), String> {
         // A field, not a process global — the purity gate's lever_snapshot
         // additionally proves the parse never called set_sbt_mode.
         ("dxr_sbt", o.dxr_sbt == 3),
+        ("waveviz", o.waveviz == 2),
         ("foliage_sway", !o.foliage_sway),
         ("foliage_amp", o.foliage_amp == 2.0),
     ] {
@@ -2097,6 +2123,16 @@ pub fn self_test() -> Result<(), String> {
         || bare.obj.as_deref() != Some("model.obj")
     {
         return Err("--blas-split must not swallow a following scene path".into());
+    }
+    // Same optional-value contract for --waveviz: `chs` is consumed on exact
+    // match only, a scene path is not.
+    let wv = parse_argv(&["--waveviz", "chs"]);
+    if wv.opts.waveviz != 2 {
+        return Err("--waveviz chs must take the closest-hit mode".into());
+    }
+    let wv_bare = parse_argv(&["--waveviz", "model.obj"]);
+    if wv_bare.opts.waveviz != 1 || wv_bare.obj.as_deref() != Some("model.obj") {
+        return Err("--waveviz (bare) must arm without swallowing a scene path".into());
     }
     // Same optional-value contract for the emissive arming flag: bare arms
     // at the default budget without eating a scene path.

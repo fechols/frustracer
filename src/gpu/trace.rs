@@ -3325,37 +3325,48 @@ pub(crate) fn ballast_dxr_defs() -> String {
 /// Unarmed sessions stay byte-identical (conditional defs pushes). Loud on
 /// arm and on an unrecognized value (the FR_WIDE rule).
 pub(crate) fn waveviz_on() -> bool {
-    waveviz_parsed().0
+    WAVEVIZ_MODE.load(std::sync::atomic::Ordering::Relaxed) != 0
 }
 
-/// The FR_WAVEVIZ=chs sub-mode (implies `waveviz_on`).
+/// The `--waveviz chs` sub-mode (implies `waveviz_on`).
 pub(crate) fn waveviz_chs() -> bool {
-    waveviz_parsed().1
+    WAVEVIZ_MODE.load(std::sync::atomic::Ordering::Relaxed) == 2
 }
 
-fn waveviz_parsed() -> (bool, bool) {
-    static ON: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| match std::env::var("FR_WAVEVIZ") {
-        Err(_) => (false, false),
-        Ok(v) if v == "1" => {
-            eprintln!(
-                "gpu: FR_WAVEVIZ=1 — wave-ticket overlay armed (I toggles live; \
-                 tbuf carries tickets while ON, so C-verify stands down)"
-            );
-            (true, false)
-        }
-        Ok(v) if v == "chs" => {
-            eprintln!(
-                "gpu: FR_WAVEVIZ=chs — closest-hit wave tickets armed (mode-1 \
-                 DXR only; shows post-launch repacking)"
-            );
-            (true, true)
-        }
+/// 0 = off, 1 = on, 2 = chs. Written ONCE by main's lever block (the CLI
+/// `--waveviz [chs]` wins over the `FR_WAVEVIZ` env alias) BEFORE any GPU
+/// construction — Passes::new, both tracers' kernel assemblies, and the
+/// spin arms all read it through the accessors above.
+static WAVEVIZ_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub fn set_waveviz(mode: u8) {
+    WAVEVIZ_MODE.store(mode, std::sync::atomic::Ordering::Relaxed);
+    match mode {
+        1 => eprintln!(
+            "gpu: waveviz — wave-ticket overlay armed (I toggles live in GPU \
+             arms, every upscaler included; tbuf carries tickets while ON, so \
+             C-verify stands down)"
+        ),
+        2 => eprintln!(
+            "gpu: waveviz chs — closest-hit wave tickets armed (mode-1 DXR \
+             only; shows the driver's hit-stage packing)"
+        ),
+        _ => {}
+    }
+}
+
+/// The `FR_WAVEVIZ` env alias (scripts): parsed by main's lever block when
+/// the CLI flag is absent. Loud on an illegal value (the FR_WIDE rule).
+pub fn waveviz_env() -> u8 {
+    match std::env::var("FR_WAVEVIZ") {
+        Err(_) => 0,
+        Ok(v) if v == "1" => 1,
+        Ok(v) if v == "chs" => 2,
         Ok(v) => {
             eprintln!("gpu: FR_WAVEVIZ={v:?} unrecognized (legal: 1 | chs) — off");
-            (false, false)
+            0
         }
-    })
+    }
 }
 
 /// The live overlay switch inside an armed session (the I key; headless spin
@@ -4932,6 +4943,11 @@ pub struct TraceGpu {
     /// + leaf/sky queues + the cut pool, all sized to the structural worst
     /// case (see caps) so the primary queues cannot overflow.
     pub counters: ID3D12Resource,
+    /// --waveviz: a persistent 4-byte zero upload buffer — record_frame
+    /// copies it over counters[CTR_WV_TICKET] each frame so wave k's ticket
+    /// (and therefore its hash color) is deterministic per frame instead of
+    /// strobing as the counter grows. Armed sessions only.
+    wv_zero: Option<d3d12::UploadBuffer>,
     args: ID3D12Resource,
     qa: ID3D12Resource,
     qb: ID3D12Resource,
@@ -5120,15 +5136,11 @@ impl TraceGpu {
             REFERENCE_HLSL,
         ]);
         let reference_src = reference_parts.join("\n");
-        // The resolve unit takes the WAVEVIZ arm too (the ticket colorizer —
-        // it declares its own tbuf view under the define); conditional push,
-        // same rule.
-        let mut resolve_parts: Vec<&str> = Vec::new();
-        if !wv.is_empty() {
-            resolve_parts.push(wv.as_str());
-        }
-        resolve_parts.extend([sd, TRACE_COMMON_HLSLI, RESOLVE_HLSL]);
-        let resolve_src = resolve_parts.join("\n");
+        // The waveviz overlay deliberately does NOT live in this resolve
+        // unit any more: it composites at the present funnel (tonemap.rs's
+        // waveviz PSO), which is what makes it work under every upscaler —
+        // the resolve runs only on the plain arms.
+        let resolve_src = [sd, TRACE_COMMON_HLSLI, RESOLVE_HLSL].join("\n");
         let (sky_group, sky_split) = (SKY_GROUP, SKY_SPLIT);
         let sky_defs = format!(
             "#define SKY_GROUP {sky_group}\n#define SKY_SPLIT {sky_split}\n#define LEAF_TILE {}",
@@ -5432,6 +5444,13 @@ impl TraceGpu {
         // Unconditional — 20 bytes buys a lever-independent buffer shape (an
         // FR_WIDTH session and a plain one bind identical resources).
         let counters = committed_buffer(device, CTR_TOTAL as u64 * 4, uaf, ua)?;
+        let wv_zero = if waveviz_on() {
+            let z = d3d12::UploadBuffer::new(device, 4)?;
+            unsafe { std::ptr::write_bytes(z.ptr, 0, 4) };
+            Some(z)
+        } else {
+            None
+        };
         let args = committed_buffer(device, 16 * 12, uaf, ua)?;
         let qa = committed_buffer(device, cap_tile * 24, uaf, ua)?;
         let qb = committed_buffer(device, cap_tile * 24, uaf, ua)?;
@@ -5658,6 +5677,7 @@ impl TraceGpu {
             tbuf,
             info,
             counters,
+            wv_zero,
             args,
             qa,
             qb,
@@ -6430,6 +6450,26 @@ impl TraceGpu {
     /// the R-key A/B. (The reference kernel has no hemi tiers: with fb on
     /// it renders the sampled-ambient path.)
     pub fn record_frame(&self, list: &ID3D12GraphicsCommandList, slot: usize, p: &FrameParams, hybrid: bool) {
+        // --waveviz: zero the ticket counter FIRST, so wave k's ticket is a
+        // per-frame value and the overlay's colors are stable instead of
+        // strobing as the counter grows (one clear covers the hybrid,
+        // replay, AND reference arms — the reference unit runs no seed
+        // kernel, which is why this is Rust-side and not in cs_seed).
+        if let Some(z) = &self.wv_zero {
+            unsafe {
+                list.ResourceBarrier(&[transition(
+                    &self.counters,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                )]);
+                list.CopyBufferRegion(&self.counters, CTR_WV_TICKET as u64 * 4, &z.resource, 0, 4);
+                list.ResourceBarrier(&[transition(
+                    &self.counters,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+            }
+        }
         if hybrid {
             // Structure replay: a bit-equal basis under `p.replay` re-dispatches
             // the persisted terminal queues instead of re-running seed + the
@@ -7413,13 +7453,11 @@ mod width_ballast_shader_source_tests {
     /// unarmed byte-identity contract (the width pin's shape).
     #[test]
     fn waveviz_blocks_are_guarded() {
-        const RESOLVE: &str = super::RESOLVE_HLSL;
         let guards: &[&str] = &["#ifdef WAVEVIZ", "#if defined(WIDTH_PROBE) || defined(WAVEVIZ)"];
         for (name, src, needles) in [
             ("leaf", LEAF_HLSL, &["CTR_WV_TICKET", "wv_t"][..]),
             ("sky", SKY, &["CTR_WV_TICKET", "wv_t"][..]),
             ("reference", REFERENCE, &["CTR_WV_TICKET", "wv_t"][..]),
-            ("resolve", RESOLVE, &["wv_hash_color", "FLAG_WAVEVIZ"][..]),
         ] {
             for needle in needles {
                 let mut found = 0u32;
@@ -7440,9 +7478,9 @@ mod width_ballast_shader_source_tests {
                 assert!(found > 0, "{name}: expected at least one {needle} (anti-vacuity)");
             }
         }
-        // resolve declares its OWN tbuf view under the guard (the register
-        // must match the pipeline's u1 binding).
-        assert!(RESOLVE.contains("RWStructuredBuffer<float> tbuf : register(u1);"));
+        // The overlay's colorizer lives at the present funnel (waveviz.hlsl),
+        // not in resolve — resolve must stay lever-free (plain arms only).
+        assert!(!super::RESOLVE_HLSL.contains("WAVEVIZ"));
     }
 
     /// The FR_BALLAST array must be confined to its guarded blocks and its

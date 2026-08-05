@@ -3032,18 +3032,36 @@ scripted protocol can fire. Verdict shipped in the brief v1.7: heading re-scoped
 the same code", the "register-fat" qualifier retired (finding 5: the kernel's own ~50 live
 floats price from float zero — slim scenes pay too), and the audit block added to finding 1.
 
-**FR_WAVEVIZ (2026-08-05) — wave footprints made visible, and the launch-packing question
-closed.** `FR_WAVEVIZ=1` arms the wave-ticket overlay: each covered kernel's wave mints ONE
-ticket (`InterlockedAdd` + `WaveReadLaneFirst`, minted converged at kernel entry — per wave,
-never per stride iteration), every pixel stores its wave's ticket as its LAST tbuf touch
-(`asfloat` bit-cast — tbuf has no live-frame consumer), and the resolve stage hashes
-ticket→color under the runtime `FLAG_WAVEVIZ` bit (32768). **I** toggles it live in GPU
+**WAVEVIZ (2026-08-05) — wave footprints made visible, and the launch-packing question
+closed.** `--waveviz [chs]` (CLI, the user-facing spelling since the funnel promotion;
+`FR_WAVEVIZ=1|chs` stays as the env alias, CLI wins — main's lever block owns the
+precedence via `trace::set_waveviz`) arms the wave-ticket overlay: each covered kernel's
+wave mints ONE ticket (`InterlockedAdd` + `WaveReadLaneFirst`, minted converged at kernel
+entry — per wave, never per stride iteration), every pixel stores its wave's ticket as its
+LAST tbuf touch (`asfloat` bit-cast — tbuf has no live-frame consumer), and the overlay is
+COMPOSITED AT THE PRESENT FUNNEL (waveviz.hlsl — its own PS + PSO on the tonemap root
+signature, the HUD's exact shape: premultiplied blend, drawn after the tonemap draw inside
+`fullscreen_to_backbuffer`), which is what makes it work under EVERY upscaler sub-mode —
+RR/XeSS/FSR/quinlight included (feeding hash colors INTO a temporal model was rejected: it
+would smear per-frame tickets; the resolve-stage colorizer that shipped first was
+plain-arm-only and is deleted). Plumbing: tickets reach the PS as a t2 ROOT SRV (root
+param 3, bound by VA — no descriptor), nearest window→render mapping off the draw's own
+8-DWORD b0 layout (root constants are per-draw; tonemap/hud untouched), tbuf bracketed
+UA↔PIXEL_SHADER_RESOURCE around the draw (the bloom bracket), and `GpuContext::waveviz_src`
+(a Cell stamped by every presenter: Trace/Dxr/None) names whose tbuf to read — the None
+stamp on CPU-fed presenters is what stops a SPACE back to CPU compositing a stale GPU
+tbuf, and `present_again` inherits the Cell like `last_present`. PER-FRAME TICKET RESET:
+both record_frames copy a persistent 4-byte zero over the ticket counter
+(counters[CTR_WV_TICKET] / width_buf slot 2) so wave k's ticket — and color — is
+deterministic per frame instead of strobing at frame rate under the upscalers' fresh-1-spp
+contract; spin's `waves=` is therefore a per-frame count. **I** toggles it live in GPU
 arms — TWO handler copies by structure: the gpu_trace arm `continue`s before the shared
 toggle block, so it carries its own (the quality/spp pattern; a shared-block-only handler
 shipped first and was dead code in --gpu sessions). The toggle sets `frame = 0` (a
-CONVERGED still frame re-presents without tracing — no trace, no tickets, no resolve —
-so plain accumulation restarts; every history untouched; plain presentation only;
-C-verify stands down while live — tbuf holds tickets); headless `--spin` runs arm it for the whole run and
+CONVERGED still frame re-presents without tracing — no trace, no tickets — so plain
+accumulation restarts; every history untouched; C-verify stands down while live — tbuf
+holds tickets). Known-accept: P screenshots under upscalers read the upscaler output
+PRE-funnel, so they exclude the overlay (the HUD's accept); headless `--spin` runs arm it for the whole run and
 dump `waveviz-<arm>.png` + a compactness line (waves, px/wave, bbox stats — main.rs's
 `waveviz_dump`, whose Rust hash mirrors resolve.hlsl's `wv_hash_color` term for term).
 Covered: reference, leaf+sky (full wavefront coverage), the DXR raygen at inline 1/2
