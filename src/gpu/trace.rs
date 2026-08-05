@@ -5835,7 +5835,18 @@ impl TraceGpu {
             // wavefront-vs-reference image A/B bit-identical at the default-ON K.
             self.record_sky_lod(list);
             list.SetPipelineState(&self.pso_reference);
-            list.Dispatch(self.rw.div_ceil(8), self.rh.div_ceil(8), 1);
+            {
+                // The bare dispatch, mirroring `dxr-rays`' bracket shape
+                // EXACTLY (bind/PSO/cache-fills/trailing-barrier all outside,
+                // end timestamp pre-barrier like its twin): the outer
+                // `reference` region also contains bind_common + the two
+                // cloud-cache fills + the PSO set + the barrier, so a
+                // reference-vs-dxr-rays read compares two DIFFERENT bracket
+                // shapes — the finding-1 audit's bracket-asymmetry catch.
+                // `reference-kernel` is the like-for-like row.
+                let _k = super::pix::scope(list, c"reference-kernel");
+                list.Dispatch(self.rw.div_ceil(8), self.rh.div_ceil(8), 1);
+            }
             list.ResourceBarrier(&[uav_barrier(None)]);
         }
     }

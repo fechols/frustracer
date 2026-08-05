@@ -231,6 +231,37 @@ pub(crate) fn dxr_inline_mode() -> u32 {
     INLINE_MODE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// FR_DXR_LEAN=1 — the DEAD-EXPORTS CONTROL for the DispatchRays-regime
+/// finding (finding 1's "zero TraceRay" arm). At `--dxr-inline 2` the RTPSO
+/// still compiles and EXPORTS the fat `chs_shade` + misses + any-hits as
+/// dead code (rt_dxr.hlsli's own note: "dead-but-exported and no ray can
+/// reach them"), so "the raygen's 2× is its own hosting" and "the driver
+/// provisions for the fat unreached exports" were observationally
+/// confounded. Armed, the state object takes the RAYGEN-ONLY export list
+/// (same DXIL blob — the front-end input is unchanged; the driver is merely
+/// told only raygen participates), zero hit-group subobjects, declared
+/// recursion depth 0 (legal: nothing traces — the micro-variant the
+/// pipe_cfg comment deferred), and null miss/hit SBT ranges on the
+/// DispatchRays desc. Image provably identical (nothing reachable changed).
+/// If the mode-2 tax PERSISTS lean, the raygen's own hosting carries it —
+/// the ballast dose-response's intercept attribution confirmed; if it
+/// COLLAPSES, the tax was export provisioning and finding 1 gets rewritten.
+/// Mode-2-only BY SOUNDNESS: any other mode has real TraceRay consumers
+/// whose miss/hit lookups against a null table are undefined — asked-for
+/// anywhere else it refuses loudly and stays off. Default off =
+/// byte-identical descs (the FR_ABL class).
+fn lean_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("FR_DXR_LEAN") {
+        Err(_) => false,
+        Ok(v) if v == "1" => true, // announced at DxrGpu::new, where the mode is known
+        Ok(v) => {
+            eprintln!("gpu: FR_DXR_LEAN={v:?} unrecognized (legal: 1) — off");
+            false
+        }
+    })
+}
+
 /// `--dxr-sbt 0|1|2|3` (default **0** = off, today's one-record SBT): the
 /// many-record, MATERIAL-SORTED SBT ladder — the counterfactual the Intel
 /// brief's Q4 promised ("the TSU sorts by shader RECORD… the guidance would
@@ -331,6 +362,10 @@ pub struct DxrGpu {
     /// Hit-table record count (3 off-lever; classes × 3 on the --dxr-sbt
     /// alias arm) — the fill and DispatchRays read this ONE snapshot.
     sbt_hit_records: u32,
+    /// FR_DXR_LEAN snapshot (mode-2 raygen-only RTPSO): DispatchRays carries
+    /// NULL miss/hit table ranges — the tables were never filled and the
+    /// state object holds nothing they could name.
+    lean: bool,
     /// The armed --dxr-sbt rung this pipeline was BUILT at (post-degrade),
     /// how many pairwise-distinct per-class shader identifiers the driver
     /// actually minted, and how many the rung REQUIRES distinct (mode 1: all
@@ -676,6 +711,32 @@ impl DxrGpu {
         // lap loop). An unarmed sbt mode leaves every push identical — the
         // mode-0 byte-identity contract holds across the WHOLE ladder.
         let recurse = sbt_mode == 3;
+        // FR_DXR_LEAN — the dead-exports control (doc at lean_on). Qualifies
+        // ONLY at mode 2 with the sbt ladder off: every other config has real
+        // TraceRay consumers (or sorted records under audit) that a
+        // raygen-only state object would break — a miss/hit lookup against a
+        // null table is undefined, so the guard is soundness, not tidiness.
+        // The DXIL blob is deliberately UNCHANGED (same source, same
+        // compile): the lever moves only what the state object EXPORTS, so a
+        // cost delta is attributable to export provisioning and nothing else.
+        let lean = if lean_on() {
+            if inline_mode == 2 && !recurse && sbt_mode == 0 {
+                eprintln!(
+                    "dxr: FR_DXR_LEAN=1 — raygen-only RTPSO (exports: raygen; \
+                     recursion 0; null miss/hit SBT ranges) — the dead-exports \
+                     control"
+                );
+                true
+            } else {
+                eprintln!(
+                    "gpu: FR_DXR_LEAN=1 needs --dxr-inline 2 with --dxr-sbt 0 \
+                     (this session is inline {inline_mode}, sbt {sbt_mode}) — off"
+                );
+                false
+            }
+        } else {
+            false
+        };
         let inline_def = format!("#define DXR_INLINE_SEC {inline_mode}");
         let mut parts = vec![defs.as_str(), sd, cloud_defs.as_str()];
         if inline_mode > 0 {
@@ -911,7 +972,21 @@ impl DxrGpu {
             }
             v.into_iter().map(wname).collect()
         };
+        // FR_DXR_LEAN: the raygen-only export list needs a name that outlives
+        // CreateStateObject (the desc stores a raw pointer — the RTPSO
+        // lifetime rule).
+        let raygen_export_name = wname("raygen");
         let mut exports: Vec<D3D12_EXPORT_DESC> = Vec::new();
+        if lean {
+            // Same DXIL blob; the state object is told ONLY raygen
+            // participates (sbt_mode is 0 under the arming guard, so this is
+            // the exports Vec's only writer).
+            exports.push(D3D12_EXPORT_DESC {
+                Name: PCWSTR(raygen_export_name.as_ptr()),
+                ExportToRename: PCWSTR::null(),
+                Flags: D3D12_EXPORT_FLAG_NONE,
+            });
+        }
         if sbt_mode >= 1 {
             exports.reserve_exact(base_export_names.len() + n_classes);
             for n in &base_export_names {
@@ -1006,28 +1081,34 @@ impl DxrGpu {
         // pairing is per group KIND, so the per-class surface is only the
         // chs column).
         let mut hit_groups: Vec<D3D12_HIT_GROUP_DESC> = Vec::with_capacity(n_classes + 2);
-        if sbt_mode >= 1 {
-            for k in 0..n_classes {
+        // FR_DXR_LEAN: zero hit groups — a hit group's imports would drag the
+        // dead chs/ah exports back into the state object, which is exactly
+        // what the control removes.
+        if !lean {
+            if sbt_mode >= 1 {
+                for k in 0..n_classes {
+                    hit_groups.push(hit_group(
+                        &hg_class_names[k],
+                        PCWSTR(chs_alias_names[k].as_ptr()),
+                        ahs(&ah_shade_name),
+                    ));
+                }
+            } else {
                 hit_groups.push(hit_group(
-                    &hg_class_names[k],
-                    PCWSTR(chs_alias_names[k].as_ptr()),
+                    &hg_shade_name,
+                    PCWSTR(chs_shade_name.as_ptr()),
                     ahs(&ah_shade_name),
                 ));
             }
-        } else {
-            hit_groups.push(hit_group(
-                &hg_shade_name,
-                PCWSTR(chs_shade_name.as_ptr()),
-                ahs(&ah_shade_name),
-            ));
-        }
-        hit_groups.push(hit_group(&hg_hit_name, PCWSTR(chs_hit_name.as_ptr()), ahs(&ah_hit_name)));
-        if non_opaque {
-            hit_groups.push(hit_group(
-                &hg_occlude_name,
-                PCWSTR::null(),
-                PCWSTR(ah_shadow_name.as_ptr()),
-            ));
+            hit_groups
+                .push(hit_group(&hg_hit_name, PCWSTR(chs_hit_name.as_ptr()), ahs(&ah_hit_name)));
+            if non_opaque {
+                hit_groups.push(hit_group(
+                    &hg_occlude_name,
+                    PCWSTR::null(),
+                    PCWSTR(ah_shadow_name.as_ptr()),
+                ));
+            }
         }
         // RayPayload {float3 + float + uint + float2 + uint} = 32 B is the
         // largest payload (the float2/uint tail is --spp: the sample's own
@@ -1057,7 +1138,11 @@ impl DxrGpu {
         // the declared depth is device removal, not an error, so this
         // arithmetic is a soundness bound, not a tuning knob.
         let pipe_cfg = D3D12_RAYTRACING_PIPELINE_CONFIG {
-            MaxTraceRecursionDepth: if recurse {
+            // FR_DXR_LEAN takes the depth-0 micro-variant the comment above
+            // deferred (legal: the lean guard proved nothing traces).
+            MaxTraceRecursionDepth: if lean {
+                0
+            } else if recurse {
                 5
             } else if inline_mode > 0 {
                 1
@@ -1130,14 +1215,19 @@ impl DxrGpu {
             std::ptr::copy_nonoverlapping(id.as_ptr(), sbt.ptr.add(off), IDENT);
         };
         put(0, ident("raygen")?);
-        put(SBT_MISS, ident("miss_radiance")?);
-        put(SBT_MISS + IDENT, ident("miss_shadow")?);
-        put(SBT_MISS + 2 * IDENT, ident("miss_hit")?);
-        // Mode 3's continuation sentinel at miss index 3: 64 + 4·32 = 192 —
-        // the fourth record fills the miss region to EXACTLY SBT_HIT, no
-        // layout move (the const's own doc says the table fits beneath it).
-        if recurse {
-            put(SBT_MISS + 3 * IDENT, ident("miss_rec")?);
+        // FR_DXR_LEAN: the miss/hit exports don't exist in the state object —
+        // ident() on them would fail, and the dispatch desc carries null
+        // ranges, so the (allocated, zeroed) table regions are never read.
+        if !lean {
+            put(SBT_MISS, ident("miss_radiance")?);
+            put(SBT_MISS + IDENT, ident("miss_shadow")?);
+            put(SBT_MISS + 2 * IDENT, ident("miss_hit")?);
+            // Mode 3's continuation sentinel at miss index 3: 64 + 4·32 = 192 —
+            // the fourth record fills the miss region to EXACTLY SBT_HIT, no
+            // layout move (the const's own doc says the table fits beneath it).
+            if recurse {
+                put(SBT_MISS + 3 * IDENT, ident("miss_rec")?);
+            }
         }
         let mut sbt_distinct_idents: u32 = 1;
         let mut sbt_required_idents: u32 = 1;
@@ -1193,7 +1283,7 @@ impl DxrGpu {
                     put(SBT_HIT + (3 * k + 2) * IDENT, o);
                 }
             }
-        } else {
+        } else if !lean {
             put(SBT_HIT, ident("HgShade")?);
             put(SBT_HIT + IDENT, ident("HgHit")?);
             // Hit group 2 (occlusion rays): the zeroed null record on opaque
@@ -1222,30 +1312,32 @@ impl DxrGpu {
         let sfmt =
             |v: u64| if v >= STACK_NA { "-".to_string() } else { v.to_string() };
         let pipe_default = unsafe { props.GetPipelineStackSize() };
-        let mut stack_rows: Vec<(String, u64)> = vec![
-            ("raygen".into(), sstack("raygen")),
-            ("miss".into(), sstack("miss_radiance")),
-            ("miss_sh".into(), sstack("miss_shadow")),
-            ("miss_hit".into(), sstack("miss_hit")),
-        ];
-        if recurse {
-            stack_rows.push(("miss_rec".into(), sstack("miss_rec")));
-        }
-        let shade_group = if sbt_mode >= 1 { "HgShade_c0" } else { "HgShade" };
-        if sbt_mode >= 1 {
-            // Per-class frames — under sbt 2 a specialized thin CHS should
-            // report a smaller frame than uber's, a real per-class datum.
-            for k in 0..n_classes {
-                stack_rows
-                    .push((format!("c{k}"), sstack(&format!("HgShade_c{k}::closesthit"))));
+        let mut stack_rows: Vec<(String, u64)> = vec![("raygen".into(), sstack("raygen"))];
+        // FR_DXR_LEAN: raygen is the only export — querying the others would
+        // just print '-' rows for shaders the state object doesn't hold.
+        if !lean {
+            stack_rows.push(("miss".into(), sstack("miss_radiance")));
+            stack_rows.push(("miss_sh".into(), sstack("miss_shadow")));
+            stack_rows.push(("miss_hit".into(), sstack("miss_hit")));
+            if recurse {
+                stack_rows.push(("miss_rec".into(), sstack("miss_rec")));
             }
-        } else {
-            stack_rows.push(("chs".into(), sstack("HgShade::closesthit")));
-        }
-        stack_rows.push(("hit".into(), sstack("HgHit::closesthit")));
-        if non_opaque {
-            stack_rows.push(("ah".into(), sstack(&format!("{shade_group}::anyhit"))));
-            stack_rows.push(("occl".into(), sstack("HgOcclude::anyhit")));
+            let shade_group = if sbt_mode >= 1 { "HgShade_c0" } else { "HgShade" };
+            if sbt_mode >= 1 {
+                // Per-class frames — under sbt 2 a specialized thin CHS should
+                // report a smaller frame than uber's, a real per-class datum.
+                for k in 0..n_classes {
+                    stack_rows
+                        .push((format!("c{k}"), sstack(&format!("HgShade_c{k}::closesthit"))));
+                }
+            } else {
+                stack_rows.push(("chs".into(), sstack("HgShade::closesthit")));
+            }
+            stack_rows.push(("hit".into(), sstack("HgHit::closesthit")));
+            if non_opaque {
+                stack_rows.push(("ah".into(), sstack(&format!("{shade_group}::anyhit"))));
+                stack_rows.push(("occl".into(), sstack("HgOcclude::anyhit")));
+            }
         }
         eprintln!(
             "dxr stack: pipeline-default={pipe_default} | {}",
@@ -1395,6 +1487,7 @@ impl DxrGpu {
             state,
             sbt,
             sbt_hit_records,
+            lean,
             sbt_mode,
             sbt_distinct_idents,
             sbt_required_idents,
@@ -1692,20 +1785,32 @@ impl DxrGpu {
                     StartAddress: va,
                     SizeInBytes: IDENT as u64,
                 },
-                MissShaderTable: D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE {
-                    StartAddress: va + SBT_MISS as u64,
-                    // 4 records under --dxr-sbt 3 (miss_rec, the continuation
-                    // sentinel at index 3 — trace_shade names it); 3 otherwise.
-                    SizeInBytes: (if self.sbt_mode == 3 { 4 } else { 3 } * IDENT) as u64,
-                    StrideInBytes: IDENT as u64,
+                // FR_DXR_LEAN: null ranges — the raygen-only state object has
+                // no miss/hit exports, the tables were never filled, and
+                // nothing traces (declared recursion 0), so no lookup exists
+                // to dereference them.
+                MissShaderTable: if self.lean {
+                    Default::default()
+                } else {
+                    D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE {
+                        StartAddress: va + SBT_MISS as u64,
+                        // 4 records under --dxr-sbt 3 (miss_rec, the continuation
+                        // sentinel at index 3 — trace_shade names it); 3 otherwise.
+                        SizeInBytes: (if self.sbt_mode == 3 { 4 } else { 3 } * IDENT) as u64,
+                        StrideInBytes: IDENT as u64,
+                    }
                 },
-                HitGroupTable: D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE {
-                    StartAddress: va + SBT_HIT as u64,
-                    // Runtime record count (--dxr-sbt) — snapshotted at
-                    // construction beside the fill, so the two cannot
-                    // disagree.
-                    SizeInBytes: (self.sbt_hit_records as usize * IDENT) as u64,
-                    StrideInBytes: IDENT as u64,
+                HitGroupTable: if self.lean {
+                    Default::default()
+                } else {
+                    D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE {
+                        StartAddress: va + SBT_HIT as u64,
+                        // Runtime record count (--dxr-sbt) — snapshotted at
+                        // construction beside the fill, so the two cannot
+                        // disagree.
+                        SizeInBytes: (self.sbt_hit_records as usize * IDENT) as u64,
+                        StrideInBytes: IDENT as u64,
+                    }
                 },
                 CallableShaderTable: Default::default(),
                 Width: self.rw,
@@ -1909,6 +2014,71 @@ mod mode3_shader_source_tests {
             .expect("HitPayload's inst field must be mode-3-guarded");
         let inst = body.find("uint inst;").expect("HitPayload inst field missing");
         assert!(guard < inst, "the mode-3 guard must precede the inst field");
+    }
+
+    /// The finding-1 audit's source half of the zero-TraceRay proof (the
+    /// artifact half is the offline DXIL disassembly — `dx.op.traceRay`
+    /// absent from the mode-2 library): dxr.hlsl carries exactly TWO TraceRay
+    /// sites, and BOTH are preprocessor-dead at DXR_INLINE_SEC == 2 — the
+    /// thin one sits in the `== 3` guard's then-arm (no intervening
+    /// #else/#endif between guard and call), the payload one in the `== 2`
+    /// guard's #else arm. rt_dxr.hlsli's four sites are covered by the guard
+    /// pins above/below (the two-define primitive guards + trace_shade under
+    /// DXR_SBT_RECURSE). A third site, or one of these migrating out of its
+    /// guard, fails here before any GPU sees it.
+    #[test]
+    fn mode2_raygen_tracerays_are_preprocessor_dead() {
+        let src = DXR_HLSL;
+        let sites: Vec<usize> = src.match_indices("TraceRay(").map(|(i, _)| i).collect();
+        assert_eq!(sites.len(), 2, "dxr.hlsl must carry exactly two TraceRay sites");
+        // Site 1 — the mode-3 thin arm: the nearest preceding `== 3` guard
+        // with no #else/#endif between it and the call puts the call in that
+        // guard's then-arm, dead at mode 2.
+        let g3 = src[..sites[0]]
+            .rfind("#if defined(DXR_INLINE_SEC) && DXR_INLINE_SEC == 3")
+            .expect("thin TraceRay must follow a mode-3 guard");
+        let between = &src[g3..sites[0]];
+        assert!(
+            !between.contains("#else") && !between.contains("#endif"),
+            "the thin TraceRay must sit DIRECTLY in the mode-3 guard's then-arm"
+        );
+        // Site 2 — the payload primary: inside the mode-2 guard's OWN #else
+        // arm (the guard spelling is unique; the ballast compound guards
+        // parenthesize differently). The then-arm nests a SKY_LOD #if/#else,
+        // so the arm boundary needs a DEPTH-tracked scan — anchoring on the
+        // first textual #else would land on the nested one and let a
+        // mode-2-LIVE TraceRay after it pass (the false-pass shape this pin
+        // exists to prevent).
+        let g2 = src
+            .find("#if defined(DXR_INLINE_SEC) && DXR_INLINE_SEC == 2")
+            .expect("mode-2 raygen guard missing");
+        let (mut depth, mut arm_else, mut end2) = (0i32, None, None);
+        for (off, line) in src[g2..].lines().map(|l| {
+            let off = l.as_ptr() as usize - src.as_ptr() as usize;
+            (off, l.trim_start())
+        }) {
+            if line.starts_with("#if") {
+                depth += 1;
+            } else if line.starts_with("#endif") {
+                depth -= 1;
+                if depth == 0 {
+                    end2 = Some(off);
+                    break;
+                }
+            } else if line.starts_with("#else") && depth == 1 {
+                arm_else = Some(off);
+            }
+        }
+        let arm_else = arm_else.expect("mode-2 guard has no depth-1 #else arm");
+        let end2 = end2.expect("mode-2 guard unterminated");
+        assert!(
+            src[end2..].starts_with("#endif // DXR_INLINE_SEC == 2"),
+            "the mode-2 guard's closing #endif lost its label — re-anchor this pin"
+        );
+        assert!(
+            arm_else < sites[1] && sites[1] < end2,
+            "the payload TraceRay must sit in the mode-2 guard's OWN #else arm"
+        );
     }
 
     /// The thin raygen writes ONLY the hit record — accum/tbuf/info belong to

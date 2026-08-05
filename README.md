@@ -1463,13 +1463,23 @@ traversal costs 1.28 ms as a compute kernel, 2.59 ms as a mode-2
 `DispatchRays` raygen, and 3.13 ms through the shipping mode-1 pipeline —
 i.e. on Arc, with the world's fat alpha-cutout shaders, the DXR execution
 model itself costs 2–2.4× over compute for the same work on the same TLAS.
-(On the small procedural scene that same tax measured ≈ zero, which is why
-it went unnoticed; it is scene-dependent, and it is a driver/hardware
-property — the shader source is byte-identical between the arms.) The
+(On the small procedural scene that same tax originally measured ≈ zero,
+which is why it went unnoticed; that scene-gating did not survive later
+builds — the tax is a driver/hardware property of hosting the kernel's live
+state in the RT launch regime, and slim scenes pay it too.) The
 sorted-SBT ladder later localized most of that tax to the one fat shading
 record — per-class thin records dissolve the bulk of it on the spin
 scenes — though the world itself ships the one-record pipeline and was not
-re-measured under the ladder. So the
+re-measured under the ladder. An August 5 adversarial re-audit of the
+DispatchRays-tax claim then tightened the numbers: the compute bracket
+above was ~3% fat (it contained binds and two cache fills the DXR bracket
+excluded), the bare-dispatch like-for-like world read is 1.18 vs 2.81 ms =
+**2.38×**, the ratio bands 2.07–3.30× across scenes and rebuilds with the
+codegen lottery living entirely in the DXR door (the compute kernel repeats
+to ±0.001 ms across comment-touch rebuilds), a raygen-only state object
+still pays 1.9× (the tax is the raygen's own hosting), and — a finding in
+its own right — the driver spends 12–18% of a fat-scene `DispatchRays`
+provisioning dead-but-exported shaders no ray can reach. So the
 world margin is real end-to-end, but it is roughly nine parts "Arc prefers
 this workload as compute" to one part quadtree.
 

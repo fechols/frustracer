@@ -14763,6 +14763,30 @@ fn run_window(req: SceneRequest, opts: &Opts, file_settings: settings::Settings)
     gpu::gputime::report();
 }
 
+/// FR_REF=1 — the interactive session's FIRST-ENTRY `hybrid` default: false
+/// (the brute-force reference arm, the R toggle's off state) instead of the
+/// quadtree. See the doc at the consumer in `session()`; the
+/// `trace::width_probe_on` OnceLock idiom — loud on arm, loud on an
+/// unrecognized value, unset = the historical `true` bit-identically.
+#[cfg(windows)]
+fn fr_ref_hybrid_default() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| match std::env::var("FR_REF") {
+        Err(_) => true,
+        Ok(v) if v == "1" => {
+            eprintln!(
+                "gpu: FR_REF=1 — interactive session starts in the brute-force \
+                 REFERENCE arm (R toggles hybrid back)"
+            );
+            false
+        }
+        Ok(v) => {
+            eprintln!("gpu: FR_REF={v:?} unrecognized (legal: 1) — hybrid default");
+            true
+        }
+    })
+}
+
 /// One renderer session at a fixed window size (w, h): everything sized
 /// from the window lives in here and rebuilds when a resize re-enters.
 /// Seeds user-visible state from `persist` (subsequent entries) or the CLI
@@ -14824,7 +14848,17 @@ fn session(
     let mut frust: Option<frustcap::FrustArtifact> = p0.and_then(|p| p.frust);
 
     let mut frame: u32 = 0;
-    let mut hybrid = p0.map_or(true, |p| p.hybrid);
+    // FR_REF=1 — start the interactive session in the brute-force REFERENCE
+    // arm (the R toggle's off state). A measurement lever, not a mode: the
+    // world-scene reference arm was previously reachable only by a manual R
+    // keypress, which no scripted protocol can fire (the flycam reads raw OS
+    // key state, focus-gated) — the finding-1 audit needed the `reference`
+    // region from a hands-off session. FIRST-ENTRY default only: resize/F11
+    // re-entries keep the live Persist state, so a mid-session rebuild can't
+    // flip the arm under a measurement. Headless paths (--check*, --spin)
+    // never read it — they pick arms from their own flags (--spin-plain).
+    // Unset = today's hybrid default, bit-identical.
+    let mut hybrid = p0.map_or_else(fr_ref_hybrid_default, |p| p.hybrid);
     let mut dynamic = p0.map_or(true, |p| p.dynamic);
     let mut overlay_on = p0.map_or(false, |p| p.overlay_on);
     let mut gpu_tonemap = p0.map_or(false, |p| p.gpu_tonemap);
