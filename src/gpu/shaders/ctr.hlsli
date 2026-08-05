@@ -44,11 +44,7 @@
 #define CTR_W_LEVEL     27u // cs_level / cs_level_wide (last writer wins)
 #define CTR_W_HEMI      28u // cs_hemi_leaf
 #define CTR_W_REFERENCE 29u // cs_reference (declares its OWN u3 view — below)
-#define CTR_WV_TICKET   30u // FR_WAVEVIZ wave-ticket bump (one +1 per wave;
-                            // same never-zeroed/never-gated class — the value
-                            // only ever feeds the hash colorizer, so
-                            // monotone-across-frames is fine)
-#define CTR_TOTAL       31u
+#define CTR_TOTAL       30u
 
 // Compile units that paste this file bind `counters` — rt.hlsli's cutout
 // loop keys its stat increment on this (the reference kernel and the DXR

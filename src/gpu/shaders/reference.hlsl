@@ -9,13 +9,12 @@ RWStructuredBuffer<float> accum : register(u0); // rw*rh*3, CPU layout parity
 RWStructuredBuffer<float> tbuf  : register(u1); // primary-hit t, INF = sky
 RWStructuredBuffer<uint>  info  : register(u2); // pack_info(depth, kind)
 
-#if defined(WIDTH_PROBE) || defined(WAVEVIZ)
-// FR_WIDTH / FR_WAVEVIZ: the counters buffer, bound at u3 by bind_common for
-// every dispatch on this pipeline (record_reference included). Slots
+#ifdef WIDTH_PROBE
+// FR_WIDTH: the counters buffer, bound at u3 by bind_common for every
+// dispatch on this pipeline (record_reference included). Width slots
 // (>= CTR_COUNT) ONLY — deliberately NOT ctr.hlsli and NOT HAVE_COUNTERS,
 // so rt.hlsli's gated stat increments stay compiled out of this unit (the
-// ctr.hlsli contract note; CTR_W_REFERENCE / CTR_WV_TICKET are injected by
-// trace::width_defs / waveviz_defs).
+// ctr.hlsli contract note; CTR_W_REFERENCE is injected by trace::width_defs).
 RWStructuredBuffer<uint> width_ctr : register(u3);
 #endif
 
@@ -27,14 +26,13 @@ void cs_reference(uint3 id : SV_DispatchThreadID) {
     if (id.x == 0u && id.y == 0u) width_ctr[CTR_W_REFERENCE] = WaveGetLaneCount();
 #endif
 #ifdef WAVEVIZ
-    // FR_WAVEVIZ: mint this wave's TICKET here, before any early-out or
-    // divergence — the wave is still converged, so one bump identifies it and
-    // the broadcast reaches every lane. Wave-uniform by construction.
-    uint wv_t = 0u;
-    if (flags & FLAG_WAVEVIZ) {
-        if (WaveIsFirstLane()) InterlockedAdd(width_ctr[CTR_WV_TICKET], 1u, wv_t);
-        wv_t = WaveReadLaneFirst(wv_t);
-    }
+    // --waveviz: this wave's ID is its first lane's PIXEL — unique per wave
+    // within a frame (a pixel belongs to exactly one wave) and identical
+    // across frames whenever the packing is identical, so a parked view is
+    // color-STABLE and residual shimmer is real repacking. Minted before the
+    // early-out (converged). An arrival-order atomic ticket was tried first
+    // and strobed: wave scheduling order is nondeterministic per frame.
+    uint wv_t = WaveReadLaneFirst(id.y * rw + id.x);
 #endif
     if (id.x >= rw || id.y >= rh) return;
 

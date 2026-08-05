@@ -200,12 +200,8 @@ pub const CTR_W_SKY: u32 = 26;
 pub const CTR_W_LEVEL: u32 = 27;
 pub const CTR_W_HEMI: u32 = 28;
 pub const CTR_W_REFERENCE: u32 = 29;
-/// FR_WAVEVIZ's wave-ticket bump (one +1 per wave; the value only feeds the
-/// hash colorizer, so monotone-across-frames is fine). Same class as the
-/// width slots.
-pub const CTR_WV_TICKET: u32 = 30;
-pub const CTR_TOTAL: u32 = 31;
-const _: () = assert!(CTR_W_LEAF >= CTR_COUNT && CTR_TOTAL == CTR_WV_TICKET + 1);
+pub const CTR_TOTAL: u32 = 30;
+const _: () = assert!(CTR_W_LEAF >= CTR_COUNT && CTR_TOTAL == CTR_W_REFERENCE + 1);
 
 /// queues.hlsli::LeafRec's stride — the qleaf allocation and main.rs's
 /// check-gpu readback move in lockstep with the HLSL struct through this one
@@ -3381,12 +3377,13 @@ pub(crate) fn set_waveviz_live(on: bool) {
     WAVEVIZ_LIVE.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// The WAVEVIZ defines, "" when off (pushed conditionally — the width_defs
+/// The WAVEVIZ define, "" when off (pushed conditionally — the width_defs
 /// rule: never an empty join element). WAVEVIZ_CHS rides along only for the
 /// DXR library (dxr.rs pushes it per mode); compute units take WAVEVIZ alone.
+/// No injected literals: the wave IDs are position-keyed pure math.
 pub(crate) fn waveviz_defs() -> String {
     if waveviz_on() {
-        format!("#define WAVEVIZ 1\n#define CTR_WV_TICKET {CTR_WV_TICKET}u")
+        "#define WAVEVIZ 1".to_string()
     } else {
         String::new()
     }
@@ -4943,11 +4940,6 @@ pub struct TraceGpu {
     /// + leaf/sky queues + the cut pool, all sized to the structural worst
     /// case (see caps) so the primary queues cannot overflow.
     pub counters: ID3D12Resource,
-    /// --waveviz: a persistent 4-byte zero upload buffer — record_frame
-    /// copies it over counters[CTR_WV_TICKET] each frame so wave k's ticket
-    /// (and therefore its hash color) is deterministic per frame instead of
-    /// strobing as the counter grows. Armed sessions only.
-    wv_zero: Option<d3d12::UploadBuffer>,
     args: ID3D12Resource,
     qa: ID3D12Resource,
     qb: ID3D12Resource,
@@ -5444,13 +5436,6 @@ impl TraceGpu {
         // Unconditional — 20 bytes buys a lever-independent buffer shape (an
         // FR_WIDTH session and a plain one bind identical resources).
         let counters = committed_buffer(device, CTR_TOTAL as u64 * 4, uaf, ua)?;
-        let wv_zero = if waveviz_on() {
-            let z = d3d12::UploadBuffer::new(device, 4)?;
-            unsafe { std::ptr::write_bytes(z.ptr, 0, 4) };
-            Some(z)
-        } else {
-            None
-        };
         let args = committed_buffer(device, 16 * 12, uaf, ua)?;
         let qa = committed_buffer(device, cap_tile * 24, uaf, ua)?;
         let qb = committed_buffer(device, cap_tile * 24, uaf, ua)?;
@@ -5677,7 +5662,6 @@ impl TraceGpu {
             tbuf,
             info,
             counters,
-            wv_zero,
             args,
             qa,
             qb,
@@ -6450,26 +6434,6 @@ impl TraceGpu {
     /// the R-key A/B. (The reference kernel has no hemi tiers: with fb on
     /// it renders the sampled-ambient path.)
     pub fn record_frame(&self, list: &ID3D12GraphicsCommandList, slot: usize, p: &FrameParams, hybrid: bool) {
-        // --waveviz: zero the ticket counter FIRST, so wave k's ticket is a
-        // per-frame value and the overlay's colors are stable instead of
-        // strobing as the counter grows (one clear covers the hybrid,
-        // replay, AND reference arms — the reference unit runs no seed
-        // kernel, which is why this is Rust-side and not in cs_seed).
-        if let Some(z) = &self.wv_zero {
-            unsafe {
-                list.ResourceBarrier(&[transition(
-                    &self.counters,
-                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                )]);
-                list.CopyBufferRegion(&self.counters, CTR_WV_TICKET as u64 * 4, &z.resource, 0, 4);
-                list.ResourceBarrier(&[transition(
-                    &self.counters,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                )]);
-            }
-        }
         if hybrid {
             // Structure replay: a bit-equal basis under `p.replay` re-dispatches
             // the persisted terminal queues instead of re-running seed + the
@@ -7444,20 +7408,22 @@ mod width_ballast_shader_source_tests {
         assert!(CTR_W_LEAF >= CTR_COUNT && CTR_TOTAL > CTR_W_LEAF);
         // ctr.hlsli's literal block mirrors the Rust consts.
         assert!(CTR_HLSLI.contains("#define CTR_W_LEAF      25u"));
-        assert!(CTR_HLSLI.contains("#define CTR_TOTAL       31u"));
+        assert!(CTR_HLSLI.contains("#define CTR_TOTAL       30u"));
     }
 
-    /// FR_WAVEVIZ: every ticket touch (the CTR_WV_TICKET bumps, the wv_t
-    /// locals, resolve's colorizer + its tbuf view) must sit inside a WAVEVIZ
-    /// guard — an unguarded one ships in every session and breaks the
-    /// unarmed byte-identity contract (the width pin's shape).
+    /// --waveviz: every ID-mint touch (the wv_t locals and their
+    /// WaveReadLaneFirst mints) must sit inside a WAVEVIZ guard — an
+    /// unguarded one ships in every session and breaks the unarmed
+    /// byte-identity contract (the width pin's shape). Note the IDs are
+    /// POSITION-keyed pure math, never an arrival-order atomic — the atomic
+    /// ticket strobed (scheduling order is nondeterministic per frame).
     #[test]
     fn waveviz_blocks_are_guarded() {
         let guards: &[&str] = &["#ifdef WAVEVIZ", "#if defined(WIDTH_PROBE) || defined(WAVEVIZ)"];
         for (name, src, needles) in [
-            ("leaf", LEAF_HLSL, &["CTR_WV_TICKET", "wv_t"][..]),
-            ("sky", SKY, &["CTR_WV_TICKET", "wv_t"][..]),
-            ("reference", REFERENCE, &["CTR_WV_TICKET", "wv_t"][..]),
+            ("leaf", LEAF_HLSL, &["wv_t"][..]),
+            ("sky", SKY, &["wv_t"][..]),
+            ("reference", REFERENCE, &["wv_t"][..]),
         ] {
             for needle in needles {
                 let mut found = 0u32;

@@ -42,14 +42,12 @@ void cs_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     if (all(gid == 0u) && gtid.x == 0u) counters[CTR_W_LEAF] = WaveGetLaneCount();
 #endif
 #ifdef WAVEVIZ
-    // FR_WAVEVIZ: mint this wave's TICKET before any early-out — the wave is
-    // still converged, and ONE ticket per wave (not per stride iteration)
-    // keeps the wave's whole pixel footprint under one color.
-    uint wv_t = 0u;
-    if (flags & FLAG_WAVEVIZ) {
-        if (WaveIsFirstLane()) InterlockedAdd(counters[CTR_WV_TICKET], 1u, wv_t);
-        wv_t = WaveReadLaneFirst(wv_t);
-    }
+    // --waveviz: this wave's ID = (record, first lane) — pure position math,
+    // so the same wave gets the same color every frame (reference.hlsl's
+    // stability note); ONE ID per wave, not per stride iteration, keeps the
+    // wave's whole pixel footprint under one color. The salt keeps leaf IDs
+    // numerically disjoint from sky's on adjacent tiles.
+    uint wv_t = 0x40000000u ^ WaveReadLaneFirst(flat_group(gid) * LEAF_GROUP + gtid.x);
 #endif
     uint rec_i = flat_group(gid);
     if (rec_i >= counters[push0]) return;

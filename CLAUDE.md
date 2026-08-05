@@ -3036,8 +3036,15 @@ floats price from float zero — slim scenes pay too), and the audit block added
 closed.** `--waveviz [chs]` (CLI, the user-facing spelling since the funnel promotion;
 `FR_WAVEVIZ=1|chs` stays as the env alias, CLI wins — main's lever block owns the
 precedence via `trace::set_waveviz`) arms the wave-ticket overlay: each covered kernel's
-wave mints ONE ticket (`InterlockedAdd` + `WaveReadLaneFirst`, minted converged at kernel
-entry — per wave, never per stride iteration), every pixel stores its wave's ticket as its
+wave takes a POSITION-KEYED ID — `WaveReadLaneFirst(first lane's pixel/thread index)`,
+minted converged, per wave never per stride iteration (leaf/sky use group×lane math + a
+per-kernel salt) — unique per wave within a frame (a pixel belongs to exactly one wave)
+and IDENTICAL across frames whenever the packing is identical, so a parked view is
+color-STABLE and residual shimmer is REAL repacking. THE LESSON (shipped wrong twice
+before landing here): an arrival-order ATOMIC ticket strobes at frame rate because wave
+scheduling order is nondeterministic per frame, and a per-frame counter reset cannot fix
+it — order, not magnitude, was the noise; both are retired (CTR_TOTAL back to 30, no
+counter, no per-frame clears). Every pixel stores its wave's ID as its
 LAST tbuf touch (`asfloat` bit-cast — tbuf has no live-frame consumer), and the overlay is
 COMPOSITED AT THE PRESENT FUNNEL (waveviz.hlsl — its own PS + PSO on the tonemap root
 signature, the HUD's exact shape: premultiplied blend, drawn after the tonemap draw inside
@@ -3050,11 +3057,10 @@ param 3, bound by VA — no descriptor), nearest window→render mapping off the
 UA↔PIXEL_SHADER_RESOURCE around the draw (the bloom bracket), and `GpuContext::waveviz_src`
 (a Cell stamped by every presenter: Trace/Dxr/None) names whose tbuf to read — the None
 stamp on CPU-fed presenters is what stops a SPACE back to CPU compositing a stale GPU
-tbuf, and `present_again` inherits the Cell like `last_present`. PER-FRAME TICKET RESET:
-both record_frames copy a persistent 4-byte zero over the ticket counter
-(counters[CTR_WV_TICKET] / width_buf slot 2) so wave k's ticket — and color — is
-deterministic per frame instead of strobing at frame rate under the upscalers' fresh-1-spp
-contract; spin's `waves=` is therefore a per-frame count. **I** toggles it live in GPU
+tbuf, and `present_again` inherits the Cell like `last_present`. Spin's `waves=` line
+counts distinct IDs in the LAST frame's tbuf — still the per-frame wave-execution count
+(fragment shards have distinct first active lanes), so the B70 fragmentation numbers
+stay comparable across the ID redesign. **I** toggles it live in GPU
 arms — TWO handler copies by structure: the gpu_trace arm `continue`s before the shared
 toggle block, so it carries its own (the quality/spp pattern; a shared-block-only handler
 shipped first and was dead code in --gpu sessions). The toggle sets `frame = 0` (a

@@ -85,12 +85,9 @@ void cs_sky(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     if (all(gid == 0u) && gtid.x == 0u) counters[CTR_W_SKY] = WaveGetLaneCount();
 #endif
 #ifdef WAVEVIZ
-    // FR_WAVEVIZ: one ticket per wave, minted converged (leaf.hlsl's note).
-    uint wv_t = 0u;
-    if (flags & FLAG_WAVEVIZ) {
-        if (WaveIsFirstLane()) InterlockedAdd(counters[CTR_WV_TICKET], 1u, wv_t);
-        wv_t = WaveReadLaneFirst(wv_t);
-    }
+    // --waveviz: position-keyed wave ID, minted converged (leaf.hlsl's
+    // note; sky's own salt keeps the ID spaces disjoint).
+    uint wv_t = 0x80000000u ^ WaveReadLaneFirst(flat_group(gid) * SKY_GROUP + gtid.x);
 #endif
     uint g = flat_group(gid);
     uint rec_i = g / SKY_SPLIT;

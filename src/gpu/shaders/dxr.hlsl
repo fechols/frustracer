@@ -18,14 +18,13 @@ RWStructuredBuffer<float> accum : register(u0); // rw*rh*3, CPU layout parity
 RWStructuredBuffer<float> tbuf  : register(u1); // primary-hit t, INF = sky
 RWStructuredBuffer<uint>  info  : register(u2); // pack_info(depth, kind)
 
-#if defined(WIDTH_PROBE_RAYGEN) || defined(WAVEVIZ)
-// FR_WIDTH / FR_WAVEVIZ: the DXR probe sink (dxr.rs's width_buf, bound at
-// the otherwise-unbound u3 root param only when armed). Slot 0 = raygen
-// width, slot 1 = cs_dxr_shade width (that unit re-declares its own view),
-// slot 2 = the WAVEVIZ ticket counter. WaveGetLaneCount() in a raygen is
-// spec-legal (lib_6_5 — the armed modes' floor); the value is the COMPILED
-// SIMD width, which is the prize — mode 2's raygen IS the codegen lottery
-// victim.
+#ifdef WIDTH_PROBE_RAYGEN
+// FR_WIDTH: the DXR width sink (dxr.rs's width_buf, bound at the otherwise-
+// unbound u3 root param only when armed). Slot 0 = raygen, slot 1 =
+// cs_dxr_shade (that unit re-declares its own view). WaveGetLaneCount() in a
+// raygen is spec-legal (lib_6_5 — the armed modes' floor); the value is the
+// COMPILED SIMD width, which is the prize — mode 2's raygen IS the codegen
+// lottery victim.
 RWStructuredBuffer<uint> dxr_width : register(u3);
 #endif
 
@@ -225,15 +224,14 @@ void raygen() {
     }
 #endif
 #if defined(WAVEVIZ) && !defined(WAVEVIZ_CHS)
-    // FR_WAVEVIZ: this RAYGEN wave's ticket, minted at kernel END and written
-    // as the pixel's LAST tbuf touch. Mode 2 has zero TraceRay, so this IS
-    // launch packing; mode 1's composition here is the post-TraceRay
-    // continuation's (repacked or not — exactly the question). Slot 2 of the
-    // probe buffer is the DXR ticket counter.
+    // --waveviz: this RAYGEN wave's ID = its first lane's pixel, written as
+    // the pixel's LAST tbuf touch. Mode 2 has zero TraceRay, so the wave
+    // composition here IS launch packing; mode 1's is the post-TraceRay
+    // continuation's (repacked or not — exactly the question). Position-
+    // keyed, so colors are stable exactly when the packing is (the
+    // reference.hlsl note — an arrival-order atomic strobed).
     if (flags & FLAG_WAVEVIZ) {
-        uint wv_t = 0u;
-        if (WaveIsFirstLane()) InterlockedAdd(dxr_width[2], 1u, wv_t);
-        tbuf[pi] = asfloat(WaveReadLaneFirst(wv_t));
+        tbuf[pi] = asfloat(WaveReadLaneFirst(pi));
     }
 #endif
 
@@ -254,15 +252,15 @@ void raygen() {
 [shader("closesthit")]
 void chs_shade(inout RayPayload p, in BuiltInTriangleIntersectionAttributes a) {
 #if defined(WAVEVIZ) && defined(WAVEVIZ_CHS)
-    // FR_WAVEVIZ=chs: THIS closest-hit wave's ticket — the composition AFTER
+    // --waveviz chs: THIS closest-hit wave's ID — the composition AFTER
     // whatever hit-stage packing the driver did (the TSU question, drawn).
-    // Written first so the raygen's post-return sentinel logic (see the
-    // mode-0/1 arm) can leave it standing on hit pixels.
+    // Position-keyed off the first active lane's pixel (stable iff the
+    // packing is); written first so the raygen's post-return sentinel logic
+    // (see the mode-0/1 arm) can leave it standing on hit pixels.
     if (flags & FLAG_WAVEVIZ) {
-        uint wv_t = 0u;
-        if (WaveIsFirstLane()) InterlockedAdd(dxr_width[2], 1u, wv_t);
         uint2 wvid = DispatchRaysIndex().xy;
-        tbuf[wvid.y * rw + wvid.x] = asfloat(WaveReadLaneFirst(wv_t));
+        uint wv_t = WaveReadLaneFirst(wvid.y * rw + wvid.x);
+        tbuf[wvid.y * rw + wvid.x] = asfloat(wv_t);
     }
 #endif
     HitInfo h;

@@ -437,10 +437,6 @@ pub struct DxrGpu {
     /// bind exactly what they bind today. Read back by the spin/check width
     /// prints via `width_buf()`.
     width_buf: Option<ID3D12Resource>,
-    /// --waveviz: the 4-byte zero upload record_frame copies over
-    /// width_buf slot 2 (the ticket counter) each frame — per-frame-stable
-    /// ticket colors, TraceGpu::wv_zero's twin.
-    wv_zero: Option<d3d12::UploadBuffer>,
     /// The frame's spp, stashed by `write_cb` (which sees FrameParams) for
     /// `record_frame`'s mode-3 pass-pair loop (which doesn't) — the `sway_t`
     /// idiom; every caller including all --check-dxr sites writes the CB
@@ -1547,17 +1543,8 @@ impl DxrGpu {
             sway_mv_t: std::cell::Cell::new(None),
             sway_mv_on: !sway_def.is_empty(),
             mode3,
-            // 16 B = 4 u32 slots: 0/1 = the FR_WIDTH report, 2 = the
-            // waveviz ticket counter, 3 spare. Created for either probe.
-            width_buf: if trace::width_probe_on() || wv_armed {
+            width_buf: if trace::width_probe_on() {
                 Some(committed_buffer(device, 16, uaf, ua)?)
-            } else {
-                None
-            },
-            wv_zero: if wv_armed {
-                let z = d3d12::UploadBuffer::new(device, 4)?;
-                unsafe { std::ptr::write_bytes(z.ptr, 0, 4) };
-                Some(z)
             } else {
                 None
             },
@@ -1778,23 +1765,6 @@ impl DxrGpu {
         let list4: ID3D12GraphicsCommandList4 =
             list.cast().map_err(|e| format!("ID3D12GraphicsCommandList4: {e}"))?;
         let _ev = super::pix::scope(list, c"dxr");
-        // --waveviz: per-frame ticket-counter zero (TraceGpu::record_frame's
-        // twin — width_buf slot 2, offset 8).
-        if let (Some(z), Some(wb)) = (&self.wv_zero, &self.width_buf) {
-            unsafe {
-                list.ResourceBarrier(&[transition(
-                    wb,
-                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                )]);
-                list.CopyBufferRegion(wb, 8, &z.resource, 0, 4);
-                list.ResourceBarrier(&[transition(
-                    wb,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                )]);
-            }
-        }
         // --foliage-sway: rebuild this slot's animated TLAS at the frame's
         // clock BEFORE anything binds it (bind_common below picks the ring
         // slot when the clock is Some). A bit-equal clock records nothing —
@@ -1980,31 +1950,33 @@ mod mode3_shader_source_tests {
     /// (writing through an unset root descriptor is UB).
     #[test]
     fn width_writes_are_guarded() {
-        // dxr.hlsl's probe buffer now has THREE legal guards (the decl's
-        // WIDTH_PROBE_RAYGEN||WAVEVIZ, the width epilogue's, and the two
-        // WAVEVIZ ticket arms); a use is guarded iff the NEAREST preceding
-        // guard-open of ANY spelling has no #endif between it and the use.
-        let guards_dxr: &[&str] = &[
-            "#ifdef WIDTH_PROBE_RAYGEN",
-            "#if defined(WIDTH_PROBE_RAYGEN) || defined(WAVEVIZ)",
-            "#if defined(WAVEVIZ) && defined(WAVEVIZ_CHS)",
-            "#if defined(WAVEVIZ) && !defined(WAVEVIZ_CHS)",
-        ];
-        for (name, src, guards) in [
-            ("dxr.hlsl", DXR_HLSL, guards_dxr),
-            ("dxr_shade.hlsl", DXR_SHADE_HLSL, &["#ifdef WIDTH_PROBE"][..]),
+        for (name, src, guard) in [
+            ("dxr.hlsl", DXR_HLSL, "#ifdef WIDTH_PROBE_RAYGEN"),
+            ("dxr_shade.hlsl", DXR_SHADE_HLSL, "#ifdef WIDTH_PROBE"),
         ] {
             for (i, _) in src.match_indices("dxr_width") {
-                let last_open = guards
-                    .iter()
-                    .filter_map(|g| src[..i].rfind(g))
-                    .max()
-                    .unwrap_or_else(|| panic!("{name}: dxr_width used before any guard"));
+                let last_open = src[..i]
+                    .rfind(guard)
+                    .unwrap_or_else(|| panic!("{name}: dxr_width used before any {guard}"));
                 assert!(
                     !src[last_open..i].contains("#endif"),
                     "{name}: dxr_width use at byte {i} escaped its guard"
                 );
             }
+        }
+        // The waveviz ID mints are position-keyed pure math (no dxr_width /
+        // counter touch) — pin every wave-op mint inside a WAVEVIZ guard.
+        for (i, _) in DXR_HLSL.match_indices("WaveReadLaneFirst") {
+            let last_open = ["#if defined(WAVEVIZ) && defined(WAVEVIZ_CHS)",
+                             "#if defined(WAVEVIZ) && !defined(WAVEVIZ_CHS)"]
+                .iter()
+                .filter_map(|g| DXR_HLSL[..i].rfind(g))
+                .max()
+                .unwrap_or_else(|| panic!("dxr.hlsl: WaveReadLaneFirst outside a WAVEVIZ guard"));
+            assert!(
+                !DXR_HLSL[last_open..i].contains("#endif"),
+                "dxr.hlsl: WaveReadLaneFirst at byte {i} escaped its WAVEVIZ guard"
+            );
         }
     }
 
