@@ -417,6 +417,14 @@ pub struct Opts {
     /// whose early-exit bound scales in lockstep —
     /// `scene::set_detail_ao_strength` / the DETAIL_AO_STR define).
     pub detail_ao_strength: f32,
+    /// `--detail-untex-scale K` (0.0..=4.0, default 1.0): multiplier on the
+    /// synthetic texel-equivalent scale UNTEXTURED materials get
+    /// (`scene::DETAIL_UNTEX_K` × content diag) so albedo-map-free scenes
+    /// (powerplant) carry the detail field too. 0 = untextured detail off,
+    /// the bitwise pre-untextured-arm A/B (`scene::set_detail_untex_scale`;
+    /// read at scale DERIVATION, so restart tier — no GPU define, the scale
+    /// rides the per-material lane).
+    pub detail_untex_scale: f32,
     /// `--no-amb-bump` clears (`scene::set_amb_bump`): the sampled/SH ambient
     /// amplifies its irradiance response to the shading normal's deviation
     /// from the geometric normal (normal maps + detail bump + ripple read
@@ -687,6 +695,7 @@ pub fn defaults() -> Opts {
         detail_ao: true,
         detail_strength: 0.5,
         detail_ao_strength: 0.125,
+        detail_untex_scale: 1.0,
         amb_bump: true,
         water: true,
         coincident_cull: true,
@@ -961,6 +970,21 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
                         std::process::exit(2);
                     });
                 opts.detail_ao_strength = k;
+            }
+            // --detail-untex-scale: the untextured materials' synthetic
+            // detail texel scale, as a multiplier on DETAIL_UNTEX_K ×
+            // content diag (0 = untextured detail off, the bitwise A/B —
+            // read at derivation time, not per frame).
+            "--detail-untex-scale" => {
+                let k: f32 = args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .filter(|&k: &f32| k.is_finite() && (0.0..=4.0).contains(&k))
+                    .unwrap_or_else(|| {
+                        eprintln!("--detail-untex-scale needs a value in 0.0..=4.0 (1 = default, 0 = untextured detail off)");
+                        std::process::exit(2);
+                    });
+                opts.detail_untex_scale = k;
             }
             // --no-amb-bump: the SH ambient stops amplifying its response to
             // the shading normal's deviation (normal maps/detail bump go
@@ -1904,6 +1928,10 @@ pub fn usage() {
                 eprintln!("  --detail-ao-strength K  detail AO strength multiplier, 0.0..=4.0 (default 0.125;");
                 eprintln!("                1.0 = original; scales the occlusion pools, cavity, and marched");
                 eprintln!("                sun shadows)");
+                eprintln!("  --detail-untex-scale K  UNTEXTURED materials' synthetic detail texel scale,");
+                eprintln!("                0.0..=4.0 (default 1.0; a multiplier on DETAIL_UNTEX_K x the");
+                eprintln!("                content diagonal — what puts the detail field on albedo-map-free");
+                eprintln!("                scenes like powerplant; 0 = untextured detail off, the bitwise A/B)");
                 eprintln!("  --no-amb-bump  no ambient bump response: the SH ambient stops amplifying its");
                 eprintln!("                irradiance response to the shading normal's deviation (normal");
                 eprintln!("                maps + detail bump read flat under sky light again; a no-op on");
@@ -1952,7 +1980,7 @@ pub fn usage() {
 fn lever_snapshot() -> String {
     format!(
         "mips={} aniso={} h2n={} n2h={} smips={} tint={} spray={} depth={} detail={} dao={} \
-         dstr={} daostr={} \
+         dstr={} daostr={} duntex={} \
          ambb={} water={} ccull={} harm={} hon={} bloom={} clouds={} ff={} ffn={} el={} eln={} \
          cshadow={} skylod={} dxrinline={} dxrsbt={} fsway={} famp={}",
         texture::mips_enabled(),
@@ -1967,6 +1995,7 @@ fn lever_snapshot() -> String {
         scene::detail_ao(),
         scene::detail_strength(),
         scene::detail_ao_strength(),
+        scene::detail_untex_scale(),
         scene::amb_bump(),
         scene::water_enabled(),
         scene::coincident_cull_enabled(),
@@ -2023,6 +2052,8 @@ pub fn self_test() -> Result<(), String> {
         "2",
         "--detail-ao-strength",
         "0.5",
+        "--detail-untex-scale",
+        "0.25",
         "--no-amb-bump",
         "--no-water",
         "--no-coincident-cull",
@@ -2070,6 +2101,7 @@ pub fn self_test() -> Result<(), String> {
         ("detail_ao", !o.detail_ao),
         ("detail_strength", o.detail_strength == 2.0),
         ("detail_ao_strength", o.detail_ao_strength == 0.5),
+        ("detail_untex_scale", o.detail_untex_scale == 0.25),
         ("amb_bump", !o.amb_bump),
         ("water", !o.water),
         ("coincident_cull", !o.coincident_cull),

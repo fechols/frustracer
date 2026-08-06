@@ -797,12 +797,14 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
         // Kd = 1 alongside map_Kd); hardware bilinear + the SRGB SRV format
         // reproduce texture.rs::sample_bilinear (decode per texel, then
         // filter — precision-level differences only, absorbed by the
-        // statistical CPU-vs-GPU gates). The Textured arm adds the Unreal-1
-        // detail field on magnified hits (shade.rs's hook, mirrored): `dgr`
-        // carries its per-q-unit 3D gradient to the micro-bump below, `ddo`
-        // the fired flag — both dead when FLAG_DETAIL is off or dlod >= 0,
-        // and the whole branch folds away with SHADE_MAT_TEXKIND under
-        // shadeclass stripping.
+        // statistical CPU-vs-GPU gates). The detail block after the match
+        // adds the Unreal-1 field for EVERY albedo source (shade.rs's hook,
+        // mirrored): `dgr` carries its per-q-unit 3D gradient to the
+        // micro-bump below, `ddo` the fired flag — both dead when
+        // FLAG_DETAIL is off or the window is closed. Under shadeclass
+        // stripping only the textured WINDOW arm folds away with
+        // SHADE_MAT_TEXKIND; the untextured arm legitimately survives (a
+        // lambert/gloss record's materials ARE untextured).
         float3 dgr = float3(0.0, 0.0, 0.0);
         bool ddo = false;
         // The field's signed height (value - 1, mean 0) for the cavity AO
@@ -821,9 +823,22 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
         } else if (SHADE_MAT_TEXKIND(mat)) {
             float2 auv = tri_uv(hit.tri, hit.u, hit.v);
             albedo = tex_sample(mat.tex, auv, filt);
-            // Transmissive materials EXCLUDED (shade.rs — the visor/water
-            // finding): graining the transmission tint mottles glass.
-            if ((flags & FLAG_DETAIL) && SHADE_MAT_TRANSMISSION(mat) == 0.0) {
+        }
+        // The Unreal-1 detail block (shade.rs's site, mirrored): the field's
+        // domain is the rest-pose position over the per-material scale, so
+        // it needs no UVs — untextured materials ride the synthetic scale
+        // (derive_detail_scales' untextured arm via Mat.detail_scale) and
+        // the world-space window below. Transmissive materials EXCLUDED
+        // (the visor/water finding): graining the transmission tint mottles
+        // glass.
+        if ((flags & FLAG_DETAIL) && SHADE_MAT_TRANSMISSION(mat) == 0.0) {
+            // The PER-MATERIAL texel scale (Scene::detail_scales via
+            // Mat.detail_scale — never per-face, which seams on
+            // greedy-meshed atlases). s == 0 closes the window — structural
+            // off.
+            float s = mat.detail_scale;
+            float dlod;
+            if (SHADE_MAT_TEXKIND(mat)) {
                 // The albedo texture's COMPLETED lod: the iso arm's base
                 // rides in filt (free); the aniso arm keys off the MINOR
                 // axis its gradients already carry — the isotropic recompute
@@ -834,47 +849,49 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                                       : filt.lod_base;
                 uint tw, th;
                 texs[NonUniformResourceIndex(mat.tex)].GetDimensions(tw, th);
-                float dlod = lb + 0.5 * log2(float(tw * th)); // Texture::lod_dims
-                bool ao_band = dlod < DETAIL_AO_RANGE && (flags & FLAG_DETAIL_AO);
-                if (dlod < 0.0 || ao_band) {
-                    // World-space domain: q3 = rest position over the
-                    // PER-MATERIAL texel scale (Scene::detail_scales via
-                    // Mat.detail_scale — never per-face, which seams on
-                    // greedy-meshed atlases; shade.rs's site, mirrored).
-                    // s == 0 skips the field — structural off.
-                    float s = mat.detail_scale;
-                    if (s > 0.0) {
-                        float3 q3 = tri_rest_point(hit.tri, hit.u, hit.v) / s;
-                        if (dlod < 0.0) {
-                            float df;
-                            detail_field(q3, dlod, df, dgr);
-                            albedo *= df;
-                            ddo = true;
-                            dh = df - 1.0;
-                        }
-                        // The AO/relief coarse octaves fire far past the
-                        // grain (8/4-texel-equivalent cells resolve until
-                        // dlod = 3/2) — mid-distance pools AND relief rims:
-                        // their gradient joins the micro-bump
-                        // (× DETAIL_AO_BUMP_K), so pool-scale relief is lit
-                        // directionally out where the grain has faded
-                        // (shade.rs's site, mirrored). Gated on the AO lever
-                        // so the off arm never pays the evals and ddo/dmarch
-                        // stay false-shaped.
-                        if (ao_band) {
-                            float hp;
-                            float3 gp;
-                            detail_ao_field(q3, dlod, hp, gp);
-                            dh += hp;
-                            if (any(gp != float3(0.0, 0.0, 0.0))) {
-                                dgr += gp * DETAIL_AO_BUMP_K;
-                                ddo = true;
-                            }
-                            mq3 = q3;
-                            mdl = dlod;
-                            dmarch = true;
-                        }
+                dlod = lb + 0.5 * log2(float(tw * th)); // Texture::lod_dims
+            } else {
+                // Untextured: the same window measured directly in the
+                // field's own q-domain — log2 of the cone footprint in
+                // texel-equivalents. cone_w is the footprint's MINOR axis,
+                // matching the textured aniso convention above (grazing
+                // aliasing accepted at the same price); exact 0 at
+                // cone_w == s. NOT filt's untextured -1e30 base, which
+                // would saturate every octave window wide open. s == 0
+                // parks the window closed (the bitwise off arm).
+                dlod = (s > 0.0) ? log2(cone_w / s) : 1e30;
+            }
+            bool ao_band = dlod < DETAIL_AO_RANGE && (flags & FLAG_DETAIL_AO);
+            if ((dlod < 0.0 || ao_band) && s > 0.0) {
+                // World-space domain: q3 = rest position over s.
+                float3 q3 = tri_rest_point(hit.tri, hit.u, hit.v) / s;
+                if (dlod < 0.0) {
+                    float df;
+                    detail_field(q3, dlod, df, dgr);
+                    albedo *= df;
+                    ddo = true;
+                    dh = df - 1.0;
+                }
+                // The AO/relief coarse octaves fire far past the grain
+                // (8/4-texel-equivalent cells resolve until dlod = 3/2) —
+                // mid-distance pools AND relief rims: their gradient joins
+                // the micro-bump (× DETAIL_AO_BUMP_K), so pool-scale relief
+                // is lit directionally out where the grain has faded
+                // (shade.rs's site, mirrored). Gated on the AO lever so the
+                // off arm never pays the evals and ddo/dmarch stay
+                // false-shaped.
+                if (ao_band) {
+                    float hp;
+                    float3 gp;
+                    detail_ao_field(q3, dlod, hp, gp);
+                    dh += hp;
+                    if (any(gp != float3(0.0, 0.0, 0.0))) {
+                        dgr += gp * DETAIL_AO_BUMP_K;
+                        ddo = true;
                     }
+                    mq3 = q3;
+                    mdl = dlod;
+                    dmarch = true;
                 }
             }
         }

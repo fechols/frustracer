@@ -93,7 +93,10 @@ use Strip::*;
 /// same class; `verify_strips` proves that mechanically, and `self_test`
 /// runs it over a synthetic all-classes set with boundary probes.
 pub const STRIPS: [&[Strip]; N_CLASSES] = [
-    // lambert: nothing optional survives — the biggest register win.
+    // lambert: nothing optional survives — the biggest register win (since
+    // the untextured detail arm, "nothing" excludes the detail block, whose
+    // untextured window legitimately runs in stripped records: lambert
+    // materials ARE untextured and carry the synthetic detail_scale).
     &[
         TexKind, Marble, Normal, RoughTex, MetalTex, EmisTex, Ripple, Sheen, Translucency,
         Transmission, Aniso, Refl, Emissive,

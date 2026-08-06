@@ -431,6 +431,13 @@ fn main() {
     if opts.detail_ao_strength != 0.125 {
         eprintln!("detail-ao-strength: pools/cavity/shadows ×{}", opts.detail_ao_strength);
     }
+    // Read by `scene::derive_detail_scales` (finalize_scalars), so it MUST
+    // land before any scene load — the restart-tier derivation class, like
+    // the emissive budget below.
+    scene::set_detail_untex_scale(opts.detail_untex_scale);
+    if opts.detail_untex_scale != 1.0 {
+        eprintln!("detail-untex-scale: untextured detail ×{}", opts.detail_untex_scale);
+    }
     scene::set_amb_bump(opts.amb_bump);
     scene::set_water(opts.water);
     scene::set_coincident_cull(opts.coincident_cull);

@@ -147,6 +147,27 @@ pub fn detail_ao_strength() -> f32 {
     f32::from_bits(DETAIL_AO_STRENGTH.load(Relaxed))
 }
 
+/// `--detail-untex-scale K` (default 1.0): multiplier on the SYNTHETIC
+/// texel-equivalent scale UNTEXTURED materials get in
+/// `derive_detail_scales` (`DETAIL_UNTEX_K` × content diag) — the knob that
+/// sizes the detail grain on albedo-map-free scenes (powerplant). 0 keeps
+/// those materials at `detail_scale == 0.0`, the pre-untextured-arm
+/// renderer BITWISE (the A/B off arm; `--no-detail-tex` stays the
+/// whole-feature kill). Read at DERIVATION time (load), so restart tier;
+/// no GPU define — the scale rides the per-material `GpuMat.detail_scale`
+/// lane, and `detail_scales` is derived-never-serialized (no cache
+/// contact).
+static DETAIL_UNTEX_SCALE: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0x3f80_0000); // 1.0f32
+
+pub fn set_detail_untex_scale(k: f32) {
+    DETAIL_UNTEX_SCALE.store(k.to_bits(), Relaxed);
+}
+
+pub fn detail_untex_scale() -> f32 {
+    f32::from_bits(DETAIL_UNTEX_SCALE.load(Relaxed))
+}
+
 /// Ambient bump response switch (`--no-amb-bump`): the sampled/SH ambient
 /// tiers amplify the irradiance response to the shading normal's deviation
 /// from the geometric normal (`shade::amb_irradiance` — the HL2/bent-normal
@@ -399,10 +420,14 @@ pub struct Scene {
     /// (vokselia's Grass spans s 0.11..215 across merged runs), and a
     /// per-face s makes `q3` jump at every face boundary — the block-seam
     /// artifact. One s per material keeps the field continuous across every
-    /// face of a surface BY CONSTRUCTION. 0.0 = no valid basis anywhere
-    /// (the detail field's structural off). Derived (`finalize_scalars`),
-    /// never serialized (the sky_sh precedent — every cache/merge path
-    /// re-runs finalize).
+    /// face of a surface BY CONSTRUCTION. Materials with NO albedo map take
+    /// a SYNTHETIC scale instead (`DETAIL_UNTEX_K` × content diag ×
+    /// `--detail-untex-scale` — the field needs no UVs, only a
+    /// texel-equivalent size, so powerplant-class scenes grain too). 0.0 =
+    /// a Textured material with no valid basis anywhere, or the knob's off
+    /// arm (the detail field's structural off). Derived
+    /// (`finalize_scalars`), never serialized (the sky_sh precedent — every
+    /// cache/merge path re-runs finalize).
     pub detail_scales: Vec<f32>,
     /// CONTENT bounds: the geometry EXCLUDING the standard ground quad (the
     /// first `GROUND_VERTS` positions every loader pushes) — where the models
@@ -1534,11 +1559,26 @@ pub fn refresh_sky_sh(scene: &mut Scene) {
     scene.sky_sh = crate::sh::Sh9::project(|d| crate::sky::gather(d, sun, scale, night));
 }
 
+/// Texel-equivalent world size for materials with NO albedo texture, as a
+/// fraction of the CONTENT diagonal (never `Scene::diag` — the fireflies
+/// lesson: the standard ground quad inflates the full diag ~17× on
+/// procedural scenes). USER-CALIBRATED 2026-08-06, two rounds: the 3e-4
+/// starting point read as chunky blotches on powerplant ("needs to be
+/// like 100x smaller" → 3e-6, then "maybe 2x smaller than it currently
+/// is" → 1.5e-6) — the grain is genuinely fine surface texture now, at
+/// the price that it resolves only at CLOSE range (the AO pools, 8× the
+/// grain scale, carry the mid distance). Scaled by `--detail-untex-scale`
+/// (0..=4 around this center).
+pub const DETAIL_UNTEX_K: f32 = 1.5e-6;
+
 /// Per-material detail-field texel scale (see the `detail_scales` field doc):
 /// a sampled per-material MEDIAN of the per-triangle texel size —
 /// deterministic (serial, fixed stride), and deliberately NOT per-face,
-/// which seams on greedy-meshed atlases. Hand-built scenes without
-/// per-vertex UVs keep all-zero scales (the field's structural off).
+/// which seams on greedy-meshed atlases. Materials WITHOUT an albedo map
+/// get a SYNTHETIC content-diag-relative scale instead (the untextured arm
+/// below) — the detail field needs no UVs (its domain is the rest-pose
+/// position over s), only a texel-equivalent size, so powerplant-class
+/// scenes carry the grain too.
 /// LOAD-ONLY by design: called from `finalize_scalars` alone — it landed
 /// inside `refresh_sky_sh` for one commit, where the interactive TOD path's
 /// throttled SH steps re-ran the whole ~2M-sample pass ~20×/s during world
@@ -1566,6 +1606,26 @@ fn derive_detail_scales(scene: &mut Scene) {
             if !v.is_empty() {
                 v.sort_by(|a, b| a.total_cmp(b));
                 scene.detail_scales[m] = v[v.len() / 2];
+            }
+        }
+    }
+    // The UNTEXTURED arm: no albedo map means no texel size to measure, so
+    // those materials take DETAIL_UNTEX_K × content diag × the
+    // `--detail-untex-scale` knob (0 ⇒ they stay 0.0 — the bitwise off arm).
+    // Keyed on KIND, deliberately never on "collected no samples": a
+    // Textured material whose UVs are all degenerate must keep its bitwise
+    // 0.0 structural off (the self-test pin) — its albedo really is
+    // texture-driven and a synthetic grain domain over a broken atlas is
+    // not what the median rule promised. Outside the texcoords-length guard
+    // above on purpose: hand-built scenes without per-vertex UVs still get
+    // the untextured arm.
+    let s_untex = DETAIL_UNTEX_K
+        * detail_untex_scale()
+        * (scene.content_max - scene.content_min).length();
+    if s_untex > 0.0 && s_untex.is_finite() {
+        for (m, mat) in scene.materials.iter().enumerate() {
+            if !matches!(mat.kind, MatKind::Textured { .. }) {
+                scene.detail_scales[m] = s_untex;
             }
         }
     }

@@ -217,6 +217,9 @@ opt_fields! {
         pub detail_strength: f32,
         /// --detail-ao-strength K (restart: pools/cavity/shadows multiplier)
         pub detail_ao_strength: f32,
+        /// --detail-untex-scale K (restart: untextured materials' synthetic
+        /// detail texel scale multiplier, 0 = off arm)
+        pub detail_untex_scale: f32,
         /// --no-amb-bump inverse (restart)
         pub amb_bump: bool,
         /// --no-water inverse (restart: keys the scene cache)
@@ -842,6 +845,13 @@ pub fn apply_to_opts(s: &Settings, opts: &mut crate::Opts) -> AppliedFx {
             warn("effects.detail_ao_strength", &k.to_string());
         }
     }
+    if let Some(k) = e.detail_untex_scale {
+        if k.is_finite() && (0.0..=4.0).contains(&k) {
+            opts.detail_untex_scale = k;
+        } else {
+            warn("effects.detail_untex_scale", &k.to_string());
+        }
+    }
     if let Some(n) = e.cloud_shadow {
         if n == 0 || (2..=64).contains(&n) {
             opts.cloud_shadow = n;
@@ -1106,6 +1116,7 @@ pub fn menu_items() -> &'static [MenuItem] {
             item!("detail_ao", "detail cavity AO", "Effects", Restart, Toggle { default: true }, acc_bool!(effects.detail_ao)),
             item!("detail_strength", "detail grain strength", "Effects", Restart, StepF { min: 0.0, max: 4.0, step: 0.25, default: 0.5 }, acc_f32!(effects.detail_strength)),
             item!("detail_ao_strength", "detail AO strength", "Effects", Restart, StepF { min: 0.0, max: 4.0, step: 0.125, default: 0.125 }, acc_f32!(effects.detail_ao_strength)),
+            item!("detail_untex_scale", "detail on untextured (scale)", "Effects", Restart, StepF { min: 0.0, max: 4.0, step: 0.25, default: 1.0 }, acc_f32!(effects.detail_untex_scale)),
             item!("amb_bump", "ambient bump response", "Effects", Restart, Toggle { default: true }, acc_bool!(effects.amb_bump)),
             item!("water", "water material class", "Effects", Restart, Toggle { default: true }, acc_bool!(effects.water)),
             // ── Scene

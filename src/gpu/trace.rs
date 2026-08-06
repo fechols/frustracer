@@ -4399,10 +4399,12 @@ pub const FLAG_EMISSIVE: u32 = 16384;
 pub const FLAG_WAVEVIZ: u32 = 262144;
 
 /// Unreal-1 detail texturing (`--no-detail-tex` clears it): procedural
-/// close-up albedo grain + micro-bump on MAGNIFIED textured hits
-/// (shade.hlsli branches inside the SHADE_MAT_TEXKIND arm behind `dlod < 0`,
-/// which untextured scenes never enter — the FLAG_DEPTH_TINT shape, no
-/// compile define needed).
+/// close-up albedo grain + micro-bump on MAGNIFIED hits — textured AND
+/// untextured since the untextured arm (shade.hlsli's post-match detail
+/// block: textured materials window off their albedo texture's lod,
+/// untextured off the cone footprint in synthetic texel-equivalents,
+/// Mat.detail_scale > 0 either way — the FLAG_DEPTH_TINT shape, no compile
+/// define needed).
 pub const FLAG_DETAIL: u32 = 32768;
 
 /// Detail cavity AO (`--no-detail-ao` clears it): the detail field's pits
@@ -4688,9 +4690,9 @@ impl FrameCb {
                 && fb_mode_of(&p.q) != 2) as u32
                 * FLAG_EMISSIVE)
             // The --no-detail-tex lever, read at CB-build time (the
-            // depth-tint shape) — the branch lives inside shade.hlsli's
-            // SHADE_MAT_TEXKIND arm behind dlod < 0, which untextured
-            // scenes never enter.
+            // depth-tint shape) — shade.hlsli's post-match detail block,
+            // gated per material on Mat.detail_scale > 0 (untextured
+            // materials carry the synthetic scale since the untextured arm).
             | (crate::scene::detail_tex() as u32 * FLAG_DETAIL)
             | (crate::scene::detail_ao() as u32 * FLAG_DETAIL_AO)
             | (crate::scene::amb_bump() as u32 * FLAG_AMB_BUMP)

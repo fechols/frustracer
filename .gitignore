@@ -44,9 +44,10 @@ xess_gbuf_*.png
 # are working files — often tens of GB for one 4K60 sequence. Only the curated,
 # downscaled results under docs/media/ are committed.
 /capture/
-/capture-preview/
-/capture-reshoot/
-/capture-v2/
+# Every re-shoot dir (capture-preview, capture-v2, capture-new, ...) — a glob,
+# because the enumerated list missed each new dir until someone noticed (a
+# 33 MB EXR in one of these reaching plain git history would be permanent).
+/capture-*/
 /cap-test/
 /capture-*.log
 *.mp4

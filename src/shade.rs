@@ -621,10 +621,10 @@ pub fn shade(
     // world-space hit point (models are static, so world space is stable)
     // and textures, sampled at the hit's interpolated UV.
     // `detail` carries the Unreal-1 detail field's per-q-unit 3D gradient
-    // out of the Textured arm for the micro-bump below; None = the field
-    // never fired (lever off, dlod >= 0, degenerate UV basis, or an
-    // untextured material) — the structural off state every other material
-    // shades bit-identically past.
+    // out of the detail block for the micro-bump below; None = the field
+    // never fired (lever off, window closed, s == 0, or a transmissive
+    // material) — the structural off state those materials shade
+    // bit-identically past.
     let mut detail: Option<Vec3A> = None;
     // The field's signed height (value − 1, mean 0) for the cavity AO below;
     // 0.0 = never fired, the structural off state (detail_cavity's callers
@@ -634,23 +634,39 @@ pub fn shade(
     // marched sun shadow below re-samples the field along the sun's tangent
     // direction. Plain values, so nothing borrows the texture.
     let mut detail_march: Option<(Vec3A, f32)> = None;
-    let albedo = match mat.kind {
+    let mut albedo = match mat.kind {
         MatKind::Marble { scale } => marble(ray.o + ray.d * hit.t, scale),
         MatKind::Textured { tex } => {
             let uv = scene.tri_uv(hit.tri, hit.u, hit.v);
-            let tx = &scene.textures[tex as usize];
-            let mut a = filt.sample(tx, uv, true);
-            // Transmissive materials are EXCLUDED (the visor/water finding):
-            // their "albedo" is the transmission tint, and graining it
-            // mottles glass; the bump would frost it (see DETAIL_ROUGH_*).
-            if crate::scene::detail_tex() && mat.transmission == 0.0 {
-                // The albedo texture's COMPLETED isotropic lod. The iso arm's
-                // base is already in `filt` (free); the aniso arm derives its
-                // lod inside the sampler, so recompute the base here (L1-hot —
-                // the triangle rows were just walked). dlod < 0 is
-                // magnification: the texels can no longer resolve the ray
-                // cone's footprint, exactly where Unreal 1 faded its detail
-                // texture in.
+            filt.sample(&scene.textures[tex as usize], uv, true)
+        }
+        _ => mat.albedo,
+    };
+    // The Unreal-1 detail block — for EVERY albedo source (textured, flat,
+    // marble): the field's domain is the rest-pose position over the
+    // per-material texel scale, so it never needed UVs, only a scale and a
+    // fade window; untextured materials get both from world space
+    // (scene::derive_detail_scales' synthetic arm + the cone-footprint
+    // window below). Transmissive materials are EXCLUDED (the visor/water
+    // finding): their "albedo" is the transmission tint, and graining it
+    // mottles glass; the bump would frost it (see DETAIL_ROUGH_*).
+    if crate::scene::detail_tex() && mat.transmission == 0.0 {
+        // The per-material texel scale (Scene::detail_scales — never
+        // per-face, which seams on greedy-meshed atlases; see the field
+        // doc). s == 0 (a Textured material with no valid UV basis
+        // anywhere, `--detail-untex-scale 0`, or a hand-built scene that
+        // skipped finalize) closes the window below — structural off,
+        // coarser never wrong.
+        let s = scene.detail_scales.get(mat_idx).copied().unwrap_or(0.0);
+        let dlod = match mat.kind {
+            // The albedo texture's COMPLETED isotropic lod. The iso arm's
+            // base is already in `filt` (free); the aniso arm derives its
+            // lod inside the sampler, so recompute the base here (L1-hot —
+            // the triangle rows were just walked). dlod < 0 is
+            // magnification: the texels can no longer resolve the ray
+            // cone's footprint, exactly where Unreal 1 faded its detail
+            // texture in.
+            MatKind::Textured { tex } => {
                 let base = match filt {
                     TexFilter::Lod(b) => b,
                     // The MINOR axis, not the isotropic recompute: the aniso
@@ -663,53 +679,49 @@ pub fn shade(
                     // adjacent faces of one cube). See detail_aniso_base.
                     TexFilter::Aniso { gu, gv, .. } => detail_aniso_base(gu, gv),
                 };
-                let dlod = base + tx.lod_dims();
-                let ao_band = dlod < DETAIL_AO_RANGE && crate::scene::detail_ao();
-                if dlod < 0.0 || ao_band {
-                    // The world-space domain: q3 = rest-pose position over
-                    // the PER-MATERIAL texel scale (Scene::detail_scales —
-                    // never per-face, which seams on greedy-meshed atlases;
-                    // see the field doc). s == 0 (no valid basis anywhere,
-                    // or a hand-built scene that skipped finalize) skips the
-                    // whole field — structural off, coarser never wrong.
-                    let s = scene.detail_scales.get(mat_idx).copied().unwrap_or(0.0);
-                    if s > 0.0 {
-                        let q3 = tri_rest_point(scene, hit.tri, hit.u, hit.v) / s;
-                        if dlod < 0.0 {
-                            let (f, g) = detail_field(q3, dlod);
-                            a *= f;
-                            detail = Some(g);
-                            detail_h = f - 1.0;
-                        }
-                        // The AO/relief coarse octaves fire far past the
-                        // grain (their 8/4-texel cells resolve until
-                        // dlod = 3/2) — mid-distance pools of occlusion
-                        // AND relief rims: the pools' gradient joins the
-                        // micro-bump (scaled DETAIL_AO_BUMP_K vs the
-                        // grain), so mid-frequency relief is lit
-                        // directionally out where the grain-only bump has
-                        // faded (the flat-tops finding — the eye sees
-                        // pool-scale structure, not texel grain, at
-                        // distance). Gated on the AO lever so the off arm
-                        // never pays the evals and `detail`/`detail_march`
-                        // stay None-shaped.
-                        if ao_band {
-                            let (hp, gp) = detail_ao_field(q3, dlod);
-                            detail_h += hp;
-                            if gp != Vec3A::ZERO {
-                                detail = Some(
-                                    detail.unwrap_or(Vec3A::ZERO) + gp * DETAIL_AO_BUMP_K,
-                                );
-                            }
-                            detail_march = Some((q3, dlod));
-                        }
-                    }
-                }
+                base + scene.textures[tex as usize].lod_dims()
             }
-            a
+            // Untextured: the same window measured directly in the field's
+            // own q-domain — the cone footprint in texel-equivalents
+            // (`detail_untex_window`, the D2-gated single source; cone_w is
+            // the footprint's MINOR axis — the extent across travel; the
+            // major carries the −log2|n·d| view-tilt stretch — deliberately
+            // matching the textured aniso convention above, grazing-grain
+            // aliasing accepted at the same price). NOT filt's untextured
+            // Lod(−∞), which would saturate every octave window wide open
+            // (un-antialiased grain at every distance); s == 0 parks the
+            // window closed — the bitwise pre-untextured-arm off.
+            _ => detail_untex_window(cone_w, s),
+        };
+        let ao_band = dlod < DETAIL_AO_RANGE && crate::scene::detail_ao();
+        if (dlod < 0.0 || ao_band) && s > 0.0 {
+            // The world-space domain: q3 = rest-pose position over s.
+            let q3 = tri_rest_point(scene, hit.tri, hit.u, hit.v) / s;
+            if dlod < 0.0 {
+                let (f, g) = detail_field(q3, dlod);
+                albedo *= f;
+                detail = Some(g);
+                detail_h = f - 1.0;
+            }
+            // The AO/relief coarse octaves fire far past the grain (their
+            // 8/4-texel cells resolve until dlod = 3/2) — mid-distance
+            // pools of occlusion AND relief rims: the pools' gradient
+            // joins the micro-bump (scaled DETAIL_AO_BUMP_K vs the grain),
+            // so mid-frequency relief is lit directionally out where the
+            // grain-only bump has faded (the flat-tops finding — the eye
+            // sees pool-scale structure, not texel grain, at distance).
+            // Gated on the AO lever so the off arm never pays the evals
+            // and `detail`/`detail_march` stay None-shaped.
+            if ao_band {
+                let (hp, gp) = detail_ao_field(q3, dlod);
+                detail_h += hp;
+                if gp != Vec3A::ZERO {
+                    detail = Some(detail.unwrap_or(Vec3A::ZERO) + gp * DETAIL_AO_BUMP_K);
+                }
+                detail_march = Some((q3, dlod));
+            }
         }
-        _ => mat.albedo,
-    };
+    }
     // Map-driven material terms — all pure ALU on the hit's UV, ZERO rng
     // draws (materials with every map at NO_TEX shade bit-identically to
     // before the map fields existed — the structural guarantee, and what
@@ -2488,6 +2500,20 @@ pub fn detail_aniso_base(gu: glam::Vec2, gv: glam::Vec2) -> f32 {
     gu.length().min(gv.length()).max(1e-20).log2()
 }
 
+/// The UNTEXTURED materials' detail-fade window: the cone footprint in the
+/// field's own texel-equivalents, `log2(cone_w / s)` — exactly 0 at
+/// `cone_w == s`, and `s == 0` parks the window CLOSED (+∞ fails both the
+/// `< 0` grain test and the `< DETAIL_AO_RANGE` band — the bitwise
+/// pre-untextured-arm off). `cone_w` is the footprint's MINOR axis, matching
+/// the textured aniso convention (`detail_aniso_base`). The ONE source for
+/// the shade() call site AND the self-test's D2 anchors, so the gate pins
+/// the shipping expression rather than a local twin. Mirrored as a literal
+/// in `shade.hlsli` (1e30 in place of ∞ — a dead value either way, the
+/// consumer re-guards on `s > 0`).
+pub fn detail_untex_window(cone_w: f32, s: f32) -> f32 {
+    if s > 0.0 { (cone_w / s).log2() } else { f32::INFINITY }
+}
+
 /// (albedo factor, per-q-unit gradient of the factor's sum term). See the
 /// block comment above. Degenerate-lod note: a degenerate base lod is −∞ on
 /// the CPU and −1e30 on the GPU — both saturate every window to 1
@@ -2548,19 +2574,22 @@ pub fn detail_self_test() -> Result<(), String> {
     // RAII guard — the amb-lever save/restore pattern, generalized: this fn
     // has too many early returns for manual restores). A
     // `--detail-strength 2 --check` therefore still proves the math.
-    struct StrengthPin(f32, f32);
+    struct StrengthPin(f32, f32, f32);
     impl Drop for StrengthPin {
         fn drop(&mut self) {
             crate::scene::set_detail_strength(self.0);
             crate::scene::set_detail_ao_strength(self.1);
+            crate::scene::set_detail_untex_scale(self.2);
         }
     }
     let _pin = StrengthPin(
         crate::scene::detail_strength(),
         crate::scene::detail_ao_strength(),
+        crate::scene::detail_untex_scale(),
     );
     crate::scene::set_detail_strength(1.0);
     crate::scene::set_detail_ao_strength(1.0);
+    crate::scene::set_detail_untex_scale(1.0);
     // A fixed non-lattice-aligned 3D q-space anchor (the old uv0 × 256 texel
     // point, given a z).
     let q0 = Vec3A::new(81.152, 189.696, 7.317);
@@ -3244,7 +3273,7 @@ pub fn detail_self_test() -> Result<(), String> {
     {
         use crate::scene::{finalize_scalars, MatKind, Material, Scene};
         use crate::texture::Texture;
-        let mk = |texcoords: Vec<glam::Vec2>| -> Scene {
+        let mk = |texcoords: Vec<glam::Vec2>, kind: MatKind| -> Scene {
             let mut sc = Scene {
                 positions: vec![
                     Vec3A::new(0.0, 0.0, 0.0),
@@ -3279,7 +3308,7 @@ pub fn detail_self_test() -> Result<(), String> {
                     metal_tex: crate::scene::NO_TEX,
                     emissive_tex: crate::scene::NO_TEX,
                     class: crate::matclass::IDX_DEFAULT as u8,
-                    kind: MatKind::Textured { tex: 0 },
+                    kind,
                 }],
                 textures: vec![Texture {
                     w: 16,
@@ -3323,7 +3352,7 @@ pub fn detail_self_test() -> Result<(), String> {
             glam::Vec2::new(1.0, 1.0),
             glam::Vec2::new(0.0, 1.0),
         ];
-        let sc = mk(unit);
+        let sc = mk(unit.clone(), MatKind::Textured { tex: 0 });
         // Per-tri texel sizes: quad A twice 1/16, quad B twice 4/16; the
         // upper median (v[len/2]) of the sorted four is 0.25.
         let s = sc.detail_scales.first().copied().unwrap_or(0.0);
@@ -3335,9 +3364,51 @@ pub fn detail_self_test() -> Result<(), String> {
         if sc.detail_scales.len() != 1 {
             return Err("detail_scales must be parallel to materials".into());
         }
-        let sc0 = mk(vec![glam::Vec2::ZERO; 8]);
+        let sc0 = mk(vec![glam::Vec2::ZERO; 8], MatKind::Textured { tex: 0 });
         if sc0.detail_scales.first().copied().unwrap_or(1.0).to_bits() != 0.0f32.to_bits() {
             return Err("degenerate-UV material must derive detail_scale 0.0".into());
+        }
+        // The UNTEXTURED arm (the powerplant case): a material with NO
+        // albedo map must derive the SYNTHETIC content-diag-relative scale,
+        // bitwise the derivation's own expression — keyed on KIND, which is
+        // why the degenerate-UV *Textured* pin above stays 0.0 untouched.
+        let scd = mk(unit.clone(), MatKind::Diffuse);
+        let exp = crate::scene::DETAIL_UNTEX_K
+            * 1.0
+            * (scd.content_max - scd.content_min).length();
+        let sd = scd.detail_scales.first().copied().unwrap_or(0.0);
+        if sd.to_bits() != exp.to_bits() || !(sd > 0.0) {
+            return Err(format!(
+                "untextured material must derive the synthetic scale {exp}, got {sd}"
+            ));
+        }
+        // Knob 0 = the bitwise off arm: untextured materials stay 0.0 (the
+        // pre-untextured-arm renderer — `--detail-untex-scale 0`).
+        crate::scene::set_detail_untex_scale(0.0);
+        let sck = mk(unit, MatKind::Diffuse);
+        crate::scene::set_detail_untex_scale(1.0);
+        if sck.detail_scales.first().copied().unwrap_or(1.0).to_bits() != 0.0f32.to_bits() {
+            return Err("--detail-untex-scale 0 must keep untextured detail_scale 0.0".into());
+        }
+    }
+    // (D2) The untextured lod window — `detail_untex_window`, the SHIPPING
+    // function shade()'s untextured match arm calls (not a local twin, so
+    // call-site drift is caught). Anchors are exact powers of two (fp-exact,
+    // teeth not tolerance): cone_w == s sits exactly ON the window edge
+    // (0.0 bitwise — grain off, AO band open), halving/doubling moves dlod
+    // by exactly ∓1, and the s == 0 arm parks the window CLOSED (INFINITY
+    // fails both `< 0` and `< DETAIL_AO_RANGE`).
+    {
+        let w = detail_untex_window;
+        if w(0.037, 0.037).to_bits() != 0.0f32.to_bits() {
+            return Err("untex window: cone_w == s must be exactly 0.0".into());
+        }
+        if w(0.5, 0.25) != 1.0 || w(0.125, 0.25) != -1.0 {
+            return Err("untex window: power-of-two anchors must be exact".into());
+        }
+        let closed = w(1e-6, 0.0);
+        if closed < 0.0 || closed < DETAIL_AO_RANGE {
+            return Err("untex window: s == 0 must close the window".into());
         }
     }
     Ok(())

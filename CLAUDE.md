@@ -1571,10 +1571,38 @@ cargo run --release -- --no-detail-tex  # A/B lever: no Unreal-1 style DETAIL TE
                                       # grain and bump are one coherent surface. Zero rng draws;
                                       # detail flows into the albedo local BEFORE the
                                       # PrimarySurface capture, so guides/f0/diff_albedo stay
-                                      # coherent (the normal-map-content precedent). Structural
-                                      # off arms: lever off / dlod >= 0 / untextured materials
-                                      # are guarded branches — procedural/stress scenes and
-                                      # check.png byte-identical by construction (verified). NO
+                                      # coherent (the normal-map-content precedent).
+                                      # UNTEXTURED MATERIALS GRAIN TOO (2026-08-06 — the
+                                      # powerplant ask; the block hoisted OUT of the Textured
+                                      # albedo arm on both CPU+HLSL): the field never needed
+                                      # UVs — its domain is rest-pose position over s — only a
+                                      # texel-equivalent SIZE and a fade window, so materials
+                                      # with no albedo map take a SYNTHETIC s =
+                                      # scene::DETAIL_UNTEX_K (1.5e-6 — the user's two-round
+                                      # calibration off the 3e-4 draft: "100x smaller", then
+                                      # "2x smaller" again) × CONTENT diag ×
+                                      # --detail-untex-scale (derive_detail_scales' kind-keyed
+                                      # arm — a Textured material with degenerate UVs keeps its
+                                      # bitwise-0.0 off, the self-test pin) and a world-space
+                                      # window dlod = log2(cone_w / s) — the cone footprint in
+                                      # q-units, MINOR-axis by the same convention as the
+                                      # textured aniso arm, exactly 0 at cone_w == s; NEVER
+                                      # filt's untextured −∞ base, which would saturate every
+                                      # octave window open. Textured materials keep their
+                                      # texture-lod window verbatim (bitwise). The synthetic s
+                                      # rides GpuMat.detail_scale unchanged (kind-agnostic
+                                      # pack); shadeclass strips keep soundness (only the
+                                      # textured-window arm folds with TexKind — stripped
+                                      # lambert/gloss records legitimately run the untextured
+                                      # arm, so their register win shrinks by the detail
+                                      # block). --detail-untex-scale 0 is the bitwise off arm
+                                      # (the pre-untextured-arm renderer); it reads at
+                                      # DERIVATION (restart tier, no cache contact — scales are
+                                      # derived-never-serialized). CONSEQUENCE: procedural/
+                                      # stress scenes now grain close up — check.png MOVED at
+                                      # this change (the liveness proof; the old byte-identical
+                                      # claim retired), and the off arms are lever off /
+                                      # window closed / s == 0 / transmissive. NO
                                       # NORMAL_MAP_Y_SIGN in the bump (that flip compensates the
                                       # loader V-flip; this field is authored in +u/+v directly).
                                       # FLAG_DETAIL = 32768 (the CB bit, depth-tint shape); the
@@ -1793,8 +1821,9 @@ cargo run --release -- --no-detail-ao # A/B lever (2026-08-05): no detail cavity
                                       # field must each bitwise-differ across a 16-q-unit — one
                                       # Minecraft block — advance on every axis, the exact
                                       # offset the old UV domain aliased);
-                                      # procedural/stress check.png byte-identical
-                                      # (untextured = structural off); the same-seed wavefront-
+                                      # procedural/stress scenes carry the field via the
+                                      # untextured arm (see --no-detail-tex — check.png moved
+                                      # with it); the same-seed wavefront-
                                       # vs-reference A/B stays exact (shared shade.hlsli source).
                                       # --detail-ao-strength K (0..=4, DEFAULT 0.125 — the
                                       # 2026-08-06 feel-test calibration, 1.0 = the original
