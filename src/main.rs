@@ -11816,6 +11816,20 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
     };
 
+    // surface_point self-test — the smooth-silhouette band (the flip must be
+    // decided on the FACE, not the interpolated normal), with the pre-fix
+    // teeth, plus genuine-backface / front / degenerate-face pins.
+    let surfpt_ok = match shade::surface_point_self_test() {
+        Ok(()) => {
+            eprintln!("surface-point self-test: OK");
+            true
+        }
+        Err(e) => {
+            eprintln!("surface-point self-test: FAIL — {e}");
+            false
+        }
+    };
+
     // Water-ripple field self-test — off-state bit-identity, horizon guard,
     // closed-form anchor, animation.
     let ripple_ok = match shade::ripple_self_test() {
@@ -14219,6 +14233,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         ("nppd", nppd_ok),
         ("matclass", matclass_ok),
         ("tangent", tangent_ok),
+        ("surface-point", surfpt_ok),
         ("ripple", ripple_ok),
         ("upchain", upchain_ok),
         ("settings", settings_ok),

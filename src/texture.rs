@@ -666,7 +666,15 @@ impl Texture {
         // stretch can swap the world-space ellipse's axes, so this must be
         // decided here, not by the caller.
         let (maj_uv, lmaj, lmin) = if lu >= lv { (gu, lu, lv) } else { (gv, lv, lu) };
-        if !(lmaj > 0.0) || self.mips.is_empty() {
+        // NaN lmaj fails the `> 0.0` arm; Inf and a NaN MINOR need their own
+        // rejects — an Inf major axis used to sail through, turn `ratio` into
+        // NaN, collapse the loop to one tap at `Inf * 0.0 = NaN`, and land
+        // every pixel on texel (0, 0) via wrap()'s NaN sink (a flat wrong
+        // surface); a NaN minor slips past the max() below (Rust's max
+        // ignores NaN). Mostly unreachable since tri_grads_from grew its
+        // finiteness backstop — this keeps the sampler total over hostile
+        // gradients anyway.
+        if !(lmaj > 0.0) || !lmaj.is_finite() || !lmin.is_finite() || self.mips.is_empty() {
             return if srgb { self.sample_bilinear(u, v) } else { self.sample_bilinear_linear(u, v) };
         }
         let ratio = (lmaj / lmin.max(1e-8)).clamp(1.0, max_aniso.max(1.0));
@@ -1017,6 +1025,22 @@ pub fn self_test() -> bool {
         let b = t.sample_bilinear_linear(u, v);
         if a.to_array().map(f32::to_bits) != b.to_array().map(f32::to_bits) {
             fail("aniso(degenerate, linear) not bit-equal to bilinear_linear".into());
+            ok = false;
+        }
+    }
+    // HOSTILE footprints (non-finite gradients — the black-at-extreme-angles
+    // class): must take the same bilinear escape bit-exactly, never the tap
+    // loop. An Inf major axis used to pass `lmaj > 0.0`, turn ratio into NaN,
+    // and land every tap on texel (0,0) through wrap()'s NaN sink.
+    for (gu, gv) in [
+        (Vec2::splat(f32::INFINITY), Vec2::splat(f32::INFINITY)),
+        (Vec2::new(f32::INFINITY, 0.0), Vec2::new(0.0, 1e-3)),
+        (Vec2::splat(f32::NAN), Vec2::new(1e-3, 0.0)),
+    ] {
+        let a = t.sample_aniso(u, v, gu, gv, 16.0, true);
+        let b = t.sample_bilinear(u, v);
+        if a.to_array().map(f32::to_bits) != b.to_array().map(f32::to_bits) {
+            fail(format!("aniso({gu:?},{gv:?}) must take the bilinear escape"));
             ok = false;
         }
     }

@@ -404,6 +404,17 @@ float3 detail_bump(float3 base, float3 n, float3 g) {
 
 // shade.rs::surface_point: interpolated, face-flipped shading normal and the
 // eps-offset origin for secondary rays.
+//
+// THE FLIP IS DECIDED ON THE TRUE FACE NORMAL (shade.rs mirror — read its doc
+// for the full argument): on a SMOOTH-shaded mesh the interpolated normal
+// crosses the view horizon in a band at every silhouette while the FACE is
+// still front-facing, and flipping there aims `n` — which is also the
+// eps-offset axis — INTO the solid, so every shadow/AO ray starts inside the
+// surface and the pixel resolves to exactly (0,0,0). The face normal is read
+// ONLY inside the branch; everywhere else the two criteria agree, so the
+// common path is unchanged bit-for-bit. Inside it the face only arbitrates
+// when the interpolated normal lies in its hemisphere — a mesh whose winding
+// disagrees with its authored normals keeps the old unconditional flip.
 void surface_point(float3 ro, float3 rd, HitInfo hit, out float3 p, out float3 n) {
     uint3 idx = uint3(indices[hit.tri * 3u], indices[hit.tri * 3u + 1u], indices[hit.tri * 3u + 2u]);
     float w = 1.0 - hit.u - hit.v;
@@ -413,7 +424,17 @@ void surface_point(float3 ro, float3 rd, HitInfo hit, out float3 p, out float3 n
         float3 e2 = positions[idx.z] - positions[idx.x];
         n = normalize_or_zero(cross(e1, e2));
     }
-    if (dot(n, rd) > 0.0) n = -n;
+    if (dot(n, rd) > 0.0) {
+        // Genuine backface, or a smooth silhouette's past-horizon band? Ask
+        // the face, and only where it is entitled to answer. Both guards keep
+        // the old unconditional flip when they fire: nf·n <= 0 (winding
+        // disagrees with the authored normals — also the degenerate face's
+        // exact 0.0, and NaN) and !(nf·d < 0) (the face really is backfacing).
+        float3 e1 = positions[idx.y] - positions[idx.x];
+        float3 e2 = positions[idx.z] - positions[idx.x];
+        float3 nf = cross(e1, e2);
+        if (dot(nf, n) <= 0.0 || !(dot(nf, rd) < 0.0)) n = -n;
+    }
     p = ro + rd * hit.t + n * SCENE_EPS;
 }
 
@@ -496,8 +517,22 @@ bool tri_grads_from(float3 tu, float3 tv, float3 n, float3 d, float cone_w,
     gu = 0.0;
     gv = 0.0;
     if (!(cone_w > 0.0)) return false;
-    float den = dot(cross(tu, tv), n);
-    if (abs(den) < 1e-12) return false;
+    // RELATIVE degeneracy guard (shade.rs mirror): den/|tu x tv| is the
+    // cosine between the shading normal and the basis plane's normal. At
+    // silhouettes the interpolated n tilts nearly into the basis plane and
+    // an absolute den threshold let 1/den blow the gradients up — and
+    // SampleGrad with huge/non-finite gradients is UB (black). Written
+    // !(x >= k) so NaN inputs reject too; false = the iso-lod fallback.
+    // The a < 3e38 arm: tri_uv_basis admits UV dets down to 1e-12, so |tu|
+    // reaches ~1e12 on atlas meshes and |tu x tv|^2 overflows to Inf, which
+    // would make the cosine test reject UNCONDITIONALLY (aniso silently off
+    // there). At that scale the cosine is unmeasurable — hand it to the
+    // finiteness backstop below instead. NaN fails the < and takes the same
+    // route. Plain magnitude compare, NOT isfinite (DXC folds that away).
+    float3 axn = cross(tu, tv);
+    float den = dot(axn, n);
+    float a = length(axn);
+    if (a < 3.0e38 && !(abs(den) >= 1e-3 * a)) return false;
     float n_d = dot(d, n);
     float3 across = cross(n, d);
     float3 a_dir, b_dir;
@@ -516,6 +551,17 @@ bool tri_grads_from(float3 tu, float3 tv, float3 n, float3 d, float cone_w,
     // Cramer against the UV basis: w = du*tu + dv*tv for in-plane w.
     gu = float2(dot(cross(w_maj, tv), n), dot(cross(tu, w_maj), n)) / den;
     gv = float2(dot(cross(w_min, tv), n), dot(cross(tu, w_min), n)) / den;
+    // Overflow backstop (shade.rs mirror): a huge-but-accepted basis can
+    // still overflow the numerator products. The exponent bit test, NOT
+    // isfinite() — DXC folds isfinite away without strict IEEE (the
+    // quin.hlsl finite1 lesson). Non-finite gradients must never reach
+    // SampleGrad.
+    uint4 ge = uint4(asuint(gu), asuint(gv)) & 0x7f800000u;
+    if (any(ge == 0x7f800000u)) {
+        gu = 0.0;
+        gv = 0.0;
+        return false;
+    }
     return true;
 }
 

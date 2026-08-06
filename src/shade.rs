@@ -200,6 +200,12 @@ pub struct Abl {
     pub norefl: bool,
     /// Skip the refraction/TIR continuation chain.
     pub noglass: bool,
+    /// REPRO ARM, not a cost probe: restore the pre-fix `surface_point` flip,
+    /// which decided on the INTERPOLATED normal and so inverted the eps-offset
+    /// axis across every smooth silhouette — the black-limb-band bug. Brings
+    /// the band back on demand for a before/after A/B (the `nocandtmin`
+    /// precedent). CPU only; the GPU twin has no lever.
+    pub nofaceflip: bool,
 }
 
 pub fn abl() -> &'static Abl {
@@ -212,15 +218,19 @@ pub fn abl() -> &'static Abl {
             noao: all || v.contains("noao"),
             norefl: all || v.contains("norefl"),
             noglass: all || v.contains("noglass"),
+            // Deliberately NOT in `nosec`: this is a repro arm, not a
+            // secondary-ray cost probe, and folding it in would silently
+            // reintroduce the bug under every cost measurement.
+            nofaceflip: v.contains("nofaceflip"),
         };
         // Loud on departure from the default — a silent ablation is how a
         // measurement gets attributed to the wrong thing (the probe-reach trap
         // recorded in CLAUDE.md's pack-split section).
-        if a.noshadow || a.noao || a.norefl || a.noglass {
+        if a.noshadow || a.noao || a.norefl || a.noglass || a.nofaceflip {
             eprintln!(
-                "FR_ABL (cpu shade): noshadow={} noao={} norefl={} noglass={} \
-                 — THE IMAGE IS DELIBERATELY WRONG, this is a cost probe",
-                a.noshadow, a.noao, a.norefl, a.noglass
+                "FR_ABL (cpu shade): noshadow={} noao={} norefl={} noglass={} nofaceflip={} \
+                 — THE IMAGE IS DELIBERATELY WRONG (cost probe / repro arm)",
+                a.noshadow, a.noao, a.norefl, a.noglass, a.nofaceflip
             );
         }
         a
@@ -289,6 +299,30 @@ pub enum VisCtl<'a> {
 /// Interpolated, face-flipped shading normal at a hit and the eps-offset
 /// point secondary rays start from — shared by `shade` and the hemisphere
 /// integrator's verification probes (they must agree exactly).
+///
+/// THE FLIP IS DECIDED ON THE TRUE FACE NORMAL, not on the interpolated one,
+/// and that distinction is the whole reason this reads the positions. On any
+/// SMOOTH-shaded mesh the interpolated normal crosses the view horizon
+/// (`n·d > 0`) in a band at every silhouette while the FACE is still
+/// front-facing — that is what a smooth silhouette IS. Flipping there points
+/// `n` INTO the solid, and since `n` is also the eps-offset axis, every
+/// secondary ray then starts inside the surface: shadow rays self-occlude,
+/// `onb(n)` aims the AO hemisphere into the geometry so `ao` comes back
+/// EXACTLY 0, the direct loop's `ndl <= 0` skips every light, and the pixel
+/// lands on exactly (0,0,0) — a hard black band on the limb of every smooth
+/// curved surface (found on the powerplant's smokestack, whose vertex normals
+/// the loader welds smooth). Only the face normal can tell that band apart
+/// from a genuine backface, which is why the positions are read here.
+///
+/// The face normal is derived ONLY inside the `n·d > 0` branch: everywhere
+/// else the two criteria provably agree, so the common path pays nothing and
+/// stays bit-identical. Inside it, the face only gets to arbitrate when the
+/// interpolated normal actually lies in its hemisphere (`nf·n > 0`) — a mesh
+/// whose winding disagrees with its authored vertex normals keeps the old
+/// unconditional flip, which is what makes this equivalent to the general
+/// "orient the shading normal to the ray-oriented face normal's side" rule
+/// rather than merely equivalent-where-the-data-is-clean. Mirrored by
+/// `shade.hlsli::surface_point` — change both together.
 pub fn surface_point(scene: &Scene, ray: &Ray, hit: &Hit) -> (Vec3A, Vec3A) {
     let [i0, i1, i2] = scene.indices[hit.tri as usize];
     let w = 1.0 - hit.u - hit.v;
@@ -302,7 +336,26 @@ pub fn surface_point(scene: &Scene, ray: &Ray, hit: &Hit) -> (Vec3A, Vec3A) {
         n = e1.cross(e2).normalize_or_zero();
     }
     if n.dot(ray.d) > 0.0 {
-        n = -n;
+        // Genuine backface, or a smooth silhouette's past-horizon band? Ask
+        // the face — but only where the face is entitled to answer. Two
+        // guards, and BOTH keep the old unconditional flip when they fire:
+        //   `nf·n <= 0` — the vertex normals do NOT sit in this face's
+        //     hemisphere, so the winding disagrees with the authored normals
+        //     and the face cannot arbitrate. Also catches the degenerate face
+        //     (zero cross ⇒ exactly 0.0) and NaN.
+        //   `!(nf·d < 0)` — the face really is backfacing.
+        // Without the first, a thin sheet whose winding is inverted relative
+        // to its normals would render its back side with the offset INSIDE
+        // the solid: the exact black band this guard exists to remove, moved
+        // onto a different population. The OnceLock deref rides inside this
+        // branch, so the common path pays nothing for the repro lever
+        // (FR_ABL=nofaceflip).
+        let e1 = scene.positions[i1 as usize] - scene.positions[i0 as usize];
+        let e2 = scene.positions[i2 as usize] - scene.positions[i0 as usize];
+        let nf = e1.cross(e2);
+        if abl().nofaceflip || nf.dot(n) <= 0.0 || !(nf.dot(ray.d) < 0.0) {
+            n = -n;
+        }
     }
     (ray.o + ray.d * hit.t + n * scene.eps, n)
 }
@@ -507,11 +560,29 @@ fn tri_grads_from(
         return None;
     }
     // In-plane inversion: for an in-plane w, w = du·tu + dv·tv, so Cramer
-    // against n gives du, dv. `den` is the basis' signed area — the same
-    // degeneracy `tri_uv_basis` already rejects, re-checked because n is the
-    // interpolated shading normal, not the exact face normal.
-    let den = tu.cross(tv).dot(n);
-    if den.abs() < 1e-12 {
+    // against n gives du, dv. `den` is the basis' signed area PROJECTED onto
+    // n — re-checked (tri_uv_basis already rejected a degenerate basis)
+    // because n is the interpolated shading normal, not the exact face
+    // normal, and at silhouettes it can tilt nearly into the basis plane.
+    // The guard is RELATIVE to the basis' own area: den/|tu×tv| is the
+    // cosine between n and the basis plane's normal, and an absolute
+    // threshold on den (the 1e-12 this replaced) let through cosines small
+    // enough that 1/den blew the gradients up to Inf — which SampleGrad
+    // turns into undefined behavior (black) and sample_aniso into a NaN
+    // cascade. Written `!(x >= k)` so NaN inputs also reject.
+    //
+    // The `a < f32::MAX` arm is not decoration: `tri_uv_basis` admits any UV
+    // det over 1e-12, so |tu| can reach ~1e12 (atlas meshes), and then
+    // |tu×tv|² overflows f32 and `length()` is Inf — which would make the
+    // cosine test reject UNCONDITIONALLY and silently drop those meshes to
+    // the isotropic lod. Where the scale is that extreme the cosine is
+    // unmeasurable, so hand the case to the finiteness backstop below
+    // instead. NaN `a` fails the `<` and takes the same route (the backstop
+    // rejects it there).
+    let axn = tu.cross(tv);
+    let den = axn.dot(n);
+    let a = axn.length();
+    if a < f32::MAX && !(den.abs() >= 1e-3 * a) {
         return None;
     }
     let n_d = d.dot(n);
@@ -532,7 +603,16 @@ fn tri_grads_from(
     let w_min = a_dir * cone_w;
     let w_maj = b_dir * (cone_w / n_d.abs().max(0.05));
     let to_uv = |w: Vec3A| glam::Vec2::new(w.cross(tv).dot(n) / den, tu.cross(w).dot(n) / den);
-    Some((to_uv(w_maj), to_uv(w_min)))
+    let (gu, gv) = (to_uv(w_maj), to_uv(w_min));
+    // Overflow backstop: a huge-but-accepted basis (atlas meshes reach
+    // |tu|,|tv| ~ 1e11 off a det just over tri_uv_basis' floor) can still
+    // overflow the numerator products to Inf. Non-finite gradients must
+    // never reach a sampler — None falls back to the isotropic lod, whose
+    // log terms are bounded (coarser, never wrong).
+    if !(gu.is_finite() && gv.is_finite()) {
+        return None;
+    }
+    Some((gu, gv))
 }
 
 /// Whitted-style shading. Secondary rays (shadow / AO / reflection) always use
@@ -2017,6 +2097,171 @@ pub fn tangent_self_test() -> Result<(), String> {
     }
     if tri_grads(&sc, 0, n, -Vec3A::Z, 0.0).is_some() {
         return Err("a zero cone must yield no footprint".into());
+    }
+
+    // --- the grazing hardening (the black-at-extreme-angles fix) -----------
+    // An exact silhouette (n·d = 0) with a sound basis must still produce a
+    // footprint — finite, minor axis = cone_w, major pinned at the 0.05
+    // floor's 20× stretch. The guards below must not over-reject this regime.
+    let Some((gu, gv)) = tri_grads(&sc, 0, n, Vec3A::X, cw) else {
+        return Err("tri_grads must survive an exact silhouette (n·d = 0)".into());
+    };
+    if !(gu.is_finite() && gv.is_finite()) {
+        return Err(format!("silhouette footprint not finite: {gu:?} {gv:?}"));
+    }
+    let (maj, min) = (gu.length().max(gv.length()), gu.length().min(gv.length()));
+    if (min - cw).abs() > 1e-6 || (maj - cw / 0.05).abs() > 1e-4 {
+        return Err(format!("silhouette footprint {min}×{maj}, want {cw}×{}", cw / 0.05));
+    }
+    // A shading normal tilted nearly INTO the basis plane (silhouettes on
+    // smooth-shaded geometry): den/|tu×tv| = 5e-4 sits under the 1e-3
+    // threshold and must REJECT — the old absolute `|den| < 1e-12` guard
+    // accepted it, 1/den blew the gradients toward Inf, and SampleGrad with
+    // non-finite gradients is UB (the black-surface symptom).
+    let basis = (Vec3A::X, Vec3A::Y);
+    let n_graze = Vec3A::new(1.0, 0.0, 5.0e-4).normalize();
+    if tri_grads_from(basis, n_graze, -Vec3A::Z, cw).is_some() {
+        return Err("near-in-plane shading normal must reject (den guard)".into());
+    }
+    // RELATIVE is the point: the same cosine on a 1e6-scaled basis carries an
+    // absolute den of ~5e8, which any absolute threshold accepts — the teeth
+    // against reverting the guard to `|den| < eps`.
+    let big = (Vec3A::X * 1.0e6, Vec3A::Y * 1.0e6);
+    if tri_grads_from(big, n_graze, -Vec3A::Z, cw).is_some() {
+        return Err("den guard must be relative to the basis' area".into());
+    }
+    // Just ABOVE the threshold the footprint must come back finite — the
+    // guard is a boundary, not a blanket reject of grazing normals.
+    let n_ok = Vec3A::new(1.0, 0.0, 2.0e-3).normalize();
+    match tri_grads_from(basis, n_ok, -Vec3A::Z, cw) {
+        Some((gu, gv)) if gu.is_finite() && gv.is_finite() => {}
+        Some(_) => return Err("above-threshold footprint must be finite".into()),
+        None => return Err("cosine just above the den threshold must not reject".into()),
+    }
+    // A basis so large that |tu×tv| OVERFLOWS f32 must NOT be rejected by the
+    // cosine test — `length()` is then Inf and a naive relative guard rejects
+    // unconditionally, silently dropping atlas meshes (|tu| ~ 1e12 off
+    // tri_uv_basis' 1e-12 det floor) to the isotropic lod. The cosine is
+    // unmeasurable at that scale, so the finiteness backstop is what decides;
+    // here it survives with a finite footprint. ANTI-VACUITY first: the
+    // overflow must actually happen, or this probe proves nothing.
+    let huge = (Vec3A::X * 1.0e13, Vec3A::Y * 1.0e13);
+    if huge.0.cross(huge.1).length().is_finite() {
+        return Err("probe is vacuous: |tu×tv| must overflow f32 here".into());
+    }
+    match tri_grads_from(huge, Vec3A::Z, -Vec3A::Z, cw) {
+        Some((gu, gv)) if gu.is_finite() && gv.is_finite() => {}
+        Some(_) => return Err("overflowing basis must not yield a non-finite footprint".into()),
+        None => return Err("overflowing |tu×tv| must not reject (aniso silently off)".into()),
+    }
+    Ok(())
+}
+
+/// Pure self-test for `surface_point`'s face-decided flip (run by `--check`).
+///
+/// The case that matters is the SMOOTH SILHOUETTE band: a front-facing face
+/// whose interpolated normal has already crossed the view horizon. Flipping
+/// there aims the eps offset INTO the solid, which self-occludes every
+/// secondary ray and renders the band exactly black. The gate asserts the
+/// returned point lands OUTSIDE the face plane, and carries TEETH — the
+/// pre-fix answer (`-n`) must provably fail that same bound, so the probe
+/// cannot go vacuous if the guard is reverted. Genuine backfaces, degenerate
+/// faces and ordinary front hits are pinned alongside so the fix cannot buy
+/// the band by breaking them.
+pub fn surface_point_self_test() -> Result<(), String> {
+    use crate::scene::SceneBuilder;
+    // A face tilted 85° off the view axis — front-facing, but only just, the
+    // way a facet is at a smooth limb. Vertex normals sit 10° further round,
+    // so they are PAST the view horizon while staying in the face's own
+    // hemisphere (cos 10° = 0.985) — exactly a tessellated cylinder's limb.
+    let d = Vec3A::new(0.0, 0.0, -1.0);
+    let (s85, c85) = 85f32.to_radians().sin_cos();
+    let (s95, c95) = 95f32.to_radians().sin_cos();
+    let n_face = Vec3A::new(s85, 0.0, c85);
+    let n_vert = Vec3A::new(s95, 0.0, c95);
+    if !(n_face.dot(d) < 0.0) {
+        return Err("probe setup: the face must be front-facing".into());
+    }
+    if !(n_vert.dot(d) > 0.0 && n_vert.dot(n_face) > 0.0) {
+        return Err("probe setup: vertex normals must be past-horizon yet face-side".into());
+    }
+    // Triangle spanning the plane ⊥ n_face, wound so cross(e1, e2) == n_face.
+    let t1 = Vec3A::Y;
+    let t2 = n_face.cross(t1);
+    let (p0, p1, p2) = (Vec3A::ZERO, t1, t2);
+
+    let build = |normals: [Vec3A; 3], p: [Vec3A; 3]| {
+        let mut b = SceneBuilder::new();
+        let m = b.material(Vec3A::splat(0.5), 0.8, 0.0);
+        b.tri(p, normals, m);
+        b.finish(crate::scene::default_sun())
+    };
+    let hit = Hit { t: 2.0, tri: 0, u: 0.25, v: 0.25 };
+    let at = |p: [Vec3A; 3]| p[0] * 0.5 + p[1] * hit.u + p[2] * hit.v;
+
+    // (a) THE BAND. The flip must NOT fire: the face is front-facing, so the
+    // interpolated normal stays outward and the offset point stays outside.
+    let sc = build([n_vert; 3], [p0, p1, p2]);
+    let ray = Ray::new(at([p0, p1, p2]) - d * hit.t, d);
+    let (p, n) = surface_point(&sc, &ray, &hit);
+    if n.dot(n_face) <= 0.0 {
+        return Err(format!("smooth silhouette: normal flipped into the solid: {n:?}"));
+    }
+    let out = (p - p0).dot(n_face);
+    if !(out > 0.0) {
+        return Err(format!("smooth silhouette: ray origin {out} is inside the face plane"));
+    }
+    // TEETH: the pre-fix answer must fail the very bound just asserted, so a
+    // revert of the guard cannot pass this gate.
+    let pre_fix = (at([p0, p1, p2]) - n_vert * sc.eps - p0).dot(n_face);
+    if pre_fix >= 0.0 {
+        return Err(format!("probe is vacuous: the pre-fix offset {pre_fix} is not inside"));
+    }
+
+    // (b) A GENUINE backface still flips toward the ray (the case the flip
+    // exists for): face normal +Z, viewed from −Z looking along +Z.
+    let sc = build([Vec3A::Z; 3], [Vec3A::ZERO, Vec3A::X, Vec3A::Y]);
+    let back = Ray::new(Vec3A::new(0.25, 0.25, -2.0), Vec3A::Z);
+    let (p, n) = surface_point(&sc, &back, &hit);
+    if n != -Vec3A::Z {
+        return Err(format!("genuine backface must flip toward the ray: {n:?}"));
+    }
+    if !(p.z < 0.0) {
+        return Err(format!("backface offset landed on the far side: {p:?}"));
+    }
+
+    // (c) An ordinary front hit is untouched — the common path, unchanged.
+    let front = Ray::new(Vec3A::new(0.25, 0.25, 2.0), -Vec3A::Z);
+    let (p, n) = surface_point(&sc, &front, &hit);
+    if n != Vec3A::Z || !(p.z > 0.0) {
+        return Err(format!("front hit must pass through untouched: {n:?} {p:?}"));
+    }
+
+    // (d) A DEGENERATE face keeps the old unconditional flip (zero cross ⇒
+    // the `nf·n <= 0` arm) — coarser, never wrong.
+    let sc = build([Vec3A::Z; 3], [Vec3A::ZERO; 3]);
+    let (_, n) = surface_point(&sc, &back, &hit);
+    if n != -Vec3A::Z {
+        return Err(format!("degenerate face must keep the unconditional flip: {n:?}"));
+    }
+
+    // (e) INVERTED WINDING — vertex normals anti-aligned with `cross(e1, e2)`,
+    // a modeling error the loader preserves whenever the OBJ ships a full
+    // normal array. Trusting the face here would skip the flip and put the
+    // offset inside the solid: the band bug moved onto a different
+    // population, and worse than the pre-fix behavior. The `nf·n <= 0` guard
+    // must hand these back to the unconditional flip. Face winding gives +Z
+    // while the normals say −Z, and the ray travels −Z: `n·d > 0` enters the
+    // branch, `nf·d < 0` would call the face front-facing and skip the flip,
+    // and only the hemisphere guard rescues it. The returned `n` must oppose
+    // the ray and the offset must land on the camera's side.
+    let sc = build([-Vec3A::Z; 3], [Vec3A::ZERO, Vec3A::X, Vec3A::Y]);
+    let (p, n) = surface_point(&sc, &front, &hit);
+    if n != Vec3A::Z {
+        return Err(format!("inverted winding: normal must oppose the ray: {n:?}"));
+    }
+    if !(p.z > 0.0) {
+        return Err(format!("inverted winding: offset landed inside the solid: {p:?}"));
     }
     Ok(())
 }
