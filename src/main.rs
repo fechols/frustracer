@@ -4731,6 +4731,171 @@ fn run_check_gpu(
         tg.invalidate_replay();
     }
 
+    // --- Dual-GPU tile split (--dual-gpu), the single-GPU proof ------------
+    // THE LOAD-BEARING GATE of the split design, and it runs before any second
+    // device exists. Each device renders an exact SUBTREE of the whole-screen
+    // quadtree, so two complementary masks must reconstruct the unsplit frame
+    // EXACTLY — same rects above the split, same frustums, same inherited
+    // t_start, same refined cuts.
+    //
+    // Composed on the CPU rather than by rendering A then B into one buffer,
+    // because that shape cannot see a double-write: both passes compute the
+    // same value for a shared pixel, so an overlapping mask would overwrite
+    // with identical bits and a byte compare would pass. Reading the two
+    // passes separately and requiring EXACTLY ONE of them to own each pixel
+    // catches a hole and an overlap independently, and names the pixel.
+    //
+    // Three properties, three distinct failure modes:
+    //   coverage    — a dropped tile is a hole (the false-sky class)
+    //   disjointness — an overlap is wasted work AND breaks the premise the
+    //                  cross-adapter transfer rests on (it copies "the
+    //                  secondary's rows" assuming the outputs are disjoint)
+    //   identity    — the union is the unsplit frame, bit for bit
+    //
+    // `info`'s DEPTH field is deliberately excluded from the compare while its
+    // KIND is not. A sky proof above the split depth is deferred and re-proven
+    // by the children (see level_finish), so a split frame legitimately reaches
+    // the same pixels as sky at a deeper node. The pixels are what must not
+    // move; the tree shape above them is exactly what a split changes.
+    //
+    // Resolution: the harness size only. Odd-dimension midpoint rounding is
+    // gated on the CPU by `split_self_test`, which is where it is observable —
+    // the shader derives child rects itself, so A and B partition the screen
+    // by construction whatever the rounding does, and a GPU union test at
+    // 533x400 would prove nothing this one does not.
+    {
+        const SENT: u32 = 0xffff_ffff;
+        let sp = gpu::trace::FrameParams {
+            sway_prev_time: None,
+            cam: basis,
+            frame: 0,
+            accumulate: true,
+            jitter: false,
+            frame_jitter: None,
+            prev_cam: None,
+            q,
+            verify: false,
+            spp: 1,
+            probe_sample: 0,
+            clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
+            sway_time: check_sway,
+            replay: false,
+        };
+        // Sentinel ON every pass: an unowned pixel must stay unwritten, and
+        // that is precisely what the ownership accounting reads.
+        let render = |hg: &mut gpu::trace::HeadlessGpu,
+                      s: gpu::trace::TileSplit|
+         -> Result<(Vec<f32>, Vec<f32>, Vec<u32>), String> {
+            tg.set_split(s);
+            tg.write_cb(0, &sp);
+            hg.run(|l| tg.record_wavefront(l, 0, &sp, true))?;
+            Ok((
+                read_f32(hg, &tg.accum, px * 3)?,
+                read_f32(hg, &tg.tbuf, px)?,
+                read_u32(hg, &tg.info, px)?,
+            ))
+        };
+
+        // Deeper than the leaf frontier there is no internal tile to own, and
+        // `set_split` refuses it — so the sweep stops where the renderer does.
+        let full = gpu::trace::depth_full(gw as u32, gh as u32);
+        let max_d = gpu::trace::MAX_SPLIT_DEPTH.min(full.saturating_sub(1));
+        match render(&mut hg, gpu::trace::TileSplit::ALL) {
+            Err(e) => {
+                eprintln!("check-gpu: FAIL dual-gpu split reference frame: {e}");
+                ok = false;
+            }
+            Ok((ref_acc, ref_t, ref_info)) if max_d >= 1 => {
+                for depth in 1..=max_d {
+                    let rows = 1u32 << depth;
+                    let (mut holes, mut dupes) = (0usize, 0usize);
+                    let (mut acc_d, mut t_d, mut kind_d) = (0usize, 0usize, 0usize);
+                    let (mut min_a, mut min_b) = (usize::MAX, usize::MAX);
+                    let mut first_bad: Option<u32> = None;
+                    for r in 1..rows {
+                        let a = gpu::trace::TileSplit::rows(depth, 0, r);
+                        let (aa, at, ai) = match render(&mut hg, a) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                eprintln!("check-gpu: FAIL split depth {depth} row {r} (A): {e}");
+                                ok = false;
+                                continue;
+                            }
+                        };
+                        let (ba, bt, bi) = match render(&mut hg, a.complement()) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                eprintln!("check-gpu: FAIL split depth {depth} row {r} (B): {e}");
+                                ok = false;
+                                continue;
+                            }
+                        };
+                        let (mut n_a, mut n_b) = (0usize, 0usize);
+                        let before = holes + dupes + acc_d + t_d + kind_d;
+                        for p in 0..px {
+                            let (ha, hb) = (ai[p] != SENT, bi[p] != SENT);
+                            n_a += ha as usize;
+                            n_b += hb as usize;
+                            match (ha, hb) {
+                                (false, false) => holes += 1,
+                                (true, true) => dupes += 1,
+                                _ => {
+                                    let (acc, tb, inf) =
+                                        if ha { (&aa, &at, ai[p]) } else { (&ba, &bt, bi[p]) };
+                                    t_d += (tb[p].to_bits() != ref_t[p].to_bits()) as usize;
+                                    kind_d += ((inf >> 8) != (ref_info[p] >> 8)) as usize;
+                                    for ch in 0..3 {
+                                        acc_d += (acc[p * 3 + ch].to_bits()
+                                            != ref_acc[p * 3 + ch].to_bits())
+                                            as usize;
+                                    }
+                                }
+                            }
+                        }
+                        min_a = min_a.min(n_a);
+                        min_b = min_b.min(n_b);
+                        if holes + dupes + acc_d + t_d + kind_d != before && first_bad.is_none() {
+                            first_bad = Some(r);
+                        }
+                    }
+                    eprintln!(
+                        "check-gpu: dual-gpu split depth {depth} ({} masks, {px} px): union holes {holes} dupes {dupes} | accum-diff {acc_d} tbuf-diff {t_d} kind-diff {kind_d} | owned px min {min_a}/{min_b}"
+                    , rows - 1);
+                    if holes != 0 || dupes != 0 {
+                        eprintln!(
+                            "check-gpu: FAIL split depth {depth} is not a partition (holes {holes}, overlaps {dupes}; first bad row {:?})",
+                            first_bad
+                        );
+                        ok = false;
+                    }
+                    if acc_d != 0 || t_d != 0 || kind_d != 0 {
+                        eprintln!(
+                            "check-gpu: FAIL split depth {depth} union diverged from the unsplit frame (accum {acc_d} tbuf {t_d} kind {kind_d}; first bad row {:?})",
+                            first_bad
+                        );
+                        ok = false;
+                    }
+                    // Anti-vacuity: a split that gave one side everything would
+                    // satisfy every test above while splitting nothing.
+                    if min_a == 0 || min_b == 0 || min_a == usize::MAX {
+                        eprintln!(
+                            "check-gpu: FAIL split depth {depth} left a device with no pixels (min {min_a}/{min_b}) — the partition proof is vacuous"
+                        );
+                        ok = false;
+                    }
+                }
+            }
+            Ok(_) => eprintln!(
+                "check-gpu: (skip) dual-gpu split — depth_full {full} at {gw}x{gh} leaves no internal tile to own"
+            ),
+        }
+        // Restore the unsplit assignment for everything downstream, and drop
+        // the replay key the split passes established.
+        tg.set_split(gpu::trace::TileSplit::ALL);
+        tg.invalidate_replay();
+    }
+
     // --- Multi-sampling (--spp), GPU half ----------------------------------
     // Same claim, same proof as the CPU --check: the extra samples ride the
     // tile's inherited t_start, so each one gets the exact-zero visibility
@@ -11745,6 +11910,25 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
     };
 
+    // Dual-GPU tile split (--dual-gpu): the ownership mask's bit math against
+    // the renderer's own midpoint-split rect geometry, at a power-of-two and
+    // an odd resolution, plus the partition/complement contracts at every
+    // split position. Pure and lever-independent — the blas-split rule.
+    let split_ok = match gpu::trace::split_self_test() {
+        Ok(()) => {
+            // Announce on success like every neighbouring self-test: a gate
+            // that prints only on failure reads exactly like a gate that was
+            // never wired, which is the failure mode the loud-lever rule
+            // exists to prevent.
+            eprintln!("dual-gpu split self-test: OK");
+            true
+        }
+        Err(e) => {
+            eprintln!("dual-gpu split self-test: FAIL — {e}");
+            false
+        }
+    };
+
     // Shading-class taxonomy (--dxr-sbt): membership/strip soundness on a
     // synthetic all-classes set, all-8 anti-vacuity, determinism, and
     // defines-derive-from-the-table. Pure and lever-independent — the
@@ -14261,6 +14445,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         ("sphcell", sph_ok),
         ("ftree", ftree_ok),
         ("blas-split", blas_ok),
+        ("dual-gpu-split", split_ok),
         ("shadeclass", shadeclass_ok),
         ("foliage", foliage_ok),
         ("sway-mv", sway_mv_ok),

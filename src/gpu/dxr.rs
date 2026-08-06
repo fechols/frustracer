@@ -537,11 +537,13 @@ impl DxrGpu {
         // modes 0/1 + relief AND mode 3 without relief clean — so this is the
         // driver's (non-opaque-anyhit RTPSO x thin-raygen pass pairs) combo,
         // not the shader. Degrade to mode 1 (the proven-with-relief default),
-        // never 0; keyed on the PICKED adapter (a fact), the vendor_defaults
-        // rule. Re-test on a newer driver and delete this arm if it passes.
+        // never 0; keyed on THIS DEVICE's adapter (a fact), the vendor_defaults
+        // rule — and the per-device form is the only correct one under
+        // --dual-gpu, where an NVIDIA partner device must not inherit an Intel
+        // refusal. Re-test on a newer driver and delete this arm if it passes.
         let inline_mode = if inline_mode == 3
             && !trace::height_defs(scene).is_empty()
-            && super::adapter::picked_vendor() == super::adapter::Vendor::Intel
+            && super::adapter::vendor_of_device(device) == super::adapter::Vendor::Intel
         {
             eprintln!(
                 "dxr: --dxr-inline 3 + --heightfield hangs this Intel driver \

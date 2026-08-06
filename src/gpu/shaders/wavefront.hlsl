@@ -415,7 +415,36 @@ void level_finish(TileRec rec, uint2 p0, uint2 p1, uint depth, uint cut_len, TF 
                   float best, uint lane) {
     uint s;
 #endif
-    if (best == FLT_MAX) {
+    // DUAL-GPU SPLIT: a sky proof ABOVE the split depth spans tiles that BOTH
+    // devices own, and the emit below is the one terminal path that does not
+    // pass through the child-ownership test — so both devices would fill those
+    // pixels. That is not merely wasted work: the transfer copies "the
+    // secondary's owned rows" on the premise that the two devices' outputs are
+    // DISJOINT, so a shared region silently breaks the join.
+    //
+    // Not hypothetical — the committed 800x600 gate scene emits its 4 sky
+    // rects at depth 2, above the default split depth of 3.
+    //
+    // Defer instead of emitting: fall through to the subdivide path, and the
+    // children re-prove sky on their own strictly-smaller frustums until the
+    // split depth, where the ownership test applies. Sound because a subset of
+    // an empty frustum is empty, so every child query also returns FLT_MAX —
+    // this cannot loop (depth strictly increases) and costs at most the 21
+    // queries above depth 3, each on a frustum that fails the BVH root box
+    // test immediately. The extra, smaller sky rects are if anything welcome:
+    // cs_sky grid-strides one record per group, which is exactly why SKY_SPLIT
+    // exists.
+    //
+    // It is what makes "each device walks an exact SUBTREE" literally true:
+    // every terminal rect then lies inside exactly one split-depth tile.
+    //
+    // STRUCTURE-ONLY, and the split gate is written around it: the PIXELS are
+    // unchanged (a sky fill is a pure function of pixel coords), but `info`'s
+    // depth field legitimately differs from an unsplit frame's, so that gate
+    // compares accum/tbuf bitwise and info's KIND, never info's depth.
+    bool sky = best == FLT_MAX;
+    bool sky_defer = sky && SPLIT_DEPTH != 0u && depth < SPLIT_DEPTH;
+    if (sky && !sky_defer) {
         // Sky: the whole frustum (beyond the inherited ball, which the
         // ancestor claim covers) is empty.
         // Stat: the rect's pixel area — the empty-space proof's product
@@ -423,20 +452,33 @@ void level_finish(TileRec rec, uint2 p0, uint2 p1, uint depth, uint cut_len, TF 
         ctr_add(CTR_SKY_PX, (p1.x - p0.x) * (p1.y - p0.y));
         s = ctr_add(CTR_SKY, 1u);
         if (s < cap_sky) {
-            SkyRec sky;
-            sky.xy0 = rec.xy0;
-            sky.xy1 = rec.xy1;
-            sky.depth = depth;
-            sky._pad = 0;
-            qsky[s] = sky;
+            SkyRec sky_rec;
+            sky_rec.xy0 = rec.xy0;
+            sky_rec.xy1 = rec.xy1;
+            sky_rec.depth = depth;
+            sky_rec._pad = 0;
+            qsky[s] = sky_rec;
         } else {
             InterlockedAdd(counters[CTR_OVERFLOW], 1, s);
         }
         return;
     }
 
-    // frustum.rs::advance_tc — the shared advance/slack rule.
-    bool advanced = best > rec.t_start + max(rec.t_start * 1e-4, SCENE_EPS);
+    // frustum.rs::advance_tc — the shared advance/slack rule. A deferred sky
+    // records NO progress and hands children the parent's own t_start.
+    //
+    // This guard is CONSERVATIVE, not corrective, and a teeth probe says so:
+    // removing it leaves every gate green. `best` is FLT_MAX on a deferred
+    // sky, so tc would advance to ~FLT_MAX — but sky_defer fires only when the
+    // frustum is EMPTY, and a child frustum is a subset of its parent's, so
+    // the whole deferred subtree is empty too and never traces a ray. tc is
+    // unobservable there whatever it holds.
+    //
+    // Kept because it is the honest description of the state ("no progress
+    // recorded" — the blocked path's exact semantics) and because it stays
+    // correct if a deferral is ever added for a reason OTHER than emptiness,
+    // where a ~FLT_MAX TMin would be actively wrong.
+    bool advanced = !sky_defer && best > rec.t_start + max(rec.t_start * 1e-4, SCENE_EPS);
     float tc = advanced ? max(best * (1.0 - 1e-4), rec.t_start) : rec.t_start;
     // Blocked at the inherited distance — still subdivide (children's smaller
     // frustums may exclude the blocker; that is how sky emerges). Hoisted out
@@ -539,6 +581,34 @@ void level_finish(TileRec rec, uint2 p0, uint2 p1, uint depth, uint cut_len, TF 
     uint cy0[4] = { p0.y, p0.y, ym, ym };
     uint cx1[4] = { xm, p1.x, xm, p1.x };
     uint cy1[4] = { ym, ym, p1.y, p1.y };
+
+    // DUAL-GPU SPLIT (--dual-gpu): at the split depth, COLLAPSE the rect of
+    // every child this device does not own.
+    //
+    // Expressed as a zero-extent rect rather than as a second predicate on
+    // purpose. Every consumer below — the homogeneous-batch count, the batched
+    // emit, the mixed-split fallback loop, and the SW_RAYS+FTREE leaf-cut
+    // translation — ALREADY skips `bw == 0 || bh == 0`, so this one block
+    // covers the whole function by construction. A parallel `owned[]` test
+    // would have to be threaded into four sites whose queue accounting must
+    // agree exactly, and a miss there is a reserved-but-unwritten queue slot.
+    //
+    // What makes the split sound is that each device then walks an exact
+    // SUBTREE of the single-GPU quadtree: levels above the split run
+    // identically on both devices (same frustum, same tc, same refined cut),
+    // and below it each descends only its own children. Nothing about a
+    // child's own traversal depends on whether its siblings were enqueued.
+    //
+    // Unsplit sessions never enter this block (SPLIT_DEPTH == 0), so a
+    // single-GPU frame is bit-identical to the pre-feature renderer.
+    if (SPLIT_DEPTH != 0u && d == SPLIT_DEPTH) {
+        [unroll] for (uint oc = 0u; oc < 4u; ++oc) {
+            if (!split_owns(cpath | oc)) {
+                cx1[oc] = cx0[oc];
+                cy1[oc] = cy0[oc];
+            }
+        }
+    }
 
     // The cut a leaf child consumes: the SAME (out_slot, out_len) its sibling
     // TileRecs inherit — the CPU's "leaf tiles use the inherited cut without

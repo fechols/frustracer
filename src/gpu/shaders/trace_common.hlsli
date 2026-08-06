@@ -183,6 +183,16 @@ cbuffer Frame : register(b0) {
     uint4 el_meta;
     float4 el_a[MAX_EMISSIVE_LIGHTS];
     float4 el_b[MAX_EMISSIVE_LIGHTS];
+    // Dual-GPU tile ownership (--dual-gpu): xy = the bitmask of level-`z`
+    // quadtree tiles THIS device renders (x = tiles 0..31, y = 32..63),
+    // z = the split depth, w unused. Appended LAST so no offset above moves.
+    //
+    // z == 0 is the unsplit session and `level_finish` branches around the
+    // test entirely, so a single-GPU frame is bit-identical by construction
+    // (the apply_tod / night precedent). 64 bits caps the split depth at 3
+    // (4^3 = 64 tiles, an 8x8 grid) — deeper would need more rows, and 1/64
+    // is already finer than the balancer can usefully act on.
+    uint4 split;
 }
 
 #define SCENE_EPS  (sun_e.w)
@@ -193,6 +203,23 @@ cbuffer Frame : register(b0) {
 // (trace.rs::with_frame) — scene diag + the animation clock in seconds.
 #define SCENE_DIAG (cam_right.w)
 #define CLOUD_TIME (cam_up.w)
+
+// --- dual-GPU tile ownership ---------------------------------------------
+// Is level-`split.z` tile `path` ours? `path` is the child's FULL quadtree
+// path (2 bits per level, TL=0 TR=1 BL=2 BR=3), so at the split depth it
+// indexes 0..4^z-1 directly and needs no re-derivation.
+//
+// Out-of-range paths answer TRUE. That is deliberate and conservative in the
+// right direction: the only way to exceed 64 is a split depth above 3, which
+// the CPU refuses to set, and answering "owned" renders a tile twice rather
+// than dropping it — a wasted tile is a perf bug, a dropped one is a hole in
+// the image (the false-sky class).
+#define SPLIT_DEPTH  (split.z)
+bool split_owns(uint path) {
+    if (path >= 64u) return true;
+    uint word = (path < 32u) ? split.x : split.y;
+    return ((word >> (path & 31u)) & 1u) != 0u;
+}
 
 // Hardware triangles surface a relief candidate at its BASE-PLANE t, while
 // candidate_reject/height_march decides at the displaced t. A finite

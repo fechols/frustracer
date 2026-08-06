@@ -17,7 +17,7 @@
 //! complete before we map them. We therefore report frame N's timings at the
 //! start of frame N + FRAMES_IN_FLIGHT, never stalling the pipeline to do it.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use windows::Win32::Graphics::Direct3D12::*;
 
@@ -31,7 +31,30 @@ const MAX_TS: u32 = 128;
 const REPORT_EVERY: u64 = 120;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
-static TIMER: Mutex<Option<Timer>> = Mutex::new(None);
+
+/// One timer PER DEVICE, keyed by adapter LUID, in first-seen order.
+///
+/// A query heap belongs to the device that created it and a timestamp frequency
+/// is a property of one queue, so resolving device B's timestamps into device
+/// A's heap is invalid — which is exactly what a single global did the moment
+/// `--dual-gpu` put two devices in one process. Per-device is also what the
+/// split's load balancer needs: "how long did EACH card take" is the input, and
+/// a merged table cannot answer it.
+///
+/// A `Vec` rather than a map: there are at most a handful of adapters on a box,
+/// entries are only ever pushed (so an index stays valid for the process's
+/// life — which is what lets `CURRENT` be an index), and first-seen order is
+/// the order the tables should print in.
+static TIMERS: Mutex<Vec<Timer>> = Mutex::new(Vec::new());
+
+/// Index into `TIMERS`, PLUS ONE — 0 means "no device has begun a frame yet".
+///
+/// The recording-side calls (`scope`, `resolve`, the `TimeScope` drop) sit deep
+/// inside command-list recording and have no device in hand, so `begin_frame`
+/// publishes which device is being recorded and they follow it. Sound because
+/// recording is sequential on the main thread: a device's frame is begun,
+/// recorded and resolved before the next device's begins. It never nests.
+static CURRENT: AtomicUsize = AtomicUsize::new(0);
 
 /// One open/closed region within a frame: the two timestamp indices —
 /// SLOT-RELATIVE, since `collect` maps one slot's window of the heap — and the
@@ -62,6 +85,12 @@ struct Acc {
 }
 
 struct Timer {
+    /// The adapter LUID this timer's heap belongs to — the map key.
+    luid: u64,
+    /// Short human label for the table header (the adapter's vendor). Only
+    /// printed when more than one device is timed, so single-GPU sessions'
+    /// output is byte-identical to before.
+    label: String,
     heap: ID3D12QueryHeap,
     readback: ReadbackBuffer,
     /// Ticks per second on this queue.
@@ -113,6 +142,26 @@ fn on() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
+/// Run `f` against the device whose frame is currently being recorded.
+///
+/// `None` — and therefore a no-op at every call site — before any `begin_frame`,
+/// which is exactly the inert behavior the single `Option<Timer>` used to give
+/// when no device had created a timer yet.
+fn with_current<R>(f: impl FnOnce(&mut Timer) -> R) -> Option<R> {
+    let idx = CURRENT.load(Ordering::Relaxed);
+    if idx == 0 {
+        return None;
+    }
+    let mut guard = TIMERS.lock().unwrap();
+    guard.get_mut(idx - 1).map(f)
+}
+
+/// Pack an adapter LUID into a comparable key.
+fn luid_key(device: &ID3D12Device) -> u64 {
+    let l = unsafe { device.GetAdapterLuid() };
+    ((l.HighPart as u32 as u64) << 32) | l.LowPart as u64
+}
+
 impl Timer {
     fn new(device: &ID3D12Device, queue: &ID3D12CommandQueue) -> Result<Self, String> {
         let desc = D3D12_QUERY_HEAP_DESC {
@@ -128,6 +177,8 @@ impl Timer {
         let freq = unsafe { queue.GetTimestampFrequency() }
             .map_err(|e| format!("GetTimestampFrequency: {e}"))?;
         Ok(Self {
+            luid: luid_key(device),
+            label: format!("{:?}", super::adapter::vendor_of_device(device)),
             heap: heap.unwrap(),
             readback,
             freq,
@@ -222,13 +273,18 @@ impl Timer {
     /// also means a region which stops firing — `wavefront` once structure
     /// replay takes over — correctly windows to 0.000 while its cumulative
     /// column keeps the history.
-    fn report(&mut self) {
+    /// `multi` adds the adapter label to the header. It is false in a
+    /// single-device session, so that output stays byte-identical to the
+    /// pre-dual-GPU one and no recorded table is invalidated by this change.
+    fn report(&mut self, multi: bool) {
         if self.frames == 0 {
             return;
         }
         let win_frames = self.frames.saturating_sub(self.last_frames);
+        let who = if multi { format!(" [{}]", self.label) } else { String::new() };
         eprintln!(
-            "\ngputime: per-region GPU ms | win = last {} frames, mean = all {} frames",
+            "\ngputime{}: per-region GPU ms | win = last {} frames, mean = all {} frames",
+            who,
             win_frames.max(1),
             self.frames
         );
@@ -279,15 +335,16 @@ pub fn take_regions() -> Vec<(String, u32, f64)> {
     if !on() {
         return Vec::new();
     }
-    let mut guard = TIMER.lock().unwrap();
-    let Some(t) = guard.as_mut() else { return Vec::new() };
-    let frames = t.frames.max(1) as f64;
-    let mut rows: Vec<(String, Acc)> = std::mem::take(&mut t.stats);
-    rows.sort_by_key(|(_, a)| a.order);
-    t.frames = 0;
-    t.last_frames = 0;
-    t.pending = Default::default();
-    rows.into_iter().map(|(n, a)| (n, a.depth, a.sum_ms / frames)).collect()
+    with_current(|t| {
+        let frames = t.frames.max(1) as f64;
+        let mut rows: Vec<(String, Acc)> = std::mem::take(&mut t.stats);
+        rows.sort_by_key(|(_, a)| a.order);
+        t.frames = 0;
+        t.last_frames = 0;
+        t.pending = Default::default();
+        rows.into_iter().map(|(n, a)| (n, a.depth, a.sum_ms / frames)).collect()
+    })
+    .unwrap_or_default()
 }
 
 /// Collect the previous timings for this slot and start recording it afresh.
@@ -297,24 +354,35 @@ pub fn begin_frame(device: &ID3D12Device, queue: &ID3D12CommandQueue, slot: usiz
     if !on() {
         return;
     }
-    let mut guard = TIMER.lock().unwrap();
-    if guard.is_none() {
-        match Timer::new(device, queue) {
-            Ok(t) => *guard = Some(t),
+    let mut guard = TIMERS.lock().unwrap();
+    let luid = luid_key(device);
+    let idx = match guard.iter().position(|t| t.luid == luid) {
+        Some(i) => i,
+        None => match Timer::new(device, queue) {
+            Ok(t) => {
+                guard.push(t);
+                guard.len() - 1
+            }
             Err(e) => {
                 eprintln!("gputime: {e}; timing off");
                 ENABLED.store(false, Ordering::Relaxed);
+                CURRENT.store(0, Ordering::Relaxed);
                 return;
             }
-        }
-    }
-    let t = guard.as_mut().unwrap();
+        },
+    };
+    // Publish before recording: every `scope` between here and `resolve`
+    // follows this, and they run on the same thread.
+    CURRENT.store(idx + 1, Ordering::Relaxed);
+    // Snapshot before the mutable borrow of the entry below.
+    let multi = guard.len() > 1;
+    let t = &mut guard[idx];
     t.collect(slot);
     // Scheduled off the last report's frame count, not off a modulus: `report`
     // closes the window, so this can never fire twice on one count and every
     // window is exactly REPORT_EVERY collected frames wide.
     if t.frames >= t.last_frames + REPORT_EVERY {
-        t.report();
+        t.report(multi);
     }
     t.regions = Vec::new();
     t.used = 0;
@@ -328,24 +396,24 @@ pub fn resolve(list: &ID3D12GraphicsCommandList, slot: usize) {
     if !on() {
         return;
     }
-    let mut guard = TIMER.lock().unwrap();
-    let Some(t) = guard.as_mut() else { return };
-    if t.used == 0 {
-        return;
-    }
-    let base = slot as u32 * MAX_TS;
-    unsafe {
-        list.ResolveQueryData(
-            &t.heap,
-            D3D12_QUERY_TYPE_TIMESTAMP,
-            base,
-            t.used,
-            &t.readback.resource,
-            base as u64 * 8,
-        )
-    };
-    let regions = std::mem::take(&mut t.regions);
-    t.pending[slot] = Some(regions);
+    with_current(|t| {
+        if t.used == 0 {
+            return;
+        }
+        let base = slot as u32 * MAX_TS;
+        unsafe {
+            list.ResolveQueryData(
+                &t.heap,
+                D3D12_QUERY_TYPE_TIMESTAMP,
+                base,
+                t.used,
+                &t.readback.resource,
+                base as u64 * 8,
+            )
+        };
+        let regions = std::mem::take(&mut t.regions);
+        t.pending[slot] = Some(regions);
+    });
 }
 
 /// Print the final table (session exit). The window it closes is the tail
@@ -355,8 +423,13 @@ pub fn report() {
     if !on() {
         return;
     }
-    if let Some(t) = TIMER.lock().unwrap().as_mut() {
-        t.report();
+    // Every device, not just the one that happened to record last: at session
+    // exit both cards' tables are wanted, and under --dual-gpu comparing them
+    // is the whole point.
+    let mut guard = TIMERS.lock().unwrap();
+    let multi = guard.len() > 1;
+    for t in guard.iter_mut() {
+        t.report(multi);
     }
 }
 
@@ -366,12 +439,14 @@ pub struct TimeScope(Option<(ID3D12GraphicsCommandList, usize, u32)>);
 impl Drop for TimeScope {
     fn drop(&mut self) {
         let Some((list, _idx, end_q)) = self.0.take() else { return };
-        let mut guard = TIMER.lock().unwrap();
-        let Some(t) = guard.as_mut() else { return };
-        // The region's (relative) end index was set when it opened; the
-        // absolute one rode the guard here purely for EndQuery.
-        unsafe { list.EndQuery(&t.heap, D3D12_QUERY_TYPE_TIMESTAMP, end_q) };
-        t.depth = t.depth.saturating_sub(1);
+        // Closes against the SAME device that opened it: a scope cannot outlive
+        // its frame, and frames do not nest across devices (see `CURRENT`).
+        with_current(|t| {
+            // The region's (relative) end index was set when it opened; the
+            // absolute one rode the guard here purely for EndQuery.
+            unsafe { list.EndQuery(&t.heap, D3D12_QUERY_TYPE_TIMESTAMP, end_q) };
+            t.depth = t.depth.saturating_sub(1);
+        });
     }
 }
 
@@ -381,21 +456,22 @@ pub fn scope(list: &ID3D12GraphicsCommandList, name: impl FnOnce() -> String) ->
     if !on() {
         return TimeScope(None);
     }
-    let mut guard = TIMER.lock().unwrap();
-    let Some(t) = guard.as_mut() else { return TimeScope(None) };
-    let slot_base = t.cur_slot as u32 * MAX_TS;
-    if t.used + 2 > MAX_TS {
-        t.dropped += 1;
-        return TimeScope(None);
-    }
-    let rel = t.used; // slot-relative; collect() maps one slot's window
-    let begin_q = slot_base + rel;
-    let end_q = begin_q + 1;
-    t.used += 2;
-    let depth = t.depth;
-    t.depth += 1;
-    unsafe { list.EndQuery(&t.heap, D3D12_QUERY_TYPE_TIMESTAMP, begin_q) };
-    let idx = t.regions.len();
-    t.regions.push(Region { name: name(), depth, begin: rel, end: rel + 1 });
-    TimeScope(Some((list.clone(), idx, end_q)))
+    with_current(|t| {
+        let slot_base = t.cur_slot as u32 * MAX_TS;
+        if t.used + 2 > MAX_TS {
+            t.dropped += 1;
+            return TimeScope(None);
+        }
+        let rel = t.used; // slot-relative; collect() maps one slot's window
+        let begin_q = slot_base + rel;
+        let end_q = begin_q + 1;
+        t.used += 2;
+        let depth = t.depth;
+        t.depth += 1;
+        unsafe { list.EndQuery(&t.heap, D3D12_QUERY_TYPE_TIMESTAMP, begin_q) };
+        let idx = t.regions.len();
+        t.regions.push(Region { name: name(), depth, begin: rel, end: rel + 1 });
+        TimeScope(Some((list.clone(), idx, end_q)))
+    })
+    .unwrap_or(TimeScope(None))
 }

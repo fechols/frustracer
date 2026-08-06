@@ -39,20 +39,27 @@ impl Vendor {
     }
 }
 
-/// The last `pick()`'s vendor, as a process-global so consumers that never see
-/// an `AdapterPick` can read it — specifically the KERNEL-ASSEMBLY constants in
-/// trace.rs, which are chosen long after the device exists and are threaded
-/// through nothing.
+/// The last `pick()`'s vendor, as a process-global for consumers that never see
+/// an `AdapterPick` and for which "the session's adapter" is genuinely the right
+/// question — SESSION POLICY: `main::vendor_defaults` (which render mode a
+/// flagless session starts in) and the `--spin` warm-up count. Those describe
+/// the session, not a device, so a global is correct for them.
+///
+/// **It is NOT the input to per-device decisions.** Kernel-assembly constants
+/// and driver-defect refusals must use `vendor_of_device` instead: with two
+/// devices live (`--dual-gpu`) this global is last-writer-wins and would compile
+/// one device's kernels against the other's vendor. The AMD candidate-TMin
+/// workaround (`trace::cand_defs`) is the sharp case — arming it on the wrong
+/// device silently restores a `tmin-overshoot` bug on every leaf primary.
 ///
 /// Recording it inside `pick()` is what makes it unforgettable: every path that
 /// obtains a device (GpuContext, HeadlessGpu, every `--check*` suite) goes
 /// through that one function, so a new device path cannot silently inherit a
-/// stale vendor. One device per process in practice; last-writer-wins is the
-/// correct rule regardless, since the newest pick IS the device in use.
+/// stale vendor.
 static PICKED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
 
-/// The picked adapter's vendor, or `Other` before any pick (the conservative
-/// answer — cross-vendor defaults).
+/// The session adapter's vendor, or `Other` before any pick (the conservative
+/// answer — cross-vendor defaults). Session policy only; see the caveat above.
 pub fn picked_vendor() -> Vendor {
     match PICKED.load(std::sync::atomic::Ordering::Relaxed) {
         0 => Vendor::Nvidia,
@@ -82,15 +89,61 @@ pub enum Prefer {
     Intel,
 }
 
+#[derive(Clone)]
 pub struct AdapterPick {
     pub adapter: IDXGIAdapter4,
     pub name: String,
     pub vendor: Vendor,
+    /// Dedicated video memory, the tie-break within a vendor.
+    pub vram: u64,
+    /// Packed adapter LUID — the stable identity of this physical adapter,
+    /// matching `gputime`'s key and `ID3D12Device::GetAdapterLuid`. What a
+    /// secondary search excludes the primary by; comparing `IDXGIAdapter4`
+    /// pointers would not, since DXGI may hand back distinct interface
+    /// pointers for one adapter.
+    // Consumed by the `--dual-gpu` secondary search (stage 2); recorded here
+    // because it is the identity the whole feature keys on and enumeration is
+    // the only place it is cheaply available.
+    #[allow(dead_code)]
+    pub luid: u64,
 }
 
 fn desc_name(desc: &DXGI_ADAPTER_DESC3) -> String {
     let len = desc.Description.iter().position(|&c| c == 0).unwrap_or(128);
     String::from_utf16_lossy(&desc.Description[..len])
+}
+
+/// Every HARDWARE adapter on the box, in DXGI high-performance order.
+///
+/// Deliberately does NOT record `PICKED`: **enumeration is not selection.** The
+/// dual-GPU secondary search needs to look at every adapter, and if looking
+/// moved the session vendor, it would silently retune (or mis-refuse) kernels
+/// already built for the primary — the failure `vendor_of_device` exists to
+/// prevent, reintroduced one level up. `pick` is the only writer of `PICKED`,
+/// and it is the only function that chooses.
+pub fn enumerate(factory: &IDXGIFactory6) -> Vec<AdapterPick> {
+    let mut out = Vec::new();
+    for i in 0.. {
+        let adapter: IDXGIAdapter4 = match unsafe {
+            factory.EnumAdapterByGpuPreference(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)
+        } {
+            Ok(a) => a,
+            Err(_) => break,
+        };
+        let Ok(desc) = (unsafe { adapter.GetDesc3() }) else { continue };
+        if (desc.Flags & DXGI_ADAPTER_FLAG3_SOFTWARE) != DXGI_ADAPTER_FLAG3_NONE {
+            continue;
+        }
+        out.push(AdapterPick {
+            adapter,
+            name: desc_name(&desc),
+            vendor: Vendor::of(desc.VendorId),
+            vram: desc.DedicatedVideoMemory as u64,
+            luid: ((desc.AdapterLuid.HighPart as u32 as u64) << 32)
+                | desc.AdapterLuid.LowPart as u64,
+        });
+    }
+    out
 }
 
 /// Pick the preferred vendor's adapter with the most VRAM; fall back to the
@@ -101,39 +154,23 @@ pub fn pick(factory: &IDXGIFactory6, prefer: Prefer) -> std::result::Result<Adap
         Prefer::Amd => VENDOR_AMD,
         Prefer::Intel => VENDOR_INTEL,
     };
-    let mut best: Option<(IDXGIAdapter4, DXGI_ADAPTER_DESC3)> = None;
-    let mut fallback: Option<(IDXGIAdapter4, DXGI_ADAPTER_DESC3)> = None;
-    for i in 0.. {
-        let adapter: IDXGIAdapter4 = match unsafe {
-            factory.EnumAdapterByGpuPreference(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)
-        } {
-            Ok(a) => a,
-            Err(_) => break,
-        };
-        let desc = unsafe { adapter.GetDesc3() }.map_err(|e| e.to_string())?;
-        if (desc.Flags & DXGI_ADAPTER_FLAG3_SOFTWARE) != DXGI_ADAPTER_FLAG3_NONE {
-            continue;
-        }
-        if fallback.is_none() {
-            fallback = Some((adapter.clone(), desc));
-        }
-        if desc.VendorId == want
-            && best
-                .as_ref()
-                .is_none_or(|(_, b)| desc.DedicatedVideoMemory > b.DedicatedVideoMemory)
-        {
-            best = Some((adapter, desc));
-        }
-    }
-    let picked = match (best, fallback) {
-        (Some(p), _) => p,
-        (None, Some(p)) => p,
-        (None, None) => return Err("no hardware DXGI adapter found".into()),
+    let all = enumerate(factory);
+    let want = Vendor::of(want);
+    // `reduce` with a strict `>`, NOT `max_by_key`: on equal VRAM the original
+    // loop kept the FIRST adapter (it only replaced on strictly greater) while
+    // `max_by_key` keeps the last. That differs exactly when two adapters have
+    // identical VRAM — two identical cards, which is the configuration this
+    // whole feature targets — so the tie-break is preserved deliberately.
+    let best = all
+        .iter()
+        .filter(|a| a.vendor == want)
+        .reduce(|a, b| if b.vram > a.vram { b } else { a });
+    let picked = match best.or_else(|| all.first()) {
+        Some(p) => p.clone(),
+        None => return Err("no hardware DXGI adapter found".into()),
     };
-    let name = desc_name(&picked.1);
-    let vendor = Vendor::of(picked.1.VendorId);
-    record_picked(vendor);
-    Ok(AdapterPick { adapter: picked.0, name, vendor })
+    record_picked(picked.vendor);
+    Ok(picked)
 }
 
 pub fn create_factory(debug: bool) -> Result<IDXGIFactory6> {
@@ -142,6 +179,40 @@ pub fn create_factory(debug: bool) -> Result<IDXGIFactory6> {
 }
 
 
+/// The adapter a device was created on, found by its LUID. The one route from
+/// an `ID3D12Device` back to DXGI, shared by `vram_info` and `vendor_of_device`.
+fn adapter_of_device<T: Interface>(
+    device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+) -> Option<T> {
+    let factory: IDXGIFactory4 = create_factory(false).ok()?.cast().ok()?;
+    let luid = unsafe { device.GetAdapterLuid() };
+    unsafe { factory.EnumAdapterByLuid(luid) }.ok()
+}
+
+/// The vendor of the adapter THIS device was created on.
+///
+/// The per-device answer, and the one every kernel-assembly constant and
+/// driver-defect refusal must use — `picked_vendor()` is a process-global that
+/// says nothing about which device you are holding, and under `--dual-gpu` two
+/// devices of different vendors are live at once. Deriving it from the device
+/// makes passing the wrong vendor unrepresentable: there is no argument to get
+/// backwards, the device IS the authority (the `vram_info` discipline).
+///
+/// Best-effort like `vram_info`: `Other` on any failure, which is the
+/// conservative answer — every vendor-keyed arm is an opt-IN workaround or
+/// tuning, so an unknown vendor takes the cross-vendor path.
+pub fn vendor_of_device(
+    device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+) -> Vendor {
+    let Some(adapter) = adapter_of_device::<IDXGIAdapter4>(device) else {
+        return Vendor::Other;
+    };
+    match unsafe { adapter.GetDesc3() } {
+        Ok(d) => Vendor::of(d.VendorId),
+        Err(_) => Vendor::Other,
+    }
+}
+
 /// (current usage, budget) of the device's adapter's LOCAL memory segment —
 /// the scene-upload diagnostic: WDDM demotes over-budget commits silently
 /// (10-100× slowdown, no error), so init prints where it landed. Best-effort:
@@ -149,9 +220,7 @@ pub fn create_factory(debug: bool) -> Result<IDXGIFactory6> {
 pub fn vram_info(
     device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
 ) -> Option<(u64, u64)> {
-    let factory: IDXGIFactory4 = create_factory(false).ok()?.cast().ok()?;
-    let luid = unsafe { device.GetAdapterLuid() };
-    let adapter: IDXGIAdapter3 = unsafe { factory.EnumAdapterByLuid(luid) }.ok()?;
+    let adapter: IDXGIAdapter3 = adapter_of_device(device)?;
     let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
     unsafe { adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut info) }
         .ok()?;

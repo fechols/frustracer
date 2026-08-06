@@ -3139,8 +3139,14 @@ pub(crate) fn trans_defs(scene: &Scene) -> &'static str {
 /// against the wavefront's 8.70e-1 on the same scene and adapter. Arming DXR
 /// would make every secondary enumerate candidates from 0 instead of eps, a
 /// real cost on AMD's DEFAULT render mode, to fix nothing measurable.
-pub(crate) fn cand_defs() -> &'static str {
-    if adapter::picked_vendor() == adapter::Vendor::Amd && !abl_has("nocandtmin") {
+///
+/// Takes the vendor of the device the kernels are being built FOR, never the
+/// process-global `picked_vendor()`: under `--dual-gpu` two devices are live and
+/// only one of them may be the AMD one. Arming this on the wrong device is not a
+/// missed optimization — it is the `tmin-overshoot` defect restored on every
+/// leaf primary of the device that does not need it.
+pub(crate) fn cand_defs(vendor: adapter::Vendor) -> &'static str {
+    if vendor == adapter::Vendor::Amd && !abl_has("nocandtmin") {
         "#define CAND_TMIN0 1"
     } else {
         ""
@@ -4530,6 +4536,251 @@ pub(crate) struct FrameCb {
     /// Cluster row b: xyz = C/π (radiance·area over π), w = r_infl²
     /// (the window's exact zero). Appended LAST so no offset above moves.
     el_b: [[f32; 4]; crate::emissive::MAX_EMISSIVE_LIGHTS],
+    /// Dual-GPU tile ownership (`--dual-gpu`): xy = the bitmask of
+    /// level-`z` quadtree tiles THIS device renders (x = tiles 0..31,
+    /// y = 32..63), z = the split depth, w unused. Appended LAST so no
+    /// offset above moves.
+    ///
+    /// `z == 0` is the unsplit session — `level_finish` branches around the
+    /// test entirely, so every single-GPU frame is bit-identical to the
+    /// pre-feature renderer by construction (the `apply_tod`/`night`
+    /// precedent). 64 bits caps the split depth at `MAX_SPLIT_DEPTH` = 3.
+    split: [u32; 4],
+}
+
+/// Deepest quadtree level a `--dual-gpu` split may be assigned at: 4^3 = 64
+/// tiles, exactly the 64 bits of the CB's `split.xy` mask. Also the point of
+/// diminishing returns — 1/64 of the screen is finer than the balancer can
+/// usefully act on, since every reassignment invalidates that device's
+/// structure replay.
+pub(crate) const MAX_SPLIT_DEPTH: u32 = 3;
+
+/// Which level-`depth` quadtree tiles THIS device renders (`--dual-gpu`).
+///
+/// A per-DEVICE property that changes only when the balancer reassigns tiles,
+/// which is why it lives on `TraceGpu` rather than in `FrameParams` beside the
+/// per-frame jitter: the tracer already owns the other things fixed for a
+/// device (its resolution, its queues), and the split belongs with them.
+///
+/// `depth == 0` is the whole screen — `ALL`, the unsplit default, in which
+/// `level_finish` branches around the ownership test entirely and the frame is
+/// bit-identical to the pre-feature renderer.
+///
+/// Equality is part of the structure-replay key: a device whose assignment
+/// changed must NOT replay the terminal queues it recorded for the old one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TileSplit {
+    /// Bit `i` = the level-`depth` tile whose quadtree path is `i`. Unused
+    /// above `4^depth`.
+    pub mask: u64,
+    /// The level `mask` indexes; 0 = unsplit.
+    pub depth: u32,
+}
+
+impl Default for TileSplit {
+    fn default() -> Self {
+        Self::ALL
+    }
+}
+
+impl TileSplit {
+    /// The whole screen — one device, no split, every ownership test skipped.
+    pub const ALL: TileSplit = TileSplit { mask: u64::MAX, depth: 0 };
+
+    /// Tiles at `depth`, as a count.
+    pub fn tiles_at(depth: u32) -> u32 {
+        1u32 << (2 * depth)
+    }
+
+    /// A CONTIGUOUS band of whole tile ROWS at `depth`: rows `[row0, row1)` of
+    /// the `2^depth × 2^depth` grid.
+    ///
+    /// This is the shape mixed-mode dual-GPU requires — a DXR partner renders a
+    /// rectangle, so the wavefront side's tiles must form one too (an
+    /// interleaved mask cannot be a single `DispatchRays`). It is also the
+    /// cheapest cross-adapter transfer: one contiguous row range, one copy.
+    ///
+    /// A tile's row is the interleaved "bottom" bit of its path — bit 1 of each
+    /// level's 2-bit code (TL=0 TR=1 BL=2 BR=3), most significant level first.
+    pub fn rows(depth: u32, row0: u32, row1: u32) -> TileSplit {
+        let mut mask = 0u64;
+        for path in 0..Self::tiles_at(depth) {
+            let mut row = 0u32;
+            for lvl in 0..depth {
+                // Level `lvl` contributes its B bit; the FIRST level split is
+                // the most significant row bit.
+                let shift = 2 * (depth - 1 - lvl);
+                row = (row << 1) | ((path >> (shift + 1)) & 1);
+            }
+            if row >= row0 && row < row1 {
+                mask |= 1u64 << path;
+            }
+        }
+        TileSplit { mask, depth }
+    }
+
+    /// The complement within `depth` — the partner device's assignment. Their
+    /// union must be every tile and their intersection empty, which is what
+    /// makes the two halves partition the screen exactly.
+    pub fn complement(&self) -> TileSplit {
+        if self.depth == 0 {
+            return TileSplit { mask: 0, depth: 0 };
+        }
+        let all = if Self::tiles_at(self.depth) >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << Self::tiles_at(self.depth)) - 1
+        };
+        TileSplit { mask: !self.mask & all, depth: self.depth }
+    }
+
+    /// The CB row: xy = the mask, z = depth, w unused.
+    fn cb_row(&self) -> [u32; 4] {
+        [self.mask as u32, (self.mask >> 32) as u32, self.depth, 0]
+    }
+}
+
+/// The screen rect of level-`depth` tile `path`, replaying `trace_tile` /
+/// `level_finish`'s integer midpoint splits exactly (`xm = x0 + (x1-x0)/2`,
+/// TL=0 TR=1 BL=2 BR=3).
+///
+/// Test-side only: it exists so `split_self_test` can check the ownership
+/// mask's BIT math against the actual tile GEOMETRY, which is the pair that
+/// can drift. The renderer never calls it — the shader derives child rects as
+/// it descends.
+fn rect_for_path(depth: u32, path: u32, rw: u32, rh: u32) -> (u32, u32, u32, u32) {
+    let (mut x0, mut y0, mut x1, mut y1) = (0u32, 0u32, rw, rh);
+    for lvl in 0..depth {
+        let code = (path >> (2 * (depth - 1 - lvl))) & 3;
+        let xm = x0 + (x1 - x0) / 2;
+        let ym = y0 + (y1 - y0) / 2;
+        if code & 1 == 0 {
+            x1 = xm;
+        } else {
+            x0 = xm;
+        }
+        if (code >> 1) & 1 == 0 {
+            y1 = ym;
+        } else {
+            y0 = ym;
+        }
+    }
+    (x0, y0, x1, y1)
+}
+
+/// Pure-math gates for the `--dual-gpu` tile split. DLL- and GPU-free, and run
+/// by every `--check` regardless of the lever — the blas-split rule, so the
+/// machinery cannot rot while the feature is off.
+///
+/// What this actually protects: `TileSplit::rows` derives a tile's ROW from
+/// interleaved path bits, while the renderer derives a tile's RECT by
+/// recursive midpoint splits. Those are two independent derivations of the same
+/// thing, and if they disagree a device renders tiles it does not own (wasted
+/// work) or, worse, neither device renders a tile (a hole in the image). The
+/// geometry cross-check below is the gate that ties them together.
+pub fn split_self_test() -> std::result::Result<(), String> {
+    // The unsplit default must be exactly the state every consumer branches
+    // around — depth 0. If this drifts, single-GPU frames stop being
+    // bit-identical and every existing gate silently changes meaning.
+    if TileSplit::ALL.depth != 0 {
+        return Err("TileSplit::ALL must be depth 0 (the branched-around unsplit state)".into());
+    }
+
+    // The documented level-1 claim: a horizontal half-split IS the level-1
+    // quadrant boundary, top band = TL | TR = paths 0 and 1.
+    let top = TileSplit::rows(1, 0, 1);
+    if top.mask != 0b0011 {
+        return Err(format!(
+            "rows(1,0,1) must be TL|TR = 0b0011, got {:#06b} — the top band is not the \
+             level-1 quadrant pair, so a half-split is no longer a quadtree subtree",
+            top.mask
+        ));
+    }
+
+    for depth in 1..=MAX_SPLIT_DEPTH {
+        let n = TileSplit::tiles_at(depth);
+        let side = 1u32 << depth;
+        let full = TileSplit::rows(depth, 0, side);
+        let all_bits = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+        if full.mask != all_bits {
+            return Err(format!(
+                "rows({depth},0,{side}) must cover all {n} tiles, got {:#x}",
+                full.mask
+            ));
+        }
+
+        for r in 0..=side {
+            let a = TileSplit::rows(depth, 0, r);
+            let b = TileSplit::rows(depth, r, side);
+
+            // PARTITION: disjoint, and together every tile. This is what makes
+            // the two devices' work cover the screen exactly once — the
+            // property `--check-gpu`'s exactly-once coverage gate asserts on
+            // the GPU, checked here in closed form at every split position.
+            if a.mask & b.mask != 0 {
+                return Err(format!(
+                    "depth {depth} row {r}: the two bands overlap ({:#x}) — those tiles \
+                     would be rendered twice",
+                    a.mask & b.mask
+                ));
+            }
+            if a.mask | b.mask != all_bits {
+                return Err(format!(
+                    "depth {depth} row {r}: the two bands leave {:#x} unrendered — a hole \
+                     in the image (the false-sky class)",
+                    all_bits & !(a.mask | b.mask)
+                ));
+            }
+            // The partner's assignment must be derivable as the complement,
+            // since that is how the second device is actually configured.
+            if a.complement().mask != b.mask || a.complement().depth != depth {
+                return Err(format!(
+                    "depth {depth} row {r}: complement() disagrees with rows() — \
+                     {:#x} vs {:#x}",
+                    a.complement().mask,
+                    b.mask
+                ));
+            }
+
+            // GEOMETRY: the mask's bit math vs the renderer's rect recursion,
+            // at a power-of-two resolution AND an odd one (where the integer
+            // midpoint rounds and the bands are NOT equal height).
+            for &(rw, rh) in &[(1920u32, 1080u32), (533, 400)] {
+                // The seam: the largest y1 among the top band's tiles must be
+                // the smallest y0 among the bottom band's. Anything else is a
+                // gap or an overlap in SCREEN space even if the masks
+                // partition in INDEX space.
+                let mut top_max_y1 = 0u32;
+                let mut bot_min_y0 = u32::MAX;
+                for path in 0..n {
+                    let (_, y0, _, y1) = rect_for_path(depth, path, rw, rh);
+                    let in_a = (a.mask >> path) & 1 == 1;
+                    if in_a {
+                        top_max_y1 = top_max_y1.max(y1);
+                    } else {
+                        bot_min_y0 = bot_min_y0.min(y0);
+                    }
+                }
+                if r > 0 && r < side && top_max_y1 != bot_min_y0 {
+                    return Err(format!(
+                        "depth {depth} row {r} at {rw}x{rh}: band seam disagrees — top ends \
+                         at y={top_max_y1}, bottom starts at y={bot_min_y0}. The mask's row \
+                         bits and the midpoint-split rects have drifted apart."
+                    ));
+                }
+            }
+        }
+    }
+
+    // A depth past the mask's width must be refused rather than silently
+    // truncated — the CB carries 64 bits and nothing else.
+    if TileSplit::tiles_at(MAX_SPLIT_DEPTH) != 64 {
+        return Err(format!(
+            "MAX_SPLIT_DEPTH={MAX_SPLIT_DEPTH} implies {} tiles, but the CB mask holds 64",
+            TileSplit::tiles_at(MAX_SPLIT_DEPTH)
+        ));
+    }
+    Ok(())
 }
 // The HLSL cbuffer is hand-mirrored across 7 concatenated compile units —
 // a size drift here corrupts every field after the drift point.
@@ -4547,6 +4798,7 @@ const _: () = assert!(
             + 16 // sway_mv_base
             + 16 // el_meta
             + 32 * crate::emissive::MAX_EMISSIVE_LIGHTS
+            + 16 // split (dual-GPU tile ownership)
 );
 // ...and the whole thing must still fit a CB ring slot.
 const _: () = assert!(std::mem::size_of::<FrameCb>() <= CB_STRIDE);
@@ -4607,6 +4859,9 @@ impl FrameCb {
             ff_count: 0,
             ff: [[0.0; 4]; crate::fireflies::MAX_FIREFLIES],
             cloud_grid: [0.0; 4],
+            // Unsplit: depth 0 means every consumer branches around the
+            // ownership test, so the whole feature is off by default.
+            split: [0; 4],
             sway_mv_base: [0; 4],
             el_meta: [scene.emissive.count, 0, 0, 0],
             el_a,
@@ -4896,8 +5151,18 @@ pub struct TraceGpu {
     /// EVERY record_wavefront (incl. verify/check callers), cleared by
     /// invalidate_replay (aborts, hemi-probe seeds) and by TraceGpu recreation.
     /// `Cell` because the record_* methods take `&self`. record_frame replays
-    /// only when `p.replay && last_struct == Some(p.cam)`.
-    last_struct: std::cell::Cell<Option<CamBasis>>,
+    /// only when `p.replay && last_struct == Some((p.cam, self.split))`.
+    ///
+    /// The SPLIT is in the key, not just the basis: under `--dual-gpu` the
+    /// terminal queues describe the tiles this device owned when it recorded
+    /// them, so a rebalance must force a fresh trace. Keying on the basis
+    /// alone would re-dispatch the old assignment's leaves and leave the
+    /// reassigned tiles unwritten — a hole in the image, the false-sky class.
+    last_struct: std::cell::Cell<Option<(CamBasis, TileSplit)>>,
+    /// Which level-`depth` tiles this device renders (`--dual-gpu`).
+    /// `TileSplit::ALL` in every single-GPU session, which is the state in
+    /// which the ownership test is branched around entirely.
+    split: std::cell::Cell<TileSplit>,
     /// --foliage-sway clock for the frame being recorded (the DxrGpu shape,
     /// but set by record_wavefront/record_wavefront_replay from their OWN
     /// FrameParams — never write_cb, so the check/bench sites that skip
@@ -5053,6 +5318,12 @@ impl TraceGpu {
     ) -> Result<Self> {
         require_caps(device)?;
         abl_announce();
+        // The vendor of THIS device — never `picked_vendor()`, which is a
+        // process-global and under --dual-gpu names whichever device was picked
+        // last. Every vendor-keyed decision below (the AMD candidate-TMin
+        // workaround, the Intel work-graph refusal) is a property of the adapter
+        // these kernels will run on, so it is derived from the device itself.
+        let vendor = adapter::vendor_of_device(device);
         let root_sig = create_root_signature(device)?;
         let cmd_sig = create_dispatch_signature(device)?;
 
@@ -5076,7 +5347,7 @@ impl TraceGpu {
             alpha_defs(scene),
             height_defs(scene),
             trans_defs(scene),
-            cand_defs(),
+            cand_defs(vendor),
             blas_defs(),
             sway_def,
             abl_defs()
@@ -5340,10 +5611,11 @@ impl TraceGpu {
             // procedure below): the IDENTICAL AV — exit 0xC0000005 at the
             // first graph dispatch of --check-gpu, backing ask still
             // 517.62 MB, state object still builds. Re-test on a driver newer
-            // than 8805 and delete this arm if it passes; keying on the
-            // PICKED adapter (a fact) rather than --prefer-* (a request that
-            // can fall back) is the vendor_defaults rule.
-            let vendor = adapter::picked_vendor();
+            // than 8805 and delete this arm if it passes; keying on THIS
+            // DEVICE's adapter (a fact) rather than --prefer-* (a request that
+            // can fall back) is the vendor_defaults rule — and under
+            // --dual-gpu the per-device form is the only correct one, since
+            // the Intel device must refuse while its NVIDIA partner does not.
             if caps.work_graphs_tier == 0 {
                 eprintln!(
                     "gpu work-graph: FR_WORKGRAPH=1 but the device reports no work-graph \
@@ -5682,6 +5954,7 @@ impl TraceGpu {
             pso_seed,
             pso_seed_replay,
             last_struct: std::cell::Cell::new(None),
+            split: std::cell::Cell::new(TileSplit::ALL),
             sway_t: std::cell::Cell::new(None),
             sway_mv_on: !sway_def.is_empty(),
             sky_split,
@@ -5772,6 +6045,7 @@ impl TraceGpu {
         let mut cb =
             self.cb_base.with_frame(p, self.gbuf_full, self.fsr_sig(), self.gbuf_ext_needed());
         cb.cloud_grid = self.cloud_grid_row(p);
+        cb.split = self.split.get().cb_row();
         // Sway MVs: the SAME predicate record_sway's fill uses (sway_mv_pair
         // + the compile-in), so the flag and the slot's rows cannot disagree.
         // Known-accept: a record_rebuild FAILURE after this CB was written
@@ -6267,7 +6541,7 @@ impl TraceGpu {
         // The queues now hold this basis's terminal structure — a later
         // bit-equal-basis frame under `p.replay` can re-dispatch it (record_frame
         // decides). Truthful for every producer, verify/check callers included.
-        self.last_struct.set(Some(p.cam));
+        self.last_struct.set(Some((p.cam, self.split.get())));
     }
 
     /// The leaf + sky fills (disjoint pixels — no barrier between them) plus the
@@ -6386,6 +6660,61 @@ impl TraceGpu {
         }
     }
 
+    /// This device's `--dual-gpu` tile assignment.
+    // Read by the stage-4 balancer (which rebalances against the CURRENT
+    // assignment) and by the transfer, which copies exactly the rows this
+    // device owns. The setter is what stage 1 exercises.
+    #[allow(dead_code)]
+    pub fn split(&self) -> TileSplit {
+        self.split.get()
+    }
+
+    /// Assign which level-`depth` tiles this device renders.
+    ///
+    /// No explicit replay invalidation is needed — the split is IN the replay
+    /// key, so a changed assignment simply fails the bit-equality test and the
+    /// next frame traces fresh. That is deliberately not the same as clearing
+    /// the key: flipping back to a previous assignment at an unchanged basis
+    /// legitimately replays, which is what makes a balancer that oscillates
+    /// between two splits cost nothing extra.
+    ///
+    /// A depth above `MAX_SPLIT_DEPTH` cannot be represented in the CB's 64-bit
+    /// mask, so it is refused loudly and the device keeps its current
+    /// assignment rather than silently rendering a subset (a hole in the
+    /// image) — the loud-degrade rule.
+    ///
+    /// A depth at or below the LEAF FRONTIER is refused for a subtler reason,
+    /// and it is a soundness guard rather than a sanity check. `level_finish`
+    /// has a second terminal path — the batch that emits four LEAF children
+    /// directly when both child extents fit `LEAF_TILE` — which does not pass
+    /// through the child-ownership test. Requiring `depth < depth_full` puts
+    /// that batch strictly BELOW the split depth (it only fires at the leaf
+    /// frontier, whose children are at `depth_full`), so its leaves always lie
+    /// inside an already-owned tile and need no test of their own. Drop this
+    /// guard and that path silently emits all four leaves on both devices.
+    /// A split that fine has nothing to balance anyway — its tiles would be
+    /// single leaf tiles.
+    pub fn set_split(&self, split: TileSplit) {
+        if split.depth > MAX_SPLIT_DEPTH {
+            eprintln!(
+                "dual-gpu: split depth {} exceeds MAX_SPLIT_DEPTH={} (the CB mask is 64 bits) \
+                 — keeping the current assignment",
+                split.depth, MAX_SPLIT_DEPTH
+            );
+            return;
+        }
+        let full = depth_full(self.rw, self.rh);
+        if split.depth >= full && split.depth != 0 {
+            eprintln!(
+                "dual-gpu: split depth {} is at or below the leaf frontier (depth_full={} at \
+                 {}x{}) — keeping the current assignment",
+                split.depth, full, self.rw, self.rh
+            );
+            return;
+        }
+        self.split.set(split);
+    }
+
     /// Drop the replay key. Called when a recorded-but-never-executed producing
     /// frame is aborted (the queues then hold the OLD basis while `last_struct`
     /// would claim the NEW one), and when a hemi-probe seed zeroes the terminal
@@ -6497,7 +6826,7 @@ impl TraceGpu {
             // the persisted terminal queues instead of re-running seed + the
             // ladder. record_reference is a verified non-clobber (its unit
             // declares no counters/queues), so the R toggle round-trips free.
-            if p.replay && self.last_struct.get() == Some(p.cam) {
+            if p.replay && self.last_struct.get() == Some((p.cam, self.split.get())) {
                 self.record_wavefront_replay(list, slot, p, false);
             } else {
                 self.record_wavefront(list, slot, p, false);
