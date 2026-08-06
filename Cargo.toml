@@ -94,6 +94,20 @@ sdl3 = { version = "0.18", features = ["build-from-source-static", "raw-window-h
 # Windows-only because only run_window sessions ever decode audio; core SDL3
 # audio (no `mixer` feature) does the playback.
 lewton = "0.10"
+# Stack walking + PDB symbolization for the crash handler (src/crash.rs). Cheap
+# on THIS target by construction: backtrace excludes the gimli/addr2line/object
+# stack on windows-msvc and uses dbghelp instead, so the closure is ~cfg-if +
+# rustc-demangle. (Cargo.lock is platform-AGNOSTIC and therefore still lists
+# gimli/object/addr2line — do not read that as bloat: verified with
+# `cargo tree --target x86_64-pc-windows-msvc` and by the absence of their
+# rlibs in target/release/deps, only those three actually compile here.)
+# It also LoadLibrary's dbghelp itself rather than importing it,
+# which is the same footprint policy dxc.rs/oidn.rs/pix.rs state — so --check
+# stays DLL-free (dbghelp only ever loads on an actual crash).
+#
+# Windows-only because the handler is: SEH, MiniDumpWriteDump, and the one
+# frustracer.pdb that spans both the Rust code and the cc-built shim/*.cpp.
+backtrace = "0.3"
 raw-window-handle = "0.6"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
@@ -107,6 +121,17 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Dxgi_Common",
     "Win32_System_Threading",
     "Win32_System_LibraryLoader",
+    # Crash handler (src/crash.rs): the exception TYPES (EXCEPTION_POINTERS /
+    # EXCEPTION_RECORD / CONTEXT / MINIDUMP_*) plus SetUnhandledExceptionFilter,
+    # which is kernel32 and always present — so linking it breaks no policy.
+    # MiniDumpWriteDump is deliberately NOT called through this feature: it
+    # lives in dbghelp.dll and is resolved with GetProcAddress (the pix.rs
+    # pattern), so nothing imports dbghelp and a missing/old one degrades to
+    # "stack printed, no dump" instead of failing the link.
+    "Win32_System_Diagnostics_Debug",
+    # EXCEPTION_POINTERS / EXCEPTION_RECORD / CONTEXT live behind this one in
+    # windows-rs 0.62 — Diagnostics_Debug alone configures them out.
+    "Win32_System_Kernel",
     "Win32_Security",
     # 500 Hz input integrator (src/flycam.rs): GetAsyncKeyState / cursor +
     # window queries / ScreenToClient / timeBeginPeriod fallback / XInput.

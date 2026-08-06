@@ -7,6 +7,7 @@
 #include <windows.h>
 #include <d3d12.h>
 #include <cstring>
+#include <cstdlib>   // atexit — the post-main probe at the end of this file
 #include <string>
 
 #include "../SDKs/fidelityfx-sdk/api/include/ffx_api.h"
@@ -577,6 +578,50 @@ int32_t ffxshim_upscale(void* upscaler_ctx, const FfxShimUpscaleDesc* d) {
 
     ffxContext ctx = upscaler_ctx;
     return static_cast<int32_t>(g_api.dispatch(&ctx, &desc.header));
+}
+
+// ---------------------------------------------------------------------------
+// Deliberate fault for the crash handler's gate (FR_CRASH_TEST=cpp, see
+// src/crash.rs). Nothing else calls it, and nothing arms it by default.
+//
+// It lives HERE because this TU is the shim built unconditionally on Windows —
+// the DLSS shims compile only when the (non-redistributable) SDK is present —
+// so a C++ frame is guaranteed to exist in every build. A crash report naming
+// these functions with `shim/ffx_shim.cpp:LINE` is the end-to-end proof that
+// the Rust code and the cc-built C++ share one frustracer.pdb; without it the
+// handler's "prints C++ frames too" claim would be untested.
+//
+// Two frames, both noinline, so the report has to show a real C++ -> C++ call
+// chain rather than a single leaf that could be a coincidence.
+// ---------------------------------------------------------------------------
+__declspec(noinline) void frshim_crash_test_inner(volatile int* p) {
+    *p = 0x5A;  // deliberate null-pointer write
+}
+
+__declspec(noinline) void frshim_crash_test(void) {
+    frshim_crash_test_inner(nullptr);
+}
+
+// --- late-phase hook: AFTER main returns -----------------------------------
+//
+// Rust cannot register an atexit handler, and the phase after main returns
+// (CRT atexit + static destructors, then DLL_PROCESS_DETACH) is exactly the
+// window a "did the crash handler outlive the crash?" question is about. So
+// the shim owns the registration and calls back into Rust.
+//
+// atexit handlers run in REVERSE registration order, and crash::install()
+// registers this one FIRST — so it runs LAST, which is what makes it a
+// meaningful probe of the latest reachable moment.
+typedef void (*FrShimLateCb)(void);
+static FrShimLateCb g_late_cb = nullptr;
+
+static void frshim_late_trampoline(void) {
+    if (g_late_cb) g_late_cb();
+}
+
+__declspec(noinline) void frshim_register_atexit(FrShimLateCb cb) {
+    g_late_cb = cb;
+    atexit(&frshim_late_trampoline);
 }
 
 } // extern "C"

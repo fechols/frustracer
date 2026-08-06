@@ -295,15 +295,22 @@ opt_fields! {
 // Load / save
 // ---------------------------------------------------------------------------
 
-/// Where the file lives: next to the exe (the in-tree convention — SDK paths
-/// are manifest-relative, the scene cache writes sidecars next to sources;
-/// there is no AppData convention anywhere in this project), CWD fallback.
-pub fn path() -> PathBuf {
+/// The directory side-channel files live in: next to the exe (the in-tree
+/// convention — SDK paths are manifest-relative, the scene cache writes
+/// sidecars next to sources; there is no AppData convention anywhere in this
+/// project), CWD fallback. Split out of `path()` so the crash handler
+/// (src/crash.rs) writes its report/minidump under the SAME rule rather than
+/// growing a second copy of it.
+pub fn dir() -> PathBuf {
     std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(FILE_NAME)
+}
+
+/// Where the settings file lives — `dir()` plus the fixed name.
+pub fn path() -> PathBuf {
+    dir().join(FILE_NAME)
 }
 
 /// Should this invocation ignore the settings file? Any headless gate /

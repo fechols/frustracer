@@ -19,6 +19,11 @@ mod camera;
 mod cli;
 mod cinematic;
 mod clouds;
+// Top-level SEH filter + panic hook: prints a symbolized stack that crosses
+// the Rust/C++ boundary (one PDB spans both) and writes a minidump. Installed
+// first thing in main so it covers load, GPU init, the frame loop AND the
+// teardown after main returns — which is where the vendor-runtime AVs live.
+mod crash;
 mod dlss;
 mod emissive;
 // Signal split, wire encoders, and demodulation/composite math for FSR Ray
@@ -206,6 +211,19 @@ struct PrevPose {
 fn main() {
     prof::init(); // before any zone can fire; inert without --features tracy
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    // Crash handler FIRST — before the settings load and before the parse, so
+    // a fault anywhere (including CRT exit and DLL unload after this function
+    // returns) reports a stack instead of a bare 0xC0000005 exit code. Its
+    // kill lever is a raw-argv scan for the same reason `--no-settings` is
+    // one: it must be readable before `cli::parse_from` exists to tell us.
+    // Loud on departure from the default, in BOTH spellings — `install` says
+    // so for FR_NO_CRASH, so the flag has to say so here or the same lever is
+    // announced by one name and silent under the other.
+    if crash::disabled_by_args(argv.iter()) {
+        eprintln!("crash: --no-crash-handler — handler not installed");
+    } else {
+        crash::install();
+    }
     // JSON settings: the file's values land in `Opts` BEFORE the parse runs, so
     // every CLI flag below simply overwrites them — defaults < file < flags.
     // Since the CLI moved to cli.rs that layering is a readable DATA FLOW
@@ -12025,6 +12043,23 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
     };
 
+    // Crash handler — the pure tables (exception names, AV flavor, the
+    // module+offset arithmetic, the kill-lever scan) plus address resolution
+    // against our own image, with the anti-vacuity arm that an address in NO
+    // module must fail to resolve. Deliberately faults nothing, loads no
+    // dbghelp (--check stays DLL-free — it loads on a real crash only), and
+    // leaves the installed filter exactly as it found it.
+    let crash_ok = match crash::self_test() {
+        Ok(()) => {
+            eprintln!("crash self-test: OK");
+            true
+        }
+        Err(e) => {
+            eprintln!("crash self-test: FAIL — {e}");
+            false
+        }
+    };
+
     let rep = render::verify(scene, bvh, &cam, q, rw, rh, &stats, None, &[], None);
     eprintln!(
         "verify full-depth ({} px): false-sky {} | tmin-overshoot {} | hybrid-extra {} | max rel t err {:.2e}",
@@ -14245,6 +14280,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         ("cinematic", cinematic_ok),
         ("audio", audio_ok),
         ("progress", progress_ok),
+        ("crash", crash_ok),
         ("quin", quin_ok),
         ("ngxfg-guides", ngxfg_guides_ok),
         ("hemi-ao", hemi_ok),

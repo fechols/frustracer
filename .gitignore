@@ -87,3 +87,9 @@ __pycache__/
 !/SDKs/fidelityfx-sdk/framegeneration/
 !/SDKs/fidelityfx-sdk/README.md
 waveviz-*.png
+
+# Crash handler artifacts (src/crash.rs) — the symbolized report and the
+# minidump, written next to the exe on a fault. Normally that is target/
+# (already ignored); this covers a copied-out exe run from the repo root.
+frustracer-crash-*.txt
+frustracer-crash-*.dmp

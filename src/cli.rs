@@ -1659,6 +1659,11 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
             // — this arm only keeps the token out of the positional fallback,
             // which would read it as a scene path.
             "--no-settings" => {}
+            // Same shape: consumed by the pre-parse scan in main
+            // (crash::disabled_by_args), because the crash handler installs
+            // before this parser runs. The arm exists only so the positional
+            // fallback does not read the flag as a scene path.
+            "--no-crash-handler" => {}
             "--world" => world_flag = Some(true),
             "--no-world" => world_flag = Some(false),
             "--stress" => {
@@ -1990,6 +1995,15 @@ pub fn usage() {
                 eprintln!("  --no-settings ignore {} for this run (the pause menu's", settings::FILE_NAME);
                 eprintln!("                saved settings, read as defaults that CLI flags override;");
                 eprintln!("                headless --check*/--spin runs always ignore it)");
+                eprintln!("  --no-crash-handler");
+                eprintln!("                don't install the crash handler (default ON: on a fault it");
+                eprintln!("                prints a symbolized Rust+C++ stack and writes");
+                eprintln!("                frustracer-crash-<pid>.txt/.dmp next to the exe;");
+                eprintln!("                FR_NO_CRASH=1 does the same, FR_CRASH_FULLDUMP=1 dumps");
+                eprintln!("                full memory, FR_CRASH_VERIFY=1 reports after main whether");
+                eprintln!("                the filter is still ours, and");
+                eprintln!("                FR_CRASH_TEST=deref|cpp|panic|overflow|atexit faults");
+                eprintln!("                on purpose to exercise it)");
 }
 
 // ---------------------------------------------------------------------------
