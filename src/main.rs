@@ -4765,31 +4765,15 @@ fn run_check_gpu(
     // 533x400 would prove nothing this one does not.
     {
         const SENT: u32 = 0xffff_ffff;
-        let sp = gpu::trace::FrameParams {
-            sway_prev_time: None,
-            cam: basis,
-            frame: 0,
-            accumulate: true,
-            jitter: false,
-            frame_jitter: None,
-            prev_cam: None,
-            q,
-            verify: false,
-            spp: 1,
-            probe_sample: 0,
-            clouds: crate::clouds::Clouds::check(scene.diag),
-            fireflies: crate::fireflies::Fireflies::check(scene),
-            sway_time: check_sway,
-            replay: false,
-        };
         // Sentinel ON every pass: an unowned pixel must stay unwritten, and
         // that is precisely what the ownership accounting reads.
         let render = |hg: &mut gpu::trace::HeadlessGpu,
+                      sp: &gpu::trace::FrameParams,
                       s: gpu::trace::TileSplit|
          -> Result<(Vec<f32>, Vec<f32>, Vec<u32>), String> {
             tg.set_split(s);
-            tg.write_cb(0, &sp);
-            hg.run(|l| tg.record_wavefront(l, 0, &sp, true))?;
+            tg.write_cb(0, sp);
+            hg.run(|l| tg.record_wavefront(l, 0, sp, true))?;
             Ok((
                 read_f32(hg, &tg.accum, px * 3)?,
                 read_f32(hg, &tg.tbuf, px)?,
@@ -4801,9 +4785,59 @@ fn run_check_gpu(
         // `set_split` refuses it — so the sweep stops where the renderer does.
         let full = gpu::trace::depth_full(gw as u32, gh as u32);
         let max_d = gpu::trace::MAX_SPLIT_DEPTH.min(full.saturating_sub(1));
-        match render(&mut hg, gpu::trace::TileSplit::ALL) {
+
+        // THE SWEEP RUNS AT fb OFF, AO AND GI. `record_wavefront` dispatches
+        // `cs_compose` and the whole hemi wavefront ONLY when fb_mode > 0, so
+        // an fb-off sweep leaves the entire bounce tier — the regime dual-GPU
+        // exists for — structurally unexercised under a split. Bounce depth 2
+        // is deliberate: these arms gate the SPLIT, not the estimator, so the
+        // cheapest depth that dispatches the fb path is the right one.
+        //
+        // KNOWN BLIND SPOT, measured rather than assumed (2026-08-06). These
+        // arms do NOT have teeth against an unbanded `cs_compose`: reverting
+        // compose.hlsl's ownership test leaves all nine rows green. Two
+        // independent reasons, both worth knowing before trusting this gate
+        // with a compose-side change:
+        //   - The accounting reads each pixel from its OWNING device's buffer,
+        //     so an unbanded compose damages exactly the region this gate
+        //     reads from the other buffer.
+        //   - Even asserting "A's accum outside its band is untouched" would
+        //     pass, because the full-screen reference renders immediately
+        //     before and leaves A's `partial`/`ambw` at B's pixels holding the
+        //     reference's own values — an unbanded compose recomputes exactly
+        //     the reference answer there.
+        // Catching it needs a harness whose preceding render differs in the
+        // unowned region. What these arms DO gate is everything else the fb
+        // path could get wrong under a split: hemi points appended for
+        // unowned pixels, a hemi queue that does not band, a compose that
+        // writes OUTSIDE the union.
+        for (fb_name, fb) in [
+            ("fb off", crate::shade::FrustumBounce::OFF),
+            ("fb ao", crate::shade::FrustumBounce { ao: true, gi: false, depth: 2 }),
+            ("fb gi", crate::shade::FrustumBounce { ao: false, gi: true, depth: 2 }),
+        ] {
+        let mut q_fb = q;
+        q_fb.fb = fb;
+        let sp = gpu::trace::FrameParams {
+            sway_prev_time: None,
+            cam: basis,
+            frame: 0,
+            accumulate: true,
+            jitter: false,
+            frame_jitter: None,
+            prev_cam: None,
+            q: q_fb,
+            verify: false,
+            spp: 1,
+            probe_sample: 0,
+            clouds: crate::clouds::Clouds::check(scene.diag),
+            fireflies: crate::fireflies::Fireflies::check(scene),
+            sway_time: check_sway,
+            replay: false,
+        };
+        match render(&mut hg, &sp, gpu::trace::TileSplit::ALL) {
             Err(e) => {
-                eprintln!("check-gpu: FAIL dual-gpu split reference frame: {e}");
+                eprintln!("check-gpu: FAIL dual-gpu split reference frame ({fb_name}): {e}");
                 ok = false;
             }
             Ok((ref_acc, ref_t, ref_info)) if max_d >= 1 => {
@@ -4815,18 +4849,18 @@ fn run_check_gpu(
                     let mut first_bad: Option<u32> = None;
                     for r in 1..rows {
                         let a = gpu::trace::TileSplit::rows(depth, 0, r);
-                        let (aa, at, ai) = match render(&mut hg, a) {
+                        let (aa, at, ai) = match render(&mut hg, &sp, a) {
                             Ok(v) => v,
                             Err(e) => {
-                                eprintln!("check-gpu: FAIL split depth {depth} row {r} (A): {e}");
+                                eprintln!("check-gpu: FAIL split {fb_name} depth {depth} row {r} (A): {e}");
                                 ok = false;
                                 continue;
                             }
                         };
-                        let (ba, bt, bi) = match render(&mut hg, a.complement()) {
+                        let (ba, bt, bi) = match render(&mut hg, &sp, a.complement()) {
                             Ok(v) => v,
                             Err(e) => {
-                                eprintln!("check-gpu: FAIL split depth {depth} row {r} (B): {e}");
+                                eprintln!("check-gpu: FAIL split {fb_name} depth {depth} row {r} (B): {e}");
                                 ok = false;
                                 continue;
                             }
@@ -4860,18 +4894,18 @@ fn run_check_gpu(
                         }
                     }
                     eprintln!(
-                        "check-gpu: dual-gpu split depth {depth} ({} masks, {px} px): union holes {holes} dupes {dupes} | accum-diff {acc_d} tbuf-diff {t_d} kind-diff {kind_d} | owned px min {min_a}/{min_b}"
+                        "check-gpu: dual-gpu split {fb_name} depth {depth} ({} masks, {px} px): union holes {holes} dupes {dupes} | accum-diff {acc_d} tbuf-diff {t_d} kind-diff {kind_d} | owned px min {min_a}/{min_b}"
                     , rows - 1);
                     if holes != 0 || dupes != 0 {
                         eprintln!(
-                            "check-gpu: FAIL split depth {depth} is not a partition (holes {holes}, overlaps {dupes}; first bad row {:?})",
+                            "check-gpu: FAIL split {fb_name} depth {depth} is not a partition (holes {holes}, overlaps {dupes}; first bad row {:?})",
                             first_bad
                         );
                         ok = false;
                     }
                     if acc_d != 0 || t_d != 0 || kind_d != 0 {
                         eprintln!(
-                            "check-gpu: FAIL split depth {depth} union diverged from the unsplit frame (accum {acc_d} tbuf {t_d} kind {kind_d}; first bad row {:?})",
+                            "check-gpu: FAIL split {fb_name} depth {depth} union diverged from the unsplit frame (accum {acc_d} tbuf {t_d} kind {kind_d}; first bad row {:?})",
                             first_bad
                         );
                         ok = false;
@@ -4880,7 +4914,7 @@ fn run_check_gpu(
                     // satisfy every test above while splitting nothing.
                     if min_a == 0 || min_b == 0 || min_a == usize::MAX {
                         eprintln!(
-                            "check-gpu: FAIL split depth {depth} left a device with no pixels (min {min_a}/{min_b}) — the partition proof is vacuous"
+                            "check-gpu: FAIL split {fb_name} depth {depth} left a device with no pixels (min {min_a}/{min_b}) — the partition proof is vacuous"
                         );
                         ok = false;
                     }
@@ -4890,10 +4924,368 @@ fn run_check_gpu(
                 "check-gpu: (skip) dual-gpu split — depth_full {full} at {gw}x{gh} leaves no internal tile to own"
             ),
         }
+        }
         // Restore the unsplit assignment for everything downstream, and drop
         // the replay key the split passes established.
         tg.set_split(gpu::trace::TileSplit::ALL);
         tg.invalidate_replay();
+    }
+
+    // --- Cross-adapter transfer cost probe (--dual-gpu sizing) -------------
+    // THE number the dual-GPU design is sized by, and the one it was missing.
+    // A secondary device's band reaches the primary as a PCIe crossing in each
+    // direction, so the feature pays only when the tracer work it offloads
+    // exceeds that crossing:
+    //
+    //     break-even:  share x tracer_ns_per_px  =  payload_B_per_px / BW
+    //
+    // which is resolution-INVARIANT (both sides scale with pixels), so this
+    // one measurement fixes the break-even spp at every resolution.
+    //
+    // The device->sysmem->device round trip measured here IS the fallback
+    // path's cost and a lower bound on the shared-heap path's — the same two
+    // crossings, one less staging copy. The directions are timed SEPARATELY
+    // because the balancer hides one and not the other: a secondary that
+    // finishes early enough overlaps its own write under the primary's
+    // remaining trace, leaving only the primary's read exposed in the frame.
+    //
+    // Reported, never gated — it is a property of the machine, not the code.
+    // Sizes bracket the real payloads (a 1080p band at 22-108 B/px is 8-76 MB)
+    // and the small end also exposes the fixed submit overhead, which is why
+    // the GB/s column is only meaningful as it flattens.
+    {
+        use std::time::Instant;
+        use windows::Win32::Graphics::Direct3D12 as d12;
+        const REPS: usize = 5;
+        eprintln!(
+            "check-gpu: dual-gpu transfer probe on \"{}\" (device -> sysmem -> device, min of {REPS})",
+            hg.adapter_name
+        );
+        for &mb in &[2usize, 8, 32, 128] {
+            let n = mb * 1024 * 1024;
+            let probe = (|| -> Result<(f64, f64, f64), String> {
+                let dev = hg.device.clone();
+                let src = gpu::d3d12::committed_buffer(
+                    &dev,
+                    n as u64,
+                    d12::D3D12_RESOURCE_FLAG_NONE,
+                    d12::D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )?;
+                let dst = gpu::d3d12::committed_buffer(
+                    &dev,
+                    n as u64,
+                    d12::D3D12_RESOURCE_FLAG_NONE,
+                    d12::D3D12_RESOURCE_STATE_COPY_DEST,
+                )?;
+                let rb = gpu::d3d12::ReadbackBuffer::new(&dev, n)?;
+                let ub = gpu::d3d12::UploadBuffer::new(&dev, n)?;
+                let (mut wr, mut cp, mut rd) = (f64::MAX, f64::MAX, f64::MAX);
+                // Pass 0 is an untimed warm-up: first touch faults in the
+                // staging pages and primes the copy engine (the house
+                // discard-a-warm-up-per-variant rule, which bites hardest on
+                // the Arc driver).
+                for i in 0..=REPS {
+                    let t0 = Instant::now();
+                    hg.run(|l| unsafe {
+                        l.CopyBufferRegion(&rb.resource, 0, &src, 0, n as u64)
+                    })?;
+                    let t1 = Instant::now();
+                    unsafe {
+                        let mut p = std::ptr::null_mut();
+                        rb.resource
+                            .Map(0, None, Some(&mut p))
+                            .map_err(|e| format!("Map: {e}"))?;
+                        std::ptr::copy_nonoverlapping(p as *const u8, ub.ptr, n);
+                        rb.resource.Unmap(0, None);
+                    }
+                    let t2 = Instant::now();
+                    hg.run(|l| unsafe {
+                        l.CopyBufferRegion(&dst, 0, &ub.resource, 0, n as u64)
+                    })?;
+                    let t3 = Instant::now();
+                    if i > 0 {
+                        wr = wr.min((t1 - t0).as_secs_f64() * 1e3);
+                        cp = cp.min((t2 - t1).as_secs_f64() * 1e3);
+                        rd = rd.min((t3 - t2).as_secs_f64() * 1e3);
+                    }
+                }
+                Ok((wr, cp, rd))
+            })();
+            match probe {
+                Ok((wr, cp, rd)) => {
+                    let gbs = |ms: f64| n as f64 / (ms * 1e-3) / 1e9;
+                    eprintln!(
+                        "check-gpu:   {mb:4} MB | D->H {wr:6.2} ms ({:5.1} GB/s) | memcpy {cp:6.2} ms ({:5.1} GB/s) | H->D {rd:6.2} ms ({:5.1} GB/s)",
+                        gbs(wr),
+                        gbs(cp),
+                        gbs(rd)
+                    );
+                }
+                Err(e) => eprintln!("check-gpu:   {mb:4} MB | probe unavailable: {e}"),
+            }
+        }
+    }
+
+    // --- Dual-GPU: the TWO-DEVICE gate -------------------------------------
+    // The single-device split proof above establishes that two complementary
+    // masks reconstruct the unsplit frame. This one establishes that they do
+    // so when the halves are rendered by two DIFFERENT physical adapters,
+    // which is the claim the feature actually rests on and the one no amount
+    // of single-device testing can reach.
+    //
+    // Skips, never fails, when the box has one usable adapter: exit 2 is
+    // ENVIRONMENT and exit 1 is a gate that ran and disagreed, so "no second
+    // GPU" must not be reported as a defect. Construction failures on the
+    // secondary (no RT 1.1, no VRAM, a driver that refuses) are environment
+    // too — they are exactly the conditions under which the shipping feature
+    // degrades to single-GPU, so the gate degrades the same way.
+    //
+    // IDENTITY IS VENDOR-CONDITIONAL, and that is not a convenience. Two
+    // adapters of the SAME vendor run the same kernel and must agree BIT for
+    // bit. Across vendors they do not: `cand_defs` compiles a different
+    // candidate loop on AMD (the RDNA4 TMin defect workaround), and two
+    // compilers on one HLSL source diverge by ulps that a grazing occlusion
+    // bit turns into whole-pixel colour differences — the documented
+    // cross-vendor class. So structure (coverage, disjointness) stays EXACT
+    // on every pairing, and only radiance relaxes.
+    {
+        // The gate re-uploads the scene and rebuilds a BLAS on the secondary.
+        // That is free on the check scene and a few seconds on San Miguel, but
+        // pointless punishment on a mega-scene: cross-device agreement is a
+        // property of the kernels and is fully exercised at any triangle count,
+        // so size buys no coverage here. Skip loudly above the bar rather than
+        // doubling a --tile run's setup.
+        const TWO_DEV_MAX_TRIS: usize = 12_000_000;
+        let tris = scene.indices.len() / 3;
+        let sec = if tris > TWO_DEV_MAX_TRIS {
+            eprintln!(
+                "check-gpu: (skip) dual-gpu two-device gate — {tris} tris is over the {TWO_DEV_MAX_TRIS} bar; \
+                 a second upload buys no coverage the check scene does not already give"
+            );
+            None
+        } else {
+            match gpu::adapter::create_factory(opts.gpu_debug) {
+            Err(e) => {
+                eprintln!("check-gpu: (skip) dual-gpu second device — factory: {e}");
+                None
+            }
+            Ok(f) => {
+                let prim = gpu::adapter::luid_of_device(&hg.device);
+                // Most-VRAM among the non-primary adapters: on a box with a
+                // discrete secondary and an integrated one, that is the card
+                // worth splitting to, and it matches `adapter::pick`'s own
+                // within-vendor tie-break.
+                gpu::adapter::enumerate(&f)
+                    .into_iter()
+                    .filter(|a| a.luid != prim)
+                    .reduce(|a, b| if b.vram > a.vram { b } else { a })
+            }
+            }
+        };
+        match sec {
+            None => eprintln!(
+                "check-gpu: (skip) dual-gpu second device — no second hardware adapter on this box"
+            ),
+            Some(p) => {
+                let full = gpu::trace::depth_full(gw as u32, gh as u32);
+                let max_d = gpu::trace::MAX_SPLIT_DEPTH.min(full.saturating_sub(1)).min(2);
+                let build = (|| -> Result<
+                    (gpu::trace::HeadlessGpu, gpu::trace::TraceGpu),
+                    String,
+                > {
+                    let mut h2 = gpu::trace::HeadlessGpu::from_pick(&p, opts.gpu_debug)?;
+                    let d2 = h2.device.clone();
+                    let core2 =
+                        std::rc::Rc::new(gpu::trace::SceneGpu::new_uploaded(
+                            &d2, scene, bvh, &mut h2, opts.bc7,
+                        )?);
+                    let t2 = gpu::trace::TraceGpu::new(
+                        &d2,
+                        &dxc,
+                        scene,
+                        bvh,
+                        core2,
+                        gw as u32,
+                        gh as u32,
+                        false,
+                        false,
+                        opts.gpu_debug,
+                        &mut h2,
+                    )?;
+                    Ok((h2, t2))
+                })();
+                match build {
+                    Err(e) => eprintln!(
+                        "check-gpu: (skip) dual-gpu second device \"{}\" — cannot host a tracer: {e}",
+                        p.name
+                    ),
+                    Ok((mut hg2, tg2)) if max_d >= 1 => {
+                        let cross = hg2.vendor != hg.vendor;
+                        eprintln!(
+                            "check-gpu: dual-gpu two-device gate: A \"{}\" | B \"{}\" ({})",
+                            hg.adapter_name,
+                            hg2.adapter_name,
+                            if cross { "cross-vendor: structure exact, radiance statistical" } else { "same vendor: bit-exact" }
+                        );
+                        let sp = gpu::trace::FrameParams {
+                            sway_prev_time: None,
+                            cam: basis,
+                            frame: 0,
+                            accumulate: true,
+                            jitter: false,
+                            frame_jitter: None,
+                            prev_cam: None,
+                            q: Quality { fb: crate::shade::FrustumBounce::OFF, ..q },
+                            verify: false,
+                            spp: 1,
+                            probe_sample: 0,
+                            clouds: crate::clouds::Clouds::check(scene.diag),
+                            fireflies: crate::fireflies::Fireflies::check(scene),
+                            sway_time: check_sway,
+                            replay: false,
+                        };
+                        // Reads are inlined rather than reusing the suite's
+                        // `read_f32`/`read_u32`: those closures fixed their
+                        // reference lifetime at their first call site, which a
+                        // buffer borrowed from a closure-local `&TraceGpu`
+                        // cannot satisfy.
+                        let one = |h: &mut gpu::trace::HeadlessGpu,
+                                   t: &gpu::trace::TraceGpu,
+                                   s: gpu::trace::TileSplit|
+                         -> Result<(Vec<f32>, Vec<u32>), String> {
+                            t.set_split(s);
+                            t.write_cb(0, &sp);
+                            h.run(|l| t.record_wavefront(l, 0, &sp, true))?;
+                            let ab = h.read_buffer(&t.accum, ua, px * 3 * 4)?;
+                            let ib = h.read_buffer(&t.info, ua, px * 4)?;
+                            Ok((
+                                ab.chunks_exact(4)
+                                    .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                                    .collect(),
+                                ib.chunks_exact(4)
+                                    .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                                    .collect(),
+                            ))
+                        };
+                        let refr = one(&mut hg, &tg, gpu::trace::TileSplit::ALL);
+                        match refr {
+                            Err(e) => {
+                                eprintln!("check-gpu: FAIL dual-gpu two-device reference: {e}");
+                                ok = false;
+                            }
+                            Ok((ref_acc, _)) => {
+                                for depth in 1..=max_d {
+                                    for r in 1..(1u32 << depth) {
+                                        let a = gpu::trace::TileSplit::rows(depth, 0, r);
+                                        let (aa, ai) = match one(&mut hg, &tg, a) {
+                                            Ok(v) => v,
+                                            Err(e) => {
+                                                eprintln!("check-gpu: FAIL two-device d{depth} r{r} (A): {e}");
+                                                ok = false;
+                                                continue;
+                                            }
+                                        };
+                                        let (ba, bi) =
+                                            match one(&mut hg2, &tg2, a.complement()) {
+                                                Ok(v) => v,
+                                                Err(e) => {
+                                                    eprintln!("check-gpu: FAIL two-device d{depth} r{r} (B): {e}");
+                                                    ok = false;
+                                                    continue;
+                                                }
+                                            };
+                                        const SENT2: u32 = 0xffff_ffff;
+                                        let (mut holes, mut dupes) = (0usize, 0usize);
+                                        let (mut sum_d, mut sum_r) = (0f64, 0f64);
+                                        let (mut hot, mut n_b) = (0usize, 0usize);
+                                        for i in 0..px {
+                                            let (ha, hb) = (ai[i] != SENT2, bi[i] != SENT2);
+                                            n_b += hb as usize;
+                                            match (ha, hb) {
+                                                (false, false) => holes += 1,
+                                                (true, true) => dupes += 1,
+                                                _ => {
+                                                    let src = if ha { &aa } else { &ba };
+                                                    for c in 0..3 {
+                                                        let (g, e) =
+                                                            (src[i * 3 + c], ref_acc[i * 3 + c]);
+                                                        let d = (g - e).abs() as f64;
+                                                        sum_d += d;
+                                                        sum_r += e.abs() as f64;
+                                                        hot += (d > 1e-2) as usize;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        let rel = if sum_r > 0.0 { sum_d / sum_r } else { 0.0 };
+                                        eprintln!(
+                                            "check-gpu:   d{depth} r{r}: holes {holes} dupes {dupes} | B owned {n_b} px | union-vs-unsplit mean rel {rel:.2e} hot {hot}"
+                                        );
+                                        // STRUCTURE is exact on every pairing:
+                                        // which device owns a pixel is integer
+                                        // arithmetic on both, not floating point.
+                                        if holes != 0 || dupes != 0 || n_b == 0 {
+                                            eprintln!(
+                                                "check-gpu: FAIL two-device d{depth} r{r} is not a partition (holes {holes}, overlaps {dupes}, B owned {n_b})"
+                                            );
+                                            ok = false;
+                                        }
+                                        // TWO-PART, for the reason the suite's
+                                        // other statistical gates are: a HOT
+                                        // COUNT catches localized divergence, a
+                                        // relative MEAN catches systematic bias,
+                                        // and neither sees the other. A uniform
+                                        // 0.1% shift everywhere would show zero
+                                        // hot channels; a handful of flipped
+                                        // grazing pixels barely moves a mean.
+                                        //
+                                        // MEASURED 4090 + B70, 2026-08-06:
+                                        // procedural 6e-7..2e-6 / 3-11 hot;
+                                        // san-miguel-lp 5e-5..6e-5 / 20 hot of
+                                        // 1.44M. A single mean bound is the
+                                        // WRONG shape here — the mean is
+                                        // dominated by those few hot pixels
+                                        // (20 channels off by ~1.0 against a
+                                        // 1.44M-channel sum IS 5e-5), so it
+                                        // scales with how much grazing geometry
+                                        // a scene has and a first-draft 1e-4
+                                        // limit sat only 1.6x above San Miguel.
+                                        // Hence the count carries the localized
+                                        // half at the suite's own 0.05%
+                                        // two-intersector allowance (35x
+                                        // headroom), and the mean is a loose
+                                        // backstop for bias alone (16x).
+                                        let cmp_ch = 3 * (px - holes - dupes);
+                                        let hot_lim =
+                                            if cross { cmp_ch * 5 / 10_000 } else { 0 };
+                                        let mean_lim = if cross { 1e-3 } else { 0.0 };
+                                        if hot > hot_lim {
+                                            eprintln!(
+                                                "check-gpu: FAIL two-device d{depth} r{r} localized divergence: {hot} hot channels > {hot_lim} ({} pairing)",
+                                                if cross { "cross-vendor allowance 0.05%" } else { "same-vendor, which must be bit-exact" }
+                                            );
+                                            ok = false;
+                                        }
+                                        if rel > mean_lim {
+                                            eprintln!(
+                                                "check-gpu: FAIL two-device d{depth} r{r} systematic divergence: mean rel {rel:.3e} > {mean_lim:.0e} ({} pairing)",
+                                                if cross { "cross-vendor" } else { "same-vendor, which must be bit-exact" }
+                                            );
+                                            ok = false;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        tg.set_split(gpu::trace::TileSplit::ALL);
+                        tg.invalidate_replay();
+                    }
+                    Ok(_) => eprintln!(
+                        "check-gpu: (skip) dual-gpu two-device — depth_full {full} leaves no internal tile to own"
+                    ),
+                }
+            }
+        }
     }
 
     // --- Multi-sampling (--spp), GPU half ----------------------------------

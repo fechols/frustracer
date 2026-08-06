@@ -17,6 +17,27 @@
 void cs_compose(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     uint pi = flat_group(gid) * 256u + gtid.x;
     if (pi >= rw * rh) return;
+    // --dual-gpu: this is the tracer's one per-PIXEL pass, and so the one that
+    // does not band itself — every other terminal write is queue-driven. Both
+    // stores below are unconditional, so without this test a split device
+    // recomputes the partner's rows from a `partial`/`ambw`/`hbuf` it never
+    // wrote (uninitialized VRAM at worst).
+    //
+    // BE PRECISE ABOUT WHY THIS IS HERE, because it is NOT a live corruption
+    // fix and a future reader will otherwise mis-rank it. In the shipping
+    // design the damage is MASKED: the cross-adapter copy lands the secondary's
+    // rows after compose, overwriting exactly the region compose damaged. Two
+    // real reasons remain:
+    //   - COST. compose is ~0.19 ms at 1080p; unbanded, two devices each pay
+    //     the whole screen to produce one. That is material against a feature
+    //     whose entire transfer budget is a few tenths of a millisecond.
+    //   - INVARIANT. It makes "exactly one device writes each pixel" true of
+    //     accum as well as of the terminal queues, so correctness stops
+    //     depending on the copy happening to be ordered after compose.
+    //
+    // The `!= 0u` short-circuit keeps every single-GPU session on the
+    // pre-feature instruction stream (level_finish's own idiom).
+    if (SPLIT_DEPTH != 0u && !split_owns_px(uint2(pi % rw, pi / rw))) return;
     uint i3 = pi * 3u;
     float3 c = float3(partial[i3], partial[i3 + 1u], partial[i3 + 2u]);
     if (fb_mode != 0u) {

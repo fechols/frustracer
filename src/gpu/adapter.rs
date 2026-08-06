@@ -10,8 +10,10 @@ const VENDOR_NVIDIA: u32 = 0x10DE;
 const VENDOR_AMD: u32 = 0x1002;
 const VENDOR_INTEL: u32 = 0x8086;
 
-/// The vendor of the adapter we actually PICKED — the input to every
-/// vendor-aware default (`main::vendor_defaults`, `trace::leaf_group`).
+/// The vendor of the adapter we actually PICKED — the input to the session's
+/// vendor-aware policy (`main::vendor_defaults`, the `--spin` warm-up count).
+/// It named `trace::leaf_group` until 2026-08-01; that constant lost its
+/// vendor arm and is now a plain const + `FR_LGROUP` lever.
 ///
 /// Deliberately not the same type as `Prefer`: a preference is what the user
 /// asked for and may not be honored (a box without that vendor falls back to
@@ -187,6 +189,19 @@ fn adapter_of_device<T: Interface>(
     let factory: IDXGIFactory4 = create_factory(false).ok()?.cast().ok()?;
     let luid = unsafe { device.GetAdapterLuid() };
     unsafe { factory.EnumAdapterByLuid(luid) }.ok()
+}
+
+/// The packed LUID of the adapter THIS device was created on — the same
+/// encoding `AdapterPick::luid` carries, so the two compare directly.
+///
+/// How a secondary search excludes the primary. Comparing `IDXGIAdapter4`
+/// pointers would not work: DXGI may hand back distinct interface pointers for
+/// one physical adapter, so identity has to come from the LUID.
+pub fn luid_of_device(
+    device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+) -> u64 {
+    let l = unsafe { device.GetAdapterLuid() };
+    ((l.HighPart as u32 as u64) << 32) | l.LowPart as u64
 }
 
 /// The vendor of the adapter THIS device was created on.

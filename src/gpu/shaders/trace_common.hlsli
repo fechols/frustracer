@@ -221,6 +221,38 @@ bool split_owns(uint path) {
     return ((word >> (path & 31u)) & 1u) != 0u;
 }
 
+// Is the level-`split.z` tile CONTAINING pixel `p` ours? The pixel->path
+// mirror of `split_owns`, for passes that dispatch per PIXEL and so never hold
+// a quadtree path.
+//
+// `cs_compose` is the one consumer: a flat per-pixel dispatch that STORES into
+// accum, where the terminal fills are queue-driven and band themselves for
+// free. See its call site for why that banding is a cost-and-invariant measure
+// rather than a live-corruption fix (the cross-adapter copy overwrites the
+// region an unbanded compose would damage).
+//
+// The recursion is `level_finish`'s midpoint split VERBATIM (xm = x0 +
+// (x1-x0)/2, TL=0 TR=1 BL=2 BR=3, path = (path<<2) | code), so ownership
+// cannot drift from the rect derivation the tiles actually descend through.
+// Degenerate rects need no special case: at extent 1 the midpoint equals the
+// low edge, so every pixel takes the child that is the whole rect and the
+// empty sibling is unreachable — which is exactly what `level_finish` does.
+bool split_owns_px(uint2 p) {
+    uint2 q0 = uint2(0u, 0u);
+    uint2 q1 = uint2(rw, rh);
+    uint path = 0u;
+    for (uint d = 0u; d < SPLIT_DEPTH; ++d) {
+        uint xm = q0.x + (q1.x - q0.x) / 2u;
+        uint ym = q0.y + (q1.y - q0.y) / 2u;
+        uint cx = (p.x >= xm) ? 1u : 0u;
+        uint cy = (p.y >= ym) ? 1u : 0u;
+        path = (path << 2) | (cy * 2u + cx);
+        q0 = uint2((cx != 0u) ? xm : q0.x, (cy != 0u) ? ym : q0.y);
+        q1 = uint2((cx != 0u) ? q1.x : xm, (cy != 0u) ? q1.y : ym);
+    }
+    return split_owns(path);
+}
+
 // Hardware triangles surface a relief candidate at its BASE-PLANE t, while
 // candidate_reject/height_march decides at the displaced t. A finite
 // +/-height_max widening is therefore unsound at grazing incidence: the

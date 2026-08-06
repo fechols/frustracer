@@ -1197,6 +1197,23 @@ impl HeadlessGpu {
     pub fn new(debug: bool, prefer: adapter::Prefer) -> Result<Self> {
         let factory = adapter::create_factory(debug).map_err(|e| format!("factory: {e}"))?;
         let pick = adapter::pick(&factory, prefer)?;
+        Self::from_pick(&pick, debug)
+    }
+
+    /// Open a harness on an ALREADY-CHOSEN adapter.
+    ///
+    /// The `--dual-gpu` entry point, and the reason it exists rather than a
+    /// second `Prefer`: `adapter::pick` can only ever land on one adapter, and
+    /// it RECORDS `PICKED` (the session-vendor global). Calling it twice would
+    /// leave the process claiming the secondary's vendor as the session's,
+    /// silently retuning `main::vendor_defaults` and the `--spin` warm-up
+    /// against the wrong device. `adapter::enumerate` + this constructor is the
+    /// pair that opens a second device without touching that global — which is
+    /// exactly why `enumerate` deliberately does not record it either.
+    ///
+    /// Everything below is already adapter-parameterized, so `new` is now just
+    /// `pick` + this.
+    pub fn from_pick(pick: &adapter::AdapterPick, debug: bool) -> Result<Self> {
         let device = d3d12::create_device(&pick.adapter, debug)?;
         let queue = d3d12::create_queue(&device)?;
         let alloc: ID3D12CommandAllocator =
@@ -1218,7 +1235,7 @@ impl HeadlessGpu {
             fence,
             event,
             next: 1,
-            adapter_name: pick.name,
+            adapter_name: pick.name.clone(),
             vendor: pick.vendor,
         })
     }
@@ -4634,6 +4651,48 @@ impl TileSplit {
         TileSplit { mask: !self.mask & all, depth: self.depth }
     }
 
+    /// Does this assignment own the level-`depth` tile CONTAINING pixel
+    /// `(x, y)` of an `rw x rh` screen?
+    ///
+    /// The twin of `trace_common.hlsli`'s `split_owns_px`, written as the same
+    /// forward midpoint recursion so the two cannot drift. Two consumers: the
+    /// shader side bands `cs_compose` (the one per-pixel pass in the tracer),
+    /// and the CPU side derives the cross-adapter transfer's row ranges from it.
+    ///
+    /// `depth == 0` is the unsplit whole screen and answers true without
+    /// touching the mask, matching the branch every other consumer takes.
+    pub fn owns_px(&self, x: u32, y: u32, rw: u32, rh: u32) -> bool {
+        if self.depth == 0 {
+            return true;
+        }
+        let (mut x0, mut y0, mut x1, mut y1) = (0u32, 0u32, rw, rh);
+        let mut path = 0u32;
+        for _ in 0..self.depth {
+            let xm = x0 + (x1 - x0) / 2;
+            let ym = y0 + (y1 - y0) / 2;
+            let cx = u32::from(x >= xm);
+            let cy = u32::from(y >= ym);
+            path = (path << 2) | (cy * 2 + cx);
+            if cx == 1 {
+                x0 = xm;
+            } else {
+                x1 = xm;
+            }
+            if cy == 1 {
+                y0 = ym;
+            } else {
+                y1 = ym;
+            }
+        }
+        // The shader's conservative arm, mirrored: an out-of-range path renders
+        // a tile twice rather than dropping it. Unreachable at
+        // `depth <= MAX_SPLIT_DEPTH`, kept so the twins stay textually equal.
+        if path >= 64 {
+            return true;
+        }
+        (self.mask >> path) & 1 != 0
+    }
+
     /// The CB row: xy = the mask, z = depth, w unused.
     fn cb_row(&self) -> [u32; 4] {
         [self.mask as u32, (self.mask >> 32) as u32, self.depth, 0]
@@ -4769,6 +4828,57 @@ pub fn split_self_test() -> std::result::Result<(), String> {
                     ));
                 }
             }
+        }
+
+        // OWNS_PX: the FORWARD pixel->path recursion against the BACKWARD
+        // path->rect one — the same two-independent-derivations check the
+        // seam test above applies to `rows`.
+        //
+        // It matters because `cs_compose` is a flat per-pixel dispatch that
+        // bands itself with the shader twin of `owns_px`, while the tiles
+        // themselves descend through the rect recursion. A drift between the
+        // two blanks or double-writes a band on fb frames only — and no image
+        // gate can see it, since fb-off frames never dispatch compose at all.
+        for &(rw, rh) in &[(1920u32, 1080u32), (533, 400)] {
+            // A deliberately MIXED assignment (every other tile): a uniform
+            // mask would pass a recursion that always answered the same way.
+            let s = TileSplit { mask: 0x5555_5555_5555_5555u64 & all_bits, depth };
+            for path in 0..n {
+                let (x0, y0, x1, y1) = rect_for_path(depth, path, rw, rh);
+                if x0 >= x1 || y0 >= y1 {
+                    continue; // degenerate at this resolution — owns no pixels
+                }
+                let want = (s.mask >> path) & 1 == 1;
+                for &(px, py) in &[
+                    (x0, y0),
+                    (x1 - 1, y0),
+                    (x0, y1 - 1),
+                    (x1 - 1, y1 - 1),
+                    (x0 + (x1 - x0) / 2, y0 + (y1 - y0) / 2),
+                ] {
+                    let got = s.owns_px(px, py, rw, rh);
+                    if got != want {
+                        return Err(format!(
+                            "depth {depth} at {rw}x{rh}: owns_px({px},{py}) = {got}, but that \
+                             pixel lies in tile path {path}, whose mask bit is {want}. The \
+                             pixel->path recursion and the path->rect one have drifted — \
+                             cs_compose would band on a different grid than the tiles do."
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // The unsplit default must answer true everywhere without consulting the
+    // mask: that is the branch `cs_compose` short-circuits on, and if it ever
+    // returned false a single-GPU fb frame would come back black.
+    for &(x, y) in &[(0u32, 0u32), (1919, 1079), (960, 540)] {
+        if !TileSplit::ALL.owns_px(x, y, 1920, 1080) {
+            return Err(format!(
+                "TileSplit::ALL must own every pixel; ({x},{y}) came back unowned — an \
+                 unsplit fb frame would compose nothing there"
+            ));
         }
     }
 
