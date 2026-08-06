@@ -652,6 +652,37 @@ mod device {
         steady: bool,
     }
 
+    /// Detach the C callback BEFORE the stream field drops. The sdl3 crate's
+    /// own `Drop for AudioStreamWithCallback` frees the boxed `SdlMixer` in its
+    /// body and only THEN drops `base_stream` — i.e. it calls
+    /// `SDL_DestroyAudioStream`, the call that actually stops the device thread
+    /// and joins any in-flight callback, one statement too late (Rust runs a
+    /// Drop body before the struct's fields). That window is exactly one
+    /// callback wide, and a device thread that walks into it reads a freed
+    /// `LoopBuf::samples` — multi-MB, so the allocator returns it to the OS and
+    /// the read FAULTS rather than glitching once (observed at shutdown as an
+    /// access violation inside `MixCore::render`, reported by src/crash.rs).
+    /// `SDL_SetAudioStreamGetCallback` takes the stream's own lock, so it
+    /// blocks behind an in-flight callback and, once it returns, nothing can
+    /// reach the box again — after which the crate's drop order is harmless.
+    impl Drop for AudioSys {
+        fn drop(&mut self) {
+            let s = self._stream.stream();
+            if !s.is_null() {
+                // SAFETY: `s` is this stream, still alive (we are ahead of its
+                // own drop); a None callback with a null userdata is the
+                // documented detach, and SDL states the call is thread-safe.
+                unsafe {
+                    sdl3::sys::audio::SDL_SetAudioStreamGetCallback(
+                        s,
+                        None,
+                        std::ptr::null_mut(),
+                    );
+                }
+            }
+        }
+    }
+
     impl AudioSys {
         /// Build the whole pipeline. Every failure is one loud line + None —
         /// a session without audio is a session, never an error.
