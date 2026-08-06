@@ -4693,6 +4693,85 @@ impl TileSplit {
         (self.mask >> path) & 1 != 0
     }
 
+    /// The CONTIGUOUS pixel row range `[y0, y1)` this assignment owns, or
+    /// `None` if it is not a whole-tile-row band.
+    ///
+    /// This is what makes the cross-adapter transfer one `CopyBufferRegion`
+    /// per buffer instead of a scatter: every per-pixel plane is indexed
+    /// `y*rw + x`, so a row band is a contiguous BYTE range at
+    /// `y0*rw*stride` for `(y1-y0)*rw*stride` bytes. `TileSplit::rows` is
+    /// built to satisfy this; an interleaved mask deliberately answers `None`
+    /// so a caller cannot silently copy the wrong bytes for one.
+    ///
+    /// Returns `None` rather than a bounding box on purpose — a bounding box
+    /// would be a plausible-looking answer that copies pixels the partner
+    /// owns, which is exactly the overlap the whole design forbids.
+    pub fn row_range(&self, rw: u32, rh: u32) -> Option<(u32, u32)> {
+        if self.depth == 0 {
+            return Some((0, rh));
+        }
+        let side = 1u32 << self.depth;
+        // Per grid row: how many of its tiles are owned. A band must own all
+        // of them or none — a partially-owned row is not a row band.
+        let mut owned = [0u32; 8];
+        debug_assert!(side as usize <= owned.len());
+        for path in 0..Self::tiles_at(self.depth) {
+            if (self.mask >> path) & 1 == 0 {
+                continue;
+            }
+            // The tile's grid row: the interleaved "bottom" bit of each
+            // level's 2-bit code, most significant level first — the same
+            // extraction `rows()` builds the mask from.
+            let mut row = 0u32;
+            for lvl in 0..self.depth {
+                let shift = 2 * (self.depth - 1 - lvl);
+                row = (row << 1) | ((path >> (shift + 1)) & 1);
+            }
+            owned[row as usize] += 1;
+        }
+        let mut first = None;
+        let mut last = 0u32;
+        for r in 0..side {
+            match owned[r as usize] {
+                0 => {
+                    // A gap AFTER the band started means two disjoint bands.
+                    if first.is_some() && r <= last {
+                        return None;
+                    }
+                }
+                n if n == side => {
+                    if first.is_none() {
+                        first = Some(r);
+                    } else if r != last + 1 {
+                        return None; // non-contiguous
+                    }
+                    last = r;
+                }
+                _ => return None, // partially-owned row
+            }
+        }
+        let first = first?;
+        // Every tile in a grid row shares that row's y extent (the y half of
+        // the midpoint recursion depends only on the row bits), so any tile of
+        // the row gives the band's edges.
+        let top = Self::first_path_of_row(self.depth, first);
+        let bot = Self::first_path_of_row(self.depth, last);
+        let (_, y0, _, _) = rect_for_path(self.depth, top, rw, rh);
+        let (_, _, _, y1) = rect_for_path(self.depth, bot, rw, rh);
+        Some((y0, y1))
+    }
+
+    /// The lowest path index whose grid row is `row` — the inverse of the row
+    /// extraction above, taking every x bit as 0.
+    fn first_path_of_row(depth: u32, row: u32) -> u32 {
+        let mut path = 0u32;
+        for lvl in 0..depth {
+            let bit = (row >> (depth - 1 - lvl)) & 1;
+            path = (path << 2) | (bit << 1);
+        }
+        path
+    }
+
     /// The CB row: xy = the mask, z = depth, w unused.
     fn cb_row(&self) -> [u32; 4] {
         [self.mask as u32, (self.mask >> 32) as u32, self.depth, 0]
@@ -4868,6 +4947,60 @@ pub fn split_self_test() -> std::result::Result<(), String> {
                 }
             }
         }
+    }
+
+    // ROW_RANGE: the transfer's byte range. Two bands' pixel rows must
+    // partition [0, rh) exactly and meet at the same seam the tile rects do —
+    // an off-by-one here copies a row twice or leaves one stale, which is the
+    // hole/overlap class again, one level down in the stack.
+    for depth in 1..=MAX_SPLIT_DEPTH {
+        let side = 1u32 << depth;
+        for &(rw, rh) in &[(1920u32, 1080u32), (533, 400)] {
+            for r in 1..side {
+                let a = TileSplit::rows(depth, 0, r);
+                let b = a.complement();
+                let (ay0, ay1) = a.row_range(rw, rh).ok_or_else(|| {
+                    format!("depth {depth} row {r} at {rw}x{rh}: rows() produced a mask row_range calls non-contiguous")
+                })?;
+                let (by0, by1) = b.row_range(rw, rh).ok_or_else(|| {
+                    format!("depth {depth} row {r} at {rw}x{rh}: the complement of a row band must also be one")
+                })?;
+                if ay0 != 0 || by1 != rh || ay1 != by0 {
+                    return Err(format!(
+                        "depth {depth} row {r} at {rw}x{rh}: bands [{ay0},{ay1}) and [{by0},{by1}) \
+                         do not partition [0,{rh}) — the transfer would copy a row twice or leave \
+                         one stale"
+                    ));
+                }
+                // And the seam must be where the TILES say it is, not merely
+                // self-consistent: row_range and rect_for_path are again two
+                // derivations of one number.
+                let top = TileSplit::first_path_of_row(depth, r);
+                let (_, ty0, _, _) = rect_for_path(depth, top, rw, rh);
+                if ay1 != ty0 {
+                    return Err(format!(
+                        "depth {depth} row {r} at {rw}x{rh}: band seam {ay1} disagrees with the \
+                         tile rect's y0 {ty0}"
+                    ));
+                }
+            }
+        }
+    }
+
+    // An INTERLEAVED mask must refuse rather than answer with a bounding box:
+    // a plausible-looking range there would copy pixels the partner owns.
+    let inter = TileSplit { mask: 0b0101, depth: 1 };
+    if inter.row_range(1920, 1080).is_some() {
+        return Err(
+            "an interleaved (non-row-band) mask must return None from row_range — a bounding \
+             box would silently copy the partner's pixels"
+                .into(),
+        );
+    }
+    // A partially-owned row must refuse for the same reason.
+    let partial = TileSplit { mask: 0b0001, depth: 1 };
+    if partial.row_range(1920, 1080).is_some() {
+        return Err("a partially-owned tile row must return None from row_range".into());
     }
 
     // The unsplit default must answer true everywhere without consulting the

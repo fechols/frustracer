@@ -5090,7 +5090,11 @@ fn run_check_gpu(
                 let full = gpu::trace::depth_full(gw as u32, gh as u32);
                 let max_d = gpu::trace::MAX_SPLIT_DEPTH.min(full.saturating_sub(1)).min(2);
                 let build = (|| -> Result<
-                    (gpu::trace::HeadlessGpu, gpu::trace::TraceGpu),
+                    (
+                        gpu::trace::HeadlessGpu,
+                        gpu::trace::TraceGpu,
+                        gpu::dual::BandTransfer,
+                    ),
                     String,
                 > {
                     let mut h2 = gpu::trace::HeadlessGpu::from_pick(&p, opts.gpu_debug)?;
@@ -5112,14 +5116,23 @@ fn run_check_gpu(
                         opts.gpu_debug,
                         &mut h2,
                     )?;
-                    Ok((h2, t2))
+                    // Staging is sized from the FULL screen, not the band the
+                    // gate happens to use: that is the contract the shipping
+                    // balancer needs (a rebalance must not reallocate), so the
+                    // gate holds itself to it too.
+                    let xf = gpu::dual::BandTransfer::new(
+                        &d2,
+                        &hg.device,
+                        gpu::dual::payload_bytes(&[12], gw as u32, gh as u32),
+                    )?;
+                    Ok((h2, t2, xf))
                 })();
                 match build {
                     Err(e) => eprintln!(
                         "check-gpu: (skip) dual-gpu second device \"{}\" — cannot host a tracer: {e}",
                         p.name
                     ),
-                    Ok((mut hg2, tg2)) if max_d >= 1 => {
+                    Ok((mut hg2, tg2, xf)) if max_d >= 1 => {
                         let cross = hg2.vendor != hg.vendor;
                         eprintln!(
                             "check-gpu: dual-gpu two-device gate: A \"{}\" | B \"{}\" ({})",
@@ -5218,9 +5231,104 @@ fn run_check_gpu(
                                             }
                                         }
                                         let rel = if sum_r > 0.0 { sum_d / sum_r } else { 0.0 };
+
+                                        // THE END-TO-END PROOF: stop composing
+                                        // the union on the CPU and actually
+                                        // move B's band across PCIe into A's
+                                        // accum, then compare the MERGED plane
+                                        // — every pixel, not just the owned
+                                        // ones.
+                                        //
+                                        // TEETH, measured: shifting the
+                                        // destination by ONE ROW takes this
+                                        // from 9.4e-7 to 4.3e-2 (46,000x, and
+                                        // 43x over the limit) while the
+                                        // CPU-composed column above stays at
+                                        // 9.40e-7 — unmoved. The composed
+                                        // check is structurally blind to a
+                                        // transfer defect, which is the whole
+                                        // reason this one exists.
+                                        //
+                                        // Known limit, the same stale-correct
+                                        // effect documented at cs_compose: a
+                                        // transfer that does NOTHING is not
+                                        // caught here, because A's accum
+                                        // outside its band still holds the
+                                        // full-screen reference this loop
+                                        // rendered into it. This gate is
+                                        // sensitive to a MISPLACED copy, not
+                                        // to an absent one.
+                                        let xfer = (|| -> Result<f64, String> {
+                                            let (by0, by1) = a
+                                                .complement()
+                                                .row_range(gw as u32, gh as u32)
+                                                .ok_or("complement is not a row band")?;
+                                            let pl2 = [gpu::dual::Plane {
+                                                res: &tg2.accum,
+                                                stride: 12,
+                                            }];
+                                            let pl1 = [gpu::dual::Plane {
+                                                res: &tg.accum,
+                                                stride: 12,
+                                            }];
+                                            hg2.run(|l| {
+                                                let _ = xf.record_out(
+                                                    l,
+                                                    &pl2,
+                                                    gw as u32,
+                                                    by0,
+                                                    by1,
+                                                );
+                                            })?;
+                                            xf.hop(gpu::dual::payload_bytes(
+                                                &[12],
+                                                gw as u32,
+                                                by1 - by0,
+                                            ))?;
+                                            hg.run(|l| {
+                                                let _ = xf.record_in(
+                                                    l,
+                                                    &pl1,
+                                                    gw as u32,
+                                                    by0,
+                                                    by1,
+                                                );
+                                            })?;
+                                            let m = hg.read_buffer(&tg.accum, ua, px * 3 * 4)?;
+                                            let merged: Vec<f32> = m
+                                                .chunks_exact(4)
+                                                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                                                .collect();
+                                            let (mut sd, mut sr) = (0f64, 0f64);
+                                            for i in 0..px * 3 {
+                                                sd += (merged[i] - ref_acc[i]).abs() as f64;
+                                                sr += ref_acc[i].abs() as f64;
+                                            }
+                                            Ok(if sr > 0.0 { sd / sr } else { 0.0 })
+                                        })();
+                                        let xrel = match xfer {
+                                            Ok(v) => v,
+                                            Err(e) => {
+                                                eprintln!("check-gpu: FAIL two-device d{depth} r{r} transfer: {e}");
+                                                ok = false;
+                                                f64::NAN
+                                            }
+                                        };
                                         eprintln!(
-                                            "check-gpu:   d{depth} r{r}: holes {holes} dupes {dupes} | B owned {n_b} px | union-vs-unsplit mean rel {rel:.2e} hot {hot}"
+                                            "check-gpu:   d{depth} r{r}: holes {holes} dupes {dupes} | B owned {n_b} px | union-vs-unsplit mean rel {rel:.2e} hot {hot} | TRANSFERRED merged mean rel {xrel:.2e}"
                                         );
+                                        // The merged plane is the real
+                                        // deliverable, so it is held to the
+                                        // same bound as the CPU-composed union
+                                        // — a transfer that dropped or shifted
+                                        // rows would blow it by orders.
+                                        let xlim = if cross { 1e-3 } else { 0.0 };
+                                        if !(xrel <= xlim) {
+                                            eprintln!(
+                                                "check-gpu: FAIL two-device d{depth} r{r} TRANSFERRED image diverged: mean rel {xrel:.3e} > {xlim:.0e}"
+                                            );
+                                            ok = false;
+                                        }
                                         // STRUCTURE is exact on every pairing:
                                         // which device owns a pixel is integer
                                         // arithmetic on both, not floating point.
@@ -12321,6 +12429,22 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
     };
 
+    // The transfer's byte addressing: complementary bands must tile every
+    // plane's byte range exactly, and the staging layout must be a partition.
+    // Pure and lever-independent (the blas-split rule). This is the level
+    // below the split gate — a wrong offset here renders a plausible image
+    // with one displaced stripe, which is far harder to attribute than a hole.
+    let dual_ok = match gpu::dual::self_test() {
+        Ok(()) => {
+            eprintln!("dual-gpu transfer self-test: OK");
+            true
+        }
+        Err(e) => {
+            eprintln!("dual-gpu transfer self-test: FAIL — {e}");
+            false
+        }
+    };
+
     // Shading-class taxonomy (--dxr-sbt): membership/strip soundness on a
     // synthetic all-classes set, all-8 anti-vacuity, determinism, and
     // defines-derive-from-the-table. Pure and lever-independent — the
@@ -14838,6 +14962,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         ("ftree", ftree_ok),
         ("blas-split", blas_ok),
         ("dual-gpu-split", split_ok),
+        ("dual-gpu-transfer", dual_ok),
         ("shadeclass", shadeclass_ok),
         ("foliage", foliage_ok),
         ("sway-mv", sway_mv_ok),

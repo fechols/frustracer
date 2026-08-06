@@ -12,6 +12,7 @@ pub mod d3d12;
 /// What the monitor under the window can actually display (HDR on/off, peak
 /// luminance) — re-probed on every move, not a startup fact.
 pub mod display;
+pub mod dual;
 pub mod dxc;
 pub mod dxr;
 pub mod ffx;
