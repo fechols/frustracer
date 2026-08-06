@@ -459,13 +459,22 @@ pub struct Opts {
     /// the parse only NOTES the clamp, so this field carries the raw request.
     pub fireflies_count: u32,
     /// `--emissive-lights [N]` ARMS the direct-tier NEE for emissive
-    /// surfaces (src/emissive.rs) — DEFAULT OFF, the heightfield shape;
-    /// `--no-emissive-lights` spells the default (later flags win).
+    /// surfaces (src/emissive.rs) — DEFAULT OFF, the heightfield arming
+    /// shape (the user's call, third round 2026-08-06: with EL_BOOST the
+    /// look earns it, but only the bistro island carries emissive maps and
+    /// the CPU cost is per-session); `--no-emissive-lights` spells the
+    /// default (later flags win). The default is DUPLICATED in emissive.rs's
+    /// ENABLED initializer — flip in lockstep.
     pub emissive_lights: bool,
     /// The `--emissive-lights` budget (bare flag keeps the default).
     /// `emissive::set_budget` owns the clamp to MAX_EMISSIVE_LIGHTS; the
     /// parse only NOTES it (the fireflies shape).
     pub emissive_lights_count: u32,
+    /// `--el-cluster grid|som` — the emitter-placement A/B lever (the
+    /// `--bvh-builder` bake-off shape). Validated in main's lever block
+    /// (illegal value exits 2 there — the parse stays pure); grid is the
+    /// shipped clusterer, bit-identical.
+    pub el_cluster: String,
     /// `--dxr-inline 0|1|2` (`gpu::dxr::set_inline_mode`).
     pub dxr_inline: u32,
     /// Did the user pick a `--dxr-inline` mode at all (flag or settings
@@ -708,6 +717,7 @@ pub fn defaults() -> Opts {
         fireflies_count: fireflies::DEFAULT_COUNT,
         emissive_lights: false,
         emissive_lights_count: emissive::EL_DEFAULT,
+        el_cluster: "grid".to_string(),
         dxr_inline: 1,
         dxr_inline_explicit: false,
         waveviz: 0,
@@ -1073,8 +1083,10 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
                 opts.fireflies_count = n;
             }
             // Emissive cluster lights — DEFAULT OFF (the heightfield arming
-            // shape; the CPU shadow-ray cost is real and the physical
-            // calibration's pools are faint, see emissive.rs's header).
+            // shape; the user's call, third round 2026-08-06: EL_BOOST fixed
+            // the faint pools, but the CPU shadow-ray cost is real and only
+            // the bistro island carries emissive maps — see emissive.rs's
+            // header).
             // Optional value, the --blas-split idiom: the next token is
             // consumed only when it is all digits, so `--emissive-lights
             // model.obj` leaves the scene path alone — but a numeric token
@@ -1103,6 +1115,16 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
                     }
                     opts.emissive_lights_count = n;
                 }
+            }
+            // Emitter-placement A/B lever (the --bvh-builder bake-off shape):
+            // required value, last-wins by plain store; the VOCABULARY is
+            // validated in main's lever block via emissive::set_cluster_mode
+            // (illegal exits 2 there), which keeps the parse pure.
+            "--el-cluster" => {
+                opts.el_cluster = args.next().unwrap_or_else(|| {
+                    eprintln!("--el-cluster needs one of: grid | som");
+                    std::process::exit(2);
+                });
             }
             // Same "knob before scene load" pattern: the GPU reads it for the
             // static sampler's MaxAnisotropy, the CPU for Cone::aniso. 1 = off
@@ -1883,12 +1905,15 @@ pub fn usage() {
                 eprintln!("                fireflies and is bit-identical structurally)");
                 eprintln!("  --fireflies N   firefly count (default {}, max {})", fireflies::DEFAULT_COUNT, fireflies::MAX_FIREFLIES);
                 eprintln!("  --emissive-lights [N]  ARM emissive surfaces lighting the scene (OFF by default —");
-                eprintln!("                the CPU shadow-ray cost is real; measured bistro +5.5 ms at N=32):");
+                eprintln!("                the CPU shadow-ray cost is real, measured bistro +5.5 ms at N=32, and");
+                eprintln!("                only emissive-mapped scenes like bistro benefit):");
                 eprintln!("                Ke/map_Ke/glTF-emissive triangles cluster into <= {} virtual disc", emissive::MAX_EMISSIVE_LIGHTS);
                 eprintln!("                lights sampled in the direct tier — windowed falloff, one hard shadow");
-                eprintln!("                ray each, zero rng; bare flag = budget {}, N overrides; GI (H) frames", emissive::EL_DEFAULT);
-                eprintln!("                keep the exact gather instead and skip the clusters");
+                eprintln!("                ray each, zero rng, x{} artistic boost; bare flag = budget {}, N", emissive::EL_BOOST, emissive::EL_DEFAULT);
+                eprintln!("                overrides; GI (H) frames keep the exact gather and skip the clusters");
                 eprintln!("  --no-emissive-lights  the default, spelled explicitly (later flags win)");
+                eprintln!("  --el-cluster M  emitter clustering: grid (default, the shipped clusterer) | som");
+                eprintln!("                (deterministic batch-SOM/weighted-Lloyd placement refinement — A/B lever)");
                 eprintln!("  --no-foliage-sway  disable wind-swayed foliage (ON by default: alpha-cutout leaves");
                 eprintln!("                bucket into per-cell chunks translated on the cloud clock — ALL render");
                 eprintln!("                modes (CPU/GPU/DXR; swept leaf AABBs keep every claim sound); a scene");
@@ -1982,7 +2007,7 @@ fn lever_snapshot() -> String {
         "mips={} aniso={} h2n={} n2h={} smips={} tint={} spray={} depth={} detail={} dao={} \
          dstr={} daostr={} duntex={} \
          ambb={} water={} ccull={} harm={} hon={} bloom={} clouds={} ff={} ffn={} el={} eln={} \
-         cshadow={} skylod={} dxrinline={} dxrsbt={} fsway={} famp={}",
+         elcluster={} cshadow={} skylod={} dxrinline={} dxrsbt={} fsway={} famp={}",
         texture::mips_enabled(),
         texture::max_aniso(),
         texture::h2n_enabled(),
@@ -2007,6 +2032,7 @@ fn lever_snapshot() -> String {
         fireflies::count(),
         emissive::enabled(),
         emissive::budget(),
+        emissive::cluster_mode_name(),
         gpu::trace::cloud_shadow_n(),
         gpu::trace::sky_lod(),
         gpu::dxr::dxr_inline_mode(),
@@ -2068,6 +2094,8 @@ pub fn self_test() -> Result<(), String> {
         "--no-emissive-lights",
         "--emissive-lights",
         "9",
+        "--el-cluster",
+        "som",
         "--dxr-inline",
         "2",
         "--dxr-sbt",
@@ -2116,6 +2144,9 @@ pub fn self_test() -> Result<(), String> {
         // wins over the earlier --no-emissive-lights in the argv above).
         ("emissive_lights", o.emissive_lights),
         ("emissive_lights_count", o.emissive_lights_count == 9),
+        // A field, not a process global — lever_snapshot's elcluster entry
+        // additionally proves the parse never called set_cluster_mode.
+        ("el_cluster", o.el_cluster == "som"),
         ("dxr_inline", o.dxr_inline == 2),
         ("dxr_inline_explicit", o.dxr_inline_explicit),
         // A field, not a process global — the purity gate's lever_snapshot
@@ -2138,6 +2169,12 @@ pub fn self_test() -> Result<(), String> {
     }
     if parse_argv(&["--heightfield", "--no-heightfield"]).opts.heightfield {
         return Err("--heightfield --no-heightfield must disarm".into());
+    }
+    if !parse_argv(&["--no-emissive-lights", "--emissive-lights"]).opts.emissive_lights {
+        return Err("--no-emissive-lights --emissive-lights must re-arm (later flags win)".into());
+    }
+    if parse_argv(&["--emissive-lights", "--no-emissive-lights"]).opts.emissive_lights {
+        return Err("--emissive-lights --no-emissive-lights must disarm".into());
     }
     if parse_argv(&["--no-aniso", "--aniso", "8"]).opts.aniso != 8 {
         return Err("--no-aniso --aniso 8 must land on 8".into());

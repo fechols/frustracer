@@ -451,11 +451,23 @@ fn main() {
     fireflies::set_enabled(opts.fireflies);
     // set_count is what CLAMPS to the CB row cap; the parse only noted it.
     fireflies::set_count(opts.fireflies_count);
-    // Emissive cluster lights (src/emissive.rs) — the budget MUST land
-    // before any scene load: finalize_scalars derives the clusters through
-    // it (restart-tier); the enable is live (consumers read it per frame).
+    // Emissive cluster lights (src/emissive.rs) — the budget and cluster
+    // mode MUST land before any scene load: finalize_scalars derives the
+    // clusters through them (restart-tier); the enable is live (consumers
+    // read it per frame). DEFAULT OFF: arming announces via scene.rs's
+    // `emissive lights:` derivation line, so no lever line here.
     emissive::set_enabled(opts.emissive_lights);
     emissive::set_budget(opts.emissive_lights_count);
+    match emissive::set_cluster_mode(&opts.el_cluster) {
+        None => {
+            eprintln!("--el-cluster: unknown mode '{}' (grid | som)", opts.el_cluster);
+            std::process::exit(2);
+        }
+        Some(emissive::ClusterMode::Som) => eprintln!(
+            "emissive: --el-cluster som (batch-SOM emitter placement — A/B vs the shipped grid clusterer)"
+        ),
+        Some(emissive::ClusterMode::Grid) => {}
+    }
     // Leaf sway (src/foliage.rs; the design doc is docs/design/
     // animated-foliage.md). Read at SceneGpu upload — the blas_split timing
     // class. DEFAULT ON: only a departure prints (the lever-line convention);

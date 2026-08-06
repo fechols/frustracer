@@ -1528,10 +1528,11 @@ pub fn finalize_scalars(scene: &mut Scene) {
             })
             .sum();
         eprintln!(
-            "emissive lights: {} clusters (budget {}, total power {:.3}){}",
+            "emissive lights: {} clusters (budget {}, total power {:.3} incl x{} boost){}",
             scene.emissive.count,
             crate::emissive::budget(),
             total,
+            crate::emissive::EL_BOOST,
             if crate::emissive::enabled() { "" } else { " — OFF (arm with --emissive-lights)" }
         );
     }

@@ -6,19 +6,24 @@
 //! CB-row transport with CPU↔GPU parity BY DATA. **Default OFF** — the
 //! heightfield arming shape, not the fireflies': `--emissive-lights [N]`
 //! ARMS the tier (bare = the default budget; N moves it),
-//! `--no-emissive-lights` spells the default. Off by default because the
-//! cost is real on the CPU tracer (measured bistro: +5.5 ms at N=32, of
-//! which ~3.3 ms is the shadow rays themselves — irreducible, they ARE the
-//! feature; the ~2.2 ms per-pixel scan half is RECOVERED by the per-leaf-
-//! tile cull since 2026-08-01 — `cull_tile` below, measured nocull 54.71 →
-//! cull 52.46 ms on the same workload) while the
-//! PHYSICAL calibration's pools are faint before true nightfall; if a
-//! feel-test lands an artistic boost (the MOON_E_OVER_PI precedent) the
-//! default is one constant to revisit. Either way a scene with no emissive
-//! material derives `count = 0` and every consumer's loop body is
-//! unreachable, so the pre-feature renderer is reproduced STRUCTURALLY
-//! (guarded branches, no unconditional `+0.0` — the fireflies /
-//! `apply_tod`-unreachable precedent).
+//! `--no-emissive-lights` spells the default. The old LOOK FINDING (physical
+//! pools faint before true nightfall) is RESOLVED by `EL_BOOST` = 2 at the
+//! C_c fill (2026-08-06, the MOON_E_OVER_PI artistic precedent — user
+//! feel-tested "beautiful"; it also ~doubles `r_infl2` pre-cap, so in-range
+//! scan/ray counts sit above the pre-boost measurements), and the default
+//! stayed OFF anyway on the user's third-round call: the CPU cost is real
+//! (measured bistro PRE-boost: +5.5 ms at N=32, of which ~3.3 ms is the
+//! shadow rays themselves — irreducible, they ARE the feature; the ~2.2 ms
+//! per-pixel scan half is RECOVERED by the per-leaf-tile cull since
+//! 2026-08-01 — `cull_tile` below, measured nocull 54.71 → cull 52.46 ms on
+//! the same workload) and only ONE world island — bistro — carries emissive
+//! maps, so every other session would pay derivation for count 0 and bistro
+//! visitors an always-on ray tax. Emitter PLACEMENT has its own A/B lever,
+//! `--el-cluster grid|som` (`ClusterMode` / `som_refine` below). Either way
+//! a scene with no emissive material derives `count = 0` and every
+//! consumer's loop body is unreachable, so the pre-feature renderer is
+//! reproduced STRUCTURALLY (guarded branches, no unconditional `+0.0` — the
+//! fireflies / `apply_tod`-unreachable precedent).
 //!
 //! # Why this exists (the sun-disc argument, third verse)
 //!
@@ -83,7 +88,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 /// Session enable — `--emissive-lights` ARMS (default OFF, the heightfield
 /// shape; `fireflies::set_enabled` mechanics: live-flippable — consumers
 /// read it per frame, derivation always runs so the menu toggle needs no
-/// restart).
+/// restart). The default is DUPLICATED in `cli::Opts`' constructor — flip
+/// both in lockstep (the heightfield one-field-two-statics hazard: headless
+/// paths that never run main's lever block inherit THIS initializer).
 static ENABLED: AtomicBool = AtomicBool::new(false);
 pub fn set_enabled(on: bool) {
     ENABLED.store(on, Ordering::Relaxed);
@@ -101,6 +108,46 @@ pub fn set_budget(n: u32) {
 }
 pub fn budget() -> u32 {
     BUDGET.load(Ordering::Relaxed)
+}
+
+/// `--el-cluster grid|som` — the emitter-PLACEMENT A/B lever (the
+/// `--bvh-builder` bake-off pattern: a dev experiment lever, no settings
+/// row). `Grid` is the shipped clusterer (grid seed + agglomerative merge —
+/// bit-identical to the pre-lever code, a guarded branch); `Som` refines the
+/// merged centers with `som_refine` below. Restart-tier: set from main's
+/// lever block BEFORE any scene load (`finalize_scalars` derives through
+/// it). Derived-never-serialized (the sky_sh precedent — warm loads
+/// re-derive), so no CACHE_VERSION move and the lever does not key the
+/// .fcache. The judging instrument is the feature's own: a GI (H) still
+/// frame at the same pose is ground truth for cluster placement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClusterMode {
+    Grid,
+    Som,
+}
+static CLUSTER_MODE: AtomicU32 = AtomicU32::new(0);
+pub fn set_cluster_mode(name: &str) -> Option<ClusterMode> {
+    let m = match name {
+        "grid" => ClusterMode::Grid,
+        "som" => ClusterMode::Som,
+        _ => return None,
+    };
+    CLUSTER_MODE.store(m as u32, Ordering::Relaxed);
+    Some(m)
+}
+pub fn cluster_mode() -> ClusterMode {
+    match CLUSTER_MODE.load(Ordering::Relaxed) {
+        1 => ClusterMode::Som,
+        _ => ClusterMode::Grid,
+    }
+}
+/// The lever's spelled name — `cli::lever_snapshot` reads this to prove the
+/// parse never called `set_cluster_mode` (the dxr_sbt precedent).
+pub fn cluster_mode_name() -> &'static str {
+    match cluster_mode() {
+        ClusterMode::Grid => "grid",
+        ClusterMode::Som => "som",
+    }
 }
 
 /// Hard cap — sizes the `FrameCb` emissive rows (raise `CB_STRIDE` in
@@ -133,6 +180,21 @@ pub const EL_RMAX_K: f32 = 0.5;
 /// sun-disc / `FF_GLOW_L_MAX` lesson: the dd plane is f16, and a shading
 /// point inside a bulb must not push ±Inf into the upscaler guides).
 pub const EL_E_MAX: f32 = 1000.0;
+/// Artistic brightness boost applied at the C_c fill (the MOON_E_OVER_PI
+/// precedent — the LOOK FINDING's resolution, 2026-08-06: the PHYSICAL
+/// calibration's pools read as faint before true nightfall). Multiplies the
+/// cluster color AND therefore `r_infl2` (`lum(cp)/EL_MIN_E` doubles — reach
+/// and per-pixel scan cost rise with it; `r_cap2` still bounds the radius).
+/// The GPU needs NO edit: the el_a/el_b CB rows carry the boosted values and
+/// `EL_E_MAX` is absolute and mirrored, so parity holds BY DATA. The
+/// self_test power gates scale by this const — a retune moves them with it.
+pub const EL_BOOST: f32 = 2.0;
+/// Batch epochs for the `--el-cluster som` arm — fixed (never adaptive:
+/// determinism is a count, not a convergence test). Runs unconditionally
+/// under the som mode, even when the seed count already fits the budget —
+/// grid-cell centroids are not Lloyd-stationary, and one code path is the
+/// simpler determinism story.
+pub const EL_SOM_EPOCHS: usize = 8;
 
 /// Rec.709 luminance — the scalar the influence radius, the near-field
 /// clamp, and the merge order key on. Mirrored as a literal float3 in
@@ -302,6 +364,16 @@ fn tri_radiance(
     base * ((tap(uv0) + tap(uv1) + tap(uv2) + tap(uvc)) * 0.25)
 }
 
+/// One emissive triangle's derivation record (centroid, A·L̄ power, AABB) —
+/// filled by `derive_parts`' first pass, consumed by the grid binning and
+/// the som refinement alike.
+struct TriRec {
+    centroid: Vec3A,
+    power: Vec3A,
+    mn: Vec3A,
+    mx: Vec3A,
+}
+
 /// One seed/merged cluster during derivation.
 #[derive(Clone, Copy)]
 struct Cluster {
@@ -342,7 +414,86 @@ pub fn derive(scene: &Scene, budget: u32) -> EmissiveLights {
         scene.content_max,
         scene.eps,
         budget,
+        cluster_mode(),
     )
+}
+
+/// The `--el-cluster som` arm: a power-weighted BATCH SOM refinement of the
+/// merged clusters. With the neighborhood radius at 0 a batch SOM is exactly
+/// weighted Lloyd's/k-means, and radius 0 is deliberate — the merged centers
+/// carry no lattice topology for a neighborhood term to couple (the
+/// bvh::builders `som_codes` lattice learned a space-filling CURVE; that
+/// purpose does not transfer, and its M7 bake-off verdict is the codebase's
+/// own evidence that the coupling buys nothing measurable here). SERIAL and
+/// index-ordered like the rest of the derivation: each epoch scans `recs` in
+/// tri order (nearest center by `length_squared`, ties to the lowest center
+/// index — strict `<` makes the first minimum win), accumulation is
+/// fixed-order f32, so the result is byte-deterministic across runs and
+/// thread counts. Power conserves BY CONSTRUCTION (the final pass assigns
+/// every rec exactly once); the center count can only SHRINK (an emptied
+/// center drops), so the budget cap holds. Zero rng draws.
+fn som_refine(recs: &[TriRec], clusters: &mut Vec<Cluster>) {
+    let mut centers: Vec<Vec3A> =
+        clusters.iter().filter(|c| c.alive).map(|c| c.centroid()).collect();
+    if centers.is_empty() {
+        return;
+    }
+    let nearest = |centers: &[Vec3A], p: Vec3A| -> usize {
+        let mut j_min = 0usize;
+        let mut d_min = f32::INFINITY;
+        for (j, c) in centers.iter().enumerate() {
+            let d = (*c - p).length_squared();
+            if d < d_min {
+                d_min = d;
+                j_min = j;
+            }
+        }
+        j_min
+    };
+    for _ in 0..EL_SOM_EPOCHS {
+        let mut acc = vec![Vec3A::ZERO; centers.len()];
+        let mut wsum = vec![0.0f32; centers.len()];
+        for r in recs {
+            let j = nearest(&centers, r.centroid);
+            let w = lum(r.power);
+            acc[j] += r.centroid * w;
+            wsum[j] += w;
+        }
+        for j in 0..centers.len() {
+            // An emptied center keeps its position — it may capture records
+            // again in a later epoch as its neighbors move.
+            if wsum[j] > 0.0 {
+                centers[j] = acc[j] / wsum[j];
+            }
+        }
+    }
+    // Final assignment pass rebuilds the cluster records around the settled
+    // centers — power sums, power-weighted centroid, AABB union: exactly the
+    // fields the shared finalize loop below derives rc2/r_infl2 from, so the
+    // som arm inherits the disc model and the influence band for free.
+    let mut rebuilt: Vec<Cluster> = centers
+        .iter()
+        .map(|_| Cluster {
+            power: Vec3A::ZERO,
+            cacc: Vec3A::ZERO,
+            wsum: 0.0,
+            mn: Vec3A::splat(f32::INFINITY),
+            mx: Vec3A::splat(f32::NEG_INFINITY),
+            alive: true,
+        })
+        .collect();
+    for r in recs {
+        let j = nearest(&centers, r.centroid);
+        let w = lum(r.power);
+        let c = &mut rebuilt[j];
+        c.power += r.power;
+        c.cacc += r.centroid * w;
+        c.wsum += w;
+        c.mn = c.mn.min(r.mn);
+        c.mx = c.mx.max(r.mx);
+    }
+    rebuilt.retain(|c| c.wsum > 0.0);
+    *clusters = rebuilt;
 }
 
 /// The derivation over bare parts — what `self_test` drives with synthetic
@@ -359,6 +510,7 @@ pub(crate) fn derive_parts(
     cmax: Vec3A,
     eps: f32,
     budget: u32,
+    mode: ClusterMode,
 ) -> EmissiveLights {
     let budget = budget.min(MAX_EMISSIVE_LIGHTS as u32);
     // Material precheck — the exact display-add predicate (shade.rs's
@@ -375,12 +527,6 @@ pub(crate) fn derive_parts(
 
     // Per-triangle records: centroid, A·L̄ power, AABB. One pass, index
     // order.
-    struct TriRec {
-        centroid: Vec3A,
-        power: Vec3A,
-        mn: Vec3A,
-        mx: Vec3A,
-    }
     let mut recs: Vec<TriRec> = Vec::new();
     for (t, idx) in indices.iter().enumerate() {
         if !mat_emits[tri_mat[t] as usize] {
@@ -478,6 +624,12 @@ pub(crate) fn derive_parts(
         alive -= 1;
     }
 
+    // The ONE mode conditional — `Grid` runs the pre-lever instruction
+    // stream verbatim (the fireflies structural-off discipline).
+    if mode == ClusterMode::Som {
+        som_refine(&recs, &mut clusters);
+    }
+
     // Finalize rows, cluster order preserved (deterministic).
     let mut out = EmissiveLights::off();
     let r_cap2 = (EL_RMAX_K * diag_c) * (EL_RMAX_K * diag_c);
@@ -485,7 +637,7 @@ pub(crate) fn derive_parts(
         let cen = c.centroid();
         let half = 0.5 * (c.mx - c.mn).length();
         let rc2 = (half * half).max((2.0 * eps) * (2.0 * eps));
-        let cp = c.power * std::f32::consts::FRAC_1_PI;
+        let cp = c.power * (EL_BOOST * std::f32::consts::FRAC_1_PI);
         // r_infl: where lum(C/π)/(d²+rc²) falls to EL_MIN_E — floored at
         // 4·rc2 (reach past the body), capped at the scan-cost bound. The
         // FLOOR WINS when they cross (a low-budget merge over spread
@@ -554,12 +706,12 @@ pub fn self_test() -> Result<(), String> {
         let (mut pos, mut idx, mut tm) = (Vec::new(), Vec::new(), Vec::new());
         push_tri(&mut pos, &mut idx, &mut tm, Vec3A::ZERO, 0);
         let mats = [mat_dark()];
-        let el = derive_parts(&pos, &idx, &tm, &mats, &[], &[], cmin, cmax, eps, 32);
+        let el = derive_parts(&pos, &idx, &tm, &mats, &[], &[], cmin, cmax, eps, 32, ClusterMode::Grid);
         if el.count != 0 {
             return Err(format!("emissive-free scene derived {} lights", el.count));
         }
         let mats2 = [mat_emit(Vec3A::ONE)];
-        let el2 = derive_parts(&pos, &idx, &tm, &mats2, &[], &[], cmin, cmax, eps, 0);
+        let el2 = derive_parts(&pos, &idx, &tm, &mats2, &[], &[], cmin, cmax, eps, 0, ClusterMode::Grid);
         if el2.count != 0 {
             return Err("zero budget did not derive count 0".into());
         }
@@ -567,22 +719,23 @@ pub fn self_test() -> Result<(), String> {
 
     // 2. Determinism + power conservation + placement: two far-apart
     //    emitters cluster separately, bit-identical across derivations, and
-    //    Σ color·π over the lights equals Σ A·L̄ over the triangles exactly
-    //    (fixed-order sums — the same adds in the same order).
+    //    Σ color·π over the lights equals EL_BOOST · Σ A·L̄ over the
+    //    triangles exactly (fixed-order sums — the same adds in the same
+    //    order; the boost lands once, at the C_c fill).
     {
         let (mut pos, mut idx, mut tm) = (Vec::new(), Vec::new(), Vec::new());
         push_tri(&mut pos, &mut idx, &mut tm, Vec3A::new(-8.0, 1.0, 0.0), 0);
         push_tri(&mut pos, &mut idx, &mut tm, Vec3A::new(8.0, 1.0, 0.0), 1);
         let mats = [mat_emit(Vec3A::new(4.0, 2.0, 1.0)), mat_emit(Vec3A::splat(6.0))];
-        let a = derive_parts(&pos, &idx, &tm, &mats, &[], &[], cmin, cmax, eps, 32);
-        let b = derive_parts(&pos, &idx, &tm, &mats, &[], &[], cmin, cmax, eps, 32);
+        let a = derive_parts(&pos, &idx, &tm, &mats, &[], &[], cmin, cmax, eps, 32, ClusterMode::Grid);
+        let b = derive_parts(&pos, &idx, &tm, &mats, &[], &[], cmin, cmax, eps, 32, ClusterMode::Grid);
         if a != b {
             return Err("derive is not deterministic".into());
         }
         if a.count != 2 {
             return Err(format!("expected 2 clusters, got {}", a.count));
         }
-        let total_tris = mats[0].emissive * 0.5 + mats[1].emissive * 0.5;
+        let total_tris = (mats[0].emissive * 0.5 + mats[1].emissive * 0.5) * EL_BOOST;
         let total_lights: Vec3A = (0..a.count as usize)
             .map(|i| Vec3A::from(a.lights[i].color) * std::f32::consts::PI)
             .fold(Vec3A::ZERO, |s, v| s + v);
@@ -616,13 +769,13 @@ pub fn self_test() -> Result<(), String> {
             push_tri(&mut pos, &mut idx, &mut tm, Vec3A::new(x, 1.0, z), 0);
         }
         let mats = [mat_emit(Vec3A::splat(2.0))];
-        let el = derive_parts(&pos, &idx, &tm, &mats, &[], &[], cmin, cmax, eps, 16);
+        let el = derive_parts(&pos, &idx, &tm, &mats, &[], &[], cmin, cmax, eps, 16, ClusterMode::Grid);
         if el.count != 16 {
             return Err(format!("budget 16 derived {} lights", el.count));
         }
         let total: f32 =
             (0..16).map(|i| lum(Vec3A::from(el.lights[i].color)) * std::f32::consts::PI).sum();
-        let expect = 200.0 * 0.5 * lum(Vec3A::splat(2.0));
+        let expect = 200.0 * 0.5 * lum(Vec3A::splat(2.0)) * EL_BOOST;
         if (total - expect).abs() > 1e-3 * expect {
             return Err(format!("merge lost power: {total} vs {expect}"));
         }
@@ -636,7 +789,7 @@ pub fn self_test() -> Result<(), String> {
         // half the content box, where the 4·rc2 floor exceeds the r_cap2
         // cap — the arm that PANICKED as a bare `clamp` (min > max; measured
         // live on bistro --emissive-lights 1). The floor must win.
-        let el1 = derive_parts(&pos, &idx, &tm, &mats, &[], &[], cmin, cmax, eps, 1);
+        let el1 = derive_parts(&pos, &idx, &tm, &mats, &[], &[], cmin, cmax, eps, 1, ClusterMode::Grid);
         if el1.count != 1 {
             return Err(format!("budget 1 derived {} lights", el1.count));
         }
@@ -691,11 +844,11 @@ pub fn self_test() -> Result<(), String> {
         m.emissive_tex = 0;
         let mats = [m];
         let texs = [tex];
-        let el = derive_parts(&pos, &idx, &tm, &mats, &texs, &uvs, cmin, cmax, eps, 32);
+        let el = derive_parts(&pos, &idx, &tm, &mats, &texs, &uvs, cmin, cmax, eps, 32, ClusterMode::Grid);
         if el.count != 1 {
             return Err(format!("mapped emitter derived {} lights", el.count));
         }
-        let want = 2.0 * 0.5 * std::f32::consts::FRAC_1_PI; // factor·area/π per channel
+        let want = 2.0 * 0.5 * std::f32::consts::FRAC_1_PI * EL_BOOST; // factor·area·boost/π per channel
         let got = Vec3A::from(el.lights[0].color);
         if (got - Vec3A::splat(want)).abs().max_element() > 1e-5 {
             return Err(format!("white-map power {got:?} != {want}"));
@@ -704,7 +857,7 @@ pub fn self_test() -> Result<(), String> {
             image::RgbaImage::from_raw(2, 2, vec![0u8, 0, 0, 255].repeat(4)).unwrap(),
         );
         let texs_b = [Texture::from_image(black, true)];
-        let el_b = derive_parts(&pos, &idx, &tm, &mats, &texs_b, &uvs, cmin, cmax, eps, 32);
+        let el_b = derive_parts(&pos, &idx, &tm, &mats, &texs_b, &uvs, cmin, cmax, eps, 32, ClusterMode::Grid);
         if el_b.count != 0 {
             return Err("black emissive map still derived a light".into());
         }
@@ -714,7 +867,7 @@ pub fn self_test() -> Result<(), String> {
         let mut m0 = mat_emit(Vec3A::ZERO);
         m0.emissive_tex = 0;
         let mats0 = [m0];
-        let el_0 = derive_parts(&pos, &idx, &tm, &mats0, &texs, &uvs, cmin, cmax, eps, 32);
+        let el_0 = derive_parts(&pos, &idx, &tm, &mats0, &texs, &uvs, cmin, cmax, eps, 32, ClusterMode::Grid);
         if el_0.count != 0 {
             return Err("Ke-zero mapped material derived a light (display renders it black)".into());
         }
@@ -725,7 +878,7 @@ pub fn self_test() -> Result<(), String> {
         let (mut pos, mut idx, mut tm) = (Vec::new(), Vec::new(), Vec::new());
         push_tri(&mut pos, &mut idx, &mut tm, Vec3A::ZERO, 0);
         let mats = [mat_emit(Vec3A::ONE)];
-        let el = derive_parts(&pos, &idx, &tm, &mats, &[], &[], cmin, cmax, eps, 999);
+        let el = derive_parts(&pos, &idx, &tm, &mats, &[], &[], cmin, cmax, eps, 999, ClusterMode::Grid);
         if el.count != 1 {
             return Err("over-cap budget mishandled".into());
         }
@@ -830,6 +983,57 @@ pub fn self_test() -> Result<(), String> {
         let (kept_e, culled_e) = cull_tile(&EmissiveLights::off(), &tf, fwd, t_start);
         if kept_e.count != 0 || culled_e != 0 {
             return Err("empty set culled something".into());
+        }
+    }
+
+    // 8. The --el-cluster som arm (som_refine — power-weighted batch Lloyd,
+    //    a radius-0 batch SOM): deterministic, power-conserving through the
+    //    refinement (× EL_BOOST at the shared fill), budget-capped, and the
+    //    shared finalize keeps the influence band. Gates 1-7 all pass
+    //    ClusterMode::Grid explicitly, so they ARE the grid-arm-unmoved pin
+    //    (one dispatch point, a guarded branch). Runs unconditionally —
+    //    pure math, no lever needed (the self_test pattern).
+    {
+        // Gate 3's 200-tri deterministic scatter, rebuilt — enough spread
+        // emitters that the merge to budget 16 leaves the Lloyd pass real
+        // work (multi-tri clusters whose centroids genuinely move).
+        let (mut pos, mut idx, mut tm) = (Vec::new(), Vec::new(), Vec::new());
+        for i in 0..200u32 {
+            let h = crate::sky::pcg_mix(i.wrapping_mul(0x9E37_79B9));
+            let x = (h & 0xFFFF) as f32 / 65535.0 * 28.0 - 14.0;
+            let z = ((h >> 16) & 0xFFFF) as f32 / 65535.0 * 28.0 - 14.0;
+            push_tri(&mut pos, &mut idx, &mut tm, Vec3A::new(x, 1.0, z), 0);
+        }
+        let mats = [mat_emit(Vec3A::splat(2.0))];
+        let a = derive_parts(&pos, &idx, &tm, &mats, &[], &[], cmin, cmax, eps, 16, ClusterMode::Som);
+        let b = derive_parts(&pos, &idx, &tm, &mats, &[], &[], cmin, cmax, eps, 16, ClusterMode::Som);
+        if a != b {
+            return Err("som derive is not deterministic".into());
+        }
+        if a.count == 0 || a.count > 16 {
+            return Err(format!("som budget 16 derived {} lights", a.count));
+        }
+        let total: f32 = (0..a.count as usize)
+            .map(|i| lum(Vec3A::from(a.lights[i].color)) * std::f32::consts::PI)
+            .sum();
+        let expect = 200.0 * 0.5 * lum(Vec3A::splat(2.0)) * EL_BOOST;
+        if (total - expect).abs() > 1e-3 * expect {
+            return Err(format!("som refinement lost power: {total} vs {expect}"));
+        }
+        for i in 0..a.count as usize {
+            let l = &a.lights[i];
+            if !(l.r_infl2 >= 4.0 * l.rc2
+                && l.r_infl2 <= (EL_RMAX_K * 32.0 * 1.8) * (EL_RMAX_K * 32.0 * 1.8))
+            {
+                return Err(format!("som light {i} influence out of band: {}", l.r_infl2));
+            }
+        }
+        // Anti-vacuity: the refinement must actually MOVE something on this
+        // geometry, or the gate proves only that the arm compiled — the
+        // grid centroids are not Lloyd-stationary here by construction.
+        let g = derive_parts(&pos, &idx, &tm, &mats, &[], &[], cmin, cmax, eps, 16, ClusterMode::Grid);
+        if a == g {
+            return Err("som arm returned the grid clustering bitwise — the refinement never ran".into());
         }
     }
 
