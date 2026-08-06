@@ -192,7 +192,18 @@ void raygen() {
 #endif
         csum += p.color;
         if ((p.prim & 1u) != 0u) {
+#if defined(WAVEVIZ) && defined(WAVEVIZ_CHS)
+            // FR_WAVEVIZ=chs: the closest-hit owns tbuf while live — keep
+            // the chs-written ticket on hit pixels, mark misses with the
+            // sentinel (resolve darkens it: "no hit shader ran here").
+            if (flags & FLAG_WAVEVIZ) {
+                if (isinf(p.t)) tbuf[pi] = asfloat(0xFFFFFFFEu);
+            } else {
+                tbuf[pi] = p.t;
+            }
+#else
             tbuf[pi] = p.t;
+#endif
             info[pi] = pack_info(0u, KIND_LEAF);
             // Sky G-buffer capture (FLAG_GBUF-gated inside the helper — plain
             // sessions are bit-untouched, and no rng draw is consumed). The
@@ -212,6 +223,17 @@ void raygen() {
         c += bacc;
     }
 #endif
+#if defined(WAVEVIZ) && !defined(WAVEVIZ_CHS)
+    // --waveviz: this RAYGEN wave's ID = its first lane's pixel, written as
+    // the pixel's LAST tbuf touch. Mode 2 has zero TraceRay, so the wave
+    // composition here IS launch packing; mode 1's is the post-TraceRay
+    // continuation's (repacked or not — exactly the question). Position-
+    // keyed, so colors are stable exactly when the packing is (the
+    // reference.hlsl note — an arrival-order atomic strobed).
+    if (flags & FLAG_WAVEVIZ) {
+        tbuf[pi] = asfloat(WaveReadLaneFirst(pi));
+    }
+#endif
 
     uint i3 = pi * 3u;
     // splat: frame 0 (or non-accumulating) stores — the implicit clear.
@@ -229,6 +251,18 @@ void raygen() {
 
 [shader("closesthit")]
 void chs_shade(inout RayPayload p, in BuiltInTriangleIntersectionAttributes a) {
+#if defined(WAVEVIZ) && defined(WAVEVIZ_CHS)
+    // --waveviz chs: THIS closest-hit wave's ID — the composition AFTER
+    // whatever hit-stage packing the driver did (the TSU question, drawn).
+    // Position-keyed off the first active lane's pixel (stable iff the
+    // packing is); written first so the raygen's post-return sentinel logic
+    // (see the mode-0/1 arm) can leave it standing on hit pixels.
+    if (flags & FLAG_WAVEVIZ) {
+        uint2 wvid = DispatchRaysIndex().xy;
+        uint wv_t = WaveReadLaneFirst(wvid.y * rw + wvid.x);
+        tbuf[wvid.y * rw + wvid.x] = asfloat(wv_t);
+    }
+#endif
     HitInfo h;
     h.t = RayTCurrent();
     // tri_of == PrimitiveIndex() in the single-BLAS build; the chunk remap

@@ -85,3 +85,4 @@ __pycache__/
 !/SDKs/fidelityfx-sdk/upscalers/
 !/SDKs/fidelityfx-sdk/framegeneration/
 !/SDKs/fidelityfx-sdk/README.md
+waveviz-*.png

@@ -25,6 +25,15 @@ void cs_reference(uint3 id : SV_DispatchThreadID) {
     // per-shader SIMD choice the driver made for THIS kernel's pressure.
     if (id.x == 0u && id.y == 0u) width_ctr[CTR_W_REFERENCE] = WaveGetLaneCount();
 #endif
+#ifdef WAVEVIZ
+    // --waveviz: this wave's ID is its first lane's PIXEL — unique per wave
+    // within a frame (a pixel belongs to exactly one wave) and identical
+    // across frames whenever the packing is identical, so a parked view is
+    // color-STABLE and residual shimmer is real repacking. Minted before the
+    // early-out (converged). An arrival-order atomic ticket was tried first
+    // and strobed: wave scheduling order is nondeterministic per frame.
+    uint wv_t = WaveReadLaneFirst(id.y * rw + id.x);
+#endif
     if (id.x >= rw || id.y >= rh) return;
 
     uint pi = id.y * rw + id.x;
@@ -116,6 +125,12 @@ void cs_reference(uint3 id : SV_DispatchThreadID) {
         [unroll] for (uint bi = 0u; bi < BALLAST_N; ++bi) bacc += ballast[bi];
         c += bacc;
     }
+#endif
+#ifdef WAVEVIZ
+    // The kernel's LAST tbuf touch: this pixel now carries its wave's ticket
+    // (asfloat bit-cast — float(t) would quantize past 2^24) for the resolve
+    // colorizer. accum keeps the real image, so toggling off is clean.
+    if (flags & FLAG_WAVEVIZ) tbuf[pi] = asfloat(wv_t);
 #endif
 
     uint i3 = pi * 3u;

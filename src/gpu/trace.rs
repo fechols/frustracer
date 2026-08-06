@@ -3312,6 +3312,88 @@ pub(crate) fn ballast_dxr_defs() -> String {
     }
 }
 
+/// FR_WAVEVIZ=1|chs — arm the wave-footprint visualization: every wave takes
+/// a TICKET (one atomic bump per wave, broadcast to its lanes), each covered
+/// kernel stores its wave's ticket per pixel (hijacking tbuf as asfloat bits —
+/// nothing consumes tbuf in a live GPU frame), and the resolve stage hashes
+/// ticket→color under FLAG_WAVEVIZ, making wave footprints literally visible
+/// (compact tiles vs scattered confetti — the DispatchRays launch-packing
+/// question). `chs` = the mode-1 closest-hit variant: chs_shade takes the
+/// ticket instead of the raygen, so the picture shows whether the driver
+/// REPACKS waves between launch and hit shading (the TSU acting). Armed
+/// sessions toggle the overlay live with the I key (display-stage only — no
+/// resets); headless --spin runs dump waveviz-<arm>.png + compactness stats.
+/// Unarmed sessions stay byte-identical (conditional defs pushes). Loud on
+/// arm and on an unrecognized value (the FR_WIDE rule).
+pub(crate) fn waveviz_on() -> bool {
+    WAVEVIZ_MODE.load(std::sync::atomic::Ordering::Relaxed) != 0
+}
+
+/// The `--waveviz chs` sub-mode (implies `waveviz_on`).
+pub(crate) fn waveviz_chs() -> bool {
+    WAVEVIZ_MODE.load(std::sync::atomic::Ordering::Relaxed) == 2
+}
+
+/// 0 = off, 1 = on, 2 = chs. Written ONCE by main's lever block (the CLI
+/// `--waveviz [chs]` wins over the `FR_WAVEVIZ` env alias) BEFORE any GPU
+/// construction — Passes::new, both tracers' kernel assemblies, and the
+/// spin arms all read it through the accessors above.
+static WAVEVIZ_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub fn set_waveviz(mode: u8) {
+    WAVEVIZ_MODE.store(mode, std::sync::atomic::Ordering::Relaxed);
+    match mode {
+        1 => eprintln!(
+            "gpu: waveviz — wave-ticket overlay armed (I toggles live in GPU \
+             arms, every upscaler included; tbuf carries tickets while ON, so \
+             C-verify stands down)"
+        ),
+        2 => eprintln!(
+            "gpu: waveviz chs — closest-hit wave tickets armed (mode-1 DXR \
+             only; shows the driver's hit-stage packing)"
+        ),
+        _ => {}
+    }
+}
+
+/// The `FR_WAVEVIZ` env alias (scripts): parsed by main's lever block when
+/// the CLI flag is absent. Loud on an illegal value (the FR_WIDE rule).
+pub fn waveviz_env() -> u8 {
+    match std::env::var("FR_WAVEVIZ") {
+        Err(_) => 0,
+        Ok(v) if v == "1" => 1,
+        Ok(v) if v == "chs" => 2,
+        Ok(v) => {
+            eprintln!("gpu: FR_WAVEVIZ={v:?} unrecognized (legal: 1 | chs) — off");
+            0
+        }
+    }
+}
+
+/// The live overlay switch inside an armed session (the I key; headless spin
+/// arms it unconditionally). Read at CB-build time like the V toggle.
+static WAVEVIZ_LIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn waveviz_live() -> bool {
+    WAVEVIZ_LIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn set_waveviz_live(on: bool) {
+    WAVEVIZ_LIVE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The WAVEVIZ define, "" when off (pushed conditionally — the width_defs
+/// rule: never an empty join element). WAVEVIZ_CHS rides along only for the
+/// DXR library (dxr.rs pushes it per mode); compute units take WAVEVIZ alone.
+/// No injected literals: the wave IDs are position-keyed pure math.
+pub(crate) fn waveviz_defs() -> String {
+    if waveviz_on() {
+        "#define WAVEVIZ 1".to_string()
+    } else {
+        String::new()
+    }
+}
+
 /// One line from a CTR_TOTAL-sized counter readback. 0 = that kernel never
 /// ran this session (e.g. hemi without an H cycle, level under replay).
 pub fn format_width_report(c: &[u32]) -> String {
@@ -3559,6 +3641,13 @@ pub(crate) fn sky_unit_src(k: u32, n: u32) -> String {
     let wd = width_defs();
     if !wd.is_empty() {
         parts.push(wd);
+    }
+    // WAVEVIZ rides the same conditional-push rule. Like WIDTH_PROBE, its
+    // armed block lives in cs_sky alone — the DXR pipeline compiles only the
+    // fill entries from this unit, so DXR's u3 stays untouched here.
+    let wv = waveviz_defs();
+    if !wv.is_empty() {
+        parts.push(wv);
     }
     parts.extend([
         // Ablations must reach THIS unit too — see the feed_src note. A
@@ -4298,6 +4387,16 @@ pub const FLAG_SWAY_MV: u32 = 8192;
 /// so its kernels are bit-identical by construction (the FLAG_FIREFLIES
 /// shape).
 pub const FLAG_EMISSIVE: u32 = 16384;
+/// FR_WAVEVIZ live overlay (armed session AND the I key / headless spin):
+/// covered kernels overwrite tbuf with their wave ticket and the resolve
+/// stage blends the ticket hash over the scene. Runtime half of the WAVEVIZ
+/// compile-in — an armed-but-OFF frame runs the normal tbuf writes, so
+/// toggling off recovers the clean frame immediately.
+// RENUMBERED at the 2026-08-06 merge: both parallel sessions claimed bit
+// 32768 (the sibling branched before FLAG_DETAIL/FLAG_DETAIL_AO/
+// FLAG_AMB_BUMP landed); detail keeps 32768..131072, waveviz takes the
+// next free bit. Lockstep with trace_common.hlsli's FLAG_WAVEVIZ.
+pub const FLAG_WAVEVIZ: u32 = 262144;
 
 /// Unreal-1 detail texturing (`--no-detail-tex` clears it): procedural
 /// close-up albedo grain + micro-bump on MAGNIFIED textured hits
@@ -4594,7 +4693,11 @@ impl FrameCb {
             // scenes never enter.
             | (crate::scene::detail_tex() as u32 * FLAG_DETAIL)
             | (crate::scene::detail_ao() as u32 * FLAG_DETAIL_AO)
-            | (crate::scene::amb_bump() as u32 * FLAG_AMB_BUMP);
+            | (crate::scene::amb_bump() as u32 * FLAG_AMB_BUMP)
+            // FR_WAVEVIZ live toggle, read at CB-build time like the V
+            // toggle — unarmed sessions compile no WAVEVIZ block, so the
+            // bit is only ever consumed where the code exists.
+            | ((waveviz_on() && waveviz_live()) as u32 * FLAG_WAVEVIZ);
         cb.shadow_samples = p.q.shadow_samples;
         cb.ao_samples = p.q.ao_samples;
         cb.reflections = p.q.reflections as u32;
@@ -5053,12 +5156,16 @@ impl TraceGpu {
         // unarmed assemblies must be byte-identical to the pre-lever sources.
         let wd = width_defs();
         let bd = ballast_defs();
+        let wv = waveviz_defs();
         let mut reference_parts: Vec<&str> = Vec::new();
         if !wd.is_empty() {
             reference_parts.push(wd.as_str());
         }
         if !bd.is_empty() {
             reference_parts.push(bd.as_str());
+        }
+        if !wv.is_empty() {
+            reference_parts.push(wv.as_str());
         }
         reference_parts.extend([
             csn.as_str(),
@@ -5075,6 +5182,10 @@ impl TraceGpu {
             REFERENCE_HLSL,
         ]);
         let reference_src = reference_parts.join("\n");
+        // The waveviz overlay deliberately does NOT live in this resolve
+        // unit any more: it composites at the present funnel (tonemap.rs's
+        // waveviz PSO), which is what makes it work under every upscaler —
+        // the resolve runs only on the plain arms.
         let resolve_src = [sd, TRACE_COMMON_HLSLI, RESOLVE_HLSL].join("\n");
         let (sky_group, sky_split) = (SKY_GROUP, SKY_SPLIT);
         let sky_defs = format!(
@@ -5122,6 +5233,9 @@ impl TraceGpu {
             let mut parts: Vec<&str> = Vec::new();
             if !wd.is_empty() {
                 parts.push(wd.as_str());
+            }
+            if !wv.is_empty() {
+                parts.push(wv.as_str());
             }
             parts.extend([
                 lg.as_str(),
@@ -7327,12 +7441,15 @@ mod width_ballast_shader_source_tests {
             ("reference", REFERENCE, "CTR_W_REFERENCE"),
         ] {
             for (i, _) in src.match_indices(slot) {
-                // Every use must sit between a `#ifdef WIDTH_PROBE` and its
-                // `#endif`: the nearest preceding open must exist, with no
-                // intervening close. (The probe epilogues are one-liners, so
-                // no nested preprocessor blocks live inside the guards.)
-                let last_open = src[..i]
-                    .rfind("#ifdef WIDTH_PROBE")
+                // Every use must sit between a guard-open and its `#endif`:
+                // the nearest preceding open of ANY legal spelling must
+                // exist, with no intervening close. (reference.hlsl's u3
+                // DECL guard widened to `WIDTH_PROBE || WAVEVIZ` for the
+                // waveviz ticket — the compound spelling is legal there.)
+                let last_open = ["#ifdef WIDTH_PROBE", "#if defined(WIDTH_PROBE) || defined(WAVEVIZ)"]
+                    .iter()
+                    .filter_map(|g| src[..i].rfind(g))
+                    .max()
                     .unwrap_or_else(|| panic!("{name}: {slot} used before any WIDTH_PROBE guard"));
                 assert!(
                     !src[last_open..i].contains("#endif"),
@@ -7348,6 +7465,44 @@ mod width_ballast_shader_source_tests {
         // ctr.hlsli's literal block mirrors the Rust consts.
         assert!(CTR_HLSLI.contains("#define CTR_W_LEAF      25u"));
         assert!(CTR_HLSLI.contains("#define CTR_TOTAL       30u"));
+    }
+
+    /// --waveviz: every ID-mint touch (the wv_t locals and their
+    /// WaveReadLaneFirst mints) must sit inside a WAVEVIZ guard — an
+    /// unguarded one ships in every session and breaks the unarmed
+    /// byte-identity contract (the width pin's shape). Note the IDs are
+    /// POSITION-keyed pure math, never an arrival-order atomic — the atomic
+    /// ticket strobed (scheduling order is nondeterministic per frame).
+    #[test]
+    fn waveviz_blocks_are_guarded() {
+        let guards: &[&str] = &["#ifdef WAVEVIZ", "#if defined(WIDTH_PROBE) || defined(WAVEVIZ)"];
+        for (name, src, needles) in [
+            ("leaf", LEAF_HLSL, &["wv_t"][..]),
+            ("sky", SKY, &["wv_t"][..]),
+            ("reference", REFERENCE, &["wv_t"][..]),
+        ] {
+            for needle in needles {
+                let mut found = 0u32;
+                for (i, _) in src.match_indices(needle) {
+                    found += 1;
+                    let last_open = guards
+                        .iter()
+                        .filter_map(|g| src[..i].rfind(g))
+                        .max()
+                        .unwrap_or_else(|| {
+                            panic!("{name}: {needle} used before any WAVEVIZ guard")
+                        });
+                    assert!(
+                        !src[last_open..i].contains("#endif"),
+                        "{name}: {needle} use at byte {i} escaped its WAVEVIZ guard"
+                    );
+                }
+                assert!(found > 0, "{name}: expected at least one {needle} (anti-vacuity)");
+            }
+        }
+        // The overlay's colorizer lives at the present funnel (waveviz.hlsl),
+        // not in resolve — resolve must stay lever-free (plain arms only).
+        assert!(!super::RESOLVE_HLSL.contains("WAVEVIZ"));
     }
 
     /// The FR_BALLAST array must be confined to its guarded blocks and its

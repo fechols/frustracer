@@ -41,6 +41,14 @@ void cs_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     // zeroed, never gated. leaf vs leaf-fb share the slot (last ran wins).
     if (all(gid == 0u) && gtid.x == 0u) counters[CTR_W_LEAF] = WaveGetLaneCount();
 #endif
+#ifdef WAVEVIZ
+    // --waveviz: this wave's ID = (record, first lane) — pure position math,
+    // so the same wave gets the same color every frame (reference.hlsl's
+    // stability note); ONE ID per wave, not per stride iteration, keeps the
+    // wave's whole pixel footprint under one color. The salt keeps leaf IDs
+    // numerically disjoint from sky's on adjacent tiles.
+    uint wv_t = 0x40000000u ^ WaveReadLaneFirst(flat_group(gid) * LEAF_GROUP + gtid.x);
+#endif
     uint rec_i = flat_group(gid);
     if (rec_i >= counters[push0]) return;
     LeafRec rec = qleaf[rec_i];
@@ -221,6 +229,11 @@ void cs_leaf(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
             info[pi] = pack_info(rec.depth, KIND_LEAF);
         }
     }
+#ifdef WAVEVIZ
+    // Every pixel this wave touched carries the wave's ticket (the LAST tbuf
+    // touch — after the prim write above; per stride pixel, not per sample).
+    if (flags & FLAG_WAVEVIZ) tbuf[pi] = asfloat(wv_t);
+#endif
 
     float inv = 1.0 / float(spp);
 #ifdef LEAF_NO_FB

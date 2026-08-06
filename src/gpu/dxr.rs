@@ -774,6 +774,40 @@ impl DxrGpu {
                 );
             }
         }
+        // FR_WAVEVIZ — the wave-ticket overlay's DXR half. Modes 1/2 only:
+        // mode 0's raygen is lib_6_3 (no wave ops) and mode 3's thin raygen
+        // is PINNED to write no tbuf (the deferred kernel is plain compute —
+        // its packing is the dispatch grid's, nothing to discover). The
+        // `chs` sub-mode additionally needs mode 1 (the one mode whose
+        // primary runs a closest-hit).
+        let wv = trace::waveviz_defs();
+        // The arming is fully expressed by the parts pushes; the binding is
+        // kept for the branch structure only (underscored at the 2026-08-06
+        // merge — it was an unused-variable warning as pushed).
+        let _wv_armed = if !wv.is_empty() {
+            if inline_mode == 1 || inline_mode == 2 {
+                parts.push(wv.as_str());
+                if trace::waveviz_chs() {
+                    if inline_mode == 1 {
+                        parts.push("#define WAVEVIZ_CHS 1");
+                    } else {
+                        eprintln!(
+                            "gpu: FR_WAVEVIZ=chs needs --dxr-inline 1 (this session \
+                             is mode {inline_mode}) — raygen tickets instead"
+                        );
+                    }
+                }
+                true
+            } else {
+                eprintln!(
+                    "gpu: FR_WAVEVIZ needs --dxr-inline 1|2 (this session is mode \
+                     {inline_mode}) — off on this pipeline"
+                );
+                false
+            }
+        } else {
+            false
+        };
         parts.push(trace::TRACE_COMMON_HLSLI);
         // skylod.hlsli after trace_common (needs sky_compose/sky_backdrop/rw); no
         // SKY_UNIT — this unit pastes no queues.hlsli, so u5 is free anyway.
@@ -824,6 +858,8 @@ impl DxrGpu {
                 )
             })
             .collect::<Result<_>>()?;
+        // The waveviz overlay composites at the present funnel, not here —
+        // this resolve runs only on the plain arm and stays lever-free.
         let resolve_src = [sd, trace::TRACE_COMMON_HLSLI, trace::RESOLVE_HLSL].join("\n");
         let pso_resolve = trace::compute_pso(
             device,
@@ -1934,6 +1970,20 @@ mod mode3_shader_source_tests {
                     "{name}: dxr_width use at byte {i} escaped its guard"
                 );
             }
+        }
+        // The waveviz ID mints are position-keyed pure math (no dxr_width /
+        // counter touch) — pin every wave-op mint inside a WAVEVIZ guard.
+        for (i, _) in DXR_HLSL.match_indices("WaveReadLaneFirst") {
+            let last_open = ["#if defined(WAVEVIZ) && defined(WAVEVIZ_CHS)",
+                             "#if defined(WAVEVIZ) && !defined(WAVEVIZ_CHS)"]
+                .iter()
+                .filter_map(|g| DXR_HLSL[..i].rfind(g))
+                .max()
+                .unwrap_or_else(|| panic!("dxr.hlsl: WaveReadLaneFirst outside a WAVEVIZ guard"));
+            assert!(
+                !DXR_HLSL[last_open..i].contains("#endif"),
+                "dxr.hlsl: WaveReadLaneFirst at byte {i} escaped its WAVEVIZ guard"
+            );
         }
     }
 

@@ -13,11 +13,17 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 
 const BLIT_HLSL: &str = include_str!("shaders/blit.hlsl");
 const TONEMAP_HLSL: &str = include_str!("shaders/tonemap.hlsl");
+const WAVEVIZ_HLSL: &str = include_str!("shaders/waveviz.hlsl");
 
 pub struct Passes {
     pub root_sig: ID3D12RootSignature,
     pub blit_pso: ID3D12PipelineState,
     pub tonemap_pso: ID3D12PipelineState,
+    /// The --waveviz overlay composite (the HUD's shape: its own PS + PSO on
+    /// this root signature, premultiplied blend, drawn after the tonemap
+    /// draw). Built only in ARMED sessions — unarmed sessions compile
+    /// nothing and record nothing.
+    pub waveviz_pso: Option<ID3D12PipelineState>,
     /// Shader-visible SRV heap; slot 0 = blit texture, slot 1 = HDR source.
     pub srv_heap: ID3D12DescriptorHeap,
     pub srv_size: u32,
@@ -377,6 +383,17 @@ impl Passes {
                 },
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
             },
+            // [3] t2 as a ROOT SRV (2 DWORDs, no descriptor): the --waveviz
+            // ticket buffer, bound by GPU VA only for the waveviz draw. The
+            // tonemap/hud/blit shaders never declare t2, so leaving this
+            // param unset on their draws is legal.
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR { ShaderRegister: 2, RegisterSpace: 0 },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+            },
         ];
         let samp = [D3D12_STATIC_SAMPLER_DESC {
             Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
@@ -416,6 +433,22 @@ impl Passes {
         let tm_ps = compile(TONEMAP_HLSL, s!("psmain"), s!("ps_5_0"), "tonemap ps")?;
         let blit_pso = fullscreen_pso(device, rtv_format, &root_sig, &blit_vs, &blit_ps)?;
         let tonemap_pso = fullscreen_pso(device, rtv_format, &root_sig, &tm_vs, &tm_ps)?;
+        // --waveviz: armed sessions only — the unarmed session builds no
+        // extra PSO and the funnel's draw predicate never fires.
+        let waveviz_pso = if super::trace::waveviz_on() {
+            let wv_vs = compile(WAVEVIZ_HLSL, s!("vsmain"), s!("vs_5_0"), "waveviz vs")?;
+            let wv_ps = compile(WAVEVIZ_HLSL, s!("psmain"), s!("ps_5_0"), "waveviz ps")?;
+            Some(fullscreen_pso_blend(
+                device,
+                rtv_format,
+                &root_sig,
+                &wv_vs,
+                &wv_ps,
+                premultiplied_blend(),
+            )?)
+        } else {
+            None
+        };
 
         let srv_heap: ID3D12DescriptorHeap = unsafe {
             device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
@@ -430,7 +463,71 @@ impl Passes {
             device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
         };
 
-        Ok(Self { root_sig, blit_pso, tonemap_pso, srv_heap, srv_size })
+        Ok(Self { root_sig, blit_pso, tonemap_pso, waveviz_pso, srv_heap, srv_size })
+    }
+
+    /// The --waveviz overlay draw (waveviz.hlsl's own b0 layout — root
+    /// constants are per-draw, so the tonemap/hud draws are untouched):
+    /// tickets bound as the t2 root SRV by VA, nearest window→render mapping
+    /// from the four dims, ToneParams supplying the PQ arm's scale/mode.
+    /// Caller brackets the ticket buffer UNORDERED_ACCESS ↔
+    /// PIXEL_SHADER_RESOURCE around this draw.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_waveviz(
+        &self,
+        list: &ID3D12GraphicsCommandList,
+        pso: &ID3D12PipelineState,
+        tickets_va: u64,
+        rw: u32,
+        rh: u32,
+        ww: u32,
+        wh: u32,
+        tone: ToneParams,
+        rtv: D3D12_CPU_DESCRIPTOR_HANDLE,
+    ) {
+        unsafe {
+            list.SetPipelineState(pso);
+            list.SetGraphicsRootSignature(&self.root_sig);
+            list.SetDescriptorHeaps(&[Some(self.srv_heap.clone())]);
+            // Tables 0/2 are unread by this PS but bound to valid slots
+            // anyway (the record() habit — nothing is left dangling).
+            list.SetGraphicsRootDescriptorTable(0, self.gpu_srv(SRV_SLOT_HDR));
+            list.SetGraphicsRootDescriptorTable(2, self.gpu_srv(SRV_SLOT_BLOOM));
+            list.SetGraphicsRootShaderResourceView(3, tickets_va);
+            // waveviz.hlsl's Params layout: rw rh ww wh | scale mode pad pad.
+            let consts: [u32; NUM_ROOT_CONSTS as usize] = [
+                rw,
+                rh,
+                ww,
+                wh,
+                tone.scale.to_bits(),
+                match tone.mode {
+                    crate::tone::ToneMode::Gamma22 => 1.0f32,
+                    crate::tone::ToneMode::Pq => 2.0f32,
+                }
+                .to_bits(),
+                0,
+                0,
+            ];
+            list.SetGraphicsRoot32BitConstants(1, NUM_ROOT_CONSTS, consts.as_ptr() as *const _, 0);
+            list.RSSetViewports(&[D3D12_VIEWPORT {
+                TopLeftX: 0.0,
+                TopLeftY: 0.0,
+                Width: ww as f32,
+                Height: wh as f32,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            }]);
+            list.RSSetScissorRects(&[windows::Win32::Foundation::RECT {
+                left: 0,
+                top: 0,
+                right: ww as i32,
+                bottom: wh as i32,
+            }]);
+            list.OMSetRenderTargets(1, Some(&rtv), false, None);
+            list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            list.DrawInstanced(3, 1, 0, 0);
+        }
     }
 
     pub fn create_srv(&self, device: &ID3D12Device, res: &ID3D12Resource, format: DXGI_FORMAT, slot: u32) {

@@ -565,6 +565,15 @@ fn fsr_range_check(fs: &FsrState, rw: u32, rh: u32) -> Result<()> {
 /// the raw-NGX session holds its own device clone, so it may drop anywhere;
 /// the surviving constraints are the FG swapchain-wrapper ones on `fg`/`fg_x`
 /// (declared after `d3d`).
+
+/// The --waveviz funnel draw's source arm (see `GpuContext::waveviz_src`).
+#[derive(Clone, Copy, PartialEq)]
+enum WvSrc {
+    None,
+    Trace,
+    Dxr,
+}
+
 pub struct GpuContext {
     d3d: D3d,
     passes: tonemap::Passes,
@@ -582,6 +591,12 @@ pub struct GpuContext {
     /// inv_samples)` — `present_again`'s re-present source (the pause menu
     /// holds the frame without tracing). Cell: the recorder is `&self`.
     last_present: std::cell::Cell<Option<(bool, u32, f32)>>,
+    /// Which tracer produced the frame being presented — the --waveviz funnel
+    /// draw reads exactly that arm's ticket buffer (None = CPU-fed: no GPU
+    /// tickets exist, the overlay stands down). Stamped at the top of every
+    /// presenter; a Cell so `present_again`'s replay inherits the last real
+    /// present's source, the last_present pattern.
+    waveviz_src: std::cell::Cell<WvSrc>,
     /// The SHARED scene core both GPU tracers hold an Rc of: uploaded once
     /// per session by whichever of init_trace/init_dxr runs first, so the
     /// second tracer (and every resize re-entry — the device survives
@@ -1411,6 +1426,7 @@ impl GpuContext {
             hdr,
             hud,
             last_present: std::cell::Cell::new(None),
+            waveviz_src: std::cell::Cell::new(WvSrc::None),
             scene_gpu: None,
             trace: None,
             dxr: None,
@@ -2480,6 +2496,7 @@ impl GpuContext {
     /// One DXR frame: constants -> DispatchRays -> resolve -> tonemap ->
     /// present. `samples` divides the accumulation (the present_trace shape).
     pub fn present_dxr(&mut self, p: &trace::FrameParams, samples: u32) -> Result<()> {
+        self.waveviz_src.set(WvSrc::Dxr);
         crate::zone!("present-dxr");
         let Some(d) = &self.dxr else {
             return Err("DXR pipeline not initialized".into());
@@ -2499,6 +2516,7 @@ impl GpuContext {
     /// converged-idle path (present_hold's contract: record_resolve left hdr
     /// in PIXEL_SHADER_RESOURCE).
     pub fn present_dxr_hold(&mut self) -> Result<()> {
+        self.waveviz_src.set(WvSrc::Dxr);
         if self.dxr.is_none() {
             return Err("DXR pipeline not initialized".into());
         }
@@ -2529,6 +2547,7 @@ impl GpuContext {
         fc: &dlss::FrameConstants,
         frame_idx: u32,
     ) -> Result<()> {
+        self.waveviz_src.set(WvSrc::Dxr);
         crate::zone!("present-dxr-rr");
         let _ = frame_idx; // was the SL frame token's index; the raw evaluate needs none
         if self.dxr.is_none() || self.ngxrr.is_none() || self.rr.is_none() {
@@ -2604,6 +2623,7 @@ impl GpuContext {
         fc: &dlss::FrameConstants,
         frame_ms: f32,
     ) -> Result<()> {
+        self.waveviz_src.set(WvSrc::Dxr);
         crate::zone!("present-dxr-xess");
         if self.dxr.is_none() || self.xess.is_none() {
             return Err("DXR pipeline + XeSS not both initialized".into());
@@ -2689,6 +2709,7 @@ impl GpuContext {
         fc: &dlss::FrameConstants,
         frame_ms: f32,
     ) -> Result<()> {
+        self.waveviz_src.set(WvSrc::Dxr);
         crate::zone!("present-dxr-fsr3");
         if self.dxr.is_none() || self.fsr.is_none() {
             return Err("DXR pipeline + FSR not both initialized".into());
@@ -2745,6 +2766,7 @@ impl GpuContext {
     /// or the vanilla reference when `hybrid` is false — the R-key A/B) ->
     /// resolve -> tonemap -> present. `samples` divides the accumulation.
     pub fn present_trace(&mut self, p: &trace::FrameParams, samples: u32, hybrid: bool) -> Result<()> {
+        self.waveviz_src.set(WvSrc::Trace);
         crate::zone!("present-trace");
         let Some(tg) = &self.trace else {
             return Err("GPU tracer not initialized".into());
@@ -2763,6 +2785,7 @@ impl GpuContext {
     /// `record_resolve` leaves hdr in PIXEL_SHADER_RESOURCE, so the tonemap
     /// blit is all that's needed.
     pub fn present_hold(&mut self) -> Result<()> {
+        self.waveviz_src.set(WvSrc::Trace);
         if self.trace.is_none() {
             return Err("GPU tracer not initialized".into());
         }
@@ -2791,6 +2814,7 @@ impl GpuContext {
         fc: &dlss::FrameConstants,
         frame_ms: f32,
     ) -> Result<()> {
+        self.waveviz_src.set(WvSrc::Trace);
         crate::zone!("present-trace-xess");
         if self.trace.is_none() || self.xess.is_none() {
             return Err("GPU tracer + XeSS not both initialized".into());
@@ -3010,6 +3034,7 @@ impl GpuContext {
         frame_ms: f32,
         sky_sh: &crate::sh::Sh9,
     ) -> Result<()> {
+        self.waveviz_src.set(WvSrc::Trace);
         crate::zone!("present-trace-quin");
         if self.trace.is_none() || self.quin.is_none() {
             return Err("GPU tracer + quinlight fuse not both initialized".into());
@@ -3049,6 +3074,7 @@ impl GpuContext {
         frame_ms: f32,
         sky_sh: &crate::sh::Sh9,
     ) -> Result<()> {
+        self.waveviz_src.set(WvSrc::Dxr);
         crate::zone!("present-dxr-quin");
         if self.dxr.is_none() || self.quin.is_none() {
             return Err("DXR pipeline + quinlight fuse not both initialized".into());
@@ -3097,6 +3123,7 @@ impl GpuContext {
         fc: &dlss::FrameConstants,
         frame_ms: f32,
     ) -> Result<()> {
+        self.waveviz_src.set(WvSrc::Trace);
         crate::zone!("present-trace-fsr3");
         if self.trace.is_none() || self.fsr.is_none() {
             return Err("GPU tracer + FSR not both initialized".into());
@@ -3541,6 +3568,7 @@ impl GpuContext {
         frame_ms: f32,
         sky_sh: &crate::sh::Sh9,
     ) -> Result<()> {
+        self.waveviz_src.set(WvSrc::None);
         crate::zone!("present-fsr");
         let Some(fs) = &self.fsr else {
             return Err("FSR not initialized".into());
@@ -3712,6 +3740,7 @@ impl GpuContext {
         frame_ms: f32,
         sky_sh: &crate::sh::Sh9,
     ) -> Result<()> {
+        self.waveviz_src.set(WvSrc::Trace);
         crate::zone!("present-trace-fsr-rr");
         if self.trace.is_none() || self.fsr.is_none() {
             return Err("GPU tracer + FSR not both initialized".into());
@@ -3765,6 +3794,7 @@ impl GpuContext {
         frame_ms: f32,
         sky_sh: &crate::sh::Sh9,
     ) -> Result<()> {
+        self.waveviz_src.set(WvSrc::Dxr);
         crate::zone!("present-dxr-fsr-rr");
         if self.dxr.is_none() || self.fsr.is_none() {
             return Err("DXR pipeline + FSR not both initialized".into());
@@ -3863,6 +3893,7 @@ impl GpuContext {
         fc: &dlss::FrameConstants,
         frame_ms: f32,
     ) -> Result<()> {
+        self.waveviz_src.set(WvSrc::None);
         crate::zone!("present-fsr");
         let Some(fs) = &self.fsr else {
             return Err("FSR not initialized".into());
@@ -4138,6 +4169,7 @@ impl GpuContext {
         fc: &dlss::FrameConstants,
         frame_ms: f32,
     ) -> Result<()> {
+        self.waveviz_src.set(WvSrc::None);
         crate::zone!("present-xess");
         let slot = self.record_xess_dispatch(color, g, rw, rh, jitter, reset, near, far)?;
         let x = self.xess.as_ref().unwrap();
@@ -4203,6 +4235,7 @@ impl GpuContext {
         // traced this frame with. Unused when FG is not armed.
         cl: &crate::clouds::Clouds,
     ) -> Result<()> {
+        self.waveviz_src.set(WvSrc::None);
         crate::zone!("present-rr");
         let _ = frame_idx; // was the SL frame token's index; the raw evaluate needs none
         let (Some(nx), Some(feat), Some(rr)) =
@@ -4270,6 +4303,7 @@ impl GpuContext {
         fc: &dlss::FrameConstants,
         frame_idx: u32,
     ) -> Result<()> {
+        self.waveviz_src.set(WvSrc::Trace);
         crate::zone!("present-trace-rr");
         let _ = frame_idx; // was the SL frame token's index; the raw evaluate needs none
         if self.trace.is_none() || self.ngxrr.is_none() || self.rr.is_none() {
@@ -4413,6 +4447,7 @@ impl GpuContext {
 
     /// M1: present the CPU-tonemapped u32 0RGB frame.
     pub fn present_cpu(&mut self, pixels: &[u32]) -> Result<()> {
+        self.waveviz_src.set(WvSrc::None);
         crate::zone!("present-cpu");
         let slot = self.d3d.begin_frame()?;
         self.blit.record(&self.d3d, slot, pixels);
@@ -4426,6 +4461,7 @@ impl GpuContext {
     /// R10G10B10A2 pack), so this is still a straight blit — the blit PS
     /// stays a passthrough and never learns about colour spaces.
     pub fn present_cpu_10bit(&mut self, pixels: &[u32]) -> Result<()> {
+        self.waveviz_src.set(WvSrc::None);
         crate::zone!("present-cpu-10bit");
         let slot = self.d3d.begin_frame()?;
         self.blit.record_10bit(&self.d3d, slot, pixels);
@@ -4473,6 +4509,7 @@ impl GpuContext {
 
     /// M2: present the raw linear-HDR accumulation with the GPU tonemap.
     pub fn present_hdr(&mut self, accum: &[AtomicU32], samples: u32) -> Result<()> {
+        self.waveviz_src.set(WvSrc::None);
         crate::zone!("present-hdr");
         let slot = self.d3d.begin_frame()?;
         self.hdr.record(&self.d3d, slot, accum);
@@ -5498,6 +5535,51 @@ impl GpuContext {
             self.d3d.width,
             self.d3d.height,
         );
+        // The --waveviz overlay composite: a fullscreen draw over the
+        // PRESENTED image — the HUD's shape and insertion point, which is
+        // what makes it work under every upscaler (the overlay is blended
+        // AFTER reconstruction; feeding hash colors INTO a temporal model
+        // was rejected — it would smear per-frame tickets). Reads the live
+        // arm's render-res tbuf (tickets) as the t2 root SRV, bracketed
+        // UNORDERED_ACCESS <-> PIXEL_SHADER_RESOURCE around the draw (the
+        // bloom bracket's pattern). Below the HUD so the menu stays
+        // readable over it.
+        if trace::waveviz_on() && trace::waveviz_live() {
+            let src = match self.waveviz_src.get() {
+                WvSrc::Trace => self.trace.as_ref().map(|t| (&t.tbuf, t.rw, t.rh)),
+                WvSrc::Dxr => self.dxr.as_ref().map(|d| (&d.tbuf, d.rw, d.rh)),
+                WvSrc::None => None,
+            };
+            if let (Some((tbuf, rw, rh)), Some(pso)) =
+                (src, self.passes.waveviz_pso.as_ref())
+            {
+                unsafe {
+                    self.d3d.list.ResourceBarrier(&[transition(
+                        tbuf,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                    )]);
+                }
+                self.passes.record_waveviz(
+                    &self.d3d.list,
+                    pso,
+                    unsafe { tbuf.GetGPUVirtualAddress() },
+                    rw,
+                    rh,
+                    self.d3d.width,
+                    self.d3d.height,
+                    self.tone,
+                    self.d3d.rtv_handle(bb),
+                );
+                unsafe {
+                    self.d3d.list.ResourceBarrier(&[transition(
+                        tbuf,
+                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    )]);
+                }
+            }
+        }
         // The HUD/menu composite: a second fullscreen draw over the tonemapped
         // frame while the backbuffer is still a render target — this ONE
         // insertion covers every present arm. `Passes::record` rebinds

@@ -86,6 +86,16 @@
                                // amplifies the SH ambient's response to the
                                // n_g -> n_s deviation — n_s == n returns
                                // the plain expression verbatim)
+#define FLAG_WAVEVIZ   262144u // FR_WAVEVIZ live overlay: covered kernels
+                               // overwrite tbuf with their wave ticket and
+                               // the resolve stage blends the ticket hash
+                               // (only consumed inside #ifdef WAVEVIZ blocks
+                               // — unarmed kernels never read the bit).
+                               // RENUMBERED at the 2026-08-06 merge: both
+                               // parallel sessions claimed 32768 (detail vs
+                               // waveviz — the sibling branched before the
+                               // detail flags landed); detail keeps it,
+                               // waveviz takes the next free bit.
 
 cbuffer Frame : register(b0) {
     float4 cam_origin;   // xyz; w = inv_w

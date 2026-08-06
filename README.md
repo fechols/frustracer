@@ -559,7 +559,8 @@ Real flags, all of them measured rather than guessed.
 | `--spin-warmup N` | Exclude leading frames; defaults to 1600 on Intel and 20 elsewhere. A *defaulted* `--spin-frames` is extended so the timed span still covers a whole 600-frame lap |
 | `FR_ABL=oldcut,nobatch` | Reconstruct the pre-B70-pass wavefront queue code for a pixel-identical performance A/B |
 | `FR_WIDTH=1` | Every real kernel reports its **compiled** SIMD width (`WaveGetLaneCount()` from inside the kernel — the register-pressure choice a trivial probe can't see); printed at the spin accounting line, the check suites, and the C-key verify |
-| `FR_BALLAST=N` | Inject N provably-live floats into the reference kernel (image bit-identical) — sweep N to locate the compiler's spill knee; see the register-cliff paragraph |
+| `FR_BALLAST=N` \| `dxr:N` | Inject N provably-live floats into the reference kernel, or (`dxr:N`) the identical-code mode-2 DXR raygen (image bit-identical) — sweep both to compare the compute spill knee against the RT launch regime's pricing; see the register-cliff paragraph |
+| `--waveviz` \| `--waveviz chs` | Wave-footprint visualization: every wave takes a ticket, every pixel wears its wave's hash color — **I** toggles it live in GPU sessions, composited at the present funnel so it works under every upscaler; headless `--spin` runs dump `waveviz-<arm>.png` + compactness stats. `chs` tickets the mode-1 closest-hit instead (the driver's hit-stage packing, drawn). `FR_WAVEVIZ=1\|chs` is the env alias |
 | `--stress 5000` | A procedural field of 5000 objects |
 | `--tile 4x2` | Replicate a loaded scene into a grid — the 100-million-triangle path |
 | `--bvh-builder sah\|lbvh\|ploc\|som` | Swap the BVH builder, including a self-organising-map "learned space-filling curve" (it loses) |

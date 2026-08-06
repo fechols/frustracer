@@ -477,6 +477,12 @@ fn main() {
     }
     gpu::trace::set_cloud_shadow(opts.cloud_shadow);
     gpu::trace::set_sky_lod(opts.sky_lod);
+    // --waveviz wins over the FR_WAVEVIZ env alias; both land before any GPU
+    // construction (Passes::new + both tracers' kernel assemblies read it).
+    match if opts.waveviz != 0 { opts.waveviz } else { gpu::trace::waveviz_env() } {
+        0 => {}
+        m => gpu::trace::set_waveviz(m),
+    }
     gpu::dxr::set_inline_mode(opts.dxr_inline);
     // --dxr-sbt: parse-time only (no vendor policy, so no run_window
     // re-store) — and it MUST land before any SceneGpu upload, which bakes
@@ -11107,6 +11113,12 @@ fn run_spin_gpu(
             return 2;
         }
     };
+    // FR_WAVEVIZ: headless spins run the overlay's TICKET writes for the whole
+    // run (no key to press) — the post-run hook below reads the LAST frame's
+    // tickets out of tbuf and dumps waveviz-<arm>.png + compactness stats.
+    if gpu::trace::waveviz_on() {
+        gpu::trace::set_waveviz_live(true);
+    }
     let intel = gpu::adapter::picked_vendor() == gpu::adapter::Vendor::Intel;
     let warmup = warmup_override.unwrap_or(if intel {
         INTEL_SPIN_WARMUP
@@ -11348,8 +11360,98 @@ fn run_spin_gpu(
             _ => {}
         }
     }
+    // FR_WAVEVIZ: tbuf holds the LAST frame's wave tickets — colorize + stats.
+    if gpu::trace::waveviz_on() {
+        let ua = windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        let (tbuf, label) = match &armv {
+            Arm::Wave(tg) => {
+                (&tg.tbuf, if hybrid { "wavefront".to_string() } else { "reference".to_string() })
+            }
+            Arm::Dxr(dg) => {
+                (
+                    &dg.tbuf,
+                    format!(
+                        "dxr{}{}",
+                        gpu::dxr::dxr_inline_mode(),
+                        if gpu::trace::waveviz_chs() { "-chs" } else { "" }
+                    ),
+                )
+            }
+        };
+        match hg.read_buffer(tbuf, ua, rw * rh * 4) {
+            Ok(b) => {
+                let bits: Vec<u32> = b
+                    .chunks_exact(4)
+                    .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                    .collect();
+                waveviz_dump(&label, &bits, rw, rh);
+            }
+            Err(e) => eprintln!("waveviz: tbuf readback failed: {e}"),
+        }
+    }
     gpu::gputime::report();
     0
+}
+
+/// FR_WAVEVIZ's headless product: per-ticket footprint stats + the colorized
+/// PNG (the same integer hash as resolve.hlsl's wv_hash_color, so the live
+/// overlay and the dump agree color-for-color). "Compact" = a 32-lane wave
+/// whose bounding box is at most 8x8-ish (<= 96 px area — three 32-px rows);
+/// screen-tiled launches score near 100%, scattered packing near 0.
+fn waveviz_dump(label: &str, bits: &[u32], w: usize, h: usize) {
+    use std::collections::HashMap;
+    // ticket -> (min_x, max_x, min_y, max_y, count)
+    let mut waves: HashMap<u32, (usize, usize, usize, usize, usize)> = HashMap::new();
+    let mut miss_px = 0usize;
+    for (i, &t) in bits.iter().enumerate() {
+        if t == 0xFFFF_FFFE {
+            miss_px += 1;
+            continue;
+        }
+        let (x, y) = (i % w, i / w);
+        let e = waves.entry(t).or_insert((usize::MAX, 0, usize::MAX, 0, 0));
+        e.0 = e.0.min(x);
+        e.1 = e.1.max(x);
+        e.2 = e.2.min(y);
+        e.3 = e.3.max(y);
+        e.4 += 1;
+    }
+    if waves.is_empty() {
+        eprintln!("waveviz: arm={label} — no tickets in tbuf (kernel not covered?)");
+        return;
+    }
+    let n = waves.len();
+    let px: usize = waves.values().map(|e| e.4).sum();
+    let mut bbox_areas: Vec<usize> =
+        waves.values().map(|e| (e.1 - e.0 + 1) * (e.3 - e.2 + 1)).collect();
+    bbox_areas.sort_unstable();
+    let compact = bbox_areas.iter().filter(|&&a| a <= 96).count();
+    let mean_bbox = bbox_areas.iter().sum::<usize>() as f64 / n as f64;
+    eprintln!(
+        "waveviz: arm={label} waves={n} mean-px/wave={:.1} bbox-area mean={:.0} \
+         median={} max={} | compact(<=96px)={:.1}%{}",
+        px as f64 / n as f64,
+        mean_bbox,
+        bbox_areas[n / 2],
+        bbox_areas[n - 1],
+        compact as f64 * 100.0 / n as f64,
+        if miss_px > 0 { format!(" | miss-sentinel px={miss_px}") } else { String::new() }
+    );
+    // resolve.hlsl::wv_hash_color, term for term (u32 wrapping).
+    let hash = |t: u32| -> u32 {
+        let mut hx = t.wrapping_mul(747796405).wrapping_add(2891336453);
+        hx = ((hx >> ((hx >> 28) + 4)) ^ hx).wrapping_mul(277803737);
+        hx = (hx >> 22) ^ hx;
+        let c = |v: u32| -> u32 { 64 + (v * 191 / 1023) }; // 0.25 + 0.75*c, in u8
+        (c(hx & 1023) << 16) | (c((hx >> 10) & 1023) << 8) | c((hx >> 20) & 1023)
+    };
+    let present: Vec<u32> = bits
+        .iter()
+        .map(|&t| if t == 0xFFFF_FFFE { 0x00202020 } else { hash(t) })
+        .collect();
+    let name = format!("waveviz-{label}.png");
+    save_png(&name, &present, w, h);
+    eprintln!("waveviz: wrote {name}");
 }
 
 /// Headless end-to-end check: correctness counters (must be 0), an A/B
@@ -16489,6 +16591,30 @@ fn session(
                 gpu_reset = true;
                 eprintln!("gpu: {}", if hybrid { "hybrid (wavefront quadtree)" } else { "plain (per-pixel reference)" });
             }
+            // I: the waveviz overlay — THIS arm's copy (the gpu_trace arm
+            // `continue`s before the shared toggle block below, the same
+            // reason it has its own quality/spp/hybrid handlers). frame = 0
+            // because a CONVERGED still frame re-presents without tracing —
+            // no trace, no tickets — so the toggle restarts plain
+            // accumulation; every history is untouched. The overlay
+            // composites at the present funnel, so it shows under every
+            // upscaler sub-mode too.
+            if edges.toggle_waveviz {
+                if !gpu::trace::waveviz_on() {
+                    eprintln!(
+                        "waveviz: not armed — relaunch with --waveviz (or \
+                         --waveviz chs for mode-1 closest-hit tickets)"
+                    );
+                } else {
+                    let on = !gpu::trace::waveviz_live();
+                    gpu::trace::set_waveviz_live(on);
+                    frame = 0;
+                    eprintln!(
+                        "waveviz: {}",
+                        if on { "ON (wave-ticket overlay)" } else { "OFF" }
+                    );
+                }
+            }
             // --quinlight: every upscaler key toggles the fuse vs plain (see
             // gpu_quin_avail). Handled once, ahead of the per-level toggles,
             // which are then suppressed — their "not wired" lines would be a
@@ -16619,7 +16745,12 @@ fn session(
             // the present would let the next frame ADD onto the verify image.
             // The basis is the SESSION render res (the tracer's buffers are
             // sized to it), not the window.
-            if edges.verify {
+            if edges.verify && gpu::trace::waveviz_on() && gpu::trace::waveviz_live() {
+                // tbuf carries wave tickets while the overlay is live, and
+                // verify's own frames would write them too (the flag rides
+                // write_cb) — the compare would be garbage either way.
+                eprintln!("gpu: C verify stands down while waveviz is live — press I first");
+            } else if edges.verify {
                 eprintln!("gpu: verifying current view (wavefront vs reference, on-GPU)...");
                 match gpu.verify_trace(
                     &cam.basis(grw, grh),
@@ -17014,6 +17145,30 @@ fn session(
                 eprintln!(
                     "heightfield relief: {}",
                     if height_on { "ON" } else { "OFF (normal-mapped)" }
+                );
+            }
+        }
+        // I: the waveviz overlay, the DXR/CPU arms' copy (the gpu_trace arm
+        // `continue`s before this block and carries its own — the
+        // quality/spp handler pattern). frame = 0 on toggle: a CONVERGED
+        // still frame re-presents without tracing, so without the reset no
+        // ticket is ever traced. Every history is untouched; the funnel
+        // composite shows under every upscaler sub-mode.
+        if edges.toggle_waveviz {
+            if !gpu::trace::waveviz_on() {
+                eprintln!(
+                    "waveviz: not armed — relaunch with --waveviz (or \
+                     --waveviz chs for mode-1 closest-hit tickets)"
+                );
+            } else if !dxr_on {
+                eprintln!("waveviz: GPU modes only (SPACE into the wavefront or DXR arm)");
+            } else {
+                let on = !gpu::trace::waveviz_live();
+                gpu::trace::set_waveviz_live(on);
+                frame = 0;
+                eprintln!(
+                    "waveviz: {}",
+                    if on { "ON (wave-ticket overlay)" } else { "OFF" }
                 );
             }
         }
