@@ -266,6 +266,7 @@ pub fn self_test() -> Result<(), String> {
         source: String::new(),
         h2n: false,
         n2h: false,
+        normal_role: false,
         mips: Vec::new(),
     };
 

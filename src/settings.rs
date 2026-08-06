@@ -200,12 +200,25 @@ opt_fields! {
         pub h2n: bool,
         /// --no-n2h inverse (restart: load-time, keys the scene cache)
         pub n2h: bool,
+        /// --normal-strength K (restart: post-cache load-time multiply on
+        /// every material's normal_scale; 1.0 = bit-identical off arm)
+        pub normal_strength: f32,
         /// --no-tinted-shadows inverse (restart: load-time)
         pub tinted_shadows: bool,
         /// --no-spray inverse (restart: keys the scene cache)
         pub spray: bool,
         /// --no-depth-tint inverse (restart)
         pub depth_tint: bool,
+        /// --no-detail-tex inverse (restart)
+        pub detail_tex: bool,
+        /// --no-detail-ao inverse (restart)
+        pub detail_ao: bool,
+        /// --detail-strength K (restart: grain family multiplier, 1.0 = off arm)
+        pub detail_strength: f32,
+        /// --detail-ao-strength K (restart: pools/cavity/shadows multiplier)
+        pub detail_ao_strength: f32,
+        /// --no-amb-bump inverse (restart)
+        pub amb_bump: bool,
         /// --no-water inverse (restart: keys the scene cache)
         pub water: bool,
     }
@@ -808,6 +821,27 @@ pub fn apply_to_opts(s: &Settings, opts: &mut crate::Opts) -> AppliedFx {
             warn("effects.aniso", &n.to_string());
         }
     }
+    if let Some(k) = e.normal_strength {
+        if k.is_finite() && (0.0..=8.0).contains(&k) {
+            opts.normal_strength = k;
+        } else {
+            warn("effects.normal_strength", &k.to_string());
+        }
+    }
+    if let Some(k) = e.detail_strength {
+        if k.is_finite() && (0.0..=4.0).contains(&k) {
+            opts.detail_strength = k;
+        } else {
+            warn("effects.detail_strength", &k.to_string());
+        }
+    }
+    if let Some(k) = e.detail_ao_strength {
+        if k.is_finite() && (0.0..=4.0).contains(&k) {
+            opts.detail_ao_strength = k;
+        } else {
+            warn("effects.detail_ao_strength", &k.to_string());
+        }
+    }
     if let Some(n) = e.cloud_shadow {
         if n == 0 || (2..=64).contains(&n) {
             opts.cloud_shadow = n;
@@ -836,6 +870,15 @@ pub fn apply_to_opts(s: &Settings, opts: &mut crate::Opts) -> AppliedFx {
     }
     if let Some(v) = e.depth_tint {
         opts.depth_tint = v;
+    }
+    if let Some(v) = e.detail_tex {
+        opts.detail_tex = v;
+    }
+    if let Some(v) = e.detail_ao {
+        opts.detail_ao = v;
+    }
+    if let Some(v) = e.amb_bump {
+        opts.amb_bump = v;
     }
     if let Some(v) = e.water {
         opts.water = v;
@@ -1046,6 +1089,7 @@ pub fn menu_items() -> &'static [MenuItem] {
             item!("emissive_lights", "emissive lights", "Effects", Live, Toggle { default: false }, acc_bool!(effects.emissive_lights)),
             item!("emissive_lights_count", "emissive light budget", "Effects", Restart, StepU { min: 8, max: 64, step: 8, default: 32 }, acc_u32!(effects.emissive_lights_count)),
             item!("aniso", "max anisotropy", "Effects", Restart, Cycle { options: &["1", "2", "4", "8", "16"], default_ix: 4 }, acc_u32!(effects.aniso)),
+            item!("normal_strength", "normal-map strength", "Effects", Restart, StepF { min: 0.0, max: 8.0, step: 0.5, default: 1.0 }, acc_f32!(effects.normal_strength)),
             item!("cloud_shadow", "cloud shadow cache (cells/λ; off)", "Effects", Restart, Cycle { options: &["off", "8", "16", "32", "64"], default_ix: 2 }, ((|s: &Settings| s.effects.cloud_shadow.map(|v| if v == 0 { "off".into() } else { v.to_string() })), (|s: &mut Settings, v: &str| {
                 s.effects.cloud_shadow = if v == "off" { Some(0) } else { v.parse().ok() };
             }))),
@@ -1058,6 +1102,11 @@ pub fn menu_items() -> &'static [MenuItem] {
             item!("tinted_shadows", "tinted glass shadows", "Effects", Restart, Toggle { default: true }, acc_bool!(effects.tinted_shadows)),
             item!("spray", "spray reclassification", "Effects", Restart, Toggle { default: true }, acc_bool!(effects.spray)),
             item!("depth_tint", "water depth tint", "Effects", Restart, Toggle { default: true }, acc_bool!(effects.depth_tint)),
+            item!("detail_tex", "detail textures", "Effects", Restart, Toggle { default: true }, acc_bool!(effects.detail_tex)),
+            item!("detail_ao", "detail cavity AO", "Effects", Restart, Toggle { default: true }, acc_bool!(effects.detail_ao)),
+            item!("detail_strength", "detail grain strength", "Effects", Restart, StepF { min: 0.0, max: 4.0, step: 0.25, default: 0.5 }, acc_f32!(effects.detail_strength)),
+            item!("detail_ao_strength", "detail AO strength", "Effects", Restart, StepF { min: 0.0, max: 4.0, step: 0.125, default: 0.125 }, acc_f32!(effects.detail_ao_strength)),
+            item!("amb_bump", "ambient bump response", "Effects", Restart, Toggle { default: true }, acc_bool!(effects.amb_bump)),
             item!("water", "water material class", "Effects", Restart, Toggle { default: true }, acc_bool!(effects.water)),
             // ── Scene
             item!("world", "world mode (flagless boot)", "Scene", Restart, Toggle { default: true }, acc_bool!(scene.world)),

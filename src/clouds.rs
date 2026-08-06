@@ -546,7 +546,7 @@ pub(crate) fn vnoise_vg(q: Vec2, oct: u32) -> (f32, Vec2) {
 /// This is the erosion field's noise — genuinely varying in all three axes,
 /// which is what breaks the nested-level-set structure a 2D field is stuck
 /// with. Same floor-then-cast discipline as `vnoise`.
-fn vnoise3(q: Vec3A, oct: u32) -> f32 {
+pub(crate) fn vnoise3(q: Vec3A, oct: u32) -> f32 {
     let fx = q.x.floor();
     let fy = q.y.floor();
     let fz = q.z.floor();
@@ -575,6 +575,19 @@ fn vnoise3(q: Vec3A, oct: u32) -> f32 {
 fn vnoise3_grad(q: Vec3A, oct: u32) -> Vec3A {
     let c = grad_cell(q);
     grad_from(corner_hashes3(c.i, c.j, c.k, oct), &c)
+}
+
+/// `vnoise3` plus its ANALYTIC gradient in ONE corner fetch — the 3D
+/// sibling of `vnoise_vg`, added for the world-space detail field (each
+/// octave wants value AND gradient; separate `vnoise3` + `vnoise3_grad`
+/// calls would fetch the 8 corner hashes twice). The value bit-equals
+/// `vnoise3` and the gradient bit-equals `vnoise3_grad` (G10b pins both):
+/// `value_from` is `vnoise3`'s trilerp verbatim over the shared fades, same
+/// association.
+pub(crate) fn vnoise3_vg(q: Vec3A, oct: u32) -> (f32, Vec3A) {
+    let c = grad_cell(q);
+    let h = corner_hashes3(c.i, c.j, c.k, oct);
+    (value_from(h, &c), grad_from(h, &c))
 }
 
 /// TWO gradients of the same cell at two octave ids — `curl_offset`'s pair.
@@ -621,6 +634,21 @@ fn grad_cell(q: Vec3A) -> GradCell {
         duy: 6.0 * ty * (1.0 - ty),
         duz: 6.0 * tz * (1.0 - tz),
     }
+}
+
+/// The value trilerp over one cell's 8 corner hashes — `vnoise3`'s
+/// expressions verbatim (same operand order, so the result is bit-equal to
+/// a fresh `vnoise3` call; G10b's pin depends on that).
+#[inline(always)]
+fn value_from(h: [f32; 8], c: &GradCell) -> f32 {
+    let [h000, h100, h010, h110, h001, h101, h011, h111] = h;
+    let a0 = h000 + (h100 - h000) * c.ux;
+    let b0 = h010 + (h110 - h010) * c.ux;
+    let c0 = a0 + (b0 - a0) * c.uy;
+    let a1 = h001 + (h101 - h001) * c.ux;
+    let b1 = h011 + (h111 - h011) * c.ux;
+    let c1 = a1 + (b1 - a1) * c.uy;
+    c0 + (c1 - c0) * c.uz
 }
 
 /// The gradient bilerps over one cell's 8 corner hashes — the old
@@ -1401,6 +1429,31 @@ pub fn self_test() -> Result<(), String> {
     }
     if !curl_fired {
         return Err("G10c: the curl field never displaces — the wind field is dead".into());
+    }
+
+    // G10d: vnoise3_vg is the fused (value, gradient) eval — value bit-equal
+    // to vnoise3, gradient bit-equal to vnoise3_grad, over the G10a probe
+    // set. The world-space detail field consumes it; a drifted trilerp would
+    // silently unpin the detail self-test's window-endpoint gate.
+    for i in 0..96 {
+        let q = Vec3A::new(
+            ((i % 8) as f32 - 3.3) * 0.73,
+            (((i / 8) % 4) as f32 - 1.6) * 1.19,
+            ((i / 32) as f32 - 0.9) * 2.41,
+        );
+        for oct in [6_u32, 7, 40, 43] {
+            let (v, g) = vnoise3_vg(q, oct);
+            if v.to_bits() != vnoise3(q, oct).to_bits() {
+                return Err(format!("G10d: vnoise3_vg value diverges from vnoise3 at {q:?} oct {oct}"));
+            }
+            let g2 = vnoise3_grad(q, oct);
+            if g.x.to_bits() != g2.x.to_bits()
+                || g.y.to_bits() != g2.y.to_bits()
+                || g.z.to_bits() != g2.z.to_bits()
+            {
+                return Err(format!("G10d: vnoise3_vg gradient diverges from vnoise3_grad at {q:?} oct {oct}"));
+            }
+        }
     }
 
     // G6: the advection identity — the field at time t IS the t=0 field

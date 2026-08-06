@@ -73,6 +73,19 @@
                                // keep the exact gather instead; an
                                // emissive-free scene never sets the bit, so
                                // its kernels are bit-identical)
+#define FLAG_DETAIL     32768u // Unreal-1 detail texturing (--no-detail-tex
+                               // clears; shade.hlsli's SHADE_MAT_TEXKIND arm
+                               // branches behind dlod < 0, unreachable on
+                               // untextured scenes — the DEPTH_TINT shape)
+#define FLAG_DETAIL_AO  65536u // detail cavity AO (--no-detail-ao clears;
+                               // shade.hlsli branches behind dh < 0, which
+                               // only the fired detail field sets — the same
+                               // runtime-lever shape as FLAG_DETAIL)
+#define FLAG_AMB_BUMP  131072u // ambient bump response (--no-amb-bump
+                               // clears; shade.hlsli::amb_irradiance
+                               // amplifies the SH ambient's response to the
+                               // n_g -> n_s deviation — n_s == n returns
+                               // the plain expression verbatim)
 
 cbuffer Frame : register(b0) {
     float4 cam_origin;   // xyz; w = inv_w
@@ -668,6 +681,54 @@ float3 cloud_vnoise3_grad(float3 q, uint oct) {
     float za = (h001 - h000) + ((h101 - h100) - (h001 - h000)) * ux;
     float zb = (h011 - h010) + ((h111 - h110) - (h011 - h010)) * ux;
     return float3(
+        dux * (xa + (xb - xa) * uz),
+        duy * (ya + (yb - ya) * uz),
+        duz * (za + (zb - za) * uy));
+}
+
+// Fused (value, gradient) eval of the SAME field (clouds.rs::vnoise3_vg) —
+// one 8-corner fetch serves both, for the world-space detail field whose
+// every octave wants value AND gradient. The value expression is
+// cloud_vnoise3's verbatim and the gradient cloud_vnoise3_grad's, same
+// operand order, so both halves are bit-equal to the standalone evals.
+void cloud_vnoise3_vg(float3 q, uint oct, out float v, out float3 g) {
+    float fx = floor(q.x);
+    float fy = floor(q.y);
+    float fz = floor(q.z);
+    int i = int(fx);
+    int j = int(fy);
+    int k = int(fz);
+    float tx = q.x - fx;
+    float ty = q.y - fy;
+    float tz = q.z - fz;
+    float ux = tx * tx * (3.0 - 2.0 * tx);
+    float uy = ty * ty * (3.0 - 2.0 * ty);
+    float uz = tz * tz * (3.0 - 2.0 * tz);
+    float dux = 6.0 * tx * (1.0 - tx);
+    float duy = 6.0 * ty * (1.0 - ty);
+    float duz = 6.0 * tz * (1.0 - tz);
+    float h000 = cloud_cell_hash3(i, j, k, oct);
+    float h100 = cloud_cell_hash3(i + 1, j, k, oct);
+    float h010 = cloud_cell_hash3(i, j + 1, k, oct);
+    float h110 = cloud_cell_hash3(i + 1, j + 1, k, oct);
+    float h001 = cloud_cell_hash3(i, j, k + 1, oct);
+    float h101 = cloud_cell_hash3(i + 1, j, k + 1, oct);
+    float h011 = cloud_cell_hash3(i, j + 1, k + 1, oct);
+    float h111 = cloud_cell_hash3(i + 1, j + 1, k + 1, oct);
+    float a0 = h000 + (h100 - h000) * ux;
+    float b0 = h010 + (h110 - h010) * ux;
+    float c0 = a0 + (b0 - a0) * uy;
+    float a1 = h001 + (h101 - h001) * ux;
+    float b1 = h011 + (h111 - h011) * ux;
+    float c1 = a1 + (b1 - a1) * uy;
+    v = c0 + (c1 - c0) * uz;
+    float xa = (h100 - h000) + ((h110 - h010) - (h100 - h000)) * uy;
+    float xb = (h101 - h001) + ((h111 - h011) - (h101 - h001)) * uy;
+    float ya = (h010 - h000) + ((h110 - h100) - (h010 - h000)) * ux;
+    float yb = (h011 - h001) + ((h111 - h101) - (h011 - h001)) * ux;
+    float za = (h001 - h000) + ((h101 - h100) - (h001 - h000)) * ux;
+    float zb = (h011 - h010) + ((h111 - h110) - (h011 - h010)) * ux;
+    g = float3(
         dux * (xa + (xb - xa) * uz),
         duy * (ya + (yb - ya) * uz),
         duz * (za + (zb - za) * uy));

@@ -89,6 +89,61 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 pub const ROUGH_LO: f32 = 0.25;
 pub const ROUGH_HI: f32 = 0.6;
 
+/// Round 4's dt WINDOW in seconds of ripple-clock delta (the 8K lesson).
+/// The clock advances by real wall time (main.rs's `cloud_time`), so at
+/// 8K's ~6-10 fps each frame steps the field 100-165 ms. MEASURED (the
+/// `ripple_probe` cargo test, world scale): the field stays COHERENT there
+/// — normal swing mean 1.4 / max 3.5 deg at 150 ms — and the first-order
+/// reconstruction stays near-EXACT (err <= 0.06 deg out to 250 ms; the
+/// original "value noise decorrelates" guess was WRONG, the user's
+/// slow-wide-waves observation right). What explodes is the MAGNITUDE of
+/// the TRUE motion: the reflected image moves 200-550 px/frame at 8K pixel
+/// density (water's rough 0.05 sits below ROUGH_LO so nothing damps it,
+/// grazing Fresnel drives wgt to ~1, and nothing clamps), and handing NGX
+/// accurate MVs of that size measured as severe water glitching where
+/// zeroing them measured much better — game MVs are normally tens of px,
+/// and the ripple field also STRETCHES (the disc reshapes), which a warp
+/// at that scale tears on. `ripple_dt_weight` scales the GRADIENT DELTA,
+/// so past DT_HI the whole path collapses onto the exact still-mirror
+/// unfold (gd = 0 IS the involution identity) — coarser, never
+/// wrong-signed. Also covers the stale-`prev_clock` seam (an FG res-move
+/// skip window leaves a multi-frame delta on the first paired frame).
+/// OPEN: the unfaded arm was only ever observed WITH the `wire_cam_far`
+/// f16 sky-compare bug live; FR_NGXFG_RIPPLEDT=off at 8K on the fixed
+/// build is the pending A/B that decides whether this fade can narrow
+/// (e.g. become magnitude-aware) or stands. Mirrored as HLSL literals in
+/// `cs_guides` — change all together. (Kernel-side lever only; the Rust
+/// twins always fade.)
+pub const RIPPLE_DT_LO: f32 = 1.0 / 30.0;
+pub const RIPPLE_DT_HI: f32 = 0.1;
+
+/// `1 - smoothstep(RIPPLE_DT_LO, RIPPLE_DT_HI, dt)` — round 4's confidence
+/// in the interval it is asked to reconstruct across. Exactly 1.0 at and
+/// below DT_LO (multiplying by it is the bitwise identity, so the validated
+/// regime is structurally untouched), exactly 0.0 at and past DT_HI. A
+/// negative dt (unphysical — the clock is monotone) reads as full
+/// confidence, which keeps the humility gate's adversarial probes live.
+pub fn ripple_dt_weight(dt: f32) -> f32 {
+    let t = ((dt - RIPPLE_DT_LO) / (RIPPLE_DT_HI - RIPPLE_DT_LO)).clamp(0.0, 1.0);
+    1.0 - t * t * (3.0 - 2.0 * t)
+}
+
+/// The `cam_far` value `GuideParams` must carry: `spec_hit_t` rides an R16F
+/// plane, so the sky sentinel the kernel's `t_r >= cam_far` compare sees is
+/// far ROUNDED TO f16 — RNE from the CPU arm (`dlss::st16`), possibly
+/// round-toward-zero from the GPU feed's typed-UAV store (D3D grants the
+/// latitude). Both land at or above far's f16 FLOOR, so the compare
+/// threshold is that floor; the exact f32 NEVER fires when f16 rounds far
+/// down (THE WORLD: 2*diag ~ 138.56 -> 138.5), which silently reopened the
+/// round-2 sky-parallax bug on every world water reflection. Known-accept:
+/// a genuine hit within one f16 quantum of far classifies as sky — at
+/// ~2*diag its parallax is ~zero anyway.
+pub fn wire_cam_far(far: f32) -> f32 {
+    let h = half::f16::from_f32(far);
+    let h = if h.to_f32() > far { half::f16::from_bits(h.to_bits() - 1) } else { h };
+    h.to_f32()
+}
+
 /// The firefly-MV dominance reference (round 3): a pixel whose summed glow
 /// luminance S reaches this value takes half the firefly MV, and a bright
 /// splat core (lum near the `FF_GLOW_L_MAX` cap, ~446 in luminance) lands at
@@ -119,7 +174,7 @@ cbuffer C : register(b0) {
     float4 rgt;  // right * tan(fov/2) * aspect (CamBasis pre-scaling)
     float4 upv;  // up * tan(fov/2)
     uint   rmv; float cam_far; float t_cur; float t_prev; // ripple clock (rides the old _pad)
-    float  diag; uint ripplemv; float2 _pad2;
+    float  diag; uint ripplemv; uint ripdt; float _pad2;
 }
 // Round 3: the CPU-baked firefly splat table (FfTable — layout in lockstep,
 // see the size assert beside it). ffc == 0 is the structural off.
@@ -193,23 +248,39 @@ void cs_guides(uint3 id : SV_DispatchThreadID) {
         float3 d = du;
         float amp = ripsrc[id.xy];
         if (ripplemv != 0 && amp > 0.0f) {
-            float3 n_c = normalize(nrough[id.xy].xyz);
-            // First-order previous normal: the ripple perturbs by SUBTRACTING
-            // the in-plane height gradient, so stepping the gradient back in
-            // time steps the normal back with it. Exact at dt = 0; the error
-            // is second order in amp*|g| (<= ~0.8 deg on water's ~14 deg
-            // tilt), well under the 1-3 deg/frame being corrected.
-            float2 gd = amp * (ripple_grad(hit_p, t_prev, diag)
-                             - ripple_grad(hit_p, t_cur, diag));
-            float3 g3 = float3(gd.x, 0.0f, gd.y);
-            float3 n_p = n_c - (g3 - n_c * dot(g3, n_c));
-            float nl = dot(n_p, n_p);
-            // A degenerate or horizon-crossing reconstruction falls back to
-            // n_c, i.e. to the exact pre-round-4 unfold. Coarser, never
-            // wrong-signed — the humble arm.
-            if (nl > 1e-12f) {
-                n_p *= rsqrt(nl);
-                if (dot(n_p, n_c) > 0.0f) d = reflect(reflect(du, n_c), n_p);
+            // dt-CONFIDENCE FADE (the 8K lesson): the clock advances by
+            // real wall time, so at 8K's ~6-10 fps each frame steps the
+            // field 100-165 ms. The reconstruction below stays near-EXACT
+            // there (probe-measured — see RIPPLE_DT_LO's doc), but the TRUE
+            // reflected motion reaches 200-550 px/frame at 8K density, far
+            // past what the FG warp consumes (the measured water glitch);
+            // fading the GRADIENT DELTA collapses the path onto the exact
+            // still-mirror unfold past RIPPLE_DT_HI (gd = 0 is the
+            // involution identity). Literals mirror ripple_dt_weight /
+            // RIPPLE_DT_LO/HI — change all together.
+            // FR_NGXFG_RIPPLEDT=off (ripdt == 0) is the unfaded repro arm.
+            float w_dt = 1.0f - smoothstep(1.0f / 30.0f, 0.1f, t_cur - t_prev);
+            if (ripdt == 0) w_dt = 1.0f;
+            if (w_dt > 0.0f) {
+                float3 n_c = normalize(nrough[id.xy].xyz);
+                // First-order previous normal: the ripple perturbs by
+                // SUBTRACTING the in-plane height gradient, so stepping the
+                // gradient back in time steps the normal back with it. Exact
+                // at dt = 0; the error is second order in amp*|g| (<= ~0.8
+                // deg on water's ~14 deg tilt), well under the 1-3 deg/frame
+                // being corrected — WITHIN the dt window above.
+                float2 gd = (amp * w_dt) * (ripple_grad(hit_p, t_prev, diag)
+                                          - ripple_grad(hit_p, t_cur, diag));
+                float3 g3 = float3(gd.x, 0.0f, gd.y);
+                float3 n_p = n_c - (g3 - n_c * dot(g3, n_c));
+                float nl = dot(n_p, n_p);
+                // A degenerate or horizon-crossing reconstruction falls back
+                // to n_c, i.e. to the exact pre-round-4 unfold. Coarser,
+                // never wrong-signed — the humble arm.
+                if (nl > 1e-12f) {
+                    n_p *= rsqrt(nl);
+                    if (dot(n_p, n_c) > 0.0f) d = reflect(reflect(du, n_c), n_p);
+                }
             }
         }
         float3 V = hit_p + d * t_r; // planar-unfold virtual point
@@ -337,9 +408,12 @@ pub fn virtual_prev_px(
 /// `ripple_normal` tilts by SUBTRACTING the in-plane height gradient, so
 /// stepping the gradient back in time steps the normal back with it. Exact at
 /// `t_prev == t_cur` (returns `n_c` bitwise, which is what makes the whole
-/// round-4 path collapse to round 2/3); second-order in `amp·|g|` otherwise.
-/// A degenerate or horizon-crossing result falls back to `n_c` — coarser,
-/// never wrong-signed.
+/// round-4 path collapse to round 2/3); second-order in `amp·|g|` otherwise —
+/// at water amplitudes that error stays under 0.06 deg out to 250 ms clock
+/// deltas (the `ripple_probe` test pins it), so the `ripple_dt_weight` fade
+/// exists for the resulting MV's MAGNITUDE, not for this function's accuracy
+/// (see RIPPLE_DT_LO's doc). A degenerate or horizon-crossing result falls
+/// back to `n_c` — coarser, never wrong-signed.
 pub fn ripple_prev_normal(
     n_c: Vec3A,
     hit_p: Vec3A,
@@ -351,9 +425,15 @@ pub fn ripple_prev_normal(
     if amp <= 0.0 {
         return n_c;
     }
+    // The dt-confidence fade (the 8K lesson — see RIPPLE_DT_LO/HI): past the
+    // window the reconstruction is noise, so it collapses to n_c exactly.
+    let w_dt = ripple_dt_weight(t_cur - t_prev);
+    if w_dt <= 0.0 {
+        return n_c;
+    }
     let gd = (crate::shade::ripple_grad(hit_p, t_prev, diag)
         - crate::shade::ripple_grad(hit_p, t_cur, diag))
-        * amp;
+        * (amp * w_dt);
     let g3 = Vec3A::new(gd.x, 0.0, gd.y);
     let n_p = n_c - (g3 - n_c * g3.dot(n_c));
     let nl = n_p.length_squared();
@@ -394,8 +474,11 @@ pub fn ripple_virtual_prev_px(
     diag: f32,
 ) -> Option<(f32, f32)> {
     // The off arm CALLS the still-mirror twin, so "bit-identical when the
-    // feature is off" is true by construction and not by re-derivation.
-    if amp <= 0.0 {
+    // feature is off" is true by construction and not by re-derivation — and
+    // the dt fade's floor (w_dt == 0, dt >= RIPPLE_DT_HI) takes the same arm:
+    // past the window the reconstructed normal is n_c, and the involution
+    // identity makes that the still-mirror answer exactly.
+    if amp <= 0.0 || ripple_dt_weight(t_cur - t_prev) <= 0.0 {
         return virtual_prev_px(
             cx, cy, w, h, view_z, t_r, cam_far, origin, fwd, right_s, up_s, m,
         );
@@ -628,7 +711,11 @@ pub struct GuideParams {
     pub diag: f32,
     /// `FR_NGXFG_RIPPLEMV=off` clears it (0 = the pre-round-4 kernel stream).
     pub ripplemv: u32,
-    pub _pad2: [f32; 2],
+    /// `FR_NGXFG_RIPPLEDT=off` clears it (0 = the unfaded reconstruction —
+    /// the 8K low-framerate repro arm; 1 = the shipped dt-confidence fade,
+    /// see `RIPPLE_DT_LO`/`RIPPLE_DT_HI`).
+    pub ripdt: u32,
+    pub _pad2: f32,
 }
 const PARAM_DWORDS: u32 = (std::mem::size_of::<GuideParams>() / 4) as u32;
 const _: () = assert!(std::mem::size_of::<GuideParams>() == 44 * 4);
@@ -1885,25 +1972,38 @@ pub fn self_test() -> std::result::Result<(), String> {
     // reaching it means the probe is vacuous, which is itself a failure.
     {
         let (cx, cy, view_z, t_r) = (216.5f32, 162.5f32, 6.0f32, 30.0f32);
+        // The scan stays INSIDE the dt-confidence window — past RIPPLE_DT_HI
+        // the fade zeroes the reconstruction by design, and that arm is
+        // (r-h)'s to pin; a probe out there would measure the fade, not the
+        // reconstruction. Several base phases, because the swell is
+        // oscillatory and a single phase can sit near a zero-crossing of the
+        // field's time derivative (the original single-phase probe only
+        // reached its bar at deltas the fade now rejects).
         let mut fired = None;
-        for k in 1..=24 {
-            let dt = k as f32 / 60.0;
-            let (mx, my) = ripple_virtual_prev_px(
-                cx, cy, rw as f32, rh as f32, view_z, t_r, far, org, fwd, rgt, upv,
-                &world_to_clip, // PARKED: prev matrices == current
-                n_flat, dt, 0.0, amp, diag,
-            )
-            .ok_or("ripple parked probe went behind the image plane")?;
-            let mv = ((mx - cx).powi(2) + (my - cy).powi(2)).sqrt();
-            if mv >= 5.0 {
-                fired = Some((dt, mv));
-                break;
+        let mut best = 0.0f32;
+        'scan: for pi in 0..8 {
+            let t0 = pi as f32 * 1.37;
+            for k in 1..=5 {
+                let dt = k as f32 / 60.0;
+                let (mx, my) = ripple_virtual_prev_px(
+                    cx, cy, rw as f32, rh as f32, view_z, t_r, far, org, fwd, rgt, upv,
+                    &world_to_clip, // PARKED: prev matrices == current
+                    n_flat, t0 + dt, t0, amp, diag,
+                )
+                .ok_or("ripple parked probe went behind the image plane")?;
+                let mv = ((mx - cx).powi(2) + (my - cy).powi(2)).sqrt();
+                best = best.max(mv);
+                if mv >= 2.0 {
+                    fired = Some((dt, mv, t0));
+                    break 'scan;
+                }
             }
         }
-        let Some((dt, mv)) = fired else {
-            return Err(
-                "ripple parked probe never reached 5 px of motion — the gate is vacuous".into(),
-            );
+        let Some((dt, mv, t0)) = fired else {
+            return Err(format!(
+                "ripple parked probe never reached 2 px of motion inside the dt window \
+                 (best {best:.3} px) — the gate is vacuous"
+            ));
         };
         // TEETH: the still-mirror answer at the SAME parked pose. It is the
         // pre-round-4 behavior AND the surface MV, and both are ~0 — if this
@@ -1928,7 +2028,7 @@ pub fn self_test() -> std::result::Result<(), String> {
         let ndy = 1.0 - cy * (2.0 / rh as f32);
         let du = (fwd + rgt * ndx + upv * ndy).normalize();
         let hit_p = org + du * (view_z / du.dot(fwd));
-        let n_p = ripple_prev_normal(n_flat, hit_p, dt, 0.0, amp, diag);
+        let n_p = ripple_prev_normal(n_flat, hit_p, t0 + dt, t0, amp, diag);
         let refl = |i: Vec3A, n: Vec3A| i - n * (2.0 * i.dot(n));
         let r_cur = refl(du, n_flat);
         let back = refl(refl(r_cur, n_p), n_p); // reflect off n_p and back
@@ -2037,6 +2137,269 @@ pub fn self_test() -> std::result::Result<(), String> {
         }
     }
 
+    // (r-h) THE dt-CONFIDENCE FADE (the 8K lesson). The reconstruction is
+    // only valid over ~60 fps clock deltas; at 8K's ~6-10 fps the wall-clock
+    // ripple clock steps 100-165 ms per frame and the unfaded n_p is noise —
+    // the world-water FG glitch. Past RIPPLE_DT_HI the twin must collapse
+    // onto the still-mirror twin BITWISE (the delegate arm); weight anchors
+    // pin the window's shape; both edges are continuous so a session whose
+    // framerate drifts across the window never pops.
+    {
+        if ripple_dt_weight(0.0) != 1.0 || ripple_dt_weight(RIPPLE_DT_LO) != 1.0 {
+            return Err("ripple dt weight must be exactly 1 through RIPPLE_DT_LO".into());
+        }
+        if ripple_dt_weight(-1.0) != 1.0 {
+            return Err("ripple dt weight at negative dt must be 1 (the humility probes)".into());
+        }
+        if ripple_dt_weight(RIPPLE_DT_HI) != 0.0 || ripple_dt_weight(10.0) != 0.0 {
+            return Err("ripple dt weight must be exactly 0 at and past RIPPLE_DT_HI".into());
+        }
+        let mid_dt = 0.5 * (RIPPLE_DT_LO + RIPPLE_DT_HI);
+        let mid = ripple_dt_weight(mid_dt);
+        if (mid - 0.5).abs() > 1e-6 {
+            return Err(format!("ripple dt weight midpoint = {mid}, want 0.5"));
+        }
+        let mut prev_w = f32::INFINITY;
+        for k in 0..=64 {
+            let w = ripple_dt_weight(k as f32 * RIPPLE_DT_HI / 32.0);
+            if w > prev_w {
+                return Err("ripple dt weight not monotone".into());
+            }
+            prev_w = w;
+        }
+        let (cx, cy, view_z, t_r) = (216.5f32, 162.5f32, 6.0f32, 30.0f32);
+        let at_dt = |dt: f32| {
+            ripple_virtual_prev_px(
+                cx, cy, rw as f32, rh as f32, view_z, t_r, far, org, fwd, rgt, upv,
+                &world_to_clip, n_flat, dt, 0.0, amp, diag,
+            )
+        };
+        let still = virtual_prev_px(
+            cx, cy, rw as f32, rh as f32, view_z, t_r, far, org, fwd, rgt, upv, &world_to_clip,
+        );
+        let (sx, sy) = still.ok_or("ripple fade: still-mirror arm missing")?;
+        // ANTI-VACUITY: inside the window the reconstruction must actually
+        // move at this pose, or the collapse pins below prove nothing.
+        let (mx, my) = at_dt(mid_dt).ok_or("ripple fade: mid-window arm missing")?;
+        if ((mx - sx).powi(2) + (my - sy).powi(2)).sqrt() < 0.05 {
+            return Err("ripple fade gate is vacuous — mid-window MV ~ still-mirror".into());
+        }
+        // The collapse: dt at/past the window is the still-mirror twin to
+        // the BIT — 0.166 s is 6 fps, the measured 8K regime.
+        for dt in [RIPPLE_DT_HI, 0.166, 0.25, 1.0] {
+            let got = at_dt(dt).map(|(a, b)| (a.to_bits(), b.to_bits()));
+            let want = still.map(|(a, b)| (a.to_bits(), b.to_bits()));
+            if got != want {
+                return Err(format!(
+                    "ripple fade at dt={dt}: not bit-identical to the still-mirror twin"
+                ));
+            }
+        }
+        // Edge continuity (the 1e-3 s of field motion inside these probes is
+        // itself far under half a pixel at this pose).
+        let (ax, ay) = at_dt(RIPPLE_DT_HI - 1e-3).ok_or("ripple fade: HI-edge arm")?;
+        if ((ax - sx).powi(2) + (ay - sy).powi(2)).sqrt() > 0.5 {
+            return Err("ripple fade pops at the RIPPLE_DT_HI edge".into());
+        }
+        let (bx, by) = at_dt(RIPPLE_DT_LO).ok_or("ripple fade: LO arm")?;
+        let (ex, ey) = at_dt(RIPPLE_DT_LO + 1e-3).ok_or("ripple fade: LO-edge arm")?;
+        if ((bx - ex).powi(2) + (by - ey).powi(2)).sqrt() > 0.5 {
+            return Err("ripple fade pops at the RIPPLE_DT_LO edge".into());
+        }
+    }
+
+    // (r-i) RECONSTRUCTION FIDELITY — the gate that never existed, and the
+    // hole the 8K glitch lived in: inside the validity window,
+    // `ripple_prev_normal` must agree with the function it claims to
+    // reconstruct — `shade::ripple_normal` actually evaluated at t_prev —
+    // not merely satisfy its own involution. Flat ocean (base == geometric
+    // n == Y, the rungholt/vokselia shape), a grid of hit points and phases,
+    // dt at 120/60/30 fps.
+    {
+        let mut worst = 0.0f32;
+        for &dt in &[1.0 / 120.0, 1.0 / 60.0, RIPPLE_DT_LO] {
+            for i in 0..5 {
+                for j in 0..5 {
+                    let hit_p = Vec3A::new(i as f32 * 3.7 - 7.0, 0.0, j as f32 * 2.9 - 6.0);
+                    for &t_cur in &[0.7f32, 9.3, 41.0] {
+                        let t_prev = t_cur - dt;
+                        let n_c =
+                            crate::shade::ripple_normal(n_flat, n_flat, hit_p, t_cur, amp, diag);
+                        let truth =
+                            crate::shade::ripple_normal(n_flat, n_flat, hit_p, t_prev, amp, diag);
+                        let got = ripple_prev_normal(n_c, hit_p, t_cur, t_prev, amp, diag);
+                        let ang = got.dot(truth).clamp(-1.0, 1.0).acos().to_degrees();
+                        worst = worst.max(ang);
+                    }
+                }
+            }
+        }
+        // The first-order bound is ~0.8 deg at 60 fps deltas; 2 deg gives
+        // headroom at the 30 fps edge without admitting a wrong-signed
+        // reconstruction (the swing being corrected is 1-3+ deg/frame).
+        if worst > 2.0 {
+            return Err(format!(
+                "ripple fidelity: reconstructed previous normal {worst:.3} deg off \
+                 shade::ripple_normal(t_prev) inside the dt window, want <= 2 deg"
+            ));
+        }
+    }
+
+    // (r-j) THE f16 SKY COMPARE (`wire_cam_far`). spec_hit_t rides an R16F
+    // plane, so the sky sentinel the kernel's `t_r >= cam_far` sees is
+    // f16(far); at a far that f16 rounds DOWN (THE WORLD's 2*diag ~ 138.56)
+    // an exact-f32 threshold never fires and every sky reflection takes the
+    // finite-point branch — false translation parallax, the round-2 class
+    // reopened by the wire format. TEETH: the exact-f32 compare must FAIL
+    // the same probe.
+    {
+        // 138.56: RNE rounds DOWN (the world's shape). 138.7: RNE rounds UP
+        // — there the CPU-arm sentinel clears an exact compare but a
+        // truncating GPU store (D3D latitude) still would not; the floor
+        // threshold covers both.
+        for &far_w in &[138.56f32, 138.7] {
+            let wire = wire_cam_far(far_w);
+            if wire >= far_w {
+                return Err(format!(
+                    "wire_cam_far({far_w}) = {wire} — probe far is f16-exact, pick another"
+                ));
+            }
+            if crate::fsr::q16(wire) != wire {
+                return Err(format!("wire_cam_far({far_w}) = {wire} not f16-representable"));
+            }
+            // Both stores land at or above the floor: RNE (the CPU arm)...
+            let rne = crate::fsr::q16(far_w);
+            if rne < wire {
+                return Err(format!("RNE sentinel {rne} below wire_cam_far {wire}"));
+            }
+            // ...and the floor itself (a truncating GPU store).
+            if wire > rne {
+                return Err(format!("wire_cam_far {wire} above the RNE sentinel {rne}"));
+            }
+        }
+        let far_w = 138.56f32;
+        let wire = wire_cam_far(far_w);
+        let sentinel = crate::fsr::q16(far_w);
+        if sentinel >= far_w {
+            return Err("sky-compare teeth need a far that f16 rounds down".into());
+        }
+        // Behavioral: pure strafe, sky sentinel on the plane. The floor
+        // threshold classifies sky (a direction — translation-invariant);
+        // the exact-f32 threshold takes the point branch and moves.
+        let strafe_cam = Camera { pos: cam.pos + rgt.normalize() * 0.3, ..cam };
+        let strafe_mats = crate::dlss::cam_matrices(&strafe_cam, rw, rh, near, far_w);
+        let m_strafe = strafe_mats.view_to_clip * strafe_mats.world_to_view;
+        let (cx, cy, view_z) = (216.5f32, 162.5f32, 2.5f32);
+        let (fx, fy) = virtual_prev_px(
+            cx, cy, rw as f32, rh as f32, view_z, sentinel, wire, org, fwd, rgt, upv, &m_strafe,
+        )
+        .ok_or("sky-compare: fixed arm missing")?;
+        let mv_fixed = ((fx - cx).powi(2) + (fy - cy).powi(2)).sqrt();
+        if mv_fixed > 0.05 {
+            return Err(format!(
+                "sky-compare: wire_cam_far still translates the reflected sky ({mv_fixed} px)"
+            ));
+        }
+        let (ox, oy) = virtual_prev_px(
+            cx, cy, rw as f32, rh as f32, view_z, sentinel, far_w, org, fwd, rgt, upv, &m_strafe,
+        )
+        .ok_or("sky-compare: pre-fix arm missing")?;
+        let mv_old = ((ox - cx).powi(2) + (oy - cy).powi(2)).sqrt();
+        if mv_old <= 0.05 {
+            return Err(
+                "sky-compare gate is TOOTHLESS: the exact-f32 threshold also lands at ~0".into(),
+            );
+        }
+    }
+
     eprintln!("ngxfg-guides self-test: OK");
     Ok(())
+}
+
+// The empirical basis of the round-4 dt story, pinned so it cannot silently
+// rot: the ripple field stays COHERENT at low-framerate clock deltas (the
+// waves are slow and wide — normal swing ~1.4 deg mean at 150 ms) and the
+// UNFADED first-order reconstruction stays near-exact out to 250 ms. The
+// `ripple_dt_weight` fade therefore exists for the resulting MV's MAGNITUDE
+// (200-550 px/frame at 8K density — past what the FG warp consumes), NOT for
+// reconstruction accuracy — if a field retune ever breaks either premise,
+// this test is what says the fade needs re-deriving.
+#[cfg(test)]
+mod ripple_probe {
+    use glam::Vec3A;
+
+    #[test]
+    fn field_coherence_stats() {
+        let diag = 69.0f32; // THE WORLD's scale
+        let amp = crate::scene::WATER_RIPPLE_AMP;
+        let n = Vec3A::Y;
+        let ang = |a: Vec3A, b: Vec3A| a.dot(b).clamp(-1.0, 1.0).acos().to_degrees();
+        for &dt in &[1.0f32 / 60.0, 1.0 / 30.0, 0.05, 0.1, 0.15, 0.25] {
+            let (mut sw_max, mut sw_sum) = (0f32, 0f32);
+            let (mut er_max, mut er_sum) = (0f32, 0f32);
+            let mut cnt = 0u32;
+            for i in 0..12 {
+                for j in 0..12 {
+                    let p = Vec3A::new(i as f32 * 2.13 - 12.0, 0.0, j as f32 * 1.87 - 11.0);
+                    for pi in 0..6 {
+                        let t0 = pi as f32 * 2.29;
+                        let t1 = t0 + dt;
+                        let n_c = crate::shade::ripple_normal(n, n, p, t1, amp, diag);
+                        let truth = crate::shade::ripple_normal(n, n, p, t0, amp, diag);
+                        // The UNFADED first-order reconstruction (the pre-fade
+                        // kernel, replicated so the shipping fade doesn't hide it).
+                        let gd = (crate::shade::ripple_grad(p, t0, diag)
+                            - crate::shade::ripple_grad(p, t1, diag))
+                            * amp;
+                        let g3 = Vec3A::new(gd.x, 0.0, gd.y);
+                        let n_p = (n_c - (g3 - n_c * g3.dot(n_c))).normalize();
+                        let swing = ang(n_c, truth);
+                        let err = ang(n_p, truth);
+                        sw_max = sw_max.max(swing);
+                        sw_sum += swing;
+                        er_max = er_max.max(err);
+                        er_sum += err;
+                        cnt += 1;
+                    }
+                }
+            }
+            // ~px per radian at 8K (4320 px over fov_y 0.9); reflected content
+            // moves at 2x the normal swing, sky content maps 1:1 through it.
+            let px8k = 4470.0f32;
+            let mv = |deg: f32| 2.0 * deg.to_radians() * px8k;
+            eprintln!(
+                "dt={dt:.3}s | normal swing mean {:.3} max {:.3} deg | rec err mean {:.4} \
+                 max {:.4} deg | reflected MV @8K mean {:.0} max {:.0} px | MV err mean \
+                 {:.1} max {:.1} px",
+                sw_sum / cnt as f32,
+                sw_max,
+                er_sum / cnt as f32,
+                er_max,
+                mv(sw_sum / cnt as f32),
+                mv(sw_max),
+                mv(er_sum / cnt as f32),
+                mv(er_max)
+            );
+            // COHERENCE: the field must remain smooth at low-framerate deltas
+            // (measured max 3.5 deg at 150 ms / 5.3 deg at 250 ms — a field
+            // that swings tens of degrees per frame would re-open the
+            // confident-wrong-MV class the fade's zero answer relies on
+            // being mild).
+            if sw_max > 12.0 {
+                panic!(
+                    "ripple field swings {sw_max} deg over dt={dt} — no longer the \
+                     slow-wide-waves regime the round-4 fade was derived in"
+                );
+            }
+            // ACCURACY: the unfaded reconstruction stays near-exact at every
+            // dt (measured <= 0.06 deg at 250 ms; 0.5 deg is ~10x headroom).
+            // If this fails, the fade is no longer "magnitude, not math".
+            if er_max > 0.5 {
+                panic!(
+                    "ripple reconstruction err {er_max} deg at dt={dt} — the first-order \
+                     model broke, re-derive the round-4 story"
+                );
+            }
+        }
+    }
 }

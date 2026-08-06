@@ -483,6 +483,7 @@ fn decode_tex_records(recs: Vec<TexRecord>) -> Vec<Texture> {
                                 source: String::new(),
                                 h2n: false,
                                 n2h: false,
+                                normal_role: false,
                                 mips: Vec::new(),
                             }
                         }
@@ -651,6 +652,7 @@ pub fn try_load(src_path: &str) -> Option<(Scene, Bvh)> {
         diag: 0.0,
         eps: 0.0,
         ao_radius: 0.0,
+        detail_scales: Vec::new(),
         content_min: glam::Vec3A::ZERO,
         content_max: glam::Vec3A::ZERO,
     };
@@ -1006,6 +1008,7 @@ pub fn try_load_world(
         diag: 0.0,
         eps: 0.0,
         ao_radius: 0.0,
+        detail_scales: Vec::new(),
         content_min: glam::Vec3A::ZERO,
         content_max: glam::Vec3A::ZERO,
     };

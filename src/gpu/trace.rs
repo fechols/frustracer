@@ -1646,7 +1646,7 @@ struct GpuBvhNode {
 }
 
 /// scene.rs::Material packed for StructuredBuffer<Mat> (shade.hlsli).
-/// 100 B — the HLSL `Mat` mirrors this field-for-field; a stride skew reads
+/// 104 B — the HLSL `Mat` mirrors this field-for-field; a stride skew reads
 /// garbage, so the two must move in the same commit.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -1671,6 +1671,9 @@ struct GpuMat {
     trans_tint: [f32; 3], // transmission/absorption tint; .x < 0 = "use albedo"
     ior: f32,             // Snell/Fresnel IOR (default 1.5; water 1.33)
     ripple_amp: f32,      // water ripple slope amplitude (0 = none)
+    // Per-material world-space detail texel scale (Scene::detail_scales —
+    // never per-face, which seams on greedy-meshed atlases). 0 = field off.
+    detail_scale: f32,
 }
 
 /// Bytes of reusable staging streamed per blocking submit — bounds the
@@ -2056,7 +2059,8 @@ impl SceneGpu {
         let materials: Vec<GpuMat> = scene
             .materials
             .iter()
-            .map(|m| GpuMat {
+            .enumerate()
+            .map(|(mi, m)| GpuMat {
                 albedo: [m.albedo.x, m.albedo.y, m.albedo.z],
                 roughness: m.roughness,
                 metallic: m.metallic,
@@ -2086,6 +2090,7 @@ impl SceneGpu {
                 trans_tint: [m.trans_tint.x, m.trans_tint.y, m.trans_tint.z],
                 ior: m.ior,
                 ripple_amp: m.ripple_amp,
+                detail_scale: scene.detail_scales.get(mi).copied().unwrap_or(0.0),
             })
             .collect();
         let materials_b = stream_buffer(device, sub, &ring, &materials, |m| *m, srv)?;
@@ -3487,6 +3492,22 @@ fn wavefront_ablation_defs() -> String {
 
 /// HLSL prelude every compile unit takes: the `--spp` jitter table's row count
 /// (`FrameCb::jitters`, hand-mirrored in trace_common.hlsli's cbuffer). The
+/// The detail strength knobs (`--detail-strength` / `--detail-ao-strength`)
+/// as compile-time defines for shade.hlsli's DETAIL_STR/DETAIL_AO_STR seams
+/// (which default to 1.0 by #ifndef, so the file stands alone). Session
+/// constants (restart tier — kernels compile at construction), injected into
+/// every unit that pastes SHADE_HLSLI on BOTH pipelines: the probe-reach
+/// rule — a define that misses one shade unit silently splits the arms.
+/// `{:.9e}` = past-f32 significant digits, so HLSL parses back the exact
+/// bits the CPU statics hold (the spp_defs SKY_J idiom).
+pub(crate) fn detail_defs() -> String {
+    format!(
+        "#define DETAIL_STR {:.9e}\n#define DETAIL_AO_STR {:.9e}",
+        crate::scene::detail_strength(),
+        crate::scene::detail_ao_strength()
+    )
+}
+
 /// SIZE is derived from `dlss::MAX_SPP` rather than written twice — a literal
 /// there would be a third constant to raise in lockstep, and a shader reading
 /// past a too-small array is silent (no gate can see it). Injected like
@@ -4278,6 +4299,24 @@ pub const FLAG_SWAY_MV: u32 = 8192;
 /// shape).
 pub const FLAG_EMISSIVE: u32 = 16384;
 
+/// Unreal-1 detail texturing (`--no-detail-tex` clears it): procedural
+/// close-up albedo grain + micro-bump on MAGNIFIED textured hits
+/// (shade.hlsli branches inside the SHADE_MAT_TEXKIND arm behind `dlod < 0`,
+/// which untextured scenes never enter — the FLAG_DEPTH_TINT shape, no
+/// compile define needed).
+pub const FLAG_DETAIL: u32 = 32768;
+
+/// Detail cavity AO (`--no-detail-ao` clears it): the detail field's pits
+/// darken ambient + direct specular (shade.hlsli branches behind `dh < 0`,
+/// which only the fired field sets — the FLAG_DETAIL runtime-lever shape).
+pub const FLAG_DETAIL_AO: u32 = 65536;
+
+/// Ambient bump response (`--no-amb-bump` clears it): shade.hlsli's
+/// `amb_irradiance` amplifies the SH ambient's response to the n_g → n_s
+/// deviation (normal maps + detail bump + ripple) — flat-shaded geometry
+/// (n_s == n) takes the plain expression verbatim, the runtime-lever shape.
+pub const FLAG_AMB_BUMP: u32 = 131072;
+
 /// `GBufCore` stride in bytes — lockstep with trace_common.hlsli (one float4:
 /// mv.xy | view_z | prev_z).
 pub const GBUF_STRIDE: u64 = 16;
@@ -4548,7 +4587,14 @@ impl FrameCb {
             | ((self.el_meta[0] > 0
                 && crate::emissive::enabled()
                 && fb_mode_of(&p.q) != 2) as u32
-                * FLAG_EMISSIVE);
+                * FLAG_EMISSIVE)
+            // The --no-detail-tex lever, read at CB-build time (the
+            // depth-tint shape) — the branch lives inside shade.hlsli's
+            // SHADE_MAT_TEXKIND arm behind dlod < 0, which untextured
+            // scenes never enter.
+            | (crate::scene::detail_tex() as u32 * FLAG_DETAIL)
+            | (crate::scene::detail_ao() as u32 * FLAG_DETAIL_AO)
+            | (crate::scene::amb_bump() as u32 * FLAG_AMB_BUMP);
         cb.shadow_samples = p.q.shadow_samples;
         cb.ao_samples = p.q.ao_samples;
         cb.reflections = p.q.reflections as u32;
@@ -4948,6 +4994,9 @@ impl TraceGpu {
         // The cbuffer's jitter-table size (--spp) — every unit sees the cbuffer.
         let sd = spp_defs();
         let sd = sd.as_str();
+        // The detail strength knobs — every unit that pastes SHADE_HLSLI.
+        let dd = detail_defs();
+        let dd = dd.as_str();
         // --sw-rays: rt_sw.hlsli pastes in place of rt.hlsli in every
         // ray-shooting unit (leaf x2, reference, hemi_wave, hemi_leaf); the
         // wavefront unit gets the SW_RAYS define too (level_finish's leaf-cut
@@ -5017,6 +5066,7 @@ impl TraceGpu {
             defs,
             sw_defs,
             sd,
+            dd,
             TRACE_COMMON_HLSLI,
             SKYLOD_HLSLI,
             rt_src,
@@ -5082,6 +5132,7 @@ impl TraceGpu {
                 sw_defs,
                 sw_leaf_defs,
                 sd,
+                dd,
                 TRACE_COMMON_HLSLI,
                 CTR_HLSLI,
                 QUEUES_HLSLI,
@@ -5121,6 +5172,7 @@ impl TraceGpu {
             defs,
             sw_defs,
             sd,
+            dd,
             TRACE_COMMON_HLSLI,
             CTR_HLSLI,
             HEMI_HLSLI,

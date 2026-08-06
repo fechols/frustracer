@@ -657,6 +657,9 @@ impl DxrGpu {
         // The cbuffer's --spp jitter-table size, injected like alpha_defs.
         let sd = trace::spp_defs();
         let sd = sd.as_str();
+        // The detail strength knobs (shade.hlsli's DETAIL_STR seams).
+        let dd = trace::detail_defs();
+        let dd = dd.as_str();
         let sway_def = trace::sway_defs(&scene_gpu);
         let defs = format!(
             "{}\n{}\n{}\n{}\n{}\n{}\n{}",
@@ -738,7 +741,7 @@ impl DxrGpu {
             false
         };
         let inline_def = format!("#define DXR_INLINE_SEC {inline_mode}");
-        let mut parts = vec![defs.as_str(), sd, cloud_defs.as_str()];
+        let mut parts = vec![defs.as_str(), sd, dd, cloud_defs.as_str()];
         if inline_mode > 0 {
             parts.push(inline_def.as_str());
         }
@@ -908,6 +911,7 @@ impl DxrGpu {
             shade_parts.extend([
                 defs.as_str(),
                 sd,
+                dd,
                 cloud_defs.as_str(),
                 inline_def.as_str(),
                 trace::TRACE_COMMON_HLSLI,

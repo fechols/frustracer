@@ -89,6 +89,25 @@ pub fn n2h_enabled() -> bool {
     N2H_ENABLED.load(Relaxed)
 }
 
+/// Slope-space mip filtering for normal maps (`--no-slope-mips` kills) — the
+/// `set_mips` "knob before scene load" family. The lever gates the
+/// `scene::finalize_normal_mips` pass, NOT `build_mips` itself: off means the
+/// pass never marks a texture `normal_role`, so every chain is built by the
+/// legacy filter and the off arm is bit-identical to the pre-feature renderer
+/// by construction (and `texture::self_test` stays independent of the static —
+/// it sets `normal_role` on its probe textures directly). NOT in the scene
+/// cache's lever word: mips are derived-only, never persisted (the `--no-mips`
+/// precedent).
+static SLOPE_MIPS_ENABLED: AtomicBool = AtomicBool::new(true);
+
+pub fn set_slope_mips(on: bool) {
+    SLOPE_MIPS_ENABLED.store(on, Relaxed);
+}
+
+pub fn slope_mips_enabled() -> bool {
+    SLOPE_MIPS_ENABLED.load(Relaxed)
+}
+
 /// High-pass knee of the normal→height solve, in CYCLES per texture tile:
 /// spectral integration divides by |k|, so the lowest bins amplify normal-map
 /// noise into tile-scale height swell (the classic Frankot–Chellappa
@@ -163,6 +182,18 @@ pub struct Texture {
     /// Frankot–Chellappa) into the alpha channel, RGB untouched. Persisted
     /// like `h2n` and for the same reason: a re-decoded file has alpha 255.
     pub n2h: bool,
+    /// This texture is consumed as a NORMAL MAP (some material's `normal_tex`
+    /// points at it), so `build_mips` averages SLOPES (x/z, y/z) instead of
+    /// raw channel bytes — averaging unit normal VECTORS under-tilts (the
+    /// mean of four tilted normals points flatter than the mean slope, and
+    /// `perturb_normal`'s renormalize restores length, not tilt), which is
+    /// why normal-mapped surfaces used to flatten with distance. IN-MEMORY
+    /// ONLY, never serialized: set by `scene::finalize_normal_mips` from the
+    /// material wiring (the one predicate identical across cold/warm/glTF/
+    /// world/tile loads), false in every constructor. A texture shared with a
+    /// rough/metal/emissive role is deliberately NOT marked (slope-encoded
+    /// mips would corrupt those samples — coarser, never wrong).
+    pub normal_role: bool,
     /// Mip chain, levels 1.. down to 1×1 (floor-halving; level 0 is the base
     /// fields above). Built at decode time in LINEAR space (sRGB textures
     /// decode → average → re-encode; a gamma-space box filter darkens
@@ -187,6 +218,7 @@ impl Texture {
             source: String::new(),
             h2n: false,
             n2h: false,
+            normal_role: false,
             mips: Vec::new(),
         };
         if MIPS_ENABLED.load(Relaxed) {
@@ -214,7 +246,18 @@ impl Texture {
         h2n: bool,
         n2h: bool,
     ) -> Texture {
-        let mut t = Texture { w, h, texels, alpha_masked, srgb, source, h2n, n2h, mips: Vec::new() };
+        let mut t = Texture {
+            w,
+            h,
+            texels,
+            alpha_masked,
+            srgb,
+            source,
+            h2n,
+            n2h,
+            normal_role: false,
+            mips: Vec::new(),
+        };
         if MIPS_ENABLED.load(Relaxed) {
             t.build_mips();
         }
@@ -225,7 +268,19 @@ impl Texture {
     /// averages a 2×2 tap block of the level above (taps clamp at odd
     /// edges); sRGB channels average in LINEAR space through
     /// `SRGB_LUT`/`encode_srgb`, linear maps and alpha average as raw u8
-    /// with round-to-nearest.
+    /// with round-to-nearest — EXCEPT `normal_role` textures, whose RGB
+    /// averages in SLOPE space: decode each tap to a tangent vector (the
+    /// exact `perturb_normal` decode incl. the z ≥ 0.05 clamp), average the
+    /// slopes (x/z, y/z) — slopes are the linear quantity, so their mean IS
+    /// the mean tilt, where the mean of unit VECTORS under-tilts and
+    /// sample-time renormalization can't recover it (a steep/flat quad's
+    /// true mean slope −2.02 came back −0.77 from the byte average, 2.6×
+    /// too flat — the "normal maps flatten with distance" bug) — and
+    /// re-encode `normalize(s̄x, s̄y, 1)`. `NORMAL_MAP_Y_SIGN` cancels
+    /// through the linear average (encode inverts decode), so the stored-y
+    /// convention passes through untouched. Alpha (the n2h/h2n height)
+    /// stays the raw u8 box average in every arm — height is linear, and
+    /// the follow-on cavity tap wants those mips correct.
     fn build_mips(&mut self) {
         let (mut w, mut h) = (self.w, self.h);
         while w > 1 || h > 1 {
@@ -256,6 +311,19 @@ impl Texture {
                             encode_srgb(avg_lin(2)),
                             avg_u8(3),
                         ]
+                    } else if self.normal_role {
+                        // Slope-space average (see the doc comment above).
+                        let (mut sx, mut sy) = (0.0f32, 0.0f32);
+                        for t in &taps {
+                            let x = t[0] as f32 / 255.0 * 2.0 - 1.0;
+                            let y = t[1] as f32 / 255.0 * 2.0 - 1.0;
+                            let z = (t[2] as f32 / 255.0 * 2.0 - 1.0).max(0.05);
+                            sx += x / z;
+                            sy += y / z;
+                        }
+                        let n = Vec3A::new(sx * 0.25, sy * 0.25, 1.0).normalize();
+                        let enc = |c: f32| ((c * 0.5 + 0.5) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+                        [enc(n.x), enc(n.y), enc(n.z), avg_u8(3)]
                     } else {
                         [avg_u8(0), avg_u8(1), avg_u8(2), avg_u8(3)]
                     };
@@ -273,6 +341,17 @@ impl Texture {
     #[inline]
     pub fn lod_dims(&self) -> f32 {
         0.5 * ((self.w * self.h) as f32).log2()
+    }
+
+    /// Drop and rebuild the mip chain under the session's `--no-mips` lever —
+    /// for passes that change how this texture's chain should be filtered
+    /// after construction (`scene::finalize_normal_mips` flips `normal_role`
+    /// and calls this). A no-chain session stays no-chain.
+    pub fn rebuild_mips(&mut self) {
+        self.mips.clear();
+        if MIPS_ENABLED.load(Relaxed) {
+            self.build_mips();
+        }
     }
 
     /// True when the image is grayscale (r == g == b on every texel) — the
@@ -331,6 +410,7 @@ impl Texture {
             source: self.source.clone(),
             h2n: true,
             n2h: false,
+            normal_role: false,
             mips: Vec::new(),
         };
         if MIPS_ENABLED.load(Relaxed) {
@@ -696,6 +776,7 @@ pub fn self_test() -> bool {
             source: String::new(),
             h2n: false,
             n2h: false,
+            normal_role: false,
             mips: Vec::new(),
         };
         t.build_mips();
@@ -736,6 +817,102 @@ pub fn self_test() -> bool {
     let got = t.mips[0].texels[0][0];
     if got != want || (got as i32 - 128).abs() <= 20 {
         fail(format!("checker mip = {got}, want linear-space {want} (gamma-space would be ~128)"));
+        ok = false;
+    }
+
+    // --- Slope-space normal-map mips ---------------------------------------
+    // A normal-role texture must average SLOPES, not bytes. Directly sets
+    // `normal_role` (never the SLOPE_MIPS lever — that gates the scene pass,
+    // and this test must stay static-independent).
+    let mkn = |w: u32, h: u32, texels: Vec<[u8; 4]>, role: bool| {
+        let mut t = Texture {
+            w,
+            h,
+            texels,
+            alpha_masked: false,
+            srgb: false,
+            source: String::new(),
+            h2n: false,
+            n2h: false,
+            normal_role: role,
+            mips: Vec::new(),
+        };
+        t.build_mips();
+        t
+    };
+    let slope_of = |px: [u8; 4]| {
+        let x = px[0] as f32 / 255.0 * 2.0 - 1.0;
+        let z = (px[2] as f32 / 255.0 * 2.0 - 1.0).max(0.05);
+        x / z
+    };
+    // Steep ≈ enc(normalize(-4,0,1)) and flat texels, interleaved: the true
+    // mean x/z is (−4.049 + 0.004)/2 ≈ −2.02.
+    let steep = [4u8, 128, 158, 0];
+    let flat = [128u8, 128, 255, 255];
+    let quad = vec![steep, flat, steep, flat];
+    let t = mkn(2, 2, quad.clone(), true);
+    let got = t.mips[0].texels[0];
+    let s = slope_of(got);
+    if (s + 2.02).abs() > 0.15 {
+        fail(format!("slope mip x/z = {s:.3} ({got:?}), want ≈ −2.02 (mean slope preserved)"));
+        ok = false;
+    }
+    // Anti-vacuity teeth: the legacy byte average [66,128,207] decodes to
+    // x/z ≈ −0.774 — it must both differ from the slope arm's product AND
+    // provably fail the gate above (i.e. the old filter under-tilts 2.6×).
+    let legacy = [66u8, 128, 207];
+    if got[..3] == legacy {
+        fail("slope mip bit-equals the legacy byte average — slope arm not live".into());
+        ok = false;
+    }
+    let ls = slope_of([legacy[0], legacy[1], legacy[2], 0]);
+    if (ls + 2.02).abs() <= 0.15 {
+        fail(format!("legacy average x/z = {ls:.3} passes the slope gate — teeth are vacuous"));
+        ok = false;
+    }
+    // Y-axis twin (covers the y lane + renormalization symmetrically).
+    let steep_y = [128u8, 4, 158, 0];
+    let ty = mkn(2, 2, vec![steep_y, flat, steep_y, flat], true);
+    let gy = ty.mips[0].texels[0];
+    let sy = {
+        let y = gy[1] as f32 / 255.0 * 2.0 - 1.0;
+        let z = (gy[2] as f32 / 255.0 * 2.0 - 1.0).max(0.05);
+        y / z
+    };
+    if (sy + 2.02).abs() > 0.15 {
+        fail(format!("slope mip y/z = {sy:.3} ({gy:?}), want ≈ −2.02"));
+        ok = false;
+    }
+    // Alpha (the height channel) stays a plain box filter in the slope arm.
+    let ta = mkn(
+        2,
+        2,
+        vec![[128, 128, 255, 0], [128, 128, 255, 255], [128, 128, 255, 0], [128, 128, 255, 255]],
+        true,
+    );
+    if ta.mips[0].texels[0][3] != 128 {
+        fail(format!("slope-arm alpha mip = {}, want box-average 128", ta.mips[0].texels[0][3]));
+        ok = false;
+    }
+    // Constant normal map round-trips every level bit-exactly (enc(0) = 128,
+    // enc(1) = 255 exact) — bounds level-chain quantization accumulation.
+    let tc = mkn(8, 8, vec![[128, 128, 255, 200]; 64], true);
+    for (li, m) in tc.mips.iter().enumerate() {
+        for px in &m.texels {
+            if *px != [128, 128, 255, 200] {
+                fail(format!("constant normal map drifted at level {} ({px:?})", li + 1));
+                ok = false;
+            }
+        }
+    }
+    // normal_role = false keeps the legacy path bit-exactly (the lever's
+    // off-arm identity at the unit level).
+    let tl = mkn(2, 2, quad, false);
+    if tl.mips[0].texels[0][..3] != legacy {
+        fail(format!(
+            "non-role mip {:?} != legacy byte average {legacy:?}",
+            &tl.mips[0].texels[0][..3]
+        ));
         ok = false;
     }
 

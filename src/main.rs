@@ -417,9 +417,21 @@ fn main() {
     texture::set_aniso(opts.aniso);
     texture::set_h2n(opts.h2n);
     texture::set_n2h(opts.n2h);
+    texture::set_slope_mips(opts.slope_mips);
     scene::set_tinted_shadows(opts.tinted_shadows);
     scene::set_spray(opts.spray);
     scene::set_depth_tint(opts.depth_tint);
+    scene::set_detail_tex(opts.detail_tex);
+    scene::set_detail_ao(opts.detail_ao);
+    scene::set_detail_strength(opts.detail_strength);
+    scene::set_detail_ao_strength(opts.detail_ao_strength);
+    if opts.detail_strength != 0.5 {
+        eprintln!("detail-strength: grain ×{}", opts.detail_strength);
+    }
+    if opts.detail_ao_strength != 0.125 {
+        eprintln!("detail-ao-strength: pools/cavity/shadows ×{}", opts.detail_ao_strength);
+    }
+    scene::set_amb_bump(opts.amb_bump);
     scene::set_water(opts.water);
     scene::set_coincident_cull(opts.coincident_cull);
     // One field, BOTH statics — which is what keeps `--no-heightfield
@@ -661,6 +673,7 @@ fn main() {
         world_wanted,
         cam_override,
         tod: opts.tod,
+        normal_strength: opts.normal_strength,
         verify_rebuild: check,
         bvh_builder: opts.bvh_builder.clone(),
         c_trav: opts.c_trav,
@@ -806,6 +819,10 @@ struct SceneRequest {
     world_wanted: bool,
     cam_override: Option<Camera>,
     tod: Option<f32>,
+    /// `--normal-strength`: multiplies every material's `normal_scale` AFTER
+    /// the cache load/store and `derive_heights` (the `tod` placement class),
+    /// so it never bakes into a sidecar and `height_amp` stays unscaled.
+    normal_strength: f32,
     verify_rebuild: bool,
     bvh_builder: String,
     c_trav: f32,
@@ -957,6 +974,13 @@ fn load_scene(req: &SceneRequest) -> LoadedScene {
     // identical partition), and is a structural no-op on procedural/stress
     // scenes (no foliage classes) and unarmed sessions.
     foliage::attach(&mut scene);
+    // Slope-space normal-map mips, the same post-match rationale as
+    // foliage::attach: material wiring is identical on cold/warm/glTF/world/
+    // tile loads, and this runs after every apply_n2h/height_to_normal mip
+    // rebuild. Mips are never persisted, so ordering vs the sidecar store is
+    // free; alpha (height) mips are untouched, so the BVH sweep below sees
+    // identical data.
+    scene::finalize_normal_mips(&mut scene);
     progress::phase(progress::Phase::Bvh, "", 0);
     let t0 = Instant::now();
     let bvh = prebuilt.unwrap_or_else(|| bvh::Bvh::build(&scene));
@@ -992,6 +1016,19 @@ fn load_scene(req: &SceneRequest) -> LoadedScene {
         eprintln!(
             "tod: starting at {h:.2}h (sun y {:+.2}, sky scale {:.3}, night {:.2})",
             scene.sun.dir.y, scene.sky_scale, scene.night
+        );
+    }
+    // --normal-strength: post-cache/post-derive_heights like --tod, so the
+    // multiply never bakes into a sidecar and relief's height_amp (derived
+    // from the UNSCALED normal_scale) stays put — the decode slopes and the
+    // relief surface deliberately decouple at K != 1 (a feel lever).
+    if req.normal_strength != 1.0 {
+        for m in &mut scene.materials {
+            m.normal_scale *= req.normal_strength;
+        }
+        eprintln!(
+            "normal-strength: x{:.2} (post-cache; height_amp unscaled)",
+            req.normal_strength
         );
     }
     LoadedScene { scene, bvh, world_info, cam0 }
@@ -11517,6 +11554,20 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
     };
 
+    // Detail-texture math gates — off anchors bit-exact, window endpoints,
+    // fade continuity, bounds, energy neutrality, integrability (gradient vs
+    // central difference), the bump guards + sign pin, determinism.
+    let detail_ok = match shade::detail_self_test() {
+        Ok(()) => {
+            eprintln!("detail-tex self-test: OK");
+            true
+        }
+        Err(e) => {
+            eprintln!("detail-tex self-test: FAIL — {e}");
+            false
+        }
+    };
+
     // Spherical-cell math self-test — closed-form identities the hemisphere
     // bounce integrator is built on (Ω/PSA anchors, exact partition,
     // in-cell sampling).
@@ -14028,6 +14079,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         ("spray", spray_ok),
         ("coincident-cull", ccull_ok),
         ("depth-tint", depth_tint_ok),
+        ("detail-tex", detail_ok),
         ("sh", sh_ok),
         ("sky", sky_ok),
         ("clouds", clouds_ok),
@@ -14826,6 +14878,11 @@ fn session(
     let mut cam = snap0.cam;
     let mut prev_snap = cam;
     let mut cur_tod = snap0.tod;
+    // The hour the current scene.sky_sh was projected at — the interactive
+    // TOD path re-projects only on scene::SH_TOD_STEP steps (plus a settle
+    // on the first non-writing frame), so a flying world session pays the
+    // projection ~20×/s instead of every frame (the 235→17 fps stall).
+    let mut sh_tod = snap0.tod;
     let accum: Vec<AtomicU32> = (0..w * h * 3).map(|_| AtomicU32::new(0)).collect();
     let info: Vec<AtomicU32> = (0..w * h).map(|_| AtomicU32::new(0)).collect();
     let tbuf: Vec<AtomicU32> = (0..w * h).map(|_| AtomicU32::new(0)).collect();
@@ -15967,7 +16024,27 @@ fn session(
         let sun_moved = snap.tod != cur_tod;
         if sun_moved {
             cur_tod = snap.tod;
-            scene::apply_tod(scene, cur_tod);
+            // The cheap half every write (sun/moon dir, dome scale, night —
+            // shadows track continuously); the SH re-projection only on
+            // SH_TOD_STEP quanta of the eased clock. The world's attractors
+            // write tod EVERY MOVING frame, and the old per-write projection
+            // was a ~54 ms main-thread stall (measured 235 → 17 fps flying,
+            // GPU idle at 3.8 ms); the stepped ambient is the cloud-drift
+            // shading-change class the temporal integrators absorb.
+            scene::apply_tod_lit(scene, cur_tod);
+            let d = (cur_tod - sh_tod).abs();
+            if d.min(24.0 - d) >= scene::SH_TOD_STEP {
+                scene::refresh_sky_sh(scene);
+                sh_tod = cur_tod;
+            }
+            gpu.refresh_sky(scene);
+            frame = 0;
+        } else if sh_tod != cur_tod {
+            // Settle: the first frame after the writes stop re-projects at
+            // the final hour, so a parked session never rests on an ambient
+            // up to SH_TOD_STEP stale.
+            scene::refresh_sky_sh(scene);
+            sh_tod = cur_tod;
             gpu.refresh_sky(scene);
             frame = 0;
         }

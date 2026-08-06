@@ -68,23 +68,49 @@ impl Sh9 {
     /// 4π/N) — NOT Monte Carlo. `f` must be the SUN-FREE dome: projecting a
     /// sharp sun here would smear it into a hemisphere-wide gradient AND
     /// double-count it against the explicit sun light.
-    pub fn project(f: impl Fn(Vec3A) -> Vec3A) -> Sh9 {
-        let mut c = [Vec3A::ZERO; N];
+    pub fn project(f: impl Fn(Vec3A) -> Vec3A + Sync) -> Sh9 {
+        use rayon::prelude::*;
+        // PARALLEL over fixed chunks with an ORDERED serial fold of the
+        // partials (the two-phase BVH build discipline): deterministic
+        // across runs AND thread counts — the sum is a pure function of
+        // PROJ_SAMPLES/PROJ_CHUNK alone. It went parallel because the
+        // world's TOD attractors re-project per MOVING frame, and the
+        // serial 16k-sample pass was a ~54 ms main-thread stall (measured
+        // 235 -> 17 fps flying; GPU idle). NOTE the association differs
+        // from the old serial loop by design (a ±ulp move of every
+        // coefficient — the reassociation class, invisible next to the
+        // gates' tolerances).
+        const PROJ_CHUNK: usize = 512;
+        const _: () = assert!(PROJ_SAMPLES % PROJ_CHUNK == 0);
         let n = PROJ_SAMPLES as f32;
         // Golden angle — the Fibonacci spiral's azimuthal increment.
         let ga = std::f32::consts::PI * (3.0 - 5.0f32.sqrt());
-        for i in 0..PROJ_SAMPLES {
-            let fi = i as f32;
-            // z stratified over [-1, 1) at cell centers; r from the identity
-            // x²+y²+z² = 1. Equal-area in z ⇒ uniform on the sphere.
-            let z = 1.0 - 2.0 * (fi + 0.5) / n;
-            let r = (1.0 - z * z).max(0.0).sqrt();
-            let phi = ga * fi;
-            let d = Vec3A::new(r * phi.cos(), r * phi.sin(), z);
-            let l = f(d);
-            let b = basis(d);
+        let partials: Vec<[Vec3A; N]> = (0..PROJ_SAMPLES / PROJ_CHUNK)
+            .into_par_iter()
+            .map(|ci| {
+                let mut c = [Vec3A::ZERO; N];
+                for i in ci * PROJ_CHUNK..(ci + 1) * PROJ_CHUNK {
+                    let fi = i as f32;
+                    // z stratified over [-1, 1) at cell centers; r from the
+                    // identity x²+y²+z² = 1. Equal-area in z ⇒ uniform on
+                    // the sphere.
+                    let z = 1.0 - 2.0 * (fi + 0.5) / n;
+                    let r = (1.0 - z * z).max(0.0).sqrt();
+                    let phi = ga * fi;
+                    let d = Vec3A::new(r * phi.cos(), r * phi.sin(), z);
+                    let l = f(d);
+                    let b = basis(d);
+                    for k in 0..N {
+                        c[k] += l * b[k];
+                    }
+                }
+                c
+            })
+            .collect();
+        let mut c = [Vec3A::ZERO; N];
+        for p in &partials {
             for k in 0..N {
-                c[k] += l * b[k];
+                c[k] += p[k];
             }
         }
         let w = 4.0 * std::f32::consts::PI / n;

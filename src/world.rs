@@ -369,6 +369,7 @@ fn merge_scenes(parts: Vec<(Scene, Vec3A)>, field_half: f32) -> Scene {
         diag: 0.0,
         eps: 0.0,
         ao_radius: 0.0,
+        detail_scales: Vec::new(),
         content_min: Vec3A::ZERO,
         content_max: Vec3A::ZERO,
     };
@@ -685,6 +686,7 @@ fn test_part(n_tex: u32, albedo_tex: u32, normal_tex: u32) -> Scene {
             source: String::new(),
             h2n: false,
             n2h: false,
+            normal_role: false,
             mips: Vec::new(),
         });
     }

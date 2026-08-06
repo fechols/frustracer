@@ -493,6 +493,16 @@ struct NgxFgState {
     /// bit-for-bit, so water reflections strobe on generated frames again on
     /// demand.
     ripplemv_off: bool,
+    /// FR_NGXFG_RIPPLEDT=off — disarm round 4's large-dt confidence fade
+    /// (`ngxfg_guides::RIPPLE_DT_LO/HI`): the reconstruction runs unfaded at
+    /// any clock delta. The reconstruction itself stays near-exact at those
+    /// deltas (the `ripple_probe` test); what the fade withholds is the
+    /// resulting 200-550 px/frame MV at 8K density, which measured as severe
+    /// water glitching when handed to NGX. NOTE the glitchy unfaded arm was
+    /// only ever observed WITH the pre-`wire_cam_far` f16 sky-compare bug
+    /// live — this lever on the fixed build is the pending A/B that decides
+    /// whether the fade can narrow.
+    ripdt_off: bool,
     /// FR_NGXFG_TONEMAP — the range-compression probe (see
     /// `ngxfg_guides::TonePass` for the full diagnosis this exists to settle).
     /// 0 = off (the shipped stream, byte-identical), 1 = `scale`, 2 =
@@ -1177,6 +1187,14 @@ impl GpuContext {
                              generated frames (expect rippling reflections to strobe)"
                         );
                     }
+                    let ripdt_off = lever("FR_NGXFG_RIPPLEDT", &["off"]) == 1;
+                    if ripdt_off {
+                        eprintln!(
+                            "fg: FR_NGXFG_RIPPLEDT=off — round 4's large-dt confidence fade \
+                             disarmed (unfaded reconstruction at any clock delta; expect the \
+                             low-framerate water glitch back on demand)"
+                        );
+                    }
                     // FR_NGXFG_TONEMAP — which curve shapes the color handed
                     // to NGX. DEFAULT reinhard (2026-07-31): the flow
                     // estimator needs a display-curve-shaped input, and
@@ -1258,6 +1276,7 @@ impl GpuContext {
                         ffmv_off,
                         prev_ff: std::cell::Cell::new(crate::fireflies::Fireflies::off()),
                         ripplemv_off,
+                        ripdt_off,
                         prev_clock: std::cell::Cell::new(None),
                         tone_mode,
                         tone,
@@ -4985,8 +5004,12 @@ impl GpuContext {
                 // The SAME far the pack clamps a missed reflection to
                 // (`spec_hit_t`), so the kernel can recognize "reflected sky"
                 // and reproject it as a direction instead of a point 2*diag
-                // away. Both come from dlss::near_far — keep them one source.
-                cam_far: far,
+                // away. Both come from dlss::near_far — keep them one source —
+                // but the plane is R16F, so the compare threshold is far's f16
+                // FLOOR (`wire_cam_far`): the exact f32 never fires when f16
+                // rounds far down (THE WORLD's 138.56 -> 138.5), which
+                // silently re-opened the round-2 sky parallax on world water.
+                cam_far: ngxfg_guides::wire_cam_far(far),
                 // Round 4. `t_prev == t_cur` whenever there is no retained
                 // frame yet, when the clock is pinned (--check*'s
                 // CLOUD_CHECK_TIME), or when the lever is off — all three
@@ -4995,7 +5018,8 @@ impl GpuContext {
                 t_prev: n.prev_clock.get().unwrap_or(cl.time),
                 diag: cl.diag,
                 ripplemv: (!n.ripplemv_off) as u32,
-                _pad2: [0.0; 2],
+                ripdt: (!n.ripdt_off) as u32,
+                _pad2: 0.0,
             };
             gp.record(list, &p, slot, &ff_table);
         }

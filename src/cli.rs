@@ -377,12 +377,52 @@ pub struct Opts {
     /// `--no-n2h` clears: no Frankot-Chellappa heightfield derived from normal
     /// maps at load (`texture::set_n2h`). Keys the scene cache.
     pub n2h: bool,
+    /// `--no-slope-mips` clears (`texture::set_slope_mips`): normal-map mip
+    /// chains fall back to the legacy raw-byte box filter, which under-tilts
+    /// (the "normal maps flatten with distance" behavior). Default on: mips
+    /// of normal-role textures average SLOPES. Derived-only (mips are never
+    /// persisted), so it does NOT key the scene cache — the --no-mips class.
+    pub slope_mips: bool,
+    /// `--normal-strength K`: session multiplier on every material's
+    /// `normal_scale`, applied post-cache in `load_scene` (the --tod
+    /// placement class — never baked into a sidecar, and relief's
+    /// `height_amp` stays unscaled). 1.0 = bit-identical off arm; 0.0 =
+    /// normals fully off (the A/B floor).
+    pub normal_strength: f32,
     /// `--no-tinted-shadows` clears (`scene::set_tinted_shadows`).
     pub tinted_shadows: bool,
     /// `--no-spray` clears (`scene::set_spray`). Keys the cache lever word.
     pub spray: bool,
     /// `--no-depth-tint` clears (`scene::set_depth_tint`).
     pub depth_tint: bool,
+    /// `--no-detail-tex` clears (`scene::set_detail_tex`): Unreal-1 style
+    /// procedural close-up detail (albedo grain + micro-bump on magnified
+    /// textured hits). Runtime shading lever — the depth-tint class.
+    pub detail_tex: bool,
+    /// `--no-detail-ao` clears (`scene::set_detail_ao`): the detail field's
+    /// pits darken ambient + direct specular (texel-scale sky-visibility
+    /// contrast on flat sun-facing surfaces). Runtime shading lever — the
+    /// depth-tint class; a no-op wherever detail-tex never fires.
+    pub detail_ao: bool,
+    /// `--detail-strength K` (0.0..=4.0, default 0.5 — the 2026-08-06
+    /// feel-test calibration; 1.0 spells the original full-strength field,
+    /// and ×1.0 is the bit-identical arm): session multiplier on the detail
+    /// GRAIN family's amplitudes (albedo grain + micro-bump —
+    /// `scene::set_detail_strength`; the GPU twin is the injected DETAIL_STR
+    /// define). 0 = grain off, the A/B floor.
+    pub detail_strength: f32,
+    /// `--detail-ao-strength K` (0.0..=4.0, default 0.125 — the same
+    /// feel-test; 1.0 = the original amplitudes): session multiplier on the
+    /// detail AO family's amplitudes (pools + cavity + marched sun shadows,
+    /// whose early-exit bound scales in lockstep —
+    /// `scene::set_detail_ao_strength` / the DETAIL_AO_STR define).
+    pub detail_ao_strength: f32,
+    /// `--no-amb-bump` clears (`scene::set_amb_bump`): the sampled/SH ambient
+    /// amplifies its irradiance response to the shading normal's deviation
+    /// from the geometric normal (normal maps + detail bump + ripple read
+    /// under sky light). Runtime shading lever — the depth-tint class; a
+    /// no-op on flat-shaded geometry (n_s == n_g).
+    pub amb_bump: bool,
     /// `--no-water` clears (`scene::set_water`). Keys the cache lever word.
     pub water: bool,
     /// `--no-coincident-cull` clears (`scene::set_coincident_cull`): keep
@@ -631,9 +671,16 @@ pub fn defaults() -> Opts {
         aniso: texture::MAX_ANISO_CAP,
         h2n: true,
         n2h: true,
+        slope_mips: true,
+        normal_strength: 1.0,
         tinted_shadows: true,
         spray: true,
         depth_tint: true,
+        detail_tex: true,
+        detail_ao: true,
+        detail_strength: 0.5,
+        detail_ao_strength: 0.125,
+        amb_bump: true,
         water: true,
         coincident_cull: true,
         heightfield: false,
@@ -844,6 +891,22 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
             // at 0.0 — relief has no field to march, structurally off.
             "--no-h2n" => opts.h2n = false,
             "--no-n2h" => opts.n2h = false,
+            // Slope-space normal-map mips A/B lever (derived-only — never
+            // keys the cache) and the session normal-strength multiplier
+            // (per-load data, the --tod class: no process global, so no
+            // lever-block line — load_scene reads it off SceneRequest).
+            "--no-slope-mips" => opts.slope_mips = false,
+            "--normal-strength" => {
+                let k: f32 = args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .filter(|&k: &f32| k.is_finite() && (0.0..=8.0).contains(&k))
+                    .unwrap_or_else(|| {
+                        eprintln!("--normal-strength needs a value in 0.0..=8.0 (1 = default, 0 = normals off)");
+                        std::process::exit(2);
+                    });
+                opts.normal_strength = k;
+            }
             // Tinted-shadows kill lever, same "knob before scene load"
             // pattern: finalize_scalars never arms any_transmissive, so
             // every light-occlusion query binary-blocks on glass — the
@@ -858,6 +921,44 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
             // transmission chain's interior segments (runtime shading lever).
             "--no-spray" => opts.spray = false,
             "--no-depth-tint" => opts.depth_tint = false,
+            // --no-detail-tex: no Unreal-1 close-up detail field (albedo
+            // grain + micro-bump on magnified textured hits) — runtime
+            // shading lever, the depth-tint class.
+            "--no-detail-tex" => opts.detail_tex = false,
+            // --no-detail-ao: the detail field's pits stop darkening
+            // ambient/specular (the cavity term) — runtime shading lever,
+            // the depth-tint class.
+            "--no-detail-ao" => opts.detail_ao = false,
+            // Detail strength multipliers — the --normal-strength arm's
+            // shape, but process-global levers (main's lever block stores
+            // them; the GPU twins are injected #defines at kernel compile).
+            "--detail-strength" => {
+                let k: f32 = args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .filter(|&k: &f32| k.is_finite() && (0.0..=4.0).contains(&k))
+                    .unwrap_or_else(|| {
+                        eprintln!("--detail-strength needs a value in 0.0..=4.0 (1 = default, 0 = grain off)");
+                        std::process::exit(2);
+                    });
+                opts.detail_strength = k;
+            }
+            "--detail-ao-strength" => {
+                let k: f32 = args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .filter(|&k: &f32| k.is_finite() && (0.0..=4.0).contains(&k))
+                    .unwrap_or_else(|| {
+                        eprintln!("--detail-ao-strength needs a value in 0.0..=4.0 (1 = default, 0 = pools/shadows off)");
+                        std::process::exit(2);
+                    });
+                opts.detail_ao_strength = k;
+            }
+            // --no-amb-bump: the SH ambient stops amplifying its response to
+            // the shading normal's deviation (normal maps/detail bump go
+            // back to the plain order-2 irradiance) — runtime shading
+            // lever, the depth-tint class.
+            "--no-amb-bump" => opts.amb_bump = false,
             // --no-water: the fountain classifies as generic glassware (the
             // pre-water-class look) instead of the water refinement (blue-green
             // tint, IOR 1.33, ripple normals); keys the cache lever word.
@@ -1753,12 +1854,37 @@ pub fn usage() {
                 eprintln!("                dropped, the pre-conversion behavior)");
                 eprintln!("  --no-n2h      don't derive heightfields from normal maps (Frankot–Chellappa) — no");
                 eprintln!("                alpha-channel height, height_amp stays 0");
+                eprintln!("  --no-slope-mips  normal-map mips back on the raw-byte box filter (A/B lever; the");
+                eprintln!("                default slope-space filter preserves mean tilt, so normal maps stop");
+                eprintln!("                flattening with distance)");
+                eprintln!("  --normal-strength K  multiply every material's normal-map strength (0.0..=8.0,");
+                eprintln!("                default 1 = bit-identical; 0 = normals off). Post-cache, so relief's");
+                eprintln!("                height_amp stays unscaled — decode slopes and --heightfield relief");
+                eprintln!("                deliberately decouple at K != 1");
                 eprintln!("  --no-tinted-shadows  shadow/AO rays binary-block on transmissive surfaces (the");
                 eprintln!("                pre-feature behavior; default: they pass with a transmission×albedo tint)");
                 eprintln!("  --no-spray    keep tiny transmissive islands (fountain droplets) as clear glass");
                 eprintln!("                instead of white-scatter spray (load-time retag; keys the scene cache)");
                 eprintln!("  --no-depth-tint  no Beer–Lambert attenuation over the transmission chain's interior");
                 eprintln!("                segments (water loses its depth-graded tint)");
+                eprintln!("  --no-detail-tex  no Unreal-1 style detail texturing: procedural close-up albedo");
+                eprintln!("                grain + micro-bump on magnified textured hits (runtime shading lever;");
+                eprintln!("                default on — only fires where the base texture blurs, lod < 0)");
+                eprintln!("  --no-detail-ao  no detail surface AO/shadows: the detail height's pits stop");
+                eprintln!("                darkening ambient + specular (cavity), the horizon-marched sun");
+                eprintln!("                shadows stop (the closed-form heightfield trace toward the sun),");
+                eprintln!("                and the coarse occlusion pools + their relief rims go flat");
+                eprintln!("                (a no-op wherever detail-tex never fires)");
+                eprintln!("  --detail-strength K  detail GRAIN strength multiplier, 0.0..=4.0 (default 0.5;");
+                eprintln!("                1.0 = the original full-strength field; scales the close-up");
+                eprintln!("                albedo grain + micro-bump)");
+                eprintln!("  --detail-ao-strength K  detail AO strength multiplier, 0.0..=4.0 (default 0.125;");
+                eprintln!("                1.0 = original; scales the occlusion pools, cavity, and marched");
+                eprintln!("                sun shadows)");
+                eprintln!("  --no-amb-bump  no ambient bump response: the SH ambient stops amplifying its");
+                eprintln!("                irradiance response to the shading normal's deviation (normal");
+                eprintln!("                maps + detail bump read flat under sky light again; a no-op on");
+                eprintln!("                flat-shaded geometry)");
                 eprintln!("  --no-water    classify the fountain as generic glassware, not the water class");
                 eprintln!("                (no blue-green tint / IOR 1.33 / ripple normals; keys the scene cache)");
                 eprintln!("  --no-coincident-cull  keep transmissive faces exactly coincident with opaque faces");
@@ -1802,16 +1928,23 @@ pub fn usage() {
 /// contract and gets applied in one order.
 fn lever_snapshot() -> String {
     format!(
-        "mips={} aniso={} h2n={} n2h={} tint={} spray={} depth={} water={} ccull={} \
-         harm={} hon={} bloom={} clouds={} ff={} ffn={} el={} eln={} cshadow={} skylod={} \
-         dxrinline={} dxrsbt={} fsway={} famp={}",
+        "mips={} aniso={} h2n={} n2h={} smips={} tint={} spray={} depth={} detail={} dao={} \
+         dstr={} daostr={} \
+         ambb={} water={} ccull={} harm={} hon={} bloom={} clouds={} ff={} ffn={} el={} eln={} \
+         cshadow={} skylod={} dxrinline={} dxrsbt={} fsway={} famp={}",
         texture::mips_enabled(),
         texture::max_aniso(),
         texture::h2n_enabled(),
         texture::n2h_enabled(),
+        texture::slope_mips_enabled(),
         scene::tinted_shadows(),
         scene::spray_enabled(),
         scene::depth_tint(),
+        scene::detail_tex(),
+        scene::detail_ao(),
+        scene::detail_strength(),
+        scene::detail_ao_strength(),
+        scene::amb_bump(),
         scene::water_enabled(),
         scene::coincident_cull_enabled(),
         bvh::height_armed(),
@@ -1855,9 +1988,19 @@ pub fn self_test() -> Result<(), String> {
         "4",
         "--no-h2n",
         "--no-n2h",
+        "--no-slope-mips",
+        "--normal-strength",
+        "2.5",
         "--no-tinted-shadows",
         "--no-spray",
         "--no-depth-tint",
+        "--no-detail-tex",
+        "--no-detail-ao",
+        "--detail-strength",
+        "2",
+        "--detail-ao-strength",
+        "0.5",
+        "--no-amb-bump",
         "--no-water",
         "--no-coincident-cull",
         "--heightfield",
@@ -1893,9 +2036,16 @@ pub fn self_test() -> Result<(), String> {
         ("aniso", o.aniso == 4),
         ("h2n", !o.h2n),
         ("n2h", !o.n2h),
+        ("slope_mips", !o.slope_mips),
+        ("normal_strength", o.normal_strength == 2.5),
         ("tinted_shadows", !o.tinted_shadows),
         ("spray", !o.spray),
         ("depth_tint", !o.depth_tint),
+        ("detail_tex", !o.detail_tex),
+        ("detail_ao", !o.detail_ao),
+        ("detail_strength", o.detail_strength == 2.0),
+        ("detail_ao_strength", o.detail_ao_strength == 0.5),
+        ("amb_bump", !o.amb_bump),
         ("water", !o.water),
         ("coincident_cull", !o.coincident_cull),
         ("heightfield", o.heightfield),
@@ -1933,6 +2083,14 @@ pub fn self_test() -> Result<(), String> {
     }
     if parse_argv(&["--no-aniso", "--aniso", "8"]).opts.aniso != 8 {
         return Err("--no-aniso --aniso 8 must land on 8".into());
+    }
+    if parse_argv(&[]).opts.normal_strength != 1.0 {
+        return Err("normal_strength must default to 1.0 (the bit-identical off arm)".into());
+    }
+    if parse_argv(&["--normal-strength", "2", "--normal-strength", "0.5"]).opts.normal_strength
+        != 0.5
+    {
+        return Err("--normal-strength must be last-wins".into());
     }
     if parse_argv(&["--aniso", "8", "--no-aniso"]).opts.aniso != 1 {
         return Err("--aniso 8 --no-aniso must land on 1".into());

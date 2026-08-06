@@ -63,7 +63,7 @@ StructuredBuffer<uint>   tri_mat   : register(t5);
 // scene.rs::NO_TEX — "no map" sentinel for the texture-index fields.
 #define TEX_NONE 0xffffffffu
 
-// Mirrors trace.rs::GpuMat field-for-field (100 B) — a stride skew reads
+// Mirrors trace.rs::GpuMat field-for-field (104 B) — a stride skew reads
 // garbage; the two must move in the same commit.
 struct Mat {
     float3 albedo;
@@ -85,6 +85,9 @@ struct Mat {
     float3 trans_tint; // transmission/absorption tint; sentinel .x < 0 = "use albedo"
     float ior;         // Snell/Fresnel IOR (default 1.5; water 1.33)
     float ripple_amp;  // water ripple slope amplitude (0 = none)
+    // Per-material world-space detail texel scale (Scene::detail_scales —
+    // never per-face, which seams on greedy-meshed atlases). 0 = field off.
+    float detail_scale;
 };
 StructuredBuffer<Mat> materials : register(t6);
 
@@ -180,6 +183,225 @@ float3 marble(float3 p, float scale) {
     return lerp(VEIN, BASE, t * t * (3.0 - 2.0 * t));
 }
 
+// shade.rs::detail_field / detail_bump — Unreal-1 style detail texturing,
+// mirrored verbatim (constants are LITERALS, the clouds-wind idiom — change
+// both together). Three octaves of WORLD-SPACE 3D value noise multiply the
+// albedo and tilt the shading normal where the base texture is MAGNIFIED
+// (dlod < 0); octave k's window saturate(-dlod - k) IS its anti-alias and
+// the progressive fade ladder. THE DOMAIN is q3 = p_rest / s: the hit's
+// barycentric REST-pose position (tri_rest_point — positions[] is the rest
+// buffer, sway rides TLAS instance transforms) over the per-hit texel world
+// size s from tri_uv_basis, so octave 0 stays one cell per texel-EQUIVALENT
+// and atlas meshes (rungholt) stop tiling the noise in lockstep with their
+// repeated UV rects. Value + analytic gradient come from ONE
+// cloud_vnoise3_vg eval per octave (trace_common.hlsli, pasted ahead of
+// this file in every unit), so grain and bump are one coherent surface.
+// Zero rng draws. Degenerate lod is -inf on the CPU and -1e30 here — every
+// window saturates to 1 identically, output bounded at whatever q3 came in.
+#define DETAIL_AMP      0.18
+#define DETAIL_BUMP_K   2.0
+// Session strength multipliers (--detail-strength / --detail-ao-strength),
+// injected by trace::detail_defs into every unit that pastes this file; the
+// #ifndef fallbacks MATCH the compiled defaults (0.5 grain / 0.125 AO — the
+// 2026-08-06 feel-test calibration; 1.0 spells the original full-strength
+// field, and ×1.0 is the bitwise-exact arm), so a unit the injection ever
+// missed would still agree with the CPU's default statics — the probe-reach
+// rule's fail-safe. shade.rs reads the scene:: statics — CPU/GPU move
+// together by value.
+#ifndef DETAIL_STR
+#define DETAIL_STR 0.5
+#endif
+#ifndef DETAIL_AO_STR
+#define DETAIL_AO_STR 0.125
+#endif
+// Direct N·L contrast ceiling for the detail bump (round 6, shade.rs::
+// DETAIL_NDL_CAP): the tilt may move the sun's diffuse by at most ±CAP of
+// the PRE-detail N·L — under-cap pixels (tops) keep the raw value bitwise,
+// grazing-lit faces (tan(incidence) large) compress to the ceiling.
+#define DETAIL_NDL_CAP  0.5
+// shade.rs::detail_ndl_cap — raw = n_s·wi (post-detail), p = n_pre·wi.
+float detail_ndl_cap(float raw, float p) {
+    return (p > 0.0)
+        ? clamp(raw, p * (1.0 - DETAIL_NDL_CAP), p * (1.0 + DETAIL_NDL_CAP))
+        : min(raw, 0.0);
+}
+#define DETAIL_AO_BUMP_K 1.5
+#define DETAIL_ROUGH_LO 0.2
+#define DETAIL_ROUGH_HI 0.45
+
+// shade.rs::detail_bump_weight — the bump's roughness damping (the
+// frosted-visor guard): 0 at/below LO (detail_bump's g == 0 guard then
+// returns the base verbatim), 1 at/above HI. Reads the MAP-DRIVEN per-pixel
+// rough_eff — safe, the bump draws no rng.
+float detail_bump_weight(float rough) {
+    return saturate((rough - DETAIL_ROUGH_LO) / (DETAIL_ROUGH_HI - DETAIL_ROUGH_LO));
+}
+// shade.rs::detail_aniso_base — the detail window's lod base under the aniso
+// filter: log2 of the footprint's MINOR axis (what SampleGrad leaves
+// unresolved), deliberately uncapped by MaxAnisotropy (see the shade.rs doc
+// for the ~0.32-lod grazing known-accept that buys a max-free twin).
+float detail_aniso_base(float2 gu, float2 gv) {
+    return log2(max(min(length(gu), length(gv)), 1e-20));
+}
+// shade.rs::DETAIL_AO_K / detail_cavity — cavity AO from the field's own
+// signed height h = value − 1 (mean 0 by construction — zero extra lookups):
+// pits darken ambient + direct specular, peaks return exactly 1.0 (callers
+// branch on h < 0). Not energy-neutral: it is occlusion.
+#define DETAIL_AO_K 3.0
+float detail_cavity(float h) {
+    return exp(DETAIL_AO_K * min(h, 0.0));
+}
+// shade.rs::DETAIL_AO_RANGE / detail_ao_field — coarse height octaves
+// (8/4-texel-equivalent cells, salts 43/44, windows log2(cell) − dlod): the
+// lower-frequency pools that make the cavity read as AO and reach
+// mid-distance, returning their per-q-unit GRADIENT too (chain rule: an
+// octave samples at q/div, so it carries 1/div) — the relief-rim share of
+// the micro-bump (× DETAIL_AO_BUMP_K). Term-for-term CPU mirror.
+#define DETAIL_AO_RANGE 3.0
+void detail_ao_field(float3 q3, float dlod, out float hh, out float3 g) {
+    hh = 0.0;
+    g = float3(0.0, 0.0, 0.0);
+    float v;
+    float3 gv;
+    float wk = saturate(3.0 - dlod);
+    if (wk > 0.0) {
+        cloud_vnoise3_vg(q3 / 8.0, 43u, v, gv);
+        hh += (0.5 * DETAIL_AO_STR) * wk * (2.0 * v - 1.0);
+        g += gv * ((0.5 * DETAIL_AO_STR) * wk * 2.0 / 8.0);
+    }
+    wk = saturate(2.0 - dlod);
+    if (wk > 0.0) {
+        cloud_vnoise3_vg(q3 / 4.0, 44u, v, gv);
+        hh += (0.35 * DETAIL_AO_STR) * wk * (2.0 * v - 1.0);
+        g += gv * ((0.35 * DETAIL_AO_STR) * wk * 2.0 / 4.0);
+    }
+}
+// shade.rs::DETAIL_SHADOW_* / detail_shadow_h / detail_sun_shadow — the REAL
+// horizon-marched sun shadow: a closed-form occlusion trace of the detail
+// heightfield toward the sun (replaces the retired statistical
+// detail_micro_shadow). The shadow field = grain octave 0 + both pools
+// under their existing windows (sub-texel grain octaves are speckle-scale),
+// value-only via cloud_vnoise3 (never the grad path); lt = the sun's
+// tangent-plane projection l − n(n·l), UNNORMALIZED (|lt| is the grazing
+// measure); the sun ray rises (n·l)/(|lt|·HT) field-units per q-unit and
+// taps that clear the conservative HMAX bound exit early (the clouds
+// interval-skip shape). Soft contact exp(−K·occ): K → inf is a binary hit
+// test, which aliases at 1 spp; the softness doubles as the 2°-sun
+// penumbra. Exact 1.0 when nothing occludes / windows closed / zenith
+// azimuth / sub-horizon sun. HT is INCIDENCE-ADAPTIVE (round 6):
+// lerp(LO, HI, saturate(ndl)) — the artistic HI applies where the natural
+// response is weakest (noon tops) and fades to the near-coherent LO at
+// grazing, where rise ∝ ndl already makes shadows maximal (the
+// overdone-sides fix). Term-for-term CPU mirror; zero rng.
+#define DETAIL_SHADOW_HT_LO 1.5
+#define DETAIL_SHADOW_HT_HI 6.0
+#define DETAIL_SHADOW_K  5.0
+// The march's HMAX bound is computed in detail_sun_shadow (it scales with
+// the strength knobs); the retired constant was 1.03 = 0.18 + 0.5 + 0.35.
+float detail_shadow_h(float3 q3, float dlod) {
+    float hh = 0.0;
+    // Grain rides DETAIL_STR, pools DETAIL_AO_STR — the same terrain the
+    // surface shades with stays the terrain that shadows it (shade.rs twin).
+    float w0 = saturate(-dlod);
+    if (w0 > 0.0) {
+        float v = cloud_vnoise3(q3, 40u);
+        hh += DETAIL_AMP * DETAIL_STR * w0 * (2.0 * v - 1.0);
+    }
+    float wk = saturate(3.0 - dlod);
+    if (wk > 0.0) {
+        float v = cloud_vnoise3(q3 / 8.0, 43u);
+        hh += (0.5 * DETAIL_AO_STR) * wk * (2.0 * v - 1.0);
+    }
+    wk = saturate(2.0 - dlod);
+    if (wk > 0.0) {
+        float v = cloud_vnoise3(q3 / 4.0, 44u);
+        hh += (0.35 * DETAIL_AO_STR) * wk * (2.0 * v - 1.0);
+    }
+    return hh;
+}
+float detail_sun_shadow(float3 q3, float dlod, float3 lt, float ndl) {
+    float ltl = length(lt);
+    if (ltl < 1e-4 || ndl <= 0.0) return 1.0;
+    float3 dir = lt / ltl;
+    float ht = DETAIL_SHADOW_HT_LO + (DETAIL_SHADOW_HT_HI - DETAIL_SHADOW_HT_LO) * saturate(ndl);
+    float rise = ndl / (ltl * ht);
+    float h0 = detail_shadow_h(q3, dlod);
+    // The early-exit bound scales WITH the strength knobs (shade.rs twin —
+    // left-assoc so 1.0/1.0 reproduces DETAIL_SHADOW_HMAX's chain bitwise).
+    float hmax = DETAIL_AMP * DETAIL_STR + 0.5 * DETAIL_AO_STR + 0.35 * DETAIL_AO_STR;
+    float occ = 0.0;
+    static const float taps[8] = { 1.0, 2.0, 3.0, 4.0, 6.0, 9.0, 14.0, 20.0 };
+    [unroll] for (uint i = 0u; i < 8u; ++i) {
+        float ray_h = h0 + taps[i] * rise;
+        if (ray_h > hmax) break;
+        occ = max(occ, detail_shadow_h(q3 + dir * taps[i], dlod) - ray_h);
+    }
+    return occ > 0.0 ? exp(-DETAIL_SHADOW_K * occ) : 1.0;
+}
+// shade.rs::AMB_BUMP_K / amb_irradiance — ambient bump-response
+// amplification (FLAG_AMB_BUMP; the HL2/bent-normal dominant-direction
+// class): the order-2 irradiance is a cosine convolution, too smooth to
+// show texel relief at any tilt, so the sampled/SH ambient amplifies the
+// deviation response irr(n) + K·(irr(n_s) − irr(n)), clamped ≥ 0. n_s == n
+// (flat-shaded geometry) and flag-off return the plain expression verbatim.
+// The amplified delta is CAPPED at ±AMB_BUMP_CAP of the base by a SCALAR
+// rescale (hue-preserving; round 6): the SH derivative is maximal when n ⊥
+// the dome's dominant direction — the sides — so the ×K tuned for tops
+// overdrives there. Under-cap pixels return the uncapped formula bitwise.
+// CAP 0.5 -> 0.25 (round 6b): a noon block side gets ~no direct sun, so a
+// ±50% cap on its ambient WAS a ±50% swing of its total brightness.
+#define AMB_BUMP_K 6.0
+#define AMB_BUMP_CAP 0.25
+float3 amb_irradiance(float3 n, float3 n_s) {
+    if (all(n_s == n) || !(flags & FLAG_AMB_BUMP)) return sh_irradiance(n_s);
+    float3 base = sh_irradiance(n);
+    float3 d = (sh_irradiance(n_s) - base) * AMB_BUMP_K;
+    float m = max(abs(d.x), max(abs(d.y), abs(d.z)));
+    float lim = AMB_BUMP_CAP * max(base.x, max(base.y, base.z));
+    if (m > lim) d *= lim / m;
+    return max(base + d, 0.0);
+}
+void detail_field(float3 q3, float dlod, out float f, out float3 g) {
+    float3 q = q3;
+    // --detail-strength scales the whole ladder (the gradient — and so the
+    // micro-bump — scales with it). shade.rs twin.
+    float amp = DETAIL_AMP * DETAIL_STR;
+    float scl = 1.0;
+    f = 1.0;
+    g = float3(0.0, 0.0, 0.0);
+    [unroll] for (uint k = 0u; k < 3u; ++k) {
+        float wk = saturate(-dlod - float(k));
+        // A real branch, mirrored with the CPU — it also skips the noise eval.
+        if (wk > 0.0) {
+            float v;
+            float3 gv;
+            cloud_vnoise3_vg(q, 40u + k, v, gv);
+            f += amp * wk * (2.0 * v - 1.0);
+            // Chain rule: octave k samples at q*2^k, so its per-q-unit
+            // gradient carries the 2^k (scl), and the (2v - 1) the 2.
+            g += gv * (amp * wk * 2.0 * scl);
+        }
+        q *= 2.0;
+        amp *= 0.5;
+        scl *= 2.0;
+    }
+    f = max(f, 0.05);
+}
+
+// Tilt the shading normal by the detail field's 3D gradient's TANGENTIAL
+// PROJECTION gt = g − n(n·g) — identical to the retired (t, b)-frame form
+// (the frame was orthonormal, so t·g.x + b·g.y WAS this projection; the
+// winding sign cancels in b⊗b). gt == 0 subsumes both old guards (zero g
+// and the degenerate tangent). Zero result / below-horizon fall back to
+// base (the ripple_normal shape).
+float3 detail_bump(float3 base, float3 n, float3 g) {
+    float3 gt = g - n * dot(n, g);
+    if (all(gt == float3(0.0, 0.0, 0.0))) return base;
+    float3 outn = normalize_or_zero(base - gt * DETAIL_BUMP_K);
+    if (all(outn == float3(0.0, 0.0, 0.0)) || dot(outn, n) <= 0.0) return base;
+    return outn;
+}
+
 // shade.rs::surface_point: interpolated, face-flipped shading normal and the
 // eps-offset origin for secondary rays.
 void surface_point(float3 ro, float3 rd, HitInfo hit, out float3 p, out float3 n) {
@@ -247,6 +469,16 @@ bool tri_uv_basis(uint tri, out float3 tu, out float3 tv) {
     tu = (e1 * d2.y - e2 * d1.y) / det;
     tv = (e2 * d1.x - e1 * d2.x) / det;
     return true;
+}
+
+// shade.rs::tri_rest_point — the hit's barycentric REST-pose world position
+// over positions[], which IS the rest buffer (sway rides TLAS instance
+// transforms; vertices never move). The world-space detail field's sample
+// point: stable under sway, deliberately NOT ro + t*rd (displaced) and not
+// the eps-offset p.
+float3 tri_rest_point(uint tri, float u, float v) {
+    uint3 idx = uint3(indices[tri * 3u], indices[tri * 3u + 1u], indices[tri * 3u + 2u]);
+    return positions[idx.x] * (1.0 - u - v) + positions[idx.y] * u + positions[idx.z] * v;
 }
 
 // shade.rs::tri_grads_from mirror (change both together): the ray cone's
@@ -565,11 +797,87 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
         // Kd = 1 alongside map_Kd); hardware bilinear + the SRGB SRV format
         // reproduce texture.rs::sample_bilinear (decode per texel, then
         // filter — precision-level differences only, absorbed by the
-        // statistical CPU-vs-GPU gates).
-        float3 albedo =
-            SHADE_MAT_MARBLE(mat)  ? marble(ro + rd * hit.t, mat.scale)
-          : SHADE_MAT_TEXKIND(mat) ? tex_sample(mat.tex, tri_uv(hit.tri, hit.u, hit.v), filt)
-          : mat.albedo;
+        // statistical CPU-vs-GPU gates). The Textured arm adds the Unreal-1
+        // detail field on magnified hits (shade.rs's hook, mirrored): `dgr`
+        // carries its per-q-unit 3D gradient to the micro-bump below, `ddo`
+        // the fired flag — both dead when FLAG_DETAIL is off or dlod >= 0,
+        // and the whole branch folds away with SHADE_MAT_TEXKIND under
+        // shadeclass stripping.
+        float3 dgr = float3(0.0, 0.0, 0.0);
+        bool ddo = false;
+        // The field's signed height (value - 1, mean 0) for the cavity AO
+        // below; 0.0 = never fired, the structural off state (the cavity
+        // sites branch on `< 0`).
+        float dh = 0.0;
+        // Horizon-march capture (shade.rs::detail_march): live while the AO
+        // band is open — the marched sun shadow below re-samples the field
+        // along the sun's tangent direction from the SAME q3.
+        float3 mq3 = float3(0.0, 0.0, 0.0);
+        float mdl = 0.0;
+        bool dmarch = false;
+        float3 albedo = mat.albedo;
+        if (SHADE_MAT_MARBLE(mat)) {
+            albedo = marble(ro + rd * hit.t, mat.scale);
+        } else if (SHADE_MAT_TEXKIND(mat)) {
+            float2 auv = tri_uv(hit.tri, hit.u, hit.v);
+            albedo = tex_sample(mat.tex, auv, filt);
+            // Transmissive materials EXCLUDED (shade.rs — the visor/water
+            // finding): graining the transmission tint mottles glass.
+            if ((flags & FLAG_DETAIL) && SHADE_MAT_TRANSMISSION(mat) == 0.0) {
+                // The albedo texture's COMPLETED lod: the iso arm's base
+                // rides in filt (free); the aniso arm keys off the MINOR
+                // axis its gradients already carry — the isotropic recompute
+                // carried the major axis's -log2|n·d| view-tilt stretch,
+                // which closed the window on grazing-viewed faces whose
+                // albedo SampleGrad kept sharp (the Minecraft-tops finding).
+                float lb = filt.aniso ? detail_aniso_base(filt.gu, filt.gv)
+                                      : filt.lod_base;
+                uint tw, th;
+                texs[NonUniformResourceIndex(mat.tex)].GetDimensions(tw, th);
+                float dlod = lb + 0.5 * log2(float(tw * th)); // Texture::lod_dims
+                bool ao_band = dlod < DETAIL_AO_RANGE && (flags & FLAG_DETAIL_AO);
+                if (dlod < 0.0 || ao_band) {
+                    // World-space domain: q3 = rest position over the
+                    // PER-MATERIAL texel scale (Scene::detail_scales via
+                    // Mat.detail_scale — never per-face, which seams on
+                    // greedy-meshed atlases; shade.rs's site, mirrored).
+                    // s == 0 skips the field — structural off.
+                    float s = mat.detail_scale;
+                    if (s > 0.0) {
+                        float3 q3 = tri_rest_point(hit.tri, hit.u, hit.v) / s;
+                        if (dlod < 0.0) {
+                            float df;
+                            detail_field(q3, dlod, df, dgr);
+                            albedo *= df;
+                            ddo = true;
+                            dh = df - 1.0;
+                        }
+                        // The AO/relief coarse octaves fire far past the
+                        // grain (8/4-texel-equivalent cells resolve until
+                        // dlod = 3/2) — mid-distance pools AND relief rims:
+                        // their gradient joins the micro-bump
+                        // (× DETAIL_AO_BUMP_K), so pool-scale relief is lit
+                        // directionally out where the grain has faded
+                        // (shade.rs's site, mirrored). Gated on the AO lever
+                        // so the off arm never pays the evals and ddo/dmarch
+                        // stay false-shaped.
+                        if (ao_band) {
+                            float hp;
+                            float3 gp;
+                            detail_ao_field(q3, dlod, hp, gp);
+                            dh += hp;
+                            if (any(gp != float3(0.0, 0.0, 0.0))) {
+                                dgr += gp * DETAIL_AO_BUMP_K;
+                                ddo = true;
+                            }
+                            mq3 = q3;
+                            mdl = dlod;
+                            dmarch = true;
+                        }
+                    }
+                }
+            }
+        }
         // Map-driven material terms — the shade.rs block, ZERO rng draws
         // (materials with every map at TEX_NONE run bit-identically to the
         // pre-map kernel; the same-seed wavefront-vs-reference gates rely on
@@ -596,6 +904,29 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
         float3 n_s = n;
         if (SHADE_MAT_NORMAL(mat) && has_basis) {
             n_s = perturb_normal(n, mat, map_uv, filt, tu, tv);
+        }
+        // Unreal-1 detail micro-bump (shade.rs's hook, mirrored): the SAME
+        // field that modulated the albedo tilts n_s by its gradient's
+        // tangential projection, composed ON the normal map and UNDER the
+        // ripple. `ddo` fires only on magnified textured hits with a sound
+        // basis, so far pixels never reach this (no tangent frame needed —
+        // the projection is frame-free). Damped by the PER-PIXEL roughness
+        // (detail_bump_weight — a tight specular lobe frosts under normal
+        // scatter: the visor keeps its mirror, the shell its grain).
+        // Pre-detail shading normal, live iff detail_bump ran (dcap): the
+        // direct loop's DETAIL_NDL_CAP clamps the sun's N·L relative to it.
+        // Captured BEFORE the ripple — sound because ripple and detail are
+        // structurally disjoint (water is transmissive; transmissive skips
+        // the detail field). shade.rs::n_pre.
+        float3 n_pd = n_s;
+        bool dcap = false;
+        if (ddo) {
+            float bw = detail_bump_weight(rough_eff);
+            if (bw > 0.0) {
+                n_pd = n_s;
+                n_s = detail_bump(n_s, n, dgr * bw);
+                dcap = true;
+            }
         }
         // Water ripples tilt the SHADING normal on the shared cloud clock
         // (pure ALU, no rng). Composes on the normal map; geometric n
@@ -665,8 +996,12 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
             float sv = rng_next(rng);
             float3 wi = sun_sample_dir(su, sv);
             // N·L against the SHADING normal; the shadow/translucency ray
-            // geometry stays on the geometric n (shade.rs).
+            // geometry stays on the geometric n (shade.rs). Detail pixels
+            // ride the contrast cap (shade.rs's n_pre clamp — tan(incidence)
+            // makes one bump strength overdrive grazing-lit faces 14×; the
+            // p <= 0 arm is terminator hygiene).
             float ndl = dot(n_s, wi);
+            if (dcap) ndl = detail_ndl_cap(ndl, dot(n_pd, wi));
             if (ndl <= 0.0) {
                 // shade.rs translucency arm: a back-lit leaf receives the
                 // light through itself; the occlusion ray starts on the
@@ -760,7 +1095,10 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                 if (fd2 >= ff_r2) continue;
                 float fdist = sqrt(fd2);
                 float3 fwi = fto / fdist;
+                // The detail contrast cap applies to every direct-tier
+                // light (shade.rs::capped_ndl, round 6b).
                 float fndl = dot(n_s, fwi);
+                if (dcap) fndl = detail_ndl_cap(fndl, dot(n_pd, fwi));
                 if (fndl <= 0.0) continue;
                 // Windowed 1/d² (fireflies.rs::irradiance — exactly 0 at the
                 // radius, C¹ there, near-field clamped under the f16 ceiling).
@@ -818,7 +1156,9 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                 if (ed2 >= er2) continue;
                 float edist = sqrt(ed2);
                 float3 ewi = eto / edist;
+                // Same detail contrast cap as the sun/firefly tiers.
                 float endl = dot(n_s, ewi);
+                if (dcap) endl = detail_ndl_cap(endl, dot(n_pd, ewi));
                 if (endl <= 0.0) continue;
                 // Windowed disc irradiance (emissive.rs::irradiance — the
                 // +rc² denominator is the near-field softening, the window
@@ -844,6 +1184,28 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
             prim.direct_d = direct_d;
             prim.direct_s = direct_s;
         }
+        // Detail cavity AO — AFTER the prim captures (shade.rs's site): the
+        // FSR signals stay un-cavitied and the deterministic delta rides the
+        // exact-remainder residual (texel-crisp under FSR-RR; a reflection
+        // LAP's cavity rides the denoised ind_s instead — the documented
+        // asymmetry, identity closing either way). Guarded, never `* 1.0`:
+        // dh == 0.0 on every non-fired hit and > 0 on peaks, so lever-off /
+        // detail-off / dlod >= 0 / peaks leave the expression DAG untouched.
+        float dcav = 1.0;
+        if (dh < 0.0 && (flags & FLAG_DETAIL_AO)) {
+            dcav = detail_cavity(dh);
+            direct_s *= dcav;
+        }
+        // REAL horizon-marched sun shadow on the DIRECT diffuse (shade.rs's
+        // site — post-capture, the delta rides the residual; replaces the
+        // retired statistical micro_shadow). The march direction is the
+        // sun's tangent-plane projection — the same projection the bump
+        // applies, so the azimuths agree by construction (no frame to keep
+        // in lockstep).
+        if (dmarch) {
+            float3 slt = sun.xyz - n * dot(n, sun.xyz);
+            direct_d *= detail_sun_shadow(mq3, mdl, slt, dot(n, sun.xyz));
+        }
         // Diffuse budget split, front vs transmitted (ambient front-only —
         // shade.rs composition). Transmissive glass has (almost) no diffuse
         // response — the transmitted scene replaces it (the chain below);
@@ -864,12 +1226,16 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
             total += c;
             if (in_refl) prim.ind_s += c;
             amb_w = tput * kd * kt;
+            // The cavity darkens the composed ambient through its weight —
+            // the CPU's `ambient *= cav` under fb (compose multiplies later).
+            if (dh < 0.0 && (flags & FLAG_DETAIL_AO)) amb_w *= dcav;
             // fb_mode 1 (AO) scales the SKY's irradiance by an openness
             // scalar, so the sky term folds into the weight HERE, where n_s is
             // in scope — compose has no normal. fb_mode 2 (GI) integrates the
             // sky itself and must NOT be pre-multiplied by it (that would
-            // square the sky). See compose.hlsl.
-            if (fb_mode == 1u) amb_w *= sh_irradiance(n_s);
+            // square the sky). See compose.hlsl. Through amb_irradiance so
+            // bumped normals get the amplified sky response (shade.rs's site).
+            if (fb_mode == 1u) amb_w *= amb_irradiance(n, n_s);
             amb_o = p;
             amb_n = n;
         } else {
@@ -901,7 +1267,13 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
             // sky's own SH irradiance at n_s (feed.hlsl / fsr_composite.hlsl
             // rebuild it from the WIRE normal — see fsr::wire_normal).
             if (lap == 0u) prim.ao = ao;
-            float3 c = tput * (kd * kt * (diffuse_d + sh_irradiance(n_s) * ao) + direct_s);
+            // The ambient term hoisted so the cavity can scale it without
+            // touching prim.ao (the un-cavitied FSR signal) — same
+            // subexpression, same tree; the off arm's DAG identity is what
+            // the same-seed byte gates verify.
+            float3 amb_t = amb_irradiance(n, n_s) * ao;
+            if (dh < 0.0 && (flags & FLAG_DETAIL_AO)) amb_t *= dcav;
+            float3 c = tput * (kd * kt * (diffuse_d + amb_t) + direct_s);
             total += c;
             if (in_refl) prim.ind_s += c;
         }

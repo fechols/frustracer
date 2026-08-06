@@ -76,6 +76,96 @@ pub fn depth_tint() -> bool {
     DEPTH_TINT.load(Relaxed)
 }
 
+/// Detail-texture switch (`--no-detail-tex`): Unreal-1 style procedural
+/// close-up detail — albedo grain + micro-bump on magnified textured hits
+/// (`shade::detail_field`). Runtime shading lever like depth-tint (no scene
+/// data changes — reads live in shade.rs / the GPU FLAG_DETAIL bit; no
+/// cache-lever-word bit, no CACHE_VERSION move).
+static DETAIL_TEX: AtomicBool = AtomicBool::new(true);
+
+pub fn set_detail_tex(on: bool) {
+    DETAIL_TEX.store(on, Relaxed);
+}
+
+pub fn detail_tex() -> bool {
+    DETAIL_TEX.load(Relaxed)
+}
+
+/// Detail cavity AO switch (`--no-detail-ao`): pits of the detail field's own
+/// height (its value has mean 1.0 by construction, so value − 1 IS signed
+/// depth-below-neighborhood) darken the AMBIENT + SPECULAR terms — the
+/// texel-scale sky-visibility contrast a flat sun-facing surface cannot get
+/// from normal perturbation (SH ambient is order-2 smooth, N·L sits at the
+/// cosine max). Runtime shading lever like detail-tex above (no scene data
+/// changes — reads live in shade.rs / the GPU FLAG_DETAIL_AO bit; no
+/// cache-lever-word bit). A no-op wherever the detail field itself never
+/// fires (lever off, dlod >= 0, untextured/transmissive materials).
+static DETAIL_AO: AtomicBool = AtomicBool::new(true);
+
+pub fn set_detail_ao(on: bool) {
+    DETAIL_AO.store(on, Relaxed);
+}
+
+pub fn detail_ao() -> bool {
+    DETAIL_AO.load(Relaxed)
+}
+
+/// `--detail-strength K` (default 0.5 — the 2026-08-06 feel-test
+/// calibration; 1.0 spells the original full-strength field, and ×1.0 is
+/// the bit-identical arm): session multiplier on the detail GRAIN family's
+/// amplitudes — `shade::detail_field`'s octave ladder and the grain term of
+/// the shadow field. The micro-bump scales with it for free (it consumes
+/// the field's gradient, linear in amplitude). Runtime shading lever, the
+/// detail_tex class (no cache contact); the GPU twin is the injected
+/// DETAIL_STR define (`trace::detail_defs` — kernels compile at session
+/// start, restart tier).
+static DETAIL_STRENGTH: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0x3f00_0000); // 0.5f32
+
+pub fn set_detail_strength(k: f32) {
+    DETAIL_STRENGTH.store(k.to_bits(), Relaxed);
+}
+
+pub fn detail_strength() -> f32 {
+    f32::from_bits(DETAIL_STRENGTH.load(Relaxed))
+}
+
+/// `--detail-ao-strength K` (default 0.125 — the same feel-test; 1.0 = the
+/// original amplitudes): session multiplier on the detail AO family's
+/// amplitudes — the pool octaves (height + relief rims + cavity input) and
+/// their share of the marched shadow field, whose HMAX early-exit bound
+/// scales in lockstep (an unscaled bound would clip K > 1 shadows). Same
+/// lever class as `detail_strength` above.
+static DETAIL_AO_STRENGTH: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0x3e00_0000); // 0.125f32
+
+pub fn set_detail_ao_strength(k: f32) {
+    DETAIL_AO_STRENGTH.store(k.to_bits(), Relaxed);
+}
+
+pub fn detail_ao_strength() -> f32 {
+    f32::from_bits(DETAIL_AO_STRENGTH.load(Relaxed))
+}
+
+/// Ambient bump response switch (`--no-amb-bump`): the sampled/SH ambient
+/// tiers amplify the irradiance response to the shading normal's deviation
+/// from the geometric normal (`shade::amb_irradiance` — the HL2/bent-normal
+/// dominant-direction class), so normal maps and the detail micro-bump read
+/// under SKY light, whose order-2 cosine-convolved irradiance is otherwise
+/// too smooth to show texel-scale relief at any tilt. Runtime shading lever
+/// like detail-tex above (reads live in shade.rs / the GPU FLAG_AMB_BUMP
+/// bit; no cache contact). A no-op wherever n_s == n_g (flat-shaded
+/// geometry) — the structural off state.
+static AMB_BUMP: AtomicBool = AtomicBool::new(true);
+
+pub fn set_amb_bump(on: bool) {
+    AMB_BUMP.store(on, Relaxed);
+}
+
+pub fn amb_bump() -> bool {
+    AMB_BUMP.load(Relaxed)
+}
+
 /// How a material derives its albedo. Reflection behavior is fully described
 /// by the metallic/roughness/anisotropy parameters (the old `Metal` variant is
 /// subsumed by Fresnel: F0 = lerp(0.04, albedo, metallic)).
@@ -301,6 +391,19 @@ pub struct Scene {
     /// Self-intersection offset for secondary rays.
     pub eps: f32,
     pub ao_radius: f32,
+    /// Per-MATERIAL detail-field texel scale (world units per noise cell at
+    /// octave 0), parallel to `materials` — the world-space detail domain's
+    /// `s` in `q3 = p_rest / s`. A PER-MATERIAL sampled MEDIAN of the
+    /// tri_uv_basis texel-size formula, never a per-face value: greedy-meshed
+    /// atlas exporters make per-face texel density wildly non-uniform
+    /// (vokselia's Grass spans s 0.11..215 across merged runs), and a
+    /// per-face s makes `q3` jump at every face boundary — the block-seam
+    /// artifact. One s per material keeps the field continuous across every
+    /// face of a surface BY CONSTRUCTION. 0.0 = no valid basis anywhere
+    /// (the detail field's structural off). Derived (`finalize_scalars`),
+    /// never serialized (the sky_sh precedent — every cache/merge path
+    /// re-runs finalize).
+    pub detail_scales: Vec<f32>,
     /// CONTENT bounds: the geometry EXCLUDING the standard ground quad (the
     /// first `GROUND_VERTS` positions every loader pushes) — where the models
     /// actually are. `diag` is ground-quad-dominated on the procedural/stress
@@ -538,6 +641,7 @@ impl SceneBuilder {
             diag: 0.0,
             eps: 0.0,
             ao_radius: 0.0,
+            detail_scales: Vec::new(),
             content_min: Vec3A::ZERO,
             content_max: Vec3A::ZERO,
         };
@@ -661,6 +765,76 @@ pub fn derive_heights(scene: &mut Scene) {
             n_mats,
             amp_max,
             solve.len(),
+            t0.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+}
+
+/// Mark every texture consumed as a NORMAL MAP and rebuild its mip chain
+/// with the slope-space filter (`Texture::normal_role` — the "normal maps
+/// flatten with distance" fix; `--no-slope-mips` kills). Runs ONCE from
+/// `load_scene`'s post-match site (the `foliage::attach` slot), which is the
+/// single point cold OBJ, warm sidecar, glTF, world-merged and tiled loads
+/// all pass through — the role is defined by MATERIAL WIRING, identical in
+/// every one of those, so warm and cold chains cannot diverge (loader-side
+/// flagging would need 4+ sites plus a persisted flag byte plus a
+/// CACHE_VERSION bump for a fact that is derivable). Runs after every
+/// `apply_n2h`/`height_to_normal` mip rebuild by construction. A texture id
+/// ALSO referenced by a rough/metal/emissive/albedo role is skipped loudly:
+/// the dedup key is (path, srgb), so one linear map can serve two roles, and
+/// slope-encoded mips would corrupt the other role's samples — coarser,
+/// never wrong. Alpha (height) mips are untouched by the slope arm, so the
+/// BVH height sweep and the relief march see identical data either way.
+pub fn finalize_normal_mips(scene: &mut Scene) {
+    use std::collections::HashSet;
+    if !crate::texture::slope_mips_enabled() || !crate::texture::mips_enabled() {
+        return;
+    }
+    let mut normal_ids: HashSet<u32> = HashSet::new();
+    let mut other_ids: HashSet<u32> = HashSet::new();
+    for m in &scene.materials {
+        if m.normal_tex != NO_TEX {
+            normal_ids.insert(m.normal_tex);
+        }
+        for id in [m.rough_tex, m.metal_tex, m.emissive_tex] {
+            if id != NO_TEX {
+                other_ids.insert(id);
+            }
+        }
+        if let MatKind::Textured { tex } = m.kind {
+            other_ids.insert(tex);
+        }
+    }
+    if normal_ids.is_empty() {
+        return; // procedural/stress scenes: structurally untouched
+    }
+    let shared = normal_ids.intersection(&other_ids).count();
+    if shared > 0 {
+        eprintln!(
+            "slope-mips: {shared} normal map(s) shared with another texture role — kept on the box filter"
+        );
+    }
+    let t0 = std::time::Instant::now();
+    let n: u32 = {
+        use rayon::prelude::*;
+        scene
+            .textures
+            .par_iter_mut()
+            .enumerate()
+            .filter(|(i, _)| {
+                let id = *i as u32;
+                normal_ids.contains(&id) && !other_ids.contains(&id)
+            })
+            .map(|(_, t)| {
+                t.normal_role = true;
+                t.rebuild_mips();
+                1u32
+            })
+            .sum()
+    };
+    if n > 0 {
+        eprintln!(
+            "slope-mips: {n} normal map chain(s) rebuilt slope-space in {:.0} ms",
             t0.elapsed().as_secs_f64() * 1000.0
         );
     }
@@ -1074,6 +1248,7 @@ pub fn spray_self_test() -> Result<(), String> {
             diag: 1.0,
             eps: 1e-4,
             ao_radius: 0.03,
+            detail_scales: Vec::new(),
             content_min: Vec3A::ZERO,
             content_max: Vec3A::ZERO,
         };
@@ -1244,6 +1419,7 @@ pub fn coincident_self_test() -> Result<(), String> {
                 diag: 1.0,
                 eps: 1e-4,
                 ao_radius: 0.03,
+                detail_scales: Vec::new(),
                 content_min: Vec3A::ZERO,
                 content_max: Vec3A::ZERO,
             };
@@ -1335,6 +1511,7 @@ pub fn finalize_scalars(scene: &mut Scene) {
         );
     }
 
+    derive_detail_scales(scene);
     refresh_sky_sh(scene);
 }
 
@@ -1355,6 +1532,43 @@ pub fn refresh_sky_sh(scene: &mut Scene) {
     let scale = scene.sky_scale;
     let night = scene.night;
     scene.sky_sh = crate::sh::Sh9::project(|d| crate::sky::gather(d, sun, scale, night));
+}
+
+/// Per-material detail-field texel scale (see the `detail_scales` field doc):
+/// a sampled per-material MEDIAN of the per-triangle texel size —
+/// deterministic (serial, fixed stride), and deliberately NOT per-face,
+/// which seams on greedy-meshed atlases. Hand-built scenes without
+/// per-vertex UVs keep all-zero scales (the field's structural off).
+/// LOAD-ONLY by design: called from `finalize_scalars` alone — it landed
+/// inside `refresh_sky_sh` for one commit, where the interactive TOD path's
+/// throttled SH steps re-ran the whole ~2M-sample pass ~20×/s during world
+/// flight (the residual half of the 235→17 fps stall).
+fn derive_detail_scales(scene: &mut Scene) {
+    scene.detail_scales = vec![0.0; scene.materials.len()];
+    if scene.texcoords.len() == scene.positions.len() {
+        let mut samples: Vec<Vec<f32>> = vec![Vec::new(); scene.materials.len()];
+        let stride = (scene.indices.len() / 2_000_000).max(1);
+        let mut i = 0;
+        while i < scene.indices.len() {
+            let m = scene.tri_mat[i] as usize;
+            if let MatKind::Textured { tex } = scene.materials[m].kind {
+                if let Some((bu, bv)) = crate::shade::tri_uv_basis(scene, i as u32) {
+                    let t = &scene.textures[tex as usize];
+                    let s = ((bu.length() / t.w as f32) * (bv.length() / t.h as f32)).sqrt();
+                    if s.is_finite() && s > 0.0 {
+                        samples[m].push(s);
+                    }
+                }
+            }
+            i += stride;
+        }
+        for (m, mut v) in samples.into_iter().enumerate() {
+            if !v.is_empty() {
+                v.sort_by(|a, b| a.total_cmp(b));
+                scene.detail_scales[m] = v[v.len() / 2];
+            }
+        }
+    }
 }
 
 /// The sun direction is UNCHANGED from the old rect light's center — so shadow
@@ -1397,6 +1611,20 @@ pub fn default_tod() -> f32 {
 /// renders the moonlit sky at the `MOON_DOME_FRAC` floor. `night` gates the
 /// stars in after sunset.
 pub fn apply_tod(scene: &mut Scene, hour: f32) {
+    apply_tod_lit(scene, hour);
+    refresh_sky_sh(scene);
+}
+
+/// The cheap closed-form half of `apply_tod` — sun/moon direction, dome
+/// scale, night — WITHOUT the SH re-projection. The interactive TOD path
+/// (main.rs's `sun_moved` block) calls this every write so the shadow
+/// direction never lags, and re-projects the SH ambient only on
+/// `SH_TOD_STEP` steps of the eased clock: the world's flight attractors
+/// write tod every MOVING frame, and a per-write projection was a ~54 ms
+/// main-thread stall (measured 235 -> 17 fps flying, GPU idle). Every other
+/// caller takes `apply_tod`, which composes both halves — semantics
+/// unchanged.
+pub fn apply_tod_lit(scene: &mut Scene, hour: f32) {
     let dir = sun_dir_for_tod(hour);
     let fade = crate::sky::sun_fade(dir.y, default_sun().dir.y);
     let lum = fade.dot(Vec3A::new(0.2126, 0.7152, 0.0722));
@@ -1413,8 +1641,17 @@ pub fn apply_tod(scene: &mut Scene, hour: f32) {
     // Stars fade in once the sun is well below the horizon.
     let t = ((-dir.y - 0.05) / 0.10).clamp(0.0, 1.0);
     scene.night = t * t * (3.0 - 2.0 * t);
-    refresh_sky_sh(scene);
 }
+
+/// The interactive TOD path's SH re-projection quantum, in game hours
+/// (0.05 h = 3 game-minutes ≈ 0.75° of sun arc). The smooth order-2 ambient
+/// stepping by this much is invisible under the temporal integrators (the
+/// cloud-drift shading-change class), while it caps the projection rate at
+/// ~20/s during the fastest scrub — with the parallel `Sh9::project` that
+/// is ~4% of a frame instead of the old per-write stall. The sun disc,
+/// shadows, sky_scale, and night never quantize (apply_tod_lit runs every
+/// write).
+pub const SH_TOD_STEP: f32 = 0.05;
 
 /// Closed-form time-of-day gates, run by `--check`. No rng, no DLLs. Pins the
 /// arc's anchors, the fade's identities (the bit-identity guards), the sunset
@@ -1770,6 +2007,7 @@ pub fn tile_scene(base: Scene, nx: u32, nz: u32) -> (Scene, f32) {
         diag: 0.0,
         eps: 0.0,
         ao_radius: 0.0,
+        detail_scales: Vec::new(),
         content_min: Vec3A::ZERO,
         content_max: Vec3A::ZERO,
     };

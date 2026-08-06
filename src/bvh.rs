@@ -2164,6 +2164,7 @@ pub fn height_self_test() -> Result<(), String> {
                 source: String::new(),
                 h2n: true,
                 n2h: false,
+                normal_role: false,
                 mips: Vec::new(),
             }],
             any_alpha: false,
@@ -2179,6 +2180,7 @@ pub fn height_self_test() -> Result<(), String> {
             diag: 1.0,
             eps: 1e-4,
             ao_radius: 0.03,
+            detail_scales: Vec::new(),
             content_min: Vec3A::ZERO,
             content_max: Vec3A::ZERO,
         };
@@ -2500,6 +2502,7 @@ pub fn tinted_shadow_self_test() -> Result<(), String> {
             diag: 1.0,
             eps: 1e-4,
             ao_radius: 0.03,
+            detail_scales: Vec::new(),
             content_min: Vec3A::ZERO,
             content_max: Vec3A::ZERO,
         };

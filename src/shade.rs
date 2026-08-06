@@ -436,7 +436,7 @@ pub fn tri_lod_base(scene: &Scene, tri: u32, n_dot_d: f32, cone_w: f32) -> f32 {
 /// (`perturb_normal`) and the texture footprint (`tri_grads_from`).
 /// Degenerate UVs (zero-area in UV space) ⇒ None.
 /// Mirrored by `shade.hlsli::tri_uv_basis`.
-fn tri_uv_basis(scene: &Scene, tri: u32) -> Option<(Vec3A, Vec3A)> {
+pub(crate) fn tri_uv_basis(scene: &Scene, tri: u32) -> Option<(Vec3A, Vec3A)> {
     let [i0, i1, i2] = scene.indices[tri as usize];
     let p0 = scene.positions[i0 as usize];
     let e1 = scene.positions[i1 as usize] - p0;
@@ -449,6 +449,21 @@ fn tri_uv_basis(scene: &Scene, tri: u32) -> Option<(Vec3A, Vec3A)> {
         return None;
     }
     Some(((e1 * d2.y - e2 * d1.y) / det, (e2 * d1.x - e1 * d2.x) / det))
+}
+
+/// The hit's barycentric REST-pose world position: `(1−u−v)·P0 + u·P1 +
+/// v·P2` over `Scene::positions` — which is permanently the rest pose on
+/// BOTH paths (foliage sway never moves vertices: the CPU shears the RAY
+/// into rest space, the GPU rides TLAS instance transforms over rest-pose
+/// BLASes). This is the world-space detail field's sample point: stable
+/// under sway (grain must not crawl over a waving leaf), deliberately NOT
+/// `ray.o + t·d` (displaced on both paths) and not the eps-offset `p`.
+/// Mirrored by `shade.hlsli::tri_rest_point`.
+fn tri_rest_point(scene: &Scene, tri: u32, u: f32, v: f32) -> Vec3A {
+    let [i0, i1, i2] = scene.indices[tri as usize];
+    scene.positions[i0 as usize] * (1.0 - u - v)
+        + scene.positions[i1 as usize] * u
+        + scene.positions[i2 as usize] * v
 }
 
 /// The ray cone's texture footprint at a hit, as two UV-space gradient
@@ -572,7 +587,8 @@ pub fn shade(
     // adaptive cell already evaluated it for the coherence test and must not
     // pay the triangle fetch + interpolation twice per pixel.
     let (p, n) = sp.unwrap_or_else(|| surface_point(scene, ray, hit));
-    let mat = &scene.materials[scene.tri_mat[hit.tri as usize] as usize];
+    let mat_idx = scene.tri_mat[hit.tri as usize] as usize;
+    let mat = &scene.materials[mat_idx];
     // Ray-cone texture LOD: cone width at the hit, then one per-hit base
     // term shared by every map on this material (each adds its own
     // dimension term at the sample). Untextured materials skip the
@@ -604,11 +620,93 @@ pub fn shade(
     // Effective albedo: constant, except marble which is evaluated at the
     // world-space hit point (models are static, so world space is stable)
     // and textures, sampled at the hit's interpolated UV.
+    // `detail` carries the Unreal-1 detail field's per-q-unit 3D gradient
+    // out of the Textured arm for the micro-bump below; None = the field
+    // never fired (lever off, dlod >= 0, degenerate UV basis, or an
+    // untextured material) — the structural off state every other material
+    // shades bit-identically past.
+    let mut detail: Option<Vec3A> = None;
+    // The field's signed height (value − 1, mean 0) for the cavity AO below;
+    // 0.0 = never fired, the structural off state (detail_cavity's callers
+    // branch on `< 0`).
+    let mut detail_h: f32 = 0.0;
+    // Horizon-march capture (q3, dlod): Some while the AO band is open — the
+    // marched sun shadow below re-samples the field along the sun's tangent
+    // direction. Plain values, so nothing borrows the texture.
+    let mut detail_march: Option<(Vec3A, f32)> = None;
     let albedo = match mat.kind {
         MatKind::Marble { scale } => marble(ray.o + ray.d * hit.t, scale),
         MatKind::Textured { tex } => {
             let uv = scene.tri_uv(hit.tri, hit.u, hit.v);
-            filt.sample(&scene.textures[tex as usize], uv, true)
+            let tx = &scene.textures[tex as usize];
+            let mut a = filt.sample(tx, uv, true);
+            // Transmissive materials are EXCLUDED (the visor/water finding):
+            // their "albedo" is the transmission tint, and graining it
+            // mottles glass; the bump would frost it (see DETAIL_ROUGH_*).
+            if crate::scene::detail_tex() && mat.transmission == 0.0 {
+                // The albedo texture's COMPLETED isotropic lod. The iso arm's
+                // base is already in `filt` (free); the aniso arm derives its
+                // lod inside the sampler, so recompute the base here (L1-hot —
+                // the triangle rows were just walked). dlod < 0 is
+                // magnification: the texels can no longer resolve the ray
+                // cone's footprint, exactly where Unreal 1 faded its detail
+                // texture in.
+                let base = match filt {
+                    TexFilter::Lod(b) => b,
+                    // The MINOR axis, not the isotropic recompute: the aniso
+                    // sampler resolves the footprint down to its short axis,
+                    // and the isotropic lod carries the major axis's
+                    // -log2|n·d| view-tilt stretch — which closed the window
+                    // on every grazing-VIEWED face while SampleGrad kept its
+                    // albedo texel-sharp (the Minecraft-tops finding: block
+                    // sides detailed, tops flat, a binary flip between
+                    // adjacent faces of one cube). See detail_aniso_base.
+                    TexFilter::Aniso { gu, gv, .. } => detail_aniso_base(gu, gv),
+                };
+                let dlod = base + tx.lod_dims();
+                let ao_band = dlod < DETAIL_AO_RANGE && crate::scene::detail_ao();
+                if dlod < 0.0 || ao_band {
+                    // The world-space domain: q3 = rest-pose position over
+                    // the PER-MATERIAL texel scale (Scene::detail_scales —
+                    // never per-face, which seams on greedy-meshed atlases;
+                    // see the field doc). s == 0 (no valid basis anywhere,
+                    // or a hand-built scene that skipped finalize) skips the
+                    // whole field — structural off, coarser never wrong.
+                    let s = scene.detail_scales.get(mat_idx).copied().unwrap_or(0.0);
+                    if s > 0.0 {
+                        let q3 = tri_rest_point(scene, hit.tri, hit.u, hit.v) / s;
+                        if dlod < 0.0 {
+                            let (f, g) = detail_field(q3, dlod);
+                            a *= f;
+                            detail = Some(g);
+                            detail_h = f - 1.0;
+                        }
+                        // The AO/relief coarse octaves fire far past the
+                        // grain (their 8/4-texel cells resolve until
+                        // dlod = 3/2) — mid-distance pools of occlusion
+                        // AND relief rims: the pools' gradient joins the
+                        // micro-bump (scaled DETAIL_AO_BUMP_K vs the
+                        // grain), so mid-frequency relief is lit
+                        // directionally out where the grain-only bump has
+                        // faded (the flat-tops finding — the eye sees
+                        // pool-scale structure, not texel grain, at
+                        // distance). Gated on the AO lever so the off arm
+                        // never pays the evals and `detail`/`detail_march`
+                        // stay None-shaped.
+                        if ao_band {
+                            let (hp, gp) = detail_ao_field(q3, dlod);
+                            detail_h += hp;
+                            if gp != Vec3A::ZERO {
+                                detail = Some(
+                                    detail.unwrap_or(Vec3A::ZERO) + gp * DETAIL_AO_BUMP_K,
+                                );
+                            }
+                            detail_march = Some((q3, dlod));
+                        }
+                    }
+                }
+            }
+            a
         }
         _ => mat.albedo,
     };
@@ -652,6 +750,34 @@ pub fn shade(
         (true, Some(uv), Some(basis)) => perturb_normal(scene, n, mat, uv, filt, basis),
         _ => n,
     };
+    // Unreal-1 detail micro-bump: the SAME field that just modulated the
+    // albedo tilts the SHADING normal by its analytic gradient's tangential
+    // projection, so dark grains sit in concave pits. Composes ON the normal
+    // map (and the ripple below rides on top in turn); geometric n untouched
+    // — the n_g/n_s split. `detail` is Some only when the field fired, so
+    // far pixels, degenerate-basis hits, and lever-off sessions never reach
+    // this branch (no tangent frame needed here any more — the projection is
+    // frame-free).
+    // The bump is additionally damped by the PER-PIXEL roughness
+    // (detail_bump_weight): a tight specular lobe frosts under normal
+    // scatter, so polished pixels keep their mirror while matte ones keep
+    // their grain — one material can be both (DamagedHelmet's visor vs
+    // shell).
+    // Pre-detail shading normal, retained iff detail_bump actually ran: the
+    // direct loop's contrast cap (DETAIL_NDL_CAP) clamps the sun's N·L
+    // relative to this — the detail feature's own off state. Sound to capture
+    // BEFORE the ripple below: ripple and detail are structurally disjoint
+    // (water is transmissive, and transmissive materials skip the whole
+    // detail field), so on any detail pixel n_pre is the final n_s minus
+    // exactly the detail tilt.
+    let mut n_pre: Option<Vec3A> = None;
+    if let Some(g) = detail {
+        let bw = detail_bump_weight(rough_eff);
+        if bw > 0.0 {
+            n_pre = Some(n_s);
+            n_s = detail_bump(n_s, n, g * bw);
+        }
+    }
     // Water ripples tilt the SHADING normal on the shared cloud clock (a
     // pure-function wave field, zero rng). Composes ON the normal map: the
     // full-res fountain has none (n_s == n, ripple is the only perturbation),
@@ -769,7 +895,18 @@ pub fn shade(
         let wi = scene.sun.sample_dir(su, sv);
         // N·L against the SHADING normal (n_s ≡ n when unmapped); the
         // shadow/translucency ray geometry below stays on the geometric n.
-        let ndl = n_s.dot(wi);
+        // DETAIL CONTRAST CAP (detail pixels only — n_pre is Some iff
+        // detail_bump ran): direct contrast from a tilt δ scales as
+        // tan(incidence)·δ, so the one bump strength tuned for steep-lit
+        // tops (tan ≈ 0.27 at noon) overdrives grazing-lit sides (tan ≈ 3.7)
+        // 14×. The cap bounds the detail tilt's modulation to ±DETAIL_NDL_CAP
+        // of the PRE-detail N·L: under-cap pixels (tops) return raw bitwise,
+        // grazing faces compress to a fixed contrast ceiling. The p <= 0 arm
+        // kills bright speckle on the shadow side of the terminator (detail
+        // may not light a pre-detail-unlit facet); both arms are continuous
+        // at p = 0. Fireflies and emissive NEE below ride the SAME cap
+        // (capped_ndl — one rule per light family, round 6b).
+        let ndl = capped_ndl(n_s, n_pre, wi);
         if ndl <= 0.0 {
             // Below the rep's horizon: no ray was traced, so this "occluded"
             // is a claim about the rep's normal, not the scene. Mark the
@@ -936,7 +1073,9 @@ pub fn shade(
             }
             let dist = d2.sqrt();
             let wi = to / dist;
-            let ndl = n_s.dot(wi);
+            // The detail contrast cap applies to every direct-tier light
+            // (round 6b — the "other light sources" uniformity rule).
+            let ndl = capped_ndl(n_s, n_pre, wi);
             if ndl <= 0.0 {
                 continue;
             }
@@ -1003,7 +1142,8 @@ pub fn shade(
             }
             let dist = d2.sqrt();
             let wi = to / dist;
-            let ndl = n_s.dot(wi);
+            // The detail contrast cap — same rule as the sun/firefly tiers.
+            let ndl = capped_ndl(n_s, n_pre, wi);
             if ndl <= 0.0 {
                 continue;
             }
@@ -1054,7 +1194,7 @@ pub fn shade(
     // occlusion and bounce — so the three tiers now agree on what the sky IS,
     // and `sh::self_test` gates that agreement. Zero rng draws (a pure function
     // of the normal), which is what keeps the same-seed contracts intact.
-    let ambient = if q.fb.gi {
+    let mut ambient = if q.fb.gi {
         let (t1, t2) = onb(n);
         let accel = crate::ftree::Accel::of(bvh);
         crate::hemi::gi(scene, accel, p, n, t1, t2, q.fb.depth, sun, cl, depth, hemi_share, rng, None, ls)
@@ -1130,9 +1270,47 @@ pub fn shade(
             prim.ao = ao;
         }
         // The shading normal: ambient is a BRDF-side quantity, and the n_g/n_s
-        // split reserves the geometric normal for visibility.
-        scene.sky_sh.irradiance(n_s) * ao
+        // split reserves the geometric normal for visibility. Through
+        // amb_irradiance so bumped normals get a first-order sky response
+        // (the order-2 SH alone is too smooth to show texel relief).
+        amb_irradiance(&scene.sky_sh, n, n_s) * ao
     };
+
+    // Detail cavity AO — AFTER the PrimarySurface captures (prim.ao,
+    // prim.direct_d/direct_s are already written), so every FSR signal stays
+    // un-cavitied and the deterministic delta lands in the exact-remainder
+    // residual (fsr::split_signals subtracts the exported signals from the
+    // FINAL color — texel-crisp under FSR-RR, zero wire-format contact; the
+    // one asymmetry: a cavity on a reflection LAP rides the denoised ind_s
+    // instead, identity closing either way). Guarded, never `* 1.0`:
+    // detail_h == 0.0 on every non-fired hit and > 0 on peaks, so lever-off /
+    // detail-off / dlod >= 0 / peaks are all structural. `detail_h < 0.0`
+    // first, so the atomic load is skipped on the non-fired majority. Zero
+    // rng draws. Direct diffuse (N·L + shadows carry the sun's contrast),
+    // direct_t, emissive and the transmission chain stay untouched.
+    if detail_h < 0.0 && crate::scene::detail_ao() {
+        let cav = detail_cavity(detail_h);
+        ambient *= cav;
+        direct_s *= cav;
+    }
+    // REAL horizon-marched sun shadow: a closed-form occlusion trace of the
+    // detail heightfield toward the sun (detail_sun_shadow — the statistical
+    // micro_shadow it replaces darkened pits by depth with no direction; the
+    // march tests actual upstream terrain against the sun ray, so shadows
+    // fall away from the sun and lengthen as it drops). Same post-capture
+    // placement: prim.direct_d is already exported, the delta rides the
+    // residual. Shading-only — visibility, the BVH, and every rng stream are
+    // untouched. `detail_march` is Some only under the AO lever with the
+    // band open (and a sound basis for the q3 scale), so lever-off/off-band/
+    // untextured/degenerate are structural. The march direction is the sun's
+    // tangent-plane projection — the same tangential projection the bump
+    // applies, so the march's azimuth agrees with the bump's tilt by
+    // construction (no frame to keep in lockstep any more).
+    if let Some((q3, ddl)) = detail_march {
+        let l = scene.sun.dir;
+        let lt = l - n * n.dot(l);
+        direct_d *= detail_sun_shadow(q3, ddl, lt, n.dot(l));
+    }
 
     // Ambient stays diffuse-only; metals get their environment from the
     // specular bounce ray below. Translucency splits the diffuse budget
@@ -1613,7 +1791,10 @@ pub(crate) fn ripple_grad(p: Vec3A, t: f32, diag: f32) -> glam::Vec2 {
 /// +`n` side. `n` is the GEOMETRIC normal — both the horizon guard and the
 /// axis the world-XZ slope is projected against. A degenerate/below-horizon
 /// result falls back to `base` (coarser, never wrong). Zero rng.
-fn ripple_normal(base: Vec3A, n: Vec3A, p: Vec3A, t: f32, amp: f32, diag: f32) -> Vec3A {
+/// `pub(crate)` for exactly one outside consumer: `ngxfg_guides::self_test`'s
+/// reconstruction-fidelity gate scores `ripple_prev_normal` against this
+/// function evaluated at `t_prev` — the ground truth it claims to reconstruct.
+pub(crate) fn ripple_normal(base: Vec3A, n: Vec3A, p: Vec3A, t: f32, amp: f32, diag: f32) -> Vec3A {
     // Off state returns `base` untouched (no re-normalize — an already-unit
     // base would drift by a ulp). The call sites also guard `ripple_amp > 0`,
     // so this is the structural bit-identity in-function too.
@@ -1648,6 +1829,7 @@ pub fn tangent_self_test() -> Result<(), String> {
         source: String::new(),
         h2n: false,
         n2h: false,
+        normal_role: false,
         mips: Vec::new(),
     };
     let tri_scene = |texcoords: [glam::Vec2; 3], tex: Texture| -> Scene {
@@ -1692,6 +1874,7 @@ pub fn tangent_self_test() -> Result<(), String> {
             diag: 1.0,
             eps: 1e-4,
             ao_radius: 0.03,
+            detail_scales: Vec::new(),
             content_min: Vec3A::ZERO,
             content_max: Vec3A::ZERO,
         };
@@ -1936,6 +2119,1226 @@ pub fn ripple_self_test() -> Result<(), String> {
     let b = ripple_normal(n, n, Vec3A::new(0.5, 0.0, 0.5), 1.0, amp, diag);
     if (a - b).length() < 1e-4 {
         return Err("ripple must advance with time".into());
+    }
+    Ok(())
+}
+
+/// Unreal-1 style detail texturing — the procedural close-up field
+/// (`--no-detail-tex` kills; `scene::detail_tex()` is the lever).
+///
+/// Three octaves of WORLD-SPACE 3D value noise multiply the sampled albedo
+/// and tilt the shading normal wherever the base texture is MAGNIFIED (the
+/// completed isotropic lod `dlod < 0` — texels can no longer resolve the ray
+/// cone's footprint, exactly the regime Unreal 1 faded its detail texture in
+/// over). Each octave k lives in its own lod window `saturate(-dlod - k)`:
+/// it fades in only once it is resolvable — the window IS the anti-alias
+/// (the clouds oct_t lesson) and the progressive more-detail-as-you-approach
+/// ladder.
+///
+/// THE DOMAIN is `q3 = p_rest / s` — the hit's barycentric REST-pose world
+/// position (`tri_rest_point`: stable under foliage sway, whose vertices
+/// never move — the CPU shears the ray, the GPU the TLAS instances) over the
+/// PER-MATERIAL texel scale `s` (`Scene::detail_scales` — a sampled median
+/// of the tri_uv_basis texel-size formula over the material's triangles,
+/// derived in finalize_scalars, so octave 0 stays one noise cell per
+/// texel-EQUIVALENT and the field self-scales per surface). It moved off UV
+/// texel space because atlas meshes (rungholt: 704 distinct vt coords for
+/// 6.7M tris) repeat the same UV rect per block face, and any UV-domain
+/// noise tiles in lockstep with it — blatant repeated blotches on every
+/// wall; world position decorrelates by construction. And `s` is
+/// deliberately NOT per-face: greedy-meshed exports make per-face texel
+/// density wildly non-uniform (vokselia's Grass spans s 0.11..215 across
+/// merged runs), so a per-face `s` made `q3` jump at every face boundary —
+/// the block-seam artifact the first draft of this domain shipped. One `s`
+/// per material keeps the field continuous across every face of a surface
+/// by construction. Known accepts: grain frequency is uniform per material
+/// (no within-chart density adaptation — coarser, never wrong), and the
+/// finest octave's fract granularity is ~1/32 cell at THE WORLD's
+/// coordinate scale (subvisible).
+///
+/// Grayscale and energy-neutral (value noise is symmetric about ½, so the
+/// factor's mean ≈ 1 — the self-test pins it, so a retune cannot silently
+/// shift exposure), bounded to [1 − ΣA, 1 + ΣA] ⊂ [0.685, 1.315] ahead of
+/// the defensive floor. `clouds::vnoise3_vg` supplies value + ANALYTIC
+/// gradient in one 8-corner fetch (u32-exact against the GPU's
+/// `cloud_vnoise3_vg` in trace_common.hlsli), so the albedo grain and the
+/// micro-bump are one coherent surface: dark crevices align with concave
+/// bump. Octave salts 40..42 (ripple owns 16..19). Pure hit function, ZERO
+/// rng draws — every same-seed/replay/VisCtl-burn contract holds. Mirrored
+/// verbatim by `shade.hlsli::detail_field` — change both together
+/// (constants are LITERALS, the clouds-wind idiom).
+pub const DETAIL_AMP: f32 = 0.18;
+/// Micro-bump strength, a dimensionless slope-per-texel-equivalent (the
+/// gradient is per q-unit and applied by tangential projection, so the tilt
+/// does not vary with mesh scale or texture resolution). Mirrored in shade.hlsli.
+/// RAISED 0.35 → 1.2 by image A/B (the flat-tops campaign): tilt contrast
+/// under a light at incidence θ is tan(θ)·tilt, so the old ~5° tilts read
+/// only within ~5° of grazing — every flat surface had a razor-thin relief
+/// window pinned at ITS grazing configuration (tops at sunset, walls at
+/// noon). Real dirt facets run 30-60°; ~15-20° widens relief to most of the
+/// day. COHERENCE RULE: this and DETAIL_SHADOW_HT_LO/HI describe the SAME
+/// terrain steepness — move them together or shadows contradict the shading.
+/// The DIRECT term additionally rides DETAIL_NDL_CAP (below): one global
+/// tilt cannot fit both incidence regimes, so the crank is paired with a
+/// contrast ceiling instead of being dialed back.
+pub const DETAIL_BUMP_K: f32 = 2.0;
+
+/// Direct N·L contrast ceiling for the detail bump (round 6, the
+/// overdone-sides fix): the detail tilt may move the sun's diffuse N·L by at
+/// most ±CAP relative to the PRE-detail N·L (`n_pre` in shade()). Contrast
+/// from a tilt δ is tan(incidence)·δ — 0.27 on a noon-lit top vs 3.7 on a
+/// noon-lit side — so the crank tuned for tops overdrives grazing-lit faces
+/// 14×; the clamp compresses exactly the divergent-tan regime while
+/// under-cap pixels (tops) keep the raw value BITWISE. The lower bound is
+/// the anti-speckle floor (detail cannot extinguish a lit facet past 1−CAP),
+/// and a pre-detail-unlit facet may not be lit by detail at all (min(raw,0)
+/// — terminator hygiene). 0.8 → 0.5 in round 6b (the "sides still too much"
+/// feel-test). Mirrored in shade.hlsli.
+pub const DETAIL_NDL_CAP: f32 = 0.5;
+
+/// The cap itself: `raw` = n_s·wi (post-detail), `p` = n_pre·wi (pre-detail).
+/// Both arms are continuous at p = 0 (the bounds and the min both → ≤ 0).
+/// Under-cap values return `raw` BITWISE (clamp inside its own bounds).
+#[inline(always)]
+pub fn detail_ndl_cap(raw: f32, p: f32) -> f32 {
+    if p > 0.0 {
+        raw.clamp(p * (1.0 - DETAIL_NDL_CAP), p * (1.0 + DETAIL_NDL_CAP))
+    } else {
+        raw.min(0.0)
+    }
+}
+
+/// The cap applied to a light direction: every direct-tier N·L on a detail
+/// pixel goes through this (sun, fireflies, emissive clusters — ONE rule, so
+/// no light family re-opens the overdone-sides regime; the moon rides the
+/// sun struct and is covered by construction). `n_pre` None (no detail) is
+/// the raw dot verbatim — the structural off arm.
+#[inline(always)]
+pub fn capped_ndl(n_s: Vec3A, n_pre: Option<Vec3A>, wi: Vec3A) -> f32 {
+    let raw = n_s.dot(wi);
+    match n_pre {
+        Some(np) => detail_ndl_cap(raw, np.dot(wi)),
+        None => raw,
+    }
+}
+
+/// The coarse pool octaves' gradient share of the micro-bump (relief RIMS),
+/// relative to the grain's. The pools reach dlod < 3, so this is what keeps
+/// mid-distance surfaces from going flat when the grain window closes.
+/// Mirrored in shade.hlsli.
+pub const DETAIL_AO_BUMP_K: f32 = 1.5;
+/// The micro-bump's roughness window: zero bump at or below LO, full bump at
+/// or above HI (smoothstep-free linear ramp between). A slope that reads as
+/// surface grain on a matte wall FROSTS a tight specular lobe — the
+/// DamagedHelmet-visor feel-test finding — so smooth surfaces keep their
+/// polish. HI sits at the reflection-lobe gate's own 0.45 "glossy" threshold.
+/// Evaluated on the MAP-DRIVEN per-pixel rough_eff (one material can be
+/// visor-smooth and shell-rough), which is safe here because the bump draws
+/// no rng — unlike the reflection gate, which must read the flat factor.
+/// Mirrored in shade.hlsli.
+pub const DETAIL_ROUGH_LO: f32 = 0.2;
+pub const DETAIL_ROUGH_HI: f32 = 0.45;
+
+/// The bump's roughness damping weight in [0, 1] — exact 0 at/below LO
+/// (`detail_bump`'s g == 0 guard then returns the base normal verbatim),
+/// exact 1 at/above HI. Mirrored by `shade.hlsli::detail_bump_weight`.
+#[inline(always)]
+pub fn detail_bump_weight(rough: f32) -> f32 {
+    ((rough - DETAIL_ROUGH_LO) / (DETAIL_ROUGH_HI - DETAIL_ROUGH_LO)).clamp(0.0, 1.0)
+}
+
+/// Detail cavity AO strength — the feel knob (exponent scale: ambient in a
+/// pool of depth |h| is scaled by exp(−K·|h|); a typical −0.15 pool at K = 2
+/// reads ~0.74, the deepest combined ~−0.5 reads ~0.37). Mirrored as a
+/// literal in shade.hlsli (the clouds-wind idiom). The first linear K = 1.0
+/// measured a 0.6/255 mean image delta at a sunlit rungholt plaza —
+/// provably live and provably invisible; don't re-timid it without an A/B.
+pub const DETAIL_AO_K: f32 = 3.0;
+
+/// Cavity factor from the detail height `h` (the grain field's value − 1.0
+/// plus the coarse AO octaves — mean 0 by construction, so the
+/// "neighborhood mean" is a compile-time constant and this is a zero-lookup
+/// AO term): `exp(K·min(h, 0))` — pits darken, peaks return EXACTLY 1.0
+/// (exp(±0.0) == 1.0, and the call sites branch on `h < 0`, so the peak
+/// identity is structural twice over). Exponential rather than linear:
+/// strictly positive at ANY strength (no clamp to maintain as K or the
+/// field's range moves), and compounding depth is how occlusion composes.
+/// Multiplies AMBIENT and DIRECT SPECULAR, AFTER the PrimarySurface
+/// captures — the FSR signals stay un-cavitied and the deterministic delta
+/// rides the exact-remainder residual (un-denoised, texel-crisp).
+/// Deliberately NOT energy-neutral: it is occlusion. Auto-fades with the
+/// field's own dlod windows (h → 0 as they close).
+#[inline(always)]
+pub fn detail_cavity(h: f32) -> f32 {
+    (DETAIL_AO_K * h.min(0.0)).exp()
+}
+
+/// The marched shadow's height scale: TEXELS of geometric height per unit of
+/// field value — the terrain's steepness for shadow-length purposes. It is
+/// INCIDENCE-ADAPTIVE (round 6): `HT_eff = lerp(LO, HI, saturate(n·l))`.
+/// HI is the ARTISTIC override (at the coherent ~1.2 the sun ray cleared
+/// HMAX in a fraction of a texel for any sun above ~15°, so shadows existed
+/// only at grazing — a shadow term that vanishes whenever the scene is lit
+/// reads as absent); it applies in full exactly where it is needed — steep
+/// incidence (noon tops), where the natural response is weakest. At grazing
+/// incidence (noon SIDES, sunset tops) the march is already maximal at the
+/// physical steepness — rise ∝ n·l is tiny — so the override fades to LO
+/// (near-coherent) there instead of multiplying 5× onto an already-strong
+/// response; the overdone-sides feel-test is what forced the fade. rise =
+/// ndl/(|lt|·(LO + (HI−LO)·ndl)) stays strictly increasing in ndl
+/// (d/dndl = LO/(…)² > 0), so "higher sun never darker" survives.
+/// Mirrored in shade.hlsli.
+pub const DETAIL_SHADOW_HT_LO: f32 = 1.5;
+pub const DETAIL_SHADOW_HT_HI: f32 = 6.0;
+
+/// Shadow contact hardness: `exp(−K·penetration)`. K → ∞ converges to a
+/// binary hit test (which aliases at 1 spp — the relief feature affords
+/// binary only because its shadows ride real visibility); the soft-contact
+/// form doubles as the 2°-sun penumbra. Mirrored in shade.hlsli.
+pub const DETAIL_SHADOW_K: f32 = 5.0;
+
+/// March tap distances, texels: LINEAR near-field (continuous coverage — no
+/// gap a thin ridge slips through at contact-shadow scale) then geometric
+/// far-field (distant occluders are penumbra-soft under a 2° sun, so sparse
+/// taps + the soft max model that for free). Mirrored in shade.hlsli.
+pub const DETAIL_SHADOW_D: [f32; 8] = [1.0, 2.0, 3.0, 4.0, 6.0, 9.0, 14.0, 20.0];
+
+// The march's conservative HMAX bound (once the sun ray climbs past it no
+// tap can occlude — the clouds interval-skip lesson: high-sun pixels exit
+// after 2-3 taps) is COMPUTED inside `detail_sun_shadow` since the strength
+// knobs: DETAIL_AMP·kd + 0.5·kao + 0.35·kao, left-assoc so the default
+// reproduces the retired `DETAIL_AMP + 0.5 + 0.35` constant chain bitwise.
+
+/// The shadow FIELD: the height the march tests against — grain octave 0
+/// (1-texel-equivalent cells, salt 40) + both pool octaves (8/4-texel,
+/// salts 43/44), each under its EXISTING dlod window, value-only
+/// (`clouds::vnoise3` — never the grad path, the march wants no gradient).
+/// The same terrain the surface shades with minus the sub-texel grain
+/// octaves 1-2 (speckle-scale, irrelevant to shadows at ≥ 1-texel tap
+/// distances). `q3` in the world-space q-units of `detail_field`.
+/// Term-for-term HLSL twin.
+fn detail_shadow_h(q3: Vec3A, dlod: f32) -> f32 {
+    let mut hh = 0.0f32;
+    // The shadow field is the SUM of both strength families: grain octave 0
+    // rides --detail-strength, the pools --detail-ao-strength — the same
+    // terrain the surface shades with stays the terrain that shadows it.
+    let w0 = (-dlod).clamp(0.0, 1.0);
+    if w0 > 0.0 {
+        let v = crate::clouds::vnoise3(q3, 40);
+        hh += DETAIL_AMP * crate::scene::detail_strength() * w0 * (2.0 * v - 1.0);
+    }
+    let kao = crate::scene::detail_ao_strength();
+    for (div, salt, amp, lg) in [(8.0f32, 43u32, 0.5f32, 3.0f32), (4.0, 44, 0.35, 2.0)] {
+        let amp = amp * kao;
+        let wk = (lg - dlod).clamp(0.0, 1.0);
+        if wk > 0.0 {
+            let v = crate::clouds::vnoise3(q3 / div, salt);
+            hh += amp * wk * (2.0 * v - 1.0);
+        }
+    }
+    hh
+}
+
+/// REAL horizon-marched sun shadow — a closed-form occlusion trace of the
+/// detail heightfield toward the sun. From the hit's q-space position the
+/// sun ray is walked along the sun's tangent-plane direction, and upstream
+/// terrain that rises above it occludes: `occ = max_i(h(q3 + d_i·l̂t) −
+/// (h0 + d_i·rise))`, `shadow = exp(−K·max(occ, 0))`. Everything is in
+/// texel-EQUIVALENT q-units (one q-unit = one texel's worth of world travel,
+/// by the `s` scaling — see `detail_field`): `lt` = the sun's tangent-plane
+/// projection `l − n(n·l)`, unnormalized, so `|lt|` is the same grazing
+/// measure the old (t, b)-frame 2-vector had; `rise` = (n·l)/(|lt|·HT)
+/// field-units per q-unit (HT maps field value to texel-equivalents of
+/// height, so a low sun rises slowly ⇒ long shadows, a high sun exits on
+/// the HMAX bound after 2-3 taps). Exact 1.0 bitwise when nothing occludes
+/// or every window is closed; a sub-horizon sun (ndl ≤ 0, the face is
+/// geometrically self-shadowed) and the exact-zenith azimuth degeneracy
+/// return 1.0. Zero rng, pure hit function — every same-seed/replay/VisCtl
+/// contract holds. Shading-only: no visibility contact, silhouettes stay
+/// flat (deliberately NOT the --heightfield relief feature). Term-for-term
+/// HLSL twin.
+pub fn detail_sun_shadow(q3: Vec3A, dlod: f32, lt: Vec3A, ndl: f32) -> f32 {
+    let ltl = lt.length();
+    if ltl < 1e-4 || ndl <= 0.0 {
+        return 1.0;
+    }
+    let dir = lt / ltl;
+    let ht = DETAIL_SHADOW_HT_LO + (DETAIL_SHADOW_HT_HI - DETAIL_SHADOW_HT_LO) * ndl.clamp(0.0, 1.0);
+    let rise = ndl / (ltl * ht);
+    let h0 = detail_shadow_h(q3, dlod);
+    // The early-exit bound scales WITH the strength knobs (left-assoc so
+    // kd = kao = 1 reproduces DETAIL_SHADOW_HMAX's constant chain bitwise)
+    // — an unscaled bound would clip cranked-field shadows.
+    let hmax = DETAIL_AMP * crate::scene::detail_strength()
+        + 0.5 * crate::scene::detail_ao_strength()
+        + 0.35 * crate::scene::detail_ao_strength();
+    let mut occ = 0.0f32;
+    for d in DETAIL_SHADOW_D {
+        let ray_h = h0 + d * rise;
+        if ray_h > hmax {
+            break;
+        }
+        let o = detail_shadow_h(q3 + dir * d, dlod) - ray_h;
+        occ = occ.max(o);
+    }
+    if occ > 0.0 { (-DETAIL_SHADOW_K * occ).exp() } else { 1.0 }
+}
+
+/// Ambient bump-response amplification (`--no-amb-bump`; the HL2 radiosity-
+/// basis / bent-normal / SH-dominant-light class): irradiance is a cosine
+/// convolution, so even the exact sky response to a bump tilt is a few
+/// percent — structurally too smooth to show texel-scale relief under sky
+/// light at ANY tilt. The SH linear band already carries the dome's bright
+/// direction, so the cleanest member of that trick family is amplifying the
+/// deviation response: `irr(n) + K·(irr(n_s) − irr(n))`, clamped ≥ 0. First
+/// order and DIRECTIONAL — facets tilted toward the bright horizon/sun
+/// azimuth brighten, away darken — for one extra 9-madd SH eval. Applies to
+/// the FULL n_g→n_s deviation (normal maps, detail bump, ripple), so real
+/// normal-mapped scenes gain daylight relief too. Deliberately NOT energy
+/// conserving (an artistic exaggeration, the MOON_E_OVER_PI class).
+/// `n_s == n` (flat-shaded geometry — the majority) and lever-off return
+/// the old expression verbatim, checked in that order so the atomic load is
+/// skipped on the majority. Zero rng. Mirrored in shade.hlsli
+/// (`amb_irradiance`, gated on FLAG_AMB_BUMP).
+pub const AMB_BUMP_K: f32 = 6.0;
+
+/// Ambient response ceiling (round 6, the overdone-sides fix): the amplified
+/// delta is capped at ±CAP of the base irradiance, by a SCALAR rescale so the
+/// hue never shifts. The SH irradiance derivative is largest when n is
+/// PERPENDICULAR to the dome's dominant direction — i.e. on the very sides
+/// the K was not tuned for (tops sit near the dominant direction, where the
+/// derivative is minimal) — so the ×K response is geometrically maximal
+/// exactly where it overdrives. Under-cap pixels (the tops, measured ~10-30%
+/// relative on the tod-15 plaza) return the uncapped formula BITWISE.
+/// 0.5 → 0.25 in round 6b: at HIGH NOON a vertical block side gets ~no
+/// direct sun (n·l ≈ 0 with the sun overhead), so its light is almost
+/// entirely THIS ambient term — a ±50% cap on an ambient-dominated wall is
+/// a ±50% swing of its TOTAL brightness, which is the up-close side
+/// contrast the feel-test kept reporting; tops are direct-dominated at
+/// noon, so the same swing is a small fraction of their total and they
+/// keep their look either way.
+/// Mirrored in shade.hlsli.
+pub const AMB_BUMP_CAP: f32 = 0.25;
+
+#[inline(always)]
+pub fn amb_irradiance(sh: &crate::sh::Sh9, n: Vec3A, n_s: Vec3A) -> Vec3A {
+    if n_s == n || !crate::scene::amb_bump() {
+        return sh.irradiance(n_s);
+    }
+    let base = sh.irradiance(n);
+    let mut d = (sh.irradiance(n_s) - base) * AMB_BUMP_K;
+    let m = d.abs().max_element();
+    let lim = AMB_BUMP_CAP * base.max_element();
+    if m > lim {
+        d *= lim / m;
+    }
+    (base + d).max(Vec3A::ZERO)
+}
+
+/// The AO octaves open while `dlod` is below this — the coarsest pool cell is
+/// 8 texels, resolvable until the footprint reaches it (log2(8) = 3), which
+/// is what extends the cavity to MID-DISTANCE surfaces where the fine grain
+/// (dlod < 0) has long faded.
+pub const DETAIL_AO_RANGE: f32 = 3.0;
+
+/// Coarse height octaves: pools of occlusion AND relief rims at multi-texel
+/// scale — a LOWER frequency than the grain, which is what makes the cavity
+/// read as AO instead of "darker grain" (the same field would just deepen
+/// the speckle). Two octaves at 8- and 4-texel-equivalent cells (salts 43/44
+/// — the grain owns 40..42, ripple 16..19), each in its own resolvability
+/// window `clamp(log2(cell) − dlod, 0, 1)`, amplitudes summing to 0.85.
+/// Same world-space `q3` domain as `detail_field` (see the block comment
+/// there). Returns (height, per-q-unit gradient) like `detail_field` — the
+/// gradient feeds the micro-bump (× DETAIL_AO_BUMP_K), so the pools cast
+/// directional relief out to mid-distance. Chain rule: an octave samples at
+/// q/div, so its per-q-unit gradient carries 1/div (and the (2v − 1) the 2).
+/// Zero rng, u32-exact via the shared `vnoise3_vg`; term-for-term HLSL twin.
+pub fn detail_ao_field(q3: Vec3A, dlod: f32) -> (f32, Vec3A) {
+    let mut hh = 0.0f32;
+    let mut g = Vec3A::ZERO;
+    // --detail-ao-strength: scales both pool amplitudes (height, rims via
+    // the gradient, cavity input). ·1.0 bitwise-exact.
+    let kao = crate::scene::detail_ao_strength();
+    for (div, salt, amp, lg) in [(8.0f32, 43u32, 0.5f32, 3.0f32), (4.0, 44, 0.35, 2.0)] {
+        let amp = amp * kao;
+        let wk = (lg - dlod).clamp(0.0, 1.0);
+        if wk > 0.0 {
+            let (v, gv) = crate::clouds::vnoise3_vg(q3 / div, salt);
+            hh += amp * wk * (2.0 * v - 1.0);
+            g += gv * (amp * wk * 2.0 / div);
+        }
+    }
+    (hh, g)
+}
+
+/// The detail window's lod base for an ANISOTROPIC footprint: the log2 length
+/// of the footprint's MINOR axis, in normalized UV (unit-consistent with
+/// `tri_lod_base`, which is the log2 MAJOR axis — the `tangent_self_test`
+/// reduction gate pins that identity on conformal maps). The window must key
+/// off what the sampler actually leaves unresolved, and `SampleGrad`/
+/// `sample_aniso` resolve down to the short axis — keying off the isotropic
+/// (major-axis) lod closed the window on grazing-viewed faces whose albedo
+/// was still texel-sharp. Deliberately UNCAPPED by MaxAnisotropy: past the
+/// cap the window opens ~log2(ratio/max) further than the sampler resolves,
+/// which at the default 16 against tri_grads' 0.05 |n·d| floor is at most
+/// 0.32 lod of amplitude-`DETAIL_AMP` grain at near-silhouette grazing —
+/// accepted, and what keeps the HLSL twin free of an injected max constant.
+/// Mirrored by `shade.hlsli::detail_aniso_base`.
+pub fn detail_aniso_base(gu: glam::Vec2, gv: glam::Vec2) -> f32 {
+    gu.length().min(gv.length()).max(1e-20).log2()
+}
+
+/// (albedo factor, per-q-unit gradient of the factor's sum term). See the
+/// block comment above. Degenerate-lod note: a degenerate base lod is −∞ on
+/// the CPU and −1e30 on the GPU — both saturate every window to 1
+/// identically, and the output stays bounded at whatever q3 came in.
+pub fn detail_field(q3: Vec3A, dlod: f32) -> (f32, Vec3A) {
+    let mut q = q3;
+    // --detail-strength: scales the whole amplitude ladder (the gradient —
+    // and so the micro-bump — scales with it, linear in amp). ·1.0 is
+    // bitwise-exact, so the default is the unscaled field with no branch.
+    let (mut amp, mut scl) = (DETAIL_AMP * crate::scene::detail_strength(), 1.0f32);
+    let mut f = 1.0f32;
+    let mut g = Vec3A::ZERO;
+    for k in 0..3u32 {
+        let wk = (-dlod - k as f32).clamp(0.0, 1.0);
+        // A real branch, mirrored in HLSL — it also skips the noise eval.
+        if wk > 0.0 {
+            let (v, gv) = crate::clouds::vnoise3_vg(q, 40 + k);
+            f += amp * wk * (2.0 * v - 1.0);
+            // Chain rule: octave k samples at q·2^k, so its per-q-unit
+            // gradient carries the 2^k (`scl`), and the (2v − 1) the 2.
+            g += gv * (amp * wk * 2.0 * scl);
+        }
+        q *= 2.0;
+        amp *= 0.5;
+        scl *= 2.0;
+    }
+    (f.max(0.05), g)
+}
+
+/// Tilt `base` (the shading normal) by the detail field's 3D gradient's
+/// TANGENTIAL PROJECTION `gt = g − n(n·g)`. Under the old UV domain this was
+/// `t·g.x + b·g.y` on the Gram-Schmidt (t, b) frame — an orthonormal basis
+/// of the tangent plane, so the projection is the same operation with the
+/// frame construction deleted (the winding sign cancels in b⊗b). A zero
+/// result or a below-horizon tilt falls back to `base` (coarser, never
+/// wrong — the ripple_normal shape); `gt == 0` returns `base` verbatim, the
+/// structural off state in-function (it subsumes BOTH old guards: g == 0 and
+/// the degenerate-tangent bail — a normal-parallel gradient has no tangent
+/// component to apply).
+fn detail_bump(base: Vec3A, n: Vec3A, g: Vec3A) -> Vec3A {
+    let gt = g - n * n.dot(g);
+    if gt == Vec3A::ZERO {
+        return base;
+    }
+    let out = (base - gt * DETAIL_BUMP_K).normalize_or_zero();
+    if out == Vec3A::ZERO || out.dot(n) <= 0.0 { base } else { out }
+}
+
+/// Detail-texture math gates, run by `--check` (the depth-tint/ripple gate
+/// class): off anchors bit-exact, the single-octave window endpoint, fade
+/// continuity, bounds, energy neutrality, integrability (returned gradient
+/// vs central difference — the mechanized pin no image gate can see), the
+/// bump guards + sign pin, the anti-tiling teeth (the world-space domain's
+/// whole reason to exist), determinism.
+pub fn detail_self_test() -> Result<(), String> {
+    // Every gate below assumes the DEFAULT amplitudes, so the strength knobs
+    // are pinned to 1.0 for the duration and restored on EVERY exit path (an
+    // RAII guard — the amb-lever save/restore pattern, generalized: this fn
+    // has too many early returns for manual restores). A
+    // `--detail-strength 2 --check` therefore still proves the math.
+    struct StrengthPin(f32, f32);
+    impl Drop for StrengthPin {
+        fn drop(&mut self) {
+            crate::scene::set_detail_strength(self.0);
+            crate::scene::set_detail_ao_strength(self.1);
+        }
+    }
+    let _pin = StrengthPin(
+        crate::scene::detail_strength(),
+        crate::scene::detail_ao_strength(),
+    );
+    crate::scene::set_detail_strength(1.0);
+    crate::scene::set_detail_ao_strength(1.0);
+    // A fixed non-lattice-aligned 3D q-space anchor (the old uv0 × 256 texel
+    // point, given a z).
+    let q0 = Vec3A::new(81.152, 189.696, 7.317);
+    // (1) Off anchors, bit-exact: dlod >= 0 saturates every window to 0 —
+    // factor bits == 1.0, gradient exactly zero. The call site's `dlod < 0`
+    // guard therefore has a continuous in-function partner.
+    for &dl in &[0.0f32, 3.0] {
+        let (f, g) = detail_field(q0, dl);
+        if f.to_bits() != 1.0f32.to_bits() || g != Vec3A::ZERO {
+            return Err(format!("dlod {dl} must be exactly inert, got ({f}, {g:?})"));
+        }
+    }
+    // (2) Window endpoint at dlod = −1: octave 0 fully in (w0 == 1), octaves
+    // 1..2 exactly absent — the factor bit-equals a one-octave re-derivation.
+    {
+        let (f, _) = detail_field(q0, -1.0);
+        let (v, _) = crate::clouds::vnoise3_vg(q0, 40);
+        let expect = (1.0f32 + DETAIL_AMP * (2.0 * v - 1.0)).max(0.05);
+        if f.to_bits() != expect.to_bits() {
+            return Err(format!("dlod −1 factor {f} != single-octave {expect}"));
+        }
+    }
+    // (3) Continuity at the fade edge — no pop crossing dlod = 0.
+    {
+        let (f, _) = detail_field(q0, -1e-4);
+        if (f - 1.0).abs() > 1e-3 {
+            return Err(format!("fade edge pops: factor {f} at dlod −1e-4"));
+        }
+    }
+    // (4)+(5) Bounds/finiteness over a q3 × dlod sweep on a non-lattice-
+    // aligned 3D slab (z drifts per sample so the sweep is genuinely 3D),
+    // and energy: the mean factor at full depth must sit at 1 (a drift is an
+    // exposure shift).
+    {
+        let (nx, ny) = (97u32, 89u32);
+        let mut sum = 0.0f64;
+        for i in 0..nx {
+            for j in 0..ny {
+                let q = Vec3A::new(
+                    (i as f32 + 0.5) * 256.0 / nx as f32,
+                    (j as f32 + 0.5) * 256.0 / ny as f32,
+                    ((i * 13 + j * 7) % 32) as f32 * 0.37,
+                );
+                for &dl in &[-0.5f32, -1.5, -2.5, -4.0, -16.0] {
+                    let (f, g) = detail_field(q, dl);
+                    if !(0.6..=1.4).contains(&f) || !f.is_finite() || !g.is_finite() {
+                        return Err(format!(
+                            "factor/gradient out of bounds: ({f}, {g:?}) at {q:?} dlod {dl}"
+                        ));
+                    }
+                    if g.length() > 2.5 {
+                        return Err(format!("gradient {g:?} exceeds the design bound at {q:?}"));
+                    }
+                    if dl == -4.0 {
+                        sum += f as f64;
+                    }
+                }
+            }
+        }
+        let mean = sum / (nx as f64 * ny as f64);
+        if (mean - 1.0).abs() > 0.01 {
+            return Err(format!("detail factor mean {mean} drifts from 1 — exposure shift"));
+        }
+    }
+    // (6) Integrability: the returned gradient must be the true q-space
+    // derivative of the factor (dlod −4: every window saturated, so the sum
+    // is the only q-dependence and the 0.05 floor is provably inactive).
+    // Probe points sit with ALL THREE coords ≡ 0.125 (mod 0.25) q-units —
+    // the INTERIOR of every octave's lattice cell (≥ 0.125 q-units from the
+    // nearest boundary in all three octaves): value noise is only C¹ across
+    // a cell boundary, so a central difference straddling one carries O(h)
+    // error instead of O(h²) and would measure the probe, not the gradient.
+    {
+        let h = 0.02f32; // q-units — [q−h·2^k, q+h·2^k] stays in-cell everywhere
+        let mut worst = 0.0f32;
+        for i in 0..16u32 {
+            let q = Vec3A::new(
+                ((7 + i * 11) % 250) as f32 + 0.125,
+                ((5 + i * 17) % 250) as f32 + 0.125,
+                ((3 + i * 23) % 250) as f32 + 0.125,
+            );
+            let px = |d: Vec3A| detail_field(q + d, -4.0).0;
+            let g_fd = Vec3A::new(
+                (px(Vec3A::new(h, 0.0, 0.0)) - px(Vec3A::new(-h, 0.0, 0.0))) / (2.0 * h),
+                (px(Vec3A::new(0.0, h, 0.0)) - px(Vec3A::new(0.0, -h, 0.0))) / (2.0 * h),
+                (px(Vec3A::new(0.0, 0.0, h)) - px(Vec3A::new(0.0, 0.0, -h))) / (2.0 * h),
+            );
+            let (_, g) = detail_field(q, -4.0);
+            worst = worst.max((g - g_fd).abs().max_element());
+        }
+        if worst > 5e-3 {
+            return Err(format!(
+                "detail gradient is not the factor's derivative (worst |Δ| {worst})"
+            ));
+        }
+    }
+    // (7) Bump guards: zero gradient ⇒ base verbatim; unit length + horizon
+    // over a sweep; a NORMAL-PARALLEL gradient ⇒ base verbatim (the
+    // tangential projection is zero — this pin replaces the retired
+    // degenerate-tangent gate, whose frame no longer exists); and the sign
+    // pin — positive g.x under n = +Y tilts the normal AGAINST +x, so a
+    // silent sign flip fails loudly.
+    {
+        let n = Vec3A::Y;
+        let base = Vec3A::new(0.1, 0.98, -0.05).normalize();
+        let z = detail_bump(base, n, Vec3A::ZERO);
+        if z.to_array().map(f32::to_bits) != base.to_array().map(f32::to_bits) {
+            return Err("zero gradient must return the base verbatim".into());
+        }
+        for i in 0..16 {
+            let g = Vec3A::new(i as f32 * 0.15 - 1.0, 0.3, 0.8 - i as f32 * 0.11);
+            let out = detail_bump(n, n, g);
+            if (out.length() - 1.0).abs() > 1e-5 || out.dot(n) <= 0.0 {
+                return Err(format!("bump normal invalid: {out:?} for g {g:?}"));
+            }
+        }
+        let d = detail_bump(base, n, Vec3A::Y * 0.7);
+        if d.to_array().map(f32::to_bits) != base.to_array().map(f32::to_bits) {
+            return Err("normal-parallel gradient must return the base verbatim".into());
+        }
+        let s = detail_bump(n, n, Vec3A::new(0.5, 0.0, 0.0));
+        if s.x >= 0.0 {
+            return Err(format!("sign pin: +g.x must tilt against +x, got {s:?}"));
+        }
+    }
+    // (8) Determinism.
+    {
+        let a = detail_field(q0 * 1.31, -2.7);
+        let b = detail_field(q0 * 1.31, -2.7);
+        if a.0.to_bits() != b.0.to_bits() || a.1 != b.1 {
+            return Err("detail_field is not deterministic".into());
+        }
+    }
+    // (9) The bump's roughness window (the frosted-visor guard): exact 0
+    // at/below LO — which the g == 0 guard turns into a verbatim base normal
+    // — exact 1 at/above HI, monotone between.
+    {
+        for &(r, want) in &[
+            (0.0f32, 0.0f32),
+            (DETAIL_ROUGH_LO, 0.0),
+            (DETAIL_ROUGH_HI, 1.0),
+            (1.0, 1.0),
+        ] {
+            let w = detail_bump_weight(r);
+            if w.to_bits() != want.to_bits() {
+                return Err(format!("bump weight at rough {r} must be exactly {want}, got {w}"));
+            }
+        }
+        let mut prev = -1.0f32;
+        for i in 0..=20 {
+            let w = detail_bump_weight(i as f32 * 0.05);
+            if w < prev {
+                return Err("bump weight must be monotone in roughness".into());
+            }
+            prev = w;
+        }
+        // The composition: a smooth pixel's bump must be a verbatim no-op
+        // through the g·bw == 0 path.
+        let n = Vec3A::Y;
+        let g = Vec3A::new(0.7, 0.0, -0.4) * detail_bump_weight(DETAIL_ROUGH_LO);
+        let out = detail_bump(n, n, g);
+        if out.to_array().map(f32::to_bits) != n.to_array().map(f32::to_bits) {
+            return Err("smooth-pixel bump must be a verbatim no-op".into());
+        }
+    }
+    // The aniso window base keys off the MINOR axis (the Minecraft-tops
+    // finding: the isotropic base's view-tilt term closed the window on
+    // grazing-viewed faces whose albedo the aniso sampler kept sharp).
+    {
+        let iso = glam::Vec2::new(0.01, 0.0);
+        let v = glam::Vec2::new(0.0, 0.01);
+        let conformal = detail_aniso_base(iso, v);
+        if (conformal - 0.01f32.log2()).abs() > 1e-6 {
+            return Err(format!(
+                "conformal aniso base {conformal} != log2(0.01) — unit drift vs tri_lod_base"
+            ));
+        }
+        // Stretching the MAJOR axis alone (the grazing-view case) must not
+        // move the window — invariance is the fix, and the teeth: the old
+        // isotropic (major-axis) base moves by log2(16) here.
+        let stretched = detail_aniso_base(glam::Vec2::new(0.16, 0.0), v);
+        if stretched.to_bits() != conformal.to_bits() {
+            return Err("major-axis stretch must not move the detail window".into());
+        }
+        let major = 0.16f32.log2();
+        if (major - stretched).abs() < 3.9 {
+            return Err("teeth: the major-axis base must differ by ~log2(16)".into());
+        }
+        // gu/gv symmetry, and the degenerate floor stays finite.
+        if detail_aniso_base(v, glam::Vec2::new(0.16, 0.0)).to_bits() != stretched.to_bits() {
+            return Err("aniso base must be symmetric in gu/gv".into());
+        }
+        if !detail_aniso_base(glam::Vec2::ZERO, glam::Vec2::ZERO).is_finite() {
+            return Err("degenerate footprint must stay finite".into());
+        }
+    }
+    // Detail cavity AO (detail_cavity): the pits-only occlusion factor.
+    {
+        // Off anchor + peaks clamp, EXACT: 1.0 + K·0.0 is a +0.0 add ⇒
+        // bitwise 1.0, and the call sites' `h < 0` branch makes peaks
+        // structural — but the function itself must agree.
+        for h in [0.0f32, 1e-6, 0.1, 0.315] {
+            if detail_cavity(h).to_bits() != 1.0f32.to_bits() {
+                return Err(format!("cavity({h}) must be exactly 1.0"));
+            }
+        }
+        // Pits darken, strictly monotone in depth.
+        let mut prev = 1.0f32;
+        for h in [-0.05f32, -0.1, -0.2, -0.315] {
+            let c = detail_cavity(h);
+            if c >= prev {
+                return Err(format!("cavity must strictly decrease into pits ({h} -> {c})"));
+            }
+            prev = c;
+        }
+        // Strict positivity at any depth — the exp form's whole point (a
+        // future K raise must never need a clamp audit).
+        for h in [-0.315f32, -0.95, -3.0] {
+            if !(detail_cavity(h) > 0.0) {
+                return Err(format!("cavity({h}) must stay strictly positive"));
+            }
+        }
+        // Continuity at 0⁻ (no pop crossing the mean): |exp(K·h) − 1| ≈ K·|h|.
+        if (detail_cavity(-1e-6) - 1.0).abs() > (DETAIL_AO_K + 1.0) * 1e-6 {
+            return Err("cavity must be continuous at h = 0".into());
+        }
+        // TEETH, field -> cavity end-to-end: a real pit of the field must
+        // darken, and the SAME q3 with the window closed must be exactly
+        // 1.0. The scan failing to find a pit is itself a failure (the
+        // field would have lost its variance).
+        let mut pit: Option<Vec3A> = None;
+        'scan: for iy in 0..64 {
+            for ix in 0..64 {
+                let q = Vec3A::new(
+                    ix as f32 * 4.0 + 0.7,
+                    iy as f32 * 4.0 + 0.3,
+                    ((ix * 3 + iy * 5) % 17) as f32 * 0.9,
+                );
+                let (f, _) = detail_field(q, -3.0);
+                if f < 0.95 {
+                    pit = Some(q);
+                    break 'scan;
+                }
+            }
+        }
+        let Some(q) = pit else {
+            return Err("no pit (f < 0.95) found at dlod = -3 — the field lost its variance".into());
+        };
+        let (f, _) = detail_field(q, -3.0);
+        if detail_cavity(f - 1.0) >= 1.0 {
+            return Err("a real field pit must produce cavity < 1".into());
+        }
+        let (f0, _) = detail_field(q, 0.0);
+        if detail_cavity(f0 - 1.0).to_bits() != 1.0f32.to_bits() {
+            return Err("a closed window must produce cavity exactly 1.0".into());
+        }
+        // Determinism: bit-equal across two evals.
+        if detail_cavity(f - 1.0).to_bits() != detail_cavity(f - 1.0).to_bits() {
+            return Err("cavity must be deterministic".into());
+        }
+    }
+    // Horizon-marched sun shadow (detail_sun_shadow) — the real trace.
+    {
+        let qa = Vec3A::new(80.128, 173.312, 4.913);
+        // Closed windows (dlod >= 3): the shadow field is identically zero,
+        // occ never exceeds 0, factor bitwise 1.0 at any sun.
+        for dlod in [DETAIL_AO_RANGE, 6.0] {
+            let s = detail_sun_shadow(qa, dlod, Vec3A::new(0.6, 0.0, 0.2), 0.5);
+            if s.to_bits() != 1.0f32.to_bits() {
+                return Err(format!("closed-window march must be exactly 1.0, got {s}"));
+            }
+        }
+        // Degeneracies: exact-zenith azimuth (|lt| < 1e-4) and a sub-horizon
+        // sun both return bitwise 1.0.
+        if detail_sun_shadow(qa, -1.0, Vec3A::ZERO, 1.0).to_bits() != 1.0f32.to_bits()
+            || detail_sun_shadow(qa, -1.0, Vec3A::new(0.5, 0.0, 0.0), -0.1).to_bits()
+                != 1.0f32.to_bits()
+        {
+            return Err("zenith/sub-horizon march must be exactly 1.0".into());
+        }
+        // OCCLUDER TEETH with directionality: scan for a point where a LOW
+        // grazing sun from +x is occluded (< 1) while the OPPOSITE azimuth
+        // at the same point is not darker than it — and require the shadow
+        // to exist at all (anti-vacuity: a dead march passes every anchor
+        // above while shadowing nothing).
+        let ndl = 0.08f32; // low sun: rise ≈ 0.067 field-units/q-unit
+        let lt = Vec3A::new(0.99, 0.0, 0.0);
+        let mut found = None;
+        'scan: for iy in 0..48 {
+            for ix in 0..48 {
+                let p = Vec3A::new(
+                    ix as f32 * 5.34 + 2.3,
+                    iy as f32 * 5.34 + 1.1,
+                    ((ix * 7 + iy * 11) % 23) as f32 * 0.7,
+                );
+                let s = detail_sun_shadow(p, -1.0, lt, ndl);
+                if s < 0.85 {
+                    found = Some((p, s));
+                    break 'scan;
+                }
+            }
+        }
+        let Some((p, s)) = found else {
+            return Err("no marched shadow (< 0.85) found at a grazing sun — the march is dead".into());
+        };
+        if !(s > 0.0) {
+            return Err("marched shadow must stay strictly positive".into());
+        }
+        // Directionality: the same point lit from the opposite azimuth sees
+        // different upstream terrain — the factors must differ (a direction-
+        // blind march would be the retired statistical term in disguise).
+        let s_opp = detail_sun_shadow(p, -1.0, -lt, ndl);
+        if s_opp.to_bits() == s.to_bits() {
+            return Err("march must be directional (opposite azimuths bit-equal)".into());
+        }
+        // THIRD-AXIS LIVENESS (world-space domain): the march must occlude
+        // along z exactly as along x — a port that silently dropped an axis
+        // (or a field flat in z) passes the x-scan while shadowing nothing
+        // on half the walls.
+        {
+            let ltz = Vec3A::new(0.0, 0.0, 0.99);
+            let mut found_z = false;
+            'zscan: for iy in 0..48 {
+                for ix in 0..48 {
+                    let p = Vec3A::new(
+                        ix as f32 * 5.34 + 2.3,
+                        ((ix * 7 + iy * 11) % 23) as f32 * 0.7,
+                        iy as f32 * 5.34 + 1.1,
+                    );
+                    if detail_sun_shadow(p, -1.0, ltz, ndl) < 0.85 {
+                        found_z = true;
+                        break 'zscan;
+                    }
+                }
+            }
+            if !found_z {
+                return Err("no marched shadow along +z — the third axis is dead".into());
+            }
+        }
+        // Shadows lengthen as the sun drops: at the shadowed point, a higher
+        // sun never darkens more, and somewhere the low sun is strictly
+        // darker than the high one.
+        let s_hi = detail_sun_shadow(p, -1.0, lt, 0.9);
+        if s_hi < s {
+            return Err("a higher sun must not deepen the marched shadow".into());
+        }
+        if !(s < s_hi) && s_hi.to_bits() == s.to_bits() {
+            return Err("teeth: a low sun must shadow strictly more somewhere".into());
+        }
+        // Adaptive-HT monotonicity (round 6): the incidence fade must keep
+        // "higher sun never darker" over the WHOLE ndl range — rise =
+        // ndl/(|lt|·(LO + (HI−LO)·ndl)) is strictly increasing in ndl
+        // (d/dndl = LO/(…)² > 0), and this sweep is the behavioral pin.
+        let mut prev = s;
+        for k in 1..=18 {
+            let nd = 0.08 + 0.045 * k as f32;
+            let sk = detail_sun_shadow(p, -1.0, lt, nd);
+            if sk < prev {
+                return Err(format!(
+                    "adaptive HT broke shadow monotonicity at ndl {nd}: {sk} < {prev}"
+                ));
+            }
+            prev = sk;
+        }
+        // Endpoint pins on the fade itself: the lerp must land the artistic
+        // HI at steep incidence and the near-coherent LO at grazing.
+        let ht_at = |nd: f32| {
+            DETAIL_SHADOW_HT_LO + (DETAIL_SHADOW_HT_HI - DETAIL_SHADOW_HT_LO) * nd.clamp(0.0, 1.0)
+        };
+        if ht_at(0.0).to_bits() != DETAIL_SHADOW_HT_LO.to_bits()
+            || ht_at(1.0).to_bits() != DETAIL_SHADOW_HT_HI.to_bits()
+            || !(DETAIL_SHADOW_HT_LO < DETAIL_SHADOW_HT_HI)
+        {
+            return Err("adaptive HT endpoints must be exactly LO/HI with LO < HI".into());
+        }
+        // Determinism.
+        if detail_sun_shadow(p, -1.0, lt, ndl).to_bits() != s.to_bits() {
+            return Err("march must be deterministic".into());
+        }
+    }
+    // Direct N·L contrast cap (detail_ndl_cap) — the overdone-sides ceiling.
+    {
+        let c = DETAIL_NDL_CAP;
+        // Under-cap identity: a raw inside the bounds returns BITWISE.
+        let raw = 0.55f32;
+        if detail_ndl_cap(raw, 0.5).to_bits() != raw.to_bits() {
+            return Err("under-cap ndl must return raw bitwise".into());
+        }
+        // Over-cap lands exactly on the bounds.
+        if detail_ndl_cap(2.0, 0.5).to_bits() != (0.5 * (1.0 + c)).to_bits()
+            || detail_ndl_cap(-0.5, 0.5).to_bits() != (0.5 * (1.0 - c)).to_bits()
+        {
+            return Err("over-cap ndl must land exactly on p·(1±CAP)".into());
+        }
+        // Terminator hygiene: a pre-detail-unlit facet may not be lit by
+        // detail (bright-speckle kill), while a darker tilt passes through.
+        if detail_ndl_cap(0.3, 0.0).to_bits() != 0.0f32.to_bits()
+            || detail_ndl_cap(0.3, -0.2).to_bits() != 0.0f32.to_bits()
+            || detail_ndl_cap(-0.2, -0.1).to_bits() != (-0.2f32).to_bits()
+        {
+            return Err("p <= 0 must force ndl <= 0".into());
+        }
+        // Continuity at p = 0: both arms collapse toward 0 (no pop crossing
+        // the pre-detail terminator).
+        let eps_p = 1e-6f32;
+        if detail_ndl_cap(0.5, eps_p) > eps_p * (1.0 + c) {
+            return Err("ndl cap must be continuous at p = 0".into());
+        }
+    }
+    // Ambient bump response (amb_irradiance). The fn reads the live lever,
+    // so the gate PINS it on for the amplification teeth and restores after
+    // (the wide-tiles pattern) — a `--no-amb-bump --check` run must still
+    // prove the math, then re-verify the off arm below.
+    {
+        let lever = crate::scene::amb_bump();
+        crate::scene::set_amb_bump(true);
+        // A synthetic SH with a known linear band: bright toward +x. Project
+        // a directional-ish sky by hand — coefficient layout per sh.rs
+        // (band 1 = Y_1{-1,0,1} ∝ y, z, x).
+        let mut sh = crate::sh::Sh9::ZERO;
+        sh.c[0] = Vec3A::splat(1.0);
+        sh.c[3] = Vec3A::splat(0.4); // the +x linear band
+        let n = Vec3A::Y;
+        // Identity: n_s == n must be the plain irradiance bitwise (the
+        // structural off arm — flat-shaded geometry).
+        let plain = sh.irradiance(n);
+        if amb_irradiance(&sh, n, n)
+            .to_array()
+            .map(f32::to_bits)
+            != plain.to_array().map(f32::to_bits)
+        {
+            return Err("amb_irradiance must be plain irradiance at n_s == n".into());
+        }
+        // Sign + amplification teeth: a tilt toward the bright +x must
+        // brighten, away must darken, and the amplified delta must exceed
+        // the raw delta (K > 1 anti-vacuity).
+        let toward = Vec3A::new(0.3, 0.954, 0.0).normalize();
+        let away = Vec3A::new(-0.3, 0.954, 0.0).normalize();
+        let a_t = amb_irradiance(&sh, n, toward);
+        let a_a = amb_irradiance(&sh, n, away);
+        if !(a_t.x > plain.x) || !(a_a.x < plain.x) {
+            return Err("amb bump: toward-bright must brighten, away must darken".into());
+        }
+        let raw = sh.irradiance(toward);
+        if !((a_t.x - plain.x) > (raw.x - plain.x) * 1.5) {
+            return Err("amb bump: the amplified delta must exceed the raw delta".into());
+        }
+        // Response ceiling (round 6): where the raw ×K delta exceeds
+        // ±AMB_BUMP_CAP of the base, the output delta's max channel must sit
+        // ON the ceiling (scalar rescale) with the hue untouched — probed on
+        // a CHROMATIC SH so the ratio teeth aren't trivially satisfied.
+        {
+            let mut shc = crate::sh::Sh9::ZERO;
+            shc.c[0] = Vec3A::new(1.0, 0.8, 0.6);
+            shc.c[3] = Vec3A::new(0.5, 0.4, 0.3);
+            let plainc = shc.irradiance(n);
+            let d_raw = (shc.irradiance(toward) - plainc) * AMB_BUMP_K;
+            let lim = AMB_BUMP_CAP * plainc.max_element();
+            if !(d_raw.abs().max_element() > lim) {
+                return Err(
+                    "amb cap teeth are vacuous — the synthetic SH no longer exceeds the cap"
+                        .into(),
+                );
+            }
+            let d_out = amb_irradiance(&shc, n, toward) - plainc;
+            let m_out = d_out.abs().max_element();
+            if !((m_out - lim).abs() <= 1e-5 * lim) {
+                return Err(format!(
+                    "amb cap: capped delta max {m_out} must land on the ceiling {lim}"
+                ));
+            }
+            // Hue preservation: the rescale is scalar, so channel ratios of
+            // the output delta match the raw delta's.
+            let s0 = d_out.x / d_raw.x;
+            if !((d_out.y / d_raw.y - s0).abs() <= 1e-5) || !((d_out.z / d_raw.z - s0).abs() <= 1e-5)
+            {
+                return Err("amb cap must rescale scalar (hue-preserving)".into());
+            }
+            // Under-cap bitwise identity: a small tilt whose ×K delta stays
+            // under the ceiling must reproduce the UNCAPPED formula exactly.
+            let mild = Vec3A::new(0.02, 0.9998, 0.0).normalize();
+            let d_mild = (shc.irradiance(mild) - plainc) * AMB_BUMP_K;
+            if !(d_mild.abs().max_element() < lim) {
+                return Err("amb cap under-cap probe is not under the cap".into());
+            }
+            let expect = (plainc + d_mild).max(Vec3A::ZERO);
+            if amb_irradiance(&shc, n, mild).to_array().map(f32::to_bits)
+                != expect.to_array().map(f32::to_bits)
+            {
+                return Err("under-cap amb response must be the uncapped formula bitwise".into());
+            }
+        }
+        // Clamp floor: a hostile tilt against a strong band cannot go
+        // negative.
+        let mut hostile = crate::sh::Sh9::ZERO;
+        hostile.c[0] = Vec3A::splat(0.1);
+        hostile.c[3] = Vec3A::splat(2.0);
+        let neg = amb_irradiance(&hostile, n, away);
+        if neg.min_element() < 0.0 {
+            return Err("amb bump must clamp at zero".into());
+        }
+        // Determinism.
+        if amb_irradiance(&sh, n, toward).to_array().map(f32::to_bits)
+            != a_t.to_array().map(f32::to_bits)
+        {
+            return Err("amb_irradiance must be deterministic".into());
+        }
+        // Lever-off arm: the plain irradiance verbatim at a perturbed n_s.
+        crate::scene::set_amb_bump(false);
+        if amb_irradiance(&sh, n, toward).to_array().map(f32::to_bits)
+            != sh.irradiance(toward).to_array().map(f32::to_bits)
+        {
+            crate::scene::set_amb_bump(lever);
+            return Err("lever-off amb_irradiance must be plain irradiance".into());
+        }
+        crate::scene::set_amb_bump(lever);
+    }
+    // Coarse AO/relief octaves (detail_ao_field).
+    {
+        let qa = Vec3A::new(80.128, 173.312, 4.913);
+        // Structural off past the range: both windows exactly closed —
+        // height bitwise 0.0 AND gradient exactly zero (the rim bump's own
+        // off arm).
+        for dlod in [DETAIL_AO_RANGE, 4.0, 10.0] {
+            let (v, g) = detail_ao_field(qa, dlod);
+            if v.to_bits() != 0.0f32.to_bits() || g != Vec3A::ZERO {
+                return Err(format!("ao field must be exactly inert at dlod = {dlod}"));
+            }
+        }
+        // Continuity at the window edge (no pop entering range).
+        if detail_ao_field(qa, DETAIL_AO_RANGE - 1e-4).0.abs() > 1e-4 {
+            return Err("ao field must fade in continuously at the range edge".into());
+        }
+        // Bounds + anti-vacuity over a grid at full window: |h| <= 0.85, and
+        // the field must actually vary (a dead field would pass every gate
+        // above while darkening nothing).
+        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        for iy in 0..48 {
+            for ix in 0..48 {
+                let p = Vec3A::new(
+                    ix as f32 * 5.34 + 2.3,
+                    iy as f32 * 5.34 + 1.1,
+                    ((ix * 5 + iy * 3) % 29) as f32 * 0.8,
+                );
+                let (v, g) = detail_ao_field(p, -1.0);
+                if !v.is_finite() || v.abs() > 0.85 || !g.is_finite() {
+                    return Err(format!("ao field out of bounds at {p:?}: ({v}, {g:?})"));
+                }
+                lo = lo.min(v);
+                hi = hi.max(v);
+            }
+        }
+        if lo > -0.05 || hi < 0.05 {
+            return Err(format!("ao field lost its variance (range {lo}..{hi})"));
+        }
+        // Integrability: the returned gradient must be the true q-space
+        // derivative of the height. Probes sit at cell-INTERIOR points of
+        // BOTH pool lattices in ALL THREE axes (8- and 4-unit cells:
+        // p ≡ 2 (mod 4) is ≥ 1 unit from every 4-boundary and ≥ 2 from
+        // every 8-boundary) — value noise is only C¹ across a cell boundary,
+        // so a straddling central difference measures the probe, not the
+        // gradient (the detail_field lesson).
+        {
+            // q-units — stays in-cell for both lattices, and small enough
+            // that the O(h²) truncation sits well under the 5e-3 bound (at
+            // 0.25 the pools' third derivative alone measured 0.014 — the
+            // difference was measuring the probe, not the gradient).
+            let hh = 0.05f32;
+            let mut worst = 0.0f32;
+            for i in 0..12u32 {
+                let p = Vec3A::new(
+                    ((6 + i * 16) % 248) as f32 + 2.0,
+                    ((10 + i * 24) % 248) as f32 + 2.0,
+                    ((14 + i * 40) % 248) as f32 + 2.0,
+                );
+                let f = |d: Vec3A| detail_ao_field(p + d, -1.0).0;
+                let g_fd = Vec3A::new(
+                    (f(Vec3A::new(hh, 0.0, 0.0)) - f(Vec3A::new(-hh, 0.0, 0.0))) / (2.0 * hh),
+                    (f(Vec3A::new(0.0, hh, 0.0)) - f(Vec3A::new(0.0, -hh, 0.0))) / (2.0 * hh),
+                    (f(Vec3A::new(0.0, 0.0, hh)) - f(Vec3A::new(0.0, 0.0, -hh))) / (2.0 * hh),
+                );
+                let (_, g) = detail_ao_field(p, -1.0);
+                worst = worst.max((g - g_fd).abs().max_element());
+            }
+            if worst > 5e-3 {
+                return Err(format!(
+                    "ao gradient is not the height's derivative (worst |Δ| {worst})"
+                ));
+            }
+        }
+        // Determinism.
+        {
+            let a = detail_ao_field(qa, -1.0);
+            let b = detail_ao_field(qa, -1.0);
+            if a.0.to_bits() != b.0.to_bits() || a.1 != b.1 {
+                return Err("ao field must be deterministic".into());
+            }
+        }
+    }
+    // ANTI-TILING TEETH — the world-space domain's reason to exist. 16
+    // q-units = one 16-texel Minecraft block advance, the exact offset that
+    // aliased onto the same UV rect (hence the same field values) under the
+    // old UV-texel domain. Every axis must decorrelate, for the grain, the
+    // AO pools, and the shadow field alike.
+    {
+        for axis in [Vec3A::X, Vec3A::Y, Vec3A::Z] {
+            let q1 = q0 + axis * 16.0;
+            if detail_field(q0, -4.0).0.to_bits() == detail_field(q1, -4.0).0.to_bits() {
+                return Err(format!("grain repeats one block along {axis:?} — the domain tiles"));
+            }
+            if detail_ao_field(q0, -1.0).0.to_bits() == detail_ao_field(q1, -1.0).0.to_bits() {
+                return Err(format!("AO pools repeat one block along {axis:?} — the domain tiles"));
+            }
+            if detail_shadow_h(q0, -1.0).to_bits() == detail_shadow_h(q1, -1.0).to_bits() {
+                return Err(format!("shadow field repeats one block along {axis:?} — the domain tiles"));
+            }
+        }
+    }
+    // STRENGTH KNOBS (--detail-strength / --detail-ao-strength): amplitude
+    // scaling must be EXACT where fp lets it be — 0 is the structural
+    // off-by-amplitude, and ×2 is a power of two, so the deviation doubles
+    // BITWISE (real teeth, not a tolerance). The hmax pin: at a cranked AO
+    // field a low-sun march must still find shadow — an UNSCALED early-exit
+    // bound would clip exactly the shadows the knob asked for.
+    {
+        let (f1, _) = detail_field(q0, -4.0);
+        crate::scene::set_detail_strength(0.0);
+        let (f0, g0) = detail_field(q0, -4.0);
+        if f0.to_bits() != 1.0f32.to_bits() || g0 != Vec3A::ZERO {
+            crate::scene::set_detail_strength(1.0);
+            return Err("detail-strength 0 must be exactly inert".into());
+        }
+        crate::scene::set_detail_strength(2.0);
+        let (f2, _) = detail_field(q0, -4.0);
+        crate::scene::set_detail_strength(1.0);
+        if (f2 - 1.0).to_bits() != (2.0 * (f1 - 1.0)).to_bits() {
+            return Err(format!(
+                "detail-strength 2 must double the deviation exactly ({} vs {})",
+                f2 - 1.0,
+                2.0 * (f1 - 1.0)
+            ));
+        }
+        let (h1, gr1) = detail_ao_field(q0, -1.0);
+        crate::scene::set_detail_ao_strength(2.0);
+        let (h2, gr2) = detail_ao_field(q0, -1.0);
+        crate::scene::set_detail_ao_strength(1.0);
+        if h2.to_bits() != (2.0 * h1).to_bits() || gr2 != gr1 * 2.0 {
+            return Err("detail-ao-strength 2 must double the pools exactly".into());
+        }
+        // hmax coherence: kao = 4 grows the field 4× — the march must still
+        // find a sub-0.85 shadow at a grazing sun somewhere on the scan grid
+        // (a stale unscaled bound breaks out before the taller terrain can
+        // occlude).
+        crate::scene::set_detail_ao_strength(4.0);
+        let mut found4 = false;
+        'k4: for iy in 0..24 {
+            for ix in 0..24 {
+                let p = Vec3A::new(
+                    ix as f32 * 10.7 + 2.3,
+                    iy as f32 * 10.7 + 1.1,
+                    ((ix * 7 + iy * 11) % 23) as f32 * 0.7,
+                );
+                if detail_sun_shadow(p, -1.0, Vec3A::new(0.99, 0.0, 0.0), 0.08) < 0.85 {
+                    found4 = true;
+                    break 'k4;
+                }
+            }
+        }
+        crate::scene::set_detail_ao_strength(1.0);
+        if !found4 {
+            return Err("kao = 4 march found no shadow — the hmax bound did not scale".into());
+        }
+    }
+    // PER-MATERIAL SCALE DERIVATION (Scene::detail_scales — the greedy-mesh
+    // anti-seam fix): two coplanar quads of ONE material, one mapped 1:1
+    // (16 texels over 1 world unit) and one stretched 4× (vokselia's merged
+    // strips in miniature), must derive a SINGLE nonzero scale equal to the
+    // hand-computed median of the per-triangle texel sizes — a per-face
+    // value is exactly what seamed the field at every face boundary. A
+    // degenerate-UV scene must derive 0.0 (the structural off).
+    {
+        use crate::scene::{finalize_scalars, MatKind, Material, Scene};
+        use crate::texture::Texture;
+        let mk = |texcoords: Vec<glam::Vec2>| -> Scene {
+            let mut sc = Scene {
+                positions: vec![
+                    Vec3A::new(0.0, 0.0, 0.0),
+                    Vec3A::new(1.0, 0.0, 0.0),
+                    Vec3A::new(1.0, 0.0, 1.0),
+                    Vec3A::new(0.0, 0.0, 1.0),
+                    Vec3A::new(1.0, 0.0, 0.0),
+                    Vec3A::new(5.0, 0.0, 0.0),
+                    Vec3A::new(5.0, 0.0, 4.0),
+                    Vec3A::new(1.0, 0.0, 4.0),
+                ],
+                normals: vec![Vec3A::Y; 8],
+                texcoords,
+                indices: vec![[0, 1, 2], [0, 2, 3], [4, 5, 6], [4, 6, 7]],
+                tri_mat: vec![0; 4],
+                materials: vec![Material {
+                    albedo: Vec3A::ONE,
+                    roughness: 0.8,
+                    metallic: 0.0,
+                    anisotropy: 0.0,
+                    sheen: 0.0,
+                    translucency: 0.0,
+                    transmission: 0.0,
+                    trans_tint: Vec3A::splat(-1.0),
+                    ior: 1.5,
+                    ripple_amp: 0.0,
+                    emissive: Vec3A::ZERO,
+                    normal_tex: crate::scene::NO_TEX,
+                    normal_scale: 1.0,
+                    height_amp: 0.0,
+                    rough_tex: crate::scene::NO_TEX,
+                    metal_tex: crate::scene::NO_TEX,
+                    emissive_tex: crate::scene::NO_TEX,
+                    class: crate::matclass::IDX_DEFAULT as u8,
+                    kind: MatKind::Textured { tex: 0 },
+                }],
+                textures: vec![Texture {
+                    w: 16,
+                    h: 16,
+                    texels: vec![[128u8, 128, 128, 255]; 256],
+                    alpha_masked: false,
+                    srgb: true,
+                    source: String::new(),
+                    h2n: false,
+                    n2h: false,
+                    normal_role: false,
+                    mips: Vec::new(),
+                }],
+                any_alpha: false,
+                any_height: false,
+                any_transmissive: false,
+                emissive: crate::emissive::EmissiveLights::off(),
+                sun: crate::sky::Sun::new(Vec3A::Y),
+                sky_sh: crate::sh::Sh9::ZERO,
+                sky_scale: 1.0,
+                night: 0.0,
+                sway: None,
+                sway_regions: Vec::new(),
+                diag: 1.0,
+                eps: 1e-4,
+                ao_radius: 0.03,
+                detail_scales: Vec::new(),
+                content_min: Vec3A::ZERO,
+                content_max: Vec3A::ZERO,
+            };
+            finalize_scalars(&mut sc);
+            sc
+        };
+        let unit = vec![
+            glam::Vec2::new(0.0, 0.0),
+            glam::Vec2::new(1.0, 0.0),
+            glam::Vec2::new(1.0, 1.0),
+            glam::Vec2::new(0.0, 1.0),
+            glam::Vec2::new(0.0, 0.0),
+            glam::Vec2::new(1.0, 0.0),
+            glam::Vec2::new(1.0, 1.0),
+            glam::Vec2::new(0.0, 1.0),
+        ];
+        let sc = mk(unit);
+        // Per-tri texel sizes: quad A twice 1/16, quad B twice 4/16; the
+        // upper median (v[len/2]) of the sorted four is 0.25.
+        let s = sc.detail_scales.first().copied().unwrap_or(0.0);
+        if !((s - 0.25).abs() < 1e-6) {
+            return Err(format!(
+                "detail_scales derivation: expected the 0.25 median, got {s}"
+            ));
+        }
+        if sc.detail_scales.len() != 1 {
+            return Err("detail_scales must be parallel to materials".into());
+        }
+        let sc0 = mk(vec![glam::Vec2::ZERO; 8]);
+        if sc0.detail_scales.first().copied().unwrap_or(1.0).to_bits() != 0.0f32.to_bits() {
+            return Err("degenerate-UV material must derive detail_scale 0.0".into());
+        }
     }
     Ok(())
 }
