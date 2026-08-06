@@ -11913,6 +11913,114 @@ fn run_spin_gpu(
         }
     };
 
+    // --dual-gpu: a second adapter takes N of the 8 level-3 tile rows.
+    //
+    // Wavefront only for now — the DXR pipeline has no tile ownership at all
+    // (it needs the sub-rect + y-offset, which is the last stage of the plan),
+    // so an armed --dxr spin says so rather than silently measuring one GPU.
+    struct Dual {
+        hg: gpu::trace::HeadlessGpu,
+        tg: gpu::trace::TraceGpu,
+        xf: gpu::dual::BandTransfer,
+        y0: u32,
+        y1: u32,
+        bytes: usize,
+        // Per-phase wall time, accumulated over the TIMED frames only. The
+        // balancer needs these separated — its setpoint is "secondary finish +
+        // write <= primary finish", which is unknowable from a frame total —
+        // and without them a dual-GPU regression is a single number with four
+        // candidate causes.
+        t_sec: f64,
+        t_out: f64,
+        t_hop: f64,
+        t_prim: f64,
+        t_in: f64,
+    }
+    let mut dual: Option<Dual> = None;
+    if let Some(share) = opts.dual_gpu {
+        if !opts.gpu {
+            eprintln!(
+                "spin dxr: --dual-gpu needs the wavefront tracer (--gpu); the DXR pipeline has \
+                 no tile ownership yet"
+            );
+        } else if let Arm::Wave(tg) = &armv {
+            let d = gpu::trace::MAX_SPLIT_DEPTH;
+            let side = 1u32 << d;
+            // The PRIMARY keeps the top rows, the secondary the bottom `share`
+            // — so `--dual-gpu 1` is the smallest useful offload and 7 the
+            // largest, sweeping the whole curve.
+            let prim = gpu::trace::TileSplit::rows(d, 0, side - share);
+            let sec = prim.complement();
+            match (|| -> Result<Dual, String> {
+                let (y0, y1) = sec
+                    .row_range(rw as u32, rh as u32)
+                    .ok_or("the secondary's mask is not a row band")?;
+                let f = gpu::adapter::create_factory(opts.gpu_debug)
+                    .map_err(|e| format!("factory: {e}"))?;
+                let prim_luid = gpu::adapter::luid_of_device(&hg.device);
+                let p = gpu::adapter::enumerate(&f)
+                    .into_iter()
+                    .filter(|a| a.luid != prim_luid)
+                    .reduce(|a, b| if b.vram > a.vram { b } else { a })
+                    .ok_or("no second hardware adapter")?;
+                let mut h2 = gpu::trace::HeadlessGpu::from_pick(&p, opts.gpu_debug)?;
+                let d2 = h2.device.clone();
+                let c2 = std::rc::Rc::new(gpu::trace::SceneGpu::new_uploaded(
+                    &d2, scene, bvh, &mut h2, opts.bc7,
+                )?);
+                let t2 = gpu::trace::TraceGpu::new(
+                    &d2,
+                    &dxc,
+                    scene,
+                    bvh,
+                    c2,
+                    rw as u32,
+                    rh as u32,
+                    false,
+                    false,
+                    opts.gpu_debug,
+                    &mut h2,
+                )?;
+                // Staging sized from the FULL screen: a balancer must be able
+                // to move the seam without reallocating.
+                let xf = gpu::dual::BandTransfer::new(
+                    &d2,
+                    &hg.device,
+                    gpu::dual::payload_bytes(&[12], rw as u32, rh as u32),
+                )?;
+                let bytes = gpu::dual::payload_bytes(&[12], rw as u32, y1 - y0);
+                tg.set_split(prim);
+                t2.set_split(sec);
+                Ok(Dual {
+                    hg: h2,
+                    tg: t2,
+                    xf,
+                    y0,
+                    y1,
+                    bytes,
+                    t_sec: 0.0,
+                    t_out: 0.0,
+                    t_hop: 0.0,
+                    t_prim: 0.0,
+                    t_in: 0.0,
+                })
+            })() {
+                Ok(d) => {
+                    eprintln!(
+                        "spin dual-gpu: secondary \"{}\" takes {share}/8 rows (y {}..{}, {:.1} MB/frame) | primary \"{}\"",
+                        d.hg.adapter_name,
+                        d.y0,
+                        d.y1,
+                        d.bytes as f64 / 1e6,
+                        hg.adapter_name
+                    );
+                    dual = Some(d);
+                }
+                Err(e) => eprintln!("spin dual-gpu: unavailable ({e}) — running single-GPU"),
+            }
+        }
+    }
+
     eprintln!(
         "spin {mode} [{arm}]: {frames} frames ({warmup} warmup) at {rw}x{rh} ({:.0}% of {W}x{H}), 1-spp quality, spp {} | adapter \"{}\" | pid {}",
         lock * 100.0,
@@ -11957,12 +12065,67 @@ fn run_spin_gpu(
             replay: hybrid && opts.replay && !moving,
         };
         let t = Instant::now();
-        let r = match &armv {
-            Arm::Wave(tg) => {
+        let r = match (&armv, dual.as_mut()) {
+            // THE DUAL SCHEDULE. Both devices are put in flight before either
+            // is waited on — driving them through the blocking `run` would
+            // serialize them and measure the SUM of two tracers rather than
+            // the max, i.e. report a working feature as a large regression.
+            //
+            // The secondary's band goes OUT while the primary is still
+            // tracing, so its PCIe write (the expensive direction on this box,
+            // 5.6 GB/s against the primary's 25.8) is hidden and only the
+            // primary's read is exposed in the frame. That is the schedule the
+            // balancer's setpoint assumes.
+            (Arm::Wave(tg), Some(d)) => {
+                tg.write_cb(0, &p);
+                d.tg.write_cb(0, &p);
+                let (hg2, tg2, xf) = (&mut d.hg, &d.tg, &d.xf);
+                let v2 = hg2.submit(|l| tg2.record_frame(l, 0, &p, hybrid));
+                let v1 = hg.submit(|l| tg.record_frame(l, 0, &p, hybrid));
+                let (y0, y1, bytes) = (d.y0, d.y1, d.bytes);
+                let mut ph = [0.0f64; 5];
+                let res = (|| -> Result<(), String> {
+                    let (v2, v1) = (v2?, v1?);
+                    let a = Instant::now();
+                    hg2.wait(v2)?;
+                    let b = Instant::now();
+                    let po = [gpu::dual::Plane { res: &tg2.accum, stride: 12 }];
+                    hg2.run(|l| {
+                        let _ = xf.record_out(l, &po, rw as u32, y0, y1);
+                    })?;
+                    let c = Instant::now();
+                    xf.hop(bytes)?;
+                    let e = Instant::now();
+                    hg.wait(v1)?;
+                    let f = Instant::now();
+                    let pi = [gpu::dual::Plane { res: &tg.accum, stride: 12 }];
+                    hg.run(|l| {
+                        let _ = xf.record_in(l, &pi, rw as u32, y0, y1);
+                    })?;
+                    let g = Instant::now();
+                    ph = [
+                        (b - a).as_secs_f64() * 1e3,
+                        (c - b).as_secs_f64() * 1e3,
+                        (e - c).as_secs_f64() * 1e3,
+                        (f - e).as_secs_f64() * 1e3,
+                        (g - f).as_secs_f64() * 1e3,
+                    ];
+                    Ok(())
+                })();
+                if idx >= warmup {
+                    d.t_sec += ph[0];
+                    d.t_out += ph[1];
+                    d.t_hop += ph[2];
+                    d.t_prim += ph[3];
+                    d.t_in += ph[4];
+                }
+                res
+            }
+            (Arm::Wave(tg), None) => {
                 tg.write_cb(0, &p);
                 hg.run(|l| tg.record_frame(l, 0, &p, hybrid))
             }
-            Arm::Dxr(dg) => {
+            (Arm::Dxr(dg), _) => {
                 dg.write_cb(0, &p);
                 let mut rec = Ok(());
                 hg.run(|l| rec = dg.record_frame(l, 0)).and(rec)
@@ -11995,6 +12158,22 @@ fn run_spin_gpu(
         peak_ms,
         timed as u64,
     );
+    if let Some(d) = &dual {
+        // sec-wait = how long the secondary ran PAST the point both were
+        // launched; prim-wait = the primary's remaining trace after the
+        // secondary's band was already staged. A healthy split has prim-wait
+        // near zero and sec-wait small; prim-wait large means the secondary
+        // was given too little, sec-wait large too much.
+        eprintln!(
+            "spin dual-gpu phases (ms/frame): sec-wait {:.2} | band-out {:.2} | hop {:.2} | prim-wait {:.2} | band-in {:.2} | overhead-sum {:.2}",
+            d.t_sec / timed,
+            d.t_out / timed,
+            d.t_hop / timed,
+            d.t_prim / timed,
+            d.t_in / timed,
+            (d.t_sec + d.t_out + d.t_hop + d.t_prim + d.t_in) / timed,
+        );
+    }
     // Terminal-structure accounting (wavefront only; the reference kernel and
     // DXR never bind counters). One readback AFTER the loop, so no timed
     // frame pays a stall. Counters reset per producing frame in cs_seed, so

@@ -1240,6 +1240,46 @@ impl HeadlessGpu {
         })
     }
 
+    /// Record + execute, WITHOUT blocking. Returns the fence value to pass to
+    /// `wait`.
+    ///
+    /// The `--dual-gpu` primitive, and the reason it has to exist: the whole
+    /// claim of split rendering is that two devices work AT THE SAME TIME, so
+    /// driving them through the blocking `run` would serialize them and
+    /// measure the SUM of two tracers instead of the max — reporting the
+    /// feature as a large regression while it was in fact working.
+    ///
+    /// CONTRACT: the caller must `wait` on the previous submit before calling
+    /// this again on the same harness. Resetting a command allocator whose
+    /// lists are still executing is undefined behaviour, and this is the one
+    /// place in the codebase where that ordering is the caller's to keep
+    /// rather than the callee's.
+    pub fn submit<F: FnOnce(&ID3D12GraphicsCommandList)>(&mut self, f: F) -> Result<u64> {
+        unsafe { self.alloc.Reset() }.map_err(|e| format!("alloc Reset: {e}"))?;
+        unsafe { self.list.Reset(&self.alloc, None) }.map_err(|e| format!("list Reset: {e}"))?;
+        super::gputime::begin_frame(&self.device, &self.queue, 0);
+        f(&self.list);
+        super::gputime::resolve(&self.list, 0);
+        unsafe { self.list.Close() }.map_err(|e| format!("list Close: {e}"))?;
+        let cl: ID3D12CommandList = self.list.cast().map_err(|e| format!("cast: {e}"))?;
+        unsafe { self.queue.ExecuteCommandLists(&[Some(cl)]) };
+        let v = self.next;
+        self.next += 1;
+        unsafe { self.queue.Signal(&self.fence, v) }.map_err(|e| format!("Signal: {e}"))?;
+        Ok(v)
+    }
+
+    /// Block until a `submit` value completes.
+    pub fn wait(&mut self, v: u64) -> Result<()> {
+        if unsafe { self.fence.GetCompletedValue() } < v {
+            unsafe { self.fence.SetEventOnCompletion(v, self.event) }
+                .map_err(|e| format!("SetEventOnCompletion: {e}"))?;
+            unsafe { WaitForSingleObject(self.event, INFINITE) };
+        }
+        d3d12::drain_debug(&self.device);
+        Ok(())
+    }
+
     /// Record + execute + block. The `--check-gpu` cadence: correctness
     /// first, wall-clock timing is a separate explicit segment.
     pub fn run<F: FnOnce(&ID3D12GraphicsCommandList)>(&mut self, f: F) -> Result<()> {

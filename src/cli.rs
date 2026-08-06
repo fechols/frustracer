@@ -261,6 +261,22 @@ pub struct Opts {
     /// nothing in the scene cache; the CPU tracer, the software BVH and the
     /// frustum cut never see it.
     pub blas_split: Option<u32>,
+    /// `--dual-gpu N`: split the frame across two adapters, giving the
+    /// SECONDARY `N` of the 8 level-3 tile rows (1..=7). `None` = off, the
+    /// default and structurally the pre-feature renderer.
+    ///
+    /// Expressed as a share of eighths rather than a boolean because the
+    /// optimal share is NOT the compute-balanced one and cannot be guessed: it
+    /// minimises `max(T(1-s), r*T*s + s*K)` over the payload, the link speed
+    /// AND the tracer cost, and on this box the secondary's link is 4.6x
+    /// slower than the primary's (a consumer board's second x16-length slot is
+    /// electrically x4). So the knob exists to be SWEPT — `--dual-gpu 1..7`
+    /// walks the curve and finds the minimum empirically, which is what the
+    /// eventual balancer has to converge to anyway.
+    ///
+    /// Level 3 is `MAX_SPLIT_DEPTH`: 8 rows is the finest the CB's 64-bit mask
+    /// expresses, and finer than the balancer could usefully act on.
+    pub dual_gpu: Option<u32>,
     /// A/B lever (--no-ftree disables): route ALL bound queries through the
     /// 8-wide frustum tree lazily collapsed from the ray BVH (ftree.rs) — the
     /// two-tree split. Rays always stay on the binary BVH.
@@ -666,6 +682,7 @@ pub fn defaults() -> Opts {
         split_axes: 3,
         bvh_builder: "sah".to_string(),
         blas_split: Some(blas_split::DEFAULT_MAX_PRIMS),
+        dual_gpu: None,
         ftree: true,
         ftree_tiles: false,
         wide_levels: true,
@@ -1249,6 +1266,26 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
                 opts.blas_split = Some(n);
             }
             "--no-blas-split" => opts.blas_split = None,
+            // --dual-gpu [N]: the secondary's share in eighths. Optional value,
+            // the --blas-split idiom, so a following scene path is safe.
+            "--dual-gpu" => {
+                let numeric = args
+                    .peek()
+                    .is_some_and(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()));
+                let n = if numeric {
+                    let v = args.next().unwrap();
+                    v.parse::<u32>().ok().filter(|n| (1..=7).contains(n)).unwrap_or_else(|| {
+                        eprintln!(
+                            "--dual-gpu: '{v}' is not a secondary share in eighths (1..=7)"
+                        );
+                        std::process::exit(2);
+                    })
+                } else {
+                    2
+                };
+                opts.dual_gpu = Some(n);
+            }
+            "--no-dual-gpu" => opts.dual_gpu = None,
             // The DXR pipeline's ray-dispatch mode (applied through
             // gpu::dxr::set_inline_mode). DEFAULT 1 = primary TraceRay +
             // inline RayQuery secondaries, which strictly dominates the
