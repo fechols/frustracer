@@ -11154,19 +11154,9 @@ struct CineDual {
     hg: gpu::trace::HeadlessGpu,
     core: std::rc::Rc<gpu::trace::SceneGpu>,
     res: Option<CineDualRes>,
-    depth: u32,
-    auto: bool,
-    ctl: gpu::dual::ShareCtl,
-    lim: gpu::dual::ShareLimiter,
-    rows: u32,
-    adopts: u64,
-    idle: u64,
-    probes: u64,
-    /// Set by `cine_dual_arm` when THIS output frame is a solo baseline — one
-    /// frame at zero share whose cost tells the balancer whether splitting is
-    /// worth anything at all. Cleared by the caller once recorded.
-    solo: bool,
-    solos: u64,
+    /// The share, the controllers and the ONE per-frame decision — shared with
+    /// `--spin` and the interactive presenters (see `dual::Balancer`).
+    bal: gpu::dual::Balancer,
     /// Wall time per phase, summed over output frames, and the tick count.
     t_sec: f64,
     t_out: f64,
@@ -11174,10 +11164,6 @@ struct CineDual {
     t_prim: f64,
     t_in: f64,
     ticks: f64,
-    /// True once a dual output frame has actually run — so the summary can tell
-    /// "the balancer converged to zero" from "the feature never armed", which
-    /// look identical from the outside and are very different answers.
-    ran: bool,
 }
 
 #[cfg(windows)]
@@ -11235,26 +11221,13 @@ fn cine_dual_open(
         hg: h2,
         core,
         res: None,
-        depth,
-        auto: opts.dual_gpu_auto,
-        ctl: gpu::dual::ShareCtl::new(
-            share as f32 / side as f32,
-            (side - 1) as f32 / side as f32,
-        ),
-        lim: gpu::dual::ShareLimiter::with_dwell(CINE_SHARE_DWELL),
-        rows: share,
-        adopts: 0,
-        idle: 0,
-        probes: 0,
-        solo: false,
-        solos: 0,
+        bal: gpu::dual::Balancer::new(share, depth, opts.dual_gpu_auto, CINE_SHARE_DWELL),
         t_sec: 0.0,
         t_out: 0.0,
         t_hop: 0.0,
         t_prim: 0.0,
         t_in: 0.0,
         ticks: 0.0,
-        ran: false,
     }))
 }
 
@@ -11304,80 +11277,30 @@ fn cine_dual_res(
     Ok(())
 }
 
-/// The balancer's tick — ONCE per output frame, before its sub-frames, because
-/// a split that moved mid-frame would leave rows accumulated by two different
-/// devices. Sets the split on both tracers and returns `(band, probing)`, or
-/// `None` when the secondary sits this frame out.
+/// Set the split on both tracers for THIS output frame and return the
+/// secondary's band, or None when it sits the frame out (which is the
+/// pre-feature path exactly).
 ///
-/// A `None` return is the PRE-FEATURE PATH EXACTLY: `for_share(0, _)` hands the
-/// primary `TileSplit::ALL` (depth 0), which every consumer branches around.
+/// The decision itself lives in `dual::Balancer` — one tick, shared with
+/// `--spin` and the interactive presenters. It happens ONCE per output frame in
+/// the accumulation arm because a split that moved between sub-frames would
+/// leave rows accumulated by two different devices.
 #[cfg(windows)]
 fn cine_dual_arm(
     d: &mut CineDual,
     prim: &gpu::trace::TraceGpu,
     rw: u32,
     rh: u32,
-) -> Option<((u32, u32), bool)> {
-    let side = 1u32 << d.depth;
-    // EVERY probe is gated on `auto`, not just the adoption. A pinned share
-    // means "do not move it", and a measurement nothing can act on is not free:
-    // the solo probe zeroes `rows` for its frame and restores from the LIMITER,
-    // which a pinned session never applied — so the first probe silently
-    // dropped a pinned `--dual-gpu 4` to 0 for the rest of the run. Measured on
-    // a pinned capture reporting "settled at 0 | 0 adoptions".
-    let probing = d.auto && d.rows == 0 && d.ctl.idle_frame();
-    if probing {
-        d.probes += 1;
-    }
-    if d.auto {
-        let want = gpu::dual::quantize_share(d.ctl.share(), side, d.rows);
-        // A measured loss to the no-split baseline is the emergency the
-        // limiter's `shed` exists for — it may only ever shrink, so bypassing
-        // the dwell here cannot hand the secondary more work.
-        let shed = d.ctl.losing();
-        let next = d.lim.apply(want, shed);
-        if next != d.rows {
-            if shed && next < d.rows {
-                d.ctl.shed_landed();
-            }
-            d.adopts += 1;
-            d.rows = next;
-        }
-    }
-    // A probe BYPASSES the limiter: it is one measurement, not an adoption.
-    // Routing it through `apply` resets the dwell, which pins the secondary on
-    // for the whole dwell after every probe (measured on --spin at 2x the
-    // baseline frame time).
-    if probing {
-        d.rows = 1;
-    }
-    // The SOLO probe is the mirror: one frame at zero share, so the balancer
-    // has a measured no-split baseline to judge the split against. Without it
-    // it can only find the best SPLIT, which on an interfering box is still
-    // slower than not splitting at all.
-    d.solo = d.auto && d.rows > 0 && d.ctl.solo_frame();
-    if d.solo {
-        d.rows = 0;
-        d.solos += 1;
-    }
-    let (prim_split, sec_split) = gpu::trace::TileSplit::for_share(d.rows, d.depth);
+) -> Option<(u32, u32)> {
+    let rows = d.bal.tick(false);
+    let (prim_split, sec_split) = gpu::trace::TileSplit::for_share(rows, d.bal.depth());
     prim.set_split(prim_split);
-    if d.rows == 0 {
-        if d.solo {
-            // Restore the limiter's decision — the probe measured, it did not
-            // adopt, exactly like the idle probe.
-            d.rows = d.lim.rows();
-        } else {
-            d.idle += 1;
-        }
-        return None;
-    }
     let r = d.res.as_ref()?;
     let sec_split = sec_split?;
     let band = sec_split.row_range(rw, rh)?;
     r.tg.set_split(sec_split);
-    d.ran = true;
-    Some((band, probing))
+    d.bal.mark_ran();
+    Some(band)
 }
 
 /// The one band merge per output frame: the secondary's rows out, across, and
@@ -11833,6 +11756,9 @@ fn run_cinematic_gpu(
                         }
                         _ => None,
                     };
+                    // The phases of a SPLIT sub-frame; (0, 0) otherwise.
+                    let mut phase = (0.0f32, 0.0f32);
+                    let sub_t = Instant::now();
                     let r = match (&mut *armv, dual.as_mut().filter(|_| band.is_some())) {
                         // THE FED DUAL SUB-FRAME. The primary's trace goes in
                         // flight on its own submit so the wait on the secondary
@@ -11840,7 +11766,7 @@ fn run_cinematic_gpu(
                         // lands on the list that runs feed + evaluate, which
                         // the same queue executes after the trace by FIFO.
                         (CineArm::Wave(tg), Some(d)) => {
-                            let (y0, y1) = band.expect("filtered").0;
+                            let (y0, y1) = band.expect("filtered");
                             let strides =
                                 gpu::dual::fed_strides(tg.pack_full(), tg.gbuf_ext_needed());
                             tg.write_cb(0, &p);
@@ -11911,8 +11837,7 @@ fn run_cinematic_gpu(
                                 rec?;
                                 // The transfer is the secondary's cost, so it
                                 // belongs on its side of the balance.
-                                d.ctl.update(pm, sm + hop, pm.max(sm + hop));
-                                d.ctl.anti_windup(d.rows, 1u32 << d.depth);
+                                phase = (pm, sm + hop);
                                 Ok(())
                             })()
                         }
@@ -11964,6 +11889,16 @@ fn run_cinematic_gpu(
                     if let Err(e) = r {
                         eprintln!("cinematic: frame {f} sub-frame {seq} failed: {e}");
                         return Ok(1);
+                    }
+                    // Close on EVERY sub-frame — see the accumulation arm: a
+                    // solo tick renders no band, so an `observe` guarded by the
+                    // split would never record the baseline.
+                    if let Some(d) = dual.as_mut() {
+                        d.bal.observe(
+                            phase.0,
+                            phase.1,
+                            sub_t.elapsed().as_secs_f32() * 1e3,
+                        );
                     }
                     prev_cam = Some(fs.cam);
                     prev_sway = Some(fs.sway_time);
@@ -12086,16 +12021,10 @@ fn run_cinematic_gpu(
                 // accumulation, so this crosses PCIe once per OUTPUT frame
                 // rather than once per rendered frame — the whole reason a
                 // capture is the feature's best case.
-                // A SOLO baseline frame ran single-GPU by construction, so its
-                // whole cost is right here — this is the number the balancer
-                // judges every split against.
-                if let Some(d) = dual.as_mut() {
-                    if d.solo {
-                        d.solo = false;
-                        d.ctl.solo(t_tick.elapsed().as_secs_f32() * 1e3);
-                    }
-                }
-                if let (CineArm::Wave(tg), Some(d), Some((bnd, probing))) =
+                // The phases of a SPLIT tick; (0, 0) on a solo or idle one,
+                // where `observe` ignores them and reads `frame_ms` instead.
+                let mut phase = (0.0f32, 0.0f32);
+                if let (CineArm::Wave(tg), Some(d), Some(bnd)) =
                     (&*armv, dual.as_mut(), band)
                 {
                     match cine_dual_merge(d, &mut hg, tg, bnd, rw as u32, shot.overlay) {
@@ -12112,34 +12041,22 @@ fn run_cinematic_gpu(
                             // share buys — omit it and the controller balances
                             // compute rather than the real objective and
                             // converges high.
-                            let (pm, sm) = (t_prim as f32, (t_sec + out + hop) as f32);
-                            if probing {
-                                d.ctl.probe(pm, sm, 1.0 / (1u32 << d.depth) as f32);
-                                // The probe was a measurement; the limiter never
-                                // saw it, so restore its own decision.
-                                d.rows = d.lim.rows();
-                            } else {
-                                // The tick's wall time INCLUDES the merge, and
-                                // must — it is what a solo frame is compared
-                                // against.
-                                d.ctl.update(
-                                    pm,
-                                    sm,
-                                    t_tick.elapsed().as_secs_f32() * 1e3,
-                                );
-                                // Anti-windup: the limiter holds the row count
-                                // for a whole dwell, so without this the
-                                // estimate integrates the SAME evidence every
-                                // tick and overshoots the balance point before
-                                // it is ever allowed to act.
-                                d.ctl.anti_windup(d.rows, 1u32 << d.depth);
-                            }
+                            phase = (t_prim as f32, (t_sec + out + hop) as f32);
                         }
                         Err(e) => {
                             eprintln!("cinematic: frame {f} band merge failed: {e}");
                             return Ok(1);
                         }
                     }
+                }
+                // CLOSE THE LOOP ON EVERY TICK, not just merged ones — a
+                // SOLO tick renders no band by definition, so an `observe`
+                // guarded by the merge would silently never record the
+                // baseline it exists to measure. Regressed exactly that way
+                // once: the balancer fell back to pure balance-seeking and
+                // settled at 2 rows on a box whose answer is 0.
+                if let Some(d) = dual.as_mut() {
+                    d.bal.observe(phase.0, phase.1, t_tick.elapsed().as_secs_f32() * 1e3);
                 }
                 let acc_res = match &*armv {
                     CineArm::Wave(tg) => &tg.accum,
@@ -12176,6 +12093,7 @@ fn run_cinematic_gpu(
                 (d.t_out + d.t_hop + d.t_in) / d.ticks,
             );
         }
+        let (adopts, idles, probes, solos) = d.bal.counts();
         // State the verdict rather than implying it. Converging to ZERO is a
         // correct answer — on a box whose secondary link cannot carry its own
         // output it is THE correct answer — but a silent zero is
@@ -12183,17 +12101,17 @@ fn run_cinematic_gpu(
         eprintln!(
             "cinematic dual-gpu: settled at {} of {} rows (share {:.3}) | {} adoptions | \
              {} idle output frames, {} re-probes, {} solo baselines{}",
-            d.rows,
-            1u32 << d.depth,
-            d.ctl.share(),
-            d.adopts,
-            d.idle,
-            d.probes,
-            d.solos,
-            if d.rows == 0 && d.ran {
+            d.bal.rows(),
+            d.bal.side(),
+            d.bal.share(),
+            adopts,
+            idles,
+            probes,
+            solos,
+            if d.bal.rows() == 0 && d.bal.ran() {
                 " — VERDICT: the secondary does not pay for itself here; the capture ran \
                  the single-GPU path"
-            } else if !d.ran {
+            } else if !d.bal.ran() {
                 " — the secondary never rendered an output frame (every shot took the \
                  reconstruction arm?)"
             } else {
@@ -12646,25 +12564,11 @@ fn run_spin_gpu(
         hg: gpu::trace::HeadlessGpu,
         tg: gpu::trace::TraceGpu,
         xf: gpu::dual::BandTransfer,
-        depth: u32,
-        auto: bool,
-        ctl: gpu::dual::ShareCtl,
-        lim: gpu::dual::ShareLimiter,
-        /// Rows in force. 0 = the secondary sits this frame out entirely and
-        /// the primary runs `TileSplit::ALL` — the pre-feature path.
-        rows: u32,
-        /// Frames the secondary sat out, and re-probes fired: the balancer's
-        /// honest answer on a bandwidth-starved box is "zero", and a run that
-        /// reports it silently is indistinguishable from one where the
-        /// feature never armed.
-        idle: u64,
-        probes: u64,
-        adopts: u64,
-        /// This frame is a SOLO baseline — zero share, so its cost measures the
-        /// no-split path the balancer judges every split against. Cleared once
-        /// recorded.
-        solo: bool,
-        solos: u64,
+        /// The share, the controllers and the ONE per-frame decision — shared
+        /// with `--cinematic` and the interactive presenters. Its counters are
+        /// what let a run distinguish "converged to zero" (the honest answer on
+        /// a bandwidth-starved box) from "the feature never armed".
+        bal: gpu::dual::Balancer,
         // Per-phase wall time, accumulated over the TIMED frames only. The
         // balancer needs these separated — its setpoint is "secondary finish +
         // write <= primary finish", which is unknowable from a frame total —
@@ -12737,19 +12641,12 @@ fn run_spin_gpu(
                     hg: h2,
                     tg: t2,
                     xf,
-                    depth: d,
-                    auto: opts.dual_gpu_auto,
-                    ctl: gpu::dual::ShareCtl::new(
-                        share as f32 / side as f32,
-                        (side - 1) as f32 / side as f32,
+                    bal: gpu::dual::Balancer::new(
+                        share,
+                        d,
+                        opts.dual_gpu_auto,
+                        gpu::dual::SHARE_DWELL,
                     ),
-                    lim: gpu::dual::ShareLimiter::new(),
-                    rows: share,
-                    idle: 0,
-                    probes: 0,
-                    adopts: 0,
-                    solo: false,
-                    solos: 0,
                     t_sec: 0.0,
                     t_out: 0.0,
                     t_hop: 0.0,
@@ -12758,19 +12655,19 @@ fn run_spin_gpu(
                 })
             })() {
                 Ok(d) => {
-                    let band = gpu::trace::TileSplit::for_share(d.rows, d.depth)
+                    let band = gpu::trace::TileSplit::for_share(d.bal.rows(), d.bal.depth())
                         .1
                         .and_then(|s| s.row_range(rw as u32, rh as u32))
                         .unwrap_or((0, 0));
                     eprintln!(
                         "spin dual-gpu: secondary \"{}\" starts at {}/{} rows (y {}..{}, {:.1} MB/frame){} | primary \"{}\"",
                         d.hg.adapter_name,
-                        d.rows,
-                        1u32 << d.depth,
+                        d.bal.rows(),
+                        d.bal.side(),
                         band.0,
                         band.1,
                         gpu::dual::payload_bytes(&[12], rw as u32, band.1 - band.0) as f64 / 1e6,
-                        if d.auto { ", balancer driving" } else { ", pinned" },
+                        if opts.dual_gpu_auto { ", balancer driving" } else { ", pinned" },
                         hg.adapter_name
                     );
                     dual = Some(d);
@@ -12829,66 +12726,17 @@ fn run_spin_gpu(
         // converged to; otherwise it is pinned and the controller only
         // observes. A re-probe forces one row for a single frame so an idled
         // secondary can be re-measured.
-        let mut probing = false;
+        // ONE tick, shared with --cinematic and the interactive presenters. A
+        // ZERO share hands the primary `TileSplit::ALL` (depth 0), which every
+        // consumer branches around, and the match below then takes the plain
+        // single-GPU arm — no secondary submit, no transfer, no extra fence.
+        // Arming the feature costs exactly nothing once the balancer reaches
+        // zero, and `--spin` is deterministic so nothing here freezes.
         if let (Some(d), Arm::Wave(tg)) = (dual.as_mut(), &armv) {
-            let side = 1u32 << d.depth;
-            // Gated on `auto` like every other probe: a pinned share means
-            // "do not move it", and the solo probe below restores from the
-            // LIMITER, which a pinned run never applied — so the first probe
-            // would drop a pinned `--dual-gpu 4` to 0 for the whole run and
-            // then measure single-GPU while reporting a split. This is the
-            // THIRD copy of the tick (spin/cinematic/interactive) and it is
-            // the one the same fix missed the first time round.
-            probing = d.auto && d.rows == 0 && d.ctl.idle_frame();
-            if probing {
-                d.probes += 1;
-            }
-            if d.auto {
-                let want = gpu::dual::quantize_share(d.ctl.share(), side, d.rows);
-                // A measured loss to the no-split baseline is the emergency the
-                // limiter's `shed` exists for — it may only ever shrink, so
-                // bypassing the dwell cannot hand the secondary more work.
-                // Without it the walk down costs one dwell per row: 4 x
-                // SHARE_DWELL = 360 frames here.
-                let shed = d.ctl.losing();
-                let next = d.lim.apply(want, shed);
-                if next != d.rows {
-                    if shed && next < d.rows {
-                        d.ctl.shed_landed();
-                    }
-                    d.adopts += 1;
-                    d.rows = next;
-                }
-            }
-            // A PROBE BYPASSES THE LIMITER ENTIRELY — it is one frame, not an
-            // adoption. Routing it through `apply` was measured at 0.83 ms/frame
-            // against a 0.40 ms baseline: adopting 1 row resets the dwell, so
-            // every ~10 s probe pinned the secondary on for 90 frames. The
-            // balancer's own state must not move for a measurement.
-            if probing {
-                d.rows = 1;
-            }
-            // The SOLO probe is the mirror of it: one frame at ZERO share, so
-            // the balancer has a measured no-split baseline. Equalising prim
-            // and sec only finds the best SPLIT; on a box where the two devices
-            // interfere, every split can still be slower than not splitting,
-            // and nothing else would ever tell the controller so.
-            d.solo = d.auto && d.rows > 0 && d.ctl.solo_frame();
-            if d.solo {
-                d.rows = 0;
-                d.solos += 1;
-            }
-            // ZERO SHARE = THE PRE-FEATURE PATH. `for_share` hands back
-            // TileSplit::ALL (depth 0), which every consumer branches around,
-            // and the match below then takes the plain single-GPU arm — no
-            // secondary submit, no transfer, no extra fence. Arming the
-            // feature costs exactly nothing once the balancer reaches zero.
-            tg.set_split(gpu::trace::TileSplit::for_share(d.rows, d.depth).0);
-            if d.rows == 0 && !d.solo {
-                d.idle += 1;
-            }
+            let rows = d.bal.tick(false);
+            tg.set_split(gpu::trace::TileSplit::for_share(rows, d.bal.depth()).0);
         }
-        let active = dual.as_ref().is_some_and(|d| d.rows > 0);
+        let active = dual.as_ref().is_some_and(|d| d.bal.rows() > 0);
 
         let t = Instant::now();
         let r = match (&armv, dual.as_mut().filter(|_| active)) {
@@ -12903,10 +12751,9 @@ fn run_spin_gpu(
             // primary's read is exposed in the frame. That is the schedule the
             // balancer's setpoint assumes.
             (Arm::Wave(tg), Some(d)) => {
-                let side = 1u32 << d.depth;
                 // The primary's split was set with the balancer's decision
                 // above; the secondary's follows from the same `for_share`.
-                let sec_split = gpu::trace::TileSplit::for_share(d.rows, d.depth)
+                let sec_split = gpu::trace::TileSplit::for_share(d.bal.rows(), d.bal.depth())
                     .1
                     .expect("active implies rows > 0");
                 d.tg.set_split(sec_split);
@@ -12977,21 +12824,10 @@ fn run_spin_gpu(
                         ph[3] as f32,
                         prim_early,
                     );
-                    if probing {
-                        d.ctl.probe(pm, sm, 1.0 / side as f32);
-                        // Restore the balancer's own decision: the probe was a
-                        // measurement, and `lim` never saw it.
-                        d.rows = d.lim.rows();
-                    } else {
-                        // The wall time here covers everything a solo frame's
-                        // does — trace, transfer, merge — so the two are
-                        // directly comparable.
-                        d.ctl.update(pm, sm, t.elapsed().as_secs_f32() * 1e3);
-                        // Anti-windup — see ShareCtl. Without it the estimate
-                        // integrates one-sidedly for the whole dwell and adopts
-                        // a row count whose effect it never observed.
-                        d.ctl.anti_windup(d.rows, side);
-                    }
+                    // ONE close for every tick kind. The wall time covers
+                    // everything a solo frame's does — trace, transfer, merge —
+                    // so the two are directly comparable.
+                    d.bal.observe(pm, sm, t.elapsed().as_secs_f32() * 1e3);
                 }
                 res
             }
@@ -13010,13 +12846,12 @@ fn run_spin_gpu(
             return 1;
         }
         let ms = t.elapsed().as_secs_f64() * 1000.0;
-        // A solo baseline frame ran the pre-feature path by construction, so
-        // its whole cost is `ms` — the number every split is judged against.
-        if let Some(d) = dual.as_mut() {
-            if d.solo {
-                d.solo = false;
-                d.rows = d.lim.rows();
-                d.ctl.solo(ms as f32);
+        // A SOLO or IDLE frame took the single-GPU arm above, so nothing closed
+        // the loop there — `observe` still has to see the tick, and on a solo
+        // one `ms` IS the no-split baseline every split is judged against.
+        if !active {
+            if let Some(d) = dual.as_mut() {
+                d.bal.observe(0.0, 0.0, ms as f32);
             }
         }
         prof::frame_mark();
@@ -13060,17 +12895,14 @@ fn run_spin_gpu(
         // ZERO is a correct answer — on a box whose secondary link cannot
         // carry its own output it is THE correct answer — but a silent zero
         // is indistinguishable from a feature that never armed, so say it.
-        if d.auto {
+        if opts.dual_gpu_auto {
+            let (adopts, idles, probes, solos) = d.bal.counts();
             eprintln!(
-                "spin dual-gpu balancer: settled at {} of {} rows (share {:.3}) | {} adoptions | {} idle frames, {} re-probes, {} solo baselines{}",
-                d.rows,
-                1u32 << d.depth,
-                d.ctl.share(),
-                d.adopts,
-                d.idle,
-                d.probes,
-                d.solos,
-                if d.rows == 0 {
+                "spin dual-gpu balancer: settled at {} of {} rows (share {:.3}) | {adopts} adoptions | {idles} idle frames, {probes} re-probes, {solos} solo baselines{}",
+                d.bal.rows(),
+                d.bal.side(),
+                d.bal.share(),
+                if d.bal.rows() == 0 {
                     " — VERDICT: the secondary does not pay for itself here; \
                      the frame ran the pre-feature single-GPU path"
                 } else {

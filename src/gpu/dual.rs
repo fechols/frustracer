@@ -672,6 +672,182 @@ impl ShareLimiter {
     }
 }
 
+/// What a frame IS to the balancer, which is what decides how its cost is
+/// interpreted afterwards.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Tick {
+    /// An ordinary frame at the share in force: its cost feeds `update`.
+    Split,
+    /// Forced to ZERO share to measure the no-split baseline (`solo`).
+    Solo,
+    /// Forced to ONE row to re-measure an idled secondary (`probe`).
+    Probe,
+    /// The share is zero and this frame is not a probe — the pre-feature path.
+    Idle,
+}
+
+/// THE balancer: the share, the two controllers behind it, and the ONE
+/// per-frame decision every driver makes.
+///
+/// IT IS ONE TYPE BECAUSE THREE COPIES OF IT DRIFTED. `--spin`, `--cinematic`
+/// and the interactive presenters each grew their own fifteen-line version of
+/// this tick, and a fix applied to two of them left the third running its solo
+/// probe regardless of `--dual-gpu-auto` — where the probe restores from the
+/// LIMITER, which a pinned run never applies, so the first one dropped a pinned
+/// `--dual-gpu 4` to zero rows for the whole run. It failed silently: the run
+/// completed, printed a per-phase table, and reported 0.97 ms/frame against a
+/// 0.96 single-GPU baseline with 0.01 ms of transfer — indistinguishable from a
+/// free split rather than an absent one. Folding the copies into one is the
+/// actual fix; gating THIS is what makes it stay fixed.
+///
+/// The drivers differ only in what they can observe, never in the policy, so
+/// they pass that in (`frozen`) and read the decision back out.
+pub struct Balancer {
+    ctl: ShareCtl,
+    lim: ShareLimiter,
+    depth: u32,
+    auto: bool,
+    rows: u32,
+    kind: Tick,
+    adopts: u64,
+    solos: u64,
+    probes: u64,
+    idles: u64,
+    /// Whether a split frame has ever actually run — so "converged to zero"
+    /// can be told from "never armed", which look identical from outside.
+    ran: bool,
+}
+
+impl Balancer {
+    /// `share` is the starting row count, `depth` the split level (side =
+    /// 2^depth), `auto` whether the balancer may move it at all.
+    pub fn new(share: u32, depth: u32, auto: bool, dwell: u32) -> Self {
+        let side = 1u32 << depth;
+        let share = share.min(side.saturating_sub(1));
+        Self {
+            ctl: ShareCtl::new(share as f32 / side as f32, (side - 1) as f32 / side as f32),
+            lim: ShareLimiter::with_dwell(dwell),
+            depth,
+            auto,
+            rows: share,
+            kind: Tick::Split,
+            adopts: 0,
+            solos: 0,
+            probes: 0,
+            idles: 0,
+            ran: false,
+        }
+    }
+
+    pub fn side(&self) -> u32 {
+        1u32 << self.depth
+    }
+    pub fn depth(&self) -> u32 {
+        self.depth
+    }
+    pub fn rows(&self) -> u32 {
+        self.rows
+    }
+    pub fn kind(&self) -> Tick {
+        self.kind
+    }
+    pub fn ran(&self) -> bool {
+        self.ran
+    }
+    pub fn share(&self) -> f32 {
+        self.ctl.share()
+    }
+    /// `(adoptions, idle frames, re-probes, solo baselines)` for the verdict.
+    pub fn counts(&self) -> (u64, u64, u64, u64) {
+        (self.adopts, self.idles, self.probes, self.solos)
+    }
+    /// Mark that a split frame really rendered (the driver knows; the balancer
+    /// only knows what it asked for).
+    pub fn mark_ran(&mut self) {
+        self.ran = true;
+    }
+
+    /// THE per-frame decision. Returns the rows the secondary takes THIS frame.
+    ///
+    /// `frozen` holds the current share — each driver decides what freezing
+    /// means for it, because only the driver knows whether its frame is
+    /// accumulating (see `GpuContext::record_trace`, where moving the split
+    /// mid-accumulation is a correctness bug rather than a preference).
+    ///
+    /// EVERY probe is gated on `auto`, not just the adoption: a pinned share
+    /// means "do not move it", and both probes move it for their frame and
+    /// restore from the limiter afterwards — which a pinned run never applied.
+    pub fn tick(&mut self, frozen: bool) -> u32 {
+        self.kind = Tick::Split;
+        if !frozen && self.auto {
+            // The idle re-probe: one forced row so an idled secondary can be
+            // re-measured. Without it a single transient disables it forever.
+            if self.rows == 0 && self.ctl.idle_frame() {
+                self.probes += 1;
+                self.kind = Tick::Probe;
+                // A probe BYPASSES the limiter — it is one measurement, not an
+                // adoption. Routing it through `apply` resets the dwell, which
+                // then pins the secondary on for the whole dwell after every
+                // probe (measured on --spin at 2x the baseline frame time).
+                self.rows = 1;
+                return self.rows;
+            }
+            // A measured loss to the no-split baseline is the emergency the
+            // limiter's `shed` exists for — it may only ever shrink, so
+            // bypassing the dwell cannot hand the secondary more work.
+            let shed = self.ctl.losing();
+            let want = quantize_share(self.ctl.share(), self.side(), self.rows);
+            let next = self.lim.apply(want, shed);
+            if next != self.rows {
+                if shed && next < self.rows {
+                    self.ctl.shed_landed();
+                }
+                self.adopts += 1;
+                self.rows = next;
+            }
+            // The SOLO probe is the idle probe's mirror: one frame at ZERO
+            // share, so the balancer has a measured no-split baseline to judge
+            // the split against. Without it it can only find the best SPLIT,
+            // which on an interfering box is still slower than not splitting.
+            if self.rows > 0 && self.ctl.solo_frame() {
+                self.solos += 1;
+                self.kind = Tick::Solo;
+                self.rows = 0;
+                return self.rows;
+            }
+        }
+        if self.rows == 0 {
+            self.idles += 1;
+            self.kind = Tick::Idle;
+        }
+        self.rows
+    }
+
+    /// Close the loop with what the frame cost. `frame_ms` is its measured
+    /// wall total — the same quantity on every kind of tick, which is what
+    /// makes the solo comparison meaningful.
+    ///
+    /// Restores the limiter's own decision after a probe or a solo: both
+    /// MEASURED, neither adopted.
+    pub fn observe(&mut self, prim_ms: f32, sec_ms: f32, frame_ms: f32) {
+        match self.kind {
+            Tick::Split => {
+                self.ctl.update(prim_ms, sec_ms, frame_ms);
+                self.ctl.anti_windup(self.rows, self.side());
+            }
+            Tick::Solo => {
+                self.ctl.solo(frame_ms);
+                self.rows = self.lim.rows();
+            }
+            Tick::Probe => {
+                self.ctl.probe(prim_ms, sec_ms, 1.0 / self.side() as f32);
+                self.rows = self.lim.rows();
+            }
+            Tick::Idle => {}
+        }
+    }
+}
+
 /// Pure-math gates for the transfer's addressing. DLL- and GPU-free, run by
 /// every `--check` like the split's own — the byte arithmetic is where a band
 /// copy goes wrong silently, and a wrong offset lands a plausible image with
@@ -1173,6 +1349,117 @@ fn balance_self_test() -> std::result::Result<(), String> {
         }
         if nb < na && tb > ta {
             return Err("join_poll reported the earlier finisher as the later one".into());
+        }
+    }
+
+    // (5d) THE BALANCER AS ONE OBJECT — the tick every driver now shares, and
+    // the gate that exists because three hand-copies of it drifted.
+    //
+    // THE PIN. A `--dual-gpu N` without `--dual-gpu-auto` must hold N for the
+    // whole run, whatever it measures and however hostile: no adoption, no solo
+    // probe, no idle probe. That is the bug this file's history is about, and
+    // it was invisible in the product — a pinned run reported plausible timings
+    // that happened to be single-GPU's.
+    for pin in 1..8u32 {
+        let mut b = Balancer::new(pin, 3, false, 4);
+        for i in 0..1000 {
+            if b.tick(false) != pin {
+                return Err(format!(
+                    "a PINNED balancer moved off {pin} rows at tick {i} (to {}, kind {:?}) — \
+                     `--dual-gpu {pin}` without --dual-gpu-auto must never move",
+                    b.rows(),
+                    b.kind()
+                ));
+            }
+            if b.kind() != Tick::Split {
+                return Err(format!(
+                    "a PINNED balancer took a {:?} tick — both probes zero or force the share \
+                     for their frame and restore from the LIMITER, which a pinned run never \
+                     applies, so one is enough to strand it",
+                    b.kind()
+                ));
+            }
+            // Feed it the most hostile evidence available, in both directions.
+            b.observe(if i % 2 == 0 { 100.0 } else { 1.0 }, 1.0, 50.0);
+        }
+        let (adopts, idles, probes, solos) = b.counts();
+        if (adopts, idles, probes, solos) != (0, 0, 0, 0) {
+            return Err(format!(
+                "a PINNED balancer counted ({adopts} adoptions, {idles} idle, {probes} probes, \
+                 {solos} solos) — it must do nothing at all"
+            ));
+        }
+    }
+    // ...and the same balancer with `auto` must provably NOT be inert, or the
+    // pin gate above passes on a balancer that never works.
+    {
+        let mut b = Balancer::new(4, 3, true, 4);
+        let (mut saw_solo, mut saw_move) = (false, false);
+        for _ in 0..400 {
+            let rows = b.tick(false);
+            if b.kind() == Tick::Solo {
+                saw_solo = true;
+            }
+            if rows != 4 && b.kind() == Tick::Split {
+                saw_move = true;
+            }
+            // A hopeless secondary: the split always costs more than solo.
+            let (prim, sec) = (10.0f32, 40.0f32);
+            b.observe(prim, sec, if b.kind() == Tick::Solo { 12.0 } else { 40.0 });
+        }
+        if !saw_solo || !saw_move {
+            return Err(format!(
+                "an AUTO balancer was inert (solo probe {saw_solo}, share moved {saw_move}) — \
+                 the pin gate above would then prove nothing"
+            ));
+        }
+        if b.rows() != 0 {
+            return Err(format!(
+                "an auto balancer facing a hopeless secondary settled at {} rows, not 0",
+                b.rows()
+            ));
+        }
+    }
+    // FROZEN holds the share without consuming a probe: a driver that freezes
+    // for correctness (an accumulating frame) must not silently lose its
+    // baseline schedule to the freeze.
+    {
+        let mut b = Balancer::new(3, 3, true, 4);
+        for _ in 0..500 {
+            if b.tick(true) != 3 {
+                return Err("a FROZEN tick must hold the share exactly".into());
+            }
+            if b.kind() != Tick::Split {
+                return Err(format!("a FROZEN tick took a {:?}", b.kind()));
+            }
+        }
+    }
+    // A probe and a solo each MEASURE, never adopt: the share afterwards is the
+    // limiter's own, not the forced value.
+    {
+        let mut b = Balancer::new(0, 3, true, 4);
+        let mut probed = false;
+        for _ in 0..SHARE_PROBE_FRAMES + 8 {
+            let rows = b.tick(false);
+            if b.kind() == Tick::Probe {
+                if rows != 1 {
+                    return Err(format!("an idle probe must force exactly 1 row, got {rows}"));
+                }
+                probed = true;
+                b.observe(1.0, 40.0, 40.0); // unfavourable
+                if b.rows() != 0 {
+                    return Err(format!(
+                        "after an unfavourable probe the share must return to the limiter's \
+                         own value (0), got {}",
+                        b.rows()
+                    ));
+                }
+            } else {
+                b.observe(1.0, 1.0, 1.0);
+            }
+        }
+        if !probed {
+            return Err("an idled auto balancer never re-probed".into());
         }
     }
 

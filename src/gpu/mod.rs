@@ -604,16 +604,9 @@ struct DualState {
     core: std::rc::Rc<trace::SceneGpu>,
     tg: trace::TraceGpu,
     xf: dual::BandTransfer,
-    depth: u32,
-    auto: bool,
-    ctl: dual::ShareCtl,
-    lim: dual::ShareLimiter,
-    /// Rows in force. 0 = the secondary sits the frame out and the primary runs
-    /// `TileSplit::ALL` — the pre-feature path, byte for byte.
-    rows: u32,
-    /// This frame is a SOLO baseline (zero share, so its cost measures the
-    /// no-split path). Cleared once the presenter records it.
-    solo: bool,
+    /// The share, the controllers and the ONE per-frame decision — shared with
+    /// `--spin` and `--cinematic`, which is the point (see `dual::Balancer`).
+    bal: dual::Balancer,
     /// What the band must carry, both properties of the PRIMARY and both
     /// resolved per frame (`wire_feed_add` can run after construction):
     /// whether it has a full-size pack, and whether its feed reads the guide
@@ -624,10 +617,10 @@ struct DualState {
     /// on the NEXT frame: a presenter records the merge and only then knows
     /// them, and the frame's own total is not available until it presents.
     last_sec_ms: f32,
-    /// Rolling report state — a dual session that silently does nothing is
-    /// indistinguishable from one that never armed.
-    adopts: u64,
-    solos: u64,
+    /// Whether the settle-at-zero verdict has been said. A dual session that
+    /// silently stops using its secondary looks exactly like one that never
+    /// armed, and those are very different answers — but it only needs saying
+    /// once.
     said: bool,
 }
 
@@ -648,13 +641,7 @@ pub struct GpuContext {
     /// which adapter pays. Also declared ahead of `d3d`, for the same reason
     /// `dual` is.
     #[allow(clippy::type_complexity)]
-    dual_keep: Option<(
-        trace::HeadlessGpu,
-        std::rc::Rc<trace::SceneGpu>,
-        dual::ShareCtl,
-        dual::ShareLimiter,
-        u32,
-    )>,
+    dual_keep: Option<(trace::HeadlessGpu, std::rc::Rc<trace::SceneGpu>, dual::Balancer)>,
     d3d: D3d,
     passes: tonemap::Passes,
     /// Glare. Always built (never Option): the tonemap PS declares its halo SRV
@@ -1826,7 +1813,7 @@ impl GpuContext {
         // `dual_keep`, so the re-entry re-pays kernel compiles and planes but
         // NOT the second scene upload — the same bargain `scene_gpu` strikes
         // one line down, and by far the more expensive of the two to re-pay.
-        self.dual_keep = self.dual.take().map(|d| (d.hg, d.core, d.ctl, d.lim, d.rows));
+        self.dual_keep = self.dual.take().map(|d| (d.hg, d.core, d.bal));
         // scene_gpu deliberately SURVIVES: the shared core is scene-bound,
         // not window-bound (device+queue live across d3d.resize), so the
         // re-entry's tracer rebuilds skip the scene upload + BLAS build —
@@ -2468,8 +2455,8 @@ impl GpuContext {
         // state; only the window-bound half is rebuilt.
         let kept = self.dual_keep.take();
         let resumed = kept.is_some();
-        let (mut hg, core, ctl, lim, rows) = match kept {
-            Some((hg, core, ctl, lim, rows)) => (hg, core, ctl, lim, rows),
+        let (mut hg, core, bal) = match kept {
+            Some(k) => k,
             None => {
                 let f = adapter::create_factory(debug).map_err(|e| format!("factory: {e}"))?;
                 let prim_luid = adapter::luid_of_device(&self.d3d.device);
@@ -2483,16 +2470,7 @@ impl GpuContext {
                 let core = std::rc::Rc::new(trace::SceneGpu::new_uploaded(
                     &dev, scene, bvh, &mut hg, bc7_mode,
                 )?);
-                (
-                    hg,
-                    core,
-                    dual::ShareCtl::new(
-                        share as f32 / side as f32,
-                        (side - 1) as f32 / side as f32,
-                    ),
-                    dual::ShareLimiter::new(),
-                    share,
-                )
+                (hg, core, dual::Balancer::new(share, depth, self.dual_auto, dual::SHARE_DWELL))
             }
         };
         let dev = hg.device.clone();
@@ -2514,7 +2492,7 @@ impl GpuContext {
             eprintln!(
                 "dual-gpu: secondary \"{}\" at {}/{} rows{} | primary \"{}\"",
                 hg.adapter_name,
-                rows,
+                bal.rows(),
                 side,
                 if self.dual_auto { ", balancer driving" } else { ", pinned" },
                 self.adapter_name
@@ -2525,17 +2503,10 @@ impl GpuContext {
             core,
             tg,
             xf,
-            depth,
-            auto: self.dual_auto,
-            ctl,
-            lim,
-            rows,
-            solo: false,
+            bal,
             pack: false,
             ext: false,
             last_sec_ms: 0.0,
-            adopts: 0,
-            solos: 0,
             said: false,
         });
         Ok(())
@@ -2603,7 +2574,15 @@ impl GpuContext {
         // frozen a PARKED upscaler session forever, which is the state a
         // user leaves a window in.
         let frozen = p.accumulate && p.frame > 0;
-        let band = Self::dual_arm(d, tg, rw, rh, frozen);
+        let rows = d.bal.tick(frozen);
+        let (prim_split, sec_split) = trace::TileSplit::for_share(rows, d.bal.depth());
+        tg.set_split(prim_split);
+        let band = sec_split.and_then(|sp| {
+            let b = sp.row_range(rw, rh)?;
+            d.tg.set_split(sp);
+            d.bal.mark_ran();
+            Some(b)
+        });
         let Some((y0, y1)) = band else {
             tg.write_cb(slot, p);
             tg.record_frame(&d3d.list, slot, p, hybrid);
@@ -2648,54 +2627,6 @@ impl GpuContext {
     /// the secondary sits this frame out, which sets `TileSplit::ALL` on the
     /// primary: the pre-feature path.
     ///
-    /// `frozen` holds the current share for this frame — see the call site for
-    /// why it is "the frame is accumulating" and not "the frame is replaying".
-    fn dual_arm(
-        d: &mut DualState,
-        prim: &trace::TraceGpu,
-        rw: u32,
-        rh: u32,
-        frozen: bool,
-    ) -> Option<(u32, u32)> {
-        // EVERY probe is gated on `auto`, not just the adoption. A pinned share
-        // means "do not move it", and the solo probe is not free to run anyway:
-        // it zeroes `rows` for its frame and restores from the LIMITER, which a
-        // pinned session never applied — so the first probe would silently drop
-        // a pinned `--dual-gpu 4` to 0 for the rest of the run.
-        if !frozen && d.auto {
-            let side = 1u32 << d.depth;
-            let shed = d.ctl.losing();
-            let next = dual::quantize_share(d.ctl.share(), side, d.rows);
-            let next = d.lim.apply(next, shed);
-            if next != d.rows {
-                if shed && next < d.rows {
-                    d.ctl.shed_landed();
-                }
-                d.adopts += 1;
-                d.rows = next;
-            }
-            d.solo = d.rows > 0 && d.ctl.solo_frame();
-            if d.solo {
-                d.rows = 0;
-                d.solos += 1;
-            }
-        }
-        let (prim_split, sec_split) = trace::TileSplit::for_share(d.rows, d.depth);
-        prim.set_split(prim_split);
-        if d.rows == 0 {
-            if d.solo {
-                // The probe measured; it did not adopt.
-                d.rows = d.lim.rows();
-            }
-            return None;
-        }
-        let sec_split = sec_split?;
-        let band = sec_split.row_range(rw, rh)?;
-        d.tg.set_split(sec_split);
-        d.said = true;
-        Some(band)
-    }
-
     /// Close the balancer's loop with the frame's measured total. Called by
     /// main.rs once the frame has actually presented, because that total is not
     /// knowable inside a presenter.
@@ -2705,19 +2636,12 @@ impl GpuContext {
     /// the whole requirement — see `ShareCtl::solo`.
     pub fn dual_frame_cost(&mut self, frame_ms: f32) {
         let Some(d) = self.dual.as_mut() else { return };
-        if d.solo {
-            d.solo = false;
-            d.ctl.solo(frame_ms);
-            return;
-        }
-        if d.last_sec_ms > 0.0 {
-            // prim = the frame minus what the secondary held it up for; sec =
-            // that hold plus the transfer, which `last_sec_ms` already spans.
-            let prim = (frame_ms - d.last_sec_ms).max(0.0);
-            d.ctl.update(prim, d.last_sec_ms, frame_ms);
-            d.ctl.anti_windup(d.rows, 1u32 << d.depth);
-            d.last_sec_ms = 0.0;
-        }
+        // prim = the frame minus what the secondary held it up for; sec = that
+        // hold plus the transfer, which `last_sec_ms` already spans. On a solo
+        // or idle tick neither is meaningful and `observe` ignores them.
+        let prim = (frame_ms - d.last_sec_ms).max(0.0);
+        d.bal.observe(prim, d.last_sec_ms, frame_ms);
+        d.last_sec_ms = 0.0;
         self.dual_report();
     }
 
@@ -2726,7 +2650,7 @@ impl GpuContext {
     /// secondary as not paying and the frame ran the pre-feature path —
     /// correct, and the one state a silent feature is indistinguishable from.
     pub fn dual_status(&self) -> Option<(u32, u32)> {
-        self.dual.as_ref().map(|d| (d.rows, 1u32 << d.depth))
+        self.dual.as_ref().map(|d| (d.bal.rows(), d.bal.side()))
     }
 
     /// Say the verdict ONCE, the first time the balancer settles at zero after
@@ -2735,15 +2659,14 @@ impl GpuContext {
     /// those are very different answers.
     pub fn dual_report(&mut self) {
         let Some(d) = self.dual.as_mut() else { return };
-        if d.rows == 0 && d.said {
-            d.said = false;
+        if d.bal.rows() == 0 && d.bal.ran() && !d.said {
+            d.said = true;
+            let (adopts, _, _, solos) = d.bal.counts();
             eprintln!(
-                "dual-gpu: the balancer settled at 0 of {} rows after {} adoptions and {} solo \
-                 baselines — the secondary does not pay for itself here, and the session is \
-                 running the pre-feature single-GPU path",
-                1u32 << d.depth,
-                d.adopts,
-                d.solos
+                "dual-gpu: the balancer settled at 0 of {} rows after {adopts} adoptions \
+                 and {solos} solo baselines — the secondary does not pay for itself here, \
+                 and the session is running the pre-feature single-GPU path",
+                d.bal.side()
             );
         }
     }
