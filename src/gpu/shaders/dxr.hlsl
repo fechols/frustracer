@@ -49,14 +49,33 @@ struct HitRec {
     uint inst; // committed InstanceID (sway-MV lane); 0 on miss
 };
 RWStructuredBuffer<HitRec> hitrec : register(u7);
-// Per-pass sample index. resolve.hlsl declares the same cbuffer in its own
-// compile unit; nothing else in the LIB assembly declares b1.
-cbuffer Push : register(b1) { uint push0; uint push1; uint push2; uint push3; }
 #endif
+
+// The b1 root constants. Declared for EVERY mode, not just 3, because the
+// --dual-gpu band offset rides push1/push2 and modes 0-2 need it too.
+// resolve.hlsl declares the same cbuffer in its own compile unit; nothing else
+// in the LIB assembly declares b1.
+//   push0 = per-pass sample index (mode 3 only)
+//   push1 = the band's first row, push2 = one past its last
+// RP_PUSH already carries 4 DWORDs, so this costs no root-signature change.
+cbuffer Push : register(b1) { uint push0; uint push1; uint push2; uint push3; }
+
+// --- --dual-gpu sub-rect -------------------------------------------------
+// A banded DispatchRays shrinks the GRID, so every DispatchRaysIndex() must be
+// lifted back into absolute screen space. Note what does NOT change: `rw`/`rh`
+// stay full-screen, because DispatchRaysDimensions() is never read anywhere in
+// this pipeline — every extent already comes from the constant buffer. That is
+// what makes a band bit-identical to the same rows of a full-frame render
+// rather than merely similar: ray_dir, sample_pos, the sky-LOD lattice index
+// and the cloud dither hash are all pure functions of the ABSOLUTE pixel.
+uint2 band_id(uint2 id) {
+    id.y += push1;
+    return id;
+}
 
 [shader("raygeneration")]
 void raygen() {
-    uint2 id = DispatchRaysIndex().xy;
+    uint2 id = band_id(DispatchRaysIndex().xy);
     uint pi = id.y * rw + id.x;
 #ifdef WIDTH_PROBE_RAYGEN
     // FR_WIDTH: this raygen's compiled wave width, once per dispatch.
@@ -258,7 +277,7 @@ void chs_shade(inout RayPayload p, in BuiltInTriangleIntersectionAttributes a) {
     // packing is); written first so the raygen's post-return sentinel logic
     // (see the mode-0/1 arm) can leave it standing on hit pixels.
     if (flags & FLAG_WAVEVIZ) {
-        uint2 wvid = DispatchRaysIndex().xy;
+        uint2 wvid = band_id(DispatchRaysIndex().xy);
         uint wv_t = WaveReadLaneFirst(wvid.y * rw + wvid.x);
         tbuf[wvid.y * rw + wvid.x] = asfloat(wv_t);
     }
@@ -311,7 +330,7 @@ void chs_shade(inout RayPayload p, in BuiltInTriangleIntersectionAttributes a) {
     // stage just reports where the ray was. Bit 0 of prim is the probe bit —
     // the high bits carry the sample index for the miss shader's cloud phase.
     if ((p.prim & 1u) == 0u) return;
-    uint2 id = DispatchRaysIndex().xy;
+    uint2 id = band_id(DispatchRaysIndex().xy);
     // SWAY_ARG: the CHS has the instance intrinsic directly (the same id
     // tri_of consumed above) — no HitInfo hop needed on this path.
     gbuf_write_hit(id.y * rw + id.x, p.sp.x, p.sp.y, WorldRayDirection(), h.t, ps
@@ -344,11 +363,11 @@ void miss_radiance(inout RayPayload p) {
     // The amortized cloud lattice (record_frame fills it before DispatchRays),
     // read through the same sky_radiance_lod cs_leaf uses. DispatchRaysIndex()
     // is legal in a miss shader (used on the line below already).
-    uint2 mid = DispatchRaysIndex().xy;
+    uint2 mid = band_id(DispatchRaysIndex().xy);
     p.color = sky_radiance_lod(WorldRayDirection(), mid.x, mid.y);
 #else
     p.color = sky_radiance(WorldRayOrigin(), WorldRayDirection(), pixel_cone * 0.5, frame,
-                           cloud_dither_k(DispatchRaysIndex().xy, frame, p.prim >> 1u, spp));
+                           cloud_dither_k(band_id(DispatchRaysIndex().xy), frame, p.prim >> 1u, spp));
 #endif
     p.t = INF;
 }

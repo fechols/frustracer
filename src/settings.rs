@@ -255,6 +255,13 @@ opt_fields! {
         /// Triangles per BLAS; 0 = --no-blas-split (0 is not a legal CLI cap,
         /// so it is free to mean "off" here)
         pub blas_split: u32,
+        /// `--dual-gpu N`: the secondary adapter's share in eighths of the
+        /// screen. 0 = off, the `blas_split` trick again (1..=7 are the legal
+        /// CLI values, so 0 is free to mean "off").
+        pub dual_gpu: u32,
+        /// `--dual-gpu-auto`: let the balancer choose the share; `dual_gpu` is
+        /// then the starting point rather than a fixed value.
+        pub dual_gpu_auto: bool,
         pub ftree: bool,
         pub ftree_tiles: bool,
         pub temporal: bool,
@@ -728,6 +735,24 @@ pub fn apply_to_opts(s: &Settings, opts: &mut crate::Opts) -> AppliedFx {
         // 0 = --no-blas-split (not a legal CLI cap, so free to mean "off").
         opts.blas_split = if n == 0 { None } else { Some(n) };
     }
+    if let Some(n) = a.dual_gpu {
+        // Same trick: 0 = off. Out-of-range warns and is ignored rather than
+        // exiting — a settings FILE has no user standing by to correct it,
+        // which is the load()-rule split from the CLI's exit(2).
+        if n > 7 {
+            warn("dual_gpu", &n.to_string());
+        } else {
+            opts.dual_gpu = if n == 0 { None } else { Some(n) };
+        }
+    }
+    if let Some(v) = a.dual_gpu_auto {
+        opts.dual_gpu_auto = v;
+        // Arming parity with the CLI's `--dual-gpu-auto`: a balancer with
+        // nothing to balance is a silent no-op.
+        if v && opts.dual_gpu.is_none() {
+            opts.dual_gpu = Some(2);
+        }
+    }
     if let Some(v) = a.ftree {
         opts.ftree = v;
     }
@@ -1137,6 +1162,14 @@ pub fn menu_items() -> &'static [MenuItem] {
             item!("blas_split", "BLAS split (tris; off = one BLAS)", "Advanced", Restart, Cycle { options: &["off", "64", "4096", "65536", "262144"], default_ix: 3 }, ((|s: &Settings| s.advanced.blas_split.map(|v| if v == 0 { "off".into() } else { v.to_string() })), (|s: &mut Settings, v: &str| {
                 s.advanced.blas_split = if v == "off" { Some(0) } else { v.parse().ok() };
             }))),
+            // Restart tier: the secondary device, its scene upload and its BLAS
+            // are all built at tracer init. The vocabulary is eighths of the
+            // screen, "off" = 0 (the blas_split trick); `auto` hands the share
+            // to the balancer, in which case this is only the starting point.
+            item!("dual_gpu", "second GPU share (eighths)", "Advanced", Restart, Cycle { options: &["off", "1", "2", "3", "4", "5", "6", "7"], default_ix: 0 }, ((|s: &Settings| s.advanced.dual_gpu.map(|v| if v == 0 { "off".into() } else { v.to_string() })), (|s: &mut Settings, v: &str| {
+                s.advanced.dual_gpu = if v == "off" { Some(0) } else { v.parse().ok() };
+            }))),
+            item!("dual_gpu_auto", "second GPU: balance automatically", "Advanced", Restart, Toggle { default: false }, acc_bool!(advanced.dual_gpu_auto)),
             item!("ftree", "8-wide frustum tree", "Advanced", Restart, Toggle { default: true }, acc_bool!(advanced.ftree)),
             item!("ftree_tiles", "wide tree for CPU tiles", "Advanced", Restart, Toggle { default: false }, acc_bool!(advanced.ftree_tiles)),
             item!("temporal", "temporal reuse", "Advanced", Restart, Toggle { default: true }, acc_bool!(advanced.temporal)),
@@ -1562,6 +1595,11 @@ pub fn self_test() -> Result<(), String> {
             ("sky_lod", Control::Cycle { options, .. }) => options.iter().all(|o| {
                 *o == "off" || o.parse::<u32>().is_ok_and(|k| k.is_power_of_two() && (2..=32).contains(&k))
             }),
+            // Same drift guard: "off" ↔ 0, and every other option must be a
+            // share apply_to_opts accepts rather than warn away.
+            ("dual_gpu", Control::Cycle { options, .. }) => options
+                .iter()
+                .all(|o| *o == "off" || o.parse::<u32>().is_ok_and(|n| (1..=7).contains(&n))),
             _ => true,
         };
         if !ok {

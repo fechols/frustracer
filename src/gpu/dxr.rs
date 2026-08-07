@@ -442,6 +442,17 @@ pub struct DxrGpu {
     /// idiom; every caller including all --check-dxr sites writes the CB
     /// first.
     spp: std::cell::Cell<u32>,
+    /// `--dual-gpu` sub-rect: the pixel rows `[y0, y1)` this device renders.
+    /// `(0, rh)` is the whole screen and compiles to the pre-feature dispatch
+    /// exactly — the band offset rides push1/push2, which are zero and `rh`
+    /// then, so every arithmetic site is an identity.
+    ///
+    /// The DXR twin of `TraceGpu::set_split`, and deliberately a RECT rather
+    /// than a tile mask: DispatchRays takes one grid, so an interleaved
+    /// assignment cannot be expressed here. That is why `TileSplit::rows`
+    /// exists and why mixed-mode forces the contiguous-band shape on the
+    /// wavefront side too.
+    band: std::cell::Cell<(u32, u32)>,
     gbuf_full: bool,
     /// RGBA16F resolve target; rests in PIXEL_SHADER_RESOURCE between frames
     /// (the tonemap PS reads it via SRV_SLOT_DXR).
@@ -1549,6 +1560,7 @@ impl DxrGpu {
             gbuf_ext,
             force_gbuf_ext: std::cell::Cell::new(false),
             sway_t: std::cell::Cell::new(None),
+            band: std::cell::Cell::new((0, rh)),
             sway_mv_t: std::cell::Cell::new(None),
             sway_mv_on: !sway_def.is_empty(),
             mode3,
@@ -1584,6 +1596,39 @@ impl DxrGpu {
     pub fn width_buf(&self) -> Option<&ID3D12Resource> {
         self.width_buf.as_ref()
     }
+
+    /// `--dual-gpu`: render only pixel rows `[y0, y1)`. `(0, rh)` restores the
+    /// whole screen and is the pre-feature dispatch exactly.
+    ///
+    /// Refuses an empty or out-of-range band LOUDLY rather than dispatching a
+    /// zero-height grid: a device that silently renders nothing is a black
+    /// band in the presented frame, the hole class this whole feature is
+    /// gated against.
+    ///
+    /// FLAG_WAVEVIZ is refused with it. The overlay's ticket is
+    /// `WaveReadLaneFirst` of the first lane's pixel index, so it is a
+    /// property of how the DRIVER packed the launch — a banded grid packs
+    /// differently by construction, and the overlay would be measuring the
+    /// band rather than the pipeline. Not a bug to fix; the two questions are
+    /// incompatible.
+    pub fn set_band(&self, y0: u32, y1: u32) {
+        if y0 >= y1 || y1 > self.rh {
+            eprintln!(
+                "dxr: band {y0}..{y1} is empty or past the {}-row frame — keeping the whole screen",
+                self.rh
+            );
+            return;
+        }
+        if (y0, y1) != (0, self.rh) && trace::waveviz_on() {
+            eprintln!(
+                "dxr: --waveviz measures launch PACKING, which a banded dispatch changes by \
+                 construction — keeping the whole screen"
+            );
+            return;
+        }
+        self.band.set((y0, y1));
+    }
+
 
     pub fn write_cb(&self, slot: usize, p: &FrameParams) {
         // Stash the sway clock for record_frame/bind_common — write_cb is the
@@ -1821,6 +1866,7 @@ impl DxrGpu {
                 list.Dispatch(groups.min(32768), groups.div_ceil(32768), 1);
                 list.ResourceBarrier(&[uav_barrier(None)]);
             }
+            let (by0, by1) = self.band.get();
             let va = self.sbt.resource.GetGPUVirtualAddress();
             let desc = D3D12_DISPATCH_RAYS_DESC {
                 RayGenerationShaderRecord: D3D12_GPU_VIRTUAL_ADDRESS_RANGE {
@@ -1856,9 +1902,20 @@ impl DxrGpu {
                 },
                 CallableShaderTable: Default::default(),
                 Width: self.rw,
-                Height: self.rh,
+                // --dual-gpu: only the band's rows are launched. `rw`/`rh` in
+                // the CB stay FULL-SCREEN — the shaders lift the grid index
+                // back to absolute with `band_id`, and nothing in this
+                // pipeline ever reads DispatchRaysDimensions(), which is what
+                // makes a band bit-identical to those rows of a full frame.
+                Height: by1 - by0,
                 Depth: 1,
             };
+            // push1/push2 carry the band to every mode. Set once, before the
+            // mode-3 loop: root arguments persist across SetPipelineState1,
+            // and re-issuing bind_common in the loop would wipe them (the
+            // same reason push0 is set where it is).
+            let bandc = [by0, by1];
+            list.SetComputeRoot32BitConstants(RP_PUSH, 2, bandc.as_ptr() as *const _, 1);
             if let Some(m3) = &self.mode3 {
                 // Mode 3: thin pass pairs — for each sample, a bare-hit
                 // DispatchRays (records only) fenced against a cs_dxr_shade
@@ -1897,7 +1954,12 @@ impl DxrGpu {
                     {
                         let _e = super::pix::scope(list, c"dxr-shade");
                         list.SetPipelineState(&m3.pso_shade);
-                        list.Dispatch(self.rw.div_ceil(8), self.rh.div_ceil(8), 1);
+                        // Banded in LOCKSTEP with the DispatchRays above: this
+                        // pass shades from `hitrec`, so a full-screen grid
+                        // would shade rows outside the band from records this
+                        // device never wrote (stale, or uninitialised VRAM on
+                        // the first frame) and splat them into accum.
+                        list.Dispatch(self.rw.div_ceil(8), (by1 - by0).div_ceil(8), 1);
                     }
                     list.ResourceBarrier(&[uav_barrier(None)]);
                 }

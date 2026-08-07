@@ -57,7 +57,14 @@ void cs_dxr_shade(uint3 id : SV_DispatchThreadID) {
     // doing less work, before the early-out so it always reports.
     if (id.x == 0u && id.y == 0u) dxr_width[1] = WaveGetLaneCount();
 #endif
-    if (id.x >= rw || id.y >= rh)
+    // --dual-gpu: the dispatch covers only [push1, push2) rows, so lift the
+    // thread id back into absolute screen space (the raygen's `band_id`) and
+    // bound against the band's END rather than `rh` — the grid is rounded up
+    // to the 8x8 group, so the tail would otherwise shade rows this device
+    // does not own from a STALE hit record. Unbanded, push1 = 0 and
+    // push2 = rh, which is the pre-feature test verbatim.
+    id.y += push1;
+    if (id.x >= rw || id.y >= push2)
         return;
     uint pi = id.y * rw + id.x;
     uint s = push0;

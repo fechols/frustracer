@@ -2597,6 +2597,75 @@ fn run_check_dxr(
         }
     }
 
+    // --- --dual-gpu sub-rect: a band IS those rows of the full frame -------
+    // Mixed-mode's whole premise. DXR has no quadtree and no inherited claim,
+    // so a banded dispatch must be BIT-IDENTICAL to the same rows of a
+    // full-screen render — `rw`/`rh` stay full-screen in the CB and only the
+    // grid shrinks, so every per-pixel input (ray_dir, sample_pos, the sky-LOD
+    // lattice index, the cloud dither hash) is unchanged by construction.
+    //
+    // THE HARNESS IS SHAPED TO AVOID THE STALE-CORRECT TRAP that this feature
+    // has already produced twice. Rendering the reference and then a band into
+    // the same buffer cannot see a band that renders NOTHING, because the rows
+    // outside it already hold correct values. So the buffer is deliberately
+    // DIRTIED with an accumulated second frame first: a band must then restore
+    // its own rows exactly AND leave the dirty rows untouched, which is
+    // sensitive in both directions.
+    {
+        let n = gw * gh * 3;
+        let rd = |hg: &mut gpu::trace::HeadlessGpu| -> Result<Vec<f32>, String> {
+            read_f32(hg, &dg.accum, n)
+        };
+        let band = (|| -> Result<(), String> {
+            gpu_frame(&mut hg, &dg, 0)?;
+            let refr = rd(&mut hg)?;
+            gpu_frame(&mut hg, &dg, 1)?; // accumulate — dirties every row
+            let dirty = rd(&mut hg)?;
+            let mid = (gh / 2) as u32;
+            let mut bad = (0usize, 0usize);
+            for (y0, y1) in [(0u32, mid), (mid, gh as u32)] {
+                dg.set_band(y0, y1);
+                gpu_frame(&mut hg, &dg, 0)?;
+                let got = rd(&mut hg)?;
+                for y in 0..gh {
+                    let inside = y as u32 >= y0 && (y as u32) < y1;
+                    for i in y * gw * 3..(y + 1) * gw * 3 {
+                        let want = if inside { refr[i] } else { dirty[i] };
+                        if got[i].to_bits() != want.to_bits() {
+                            if inside {
+                                bad.0 += 1;
+                            } else {
+                                bad.1 += 1;
+                            }
+                        }
+                    }
+                }
+                // Restore before the next pass, so each band starts from the
+                // same dirty state rather than the previous band's output.
+                dg.set_band(0, gh as u32);
+                gpu_frame(&mut hg, &dg, 0)?;
+                gpu_frame(&mut hg, &dg, 1)?;
+            }
+            eprintln!(
+                "check-dxr: dual-gpu band ({}x{}, split at y={mid}): in-band diff {} | outside-band touched {}",
+                gw, gh, bad.0, bad.1
+            );
+            if bad != (0, 0) {
+                return Err(format!(
+                    "a band must reproduce those rows EXACTLY ({} differ) and touch nothing \
+                     else ({} outside rows written)",
+                    bad.0, bad.1
+                ));
+            }
+            Ok(())
+        })();
+        dg.set_band(0, gh as u32);
+        if let Err(e) = band {
+            eprintln!("check-dxr: FAIL dual-gpu band: {e}");
+            ok = false;
+        }
+    }
+
     if ok {
         println!("check-dxr: PASS (DispatchRays pipeline vs the CPU plain reference)");
         0
