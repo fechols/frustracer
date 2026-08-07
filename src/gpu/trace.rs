@@ -1257,9 +1257,13 @@ impl HeadlessGpu {
     pub fn submit<F: FnOnce(&ID3D12GraphicsCommandList)>(&mut self, f: F) -> Result<u64> {
         unsafe { self.alloc.Reset() }.map_err(|e| format!("alloc Reset: {e}"))?;
         unsafe { self.list.Reset(&self.alloc, None) }.map_err(|e| format!("list Reset: {e}"))?;
-        super::gputime::begin_frame(&self.device, &self.queue, 0);
+        // A dual-GPU frame nests THIS inside the primary's open one, so the
+        // restore is load-bearing: without it the primary's remaining
+        // timestamps name the secondary's query heap. See `gputime::CURRENT`.
+        let prev = super::gputime::begin_frame(&self.device, &self.queue, 0);
         f(&self.list);
         super::gputime::resolve(&self.list, 0);
+        super::gputime::restore(prev);
         unsafe { self.list.Close() }.map_err(|e| format!("list Close: {e}"))?;
         let cl: ID3D12CommandList = self.list.cast().map_err(|e| format!("cast: {e}"))?;
         unsafe { self.queue.ExecuteCommandLists(&[Some(cl)]) };
@@ -1304,9 +1308,12 @@ impl HeadlessGpu {
         // slot instead of FRAMES_IN_FLIGHT. Without this the headless suites
         // (the deterministic workloads, and the only place a per-pass number
         // means anything) would record no timings at all.
-        super::gputime::begin_frame(&self.device, &self.queue, 0);
+        // Nested inside the primary's frame on the dual-GPU band readback —
+        // restore, exactly as `submit` does.
+        let prev = super::gputime::begin_frame(&self.device, &self.queue, 0);
         f(&self.list);
         super::gputime::resolve(&self.list, 0);
+        super::gputime::restore(prev);
         unsafe { self.list.Close() }.map_err(|e| format!("list Close: {e}"))?;
         let lists = [Some(self.list.cast::<ID3D12CommandList>().unwrap())];
         unsafe { self.queue.ExecuteCommandLists(&lists) };
@@ -5539,6 +5546,13 @@ pub struct TraceGpu {
     /// `TileSplit::ALL` in every single-GPU session, which is the state in
     /// which the ownership test is branched around entirely.
     split: std::cell::Cell<TileSplit>,
+    /// Whether the last `set_split` was refused, so a refusal that repeats
+    /// prints ONCE. `set_split` is called every frame from `record_trace`, and
+    /// every refusal condition (a depth past the leaf frontier at a small
+    /// render resolution, `--waveviz`) holds for as long as that condition
+    /// does — an unlatched `eprintln!` there is two lines per frame at
+    /// whatever the frame rate is, which buries the one line that mattered.
+    split_refused: std::cell::Cell<bool>,
     /// --foliage-sway clock for the frame being recorded (the DxrGpu shape,
     /// but set by record_wavefront/record_wavefront_replay from their OWN
     /// FrameParams — never write_cb, so the check/bench sites that skip
@@ -6334,6 +6348,7 @@ impl TraceGpu {
             pso_seed_replay,
             last_struct: std::cell::Cell::new(None),
             split: std::cell::Cell::new(TileSplit::ALL),
+            split_refused: std::cell::Cell::new(false),
             sway_t: std::cell::Cell::new(None),
             sway_mv_on: !sway_def.is_empty(),
             sky_split,
@@ -7096,10 +7111,34 @@ impl TraceGpu {
     /// legitimately replays, which is what makes a balancer that oscillates
     /// between two splits cost nothing extra.
     ///
+    /// RETURNS WHETHER THE SPLIT WAS APPLIED, and a refusal leaves the device
+    /// on `TileSplit::ALL` — the whole screen, the pre-feature dispatch.
+    /// Refusing by KEEPING the current assignment is what shipped, and it is
+    /// unsound in both directions: keep a partial split and the rows the
+    /// caller thinks it handed to the other device go unrendered (a hole);
+    /// keep the whole screen while the OTHER device did arm and its band
+    /// overwrites rows this one also traced, which under accumulation is two
+    /// devices' sample counts fighting over the same pixels. Handing the
+    /// caller a `false` lets it do the only correct thing — put BOTH devices
+    /// back on the whole screen and take the single-GPU path for the frame.
+    /// The message prints once per refusal episode (`split_refused`), because
+    /// every condition here is a property of the resolution or a lever and so
+    /// repeats on every frame it holds for.
+    ///
     /// A depth above `MAX_SPLIT_DEPTH` cannot be represented in the CB's 64-bit
-    /// mask, so it is refused loudly and the device keeps its current
-    /// assignment rather than silently rendering a subset (a hole in the
-    /// image) — the loud-degrade rule.
+    /// mask, so it is refused loudly rather than silently rendering a subset
+    /// (a hole in the image) — the loud-degrade rule.
+    ///
+    /// FLAG_WAVEVIZ is refused with it, the `DxrGpu::set_band` rule and for
+    /// the same reason: the overlay's ticket is `WaveReadLaneFirst` of the
+    /// first lane's pixel index, i.e. a property of how the DRIVER packed the
+    /// launch, and a split changes that packing by construction. It is worse
+    /// here than on the DXR side, because `tbuf` — where the tickets live — is
+    /// not among the planes the band transfer carries, so the other device's
+    /// rows would show this device's PREVIOUS frame's tickets. A `--spin
+    /// --waveviz` run would then print a compactness line computed over them:
+    /// an instrument reporting fabricated numbers, which is strictly worse
+    /// than one that declines to run.
     ///
     /// A depth at or below the LEAF FRONTIER is refused for a subtler reason,
     /// and it is a soundness guard rather than a sanity check. `level_finish`
@@ -7112,25 +7151,37 @@ impl TraceGpu {
     /// guard and that path silently emits all four leaves on both devices.
     /// A split that fine has nothing to balance anyway — its tiles would be
     /// single leaf tiles.
-    pub fn set_split(&self, split: TileSplit) {
-        if split.depth > MAX_SPLIT_DEPTH {
-            eprintln!(
-                "dual-gpu: split depth {} exceeds MAX_SPLIT_DEPTH={} (the CB mask is 64 bits) \
-                 — keeping the current assignment",
-                split.depth, MAX_SPLIT_DEPTH
-            );
-            return;
-        }
+    pub fn set_split(&self, split: TileSplit) -> bool {
         let full = depth_full(self.rw, self.rh);
-        if split.depth >= full && split.depth != 0 {
-            eprintln!(
-                "dual-gpu: split depth {} is at or below the leaf frontier (depth_full={} at \
-                 {}x{}) — keeping the current assignment",
+        let why = if split.depth > MAX_SPLIT_DEPTH {
+            Some(format!(
+                "depth {} exceeds MAX_SPLIT_DEPTH={} (the CB mask is 64 bits)",
+                split.depth, MAX_SPLIT_DEPTH
+            ))
+        } else if split.depth >= full && split.depth != 0 {
+            Some(format!(
+                "depth {} is at or below the leaf frontier (depth_full={} at {}x{})",
                 split.depth, full, self.rw, self.rh
-            );
-            return;
+            ))
+        } else if split.depth != 0 && waveviz_on() {
+            Some(
+                "--waveviz measures launch PACKING, which a split changes by construction (and \
+                 `tbuf`, which carries the tickets, does not cross the band)"
+                    .into(),
+            )
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            if !self.split_refused.replace(true) {
+                eprintln!("dual-gpu: {why} — rendering the whole screen on this device");
+            }
+            self.split.set(TileSplit::ALL);
+            return false;
         }
+        self.split_refused.set(false);
         self.split.set(split);
+        true
     }
 
     /// Drop the replay key. Called when a recorded-but-never-executed producing

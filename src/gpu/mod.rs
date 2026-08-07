@@ -2448,7 +2448,27 @@ impl GpuContext {
         debug: bool,
         bc7_mode: crate::bc7::Bc7Mode,
     ) -> Result<()> {
-        let depth = self.dual_depth.clamp(1, trace::MAX_SPLIT_DEPTH);
+        // The split depth must stay strictly under the leaf frontier — see
+        // `TraceGpu::set_split`, where that is a soundness guard rather than a
+        // sanity check. Clamping HERE rather than letting `set_split` refuse
+        // is what keeps a small render resolution splitting at all: at 240x135
+        // `depth_full` is 3, so the requested depth 3 would be declined every
+        // frame while depth 2 works perfectly well. A frame too small for even
+        // depth 1 has nothing to balance, and says so once.
+        let full = trace::depth_full(rw, rh);
+        if full <= 1 {
+            return Err(format!(
+                "a {rw}x{rh} frame is one quadtree level deep — there are no tiles to split"
+            ));
+        }
+        let depth = self.dual_depth.clamp(1, trace::MAX_SPLIT_DEPTH.min(full - 1));
+        if depth != self.dual_depth.clamp(1, trace::MAX_SPLIT_DEPTH) {
+            eprintln!(
+                "dual-gpu: split depth {} is at or past the leaf frontier at {rw}x{rh} \
+                 (depth_full={full}) — splitting at depth {depth} instead",
+                self.dual_depth
+            );
+        }
         let side = 1u32 << depth;
         let share = share.min(side - 1);
         // A resize kept the device, the scene core and the balancer's converged
@@ -2473,6 +2493,14 @@ impl GpuContext {
                 (hg, core, dual::Balancer::new(share, depth, self.dual_auto, dual::SHARE_DWELL))
             }
         };
+        // A resize can move `depth_full` under the depth the kept balancer
+        // converged at, and its depth is baked in (it indexes the row grid).
+        // Rebuilding it at the legal depth costs the converged share, which is
+        // strictly better than every frame's `set_split` declining.
+        let mut bal = bal;
+        if bal.depth() != depth {
+            bal = dual::Balancer::new(share, depth, self.dual_auto, dual::SHARE_DWELL);
+        }
         let dev = hg.device.clone();
         // The pack matters here in a way it never did for a capture: an
         // interactive frame is FED, so `record_feed` reads the secondary's rows
@@ -2576,18 +2604,29 @@ impl GpuContext {
         let frozen = p.accumulate && p.frame > 0;
         let rows = d.bal.tick(frozen);
         let (prim_split, sec_split) = trace::TileSplit::for_share(rows, d.bal.depth());
-        tg.set_split(prim_split);
+        // ARM BOTH DEVICES OR NEITHER. `set_split` can decline (a depth past
+        // the leaf frontier once a small render resolution has moved
+        // `depth_full` under it, `--waveviz`), and a half-armed frame is the
+        // hole class: the primary skipping rows nothing else renders. So the
+        // secondary's half is settled FIRST and the primary is only narrowed
+        // once it is; anything short of that puts both back on the whole
+        // screen, which is the pre-feature path exactly.
         let band = sec_split.and_then(|sp| {
             let b = sp.row_range(rw, rh)?;
-            d.tg.set_split(sp);
-            d.bal.mark_ran();
+            if !d.tg.set_split(sp) {
+                return None;
+            }
             Some(b)
         });
-        let Some((y0, y1)) = band else {
+        let armed = band.filter(|_| tg.set_split(prim_split));
+        let Some((y0, y1)) = armed else {
+            tg.set_split(trace::TileSplit::ALL);
+            d.tg.set_split(trace::TileSplit::ALL);
             tg.write_cb(slot, p);
             tg.record_frame(&d3d.list, slot, p, hybrid);
             return Ok(());
         };
+        d.bal.mark_ran();
         let strides = dual::fed_strides(d.pack, d.ext);
         tg.write_cb(slot, p);
         {
@@ -2596,9 +2635,20 @@ impl GpuContext {
             let v2 = hg2.submit(|l| tg2.record_frame(l, 0, p, hybrid))?;
             tg.record_frame(&d3d.list, slot, p, hybrid);
             // The primary is now EXECUTING; the wait below overlaps it.
-            d3d.split_frame(slot)?;
+            //
+            // THE SPLIT'S ERROR IS DEFERRED PAST THE WAIT, never `?`-ed here.
+            // The secondary's fence is in flight from the `submit` above, and
+            // `HeadlessGpu::submit` puts the ordering on its caller: returning
+            // without waiting leaves the NEXT frame's submit resetting a
+            // command allocator whose list may still be executing, which is
+            // UB and in practice removes the secondary device. One recoverable
+            // frame error (the presenter aborts the frame and main.rs sheds
+            // the upscaler) would become a wedged adapter.
+            let split = d3d.split_frame(slot);
             let t0 = std::time::Instant::now();
-            hg2.wait(v2)?;
+            let waited = hg2.wait(v2);
+            split?;
+            waited?;
             let src = [
                 dual::Plane { res: &tg2.accum, stride: 12 },
                 dual::Plane { res: &tg2.gbuf, stride: 16 },
@@ -2607,7 +2657,7 @@ impl GpuContext {
             let mut rec = Ok(());
             hg2.run(|l| rec = d.xf.record_out(l, &src[..strides.len()], rw, y0, y1))?;
             rec?;
-            d.xf.hop(dual::payload_bytes(strides, rw, y1 - y0))?;
+            d.xf.hop(slot, dual::payload_bytes(strides, rw, y1 - y0))?;
             // Everything the secondary cost us: its trace past the launch point
             // plus getting its band across. The balancer sees it next frame,
             // when this frame's own total is finally known.
@@ -2618,8 +2668,7 @@ impl GpuContext {
             dual::Plane { res: &tg.gbuf, stride: 16 },
             dual::Plane { res: &tg.gbuf_ext, stride: 72 },
         ];
-        d.xf.record_in(&d3d.list, &dst[..strides.len()], rw, y0, y1)?;
-        let _ = rh;
+        d.xf.record_in(&d3d.list, &dst[..strides.len()], rw, y0, y1, slot)?;
         Ok(())
     }
 

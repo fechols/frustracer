@@ -1611,22 +1611,37 @@ impl DxrGpu {
     /// differently by construction, and the overlay would be measuring the
     /// band rather than the pipeline. Not a bug to fix; the two questions are
     /// incompatible.
-    pub fn set_band(&self, y0: u32, y1: u32) {
+    ///
+    /// A REFUSAL RESTORES THE WHOLE SCREEN AND RETURNS `false`, and both
+    /// halves are load-bearing. Leaving `self.band` at whatever it already
+    /// held is the version that shipped — a caller that asked for a band and
+    /// got the previous one silently is the hole class. Restoring the whole
+    /// screen alone is not enough either: `--check-dxr --waveviz` then renders
+    /// a full-screen frame and scores it against a band the tracer never had,
+    /// which is the same spurious FAIL by another route. The caller has to be
+    /// TOLD, so it can stand its gate down under the lever rather than fail
+    /// it (the `el-cull` shape).
+    #[must_use = "a refused band still renders the whole screen — the caller must not \
+                  go on to score it as a band"]
+    pub fn set_band(&self, y0: u32, y1: u32) -> bool {
         if y0 >= y1 || y1 > self.rh {
             eprintln!(
                 "dxr: band {y0}..{y1} is empty or past the {}-row frame — keeping the whole screen",
                 self.rh
             );
-            return;
+            self.band.set((0, self.rh));
+            return false;
         }
         if (y0, y1) != (0, self.rh) && trace::waveviz_on() {
             eprintln!(
                 "dxr: --waveviz measures launch PACKING, which a banded dispatch changes by \
                  construction — keeping the whole screen"
             );
-            return;
+            self.band.set((0, self.rh));
+            return false;
         }
         self.band.set((y0, y1));
+        true
     }
 
 

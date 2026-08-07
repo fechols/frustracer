@@ -683,7 +683,9 @@ impl D3d {
         // The fence wait above is what makes this slot's timestamps safe to
         // map: --gpu-timing reports frame N at the top of frame N+2, never
         // stalling the pipeline to do it.
-        super::gputime::begin_frame(&self.device, &self.queue, slot);
+        // The OUTERMOST frame: nothing was open before it, so the restore
+        // token is discarded here and nowhere else (see `gputime::CURRENT`).
+        let _outermost = super::gputime::begin_frame(&self.device, &self.queue, slot);
         Ok(slot)
     }
 

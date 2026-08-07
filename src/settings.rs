@@ -749,7 +749,17 @@ pub fn apply_to_opts(s: &Settings, opts: &mut crate::Opts) -> AppliedFx {
         opts.dual_gpu_auto = v;
         // Arming parity with the CLI's `--dual-gpu-auto`: a balancer with
         // nothing to balance is a silent no-op.
-        if v && opts.dual_gpu.is_none() {
+        //
+        // AN EXPLICIT `dual_gpu: 0` VETOES IT, and that has to be read off the
+        // FILE rather than off `opts`: the share row's "off" and "the file
+        // never mentioned a share" both land on `opts.dual_gpu == None`, so
+        // testing `opts` alone re-armed the very setting the user had just
+        // switched off — and since the share row is the menu's only way to
+        // turn the feature off, that made it unturnoffable while the auto
+        // toggle was on, at the cost of a second scene upload and BLAS build
+        // every launch. The CLI has no equivalent because `--no-dual-gpu`
+        // clears both fields; a file has no ordering, so the veto is explicit.
+        if v && opts.dual_gpu.is_none() && a.dual_gpu != Some(0) {
             opts.dual_gpu = Some(2);
         }
     }
@@ -1486,6 +1496,45 @@ pub fn self_test() -> Result<(), String> {
         let _ = apply_to_opts(&Settings::default(), &mut o2);
         if o2.dxr_inline_explicit {
             return Err("a default Settings must not set dxr_inline_explicit".into());
+        }
+    }
+
+    // THE dual_gpu_auto VETO. `dual_gpu: 0` is the share row's "off" (the
+    // blas_split trick), and the auto toggle must not undo it — the two rows
+    // are independent settings, and the share row is the menu's only way to
+    // turn the feature off. Three cases, and the middle one is the whole
+    // point: testing `opts.dual_gpu.is_none()` alone cannot tell "off" from
+    // "unmentioned", which is how the re-arm shipped.
+    {
+        let mut o = crate::cli::defaults();
+        let mut s = Settings::default();
+        s.advanced.dual_gpu_auto = Some(true);
+        let _ = apply_to_opts(&s, &mut o);
+        if o.dual_gpu.is_none() || !o.dual_gpu_auto {
+            return Err("advanced.dual_gpu_auto alone must arm a default share".into());
+        }
+        let mut o = crate::cli::defaults();
+        let mut s = Settings::default();
+        s.advanced.dual_gpu = Some(0);
+        s.advanced.dual_gpu_auto = Some(true);
+        let _ = apply_to_opts(&s, &mut o);
+        if o.dual_gpu.is_some() {
+            return Err(
+                "an explicit advanced.dual_gpu=0 must veto dual_gpu_auto's arming — the share \
+                 row's \"off\" is the only way to turn the feature off from the menu"
+                    .into(),
+            );
+        }
+        if !o.dual_gpu_auto {
+            return Err("the veto must silence the SHARE, not the auto flag itself".into());
+        }
+        let mut o = crate::cli::defaults();
+        let mut s = Settings::default();
+        s.advanced.dual_gpu = Some(3);
+        s.advanced.dual_gpu_auto = Some(true);
+        let _ = apply_to_opts(&s, &mut o);
+        if o.dual_gpu != Some(3) {
+            return Err("an explicit share must survive dual_gpu_auto".into());
         }
     }
 

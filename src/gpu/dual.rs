@@ -40,11 +40,26 @@ pub struct Plane<'a> {
 }
 
 /// Staging for one direction of a band copy: a readback buffer on the source
-/// device and an upload buffer on the destination's.
+/// device and an upload RING on the destination's.
 ///
 /// Both are allocated once at the worst-case band size and reused, the
 /// `XessResources` discipline — a per-frame allocation on this path would cost
 /// more than the copy.
+///
+/// THE UPLOAD SIDE IS A RING AND THE READBACK SIDE IS NOT, and the asymmetry
+/// is exactly the fencing. `record_out` runs on the secondary through a
+/// BLOCKING `run`/`wait`, so the readback is complete before `hop` reads it and
+/// nothing else can be in flight against it. `record_in` is recorded onto the
+/// PRIMARY's frame list and executes whenever that frame executes — so on the
+/// interactive path frame N's copy is still queued when frame N+1's `hop`
+/// memcpys, and a single buffer would be rewritten under an executing copy
+/// (`UploadBuffer`'s own safety note assumes the begin_frame fence wait, which
+/// at `FRAMES_IN_FLIGHT = 2` only retires frame N-2). The symptom would be a
+/// horizontal tear inside the band, between two frames' radiance, appearing
+/// only under a particular primary/secondary timing — the class that never
+/// reproduces. One sub-buffer per in-flight slot, keyed by the caller's own
+/// frame slot, makes it structural: the slot the caller writes was last read
+/// by frame N-2, whose retirement `D3d::begin_frame` already waited on.
 pub struct BandTransfer {
     readback: ReadbackBuffer,
     upload: UploadBuffer,
@@ -83,16 +98,33 @@ pub fn fed_strides(pack: bool, ext: bool) -> &'static [u64] {
 /// Every stride any arm can ask for — the staging cap's worst case.
 pub const MAX_FED_STRIDES: [u64; 3] = [12, 16, 72];
 
+/// Byte base of frame slot `slot`'s sub-buffer inside a `cap`-sized upload
+/// ring. Free-standing so the arithmetic is gated without a device — the
+/// module's own "a wrong offset lands a plausible image with one displaced
+/// stripe" rule, which is exactly what a ring the two halves disagree about
+/// would produce.
+pub fn ring_base(cap: usize, slot: usize) -> u64 {
+    (slot % d3d12::FRAMES_IN_FLIGHT) as u64 * cap as u64
+}
+
 impl BandTransfer {
     /// `cap` must cover the largest band the balancer can assign — size it
     /// from the FULL screen, not the current split, or a rebalance reallocates
     /// mid-session.
+    ///
+    /// The upload allocation is `FRAMES_IN_FLIGHT * cap`: one sub-buffer per
+    /// frame slot, see the type's own note.
     pub fn new(src: &ID3D12Device, dst: &ID3D12Device, cap: usize) -> Result<Self> {
         Ok(Self {
             readback: ReadbackBuffer::new(src, cap)?,
-            upload: UploadBuffer::new(dst, cap)?,
+            upload: UploadBuffer::new(dst, cap * d3d12::FRAMES_IN_FLIGHT)?,
             cap,
         })
+    }
+
+    /// Byte base of one frame slot's upload sub-buffer.
+    fn slot_base(&self, slot: usize) -> u64 {
+        ring_base(self.cap, slot)
     }
 
     /// Byte offsets of each plane's slice inside the staging buffer, packed in
@@ -161,7 +193,12 @@ impl BandTransfer {
     ///
     /// This is the crossing a shared heap removes; nothing else about the
     /// shape changes when it does.
-    pub fn hop(&self, bytes: usize) -> Result<()> {
+    ///
+    /// `slot` is the DESTINATION frame's slot — the same one its `record_in`
+    /// passes, and the same one `D3d::begin_frame` fence-waited on. A
+    /// submit-and-wait driver (`--spin`, `--cinematic`) has one frame in
+    /// flight and passes 0.
+    pub fn hop(&self, slot: usize, bytes: usize) -> Result<()> {
         if bytes == 0 {
             return Ok(());
         }
@@ -174,7 +211,8 @@ impl BandTransfer {
                 .resource
                 .Map(0, None, Some(&mut p))
                 .map_err(|e| format!("band hop Map: {e}"))?;
-            std::ptr::copy_nonoverlapping(p as *const u8, self.upload.ptr, bytes);
+            let dst = self.upload.ptr.add(self.slot_base(slot) as usize);
+            std::ptr::copy_nonoverlapping(p as *const u8, dst, bytes);
             self.readback.resource.Unmap(0, None);
         }
         Ok(())
@@ -182,7 +220,11 @@ impl BandTransfer {
 
     /// Record on the DESTINATION device's list: staging back into each plane's
     /// `[y0, y1)` rows. Layout mirrors `record_out` through the shared
-    /// `offsets`.
+    /// `offsets`, offset by the frame slot's own sub-buffer.
+    ///
+    /// `slot` MUST be the one the matching `hop` wrote — they are the two
+    /// halves of one ring entry, and disagreeing would read a stale frame's
+    /// band with no error anywhere.
     pub fn record_in(
         &self,
         list: &ID3D12GraphicsCommandList,
@@ -190,9 +232,11 @@ impl BandTransfer {
         rw: u32,
         y0: u32,
         y1: u32,
+        slot: usize,
     ) -> Result<()> {
         let rows = y1.saturating_sub(y0);
         let offs = Self::offsets(planes, rw, rows);
+        let base = self.slot_base(slot);
         for (p, (at, len)) in planes.iter().zip(&offs) {
             if *len == 0 {
                 continue;
@@ -204,7 +248,7 @@ impl BandTransfer {
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                     D3D12_RESOURCE_STATE_COPY_DEST,
                 )]);
-                list.CopyBufferRegion(p.res, dst_off, &self.upload.resource, *at, *len);
+                list.CopyBufferRegion(p.res, dst_off, &self.upload.resource, base + *at, *len);
                 list.ResourceBarrier(&[d3d12::transition(
                     p.res,
                     D3D12_RESOURCE_STATE_COPY_DEST,
@@ -708,6 +752,10 @@ pub struct Balancer {
     depth: u32,
     auto: bool,
     rows: u32,
+    /// What the LAST UNFROZEN tick actually rendered with — the share a frozen
+    /// tick holds. Not the same thing as `rows`, which `observe` rewrites
+    /// after a Solo or Probe frame; see `tick`.
+    held: u32,
     kind: Tick,
     adopts: u64,
     solos: u64,
@@ -730,6 +778,7 @@ impl Balancer {
             depth,
             auto,
             rows: share,
+            held: share,
             kind: Tick::Split,
             adopts: 0,
             solos: 0,
@@ -777,9 +826,25 @@ impl Balancer {
     /// EVERY probe is gated on `auto`, not just the adoption: a pinned share
     /// means "do not move it", and both probes move it for their frame and
     /// restore from the limiter afterwards — which a pinned run never applied.
+    ///
+    /// A FROZEN TICK HOLDS `held`, NOT `rows`, and the distinction is the
+    /// whole point of the field. `observe` restores `rows` from the limiter
+    /// after a Solo or Probe frame, so "keep doing what you were doing" read
+    /// off `rows` could hand back a DIFFERENT share than the frame it is
+    /// meant to be continuing: a Solo landing on the last moving frame (which
+    /// stores at `frame == 0`) would be followed by a frozen frame at the
+    /// restored share, and the secondary — which never ran the storing frame —
+    /// would ADD its band onto an accumulation it never opened. That is a
+    /// ghosted band appearing the instant the camera stops. Holding what the
+    /// frame BEFORE the freeze actually rendered makes the store and every
+    /// subsequent add agree by construction; the price is that a probe frame's
+    /// share persists for that still period, which is one converge at a
+    /// measured share rather than a wrong image.
     pub fn tick(&mut self, frozen: bool) -> u32 {
         self.kind = Tick::Split;
-        if !frozen && self.auto {
+        if frozen {
+            self.rows = self.held;
+        } else if self.auto {
             // The idle re-probe: one forced row so an idled secondary can be
             // re-measured. Without it a single transient disables it forever.
             if self.rows == 0 && self.ctl.idle_frame() {
@@ -790,7 +855,7 @@ impl Balancer {
                 // then pins the secondary on for the whole dwell after every
                 // probe (measured on --spin at 2x the baseline frame time).
                 self.rows = 1;
-                return self.rows;
+                return self.commit();
             }
             // A measured loss to the no-split baseline is the emergency the
             // limiter's `shed` exists for — it may only ever shrink, so
@@ -813,13 +878,20 @@ impl Balancer {
                 self.solos += 1;
                 self.kind = Tick::Solo;
                 self.rows = 0;
-                return self.rows;
+                return self.commit();
             }
         }
         if self.rows == 0 {
             self.idles += 1;
             self.kind = Tick::Idle;
         }
+        self.commit()
+    }
+
+    /// Latch what this frame renders with, so the next FROZEN tick can hold
+    /// it. The one exit every arm of `tick` goes through.
+    fn commit(&mut self) -> u32 {
+        self.held = self.rows;
         self.rows
     }
 
@@ -910,6 +982,43 @@ pub fn self_test() -> std::result::Result<(), String> {
     }
     if at as usize != payload_bytes(&strides, rw, rows) {
         return Err("staging layout total disagrees with payload_bytes".into());
+    }
+
+    // THE UPLOAD RING. `record_in` executes on the destination's FRAME list, so
+    // it is still queued when the next frame's `hop` memcpys — one sub-buffer
+    // per in-flight slot is what stops the second overwriting the first's
+    // source. Both halves derive their base from `ring_base`, so what has to
+    // hold is that the slots are distinct, `cap` apart (a full-size band at
+    // slot i cannot reach slot i+1), and that the index WRAPS — the callers
+    // pass a frame slot, and a raw frame index must be as safe.
+    {
+        let n = d3d12::FRAMES_IN_FLIGHT;
+        if n < 2 {
+            return Err("FRAMES_IN_FLIGHT < 2 makes the band's upload ring a single buffer, \
+                        which is the tear this ring exists to prevent"
+                .into());
+        }
+        let cap = payload_bytes(&MAX_FED_STRIDES, rw, rh);
+        for i in 0..n {
+            for j in 0..n {
+                let (a, b) = (ring_base(cap, i), ring_base(cap, j));
+                if (i == j) != (a == b) {
+                    return Err(format!("ring slots {i} and {j} disagree about being distinct"));
+                }
+                if i != j && a.abs_diff(b) < cap as u64 {
+                    return Err(format!(
+                        "ring slots {i} and {j} are {} B apart but a band is up to {cap} B — \
+                         one frame's copy would read the next frame's bytes",
+                        a.abs_diff(b)
+                    ));
+                }
+            }
+        }
+        if ring_base(cap, n) != ring_base(cap, 0) {
+            return Err("ring_base must wrap: callers pass a frame slot, and a raw frame \
+                        index has to land on the same entry"
+                .into());
+        }
     }
 
     balance_self_test()?;
@@ -1543,6 +1652,63 @@ fn balance_self_test() -> std::result::Result<(), String> {
         }
         if l.apply(2, false) != 2 {
             return Err(format!("dwell {d} never released"));
+        }
+    }
+
+    // (8) THE FREEZE HOLDS WHAT THE PREVIOUS FRAME RENDERED, not what
+    // `observe` restored afterwards — the accumulation rule in
+    // `GpuContext::record_trace`. A SOLO frame is the case that separates the
+    // two: it renders at ZERO rows and STORES (it is an unfrozen frame, so
+    // `frame == 0`), then `observe` puts the share back from the limiter. If
+    // the following frozen frame read `rows` it would re-arm the split, and
+    // the secondary — which never ran the storing frame — would ADD its band
+    // into an accumulation it never opened: a ghosted band the instant the
+    // camera stops.
+    {
+        let mut b = Balancer::new(3, 3, true, SHARE_DWELL);
+        let mut solo = false;
+        for _ in 0..4096 {
+            let rows = b.tick(false);
+            if b.kind() == Tick::Solo {
+                if rows != 0 {
+                    return Err(format!("a SOLO tick must render at zero rows, got {rows}"));
+                }
+                // A solo frame that measures SLOWER than the splits keeps the
+                // limiter's share alive, which is what makes the restore — and
+                // therefore this gate — non-vacuous.
+                b.observe(0.0, 0.0, 2.0);
+                solo = true;
+                break;
+            }
+            b.observe(1.0, 1.0, 1.0);
+        }
+        if !solo {
+            return Err("no SOLO baseline in 4096 ticks — the freeze gate would be vacuous".into());
+        }
+        // TEETH: `observe` really did restore a DIFFERENT share, so holding
+        // zero below is a distinction rather than a coincidence.
+        if b.rows() == 0 {
+            return Err("the solo restore left zero rows — the freeze gate proves nothing".into());
+        }
+        if b.tick(true) != 0 {
+            return Err(
+                "a frozen tick after a SOLO frame must hold ZERO rows: the solo frame is the \
+                 one that STORED, and the secondary did not run it"
+                    .into(),
+            );
+        }
+        // ...and the hold is not a latch. The moment the freeze lifts the
+        // balancer is free again, or a still frame would disable the secondary
+        // for the rest of the session.
+        let back = b.tick(false);
+        if back == 0 {
+            return Err("the freeze must release: an unfrozen tick is free to re-adopt".into());
+        }
+        // An ordinary split frame's share is held across a freeze unchanged —
+        // the general contract, of which the solo case is the sharp corner.
+        b.observe(1.0, 1.0, 1.0);
+        if b.tick(true) != back {
+            return Err("a frozen tick must hold the previous frame's share exactly".into());
         }
     }
     Ok(())

@@ -52,8 +52,19 @@ static TIMERS: Mutex<Vec<Timer>> = Mutex::new(Vec::new());
 /// The recording-side calls (`scope`, `resolve`, the `TimeScope` drop) sit deep
 /// inside command-list recording and have no device in hand, so `begin_frame`
 /// publishes which device is being recorded and they follow it. Sound because
-/// recording is sequential on the main thread: a device's frame is begun,
-/// recorded and resolved before the next device's begins. It never nests.
+/// recording is sequential on the main thread.
+///
+/// IT DOES NEST, exactly once, and that is why `begin_frame` hands back a
+/// token. The `--dual-gpu` schedule submits the SECONDARY's whole frame from
+/// inside the primary's open one (`GpuContext::record_trace`) — that is the
+/// point of the feature, since serialising the two would measure their sum.
+/// A plain store would leave `CURRENT` on the secondary for the rest of the
+/// primary's frame, and the primary's remaining `EndQuery`/`ResolveQueryData`
+/// calls would then name the SECONDARY device's query heap from the PRIMARY's
+/// command list: invalid D3D12 (a GBV flood with `--gpu-debug`, a plausible
+/// route to DEVICE_REMOVED without it), and — where a driver tolerates it —
+/// two silently wrong `--gpu-timing` tables, which is the one measurement the
+/// per-device split exists to produce. Save and restore, never assume.
 static CURRENT: AtomicUsize = AtomicUsize::new(0);
 
 /// One open/closed region within a frame: the two timestamp indices —
@@ -347,12 +358,32 @@ pub fn take_regions() -> Vec<(String, u32, f64)> {
     .unwrap_or_default()
 }
 
+/// Whichever device's frame was open when a nested one began. Hand it to
+/// `restore` once the nested frame is recorded and resolved — see `CURRENT`.
+#[must_use = "a nested gputime frame must be restored, or the outer device's \
+              timestamps are recorded against this one's query heap"]
+pub struct Nested(usize);
+
+/// Republish the device whose frame `begin_frame` interrupted.
+pub fn restore(prev: Nested) {
+    CURRENT.store(prev.0, Ordering::Relaxed);
+}
+
 /// Collect the previous timings for this slot and start recording it afresh.
-/// Called from `D3d::begin_frame` (and `HeadlessGpu::run`), after the slot's
-/// fence wait.
-pub fn begin_frame(device: &ID3D12Device, queue: &ID3D12CommandQueue, slot: usize) {
+/// Called from `D3d::begin_frame` (and `HeadlessGpu::submit`/`run`), after the
+/// slot's fence wait.
+///
+/// The returned token restores whatever was open before — an outermost frame
+/// discards it (there is nothing to go back to), the dual-GPU schedule's inner
+/// one must not.
+pub fn begin_frame(
+    device: &ID3D12Device,
+    queue: &ID3D12CommandQueue,
+    slot: usize,
+) -> Nested {
+    let prev = Nested(CURRENT.load(Ordering::Relaxed));
     if !on() {
-        return;
+        return prev;
     }
     let mut guard = TIMERS.lock().unwrap();
     let luid = luid_key(device);
@@ -367,7 +398,9 @@ pub fn begin_frame(device: &ID3D12Device, queue: &ID3D12CommandQueue, slot: usiz
                 eprintln!("gputime: {e}; timing off");
                 ENABLED.store(false, Ordering::Relaxed);
                 CURRENT.store(0, Ordering::Relaxed);
-                return;
+                // Timing is off from here on, so the token's only job is to
+                // keep the caller's `restore` a no-op that agrees with it.
+                return Nested(0);
             }
         },
     };
@@ -388,6 +421,7 @@ pub fn begin_frame(device: &ID3D12Device, queue: &ID3D12CommandQueue, slot: usiz
     t.used = 0;
     t.depth = 0;
     t.cur_slot = slot;
+    prev
 }
 
 /// Record the ResolveQueryData for the slot just recorded. Called from

@@ -2624,7 +2624,17 @@ fn run_check_dxr(
             let mid = (gh / 2) as u32;
             let mut bad = (0usize, 0usize);
             for (y0, y1) in [(0u32, mid), (mid, gh as u32)] {
-                dg.set_band(y0, y1);
+                if !dg.set_band(y0, y1) {
+                    // The tracer declined the band and is rendering the whole
+                    // screen — scoring THAT as a band is a gate failing on a
+                    // lever rather than on a defect (`--waveviz` is the one
+                    // that reaches here). Stand down loudly instead.
+                    eprintln!(
+                        "check-dxr: dual-gpu band skipped — the tracer refused a band in this \
+                         configuration (see the line above)"
+                    );
+                    return Ok(());
+                }
                 gpu_frame(&mut hg, &dg, 0)?;
                 let got = rd(&mut hg)?;
                 for y in 0..gh {
@@ -2642,7 +2652,8 @@ fn run_check_dxr(
                 }
                 // Restore before the next pass, so each band starts from the
                 // same dirty state rather than the previous band's output.
-                dg.set_band(0, gh as u32);
+                // The whole screen is the one request that cannot be refused.
+                let _ = dg.set_band(0, gh as u32);
                 gpu_frame(&mut hg, &dg, 0)?;
                 gpu_frame(&mut hg, &dg, 1)?;
             }
@@ -2659,7 +2670,7 @@ fn run_check_dxr(
             }
             Ok(())
         })();
-        dg.set_band(0, gh as u32);
+        let _ = dg.set_band(0, gh as u32);
         if let Err(e) = band {
             eprintln!("check-dxr: FAIL dual-gpu band: {e}");
             ok = false;
@@ -4832,6 +4843,20 @@ fn run_check_gpu(
     // the shader derives child rects itself, so A and B partition the screen
     // by construction whatever the rounding does, and a GPU union test at
     // 533x400 would prove nothing this one does not.
+    //
+    // STAND DOWN UNDER A LEVER THAT FORBIDS SPLITS OUTRIGHT. `--waveviz` is
+    // the one that does (a split changes launch packing, and `tbuf` — which
+    // carries the tickets — does not cross a band), and without this probe
+    // both split families below score FULL-SCREEN renders as bands and report
+    // a partition failure caused entirely by an unrelated debug flag. Ask
+    // `set_split`, which owns the policy, with a real split and restore: a
+    // gate that cannot tell "refused" from "wrong" is a property of its own
+    // levers.
+    let splittable = gpu::trace::depth_full(gw as u32, gh as u32) > 1 && {
+        let s = tg.set_split(gpu::trace::TileSplit::rows(1, 0, 1));
+        let _ = tg.set_split(gpu::trace::TileSplit::ALL);
+        s
+    };
     {
         const SENT: u32 = 0xffff_ffff;
         // Sentinel ON every pass: an unowned pixel must stay unwritten, and
@@ -4840,7 +4865,14 @@ fn run_check_gpu(
                       sp: &gpu::trace::FrameParams,
                       s: gpu::trace::TileSplit|
          -> Result<(Vec<f32>, Vec<f32>, Vec<u32>), String> {
-            tg.set_split(s);
+            // A refused split renders the whole screen, so scoring the result
+            // as a partition would fail the gate on a LEVER rather than on a
+            // defect (`--waveviz` is the one that reaches here). Say so and
+            // let the caller stand the family down — the `--check-dxr` band
+            // gate's shape.
+            if !tg.set_split(s) {
+                return Err("the tracer refused this split (see the line above)".into());
+            }
             tg.write_cb(0, sp);
             hg.run(|l| tg.record_wavefront(l, 0, sp, true))?;
             Ok((
@@ -4853,7 +4885,11 @@ fn run_check_gpu(
         // Deeper than the leaf frontier there is no internal tile to own, and
         // `set_split` refuses it — so the sweep stops where the renderer does.
         let full = gpu::trace::depth_full(gw as u32, gh as u32);
-        let max_d = gpu::trace::MAX_SPLIT_DEPTH.min(full.saturating_sub(1));
+        let max_d = if splittable {
+            gpu::trace::MAX_SPLIT_DEPTH.min(full.saturating_sub(1))
+        } else {
+            0
+        };
 
         // THE SWEEP RUNS AT fb OFF, AO AND GI. `record_wavefront` dispatches
         // `cs_compose` and the whole hemi wavefront ONLY when fb_mode > 0, so
@@ -4989,6 +5025,9 @@ fn run_check_gpu(
                     }
                 }
             }
+            Ok(_) if !splittable => eprintln!(
+                "check-gpu: (skip) dual-gpu split {fb_name} — the tracer refuses a split in this configuration (see the line above)"
+            ),
             Ok(_) => eprintln!(
                 "check-gpu: (skip) dual-gpu split — depth_full {full} at {gw}x{gh} leaves no internal tile to own"
             ),
@@ -5157,7 +5196,11 @@ fn run_check_gpu(
             ),
             Some(p) => {
                 let full = gpu::trace::depth_full(gw as u32, gh as u32);
-                let max_d = gpu::trace::MAX_SPLIT_DEPTH.min(full.saturating_sub(1)).min(2);
+                let max_d = if splittable {
+                    gpu::trace::MAX_SPLIT_DEPTH.min(full.saturating_sub(1)).min(2)
+                } else {
+                    0
+                };
                 let build = (|| -> Result<
                     (
                         gpu::trace::HeadlessGpu,
@@ -5235,7 +5278,11 @@ fn run_check_gpu(
                                    t: &gpu::trace::TraceGpu,
                                    s: gpu::trace::TileSplit|
                          -> Result<(Vec<f32>, Vec<u32>), String> {
-                            t.set_split(s);
+                            if !t.set_split(s) {
+                                return Err(
+                                    "the tracer refused this split (see the line above)".into()
+                                );
+                            }
                             t.write_cb(0, &sp);
                             h.run(|l| t.record_wavefront(l, 0, &sp, true))?;
                             let ab = h.read_buffer(&t.accum, ua, px * 3 * 4)?;
@@ -5349,11 +5396,14 @@ fn run_check_gpu(
                                                     by1,
                                                 );
                                             })?;
-                                            xf.hop(gpu::dual::payload_bytes(
-                                                &[12],
-                                                gw as u32,
-                                                by1 - by0,
-                                            ))?;
+                                            xf.hop(
+                                                0,
+                                                gpu::dual::payload_bytes(
+                                                    &[12],
+                                                    gw as u32,
+                                                    by1 - by0,
+                                                ),
+                                            )?;
                                             hg.run(|l| {
                                                 let _ = xf.record_in(
                                                     l,
@@ -5361,6 +5411,7 @@ fn run_check_gpu(
                                                     gw as u32,
                                                     by0,
                                                     by1,
+                                                    0,
                                                 );
                                             })?;
                                             let m = hg.read_buffer(&tg.accum, ua, px * 3 * 4)?;
@@ -11285,6 +11336,16 @@ fn cine_dual_res(
 /// `--spin` and the interactive presenters. It happens ONCE per output frame in
 /// the accumulation arm because a split that moved between sub-frames would
 /// leave rows accumulated by two different devices.
+///
+/// THE PRIMARY IS NARROWED ONLY ONCE THE SECONDARY HAS ITS HALF. Committing
+/// `prim_split` first and bailing out afterwards is what shipped, and it turned
+/// the documented single-GPU degrade (`cine_dual_res` failing at this
+/// resolution leaves `d.res` empty while `dual` stays armed) into a silent
+/// wrong image: the primary kept rendering its band, the caller read the
+/// `None` as "the secondary sits this frame out" and took the single-GPU path,
+/// and the rows nobody traced kept the PREVIOUS output frame's `accum` — a
+/// stale band across the bottom of every written PNG, after one degrade line
+/// claiming the capture was single-GPU.
 #[cfg(windows)]
 fn cine_dual_arm(
     d: &mut CineDual,
@@ -11294,13 +11355,26 @@ fn cine_dual_arm(
 ) -> Option<(u32, u32)> {
     let rows = d.bal.tick(false);
     let (prim_split, sec_split) = gpu::trace::TileSplit::for_share(rows, d.bal.depth());
-    prim.set_split(prim_split);
-    let r = d.res.as_ref()?;
-    let sec_split = sec_split?;
-    let band = sec_split.row_range(rw, rh)?;
-    r.tg.set_split(sec_split);
-    d.bal.mark_ran();
-    Some(band)
+    let band = (|| {
+        let r = d.res.as_ref()?;
+        let sec_split = sec_split?;
+        let band = sec_split.row_range(rw, rh)?;
+        r.tg.set_split(sec_split).then_some(band)
+    })();
+    match band.filter(|_| prim.set_split(prim_split)) {
+        Some(b) => {
+            d.bal.mark_ran();
+            Some(b)
+        }
+        None => {
+            // Both back on the whole screen: the pre-feature path exactly.
+            prim.set_split(gpu::trace::TileSplit::ALL);
+            if let Some(r) = d.res.as_ref() {
+                r.tg.set_split(gpu::trace::TileSplit::ALL);
+            }
+            None
+        }
+    }
 }
 
 /// The one band merge per output frame: the secondary's rows out, across, and
@@ -11334,10 +11408,10 @@ fn cine_dual_merge(
     d.hg.run(|l| rec = r.xf.record_out(l, &src[..n], rw, y0, y1))?;
     rec?;
     let b = Instant::now();
-    r.xf.hop(gpu::dual::payload_bytes(strides, rw, y1 - y0))?;
+    r.xf.hop(0, gpu::dual::payload_bytes(strides, rw, y1 - y0))?;
     let c = Instant::now();
     let mut rec = Ok(());
-    hg.run(|l| rec = r.xf.record_in(l, &dst[..n], rw, y0, y1))?;
+    hg.run(|l| rec = r.xf.record_in(l, &dst[..n], rw, y0, y1, 0))?;
     rec?;
     let e = Instant::now();
     Ok((
@@ -11627,18 +11701,6 @@ fn run_cinematic_gpu(
         };
 
         if let Some(u) = up {
-            // THE RECONSTRUCTION ARM DOES NOT SPLIT, and the reason is a
-            // different payload rather than missing plumbing. Its engine
-            // consumes a whole merged frame every SUB-frame, so the band would
-            // cross `shot.samples` times instead of once — and it would have to
-            // carry the G-BUFFER PACK as well as `accum`, because `record_feed`
-            // reads the secondary's rows of it: 28 B/px with a XeSS/FSR3 feed,
-            // 100 B/px with RR or FSR4-RR, against the accumulation arm's 12.
-            // On top of that the secondary would have to be told to store a
-            // pack no feed of its own consumes (`force_gbuf_ext`, plus a
-            // FLAG_FSR_SIG equivalent that has no forcing hook at all).
-            // Buildable, differently shaped, and pointless to guess at before a
-            // platform exists that could measure it.
             // THE RECONSTRUCTION ARM SPLITS TOO, and pays a different price for
             // it: its engine consumes a whole merged frame every SUB-frame, so
             // the band crosses `shot.samples` times instead of once, and it
@@ -11802,11 +11864,10 @@ fn run_cinematic_gpu(
                                 })?;
                                 rec?;
                                 let t_hop = Instant::now();
-                                dres.xf.hop(gpu::dual::payload_bytes(
-                                    strides,
-                                    rw as u32,
-                                    y1 - y0,
-                                ))?;
+                                dres.xf.hop(
+                                    0,
+                                    gpu::dual::payload_bytes(strides, rw as u32, y1 - y0),
+                                )?;
                                 let hop = t_hop.elapsed().as_secs_f32() * 1e3;
                                 hg.wait(v1)?;
                                 let dst = [
@@ -11818,7 +11879,7 @@ fn run_cinematic_gpu(
                                 hg.run(|l| {
                                     rec = dres
                                         .xf
-                                        .record_in(l, &dst[..strides.len()], rw as u32, y0, y1)
+                                        .record_in(l, &dst[..strides.len()], rw as u32, y0, y1, 0)
                                         .and_then(|()| tg.record_feed(l, 0, false))
                                         .and_then(|()| {
                                             u.record_eval(
@@ -12782,7 +12843,7 @@ fn run_spin_gpu(
                         let _ = xf.record_out(l, &po, rw as u32, y0, y1);
                     })?;
                     let c = Instant::now();
-                    xf.hop(bytes)?;
+                    xf.hop(0, bytes)?;
                     let e = Instant::now();
                     // Query BEFORE waiting: this is the balancer's one exact
                     // signal, and it is unrecoverable afterwards (waiting on a
@@ -12793,7 +12854,7 @@ fn run_spin_gpu(
                     let f = Instant::now();
                     let pi = [gpu::dual::Plane { res: &tg.accum, stride: 12 }];
                     hg.run(|l| {
-                        let _ = xf.record_in(l, &pi, rw as u32, y0, y1);
+                        let _ = xf.record_in(l, &pi, rw as u32, y0, y1, 0);
                     })?;
                     let g = Instant::now();
                     ph = [
