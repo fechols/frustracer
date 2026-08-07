@@ -12832,7 +12832,14 @@ fn run_spin_gpu(
         let mut probing = false;
         if let (Some(d), Arm::Wave(tg)) = (dual.as_mut(), &armv) {
             let side = 1u32 << d.depth;
-            probing = d.rows == 0 && d.ctl.idle_frame();
+            // Gated on `auto` like every other probe: a pinned share means
+            // "do not move it", and the solo probe below restores from the
+            // LIMITER, which a pinned run never applied — so the first probe
+            // would drop a pinned `--dual-gpu 4` to 0 for the whole run and
+            // then measure single-GPU while reporting a split. This is the
+            // THIRD copy of the tick (spin/cinematic/interactive) and it is
+            // the one the same fix missed the first time round.
+            probing = d.auto && d.rows == 0 && d.ctl.idle_frame();
             if probing {
                 d.probes += 1;
             }
@@ -12866,7 +12873,7 @@ fn run_spin_gpu(
             // and sec only finds the best SPLIT; on a box where the two devices
             // interfere, every split can still be slower than not splitting,
             // and nothing else would ever tell the controller so.
-            d.solo = d.rows > 0 && d.ctl.solo_frame();
+            d.solo = d.auto && d.rows > 0 && d.ctl.solo_frame();
             if d.solo {
                 d.rows = 0;
                 d.solos += 1;
