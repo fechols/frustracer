@@ -56,6 +56,33 @@ pub fn payload_bytes(planes: &[u64], rw: u32, rows: u32) -> usize {
     planes.iter().map(|s| s * rw as u64 * rows as u64).sum::<u64>() as usize
 }
 
+/// The strides a band must carry for a frame that will be FED to an upscaler,
+/// in the order `record_out`/`record_in` pack them.
+///
+/// `accum` alone is only enough for a frame the CPU reads back — an
+/// accumulation capture. Anything that runs `record_feed` reads the secondary's
+/// rows of the G-BUFFER PACK too, so the pack crosses with it: `GBufCore`
+/// always, `GBufExt` only when a guide-consuming feed (RR, FSR4-RR, NPPD) is
+/// wired. That is 28 B/px for a XeSS or FSR 3.1 session and 100 for an RR one,
+/// against the capture path's 12 — and unlike the capture, a fed frame pays it
+/// EVERY frame, because the engine consumes a whole merged image each time.
+/// Sizing a staging cap from the largest of these is what lets the wiring
+/// change without reallocating.
+/// `pack` is `TraceGpu::pack_full()` and MUST be read from the PRIMARY: a
+/// plain session's pack buffers are single-element dummies, so a band copied
+/// into them is an out-of-bounds `CopyBufferRegion` — which does not fault,
+/// it just makes the whole command list fail to Close.
+pub fn fed_strides(pack: bool, ext: bool) -> &'static [u64] {
+    match (pack, ext) {
+        (false, _) => &[12],
+        (true, false) => &[12, 16],
+        (true, true) => &[12, 16, 72],
+    }
+}
+
+/// Every stride any arm can ask for — the staging cap's worst case.
+pub const MAX_FED_STRIDES: [u64; 3] = [12, 16, 72];
+
 impl BandTransfer {
     /// `cap` must cover the largest band the balancer can assign — size it
     /// from the FULL screen, not the current split, or a rebalance reallocates

@@ -11046,6 +11046,31 @@ fn cine_push_sky(arm: &mut CineArm, scene: &scene::Scene, fs: &CineFrame, prev_h
     }
 }
 
+/// The secondary's half of `cine_push_sky`, split out so the two capture arms
+/// cannot drift apart again.
+///
+/// THE SECONDARY CARRIES ITS OWN CONSTANT BUFFER, so an hour pushed to the
+/// primary alone leaves the band lit by the load-time sun. On a still shot that
+/// is nearly invisible (one frame of drift); on a TOUR — whose whole point is
+/// sweeping dawn to night — the band diverges monotonically, and it was
+/// measured at 51/255 by frame 39 with the error growing frame over frame.
+/// The reconstruction arm shipped without this for exactly as long as it took
+/// to test it against a moving camera rather than a still one.
+#[cfg(windows)]
+fn cine_push_sky_dual(
+    dual: Option<&mut CineDual>,
+    scene: &scene::Scene,
+    fs: &CineFrame,
+    prev_hour: Option<f32>,
+) {
+    if fs.hour.is_none() || prev_hour.is_none() {
+        return;
+    }
+    if let Some(r) = dual.and_then(|d| d.res.as_mut()) {
+        r.tg.refresh_sky(scene);
+    }
+}
+
 /// The per-output-frame tail both capture arms share: the overlay's `info`
 /// readback (paid only when the shot draws it), the ONE write path
 /// (`cine_write_frame` owns the tone curve), and the progress line.
@@ -11237,10 +11262,11 @@ fn cine_dual_open(
 /// rebuilds its arm, and with the same free-then-allocate order: at 4K two sets
 /// of window-sized buffers at once is a real VRAM spike.
 ///
-/// `gbuf` is deliberately FALSE always: the secondary is used only by the
-/// accumulation arm, which reads no pack. Storing one would be up to 88 B/px of
-/// writes nothing consumes.
+/// `gbuf` follows the PRIMARY's arm: the accumulation arm reads no pack, but the
+/// reconstruction arm's `record_feed` reads the secondary's rows of one, so it
+/// has to have been stored on that device to be copied across.
 #[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
 fn cine_dual_res(
     d: &mut CineDual,
     prim_dev: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
@@ -11249,6 +11275,7 @@ fn cine_dual_res(
     bvh: &bvh::Bvh,
     rw: u32,
     rh: u32,
+    gbuf: bool,
     debug: bool,
 ) -> Result<(), String> {
     d.res = None;
@@ -11261,17 +11288,17 @@ fn cine_dual_res(
         d.core.clone(),
         rw,
         rh,
-        false,
+        gbuf,
         false,
         debug,
         &mut d.hg,
     )?;
-    // Staging is sized from the FULL screen so the balancer can move the seam
-    // without reallocating mid-capture.
+    // Staging is sized from the FULL screen at the WORST stride set, so neither
+    // the balancer moving the seam nor a change of arm reallocates.
     let xf = gpu::dual::BandTransfer::new(
         &dev,
         prim_dev,
-        gpu::dual::payload_bytes(&CINE_DUAL_STRIDES, rw, rh),
+        gpu::dual::payload_bytes(&gpu::dual::MAX_FED_STRIDES, rw, rh),
     )?;
     d.res = Some(CineDualRes { tg, xf });
     Ok(())
@@ -11292,7 +11319,13 @@ fn cine_dual_arm(
     rh: u32,
 ) -> Option<((u32, u32), bool)> {
     let side = 1u32 << d.depth;
-    let probing = d.rows == 0 && d.ctl.idle_frame();
+    // EVERY probe is gated on `auto`, not just the adoption. A pinned share
+    // means "do not move it", and a measurement nothing can act on is not free:
+    // the solo probe zeroes `rows` for its frame and restores from the LIMITER,
+    // which a pinned session never applied — so the first probe silently
+    // dropped a pinned `--dual-gpu 4` to 0 for the rest of the run. Measured on
+    // a pinned capture reporting "settled at 0 | 0 adoptions".
+    let probing = d.auto && d.rows == 0 && d.ctl.idle_frame();
     if probing {
         d.probes += 1;
     }
@@ -11322,7 +11355,7 @@ fn cine_dual_arm(
     // has a measured no-split baseline to judge the split against. Without it
     // it can only find the best SPLIT, which on an interfering box is still
     // slower than not splitting at all.
-    d.solo = d.rows > 0 && d.ctl.solo_frame();
+    d.solo = d.auto && d.rows > 0 && d.ctl.solo_frame();
     if d.solo {
         d.rows = 0;
         d.solos += 1;
@@ -11484,6 +11517,11 @@ fn run_cinematic_gpu(
         xess_dir: opts.xess_path.clone(),
         xess_autoexposure: opts.xess_autoexposure,
         ffx_dir: opts.ffx_path.clone(),
+        // --cinematic drives its OWN secondary (CineDual) around the headless
+        // harness; GpuContext exists here only for the chain probe.
+        dual_gpu: None,
+        dual_depth: 1,
+        dual_auto: false,
         fg: false,
         fg_dir: String::new(),
         fsr_tune: opts.fsr_tune,
@@ -11603,14 +11641,25 @@ fn run_cinematic_gpu(
             } else if up_wanted {
                 eprintln!("cinematic: no upscaler level came up — accumulation fallback");
             }
+            // What the primary ended up with, after any wiring fallback —
+            // the secondary must store the same pack half.
+            let gbuf_on = up.is_some();
             built = Some(((rw, rh), a, up));
             // The secondary's resolution-bound half follows the primary's, and
             // a failure here degrades the CAPTURE to single-GPU rather than
             // ending it — the shot still gets rendered, just on one adapter.
             if let Some(d) = dual.as_mut() {
-                if let Err(e) =
-                    cine_dual_res(d, &dev, &dxc, scene, bvh, rw as u32, rh as u32, opts.gpu_debug)
-                {
+                if let Err(e) = cine_dual_res(
+                    d,
+                    &dev,
+                    &dxc,
+                    scene,
+                    bvh,
+                    rw as u32,
+                    rh as u32,
+                    gbuf_on,
+                    opts.gpu_debug,
+                ) {
                     eprintln!(
                         "cinematic dual-gpu: secondary tracer at {rw}x{rh} failed ({e}) — \
                          this resolution captures single-GPU"
@@ -11667,12 +11716,19 @@ fn run_cinematic_gpu(
             // FLAG_FSR_SIG equivalent that has no forcing hook at all).
             // Buildable, differently shaped, and pointless to guess at before a
             // platform exists that could measure it.
+            // THE RECONSTRUCTION ARM SPLITS TOO, and pays a different price for
+            // it: its engine consumes a whole merged frame every SUB-frame, so
+            // the band crosses `shot.samples` times instead of once, and it
+            // carries the G-BUFFER PACK as well as `accum` because
+            // `record_feed` reads the secondary's rows of it — 28 B/px with a
+            // XeSS or FSR3 feed, 100 with RR or FSR4-RR, against the
+            // accumulation arm's 12 paid once. The balancer prices exactly that
+            // and sheds accordingly; there is nothing to special-case.
             if dual.is_some() {
                 eprintln!(
-                    "cinematic dual-gpu: \"{}\" reconstructs through {} — that arm needs the \
-                     pack across too (28-100 B/px per SUB-frame vs 12 once per output frame), \
-                     so this shot captures single-GPU; --no-upscale or a GI shot takes the \
-                     accumulation arm",
+                    "cinematic dual-gpu: \"{}\" reconstructs through {} — the band carries the \
+                     pack too, every sub-frame (the accumulation arm's is 12 B/px once per \
+                     output frame)",
                     shot.name, u.name
                 );
             }
@@ -11697,6 +11753,7 @@ fn run_cinematic_gpu(
             for f in 0..frames {
                 let fs = cine_frame_state(scene, shot, attractors, cine, f, &mut prev_hour);
                 cine_push_sky(armv, scene, &fs, prev_hour);
+                cine_push_sky_dual(dual.as_mut(), scene, &fs, prev_hour);
                 let basis = fs.cam.basis(rw, rh);
                 // WARM-UP, output frame 0 only. `seq` free-runs, so frame f
                 // is reconstructed from its own `samples` passes PLUS every
@@ -11761,8 +11818,105 @@ fn run_cinematic_gpu(
                         rh,
                     );
                     let prev_pos = prev_cam.map(|c| c.pos);
-                    let r = match armv {
-                        CineArm::Wave(tg) => {
+                    // The balancer ticks per SUB-frame here (the transfer is
+                    // per sub-frame too), and nothing accumulates — every frame
+                    // stores — so the split may move freely.
+                    let band = match (&*armv, dual.as_mut()) {
+                        (CineArm::Wave(tg), Some(d)) => {
+                            if let Some(r) = d.res.as_ref() {
+                                // Mirror the PRIMARY's wiring: the secondary
+                                // has no feed of its own to derive it from.
+                                r.tg.force_gbuf_ext(tg.gbuf_ext_needed());
+                                r.tg.force_fsr_sig(tg.fsr_sig());
+                            }
+                            cine_dual_arm(d, tg, rw as u32, rh as u32)
+                        }
+                        _ => None,
+                    };
+                    let r = match (&mut *armv, dual.as_mut().filter(|_| band.is_some())) {
+                        // THE FED DUAL SUB-FRAME. The primary's trace goes in
+                        // flight on its own submit so the wait on the secondary
+                        // overlaps it; the band — accum AND the pack — then
+                        // lands on the list that runs feed + evaluate, which
+                        // the same queue executes after the trace by FIFO.
+                        (CineArm::Wave(tg), Some(d)) => {
+                            let (y0, y1) = band.expect("filtered").0;
+                            let strides =
+                                gpu::dual::fed_strides(tg.pack_full(), tg.gbuf_ext_needed());
+                            tg.write_cb(0, &p);
+                            let (hg2, dres) = (&mut d.hg, d.res.as_ref());
+                            let Some(dres) = dres else {
+                                eprintln!("cinematic: dual armed with no secondary tracer");
+                                return Ok(1);
+                            };
+                            dres.tg.write_cb(0, &p);
+                            let v2 = hg2.submit(|l| dres.tg.record_frame(l, 0, &p, true));
+                            let v1 = hg.submit(|l| tg.record_frame(l, 0, &p, true));
+                            (|| -> Result<(), String> {
+                                let (v2, v1) = (v2?, v1?);
+                                let (pm, sm) = gpu::dual::join_poll(
+                                    || hg.completed(v1),
+                                    || hg2.completed(v2),
+                                );
+                                hg2.wait(v2)?;
+                                let src = [
+                                    gpu::dual::Plane { res: &dres.tg.accum, stride: 12 },
+                                    gpu::dual::Plane { res: &dres.tg.gbuf, stride: 16 },
+                                    gpu::dual::Plane { res: &dres.tg.gbuf_ext, stride: 72 },
+                                ];
+                                let mut rec = Ok(());
+                                hg2.run(|l| {
+                                    rec = dres.xf.record_out(
+                                        l,
+                                        &src[..strides.len()],
+                                        rw as u32,
+                                        y0,
+                                        y1,
+                                    )
+                                })?;
+                                rec?;
+                                let t_hop = Instant::now();
+                                dres.xf.hop(gpu::dual::payload_bytes(
+                                    strides,
+                                    rw as u32,
+                                    y1 - y0,
+                                ))?;
+                                let hop = t_hop.elapsed().as_secs_f32() * 1e3;
+                                hg.wait(v1)?;
+                                let dst = [
+                                    gpu::dual::Plane { res: &tg.accum, stride: 12 },
+                                    gpu::dual::Plane { res: &tg.gbuf, stride: 16 },
+                                    gpu::dual::Plane { res: &tg.gbuf_ext, stride: 72 },
+                                ];
+                                let mut rec = Ok(());
+                                hg.run(|l| {
+                                    rec = dres
+                                        .xf
+                                        .record_in(l, &dst[..strides.len()], rw as u32, y0, y1)
+                                        .and_then(|()| tg.record_feed(l, 0, false))
+                                        .and_then(|()| {
+                                            u.record_eval(
+                                                ngxrr.as_ref(),
+                                                l,
+                                                &fc,
+                                                jit,
+                                                reset,
+                                                seq,
+                                                frame_ms,
+                                                prev_pos,
+                                                &scene.sky_sh,
+                                            )
+                                        })
+                                })?;
+                                rec?;
+                                // The transfer is the secondary's cost, so it
+                                // belongs on its side of the balance.
+                                d.ctl.update(pm, sm + hop, pm.max(sm + hop));
+                                d.ctl.anti_windup(d.rows, 1u32 << d.depth);
+                                Ok(())
+                            })()
+                        }
+                        (CineArm::Wave(tg), None) => {
                             tg.write_cb(0, &p);
                             let mut rec = Ok(());
                             hg.run(|l| {
@@ -11783,7 +11937,7 @@ fn run_cinematic_gpu(
                             })
                             .and(rec)
                         }
-                        CineArm::Dxr(dg) => {
+                        (CineArm::Dxr(dg), _) => {
                             dg.write_cb(0, &p);
                             let mut rec = Ok(());
                             hg.run(|l| {
@@ -11827,14 +11981,7 @@ fn run_cinematic_gpu(
             for f in 0..frames {
                 let fs = cine_frame_state(scene, shot, attractors, cine, f, &mut prev_hour);
                 cine_push_sky(armv, scene, &fs, prev_hour);
-                // The secondary carries its OWN constant buffer, so a moved
-                // hour has to reach it too — a sky pushed to one device only
-                // would seam the frame exactly along the split.
-                if let Some(r) = dual.as_mut().and_then(|d| d.res.as_mut()) {
-                    if fs.hour.is_some() && prev_hour.is_some() {
-                        r.tg.refresh_sky(scene);
-                    }
-                }
+                cine_push_sky_dual(dual.as_mut(), scene, &fs, prev_hour);
                 let basis = fs.cam.basis(rw, rh);
                 // THE BALANCER TICK, once per output frame — a split that moved
                 // between sub-frames would leave rows accumulated by two
@@ -16383,6 +16530,9 @@ fn run_window(req: SceneRequest, opts: &Opts, file_settings: settings::Settings)
         peak_nits: opts.hdr_peak,
         quin: opts.quin,
         quin_anchor: opts.quin_anchor,
+        dual_gpu: opts.dual_gpu,
+        dual_depth: opts.dual_gpu_depth,
+        dual_auto: opts.dual_gpu_auto,
     };
     let mut gpu = gpu::GpuContext::new(sdl_hwnd(&window), W as u32, H as u32, &gopts)
         .expect("GPU init failed");
@@ -18568,6 +18718,13 @@ fn session(
                 match presented {
                     Ok(()) => {
                         last_ms = t.elapsed().as_secs_f64() * 1000.0;
+                        // --dual-gpu: close the balancer's loop with the
+                        // frame's MEASURED total. It cannot live inside the
+                        // presenter — the total is not known until the frame
+                        // has presented — and it must be the same quantity a
+                        // SOLO baseline frame reports, which is why both come
+                        // off this one clock.
+                        gpu.dual_frame_cost(last_ms as f32);
                         // The sway clock pairs with the camera (PrevPose):
                         // this frame's FrameParams traced at cloud_time, and
                         // cloud_time has not advanced since.
@@ -18645,6 +18802,10 @@ fn session(
                         gpu.invalidate_replay(); // recorded-but-aborted producing frame
                         gpu.invalidate_sway(); // the ring build never executed either
                         eprintln!("gpu: present failed: {e}");
+                    } else {
+                        // --dual-gpu: the balancer's tick. See the upscaler
+                        // arm above — the frame's total is only knowable here.
+                        gpu.dual_frame_cost(t.elapsed().as_secs_f64() as f32 * 1000.0);
                     }
                     // Moving frames stay at frame 0: every one is a fresh
                     // store, and the first still frame then re-stores at full
@@ -18758,13 +18919,21 @@ fn session(
                 } else {
                     format!(" | {spp} spp")
                 };
+                // --dual-gpu: the live share, so a session can be seen using
+                // its secondary (or having decided not to) without reading a
+                // log. `0/8` is a correct, deliberate state.
+                let dual_txt = match gpu.dual_status() {
+                    Some((rows, side)) => format!(" | dual {rows}/{side}"),
+                    None => String::new(),
+                };
                 let _ = window.set_title(&format!(
-                    "frustracer | {} | GPU {} | {} | quality {}{} | {}",
+                    "frustracer | {} | GPU {} | {} | quality {}{}{} | {}",
                     fps_title(fps, gpu.fg_display_mult()),
                     if hybrid { "hybrid" } else { "plain" },
                     mode,
                     preset,
                     spp_txt,
+                    dual_txt,
                     tod_hhmm(cur_tod),
                 ));
             }

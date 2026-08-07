@@ -5660,6 +5660,9 @@ pub struct TraceGpu {
     /// Allocated whenever `gbuf` is, but WRITTEN only under FLAG_GBUF_EXT —
     /// see that flag for why the split exists and what it measured.
     pub gbuf_ext: ID3D12Resource,
+    /// See `force_fsr_sig` — the `--dual-gpu` secondary's only way to store the
+    /// signal lanes its partner's feed will read.
+    force_fsr_sig: std::cell::Cell<bool>,
     /// Test hook — see `force_gbuf_ext`. `Cell` because the record/write
     /// methods take `&self` (the `last_struct` precedent).
     force_gbuf_ext: std::cell::Cell<bool>,
@@ -6387,6 +6390,7 @@ impl TraceGpu {
             gbuf,
             gbuf_ext,
             force_gbuf_ext: std::cell::Cell::new(false),
+            force_fsr_sig: std::cell::Cell::new(false),
             gbuf_full,
             uav_heap,
             tex_table,
@@ -6446,8 +6450,8 @@ impl TraceGpu {
     /// --quinlight, FSR4-RR can be one engine among several — one subscriber is
     /// enough to arm FLAG_FSR_SIG, and the capture is assignment-only, so the
     /// other engines' frames stay bit-identical).
-    fn fsr_sig(&self) -> bool {
-        self.feed.iter().any(|(k, _)| matches!(k, FeedKind::FsrRr))
+    pub fn fsr_sig(&self) -> bool {
+        self.force_fsr_sig.get() || self.feed.iter().any(|(k, _)| matches!(k, FeedKind::FsrRr))
     }
 
     /// Whether ANY consumer reads the pack's guide/signal half this frame.
@@ -6457,20 +6461,58 @@ impl TraceGpu {
     ///
     /// XeSS and FSR 3.1 alone answer FALSE, which is the whole win: their
     /// sessions store 16 B/px instead of 88.
-    fn gbuf_ext_needed(&self) -> bool {
+    ///
+    /// PUBLIC for `--dual-gpu`, which must copy exactly the lanes the PRIMARY's
+    /// feed will read: the secondary traced its band's pack on its own device,
+    /// so a fed frame carries the pack across as well as `accum`. Copying the
+    /// ext half unconditionally would be 72 B/px of waste on the link that is
+    /// already the binding constraint; omitting it when a guide-consuming feed
+    /// is wired hands the engine the primary's stale normals for those rows.
+    /// Whether the pack buffers are FULL-SIZE (`rw*rh` strided) rather than the
+    /// single-element dummies a plain session allocates.
+    ///
+    /// PUBLIC for `--dual-gpu`, and it is a memory-safety read there rather
+    /// than an optimization: a plain (`--no-upscale`) session's `gbuf` is
+    /// GBUF_STRIDE bytes TOTAL, so copying a band into it is an out-of-bounds
+    /// `CopyBufferRegion`. That does not fault at record time — the command is
+    /// simply invalid and the whole list fails to Close, which surfaces as
+    /// `list Close: The parameter is incorrect` and then a permanently broken
+    /// allocator. Measured exactly that way.
+    pub fn pack_full(&self) -> bool {
+        self.gbuf_full
+    }
+
+    pub fn gbuf_ext_needed(&self) -> bool {
         self.force_gbuf_ext.get()
             || self.nppd.is_some()
             || self.feed.iter().any(|(k, _)| matches!(k, FeedKind::Rr | FeedKind::FsrRr))
     }
 
     /// Force the guide/signal half to be stored even with no guide-consuming
-    /// feed wired. For the `--check-gpu`/`--check-dxr` pack gates ONLY: their
-    /// consumer is a CPU READBACK, not a feed kernel, and they trace their
-    /// coverage frames before any `wire_feed` call — so without this the
-    /// normals/albedo they gate would be unwritten. Never set in a session;
-    /// production sessions derive the flag from what is actually wired.
+    /// feed wired.
+    ///
+    /// TWO legitimate consumers, and neither derives the flag the normal way
+    /// because neither owns the feed that would set it. (1) The
+    /// `--check-gpu`/`--check-dxr` pack gates: their consumer is a CPU
+    /// READBACK, and they trace their coverage frames before any `wire_feed`
+    /// call, so without this the normals/albedo they gate would be unwritten.
+    /// (2) `--dual-gpu`'s SECONDARY tracer: its feed list is empty by
+    /// construction — the upscaler lives on the primary — so it must be told
+    /// to store the same pack half the PRIMARY's feed will read off its band
+    /// after the transfer. Both mirror a flag that is a property of the
+    /// CONSUMER, which in these two cases is not this tracer.
     pub fn force_gbuf_ext(&self, on: bool) {
         self.force_gbuf_ext.set(on);
+    }
+
+    /// The `fsr_sig` twin of `force_gbuf_ext`, and it exists for the same
+    /// reason: an FSR4-RR session's pack carries the demodulated dd/ds/ao/ind_s
+    /// lanes, `--dual-gpu`'s secondary has no FSR feed of its own to derive
+    /// that from, and a band transferred without them hands the denoiser zeros
+    /// for every signal in the secondary's rows — which reads as a black band
+    /// through the composite, not as a subtle error.
+    pub fn force_fsr_sig(&self, on: bool) {
+        self.force_fsr_sig.set(on);
     }
 
     /// Bind the shared root signature + everything every kernel might read.

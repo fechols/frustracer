@@ -120,6 +120,18 @@ pub struct GpuOptions {
     /// the prebuilt drop ships it in the FSR sample dir, NOT next to the
     /// loader the default --ffx-path points at).
     pub fg_dir: String,
+    /// `--dual-gpu N`: hand the second adapter N of the level-`dual_depth` tile
+    /// rows. None = single-GPU, and every dual code path is then structurally
+    /// unreachable. Armed lazily by `init_trace` (it needs the scene), and a
+    /// share the balancer drives to zero is the pre-feature path exactly.
+    pub dual_gpu: Option<u32>,
+    /// `--dual-gpu-depth K`: the quadtree level the split happens at, so the
+    /// share granularity is 1/2^K. Trades balance resolution against duplicated
+    /// ladder work (levels 0..K run on BOTH devices).
+    pub dual_depth: u32,
+    /// `--dual-gpu-auto`: let the balancer move the share rather than pinning
+    /// it where the flag put it.
+    pub dual_auto: bool,
 }
 
 /// Which chain level a session actually wired — derived from the live state
@@ -575,7 +587,74 @@ enum WvSrc {
     Dxr,
 }
 
+/// `--dual-gpu`, interactive: the second adapter, its own scene upload and
+/// tracer, the band transfer, and the balancer.
+///
+/// DECLARED BEFORE `d3d` IN `GpuContext` AND THAT IS LOAD-BEARING. Fields drop
+/// in declaration order, and this holds two things that must die before the
+/// primary device does: the transfer's UPLOAD buffer, which is a primary-device
+/// resource, and the secondary's `HeadlessGpu`, whose own Drop drains its queue
+/// (so no separate wait-idle is needed here — unlike the xess/fsr/fg contexts,
+/// which is why this sits outside that guard rather than inside it).
+struct DualState {
+    hg: trace::HeadlessGpu,
+    /// The secondary's OWN scene core. `ensure_scene_gpu`'s Rc is device-bound
+    /// and cannot cross, so the scene is uploaded twice — the dominant arming
+    /// cost, and the known accept.
+    core: std::rc::Rc<trace::SceneGpu>,
+    tg: trace::TraceGpu,
+    xf: dual::BandTransfer,
+    depth: u32,
+    auto: bool,
+    ctl: dual::ShareCtl,
+    lim: dual::ShareLimiter,
+    /// Rows in force. 0 = the secondary sits the frame out and the primary runs
+    /// `TileSplit::ALL` — the pre-feature path, byte for byte.
+    rows: u32,
+    /// This frame is a SOLO baseline (zero share, so its cost measures the
+    /// no-split path). Cleared once the presenter records it.
+    solo: bool,
+    /// What the band must carry, both properties of the PRIMARY and both
+    /// resolved per frame (`wire_feed_add` can run after construction):
+    /// whether it has a full-size pack, and whether its feed reads the guide
+    /// half. `pack` false is a plain session, whose pack buffers are dummies.
+    pack: bool,
+    ext: bool,
+    /// The previous frame's secondary + transfer wall time, fed to the balancer
+    /// on the NEXT frame: a presenter records the merge and only then knows
+    /// them, and the frame's own total is not available until it presents.
+    last_sec_ms: f32,
+    /// Rolling report state — a dual session that silently does nothing is
+    /// indistinguishable from one that never armed.
+    adopts: u64,
+    solos: u64,
+    said: bool,
+}
+
 pub struct GpuContext {
+    /// `--dual-gpu`. FIRST FIELD deliberately — see `DualState`.
+    dual: Option<DualState>,
+    /// The requested share, kept because `dual` is built lazily at the first
+    /// `init_trace` (which has the scene). Cleared on a build failure so a
+    /// SPACE re-entry does not retry a whole second scene upload per keypress —
+    /// the `trace_failed` latch, owned here rather than in main.rs because this
+    /// is where the failure is seen.
+    dual_want: Option<u32>,
+    dual_depth: u32,
+    dual_auto: bool,
+    /// What survives a resize: the secondary's device and its SCENE core (both
+    /// window-independent, and the scene upload is the expensive one), plus the
+    /// balancer's converged state — a window resize is not a reason to re-learn
+    /// which adapter pays. Also declared ahead of `d3d`, for the same reason
+    /// `dual` is.
+    #[allow(clippy::type_complexity)]
+    dual_keep: Option<(
+        trace::HeadlessGpu,
+        std::rc::Rc<trace::SceneGpu>,
+        dual::ShareCtl,
+        dual::ShareLimiter,
+        u32,
+    )>,
     d3d: D3d,
     passes: tonemap::Passes,
     /// Glare. Always built (never Option): the tonemap PS declares its halo SRV
@@ -1418,6 +1497,13 @@ impl GpuContext {
         });
 
         Ok(Self {
+            // Armed by `init_trace` — it needs the scene, and a session that
+            // never enters the wavefront tracer must not pay a second upload.
+            dual: None,
+            dual_want: opts.dual_gpu,
+            dual_depth: opts.dual_depth,
+            dual_auto: opts.dual_auto,
+            dual_keep: None,
             ngxrr,
             rr_feature,
             d3d,
@@ -1735,6 +1821,12 @@ impl GpuContext {
         }
         self.trace = None;
         self.dxr = None;
+        // --dual-gpu: the secondary's TRACER and its staging are window-bound
+        // and go with the primary's; its DEVICE and its SCENE CORE survive in
+        // `dual_keep`, so the re-entry re-pays kernel compiles and planes but
+        // NOT the second scene upload — the same bargain `scene_gpu` strikes
+        // one line down, and by far the more expensive of the two to re-pay.
+        self.dual_keep = self.dual.take().map(|d| (d.hg, d.core, d.ctl, d.lim, d.rows));
         // scene_gpu deliberately SURVIVES: the shared core is scene-bound,
         // not window-bound (device+queue live across d3d.resize), so the
         // re-entry's tracer rebuilds skip the scene upload + BLAS build —
@@ -2330,7 +2422,330 @@ impl GpuContext {
         self.trace = Some(tg);
         // The fuse, over whatever engines the chain wired (--quinlight only).
         self.build_quin(dxc)?;
+        // --dual-gpu. Built LAST and never fatal: the session is a working
+        // single-GPU one at this point, and a second adapter that cannot be
+        // opened is a missing optimisation, not a failed session. One loud
+        // line, the `nppd-gpu: unavailable (…)` shape.
+        if let Some(share) = self.dual_want {
+            if self.dual.is_none() {
+                match self.build_dual(dxc, scene, bvh, rw, rh, share, gbuf, debug, bc7_mode) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        eprintln!("dual-gpu: unavailable ({e}) — running single-GPU");
+                        // Latch it off: without this every SPACE re-entry
+                        // retries a full second scene upload + BLAS build.
+                        self.dual_want = None;
+                    }
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// Open the second adapter, upload the scene to it, and build its tracer.
+    ///
+    /// Everything here is device-parameterised already — `from_pick`,
+    /// `SceneGpu::new_uploaded`, `TraceGpu::new` — so this is assembly, not new
+    /// machinery. The staging cap is sized from the FULL screen at the WORST
+    /// stride set, so neither a rebalance nor a wiring change reallocates.
+    #[allow(clippy::too_many_arguments)]
+    fn build_dual(
+        &mut self,
+        dxc: &dxc::Dxc,
+        scene: &crate::scene::Scene,
+        bvh: &crate::bvh::Bvh,
+        rw: u32,
+        rh: u32,
+        share: u32,
+        gbuf: bool,
+        debug: bool,
+        bc7_mode: crate::bc7::Bc7Mode,
+    ) -> Result<()> {
+        let depth = self.dual_depth.clamp(1, trace::MAX_SPLIT_DEPTH);
+        let side = 1u32 << depth;
+        let share = share.min(side - 1);
+        // A resize kept the device, the scene core and the balancer's converged
+        // state; only the window-bound half is rebuilt.
+        let kept = self.dual_keep.take();
+        let resumed = kept.is_some();
+        let (mut hg, core, ctl, lim, rows) = match kept {
+            Some((hg, core, ctl, lim, rows)) => (hg, core, ctl, lim, rows),
+            None => {
+                let f = adapter::create_factory(debug).map_err(|e| format!("factory: {e}"))?;
+                let prim_luid = adapter::luid_of_device(&self.d3d.device);
+                let pick = adapter::enumerate(&f)
+                    .into_iter()
+                    .filter(|a| a.luid != prim_luid)
+                    .reduce(|a, b| if b.vram > a.vram { b } else { a })
+                    .ok_or("no second hardware adapter")?;
+                let mut hg = trace::HeadlessGpu::from_pick(&pick, debug)?;
+                let dev = hg.device.clone();
+                let core = std::rc::Rc::new(trace::SceneGpu::new_uploaded(
+                    &dev, scene, bvh, &mut hg, bc7_mode,
+                )?);
+                (
+                    hg,
+                    core,
+                    dual::ShareCtl::new(
+                        share as f32 / side as f32,
+                        (side - 1) as f32 / side as f32,
+                    ),
+                    dual::ShareLimiter::new(),
+                    share,
+                )
+            }
+        };
+        let dev = hg.device.clone();
+        // The pack matters here in a way it never did for a capture: an
+        // interactive frame is FED, so `record_feed` reads the secondary's rows
+        // of it. The secondary therefore stores one whenever the PRIMARY does —
+        // `gbuf` mirrored, and both forcing hooks mirrored per frame in
+        // `record_trace`, since its own feed list is empty by construction. A
+        // plain session mirrors the dummy instead and only `accum` crosses.
+        let tg = trace::TraceGpu::new(
+            &dev, dxc, scene, bvh, core.clone(), rw, rh, gbuf, false, debug, &mut hg,
+        )?;
+        let xf = dual::BandTransfer::new(
+            &dev,
+            &self.d3d.device,
+            dual::payload_bytes(&dual::MAX_FED_STRIDES, rw, rh),
+        )?;
+        if !resumed {
+            eprintln!(
+                "dual-gpu: secondary \"{}\" at {}/{} rows{} | primary \"{}\"",
+                hg.adapter_name,
+                rows,
+                side,
+                if self.dual_auto { ", balancer driving" } else { ", pinned" },
+                self.adapter_name
+            );
+        }
+        self.dual = Some(DualState {
+            hg,
+            core,
+            tg,
+            xf,
+            depth,
+            auto: self.dual_auto,
+            ctl,
+            lim,
+            rows,
+            solo: false,
+            pack: false,
+            ext: false,
+            last_sec_ms: 0.0,
+            adopts: 0,
+            solos: 0,
+            said: false,
+        });
+        Ok(())
+    }
+
+    /// Record the wavefront trace for this frame — THE ONE SITE every
+    /// wavefront presenter goes through, so `--dual-gpu` reaches all six of
+    /// them with a one-line change each and cannot be half-wired.
+    ///
+    /// Single-GPU (the overwhelmingly common case, and the case a balancer
+    /// that reached zero produces) is the early return: `write_cb` +
+    /// `record_frame`, byte for byte what the presenters used to inline.
+    ///
+    /// THE DUAL SCHEDULE, and why it cannot live in `session()` the way
+    /// `--spin`'s does: a presenter records AND presents in one call, so the
+    /// only place both devices can be in flight together is inside it.
+    ///
+    ///   secondary submit  ->  primary record  ->  d3d.split_frame
+    ///     -> wait(secondary) -> band out -> hop -> record the band IN
+    ///
+    /// `split_frame` is what makes it concurrent rather than serial: it
+    /// executes the primary's trace immediately, so the CPU's wait on the
+    /// secondary overlaps it. Without it the primary would not start until the
+    /// frame's single ExecuteCommandLists at present time, and the two devices
+    /// would run one after the other — a working feature reported as a large
+    /// regression. The band copy then rides the FRESH list, which the same
+    /// queue executes after the trace by FIFO order, so it needs no fence of
+    /// its own; only `hop` does, because it is a CPU memcpy out of the
+    /// secondary's readback.
+    fn record_trace(
+        &mut self,
+        p: &trace::FrameParams,
+        hybrid: bool,
+        slot: usize,
+    ) -> Result<()> {
+        let Self { dual, trace, d3d, .. } = self;
+        let tg = trace.as_ref().ok_or("no wavefront tracer")?;
+        let (rw, rh) = (tg.rw, tg.rh);
+        let Some(d) = dual.as_mut() else {
+            tg.write_cb(slot, p);
+            tg.record_frame(&d3d.list, slot, p, hybrid);
+            return Ok(());
+        };
+        // The secondary must store exactly the pack half the PRIMARY's feed
+        // will read — resolved per frame, because `wire_feed_add` can run after
+        // the secondary was built.
+        // What the band must carry is a property of the PRIMARY: whether it
+        // has a full-size pack at all, and whether its feed reads the guide
+        // half. Both are resolved per frame, because `wire_feed_add` can run
+        // after the secondary was built.
+        d.pack = tg.pack_full();
+        d.ext = d.pack && tg.gbuf_ext_needed();
+        d.tg.force_gbuf_ext(d.ext);
+        d.tg.force_fsr_sig(d.pack && tg.fsr_sig());
+
+        // FREEZE THE SPLIT WHILE THE FRAME IS ACCUMULATING, and this is a
+        // CORRECTNESS rule rather than the "don't disturb replay" performance
+        // one it started as. `accum` is per-device: if a row moves from the
+        // primary to the secondary at accumulated frame 10, the secondary's
+        // accum for that row holds only frames 10..n while `record_resolve`
+        // still divides by n — a dark band, growing darker the later the move.
+        // Upscaler sub-modes never accumulate (every frame stores at frame 0),
+        // so they rebalance freely; the plain sub-mode's still frames do not.
+        // Freezing on `p.replay` instead — the obvious reading — would have
+        // frozen a PARKED upscaler session forever, which is the state a
+        // user leaves a window in.
+        let frozen = p.accumulate && p.frame > 0;
+        let band = Self::dual_arm(d, tg, rw, rh, frozen);
+        let Some((y0, y1)) = band else {
+            tg.write_cb(slot, p);
+            tg.record_frame(&d3d.list, slot, p, hybrid);
+            return Ok(());
+        };
+        let strides = dual::fed_strides(d.pack, d.ext);
+        tg.write_cb(slot, p);
+        {
+            let (hg2, tg2) = (&mut d.hg, &d.tg);
+            tg2.write_cb(0, p);
+            let v2 = hg2.submit(|l| tg2.record_frame(l, 0, p, hybrid))?;
+            tg.record_frame(&d3d.list, slot, p, hybrid);
+            // The primary is now EXECUTING; the wait below overlaps it.
+            d3d.split_frame(slot)?;
+            let t0 = std::time::Instant::now();
+            hg2.wait(v2)?;
+            let src = [
+                dual::Plane { res: &tg2.accum, stride: 12 },
+                dual::Plane { res: &tg2.gbuf, stride: 16 },
+                dual::Plane { res: &tg2.gbuf_ext, stride: 72 },
+            ];
+            let mut rec = Ok(());
+            hg2.run(|l| rec = d.xf.record_out(l, &src[..strides.len()], rw, y0, y1))?;
+            rec?;
+            d.xf.hop(dual::payload_bytes(strides, rw, y1 - y0))?;
+            // Everything the secondary cost us: its trace past the launch point
+            // plus getting its band across. The balancer sees it next frame,
+            // when this frame's own total is finally known.
+            d.last_sec_ms = t0.elapsed().as_secs_f32() * 1e3;
+        }
+        let dst = [
+            dual::Plane { res: &tg.accum, stride: 12 },
+            dual::Plane { res: &tg.gbuf, stride: 16 },
+            dual::Plane { res: &tg.gbuf_ext, stride: 72 },
+        ];
+        d.xf.record_in(&d3d.list, &dst[..strides.len()], rw, y0, y1)?;
+        let _ = rh;
+        Ok(())
+    }
+
+    /// The balancer's tick and the resulting split on both tracers. `None` =
+    /// the secondary sits this frame out, which sets `TileSplit::ALL` on the
+    /// primary: the pre-feature path.
+    ///
+    /// `frozen` holds the current share for this frame — see the call site for
+    /// why it is "the frame is accumulating" and not "the frame is replaying".
+    fn dual_arm(
+        d: &mut DualState,
+        prim: &trace::TraceGpu,
+        rw: u32,
+        rh: u32,
+        frozen: bool,
+    ) -> Option<(u32, u32)> {
+        // EVERY probe is gated on `auto`, not just the adoption. A pinned share
+        // means "do not move it", and the solo probe is not free to run anyway:
+        // it zeroes `rows` for its frame and restores from the LIMITER, which a
+        // pinned session never applied — so the first probe would silently drop
+        // a pinned `--dual-gpu 4` to 0 for the rest of the run.
+        if !frozen && d.auto {
+            let side = 1u32 << d.depth;
+            let shed = d.ctl.losing();
+            let next = dual::quantize_share(d.ctl.share(), side, d.rows);
+            let next = d.lim.apply(next, shed);
+            if next != d.rows {
+                if shed && next < d.rows {
+                    d.ctl.shed_landed();
+                }
+                d.adopts += 1;
+                d.rows = next;
+            }
+            d.solo = d.rows > 0 && d.ctl.solo_frame();
+            if d.solo {
+                d.rows = 0;
+                d.solos += 1;
+            }
+        }
+        let (prim_split, sec_split) = trace::TileSplit::for_share(d.rows, d.depth);
+        prim.set_split(prim_split);
+        if d.rows == 0 {
+            if d.solo {
+                // The probe measured; it did not adopt.
+                d.rows = d.lim.rows();
+            }
+            return None;
+        }
+        let sec_split = sec_split?;
+        let band = sec_split.row_range(rw, rh)?;
+        d.tg.set_split(sec_split);
+        d.said = true;
+        Some(band)
+    }
+
+    /// Close the balancer's loop with the frame's measured total. Called by
+    /// main.rs once the frame has actually presented, because that total is not
+    /// knowable inside a presenter.
+    ///
+    /// A SOLO frame's cost is the no-split baseline; a dual frame's is what the
+    /// split achieved. Both are the same quantity off the same clock, which is
+    /// the whole requirement — see `ShareCtl::solo`.
+    pub fn dual_frame_cost(&mut self, frame_ms: f32) {
+        let Some(d) = self.dual.as_mut() else { return };
+        if d.solo {
+            d.solo = false;
+            d.ctl.solo(frame_ms);
+            return;
+        }
+        if d.last_sec_ms > 0.0 {
+            // prim = the frame minus what the secondary held it up for; sec =
+            // that hold plus the transfer, which `last_sec_ms` already spans.
+            let prim = (frame_ms - d.last_sec_ms).max(0.0);
+            d.ctl.update(prim, d.last_sec_ms, frame_ms);
+            d.ctl.anti_windup(d.rows, 1u32 << d.depth);
+            d.last_sec_ms = 0.0;
+        }
+        self.dual_report();
+    }
+
+    /// The dual verdict for the title bar: `(rows, side)`, or None when the
+    /// session is not dual at all. A `0` there means the balancer measured the
+    /// secondary as not paying and the frame ran the pre-feature path —
+    /// correct, and the one state a silent feature is indistinguishable from.
+    pub fn dual_status(&self) -> Option<(u32, u32)> {
+        self.dual.as_ref().map(|d| (d.rows, 1u32 << d.depth))
+    }
+
+    /// Say the verdict ONCE, the first time the balancer settles at zero after
+    /// having actually rendered a split frame. A dual session that silently
+    /// stops using its secondary looks exactly like one that never armed, and
+    /// those are very different answers.
+    pub fn dual_report(&mut self) {
+        let Some(d) = self.dual.as_mut() else { return };
+        if d.rows == 0 && d.said {
+            d.said = false;
+            eprintln!(
+                "dual-gpu: the balancer settled at 0 of {} rows after {} adoptions and {} solo \
+                 baselines — the secondary does not pay for itself here, and the session is \
+                 running the pre-feature single-GPU path",
+                1u32 << d.depth,
+                d.adopts,
+                d.solos
+            );
+        }
     }
 
     pub fn trace_ready(&self) -> bool {
@@ -2394,6 +2809,12 @@ impl GpuContext {
         self.quin = None;
         self.trace = None;
         self.dxr = None;
+        // --dual-gpu: the secondary's core is scene-bound like the primary's,
+        // so BOTH halves go — device included, since keeping it would strand a
+        // `dual_keep` whose scene core is stale by construction. Its own Drop
+        // drains its queue.
+        self.dual = None;
+        self.dual_keep = None;
         // The shared core is scene-bound too — the next mode entry must
         // re-upload from the edited scene, never serve the stale cache.
         self.scene_gpu = None;
@@ -2410,6 +2831,11 @@ impl GpuContext {
         if let Some(d) = &mut self.dxr {
             d.refresh_sky(scene);
         }
+        // The secondary carries its OWN constant buffer, so a sky pushed to the
+        // primary alone would seam the frame exactly along the split.
+        if let Some(d) = &mut self.dual {
+            d.tg.refresh_sky(scene);
+        }
     }
 
     /// Drop the wavefront tracer's structure-replay key. main.rs calls this on
@@ -2421,6 +2847,11 @@ impl GpuContext {
     pub fn invalidate_replay(&self) {
         if let Some(t) = &self.trace {
             t.invalidate_replay();
+        }
+        // The secondary keeps its own replay key over its own band, and a
+        // present error abandons ITS recorded frame too.
+        if let Some(d) = &self.dual {
+            d.tg.invalidate_replay();
         }
     }
 
@@ -2437,6 +2868,13 @@ impl GpuContext {
             if let Some(sw) = s.sway.as_ref() {
                 sw.invalidate();
             }
+        }
+        // The secondary's core is a SEPARATE upload with its own animated-TLAS
+        // ring, so it needs the same forget — a wavefront-only session already
+        // taught this lesson once (routing through `self.dxr` alone was a
+        // silent no-op).
+        if let Some(sw) = self.dual.as_ref().and_then(|d| d.core.sway.as_ref()) {
+            sw.invalidate();
         }
     }
 
@@ -2769,12 +3207,15 @@ impl GpuContext {
     pub fn present_trace(&mut self, p: &trace::FrameParams, samples: u32, hybrid: bool) -> Result<()> {
         self.waveviz_src.set(WvSrc::Trace);
         crate::zone!("present-trace");
-        let Some(tg) = &self.trace else {
+        if self.trace.is_none() {
             return Err("GPU tracer not initialized".into());
-        };
+        }
         let slot = self.d3d.begin_frame()?;
-        tg.write_cb(slot, p);
-        tg.record_frame(&self.d3d.list, slot, p, hybrid);
+        if let Err(e) = self.record_trace(p, hybrid, slot) {
+            self.d3d.abort_frame();
+            return Err(e);
+        }
+        let tg = self.trace.as_ref().unwrap();
         tg.record_resolve(&self.d3d.list, slot, samples);
         self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_GPU, 1.0);
         self.d3d.end_frame(slot)
@@ -2822,13 +3263,17 @@ impl GpuContext {
         }
         let nppd_on = nppd && self.nppd_gpu.is_some();
         let slot = self.d3d.begin_frame()?;
+        // The trace goes through the ONE site, so --dual-gpu reaches this arm
+        // without the presenter knowing anything about it.
+        if let Err(e) = self.record_trace(p, hybrid, slot) {
+            self.d3d.abort_frame();
+            return Err(e);
+        }
         {
             // Field-split borrows: the recorder reads the tracer, abort needs
             // d3d mutably.
             let d3d = &mut self.d3d;
             let tg = self.trace.as_ref().unwrap();
-            tg.write_cb(slot, p);
-            tg.record_frame(&d3d.list, slot, p, hybrid);
             if nppd_on {
                 // A reset frame zeroes the warped-state input instead of
                 // warping (the graph rewrites the state buffer either way).
@@ -3041,11 +3486,13 @@ impl GpuContext {
             return Err("GPU tracer + quinlight fuse not both initialized".into());
         }
         let slot = self.d3d.begin_frame()?;
+        if let Err(e) = self.record_trace(p, hybrid, slot) {
+            self.d3d.abort_frame();
+            return Err(e);
+        }
         let (rw, rh) = {
             let d3d = &mut self.d3d;
             let tg = self.trace.as_ref().unwrap();
-            tg.write_cb(slot, p);
-            tg.record_frame(&d3d.list, slot, p, hybrid);
             if let Err(e) = tg.record_feed(&d3d.list, slot, false) {
                 d3d.abort_frame();
                 return Err(e);
@@ -3141,8 +3588,16 @@ impl GpuContext {
                     fc.rw, fc.rh, tg.rw, tg.rh
                 ));
             }
-            tg.write_cb(slot, p);
-            tg.record_frame(&d3d.list, slot, p, hybrid);
+        }
+        // The trace goes through the ONE site (`record_trace`), which is what
+        // puts --dual-gpu in every wavefront presenter at once.
+        if let Err(e) = self.record_trace(p, hybrid, slot) {
+            self.d3d.abort_frame();
+            return Err(e);
+        }
+        {
+            let d3d = &mut self.d3d;
+            let tg = self.trace.as_ref().unwrap();
             if let Err(e) = tg.record_feed(&d3d.list, slot, false) {
                 d3d.abort_frame();
                 return Err(e);
@@ -3758,8 +4213,16 @@ impl GpuContext {
                     fc.rw, fc.rh, tg.rw, tg.rh
                 ));
             }
-            tg.write_cb(slot, p);
-            tg.record_frame(&d3d.list, slot, p, hybrid);
+        }
+        // The trace goes through the ONE site (`record_trace`), which is what
+        // puts --dual-gpu in every wavefront presenter at once.
+        if let Err(e) = self.record_trace(p, hybrid, slot) {
+            self.d3d.abort_frame();
+            return Err(e);
+        }
+        {
+            let d3d = &mut self.d3d;
+            let tg = self.trace.as_ref().unwrap();
             if let Err(e) = tg.record_feed(&d3d.list, slot, false) {
                 d3d.abort_frame();
                 return Err(e);
@@ -4323,8 +4786,16 @@ impl GpuContext {
                     fc.rw, fc.rh, tg.rw, tg.rh
                 ));
             }
-            tg.write_cb(slot, p);
-            tg.record_frame(&d3d.list, slot, p, hybrid);
+        }
+        // The trace goes through the ONE site (`record_trace`), which is what
+        // puts --dual-gpu in every wavefront presenter at once.
+        if let Err(e) = self.record_trace(p, hybrid, slot) {
+            self.d3d.abort_frame();
+            return Err(e);
+        }
+        {
+            let d3d = &mut self.d3d;
+            let tg = self.trace.as_ref().unwrap();
             if let Err(e) = tg.record_feed(&d3d.list, slot, false) {
                 d3d.abort_frame();
                 return Err(e);
