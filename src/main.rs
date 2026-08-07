@@ -11922,9 +11922,20 @@ fn run_spin_gpu(
         hg: gpu::trace::HeadlessGpu,
         tg: gpu::trace::TraceGpu,
         xf: gpu::dual::BandTransfer,
-        y0: u32,
-        y1: u32,
-        bytes: usize,
+        depth: u32,
+        auto: bool,
+        ctl: gpu::dual::ShareCtl,
+        lim: gpu::dual::ShareLimiter,
+        /// Rows in force. 0 = the secondary sits this frame out entirely and
+        /// the primary runs `TileSplit::ALL` — the pre-feature path.
+        rows: u32,
+        /// Frames the secondary sat out, and re-probes fired: the balancer's
+        /// honest answer on a bandwidth-starved box is "zero", and a run that
+        /// reports it silently is indistinguishable from one where the
+        /// feature never armed.
+        idle: u64,
+        probes: u64,
+        adopts: u64,
         // Per-phase wall time, accumulated over the TIMED frames only. The
         // balancer needs these separated — its setpoint is "secondary finish +
         // write <= primary finish", which is unknowable from a frame total —
@@ -11944,13 +11955,14 @@ fn run_spin_gpu(
                  no tile ownership yet"
             );
         } else if let Arm::Wave(tg) = &armv {
-            let d = gpu::trace::MAX_SPLIT_DEPTH;
+            let d = opts.dual_gpu_depth.clamp(1, gpu::trace::MAX_SPLIT_DEPTH);
             let side = 1u32 << d;
+            let share = share.min(side - 1);
             // The PRIMARY keeps the top rows, the secondary the bottom `share`
-            // — so `--dual-gpu 1` is the smallest useful offload and 7 the
-            // largest, sweeping the whole curve.
-            let prim = gpu::trace::TileSplit::rows(d, 0, side - share);
-            let sec = prim.complement();
+            // — so `--dual-gpu 1` is the smallest useful offload and `side-1`
+            // the largest, sweeping the whole curve.
+            let (prim, sec) = gpu::trace::TileSplit::for_share(share, d);
+            let sec = sec.expect("share >= 1 yields a secondary");
             match (|| -> Result<Dual, String> {
                 let (y0, y1) = sec
                     .row_range(rw as u32, rh as u32)
@@ -11991,13 +12003,22 @@ fn run_spin_gpu(
                 let bytes = gpu::dual::payload_bytes(&[12], rw as u32, y1 - y0);
                 tg.set_split(prim);
                 t2.set_split(sec);
+                let _ = (y0, y1, bytes);
                 Ok(Dual {
                     hg: h2,
                     tg: t2,
                     xf,
-                    y0,
-                    y1,
-                    bytes,
+                    depth: d,
+                    auto: opts.dual_gpu_auto,
+                    ctl: gpu::dual::ShareCtl::new(
+                        share as f32 / side as f32,
+                        (side - 1) as f32 / side as f32,
+                    ),
+                    lim: gpu::dual::ShareLimiter::new(),
+                    rows: share,
+                    idle: 0,
+                    probes: 0,
+                    adopts: 0,
                     t_sec: 0.0,
                     t_out: 0.0,
                     t_hop: 0.0,
@@ -12006,12 +12027,19 @@ fn run_spin_gpu(
                 })
             })() {
                 Ok(d) => {
+                    let band = gpu::trace::TileSplit::for_share(d.rows, d.depth)
+                        .1
+                        .and_then(|s| s.row_range(rw as u32, rh as u32))
+                        .unwrap_or((0, 0));
                     eprintln!(
-                        "spin dual-gpu: secondary \"{}\" takes {share}/8 rows (y {}..{}, {:.1} MB/frame) | primary \"{}\"",
+                        "spin dual-gpu: secondary \"{}\" starts at {}/{} rows (y {}..{}, {:.1} MB/frame){} | primary \"{}\"",
                         d.hg.adapter_name,
-                        d.y0,
-                        d.y1,
-                        d.bytes as f64 / 1e6,
+                        d.rows,
+                        1u32 << d.depth,
+                        band.0,
+                        band.1,
+                        gpu::dual::payload_bytes(&[12], rw as u32, band.1 - band.0) as f64 / 1e6,
+                        if d.auto { ", balancer driving" } else { ", pinned" },
                         hg.adapter_name
                     );
                     dual = Some(d);
@@ -12064,8 +12092,49 @@ fn run_spin_gpu(
             sway_time: None,
             replay: hybrid && opts.replay && !moving,
         };
+        // THE BALANCER, decided before the match so a zero share can fall
+        // through to the ordinary single-GPU arm rather than a special case.
+        // Under --dual-gpu-auto the share is whatever the controller has
+        // converged to; otherwise it is pinned and the controller only
+        // observes. A re-probe forces one row for a single frame so an idled
+        // secondary can be re-measured.
+        let mut probing = false;
+        if let (Some(d), Arm::Wave(tg)) = (dual.as_mut(), &armv) {
+            let side = 1u32 << d.depth;
+            probing = d.rows == 0 && d.ctl.idle_frame();
+            if probing {
+                d.probes += 1;
+            }
+            if d.auto {
+                let want = gpu::dual::quantize_share(d.ctl.share(), side, d.rows);
+                let next = d.lim.apply(want, false);
+                if next != d.rows {
+                    d.adopts += 1;
+                    d.rows = next;
+                }
+            }
+            // A PROBE BYPASSES THE LIMITER ENTIRELY — it is one frame, not an
+            // adoption. Routing it through `apply` was measured at 0.83 ms/frame
+            // against a 0.40 ms baseline: adopting 1 row resets the dwell, so
+            // every ~10 s probe pinned the secondary on for 90 frames. The
+            // balancer's own state must not move for a measurement.
+            if probing {
+                d.rows = 1;
+            }
+            // ZERO SHARE = THE PRE-FEATURE PATH. `for_share` hands back
+            // TileSplit::ALL (depth 0), which every consumer branches around,
+            // and the match below then takes the plain single-GPU arm — no
+            // secondary submit, no transfer, no extra fence. Arming the
+            // feature costs exactly nothing once the balancer reaches zero.
+            tg.set_split(gpu::trace::TileSplit::for_share(d.rows, d.depth).0);
+            if d.rows == 0 {
+                d.idle += 1;
+            }
+        }
+        let active = dual.as_ref().is_some_and(|d| d.rows > 0);
+
         let t = Instant::now();
-        let r = match (&armv, dual.as_mut()) {
+        let r = match (&armv, dual.as_mut().filter(|_| active)) {
             // THE DUAL SCHEDULE. Both devices are put in flight before either
             // is waited on — driving them through the blocking `run` would
             // serialize them and measure the SUM of two tracers rather than
@@ -12077,13 +12146,28 @@ fn run_spin_gpu(
             // primary's read is exposed in the frame. That is the schedule the
             // balancer's setpoint assumes.
             (Arm::Wave(tg), Some(d)) => {
+                let side = 1u32 << d.depth;
+                // The primary's split was set with the balancer's decision
+                // above; the secondary's follows from the same `for_share`.
+                let sec_split = gpu::trace::TileSplit::for_share(d.rows, d.depth)
+                    .1
+                    .expect("active implies rows > 0");
+                d.tg.set_split(sec_split);
+                let (y0, y1) = match sec_split.row_range(rw as u32, rh as u32) {
+                    Some(v) => v,
+                    None => {
+                        eprintln!("spin dual-gpu: secondary mask is not a row band");
+                        return 1;
+                    }
+                };
+                let bytes = gpu::dual::payload_bytes(&[12], rw as u32, y1 - y0);
                 tg.write_cb(0, &p);
                 d.tg.write_cb(0, &p);
                 let (hg2, tg2, xf) = (&mut d.hg, &d.tg, &d.xf);
                 let v2 = hg2.submit(|l| tg2.record_frame(l, 0, &p, hybrid));
                 let v1 = hg.submit(|l| tg.record_frame(l, 0, &p, hybrid));
-                let (y0, y1, bytes) = (d.y0, d.y1, d.bytes);
                 let mut ph = [0.0f64; 5];
+                let mut prim_early = false;
                 let res = (|| -> Result<(), String> {
                     let (v2, v1) = (v2?, v1?);
                     let a = Instant::now();
@@ -12096,6 +12180,11 @@ fn run_spin_gpu(
                     let c = Instant::now();
                     xf.hop(bytes)?;
                     let e = Instant::now();
+                    // Query BEFORE waiting: this is the balancer's one exact
+                    // signal, and it is unrecoverable afterwards (waiting on a
+                    // signalled fence still costs nanoseconds, so a duration
+                    // test reads "still running" every frame).
+                    prim_early = hg.completed(v1);
                     hg.wait(v1)?;
                     let f = Instant::now();
                     let pi = [gpu::dual::Plane { res: &tg.accum, stride: 12 }];
@@ -12118,6 +12207,27 @@ fn run_spin_gpu(
                     d.t_hop += ph[2];
                     d.t_prim += ph[3];
                     d.t_in += ph[4];
+                }
+                // Close the loop. `phase_times` folds the TRANSFER into the
+                // secondary's cost — omit it and the controller minimises
+                // compute balance instead of the real objective, converging
+                // ~15% high (gated in dual::self_test).
+                if res.is_ok() {
+                    let (pm, sm) = gpu::dual::phase_times(
+                        ph[0] as f32,
+                        ph[1] as f32,
+                        ph[2] as f32,
+                        ph[3] as f32,
+                        prim_early,
+                    );
+                    if probing {
+                        d.ctl.probe(pm, sm, 1.0 / side as f32);
+                        // Restore the balancer's own decision: the probe was a
+                        // measurement, and `lim` never saw it.
+                        d.rows = d.lim.rows();
+                    } else {
+                        d.ctl.update(pm, sm);
+                    }
                 }
                 res
             }
@@ -12173,6 +12283,27 @@ fn run_spin_gpu(
             d.t_in / timed,
             (d.t_sec + d.t_out + d.t_hop + d.t_prim + d.t_in) / timed,
         );
+        // The balancer's verdict, stated rather than implied. Converging to
+        // ZERO is a correct answer — on a box whose secondary link cannot
+        // carry its own output it is THE correct answer — but a silent zero
+        // is indistinguishable from a feature that never armed, so say it.
+        if d.auto {
+            eprintln!(
+                "spin dual-gpu balancer: settled at {} of {} rows (share {:.3}) | {} adoptions | {} idle frames, {} re-probes{}",
+                d.rows,
+                1u32 << d.depth,
+                d.ctl.share(),
+                d.adopts,
+                d.idle,
+                d.probes,
+                if d.rows == 0 {
+                    " — VERDICT: the secondary does not pay for itself here; \
+                     the frame ran the pre-feature single-GPU path"
+                } else {
+                    ""
+                }
+            );
+        }
     }
     // Terminal-structure accounting (wavefront only; the reference kernel and
     // DXR never bind counters). One readback AFTER the loop, so no timed

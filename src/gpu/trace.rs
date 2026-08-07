@@ -1269,6 +1269,19 @@ impl HeadlessGpu {
         Ok(v)
     }
 
+    /// Has this `submit` value already completed? A NON-blocking query.
+    ///
+    /// The dual-GPU balancer's one exact signal. Asking "was `wait` fast?"
+    /// cannot answer it: waiting on an already-signalled fence still burns
+    /// tens of nanoseconds, so a duration test reads as "the primary was
+    /// still running" on essentially every frame — which had the balancer
+    /// growing the secondary's share on a box where it should shrink it to
+    /// zero. Measure the condition, not a proxy for it.
+    pub fn completed(&self, v: u64) -> bool {
+        let done = unsafe { self.fence.GetCompletedValue() };
+        done >= v
+    }
+
     /// Block until a `submit` value completes.
     pub fn wait(&mut self, v: u64) -> Result<()> {
         if unsafe { self.fence.GetCompletedValue() } < v {
@@ -4733,6 +4746,35 @@ impl TileSplit {
         (self.mask >> path) & 1 != 0
     }
 
+    /// The two devices' assignments for a secondary share of `rows` out of
+    /// `2^depth` tile rows: `(primary, secondary)`.
+    ///
+    /// **A share of ZERO returns `(ALL, None)`, and that is the safety
+    /// property the whole feature rests on.** Not `rows(depth, 0, side)` — a
+    /// full mask at a nonzero depth is functionally the same but structurally
+    /// different: `SPLIT_DEPTH != 0` makes `level_finish` run the ownership
+    /// test and `cs_compose` run `split_owns_px` per pixel. `ALL` is depth 0,
+    /// which every consumer branches AROUND, so share 0 is the pre-feature
+    /// renderer instruction-for-instruction.
+    ///
+    /// That is what makes it honest to ship a feature whose correct answer on
+    /// a bandwidth-starved box is "give the secondary nothing": arming it
+    /// costs exactly nothing when the balancer converges to zero. The `None`
+    /// is the other half — the caller must skip the secondary's submit and
+    /// the transfer outright, not hand it an empty mask and pay the schedule.
+    ///
+    /// A share at or above `side` would leave the PRIMARY with nothing, which
+    /// no consumer expects (it still presents), so it is clamped to `side-1`.
+    pub fn for_share(rows: u32, depth: u32) -> (TileSplit, Option<TileSplit>) {
+        if rows == 0 || depth == 0 {
+            return (TileSplit::ALL, None);
+        }
+        let side = 1u32 << depth;
+        let rows = rows.min(side - 1);
+        let prim = TileSplit::rows(depth, 0, side - rows);
+        (prim, Some(prim.complement()))
+    }
+
     /// The CONTIGUOUS pixel row range `[y0, y1)` this assignment owns, or
     /// `None` if it is not a whole-tile-row band.
     ///
@@ -5041,6 +5083,57 @@ pub fn split_self_test() -> std::result::Result<(), String> {
     let partial = TileSplit { mask: 0b0001, depth: 1 };
     if partial.row_range(1920, 1080).is_some() {
         return Err("a partially-owned tile row must return None from row_range".into());
+    }
+
+    // THE ZERO-SHARE IDENTITY — the safety property the whole feature rests
+    // on, and the reason it is honest to ship a split whose correct answer on
+    // a bandwidth-starved box is "give the secondary nothing".
+    //
+    // Share 0 must return the DEPTH-0 unsplit state, not a full mask at a
+    // nonzero depth. The two render the same image, but only depth 0 is the
+    // state every consumer branches AROUND: at any nonzero depth
+    // `level_finish` runs the ownership test and `cs_compose` runs
+    // `split_owns_px` for every pixel. Arming the feature must cost exactly
+    // nothing when the balancer converges to zero.
+    for d in 0..=MAX_SPLIT_DEPTH {
+        let (p, s) = TileSplit::for_share(0, d);
+        if p != TileSplit::ALL || s.is_some() {
+            return Err(format!(
+                "for_share(0, {d}) must be (ALL, None) — a share of zero has to take the \
+                 pre-feature path, not a full mask at depth {d} that still runs the ownership \
+                 test on every tile and every compose pixel"
+            ));
+        }
+    }
+    for d in 1..=MAX_SPLIT_DEPTH {
+        let side = 1u32 << d;
+        for rows in 1..side {
+            let (p, s) = TileSplit::for_share(rows, d);
+            let s = s.ok_or_else(|| format!("for_share({rows}, {d}) dropped the secondary"))?;
+            // The pair must still partition, and the SECONDARY must be the one
+            // that grows with the share — invert this and every safety
+            // property inverts with it (the balancer's "down is safe"
+            // direction would then hand the slow device MORE work).
+            if p.complement() != s {
+                return Err(format!("for_share({rows}, {d}) is not a complementary pair"));
+            }
+            let (y0, y1) = s
+                .row_range(1920, 1080)
+                .ok_or_else(|| format!("for_share({rows}, {d}) secondary is not a row band"))?;
+            let got = ((y1 - y0) as f32 / 1080.0 * side as f32).round() as u32;
+            if got != rows {
+                return Err(format!(
+                    "for_share({rows}, {d}): the secondary got {got}/{side} rows, not {rows} — \
+                     the share is oriented at the wrong device"
+                ));
+            }
+        }
+        // Asking for the whole screen must leave the primary something: it is
+        // the device that presents.
+        let (p, _) = TileSplit::for_share(side, d);
+        if p.mask == 0 {
+            return Err(format!("for_share({side}, {d}) starved the primary"));
+        }
     }
 
     // The unsplit default must answer true everywhere without consulting the

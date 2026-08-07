@@ -277,6 +277,17 @@ pub struct Opts {
     /// Level 3 is `MAX_SPLIT_DEPTH`: 8 rows is the finest the CB's 64-bit mask
     /// expresses, and finer than the balancer could usefully act on.
     pub dual_gpu: Option<u32>,
+    /// `--dual-gpu-auto`: hand the share to the balancer instead of pinning
+    /// it. `dual_gpu`'s value is then the STARTING share, not a fixed one.
+    /// Implies arming, since a balancer with nothing to balance is a no-op.
+    pub dual_gpu_auto: bool,
+    /// `--dual-gpu-depth K`: the quadtree level the split is assigned at,
+    /// 1..=`MAX_SPLIT_DEPTH`. Trades balance granularity against DUPLICATED
+    /// LADDER WORK: levels `0..K` run identically on both devices, so K=3
+    /// gives 8 rows of granularity but duplicates 21 of the tree's 1365 tiles
+    /// — and they are the most expensive ones, being the shallowest. K=1
+    /// duplicates a single tile and offers only a half-and-half split.
+    pub dual_gpu_depth: u32,
     /// A/B lever (--no-ftree disables): route ALL bound queries through the
     /// 8-wide frustum tree lazily collapsed from the ray BVH (ftree.rs) — the
     /// two-tree split. Rays always stay on the binary BVH.
@@ -683,6 +694,8 @@ pub fn defaults() -> Opts {
         bvh_builder: "sah".to_string(),
         blas_split: Some(blas_split::DEFAULT_MAX_PRIMS),
         dual_gpu: None,
+        dual_gpu_auto: false,
+        dual_gpu_depth: 3,
         ftree: true,
         ftree_tiles: false,
         wide_levels: true,
@@ -1285,7 +1298,30 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
                 };
                 opts.dual_gpu = Some(n);
             }
-            "--no-dual-gpu" => opts.dual_gpu = None,
+            "--no-dual-gpu" => {
+                opts.dual_gpu = None;
+                opts.dual_gpu_auto = false;
+            }
+            // Arms if it wasn't already: a balancer with nothing to balance
+            // is a no-op, and silently doing nothing is the failure mode the
+            // loud-lever rule exists to prevent.
+            "--dual-gpu-auto" => {
+                opts.dual_gpu_auto = true;
+                if opts.dual_gpu.is_none() {
+                    opts.dual_gpu = Some(2);
+                }
+            }
+            "--dual-gpu-depth" => {
+                let v = args.next().unwrap_or_default();
+                opts.dual_gpu_depth = v
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|k| (1..=3).contains(k))
+                    .unwrap_or_else(|| {
+                        eprintln!("--dual-gpu-depth: '{v}' is not a split level (1..=3)");
+                        std::process::exit(2);
+                    });
+            }
             // The DXR pipeline's ray-dispatch mode (applied through
             // gpu::dxr::set_inline_mode). DEFAULT 1 = primary TraceRay +
             // inline RayQuery secondaries, which strictly dominates the
@@ -2156,6 +2192,10 @@ pub fn self_test() -> Result<(), String> {
         "--no-foliage-sway",
         "--foliage-amp",
         "2",
+        "--dual-gpu",
+        "3",
+        "--dual-gpu-depth",
+        "2",
     ]);
     let after = lever_snapshot();
     if after != before {
@@ -2167,6 +2207,8 @@ pub fn self_test() -> Result<(), String> {
     // vacuously for a parser that simply ignores every flag.
     let o = &c.opts;
     for (name, took) in [
+        ("dual_gpu", o.dual_gpu == Some(3)),
+        ("dual_gpu_depth", o.dual_gpu_depth == 2),
         ("mips", !o.mips),
         ("aniso", o.aniso == 4),
         ("h2n", !o.h2n),
@@ -2229,6 +2271,21 @@ pub fn self_test() -> Result<(), String> {
     }
     if parse_argv(&["--no-aniso", "--aniso", "8"]).opts.aniso != 8 {
         return Err("--no-aniso --aniso 8 must land on 8".into());
+    }
+    if parse_argv(&["--dual-gpu", "3", "--no-dual-gpu"]).opts.dual_gpu.is_some() {
+        return Err("--dual-gpu 3 --no-dual-gpu must disarm".into());
+    }
+    if parse_argv(&["--dual-gpu-auto", "--no-dual-gpu"]).opts.dual_gpu_auto {
+        return Err("--no-dual-gpu must clear the balancer too, not just the share".into());
+    }
+    // --dual-gpu-auto ARMS: a balancer with nothing to balance is a silent
+    // no-op, which is the failure the loud-lever rule exists to prevent.
+    if parse_argv(&["--dual-gpu-auto"]).opts.dual_gpu.is_none() {
+        return Err("--dual-gpu-auto must arm the split, not sit inert".into());
+    }
+    // ...and it must not overwrite an explicitly chosen starting share.
+    if parse_argv(&["--dual-gpu", "5", "--dual-gpu-auto"]).opts.dual_gpu != Some(5) {
+        return Err("--dual-gpu-auto must keep an explicit starting share".into());
     }
     if parse_argv(&[]).opts.normal_strength != 1.0 {
         return Err("normal_strength must default to 1.0 (the bit-identical off arm)".into());
