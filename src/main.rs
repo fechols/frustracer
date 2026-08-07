@@ -11096,6 +11096,301 @@ fn cine_emit_frame(
     Ok(())
 }
 
+// --- --dual-gpu, the capture path ---------------------------------------
+//
+// THE ONE THING THAT IS DIFFERENT HERE, AND IT IS THE FEATURE'S BEST CASE:
+// a capture's control tick and its transfer are both per OUTPUT frame, not per
+// rendered frame. Each device splats into its OWN band of its own `accum` for
+// all `shot.samples` sub-frames — a band that never leaves the device it was
+// traced on — so ONE `record_out`/`hop`/`record_in` at the end of the output
+// frame merges them. `--spin` pays that transfer every frame; a 32-sample
+// sequence frame pays 1/32 of it, a 256-sample still 1/256. Nothing else in
+// this design divides the payload by anything.
+
+/// Bytes per pixel the capture's band carries: `accum` always, `info` only when
+/// the shot draws the quadtree overlay (whose readback reads it). ONE list, so
+/// the staging cap and the per-frame payload cannot disagree.
+#[cfg(windows)]
+const CINE_DUAL_STRIDES: [u64; 2] = [12, 4];
+
+/// The limiter's dwell in OUTPUT frames. Far shorter than the display-frame
+/// default because the cost it guards — structure replay dropped on both
+/// devices — is ALREADY paid at every output-frame boundary here (the camera
+/// moved). At `SHARE_DWELL` a 120-frame shot would get one adoption, which is a
+/// balancer that cannot balance.
+#[cfg(windows)]
+const CINE_SHARE_DWELL: u32 = 8;
+
+/// `--dual-gpu` state for `--cinematic`: the second adapter, its own scene
+/// upload, and the balancer. `res` is the resolution-bound half, rebuilt
+/// alongside the primary's arm.
+#[cfg(windows)]
+struct CineDual {
+    hg: gpu::trace::HeadlessGpu,
+    core: std::rc::Rc<gpu::trace::SceneGpu>,
+    res: Option<CineDualRes>,
+    depth: u32,
+    auto: bool,
+    ctl: gpu::dual::ShareCtl,
+    lim: gpu::dual::ShareLimiter,
+    rows: u32,
+    adopts: u64,
+    idle: u64,
+    probes: u64,
+    /// Set by `cine_dual_arm` when THIS output frame is a solo baseline — one
+    /// frame at zero share whose cost tells the balancer whether splitting is
+    /// worth anything at all. Cleared by the caller once recorded.
+    solo: bool,
+    solos: u64,
+    /// Wall time per phase, summed over output frames, and the tick count.
+    t_sec: f64,
+    t_out: f64,
+    t_hop: f64,
+    t_prim: f64,
+    t_in: f64,
+    ticks: f64,
+    /// True once a dual output frame has actually run — so the summary can tell
+    /// "the balancer converged to zero" from "the feature never armed", which
+    /// look identical from the outside and are very different answers.
+    ran: bool,
+}
+
+#[cfg(windows)]
+struct CineDualRes {
+    tg: gpu::trace::TraceGpu,
+    xf: gpu::dual::BandTransfer,
+}
+
+/// Open the second adapter and upload the scene to it. `Ok(None)` = not armed
+/// (or armed on an arm that cannot use it); `Err` = armed and genuinely failed,
+/// which the caller degrades from loudly.
+#[cfg(windows)]
+fn cine_dual_open(
+    hg: &mut gpu::trace::HeadlessGpu,
+    scene: &scene::Scene,
+    bvh: &bvh::Bvh,
+    opts: &Opts,
+    use_wave: bool,
+) -> Result<Option<CineDual>, String> {
+    let Some(share) = opts.dual_gpu else {
+        return Ok(None);
+    };
+    if !use_wave {
+        eprintln!(
+            "cinematic dual-gpu: the DXR pipeline has no tile ownership in this arm — \
+             pass --gpu (a GI or overlay shot forces it anyway)"
+        );
+        return Ok(None);
+    }
+    let depth = opts.dual_gpu_depth.clamp(1, gpu::trace::MAX_SPLIT_DEPTH);
+    let side = 1u32 << depth;
+    let share = share.min(side - 1);
+    let f = gpu::adapter::create_factory(opts.gpu_debug).map_err(|e| format!("factory: {e}"))?;
+    let prim_luid = gpu::adapter::luid_of_device(&hg.device);
+    let pick = gpu::adapter::enumerate(&f)
+        .into_iter()
+        .filter(|a| a.luid != prim_luid)
+        .reduce(|a, b| if b.vram > a.vram { b } else { a })
+        .ok_or("no second hardware adapter")?;
+    let mut h2 = gpu::trace::HeadlessGpu::from_pick(&pick, opts.gpu_debug)?;
+    let d2 = h2.device.clone();
+    // The scene is paid for TWICE — VRAM and load time both. That is the known
+    // accept, and it is the dominant arming cost.
+    let core =
+        std::rc::Rc::new(gpu::trace::SceneGpu::new_uploaded(&d2, scene, bvh, &mut h2, opts.bc7)?);
+    eprintln!(
+        "cinematic dual-gpu: secondary \"{}\" starts at {}/{} rows{} | primary \"{}\"",
+        h2.adapter_name,
+        share,
+        side,
+        if opts.dual_gpu_auto { ", balancer driving" } else { ", pinned" },
+        hg.adapter_name
+    );
+    Ok(Some(CineDual {
+        hg: h2,
+        core,
+        res: None,
+        depth,
+        auto: opts.dual_gpu_auto,
+        ctl: gpu::dual::ShareCtl::new(
+            share as f32 / side as f32,
+            (side - 1) as f32 / side as f32,
+        ),
+        lim: gpu::dual::ShareLimiter::with_dwell(CINE_SHARE_DWELL),
+        rows: share,
+        adopts: 0,
+        idle: 0,
+        probes: 0,
+        solo: false,
+        solos: 0,
+        t_sec: 0.0,
+        t_out: 0.0,
+        t_hop: 0.0,
+        t_prim: 0.0,
+        t_in: 0.0,
+        ticks: 0.0,
+        ran: false,
+    }))
+}
+
+/// (Re)build the secondary's resolution-bound half. Called wherever the primary
+/// rebuilds its arm, and with the same free-then-allocate order: at 4K two sets
+/// of window-sized buffers at once is a real VRAM spike.
+///
+/// `gbuf` is deliberately FALSE always: the secondary is used only by the
+/// accumulation arm, which reads no pack. Storing one would be up to 88 B/px of
+/// writes nothing consumes.
+#[cfg(windows)]
+fn cine_dual_res(
+    d: &mut CineDual,
+    prim_dev: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+    dxc: &gpu::dxc::Dxc,
+    scene: &scene::Scene,
+    bvh: &bvh::Bvh,
+    rw: u32,
+    rh: u32,
+    debug: bool,
+) -> Result<(), String> {
+    d.res = None;
+    let dev = d.hg.device.clone();
+    let tg = gpu::trace::TraceGpu::new(
+        &dev,
+        dxc,
+        scene,
+        bvh,
+        d.core.clone(),
+        rw,
+        rh,
+        false,
+        false,
+        debug,
+        &mut d.hg,
+    )?;
+    // Staging is sized from the FULL screen so the balancer can move the seam
+    // without reallocating mid-capture.
+    let xf = gpu::dual::BandTransfer::new(
+        &dev,
+        prim_dev,
+        gpu::dual::payload_bytes(&CINE_DUAL_STRIDES, rw, rh),
+    )?;
+    d.res = Some(CineDualRes { tg, xf });
+    Ok(())
+}
+
+/// The balancer's tick — ONCE per output frame, before its sub-frames, because
+/// a split that moved mid-frame would leave rows accumulated by two different
+/// devices. Sets the split on both tracers and returns `(band, probing)`, or
+/// `None` when the secondary sits this frame out.
+///
+/// A `None` return is the PRE-FEATURE PATH EXACTLY: `for_share(0, _)` hands the
+/// primary `TileSplit::ALL` (depth 0), which every consumer branches around.
+#[cfg(windows)]
+fn cine_dual_arm(
+    d: &mut CineDual,
+    prim: &gpu::trace::TraceGpu,
+    rw: u32,
+    rh: u32,
+) -> Option<((u32, u32), bool)> {
+    let side = 1u32 << d.depth;
+    let probing = d.rows == 0 && d.ctl.idle_frame();
+    if probing {
+        d.probes += 1;
+    }
+    if d.auto {
+        let want = gpu::dual::quantize_share(d.ctl.share(), side, d.rows);
+        // A measured loss to the no-split baseline is the emergency the
+        // limiter's `shed` exists for — it may only ever shrink, so bypassing
+        // the dwell here cannot hand the secondary more work.
+        let shed = d.ctl.losing();
+        let next = d.lim.apply(want, shed);
+        if next != d.rows {
+            if shed && next < d.rows {
+                d.ctl.shed_landed();
+            }
+            d.adopts += 1;
+            d.rows = next;
+        }
+    }
+    // A probe BYPASSES the limiter: it is one measurement, not an adoption.
+    // Routing it through `apply` resets the dwell, which pins the secondary on
+    // for the whole dwell after every probe (measured on --spin at 2x the
+    // baseline frame time).
+    if probing {
+        d.rows = 1;
+    }
+    // The SOLO probe is the mirror: one frame at zero share, so the balancer
+    // has a measured no-split baseline to judge the split against. Without it
+    // it can only find the best SPLIT, which on an interfering box is still
+    // slower than not splitting at all.
+    d.solo = d.rows > 0 && d.ctl.solo_frame();
+    if d.solo {
+        d.rows = 0;
+        d.solos += 1;
+    }
+    let (prim_split, sec_split) = gpu::trace::TileSplit::for_share(d.rows, d.depth);
+    prim.set_split(prim_split);
+    if d.rows == 0 {
+        if d.solo {
+            // Restore the limiter's decision — the probe measured, it did not
+            // adopt, exactly like the idle probe.
+            d.rows = d.lim.rows();
+        } else {
+            d.idle += 1;
+        }
+        return None;
+    }
+    let r = d.res.as_ref()?;
+    let sec_split = sec_split?;
+    let band = sec_split.row_range(rw, rh)?;
+    r.tg.set_split(sec_split);
+    d.ran = true;
+    Some((band, probing))
+}
+
+/// The one band merge per output frame: the secondary's rows out, across, and
+/// into the primary's planes. Returns `(out_ms, hop_ms, in_ms)`.
+#[cfg(windows)]
+fn cine_dual_merge(
+    d: &mut CineDual,
+    hg: &mut gpu::trace::HeadlessGpu,
+    prim: &gpu::trace::TraceGpu,
+    band: (u32, u32),
+    rw: u32,
+    overlay: bool,
+) -> Result<(f64, f64, f64), String> {
+    let (y0, y1) = band;
+    let r = d.res.as_ref().ok_or("dual: no secondary tracer at this resolution")?;
+    // `info` rides along ONLY for an overlay shot, whose emit path reads it
+    // back. Copying 4 B/px of a plane nothing consumes would be a third of the
+    // payload for nothing.
+    let n = if overlay { 2 } else { 1 };
+    let strides = &CINE_DUAL_STRIDES[..n];
+    let src = [
+        gpu::dual::Plane { res: &r.tg.accum, stride: 12 },
+        gpu::dual::Plane { res: &r.tg.info, stride: 4 },
+    ];
+    let dst = [
+        gpu::dual::Plane { res: &prim.accum, stride: 12 },
+        gpu::dual::Plane { res: &prim.info, stride: 4 },
+    ];
+    let a = Instant::now();
+    let mut rec = Ok(());
+    d.hg.run(|l| rec = r.xf.record_out(l, &src[..n], rw, y0, y1))?;
+    rec?;
+    let b = Instant::now();
+    r.xf.hop(gpu::dual::payload_bytes(strides, rw, y1 - y0))?;
+    let c = Instant::now();
+    let mut rec = Ok(());
+    hg.run(|l| rec = r.xf.record_in(l, &dst[..n], rw, y0, y1))?;
+    rec?;
+    let e = Instant::now();
+    Ok((
+        (b - a).as_secs_f64() * 1e3,
+        (c - b).as_secs_f64() * 1e3,
+        (e - c).as_secs_f64() * 1e3,
+    ))
+}
+
 /// The GPU arms of `--cinematic`: the `run_spin_gpu` skeleton (HeadlessGpu +
 /// one shared `SceneGpu` + either tracer), with the per-shot capture loops
 /// (reconstructed through the wired upscaler by default, accumulation on the
@@ -11211,6 +11506,24 @@ fn run_cinematic_gpu(
         hg.adapter_name
     );
 
+    // --dual-gpu: a second adapter takes N of the level-`depth` tile rows.
+    //
+    // A capture is the regime the feature was justified on, and the ACCUMULATION
+    // arm is where its economics actually work: both devices splat into their
+    // OWN band of their own `accum` across all `shot.samples` sub-frames, so the
+    // band only has to cross once per OUTPUT frame. That divides the transfer by
+    // `samples` — 32x on a sequence, 256x on a still — against a `--spin` frame
+    // which pays it every single frame. The reconstruction arm cannot do that
+    // (the engine consumes a whole merged frame per sub-frame) and pays the pack
+    // as well; see the two schedules below.
+    let mut dual = match cine_dual_open(&mut hg, scene, bvh, opts, use_wave) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("cinematic dual-gpu: unavailable ({e}) — capturing single-GPU");
+            None
+        }
+    };
+
     // Kernel/RTPSO compilation is per resolution, so cache the arm and rebuild
     // only when a shot changes it (the `islands` preset is 7 shots at one res).
     // The upscaler session rides the same cache — its contexts and planes are
@@ -11291,6 +11604,19 @@ fn run_cinematic_gpu(
                 eprintln!("cinematic: no upscaler level came up — accumulation fallback");
             }
             built = Some(((rw, rh), a, up));
+            // The secondary's resolution-bound half follows the primary's, and
+            // a failure here degrades the CAPTURE to single-GPU rather than
+            // ending it — the shot still gets rendered, just on one adapter.
+            if let Some(d) = dual.as_mut() {
+                if let Err(e) =
+                    cine_dual_res(d, &dev, &dxc, scene, bvh, rw as u32, rh as u32, opts.gpu_debug)
+                {
+                    eprintln!(
+                        "cinematic dual-gpu: secondary tracer at {rw}x{rh} failed ({e}) — \
+                         this resolution captures single-GPU"
+                    );
+                }
+            }
         }
         let (_, armv, upv) = built.as_mut().expect("just built");
 
@@ -11329,6 +11655,27 @@ fn run_cinematic_gpu(
         };
 
         if let Some(u) = up {
+            // THE RECONSTRUCTION ARM DOES NOT SPLIT, and the reason is a
+            // different payload rather than missing plumbing. Its engine
+            // consumes a whole merged frame every SUB-frame, so the band would
+            // cross `shot.samples` times instead of once — and it would have to
+            // carry the G-BUFFER PACK as well as `accum`, because `record_feed`
+            // reads the secondary's rows of it: 28 B/px with a XeSS/FSR3 feed,
+            // 100 B/px with RR or FSR4-RR, against the accumulation arm's 12.
+            // On top of that the secondary would have to be told to store a
+            // pack no feed of its own consumes (`force_gbuf_ext`, plus a
+            // FLAG_FSR_SIG equivalent that has no forcing hook at all).
+            // Buildable, differently shaped, and pointless to guess at before a
+            // platform exists that could measure it.
+            if dual.is_some() {
+                eprintln!(
+                    "cinematic dual-gpu: \"{}\" reconstructs through {} — that arm needs the \
+                     pack across too (28-100 B/px per SUB-frame vs 12 once per output frame), \
+                     so this shot captures single-GPU; --no-upscale or a GI shot takes the \
+                     accumulation arm",
+                    shot.name, u.name
+                );
+            }
             // === Reconstructed capture (the default): every sub-frame is a
             // fresh jittered 1-spp-contract frame with real MVs, fed through
             // the wired engine; the output frame is the engine's RECONSTRUCTED
@@ -11480,7 +11827,29 @@ fn run_cinematic_gpu(
             for f in 0..frames {
                 let fs = cine_frame_state(scene, shot, attractors, cine, f, &mut prev_hour);
                 cine_push_sky(armv, scene, &fs, prev_hour);
+                // The secondary carries its OWN constant buffer, so a moved
+                // hour has to reach it too — a sky pushed to one device only
+                // would seam the frame exactly along the split.
+                if let Some(r) = dual.as_mut().and_then(|d| d.res.as_mut()) {
+                    if fs.hour.is_some() && prev_hour.is_some() {
+                        r.tg.refresh_sky(scene);
+                    }
+                }
                 let basis = fs.cam.basis(rw, rh);
+                // THE BALANCER TICK, once per output frame — a split that moved
+                // between sub-frames would leave rows accumulated by two
+                // different devices. `None` means the secondary sits this frame
+                // out and the primary runs `TileSplit::ALL`: the pre-feature
+                // path, byte for byte.
+                let band = match (&*armv, dual.as_mut()) {
+                    (CineArm::Wave(tg), Some(d)) => cine_dual_arm(d, tg, rw as u32, rh as u32),
+                    _ => None,
+                };
+                let (mut t_sec, mut t_prim) = (0.0f64, 0.0f64);
+                // The tick's wall time, measured the SAME way on a dual frame
+                // and on a solo baseline frame — the two are compared directly,
+                // so they must be the same quantity off the same clock.
+                let t_tick = Instant::now();
                 for k in 0..shot.samples {
                     let p = gpu::trace::FrameParams {
                         cam: basis,
@@ -11511,12 +11880,51 @@ fn run_cinematic_gpu(
                         // DXR has no quadtree to persist.
                         replay: opts.replay && use_wave,
                     };
-                    let r = match armv {
-                        CineArm::Wave(tg) => {
+                    let r = match (&*armv, dual.as_mut().filter(|_| band.is_some())) {
+                        // THE DUAL SUB-FRAME. Both devices go in flight before
+                        // either is waited on; driving them through the blocking
+                        // `run` would serialise them and measure the SUM of two
+                        // tracers instead of the max. NO TRANSFER HERE — each
+                        // device splats into its own band of its own `accum`
+                        // and the single merge happens after the loop.
+                        (CineArm::Wave(tg), Some(d)) => {
+                            tg.write_cb(0, &p);
+                            let (hg2, dres) = (&mut d.hg, d.res.as_ref());
+                            let Some(dres) = dres else {
+                                eprintln!("cinematic: dual armed with no secondary tracer");
+                                return Ok(1);
+                            };
+                            dres.tg.write_cb(0, &p);
+                            let v2 = hg2.submit(|l| dres.tg.record_frame(l, 0, &p, true));
+                            let v1 = hg.submit(|l| tg.record_frame(l, 0, &p, true));
+                            (|| -> Result<(), String> {
+                                let (v2, v1) = (v2?, v1?);
+                                // BOTH sides measured, not one inferred from
+                                // the other. `--spin` can infer because its
+                                // transfer is a large fraction of the wait; a
+                                // capture amortises the transfer over
+                                // `shot.samples`, so the inferred signal drops
+                                // inside the deadband and the balancer goes
+                                // blind (measured: 62 ms of imbalance producing
+                                // |err| 0.002 and zero adoptions). The thread
+                                // is blocked here either way, so polling both
+                                // fences costs no wall clock.
+                                let (pm, sm) = gpu::dual::join_poll(
+                                    || hg.completed(v1),
+                                    || hg2.completed(v2),
+                                );
+                                hg.wait(v1)?;
+                                hg2.wait(v2)?;
+                                t_prim += pm as f64;
+                                t_sec += sm as f64;
+                                Ok(())
+                            })()
+                        }
+                        (CineArm::Wave(tg), None) => {
                             tg.write_cb(0, &p);
                             hg.run(|l| tg.record_frame(l, 0, &p, true))
                         }
-                        CineArm::Dxr(dg) => {
+                        (CineArm::Dxr(dg), _) => {
                             dg.write_cb(0, &p);
                             let mut rec = Ok(());
                             hg.run(|l| rec = dg.record_frame(l, 0)).and(rec)
@@ -11527,7 +11935,66 @@ fn run_cinematic_gpu(
                         return Ok(1);
                     }
                 }
-                let acc_res = match armv {
+                // THE ONE MERGE. Both bands hold `shot.samples` sub-frames of
+                // accumulation, so this crosses PCIe once per OUTPUT frame
+                // rather than once per rendered frame — the whole reason a
+                // capture is the feature's best case.
+                // A SOLO baseline frame ran single-GPU by construction, so its
+                // whole cost is right here — this is the number the balancer
+                // judges every split against.
+                if let Some(d) = dual.as_mut() {
+                    if d.solo {
+                        d.solo = false;
+                        d.ctl.solo(t_tick.elapsed().as_secs_f32() * 1e3);
+                    }
+                }
+                if let (CineArm::Wave(tg), Some(d), Some((bnd, probing))) =
+                    (&*armv, dual.as_mut(), band)
+                {
+                    match cine_dual_merge(d, &mut hg, tg, bnd, rw as u32, shot.overlay) {
+                        Ok((out, hop, tin)) => {
+                            d.t_sec += t_sec;
+                            d.t_out += out;
+                            d.t_hop += hop;
+                            d.t_prim += t_prim;
+                            d.t_in += tin;
+                            d.ticks += 1.0;
+                            // Close the loop. Both times are MEASURED (see the
+                            // sub-frame join); the transfer is folded into the
+                            // secondary's cost because it is work the chosen
+                            // share buys — omit it and the controller balances
+                            // compute rather than the real objective and
+                            // converges high.
+                            let (pm, sm) = (t_prim as f32, (t_sec + out + hop) as f32);
+                            if probing {
+                                d.ctl.probe(pm, sm, 1.0 / (1u32 << d.depth) as f32);
+                                // The probe was a measurement; the limiter never
+                                // saw it, so restore its own decision.
+                                d.rows = d.lim.rows();
+                            } else {
+                                // The tick's wall time INCLUDES the merge, and
+                                // must — it is what a solo frame is compared
+                                // against.
+                                d.ctl.update(
+                                    pm,
+                                    sm,
+                                    t_tick.elapsed().as_secs_f32() * 1e3,
+                                );
+                                // Anti-windup: the limiter holds the row count
+                                // for a whole dwell, so without this the
+                                // estimate integrates the SAME evidence every
+                                // tick and overshoots the balance point before
+                                // it is ever allowed to act.
+                                d.ctl.anti_windup(d.rows, 1u32 << d.depth);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("cinematic: frame {f} band merge failed: {e}");
+                            return Ok(1);
+                        }
+                    }
+                }
+                let acc_res = match &*armv {
                     CineArm::Wave(tg) => &tg.accum,
                     CineArm::Dxr(dg) => &dg.accum,
                 };
@@ -11545,6 +12012,47 @@ fn run_cinematic_gpu(
         }
         cine_finish(&dir, shot, t_shot);
         cine_encode(&dir, shot, cine);
+    }
+    if let Some(d) = &dual {
+        if d.ticks > 0.0 {
+            // sec-wait is how long the secondary ran PAST the point both were
+            // launched, summed over an output frame's sub-frames; prim-wait is
+            // the primary's remainder after that. band-* are the ONE crossing.
+            eprintln!(
+                "cinematic dual-gpu phases (ms/output frame): sec-wait {:.2} | prim-wait {:.2} \
+                 | band-out {:.2} | hop {:.2} | band-in {:.2} | transfer-sum {:.2}",
+                d.t_sec / d.ticks,
+                d.t_prim / d.ticks,
+                d.t_out / d.ticks,
+                d.t_hop / d.ticks,
+                d.t_in / d.ticks,
+                (d.t_out + d.t_hop + d.t_in) / d.ticks,
+            );
+        }
+        // State the verdict rather than implying it. Converging to ZERO is a
+        // correct answer — on a box whose secondary link cannot carry its own
+        // output it is THE correct answer — but a silent zero is
+        // indistinguishable from a feature that never armed.
+        eprintln!(
+            "cinematic dual-gpu: settled at {} of {} rows (share {:.3}) | {} adoptions | \
+             {} idle output frames, {} re-probes, {} solo baselines{}",
+            d.rows,
+            1u32 << d.depth,
+            d.ctl.share(),
+            d.adopts,
+            d.idle,
+            d.probes,
+            d.solos,
+            if d.rows == 0 && d.ran {
+                " — VERDICT: the secondary does not pay for itself here; the capture ran \
+                 the single-GPU path"
+            } else if !d.ran {
+                " — the secondary never rendered an output frame (every shot took the \
+                 reconstruction arm?)"
+            } else {
+                ""
+            }
+        );
     }
     Ok(0)
 }
@@ -12005,6 +12513,11 @@ fn run_spin_gpu(
         idle: u64,
         probes: u64,
         adopts: u64,
+        /// This frame is a SOLO baseline — zero share, so its cost measures the
+        /// no-split path the balancer judges every split against. Cleared once
+        /// recorded.
+        solo: bool,
+        solos: u64,
         // Per-phase wall time, accumulated over the TIMED frames only. The
         // balancer needs these separated — its setpoint is "secondary finish +
         // write <= primary finish", which is unknowable from a frame total —
@@ -12088,6 +12601,8 @@ fn run_spin_gpu(
                     idle: 0,
                     probes: 0,
                     adopts: 0,
+                    solo: false,
+                    solos: 0,
                     t_sec: 0.0,
                     t_out: 0.0,
                     t_hop: 0.0,
@@ -12176,8 +12691,17 @@ fn run_spin_gpu(
             }
             if d.auto {
                 let want = gpu::dual::quantize_share(d.ctl.share(), side, d.rows);
-                let next = d.lim.apply(want, false);
+                // A measured loss to the no-split baseline is the emergency the
+                // limiter's `shed` exists for — it may only ever shrink, so
+                // bypassing the dwell cannot hand the secondary more work.
+                // Without it the walk down costs one dwell per row: 4 x
+                // SHARE_DWELL = 360 frames here.
+                let shed = d.ctl.losing();
+                let next = d.lim.apply(want, shed);
                 if next != d.rows {
+                    if shed && next < d.rows {
+                        d.ctl.shed_landed();
+                    }
                     d.adopts += 1;
                     d.rows = next;
                 }
@@ -12190,13 +12714,23 @@ fn run_spin_gpu(
             if probing {
                 d.rows = 1;
             }
+            // The SOLO probe is the mirror of it: one frame at ZERO share, so
+            // the balancer has a measured no-split baseline. Equalising prim
+            // and sec only finds the best SPLIT; on a box where the two devices
+            // interfere, every split can still be slower than not splitting,
+            // and nothing else would ever tell the controller so.
+            d.solo = d.rows > 0 && d.ctl.solo_frame();
+            if d.solo {
+                d.rows = 0;
+                d.solos += 1;
+            }
             // ZERO SHARE = THE PRE-FEATURE PATH. `for_share` hands back
             // TileSplit::ALL (depth 0), which every consumer branches around,
             // and the match below then takes the plain single-GPU arm — no
             // secondary submit, no transfer, no extra fence. Arming the
             // feature costs exactly nothing once the balancer reaches zero.
             tg.set_split(gpu::trace::TileSplit::for_share(d.rows, d.depth).0);
-            if d.rows == 0 {
+            if d.rows == 0 && !d.solo {
                 d.idle += 1;
             }
         }
@@ -12295,7 +12829,14 @@ fn run_spin_gpu(
                         // measurement, and `lim` never saw it.
                         d.rows = d.lim.rows();
                     } else {
-                        d.ctl.update(pm, sm);
+                        // The wall time here covers everything a solo frame's
+                        // does — trace, transfer, merge — so the two are
+                        // directly comparable.
+                        d.ctl.update(pm, sm, t.elapsed().as_secs_f32() * 1e3);
+                        // Anti-windup — see ShareCtl. Without it the estimate
+                        // integrates one-sidedly for the whole dwell and adopts
+                        // a row count whose effect it never observed.
+                        d.ctl.anti_windup(d.rows, side);
                     }
                 }
                 res
@@ -12315,6 +12856,15 @@ fn run_spin_gpu(
             return 1;
         }
         let ms = t.elapsed().as_secs_f64() * 1000.0;
+        // A solo baseline frame ran the pre-feature path by construction, so
+        // its whole cost is `ms` — the number every split is judged against.
+        if let Some(d) = dual.as_mut() {
+            if d.solo {
+                d.solo = false;
+                d.rows = d.lim.rows();
+                d.ctl.solo(ms as f32);
+            }
+        }
         prof::frame_mark();
         if idx >= warmup {
             total_ms += ms;
@@ -12358,13 +12908,14 @@ fn run_spin_gpu(
         // is indistinguishable from a feature that never armed, so say it.
         if d.auto {
             eprintln!(
-                "spin dual-gpu balancer: settled at {} of {} rows (share {:.3}) | {} adoptions | {} idle frames, {} re-probes{}",
+                "spin dual-gpu balancer: settled at {} of {} rows (share {:.3}) | {} adoptions | {} idle frames, {} re-probes, {} solo baselines{}",
                 d.rows,
                 1u32 << d.depth,
                 d.ctl.share(),
                 d.adopts,
                 d.idle,
                 d.probes,
+                d.solos,
                 if d.rows == 0 {
                     " — VERDICT: the secondary does not pay for itself here; \
                      the frame ran the pre-feature single-GPU path"

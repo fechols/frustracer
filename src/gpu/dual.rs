@@ -229,6 +229,18 @@ const SHARE_HYST: f32 = 0.15;
 /// Frames between APPLIED row changes. Every change is a real reassignment
 /// that invalidates structure replay on BOTH devices.
 pub const SHARE_DWELL: u32 = 90;
+/// Output frames between SOLO probes: one frame forced to zero share, so the
+/// controller has a measured no-split baseline to judge the split against.
+/// Cheap by construction — a solo frame is a correct frame, and on a box where
+/// splitting does not pay it is the FASTER one.
+pub const SOLO_PROBE_FRAMES: u32 = 16;
+/// How much worse than solo the split must measure before the controller sheds
+/// on that ground alone. Small, because the comparison is between EWMAs of
+/// nearby frames; it exists to stop churn, not to grant the split leeway.
+const SOLO_MARGIN: f32 = 0.02;
+/// EWMA weight for both cost estimates.
+const COST_EWMA: f32 = 0.25;
+
 /// Frames the secondary stays idle before one forced probe re-measures it.
 /// Without a probe a single transient disables the secondary permanently;
 /// with one the controller is self-correcting at the cost of one hitched
@@ -250,16 +262,123 @@ pub struct ShareCtl {
     share: f32,
     max: f32,
     idle: u32,
+    /// Ticks since the last solo probe, the running dual cost, and the LATCHED
+    /// verdict of the most recent solo comparison.
+    since_solo: u32,
+    dual_ms: f32,
+    split_loses: bool,
+    grow_block: bool,
 }
 
 impl ShareCtl {
     pub fn new(start: f32, max: f32) -> Self {
         let max = max.clamp(0.0, 1.0);
-        Self { share: start.clamp(0.0, max), max, idle: 0 }
+        Self {
+            share: start.clamp(0.0, max),
+            max,
+            idle: 0,
+            // Due soon, but not on the very first tick: the verdict compares
+            // the probe against the dual frames just before it, so it needs a
+            // few of those to exist.
+            since_solo: SOLO_PROBE_FRAMES.saturating_sub(4),
+            dual_ms: 0.0,
+            split_loses: false,
+            grow_block: false,
+        }
     }
 
     pub fn share(&self) -> f32 {
         self.share
+    }
+
+    /// True when a SOLO probe is due — one frame forced to zero share, whose
+    /// cost `solo` then records.
+    ///
+    /// WHY THIS EXISTS, and it is the difference between the balancer being
+    /// honest and being a regression a user armed on purpose: equalising
+    /// `prim` and `sec` finds the best SPLIT, but says nothing about whether
+    /// splitting beats not splitting. That proxy is exact only while the two
+    /// devices do not interfere. On this box they do — a 4090 that renders the
+    /// whole screen in 21 ms takes 16.6 for HALF of it while the secondary
+    /// runs — so the balanced point is 1.7x slower than one GPU, and a
+    /// balance-only controller reports "settled at 3 rows" as though that were
+    /// a success. MEASURED, and it is why the pre-anti-windup code looked
+    /// better than it was: it reached zero only by overshooting.
+    ///
+    /// A solo frame is a correct frame, so the probe costs nothing but the
+    /// split's own benefit for one frame out of `SOLO_PROBE_FRAMES`.
+    pub fn solo_frame(&mut self) -> bool {
+        self.since_solo = self.since_solo.saturating_add(1);
+        if self.since_solo >= SOLO_PROBE_FRAMES {
+            self.since_solo = 0;
+            return true;
+        }
+        false
+    }
+
+    /// Whether the last solo probe found the split LOSING to no split at all.
+    ///
+    /// This is the limiter's `shed` condition, and the only thing in the design
+    /// that legitimately bypasses the dwell: a dwell exists to stop churn
+    /// between two workable shares, not to hold a configuration that has been
+    /// measured slower than doing nothing. Without it the walk down costs one
+    /// dwell per row — 4 x `SHARE_DWELL` = 360 frames on `--spin`, measured at
+    /// 2.67 ms/frame mean against a 0.59 ms baseline.
+    pub fn losing(&self) -> bool {
+        self.split_loses
+    }
+
+    /// An emergency shed landed. The verdict is spent — it said "THIS share
+    /// loses", not "every share loses", so the next probe must re-test at the
+    /// new one; a latch that survived its own shed would run straight to zero
+    /// off one measurement, skipping shares that may well pay.
+    ///
+    /// But clearing it alone is not enough, and this is the part that had to be
+    /// measured to find: on an interfering box the BALANCE error is positive at
+    /// small shares (the primary is the slow one there), so between probes it
+    /// simply grows the share back and the controller parks at the balance
+    /// point it was just told is worse than nothing. So growth is also blocked
+    /// until a fresh probe re-tests. Shrinking stays free.
+    pub fn shed_landed(&mut self) {
+        self.split_loses = false;
+        self.grow_block = true;
+        self.dual_ms = 0.0;
+    }
+
+    /// Record what a solo (zero-share) frame cost, AND make the verdict.
+    ///
+    /// The comparison happens here, against `dual_ms` — an EWMA whose effective
+    /// window is a handful of frames — so it is between the probe and the dual
+    /// frames IMMEDIATELY BEFORE IT. That locality is the point: on a moving
+    /// camera the per-frame cost varies with content, so averaging solo samples
+    /// and dual samples over a whole shot and comparing the two means compares
+    /// different parts of the scene. MEASURED: whole-shot averaging over a
+    /// 48-frame GI tour left the controller oscillating at 3 rows while the
+    /// capture ran 1.4x slower than single-GPU.
+    ///
+    /// The result LATCHES until the next probe, so the shed pressure between
+    /// probes is consistent rather than flickering on frame-to-frame noise.
+    pub fn solo(&mut self, ms: f32) {
+        if !(ms > 0.0 && self.dual_ms > 0.0) {
+            return;
+        }
+        if self.dual_ms > ms * (1.0 + SOLO_MARGIN) {
+            self.split_loses = true;
+        } else if self.dual_ms < ms * (1.0 - SOLO_MARGIN) {
+            // A MEASURED WIN. Only this lifts the growth block — the split has
+            // to EARN the right to grow back, not merely fail to lose.
+            self.split_loses = false;
+            self.grow_block = false;
+        } else {
+            // PARITY: stop shedding, but do not resume growing. Splitting at
+            // parity buys nothing and costs a second scene upload, its VRAM and
+            // a second device's power. Treating "not losing" as permission was
+            // measured churning 14 adoptions over a 200-frame GI capture (9.8 s
+            // against 7.1 s single-GPU): on a moving camera the frame cost
+            // varies with content, so a parity verdict flips on noise and the
+            // controller walks back up between probes.
+            self.split_loses = false;
+        }
     }
 
     /// Feed a frame in which the secondary ACTUALLY rendered.
@@ -268,18 +387,58 @@ impl ShareCtl {
     /// the error pins at +1 and the share climbs straight back out of the idle
     /// state it correctly reached. That oscillation is the whole reason
     /// `idle_frame`/`probe` exist as separate entry points.
-    pub fn update(&mut self, prim_ms: f32, sec_ms: f32) {
+    /// `frame_ms` is the tick's MEASURED wall time, the number `solo` records
+    /// on a baseline frame — the two must be the same quantity or the
+    /// comparison below is between different clocks. Pass 0.0 to fall back to
+    /// `max(prim, sec)`, which is the same thing up to submit overhead.
+    pub fn update(&mut self, prim_ms: f32, sec_ms: f32, frame_ms: f32) {
         self.idle = 0;
         let sum = prim_ms + sec_ms;
         if !(sum > 0.0) {
             return;
         }
-        let err = (prim_ms - sec_ms) / sum;
+        // The frame cost IS the later of the two — that is the objective, and
+        // the balance error below is only a proxy for it.
+        let cost = if frame_ms > 0.0 { frame_ms } else { prim_ms.max(sec_ms) };
+        self.dual_ms =
+            if self.dual_ms > 0.0 { self.dual_ms + (cost - self.dual_ms) * COST_EWMA } else { cost };
+        // THE BASELINE VERDICT OVERRIDES THE BALANCE ONE. Shedding a row here
+        // is not a guess: the next probe re-measures at the smaller share, so
+        // it walks down only while the split is still losing — and stops at
+        // whatever share does pay, zero included.
+        let err = if self.split_loses { -1.0 } else { (prim_ms - sec_ms) / sum };
         if err.abs() < SHARE_DEADBAND {
             return;
         }
-        let step = (SHARE_GAIN * err).clamp(-SHARE_DOWN_MAX, SHARE_UP_MAX);
+        let mut step = (SHARE_GAIN * err).clamp(-SHARE_DOWN_MAX, SHARE_UP_MAX);
+        if self.grow_block {
+            step = step.min(0.0);
+        }
         self.share = (self.share + step).clamp(0.0, self.max);
+    }
+
+    /// ANTI-WINDUP: hold the continuous estimate within one quantum of what is
+    /// actually APPLIED. Call once per tick, after `update`.
+    ///
+    /// Without it the controller keeps integrating in one direction for the
+    /// whole dwell while the row count it is judging never changes — so it is
+    /// re-counting the same evidence, and by the time the limiter may act the
+    /// estimate has overshot far past the balance point. MEASURED: a 48-frame
+    /// GI capture at 4/8 rows shed 8 x SHARE_DOWN_MAX = 0.8 during one 8-frame
+    /// dwell, clamped at 0.0, and adopted ZERO in a single jump — skipping
+    /// straight past the 2/8 the same numbers say is optimal, and then idling
+    /// there because nothing re-probes within the shot. One quantum per dwell
+    /// is not a rate limit bolted on; it is the largest step whose EFFECT the
+    /// next tick can actually observe.
+    pub fn anti_windup(&mut self, rows: u32, side: u32) {
+        if side == 0 {
+            return;
+        }
+        let q = 1.0 / side as f32;
+        let at = rows as f32 * q;
+        let lo = (at - q).max(0.0);
+        let hi = (at + q).min(self.max).max(lo);
+        self.share = self.share.clamp(lo, hi);
     }
 
     /// Feed a frame in which the secondary did NOT render (the share
@@ -305,6 +464,12 @@ impl ShareCtl {
         let sum = prim_ms + sec_ms;
         if sum > 0.0 && (prim_ms - sec_ms) / sum > SHARE_DEADBAND {
             self.share = self.share.max(level).clamp(0.0, self.max);
+            // Clear the stale verdict: it was reached at a different share, on
+            // a scene that has since moved. A freshly re-armed secondary gets
+            // until the next solo probe to prove itself, rather than being shed
+            // on the first `update` by a latch nothing has re-tested.
+            self.split_loses = false;
+            self.dual_ms = 0.0;
         }
     }
 }
@@ -329,6 +494,19 @@ impl ShareCtl {
 /// and the share holds. Using an upper bound makes the shrink CONSERVATIVE,
 /// which is the safe direction.
 ///
+/// THE UPPER BOUND IS ONLY USABLE WHILE THE TRANSFER IS A LARGE FRACTION OF
+/// THE WAIT, and that is a real limit rather than a caveat. The error it
+/// produces is proportional to `out + hop`, so on a per-frame schedule like
+/// `--spin` (0.4 ms frames, ~0.5 ms of transfer) it is decisive — but a
+/// `--cinematic` capture amortises ONE crossing over `shot.samples` sub-frames
+/// BY DESIGN, which shrinks it to ~0.2% and drops it inside `SHARE_DEADBAND`.
+/// Measured: a 48-frame GI tour with the secondary 62 ms behind and the primary
+/// at 0.00 produced |err| 0.002 and ZERO adoptions. So the capture path does not
+/// use this function at all — it measures both sides directly with `join_poll`,
+/// which it can afford because its calling thread is blocked either way. The
+/// amortisation that makes a capture fast is exactly what blinds a controller
+/// fed by inference.
+///
 /// `prim_early` must come from a NON-BLOCKING fence query
 /// (`HeadlessGpu::completed`), never from "was the wait short?". Waiting on an
 /// already-signalled fence still burns tens of nanoseconds, so a duration test
@@ -345,6 +523,42 @@ pub fn phase_times(
     let sec = sec_wait + out + hop;
     let prim = if prim_early { sec_wait } else { sec + prim_wait };
     (prim, sec)
+}
+
+/// Observe when EACH of two concurrently-launched submissions completes, in ms
+/// from the moment polling began. Returns once both are done.
+///
+/// This is the exact measurement `phase_times` can only bound. Waiting on one
+/// fence and inferring the other structurally loses whichever finished first,
+/// and the inference's magnitude comes from the transfer — which a capture
+/// amortises to nothing (see `phase_times`). Polling recovers both sides with
+/// no such coupling.
+///
+/// It costs no wall clock: the calling thread has nothing to do until both
+/// devices are finished, so this spins where it would otherwise block. It does
+/// burn a core, so it belongs on batch paths (a capture) and not on a benchmark
+/// whose reported number is wall clock. `yield_now` keeps it cooperative rather
+/// than starving the driver's own threads.
+///
+/// The two predicates must be NON-BLOCKING fence queries. Handing this a
+/// blocking wait would serialise the very concurrency it exists to measure.
+pub fn join_poll(mut a: impl FnMut() -> bool, mut b: impl FnMut() -> bool) -> (f32, f32) {
+    let t0 = std::time::Instant::now();
+    let (mut ta, mut tb) = (None, None);
+    loop {
+        if ta.is_none() && a() {
+            ta = Some(t0.elapsed());
+        }
+        if tb.is_none() && b() {
+            tb = Some(t0.elapsed());
+        }
+        match (ta, tb) {
+            (Some(x), Some(y)) => {
+                return (x.as_secs_f32() * 1e3, y.as_secs_f32() * 1e3);
+            }
+            _ => std::thread::yield_now(),
+        }
+    }
 }
 
 /// Continuous share -> whole tile rows, with hysteresis.
@@ -380,6 +594,7 @@ pub fn quantize_share(share: f32, side: u32, cur: u32) -> u32 {
 pub struct ShareLimiter {
     applied: Option<u32>,
     since: u32,
+    dwell: u32,
 }
 
 impl Default for ShareLimiter {
@@ -390,7 +605,20 @@ impl Default for ShareLimiter {
 
 impl ShareLimiter {
     pub fn new() -> Self {
-        Self { applied: None, since: 0 }
+        Self::with_dwell(SHARE_DWELL)
+    }
+
+    /// A limiter whose control tick is not a DISPLAY frame.
+    ///
+    /// The dwell's whole justification is that every applied change drops
+    /// structure replay on both devices — so it is priced in replays lost per
+    /// unit time, not in ticks. `--cinematic` ticks once per OUTPUT frame,
+    /// where the camera has already moved and replay is therefore ALREADY
+    /// invalidated at the boundary; the dwell there is pure anti-flap and can
+    /// be far shorter. At the display-frame default a 120-frame shot would get
+    /// at most one adoption, i.e. a balancer that cannot balance.
+    pub fn with_dwell(dwell: u32) -> Self {
+        Self { applied: None, since: 0, dwell }
     }
 
     pub fn rows(&self) -> u32 {
@@ -409,7 +637,7 @@ impl ShareLimiter {
         if shed && target < cur {
             self.applied = Some(target);
             self.since = 0;
-        } else if target != cur && self.since >= SHARE_DWELL {
+        } else if target != cur && self.since >= self.dwell {
             self.applied = Some(target);
             self.since = 0;
         }
@@ -506,7 +734,7 @@ fn balance_self_test() -> std::result::Result<(), String> {
     let mut c = ShareCtl::new(0.0, MAX);
     for _ in 0..4000 {
         let s = c.share();
-        c.update(t * (1.0 - s), r * t * s + k * s);
+        c.update(t * (1.0 - s), r * t * s + k * s, 0.0);
     }
     if (c.share() - opt).abs() > 0.02 {
         return Err(format!(
@@ -520,7 +748,7 @@ fn balance_self_test() -> std::result::Result<(), String> {
     let mut c = ShareCtl::new(MAX, MAX);
     for _ in 0..4000 {
         let s = c.share();
-        c.update(t * (1.0 - s), r * t * s + k * s);
+        c.update(t * (1.0 - s), r * t * s + k * s, 0.0);
     }
     if (c.share() - opt).abs() > 0.02 {
         return Err(format!(
@@ -534,7 +762,7 @@ fn balance_self_test() -> std::result::Result<(), String> {
     // controller is in linear space at all.
     let mut c = ShareCtl::new(0.5, MAX);
     for _ in 0..200 {
-        c.update(1.0, 10.0);
+        c.update(1.0, 10.0, 0.0);
     }
     if c.share() != 0.0 {
         return Err(format!(
@@ -544,20 +772,255 @@ fn balance_self_test() -> std::result::Result<(), String> {
         ));
     }
     for _ in 0..200 {
-        c.update(1.0, 10.0);
+        c.update(1.0, 10.0, 0.0);
     }
     if c.share() != 0.0 {
         return Err("the zero state must be stable under continued bad frames".into());
     }
 
+    // (2b) THE CLOSED LOOP — quantiser, limiter, anti-windup and the idle/probe
+    // pair all in the loop against the same cost model. This is the
+    // configuration that actually ships, and it catches what an open-loop
+    // controller test structurally cannot: the estimate winding up during the
+    // dwell and adopting a row count whose effect it never observed.
+    //
+    // The target is the DISCRETE argmin of max(prim, sec), brute-forced —
+    // deliberately not `round(s* * side)`, which disagrees with it. At
+    // (T 10, r 6, K 40) the continuous optimum is 0.73 rows, but one row
+    // measures WORSE than none (12.5 vs 10.0), and rounding would have gated
+    // the controller against an answer that is simply wrong.
+    let side = 8u32;
+    // `windup` false is the SHIPPING loop; true reproduces the pre-fix one, so
+    // the gate can prove its own teeth rather than asserting them. Horizon and
+    // dwell are parameters because THE FAILURE IS HORIZON-DEPENDENT — see the
+    // teeth below.
+    // `interf` is the fraction by which running BOTH devices slows the primary,
+    // which is the effect that makes balance a wrong proxy for the minimum. 0.0
+    // is the ideal non-interfering model; 0.58 is this box, fitted to the
+    // measured GI capture.
+    let closed_loop_i = |t: f32,
+                         r: f32,
+                         k: f32,
+                         interf: f32,
+                         solo_probe: bool,
+                         windup: bool,
+                         ticks: u32,
+                         dwell: u32,
+                         start: u32|
+     -> f64 {
+        let mut c = ShareCtl::new(start as f32 / side as f32, MAX);
+        let mut l = ShareLimiter::with_dwell(dwell);
+        let mut rows = start;
+        let (mut sum, mut n) = (0.0f64, 0.0f64);
+        for i in 0..ticks {
+            let shed = c.losing();
+            let next = l.apply(quantize_share(c.share(), side, rows), shed);
+            if shed && next < rows {
+                c.shed_landed();
+            }
+            rows = next;
+            // A solo probe forces zero share for one tick, exactly like the
+            // idle probe forces one row — and bypasses the limiter the same way.
+            let solo = solo_probe && rows > 0 && c.solo_frame();
+            if solo {
+                rows = 0;
+            }
+            if rows == 0 {
+                let cost = t;
+                if solo {
+                    c.solo(cost);
+                } else if c.idle_frame() {
+                    let s = 1.0 / side as f32;
+                    let prim = t * (1.0 - s) * (1.0 + interf);
+                    c.probe(prim, r * t * s + k * s, s);
+                }
+            } else {
+                let s = rows as f32 / side as f32;
+                c.update(t * (1.0 - s) * (1.0 + interf), r * t * s + k * s, 0.0);
+                if !windup {
+                    c.anti_windup(rows, side);
+                }
+            }
+            if i * 4 >= ticks * 3 {
+                sum += rows as f64;
+                n += 1.0;
+            }
+        }
+        sum / n
+    };
+    let closed_loop = |t: f32, r: f32, k: f32, windup: bool, ticks: u32, dwell: u32, start: u32| -> f64 {
+        let mut c = ShareCtl::new(start as f32 / side as f32, MAX);
+        let mut l = ShareLimiter::with_dwell(dwell);
+        let mut rows = start;
+        let (mut sum, mut n) = (0.0f64, 0.0f64);
+        for i in 0..ticks {
+            // DECIDE, then render at that decision, then observe — the shipping
+            // order. Reversing it lets the limiter's first (unconditional)
+            // adoption consume a share the controller has already moved, which
+            // hides the windup entirely: the first draft of this gate did
+            // exactly that and reported the broken loop converging.
+            rows = l.apply(quantize_share(c.share(), side, rows), false);
+            if rows == 0 {
+                // The secondary sat this tick out, so `update` must not see it
+                // (sec ~ 0 pins err at +1). Only a forced probe re-measures.
+                if c.idle_frame() {
+                    let s = 1.0 / side as f32;
+                    c.probe(t * (1.0 - s), r * t * s + k * s, s);
+                }
+            } else {
+                let s = rows as f32 / side as f32;
+                c.update(t * (1.0 - s), r * t * s + k * s, 0.0);
+                if !windup {
+                    c.anti_windup(rows, side);
+                }
+            }
+            if i * 4 >= ticks * 3 {
+                sum += rows as f64;
+                n += 1.0;
+            }
+        }
+        sum / n
+    };
+    let discrete_opt = |t: f32, r: f32, k: f32| -> u32 {
+        let cost = |rows: u32| {
+            let s = rows as f32 / side as f32;
+            (t * (1.0 - s)).max(r * t * s + k * s)
+        };
+        (0..side).min_by(|&a, &b| cost(a).total_cmp(&cost(b))).unwrap()
+    };
+    for (t, r, k) in [(10.0f32, 2.0f32, 5.0f32), (20.0, 1.0, 1.0), (10.0, 6.0, 40.0)] {
+        let want = discrete_opt(t, r, k);
+        // A discrete actuator cannot sit ON a continuous optimum, so it dithers
+        // between the two row counts bracketing it — which is exactly why
+        // growing is 5x slower than shedding, biasing the duty cycle toward the
+        // cheaper side. Score the time AVERAGE, not a snapshot.
+        let mean = closed_loop(t, r, k, false, 2000, 4, side - 1);
+        if (mean - want as f64).abs() > 1.0 {
+            return Err(format!(
+                "closed loop (T {t}, r {r}, K {k}) averaged {mean:.2} rows, not the discrete \
+                 optimum {want} — quantiser/limiter/anti-windup are not converging together"
+            ));
+        }
+    }
+    // TEETH, AND THE HORIZON IS PART OF THEM. Over thousands of ticks the
+    // wound-up controller ALSO finds the optimum — the probe machinery digs it
+    // back out — so a long-horizon teeth check passes on the broken code and
+    // proves nothing (it did, on the first attempt at this gate). The failure
+    // is a CAPTURE's horizon: 48 output frames, the 8-frame dwell, starting
+    // where `--dual-gpu 4` starts, and `SHARE_PROBE_FRAMES` longer than the
+    // whole shot. Constants fitted to the measured GI capture (primary 16.6 ms
+    // and secondary 37.6 ms per sub-frame at 4/8), where the discrete optimum
+    // is 2 rows: the shipping loop must find it and the wound-up one must shed
+    // 8 x SHARE_DOWN_MAX in a single dwell, adopt ZERO in one jump, and then
+    // idle there for the rest of the shot.
+    let (t, r, k) = (33.2f32, 2.26f32, 0.04f32);
+    let want = discrete_opt(t, r, k);
+    let good = closed_loop(t, r, k, false, 48, 8, 4);
+    if (good - want as f64).abs() > 1.0 {
+        return Err(format!(
+            "over a capture's horizon the loop averaged {good:.2} rows, not the optimum {want}"
+        ));
+    }
+    let bad = closed_loop(t, r, k, true, 48, 8, 4);
+    if (bad - want as f64).abs() <= 1.0 {
+        return Err(format!(
+            "the pre-anti-windup loop also averaged {bad:.2} rows over a capture's horizon — \
+             this gate is not testing what it claims to"
+        ));
+    }
+
+    // (2c) THE INTERFERING BOX — the one this ships on, and the case where
+    // BALANCE IS THE WRONG OBJECTIVE. Constants fitted to the measured GI
+    // capture: a 4090 that renders the whole screen in 21 ms takes 16.6 for
+    // half of it while the B70 runs, and the B70 takes 37.6 for the other
+    // half. Every split therefore costs MORE than not splitting (the cheapest,
+    // 2 rows, is 24.9 against 21.0), so the only right answer is zero — and a
+    // controller that only equalises `prim` and `sec` cannot see that.
+    let (t, r, k, interf) = (21.0f32, 3.58f32, 0.04f32, 0.58f32);
+    for rows in 1..side {
+        let s = rows as f32 / side as f32;
+        let cost = (t * (1.0 - s) * (1.0 + interf)).max(r * t * s + k * s);
+        if cost <= t {
+            return Err(format!(
+                "the interference model is not adversarial: {rows} rows costs {cost:.1} against \
+                 a solo {t:.1}, so zero is not the right answer and the gate proves nothing"
+            ));
+        }
+    }
+    let with_solo = closed_loop_i(t, r, k, interf, true, false, 400, 8, 4);
+    if with_solo > 0.05 {
+        return Err(format!(
+            "on an interfering box the controller averaged {with_solo:.2} rows — every split \
+             there is slower than no split, so it must reach and hold ZERO"
+        ));
+    }
+    // TEETH: without the solo baseline the SAME loop must provably settle on a
+    // split, because equalising prim and sec is a proxy that this box breaks.
+    let no_solo = closed_loop_i(t, r, k, interf, false, false, 400, 8, 4);
+    if no_solo <= 0.35 {
+        return Err(format!(
+            "balance-only also reached {no_solo:.2} rows — the solo probe is not being tested \
+             (it is what turns 'the best split' into 'is splitting worth it')"
+        ));
+    }
+    // THE ESCAPE MUST BE FAST, and at the DISPLAY dwell, which is where it
+    // matters: `--spin`'s 90-frame dwell would otherwise cost one dwell per row
+    // to walk out of a losing configuration (4 x SHARE_DWELL = 360 frames,
+    // measured at 2.67 ms/frame against a 0.59 ms baseline). The emergency shed
+    // — the limiter's own mechanism, previously never used by anything — must
+    // bring that inside a couple of probe intervals while still re-testing at
+    // each share on the way down.
+    let escaped = closed_loop_i(t, r, k, interf, true, false, 200, SHARE_DWELL, 4);
+    if escaped > 0.05 {
+        return Err(format!(
+            "at the display dwell the controller still averaged {escaped:.2} rows over 200 \
+             ticks — the emergency shed is not bypassing the dwell for a measured loss"
+        ));
+    }
+    // ...and on a NON-interfering box the solo probe must not cost anything:
+    // the split genuinely wins there, so it must still be found.
+    let (t2, r2, k2) = (20.0f32, 1.0f32, 1.0f32);
+    let want2 = discrete_opt(t2, r2, k2);
+    let ideal = closed_loop_i(t2, r2, k2, 0.0, true, false, 2000, 4, side - 1);
+    if (ideal - want2 as f64).abs() > 1.0 {
+        return Err(format!(
+            "with a solo baseline on a non-interfering box the loop averaged {ideal:.2} rows, \
+             not the optimum {want2} — the baseline test must not veto a split that pays"
+        ));
+    }
+    // ANTI-WINDUP ITSELF: one quantum is the largest step whose effect the next
+    // tick can observe, so the estimate may never sit further out than that.
+    for rows in 0..8u32 {
+        let mut c = ShareCtl::new(MAX, MAX);
+        for _ in 0..200 {
+            c.update(100.0, 1.0, 0.0); // maximally primary-bound: pin the growth
+            c.anti_windup(rows, 8);
+        }
+        if c.share() > (rows as f32 + 1.0) / 8.0 + 1e-6 {
+            return Err(format!(
+                "the estimate wound up to {} at {rows} applied rows — a whole dwell of \
+                 one-sided error must not carry it past one quantum",
+                c.share()
+            ));
+        }
+        let mut c = ShareCtl::new(0.0, MAX);
+        for _ in 0..200 {
+            c.update(1.0, 100.0, 0.0);
+            c.anti_windup(rows, 8);
+        }
+        if c.share() + 1e-6 < (rows as f32 - 1.0).max(0.0) / 8.0 {
+            return Err(format!("the estimate wound DOWN past one quantum at {rows} rows"));
+        }
+    }
+
     // (3) PER-FRAME STEP BOUNDS, both directions.
     let mut c = ShareCtl::new(0.4, MAX);
-    c.update(100.0, 1.0); // maximally primary-bound: grow
+    c.update(100.0, 1.0, 0.0); // maximally primary-bound: grow
     if c.share() - 0.4 > SHARE_UP_MAX + 1e-6 {
         return Err(format!("grew {} in one frame, over the {SHARE_UP_MAX} cap", c.share() - 0.4));
     }
     let mut c = ShareCtl::new(0.4, MAX);
-    c.update(1.0, 100.0); // maximally secondary-bound: shed
+    c.update(1.0, 100.0, 0.0); // maximally secondary-bound: shed
     if 0.4 - c.share() > SHARE_DOWN_MAX + 1e-6 {
         return Err(format!("shed {} in one frame, over the {SHARE_DOWN_MAX} cap", 0.4 - c.share()));
     }
@@ -571,7 +1034,7 @@ fn balance_self_test() -> std::result::Result<(), String> {
     let mut c = ShareCtl::new(0.3, MAX);
     let parked = c.share();
     for _ in 0..50 {
-        c.update(10.0, 10.2); // |err| ~ 0.01, inside the band
+        c.update(10.0, 10.2, 0.0); // |err| ~ 0.01, inside the band
     }
     if c.share() != parked {
         return Err(format!("controller moved inside the deadband: {parked} -> {}", c.share()));
@@ -634,7 +1097,7 @@ fn balance_self_test() -> std::result::Result<(), String> {
     let mut c = ShareCtl::new(0.5, MAX);
     let before = c.share();
     let (p, s) = phase_times(2.0, 0.5, 0.1, 0.0, true);
-    c.update(p, s);
+    c.update(p, s, 0.0);
     let shed = before - c.share();
     if shed <= SHARE_UP_MAX {
         return Err(format!(
@@ -654,6 +1117,36 @@ fn balance_self_test() -> std::result::Result<(), String> {
             "the early-primary signal does not scale with transfer cost (cheap {cheap:.4} vs \
              dear {dear:.4}) — it is a constant, not a measurement"
         ));
+    }
+
+    // (5c) THE EXACT ALTERNATIVE. `join_poll` must return only when BOTH are
+    // done, must order the two finishes correctly, and must not conflate them —
+    // the failure `phase_times` has by construction and that measured as zero
+    // adoptions on a 48-frame GI capture. Driven by counters, so it is
+    // deterministic in everything except the wall-clock magnitudes.
+    for (na, nb) in [(1u32, 40u32), (40, 1), (1, 1)] {
+        let (mut ca, mut cb) = (0u32, 0u32);
+        let (ta, tb) = join_poll(
+            || {
+                ca += 1;
+                ca >= na
+            },
+            || {
+                cb += 1;
+                cb >= nb
+            },
+        );
+        if !(ta.is_finite() && tb.is_finite() && ta >= 0.0 && tb >= 0.0) {
+            return Err(format!("join_poll returned nonsense: ({ta}, {tb})"));
+        }
+        // The one that needed more polls cannot have been observed EARLIER.
+        // (Equal counts may tie either way, so only compare when they differ.)
+        if na < nb && ta > tb {
+            return Err("join_poll reported the earlier finisher as the later one".into());
+        }
+        if nb < na && tb > ta {
+            return Err("join_poll reported the earlier finisher as the later one".into());
+        }
     }
 
     // (6) QUANTISER: zero reachable, top clamped below `side`, range escape,
@@ -721,6 +1214,22 @@ fn balance_self_test() -> std::result::Result<(), String> {
              re-run first-frame adoption here and disabled the limiter silently"
                 .into(),
         );
+    }
+    // A shortened dwell must be OBEYED and must be the only thing that changed:
+    // adopt, hold, and move on exactly the d-th tick after adoption — the same
+    // accounting `SHARE_DWELL` gets above. `--cinematic` ticks once per OUTPUT
+    // frame and at the display default would get ~1 adoption per shot.
+    for d in [0u32, 1, 8] {
+        let mut l = ShareLimiter::with_dwell(d);
+        l.apply(4, false);
+        for i in 1..d {
+            if l.apply(2, false) != 4 {
+                return Err(format!("dwell {d} released early, at tick {i}"));
+            }
+        }
+        if l.apply(2, false) != 2 {
+            return Err(format!("dwell {d} never released"));
+        }
     }
     Ok(())
 }
