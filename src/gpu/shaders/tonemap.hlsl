@@ -21,7 +21,7 @@ SamplerState samp_lin : register(s0); // linear, clamp
 
 // Field order is the root-constant DWORD order tonemap.rs writes; the float2
 // sits at offset 8 so it cannot straddle a 16-byte boundary (the fsr_composite
-// bug). Eight contiguous DWORDs.
+// bug). Nine contiguous DWORDs.
 cbuffer Params : register(b0) {
     float inv_samples;
     float bloom_strength; // 0 = off
@@ -31,6 +31,7 @@ cbuffer Params : register(b0) {
     float scale;     // Gamma22 (SDR/Sdr10): 1.0. HDR10: paper_white / 10000
     float mode;      // 1 = gamma 2.2 (8-bit AND Sdr10), 2 = HDR10 PQ (tone::ToneMode;
                      // 0 was scRGB-linear, retired with the f16 swapchain)
+    float exposure;  // ToneParams::exposure — the aperture (autoexp.rs). 1.0 = off.
 };
 
 // Rec.709 -> Rec.2020 primaries. Literals mirror tone::m709_to_2020
@@ -98,6 +99,12 @@ float4 psmain(float4 pos : SV_Position) : SV_Target {
         float2 uv = (pos.xy + 0.5) / dims;
         c = lerp(c, tent(uv), bloom_strength);
     }
+    // Exposure: pre-curve, AFTER the glare blend — the lerp is linear, so
+    // scaling the blend equals exposing source and glare consistently, and it
+    // matches the CPU order (bloom composites into the HDR slice before
+    // tone::shape applies exposure). Branched at 1.0 like tone::shape, so the
+    // unexposed stream is bit-identical (M12's sdr/sdr10/hdr10 rows).
+    if (exposure != 1.0) c *= exposure;
     float3 f = float3(curve(c.r), curve(c.g), curve(c.b));
     if (mode > 1.5) {
         // HDR10: paper-white-relative -> PQ's 10000-nit-normalized domain,

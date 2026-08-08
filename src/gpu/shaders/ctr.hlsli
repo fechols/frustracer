@@ -28,7 +28,9 @@
 #define CTR_FRONTIER_RAYS    22u // primary ray samples reusing those handles
 #define CTR_FRONTIER_ENTRIES 23u // summed software-frontier widths
 #define CTR_SKY_PX       24u // stat: pixels inside proven-empty sky rects (zero rays)
-#define CTR_COUNT        25u
+#define CTR_RTGI_RAYS    25u // stat: real-time-GI bounce rays (shade_full's RTGI block;
+                             // wavefront leaf units only — reference/DXR carry no counters)
+#define CTR_COUNT        26u
 
 // --- WIDTH_PROBE slots (FR_WIDTH=1 — trace::width_defs) --------------------
 // Each kernel reports its COMPILED wave width (WaveGetLaneCount()) — the
@@ -39,12 +41,12 @@
 // CTR_COUNT*4 bytes — so these slots are never zeroed, never gated, and
 // survive to the end-of-session readback BY CONSTRUCTION. LOCKSTEP with
 // trace.rs's consts AND the counters buffer size (CTR_TOTAL * 4).
-#define CTR_W_LEAF      25u // cs_leaf (leaf vs leaf-fb: whichever ran last)
-#define CTR_W_SKY       26u // cs_sky
-#define CTR_W_LEVEL     27u // cs_level / cs_level_wide (last writer wins)
-#define CTR_W_HEMI      28u // cs_hemi_leaf
-#define CTR_W_REFERENCE 29u // cs_reference (declares its OWN u3 view — below)
-#define CTR_TOTAL       30u
+#define CTR_W_LEAF      26u // cs_leaf (leaf vs leaf-fb: whichever ran last)
+#define CTR_W_SKY       27u // cs_sky
+#define CTR_W_LEVEL     28u // cs_level / cs_level_wide (last writer wins)
+#define CTR_W_HEMI      29u // cs_hemi_leaf
+#define CTR_W_REFERENCE 30u // cs_reference (declares its OWN u3 view — below)
+#define CTR_TOTAL       31u
 
 // Compile units that paste this file bind `counters` — rt.hlsli's cutout
 // loop keys its stat increment on this (the reference kernel and the DXR

@@ -189,18 +189,22 @@ pub const CTR_FRONTIER_ENTRIES: u32 = 23;
 /// (the qsky rect-area sum), so `cs_seed_replay` preserves it with
 /// CTR_LEAF/CTR_SKY/CTR_CUT.
 pub const CTR_SKY_PX: u32 = 24;
-pub const CTR_COUNT: u32 = 25;
+/// Real-time-GI bounce rays (shade_full's RTGI block; wavefront leaf units
+/// only — the reference kernel and the DXR library carry no counters). The
+/// `--check-gpu` must-fire on armed sessions, exactly 0 under `--no-rtgi`.
+pub const CTR_RTGI_RAYS: u32 = 25;
+pub const CTR_COUNT: u32 = 26;
 // WIDTH_PROBE slots (FR_WIDTH=1 — `width_defs`): each kernel reports its
 // COMPILED wave width (WaveGetLaneCount()). DELIBERATELY >= CTR_COUNT: every
 // zero loop runs `i < CTR_COUNT` and every gate readback reads CTR_COUNT*4
 // bytes, so these slots are never zeroed and never gated by construction.
 // LOCKSTEP with ctr.hlsli's block AND the counters buffer size (CTR_TOTAL*4).
-pub const CTR_W_LEAF: u32 = 25;
-pub const CTR_W_SKY: u32 = 26;
-pub const CTR_W_LEVEL: u32 = 27;
-pub const CTR_W_HEMI: u32 = 28;
-pub const CTR_W_REFERENCE: u32 = 29;
-pub const CTR_TOTAL: u32 = 30;
+pub const CTR_W_LEAF: u32 = 26;
+pub const CTR_W_SKY: u32 = 27;
+pub const CTR_W_LEVEL: u32 = 28;
+pub const CTR_W_HEMI: u32 = 29;
+pub const CTR_W_REFERENCE: u32 = 30;
+pub const CTR_TOTAL: u32 = 31;
 const _: () = assert!(CTR_W_LEAF >= CTR_COUNT && CTR_TOTAL == CTR_W_REFERENCE + 1);
 
 /// queues.hlsli::LeafRec's stride — the qleaf allocation and main.rs's
@@ -3189,6 +3193,15 @@ pub(crate) fn trans_defs(scene: &Scene) -> &'static str {
     if scene.any_transmissive && !abl_has("notrans") { "#define TRANS_SHADOW 1" } else { "" }
 }
 
+/// `#define RTGI` — compiles shade_full's real-time-GI bounce block in (the
+/// trans_defs session-lever pattern). `--no-rtgi` omits it, so the unarmed
+/// assembly's shade_full is the verbatim pre-RTGI call — the bit-identity
+/// arm. Reaches every unit that pastes SHADE_HLSLI on BOTH pipelines (the
+/// probe-reach rule); the per-frame fb stand-down rides FLAG_RTGI on top.
+pub(crate) fn rtgi_defs() -> &'static str {
+    if crate::shade::rtgi_enabled() { "#define RTGI 1" } else { "" }
+}
+
 /// The AMD candidate-loop TMin workaround — see `rt.hlsli::cand_tmin` for the
 /// bug, the evidence, and why the fix is shaped this way. This is the gate.
 ///
@@ -3265,7 +3278,7 @@ fn abl_has(tag: &str) -> bool {
 const ABL_GPU_TAGS: &[&str] = &[
     "sunt", "rough", "nogbuf", "nopack", "nowave", "noelcull", "noffcode", "noelcode", "oldcut",
     "nobatch", "nocandtmin", "noalpha", "noheight", "notrans", "tzero", "noshadow", "noao",
-    "norefl", "noglass", "nosec",
+    "norefl", "noglass", "nogi", "nosec",
 ];
 
 /// One loud line per process when FR_ABL is set at all — the GPU twin of
@@ -3613,12 +3626,13 @@ pub(crate) fn abl_defs() -> String {
         // opaque DispatchRays region: shade.hlsli neutralizes the TRAVERSAL
         // at each consumer while keeping every rng draw and all control flow,
         // so the delta prices the rays and nothing else. `nosec` arms all
-        // four (the OR lives in shade.hlsli's ABL_OFF_* block). Image changes
+        // five (the OR lives in shade.hlsli's ABL_* block). Image changes
         // by design — cost probes, never levers (the nogbuf class).
         ("noshadow", "ABL_NOSHADOW"),
         ("noao", "ABL_NOAO"),
         ("norefl", "ABL_NOREFL"),
         ("noglass", "ABL_NOGLASS"),
+        ("nogi", "ABL_NOGI"),
         ("nosec", "ABL_NOSEC"),
     ] {
         if abl_has(tag) {
@@ -4481,6 +4495,12 @@ pub const FLAG_EMISSIVE: u32 = 16384;
 // next free bit. Lockstep with trace_common.hlsli's FLAG_WAVEVIZ.
 pub const FLAG_WAVEVIZ: u32 = 262144;
 
+/// Real-time GI live this frame (`--no-rtgi` clears the session lever;
+/// `with_frame` additionally clears the bit on fb frames — the hemi tiers
+/// take precedence — so shade_full's bounce block can key on the bit alone).
+/// Lockstep with trace_common.hlsli's FLAG_RTGI.
+pub const FLAG_RTGI: u32 = 524288;
+
 /// Unreal-1 detail texturing (`--no-detail-tex` clears it): procedural
 /// close-up albedo grain + micro-bump on MAGNIFIED hits — textured AND
 /// untextured since the untextured arm (shade.hlsli's post-match detail
@@ -5322,11 +5342,20 @@ impl FrameCb {
             // the base) × the live lever × NOT a GI frame — under fb.gi the
             // hemi gather already delivers emissive transport exactly, so
             // the cluster tier stands down (the inverted once-per-path
-            // rule). Emissive-free scenes never set the bit.
+            // rule). NEE STAYS LIVE under RTGI (the NEE-keep rule): the
+            // bounce's emissive display-add suppresses on this very bit
+            // instead (shade.hlsli's `cam_lights || !FLAG_EMISSIVE` gate),
+            // so exactly one mechanism delivers per frame. Emissive-free
+            // scenes never set the bit.
             | ((self.el_meta[0] > 0
                 && crate::emissive::enabled()
                 && fb_mode_of(&p.q) != 2) as u32
                 * FLAG_EMISSIVE)
+            // Real-time GI: the session lever (baked as the RTGI compile
+            // define; this runtime bit covers the fb stand-down) × NOT a
+            // hemi frame — the still-frame tiers take precedence, so
+            // shade_full's bounce block keys on the bit alone.
+            | ((p.q.rtgi && fb_mode_of(&p.q) == 0) as u32 * FLAG_RTGI)
             // The --no-detail-tex lever, read at CB-build time (the
             // depth-tint shape) — shade.hlsli's post-match detail block,
             // gated per material on Mat.detail_scale > 0 (untextured
@@ -5735,7 +5764,7 @@ impl TraceGpu {
         // (sway_defs' doc). DXR takes sway_defs verbatim.
         let sway_def = if sw_rays() { "" } else { sway_defs(&scene_gpu) };
         let defs = format!(
-            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
             empty_def,
             alpha_defs(scene),
             height_defs(scene),
@@ -5743,7 +5772,8 @@ impl TraceGpu {
             cand_defs(vendor),
             blas_defs(),
             sway_def,
-            abl_defs()
+            abl_defs(),
+            rtgi_defs()
         );
         let defs = defs.as_str();
         // The session's frustum structure: `#define FTREE` swaps frustum.hlsli's
@@ -8271,8 +8301,8 @@ mod width_ballast_shader_source_tests {
         assert!(!WAVEFRONT_HLSL.contains("i < CTR_TOTAL"));
         assert!(CTR_W_LEAF >= CTR_COUNT && CTR_TOTAL > CTR_W_LEAF);
         // ctr.hlsli's literal block mirrors the Rust consts.
-        assert!(CTR_HLSLI.contains("#define CTR_W_LEAF      25u"));
-        assert!(CTR_HLSLI.contains("#define CTR_TOTAL       30u"));
+        assert!(CTR_HLSLI.contains("#define CTR_W_LEAF      26u"));
+        assert!(CTR_HLSLI.contains("#define CTR_TOTAL       31u"));
     }
 
     /// --waveviz: every ID-mint touch (the wv_t locals and their

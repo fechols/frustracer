@@ -96,6 +96,13 @@
                                // waveviz — the sibling branched before the
                                // detail flags landed); detail keeps it,
                                // waveviz takes the next free bit.
+#define FLAG_RTGI      524288u // real-time GI live THIS frame (shade_full's
+                               // #ifdef RTGI bounce block — --no-rtgi
+                               // compiles the block out, so the bit is only
+                               // consumed where the code exists; the flag
+                               // derivation guarantees fb_mode == 0 whenever
+                               // it is set, the hemi-tiers-take-precedence
+                               // rule). Lockstep with trace.rs's FLAG_RTGI.
 
 cbuffer Frame : register(b0) {
     float4 cam_origin;   // xyz; w = inv_w

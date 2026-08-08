@@ -8,6 +8,7 @@
 //! proxy plumbing, M4 `present_rr` (DLSS Ray Reconstruction).
 
 pub mod adapter;
+pub mod autoexp;
 pub mod d3d12;
 /// What the monitor under the window can actually display (HDR on/off, peak
 /// luminance) — re-probed on every move, not a startup fact.
@@ -416,8 +417,10 @@ struct NgxFgState {
     primed: std::cell::Cell<bool>,
     frame_id: std::cell::Cell<u64>,
     /// The recreate-storm guard: (pending res, consecutive dispatches seen
-    /// at it). A SPACE/F mode switch moves the render res ONCE (the CPU
-    /// arm's quality-2/3 vs the GPU arms' native default) and then holds —
+    /// at it). A SPACE/F mode switch moves the render res ONCE (e.g. a
+    /// dynamic-DRS CPU arm's res vs the GPU arms' locked default; with the
+    /// one locked scale every arm shares, most switches move nothing) and
+    /// then holds —
     /// it recreates a fraction of a second in; a `--lock-res dynamic` RAMP
     /// changes res every frame, never qualifies, and keeps skipping (the
     /// pre-recreate behavior); a completed DRS step holds >= the 90-frame
@@ -686,6 +689,15 @@ pub struct GpuContext {
     /// unconditionally, so the descriptor must be valid even under `--no-bloom`,
     /// where the pass simply isn't recorded and strength is 0.
     bloom: bloom::BloomGpu,
+    /// Auto-exposure's luminance meter (gpu/autoexp.rs). Always built, like
+    /// bloom — recording is gated per frame on `autoexp::enabled()`, and the
+    /// buffers are constant-sized (8K tile budget), so there is no resize path.
+    autoexp: autoexp::AutoExpGpu,
+    /// The newest collected meter value (mean log2-luminance of a presented
+    /// frame's tonemap source, FRAMES_IN_FLIGHT frames old) — stashed by
+    /// `fullscreen_to_backbuffer`, consumed by main's controller via
+    /// `take_meter`. Cell: the present recorder is `&self`.
+    meter: std::cell::Cell<Option<f32>>,
     blit: upload::BlitUpload,
     hdr: upload::HdrUpload,
     /// The HUD/menu overlay (gpu/hud.rs): window-sized premultiplied RGBA8,
@@ -843,12 +855,18 @@ fn wire_tonemap_src(
     device: &ID3D12Device,
     passes: &tonemap::Passes,
     bloom: &bloom::BloomGpu,
+    aexp: &autoexp::AutoExpGpu,
     res: &ID3D12Resource,
     format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
     slot: u32,
 ) {
     passes.create_srv(device, res, format, slot);
     bloom.create_source_srv(device, res, format, slot);
+    // The auto-exposure meter reads the same sources from ITS heap — the same
+    // one-heap-at-a-time argument as bloom's, and the same silent-failure mode
+    // if a source got the draw SRV but not this one (it would present fine and
+    // simply never meter, i.e. exposure would freeze at 1.0 in that arm).
+    aexp.create_source_srv(device, res, format, slot);
 }
 
 impl GpuContext {
@@ -1093,6 +1111,7 @@ impl GpuContext {
 
         let passes = tonemap::Passes::new(&d3d.device, d3d.format)?;
         let bloom = bloom::BloomGpu::new(&d3d.device, w as u32, h as u32)?;
+        let aexp_gpu = autoexp::AutoExpGpu::new(&d3d.device)?;
         passes.create_srv(
             &d3d.device,
             bloom.glare_srv_source(),
@@ -1103,6 +1122,7 @@ impl GpuContext {
             &d3d.device,
             &passes,
             &bloom,
+            &aexp_gpu,
             xess_state.as_ref(),
             fsr_state.as_ref(),
         );
@@ -1137,6 +1157,7 @@ impl GpuContext {
                         &d3d.device,
                         &passes,
                         &bloom,
+                        &aexp_gpu,
                         &r.output,
                         windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
                         tonemap::SRV_SLOT_RR,
@@ -1164,6 +1185,7 @@ impl GpuContext {
             &d3d.device,
             &passes,
             &bloom,
+            &aexp_gpu,
             &hdr.texture,
             windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
             tonemap::SRV_SLOT_HDR,
@@ -1187,6 +1209,7 @@ impl GpuContext {
                         &d3d.device,
                         &passes,
                         &bloom,
+                        &aexp_gpu,
                         &out,
                         windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
                         tonemap::SRV_SLOT_NGXFG,
@@ -1535,6 +1558,8 @@ impl GpuContext {
             d3d,
             passes,
             bloom,
+            autoexp: aexp_gpu,
+            meter: std::cell::Cell::new(None),
             blit,
             hdr,
             hud,
@@ -1665,6 +1690,7 @@ impl GpuContext {
         device: &ID3D12Device,
         passes: &tonemap::Passes,
         bloom: &bloom::BloomGpu,
+        aexp: &autoexp::AutoExpGpu,
         xess: Option<&XessState>,
         fsr: Option<&FsrState>,
     ) {
@@ -1673,6 +1699,7 @@ impl GpuContext {
                 device,
                 passes,
                 bloom,
+                aexp,
                 &s.res.output,
                 windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
                 tonemap::SRV_SLOT_XESS,
@@ -1683,6 +1710,7 @@ impl GpuContext {
                 device,
                 passes,
                 bloom,
+                aexp,
                 s.res.upscaled(),
                 windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
                 tonemap::SRV_SLOT_FSR,
@@ -1910,6 +1938,7 @@ impl GpuContext {
             &self.d3d.device,
             &self.passes,
             &self.bloom,
+            &self.autoexp,
             &self.hdr.texture,
             windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
             tonemap::SRV_SLOT_HDR,
@@ -1921,6 +1950,7 @@ impl GpuContext {
                 &self.d3d.device,
                 &self.passes,
                 &self.bloom,
+                &self.autoexp,
                 &r.output,
                 windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
                 tonemap::SRV_SLOT_RR,
@@ -1962,6 +1992,7 @@ impl GpuContext {
                     &self.d3d.device,
                     &self.passes,
                     &self.bloom,
+                    &self.autoexp,
                     x.as_ref(),
                     f.as_ref(),
                 );
@@ -1976,6 +2007,7 @@ impl GpuContext {
                             &self.d3d.device,
                             &self.passes,
                             &self.bloom,
+                            &self.autoexp,
                             &s.res.output,
                             windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
                             tonemap::SRV_SLOT_XESS,
@@ -1997,6 +2029,7 @@ impl GpuContext {
                             &self.d3d.device,
                             &self.passes,
                             &self.bloom,
+                            &self.autoexp,
                             s.res.upscaled(),
                             windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
                             tonemap::SRV_SLOT_FSR,
@@ -2025,6 +2058,7 @@ impl GpuContext {
                 &self.d3d.device,
                 &self.passes,
                 &self.bloom,
+                &self.autoexp,
                 &n.out,
                 windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
                 tonemap::SRV_SLOT_NGXFG,
@@ -2446,6 +2480,7 @@ impl GpuContext {
             &self.d3d.device,
             &self.passes,
             &self.bloom,
+            &self.autoexp,
             &tg.hdr,
             windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
             tonemap::SRV_SLOT_GPU,
@@ -3079,6 +3114,7 @@ impl GpuContext {
             &self.d3d.device,
             &self.passes,
             &self.bloom,
+            &self.autoexp,
             &d.hdr,
             windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
             tonemap::SRV_SLOT_DXR,
@@ -4072,6 +4108,7 @@ impl GpuContext {
             &self.d3d.device,
             &self.passes,
             &self.bloom,
+            &self.autoexp,
             &q.output,
             windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
             tonemap::SRV_SLOT_QUIN,
@@ -5106,7 +5143,14 @@ impl GpuContext {
                 // to open-code the curve a third time; it now shares tone::map,
                 // so the file can't drift from the screen.
                 let c = glam::Vec3A::new(px[0].into(), px[1].into(), px[2].into());
-                let m = crate::tone::map(c, crate::tone::ToneParams::SDR)
+                // ... but they DO carry the session's live exposure — P must
+                // capture what the screen shows (the "two sessions must agree
+                // about what P captures" rule), and 1.0 is bit-inert.
+                let tp = crate::tone::ToneParams {
+                    exposure: self.tone.exposure,
+                    ..crate::tone::ToneParams::SDR
+                };
+                let m = crate::tone::map(c, tp)
                     .clamp(glam::Vec3A::ZERO, glam::Vec3A::ONE)
                     * 255.0;
                 let q = |v: f32| (v + 0.5) as u32;
@@ -5167,7 +5211,12 @@ impl GpuContext {
             return None;
         }
         self.display = Some(d);
-        self.tone = d.tone_pq(paper_white, peak);
+        // A display move is a retune of the CURVE, never of the aperture — the
+        // session's live exposure survives it.
+        self.tone = crate::tone::ToneParams {
+            exposure: self.tone.exposure,
+            ..d.tone_pq(paper_white, peak)
+        };
         Some(d)
     }
 
@@ -5176,6 +5225,22 @@ impl GpuContext {
     /// change reaches them.
     pub fn tone(&self) -> crate::tone::ToneParams {
         self.tone
+    }
+
+    /// Auto-exposure: the linear scale the presentation curve applies next
+    /// frame. UNCONDITIONAL by design — `refresh_display` early-outs on the
+    /// gamma wires, so exposure must not route through it (a setter gated on
+    /// Hdr10 would be dead in every SDR/Sdr10 session).
+    pub fn set_exposure(&mut self, e: f32) {
+        self.tone.exposure = e;
+    }
+
+    /// Auto-exposure: the newest collected meter value (mean log2-luminance of
+    /// a presented frame's tonemap source, FRAMES_IN_FLIGHT frames old),
+    /// stashed by `fullscreen_to_backbuffer`. Take-semantics so the controller
+    /// never folds one measurement twice.
+    pub fn take_meter(&self) -> Option<f32> {
+        self.meter.take()
     }
 
 
@@ -6185,6 +6250,33 @@ impl GpuContext {
         } else {
             (0.0, 0.0, 0.0)
         };
+
+        // Auto-exposure's luminance meter (gpu/autoexp.rs): collect this
+        // slot's 2-frame-old mean first (begin_frame's fence wait already
+        // retired that frame — the gputime contract; `hud_slot` above IS the
+        // fence-waited slot), then record this frame's reduction on the same
+        // source, with bloom's own PSR<->NPSR borrow. Gated on the lever so
+        // `--no-auto-exposure` records nothing (the --no-bloom discipline).
+        // The blit arms (use_tonemap false) are CPU-tonemapped and meter
+        // CPU-side instead (CpuPresent).
+        if use_tonemap && crate::autoexp::enabled() {
+            if let Some(src) = self.tonemap_source(srv_slot) {
+                if let Some(v) = self.autoexp.collect(hud_slot) {
+                    self.meter.set(Some(v));
+                }
+                let (sw, sh) = {
+                    let d = unsafe { src.GetDesc() };
+                    (d.Width as u32, d.Height)
+                };
+                let (psr, npsr) = (
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                );
+                unsafe { self.d3d.list.ResourceBarrier(&[transition(src, psr, npsr)]) };
+                self.autoexp.record(&self.d3d.list, srv_slot, sw, sh, inv_samples, hud_slot);
+                unsafe { self.d3d.list.ResourceBarrier(&[transition(src, npsr, psr)]) };
+            }
+        }
 
         let bb = unsafe { self.d3d.swapchain.GetCurrentBackBufferIndex() };
         let backbuffer = &self.d3d.backbuffers[bb as usize];

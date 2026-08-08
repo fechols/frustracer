@@ -281,10 +281,10 @@ pub(super) fn premultiplied_blend() -> D3D12_BLEND_DESC {
 
 /// Root constants the fullscreen PS reads (b0), in tonemap.hlsl's cbuffer
 /// order: `inv_samples`, the three glare fields (strength + the tent's texel
-/// step), then the four `tone::ToneParams` fields — the presentation curve is
-/// uniform state, not baked into the shader, which is what lets a display
-/// change be a retune.
-const NUM_ROOT_CONSTS: u32 = 8;
+/// step), then the five `tone::ToneParams` fields (knee/headroom/scale/mode/
+/// exposure) — the presentation curve is uniform state, not baked into the
+/// shader, which is what lets a display change be a retune.
+const NUM_ROOT_CONSTS: u32 = 9;
 
 fn fullscreen_pso(
     device: &ID3D12Device,
@@ -494,7 +494,7 @@ impl Passes {
             list.SetGraphicsRootDescriptorTable(0, self.gpu_srv(SRV_SLOT_HDR));
             list.SetGraphicsRootDescriptorTable(2, self.gpu_srv(SRV_SLOT_BLOOM));
             list.SetGraphicsRootShaderResourceView(3, tickets_va);
-            // waveviz.hlsl's Params layout: rw rh ww wh | scale mode pad pad.
+            // waveviz.hlsl's Params layout: rw rh ww wh | scale mode pad pad pad.
             let consts: [u32; NUM_ROOT_CONSTS as usize] = [
                 rw,
                 rh,
@@ -506,6 +506,7 @@ impl Passes {
                     crate::tone::ToneMode::Pq => 2.0f32,
                 }
                 .to_bits(),
+                0,
                 0,
                 0,
             ];
@@ -599,6 +600,7 @@ impl Passes {
                     crate::tone::ToneMode::Gamma22 => 1.0,
                     crate::tone::ToneMode::Pq => 2.0,
                 },
+                tone.exposure,
             ];
             list.SetGraphicsRoot32BitConstants(1, NUM_ROOT_CONSTS, consts.as_ptr() as *const _, 0);
             list.RSSetViewports(&[D3D12_VIEWPORT {

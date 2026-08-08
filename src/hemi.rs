@@ -391,6 +391,13 @@ pub(crate) const BOUNCE_Q: shade::Quality = shade::Quality {
     ao_samples: 1,
     reflections: false,
     fb: shade::FrustumBounce::OFF,
+    // Bounce hits never re-bounce (RTGI's own leaf policy included): the
+    // SH×AO ambient above IS the tail. Keeps both GI tiers recursion-bounded.
+    rtgi: false,
+    // The hemi gather DELIVERS emissive transport (fb.gi drops the cluster
+    // NEE instead); the RTGI bounce overrides this per frame via struct
+    // update when NEE is live (the NEE-keep rule — see Quality's field doc).
+    emissive_display: true,
 };
 
 /// `--check` instrumentation: re-validates every claim the integrator makes

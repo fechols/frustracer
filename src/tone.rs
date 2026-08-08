@@ -122,13 +122,19 @@ pub struct ToneParams {
     /// The display encode (see `ToneMode`). `Gamma22` for the 8-bit and Sdr10
     /// swapchains; `Pq` for the HDR10 one.
     pub mode: ToneMode,
+    /// Linear pre-curve radiance multiplier — the aperture (auto-exposure /
+    /// `--exposure-bias`, src/autoexp.rs). 1.0 = off, and `shape` BRANCHES
+    /// around the multiply there (the `cinematic::exposure_scale` idiom), so
+    /// every pre-exposure consumer — arm (1)'s bit-for-bit SDR degeneracy
+    /// included — is bit-identical by construction, not by fp luck.
+    pub exposure: f32,
 }
 
 impl ToneParams {
     /// The SDR gamma-2.2 curve — the 8-bit swapchain AND Sdr10 (the pack width
     /// is the caller's business). Reproduces the pre-HDR renderer bit-for-bit.
     pub const SDR: ToneParams =
-        ToneParams { knee: 0.0, headroom: 1.0, scale: 1.0, mode: ToneMode::Gamma22 };
+        ToneParams { knee: 0.0, headroom: 1.0, scale: 1.0, mode: ToneMode::Gamma22, exposure: 1.0 };
 
     /// HDR10/PQ output — the HDR-on-display default and the arm the
     /// swapchain-wrapper FG families take. The scale anchors paper white
@@ -141,9 +147,9 @@ impl ToneParams {
         let scale = paper / PQ_MAX_NITS;
         let headroom = peak_nits / paper;
         if headroom <= HDR_KNEE {
-            return ToneParams { knee: 0.0, headroom: 1.0, scale, mode: ToneMode::Pq };
+            return ToneParams { knee: 0.0, headroom: 1.0, scale, mode: ToneMode::Pq, exposure: 1.0 };
         }
-        ToneParams { knee: HDR_KNEE, headroom, scale, mode: ToneMode::Pq }
+        ToneParams { knee: HDR_KNEE, headroom, scale, mode: ToneMode::Pq, exposure: 1.0 }
     }
 
     /// Peak luminance this parameterisation will actually emit, in nits.
@@ -178,6 +184,9 @@ fn curve(x: f32, knee: f32, headroom: f32) -> f32 {
 #[inline]
 pub fn shape(c: Vec3A, p: ToneParams) -> Vec3A {
     let c = c.max(Vec3A::ZERO);
+    // Exposure: pre-curve, post-clamp. Branched at 1.0 so the off state is
+    // structurally the pre-exposure renderer (arm (1) compares bits).
+    let c = if p.exposure != 1.0 { c * p.exposure } else { c };
     let f = Vec3A::new(
         curve(c.x, p.knee, p.headroom),
         curve(c.y, p.knee, p.headroom),
@@ -375,6 +384,38 @@ pub fn self_test() -> Result<(), String> {
     let v10 = map(Vec3A::splat(3.0), flat10).x;
     if !v10.is_finite() || !(0.0..=1.0).contains(&v10) {
         return Err(format!("no-headroom HDR10 display produced {v10}"));
+    }
+
+    // (9) Exposure. The off state must be STRUCTURAL (SDR carries exactly 1.0
+    // and `shape` branches around the multiply — pinned by bit-equality, the
+    // cinematic `exposure_scale` inertness contract), and the on state must be
+    // EXACTLY pre-curve radiance scaling: exposing the params and scaling the
+    // input are the same computation, so the bits must agree — a drift here
+    // means exposure moved somewhere else in the pipeline.
+    if ToneParams::SDR.exposure != 1.0 {
+        return Err(format!("ToneParams::SDR.exposure {} != 1.0", ToneParams::SDR.exposure));
+    }
+    if ToneParams::hdr10(200.0, 1000.0).exposure != 1.0 {
+        return Err("hdr10() must construct exposure 1.0".into());
+    }
+    let exposed = ToneParams { exposure: 2.5, ..ToneParams::SDR };
+    let unit = ToneParams { exposure: 1.0, ..ToneParams::SDR };
+    for i in 0..=2000 {
+        let x = i as f32 * 0.01;
+        let c = Vec3A::splat(x);
+        let got = map(c, exposed);
+        let want = map(c * 2.5, ToneParams::SDR);
+        if got.x.to_bits() != want.x.to_bits() {
+            return Err(format!(
+                "exposure is not pre-curve scaling: c={x} exposed 2.5 -> {} vs scaled input {}",
+                got.x, want.x
+            ));
+        }
+        let inert = map(c, unit);
+        let base = map(c, ToneParams::SDR);
+        if inert.x.to_bits() != base.x.to_bits() {
+            return Err(format!("exposure 1.0 not bit-inert at c={x}"));
+        }
     }
 
     eprintln!("tone self-test: OK");

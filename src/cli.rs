@@ -470,6 +470,27 @@ pub struct Opts {
     /// under sky light). Runtime shading lever — the depth-tint class; a
     /// no-op on flat-shaded geometry (n_s == n_g).
     pub amb_bump: bool,
+    /// `--no-rtgi` clears (`shade::set_rtgi`): real-time GI OFF — the ambient
+    /// tier goes back to flat `SH sky irradiance × AO`, bit-identical to the
+    /// pre-RTGI renderer (the GPU compiles the bounce block out). DEFAULT ON:
+    /// one cosine-sampled bounce ray per pixel per frame replaces the ambient
+    /// term, shaded at the hemi BOUNCE_Q policy, integrated by the temporal
+    /// denoisers / accumulation. Still-frame hemi tiers (H) take precedence.
+    pub rtgi: bool,
+    /// `--no-auto-exposure` clears (`autoexp::set_enabled`): the interactive
+    /// aperture holds at exactly 1.0 (plus any bias) instead of adapting.
+    /// DEFAULT ON: a display-stage controller eases a clamped EV toward what
+    /// the presented frame's mean log2-luminance asks for (src/autoexp.rs) —
+    /// enclosures open up, exteriors hold at ~0 EV. Headless paths never run
+    /// the controller, so every gate/benchmark sees exposure 1.0 regardless.
+    pub autoexp: bool,
+    /// `--exposure-bias EV` (stops, -8..=8, default 0 — the cinematic
+    /// `-exposure` range): a manual aperture offset composed ON TOP of the
+    /// controller's EV, and live even under `--no-auto-exposure` (the manual
+    /// exposure lever). Interactive-only by construction — the bias reaches
+    /// the screen through the session controller's `set_exposure`, which
+    /// headless paths never tick.
+    pub exposure_bias: f32,
     /// `--no-water` clears (`scene::set_water`). Keys the cache lever word.
     pub water: bool,
     /// `--no-coincident-cull` clears (`scene::set_coincident_cull`): keep
@@ -503,8 +524,24 @@ pub struct Opts {
     /// look earns it, but only the bistro island carries emissive maps and
     /// the CPU cost is per-session); `--no-emissive-lights` spells the
     /// default (later flags win). The default is DUPLICATED in emissive.rs's
-    /// ENABLED initializer — flip in lockstep.
+    /// ENABLED initializer — flip in lockstep. NOTE the compiled default is
+    /// only half the story since 2026-08-08: `main::upscaler_defaults` arms
+    /// it in sessions whose WIRED upscaler is TAA-class (XeSS/FSR3) unless
+    /// `emissive_lights_explicit` vetoes — see that field.
     pub emissive_lights: bool,
+    /// Did the user pick an emissive-lights state at all (flag or settings
+    /// file)? OFF is a real default, so the value cannot report whether it
+    /// was chosen — and the upscaler-class default (`main::
+    /// upscaler_defaults`: XeSS/FSR3 sessions arm NEE because a TAA-class
+    /// neighborhood clamp rejects the RTGI bounce's sparse stochastic
+    /// emissive) may only move a default the user left alone. BOTH spellings
+    /// set it — presence, not value, is the signal (the
+    /// `dxr_inline_explicit` doctrine), which makes `--no-emissive-lights`
+    /// the spelled opt-out in XeSS/FSR3 sessions. The settings file sets it
+    /// too — the `dxr_inline` precedent, NOT the fg one: the menu writes
+    /// `effects.emissive_lights`, and a saved preference must veto the
+    /// policy.
+    pub emissive_lights_explicit: bool,
     /// The `--emissive-lights` budget (bare flag keeps the default).
     /// `emissive::set_budget` owns the clamp to MAX_EMISSIVE_LIGHTS; the
     /// parse only NOTES it (the fireflies shape).
@@ -749,6 +786,9 @@ pub fn defaults() -> Opts {
         detail_ao_strength: 0.125,
         detail_untex_scale: 1.0,
         amb_bump: true,
+        rtgi: true,
+        autoexp: true,
+        exposure_bias: 0.0,
         water: true,
         coincident_cull: true,
         heightfield: false,
@@ -759,6 +799,7 @@ pub fn defaults() -> Opts {
         fireflies: true,
         fireflies_count: fireflies::DEFAULT_COUNT,
         emissive_lights: false,
+        emissive_lights_explicit: false,
         emissive_lights_count: emissive::EL_DEFAULT,
         el_cluster: "grid".to_string(),
         dxr_inline: 1,
@@ -1044,6 +1085,29 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
             // back to the plain order-2 irradiance) — runtime shading
             // lever, the depth-tint class.
             "--no-amb-bump" => opts.amb_bump = false,
+            // --no-rtgi: real-time GI off — the ambient tier reverts to flat
+            // SH×AO (bit-identical pre-RTGI arm; the GPU kernels compile the
+            // bounce block out). --rtgi spells the default (later flags win).
+            "--no-rtgi" => opts.rtgi = false,
+            "--rtgi" => opts.rtgi = true,
+            // --no-auto-exposure: the interactive aperture never adapts (a
+            // fixed 1.0, plus any --exposure-bias). --auto-exposure spells
+            // the default (later flags win). Display-stage — no gate contact.
+            "--no-auto-exposure" => opts.autoexp = false,
+            "--auto-exposure" => opts.autoexp = true,
+            "--exposure-bias" => {
+                let ev: f32 = args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .filter(|&ev: &f32| ev.is_finite() && (-8.0..=8.0).contains(&ev))
+                    .unwrap_or_else(|| {
+                        eprintln!(
+                            "--exposure-bias needs a value in stops, -8..=8 (e.g. --exposure-bias 1.5)"
+                        );
+                        std::process::exit(2);
+                    });
+                opts.exposure_bias = ev;
+            }
             // --no-water: the fountain classifies as generic glassware (the
             // pre-water-class look) instead of the water refinement (blue-green
             // tint, IOR 1.33, ripple normals); keys the cache lever word.
@@ -1135,9 +1199,13 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
             // model.obj` leaves the scene path alone — but a numeric token
             // that is not a legal budget (0) is a typo and exits rather than
             // arming at the default and landing in the positional arm.
-            "--no-emissive-lights" => opts.emissive_lights = false,
+            "--no-emissive-lights" => {
+                opts.emissive_lights = false;
+                opts.emissive_lights_explicit = true;
+            }
             "--emissive-lights" => {
                 opts.emissive_lights = true;
+                opts.emissive_lights_explicit = true;
                 let numeric = args.peek().is_some_and(|v| {
                     !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit())
                 });
@@ -2074,6 +2142,15 @@ pub fn usage() {
                 eprintln!("                irradiance response to the shading normal's deviation (normal");
                 eprintln!("                maps + detail bump read flat under sky light again; a no-op on");
                 eprintln!("                flat-shaded geometry)");
+                eprintln!("  --no-rtgi     real-time GI off: the ambient tier reverts to flat SH-sky x AO");
+                eprintln!("                (the pre-RTGI renderer bit-exactly). Default ON: one cosine bounce");
+                eprintln!("                ray per pixel per frame IS the ambient — real one-bounce GI the");
+                eprintln!("                temporal denoisers/accumulation integrate (--rtgi spells the default)");
+                eprintln!("  --no-auto-exposure  interactive aperture fixed at 1.0 (default ON: a display-stage");
+                eprintln!("                controller eases exposure toward mid-grey — enclosures open up;");
+                eprintln!("                headless paths never adapt either way)");
+                eprintln!("  --exposure-bias EV  manual aperture offset in stops (-8..=8, default 0; composes");
+                eprintln!("                with auto-exposure and still applies under --no-auto-exposure)");
                 eprintln!("  --no-water    classify the fountain as generic glassware, not the water class");
                 eprintln!("                (no blue-green tint / IOR 1.33 / ripple normals; keys the scene cache)");
                 eprintln!("  --no-coincident-cull  keep transmissive faces exactly coincident with opaque faces");
@@ -2142,7 +2219,7 @@ fn lever_snapshot() -> String {
     format!(
         "mips={} aniso={} h2n={} n2h={} smips={} tint={} spray={} depth={} detail={} dao={} \
          dstr={} daostr={} duntex={} \
-         ambb={} water={} ccull={} harm={} hon={} bloom={} clouds={} ff={} ffn={} el={} eln={} \
+         ambb={} rtgi={} aexp={} ebias={} water={} ccull={} harm={} hon={} bloom={} clouds={} ff={} ffn={} el={} eln={} \
          elcluster={} cshadow={} skylod={} dxrinline={} dxrsbt={} fsway={} famp={}",
         texture::mips_enabled(),
         texture::max_aniso(),
@@ -2158,6 +2235,9 @@ fn lever_snapshot() -> String {
         scene::detail_ao_strength(),
         scene::detail_untex_scale(),
         scene::amb_bump(),
+        crate::shade::rtgi_enabled(),
+        crate::autoexp::enabled(),
+        crate::autoexp::bias(),
         scene::water_enabled(),
         scene::coincident_cull_enabled(),
         bvh::height_armed(),
@@ -2217,6 +2297,10 @@ pub fn self_test() -> Result<(), String> {
         "--detail-untex-scale",
         "0.25",
         "--no-amb-bump",
+        "--no-rtgi",
+        "--no-auto-exposure",
+        "--exposure-bias",
+        "1.5",
         "--no-water",
         "--no-coincident-cull",
         "--heightfield",
@@ -2276,6 +2360,9 @@ pub fn self_test() -> Result<(), String> {
         ("detail_ao_strength", o.detail_ao_strength == 0.5),
         ("detail_untex_scale", o.detail_untex_scale == 0.25),
         ("amb_bump", !o.amb_bump),
+        ("rtgi", !o.rtgi),
+        ("autoexp", !o.autoexp),
+        ("exposure_bias", o.exposure_bias == 1.5),
         ("water", !o.water),
         ("coincident_cull", !o.coincident_cull),
         ("heightfield", o.heightfield),
@@ -2288,6 +2375,9 @@ pub fn self_test() -> Result<(), String> {
         // Default OFF: "moved" means ARMED (the trailing --emissive-lights 9
         // wins over the earlier --no-emissive-lights in the argv above).
         ("emissive_lights", o.emissive_lights),
+        // Either spelling sets it (this argv carries both) — the
+        // upscaler-default veto, pinned properly in section 2 below.
+        ("emissive_lights_explicit", o.emissive_lights_explicit),
         ("emissive_lights_count", o.emissive_lights_count == 9),
         // A field, not a process global — lever_snapshot's elcluster entry
         // additionally proves the parse never called set_cluster_mode.
@@ -2424,6 +2514,22 @@ pub fn self_test() -> Result<(), String> {
     let di = parse_argv(&["--dxr-inline", "1"]).opts;
     if di.dxr_inline != 1 || !di.dxr_inline_explicit {
         return Err("--dxr-inline 1 must set dxr_inline_explicit (the vendor-default veto)".into());
+    }
+    if parse_argv(&[]).opts.emissive_lights_explicit {
+        return Err("--emissive-lights was not passed; explicit must stay false".into());
+    }
+    // The upscaler-default veto pin: `--no-emissive-lights` is a real CHOICE
+    // even though OFF is also the compiled default — presence, not value, is
+    // the signal (the dxr_inline doctrine), and it is what lets a XeSS/FSR3
+    // user pin OFF against main::upscaler_defaults.
+    let el = parse_argv(&["--no-emissive-lights"]).opts;
+    if el.emissive_lights || !el.emissive_lights_explicit {
+        return Err(
+            "--no-emissive-lights must disarm AND set emissive_lights_explicit (the upscaler-default veto)".into(),
+        );
+    }
+    if !parse_argv(&["--emissive-lights"]).opts.emissive_lights_explicit {
+        return Err("--emissive-lights must set emissive_lights_explicit".into());
     }
     if parse_argv(&["--world", "--no-world"]).world_flag != Some(false) {
         return Err("--world --no-world must resolve to Some(false)".into());

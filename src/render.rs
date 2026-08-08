@@ -621,6 +621,11 @@ enum TilePend {
 /// Sound because the cull is an OPTIMIZATION of an exact predicate — full
 /// set and culled set shade bit-identically.
 fn full_el<'c>(ctx: &'c FrameCtx) -> Option<&'c crate::emissive::EmissiveLights> {
+    // NEE stays live under RTGI (the NEE-keep rule, 2026-08-08): the bounce
+    // suppresses its own emissive display-add whenever `el` is Some, so the
+    // two mechanisms never double-count and TAA-class upscalers (XeSS/FSR3,
+    // whose neighborhood clamp rejects sparse stochastic emissive) keep the
+    // deterministic pools. Only fb.gi drops NEE — its gather delivers.
     (!ctx.q.fb.gi && ctx.scene.emissive.count > 0 && crate::emissive::enabled())
         .then_some(&ctx.scene.emissive)
 }
@@ -2161,6 +2166,7 @@ pub fn resolve(
     info: &[AtomicU32],
     samples: u32,
     overlay_on: bool,
+    exposure: f32,
     present: &mut [u32],
     rw: usize,
     rh: usize,
@@ -2186,7 +2192,7 @@ pub fn resolve(
                     }
                 });
             },
-            |hdr| tonemap_to(hdr, info, overlay_on, present, rw, rh, ww, wh),
+            |hdr| tonemap_to(hdr, info, overlay_on, exposure, present, rw, rh, ww, wh),
         );
         return;
     }
@@ -2201,7 +2207,7 @@ pub fn resolve(
                 f32::from_bits(accum[i + 1].load(Relaxed)),
                 f32::from_bits(accum[i + 2].load(Relaxed)),
             ) * inv;
-            *out = present_px(c, info, overlay_on, sx, sy, rw, rh);
+            *out = present_px(c, info, overlay_on, exposure, sx, sy, rw, rh);
         }
     });
 }
@@ -2212,6 +2218,7 @@ pub fn resolve_hdr(
     hdr: &[f32],
     info: &[AtomicU32],
     overlay_on: bool,
+    exposure: f32,
     present: &mut [u32],
     rw: usize,
     rh: usize,
@@ -2224,18 +2231,21 @@ pub fn resolve_hdr(
     // materializes its own HDR image and calls `tonemap_to` below with the glare
     // already applied, so nothing can double-bloom.
     crate::bloom::with_glare(hdr, rw, rh, |hdr| {
-        tonemap_to(hdr, info, overlay_on, present, rw, rh, ww, wh)
+        tonemap_to(hdr, info, overlay_on, exposure, present, rw, rh, ww, wh)
     });
 }
 
 /// Tonemap + overlay + upscale an HDR image into the present buffer. The one
 /// CPU present loop, shared by `resolve` and `resolve_hdr`; glare is the
-/// caller's business, so this can never apply it twice.
+/// caller's business, so this can never apply it twice. `exposure` is the
+/// session aperture (autoexp.rs) — 1.0 on every headless path, and applied
+/// pre-curve/post-glare exactly as the GPU tonemap PS does.
 #[allow(clippy::too_many_arguments)]
 fn tonemap_to(
     hdr: &[f32],
     info: &[AtomicU32],
     overlay_on: bool,
+    exposure: f32,
     present: &mut [u32],
     rw: usize,
     rh: usize,
@@ -2248,7 +2258,7 @@ fn tonemap_to(
             let sx = (wx * rw / ww).min(rw - 1);
             let i = (sy * rw + sx) * 3;
             let c = Vec3A::new(hdr[i], hdr[i + 1], hdr[i + 2]);
-            *out = present_px(c, info, overlay_on, sx, sy, rw, rh);
+            *out = present_px(c, info, overlay_on, exposure, sx, sy, rw, rh);
         }
     });
 }
@@ -2261,6 +2271,7 @@ pub fn resolve_sdr10(
     info: &[AtomicU32],
     samples: u32,
     overlay_on: bool,
+    exposure: f32,
     present: &mut [u32],
     rw: usize,
     rh: usize,
@@ -2286,7 +2297,7 @@ pub fn resolve_sdr10(
                     }
                 });
             },
-            |hdr| tonemap_to_sdr10(hdr, info, overlay_on, present, rw, rh, ww, wh),
+            |hdr| tonemap_to_sdr10(hdr, info, overlay_on, exposure, present, rw, rh, ww, wh),
         );
         return;
     }
@@ -2301,17 +2312,19 @@ pub fn resolve_sdr10(
                 f32::from_bits(accum[i + 1].load(Relaxed)),
                 f32::from_bits(accum[i + 2].load(Relaxed)),
             ) * inv;
-            *out = present_px_sdr10(c, info, overlay_on, sx, sy, rw, rh);
+            *out = present_px_sdr10(c, info, overlay_on, exposure, sx, sy, rw, rh);
         }
     });
 }
 
 /// `resolve_hdr` for the Sdr10 swapchain — the OIDN / NPPD / XeSS-post output
 /// path, which hands over an already-averaged linear HDR buffer.
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_hdr_sdr10(
     hdr: &[f32],
     info: &[AtomicU32],
     overlay_on: bool,
+    exposure: f32,
     present: &mut [u32],
     rw: usize,
     rh: usize,
@@ -2321,17 +2334,19 @@ pub fn resolve_hdr_sdr10(
     crate::zone!("resolve-hdr-sdr10");
     // The Sdr10 twin of `resolve_hdr`: the CPU denoisers' glare comes from here.
     crate::bloom::with_glare(hdr, rw, rh, |hdr| {
-        tonemap_to_sdr10(hdr, info, overlay_on, present, rw, rh, ww, wh)
+        tonemap_to_sdr10(hdr, info, overlay_on, exposure, present, rw, rh, ww, wh)
     });
 }
 
 /// `tonemap_to` for the Sdr10 swapchain — the one Sdr10 present loop, shared
 /// by `resolve_sdr10` and `resolve_hdr_sdr10`. Glare is the caller's business,
 /// so this can never apply it twice.
+#[allow(clippy::too_many_arguments)]
 fn tonemap_to_sdr10(
     hdr: &[f32],
     info: &[AtomicU32],
     overlay_on: bool,
+    exposure: f32,
     present: &mut [u32],
     rw: usize,
     rh: usize,
@@ -2344,7 +2359,7 @@ fn tonemap_to_sdr10(
             let sx = (wx * rw / ww).min(rw - 1);
             let i = (sy * rw + sx) * 3;
             let c = Vec3A::new(hdr[i], hdr[i + 1], hdr[i + 2]);
-            *out = present_px_sdr10(c, info, overlay_on, sx, sy, rw, rh);
+            *out = present_px_sdr10(c, info, overlay_on, exposure, sx, sy, rw, rh);
         }
     });
 }
@@ -2477,17 +2492,22 @@ fn overlay_px(
 /// the ladders' last rung). `ToneParams::SDR` is the pre-HDR curve exactly —
 /// gated bit-for-bit by `tone::self_test` — and `shape` has already applied
 /// the gamma, so the overlay lands in display space with no extra work.
+/// `exposure` rides the params (1.0 = the bit-identical off arm — `shape`
+/// branches around the multiply, so every headless caller is structurally
+/// the pre-exposure path).
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn present_px(
     c: Vec3A,
     info: &[AtomicU32],
     overlay_on: bool,
+    exposure: f32,
     sx: usize,
     sy: usize,
     rw: usize,
     rh: usize,
 ) -> u32 {
-    let mut c = tone::shape(c, tone::ToneParams::SDR);
+    let mut c = tone::shape(c, tone::ToneParams { exposure, ..tone::ToneParams::SDR });
     if overlay_on {
         c = overlay_px(c, info, sx, sy, rw, rh);
     }
@@ -2502,16 +2522,18 @@ fn present_px(
 /// is `r | g<<10 | b<<20 | 3<<30` (R in the LOW bits, R10G10B10A2's lane
 /// order, opposite the SDR pack's BGRA8).
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn present_px_sdr10(
     c: Vec3A,
     info: &[AtomicU32],
     overlay_on: bool,
+    exposure: f32,
     sx: usize,
     sy: usize,
     rw: usize,
     rh: usize,
 ) -> u32 {
-    let mut c = tone::shape(c, tone::ToneParams::SDR);
+    let mut c = tone::shape(c, tone::ToneParams { exposure, ..tone::ToneParams::SDR });
     if overlay_on {
         c = overlay_px(c, info, sx, sy, rw, rh);
     }

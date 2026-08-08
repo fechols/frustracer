@@ -18,7 +18,9 @@
 //
 // The cbuffer DECLARATION mirrors tonemap.hlsl's Params exactly — this pass
 // reuses the tonemap root signature and is recorded through `Passes::record`,
-// so the 8 root constants arrive in that layout; only scale/mode are read.
+// so the 9 root constants arrive in that layout; only scale/mode are read
+// (exposure DELIBERATELY not: the HUD is authored in display space — exposing
+// it would dim the UI with the scene).
 Texture2D<float4> src : register(t0);
 
 cbuffer Params : register(b0) {
@@ -29,6 +31,7 @@ cbuffer Params : register(b0) {
     float headroom;
     float scale;
     float mode; // 1 = gamma 2.2 (SDR/Sdr10), 2 = HDR10 PQ (0 retired with scRGB)
+    float exposure; // never read here — see the header note
 }
 
 // tone.rs twins (see tonemap.hlsl — same literals, change all three together).

@@ -30,6 +30,39 @@ pub struct Quality {
     pub ao_samples: u32,
     pub reflections: bool,
     pub fb: FrustumBounce,
+    /// REAL-TIME GI: one cosine-sampled bounce ray per pixel per frame IS the
+    /// ambient term (shaded at `hemi::BOUNCE_Q` — its SH×AO ambient is the
+    /// tail standing in for deeper bounces), replacing `amb_irradiance × AO`.
+    /// Primary path only (`depth == 0`); the still-frame fb tiers take
+    /// precedence. Session-armed via `set_rtgi` (`--no-rtgi`), read by the
+    /// constructors below so every session path inherits ONE decision — check
+    /// harnesses pin the field per pass instead of mutating process state.
+    pub rtgi: bool,
+    /// May this invocation's shading add material emissive to the display
+    /// color? TRUE everywhere except the RTGI bounce while cluster NEE is
+    /// live that frame (the NEE-keep rule, 2026-08-08 — the XeSS feel-test:
+    /// a TAA-class upscaler's neighborhood clamp rejects sparse stochastic
+    /// emissive, so armed sessions keep the deterministic NEE pools and the
+    /// bounce suppresses emitter-as-emitter transport instead — exactly one
+    /// delivery per frame). Propagates through the bounce's own glass chain
+    /// via the recursion's `..*q`; the hemi gather keeps the add (fb.gi
+    /// drops NEE instead — the original inverted once-per-path rule). The
+    /// GPU twin is shade.hlsli's `cam_lights || !FLAG_EMISSIVE` gate on the
+    /// emissive block — no new shader argument needed.
+    pub emissive_display: bool,
+}
+
+/// Session lever for real-time GI (the `scene::amb_bump` lever shape):
+/// DEFAULT ON, `--no-rtgi` clears (main's lever block). Read by the `Quality`
+/// constructors — never inside `shade()` itself.
+static RTGI: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_rtgi(on: bool) {
+    RTGI.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn rtgi_enabled() -> bool {
+    RTGI.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 impl Quality {
@@ -43,18 +76,24 @@ impl Quality {
                 ao_samples: 0,
                 reflections: false,
                 fb: FrustumBounce { depth: 2, ..FrustumBounce::OFF },
+                rtgi: rtgi_enabled(),
+                emissive_display: true,
             },
             3 => Quality {
                 shadow_samples: 4,
                 ao_samples: 4,
                 reflections: true,
                 fb: FrustumBounce { depth: 4, ..FrustumBounce::OFF },
+                rtgi: rtgi_enabled(),
+                emissive_display: true,
             },
             _ => Quality {
                 shadow_samples: 2,
                 ao_samples: 2,
                 reflections: true,
                 fb: FrustumBounce { depth: 3, ..FrustumBounce::OFF },
+                rtgi: rtgi_enabled(),
+                emissive_display: true,
             },
         }
     }
@@ -70,6 +109,11 @@ impl Quality {
             ao_samples: 1,
             reflections: true,
             fb: FrustumBounce::OFF,
+            // RTGI rides the upscaler contract: the bounce is per-frame
+            // stochastic noise the temporal integrator launders, exactly like
+            // the 1-spp shadow/AO rays.
+            rtgi: rtgi_enabled(),
+            emissive_display: true,
         }
     }
 
@@ -82,6 +126,10 @@ impl Quality {
             ao_samples: 0,
             reflections: self.reflections,
             fb: FrustumBounce::OFF,
+            // RTGI stays ON while moving — the bounce IS the ambient (the arm
+            // never reads ao_samples), and accumulation/denoisers converge it.
+            rtgi: self.rtgi,
+            emissive_display: true,
         }
     }
 }
@@ -175,8 +223,8 @@ pub const VIS_MAX: usize = 8;
 /// Dev cost-attribution ablations for the CPU shade path — the twin of
 /// `gpu::trace`'s `abl_has`, and read from the same `FR_ABL` variable.
 ///
-/// `FR_ABL=noshadow,noao,norefl,noglass` neutralize one secondary-ray consumer
-/// each; `nosec` arms all four. **NOT shipping levers**: every arm changes the
+/// `FR_ABL=noshadow,noao,norefl,noglass,nogi` neutralize one secondary-ray
+/// consumer each; `nosec` arms all five. **NOT shipping levers**: every arm changes the
 /// image, which is the point — you are measuring a term against its own
 /// absence (the `--no-wide-levels` idiom). Unset is bit-identical, and the
 /// per-ray cost when unset is one already-initialized `OnceLock` deref.
@@ -200,6 +248,9 @@ pub struct Abl {
     pub norefl: bool,
     /// Skip the refraction/TIR continuation chain.
     pub noglass: bool,
+    /// Skip the RTGI bounce (ray + recursive shade — ambient degrades to the
+    /// unoccluded sky gather; the norefl shape for a recursive consumer).
+    pub nogi: bool,
     /// REPRO ARM, not a cost probe: restore the pre-fix `surface_point` flip,
     /// which decided on the INTERPOLATED normal and so inverted the eps-offset
     /// axis across every smooth silhouette — the black-limb-band bug. Brings
@@ -218,6 +269,7 @@ pub fn abl() -> &'static Abl {
             noao: all || v.contains("noao"),
             norefl: all || v.contains("norefl"),
             noglass: all || v.contains("noglass"),
+            nogi: all || v.contains("nogi"),
             // Deliberately NOT in `nosec`: this is a repro arm, not a
             // secondary-ray cost probe, and folding it in would silently
             // reintroduce the bug under every cost measurement.
@@ -226,11 +278,11 @@ pub fn abl() -> &'static Abl {
         // Loud on departure from the default — a silent ablation is how a
         // measurement gets attributed to the wrong thing (the probe-reach trap
         // recorded in CLAUDE.md's pack-split section).
-        if a.noshadow || a.noao || a.norefl || a.noglass || a.nofaceflip {
+        if a.noshadow || a.noao || a.norefl || a.noglass || a.nogi || a.nofaceflip {
             eprintln!(
-                "FR_ABL (cpu shade): noshadow={} noao={} norefl={} noglass={} nofaceflip={} \
+                "FR_ABL (cpu shade): noshadow={} noao={} norefl={} noglass={} nogi={} nofaceflip={} \
                  — THE IMAGE IS DELIBERATELY WRONG (cost probe / repro arm)",
-                a.noshadow, a.noao, a.norefl, a.noglass, a.nofaceflip
+                a.noshadow, a.noao, a.norefl, a.noglass, a.nogi, a.nofaceflip
             );
         }
         a
@@ -1290,6 +1342,72 @@ pub fn shade(
         let (t1, t2) = onb(n);
         let accel = crate::ftree::Accel::of(bvh);
         crate::hemi::gi(scene, accel, p, n, t1, t2, q.fb.depth, sun, cl, depth, hemi_share, rng, None, ls)
+    } else if q.rtgi && depth == 0 && !q.fb.ao {
+        // REAL-TIME GI: one cosine-sampled bounce ray IS the ambient. Cosine
+        // importance sampling makes the single sampled radiance the estimate
+        // of the irradiance-convention ambient directly (no π — the
+        // `irradiance()` L-in-L-out convention), so a fresh draw per frame
+        // converges to the true gathered GI under accumulation and reads as
+        // laundered noise to the temporal denoisers (the 1-spp contract).
+        // The bounce hit shades at hemi's leaf policy (`BOUNCE_Q`: 1 shadow +
+        // 1 AO + SH×AO ambient — the tail standing in for deeper bounces);
+        // the miss is `sky::gather` — NO sun disc (the once-per-path rule:
+        // direct_d already delivers the sun with its own shadow ray, and the
+        // hemi GI leaf takes the identical arm for the identical reason).
+        // Primary path only (`depth == 0` — belt to BOUNCE_Q's `rtgi: false`
+        // braces); the still-frame fb tiers take precedence (fb.gi above,
+        // fb.ao via the guard here). Runs IDENTICALLY under VisCtl
+        // Off/Capture/Apply — it reads and writes no VisRecord field, and
+        // both arms draw the same stream, so no burn is needed and the
+        // adaptive same-seed alignment holds per-pixel. `prim.ao` stays 0.0
+        // (the fb.gi precedent: real RGB irradiance is not an AO scalar —
+        // the GI term rides FSR's exact-remainder residual).
+        let (t1, t2) = onb(n);
+        let r1 = rng.f32();
+        let r2 = rng.f32();
+        let dir = cosine_dir(n, t1, t2, r1, r2);
+        ls.secondary_rays += 1;
+        ls.rtgi_rays += 1;
+        let bray = Ray::new(p, dir);
+        // FR_ABL=nogi: drop the ray AND the bounce shade behind it (the
+        // norefl shape — a recursive consumer's cost probe removes the whole
+        // continuation): ambient degrades to the unoccluded sky gather.
+        let bhit = if abl().nogi {
+            None
+        } else {
+            bvh.intersect(scene, &bray, 0.0, f32::INFINITY, &mut ls.ray_nodes)
+        };
+        // The NEE-keep rule (2026-08-08, the XeSS feel-test): when cluster
+        // NEE is live this frame (`el` Some — the camera path's arming), the
+        // bounce must NOT re-deliver emitter-as-emitter transport, so its
+        // whole subtree shades with the emissive display-add suppressed
+        // (propagates through the chain via the recursion's `..*q`). NEE
+        // unarmed keeps the add — the bounce is then the only delivery
+        // (integrated by RR/accumulation; a TAA upscaler's neighborhood
+        // clamp rejects it, the documented known-accept).
+        let bq = Quality { emissive_display: el.is_none(), ..crate::hemi::BOUNCE_Q };
+        match bhit {
+            Some(bh) => shade(
+                scene,
+                bvh,
+                &bray,
+                &bh,
+                None,
+                &bq,
+                rng,
+                sun,
+                cl,
+                Cone::bounce(),
+                depth + 1,
+                ls,
+                None,          // secondaries never capture prim
+                VisCtl::Off,   // bounce rays never share visibility
+                None,          // no hemi share off the fb tiers
+                None,          // fireflies don't light bounce surfaces (the stars rule)
+                None,          // bounce surfaces take no cluster NEE (the hemi rule)
+            ),
+            None => crate::sky::gather(dir, sun, scene.sky_scale, scene.night),
+        }
     } else {
         let mut ao = 1.0;
         if q.fb.ao {
@@ -1428,7 +1546,11 @@ pub fn shade(
     // picking this very term up off bounce hits. At most one of those two
     // lights other surfaces per frame (FLAG/fb gating), and this add is
     // never conditional on either.
-    if mat.emissive != Vec3A::ZERO || mat.emissive_tex != NO_TEX {
+    // `q.emissive_display` is TRUE on every path except the RTGI bounce
+    // subtree while cluster NEE is live (the NEE-keep rule — see the Quality
+    // field doc): there the NEE already delivers emitter-as-emitter
+    // transport, so this add would double-count it.
+    if q.emissive_display && (mat.emissive != Vec3A::ZERO || mat.emissive_tex != NO_TEX) {
         let e = match (mat.emissive_tex != NO_TEX, map_uv) {
             (true, Some(uv)) => {
                 mat.emissive * filt.sample(&scene.textures[mat.emissive_tex as usize], uv, true)
@@ -1490,7 +1612,9 @@ pub fn shade(
                     // path), mirroring hemi's recursion-free leaf policy —
                     // otherwise every glossy pixel would pay a second full
                     // hemisphere integration (and shaft build) at depth 1.
-                    let rq = Quality { fb: FrustumBounce::OFF, ..*q };
+                    // rtgi: false for parity with the GPU's lap-0-only shape
+                    // (the depth gate already makes inheritance inert).
+                    let rq = Quality { fb: FrustumBounce::OFF, rtgi: false, ..*q };
                     // The child cone starts at this hit's width — reflected
                     // hits read footprints grown by the full path length.
                     let rcone = Cone { w0: cone_w, spread: cone.spread, aniso: cone.aniso };
@@ -1631,7 +1755,7 @@ pub fn shade(
         if tput > 1e-3 && !abl().noglass {
             let tray = Ray::new(torig, tdir);
             ls.secondary_rays += 1;
-            let rq = Quality { fb: FrustumBounce::OFF, ..*q };
+            let rq = Quality { fb: FrustumBounce::OFF, rtgi: false, ..*q };
             let tcone = Cone { w0: cone_w, spread: cone.spread, aniso: cone.aniso };
             // Does the continuation travel INSIDE the medium? Entering
             // crosses in; TIR (only possible on the exit attempt) stays in; a

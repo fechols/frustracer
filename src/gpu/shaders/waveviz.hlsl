@@ -10,7 +10,7 @@
 //
 // The cbuffer REUSES register b0 through the shared root signature but with
 // THIS pass's own layout — root constants are per-draw state, so the
-// tonemap/hud draws are untouched (their 8 DWORDs arrive in their layout,
+// tonemap/hud draws are untouched (their 9 DWORDs arrive in their layout,
 // ours in this one; record_waveviz writes it).
 StructuredBuffer<float> tickets : register(t2);
 
@@ -23,6 +23,7 @@ cbuffer Params : register(b0) {
     float mode;   // 1 = gamma 2.2 (SDR/Sdr10), 2 = HDR10 PQ (hud.hlsl's split)
     float _wvp0;
     float _wvp1;
+    float _wvp2;  // pads to NUM_ROOT_CONSTS (the tonemap layout gained exposure)
 }
 
 // tone.rs twins (see tonemap.hlsl / hud.hlsl — same literals, change all

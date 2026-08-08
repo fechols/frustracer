@@ -49,6 +49,14 @@
 #else
 #define ABL_TRACE_GLASS(o, d, t0, t1, h) trace_closest(o, d, t0, t1, h)
 #endif
+#if defined(ABL_NOSEC) || defined(ABL_NOGI)
+// FR_ABL=nogi: drop the RTGI bounce ray AND the bounce shade behind it (the
+// norefl shape for a recursive consumer) — ambient degrades to the unoccluded
+// sky gather. The 2 direction draws above the trace still run (shade.rs).
+#define ABL_TRACE_GI(o, d, t0, t1, h) false
+#else
+#define ABL_TRACE_GI(o, d, t0, t1, h) trace_closest(o, d, t0, t1, h)
+#endif
 
 // t0 (bvh nodes) and t1 (tri_idx) belong to the frustum kernels.
 StructuredBuffer<float3> positions : register(t2);
@@ -741,6 +749,10 @@ void glass_snell(float3 rd, float3 v, float3 ns, float3 n, float3 hit_p,
 // Whitted shading of a committed primary hit, reflection bounce included.
 // (ro, rd) is the ray that produced `hit`; rd unit-length. RNG draw order
 // matches shade.rs exactly per lap: shadow pairs, AO pairs, reflection pair.
+// ONE cross-pipeline exception (RTGI): shade_full's bounce draws land AFTER
+// this DFS returns, where the CPU arm draws them at its ambient-tier
+// position — permitted because CPU and GPU are different streams by design
+// (sequences differ, means match); within each pipeline the order is fixed.
 // Quality is explicit (n_shadow / n_ao / refl) so the hemi leaf pass can run
 // the BOUNCE_Q policy (1/0/false) through the same code.
 // `split_ambient` (hemi mode, lap 0 only): the primary ambient term is
@@ -1344,7 +1356,14 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
         // Emitted radiance — additive per lap, OUTSIDE the kd*kt factor, so
         // emitters appear in reflections and through glass (shade.rs). The
         // guard keeps emissive-free materials bit-identical.
-        if (SHADE_MAT_EMISSIVE(mat)) {
+        // THE NEE-KEEP GATE (shade.rs Quality::emissive_display's GPU twin,
+        // no new argument): camera laps (cam_lights=true) always add; a
+        // BOUNCE invocation (cam_lights=false) adds only when cluster NEE is
+        // NOT live this frame — hemi's fb.gi bounce keeps the add because
+        // FLAG_EMISSIVE clears at fb_mode==2 (the gather delivers), the RTGI
+        // bounce suppresses under a live flag (NEE delivers), and an unarmed
+        // frame's clear flag keeps the RTGI bounce as the only delivery.
+        if (SHADE_MAT_EMISSIVE(mat) && (cam_lights || (flags & FLAG_EMISSIVE) == 0u)) {
             float3 emis = mat.emissive;
             if (SHADE_MAT_EMISTEX(mat)) {
                 emis *= tex_sample(mat.emissive_tex, map_uv, filt);
@@ -1618,11 +1637,78 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
 // the ray cone is the primary one (apex at the camera, one-pixel spread).
 // `el_mask` forwards verbatim — the leaf kernel passes its tile cull, every
 // tile-less caller (reference, DXR raygen/chs) the full ~0 mask.
+//
+// REAL-TIME GI (#ifdef RTGI, --no-rtgi compiles it out — the off arm is the
+// verbatim pre-RTGI call): when FLAG_RTGI is live the primary runs in
+// split-ambient mode (amb_w = tput·kd·kt·dcav, NO SH pre-multiply — the flag
+// derivation guarantees fb_mode == 0 whenever the bit is set, so the
+// fb_mode==1 pre-multiply in the split arm never fires here) and ONE
+// cosine-sampled bounce ray IS the ambient: hit → a second shade_split at the
+// BOUNCE_Q literals (hemi_leaf.hlsl:99's call, lockstep — 1 shadow / 1 AO /
+// no refl / octant cone / no cam lights; its SH×AO ambient is the tail
+// standing in for deeper bounces), miss → sky_gather (NO sun disc — the
+// once-per-path rule; direct_d already delivers the sun). `c += amb_w * li`
+// with no π: cosine importance sampling makes the sampled radiance the
+// irradiance-convention estimate directly (shade.rs's RTGI arm — the CPU
+// source of truth; its rng draws sit at the ambient-tier position while
+// these land after the DFS, a permitted cross-pipeline stream divergence).
+// Bounce rays cannot re-bounce: the inner call is shade_split, never this
+// entry. Flag-off frames pass split_ambient=false — value-identical to the
+// pre-feature call (the runtime lever); fb frames clear the flag (the hemi
+// tiers take precedence).
 float3 shade_full(float3 ro, float3 rd, HitInfo hit, inout uint rng, uint2 el_mask,
                   out PrimSurf prim) {
     float3 w, o, n;
     // Camera rays (and their reflection/glass continuations) resolve their
     // footprint anisotropically when the session asks for it — FLAG_ANISO.
+#ifdef RTGI
+    bool rtgi = (flags & FLAG_RTGI) != 0u;
+    float3 c = shade_split(ro, rd, hit, rng, shadow_samples, ao_samples, reflections != 0u,
+                           rtgi, 0.0, pixel_cone, true, true, el_mask, w, o, n, prim
+#ifdef DXR_SBT_RECURSE
+                           // The DEPTH-0 root: chs_shade's recursion-tagged
+                           // continuations bypass this entry and call shade_split
+                           // with the payload's own depth.
+                           , 0u
+#endif
+    );
+    if (rtgi) {
+        // Exactly the CPU arm's 2 direction draws, then the bounce shade's
+        // stream-shared draws (hit: 1 shadow pair + 1 AO pair; miss: none).
+        float gr1 = rng_next(rng);
+        float gr2 = rng_next(rng);
+        float3 bt1, bt2;
+        onb(n, bt1, bt2);
+        float3 bd = cosine_dir(n, bt1, bt2, gr1, gr2);
+#ifdef HAVE_COUNTERS
+        // Liveness stat (the CTR_TRANS_PASS shape — raw atomic in shading
+        // code; reference/DXR units carry no counters and compile this out).
+        uint _g;
+        InterlockedAdd(counters[CTR_RTGI_RAYS], 1u, _g);
+#endif
+        HitInfo bh;
+        float3 li;
+        if (ABL_TRACE_GI(o, bd, 0.0, FLT_MAX, bh)) {
+            float3 w3, o3, n3;
+            PrimSurf ps_unused; // bounce rays never capture (secondary-ray rule)
+            li = shade_split(o, bd, bh, rng, 1u, 1u, false, false,
+                             0.0, HEMI_CONE_SPREAD, false, false,
+                             uint2(0xffffffffu, 0xffffffffu), w3, o3, n3, ps_unused
+#ifdef DXR_SBT_RECURSE
+                             // The bounce surface shades at depth 1 (the
+                             // CPU's `depth + 1`), so its glass chain keeps
+                             // the CPU's interface budget and the recursion
+                             // stays under the declared 5.
+                             , 1u
+#endif
+            );
+        } else {
+            li = sky_gather(bd);
+        }
+        c += w * li;
+    }
+    return c;
+#else
     return shade_split(ro, rd, hit, rng, shadow_samples, ao_samples, reflections != 0u,
                        false, 0.0, pixel_cone, true, true, el_mask, w, o, n, prim
 #ifdef DXR_SBT_RECURSE
@@ -1632,4 +1718,5 @@ float3 shade_full(float3 ro, float3 rd, HitInfo hit, inout uint rng, uint2 el_ma
                        , 0u
 #endif
     );
+#endif
 }

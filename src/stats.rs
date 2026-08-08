@@ -24,6 +24,10 @@ pub struct Stats {
     /// `secondary_rays`) — the `--check-gpu`/`--check-dxr` must-fire signal on
     /// emissive scenes (src/emissive.rs).
     pub emissive_rays: AtomicU64,
+    /// RTGI bounce rays (a subset of `secondary_rays`) — the run_check
+    /// must-fire that real-time GI is live on armed sessions, exactly 0 under
+    /// `--no-rtgi` (src/shade.rs's RTGI ambient arm).
+    pub rtgi_rays: AtomicU64,
     /// Leaf/capped tiles that ran the emissive per-tile light cull
     /// (`emissive::cull_tile`) — the run_check must-fire that the cull is
     /// live on armed emissive scenes (hybrid arms only; the plain reference
@@ -121,6 +125,8 @@ pub struct LocalStats {
     pub secondary_rays: u64,
     /// Emissive-NEE subset of `secondary_rays` (see `Stats::emissive_rays`).
     pub emissive_rays: u64,
+    /// RTGI bounce-ray subset of `secondary_rays` (see `Stats::rtgi_rays`).
+    pub rtgi_rays: u64,
     /// Tiles that ran the emissive light cull (see `Stats::el_cull_tiles`).
     pub el_cull_tiles: u64,
     /// Lights culled by those tiles (see `Stats::el_cull_culled`).
@@ -178,6 +184,7 @@ impl LocalStats {
         self.primary_rays += o.primary_rays;
         self.secondary_rays += o.secondary_rays;
         self.emissive_rays += o.emissive_rays;
+        self.rtgi_rays += o.rtgi_rays;
         self.el_cull_tiles += o.el_cull_tiles;
         self.el_cull_culled += o.el_cull_culled;
         self.sky_pixels += o.sky_pixels;
@@ -232,6 +239,7 @@ impl Stats {
         self.primary_rays.store(0, Relaxed);
         self.secondary_rays.store(0, Relaxed);
         self.emissive_rays.store(0, Relaxed);
+        self.rtgi_rays.store(0, Relaxed);
         self.el_cull_tiles.store(0, Relaxed);
         self.el_cull_culled.store(0, Relaxed);
         self.sky_pixels.store(0, Relaxed);
@@ -297,6 +305,9 @@ impl Stats {
         }
         if l.emissive_rays > 0 {
             self.emissive_rays.fetch_add(l.emissive_rays, Relaxed);
+        }
+        if l.rtgi_rays > 0 {
+            self.rtgi_rays.fetch_add(l.rtgi_rays, Relaxed);
         }
         if l.el_cull_tiles > 0 {
             self.el_cull_tiles.fetch_add(l.el_cull_tiles, Relaxed);
@@ -562,8 +573,12 @@ impl Stats {
         } else {
             String::new()
         };
+        // RTGI bounce rays — absent under --no-rtgi / fb frames (the
+        // conditional-segment precedent).
+        let grays = self.rtgi_rays.load(Relaxed);
+        let rtgi = if grays > 0 { format!(" | rtgi: rays {grays}") } else { String::new() };
         format!(
-            "tiles {tiles} | fr-queries {fq} (blocked {blocked}) | cut mean {cut_mean:.1} (ovf {ovf}) | nodes: frustum {fnodes} + ray {rnodes}{rsplit} = {} | rays: {prim} prim + {sec} sec | sky-px (0 rays) {sky} | coarse-px {coarse} (smp {csmp}) | temporal: seeds {tseeds} sky {tsky} cells {ttests} | mean t_start/t_hit {skip:.2}{adopt}{tring}{replay}{hemi}{share}{adapt}{defer}{tri}{elcull}",
+            "tiles {tiles} | fr-queries {fq} (blocked {blocked}) | cut mean {cut_mean:.1} (ovf {ovf}) | nodes: frustum {fnodes} + ray {rnodes}{rsplit} = {} | rays: {prim} prim + {sec} sec | sky-px (0 rays) {sky} | coarse-px {coarse} (smp {csmp}) | temporal: seeds {tseeds} sky {tsky} cells {ttests} | mean t_start/t_hit {skip:.2}{adopt}{tring}{replay}{hemi}{share}{adapt}{defer}{tri}{elcull}{rtgi}",
             fnodes + rnodes
         )
     }

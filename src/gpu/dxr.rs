@@ -692,7 +692,7 @@ impl DxrGpu {
         let dd = dd.as_str();
         let sway_def = trace::sway_defs(&scene_gpu);
         let defs = format!(
-            "{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
             // SCENE_EMPTY is INERT in this pipeline and is carried only so the
             // two arms' define sets stay comparable: the guards it gates live in
             // frustum.hlsli and rt_sw.hlsli, neither of which this library
@@ -710,7 +710,11 @@ impl DxrGpu {
             sway_def,
             // FR_ABL, shared with the wavefront — without it every cloud cost
             // attribution was wavefront-only and silently incomparable here.
-            trace::abl_defs()
+            trace::abl_defs(),
+            // Real-time GI (--no-rtgi omits): shade_full's bounce block —
+            // shared with the wavefront so the two pipelines' shading stays
+            // one source (the probe-reach rule).
+            trace::rtgi_defs()
         );
         // The cloud shading caches, snapshotted at construction like TraceGpu:
         // the library is compiled against these, the buffers sized against them,

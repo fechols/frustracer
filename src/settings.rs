@@ -172,6 +172,10 @@ opt_fields! {
     pub struct Effects {
         /// --no-bloom inverse (live, display-stage — no reset)
         pub bloom: bool,
+        /// --no-auto-exposure inverse (live, display-stage — no reset)
+        pub autoexp: bool,
+        /// --exposure-bias in EV (live, display-stage — no reset)
+        pub exposure_bias: f32,
         /// --no-clouds inverse (live: frame=0, histories kept)
         pub clouds: bool,
         /// --no-fireflies inverse (live: frame=0, histories kept)
@@ -222,6 +226,10 @@ opt_fields! {
         pub detail_untex_scale: f32,
         /// --no-amb-bump inverse (restart)
         pub amb_bump: bool,
+        /// --no-rtgi inverse (restart: the GPU bounce block is a compile
+        /// define, so a live enable in a session built without it would
+        /// silently diverge CPU vs GPU)
+        pub rtgi: bool,
         /// --no-water inverse (restart: keys the scene cache)
         pub water: bool,
     }
@@ -932,11 +940,24 @@ pub fn apply_to_opts(s: &Settings, opts: &mut crate::Opts) -> AppliedFx {
     if let Some(v) = e.amb_bump {
         opts.amb_bump = v;
     }
+    if let Some(v) = e.rtgi {
+        opts.rtgi = v;
+    }
     if let Some(v) = e.water {
         opts.water = v;
     }
     if let Some(v) = e.bloom {
         opts.bloom = v;
+    }
+    if let Some(v) = e.autoexp {
+        opts.autoexp = v;
+    }
+    if let Some(v) = e.exposure_bias {
+        if v.is_finite() && (-8.0..=8.0).contains(&v) {
+            opts.exposure_bias = v;
+        } else {
+            eprintln!("settings: effects.exposure_bias {v} outside -8..=8 — ignored");
+        }
     }
     if let Some(v) = e.clouds {
         opts.clouds = v;
@@ -955,6 +976,11 @@ pub fn apply_to_opts(s: &Settings, opts: &mut crate::Opts) -> AppliedFx {
     }
     if let Some(v) = e.emissive_lights {
         opts.emissive_lights = v;
+        // The dxr_inline precedent, deliberately NOT the fg one: the menu
+        // writes effects.emissive_lights, and a saved preference must veto
+        // the upscaler-class default (main::upscaler_defaults — XeSS/FSR3
+        // sessions arm NEE for a default the user left alone).
+        opts.emissive_lights_explicit = true;
     }
     if let Some(n) = e.emissive_lights_count {
         if n > crate::emissive::MAX_EMISSIVE_LIGHTS as u32 {
@@ -1135,6 +1161,8 @@ pub fn menu_items() -> &'static [MenuItem] {
             // ── Effects
             item!("tod", "time of day", "Effects", Live, StepF { min: 0.0, max: 24.0, step: 0.5, default: 12.0 }, acc_f32!(effects.tod)),
             item!("bloom", "bloom (glare)", "Effects", Live, Toggle { default: true }, acc_bool!(effects.bloom)),
+            item!("autoexp", "auto-exposure", "Effects", Live, Toggle { default: true }, acc_bool!(effects.autoexp)),
+            item!("exposure_bias", "exposure bias (EV)", "Effects", Live, StepF { min: -8.0, max: 8.0, step: 0.5, default: 0.0 }, acc_f32!(effects.exposure_bias)),
             item!("clouds", "volumetric clouds", "Effects", Live, Toggle { default: true }, acc_bool!(effects.clouds)),
             item!("fireflies", "fireflies (night)", "Effects", Live, Toggle { default: true }, acc_bool!(effects.fireflies)),
             item!("fireflies_count", "firefly count", "Effects", Live, StepU { min: 8, max: 64, step: 8, default: 32 }, acc_u32!(effects.fireflies_count)),
@@ -1160,6 +1188,7 @@ pub fn menu_items() -> &'static [MenuItem] {
             item!("detail_ao_strength", "detail AO strength", "Effects", Restart, StepF { min: 0.0, max: 4.0, step: 0.125, default: 0.125 }, acc_f32!(effects.detail_ao_strength)),
             item!("detail_untex_scale", "detail on untextured (scale)", "Effects", Restart, StepF { min: 0.0, max: 4.0, step: 0.25, default: 1.0 }, acc_f32!(effects.detail_untex_scale)),
             item!("amb_bump", "ambient bump response", "Effects", Restart, Toggle { default: true }, acc_bool!(effects.amb_bump)),
+            item!("rtgi", "real-time GI (1 bounce/frame)", "Effects", Restart, Toggle { default: true }, acc_bool!(effects.rtgi)),
             item!("water", "water material class", "Effects", Restart, Toggle { default: true }, acc_bool!(effects.water)),
             // ── Scene
             item!("world", "world mode (flagless boot)", "Scene", Restart, Toggle { default: true }, acc_bool!(scene.world)),
@@ -1234,6 +1263,8 @@ pub struct LiveView {
     pub tod: f32,
     pub hud: bool,
     pub bloom: bool,
+    pub autoexp: bool,
+    pub exposure_bias: f32,
     pub clouds: bool,
     pub fireflies: bool,
     pub fireflies_count: u32,
@@ -1264,6 +1295,8 @@ pub enum MenuFx {
     Quality(u32),
     SetTod(f32),
     ToggleBloom,
+    ToggleAutoExp,
+    ExposureBias(f32),
     ToggleClouds,
     ToggleFireflies,
     FirefliesCount(u32),
@@ -1296,6 +1329,8 @@ pub fn menu_value(item: &MenuItem, s: &Settings, live: &LiveView) -> String {
             "nppd" => onoff(live.nppd),
             "tod" => format!("{:02}:{:02}", live.tod as u32 % 24, (live.tod.fract() * 60.0) as u32),
             "bloom" => onoff(live.bloom),
+            "autoexp" => onoff(live.autoexp),
+            "exposure_bias" => format!("{:+.1} EV", live.exposure_bias),
             "clouds" => onoff(live.clouds),
             "fireflies" => onoff(live.fireflies),
             "fireflies_count" => live.fireflies_count.to_string(),
@@ -1383,6 +1418,22 @@ pub fn menu_adjust(item: &MenuItem, dir: i32, s: &mut Settings, live: &LiveView)
             "bloom" => {
                 (item.set)(s, &onoff(!live.bloom));
                 MenuFx::ToggleBloom
+            }
+            "autoexp" => {
+                (item.set)(s, &onoff(!live.autoexp));
+                MenuFx::ToggleAutoExp
+            }
+            "exposure_bias" => {
+                let (min, max, step) = match &item.control {
+                    Control::StepF { min, max, step, .. } => (*min, *max, *step),
+                    _ => (-8.0, 8.0, 0.5),
+                };
+                let v = (live.exposure_bias + dir as f32 * step).clamp(min, max);
+                if v == live.exposure_bias {
+                    return MenuFx::None;
+                }
+                (item.set)(s, &format!("{v}"));
+                MenuFx::ExposureBias(v)
             }
             "clouds" => {
                 (item.set)(s, &onoff(!live.clouds));
@@ -1496,6 +1547,25 @@ pub fn self_test() -> Result<(), String> {
         let _ = apply_to_opts(&Settings::default(), &mut o2);
         if o2.dxr_inline_explicit {
             return Err("a default Settings must not set dxr_inline_explicit".into());
+        }
+    }
+
+    // The emissive_lights explicit veto (the dxr_inline shape): a file value
+    // — EITHER polarity, since a saved OFF is exactly the preference the
+    // XeSS/FSR3 upscaler default (main::upscaler_defaults) must respect —
+    // sets `emissive_lights_explicit`; an untouched schema must not.
+    {
+        let mut o = crate::cli::defaults();
+        let mut s = Settings::default();
+        s.effects.emissive_lights = Some(false);
+        let _ = apply_to_opts(&s, &mut o);
+        if o.emissive_lights || !o.emissive_lights_explicit {
+            return Err("settings effects.emissive_lights=false must set the explicit veto".into());
+        }
+        let mut o2 = crate::cli::defaults();
+        let _ = apply_to_opts(&Settings::default(), &mut o2);
+        if o2.emissive_lights_explicit {
+            return Err("a default Settings must not set emissive_lights_explicit".into());
         }
     }
 

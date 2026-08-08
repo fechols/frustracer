@@ -3,6 +3,7 @@
 // Windows-only inside the module; the mixer/resampler/gain math is pure and
 // feeds --check. Display-only — no render-path or rng-stream contact.
 mod audio;
+mod autoexp;
 // BC7 block compression of OPAQUE scene textures (ON by default via the GPU
 // compute encoder; --no-bc7 kills, --bc7-cpu = the ispc A/B arm) — GPU upload
 // only; the CPU renderer keeps sampling the exact RGBA8 texels. Alpha-masked
@@ -457,6 +458,18 @@ fn main() {
         eprintln!("detail-untex-scale: untextured detail ×{}", opts.detail_untex_scale);
     }
     scene::set_amb_bump(opts.amb_bump);
+    shade::set_rtgi(opts.rtgi);
+    if !opts.rtgi {
+        eprintln!("rtgi: OFF — flat SH×AO ambient (the pre-RTGI renderer)");
+    }
+    autoexp::set_enabled(opts.autoexp);
+    if !opts.autoexp {
+        eprintln!("auto-exposure: OFF — fixed 1.0 aperture (--exposure-bias still applies)");
+    }
+    autoexp::set_bias(opts.exposure_bias);
+    if opts.exposure_bias != 0.0 {
+        eprintln!("exposure-bias: {:+} EV", opts.exposure_bias);
+    }
     scene::set_water(opts.water);
     scene::set_coincident_cull(opts.coincident_cull);
     // One field, BOTH statics — which is what keeps `--no-heightfield
@@ -2010,7 +2023,9 @@ fn run_check_dxr(
         // See the --check-gpu twin: the readback IS the consumer here.
         dg2.force_gbuf_ext(true);
         let (near, far) = dlss::near_far(scene.diag);
-        let uq = Quality::upscaler_1spp();
+        // rtgi pinned OFF — the --check-gpu twin's composition-gate rule
+        // (prim.ao == 0 under RTGI would vacuate the AO must-fires).
+        let uq = Quality { rtgi: false, ..Quality::upscaler_1spp() };
         let dxr_gbuf_frame = |hg: &mut gpu::trace::HeadlessGpu,
                               dg2: &gpu::dxr::DxrGpu,
                               basis: camera::CamBasis,
@@ -4704,6 +4719,23 @@ fn run_check_gpu(
         );
         ok = false;
     }
+    // RTGI anti-vacuity, the fourth twin: an armed session's wavefront frame
+    // (fb OFF, so FLAG_RTGI is live) must have traced bounce rays from
+    // shade_full's RTGI block, or the compiled-in arm is dead code; --no-rtgi
+    // must count exactly 0 (the define is omitted, so a nonzero count means
+    // the bump escaped its guard). Same --cam caveat class: a pose with no
+    // hit pixel would trip the must-fire.
+    let rtgi_rays = ctrs[gpu::trace::CTR_RTGI_RAYS as usize];
+    if shade::rtgi_enabled() {
+        eprintln!("check-gpu: rtgi bounce rays: {rtgi_rays}");
+        if rtgi_rays == 0 {
+            eprintln!("check-gpu: FAIL rtgi armed but the wavefront frame traced 0 bounce rays");
+            ok = false;
+        }
+    } else if rtgi_rays != 0 {
+        eprintln!("check-gpu: FAIL {rtgi_rays} rtgi bounce rays under --no-rtgi (RTGI must be compiled out)");
+        ok = false;
+    }
     // Opaque-continuation anti-vacuity and reuse accounting. These counters
     // fire once per CONSUMED non-root LeafRec, not once per ray; the ray total
     // is added by that one lane from the record's rectangle and SPP. The
@@ -6475,7 +6507,14 @@ fn run_check_gpu(
         // guide/signal half explicitly (see TraceGpu::force_gbuf_ext).
         ptg.force_gbuf_ext(true);
         let (near, far) = dlss::near_far(scene.diag);
-        let uq = Quality::upscaler_1spp();
+        // rtgi pinned OFF for the composition-gate family (the harness rule):
+        // the pack/feed/composite gates' AO-term must-fires need the
+        // sampled-AO tier live — under RTGI prim.ao is 0.0 everywhere (the
+        // fb.gi export precedent), which reads as "occluded" to the feed
+        // gate's anti-vacuity and as "no live AO term" to the composite's.
+        // The runtime flag derives from p.q, so this is per-pass, no global.
+        // Armed coverage lives in the wavefront soundness/rtgi gates above.
+        let uq = Quality { rtgi: false, ..Quality::upscaler_1spp() };
         // One fresh 1-spp wavefront frame at the upscaler contract
         // (accumulate off, frame-uniform zero jitter), pack read back into a
         // CPU GBufs so the CPU gate consumes it unmodified. Returns the pack
@@ -8496,11 +8535,16 @@ fn fsr_frame_check(
     far: f32,
     structural: bool,
 ) -> bool {
+    // rtgi pinned OFF: this gate exercises the AO-signal machinery (the
+    // composite identity's ao·amb(n)·kd term must stay non-vacuous); armed
+    // sessions export ao = 0 and ride the residual (the fb.gi shape).
     let q = Quality {
         shadow_samples: 1,
         ao_samples: 1,
         reflections: true,
         fb: shade::FrustumBounce::OFF,
+        rtgi: false,
+        emissive_display: true,
     };
     let stats = Stats::default();
     eprintln!("FSR frame gates at {rw}x{rh}:");
@@ -9281,11 +9325,15 @@ fn mv_check_at(
     dump_prefix: Option<&str>,
 ) -> bool {
     let (near, far) = dlss::near_far(scene.diag);
+    // rtgi pinned OFF: MV/depth gates only — the bounce adds cost and color
+    // noise this gate never reads.
     let q = Quality {
         shadow_samples: 1,
         ao_samples: 1,
         reflections: true,
         fb: shade::FrustumBounce::OFF,
+        rtgi: false,
+        emissive_display: true,
     };
     let stats = Stats::default();
     eprintln!("MV/depth/matrix self-test at {rw}x{rh}:");
@@ -9746,11 +9794,16 @@ fn run_check_xess(
         // self-declassifier can only fire with >= 2 light samples (a single
         // sample is trivially uniform). The interactive XeSS preset is 1/1 —
         // there, penumbra correlation at cell scale is laundered temporally.
+        // rtgi pinned OFF: the AO-reuse teeth (VisCtl Capture/Apply + the
+        // adapt_rays_saved must-fires) need the sampled-AO tier live; armed
+        // coverage comes from run_check's own RTGI gates.
         let q = Quality {
             shadow_samples: 2,
             ao_samples: 2,
             reflections: true,
             fb: shade::FrustumBounce::OFF,
+            rtgi: false,
+            emissive_display: true,
         };
         // Accumulate several jittered frames per side: two single 1-spp
         // frames differ only by the shared-visibility approximation (Apply
@@ -9999,11 +10052,15 @@ fn run_check_nppd(
     };
 
     // The interactive NPPD quality contract: fixed cheap 1-spp preset.
+    // rtgi pinned OFF so the denoise gates score a fixed noise contract
+    // (the harness rule; the session's own neural arm reads the lever).
     let q = Quality {
         shadow_samples: 1,
         ao_samples: 1,
         reflections: true,
         fb: shade::FrustumBounce::OFF,
+        rtgi: false,
+        emissive_display: true,
     };
     let stats = Stats::default();
     let accum: Vec<AtomicU32> = (0..rw * rh * 3).map(|_| AtomicU32::new(0)).collect();
@@ -10189,7 +10246,7 @@ fn run_check_nppd(
         let mut present = vec![0u32; rw * rh];
         for (name, data) in [("nppd_before", &input0), ("nppd_after", &out0), ("nppd_dolly", &out2)]
         {
-            render::resolve_hdr(data, &info, false, &mut present, rw, rh, rw, rh);
+            render::resolve_hdr(data, &info, false, 1.0, &mut present, rw, rh, rw, rh);
             save_png(&format!("{name}.png"), &present, rw, rh);
             eprintln!("wrote {name}.png");
         }
@@ -10731,11 +10788,11 @@ fn run_check_oidn(
 
     if dump {
         let mut present = vec![0u32; rw * rh];
-        render::resolve_hdr(&input, &info, false, &mut present, rw, rh, rw, rh);
+        render::resolve_hdr(&input, &info, false, 1.0, &mut present, rw, rh, rw, rh);
         save_png("oidn_before.png", &present, rw, rh);
-        render::resolve_hdr(&out, &info, false, &mut present, rw, rh, rw, rh);
+        render::resolve_hdr(&out, &info, false, 1.0, &mut present, rw, rh, rw, rh);
         save_png("oidn_after.png", &present, rw, rh);
-        render::resolve_hdr(&hist_dolly, &info, false, &mut present, rw, rh, rw, rh);
+        render::resolve_hdr(&hist_dolly, &info, false, 1.0, &mut present, rw, rh, rw, rh);
         save_png("oidn_hist.png", &present, rw, rh);
         dlss::dump_gbufs(&g, "oidn_gbuf", far);
         eprintln!("wrote oidn_before.png / oidn_after.png / oidn_hist.png / oidn_gbuf_*.png");
@@ -11504,7 +11561,9 @@ fn cine_write_frame(
         &scaled
     };
     if !hdr_frames {
-        render::resolve_hdr(hdr, info, shot.overlay, present, rw, rh, rw, rh);
+        // Exposure 1.0 — cinematic's own `-exposure` is applied to the LINEAR
+        // radiance upstream (the one-write-site rule), never through the curve.
+        render::resolve_hdr(hdr, info, shot.overlay, 1.0, present, rw, rh, rw, rh);
         #[cfg(windows)]
         cine_composite_hud(present, shot, fs, rw, rh, mode);
         #[cfg(not(windows))]
@@ -12105,6 +12164,10 @@ fn run_cinematic_gpu(
     // The upscaler session rides the same cache — its contexts and planes are
     // output-size-bound too. None = accumulation for shots at that res.
     let mut built: Option<((usize, usize), CineArm, Option<gpu::CineUp>)> = None;
+    // The upscaler-class emissive default fires once per RUN, at the first
+    // wiring that actually took (a per-res reprobe re-resolves the same
+    // level; a failed first res must not burn the decision).
+    let mut el_defaulted = false;
 
     for shot in shots {
         let (rw, rh) = shot.res;
@@ -12163,10 +12226,31 @@ fn run_cinematic_gpu(
                     }
                 };
                 match wired {
-                    Ok(()) => eprintln!(
-                        "cinematic: {} reconstruction at 100% (DLAA-grade), {}x{}",
-                        u.name, rw, rh
-                    ),
+                    Ok(()) => {
+                        eprintln!(
+                            "cinematic: {} reconstruction at 100% (DLAA-grade), {}x{}",
+                            u.name, rw, rh
+                        );
+                        // The upscaler-class emissive default, cinematic twin
+                        // (see `upscaler_defaults`): --cinematic resolves a
+                        // real chain level, so a XeSS/FSR3 capture gets the
+                        // same TAA-class arming a window session would. The
+                        // scene is already loaded here — harmless, because
+                        // derivation ran unconditionally and the enable is a
+                        // live per-frame read; the fn's own announce covers
+                        // the derivation line having printed the pre-policy
+                        // state. GI shots are untouched either way (fb.gi
+                        // drops cluster NEE — the inverted GI rule).
+                        if !el_defaulted {
+                            el_defaulted = true;
+                            let mut o = opts.clone();
+                            upscaler_defaults(
+                                &mut o,
+                                matches!(u.name, "xess" | "fsr3").then_some(u.name),
+                            );
+                            emissive::set_enabled(o.emissive_lights);
+                        }
+                    }
                     Err(e) => {
                         eprintln!(
                             "cinematic: {} feed wiring failed ({e}) — accumulation fallback",
@@ -14186,6 +14270,18 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
     };
 
+    // Auto-exposure self-test — the controller (convergence/clamps/deadband/
+    // dt-clamp/determinism) and the CPU meters, pure math; it saves and
+    // restores the process levers, so a `--no-auto-exposure --check` still
+    // proves the on arm and the run's own lever state survives.
+    let autoexp_ok = match autoexp::self_test() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("autoexp self-test: FAIL — {e}");
+            false
+        }
+    };
+
     // Registered-consensus self-test (--quinlight) — the winsorized reduce's
     // identities: the m==2 plain-mean degeneracy (what makes a two-engine fuse a
     // PROVABLE registered mean), the m>=3 outlier rejection, median order
@@ -15295,6 +15391,134 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
     };
 
+    // REAL-TIME GI liveness (the alpha-rej/el-cull shape), snapshotted before
+    // the first stats.clear() like el-cull above: an armed session's verify
+    // phases must have traced bounce rays (every hybrid pass with fb OFF
+    // bounces at each hit pixel — a hitless --cam pose is the documented
+    // caveat class), and --no-rtgi must count exactly 0 (the arm is
+    // Quality-gated, so a stray ray means a constructor stopped reading the
+    // lever).
+    let rtgi_ok = {
+        let rays = stats.rtgi_rays.load(Relaxed);
+        if shade::rtgi_enabled() {
+            eprintln!("check: rtgi bounce rays {rays}");
+            if rays == 0 {
+                eprintln!("check: FAIL rtgi armed but the verify phases traced 0 bounce rays");
+            }
+            rays > 0
+        } else if rays != 0 {
+            eprintln!("check: FAIL {rays} rtgi bounce rays under --no-rtgi");
+            false
+        } else {
+            true
+        }
+    };
+
+    // RTGI estimator/wiring A/B (structural — default scene). The unpaired
+    // hemi-GI probe gate below already pins the BOUNCE MATH: its cosine
+    // reference (draw → miss: sky::gather / hit: shade@BOUNCE_Q@depth 1) IS
+    // the RTGI single-sample estimator, scored against hemi::gi at 512
+    // samples. What that cannot see is the ARM'S WIRING inside shade() — that
+    // the ambient tier really consumes that estimator (draw placement, the
+    // kd·(1−trans) fold happening ONCE, the disc-free miss arm, no stray π)
+    // — so this gate compares a many-frame RTGI accumulation against an
+    // fb.gi accumulation of the same view. Both estimate the same integral
+    // through the same BOUNCE_Q policy and everything OUTSIDE the ambient
+    // tier is identical by construction (same q otherwise; both arms drop
+    // emissive NEE; recursion shades rtgi: false either way), so the trimmed
+    // per-pixel relative-luminance means differ only by estimator noise —
+    // while a kd double-fold (≈−15%), a π factor (+200%), or a disc-carrying
+    // miss (firefly-scale) blow the bounds. Trim per the unpaired-A/B
+    // firefly discipline (the canopy lesson); bq.rtgi is pinned PER-QUALITY,
+    // so the gate keeps its teeth under a `--no-rtgi --check` (the CPU arm
+    // is Quality-gated, not lever-gated — the amb-bump save/restore pattern
+    // without the global).
+    let rtgi_ab_ok = if structural {
+        const RTGI_AB_FRAMES: u32 = 32;
+        const GI_AB_FRAMES: u32 = 4;
+        let render_mean = |bq: Quality, n: u32| -> Vec<f32> {
+            for f in 0..n {
+                let ctx = FrameCtx {
+                    sway_mv: None,
+                    scene,
+                    bvh,
+                    cam,
+                    q: bq,
+                    frame: f,
+                    jitter: false,
+                    rw,
+                    rh,
+                    accum: &accum,
+                    info: &info,
+                    tbuf: &tbuf,
+                    stats: &stats,
+                    sun: render::sun_dir(scene),
+                    clouds: crate::clouds::Clouds::check(scene.diag),
+                    fireflies: crate::fireflies::Fireflies::check(scene),
+                    tcache_cur: None,
+                    tcache_prev: &[],
+                    accumulate: true,
+                    gbuf: None,
+                    fsr_buf: None,
+                    prev_cam: None,
+                    frame_jitter: None,
+                    spp: 1,
+                    primary_sample: 0,
+                    adaptive: false,
+                    hemi_share: false,
+                    replay_rec: None,
+                    cut_cur: None,
+                    cut_prev: None,
+                    discard_seeds: false,
+                    defer_shade: false,
+                };
+                render::render_frame(&ctx, true);
+            }
+            // accum holds the n-frame SUM (frame 0 stores, later frames add).
+            (0..rw * rh * 3)
+                .map(|i| f32::from_bits(accum[i].load(Relaxed)) / n as f32)
+                .collect()
+        };
+        let mut bq_rtgi = q;
+        bq_rtgi.fb = shade::FrustumBounce::OFF;
+        bq_rtgi.rtgi = true;
+        let mut bq_gi = q;
+        bq_gi.fb = shade::FrustumBounce { ao: false, gi: true, depth: q.fb.depth };
+        bq_gi.rtgi = false;
+        let img_rtgi = render_mean(bq_rtgi, RTGI_AB_FRAMES);
+        let img_gi = render_mean(bq_gi, GI_AB_FRAMES);
+        let lum = |b: &[f32], i: usize| {
+            0.2126 * b[i * 3] + 0.7152 * b[i * 3 + 1] + 0.0722 * b[i * 3 + 2]
+        };
+        let mut rels: Vec<f64> = (0..rw * rh)
+            .map(|i| {
+                let lg = lum(&img_gi, i);
+                ((lum(&img_rtgi, i) - lg) / lg.max(0.05)) as f64
+            })
+            .collect();
+        // total_cmp: a NaN rel must FAIL (it sorts past +inf into the kept
+        // slice and poisons the mean), never panic the sort.
+        rels.sort_by(|a, b| a.total_cmp(b));
+        let cut = rw * rh / 50; // 2% per tail
+        let kept = &rels[cut..rels.len() - cut];
+        let mean_signed = kept.iter().sum::<f64>() / kept.len() as f64;
+        let mean_abs = kept.iter().map(|r| r.abs()).sum::<f64>() / kept.len() as f64;
+        eprintln!(
+            "check: rtgi-vs-hemi-gi A/B ({RTGI_AB_FRAMES}f vs {GI_AB_FRAMES}f): \
+             trimmed mean rel {mean_abs:.4} signed {mean_signed:+.4} \
+             (raw worst {:+.2}/{:+.2})",
+            rels[0],
+            rels[rels.len() - 1]
+        );
+        let ok = mean_abs < 0.08 && mean_signed.abs() < 0.02;
+        if !ok {
+            eprintln!("check: FAIL rtgi ambient disagrees with the hemi GI tier");
+        }
+        ok
+    } else {
+        true
+    };
+
     const BENCH_FRAMES: u32 = 8;
     // (hemi_queries, share groups, share fallback) per row, for the
     // hemi-share must-fires below (share-on must run strictly fewer queries).
@@ -15363,11 +15587,11 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         // fresh (frame stays 0, so accum holds exactly the last frame).
         if hybrid && !hemi_ao && !hemi_gi {
             let mut present = vec![0u32; rw * rh];
-            render::resolve(&accum, &info, 1, false, &mut present, rw, rh, rw, rh);
+            render::resolve(&accum, &info, 1, false, 1.0, &mut present, rw, rh, rw, rh);
             save_png("check.png", &present, rw, rh);
         } else if hemi_gi && !share {
             let mut present = vec![0u32; rw * rh];
-            render::resolve(&accum, &info, 1, false, &mut present, rw, rh, rw, rh);
+            render::resolve(&accum, &info, 1, false, 1.0, &mut present, rw, rh, rw, rh);
             save_png("check_gi.png", &present, rw, rh);
         }
     }
@@ -16315,7 +16539,18 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         // frames trace full-depth at 1 shadow / 1 AO sample, where the
         // quadtree is a large share of the frame; the preset-q rows show the
         // heavy-shading dilution for context.
-        let q1 = Quality { shadow_samples: 1, ao_samples: 1, reflections: true, fb: shade::FrustumBounce::OFF };
+        // rtgi follows the session lever: the row models the real upscaler
+        // motion workload, and the bounce is identical in both adopt arms
+        // (seeded per pixel/frame — the ray-node bit-identity claim is about
+        // the temporal machinery, which the bounce never touches).
+        let q1 = Quality {
+            shadow_samples: 1,
+            ao_samples: 1,
+            reflections: true,
+            fb: shade::FrustumBounce::OFF,
+            rtgi: shade::rtgi_enabled(),
+            emissive_display: true,
+        };
         for (label, bq, cuts_opt) in [
             ("dolly warm q2 (adopt off) ", q, None),
             ("dolly warm q2 (adopt on)  ", q, Some(&cuts_a)),
@@ -16523,8 +16758,11 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         ("fireflies", fireflies_ok),
         ("emissive", emissive_ok),
         ("el-cull", el_cull_ok),
+        ("rtgi", rtgi_ok),
+        ("rtgi-ab", rtgi_ab_ok),
         ("tod", tod_ok),
         ("bloom", bloom_ok),
+        ("autoexp", autoexp_ok),
         ("sphcell", sph_ok),
         ("ftree", ftree_ok),
         ("blas-split", blas_ok),
@@ -16732,6 +16970,9 @@ struct Persist {
     trace_failed: bool,
     shot: u32,
     depth_est: f32,
+    /// Auto-exposure's eased EV (the controller's whole state) — carried
+    /// across resize/F11 re-entries so the aperture never flashes on rebuild.
+    autoexp_ev: f32,
     /// The cloud animation clock (seconds, f64 so long sessions don't lose
     /// resolution) — carried across resize/F11 re-entries like the camera
     /// pose: a rebuild is not a weather change.
@@ -16844,17 +17085,18 @@ fn vendor_defaults(opts: &mut Opts, vendor: gpu::adapter::Vendor) {
     // change if that trade ever reads the other way; make it on these
     // numbers, not the table above.
     //
-    // RESOLVED DEBT (2026-07-26 -> 2026-07-31): between those dates the
-    // flagless default was `--lock-res quality` (2/3), which is NOT the
-    // resolution any number above was taken at — the arms don't scale
-    // together (`trace::depth_full` is 6 at 1920 AND 1280, so the wavefront's
-    // ladder is res-independent while leaf/sky and all of `dxr-rays` are
-    // per-pixel), and hand-scaling the decomposition suggested the moving
-    // margin would invert (~2.75 vs ~1.90). That arithmetic was never
-    // measured; the default has since moved BACK to native 100%
-    // (xess::DEFAULT_LOCK_SCALE), so a flagless session traces at the res the
-    // table records again and the entry's stated basis holds as written. Any
-    // number recorded during the 2/3 window carries the 0.444x-pixels offset.
+    // RE-OPENED DEBT (2026-07-26 -> 2026-07-31 quality, -> 2026-08-08 native,
+    // -> quality again): the flagless default is `--lock-res quality` (2/3,
+    // xess::DEFAULT_LOCK_SCALE — third move), which is NOT the resolution the
+    // numbers above were taken at — the arms don't scale together
+    // (`trace::depth_full` is 6 at 1920 AND 1280, so the wavefront's ladder
+    // is res-independent while leaf/sky and all of `dxr-rays` are per-pixel),
+    // and hand-scaling the decomposition suggested the moving margin would
+    // invert (~2.75 vs ~1.90). That arithmetic was never measured. During the
+    // native window (07-31..08-08) a flagless session traced at the table's
+    // res and this caveat was recorded as resolved; with the default back at
+    // 2/3 any flagless number carries the 0.444x-pixels offset again —
+    // re-measure at `--lock-res native` before revisiting the Intel entry.
     // The feature grounds (H/R/C/O, >=spp-3, the replay win at rest) are
     // untouched by resolution either way.
     //
@@ -16978,6 +17220,44 @@ fn vendor_defaults(opts: &mut Opts, vendor: gpu::adapter::Vendor) {
     }
 }
 
+/// The upscaler-class sibling of `vendor_defaults`, keyed on the session's
+/// WIRED chain level rather than the adapter — that function's own bar ("a
+/// property of the HARDWARE BALANCE ... must INVERT between vendors")
+/// deliberately does not describe this axis, so the policy lives beside it
+/// under the same discipline: pure over `Opts`, announce on departure,
+/// explicit choices veto, headless paths never call it.
+///
+/// ONE entry (2026-08-08, the user's call): a session whose wired upscaler is
+/// TAA-class — XeSS or FSR 3.1 — arms `--emissive-lights` by default. The
+/// reasoning is the NEE-keep rule's own known-accept (render.rs's `full_el`
+/// comment / the --no-rtgi entry): a TAA neighborhood clamp rejects the RTGI
+/// bounce's sparse stochastic emissive, so unarmed XeSS/FSR3 sessions lose
+/// the emissive pools entirely, while DLSS-RR/FSR4-RR reconstruct them and
+/// keep the compiled OFF (cluster NEE there buys shadow rays for transport
+/// the bounce already delivers). Quin stays OFF — the fuse anchors on a
+/// denoising engine when one exists (`quin::default_anchor`). Plain is
+/// unchanged (no temporal integrator to clamp; stills converge by plain
+/// accumulation). `emissive_lights_explicit` — either CLI spelling, or a
+/// saved settings-file value — vetoes, and the pause menu's live toggle
+/// still overrides at runtime either way. `taa_wired` carries the wired
+/// level's name purely for the announce line; None = not TAA-class = no-op.
+/// The interactive call site re-stores `emissive::set_enabled` (the
+/// `set_inline_mode` re-store shape); `run_cinematic_gpu` applies the same
+/// policy once after ITS chain probe — a media mode that already resolves a
+/// chain — while `--check*`/`--spin` keep the parse-time store, so gates
+/// stay a pure function of the command line.
+#[cfg(windows)]
+fn upscaler_defaults(opts: &mut Opts, taa_wired: Option<&'static str>) {
+    let Some(name) = taa_wired else { return };
+    if !opts.emissive_lights_explicit && !opts.emissive_lights {
+        opts.emissive_lights = true;
+        eprintln!(
+            "emissive lights: ON by default — {name} wired (a TAA-class upscaler's neighborhood \
+             clamp rejects the RTGI bounce's stochastic emissive; --no-emissive-lights opts out)"
+        );
+    }
+}
+
 #[cfg(windows)]
 fn run_window(req: SceneRequest, opts: &Opts, file_settings: settings::Settings) {
     // SDL3 is per-monitor-v2 DPI aware on Windows unconditionally (SDL2's
@@ -17054,6 +17334,18 @@ fn run_window(req: SceneRequest, opts: &Opts, file_settings: settings::Settings)
     let opts = &{
         let mut o = opts.clone();
         vendor_defaults(&mut o, gpu.adapter_vendor);
+        // The wired chain level is a fact here too (GpuContext::new probed
+        // it), so the upscaler-class default runs beside the vendor one:
+        // XeSS/FSR3 = TAA-class = arm emissive-lights unless the user chose.
+        // wired()'s Quin/Rr/Fsr4/Plain arms all fall to None — see the fn.
+        upscaler_defaults(
+            &mut o,
+            match gpu.wired() {
+                gpu::WiredUpscaler::Xess => Some("xess"),
+                gpu::WiredUpscaler::Fsr3 => Some("fsr3"),
+                _ => None,
+            },
+        );
         o
     };
     // vendor_defaults may have moved --dxr-inline; the knob global was
@@ -17066,6 +17358,14 @@ fn run_window(req: SceneRequest, opts: &Opts, file_settings: settings::Settings)
     // (Lives at the call site, not inside vendor_defaults, so the policy fn
     // stays a pure &mut Opts — the cli lever_snapshot purity discipline.)
     gpu::dxr::set_inline_mode(opts.dxr_inline);
+    // upscaler_defaults may have armed emissive-lights; that global too was
+    // published from the PRE-policy value at main()'s lever block. It is
+    // LIVE-tier (derivation runs unconditionally at scene load, consumers
+    // read it per frame), so this re-store is the policy's whole
+    // application — and it sits before the scene-load spawn below, so the
+    // `emissive lights:` derivation line reports the policy state. Same
+    // headless invariant as above: --check*/--spin never reach here.
+    emissive::set_enabled(opts.emissive_lights);
     // --fsr4: the FSR4 + Ray Regeneration level is a requirement, so the chain
     // falling through it is fatal here rather than a quiet downgrade. Checked
     // against the session's ACTUAL wiring (the probe already printed its own
@@ -18096,6 +18396,14 @@ fn session(
     // A resize re-entry keeps the last estimate — cost scales with area,
     // but the controller corrects within a frame either way.
     let mut depth_est: f32 = p0.map_or(4.0, |p| p.depth_est);
+    // Auto-exposure: the eased EV is `autoexp::step`'s WHOLE state, carried
+    // across resize/F11 re-entries like depth_est (a rebuild is not a scene
+    // change — snapping back to 0 EV would flash the frame). The tick clock
+    // is session-local: a re-entry's first dt spans the rebuild and step
+    // clamps it to one bounded ease.
+    let mut aexp_ev: f32 = p0.map_or(0.0, |p| p.autoexp_ev);
+    let mut aexp_t = Instant::now();
+    let mut aexp_trace_t = Instant::now();
     // The cloud clock. Advanced by the last frame's measured render time at
     // each arm's fresh-frame predicate (upscaler/denoiser frames always;
     // plain accumulation only at frame 0, so a converging still frame keeps
@@ -18198,6 +18506,32 @@ fn session(
         let now = Instant::now();
         if present_dead {
             break SessionEnd::Quit;
+        }
+
+        // ── Auto-exposure: one controller tick per iteration, every arm
+        // (menu holds included — `present_again` re-records the GPU meter,
+        // so the aperture stays live under the hold). GPU-tonemapped arms
+        // meter in `fullscreen_to_backbuffer` (`take_meter` —
+        // FRAMES_IN_FLIGHT frames of latency, invisible inside the ~1 s
+        // EMA); CPU-presented arms meter in `CpuPresent::resolve[_hdr]`
+        // (same-frame). At most one source fires per frame, so the or()
+        // never drops a measurement. `set_exposure` runs unconditionally:
+        // the menu moves enabled/bias live, OFF must restore exactly 1.0,
+        // and the write is one f32.
+        {
+            let dt = (now - aexp_t).as_secs_f64() as f32;
+            aexp_t = now;
+            if let Some(m) = gpu.take_meter().or_else(|| present.take_meter()) {
+                aexp_ev = autoexp::step(aexp_ev, m, dt);
+                if autoexp::trace_on() && aexp_trace_t.elapsed().as_secs_f64() >= 1.0 {
+                    aexp_trace_t = now;
+                    eprintln!(
+                        "autoexp: measured {m:+.3} ev {aexp_ev:+.3} scale {:.3}",
+                        autoexp::exposure(aexp_ev)
+                    );
+                }
+            }
+            gpu.set_exposure(autoexp::exposure(aexp_ev));
         }
 
         // Menu OPEN routes events to Slint (toggle keys can't fire); the
@@ -18325,6 +18659,8 @@ fn session(
                 tod: cur_tod,
                 hud: hd.visible(),
                 bloom: bloom::enabled(),
+                autoexp: autoexp::enabled(),
+                exposure_bias: autoexp::bias(),
                 clouds: clouds::enabled(),
                 fireflies: fireflies::enabled(),
                 fireflies_count: fireflies::count(),
@@ -18380,6 +18716,16 @@ fn session(
                                     // Display-stage — deliberately NO reset
                                     // (the --no-bloom bit-identity argument).
                                     bloom::set_enabled(!bloom::enabled());
+                                }
+                                settings::MenuFx::ToggleAutoExp => {
+                                    // Display-stage, no reset (the bloom
+                                    // shape); the session controller tick
+                                    // picks the change up next iteration —
+                                    // OFF restores exactly 1.0 (+bias).
+                                    autoexp::set_enabled(!autoexp::enabled());
+                                }
+                                settings::MenuFx::ExposureBias(ev) => {
+                                    autoexp::set_bias(ev);
                                 }
                                 settings::MenuFx::ToggleClouds => {
                                     // Shading change: plain accumulation only,
@@ -20433,12 +20779,15 @@ fn session(
         let base_q = Quality::preset(preset);
         let mut q = if neural {
             // Fixed cheap preset: the temporal denoisers/upscalers want
-            // frame-stationary noise statistics.
+            // frame-stationary noise statistics. rtgi follows the session
+            // lever (per-frame bounce noise is exactly what they launder).
             Quality {
                 shadow_samples: 1,
                 ao_samples: 1,
                 reflections: true,
                 fb: shade::FrustumBounce::OFF,
+                rtgi: shade::rtgi_enabled(),
+                emissive_display: true,
             }
         } else if moved && !use_budget {
             base_q.while_moving()
@@ -21486,6 +21835,7 @@ fn session(
         height_on,
         preset,
         spp,
+        autoexp_ev: aexp_ev,
         dlss_on,
         xess_on,
         fsr_on,
@@ -21529,9 +21879,16 @@ struct CpuPresent {
     sdr: Vec<u32>,
     wire10: Vec<u32>,
     /// Refreshed from `gpu.tone()` each frame — this is how a display change
-    /// reaches the CPU arms (only Hdr10 retunes; the gamma curve is static).
+    /// (and the session's live exposure) reaches the CPU arms.
     tone: tone::ToneParams,
     enc: gpu::d3d12::PresentSpace,
+    /// Auto-exposure's CPU-side meter (the GPU-tonemapped arms meter in
+    /// `fullscreen_to_backbuffer` instead): mean log2-luminance of the last
+    /// `resolve`/`resolve_hdr` input — the pre-exposure linear tonemap
+    /// source, same-frame. Take-semantics like `GpuContext::take_meter`; the
+    /// screenshot re-resolves (`resolve_sdr`/`resolve_hdr_sdr`) never write
+    /// it — a P press must not double-feed the controller.
+    meter: Option<f32>,
 }
 
 impl CpuPresent {
@@ -21542,7 +21899,14 @@ impl CpuPresent {
             wire10: if enc != PresentSpace::Sdr { vec![0u32; w * h] } else { Vec::new() },
             tone,
             enc,
+            meter: None,
         }
+    }
+
+    /// The newest CPU-side meter value, if a presentable resolve ran since
+    /// the last take (the session controller's other measurement source).
+    fn take_meter(&mut self) -> Option<f32> {
+        self.meter.take()
     }
 
     /// Was the presented frame something other than the 8-bit SDR wire? The
@@ -21565,15 +21929,21 @@ impl CpuPresent {
         w: usize,
         h: usize,
     ) {
+        // Meter the pre-exposure linear source (the render-res PREFIX — the
+        // slice can be the full window buffer while the frame is smaller).
+        if autoexp::enabled() {
+            self.meter = Some(autoexp::meter_accum(&accum[..rw * rh * 3], samples));
+        }
+        let e = self.tone.exposure;
         match self.enc {
             gpu::d3d12::PresentSpace::Sdr10 => render::resolve_sdr10(
-                accum, info, samples, overlay, &mut self.wire10, rw, rh, w, h,
+                accum, info, samples, overlay, e, &mut self.wire10, rw, rh, w, h,
             ),
             gpu::d3d12::PresentSpace::Hdr10 => render::resolve_pq(
                 accum, info, samples, overlay, self.tone, &mut self.wire10, rw, rh, w, h,
             ),
             gpu::d3d12::PresentSpace::Sdr => {
-                render::resolve(accum, info, samples, overlay, &mut self.sdr, rw, rh, w, h)
+                render::resolve(accum, info, samples, overlay, e, &mut self.sdr, rw, rh, w, h)
             }
         }
     }
@@ -21589,22 +21959,29 @@ impl CpuPresent {
         w: usize,
         h: usize,
     ) {
+        if autoexp::enabled() {
+            self.meter = Some(autoexp::meter_hdr(&src[..rw * rh * 3]));
+        }
+        let e = self.tone.exposure;
         match self.enc {
             gpu::d3d12::PresentSpace::Sdr10 => {
-                render::resolve_hdr_sdr10(src, info, overlay, &mut self.wire10, rw, rh, w, h)
+                render::resolve_hdr_sdr10(src, info, overlay, e, &mut self.wire10, rw, rh, w, h)
             }
             gpu::d3d12::PresentSpace::Hdr10 => render::resolve_hdr_pq(
                 src, info, overlay, self.tone, &mut self.wire10, rw, rh, w, h,
             ),
             gpu::d3d12::PresentSpace::Sdr => {
-                render::resolve_hdr(src, info, overlay, &mut self.sdr, rw, rh, w, h)
+                render::resolve_hdr(src, info, overlay, e, &mut self.sdr, rw, rh, w, h)
             }
         }
     }
 
     /// Force the SDR encoding regardless of the session — the screenshot path,
     /// where the destination is always an 8-bit PNG. The `resolve_*` pair above
-    /// picks its encoding from the swapchain; these two never do.
+    /// picks its encoding from the swapchain; these two never do. They DO carry
+    /// the session's live exposure (P must capture what the screen shows — the
+    /// GPU-readback screenshot's rule; 1.0 is bit-inert) and never write the
+    /// meter — a screenshot must not feed the controller a duplicate sample.
     #[allow(clippy::too_many_arguments)]
     fn resolve_sdr(
         &mut self,
@@ -21617,7 +21994,8 @@ impl CpuPresent {
         w: usize,
         h: usize,
     ) {
-        render::resolve(accum, info, samples, overlay, &mut self.sdr, rw, rh, w, h);
+        let e = self.tone.exposure;
+        render::resolve(accum, info, samples, overlay, e, &mut self.sdr, rw, rh, w, h);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -21631,7 +22009,8 @@ impl CpuPresent {
         w: usize,
         h: usize,
     ) {
-        render::resolve_hdr(src, info, overlay, &mut self.sdr, rw, rh, w, h);
+        let e = self.tone.exposure;
+        render::resolve_hdr(src, info, overlay, e, &mut self.sdr, rw, rh, w, h);
     }
 
     fn blit(&self, gpu: &mut gpu::GpuContext) -> gpu::d3d12::Result<()> {
