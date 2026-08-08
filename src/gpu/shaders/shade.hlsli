@@ -89,7 +89,7 @@ StructuredBuffer<uint>   tri_mat   : register(t5);
 // scene.rs::NO_TEX — "no map" sentinel for the texture-index fields.
 #define TEX_NONE 0xffffffffu
 
-// Mirrors trace.rs::GpuMat field-for-field (104 B) — a stride skew reads
+// Mirrors trace.rs::GpuMat field-for-field (108 B) — a stride skew reads
 // garbage; the two must move in the same commit.
 struct Mat {
     float3 albedo;
@@ -114,6 +114,9 @@ struct Mat {
     // Per-material world-space detail texel scale (Scene::detail_scales —
     // never per-face, which seams on greedy-meshed atlases). 0 = field off.
     float detail_scale;
+    // Spec-AA: the normal map's slope-variance companion texture
+    // (Scene::tex_var; TEX_NONE = none — the fold's map-arm off state).
+    uint normal_var_tex;
 };
 StructuredBuffer<Mat> materials : register(t6);
 
@@ -261,6 +264,39 @@ float detail_ndl_cap(float raw, float p) {
 // rough_eff — safe, the bump draws no rng.
 float detail_bump_weight(float rough) {
     return saturate((rough - DETAIL_ROUGH_LO) / (DETAIL_ROUGH_HI - DETAIL_ROUGH_LO));
+}
+// shade.rs::SPEC_AA_S2_CAP / VNOISE_GRAD_VAR — the spec-AA literals
+// (texture.rs::SPEC_AA_S2_CAP is the encode's cap; VNOISE_GRAD_VAR is the
+// measured per-component gradient variance of the shared vnoise — both
+// mirrored, the clouds-wind idiom; spec_aa_self_test re-measures the
+// latter, so change all copies together).
+#define SPEC_AA_S2_CAP 0.5
+#define VNOISE_GRAD_VAR 0.1104
+// shade.rs::detail_var — the spec-AA detail transfer: per-axis slope
+// variance of detail tilt NOT applied because its octave windows have
+// closed (applied variance scales wk², the discarded share is 1 − wk² of
+// each octave's full-on variance; grain full-on factor 2·AMP·STR·BUMP_K is
+// scale-invariant across k). Fully-open windows contribute an IEEE-exact
+// 0.0 — magnified pixels transfer nothing bit-identically; past
+// DETAIL_AO_RANGE the transfer plateaus at the field's whole variance. The
+// consumer weights by detail_bump_weight² (applied + transferred = bw²·full
+// at every distance — the invariant). Term-for-term CPU mirror.
+float detail_var(float dlod) {
+    float sum = 0.0;
+    float a = 2.0 * DETAIL_AMP * DETAIL_STR * DETAIL_BUMP_K;
+    [unroll] for (uint k = 0u; k < 3u; ++k) {
+        float wk = saturate(-dlod - float(k));
+        sum += a * a * (1.0 - wk * wk);
+    }
+    if (flags & FLAG_DETAIL_AO) {
+        float c8 = 0.5 * DETAIL_AO_STR * (2.0 / 8.0) * DETAIL_AO_BUMP_K * DETAIL_BUMP_K;
+        float wk = saturate(3.0 - dlod);
+        sum += c8 * c8 * (1.0 - wk * wk);
+        float c4 = 0.35 * DETAIL_AO_STR * (2.0 / 4.0) * DETAIL_AO_BUMP_K * DETAIL_BUMP_K;
+        wk = saturate(2.0 - dlod);
+        sum += c4 * c4 * (1.0 - wk * wk);
+    }
+    return sum * VNOISE_GRAD_VAR;
 }
 // shade.rs::detail_aniso_base — the detail window's lod base under the aniso
 // filter: log2 of the footprint's MINOR axis (what SampleGrad leaves
@@ -893,6 +929,9 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
         float3 mq3 = float3(0.0, 0.0, 0.0);
         float mdl = 0.0;
         bool dmarch = false;
+        // Spec-AA: the detail field's discarded-octave slope variance
+        // (0.0 = nothing to transfer), folded into rough_eff below.
+        float s2_detail = 0.0;
         float3 albedo = mat.albedo;
         if (SHADE_MAT_MARBLE(mat)) {
             albedo = marble(ro + rd * hit.t, mat.scale);
@@ -936,6 +975,16 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                 // would saturate every octave window wide open. s == 0
                 // parks the window closed (the bitwise off arm).
                 dlod = (s > 0.0) ? log2(cone_w / s) : 1e30;
+            }
+            // Spec-AA transfer capture (shade.rs's site, mirrored):
+            // deliberately OUTSIDE the window gate below — at dlod >=
+            // DETAIL_AO_RANGE (every window shut, both arms dead) the
+            // transfer is at its MAXIMUM, the "distant surface must go
+            // matte" regime. s == 0 keeps the exact-0.0 off state; a
+            // fully-open window contributes an IEEE-exact 0.0, so magnified
+            // pixels are bit-identical through the fold's branch.
+            if ((flags & FLAG_SPEC_AA) && s > 0.0) {
+                s2_detail = detail_var(dlod);
             }
             bool ao_band = dlod < DETAIL_AO_RANGE && (flags & FLAG_DETAIL_AO);
             if ((dlod < 0.0 || ao_band) && s > 0.0) {
@@ -1026,6 +1075,36 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
         // untouched. Off (ripple_amp 0) leaves n_s exactly as selected.
         if (SHADE_MAT_RIPPLE(mat) > 0.0) {
             n_s = ripple_normal(n_s, n, ro + rd * hit.t, CLOUD_TIME, mat.ripple_amp, SCENE_DIAG);
+        }
+        // Spec-AA fold (shade.rs's site, mirrored term-for-term): the slope
+        // variance the mip/window pipeline resolved AWAY widens the GGX lobe
+        // — α′² = α² + 2σ², so detail stays in the rendering equation at
+        // every distance. Both sources are exactly 0.0 wherever nothing was
+        // resolved away, and the identity is BY BRANCH (s2 > 0.0):
+        //  - the normal map's variance companion, through the SAME filt as
+        //    the map itself (level-0 all-zero ⇒ magnification reads exact
+        //    0.0); ×normal_scale² — the decode scales slopes linearly;
+        //  - the detail transfer ×bw² (applied bw²·wk² + transferred
+        //    bw²·(1−wk²) = bw²·full at EVERY distance; a polished surface
+        //    is never frosted by detail it would never have shown).
+        // ggx_alphas, the sheen inverse-alpha, and the prim guide below all
+        // see the widened lobe; detail_bump_weight above read the PRE-fold
+        // roughness; the reflection gate keeps its FLAT fields (the rng
+        // rule). Zero rng draws.
+        if (flags & FLAG_SPEC_AA) {
+            float s2 = 0.0;
+            if (s2_detail > 0.0) {
+                float bw = detail_bump_weight(rough_eff);
+                s2 += bw * bw * s2_detail;
+            }
+            if (SHADE_MAT_NORMAL(mat) && has_basis && mat.normal_var_tex != TEX_NONE) {
+                float u = tex_sample(mat.normal_var_tex, map_uv, filt).x;
+                s2 += u * u * SPEC_AA_S2_CAP * mat.normal_scale * mat.normal_scale;
+            }
+            if (s2 > 0.0) {
+                rough_eff = min(
+                    sqrt(sqrt(rough_eff * rough_eff * rough_eff * rough_eff + 2.0 * s2)), 1.0);
+            }
         }
         if (lap == 0u) {
             // shade.rs — spec_t stays 0 unless the lap-0 reflection below

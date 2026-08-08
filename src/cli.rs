@@ -439,6 +439,14 @@ pub struct Opts {
     /// of normal-role textures average SLOPES. Derived-only (mips are never
     /// persisted), so it does NOT key the scene cache — the --no-mips class.
     pub slope_mips: bool,
+    /// `--no-spec-aa` clears (`scene::set_spec_aa`): no slope-variance →
+    /// roughness fold — mip-averaged normal-map detail and faded detail-field
+    /// octaves vanish with distance instead of widening the GGX lobe (the
+    /// pre-feature behavior, bit-identical). Default on. Derived-only (the
+    /// variance companions are never persisted), so it does NOT key the
+    /// scene cache — the --no-mips class. `--no-slope-mips`/`--no-mips` kill
+    /// the map half automatically; the detail-field half is independent.
+    pub spec_aa: bool,
     /// `--normal-strength K`: session multiplier on every material's
     /// `normal_scale`, applied post-cache in `load_scene` (the --tod
     /// placement class — never baked into a sidecar, and relief's
@@ -799,6 +807,7 @@ pub fn defaults() -> Opts {
         h2n: true,
         n2h: true,
         slope_mips: true,
+        spec_aa: true,
         normal_strength: 1.0,
         tinted_shadows: true,
         spray: true,
@@ -1043,6 +1052,10 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
             // (per-load data, the --tod class: no process global, so no
             // lever-block line — load_scene reads it off SceneRequest).
             "--no-slope-mips" => opts.slope_mips = false,
+            // Spec-AA A/B lever (derived-only — never keys the cache): the
+            // slope-variance → roughness fold that keeps detail maps in the
+            // rendering equation at every distance.
+            "--no-spec-aa" => opts.spec_aa = false,
             "--normal-strength" => {
                 let k: f32 = args
                     .next()
@@ -2157,6 +2170,10 @@ pub fn usage() {
                 eprintln!("  --no-slope-mips  normal-map mips back on the raw-byte box filter (A/B lever; the");
                 eprintln!("                default slope-space filter preserves mean tilt, so normal maps stop");
                 eprintln!("                flattening with distance)");
+                eprintln!("  --no-spec-aa  no slope-variance -> roughness fold (A/B lever; the default keeps");
+                eprintln!("                detail maps in the rendering equation at every distance — what a mip");
+                eprintln!("                averages away widens the GGX lobe instead of vanishing, so distant");
+                eprintln!("                bumpy surfaces shade matte instead of mirror-flat)");
                 eprintln!("  --normal-strength K  multiply every material's normal-map strength (0.0..=8.0,");
                 eprintln!("                default 1 = bit-identical; 0 = normals off). Post-cache, so relief's");
                 eprintln!("                height_amp stays unscaled — decode slopes and --heightfield relief");
@@ -2264,7 +2281,7 @@ pub fn usage() {
 /// contract and gets applied in one order.
 fn lever_snapshot() -> String {
     format!(
-        "mips={} aniso={} h2n={} n2h={} smips={} tint={} spray={} depth={} detail={} dao={} \
+        "mips={} aniso={} h2n={} n2h={} smips={} saa={} tint={} spray={} depth={} detail={} dao={} \
          dstr={} daostr={} duntex={} \
          ambb={} rtgi={} aexp={} ebias={} water={} ccull={} harm={} hon={} bloom={} clouds={} ff={} ffn={} el={} eln={} \
          elcluster={} cshadow={} skylod={} dxrinline={} dxrsbt={} fsway={} famp={}",
@@ -2273,6 +2290,7 @@ fn lever_snapshot() -> String {
         texture::h2n_enabled(),
         texture::n2h_enabled(),
         texture::slope_mips_enabled(),
+        scene::spec_aa(),
         scene::tinted_shadows(),
         scene::spray_enabled(),
         scene::depth_tint(),
@@ -2330,6 +2348,7 @@ pub fn self_test() -> Result<(), String> {
         "--no-h2n",
         "--no-n2h",
         "--no-slope-mips",
+        "--no-spec-aa",
         "--normal-strength",
         "2.5",
         "--no-tinted-shadows",
@@ -2397,6 +2416,7 @@ pub fn self_test() -> Result<(), String> {
         ("h2n", !o.h2n),
         ("n2h", !o.n2h),
         ("slope_mips", !o.slope_mips),
+        ("spec_aa", !o.spec_aa),
         ("normal_strength", o.normal_strength == 2.5),
         ("tinted_shadows", !o.tinted_shadows),
         ("spray", !o.spray),

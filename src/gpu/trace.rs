@@ -1734,7 +1734,7 @@ struct GpuBvhNode {
 }
 
 /// scene.rs::Material packed for StructuredBuffer<Mat> (shade.hlsli).
-/// 104 B — the HLSL `Mat` mirrors this field-for-field; a stride skew reads
+/// 108 B — the HLSL `Mat` mirrors this field-for-field; a stride skew reads
 /// garbage, so the two must move in the same commit.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -1762,6 +1762,10 @@ struct GpuMat {
     // Per-material world-space detail texel scale (Scene::detail_scales —
     // never per-face, which seams on greedy-meshed atlases). 0 = field off.
     detail_scale: f32,
+    // Spec-AA: the normal map's slope-variance companion texture
+    // (Scene::tex_var; TEX_NONE = none — every unmapped/lever-off material,
+    // the fold's structural map-arm off state).
+    normal_var_tex: u32,
 }
 
 /// Bytes of reusable staging streamed per blocking submit — bounds the
@@ -2179,6 +2183,11 @@ impl SceneGpu {
                 ior: m.ior,
                 ripple_amp: m.ripple_amp,
                 detail_scale: scene.detail_scales.get(mi).copied().unwrap_or(0.0),
+                normal_var_tex: scene
+                    .tex_var
+                    .get(m.normal_tex as usize)
+                    .copied()
+                    .unwrap_or(crate::scene::NO_TEX),
             })
             .collect();
         let materials_b = stream_buffer(device, sub, &ring, &materials, |m| *m, srv)?;
@@ -4508,6 +4517,14 @@ pub const FLAG_WAVEVIZ: u32 = 262144;
 /// Lockstep with trace_common.hlsli's FLAG_RTGI.
 pub const FLAG_RTGI: u32 = 524288;
 
+/// Spec-AA (`--no-spec-aa` clears it): the slope-variance → roughness fold —
+/// mip-averaged normal-map detail (the variance companion, gated per
+/// material on Mat.normal_var_tex) and the detail field's faded octaves
+/// (detail_var) widen the GGX lobe instead of vanishing with distance. The
+/// FLAG_DETAIL runtime-lever shape; lockstep with trace_common.hlsli's
+/// FLAG_SPEC_AA.
+pub const FLAG_SPEC_AA: u32 = 1048576;
+
 /// Unreal-1 detail texturing (`--no-detail-tex` clears it): procedural
 /// close-up albedo grain + micro-bump on MAGNIFIED hits — textured AND
 /// untextured since the untextured arm (shade.hlsli's post-match detail
@@ -5369,6 +5386,7 @@ impl FrameCb {
             // materials carry the synthetic scale since the untextured arm).
             | (crate::scene::detail_tex() as u32 * FLAG_DETAIL)
             | (crate::scene::detail_ao() as u32 * FLAG_DETAIL_AO)
+            | (crate::scene::spec_aa() as u32 * FLAG_SPEC_AA)
             | (crate::scene::amb_bump() as u32 * FLAG_AMB_BUMP)
             // FR_WAVEVIZ live toggle, read at CB-build time like the V
             // toggle — unarmed sessions compile no WAVEVIZ block, so the

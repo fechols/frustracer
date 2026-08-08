@@ -457,6 +457,10 @@ fn main() {
     texture::set_h2n(opts.h2n);
     texture::set_n2h(opts.n2h);
     texture::set_slope_mips(opts.slope_mips);
+    scene::set_spec_aa(opts.spec_aa);
+    if !opts.spec_aa {
+        eprintln!("spec-aa: off — mip-averaged detail no longer widens roughness");
+    }
     scene::set_tinted_shadows(opts.tinted_shadows);
     scene::set_spray(opts.spray);
     scene::set_depth_tint(opts.depth_tint);
@@ -14849,6 +14853,20 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
     };
 
+    // Spec-AA math gates — the fold's anchors/monotone bounds, the detail
+    // transfer's exact-zero open-window identity + plateau closed form, and
+    // the VNOISE_GRAD_VAR re-measure that keeps the baked literal honest.
+    let spec_aa_ok = match shade::spec_aa_self_test() {
+        Ok(()) => {
+            eprintln!("spec-aa self-test: OK");
+            true
+        }
+        Err(e) => {
+            eprintln!("spec-aa self-test: FAIL — {e}");
+            false
+        }
+    };
+
     // Spherical-cell math self-test — closed-form identities the hemisphere
     // bounce integrator is built on (Ω/PSA anchors, exact partition,
     // in-cell sampling).
@@ -17578,6 +17596,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         ("coincident-cull", ccull_ok),
         ("depth-tint", depth_tint_ok),
         ("detail-tex", detail_ok),
+        ("spec-aa", spec_aa_ok),
         ("sh", sh_ok),
         ("sky", sky_ok),
         ("clouds", clouds_ok),

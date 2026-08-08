@@ -268,6 +268,7 @@ pub fn self_test() -> Result<(), String> {
         n2h: false,
         normal_role: false,
         mips: Vec::new(),
+        var_mips: Vec::new(),
     };
 
     // should_compress IS the carve-out plus the spec guard. An alpha-masked

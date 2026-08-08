@@ -776,6 +776,10 @@ pub fn shade(
     // marched sun shadow below re-samples the field along the sun's tangent
     // direction. Plain values, so nothing borrows the texture.
     let mut detail_march: Option<(Vec3A, f32)> = None;
+    // Spec-AA: the detail field's discarded-octave slope variance (0.0 =
+    // nothing to transfer — lever off, no field, or every window fully
+    // open), folded into rough_eff at the fold site below.
+    let mut s2_detail: f32 = 0.0;
     let mut albedo = match mat.kind {
         MatKind::Marble { scale } => marble(ray.o + ray.d * hit.t, scale),
         MatKind::Textured { tex } => {
@@ -835,6 +839,17 @@ pub fn shade(
             // window closed — the bitwise pre-untextured-arm off.
             _ => detail_untex_window(cone_w, s),
         };
+        // Spec-AA transfer capture (`--no-spec-aa` kills): the slope
+        // variance of the detail tilt NOT applied because its windows have
+        // closed. Deliberately OUTSIDE the window gate below — at
+        // dlod >= DETAIL_AO_RANGE (every window shut, both arms dead) the
+        // transfer is at its MAXIMUM, exactly the "distant surface must go
+        // matte" regime. s == 0 (no field ever) keeps the exact-0.0 off
+        // state; a fully-open window returns an IEEE-exact 0.0 (1 − 1·1),
+        // so magnified pixels are bit-identical through the fold's branch.
+        if crate::scene::spec_aa() && s > 0.0 {
+            s2_detail = detail_var(dlod);
+        }
         let ao_band = dlod < DETAIL_AO_RANGE && crate::scene::detail_ao();
         if (dlod < 0.0 || ao_band) && s > 0.0 {
             // The world-space domain: q3 = rest-pose position over s.
@@ -941,6 +956,52 @@ pub fn shade(
     // state: ripple_amp == 0.0 leaves n_s exactly as selected above.
     if mat.ripple_amp > 0.0 {
         n_s = ripple_normal(n_s, n, ray.o + ray.d * hit.t, cl.time, mat.ripple_amp, scene.diag);
+    }
+    // Spec-AA fold (`--no-spec-aa` kills): the slope variance the mip/window
+    // pipeline resolved AWAY comes back as a wider GGX lobe — the
+    // Toksvig/LEAN identity α′² = α² + 2σ² (α = roughness², σ² = mean
+    // per-axis slope variance), so detail maps stay in the rendering
+    // equation at every distance: a distant bumpy surface shades matte-rough
+    // instead of collapsing to a mirror-flat mean normal. Two sources, each
+    // an exact 0.0 wherever nothing was resolved away, and the identity is
+    // BY BRANCH (`s2 > 0.0`) — sqrt(sqrt(x⁴)) is NOT an f32 bitwise
+    // identity:
+    //  - the normal map's variance companion (scene.tex_var): level 0 is
+    //    all-zero, so magnification reads an exact 0.0 through the lod ≤ 0
+    //    bilinear escape; sampled through the SAME `filt` as the map itself
+    //    (footprints agree by construction), guarded by perturb_normal's
+    //    own triple so a hit that never decoded the map never folds it;
+    //    ×normal_scale² — the decode scales slopes linearly;
+    //  - the detail field's faded octaves (`s2_detail`), ×bw² — the bump
+    //    applies its gradient through the same weight, so applied (bw²·wk²)
+    //    plus transferred (bw²·(1−wk²)) is bw²·full at EVERY distance, and
+    //    a polished surface (bw = 0) is never frosted by detail it would
+    //    never have shown.
+    // Sits AFTER the ripple and BEFORE the PrimarySurface capture:
+    // ggx_alphas, the sheen inverse-alpha, and the denoiser guides all see
+    // the widened lobe, while detail_bump_weight above read the PRE-fold
+    // roughness (no feedback) and the reflection-lobe gate below keeps
+    // reading the FLAT mat.roughness (the rng-schedule rule — the fold may
+    // move the lobe, never the draw schedule). Zero rng draws, pure
+    // function of (hit, texels) — every same-seed/replay/VisCtl contract
+    // holds. Mirrored term-for-term in shade.hlsli.
+    if crate::scene::spec_aa() {
+        let mut s2 = 0.0f32;
+        if s2_detail > 0.0 {
+            let bw = detail_bump_weight(rough_eff);
+            s2 += bw * bw * s2_detail;
+        }
+        if let (true, Some(uv), Some(_)) = (mat.normal_tex != NO_TEX, map_uv, uv_basis) {
+            if let Some(&vid) = scene.tex_var.get(mat.normal_tex as usize) {
+                if vid != NO_TEX {
+                    let u = filt.sample(&scene.textures[vid as usize], uv, false).x;
+                    s2 += crate::texture::spec_aa_decode(u) * mat.normal_scale * mat.normal_scale;
+                }
+            }
+        }
+        if s2 > 0.0 {
+            rough_eff = spec_aa_fold(rough_eff, s2);
+        }
     }
     if let Some(prim) = prim.as_deref_mut() {
         *prim = PrimarySurface {
@@ -2060,6 +2121,7 @@ pub fn tangent_self_test() -> Result<(), String> {
         n2h: false,
         normal_role: false,
         mips: Vec::new(),
+        var_mips: Vec::new(),
     };
     let tri_scene = |texcoords: [glam::Vec2; 3], tex: Texture| -> Scene {
         let mut sc = Scene {
@@ -2106,6 +2168,7 @@ pub fn tangent_self_test() -> Result<(), String> {
             detail_scales: Vec::new(),
             content_min: Vec3A::ZERO,
             content_max: Vec3A::ZERO,
+            tex_var: Vec::new(),
         };
         crate::scene::finalize_scalars(&mut sc);
         sc
@@ -2863,6 +2926,202 @@ pub fn detail_ao_field(q3: Vec3A, dlod: f32) -> (f32, Vec3A) {
         }
     }
     (hh, g)
+}
+
+/// Pooled per-component variance of `clouds::vnoise3_vg`'s analytic gradient
+/// over its stationary distribution — the one statistical constant the
+/// spec-AA detail transfer needs (each octave's applied tilt is a linear
+/// scale of this gradient, so its slope variance is that scale² × this).
+/// MEASURED by deterministic lattice MC over the shipping function (600k
+/// pooled components, mean 7e-5 ≈ 0 as symmetry demands) and baked as a
+/// literal (the clouds-wind idiom, mirrored in shade.hlsli);
+/// `spec_aa_self_test` re-measures it fresh within ±10%, so a noise retune
+/// cannot silently skew the transfer.
+pub const VNOISE_GRAD_VAR: f32 = 0.1104;
+
+/// Spec-AA detail transfer: the per-axis slope variance of detail tilt NOT
+/// currently applied because the octave windows have closed (`--no-spec-aa`
+/// kills at the capture site). Per octave the applied tilt scales linearly
+/// with its window `wk`, so applied variance goes as `wk²` and the discarded
+/// share is `(1 − wk²)` of the octave's full-on variance:
+///  - grain (the `detail_field` ladder): full-on applied slope factor is
+///    `2·DETAIL_AMP·STR·DETAIL_BUMP_K` per octave — `amp_k·2·2^k` is
+///    scale-invariant across k, the chain rule's gift — windows
+///    `wk = clamp(−dlod − k, 0, 1)`;
+///  - pools (`detail_ao_field`, gated on the AO lever like the bump share
+///    itself): factor `amp_j·AO_STR·(2/div_j)·DETAIL_AO_BUMP_K·DETAIL_BUMP_K`,
+///    windows `clamp(lg_j − dlod, 0, 1)`.
+/// Every fully-open window contributes an IEEE-exact 0.0 (1 − 1·1), so
+/// magnified pixels transfer nothing bit-identically; at dlod ≥
+/// DETAIL_AO_RANGE the transfer plateaus at the field's whole variance. The
+/// consumer weights the result by `detail_bump_weight²` — a surface whose
+/// bump never applies (polished visor) is never frosted by the transfer, and
+/// applied + transferred = `bw²·full` at EVERY distance, which is the
+/// "detail always in the rendering equation" invariant. Pure function, zero
+/// rng; term-for-term HLSL twin in shade.hlsli.
+pub fn detail_var(dlod: f32) -> f32 {
+    let mut sum = 0.0f32;
+    // Grain octaves 0..2.
+    let a = 2.0 * DETAIL_AMP * crate::scene::detail_strength() * DETAIL_BUMP_K;
+    for k in 0..3u32 {
+        let wk = (-dlod - k as f32).clamp(0.0, 1.0);
+        sum += a * a * (1.0 - wk * wk);
+    }
+    // Pool octaves (8- and 4-texel cells — detail_ao_field's ladder).
+    if crate::scene::detail_ao() {
+        let kao = crate::scene::detail_ao_strength();
+        for (div, amp, lg) in [(8.0f32, 0.5f32, 3.0f32), (4.0, 0.35, 2.0)] {
+            let c = amp * kao * (2.0 / div) * DETAIL_AO_BUMP_K * DETAIL_BUMP_K;
+            let wk = (lg - dlod).clamp(0.0, 1.0);
+            sum += c * c * (1.0 - wk * wk);
+        }
+    }
+    sum * VNOISE_GRAD_VAR
+}
+
+/// The spec-AA fold itself: `α′² = α² + 2σ²` with `α = roughness²`, in
+/// roughness form — `(r⁴ + 2σ²)^¼`, clamped at 1. The Beckmann slope-variance
+/// identity (α²/2 = per-axis slope variance) applied pragmatically to GGX,
+/// the LEAN/Kaplanyan fold. Monotone, ≥ r always. `σ² == 0.0` is handled by
+/// the CALLER's branch, never here: `sqrt(sqrt(r⁴))` re-rounds, so the
+/// off-state identity is structural, not algebraic. Mirrored term-for-term
+/// in shade.hlsli.
+#[inline(always)]
+pub fn spec_aa_fold(rough: f32, s2: f32) -> f32 {
+    (rough * rough * rough * rough + 2.0 * s2).sqrt().sqrt().min(1.0)
+}
+
+/// Spec-AA math gates, run by `--check` (the detail/ripple gate class): the
+/// fold's closed-form anchor and monotone bounds, the transfer's exact-zero
+/// open-window identity (the bit-identity spine of the magnification off
+/// state), its plateau against an independently assembled closed form, the
+/// AO-lever share, and the VNOISE_GRAD_VAR re-measure (±10%) that keeps the
+/// baked literal honest against a vnoise retune.
+pub fn spec_aa_self_test() -> Result<(), String> {
+    // Pin the strength knobs (the detail_self_test RAII pattern) so the
+    // closed forms below are checked at KNOWN amplitudes even under a
+    // --detail-strength session; restored on every exit path.
+    struct Pin(f32, f32, bool);
+    impl Drop for Pin {
+        fn drop(&mut self) {
+            crate::scene::set_detail_strength(self.0);
+            crate::scene::set_detail_ao_strength(self.1);
+            crate::scene::set_detail_ao(self.2);
+        }
+    }
+    let _pin = Pin(
+        crate::scene::detail_strength(),
+        crate::scene::detail_ao_strength(),
+        crate::scene::detail_ao(),
+    );
+    crate::scene::set_detail_strength(1.0);
+    crate::scene::set_detail_ao_strength(1.0);
+    crate::scene::set_detail_ao(true);
+
+    // --- The fold ----------------------------------------------------------
+    // Closed-form anchor: fold(0, σ²) = (2σ²)^¼.
+    for s2 in [1e-4f32, 0.01, 0.1, 0.5] {
+        let want = (2.0 * s2).powf(0.25);
+        let got = spec_aa_fold(0.0, s2);
+        if (got - want).abs() > 1e-6 * want.max(1.0) {
+            return Err(format!("fold(0, {s2}) = {got}, want (2σ²)^¼ = {want}"));
+        }
+    }
+    // Monotone in both arguments, bounded to [rough, 1].
+    let rs = [0.0f32, 0.02, 0.1, 0.3, 0.5, 0.8, 1.0];
+    let s2s = [0.0f32, 1e-4, 1e-2, 0.1, 0.5];
+    for (i, &r) in rs.iter().enumerate() {
+        for (j, &s2) in s2s.iter().enumerate() {
+            let f = spec_aa_fold(r, s2);
+            if !(f >= r - 1e-6 && f <= 1.0) {
+                return Err(format!("fold({r}, {s2}) = {f} escapes [rough, 1]"));
+            }
+            if i > 0 && spec_aa_fold(rs[i - 1], s2) > f + 1e-7 {
+                return Err(format!("fold not monotone in rough at ({r}, {s2})"));
+            }
+            if j > 0 && spec_aa_fold(r, s2s[j - 1]) > f + 1e-7 {
+                return Err(format!("fold not monotone in σ² at ({r}, {s2})"));
+            }
+        }
+    }
+
+    // --- The transfer's window identities -----------------------------------
+    // Every window fully open ⇒ IEEE-exact 0.0 (a magnified pixel transfers
+    // nothing, bit-identically) — including the GPU's −1e30 degenerate lod
+    // and the CPU's −∞.
+    for dlod in [-3.0f32, -5.0, -100.0, -1e30, f32::NEG_INFINITY] {
+        let v = detail_var(dlod);
+        if v.to_bits() != 0.0f32.to_bits() {
+            return Err(format!("detail_var({dlod}) = {v}, want bitwise 0.0"));
+        }
+    }
+    // Plateau at dlod ≥ DETAIL_AO_RANGE: every window shut, the field's whole
+    // variance transfers. The oracle is the octave table spelled out
+    // independently, not the function's own loop.
+    let a = 2.0 * DETAIL_AMP * DETAIL_BUMP_K; // strengths pinned at 1.0
+    let pools = {
+        let c8 = 0.5 * (2.0 / 8.0) * DETAIL_AO_BUMP_K * DETAIL_BUMP_K;
+        let c4 = 0.35 * (2.0 / 4.0) * DETAIL_AO_BUMP_K * DETAIL_BUMP_K;
+        c8 * c8 + c4 * c4
+    };
+    let want_plateau = (3.0 * a * a + pools) * VNOISE_GRAD_VAR;
+    let got_plateau = detail_var(DETAIL_AO_RANGE);
+    if (got_plateau - want_plateau).abs() > 1e-6 * want_plateau {
+        return Err(format!("plateau {got_plateau} != closed form {want_plateau}"));
+    }
+    if detail_var(1e30) != got_plateau {
+        return Err("plateau does not saturate past DETAIL_AO_RANGE".into());
+    }
+    // Anti-vacuity: the transfer must be live at the pinned strengths.
+    if !(got_plateau > 0.0) {
+        return Err("plateau is 0 — the transfer is vacuous".into());
+    }
+    // Monotone nondecreasing across the whole fade band (windows only close
+    // as dlod grows, so transferred variance only accumulates).
+    let mut prev = 0.0f32;
+    let mut x = -3.5f32;
+    while x <= 3.5 {
+        let v = detail_var(x);
+        if v + 1e-7 < prev {
+            return Err(format!("detail_var not monotone at dlod {x}"));
+        }
+        prev = v;
+        x += 0.05;
+    }
+    // The AO lever removes exactly the pool share (the transfer follows the
+    // bump share it mirrors).
+    crate::scene::set_detail_ao(false);
+    let grain_only = detail_var(DETAIL_AO_RANGE);
+    crate::scene::set_detail_ao(true);
+    let want_grain = 3.0 * a * a * VNOISE_GRAD_VAR;
+    if (grain_only - want_grain).abs() > 1e-6 * want_grain {
+        return Err(format!("AO-off plateau {grain_only} != grain-only {want_grain}"));
+    }
+
+    // --- VNOISE_GRAD_VAR re-measure ----------------------------------------
+    // The same deterministic lattice that baked the literal (600k pooled
+    // gradient components across ~124k cells); ±10% so a vnoise retune
+    // cannot silently skew the transfer's magnitude.
+    let (mut s, mut s2m, mut n) = (0.0f64, 0.0f64, 0u64);
+    for i in 0..200_000u32 {
+        let t = i as f32;
+        let q = Vec3A::new(t * 0.618_034 + 0.123, t * 0.414_214 + 4.567, t * 0.267_949 + 9.876);
+        let (_, g) = crate::clouds::vnoise3_vg(q, 40);
+        for c in [g.x, g.y, g.z] {
+            s += c as f64;
+            s2m += (c as f64) * (c as f64);
+            n += 1;
+        }
+    }
+    let mean = s / n as f64;
+    let var = (s2m / n as f64 - mean * mean) as f32;
+    if (var - VNOISE_GRAD_VAR).abs() > 0.1 * VNOISE_GRAD_VAR {
+        return Err(format!(
+            "vnoise gradient variance measured {var:.4} vs baked {VNOISE_GRAD_VAR} (±10%) — \
+             re-bake the literal (and its shade.hlsli twin)"
+        ));
+    }
+    Ok(())
 }
 
 /// The detail window's lod base for an ANISOTROPIC footprint: the log2 length
@@ -3703,6 +3962,7 @@ pub fn detail_self_test() -> Result<(), String> {
                     n2h: false,
                     normal_role: false,
                     mips: Vec::new(),
+                    var_mips: Vec::new(),
                 }],
                 any_alpha: false,
                 any_height: false,
@@ -3720,6 +3980,7 @@ pub fn detail_self_test() -> Result<(), String> {
                 detail_scales: Vec::new(),
                 content_min: Vec3A::ZERO,
                 content_max: Vec3A::ZERO,
+                tex_var: Vec::new(),
             };
             finalize_scalars(&mut sc);
             sc

@@ -2166,6 +2166,7 @@ pub fn height_self_test() -> Result<(), String> {
                 n2h: false,
                 normal_role: false,
                 mips: Vec::new(),
+                var_mips: Vec::new(),
             }],
             any_alpha: false,
             any_height: false,
@@ -2183,6 +2184,7 @@ pub fn height_self_test() -> Result<(), String> {
             detail_scales: Vec::new(),
             content_min: Vec3A::ZERO,
             content_max: Vec3A::ZERO,
+            tex_var: Vec::new(),
         };
         crate::scene::finalize_scalars(&mut sc);
         sc
@@ -2505,6 +2507,7 @@ pub fn tinted_shadow_self_test() -> Result<(), String> {
             detail_scales: Vec::new(),
             content_min: Vec3A::ZERO,
             content_max: Vec3A::ZERO,
+            tex_var: Vec::new(),
         };
         crate::scene::finalize_scalars(&mut sc);
         sc

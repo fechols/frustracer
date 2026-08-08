@@ -372,6 +372,7 @@ fn merge_scenes(parts: Vec<(Scene, Vec3A)>, field_half: f32) -> Scene {
         detail_scales: Vec::new(),
         content_min: Vec3A::ZERO,
         content_max: Vec3A::ZERO,
+        tex_var: Vec::new(),
     };
     // Re-derives diag/eps/ao_radius (now world-scale — the proven --tile
     // regime), the content box (unions the islands, excludes the ground),
@@ -688,6 +689,7 @@ fn test_part(n_tex: u32, albedo_tex: u32, normal_tex: u32) -> Scene {
             n2h: false,
             normal_role: false,
             mips: Vec::new(),
+            var_mips: Vec::new(),
         });
     }
     let m = b.material_full(Material {

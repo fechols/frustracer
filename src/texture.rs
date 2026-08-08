@@ -137,6 +137,33 @@ pub const N2H_AMP_CAP: f32 = 8.0;
 /// so the two modes describe one surface.
 pub const HEIGHT_NORMAL_STRENGTH: f32 = 2.0;
 
+/// Cap of the stored slope-variance signal (spec-AA, the Toksvig/LEAN fold):
+/// the fold `α′² = α² + 2σ²` saturates roughness at 1.0 once `2σ² ≥ 1 − α⁴`,
+/// so any σ² ≥ 0.5 is indistinguishable from 0.5 through the fold — the cap
+/// loses nothing the consumer could see. MIRRORED as a literal in
+/// shade.hlsli (`SPEC_AA_S2_CAP`) — change both together.
+pub const SPEC_AA_S2_CAP: f32 = 0.5;
+
+/// Encode a per-axis slope variance into the companion plane's u8: sqrt
+/// domain against the cap, so resolution concentrates near σ ≈ 0 where
+/// roughness is most sensitive. `enc(0.0) == 0` exactly — the zero byte is
+/// what makes the level-0 all-zero companion plane an EXACT 0.0 through the
+/// bilinear escape, the fold's structural off state.
+#[inline]
+fn spec_aa_encode(s2: f32) -> u8 {
+    ((s2.clamp(0.0, SPEC_AA_S2_CAP) / SPEC_AA_S2_CAP).sqrt() * 255.0 + 0.5) as u8
+}
+
+/// Decode one filtered UNORM sample of a companion plane back to σ² — the
+/// ONE decode both shade.rs and the self-test share (shade.hlsli mirrors it
+/// term-for-term). `decode(0.0) == 0.0` bitwise: `0·0·CAP` is an IEEE-exact
+/// zero, which is what lets the fold branch on `s2 > 0.0` and stay
+/// bit-identical wherever no variance was ever stored.
+#[inline]
+pub fn spec_aa_decode(u: f32) -> f32 {
+    u * u * SPEC_AA_S2_CAP
+}
+
 /// One mip level below the base image (level 0 lives in `Texture::{w,h,
 /// texels}` unchanged — every existing consumer keeps its layout).
 pub struct Mip {
@@ -201,6 +228,20 @@ pub struct Texture {
     /// the base texels, mips are NOT persisted by the scene cache — they
     /// regenerate on every load.
     pub mips: Vec<Mip>,
+    /// Slope-VARIANCE planes for `normal_role` chains (spec-AA — the
+    /// Toksvig/LEAN signal `build_mips`' slope average otherwise discards at
+    /// its renormalize): `var_mips[L]` pairs with `mips[L]` — same dims —
+    /// holding the mean per-axis variance σ² of the BASE-level slopes inside
+    /// that texel's footprint, sqrt-domain u8-encoded against
+    /// `SPEC_AA_S2_CAP` (grayscale, alpha 255). Computed by an exact-f32
+    /// law-of-total-variance side-chain in `build_mips` — the RGB/alpha byte
+    /// path is untouched, so the slope-mip gates cannot move. Wrapped into a
+    /// grayscale companion texture by `scene::finalize_normal_mips` (whose
+    /// level 0 is ALL-ZERO — the base level has no filtered-away variance,
+    /// which is what makes the fold self-disable at magnification through
+    /// the `lod <= 0` bilinear escape). Derived-only, never serialized;
+    /// empty unless `normal_role`.
+    pub var_mips: Vec<Mip>,
 }
 
 impl Texture {
@@ -220,6 +261,7 @@ impl Texture {
             n2h: false,
             normal_role: false,
             mips: Vec::new(),
+            var_mips: Vec::new(),
         };
         if MIPS_ENABLED.load(Relaxed) {
             t.build_mips();
@@ -257,6 +299,7 @@ impl Texture {
             n2h,
             normal_role: false,
             mips: Vec::new(),
+            var_mips: Vec::new(),
         };
         if MIPS_ENABLED.load(Relaxed) {
             t.build_mips();
@@ -281,8 +324,35 @@ impl Texture {
     /// convention passes through untouched. Alpha (the n2h/h2n height)
     /// stays the raw u8 box average in every arm — height is linear, and
     /// the follow-on cavity tap wants those mips correct.
+    ///
+    /// `normal_role` chains additionally carry a slope-VARIANCE side-chain
+    /// into `var_mips` (spec-AA): the renormalize above keeps the mean tilt
+    /// and discards the spread about it, so a texel whose footprint held
+    /// ±steep opposing slopes encodes exactly like a flat one — the variance
+    /// planes are where that discarded signal goes, to be folded into GGX
+    /// roughness at shading. The chain is exact f32 (never re-decoded from
+    /// the quantized mip bytes), advanced per level by the law of total
+    /// variance, and quantized once per level at store; the byte path above
+    /// is untouched in every arm.
     fn build_mips(&mut self) {
         let (mut w, mut h) = (self.w, self.h);
+        // Spec-AA side-chain (normal_role only): exact-f32 (mean_x, mean_y,
+        // σ²) per texel of the CURRENT level, seeded from the base texels'
+        // decoded slopes (the perturb_normal decode, z-clamp included) at
+        // σ² = 0.
+        let mut chain: Vec<[f32; 3]> = if self.normal_role {
+            self.texels
+                .iter()
+                .map(|t| {
+                    let x = t[0] as f32 / 255.0 * 2.0 - 1.0;
+                    let y = t[1] as f32 / 255.0 * 2.0 - 1.0;
+                    let z = (t[2] as f32 / 255.0 * 2.0 - 1.0).max(0.05);
+                    [x / z, y / z, 0.0]
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         while w > 1 || h > 1 {
             let (nw, nh) = ((w / 2).max(1), (h / 2).max(1));
             let src: &[[u8; 4]] = match self.mips.last() {
@@ -290,15 +360,17 @@ impl Texture {
                 None => &self.texels,
             };
             let mut texels = Vec::with_capacity((nw * nh) as usize);
+            let mut next_chain: Vec<[f32; 3]> =
+                Vec::with_capacity(if self.normal_role { (nw * nh) as usize } else { 0 });
             for y in 0..nh {
                 for x in 0..nw {
-                    let taps = [
+                    let coords = [
                         (2 * x, 2 * y),
                         ((2 * x + 1).min(w - 1), 2 * y),
                         (2 * x, (2 * y + 1).min(h - 1)),
                         ((2 * x + 1).min(w - 1), (2 * y + 1).min(h - 1)),
-                    ]
-                    .map(|(tx, ty)| src[(ty * w + tx) as usize]);
+                    ];
+                    let taps = coords.map(|(tx, ty)| src[(ty * w + tx) as usize]);
                     let avg_u8 =
                         |ch: usize| ((taps.iter().map(|t| t[ch] as u32).sum::<u32>() + 2) / 4) as u8;
                     let px = if self.srgb {
@@ -328,7 +400,42 @@ impl Texture {
                         [avg_u8(0), avg_u8(1), avg_u8(2), avg_u8(3)]
                     };
                     texels.push(px);
+                    if self.normal_role {
+                        // Law of total variance over the four children,
+                        // per axis then axis-averaged: total = within (the
+                        // mean of the child σ²s) + between (the variance
+                        // of the child means). `.max(0.0)` guards the
+                        // E[x²] − E[x]² cancellation against a negative ulp.
+                        let c = coords.map(|(tx, ty)| chain[(ty * w + tx) as usize]);
+                        let mx = (c[0][0] + c[1][0] + c[2][0] + c[3][0]) * 0.25;
+                        let my = (c[0][1] + c[1][1] + c[2][1] + c[3][1]) * 0.25;
+                        let ex2 = (c[0][0] * c[0][0]
+                            + c[1][0] * c[1][0]
+                            + c[2][0] * c[2][0]
+                            + c[3][0] * c[3][0])
+                            * 0.25;
+                        let ey2 = (c[0][1] * c[0][1]
+                            + c[1][1] * c[1][1]
+                            + c[2][1] * c[2][1]
+                            + c[3][1] * c[3][1])
+                            * 0.25;
+                        let within = (c[0][2] + c[1][2] + c[2][2] + c[3][2]) * 0.25;
+                        let between =
+                            0.5 * ((ex2 - mx * mx).max(0.0) + (ey2 - my * my).max(0.0));
+                        next_chain.push([mx, my, within + between]);
+                    }
                 }
+            }
+            if self.normal_role {
+                let var_texels = next_chain
+                    .iter()
+                    .map(|c| {
+                        let e = spec_aa_encode(c[2]);
+                        [e, e, e, 255]
+                    })
+                    .collect();
+                self.var_mips.push(Mip { w: nw, h: nh, texels: var_texels });
+                chain = next_chain;
             }
             self.mips.push(Mip { w: nw, h: nh, texels });
             (w, h) = (nw, nh);
@@ -349,6 +456,7 @@ impl Texture {
     /// and calls this). A no-chain session stays no-chain.
     pub fn rebuild_mips(&mut self) {
         self.mips.clear();
+        self.var_mips.clear();
         if MIPS_ENABLED.load(Relaxed) {
             self.build_mips();
         }
@@ -412,6 +520,7 @@ impl Texture {
             n2h: false,
             normal_role: false,
             mips: Vec::new(),
+            var_mips: Vec::new(),
         };
         if MIPS_ENABLED.load(Relaxed) {
             t.build_mips();
@@ -786,6 +895,7 @@ pub fn self_test() -> bool {
             n2h: false,
             normal_role: false,
             mips: Vec::new(),
+            var_mips: Vec::new(),
         };
         t.build_mips();
         t
@@ -844,6 +954,7 @@ pub fn self_test() -> bool {
             n2h: false,
             normal_role: role,
             mips: Vec::new(),
+            var_mips: Vec::new(),
         };
         t.build_mips();
         t
@@ -921,6 +1032,117 @@ pub fn self_test() -> bool {
             "non-role mip {:?} != legacy byte average {legacy:?}",
             &tl.mips[0].texels[0][..3]
         ));
+        ok = false;
+    }
+
+    // --- Spec-AA slope-variance planes --------------------------------------
+    // The slope arm's renormalize keeps the mean tilt and discards the spread
+    // about it; var_mips is where the spread goes. Gates: exact zero where
+    // there is no spread, the law-of-total-variance accumulation against a
+    // direct oracle over the base slopes, the encode/decode zero identity
+    // (the fold's structural off state), cap saturation, and the off arm.
+    //
+    // decode(enc(0)) == 0.0 BITWISE — what lets shade's fold branch on
+    // `s2 > 0.0` and stay bit-identical wherever nothing was stored.
+    if spec_aa_decode(spec_aa_encode(0.0) as f32 / 255.0).to_bits() != 0.0f32.to_bits() {
+        fail("spec-aa decode(enc(0)) != 0.0 bitwise — the fold's off identity is broken".into());
+        ok = false;
+    }
+    // A constant map has zero spread at every level; the plane must pair the
+    // mip chain level-for-level and read exactly 0 (alpha rides at 255).
+    if tc.var_mips.len() != tc.mips.len() {
+        fail(format!(
+            "constant-map var planes {} != mip levels {}",
+            tc.var_mips.len(),
+            tc.mips.len()
+        ));
+        ok = false;
+    }
+    for (li, m) in tc.var_mips.iter().enumerate() {
+        for px in &m.texels {
+            if px[0] != 0 || px[1] != 0 || px[2] != 0 || px[3] != 255 {
+                fail(format!("constant-map var plane nonzero at level {} ({px:?})", li + 1));
+                ok = false;
+            }
+        }
+    }
+    // The steep/flat probe's spread (±4 slopes ⇒ σ² ≈ 2.05, 4× the cap) must
+    // saturate to byte 255 — the cap is lossless through the fold, not lossy
+    // storage of a value the consumer could distinguish.
+    let tsat = mkn(2, 2, vec![steep, flat, steep, flat], true);
+    if tsat.var_mips[0].texels[0][0] != 255 {
+        fail(format!(
+            "steep/flat var byte = {}, want cap-saturated 255",
+            tsat.var_mips[0].texels[0][0]
+        ));
+        ok = false;
+    }
+    // Law of total variance across two levels: a 4×4 whose 2×2 blocks are
+    // (mixed ±0.5-slope, all +0.5, all −0.5, all flat) — level 1 carries the
+    // within-block spread, level 2 adds the between-block spread of the
+    // means, and the 1×1 plane must equal a DIRECT variance of all 16 base
+    // slopes (the chain stays f32, so only the one store quantization and
+    // f32 association separate them — ±1 byte).
+    let sp = [185u8, 128, 242, 255]; // slope ≈ +0.502
+    let sm = [70u8, 128, 242, 255]; // slope ≈ −0.502
+    let fl = [128u8, 128, 255, 255]; // slope ≈ 0
+    #[rustfmt::skip]
+    let base16 = vec![
+        sp, sm, sp, sp,
+        sp, sm, sp, sp,
+        sm, sm, fl, fl,
+        sm, sm, fl, fl,
+    ];
+    let tv = mkn(4, 4, base16.clone(), true);
+    let dec2 = |px: [u8; 4]| {
+        let x = px[0] as f32 / 255.0 * 2.0 - 1.0;
+        let y = px[1] as f32 / 255.0 * 2.0 - 1.0;
+        let z = (px[2] as f32 / 255.0 * 2.0 - 1.0).max(0.05);
+        (x / z, y / z)
+    };
+    let n16 = base16.len() as f32;
+    let (mut mx, mut my, mut ex2, mut ey2) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+    for &px in &base16 {
+        let (sx, sy) = dec2(px);
+        mx += sx;
+        my += sy;
+        ex2 += sx * sx;
+        ey2 += sy * sy;
+    }
+    (mx, my, ex2, ey2) = (mx / n16, my / n16, ex2 / n16, ey2 / n16);
+    let want_s2 = 0.5 * ((ex2 - mx * mx).max(0.0) + (ey2 - my * my).max(0.0));
+    let want_b = spec_aa_encode(want_s2);
+    let got_b = tv.var_mips[1].texels[0][0];
+    if (got_b as i32 - want_b as i32).abs() > 1 {
+        fail(format!(
+            "1×1 var byte = {got_b}, want {want_b} (direct σ² {want_s2:.4}) — law of total \
+             variance drifted"
+        ));
+        ok = false;
+    }
+    // Anti-vacuity: the probe must land mid-range (a 0 or 255 oracle would
+    // pass the compare while testing nothing but the clamps).
+    if want_b == 0 || want_b == 255 {
+        fail(format!("LTV probe oracle byte {want_b} is degenerate — retune the probe"));
+        ok = false;
+    }
+    // Level-1 spot pair: the all-+0.5 block (2×2 texel (1,0)) has zero
+    // spread — exact 0 — while the mixed block (texel (0,0)) must be > 0.
+    if tv.var_mips[0].texels[1][0] != 0 {
+        fail(format!(
+            "uniform-block var byte = {}, want exact 0",
+            tv.var_mips[0].texels[1][0]
+        ));
+        ok = false;
+    }
+    if tv.var_mips[0].texels[0][0] == 0 {
+        fail("mixed-block var byte = 0 — the within-block spread was lost".into());
+        ok = false;
+    }
+    // normal_role = false builds NO variance planes (the off arm at the unit
+    // level — no companion source, the fold structurally unreachable).
+    if !tl.var_mips.is_empty() {
+        fail("non-role texture grew var planes".into());
         ok = false;
     }
 

@@ -822,6 +822,7 @@ pub fn synth_sway_scene(clusters: &[Vec3A], per: usize) -> Scene {
         n2h: false,
         normal_role: false,
         mips: Vec::new(),
+        var_mips: Vec::new(),
     });
     let m = b.material_kind(Vec3A::ONE, 0.5, 0.0, 0.0, MatKind::Textured { tex: t });
     for &c in clusters {
@@ -1665,6 +1666,7 @@ pub fn self_test(scene: &Scene, bvh: &crate::bvh::Bvh) -> Result<(), String> {
             n2h: false,
             normal_role: false,
             mips: Vec::new(),
+            var_mips: Vec::new(),
         };
         let mut b = crate::scene::SceneBuilder::new();
         let t_alpha = b.add_texture(mk_tex(true));
@@ -2282,6 +2284,7 @@ pub fn self_test(scene: &Scene, bvh: &crate::bvh::Bvh) -> Result<(), String> {
             n2h: false,
             normal_role: false,
             mips: Vec::new(),
+            var_mips: Vec::new(),
         };
         let mut b = crate::scene::SceneBuilder::new();
         let t_leaf = b.add_texture(mk_tex(true));
@@ -2481,6 +2484,7 @@ pub fn self_test(scene: &Scene, bvh: &crate::bvh::Bvh) -> Result<(), String> {
             n2h: false,
             normal_role: false,
             mips: Vec::new(),
+            var_mips: Vec::new(),
         };
         let build = || {
             let mut b = crate::scene::SceneBuilder::new();

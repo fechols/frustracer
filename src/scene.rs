@@ -130,6 +130,28 @@ pub fn detail_strength() -> f32 {
     f32::from_bits(DETAIL_STRENGTH.load(Relaxed))
 }
 
+/// Spec-AA switch (`--no-spec-aa`): the Toksvig/LEAN slope-variance →
+/// roughness fold, keeping detail maps in the rendering equation at every
+/// distance — what a mip averages away comes back as a wider GGX lobe
+/// instead of vanishing. Gates (1) the variance-companion pass in
+/// `finalize_normal_mips` (off ⇒ no companions ⇒ the map arm structurally
+/// dead on both CPU and GPU), (2) the detail-field transfer capture in
+/// shade.rs, and (3) the GPU FLAG_SPEC_AA bit. Runtime-lever class like
+/// detail_tex (derived data only — no cache-lever-word bit, no
+/// CACHE_VERSION move); the off arm is bit-identical to the pre-feature
+/// renderer by construction. `--no-slope-mips`/`--no-mips` kill the map
+/// half automatically (no `normal_role` ⇒ no variance planes); the detail
+/// half is independent.
+static SPEC_AA: AtomicBool = AtomicBool::new(true);
+
+pub fn set_spec_aa(on: bool) {
+    SPEC_AA.store(on, Relaxed);
+}
+
+pub fn spec_aa() -> bool {
+    SPEC_AA.load(Relaxed)
+}
+
 /// `--detail-ao-strength K` (default 0.125 — the same feel-test; 1.0 = the
 /// original amplitudes): session multiplier on the detail AO family's
 /// amplitudes — the pool octaves (height + relief rims + cavity input) and
@@ -438,6 +460,14 @@ pub struct Scene {
     /// be degenerate. Derived (`finalize_scalars`), never serialized.
     pub content_min: Vec3A,
     pub content_max: Vec3A,
+    /// Spec-AA companion map: texture id → the id of its slope-VARIANCE
+    /// companion texture (`NO_TEX` = none), parallel to `textures`. Filled by
+    /// `finalize_normal_mips` — companions are appended at the END of the
+    /// table, so no existing id shifts (the cache-v7 argument) — and read by
+    /// shade's roughness fold. Derived, never serialized (the pass runs
+    /// post-cache-store on every load path); EMPTY on any scene that never
+    /// ran it, so lookups must go through `.get()`.
+    pub tex_var: Vec<u32>,
 }
 
 impl Scene {
@@ -669,6 +699,7 @@ impl SceneBuilder {
             detail_scales: Vec::new(),
             content_min: Vec3A::ZERO,
             content_max: Vec3A::ZERO,
+            tex_var: Vec::new(),
         };
         finalize_scalars(&mut scene);
         scene
@@ -862,6 +893,47 @@ pub fn finalize_normal_mips(scene: &mut Scene) {
             "slope-mips: {n} normal map chain(s) rebuilt slope-space in {:.0} ms",
             t0.elapsed().as_secs_f64() * 1000.0
         );
+    }
+    // Spec-AA companions (`--no-spec-aa` kills): wrap each rebuilt chain's
+    // slope-variance planes into a grayscale companion texture APPENDED at
+    // the end of the table — existing ids never shift (the cache-v7
+    // argument), and every store site runs before this pass, so a companion
+    // can never reach a sidecar. Level 0 is ALL-ZERO: the base level has no
+    // filtered-away variance, and the `lod <= 0` bilinear escape then reads
+    // an exact 0.0, which is what makes shade's fold self-disable at
+    // magnification with no extra branch. Sequential in id order —
+    // deterministic table layout. The planes MOVE out of the source texture
+    // (they were staging there, never sampled in place).
+    if spec_aa() {
+        let n_tex = scene.textures.len();
+        let mut tex_var = vec![NO_TEX; n_tex];
+        let mut added = 0u32;
+        for id in 0..n_tex {
+            if scene.textures[id].var_mips.is_empty() {
+                continue;
+            }
+            let (w, h) = (scene.textures[id].w, scene.textures[id].h);
+            let var_mips = std::mem::take(&mut scene.textures[id].var_mips);
+            tex_var[id] = scene.textures.len() as u32;
+            scene.textures.push(crate::texture::Texture {
+                w,
+                h,
+                texels: vec![[0, 0, 0, 255]; (w * h) as usize],
+                alpha_masked: false,
+                srgb: false,
+                source: String::new(),
+                h2n: false,
+                n2h: false,
+                normal_role: false,
+                mips: var_mips,
+                var_mips: Vec::new(),
+            });
+            added += 1;
+        }
+        scene.tex_var = tex_var;
+        if added > 0 {
+            eprintln!("spec-aa: {added} slope-variance companion(s) appended");
+        }
     }
 }
 
@@ -1276,6 +1348,7 @@ pub fn spray_self_test() -> Result<(), String> {
             detail_scales: Vec::new(),
             content_min: Vec3A::ZERO,
             content_max: Vec3A::ZERO,
+            tex_var: Vec::new(),
         };
         finalize_scalars(&mut sc);
         sc
@@ -1447,6 +1520,7 @@ pub fn coincident_self_test() -> Result<(), String> {
                 detail_scales: Vec::new(),
                 content_min: Vec3A::ZERO,
                 content_max: Vec3A::ZERO,
+                tex_var: Vec::new(),
             };
             set_coincident_cull(cull);
             cull_coincident(&mut sc);
@@ -2071,6 +2145,7 @@ pub fn tile_scene(base: Scene, nx: u32, nz: u32) -> (Scene, f32) {
         detail_scales: Vec::new(),
         content_min: Vec3A::ZERO,
         content_max: Vec3A::ZERO,
+        tex_var: Vec::new(),
     };
     finalize_scalars(&mut scene);
     eprintln!(

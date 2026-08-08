@@ -1704,6 +1704,74 @@ cargo run --release -- --no-slope-mips  # A/B lever (2026-08-05): normal-map mip
                                       # the off arm's unit-level identity); liveness proven by
                                       # check.png moving on smlp with the suite green both arms,
                                       # world cold/warm smoke rebuilds identical chain counts
+cargo run --release -- --no-spec-aa   # A/B lever (2026-08-08): no slope-variance → roughness fold —
+                                      # the pre-feature behavior, where mip-averaged normal-map
+                                      # detail and faded detail-field octaves VANISH with distance
+                                      # (distant bumpy surfaces collapse to a mirror-flat mean
+                                      # normal at authored roughness — the missing-Toksvig
+                                      # signature the slope mips above deliberately left open:
+                                      # their renormalize keeps the mean tilt, discards the
+                                      # SPREAD). DEFAULT ON ("spec-AA"): detail maps stay in the
+                                      # rendering equation at every distance in the statistical
+                                      # sense — what a footprint can no longer show as normal
+                                      # perturbation shades as a wider GGX lobe instead,
+                                      # α′² = α² + 2σ² (`shade::spec_aa_fold`, the LEAN/Kaplanyan
+                                      # fold; σ² = mean per-axis slope variance), applied to
+                                      # rough_eff between the ripple and the PrimarySurface
+                                      # capture so ggx_alphas/sheen/denoiser guides all see it,
+                                      # while `refl_ray` keeps reading the FLAT roughness (the
+                                      # rng-schedule rule — the fold moves the lobe, never the
+                                      # draw schedule; shadeclass strips stay valid verbatim).
+                                      # TWO SOURCES, each exactly 0.0 where nothing was resolved
+                                      # away (identity BY BRANCH `s2 > 0` — sqrt(sqrt(r⁴)) is not
+                                      # an f32 identity): (1) normal maps — `build_mips`' slope
+                                      # arm now carries an exact-f32 law-of-total-variance
+                                      # side-chain (`Texture::var_mips`, the σ² of the BASE
+                                      # slopes inside each footprint, sqrt-domain u8 vs
+                                      # SPEC_AA_S2_CAP=0.5 — lossless through the fold's
+                                      # saturation; the RGB/alpha byte paths untouched so the
+                                      # slope-mip gates cannot move), wrapped by
+                                      # finalize_normal_mips into a grayscale COMPANION texture
+                                      # appended at the END of scene.textures (no id shift — the
+                                      # cache-v7 argument; every store site runs before the pass,
+                                      # so companions never reach a sidecar — derived-only, NO
+                                      # CACHE_VERSION move, no lever-word bit), level 0 ALL-ZERO
+                                      # so the lod ≤ 0 bilinear escape reads exact 0.0 and the
+                                      # fold self-disables at magnification structurally; sampled
+                                      # through the SAME TexFilter as the map itself
+                                      # (Scene::tex_var → Mat.normal_var_tex on GPU, GpuMat/Mat
+                                      # 104→108 B lockstep), ×normal_scale² (the decode scales
+                                      # slopes linearly); (2) the detail field — `shade::
+                                      # detail_var(dlod)`: each octave's applied tilt scales with
+                                      # its window wk, so applied variance goes wk² and the
+                                      # discarded share (1−wk²) transfers, ×bw²
+                                      # (detail_bump_weight — applied + transferred = bw²·full at
+                                      # EVERY distance, the invariant; a polished visor is never
+                                      # frosted by detail it would never have shown), plateauing
+                                      # past DETAIL_AO_RANGE at the field's whole variance
+                                      # (VNOISE_GRAD_VAR = 0.1104, measured by deterministic
+                                      # lattice MC over vnoise3_vg, mirrored literal, self-test
+                                      # re-measures ±10%). GPU: FLAG_SPEC_AA=1048576 (runtime
+                                      # lever, the FLAG_DETAIL shape; rides FrameCb::with_frame so
+                                      # DXR inherits it), shade.hlsli term-for-term twin,
+                                      # companions ride texs[] verbatim (BC7 like any linear map).
+                                      # `--no-slope-mips`/`--no-mips` kill the map half
+                                      # automatically (no normal_role ⇒ no planes); the detail
+                                      # half is independent. Zero rng draws anywhere. Gates:
+                                      # texture::self_test's variance family (constant-map exact
+                                      # 0 every level, LTV vs a direct 16-slope oracle ±1 byte,
+                                      # uniform-block exact 0 + mixed-block >0, cap saturation,
+                                      # decode(enc(0)) bitwise 0, role-off empty) +
+                                      # shade::spec_aa_self_test (fold anchor (2σ²)^¼, monotone
+                                      # bounds, open-window bitwise-0 incl. −1e30/−∞, plateau vs
+                                      # an independently assembled closed form, AO-lever share,
+                                      # the MC pin) in --check; off arm proven byte-identical
+                                      # (check.png/check_gi.png == pre-feature under
+                                      # --no-spec-aa); the ON arm moves both goldens (the detail
+                                      # transfer fires on the procedural scenes' mid/far pixels —
+                                      # re-blessed). Far-field magnitude at defaults: σ² ≈ 0.044
+                                      # ⇒ rough 0.5 → ~0.62, gentle by construction (STR=0.5 and
+                                      # AO_STR=0.125 govern it; DETAIL_STR² scaling built in)
 cargo run --release -- --normal-strength 1.5  # session multiplier on every material's normal-map
                                       # strength (0.0..=8.0; default 1.0 = bit-identical off arm,
                                       # gated k != 1.0 — smlp check.png hash-equal proven; 0 =

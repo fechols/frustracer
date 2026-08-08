@@ -103,6 +103,13 @@
                                // derivation guarantees fb_mode == 0 whenever
                                // it is set, the hemi-tiers-take-precedence
                                // rule). Lockstep with trace.rs's FLAG_RTGI.
+#define FLAG_SPEC_AA  1048576u // spec-AA (--no-spec-aa clears): the slope-
+                               // variance -> roughness fold — the normal
+                               // map's variance companion (per material via
+                               // Mat.normal_var_tex) + the detail field's
+                               // faded octaves widen the GGX lobe instead of
+                               // vanishing with distance. Lockstep with
+                               // trace.rs::FLAG_SPEC_AA.
 
 cbuffer Frame : register(b0) {
     float4 cam_origin;   // xyz; w = inv_w
