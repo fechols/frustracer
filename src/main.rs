@@ -59,6 +59,10 @@ mod oidn;
 // The ORT loader half is Windows-only (LoadLibrary + DirectML); the padding,
 // NCHW packing, and temporal-warp math are pure and feed --check.
 mod nppd;
+// NRD (ReBLUR) runtime FFI: the transcription + version gate + the oracle
+// math twins are pure and feed --check-nrd's DLL-free half; only Nrd::new
+// touches NRD.dll.
+mod nrd;
 mod frustcap;
 // Step-0 measurement harness (FR_ORACLE=1): read-only probes that size the
 // candidate frustum-query changes. Default OFF and behaviour-free.
@@ -266,6 +270,7 @@ fn main() {
         check_fsr,
         check_nppd,
         nppd_dump,
+        check_nrd,
         check_gpu,
         check_dxr,
         no_xess_explicit,
@@ -362,6 +367,21 @@ fn main() {
              present arm, and the fuse presents through its own. Drop one."
         );
         std::process::exit(2);
+    }
+    // Same shape for the two pre-upscale denoisers themselves: cs_nrd_out and
+    // the NPPD crop both claim the engine's color plane — being told beats a
+    // silent last-writer-wins. But NRD is ON BY DEFAULT, and a default must
+    // never make another flag fatal (the fg_explicit precedent): only the
+    // EXPLICIT pair exits 2; a bare --nppd disarms the defaulted nrd loudly.
+    if opts.nrd && opts.nppd {
+        if opts.nrd_explicit {
+            eprintln!(
+                "--nrd cannot compose with --nppd: both claim the pre-upscale color slot. Drop one."
+            );
+            std::process::exit(2);
+        }
+        eprintln!("nrd: default disarmed — --nppd claims the pre-upscale color slot");
+        opts.nrd = false;
     }
     // A --quin-anchor with no fuse to anchor is a typo, not a preference.
     if opts.quin_anchor.is_some() && !opts.quin {
@@ -662,6 +682,7 @@ fn main() {
         || check_xess
         || check_fsr
         || check_nppd
+        || check_nrd
         || check_gpu
         || check_dxr;
     // FR_WORLD_CHECK=1 (opt-in, off by default) lets the headless suites run
@@ -816,6 +837,10 @@ fn main() {
             eprintln!("--check-dxr requires Windows (D3D12)");
             std::process::exit(2);
         }
+    }
+    if check_nrd {
+        let code = run_check_nrd(&opts);
+        std::process::exit(code);
     }
     if check_nppd {
         #[cfg(windows)]
@@ -1173,6 +1198,7 @@ fn run_check_dxr(
         gw as u32,
         gh as u32,
         false,
+        false,
         opts.gpu_debug,
     ) {
         Ok(d) => d,
@@ -1406,7 +1432,7 @@ fn run_check_dxr(
         gpu::trace::set_sky_lod(1);
         gpu::trace::set_cloud_shadow(0);
         let off_built = gpu::dxr::DxrGpu::new(
-            &dev, &dxc, scene, core.clone(), gw as u32, gh as u32, false, opts.gpu_debug,
+            &dev, &dxc, scene, core.clone(), gw as u32, gh as u32, false, false, opts.gpu_debug,
         );
         match (on_acc, off_built) {
             (Ok(on_acc), Ok(dg_off)) => {
@@ -1631,7 +1657,7 @@ fn run_check_dxr(
                     ),
                 };
                 let dg_x = gpu::dxr::DxrGpu::new(
-                    &dev, &dxc, scene, arm_core, gw as u32, gh as u32, false, opts.gpu_debug,
+                    &dev, &dxc, scene, arm_core, gw as u32, gh as u32, false, false, opts.gpu_debug,
                 )
                 .map_err(|e| format!("{label} DxrGpu: {e}"))?;
                 if dg_x.sbt_mode != mode {
@@ -2011,6 +2037,7 @@ fn run_check_dxr(
             pw as u32,
             ph as u32,
             true,
+            true, // + the NRD bridge kernels (the ptg symmetry)
             opts.gpu_debug,
         ) {
             Ok(d) => d,
@@ -2433,6 +2460,65 @@ fn run_check_dxr(
                         "check-dxr: FAIL FSR-sig on/off accum not bit-identical (the sig capture changed shading)"
                     );
                     ok = false;
+                }
+                // --- N5 (NRD): the sig.w capture lanes — the check-gpu twin.
+                // This suite runs the DEFAULT --dxr-inline 1, whose secondaries
+                // are rt.hlsli's bodies, so the capture is LIVE here; under
+                // --dxr-inline 0 the rt_dxr twin reports tmax and the
+                // must-fires would go vacuous (run this suite at the default).
+                {
+                    let (_, far) = dlss::near_far(scene.diag);
+                    let h16 = |bits: u16| half::f16::from_bits(bits).to_f32();
+                    let (mut sky_bad, mut range_bad) = (0usize, 0usize);
+                    let (mut ao_fired, mut ao_occluded, mut sh_fired) = (0usize, 0usize, 0usize);
+                    for i in 0..pw * ph {
+                        let core_z =
+                            f32::from_le_bytes(pack2[i * 16 + 8..i * 16 + 12].try_into().unwrap());
+                        let w = u32::from_le_bytes(
+                            pack2_ext[i * 72 + 60..i * 72 + 64].try_into().unwrap(),
+                        );
+                        if core_z == far {
+                            if w != 0 {
+                                sky_bad += 1;
+                            }
+                            continue;
+                        }
+                        let ao_t = h16(w as u16);
+                        let sh_t = h16((w >> 16) as u16);
+                        if !(0.0..=scene.ao_radius * 1.01).contains(&ao_t)
+                            || !(0.0..=far * 1.01).contains(&sh_t)
+                        {
+                            range_bad += 1;
+                        }
+                        if ao_t > 0.0 {
+                            ao_fired += 1;
+                            if ao_t < scene.ao_radius * 0.99 {
+                                ao_occluded += 1;
+                            }
+                        }
+                        if sh_t > 0.0 {
+                            sh_fired += 1;
+                        }
+                    }
+                    println!(
+                        "check-dxr: nrd sig.w — sky-bad {sky_bad} range-bad {range_bad} | \
+                         ao-fired {ao_fired} ao-occluded {ao_occluded} shadow-fired {sh_fired}"
+                    );
+                    if sky_bad > 0 || range_bad > 0 {
+                        eprintln!("check-dxr: FAIL N5 nrd sig.w lanes (see counters)");
+                        ok = false;
+                    }
+                    // Must-fire only where the capture is LIVE: rt_dxr's
+                    // --dxr-inline 0 twin reports tmax by design (the
+                    // documented no-capture arm), so demanding an occluder
+                    // there would fail a legal suite configuration.
+                    if must_fire
+                        && gpu::dxr::dxr_inline_mode() != 0
+                        && (ao_fired == 0 || ao_occluded == 0 || sh_fired == 0)
+                    {
+                        eprintln!("check-dxr: FAIL N5 nrd sig.w must-fire (capture never ran)");
+                        ok = false;
+                    }
                 }
                 let mut f_rec = Ok(());
                 if let Err(e) = hg.run(|l| f_rec = dg2.record_feed(l, 0)) {
@@ -2972,6 +3058,7 @@ fn run_check_dxr(
                                     gh as u32,
                                     false,
                                     false,
+                                    false,
                                     opts.gpu_debug,
                                     &mut h2,
                                 )?)
@@ -2984,6 +3071,7 @@ fn run_check_dxr(
                                     c2,
                                     gw as u32,
                                     gh as u32,
+                                    false,
                                     false,
                                     opts.gpu_debug,
                                 )?)
@@ -3245,7 +3333,11 @@ fn unpack_gbuf_bytes(
 }
 
 /// Row-packed feed-plane readback (footprint pitch is 256-aligned); the
-/// plane rests in NON_PIXEL_SHADER_RESOURCE around the copy.
+/// plane rests in NON_PIXEL_SHADER_RESOURCE around the copy — see
+/// `read_tex_at` for planes resting in another state (a transition whose
+/// StateBefore mismatches the resource's actual state is invalid API use,
+/// the --gpu-debug GBV class, and on some drivers skips the UAV flush the
+/// copy needed — a green gate reading stale bytes).
 #[cfg(windows)]
 fn read_feed_tex(
     hg: &mut gpu::trace::HeadlessGpu,
@@ -3255,15 +3347,35 @@ fn read_feed_tex(
     pw: usize,
     ph: usize,
 ) -> Result<Vec<u8>, String> {
+    read_tex_at(
+        hg,
+        tex,
+        fmt,
+        bpp,
+        pw,
+        ph,
+        windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+    )
+}
+
+/// `read_feed_tex` with the plane's REST state explicit — for gate-local
+/// planes resting in UNORDERED_ACCESS (the NRD bridge planes' contract).
+#[cfg(windows)]
+fn read_tex_at(
+    hg: &mut gpu::trace::HeadlessGpu,
+    tex: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    fmt: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+    bpp: usize,
+    pw: usize,
+    ph: usize,
+    rest: windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES,
+) -> Result<Vec<u8>, String> {
     use gpu::d3d12::{aligned_pitch, footprint, loc_footprint, loc_subresource, transition, ReadbackBuffer};
-    use windows::Win32::Graphics::Direct3D12::{
-        D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-    };
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_COPY_SOURCE;
     let pitch = aligned_pitch(pw * bpp);
     let rb = ReadbackBuffer::new(&hg.device, pitch * ph)?;
     hg.run(|l| unsafe {
-        let npsr = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-        l.ResourceBarrier(&[transition(tex, npsr, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+        l.ResourceBarrier(&[transition(tex, rest, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
         let fp = footprint(fmt, pw as u32, ph as u32, bpp, 0);
         l.CopyTextureRegion(
             &loc_footprint(&rb.resource, fp),
@@ -3273,7 +3385,7 @@ fn read_feed_tex(
             &loc_subresource(tex),
             None,
         );
-        l.ResourceBarrier(&[transition(tex, D3D12_RESOURCE_STATE_COPY_SOURCE, npsr)]);
+        l.ResourceBarrier(&[transition(tex, D3D12_RESOURCE_STATE_COPY_SOURCE, rest)]);
     })?;
     let mut ptr = std::ptr::null_mut();
     unsafe { rb.resource.Map(0, None, Some(&mut ptr)) }.map_err(|e| format!("Map: {e}"))?;
@@ -4095,6 +4207,7 @@ fn run_check_gpu(
         gw as u32,
         gh as u32,
         false, // no pack: the M7-M9 gbuf/feed gates build their own tracer
+        false,
         false,
         opts.gpu_debug,
         &mut hg,
@@ -5088,7 +5201,7 @@ fn run_check_gpu(
         gpu::trace::set_cloud_shadow(0);
         let dev = hg.device.clone();
         match gpu::trace::TraceGpu::new(
-            &dev, &dxc, scene, bvh, core.clone(), gw as u32, gh as u32, false, false,
+            &dev, &dxc, scene, bvh, core.clone(), gw as u32, gh as u32, false, false, false,
             opts.gpu_debug, &mut hg,
         ) {
             Ok(otg) => {
@@ -5752,6 +5865,7 @@ fn run_check_gpu(
                         core2,
                         gw as u32,
                         gh as u32,
+                        false,
                         false,
                         false,
                         opts.gpu_debug,
@@ -6493,6 +6607,7 @@ fn run_check_gpu(
             ph as u32,
             true,
             true, // + the NPPD staging buffers/kernels (M10 gates them)
+            true, // + the NRD bridge kernels (the N2/N3 gates)
             opts.gpu_debug,
             &mut hg,
         ) {
@@ -7022,6 +7137,67 @@ fn run_check_gpu(
                     );
                     ok = false;
                 }
+                // --- N5 (NRD): the sig.w hit-distance capture lanes,
+                // f16x2(ao_t, shadow_t). Sky stores exactly 0 (gbuf_write_sky
+                // zeroes the whole sig); hit lanes stay in [0, AO_RADIUS] /
+                // [0, CAM_FAR] (f16 slack); must-fires prove the capture ran
+                // (an AO occluder inside the radius, a fired shadow ray) —
+                // without them a dead `0u` lane passes every bound.
+                {
+                    let (_, far) = dlss::near_far(scene.diag);
+                    let h16 = |bits: u16| half::f16::from_bits(bits).to_f32();
+                    let (mut sky_bad, mut range_bad) = (0usize, 0usize);
+                    let (mut ao_fired, mut ao_occluded, mut sh_fired) = (0usize, 0usize, 0usize);
+                    for i in 0..pw * ph {
+                        let core_z =
+                            f32::from_le_bytes(pack2[i * 16 + 8..i * 16 + 12].try_into().unwrap());
+                        let w = u32::from_le_bytes(
+                            pack2_ext[i * 72 + 60..i * 72 + 64].try_into().unwrap(),
+                        );
+                        if core_z == far {
+                            if w != 0 {
+                                sky_bad += 1;
+                            }
+                            continue;
+                        }
+                        let ao_t = h16(w as u16);
+                        let sh_t = h16((w >> 16) as u16);
+                        if !(0.0..=scene.ao_radius * 1.01).contains(&ao_t)
+                            || !(0.0..=far * 1.01).contains(&sh_t)
+                        {
+                            range_bad += 1;
+                        }
+                        if ao_t > 0.0 {
+                            ao_fired += 1;
+                            if ao_t < scene.ao_radius * 0.99 {
+                                ao_occluded += 1;
+                            }
+                        }
+                        if sh_t > 0.0 {
+                            sh_fired += 1;
+                        }
+                    }
+                    println!(
+                        "check-gpu: nrd sig.w — sky-bad {sky_bad} range-bad {range_bad} | \
+                         ao-fired {ao_fired} ao-occluded {ao_occluded} shadow-fired {sh_fired}"
+                    );
+                    if sky_bad > 0 || range_bad > 0 {
+                        eprintln!("check-gpu: FAIL N5 nrd sig.w lanes (see counters)");
+                        ok = false;
+                    }
+                    // Must-fire only where the capture is LIVE: rt_sw.hlsli's
+                    // --sw-rays twins report tmax by design (the documented
+                    // no-capture arm — every AO lane reads exactly AO_RADIUS,
+                    // so ao_occluded stays 0), the check-dxr twin's
+                    // dxr_inline_mode() != 0 guard by another lever.
+                    if must_fire
+                        && !opts.sw_rays
+                        && (ao_fired == 0 || ao_occluded == 0 || sh_fired == 0)
+                    {
+                        eprintln!("check-gpu: FAIL N5 nrd sig.w must-fire (capture never ran)");
+                        ok = false;
+                    }
+                }
                 let mut f_rec = Ok(());
                 if let Err(e) = hg.run(|l| f_rec = ptg.record_feed(l, 0, false)) {
                     eprintln!("check-gpu: FAIL FSR4-RR feed dispatch submit: {e}");
@@ -7107,6 +7283,515 @@ fn run_check_gpu(
                     must_fire,
                 ) {
                     ok = false;
+                }
+                // --- N2/N3 (NRD bridge, DLL-free — nrd_bridge.hlsl). N2:
+                // cs_nrd_pack's five IN planes vs a CPU oracle computed FROM
+                // THE SAME pack readback (the M10 discipline — never a
+                // recompute of the frame). N3 (the quin control-arm shape):
+                // OUT planes byte-copied from IN (a passthrough denoiser) →
+                // cs_nrd_out's delta-form recompose must reproduce
+                // cs_feed_xess's color plane BYTE-IDENTICALLY — identical f32
+                // values through identical typed stores, so hardware store
+                // rounding cancels and the compare is exact.
+                {
+                    use windows::Win32::Graphics::Direct3D12::*;
+                    use windows::Win32::Graphics::Dxgi::Common::*;
+                    let uaf = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+                    let ust = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                    // Rest states must match the recorders' transitions: the
+                    // color planes (0 = cs_nrd_out's target with its own
+                    // NPSR↔UA bracket, 8..10 = the xess trio round-tripped by
+                    // record_feed_dispatch) rest NON_PIXEL_SHADER_RESOURCE —
+                    // the session planes' contract; the bridge's own IN/OUT
+                    // planes (1..7) rest UNORDERED_ACCESS (no transitions
+                    // anywhere — the NrdGpu pool doctrine).
+                    let npsr = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                    let fmts = [
+                        (DXGI_FORMAT_R16G16B16A16_FLOAT, npsr), // 0 color (cs_nrd_out)
+                        (DXGI_FORMAT_R10G10B10A2_UNORM, ust),   // 1 IN_NORMAL_ROUGHNESS
+                        (DXGI_FORMAT_R32_FLOAT, ust),           // 2 IN_VIEWZ
+                        (DXGI_FORMAT_R16G16B16A16_FLOAT, ust),  // 3 OUT_SPEC
+                        (DXGI_FORMAT_R16G16B16A16_FLOAT, ust),  // 4 IN_MV (2.5D)
+                        (DXGI_FORMAT_R16G16B16A16_FLOAT, ust),  // 5 IN_DIFF
+                        (DXGI_FORMAT_R16G16B16A16_FLOAT, ust),  // 6 IN_SPEC
+                        (DXGI_FORMAT_R16G16B16A16_FLOAT, ust),  // 7 OUT_DIFF
+                        (DXGI_FORMAT_R16G16B16A16_FLOAT, npsr), // 8 color ref (cs_feed_xess)
+                        (DXGI_FORMAT_R16G16_FLOAT, npsr),       // 9 mvec dummy (xess wire)
+                        (DXGI_FORMAT_R32_FLOAT, npsr),          // 10 depth dummy (xess wire)
+                    ];
+                    let pl: std::result::Result<Vec<_>, _> = fmts
+                        .iter()
+                        .map(|&(f, st)| {
+                            gpu::d3d12::committed_tex(&hg.device, pw as u32, ph as u32, f, uaf, st)
+                        })
+                        .collect();
+                    let pl = match pl {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("check-gpu: FAIL nrd bridge plane alloc: {e}");
+                            return 1;
+                        }
+                    };
+                    if let Err(e) = ptg.wire_nrd_feed(
+                        &hg.device,
+                        &[
+                            (16, &pl[0], fmts[0].0),
+                            (17, &pl[1], fmts[1].0),
+                            (18, &pl[2], fmts[2].0),
+                            (20, &pl[3], fmts[3].0),
+                            (23, &pl[4], fmts[4].0),
+                            (24, &pl[5], fmts[5].0),
+                            (25, &pl[6], fmts[6].0),
+                            (27, &pl[7], fmts[7].0),
+                        ],
+                    ) {
+                        eprintln!("check-gpu: FAIL nrd bridge wiring: {e}");
+                        return 1;
+                    }
+                    let mut rec = Ok(());
+                    if hg.run(|l| rec = ptg.record_nrd_pack(l, 0)).is_err() || rec.is_err() {
+                        eprintln!("check-gpu: FAIL nrd pack dispatch");
+                        return 1;
+                    }
+                    // N2 readbacks + oracle from pack2/pack2_ext (frame B's).
+                    // A macro, not a closure — a closure would pin &mut hg
+                    // for the whole block. read_tex_at with each plane's OWN
+                    // rest state (fmts[i].1) — a hard-coded NPSR StateBefore
+                    // on the UA-resting bridge planes was the invalid-
+                    // transition class this table exists to prevent.
+                    macro_rules! rb {
+                        ($i:expr, $bpp:expr) => {
+                            read_tex_at(&mut hg, &pl[$i], fmts[$i].0, $bpp, pw, ph, fmts[$i].1)
+                        };
+                    }
+                    let (b_nr, b_vz, b_mv, b_di, b_sp) =
+                        match (rb!(1, 4), rb!(2, 4), rb!(4, 8), rb!(5, 8), rb!(6, 8)) {
+                            (Ok(a), Ok(b), Ok(c), Ok(d), Ok(e)) => (a, b, c, d, e),
+                            _ => {
+                                eprintln!("check-gpu: FAIL nrd pack plane readback");
+                                return 1;
+                            }
+                        };
+                    let elanes = gpu::trace::GBUF_EXT_STRIDE as usize / 4;
+                    let clanes = gpu::trace::GBUF_STRIDE as usize / 4;
+                    let ext_u = |i: usize, l: usize| {
+                        u32::from_le_bytes(pack2_ext[(i * elanes + l) * 4..][..4].try_into().unwrap())
+                    };
+                    let ext_f = |i: usize, l: usize| f32::from_bits(ext_u(i, l));
+                    let core_f = |i: usize, l: usize| {
+                        f32::from_le_bytes(pack2[(i * clanes + l) * 4..][..4].try_into().unwrap())
+                    };
+                    let hf = |w: u32, hi: bool| {
+                        half::f16::from_bits(if hi { (w >> 16) as u16 } else { w as u16 }).to_f32()
+                    };
+                    let tex_h = |b: &[u8], i: usize, l: usize| {
+                        half::f16::from_bits(u16::from_le_bytes(
+                            b[i * 8 + l * 2..][..2].try_into().unwrap(),
+                        ))
+                        .to_f32()
+                    };
+                    // 2 f16 ulp at the value's own magnitude + a small floor —
+                    // the fold/YCoCg run f32 on both sides; only fp order and
+                    // the store rounding differ.
+                    let tol = |c: f32| (c.abs() / 512.0).max(2e-5);
+                    let hd_params = [3.0f32, 0.1, 20.0];
+                    let (mut n2_bad, mut nh_live_d, mut nh_live_s) = (0usize, 0usize, 0usize);
+                    for i in 0..pw * ph {
+                        let vz = core_f(i, 2);
+                        // IN_VIEWZ: R32F passthrough — bit-equal.
+                        let gvz =
+                            f32::from_le_bytes(b_vz[i * 4..][..4].try_into().unwrap());
+                        if gvz.to_bits() != vz.to_bits() {
+                            n2_bad += 1;
+                            continue;
+                        }
+                        // IN_MV: (mv.xy, prev_z − view_z) through f16 stores.
+                        let mve = [core_f(i, 0), core_f(i, 1), core_f(i, 3) - vz];
+                        for l in 0..3 {
+                            if (tex_h(&b_mv, i, l) - mve[l]).abs() > tol(mve[l]) {
+                                n2_bad += 1;
+                            }
+                        }
+                        // IN_NORMAL_ROUGHNESS: encoding-2 through the 10-bit
+                        // UNORM store, ≤1 LSB per channel.
+                        let n = [ext_f(i, 0), ext_f(i, 1), ext_f(i, 2)];
+                        let enc = nrd::oracle::encode_normal_roughness_101010(n, ext_f(i, 3));
+                        let gnr = u32::from_le_bytes(b_nr[i * 4..][..4].try_into().unwrap());
+                        for (l, e) in enc.iter().enumerate() {
+                            let g = ((gnr >> (10 * l)) & 0x3ff) as i64;
+                            let c = (e.clamp(0.0, 1.0) * 1023.0).round() as i64;
+                            if (g - c).abs() > 1 {
+                                n2_bad += 1;
+                            }
+                        }
+                        // IN_DIFF / IN_SPEC: the folds + YCoCg + normHitDist.
+                        let dd = [hf(ext_u(i, 12), false), hf(ext_u(i, 12), true), hf(ext_u(i, 13), false)];
+                        let ds = [hf(ext_u(i, 13), true), hf(ext_u(i, 14), false), hf(ext_u(i, 14), true)];
+                        let ao = hf(ext_u(i, 16), false);
+                        let is = [hf(ext_u(i, 16), true), hf(ext_u(i, 17), false), hf(ext_u(i, 17), true)];
+                        let ao_t = hf(ext_u(i, 15), false);
+                        let amb = scene.sky_sh.irradiance(Vec3A::new(n[0], n[1], n[2]));
+                        let diff = nrd::oracle::sanitize_radiance([
+                            dd[0] + ao * amb.x,
+                            dd[1] + ao * amb.y,
+                            dd[2] + ao * amb.z,
+                        ]);
+                        let spec = nrd::oracle::sanitize_radiance([
+                            ds[0] + is[0],
+                            ds[1] + is[1],
+                            ds[2] + is[2],
+                        ]);
+                        let dy = nrd::oracle::linear_to_ycocg(diff);
+                        let sy = nrd::oracle::linear_to_ycocg(spec);
+                        let nh_d = if ao_t > 0.0 {
+                            nrd::oracle::norm_hit_dist(ao_t, vz, hd_params, 1.0)
+                        } else {
+                            0.0
+                        };
+                        let spec_w = ext_f(i, 11);
+                        let nh_s = if spec_w > 0.0 {
+                            nrd::oracle::norm_hit_dist(spec_w, vz, hd_params, ext_f(i, 3))
+                        } else {
+                            0.0
+                        };
+                        for l in 0..3 {
+                            if (tex_h(&b_di, i, l) - dy[l]).abs() > tol(dy[l]) {
+                                n2_bad += 1;
+                            }
+                            if (tex_h(&b_sp, i, l) - sy[l]).abs() > tol(sy[l]) {
+                                n2_bad += 1;
+                            }
+                        }
+                        if (tex_h(&b_di, i, 3) - nh_d).abs() > tol(nh_d) {
+                            n2_bad += 1;
+                        }
+                        if (tex_h(&b_sp, i, 3) - nh_s).abs() > tol(nh_s) {
+                            n2_bad += 1;
+                        }
+                        if tex_h(&b_di, i, 3) > 0.0 {
+                            nh_live_d += 1;
+                        }
+                        if tex_h(&b_sp, i, 3) > 0.0 {
+                            nh_live_s += 1;
+                        }
+                    }
+                    // N3: byte-copy IN → OUT (the passthrough denoiser), run
+                    // the recompose, and diff against cs_feed_xess's color.
+                    let copy = |l: &ID3D12GraphicsCommandList, src: &ID3D12Resource, dst: &ID3D12Resource| unsafe {
+                        let t = |r, f, to| gpu::d3d12::transition(r, f, to);
+                        l.ResourceBarrier(&[
+                            t(src, ust, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                            t(dst, ust, D3D12_RESOURCE_STATE_COPY_DEST),
+                        ]);
+                        l.CopyResource(dst, src);
+                        l.ResourceBarrier(&[
+                            t(src, D3D12_RESOURCE_STATE_COPY_SOURCE, ust),
+                            t(dst, D3D12_RESOURCE_STATE_COPY_DEST, ust),
+                        ]);
+                    };
+                    let mut rec = Ok(());
+                    let sub = hg.run(|l| {
+                        copy(l, &pl[5], &pl[7]);
+                        copy(l, &pl[6], &pl[3]);
+                        rec = ptg.record_nrd_out(l, 0);
+                    });
+                    if sub.is_err() || rec.is_err() {
+                        eprintln!("check-gpu: FAIL nrd out dispatch");
+                        return 1;
+                    }
+                    if let Err(e) = ptg.wire_feed(
+                        &hg.device,
+                        gpu::trace::FeedKind::Xess,
+                        &[
+                            (gpu::trace::FEED_COLOR, &pl[8], fmts[8].0),
+                            (gpu::trace::FEED_MVEC, &pl[9], fmts[9].0),
+                            (gpu::trace::FEED_DEPTH, &pl[10], fmts[10].0),
+                        ],
+                    ) {
+                        eprintln!("check-gpu: FAIL nrd xess-ref wiring: {e}");
+                        return 1;
+                    }
+                    let mut f_rec = Ok(());
+                    if hg.run(|l| f_rec = ptg.record_feed(l, 0, false)).is_err() || f_rec.is_err() {
+                        eprintln!("check-gpu: FAIL nrd xess-ref feed dispatch");
+                        return 1;
+                    }
+                    let (b_nrd, b_ref) = match (rb!(0, 8), rb!(8, 8)) {
+                        (Ok(a), Ok(b)) => (a, b),
+                        _ => {
+                            eprintln!("check-gpu: FAIL nrd color readback");
+                            return 1;
+                        }
+                    };
+                    // Alpha differs by design (cs_feed_xess may carry its own
+                    // A semantics) — compare the RGB f16 lanes.
+                    let mut n3_bad = 0usize;
+                    for i in 0..pw * ph {
+                        for l in 0..3 {
+                            if b_nrd[i * 8 + l * 2..][..2] != b_ref[i * 8 + l * 2..][..2] {
+                                n3_bad += 1;
+                            }
+                        }
+                    }
+                    println!(
+                        "check-gpu: nrd bridge — n2-bad {n2_bad} | n3 passthrough color \
+                         byte-diff {n3_bad} | nh-live d {nh_live_d} s {nh_live_s}"
+                    );
+                    if n2_bad > 0 || n3_bad > 0 {
+                        eprintln!("check-gpu: FAIL nrd bridge gates (see counters)");
+                        ok = false;
+                    }
+                    if must_fire && (nh_live_d == 0 || nh_live_s == 0) {
+                        eprintln!("check-gpu: FAIL nrd bridge must-fire (dead hit-dist lanes)");
+                        ok = false;
+                    }
+                    // Restore the FSR-RR wiring (wire_feed REPLACES set 0) —
+                    // ALSO load-bearing for N4 below: its re-traces must run
+                    // with FLAG_FSR_SIG armed or NRD would see zero signals.
+                    if let Err(e) = ptg.wire_feed(
+                        &hg.device,
+                        gpu::trace::FeedKind::FsrRr,
+                        &[
+                            (gpu::trace::FEED_SPECHIT, fpl[0].0, fpl[0].1),
+                            (gpu::trace::FEED_DEPTH, fpl[1].0, fpl[1].1),
+                            (gpu::trace::FEED_FSR_MVEC, fpl[2].0, fpl[2].1),
+                            (gpu::trace::FEED_NR, fpl[3].0, fpl[3].1),
+                            (gpu::trace::FEED_ALB, fpl[4].0, fpl[4].1),
+                            (gpu::trace::FEED_SPEC, fpl[5].0, fpl[5].1),
+                            (gpu::trace::FEED_FSR_DD, fpl[6].0, fpl[6].1),
+                            (gpu::trace::FEED_FSR_DS, fpl[7].0, fpl[7].1),
+                            (gpu::trace::FEED_COLOR, fpl[8].0, fpl[8].1),
+                            (gpu::trace::FEED_FSR_AO, fpl[9].0, fpl[9].1),
+                            (gpu::trace::FEED_FSR_IS, fpl[10].0, fpl[10].1),
+                        ],
+                    ) {
+                        eprintln!("check-gpu: FAIL nrd fsr-rr rewire: {e}");
+                        return 1;
+                    }
+                    // --- N4 (NRD, needs NRD.dll — LOUD SKIP otherwise, the
+                    // --check-oidn absent-SDK shape): 8 same-view fresh-noise
+                    // frames through the REAL ReBLUR instance (+ a 9th with
+                    // RESTART). A foreign denoiser gets the OIDN statistical
+                    // gate shape: finite, ≠input, spatial Laplacian strictly
+                    // drops, energy preserved, temporal deltas SHRINK under
+                    // CONTINUE (accumulation works), and a RESTART frame
+                    // departs from the trajectory (the reset latch reaches
+                    // NRD — the gate that catches a dead-history matrix or
+                    // jitter mistake).
+                    match gpu::nrd_gpu::NrdGpu::new(
+                        &hg.device,
+                        &opts.nrd_path,
+                        pw as u32,
+                        ph as u32,
+                    ) {
+                        Err(e) => println!(
+                            "check-gpu: SKIP N4 (NRD unavailable: {e}); run \
+                             install-prerequisites.bat nrd"
+                        ),
+                        Ok(mut ng) => {
+                            let wired = ptg.wire_nrd_feed(
+                                &hg.device,
+                                &[
+                                    (16, &pl[0], fmts[0].0),
+                                    (17, ng.plane_in_nr(), DXGI_FORMAT_R10G10B10A2_UNORM),
+                                    (18, ng.plane_in_viewz(), DXGI_FORMAT_R32_FLOAT),
+                                    (20, ng.plane_out_spec(), DXGI_FORMAT_R16G16B16A16_FLOAT),
+                                    (23, ng.plane_in_mv(), DXGI_FORMAT_R16G16B16A16_FLOAT),
+                                    (24, ng.plane_in_diff(), DXGI_FORMAT_R16G16B16A16_FLOAT),
+                                    (25, ng.plane_in_spec(), DXGI_FORMAT_R16G16B16A16_FLOAT),
+                                    (27, ng.plane_out_diff(), DXGI_FORMAT_R16G16B16A16_FLOAT),
+                                ],
+                            );
+                            if let Err(e) = wired {
+                                eprintln!("check-gpu: FAIL N4 nrd wiring: {e}");
+                                return 1;
+                            }
+                            let (near, far) = dlss::near_far(scene.diag);
+                            let mats = dlss::cam_matrices(&cam_b, pw, ph, near, far);
+                            let rs = gpu::nrd_gpu::reblur_settings();
+                            let dev2 = hg.device.clone();
+                            let mut frames: Vec<Vec<u8>> = Vec::new();
+                            let mut input0: Vec<u8> = Vec::new();
+                            let mut n4_fail = false;
+                            for k in 0..9u32 {
+                                let reset = k == 0 || k == 8;
+                                let p = gpu::trace::FrameParams {
+                                    sway_prev_time: None,
+                                    cam: basis_b,
+                                    frame: 100 + k,
+                                    accumulate: false,
+                                    jitter: false,
+                                    frame_jitter: Some((0.0, 0.0)),
+                                    prev_cam: Some(basis_b),
+                                    q: uq,
+                                    verify: false,
+                                    spp: 1,
+                                    probe_sample: 0,
+                                    clouds: crate::clouds::Clouds::check(scene.diag),
+                                    fireflies: crate::fireflies::Fireflies::check(scene),
+                                    sway_time: check_sway,
+                                    replay: false,
+                                };
+                                ptg.write_cb(0, &p);
+                                let mut r1 = Ok(());
+                                let mut r2 = Ok(());
+                                let sub = hg.run(|l| {
+                                    ptg.record_wavefront(l, 0, &p, false);
+                                    r1 = ptg.record_nrd_pack(l, 0);
+                                });
+                                if sub.is_err() || r1.is_err() {
+                                    eprintln!("check-gpu: FAIL N4 trace/pack (frame {k})");
+                                    n4_fail = true;
+                                    break;
+                                }
+                                let cs = gpu::nrd_gpu::common_settings(
+                                    &mats,
+                                    &mats,
+                                    (0.0, 0.0),
+                                    (0.0, 0.0),
+                                    pw as u32,
+                                    ph as u32,
+                                    far,
+                                    100 + k,
+                                    reset,
+                                );
+                                let mut rn = Ok(());
+                                let sub = hg.run(|l| {
+                                    rn = ng.record(&dev2, l, 0, &cs, &rs);
+                                    if rn.is_ok() {
+                                        r2 = ptg.record_nrd_out(l, 0);
+                                    }
+                                });
+                                if sub.is_err() || rn.is_err() || r2.is_err() {
+                                    eprintln!(
+                                        "check-gpu: FAIL N4 nrd record (frame {k}): {:?} {:?}",
+                                        rn.err(),
+                                        r2.err()
+                                    );
+                                    n4_fail = true;
+                                    break;
+                                }
+                                if k == 0 {
+                                    input0 = match hg.read_buffer(&ptg.accum, ua, pw * ph * 12) {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            eprintln!("check-gpu: FAIL N4 accum readback: {e}");
+                                            return 1;
+                                        }
+                                    };
+                                }
+                                match rb!(0, 8) {
+                                    Ok(v) => frames.push(v),
+                                    Err(e) => {
+                                        eprintln!("check-gpu: FAIL N4 color readback: {e}");
+                                        return 1;
+                                    }
+                                }
+                            }
+                            if !n4_fail {
+                                let lum = |b: &[u8], i: usize| -> f32 {
+                                    let h = |l: usize| {
+                                        half::f16::from_bits(u16::from_le_bytes(
+                                            b[i * 8 + l * 2..][..2].try_into().unwrap(),
+                                        ))
+                                        .to_f32()
+                                    };
+                                    (h(0) + h(1) + h(2)) / 3.0
+                                };
+                                let lum_in = |i: usize| -> f32 {
+                                    let f = |c: usize| {
+                                        f32::from_le_bytes(
+                                            input0[(i * 3 + c) * 4..][..4].try_into().unwrap(),
+                                        )
+                                    };
+                                    (f(0) + f(1) + f(2)) / 3.0
+                                };
+                                let npx = pw * ph;
+                                let mut finite = true;
+                                let mut differs = 0usize;
+                                let (mut mean_out, mut mean_in) = (0f64, 0f64);
+                                let (mut lap_out, mut lap_in) = (0f64, 0f64);
+                                for i in 0..npx {
+                                    let lo = lum(&frames[0], i);
+                                    let li = lum_in(i);
+                                    if !lo.is_finite() {
+                                        finite = false;
+                                    }
+                                    if (lo - li).abs() > 1e-4 {
+                                        differs += 1;
+                                    }
+                                    mean_out += lo as f64;
+                                    mean_in += li as f64;
+                                    let (x, y) = (i % pw, i / pw);
+                                    if x > 0 && x + 1 < pw && y > 0 && y + 1 < ph {
+                                        let l4 = |f: &dyn Fn(usize) -> f32| {
+                                            (4.0 * f(i) - f(i - 1) - f(i + 1) - f(i - pw) - f(i + pw))
+                                                .abs() as f64
+                                        };
+                                        let fo = |j: usize| lum(&frames[0], j);
+                                        let fi = |j: usize| lum_in(j);
+                                        lap_out += l4(&fo);
+                                        lap_in += l4(&fi);
+                                    }
+                                }
+                                let delta = |a: &[u8], b: &[u8]| -> f64 {
+                                    let mut d = 0f64;
+                                    for i in 0..npx {
+                                        d += (lum(a, i) - lum(b, i)).abs() as f64;
+                                    }
+                                    d / npx as f64
+                                };
+                                let d_early = delta(&frames[1], &frames[0]);
+                                let d_late = delta(&frames[7], &frames[6]);
+                                let d_restart = delta(&frames[8], &frames[7]);
+                                println!(
+                                    "check-gpu: nrd N4 — differs {differs}/{npx} | lap {:.4} -> {:.4} | \
+                                     mean {:.4} -> {:.4} | temporal {:.5} -> {:.5} | restart {:.5}",
+                                    lap_in / npx as f64,
+                                    lap_out / npx as f64,
+                                    mean_in / npx as f64,
+                                    mean_out / npx as f64,
+                                    d_early,
+                                    d_late,
+                                    d_restart
+                                );
+                                let mut bad = Vec::new();
+                                if !finite {
+                                    bad.push("non-finite");
+                                }
+                                if differs == 0 {
+                                    bad.push("output == input (vacuous)");
+                                }
+                                if lap_out >= lap_in {
+                                    bad.push("Laplacian did not drop");
+                                }
+                                if (mean_out - mean_in).abs() > 0.25 * mean_in.max(1e-6) {
+                                    bad.push("mean drifted > 25%");
+                                }
+                                if d_late >= d_early {
+                                    bad.push("temporal deltas not shrinking");
+                                }
+                                if d_restart <= d_late {
+                                    bad.push("RESTART did not depart (reset latch dead?)");
+                                }
+                                if !bad.is_empty() {
+                                    eprintln!("check-gpu: FAIL N4 nrd: {}", bad.join(", "));
+                                    ok = false;
+                                }
+                            } else {
+                                ok = false;
+                            }
+                            // Restore frame B's buffers: N4's probe traces
+                            // left accum/gbuf holding frame 108, and the M10
+                            // NPPD gates below compare against the frame-B
+                            // readbacks taken above (gate independence).
+                            ptg.write_cb(0, &p);
+                            if hg.run(|l| ptg.record_wavefront(l, 0, &p, false)).is_err() {
+                                eprintln!("check-gpu: FAIL N4 frame-B restore");
+                                return 1;
+                            }
+                        }
+                    }
                 }
                 // FR_CHECK_AB_DUMP — read-only diagnostic (the radiance-dump
                 // family): render the SAME frame on the CPU with the FSR
@@ -7922,6 +8607,7 @@ fn run_check_gpu(
         bh as u32,
         false, // bench frames don't consume the pack
         false,
+        false,
         opts.gpu_debug,
         &mut hg,
     ) {
@@ -8213,6 +8899,138 @@ fn run_check_gpu(
 /// dynamic-range fallbacks match the documented FSR ratios, FsrBufs
 /// reinterprets in place under set_res, and turning the capture on leaves the
 /// rendered image bit-identical.
+/// `--check-nrd`: the NRD gate suite. N0 (always, DLL-free) pins the oracle
+/// math the bridge kernels reimplement — YCoCg round trips, the encoding-2
+/// normal pack through its 10-bit wire quantization, ReBLUR's hit-distance
+/// normalization anchors. N1 (needs NRD.dll — absent is a LOUD SKIP + exit 0,
+/// the --check-oidn absent-SDK shape, so CI without the locally-built SDK
+/// stays green) loads the DLL through the pinned version/encoding gate,
+/// creates a REBLUR_DIFFUSE_SPECULAR instance, and must-fires the
+/// InstanceDesc contract our GPU host will consume: pipelines with DXIL
+/// blobs, non-empty texture pools, a constant buffer, exactly the 2 static
+/// samplers — then pulls one dispatch list through SetCommonSettings at a
+/// synthetic 320x180 and bounds-checks every DispatchDesc.
+fn run_check_nrd(opts: &Opts) -> i32 {
+    let mut ok = true;
+
+    // N0 — DLL-free math twins.
+    if let Err(e) = nrd::oracle::self_test() {
+        eprintln!("check-nrd: FAIL N0 {e}");
+        ok = false;
+    } else {
+        println!("check-nrd: N0 oracle math OK");
+    }
+
+    // N1 — the DLL contract.
+    let denoisers = [nrd::DenoiserDesc {
+        identifier: 0,
+        denoiser: nrd::DENOISER_REBLUR_DIFFUSE_SPECULAR,
+    }];
+    let mut inst = match nrd::Nrd::new(&opts.nrd_path, &denoisers) {
+        Ok(i) => i,
+        Err(e) => {
+            // A missing/drifted DLL must not fail a bare-checkout gate run —
+            // but say exactly how to get one.
+            println!(
+                "check-nrd: SKIP N1 (NRD.dll unavailable: {e}); run install-prerequisites.bat nrd"
+            );
+            return if ok { 0 } else { 1 };
+        }
+    };
+    println!(
+        "check-nrd: N1 NRD v{}.{}.{} loaded (encodings pinned 2/1)",
+        inst.version.0, inst.version.1, inst.version.2
+    );
+    {
+        let d = inst.instance_desc();
+        let mut n1_ok = d.pipelines_num > 0
+            && d.permanent_pool_size > 0
+            && d.transient_pool_size > 0
+            && d.constant_buffer_max_data_size > 0
+            && d.samplers_num == 2;
+        // The install script builds DXIL-only — every pipeline must carry a
+        // DXIL blob or the GPU host has nothing to create PSOs from.
+        let pipes = unsafe { std::slice::from_raw_parts(d.pipelines, d.pipelines_num as usize) };
+        let dxil_missing = pipes
+            .iter()
+            .filter(|p| p.compute_shader_dxil.bytecode.is_null() || p.compute_shader_dxil.size == 0)
+            .count();
+        if dxil_missing > 0 {
+            n1_ok = false;
+        }
+        println!(
+            "check-nrd: N1 pipelines {} (dxil-missing {dxil_missing}) | pool perm {} trans {} | \
+             cb-max {} B | samplers {}",
+            d.pipelines_num,
+            d.permanent_pool_size,
+            d.transient_pool_size,
+            d.constant_buffer_max_data_size,
+            d.samplers_num
+        );
+        if !n1_ok {
+            eprintln!("check-nrd: FAIL N1 instance contract (see the counter line)");
+            ok = false;
+        }
+    }
+
+    // One dispatch list at a synthetic res: grids and indices must be sane.
+    let mut cs = nrd::CommonSettings::default();
+    let ident = [
+        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+    ];
+    cs.view_to_clip_matrix = ident;
+    cs.view_to_clip_matrix_prev = ident;
+    cs.world_to_view_matrix = ident;
+    cs.world_to_view_matrix_prev = ident;
+    cs.resource_size = [320, 180];
+    cs.resource_size_prev = [320, 180];
+    cs.rect_size = [320, 180];
+    cs.rect_size_prev = [320, 180];
+    cs.accumulation_mode = nrd::ACCUM_RESTART;
+    if let Err(e) = inst.set_common_settings(&cs) {
+        eprintln!("check-nrd: FAIL N1 {e}");
+        ok = false;
+    }
+    if let Err(e) = inst.set_reblur_settings(0, &nrd::ReblurSettings::default()) {
+        eprintln!("check-nrd: FAIL N1 {e}");
+        ok = false;
+    }
+    let pipelines_num = inst.instance_desc().pipelines_num;
+    match inst.compute_dispatches(&[0]) {
+        Ok(ds) if !ds.is_empty() => {
+            let bad = ds
+                .iter()
+                .filter(|d| {
+                    d.pipeline_index as u32 >= pipelines_num
+                        || d.grid_width == 0
+                        || d.grid_height == 0
+                        || d.resources_num == 0
+                })
+                .count();
+            println!("check-nrd: N1 dispatches {} (bad {bad})", ds.len());
+            if bad > 0 {
+                eprintln!("check-nrd: FAIL N1 dispatch bounds");
+                ok = false;
+            }
+        }
+        Ok(_) => {
+            eprintln!("check-nrd: FAIL N1 zero dispatches for a live denoiser");
+            ok = false;
+        }
+        Err(e) => {
+            eprintln!("check-nrd: FAIL N1 {e}");
+            ok = false;
+        }
+    }
+
+    if ok {
+        println!("check-nrd: PASS");
+        0
+    } else {
+        1
+    }
+}
+
 fn run_check_fsr(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: bool) -> i32 {
     let (_, far) = dlss::near_far(scene.diag);
     let mut all_ok = true;
@@ -11908,6 +12726,7 @@ fn cine_dual_res(
             rh,
             gbuf,
             false,
+            false,
             debug,
             &mut d.hg,
         )?),
@@ -11919,6 +12738,7 @@ fn cine_dual_res(
             rw,
             rh,
             gbuf,
+            false,
             debug,
         )?),
     };
@@ -12199,6 +13019,7 @@ fn run_cinematic_gpu(
                         rh as u32,
                         gbuf,
                         false, // no NPPD stage
+                        false, // no NRD bridge
                         opts.gpu_debug,
                         hg,
                     )?)
@@ -12211,6 +13032,7 @@ fn run_cinematic_gpu(
                         rw as u32,
                         rh as u32,
                         gbuf,
+                        false, // no NRD bridge (cinematic captures via its own arms)
                         opts.gpu_debug,
                     )?)
                 })
@@ -13203,6 +14025,7 @@ fn run_spin_gpu(
             rh as u32,
             false, // no G-buffer pack: this measures the tracer
             false, // no NPPD stage
+            false, // no NRD bridge
             opts.gpu_debug,
             &mut hg,
         ) {
@@ -13220,6 +14043,7 @@ fn run_spin_gpu(
             core,
             rw as u32,
             rh as u32,
+            false,
             false,
             opts.gpu_debug,
         ) {
@@ -13312,6 +14136,7 @@ fn run_spin_gpu(
                             rh as u32,
                             false,
                             false,
+                            false,
                             opts.gpu_debug,
                             &mut h2,
                         )?)
@@ -13323,6 +14148,7 @@ fn run_spin_gpu(
                         c2,
                         rw as u32,
                         rh as u32,
+                        false,
                         false,
                         opts.gpu_debug,
                     )?),
@@ -17967,6 +18793,16 @@ fn session(
         if gpu_lock_note {
             lock_dynamic_note("gpu", (grw, grh));
         }
+        if opts.nrd_explicit && !matches!(gpu_wired_up, GpuUp::Xess | GpuUp::Fsr3) {
+            // Loud, never fatal — and only for the EXPLICIT flag: nrd is on
+            // by default, and the default must not nag every DLSS session.
+            // RR/FSR4-RR already denoise, quinlight owns its present, plain
+            // has no upscaler to feed.
+            eprintln!(
+                "nrd: not armed — --nrd composes with XeSS/FSR3 sessions (this session's \
+                 upscaler already denoises, or there is none)"
+            );
+        }
         gpu_trace = match gpu::dxc::Dxc::load(&opts.dxc_path).and_then(|dxc| {
             gpu.init_trace(
                 &dxc,
@@ -17977,6 +18813,8 @@ fn session(
                 gpu_wired_up != GpuUp::Plain,
                 (gpu_wired_up == GpuUp::Xess && opts.nppd)
                     .then_some((opts.nppd_path.as_str(), opts.nppd_model.as_str())),
+                (matches!(gpu_wired_up, GpuUp::Xess | GpuUp::Fsr3) && opts.nrd)
+                    .then_some(opts.nrd_path.as_str()),
                 opts.gpu_debug,
                 opts.bc7,
             )
@@ -18333,7 +19171,20 @@ fn session(
             lock_dynamic_note("dxr", (dxw, dxh));
         }
         match gpu::dxc::Dxc::load(&opts.dxc_path).and_then(|dxc| {
-            gpu.init_dxr(&dxc, scene, bvh, dxw as u32, dxh as u32, compose, opts.gpu_debug, opts.bc7)
+            gpu.init_dxr(
+                &dxc,
+                scene,
+                bvh,
+                dxw as u32,
+                dxh as u32,
+                compose,
+                // NRD composes with the XeSS/FSR3 levels only (RR/FSR4-RR
+                // already denoise; quinlight owns its own present).
+                ((dxr_xess_avail || dxr_fsr3_avail) && !dxr_quin_avail && opts.nrd)
+                    .then_some(opts.nrd_path.as_str()),
+                opts.gpu_debug,
+                opts.bc7,
+            )
         }) {
             Ok(()) => {
                 dxr_on = true;
@@ -19077,6 +19928,9 @@ fn session(
                                     // session init only; gpu_nppd_avail is
                                     // structurally false on this path.
                                     None,
+                                    // NRD likewise wires at session init only.
+                                    (matches!(gpu_wired_up, GpuUp::Xess | GpuUp::Fsr3) && opts.nrd)
+                                        .then_some(opts.nrd_path.as_str()),
                                     opts.gpu_debug,
                                     opts.bc7,
                                 )
@@ -19142,8 +19996,29 @@ fn session(
                             if compose && opts.lock_scale.is_none() {
                                 lock_dynamic_note("dxr", (dxw, dxh));
                             }
+                            if opts.nrd_explicit
+                                && !((dxr_xess_avail || dxr_fsr3_avail) && !dxr_quin_avail)
+                            {
+                                eprintln!(
+                                    "nrd: not armed — --nrd composes with XeSS/FSR3 sessions \
+                                     (this session's upscaler already denoises, or there is none)"
+                                );
+                            }
                             let built = gpu::dxc::Dxc::load(&opts.dxc_path).and_then(|dxc| {
-                                gpu.init_dxr(&dxc, scene, bvh, dxw as u32, dxh as u32, compose, opts.gpu_debug, opts.bc7)
+                                gpu.init_dxr(
+                                    &dxc,
+                                    scene,
+                                    bvh,
+                                    dxw as u32,
+                                    dxh as u32,
+                                    compose,
+                                    ((dxr_xess_avail || dxr_fsr3_avail)
+                                        && !dxr_quin_avail
+                                        && opts.nrd)
+                                        .then_some(opts.nrd_path.as_str()),
+                                    opts.gpu_debug,
+                                    opts.bc7,
+                                )
                             });
                             if let Err(e) = built {
                                 eprintln!("dxr: unavailable — {e}");

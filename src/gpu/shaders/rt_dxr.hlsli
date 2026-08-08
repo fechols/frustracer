@@ -250,4 +250,15 @@ float3 transmit_q(float3 o, float3 d, float tmin, float tmax) {
     return p.tint;
 }
 
+// _t twin (NRD's sig.w hit-distance guide): the all-TraceRay arm does NOT
+// capture — carrying the occluder t out would grow ShadowPayload (an ABI
+// every ah_shadow/miss_shadow site shares), for the --dxr-inline 0
+// measurement escape only; the DEFAULT inline-1 pipeline captures via
+// rt.hlsli's bodies. first_t = tmax (= "miss"/no data); ReBLUR's
+// hit-distance-reconstruction mode covers it. Documented known-accept.
+float3 transmit_q_t(float3 o, float3 d, float tmin, float tmax, out float first_t) {
+    first_t = tmax;
+    return transmit_q(o, d, tmin, tmax);
+}
+
 #endif // !DXR_INLINE_SEC && !DXR_SBT_RECURSE

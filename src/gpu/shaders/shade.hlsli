@@ -39,6 +39,24 @@
 #else
 #define ABL_TQ_AO(o, d, t0, t1) transmit_q(o, d, t0, t1)
 #endif
+// _T flavors of the two occlusion wrappers: the same queries, additionally
+// reporting the occluder t (the NRD hit-distance capture — sig.w; sample 0
+// only, the side-channel rule). The ablation arms report t1 (= miss), so a
+// neutralized traversal cannot resurface as a live-looking guide.
+float3 abl_tq_pass_t(float t1, out float first_t) {
+    first_t = t1;
+    return float3(1.0, 1.0, 1.0);
+}
+#if defined(ABL_NOSEC) || defined(ABL_NOSHADOW)
+#define ABL_TQ_SHADOW_T(o, d, t0, t1, ot) abl_tq_pass_t(t1, ot)
+#else
+#define ABL_TQ_SHADOW_T(o, d, t0, t1, ot) transmit_q_t(o, d, t0, t1, ot)
+#endif
+#if defined(ABL_NOSEC) || defined(ABL_NOAO)
+#define ABL_TQ_AO_T(o, d, t0, t1, ot) abl_tq_pass_t(t1, ot)
+#else
+#define ABL_TQ_AO_T(o, d, t0, t1, ot) transmit_q_t(o, d, t0, t1, ot)
+#endif
 #if defined(ABL_NOSEC) || defined(ABL_NOREFL)
 #define ABL_TRACE_REFL(o, d, t0, t1, h) false
 #else
@@ -1065,6 +1083,10 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
         float3 direct_d = 0.0;
         float3 direct_s = 0.0;
         float3 direct_t = 0.0; // thin-surface back transmission (foliage)
+        // Sun shadow sample 0's occluder t (the NRD/SIGMA penumbra guide).
+        // 0 = no front shadow ray fired — the backlit/ndl<=0 arm — which IS
+        // SIGMA's "NoL <= 0 -> 0" convention; miss = INF (CAM_FAR at the pack).
+        float sh_t0 = 0.0;
         for (uint si = 0u; si < n_shadow; ++si) {
             // The SAME two draws, in the same order, the rect sampling consumed.
             float su = rng_next(rng);
@@ -1096,8 +1118,12 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
             // tmax = INF: the sun is at infinity, so anything along the ray
             // occludes it. transmit_q: the sun ray carries a tint through
             // glass (tinted shadows); the throughput rides `li`, so the
-            // GGX/sheen terms inherit it componentwise (shade.rs).
-            float3 vis_t = ABL_TQ_SHADOW(p, wi, 0.0, INF);
+            // GGX/sheen terms inherit it componentwise (shade.rs). Sample 0
+            // routes through the _T twin — same query body, so the
+            // transmittance value (and every rng draw) is untouched.
+            float3 vis_t;
+            if (si == 0u) vis_t = ABL_TQ_SHADOW_T(p, wi, 0.0, INF, sh_t0);
+            else vis_t = ABL_TQ_SHADOW(p, wi, 0.0, INF);
             if (any(vis_t != 0.0)) {
                 float3 li = sun_e.xyz * ndl * vis_t;
                 direct_d += li;
@@ -1258,6 +1284,7 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
             // rng draws.
             prim.direct_d = direct_d;
             prim.direct_s = direct_s;
+            prim.shadow_t = sh_t0;
         }
         // Detail cavity AO — AFTER the prim captures (shade.rs's site): the
         // FSR signals stay un-cavitied and the deterministic delta rides the
@@ -1319,6 +1346,9 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
             // ambient is a BRDF-side quantity, while the AO ray directions
             // below keep the GEOMETRIC n (visibility), per the n_g/n_s split.
             float ao = 1.0;
+            // AO sample 0's occluder t (the NRD hit-distance guide): 0 = no
+            // AO ray at this preset, miss = AO_RADIUS (the query's tmax).
+            float ao_t0 = 0.0;
             if (n_ao > 0u) {
                 float3 at1, at2;
                 onb(n, at1, at2);
@@ -1330,8 +1360,12 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
                     // SCALAR, so a glass throughput folds to gray. The true
                     // divide keeps 3.0/3.0 == 1.0 and 0.0/3.0 == 0.0 exact —
                     // opaque scenes accumulate the old integer counts
-                    // bit-identically.
-                    float3 tp = ABL_TQ_AO(p, cosine_dir(n, at1, at2, r1, r2), 0.0, AO_RADIUS);
+                    // bit-identically. Sample 0 routes through the _T twin —
+                    // same query body, transmittance and rng untouched.
+                    float3 dir_ao = cosine_dir(n, at1, at2, r1, r2);
+                    float3 tp;
+                    if (ai == 0u) tp = ABL_TQ_AO_T(p, dir_ao, 0.0, AO_RADIUS, ao_t0);
+                    else tp = ABL_TQ_AO(p, dir_ao, 0.0, AO_RADIUS);
                     open += (tp.x + tp.y + tp.z) / 3.0;
                 }
                 ao = open / float(n_ao);
@@ -1341,7 +1375,10 @@ float3 shade_split(float3 ro, float3 rd, HitInfo hit, inout uint rng,
             // The factor it remodulates by is no longer a constant: it is the
             // sky's own SH irradiance at n_s (feed.hlsl / fsr_composite.hlsl
             // rebuild it from the WIRE normal — see fsr::wire_normal).
-            if (lap == 0u) prim.ao = ao;
+            if (lap == 0u) {
+                prim.ao = ao;
+                prim.ao_t = ao_t0;
+            }
             // The ambient term hoisted so the cavity can scale it without
             // touching prim.ao (the un-cavitied FSR signal) — same
             // subexpression, same tree; the off arm's DAG identity is what

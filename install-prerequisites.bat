@@ -25,9 +25,16 @@ rem    install-prerequisites.bat dxc fsr         only those
 rem    install-prerequisites.bat all /force      re-download and re-extract
 rem    install-prerequisites.bat /clean          delete the download cache
 rem
-rem  Components: dxc fsr xess nppd oidn pix
+rem  Components: dxc fsr xess nppd oidn pix nrd
 rem  Needs: Windows 10 1803+ (curl.exe + tar.exe are in-box). ~700 MB of
 rem  downloads, ~2 GB on disk after extraction.
+rem
+rem  nrd is the ONE component that compiles locally (VS 2022 + CMake; NVIDIA
+rem  publishes no prebuilt NRD binaries — the GitHub releases are source tags).
+rem  Building frustracer itself still needs none of this: NRD.dll is
+rem  LoadLibrary'd at runtime like every other SDK here, and a default run that
+rem  finds no VS just skips nrd with a note ([x] + failure exit only when nrd
+rem  was asked for BY NAME).
 rem ===========================================================================
 setlocal EnableExtensions EnableDelayedExpansion
 cd /d "%~dp0"
@@ -48,6 +55,9 @@ set "FFX_VER=2.3.0"
 set "ORT_VER=1.24.4"
 set "DML_VER=1.15.4"
 set "PIX_VER=1.0.240308001"
+rem  NRD is pinned BOTH here and in src/nrd.rs (the transcribed structs +
+rem  runtime GetLibraryDesc gate) — move the two together or --nrd sheds loudly.
+set "NRD_TAG=v4.17.3"
 
 rem --- tools ---------------------------------------------------------------
 rem  Absolute System32 paths on purpose, NOT bare names: a PATH with Git for
@@ -77,6 +87,7 @@ for %%A in (%*) do (
     if /i "%%~A"=="nppd" set "KNOWN=1"
     if /i "%%~A"=="oidn" set "KNOWN=1"
     if /i "%%~A"=="pix" set "KNOWN=1"
+    if /i "%%~A"=="nrd" (set "KNOWN=1" & set "NRD_EXPLICIT=1")
     rem  Reject via goto, not an in-block exit /b: exiting from inside this
     rem  parenthesized loop body terminates the script but does NOT reliably
     rem  propagate the exit code to the caller (measured: cmd /c saw 0).
@@ -85,7 +96,7 @@ for %%A in (%*) do (
     set "SEL=!SEL! %%~A"
     ))))
 )
-if not defined SEL (set "SEL= dxc fsr xess nppd oidn pix")
+if not defined SEL (set "SEL= dxc fsr xess nppd oidn pix nrd")
 goto :args_done
 
 rem `dlss` was a valid component in the Streamline era; say why it is gone
@@ -116,6 +127,7 @@ call :want xess && call :do_xess
 call :want nppd && call :do_nppd
 call :want oidn && call :do_oidn
 call :want pix  && call :do_pix
+call :want nrd  && call :do_nrd
 
 rem =========================== verification =================================
 echo.
@@ -128,6 +140,7 @@ call :check "NPPD (--nppd / J)"                      "%SDKS%\onnxruntime\bin\onn
 call :check "  (DirectML EP)"                        "%SDKS%\onnxruntime\bin\DirectML.dll"
 call :check "OIDN (--oidn / N)"                      "%SDKS%\oidn.x64.windows\bin\OpenImageDenoise.dll"
 call :check "PIX markers (--pix-markers)"            "%SDKS%\pix\bin\x64\WinPixEventRuntime.dll"
+call :check "NRD denoiser (--nrd)"                   "%SDKS%\NRD\bin\NRD.dll"
 
 rem DLSS is decided at BUILD time, not here (see the header) — but say so in
 rem the summary, where someone looking for the missing DLSS-RR row will look.
@@ -230,6 +243,85 @@ call :fetch pix.zip "https://www.nuget.org/api/v2/package/WinPixEventRuntime/%PI
 call :unzip pix.zip "%SDKS%\pix" || exit /b 0
 exit /b 0
 
+:do_nrd
+rem NVIDIA publishes NO prebuilt NRD binaries, so this component COMPILES the
+rem pinned tag locally — the one component with a toolchain requirement (CMake +
+rem VS 2022 C++ tools; NRD's FetchContent pulls ShaderMake/MathLib as plain zip
+rem URLs, so configure needs network but NOT git). Only the resulting NRD.dll is
+rem kept: the DXIL shader blobs are EMBEDDED in it and src/nrd.rs loads it at
+rem runtime, so building frustracer still needs none of this. A missing
+rem toolchain is a hard failure only when nrd was named on the command line —
+rem a default `all` run degrades to a note, like the DLSS/NPPD-model rows.
+call :skip "%SDKS%\NRD\bin\NRD.dll" nrd && exit /b 0
+set "CMAKE="
+set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+where cmake.exe >nul 2>nul && set "CMAKE=cmake.exe"
+if not defined CMAKE if exist "%VSWHERE%" (
+    for /f "usebackq delims=" %%C in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe 2^>nul`) do set "CMAKE=%%C"
+)
+set "VSDIR="
+if exist "%VSWHERE%" (
+    for /f "usebackq delims=" %%V in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2^>nul`) do set "VSDIR=%%V"
+)
+if not defined CMAKE goto :nrd_no_toolchain
+if not defined VSDIR goto :nrd_no_toolchain
+call :fetch nrd-src.zip "https://github.com/NVIDIA-RTX/NRD/archive/refs/tags/%NRD_TAG%.zip" || exit /b 0
+call :unzip nrd-src.zip "%CACHE%\nrd-src" || exit /b 0
+rem  the tag zip wraps everything in NRD-<ver-without-v>/
+set "NRD_SRC=%CACHE%\nrd-src\NRD-%NRD_TAG:~1%"
+if not exist "%NRD_SRC%\CMakeLists.txt" (
+    echo     [x] nrd source layout unexpected ^(no CMakeLists at %NRD_SRC%^)
+    set "FAILED=1"
+    exit /b 0
+)
+rem  DXIL only (our sessions are D3D12; skipping DXBC/SPIRV halves the shader
+rem  build); encoding pins 2/1 are the build contract src/nrd.rs gates at
+rem  runtime via GetLibraryDesc. SHADERMAKE_DXC_PATH prefers the dxc component's
+rem  compiler when installed (script order runs dxc first); absent, ShaderMake
+rem  falls back to the Windows-SDK dxc on its own.
+set "DXCARG="
+if exist "%SDKS%\dxc\bin\x64\dxc.exe" set "DXCARG=-DSHADERMAKE_DXC_PATH=%SDKS%\dxc\bin\x64\dxc.exe"
+echo     [+] configuring NRD %NRD_TAG% ^(cmake log: %CACHE%\nrd-cmake.log^)
+"%CMAKE%" -S "%NRD_SRC%" -B "%CACHE%\nrd-build" -A x64 -DNRD_STATIC_LIBRARY=OFF -DNRD_NRI=OFF -DNRD_EMBEDS_DXIL_SHADERS=ON -DNRD_EMBEDS_DXBC_SHADERS=OFF -DNRD_EMBEDS_SPIRV_SHADERS=OFF -DNRD_NORMAL_ENCODING=2 -DNRD_ROUGHNESS_ENCODING=1 %DXCARG% > "%CACHE%\nrd-cmake.log" 2>&1
+if errorlevel 1 (
+    echo     [x] nrd cmake configure FAILED — see %CACHE%\nrd-cmake.log
+    set "FAILED=1"
+    exit /b 0
+)
+echo     [+] building NRD ^(a few minutes; log: %CACHE%\nrd-build.log^)
+"%CMAKE%" --build "%CACHE%\nrd-build" --config Release --parallel > "%CACHE%\nrd-build.log" 2>&1
+if errorlevel 1 (
+    echo     [x] nrd build FAILED — see %CACHE%\nrd-build.log
+    set "FAILED=1"
+    exit /b 0
+)
+rem  CMAKE_RUNTIME_OUTPUT_DIRECTORY is _Bin under the SOURCE dir; cover both
+rem  the flat and the per-config layout across generator versions.
+set "NRD_DLL="
+if exist "%NRD_SRC%\_Bin\NRD.dll" set "NRD_DLL=%NRD_SRC%\_Bin\NRD.dll"
+if exist "%NRD_SRC%\_Bin\Release\NRD.dll" set "NRD_DLL=%NRD_SRC%\_Bin\Release\NRD.dll"
+if not defined NRD_DLL (
+    echo     [x] nrd build produced no NRD.dll under %NRD_SRC%\_Bin
+    set "FAILED=1"
+    exit /b 0
+)
+if not exist "%SDKS%\NRD\bin" mkdir "%SDKS%\NRD\bin"
+copy /y "%NRD_DLL%" "%SDKS%\NRD\bin\" >nul || (set "FAILED=1" & exit /b 0)
+echo     [+] NRD.dll -^> SDKs\NRD\bin
+exit /b 0
+
+:nrd_no_toolchain
+if defined NRD_EXPLICIT (
+    echo     [x] nrd needs CMake + Visual Studio 2022 C++ tools: NVIDIA ships no
+    echo         prebuilt NRD binaries, so it must compile locally.
+    set "FAILED=1"
+) else (
+    echo     [i] nrd skipped — needs CMake + VS 2022 C++ tools to compile
+    echo         ^(NVIDIA ships no prebuilt binaries^). Rerun `install-prerequisites.bat nrd`
+    echo         once they are installed; every other feature works without it.
+)
+exit /b 0
+
 rem =========================== helpers ======================================
 
 rem :want <component> — is it in the selection?
@@ -267,11 +359,14 @@ rem dest stays absolute.
 :unzip
 if not exist "%~2" mkdir "%~2"
 echo     [+] extracting %~1 -^> %~2
+rem  TAR_RC, deliberately NOT "RC": RC is the MSVC resource-compiler override,
+rem  and leaking RC=0 into the nrd component's cmake child broke its configure
+rem  ("Could not find compiler set in environment variable RC: 0").
 pushd "%CACHE%"
 "%TAR%" -xf "%~1" -C "%~2" %~3
-set "RC=%errorlevel%"
+set "TAR_RC=%errorlevel%"
 popd
-if not "%RC%"=="0" (
+if not "%TAR_RC%"=="0" (
     echo     [x] extract FAILED ^(corrupt download? rerun with /force^)
     set "FAILED=1"
     exit /b 1

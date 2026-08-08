@@ -355,6 +355,7 @@ cargo run --release -- model.obj     # or just load your own OBJ / glTF / GLB
 | **G** / **K** / **X** | toggle the wired upscaler (DLSS-RR / FSR / XeSS) against plain |
 | **N** / **M** | OIDN denoising; its temporal history |
 | **J** | NPPD neural denoising |
+| `--no-nrd` | NRD (ReBLUR) pre-upscale ray reconstruction is ON by default in XeSS/FSR3 sessions — the non-neural denoiser that takes them below DLSS-RR-class flicker (`install-prerequisites.bat nrd` builds the SDK; this is the kill lever) |
 | **U** | double samples per pixel (1 → 2 → … → 128 → 1) |
 | **1 2 3** | quality presets |
 | **H** | hemisphere bounces: off → AO → GI (still frames) |

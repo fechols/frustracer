@@ -61,10 +61,16 @@ pub const FEED_SET_STRIDE: u32 = 1 + NUM_FEED;
 /// dispatches recorded into the SAME command list would be a bug: descriptors
 /// are read at execute time, so the last write would win for both.
 ///
-/// 3 is the ceiling, not a guess: the engines that need a DISTINCT plane set are
-/// DLSS-RR, FSR4-RR, and the XeSS/FSR3 trio — XeSS and FSR 3.1 take a
-/// byte-identical plane set, so they share one feed (see `ffx_up::upscale_res_shared`).
-pub const FEED_SETS: u32 = 3;
+/// 4 = the 3 engine sets + the NRD bridge set. The engine ceiling is still 3
+/// (DLSS-RR, FSR4-RR, and the XeSS/FSR3 trio — XeSS and FSR 3.1 take a
+/// byte-identical plane set, so they share one feed, see
+/// `ffx_up::upscale_res_shared`); set `NRD_FEED_SET` (= 3, the LAST set) holds
+/// the `--nrd` bridge's plane descriptors (nrd_bridge.hlsl's IN_*/OUT_* over
+/// the shared u16..u27 registers), wired via `wire_nrd_feed`. The bump is heap
+/// arithmetic only — TEX_HEAP_BASE derives, the root signature is untouched.
+pub const FEED_SETS: u32 = 4;
+/// The NRD bridge's descriptor set (the last one — engine sets stay 0..2).
+pub const NRD_FEED_SET: u32 = 3;
 pub const FEED_COLOR: u32 = 16; // RGBA16F (RR/XeSS); RGBA16F residual (FSR-RR)
 pub const FEED_NR: u32 = 17; // RGBA16F normal+rough (RR); RGB10A2 oct-normals (FSR-RR)
 pub const FEED_DEPTH: u32 = 18; // R32F (all; encoding differs per kernel)
@@ -777,6 +783,7 @@ const HEMI_LEAF_HLSL: &str = include_str!("shaders/hemi_leaf.hlsl");
 const COMPOSE_HLSL: &str = include_str!("shaders/compose.hlsl");
 pub(crate) const FEED_HLSL: &str = include_str!("shaders/feed.hlsl");
 const NPPD_HLSL: &str = include_str!("shaders/nppd.hlsl");
+pub(crate) const NRD_BRIDGE_HLSL: &str = include_str!("shaders/nrd_bridge.hlsl");
 const WAVEPROBE_HLSL: &str = include_str!("shaders/waveprobe.hlsl");
 const WORKGRAPH_HLSL: &str = include_str!("shaders/workgraph.hlsl");
 
@@ -5549,6 +5556,36 @@ pub struct NppdRes {
     pso_feed_dm: ID3D12PipelineState,
 }
 
+/// The --nrd bridge stage: the two kernels flanking NRD's own passes
+/// (nrd_bridge.hlsl). PSOs only — the NRD plane TEXTURES belong to the
+/// session's NrdGpu (gpu/nrd_gpu.rs) or a gate's locals, wired into
+/// descriptor set NRD_FEED_SET via `wire_nrd_feed` (the NppdRes shape,
+/// minus buffers). pso_feed_dm is the guides-only engine feed the NRD
+/// composition uses in place of the color-writing kernel (cs_nrd_out owns
+/// the color plane — the NPPD-slot pattern).
+pub struct NrdRes {
+    // pub(crate): DxrGpu's record twins bind the same PSOs (compiled with
+    // ITS root-signature object — same layout, the feed_pso discipline).
+    pub(crate) pso_pack: ID3D12PipelineState,
+    pub(crate) pso_out: ID3D12PipelineState,
+    /// The guides-only engine feed for NRD sessions (cs_nrd_out owns the
+    /// color plane). Consumed by the session wiring; the gates dispatch
+    /// pack/out directly.
+    pub pso_feed_dm: ID3D12PipelineState,
+}
+
+impl NrdRes {
+    /// DxrGpu's constructor — it compiles the same nrd_bridge.hlsl unit at
+    /// its own cs_6_3 floor with its own root-signature object.
+    pub(crate) fn from_psos(
+        pso_pack: ID3D12PipelineState,
+        pso_out: ID3D12PipelineState,
+        pso_feed_dm: ID3D12PipelineState,
+    ) -> Self {
+        Self { pso_pack, pso_out, pso_feed_dm }
+    }
+}
+
 pub struct TraceGpu {
     pub root_sig: ID3D12RootSignature,
     pub cmd_sig: ID3D12CommandSignature,
@@ -5660,6 +5697,18 @@ pub struct TraceGpu {
     /// GPU-resident NPPD staging (the --gpu --nppd composition) — buffers
     /// nppd::NppdGpu wraps as ORT tensors, plus the staging kernels.
     pub nppd: Option<NppdRes>,
+    /// The --nrd bridge kernels (pack/out around NRD's passes) — built when
+    /// the session (or a gate) asks; wire_nrd_feed points set NRD_FEED_SET
+    /// at the frame's NRD planes.
+    pub nrd: Option<NrdRes>,
+    /// Keeps the wired NRD planes alive for the descriptors' lifetime (the
+    /// wire_feed discipline — descriptors don't own).
+    nrd_wired: Vec<ID3D12Resource>,
+    /// The wired NRD set's u16 target — the ENGINE's color plane, which RESTS
+    /// in NON_PIXEL_SHADER_RESOURCE (the upscaler-eval contract) and must be
+    /// bracketed NPSR→UA→NPSR around cs_nrd_out's write. Held separately from
+    /// `nrd_wired` because record_nrd_out needs the RESOURCE, not a keepalive.
+    nrd_color: Option<ID3D12Resource>,
     /// The shared scene core — one Rc per tracer, cached in GpuContext (the
     /// second tracer and resize re-entries skip the upload + BLAS build).
     pub scene: std::rc::Rc<SceneGpu>,
@@ -5735,6 +5784,7 @@ impl TraceGpu {
         rh: u32,
         gbuf_full: bool,
         nppd: bool,
+        nrd: bool,
         debug: bool,
         sub: &mut dyn d3d12::Submit,
     ) -> Result<Self> {
@@ -6116,6 +6166,21 @@ impl TraceGpu {
         } else {
             (None, None, None)
         };
+        // NRD bridge kernels: --nrd sessions + the check-gpu bridge gates.
+        // abl_defs FIRST (the probe-reach lesson — an ablation define that
+        // cannot reach its unit answers confidently).
+        let nrd_res = if gbuf_full && nrd {
+            let nrd_src =
+                [abl_defs().as_str(), sd, TRACE_COMMON_HLSLI, FSR_WIRE_HLSLI, NRD_BRIDGE_HLSL]
+                    .join("\n");
+            Some(NrdRes {
+                pso_pack: pso(&nrd_src, "cs_nrd_pack", "nrd_pack")?,
+                pso_out: pso(&nrd_src, "cs_nrd_out", "nrd_out")?,
+                pso_feed_dm: pso(&feed_src, "cs_feed_xess_dm", "nrd_feed_dm")?,
+            })
+        } else {
+            None
+        };
         // NPPD staging kernels: only in --gpu --nppd (XeSS) sessions.
         let nppd_psos = if gbuf_full && nppd {
             let nppd_src = [sd, TRACE_COMMON_HLSLI, NPPD_HLSL].join("\n");
@@ -6376,6 +6441,9 @@ impl TraceGpu {
             pso_resolve,
             pso_seed,
             pso_seed_replay,
+            nrd: nrd_res,
+            nrd_wired: Vec::new(),
+            nrd_color: None,
             last_struct: std::cell::Cell::new(None),
             split: std::cell::Cell::new(TileSplit::ALL),
             split_refused: std::cell::Cell::new(false),
@@ -6496,7 +6564,13 @@ impl TraceGpu {
     /// enough to arm FLAG_FSR_SIG, and the capture is assignment-only, so the
     /// other engines' frames stay bit-identical).
     pub fn fsr_sig(&self) -> bool {
-        self.force_fsr_sig.get() || self.feed.iter().any(|(k, _)| matches!(k, FeedKind::FsrRr))
+        // `nrd_wired`, deliberately NOT `nrd.is_some()`: the check-gpu pack
+        // tracer builds the bridge PSOs unconditionally, and arming the sig
+        // capture on mere PSO presence would run M9b's "off" baseline with
+        // the capture ON — a vacuous bit-identity A/B. Wiring is the intent.
+        self.force_fsr_sig.get()
+            || !self.nrd_wired.is_empty()
+            || self.feed.iter().any(|(k, _)| matches!(k, FeedKind::FsrRr))
     }
 
     /// Whether ANY consumer reads the pack's guide/signal half this frame.
@@ -6528,8 +6602,13 @@ impl TraceGpu {
     }
 
     pub fn gbuf_ext_needed(&self) -> bool {
+        // `nrd_wired` for the same reason fsr_sig carries it: cs_nrd_pack
+        // reads gbuf_ext FULL-SCREEN, so --dual-gpu's fed_strides must carry
+        // the EXT band for the secondary's rows in an NRD session (without
+        // it the bridge packs stale normals/albedo/sig for that band).
         self.force_gbuf_ext.get()
             || self.nppd.is_some()
+            || !self.nrd_wired.is_empty()
             || self.feed.iter().any(|(k, _)| matches!(k, FeedKind::Rr | FeedKind::FsrRr))
     }
 
@@ -7497,6 +7576,32 @@ impl TraceGpu {
         Ok(())
     }
 
+    /// The --nrd flavor of the engine feed: GUIDES-ONLY (cs_feed_xess_dm) —
+    /// cs_nrd_out already wrote the denoised color into the engine's color
+    /// plane, and the normal color-writing kernel would overwrite it with raw
+    /// accum. XeSS- or FSR3-wired sessions (they take a byte-identical plane
+    /// trio with the same encodings, so the one dm kernel serves both — the
+    /// upscale_res_shared argument); RR/FSR-RR sessions never arm NRD.
+    pub fn record_feed_nrd(&self, list: &ID3D12GraphicsCommandList, slot: usize) -> Result<()> {
+        if self.feed.len() != 1 || !matches!(self.feed[0].0, FeedKind::Xess | FeedKind::Fsr3) {
+            return Err("NRD feed composition is XeSS/FSR3-only".into());
+        }
+        let n = self.nrd.as_ref().ok_or("NRD bridge not built")?;
+        let planes = &self.feed[0].1;
+        let feeds = [(&n.pso_feed_dm, 0u32, planes.as_slice())];
+        record_feed_dispatch(
+            list,
+            &self.device,
+            &self.uav_heap,
+            &feeds,
+            None,
+            self.rw,
+            self.rh,
+            &|| unsafe { self.bind_common(list, slot) },
+        );
+        Ok(())
+    }
+
     /// NPPD pre-inference staging: pack the G-buffer + 1-spp radiance into
     /// the NCHW frame buffer and backward-warp the recurrent state (or zero
     /// the warped buffer when `state_valid` is false — a reset). Record AFTER
@@ -7518,6 +7623,91 @@ impl TraceGpu {
             list.Dispatch(n.pw / 8, n.ph / 8, 1);
             list.SetPipelineState(if state_valid { &n.pso_warp } else { &n.pso_zero });
             list.Dispatch(n.pw / 8, n.ph / 8, 1);
+        }
+        Ok(())
+    }
+
+    /// Point descriptor set NRD_FEED_SET at the frame's NRD planes (the
+    /// bridge kernels' u16..u27 — see nrd_bridge.hlsl's register map). The
+    /// engine feed sets (0..2) are untouched; NRD is a bridge, never a
+    /// FeedKind, so `fsr_sig()`/`record_feed` semantics cannot be perturbed
+    /// by wiring it.
+    pub fn wire_nrd_feed(
+        &mut self,
+        device: &ID3D12Device,
+        targets: &[(u32, &ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT)],
+    ) -> Result<()> {
+        self.nrd_wired = wire_feed_targets(device, &self.uav_heap, NRD_FEED_SET, targets)?;
+        // u16 = the engine's color plane: record_nrd_out brackets its write
+        // with NPSR↔UA transitions (the plane rests NON_PIXEL_SHADER_RESOURCE
+        // — the upscaler-eval contract every other writer honors through
+        // record_feed_dispatch's own transitions).
+        self.nrd_color = targets.iter().find(|t| t.0 == 16).map(|t| t.1.clone());
+        Ok(())
+    }
+
+    /// Un-wire the NRD set: drops the plane keepalives (and with them the
+    /// last refs once NrdGpu is gone) and disarms `fsr_sig`'s nrd term, so a
+    /// shed session stops paying the sig/sig2 pack stores. The set-3
+    /// descriptors go stale, which is fine — nothing binds them once
+    /// record_nrd_*/record_feed_nrd stop being called.
+    pub fn clear_nrd_wired(&mut self) {
+        self.nrd_wired.clear();
+        self.nrd_color = None;
+    }
+
+    /// Whether THIS tracer can run the NRD bridge (PSOs built AND planes
+    /// wired) — the presenters' per-arm predicate, so a session whose other
+    /// arm armed NRD runs this one plain instead of shedding on the first
+    /// "NRD bridge not built" frame.
+    pub fn nrd_armed(&self) -> bool {
+        self.nrd.is_some() && !self.nrd_wired.is_empty()
+    }
+
+    /// The bridge's front half: gbuf/gbuf_ext/accum -> NRD's five IN planes.
+    /// Runs after record_frame (its trailing global UAV barrier fences the
+    /// pack writes); the caller owns the IN planes' UAV barrier before NRD's
+    /// own passes consume them.
+    pub fn record_nrd_pack(&self, list: &ID3D12GraphicsCommandList, slot: usize) -> Result<()> {
+        let n = self.nrd.as_ref().ok_or("NRD bridge not built")?;
+        let _ev = super::pix::scope(list, c"nrd-pack");
+        unsafe {
+            self.bind_common(list, slot);
+            list.SetDescriptorHeaps(&[Some(self.uav_heap.clone())]);
+            list.SetComputeRootDescriptorTable(
+                RP_TEX,
+                feed_set_handle(&self.device, &self.uav_heap, NRD_FEED_SET),
+            );
+            list.SetPipelineState(&n.pso_pack);
+            list.Dispatch(self.rw.div_ceil(8), self.rh.div_ceil(8), 1);
+        }
+        Ok(())
+    }
+
+    /// The bridge's back half: the delta-form recompose into the upscaler's
+    /// color plane (u16 of the NRD set — the same texture the engine set's
+    /// color slot names). The caller fences NRD's OUT-plane writes first.
+    /// The color plane RESTS in NON_PIXEL_SHADER_RESOURCE (the state the
+    /// upscaler eval reads it in; record_feed_dispatch round-trips it the
+    /// same way), so the UAV write is bracketed NPSR→UA→NPSR here — gate
+    /// callers must create their stand-in color plane resting NPSR too.
+    pub fn record_nrd_out(&self, list: &ID3D12GraphicsCommandList, slot: usize) -> Result<()> {
+        let n = self.nrd.as_ref().ok_or("NRD bridge not built")?;
+        let color = self.nrd_color.as_ref().ok_or("NRD color plane not wired")?;
+        let _ev = super::pix::scope(list, c"nrd-out");
+        unsafe {
+            let npsr = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            let ua = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            list.ResourceBarrier(&[transition(color, npsr, ua)]);
+            self.bind_common(list, slot);
+            list.SetDescriptorHeaps(&[Some(self.uav_heap.clone())]);
+            list.SetComputeRootDescriptorTable(
+                RP_TEX,
+                feed_set_handle(&self.device, &self.uav_heap, NRD_FEED_SET),
+            );
+            list.SetPipelineState(&n.pso_out);
+            list.Dispatch(self.rw.div_ceil(8), self.rh.div_ceil(8), 1);
+            list.ResourceBarrier(&[transition(color, ua, npsr)]);
         }
         Ok(())
     }

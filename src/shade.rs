@@ -197,6 +197,16 @@ pub struct PrimarySurface {
     /// direct_s`-style remainder, so capture changes no shading math.
     pub direct_d: Vec3A,
     pub direct_s: Vec3A,
+    /// NRD hit-distance guides (`GBufExt.sig.w` on the GPU): the AO ray's
+    /// and the sun-shadow ray's sample-0 occluder t. GPU-CAPTURED ONLY in
+    /// v1 — the CPU renderer never feeds NRD, and threading a t out of
+    /// `Bvh::transmittance`'s traversal would touch the CPU hot loops for a
+    /// value nothing consumes; these stay 0.0 here so the PrimSurf mirror
+    /// remains field-aligned (shade.hlsli owns the live capture).
+    #[allow(dead_code)] // never read on the CPU by design (see above)
+    pub ao_t: f32,
+    #[allow(dead_code)]
+    pub shadow_t: f32,
 }
 
 impl PrimarySurface {
@@ -948,6 +958,9 @@ pub fn shade(
             // ambient, or a surface whose reflection gate never fired).
             ao: 0.0,
             ind_s: Vec3A::ZERO,
+            // GPU-captured only (see the field docs) — 0.0 = "no data".
+            ao_t: 0.0,
+            shadow_t: 0.0,
         };
     }
 

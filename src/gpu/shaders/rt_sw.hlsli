@@ -374,6 +374,17 @@ float3 transmit_q(float3 o, float3 d, float tmin, float tmax) {
 
 #endif // TRANS_SHADOW
 
+// _t twin (NRD's sig.w hit-distance guide): the software arm does NOT
+// capture — threading a first-t through sw_occluded_from/sw_transmit_from
+// would touch the --sw-rays measurement lever's whole traversal for a guide
+// only --nrd consumes, and --sw-rays sessions are the A/B arm, not a
+// shipping config. first_t = tmax (= "miss"/no data); ReBLUR's
+// hit-distance-reconstruction mode covers it. Documented known-accept.
+float3 transmit_q_t(float3 o, float3 d, float tmin, float tmax, out float first_t) {
+    first_t = tmax;
+    return transmit_q(o, d, tmin, tmax);
+}
+
 // Software provider for the opaque traversal-frontier API. This is
 // bvh.rs::intersect_multi — closest hit seeded from a tile's node cut instead
 // of the root. Every leaf-pixel sample lies inside the tile frustum, so the

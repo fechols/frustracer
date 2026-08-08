@@ -34,6 +34,7 @@ pub mod quin;
 pub mod rr;
 pub mod bc7gpu;
 pub mod bloom;
+pub mod nrd_gpu;
 pub mod tonemap;
 pub mod trace;
 pub mod upload;
@@ -760,6 +761,27 @@ pub struct GpuContext {
     /// Whether the recurrent state carries history (false forces the next
     /// NPPD frame to zero the warped-state input — a reset).
     nppd_state_valid: bool,
+    /// The NRD (ReBLUR) pre-upscale denoiser (`--nrd`, XeSS sessions v1):
+    /// NRD's own passes over the bridge kernels' planes (nrd_gpu.rs).
+    nrd_gpu: Option<nrd_gpu::NrdGpu>,
+    /// The nppd_state_valid pattern: false → the next NRD frame passes
+    /// AccumulationMode::RESTART (set on gpu_reset, never on motion).
+    nrd_hist_valid: bool,
+    /// Previous frame's matrices + jitter for CommonSettings (NRD wants the
+    /// prev pair explicitly; its own contract, like dlss_prev/xess_prev).
+    nrd_prev: Option<(crate::dlss::CamMatrices, (f32, f32))>,
+    /// NRD's consecutively-growing frame index (its contract: +1 per FRAME,
+    /// restartable after a non-CONTINUE mode).
+    nrd_frame_idx: u32,
+    /// The NRD shed, split in two because D3D12 command lists don't refcount:
+    /// a failing frame only FLAGS the shed here (NrdGpu's heaps/PSOs/pools
+    /// are still referenced by up to FRAMES_IN_FLIGHT submitted lists — and,
+    /// on a mid-record failure, by the very list about to Present — so an
+    /// immediate drop executes GPU work against destroyed objects: device
+    /// removal). `nrd_shed_cleanup` at the next presenter entry drains and
+    /// frees. Stays true afterwards as the session tombstone — NRD is never
+    /// rebuilt this session (the nppd-gpu shape; `arm_nrd_for` refuses).
+    nrd_shed: bool,
     /// Frame generation (native sessions; see FgState). Declared AFTER `d3d`
     /// deliberately: d3d's swapchain/backbuffer refs on the FI proxy must
     /// release before FgState's drop destroys the swapchain context.
@@ -1576,6 +1598,11 @@ impl GpuContext {
             quin_cfg: opts.quin.then_some((opts.quin_anchor, opts.debug)),
             nppd_gpu: None,
             nppd_state_valid: false,
+            nrd_gpu: None,
+            nrd_hist_valid: false,
+            nrd_prev: None,
+            nrd_frame_idx: 0,
+            nrd_shed: false,
             fg: fg_state,
             fg_x,
             fg_n,
@@ -2403,6 +2430,7 @@ impl GpuContext {
         rh: u32,
         gbuf: bool,
         nppd: Option<(&str, &str)>,
+        nrd: Option<&str>,
         debug: bool,
         bc7_mode: crate::bc7::Bc7Mode,
     ) -> Result<()> {
@@ -2418,6 +2446,7 @@ impl GpuContext {
             rh,
             gbuf,
             nppd.is_some(),
+            nrd.is_some(),
             debug,
             &mut self.d3d,
         );
@@ -2474,6 +2503,27 @@ impl GpuContext {
                     eprintln!("nppd-gpu: unavailable ({e}); running plain GPU-XeSS");
                     tg.nppd = None;
                 }
+            }
+        }
+        // NRD (ReBLUR) pre-upscale denoising: NRD's passes between the bridge
+        // kernels, all on the one list (no split — pure compute). The
+        // arming/wiring itself is `arm_nrd_for` — ONE block shared with
+        // init_dxr, and ONE NrdGpu shared by both arms. A failure keeps the
+        // session running plain and sheds loudly (the nppd-gpu shape).
+        // --nrd + --nppd is refused at the CLI/session boundary (both claim
+        // the pre-upscale color slot), asserted again here.
+        if let Some(dir) = nrd {
+            if nppd.is_some() {
+                self.evict_unused_scene_gpu();
+                return Err("--nrd and --nppd both claim the pre-upscale color slot".into());
+            }
+            if let Err(e) = self.arm_nrd_for(&dev, dir, rw, rh, &mut |t| tg.wire_nrd_feed(&dev, t))
+            {
+                eprintln!(
+                    "nrd: unavailable ({e}); running plain GPU upscaling \
+                     (install-prerequisites.bat nrd builds the SDK; --no-nrd silences this)"
+                );
+                tg.nrd = None;
             }
         }
         wire_tonemap_src(
@@ -2620,7 +2670,7 @@ impl GpuContext {
         // plain session mirrors the dummy instead and only `accum` crosses.
         let sec = match arm {
             dual::Arm::Wave => dual::Secondary::Wave(trace::TraceGpu::new(
-                &dev, dxc, scene, bvh, core.clone(), rw, rh, gbuf, false, debug, &mut hg,
+                &dev, dxc, scene, bvh, core.clone(), rw, rh, gbuf, false, false, debug, &mut hg,
             )?),
             // DxrGpu::new needs no upload harness — there is no queue or
             // submit anywhere in it, unlike TraceGpu::new's software trees.
@@ -2632,6 +2682,7 @@ impl GpuContext {
                 rw,
                 rh,
                 gbuf,
+                false,
                 debug,
             )?),
         };
@@ -3086,6 +3137,7 @@ impl GpuContext {
         rw: u32,
         rh: u32,
         gbuf: bool,
+        nrd: Option<&str>,
         debug: bool,
         bc7_mode: crate::bc7::Bc7Mode,
     ) -> Result<()> {
@@ -3094,7 +3146,8 @@ impl GpuContext {
         }
         let dev = self.d3d.device.clone();
         let core = self.ensure_scene_gpu(scene, bvh, bc7_mode)?;
-        let mut d = match dxr::DxrGpu::new(&dev, dxc, scene, core, rw, rh, gbuf, debug) {
+        let mut d = match dxr::DxrGpu::new(&dev, dxc, scene, core, rw, rh, gbuf, nrd.is_some(), debug)
+        {
             Ok(d) => d,
             Err(e) => {
                 self.evict_unused_scene_gpu();
@@ -3108,6 +3161,18 @@ impl GpuContext {
             if let Err(e) = wired {
                 self.evict_unused_scene_gpu();
                 return Err(e);
+            }
+        }
+        // NRD pre-upscale denoising — arm_nrd_for, DXR flavor (one shared
+        // block, one shared NrdGpu — see init_trace's call site).
+        if let Some(dir) = nrd {
+            if let Err(e) = self.arm_nrd_for(&dev, dir, rw, rh, &mut |t| d.wire_nrd_feed(&dev, t))
+            {
+                eprintln!(
+                    "nrd: unavailable ({e}); running plain GPU upscaling \
+                     (install-prerequisites.bat nrd builds the SDK; --no-nrd silences this)"
+                );
+                d.nrd = None;
             }
         }
         wire_tonemap_src(
@@ -3287,6 +3352,7 @@ impl GpuContext {
         if self.dxr.is_none() || self.xess.is_none() {
             return Err("DXR pipeline + XeSS not both initialized".into());
         }
+        self.nrd_shed_cleanup()?;
         let slot = self.d3d.begin_frame()?;
         // --dual-gpu goes through the ONE site, and it must precede the feed:
         // `record_feed` dispatches FULL SCREEN and reads the secondary's rows
@@ -3295,13 +3361,47 @@ impl GpuContext {
             self.d3d.abort_frame();
             return Err(e);
         }
+        let nrd_armed = self.nrd_gpu.is_some() && self.dxr.as_ref().is_some_and(|d| d.nrd_armed());
+        let mut nrd_ok = nrd_armed;
         {
             let d3d = &mut self.d3d;
             let d = self.dxr.as_ref().unwrap();
-            if let Err(e) = d.record_feed(&d3d.list, slot) {
+            if nrd_ok {
+                // The shared NRD step, DXR flavor.
+                let dev = d3d.device.clone();
+                nrd_ok = Self::nrd_frame_step(
+                    &mut self.nrd_gpu,
+                    &mut self.nrd_prev,
+                    &mut self.nrd_frame_idx,
+                    &mut self.nrd_hist_valid,
+                    &dev,
+                    &d3d.list,
+                    slot,
+                    d.rw,
+                    d.rh,
+                    fc,
+                    jitter,
+                    reset,
+                    &|| d.record_nrd_pack(&d3d.list, slot),
+                    &|| d.record_nrd_out(&d3d.list, slot),
+                );
+            }
+            let feed = if nrd_ok {
+                d.record_feed_nrd(&d3d.list, slot)
+            } else {
+                d.record_feed(&d3d.list, slot)
+            };
+            if let Err(e) = feed {
                 d3d.abort_frame();
                 return Err(e);
             }
+        }
+        if nrd_armed && !nrd_ok {
+            // The shed, FLAG-only (see present_trace_xess's twin comment):
+            // in-flight lists still reference NrdGpu — nrd_shed_cleanup
+            // drains and frees at the next presenter entry.
+            self.nrd_shed = true;
+            self.nrd_hist_valid = false;
         }
         {
             let d3d = &mut self.d3d;
@@ -3376,6 +3476,7 @@ impl GpuContext {
             return Err("DXR pipeline + FSR not both initialized".into());
         }
         debug_assert!(self.ngxrr.is_none());
+        self.nrd_shed_cleanup()?;
         let slot = self.d3d.begin_frame()?;
         {
             let d3d = &mut self.d3d;
@@ -3397,13 +3498,48 @@ impl GpuContext {
             self.d3d.abort_frame();
             return Err(e);
         }
+        let nrd_armed = self.nrd_gpu.is_some() && self.dxr.as_ref().is_some_and(|d| d.nrd_armed());
+        let mut nrd_ok = nrd_armed;
         {
             let d3d = &mut self.d3d;
             let d = self.dxr.as_ref().unwrap();
-            if let Err(e) = d.record_feed(&d3d.list, slot) {
+            if nrd_ok {
+                // The shared NRD step (fc carries this presenter's
+                // jitter/reset).
+                let dev = d3d.device.clone();
+                nrd_ok = Self::nrd_frame_step(
+                    &mut self.nrd_gpu,
+                    &mut self.nrd_prev,
+                    &mut self.nrd_frame_idx,
+                    &mut self.nrd_hist_valid,
+                    &dev,
+                    &d3d.list,
+                    slot,
+                    d.rw,
+                    d.rh,
+                    fc,
+                    fc.jitter,
+                    fc.reset,
+                    &|| d.record_nrd_pack(&d3d.list, slot),
+                    &|| d.record_nrd_out(&d3d.list, slot),
+                );
+            }
+            let feed = if nrd_ok {
+                d.record_feed_nrd(&d3d.list, slot)
+            } else {
+                d.record_feed(&d3d.list, slot)
+            };
+            if let Err(e) = feed {
                 d3d.abort_frame();
                 return Err(e);
             }
+        }
+        if nrd_armed && !nrd_ok {
+            // The shed, FLAG-only (see present_trace_xess's twin comment):
+            // in-flight lists still reference NrdGpu — nrd_shed_cleanup
+            // drains and frees at the next presenter entry.
+            self.nrd_shed = true;
+            self.nrd_hist_valid = false;
         }
         {
             let fs = self.fsr.as_ref().unwrap();
@@ -3464,6 +3600,160 @@ impl GpuContext {
         self.d3d.end_frame(slot)
     }
 
+    /// The one NRD frame step all four NRD-capable presenters share
+    /// (wavefront/DXR × XeSS/FSR3): bridge pack → NRD's own passes →
+    /// delta-form recompose, plus the prev-matrices/frame-index/latch
+    /// bookkeeping. Returns whether NRD produced this frame's color (false ⇒
+    /// the caller runs the normal color-writing feed, and — if a denoiser
+    /// exists — sheds it for the session AFTER its borrows end). Free fn
+    /// over explicit fields: the presenters hold field-split borrows this
+    /// must thread through, not own.
+    #[allow(clippy::too_many_arguments)]
+    fn nrd_frame_step(
+        nrd_gpu: &mut Option<nrd_gpu::NrdGpu>,
+        nrd_prev: &mut Option<(crate::dlss::CamMatrices, (f32, f32))>,
+        nrd_frame_idx: &mut u32,
+        nrd_hist_valid: &mut bool,
+        device: &ID3D12Device,
+        list: &ID3D12GraphicsCommandList,
+        slot: usize,
+        rw: u32,
+        rh: u32,
+        fc: &dlss::FrameConstants,
+        jitter: (f32, f32),
+        reset: bool,
+        pack: &dyn Fn() -> Result<()>,
+        out: &dyn Fn() -> Result<()>,
+    ) -> bool {
+        let Some(ng) = nrd_gpu.as_mut() else { return false };
+        let mats = crate::dlss::CamMatrices {
+            world_to_view: fc.world_to_view,
+            view_to_clip: fc.view_to_clip,
+        };
+        let (pm, pj) = nrd_prev.unwrap_or((mats, jitter));
+        let hist_reset = reset || !*nrd_hist_valid;
+        let cs = nrd_gpu::common_settings(
+            &mats,
+            &pm,
+            jitter,
+            pj,
+            rw,
+            rh,
+            fc.far,
+            *nrd_frame_idx,
+            hist_reset,
+        );
+        let rs = nrd_gpu::reblur_settings();
+        let step = pack()
+            .and_then(|()| ng.record(device, list, slot, &cs, &rs))
+            .and_then(|()| out());
+        match step {
+            Ok(()) => {
+                *nrd_prev = Some((mats, jitter));
+                *nrd_frame_idx = nrd_frame_idx.wrapping_add(1);
+                *nrd_hist_valid = true;
+                true
+            }
+            Err(e) => {
+                eprintln!("nrd: frame failed ({e}); shedding — plain upscaling continues");
+                false
+            }
+        }
+    }
+
+    /// Arm NRD for one tracer — the ONE arming block both GPU arms share
+    /// (init_trace and init_dxr used to carry verbatim copies). Reuses the
+    /// session's single NrdGpu, building it on first arming: both arms trace
+    /// at the session-locked res, and sharing the instance is what keeps a
+    /// SPACE/F cycle's MEMOIZED arm wired at live planes — a second instance
+    /// would strand the first arm's NRD_FEED_SET descriptors on dropped
+    /// pools (packing into ghosts, denoising never-written inputs). `wire`
+    /// points the caller's tracer at the planes. An Err leaves that tracer
+    /// unarmed (`nrd_armed()` false — it runs plain); the caller sheds
+    /// loudly.
+    fn arm_nrd_for(
+        &mut self,
+        dev: &ID3D12Device,
+        dir: &str,
+        rw: u32,
+        rh: u32,
+        wire: &mut dyn FnMut(
+            &[(u32, &ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT)],
+        ) -> Result<()>,
+    ) -> Result<()> {
+        if self.nrd_shed {
+            return Err("NRD was shed earlier this session".into());
+        }
+        // The engine whose color plane cs_nrd_out owns: XeSS or the FSR 3.1
+        // upscaler (the byte-identical-trio pair; `fsr` is the SESSION state,
+        // either flavor — `fsr3` is quinlight's extra engine). RR/FSR-RR
+        // already denoise and never reach here. The resource is CLONED
+        // (COM AddRef) so no borrow of self survives into the build below.
+        let (color_res, color_fmt) = if let Some(x) = &self.xess {
+            let pl = x.res.plane_resources();
+            (pl[0].0.clone(), pl[0].1)
+        } else if let Some(FsrRes::Up(res)) = self.fsr.as_ref().map(|f| &f.res) {
+            let pl = res.plane_resources();
+            (pl[0].0.clone(), pl[0].1)
+        } else {
+            return Err("--nrd composes with an XeSS or FSR3 session".into());
+        };
+        match &self.nrd_gpu {
+            Some(g) if (g.rw, g.rh) == (rw, rh) => {}
+            Some(g) => {
+                // Unreachable while both arms share --lock-res; refuse rather
+                // than rebuild (the rebuild is the stranding bug).
+                return Err(format!(
+                    "NRD armed at {}x{}, this arm traces {rw}x{rh}",
+                    g.rw, g.rh
+                ));
+            }
+            None => {
+                self.nrd_gpu = Some(nrd_gpu::NrdGpu::new(dev, dir, rw, rh)?);
+                self.nrd_hist_valid = false;
+                self.nrd_prev = None;
+                self.nrd_frame_idx = 0;
+            }
+        }
+        let ng = self.nrd_gpu.as_ref().unwrap();
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        // Set NRD_FEED_SET: the bridge's registers — u16 is the ENGINE's
+        // color plane (cs_nrd_out owns it; the engine feed then runs
+        // guides-only via record_feed_nrd).
+        wire(&[
+            (16, &color_res, color_fmt),
+            (17, ng.plane_in_nr(), DXGI_FORMAT_R10G10B10A2_UNORM),
+            (18, ng.plane_in_viewz(), DXGI_FORMAT_R32_FLOAT),
+            (20, ng.plane_out_spec(), DXGI_FORMAT_R16G16B16A16_FLOAT),
+            (23, ng.plane_in_mv(), DXGI_FORMAT_R16G16B16A16_FLOAT),
+            (24, ng.plane_in_diff(), DXGI_FORMAT_R16G16B16A16_FLOAT),
+            (25, ng.plane_in_spec(), DXGI_FORMAT_R16G16B16A16_FLOAT),
+            (27, ng.plane_out_diff(), DXGI_FORMAT_R16G16B16A16_FLOAT),
+        ])
+    }
+
+    /// The deferred half of the NRD shed (see the `nrd_shed` field comment):
+    /// at a presenter entry nothing new references NrdGpu's objects, one
+    /// wait_idle covers every submitted list that still does, and the drop +
+    /// wiring clear (which releases the bridge planes AND disarms the
+    /// tracers' fsr_sig/gbuf_ext_needed nrd terms, so the pack stops storing
+    /// for a consumer that no longer exists) become safe.
+    fn nrd_shed_cleanup(&mut self) -> Result<()> {
+        if !self.nrd_shed || self.nrd_gpu.is_none() {
+            return Ok(());
+        }
+        self.d3d.wait_idle()?;
+        self.nrd_gpu = None;
+        self.nrd_hist_valid = false;
+        if let Some(tg) = self.trace.as_mut() {
+            tg.clear_nrd_wired();
+        }
+        if let Some(d) = self.dxr.as_mut() {
+            d.clear_nrd_wired();
+        }
+        Ok(())
+    }
+
     /// XeSS-SR fed by the GPU-resident tracer (`--gpu --xess`): trace
     /// (wavefront or reference) -> feed (pack -> input planes, on-GPU — the
     /// CPU upload of the xr.rs path does not exist here) -> XeSS upscale ->
@@ -3489,7 +3779,13 @@ impl GpuContext {
         if self.trace.is_none() || self.xess.is_none() {
             return Err("GPU tracer + XeSS not both initialized".into());
         }
+        self.nrd_shed_cleanup()?;
         let nppd_on = nppd && self.nppd_gpu.is_some();
+        // Armed = this ARM's tracer is wired too — a session whose other arm
+        // armed NRD runs this one plain instead of tripping the shed.
+        let nrd_armed =
+            self.nrd_gpu.is_some() && self.trace.as_ref().is_some_and(|t| t.nrd_armed());
+        let mut nrd_ok = nrd_armed;
         let slot = self.d3d.begin_frame()?;
         // The trace goes through the ONE site, so --dual-gpu reaches this arm
         // without the presenter knowing anything about it.
@@ -3517,10 +3813,48 @@ impl GpuContext {
                 }
                 self.nppd_state_valid = true;
             }
-            if let Err(e) = tg.record_feed(&d3d.list, slot, nppd_on) {
+            if nrd_ok {
+                // The NRD (ReBLUR) pre-upscale denoise: pack → NRD's own
+                // passes → delta-form recompose into the XeSS color plane,
+                // all on the one list (pure compute — no split_frame; the
+                // NPPD slot minus the ORT run). A failure sheds NRD for the
+                // session and the frame continues plain (the normal feed
+                // below overwrites the color plane from accum).
+                let dev = d3d.device.clone();
+                nrd_ok = Self::nrd_frame_step(
+                    &mut self.nrd_gpu,
+                    &mut self.nrd_prev,
+                    &mut self.nrd_frame_idx,
+                    &mut self.nrd_hist_valid,
+                    &dev,
+                    &d3d.list,
+                    slot,
+                    tg.rw,
+                    tg.rh,
+                    fc,
+                    jitter,
+                    reset,
+                    &|| tg.record_nrd_pack(&d3d.list, slot),
+                    &|| tg.record_nrd_out(&d3d.list, slot),
+                );
+            }
+            let feed = if nrd_ok {
+                tg.record_feed_nrd(&d3d.list, slot)
+            } else {
+                tg.record_feed(&d3d.list, slot, nppd_on)
+            };
+            if let Err(e) = feed {
                 d3d.abort_frame();
                 return Err(e);
             }
+        }
+        if nrd_armed && !nrd_ok {
+            // The shed, FLAG-only: in-flight lists (and, on a mid-record
+            // failure, THIS frame's) still reference NrdGpu's heaps/PSOs/
+            // pools — nrd_shed_cleanup drains and frees at the next presenter
+            // entry. Never rebuilt this session (the nppd-gpu shape).
+            self.nrd_shed = true;
+            self.nrd_hist_valid = false;
         }
         if !nppd_on {
             // J-off (or a run failure upstream): the next NPPD frame starts
@@ -3807,6 +4141,7 @@ impl GpuContext {
             return Err("GPU tracer + FSR not both initialized".into());
         }
         debug_assert!(self.ngxrr.is_none());
+        self.nrd_shed_cleanup()?;
         let slot = self.d3d.begin_frame()?;
         {
             let d3d = &mut self.d3d;
@@ -3825,13 +4160,49 @@ impl GpuContext {
             self.d3d.abort_frame();
             return Err(e);
         }
+        let nrd_armed =
+            self.nrd_gpu.is_some() && self.trace.as_ref().is_some_and(|t| t.nrd_armed());
+        let mut nrd_ok = nrd_armed;
         {
             let d3d = &mut self.d3d;
             let tg = self.trace.as_ref().unwrap();
-            if let Err(e) = tg.record_feed(&d3d.list, slot, false) {
+            if nrd_ok {
+                // The NRD pre-upscale denoise — the shared step (fc carries
+                // this presenter's jitter/reset).
+                let dev = d3d.device.clone();
+                nrd_ok = Self::nrd_frame_step(
+                    &mut self.nrd_gpu,
+                    &mut self.nrd_prev,
+                    &mut self.nrd_frame_idx,
+                    &mut self.nrd_hist_valid,
+                    &dev,
+                    &d3d.list,
+                    slot,
+                    tg.rw,
+                    tg.rh,
+                    fc,
+                    fc.jitter,
+                    fc.reset,
+                    &|| tg.record_nrd_pack(&d3d.list, slot),
+                    &|| tg.record_nrd_out(&d3d.list, slot),
+                );
+            }
+            let feed = if nrd_ok {
+                tg.record_feed_nrd(&d3d.list, slot)
+            } else {
+                tg.record_feed(&d3d.list, slot, false)
+            };
+            if let Err(e) = feed {
                 d3d.abort_frame();
                 return Err(e);
             }
+        }
+        if nrd_armed && !nrd_ok {
+            // The shed, FLAG-only (see present_trace_xess's twin comment):
+            // in-flight lists still reference NrdGpu — nrd_shed_cleanup
+            // drains and frees at the next presenter entry.
+            self.nrd_shed = true;
+            self.nrd_hist_valid = false;
         }
         {
             let fs = self.fsr.as_ref().unwrap();

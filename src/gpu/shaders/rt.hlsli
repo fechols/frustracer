@@ -159,7 +159,15 @@ bool trace_closest(float3 o, float3 d, float tmin, float tmax, out HitInfo h) {
     return false;
 }
 
-bool occluded_q(float3 o, float3 d, float tmin, float tmax) {
+// _t flavor: also reports the occluder's t (miss = tmax) for the NRD
+// hit-distance guide (GBufExt.sig.w). ONE body per arm — occluded_q wraps —
+// so the boolean semantics cannot drift from the capture's. KNOWN-ACCEPT:
+// under ACCEPT_FIRST_HIT the committed t is A occluder's t, not provably the
+// nearest (candidate order is hardware-arbitrary) — fine for a denoiser
+// guide, and keeping the query flavor is what keeps arming FLAG_FSR_SIG
+// accum-bit-identical on every scene (the M9b contract).
+bool occluded_q_t(float3 o, float3 d, float tmin, float tmax, out float first_t) {
+    first_t = tmax;
     if (tmax <= tmin) return false;
     RayDesc r;
     r.Origin = o; r.Direction = d; r.TMin = cand_tmin(tmin); r.TMax = height_tmax(tmax);
@@ -178,7 +186,16 @@ bool occluded_q(float3 o, float3 d, float tmin, float tmax) {
         else
             count_height_rej();
     }
-    return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
+    if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
+        first_t = q.CommittedRayT();
+        return true;
+    }
+    return false;
+}
+
+bool occluded_q(float3 o, float3 d, float tmin, float tmax) {
+    float _t;
+    return occluded_q_t(o, d, tmin, tmax, _t);
 }
 
 #else
@@ -203,14 +220,26 @@ bool trace_closest(float3 o, float3 d, float tmin, float tmax, out HitInfo h) {
     return false;
 }
 
-bool occluded_q(float3 o, float3 d, float tmin, float tmax) {
+// _t flavor: see the ALPHA_CUTOUT arm's comment — the capture must not
+// change the query flavor, so the t is whatever ACCEPT_FIRST_HIT committed.
+bool occluded_q_t(float3 o, float3 d, float tmin, float tmax, out float first_t) {
+    first_t = tmax;
     if (tmax <= tmin) return false;
     RayDesc r;
     r.Origin = o; r.Direction = d; r.TMin = tmin; r.TMax = tmax;
     RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
     q.TraceRayInline(tlas, RAY_FLAG_NONE, 0xffu, r);
     q.Proceed();
-    return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
+    if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
+        first_t = q.CommittedRayT();
+        return true;
+    }
+    return false;
+}
+
+bool occluded_q(float3 o, float3 d, float tmin, float tmax) {
+    float _t;
+    return occluded_q_t(o, d, tmin, tmax, _t);
 }
 
 #endif // ALPHA_CUTOUT
@@ -233,7 +262,13 @@ void count_trans_pass() {
 #endif
 }
 
-float3 transmit_q(float3 o, float3 d, float tmin, float tmax) {
+// _t flavor: also reports the nearest CONTRIBUTING t seen — the min over
+// transmissive interfaces multiplied in and the committed opaque hit (miss =
+// tmax) — the NRD hit-distance guide. One body; transmit_q wraps. The min is
+// over the candidates the query VISITED (ACCEPT_FIRST_HIT may end the search
+// early), the same known-accept as occluded_q_t's.
+float3 transmit_q_t(float3 o, float3 d, float tmin, float tmax, out float first_t) {
+    first_t = tmax;
     if (tmax <= tmin) return float3(1.0, 1.0, 1.0);
     RayDesc r;
     r.Origin = o; r.Direction = d; r.TMin = cand_tmin(tmin); r.TMax = height_tmax(tmax);
@@ -258,11 +293,13 @@ float3 transmit_q(float3 o, float3 d, float tmin, float tmax) {
             float4 ms = mat_shadow[uv_tri_mat[tri]];
             if (ms.a > 0.0) {
                 tp *= ms.rgb;
+                first_t = min(first_t, ct);
                 count_trans_pass();
                 if (max(tp.x, max(tp.y, tp.z)) < SHADOW_TP_MIN)
                     return float3(0.0, 0.0, 0.0);
             } else {
                 q.CommitNonOpaqueTriangleHit();
+                first_t = min(first_t, ct);
             }
         }
 #if defined(ALPHA_CUTOUT) || defined(HEIGHTFIELD)
@@ -277,12 +314,22 @@ float3 transmit_q(float3 o, float3 d, float tmin, float tmax) {
         : tp;
 }
 
+float3 transmit_q(float3 o, float3 d, float tmin, float tmax) {
+    float _t;
+    return transmit_q_t(o, d, tmin, tmax, _t);
+}
+
 #else
 
-float3 transmit_q(float3 o, float3 d, float tmin, float tmax) {
-    return occluded_q(o, d, tmin, tmax)
+float3 transmit_q_t(float3 o, float3 d, float tmin, float tmax, out float first_t) {
+    return occluded_q_t(o, d, tmin, tmax, first_t)
         ? float3(0.0, 0.0, 0.0)
         : float3(1.0, 1.0, 1.0);
+}
+
+float3 transmit_q(float3 o, float3 d, float tmin, float tmax) {
+    float _t;
+    return transmit_q_t(o, d, tmin, tmax, _t);
 }
 
 #endif // TRANS_SHADOW

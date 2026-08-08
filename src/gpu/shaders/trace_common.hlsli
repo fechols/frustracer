@@ -1356,6 +1356,10 @@ struct PrimSurf {
     float3 direct_s; // direct specular incl. per-sample Fresnel
     float ao;        // AO open fraction, the `ambient = AMBIENT * ao` factor
     float3 ind_s;    // the reflection bounce's whole contribution to color
+    float ao_t;      // AO sample 0's occluder t (miss = AO_RADIUS, no ray = 0)
+    float shadow_t;  // sun shadow sample 0's occluder t (miss = INF -> CAM_FAR
+                     // at the pack; 0 = no front ray, SIGMA's NoL<=0 rule) —
+                     // the NRD hit-distance capture, sig.w under FLAG_FSR_SIG
 };
 
 // dlss::GBufs re-hosted as one interleaved plane; the feed kernels fan it out
@@ -1573,7 +1577,10 @@ void gbuf_write_hit(uint pi, float fx, float fy, float3 dir, float t, PrimSurf p
         float3 dd = ps.direct_d;
         float3 ds = ps.direct_s / f0_floor;
         float3 is = ps.ind_s / f0_floor;
-        g.sig = uint4(pack_h2(dd.x, dd.y), pack_h2(dd.z, ds.x), pack_h2(ds.y, ds.z), 0u);
+        // .w — the hit-distance guide lanes (NRD): f16x2(ao_t, shadow_t),
+        // the INF-miss clamped to CAM_FAR like spec.w above.
+        g.sig = uint4(pack_h2(dd.x, dd.y), pack_h2(dd.z, ds.x), pack_h2(ds.y, ds.z),
+                      pack_h2(ps.ao_t, isinf(ps.shadow_t) ? CAM_FAR : ps.shadow_t));
         g.sig2 = uint2(pack_h2(ps.ao, is.x), pack_h2(is.y, is.z));
     }
     gbuf_ext[pi] = g;

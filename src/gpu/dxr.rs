@@ -477,6 +477,13 @@ pub struct DxrGpu {
     uav_heap: ID3D12DescriptorHeap,
     /// GPU handle of the RP_SCENE_TEX table (heap slot TEX_HEAP_BASE).
     tex_table: D3D12_GPU_DESCRIPTOR_HANDLE,
+    /// The --nrd bridge kernels (this pipeline's compile of the same
+    /// nrd_bridge.hlsl unit) + the wired-plane keepalives.
+    pub nrd: Option<trace::NrdRes>,
+    nrd_wired: Vec<ID3D12Resource>,
+    /// The wired u16 target — the engine's color plane (rests NPSR; see the
+    /// TraceGpu twin's field comment).
+    nrd_color: Option<ID3D12Resource>,
     /// Upscaler feed kernels (compiled only when `gbuf_full`; every kind so
     /// --check-dxr can rewire between them like --check-gpu does) and the
     /// wired planes record_feed barriers over.
@@ -503,6 +510,7 @@ impl DxrGpu {
         rw: u32,
         rh: u32,
         gbuf_full: bool,
+        nrd: bool,
         debug: bool,
     ) -> Result<Self> {
         require_caps(device)?;
@@ -963,6 +971,49 @@ impl DxrGpu {
             )
         } else {
             (None, None, None)
+        };
+        // --nrd bridge kernels: the same nrd_bridge.hlsl unit at this
+        // pipeline's cs_6_3 floor (conditional abl_defs push — the feed
+        // unit's byte-identity rule above).
+        let nrd_res = if gbuf_full && nrd {
+            let abl = trace::abl_defs();
+            let mut parts: Vec<&str> = Vec::new();
+            if !abl.is_empty() {
+                parts.push(abl.as_str());
+            }
+            parts.extend([
+                sd,
+                trace::TRACE_COMMON_HLSLI,
+                trace::FSR_WIRE_HLSLI,
+                trace::NRD_BRIDGE_HLSL,
+            ]);
+            let nrd_src = parts.join("\n");
+            let mut feed_parts: Vec<&str> = Vec::new();
+            if !abl.is_empty() {
+                feed_parts.push(abl.as_str());
+            }
+            feed_parts.extend([
+                sd,
+                trace::TRACE_COMMON_HLSLI,
+                trace::FSR_WIRE_HLSLI,
+                trace::FEED_HLSL,
+            ]);
+            let feed_src = feed_parts.join("\n");
+            let pso = |src: &str, entry: &str, name: &str| -> Result<ID3D12PipelineState> {
+                trace::compute_pso(
+                    device,
+                    &root_sig,
+                    &dxc.compile(src, entry, "cs_6_3", name, debug)?,
+                    name,
+                )
+            };
+            Some(trace::NrdRes::from_psos(
+                pso(&nrd_src, "cs_nrd_pack", "dxr nrd_pack")?,
+                pso(&nrd_src, "cs_nrd_out", "dxr nrd_out")?,
+                pso(&feed_src, "cs_feed_xess_dm", "dxr nrd_feed_dm")?,
+            ))
+        } else {
+            None
         };
         // --dxr-inline 3: the deferred-shade kernel. cs_6_5 — it fires
         // rt.hlsli's inline RayQuery secondaries, the same SM 6.5 / tier 1.1
@@ -1562,6 +1613,9 @@ impl DxrGpu {
             sbt,
             sbt_hit_records,
             lean,
+            nrd: nrd_res,
+            nrd_wired: Vec::new(),
+            nrd_color: None,
             sbt_mode,
             sbt_distinct_idents,
             sbt_required_idents,
@@ -1635,7 +1689,11 @@ impl DxrGpu {
     /// Whether this frame stores the pack's EXT half. The `TraceGpu`
     /// twin, minus its NPPD term — this pipeline has no NPPD arm.
     pub fn gbuf_ext_needed(&self) -> bool {
+        // `nrd_wired`: cs_nrd_pack reads gbuf_ext full-screen, so --dual-gpu
+        // must carry the EXT band in an NRD session (the TraceGpu twin's
+        // comment has the failure shape).
         self.force_gbuf_ext.get()
+            || !self.nrd_wired.is_empty()
             || self
                 .feed
                 .iter()
@@ -1644,9 +1702,11 @@ impl DxrGpu {
 
     /// Whether this frame stores FSR-RR's demodulated signal lanes. The
     /// `TraceGpu::fsr_sig` twin; `force_fsr_sig` is what lets a secondary
-    /// answer true with an empty feed.
+    /// answer true with an empty feed; `nrd_wired` (never `nrd.is_some()` —
+    /// the trace.rs teeth argument) arms the capture for --nrd sessions.
     pub fn fsr_sig(&self) -> bool {
         self.force_fsr_sig.get()
+            || !self.nrd_wired.is_empty()
             || self.feed.iter().any(|(k, _)| matches!(k, trace::FeedKind::FsrRr))
     }
 
@@ -1784,6 +1844,96 @@ impl DxrGpu {
     ) -> Result<()> {
         self.feed.clear();
         self.wire_feed_add(device, kind, targets)
+    }
+
+    /// The trace.rs wire_nrd_feed twin: point descriptor set NRD_FEED_SET at
+    /// the frame's NRD planes (never a FeedKind — fsr_sig()/record_feed
+    /// semantics cannot be perturbed by wiring it).
+    pub fn wire_nrd_feed(
+        &mut self,
+        device: &ID3D12Device,
+        targets: &[(u32, &ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT)],
+    ) -> Result<()> {
+        self.nrd_wired =
+            trace::wire_feed_targets(device, &self.uav_heap, trace::NRD_FEED_SET, targets)?;
+        // u16 = the engine's color plane (rests NPSR; record_nrd_out's
+        // transition target — the TraceGpu twin's rule).
+        self.nrd_color = targets.iter().find(|t| t.0 == 16).map(|t| t.1.clone());
+        Ok(())
+    }
+
+    /// The TraceGpu twin: un-wire the NRD set (drops keepalives, disarms
+    /// fsr_sig's/gbuf_ext_needed's nrd terms).
+    pub fn clear_nrd_wired(&mut self) {
+        self.nrd_wired.clear();
+        self.nrd_color = None;
+    }
+
+    /// The TraceGpu twin: whether THIS pipeline can run the NRD bridge.
+    pub fn nrd_armed(&self) -> bool {
+        self.nrd.is_some() && !self.nrd_wired.is_empty()
+    }
+
+    /// trace.rs's record_nrd_pack twin (this pipeline's bind_common).
+    pub fn record_nrd_pack(&self, list: &ID3D12GraphicsCommandList, slot: usize) -> Result<()> {
+        let n = self.nrd.as_ref().ok_or("NRD bridge not built")?;
+        let _ev = super::pix::scope(list, c"nrd-pack");
+        unsafe {
+            self.bind_common(list, slot);
+            list.SetDescriptorHeaps(&[Some(self.uav_heap.clone())]);
+            list.SetComputeRootDescriptorTable(
+                trace::RP_TEX,
+                trace::feed_set_handle(&self.device, &self.uav_heap, trace::NRD_FEED_SET),
+            );
+            list.SetPipelineState(&n.pso_pack);
+            list.Dispatch(self.rw.div_ceil(8), self.rh.div_ceil(8), 1);
+        }
+        Ok(())
+    }
+
+    /// trace.rs's record_nrd_out twin (same NPSR↔UA color-plane bracket).
+    pub fn record_nrd_out(&self, list: &ID3D12GraphicsCommandList, slot: usize) -> Result<()> {
+        let n = self.nrd.as_ref().ok_or("NRD bridge not built")?;
+        let color = self.nrd_color.as_ref().ok_or("NRD color plane not wired")?;
+        let _ev = super::pix::scope(list, c"nrd-out");
+        unsafe {
+            let npsr = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            let ua = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            list.ResourceBarrier(&[transition(color, npsr, ua)]);
+            self.bind_common(list, slot);
+            list.SetDescriptorHeaps(&[Some(self.uav_heap.clone())]);
+            list.SetComputeRootDescriptorTable(
+                trace::RP_TEX,
+                trace::feed_set_handle(&self.device, &self.uav_heap, trace::NRD_FEED_SET),
+            );
+            list.SetPipelineState(&n.pso_out);
+            list.Dispatch(self.rw.div_ceil(8), self.rh.div_ceil(8), 1);
+            list.ResourceBarrier(&[transition(color, ua, npsr)]);
+        }
+        Ok(())
+    }
+
+    /// trace.rs's record_feed_nrd twin: guides-only (cs_nrd_out owns color).
+    pub fn record_feed_nrd(&self, list: &ID3D12GraphicsCommandList, slot: usize) -> Result<()> {
+        if self.feed.len() != 1
+            || !matches!(self.feed[0].0, trace::FeedKind::Xess | trace::FeedKind::Fsr3)
+        {
+            return Err("NRD feed composition is XeSS/FSR3-only".into());
+        }
+        let n = self.nrd.as_ref().ok_or("NRD bridge not built")?;
+        let planes = &self.feed[0].1;
+        let feeds = [(&n.pso_feed_dm, 0u32, planes.as_slice())];
+        trace::record_feed_dispatch(
+            list,
+            &self.device,
+            &self.uav_heap,
+            &feeds,
+            None,
+            self.rw,
+            self.rh,
+            &|| unsafe { self.bind_common(list, slot) },
+        );
+        Ok(())
     }
 
     /// APPENDS one engine, claiming the next descriptor set (--quinlight).

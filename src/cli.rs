@@ -91,6 +91,23 @@ pub struct Opts {
     /// NPPD execution provider: None = DirectML then CPU fallback,
     /// Some(-1) = CPU forced, Some(n) = DirectML adapter n forced.
     pub nppd_device: Option<i32>,
+    /// NRD (ReBLUR) pre-upscale denoising — ON BY DEFAULT for the sessions
+    /// that can arm it (GPU tracers × XeSS/FSR3; `--no-nrd` is the kill
+    /// lever, `--nrd` spells the default explicitly). The hand-crafted
+    /// (non-neural) temporal denoiser that cleans the 1-spp signal at render
+    /// res before the TAA-upscaler runs. DLSS-RR / FSR4-RR sessions never
+    /// arm it (they already denoise); a missing NRD.dll sheds loudly to
+    /// plain upscaling. Excl. --nppd (both claim the pre-upscale color
+    /// slot): the EXPLICIT pair exits 2, a merely-defaulted nrd disarms with
+    /// a loud line instead — the fg_explicit pattern (a default must never
+    /// make another flag fatal).
+    pub nrd: bool,
+    /// True only when --nrd was NAMED on the command line — what makes the
+    /// --nppd conflict fatal vs a loud disarm, and what gates the
+    /// "not armed" session notes (a default shouldn't nag DLSS sessions).
+    pub nrd_explicit: bool,
+    /// Directory holding NRD.dll (install-prerequisites.bat nrd builds it).
+    pub nrd_path: String,
     /// Directory holding libxess.dll.
     pub xess_path: String,
     /// Directory holding amd_fidelityfx_loader_dx12.dll + the provider DLLs.
@@ -615,6 +632,7 @@ pub struct Cli {
     pub check_fsr: bool,
     pub check_nppd: bool,
     pub nppd_dump: bool,
+    pub check_nrd: bool,
     pub check_gpu: bool,
     pub check_dxr: bool,
     /// `--no-xess` was passed (distinct from the chain simply never reaching
@@ -691,6 +709,11 @@ pub fn defaults() -> Opts {
             concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\nppd\nppd_small.onnx").to_string()
         }),
         nppd_device: None,
+        nrd: true,
+        nrd_explicit: false,
+        nrd_path: std::env::var("FRUSTRACER_NRD_PATH").unwrap_or_else(|_| {
+            concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\NRD\bin").to_string()
+        }),
         xess_path: std::env::var("FRUSTRACER_XESS_PATH").unwrap_or_else(|_| {
             concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\XeSS-SDK\bin").to_string()
         }),
@@ -831,6 +854,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
     let mut check_fsr = false;
     let mut check_nppd = false;
     let mut nppd_dump = false;
+    let mut check_nrd = false;
     let mut no_xess_explicit = false;
     let mut fsr_forced = false;
     let mut dxr_explicit = false;
@@ -882,6 +906,18 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
             "--nppd-dump" => {
                 check_nppd = true;
                 nppd_dump = true;
+            }
+            "--check-nrd" => check_nrd = true,
+            "--nrd" => {
+                opts.nrd = true;
+                opts.nrd_explicit = true;
+            }
+            "--no-nrd" => opts.nrd = false,
+            "--nrd-path" => {
+                opts.nrd_path = args.next().unwrap_or_else(|| {
+                    eprintln!("--nrd-path needs a directory argument");
+                    std::process::exit(2);
+                })
             }
             "--nppd" => opts.nppd = true,
             "--no-nppd" => opts.nppd = false,
@@ -1916,6 +1952,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
         check_fsr,
         check_nppd,
         nppd_dump,
+        check_nrd,
         check_gpu,
         check_dxr,
         no_xess_explicit,
@@ -2031,6 +2068,16 @@ pub fn usage() {
                 eprintln!("  --nppd-dump   --check-nppd plus before/after PNG dumps");
                 eprintln!("  --nppd-path   ONNX Runtime DLL directory (default: SDKs\\onnxruntime\\bin)");
                 eprintln!("  --nppd-model  exported NPPD .onnx (default: SDKs\\nppd\\nppd_small.onnx)");
+                eprintln!("  --nrd         NRD (ReBLUR) pre-upscale denoising — ON BY DEFAULT for XeSS/FSR3");
+                eprintln!("                sessions (this flag spells the default; --no-nrd is the kill lever).");
+                eprintln!("                The non-neural temporal denoiser cleaning the 1-spp signal at render");
+                eprintln!("                res before the TAA-upscaler runs. GPU tracers only; DLSS-RR/FSR4-RR");
+                eprintln!("                never arm it; excl. --nppd (explicit pair exits 2, defaulted disarms);");
+                eprintln!("                missing SDKs\\NRD\\bin\\NRD.dll sheds loudly — install-prerequisites.bat");
+                eprintln!("                nrd builds it");
+                eprintln!("  --no-nrd      kill lever: plain (undenoised) XeSS/FSR3 — the pre-NRD baseline");
+                eprintln!("  --nrd-path    NRD.dll directory (default: SDKs\\NRD\\bin)");
+                eprintln!("  --check-nrd   headless: NRD math gates (DLL-free) + instance/dispatch contract (DLL)");
                 eprintln!("  --nppd-device NPPD execution provider: auto|cpu|dml|dml:<n> (default auto = DML then CPU)");
                 eprintln!("  --check-xess  headless: XeSS dynamic-res contract self-test (no GPU or DLL needed)");
                 eprintln!("  --xess-dump   --check-xess plus G-buffer PNG dumps");

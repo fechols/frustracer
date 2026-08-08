@@ -1390,6 +1390,119 @@ cargo run --release -- --nppd         # NPPD neural denoising (J toggles; mutual
                                       # libxess.dll is missing)
 cargo run --release -- --xess --nppd  # same session spelled explicitly; J toggles the pre-upscale slot
                                       # (takes the slot OIDN's N-cycle pre placement uses)
+cargo run --release -- --gpu --xess --nrd  # NRD (ReBLUR) pre-upscale denoising — the HAND-CRAFTED
+                                      # (non-neural) temporal ray reconstruction that makes the
+                                      # TAA-upscalers peers of the RR engines (the quinlight
+                                      # "pre-denoise their SHARED input" follow-on, built).
+                                      # ON BY DEFAULT wherever it can arm (GPU tracers ×
+                                      # XeSS/FSR3): --nrd spells the default, --no-nrd is the
+                                      # kill lever (= the pre-NRD plain baseline), and
+                                      # Opts::nrd_explicit is the fg_explicit pattern — the
+                                      # DEFAULTED nrd under --nppd disarms with a loud line
+                                      # while the EXPLICIT pair exits 2 (a default must never
+                                      # make another flag fatal), and the "not armed" session
+                                      # notes fire only for the explicit flag (the default
+                                      # must not nag DLSS sessions). A missing NRD.dll sheds
+                                      # loudly per session with the install hint.
+                                      # NVIDIA's NRD v4.17.3, PINNED in three places that must
+                                      # move together: install-prerequisites.bat's NRD_TAG (the
+                                      # `nrd` component CMake-builds the SDK locally — NVIDIA
+                                      # ships no prebuilt binaries and the RTX-SDKs license
+                                      # forbids committing source, so SDKs\NRD\bin\NRD.dll is
+                                      # gitignored + LoadLibrary'd at runtime, the xess.rs
+                                      # footprint; the ONE component needing CMake+VS, loud
+                                      # preflight, informational skip on a default `all` run),
+                                      # src/nrd.rs (repr(C) transcription against MSVC-sizer
+                                      # ground truth + the Nrd::new GetLibraryDesc gate: version
+                                      # 4.17 AND normalEncoding 2 AND roughnessEncoding 1, else
+                                      # loud shed), and nrd_bridge.hlsl's reimplemented packing
+                                      # math (YCoCg, the enc-2 L1-oct normal, normHitDist —
+                                      # NEVER paste the licensed NRD.hlsli; nrd::oracle's CPU
+                                      # twins + the N0/N2 gates keep the three in lockstep).
+                                      # GPU tracers only (wavefront AND DXR), XeSS or FSR3
+                                      # sessions (RR/FSR4-RR already denoise; --nppd excluded —
+                                      # both claim the pre-upscale color slot, exit 2; quinlight
+                                      # excluded). ONE denoiser, TWO EXACT-LINEAR FOLDS into
+                                      # REBLUR_DIFFUSE_SPECULAR: diffuse = dd + ao·sh_irr(n)
+                                      # (shared kd factor), specular = ds + is (shared un-floored
+                                      # wire F0 — the pack's own demodulation divisors), so the
+                                      # DELTA-form recompose color' = accum + (D'−D)·kd +
+                                      # (S'−S)·f0 is exact, the residual is untouched by
+                                      # construction, and a PASSTHROUGH denoiser reproduces
+                                      # cs_feed_xess's color plane BYTE-identically (the N3
+                                      # control arm). Hit-dist guides ride the pack's ex-free
+                                      # sig.w lane (f16x2(ao_t, shadow_t), FLAG_FSR_SIG,
+                                      # captured by transmit_q_t twins in rt.hlsli —
+                                      # assignment-only off the EXISTING queries, zero rng, M9b
+                                      # accum-bit-identity preserved; rt_sw/--dxr-inline-0 arms
+                                      # report tmax = no capture, documented known-accepts —
+                                      # ReBLUR's AREA_3X3 hit-dist reconstruction covers them;
+                                      # shadow_t = SIGMA_SHADOW's NoL<=0-is-0 convention,
+                                      # captured now for the Phase-2 sun-shadow denoiser).
+                                      # Bridge kernels (nrd_bridge.hlsl, cs_6_3-clean, both
+                                      # pipelines) ride descriptor set NRD_FEED_SET=3
+                                      # (FEED_SETS 3→4, heap arithmetic only, root sig stays
+                                      # 64/64); NRD's own ~14 pipelines/31 dispatches run from
+                                      # NrdGpu's private heap (gpu/nrd_gpu.rs — the bloom
+                                      # pattern at the DXC tier; CommonSettings matrices are
+                                      # glam col-major VERBATIM, no transpose — the anti-SL
+                                      # convention, proven by N4's 8× temporal-delta shrink);
+                                      # all on the ONE list, no split_frame; the engine feed
+                                      # runs guides-only (record_feed_nrd); cs_nrd_out brackets
+                                      # the engine color plane NPSR↔UA itself (the plane RESTS
+                                      # in NON_PIXEL_SHADER_RESOURCE — the upscaler-eval
+                                      # contract; gate stand-ins must rest NPSR too), and its
+                                      # sky pass-through predicate is 0.999·CAM_FAR — the EXACT
+                                      # denoisingRange bound (a plain-CAM_FAR predicate shipped
+                                      # once and recomposed the [0.999·far, far) hit band from
+                                      # OUT texels NRD never wrote). fsr_sig() AND
+                                      # gbuf_ext_needed() arm on nrd_WIRED (never PSO presence
+                                      # — M9b's baseline teeth; the ext term is what carries
+                                      # GBufExt across the dual-gpu band for the full-screen
+                                      # bridge reads), so dual-gpu works by construction (the
+                                      # per-frame force mirrors + fed_planes cover every bridge
+                                      # input). ONE NrdGpu per session, shared by both GPU arms
+                                      # via gpu::arm_nrd_for (both trace at the locked res;
+                                      # a second instance would strand the memoized arm's
+                                      # NRD_FEED_SET descriptors on dropped pools). Reset =
+                                      # the presenters' gpu_reset → AccumulationMode::RESTART
+                                      # (never camera motion); any frame error sheds NRD for
+                                      # the session, loudly, frame continues plain — the shed
+                                      # is TWO-PHASE (flag now, wait_idle-then-drop at the next
+                                      # presenter entry + clear_nrd_wired on both tracers):
+                                      # D3D12 lists don't refcount, so an immediate drop frees
+                                      # heaps/PSOs/pools that in-flight lists still reference
+                                      # (device removal), and the wiring clear is what releases
+                                      # the bridge planes and disarms the pack's sig stores
+                                      # after the shed. MEASURED
+                                      # (4090, procedural still, native 1080p): FRUSTRACER_STAB
+                                      # XeSS-alone 0.42/255 → NRD 0.07–0.10 (BELOW DLSS-RR's
+                                      # ~0.12 reference); AMD iGPU FSR3 0.38 → 0.19 still
+                                      # ramping (vendor neutrality live); DXR+XeSS → 0.10.
+                                      # COST: nrd-pack 0.27 + nrd 0.63 + nrd-out 0.28 =
+                                      # ~1.18 ms native 1080p (~0.5 ms at the default 2/3
+                                      # scale); the two bridge halves are bandwidth passes that
+                                      # rival ReBLUR itself — folding pack into the feed family
+                                      # is the documented follow-on. Gates: --check-nrd (N0
+                                      # DLL-free math twins + N1 instance/dispatch contract,
+                                      # absent-DLL = loud skip exit 0); --check-gpu N2
+                                      # (pack-vs-oracle, 0 bad px), N3 (passthrough byte-equal),
+                                      # N4 (real ReBLUR: Laplacian −70%, energy +0.6%, temporal
+                                      # 8× shrink, RESTART departs — N4 RESTORES frame B's
+                                      # buffers after, the M10-independence lesson), N5 (sig.w
+                                      # sky-0/ranges/must-fires, both suites; each must-fire
+                                      # guards on its own no-capture lever — check-dxr on
+                                      # dxr_inline_mode()!=0, check-gpu on !--sw-rays, since
+                                      # the rt_sw/rt_dxr twins report tmax by design and
+                                      # ao_occluded is structurally 0 there). Touch nrd.rs /
+                                      # nrd_gpu.rs / nrd_bridge.hlsl / the transmit_q_t twins /
+                                      # the sig.w pack lane / record_*_nrd / the four presenter
+                                      # branches → run --check, --check-nrd, --check-gpu,
+                                      # --check-dxr, --check-fsr, then the STAB smoke on a still
+                                      # XeSS view (the 0.42-baseline table above)
+cargo run --release -- --gpu --fsr3 --nrd  # the same denoiser under the FSR 3.1 chain (and
+                                      # --dxr --xess/--fsr3 --nrd for the DXR pipeline — all
+                                      # four chain combinations share one nrd_frame_step)
 cargo run --release -- --no-temporal  # A/B lever: disable ALL previous-frame quadtree reuse (no
                                       # temporal cache, no claim ring, no query skip, no structure
                                       # replay) — every frame proves its empty space from scratch
