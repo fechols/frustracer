@@ -7179,7 +7179,15 @@ impl TraceGpu {
             self.split.set(TileSplit::ALL);
             return false;
         }
-        self.split_refused.set(false);
+        // Clear on a NON-TRIVIAL accept only. `TileSplit::ALL` is depth 0 and
+        // passes every test above, and the both-or-neither degrade arm calls
+        // it on BOTH devices on every refused frame — so an unguarded clear
+        // re-arms the announce each frame, and a session refusing every frame
+        // (`--waveviz --dual-gpu`) prints two lines per frame instead of two
+        // lines per episode. The `DxrGpu::set_band` twin.
+        if split.depth != 0 {
+            self.split_refused.set(false);
+        }
         self.split.set(split);
         true
     }

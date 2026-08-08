@@ -1285,9 +1285,13 @@ fn run_check_dxr(
         };
         render::render_frame(&ctx, false);
     };
-    let gpu_frame = |hg: &mut gpu::trace::HeadlessGpu,
-                     dg: &gpu::dxr::DxrGpu,
-                     frame: u32|
+    // The band gate needs a frame at a DIFFERENT pose (see its own comment on
+    // why an accumulated second frame cannot dirty `tbuf`), so the basis is a
+    // parameter here and `gpu_frame` below pins it to the suite's own.
+    let gpu_frame_at = |hg: &mut gpu::trace::HeadlessGpu,
+                        dg: &gpu::dxr::DxrGpu,
+                        frame: u32,
+                        basis: crate::camera::CamBasis|
      -> Result<(), String> {
         dg.write_cb(
             0,
@@ -1313,6 +1317,10 @@ fn run_check_dxr(
         hg.run(|l| rec = dg.record_frame(l, 0))?;
         rec
     };
+    let gpu_frame = |hg: &mut gpu::trace::HeadlessGpu,
+                     dg: &gpu::dxr::DxrGpu,
+                     frame: u32|
+     -> Result<(), String> { gpu_frame_at(hg, dg, frame, basis) };
 
     // T1: one unjittered DispatchRays frame vs the CPU reference — primary
     // visibility (t + hit/sky classification), plus the must-fire halves.
@@ -2611,61 +2619,224 @@ fn run_check_dxr(
     // DIRTIED with an accumulated second frame first: a band must then restore
     // its own rows exactly AND leave the dirty rows untouched, which is
     // sensitive in both directions.
+    //
+    // TWO EXTENSIONS BEYOND THE ORIGINAL MIDPOINT PASS, both of which the
+    // shipping feature depends on and neither of which it proved:
+    //
+    //   * THE SPLIT POSITIONS COME FROM `TileSplit::for_share`, at every depth
+    //     and every share — the geometry the balancer can actually ask for —
+    //     and each pair must PARTITION the frame. Plus the mixed-mode
+    //     cross-check nothing else makes: per pixel, the wavefront's tile mask
+    //     and the DXR row band must agree about ownership, or a DXR primary
+    //     paired with a wavefront secondary seams exactly at the join.
+    //   * THE DIRTY PASS IS A DIFFERENT POSE, not just an accumulated second
+    //     frame. Accumulating dirties `accum` and nothing else: `tbuf[pi] = t`
+    //     OVERWRITES, and at the same camera the same t comes back, so a
+    //     `tbuf` outside-band column built on it would read 0 whether or not
+    //     the dispatch overreached — a column that proves nothing in both
+    //     directions. A dolly makes it a real second image.
     {
         let n = gw * gh * 3;
-        let rd = |hg: &mut gpu::trace::HeadlessGpu| -> Result<Vec<f32>, String> {
+        let rda = |hg: &mut gpu::trace::HeadlessGpu| -> Result<Vec<f32>, String> {
             read_f32(hg, &dg.accum, n)
         };
+        let rdt = |hg: &mut gpu::trace::HeadlessGpu| -> Result<Vec<f32>, String> {
+            read_f32(hg, &dg.tbuf, gw * gh)
+        };
+        // A YAW, not the T4 dolly. A dolly leaves distant SKY bit-identical
+        // (its ray directions barely move and its radiance is at infinity), so
+        // 83 of this scene's 600 rows came back unchanged and an over-wide
+        // dispatch into them would have been invisible. Rotating changes
+        // `ray_dir` for every pixel including sky, which is what the
+        // outside-band column needs in EVERY row.
+        let cam_d = {
+            let mut c = cam0;
+            c.yaw += 0.08;
+            c
+        };
+        let basis_d = cam_d.basis(gw, gh);
         let band = (|| -> Result<(), String> {
             gpu_frame(&mut hg, &dg, 0)?;
-            let refr = rd(&mut hg)?;
-            gpu_frame(&mut hg, &dg, 1)?; // accumulate — dirties every row
-            let dirty = rd(&mut hg)?;
-            let mid = (gh / 2) as u32;
-            let mut bad = (0usize, 0usize);
-            for (y0, y1) in [(0u32, mid), (mid, gh as u32)] {
-                if !dg.set_band(y0, y1) {
-                    // The tracer declined the band and is rendering the whole
-                    // screen — scoring THAT as a band is a gate failing on a
-                    // lever rather than on a defect (`--waveviz` is the one
-                    // that reaches here). Stand down loudly instead.
-                    eprintln!(
-                        "check-dxr: dual-gpu band skipped — the tracer refused a band in this \
-                         configuration (see the line above)"
-                    );
-                    return Ok(());
-                }
-                gpu_frame(&mut hg, &dg, 0)?;
-                let got = rd(&mut hg)?;
-                for y in 0..gh {
-                    let inside = y as u32 >= y0 && (y as u32) < y1;
-                    for i in y * gw * 3..(y + 1) * gw * 3 {
-                        let want = if inside { refr[i] } else { dirty[i] };
-                        if got[i].to_bits() != want.to_bits() {
-                            if inside {
-                                bad.0 += 1;
-                            } else {
-                                bad.1 += 1;
+            let (ref_a, ref_t) = (rda(&mut hg)?, rdt(&mut hg)?);
+            gpu_frame_at(&mut hg, &dg, 0, basis_d)?; // a DIFFERENT image
+            let (dirty_a, dirty_t) = (rda(&mut hg)?, rdt(&mut hg)?);
+
+            // ANTI-VACUITY, printed: unless the dirty pass really moved the
+            // planes, the outside-band column below cannot see an over-wide
+            // dispatch and the whole family is decoration.
+            //
+            // THE MEASURE IS PER ROW, not a whole-frame percentage. An
+            // over-wide dispatch is only visible in a row the dirty pass
+            // actually moved, so what has to hold is that EVERY row carries
+            // some signal — and a global fraction hides the one row that does
+            // not. (A dolly leaves distant sky bit-identical, so this scene's
+            // whole-frame figure is ~53% while every row still has teeth.)
+            let da = (0..n).filter(|&i| ref_a[i].to_bits() != dirty_a[i].to_bits()).count();
+            let blind = (0..gh)
+                .filter(|&y| {
+                    (y * gw..(y + 1) * gw).all(|i| ref_t[i].to_bits() == dirty_t[i].to_bits())
+                        && (y * gw * 3..(y + 1) * gw * 3)
+                            .all(|i| ref_a[i].to_bits() == dirty_a[i].to_bits())
+                })
+                .count();
+            let pa = 100.0 * da as f64 / n as f64;
+            eprintln!(
+                "check-dxr: dual-gpu band sweep ({gw}x{gh}, dirty = +0.08 rad yaw): \
+                 dirty-vs-ref differs on {da}/{n} accum channels ({pa:.1}%), and {} of {gh} rows \
+                 carry signal — the outside-band column has teeth",
+                gh - blind
+            );
+            if blind > 0 {
+                return Err(format!(
+                    "{blind} of {gh} rows came back bit-identical under the dirty pose — an \
+                     over-wide dispatch into those rows would be invisible to the outside-band \
+                     column"
+                ));
+            }
+
+            // `info` under DXR is `pack_info(0, KIND_LEAF)` at every launched
+            // index — a CONSTANT plane, so a band column on it would pass while
+            // proving nothing either way. Probe and say so rather than score it;
+            // a future change that gives it a payload flips this on.
+            let inf = hg.read_buffer(&dg.info, ua, gw * gh * 4)?;
+            let distinct =
+                inf.chunks_exact(4).collect::<std::collections::HashSet<_>>().len();
+            if distinct <= 1 {
+                eprintln!(
+                    "check-dxr: dual-gpu band: `info` is CONSTANT under DXR ({distinct} distinct \
+                     value(s) over {} px) — it carries no ownership and is not scored",
+                    gw * gh
+                );
+            }
+
+            let mut rows = 0usize;
+            for depth in 1..=gpu::trace::MAX_SPLIT_DEPTH {
+                let side = 1u32 << depth;
+                for share in 1..side {
+                    let (prim, sec) = gpu::trace::TileSplit::for_share(share, depth);
+                    let sec = sec.expect("share >= 1 yields a secondary");
+                    let (Some((p0, p1)), Some((b0, b1))) = (
+                        prim.row_range(gw as u32, gh as u32),
+                        sec.row_range(gw as u32, gh as u32),
+                    ) else {
+                        eprintln!(
+                            "check-dxr: (skip) dual-gpu band d{depth} s{share}/{side} — \
+                             for_share is not a row band at {gw}x{gh}"
+                        );
+                        continue;
+                    };
+                    // THE PARTITION PROOF, integer and exact — the DXR
+                    // replacement for the wavefront family's info-sentinel
+                    // holes/dupes accounting, and checkable before a ray flies.
+                    if p0 != 0 || p1 != b0 || b1 != gh as u32 {
+                        return Err(format!(
+                            "d{depth} s{share}/{side}: A [{p0},{p1}) and B [{b0},{b1}) do not \
+                             tile [0,{gh}) exactly"
+                        ));
+                    }
+                    if p1 == p0 || b1 == b0 {
+                        return Err(format!(
+                            "d{depth} s{share}/{side} left a device with no rows — the \
+                             partition proof is vacuous"
+                        ));
+                    }
+                    // ...and the mixed-mode agreement: the wavefront's per-pixel
+                    // mask must be the same partition as this row band.
+                    let mut md = 0u64;
+                    for y in 0..gh as u32 {
+                        for x in 0..gw as u32 {
+                            if sec.owns_px(x, y, gw as u32, gh as u32) != (y >= b0 && y < b1) {
+                                md += 1;
                             }
                         }
                     }
+                    if md != 0 {
+                        return Err(format!(
+                            "d{depth} s{share}/{side}: {md} px where the wavefront tile mask and \
+                             the DXR row band [{b0},{b1}) disagree about ownership — mixed mode \
+                             would seam there"
+                        ));
+                    }
+
+                    let mut bad = (0usize, 0usize, 0usize, 0usize);
+                    for (y0, y1) in [(p0, p1), (b0, b1)] {
+                        if !dg.set_band(y0, y1) {
+                            // The tracer declined and is rendering the whole
+                            // screen — scoring THAT as a band is a gate failing
+                            // on a lever rather than a defect (`--waveviz`).
+                            eprintln!(
+                                "check-dxr: dual-gpu band skipped — the tracer refused a band in \
+                                 this configuration (see the line above)"
+                            );
+                            return Ok(());
+                        }
+                        // The dispatch really shrank, and to the band asked for:
+                        // `set_band` answering true is a weaker claim than the
+                        // value DISPATCH_RAYS_DESC's height is derived from.
+                        if dg.band() != (y0, y1) {
+                            return Err(format!(
+                                "set_band applied but the tracer reports band {:?}, not \
+                                 ({y0}, {y1}) — the dispatch grid is not the band it was asked for",
+                                dg.band()
+                            ));
+                        }
+                        if y1 - y0 >= gh as u32 {
+                            return Err(format!(
+                                "d{depth} s{share}/{side}: band [{y0},{y1}) spans the whole \
+                                 {gh}-row frame — a full-screen dispatch cannot prove a sub-rect"
+                            ));
+                        }
+                        gpu_frame(&mut hg, &dg, 0)?;
+                        let (ga, gt) = (rda(&mut hg)?, rdt(&mut hg)?);
+                        for y in 0..gh {
+                            let inside = y as u32 >= y0 && (y as u32) < y1;
+                            for i in y * gw * 3..(y + 1) * gw * 3 {
+                                let want = if inside { ref_a[i] } else { dirty_a[i] };
+                                if ga[i].to_bits() != want.to_bits() {
+                                    if inside {
+                                        bad.0 += 1;
+                                    } else {
+                                        bad.1 += 1;
+                                    }
+                                }
+                            }
+                            for i in y * gw..(y + 1) * gw {
+                                let want = if inside { ref_t[i] } else { dirty_t[i] };
+                                if gt[i].to_bits() != want.to_bits() {
+                                    if inside {
+                                        bad.2 += 1;
+                                    } else {
+                                        bad.3 += 1;
+                                    }
+                                }
+                            }
+                        }
+                        // Restore the dirty state for the next band, so each
+                        // starts from the same place rather than the previous
+                        // band's output. The whole screen cannot be refused.
+                        let _ = dg.set_band(0, gh as u32);
+                        gpu_frame_at(&mut hg, &dg, 0, basis_d)?;
+                    }
+                    rows += 1;
+                    eprintln!(
+                        "check-dxr: dual-gpu band d{depth} s{share}/{side} (A y {p0}..{p1} | \
+                         B y {b0}..{b1}): in-band diff accum {} tbuf {} | outside-band touched \
+                         accum {} tbuf {} | mask-vs-band disagree {md}",
+                        bad.0, bad.2, bad.1, bad.3
+                    );
+                    if bad != (0, 0, 0, 0) {
+                        return Err(format!(
+                            "d{depth} s{share}/{side}: a band must reproduce those rows EXACTLY \
+                             (accum {} tbuf {} differ) and touch nothing else (accum {} tbuf {} \
+                             outside)",
+                            bad.0, bad.2, bad.1, bad.3
+                        ));
+                    }
                 }
-                // Restore before the next pass, so each band starts from the
-                // same dirty state rather than the previous band's output.
-                // The whole screen is the one request that cannot be refused.
-                let _ = dg.set_band(0, gh as u32);
-                gpu_frame(&mut hg, &dg, 0)?;
-                gpu_frame(&mut hg, &dg, 1)?;
             }
-            eprintln!(
-                "check-dxr: dual-gpu band ({}x{}, split at y={mid}): in-band diff {} | outside-band touched {}",
-                gw, gh, bad.0, bad.1
-            );
-            if bad != (0, 0) {
+            if rows == 0 {
                 return Err(format!(
-                    "a band must reproduce those rows EXACTLY ({} differ) and touch nothing \
-                     else ({} outside rows written)",
-                    bad.0, bad.1
+                    "no complementary pair was a row band at {gw}x{gh} — the sweep proved nothing"
                 ));
             }
             Ok(())
@@ -2674,6 +2845,332 @@ fn run_check_dxr(
         if let Err(e) = band {
             eprintln!("check-dxr: FAIL dual-gpu band: {e}");
             ok = false;
+        }
+    }
+
+    // --- Dual-GPU: the TWO-DEVICE gate, DXR primary -------------------------
+    // The band sweep above proves a banded dispatch reproduces its rows on ONE
+    // device. This proves the other half of the feature: that a SECOND physical
+    // adapter's rows arrive, over PCIe, in the right place.
+    //
+    // TWO ARMS, because the shipping policy can produce either. DXR+DXR needs
+    // RT tier 1.0 on the secondary; DXR+WAVEFRONT needs nothing extra and is
+    // what `dual::arm_for` actually picks on this box (an Intel secondary goes
+    // to the wavefront), so it is the arm most sessions run and the one a
+    // gate that only did the homogeneous case would never touch.
+    //
+    // IT IS SHAPED TO CATCH AN ABSENT COPY, which is the hole the wavefront
+    // two-device family documents in itself (main.rs: "sensitive to a MISPLACED
+    // copy, not to an absent one"). Rendering A's reference immediately before
+    // the split leaves A's out-of-band rows already correct, so a transfer that
+    // never happened still compares clean. Here A's plane is deliberately
+    // DIRTIED with a different pose first, and the gate reads it TWICE: `PRE`,
+    // after A has restored only its own rows, must be visibly WRONG — that is
+    // the teeth, asserted, not assumed — and `TRANSFERRED`, after B's band has
+    // crossed, must be right. An absent copy leaves the second reading equal to
+    // the first and fails by the width of the whole band.
+    //
+    // Skips, never fails, on a one-adapter box: exit 2 is ENVIRONMENT and exit 1
+    // is a gate that ran and disagreed. A secondary that cannot host a tracer is
+    // environment too — it is exactly the condition under which the shipping
+    // feature degrades to single-GPU.
+    {
+        const TWO_DEV_MAX_TRIS: usize = 12_000_000;
+        let tris = scene.indices.len() / 3;
+        let pick = if tris > TWO_DEV_MAX_TRIS {
+            eprintln!(
+                "check-dxr: (skip) dual-gpu two-device gate — {tris} tris is over the \
+                 {TWO_DEV_MAX_TRIS} bar; a second upload AND BLAS build buys no coverage the \
+                 check scene does not already give"
+            );
+            None
+        } else {
+            match gpu::adapter::create_factory(opts.gpu_debug) {
+                Err(e) => {
+                    eprintln!("check-dxr: (skip) dual-gpu second device — factory: {e}");
+                    None
+                }
+                Ok(f) => {
+                    let prim = gpu::adapter::luid_of_device(&hg.device);
+                    gpu::adapter::enumerate(&f)
+                        .into_iter()
+                        .filter(|a| a.luid != prim)
+                        .reduce(|a, b| if b.vram > a.vram { b } else { a })
+                }
+            }
+        };
+        let px = gw * gh;
+        let full = gpu::trace::depth_full(gw as u32, gh as u32);
+        let max_d = gpu::trace::MAX_SPLIT_DEPTH.min(full.saturating_sub(1)).min(2);
+        match pick {
+            None => eprintln!(
+                "check-dxr: (skip) dual-gpu two-device gate — no second hardware adapter on \
+                 this box"
+            ),
+            Some(_) if max_d < 1 => eprintln!(
+                "check-dxr: (skip) dual-gpu two-device — depth_full {full} at {gw}x{gh} leaves \
+                 no internal tile to own"
+            ),
+            Some(p) => {
+                let cam_d = {
+                    let mut c = cam0;
+                    c.yaw += 0.08;
+                    c
+                };
+                let basis_d = cam_d.basis(gw, gh);
+                let mk = |b: crate::camera::CamBasis| gpu::trace::FrameParams {
+                    sway_prev_time: None,
+                    cam: b,
+                    frame: 0,
+                    accumulate: true,
+                    jitter: false,
+                    frame_jitter: None,
+                    prev_cam: None,
+                    q,
+                    verify: false,
+                    spp: 1,
+                    probe_sample: 0,
+                    clouds: crate::clouds::Clouds::check(scene.diag),
+                    fireflies: crate::fireflies::Fireflies::check(scene),
+                    sway_time: check_sway,
+                    replay: false,
+                };
+                for arm in [gpu::dual::Arm::Dxr, gpu::dual::Arm::Wave] {
+                    let two = (|| -> Result<(), String> {
+                        let mut h2 = gpu::trace::HeadlessGpu::from_pick(&p, opts.gpu_debug)?;
+                        let d2 = h2.device.clone();
+                        if arm == gpu::dual::Arm::Dxr {
+                            gpu::dxr::require_caps(&d2).map_err(|e| format!("no DXR: {e}"))?;
+                        }
+                        let c2 = std::rc::Rc::new(gpu::trace::SceneGpu::new_uploaded(
+                            &d2, scene, bvh, &mut h2, opts.bc7,
+                        )?);
+                        let sec = match arm {
+                            gpu::dual::Arm::Wave => {
+                                gpu::dual::Secondary::Wave(gpu::trace::TraceGpu::new(
+                                    &d2,
+                                    &dxc,
+                                    scene,
+                                    bvh,
+                                    c2,
+                                    gw as u32,
+                                    gh as u32,
+                                    false,
+                                    false,
+                                    opts.gpu_debug,
+                                    &mut h2,
+                                )?)
+                            }
+                            gpu::dual::Arm::Dxr => {
+                                gpu::dual::Secondary::Dxr(gpu::dxr::DxrGpu::new(
+                                    &d2,
+                                    &dxc,
+                                    scene,
+                                    c2,
+                                    gw as u32,
+                                    gh as u32,
+                                    false,
+                                    opts.gpu_debug,
+                                )?)
+                            }
+                        };
+                        // Full-screen staging: the contract the shipping
+                        // balancer needs (a rebalance must not reallocate), so
+                        // the gate holds itself to it too.
+                        let xf = gpu::dual::BandTransfer::new(
+                            &d2,
+                            &hg.device,
+                            gpu::dual::payload_bytes(&[12], gw as u32, gh as u32),
+                        )?;
+                        // Cross-VENDOR or cross-PIPELINE both mean two
+                        // intersectors on one HLSL source, whose ulps a grazing
+                        // occlusion bit turns into whole-pixel colour. Structure
+                        // stays exact on every pairing; only radiance relaxes.
+                        let cross = h2.vendor != hg.vendor;
+                        let mixed = arm != gpu::dual::Arm::Dxr;
+                        let stat = cross || mixed;
+                        let (xlim, hot_lim) =
+                            if stat { (1e-3f64, px * 3 * 5 / 10_000) } else { (0.0, 0) };
+                        eprintln!(
+                            "check-dxr: dual-gpu two-device gate [{}]: A \"{}\" (DXR) | B \"{}\" \
+                             ({}) — {}",
+                            if mixed { "mixed pipeline" } else { "DXR+DXR" },
+                            hg.adapter_name,
+                            h2.adapter_name,
+                            arm.name(),
+                            match (mixed, cross) {
+                                (false, false) => "same vendor, same pipeline: bit-exact",
+                                (false, true) =>
+                                    "cross-vendor: structure exact, radiance statistical",
+                                _ => "mixed pipeline: two intersectors, structure exact, \
+                                      radiance statistical",
+                            }
+                        );
+                        let rda = |h: &mut gpu::trace::HeadlessGpu| -> Result<Vec<f32>, String> {
+                            let b = h.read_buffer(&dg.accum, ua, px * 3 * 4)?;
+                            Ok(b.chunks_exact(4)
+                                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                                .collect())
+                        };
+                        // A's unsplit reference — what the merge must reproduce.
+                        let _ = dg.set_band(0, gh as u32);
+                        gpu_frame_at(&mut hg, &dg, 0, basis)?;
+                        let refr = rda(&mut hg)?;
+                        let mean_ref =
+                            refr.iter().map(|v| v.abs() as f64).sum::<f64>() / refr.len() as f64;
+                        // Scoped to a ROW RANGE, because the two readings ask
+                        // different questions. `TRANSFERRED` is whole-frame —
+                        // the merge must be right everywhere. `PRE` is the
+                        // BAND ONLY: it asks whether the region the transfer is
+                        // responsible for is visibly wrong beforehand, and a
+                        // whole-frame mean would dilute that by the share (a
+                        // 1/8 band's dirt reads 8x smaller), making the teeth a
+                        // function of the split rather than of the dirt.
+                        let cmp = |got: &[f32], y0: u32, y1: u32| -> (f64, usize) {
+                            let (mut sd, mut sr, mut hot) = (0f64, 0f64, 0usize);
+                            for i in (y0 as usize * gw * 3)..(y1 as usize * gw * 3) {
+                                let d = (got[i] - refr[i]).abs() as f64;
+                                sd += d;
+                                sr += refr[i].abs() as f64;
+                                hot += (d > 1e-2) as usize;
+                            }
+                            (if sr > 0.0 { sd / sr } else { 0.0 }, hot)
+                        };
+                        if mean_ref <= 0.0 {
+                            return Err("the reference frame is uniformly zero — every \
+                                        comparison below would be vacuous"
+                                .into());
+                        }
+                        for depth in 1..=max_d {
+                            let side = 1u32 << depth;
+                            for share in 1..side {
+                                let (pr, sc) = gpu::trace::TileSplit::for_share(share, depth);
+                                let sc = sc.expect("share >= 1 yields a secondary");
+                                let (Some((p0, p1)), Some((b0, b1))) = (
+                                    pr.row_range(gw as u32, gh as u32),
+                                    sc.row_range(gw as u32, gh as u32),
+                                ) else {
+                                    continue;
+                                };
+                                // Structure, exact on every pairing: the pair
+                                // must tile the frame with no hole and no
+                                // overlap, and neither device may get nothing.
+                                if p0 != 0 || p1 != b0 || b1 != gh as u32 {
+                                    return Err(format!(
+                                        "d{depth} s{share}/{side}: A [{p0},{p1}) and B \
+                                         [{b0},{b1}) do not tile [0,{gh}) exactly"
+                                    ));
+                                }
+                                if p1 == p0 || b1 == b0 {
+                                    return Err(format!(
+                                        "d{depth} s{share}/{side} left a device with no rows"
+                                    ));
+                                }
+                                // DIRTY A's whole plane with a different image,
+                                // then let A restore ONLY its own rows.
+                                let _ = dg.set_band(0, gh as u32);
+                                gpu_frame_at(&mut hg, &dg, 0, basis_d)?;
+                                if !dg.set_band(p0, p1) {
+                                    eprintln!(
+                                        "check-dxr: (skip) dual-gpu two-device — the tracer \
+                                         refused a band on A at d{depth} (see the line above)"
+                                    );
+                                    return Ok(());
+                                }
+                                gpu_frame_at(&mut hg, &dg, 0, basis)?;
+                                // READING ONE: B's rows are still the dirty
+                                // pose. This MUST be badly wrong, or the
+                                // reading after the transfer proves nothing.
+                                let (pre, _) = cmp(&rda(&mut hg)?, b0, b1);
+
+                                // B renders its half on the other adapter.
+                                let s = sec.as_ref();
+                                if !s.set_region(sc, gw as u32, gh as u32) {
+                                    eprintln!(
+                                        "check-dxr: (skip) dual-gpu two-device — the secondary \
+                                         refused its region at d{depth} (see the line above)"
+                                    );
+                                    return Ok(());
+                                }
+                                let fp = mk(basis);
+                                s.write_cb(0, &fp);
+                                let mut rec = Ok(());
+                                // HYBRID, because the whole point of the mixed
+                                // arm is the wavefront's BANDED render. `false`
+                                // routes to `record_reference`, whose dispatch
+                                // is the full `rw x rh` grid and whose kernel
+                                // has no ownership test at all (`split_owns_px`
+                                // lives only in compose.hlsl) — so the region
+                                // just handed to it would be ignored, the gate
+                                // would slice a band out of a whole-screen
+                                // render, and `level_finish`'s child-ownership
+                                // test — the thing the shipping path relies on,
+                                // since `record_dxr_trace` passes `true` — would
+                                // never run here at all.
+                                h2.run(|l| rec = s.record(l, 0, &fp, true))?;
+                                rec?;
+                                // ...and it crosses, for real.
+                                let src = [s.fed_planes()[0]];
+                                let mut rec = Ok(());
+                                h2.run(|l| {
+                                    rec = xf.record_out(l, &src, gw as u32, b0, b1)
+                                })?;
+                                rec?;
+                                xf.hop(0, gpu::dual::payload_bytes(&[12], gw as u32, b1 - b0))?;
+                                let dst = [gpu::dual::Plane { res: &dg.accum, stride: 12 }];
+                                let mut rec = Ok(());
+                                hg.run(|l| {
+                                    rec = xf.record_in(l, &dst, gw as u32, b0, b1, 0)
+                                })?;
+                                rec?;
+                                // READING TWO: the merged plane.
+                                let (xrel, hot) = cmp(&rda(&mut hg)?, 0, gh as u32);
+                                eprintln!(
+                                    "check-dxr:   [{}] d{depth} s{share}/{side}: A y[{p0},{p1}) \
+                                     B y[{b0},{b1}) | PRE-transfer mean rel {pre:.2e} over the \
+                                     BAND (the absent-copy witness) | TRANSFERRED mean rel \
+                                     {xrel:.2e} whole-frame, hot {hot} of {}",
+                                    arm.name(),
+                                    px * 3
+                                );
+                                if pre < 0.1 {
+                                    return Err(format!(
+                                        "d{depth} s{share}/{side}: A's rows [{b0},{b1}) before \
+                                         the transfer are only {pre:.2e} away from the reference \
+                                         — the dirty band is not visibly wrong, so a transfer \
+                                         that never happened would pass this gate"
+                                    ));
+                                }
+                                if xrel > xlim || hot > hot_lim {
+                                    return Err(format!(
+                                        "d{depth} s{share}/{side}: the MERGED plane is {xrel:.2e} \
+                                         (limit {xlim:.0e}) with {hot} hot channels (limit \
+                                         {hot_lim}) — B's band did not land where A expects it"
+                                    ));
+                                }
+                            }
+                        }
+                        Ok(())
+                    })();
+                    let _ = dg.set_band(0, gh as u32);
+                    match two {
+                        Ok(()) => {}
+                        Err(e) if e.starts_with("no DXR") || e.contains("cannot host") => {
+                            eprintln!(
+                                "check-dxr: (skip) dual-gpu two-device {} arm — secondary \
+                                 \"{}\": {e}; this is exactly the box on which the shipping \
+                                 policy sends the secondary to the wavefront",
+                                arm.name(),
+                                p.name
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("check-dxr: FAIL dual-gpu two-device [{}]: {e}", arm.name());
+                            ok = false;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -11083,6 +11580,16 @@ enum CineArm {
     Dxr(gpu::dxr::DxrGpu),
 }
 
+/// The capture arm as a `dual::Tracer`, so the split schedules are written once
+/// for both pipelines — the `--spin` `arm_tracer` twin.
+#[cfg(windows)]
+fn cine_arm_tracer(a: &CineArm) -> gpu::dual::Tracer<'_> {
+    match a {
+        CineArm::Wave(t) => gpu::dual::Tracer::Wave(t),
+        CineArm::Dxr(d) => gpu::dual::Tracer::Dxr(d),
+    }
+}
+
 /// The sky rows live in the tracer's constant buffer, so a moved hour has to
 /// be pushed before the frame's first `write_cb`. ONE definition for both
 /// capture arms (reconstructed and accumulation) so the TOD contract cannot
@@ -11118,7 +11625,7 @@ fn cine_push_sky_dual(
         return;
     }
     if let Some(r) = dual.and_then(|d| d.res.as_mut()) {
-        r.tg.refresh_sky(scene);
+        r.sec.refresh_sky(scene);
     }
 }
 
@@ -11204,6 +11711,11 @@ const CINE_SHARE_DWELL: u32 = 8;
 struct CineDual {
     hg: gpu::trace::HeadlessGpu,
     core: std::rc::Rc<gpu::trace::SceneGpu>,
+    /// The secondary's pipeline, decided ONCE at open (`dual::arm_for` plus the
+    /// capture-specific vetoes) and carried across every resolution rebuild —
+    /// re-deciding it per `cine_dual_res` would let a shot-list resolution
+    /// change silently switch pipelines mid-capture.
+    arm: gpu::dual::Arm,
     res: Option<CineDualRes>,
     /// The share, the controllers and the ONE per-frame decision — shared with
     /// `--spin` and the interactive presenters (see `dual::Balancer`).
@@ -11219,7 +11731,7 @@ struct CineDual {
 
 #[cfg(windows)]
 struct CineDualRes {
-    tg: gpu::trace::TraceGpu,
+    sec: gpu::dual::Secondary,
     xf: gpu::dual::BandTransfer,
 }
 
@@ -11232,18 +11744,12 @@ fn cine_dual_open(
     scene: &scene::Scene,
     bvh: &bvh::Bvh,
     opts: &Opts,
-    use_wave: bool,
+    wants_gi: bool,
+    wants_overlay: bool,
 ) -> Result<Option<CineDual>, String> {
     let Some(share) = opts.dual_gpu else {
         return Ok(None);
     };
-    if !use_wave {
-        eprintln!(
-            "cinematic dual-gpu: the DXR pipeline has no tile ownership in this arm — \
-             pass --gpu (a GI or overlay shot forces it anyway)"
-        );
-        return Ok(None);
-    }
     let depth = opts.dual_gpu_depth.clamp(1, gpu::trace::MAX_SPLIT_DEPTH);
     let side = 1u32 << depth;
     let share = share.min(side - 1);
@@ -11256,13 +11762,40 @@ fn cine_dual_open(
         .ok_or("no second hardware adapter")?;
     let mut h2 = gpu::trace::HeadlessGpu::from_pick(&pick, opts.gpu_debug)?;
     let d2 = h2.device.clone();
+    // WHICH PIPELINE THE SECONDARY RUNS. Two capture-specific vetoes on top of
+    // the caps floor, both static and both silent-wrong-image classes:
+    //
+    //   * A GI SHOT. The DXR pipeline has no hemisphere stage at all, so a DXR
+    //     secondary would render its band with the bounce tier absent — a
+    //     differently-lit band in EVERY frame of the shot, with no error
+    //     anywhere. (The primary is already forced to the wavefront for these.)
+    //   * AN OVERLAY SHOT. The band carries `info`, and DXR's `info` is a
+    //     constant (`pack_info(0, KIND_LEAF)` at every launched index) rather
+    //     than a quadtree depth — the overlay would render flat over exactly
+    //     the secondary's rows, which is a picture of nothing.
+    let caps = gpu::dxr::require_caps(&d2);
+    let veto = if wants_gi {
+        Some("a GI shot needs the hemisphere stage, which only the wavefront has")
+    } else if wants_overlay {
+        Some("an overlay shot needs the quadtree depth in `info`, which DXR does not write")
+    } else {
+        None
+    };
+    let arm = gpu::dual::arm_for(pick.vendor, opts.dual_gpu_arm, caps.is_ok() && veto.is_none());
+    if let (Some(why), Some(gpu::dual::Arm::Dxr)) = (veto, opts.dual_gpu_arm) {
+        eprintln!(
+            "cinematic dual-gpu: --dual-gpu-arm dxr cannot be honoured here — {why}; the \
+             secondary runs the compute wavefront instead"
+        );
+    }
     // The scene is paid for TWICE — VRAM and load time both. That is the known
     // accept, and it is the dominant arming cost.
     let core =
         std::rc::Rc::new(gpu::trace::SceneGpu::new_uploaded(&d2, scene, bvh, &mut h2, opts.bc7)?);
     eprintln!(
-        "cinematic dual-gpu: secondary \"{}\" starts at {}/{} rows{} | primary \"{}\"",
+        "cinematic dual-gpu: secondary \"{}\" running {} starts at {}/{} rows{} | primary \"{}\"",
         h2.adapter_name,
+        arm.name(),
         share,
         side,
         if opts.dual_gpu_auto { ", balancer driving" } else { ", pinned" },
@@ -11271,6 +11804,7 @@ fn cine_dual_open(
     Ok(Some(CineDual {
         hg: h2,
         core,
+        arm,
         res: None,
         bal: gpu::dual::Balancer::new(share, depth, opts.dual_gpu_auto, CINE_SHARE_DWELL),
         t_sec: 0.0,
@@ -11304,19 +11838,31 @@ fn cine_dual_res(
 ) -> Result<(), String> {
     d.res = None;
     let dev = d.hg.device.clone();
-    let tg = gpu::trace::TraceGpu::new(
-        &dev,
-        dxc,
-        scene,
-        bvh,
-        d.core.clone(),
-        rw,
-        rh,
-        gbuf,
-        false,
-        debug,
-        &mut d.hg,
-    )?;
+    let sec = match d.arm {
+        gpu::dual::Arm::Wave => gpu::dual::Secondary::Wave(gpu::trace::TraceGpu::new(
+            &dev,
+            dxc,
+            scene,
+            bvh,
+            d.core.clone(),
+            rw,
+            rh,
+            gbuf,
+            false,
+            debug,
+            &mut d.hg,
+        )?),
+        gpu::dual::Arm::Dxr => gpu::dual::Secondary::Dxr(gpu::dxr::DxrGpu::new(
+            &dev,
+            dxc,
+            scene,
+            d.core.clone(),
+            rw,
+            rh,
+            gbuf,
+            debug,
+        )?),
+    };
     // Staging is sized from the FULL screen at the WORST stride set, so neither
     // the balancer moving the seam nor a change of arm reallocates.
     let xf = gpu::dual::BandTransfer::new(
@@ -11324,7 +11870,7 @@ fn cine_dual_res(
         prim_dev,
         gpu::dual::payload_bytes(&gpu::dual::MAX_FED_STRIDES, rw, rh),
     )?;
-    d.res = Some(CineDualRes { tg, xf });
+    d.res = Some(CineDualRes { sec, xf });
     Ok(())
 }
 
@@ -11349,7 +11895,7 @@ fn cine_dual_res(
 #[cfg(windows)]
 fn cine_dual_arm(
     d: &mut CineDual,
-    prim: &gpu::trace::TraceGpu,
+    prim: gpu::dual::Tracer<'_>,
     rw: u32,
     rh: u32,
 ) -> Option<(u32, u32)> {
@@ -11359,18 +11905,18 @@ fn cine_dual_arm(
         let r = d.res.as_ref()?;
         let sec_split = sec_split?;
         let band = sec_split.row_range(rw, rh)?;
-        r.tg.set_split(sec_split).then_some(band)
+        r.sec.as_ref().set_region(sec_split, rw, rh).then_some(band)
     })();
-    match band.filter(|_| prim.set_split(prim_split)) {
+    match band.filter(|_| prim.set_region(prim_split, rw, rh)) {
         Some(b) => {
             d.bal.mark_ran();
             Some(b)
         }
         None => {
             // Both back on the whole screen: the pre-feature path exactly.
-            prim.set_split(gpu::trace::TileSplit::ALL);
+            let _ = prim.set_region(gpu::trace::TileSplit::ALL, rw, rh);
             if let Some(r) = d.res.as_ref() {
-                r.tg.set_split(gpu::trace::TileSplit::ALL);
+                let _ = r.sec.as_ref().set_region(gpu::trace::TileSplit::ALL, rw, rh);
             }
             None
         }
@@ -11383,7 +11929,7 @@ fn cine_dual_arm(
 fn cine_dual_merge(
     d: &mut CineDual,
     hg: &mut gpu::trace::HeadlessGpu,
-    prim: &gpu::trace::TraceGpu,
+    prim: gpu::dual::Tracer<'_>,
     band: (u32, u32),
     rw: u32,
     overlay: bool,
@@ -11395,14 +11941,8 @@ fn cine_dual_merge(
     // payload for nothing.
     let n = if overlay { 2 } else { 1 };
     let strides = &CINE_DUAL_STRIDES[..n];
-    let src = [
-        gpu::dual::Plane { res: &r.tg.accum, stride: 12 },
-        gpu::dual::Plane { res: &r.tg.info, stride: 4 },
-    ];
-    let dst = [
-        gpu::dual::Plane { res: &prim.accum, stride: 12 },
-        gpu::dual::Plane { res: &prim.info, stride: 4 },
-    ];
+    let src = r.sec.as_ref().cap_planes();
+    let dst = prim.cap_planes();
     let a = Instant::now();
     let mut rec = Ok(());
     d.hg.run(|l| rec = r.xf.record_out(l, &src[..n], rw, y0, y1))?;
@@ -11519,6 +12059,7 @@ fn run_cinematic_gpu(
         dual_gpu: None,
         dual_depth: 1,
         dual_auto: false,
+        dual_arm: None,
         fg: false,
         fg_dir: String::new(),
         fsr_tune: opts.fsr_tune,
@@ -11551,7 +12092,7 @@ fn run_cinematic_gpu(
     // which pays it every single frame. The reconstruction arm cannot do that
     // (the engine consumes a whole merged frame per sub-frame) and pays the pack
     // as well; see the two schedules below.
-    let mut dual = match cine_dual_open(&mut hg, scene, bvh, opts, use_wave) {
+    let mut dual = match cine_dual_open(&mut hg, scene, bvh, opts, wants_gi, wants_overlay) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("cinematic dual-gpu: unavailable ({e}) — capturing single-GPU");
@@ -11806,40 +12347,44 @@ fn run_cinematic_gpu(
                     // The balancer ticks per SUB-frame here (the transfer is
                     // per sub-frame too), and nothing accumulates — every frame
                     // stores — so the split may move freely.
-                    let band = match (&*armv, dual.as_mut()) {
-                        (CineArm::Wave(tg), Some(d)) => {
+                    let primv = cine_arm_tracer(&armv);
+                    let band = match dual.as_mut() {
+                        Some(d) => {
                             if let Some(r) = d.res.as_ref() {
                                 // Mirror the PRIMARY's wiring: the secondary
                                 // has no feed of its own to derive it from.
-                                r.tg.force_gbuf_ext(tg.gbuf_ext_needed());
-                                r.tg.force_fsr_sig(tg.fsr_sig());
+                                r.sec.as_ref().force_gbuf_ext(primv.gbuf_ext_needed());
+                                r.sec.as_ref().force_fsr_sig(primv.fsr_sig());
                             }
-                            cine_dual_arm(d, tg, rw as u32, rh as u32)
+                            cine_dual_arm(d, primv, rw as u32, rh as u32)
                         }
-                        _ => None,
+                        None => None,
                     };
                     // The phases of a SPLIT sub-frame; (0, 0) otherwise.
                     let mut phase = (0.0f32, 0.0f32);
                     let sub_t = Instant::now();
-                    let r = match (&mut *armv, dual.as_mut().filter(|_| band.is_some())) {
+                    let r = match dual.as_mut().filter(|_| band.is_some()) {
                         // THE FED DUAL SUB-FRAME. The primary's trace goes in
                         // flight on its own submit so the wait on the secondary
                         // overlaps it; the band — accum AND the pack — then
                         // lands on the list that runs feed + evaluate, which
                         // the same queue executes after the trace by FIFO.
-                        (CineArm::Wave(tg), Some(d)) => {
+                        Some(d) => {
                             let (y0, y1) = band.expect("filtered");
                             let strides =
-                                gpu::dual::fed_strides(tg.pack_full(), tg.gbuf_ext_needed());
-                            tg.write_cb(0, &p);
+                                gpu::dual::fed_strides(primv.pack_full(), primv.gbuf_ext_needed());
+                            primv.write_cb(0, &p);
                             let (hg2, dres) = (&mut d.hg, d.res.as_ref());
                             let Some(dres) = dres else {
                                 eprintln!("cinematic: dual armed with no secondary tracer");
                                 return Ok(1);
                             };
-                            dres.tg.write_cb(0, &p);
-                            let v2 = hg2.submit(|l| dres.tg.record_frame(l, 0, &p, true));
-                            let v1 = hg.submit(|l| tg.record_frame(l, 0, &p, true));
+                            let sec = dres.sec.as_ref();
+                            sec.write_cb(0, &p);
+                            let mut rec2 = Ok(());
+                            let v2 = hg2.submit(|l| rec2 = sec.record(l, 0, &p, true));
+                            let mut rec1 = Ok(());
+                            let v1 = hg.submit(|l| rec1 = primv.record(l, 0, &p, true));
                             (|| -> Result<(), String> {
                                 let (v2, v1) = (v2?, v1?);
                                 let (pm, sm) = gpu::dual::join_poll(
@@ -11847,11 +12392,9 @@ fn run_cinematic_gpu(
                                     || hg2.completed(v2),
                                 );
                                 hg2.wait(v2)?;
-                                let src = [
-                                    gpu::dual::Plane { res: &dres.tg.accum, stride: 12 },
-                                    gpu::dual::Plane { res: &dres.tg.gbuf, stride: 16 },
-                                    gpu::dual::Plane { res: &dres.tg.gbuf_ext, stride: 72 },
-                                ];
+                                // Deferred past the wait — the record_split rule.
+                                rec2?;
+                                let src = sec.fed_planes();
                                 let mut rec = Ok(());
                                 hg2.run(|l| {
                                     rec = dres.xf.record_out(
@@ -11870,17 +12413,14 @@ fn run_cinematic_gpu(
                                 )?;
                                 let hop = t_hop.elapsed().as_secs_f32() * 1e3;
                                 hg.wait(v1)?;
-                                let dst = [
-                                    gpu::dual::Plane { res: &tg.accum, stride: 12 },
-                                    gpu::dual::Plane { res: &tg.gbuf, stride: 16 },
-                                    gpu::dual::Plane { res: &tg.gbuf_ext, stride: 72 },
-                                ];
+                                rec1?;
+                                let dst = primv.fed_planes();
                                 let mut rec = Ok(());
                                 hg.run(|l| {
                                     rec = dres
                                         .xf
                                         .record_in(l, &dst[..strides.len()], rw as u32, y0, y1, 0)
-                                        .and_then(|()| tg.record_feed(l, 0, false))
+                                        .and_then(|()| primv.record_feed(l, 0))
                                         .and_then(|()| {
                                             u.record_eval(
                                                 ngxrr.as_ref(),
@@ -11902,34 +12442,15 @@ fn run_cinematic_gpu(
                                 Ok(())
                             })()
                         }
-                        (CineArm::Wave(tg), None) => {
-                            tg.write_cb(0, &p);
+                        // Single-GPU, both pipelines — the zero-share path and
+                        // the unarmed one are the same code.
+                        None => {
+                            primv.write_cb(0, &p);
                             let mut rec = Ok(());
                             hg.run(|l| {
-                                tg.record_frame(l, 0, &p, true);
-                                rec = tg.record_feed(l, 0, false).and_then(|()| {
-                                    u.record_eval(
-                                        ngxrr.as_ref(),
-                                        l,
-                                        &fc,
-                                        jit,
-                                        reset,
-                                        seq,
-                                        frame_ms,
-                                        prev_pos,
-                                        &scene.sky_sh,
-                                    )
-                                });
-                            })
-                            .and(rec)
-                        }
-                        (CineArm::Dxr(dg), _) => {
-                            dg.write_cb(0, &p);
-                            let mut rec = Ok(());
-                            hg.run(|l| {
-                                rec = dg
-                                    .record_frame(l, 0)
-                                    .and_then(|()| dg.record_feed(l, 0))
+                                rec = primv
+                                    .record(l, 0, &p, true)
+                                    .and_then(|()| primv.record_feed(l, 0))
                                     .and_then(|()| {
                                         u.record_eval(
                                             ngxrr.as_ref(),
@@ -11984,9 +12505,10 @@ fn run_cinematic_gpu(
                 // different devices. `None` means the secondary sits this frame
                 // out and the primary runs `TileSplit::ALL`: the pre-feature
                 // path, byte for byte.
-                let band = match (&*armv, dual.as_mut()) {
-                    (CineArm::Wave(tg), Some(d)) => cine_dual_arm(d, tg, rw as u32, rh as u32),
-                    _ => None,
+                let primv = cine_arm_tracer(&armv);
+                let band = match dual.as_mut() {
+                    Some(d) => cine_dual_arm(d, primv, rw as u32, rh as u32),
+                    None => None,
                 };
                 let (mut t_sec, mut t_prim) = (0.0f64, 0.0f64);
                 // The tick's wall time, measured the SAME way on a dual frame
@@ -12023,23 +12545,26 @@ fn run_cinematic_gpu(
                         // DXR has no quadtree to persist.
                         replay: opts.replay && use_wave,
                     };
-                    let r = match (&*armv, dual.as_mut().filter(|_| band.is_some())) {
+                    let r = match dual.as_mut().filter(|_| band.is_some()) {
                         // THE DUAL SUB-FRAME. Both devices go in flight before
                         // either is waited on; driving them through the blocking
                         // `run` would serialise them and measure the SUM of two
                         // tracers instead of the max. NO TRANSFER HERE — each
                         // device splats into its own band of its own `accum`
                         // and the single merge happens after the loop.
-                        (CineArm::Wave(tg), Some(d)) => {
-                            tg.write_cb(0, &p);
+                        Some(d) => {
+                            primv.write_cb(0, &p);
                             let (hg2, dres) = (&mut d.hg, d.res.as_ref());
                             let Some(dres) = dres else {
                                 eprintln!("cinematic: dual armed with no secondary tracer");
                                 return Ok(1);
                             };
-                            dres.tg.write_cb(0, &p);
-                            let v2 = hg2.submit(|l| dres.tg.record_frame(l, 0, &p, true));
-                            let v1 = hg.submit(|l| tg.record_frame(l, 0, &p, true));
+                            let sec = dres.sec.as_ref();
+                            sec.write_cb(0, &p);
+                            let mut rec2 = Ok(());
+                            let v2 = hg2.submit(|l| rec2 = sec.record(l, 0, &p, true));
+                            let mut rec1 = Ok(());
+                            let v1 = hg.submit(|l| rec1 = primv.record(l, 0, &p, true));
                             (|| -> Result<(), String> {
                                 let (v2, v1) = (v2?, v1?);
                                 // BOTH sides measured, not one inferred from
@@ -12058,19 +12583,19 @@ fn run_cinematic_gpu(
                                 );
                                 hg.wait(v1)?;
                                 hg2.wait(v2)?;
+                                // Both deferred past both waits.
+                                rec2?;
+                                rec1?;
                                 t_prim += pm as f64;
                                 t_sec += sm as f64;
                                 Ok(())
                             })()
                         }
-                        (CineArm::Wave(tg), None) => {
-                            tg.write_cb(0, &p);
-                            hg.run(|l| tg.record_frame(l, 0, &p, true))
-                        }
-                        (CineArm::Dxr(dg), _) => {
-                            dg.write_cb(0, &p);
+                        // Single-GPU, both pipelines.
+                        None => {
+                            primv.write_cb(0, &p);
                             let mut rec = Ok(());
-                            hg.run(|l| rec = dg.record_frame(l, 0)).and(rec)
+                            hg.run(|l| rec = primv.record(l, 0, &p, true)).and(rec)
                         }
                     };
                     if let Err(e) = r {
@@ -12085,10 +12610,8 @@ fn run_cinematic_gpu(
                 // The phases of a SPLIT tick; (0, 0) on a solo or idle one,
                 // where `observe` ignores them and reads `frame_ms` instead.
                 let mut phase = (0.0f32, 0.0f32);
-                if let (CineArm::Wave(tg), Some(d), Some(bnd)) =
-                    (&*armv, dual.as_mut(), band)
-                {
-                    match cine_dual_merge(d, &mut hg, tg, bnd, rw as u32, shot.overlay) {
+                if let (Some(d), Some(bnd)) = (dual.as_mut(), band) {
+                    match cine_dual_merge(d, &mut hg, primv, bnd, rw as u32, shot.overlay) {
                         Ok((out, hop, tin)) => {
                             d.t_sec += t_sec;
                             d.t_out += out;
@@ -12570,6 +13093,14 @@ fn run_spin_gpu(
         Wave(gpu::trace::TraceGpu),
         Dxr(gpu::dxr::DxrGpu),
     }
+    /// The spin arm as a `dual::Tracer`, so the split schedule below is written
+    /// once for both pipelines rather than per arm.
+    fn arm_tracer(a: &Arm) -> gpu::dual::Tracer<'_> {
+        match a {
+            Arm::Wave(t) => gpu::dual::Tracer::Wave(t),
+            Arm::Dxr(d) => gpu::dual::Tracer::Dxr(d),
+        }
+    }
     let core = match gpu::trace::SceneGpu::new_uploaded(&dev, scene, bvh, &mut hg, opts.bc7) {
         Ok(c) => std::rc::Rc::new(c),
         Err(e) => {
@@ -12623,7 +13154,10 @@ fn run_spin_gpu(
     // so an armed --dxr spin says so rather than silently measuring one GPU.
     struct Dual {
         hg: gpu::trace::HeadlessGpu,
-        tg: gpu::trace::TraceGpu,
+        /// The secondary's tracer, whose arm follows ITS OWN adapter's vendor
+        /// (`dual::arm_for`) and need not match the primary's — the same
+        /// mixed-mode rule the interactive path uses.
+        sec: gpu::dual::Secondary,
         xf: gpu::dual::BandTransfer,
         /// The share, the controllers and the ONE per-frame decision — shared
         /// with `--cinematic` and the interactive presenters. Its counters are
@@ -12643,12 +13177,7 @@ fn run_spin_gpu(
     }
     let mut dual: Option<Dual> = None;
     if let Some(share) = opts.dual_gpu {
-        if !opts.gpu {
-            eprintln!(
-                "spin dxr: --dual-gpu needs the wavefront tracer (--gpu); the DXR pipeline has \
-                 no tile ownership yet"
-            );
-        } else if let Arm::Wave(tg) = &armv {
+        {
             let d = opts.dual_gpu_depth.clamp(1, gpu::trace::MAX_SPLIT_DEPTH);
             let side = 1u32 << d;
             let share = share.min(side - 1);
@@ -12657,6 +13186,7 @@ fn run_spin_gpu(
             // the largest, sweeping the whole curve.
             let (prim, sec) = gpu::trace::TileSplit::for_share(share, d);
             let sec = sec.expect("share >= 1 yields a secondary");
+            let primv = arm_tracer(&armv);
             match (|| -> Result<Dual, String> {
                 let (y0, y1) = sec
                     .row_range(rw as u32, rh as u32)
@@ -12671,22 +13201,48 @@ fn run_spin_gpu(
                     .ok_or("no second hardware adapter")?;
                 let mut h2 = gpu::trace::HeadlessGpu::from_pick(&p, opts.gpu_debug)?;
                 let d2 = h2.device.clone();
+                // The secondary's arm, by the SAME policy the interactive path
+                // uses — probed before the upload, the cheapest place to change
+                // our mind (the scene core is arm-independent).
+                let caps = gpu::dxr::require_caps(&d2);
+                let arm = gpu::dual::arm_for(p.vendor, opts.dual_gpu_arm, caps.is_ok());
+                if let (Err(e), Some(gpu::dual::Arm::Dxr)) = (&caps, opts.dual_gpu_arm) {
+                    eprintln!(
+                        "spin dual-gpu: --dual-gpu-arm dxr cannot be honoured on \"{}\" ({e}) — \
+                         its share runs the compute wavefront instead",
+                        p.name
+                    );
+                }
                 let c2 = std::rc::Rc::new(gpu::trace::SceneGpu::new_uploaded(
                     &d2, scene, bvh, &mut h2, opts.bc7,
                 )?);
-                let t2 = gpu::trace::TraceGpu::new(
-                    &d2,
-                    &dxc,
-                    scene,
-                    bvh,
-                    c2,
-                    rw as u32,
-                    rh as u32,
-                    false,
-                    false,
-                    opts.gpu_debug,
-                    &mut h2,
-                )?;
+                let s2 = match arm {
+                    gpu::dual::Arm::Wave => {
+                        gpu::dual::Secondary::Wave(gpu::trace::TraceGpu::new(
+                            &d2,
+                            &dxc,
+                            scene,
+                            bvh,
+                            c2,
+                            rw as u32,
+                            rh as u32,
+                            false,
+                            false,
+                            opts.gpu_debug,
+                            &mut h2,
+                        )?)
+                    }
+                    gpu::dual::Arm::Dxr => gpu::dual::Secondary::Dxr(gpu::dxr::DxrGpu::new(
+                        &d2,
+                        &dxc,
+                        scene,
+                        c2,
+                        rw as u32,
+                        rh as u32,
+                        false,
+                        opts.gpu_debug,
+                    )?),
+                };
                 // Staging sized from the FULL screen: a balancer must be able
                 // to move the seam without reallocating.
                 let xf = gpu::dual::BandTransfer::new(
@@ -12695,12 +13251,22 @@ fn run_spin_gpu(
                     gpu::dual::payload_bytes(&[12], rw as u32, rh as u32),
                 )?;
                 let bytes = gpu::dual::payload_bytes(&[12], rw as u32, y1 - y0);
-                tg.set_split(prim);
-                t2.set_split(sec);
+                // ARM THE SECONDARY FIRST, narrow the primary only once it took
+                // — the rule `cine_dual_arm`'s doc records shipping wrong once.
+                // It matters here now that the primary can be a DXR band, which
+                // (unlike the old discarded `set_split`) genuinely refuses.
+                if !s2.as_ref().set_region(sec, rw as u32, rh as u32) {
+                    return Err("the secondary declined its share of the split".into());
+                }
+                if !primv.set_region(prim, rw as u32, rh as u32) {
+                    let _ =
+                        s2.as_ref().set_region(gpu::trace::TileSplit::ALL, rw as u32, rh as u32);
+                    return Err("the primary declined its share of the split".into());
+                }
                 let _ = (y0, y1, bytes);
                 Ok(Dual {
                     hg: h2,
-                    tg: t2,
+                    sec: s2,
                     xf,
                     bal: gpu::dual::Balancer::new(
                         share,
@@ -12721,15 +13287,17 @@ fn run_spin_gpu(
                         .and_then(|s| s.row_range(rw as u32, rh as u32))
                         .unwrap_or((0, 0));
                     eprintln!(
-                        "spin dual-gpu: secondary \"{}\" starts at {}/{} rows (y {}..{}, {:.1} MB/frame){} | primary \"{}\"",
+                        "spin dual-gpu: secondary \"{}\" running {} starts at {}/{} rows (y {}..{}, {:.1} MB/frame){} | primary \"{}\" running {}",
                         d.hg.adapter_name,
+                        d.sec.arm().name(),
                         d.bal.rows(),
                         d.bal.side(),
                         band.0,
                         band.1,
                         gpu::dual::payload_bytes(&[12], rw as u32, band.1 - band.0) as f64 / 1e6,
                         if opts.dual_gpu_auto { ", balancer driving" } else { ", pinned" },
-                        hg.adapter_name
+                        hg.adapter_name,
+                        arm_tracer(&armv).arm().name()
                     );
                     dual = Some(d);
                 }
@@ -12793,14 +13361,39 @@ fn run_spin_gpu(
         // single-GPU arm — no secondary submit, no transfer, no extra fence.
         // Arming the feature costs exactly nothing once the balancer reaches
         // zero, and `--spin` is deterministic so nothing here freezes.
-        if let (Some(d), Arm::Wave(tg)) = (dual.as_mut(), &armv) {
+        //
+        // ARM THE SECONDARY FIRST AND THE PRIMARY ONLY ONCE IT TOOK. The old
+        // shape set the primary's split here and the secondary's inside the
+        // match, which is the inversion `cine_dual_arm`'s doc comment records
+        // shipping once — it survived only because `set_split`'s return was
+        // discarded. A DXR primary's `set_band` genuinely refuses (`--waveviz`),
+        // and a refused primary beside an armed secondary renders the band
+        // TWICE, which under --spin's non-accumulating frames looks correct.
+        let primv = arm_tracer(&armv);
+        let band = dual.as_mut().and_then(|d| {
             let rows = d.bal.tick(false);
-            tg.set_split(gpu::trace::TileSplit::for_share(rows, d.bal.depth()).0);
-        }
-        let active = dual.as_ref().is_some_and(|d| d.bal.rows() > 0);
+            let (prim_split, sec_split) = gpu::trace::TileSplit::for_share(rows, d.bal.depth());
+            let armed = sec_split.and_then(|sp| {
+                let b = sp.row_range(rw as u32, rh as u32)?;
+                d.sec.as_ref().set_region(sp, rw as u32, rh as u32).then_some(b)
+            });
+            match armed.filter(|_| primv.set_region(prim_split, rw as u32, rh as u32)) {
+                Some(b) => Some(b),
+                None => {
+                    // Both back on the whole screen: the pre-feature path.
+                    let _ = primv.set_region(gpu::trace::TileSplit::ALL, rw as u32, rh as u32);
+                    let _ = d
+                        .sec
+                        .as_ref()
+                        .set_region(gpu::trace::TileSplit::ALL, rw as u32, rh as u32);
+                    None
+                }
+            }
+        });
+        let active = band.is_some();
 
         let t = Instant::now();
-        let r = match (&armv, dual.as_mut().filter(|_| active)) {
+        let r = match (band, dual.as_mut().filter(|_| active)) {
             // THE DUAL SCHEDULE. Both devices are put in flight before either
             // is waited on — driving them through the blocking `run` would
             // serialize them and measure the SUM of two tracers rather than
@@ -12811,34 +13404,30 @@ fn run_spin_gpu(
             // 5.6 GB/s against the primary's 25.8) is hidden and only the
             // primary's read is exposed in the frame. That is the schedule the
             // balancer's setpoint assumes.
-            (Arm::Wave(tg), Some(d)) => {
-                // The primary's split was set with the balancer's decision
-                // above; the secondary's follows from the same `for_share`.
-                let sec_split = gpu::trace::TileSplit::for_share(d.bal.rows(), d.bal.depth())
-                    .1
-                    .expect("active implies rows > 0");
-                d.tg.set_split(sec_split);
-                let (y0, y1) = match sec_split.row_range(rw as u32, rh as u32) {
-                    Some(v) => v,
-                    None => {
-                        eprintln!("spin dual-gpu: secondary mask is not a row band");
-                        return 1;
-                    }
-                };
+            (Some((y0, y1)), Some(d)) => {
+                // Both regions were armed above, together or not at all.
                 let bytes = gpu::dual::payload_bytes(&[12], rw as u32, y1 - y0);
-                tg.write_cb(0, &p);
-                d.tg.write_cb(0, &p);
-                let (hg2, tg2, xf) = (&mut d.hg, &d.tg, &d.xf);
-                let v2 = hg2.submit(|l| tg2.record_frame(l, 0, &p, hybrid));
-                let v1 = hg.submit(|l| tg.record_frame(l, 0, &p, hybrid));
+                primv.write_cb(0, &p);
+                let sec = d.sec.as_ref();
+                sec.write_cb(0, &p);
+                let (hg2, xf) = (&mut d.hg, &d.xf);
+                let mut rec2 = Ok(());
+                let v2 = hg2.submit(|l| rec2 = sec.record(l, 0, &p, hybrid));
+                let mut rec1 = Ok(());
+                let v1 = hg.submit(|l| rec1 = primv.record(l, 0, &p, hybrid));
                 let mut ph = [0.0f64; 5];
                 let mut prim_early = false;
                 let res = (|| -> Result<(), String> {
                     let (v2, v1) = (v2?, v1?);
                     let a = Instant::now();
                     hg2.wait(v2)?;
+                    // Deferred past the wait, the record_split rule: a DXR
+                    // secondary's record CAN fail, and returning with a fence
+                    // in flight leaves the next submit resetting an executing
+                    // allocator.
+                    rec2?;
                     let b = Instant::now();
-                    let po = [gpu::dual::Plane { res: &tg2.accum, stride: 12 }];
+                    let po = [sec.fed_planes()[0]];
                     hg2.run(|l| {
                         let _ = xf.record_out(l, &po, rw as u32, y0, y1);
                     })?;
@@ -12851,8 +13440,9 @@ fn run_spin_gpu(
                     // test reads "still running" every frame).
                     prim_early = hg.completed(v1);
                     hg.wait(v1)?;
+                    rec1?;
                     let f = Instant::now();
-                    let pi = [gpu::dual::Plane { res: &tg.accum, stride: 12 }];
+                    let pi = [primv.fed_planes()[0]];
                     hg.run(|l| {
                         let _ = xf.record_in(l, &pi, rw as u32, y0, y1, 0);
                     })?;
@@ -12892,14 +13482,14 @@ fn run_spin_gpu(
                 }
                 res
             }
-            (Arm::Wave(tg), None) => {
-                tg.write_cb(0, &p);
-                hg.run(|l| tg.record_frame(l, 0, &p, hybrid))
-            }
-            (Arm::Dxr(dg), _) => {
-                dg.write_cb(0, &p);
+            // Single-GPU, both pipelines: the zero-share path and the
+            // unarmed one are the same code, which is what makes "arming
+            // the feature costs nothing once the balancer reaches zero"
+            // structural rather than a claim.
+            _ => {
+                primv.write_cb(0, &p);
                 let mut rec = Ok(());
-                hg.run(|l| rec = dg.record_frame(l, 0)).and(rec)
+                hg.run(|l| rec = primv.record(l, 0, &p, hybrid)).and(rec)
             }
         };
         if let Err(e) = r {
@@ -16433,6 +17023,7 @@ fn run_window(req: SceneRequest, opts: &Opts, file_settings: settings::Settings)
         dual_gpu: opts.dual_gpu,
         dual_depth: opts.dual_gpu_depth,
         dual_auto: opts.dual_gpu_auto,
+        dual_arm: opts.dual_gpu_arm,
     };
     let mut gpu = gpu::GpuContext::new(sdl_hwnd(&window), W as u32, H as u32, &gopts)
         .expect("GPU init failed");
@@ -19495,6 +20086,12 @@ fn session(
                 match presented {
                     Ok(()) => {
                         last_ms = t.elapsed().as_secs_f64() * 1000.0;
+                        // --dual-gpu: close the balancer's loop with the
+                        // frame's MEASURED total, exactly as the wavefront
+                        // arms do. Without this `tick` runs and `observe`
+                        // never does — the first solo probe would then zero
+                        // the share and nothing would ever restore it.
+                        gpu.dual_frame_cost(last_ms as f32);
                         // The sway clock pairs with the camera (PrevPose).
                         dxr_prev_cam = Some(PrevPose {
                             cam,
@@ -19554,6 +20151,9 @@ fn session(
                     match gpu.present_dxr(&p, frame + 1) {
                         Ok(()) => {
                             last_ms = t.elapsed().as_secs_f64() * 1000.0;
+                            // --dual-gpu: see the upscaler arm above — the
+                            // frame's total is only knowable here.
+                            gpu.dual_frame_cost(last_ms as f32);
                             // Moving frames stay at frame 0: every one is a
                             // fresh store, and the first still frame
                             // re-stores at full quality instead of adding

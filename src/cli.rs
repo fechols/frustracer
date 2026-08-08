@@ -288,6 +288,18 @@ pub struct Opts {
     /// — and they are the most expensive ones, being the shallowest. K=1
     /// duplicates a single tile and offers only a half-and-half split.
     pub dual_gpu_depth: u32,
+    /// `--dual-gpu-arm wave|dxr`: force the SECONDARY's pipeline instead of
+    /// letting its own adapter's vendor choose it (`gpu::dual::arm_for`).
+    /// `None` = the vendor policy, which is the shipping default.
+    ///
+    /// It names the SECONDARY ONLY. The primary's pipeline is the session's,
+    /// picked by --gpu/--dxr/SPACE, and this flag never touches it — the two
+    /// are independent and all four combinations are legal.
+    ///
+    /// A secondary that cannot host a `DxrGpu` (no RT tier 1.0) degrades to
+    /// the wavefront with a loud line even when this asks for DXR: that floor
+    /// is soundness, not policy.
+    pub dual_gpu_arm: Option<crate::gpu::dual::Arm>,
     /// A/B lever (--no-ftree disables): route ALL bound queries through the
     /// 8-wide frustum tree lazily collapsed from the ray BVH (ftree.rs) — the
     /// two-tree split. Rays always stay on the binary BVH.
@@ -696,6 +708,7 @@ pub fn defaults() -> Opts {
         dual_gpu: None,
         dual_gpu_auto: false,
         dual_gpu_depth: 3,
+        dual_gpu_arm: None,
         ftree: true,
         ftree_tiles: false,
         wide_levels: true,
@@ -1301,6 +1314,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
             "--no-dual-gpu" => {
                 opts.dual_gpu = None;
                 opts.dual_gpu_auto = false;
+                opts.dual_gpu_arm = None;
             }
             // Arms if it wasn't already: a balancer with nothing to balance
             // is a no-op, and silently doing nothing is the failure mode the
@@ -1321,6 +1335,27 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
                         eprintln!("--dual-gpu-depth: '{v}' is not a split level (1..=3)");
                         std::process::exit(2);
                     });
+            }
+            // Which pipeline the SECONDARY runs. Names the secondary only —
+            // the primary's arm is the session's.
+            //
+            // ARMS IF IT WASN'T ALREADY, the `--dual-gpu-auto` rule: forcing an
+            // arm on a device that was never opened is a silent no-op, and
+            // silently doing nothing is the failure mode the loud-lever rule
+            // exists to prevent.
+            "--dual-gpu-arm" => {
+                let v = args.next().unwrap_or_default();
+                if opts.dual_gpu.is_none() {
+                    opts.dual_gpu = Some(2);
+                }
+                opts.dual_gpu_arm = Some(match v.as_str() {
+                    "wave" | "wavefront" | "gpu" => crate::gpu::dual::Arm::Wave,
+                    "dxr" => crate::gpu::dual::Arm::Dxr,
+                    _ => {
+                        eprintln!("--dual-gpu-arm: '{v}' is not wave|dxr");
+                        std::process::exit(2);
+                    }
+                });
             }
             // The DXR pipeline's ray-dispatch mode (applied through
             // gpu::dxr::set_inline_mode). DEFAULT 1 = primary TraceRay +
@@ -2064,6 +2099,20 @@ pub fn usage() {
                 eprintln!("                pick that vendor's adapter for the D3D12 device (default NVIDIA, or AMD");
                 eprintln!("                with --fsr; a preference, not a requirement — features the picked GPU");
                 eprintln!("                can't support fall back with a log line)");
+                eprintln!("  --dual-gpu [N]  split the frame across two adapters, giving the SECONDARY N of the");
+                eprintln!("                8 level-3 tile rows (1..=7, default 2; --no-dual-gpu = off, the default).");
+                eprintln!("                Works with either render mode; the secondary's own pipeline follows its");
+                eprintln!("                adapter's vendor (Intel -> wavefront, NVIDIA/AMD -> DXR).");
+                eprintln!("                MEASURED: it LOSES on a box whose second slot is electrically x4 — the");
+                eprintln!("                band is the whole cost. --dual-gpu-auto is how you find that out.");
+                eprintln!("    --dual-gpu-auto   hand the share to the balancer (N is then the STARTING share);");
+                eprintln!("                      it converges to 0 with a stated verdict where splitting cannot pay");
+                eprintln!("    --dual-gpu-depth K  the quadtree level the split is assigned at (1..=3, default 3 =");
+                eprintln!("                      eighths; K=1 is halves, with less duplicated ladder work)");
+                eprintln!("    --dual-gpu-arm wave|dxr  force the SECONDARY's pipeline instead of the vendor policy");
+                eprintln!("                      (names the secondary only; arms --dual-gpu at its default if it");
+                eprintln!("                      wasn't already; an adapter without RT tier 1.0 still degrades to");
+                eprintln!("                      the wavefront, loudly)");
                 eprintln!("  --gpu-debug   D3D12 debug layer + GPU-based validation");
                 eprintln!("  --no-settings ignore {} for this run (the pause menu's", settings::FILE_NAME);
                 eprintln!("                saved settings, read as defaults that CLI flags override;");
@@ -2196,6 +2245,8 @@ pub fn self_test() -> Result<(), String> {
         "3",
         "--dual-gpu-depth",
         "2",
+        "--dual-gpu-arm",
+        "dxr",
     ]);
     let after = lever_snapshot();
     if after != before {
@@ -2209,6 +2260,7 @@ pub fn self_test() -> Result<(), String> {
     for (name, took) in [
         ("dual_gpu", o.dual_gpu == Some(3)),
         ("dual_gpu_depth", o.dual_gpu_depth == 2),
+        ("dual_gpu_arm", o.dual_gpu_arm == Some(crate::gpu::dual::Arm::Dxr)),
         ("mips", !o.mips),
         ("aniso", o.aniso == 4),
         ("h2n", !o.h2n),
@@ -2278,10 +2330,35 @@ pub fn self_test() -> Result<(), String> {
     if parse_argv(&["--dual-gpu-auto", "--no-dual-gpu"]).opts.dual_gpu_auto {
         return Err("--no-dual-gpu must clear the balancer too, not just the share".into());
     }
+    // ...and the secondary's arm with them: --no-dual-gpu spells "no second
+    // device at all", so leaving a forced arm behind would have it apply to
+    // whatever a later --dual-gpu re-arms.
+    if parse_argv(&["--dual-gpu-arm", "dxr", "--no-dual-gpu"]).opts.dual_gpu_arm.is_some() {
+        return Err("--no-dual-gpu must clear the forced secondary arm too".into());
+    }
+    // The default is the VENDOR POLICY, not an arm — `None` is what lets
+    // `arm_for` decide, and a default of Some(_) would pin every box to one
+    // pipeline while looking like it had chosen.
+    if parse_argv(&[]).opts.dual_gpu_arm.is_some() {
+        return Err("--dual-gpu-arm must default to None (the vendor policy decides)".into());
+    }
+    if parse_argv(&["--dual-gpu-arm", "wave"]).opts.dual_gpu_arm
+        != Some(crate::gpu::dual::Arm::Wave)
+    {
+        return Err("--dual-gpu-arm wave must select the wavefront".into());
+    }
     // --dual-gpu-auto ARMS: a balancer with nothing to balance is a silent
     // no-op, which is the failure the loud-lever rule exists to prevent.
     if parse_argv(&["--dual-gpu-auto"]).opts.dual_gpu.is_none() {
         return Err("--dual-gpu-auto must arm the split, not sit inert".into());
+    }
+    // --dual-gpu-arm ARMS for the same reason: an arm forced on a device that
+    // was never opened is the same silent no-op.
+    if parse_argv(&["--dual-gpu-arm", "dxr"]).opts.dual_gpu.is_none() {
+        return Err("--dual-gpu-arm must arm the split, not sit inert".into());
+    }
+    if parse_argv(&["--dual-gpu", "5", "--dual-gpu-arm", "wave"]).opts.dual_gpu != Some(5) {
+        return Err("--dual-gpu-arm must not overwrite an explicit starting share".into());
     }
     // ...and it must not overwrite an explicitly chosen starting share.
     if parse_argv(&["--dual-gpu", "5", "--dual-gpu-auto"]).opts.dual_gpu != Some(5) {

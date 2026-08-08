@@ -132,6 +132,9 @@ pub struct GpuOptions {
     /// `--dual-gpu-auto`: let the balancer move the share rather than pinning
     /// it where the flag put it.
     pub dual_auto: bool,
+    /// `--dual-gpu-arm`: force the SECONDARY's pipeline. None = the vendor
+    /// policy (`dual::arm_for`), which is the shipping default.
+    pub dual_arm: Option<dual::Arm>,
 }
 
 /// Which chain level a session actually wired — derived from the live state
@@ -602,7 +605,12 @@ struct DualState {
     /// and cannot cross, so the scene is uploaded twice — the dominant arming
     /// cost, and the known accept.
     core: std::rc::Rc<trace::SceneGpu>,
-    tg: trace::TraceGpu,
+    /// The secondary's tracer, which is NOT necessarily the primary's kind:
+    /// its arm follows its OWN adapter's vendor (`dual::arm_for`), so a 4090
+    /// primary on DXR pairs with an Arc secondary on the wavefront. Both are
+    /// driven through `dual::Tracer`, which is what lets one schedule serve
+    /// every combination.
+    sec: dual::Secondary,
     xf: dual::BandTransfer,
     /// The share, the controllers and the ONE per-frame decision — shared with
     /// `--spin` and `--cinematic`, which is the point (see `dual::Balancer`).
@@ -622,6 +630,33 @@ struct DualState {
     /// armed, and those are very different answers — but it only needs saying
     /// once.
     said: bool,
+    /// Same, for the mixed-arm stand-down: an fb session would otherwise print
+    /// it every frame H is held on.
+    said_mixed: bool,
+    /// Same, for the pack-disagreement stand-down. A SEPARATE latch rather than
+    /// one shared with `said_mixed`: the two denies have independent causes and
+    /// can hold at once, and a shared latch would silently swallow whichever
+    /// arrived second — which is the one you would need to see, since it is the
+    /// rarer of the two.
+    said_pack: bool,
+}
+
+/// What a resize keeps of `DualState`: everything that is not window-bound.
+///
+/// Declared ahead of `d3d` in `GpuContext` for the same Drop-order reason
+/// `DualState` is.
+struct DualKeep {
+    hg: trace::HeadlessGpu,
+    core: std::rc::Rc<trace::SceneGpu>,
+    bal: dual::Balancer,
+    /// THE SECONDARY'S ARM, carried across rather than re-decided. It is a
+    /// property of the ADAPTER and is settled once, at open: re-running the
+    /// policy on re-adoption would let an explicit `--dual-gpu-arm` lapse at
+    /// the first F11 — the secondary silently switching pipelines mid-session,
+    /// which reads as a frame-time discontinuity at the resize with no line
+    /// explaining it — and would re-probe `require_caps` against a device that
+    /// has already answered.
+    arm: dual::Arm,
 }
 
 pub struct GpuContext {
@@ -635,13 +670,16 @@ pub struct GpuContext {
     dual_want: Option<u32>,
     dual_depth: u32,
     dual_auto: bool,
+    /// `--dual-gpu-arm`: the forced secondary pipeline, or None for the vendor
+    /// policy. Read once, at `build_dual` — see `DualKeep::arm` for why a
+    /// resize must not re-decide it.
+    dual_arm: Option<dual::Arm>,
     /// What survives a resize: the secondary's device and its SCENE core (both
     /// window-independent, and the scene upload is the expensive one), plus the
     /// balancer's converged state — a window resize is not a reason to re-learn
     /// which adapter pays. Also declared ahead of `d3d`, for the same reason
     /// `dual` is.
-    #[allow(clippy::type_complexity)]
-    dual_keep: Option<(trace::HeadlessGpu, std::rc::Rc<trace::SceneGpu>, dual::Balancer)>,
+    dual_keep: Option<DualKeep>,
     d3d: D3d,
     passes: tonemap::Passes,
     /// Glare. Always built (never Option): the tonemap PS declares its halo SRV
@@ -1490,6 +1528,7 @@ impl GpuContext {
             dual_want: opts.dual_gpu,
             dual_depth: opts.dual_depth,
             dual_auto: opts.dual_auto,
+            dual_arm: opts.dual_arm,
             dual_keep: None,
             ngxrr,
             rr_feature,
@@ -1813,7 +1852,12 @@ impl GpuContext {
         // `dual_keep`, so the re-entry re-pays kernel compiles and planes but
         // NOT the second scene upload — the same bargain `scene_gpu` strikes
         // one line down, and by far the more expensive of the two to re-pay.
-        self.dual_keep = self.dual.take().map(|d| (d.hg, d.core, d.bal));
+        self.dual_keep = self.dual.take().map(|d| DualKeep {
+            arm: d.sec.arm(),
+            hg: d.hg,
+            core: d.core,
+            bal: d.bal,
+        });
         // scene_gpu deliberately SURVIVES: the shared core is scene-bound,
         // not window-bound (device+queue live across d3d.resize), so the
         // re-entry's tracer rebuilds skip the scene upload + BLAS build —
@@ -2475,8 +2519,8 @@ impl GpuContext {
         // state; only the window-bound half is rebuilt.
         let kept = self.dual_keep.take();
         let resumed = kept.is_some();
-        let (mut hg, core, bal) = match kept {
-            Some(k) => k,
+        let (mut hg, core, bal, arm) = match kept {
+            Some(k) => (k.hg, k.core, k.bal, k.arm),
             None => {
                 let f = adapter::create_factory(debug).map_err(|e| format!("factory: {e}"))?;
                 let prim_luid = adapter::luid_of_device(&self.d3d.device);
@@ -2487,10 +2531,41 @@ impl GpuContext {
                     .ok_or("no second hardware adapter")?;
                 let mut hg = trace::HeadlessGpu::from_pick(&pick, debug)?;
                 let dev = hg.device.clone();
+                // WHICH PIPELINE THE SECONDARY RUNS, decided here and once.
+                // The caps probe comes BEFORE the scene upload — the cheapest
+                // place to change our mind, since the core is arm-independent
+                // and both arms take the same Rc. A device that cannot host a
+                // DxrGpu degrades to the wavefront LOUDLY rather than failing
+                // the session: on such a box the wavefront is exactly what the
+                // shipping policy would have picked anyway.
+                let caps = dxr::require_caps(&dev);
+                let arm = dual::arm_for(pick.vendor, self.dual_arm, caps.is_ok());
+                if let Err(e) = &caps {
+                    if self.dual_arm == Some(dual::Arm::Dxr) {
+                        eprintln!(
+                            "dual-gpu: --dual-gpu-arm dxr cannot be honoured on secondary \
+                             \"{}\" ({e}) — its share runs the compute wavefront instead",
+                            pick.name
+                        );
+                    } else if pick.vendor != adapter::Vendor::Intel
+                        && pick.vendor != adapter::Vendor::Other
+                    {
+                        eprintln!(
+                            "dual-gpu: secondary \"{}\" cannot run the DXR pipeline ({e}) — \
+                             its share runs the compute wavefront instead",
+                            pick.name
+                        );
+                    }
+                }
                 let core = std::rc::Rc::new(trace::SceneGpu::new_uploaded(
                     &dev, scene, bvh, &mut hg, bc7_mode,
                 )?);
-                (hg, core, dual::Balancer::new(share, depth, self.dual_auto, dual::SHARE_DWELL))
+                (
+                    hg,
+                    core,
+                    dual::Balancer::new(share, depth, self.dual_auto, dual::SHARE_DWELL),
+                    arm,
+                )
             }
         };
         // A resize can move `depth_full` under the depth the kept balancer
@@ -2508,9 +2583,23 @@ impl GpuContext {
         // `gbuf` mirrored, and both forcing hooks mirrored per frame in
         // `record_trace`, since its own feed list is empty by construction. A
         // plain session mirrors the dummy instead and only `accum` crosses.
-        let tg = trace::TraceGpu::new(
-            &dev, dxc, scene, bvh, core.clone(), rw, rh, gbuf, false, debug, &mut hg,
-        )?;
+        let sec = match arm {
+            dual::Arm::Wave => dual::Secondary::Wave(trace::TraceGpu::new(
+                &dev, dxc, scene, bvh, core.clone(), rw, rh, gbuf, false, debug, &mut hg,
+            )?),
+            // DxrGpu::new needs no upload harness — there is no queue or
+            // submit anywhere in it, unlike TraceGpu::new's software trees.
+            dual::Arm::Dxr => dual::Secondary::Dxr(dxr::DxrGpu::new(
+                &dev,
+                dxc,
+                scene,
+                core.clone(),
+                rw,
+                rh,
+                gbuf,
+                debug,
+            )?),
+        };
         let xf = dual::BandTransfer::new(
             &dev,
             &self.d3d.device,
@@ -2518,8 +2607,9 @@ impl GpuContext {
         )?;
         if !resumed {
             eprintln!(
-                "dual-gpu: secondary \"{}\" at {}/{} rows{} | primary \"{}\"",
+                "dual-gpu: secondary \"{}\" running {} at {}/{} rows{} | primary \"{}\"",
                 hg.adapter_name,
+                arm.name(),
                 bal.rows(),
                 side,
                 if self.dual_auto { ", balancer driving" } else { ", pinned" },
@@ -2529,13 +2619,15 @@ impl GpuContext {
         self.dual = Some(DualState {
             hg,
             core,
-            tg,
+            sec,
             xf,
             bal,
             pack: false,
             ext: false,
             last_sec_ms: 0.0,
             said: false,
+            said_mixed: false,
+            said_pack: false,
         });
         Ok(())
     }
@@ -2572,11 +2664,49 @@ impl GpuContext {
     ) -> Result<()> {
         let Self { dual, trace, d3d, .. } = self;
         let tg = trace.as_ref().ok_or("no wavefront tracer")?;
-        let (rw, rh) = (tg.rw, tg.rh);
-        let Some(d) = dual.as_mut() else {
+        Self::record_split(dual.as_mut(), d3d, dual::Tracer::Wave(tg), p, hybrid, slot)
+    }
+
+    /// The DXR twin of `record_trace` — THE ONE SITE every DXR presenter goes
+    /// through, for the same reason.
+    ///
+    /// `hybrid` is the wavefront's R-key A/B and has no meaning here (this
+    /// pipeline has no reference kernel), so it is not a parameter; the shared
+    /// schedule takes `true` and the DXR arm ignores it.
+    fn record_dxr_trace(&mut self, p: &trace::FrameParams, slot: usize) -> Result<()> {
+        let Self { dual, dxr, d3d, .. } = self;
+        let dg = dxr.as_ref().ok_or("DXR pipeline not initialized")?;
+        Self::record_split(dual.as_mut(), d3d, dual::Tracer::Dxr(dg), p, true, slot)
+    }
+
+    /// The frame schedule itself, for EITHER primary pipeline.
+    ///
+    /// An associated fn rather than a method so its two callers can each
+    /// destructure `Self` against their own tracer field — `record_trace`
+    /// borrows `self.trace`, `record_dxr_trace` `self.dxr`, and neither can be
+    /// reborrowed out of `self` while `dual` and `d3d` are also live.
+    ///
+    /// ONE BODY, NOT TWO TWINS. Nearly every line below is an ordering rule,
+    /// and `dual::Balancer`'s own header records what three hand-copies of a
+    /// fifteen-line tick cost when one of them was fixed and the others were
+    /// not. `dual::Tracer` exists precisely so this does not have to happen a
+    /// second time at a larger scale.
+    fn record_split(
+        dual: Option<&mut DualState>,
+        d3d: &mut D3d,
+        prim: dual::Tracer<'_>,
+        p: &trace::FrameParams,
+        hybrid: bool,
+        slot: usize,
+    ) -> Result<()> {
+        let (rw, rh) = match prim {
+            dual::Tracer::Wave(t) => (t.rw, t.rh),
+            dual::Tracer::Dxr(d) => (d.rw, d.rh),
+        };
+        let tg = prim;
+        let Some(d) = dual else {
             tg.write_cb(slot, p);
-            tg.record_frame(&d3d.list, slot, p, hybrid);
-            return Ok(());
+            return tg.record(&d3d.list, slot, p, hybrid);
         };
         // The secondary must store exactly the pack half the PRIMARY's feed
         // will read — resolved per frame, because `wire_feed_add` can run after
@@ -2585,10 +2715,33 @@ impl GpuContext {
         // has a full-size pack at all, and whether its feed reads the guide
         // half. Both are resolved per frame, because `wire_feed_add` can run
         // after the secondary was built.
-        d.pack = tg.pack_full();
+        //
+        // IT IS THE **AND** OF BOTH SIDES, not the primary alone. A SPACE
+        // cycle can leave them disagreeing (the secondary was built at
+        // whichever session came first, and `init_dxr`'s `gbuf` need not match
+        // `init_trace`'s), and copying a band into a stride-sized dummy is an
+        // out-of-bounds `CopyBufferRegion` — which does NOT fault. The whole
+        // list fails to Close, and the allocator is then permanently broken:
+        // `list Close: The parameter is incorrect` followed by `list Reset`
+        // forever. Degrading the frame is cheap; that is not.
+        let sec = d.sec.as_ref();
+        d.pack = tg.pack_full() && sec.pack_full();
         d.ext = d.pack && tg.gbuf_ext_needed();
-        d.tg.force_gbuf_ext(d.ext);
-        d.tg.force_fsr_sig(d.pack && tg.fsr_sig());
+        sec.force_gbuf_ext(d.ext);
+        sec.force_fsr_sig(d.pack && tg.fsr_sig());
+        // ...AND THE ONE-SIDED CASE MUST DENY THE FRAME, not just narrow the
+        // payload. The AND above stops the out-of-bounds copy, but a primary
+        // that HAS a pack paired with a secondary that has none would still
+        // SPLIT: the primary then renders only its own rows, never writing
+        // `gbuf`/`gbuf_ext` for the band, while `record_feed` dispatches FULL
+        // SCREEN and reads them anyway — stale MVs/depth/albedo from whatever
+        // frame last ran unbanded, handed to the upscaler as if current. That
+        // is a quieter version of the hole the AND exists to prevent, so it
+        // takes the same answer the mixed-arm stand-down does. The reverse
+        // pairing is fine: a primary with no pack has no feed to read one.
+        let pack_denies = (tg.pack_full() && !sec.pack_full()).then_some(
+            "the secondary has no G-buffer pack while the primary's feed reads one",
+        );
 
         // FREEZE THE SPLIT WHILE THE FRAME IS ACCUMULATING, and this is a
         // CORRECTNESS rule rather than the "don't disturb replay" performance
@@ -2603,6 +2756,27 @@ impl GpuContext {
         // user leaves a window in.
         let frozen = p.accumulate && p.frame > 0;
         let rows = d.bal.tick(frozen);
+        // MIXED ARMS CANNOT RENDER EVERY FRAME. The DXR pipeline has no
+        // hemisphere stage at all, so a DXR partner on an fb frame would draw
+        // its band with the bounce tier silently absent — a visibly flatter-lit
+        // band appearing the instant H is pressed, with no error anywhere.
+        // Degrading the FRAME rather than refusing the session is right: fb is
+        // a live toggle, and every non-bounce frame is still splittable.
+        let mixed = (prim.arm() != d.sec.arm()).then(|| dual::mixed_denies(p)).flatten();
+        if let Some(why) = mixed {
+            if !d.said_mixed {
+                d.said_mixed = true;
+                eprintln!("dual-gpu: {why} — these frames render single-GPU");
+            }
+        }
+        if let Some(why) = pack_denies {
+            if !d.said_pack {
+                d.said_pack = true;
+                eprintln!("dual-gpu: {why} — these frames render single-GPU");
+            }
+        }
+        let denied = mixed.or(pack_denies);
+        let rows = if denied.is_some() { 0 } else { rows };
         let (prim_split, sec_split) = trace::TileSplit::for_share(rows, d.bal.depth());
         // ARM BOTH DEVICES OR NEITHER. `set_split` can decline (a depth past
         // the leaf frontier once a small render resolution has moved
@@ -2613,27 +2787,42 @@ impl GpuContext {
         // screen, which is the pre-feature path exactly.
         let band = sec_split.and_then(|sp| {
             let b = sp.row_range(rw, rh)?;
-            if !d.tg.set_split(sp) {
+            if !sec.set_region(sp, rw, rh) {
                 return None;
             }
             Some(b)
         });
-        let armed = band.filter(|_| tg.set_split(prim_split));
+        let armed = band.filter(|_| tg.set_region(prim_split, rw, rh));
         let Some((y0, y1)) = armed else {
-            tg.set_split(trace::TileSplit::ALL);
-            d.tg.set_split(trace::TileSplit::ALL);
+            // `TileSplit::ALL` maps to the whole screen on both arms, and that
+            // is the one region neither can refuse — so the restore always
+            // takes, which is what makes "both or neither" total.
+            let _ = tg.set_region(trace::TileSplit::ALL, rw, rh);
+            let _ = sec.set_region(trace::TileSplit::ALL, rw, rh);
+            // THE ONE EXIT EVERY SINGLE-GPU FRAME TAKES — a deny above, a
+            // declined region here, or a zero share from the balancer itself —
+            // so demoting the tick once, here, covers all three. Without it
+            // `dual_frame_cost` feeds this frame to `observe` as a SPLIT whose
+            // secondary cost nothing, which steps the auto-balancer's share up
+            // on a frame the secondary sat out entirely. (A zero-share tick is
+            // already `Tick::Idle`; marking it again only counts one more idle
+            // frame, which is what it is.)
+            d.bal.mark_unsplit();
             tg.write_cb(slot, p);
-            tg.record_frame(&d3d.list, slot, p, hybrid);
-            return Ok(());
+            return tg.record(&d3d.list, slot, p, hybrid);
         };
         d.bal.mark_ran();
         let strides = dual::fed_strides(d.pack, d.ext);
         tg.write_cb(slot, p);
         {
-            let (hg2, tg2) = (&mut d.hg, &d.tg);
-            tg2.write_cb(0, p);
-            let v2 = hg2.submit(|l| tg2.record_frame(l, 0, p, hybrid))?;
-            tg.record_frame(&d3d.list, slot, p, hybrid);
+            let hg2 = &mut d.hg;
+            sec.write_cb(0, p);
+            // A DXR secondary's `record_frame` can fail where the wavefront's
+            // cannot, so its error joins the DEFERRED set below rather than
+            // being `?`-ed here — the fence is already in flight.
+            let mut rec2 = Ok(());
+            let v2 = hg2.submit(|l| rec2 = sec.record(l, 0, p, hybrid))?;
+            let rec1 = tg.record(&d3d.list, slot, p, hybrid);
             // The primary is now EXECUTING; the wait below overlaps it.
             //
             // THE SPLIT'S ERROR IS DEFERRED PAST THE WAIT, never `?`-ed here.
@@ -2647,13 +2836,13 @@ impl GpuContext {
             let split = d3d.split_frame(slot);
             let t0 = std::time::Instant::now();
             let waited = hg2.wait(v2);
+            // EVERY error above is reported only now, past the wait — see the
+            // comment on `split`. `rec1`/`rec2` join it for the same reason.
+            rec2?;
+            rec1?;
             split?;
             waited?;
-            let src = [
-                dual::Plane { res: &tg2.accum, stride: 12 },
-                dual::Plane { res: &tg2.gbuf, stride: 16 },
-                dual::Plane { res: &tg2.gbuf_ext, stride: 72 },
-            ];
+            let src = sec.fed_planes();
             let mut rec = Ok(());
             hg2.run(|l| rec = d.xf.record_out(l, &src[..strides.len()], rw, y0, y1))?;
             rec?;
@@ -2663,11 +2852,7 @@ impl GpuContext {
             // when this frame's own total is finally known.
             d.last_sec_ms = t0.elapsed().as_secs_f32() * 1e3;
         }
-        let dst = [
-            dual::Plane { res: &tg.accum, stride: 12 },
-            dual::Plane { res: &tg.gbuf, stride: 16 },
-            dual::Plane { res: &tg.gbuf_ext, stride: 72 },
-        ];
+        let dst = tg.fed_planes();
         d.xf.record_in(&d3d.list, &dst[..strides.len()], rw, y0, y1, slot)?;
         Ok(())
     }
@@ -2806,7 +2991,7 @@ impl GpuContext {
         // The secondary carries its OWN constant buffer, so a sky pushed to the
         // primary alone would seam the frame exactly along the split.
         if let Some(d) = &mut self.dual {
-            d.tg.refresh_sky(scene);
+            d.sec.refresh_sky(scene);
         }
     }
 
@@ -2823,7 +3008,7 @@ impl GpuContext {
         // The secondary keeps its own replay key over its own band, and a
         // present error abandons ITS recorded frame too.
         if let Some(d) = &self.dual {
-            d.tg.invalidate_replay();
+            d.sec.as_ref().invalidate_replay();
         }
     }
 
@@ -2901,6 +3086,24 @@ impl GpuContext {
         self.dxr = Some(d);
         // The fuse, over whatever engines the chain wired (--quinlight only).
         self.build_quin(dxc)?;
+        // --dual-gpu, the `init_trace` block verbatim: a DXR session splits too
+        // (the band is `DxrGpu::set_band`, and `TileSplit::row_range` speaks
+        // its units by construction). Built LAST and never fatal — the session
+        // is a working single-GPU one at this point, and a second adapter that
+        // cannot be opened is a missing optimisation, not a failed session.
+        if let Some(share) = self.dual_want {
+            if self.dual.is_none() {
+                match self.build_dual(dxc, scene, bvh, rw, rh, share, gbuf, debug, bc7_mode) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        eprintln!("dual-gpu: unavailable ({e}) — running single-GPU");
+                        // Latch it off: without this every SPACE re-entry
+                        // retries a full second scene upload + BLAS build.
+                        self.dual_want = None;
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -2909,15 +3112,18 @@ impl GpuContext {
     pub fn present_dxr(&mut self, p: &trace::FrameParams, samples: u32) -> Result<()> {
         self.waveviz_src.set(WvSrc::Dxr);
         crate::zone!("present-dxr");
-        let Some(d) = &self.dxr else {
+        if self.dxr.is_none() {
             return Err("DXR pipeline not initialized".into());
-        };
+        }
         let slot = self.d3d.begin_frame()?;
-        d.write_cb(slot, p);
-        if let Err(e) = d.record_frame(&self.d3d.list, slot) {
+        // --dual-gpu goes through the ONE site; the band copy it may record
+        // lands on the frame list BEFORE the full-screen resolve below, which
+        // is what that resolve depends on.
+        if let Err(e) = self.record_dxr_trace(p, slot) {
             self.d3d.abort_frame();
             return Err(e);
         }
+        let d = self.dxr.as_ref().expect("checked above");
         d.record_resolve(&self.d3d.list, slot, samples);
         self.fullscreen_to_backbuffer(true, tonemap::SRV_SLOT_DXR, 1.0);
         self.d3d.end_frame(slot)
@@ -2977,11 +3183,17 @@ impl GpuContext {
                     fc.rw, fc.rh, d.rw, d.rh
                 ));
             }
-            d.write_cb(slot, p);
-            if let Err(e) = d.record_frame(&d3d.list, slot) {
-                d3d.abort_frame();
-                return Err(e);
-            }
+        }
+        // --dual-gpu goes through the ONE site, and it must precede the feed:
+        // `record_feed` dispatches FULL SCREEN and reads the secondary's rows
+        // of the pack, so the band has to have landed on this list first.
+        if let Err(e) = self.record_dxr_trace(p, slot) {
+            self.d3d.abort_frame();
+            return Err(e);
+        }
+        {
+            let d3d = &mut self.d3d;
+            let d = self.dxr.as_ref().unwrap();
             if let Err(e) = d.record_feed(&d3d.list, slot) {
                 d3d.abort_frame();
                 return Err(e);
@@ -3040,14 +3252,16 @@ impl GpuContext {
             return Err("DXR pipeline + XeSS not both initialized".into());
         }
         let slot = self.d3d.begin_frame()?;
+        // --dual-gpu goes through the ONE site, and it must precede the feed:
+        // `record_feed` dispatches FULL SCREEN and reads the secondary's rows
+        // of the pack, so the band has to have landed on this list first.
+        if let Err(e) = self.record_dxr_trace(p, slot) {
+            self.d3d.abort_frame();
+            return Err(e);
+        }
         {
             let d3d = &mut self.d3d;
             let d = self.dxr.as_ref().unwrap();
-            d.write_cb(slot, p);
-            if let Err(e) = d.record_frame(&d3d.list, slot) {
-                d3d.abort_frame();
-                return Err(e);
-            }
             if let Err(e) = d.record_feed(&d3d.list, slot) {
                 d3d.abort_frame();
                 return Err(e);
@@ -3139,11 +3353,17 @@ impl GpuContext {
                     fc.rw, fc.rh, d.rw, d.rh
                 ));
             }
-            d.write_cb(slot, p);
-            if let Err(e) = d.record_frame(&d3d.list, slot) {
-                d3d.abort_frame();
-                return Err(e);
-            }
+        }
+        // --dual-gpu goes through the ONE site, and it must precede the feed:
+        // `record_feed` dispatches FULL SCREEN and reads the secondary's rows
+        // of the pack, so the band has to have landed on this list first.
+        if let Err(e) = self.record_dxr_trace(p, slot) {
+            self.d3d.abort_frame();
+            return Err(e);
+        }
+        {
+            let d3d = &mut self.d3d;
+            let d = self.dxr.as_ref().unwrap();
             if let Err(e) = d.record_feed(&d3d.list, slot) {
                 d3d.abort_frame();
                 return Err(e);
@@ -3500,14 +3720,16 @@ impl GpuContext {
             return Err("DXR pipeline + quinlight fuse not both initialized".into());
         }
         let slot = self.d3d.begin_frame()?;
+        // --dual-gpu goes through the ONE site, and it must precede the feed:
+        // `record_feed` dispatches FULL SCREEN and reads the secondary's rows
+        // of the pack, so the band has to have landed on this list first.
+        if let Err(e) = self.record_dxr_trace(p, slot) {
+            self.d3d.abort_frame();
+            return Err(e);
+        }
         let (rw, rh) = {
             let d3d = &mut self.d3d;
             let d = self.dxr.as_ref().unwrap();
-            d.write_cb(slot, p);
-            if let Err(e) = d.record_frame(&d3d.list, slot) {
-                d3d.abort_frame();
-                return Err(e);
-            }
             if let Err(e) = d.record_feed(&d3d.list, slot) {
                 d3d.abort_frame();
                 return Err(e);
@@ -4247,11 +4469,17 @@ impl GpuContext {
                     fc.rw, fc.rh, d.rw, d.rh
                 ));
             }
-            d.write_cb(slot, p);
-            if let Err(e) = d.record_frame(&d3d.list, slot) {
-                d3d.abort_frame();
-                return Err(e);
-            }
+        }
+        // --dual-gpu goes through the ONE site, and it must precede the feed:
+        // `record_feed` dispatches FULL SCREEN and reads the secondary's rows
+        // of the pack, so the band has to have landed on this list first.
+        if let Err(e) = self.record_dxr_trace(p, slot) {
+            self.d3d.abort_frame();
+            return Err(e);
+        }
+        {
+            let d3d = &mut self.d3d;
+            let d = self.dxr.as_ref().unwrap();
             if let Err(e) = d.record_feed(&d3d.list, slot) {
                 d3d.abort_frame();
                 return Err(e);

@@ -260,6 +260,276 @@ impl BandTransfer {
     }
 }
 
+// --- which pipeline each device runs ------------------------------------
+
+/// Which tracer a device runs its share of the frame through.
+///
+/// `--dual-gpu` is MIXED-MODE by construction: the primary's arm is whatever
+/// the session is in (`--gpu`/`--dxr`/SPACE) and the secondary's is a property
+/// of ITS OWN adapter (`arm_for`). The two are independent and all four
+/// combinations are legal — which is the arrangement `TileSplit::rows`' doc
+/// comment describes, and the reason a band is a contiguous ROW range on both
+/// sides rather than an interleaved mask.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Arm {
+    Wave,
+    Dxr,
+}
+
+impl Arm {
+    /// For the announce lines and the gate reports.
+    pub fn name(self) -> &'static str {
+        match self {
+            Arm::Wave => "wavefront",
+            Arm::Dxr => "DXR",
+        }
+    }
+}
+
+/// Which pipeline a SECONDARY adapter should run, from its own vendor.
+///
+/// Keyed off `AdapterPick::vendor` — a FACT about the device we opened, the
+/// `main::vendor_defaults` discipline — and deliberately NOT
+/// `adapter::picked_vendor()`, which names the PRIMARY and would answer the
+/// wrong question here.
+///
+/// The numbers are `vendor_defaults`' own, read for the secondary role:
+///
+/// * Intel — the WAVEFRONT. THE WORLD frame span 3.30 ms against mode-1 DXR's
+///   5.36 (2026-08-01), and the hybrid wins moving or parked. Arc's RT cores
+///   are weak relative to its shader cores, so proving space empty is worth
+///   more there than RT-core root traversal.
+/// * NVIDIA, AMD — DXR. 0.54-0.72x across every measured scene and spp; not
+///   close on any of them.
+/// * Other — the wavefront: the arm `--dual-gpu` has always shipped, and the
+///   one with no RT-tier floor to clear. An unknown GPU is exactly the case
+///   where a tuned constant is least likely to hold.
+///
+/// `want` is `--dual-gpu-arm` and WINS OUTRIGHT — nothing here may countermand
+/// the command line (the `mode_explicit` rule). `caps` is whether the adapter
+/// can actually host a `DxrGpu`; a device that cannot is never sent to the DXR
+/// arm whatever the vendor table says, which is a soundness rule rather than a
+/// tuning one and is gated separately from the table for exactly that reason.
+pub fn arm_for(vendor: super::adapter::Vendor, want: Option<Arm>, caps: bool) -> Arm {
+    use super::adapter::Vendor;
+    let pick = want.unwrap_or(match vendor {
+        Vendor::Intel | Vendor::Other => Arm::Wave,
+        Vendor::Nvidia | Vendor::Amd => Arm::Dxr,
+    });
+    if pick == Arm::Dxr && !caps { Arm::Wave } else { pick }
+}
+
+/// Why a MIXED-arm split must stand down for this frame, or `None` if it may
+/// run. Checked only when the two devices' arms differ.
+///
+/// The DXR pipeline has no hemisphere stage at all — no `fb_mode`, no bounce
+/// wavefront — so a DXR partner would render its band with the bounce tier
+/// silently absent while the wavefront side integrates it. The shape is a
+/// visibly flatter-lit band appearing the instant H is pressed and vanishing
+/// when it is pressed again, with no error anywhere: exactly the class this
+/// feature's gates exist to make impossible, and unreachable by any synthetic
+/// test because it needs two adapters and a keypress.
+///
+/// Degrading the FRAME (both devices back to the whole screen) is the right
+/// response rather than refusing the session: `fb` is a live toggle, so a
+/// session that armed the split legitimately keeps it for every non-bounce
+/// frame.
+pub fn mixed_denies(p: &super::trace::FrameParams) -> Option<&'static str> {
+    (p.q.fb.ao || p.q.fb.gi).then_some(
+        "hemisphere bounces (H) are a wavefront-only stage — the DXR partner has no bounce tier",
+    )
+}
+
+/// The secondary's tracer, OWNED by `DualState`.
+///
+/// An enum rather than a trait object, matching `--spin`'s `Arm` and
+/// `--cinematic`'s `CineArm`, which already model this exact pair: a trait wide
+/// enough to also serve the PRIMARY role (which needs `record_resolve`,
+/// `record_feed`, `hdr`) would have arms that lie, and `GpuContext` is one
+/// concrete struct threaded through `main.rs`, so a type parameter is not
+/// available.
+pub enum Secondary {
+    Wave(super::trace::TraceGpu),
+    Dxr(super::dxr::DxrGpu),
+}
+
+impl Secondary {
+    pub fn as_ref(&self) -> Tracer<'_> {
+        match self {
+            Secondary::Wave(t) => Tracer::Wave(t),
+            Secondary::Dxr(d) => Tracer::Dxr(d),
+        }
+    }
+
+    pub fn arm(&self) -> Arm {
+        match self {
+            Secondary::Wave(_) => Arm::Wave,
+            Secondary::Dxr(_) => Arm::Dxr,
+        }
+    }
+
+    /// A time-of-day move must reach the secondary's OWN constant buffer. The
+    /// `&mut` is why this lives here rather than on `Tracer`.
+    pub fn refresh_sky(&mut self, scene: &crate::scene::Scene) {
+        match self {
+            Secondary::Wave(t) => t.refresh_sky(scene),
+            Secondary::Dxr(d) => d.refresh_sky(scene),
+        }
+    }
+}
+
+/// Either tracer, BORROWED — the same surface for the PRIMARY role, which is
+/// what lets one schedule (`GpuContext::record_split`) serve both pipelines
+/// instead of two hand-maintained twins of a body whose every line is an
+/// ordering rule. `Balancer`'s own header records what three copies of one
+/// tick cost; this is that lesson applied one level up.
+#[derive(Clone, Copy)]
+pub enum Tracer<'a> {
+    Wave(&'a super::trace::TraceGpu),
+    Dxr(&'a super::dxr::DxrGpu),
+}
+
+impl<'a> Tracer<'a> {
+    pub fn arm(&self) -> Arm {
+        match self {
+            Tracer::Wave(_) => Arm::Wave,
+            Tracer::Dxr(_) => Arm::Dxr,
+        }
+    }
+
+    pub fn write_cb(&self, slot: usize, p: &super::trace::FrameParams) {
+        match self {
+            Tracer::Wave(t) => t.write_cb(slot, p),
+            Tracer::Dxr(d) => d.write_cb(slot, p),
+        }
+    }
+
+    /// `hybrid` is the WAVEFRONT's R-key A/B and is IGNORED by the DXR arm,
+    /// which has no reference kernel. Passing it through rather than splitting
+    /// the method is what keeps ONE call site in the schedule.
+    pub fn record(
+        &self,
+        list: &ID3D12GraphicsCommandList,
+        slot: usize,
+        p: &super::trace::FrameParams,
+        hybrid: bool,
+    ) -> Result<()> {
+        match self {
+            Tracer::Wave(t) => {
+                t.record_frame(list, slot, p, hybrid);
+                Ok(())
+            }
+            Tracer::Dxr(d) => d.record_frame(list, slot),
+        }
+    }
+
+    /// `TraceGpu::set_split` and `DxrGpu::set_band` behind ONE call, so "put
+    /// this device on these rows" and "put it back on the whole screen" are one
+    /// expression on both arms.
+    ///
+    /// `TileSplit::ALL` maps to the DXR side's `(0, rh)`, which `set_band`
+    /// cannot refuse — that is what makes the both-or-neither degrade always
+    /// succeed. A mask that is not a row band answers `false` here rather than
+    /// a bounding box, `row_range`'s own rule.
+    #[must_use = "a refused region still renders the whole screen — the caller must not \
+                  go on to treat this device as banded"]
+    pub fn set_region(&self, sp: super::trace::TileSplit, rw: u32, rh: u32) -> bool {
+        match self {
+            Tracer::Wave(t) => t.set_split(sp),
+            Tracer::Dxr(d) => match sp.row_range(rw, rh) {
+                Some((y0, y1)) => d.set_band(y0, y1),
+                None => {
+                    // Not a row band, so this device cannot express it. Restore
+                    // the whole screen the way a refusal does — never leave the
+                    // previous band standing (the hole class).
+                    let _ = d.set_band(0, rh);
+                    false
+                }
+            },
+        }
+    }
+
+    /// The planes a FED frame's band carries, in `fed_strides` order.
+    /// The one place this array literal lives.
+    pub fn fed_planes(&self) -> [Plane<'a>; 3] {
+        let (accum, gbuf, gbuf_ext) = match self {
+            Tracer::Wave(t) => (&t.accum, &t.gbuf, &t.gbuf_ext),
+            Tracer::Dxr(d) => (&d.accum, &d.gbuf, &d.gbuf_ext),
+        };
+        [
+            Plane { res: accum, stride: 12 },
+            Plane { res: gbuf, stride: super::trace::GBUF_STRIDE },
+            Plane { res: gbuf_ext, stride: super::trace::GBUF_EXT_STRIDE },
+        ]
+    }
+
+    /// The planes a CAPTURE's band carries (`accum` + `info`), in the order
+    /// `--cinematic`'s `CINE_DUAL_STRIDES` packs them. `info` rides along only
+    /// for an overlay shot; the caller slices.
+    pub fn cap_planes(&self) -> [Plane<'a>; 2] {
+        let (accum, info) = match self {
+            Tracer::Wave(t) => (&t.accum, &t.info),
+            Tracer::Dxr(d) => (&d.accum, &d.info),
+        };
+        [Plane { res: accum, stride: 12 }, Plane { res: info, stride: 4 }]
+    }
+
+    /// The upscaler feed. The wavefront's `nppd_color` arm is passed `false`:
+    /// NPPD composes with the interactive XeSS chain only, never with a
+    /// capture, which is the one caller of this method.
+    pub fn record_feed(&self, list: &ID3D12GraphicsCommandList, slot: usize) -> Result<()> {
+        match self {
+            Tracer::Wave(t) => t.record_feed(list, slot, false),
+            Tracer::Dxr(d) => d.record_feed(list, slot),
+        }
+    }
+
+    pub fn pack_full(&self) -> bool {
+        match self {
+            Tracer::Wave(t) => t.pack_full(),
+            Tracer::Dxr(d) => d.pack_full(),
+        }
+    }
+
+    pub fn gbuf_ext_needed(&self) -> bool {
+        match self {
+            Tracer::Wave(t) => t.gbuf_ext_needed(),
+            Tracer::Dxr(d) => d.gbuf_ext_needed(),
+        }
+    }
+
+    pub fn fsr_sig(&self) -> bool {
+        match self {
+            Tracer::Wave(t) => t.fsr_sig(),
+            Tracer::Dxr(d) => d.fsr_sig(),
+        }
+    }
+
+    pub fn force_gbuf_ext(&self, on: bool) {
+        match self {
+            Tracer::Wave(t) => t.force_gbuf_ext(on),
+            Tracer::Dxr(d) => d.force_gbuf_ext(on),
+        }
+    }
+
+    pub fn force_fsr_sig(&self, on: bool) {
+        match self {
+            Tracer::Wave(t) => t.force_fsr_sig(on),
+            Tracer::Dxr(d) => d.force_fsr_sig(on),
+        }
+    }
+
+    /// The DXR arm is a documented NO-OP: that pipeline has no structure to
+    /// replay (no `last_struct`, and `p.replay` is never read there), so there
+    /// is nothing a rebalance could invalidate.
+    pub fn invalidate_replay(&self) {
+        match self {
+            Tracer::Wave(t) => t.invalidate_replay(),
+            Tracer::Dxr(_) => {}
+        }
+    }
+}
+
 // --- the balancer -------------------------------------------------------
 //
 // WHY NOT `xess::ScaleCtl`, which is the obvious thing to reuse and which the
@@ -816,6 +1086,38 @@ impl Balancer {
         self.ran = true;
     }
 
+    /// Mark that this frame did NOT split after all — the driver asked for a
+    /// share and then rendered single-GPU anyway (a mixed-arm stand-down, a
+    /// declined region, a pack disagreement).
+    ///
+    /// IT DEMOTES THE TICK, AND THAT IS THE WHOLE POINT. `tick` has already
+    /// committed `kind = Tick::Split`, and `observe`'s Split arm feeds
+    /// `ctl.update` — which on such a frame gets the frame's whole time as
+    /// `prim_ms` and ZERO as `sec_ms`, reads `err = 1.0`, and steps the share
+    /// UP by the maximum on a frame where the secondary did nothing at all.
+    /// Held H under a mixed-arm pair, that ratchets the share to its ceiling
+    /// while `dual_ms` fills with single-GPU times, so `split_loses` never
+    /// fires either and the balancer resumes at a share it never measured.
+    /// `Tick::Idle` is exactly the "nothing to learn from this frame" state
+    /// `observe` already ignores.
+    ///
+    /// `rows` and `held` are deliberately LEFT ALONE. Zeroing `rows` would
+    /// strand a PINNED balancer at zero forever (nothing outside the `auto`
+    /// arms ever restores it), and zeroing `held` reaches the same place via
+    /// the freeze path — while the share itself is still the right answer for
+    /// the next frame the deny does not cover. Only the FRAME is idle, not the
+    /// decision.
+    /// IDEMPOTENT, because its one caller is the exit that a zero-share tick
+    /// ALSO takes — and `tick` has already counted that frame as idle. An
+    /// unguarded increment would double-count every idle frame in the verdict
+    /// line, which is the sort of drift that makes a counter stop being read.
+    pub fn mark_unsplit(&mut self) {
+        if self.kind != Tick::Idle {
+            self.kind = Tick::Idle;
+            self.idles += 1;
+        }
+    }
+
     /// THE per-frame decision. Returns the rows the secondary takes THIS frame.
     ///
     /// `frozen` holds the current share — each driver decides what freezing
@@ -1021,7 +1323,210 @@ pub fn self_test() -> std::result::Result<(), String> {
         }
     }
 
+    // THE FED STRIDE LIST is what both halves of a copy pack from, and the DXR
+    // planes are the same strides by construction — so the one thing that can
+    // silently drift is this list against the constants the tracers allocate
+    // from. A band copied at a stride the destination does not use lands a
+    // plausible image with displaced bytes; a band copied into a plane sized
+    // for a DIFFERENT stride is an out-of-bounds `CopyBufferRegion`, which does
+    // not fault and instead breaks the command allocator permanently.
+    if fed_strides(true, true)
+        != [12, super::trace::GBUF_STRIDE, super::trace::GBUF_EXT_STRIDE]
+    {
+        return Err(format!(
+            "fed_strides(true, true) = {:?} but the tracers allocate accum 12 / gbuf {} / \
+             gbuf_ext {}",
+            fed_strides(true, true),
+            super::trace::GBUF_STRIDE,
+            super::trace::GBUF_EXT_STRIDE
+        ));
+    }
+    for (pack, ext) in [(false, false), (false, true), (true, false), (true, true)] {
+        for (i, s) in fed_strides(pack, ext).iter().enumerate() {
+            if *s > MAX_FED_STRIDES[i] {
+                return Err(format!(
+                    "fed_strides({pack}, {ext})[{i}] = {s} exceeds MAX_FED_STRIDES[{i}] = {} — \
+                     the staging cap would not cover it and a rebalance would reallocate",
+                    MAX_FED_STRIDES[i]
+                ));
+            }
+        }
+    }
+
+    arm_policy_self_test()?;
+    band_mask_self_test()?;
     balance_self_test()?;
+    Ok(())
+}
+
+/// The vendor -> secondary-arm policy (`arm_for`). Pure, so it gates DLL-free
+/// and GPU-free; the shipping mixed-mode design rests entirely on it.
+fn arm_policy_self_test() -> std::result::Result<(), String> {
+    use super::adapter::Vendor;
+    const VENDORS: [Vendor; 4] = [Vendor::Nvidia, Vendor::Amd, Vendor::Intel, Vendor::Other];
+
+    // THE TABLE, RESTATED rather than re-derived. A policy change must edit
+    // this list, which is the point: the numbers behind each row live in
+    // `arm_for`'s doc comment and a silent flip would otherwise cost a
+    // measurement campaign to notice.
+    for (v, want) in [
+        (Vendor::Nvidia, Arm::Dxr),
+        (Vendor::Amd, Arm::Dxr),
+        (Vendor::Intel, Arm::Wave),
+        (Vendor::Other, Arm::Wave),
+    ] {
+        let got = arm_for(v, None, true);
+        if got != want {
+            return Err(format!(
+                "arm_for({v:?}, default, caps) = {got:?}, the policy says {want:?}"
+            ));
+        }
+    }
+
+    // THE SAFETY INVARIANT, stated separately from the table on purpose: a
+    // secondary that cannot host a `DxrGpu` must never be sent to the DXR arm
+    // for ANY vendor, whatever the table says. Folding it into the rows above
+    // would make it a typo away from gone.
+    for v in VENDORS {
+        for want in [None, Some(Arm::Wave), Some(Arm::Dxr)] {
+            if arm_for(v, want, false) == Arm::Dxr {
+                return Err(format!(
+                    "arm_for({v:?}, {want:?}, caps=false) chose the DXR arm — a secondary \
+                     without RT tier 1.0 cannot construct a DxrGpu at all"
+                ));
+            }
+        }
+    }
+
+    // An explicit --dual-gpu-arm wins over the vendor table (the command line
+    // is never countermanded), but not over the caps floor above.
+    for v in VENDORS {
+        for want in [Arm::Wave, Arm::Dxr] {
+            let got = arm_for(v, Some(want), true);
+            if got != want {
+                return Err(format!(
+                    "arm_for({v:?}, Some({want:?}), caps) = {got:?} — an explicit \
+                     --dual-gpu-arm must win over the vendor policy"
+                ));
+            }
+        }
+    }
+
+    // Determinism, and ANTI-VACUITY: both arms must be reachable across the
+    // enumeration. A selector stubbed to one answer would satisfy a loosely
+    // written table check while turning mixed mode structurally off.
+    let mut saw = (false, false);
+    for v in VENDORS {
+        for caps in [false, true] {
+            let a = arm_for(v, None, caps);
+            if a != arm_for(v, None, caps) {
+                return Err(format!("arm_for({v:?}, default, {caps}) is not deterministic"));
+            }
+            match a {
+                Arm::Wave => saw.0 = true,
+                Arm::Dxr => saw.1 = true,
+            }
+        }
+    }
+    if !(saw.0 && saw.1) {
+        return Err(format!(
+            "the arm policy answered only {} across every enumerated pairing — mixed mode is \
+             structurally off and the table above proves nothing",
+            if saw.0 { "the wavefront" } else { "DXR" }
+        ));
+    }
+    Ok(())
+}
+
+/// A DXR pixel-row BAND and a wavefront tile MASK must be the same partition.
+///
+/// This is what mixed mode rests on and nothing checked it: `split_self_test`
+/// proves `row_range` is a contiguous band and that its seam matches
+/// `rect_for_path`, but never against `owns_px`, which is what `cs_compose`
+/// actually bands on. A disagreement is a seam — a stripe of pixels rendered
+/// twice or not at all, exactly at the join between the two devices.
+fn band_mask_self_test() -> std::result::Result<(), String> {
+    use super::trace::TileSplit;
+    // Odd dimensions are in the list deliberately: the row seam comes out of
+    // the quadtree's MIDPOINT recursion, not from `rh/side`, so a rounding
+    // disagreement can only appear where the two do not coincide.
+    for (rw, rh) in [(1920u32, 1080u32), (800, 600), (533, 400), (801, 601)] {
+        for depth in 1..=super::trace::MAX_SPLIT_DEPTH {
+            let side = 1u32 << depth;
+            for share in 1..side {
+                let (prim, sec) = TileSplit::for_share(share, depth);
+                let sec = sec.ok_or_else(|| {
+                    format!("for_share({share}, {depth}) gave no secondary at a nonzero share")
+                })?;
+                let (p0, p1) = prim.row_range(rw, rh).ok_or_else(|| {
+                    format!("primary of for_share({share}, {depth}) is not a row band")
+                })?;
+                let (b0, b1) = sec.row_range(rw, rh).ok_or_else(|| {
+                    format!("secondary of for_share({share}, {depth}) is not a row band")
+                })?;
+                // Adjacency and coverage: the pair must tile [0, rh) with no
+                // gap and no overlap, and neither side may be empty.
+                if p0 != 0 || p1 != b0 || b1 != rh {
+                    return Err(format!(
+                        "{rw}x{rh} d{depth} s{share}: A [{p0},{p1}) and B [{b0},{b1}) do not \
+                         tile [0,{rh}) exactly"
+                    ));
+                }
+                if p1 == p0 || b1 == b0 {
+                    return Err(format!(
+                        "{rw}x{rh} d{depth} s{share}: a device got no rows ([{p0},{p1}) / \
+                         [{b0},{b1}))"
+                    ));
+                }
+                // ...and the load-bearing one: per pixel, the wavefront's mask
+                // and the DXR band must agree about who owns it.
+                let (mut bad, mut saw) = (0u64, (false, false));
+                for y in 0..rh {
+                    for x in 0..rw {
+                        let by_mask = sec.owns_px(x, y, rw, rh);
+                        let by_band = y >= b0 && y < b1;
+                        if by_mask != by_band {
+                            bad += 1;
+                        }
+                        match by_mask {
+                            true => saw.0 = true,
+                            false => saw.1 = true,
+                        }
+                    }
+                }
+                if bad != 0 {
+                    return Err(format!(
+                        "{rw}x{rh} d{depth} s{share}: {bad} px where the tile mask and the row \
+                         band [{b0},{b1}) disagree about ownership — mixed mode seams there"
+                    ));
+                }
+                // ANTI-VACUITY: a `row_range` degenerated to (0, rh) paired
+                // with an always-true `owns_px` would agree trivially.
+                if !(saw.0 && saw.1) {
+                    return Err(format!(
+                        "{rw}x{rh} d{depth} s{share}: owns_px answered {} for every pixel — \
+                         the agreement above is vacuous",
+                        saw.0
+                    ));
+                }
+            }
+        }
+    }
+    // The zero-share identity the whole safety argument rests on: no secondary
+    // at all, and a primary that is depth 0 (`TileSplit::ALL`), which every
+    // consumer branches AROUND. `row_range` must then answer the whole screen,
+    // because that is the un-refusable restore `set_region` degrades to.
+    let (all, none) = TileSplit::for_share(0, 3);
+    if none.is_some() {
+        return Err("for_share(0, _) must yield NO secondary — the caller has to skip the \
+                    submit and the transfer outright, not hand it an empty mask"
+            .into());
+    }
+    if all.row_range(1920, 1080) != Some((0, 1080)) {
+        return Err("TileSplit::ALL must span the whole frame — set_region's restore maps it \
+                    to the one band DxrGpu::set_band cannot refuse"
+            .into());
+    }
     Ok(())
 }
 

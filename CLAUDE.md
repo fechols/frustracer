@@ -2161,6 +2161,182 @@ cargo run --release -- --no-blas-split  # A/B lever (GPU only) BACK to ONE BLAS 
                                         # Run --check-gpu/--check-dxr --no-blas-split to gate the
                                         # single-BLAS arm; --check* NEVER loads the world, so the
                                         # Intel removal above is reachable only interactively
+cargo run --release -- --dual-gpu 4      # SPLIT THE FRAME ACROSS TWO ADAPTERS (src/gpu/dual.rs;
+                                        # DEFAULT OFF, --no-dual-gpu spells it). N = the
+                                        # SECONDARY's share of the 8 level-`--dual-gpu-depth`
+                                        # tile ROWS, 1..=7 (bare --dual-gpu = 2); the primary
+                                        # keeps the top rows. Eighths rather than a boolean
+                                        # because the optimal share is NOT the compute-balanced
+                                        # one and cannot be guessed: it minimises
+                                        # max(T(1-s), r*T*s + s*K) over payload, link speed AND
+                                        # tracer cost. `--dual-gpu-auto` hands it to
+                                        # dual::Balancer (N is then the STARTING share) which
+                                        # converges to that optimum and SAYS SO — a silent zero
+                                        # is indistinguishable from a feature that never armed,
+                                        # which is why the settle verdict prints.
+                                        # THE SPLIT IS A CONTIGUOUS ROW BAND on both sides, and
+                                        # that shape is what makes MIXED MODE work: the
+                                        # wavefront expresses it as a `TileSplit` tile mask
+                                        # (level_finish's ownership test + cs_compose's
+                                        # split_owns_px), DXR as a shrunken DispatchRays grid
+                                        # (`DxrGpu::set_band`; rw/rh stay full-screen in the CB
+                                        # and `band_id` lifts every DispatchRaysIndex back to
+                                        # absolute, so ray_dir, sample_pos, the sky-LOD lattice
+                                        # index and the cloud dither hash are unchanged BY
+                                        # CONSTRUCTION). `TileSplit::row_range` converts one to
+                                        # the other and answers None — never a bounding box —
+                                        # for any mask that is not a band.
+                                        # EITHER DEVICE RUNS EITHER PIPELINE. The primary's arm
+                                        # is the session's (--gpu/--dxr/SPACE); the SECONDARY's
+                                        # follows ITS OWN adapter's vendor (dual::arm_for —
+                                        # Intel -> wavefront, NVIDIA/AMD -> DXR, the
+                                        # vendor_defaults discipline keyed off AdapterPick::
+                                        # vendor, a FACT, not adapter::picked_vendor(), which
+                                        # names the primary). `--dual-gpu-arm wave|dxr` forces
+                                        # it (and ARMS --dual-gpu at its default if it wasn't
+                                        # already — the --dual-gpu-auto rule: an arm forced on a
+                                        # device that was never opened is a silent no-op); a
+                                        # secondary without RT tier 1.0 degrades to the
+                                        # wavefront loudly whatever is asked, which is
+                                        # soundness rather than policy and is gated separately
+                                        # from the vendor table for exactly that reason.
+                                        # ONE SITE PER PIPELINE: GpuContext::record_split is the
+                                        # schedule (secondary submit -> primary record ->
+                                        # d3d.split_frame -> wait -> band out -> hop -> band in),
+                                        # reached by record_trace's six wavefront presenters and
+                                        # record_dxr_trace's six DXR ones, so the feature cannot
+                                        # be half-wired. `split_frame` is what makes it
+                                        # CONCURRENT rather than serial. ORDERING RULES, each of
+                                        # which has shipped wrong once: arm the SECONDARY first
+                                        # and narrow the primary only once it took (a refused
+                                        # primary beside an armed secondary renders the band
+                                        # twice); both or neither, restoring to TileSplit::ALL,
+                                        # which maps to the one region neither arm can refuse;
+                                        # freeze the split while `p.accumulate && p.frame > 0`
+                                        # (accum is per-device — a row that moves mid-
+                                        # accumulation holds fewer samples than record_resolve
+                                        # divides by: a dark band, darker the later the move)
+                                        # and NEVER on p.replay, which would freeze a parked
+                                        # session forever; every error DEFERRED past the wait
+                                        # (returning with the secondary's fence in flight leaves
+                                        # the next submit resetting an executing allocator,
+                                        # which removes the adapter); and `record_feed`/
+                                        # `record_resolve` are FULL-SCREEN, so the band must
+                                        # land on the list before them.
+                                        # WHAT CROSSES: accum 12 B/px always, + GBufCore 16 and
+                                        # GBufExt 72 when the primary's feed reads them
+                                        # (dual::fed_strides — 28 B/px for XeSS/FSR3, 100 for
+                                        # RR/FSR4-RR, paid EVERY frame on an interactive path
+                                        # against a capture's once per OUTPUT frame). `pack_full`
+                                        # is the AND of both sides: copying a band into a
+                                        # stride-sized dummy is an out-of-bounds
+                                        # CopyBufferRegion, which does NOT fault — the list
+                                        # fails to Close and the allocator is permanently broken.
+                                        # AND THE ONE-SIDED CASE DENIES THE FRAME rather than
+                                        # just narrowing the payload: a primary that HAS a pack
+                                        # beside a secondary that has none would still SPLIT, so
+                                        # the primary never writes gbuf/gbuf_ext for the band
+                                        # while record_feed reads them FULL-SCREEN — stale
+                                        # MVs/depth/albedo handed to the upscaler as if current,
+                                        # the quieter half of the same hole (the reverse pairing
+                                        # is fine: a primary with no pack has no feed to read
+                                        # one). Same answer as the mixed-arm stand-down, its own
+                                        # once-per-episode line.
+                                        # The secondary has no feed of its own, so
+                                        # force_gbuf_ext/force_fsr_sig are mirrored onto it per
+                                        # frame (without the latter an FSR4-RR session gets zeros
+                                        # for dd/ds/ao/ind_s in the secondary's rows — a black
+                                        # band, present only under --fsr4).
+                                        # MIXED ARMS STAND DOWN ON fb FRAMES (dual::mixed_denies):
+                                        # DXR has no hemisphere stage at all, so a DXR partner
+                                        # would draw its band with the bounce tier absent — a
+                                        # flatter-lit band appearing the instant H is pressed.
+                                        # --cinematic additionally forces a wavefront secondary
+                                        # for GI shots (same reason) and for overlay shots (the
+                                        # band carries `info`, and DXR's info is the CONSTANT
+                                        # pack_info(0, KIND_LEAF), not a quadtree depth).
+                                        # EVERY DENIED FRAME DEMOTES ITS TICK (Balancer::
+                                        # mark_unsplit, called from record_split's ONE
+                                        # single-GPU exit — a deny, a declined region, or a
+                                        # zero share all land there): `tick` has already
+                                        # committed kind=Split, and observe's Split arm would
+                                        # then feed ctl.update the whole frame as prim_ms and
+                                        # ZERO as sec_ms, read err=1.0, and step the share UP on
+                                        # a frame the secondary sat out — so held H under a
+                                        # mixed pair ratchets to the ceiling while dual_ms fills
+                                        # with single-GPU times and split_loses never fires.
+                                        # Tick::Idle is the state observe already ignores. rows
+                                        # and held are deliberately LEFT ALONE: zeroing rows
+                                        # strands a PINNED balancer at zero forever (nothing
+                                        # outside the auto arms restores it) and zeroing held
+                                        # reaches the same place through the freeze path. Only
+                                        # the FRAME is idle, not the decision. --spin and
+                                        # --cinematic never had this: they pass literal zeros to
+                                        # observe, which ShareCtl::update early-returns on.
+                                        # MEASURED on this box (4090 primary + Arc Pro B70
+                                        # secondary, the second x16-length slot electrically x4):
+                                        # IT LOSES, and the transfer is the whole cost.
+                                        # --spin path --dxr 1080p: single 0.37 ms/frame, pinned
+                                        # 4/8 11.61 (band-out 2.57 + hop 0.51 + band-in 3.81 =
+                                        # 6.89 of it, prim-wait 0.00 at every share — the primary
+                                        # always finishes first and waits on the wire),
+                                        # --dual-gpu-auto 1.01 and settles at 0 of 8 with its
+                                        # verdict. The wavefront arm reads the same shape. THE
+                                        # ONE CONFIGURATION THAT WINS is a --cinematic GI capture
+                                        # (2/8, 4-8%), where the band crosses once per OUTPUT
+                                        # frame and amortises over shot.samples. A phase table
+                                        # summing to ~0.01 ms with every share within noise of
+                                        # the baseline is the a28953c signature of a run that
+                                        # measured single-GPU and reported it as a free split.
+                                        # --spin-warmup: derives from picked_vendor() = the
+                                        # PRIMARY, so a NVIDIA-primary run defaults to 20 frames
+                                        # while an Intel SECONDARY needs 1600 — pass it
+                                        # explicitly or every number is the Arc async-compile
+                                        # fallback (recorded in abf7b28; no code guards it).
+                                        # Gates: dual::self_test + trace::split_self_test in
+                                        # --check (payload/ring arithmetic, convergence to the
+                                        # analytic optimum s* = T/(T(1+r)+K), the interfering-box
+                                        # family, the PINNED-balancer sweep, the freeze family,
+                                        # the vendor-arm policy table with its caps invariant
+                                        # stated SEPARATELY, the band-vs-owns_px agreement
+                                        # sweep — the last is the one nothing checked and its
+                                        # teeth are that an owns_px midpoint flip fires 1920 px
+                                        # at 1080p while split_self_test stays green);
+                                        # --check-dxr's band sweep (11 complementary pairs over
+                                        # depth 1..=3, dirtied by a YAW because a dolly leaves
+                                        # sky bit-identical and left 83 of 600 rows blind,
+                                        # accum + tbuf scored both directions, the partition
+                                        # proof, the mask-vs-band cross-check, dg.band() vs what
+                                        # was asked, and per-ROW anti-vacuity); --check-gpu's
+                                        # wavefront split + two-device families; and a
+                                        # cargo-test source gate that every DispatchRaysIndex()
+                                        # in dxr.hlsl is band_id-lifted (comments MUST be
+                                        # stripped first — two of the seven occurrences are
+                                        # prose); and --check-dxr's TWO-DEVICE gate, which runs
+                                        # BOTH arms (DXR+DXR, skipped loudly when the secondary
+                                        # lacks RT tier 1.0, and DXR+wavefront, which is what
+                                        # arm_for actually picks here) over every share at
+                                        # depth 1..=2 and does the REAL transfer.
+                                        # THAT GATE CLOSES THE HOLE THE WAVEFRONT TWO-DEVICE
+                                        # FAMILY DOCUMENTS IN ITSELF ("sensitive to a MISPLACED
+                                        # copy, not to an absent one"): rendering A's reference
+                                        # just before the split leaves A's out-of-band rows
+                                        # stale-CORRECT, so a transfer that never happened
+                                        # compares clean. Here A's plane is dirtied with a
+                                        # different pose first and read TWICE — PRE, over the
+                                        # BAND ROWS ONLY (whole-frame would dilute by the share
+                                        # and make the teeth a function of the split), must be
+                                        # visibly wrong, ASSERTED at >= 0.1; TRANSFERRED,
+                                        # whole-frame, must be right. MEASURED: clean 6e-7..2e-6
+                                        # against a 1e-3 limit, absent copy 1.47e-1 (147x over,
+                                        # 343398 hot channels vs 720), one-row-misplaced copy
+                                        # 4.36e-2 — matching the wavefront gate's own recorded
+                                        # 4.3e-2 for that revert. Structure (the pair tiles the
+                                        # frame exactly, neither device empty) stays EXACT on
+                                        # every pairing; radiance relaxes when the arms or the
+                                        # vendors differ, since either means two intersectors on
+                                        # one HLSL source. Both adapter orientations pass
+                                        # (--prefer-intel flips which card is A)
 cargo run --release -- --no-cut-rays    # A/B lever: cut-SEEDED rays (primary leaf-tile rays)
                                         # traverse from the BVH root instead; the inherited
                                         # t_start is a scalar and survives. Isolates what the

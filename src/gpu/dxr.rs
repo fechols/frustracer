@@ -453,6 +453,23 @@ pub struct DxrGpu {
     /// exists and why mixed-mode forces the contiguous-band shape on the
     /// wavefront side too.
     band: std::cell::Cell<(u32, u32)>,
+    /// Once-per-episode latch for `set_band`'s refusals — the twin of
+    /// `TraceGpu::split_refused`. Without it a per-frame dual loop under
+    /// `--waveviz` prints a line PER FRAME on a device that is refusing every
+    /// one of them, which buries every other diagnostic in the session.
+    ///
+    /// Cleared only by a NON-TRIVIAL accept (see `set_band`): the degrade arm
+    /// restores `(0, rh)` on both devices every frame, so an unguarded clear
+    /// re-arms the announce each frame and restores the spam exactly.
+    band_refused: std::cell::Cell<bool>,
+    /// Test/dual hook — the twin of `TraceGpu::force_fsr_sig`. A `--dual-gpu`
+    /// SECONDARY has an empty `feed` by construction, so it cannot derive the
+    /// signal-split flag the way `write_cb` otherwise does; the primary
+    /// mirrors its own onto it per frame. Without this a DXR secondary in an
+    /// FSR4-RR session stores the wrong pack half and the denoiser reads zeros
+    /// for dd/ds/ao/ind_s across the secondary's rows — a black band, present
+    /// only under `--fsr4`.
+    force_fsr_sig: std::cell::Cell<bool>,
     gbuf_full: bool,
     /// RGBA16F resolve target; rests in PIXEL_SHADER_RESOURCE between frames
     /// (the tonemap PS reads it via SRV_SLOT_DXR).
@@ -1561,6 +1578,8 @@ impl DxrGpu {
             force_gbuf_ext: std::cell::Cell::new(false),
             sway_t: std::cell::Cell::new(None),
             band: std::cell::Cell::new((0, rh)),
+            band_refused: std::cell::Cell::new(false),
+            force_fsr_sig: std::cell::Cell::new(false),
             sway_mv_t: std::cell::Cell::new(None),
             sway_mv_on: !sway_def.is_empty(),
             mode3,
@@ -1586,9 +1605,52 @@ impl DxrGpu {
         })
     }
 
-    /// See `TraceGpu::force_gbuf_ext` — gates only.
+    /// See `TraceGpu::force_gbuf_ext` — gates, and the `--dual-gpu` secondary
+    /// (which has no feed of its own to derive the flag from).
     pub fn force_gbuf_ext(&self, on: bool) {
         self.force_gbuf_ext.set(on);
+    }
+
+    /// See `TraceGpu::force_fsr_sig`. Mirrored onto a `--dual-gpu` SECONDARY
+    /// from the primary every frame — see the field for the black band that
+    /// omitting it produces.
+    pub fn force_fsr_sig(&self, on: bool) {
+        self.force_fsr_sig.set(on);
+    }
+
+    /// Whether the pack buffers are the full `rw*rh` allocation rather than
+    /// the stride-sized dummies a plain session gets. The `TraceGpu::pack_full`
+    /// twin, and a MEMORY-SAFETY read for `--dual-gpu`: copying a band into a
+    /// dummy is an out-of-bounds `CopyBufferRegion`, which does not fault —
+    /// the whole list fails to Close and the allocator is then permanently
+    /// broken (see `TraceGpu::pack_full` for the measured shape).
+    pub fn pack_full(&self) -> bool {
+        self.gbuf_full
+    }
+
+    /// Whether this frame stores the pack's EXT half. The `TraceGpu`
+    /// twin, minus its NPPD term — this pipeline has no NPPD arm.
+    pub fn gbuf_ext_needed(&self) -> bool {
+        self.force_gbuf_ext.get()
+            || self
+                .feed
+                .iter()
+                .any(|(k, _)| matches!(k, trace::FeedKind::Rr | trace::FeedKind::FsrRr))
+    }
+
+    /// Whether this frame stores FSR-RR's demodulated signal lanes. The
+    /// `TraceGpu::fsr_sig` twin; `force_fsr_sig` is what lets a secondary
+    /// answer true with an empty feed.
+    pub fn fsr_sig(&self) -> bool {
+        self.force_fsr_sig.get()
+            || self.feed.iter().any(|(k, _)| matches!(k, trace::FeedKind::FsrRr))
+    }
+
+    /// The band `record_frame` will dispatch — gates only, and deliberately
+    /// not the same claim as `set_band` returning true: this is the value the
+    /// DISPATCH_RAYS_DESC height is actually derived from.
+    pub fn band(&self) -> (u32, u32) {
+        self.band.get()
     }
 
     /// FR_WIDTH: the DXR width sink (slot 0 = raygen, slot 1 = cs_dxr_shade),
@@ -1624,21 +1686,36 @@ impl DxrGpu {
     #[must_use = "a refused band still renders the whole screen — the caller must not \
                   go on to score it as a band"]
     pub fn set_band(&self, y0: u32, y1: u32) -> bool {
-        if y0 >= y1 || y1 > self.rh {
-            eprintln!(
-                "dxr: band {y0}..{y1} is empty or past the {}-row frame — keeping the whole screen",
+        let why = if y0 >= y1 || y1 > self.rh {
+            Some(format!(
+                "band {y0}..{y1} is empty or past the {}-row frame",
                 self.rh
-            );
+            ))
+        } else if (y0, y1) != (0, self.rh) && trace::waveviz_on() {
+            Some(
+                "--waveviz measures launch PACKING, which a banded dispatch changes by \
+                 construction"
+                    .into(),
+            )
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            // Once per REFUSAL EPISODE, not once per call: the caller is a
+            // per-frame loop, and a device refusing every frame would
+            // otherwise print at frame rate.
+            if !self.band_refused.replace(true) {
+                eprintln!("dxr: {why} — keeping the whole screen");
+            }
             self.band.set((0, self.rh));
             return false;
         }
-        if (y0, y1) != (0, self.rh) && trace::waveviz_on() {
-            eprintln!(
-                "dxr: --waveviz measures launch PACKING, which a banded dispatch changes by \
-                 construction — keeping the whole screen"
-            );
-            self.band.set((0, self.rh));
-            return false;
+        // Clear on a NON-TRIVIAL accept only. The both-or-neither degrade arm
+        // restores `(0, rh)` on every refused frame, and that restore is an
+        // accept — clearing on it re-arms the announce each frame and gives
+        // back the per-frame spam this latch exists to stop.
+        if (y0, y1) != (0, self.rh) {
+            self.band_refused.set(false);
         }
         self.band.set((y0, y1));
         true
@@ -1654,17 +1731,14 @@ impl DxrGpu {
         // U-key live changes and every check path route through here).
         self.spp.set(p.spp.max(1));
         // One FSR4-RR subscriber among the wired engines is enough to arm the
-        // pack's signal lanes (--quinlight can wire several).
-        let fsr_sig = self.feed.iter().any(|(k, _)| matches!(k, trace::FeedKind::FsrRr));
-        // ...and one RR/FSR-RR subscriber is enough to require the pack's
-        // guide/signal half. DXR has no NPPD arm, so unlike TraceGpu's
-        // `gbuf_ext_needed` there is no nppd term here.
-        let gbuf_ext = self.force_gbuf_ext.get()
-            || self
-                .feed
-                .iter()
-                .any(|(k, _)| matches!(k, trace::FeedKind::Rr | trace::FeedKind::FsrRr));
-        let mut cb = self.cb_base.with_frame(p, self.gbuf_full, fsr_sig, gbuf_ext);
+        // pack's signal lanes (--quinlight can wire several); one RR/FSR-RR
+        // subscriber is enough to require the pack's guide/signal half.
+        //
+        // Both go through the ACCESSORS rather than being re-derived here, so
+        // a `--dual-gpu` secondary's forced values actually reach the CB — a
+        // forced flag that write_cb re-derives past is written and never read.
+        let mut cb =
+            self.cb_base.with_frame(p, self.gbuf_full, self.fsr_sig(), self.gbuf_ext_needed());
         // Sway MVs: arm the flag + the ring-slot base, and stash the clock
         // pair for record_frame's dmv fill — one predicate (sway_mv_pair +
         // the compile-in) drives both, the TraceGpu discipline.
@@ -2235,7 +2309,7 @@ mod mode3_shader_source_tests {
 
 #[cfg(test)]
 mod sbt_recurse_shader_source_tests {
-    use super::{trace, DXR_HLSL, RT_DXR_HLSLI};
+    use super::{trace, DXR_HLSL, DXR_SHADE_HLSL, RT_DXR_HLSLI};
 
     /// The recursion's whole routing contract is ONE TraceRay line:
     /// RayContribution 0 (the class-major triplet's SHADING slot — the
@@ -2307,5 +2381,87 @@ mod sbt_recurse_shader_source_tests {
             arm.contains("asuint(p.sp.x)"),
             "the recursion branch must pass the payload's depth into shade_split"
         );
+    }
+
+    /// Strip `//`-to-end-of-line comments, PRESERVING byte offsets (comment
+    /// bytes become spaces) so a failure can name a real position.
+    ///
+    /// Mandatory for the scan below, not tidiness: `dxr.hlsl` carries the
+    /// literal `DispatchRaysIndex()` in TWO comments (the `band_id` header and
+    /// the miss shader's sky-LOD note), so a naive scan fails on CORRECT code.
+    /// The pre-commit hook's own first draft "passed" by matching nothing for
+    /// the mirror-image reason; a scanner has to be shown its own blind spot.
+    fn strip_line_comments(src: &str) -> String {
+        let b = src.as_bytes();
+        let mut out = Vec::with_capacity(b.len());
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'/' {
+                while i < b.len() && b[i] != b'\n' {
+                    out.push(b' ');
+                    i += 1;
+                }
+            } else {
+                out.push(b[i]);
+                i += 1;
+            }
+        }
+        String::from_utf8(out).expect("ascii-preserving strip")
+    }
+
+    /// `--dual-gpu`: a banded DispatchRays shrinks the GRID, so every
+    /// `DispatchRaysIndex()` must be lifted back to absolute by `band_id` or it
+    /// addresses the wrong pixel — and in inline modes 0-2 there is no bounds
+    /// check anywhere, so an unlifted index WRITES PAST THE PLANE.
+    ///
+    /// Five sites carry the lift today (raygen, the waveviz CHS mint,
+    /// chs_shade's gbuf write, the miss shader's sky-LOD and its cloud dither).
+    /// A sixth added without it is the hole class, and on a single-adapter box
+    /// no GPU gate can see it — this one runs in `cargo test`.
+    ///
+    /// Deliberately NOT pinned to an exact site count: new lifted sites are
+    /// expected, and the loop already requires each one to be lifted. It
+    /// asserts nothing about formatting, line numbers, or `band_id`'s body
+    /// beyond its dependence on the band's own root constant.
+    #[test]
+    fn every_dispatch_rays_index_is_band_lifted() {
+        let src = strip_line_comments(DXR_HLSL);
+        let mut n = 0;
+        for (i, _) in src.match_indices("DispatchRaysIndex()") {
+            assert!(
+                src[..i].trim_end().ends_with("band_id("),
+                "dxr.hlsl: a DispatchRaysIndex() at byte {i} is not wrapped in band_id() — a \
+                 banded --dual-gpu dispatch would address the wrong pixel there, and in inline \
+                 modes 0-2 write past the plane"
+            );
+            n += 1;
+        }
+        // Anti-vacuity: a rename or a refactor that removed every occurrence
+        // would otherwise pass this trivially.
+        assert!(n >= 5, "expected at least the 5 known lifted sites, found {n}");
+        assert!(
+            src.contains("uint2 band_id(uint2 id)"),
+            "band_id must exist for the scan above to mean anything"
+        );
+        assert!(
+            src[src.find("uint2 band_id(uint2 id)").unwrap()..]
+                .lines()
+                .take(4)
+                .any(|l| l.contains("push1")),
+            "band_id must lift by the band's own root constant (push1)"
+        );
+    }
+
+    /// Mode 3's deferred compute half has no `DispatchRaysIndex` — it lifts by
+    /// hand — and it must do so BEFORE it derives a pixel index. A full-screen
+    /// compute grid beside a banded dispatch shades rows this device never
+    /// wrote, from a `hitrec` that is stale or uninitialised VRAM.
+    #[test]
+    fn deferred_shade_lifts_and_clamps_before_indexing() {
+        let src = strip_line_comments(DXR_SHADE_HLSL);
+        let lift = src.find("id.y += push1").expect("dxr_shade.hlsl: no band lift");
+        let clamp = src.find("id.y >= push2").expect("dxr_shade.hlsl: no band clamp");
+        let pi = src.find("uint pi =").expect("dxr_shade.hlsl: no pixel index");
+        assert!(lift < pi && clamp < pi, "the band lift and clamp must precede the pixel index");
     }
 }
