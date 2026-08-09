@@ -34,6 +34,7 @@ pub mod quin;
 pub mod rr;
 pub mod bc7gpu;
 pub mod bloom;
+pub mod frd_gpu;
 pub mod nrd_gpu;
 pub mod tonemap;
 pub mod trace;
@@ -151,6 +152,94 @@ pub enum WiredUpscaler {
     Xess,
     Fsr3,
     Plain,
+}
+
+/// Which pre-upscale denoiser a session asks for (the ONE slot both GPU arms
+/// share). Computed once in main from the post-exclusivity Opts and passed to
+/// init_trace/init_dxr — the FsrRes variant-IS-the-fact discipline.
+#[derive(Clone, Copy)]
+pub enum DnKind<'a> {
+    /// NRD (ReBLUR) — the directory holding NRD.dll.
+    Nrd(&'a str),
+    /// FRD — the from-scratch engine (src/frd.rs); no external artifact,
+    /// kernels compile through the session DXC like every other unit.
+    Frd,
+}
+
+/// The live engine in that slot. One enum rather than two Options so
+/// one-denoiser-per-session is structural, and so nrd_frame_step / the shed
+/// machinery / the presenters' `is_some()` predicates work engine-blind.
+enum DnGpu {
+    Nrd(nrd_gpu::NrdGpu),
+    Frd(frd_gpu::FrdGpu),
+}
+
+impl DnGpu {
+    fn size(&self) -> (u32, u32) {
+        match self {
+            DnGpu::Nrd(g) => (g.rw, g.rh),
+            DnGpu::Frd(g) => (g.rw, g.rh),
+        }
+    }
+
+    fn tag(&self) -> &'static str {
+        match self {
+            DnGpu::Nrd(_) => "nrd",
+            DnGpu::Frd(_) => "frd",
+        }
+    }
+
+    fn matches(&self, kind: &DnKind) -> bool {
+        matches!(
+            (self, kind),
+            (DnGpu::Nrd(_), DnKind::Nrd(_)) | (DnGpu::Frd(_), DnKind::Frd)
+        )
+    }
+
+    // The wire-plane accessors arm_denoiser_for's register block reads —
+    // identical names/formats on both engines (the FrdGpu plane contract).
+    fn plane_in_mv(&self) -> &ID3D12Resource {
+        match self {
+            DnGpu::Nrd(g) => g.plane_in_mv(),
+            DnGpu::Frd(g) => g.plane_in_mv(),
+        }
+    }
+    fn plane_in_nr(&self) -> &ID3D12Resource {
+        match self {
+            DnGpu::Nrd(g) => g.plane_in_nr(),
+            DnGpu::Frd(g) => g.plane_in_nr(),
+        }
+    }
+    fn plane_in_viewz(&self) -> &ID3D12Resource {
+        match self {
+            DnGpu::Nrd(g) => g.plane_in_viewz(),
+            DnGpu::Frd(g) => g.plane_in_viewz(),
+        }
+    }
+    fn plane_in_diff(&self) -> &ID3D12Resource {
+        match self {
+            DnGpu::Nrd(g) => g.plane_in_diff(),
+            DnGpu::Frd(g) => g.plane_in_diff(),
+        }
+    }
+    fn plane_in_spec(&self) -> &ID3D12Resource {
+        match self {
+            DnGpu::Nrd(g) => g.plane_in_spec(),
+            DnGpu::Frd(g) => g.plane_in_spec(),
+        }
+    }
+    fn plane_out_diff(&self) -> &ID3D12Resource {
+        match self {
+            DnGpu::Nrd(g) => g.plane_out_diff(),
+            DnGpu::Frd(g) => g.plane_out_diff(),
+        }
+    }
+    fn plane_out_spec(&self) -> &ID3D12Resource {
+        match self {
+            DnGpu::Nrd(g) => g.plane_out_spec(),
+            DnGpu::Frd(g) => g.plane_out_spec(),
+        }
+    }
 }
 
 /// A live XeSS-SR context + its resource set and the queried input-resolution
@@ -779,9 +868,12 @@ pub struct GpuContext {
     /// Whether the recurrent state carries history (false forces the next
     /// NPPD frame to zero the warped-state input — a reset).
     nppd_state_valid: bool,
-    /// The NRD (ReBLUR) pre-upscale denoiser (`--nrd`, XeSS sessions v1):
-    /// NRD's own passes over the bridge kernels' planes (nrd_gpu.rs).
-    nrd_gpu: Option<nrd_gpu::NrdGpu>,
+    /// The pre-upscale denoiser slot (`--nrd` | `--frd`, XeSS/FSR3
+    /// sessions): NRD's DLL-served passes or FRD's own kernels between the
+    /// SAME bridge kernels (nrd_bridge.hlsl). One enum, one slot — the CLI
+    /// exclusivity is structural here. Field/latch names keep the nrd_
+    /// prefix during coexistence (the plan's Phase-E rename).
+    nrd_gpu: Option<DnGpu>,
     /// The nppd_state_valid pattern: false → the next NRD frame passes
     /// AccumulationMode::RESTART (set on gpu_reset, never on motion).
     nrd_hist_valid: bool,
@@ -2545,7 +2637,7 @@ impl GpuContext {
         rh: u32,
         gbuf: bool,
         nppd: Option<(&str, &str)>,
-        nrd: Option<&str>,
+        dn: Option<DnKind>,
         debug: bool,
         bc7_mode: crate::bc7::Bc7Mode,
     ) -> Result<()> {
@@ -2561,7 +2653,7 @@ impl GpuContext {
             rh,
             gbuf,
             nppd.is_some(),
-            nrd.is_some(),
+            dn.is_some(),
             debug,
             &mut self.d3d,
         );
@@ -2620,24 +2712,34 @@ impl GpuContext {
                 }
             }
         }
-        // NRD (ReBLUR) pre-upscale denoising: NRD's passes between the bridge
-        // kernels, all on the one list (no split — pure compute). The
-        // arming/wiring itself is `arm_nrd_for` — ONE block shared with
-        // init_dxr, and ONE NrdGpu shared by both arms. A failure keeps the
-        // session running plain and sheds loudly (the nppd-gpu shape).
-        // --nrd + --nppd is refused at the CLI/session boundary (both claim
-        // the pre-upscale color slot), asserted again here.
-        if let Some(dir) = nrd {
+        // Pre-upscale denoising (NRD or FRD): the engine's passes between the
+        // bridge kernels, all on the one list (no split — pure compute). The
+        // arming/wiring itself is `arm_denoiser_for` — ONE block shared with
+        // init_dxr, and ONE engine instance shared by both arms. A failure
+        // keeps the session running plain and sheds loudly (the nppd-gpu
+        // shape). The denoiser + --nppd conflict is refused at the
+        // CLI/session boundary (both claim the pre-upscale color slot),
+        // asserted again here.
+        if let Some(dn) = dn {
             if nppd.is_some() {
                 self.evict_unused_scene_gpu();
-                return Err("--nrd and --nppd both claim the pre-upscale color slot".into());
+                return Err("the denoiser and --nppd both claim the pre-upscale color slot".into());
             }
-            if let Err(e) = self.arm_nrd_for(&dev, dir, rw, rh, &mut |t| tg.wire_nrd_feed(&dev, t))
+            if let Err(e) = self.arm_denoiser_for(&dev, dxc, dn, rw, rh, debug, &mut |t| {
+                tg.wire_nrd_feed(&dev, t)
+            })
             {
-                eprintln!(
-                    "nrd: unavailable ({e}); running plain GPU upscaling \
-                     (install-prerequisites.bat nrd builds the SDK; --no-nrd silences this)"
-                );
+                let hint = match dn {
+                    DnKind::Nrd(_) => {
+                        " (install-prerequisites.bat nrd builds the SDK; --no-nrd silences this)"
+                    }
+                    DnKind::Frd => "",
+                };
+                let tag = match dn {
+                    DnKind::Nrd(_) => "nrd",
+                    DnKind::Frd => "frd",
+                };
+                eprintln!("{tag}: unavailable ({e}); running plain GPU upscaling{hint}");
                 tg.nrd = None;
             }
         }
@@ -3256,7 +3358,7 @@ impl GpuContext {
         rw: u32,
         rh: u32,
         gbuf: bool,
-        nrd: Option<&str>,
+        dn: Option<DnKind>,
         debug: bool,
         bc7_mode: crate::bc7::Bc7Mode,
     ) -> Result<()> {
@@ -3265,7 +3367,7 @@ impl GpuContext {
         }
         let dev = self.d3d.device.clone();
         let core = self.ensure_scene_gpu(scene, bvh, bc7_mode)?;
-        let mut d = match dxr::DxrGpu::new(&dev, dxc, scene, core, rw, rh, gbuf, nrd.is_some(), debug)
+        let mut d = match dxr::DxrGpu::new(&dev, dxc, scene, core, rw, rh, gbuf, dn.is_some(), debug)
         {
             Ok(d) => d,
             Err(e) => {
@@ -3282,15 +3384,21 @@ impl GpuContext {
                 return Err(e);
             }
         }
-        // NRD pre-upscale denoising — arm_nrd_for, DXR flavor (one shared
-        // block, one shared NrdGpu — see init_trace's call site).
-        if let Some(dir) = nrd {
-            if let Err(e) = self.arm_nrd_for(&dev, dir, rw, rh, &mut |t| d.wire_nrd_feed(&dev, t))
+        // Pre-upscale denoising — arm_denoiser_for, DXR flavor (one shared
+        // block, one shared engine instance — see init_trace's call site).
+        if let Some(dn) = dn {
+            if let Err(e) = self.arm_denoiser_for(&dev, dxc, dn, rw, rh, debug, &mut |t| {
+                d.wire_nrd_feed(&dev, t)
+            })
             {
-                eprintln!(
-                    "nrd: unavailable ({e}); running plain GPU upscaling \
-                     (install-prerequisites.bat nrd builds the SDK; --no-nrd silences this)"
-                );
+                let (tag, hint) = match dn {
+                    DnKind::Nrd(_) => (
+                        "nrd",
+                        " (install-prerequisites.bat nrd builds the SDK; --no-nrd silences this)",
+                    ),
+                    DnKind::Frd => ("frd", ""),
+                };
+                eprintln!("{tag}: unavailable ({e}); running plain GPU upscaling{hint}");
                 d.nrd = None;
             }
         }
@@ -3727,7 +3835,7 @@ impl GpuContext {
     /// must thread through, not own.
     #[allow(clippy::too_many_arguments)]
     fn nrd_frame_step(
-        nrd_gpu: &mut Option<nrd_gpu::NrdGpu>,
+        nrd_gpu: &mut Option<DnGpu>,
         nrd_prev: &mut Option<(crate::dlss::CamMatrices, (f32, f32))>,
         nrd_frame_idx: &mut u32,
         nrd_hist_valid: &mut bool,
@@ -3742,27 +3850,47 @@ impl GpuContext {
         pack: &dyn Fn() -> Result<()>,
         out: &dyn Fn() -> Result<()>,
     ) -> bool {
-        let Some(ng) = nrd_gpu.as_mut() else { return false };
+        let Some(dn) = nrd_gpu.as_mut() else { return false };
         let mats = crate::dlss::CamMatrices {
             world_to_view: fc.world_to_view,
             view_to_clip: fc.view_to_clip,
         };
         let (pm, pj) = nrd_prev.unwrap_or((mats, jitter));
         let hist_reset = reset || !*nrd_hist_valid;
-        let cs = nrd_gpu::common_settings(
-            &mats,
-            &pm,
-            jitter,
-            pj,
-            rw,
-            rh,
-            fc.far,
-            *nrd_frame_idx,
-            hist_reset,
-        );
-        let rs = nrd_gpu::reblur_settings();
+        let tag = dn.tag();
         let step = pack()
-            .and_then(|()| ng.record(device, list, slot, &cs, &rs))
+            .and_then(|()| match dn {
+                DnGpu::Nrd(ng) => {
+                    let cs = nrd_gpu::common_settings(
+                        &mats,
+                        &pm,
+                        jitter,
+                        pj,
+                        rw,
+                        rh,
+                        fc.far,
+                        *nrd_frame_idx,
+                        hist_reset,
+                    );
+                    let rs = nrd_gpu::reblur_settings();
+                    ng.record(device, list, slot, &cs, &rs)
+                }
+                DnGpu::Frd(fg) => {
+                    // The kernel's camera facts, derived once per frame: the
+                    // translation step (the specular parallax numerator),
+                    // the forward vector (the n·v proxy), and the
+                    // world→pixel projection scale (m11 · rh/2 — the blur
+                    // radius converter). O = the view matrix's inverse
+                    // translation; forward = its z row — glam col-major,
+                    // rigid, so all are exact.
+                    let o_cur = mats.world_to_view.inverse().w_axis.truncate();
+                    let o_prev = pm.world_to_view.inverse().w_axis.truncate();
+                    let step = (o_cur - o_prev).length();
+                    let fwd = mats.world_to_view.row(2).truncate().normalize_or_zero();
+                    let proj = mats.view_to_clip.y_axis.y * rh as f32 * 0.5;
+                    fg.record(list, slot, hist_reset, fc.far, proj, step, fwd.to_array())
+                }
+            })
             .and_then(|()| out());
         match step {
             Ok(()) => {
@@ -3772,34 +3900,38 @@ impl GpuContext {
                 true
             }
             Err(e) => {
-                eprintln!("nrd: frame failed ({e}); shedding — plain upscaling continues");
+                eprintln!("{tag}: frame failed ({e}); shedding — plain upscaling continues");
                 false
             }
         }
     }
 
-    /// Arm NRD for one tracer — the ONE arming block both GPU arms share
-    /// (init_trace and init_dxr used to carry verbatim copies). Reuses the
-    /// session's single NrdGpu, building it on first arming: both arms trace
-    /// at the session-locked res, and sharing the instance is what keeps a
-    /// SPACE/F cycle's MEMOIZED arm wired at live planes — a second instance
-    /// would strand the first arm's NRD_FEED_SET descriptors on dropped
-    /// pools (packing into ghosts, denoising never-written inputs). `wire`
-    /// points the caller's tracer at the planes. An Err leaves that tracer
-    /// unarmed (`nrd_armed()` false — it runs plain); the caller sheds
-    /// loudly.
-    fn arm_nrd_for(
+    /// Arm the pre-upscale denoiser (NRD or FRD — `dn` picks) for one
+    /// tracer — the ONE arming block both GPU arms share (init_trace and
+    /// init_dxr used to carry verbatim copies). Reuses the session's single
+    /// engine instance, building it on first arming: both arms trace at the
+    /// session-locked res, and sharing the instance is what keeps a SPACE/F
+    /// cycle's MEMOIZED arm wired at live planes — a second instance would
+    /// strand the first arm's NRD_FEED_SET descriptors on dropped pools
+    /// (packing into ghosts, denoising never-written inputs). `wire` points
+    /// the caller's tracer at the planes — engine-blind, since both engines
+    /// carry the same plane contract. An Err leaves that tracer unarmed
+    /// (`nrd_armed()` false — it runs plain); the caller sheds loudly.
+    #[allow(clippy::too_many_arguments)]
+    fn arm_denoiser_for(
         &mut self,
         dev: &ID3D12Device,
-        dir: &str,
+        dxc: &dxc::Dxc,
+        dn: DnKind,
         rw: u32,
         rh: u32,
+        debug: bool,
         wire: &mut dyn FnMut(
             &[(u32, &ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT)],
         ) -> Result<()>,
     ) -> Result<()> {
         if self.nrd_shed {
-            return Err("NRD was shed earlier this session".into());
+            return Err("the denoiser was shed earlier this session".into());
         }
         // The engine whose planes the bridge owns: XeSS or the FSR 3.1
         // upscaler (the byte-identical-trio pair; `fsr` is the SESSION state,
@@ -3815,10 +3947,15 @@ impl GpuContext {
             } else if let Some(FsrRes::Up(res)) = self.fsr.as_ref().map(|f| &f.res) {
                 res.plane_resources().map(|(r, f)| (r.clone(), f))
             } else {
-                return Err("--nrd composes with an XeSS or FSR3 session".into());
+                return Err("the pre-upscale denoiser composes with an XeSS or FSR3 session".into());
             };
         match &self.nrd_gpu {
-            Some(g) if (g.rw, g.rh) == (rw, rh) => {}
+            Some(g) if (g.size()) == (rw, rh) && g.matches(&dn) => {}
+            Some(g) if !g.matches(&dn) => {
+                // Kind is session-constant (one Opts), so a mismatch here is
+                // a lifecycle hole, not a path — refuse like the size arm.
+                return Err(format!("{} armed, this arm asks for the other engine", g.tag()));
+            }
             Some(g) => {
                 // The desync BACKSTOP, not a normal path: both arms share
                 // --lock-res, and resize_output drops the instance with the
@@ -3827,25 +3964,48 @@ impl GpuContext {
                 // "unreachable" reasoning missed). A mismatch reaching here
                 // now means a NEW lifecycle hole; refuse rather than rebuild
                 // (the rebuild is the stranding bug).
+                let (gw, gh) = g.size();
                 return Err(format!(
-                    "NRD armed at {}x{}, this arm traces {rw}x{rh}",
-                    g.rw, g.rh
+                    "denoiser armed at {gw}x{gh}, this arm traces {rw}x{rh}"
                 ));
             }
             None => {
-                self.nrd_gpu = Some(nrd_gpu::NrdGpu::new(dev, dir, rw, rh)?);
+                // The one success line per engine — every other nrd:/frd:
+                // line is a failure path, and an armed session used to be
+                // indistinguishable from an unarmed one (the user-report
+                // class this fixes). Once per session: both arms share the
+                // instance, so the SPACE/F re-arms land in the reuse arm
+                // above.
+                let built = match dn {
+                    DnKind::Nrd(dir) => {
+                        let g = nrd_gpu::NrdGpu::new(dev, dir, rw, rh)?;
+                        // The dir is printed because the standard and
+                        // --nrd-perf DLLs are version-indistinguishable
+                        // (LibraryDesc has no perf bit) — this line is the
+                        // only record of which one loaded.
+                        eprintln!(
+                            "nrd: armed — ReBLUR pre-upscale denoising at {rw}x{rh} ({dir})"
+                        );
+                        DnGpu::Nrd(g)
+                    }
+                    DnKind::Frd => {
+                        let g = frd_gpu::FrdGpu::new(dev, dxc, rw, rh, debug)?;
+                        // Names the COMPILE arm honestly: phases B/C build
+                        // fp32 kernels regardless of the OPTIONS4 probe —
+                        // "capable" is the phase-D promise, not the running
+                        // precision.
+                        eprintln!(
+                            "frd: armed — recurrent pre-upscale denoising at {rw}x{rh} \
+                             (fp32 kernels; fp16 {})",
+                            if g.fp16 { "capable" } else { "unavailable" }
+                        );
+                        DnGpu::Frd(g)
+                    }
+                };
+                self.nrd_gpu = Some(built);
                 self.nrd_hist_valid = false;
                 self.nrd_prev = None;
                 self.nrd_frame_idx = 0;
-                // The one success line — every other nrd: line is a failure
-                // path, and an armed session used to be indistinguishable
-                // from an unarmed one (the user-report class this fixes).
-                // Once per session: both arms share the instance, so the
-                // SPACE/F re-arms land in the Some(g) arm above. The dir is
-                // printed because the standard and --nrd-perf DLLs are
-                // version-indistinguishable (LibraryDesc has no perf bit) —
-                // this line is the only record of which one loaded.
-                eprintln!("nrd: armed — ReBLUR pre-upscale denoising at {rw}x{rh} ({dir})");
             }
         }
         let ng = self.nrd_gpu.as_ref().unwrap();

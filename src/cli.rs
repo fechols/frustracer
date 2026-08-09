@@ -28,8 +28,8 @@
 
 use crate::camera::Camera;
 use crate::{
-    bc7, blas_split, bloom, bvh, cinematic, clouds, dlss, emissive, fireflies, fsr, gpu, nrd,
-    oidn, scene, settings, texture, tone, upchain, xess,
+    bc7, blas_split, bloom, bvh, cinematic, clouds, dlss, emissive, fireflies, frd, fsr, gpu,
+    nrd, oidn, scene, settings, texture, tone, upchain, xess,
 };
 use glam::Vec3A;
 
@@ -120,6 +120,23 @@ pub struct Opts {
     /// --nrd-prepass-radius, --nrd-no-anti-firefly, --nrd-max-accum-frames) —
     /// the fsr_tune shape: all None = the settings the session always sent.
     pub nrd_tune: nrd::ReblurTuning,
+    /// FRD — the from-scratch clean-room pre-upscale denoiser (src/frd.rs;
+    /// same arming surface as NRD: GPU tracers × XeSS/FSR3). OPT-IN until it
+    /// reaches NRD parity (the plan's Phase-E default flip): `--frd` takes
+    /// the one denoiser slot. Only EXPLICIT pairs are fatal (main's lever
+    /// block): explicit --frd + explicit --nrd or + --nppd exits 2; an
+    /// explicit --frd silently disarms the defaulted nrd (opting into FRD is
+    /// opting out of the default NRD); a FILE-defaulted frd (the settings
+    /// row seeds this field WITHOUT frd_explicit) yields loudly to an
+    /// explicit --nrd/--nppd instead — a default never makes another flag
+    /// fatal.
+    pub frd: bool,
+    /// True only when --frd was NAMED (the nrd_explicit pattern) — gates the
+    /// "not armed" session notes.
+    pub frd_explicit: bool,
+    /// Runtime FRD tuning (--frd-* levers) — the nrd_tune shape: all None =
+    /// the compiled constants in frd.rs.
+    pub frd_tune: frd::FrdTuning,
     /// Directory holding libxess.dll.
     pub xess_path: String,
     /// Directory holding amd_fidelityfx_loader_dx12.dll + the provider DLLs.
@@ -747,6 +764,9 @@ pub fn defaults() -> Opts {
         }),
         nrd_perf: false,
         nrd_tune: Default::default(),
+        frd: false,
+        frd_explicit: false,
+        frd_tune: Default::default(),
         xess_path: std::env::var("FRUSTRACER_XESS_PATH").unwrap_or_else(|_| {
             concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\XeSS-SDK\bin").to_string()
         }),
@@ -987,6 +1007,56 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
             }
             "--nrd-no-anti-firefly" => opts.nrd_tune.anti_firefly = Some(false),
             "--nrd-anti-firefly" => opts.nrd_tune.anti_firefly = Some(true),
+            "--frd" => {
+                opts.frd = true;
+                opts.frd_explicit = true;
+            }
+            "--no-frd" => opts.frd = false,
+            // FRD runtime tuning (the --nrd-* shape: absent = the compiled
+            // frd.rs constants, so a flagless session is unchanged).
+            "--frd-max-accum-frames" | "--frd-fast-frames" | "--frd-max-stab-frames" => {
+                let v: u32 = args.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| {
+                    eprintln!("{a} needs a non-negative integer argument");
+                    std::process::exit(2);
+                });
+                match a.as_str() {
+                    "--frd-max-accum-frames" => {
+                        // The meta plane stores n/63 (frd::META_N_MAX), so a
+                        // larger cap truncates at the wire regardless of the
+                        // CB — note it (the --fireflies clamp shape; the
+                        // field carries the raw request, frd_gpu's cb()
+                        // clamps).
+                        if v as f32 > frd::META_N_MAX {
+                            notes.push(format!(
+                                "frd: max-accum-frames {v} clamped to {} (the meta plane's \
+                                 n/63 wire cap)",
+                                frd::META_N_MAX
+                            ));
+                        }
+                        opts.frd_tune.max_accum_frames = Some(v);
+                    }
+                    "--frd-fast-frames" => opts.frd_tune.fast_frames = Some(v),
+                    _ => opts.frd_tune.max_stab_frames = Some(v),
+                }
+            }
+            "--frd-blur-radius" | "--frd-clamp-sigma" => {
+                let v = args
+                    .next()
+                    .and_then(|s| s.parse::<f32>().ok())
+                    .filter(|v| v.is_finite() && *v >= 0.0)
+                    .unwrap_or_else(|| {
+                        eprintln!("{a} needs a non-negative float argument");
+                        std::process::exit(2);
+                    });
+                if a == "--frd-blur-radius" {
+                    opts.frd_tune.blur_radius = Some(v);
+                } else {
+                    opts.frd_tune.clamp_sigma = Some(v);
+                }
+            }
+            "--frd-no-anti-firefly" => opts.frd_tune.anti_firefly = Some(false),
+            "--frd-anti-firefly" => opts.frd_tune.anti_firefly = Some(true),
+            "--frd-no-fp16" => opts.frd_tune.no_fp16 = true,
             "--nppd" => opts.nppd = true,
             "--no-nppd" => opts.nppd = false,
             "--nppd-path" => {
@@ -2174,6 +2244,18 @@ pub fn usage() {
                 eprintln!("  --nrd-no-anti-firefly    drop ReBLUR's anti-firefly filter (--nrd-anti-firefly");
                 eprintln!("                spells the default)");
                 eprintln!("  --check-nrd   headless: NRD math gates (DLL-free) + instance/dispatch contract (DLL)");
+                eprintln!("  --frd         FRD — the from-scratch clean-room pre-upscale denoiser (opt-in until");
+                eprintln!("                NRD parity; same arming surface: GPU tracers x XeSS/FSR3). Takes the");
+                eprintln!("                one denoiser slot: an explicit --nrd beside it exits 2, the defaulted");
+                eprintln!("                nrd disarms silently; --nppd beside it exits 2. No DLL, no install");
+                eprintln!("                step — the kernels compile like every other unit");
+                eprintln!("  --no-frd      the default, spelled explicitly");
+                eprintln!("  --frd-max-accum-frames N (clamped loudly to 63 — the meta plane's n/63 wire cap)");
+                eprintln!("                | --frd-fast-frames N | --frd-blur-radius X | --frd-clamp-sigma X");
+                eprintln!("                | --frd-no-fp16 (force the fp32 shader arm)   FRD tuning (unset = the");
+                eprintln!("                compiled frd.rs constants). --frd-max-stab-frames N and");
+                eprintln!("                --frd-[no-]anti-firefly parse but are NOT YET WIRED (the stabilization");
+                eprintln!("                sub-step and firefly pre-clamp are unbuilt phase-C/D items)");
                 eprintln!("  --nppd-device NPPD execution provider: auto|cpu|dml|dml:<n> (default auto = DML then CPU)");
                 eprintln!("  --check-xess  headless: XeSS dynamic-res contract self-test (no GPU or DLL needed)");
                 eprintln!("  --xess-dump   --check-xess plus G-buffer PNG dumps");
@@ -2553,6 +2635,10 @@ pub fn self_test() -> Result<(), String> {
         "2",
         "--dual-gpu-arm",
         "dxr",
+        "--frd",
+        "--frd-max-accum-frames",
+        "12",
+        "--frd-no-fp16",
     ]);
     let after = lever_snapshot();
     if after != before {
@@ -2567,6 +2653,8 @@ pub fn self_test() -> Result<(), String> {
         ("dual_gpu", o.dual_gpu == Some(3)),
         ("dual_gpu_depth", o.dual_gpu_depth == 2),
         ("dual_gpu_arm", o.dual_gpu_arm == Some(crate::gpu::dual::Arm::Dxr)),
+        ("frd", o.frd && o.frd_explicit),
+        ("frd_tune", o.frd_tune.max_accum_frames == Some(12) && o.frd_tune.no_fp16),
         ("mips", !o.mips),
         ("aniso", o.aniso == 4),
         ("h2n", !o.h2n),

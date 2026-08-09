@@ -139,6 +139,21 @@ impl Dxc {
         what: &str,
         debug: bool,
     ) -> Result<Vec<u8>> {
+        self.compile_args(src, entry, target, what, debug, &[])
+    }
+
+    /// `compile` with per-unit extra DXC arguments appended after the shared
+    /// set — the FRD kernels pass `-enable-16bit-types` (native fp16 needs
+    /// SM 6.2+ plus the flag; every other unit stays fp32 and passes none).
+    pub fn compile_args(
+        &self,
+        src: &str,
+        entry: &str,
+        target: &str,
+        what: &str,
+        debug: bool,
+        extra: &[&str],
+    ) -> Result<Vec<u8>> {
         if let Some(dir) = dump_dir() {
             // Filenames must survive being handed to a shell and to RGA, and
             // `what` carries hyphens/spaces in places ("dxr-lib"), so keep the
@@ -171,6 +186,7 @@ impl Dxc {
         } else {
             args.push("-O3".into());
         }
+        args.extend(extra.iter().map(|a| a.to_string()));
         let wide: Vec<Vec<u16>> = args
             .iter()
             .map(|a| a.encode_utf16().chain(std::iter::once(0)).collect())

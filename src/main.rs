@@ -63,6 +63,9 @@ mod nppd;
 // math twins are pure and feed --check-nrd's DLL-free half; only Nrd::new
 // touches NRD.dll.
 mod nrd;
+// FRD — the from-scratch clean-room denoiser replacing NRD (`--frd`): pure
+// math + tuning + the oracle twins the F0 gate pins (all DLL-free).
+mod frd;
 mod frustcap;
 // Step-0 measurement harness (FR_ORACLE=1): read-only probes that size the
 // candidate frustum-query changes. Default OFF and behaviour-free.
@@ -412,6 +415,46 @@ fn main() {
         );
         std::process::exit(2);
     }
+    // FRD vs NRD: ONE denoiser slot per session. Only the EXPLICIT pair is a
+    // contradiction (exit 2, the being-told shape) — a merely-DEFAULTED side
+    // (the settings file seeds opts.frd, the compiled default seeds opts.nrd;
+    // neither sets its _explicit) yields to the explicit one instead: a
+    // default must never make another flag fatal (the fg_explicit precedent).
+    // An explicit --frd disarms the defaulted nrd SILENTLY (opting into FRD
+    // is obviously opting out of the default NRD, and a note would nag every
+    // --frd session); an explicit --nrd disarms a file-defaulted frd with one
+    // loud line (the nrd-default-disarmed shape below); both defaulted = the
+    // file's frd opted in, the compiled nrd yields silently. Runs before the
+    // nrd/nppd block so a --frd session's nppd conflict reports against frd,
+    // not the already-disarmed nrd.
+    if opts.frd && opts.nrd {
+        if opts.frd_explicit && opts.nrd_explicit {
+            eprintln!(
+                "--frd cannot compose with --nrd: one pre-upscale denoiser per session. Drop one."
+            );
+            std::process::exit(2);
+        }
+        if opts.frd_explicit || !opts.nrd_explicit {
+            opts.nrd = false;
+        } else {
+            eprintln!("frd: default disarmed — --nrd claims the denoiser slot");
+            opts.frd = false;
+        }
+    }
+    // FRD vs NPPD: the color-slot conflict below. An EXPLICIT --frd beside
+    // --nppd is a contradiction (exit 2); a FILE-DEFAULTED frd yields loudly
+    // instead (the defaulted-nrd shape below — a settings value must never
+    // make --nppd fatal).
+    if opts.frd && opts.nppd {
+        if opts.frd_explicit {
+            eprintln!(
+                "--frd cannot compose with --nppd: both claim the pre-upscale color slot. Drop one."
+            );
+            std::process::exit(2);
+        }
+        eprintln!("frd: default disarmed — --nppd claims the pre-upscale color slot");
+        opts.frd = false;
+    }
     // Same shape for the two pre-upscale denoisers themselves: cs_nrd_out and
     // the NPPD crop both claim the engine's color plane — being told beats a
     // silent last-writer-wins. But NRD is ON BY DEFAULT, and a default must
@@ -519,6 +562,22 @@ fn main() {
     nrd::set_tuning(opts.nrd_tune);
     if opts.nrd_tune.any() {
         eprintln!("nrd: ReBLUR tuning overrides {:?}", opts.nrd_tune);
+    }
+    // FRD runtime tuning — the same one-writer shape (read by the FrdGpu
+    // kernels' constants at record time).
+    frd::set_tuning(opts.frd_tune);
+    if opts.frd_tune.any() {
+        eprintln!("frd: tuning overrides {:?}", opts.frd_tune);
+    }
+    // The two levers whose consumers are UNBUILT (stabilization + the firefly
+    // pre-clamp, phase-C/D pendings) must say so — a lever that parses and
+    // does nothing is the silent no-op A/B walk the lever doctrine exists to
+    // prevent (the FR_NGXFG unrecognized-value rule).
+    if opts.frd_tune.max_stab_frames.is_some() || opts.frd_tune.anti_firefly.is_some() {
+        eprintln!(
+            "frd: --frd-max-stab-frames / --frd-[no-]anti-firefly are NOT YET WIRED \
+             (unbuilt phase-C/D items) — inert this build"
+        );
     }
     texture::set_mips(opts.mips);
     texture::set_aniso(opts.aniso);
@@ -4239,6 +4298,22 @@ fn lock_dynamic_note(arm: &str, res: (usize, usize)) {
     );
 }
 
+/// The session's pre-upscale denoiser pick, POST-exclusivity: the lever
+/// block guarantees at most one of frd/nrd survives. ARMABILITY (which
+/// sessions may wire a denoiser at all — XeSS/FSR3, never RR/quin) stays at
+/// the four init call sites; this is only WHICH engine an armable session
+/// gets. None = neither asked (both killed, or --nppd disarmed the default).
+#[cfg(windows)]
+fn dn_kind(opts: &Opts) -> Option<gpu::DnKind<'_>> {
+    if opts.frd {
+        Some(gpu::DnKind::Frd)
+    } else if opts.nrd {
+        Some(gpu::DnKind::Nrd(opts.nrd_path.as_str()))
+    } else {
+        None
+    }
+}
+
 /// Headless GPU-tracer gate suite (M1: toolchain + dispatch plumbing).
 /// Unlike --check/--check-dlss/--check-xess this needs real hardware: a
 /// D3D12 device with RT tier 1.1 and the DXC DLL drop. Exit codes: 0 = all
@@ -7785,6 +7860,144 @@ fn run_check_gpu(
                         eprintln!("check-gpu: FAIL N2 sky-arm must-fire (no sky pixels)");
                         ok = false;
                     }
+                    // --- F1/F3 (FRD, DLL-free — gpu/frd_gpu.rs). N3 proved
+                    // the passthrough IDEA with a hand-rolled copy; F3 proves
+                    // FrdGpu's OWN record() — its planes, barriers, and the
+                    // arm_denoiser_for register map — closes the same
+                    // byte-identity: pack into the ENGINE's planes, run the
+                    // engine (phase A: the passthrough), recompose, compare
+                    // against the SAME cs_feed_xess reference. F1 is the
+                    // instance contract (planes at the gate res + the fp16
+                    // probe ran — grows with the real passes).
+                    {
+                        let fg = match gpu::frd_gpu::FrdGpu::new(
+                            &hg.device,
+                            &dxc,
+                            pw as u32,
+                            ph as u32,
+                            opts.gpu_debug,
+                        ) {
+                            Ok(f) => f,
+                            Err(e) => {
+                                eprintln!("check-gpu: FAIL F1 FrdGpu init: {e}");
+                                return 1;
+                            }
+                        };
+                        if (fg.rw, fg.rh) != (pw as u32, ph as u32) {
+                            eprintln!("check-gpu: FAIL F1 FrdGpu size contract");
+                            ok = false;
+                        }
+                        println!(
+                            "check-gpu: frd F1 — planes {}x{} | fp16 probe {}",
+                            fg.rw,
+                            fg.rh,
+                            if fg.fp16 { "capable" } else { "unavailable" }
+                        );
+                        // The arm_denoiser_for register map, gate flavor:
+                        // gate-owned color + engine-guide dummies at
+                        // 16/18/19, the ENGINE's planes everywhere else.
+                        if let Err(e) = ptg.wire_nrd_feed(
+                            &hg.device,
+                            &[
+                                (16, &pl[0], fmts[0].0),
+                                (17, fg.plane_in_nr(), fmts[1].0),
+                                (18, &pl[10], fmts[10].0),
+                                (19, &pl[9], fmts[9].0),
+                                (20, fg.plane_out_spec(), fmts[3].0),
+                                (23, fg.plane_in_mv(), fmts[4].0),
+                                (24, fg.plane_in_diff(), fmts[5].0),
+                                (25, fg.plane_in_spec(), fmts[6].0),
+                                (26, fg.plane_in_viewz(), fmts[2].0),
+                                (27, fg.plane_out_diff(), fmts[7].0),
+                            ],
+                        ) {
+                            eprintln!("check-gpu: FAIL F3 frd wiring: {e}");
+                            return 1;
+                        }
+                        // ANTI-VACUITY: pl[0] currently holds N3's result,
+                        // which EQUALS the reference — a dead out dispatch
+                        // would pass the compare on stale bytes. Dirty it
+                        // (IN_SPEC's YCoCg is not the composed color) and
+                        // MEASURE the difference before trusting the pass.
+                        let dirty = |l: &ID3D12GraphicsCommandList| unsafe {
+                            let t = gpu::d3d12::transition;
+                            l.ResourceBarrier(&[
+                                t(&pl[0], fmts[0].1, D3D12_RESOURCE_STATE_COPY_DEST),
+                                t(&pl[3], ust, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                            ]);
+                            l.CopyResource(&pl[0], &pl[3]);
+                            l.ResourceBarrier(&[
+                                t(&pl[0], D3D12_RESOURCE_STATE_COPY_DEST, fmts[0].1),
+                                t(&pl[3], D3D12_RESOURCE_STATE_COPY_SOURCE, ust),
+                            ]);
+                        };
+                        if hg.run(|l| dirty(l)).is_err() {
+                            eprintln!("check-gpu: FAIL F3 dirty pass");
+                            return 1;
+                        }
+                        let pre = match rb!(0, 8) {
+                            Ok(b) => b,
+                            Err(_) => {
+                                eprintln!("check-gpu: FAIL F3 pre readback");
+                                return 1;
+                            }
+                        };
+                        let mut pre_diff = 0usize;
+                        for i in 0..pw * ph {
+                            for l in 0..3 {
+                                if pre[i * 8 + l * 2..][..2] != b_ref[i * 8 + l * 2..][..2] {
+                                    pre_diff += 1;
+                                }
+                            }
+                        }
+                        // The engine sequence: pack -> FrdGpu -> out on ONE
+                        // list, the nrd_frame_step ordering.
+                        // The F3 control arm: the engine's own passthrough
+                        // switch (OUT = byte-copy of IN — the spatial passes
+                        // fire on reset frames by design, so the copy path
+                        // is the arm, not the reset).
+                        fg.force_passthrough.set(true);
+                        let (mut r1, mut r2, mut r3) = (Ok(()), Ok(()), Ok(()));
+                        let sub = hg.run(|l| {
+                            r1 = ptg.record_nrd_pack(l, 0);
+                            r2 = fg.record(l, 0, true, n2_far, 1.0, 0.0, [0.0, 0.0, 1.0]);
+                            r3 = ptg.record_nrd_out(l, 0);
+                        });
+                        if sub.is_err() || r1.is_err() || r2.is_err() || r3.is_err() {
+                            eprintln!(
+                                "check-gpu: FAIL F3 frd sequence: {:?} {:?} {:?}",
+                                r1, r2, r3
+                            );
+                            return 1;
+                        }
+                        let b_frd = match rb!(0, 8) {
+                            Ok(b) => b,
+                            Err(_) => {
+                                eprintln!("check-gpu: FAIL F3 color readback");
+                                return 1;
+                            }
+                        };
+                        let mut f3_bad = 0usize;
+                        for i in 0..pw * ph {
+                            for l in 0..3 {
+                                if b_frd[i * 8 + l * 2..][..2] != b_ref[i * 8 + l * 2..][..2] {
+                                    f3_bad += 1;
+                                }
+                            }
+                        }
+                        println!(
+                            "check-gpu: frd F3 — passthrough color byte-diff {f3_bad} \
+                             (pre-dirty {pre_diff})"
+                        );
+                        if f3_bad > 0 {
+                            eprintln!("check-gpu: FAIL F3 frd passthrough byte-identity");
+                            ok = false;
+                        }
+                        if pre_diff == 0 {
+                            eprintln!("check-gpu: FAIL F3 anti-vacuity (dirty pass changed nothing)");
+                            ok = false;
+                        }
+                    }
                     // Restore the FSR-RR wiring (wire_feed REPLACES set 0) —
                     // ALSO load-bearing for N4 below: its re-traces must run
                     // with FLAG_FSR_SIG armed or NRD would see zero signals.
@@ -8032,6 +8245,210 @@ fn run_check_gpu(
                                 eprintln!("check-gpu: FAIL N4 frame-B restore");
                                 return 1;
                             }
+                        }
+                    }
+                    // --- F4 (FRD, DLL-free — the N4 protocol pointed at
+                    // FrdGpu): 9 same-view fresh-noise frames through
+                    // pack -> FrdGpu -> out, reset at k=0 and k=8. Scored on
+                    // the CONVERGED frame (k=7) rather than N4's frame 0:
+                    // FRD's reset frame restarts history and runs the wide
+                    // history-fix blur SPATIAL-ONLY, so frame 0 measures one
+                    // blur rather than the recurrent loop — the teeth live
+                    // where accumulation has worked. The input baseline is
+                    // frame 7's OWN accum (what the un-denoised color would
+                    // be — the delta recompose anchors to it).
+                    {
+                        let fg = match gpu::frd_gpu::FrdGpu::new(
+                            &hg.device,
+                            &dxc,
+                            pw as u32,
+                            ph as u32,
+                            opts.gpu_debug,
+                        ) {
+                            Ok(f) => f,
+                            Err(e) => {
+                                eprintln!("check-gpu: FAIL F4 FrdGpu init: {e}");
+                                return 1;
+                            }
+                        };
+                        if let Err(e) = ptg.wire_nrd_feed(
+                            &hg.device,
+                            &[
+                                (16, &pl[0], fmts[0].0),
+                                (17, fg.plane_in_nr(), fmts[1].0),
+                                (18, &pl[10], fmts[10].0),
+                                (19, &pl[9], fmts[9].0),
+                                (20, fg.plane_out_spec(), fmts[3].0),
+                                (23, fg.plane_in_mv(), fmts[4].0),
+                                (24, fg.plane_in_diff(), fmts[5].0),
+                                (25, fg.plane_in_spec(), fmts[6].0),
+                                (26, fg.plane_in_viewz(), fmts[2].0),
+                                (27, fg.plane_out_diff(), fmts[7].0),
+                            ],
+                        ) {
+                            eprintln!("check-gpu: FAIL F4 frd wiring: {e}");
+                            return 1;
+                        }
+                        let (f4_near, f4_far) = dlss::near_far(scene.diag);
+                        let f4_mats = dlss::cam_matrices(&cam_b, pw, ph, f4_near, f4_far);
+                        let f4_proj = f4_mats.view_to_clip.y_axis.y * ph as f32 * 0.5;
+                        let mut frames: Vec<Vec<u8>> = Vec::new();
+                        let mut input7: Vec<u8> = Vec::new();
+                        let mut f4_fail = false;
+                        for k in 0..9u32 {
+                            let reset = k == 0 || k == 8;
+                            let fp = gpu::trace::FrameParams {
+                                sway_prev_time: None,
+                                cam: basis_b,
+                                frame: 200 + k,
+                                accumulate: false,
+                                jitter: false,
+                                frame_jitter: Some((0.0, 0.0)),
+                                prev_cam: Some(basis_b),
+                                q: uq,
+                                verify: false,
+                                spp: 1,
+                                probe_sample: 0,
+                                clouds: crate::clouds::Clouds::check(scene.diag),
+                                fireflies: crate::fireflies::Fireflies::check(scene),
+                                sway_time: check_sway,
+                                replay: false,
+                            };
+                            ptg.write_cb(0, &fp);
+                            let (mut r1, mut r2, mut r3) = (Ok(()), Ok(()), Ok(()));
+                            let sub = hg.run(|l| {
+                                ptg.record_wavefront(l, 0, &fp, false);
+                                r1 = ptg.record_nrd_pack(l, 0);
+                                // Parked pose: cam step 0, fwd inert.
+                                r2 = fg.record(l, 0, reset, f4_far, f4_proj, 0.0, [0.0, 0.0, 1.0]);
+                                r3 = ptg.record_nrd_out(l, 0);
+                            });
+                            if sub.is_err() || r1.is_err() || r2.is_err() || r3.is_err() {
+                                eprintln!(
+                                    "check-gpu: FAIL F4 frame {k}: {:?} {:?} {:?}",
+                                    r1, r2, r3
+                                );
+                                f4_fail = true;
+                                break;
+                            }
+                            if k == 7 {
+                                input7 = match hg.read_buffer(&ptg.accum, ua, pw * ph * 12) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        eprintln!("check-gpu: FAIL F4 accum readback: {e}");
+                                        return 1;
+                                    }
+                                };
+                            }
+                            match rb!(0, 8) {
+                                Ok(v) => frames.push(v),
+                                Err(e) => {
+                                    eprintln!("check-gpu: FAIL F4 color readback: {e}");
+                                    return 1;
+                                }
+                            }
+                        }
+                        if !f4_fail {
+                            let lum = |b: &[u8], i: usize| -> f32 {
+                                let h = |l: usize| {
+                                    half::f16::from_bits(u16::from_le_bytes(
+                                        b[i * 8 + l * 2..][..2].try_into().unwrap(),
+                                    ))
+                                    .to_f32()
+                                };
+                                (h(0) + h(1) + h(2)) / 3.0
+                            };
+                            let lum_in = |i: usize| -> f32 {
+                                let f = |c: usize| {
+                                    f32::from_le_bytes(
+                                        input7[(i * 3 + c) * 4..][..4].try_into().unwrap(),
+                                    )
+                                };
+                                (f(0) + f(1) + f(2)) / 3.0
+                            };
+                            let npx = pw * ph;
+                            let mut finite = true;
+                            let mut differs = 0usize;
+                            let (mut mean_out, mut mean_in) = (0f64, 0f64);
+                            let (mut lap_out, mut lap_in) = (0f64, 0f64);
+                            for i in 0..npx {
+                                let lo = lum(&frames[7], i);
+                                let li = lum_in(i);
+                                if !lo.is_finite() {
+                                    finite = false;
+                                }
+                                if (lo - li).abs() > 1e-4 {
+                                    differs += 1;
+                                }
+                                mean_out += lo as f64;
+                                mean_in += li as f64;
+                                let (x, y) = (i % pw, i / pw);
+                                if x > 0 && x + 1 < pw && y > 0 && y + 1 < ph {
+                                    let l4 = |f: &dyn Fn(usize) -> f32| {
+                                        (4.0 * f(i) - f(i - 1) - f(i + 1) - f(i - pw)
+                                            - f(i + pw))
+                                        .abs() as f64
+                                    };
+                                    let fo = |j: usize| lum(&frames[7], j);
+                                    let fi = |j: usize| lum_in(j);
+                                    lap_out += l4(&fo);
+                                    lap_in += l4(&fi);
+                                }
+                            }
+                            let delta = |a: &[u8], b: &[u8]| -> f64 {
+                                let mut d = 0f64;
+                                for i in 0..npx {
+                                    d += (lum(a, i) - lum(b, i)).abs() as f64;
+                                }
+                                d / npx as f64
+                            };
+                            let d_early = delta(&frames[1], &frames[0]);
+                            let d_late = delta(&frames[7], &frames[6]);
+                            let d_restart = delta(&frames[8], &frames[7]);
+                            println!(
+                                "check-gpu: frd F4 — differs {differs}/{npx} | lap {:.4} -> {:.4} | \
+                                 mean {:.4} -> {:.4} | temporal {:.5} -> {:.5} | restart {:.5}",
+                                lap_in / npx as f64,
+                                lap_out / npx as f64,
+                                mean_in / npx as f64,
+                                mean_out / npx as f64,
+                                d_early,
+                                d_late,
+                                d_restart
+                            );
+                            let mut bad = Vec::new();
+                            if !finite {
+                                bad.push("non-finite");
+                            }
+                            if differs == 0 {
+                                bad.push("output == input (vacuous)");
+                            }
+                            if lap_out >= lap_in {
+                                bad.push("Laplacian did not drop");
+                            }
+                            if (mean_out - mean_in).abs() > 0.25 * mean_in.max(1e-6) {
+                                bad.push("mean drifted > 25%");
+                            }
+                            if d_late >= d_early {
+                                bad.push("temporal deltas not shrinking");
+                            }
+                            if d_restart <= d_late {
+                                bad.push("RESTART did not depart (reset latch dead?)");
+                            }
+                            if !bad.is_empty() {
+                                eprintln!("check-gpu: FAIL F4 frd: {}", bad.join(", "));
+                                ok = false;
+                            }
+                        } else {
+                            ok = false;
+                        }
+                        // Restore frame B's buffers (the N4/M10 gate-
+                        // independence rule): the probe traces left
+                        // accum/gbuf holding frame 208.
+                        ptg.write_cb(0, &p);
+                        if hg.run(|l| ptg.record_wavefront(l, 0, &p, false)).is_err() {
+                            eprintln!("check-gpu: FAIL F4 frame-B restore");
+                            return 1;
                         }
                     }
                     // --- N7 (NRD): FLAG_SKY_EXT_SKIP — sky pixels elide the
@@ -15258,6 +15675,19 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
     };
 
+    // F0 — the FRD denoiser's pure math (reprojection convention,
+    // disocclusion anchors + grazing relaxation, the running-mean
+    // accumulation identity, Welford variance, clamp idempotence, bilateral
+    // weight shapes, radius endpoints, the Vogel tap disk, and the
+    // shared-wire re-export pin against nrd::oracle). DLL-free, always runs.
+    let frd_ok = match frd::oracle::self_test() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("frd self-test: FAIL — {e}");
+            false
+        }
+    };
+
     // The one sky: the disc's radiance/irradiance round-trip (the classic 4π
     // slip), cone sampling inside-and-covering the disc, the disc test agreeing
     // with the cone the sampler draws from, the DOME carrying no disc (the
@@ -18171,6 +18601,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         ("rtgi-ab", rtgi_ab_ok),
         ("tod", tod_ok),
         ("bloom", bloom_ok),
+        ("frd", frd_ok),
         ("autoexp", autoexp_ok),
         ("sphcell", sph_ok),
         ("ftree", ftree_ok),
@@ -19438,14 +19869,17 @@ fn session(
         if gpu_lock_note {
             lock_dynamic_note("gpu", (grw, grh));
         }
-        if opts.nrd_explicit && !matches!(gpu_wired_up, GpuUp::Xess | GpuUp::Fsr3) {
-            // Loud, never fatal — and only for the EXPLICIT flag: nrd is on
-            // by default, and the default must not nag every DLSS session.
-            // RR/FSR4-RR already denoise, quinlight owns its present, plain
-            // has no upscaler to feed.
+        if (opts.nrd_explicit || opts.frd_explicit)
+            && !matches!(gpu_wired_up, GpuUp::Xess | GpuUp::Fsr3)
+        {
+            // Loud, never fatal — and only for the EXPLICIT flags: nrd is on
+            // by default, frd can be settings-file-defaulted, and a default
+            // must not nag every DLSS session. RR/FSR4-RR already denoise,
+            // quinlight owns its present, plain has no upscaler to feed.
             eprintln!(
-                "nrd: not armed — --nrd composes with XeSS/FSR3 sessions (this session's \
-                 upscaler already denoises, or there is none)"
+                "{}: not armed — the denoiser composes with XeSS/FSR3 sessions (this session's \
+                 upscaler already denoises, or there is none)",
+                if opts.frd_explicit { "frd" } else { "nrd" }
             );
         }
         gpu_trace = match gpu::dxc::Dxc::load(&opts.dxc_path).and_then(|dxc| {
@@ -19458,8 +19892,9 @@ fn session(
                 gpu_wired_up != GpuUp::Plain,
                 (gpu_wired_up == GpuUp::Xess && opts.nppd)
                     .then_some((opts.nppd_path.as_str(), opts.nppd_model.as_str())),
-                (matches!(gpu_wired_up, GpuUp::Xess | GpuUp::Fsr3) && opts.nrd)
-                    .then_some(opts.nrd_path.as_str()),
+                matches!(gpu_wired_up, GpuUp::Xess | GpuUp::Fsr3)
+                    .then(|| dn_kind(&opts))
+                    .flatten(),
                 opts.gpu_debug,
                 opts.bc7,
             )
@@ -19823,10 +20258,11 @@ fn session(
                 dxw as u32,
                 dxh as u32,
                 compose,
-                // NRD composes with the XeSS/FSR3 levels only (RR/FSR4-RR
-                // already denoise; quinlight owns its own present).
-                ((dxr_xess_avail || dxr_fsr3_avail) && !dxr_quin_avail && opts.nrd)
-                    .then_some(opts.nrd_path.as_str()),
+                // The denoiser composes with the XeSS/FSR3 levels only
+                // (RR/FSR4-RR already denoise; quinlight owns its present).
+                ((dxr_xess_avail || dxr_fsr3_avail) && !dxr_quin_avail)
+                    .then(|| dn_kind(&opts))
+                    .flatten(),
                 opts.gpu_debug,
                 opts.bc7,
             )
@@ -19878,12 +20314,17 @@ fn session(
             }
             Err(e) => {
                 eprintln!("dxr: falling back to CPU tracing — {e}");
-                // The NRD-eligibility predicate held (the .then_some above)
-                // but init never completed, so no nrd: line ever fired — and
-                // the CPU renderer has no NRD path at all. Say so: a silent
-                // drop here is indistinguishable from an armed session.
-                if (dxr_xess_avail || dxr_fsr3_avail) && !dxr_quin_avail && opts.nrd {
-                    eprintln!("nrd: not armed — the CPU renderer has no NRD path");
+                // The denoiser-eligibility predicate held (the dn_kind call
+                // above) but init never completed, so no armed line ever
+                // fired — and the CPU renderer has no pre-upscale denoiser
+                // path at all. Say so: a silent drop here is
+                // indistinguishable from an armed session.
+                if (dxr_xess_avail || dxr_fsr3_avail) && !dxr_quin_avail && (opts.nrd || opts.frd)
+                {
+                    eprintln!(
+                        "{}: not armed — the CPU renderer has no pre-upscale denoiser path",
+                        if opts.frd { "frd" } else { "nrd" }
+                    );
                 }
                 dxr_failed = true;
             }
@@ -20589,9 +21030,11 @@ fn session(
                                     // session init only; gpu_nppd_avail is
                                     // structurally false on this path.
                                     None,
-                                    // NRD likewise wires at session init only.
-                                    (matches!(gpu_wired_up, GpuUp::Xess | GpuUp::Fsr3) && opts.nrd)
-                                        .then_some(opts.nrd_path.as_str()),
+                                    // The denoiser likewise wires at session
+                                    // init only.
+                                    matches!(gpu_wired_up, GpuUp::Xess | GpuUp::Fsr3)
+                                        .then(|| dn_kind(&opts))
+                                        .flatten(),
                                     opts.gpu_debug,
                                     opts.bc7,
                                 )
@@ -20657,12 +21100,14 @@ fn session(
                             if compose && opts.lock_scale.is_none() {
                                 lock_dynamic_note("dxr", (dxw, dxh));
                             }
-                            if opts.nrd_explicit
+                            if (opts.nrd_explicit || opts.frd_explicit)
                                 && !((dxr_xess_avail || dxr_fsr3_avail) && !dxr_quin_avail)
                             {
                                 eprintln!(
-                                    "nrd: not armed — --nrd composes with XeSS/FSR3 sessions \
-                                     (this session's upscaler already denoises, or there is none)"
+                                    "{}: not armed — the denoiser composes with XeSS/FSR3 \
+                                     sessions (this session's upscaler already denoises, or \
+                                     there is none)",
+                                    if opts.frd_explicit { "frd" } else { "nrd" }
                                 );
                             }
                             let built = gpu::dxc::Dxc::load(&opts.dxc_path).and_then(|dxc| {
@@ -20673,10 +21118,9 @@ fn session(
                                     dxw as u32,
                                     dxh as u32,
                                     compose,
-                                    ((dxr_xess_avail || dxr_fsr3_avail)
-                                        && !dxr_quin_avail
-                                        && opts.nrd)
-                                        .then_some(opts.nrd_path.as_str()),
+                                    ((dxr_xess_avail || dxr_fsr3_avail) && !dxr_quin_avail)
+                                        .then(|| dn_kind(&opts))
+                                        .flatten(),
                                     opts.gpu_debug,
                                     opts.bc7,
                                 )

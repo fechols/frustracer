@@ -194,6 +194,10 @@ opt_fields! {
         pub nrd_prepass_radius: f32,
         pub nrd_anti_firefly: bool,
         pub nrd_max_accum_frames: u32,
+        /// --frd (restart): the from-scratch pre-upscale denoiser. Drives
+        /// the DEFAULT arm only — never frd_explicit (the fg-row rule), so
+        /// a file value can't make another flag fatal.
+        pub frd: bool,
     }
 }
 
@@ -859,6 +863,9 @@ fn apply_with(
     }
     if let Some(v) = u.nrd_max_accum_frames {
         nt.max_accum_frames = Some(v);
+    }
+    if let Some(v) = u.frd {
+        opts.frd = v;
     }
 
     // Effects: tod rides Opts; the rest are global statics (apply_globals).

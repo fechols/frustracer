@@ -1616,6 +1616,144 @@ cargo run --release -- --gpu --xess --nrd  # NRD (ReBLUR) pre-upscale denoising 
 cargo run --release -- --gpu --fsr3 --nrd  # the same denoiser under the FSR 3.1 chain (and
                                       # --dxr --xess/--fsr3 --nrd for the DXR pipeline — all
                                       # four chain combinations share one nrd_frame_step)
+cargo run --release -- --gpu --xess --frd  # FRD (src/frd.rs + gpu/frd_gpu.rs, 2026-08-09) — the
+                                      # FROM-SCRATCH, REDISTRIBUTABLE, pure-Rust+HLSL denoiser
+                                      # being built to REPLACE NRD in the pre-upscale slot
+                                      # (coexist-then-retire: NRD stays the A/B oracle until FRD
+                                      # reaches its STAB 0.07-0.10 band, then the whole NRD stack
+                                      # — nrd.rs, nrd_gpu.rs, the install-prerequisites nrd
+                                      # component (the ONE CMake+VS dependency), the version-pin
+                                      # gate — dies in one commit). CLEAN-ROOM RULE, load-bearing:
+                                      # the NRD source tree is NEVER read/quoted/transcribed
+                                      # (extends the nrd::oracle never-paste rule; do not open
+                                      # %TEMP%\frustracer-prereqs); the design comes from the
+                                      # published literature (RTG II ch. 49 ReBLUR, the GDC
+                                      # self-stabilizing-recurrent-blurs talk, SVGF) — plan doc:
+                                      # the ReBLUR-class recurrent 3-dispatch shape (temporal /
+                                      # blur / post+feedback) at fp16, wave-ops, narrow barriers,
+                                      # B70-first (XMX ruled out: bilateral weights are not a
+                                      # GEMM). OPT-IN until parity: --frd takes the ONE denoiser
+                                      # slot (enum DnGpu in gpu/mod.rs — arm_denoiser_for /
+                                      # nrd_frame_step / the shed machinery are engine-blind, the
+                                      # bridge kernels + NRD_FEED_SET + nrd_sig/sky-ext-skip
+                                      # wiring UNCHANGED: FrdGpu carries NrdGpu's exact plane
+                                      # contract); only EXPLICIT pairs are fatal — explicit
+                                      # --frd + explicit --nrd exits 2, explicit --frd + --nppd
+                                      # exits 2, an explicit --frd silently disarms the
+                                      # DEFAULTED nrd, and a FILE-defaulted frd (the settings
+                                      # row) yields LOUDLY to an explicit --nrd/--nppd instead
+                                      # (a default never makes another flag fatal — the
+                                      # fg_explicit doctrine; both-defaulted = the file's frd
+                                      # beats the compiled nrd, silently); the not-armed session
+                                      # notes key on frd_explicit, so a file default never nags;
+                                      # --no-frd spells the default; settings row `frd` drives
+                                      # the default arm only (the fg-row rule).
+                                      # --frd-max-accum-frames/-fast-frames/-max-stab-frames/
+                                      # -blur-radius/-clamp-sigma/-[no-]anti-firefly/-no-fp16 =
+                                      # the tuning family (frd::FrdTuning, all-None = compiled
+                                      # constants; --frd-no-fp16 forces the fp32 shader arm).
+                                      # PHASE STATUS: A+B+C SHIPPED (2026-08-09) — the plan's
+                                      # 3-dispatch recurrent shape is LIVE: cs_frd_temporal
+                                      # (reproject off the wire 2.5D MV, per-foot disocclusion
+                                      # with the grazing-relaxed relative-Z test, slow/fast
+                                      # accumulation, Welford variance) -> cs_frd_blur
+                                      # (8-tap Vogel-disk bilateral at a hit-dist-driven,
+                                      # accumulation-scaled radius; history fix folded in as the
+                                      # n<N_FIX radius boost) -> cs_frd_post (1.7x disk,
+                                      # fast-history clamp, writes OUT + the RECURRENT slow
+                                      # feedback — pass 3's output IS next frame's history, the
+                                      # self-stabilizing compounding that makes a 30-frame cap
+                                      # converge; slow is single-buffered, pass 1 reads before
+                                      # pass 3 rewrites). Tap rotation = a pure integer hash of
+                                      # (pixel, frame, salt) — zero rng draws; tuning rides root
+                                      # constants (a lever never recompiles); per-pass
+                                      # frd/frd-temporal/frd-blur/frd-post pix::scope regions
+                                      # feed --gpu-timing from day one. force_passthrough is the
+                                      # F3 control arm (the spatial passes fire on reset frames
+                                      # BY DESIGN — that wide blur IS the history fix).
+                                      # MEASURED (4090, procedural still, native 1080p,
+                                      # FRUSTRACER_STAB — taken while other sessions ran
+                                      # benchmarks, so re-confirm solo before recording as
+                                      # canonical): XeSS-alone 0.79 -> FRD 0.09-0.11 (the NRD
+                                      # 0.07-0.10 band; Phase B temporal-only read 0.27); F4
+                                      # Laplacian 0.1264 -> 0.0436, mean drift 0.9%, temporal
+                                      # shrink 5.8x; B70 solo re-confirm 2026-08-09: FRD 0.06 vs
+                                      # NRD 0.04-0.05 on the converged still — band held.
+                                      # THE PHASE-D PERF CAMPAIGN (2026-08-09, same day —
+                                      # triggered by a user world test reading "NRD 36 FPS vs
+                                      # FRD 31", which decomposed to a MISLABELED BASELINE: that
+                                      # checkout had no NRD.dll, so the "NRD" arm shed loudly to
+                                      # PLAIN upscaling and the 4.5 ms delta was FRD-vs-NOTHING,
+                                      # not FRD-vs-NRD — check the `nrd: armed` vs `nrd:
+                                      # unavailable` line before believing any denoiser A/B; the
+                                      # DLL is now built on this checkout and N4/F8 run live).
+                                      # THE REAL HEAD-TO-HEAD (B70 world parked, native 1080p,
+                                      # same protocol both arms, foreign-PID check per d2d5f6a):
+                                      # FRD region 0.488 ms vs NRD 1.204 — 2.5x FASTER, whole
+                                      # frame span 5.42 vs 6.12; 4090 FRD region 0.226. Three
+                                      # moves got it from the first-light 0.543: (1) the
+                                      # TAP-LOOP DIET — the fused log2-domain tap weight
+                                      # (oracle::tap_exp2 + frd_tap_exp2: Gaussian/z/normal/
+                                      # hit-dist exponents SUM under ONE exp2; the Gaussian's
+                                      # r_i^2 = (i+0.5)/TAPS is a per-index constant so the
+                                      # per-tap length/sqrt died with it) + the literal Vogel
+                                      # table rotated by one per-pixel sincos (VOGEL8/vogel_rot,
+                                      # F0-pinned to the analytic generator) + pass-1 feet
+                                      # testing b==0 and z-validity BEFORE the prev_nr
+                                      # load+decode — measured only −2% on the B70 (0.543 ->
+                                      # 0.531: the passes are LATENCY-bound, not EM-pipe-bound,
+                                      # the d2d5f6a guide-campaign shape again) but ships as
+                                      # strictly-less-work with F4 statistically identical;
+                                      # (2) the GROUP-SHAPE SWEEP (FR_FRD_GROUP=TXxTY,BXxBY —
+                                      # loud on departure, loud+defaults on illegal; every cell
+                                      # a new Arc variant, maiden discard): temporal wants 8x8
+                                      # (0.233 -> 0.224) while blur/post want 16x16 (0.294 ->
+                                      # 0.260 combined; 8x8 was WORST there — the two pass
+                                      # families genuinely prefer opposite shapes, so per-pass
+                                      # constants, never one), adopted as compiled defaults and
+                                      # re-verified a 4090 WIN too (0.260 -> 0.226); (3) the
+                                      # fp16 arm is DEFERRED WITH REASONING — the diet's null
+                                      # result is the proxy measurement (ALU-rate wins don't
+                                      # move latency-bound passes), the group sweep already
+                                      # banked the occupancy half, and 0.488 sits 2.5x under
+                                      # the bar; the FRD_FP16 typedefs + compile_args hook +
+                                      # OPTIONS4 probe stay ready if a future res/scene regime
+                                      # re-opens it. STILL PENDING in C: firefly pre-clamp,
+                                      # hit-dist reconstruction, the 3x3 valid-foot fallback
+                                      # (shader-header notes); F8 as a DEDICATED gate (N4 + F4
+                                      # now run live on the same protocol/inputs — ReBLUR lap
+                                      # 0.1112->0.0336 vs FRD 0.1264->0.0436, the report-only
+                                      # comparison — but the promoted must-fire form is
+                                      # unbuilt). Gates: F0 (`frd` in
+                                      # --check —
+                                      # frd::oracle::self_test: reprojection convention,
+                                      # disocclusion anchors + grazing relaxation, the
+                                      # running-mean accumulation identity, Welford variance,
+                                      # clamp idempotence + box widths, firefly cap, bilateral
+                                      # weight shapes, radius endpoints, Vogel-disk spread, and
+                                      # the wire re-export pin vs nrd::oracle); F1 (check-gpu:
+                                      # instance contract + the fp16 probe); F3 (check-gpu, the
+                                      # structurally-critical one: pack -> FrdGpu.record ->
+                                      # out must reproduce cs_feed_xess's color BYTE-identically,
+                                      # with a measured dirty-pass anti-vacuity — 629341 channels
+                                      # provably dirtied, then byte-diff 0); F4 (check-gpu,
+                                      # DLL-free — the N4 protocol at FrdGpu, scored on the
+                                      # CONVERGED frame 7 since FRD's reset frame restarts
+                                      # history — one spatial-only wide blur, not the recurrent
+                                      # loop: finite, differs, Laplacian drops, mean
+                                      # <=25%, temporal shrink, RESTART departs, frame-B
+                                      # restore). dxc::compile_args is the per-unit
+                                      # -enable-16bit-types hook the phase-D fp16 arm uses.
+                                      # Next: C-completion (firefly/hit-dist-recon/3x3-fallback)
+                                      # + F8, D tuning to parity on the B70 at <1 ms (NRD:
+                                      # 1.74-1.97 ms B70; fp16 arm, wave ops, B70 group-size
+                                      # sweep, plane-distance bilateral upgrade, anti-lag,
+                                      # stabilization, specular virtual-motion v1.5), E default
+                                      # flip + NRD deletion.
+                                      # Touch frd.rs / frd_gpu.rs / the DnGpu enum /
+                                      # arm_denoiser_for -> run --check, --check-gpu, --check-dxr,
+                                      # --check-nrd (must stay untouched while NRD lives),
+                                      # --check-fsr, then the --gpu --xess --frd armed-line smoke
 cargo run --release -- --no-temporal  # A/B lever: disable ALL previous-frame quadtree reuse (no
                                       # temporal cache, no claim ring, no query skip, no structure
                                       # replay) — every frame proves its empty space from scratch
