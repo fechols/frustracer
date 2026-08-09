@@ -21,7 +21,17 @@
 //! line fully determines the run; a config file varying them with invisible
 //! machine state would break exactly that. Reproducible-viewpoint machinery
 //! (`--cam`, `--stress`, `--tile`) is likewise excluded from the schema:
-//! those are per-invocation experiment shapes, not preferences.
+//! those are per-invocation experiment shapes, not preferences. Two more
+//! deliberate exclusions: `--dxr-sbt` (its cli.rs comment says "no settings
+//! exposure" — a pure measurement lever) and `fg_explicit` (the
+//! passed-vs-defaulted fact belongs to the command line alone).
+//!
+//! **CLI overrides are surfaced, not silent**: main clones the post-apply
+//! `Opts` seed before the parse and diffs it per menu row against the parse's
+//! output (`cli_overrides` / `opt_projection`); a row whose saved value a CLI
+//! flag overrode gets the cyan "cli" badge and — restart tier — a
+//! "saved -> session" value display, so the menu never shows a file value as
+//! if the session were running it.
 //!
 //! Enum-ish fields serialize as the CLI's OWN strings (`"quality"`,
 //! `"fsr4"`, `"cuda"`, …) so the file reads like a command line and the two
@@ -95,6 +105,10 @@ opt_fields! {
         pub hdr_peak: f32,
         /// HUD compass+clock visibility (no CLI flag; live, F1 toggles).
         pub hud: bool,
+        /// --audio / --no-audio (restart: AudioSys is constructed once in
+        /// run_window — a live toggle would need subsystem construct/drop
+        /// plumbing that doesn't exist)
+        pub audio: bool,
     }
 }
 
@@ -153,6 +167,16 @@ opt_fields! {
         pub nppd: bool,
         /// "auto" | "cpu" | "dml" | "dml:<n>" (--nppd-device; restart)
         pub nppd_device: String,
+        /// --nrd / --no-nrd (restart: NRD wires at tracer init). The file
+        /// sets `opts.nrd` but deliberately NEVER `nrd_explicit` — the fg
+        /// precedent, not the dxr_inline one: main makes the --nrd + --nppd
+        /// pair fatal only when nrd_explicit ("a default must never make
+        /// another flag fatal" — a saved nrd plus a --nppd experiment must
+        /// land on the loud-disarm arm), nrd_explicit also gates the
+        /// not-armed session notes (a preference must not nag every DLSS
+        /// session), and no vendor policy moves nrd, so there is nothing
+        /// for an explicit bit to veto.
+        pub nrd: bool,
         /// --xess-autoexposure (restart)
         pub xess_autoexposure: bool,
         /// --no-adaptive inverse (restart)
@@ -239,6 +263,13 @@ opt_fields! {
         pub rtgi: bool,
         /// --no-water inverse (restart: keys the scene cache)
         pub water: bool,
+        /// --no-foliage-sway inverse (restart: read at scene load / SceneGpu
+        /// upload and keys the scene-cache sway word)
+        pub foliage_sway: bool,
+        /// --foliage-amp K (0.0..=8.0; restart: `sweep_mult()` pads the BVH
+        /// at BUILD time — a live raise past the swept pad would break
+        /// intersection soundness)
+        pub foliage_amp: f32,
     }
 }
 
@@ -277,6 +308,15 @@ opt_fields! {
         /// `--dual-gpu-auto`: let the balancer choose the share; `dual_gpu` is
         /// then the starting point rather than a fixed value.
         pub dual_gpu_auto: bool,
+        /// `--dual-gpu-depth 1..=3`: how deep the secondary adapter's quadtree
+        /// prefix recurses.
+        pub dual_gpu_depth: u32,
+        /// "vendor" | "wave" | "dxr" (--dual-gpu-arm; the parser also takes
+        /// the CLI aliases "wavefront"/"gpu" for hand-edited files). "vendor"
+        /// = None = the per-vendor default arm. A wave/dxr value arms
+        /// `dual_gpu = Some(2)` like the CLI flag does, under the same
+        /// explicit `dual_gpu: 0` veto `dual_gpu_auto` honors.
+        pub dual_gpu_arm: String,
         pub ftree: bool,
         pub ftree_tiles: bool,
         pub temporal: bool,
@@ -287,6 +327,25 @@ opt_fields! {
         pub hemi_share: bool,
         pub cut_rays: bool,
         pub cut_hemi: bool,
+        /// --sw-rays / --no-sw-rays (the software-BVH continuation-rays lever)
+        pub sw_rays: bool,
+        /// --wide-levels / --no-wide-levels (wave-cooperative shallow levels)
+        pub wide_levels: bool,
+        /// --no-slope-mips inverse
+        pub slope_mips: bool,
+        /// --no-spec-aa inverse
+        pub spec_aa: bool,
+        /// --no-coincident-cull inverse (keys the scene-cache lever word)
+        pub coincident_cull: bool,
+        /// "grid" | "som" (--el-cluster; validated through
+        /// emissive::parse_cluster at apply — main's lever block exit(2)s on
+        /// an illegal value, and a settings FILE must never brick the app)
+        pub el_cluster: String,
+        /// "off" | "on" | "chs" (--waveviz; "off" = 0 is not CLI-spellable —
+        /// absence — the blas_split free-value trick. NOTE a file "off"
+        /// leaves the FR_WAVEVIZ env alias live, exactly like the CLI:
+        /// main's lever block only overrides the env when nonzero.)
+        pub waveviz: String,
         /// BC7 texture compression (ON by default — the GPU encoder at
         /// `fast`; false = --no-bc7. The --bc7-cpu A/B arm is CLI-only.)
         pub bc7: bool,
@@ -306,8 +365,10 @@ opt_fields! {
         pub oidn_path: String,
         pub nppd_path: String,
         pub nppd_model: String,
+        pub nrd_path: String,
         pub xess_path: String,
         pub ffx_path: String,
+        pub fg_path: String,
         pub dxc_path: String,
         pub pix_path: String,
     }
@@ -494,6 +555,32 @@ pub fn parse_bounce(s: &str) -> Option<u32> {
     }
 }
 
+/// Mirrors --dual-gpu-arm plus the menu's "vendor" = per-vendor-default state
+/// (the CLI has no spelling for that — absence is it). Outer None = invalid;
+/// inner None = "vendor". Accepts the CLI's full alias set (wave|wavefront|gpu)
+/// so a hand-edited file using an alias still loads; the menu offers the
+/// canonical three.
+pub fn parse_dual_gpu_arm(s: &str) -> Option<Option<crate::gpu::dual::Arm>> {
+    use crate::gpu::dual::Arm;
+    match s {
+        "vendor" => Some(None),
+        "wave" | "wavefront" | "gpu" => Some(Some(Arm::Wave)),
+        "dxr" => Some(Some(Arm::Dxr)),
+        _ => None,
+    }
+}
+
+/// Mirrors --waveviz: bare flag = 1 ("on"), `chs` = 2; 0 ("off") is the
+/// flag's absence, CLI-unspellable — the blas_split free-value trick.
+pub fn parse_waveviz(s: &str) -> Option<u8> {
+    match s {
+        "off" => Some(0),
+        "on" => Some(1),
+        "chs" => Some(2),
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Apply
 // ---------------------------------------------------------------------------
@@ -523,6 +610,53 @@ fn warn(field: &str, val: &str) {
 /// is consumed by `run_window`/`session` directly from the `Settings` the
 /// caller keeps.)
 pub fn apply_to_opts(s: &Settings, opts: &mut crate::Opts) -> AppliedFx {
+    // The two informational CLAMP notes live HERE, not in the shared body:
+    // `invalid_fields` re-runs that body on every menu rebuild and must stay
+    // silent, and these are notes, not warns — the value still applies.
+    if let Some(n) = s.effects.fireflies_count {
+        if n > crate::fireflies::MAX_FIREFLIES as u32 {
+            eprintln!(
+                "settings: effects.fireflies_count {n} clamped to {} (the CB row cap)",
+                crate::fireflies::MAX_FIREFLIES
+            );
+        }
+    }
+    if let Some(n) = s.effects.emissive_lights_count {
+        if n > crate::emissive::MAX_EMISSIVE_LIGHTS as u32 {
+            eprintln!(
+                "settings: effects.emissive_lights_count {n} clamped to {} (the CB row cap)",
+                crate::emissive::MAX_EMISSIVE_LIGHTS
+            );
+        }
+    }
+    apply_with(s, opts, &mut warn)
+}
+
+/// Row ids whose saved values failed `apply_to_opts` validation — the warn
+/// keys' field tails, which ARE menu row ids (a naming convention self_test
+/// pins, so the display below can't silently rot). `build_menu_rows` calls
+/// this FRESH on every menu rebuild (cheap: pure math against a scratch
+/// defaults `Opts`, nothing printed) so a restart row can render
+/// "value (ignored)" and heal the moment the user edits the row to
+/// something legal — a startup snapshot would go stale exactly then.
+pub fn invalid_fields(s: &Settings) -> std::collections::HashSet<String> {
+    let mut bad = std::collections::HashSet::new();
+    let mut scratch = crate::cli::defaults();
+    let _ = apply_with(s, &mut scratch, &mut |field: &str, _: &str| {
+        bad.insert(field.rsplit('.').next().unwrap_or(field).to_string());
+    });
+    bad
+}
+
+/// The one validation body behind `apply_to_opts` (printing sink) and
+/// `invalid_fields` (collecting sink) — shared, so the two can never disagree
+/// about what a valid value is. The `warn` parameter deliberately shadows the
+/// free fn above, keeping every call site in the body untouched.
+fn apply_with(
+    s: &Settings,
+    opts: &mut crate::Opts,
+    warn: &mut dyn FnMut(&str, &str),
+) -> AppliedFx {
     let mut fx = AppliedFx::default();
 
     // Display
@@ -567,6 +701,9 @@ pub fn apply_to_opts(s: &Settings, opts: &mut crate::Opts) -> AppliedFx {
         } else {
             warn("display.hdr_peak", &v.to_string());
         }
+    }
+    if let Some(v) = d.audio {
+        opts.audio = v;
     }
 
     // Renderer
@@ -675,6 +812,12 @@ pub fn apply_to_opts(s: &Settings, opts: &mut crate::Opts) -> AppliedFx {
             Some(v) => opts.nppd_device = v,
             None => warn("upscaler.nppd_device", dev),
         }
+    }
+    if let Some(v) = u.nrd {
+        // Deliberately NOT nrd_explicit — the fg precedent, see the schema
+        // field's comment: a saved nrd plus a --nppd experiment must land on
+        // main's loud-disarm arm, never exit(2).
+        opts.nrd = v;
     }
     if let Some(v) = u.xess_autoexposure {
         opts.xess_autoexposure = v;
@@ -794,6 +937,28 @@ pub fn apply_to_opts(s: &Settings, opts: &mut crate::Opts) -> AppliedFx {
             opts.dual_gpu = Some(2);
         }
     }
+    if let Some(n) = a.dual_gpu_depth {
+        if (1..=3).contains(&n) {
+            opts.dual_gpu_depth = n;
+        } else {
+            warn("advanced.dual_gpu_depth", &n.to_string());
+        }
+    }
+    if let Some(arm) = a.dual_gpu_arm.as_deref() {
+        match parse_dual_gpu_arm(arm) {
+            Some(v) => {
+                opts.dual_gpu_arm = v;
+                // Arming parity with the CLI flag (forcing an arm on a device
+                // that was never opened is a silent no-op), under the same
+                // explicit `dual_gpu: 0` veto `dual_gpu_auto` carries —
+                // "vendor" arms nothing, it is the default's spelling.
+                if v.is_some() && opts.dual_gpu.is_none() && a.dual_gpu != Some(0) {
+                    opts.dual_gpu = Some(2);
+                }
+            }
+            None => warn("advanced.dual_gpu_arm", arm),
+        }
+    }
     if let Some(v) = a.ftree {
         opts.ftree = v;
     }
@@ -823,6 +988,37 @@ pub fn apply_to_opts(s: &Settings, opts: &mut crate::Opts) -> AppliedFx {
     }
     if let Some(v) = a.cut_hemi {
         opts.cut_hemi = v;
+    }
+    if let Some(v) = a.sw_rays {
+        opts.sw_rays = v;
+    }
+    if let Some(v) = a.wide_levels {
+        opts.wide_levels = v;
+    }
+    if let Some(v) = a.slope_mips {
+        opts.slope_mips = v;
+    }
+    if let Some(v) = a.spec_aa {
+        opts.spec_aa = v;
+    }
+    if let Some(v) = a.coincident_cull {
+        opts.coincident_cull = v;
+    }
+    if let Some(c) = a.el_cluster.as_deref() {
+        // Validate HERE, not just in main's lever block: the lever block
+        // exit(2)s on an illegal value (correct for the CLI, where a user is
+        // standing by), and a settings FILE must never brick the app — only a
+        // legal value may reach opts.el_cluster.
+        match crate::emissive::parse_cluster(c) {
+            Some(_) => opts.el_cluster = c.to_string(),
+            None => warn("advanced.el_cluster", c),
+        }
+    }
+    if let Some(w) = a.waveviz.as_deref() {
+        match parse_waveviz(w) {
+            Some(v) => opts.waveviz = v,
+            None => warn("advanced.waveviz", w),
+        }
     }
     // bc7_quality applies BEFORE the bc7 toggle: a settings file has no flag
     // order, so "quality implies on" (the CLI rule) must not defeat an
@@ -866,11 +1062,17 @@ pub fn apply_to_opts(s: &Settings, opts: &mut crate::Opts) -> AppliedFx {
     if let Some(p) = a.nppd_model.clone() {
         opts.nppd_model = p;
     }
+    if let Some(p) = a.nrd_path.clone() {
+        opts.nrd_path = p;
+    }
     if let Some(p) = a.xess_path.clone() {
         opts.xess_path = p;
     }
     if let Some(p) = a.ffx_path.clone() {
         opts.ffx_path = p;
+    }
+    if let Some(p) = a.fg_path.clone() {
+        opts.fg_path = p;
     }
     if let Some(p) = a.dxc_path.clone() {
         opts.dxc_path = p;
@@ -969,6 +1171,16 @@ pub fn apply_to_opts(s: &Settings, opts: &mut crate::Opts) -> AppliedFx {
     if let Some(v) = e.water {
         opts.water = v;
     }
+    if let Some(v) = e.foliage_sway {
+        opts.foliage_sway = v;
+    }
+    if let Some(k) = e.foliage_amp {
+        if k.is_finite() && (0.0..=8.0).contains(&k) {
+            opts.foliage_amp = k;
+        } else {
+            warn("effects.foliage_amp", &k.to_string());
+        }
+    }
     if let Some(v) = e.bloom {
         opts.bloom = v;
     }
@@ -979,7 +1191,7 @@ pub fn apply_to_opts(s: &Settings, opts: &mut crate::Opts) -> AppliedFx {
         if v.is_finite() && (-8.0..=8.0).contains(&v) {
             opts.exposure_bias = v;
         } else {
-            eprintln!("settings: effects.exposure_bias {v} outside -8..=8 — ignored");
+            warn("effects.exposure_bias", &v.to_string());
         }
     }
     if let Some(v) = e.clouds {
@@ -989,12 +1201,9 @@ pub fn apply_to_opts(s: &Settings, opts: &mut crate::Opts) -> AppliedFx {
         opts.fireflies = v;
     }
     if let Some(n) = e.fireflies_count {
-        if n > crate::fireflies::MAX_FIREFLIES as u32 {
-            eprintln!(
-                "settings: effects.fireflies_count {n} clamped to {} (the CB row cap)",
-                crate::fireflies::MAX_FIREFLIES
-            );
-        }
+        // Over-cap NOTE lives in apply_to_opts (this body must stay silent —
+        // invalid_fields re-runs it per menu rebuild); the value still applies,
+        // fireflies::set_count clamps.
         opts.fireflies_count = n;
     }
     if let Some(v) = e.emissive_lights {
@@ -1006,12 +1215,7 @@ pub fn apply_to_opts(s: &Settings, opts: &mut crate::Opts) -> AppliedFx {
         opts.emissive_lights_explicit = true;
     }
     if let Some(n) = e.emissive_lights_count {
-        if n > crate::emissive::MAX_EMISSIVE_LIGHTS as u32 {
-            eprintln!(
-                "settings: effects.emissive_lights_count {n} clamped to {} (the CB row cap)",
-                crate::emissive::MAX_EMISSIVE_LIGHTS
-            );
-        }
+        // Over-cap NOTE hoisted like fireflies_count's — same silence rule.
         opts.emissive_lights_count = n;
     }
     if let Some(n) = s.advanced.dxr_inline {
@@ -1147,6 +1351,7 @@ pub fn menu_items() -> &'static [MenuItem] {
             item!("hdr10", "HDR10 (PQ) vs 10-bit gamma", "Display", Restart, Toggle { default: false }, acc_bool!(display.hdr10)),
             item!("hdr_paper_white", "paper white (nits)", "Display", Restart, StepF { min: 80.0, max: 1000.0, step: 20.0, default: 200.0 }, acc_f32!(display.hdr_paper_white)),
             item!("hdr_peak", "peak override (nits)", "Display", Restart, StepF { min: 400.0, max: 4000.0, step: 100.0, default: 1000.0 }, acc_f32!(display.hdr_peak)),
+            item!("audio", "audio ambience", "Display", Restart, Toggle { default: true }, acc_bool!(display.audio)),
             // ── Renderer
             item!("mode", "render mode (SPACE cycles)", "Renderer", Live, CycleFwd, acc_str!(renderer.mode)),
             item!("preset", "quality preset (1-3)", "Renderer", Live, Cycle { options: &["1", "2", "3"], default_ix: 1 }, acc_u32!(renderer.preset)),
@@ -1166,6 +1371,8 @@ pub fn menu_items() -> &'static [MenuItem] {
             item!("oidn", "OIDN denoise (N cycles)", "Upscaler", Live, CycleFwd, acc_bool!(upscaler.oidn)),
             item!("oidn_temporal", "OIDN temporal history (M)", "Upscaler", Live, Toggle { default: true }, acc_bool!(upscaler.oidn_temporal)),
             item!("nppd", "NPPD neural denoise (J)", "Upscaler", Live, Toggle { default: false }, acc_bool!(upscaler.nppd)),
+            item!("nrd", "NRD denoise", "Upscaler", Restart, Toggle { default: true }, acc_bool!(upscaler.nrd)),
+            item!("oidn_post", "OIDN post-upscale start (XeSS)", "Upscaler", Restart, Toggle { default: false }, acc_bool!(upscaler.oidn_post)),
             item!("prefer", "adapter preference", "Upscaler", Restart, Cycle { options: &["nvidia", "amd", "intel"], default_ix: 0 }, acc_str!(upscaler.prefer)),
             item!("quinlight", "quinlight consensus fuse", "Upscaler", Restart, Toggle { default: false }, acc_bool!(upscaler.quinlight)),
             item!("quin_anchor", "quinlight anchor engine", "Upscaler", Restart, StepU { min: 0, max: 3, step: 1, default: 0 }, acc_u32!(upscaler.quin_anchor)),
@@ -1213,6 +1420,8 @@ pub fn menu_items() -> &'static [MenuItem] {
             item!("amb_bump", "ambient bump response", "Effects", Restart, Toggle { default: true }, acc_bool!(effects.amb_bump)),
             item!("rtgi", "real-time GI (1 bounce/frame)", "Effects", Restart, Toggle { default: true }, acc_bool!(effects.rtgi)),
             item!("water", "water material class", "Effects", Restart, Toggle { default: true }, acc_bool!(effects.water)),
+            item!("foliage_sway", "foliage sway", "Effects", Restart, Toggle { default: true }, acc_bool!(effects.foliage_sway)),
+            item!("foliage_amp", "foliage sway amplitude", "Effects", Restart, StepF { min: 0.0, max: 8.0, step: 0.5, default: 1.0 }, acc_f32!(effects.foliage_amp)),
             // ── Scene
             item!("world", "world mode (flagless boot)", "Scene", Restart, Toggle { default: true }, acc_bool!(scene.world)),
             item!("scene_path", "scene path", "Scene", Restart, Text, acc_str!(scene.scene_path)),
@@ -1232,6 +1441,8 @@ pub fn menu_items() -> &'static [MenuItem] {
                 s.advanced.dual_gpu = if v == "off" { Some(0) } else { v.parse().ok() };
             }))),
             item!("dual_gpu_auto", "second GPU: balance automatically", "Advanced", Restart, Toggle { default: false }, acc_bool!(advanced.dual_gpu_auto)),
+            item!("dual_gpu_depth", "second GPU quadtree depth", "Advanced", Restart, StepU { min: 1, max: 3, step: 1, default: 3 }, acc_u32!(advanced.dual_gpu_depth)),
+            item!("dual_gpu_arm", "second GPU pipeline", "Advanced", Restart, Cycle { options: &["vendor", "wave", "dxr"], default_ix: 0 }, acc_str!(advanced.dual_gpu_arm)),
             item!("ftree", "8-wide frustum tree", "Advanced", Restart, Toggle { default: true }, acc_bool!(advanced.ftree)),
             item!("ftree_tiles", "wide tree for CPU tiles", "Advanced", Restart, Toggle { default: false }, acc_bool!(advanced.ftree_tiles)),
             item!("temporal", "temporal reuse", "Advanced", Restart, Toggle { default: true }, acc_bool!(advanced.temporal)),
@@ -1242,6 +1453,13 @@ pub fn menu_items() -> &'static [MenuItem] {
             item!("hemi_share", "hemi sharing", "Advanced", Restart, Toggle { default: true }, acc_bool!(advanced.hemi_share)),
             item!("cut_rays", "cut-seeded rays", "Advanced", Restart, Toggle { default: true }, acc_bool!(advanced.cut_rays)),
             item!("cut_hemi", "cut-seeded hemi rays", "Advanced", Restart, Toggle { default: false }, acc_bool!(advanced.cut_hemi)),
+            item!("sw_rays", "software continuation rays (A/B)", "Advanced", Restart, Toggle { default: false }, acc_bool!(advanced.sw_rays)),
+            item!("wide_levels", "wave-cooperative levels", "Advanced", Restart, Toggle { default: true }, acc_bool!(advanced.wide_levels)),
+            item!("slope_mips", "slope-aware mips", "Advanced", Restart, Toggle { default: true }, acc_bool!(advanced.slope_mips)),
+            item!("spec_aa", "specular AA", "Advanced", Restart, Toggle { default: true }, acc_bool!(advanced.spec_aa)),
+            item!("coincident_cull", "coincident-face cull", "Advanced", Restart, Toggle { default: true }, acc_bool!(advanced.coincident_cull)),
+            item!("el_cluster", "emissive cluster placement", "Advanced", Restart, Cycle { options: &["grid", "som"], default_ix: 0 }, acc_str!(advanced.el_cluster)),
+            item!("waveviz", "wave-occupancy overlay", "Advanced", Restart, Cycle { options: &["off", "on", "chs"], default_ix: 0 }, acc_str!(advanced.waveviz)),
             item!("bc7", "BC7 texture compression", "Advanced", Restart, Toggle { default: true }, acc_bool!(advanced.bc7)),
             item!("bc7_quality", "BC7 quality", "Advanced", Restart, Cycle { options: &["ultrafast", "fast", "basic", "slow"], default_ix: 1 }, acc_str!(advanced.bc7_quality)),
             item!("dxr_inline", "DXR dispatch mode (0/1/2/3)", "Advanced", Restart, Cycle { options: &["0", "1", "2", "3"], default_ix: 1 }, acc_u32!(advanced.dxr_inline)),
@@ -1252,8 +1470,10 @@ pub fn menu_items() -> &'static [MenuItem] {
             item!("oidn_path", "OIDN DLL dir", "Advanced", Restart, Text, acc_str!(advanced.oidn_path)),
             item!("nppd_path", "ONNX Runtime DLL dir", "Advanced", Restart, Text, acc_str!(advanced.nppd_path)),
             item!("nppd_model", "NPPD model path", "Advanced", Restart, Text, acc_str!(advanced.nppd_model)),
+            item!("nrd_path", "NRD DLL dir", "Advanced", Restart, Text, acc_str!(advanced.nrd_path)),
             item!("xess_path", "XeSS DLL dir", "Advanced", Restart, Text, acc_str!(advanced.xess_path)),
             item!("ffx_path", "FidelityFX DLL dir", "Advanced", Restart, Text, acc_str!(advanced.ffx_path)),
+            item!("fg_path", "FG provider DLL dir", "Advanced", Restart, Text, acc_str!(advanced.fg_path)),
             item!("dxc_path", "DXC DLL dir", "Advanced", Restart, Text, acc_str!(advanced.dxc_path)),
             item!("pix_path", "PIX runtime dir", "Advanced", Restart, Text, acc_str!(advanced.pix_path)),
         ]
@@ -1376,6 +1596,252 @@ pub fn menu_value(item: &MenuItem, s: &Settings, live: &LiveView) -> String {
 
 fn onoff(v: bool) -> String {
     if v { "on" } else { "off" }.to_string()
+}
+
+// ---------------------------------------------------------------------------
+// CLI-override detection (the "cli" badge)
+// ---------------------------------------------------------------------------
+
+/// Rows that deliberately carry NO `Opts` projection, so `cli_overrides` can
+/// never flag them — and `self_test`'s coverage guard demands every OTHER
+/// persisted row have one (a new row cannot silently skip conflict tracking).
+/// Membership: session-start state with no `Opts` field (hud/preset/bounce),
+/// the stub-accessor live rows that never persist anything (overlay, gpu_tone,
+/// hybrid, dynamic, height_on, dlss, xess, fsr), and the scene side-channels
+/// (`AppliedFx`, not `Opts` — main.rs inserts their conflicts directly where
+/// it already decides that a CLI scene source replaces the file's choice).
+pub const NO_OPT_PROJECTION: &[&str] = &[
+    "hud", "overlay", "gpu_tone", "preset", "bounce", "hybrid", "dynamic", "height_on", "dlss",
+    "xess", "fsr", "scene_path", "world",
+];
+
+/// Project a row's CLI-effective value out of `Opts`, in the SAME vocabulary
+/// the row persists/displays — that is what lets a conflicted restart row
+/// read "saved -> session" without a second vocabulary. Option-typed fields
+/// with no CLI value render as "default" (a stable placeholder; equality is
+/// all the detector needs). None = the row has no `Opts` backing
+/// (`NO_OPT_PROJECTION`).
+pub fn opt_projection(id: &str) -> Option<fn(&crate::Opts) -> String> {
+    use crate::Opts;
+    fn opt_f32(v: Option<f32>) -> String {
+        v.map(|v| v.to_string()).unwrap_or_else(|| "default".into())
+    }
+    Some(match id {
+        // ── Display
+        "vsync" => |o: &Opts| onoff(o.vsync),
+        "hdr" => |o: &Opts| onoff(o.hdr),
+        "hdr10" => |o: &Opts| onoff(o.hdr10),
+        "hdr_paper_white" => |o: &Opts| o.hdr_paper_white.to_string(),
+        "hdr_peak" => |o: &Opts| opt_f32(o.hdr_peak),
+        "audio" => |o: &Opts| onoff(o.audio),
+        // ── Renderer
+        "mode" => |o: &Opts| {
+            (if o.dxr {
+                "dxr"
+            } else if o.gpu {
+                "gpu"
+            } else {
+                "cpu"
+            })
+            .to_string()
+        },
+        "lock_res" => |o: &Opts| match o.lock_scale {
+            None => "dynamic".into(),
+            Some(s) => ["quality", "balanced", "performance", "ultra-performance", "native"]
+                .iter()
+                .find(|n| crate::xess::lock_scale(n) == Some(s))
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| s.to_string()),
+        },
+        "spp" => |o: &Opts| o.spp.to_string(),
+        "heightfield" => |o: &Opts| onoff(o.heightfield),
+        // ── Upscaler
+        "chain" => |o: &Opts| {
+            use crate::upchain::UpChain;
+            // force() clears only the levels ABOVE its own, so the first
+            // enabled level in probe order (dlss -> fsr4 -> xess -> fsr3,
+            // UpLevel::ORDER) is the chain's start — exactly what the row's
+            // vocabulary names.
+            let c = o.chain;
+            (if c == UpChain::ALL {
+                "auto"
+            } else if c.dlss {
+                "dlss"
+            } else if c.fsr4 {
+                "fsr4"
+            } else if c.xess {
+                "xess"
+            } else if c.fsr3 {
+                "fsr3"
+            } else {
+                "none"
+            })
+            .to_string()
+        },
+        "fg" => |o: &Opts| onoff(o.fg),
+        "oidn" => |o: &Opts| onoff(o.oidn),
+        "oidn_temporal" => |o: &Opts| onoff(o.oidn_temporal),
+        "nppd" => |o: &Opts| onoff(o.nppd),
+        "nrd" => |o: &Opts| onoff(o.nrd),
+        "oidn_post" => |o: &Opts| onoff(o.oidn_post),
+        "prefer" => |o: &Opts| {
+            use crate::gpu::adapter::Prefer;
+            match o.prefer {
+                None => "auto".into(),
+                Some(Prefer::Nvidia) => "nvidia".into(),
+                Some(Prefer::Amd) => "amd".into(),
+                Some(Prefer::Intel) => "intel".into(),
+            }
+        },
+        "quinlight" => |o: &Opts| onoff(o.quin),
+        "quin_anchor" => |o: &Opts| {
+            o.quin_anchor.map(|v| v.to_string()).unwrap_or_else(|| "default".into())
+        },
+        "oidn_quality" => |o: &Opts| {
+            (if o.oidn_quality == crate::oidn::QUALITY_FAST {
+                "fast"
+            } else if o.oidn_quality == crate::oidn::QUALITY_HIGH {
+                "high"
+            } else {
+                "balanced"
+            })
+            .to_string()
+        },
+        "oidn_device" => |o: &Opts| {
+            ["default", "cpu", "sycl", "cuda", "hip"]
+                .get(o.oidn_device.max(0) as usize)
+                .unwrap_or(&"default")
+                .to_string()
+        },
+        "oidn_clean_aux" => |o: &Opts| onoff(o.oidn_clean_aux),
+        "nppd_device" => |o: &Opts| match o.nppd_device {
+            None => "auto".into(),
+            Some(-1) => "cpu".into(),
+            Some(0) => "dml".into(),
+            Some(n) => format!("dml:{n}"),
+        },
+        "xess_autoexposure" => |o: &Opts| onoff(o.xess_autoexposure),
+        "adaptive" => |o: &Opts| onoff(o.adaptive),
+        "fsr_max_radiance" => |o: &Opts| opt_f32(o.fsr_tune.max_radiance),
+        "fsr_stability_bias" => |o: &Opts| opt_f32(o.fsr_tune.stability_bias),
+        "fsr_radiance_clip_k" => |o: &Opts| opt_f32(o.fsr_tune.radiance_clip_k),
+        "fsr_disocclusion_threshold" => |o: &Opts| opt_f32(o.fsr_tune.disocclusion_threshold),
+        "fsr_normal_strength" => |o: &Opts| opt_f32(o.fsr_tune.normal_strength),
+        "fsr_kernel_relaxation" => |o: &Opts| opt_f32(o.fsr_tune.kernel_relaxation),
+        // ── Effects
+        "tod" => |o: &Opts| opt_f32(o.tod),
+        "bloom" => |o: &Opts| onoff(o.bloom),
+        "autoexp" => |o: &Opts| onoff(o.autoexp),
+        "exposure_bias" => |o: &Opts| o.exposure_bias.to_string(),
+        "clouds" => |o: &Opts| onoff(o.clouds),
+        "fireflies" => |o: &Opts| onoff(o.fireflies),
+        "fireflies_count" => |o: &Opts| o.fireflies_count.to_string(),
+        "emissive_lights" => |o: &Opts| onoff(o.emissive_lights),
+        "emissive_lights_count" => |o: &Opts| o.emissive_lights_count.to_string(),
+        "aniso" => |o: &Opts| o.aniso.to_string(),
+        "normal_strength" => |o: &Opts| o.normal_strength.to_string(),
+        "cloud_shadow" => |o: &Opts| {
+            if o.cloud_shadow == 0 { "off".into() } else { o.cloud_shadow.to_string() }
+        },
+        "sky_lod" => |o: &Opts| if o.sky_lod <= 1 { "off".into() } else { o.sky_lod.to_string() },
+        "mips" => |o: &Opts| onoff(o.mips),
+        "h2n" => |o: &Opts| onoff(o.h2n),
+        "n2h" => |o: &Opts| onoff(o.n2h),
+        "tinted_shadows" => |o: &Opts| onoff(o.tinted_shadows),
+        "spray" => |o: &Opts| onoff(o.spray),
+        "depth_tint" => |o: &Opts| onoff(o.depth_tint),
+        "detail_tex" => |o: &Opts| onoff(o.detail_tex),
+        "detail_ao" => |o: &Opts| onoff(o.detail_ao),
+        "detail_strength" => |o: &Opts| o.detail_strength.to_string(),
+        "detail_ao_strength" => |o: &Opts| o.detail_ao_strength.to_string(),
+        "detail_untex_scale" => |o: &Opts| o.detail_untex_scale.to_string(),
+        "amb_bump" => |o: &Opts| onoff(o.amb_bump),
+        "rtgi" => |o: &Opts| onoff(o.rtgi),
+        "water" => |o: &Opts| onoff(o.water),
+        "foliage_sway" => |o: &Opts| onoff(o.foliage_sway),
+        "foliage_amp" => |o: &Opts| o.foliage_amp.to_string(),
+        // ── Advanced
+        "bvh_builder" => |o: &Opts| o.bvh_builder.clone(),
+        "bvh_ctrav" => |o: &Opts| o.c_trav.to_string(),
+        "bvh_maxleaf" => |o: &Opts| o.max_leaf.to_string(),
+        "bvh_axes" => |o: &Opts| o.split_axes.to_string(),
+        "blas_split" => |o: &Opts| {
+            o.blas_split.map(|v| v.to_string()).unwrap_or_else(|| "off".into())
+        },
+        "dual_gpu" => |o: &Opts| o.dual_gpu.map(|v| v.to_string()).unwrap_or_else(|| "off".into()),
+        "dual_gpu_auto" => |o: &Opts| onoff(o.dual_gpu_auto),
+        "dual_gpu_depth" => |o: &Opts| o.dual_gpu_depth.to_string(),
+        "dual_gpu_arm" => |o: &Opts| {
+            use crate::gpu::dual::Arm;
+            match o.dual_gpu_arm {
+                None => "vendor".into(),
+                Some(Arm::Wave) => "wave".into(),
+                Some(Arm::Dxr) => "dxr".into(),
+            }
+        },
+        "ftree" => |o: &Opts| onoff(o.ftree),
+        "ftree_tiles" => |o: &Opts| onoff(o.ftree_tiles),
+        "temporal" => |o: &Opts| onoff(o.temporal),
+        "replay" => |o: &Opts| onoff(o.replay),
+        "adopt" => |o: &Opts| onoff(o.adopt),
+        "discard_seeds" => |o: &Opts| onoff(o.discard_seeds),
+        "defer_shade" => |o: &Opts| onoff(o.defer_shade),
+        "hemi_share" => |o: &Opts| onoff(o.hemi_share),
+        "cut_rays" => |o: &Opts| onoff(o.cut_rays),
+        "cut_hemi" => |o: &Opts| onoff(o.cut_hemi),
+        "sw_rays" => |o: &Opts| onoff(o.sw_rays),
+        "wide_levels" => |o: &Opts| onoff(o.wide_levels),
+        "slope_mips" => |o: &Opts| onoff(o.slope_mips),
+        "spec_aa" => |o: &Opts| onoff(o.spec_aa),
+        "coincident_cull" => |o: &Opts| onoff(o.coincident_cull),
+        "el_cluster" => |o: &Opts| o.el_cluster.clone(),
+        "waveviz" => |o: &Opts| {
+            ["off", "on", "chs"].get(o.waveviz as usize).unwrap_or(&"off").to_string()
+        },
+        "bc7" => |o: &Opts| onoff(o.bc7.armed()),
+        "bc7_quality" => |o: &Opts| {
+            o.bc7.quality().map(|q| q.name().to_string()).unwrap_or_else(|| "off".into())
+        },
+        "dxr_inline" => |o: &Opts| o.dxr_inline.to_string(),
+        "fsr4_required" => |o: &Opts| onoff(o.fsr4_required),
+        "gpu_debug" => |o: &Opts| onoff(o.gpu_debug),
+        "pix_markers" => |o: &Opts| onoff(o.pix_markers),
+        "gpu_timing" => |o: &Opts| onoff(o.gpu_timing),
+        "oidn_path" => |o: &Opts| o.oidn_path.clone(),
+        "nppd_path" => |o: &Opts| o.nppd_path.clone(),
+        "nppd_model" => |o: &Opts| o.nppd_model.clone(),
+        "nrd_path" => |o: &Opts| o.nrd_path.clone(),
+        "xess_path" => |o: &Opts| o.xess_path.clone(),
+        "ffx_path" => |o: &Opts| o.ffx_path.clone(),
+        "fg_path" => |o: &Opts| o.fg_path.clone(),
+        "dxc_path" => |o: &Opts| o.dxc_path.clone(),
+        "pix_path" => |o: &Opts| o.pix_path.clone(),
+        _ => return None,
+    })
+}
+
+/// id -> the session's CLI-effective value, for every row where the FILE holds
+/// a saved value AND a CLI flag moved that row's projection. `seeded` is the
+/// post-`apply_to_opts` Opts (defaults + file, cloned BEFORE the parse);
+/// `final_opts` is the parse's output. Computed by main immediately after
+/// `cli::parse_from` and BEFORE any reconciliation/vendor-policy block — the
+/// badge means "a CLI FLAG overrode your saved value", never a policy move.
+/// A flag that restates the saved value projects equal and never flags
+/// (no conflict in effect). Pure; `self_test` pins it end-to-end.
+pub fn cli_overrides(
+    file: &Settings,
+    seeded: &crate::Opts,
+    final_opts: &crate::Opts,
+) -> std::collections::HashMap<String, String> {
+    menu_items()
+        .iter()
+        .filter_map(|it| {
+            let f = opt_projection(it.id)?;
+            (it.get)(file)?; // no saved value -> nothing to conflict with
+            let (a, b) = (f(seeded), f(final_opts));
+            (a != b).then(|| (it.id.to_string(), b))
+        })
+        .collect()
 }
 
 /// Apply one click/step to a row: persist the new value into `s` (Live rows
@@ -1742,6 +2208,15 @@ pub fn self_test() -> Result<(), String> {
             ("dual_gpu", Control::Cycle { options, .. }) => options
                 .iter()
                 .all(|o| *o == "off" || o.parse::<u32>().is_ok_and(|n| (1..=7).contains(&n))),
+            ("el_cluster", Control::Cycle { options, .. }) => {
+                options.iter().all(|o| crate::emissive::parse_cluster(o).is_some())
+            }
+            ("dual_gpu_arm", Control::Cycle { options, .. }) => {
+                options.iter().all(|o| parse_dual_gpu_arm(o).is_some())
+            }
+            ("waveviz", Control::Cycle { options, .. }) => {
+                options.iter().all(|o| parse_waveviz(o).is_some())
+            }
             _ => true,
         };
         if !ok {
@@ -1780,6 +2255,221 @@ pub fn self_test() -> Result<(), String> {
     }
     if headless_args(["--tod", "17.5", "model.obj"].iter().copied()) {
         return Err("headless_args fired on an interactive command line".into());
+    }
+
+    // The nrd fg-precedent pin: the file moves opts.nrd but must NEVER set
+    // nrd_explicit — explicit is what makes the --nrd + --nppd pair fatal in
+    // main, and "a default must never make another flag fatal" (the fg rule,
+    // settings schema comment on upscaler.nrd).
+    for v in [true, false] {
+        let mut s = Settings::default();
+        s.upscaler.nrd = Some(v);
+        let mut o = crate::cli::defaults();
+        let _ = apply_to_opts(&s, &mut o);
+        if o.nrd != v || o.nrd_explicit {
+            return Err("upscaler.nrd must move opts.nrd and never nrd_explicit".into());
+        }
+    }
+
+    // New-lever vocabulary pins (the parse_mode pattern): the full CLI alias
+    // set accepted, garbage rejected.
+    for a in ["vendor", "wave", "wavefront", "gpu", "dxr"] {
+        parse_dual_gpu_arm(a).ok_or_else(|| format!("dual_gpu_arm vocab '{a}' rejected"))?;
+    }
+    if parse_dual_gpu_arm("vulkan").is_some() {
+        return Err("dual_gpu_arm vocab accepted garbage".into());
+    }
+    for w in ["off", "on", "chs"] {
+        parse_waveviz(w).ok_or_else(|| format!("waveviz vocab '{w}' rejected"))?;
+    }
+    if parse_waveviz("2").is_some() {
+        return Err("waveviz vocab accepted a bare number (the file speaks off/on/chs)".into());
+    }
+    for c in ["grid", "som"] {
+        crate::emissive::parse_cluster(c).ok_or_else(|| format!("el_cluster vocab '{c}' rejected"))?;
+    }
+    if crate::emissive::parse_cluster("bogus").is_some() {
+        return Err("el_cluster vocab accepted garbage".into());
+    }
+
+    // The dual_gpu_arm arming veto — the dual_gpu_auto three-case shape: an
+    // arm choice arms a default share, an explicit share=0 vetoes the arming
+    // (but keeps the arm), an explicit share survives. "vendor" arms nothing.
+    {
+        let mut o = crate::cli::defaults();
+        let mut s = Settings::default();
+        s.advanced.dual_gpu_arm = Some("wave".into());
+        let _ = apply_to_opts(&s, &mut o);
+        if o.dual_gpu != Some(2) || o.dual_gpu_arm != Some(crate::gpu::dual::Arm::Wave) {
+            return Err("advanced.dual_gpu_arm alone must arm a default share".into());
+        }
+        let mut o = crate::cli::defaults();
+        let mut s = Settings::default();
+        s.advanced.dual_gpu = Some(0);
+        s.advanced.dual_gpu_arm = Some("dxr".into());
+        let _ = apply_to_opts(&s, &mut o);
+        if o.dual_gpu.is_some() || o.dual_gpu_arm != Some(crate::gpu::dual::Arm::Dxr) {
+            return Err("an explicit dual_gpu=0 must veto dual_gpu_arm's arming, arm kept".into());
+        }
+        let mut o = crate::cli::defaults();
+        let mut s = Settings::default();
+        s.advanced.dual_gpu = Some(3);
+        s.advanced.dual_gpu_arm = Some("wave".into());
+        let _ = apply_to_opts(&s, &mut o);
+        if o.dual_gpu != Some(3) {
+            return Err("an explicit share must survive dual_gpu_arm".into());
+        }
+        let mut o = crate::cli::defaults();
+        let mut s = Settings::default();
+        s.advanced.dual_gpu_arm = Some("vendor".into());
+        let _ = apply_to_opts(&s, &mut o);
+        if o.dual_gpu.is_some() || o.dual_gpu_arm.is_some() {
+            return Err("dual_gpu_arm 'vendor' is the default's spelling — it arms nothing".into());
+        }
+    }
+
+    // Validation pins for the new numeric/vocab fields: out-of-range warns
+    // and IGNORES (the never-exit-from-a-file guarantee), in-range applies.
+    {
+        for bad in [9.0f32, f32::NAN] {
+            let mut s = Settings::default();
+            s.effects.foliage_amp = Some(bad);
+            let mut o = crate::cli::defaults();
+            let _ = apply_to_opts(&s, &mut o);
+            if o.foliage_amp != 1.0 {
+                return Err("effects.foliage_amp out of range must be ignored".into());
+            }
+        }
+        for good in [0.0f32, 8.0] {
+            let mut s = Settings::default();
+            s.effects.foliage_amp = Some(good);
+            let mut o = crate::cli::defaults();
+            let _ = apply_to_opts(&s, &mut o);
+            if o.foliage_amp != good {
+                return Err("effects.foliage_amp in range must apply".into());
+            }
+        }
+        for (n, want) in [(0u32, 3u32), (4, 3), (2, 2)] {
+            let mut s = Settings::default();
+            s.advanced.dual_gpu_depth = Some(n);
+            let mut o = crate::cli::defaults();
+            let _ = apply_to_opts(&s, &mut o);
+            if o.dual_gpu_depth != want {
+                return Err("advanced.dual_gpu_depth validation drifted from 1..=3".into());
+            }
+        }
+        let mut s = Settings::default();
+        s.advanced.el_cluster = Some("bogus".into());
+        let mut o = crate::cli::defaults();
+        let _ = apply_to_opts(&s, &mut o);
+        if o.el_cluster != "grid" {
+            return Err(
+                "advanced.el_cluster 'bogus' must be ignored at APPLY — main's lever block \
+                 exit(2)s on an illegal value and a file must never brick the app"
+                    .into(),
+            );
+        }
+    }
+
+    // EXTRACTOR COVERAGE GUARD: every row that can PERSIST a value must carry
+    // an Opts projection (so cli_overrides can flag it) or sit on the
+    // documented NO_OPT_PROJECTION list — a new row cannot silently skip
+    // conflict tracking. Persistence is probed through the row's OWN set/get:
+    // stub accessors never produce Some and fall out naturally.
+    for it in items {
+        let candidates: Vec<String> = match &it.control {
+            Control::Toggle { .. } => vec!["on".into()],
+            Control::Cycle { options, default_ix } => vec![options[*default_ix].to_string()],
+            Control::StepU { default, .. } => vec![default.to_string()],
+            Control::StepF { default, .. } => vec![default.to_string()],
+            Control::CycleFwd | Control::Text => {
+                vec!["on".into(), "1".into(), "gpu".into(), "x".into()]
+            }
+        };
+        let mut probe = Settings::default();
+        let persists = candidates.iter().any(|c| {
+            (it.set)(&mut probe, c);
+            (it.get)(&probe).is_some()
+        });
+        let excluded = NO_OPT_PROJECTION.contains(&it.id);
+        if persists && !excluded && opt_projection(it.id).is_none() {
+            return Err(format!(
+                "menu id '{}' persists but has no Opts projection — add it to opt_projection \
+                 (conflict tracking) or NO_OPT_PROJECTION (documented exclusion)",
+                it.id
+            ));
+        }
+        if excluded && opt_projection(it.id).is_some() {
+            return Err(format!(
+                "menu id '{}' is on NO_OPT_PROJECTION but carries a projection — pick one",
+                it.id
+            ));
+        }
+    }
+
+    // END-TO-END CONFLICT PIN (cli::parse_from is pure — its own self_test
+    // pins that — so calling it here is legal): a saved value + a flag that
+    // moves it flags the row with the session value; a flag that RESTATES the
+    // saved value is no conflict; no flags, no conflicts.
+    {
+        let mut file = Settings::default();
+        file.renderer.spp = Some(8);
+        let mut seeded = crate::cli::defaults();
+        let _ = apply_to_opts(&file, &mut seeded);
+        let argv = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let moved = crate::cli::parse_from(seeded.clone(), argv(&["--spp", "2"]).into_iter()).opts;
+        let over = cli_overrides(&file, &seeded, &moved);
+        if over.get("spp").map(String::as_str) != Some("2") {
+            return Err("cli_overrides missed a --spp override of a saved spp".into());
+        }
+        if over.len() != 1 {
+            return Err(format!("cli_overrides flagged rows no flag moved: {over:?}"));
+        }
+        let restated =
+            crate::cli::parse_from(seeded.clone(), argv(&["--spp", "8"]).into_iter()).opts;
+        if !cli_overrides(&file, &seeded, &restated).is_empty() {
+            return Err("a flag restating the saved value is not a conflict".into());
+        }
+        if !cli_overrides(&file, &seeded, &seeded).is_empty() {
+            return Err("no flags -> no conflicts".into());
+        }
+    }
+
+    // INVALID-FIELD SURFACING PIN (`invalid_fields` — the "(ignored)" tag):
+    // a clean file reports nothing; a file with warn-ignored values reports
+    // exactly their field TAILS, and every reported tail must resolve through
+    // item_by_id — the naming convention (warn key tail == menu row id) the
+    // display depends on, pinned over one representative per warn shape
+    // (range f32, range u32, vocab string, vocab enum).
+    {
+        if !invalid_fields(&Settings::default()).is_empty() {
+            return Err("invalid_fields fired on a clean file".into());
+        }
+        let mut s = Settings::default();
+        s.effects.foliage_amp = Some(f32::NAN);
+        s.effects.exposure_bias = Some(20.0);
+        s.advanced.dual_gpu_depth = Some(9);
+        s.advanced.el_cluster = Some("bogus".into());
+        s.renderer.lock_res = Some("cinematic".into());
+        // A VALID value beside them must not be swept in.
+        s.renderer.spp = Some(4);
+        let bad = invalid_fields(&s);
+        for want in ["foliage_amp", "exposure_bias", "dual_gpu_depth", "el_cluster", "lock_res"] {
+            if !bad.contains(want) {
+                return Err(format!("invalid_fields missed warn-ignored '{want}'"));
+            }
+        }
+        if bad.contains("spp") || bad.len() != 5 {
+            return Err(format!("invalid_fields over-reported: {bad:?}"));
+        }
+        for id in &bad {
+            if item_by_id(id).is_none() {
+                return Err(format!(
+                    "invalid_fields id '{id}' is not a menu row id — a warn key's field tail \
+                     must equal its row id or the (ignored) tag silently never renders"
+                ));
+            }
+        }
     }
 
     Ok(())

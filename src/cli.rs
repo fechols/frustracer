@@ -100,7 +100,8 @@ pub struct Opts {
     /// plain upscaling. Excl. --nppd (both claim the pre-upscale color
     /// slot): the EXPLICIT pair exits 2, a merely-defaulted nrd disarms with
     /// a loud line instead — the fg_explicit pattern (a default must never
-    /// make another flag fatal).
+    /// make another flag fatal). Mirrored in settings.rs (upscaler.nrd — the
+    /// file sets this field only, never nrd_explicit, per that same rule).
     pub nrd: bool,
     /// True only when --nrd was NAMED on the command line — what makes the
     /// --nppd conflict fatal vs a loud disarm, and what gates the
@@ -1339,7 +1340,9 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
             // Emitter-placement A/B lever (the --bvh-builder bake-off shape):
             // required value, last-wins by plain store; the VOCABULARY is
             // validated in main's lever block via emissive::set_cluster_mode
-            // (illegal exits 2 there), which keeps the parse pure.
+            // (illegal exits 2 there), which keeps the parse pure. Mirrored in
+            // settings.rs (advanced.el_cluster — validated at APPLY through
+            // emissive::parse_cluster, so a file value can't reach the exit).
             "--el-cluster" => {
                 opts.el_cluster = args.next().unwrap_or_else(|| {
                     eprintln!("--el-cluster needs one of: grid | som");
@@ -1397,6 +1400,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
             }
             // Leaf sway (src/foliage.rs) — DEFAULT ON; --no-foliage-sway is
             // the kill lever, the clouds/fireflies shape; later flags win.
+            // Mirrored in settings.rs (effects.foliage_sway / foliage_amp).
             "--foliage-sway" => opts.foliage_sway = true,
             "--no-foliage-sway" => opts.foliage_sway = false,
             "--foliage-amp" => {
@@ -1435,6 +1439,7 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
                 // Optional value: bare = the overlay, `chs` = the mode-1
                 // closest-hit variant. Consumed only on an exact match, so a
                 // following scene path is safe (the --blas-split idiom).
+                // Mirrored in settings.rs (advanced.waveviz — off/on/chs).
                 opts.waveviz = if args.peek().is_some_and(|v| v == "chs") {
                     args.next();
                     2
@@ -1519,7 +1524,8 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
             // ARMS IF IT WASN'T ALREADY, the `--dual-gpu-auto` rule: forcing an
             // arm on a device that was never opened is a silent no-op, and
             // silently doing nothing is the failure mode the loud-lever rule
-            // exists to prevent.
+            // exists to prevent. Mirrored in settings.rs (advanced.dual_gpu_arm
+            // — same arming, same explicit dual_gpu:0 veto).
             "--dual-gpu-arm" => {
                 let v = args.next().unwrap_or_default();
                 if opts.dual_gpu.is_none() {

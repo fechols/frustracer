@@ -36,6 +36,7 @@ slint::slint! {
         label: string,
         value: string,
         restart: bool,
+        cli: bool,
         control: string,
     }
 
@@ -575,6 +576,15 @@ slint::slint! {
                                         if row.restart : Text {
                                             text: "restart";
                                             color: #ffb04d;
+                                            font-size: 11px;
+                                            vertical-alignment: center;
+                                        }
+                                        // A CLI flag overrode this row's saved
+                                        // value; the value column then reads
+                                        // "saved -> session" (restart rows).
+                                        if row.cli : Text {
+                                            text: "cli";
+                                            color: #4dd2ff;
                                             font-size: 11px;
                                             vertical-alignment: center;
                                         }

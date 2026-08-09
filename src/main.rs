@@ -247,11 +247,19 @@ fn main() {
     };
     let mut seed = cli::defaults();
     let sfx = settings::apply_to_opts(&file_settings, &mut seed);
+    // Cloned BEFORE the parse moves `seed`: the pause menu's "cli" badge is a
+    // per-row diff between this (defaults + file) and the parse's output —
+    // computed HERE, before any reconciliation block below mutates opts, so
+    // the badge means "a CLI FLAG overrode your saved value", never a policy
+    // or reconciliation move. Headless runs load Settings::default(), so the
+    // map is empty by construction there.
+    let seeded = seed.clone();
     let parsed = cli::parse_from(seed, argv.iter().cloned());
     if parsed.helped {
         cli::usage();
         return;
     }
+    let mut cli_over = settings::cli_overrides(&file_settings, &seeded, &parsed.opts);
     // The parser COLLECTS its diagnostics rather than printing them (it has to
     // stay silent inside cli::self_test); this is the one site that says them.
     for note in &parsed.notes {
@@ -305,6 +313,42 @@ fn main() {
             obj = Some(p);
         } else if let Some(w) = sfx.world {
             world_flag = Some(w);
+        }
+    } else {
+        // The CLI named a scene source, so the file's saved choice is being
+        // replaced outright — surface that as a "cli" conflict on the Scene
+        // rows. These two ride AppliedFx rather than Opts, so
+        // settings::cli_overrides cannot see them; this is their one insert
+        // site, in the same branch that already decides the replacement.
+        let onoff = |v: bool| if v { "on" } else { "off" }.to_string();
+        if let Some(fp) = sfx.scene_path.as_deref() {
+            if obj.as_deref() != Some(fp) {
+                let session = if let Some(p) = &obj {
+                    p.clone()
+                } else if world_flag.is_some() {
+                    "(world)".to_string()
+                } else {
+                    "(stress)".to_string()
+                };
+                cli_over.insert("scene_path".to_string(), session);
+            }
+        }
+        if let Some(fw) = sfx.world {
+            match world_flag {
+                Some(cw) if cw != fw => {
+                    cli_over.insert("world".to_string(), onoff(cw));
+                }
+                // The file wanted the world and a CLI scene path / --stress
+                // replaced it; world:off replaced by a scene path is not a
+                // contradiction (the world is off either way).
+                None if fw => {
+                    cli_over.insert(
+                        "world".to_string(),
+                        if obj.is_some() { "(scene path)".to_string() } else { "(stress)".to_string() },
+                    );
+                }
+                _ => {}
+            }
         }
     }
 
@@ -908,10 +952,10 @@ fn main() {
     // the loading screen. The TOD attractors and audio cues (which need the
     // world layout the load produces) are derived there, post-join.
     #[cfg(windows)]
-    run_window(req, &opts, file_settings);
+    run_window(req, &opts, file_settings, cli_over);
     #[cfg(not(windows))]
     {
-        let _ = (req, &opts, file_settings);
+        let _ = (req, &opts, file_settings, cli_over);
         eprintln!("the interactive window requires Windows (D3D12 + DLSS); use --check / --check-dlss");
         std::process::exit(2);
     }
@@ -14181,7 +14225,14 @@ fn cine_composite_hud(
                                 hud: true,
                                 ..Default::default()
                             };
-                            h.set_rows(build_menu_rows(&cfg, &live, group));
+                            // Headless capture renders Settings::default() —
+                            // no CLI conflicts by construction.
+                            h.set_rows(build_menu_rows(
+                                &cfg,
+                                &live,
+                                group,
+                                &std::collections::HashMap::new(),
+                            ));
                         }
                     }
                     // 5.2 s fills all 40 of the FPS graph's 125 ms buckets, so
@@ -18180,22 +18231,52 @@ fn build_menu_rows(
     cfg: &settings::Settings,
     live: &settings::LiveView,
     group: &str,
+    cli_over: &std::collections::HashMap<String, String>,
 ) -> Vec<hud::MenuRow> {
+    // Saved values apply_to_opts warn-IGNORED — recomputed fresh from the
+    // current file each rebuild (a silent re-validation, nothing printed), so
+    // the tag heals the moment the user edits the row to something legal.
+    let ignored = settings::invalid_fields(cfg);
     settings::menu_items()
         .iter()
         .filter(|i| i.group == group)
-        .map(|i| hud::MenuRow {
-            id: i.id.to_string(),
-            label: i.label.to_string(),
-            value: settings::menu_value(i, cfg, live),
-            restart: i.tier == settings::Tier::Restart,
-            control: match i.control {
-                settings::Control::Toggle { .. } => "toggle",
-                settings::Control::Cycle { .. } => "cycle",
-                settings::Control::CycleFwd => "cyclefwd",
-                settings::Control::StepU { .. } | settings::Control::StepF { .. } => "step",
-                settings::Control::Text => "text",
-            },
+        .map(|i| {
+            let sess = cli_over.get(i.id);
+            let mut value = settings::menu_value(i, cfg, live);
+            let restart = i.tier == settings::Tier::Restart;
+            // Non-Text only, same reason as the composite below: a Text row's
+            // value feeds the TextInput and would be committed back on Enter.
+            if restart && ignored.contains(i.id) && !matches!(i.control, settings::Control::Text) {
+                value = format!("{value} (ignored)");
+            }
+            if let Some(sv) = sess {
+                // A CLI flag overrode this row's saved value. Restart rows
+                // display the FILE value (misleading alone — the session runs
+                // the flag's), so compose "saved -> session"; the saved side
+                // recomputes from the current file each rebuild, so an edit
+                // shows "newsaved -> session" with the badge kept (truthful:
+                // the session still runs the CLI value). Live rows keep their
+                // value (LiveView is already session truth) and TEXT rows
+                // keep theirs (it feeds the TextInput and a composite would
+                // be committed back on Enter) — badge only, both.
+                if restart && !matches!(i.control, settings::Control::Text) {
+                    value = format!("{value} -> {sv}");
+                }
+            }
+            hud::MenuRow {
+                id: i.id.to_string(),
+                label: i.label.to_string(),
+                value,
+                restart,
+                cli: sess.is_some(),
+                control: match i.control {
+                    settings::Control::Toggle { .. } => "toggle",
+                    settings::Control::Cycle { .. } => "cycle",
+                    settings::Control::CycleFwd => "cyclefwd",
+                    settings::Control::StepU { .. } | settings::Control::StepF { .. } => "step",
+                    settings::Control::Text => "text",
+                },
+            }
         })
         .collect()
 }
@@ -18621,7 +18702,12 @@ fn upscaler_defaults(opts: &mut Opts, taa_wired: Option<&'static str>) {
 }
 
 #[cfg(windows)]
-fn run_window(req: SceneRequest, opts: &Opts, file_settings: settings::Settings) {
+fn run_window(
+    req: SceneRequest,
+    opts: &Opts,
+    file_settings: settings::Settings,
+    mut cli_over: std::collections::HashMap<String, String>,
+) {
     // SDL3 is per-monitor-v2 DPI aware on Windows unconditionally (SDL2's
     // SDL_WINDOWS_DPI_AWARENESS hint is gone), so W×H stays W×H physical
     // pixels, matching the swapchain.
@@ -18893,7 +18979,7 @@ fn run_window(req: SceneRequest, opts: &Opts, file_settings: settings::Settings)
     loop {
         match session(
             &mut scene, &mut bvh, opts, &fly, audio_sys.as_ref(), &mut window, &mut inp, &mut gpu,
-            &mut hud, &mut cfg, &mut persist, w, h,
+            &mut hud, &mut cfg, &mut cli_over, &mut persist, w, h,
         ) {
             SessionEnd::Quit => break,
             SessionEnd::Resize(nw, nh) => {
@@ -18963,6 +19049,7 @@ fn session(
     gpu: &mut gpu::GpuContext,
     hud: &mut Option<hud::Hud>,
     cfg: &mut settings::Settings,
+    cli_over: &mut std::collections::HashMap<String, String>,
     persist: &mut Option<Persist>,
     w: usize,
     h: usize,
@@ -20063,7 +20150,7 @@ fn session(
             if hd.menu_open() && menu_rows_stale {
                 menu_rows_stale = false;
                 let group = hd.group().to_string();
-                hd.set_rows(build_menu_rows(cfg, &live, &group));
+                hd.set_rows(build_menu_rows(cfg, &live, &group, cli_over));
             }
             for act in hd.take_actions() {
                 match act {
@@ -20084,6 +20171,15 @@ fn session(
                     }
                     hud::HudAction::Adjust(id, dir) => {
                         if let Some(item) = settings::item_by_id(&id) {
+                            // Editing a LIVE row retires its "cli" badge: the
+                            // session now runs the menu value, so the badge's
+                            // claim ("a CLI flag overrode your saved value")
+                            // just expired. Restart rows KEEP theirs — the
+                            // session still runs the CLI value until relaunch,
+                            // and build_menu_rows recomputes the saved side.
+                            if item.tier == settings::Tier::Live {
+                                cli_over.remove(&id);
+                            }
                             match settings::menu_adjust(item, dir, cfg, &live) {
                                 settings::MenuFx::Restart => {
                                     eprintln!("settings: '{id}' saved — applies on next launch");

@@ -135,6 +135,17 @@ impl Quality {
         }
     }
 
+    /// `parse`'s inverse — the menu's `bc7_quality` row projects the session
+    /// value back into the CLI vocabulary through this.
+    pub fn name(self) -> &'static str {
+        match self {
+            Quality::UltraFast => "ultrafast",
+            Quality::Fast => "fast",
+            Quality::Basic => "basic",
+            Quality::Slow => "slow",
+        }
+    }
+
     /// The `opaque_*` presets only — see the module note: they are what keeps
     /// the alpha-mode search out of the encoder.
     fn settings(self) -> bc7::EncodeSettings {

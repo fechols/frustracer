@@ -111,8 +111,9 @@ pub fn budget() -> u32 {
 }
 
 /// `--el-cluster grid|som` — the emitter-PLACEMENT A/B lever (the
-/// `--bvh-builder` bake-off pattern: a dev experiment lever, no settings
-/// row). `Grid` is the shipped clusterer (grid seed + agglomerative merge —
+/// `--bvh-builder` bake-off pattern, settings row included; the file value
+/// validates through `parse_cluster` so a bogus save can never reach main's
+/// exit(2)). `Grid` is the shipped clusterer (grid seed + agglomerative merge —
 /// bit-identical to the pre-lever code, a guarded branch); `Som` refines the
 /// merged centers with `som_refine` below. Restart-tier: set from main's
 /// lever block BEFORE any scene load (`finalize_scalars` derives through
@@ -126,12 +127,19 @@ pub enum ClusterMode {
     Som,
 }
 static CLUSTER_MODE: AtomicU32 = AtomicU32::new(0);
+/// Pure vocabulary check — the ONE source of the lever's legal names, shared
+/// by `set_cluster_mode`, `settings::apply_to_opts`'s warn-ignore validation,
+/// and `settings::self_test`'s vocabulary pin (which must stay side-effect-
+/// free and so cannot call the storing flavor).
+pub fn parse_cluster(name: &str) -> Option<ClusterMode> {
+    match name {
+        "grid" => Some(ClusterMode::Grid),
+        "som" => Some(ClusterMode::Som),
+        _ => None,
+    }
+}
 pub fn set_cluster_mode(name: &str) -> Option<ClusterMode> {
-    let m = match name {
-        "grid" => ClusterMode::Grid,
-        "som" => ClusterMode::Som,
-        _ => return None,
-    };
+    let m = parse_cluster(name)?;
     CLUSTER_MODE.store(m as u32, Ordering::Relaxed);
     Some(m)
 }

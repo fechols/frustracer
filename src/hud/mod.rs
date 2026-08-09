@@ -95,6 +95,10 @@ pub struct MenuRow {
     pub label: String,
     pub value: String,
     pub restart: bool,
+    /// A CLI flag overrode this row's saved value this session — the cyan
+    /// "cli" badge (main computes the set once at startup from a pre-parse /
+    /// post-parse Opts diff; see settings::cli_overrides).
+    pub cli: bool,
     pub control: &'static str,
 }
 
@@ -411,6 +415,7 @@ impl Hud {
                 label: r.label.as_str().into(),
                 value: r.value.as_str().into(),
                 restart: r.restart,
+                cli: r.cli,
                 control: r.control.into(),
             })
             .collect();
