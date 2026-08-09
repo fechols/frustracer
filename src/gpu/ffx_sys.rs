@@ -74,6 +74,18 @@ pub const QUALITY_MODE_ULTRA_PERFORMANCE: u32 = 4;
 // actually in when the FFX dispatch executes.
 pub const RES_STATE_UNORDERED_ACCESS: u32 = 1 << 1;
 pub const RES_STATE_COMPUTE_READ: u32 = 1 << 2;
+/// PIXEL_SHADER_RESOURCE (ffx_api_types.h's FFX_API_RESOURCE_STATE_PIXEL_READ)
+/// — the HUD UI texture's rest state; declaring COMPUTE_READ instead would
+/// have the proxy barrier from a state the resource is not in.
+pub const RES_STATE_PIXEL_READ: u32 = 1 << 3;
+
+// FfxApiUiCompositionFlags (ffx_framegeneration.h) — the FI swapchain's UI
+// registration flags word, passed through ffxshim_fg_swapchain_ui verbatim.
+pub const UI_COMP_PREMUL_ALPHA: u32 = 1 << 0;
+/// The proxy snapshots the UI resource at Present (game-queue-ordered), so
+/// its pacing thread never reads a texture our dirty-rect copies are
+/// mid-writing — the race answer, not an optimization.
+pub const UI_COMP_INTERNAL_DOUBLE_BUFFER: u32 = 1 << 1;
 
 pub type FfxShimLogCb = Option<extern "C" fn(ty: u32, msg: *const u16)>;
 
@@ -256,7 +268,7 @@ unsafe extern "C" {
         out_sc_ctx: *mut *mut c_void,
     ) -> i32;
     pub fn ffxshim_fg_swapchain_wait(sc_ctx: *mut c_void) -> i32;
-    pub fn ffxshim_fg_swapchain_ui(sc_ctx: *mut c_void, ui: *const FfxShimRes, premul: i32) -> i32;
+    pub fn ffxshim_fg_swapchain_ui(sc_ctx: *mut c_void, ui: *const FfxShimRes, flags: u32) -> i32;
     pub fn ffxshim_create_fg(
         device: *mut c_void,
         display_w: u32,

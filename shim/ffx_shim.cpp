@@ -415,13 +415,15 @@ int32_t ffxshim_fg_swapchain_wait(void* sc_ctx) {
     return static_cast<int32_t>(g_api.dispatch(&ctx, &d.header));
 }
 
-int32_t ffxshim_fg_swapchain_ui(void* sc_ctx, const FfxShimRes* ui, int32_t premul) {
+int32_t ffxshim_fg_swapchain_ui(void* sc_ctx, const FfxShimRes* ui, uint32_t flags) {
     if (!g_api.dll) return FFXSHIM_ERR_NOT_LOADED;
     if (!sc_ctx || !ui) return FFXSHIM_ERR_BAD_ARG;
     ffxConfigureDescFrameGenerationSwapChainRegisterUiResourceDX12 desc{};
     desc.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_REGISTERUIRESOURCE_DX12;
     desc.uiResource  = shim_res(*ui);
-    desc.flags       = premul ? FFX_FRAMEGENERATION_UI_COMPOSITION_FLAG_USE_PREMUL_ALPHA : 0u;
+    // The FfxApiUiCompositionFlags word verbatim (premul-alpha, internal UI
+    // double-buffering) — the Rust side owns the policy, never this file.
+    desc.flags       = flags;
     ffxContext ctx = sc_ctx;
     return static_cast<int32_t>(g_api.configure(&ctx, &desc.header));
 }

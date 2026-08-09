@@ -390,15 +390,23 @@ impl FgSwapchain {
         }
     }
 
-    /// Register the premultiplied-alpha UI texture (the HUD) the proxy
-    /// composites onto BOTH real and generated frames. Null = unregister.
-    /// UNWIRED — the documented ffx-FG known-accept: the HUD is baked
-    /// pre-present (interpolated with the frame) and this registration is
-    /// plumbed through the shim but never called; kept for that follow-on.
-    #[allow(dead_code)]
-    pub fn register_ui(&self, resource: *mut c_void, state: u32) -> Result<(), String> {
-        let ui = sys::FfxShimRes { resource, state };
-        let r = unsafe { sys::ffxshim_fg_swapchain_ui(self.ctx, &ui, 1) };
+    /// Register (Some) or unregister (None) the premultiplied display-space
+    /// UI texture the FI proxy composites onto BOTH real and generated
+    /// frames — the post-interpolation HUD, which is what stops the proxy
+    /// warping baked HUD pixels by scene motion on every generated frame.
+    /// The resource rests in PIXEL_SHADER_RESOURCE (the HudFi contract);
+    /// INTERNAL_UI_DOUBLE_BUFFER makes the proxy snapshot it at Present so
+    /// the pacing thread never reads our mid-write texture.
+    pub fn register_ui(&self, resource: Option<*mut c_void>) -> Result<(), String> {
+        let (ui, flags) = match resource {
+            Some(p) => (
+                sys::FfxShimRes { resource: p, state: sys::RES_STATE_PIXEL_READ },
+                sys::UI_COMP_PREMUL_ALPHA | sys::UI_COMP_INTERNAL_DOUBLE_BUFFER,
+            ),
+            // "May be empty" per the header — the unregister spelling.
+            None => (sys::FfxShimRes::NULL, 0),
+        };
+        let r = unsafe { sys::ffxshim_fg_swapchain_ui(self.ctx, &ui, flags) };
         if r != sys::FFX_OK {
             return Err(format!("fg ui register failed: {}", result_str(r)));
         }

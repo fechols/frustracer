@@ -214,19 +214,20 @@ pub fn quantize_res(
     (width_for_height(rh, out, min.0, max.0), rh)
 }
 
-/// The render scale every mode locks at by default — the DLSS "quality" 2/3
-/// ratio (the wired upscaler reconstructs the window from 0.444x the pixels).
-/// ONE value for the CPU tracer, `--gpu` and `--dxr` alike:
+/// The render scale every mode locks at by default — native 100%, the
+/// DLAA-shaped arm (the wired upscaler runs as a pure antialiaser/denoiser at
+/// window res). ONE value for the CPU tracer, `--gpu` and `--dxr` alike:
 /// the upscalers are the reconstruction stage in all three, so the arm that
 /// happens to be live is not a reason to change how many pixels get traced
 /// (F/SPACE cycling between arms therefore no longer moves the render res).
-/// HISTORY, third move: quality 2/3 from 2026-07-26, native 100% (DLAA-shaped)
-/// from 2026-07-31, quality 2/3 again since 2026-08-08 — so perf numbers
-/// recorded at "the flagless default" carry the era's scale: 0.444x-pixels in
-/// the two quality windows, full-res in the native one. `--lock-res native`
-/// spells the DLAA arm now. NOTE this re-opens the vendor_defaults res-basis
-/// caveat that the native window had resolved (see main::vendor_defaults).
-pub const DEFAULT_LOCK_SCALE: f32 = 2.0 / 3.0;
+/// HISTORY, fourth move: quality 2/3 from 2026-07-26, native 100% from
+/// 2026-07-31, quality 2/3 again briefly on 2026-08-08, native again the same
+/// day (the user's call) — so perf numbers recorded at "the flagless default"
+/// carry their era's scale: 0.444x-pixels in the two quality windows,
+/// full-res in the native ones. `--lock-res quality` spells the 2/3 arm.
+/// NOTE this re-closes the vendor_defaults res-basis caveat the quality
+/// window had re-opened (see main::vendor_defaults).
+pub const DEFAULT_LOCK_SCALE: f32 = 1.0;
 
 /// --lock-res argument -> fixed render scale (both upscaler paths consume it
 /// through `quantize_res`, which range-clamps). Named presets are the

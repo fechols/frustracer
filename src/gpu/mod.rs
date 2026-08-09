@@ -272,6 +272,14 @@ struct FgState {
     /// clear the AMD provider's wedged pacing state instead of carrying it
     /// across the switch's reset+resource+cadence discontinuity.
     skip_prepare: std::cell::Cell<bool>,
+    /// What the FI swapchain's UI registration currently holds: true = the
+    /// HudFi display-space texture, false = null. Dedup for
+    /// `fg_register_ui` — the proxy must never be re-configured per steady
+    /// frame, and every disable path drives this to null.
+    ui_reg: std::cell::Cell<bool>,
+    /// A UI registration configure failed once — latch and stop trying (the
+    /// baked backbuffer draw covers every frame after; loud once).
+    ui_shed: std::cell::Cell<bool>,
 }
 
 /// Raw-NGX DLSS-G FFI (shim/dlssg_shim.cpp — the quinlight-player blueprint).
@@ -563,6 +571,9 @@ struct XefgState {
     /// Last healthy poll's frames-presented-per-present (0 = not yet
     /// measured). The title bar's presented-per-rendered multiplier.
     mult: std::cell::Cell<u32>,
+    /// A RES_UI tag failed once — stop tagging (loud once; untagged =
+    /// today's baked-HUD interpolation, never a session/FG failure).
+    ui_shed: std::cell::Cell<bool>,
 }
 
 /// The trace res must sit inside this context's SDK range. The caller already
@@ -705,6 +716,13 @@ pub struct GpuContext {
     /// dirty-rect-uploaded, composited by `fullscreen_to_backbuffer` in every
     /// present arm. Always built (cheap); `visible` gates the draw.
     hud: hud::HudGpu,
+    /// The frame-generation UI target (see hud::HudFi): a display-space
+    /// premultiplied render of the HUD the wrapper-FG proxies composite
+    /// AFTER interpolation (ffx: registered UI resource; XeSS-FG: RES_UI
+    /// tag) — what stops the baked HUD warping/jumping on generated frames.
+    /// None = no wrapper FG armed, or creation failed (loud; the baked
+    /// backbuffer draw covers every frame then).
+    fg_ui: Option<hud::HudFi>,
     /// What `fullscreen_to_backbuffer` last presented `(use_tonemap, srv_slot,
     /// inv_samples)` — `present_again`'s re-present source (the pause menu
     /// holds the frame without tracing). Cell: the recorder is `&self`.
@@ -889,6 +907,37 @@ fn wire_tonemap_src(
     // if a source got the draw SRV but not this one (it would present fine and
     // simply never meter, i.e. exposure would freeze at 1.0 in that arm).
     aexp.create_source_srv(device, res, format, slot);
+}
+
+/// Build the frame-generation UI target (`hud::HudFi`) for a wrapper-FG
+/// session — the display-space premultiplied HUD render the FI/xefg proxies
+/// composite AFTER interpolation. ONE builder for boot AND resize (the two
+/// open-coded copies drifted apart once already). Format per present space:
+/// RGBA16F under HDR10 (8-bit PQ bands, and the backbuffer's R10G10B10A2 has
+/// 2-bit alpha — unusable as a UI blend source), RGBA8 under SDR/Sdr10
+/// (hud.hlsl mode 1 is a passthrough bit-copy of the Slint buffer). Creation
+/// failure is one loud line + the baked-HUD fallback, never a session
+/// failure.
+fn make_fg_ui(
+    device: &ID3D12Device,
+    passes: &tonemap::Passes,
+    hud: &hud::HudGpu,
+    space: d3d12::PresentSpace,
+    w: u32,
+    h: u32,
+) -> Option<hud::HudFi> {
+    use windows::Win32::Graphics::Dxgi::Common::*;
+    let fmt = match space {
+        d3d12::PresentSpace::Hdr10 => DXGI_FORMAT_R16G16B16A16_FLOAT,
+        _ => DXGI_FORMAT_R8G8B8A8_UNORM,
+    };
+    match hud::HudFi::new(device, passes, hud, fmt, w, h) {
+        Ok(f) => Some(f),
+        Err(e) => {
+            eprintln!("fg: ui pre-pass target creation failed ({e}) — HUD stays baked pre-present");
+            None
+        }
+    }
 }
 
 impl GpuContext {
@@ -1533,6 +1582,8 @@ impl GpuContext {
                 last_res: std::cell::Cell::new((0, 0)),
                 pauses: std::cell::Cell::new(0),
                 skip_prepare: std::cell::Cell::new(false),
+                ui_reg: std::cell::Cell::new(false),
+                ui_shed: std::cell::Cell::new(false),
             }
         });
 
@@ -1563,8 +1614,22 @@ impl GpuContext {
                 poll: std::cell::Cell::new(0),
                 logged: std::cell::Cell::new(false),
                 mult: std::cell::Cell::new(0),
+                ui_shed: std::cell::Cell::new(false),
             }
         });
+
+        // The frame-generation UI target: built for either wrapper-FG family
+        // (the proxy composites it post-interpolation; see make_fg_ui). The
+        // ffx key is the WRAPPER, not the effect ctx — resize rebuilds the
+        // ctx AFTER the target, so a ctx key would leave every resized
+        // session bare and the two sites drifted on exactly that. The xefg
+        // key is `enabled`: a passthrough proxy (XeSS never wired) can never
+        // consume the target (`xefg_hud` requires `on`).
+        let fg_ui = if fg_state.is_some() || fg_x.as_ref().is_some_and(|x| x.enabled) {
+            make_fg_ui(&d3d.device, &passes, &hud, d3d.space, w, h)
+        } else {
+            None
+        };
 
         Ok(Self {
             // Armed by `init_trace` — it needs the scene, and a session that
@@ -1585,6 +1650,7 @@ impl GpuContext {
             blit,
             hdr,
             hud,
+            fg_ui,
             last_present: std::cell::Cell::new(None),
             waveviz_src: std::cell::Cell::new(WvSrc::None),
             scene_gpu: None,
@@ -1837,10 +1903,33 @@ impl GpuContext {
         // ResizeBuffers to its internal chain).
         if let Some(fg) = &mut self.fg {
             fg.sc.wait_for_presents();
+            // The UI registration points at the window-sized HudFi texture,
+            // which is about to drop — drive the proxy to null while it is
+            // still ALIVE (the swapchain context survives the resize and
+            // must not hold a dangling pointer).
+            if fg.ui_reg.get() {
+                if let Err(e) = fg.sc.register_ui(None) {
+                    // The proxy may still hold the pointer — LEAK the old
+                    // target rather than let `fg_ui = None` below dangle it
+                    // (window-sized, once per FAILED unregister — a rare
+                    // path; the rebuild below still creates a fresh one).
+                    eprintln!(
+                        "fg: ui unregister on resize failed ({e}) — leaking the old UI target"
+                    );
+                    if let Some(old) = self.fg_ui.take() {
+                        std::mem::forget(old);
+                    }
+                }
+                fg.ui_reg.set(false);
+            }
+            // A resize is a structural change — let a shed registration
+            // retry at the new size.
+            fg.ui_shed.set(false);
             fg.live.set(false);
             fg.prepared.set(false);
             fg.ctx = None;
         }
+        self.fg_ui = None;
         // XeSS-FG: disable so no interpolation is pending across the
         // ResizeBuffers (which the xefg proxy forwards); re-enabled below if
         // the XeSS level comes back up.
@@ -1850,6 +1939,10 @@ impl GpuContext {
                 x.on.set(false);
             }
             x.prepared.set(false);
+            // The RES_UI tag is window-sized, so a resize is exactly the
+            // structural change that can cure a shed tag — let it retry at
+            // the new size (the ffx ui_shed rule above).
+            x.ui_shed.set(false);
         }
         // Everything below drops live GPU resources; drain first (the
         // GpuContext::drop discipline — xess/ffx destroy-context require
@@ -1902,6 +1995,19 @@ impl GpuContext {
         }
         self.trace = None;
         self.dxr = None;
+        // NRD is RENDER-res-bound (NrdGpu at rw,rh), and at --lock-res the
+        // render res follows the window — so the instance must die with the
+        // tracers or the re-entry's arm_nrd_for hits its size-mismatch
+        // refusal on every maximize ("NRD armed at 1920x1080, this arm
+        // traces 3435x1332" — the user-repro that found this). Safe by the
+        // tracer-drop argument: the queue is drained above, so none of the
+        // mid-session shed's two-phase discipline applies; the re-entry
+        // re-arms at the new res (the None arm resets history/prev/idx and
+        // prints the armed line again). `nrd_shed` deliberately survives —
+        // it marks a runtime FAILURE, not a size, and a resize must not
+        // un-tombstone a genuinely failing NRD.
+        self.nrd_gpu = None;
+        self.nrd_hist_valid = false;
         // --dual-gpu: the secondary's TRACER and its staging are window-bound
         // and go with the primary's; its DEVICE and its SCENE CORE survive in
         // `dual_keep`, so the re-entry re-pays kernel compiles and planes but
@@ -1939,6 +2045,15 @@ impl GpuContext {
         let hud_visible = self.hud.visible.get();
         self.hud = hud::HudGpu::new(&self.d3d.device, &self.passes, self.d3d.format, w, h)?;
         self.hud.visible.set(hud_visible);
+        // The frame-generation UI target follows the window (the straddle
+        // above already nulled the proxy's registration and dropped the old
+        // texture). Same predicate + loud-fallback rule as boot — ONE
+        // builder (make_fg_ui), so the two sites can't drift again.
+        self.fg_ui = if self.fg.is_some() || self.fg_x.as_ref().is_some_and(|x| x.enabled) {
+            make_fg_ui(&self.d3d.device, &self.passes, &self.hud, self.d3d.space, w, h)
+        } else {
+            None
+        };
         // A resize invalidates the last-present record: every source it could
         // name is being rebuilt at the new size.
         self.last_present.set(None);
@@ -2815,6 +2930,10 @@ impl GpuContext {
         d.ext = d.pack && tg.gbuf_ext_needed();
         sec.force_gbuf_ext(d.ext);
         sec.force_fsr_sig(d.pack && tg.fsr_sig());
+        // The NRD RTGI fold must agree across the band too — an unmirrored
+        // secondary packs direct-only dd for its rows, a per-band ReBLUR
+        // denoise-semantics seam (no out-of-bounds hazard, just wrong input).
+        sec.force_nrd_sig(Some(d.pack && tg.nrd_sig()));
         // ...AND THE ONE-SIDED CASE MUST DENY THE FRAME, not just narrow the
         // payload. The AND above stops the out-of-bounds copy, but a primary
         // that HAS a pack paired with a secondary that has none would still
@@ -3701,8 +3820,13 @@ impl GpuContext {
         match &self.nrd_gpu {
             Some(g) if (g.rw, g.rh) == (rw, rh) => {}
             Some(g) => {
-                // Unreachable while both arms share --lock-res; refuse rather
-                // than rebuild (the rebuild is the stranding bug).
+                // The desync BACKSTOP, not a normal path: both arms share
+                // --lock-res, and resize_output drops the instance with the
+                // tracers (it fired on every maximize until it did — the
+                // window moving moves the locked render res, which the old
+                // "unreachable" reasoning missed). A mismatch reaching here
+                // now means a NEW lifecycle hole; refuse rather than rebuild
+                // (the rebuild is the stranding bug).
                 return Err(format!(
                     "NRD armed at {}x{}, this arm traces {rw}x{rh}",
                     g.rw, g.rh
@@ -3713,6 +3837,12 @@ impl GpuContext {
                 self.nrd_hist_valid = false;
                 self.nrd_prev = None;
                 self.nrd_frame_idx = 0;
+                // The one success line — every other nrd: line is a failure
+                // path, and an armed session used to be indistinguishable
+                // from an unarmed one (the user-report class this fixes).
+                // Once per session: both arms share the instance, so the
+                // SPACE/F re-arms land in the Some(g) arm above.
+                eprintln!("nrd: armed — ReBLUR pre-upscale denoising at {rw}x{rh}");
             }
         }
         let ng = self.nrd_gpu.as_ref().unwrap();
@@ -5875,6 +6005,30 @@ impl GpuContext {
             x.failed.set(true);
             return;
         }
+        // The UI texture tag (RES_UI, window-sized, premultiplied — xefg's
+        // DEFAULT alpha convention; the NOT_PREMUL init flag is the opt-out
+        // we don't take). Under UI_MODE_AUTO this resolves the proxy to
+        // BACKBUFFER_UITEXTURE: interpolate the backbuffer as before, REFINE
+        // the UI region on generated frames from the tagged texture — the
+        // baked HUD draw stays, so the tag is strictly additive and OPTIONAL:
+        // a failure sheds the tag alone (loud once), never frame generation.
+        // The funnel records the HudFi pre-pass on prepared XeSS-FG frames.
+        if !x.ui_shed.get() && self.hud.drawable() {
+            if let Some(ui) = &self.fg_ui {
+                let psr = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 as u32;
+                if let Err(e) = x.sc.tag_resource(
+                    id,
+                    crate::xess_fg::RES_UI,
+                    ui.resource().as_raw(),
+                    psr,
+                    self.d3d.width,
+                    self.d3d.height,
+                ) {
+                    eprintln!("fg: XeSS-FG ui tag failed ({e}) — HUD stays baked pre-present");
+                    x.ui_shed.set(true);
+                }
+            }
+        }
         x.sc.set_present_id(id);
         if !x.on.get() {
             x.sc.set_enabled(true);
@@ -6410,11 +6564,55 @@ impl GpuContext {
         }
     }
 
+    /// Drive the FI swapchain's UI registration to `active` (the HudFi
+    /// display-space texture) or null. Dedup'd via `ui_reg` — the proxy is
+    /// re-configured only on TRANSITIONS, never per steady frame. A failed
+    /// configure sheds loudly ONCE (`ui_shed`) and the funnel's baked
+    /// backbuffer draw covers every frame after — never a black HUD, never a
+    /// session failure. (Known edge: a failed UNREGISTER after a successful
+    /// register can leave the proxy compositing a stale UI onto generated
+    /// frames beside the baked one — accepted; the alternative is retrying a
+    /// failing configure per frame.)
+    fn fg_register_ui(&self, active: bool) {
+        let Some(fg) = &self.fg else { return };
+        if fg.ui_shed.get() || fg.ui_reg.get() == active {
+            return;
+        }
+        let res = if active {
+            let Some(ui) = &self.fg_ui else { return };
+            fg.sc.register_ui(Some(ui.resource().as_raw()))
+        } else {
+            fg.sc.register_ui(None)
+        };
+        match res {
+            Ok(()) => {
+                fg.ui_reg.set(active);
+                if fg.trace {
+                    eprintln!(
+                        "fg-trace: ui resource {} (frame_id {})",
+                        if active { "registered" } else { "unregistered" },
+                        fg.frame_id.get()
+                    );
+                }
+            }
+            Err(e) => {
+                fg.ui_shed.set(true);
+                eprintln!("fg: ui registration failed ({e}) — HUD stays baked pre-present");
+            }
+        }
+    }
+
     /// Configure the FI swapchain DISABLED at the current frame id, once
     /// (idempotent via `live`). Used by the toggle, the pause gate, and the
     /// funnel's not-prepared fallback.
     fn fg_disable_now(&self) {
         let Some(fg) = &self.fg else { return };
+        // Null the UI registration with the disable (idempotent via ui_reg,
+        // BEFORE the ctx/live early-returns — teardown routes through here,
+        // and the registration lives on the SWAPCHAIN context (fg.sc), which
+        // outlives the effect ctx: the proxy must not hold the HudFi pointer
+        // past this call even when the effect ctx is already gone).
+        self.fg_register_ui(false);
         let Some(ctx) = &fg.ctx else { return };
         if !fg.live.get() {
             return;
@@ -6566,10 +6764,15 @@ impl GpuContext {
         // Frame generation handshake: a frame that reaches presentation
         // WITHOUT an fg_prepare (plain arms, mode switches, holds) must not
         // let the FI swapchain interpolate against stale motion — configure
-        // it disabled first (idempotent). A prepared frame consumes its flag.
+        // it disabled first (idempotent). A prepared frame consumes its flag
+        // — and `fi_live` remembers that THIS present actually interpolates,
+        // which is what gates the post-interpolation HUD below.
+        let mut fi_live = false;
         if let Some(fg) = &self.fg {
             if !fg.prepared.replace(false) {
                 self.fg_disable_now();
+            } else {
+                fi_live = true;
             }
         }
         // XeSS-FG's half — READ prepared without consuming (xefg_end_frame
@@ -6588,6 +6791,39 @@ impl GpuContext {
         // stays current and re-showing needs no special case.
         let hud_slot = self.d3d.frame_index % d3d12::FRAMES_IN_FLIGHT;
         self.hud.record_upload(&self.d3d.list, hud_slot);
+
+        // Frame-generation UI: on interpolating presents, render the HUD into
+        // the display-space HudFi target and hand THAT to the proxy so the UI
+        // is composited AFTER interpolation — the baked backbuffer HUD gets
+        // warped by scene motion on every generated frame (the jumping-HUD
+        // defect). ffx: registered UI resource, composited onto BOTH pair
+        // halves, so the baked draw is SKIPPED once the registration is live.
+        // XeSS-FG: RES_UI tag (xefg_prepare) with UI_MODE_AUTO resolving to
+        // BACKBUFFER_UITEXTURE — the proxy REFINES the UI region on generated
+        // frames, so the baked draw stays. Non-FG arms (DLSS-G pair-present,
+        // plain, holds, CPU presenters) are untouched by construction.
+        // `!ui_shed`: after a tag failure nothing consumes the target, so
+        // the pre-pass would be a wasted fullscreen draw on every prepared
+        // frame for the rest of the session (or until a resize re-arms it).
+        let xefg_hud = self
+            .fg_x
+            .as_ref()
+            .is_some_and(|x| x.on.get() && x.prepared.get() && !x.ui_shed.get())
+            && self.fg_ui.is_some()
+            && self.hud.drawable();
+        let fi_hud = fi_live
+            && self.hud.drawable()
+            && self.fg.as_ref().is_some_and(|fg| !fg.ui_shed.get())
+            && self.fg_ui.is_some();
+        if fi_hud || xefg_hud {
+            self.fg_ui.as_ref().unwrap().record(&self.d3d.list, &self.passes, self.tone);
+        }
+        if fi_hud {
+            self.fg_register_ui(true);
+        } else {
+            // Dedup'd null: hidden HUD, disabled/passthrough presents, holds.
+            self.fg_register_ui(false);
+        }
 
         // Glare (src/bloom.rs): a display-stage pass on whatever the tonemap is
         // about to read, so EVERY GPU chain — RR, XeSS, FSR, plain, DXR — gets it
@@ -6721,7 +6957,17 @@ impl GpuContext {
         // everything, so the extra draw needs no state bookkeeping; the hud
         // PSO blends premultiplied-over and its PS reads only the
         // scale/mode lanes of the shared root-constant layout.
-        if self.hud.drawable() {
+        //
+        // SKIPPED only when the ffx FI proxy holds a LIVE UI registration for
+        // this interpolating present (the proxy composites the registered
+        // texture onto both pair halves — baking it too would double-HUD the
+        // real frames). The `ui_reg` check is what guarantees a registration
+        // FAILURE still bakes the HUD this very frame — zero HUD-less frames
+        // by construction. XeSS-FG deliberately keeps the baked draw (its
+        // proxy REFINES the backbuffer's UI region from the tag).
+        if self.hud.drawable()
+            && !(fi_hud && self.fg.as_ref().is_some_and(|fg| fg.ui_reg.get()))
+        {
             self.passes.record(
                 &self.d3d.list,
                 &self.hud.pso,

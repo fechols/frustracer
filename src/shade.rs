@@ -1435,7 +1435,12 @@ pub fn shade(
         // both arms draw the same stream, so no burn is needed and the
         // adaptive same-seed alignment holds per-pixel. `prim.ao` stays 0.0
         // (the fb.gi precedent: real RGB irradiance is not an AO scalar —
-        // the GI term rides FSR's exact-remainder residual).
+        // the GI term rides FSR's exact-remainder residual). NOTE the GPU
+        // twin diverges here BY DESIGN under FLAG_NRD_GI (shade.hlsli's
+        // shade_full): NRD sessions are GPU-tracer-only, and there the
+        // bounce folds into prim.direct_d (+ its t into ao_t) so ReBLUR's
+        // diffuse input carries the GI — this CPU capture never feeds NRD,
+        // so it keeps the residual arm verbatim.
         let (t1, t2) = onb(n);
         let r1 = rng.f32();
         let r2 = rng.f32();

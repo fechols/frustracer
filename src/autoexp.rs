@@ -1,5 +1,8 @@
-//! Automatic exposure — the interactive aperture (`--no-auto-exposure` kills,
-//! `--exposure-bias EV` composes a manual offset).
+//! Automatic exposure — the interactive aperture (`--auto-exposure` arms,
+//! `--exposure-bias EV` composes a manual offset). DEFAULT OFF since
+//! 2026-08-08 (the user's call, reverting the same day's default-ON: with
+//! RTGI on by default, enclosures light themselves and the aperture holds at
+//! exactly 1.0 — the pre-feature look — unless a session opts in).
 //!
 //! The tonemap is anchored at a fixed paper white, so an enclosure whose sun is
 //! occluded by construction (San Miguel's patio, Sponza's atrium) renders 2-3
@@ -57,9 +60,11 @@ pub const TAU_S: f32 = 1.0;
 /// clouds-wind idiom).
 const LUMA_EPS: f32 = 1e-6;
 
-/// `--no-auto-exposure` clears (consumed once by main's lever block, toggled
-/// live by the settings menu — the bloom shape).
-static ENABLED: AtomicBool = AtomicBool::new(true);
+/// `--auto-exposure` arms (consumed once by main's lever block, toggled
+/// live by the settings menu — the bloom shape). DEFAULT OFF — the default
+/// is DUPLICATED in cli.rs's `defaults()` `autoexp` field AND settings.rs's
+/// menu-row `Toggle { default }`; flip all three in lockstep.
+static ENABLED: AtomicBool = AtomicBool::new(false);
 /// `--exposure-bias` in EV, f32 bits (the `scene::set_detail_strength` idiom).
 /// 0.0 encodes as bit-pattern 0, so the static's default IS the default.
 static BIAS: AtomicU32 = AtomicU32::new(0);

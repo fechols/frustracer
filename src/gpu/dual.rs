@@ -505,6 +505,13 @@ impl<'a> Tracer<'a> {
         }
     }
 
+    pub fn nrd_sig(&self) -> bool {
+        match self {
+            Tracer::Wave(t) => t.nrd_sig(),
+            Tracer::Dxr(d) => d.nrd_sig(),
+        }
+    }
+
     pub fn force_gbuf_ext(&self, on: bool) {
         match self {
             Tracer::Wave(t) => t.force_gbuf_ext(on),
@@ -516,6 +523,13 @@ impl<'a> Tracer<'a> {
         match self {
             Tracer::Wave(t) => t.force_fsr_sig(on),
             Tracer::Dxr(d) => d.force_fsr_sig(on),
+        }
+    }
+
+    pub fn force_nrd_sig(&self, v: Option<bool>) {
+        match self {
+            Tracer::Wave(t) => t.force_nrd_sig(v),
+            Tracer::Dxr(d) => d.force_nrd_sig(v),
         }
     }
 

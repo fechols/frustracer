@@ -4525,6 +4525,15 @@ pub const FLAG_RTGI: u32 = 524288;
 /// FLAG_SPEC_AA.
 pub const FLAG_SPEC_AA: u32 = 1048576;
 
+/// An NRD (ReBLUR) bridge is wired this frame, so shade_full's RTGI bounce
+/// folds into the `prim.direct_d` capture (+ the bounce ray's t into `ao_t`)
+/// — the bridge's diffuse input carries the GI instead of the un-denoised
+/// residual. Runtime like FLAG_RTGI (NRD arms at session start and sheds
+/// mid-session), and DISTINCT from FLAG_FSR_SIG: FSR-RR sessions arm that
+/// bit too, and their dd must stay pure direct diffuse — it is AMD's own
+/// denoiser's input. Lockstep with trace_common.hlsli's FLAG_NRD_GI.
+pub const FLAG_NRD_GI: u32 = 2097152;
+
 /// Unreal-1 detail texturing (`--no-detail-tex` clears it): procedural
 /// close-up albedo grain + micro-bump on MAGNIFIED hits — textured AND
 /// untextured since the untextured arm (shade.hlsli's post-match detail
@@ -5328,6 +5337,7 @@ impl FrameCb {
         gbuf_full: bool,
         fsr_sig: bool,
         gbuf_ext: bool,
+        nrd_sig: bool,
     ) -> FrameCb {
         let (origin, forward, right, up, inv_w, inv_h) = p.cam.gpu_fields();
         let mut cb = *self;
@@ -5348,6 +5358,9 @@ impl FrameCb {
             // FSR-RR reads the sig lanes, which live in ext — so the sig flag
             // implies the ext flag by construction, not by convention.
             | ((gbuf_full && (gbuf_ext || fsr_sig)) as u32 * FLAG_GBUF_EXT)
+            // The NRD RTGI fold rides the sig capture (it edits the lanes the
+            // sig store writes), so it requires the sig flag by construction.
+            | ((gbuf_full && fsr_sig && nrd_sig) as u32 * FLAG_NRD_GI)
             | ((crate::texture::max_aniso() > 1.0) as u32 * FLAG_ANISO)
             | (p.clouds.enabled as u32 * FLAG_CLOUDS)
             // count > 0 already folds in the session enable + the night fade
@@ -5773,6 +5786,12 @@ pub struct TraceGpu {
     /// See `force_fsr_sig` — the `--dual-gpu` secondary's only way to store the
     /// signal lanes its partner's feed will read.
     force_fsr_sig: std::cell::Cell<bool>,
+    /// See `force_nrd_sig` — the secondary's half of the NRD RTGI fold (and
+    /// the check-gpu fold gate's arming hook). An OVERRIDE, not an OR: the
+    /// N6 gate must force the fold OFF on a tracer whose NRD planes the
+    /// earlier bridge gates already wired (Some(false) beats the wiring
+    /// term), and None restores wiring-derived behavior.
+    force_nrd_sig: std::cell::Cell<Option<bool>>,
     /// Test hook — see `force_gbuf_ext`. `Cell` because the record/write
     /// methods take `&self` (the `last_struct` precedent).
     force_gbuf_ext: std::cell::Cell<bool>,
@@ -6522,6 +6541,7 @@ impl TraceGpu {
             gbuf_ext,
             force_gbuf_ext: std::cell::Cell::new(false),
             force_fsr_sig: std::cell::Cell::new(false),
+            force_nrd_sig: std::cell::Cell::new(None),
             gbuf_full,
             uav_heap,
             tex_table,
@@ -6553,8 +6573,13 @@ impl TraceGpu {
     }
 
     pub fn write_cb(&self, slot: usize, p: &FrameParams) {
-        let mut cb =
-            self.cb_base.with_frame(p, self.gbuf_full, self.fsr_sig(), self.gbuf_ext_needed());
+        let mut cb = self.cb_base.with_frame(
+            p,
+            self.gbuf_full,
+            self.fsr_sig(),
+            self.gbuf_ext_needed(),
+            self.nrd_sig(),
+        );
         cb.cloud_grid = self.cloud_grid_row(p);
         cb.split = self.split.get().cb_row();
         // Sway MVs: the SAME predicate record_sway's fill uses (sway_mv_pair
@@ -6655,6 +6680,24 @@ impl TraceGpu {
     /// through the composite, not as a subtle error.
     pub fn force_fsr_sig(&self, on: bool) {
         self.force_fsr_sig.set(on);
+    }
+
+    /// Whether this frame's sig capture folds the RTGI bounce into the dd
+    /// lane for the NRD bridge (FLAG_NRD_GI). Wiring-derived like `fsr_sig`'s
+    /// nrd term — never PSO presence (the M9b baseline-teeth argument) —
+    /// unless the override is set (dual-GPU mirror / the N6 gate).
+    pub fn nrd_sig(&self) -> bool {
+        self.force_nrd_sig.get().unwrap_or(!self.nrd_wired.is_empty())
+    }
+
+    /// The `nrd_sig` half of the dual-GPU mirror (the `force_fsr_sig` shape):
+    /// the secondary has no NRD wiring of its own, and a band packed WITHOUT
+    /// the fold beside a primary that folds would hand ReBLUR direct-only
+    /// diffuse for the secondary's rows — a per-band denoise-semantics seam.
+    /// Also the check-gpu N6 gate's hook, which is why it is an OVERRIDE
+    /// (Some(false) must beat live wiring); None = wiring-derived.
+    pub fn force_nrd_sig(&self, v: Option<bool>) {
+        self.force_nrd_sig.set(v);
     }
 
     /// Bind the shared root signature + everything every kernel might read.

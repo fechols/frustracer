@@ -487,8 +487,10 @@ fn main() {
         eprintln!("rtgi: OFF — flat SH×AO ambient (the pre-RTGI renderer)");
     }
     autoexp::set_enabled(opts.autoexp);
-    if !opts.autoexp {
-        eprintln!("auto-exposure: OFF — fixed 1.0 aperture (--exposure-bias still applies)");
+    // DEFAULT OFF (RTGI lights enclosures for real) — only arming prints,
+    // the lever-line convention.
+    if opts.autoexp {
+        eprintln!("auto-exposure: ON — display-stage aperture eases toward mid-grey");
     }
     autoexp::set_bias(opts.exposure_bias);
     if opts.exposure_bias != 0.0 {
@@ -7797,6 +7799,133 @@ fn run_check_gpu(
                         }
                     }
                 }
+                // --- N6 (NRD): the FLAG_NRD_GI RTGI fold. One frame traced
+                // twice — fold armed vs disarmed — with three teeth: the
+                // bounce ray's t must land in ao_t on EVERY hit pixel
+                // (liveness — under RTGI the unfolded ao_t is 0 everywhere,
+                // ReBLUR's hit-dist guide was globally dead), accum must be
+                // BIT-IDENTICAL across the toggle (the fold is assignment-
+                // only capture, the M9b shape), and the folded dd lanes must
+                // differ somewhere (anti-vacuity — a dead flag passes the
+                // other two). Stands down under --no-rtgi: the shade block
+                // the flag gates never compiled.
+                if crate::shade::rtgi_enabled() {
+                    let gq = Quality { rtgi: true, ..Quality::upscaler_1spp() };
+                    let pg = gpu::trace::FrameParams {
+                        sway_prev_time: None,
+                        cam: basis_b,
+                        frame: 1,
+                        accumulate: false,
+                        jitter: false,
+                        frame_jitter: Some((0.0, 0.0)),
+                        prev_cam: Some(basis_a),
+                        q: gq,
+                        verify: false,
+                        spp: 1,
+                        probe_sample: 0,
+                        clouds: crate::clouds::Clouds::check(scene.diag),
+                        fireflies: crate::fireflies::Fireflies::check(scene),
+                        sway_time: check_sway,
+                        replay: false,
+                    };
+                    let mut arms: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::new();
+                    ptg.force_fsr_sig(true);
+                    // OVERRIDE both ways: the bridge gates above WIRED this
+                    // tracer's NRD planes, so a wiring-derived nrd_sig() is
+                    // true in both arms and the A/B would compare the fold
+                    // against itself (dd-differs 0 — this gate's own first
+                    // failure, worth not re-deriving).
+                    for fold in [true, false] {
+                        ptg.force_nrd_sig(Some(fold));
+                        ptg.write_cb(0, &pg);
+                        if let Err(e) = hg.run(|l| ptg.record_wavefront(l, 0, &pg, false)) {
+                            eprintln!("check-gpu: FAIL N6 gi-fold trace (fold {fold}): {e}");
+                            return 1;
+                        }
+                        match (
+                            hg.read_buffer(
+                                &ptg.gbuf,
+                                ua,
+                                pw * ph * gpu::trace::GBUF_STRIDE as usize,
+                            ),
+                            hg.read_buffer(
+                                &ptg.gbuf_ext,
+                                ua,
+                                pw * ph * gpu::trace::GBUF_EXT_STRIDE as usize,
+                            ),
+                            hg.read_buffer(&ptg.accum, ua, pw * ph * 12),
+                        ) {
+                            (Ok(c), Ok(e), Ok(a)) => arms.push((c, e, a)),
+                            _ => {
+                                eprintln!("check-gpu: FAIL N6 gi-fold readback (fold {fold})");
+                                return 1;
+                            }
+                        }
+                    }
+                    ptg.force_fsr_sig(false);
+                    ptg.force_nrd_sig(None);
+                    let (fc, fe, fa) = &arms[0];
+                    let (_, ue, uacc) = &arms[1];
+                    let (_, far) = dlss::near_far(scene.diag);
+                    let h16 = |bits: u16| half::f16::from_bits(bits).to_f32();
+                    let (mut hit_px, mut aot_fired, mut aot_bad, mut dd_differs) =
+                        (0usize, 0usize, 0usize, 0usize);
+                    for i in 0..pw * ph {
+                        let core_z =
+                            f32::from_le_bytes(fc[i * 16 + 8..i * 16 + 12].try_into().unwrap());
+                        if core_z == far {
+                            continue;
+                        }
+                        hit_px += 1;
+                        let w = u32::from_le_bytes(
+                            fe[i * 72 + 60..i * 72 + 64].try_into().unwrap(),
+                        );
+                        let ao_t = h16(w as u16);
+                        if ao_t > 0.0 {
+                            aot_fired += 1;
+                        }
+                        // Folded ao_t = the bounce ray's t (a hit) or CAM_FAR
+                        // (a miss) — strictly positive, capped at far (f16
+                        // slack). 0 means the fold never ran on a hit pixel.
+                        if !(ao_t > 0.0 && ao_t <= far * 1.01) {
+                            aot_bad += 1;
+                        }
+                        // sig.x/.y/.z carry dd.xyz (+ ds, identical across
+                        // arms) — any byte delta here is the fold's.
+                        if fe[i * 72 + 48..i * 72 + 60] != ue[i * 72 + 48..i * 72 + 60] {
+                            dd_differs += 1;
+                        }
+                    }
+                    println!(
+                        "check-gpu: nrd gi-fold — hit {hit_px} ao_t-fired {aot_fired} \
+                         ao_t-bad {aot_bad} dd-differs {dd_differs}"
+                    );
+                    if fa != uacc {
+                        eprintln!(
+                            "check-gpu: FAIL N6 gi-fold accum not bit-identical (the fold \
+                             changed shading — it must be capture-only)"
+                        );
+                        ok = false;
+                    }
+                    if aot_bad > 0 {
+                        eprintln!("check-gpu: FAIL N6 gi-fold ao_t out of (0, far]");
+                        ok = false;
+                    }
+                    if must_fire && hit_px > 0 && (aot_fired < hit_px || dd_differs == 0) {
+                        eprintln!(
+                            "check-gpu: FAIL N6 gi-fold must-fire (fired {aot_fired}/{hit_px}, \
+                             dd-differs {dd_differs})"
+                        );
+                        ok = false;
+                    }
+                    // Restore frame B (the N4 discipline — the gates below
+                    // read frame-B state off these buffers).
+                    ptg.write_cb(0, &p);
+                    if hg.run(|l| ptg.record_wavefront(l, 0, &p, false)).is_err() {
+                        eprintln!("check-gpu: FAIL N6 frame-B restore");
+                        return 1;
+                    }
+                }
                 // FR_CHECK_AB_DUMP — read-only diagnostic (the radiance-dump
                 // family): render the SAME frame on the CPU with the FSR
                 // signal capture armed and print per-term means over the
@@ -13975,7 +14104,7 @@ fn run_spin_gpu(
     let frames = spin_lap_frames(frames, frames_explicit, warmup, moving, arm);
     // Trace res = an EXPLICIT `--lock-res`, else NATIVE — deliberately NOT
     // tied to the interactive default (which happens to be native again since
-    // 2026-07-31, but was quality 2/3 for a while): this is a benchmark and
+    // 2026-08-08, but was quality 2/3 for two windows): this is a benchmark and
     // every GPU `--spin` number on record was taken at native 1080p; a
     // default that moved under it would make those non-reproducible and
     // ~2.25x flattering at 2/3 (a LINEAR scale). Same rule the vendor mode
@@ -17930,20 +18059,19 @@ fn vendor_defaults(opts: &mut Opts, vendor: gpu::adapter::Vendor) {
     // change if that trade ever reads the other way; make it on these
     // numbers, not the table above.
     //
-    // RE-OPENED DEBT (2026-07-26 -> 2026-07-31 quality, -> 2026-08-08 native,
-    // -> quality again): the flagless default is `--lock-res quality` (2/3,
-    // xess::DEFAULT_LOCK_SCALE — third move), which is NOT the resolution the
-    // numbers above were taken at — the arms don't scale together
-    // (`trace::depth_full` is 6 at 1920 AND 1280, so the wavefront's ladder
-    // is res-independent while leaf/sky and all of `dxr-rays` are per-pixel),
-    // and hand-scaling the decomposition suggested the moving margin would
-    // invert (~2.75 vs ~1.90). That arithmetic was never measured. During the
-    // native window (07-31..08-08) a flagless session traced at the table's
-    // res and this caveat was recorded as resolved; with the default back at
-    // 2/3 any flagless number carries the 0.444x-pixels offset again —
-    // re-measure at `--lock-res native` before revisiting the Intel entry.
-    // The feature grounds (H/R/C/O, >=spp-3, the replay win at rest) are
-    // untouched by resolution either way.
+    // RES-BASIS DEBT, RE-CLOSED (2026-07-26 quality -> 2026-07-31 native ->
+    // 2026-08-08 quality -> native again the same day, the user's call —
+    // fourth move): the flagless default is `--lock-res native` (100%,
+    // xess::DEFAULT_LOCK_SCALE), which IS the resolution the numbers above
+    // were taken at, so the caveat this paragraph used to carry is resolved
+    // again. It re-opens if the default ever moves sub-native once more: the
+    // arms don't scale together (`trace::depth_full` is 6 at 1920 AND 1280,
+    // so the wavefront's ladder is res-independent while leaf/sky and all of
+    // `dxr-rays` are per-pixel), and hand-scaling the decomposition suggested
+    // the moving margin would invert (~2.75 vs ~1.90) — arithmetic that was
+    // never measured; re-measure at the new scale before revisiting the
+    // Intel entry if that happens. The feature grounds (H/R/C/O, >=spp-3,
+    // the replay win at rest) are untouched by resolution either way.
     //
     // 2026-08-01 RE-MEASURE — the 0.92x producing-frame parity above is
     // RETIRED. It predates the (32,256) leaf frontier, the G-buffer pack
@@ -18079,7 +18207,11 @@ fn vendor_defaults(opts: &mut Opts, vendor: gpu::adapter::Vendor) {
 /// bounce's sparse stochastic emissive, so unarmed XeSS/FSR3 sessions lose
 /// the emissive pools entirely, while DLSS-RR/FSR4-RR reconstruct them and
 /// keep the compiled OFF (cluster NEE there buys shadow rays for transport
-/// the bounce already delivers). Quin stays OFF — the fuse anchors on a
+/// the bounce already delivers). RETIRED for part of 2026-08-08 on the
+/// premise that default-ON NRD/ReBLUR pre-upscale denoising integrates the
+/// bounce's emissive ahead of the TAA clamp; the user's same-day feel-test
+/// found NRD NOT sufficient — the pools still vanish under XeSS/FSR3 — so
+/// the policy is RE-INSTATED. Quin stays OFF — the fuse anchors on a
 /// denoising engine when one exists (`quin::default_anchor`). Plain is
 /// unchanged (no temporal integrator to clamp; stills converge by plain
 /// accumulation). `emissive_lights_explicit` — either CLI spelling, or a
@@ -18098,7 +18230,8 @@ fn upscaler_defaults(opts: &mut Opts, taa_wired: Option<&'static str>) {
         opts.emissive_lights = true;
         eprintln!(
             "emissive lights: ON by default — {name} wired (a TAA-class upscaler's neighborhood \
-             clamp rejects the RTGI bounce's stochastic emissive; --no-emissive-lights opts out)"
+             clamp rejects the RTGI bounce's stochastic emissive, and NRD's pre-upscale \
+             integration measured insufficient; --no-emissive-lights opts out)"
         );
     }
 }
@@ -19252,6 +19385,13 @@ fn session(
             }
             Err(e) => {
                 eprintln!("dxr: falling back to CPU tracing — {e}");
+                // The NRD-eligibility predicate held (the .then_some above)
+                // but init never completed, so no nrd: line ever fired — and
+                // the CPU renderer has no NRD path at all. Say so: a silent
+                // drop here is indistinguishable from an armed session.
+                if (dxr_xess_avail || dxr_fsr3_avail) && !dxr_quin_avail && opts.nrd {
+                    eprintln!("nrd: not armed — the CPU renderer has no NRD path");
+                }
                 dxr_failed = true;
             }
         }

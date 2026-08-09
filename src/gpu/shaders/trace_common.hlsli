@@ -110,6 +110,16 @@
                                // faded octaves widen the GGX lobe instead of
                                // vanishing with distance. Lockstep with
                                // trace.rs::FLAG_SPEC_AA.
+#define FLAG_NRD_GI   2097152u // an NRD (ReBLUR) bridge is wired this frame,
+                               // so shade_full's RTGI bounce folds into the
+                               // prim.direct_d capture (+ the bounce ray's t
+                               // into ao_t) — the bridge's diffuse input
+                               // carries the GI instead of the un-denoised
+                               // residual. Runtime (NRD arms/sheds live), and
+                               // DISTINCT from FLAG_FSR_SIG: FSR-RR sessions
+                               // set that bit too and their dd must stay pure
+                               // direct diffuse (AMD's own denoiser input).
+                               // Lockstep with trace.rs::FLAG_NRD_GI.
 
 cbuffer Frame : register(b0) {
     float4 cam_origin;   // xyz; w = inv_w

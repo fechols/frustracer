@@ -470,6 +470,10 @@ pub struct DxrGpu {
     /// for dd/ds/ao/ind_s across the secondary's rows — a black band, present
     /// only under `--fsr4`.
     force_fsr_sig: std::cell::Cell<bool>,
+    /// See `TraceGpu::force_nrd_sig` — the secondary's half of the NRD RTGI
+    /// fold (and the check-gpu fold gate's hook; an OVERRIDE — Some(false)
+    /// beats live wiring, None = wiring-derived).
+    force_nrd_sig: std::cell::Cell<Option<bool>>,
     gbuf_full: bool,
     /// RGBA16F resolve target; rests in PIXEL_SHADER_RESOURCE between frames
     /// (the tonemap PS reads it via SRV_SLOT_DXR).
@@ -1638,6 +1642,7 @@ impl DxrGpu {
             band: std::cell::Cell::new((0, rh)),
             band_refused: std::cell::Cell::new(false),
             force_fsr_sig: std::cell::Cell::new(false),
+            force_nrd_sig: std::cell::Cell::new(None),
             sway_mv_t: std::cell::Cell::new(None),
             sway_mv_on: !sway_def.is_empty(),
             mode3,
@@ -1708,6 +1713,20 @@ impl DxrGpu {
         self.force_fsr_sig.get()
             || !self.nrd_wired.is_empty()
             || self.feed.iter().any(|(k, _)| matches!(k, trace::FeedKind::FsrRr))
+    }
+
+    /// The `TraceGpu::nrd_sig` twin — whether this frame's sig capture folds
+    /// the RTGI bounce into the dd lane for the NRD bridge (FLAG_NRD_GI).
+    pub fn nrd_sig(&self) -> bool {
+        self.force_nrd_sig.get().unwrap_or(!self.nrd_wired.is_empty())
+    }
+
+    /// See `TraceGpu::force_nrd_sig`. Mirrored onto a `--dual-gpu` SECONDARY
+    /// like `force_fsr_sig` — an unmirrored band folds differently and hands
+    /// ReBLUR direct-only diffuse for the secondary's rows. An OVERRIDE:
+    /// Some(false) beats live wiring (the N6 gate's need), None restores.
+    pub fn force_nrd_sig(&self, v: Option<bool>) {
+        self.force_nrd_sig.set(v);
     }
 
     /// The band `record_frame` will dispatch — gates only, and deliberately
@@ -1801,8 +1820,13 @@ impl DxrGpu {
         // Both go through the ACCESSORS rather than being re-derived here, so
         // a `--dual-gpu` secondary's forced values actually reach the CB — a
         // forced flag that write_cb re-derives past is written and never read.
-        let mut cb =
-            self.cb_base.with_frame(p, self.gbuf_full, self.fsr_sig(), self.gbuf_ext_needed());
+        let mut cb = self.cb_base.with_frame(
+            p,
+            self.gbuf_full,
+            self.fsr_sig(),
+            self.gbuf_ext_needed(),
+            self.nrd_sig(),
+        );
         // Sway MVs: arm the flag + the ring-slot base, and stash the clock
         // pair for record_frame's dmv fill — one predicate (sway_mv_pair +
         // the compile-in) drives both, the TraceGpu discipline.

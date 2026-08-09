@@ -47,8 +47,12 @@ pub const INIT_FLAG_JITTERED_MV: u32 = 1 << 4;
 /// encode, near = 1, sky = exactly 0), pixel-space UNjittered MVs (analytic
 /// hit-point reprojection, the SL mvec_jittered = 0 contract), internal
 /// descriptor heap (no EXTERNAL flag — the library manages its own), UI mode
-/// AUTO with nothing tagged = interpolate the whole backbuffer (HUD baked in,
-/// the leg-1 known-accept).
+/// AUTO — with the per-present RES_UI tag (the HudFi display-space texture,
+/// PREMULTIPLIED, xefg's default alpha convention) AUTO resolves to
+/// BACKBUFFER_UITEXTURE: interpolate the backbuffer, refine the UI region on
+/// generated frames from the texture. The old nothing-tagged arm (HUD baked
+/// in and warped by interpolation — the leg-1 known-accept) survives only as
+/// the shed fallback when the tag fails or the HUD is hidden.
 pub const INIT_FLAGS: u32 = INIT_FLAG_INVERTED_DEPTH;
 
 // xefg_swapchain_resource_type_t.

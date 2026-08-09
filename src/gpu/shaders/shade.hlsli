@@ -1804,7 +1804,8 @@ float3 shade_full(float3 ro, float3 rd, HitInfo hit, inout uint rng, uint2 el_ma
 #endif
         HitInfo bh;
         float3 li;
-        if (ABL_TRACE_GI(o, bd, 0.0, FLT_MAX, bh)) {
+        bool bhit = ABL_TRACE_GI(o, bd, 0.0, FLT_MAX, bh);
+        if (bhit) {
             float3 w3, o3, n3;
             PrimSurf ps_unused; // bounce rays never capture (secondary-ray rule)
             li = shade_split(o, bd, bh, rng, 1u, 1u, false, false,
@@ -1822,6 +1823,23 @@ float3 shade_full(float3 ro, float3 rd, HitInfo hit, inout uint rng, uint2 el_ma
             li = sky_gather(bd);
         }
         c += w * li;
+        if ((flags & FLAG_NRD_GI) != 0u) {
+            // NRD diffuse fold: the bounce IS this frame's ambient (the split
+            // arm leaves prim.ao at 0, so the bridge's D = dd + ao*amb
+            // collapses to D = dd, which now carries it) — ReBLUR denoises
+            // the GI instead of it riding the un-denoised residual, and the
+            // exact-linear delta recompose is untouched because cs_nrd_out
+            // reads D back from the packed plane. The bounce ray's own t is
+            // the diffuse hit-dist guide (under RTGI no AO ray exists at
+            // depth 0, so ao_t was 0 on EVERY pixel — ReBLUR's AREA_3X3
+            // reconstruction had nothing to reconstruct from); miss stores
+            // CAM_FAR, the shadow_t INF-clamp convention. Assignment-only,
+            // zero rng — accum and the same-seed A/Bs are untouched, and
+            // FSR-RR sessions (FLAG_FSR_SIG without this bit) keep dd = pure
+            // direct diffuse for AMD's own denoiser.
+            prim.direct_d += li;
+            prim.ao_t = bhit ? bh.t : CAM_FAR;
+        }
     }
     return c;
 #else

@@ -202,9 +202,13 @@ int32_t ffxshim_fg_swapchain_wrap(void* game_queue,
 // device teardown.
 int32_t ffxshim_fg_swapchain_wait(void* sc_ctx);
 
-// Register the premultiplied-alpha UI texture (the HUD) composited by the FI
-// swapchain onto BOTH real and generated frames. Empty resource = unregister.
-int32_t ffxshim_fg_swapchain_ui(void* sc_ctx, const FfxShimRes* ui, int32_t premul);
+// Register the UI texture (the HUD) composited by the FI swapchain onto BOTH
+// real and generated frames. Empty resource = unregister. flags is the
+// FfxApiUiCompositionFlags word verbatim (USE_PREMUL_ALPHA = 1<<0,
+// ENABLE_INTERNAL_UI_DOUBLE_BUFFERING = 1<<1 — the latter has the proxy
+// snapshot the resource at Present, so the pacing thread never reads a
+// texture the game queue is mid-writing).
+int32_t ffxshim_fg_swapchain_ui(void* sc_ctx, const FfxShimRes* ui, uint32_t flags);
 
 // Create the FG effect context. backbuffer_format: FfxApiSurfaceFormat of the
 // swapchain. flags: FfxApiCreateContextFramegenerationFlags. version_id 0 =

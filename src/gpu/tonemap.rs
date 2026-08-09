@@ -246,7 +246,7 @@ fn bytecode(blob: &ID3DBlob) -> D3D12_SHADER_BYTECODE {
     }
 }
 
-fn default_blend() -> D3D12_BLEND_DESC {
+pub(super) fn default_blend() -> D3D12_BLEND_DESC {
     let rt = D3D12_RENDER_TARGET_BLEND_DESC {
         BlendEnable: false.into(),
         LogicOpEnable: false.into(),

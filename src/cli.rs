@@ -502,12 +502,17 @@ pub struct Opts {
     /// term, shaded at the hemi BOUNCE_Q policy, integrated by the temporal
     /// denoisers / accumulation. Still-frame hemi tiers (H) take precedence.
     pub rtgi: bool,
-    /// `--no-auto-exposure` clears (`autoexp::set_enabled`): the interactive
-    /// aperture holds at exactly 1.0 (plus any bias) instead of adapting.
-    /// DEFAULT ON: a display-stage controller eases a clamped EV toward what
-    /// the presented frame's mean log2-luminance asks for (src/autoexp.rs) —
-    /// enclosures open up, exteriors hold at ~0 EV. Headless paths never run
-    /// the controller, so every gate/benchmark sees exposure 1.0 regardless.
+    /// `--auto-exposure` ARMS (`autoexp::set_enabled`): a display-stage
+    /// controller eases a clamped EV toward what the presented frame's mean
+    /// log2-luminance asks for (src/autoexp.rs) — enclosures open up,
+    /// exteriors hold at ~0 EV. DEFAULT OFF (2026-08-08, the user's call —
+    /// the same-day flip of the one-day default-ON: with RTGI on by default
+    /// enclosures light themselves, so the aperture holds at exactly 1.0
+    /// plus any bias); `--no-auto-exposure` spells the default. The default
+    /// is DUPLICATED in autoexp.rs's ENABLED initializer and settings.rs's
+    /// menu-row `Toggle { default }` — flip all three in lockstep.
+    /// Headless paths never run the controller either way, so every
+    /// gate/benchmark sees exposure 1.0 regardless.
     pub autoexp: bool,
     /// `--exposure-bias EV` (stops, -8..=8, default 0 — the cinematic
     /// `-exposure` range): a manual aperture offset composed ON TOP of the
@@ -550,16 +555,22 @@ pub struct Opts {
     /// the CPU cost is per-session); `--no-emissive-lights` spells the
     /// default (later flags win). The default is DUPLICATED in emissive.rs's
     /// ENABLED initializer — flip in lockstep. NOTE the compiled default is
-    /// only half the story since 2026-08-08: `main::upscaler_defaults` arms
-    /// it in sessions whose WIRED upscaler is TAA-class (XeSS/FSR3) unless
-    /// `emissive_lights_explicit` vetoes — see that field.
+    /// only half the story: `main::upscaler_defaults` arms it in sessions
+    /// whose WIRED upscaler is TAA-class (XeSS/FSR3) unless
+    /// `emissive_lights_explicit` vetoes — see that field. (That auto-arm
+    /// was retired for part of 2026-08-08 on the premise that default-ON
+    /// NRD/ReBLUR pre-upscale denoising integrates the RTGI bounce's
+    /// stochastic emissive ahead of the TAA clamp; the user's same-day
+    /// feel-test found NRD NOT sufficient — the pools still vanish — so the
+    /// policy is RE-INSTATED.)
     pub emissive_lights: bool,
     /// Did the user pick an emissive-lights state at all (flag or settings
     /// file)? OFF is a real default, so the value cannot report whether it
     /// was chosen — and the upscaler-class default (`main::
     /// upscaler_defaults`: XeSS/FSR3 sessions arm NEE because a TAA-class
     /// neighborhood clamp rejects the RTGI bounce's sparse stochastic
-    /// emissive) may only move a default the user left alone. BOTH spellings
+    /// emissive, and NRD's pre-upscale integration measured insufficient)
+    /// may only move a default the user left alone. BOTH spellings
     /// set it — presence, not value, is the signal (the
     /// `dxr_inline_explicit` doctrine), which makes `--no-emissive-lights`
     /// the spelled opt-out in XeSS/FSR3 sessions. The settings file sets it
@@ -819,7 +830,7 @@ pub fn defaults() -> Opts {
         detail_untex_scale: 1.0,
         amb_bump: true,
         rtgi: true,
-        autoexp: true,
+        autoexp: false,
         exposure_bias: 0.0,
         water: true,
         coincident_cull: true,
@@ -1139,9 +1150,11 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
             // bounce block out). --rtgi spells the default (later flags win).
             "--no-rtgi" => opts.rtgi = false,
             "--rtgi" => opts.rtgi = true,
-            // --no-auto-exposure: the interactive aperture never adapts (a
-            // fixed 1.0, plus any --exposure-bias). --auto-exposure spells
-            // the default (later flags win). Display-stage — no gate contact.
+            // --auto-exposure ARMS the display-stage aperture controller
+            // (DEFAULT OFF — RTGI lights enclosures for real, so the
+            // aperture holds at a fixed 1.0, plus any --exposure-bias).
+            // --no-auto-exposure spells the default (later flags win).
+            // Display-stage — no gate contact.
             "--no-auto-exposure" => opts.autoexp = false,
             "--auto-exposure" => opts.autoexp = true,
             "--exposure-bias" => {
@@ -2210,11 +2223,12 @@ pub fn usage() {
                 eprintln!("                (the pre-RTGI renderer bit-exactly). Default ON: one cosine bounce");
                 eprintln!("                ray per pixel per frame IS the ambient — real one-bounce GI the");
                 eprintln!("                temporal denoisers/accumulation integrate (--rtgi spells the default)");
-                eprintln!("  --no-auto-exposure  interactive aperture fixed at 1.0 (default ON: a display-stage");
-                eprintln!("                controller eases exposure toward mid-grey — enclosures open up;");
-                eprintln!("                headless paths never adapt either way)");
+                eprintln!("  --auto-exposure  ARM the display-stage aperture controller (OFF by default —");
+                eprintln!("                RTGI lights enclosures for real, so the aperture holds at 1.0; armed,");
+                eprintln!("                exposure eases toward mid-grey; headless paths never adapt either way)");
+                eprintln!("  --no-auto-exposure  the default, spelled explicitly (later flags win)");
                 eprintln!("  --exposure-bias EV  manual aperture offset in stops (-8..=8, default 0; composes");
-                eprintln!("                with auto-exposure and still applies under --no-auto-exposure)");
+                eprintln!("                with auto-exposure and still applies with it off — the manual lever)");
                 eprintln!("  --no-water    classify the fountain as generic glassware, not the water class");
                 eprintln!("                (no blue-green tint / IOR 1.33 / ripple normals; keys the scene cache)");
                 eprintln!("  --no-coincident-cull  keep transmissive faces exactly coincident with opaque faces");
@@ -2364,7 +2378,7 @@ pub fn self_test() -> Result<(), String> {
         "0.25",
         "--no-amb-bump",
         "--no-rtgi",
-        "--no-auto-exposure",
+        "--auto-exposure",
         "--exposure-bias",
         "1.5",
         "--no-water",
@@ -2428,7 +2442,8 @@ pub fn self_test() -> Result<(), String> {
         ("detail_untex_scale", o.detail_untex_scale == 0.25),
         ("amb_bump", !o.amb_bump),
         ("rtgi", !o.rtgi),
-        ("autoexp", !o.autoexp),
+        // Default OFF: "moved" means ARMED (the argv passes --auto-exposure).
+        ("autoexp", o.autoexp),
         ("exposure_bias", o.exposure_bias == 1.5),
         ("water", !o.water),
         ("coincident_cull", !o.coincident_cull),
