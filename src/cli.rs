@@ -28,8 +28,8 @@
 
 use crate::camera::Camera;
 use crate::{
-    bc7, blas_split, bloom, bvh, cinematic, clouds, dlss, emissive, fireflies, fsr, gpu, oidn,
-    scene, settings, texture, tone, upchain, xess,
+    bc7, blas_split, bloom, bvh, cinematic, clouds, dlss, emissive, fireflies, fsr, gpu, nrd,
+    oidn, scene, settings, texture, tone, upchain, xess,
 };
 use glam::Vec3A;
 
@@ -108,6 +108,17 @@ pub struct Opts {
     pub nrd_explicit: bool,
     /// Directory holding NRD.dll (install-prerequisites.bat nrd builds it).
     pub nrd_path: String,
+    /// Load the REBLUR_PERFORMANCE_MODE build of NRD.dll (`<nrd_path>\perf`,
+    /// the install script's second cmake tree) — cheaper ReBLUR internals
+    /// (6-tap Poisson, frame rotators, no Catmull-Rom history), same dispatch
+    /// count, lower quality. Perf mode is a COMPILE-TIME NRD option (no
+    /// ReblurSettings field exists for it in 4.17.3), hence a second DLL.
+    /// A missing perf DLL falls back to the standard one with a loud line.
+    pub nrd_perf: bool,
+    /// Runtime ReblurSettings overrides (--nrd-max-stabilized-frames,
+    /// --nrd-prepass-radius, --nrd-no-anti-firefly, --nrd-max-accum-frames) —
+    /// the fsr_tune shape: all None = the settings the session always sent.
+    pub nrd_tune: nrd::ReblurTuning,
     /// Directory holding libxess.dll.
     pub xess_path: String,
     /// Directory holding amd_fidelityfx_loader_dx12.dll + the provider DLLs.
@@ -733,6 +744,8 @@ pub fn defaults() -> Opts {
         nrd_path: std::env::var("FRUSTRACER_NRD_PATH").unwrap_or_else(|_| {
             concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\NRD\bin").to_string()
         }),
+        nrd_perf: false,
+        nrd_tune: Default::default(),
         xess_path: std::env::var("FRUSTRACER_XESS_PATH").unwrap_or_else(|_| {
             concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\XeSS-SDK\bin").to_string()
         }),
@@ -939,6 +952,40 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
                     std::process::exit(2);
                 })
             }
+            "--nrd-perf" => opts.nrd_perf = true,
+            "--no-nrd-perf" => opts.nrd_perf = false,
+            // ReBLUR runtime tuning overrides (the fsr-tune shape). Absent =
+            // the settings the session always sent, so a flagless session is
+            // unchanged; each is an A/B lever on the ReBLUR cost/quality
+            // trade (max-stabilized-frames 0 drops the TemporalStabilization
+            // pass outright; prepass-radius 0 disables both prepasses).
+            "--nrd-max-stabilized-frames" | "--nrd-max-accum-frames" => {
+                let v: u32 = args.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| {
+                    eprintln!("{a} needs a non-negative integer argument");
+                    std::process::exit(2);
+                });
+                if a == "--nrd-max-stabilized-frames" {
+                    opts.nrd_tune.max_stabilized_frames = Some(v);
+                } else {
+                    opts.nrd_tune.max_accum_frames = Some(v);
+                }
+            }
+            "--nrd-prepass-radius" => {
+                opts.nrd_tune.prepass_radius = args
+                    .next()
+                    .and_then(|s| s.parse::<f32>().ok())
+                    .filter(|v| v.is_finite() && *v >= 0.0)
+                    .map(Some)
+                    .unwrap_or_else(|| {
+                        eprintln!(
+                            "--nrd-prepass-radius needs a non-negative float (px; 0 disables \
+                             the prepasses)"
+                        );
+                        std::process::exit(2);
+                    });
+            }
+            "--nrd-no-anti-firefly" => opts.nrd_tune.anti_firefly = Some(false),
+            "--nrd-anti-firefly" => opts.nrd_tune.anti_firefly = Some(true),
             "--nppd" => opts.nppd = true,
             "--no-nppd" => opts.nppd = false,
             "--nppd-path" => {
@@ -2103,6 +2150,17 @@ pub fn usage() {
                 eprintln!("                nrd builds it");
                 eprintln!("  --no-nrd      kill lever: plain (undenoised) XeSS/FSR3 — the pre-NRD baseline");
                 eprintln!("  --nrd-path    NRD.dll directory (default: SDKs\\NRD\\bin)");
+                eprintln!("  --nrd-perf    load the REBLUR_PERFORMANCE_MODE build (<nrd-path>\\perf\\NRD.dll —");
+                eprintln!("                install-prerequisites.bat nrd builds both): cheaper ReBLUR internals,");
+                eprintln!("                lower quality; missing perf DLL = loud line + the standard DLL");
+                eprintln!("  --nrd-max-stabilized-frames N  ReBLUR tuning (unset = library default 63): 0 drops");
+                eprintln!("                the TemporalStabilization pass outright — the dispatch-level lever");
+                eprintln!("  --nrd-prepass-radius X   ReBLUR pre-pass blur radius in px, both lobes (default");
+                eprintln!("                30/50; 0 disables the prepasses)");
+                eprintln!("  --nrd-max-accum-frames N ReBLUR history length (default 30; lower = more reactive,");
+                eprintln!("                noisier)");
+                eprintln!("  --nrd-no-anti-firefly    drop ReBLUR's anti-firefly filter (--nrd-anti-firefly");
+                eprintln!("                spells the default)");
                 eprintln!("  --check-nrd   headless: NRD math gates (DLL-free) + instance/dispatch contract (DLL)");
                 eprintln!("  --nppd-device NPPD execution provider: auto|cpu|dml|dml:<n> (default auto = DML then CPU)");
                 eprintln!("  --check-xess  headless: XeSS dynamic-res contract self-test (no GPU or DLL needed)");

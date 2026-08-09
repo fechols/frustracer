@@ -383,6 +383,24 @@ fn main() {
         eprintln!("nrd: default disarmed — --nppd claims the pre-upscale color slot");
         opts.nrd = false;
     }
+    // --nrd-perf resolves ONCE, here, by rewriting nrd_path — every consumer
+    // (the session arms, --check-nrd, the N4 gate) then inherits the pick with
+    // zero further plumbing. Perf mode is a COMPILE-TIME NRD option (v4.17.3
+    // has no ReblurSettings field for it), so the lever is which DLL loads;
+    // LibraryDesc carries no perf bit, which is why the pick must be loud —
+    // the version gate cannot tell the two DLLs apart after the fact.
+    if opts.nrd_perf {
+        let perf_dir = format!("{}\\perf", opts.nrd_path);
+        if std::path::Path::new(&format!("{perf_dir}\\NRD.dll")).exists() {
+            eprintln!("nrd: performance-mode DLL selected ({perf_dir})");
+            opts.nrd_path = perf_dir;
+        } else {
+            eprintln!(
+                "nrd: --nrd-perf requested but {perf_dir}\\NRD.dll not found — using the \
+                 standard DLL (run install-prerequisites.bat nrd to build both)"
+            );
+        }
+    }
     // A --quin-anchor with no fuse to anchor is a typo, not a preference.
     if opts.quin_anchor.is_some() && !opts.quin {
         eprintln!("--quin-anchor selects the fuse's anchor engine, but --quinlight was not passed");
@@ -452,6 +470,12 @@ fn main() {
     // mips BEFORE aniso is a contract, not a style choice: `set_mips(false)`
     // forces aniso to 1 and `set_aniso` re-reads the mips switch, so this is
     // the only order in which `--no-mips` still implies `--no-aniso`.
+    // ReBLUR runtime tuning: one write, read by nrd_gpu::reblur_settings()
+    // (all-None flagless = the settings the session always sent).
+    nrd::set_tuning(opts.nrd_tune);
+    if opts.nrd_tune.any() {
+        eprintln!("nrd: ReBLUR tuning overrides {:?}", opts.nrd_tune);
+    }
     texture::set_mips(opts.mips);
     texture::set_aniso(opts.aniso);
     texture::set_h2n(opts.h2n);
@@ -2524,6 +2548,129 @@ fn run_check_dxr(
                     {
                         eprintln!("check-dxr: FAIL N5 nrd sig.w must-fire (capture never ran)");
                         ok = false;
+                    }
+                }
+                // --- N7 twin (DXR): FLAG_SKY_EXT_SKIP store-elision, the
+                // NaN-sentinel half (check-gpu's N7 pins the pack's sky-branch
+                // constants — that kernel is shared; what is per-PIPELINE, and
+                // therefore gated here, is the flag derivation + the sky
+                // store's elision through this pipeline's own raygen/CHS
+                // gbuf_write_sky call sites). Must restore frame B before the
+                // feed dispatch below, which reads sky ext full-screen.
+                {
+                    use windows::Win32::Graphics::Direct3D12::*;
+                    let ext_size = pw * ph * gpu::trace::GBUF_EXT_STRIDE as usize;
+                    let sent = {
+                        let mut res: Option<ID3D12Resource> = None;
+                        let hr = unsafe {
+                            hg.device.CreateCommittedResource(
+                                &gpu::d3d12::upload_heap(),
+                                D3D12_HEAP_FLAG_NONE,
+                                &gpu::d3d12::buffer_desc(ext_size as u64),
+                                D3D12_RESOURCE_STATE_GENERIC_READ,
+                                None,
+                                &mut res,
+                            )
+                        };
+                        let res = match (hr, res) {
+                            (Ok(()), Some(r)) => r,
+                            _ => {
+                                eprintln!("check-dxr: FAIL N7 sentinel alloc");
+                                return 1;
+                            }
+                        };
+                        let mut ptr = std::ptr::null_mut();
+                        if unsafe { res.Map(0, None, Some(&mut ptr)) }.is_err() {
+                            eprintln!("check-dxr: FAIL N7 sentinel map");
+                            return 1;
+                        }
+                        unsafe {
+                            std::ptr::write_bytes(ptr as *mut u8, 0xFF, ext_size);
+                            res.Unmap(0, None);
+                        }
+                        res
+                    };
+                    if hg
+                        .run(|l| unsafe {
+                            l.ResourceBarrier(&[gpu::d3d12::transition(
+                                &dg2.gbuf_ext,
+                                ua,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                            )]);
+                            l.CopyBufferRegion(&dg2.gbuf_ext, 0, &sent, 0, ext_size as u64);
+                            l.ResourceBarrier(&[gpu::d3d12::transition(
+                                &dg2.gbuf_ext,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                                ua,
+                            )]);
+                        })
+                        .is_err()
+                    {
+                        eprintln!("check-dxr: FAIL N7 sentinel fill");
+                        return 1;
+                    }
+                    dg2.force_sky_ext_skip(Some(true));
+                    dg2.write_cb(0, &p);
+                    let mut rec7 = Ok(());
+                    let traced = hg.run(|l| rec7 = dg2.record_frame(l, 0));
+                    dg2.force_sky_ext_skip(None);
+                    if traced.is_err() || rec7.is_err() {
+                        eprintln!("check-dxr: FAIL N7 skip trace");
+                        return 1;
+                    }
+                    let (c7, e7, a7) = match (
+                        hg.read_buffer(&dg2.gbuf, ua, pw * ph * gpu::trace::GBUF_STRIDE as usize),
+                        hg.read_buffer(&dg2.gbuf_ext, ua, ext_size),
+                        hg.read_buffer(&dg2.accum, ua, pw * ph * 12),
+                    ) {
+                        (Ok(c), Ok(e), Ok(a)) => (c, e, a),
+                        _ => {
+                            eprintln!("check-dxr: FAIL N7 readback");
+                            return 1;
+                        }
+                    };
+                    if a7 != accum_bytes {
+                        eprintln!(
+                            "check-dxr: FAIL N7 sky-ext-skip accum not bit-identical (the skip \
+                             must be store-elision only)"
+                        );
+                        ok = false;
+                    }
+                    let (_, far) = dlss::near_far(scene.diag);
+                    let (mut sky_px, mut sky_stored, mut hit_bad) = (0usize, 0usize, 0usize);
+                    for i in 0..pw * ph {
+                        let core_z =
+                            f32::from_le_bytes(c7[i * 16 + 8..i * 16 + 12].try_into().unwrap());
+                        if core_z == far {
+                            sky_px += 1;
+                            if e7[i * 72..(i + 1) * 72].iter().any(|&b| b != 0xFF) {
+                                sky_stored += 1;
+                            }
+                        } else if e7[i * 72..(i + 1) * 72] != pack2_ext[i * 72..(i + 1) * 72] {
+                            hit_bad += 1;
+                        }
+                    }
+                    println!(
+                        "check-dxr: nrd sky-ext-skip — sky {sky_px} stored {sky_stored} \
+                         hit-bad {hit_bad}"
+                    );
+                    if sky_stored > 0 || hit_bad > 0 {
+                        eprintln!("check-dxr: FAIL N7 sky-ext-skip (see counters)");
+                        ok = false;
+                    }
+                    if must_fire && sky_px == 0 {
+                        eprintln!(
+                            "check-dxr: FAIL N7 must-fire (no sky pixels — the skip never \
+                             exercised)"
+                        );
+                        ok = false;
+                    }
+                    // Restore frame B (the feed dispatch below reads sky ext).
+                    dg2.write_cb(0, &p);
+                    let mut rec8 = Ok(());
+                    if hg.run(|l| rec8 = dg2.record_frame(l, 0)).is_err() || rec8.is_err() {
+                        eprintln!("check-dxr: FAIL N7 frame-B restore");
+                        return 1;
                     }
                 }
                 let mut f_rec = Ok(());
@@ -7338,16 +7485,22 @@ fn run_check_gpu(
                             return 1;
                         }
                     };
+                    // The fold's register map: viewz at 26 (pl[2] still), the
+                    // ENGINE guide dummies at 18/19 — the same pl[10]/pl[9]
+                    // the N3 reference feed's engine set names, so the folded
+                    // pack and cs_feed_xess write identical values there.
                     if let Err(e) = ptg.wire_nrd_feed(
                         &hg.device,
                         &[
                             (16, &pl[0], fmts[0].0),
                             (17, &pl[1], fmts[1].0),
-                            (18, &pl[2], fmts[2].0),
+                            (18, &pl[10], fmts[10].0),
+                            (19, &pl[9], fmts[9].0),
                             (20, &pl[3], fmts[3].0),
                             (23, &pl[4], fmts[4].0),
                             (24, &pl[5], fmts[5].0),
                             (25, &pl[6], fmts[6].0),
+                            (26, &pl[2], fmts[2].0),
                             (27, &pl[7], fmts[7].0),
                         ],
                     ) {
@@ -7401,7 +7554,9 @@ fn run_check_gpu(
                     // the store rounding differ.
                     let tol = |c: f32| (c.abs() / 512.0).max(2e-5);
                     let hd_params = [3.0f32, 0.1, 20.0];
+                    let (_, n2_far) = dlss::near_far(scene.diag);
                     let (mut n2_bad, mut nh_live_d, mut nh_live_s) = (0usize, 0usize, 0usize);
+                    let mut n2_sky = 0usize;
                     for i in 0..pw * ph {
                         let vz = core_f(i, 2);
                         // IN_VIEWZ: R32F passthrough — bit-equal.
@@ -7417,6 +7572,33 @@ fn run_check_gpu(
                             if (tex_h(&b_mv, i, l) - mve[l]).abs() > tol(mve[l]) {
                                 n2_bad += 1;
                             }
+                        }
+                        // OUT-OF-RANGE (cs_nrd_pack's sky branch, the EXACT
+                        // denoisingRange predicate): the pack writes canonical
+                        // constants and reads NO ext bytes — the oracle arm
+                        // mirrors it, which is also what keeps this loop
+                        // meaningful under FLAG_SKY_EXT_SKIP's stale sky ext.
+                        if vz >= 0.999 * n2_far {
+                            n2_sky += 1;
+                            let enc = nrd::oracle::encode_normal_roughness_101010(
+                                [0.0, 1.0, 0.0],
+                                1.0,
+                            );
+                            let gnr =
+                                u32::from_le_bytes(b_nr[i * 4..][..4].try_into().unwrap());
+                            for (l, e) in enc.iter().enumerate() {
+                                let g = ((gnr >> (10 * l)) & 0x3ff) as i64;
+                                let c = (e.clamp(0.0, 1.0) * 1023.0).round() as i64;
+                                if (g - c).abs() > 1 {
+                                    n2_bad += 1;
+                                }
+                            }
+                            for l in 0..4 {
+                                if tex_h(&b_di, i, l) != 0.0 || tex_h(&b_sp, i, l) != 0.0 {
+                                    n2_bad += 1;
+                                }
+                            }
+                            continue;
                         }
                         // IN_NORMAL_ROUGHNESS: encoding-2 through the 10-bit
                         // UNORM store, ≤1 LSB per channel.
@@ -7541,7 +7723,8 @@ fn run_check_gpu(
                     }
                     println!(
                         "check-gpu: nrd bridge — n2-bad {n2_bad} | n3 passthrough color \
-                         byte-diff {n3_bad} | nh-live d {nh_live_d} s {nh_live_s}"
+                         byte-diff {n3_bad} | nh-live d {nh_live_d} s {nh_live_s} | \
+                         n2-sky {n2_sky}"
                     );
                     if n2_bad > 0 || n3_bad > 0 {
                         eprintln!("check-gpu: FAIL nrd bridge gates (see counters)");
@@ -7549,6 +7732,13 @@ fn run_check_gpu(
                     }
                     if must_fire && (nh_live_d == 0 || nh_live_s == 0) {
                         eprintln!("check-gpu: FAIL nrd bridge must-fire (dead hit-dist lanes)");
+                        ok = false;
+                    }
+                    // Anti-vacuity for N2's sky-constant arm (and N7 below,
+                    // which shares the pose): a poseless-sky frame would pass
+                    // both without ever exercising the pack's sky branch.
+                    if must_fire && n2_sky == 0 {
+                        eprintln!("check-gpu: FAIL N2 sky-arm must-fire (no sky pixels)");
                         ok = false;
                     }
                     // Restore the FSR-RR wiring (wire_feed REPLACES set 0) —
@@ -7600,11 +7790,13 @@ fn run_check_gpu(
                                 &[
                                     (16, &pl[0], fmts[0].0),
                                     (17, ng.plane_in_nr(), DXGI_FORMAT_R10G10B10A2_UNORM),
-                                    (18, ng.plane_in_viewz(), DXGI_FORMAT_R32_FLOAT),
+                                    (18, &pl[10], fmts[10].0),
+                                    (19, &pl[9], fmts[9].0),
                                     (20, ng.plane_out_spec(), DXGI_FORMAT_R16G16B16A16_FLOAT),
                                     (23, ng.plane_in_mv(), DXGI_FORMAT_R16G16B16A16_FLOAT),
                                     (24, ng.plane_in_diff(), DXGI_FORMAT_R16G16B16A16_FLOAT),
                                     (25, ng.plane_in_spec(), DXGI_FORMAT_R16G16B16A16_FLOAT),
+                                    (26, ng.plane_in_viewz(), DXGI_FORMAT_R32_FLOAT),
                                     (27, ng.plane_out_diff(), DXGI_FORMAT_R16G16B16A16_FLOAT),
                                 ],
                             );
@@ -7796,6 +7988,198 @@ fn run_check_gpu(
                                 eprintln!("check-gpu: FAIL N4 frame-B restore");
                                 return 1;
                             }
+                        }
+                    }
+                    // --- N7 (NRD): FLAG_SKY_EXT_SKIP — sky pixels elide the
+                    // 72 B ext store when NRD is the sole ext subscriber.
+                    // Proven against a NaN SENTINEL (all-0xFF ext bytes): if
+                    // the skip fails to elide the store, sky bytes stop being
+                    // the sentinel; if cs_nrd_pack's sky branch reads ANY ext
+                    // byte, the NaN poisons its nr/diff/spec planes. The
+                    // force hook is what arms it here — this harness has an
+                    // FsrRr feed wired, which the derivation correctly
+                    // vetoes, so without the override the gate is vacuous.
+                    {
+                        let ext_size = pw * ph * gpu::trace::GBUF_EXT_STRIDE as usize;
+                        let sent = {
+                            let mut res: Option<ID3D12Resource> = None;
+                            let hr = unsafe {
+                                hg.device.CreateCommittedResource(
+                                    &gpu::d3d12::upload_heap(),
+                                    D3D12_HEAP_FLAG_NONE,
+                                    &gpu::d3d12::buffer_desc(ext_size as u64),
+                                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                                    None,
+                                    &mut res,
+                                )
+                            };
+                            let res = match (hr, res) {
+                                (Ok(()), Some(r)) => r,
+                                _ => {
+                                    eprintln!("check-gpu: FAIL N7 sentinel alloc");
+                                    return 1;
+                                }
+                            };
+                            let mut ptr = std::ptr::null_mut();
+                            if unsafe { res.Map(0, None, Some(&mut ptr)) }.is_err() {
+                                eprintln!("check-gpu: FAIL N7 sentinel map");
+                                return 1;
+                            }
+                            unsafe {
+                                std::ptr::write_bytes(ptr as *mut u8, 0xFF, ext_size);
+                                res.Unmap(0, None);
+                            }
+                            res
+                        };
+                        if hg
+                            .run(|l| unsafe {
+                                l.ResourceBarrier(&[gpu::d3d12::transition(
+                                    &ptg.gbuf_ext,
+                                    ua,
+                                    D3D12_RESOURCE_STATE_COPY_DEST,
+                                )]);
+                                l.CopyBufferRegion(&ptg.gbuf_ext, 0, &sent, 0, ext_size as u64);
+                                l.ResourceBarrier(&[gpu::d3d12::transition(
+                                    &ptg.gbuf_ext,
+                                    D3D12_RESOURCE_STATE_COPY_DEST,
+                                    ua,
+                                )]);
+                            })
+                            .is_err()
+                        {
+                            eprintln!("check-gpu: FAIL N7 sentinel fill");
+                            return 1;
+                        }
+                        ptg.force_sky_ext_skip(Some(true));
+                        ptg.write_cb(0, &p);
+                        let traced = hg.run(|l| ptg.record_wavefront(l, 0, &p, false));
+                        ptg.force_sky_ext_skip(None);
+                        if traced.is_err() {
+                            eprintln!("check-gpu: FAIL N7 skip trace");
+                            return 1;
+                        }
+                        let (c7, e7, a7) = match (
+                            hg.read_buffer(
+                                &ptg.gbuf,
+                                ua,
+                                pw * ph * gpu::trace::GBUF_STRIDE as usize,
+                            ),
+                            hg.read_buffer(&ptg.gbuf_ext, ua, ext_size),
+                            hg.read_buffer(&ptg.accum, ua, pw * ph * 12),
+                        ) {
+                            (Ok(c), Ok(e), Ok(a)) => (c, e, a),
+                            _ => {
+                                eprintln!("check-gpu: FAIL N7 readback");
+                                return 1;
+                            }
+                        };
+                        // Store elision only: shading must be untouched.
+                        if a7 != accum_bytes {
+                            eprintln!(
+                                "check-gpu: FAIL N7 sky-ext-skip accum not bit-identical \
+                                 (the skip must be store-elision only)"
+                            );
+                            ok = false;
+                        }
+                        let (_, far) = dlss::near_far(scene.diag);
+                        let (mut sky_px, mut sky_stored, mut hit_bad) = (0usize, 0usize, 0usize);
+                        for i in 0..pw * ph {
+                            let core_z = f32::from_le_bytes(
+                                c7[i * 16 + 8..i * 16 + 12].try_into().unwrap(),
+                            );
+                            if core_z == far {
+                                sky_px += 1;
+                                // Still the sentinel ⇒ the store was skipped.
+                                if e7[i * 72..(i + 1) * 72].iter().any(|&b| b != 0xFF) {
+                                    sky_stored += 1;
+                                }
+                            } else if e7[i * 72..(i + 1) * 72] != pack2_ext[i * 72..(i + 1) * 72]
+                            {
+                                // Hit stores must run exactly as frame B's.
+                                hit_bad += 1;
+                            }
+                        }
+                        // The pack over the sentinel-holding ext: sky planes
+                        // must carry the canonical constants, NOT NaN — the
+                        // proof its sky branch reads no ext byte. Set 3 must
+                        // be rewired to the probe planes first (N4 left it on
+                        // its own NrdGpu's, since dropped).
+                        if let Err(e) = ptg.wire_nrd_feed(
+                            &hg.device,
+                            &[
+                                (16, &pl[0], fmts[0].0),
+                                (17, &pl[1], fmts[1].0),
+                                (18, &pl[10], fmts[10].0),
+                                (19, &pl[9], fmts[9].0),
+                                (20, &pl[3], fmts[3].0),
+                                (23, &pl[4], fmts[4].0),
+                                (24, &pl[5], fmts[5].0),
+                                (25, &pl[6], fmts[6].0),
+                                (26, &pl[2], fmts[2].0),
+                                (27, &pl[7], fmts[7].0),
+                            ],
+                        ) {
+                            eprintln!("check-gpu: FAIL N7 rewire: {e}");
+                            return 1;
+                        }
+                        let mut rec = Ok(());
+                        if hg.run(|l| rec = ptg.record_nrd_pack(l, 0)).is_err() || rec.is_err() {
+                            eprintln!("check-gpu: FAIL N7 pack dispatch");
+                            return 1;
+                        }
+                        let (s_nr, s_di, s_sp) = match (rb!(1, 4), rb!(5, 8), rb!(6, 8)) {
+                            (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+                            _ => {
+                                eprintln!("check-gpu: FAIL N7 plane readback");
+                                return 1;
+                            }
+                        };
+                        let enc7 =
+                            nrd::oracle::encode_normal_roughness_101010([0.0, 1.0, 0.0], 1.0);
+                        let mut plane_bad = 0usize;
+                        for i in 0..pw * ph {
+                            let core_z = f32::from_le_bytes(
+                                c7[i * 16 + 8..i * 16 + 12].try_into().unwrap(),
+                            );
+                            if core_z != far {
+                                continue;
+                            }
+                            let gnr =
+                                u32::from_le_bytes(s_nr[i * 4..][..4].try_into().unwrap());
+                            for (l, e) in enc7.iter().enumerate() {
+                                let g = ((gnr >> (10 * l)) & 0x3ff) as i64;
+                                let c = (e.clamp(0.0, 1.0) * 1023.0).round() as i64;
+                                if (g - c).abs() > 1 {
+                                    plane_bad += 1;
+                                }
+                            }
+                            for l in 0..4 {
+                                if tex_h(&s_di, i, l) != 0.0 || tex_h(&s_sp, i, l) != 0.0 {
+                                    plane_bad += 1;
+                                }
+                            }
+                        }
+                        println!(
+                            "check-gpu: nrd sky-ext-skip — sky {sky_px} stored {sky_stored} \
+                             hit-bad {hit_bad} plane-bad {plane_bad}"
+                        );
+                        if sky_stored > 0 || hit_bad > 0 || plane_bad > 0 {
+                            eprintln!("check-gpu: FAIL N7 sky-ext-skip (see counters)");
+                            ok = false;
+                        }
+                        if must_fire && sky_px == 0 {
+                            eprintln!(
+                                "check-gpu: FAIL N7 must-fire (no sky pixels — the skip never \
+                                 exercised)"
+                            );
+                            ok = false;
+                        }
+                        // Restore frame B under the derived (vetoed-off) skip
+                        // so later gates read stored sky ext again.
+                        ptg.write_cb(0, &p);
+                        if hg.run(|l| ptg.record_wavefront(l, 0, &p, false)).is_err() {
+                            eprintln!("check-gpu: FAIL N7 frame-B restore");
+                            return 1;
                         }
                     }
                 }

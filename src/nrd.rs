@@ -468,6 +468,62 @@ impl Default for ReblurSettings {
     }
 }
 
+/// Runtime `ReblurSettings` overrides (the `--nrd-*` tuning levers, the
+/// `fsr::DenoiseTuning` shape): every field is `None` by default, which
+/// changes NOTHING — a flagless session sends exactly the settings it always
+/// did (defaults + the AREA_3X3 departure in `nrd_gpu::reblur_settings`).
+/// These exist because ReBLUR's compile-time performance mode covers only the
+/// shader-internal half of the cost; `max_stabilized_frames = 0` is the one
+/// lever that genuinely DROPS a pass (TemporalStabilization), and
+/// `prepass_radius = 0` disables both prepasses. Written once from main's
+/// lever block (`set_tuning`), read by `nrd_gpu::reblur_settings()` — the N4
+/// gate inherits whatever the session runs, the `--cam` user's-own-risk class.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct ReblurTuning {
+    pub max_stabilized_frames: Option<u32>,
+    pub prepass_radius: Option<f32>,
+    pub anti_firefly: Option<bool>,
+    pub max_accum_frames: Option<u32>,
+}
+
+impl ReblurTuning {
+    pub fn any(&self) -> bool {
+        self.max_stabilized_frames.is_some()
+            || self.prepass_radius.is_some()
+            || self.anti_firefly.is_some()
+            || self.max_accum_frames.is_some()
+    }
+
+    /// Fold the overrides into a settings struct (None leaves the field).
+    pub fn apply(&self, rs: &mut ReblurSettings) {
+        if let Some(n) = self.max_stabilized_frames {
+            rs.max_stabilized_frame_num = n;
+        }
+        if let Some(r) = self.prepass_radius {
+            rs.diffuse_prepass_blur_radius = r;
+            rs.specular_prepass_blur_radius = r;
+        }
+        if let Some(b) = self.anti_firefly {
+            rs.enable_anti_firefly = b as u8;
+        }
+        if let Some(n) = self.max_accum_frames {
+            rs.max_accumulated_frame_num = n;
+        }
+    }
+}
+
+static TUNING: std::sync::OnceLock<ReblurTuning> = std::sync::OnceLock::new();
+
+/// One writer: main's lever block. A second call is ignored (OnceLock), which
+/// is fine — the block runs once per process.
+pub fn set_tuning(t: ReblurTuning) {
+    let _ = TUNING.set(t);
+}
+
+pub fn tuning() -> ReblurTuning {
+    TUNING.get().copied().unwrap_or_default()
+}
+
 #[repr(C)]
 pub struct SigmaSettings {
     pub light_direction: [f32; 3],

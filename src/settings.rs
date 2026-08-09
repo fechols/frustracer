@@ -163,6 +163,13 @@ opt_fields! {
         pub fsr_disocclusion_threshold: f32,
         pub fsr_normal_strength: f32,
         pub fsr_kernel_relaxation: f32,
+        /// --nrd-perf (restart): the REBLUR_PERFORMANCE_MODE DLL variant
+        pub nrd_perf: bool,
+        /// --nrd-* ReBLUR tuning (restart; unset = library defaults)
+        pub nrd_max_stabilized_frames: u32,
+        pub nrd_prepass_radius: f32,
+        pub nrd_anti_firefly: bool,
+        pub nrd_max_accum_frames: u32,
     }
 }
 
@@ -693,6 +700,22 @@ pub fn apply_to_opts(s: &Settings, opts: &mut crate::Opts) -> AppliedFx {
     }
     if let Some(v) = u.fsr_kernel_relaxation {
         t.kernel_relaxation = Some(v);
+    }
+    if let Some(v) = u.nrd_perf {
+        opts.nrd_perf = v;
+    }
+    let nt = &mut opts.nrd_tune;
+    if let Some(v) = u.nrd_max_stabilized_frames {
+        nt.max_stabilized_frames = Some(v);
+    }
+    if let Some(v) = u.nrd_prepass_radius {
+        nt.prepass_radius = Some(v);
+    }
+    if let Some(v) = u.nrd_anti_firefly {
+        nt.anti_firefly = Some(v);
+    }
+    if let Some(v) = u.nrd_max_accum_frames {
+        nt.max_accum_frames = Some(v);
     }
 
     // Effects: tod rides Opts; the rest are global statics (apply_globals).

@@ -4534,6 +4534,18 @@ pub const FLAG_SPEC_AA: u32 = 1048576;
 /// denoiser's input. Lockstep with trace_common.hlsli's FLAG_NRD_GI.
 pub const FLAG_NRD_GI: u32 = 2097152;
 
+/// Sky pixels SKIP the GBufExt store (bit 22 — the B70 NRD-cost recovery,
+/// 2026-08-09): armed only when NRD is the SOLE ext subscriber, because at a
+/// sky texel the bridge needs nothing from ext — cs_nrd_pack takes its own
+/// canonical-constant sky branch (never reading the possibly-stale bytes) and
+/// cs_nrd_out returns at its 0.999·CAM_FAR predicate before the ext load.
+/// Every OTHER ext consumer (cs_feed_rr, cs_feed_fsr_rr, nppd.hlsl, the pack
+/// readback gates) reads ext full-screen INCLUDING sky, which is why the
+/// derivation vetoes on any of them. Measured: the sky ext store was
+/// +0.33–0.51 ms/frame on the B70 at native 1080p. Lockstep with
+/// trace_common.hlsli's FLAG_SKY_EXT_SKIP.
+pub const FLAG_SKY_EXT_SKIP: u32 = 4194304;
+
 /// Unreal-1 detail texturing (`--no-detail-tex` clears it): procedural
 /// close-up albedo grain + micro-bump on MAGNIFIED hits — textured AND
 /// untextured since the untextured arm (shade.hlsli's post-match detail
@@ -5338,6 +5350,7 @@ impl FrameCb {
         fsr_sig: bool,
         gbuf_ext: bool,
         nrd_sig: bool,
+        sky_ext_skip: bool,
     ) -> FrameCb {
         let (origin, forward, right, up, inv_w, inv_h) = p.cam.gpu_fields();
         let mut cb = *self;
@@ -5361,6 +5374,10 @@ impl FrameCb {
             // The NRD RTGI fold rides the sig capture (it edits the lanes the
             // sig store writes), so it requires the sig flag by construction.
             | ((gbuf_full && fsr_sig && nrd_sig) as u32 * FLAG_NRD_GI)
+            // Sky ext-store skip: only meaningful when the ext store runs at
+            // all, so it requires the GBUF flag by construction (the branch
+            // sits behind gbuf_write_sky's own FLAG_GBUF/FLAG_GBUF_EXT gates).
+            | ((gbuf_full && sky_ext_skip) as u32 * FLAG_SKY_EXT_SKIP)
             | ((crate::texture::max_aniso() > 1.0) as u32 * FLAG_ANISO)
             | (p.clouds.enabled as u32 * FLAG_CLOUDS)
             // count > 0 already folds in the session enable + the night fade
@@ -5591,18 +5608,13 @@ pub struct NppdRes {
 /// (nrd_bridge.hlsl). PSOs only — the NRD plane TEXTURES belong to the
 /// session's NrdGpu (gpu/nrd_gpu.rs) or a gate's locals, wired into
 /// descriptor set NRD_FEED_SET via `wire_nrd_feed` (the NppdRes shape,
-/// minus buffers). pso_feed_dm is the guides-only engine feed the NRD
-/// composition uses in place of the color-writing kernel (cs_nrd_out owns
-/// the color plane — the NPPD-slot pattern).
+/// minus buffers). The old guides-only engine feed PSO is gone — the FOLD
+/// moved cs_feed_xess_dm's stores into cs_nrd_pack itself.
 pub struct NrdRes {
     // pub(crate): DxrGpu's record twins bind the same PSOs (compiled with
     // ITS root-signature object — same layout, the feed_pso discipline).
     pub(crate) pso_pack: ID3D12PipelineState,
     pub(crate) pso_out: ID3D12PipelineState,
-    /// The guides-only engine feed for NRD sessions (cs_nrd_out owns the
-    /// color plane). Consumed by the session wiring; the gates dispatch
-    /// pack/out directly.
-    pub pso_feed_dm: ID3D12PipelineState,
 }
 
 impl NrdRes {
@@ -5611,9 +5623,8 @@ impl NrdRes {
     pub(crate) fn from_psos(
         pso_pack: ID3D12PipelineState,
         pso_out: ID3D12PipelineState,
-        pso_feed_dm: ID3D12PipelineState,
     ) -> Self {
-        Self { pso_pack, pso_out, pso_feed_dm }
+        Self { pso_pack, pso_out }
     }
 }
 
@@ -5740,6 +5751,12 @@ pub struct TraceGpu {
     /// bracketed NPSR→UA→NPSR around cs_nrd_out's write. Held separately from
     /// `nrd_wired` because record_nrd_out needs the RESOURCE, not a keepalive.
     nrd_color: Option<ID3D12Resource>,
+    /// The wired NRD set's u18/u19 targets — the ENGINE's depth/mvec guide
+    /// planes the FOLDED cs_nrd_pack writes (record_feed_nrd's retired job).
+    /// Same NPSR rest-state contract as `nrd_color`, bracketed around the
+    /// pack dispatch; the bridge's own IN planes rest UA and are never
+    /// transitioned (the NrdGpu pool doctrine).
+    nrd_guides: Vec<ID3D12Resource>,
     /// The shared scene core — one Rc per tracer, cached in GpuContext (the
     /// second tracer and resize re-entries skip the upload + BLAS build).
     pub scene: std::rc::Rc<SceneGpu>,
@@ -5795,6 +5812,9 @@ pub struct TraceGpu {
     /// Test hook — see `force_gbuf_ext`. `Cell` because the record/write
     /// methods take `&self` (the `last_struct` precedent).
     force_gbuf_ext: std::cell::Cell<bool>,
+    /// See `sky_ext_skip` — the armed-skip gate's hook (the `force_nrd_sig`
+    /// Option-override shape: Some beats the derivation, None restores it).
+    force_sky_ext_skip: std::cell::Cell<Option<bool>>,
     gbuf_full: bool,
     uav_heap: ID3D12DescriptorHeap,
     /// GPU handle of the RP_SCENE_TEX table's first descriptor (heap slot
@@ -6213,7 +6233,6 @@ impl TraceGpu {
             Some(NrdRes {
                 pso_pack: pso(&nrd_src, "cs_nrd_pack", "nrd_pack")?,
                 pso_out: pso(&nrd_src, "cs_nrd_out", "nrd_out")?,
-                pso_feed_dm: pso(&feed_src, "cs_feed_xess_dm", "nrd_feed_dm")?,
             })
         } else {
             None
@@ -6481,6 +6500,7 @@ impl TraceGpu {
             nrd: nrd_res,
             nrd_wired: Vec::new(),
             nrd_color: None,
+            nrd_guides: Vec::new(),
             last_struct: std::cell::Cell::new(None),
             split: std::cell::Cell::new(TileSplit::ALL),
             split_refused: std::cell::Cell::new(false),
@@ -6542,6 +6562,7 @@ impl TraceGpu {
             force_gbuf_ext: std::cell::Cell::new(false),
             force_fsr_sig: std::cell::Cell::new(false),
             force_nrd_sig: std::cell::Cell::new(None),
+            force_sky_ext_skip: std::cell::Cell::new(None),
             gbuf_full,
             uav_heap,
             tex_table,
@@ -6579,6 +6600,7 @@ impl TraceGpu {
             self.fsr_sig(),
             self.gbuf_ext_needed(),
             self.nrd_sig(),
+            self.sky_ext_skip(),
         );
         cb.cloud_grid = self.cloud_grid_row(p);
         cb.split = self.split.get().cb_row();
@@ -6688,6 +6710,29 @@ impl TraceGpu {
     /// unless the override is set (dual-GPU mirror / the N6 gate).
     pub fn nrd_sig(&self) -> bool {
         self.force_nrd_sig.get().unwrap_or(!self.nrd_wired.is_empty())
+    }
+
+    /// Whether sky pixels may SKIP the ext store this frame (FLAG_SKY_EXT_SKIP
+    /// — see the const's comment). Derived TRUE only when NRD is the sole ext
+    /// subscriber: the bridge's own sky branches make the bytes unread, while
+    /// an RR/FsrRr feed, NPPD, or a forced-ext consumer (the pack readback
+    /// gates, the dual-GPU secondary) reads ext at sky and vetoes. The
+    /// override is the armed-skip gate's hook (`force_nrd_sig`'s Option
+    /// shape — Some(true) must beat the force_gbuf_ext veto).
+    pub fn sky_ext_skip(&self) -> bool {
+        self.force_sky_ext_skip.get().unwrap_or(
+            !self.nrd_wired.is_empty()
+                && self.nppd.is_none()
+                && !self.force_gbuf_ext.get()
+                && !self
+                    .feed
+                    .iter()
+                    .any(|(k, _)| matches!(k, FeedKind::Rr | FeedKind::FsrRr)),
+        )
+    }
+
+    pub fn force_sky_ext_skip(&self, v: Option<bool>) {
+        self.force_sky_ext_skip.set(v);
     }
 
     /// The `nrd_sig` half of the dual-GPU mirror (the `force_fsr_sig` shape):
@@ -7637,32 +7682,6 @@ impl TraceGpu {
         Ok(())
     }
 
-    /// The --nrd flavor of the engine feed: GUIDES-ONLY (cs_feed_xess_dm) —
-    /// cs_nrd_out already wrote the denoised color into the engine's color
-    /// plane, and the normal color-writing kernel would overwrite it with raw
-    /// accum. XeSS- or FSR3-wired sessions (they take a byte-identical plane
-    /// trio with the same encodings, so the one dm kernel serves both — the
-    /// upscale_res_shared argument); RR/FSR-RR sessions never arm NRD.
-    pub fn record_feed_nrd(&self, list: &ID3D12GraphicsCommandList, slot: usize) -> Result<()> {
-        if self.feed.len() != 1 || !matches!(self.feed[0].0, FeedKind::Xess | FeedKind::Fsr3) {
-            return Err("NRD feed composition is XeSS/FSR3-only".into());
-        }
-        let n = self.nrd.as_ref().ok_or("NRD bridge not built")?;
-        let planes = &self.feed[0].1;
-        let feeds = [(&n.pso_feed_dm, 0u32, planes.as_slice())];
-        record_feed_dispatch(
-            list,
-            &self.device,
-            &self.uav_heap,
-            &feeds,
-            None,
-            self.rw,
-            self.rh,
-            &|| unsafe { self.bind_common(list, slot) },
-        );
-        Ok(())
-    }
-
     /// NPPD pre-inference staging: pack the G-buffer + 1-spp radiance into
     /// the NCHW frame buffer and backward-warp the recurrent state (or zero
     /// the warped buffer when `state_valid` is false — a reset). Record AFTER
@@ -7704,6 +7723,13 @@ impl TraceGpu {
         // — the upscaler-eval contract every other writer honors through
         // record_feed_dispatch's own transitions).
         self.nrd_color = targets.iter().find(|t| t.0 == 16).map(|t| t.1.clone());
+        // u18/u19 = the engine's depth/mvec guide planes the folded pack
+        // writes — same rest state, bracketed around record_nrd_pack.
+        self.nrd_guides = targets
+            .iter()
+            .filter(|t| t.0 == 18 || t.0 == 19)
+            .map(|t| t.1.clone())
+            .collect();
         Ok(())
     }
 
@@ -7711,10 +7737,11 @@ impl TraceGpu {
     /// last refs once NrdGpu is gone) and disarms `fsr_sig`'s nrd term, so a
     /// shed session stops paying the sig/sig2 pack stores. The set-3
     /// descriptors go stale, which is fine — nothing binds them once
-    /// record_nrd_*/record_feed_nrd stop being called.
+    /// record_nrd_* stops being called.
     pub fn clear_nrd_wired(&mut self) {
         self.nrd_wired.clear();
         self.nrd_color = None;
+        self.nrd_guides.clear();
     }
 
     /// Whether THIS tracer can run the NRD bridge (PSOs built AND planes
@@ -7725,14 +7752,23 @@ impl TraceGpu {
         self.nrd.is_some() && !self.nrd_wired.is_empty()
     }
 
-    /// The bridge's front half: gbuf/gbuf_ext/accum -> NRD's five IN planes.
-    /// Runs after record_frame (its trailing global UAV barrier fences the
-    /// pack writes); the caller owns the IN planes' UAV barrier before NRD's
-    /// own passes consume them.
+    /// The bridge's front half: gbuf/gbuf_ext/accum -> NRD's five IN planes,
+    /// PLUS the engine's mvec/depth guide planes (the fold — cs_feed_xess_dm's
+    /// stores moved into cs_nrd_pack, so record_feed_nrd is gone). Runs after
+    /// record_frame (its trailing global UAV barrier fences the pack writes);
+    /// the caller owns the IN planes' UAV barrier before NRD's own passes
+    /// consume them. Only the ENGINE guide planes transition here — the
+    /// bridge's IN planes rest UA (the NrdGpu pool doctrine).
     pub fn record_nrd_pack(&self, list: &ID3D12GraphicsCommandList, slot: usize) -> Result<()> {
         let n = self.nrd.as_ref().ok_or("NRD bridge not built")?;
         let _ev = super::pix::scope(list, c"nrd-pack");
         unsafe {
+            let npsr = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            let ua = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            let pre: Vec<_> = self.nrd_guides.iter().map(|r| transition(r, npsr, ua)).collect();
+            if !pre.is_empty() {
+                list.ResourceBarrier(&pre);
+            }
             self.bind_common(list, slot);
             list.SetDescriptorHeaps(&[Some(self.uav_heap.clone())]);
             list.SetComputeRootDescriptorTable(
@@ -7741,6 +7777,10 @@ impl TraceGpu {
             );
             list.SetPipelineState(&n.pso_pack);
             list.Dispatch(self.rw.div_ceil(8), self.rh.div_ceil(8), 1);
+            let post: Vec<_> = self.nrd_guides.iter().map(|r| transition(r, ua, npsr)).collect();
+            if !post.is_empty() {
+                list.ResourceBarrier(&post);
+            }
         }
         Ok(())
     }

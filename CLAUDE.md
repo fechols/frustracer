@@ -1512,8 +1512,29 @@ cargo run --release -- --gpu --xess --nrd  # NRD (ReBLUR) pre-upscale denoising 
                                       # pattern at the DXC tier; CommonSettings matrices are
                                       # glam col-major VERBATIM, no transpose — the anti-SL
                                       # convention, proven by N4's 8× temporal-delta shrink);
-                                      # all on the ONE list, no split_frame; the engine feed
-                                      # runs guides-only (record_feed_nrd); cs_nrd_out brackets
+                                      # all on the ONE list, no split_frame; an NRD frame runs
+                                      # NO engine feed dispatch at all since THE FOLD
+                                      # (2026-08-09, the B70 cost recovery): cs_nrd_pack itself
+                                      # writes the engine's mvec/depth guides (cs_feed_xess_dm's
+                                      # stores verbatim; record_feed_nrd is DELETED, the shared
+                                      # view_z_to_clip_depth moved to trace_common.hlsli so the
+                                      # precise-sensitive encode has ONE copy), which moved
+                                      # NRD's linear view-Z u18 → u26 and wired the engine
+                                      # depth/mvec at 18/19 of the NRD set (arm_nrd_for /
+                                      # nrd_bridge.hlsl's register map, lockstep) — the
+                                      # nrd_guides NPSR brackets ride record_nrd_pack. AND THE
+                                      # SKY EXT-STORE SKIP (same day, FLAG_SKY_EXT_SKIP bit 22):
+                                      # when NRD is the SOLE ext subscriber (derived; RR/FsrRr
+                                      # feeds, NPPD, force_gbuf_ext all veto — they read sky ext
+                                      # full-screen) sky pixels elide the whole 72 B GBufExt
+                                      # store and cs_nrd_pack's sky branch (the out kernel's
+                                      # exact 0.999·CAM_FAR predicate) writes canonical
+                                      # constants without reading a byte of ext — proven by N7's
+                                      # NaN-sentinel gate in BOTH GPU suites (fill ext with
+                                      # 0xFF, force the skip, assert sky bytes stay sentinel +
+                                      # hit bytes byte-equal + accum bit-identical + pack planes
+                                      # clean constants; force_sky_ext_skip is the Option
+                                      # override, the force_nrd_sig shape). cs_nrd_out brackets
                                       # the engine color plane NPSR↔UA itself (the plane RESTS
                                       # in NON_PIXEL_SHADER_RESOURCE — the upscaler-eval
                                       # contract; gate stand-ins must rest NPSR too), and its
@@ -1544,11 +1565,34 @@ cargo run --release -- --gpu --xess --nrd  # NRD (ReBLUR) pre-upscale denoising 
                                       # XeSS-alone 0.42/255 → NRD 0.07–0.10 (BELOW DLSS-RR's
                                       # ~0.12 reference); AMD iGPU FSR3 0.38 → 0.19 still
                                       # ramping (vendor neutrality live); DXR+XeSS → 0.10.
-                                      # COST: nrd-pack 0.27 + nrd 0.63 + nrd-out 0.28 =
-                                      # ~1.18 ms native 1080p (~0.5 ms at the quality 2/3
-                                      # scale); the two bridge halves are bandwidth passes that
-                                      # rival ReBLUR itself — folding pack into the feed family
-                                      # is the documented follow-on. Gates: --check-nrd (N0
+                                      # COST, re-measured 2026-08-09 ALL-IN (span delta vs
+                                      # --no-nrd, parked native 1080p — the recorded "~1.18 ms"
+                                      # counted only the three nrd regions and missed the
+                                      # leaf/sky ext-store delta): B70 procedural +3.65 ms
+                                      # BEFORE the fold+sky-skip (2.28 → 5.93 span, 2.6×!! — the
+                                      # user-reported "NRD makes the B70 2x slower", decomposed
+                                      # as ReBLUR 1.97 + pack 0.57 + out 0.48 + leaf ext +0.43 +
+                                      # sky ext +0.33 − feed 0.14), B70 world +2.64 (1.62×),
+                                      # 4090 procedural +1.72 (2.8× — same class, NOT
+                                      # Intel-specific: the tax is fixed per frame and the
+                                      # frames are tiny). AFTER: B70 5.93 → 5.44 procedural /
+                                      # 6.89 → 6.15 world, 4090 2.68 → 2.31 — the engine-side
+                                      # recovery, quality-neutral by construction. The
+                                      # remaining tax is mostly ReBLUR itself + the hit-pixel
+                                      # ext stores; the OPT-IN levers go further (quality
+                                      # trades, feel-test before defaulting): --nrd-perf loads
+                                      # the REBLUR_PERFORMANCE_MODE DLL from <nrd-path>\perf
+                                      # (install-prerequisites.bat builds BOTH — perf mode is
+                                      # COMPILE-TIME in 4.17.3, no ReblurSettings field exists;
+                                      # the armed line prints the DLL dir since LibraryDesc
+                                      # cannot tell the variants apart; B70 nrd 1.99 → 1.74),
+                                      # and the --nrd-* runtime tuning family (nrd::ReblurTuning,
+                                      # the fsr-tune all-Option shape, applied in
+                                      # nrd_gpu::reblur_settings): --nrd-max-stabilized-frames 0
+                                      # DROPS the TemporalStabilization pass (nrd 1.74 → 1.55
+                                      # stacked on perf), --nrd-prepass-radius 0 disables the
+                                      # prepasses, --nrd-no-anti-firefly, --nrd-max-accum-frames.
+                                      # Gates: --check-nrd (N0
                                       # DLL-free math twins + N1 instance/dispatch contract,
                                       # absent-DLL = loud skip exit 0); --check-gpu N2
                                       # (pack-vs-oracle, 0 bad px), N3 (passthrough byte-equal),
@@ -1559,9 +1603,13 @@ cargo run --release -- --gpu --xess --nrd  # NRD (ReBLUR) pre-upscale denoising 
                                       # guards on its own no-capture lever — check-dxr on
                                       # dxr_inline_mode()!=0, check-gpu on !--sw-rays, since
                                       # the rt_sw/rt_dxr twins report tmax by design and
-                                      # ao_occluded is structurally 0 there). Touch nrd.rs /
+                                      # ao_occluded is structurally 0 there), N6 (the RTGI
+                                      # fold A/B), N7 (the sky-ext-skip NaN-sentinel proof,
+                                      # both GPU suites — plus N2's own sky-constant arm with
+                                      # its n2-sky must-fire). Touch nrd.rs /
                                       # nrd_gpu.rs / nrd_bridge.hlsl / the transmit_q_t twins /
-                                      # the sig.w pack lane / record_*_nrd / the four presenter
+                                      # the sig.w pack lane / record_*_nrd / gbuf_write_sky's
+                                      # skip branch / the four presenter
                                       # branches → run --check, --check-nrd, --check-gpu,
                                       # --check-dxr, --check-fsr, then the STAB smoke on a still
                                       # XeSS view (the 0.42-baseline table above)

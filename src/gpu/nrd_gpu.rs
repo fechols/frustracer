@@ -161,14 +161,16 @@ pub fn common_settings(
     cs
 }
 
-/// The session's ReblurSettings: defaults + the two departures the 1-spp
-/// path demands, in LOCKSTEP with nrd_bridge.hlsl's literals
-/// (NRD_HITDIST_PARAMS = the {3, 0.1, 20} defaults).
+/// The session's ReblurSettings: defaults + the ONE departure the 1-spp path
+/// demands (the hit-dist params stay at their {3, 0.1, 20} defaults, which is
+/// what keeps them in LOCKSTEP with nrd_bridge.hlsl's literals), then the
+/// `--nrd-*` tuning overrides (all-None flagless — bit-identical settings).
 pub fn reblur_settings() -> nrd::ReblurSettings {
     let mut rs = nrd::ReblurSettings::default();
     // Pixels whose reflection gate never fired carry hit-dist 0 ("no data")
     // — reconstruction fills them from neighbors (required below ~1 rpp).
     rs.hit_distance_reconstruction_mode = nrd::HITDIST_RECONSTRUCTION_AREA_3X3;
+    nrd::tuning().apply(&mut rs);
     rs
 }
 

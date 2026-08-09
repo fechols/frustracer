@@ -141,6 +141,7 @@ call :check "  (DirectML EP)"                        "%SDKS%\onnxruntime\bin\Dir
 call :check "OIDN (--oidn / N)"                      "%SDKS%\oidn.x64.windows\bin\OpenImageDenoise.dll"
 call :check "PIX markers (--pix-markers)"            "%SDKS%\pix\bin\x64\WinPixEventRuntime.dll"
 call :check "NRD denoiser (--nrd)"                   "%SDKS%\NRD\bin\NRD.dll"
+call :check "  (perf variant, --nrd-perf)"           "%SDKS%\NRD\bin\perf\NRD.dll"
 
 rem DLSS is decided at BUILD time, not here (see the header) — but say so in
 rem the summary, where someone looking for the missing DLSS-RR row will look.
@@ -252,7 +253,23 @@ rem kept: the DXIL shader blobs are EMBEDDED in it and src/nrd.rs loads it at
 rem runtime, so building frustracer still needs none of this. A missing
 rem toolchain is a hard failure only when nrd was named on the command line —
 rem a default `all` run degrades to a note, like the DLSS/NPPD-model rows.
-call :skip "%SDKS%\NRD\bin\NRD.dll" nrd && exit /b 0
+rem  TWO DLLs since the --nrd-perf lever (2026-08-09): the standard build and a
+rem  REBLUR_PERFORMANCE_MODE=ON variant under bin\perf (perf mode is a
+rem  COMPILE-TIME NRD option — v4.17.3 has no ReblurSettings field for it —
+rem  hence a second binary; cheaper ReBLUR internals, same dispatch count).
+rem  SEQUENCING CONTRACT: cmake writes the generated Shaders\NRDConfig.hlsli
+rem  (which carries the perf define) into the SHARED SOURCE tree at configure,
+rem  and both build dirs output to the shared %NRD_SRC%\_Bin — so each arm
+rem  below runs configure -> build -> copy as an unbroken unit, and a build
+rem  must NEVER run without its own configure immediately before it (a stale
+rem  NRDConfig.hlsli from the other arm would silently embed the wrong
+rem  shaders into a DLL the version gate cannot tell apart).
+if defined FORCE goto :nrd_build
+if exist "%SDKS%\NRD\bin\NRD.dll" if exist "%SDKS%\NRD\bin\perf\NRD.dll" (
+    echo [=] nrd already installed
+    exit /b 0
+)
+:nrd_build
 set "CMAKE="
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 where cmake.exe >nul 2>nul && set "CMAKE=cmake.exe"
@@ -281,6 +298,10 @@ rem  compiler when installed (script order runs dxc first); absent, ShaderMake
 rem  falls back to the Windows-SDK dxc on its own.
 set "DXCARG="
 if exist "%SDKS%\dxc\bin\x64\dxc.exe" set "DXCARG=-DSHADERMAKE_DXC_PATH=%SDKS%\dxc\bin\x64\dxc.exe"
+if not defined FORCE if exist "%SDKS%\NRD\bin\NRD.dll" (
+    echo     [.] standard NRD.dll present — building only the perf variant
+    goto :nrd_perf
+)
 echo     [+] configuring NRD %NRD_TAG% ^(cmake log: %CACHE%\nrd-cmake.log^)
 "%CMAKE%" -S "%NRD_SRC%" -B "%CACHE%\nrd-build" -A x64 -DNRD_STATIC_LIBRARY=OFF -DNRD_NRI=OFF -DNRD_EMBEDS_DXIL_SHADERS=ON -DNRD_EMBEDS_DXBC_SHADERS=OFF -DNRD_EMBEDS_SPIRV_SHADERS=OFF -DNRD_NORMAL_ENCODING=2 -DNRD_ROUGHNESS_ENCODING=1 %DXCARG% > "%CACHE%\nrd-cmake.log" 2>&1
 if errorlevel 1 (
@@ -308,6 +329,37 @@ if not defined NRD_DLL (
 if not exist "%SDKS%\NRD\bin" mkdir "%SDKS%\NRD\bin"
 copy /y "%NRD_DLL%" "%SDKS%\NRD\bin\" >nul || (set "FAILED=1" & exit /b 0)
 echo     [+] NRD.dll -^> SDKs\NRD\bin
+
+:nrd_perf
+rem  The --nrd-perf variant: same pins, REBLUR_PERFORMANCE_MODE=ON, its own
+rem  build dir. The configure here is what rewrites the shared source tree's
+rem  NRDConfig.hlsli to the perf define (see the sequencing contract above).
+if not defined FORCE if exist "%SDKS%\NRD\bin\perf\NRD.dll" exit /b 0
+echo     [+] configuring NRD %NRD_TAG% perf variant ^(cmake log: %CACHE%\nrd-cmake-perf.log^)
+"%CMAKE%" -S "%NRD_SRC%" -B "%CACHE%\nrd-build-perf" -A x64 -DNRD_STATIC_LIBRARY=OFF -DNRD_NRI=OFF -DNRD_EMBEDS_DXIL_SHADERS=ON -DNRD_EMBEDS_DXBC_SHADERS=OFF -DNRD_EMBEDS_SPIRV_SHADERS=OFF -DNRD_NORMAL_ENCODING=2 -DNRD_ROUGHNESS_ENCODING=1 -DREBLUR_PERFORMANCE_MODE=ON %DXCARG% > "%CACHE%\nrd-cmake-perf.log" 2>&1
+if errorlevel 1 (
+    echo     [x] nrd perf cmake configure FAILED — see %CACHE%\nrd-cmake-perf.log
+    set "FAILED=1"
+    exit /b 0
+)
+echo     [+] building NRD perf variant ^(a few minutes; log: %CACHE%\nrd-build-perf.log^)
+"%CMAKE%" --build "%CACHE%\nrd-build-perf" --config Release --parallel > "%CACHE%\nrd-build-perf.log" 2>&1
+if errorlevel 1 (
+    echo     [x] nrd perf build FAILED — see %CACHE%\nrd-build-perf.log
+    set "FAILED=1"
+    exit /b 0
+)
+set "NRD_DLL="
+if exist "%NRD_SRC%\_Bin\NRD.dll" set "NRD_DLL=%NRD_SRC%\_Bin\NRD.dll"
+if exist "%NRD_SRC%\_Bin\Release\NRD.dll" set "NRD_DLL=%NRD_SRC%\_Bin\Release\NRD.dll"
+if not defined NRD_DLL (
+    echo     [x] nrd perf build produced no NRD.dll under %NRD_SRC%\_Bin
+    set "FAILED=1"
+    exit /b 0
+)
+if not exist "%SDKS%\NRD\bin\perf" mkdir "%SDKS%\NRD\bin\perf"
+copy /y "%NRD_DLL%" "%SDKS%\NRD\bin\perf\" >nul || (set "FAILED=1" & exit /b 0)
+echo     [+] NRD.dll ^(perf^) -^> SDKs\NRD\bin\perf
 exit /b 0
 
 :nrd_no_toolchain

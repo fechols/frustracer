@@ -31,18 +31,9 @@ RWTexture2D<float>  feed_aux3    : register(u26); // R16F     FSR-RR ambient-occ
                                                   //          may differ per kernel, its TYPE may not.
 RWTexture2D<float4> feed_aux4    : register(u27); // RGBA16F  FSR-RR indirect specular (A = ray hit t)
 
-// xess.rs::view_z_to_clip_depth: linear view-Z -> [0,1] reversed-Z clip
-// depth. `precise` keeps DXC from FMA-contracting near*(far-z) — sky's
-// view_z == far must land EXACTLY on 0.0 (the CPU encode's contract).
-float view_z_to_clip_depth(float view_z, float near, float far) {
-    precise float z = max(view_z, near);
-    precise float num = near * (far - z);
-    precise float den = z * (far - near);
-    // The quotient must be precise too, or DXC lowers it to rcp+mul
-    // (observed: 2-ulp drift on ~0.1% of pixels).
-    precise float q = num / den;
-    return saturate(q);
-}
+// view_z_to_clip_depth moved to trace_common.hlsli (pasted ahead of this
+// unit) — the NRD pack fold made it a two-unit function, and a precise-
+// sensitive encode must have exactly one copy.
 
 [numthreads(8, 8, 1)]
 void cs_feed_xess(uint3 id : SV_DispatchThreadID) {

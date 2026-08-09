@@ -474,6 +474,9 @@ pub struct DxrGpu {
     /// fold (and the check-gpu fold gate's hook; an OVERRIDE — Some(false)
     /// beats live wiring, None = wiring-derived).
     force_nrd_sig: std::cell::Cell<Option<bool>>,
+    /// See `sky_ext_skip` — the armed-skip gate's hook (the force_nrd_sig
+    /// Option-override shape).
+    force_sky_ext_skip: std::cell::Cell<Option<bool>>,
     gbuf_full: bool,
     /// RGBA16F resolve target; rests in PIXEL_SHADER_RESOURCE between frames
     /// (the tonemap PS reads it via SRV_SLOT_DXR).
@@ -488,6 +491,9 @@ pub struct DxrGpu {
     /// The wired u16 target — the engine's color plane (rests NPSR; see the
     /// TraceGpu twin's field comment).
     nrd_color: Option<ID3D12Resource>,
+    /// The wired NRD set's u18/u19 engine guide planes (the TraceGpu twin's
+    /// field comment — the folded pack's NPSR bracket targets).
+    nrd_guides: Vec<ID3D12Resource>,
     /// Upscaler feed kernels (compiled only when `gbuf_full`; every kind so
     /// --check-dxr can rewire between them like --check-gpu does) and the
     /// wired planes record_feed barriers over.
@@ -992,17 +998,6 @@ impl DxrGpu {
                 trace::NRD_BRIDGE_HLSL,
             ]);
             let nrd_src = parts.join("\n");
-            let mut feed_parts: Vec<&str> = Vec::new();
-            if !abl.is_empty() {
-                feed_parts.push(abl.as_str());
-            }
-            feed_parts.extend([
-                sd,
-                trace::TRACE_COMMON_HLSLI,
-                trace::FSR_WIRE_HLSLI,
-                trace::FEED_HLSL,
-            ]);
-            let feed_src = feed_parts.join("\n");
             let pso = |src: &str, entry: &str, name: &str| -> Result<ID3D12PipelineState> {
                 trace::compute_pso(
                     device,
@@ -1014,7 +1009,6 @@ impl DxrGpu {
             Some(trace::NrdRes::from_psos(
                 pso(&nrd_src, "cs_nrd_pack", "dxr nrd_pack")?,
                 pso(&nrd_src, "cs_nrd_out", "dxr nrd_out")?,
-                pso(&feed_src, "cs_feed_xess_dm", "dxr nrd_feed_dm")?,
             ))
         } else {
             None
@@ -1620,6 +1614,7 @@ impl DxrGpu {
             nrd: nrd_res,
             nrd_wired: Vec::new(),
             nrd_color: None,
+            nrd_guides: Vec::new(),
             sbt_mode,
             sbt_distinct_idents,
             sbt_required_idents,
@@ -1643,6 +1638,7 @@ impl DxrGpu {
             band_refused: std::cell::Cell::new(false),
             force_fsr_sig: std::cell::Cell::new(false),
             force_nrd_sig: std::cell::Cell::new(None),
+            force_sky_ext_skip: std::cell::Cell::new(None),
             sway_mv_t: std::cell::Cell::new(None),
             sway_mv_on: !sway_def.is_empty(),
             mode3,
@@ -1727,6 +1723,26 @@ impl DxrGpu {
     /// Some(false) beats live wiring (the N6 gate's need), None restores.
     pub fn force_nrd_sig(&self, v: Option<bool>) {
         self.force_nrd_sig.set(v);
+    }
+
+    /// The `TraceGpu::sky_ext_skip` twin (FLAG_SKY_EXT_SKIP — see trace.rs's
+    /// const comment), minus its NPPD term like `gbuf_ext_needed` above.
+    /// Derived TRUE only when NRD is the sole ext subscriber; the
+    /// force_gbuf_ext veto keeps the pack-readback gates and a `--dual-gpu`
+    /// secondary storing sky ext bytes their consumers actually read.
+    pub fn sky_ext_skip(&self) -> bool {
+        self.force_sky_ext_skip.get().unwrap_or(
+            !self.nrd_wired.is_empty()
+                && !self.force_gbuf_ext.get()
+                && !self
+                    .feed
+                    .iter()
+                    .any(|(k, _)| matches!(k, trace::FeedKind::Rr | trace::FeedKind::FsrRr)),
+        )
+    }
+
+    pub fn force_sky_ext_skip(&self, v: Option<bool>) {
+        self.force_sky_ext_skip.set(v);
     }
 
     /// The band `record_frame` will dispatch — gates only, and deliberately
@@ -1826,6 +1842,7 @@ impl DxrGpu {
             self.fsr_sig(),
             self.gbuf_ext_needed(),
             self.nrd_sig(),
+            self.sky_ext_skip(),
         );
         // Sway MVs: arm the flag + the ring-slot base, and stash the clock
         // pair for record_frame's dmv fill — one predicate (sway_mv_pair +
@@ -1883,6 +1900,13 @@ impl DxrGpu {
         // u16 = the engine's color plane (rests NPSR; record_nrd_out's
         // transition target — the TraceGpu twin's rule).
         self.nrd_color = targets.iter().find(|t| t.0 == 16).map(|t| t.1.clone());
+        // u18/u19 = the engine's depth/mvec guide planes the folded pack
+        // writes (the TraceGpu twin's rule).
+        self.nrd_guides = targets
+            .iter()
+            .filter(|t| t.0 == 18 || t.0 == 19)
+            .map(|t| t.1.clone())
+            .collect();
         Ok(())
     }
 
@@ -1891,6 +1915,7 @@ impl DxrGpu {
     pub fn clear_nrd_wired(&mut self) {
         self.nrd_wired.clear();
         self.nrd_color = None;
+        self.nrd_guides.clear();
     }
 
     /// The TraceGpu twin: whether THIS pipeline can run the NRD bridge.
@@ -1898,11 +1923,20 @@ impl DxrGpu {
         self.nrd.is_some() && !self.nrd_wired.is_empty()
     }
 
-    /// trace.rs's record_nrd_pack twin (this pipeline's bind_common).
+    /// trace.rs's record_nrd_pack twin (this pipeline's bind_common) — the
+    /// folded pack: NRD IN planes + the engine's mvec/depth guides, whose
+    /// NPSR rest state is bracketed here (the bridge IN planes rest UA and
+    /// are never transitioned).
     pub fn record_nrd_pack(&self, list: &ID3D12GraphicsCommandList, slot: usize) -> Result<()> {
         let n = self.nrd.as_ref().ok_or("NRD bridge not built")?;
         let _ev = super::pix::scope(list, c"nrd-pack");
         unsafe {
+            let npsr = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            let ua = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            let pre: Vec<_> = self.nrd_guides.iter().map(|r| transition(r, npsr, ua)).collect();
+            if !pre.is_empty() {
+                list.ResourceBarrier(&pre);
+            }
             self.bind_common(list, slot);
             list.SetDescriptorHeaps(&[Some(self.uav_heap.clone())]);
             list.SetComputeRootDescriptorTable(
@@ -1911,6 +1945,10 @@ impl DxrGpu {
             );
             list.SetPipelineState(&n.pso_pack);
             list.Dispatch(self.rw.div_ceil(8), self.rh.div_ceil(8), 1);
+            let post: Vec<_> = self.nrd_guides.iter().map(|r| transition(r, ua, npsr)).collect();
+            if !post.is_empty() {
+                list.ResourceBarrier(&post);
+            }
         }
         Ok(())
     }
@@ -1934,29 +1972,6 @@ impl DxrGpu {
             list.Dispatch(self.rw.div_ceil(8), self.rh.div_ceil(8), 1);
             list.ResourceBarrier(&[transition(color, ua, npsr)]);
         }
-        Ok(())
-    }
-
-    /// trace.rs's record_feed_nrd twin: guides-only (cs_nrd_out owns color).
-    pub fn record_feed_nrd(&self, list: &ID3D12GraphicsCommandList, slot: usize) -> Result<()> {
-        if self.feed.len() != 1
-            || !matches!(self.feed[0].0, trace::FeedKind::Xess | trace::FeedKind::Fsr3)
-        {
-            return Err("NRD feed composition is XeSS/FSR3-only".into());
-        }
-        let n = self.nrd.as_ref().ok_or("NRD bridge not built")?;
-        let planes = &self.feed[0].1;
-        let feeds = [(&n.pso_feed_dm, 0u32, planes.as_slice())];
-        trace::record_feed_dispatch(
-            list,
-            &self.device,
-            &self.uav_heap,
-            &feeds,
-            None,
-            self.rw,
-            self.rh,
-            &|| unsafe { self.bind_common(list, slot) },
-        );
         Ok(())
     }
 

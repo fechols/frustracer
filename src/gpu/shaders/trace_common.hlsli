@@ -120,6 +120,14 @@
                                // set that bit too and their dd must stay pure
                                // direct diffuse (AMD's own denoiser input).
                                // Lockstep with trace.rs::FLAG_NRD_GI.
+#define FLAG_SKY_EXT_SKIP 4194304u // sky pixels skip the GBufExt store: armed
+                               // only when NRD is the SOLE ext subscriber
+                               // (cs_nrd_pack's sky branch writes constants
+                               // and never reads ext there; cs_nrd_out
+                               // returns before its ext load) — every other
+                               // ext consumer reads sky texels full-screen
+                               // and the derivation vetoes. Lockstep with
+                               // trace.rs::FLAG_SKY_EXT_SKIP.
 
 cbuffer Frame : register(b0) {
     float4 cam_origin;   // xyz; w = inv_w
@@ -1603,6 +1611,22 @@ void gbuf_write_hit(uint pi, float fx, float fy, float3 dir, float t, PrimSurf p
     gbuf_ext[pi] = g;
 }
 
+// xess.rs::view_z_to_clip_depth: linear view-Z -> [0,1] reversed-Z clip
+// depth. `precise` keeps DXC from FMA-contracting near*(far-z) — sky's
+// view_z == far must land EXACTLY on 0.0 (the CPU encode's contract). Lives
+// HERE (not feed.hlsl) since the NRD pack fold: cs_nrd_pack writes the
+// engine depth guide too, and two copies of a precise-sensitive encode is
+// exactly the drift the depth ulp gates exist to catch.
+float view_z_to_clip_depth(float view_z, float near, float far) {
+    precise float z = max(view_z, near);
+    precise float num = near * (far - z);
+    precise float den = z * (far - near);
+    // The quotient must be precise too, or DXC lowers it to rcp+mul
+    // (observed: 2-ulp drift on ~0.1% of pixels).
+    precise float q = num / den;
+    return saturate(q);
+}
+
 // render.rs::write_gbuf_sky: depth = far (finite, f16-safe); MV = direction-
 // only reprojection (exact for an environment at infinity). FSR sessions:
 // sig = 0 (residual = the sky color itself downstream) and prev-Z = far so
@@ -1619,6 +1643,12 @@ void gbuf_write_sky(uint pi, float fx, float fy, float3 dir) {
                     (flags & FLAG_FSR_SIG) ? CAM_FAR : 0.0);
     gbuf[pi] = c;
     if ((flags & FLAG_GBUF_EXT) == 0u) return;
+    // Sole-NRD sessions skip the 72 B ext store outright: the bridge's own
+    // sky branches never read these bytes (stale is fine BY CONSTRUCTION —
+    // the armed check-gpu gate proves it against a NaN sentinel), and the
+    // store was +0.33-0.51 ms/frame on the B70. Whole-record skip, never a
+    // partial store — the 16-B-member measurement above forbids that shape.
+    if (flags & FLAG_SKY_EXT_SKIP) return;
 
     GBufExt g;
     g.nr = float4(-dir, 1.0);

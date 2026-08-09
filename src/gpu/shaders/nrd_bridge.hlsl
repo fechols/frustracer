@@ -36,13 +36,23 @@
 
 RWStructuredBuffer<float> accum : register(u0); // rw*rh*3 linear HDR (1-spp)
 
+// THE FOLD (2026-08-09): cs_nrd_pack ALSO writes the engine's mvec/depth
+// guide planes — what record_feed_nrd used to dispatch cs_feed_xess_dm for —
+// so an NRD frame runs one full-screen guide pass instead of two (the second
+// GBufCore load + a dispatch + the color plane's redundant transition
+// round-trip, ~0.15-0.25 ms on the B70). The engine planes take feed.hlsl's
+// own registers/types (u18/u19), which is why nrd_in_viewz moved u18 → u26
+// (free in an NRD session: record-time policy refuses RR/FSR-RR, whose
+// plane sets claim u20..u22 — never 26 on THIS set).
 RWTexture2D<float4> nrd_color_out : register(u16); // the upscaler's color plane
 RWTexture2D<float4> nrd_in_nr : register(u17);     // R10G10B10A2: NRD enc-2
-RWTexture2D<float> nrd_in_viewz : register(u18);   // R32F linear view-Z
+RWTexture2D<float> feed_depth : register(u18);     // R32F reversed-Z clip (ENGINE)
+RWTexture2D<float2> feed_mvec : register(u19);     // RG16F pixel MVs (ENGINE)
 RWTexture2D<float4> nrd_out_spec : register(u20);  // RGBA16F (NRD-written)
 RWTexture2D<float4> nrd_in_mv : register(u23);     // RGBA16F 2.5D MV
 RWTexture2D<float4> nrd_in_diff : register(u24);   // RGBA16F YCoCg + normHitDist
 RWTexture2D<float4> nrd_in_spec : register(u25);   // RGBA16F YCoCg + normHitDist
+RWTexture2D<float> nrd_in_viewz : register(u26);   // R32F linear view-Z
 RWTexture2D<float4> nrd_out_diff : register(u27);  // RGBA16F (NRD-written)
 
 // ReBLUR's HitDistanceParameters (A, B, C) — LITERALS, in LOCKSTEP with the
@@ -106,7 +116,6 @@ void cs_nrd_pack(uint3 id : SV_DispatchThreadID) {
     if (id.x >= rw || id.y >= rh) return;
     uint pi = id.y * rw + id.x;
     GBufCore c = gbuf[pi];
-    GBufExt g = gbuf_ext[pi];
 
     // Guides. MV: the pack's pixel-space prev−cur plus the 2.5D view-Z delta
     // (prev_z − view_z, both already captured); CommonSettings'
@@ -114,6 +123,27 @@ void cs_nrd_pack(uint3 id : SV_DispatchThreadID) {
     // NRD expects — the plane stays in the tree's own pixel convention.
     nrd_in_viewz[id.xy] = c.core.z;
     nrd_in_mv[id.xy] = float4(c.core.x, c.core.y, c.core.w - c.core.z, 0.0);
+    // The folded engine guides — cs_feed_xess_dm's two stores VERBATIM (one
+    // shared view_z_to_clip_depth in trace_common.hlsli, so the depth ulp
+    // gates see one encode).
+    feed_mvec[id.xy] = c.core.xy;
+    feed_depth[id.xy] = view_z_to_clip_depth(c.core.z, CAM_NEAR, CAM_FAR);
+
+    // OUT-OF-RANGE (sky + the [0.999·far, far) band — cs_nrd_out's EXACT
+    // predicate): NRD never writes these texels (denoisingRange), so the
+    // remaining planes carry deterministic constants and the ext record is
+    // NEVER read here — which is what lets FLAG_SKY_EXT_SKIP elide the sky
+    // ext store entirely (stale bytes must stay unread BY CONSTRUCTION, the
+    // armed check-gpu gate's NaN-sentinel proof). The nr constant is any
+    // NaN-free encoding (never nrd_pack_nr of a stale/zero normal — 0/0);
+    // viewZ carries the neighbor rejection, so the value is inert.
+    if (c.core.z >= 0.999 * CAM_FAR) {
+        nrd_in_nr[id.xy] = nrd_pack_nr(float3(0.0, 1.0, 0.0), 1.0);
+        nrd_in_diff[id.xy] = float4(0.0, 0.0, 0.0, 0.0);
+        nrd_in_spec[id.xy] = float4(0.0, 0.0, 0.0, 0.0);
+        return;
+    }
+    GBufExt g = gbuf_ext[pi];
     nrd_in_nr[id.xy] = nrd_pack_nr(g.nr.xyz, g.nr.w);
 
     // The two folded noisy channels (sky rows carry all-zero sig lanes, so

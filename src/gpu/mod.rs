@@ -3505,11 +3505,10 @@ impl GpuContext {
                     &|| d.record_nrd_out(&d3d.list, slot),
                 );
             }
-            let feed = if nrd_ok {
-                d.record_feed_nrd(&d3d.list, slot)
-            } else {
-                d.record_feed(&d3d.list, slot)
-            };
+            // The fold: an NRD frame needs NO engine feed dispatch — the
+            // guides were written by the folded cs_nrd_pack, the color by
+            // cs_nrd_out. Only the shed/plain arm feeds.
+            let feed = if nrd_ok { Ok(()) } else { d.record_feed(&d3d.list, slot) };
             if let Err(e) = feed {
                 d3d.abort_frame();
                 return Err(e);
@@ -3643,11 +3642,10 @@ impl GpuContext {
                     &|| d.record_nrd_out(&d3d.list, slot),
                 );
             }
-            let feed = if nrd_ok {
-                d.record_feed_nrd(&d3d.list, slot)
-            } else {
-                d.record_feed(&d3d.list, slot)
-            };
+            // The fold: an NRD frame needs NO engine feed dispatch — the
+            // guides were written by the folded cs_nrd_pack, the color by
+            // cs_nrd_out. Only the shed/plain arm feeds.
+            let feed = if nrd_ok { Ok(()) } else { d.record_feed(&d3d.list, slot) };
             if let Err(e) = feed {
                 d3d.abort_frame();
                 return Err(e);
@@ -3803,20 +3801,22 @@ impl GpuContext {
         if self.nrd_shed {
             return Err("NRD was shed earlier this session".into());
         }
-        // The engine whose color plane cs_nrd_out owns: XeSS or the FSR 3.1
+        // The engine whose planes the bridge owns: XeSS or the FSR 3.1
         // upscaler (the byte-identical-trio pair; `fsr` is the SESSION state,
         // either flavor — `fsr3` is quinlight's extra engine). RR/FSR-RR
-        // already denoise and never reach here. The resource is CLONED
-        // (COM AddRef) so no borrow of self survives into the build below.
-        let (color_res, color_fmt) = if let Some(x) = &self.xess {
-            let pl = x.res.plane_resources();
-            (pl[0].0.clone(), pl[0].1)
-        } else if let Some(FsrRes::Up(res)) = self.fsr.as_ref().map(|f| &f.res) {
-            let pl = res.plane_resources();
-            (pl[0].0.clone(), pl[0].1)
-        } else {
-            return Err("--nrd composes with an XeSS or FSR3 session".into());
-        };
+        // already denoise and never reach here. cs_nrd_out owns COLOR; since
+        // the fold, cs_nrd_pack owns the MVEC/DEPTH guides too (the retired
+        // record_feed_nrd's job), so all three wire into the NRD set. The
+        // resources are CLONED (COM AddRef) so no borrow of self survives
+        // into the build below.
+        let [(color_res, color_fmt), (mvec_res, mvec_fmt), (depth_res, depth_fmt)] =
+            if let Some(x) = &self.xess {
+                x.res.plane_resources().map(|(r, f)| (r.clone(), f))
+            } else if let Some(FsrRes::Up(res)) = self.fsr.as_ref().map(|f| &f.res) {
+                res.plane_resources().map(|(r, f)| (r.clone(), f))
+            } else {
+                return Err("--nrd composes with an XeSS or FSR3 session".into());
+            };
         match &self.nrd_gpu {
             Some(g) if (g.rw, g.rh) == (rw, rh) => {}
             Some(g) => {
@@ -3841,23 +3841,30 @@ impl GpuContext {
                 // path, and an armed session used to be indistinguishable
                 // from an unarmed one (the user-report class this fixes).
                 // Once per session: both arms share the instance, so the
-                // SPACE/F re-arms land in the Some(g) arm above.
-                eprintln!("nrd: armed — ReBLUR pre-upscale denoising at {rw}x{rh}");
+                // SPACE/F re-arms land in the Some(g) arm above. The dir is
+                // printed because the standard and --nrd-perf DLLs are
+                // version-indistinguishable (LibraryDesc has no perf bit) —
+                // this line is the only record of which one loaded.
+                eprintln!("nrd: armed — ReBLUR pre-upscale denoising at {rw}x{rh} ({dir})");
             }
         }
         let ng = self.nrd_gpu.as_ref().unwrap();
         use windows::Win32::Graphics::Dxgi::Common::*;
-        // Set NRD_FEED_SET: the bridge's registers — u16 is the ENGINE's
-        // color plane (cs_nrd_out owns it; the engine feed then runs
-        // guides-only via record_feed_nrd).
+        // Set NRD_FEED_SET: the bridge's registers — u16/u18/u19 are the
+        // ENGINE's color/depth/mvec planes (cs_nrd_out owns color, the folded
+        // cs_nrd_pack owns the two guides; no separate engine feed runs in an
+        // NRD frame), u26 is NRD's linear view-Z (moved off u18 for the fold
+        // — nrd_bridge.hlsl's register map is the lockstep twin).
         wire(&[
             (16, &color_res, color_fmt),
             (17, ng.plane_in_nr(), DXGI_FORMAT_R10G10B10A2_UNORM),
-            (18, ng.plane_in_viewz(), DXGI_FORMAT_R32_FLOAT),
+            (18, &depth_res, depth_fmt),
+            (19, &mvec_res, mvec_fmt),
             (20, ng.plane_out_spec(), DXGI_FORMAT_R16G16B16A16_FLOAT),
             (23, ng.plane_in_mv(), DXGI_FORMAT_R16G16B16A16_FLOAT),
             (24, ng.plane_in_diff(), DXGI_FORMAT_R16G16B16A16_FLOAT),
             (25, ng.plane_in_spec(), DXGI_FORMAT_R16G16B16A16_FLOAT),
+            (26, ng.plane_in_viewz(), DXGI_FORMAT_R32_FLOAT),
             (27, ng.plane_out_diff(), DXGI_FORMAT_R16G16B16A16_FLOAT),
         ])
     }
@@ -3968,11 +3975,11 @@ impl GpuContext {
                     &|| tg.record_nrd_out(&d3d.list, slot),
                 );
             }
-            let feed = if nrd_ok {
-                tg.record_feed_nrd(&d3d.list, slot)
-            } else {
-                tg.record_feed(&d3d.list, slot, nppd_on)
-            };
+            // The fold: an NRD frame needs NO engine feed dispatch — the
+            // guides were written by the folded cs_nrd_pack, the color by
+            // cs_nrd_out. Only the shed/plain arm feeds.
+            let feed =
+                if nrd_ok { Ok(()) } else { tg.record_feed(&d3d.list, slot, nppd_on) };
             if let Err(e) = feed {
                 d3d.abort_frame();
                 return Err(e);
@@ -4317,11 +4324,10 @@ impl GpuContext {
                     &|| tg.record_nrd_out(&d3d.list, slot),
                 );
             }
-            let feed = if nrd_ok {
-                tg.record_feed_nrd(&d3d.list, slot)
-            } else {
-                tg.record_feed(&d3d.list, slot, false)
-            };
+            // The fold: an NRD frame needs NO engine feed dispatch — the
+            // guides were written by the folded cs_nrd_pack, the color by
+            // cs_nrd_out. Only the shed/plain arm feeds.
+            let feed = if nrd_ok { Ok(()) } else { tg.record_feed(&d3d.list, slot, false) };
             if let Err(e) = feed {
                 d3d.abort_frame();
                 return Err(e);
