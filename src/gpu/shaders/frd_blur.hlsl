@@ -28,6 +28,10 @@ RWTexture2D<float4> b_out_spec : register(u1);
 // Pass 3 only: the recurrent slow feedback.
 RWTexture2D<float4> b_slow_diff : register(u2);
 RWTexture2D<float4> b_slow_spec : register(u3);
+// Pass 3 only: per-signal anti-lag gains g = 1/max(e, 1) for NEXT frame's
+// pass 1 (single-buffered, the slow discipline — pass 1 read it before this
+// pass rewrites it). Clamp-not-run and sky pixels store exactly 1.0.
+RWTexture2D<float2> b_antilag : register(u4);
 
 cbuffer FrdCb : register(b0) {
     uint rw;
@@ -44,6 +48,7 @@ cbuffer FrdCb : register(b0) {
     float r_max;      // --frd-blur-radius (default frd.rs R_MAX)
     float pass_scale; // 1.0 (blur) | 1.7 (post)
     uint salt;        // disk rotation salt (decorrelates the two passes)
+    float light_par;  // pass 1's lane (declared for the shared layout)
 };
 
 // One signal's disk blur, weights in log2 domain (frd_tap_exp2 — one
@@ -152,6 +157,7 @@ void cs_frd_post(uint3 id : SV_DispatchThreadID) {
         b_out_spec[p] = as_;
         b_slow_diff[p] = ad;
         b_slow_spec[p] = as_;
+        b_antilag[p] = float2(1.0, 1.0);
         return;
     }
     float sr, cr;
@@ -165,16 +171,26 @@ void cs_frd_post(uint3 id : SV_DispatchThreadID) {
     // window): box the radiance lanes to fast ± kσ (the .w hit-dist lane is
     // not radiance — never clamped). The clamped value is ALSO what feeds
     // back — a ghost the clamp rejected must not survive in the recurrence.
+    // Beside each clamp, RECORD how hard it had to fight: e = the pre-clamp
+    // luma's distance from fast in box widths, g = frd_antilag_gain(e) into
+    // the antilag plane — next frame's pass 1 cuts the reprojected age by
+    // g, the recurrent brake (in-box and clamp-not-run store exactly 1.0).
+    float2 g = float2(1.0, 1.0);
     float4 fd = b_fast_diff[p];
     float4 fs = b_fast_spec[p];
     if (c.nn.x >= fast_frames) {
-        od.xyz = frd_clamp_ycocg(od.xyz, fd.xyz, sqrt(max(fd.w, 0.0)), clamp_sigma);
+        float sig = sqrt(max(fd.w, 0.0));
+        g.x = frd_antilag_gain(abs(od.x - fd.x) / max(clamp_sigma * sig, 1e-6));
+        od.xyz = frd_clamp_ycocg(od.xyz, fd.xyz, sig, clamp_sigma);
     }
     if (c.nn.y >= fast_frames) {
-        os.xyz = frd_clamp_ycocg(os.xyz, fs.xyz, sqrt(max(fs.w, 0.0)), clamp_sigma);
+        float sig = sqrt(max(fs.w, 0.0));
+        g.y = frd_antilag_gain(abs(os.x - fs.x) / max(clamp_sigma * sig, 1e-6));
+        os.xyz = frd_clamp_ycocg(os.xyz, fs.xyz, sig, clamp_sigma);
     }
     b_out_diff[p] = od;
     b_out_spec[p] = os;
     b_slow_diff[p] = od;
     b_slow_spec[p] = os;
+    b_antilag[p] = g;
 }

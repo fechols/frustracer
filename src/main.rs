@@ -573,14 +573,16 @@ fn main() {
     if opts.frd_tune.any() {
         eprintln!("frd: tuning overrides {:?}", opts.frd_tune);
     }
-    // The two levers whose consumers are UNBUILT (stabilization + the firefly
-    // pre-clamp, phase-C/D pendings) must say so — a lever that parses and
-    // does nothing is the silent no-op A/B walk the lever doctrine exists to
-    // prevent (the FR_NGXFG unrecognized-value rule).
-    if opts.frd_tune.max_stab_frames.is_some() || opts.frd_tune.anti_firefly.is_some() {
+    // The one lever whose consumer is UNBUILT (the stabilization sub-step, a
+    // phase-D pending) must say so — a lever that parses and does nothing is
+    // the silent no-op A/B walk the lever doctrine exists to prevent (the
+    // FR_NGXFG unrecognized-value rule). --frd-[no-]anti-firefly is LIVE
+    // since 2026-08-09 (the firefly pre-clamp shipped with the bright-
+    // specular-smear fix; default ON, the no- spelling is the A/B arm).
+    if opts.frd_tune.max_stab_frames.is_some() {
         eprintln!(
-            "frd: --frd-max-stab-frames / --frd-[no-]anti-firefly are NOT YET WIRED \
-             (unbuilt phase-C/D items) — inert this build"
+            "frd: --frd-max-stab-frames is NOT YET WIRED (the stabilization sub-step is an \
+             unbuilt phase-D item) — inert this build"
         );
     }
     texture::set_mips(opts.mips);
@@ -7964,7 +7966,18 @@ fn run_check_gpu(
                         let (mut r1, mut r2, mut r3) = (Ok(()), Ok(()), Ok(()));
                         let sub = hg.run(|l| {
                             r1 = ptg.record_nrd_pack(l, 0);
-                            r2 = fg.record(l, 0, true, n2_far, 1.0, 0.0, [0.0, 0.0, 1.0]);
+                            r2 = fg.record(
+                                l,
+                                0,
+                                &gpu::frd_gpu::FrdFrame {
+                                    reset: true,
+                                    far: n2_far,
+                                    proj: 1.0,
+                                    cam_step: 0.0,
+                                    cam_fwd: [0.0, 0.0, 1.0],
+                                    light_par: 0.0,
+                                },
+                            );
                             r3 = ptg.record_nrd_out(l, 0);
                         });
                         if sub.is_err() || r1.is_err() || r2.is_err() || r3.is_err() {
@@ -8323,8 +8336,19 @@ fn run_check_gpu(
                             let sub = hg.run(|l| {
                                 ptg.record_wavefront(l, 0, &fp, false);
                                 r1 = ptg.record_nrd_pack(l, 0);
-                                // Parked pose: cam step 0, fwd inert.
-                                r2 = fg.record(l, 0, reset, f4_far, f4_proj, 0.0, [0.0, 0.0, 1.0]);
+                                // Parked pose: cam step 0, fwd inert, static sun.
+                                r2 = fg.record(
+                                    l,
+                                    0,
+                                    &gpu::frd_gpu::FrdFrame {
+                                        reset,
+                                        far: f4_far,
+                                        proj: f4_proj,
+                                        cam_step: 0.0,
+                                        cam_fwd: [0.0, 0.0, 1.0],
+                                        light_par: 0.0,
+                                    },
+                                );
                                 r3 = ptg.record_nrd_out(l, 0);
                             });
                             if sub.is_err() || r1.is_err() || r2.is_err() || r3.is_err() {

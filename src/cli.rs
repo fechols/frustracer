@@ -2255,9 +2255,10 @@ pub fn usage() {
                 eprintln!("  --frd-max-accum-frames N (clamped loudly to 63 — the meta plane's n/63 wire cap)");
                 eprintln!("                | --frd-fast-frames N | --frd-blur-radius X | --frd-clamp-sigma X");
                 eprintln!("                | --frd-no-fp16 (force the fp32 shader arm)   FRD tuning (unset = the");
-                eprintln!("                compiled frd.rs constants). --frd-max-stab-frames N and");
-                eprintln!("                --frd-[no-]anti-firefly parse but are NOT YET WIRED (the stabilization");
-                eprintln!("                sub-step and firefly pre-clamp are unbuilt phase-C/D items)");
+                eprintln!("                compiled frd.rs constants). --frd-no-anti-firefly drops the input");
+                eprintln!("                firefly pre-clamp (default ON — the bright-specular-smear killer;");
+                eprintln!("                --frd-anti-firefly spells the default). --frd-max-stab-frames N");
+                eprintln!("                parses but is NOT YET WIRED (stabilization is an unbuilt phase-D item)");
                 eprintln!("  --nppd-device NPPD execution provider: auto|cpu|dml|dml:<n> (default auto = DML then CPU)");
                 eprintln!("  --check-xess  headless: XeSS dynamic-res contract self-test (no GPU or DLL needed)");
                 eprintln!("  --xess-dump   --check-xess plus G-buffer PNG dumps");

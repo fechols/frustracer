@@ -878,8 +878,16 @@ pub struct GpuContext {
     /// AccumulationMode::RESTART (set on gpu_reset, never on motion).
     nrd_hist_valid: bool,
     /// Previous frame's matrices + jitter for CommonSettings (NRD wants the
-    /// prev pair explicitly; its own contract, like dlss_prev/xess_prev).
-    nrd_prev: Option<(crate::dlss::CamMatrices, (f32, f32))>,
+    /// prev pair explicitly; its own contract, like dlss_prev/xess_prev) +
+    /// the sun direction that frame rendered with (the FRD light-motion
+    /// parallax's "prev" half; None until the session's first refresh_sky —
+    /// a sun that never moves keeps light_par exactly 0 by construction).
+    nrd_prev: Option<(crate::dlss::CamMatrices, (f32, f32), Option<[f32; 3]>)>,
+    /// The CURRENT sun direction, captured at refresh_sky — the one site
+    /// the GPU arms learn a TOD move, which fires per frame during a held
+    /// scrub (exactly when the sun moves). Read by the presenters into
+    /// nrd_frame_step's `sun` param.
+    frd_sun: Option<[f32; 3]>,
     /// NRD's consecutively-growing frame index (its contract: +1 per FRAME,
     /// restartable after a non-CONTINUE mode).
     nrd_frame_idx: u32,
@@ -1759,6 +1767,7 @@ impl GpuContext {
             nrd_gpu: None,
             nrd_hist_valid: false,
             nrd_prev: None,
+            frd_sun: None,
             nrd_frame_idx: 0,
             nrd_shed: false,
             fg: fg_state,
@@ -3310,6 +3319,10 @@ impl GpuContext {
     /// lazily AFTER the change needs nothing: `init_trace`/`init_dxr` read the
     /// scene at call time.
     pub fn refresh_sky(&mut self, scene: &crate::scene::Scene) {
+        // The FRD light-motion parallax's "cur" half: a TOD scrub fires this
+        // per frame, so the per-frame sun delta is exactly what nrd_prev's
+        // retained copy differs by (frd::oracle::light_parallax).
+        self.frd_sun = Some(scene.sun.dir.to_array());
         if let Some(t) = &mut self.trace {
             t.refresh_sky(scene);
         }
@@ -3630,6 +3643,7 @@ impl GpuContext {
                     fc,
                     jitter,
                     reset,
+                    self.frd_sun,
                     &|| d.record_nrd_pack(&d3d.list, slot),
                     &|| d.record_nrd_out(&d3d.list, slot),
                 );
@@ -3767,6 +3781,7 @@ impl GpuContext {
                     fc,
                     fc.jitter,
                     fc.reset,
+                    self.frd_sun,
                     &|| d.record_nrd_pack(&d3d.list, slot),
                     &|| d.record_nrd_out(&d3d.list, slot),
                 );
@@ -3857,7 +3872,7 @@ impl GpuContext {
     #[allow(clippy::too_many_arguments)]
     fn nrd_frame_step(
         nrd_gpu: &mut Option<DnGpu>,
-        nrd_prev: &mut Option<(crate::dlss::CamMatrices, (f32, f32))>,
+        nrd_prev: &mut Option<(crate::dlss::CamMatrices, (f32, f32), Option<[f32; 3]>)>,
         nrd_frame_idx: &mut u32,
         nrd_hist_valid: &mut bool,
         device: &ID3D12Device,
@@ -3868,6 +3883,7 @@ impl GpuContext {
         fc: &dlss::FrameConstants,
         jitter: (f32, f32),
         reset: bool,
+        sun: Option<[f32; 3]>,
         pack: &dyn Fn() -> Result<()>,
         out: &dyn Fn() -> Result<()>,
     ) -> bool {
@@ -3876,7 +3892,7 @@ impl GpuContext {
             world_to_view: fc.world_to_view,
             view_to_clip: fc.view_to_clip,
         };
-        let (pm, pj) = nrd_prev.unwrap_or((mats, jitter));
+        let (pm, pj, psun) = nrd_prev.unwrap_or((mats, jitter, sun));
         let hist_reset = reset || !*nrd_hist_valid;
         let tag = dn.tag();
         let step = pack()
@@ -3909,13 +3925,39 @@ impl GpuContext {
                     let step = (o_cur - o_prev).length();
                     let fwd = mats.world_to_view.row(2).truncate().normalize_or_zero();
                     let proj = mats.view_to_clip.y_axis.y * rh as f32 * 0.5;
-                    fg.record(list, slot, hist_reset, fc.far, proj, step, fwd.to_array())
+                    // The light-motion parallax (oracle::light_parallax —
+                    // the parked-camera moving-sun smear): with a static
+                    // camera every reprojection is the identity, so the
+                    // glint's motion under a TOD scrub is expressible only
+                    // as a history CAP; the mirror-reflected image swings
+                    // at 2× the sun's per-frame angular delta, the same
+                    // radians-at-the-hit unit as step/z, and the two SUM in
+                    // the kernel. A static sun is bit-equal across frames
+                    // ⇒ exactly 0; FR_FRD_SUNPAR is the off/gain lever.
+                    let light_par = match (psun, sun) {
+                        (Some(a), Some(b)) => {
+                            crate::frd::oracle::light_parallax(a, b) * crate::frd::sunpar_gain()
+                        }
+                        _ => 0.0,
+                    };
+                    fg.record(
+                        list,
+                        slot,
+                        &frd_gpu::FrdFrame {
+                            reset: hist_reset,
+                            far: fc.far,
+                            proj,
+                            cam_step: step,
+                            cam_fwd: fwd.to_array(),
+                            light_par,
+                        },
+                    )
                 }
             })
             .and_then(|()| out());
         match step {
             Ok(()) => {
-                *nrd_prev = Some((mats, jitter));
+                *nrd_prev = Some((mats, jitter, sun));
                 *nrd_frame_idx = nrd_frame_idx.wrapping_add(1);
                 *nrd_hist_valid = true;
                 true
@@ -4152,6 +4194,7 @@ impl GpuContext {
                     fc,
                     jitter,
                     reset,
+                    self.frd_sun,
                     &|| tg.record_nrd_pack(&d3d.list, slot),
                     &|| tg.record_nrd_out(&d3d.list, slot),
                 );
@@ -4501,6 +4544,7 @@ impl GpuContext {
                     fc,
                     fc.jitter,
                     fc.reset,
+                    self.frd_sun,
                     &|| tg.record_nrd_pack(&d3d.list, slot),
                     &|| tg.record_nrd_out(&d3d.list, slot),
                 );

@@ -145,6 +145,57 @@ pub fn tuning() -> FrdTuning {
     TUNING.get().copied().unwrap_or_default()
 }
 
+/// FR_FRD_SUNPAR — the light-motion parallax lever (read once): `off` (or
+/// `0`) = the pre-fix repro arm (the parked-camera moving-sun smear returns
+/// on demand), any non-negative float = a host-side gain on the term (the
+/// feel-test knob — the multiply happens before the CB, no shader change).
+/// Unset = 1.0. Loud on departure, and an unrecognized value is LOUD and
+/// takes the default (the FR_NGXFG rule — a silent no-op A/B walk is the
+/// failure mode the levers exist to prevent).
+pub fn sunpar_gain() -> f32 {
+    static G: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        let Ok(v) = std::env::var("FR_FRD_SUNPAR") else {
+            return 1.0;
+        };
+        let g = if v.eq_ignore_ascii_case("off") {
+            Some(0.0)
+        } else {
+            v.parse::<f32>().ok().filter(|g| g.is_finite() && *g >= 0.0)
+        };
+        match g {
+            Some(g) => {
+                eprintln!("frd: FR_FRD_SUNPAR={v} — light-motion parallax gain {g}");
+                g
+            }
+            None => {
+                eprintln!("frd: FR_FRD_SUNPAR='{v}' is not off|<gain> — using the default 1.0");
+                1.0
+            }
+        }
+    })
+}
+
+/// FR_FRD_ANTILAG=off — disarm the anti-lag brake (the widened-clamp-box
+/// ghost repro arm: pass 3 still records gains, pass 1 skips the multiply —
+/// a CB flag, never a recompile). Loud on departure; any other value is
+/// loud + the default ON.
+pub fn antilag_enabled() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| {
+        let Ok(v) = std::env::var("FR_FRD_ANTILAG") else {
+            return true;
+        };
+        if v.eq_ignore_ascii_case("off") {
+            eprintln!("frd: FR_FRD_ANTILAG=off — anti-lag brake disarmed (repro arm)");
+            false
+        } else {
+            eprintln!("frd: FR_FRD_ANTILAG='{v}' is not `off` — the brake stays armed");
+            true
+        }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // oracle — CPU twins of the FRD shader math. Every function here mirrors a
 // formula in frd_common.hlsli term for term; F0 pins the Rust side, and the
@@ -272,6 +323,17 @@ pub mod oracle {
         }
     }
 
+    /// The brake's WIRE form: g = 1/max(e, 1), so `antilag_frames(n, e) ==
+    /// n · antilag_gain(e)` EXACTLY (n/(1+(e−1)) is n/e past the box, n·1
+    /// inside — algebra, and an F0 identity pin). g ∈ (0, 1] is what rides
+    /// the R8G8_UNORM antilag plane: pass 3 stores it from the clamp
+    /// excess, pass 1 multiplies it into the reprojected n next frame —
+    /// which is what makes a ghost's rejection STICK instead of re-fighting
+    /// a 30-frame history every frame (frd_common.hlsli twin).
+    pub fn antilag_gain(e: f32) -> f32 {
+        1.0 / e.max(1.0)
+    }
+
     // -- Firefly pre-clamp -------------------------------------------------
 
     /// Soft input clamp against the 3x3 neighborhood mean: luma may exceed
@@ -285,6 +347,29 @@ pub mod oracle {
         } else {
             cap / luma
         }
+    }
+
+    // -- Light-motion parallax ---------------------------------------------
+
+    /// The moving-LIGHT specular parallax (the parked-camera moving-sun
+    /// smear fix, 2026-08-09): with a static camera every reprojection —
+    /// surface MV or any virtual-image unfold — is the identity, so a sun
+    /// moved by a TOD scrub slides its glint across a mirror with NO motion
+    /// vector able to describe it; the CAP is the mechanism. On a mirror
+    /// the reflected image swings at exactly 2× the light's angular delta,
+    /// and that angle is already the "radians at the hit" unit
+    /// `spec_max_frames`' parallax input carries (cam_step/z is the angle
+    /// the camera step subtends), so the two halves SUM and
+    /// SPEC_PARALLAX_K applies unchanged. Bit-equal directions return
+    /// EXACTLY 0.0 — the static-sun session is structurally inert (acos of
+    /// a rounded-to-0.9999999 dot is not 0, so the early-out is the
+    /// contract, not an optimization).
+    pub fn light_parallax(sun_prev: [f32; 3], sun_cur: [f32; 3]) -> f32 {
+        if sun_prev == sun_cur {
+            return 0.0;
+        }
+        let d = sun_prev[0] * sun_cur[0] + sun_prev[1] * sun_cur[1] + sun_prev[2] * sun_cur[2];
+        2.0 * d.clamp(-1.0, 1.0).acos()
     }
 
     // -- Bilateral weights -------------------------------------------------
@@ -539,6 +624,42 @@ pub mod oracle {
         // Anti-lag: in-box e leaves n alone; e=2 halves it.
         if antilag_frames(20.0, 0.5) != 20.0 || (antilag_frames(20.0, 2.0) - 10.0).abs() > 1e-5 {
             return Err("frd: antilag_frames anchors".into());
+        }
+        // The wire-form identity: antilag_frames(n, e) == n · antilag_gain(e)
+        // over an e sweep spanning both sides of the box — the algebra the
+        // R8G8_UNORM antilag plane rides on (pass 3 stores g, pass 1
+        // multiplies) — and in-box g is EXACTLY 1.0 (the common path must be
+        // bitwise inert through the multiply).
+        for e in [0.0f32, 0.5, 1.0, 1.5, 2.0, 7.5, 100.0] {
+            let (lhs, rhs) = (antilag_frames(20.0, e), 20.0 * antilag_gain(e));
+            if (lhs - rhs).abs() > 1e-4 {
+                return Err(format!("frd: antilag gain identity at e={e} ({lhs} vs {rhs})"));
+            }
+        }
+        if antilag_gain(0.5) != 1.0 || antilag_gain(1.0) != 1.0 {
+            return Err("frd: antilag gain must be exactly 1 in-box".into());
+        }
+
+        // Light parallax: bit-equal dirs EXACTLY 0 (an ABSOLUTE pin — the
+        // strafe-gate lesson: a relative bound passes any fraction of a
+        // large value, and acos of a fp-rounded self-dot is NOT 0 without
+        // the early-out); the 2× mirror-swing factor pinned at a right
+        // angle (2·π/2 = π) and at 1°; monotone; an over-unit dot (two
+        // near-identical normalized dirs) must come back finite and >= 0.
+        if light_parallax([0.0, 1.0, 0.0], [0.0, 1.0, 0.0]) != 0.0 {
+            return Err("frd: light_parallax must be exactly 0 for a static sun".into());
+        }
+        let quarter = light_parallax([1.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+        if (quarter - std::f32::consts::PI).abs() > 1e-5 {
+            return Err(format!("frd: light_parallax 2x pin at 90 deg ({quarter})"));
+        }
+        let one_deg = light_parallax([1.0, 0.0, 0.0], [0.999_847_7, 0.017_452_4, 0.0]);
+        if (one_deg - 2.0 * 0.017_453_29).abs() > 1e-3 || one_deg >= quarter {
+            return Err(format!("frd: light_parallax 1-deg anchor ({one_deg})"));
+        }
+        let ou = light_parallax([0.6, 0.8, 0.0], [0.600_000_1, 0.8, 0.0]);
+        if !ou.is_finite() || ou < 0.0 {
+            return Err(format!("frd: light_parallax over-unit dot safety ({ou})"));
         }
 
         // Firefly: under the cap the scale is EXACTLY 1.0 (the common path

@@ -31,6 +31,7 @@ static const float FRD_N_COS_DIFF = 0.9063078;
 static const float FRD_N_COS_SPEC_SMOOTH = 0.998;
 static const float FRD_SPEC_PARALLAX_K = 30.0;
 static const float FRD_RANGE_K = 0.999;
+static const float FRD_FIREFLY_K = 8.0;
 
 // The wire's enc-2 normal+roughness decode (nrd_pack_nr's inverse — the
 // nrd.rs::oracle decode twin): L1-octahedral xy, SIGNED roughness in z.
@@ -73,6 +74,25 @@ float3 frd_clamp_ycocg(float3 s, float3 fast, float sigma_l, float k) {
     float bl = k * max(sigma_l, 0.0);
     float3 bw = float3(bl, bl * FRD_CHROMA_BOX, bl * FRD_CHROMA_BOX);
     return clamp(s, fast - bw, fast + bw);
+}
+
+// oracle::firefly_scale — the soft input clamp vs the 3x3 neighborhood
+// luma mean: under FIREFLY_K x mean the scale is EXACTLY 1.0 (the common
+// path is bitwise untouched); past it the sample compresses to the cap —
+// attenuated, never deleted. A radiance scale on the YCoCg lanes only;
+// the .w hit-dist lane is NEVER scaled.
+float frd_firefly_scale(float luma, float mean3x3) {
+    float cap = FRD_FIREFLY_K * max(mean3x3, 1e-6);
+    return (luma <= cap || luma <= 0.0) ? 1.0 : cap / luma;
+}
+
+// oracle::antilag_gain — the anti-lag brake's wire form: pass 3 stores
+// g = 1/max(e, 1) (e = the clamp's |pre − fast| luma distance in box
+// widths) into the antilag plane; pass 1 multiplies it into the
+// reprojected n. antilag_frames(n, e) == n·g EXACTLY (the F0 identity
+// pin), and in-box g is exactly 1.0.
+float frd_antilag_gain(float e) {
+    return 1.0 / max(e, 1.0);
 }
 
 // --- The spatial passes' twins (frd.rs constants, LOCKSTEP) ---------------

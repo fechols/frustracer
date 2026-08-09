@@ -25,8 +25,15 @@
 //!      pass 1 reads it, pass 3 rewrites it, the inter-pass barrier orders).
 //! `force_passthrough` byte-copies IN→OUT instead — the F3 gate's control
 //! arm (the plumbing proof, kept alive for the engine's whole life).
-//! Phase D: the fp16 arm (`fp16` is the OPTIONS4 probe), LDS tile, firefly
-//! pre-clamp, anti-lag, stabilization.
+//! Phase D: the fp16 arm (`fp16` is the OPTIONS4 probe), LDS tile,
+//! stabilization. The firefly pre-clamp + anti-lag brake are BUILT
+//! (2026-08-09, the bright-specular-smear fix): pass 1 clamps the input
+//! against its 3x3 mean (flags bit 1, --frd-[no-]anti-firefly) and cuts
+//! reprojected age by pass 3's recorded clamp excess (flags bit 3,
+//! FR_FRD_ANTILAG=off — the `antilag` R8G8_UNORM plane is the feedback
+//! path, single-buffered like `slow`); the specular parallax input sums
+//! the camera term with `light_par` (the moving-sun case — see
+//! frd::oracle::light_parallax and nrd_frame_step's Frd arm).
 
 #![allow(dead_code)]
 
@@ -70,12 +77,12 @@ const T_ACCUM_S: usize = 1;
 const T_BLUR_D: usize = 2;
 const T_BLUR_S: usize = 3;
 
-const SRVS: usize = 12;
+const SRVS: usize = 13;
 const UAVS: usize = 9;
 const SET_STRIDE: usize = SRVS + UAVS;
 // Heap sets: [pass1 P0, pass1 P1, pass2 P0, pass2 P1, pass3 P0, pass3 P1].
 const SETS: usize = 6;
-const CB_DWORDS: u32 = 16;
+const CB_DWORDS: u32 = 17;
 
 // Compiled group shapes (temporal / blur+post) — the shipping defaults,
 // adopted from the 2026-08-09 B70 sweep (world parked, per-axis cells then
@@ -118,11 +125,39 @@ fn group_lever() -> ((u32, u32), (u32, u32)) {
     }
 }
 
+/// Per-frame camera/light facts for `record` — one struct so the Stage-B
+/// virtual-motion additions extend fields instead of churning the signature
+/// (three call sites: nrd_frame_step's Frd arm + the F3/F4 harnesses).
+#[derive(Clone, Copy)]
+pub struct FrdFrame {
+    /// Restart history (the caller's reset || !hist_valid).
+    pub reset: bool,
+    /// CAM_FAR — the bridge's 0.999·far range predicate (LOCKSTEP).
+    pub far: f32,
+    /// world→pixel projection scale (view_to_clip m11 · rh/2 — what turns a
+    /// world blur radius into pixels).
+    pub proj: f32,
+    /// |O_cur − O_prev| world units — the camera-translation half of the
+    /// specular parallax.
+    pub cam_step: f32,
+    /// World-space camera forward (the n·v proxy).
+    pub cam_fwd: [f32; 3],
+    /// 2× the light's per-frame angular delta in radians
+    /// (frd::oracle::light_parallax × the FR_FRD_SUNPAR gain) — the
+    /// moving-light half of the specular parallax; the two halves SUM in
+    /// the kernel. 0.0 whenever the sun is static (bit-equal directions).
+    pub light_par: f32,
+}
+
 pub struct FrdGpu {
     planes: Vec<Reg>,
     /// The recurrent slow history (single-buffered — pass 3 writes what
     /// pass 1 read this frame).
     slow: [Reg; 2], // [diff, spec]
+    /// The anti-lag feedback plane (R8G8_UNORM g_diff/g_spec, single-
+    /// buffered like `slow`: pass 1 reads it, pass 3 rewrites it — the
+    /// brake's path around pass 3's missing meta UAV).
+    antilag: Reg,
     /// hist[parity][role] — the fast/meta/geometry ping-pong.
     hist: [Vec<Reg>; 2],
     trans: Vec<Reg>,
@@ -190,6 +225,7 @@ impl FrdGpu {
         let planes: Result<Vec<Reg>> = wire_fmts.iter().map(|&f| mk(f)).collect();
         let planes = planes?;
         let slow = [mk(f16x4)?, mk(f16x4)?];
+        let antilag = mk(DXGI_FORMAT_R8G8_UNORM)?;
         let hist_fmts = [
             f16x4,                         // fast diff (YCoCg + Welford m2)
             f16x4,                         // fast spec
@@ -333,7 +369,7 @@ impl FrdGpu {
             }
         };
         for parity in 0..2usize {
-            // Pass 1 (frd_temporal.hlsl's t0..t11 / u0..u6).
+            // Pass 1 (frd_temporal.hlsl's t0..t12 / u0..u6).
             bake(
                 parity,
                 &[
@@ -349,6 +385,7 @@ impl FrdGpu {
                     &hist[1 - parity][H_META],
                     &hist[1 - parity][H_NR],
                     &hist[1 - parity][H_VZ],
+                    &antilag,
                 ],
                 &[
                     &trans[T_ACCUM_D],
@@ -372,7 +409,7 @@ impl FrdGpu {
                 ],
                 &[&trans[T_BLUR_D], &trans[T_BLUR_S]],
             );
-            // Pass 3 (t0..t6 / u0..u3).
+            // Pass 3 (t0..t6 / u0..u4).
             bake(
                 4 + parity,
                 &[
@@ -384,13 +421,14 @@ impl FrdGpu {
                     &hist[parity][H_FAST_D],
                     &hist[parity][H_FAST_S],
                 ],
-                &[&planes[P_OUT_DIFF], &planes[P_OUT_SPEC], &slow[0], &slow[1]],
+                &[&planes[P_OUT_DIFF], &planes[P_OUT_SPEC], &slow[0], &slow[1], &antilag],
             );
         }
 
         Ok(Self {
             planes,
             slow,
+            antilag,
             hist,
             trans,
             root_sig,
@@ -452,23 +490,14 @@ impl FrdGpu {
     }
 
     /// Record one frame's FRD passes between the bridge's pack and out
-    /// dispatches (the nrd_frame_step ordering). `reset` restarts history;
-    /// `far` = CAM_FAR (the bridge's 0.999·far range predicate — LOCKSTEP);
-    /// `proj` = the world→pixel projection scale (view_to_clip m11 · rh/2 —
-    /// what turns a world blur radius into pixels); `cam_step`/`cam_fwd` =
-    /// this frame's camera translation magnitude (the specular parallax
-    /// numerator) and forward vector (the n·v proxy). Every touched
-    /// resource is restored to UNORDERED_ACCESS.
-    #[allow(clippy::too_many_arguments)]
+    /// dispatches (the nrd_frame_step ordering); `f` carries the per-frame
+    /// camera/light facts (see FrdFrame). Every touched resource is
+    /// restored to UNORDERED_ACCESS.
     pub fn record(
         &self,
         list: &ID3D12GraphicsCommandList,
         _slot: usize,
-        reset: bool,
-        far: f32,
-        proj: f32,
-        cam_step: f32,
-        cam_fwd: [f32; 3],
+        f: &FrdFrame,
     ) -> Result<()> {
         let _ev = super::pix::scope(list, c"frd");
         let npsr = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
@@ -497,13 +526,19 @@ impl FrdGpu {
 
         let parity = (self.frame_idx.get() & 1) as usize;
         let t = crate::frd::tuning();
+        // flags: bit 0 = reset | bit 1 = firefly pre-clamp (the
+        // --frd-[no-]anti-firefly lever, DEFAULT ON — it is the bright-
+        // trail killer) | bit 3 = anti-lag (FR_FRD_ANTILAG=off disarms).
+        let flags = (f.reset as u32)
+            | ((t.anti_firefly.unwrap_or(true) as u32) << 1)
+            | ((crate::frd::antilag_enabled() as u32) << 3);
         let cb = |pass_scale: f32, salt: u32| -> [u32; CB_DWORDS as usize] {
             [
                 self.rw,
                 self.rh,
-                reset as u32,
+                flags,
                 self.frame_idx.get(),
-                far.to_bits(),
+                f.far.to_bits(),
                 // Clamped to the meta wire cap: a larger value would truncate
                 // at the n/63 UNORM encode anyway — clamp HERE so the CB and
                 // the wire agree (the parse already noted it).
@@ -514,14 +549,15 @@ impl FrdGpu {
                 .to_bits(),
                 (t.fast_frames.map_or(crate::frd::FAST_FRAMES, |v| v as f32)).to_bits(),
                 (t.clamp_sigma.unwrap_or(crate::frd::CLAMP_SIGMA)).to_bits(),
-                cam_step.to_bits(),
-                cam_fwd[0].to_bits(),
-                cam_fwd[1].to_bits(),
-                cam_fwd[2].to_bits(),
-                proj.to_bits(),
+                f.cam_step.to_bits(),
+                f.cam_fwd[0].to_bits(),
+                f.cam_fwd[1].to_bits(),
+                f.cam_fwd[2].to_bits(),
+                f.proj.to_bits(),
                 (t.blur_radius.unwrap_or(crate::frd::R_MAX)).to_bits(),
                 pass_scale.to_bits(),
                 salt,
+                f.light_par.to_bits(),
             ]
         };
         let gpu0 = unsafe { self.heap.GetGPUDescriptorHandleForHeapStart() };
@@ -556,6 +592,7 @@ impl FrdGpu {
             for r in &self.slow {
                 Self::to_state(r, npsr, &mut b);
             }
+            Self::to_state(&self.antilag, npsr, &mut b);
             unsafe { list.ResourceBarrier(&b) };
             let c = cb(1.0, 0);
             unsafe {
@@ -596,6 +633,7 @@ impl FrdGpu {
             for r in &self.slow {
                 Self::to_state(r, ust, &mut b);
             }
+            Self::to_state(&self.antilag, ust, &mut b);
             unsafe { list.ResourceBarrier(&b) };
             let c = cb(1.7, 41);
             unsafe {
