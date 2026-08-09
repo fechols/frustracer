@@ -26,6 +26,13 @@ rays also seed their traversal from that cut. Default hardware
 leaf rays cannot accept an arbitrary BVH frontier, so they restart at the TLAS
 root and consume only the inherited `tmin`.
 
+Lighting is **real-time ray-traced global illumination**: one cosine-sampled
+bounce ray per pixel per frame, in all three render modes, with real emissive
+transport — bounce hits carry what they emit. Cosine importance sampling makes
+that one sample the irradiance estimate directly, so the temporal
+denoisers/upscalers converge it at 1 spp under motion, and a still frame can
+additionally switch to the converged hemisphere integrator (**H**).
+
 ### Result so far
 
 This is a research prototype, not a claim that a quadtree universally beats
@@ -346,6 +353,12 @@ cargo run --release -- model.obj     # or just load your own OBJ / glTF / GLB
 | **F11** | | borderless fullscreen |
 | **P** | | screenshot |
 
+An Xbox controller is fully supported: stick deflection is analog flight speed,
+triggers fly down/up, the bumpers are the precision divisors, and the D-pad
+scrubs time of day. Input is sampled at ~500 Hz on its own thread, so a long
+frame never eats a keypress — displacement is a function of how long you held
+the key, not of the framerate.
+
 ### Render modes and image quality
 
 | Key | Action |
@@ -355,10 +368,9 @@ cargo run --release -- model.obj     # or just load your own OBJ / glTF / GLB
 | **G** / **K** / **X** | toggle the wired upscaler (DLSS-RR / FSR / XeSS) against plain |
 | **N** / **M** | OIDN denoising; its temporal history |
 | **J** | NPPD neural denoising |
-| `--no-nrd` | NRD (ReBLUR) pre-upscale ray reconstruction is ON by default in XeSS/FSR3 sessions — the non-neural denoiser that takes them below DLSS-RR-class flicker (`install-prerequisites.bat nrd` builds the SDK; this is the kill lever) |
 | **U** | double samples per pixel (1 → 2 → … → 128 → 1) |
 | **1 2 3** | quality presets |
-| **H** | hemisphere bounces: off → AO → GI (still frames) |
+| **H** | hemisphere bounces: off → AO → GI — the converged still-frame tiers, which take over from the always-on real-time GI while a still frame accumulates |
 | **V** | heightfield relief vs plain normal mapping (`--heightfield` sessions) |
 
 ### Debug
@@ -370,6 +382,7 @@ cargo run --release -- model.obj     # or just load your own OBJ / glTF / GLB
 | **T** | dynamic resolution vs fixed half-res while moving |
 | **C** | verify the current view against a reference trace |
 | **B** | GPU vs CPU tonemap |
+| **I** | wave-footprint overlay (GPU arms — every pixel wears its wave's ticket color; see `--waveviz` below) |
 | **Y** / **Z** | freeze the view's quadtree into the scene / clear it |
 
 ---
@@ -408,16 +421,25 @@ each one's A/B is how its cost was measured in the first place.
 
 | Feature | Off switch | In-app |
 |---|---|---|
+| Real-time GI — one cosine-sampled bounce ray per pixel per frame, every render mode, with real emissive transport | `--no-rtgi` | |
 | Volumetric clouds — a drifting, curl-warped slab that shadows the sun | `--no-clouds` | |
 | Time of day, moon, and stars — the sun sets, the moon becomes the light, the star field lights the scene | `--tod <h>` to pin | **,** / **.** |
 | Wind-swayed foliage — 7.3 M triangles moving as real geometry, with real motion vectors | `--no-foliage-sway`, `--foliage-amp <x>` | |
 | Fireflies after dusk — real point lights with hard shadows | `--no-fireflies` | |
-| Hemisphere-bounce GI / AO — the quadtree idea aimed at the light integral | (opt-in) | **H** |
+| Emissive surfaces light the scene — clustered into ≤ 64 disc lights, one tinted shadow ray each: bistro's street lamps, the helmet's visor | (opt-in `--emissive-lights [N]`; auto-armed in XeSS/FSR3 sessions, `--no-emissive-lights` vetoes) | |
+| Game water — ripples off an integrable analytic height field, true refraction, tinted shadows, Beer–Lambert depth fog, aerated spray | `--no-water`, `--no-tinted-shadows`, `--no-depth-tint`, `--no-spray` | |
+| Detail texturing — Unreal-1-style close-up grain, cavity AO, horizon-marched micro sun-shadows, on textured and untextured materials alike | `--no-detail-tex`, `--no-detail-ao`, `--detail-strength <k>` | |
+| Surface detail that survives distance — slope-space normal-map mips, spec-AA (what a mip averages away widens the GGX lobe instead of vanishing), an amplified ambient bump response | `--no-slope-mips`, `--no-spec-aa`, `--no-amb-bump` | |
+| Hemisphere-bounce GI / AO — the quadtree idea aimed at the light integral: converged still-frame tiers that take over from the real-time bounce | (opt-in) | **H** |
 | Heightfield relief — real displaced geometry at the intersector | (opt-in `--heightfield`) | **V** |
 | The upscaler chain — DLSS-RR → FSR4-RR → XeSS → FSR 3.1, first supported wins | `--no-upscale` | **G** / **K** / **X** |
+| NRD (ReBLUR) pre-upscale denoising — what makes XeSS/FSR 3.1 peers of the RR engines: still-view flicker 0.42 → 0.07–0.10 /255, below DLSS-RR's ~0.12 (`install-prerequisites.bat nrd` builds the SDK) | `--no-nrd` | |
+| OIDN and NPPD — the alternate denoisers: temporal-reprojected Open Image Denoise, and a neural one on ONNX Runtime / DirectML | (opt-in `--oidn` / `--nppd`) | **N** / **J** |
 | Frame generation — three families, whichever the adapter supports | `--no-fg` | |
+| Auto-exposure — a display-stage aperture for enclosures (San Miguel's patio sits 2–3 stops under a lit exterior) | (opt-in `--auto-exposure`; `--exposure-bias <EV>` is the manual lever) | |
 | HDR output — one 10-bit swapchain: HDR10/PQ on an HDR-on display, deep-colour gamma elsewhere | `--no-hdr` | |
 | Glare — the reason the sun looks like a sun | `--no-bloom` | |
+| Mip chains + trilinear + 16× anisotropic filtering — one ray-cone LOD, all three renderers | `--no-mips`, `--aniso <n>` | |
 | BC7 texture compression, encoded on the GPU at load | `--no-bc7` | |
 | Per-island ambience + procedural wind | `--no-audio` | |
 
@@ -555,9 +577,15 @@ Real flags, all of them measured rather than guessed.
 | `--dxr-sbt 0\|1\|2\|3` | The material-sorted SBT ladder: 8 material classes as per-class TLAS instances into a class-major SBT — 1 = alias records (sort keys only), 2 = per-class specialized hit shaders, 3 = recursive per-class dispatch (needs `--dxr-inline 0`). See the sorted-SBT ladder section |
 | `--continuation-rays` | Software prototype: beam-produced opaque traversal frontier reused by leaf rays (`--sw-rays` is the technical alias) |
 | `--continuation-rays --no-cut-rays` | Direct control: same software intersector and `t_start`, but start every leaf ray at the root (and skip the terminal cut nothing there consumes) |
+| `--no-temporal` \| `--no-replay` \| `--no-adopt` \| `--discard-seeds` | The temporal-reuse A/B ladder: no cross-frame reuse at all / keep seeding but re-trace static frames / keep seeding but never adopt old cuts / run the whole machinery and consume nothing — the last isolates its cost from its benefit |
 | `--spin path` | The deterministic benchmark: a closed camera loop, pose a pure function of frame index |
 | `--spin-hybrid`, `--spin-plain` | Select the quadtree or root-traversal arm for CPU/`--gpu` benchmarks (`--dxr` has only its DXR arm) |
 | `--spin-warmup N` | Exclude leading frames; defaults to 1600 on Intel and 20 elsewhere. A *defaulted* `--spin-frames` is extended so the timed span still covers a whole 600-frame lap |
+| `--cam ex,ey,ez,tx,ty,tz` | Start camera — reproducible viewpoints for benchmarks and screenshots |
+| `--lock-res native\|quality\|0.75\|dynamic` | Render-resolution lock (default `native` — the wired upscaler runs DLAA-shaped) or step-wise dynamic resolution |
+| `--no-vsync` | Uncapped presentation, so interactive frame times measure the renderer instead of the monitor |
+| `--dual-gpu [N]` \| `--dual-gpu-auto` | Split the frame across two adapters — the secondary renders N of 8 tile rows, either pipeline on either device. Measured honestly: it **loses** interactively on this box (the second slot is electrically x4, and the band transfer costs more than the tracing it offloads), and wins 4–8% on `--cinematic` GI captures, where the band crosses once per *output* frame. The auto balancer converges its share and prints the verdict |
+| `--hdr10` \| `--no-hdr10` \| `--no-hdr` | The display three-way: force PQ / force 10-bit gamma (deep-colour SDR) / legacy 8-bit. `--hdr-paper-white <nits>` sets where linear 1.0 lands; `--hdr-peak <nits>` overrides the probed display peak |
 | `FR_ABL=oldcut,nobatch` | Reconstruct the pre-B70-pass wavefront queue code for a pixel-identical performance A/B |
 | `FR_WIDTH=1` | Every real kernel reports its **compiled** SIMD width (`WaveGetLaneCount()` from inside the kernel — the register-pressure choice a trivial probe can't see); printed at the spin accounting line, the check suites, and the C-key verify |
 | `FR_BALLAST=N` \| `dxr:N` | Inject N provably-live floats into the reference kernel, or (`dxr:N`) the identical-code mode-2 DXR raygen (image bit-identical) — sweep both to compare the compute spill knee against the RT launch regime's pricing; see the register-cliff paragraph |
@@ -565,6 +593,10 @@ Real flags, all of them measured rather than guessed.
 | `--stress 5000` | A procedural field of 5000 objects |
 | `--tile 4x2` | Replicate a loaded scene into a grid — the 100-million-triangle path |
 | `--bvh-builder sah\|lbvh\|ploc\|som` | Swap the BVH builder, including a self-organising-map "learned space-filling curve" (it loses) |
+| `--bvh-ctrav 3 --bvh-axes 3 --bvh-maxleaf 8` | The SAH build knobs at their defaults — the memory lever, the speed lever, the leaf cap; build params key the scene cache, so sweeps never collide with a stale sidecar |
+| `--el-cluster grid\|som` | Emitter-placement bake-off for the emissive-light clusterer (`som` = power-weighted batch-SOM refinement — exactly weighted Lloyd's) |
+| `--fsr-max-radiance 10` (+ 5 siblings) | FSR Ray Regeneration denoiser tuning — firefly clamp, stability bias, radiance clip, disocclusion threshold, normal strength, kernel relaxation; each unset means the provider's own default |
+| `--nrd-perf`, `--nrd-max-stabilized-frames 0`, … | ReBLUR performance-mode DLL + the runtime tuning family — the levers that trade denoise quality back into frame time |
 | `--spp 16` | Samples per pixel per frame; the quadtree is traced once regardless |
 | `--check`, `--check-gpu`, `--check-dxr` | The test suite (see below) |
 | `--gpu-timing` | Per-pass GPU milliseconds, every vendor — the only per-pass profiler that works on Arc |
@@ -605,6 +637,11 @@ settings.
 **`--fsr4` exits with code 2.** That is deliberate: `--fsr4` *requires* FSR4 +
 Ray Regeneration (RDNA4). It tells you why and what to try instead. Use
 `--fsr` if you want it to fall through.
+
+**It crashed.** The crash handler already wrote `frustracer-crash-<pid>.txt`
+and a `.dmp` next to the executable, with one symbolized stack that crosses
+the Rust/C++/vendor-DLL boundary — attach both to an issue. `--no-crash-handler`
+disables it; `FR_CRASH_TEST=cpp` faults on purpose to prove the plumbing.
 
 **A binary I built elsewhere crashes.** `.cargo/config.toml` sets
 `-C target-cpu=native`. Build with `-C target-cpu=x86-64-v3` to distribute.
@@ -715,8 +752,9 @@ exercised).
 
 Secondary lighting is an integral of incoming light over the hemisphere above
 each shading point — and the same divide-and-conquer that drives the screen
-quadtree can dispatch that search (**H** cycles it: off → AO → GI; still frames
-only).
+quadtree can dispatch that search (**H** cycles it: off → AO → GI; these are
+the converged still-frame tiers, which take over from the always-on real-time
+GI bounce described at the end of this section).
 
 The hemisphere is a quadtree too, but built from **spherical triangles**
 instead of squares: the root is the tangent half-space (a 1-plane frustum),
@@ -763,6 +801,20 @@ scene — but it is *converged* immediately where the sampled path needs
 hundreds of accumulation frames, and open scenes adapt (most of the
 hemisphere resolves analytically at octant scale).
 
+**Real-time GI** is this machinery's other delivery, and it is the default:
+instead of a whole hemisphere tree per point, every pixel of every frame runs
+the integrator's *leaf policy* once — one cosine-sampled bounce ray, whose hit
+shades with a shadow ray, an AO ray, and the SH sky standing in for deeper
+bounces, and whose miss returns the sun-free sky gather. Cosine importance
+sampling makes that single sample the irradiance estimate directly (no π to
+divide by), so plain accumulation converges it on stills and the temporal
+denoisers launder it at 1 spp under motion — real one-bounce GI, with real
+emissive transport, in all three render modes. Measured cost: +10% on the CPU
+tracer (the resolution controller absorbs it), ~+0.05 ms on a 4090,
++0.121 ms on the Arc B70. `--no-rtgi` reverts to flat SH-sky × AO ambient,
+byte-identical to the pre-feature renderer; the **H** tiers, when cycled on
+for a still frame, supersede the bounce rather than stack on it.
+
 **Shadow shafts** (removed) applied the same machinery to the light: a frustum
 from the shading point through the *rectangular* light's corners, subdivided
 once on ambiguity, so samples landing in a subrect proven empty skipped their
@@ -799,9 +851,11 @@ separable object.)
 light path.** A ray sees the disc only if no light-sampling strategy already
 covers the sun along that path — the camera's own miss and refraction through
 glass see it (nothing else delivers it there); every *gather* path (the
-hemisphere integrator's cells, GI bounce misses, the SH projection itself)
+hemisphere integrator's cells, the always-on real-time GI bounce's miss, the
+SH projection itself)
 integrates the **sun-free dome**, because the direct-lighting loop already
-delivered the sun with its own shadow ray. The specular reflection ray is the one
+delivered the sun with its own shadow ray — so the invariant holds per frame
+under motion, not just on converged stills. The specular reflection ray is the one
 path both strategies can reach, so it takes the dome plus a **MIS-weighted** disc
 (balance heuristic; zero extra rays, zero extra random draws). Get the gather
 paths wrong and you double-count the sun *and* fire fireflies into the
@@ -831,6 +885,20 @@ cells, the GI bounce misses and both reference estimators all pass no
 fireflies. Direct lighting already delivers them with a shadow ray, so a gather
 that also saw them would double-count — the same argument as the sun, applied
 to a local light.
+
+**Emissive surfaces** (`--emissive-lights`) get the same treatment with the
+GI rule *inverted*. At load, every emissive triangle is clustered into at most
+64 disc lights, each sampled in the direct tier with one tinted shadow ray —
+that is what puts pools of light under bistro's street lamps. But an emitter,
+unlike a firefly, has real geometry the gather paths can *hit*, so under the
+hemisphere integrator the cluster sampling drops instead of the gather: rays
+that land on an emitter pick up its true textured emission with true soft
+shadows, which is exact where the cluster is an approximation. And under
+real-time GI the bounce's emissive pickup and the cluster sampling trade off
+per frame the same way — exactly one mechanism delivers emitter-as-light per
+path, ever. (XeSS/FSR 3.1 sessions arm the clusters by default: a TAA-style
+neighborhood clamp rejects the bounce's sparse stochastic emissive, so those
+sessions need the deterministic delivery.)
 
 The renderer previously had *two* suns that disagreed: a soft `dot^32` glow in
 the sky (a backdrop, too bright to be a light) and, separately, a 4×4 rectangular
