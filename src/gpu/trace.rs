@@ -672,6 +672,41 @@ fn lane_stack() -> u32 {
     })
 }
 
+/// The serial traversal-stack LAYOUT lever (`FR_STACK_LAYOUT=lane|depth`).
+/// DEFAULT = DEPTH-major (2026-08-09): `g_stack[sp * 32 + lane]` puts a
+/// wave's simultaneous accesses at one depth in consecutive SLM words —
+/// conflict-free on Xe2's 16 banks x 4 B — where the v1 lane-major layout
+/// (`lane * LANE_STACK + sp`) strode lanes LANE_STACK*4 B apart, a multiple
+/// of 64 B at every legal FR_LSTACK: the textbook 16-way bank serialization
+/// on every push/pop (Intel oneAPI guide, SLM banking). MEASURED A WASH on
+/// an Arc Pro B70 everywhere the serial path runs — `--no-wide-levels`
+/// serial ladders (default/stress spans within ±0.006) and the hemi-gi
+/// bench (±0.2%) — because these kernels are global-memory-latency-bound:
+/// every stack op sits beside a BvhNode/FtNode fetch, and the LDS
+/// serialization hides entirely under it. Depth-major ships anyway as the
+/// no-downside conflict-free form (bit-identical by construction — a pure
+/// address remap — so unlike the gw_* lesson there is no behavior to
+/// regress); `lane` restores v1 for the A/B. Loud on departure AND on an
+/// illegal value (the FR_WIDE rule).
+fn stack_layout_def() -> &'static str {
+    static S: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    *S.get_or_init(|| match std::env::var("FR_STACK_LAYOUT") {
+        Err(_) => "",
+        Ok(v) if v == "depth" => "",
+        Ok(v) if v == "lane" => {
+            eprintln!(
+                "gpu: FR_STACK_LAYOUT=lane — v1 lane-major g_stack (16-way SLM bank \
+                 conflicts on Xe2; the A/B arm)"
+            );
+            "\n#define STACK_LANE_MAJOR 1"
+        }
+        Ok(v) => {
+            eprintln!("gpu: FR_STACK_LAYOUT={v:?} unrecognized (legal: lane, depth) — using depth");
+            ""
+        }
+    })
+}
+
 /// The `--no-wide-levels` A/B lever. When false, every quadtree level runs the
 /// one-thread-per-tile `cs_level` (the pre-cooperative ladder), so the feature
 /// can be measured against its own absence — the codebase's standard perf A/B.
@@ -3292,9 +3327,9 @@ fn abl_has(tag: &str) -> bool {
 /// direction (the operator investigates a working arm instead of trusting a
 /// dead one), but keep the list current.
 const ABL_GPU_TAGS: &[&str] = &[
-    "sunt", "rough", "nogbuf", "nopack", "nowave", "noelcull", "noffcode", "noelcode", "oldcut",
-    "nobatch", "nocandtmin", "noalpha", "noheight", "notrans", "tzero", "noshadow", "noao",
-    "norefl", "noglass", "nogi", "nosec",
+    "sunt", "rough", "nogbuf", "nopack", "nowave", "wavegw", "noelcull", "noffcode", "noelcode",
+    "oldcut", "nobatch", "nocandtmin", "noalpha", "noheight", "notrans", "tzero", "noshadow",
+    "noao", "norefl", "noglass", "nogi", "nosec",
 ];
 
 /// One loud line per process when FR_ABL is set at all — the GPU twin of
@@ -3584,24 +3619,29 @@ pub(crate) fn abl_defs() -> String {
         // the image is garbage BY DESIGN; these are cost probes, never levers.
         ("nogbuf", "ABL_NOGBUF"),
         ("nopack", "ABL_NOPACK"),
-        // Back to one LDS/global atomic per lane per candidate, in place of
-        // the wave-aggregated primitives (ctr.hlsli's ctr_add/ctr_bump and
-        // wavefront.hlsl's gw_alloc/gw_min_if). `FR_ABL=nobatch,nowave` is the
-        // full pre-wave-pass queue code.
+        // Everything back to one LDS/global atomic per lane per candidate —
+        // since the 2026-08-09 gw flip this means ctr.hlsli's ctr_add/
+        // ctr_bump only (the still-wave-aggregated half; the frontier's
+        // gw_alloc/gw_min_bits are plain-atomic BY DEFAULT now, so for them
+        // nowave is a no-op that also OVERRIDES a simultaneous wavegw).
+        // `FR_ABL=nobatch,nowave` remains the full pre-wave-pass queue code.
         //
         // DUAL-HOMED (2026-08-01): this row reaches ctr.hlsli's consumers
         // (leaf/sky/hemi/reference, via `defs`), and wavefront_ablation_defs
-        // emits the SAME define for the tile unit, whose gw_alloc/gw_min_bits
-        // are the feature's other half. The consumers straddle the
-        // shader-cache split, so nowave is the one arm that legitimately
-        // churns BOTH caches when flipped. Until the dual-homing the tile
-        // unit never saw the define at all, and every recorded nowave A/B —
-        // the "wave aggregation measured neutral" verdict included — compared
-        // a HALF-ARMED configuration (leaf-side neutralized, tile-side still
-        // wave-cooperative): the probe-reach trap's third instance, from
-        // inside the very comment that warned about it. Unlike its neighbours
-        // this is a PERF arm, not a cost probe — both sides publish identical
-        // counter totals and an identical `best`, so the image is unmoved.
+        // emits the SAME define for the tile unit (which also pastes
+        // ctr.hlsli, and whose gw guard reads it as the override above). The
+        // consumers straddle the shader-cache split, so nowave is the one arm
+        // that legitimately churns BOTH caches when flipped. Until the
+        // dual-homing the tile unit never saw the define at all, and every
+        // recorded nowave A/B — the "wave aggregation measured neutral"
+        // verdict included — compared a HALF-ARMED configuration (leaf-side
+        // neutralized, tile-side still wave-cooperative): the probe-reach
+        // trap's third instance, from inside the very comment that warned
+        // about it. Fully armed, the A/B REVERSED the gw half's verdict —
+        // which is why the default flipped; see wavefront.hlsl's gw block.
+        // Unlike its neighbours this is a PERF arm, not a cost probe — both
+        // sides publish identical counter totals and an identical `best`, so
+        // the image is unmoved.
         ("nowave", "ABL_NO_WAVE_OPS"),
         // The leaf kernel's per-tile emissive light cull back to the full
         // mask (leaf.hlsl's el_mask block; emissive::cull_abl is the CPU
@@ -3663,11 +3703,13 @@ pub(crate) fn abl_defs() -> String {
 /// cannot perturb the reference/leaf shader cache. `FR_ABL=oldcut,nobatch`
 /// reconstructs the pre-B70-pass queue code for an executable A/B without
 /// editing HLSL. `nowave` is the deliberate exception — emitted BOTH here and
-/// in `abl_defs`, because its consumers straddle the cache split (gw_alloc/
-/// gw_min_bits live in wavefront.hlsl, ctr_add/ctr_bump in ctr.hlsli): an arm
-/// that reaches only one side measures half a feature while reporting the
-/// whole one, which is exactly what happened until 2026-08-01 (see the
-/// abl_defs row's comment).
+/// in `abl_defs`, because its consumers straddle the cache split (the tile
+/// unit pastes ctr.hlsli too, and its gw guard reads the define as the
+/// wavegw override): an arm that reaches only one side measures half a
+/// feature while reporting the whole one, which is exactly what happened
+/// until 2026-08-01 (see the abl_defs row's comment — the fully-armed A/B is
+/// what flipped the gw default to plain atomics on 2026-08-09). `wavegw`
+/// (the gw re-arm) is tile-unit-only and lives here alone.
 fn wavefront_ablation_defs() -> String {
     let mut out = String::new();
     if abl_has("oldcut") {
@@ -3681,6 +3723,15 @@ fn wavefront_ablation_defs() -> String {
     // define is never emitted twice into one source.
     if abl_has("nowave") {
         out.push_str("#define ABL_NO_WAVE_OPS 1\n");
+    }
+    // Re-arm the frontier's wave-aggregated gw_alloc/gw_min_bits (plain
+    // atomics are the DEFAULT since the 2026-08-09 verdict flip — see
+    // wavefront.hlsl's gw block). Tile-unit-only by construction: the gw
+    // helpers live nowhere else, so this arm needs no abl_defs twin. A
+    // simultaneous `nowave` wins (the guard is
+    // `defined(ABL_WAVE_GW) && !defined(ABL_NO_WAVE_OPS)`).
+    if abl_has("wavegw") {
+        out.push_str("#define ABL_WAVE_GW 1\n");
     }
     out
 }
@@ -5895,7 +5946,7 @@ impl TraceGpu {
         // (cs_level_wide 54 VGPR against cs_leaf's 216). Injected into exactly
         // the units that paste frustum.hlsli; the work graph inherits it through
         // wavefront_src. See lane_stack() before sweeping it.
-        let ls_defs = format!("#define LANE_STACK {}u", lane_stack());
+        let ls_defs = format!("#define LANE_STACK {}u{}", lane_stack(), stack_layout_def());
         let ls_defs = ls_defs.as_str();
         // The cbuffer's jitter-table size (--spp) — every unit sees the cbuffer.
         let sd = spp_defs();

@@ -4176,7 +4176,77 @@ decomposes the pair cleanly: the HOMOGENEOUS-BATCH half is a keeper, and the `gw
 aggregation is the whole regression — small (~1-3% span, 5-10% ladder), cross-vendor, and
 invisible for a month because the revert arm never reached it. The "costs nothing" premise above
 is retired; flipping the gw half back to plain atomics (keeping ctr.hlsli's, which the old
-half-armed A/B measured correctly as neutral) is the open follow-on.
+half-armed A/B measured correctly as neutral) is the open follow-on — PAID 2026-08-09, see the
+Battlemage-guide campaign below.
+
+**THE 2026-08-09 BATTLEMAGE-GUIDE CAMPAIGN — the B70 optimization guide
+(`C:\Docs\Intel\B70\B70_OPTIMIZATION.md`, the oneAPI guide translated to graphics vocabulary)
+cross-referenced against this tree; the untaken items built and MEASURED, most of them to a
+NO.** One measurement trap first: a CONCURRENT session was benchmarking the B70 during the
+first pass — caught mid-campaign (a live foreign frustracer PID), every B70 verdict re-taken
+on a quiet box, and the contaminated pair read nearly identical to the clean one (the
+contender was parked/idle — a CONSTANT background load preserves deltas), but only the
+re-measure could prove that. Check `Get-Process frustracer` before believing any interactive
+A/B on this box. The verdicts, each behind its lever:
+
+- **gw_* frontier aggregation → plain atomics, SHIPPED** (the follow-on above; user-approved).
+  Only wavefront.hlsl's gw_alloc/gw_min_bits flipped — ctr.hlsli's global-counter halves keep
+  their wave forms (measured neutral) and the homogeneous batch stays. `FR_ABL=wavegw` re-arms
+  the aggregation (tile-unit-only; a simultaneous `nowave` wins); pixel-identical both ways.
+  Clean-box flip-day numbers: B70 default span 0.854/0.854 plain vs 0.857/0.858 wavegw (plain
+  ahead in every interleaved rep), stress dead even; 4090 default 0.420 vs 0.430. The 08-01
+  ladder magnitudes did not reproduce (tree drift — leaf grew RTGI/spec-aa); the default
+  stands on plain-never-loses + both vendors' small edges + simpler code.
+- **g_stack DEPTH-MAJOR transpose (guide §6.3), SHIPPED AS A WASH** — the one genuinely new
+  find: the serial DFS stack's `lane * LANE_STACK + sp` indexing strode lanes 64 B apart, the
+  exact 16-banks×4-B pathology, at EVERY legal FR_LSTACK (all powers of two). The transpose
+  (`GS_AT` in frustum.hlsli, covering the binary AND ftree bodies; `FR_STACK_LAYOUT=lane`
+  restores v1) measured a WASH everywhere the serial path runs — --no-wide-levels ladders
+  bit-repeatable at ±0.002 (ladder-sum 0.385 vs 0.385 default, 1.592 vs 1.594 stress), hemi-gi
+  bench ±0.2% — because every stack op sits beside a BvhNode/FtNode GLOBAL fetch and the SLM
+  serialization hides entirely under it. Ships anyway as the no-downside conflict-free form
+  (bit-identical by construction — a pure address remap, unlike the gw lesson there is no
+  behavior to regress); the shipping 1080p config barely touches the path at all (wide levels
+  alias the slab flat, conflict-free).
+- **Cloud coarse-march `[unroll]` → `[loop]`, SHIPPED** (trace_common.hlsli:~1011): the 6
+  inlined bodies sat in spill-knee territory; clean-box B70 span 0.865/0.868 → 0.850/0.854
+  default and 1.258 → 1.242 stress (leaf 0.649 → 0.638), 4090 a wash, FR_WIDTH unmoved
+  (SIMD16 — spill traffic, not width). One token, no lever.
+- **FR_DXR_LEAN → Intel VENDOR DEFAULT, SHIPPED** (the third vendor_defaults-family entry,
+  applied at the call-site re-store block in run_window beside set_inline_mode): Intel +
+  resolved mode 2 + sbt 0 arms the raygen-only RTPSO (the finding-1 audit's measured 12-18%
+  of dxr-rays back on real scenes; 4090 nil). `FR_DXR_LEAN=1|0` is the explicit force/veto
+  (lean_env), headless never runs the policy — --check-dxr gates both arms off the
+  environment alone. Smoke-verified live on the B70 (announce + veto lines).
+- **Record-load scalarization (guide §7.3): NO** — WaveReadLaneFirst on the per-group
+  LeafRec/SkyRec/TileRec loads measured a wash (B70 leaf 0.645 → 0.643) and was dropped;
+  ~2.4k record loads/frame is noise next to the ray work.
+- **NRD/ReBLUR per-resource barrier narrowing (guide §11.2): NO** — built (per-resource UAV
+  barriers on exactly the untransitioned STORAGE bindings each DispatchDesc names), gated
+  green (N-suite + GBV clean, both vendors), and measured a WASH on clean-box parked B70 NRD
+  sessions (span 6.145/6.144 global vs 6.153/6.132 narrow; nrd region 1.19 both): ReBLUR's
+  ~31 dispatches are FULL-SCREEN — each fills the machine, so there is no cross-dispatch
+  overlap for narrowing to unlock. Global stays the default; `FR_NRD_BARRIER=narrow` keeps
+  the arm compiled for a future driver.
+- **f16 register-pressure attack (guide §12.1): CLOSED WITHOUT CODE** — the DFS stash the
+  strip sweep indicted is ~16 dwords of which 13 are GEOMETRY (ray origin/dir, hit t/uv)
+  that cannot f16-quantize without breaking the eps-offset discipline (f16 granularity at
+  world scale ±70 is ~0.03 vs eps ≈ 7e-3); the packable 2-3 registers are irrelevant below
+  the knee (the ballast campaign measured ~56-60 floats of headroom in the reference class)
+  and orders too small above it. Scoped `half` arithmetic (`-enable-16bit-types`) was gated
+  on this showing headroom and is NOT taken: the u32-exact/precise/near-f16-max exclusion
+  list carves out most of the shade path, and FR_WIDTH shows SIMD16 is sticky for RayQuery
+  kernels regardless. The measured route to the spill knee remains kernel SPLITTING (the
+  mode-3 follow-on), not packing.
+
+Guide items already fought and won here, so nobody re-derives them: group sizing/dispatch
+rounds (the leaf-frontier and cs_sky campaigns), zero-LDS RT kernels (the L1 rule), wave
+intrinsics (the ctr/gw split verdict above), spills (FR_BALLAST/FR_WIDTH), ExecuteIndirect
+(the ladder), readback rings (gputime/autoexp), 32-KB-safe SLM (2 KB slab). Deliberately NOT
+taken, with reasons: async compute (user-deferred; concurrency unverified on B70, and the
+LDS/RT-overlap discipline argues against casual pairing), `[WaveSize]` (documented — forces
+the spill the compiler avoids by narrowing), ReBAR GPU_UPLOAD for the 4.5 KB FrameCb
+(negligible traffic), the hemi batch's ~2500 barriers (opt-in still-frame mode).
 
 **THE 2026-08-01 PRESSURE/OCCUPANCY CAMPAIGN — the remaining questions answered behaviorally.**
 (1) DEAD-ARM REGISTER PRESSURE (the LEAF_NO_FB class) is real but MARGINAL on Xe2:

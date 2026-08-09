@@ -75,9 +75,13 @@ uint flat_group(uint3 gid) { return gid.y * 32768u + gid.x; }
 // tile its own thread, and leaf.hlsl's hemi-point counter fires once per hit
 // PIXEL (~2M to a single address at 1080p). Folding a wave into one atomic is
 // Intel's own prescription — their RT developer guide (v4, p.26) says to keep
-// data within a wave and use wave intrinsics rather than shared-memory traffic,
-// which matters more on Intel because groupshared is carved from the same L1
-// that services the RT unit — and it is a win on every vendor.
+// data within a wave and use wave intrinsics rather than shared-memory
+// traffic. VERDICT SPLIT (2026-08-01/09): THIS half — GLOBAL-memory counters,
+// where contention is genuinely expensive — measured neutral and keeps its
+// wave forms; the FRONTIER half (wavefront.hlsl's gw_alloc/gw_min_bits, whose
+// targets are cheap on-chip GROUPSHARED words) measured a cross-vendor
+// regression once the A/B was fully armed and reverted to plain atomics —
+// see the gw block's header for the numbers and the FR_ABL=wavegw re-arm.
 //
 // NOT A BEHAVIOUR CHANGE. These are called at the same program points as the
 // per-lane atomics they replace, so the aggregate covers exactly the lanes that

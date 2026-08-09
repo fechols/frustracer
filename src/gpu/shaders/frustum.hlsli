@@ -51,6 +51,22 @@ StructuredBuffer<BvhNode> bvh_nodes : register(t0);
 #endif
 groupshared uint g_stack[32 * LANE_STACK];
 
+// Serial-path slab indexing (FR_STACK_LAYOUT=lane|depth, injected as
+// STACK_LANE_MAJOR by trace.rs's ls_defs — see stack_layout_def for the
+// verdict and the Xe2 SLM-banking rationale). Lane-major (`lane *
+// LANE_STACK + i`) strides lanes LANE_STACK*4 B apart — a multiple of 64 B
+// at every legal FR_LSTACK, the exact pathological stride for Xe2's 16
+// banks x 4 B; depth-major (`i * 32 + lane`) makes lanes at one depth
+// consecutive words, conflict-free, zero size change. Pure address remap —
+// results are bit-identical in both layouts. The wave frontier
+// (bound_query_wave) aliases this slab FLAT and lane-strided — already
+// conflict-free, untouched by the define.
+#ifdef STACK_LANE_MAJOR
+#define GS_AT(lane, i) ((lane) * LANE_STACK + (i))
+#else
+#define GS_AT(lane, i) ((i) * 32u + (lane))
+#endif
+
 // TF / frustum_plane / tile_frustum moved to trace_common.hlsli (pasted
 // before this file in every unit): leaf.hlsl's per-tile emissive-light cull
 // needs them, and leaf deliberately does NOT paste this file — the
@@ -123,12 +139,11 @@ float bound_query(TF f, float t_start, float t_limit, uint cut_slot, uint cut_le
     return t_limit;
 #endif
     float best = t_limit;
-    uint base = lane * LANE_STACK;
     for (uint r = 0; r < cut_len; ++r) {
         uint sp = 0;
-        g_stack[base + sp++] = cut_node(cut_slot, r);
+        g_stack[GS_AT(lane, sp++)] = cut_node(cut_slot, r);
         while (sp > 0) {
-            uint idx = g_stack[base + --sp];
+            uint idx = g_stack[GS_AT(lane, --sp)];
             BvhNode node = bvh_nodes[idx];
             if (aabb_outside(f, node.mn, node.mx)) continue;
             if (point_aabb_max_dist(f.origin, node.mn, node.mx) <= t_start) continue;
@@ -157,11 +172,11 @@ float bound_query(TF f, float t_start, float t_limit, uint cut_slot, uint cut_le
             // Push farther first so the nearer child pops first (tightens
             // `best` early, same intent as the CPU's ordered recursion).
             if (dl <= dr) {
-                g_stack[base + sp++] = l + 1;
-                g_stack[base + sp++] = l;
+                g_stack[GS_AT(lane, sp++)] = l + 1;
+                g_stack[GS_AT(lane, sp++)] = l;
             } else {
-                g_stack[base + sp++] = l;
-                g_stack[base + sp++] = l + 1;
+                g_stack[GS_AT(lane, sp++)] = l;
+                g_stack[GS_AT(lane, sp++)] = l + 1;
             }
         }
     }
@@ -179,23 +194,22 @@ uint refine_cut(TF f, float t_ball, float t_far, uint parent_slot, uint parent_l
 #ifdef SCENE_EMPTY
     return 0u;
 #endif
-    uint base = lane * LANE_STACK;
     uint wlen = min(parent_len, LANE_STACK);
     for (uint i = 0; i < wlen; ++i) {
-        g_stack[base + i] = cut_node(parent_slot, i);
+        g_stack[GS_AT(lane, i)] = cut_node(parent_slot, i);
     }
     bool has_far = t_far < FLT_MAX;
     uint olen = 0;
     uint out_base = out_slot * 64u;
     while (wlen > 0) {
-        uint idx = g_stack[base + --wlen];
+        uint idx = g_stack[GS_AT(lane, --wlen)];
         BvhNode node = bvh_nodes[idx];
         if (aabb_outside(f, node.mn, node.mx)) continue;
         if (point_aabb_max_dist(f.origin, node.mn, node.mx) <= t_ball) continue;
         if (has_far && point_aabb_dist(f.origin, node.mn, node.mx) >= t_far) continue;
         if (node.count == 0 && olen + wlen + 2 <= LANE_STACK) {
-            g_stack[base + wlen++] = node.left_first;
-            g_stack[base + wlen++] = node.left_first + 1;
+            g_stack[GS_AT(lane, wlen++)] = node.left_first;
+            g_stack[GS_AT(lane, wlen++)] = node.left_first + 1;
         } else {
             cut_pool[out_base + olen++] = idx;
         }

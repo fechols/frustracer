@@ -1000,7 +1000,17 @@ bool clouds_along(float3 o, float3 d, float3 amb, float j, out float t_out, out 
     // field-space altitude is exact. The slab geometry (t0, dt_c) stays a
     // function of the REAL o.
     float3 ow = o + cloud_curl_offset(o + d * (t0 + 0.5 * float(CLOUD_STEPS) * dt_c));
-    [unroll]
+    // [loop] since 2026-08-09 (was [unroll]): 6 inlined coarse bodies — each
+    // carrying a cloud_cover + the sun-probe exp pair — sat in kernels near
+    // the measured ~56-60-live-float spill knee (the B70 register-cliff
+    // campaign), the same VGPR argument that already kept the fine loop
+    // below rolled. Measured on the flip (--spin path 1080p, clean box,
+    // interleaved reps ±0.002): B70 span 0.865/0.868 -> 0.850/0.854 default
+    // (leaf 0.649 -> 0.638-0.640) and 1.258 -> 1.242 stress — a consistent
+    // ~1.5% frame; 4090 a wash. Compiled width stayed SIMD16 (FR_WIDTH), so
+    // the win is spill traffic, not a width flip. One token, both vendors —
+    // no lever earned.
+    [loop]
     for (uint i = 0u; i < CLOUD_STEPS; i++) {
         if (opaque) break;
         // Phase A: DITHERED coarse occupancy probe — 2D cover only, sampled

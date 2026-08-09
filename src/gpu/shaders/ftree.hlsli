@@ -98,7 +98,7 @@ bool ft_slot(TF f, FtNode nd, uint s, float t_start, out float d) {
 // Stack pressure takes the slot's own d as a coarse leaf — sound, see header.
 // Every write to `best` is explicitly a min: monotonicity is a correctness
 // invariant, not merely a consequence of an earlier prune.
-void ft_expand(TF f, uint ni, float t_start, inout float best, uint base, inout uint sp) {
+void ft_expand(TF f, uint ni, float t_start, inout float best, uint lane, inout uint sp) {
     FtNode nd = ft_nodes[ni];
     float sd[8];
     uint sc[8];
@@ -138,7 +138,7 @@ void ft_expand(TF f, uint ni, float t_start, inout float best, uint base, inout 
             best = min(best, pd); // coarse: the slot's d lower-bounds its subtree
             continue;
         }
-        g_stack[base + sp++] = pc;
+        g_stack[GS_AT(lane, sp++)] = pc;
     }
 }
 
@@ -148,7 +148,6 @@ void ft_expand(TF f, uint ni, float t_start, inout float best, uint base, inout 
 // same binary-node boxes; min is order-independent).
 float bound_query(TF f, float t_start, float t_limit, uint cut_slot, uint cut_len, uint lane) {
     float best = t_limit;
-    uint base = lane * LANE_STACK;
     uint sp = 0;
     uint n = cut_slot == ROOT_CUT_SLOT ? 8u : cut_len;
     for (uint r = 0; r < n; ++r) {
@@ -166,10 +165,10 @@ float bound_query(TF f, float t_start, float t_limit, uint cut_slot, uint cut_le
             best = min(best, d);
             continue;
         }
-        g_stack[base + sp++] = nd.child[s];
+        g_stack[GS_AT(lane, sp++)] = nd.child[s];
     }
     while (sp > 0) {
-        ft_expand(f, g_stack[base + --sp], t_start, best, base, sp);
+        ft_expand(f, g_stack[GS_AT(lane, --sp)], t_start, best, lane, sp);
     }
     return best;
 }
@@ -180,17 +179,16 @@ float bound_query(TF f, float t_start, float t_limit, uint cut_slot, uint cut_le
 // slots (up to 8 at once — overflow coarsens a little earlier than the
 // binary 2-way split; the entry is emitted, never dropped).
 uint refine_cut(TF f, float t_ball, float t_far, uint parent_slot, uint parent_len, uint out_slot, uint lane) {
-    uint base = lane * LANE_STACK;
     uint wlen = 0;
     uint n = parent_slot == ROOT_CUT_SLOT ? 8u : min(parent_len, LANE_STACK);
     for (uint i = 0; i < n; ++i) {
-        g_stack[base + wlen++] = parent_slot == ROOT_CUT_SLOT ? i : cut_pool[parent_slot * 64u + i];
+        g_stack[GS_AT(lane, wlen++)] = parent_slot == ROOT_CUT_SLOT ? i : cut_pool[parent_slot * 64u + i];
     }
     bool has_far = t_far < FLT_MAX;
     uint olen = 0;
     uint out_base = out_slot * 64u;
     while (wlen > 0) {
-        uint e = g_stack[base + --wlen];
+        uint e = g_stack[GS_AT(lane, --wlen)];
         uint ni = e >> 3;
         uint s = e & 7u;
         FtNode nd = ft_nodes[ni];
@@ -206,7 +204,7 @@ uint refine_cut(TF f, float t_ball, float t_far, uint parent_slot, uint parent_l
             if (olen + wlen + countbits(c_occ) <= LANE_STACK) {
                 [unroll] for (uint cs = 0; cs < 8; ++cs) {
                     if ((c_occ >> cs) & 1u) {
-                        g_stack[base + wlen++] = (c << 3) | cs;
+                        g_stack[GS_AT(lane, wlen++)] = (c << 3) | cs;
                     }
                 }
                 continue;

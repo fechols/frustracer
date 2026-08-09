@@ -18806,6 +18806,28 @@ fn run_window(
     // (Lives at the call site, not inside vendor_defaults, so the policy fn
     // stays a pure &mut Opts — the cli lever_snapshot purity discipline.)
     gpu::dxr::set_inline_mode(opts.dxr_inline);
+    // Lean RTPSO on Intel (the FR_DXR_LEAN promotion, 2026-08-09): an Arc
+    // mode-2 DXR session exports the fat chs_shade/misses/any-hits as DEAD
+    // code, and the finding-1 audit measured the driver charging 12-18% of
+    // `dxr-rays` for provisioning them (world 2.81 -> 2.28 ms, SM-lp 2.193
+    // -> 1.922; procedural nil; 4090 nil everywhere) — one vendor pays,
+    // the other is indifferent, the --dxr-inline-2 promotion's own shape.
+    // Gated on the exact conditions DxrGpu::new's soundness guard checks
+    // (mode 2, sbt ladder off — any other config has real TraceRay
+    // consumers a raygen-only state object would break), so the policy can
+    // never reach the guard's refusal arm. FR_DXR_LEAN=1|0 is the explicit
+    // force/veto (lean_env — presence wins over this store either way);
+    // headless paths never reach here, so --check-dxr keeps gating both
+    // arms purely off the environment. Lives beside the set_inline_mode
+    // re-store for the same reason it does: the lazy F/SPACE DxrGpu build
+    // must read the policy value, and every DxrGpu::new sits below this
+    // line by the invariant above.
+    if gpu.adapter_vendor == gpu::adapter::Vendor::Intel
+        && opts.dxr_inline == 2
+        && opts.dxr_sbt == 0
+    {
+        gpu::dxr::set_lean_default(true);
+    }
     // upscaler_defaults may have armed emissive-lights; that global too was
     // published from the PRE-policy value at main()'s lever block. It is
     // LIVE-tier (derivation runs unconditionally at scene load, consumers

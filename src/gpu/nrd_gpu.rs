@@ -90,6 +90,37 @@ const CB_ALIGN: usize = 256;
 const RING_FRAMES: usize = 3; // >= d3d12 frames in flight
 const MAX_DISPATCHES: usize = 48; // N1 measured 31; headroom, asserted
 
+/// FR_NRD_BARRIER=narrow — per-resource UAV barriers in place of the
+/// per-dispatch GLOBAL one (the A/B arm; default = global, the shipping v1).
+/// The narrow form fences exactly the STORAGE bindings the current
+/// DispatchDesc names that did NOT just change state (a state transition is
+/// itself the sync for that resource; the only hazard it misses is UAV→UAV
+/// on one resource, which the per-resource barrier covers — the DispatchDesc
+/// resource list is complete, it is what the descriptor table is built
+/// from). BUILT AND MEASURED A WASH on the Arc Pro B70 (2026-08-09,
+/// clean-box parked NRD sessions, 2 interleaved reps): `nrd` region
+/// 1.19/1.19 vs global's 1.19/1.20, span within ±0.03 — ReBLUR's ~31
+/// dispatches are FULL-SCREEN, each fills the machine on its own, so there
+/// is no cross-dispatch overlap for narrowing to unlock, and the global
+/// flush costs recording time only (the ladder's 11-µs class). Global stays
+/// the default as the simpler always-correct form; the narrow arm is kept
+/// compiled for re-measure on a future driver.
+fn nrd_barrier_narrow() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("FR_NRD_BARRIER") {
+        Err(_) => false,
+        Ok(v) if v == "narrow" => {
+            eprintln!("nrd: FR_NRD_BARRIER=narrow — per-resource UAV barriers (the A/B arm)");
+            true
+        }
+        Ok(v) if v == "global" => false, // the default, spelled explicitly
+        Ok(v) => {
+            eprintln!("nrd: FR_NRD_BARRIER={v:?} unrecognized (legal: narrow, global) — global");
+            false
+        }
+    })
+}
+
 pub struct NrdGpu {
     pub nrd: nrd::Nrd,
     root_sig: ID3D12RootSignature,
@@ -528,21 +559,30 @@ impl NrdGpu {
                 if cur != want {
                     barriers.push(d3d12::transition(&self.regs[idx].res, cur, want));
                     self.regs[idx].state.set(want);
+                } else if nrd_barrier_narrow() && r.descriptor_type != nrd::DESC_TEXTURE {
+                    // NARROW (the A/B arm — doc at nrd_barrier_narrow): a
+                    // STORAGE binding that did NOT change state is the one
+                    // case a transition doesn't already fence (UAV→UAV on
+                    // this resource); fence exactly it. d3d12::uav_barrier
+                    // borrows via transmute_copy — no refcount to leak.
+                    barriers.push(d3d12::uav_barrier(Some(&self.regs[idx].res)));
                 }
             }
-            // The global UAV barrier (None) fences the previous dispatch's
-            // storage writes for this one's reads — cheap (the ladder's
-            // 11 µs-for-24-barriers measurement) and always correct.
-            barriers.push(D3D12_RESOURCE_BARRIER {
-                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                        pResource: std::mem::ManuallyDrop::new(None),
-                    }),
-                },
-            });
-            unsafe { list.ResourceBarrier(&barriers) };
+            if !nrd_barrier_narrow() {
+                // The global UAV barrier (None) fences the previous
+                // dispatch's storage writes for this one's reads — cheap
+                // (the ladder's 11 µs-for-24-barriers measurement), always
+                // correct, and measured EQUAL to the narrow arm on the B70
+                // (see nrd_barrier_narrow — full-screen dispatches leave no
+                // overlap to unlock).
+                barriers.push(d3d12::uav_barrier(None));
+            }
+            // A dispatch can legitimately need zero barriers under the
+            // narrow arm (all bindings TEXTURE, all already NPSR);
+            // ResourceBarrier(0) is a debug-layer error.
+            if !barriers.is_empty() {
+                unsafe { list.ResourceBarrier(&barriers) };
+            }
 
             // Descriptor set: SRVs at [0..), UAVs at [max_tex..), in the
             // ranges' concatenated resource order.

@@ -178,31 +178,52 @@ void cs_seed_probes(uint3 id : SV_DispatchThreadID) {
 groupshared uint gw_len[2];
 groupshared uint gw_best;
 
-// WAVE-AGGREGATED SHARED-MEMORY TRAFFIC (revert: FR_ABL=nowave).
+// FRONTIER TRAFFIC IS PLAIN LDS ATOMICS BY DEFAULT (re-arm: FR_ABL=wavegw).
 //
-// Both primitives below used to be one LDS atomic PER LANE PER CANDIDATE. In
-// the FTREE round that is up to 8 per lane (the unrolled slot loop), so a
-// 32-lane group could issue ~256 atomics to ONE address per BFS round. Intel's
-// RT developer guide (v4, p.26) prescribes exactly this fix — "keep data within
-// a wave and use wave intrinsics instead of barriers", accumulating in
-// registers and combining with a wave op — and it matters more on Intel than
-// elsewhere, because groupshared is carved out of the same L1 that services the
-// RT unit. Measured on an Arc Pro B70: `cs_level_wide`'s 32-thread group is
-// EXACTLY ONE WAVE (WaveGetLaneCount() == 32 at every group width we dispatch),
-// so this collapses to a single atomic.
+// v1 wave-aggregated both primitives below on Intel's RT-guide prescription
+// (fold a wave's atomics into one via wave intrinsics). THE VERDICT REVERSED
+// on 2026-08-01, the first time the A/B was actually armed — the probe-reach
+// repair (abl_defs' nowave row) showed every earlier "neutral" had compared a
+// HALF-ARMED configuration: with both halves flipped, FR_ABL=nowave BEAT the
+// aggregation on BOTH vendors (B70 ladder 0.110→0.102 default / 0.200→0.180
+// stress, span −1.4%/−3.0%; 4090 ladder −5%), and `nobatch,nowave` landing
+// BETWEEN the arms decomposed the pair: the homogeneous-batch half is a
+// keeper, THIS aggregation was the whole regression. The mechanism fits: the
+// targets here (gw_len/gw_best) are GROUPSHARED — on-chip, one-or-two-wave
+// groups — so the per-lane atomics were already cheap, and the full
+// cross-lane reduction per candidate round cost more than the contention it
+// removed. ctr.hlsli's ctr_add/ctr_bump aggregate GLOBAL-memory counters,
+// measured neutral, and keep their wave forms — the two halves get separate
+// verdicts on purpose.
 //
-// WHY THIS IS NOT A BEHAVIOUR CHANGE. Both helpers are called at the SAME
-// program points as the per-lane atomics they replace, and lanes of one wave
-// reach a given point together, so the aggregate is over exactly the lanes that
-// would have raced there anyway. `best` is an order-independent min and the
-// queue is a SET whose slot assignment order was already unspecified (the old
-// atomics raced), so only cross-WAVE interleaving changes — and on a group that
-// is one wave, nothing does. Counted frustum nodes may still move where a group
-// spans several waves; the image may not. Same contract as WIDE_LEVELS.
+// So plain atomics are the DEFAULT since 2026-08-09. The wave forms stay
+// compiled under FR_ABL=wavegw (the re-measure arm — a future driver may
+// re-invert this); FR_ABL=nowave still means "everything plain" and wins
+// when both are set. The arms are BEHAVIOUR-IDENTICAL: same program points,
+// `best` an order-independent min, the queue a SET whose slot order was
+// always unspecified (the atomics race) — the flip is pixel-identical, and
+// the parity invariant below holds in both.
+//
+// THE FLIP-DAY RE-MEASURE (2026-08-09, this tree, define-reach proven via
+// FR_DUMP_HLSL; clean-box B70 numbers — a concurrent session contaminated
+// the first pass, caught and re-run): the recorded 08-01 B70 win shrank to
+// a TINY consistent plain edge — default span 0.854/0.854 vs wavegw
+// 0.857/0.858 (plain ahead in both interleaved reps, ±0.002 machine),
+// stress dead even over 3 reps (1.240-1.242 vs 1.241-1.244; one 1.226
+// outlier discarded) — the tree drifted since 08-01 (leaf grew RTGI/
+// spec-aa, the ladder shrank). The 4090 keeps its own small plain edge
+// (default min-of-3 0.420 vs 0.430, plain ahead in every interleaved pair;
+// stress 0.441 vs 0.448). So the default stands on plain-never-loses +
+// both vendors' small edges + the simpler code; the 08-01 magnitudes are
+// historical — re-run the two spin pairs before citing one.
 //
 // CALL THEM UNCONDITIONALLY. Each takes a participation flag rather than
-// sitting inside an `if`, so the wave op is never reached by a subset of lanes
-// that a later edit might change. Non-participants carry an identity.
+// sitting inside an `if`, so the wavegw arm's wave op is never reached by a
+// subset of lanes that a later edit might change. Non-participants carry an
+// identity.
+#if defined(ABL_WAVE_GW) && !defined(ABL_NO_WAVE_OPS)
+#define GW_WAVE 1
+#endif
 
 // float-min via InterlockedMin on the IEEE bit pattern: exact for NON-NEGATIVE
 // finite floats, whose bit patterns order exactly as their values. Every
@@ -214,16 +235,16 @@ groupshared uint gw_best;
 // accumulator through asfloat(), which would put a NaN bit pattern in a float
 // register where hardware is permitted to canonicalise it.
 void gw_min_bits(uint v) {
-#if defined(ABL_NO_WAVE_OPS)
-    if (v != 0xFFFFFFFFu) {
-        uint prev;
-        InterlockedMin(gw_best, v, prev);
-    }
-#else
+#ifdef GW_WAVE
     uint m = WaveActiveMin(v);
     if (WaveIsFirstLane() && m != 0xFFFFFFFFu) {
         uint prev;
         InterlockedMin(gw_best, m, prev);
+    }
+#else
+    if (v != 0xFFFFFFFFu) {
+        uint prev;
+        InterlockedMin(gw_best, v, prev);
     }
 #endif
 }
@@ -238,17 +259,17 @@ void gw_min_if(bool take, float d) { gw_min_bits(take ? asuint(d) : 0xFFFFFFFFu)
 // even total added to an even counter — accepted offsets stay even exactly as
 // they did when each lane added 2 on its own.
 uint gw_alloc(uint slot, uint n) {
-#if defined(ABL_NO_WAVE_OPS)
-    uint w = 0;
-    if (n != 0) InterlockedAdd(gw_len[slot], n, w);
-    return w;
-#else
+#ifdef GW_WAVE
     uint pre = WavePrefixSum(n);
     uint sum = WaveActiveSum(n);
     uint base = 0;
     if (WaveIsFirstLane() && sum != 0) InterlockedAdd(gw_len[slot], sum, base);
     // Only the first lane's `base` is meaningful; broadcast it to the wave.
     return WaveReadLaneFirst(base) + pre;
+#else
+    uint w = 0;
+    if (n != 0) InterlockedAdd(gw_len[slot], n, w);
+    return w;
 #endif
 }
 

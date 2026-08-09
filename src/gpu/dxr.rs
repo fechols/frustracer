@@ -248,18 +248,49 @@ pub(crate) fn dxr_inline_mode() -> u32 {
 /// COLLAPSES, the tax was export provisioning and finding 1 gets rewritten.
 /// Mode-2-only BY SOUNDNESS: any other mode has real TraceRay consumers
 /// whose miss/hit lookups against a null table are undefined — asked-for
-/// anywhere else it refuses loudly and stays off. Default off =
-/// byte-identical descs (the FR_ABL class).
-fn lean_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+/// anywhere else it refuses loudly and stays off.
+///
+/// PROMOTED TO AN INTEL VENDOR DEFAULT (2026-08-09): the finding-1 audit
+/// measured the DEAD exports themselves costing the B70 driver 12-18% of
+/// `dxr-rays` on real scenes (world 2.81 -> 2.28 ms, SM-lp 2.193 -> 1.922;
+/// procedural nil) while the 4090 reads nil everywhere — a
+/// one-vendor-pays-real-money / other-vendor-indifferent split, the
+/// `--dxr-inline 2` promotion's own shape. `main.rs`'s vendor_defaults call
+/// site arms `set_lean_default` for Intel mode-2 sbt-0 sessions;
+/// FR_DXR_LEAN=1|0 is the explicit force/veto either way
+/// (presence-not-value, the dxr_inline_explicit doctrine), and headless
+/// paths never run the policy — `--check-dxr` keeps gating both arms purely
+/// off the environment. The unarmed compiled default stays byte-identical
+/// descs (the FR_ABL class).
+static LEAN_DEFAULT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The vendor-policy half of `lean_on` — called from `run_window`'s
+/// vendor-defaults re-store block only (never headless). The env var wins.
+pub fn set_lean_default(on: bool) {
+    LEAN_DEFAULT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The explicit FR_DXR_LEAN choice, or None when unset (→ the vendor
+/// default). Cached: only the ENV half — the default atomic reads live, so
+/// the policy re-store can land after an early caller.
+fn lean_env() -> Option<bool> {
+    static ON: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
     *ON.get_or_init(|| match std::env::var("FR_DXR_LEAN") {
-        Err(_) => false,
-        Ok(v) if v == "1" => true, // announced at DxrGpu::new, where the mode is known
+        Err(_) => None,
+        Ok(v) if v == "1" => Some(true), // announced at DxrGpu::new, where the mode is known
+        Ok(v) if v == "0" => {
+            eprintln!("gpu: FR_DXR_LEAN=0 — lean RTPSO explicitly off (vetoes the Intel vendor default)");
+            Some(false)
+        }
         Ok(v) => {
-            eprintln!("gpu: FR_DXR_LEAN={v:?} unrecognized (legal: 1) — off");
-            false
+            eprintln!("gpu: FR_DXR_LEAN={v:?} unrecognized (legal: 1, 0) — unset (vendor default applies)");
+            None
         }
     })
+}
+
+fn lean_on() -> bool {
+    lean_env().unwrap_or_else(|| LEAN_DEFAULT.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// `--dxr-sbt 0|1|2|3` (default **0** = off, today's one-record SBT): the
@@ -776,11 +807,22 @@ impl DxrGpu {
         // cost delta is attributable to export provisioning and nothing else.
         let lean = if lean_on() {
             if inline_mode == 2 && !recurse && sbt_mode == 0 {
-                eprintln!(
-                    "dxr: FR_DXR_LEAN=1 — raygen-only RTPSO (exports: raygen; \
-                     recursion 0; null miss/hit SBT ranges) — the dead-exports \
-                     control"
-                );
+                if lean_env().is_some() {
+                    eprintln!(
+                        "dxr: FR_DXR_LEAN=1 — raygen-only RTPSO (exports: raygen; \
+                         recursion 0; null miss/hit SBT ranges) — the dead-exports \
+                         control"
+                    );
+                } else {
+                    // The Intel vendor default (set_lean_default) — the policy
+                    // gated on exactly the conditions above, so this arm never
+                    // reaches the refusal below.
+                    eprintln!(
+                        "dxr: Intel adapter — raygen-only RTPSO (dead exports \
+                         measured 12-18% of dxr-rays on Arc; FR_DXR_LEAN=0 \
+                         restores the full export list)"
+                    );
+                }
                 true
             } else {
                 eprintln!(
