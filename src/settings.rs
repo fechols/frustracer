@@ -1388,6 +1388,11 @@ pub fn menu_items() -> &'static [MenuItem] {
             item!("fsr_disocclusion_threshold", "FSR-RR disocclusion thr", "Upscaler", Restart, StepF { min: 0.0, max: 1.0, step: 0.05, default: 0.1 }, acc_f32!(upscaler.fsr_disocclusion_threshold)),
             item!("fsr_normal_strength", "FSR-RR normal strength", "Upscaler", Restart, StepF { min: 0.0, max: 2.0, step: 0.1, default: 1.0 }, acc_f32!(upscaler.fsr_normal_strength)),
             item!("fsr_kernel_relaxation", "FSR-RR kernel relaxation", "Upscaler", Restart, StepF { min: 0.0, max: 1.0, step: 0.05, default: 0.5 }, acc_f32!(upscaler.fsr_kernel_relaxation)),
+            item!("nrd_perf", "NRD perf-mode DLL", "Upscaler", Restart, Toggle { default: false }, acc_bool!(upscaler.nrd_perf)),
+            item!("nrd_max_stabilized_frames", "NRD max stabilized frames", "Upscaler", Restart, StepU { min: 0, max: 63, step: 9, default: 63 }, acc_u32!(upscaler.nrd_max_stabilized_frames)),
+            item!("nrd_prepass_radius", "NRD prepass radius (px)", "Upscaler", Restart, StepF { min: 0.0, max: 100.0, step: 5.0, default: 30.0 }, acc_f32!(upscaler.nrd_prepass_radius)),
+            item!("nrd_anti_firefly", "NRD anti-firefly filter", "Upscaler", Restart, Toggle { default: true }, acc_bool!(upscaler.nrd_anti_firefly)),
+            item!("nrd_max_accum_frames", "NRD max accum frames", "Upscaler", Restart, StepU { min: 0, max: 63, step: 5, default: 30 }, acc_u32!(upscaler.nrd_max_accum_frames)),
             // ── Effects
             item!("tod", "time of day", "Effects", Live, StepF { min: 0.0, max: 24.0, step: 0.5, default: 12.0 }, acc_f32!(effects.tod)),
             item!("bloom", "bloom (glare)", "Effects", Live, Toggle { default: true }, acc_bool!(effects.bloom)),
@@ -1626,6 +1631,9 @@ pub fn opt_projection(id: &str) -> Option<fn(&crate::Opts) -> String> {
     fn opt_f32(v: Option<f32>) -> String {
         v.map(|v| v.to_string()).unwrap_or_else(|| "default".into())
     }
+    fn opt_u32(v: Option<u32>) -> String {
+        v.map(|v| v.to_string()).unwrap_or_else(|| "default".into())
+    }
     Some(match id {
         // ── Display
         "vsync" => |o: &Opts| onoff(o.vsync),
@@ -1728,6 +1736,13 @@ pub fn opt_projection(id: &str) -> Option<fn(&crate::Opts) -> String> {
         "fsr_disocclusion_threshold" => |o: &Opts| opt_f32(o.fsr_tune.disocclusion_threshold),
         "fsr_normal_strength" => |o: &Opts| opt_f32(o.fsr_tune.normal_strength),
         "fsr_kernel_relaxation" => |o: &Opts| opt_f32(o.fsr_tune.kernel_relaxation),
+        "nrd_perf" => |o: &Opts| onoff(o.nrd_perf),
+        "nrd_max_stabilized_frames" => |o: &Opts| opt_u32(o.nrd_tune.max_stabilized_frames),
+        "nrd_prepass_radius" => |o: &Opts| opt_f32(o.nrd_tune.prepass_radius),
+        "nrd_anti_firefly" => |o: &Opts| {
+            o.nrd_tune.anti_firefly.map(onoff).unwrap_or_else(|| "default".into())
+        },
+        "nrd_max_accum_frames" => |o: &Opts| opt_u32(o.nrd_tune.max_accum_frames),
         // ── Effects
         "tod" => |o: &Opts| opt_f32(o.tod),
         "bloom" => |o: &Opts| onoff(o.bloom),
@@ -2432,6 +2447,27 @@ pub fn self_test() -> Result<(), String> {
         }
         if !cli_overrides(&file, &seeded, &seeded).is_empty() {
             return Err("no flags -> no conflicts".into());
+        }
+        // The nrd rows (d606252's fields, rows added in the follow-up): pin
+        // one bool and one Option-tune representative end-to-end — the tune
+        // projections seed from a SAVED Some through apply_to_opts, so a
+        // moved flag must surface in the row's own vocabulary.
+        let mut nfile = Settings::default();
+        nfile.upscaler.nrd_perf = Some(true);
+        nfile.upscaler.nrd_prepass_radius = Some(30.0);
+        let mut nseed = crate::cli::defaults();
+        let _ = apply_to_opts(&nfile, &mut nseed);
+        let nmoved = crate::cli::parse_from(
+            nseed.clone(),
+            argv(&["--no-nrd-perf", "--nrd-prepass-radius", "0"]).into_iter(),
+        )
+        .opts;
+        let nover = cli_overrides(&nfile, &nseed, &nmoved);
+        if nover.get("nrd_perf").map(String::as_str) != Some("off")
+            || nover.get("nrd_prepass_radius").map(String::as_str) != Some("0")
+            || nover.len() != 2
+        {
+            return Err(format!("cli_overrides missed the nrd-tune overrides: {nover:?}"));
         }
     }
 
