@@ -19443,8 +19443,71 @@ fn run_window(
                 // No frames from here until the next session's loop starts.
                 fly.pause();
                 if let Err(e) = gpu.resize_output(nw, nh, &gopts) {
-                    eprintln!("resize: rebuild at {nw}x{nh} failed ({e}); exiting");
-                    break;
+                    if let Some(r) = gpu.device_removed_reason() {
+                        eprintln!("resize: the D3D12 device was REMOVED ({r})");
+                    }
+                    eprintln!(
+                        "resize: rebuild at {nw}x{nh} failed ({e}) — rebuilding the whole \
+                         GPU context from scratch (fresh device; the scene re-uploads, \
+                         several seconds on big scenes)"
+                    );
+                    // The full-rebuild rung under resize_output: a removed
+                    // device (measured: the Intel XeSS-FG destroy/recreate
+                    // cycle can remove it) cannot be resized around — every
+                    // allocation after it fails — and losing the session
+                    // over a window resize is the worst available outcome.
+                    // The old context must DROP first (its swapchain owns
+                    // the HWND, and a dead device's resources should release
+                    // before a fresh device allocates ~gigabytes beside
+                    // them), so `gpu` is logically uninitialized between the
+                    // read and the write; a second failure exits WITHOUT
+                    // running Drop on the moved-out slot — and a PANIC in
+                    // between (GpuContext::new panicking instead of Err'ing)
+                    // must not unwind through here either, since unwinding
+                    // would Drop the moved-out slot: the guard turns that
+                    // into an abort.
+                    struct AbortOnUnwind;
+                    impl Drop for AbortOnUnwind {
+                        fn drop(&mut self) {
+                            eprintln!("resize: panic during GPU rebuild with the context moved out; aborting");
+                            std::process::abort();
+                        }
+                    }
+                    unsafe {
+                        let old = std::ptr::read(&gpu);
+                        let guard = AbortOnUnwind;
+                        drop(old);
+                        // TDR recovery takes a few seconds, and until it
+                        // completes the adapter refuses even
+                        // D3D12CreateDevice (measured: 0x887A0006 from the
+                        // immediate rebuild after the xefg destroy hung the
+                        // B70). Retry with a delay before giving up —
+                        // GpuContext::new re-enumerates the adapter fresh
+                        // each attempt.
+                        let mut attempt = 0u32;
+                        let g = loop {
+                            match gpu::GpuContext::new(sdl_hwnd(&window), nw, nh, &gopts) {
+                                Ok(g) => break g,
+                                Err(e2) if attempt < 15 => {
+                                    attempt += 1;
+                                    eprintln!(
+                                        "resize: GPU rebuild attempt {attempt} failed ({e2}) — \
+                                         retrying in 1 s (TDR recovery)"
+                                    );
+                                    std::thread::sleep(std::time::Duration::from_secs(1));
+                                }
+                                Err(e2) => {
+                                    eprintln!(
+                                        "resize: full GPU rebuild failed after {attempt} \
+                                         retries ({e2}); exiting"
+                                    );
+                                    std::process::exit(1);
+                                }
+                            }
+                        };
+                        std::ptr::write(&mut gpu, g);
+                        std::mem::forget(guard);
+                    }
                 }
                 if let Some(hd) = hud.as_mut() {
                     // New Slint buffer + forced full-window dirty: the GPU

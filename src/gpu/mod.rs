@@ -2021,10 +2021,25 @@ impl GpuContext {
             fg.prepared.set(false);
             fg.ctx = None;
         }
-        self.fg_ui = None;
-        // XeSS-FG: disable so no interpolation is pending across the
-        // ResizeBuffers (which the xefg proxy forwards); re-enabled below if
-        // the XeSS level comes back up.
+        // XeSS-FG: ResizeBuffers runs HERE, EARLY — while the proxy and
+        // every resource it has tag pointers to (the XeSS input planes, the
+        // RES_UI HudFi target) are still ALIVE. This is the developer
+        // guide's own resize contract ("release references to back buffers
+        // ... and wait for the execution of command lists used for resource
+        // tagging" — then ResizeBuffers on the proxy, which handles the
+        // resize itself; `d3d.resize` does the wait + release). The original
+        // ordering — teardown first, resize last, the non-FG arms' order —
+        // freed the tagged planes before the proxy's ResizeBuffers saw
+        // them, and it refused with a bare 0x80004005 (the 100% maximize
+        // repro). And NEVER "fix" a refusal by destroying the context to
+        // resize around it: xefgSwapChainDestroy mid-session HANGS the B70's
+        // device outright (0x887A0006, with even D3D12CreateDevice refusing
+        // for 15+ s of TDR retries — the 2026-08-09 campaign's measured
+        // dead end; at ordinary shutdown the same hang is invisible because
+        // nothing touches the adapter afterward). The context SURVIVES the
+        // resize; the tail of this function re-enables generation once the
+        // XeSS level comes back up.
+        let mut xefg_resized = false;
         if let Some(x) = &self.fg_x {
             if x.on.get() {
                 x.sc.set_enabled(false);
@@ -2035,7 +2050,10 @@ impl GpuContext {
             // structural change that can cure a shed tag — let it retry at
             // the new size (the ffx ui_shed rule above).
             x.ui_shed.set(false);
+            self.d3d.resize(w, h)?;
+            xefg_resized = true;
         }
+        self.fg_ui = None;
         // Everything below drops live GPU resources; drain first (the
         // GpuContext::drop discipline — xess/ffx destroy-context require
         // completed command lists, ResizeBuffers requires zero outstanding
@@ -2123,7 +2141,9 @@ impl GpuContext {
         self.fsr3 = None;
         self.quin = None;
         self.rr = None;
-        self.d3d.resize(w, h)?;
+        if !xefg_resized {
+            self.d3d.resize(w, h)?;
+        }
         self.blit = match self.d3d.space {
             d3d12::PresentSpace::Sdr10 | d3d12::PresentSpace::Hdr10 => {
                 upload::BlitUpload::new_10bit(&self.d3d, w, h)?
@@ -2299,7 +2319,8 @@ impl GpuContext {
             );
         }
         // XeSS-FG re-enable when the XeSS level came back up (the swapchain
-        // context itself survived the ResizeBuffers).
+        // context SURVIVED the resize — ResizeBuffers ran through the live
+        // proxy at the top of this function, the guide's own flow).
         if let Some(x) = &self.fg_x {
             if self.xess.is_some() && x.enabled && !x.failed.get() {
                 x.sc.set_enabled(true);
@@ -4665,6 +4686,15 @@ impl GpuContext {
     /// available (M4).
     pub fn dlss_ready(&self) -> bool {
         self.ngxrr.is_some() && self.rr_feature.is_some() && self.rr.is_some()
+    }
+
+    /// The D3D12 device's removal reason, if it HAS been removed — the
+    /// diagnostic for resize/rebuild failures (a downstream 0x887A0005 on an
+    /// ordinary allocation is a symptom; this names the cause, and its
+    /// presence is what tells the resize handler that only a full
+    /// GpuContext rebuild — a fresh device — can recover).
+    pub fn device_removed_reason(&self) -> Option<String> {
+        unsafe { self.d3d.device.GetDeviceRemovedReason() }.err().map(|e| e.to_string())
     }
 
     /// Which chain level this session wired — derived from the live state

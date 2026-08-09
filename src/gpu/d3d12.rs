@@ -620,8 +620,13 @@ impl D3d {
     /// `nbuf` descriptors — overwritten, never reallocated).
     /// `frame_index` needs no reset: it is only the frames-in-flight slot
     /// counter; the backbuffer index is queried fresh at every present.
-    /// Works through the FG-family proxy swapchains too — they forward
-    /// ResizeBuffers to the chain they wrap.
+    /// Works through the FG-family proxy swapchains too — they handle
+    /// ResizeBuffers themselves — but for XeSS-FG the CALL ORDER is a
+    /// contract: the proxy must be resized while every resource it holds
+    /// tag pointers to is still ALIVE (resize_output's xefg block runs this
+    /// BEFORE any teardown; resizing after freeing the tagged planes
+    /// measured a bare 0x80004005 — and destroying the context to resize
+    /// around it hangs the device, see that block's comment).
     pub fn resize(&mut self, w: u32, h: u32) -> Result<()> {
         self.wait_idle()?;
         self.backbuffers.clear();
