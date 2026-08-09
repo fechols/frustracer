@@ -1426,16 +1426,19 @@ cargo run --release -- --gpu --xess --nrd  # NRD (ReBLUR) pre-upscale denoising 
                                       # (non-neural) temporal ray reconstruction that makes the
                                       # TAA-upscalers peers of the RR engines (the quinlight
                                       # "pre-denoise their SHARED input" follow-on, built).
-                                      # ON BY DEFAULT wherever it can arm (GPU tracers ×
-                                      # XeSS/FSR3): --nrd spells the default, --no-nrd is the
-                                      # kill lever (= the pre-NRD plain baseline), and
-                                      # Opts::nrd_explicit is the fg_explicit pattern — the
-                                      # DEFAULTED nrd under --nppd disarms with a loud line
-                                      # while the EXPLICIT pair exits 2 (a default must never
-                                      # make another flag fatal), and the "not armed" session
-                                      # notes fire only for the explicit flag (the default
-                                      # must not nag DLSS sessions). A missing NRD.dll sheds
-                                      # loudly per session with the install hint.
+                                      # OPT-IN SINCE THE FRD PHASE-E DEFAULT FLIP (2026-08-09 —
+                                      # FRD is the default denoiser now; see the --frd entry):
+                                      # --nrd claims the one denoiser slot from the defaulted
+                                      # frd (silently — opting into the oracle is opting out of
+                                      # the default) and NRD stays as the A/B ORACLE until its
+                                      # planned one-commit deletion; --no-nrd spells the
+                                      # default. Opts::nrd_explicit is the fg_explicit pattern —
+                                      # a FILE-defaulted nrd under --nppd disarms with a loud
+                                      # line while the EXPLICIT pair exits 2 (a default must
+                                      # never make another flag fatal), and the "not armed"
+                                      # session notes fire only for the explicit flag (the
+                                      # default must not nag DLSS sessions). A missing NRD.dll
+                                      # sheds loudly per session with the install hint.
                                       # NVIDIA's NRD v4.17.3, PINNED in three places that must
                                       # move together: install-prerequisites.bat's NRD_TAG (the
                                       # `nrd` component CMake-builds the SDK locally — NVIDIA
@@ -1632,22 +1635,30 @@ cargo run --release -- --gpu --xess --frd  # FRD (src/frd.rs + gpu/frd_gpu.rs, 2
                                       # the ReBLUR-class recurrent 3-dispatch shape (temporal /
                                       # blur / post+feedback) at fp16, wave-ops, narrow barriers,
                                       # B70-first (XMX ruled out: bilateral weights are not a
-                                      # GEMM). OPT-IN until parity: --frd takes the ONE denoiser
+                                      # GEMM). THE DEFAULT SINCE THE PHASE-E FLIP (2026-08-09,
+                                      # same day — the parity bar was met: quality band held on
+                                      # both boxes at 2.5x NRD's speed; the DELETION half of E
+                                      # stays a later one-commit move, NRD serving as the
+                                      # opt-in A/B oracle until then): frd takes the ONE
+                                      # denoiser
                                       # slot (enum DnGpu in gpu/mod.rs — arm_denoiser_for /
                                       # nrd_frame_step / the shed machinery are engine-blind, the
                                       # bridge kernels + NRD_FEED_SET + nrd_sig/sky-ext-skip
                                       # wiring UNCHANGED: FrdGpu carries NrdGpu's exact plane
                                       # contract); only EXPLICIT pairs are fatal — explicit
                                       # --frd + explicit --nrd exits 2, explicit --frd + --nppd
-                                      # exits 2, an explicit --frd silently disarms the
-                                      # DEFAULTED nrd, and a FILE-defaulted frd (the settings
-                                      # row) yields LOUDLY to an explicit --nrd/--nppd instead
-                                      # (a default never makes another flag fatal — the
-                                      # fg_explicit doctrine; both-defaulted = the file's frd
-                                      # beats the compiled nrd, silently); the not-armed session
-                                      # notes key on frd_explicit, so a file default never nags;
-                                      # --no-frd spells the default; settings row `frd` drives
-                                      # the default arm only (the fg-row rule).
+                                      # exits 2, an explicit --nrd silently disarms the
+                                      # DEFAULTED frd (opting into the oracle is opting out of
+                                      # the default), the defaulted frd yields LOUDLY to a bare
+                                      # --nppd (a default never makes another flag fatal — the
+                                      # fg_explicit doctrine; both-defaulted = a FILE-saved nrd
+                                      # beats the compiled frd, silently — a saved preference
+                                      # beats a compiled default); the not-armed session notes
+                                      # key on frd_explicit/nrd_explicit, so a default never
+                                      # nags; --no-frd is the kill lever (= the plain undenoised
+                                      # baseline), --frd spells the default; settings rows `frd`
+                                      # (Toggle default ON) + `nrd` (the oracle, default OFF)
+                                      # drive the default arms only (the fg-row rule).
                                       # --frd-max-accum-frames/-fast-frames/-max-stab-frames/
                                       # -blur-radius/-clamp-sigma/-[no-]anti-firefly/-no-fp16 =
                                       # the tuning family (frd::FrdTuning, all-None = compiled
@@ -1745,11 +1756,12 @@ cargo run --release -- --gpu --xess --frd  # FRD (src/frd.rs + gpu/frd_gpu.rs, 2
                                       # restore). dxc::compile_args is the per-unit
                                       # -enable-16bit-types hook the phase-D fp16 arm uses.
                                       # Next: C-completion (firefly/hit-dist-recon/3x3-fallback)
-                                      # + F8, D tuning to parity on the B70 at <1 ms (NRD:
-                                      # 1.74-1.97 ms B70; fp16 arm, wave ops, B70 group-size
-                                      # sweep, plane-distance bilateral upgrade, anti-lag,
-                                      # stabilization, specular virtual-motion v1.5), E default
-                                      # flip + NRD deletion.
+                                      # + F8, further D tuning (fp16 arm, wave ops,
+                                      # plane-distance bilateral upgrade, anti-lag,
+                                      # stabilization, specular virtual-motion v1.5), then E's
+                                      # remaining half — the NRD deletion (the FLIP half of E
+                                      # SHIPPED 2026-08-09, same day: frd defaults ON, nrd is
+                                      # the opt-in oracle; see the precedence block above).
                                       # Touch frd.rs / frd_gpu.rs / the DnGpu enum /
                                       # arm_denoiser_for -> run --check, --check-gpu, --check-dxr,
                                       # --check-nrd (must stay untouched while NRD lives),

@@ -415,18 +415,21 @@ fn main() {
         );
         std::process::exit(2);
     }
-    // FRD vs NRD: ONE denoiser slot per session. Only the EXPLICIT pair is a
-    // contradiction (exit 2, the being-told shape) — a merely-DEFAULTED side
-    // (the settings file seeds opts.frd, the compiled default seeds opts.nrd;
-    // neither sets its _explicit) yields to the explicit one instead: a
-    // default must never make another flag fatal (the fg_explicit precedent).
-    // An explicit --frd disarms the defaulted nrd SILENTLY (opting into FRD
-    // is obviously opting out of the default NRD, and a note would nag every
-    // --frd session); an explicit --nrd disarms a file-defaulted frd with one
-    // loud line (the nrd-default-disarmed shape below); both defaulted = the
-    // file's frd opted in, the compiled nrd yields silently. Runs before the
-    // nrd/nppd block so a --frd session's nppd conflict reports against frd,
-    // not the already-disarmed nrd.
+    // FRD vs NRD: ONE denoiser slot per session. FRD IS THE COMPILED DEFAULT
+    // since the Phase-E flip (2026-08-09 — parity held at 2.5× NRD's speed);
+    // NRD is the opt-in A/B oracle until its planned deletion. Only the
+    // EXPLICIT pair is a contradiction (exit 2, the being-told shape) — a
+    // merely-DEFAULTED side (the compiled default seeds opts.frd, the
+    // settings file can seed either; neither sets its _explicit) yields to
+    // the explicit one instead: a default must never make another flag fatal
+    // (the fg_explicit precedent). An explicit --nrd disarms the defaulted
+    // frd SILENTLY (opting into the oracle is obviously opting out of the
+    // default FRD, and a note would nag every --nrd A/B session); an
+    // explicit --frd disarms a file-defaulted nrd with one loud line (the
+    // default-disarmed shape below); both defaulted = the file's nrd opted
+    // in, the compiled frd yields silently (a saved preference beats a
+    // compiled default). Runs before the nppd blocks so a --nrd session's
+    // nppd conflict reports against nrd, not the already-disarmed frd.
     if opts.frd && opts.nrd {
         if opts.frd_explicit && opts.nrd_explicit {
             eprintln!(
@@ -434,17 +437,17 @@ fn main() {
             );
             std::process::exit(2);
         }
-        if opts.frd_explicit || !opts.nrd_explicit {
-            opts.nrd = false;
-        } else {
-            eprintln!("frd: default disarmed — --nrd claims the denoiser slot");
+        if opts.nrd_explicit || !opts.frd_explicit {
             opts.frd = false;
+        } else {
+            eprintln!("nrd: default disarmed — --frd claims the denoiser slot");
+            opts.nrd = false;
         }
     }
     // FRD vs NPPD: the color-slot conflict below. An EXPLICIT --frd beside
-    // --nppd is a contradiction (exit 2); a FILE-DEFAULTED frd yields loudly
-    // instead (the defaulted-nrd shape below — a settings value must never
-    // make --nppd fatal).
+    // --nppd is a contradiction (exit 2); a DEFAULTED frd (the compiled
+    // default, or a settings value) yields loudly instead — a default must
+    // never make --nppd fatal.
     if opts.frd && opts.nppd {
         if opts.frd_explicit {
             eprintln!(
@@ -455,11 +458,12 @@ fn main() {
         eprintln!("frd: default disarmed — --nppd claims the pre-upscale color slot");
         opts.frd = false;
     }
-    // Same shape for the two pre-upscale denoisers themselves: cs_nrd_out and
-    // the NPPD crop both claim the engine's color plane — being told beats a
-    // silent last-writer-wins. But NRD is ON BY DEFAULT, and a default must
-    // never make another flag fatal (the fg_explicit precedent): only the
-    // EXPLICIT pair exits 2; a bare --nppd disarms the defaulted nrd loudly.
+    // Same shape for NRD vs NPPD: cs_nrd_out and the NPPD crop both claim
+    // the engine's color plane — being told beats a silent last-writer-wins.
+    // NRD is opt-in since the flip, but a FILE-saved nrd is still a
+    // non-explicit default, and a default must never make another flag fatal
+    // (the fg_explicit precedent): only the EXPLICIT pair exits 2; a bare
+    // --nppd disarms a file-defaulted nrd loudly.
     if opts.nrd && opts.nppd {
         if opts.nrd_explicit {
             eprintln!(
@@ -19872,8 +19876,8 @@ fn session(
         if (opts.nrd_explicit || opts.frd_explicit)
             && !matches!(gpu_wired_up, GpuUp::Xess | GpuUp::Fsr3)
         {
-            // Loud, never fatal — and only for the EXPLICIT flags: nrd is on
-            // by default, frd can be settings-file-defaulted, and a default
+            // Loud, never fatal — and only for the EXPLICIT flags: frd is on
+            // by default, nrd can be settings-file-defaulted, and a default
             // must not nag every DLSS session. RR/FSR4-RR already denoise,
             // quinlight owns its present, plain has no upscaler to feed.
             eprintln!(

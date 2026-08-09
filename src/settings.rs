@@ -167,15 +167,18 @@ opt_fields! {
         pub nppd: bool,
         /// "auto" | "cpu" | "dml" | "dml:<n>" (--nppd-device; restart)
         pub nppd_device: String,
-        /// --nrd / --no-nrd (restart: NRD wires at tracer init). The file
-        /// sets `opts.nrd` but deliberately NEVER `nrd_explicit` — the fg
-        /// precedent, not the dxr_inline one: main makes the --nrd + --nppd
-        /// pair fatal only when nrd_explicit ("a default must never make
-        /// another flag fatal" — a saved nrd plus a --nppd experiment must
-        /// land on the loud-disarm arm), nrd_explicit also gates the
-        /// not-armed session notes (a preference must not nag every DLSS
-        /// session), and no vendor policy moves nrd, so there is nothing
-        /// for an explicit bit to veto.
+        /// --nrd / --no-nrd (restart: NRD wires at tracer init). OPT-IN
+        /// since the FRD default flip — a saved `on` claims the denoiser
+        /// slot from the compiled frd default (a saved preference beats a
+        /// compiled default, silently). The file sets `opts.nrd` but
+        /// deliberately NEVER `nrd_explicit` — the fg precedent, not the
+        /// dxr_inline one: main makes the --nrd + --nppd pair fatal only
+        /// when nrd_explicit ("a default must never make another flag
+        /// fatal" — a saved nrd plus a --nppd experiment must land on the
+        /// loud-disarm arm), nrd_explicit also gates the not-armed session
+        /// notes (a preference must not nag every DLSS session), and no
+        /// vendor policy moves nrd, so there is nothing for an explicit bit
+        /// to veto.
         pub nrd: bool,
         /// --xess-autoexposure (restart)
         pub xess_autoexposure: bool,
@@ -194,9 +197,11 @@ opt_fields! {
         pub nrd_prepass_radius: f32,
         pub nrd_anti_firefly: bool,
         pub nrd_max_accum_frames: u32,
-        /// --frd (restart): the from-scratch pre-upscale denoiser. Drives
-        /// the DEFAULT arm only — never frd_explicit (the fg-row rule), so
-        /// a file value can't make another flag fatal.
+        /// --frd / --no-frd (restart): the from-scratch pre-upscale
+        /// denoiser, THE COMPILED DEFAULT since the Phase-E flip — a saved
+        /// `off` is the kill lever. Drives the DEFAULT arm only — never
+        /// frd_explicit (the fg-row rule), so a file value can't make
+        /// another flag fatal.
         pub frd: bool,
     }
 }
@@ -1378,7 +1383,8 @@ pub fn menu_items() -> &'static [MenuItem] {
             item!("oidn", "OIDN denoise (N cycles)", "Upscaler", Live, CycleFwd, acc_bool!(upscaler.oidn)),
             item!("oidn_temporal", "OIDN temporal history (M)", "Upscaler", Live, Toggle { default: true }, acc_bool!(upscaler.oidn_temporal)),
             item!("nppd", "NPPD neural denoise (J)", "Upscaler", Live, Toggle { default: false }, acc_bool!(upscaler.nppd)),
-            item!("nrd", "NRD denoise", "Upscaler", Restart, Toggle { default: true }, acc_bool!(upscaler.nrd)),
+            item!("frd", "FRD denoise", "Upscaler", Restart, Toggle { default: true }, acc_bool!(upscaler.frd)),
+            item!("nrd", "NRD denoise (A/B oracle)", "Upscaler", Restart, Toggle { default: false }, acc_bool!(upscaler.nrd)),
             item!("oidn_post", "OIDN post-upscale start (XeSS)", "Upscaler", Restart, Toggle { default: false }, acc_bool!(upscaler.oidn_post)),
             item!("prefer", "adapter preference", "Upscaler", Restart, Cycle { options: &["nvidia", "amd", "intel"], default_ix: 0 }, acc_str!(upscaler.prefer)),
             item!("quinlight", "quinlight consensus fuse", "Upscaler", Restart, Toggle { default: false }, acc_bool!(upscaler.quinlight)),
@@ -1698,6 +1704,7 @@ pub fn opt_projection(id: &str) -> Option<fn(&crate::Opts) -> String> {
         "oidn_temporal" => |o: &Opts| onoff(o.oidn_temporal),
         "nppd" => |o: &Opts| onoff(o.nppd),
         "nrd" => |o: &Opts| onoff(o.nrd),
+        "frd" => |o: &Opts| onoff(o.frd),
         "oidn_post" => |o: &Opts| onoff(o.oidn_post),
         "prefer" => |o: &Opts| {
             use crate::gpu::adapter::Prefer;
@@ -2290,6 +2297,19 @@ pub fn self_test() -> Result<(), String> {
         let _ = apply_to_opts(&s, &mut o);
         if o.nrd != v || o.nrd_explicit {
             return Err("upscaler.nrd must move opts.nrd and never nrd_explicit".into());
+        }
+    }
+    // The frd twin (frd is the COMPILED default since the Phase-E flip, so
+    // the load-bearing arm is the saved `off` kill lever): the file moves
+    // opts.frd and never frd_explicit — main's lever block relies on a
+    // file-defaulted frd yielding loudly to --nppd instead of exiting 2.
+    for v in [true, false] {
+        let mut s = Settings::default();
+        s.upscaler.frd = Some(v);
+        let mut o = crate::cli::defaults();
+        let _ = apply_to_opts(&s, &mut o);
+        if o.frd != v || o.frd_explicit {
+            return Err("upscaler.frd must move opts.frd and never frd_explicit".into());
         }
     }
 

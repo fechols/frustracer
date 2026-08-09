@@ -91,17 +91,17 @@ pub struct Opts {
     /// NPPD execution provider: None = DirectML then CPU fallback,
     /// Some(-1) = CPU forced, Some(n) = DirectML adapter n forced.
     pub nppd_device: Option<i32>,
-    /// NRD (ReBLUR) pre-upscale denoising — ON BY DEFAULT for the sessions
-    /// that can arm it (GPU tracers × XeSS/FSR3; `--no-nrd` is the kill
-    /// lever, `--nrd` spells the default explicitly). The hand-crafted
-    /// (non-neural) temporal denoiser that cleans the 1-spp signal at render
-    /// res before the TAA-upscaler runs. DLSS-RR / FSR4-RR sessions never
-    /// arm it (they already denoise); a missing NRD.dll sheds loudly to
-    /// plain upscaling. Excl. --nppd (both claim the pre-upscale color
-    /// slot): the EXPLICIT pair exits 2, a merely-defaulted nrd disarms with
-    /// a loud line instead — the fg_explicit pattern (a default must never
-    /// make another flag fatal). Mirrored in settings.rs (upscaler.nrd — the
-    /// file sets this field only, never nrd_explicit, per that same rule).
+    /// NRD (ReBLUR) pre-upscale denoising — OPT-IN since the Phase-E default
+    /// flip (2026-08-09; FRD is the default denoiser now): `--nrd` claims
+    /// the one denoiser slot from the defaulted frd, and NRD stays as the
+    /// A/B oracle until its planned deletion. Same arming surface (GPU
+    /// tracers × XeSS/FSR3); DLSS-RR / FSR4-RR sessions never arm it (they
+    /// already denoise); a missing NRD.dll sheds loudly to plain upscaling.
+    /// Excl. --nppd (both claim the pre-upscale color slot): the EXPLICIT
+    /// pair exits 2, a merely-FILE-defaulted nrd disarms with a loud line
+    /// instead — the fg_explicit pattern (a default must never make another
+    /// flag fatal). Mirrored in settings.rs (upscaler.nrd — the file sets
+    /// this field only, never nrd_explicit, per that same rule).
     pub nrd: bool,
     /// True only when --nrd was NAMED on the command line — what makes the
     /// --nppd conflict fatal vs a loud disarm, and what gates the
@@ -121,15 +121,17 @@ pub struct Opts {
     /// the fsr_tune shape: all None = the settings the session always sent.
     pub nrd_tune: nrd::ReblurTuning,
     /// FRD — the from-scratch clean-room pre-upscale denoiser (src/frd.rs;
-    /// same arming surface as NRD: GPU tracers × XeSS/FSR3). OPT-IN until it
-    /// reaches NRD parity (the plan's Phase-E default flip): `--frd` takes
-    /// the one denoiser slot. Only EXPLICIT pairs are fatal (main's lever
-    /// block): explicit --frd + explicit --nrd or + --nppd exits 2; an
-    /// explicit --frd silently disarms the defaulted nrd (opting into FRD is
-    /// opting out of the default NRD); a FILE-defaulted frd (the settings
-    /// row seeds this field WITHOUT frd_explicit) yields loudly to an
-    /// explicit --nrd/--nppd instead — a default never makes another flag
-    /// fatal.
+    /// same arming surface as NRD: GPU tracers × XeSS/FSR3). THE DEFAULT
+    /// since the Phase-E flip (2026-08-09 — parity held at 2.5× NRD's
+    /// speed): `--no-frd` is the kill lever, `--frd` spells the default.
+    /// Only EXPLICIT pairs are fatal (main's lever block): explicit --frd +
+    /// explicit --nrd or + --nppd exits 2; an explicit --nrd silently
+    /// disarms the defaulted frd (opting into the oracle is opting out of
+    /// the default FRD); the defaulted frd yields LOUDLY to a bare --nppd
+    /// instead — a default never makes another flag fatal. The settings row
+    /// (upscaler.frd) seeds this field WITHOUT frd_explicit, the fg-row
+    /// rule; a file-saved nrd beats the compiled frd silently (a saved
+    /// preference beats a compiled default).
     pub frd: bool,
     /// True only when --frd was NAMED (the nrd_explicit pattern) — gates the
     /// "not armed" session notes.
@@ -757,14 +759,14 @@ pub fn defaults() -> Opts {
             concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\nppd\nppd_small.onnx").to_string()
         }),
         nppd_device: None,
-        nrd: true,
+        nrd: false,
         nrd_explicit: false,
         nrd_path: std::env::var("FRUSTRACER_NRD_PATH").unwrap_or_else(|_| {
             concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\NRD\bin").to_string()
         }),
         nrd_perf: false,
         nrd_tune: Default::default(),
-        frd: false,
+        frd: true,
         frd_explicit: false,
         frd_tune: Default::default(),
         xess_path: std::env::var("FRUSTRACER_XESS_PATH").unwrap_or_else(|_| {
@@ -2222,14 +2224,13 @@ pub fn usage() {
                 eprintln!("  --nppd-dump   --check-nppd plus before/after PNG dumps");
                 eprintln!("  --nppd-path   ONNX Runtime DLL directory (default: SDKs\\onnxruntime\\bin)");
                 eprintln!("  --nppd-model  exported NPPD .onnx (default: SDKs\\nppd\\nppd_small.onnx)");
-                eprintln!("  --nrd         NRD (ReBLUR) pre-upscale denoising — ON BY DEFAULT for XeSS/FSR3");
-                eprintln!("                sessions (this flag spells the default; --no-nrd is the kill lever).");
-                eprintln!("                The non-neural temporal denoiser cleaning the 1-spp signal at render");
-                eprintln!("                res before the TAA-upscaler runs. GPU tracers only; DLSS-RR/FSR4-RR");
-                eprintln!("                never arm it; excl. --nppd (explicit pair exits 2, defaulted disarms);");
-                eprintln!("                missing SDKs\\NRD\\bin\\NRD.dll sheds loudly — install-prerequisites.bat");
-                eprintln!("                nrd builds it");
-                eprintln!("  --no-nrd      kill lever: plain (undenoised) XeSS/FSR3 — the pre-NRD baseline");
+                eprintln!("  --nrd         NRD (ReBLUR) pre-upscale denoising — the OPT-IN A/B oracle since the");
+                eprintln!("                FRD default flip (claims the one denoiser slot from the defaulted frd;");
+                eprintln!("                beside an explicit --frd it exits 2). Same arming surface (GPU tracers");
+                eprintln!("                x XeSS/FSR3; DLSS-RR/FSR4-RR never arm it); excl. --nppd (explicit pair");
+                eprintln!("                exits 2); missing SDKs\\NRD\\bin\\NRD.dll sheds loudly —");
+                eprintln!("                install-prerequisites.bat nrd builds it");
+                eprintln!("  --no-nrd      the default, spelled explicitly");
                 eprintln!("  --nrd-path    NRD.dll directory (default: SDKs\\NRD\\bin)");
                 eprintln!("  --nrd-perf    load the REBLUR_PERFORMANCE_MODE build (<nrd-path>\\perf\\NRD.dll —");
                 eprintln!("                install-prerequisites.bat nrd builds both): cheaper ReBLUR internals,");
@@ -2244,12 +2245,13 @@ pub fn usage() {
                 eprintln!("  --nrd-no-anti-firefly    drop ReBLUR's anti-firefly filter (--nrd-anti-firefly");
                 eprintln!("                spells the default)");
                 eprintln!("  --check-nrd   headless: NRD math gates (DLL-free) + instance/dispatch contract (DLL)");
-                eprintln!("  --frd         FRD — the from-scratch clean-room pre-upscale denoiser (opt-in until");
-                eprintln!("                NRD parity; same arming surface: GPU tracers x XeSS/FSR3). Takes the");
-                eprintln!("                one denoiser slot: an explicit --nrd beside it exits 2, the defaulted");
-                eprintln!("                nrd disarms silently; --nppd beside it exits 2. No DLL, no install");
-                eprintln!("                step — the kernels compile like every other unit");
-                eprintln!("  --no-frd      the default, spelled explicitly");
+                eprintln!("  --frd         FRD — the from-scratch clean-room pre-upscale denoiser, ON BY DEFAULT");
+                eprintln!("                for XeSS/FSR3 sessions (this flag spells the default; --no-frd is the");
+                eprintln!("                kill lever). Holds NRD's quality band at 2.5x its speed; no DLL, no");
+                eprintln!("                install step — the kernels compile like every other unit. One denoiser");
+                eprintln!("                slot: an explicit --nrd takes it over (beside an explicit --frd that");
+                eprintln!("                exits 2), and a bare --nppd disarms the default loudly");
+                eprintln!("  --no-frd      kill lever: plain (undenoised) XeSS/FSR3 — the no-denoiser baseline");
                 eprintln!("  --frd-max-accum-frames N (clamped loudly to 63 — the meta plane's n/63 wire cap)");
                 eprintln!("                | --frd-fast-frames N | --frd-blur-radius X | --frd-clamp-sigma X");
                 eprintln!("                | --frd-no-fp16 (force the fp32 shader arm)   FRD tuning (unset = the");

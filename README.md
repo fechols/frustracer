@@ -433,7 +433,7 @@ each one's A/B is how its cost was measured in the first place.
 | Hemisphere-bounce GI / AO — the quadtree idea aimed at the light integral: converged still-frame tiers that take over from the real-time bounce | (opt-in) | **H** |
 | Heightfield relief — real displaced geometry at the intersector | (opt-in `--heightfield`) | **V** |
 | The upscaler chain — DLSS-RR → FSR4-RR → XeSS → FSR 3.1, first supported wins | `--no-upscale` | **G** / **K** / **X** |
-| NRD (ReBLUR) pre-upscale denoising — what makes XeSS/FSR 3.1 peers of the RR engines: still-view flicker 0.42 → 0.07–0.10 /255, below DLSS-RR's ~0.12 (`install-prerequisites.bat nrd` builds the SDK) | `--no-nrd` | |
+| FRD pre-upscale denoising — the from-scratch clean-room denoiser that makes XeSS/FSR 3.1 peers of the RR engines: NRD's quality band held at 2.5× its speed, no SDK to install (`--nrd` swaps the NRD/ReBLUR oracle back in for A/B) | `--no-frd` | |
 | OIDN and NPPD — the alternate denoisers: temporal-reprojected Open Image Denoise, and a neural one on ONNX Runtime / DirectML | (opt-in `--oidn` / `--nppd`) | **N** / **J** |
 | Frame generation — three families, whichever the adapter supports | `--no-fg` | |
 | Auto-exposure — a display-stage aperture for enclosures (San Miguel's patio sits 2–3 stops under a lit exterior) | (opt-in `--auto-exposure`; `--exposure-bias <EV>` is the manual lever) | |
@@ -596,7 +596,7 @@ Real flags, all of them measured rather than guessed.
 | `--bvh-ctrav 3 --bvh-axes 3 --bvh-maxleaf 8` | The SAH build knobs at their defaults — the memory lever, the speed lever, the leaf cap; build params key the scene cache, so sweeps never collide with a stale sidecar |
 | `--el-cluster grid\|som` | Emitter-placement bake-off for the emissive-light clusterer (`som` = power-weighted batch-SOM refinement — exactly weighted Lloyd's) |
 | `--fsr-max-radiance 10` (+ 5 siblings) | FSR Ray Regeneration denoiser tuning — firefly clamp, stability bias, radiance clip, disocclusion threshold, normal strength, kernel relaxation; each unset means the provider's own default |
-| `--nrd-perf`, `--nrd-max-stabilized-frames 0`, … | ReBLUR performance-mode DLL + the runtime tuning family — the levers that trade denoise quality back into frame time |
+| `--nrd-perf`, `--nrd-max-stabilized-frames 0`, … | ReBLUR performance-mode DLL + the runtime tuning family for the opt-in NRD oracle; the default FRD denoiser carries its own `--frd-*` twins |
 | `--spp 16` | Samples per pixel per frame; the quadtree is traced once regardless |
 | `--check`, `--check-gpu`, `--check-dxr` | The test suite (see below) |
 | `--gpu-timing` | Per-pass GPU milliseconds, every vendor — the only per-pass profiler that works on Arc |
