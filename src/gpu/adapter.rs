@@ -84,12 +84,9 @@ fn record_picked(v: Vendor) {
 /// Which vendor's best-VRAM adapter to prefer (never a hard requirement —
 /// the caller's feature-support probe is the real gate; a wrong-vendor pick
 /// just reports unsupported and falls back to the plain path).
-#[derive(Clone, Copy, PartialEq)]
-pub enum Prefer {
-    Nvidia,
-    Amd,
-    Intel,
-}
+/// Defined in `gfx::vocab` — `cli.rs` and `settings.rs` parse it on every
+/// platform, long before anything opens a device.
+pub use crate::gfx::vocab::Prefer;
 
 #[derive(Clone)]
 pub struct AdapterPick {

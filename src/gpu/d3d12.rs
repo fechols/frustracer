@@ -63,23 +63,12 @@ pub const BLIT_FORMAT_10BIT: DXGI_FORMAT = DXGI_FORMAT_R10G10B10A2_UNORM;
 
 /// Which color space presentation was actually negotiated in. Runtime fact,
 /// never the CLI flag — the HDR10 declare can be refused and the FG wrap can
-/// force a rebuild, so callers must read `D3d::space`. What varies with it is
-/// the tonemap encode (`tone::ToneMode`), the CPU blit format, and nothing
-/// upstream of the present.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum PresentSpace {
-    /// 8-bit `B8G8R8A8_UNORM`, display-encoded (gamma 2.2 is ours to apply).
-    /// The `--no-hdr` lever and the ladders' last rung.
-    Sdr,
-    /// 10-bit `R10G10B10A2_UNORM`, NO colour space declared — DXGI reads a
-    /// UNORM chain as gamma-2.2/`G22_NONE_P709` by default, so this is
-    /// deep-colour SDR: the same display-encoded image as `Sdr` at 10-bit
-    /// tonal resolution. The HDR-off-display default.
-    Sdr10,
-    /// 10-bit PQ — `R10G10B10A2_UNORM`, `G2084_NONE_P2020`. The
-    /// HDR-on-display default.
-    Hdr10,
-}
+/// force a rebuild, so callers must read `D3d::space`.
+///
+/// Defined in `gfx::vocab` (the CPU present wires and the settings file both
+/// read it off Windows); the DXGI mapping stays here, in `format()` below,
+/// because a `DXGI_FORMAT` may not appear in `gfx/`.
+pub use crate::gfx::vocab::PresentSpace;
 
 impl PresentSpace {
     pub fn format(self) -> DXGI_FORMAT {

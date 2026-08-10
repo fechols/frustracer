@@ -605,6 +605,12 @@ const _: () = {
 // Loader (the xess.rs shape: LoadLibraryExW + GetProcAddress fn table).
 // ---------------------------------------------------------------------------
 
+// The DLL half is Windows-only: NRD ships `NRD.dll` with DXIL embedded for
+// D3D12. `oracle` below is the portable twin and stays compiled everywhere —
+// it is what --check-nrd's DLL-free N0 gate scores, and it must not evaporate
+// off Windows just because the loader cannot. (A Vulkan NRD build is a
+// different artifact, carrying SPIRV; see SpirvBindingOffsets above.)
+#[cfg(windows)]
 mod loader {
     use super::*;
     use windows::core::{PCSTR, PCWSTR};
@@ -671,12 +677,14 @@ mod loader {
 }
 
 /// A live NRD instance over a runtime-loaded NRD.dll.
+#[cfg(windows)]
 pub struct Nrd {
     api: loader::Api,
     instance: *mut Instance,
     pub version: (u8, u8, u8),
 }
 
+#[cfg(windows)]
 impl Nrd {
     /// Load NRD.dll from `dll_dir`, gate the version/encoding pins, and
     /// create an instance over `denoisers`. Every failure is a `String` the
@@ -783,6 +791,7 @@ impl Nrd {
     }
 }
 
+#[cfg(windows)]
 impl Drop for Nrd {
     fn drop(&mut self) {
         if !self.instance.is_null() {

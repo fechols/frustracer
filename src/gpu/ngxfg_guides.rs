@@ -409,47 +409,11 @@ pub fn clip_depth(view_z: f32, near: f32, far: f32) -> f32 {
     (a + b / view_z.max(1e-6)).clamp(0.0, 1.0)
 }
 
-/// The CPU mirror of `cs_guides`' virtual-image reprojection: the PREVIOUS
-/// frame's pixel position of the virtual point behind pixel center (cx, cy),
-/// or None when it lands behind the previous image plane. `right_s`/`up_s`
-/// carry the CamBasis pre-scaling (tan(fov/2)·aspect / tan(fov/2));
-/// `m` = world → previous clip (glam column-vector convention).
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
-pub fn virtual_prev_px(
-    cx: f32,
-    cy: f32,
-    w: f32,
-    h: f32,
-    view_z: f32,
-    t_r: f32,
-    cam_far: f32,
-    origin: Vec3A,
-    fwd: Vec3A,
-    right_s: Vec3A,
-    up_s: Vec3A,
-    m: &Mat4,
-) -> Option<(f32, f32)> {
-    let ndx = cx * (2.0 / w) - 1.0;
-    let ndy = 1.0 - cy * (2.0 / h);
-    let du = (fwd + right_s * ndx + up_s * ndy).normalize();
-    let ray_t = view_z / du.dot(fwd);
-    let v = origin + du * (ray_t + t_r);
-    // t_r >= cam_far IS the pack's "reflection missed" encoding: the sky is at
-    // infinity, so project the DIRECTION (w = 0 — the translation column drops
-    // out) for rotation-only parallax. See the cs_guides twin for why a finite
-    // stand-in warps the sun's highlight.
-    let pc = if t_r >= cam_far {
-        *m * Vec4::new(du.x, du.y, du.z, 0.0)
-    } else {
-        *m * Vec4::new(v.x, v.y, v.z, 1.0)
-    };
-    if pc.w <= 1e-6 {
-        return None;
-    }
-    let (px, py) = (pc.x / pc.w, pc.y / pc.w);
-    Some(((px + 1.0) * 0.5 * w, (1.0 - py) * 0.5 * h))
-}
+/// Defined in `gfx::guides`. It moved because `frd::oracle` cross-pins its own
+/// virtual-motion unfold against it — one unfold, two engines, one pin — and
+/// `frd.rs` is compiled on every platform, so leaving the twin behind
+/// `#[cfg(windows)]` silently dropped a tooth from `--check` everywhere else.
+pub use crate::gfx::guides::virtual_prev_px;
 
 /// Round 4: the previous frame's ripple-perturbed shading normal, first
 /// order — the CPU mirror of the `n_p` block in `cs_guides`.

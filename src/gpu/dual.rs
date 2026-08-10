@@ -270,21 +270,9 @@ impl BandTransfer {
 /// combinations are legal — which is the arrangement `TileSplit::rows`' doc
 /// comment describes, and the reason a band is a contiguous ROW range on both
 /// sides rather than an interleaved mask.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Arm {
-    Wave,
-    Dxr,
-}
-
-impl Arm {
-    /// For the announce lines and the gate reports.
-    pub fn name(self) -> &'static str {
-        match self {
-            Arm::Wave => "wavefront",
-            Arm::Dxr => "DXR",
-        }
-    }
-}
+/// Defined in `gfx::vocab` (with its `name()`) — `--dual-gpu-arm` is parsed
+/// and round-tripped through the settings file on every platform.
+pub use crate::gfx::vocab::Arm;
 
 /// Which pipeline a SECONDARY adapter should run, from its own vendor.
 ///

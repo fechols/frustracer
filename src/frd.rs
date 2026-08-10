@@ -1581,7 +1581,7 @@ pub mod oracle {
                 let d = spec_virtual_delta_px(
                     216.5, 162.5, rw as f32, rh as f32, 7.0, t_r, far, org, fwd, rgt, upv, &wp,
                 );
-                let v = crate::gpu::ngxfg_guides::virtual_prev_px(
+                let v = crate::gfx::guides::virtual_prev_px(
                     216.5, 162.5, rw as f32, rh as f32, 7.0, t_r, far, org, fwd, rgt, upv, &wp,
                 )
                 .ok_or("frd: cross-pin virtual point behind camera")?;

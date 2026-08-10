@@ -511,8 +511,8 @@ pub fn parse_chain(s: &str) -> Option<ChainChoice> {
     }
 }
 
-pub fn parse_prefer(s: &str) -> Option<crate::gpu::adapter::Prefer> {
-    use crate::gpu::adapter::Prefer;
+pub fn parse_prefer(s: &str) -> Option<crate::gfx::vocab::Prefer> {
+    use crate::gfx::vocab::Prefer;
     match s {
         "nvidia" => Some(Prefer::Nvidia),
         "amd" => Some(Prefer::Amd),
@@ -535,9 +535,9 @@ pub fn parse_oidn_device(s: &str) -> Option<i32> {
 
 pub fn parse_oidn_quality(s: &str) -> Option<i32> {
     match s {
-        "fast" => Some(crate::oidn::QUALITY_FAST),
-        "balanced" => Some(crate::oidn::QUALITY_BALANCED),
-        "high" => Some(crate::oidn::QUALITY_HIGH),
+        "fast" => Some(crate::gfx::vocab::OIDN_QUALITY_FAST),
+        "balanced" => Some(crate::gfx::vocab::OIDN_QUALITY_BALANCED),
+        "high" => Some(crate::gfx::vocab::OIDN_QUALITY_HIGH),
         _ => None,
     }
 }
@@ -571,8 +571,8 @@ pub fn parse_bounce(s: &str) -> Option<u32> {
 /// inner None = "vendor". Accepts the CLI's full alias set (wave|wavefront|gpu)
 /// so a hand-edited file using an alias still loads; the menu offers the
 /// canonical three.
-pub fn parse_dual_gpu_arm(s: &str) -> Option<Option<crate::gpu::dual::Arm>> {
-    use crate::gpu::dual::Arm;
+pub fn parse_dual_gpu_arm(s: &str) -> Option<Option<crate::gfx::vocab::Arm>> {
+    use crate::gfx::vocab::Arm;
     match s {
         "vendor" => Some(None),
         "wave" | "wavefront" | "gpu" => Some(Some(Arm::Wave)),
@@ -1709,7 +1709,7 @@ pub fn opt_projection(id: &str) -> Option<fn(&crate::Opts) -> String> {
         "frd" => |o: &Opts| onoff(o.frd),
         "oidn_post" => |o: &Opts| onoff(o.oidn_post),
         "prefer" => |o: &Opts| {
-            use crate::gpu::adapter::Prefer;
+            use crate::gfx::vocab::Prefer;
             match o.prefer {
                 None => "auto".into(),
                 Some(Prefer::Nvidia) => "nvidia".into(),
@@ -1722,9 +1722,9 @@ pub fn opt_projection(id: &str) -> Option<fn(&crate::Opts) -> String> {
             o.quin_anchor.map(|v| v.to_string()).unwrap_or_else(|| "default".into())
         },
         "oidn_quality" => |o: &Opts| {
-            (if o.oidn_quality == crate::oidn::QUALITY_FAST {
+            (if o.oidn_quality == crate::gfx::vocab::OIDN_QUALITY_FAST {
                 "fast"
-            } else if o.oidn_quality == crate::oidn::QUALITY_HIGH {
+            } else if o.oidn_quality == crate::gfx::vocab::OIDN_QUALITY_HIGH {
                 "high"
             } else {
                 "balanced"
@@ -1803,7 +1803,7 @@ pub fn opt_projection(id: &str) -> Option<fn(&crate::Opts) -> String> {
         "dual_gpu_auto" => |o: &Opts| onoff(o.dual_gpu_auto),
         "dual_gpu_depth" => |o: &Opts| o.dual_gpu_depth.to_string(),
         "dual_gpu_arm" => |o: &Opts| {
-            use crate::gpu::dual::Arm;
+            use crate::gfx::vocab::Arm;
             match o.dual_gpu_arm {
                 None => "vendor".into(),
                 Some(Arm::Wave) => "wave".into(),
@@ -2346,7 +2346,7 @@ pub fn self_test() -> Result<(), String> {
         let mut s = Settings::default();
         s.advanced.dual_gpu_arm = Some("wave".into());
         let _ = apply_to_opts(&s, &mut o);
-        if o.dual_gpu != Some(2) || o.dual_gpu_arm != Some(crate::gpu::dual::Arm::Wave) {
+        if o.dual_gpu != Some(2) || o.dual_gpu_arm != Some(crate::gfx::vocab::Arm::Wave) {
             return Err("advanced.dual_gpu_arm alone must arm a default share".into());
         }
         let mut o = crate::cli::defaults();
@@ -2354,7 +2354,7 @@ pub fn self_test() -> Result<(), String> {
         s.advanced.dual_gpu = Some(0);
         s.advanced.dual_gpu_arm = Some("dxr".into());
         let _ = apply_to_opts(&s, &mut o);
-        if o.dual_gpu.is_some() || o.dual_gpu_arm != Some(crate::gpu::dual::Arm::Dxr) {
+        if o.dual_gpu.is_some() || o.dual_gpu_arm != Some(crate::gfx::vocab::Arm::Dxr) {
             return Err("an explicit dual_gpu=0 must veto dual_gpu_arm's arming, arm kept".into());
         }
         let mut o = crate::cli::defaults();

@@ -57,9 +57,13 @@ fn narrow_hdr(v: f32) -> f16 {
     let max = f16::MAX.to_f32_const();
     f16::from_f32(if v > max { max } else { v })
 }
-pub const QUALITY_FAST: i32 = 4;
-pub const QUALITY_BALANCED: i32 = 5;
-pub const QUALITY_HIGH: i32 = 6;
+/// OIDN's own `OIDNQuality` values, defined in `gfx::vocab` — `settings.rs`
+/// round-trips them through the settings file on every platform, while this
+/// module is Windows-only today.
+pub use crate::gfx::vocab::{
+    OIDN_QUALITY_BALANCED as QUALITY_BALANCED, OIDN_QUALITY_FAST as QUALITY_FAST,
+    OIDN_QUALITY_HIGH as QUALITY_HIGH,
+};
 
 /// The resolved OIDN C entry points (all cdecl, undecorated x64 exports).
 struct Api {

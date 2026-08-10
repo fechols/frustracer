@@ -1,16 +1,39 @@
+// Off Windows the D3D12 backend is the ONLY consumer of whole subsystems here
+// (every upscaler wire, the present arms, the G-buffer packers), so their items
+// genuinely have no caller until a second backend exists. Those modules — and
+// the session-scoped items in this file — therefore carry
+// `#[cfg_attr(not(windows), allow(dead_code))]` at their own declaration.
+//
+// Per-site rather than crate-wide ON PURPOSE: a blanket allow at the crate root
+// would also hide a REAL orphan, and the shared-core moves are exactly where
+// one appears — the tell that something was copied instead of moved is a dead
+// original. Marking each site keeps the lint at full strength everywhere else.
+// An `allow` is a lint attribute with no semantic effect, so none of this
+// changes a byte of what Windows compiles.
+//
+// Drop a site's attribute once the Vulkan backend gives it a second consumer.
+// If the lint then stays quiet, the attribute was load-bearing; if it fires,
+// that item really is orphaned and the lint is doing its job.
+
 // Audio ambience: per-island biome loops (world mode) + a speed-scaled
 // procedural wind. The device half (SDL3 stream + lewton decode) is
 // Windows-only inside the module; the mixer/resampler/gain math is pure and
 // feeds --check. Display-only — no render-path or rng-stream contact.
+#[cfg_attr(not(windows), allow(dead_code))]
 mod audio;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod autoexp;
 // BC7 block compression of OPAQUE scene textures (ON by default via the GPU
 // compute encoder; --no-bc7 kills, --bc7-cpu = the ispc A/B arm) — GPU upload
 // only; the CPU renderer keeps sampling the exact RGBA8 texels. Alpha-masked
 // cutout textures are deliberately excluded (see the module note).
+#[cfg_attr(not(windows), allow(dead_code))]
 mod bc7;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod blas_split;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod bvh;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod camera;
 // --cinematic: the offline beauty path (stills + camera-spline sequences).
 // Pure half — spline, presets, HUD composite, gates; the drivers that render
@@ -19,22 +42,34 @@ mod camera;
 // main's lever block does, exactly once), gated by cli::self_test.
 mod cli;
 mod cinematic;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod clouds;
 // Top-level SEH filter + panic hook: prints a symbolized stack that crosses
 // the Rust/C++ boundary (one PDB spans both) and writes a minidump. Installed
 // first thing in main so it covers load, GPU init, the frame loop AND the
 // teardown after main returns — which is where the vendor-runtime AVs live.
+#[cfg_attr(not(windows), allow(dead_code))]
 mod crash;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod dlss;
 mod emissive;
 // Signal split, wire encoders, and demodulation/composite math for FSR Ray
 // Regeneration — pure CPU, feeds --check-fsr; the GPU seam is gpu/ffx*.
 mod builders;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod fireflies;
 mod foliage;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod fsr;
 mod frustum;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod ftree;
+// The backend-NEUTRAL half of the GPU story: the vocabulary the CLI and the
+// settings file parse, and the shader-mirror math the gates cross-pin. Named
+// items move here and their old home re-exports them, so `gpu::` call sites
+// are unchanged and there is still exactly one definition. Every platform
+// compiles it — that is what keeps the headless gates whole off Windows.
+mod gfx;
 mod gltf_loader;
 mod hemi;
 // The presentation stack (D3D12) is Windows-only; everything
@@ -58,6 +93,7 @@ mod matclass;
 mod oidn;
 // The ORT loader half is Windows-only (LoadLibrary + DirectML); the padding,
 // NCHW packing, and temporal-warp math are pure and feed --check.
+#[cfg_attr(not(windows), allow(dead_code))]
 mod nppd;
 // NRD (ReBLUR) runtime FFI: the transcription + version gate + the oracle
 // math twins are pure and feed --check-nrd's DLL-free half; only Nrd::new
@@ -66,6 +102,7 @@ mod nrd;
 // FRD — the from-scratch clean-room denoiser replacing NRD (`--frd`): pure
 // math + tuning + the oracle twins the F0 gate pins (all DLL-free).
 mod frd;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod frustcap;
 // Step-0 measurement harness (FR_ORACLE=1): read-only probes that size the
 // candidate frustum-query changes. Default OFF and behaviour-free.
@@ -80,18 +117,24 @@ mod pad;
 mod progress;
 // The live AI QA control socket (--qa): TCP transport + reply encoding; the
 // verb dispatch lives in session()'s drain (it needs the session locals).
+#[cfg_attr(not(windows), allow(dead_code))]
 mod qa;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod render;
 mod reproject;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod scene;
 mod scene_cache;
 // JSON-persisted user settings (frustracer-settings.json next to the exe):
 // file provides defaults, CLI flags override, the pause menu writes it.
 // Headless --check*/--spin runs ignore the file entirely.
+#[cfg_attr(not(windows), allow(dead_code))]
 mod settings;
 // Glare: the optics between the scene and the sensor. A display-stage pass, so
 // it never touches accum, the temporal cache, or any upscaler guide.
+#[cfg_attr(not(windows), allow(dead_code))]
 mod bloom;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod shade;
 // Shading-class taxonomy for the --dxr-sbt many-record SBT ladder (pure;
 // the strip table + its soundness gate — see the module doc).
@@ -118,6 +161,7 @@ mod upchain;
 mod world;
 // The loader half is Windows-only (LoadLibrary); the FFI structs, depth
 // encoding, and the dynamic-res controller are pure and feed --check-xess.
+#[cfg_attr(not(windows), allow(dead_code))]
 mod xess;
 mod xess_fg;
 
@@ -132,6 +176,7 @@ use std::time::{Duration, Instant};
 
 const W: usize = 1920;
 const H: usize = 1080;
+#[cfg_attr(not(windows), allow(dead_code))]
 const MAX_SAMPLES: u32 = 1024;
 /// Frame budget for dynamic-resolution mode: 60 FPS minus resolve/present
 /// headroom. Not a per-tile deadline: a log4-proportional controller turns the
@@ -139,10 +184,12 @@ const MAX_SAMPLES: u32 = 1024;
 /// for the next frame; tiles reaching the cap unresolved are sparse-filled
 /// (render::sparse_fill). Cost roughly quadruples per level, so
 /// log4(budget/elapsed) reads "levels of headroom" directly.
+#[cfg_attr(not(windows), allow(dead_code))]
 const RENDER_BUDGET: Duration = Duration::from_millis(15);
 /// U cycles samples per pixel by doubling, wrapping at dlss::MAX_SPP (128):
 /// 1 -> 2 -> 4 -> ... -> 128 -> 1. Powers of two because the interesting axis
 /// is variance, which halves per doubling (error ~ 1/√N).
+#[cfg_attr(not(windows), allow(dead_code))]
 fn next_spp(cur: u32) -> u32 {
     let n = cur.saturating_mul(2);
     if n > dlss::MAX_SPP {
@@ -153,10 +200,13 @@ fn next_spp(cur: u32) -> u32 {
 }
 
 /// Controller gain on the log4 error.
+#[cfg_attr(not(windows), allow(dead_code))]
 const DEPTH_GAIN: f32 = 0.6;
 /// Max upward step per frame — creep up (>= 3 frames per level)...
+#[cfg_attr(not(windows), allow(dead_code))]
 const STEP_UP_MAX: f32 = 0.4;
 /// ...but drop more than a full level in one step after a blown frame.
+#[cfg_attr(not(windows), allow(dead_code))]
 const STEP_DOWN_MAX: f32 = 1.5;
 
 /// The CLI surface — `Opts` plus the parser that fills it — lives in
@@ -171,6 +221,7 @@ pub use cli::Opts;
 /// synchronous GPU readback plus a window-res denoise every frame and
 /// presents through the CPU blit path.
 #[derive(Clone, Copy, PartialEq)]
+#[cfg_attr(not(windows), allow(dead_code))]
 enum XessOidn {
     Off,
     Pre,
@@ -183,6 +234,7 @@ enum XessOidn {
 /// if/else chains it replaced each re-encoded the precedence by ordering and
 /// could silently disagree when a toggle handler missed a reset.
 #[derive(Clone, Copy, PartialEq)]
+#[cfg_attr(not(windows), allow(dead_code))]
 enum RenderMode {
     Dlss,
     Xess,
@@ -214,6 +266,7 @@ enum RenderMode {
 /// the upscaler holds history for. The `dlss::DlssPrev` shape for the
 /// paths that retained a bare `Camera`.
 #[derive(Clone, Copy)]
+#[cfg_attr(not(windows), allow(dead_code))]
 struct PrevPose {
     cam: Camera,
     sway_t: Option<f32>,
@@ -514,7 +567,7 @@ fn main() {
     // (--fsr/--fsr3), NVIDIA otherwise. An explicit --prefer-* always wins;
     // the chain then probes whatever adapter got picked.
     if opts.prefer.is_none() && fsr_forced {
-        opts.prefer = Some(gpu::adapter::Prefer::Amd);
+        opts.prefer = Some(gfx::vocab::Prefer::Amd);
     }
     if no_upscale {
         eprintln!("upscale: OFF (--no-upscale; plain presentation)");
@@ -691,27 +744,37 @@ fn main() {
             );
         }
     }
-    gpu::trace::set_cloud_shadow(opts.cloud_shadow);
-    gpu::trace::set_sky_lod(opts.sky_lod);
-    // --waveviz wins over the FR_WAVEVIZ env alias; both land before any GPU
-    // construction (Passes::new + both tracers' kernel assemblies read it).
-    match if opts.waveviz != 0 { opts.waveviz } else { gpu::trace::waveviz_env() } {
-        0 => {}
-        m => gpu::trace::set_waveviz(m),
-    }
-    gpu::dxr::set_inline_mode(opts.dxr_inline);
-    // --dxr-sbt: parse-time only (no vendor policy, so no run_window
-    // re-store) — and it MUST land before any SceneGpu upload, which bakes
-    // the per-class instance contributions off this knob.
-    gpu::dxr::set_sbt_mode(opts.dxr_sbt);
+    // The knobs that live on the backend. They are set here, before any
+    // scene load or device construction, and read by kernel assembly — so
+    // they follow the backend module until the shader assembly itself moves
+    // to `gfx`. Off Windows there is no backend to configure yet; `Opts`
+    // still carries every value, so nothing is lost but the store.
+    #[cfg(windows)]
+    {
+        gpu::trace::set_cloud_shadow(opts.cloud_shadow);
+        gpu::trace::set_sky_lod(opts.sky_lod);
+        // --waveviz wins over the FR_WAVEVIZ env alias; both land before any
+        // GPU construction (Passes::new + both tracers' kernel assemblies read
+        // it).
+        match if opts.waveviz != 0 { opts.waveviz } else { gpu::trace::waveviz_env() } {
+            0 => {}
+            m => gpu::trace::set_waveviz(m),
+        }
+        gpu::dxr::set_inline_mode(opts.dxr_inline);
+        // --dxr-sbt: parse-time only (no vendor policy, so no run_window
+        // re-store) — and it MUST land before any SceneGpu upload, which bakes
+        // the per-class instance contributions off this knob.
+        gpu::dxr::set_sbt_mode(opts.dxr_sbt);
 
-    // PIX command-list markers: opt-in, runtime-loaded; inert otherwise.
-    gpu::pix::init(&opts.pix_path, opts.pix_markers);
-    // The same marker brackets, timed with D3D12 timestamp queries. No DLL,
-    // every vendor — the only per-pass GPU numbers available on Intel. Armed
-    // for interactive sessions (a table every REPORT_EVERY frames) AND for the
-    // headless suites, whose bench is the deterministic workload.
-    gpu::gputime::enable(opts.gpu_timing);
+        // PIX command-list markers: opt-in, runtime-loaded; inert otherwise.
+        gpu::pix::init(&opts.pix_path, opts.pix_markers);
+        // The same marker brackets, timed with D3D12 timestamp queries. No DLL,
+        // every vendor — the only per-pass GPU numbers available on Intel.
+        // Armed for interactive sessions (a table every REPORT_EVERY frames)
+        // AND for the headless suites, whose bench is the deterministic
+        // workload.
+        gpu::gputime::enable(opts.gpu_timing);
+    }
 
     // A/B lever: --no-cut-rays sends cut-seeded rays down the root traversal
     // instead. Every ray consumer funnels through intersect_multi/occluded_multi,
@@ -725,6 +788,7 @@ fn main() {
     // leaf primaries consume it through rt_sw.hlsli. Only a departure from
     // the default prints (the blas-split lever-line rule).
     if opts.sw_rays {
+        #[cfg(windows)]
         gpu::trace::SW_RAYS.store(true, std::sync::atomic::Ordering::Relaxed);
         if opts.cut_rays {
             eprintln!(
@@ -809,6 +873,7 @@ fn main() {
         eprintln!("ftree: --ftree-tiles — the tile recursion runs on the 8-wide frustum tree");
     }
     if !opts.wide_levels {
+        #[cfg(windows)]
         gpu::trace::WIDE_LEVELS_ON.store(false, std::sync::atomic::Ordering::Relaxed);
         eprintln!(
             "gpu: --no-wide-levels — every quadtree level runs one thread per tile \
@@ -11120,6 +11185,9 @@ fn run_check_gpu(
 /// samplers — then pulls one dispatch list through SetCommonSettings at a
 /// synthetic 320x180 and bounds-checks every DispatchDesc.
 fn run_check_nrd(opts: &Opts) -> i32 {
+    // Only N1 reads it (the DLL path); N0 below is pure.
+    #[cfg(not(windows))]
+    let _ = opts;
     let mut ok = true;
 
     // N0 — DLL-free math twins.
@@ -11130,105 +11198,119 @@ fn run_check_nrd(opts: &Opts) -> i32 {
         println!("check-nrd: N0 oracle math OK");
     }
 
-    // N1 — the DLL contract.
-    let denoisers = [nrd::DenoiserDesc {
-        identifier: 0,
-        denoiser: nrd::DENOISER_REBLUR_DIFFUSE_SPECULAR,
-    }];
-    let mut inst = match nrd::Nrd::new(&opts.nrd_path, &denoisers) {
-        Ok(i) => i,
-        Err(e) => {
-            // A missing/drifted DLL must not fail a bare-checkout gate run —
-            // but say exactly how to get one.
-            println!(
-                "check-nrd: SKIP N1 (NRD.dll unavailable: {e}); run install-prerequisites.bat nrd"
-            );
-            return if ok { 0 } else { 1 };
-        }
-    };
+    // N1 — the DLL contract. Windows-only for now, and SAID rather than
+    // silently skipped: NRD's D3D12 artifact is `NRD.dll` with DXIL
+    // embedded, which has no Linux equivalent (the portable NRD build
+    // carries SPIRV — see `SpirvBindingOffsets` in nrd.rs — and is a
+    // Vulkan-backend concern). N0 above is the DLL-free half and runs on
+    // every platform, so the packing math is still gated here.
+    #[cfg(not(windows))]
     println!(
-        "check-nrd: N1 NRD v{}.{}.{} loaded (encodings pinned 2/1)",
-        inst.version.0, inst.version.1, inst.version.2
+        "check-nrd: SKIP N1 (the NRD.dll instance/dispatch contract is \
+         D3D12-only; N0's math twins ran)"
     );
-    {
-        let d = inst.instance_desc();
-        let mut n1_ok = d.pipelines_num > 0
-            && d.permanent_pool_size > 0
-            && d.transient_pool_size > 0
-            && d.constant_buffer_max_data_size > 0
-            && d.samplers_num == 2;
-        // The install script builds DXIL-only — every pipeline must carry a
-        // DXIL blob or the GPU host has nothing to create PSOs from.
-        let pipes = unsafe { std::slice::from_raw_parts(d.pipelines, d.pipelines_num as usize) };
-        let dxil_missing = pipes
-            .iter()
-            .filter(|p| p.compute_shader_dxil.bytecode.is_null() || p.compute_shader_dxil.size == 0)
-            .count();
-        if dxil_missing > 0 {
-            n1_ok = false;
-        }
-        println!(
-            "check-nrd: N1 pipelines {} (dxil-missing {dxil_missing}) | pool perm {} trans {} | \
-             cb-max {} B | samplers {}",
-            d.pipelines_num,
-            d.permanent_pool_size,
-            d.transient_pool_size,
-            d.constant_buffer_max_data_size,
-            d.samplers_num
-        );
-        if !n1_ok {
-            eprintln!("check-nrd: FAIL N1 instance contract (see the counter line)");
-            ok = false;
-        }
-    }
 
-    // One dispatch list at a synthetic res: grids and indices must be sane.
-    let mut cs = nrd::CommonSettings::default();
-    let ident = [
-        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
-    ];
-    cs.view_to_clip_matrix = ident;
-    cs.view_to_clip_matrix_prev = ident;
-    cs.world_to_view_matrix = ident;
-    cs.world_to_view_matrix_prev = ident;
-    cs.resource_size = [320, 180];
-    cs.resource_size_prev = [320, 180];
-    cs.rect_size = [320, 180];
-    cs.rect_size_prev = [320, 180];
-    cs.accumulation_mode = nrd::ACCUM_RESTART;
-    if let Err(e) = inst.set_common_settings(&cs) {
-        eprintln!("check-nrd: FAIL N1 {e}");
-        ok = false;
-    }
-    if let Err(e) = inst.set_reblur_settings(0, &nrd::ReblurSettings::default()) {
-        eprintln!("check-nrd: FAIL N1 {e}");
-        ok = false;
-    }
-    let pipelines_num = inst.instance_desc().pipelines_num;
-    match inst.compute_dispatches(&[0]) {
-        Ok(ds) if !ds.is_empty() => {
-            let bad = ds
+    #[cfg(windows)]
+    {
+        let denoisers = [nrd::DenoiserDesc {
+            identifier: 0,
+            denoiser: nrd::DENOISER_REBLUR_DIFFUSE_SPECULAR,
+        }];
+        let mut inst = match nrd::Nrd::new(&opts.nrd_path, &denoisers) {
+            Ok(i) => i,
+            Err(e) => {
+                // A missing/drifted DLL must not fail a bare-checkout gate run —
+                // but say exactly how to get one.
+                println!(
+                    "check-nrd: SKIP N1 (NRD.dll unavailable: {e}); run install-prerequisites.bat nrd"
+                );
+                return if ok { 0 } else { 1 };
+            }
+        };
+        println!(
+            "check-nrd: N1 NRD v{}.{}.{} loaded (encodings pinned 2/1)",
+            inst.version.0, inst.version.1, inst.version.2
+        );
+        {
+            let d = inst.instance_desc();
+            let mut n1_ok = d.pipelines_num > 0
+                && d.permanent_pool_size > 0
+                && d.transient_pool_size > 0
+                && d.constant_buffer_max_data_size > 0
+                && d.samplers_num == 2;
+            // The install script builds DXIL-only — every pipeline must carry a
+            // DXIL blob or the GPU host has nothing to create PSOs from.
+            let pipes = unsafe { std::slice::from_raw_parts(d.pipelines, d.pipelines_num as usize) };
+            let dxil_missing = pipes
                 .iter()
-                .filter(|d| {
-                    d.pipeline_index as u32 >= pipelines_num
-                        || d.grid_width == 0
-                        || d.grid_height == 0
-                        || d.resources_num == 0
-                })
+                .filter(|p| p.compute_shader_dxil.bytecode.is_null() || p.compute_shader_dxil.size == 0)
                 .count();
-            println!("check-nrd: N1 dispatches {} (bad {bad})", ds.len());
-            if bad > 0 {
-                eprintln!("check-nrd: FAIL N1 dispatch bounds");
+            if dxil_missing > 0 {
+                n1_ok = false;
+            }
+            println!(
+                "check-nrd: N1 pipelines {} (dxil-missing {dxil_missing}) | pool perm {} trans {} | \
+                 cb-max {} B | samplers {}",
+                d.pipelines_num,
+                d.permanent_pool_size,
+                d.transient_pool_size,
+                d.constant_buffer_max_data_size,
+                d.samplers_num
+            );
+            if !n1_ok {
+                eprintln!("check-nrd: FAIL N1 instance contract (see the counter line)");
                 ok = false;
             }
         }
-        Ok(_) => {
-            eprintln!("check-nrd: FAIL N1 zero dispatches for a live denoiser");
-            ok = false;
-        }
-        Err(e) => {
+
+        // One dispatch list at a synthetic res: grids and indices must be sane.
+        let mut cs = nrd::CommonSettings::default();
+        let ident = [
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ];
+        cs.view_to_clip_matrix = ident;
+        cs.view_to_clip_matrix_prev = ident;
+        cs.world_to_view_matrix = ident;
+        cs.world_to_view_matrix_prev = ident;
+        cs.resource_size = [320, 180];
+        cs.resource_size_prev = [320, 180];
+        cs.rect_size = [320, 180];
+        cs.rect_size_prev = [320, 180];
+        cs.accumulation_mode = nrd::ACCUM_RESTART;
+        if let Err(e) = inst.set_common_settings(&cs) {
             eprintln!("check-nrd: FAIL N1 {e}");
             ok = false;
+        }
+        if let Err(e) = inst.set_reblur_settings(0, &nrd::ReblurSettings::default()) {
+            eprintln!("check-nrd: FAIL N1 {e}");
+            ok = false;
+        }
+        let pipelines_num = inst.instance_desc().pipelines_num;
+        match inst.compute_dispatches(&[0]) {
+            Ok(ds) if !ds.is_empty() => {
+                let bad = ds
+                    .iter()
+                    .filter(|d| {
+                        d.pipeline_index as u32 >= pipelines_num
+                            || d.grid_width == 0
+                            || d.grid_height == 0
+                            || d.resources_num == 0
+                    })
+                    .count();
+                println!("check-nrd: N1 dispatches {} (bad {bad})", ds.len());
+                if bad > 0 {
+                    eprintln!("check-nrd: FAIL N1 dispatch bounds");
+                    ok = false;
+                }
+            }
+            Ok(_) => {
+                eprintln!("check-nrd: FAIL N1 zero dispatches for a live denoiser");
+                ok = false;
+            }
+            Err(e) => {
+                eprintln!("check-nrd: FAIL N1 {e}");
+                ok = false;
+            }
         }
     }
 
@@ -12178,6 +12260,7 @@ struct SwayMvStats {
 /// probe are pure functions of the scene. Used with prev == cur camera, so
 /// the written MV is PURE object motion and the camera-only imposter is ~0
 /// by construction.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn sway_mv_pose(scene: &scene::Scene, sw: &foliage::SceneSway, bvh: &bvh::Bvh) -> Camera {
     let mut count = vec![0u32; sw.cells.len()];
     for &c in &sw.tri_cell {
@@ -13288,6 +13371,10 @@ fn run_check_nppd(
     }
 }
 
+// The OIDN gate needs the runtime-loaded SDK; its dispatch site is
+// already gated. OIDN itself is cross-platform and ships a Linux .so —
+// wiring that is a Vulkan-backend milestone, not this one.
+#[cfg(windows)]
 fn run_check_oidn(
     scene: &scene::Scene,
     bvh: &bvh::Bvh,
@@ -13943,6 +14030,7 @@ fn spin_lap_frames(frames: u32, explicit: bool, warmup: u32, moving: bool, arm: 
 /// optimized replacement in the background. The measured landing window is
 /// roughly 600-1500 frames, so begin Intel measurements after 1600 unless the
 /// caller explicitly selects another `--spin-warmup`.
+#[cfg_attr(not(windows), allow(dead_code))]
 const INTEL_SPIN_WARMUP: u32 = 1600;
 
 /// Deterministic benchmark camera: a CLOSED-loop Catmull-Rom spline keyed
@@ -14321,6 +14409,7 @@ struct CineFrame {
     /// baked `Scene::sway` at it (CPU arm); the GPU arm hands it to
     /// `FrameParams::sway_time`. One pose per OUTPUT frame — invariant 1's
     /// shape, which is what keeps sub-frame replay bit-identical.
+    #[cfg_attr(not(windows), allow(dead_code))]
     sway_time: f32,
 }
 
@@ -17725,6 +17814,7 @@ fn run_spin_gpu(
 /// overlay and the dump agree color-for-color). "Compact" = a 32-lane wave
 /// whose bounding box is at most 8x8-ish (<= 96 px area — three 32-px rows);
 /// screen-tiled launches score near 100%, scattered packing near 0.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn waveviz_dump(label: &str, bits: &[u32], w: usize, h: usize) {
     use std::collections::HashMap;
     // ticket -> (min_x, max_x, min_y, max_y, count)
@@ -18066,6 +18156,18 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     // the renderer's own midpoint-split rect geometry, at a power-of-two and
     // an odd resolution, plus the partition/complement contracts at every
     // split position. Pure and lever-independent — the blas-split rule.
+    // Both dual-GPU gates below are PURE math that happens to be hosted in the
+    // D3D12 backend (tile-split bit arithmetic; transfer byte addressing) —
+    // they move to the shared core with the rest of the layout math, and
+    // rejoin this suite on every platform when they do. Until then they SAY
+    // they were skipped, for the reason the comment below already gives: a
+    // gate that prints nothing reads exactly like a gate that was never wired.
+    #[cfg(not(windows))]
+    let split_ok = {
+        eprintln!("dual-gpu split self-test: SKIP (D3D12-hosted; pending the shared-core move)");
+        true
+    };
+    #[cfg(windows)]
     let split_ok = match gpu::trace::split_self_test() {
         Ok(()) => {
             // Announce on success like every neighbouring self-test: a gate
@@ -18086,6 +18188,12 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
     // Pure and lever-independent (the blas-split rule). This is the level
     // below the split gate — a wrong offset here renders a plausible image
     // with one displaced stripe, which is far harder to attribute than a hole.
+    #[cfg(not(windows))]
+    let dual_ok = {
+        eprintln!("dual-gpu transfer self-test: SKIP (D3D12-hosted; pending the shared-core move)");
+        true
+    };
+    #[cfg(windows)]
     let dual_ok = match gpu::dual::self_test() {
         Ok(()) => {
             eprintln!("dual-gpu transfer self-test: OK");
@@ -21770,20 +21878,16 @@ fn fr_ref_hybrid_default() -> bool {
     })
 }
 
-/// One renderer session at a fixed window size (w, h): everything sized
-/// from the window lives in here and rebuilds when a resize re-enters.
-/// Seeds user-visible state from `persist` (subsequent entries) or the CLI
-/// flags (first entry), and writes it back on every exit.
-#[cfg(windows)]
-#[allow(clippy::too_many_arguments)]
 /// A --qa verb that could not answer in its own drain: `screenshot` waits
 /// for a P arm's write, `sync` for a loop-iteration target. Every pending
 /// carries a 30 s backstop deadline (the diamondmine rule — a scripted
 /// driver must never hang forever on a verb the session dropped).
+#[cfg(windows)]
 enum QaPendKind {
     Shot,
     Sync { target: u64 },
 }
+#[cfg(windows)]
 struct QaPending {
     kind: QaPendKind,
     reply: std::sync::mpsc::SyncSender<String>,
@@ -21795,6 +21899,7 @@ struct QaPending {
 /// after their save/failure — the diamondmine typed-result lesson: a failed
 /// capture must answer ok:false, never an info line a driver parses as
 /// success).
+#[cfg(windows)]
 fn qa_resolve_shot(pend: &mut Vec<QaPending>, res: Result<&str, &str>) {
     if let Some(i) = pend.iter().position(|p| matches!(p.kind, QaPendKind::Shot)) {
         let p = pend.remove(i);
@@ -21806,6 +21911,11 @@ fn qa_resolve_shot(pend: &mut Vec<QaPending>, res: Result<&str, &str>) {
     }
 }
 
+/// One renderer session at a fixed window size (w, h): everything sized
+/// from the window lives in here and rebuilds when a resize re-enters.
+/// Seeds user-visible state from `persist` (subsequent entries) or the CLI
+/// flags (first entry), and writes it back on every exit.
+#[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 fn session(
     scene: &mut scene::Scene,
@@ -26438,6 +26548,11 @@ fn session(
 /// re-resolves into it (`resolve_*_sdr`) rather than trying to invert the
 /// display-referred output — that inversion is not well-defined, and a
 /// screenshot is rare enough that a second tonemap costs nothing.
+// The CPU-presented arms' staging buffers. Windows-only with the
+// swapchain they feed — `PresentSpace` itself is in `gfx::vocab`, so the
+// two 10-bit wire packers in `render.rs` stay portable for the Vulkan
+// backend to reuse.
+#[cfg(windows)]
 struct CpuPresent {
     sdr: Vec<u32>,
     wire10: Vec<u32>,
@@ -26454,6 +26569,7 @@ struct CpuPresent {
     meter: Option<f32>,
 }
 
+#[cfg(windows)]
 impl CpuPresent {
     fn new(w: usize, h: usize, enc: gpu::d3d12::PresentSpace, tone: tone::ToneParams) -> Self {
         use gpu::d3d12::PresentSpace;

@@ -28,9 +28,22 @@
 
 use crate::camera::Camera;
 use crate::{
-    bc7, blas_split, bloom, bvh, cinematic, clouds, dlss, emissive, fireflies, frd, fsr, gpu,
-    nrd, oidn, qa, scene, settings, texture, tone, upchain, xess,
+    bc7, blas_split, bloom, bvh, cinematic, clouds, dlss, emissive, fireflies, frd, fsr, nrd,
+    qa, scene, settings, texture, tone, upchain, xess,
 };
+// The vocabulary the parser needs (`--prefer-*`, `--dual-gpu-arm`,
+// `--oidn-quality`) lives in `gfx`, not behind the Windows-only backend
+// modules that happen to consume it — parsing an enum is not a D3D12
+// operation. See `gfx::vocab`.
+use crate::gfx::vocab::{
+    OIDN_QUALITY_BALANCED, OIDN_QUALITY_FAST, OIDN_QUALITY_HIGH, Prefer,
+};
+// `lever_snapshot` READS four backend knobs to prove the parser left them
+// alone, and `mod gpu` is itself `#[cfg(windows)]` — so this import must carry
+// the same gate the only use site does, or it is an error on the platform that
+// has no backend.
+#[cfg(windows)]
+use crate::gpu;
 use glam::Vec3A;
 
 /// CLI options beyond the OBJ path / --check.
@@ -195,7 +208,7 @@ pub struct Opts {
     /// --fsr, NVIDIA otherwise). A preference, not a requirement: the
     /// feature-support probes still gate, so e.g. DLSS on a non-NVIDIA pick
     /// logs and falls back rather than erroring.
-    pub prefer: Option<gpu::adapter::Prefer>,
+    pub prefer: Option<Prefer>,
     /// Start XeSS mode with the OIDN denoise placed AFTER the upscale
     /// (requires --xess; N cycles placement at runtime).
     pub oidn_post: bool,
@@ -353,7 +366,7 @@ pub struct Opts {
     /// A secondary that cannot host a `DxrGpu` (no RT tier 1.0) degrades to
     /// the wavefront with a loud line even when this asks for DXR: that floor
     /// is soundness, not policy.
-    pub dual_gpu_arm: Option<crate::gpu::dual::Arm>,
+    pub dual_gpu_arm: Option<crate::gfx::vocab::Arm>,
     /// A/B lever (--no-ftree disables): route ALL bound queries through the
     /// 8-wide frustum tree lazily collapsed from the ray BVH (ftree.rs) — the
     /// two-tree split. Rays always stay on the binary BVH.
@@ -766,7 +779,7 @@ pub fn defaults() -> Opts {
             concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\oidn.x64.windows\bin").to_string()
         }),
         oidn_device: 0,
-        oidn_quality: oidn::QUALITY_BALANCED,
+        oidn_quality: OIDN_QUALITY_BALANCED,
         oidn_clean_aux: true,
         oidn_temporal: true,
         nppd: false,
@@ -1637,8 +1650,8 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
                     opts.dual_gpu = Some(2);
                 }
                 opts.dual_gpu_arm = Some(match v.as_str() {
-                    "wave" | "wavefront" | "gpu" => crate::gpu::dual::Arm::Wave,
-                    "dxr" => crate::gpu::dual::Arm::Dxr,
+                    "wave" | "wavefront" | "gpu" => crate::gfx::vocab::Arm::Wave,
+                    "dxr" => crate::gfx::vocab::Arm::Dxr,
                     _ => {
                         eprintln!("--dual-gpu-arm: '{v}' is not wave|dxr");
                         std::process::exit(2);
@@ -2003,9 +2016,9 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
             }
             "--oidn-quality" => {
                 opts.oidn_quality = match args.next().as_deref() {
-                    Some("fast") => oidn::QUALITY_FAST,
-                    Some("balanced") => oidn::QUALITY_BALANCED,
-                    Some("high") => oidn::QUALITY_HIGH,
+                    Some("fast") => OIDN_QUALITY_FAST,
+                    Some("balanced") => OIDN_QUALITY_BALANCED,
+                    Some("high") => OIDN_QUALITY_HIGH,
                     _ => {
                         eprintln!("--oidn-quality needs one of: fast balanced high");
                         std::process::exit(2);
@@ -2104,9 +2117,9 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
                     std::process::exit(2);
                 })
             }
-            "--prefer-nvidia" => opts.prefer = Some(gpu::adapter::Prefer::Nvidia),
-            "--prefer-intel" => opts.prefer = Some(gpu::adapter::Prefer::Intel),
-            "--prefer-amd" => opts.prefer = Some(gpu::adapter::Prefer::Amd),
+            "--prefer-nvidia" => opts.prefer = Some(Prefer::Nvidia),
+            "--prefer-intel" => opts.prefer = Some(Prefer::Intel),
+            "--prefer-amd" => opts.prefer = Some(Prefer::Amd),
             "--gpu-debug" => opts.gpu_debug = true,
             // BC7 is ON by default (the GPU arm at `fast`). --bc7 re-arms
             // after a --no-bc7 (later flags win, never switching an explicit
@@ -2649,6 +2662,21 @@ pub fn usage() {
 /// (`set_aniso` clamps to 1 while mips are off), which is why the pair is one
 /// contract and gets applied in one order.
 fn lever_snapshot() -> String {
+    // The four backend-side knobs, bound here because an attribute may not sit
+    // on a `format!` argument. Gated because their SETTERS are gated: off
+    // Windows the purity property this snapshot exists to prove is STRUCTURAL
+    // — `parse_from` cannot call a `gpu::` setter that does not compile, which
+    // is a stronger guarantee than the snapshot's rather than a weaker one.
+    // They rejoin it when the shader-assembly knobs move to `gfx`.
+    #[cfg(windows)]
+    let (cshadow, skylod, dxrinline, dxrsbt) = (
+        gpu::trace::cloud_shadow_n(),
+        gpu::trace::sky_lod(),
+        gpu::dxr::dxr_inline_mode(),
+        gpu::dxr::dxr_sbt_mode(),
+    );
+    #[cfg(not(windows))]
+    let (cshadow, skylod, dxrinline, dxrsbt) = (0u32, 0u32, 0u32, 0u32);
     format!(
         "mips={} aniso={} h2n={} n2h={} smips={} saa={} tint={} spray={} depth={} detail={} dao={} \
          dstr={} daostr={} duntex={} \
@@ -2683,10 +2711,10 @@ fn lever_snapshot() -> String {
         emissive::enabled(),
         emissive::budget(),
         emissive::cluster_mode_name(),
-        gpu::trace::cloud_shadow_n(),
-        gpu::trace::sky_lod(),
-        gpu::dxr::dxr_inline_mode(),
-        gpu::dxr::dxr_sbt_mode(),
+        cshadow,
+        skylod,
+        dxrinline,
+        dxrsbt,
         crate::foliage::armed(),
         crate::foliage::amp_mult(),
     )
@@ -2783,7 +2811,7 @@ pub fn self_test() -> Result<(), String> {
     for (name, took) in [
         ("dual_gpu", o.dual_gpu == Some(3)),
         ("dual_gpu_depth", o.dual_gpu_depth == 2),
-        ("dual_gpu_arm", o.dual_gpu_arm == Some(crate::gpu::dual::Arm::Dxr)),
+        ("dual_gpu_arm", o.dual_gpu_arm == Some(crate::gfx::vocab::Arm::Dxr)),
         ("frd", o.frd && o.frd_explicit),
         ("frd_tune", o.frd_tune.max_accum_frames == Some(12) && o.frd_tune.no_fp16),
         ("mips", !o.mips),
@@ -2876,7 +2904,7 @@ pub fn self_test() -> Result<(), String> {
         return Err("--dual-gpu-arm must default to None (the vendor policy decides)".into());
     }
     if parse_argv(&["--dual-gpu-arm", "wave"]).opts.dual_gpu_arm
-        != Some(crate::gpu::dual::Arm::Wave)
+        != Some(crate::gfx::vocab::Arm::Wave)
     {
         return Err("--dual-gpu-arm wave must select the wavefront".into());
     }
