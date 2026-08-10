@@ -136,20 +136,28 @@ pub struct Opts {
     /// A missing perf DLL falls back to the standard one with a loud line.
     pub nrd_perf: bool,
     /// Runtime ReblurSettings overrides (--nrd-max-stabilized-frames,
-    /// --nrd-prepass-radius, --nrd-no-anti-firefly, --nrd-max-accum-frames) —
-    /// the fsr_tune shape: all None = the settings the session always sent.
+    /// --nrd-prepass-radius, --nrd-no-anti-firefly, --nrd-max-accum-frames,
+    /// and the sub-struct tuples --nrd-antilag / --nrd-responsive /
+    /// --nrd-convergence) — the fsr_tune shape: all None = the settings the
+    /// session always sent.
     pub nrd_tune: nrd::ReblurTuning,
+    /// Runtime CommonSettings overrides (--nrd-split) — the nrd_tune shape
+    /// one level up, for fields owned by the shared settings block rather
+    /// than by ReBLUR.
+    pub nrd_common: nrd::CommonTuning,
     /// FRD — the from-scratch clean-room pre-upscale denoiser (src/frd.rs;
-    /// same arming surface as NRD: GPU tracers × XeSS/FSR3). THE DEFAULT
-    /// since the Phase-E flip (2026-08-09 — parity held at 2.5× NRD's
-    /// speed): `--no-frd` is the kill lever, `--frd` spells the default.
-    /// Only EXPLICIT pairs are fatal (main's lever block): explicit --frd +
-    /// explicit --nrd or + --nppd exits 2; an explicit --nrd silently
-    /// disarms the defaulted frd (opting into the oracle is opting out of
-    /// the default FRD); the defaulted frd yields LOUDLY to a bare --nppd
-    /// instead — a default never makes another flag fatal. The settings row
-    /// (upscaler.frd) seeds this field WITHOUT frd_explicit, the fg-row
-    /// rule; a file-saved nrd beats the compiled frd silently (a saved
+    /// same arming surface as NRD: GPU tracers × XeSS/FSR3). OPT-IN since the
+    /// 2026-08-10 flip that made NRD the default (measured on this content:
+    /// NRD delivered 68% of DLSS-RR's emissive pools at 0.29 still-frame
+    /// stability against FRD's 42% at 0.47). It stays compiled and reachable
+    /// as `--frd`, both as the A/B oracle that isolated that gap and because
+    /// it is 2.5× faster in the denoiser region; `--no-frd` spells the
+    /// default. Only EXPLICIT pairs are fatal (main's lever block): explicit
+    /// --frd + explicit --nrd or + --nppd exits 2; an explicit --frd silently
+    /// disarms the defaulted nrd; the defaulted nrd yields LOUDLY to a bare
+    /// --nppd instead — a default never makes another flag fatal. The
+    /// settings row (upscaler.frd) seeds this field WITHOUT frd_explicit, the
+    /// fg-row rule; a file-saved frd beats the compiled nrd silently (a saved
     /// preference beats a compiled default).
     pub frd: bool,
     /// True only when --frd was NAMED (the nrd_explicit pattern) — gates the
@@ -790,14 +798,24 @@ pub fn defaults() -> Opts {
             concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\nppd\nppd_small.onnx").to_string()
         }),
         nppd_device: None,
-        nrd: false,
+        // THE COMPILED DEFAULT DENOISER (2026-08-10, reversing the 08-09
+        // Phase-E flip): NRD, on measurement — the bistro emissive campaign
+        // put it at 68% of DLSS-RR's pool delivery vs FRD's 42%, and 0.29 vs
+        // 0.47 still-frame stability, which is the visible half of the
+        // parked-camera darkening report. FRD stays compiled as the opt-in
+        // `--frd` (2.5x faster in the denoiser region, and the A/B oracle that
+        // isolated those bugs). The build now REQUIRES NRD (build.rs
+        // require_nrd), so unlike every other vendor level this default cannot
+        // silently fail to exist.
+        nrd: true,
         nrd_explicit: false,
         nrd_path: std::env::var("FRUSTRACER_NRD_PATH").unwrap_or_else(|_| {
             concat!(env!("CARGO_MANIFEST_DIR"), r"\SDKs\NRD\bin").to_string()
         }),
         nrd_perf: false,
         nrd_tune: Default::default(),
-        frd: true,
+        nrd_common: Default::default(),
+        frd: false,
         frd_explicit: false,
         frd_tune: Default::default(),
         xess_path: std::env::var("FRUSTRACER_XESS_PATH").unwrap_or_else(|_| {
@@ -919,6 +937,32 @@ pub fn defaults() -> Opts {
         foliage_sway: true,
         foliage_amp: 1.0,
     }
+}
+
+/// A comma-separated float tuple for the `--nrd-*` sub-struct levers
+/// (`--nrd-convergence 1.0,0.5,0.8`). Arity is a RANGE because
+/// `--nrd-responsive` has a genuinely optional second component; everything
+/// outside it exits 2 rather than applying a partial tuple, since a lever that
+/// silently half-lands makes an A/B report the wrong arm. Not `pub` — this is
+/// the parse loop's own helper, and `parse_from`'s purity contract holds
+/// because it only ever computes or exits.
+fn nrd_floats(flag: &str, arg: Option<String>, min: usize, max: usize) -> Vec<f32> {
+    let bad = |why: &str| -> ! {
+        eprintln!("{flag} needs {min}..={max} comma-separated finite floats ({why})");
+        std::process::exit(2);
+    };
+    let Some(s) = arg else { bad("no argument") };
+    let mut out = Vec::new();
+    for part in s.split(',') {
+        match part.trim().parse::<f32>() {
+            Ok(v) if v.is_finite() => out.push(v),
+            _ => bad("unparseable or non-finite component"),
+        }
+    }
+    if out.len() < min || out.len() > max {
+        bad("wrong number of components");
+    }
+    out
 }
 
 /// Parse `args` over `base`, which is the precedence seam: `main` hands in
@@ -1044,6 +1088,35 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
             }
             "--nrd-no-anti-firefly" => opts.nrd_tune.anti_firefly = Some(false),
             "--nrd-anti-firefly" => opts.nrd_tune.anti_firefly = Some(true),
+            // The three ReblurSettings SUB-STRUCTS + the one CommonSettings
+            // lever, comma-tuple spelled (the --cam idiom) so seven fields
+            // cost four flags. Same all-Option contract as the scalars above:
+            // absent = the library default, so a flagless session is
+            // unchanged. `nrd_floats` exits 2 on a wrong arity or a
+            // non-finite component — a silently-half-applied tuple would be
+            // an A/B that reports the wrong arm.
+            "--nrd-antilag" => {
+                let v = nrd_floats(&a, args.next(), 2, 2);
+                opts.nrd_tune.antilag_sigma_scale = Some(v[0]);
+                opts.nrd_tune.antilag_sensitivity = Some(v[1]);
+            }
+            "--nrd-responsive" => {
+                let v = nrd_floats(&a, args.next(), 1, 2);
+                opts.nrd_tune.responsive_roughness = Some(v[0]);
+                if let Some(&n) = v.get(1) {
+                    opts.nrd_tune.responsive_min_frames = Some(n.max(0.0) as u32);
+                }
+            }
+            "--nrd-convergence" => {
+                let v = nrd_floats(&a, args.next(), 3, 3);
+                opts.nrd_tune.convergence_s = Some(v[0]);
+                opts.nrd_tune.convergence_b = Some(v[1]);
+                opts.nrd_tune.convergence_p = Some(v[2]);
+            }
+            "--nrd-split" => {
+                let v = nrd_floats(&a, args.next(), 1, 1);
+                opts.nrd_common.split_screen = Some(v[0].clamp(0.0, 1.0));
+            }
             "--frd" => {
                 opts.frd = true;
                 opts.frd_explicit = true;
@@ -2364,11 +2437,12 @@ pub fn usage() {
                 eprintln!("  --nppd-dump   --check-nppd plus before/after PNG dumps");
                 eprintln!("  --nppd-path   ONNX Runtime DLL directory (default: SDKs\\onnxruntime\\bin)");
                 eprintln!("  --nppd-model  exported NPPD .onnx (default: SDKs\\nppd\\nppd_small.onnx)");
-                eprintln!("  --nrd         NRD (ReBLUR) pre-upscale denoising — the OPT-IN A/B oracle since the");
-                eprintln!("                FRD default flip (claims the one denoiser slot from the defaulted frd;");
-                eprintln!("                beside an explicit --frd it exits 2). Same arming surface (GPU tracers");
-                eprintln!("                x XeSS/FSR3; DLSS-RR/FSR4-RR never arm it); excl. --nppd (explicit pair");
-                eprintln!("                exits 2); missing SDKs\\NRD\\bin\\NRD.dll sheds loudly —");
+                eprintln!("  --nrd         NRD (ReBLUR) pre-upscale denoising — THE DEFAULT for XeSS/FSR3");
+                eprintln!("                sessions (this flag spells it; --no-nrd is the kill lever). The source");
+                eprintln!("                is a git submodule and the BUILD REQUIRES it, so unlike every other");
+                eprintln!("                vendor level it cannot silently fail to exist. Arming surface: GPU");
+                eprintln!("                tracers x XeSS/FSR3 (DLSS-RR/FSR4-RR never arm it); excl. --nppd");
+                eprintln!("                (explicit pair exits 2); missing SDKs\\NRD\\bin\\NRD.dll sheds loudly —");
                 eprintln!("                install-prerequisites.bat nrd builds it");
                 eprintln!("  --no-nrd      the default, spelled explicitly");
                 eprintln!("  --nrd-path    NRD.dll directory (default: SDKs\\NRD\\bin)");
@@ -2384,14 +2458,28 @@ pub fn usage() {
                 eprintln!("                noisier)");
                 eprintln!("  --nrd-no-anti-firefly    drop ReBLUR's anti-firefly filter (--nrd-anti-firefly");
                 eprintln!("                spells the default)");
+                eprintln!("  --nrd-convergence S,B,P  ReBLUR's accumulation curve, f = 1/(1 + k*N) with");
+                eprintln!("                k = S*lerp(B, 1, N/(1 + P*maxAccum)) (default 1.0,0.2,0.8). B < 1 means");
+                eprintln!("                'blur MORE on a short history' — raise B toward 1 if a parked camera");
+                eprintln!("                settles darker/flatter than the same view while moving");
+                eprintln!("  --nrd-responsive R[,N]   below roughness R, history scales WITH roughness (default");
+                eprintln!("                0 = off) — NVIDIA's animated-water lever; N floors the frames kept");
+                eprintln!("                at roughness 0 (default 3)");
+                eprintln!("  --nrd-antilag SIGMA,SENS luminance-gradient antilag (default 2.0,3.0; smaller SENS =");
+                eprintln!("                more sensitive)");
+                eprintln!("  --nrd-split X ReBLUR's own noisy-vs-denoised wipe: the left X of the frame presents");
+                eprintln!("                the RAW input, the rest the denoised output (0..1, default 0 = off) —");
+                eprintln!("                one library-side pass, no second capture to line up");
                 eprintln!("  --check-nrd   headless: NRD math gates (DLL-free) + instance/dispatch contract (DLL)");
-                eprintln!("  --frd         FRD — the from-scratch clean-room pre-upscale denoiser, ON BY DEFAULT");
-                eprintln!("                for XeSS/FSR3 sessions (this flag spells the default; --no-frd is the");
-                eprintln!("                kill lever). Holds NRD's quality band at 2.5x its speed; no DLL, no");
-                eprintln!("                install step — the kernels compile like every other unit. One denoiser");
-                eprintln!("                slot: an explicit --nrd takes it over (beside an explicit --frd that");
-                eprintln!("                exits 2), and a bare --nppd disarms the default loudly");
-                eprintln!("  --no-frd      kill lever: plain (undenoised) XeSS/FSR3 — the no-denoiser baseline");
+                eprintln!("  --frd         FRD — the from-scratch clean-room pre-upscale denoiser, OPT-IN since");
+                eprintln!("                2026-08-10 (NRD is the default). THE FAST ARM: 2.5x NRD's speed in the");
+                eprintln!("                denoiser region, no DLL and no install step — the kernels compile like");
+                eprintln!("                every other unit. NRD leads on sparse emissive (68% vs 42% of DLSS-RR's");
+                eprintln!("                pool delivery) and still-frame stability, which is why it defaults.");
+                eprintln!("                One denoiser slot: --frd claims it from the nrd default (the explicit");
+                eprintln!("                pair exits 2), and a bare --nppd disarms a saved frd loudly");
+                eprintln!("  --no-frd      spells the default (NRD holds the slot). --no-nrd --no-frd is the");
+                eprintln!("                plain undenoised XeSS/FSR3 baseline");
                 eprintln!("  --frd-max-accum-frames N (clamped loudly to 63 — the meta plane's n/63 wire cap)");
                 eprintln!("                | --frd-fast-frames N | --frd-blur-radius X | --frd-clamp-sigma X");
                 eprintln!("                | --frd-no-fp16 (force the fp32 shader arm)   FRD tuning (unset = the");
@@ -2798,6 +2886,18 @@ pub fn self_test() -> Result<(), String> {
         "--frd-max-accum-frames",
         "12",
         "--frd-no-fp16",
+        // The NRD sub-struct tuples + the CommonSettings lever. Values are
+        // deliberately all-distinct so a tuple assembled in the wrong ORDER
+        // (the whole risk of a comma-tuple flag) fails a pin instead of
+        // landing plausibly.
+        "--nrd-convergence",
+        "1.5,0.4,0.6",
+        "--nrd-responsive",
+        "0.3,1",
+        "--nrd-antilag",
+        "3,2",
+        "--nrd-split",
+        "0.5",
     ]);
     let after = lever_snapshot();
     if after != before {
@@ -2814,6 +2914,26 @@ pub fn self_test() -> Result<(), String> {
         ("dual_gpu_arm", o.dual_gpu_arm == Some(crate::gfx::vocab::Arm::Dxr)),
         ("frd", o.frd && o.frd_explicit),
         ("frd_tune", o.frd_tune.max_accum_frames == Some(12) && o.frd_tune.no_fp16),
+        // Each component pinned to ITS OWN value — an order slip inside a
+        // comma-tuple is the failure this catches, and equal values would
+        // hide it.
+        (
+            "nrd_convergence",
+            o.nrd_tune.convergence_s == Some(1.5)
+                && o.nrd_tune.convergence_b == Some(0.4)
+                && o.nrd_tune.convergence_p == Some(0.6),
+        ),
+        (
+            "nrd_responsive",
+            o.nrd_tune.responsive_roughness == Some(0.3)
+                && o.nrd_tune.responsive_min_frames == Some(1),
+        ),
+        (
+            "nrd_antilag",
+            o.nrd_tune.antilag_sigma_scale == Some(3.0)
+                && o.nrd_tune.antilag_sensitivity == Some(2.0),
+        ),
+        ("nrd_split", o.nrd_common.split_screen == Some(0.5)),
         ("mips", !o.mips),
         ("aniso", o.aniso == 4),
         ("h2n", !o.h2n),
@@ -3112,6 +3232,27 @@ pub fn self_test() -> Result<(), String> {
         || bare.obj.as_deref() != Some("model.obj")
     {
         return Err("--blas-split must not swallow a following scene path".into());
+    }
+    // --nrd-responsive's OPTIONAL second component. The one-arity form must
+    // leave `min_accumulated_frame_num` at the library default rather than
+    // inventing one — an all-Option tuning struct whose partial spelling
+    // silently pins a second field is a lever that changes more than it says.
+    let r1 = parse_argv(&["--nrd-responsive", "0.25"]).opts.nrd_tune;
+    if r1.responsive_roughness != Some(0.25) || r1.responsive_min_frames.is_some() {
+        return Err("--nrd-responsive R must set only the roughness threshold".into());
+    }
+    // --nrd-split is a fraction of the frame, so it CLAMPS rather than
+    // exiting: NRD asserts [0, 1] internally and a debug-build assert is a
+    // worse answer to a typo than a wipe at the edge.
+    if parse_argv(&["--nrd-split", "3"]).opts.nrd_common.split_screen != Some(1.0) {
+        return Err("--nrd-split must clamp into [0, 1]".into());
+    }
+    // Every --nrd-* lever is all-Option by contract: a session that names
+    // none of them must send NRD exactly the settings it always did.
+    if parse_argv(&["--nrd"]).opts.nrd_tune.any()
+        || parse_argv(&["--nrd"]).opts.nrd_common.any()
+    {
+        return Err("a bare --nrd must leave every tuning override unset".into());
     }
     // --frd-lab's optional kind: a known kind is consumed, a scene path never
     // is (an unknown non-path word exits 2 in place, so self_test only feeds

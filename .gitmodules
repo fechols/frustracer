@@ -1,0 +1,3 @@
+[submodule "SDKs/NRD-src"]
+	path = SDKs/NRD-src
+	url = https://github.com/NVIDIA-RTX/NRD.git

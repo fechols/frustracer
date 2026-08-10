@@ -121,6 +121,28 @@ fn nrd_barrier_narrow() -> bool {
     })
 }
 
+/// FR_NRD_DEBUG — arms `CommonSettings::enable_validation` AND the
+/// OUT_VALIDATION dump below. The value is the frame index to capture
+/// (`FR_NRD_DEBUG=1` means frame 1, which is usually too early to be
+/// interesting — `=120` is the useful shape); a non-numeric value takes
+/// `DEFAULT_DEBUG_FRAME`, which is what a bare `=1` used to mean before the
+/// plane had any reader at all.
+fn nrd_debug_frame() -> Option<u64> {
+    static F: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        let v = std::env::var("FR_NRD_DEBUG").ok()?;
+        let f = v.trim().parse::<u64>().ok().filter(|&n| n > 0).unwrap_or(DEFAULT_DEBUG_FRAME);
+        eprintln!(
+            "nrd: FR_NRD_DEBUG — validation overlay ON; dumping OUT_VALIDATION at frame {f} \
+             to {VALIDATION_PNG}"
+        );
+        Some(f)
+    })
+}
+
+const DEFAULT_DEBUG_FRAME: u64 = 120;
+const VALIDATION_PNG: &str = "nrd-validation.png";
+
 pub struct NrdGpu {
     pub nrd: nrd::Nrd,
     root_sig: ID3D12RootSignature,
@@ -144,8 +166,35 @@ pub struct NrdGpu {
     inc: u32,
     pub rw: u32,
     pub rh: u32,
+    /// The size the PREVIOUS recorded frame ran at, for CommonSettings'
+    /// `resourceSizePrev`/`rectSizePrev`. Equal to (rw, rh) for the whole life
+    /// of this instance today — the render res is locked at construction and a
+    /// resize rebuilds the instance outright — so it is bookkeeping against a
+    /// future DRS/resize path rather than a live fix. It is tracked anyway
+    /// because the failure it prevents is silent: NRD would reproject through
+    /// the wrong previous rect and simply denoise a slightly wrong history.
+    prev_size: std::cell::Cell<(u32, u32)>,
     frame_counter: std::cell::Cell<u64>,
+    /// OUT_VALIDATION readback (FR_NRD_DEBUG only — None otherwise, so an
+    /// ordinary session commits nothing). `pending` holds the frame counter
+    /// at which the copy was recorded; the map waits RING_FRAMES more
+    /// `record()` calls, which is the same retirement argument `gputime`
+    /// makes — RING_FRAMES is documented >= the caller's frames in flight, so
+    /// by then the caller's own `begin_frame` fence has provably retired that
+    /// frame. There is no wait_idle here: stalling the pipe to read a debug
+    /// texture would change the very frame pacing that feeds `dt_ms`.
+    vbuf: Option<ID3D12Resource>,
+    vpending: std::cell::Cell<Option<u64>>,
 }
+
+/// The `timeDeltaBetweenFrames` (ms) every DETERMINISTIC caller reports — the
+/// gates and cinematic capture. Those paths have no meaningful frame clock
+/// (a gate frame is a submit-and-wait around readbacks and oracle loops), and
+/// letting NRD fall back to its own wall-clock timer would make the settings
+/// it derives — the antilag scale, the accumulation-speed curve, the specular
+/// tap stride — a function of machine load. A fixed 60 Hz nominal makes two
+/// runs of the same gate hand NRD identical settings.
+pub const NOMINAL_DT_MS: f32 = 1000.0 / 60.0;
 
 /// The frame's CommonSettings from the tree's own camera facts.
 /// `dlss::CamMatrices` is glam — COLUMN-major with COLUMN vectors, which is
@@ -160,6 +209,30 @@ pub struct NrdGpu {
 /// pass-accum-through predicate is `view_z >= 0.999 * CAM_FAR` — the SAME
 /// bound, LOCKSTEP (a shader predicate of plain CAM_FAR shipped once and
 /// recomposed the [0.999·far, far) hit band from OUT texels NRD never wrote).
+///
+/// `dt_ms` is `timeDeltaBetweenFrames`, and it is passed EXPLICITLY rather
+/// than left at the header's "0 = tracked internally" default because NRD's
+/// internal timer measures WALL CLOCK BETWEEN `SetCommonSettings` CALLS
+/// (InstanceImpl.cpp's `m_Timer`), which for a headless gate is the gate's own
+/// CPU work — readbacks, oracle loops, PNG writes — not a frame. It is not
+/// cosmetic: `m_FrameRateScale = max(33.333/dt, 1)` reaches ReBLUR's antilag
+/// scale, its accumulation-speed curve, and the specular virtual-motion tap
+/// stride, so an internally-timed gate is a gate whose denoiser settings drift
+/// with machine load. Every caller therefore hands over a value it controls:
+/// the real per-frame wall time interactively, a fixed nominal in the gates
+/// and in cinematic capture (which is deterministic by contract).
+///
+/// `cameraJitter`, by contrast, is deliberately NOT sign-corrected the way
+/// every sibling SDK site is (`xess::JITTER_SIGN`, `fsr::JITTER_SIGN`), and
+/// that asymmetry is settled rather than assumed: in the v4.17.3 source the
+/// value reaches exactly two places — `REBLUR_Validation.cs.hlsl`'s overlay UV,
+/// and `m_JitterDelta = max(|dx|, |dy|)` over the cur/prev pair, which feeds
+/// only the CHECKERBOARD resolve speed. Both are sign-symmetric or
+/// debug-only, and we never run checkerboard mode, so polarity is
+/// STRUCTURALLY inert here. What is NOT inert is the range: NRD asserts
+/// [-0.5, 0.5], which is exactly `FrameCtx::frame_jitter`'s own interval, so
+/// the raw offset is passed through.
+#[allow(clippy::too_many_arguments)]
 pub fn common_settings(
     mats: &crate::dlss::CamMatrices,
     prev_mats: &crate::dlss::CamMatrices,
@@ -167,7 +240,10 @@ pub fn common_settings(
     prev_jitter: (f32, f32),
     rw: u32,
     rh: u32,
+    prev_rw: u32,
+    prev_rh: u32,
     far: f32,
+    dt_ms: f32,
     frame_index: u32,
     reset: bool,
 ) -> nrd::CommonSettings {
@@ -180,13 +256,21 @@ pub fn common_settings(
     cs.camera_jitter = [jitter.0, jitter.1];
     cs.camera_jitter_prev = [prev_jitter.0, prev_jitter.1];
     cs.resource_size = [rw as u16, rh as u16];
-    cs.resource_size_prev = [rw as u16, rh as u16];
+    cs.resource_size_prev = [prev_rw as u16, prev_rh as u16];
     cs.rect_size = [rw as u16, rh as u16];
-    cs.rect_size_prev = [rw as u16, rh as u16];
+    cs.rect_size_prev = [prev_rw as u16, prev_rh as u16];
     cs.denoising_range = far * 0.999;
+    // (ms) — clamped into a sane band rather than trusted: a hitch, a
+    // debugger break, or a first frame can hand us 0 or seconds, and 0 is the
+    // sentinel that silently re-enables the internal timer this exists to
+    // replace. 1 ms .. 200 ms spans 1000 fps down to 5.
+    cs.time_delta_between_frames = if dt_ms.is_finite() { dt_ms.clamp(1.0, 200.0) } else { 16.667 };
     cs.frame_index = frame_index;
     cs.accumulation_mode = if reset { nrd::ACCUM_RESTART } else { nrd::ACCUM_CONTINUE };
-    if std::env::var_os("FR_NRD_DEBUG").is_some() {
+    if let Some(x) = nrd::common_tuning().split_screen {
+        cs.split_screen = x;
+    }
+    if nrd_debug_frame().is_some() {
         cs.enable_validation = 1;
     }
     cs
@@ -432,6 +516,28 @@ impl NrdGpu {
             d.constant_buffer_max_data_size
         );
         let _ = s!(""); // keep the s! import alive for future named objects
+        // The validation readback — one screen of RGBA8 at the row-pitch
+        // alignment CopyTextureRegion demands, committed ONLY under the env
+        // lever (an ordinary session must not carry a debug allocation).
+        let vbuf = match nrd_debug_frame() {
+            None => None,
+            Some(_) => {
+                let bytes = d3d12::aligned_pitch(rw as usize * 4) * rh as usize;
+                let mut r: Option<ID3D12Resource> = None;
+                unsafe {
+                    device.CreateCommittedResource(
+                        &d3d12::readback_heap(),
+                        D3D12_HEAP_FLAG_NONE,
+                        &d3d12::buffer_desc(bytes as u64),
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        None,
+                        &mut r,
+                    )
+                }
+                .map_err(|e| format!("nrd: validation readback: {e}"))?;
+                r
+            }
+        };
         Ok(Self {
             nrd: inst,
             root_sig,
@@ -449,8 +555,106 @@ impl NrdGpu {
             inc,
             rw,
             rh,
+            prev_size: std::cell::Cell::new((rw, rh)),
             frame_counter: std::cell::Cell::new(0),
+            vbuf,
+            vpending: std::cell::Cell::new(None),
         })
+    }
+
+    /// Record the OUT_VALIDATION copy on the target frame, and write the PNG
+    /// once an earlier copy has provably retired. Called at the tail of
+    /// `record()`, where every resource is back at UNORDERED_ACCESS. A no-op
+    /// (one `Option` test) in every session that did not set FR_NRD_DEBUG.
+    ///
+    /// This is a DUMP rather than the live overlay the plane's own comment
+    /// once promised, and deliberately: a live overlay would have to composite
+    /// inside `cs_nrd_out`, which is the bridge unit BOTH engines compile, so
+    /// it would need an engine-conditional binding, a dummy RGBA8 plane on the
+    /// FRD side, and a fifth wire site — real surface across the engine-blind
+    /// boundary, for a view that only ever runs under an env var. A single
+    /// frame answers the questions the overlay exists for (is reprojection
+    /// alive, what history length does NRD think it has, did it receive the
+    /// settings we sent) exactly as well, and it works headlessly too.
+    fn validation_step(&self, list: &ID3D12GraphicsCommandList) {
+        let Some(vbuf) = self.vbuf.as_ref() else { return };
+        let Some(at) = nrd_debug_frame() else { return };
+        let now = self.frame_counter.get();
+        match self.vpending.get() {
+            // Retired: the caller has begun RING_FRAMES later frames, each of
+            // which waited on its own slot fence.
+            Some(f) if now >= f + RING_FRAMES as u64 => {
+                self.vpending.set(None);
+                self.write_validation_png(vbuf);
+            }
+            Some(_) => {}
+            None if now == at => {
+                let vres = &self.regs[self.plane_idx[7]].res;
+                let src = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: unsafe { std::mem::transmute_copy(vres) },
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                };
+                let dst = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: unsafe { std::mem::transmute_copy(vbuf) },
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        PlacedFootprint: d3d12::footprint(
+                            DXGI_FORMAT_R8G8B8A8_UNORM,
+                            self.rw,
+                            self.rh,
+                            4,
+                            0,
+                        ),
+                    },
+                };
+                let ust = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                let cps = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                unsafe {
+                    list.ResourceBarrier(&[d3d12::transition(vres, ust, cps)]);
+                    list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+                    list.ResourceBarrier(&[d3d12::transition(vres, cps, ust)]);
+                }
+                // The tracked state is unchanged by construction (restored
+                // above), so `regs[..].state` needs no write — but the
+                // round trip must stay balanced or the next frame's
+                // transition would start from a lie.
+                self.vpending.set(Some(now));
+            }
+            None => {}
+        }
+    }
+
+    fn write_validation_png(&self, vbuf: &ID3D12Resource) {
+        let pitch = d3d12::aligned_pitch(self.rw as usize * 4);
+        let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
+        if unsafe { vbuf.Map(0, None, Some(&mut p)) }.is_err() || p.is_null() {
+            eprintln!("nrd: validation readback map failed — no dump");
+            return;
+        }
+        let (w, h) = (self.rw as usize, self.rh as usize);
+        let src = unsafe { std::slice::from_raw_parts(p as *const u8, pitch * h) };
+        // RGBA8 rows at the aligned pitch -> save_png's 0x00RRGGBB. Alpha is
+        // dropped: NRD's overlay is opaque, and the PNG writer takes RGB.
+        let mut px = Vec::with_capacity(w * h);
+        for y in 0..h {
+            let row = &src[y * pitch..y * pitch + w * 4];
+            for x in 0..w {
+                let b = &row[x * 4..x * 4 + 4];
+                px.push((b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32);
+            }
+        }
+        unsafe { vbuf.Unmap(0, None) };
+        crate::save_png(VALIDATION_PNG, &px, w, h);
+        eprintln!("nrd: wrote {VALIDATION_PNG} ({w}x{h}) — NRD's own validation overlay");
+    }
+
+    /// The size the last recorded frame ran at — feeds `common_settings`'
+    /// `resourceSizePrev`/`rectSizePrev`. Seeded to the construction size, so
+    /// the first frame reports prev == cur (which is what a fresh history
+    /// wants anyway).
+    pub fn prev_size(&self) -> (u32, u32) {
+        self.prev_size.get()
     }
 
     pub fn plane_in_mv(&self) -> &ID3D12Resource {
@@ -473,6 +677,15 @@ impl NrdGpu {
     }
     pub fn plane_out_spec(&self) -> &ID3D12Resource {
         &self.regs[self.plane_idx[6]].res
+    }
+    /// OUT_VALIDATION — NRD's own RGBA8 diagnostic overlay (world-space
+    /// normals, viewZ, MV reprojection, accumulated-frame counts, and the
+    /// settings it thinks it was given), written ONLY when
+    /// `CommonSettings::enable_validation` is set, i.e. under FR_NRD_DEBUG.
+    /// The plane is allocated unconditionally — it is one RGBA8 screen and
+    /// making it conditional would mean a realloc to turn debugging on.
+    pub fn plane_validation(&self) -> &ID3D12Resource {
+        &self.regs[self.plane_idx[7]].res
     }
 
     fn reg_for(&self, r: &nrd::ResourceDesc) -> Result<usize> {
@@ -675,6 +888,8 @@ impl NrdGpu {
         });
         unsafe { list.ResourceBarrier(&barriers) };
         self.frame_counter.set(self.frame_counter.get() + 1);
+        self.prev_size.set((self.rw, self.rh));
+        self.validation_step(list);
         Ok(())
     }
 }

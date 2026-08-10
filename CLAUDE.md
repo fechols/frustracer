@@ -1488,14 +1488,52 @@ cargo run --release -- --gpu --xess --nrd  # NRD (ReBLUR) pre-upscale denoising 
                                       # session notes fire only for the explicit flag (the
                                       # default must not nag DLSS sessions). A missing NRD.dll
                                       # sheds loudly per session with the install hint.
-                                      # NVIDIA's NRD v4.17.3, PINNED in three places that must
-                                      # move together: install-prerequisites.bat's NRD_TAG (the
-                                      # `nrd` component CMake-builds the SDK locally — NVIDIA
-                                      # ships no prebuilt binaries and the RTX-SDKs license
-                                      # forbids committing source, so SDKs\NRD\bin\NRD.dll is
-                                      # gitignored + LoadLibrary'd at runtime, the xess.rs
-                                      # footprint; the ONE component needing CMake+VS, loud
-                                      # preflight, informational skip on a default `all` run),
+                                      # THE SOURCE IS A GIT SUBMODULE and the build REQUIRES it
+                                      # (2026-08-10): SDKs/NRD-src -> NVIDIA-RTX/NRD, which
+                                      # vendors nothing (a URL + a SHA; each clone fetches from
+                                      # NVIDIA, exactly as the retired tag-zip download did, so
+                                      # the object-code-only grant is never engaged). build.rs's
+                                      # require_nrd() hard-FAILS — not the DLSS block's
+                                      # cargo:warning degrade — on a missing submodule (all
+                                      # platforms) or a missing SDKs\NRD\bin\NRD.dll (Windows;
+                                      # add the libNRD.so arm when the Vulkan backend lands, the
+                                      # SPIR-V artifact being right for it and unloadable by
+                                      # D3D12). Rationale: NRD is the DEFAULT denoiser, so a tree
+                                      # that cannot produce it is a tree whose default session
+                                      # silently runs undenoised. Consequences, all deliberate:
+                                      # .gitignore needs the `!/SDKs/NRD-src` negation (the
+                                      # blanket /SDKs/* otherwise makes `git submodule add`
+                                      # refuse — and NO trailing slash, which only matches an
+                                      # existing directory); CI runs submodules: true + the real
+                                      # installer component with the DLLs cached on the submodule
+                                      # SHA; and the `nrd` component's informational-skip degrade
+                                      # is GONE (a skip now means the tree does not build).
+                                      # THE CLEAN-ROOM RULE LOST ITS PHYSICAL ENFORCEMENT with
+                                      # the submodule — Shaders/NRD.hlsli now sits in the tree
+                                      # beside our shader concat, where its absence used to make
+                                      # a paste impossible, and N0/N2 would still pass with
+                                      # pasted math (they compare against the oracle, the very
+                                      # thing a paste replaces). gpu::trace::nrd_clean_room_tests
+                                      # is the replacement: a cargo test scanning our four
+                                      # assembled shader units for NVIDIA's distinctive entry
+                                      # names, COMMENTS STRIPPED FIRST (the DispatchRaysIndex
+                                      # gate's lesson — nrd_bridge.hlsl:77 legitimately NAMES
+                                      # NRD_FrontEnd_PackNormalAndRoughness to say which
+                                      # semantics it reimplements, and citing what you
+                                      # reimplement must stay legal), with teeth pinning that the
+                                      # stripper neither guts the sources nor over-strips.
+                                      # NVIDIA's NRD v4.17.3, PINNED in FIVE places that must
+                                      # move together — and the submodule SHA is the one that
+                                      # drifts SILENTLY (a `git submodule update --remote` moves
+                                      # it with no diff in any pinned constant):
+                                      # install-prerequisites.bat's NRD_TAG (now only the
+                                      # human-readable label the loud lines print — the SOURCE is
+                                      # the submodule; the `nrd` component CMake-builds it
+                                      # locally, NVIDIA shipping no prebuilt binaries, so
+                                      # SDKs\NRD\bin\NRD.dll is gitignored + LoadLibrary'd at
+                                      # runtime, the xess.rs footprint; the ONE component
+                                      # needing CMake+VS), install-prerequisites.sh's NRD_TAG,
+                                      # the SUBMODULE SHA itself,
                                       # src/nrd.rs (repr(C) transcription against MSVC-sizer
                                       # ground truth + the Nrd::new GetLibraryDesc gate: version
                                       # 4.17 AND normalEncoding 2 AND roughnessEncoding 1, else
@@ -1644,6 +1682,110 @@ cargo run --release -- --gpu --xess --nrd  # NRD (ReBLUR) pre-upscale denoising 
                                       # DROPS the TemporalStabilization pass (nrd 1.74 → 1.55
                                       # stacked on perf), --nrd-prepass-radius 0 disables the
                                       # prepasses, --nrd-no-anti-firefly, --nrd-max-accum-frames.
+                                      # THE COMPLETENESS SWEEP (2026-08-10, the migration's
+                                      # Tier A — 22 of 28 ReblurSettings fields and 16 of 31
+                                      # CommonSettings fields had NO plumbing at all): the three
+                                      # ReBLUR SUB-STRUCTS are reachable as comma-tuples (the
+                                      # --cam idiom; nrd_floats exits 2 on a wrong arity rather
+                                      # than half-applying, since a partially-landed tuple makes
+                                      # an A/B report the wrong arm) — **--nrd-convergence S,B,P**
+                                      # is the one that matters for the parked-camera darkening
+                                      # class: ReBLUR drives denoising by f = 1/(1 + k*N) with
+                                      # k = S*lerp(B, 1, N/(1 + P*maxAccum)) since v4.17, and
+                                      # B < 1 (default 0.2) deliberately means "blur MORE on a
+                                      # short history" — the SAME shape the FRD campaign measured
+                                      # (a moving frame flattered by young-history wide blur
+                                      # bleeding light outward, a parked frame converging onto a
+                                      # genuinely dimmer truth), so raising B toward 1 is the
+                                      # lever that makes the two regimes agree;
+                                      # **--nrd-responsive R[,N]** is NVIDIA's animated-water
+                                      # lever (below roughness R the history scales WITH
+                                      # roughness — this scene's ripple-normal water is
+                                      # roughness 0.05, exactly the case; the optional N floors
+                                      # the frames kept at roughness 0, and the one-arity form
+                                      # must leave N unset — cli::self_test pins that);
+                                      # **--nrd-antilag SIGMA,SENS**. Plus the CommonSettings
+                                      # half (nrd::CommonTuning, the ReblurTuning shape one
+                                      # level up): **--nrd-split X** is ReBLUR's OWN
+                                      # noisy-vs-denoised wipe — the left X of the frame takes
+                                      # the SPLIT_SCREEN pass, which copies IN to OUT, so our
+                                      # delta-form recompose collapses to `col = base` there
+                                      # (the raw 1-spp accum) with no second capture to line up.
+                                      # MEASURED liveness at X=1.0 (full passthrough, the arm
+                                      # Reblur.cpp early-returns on): +50% Laplacian vs the
+                                      # denoised arm, 23% of px past 4/255. CAVEAT worth not
+                                      # re-deriving: a FRACTIONAL split is nearly invisible in a
+                                      # parked screenshot because XeSS's own temporal
+                                      # accumulation launders the undenoised half — read it
+                                      # under motion, or at X=1.
+                                      # THREE MORE Tier-A repairs, none of them a new flag:
+                                      # (a) timeDeltaBetweenFrames is now passed EXPLICITLY (ms)
+                                      # instead of left at the header's "0 = tracked internally"
+                                      # default — NRD's own timer measures wall clock BETWEEN
+                                      # SetCommonSettings CALLS (InstanceImpl.cpp's m_Timer),
+                                      # which in a headless gate is the gate's readbacks and
+                                      # oracle loops, not a frame, and it is not cosmetic:
+                                      # m_FrameRateScale = max(33.333/dt, 1) reaches ReBLUR's
+                                      # antilag scale, its accumulation-speed curve, and the
+                                      # specular virtual-motion tap stride, so an
+                                      # internally-timed gate is a gate whose denoiser settings
+                                      # DRIFT WITH MACHINE LOAD. Interactive presenters hand
+                                      # over their real frame_ms (clamped 1..200 ms — 0 is the
+                                      # sentinel that silently re-enables the internal timer);
+                                      # the N4 gate and cinematic capture hand over
+                                      # nrd_gpu::NOMINAL_DT_MS, a fixed 60 Hz constant, because
+                                      # both are deterministic by contract (a capture's
+                                      # sub-frames are convergence passes at ONE pose, so
+                                      # neither the frame clock nor --cinematic-fps describes
+                                      # them). (b) resourceSizePrev/rectSizePrev received the
+                                      # CURRENT size; NrdGpu::prev_size now tracks the real one
+                                      # (equal today — the res is locked at construction and a
+                                      # resize rebuilds the instance — so this is bookkeeping
+                                      # against a future DRS path, kept because the failure it
+                                      # prevents is silent: reprojection through the wrong prev
+                                      # rect just denoises a slightly wrong history).
+                                      # (c) THE cameraJitter POLARITY QUESTION IS SETTLED, and
+                                      # the answer is "structurally inert here" — do not
+                                      # re-litigate it with an A/B. We feed the RAW offset while
+                                      # every sibling SDK site applies a sign constant
+                                      # (xess/fsr::JITTER_SIGN), which looked like an
+                                      # unverified asymmetry; in the v4.17.3 source the value
+                                      # reaches exactly two places, REBLUR_Validation's overlay
+                                      # UV and m_JitterDelta = max(|dx|, |dy|) over the cur/prev
+                                      # pair (which feeds only the CHECKERBOARD resolve speed,
+                                      # and is sign-symmetric anyway), and we never run
+                                      # checkerboard. What is NOT inert is the RANGE: NRD
+                                      # asserts [-0.5, 0.5], which is exactly
+                                      # FrameCtx::frame_jitter's own interval.
+                                      # OUT_VALIDATION IS READABLE AT LAST (the plane was
+                                      # allocated, bound, and read by nothing):
+                                      # FR_NRD_DEBUG=<frame> arms enable_validation AND dumps
+                                      # that frame's overlay to nrd-validation.png — a readback
+                                      # copy recorded at the target frame and mapped
+                                      # RING_FRAMES later (the gputime retirement argument; no
+                                      # wait_idle, which would perturb the very frame pacing
+                                      # that now feeds dt_ms), with the buffer committed ONLY
+                                      # under the lever. A DUMP rather than the live overlay the
+                                      # old comment promised, deliberately: compositing would
+                                      # have to happen in cs_nrd_out, the bridge unit BOTH
+                                      # engines compile, so it would need an engine-conditional
+                                      # binding, an RGBA8 dummy plane on the FRD side, and a
+                                      # fifth wire site — real surface across the engine-blind
+                                      # DnGpu boundary for a view that only runs under an env
+                                      # var, and one frame answers its questions just as well
+                                      # (and works headlessly). READING IT: the FRAMES panels
+                                      # are f = 1 - frames/maxAccum through ColorizeZucconi, so
+                                      # BLACK = FULLY ACCUMULATED and bright = a fresh history
+                                      # (the inverse of the natural guess). Baseline read
+                                      # (helmet, parked, frame 100): normals/roughness sane, Z
+                                      # red exactly where the sky is (out of denoisingRange), MV
+                                      # black (a parked camera HAS no motion), both FRAMES
+                                      # panels black = both histories saturated — i.e. the
+                                      # wiring is healthy. The same dump with
+                                      # --nrd-responsive 0.3 live shows the specular history
+                                      # deliberately SHORT on the low-roughness visor and long
+                                      # on the rough shell, which is that lever doing exactly
+                                      # what it claims.
                                       # Gates: --check-nrd (N0
                                       # DLL-free math twins + N1 instance/dispatch contract,
                                       # absent-DLL = loud skip exit 0); --check-gpu N2

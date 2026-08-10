@@ -246,13 +246,16 @@ exit /b 0
 
 :do_nrd
 rem NVIDIA publishes NO prebuilt NRD binaries, so this component COMPILES the
-rem pinned tag locally — the one component with a toolchain requirement (CMake +
-rem VS 2022 C++ tools; NRD's FetchContent pulls ShaderMake/MathLib as plain zip
-rem URLs, so configure needs network but NOT git). Only the resulting NRD.dll is
-rem kept: the DXIL shader blobs are EMBEDDED in it and src/nrd.rs loads it at
-rem runtime, so building frustracer still needs none of this. A missing
-rem toolchain is a hard failure only when nrd was named on the command line —
-rem a default `all` run degrades to a note, like the DLSS/NPPD-model rows.
+rem SUBMODULE (SDKs\NRD-src) locally — the one component with a toolchain
+rem requirement (CMake 3.22...3.30 + VS 2022 C++ tools; NRD's FetchContent
+rem pulls ShaderMake/MathLib as plain zip URLs, so configure needs network but
+rem NOT git). Only the resulting NRD.dll is kept: the DXIL shader blobs are
+rem EMBEDDED in it and src/nrd.rs loads it at runtime.
+rem  THIS IS NO LONGER OPTIONAL. NRD is the default denoiser and build.rs
+rem  hard-fails without SDKs\NRD\bin\NRD.dll, so `all` runs it like any other
+rem  component and a missing toolchain fails LOUDLY whether or not nrd was
+rem  named — the old "informational skip on a default run" degrade is gone,
+rem  because a skip now means the tree does not build.
 rem  TWO DLLs since the --nrd-perf lever (2026-08-09): the standard build and a
 rem  REBLUR_PERFORMANCE_MODE=ON variant under bin\perf (perf mode is a
 rem  COMPILE-TIME NRD option — v4.17.3 has no ReblurSettings field for it —
@@ -282,12 +285,17 @@ if exist "%VSWHERE%" (
 )
 if not defined CMAKE goto :nrd_no_toolchain
 if not defined VSDIR goto :nrd_no_toolchain
-call :fetch nrd-src.zip "https://github.com/NVIDIA-RTX/NRD/archive/refs/tags/%NRD_TAG%.zip" || exit /b 0
-call :unzip nrd-src.zip "%CACHE%\nrd-src" || exit /b 0
-rem  the tag zip wraps everything in NRD-<ver-without-v>/
-set "NRD_SRC=%CACHE%\nrd-src\NRD-%NRD_TAG:~1%"
+rem  SOURCE = the git SUBMODULE (SDKs\NRD-src -> NVIDIA-RTX/NRD, pinned by the
+rem  recorded SHA, not by NRD_TAG's string). It replaced the tag-zip download:
+rem  build.rs now HARD-FAILS without it, so the source is guaranteed present by
+rem  the time anyone runs this, and the version lives in git rather than in a
+rem  URL. NRD_TAG survives as the human-readable label the loud lines print and
+rem  as the string src/nrd.rs's GetLibraryDesc gate is written against — keep
+rem  the two in step when the submodule moves.
+set "NRD_SRC=%~dp0SDKs\NRD-src"
 if not exist "%NRD_SRC%\CMakeLists.txt" (
-    echo     [x] nrd source layout unexpected ^(no CMakeLists at %NRD_SRC%^)
+    echo     [x] nrd: the NRD submodule is missing ^(no CMakeLists at %NRD_SRC%^)
+    echo         run: git submodule update --init SDKs/NRD-src
     set "FAILED=1"
     exit /b 0
 )
@@ -363,15 +371,13 @@ echo     [+] NRD.dll ^(perf^) -^> SDKs\NRD\bin\perf
 exit /b 0
 
 :nrd_no_toolchain
-if defined NRD_EXPLICIT (
-    echo     [x] nrd needs CMake + Visual Studio 2022 C++ tools: NVIDIA ships no
-    echo         prebuilt NRD binaries, so it must compile locally.
-    set "FAILED=1"
-) else (
-    echo     [i] nrd skipped — needs CMake + VS 2022 C++ tools to compile
-    echo         ^(NVIDIA ships no prebuilt binaries^). Rerun `install-prerequisites.bat nrd`
-    echo         once they are installed; every other feature works without it.
-)
+rem  ALWAYS a hard failure now (no NRD_EXPLICIT branch): NRD is the default
+rem  denoiser and build.rs requires SDKs\NRD\bin\NRD.dll, so a skip here means
+rem  `cargo build` fails afterwards — better to say so at the point of cause.
+echo     [x] nrd needs CMake ^(3.22...3.30^) + Visual Studio 2022 C++ tools:
+echo         NVIDIA ships no prebuilt NRD binaries, so it must compile locally,
+echo         and the build now REQUIRES the result ^(NRD is the default denoiser^).
+set "FAILED=1"
 exit /b 0
 
 rem =========================== helpers ======================================
