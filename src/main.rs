@@ -8923,8 +8923,25 @@ fn run_check_gpu(
                             };
                             let (c7x, c7y) = (266usize, 200usize);
                             let mut l7 = [0f32; 2];
-                            for (ai, vmot) in [(0usize, true), (1usize, false)] {
+                            let mut b7a: Vec<u8> = Vec::new();
+                            let fi0 = fg.frame_index();
+                            // Arms 0/1 + the byte-identity replay (arm 2 =
+                            // arm 0 re-run at the SAME frame indices — the
+                            // blur passes hash frame_idx into their tap
+                            // rotation — with curvature forced OFF: the
+                            // flat probe's constant normal word gives Δn ≡
+                            // 0 ⇒ κ = 0 ⇒ frd_virtual_dist's branch, so
+                            // the two arms must be BYTE-identical — the
+                            // κ<=0-is-the-flat-path contract, proven on
+                            // the wire).
+                            for (ai, vmot, curv) in
+                                [(0usize, true, true), (1, false, true), (2, true, false)]
+                            {
+                                if ai == 2 {
+                                    fg.set_frame_index(fi0);
+                                }
                                 fg.force_vmotion.set(Some(vmot));
+                                fg.force_curv.set(Some(curv));
                                 fup!(fg.plane_in_mv(), f4x, 8, &mv0, "F7 mv0");
                                 fup!(fg.plane_in_spec(), f4x, 8, &grad7, "F7 grad");
                                 frec!(fframe(true, 0.0), "F7 k0");
@@ -8946,9 +8963,23 @@ fn run_check_gpu(
                                     cam_up: up_s.to_array(),
                                 };
                                 frec!(pf, "F7 probe");
-                                l7[ai] = lum_at(&fout!("F7"), c7x, c7y);
+                                let b = fout!("F7");
+                                if ai == 0 {
+                                    b7a = b.clone();
+                                }
+                                if ai < 2 {
+                                    l7[ai] = lum_at(&b, c7x, c7y);
+                                }
+                                if ai == 2 && b != b7a {
+                                    eprintln!(
+                                        "check-gpu: FAIL F7 curv-off is not byte-identical on a \
+                                         flat field (the kappa<=0 branch contract)"
+                                    );
+                                    ok = false;
+                                }
                             }
                             fg.force_vmotion.set(None);
+                            fg.force_curv.set(None);
                             // The oracle's prediction at the probe: t_r off
                             // the f16-stored nh through the DECODED (UNORM10
                             // round-tripped) roughness, then the delta.
@@ -8983,12 +9014,215 @@ fn run_check_gpu(
                             let gap7 = l7[1] - l7[0];
                             let gap_pred = 0.85 * (3.0 / pw as f32) * d7[0].abs();
 
+                            // F7C — the CURVED-mirror variant (the helmet
+                            // sun-streak repro, synthetic): a normal field
+                            // rotating 1°/px about the probe column
+                            // (clamped ±30° — the curvature lives in the
+                            // center band), WORLD-ANCHORED across the
+                            // strafe (the probe frame samples the field at
+                            // each pixel's PREV screen position through the
+                            // surf_px mapping — an unshifted field
+                            // disoccludes every arm and the gate goes
+                            // vacuous). far = 50 in the probe's FrdFrame
+                            // puts the flat-arm t_r (~52.5) into the REAL
+                            // sky arm; strafe 0.06 keeps the stale
+                            // self-fetch's normal drift (~4.9°) UNDER the
+                            // spec ladder (6.6° at rough 0.05) — the
+                            // ACCEPTED-stale-self-fetch mechanism that
+                            // paints the production streak. Three arms:
+                            // S (vmotion off — the surface fetch), F (flat
+                            // sky arm — must REPRODUCE the bug: its gap vs
+                            // S tracks the sky oracle, the teeth), C
+                            // (curvature on — the fix: the fetch collapses
+                            // to ~the surface, gap ≤ 0.35× the flat gap).
+                            let prev7c = camera::Camera {
+                                pos: cam7.pos - rgt_u * 0.06,
+                                yaw: cam7.yaw,
+                                pitch: cam7.pitch,
+                                fov_y: cam7.fov_y,
+                            };
+                            let pmats7c = dlss::cam_matrices(&prev7c, pw, ph, 0.05, 5000.0);
+                            let wp7c = pmats7c.view_to_clip * pmats7c.world_to_view;
+                            let surf_px_c = |x: f32, y: f32| -> (f32, f32) {
+                                let ndx = x * (2.0 / pw as f32) - 1.0;
+                                let ndy = 1.0 - y * (2.0 / ph as f32);
+                                let du = (fwd7 + rgt_s * ndx + up_s * ndy).normalize();
+                                let hit = cam7.pos + du * (5.0 / du.dot(fwd7));
+                                let pc = wp7c * glam::Vec4::new(hit.x, hit.y, hit.z, 1.0);
+                                (
+                                    (pc.x / pc.w + 1.0) * 0.5 * pw as f32,
+                                    (1.0 - pc.y / pc.w) * 0.5 * ph as f32,
+                                )
+                            };
+                            // Unit axis ⊥ n_face (cross with x̂) — the
+                            // rotation plane of the synthetic dome.
+                            let t_ax = [0.0f32, -0.8, -0.6];
+                            let deg = std::f32::consts::PI / 180.0;
+                            let n_at = |sx: f32| -> [f32; 3] {
+                                let th = (sx - (c7x as f32 + 0.5)).clamp(-30.0, 30.0) * deg;
+                                let (s, c) = th.sin_cos();
+                                [
+                                    n_face[0] * c + t_ax[0] * s,
+                                    n_face[1] * c + t_ax[1] * s,
+                                    n_face[2] * c + t_ax[2] * s,
+                                ]
+                            };
+                            let mut nr_conv = vec![0u8; npx * 4];
+                            let mut nr_probe = vec![0u8; npx * 4];
+                            let mut mv7c = vec![0u8; npx * 8];
+                            for y in 0..ph {
+                                for x in 0..pw {
+                                    let i = (y * pw + x) * 4;
+                                    nr_conv[i..i + 4]
+                                        .copy_from_slice(&nrw(n_at(x as f32 + 0.5), 0.05));
+                                    let (sx, sy) = surf_px_c(x as f32 + 0.5, y as f32 + 0.5);
+                                    nr_probe[i..i + 4].copy_from_slice(&nrw(n_at(sx), 0.05));
+                                    mv7c[(y * pw + x) * 8..][..8].copy_from_slice(&px8([
+                                        sx - (x as f32 + 0.5),
+                                        sy - (y as f32 + 0.5),
+                                        0.0,
+                                        0.0,
+                                    ]));
+                                }
+                            }
+                            let grad7c = {
+                                let mut b = vec![0u8; npx * 8];
+                                for y in 0..ph {
+                                    for x in 0..pw {
+                                        let l = 0.05 + 6.0 * x as f32 / pw as f32;
+                                        b[(y * pw + x) * 8..][..8]
+                                            .copy_from_slice(&px8([l, 0.0, 0.0, 0.8]));
+                                    }
+                                }
+                                b
+                            };
+                            let mut l7c = [0f32; 3];
+                            for (ai, vmot, curv) in
+                                [(0usize, false, true), (1, true, false), (2, true, true)]
+                            {
+                                fg.force_vmotion.set(Some(vmot));
+                                fg.force_curv.set(Some(curv));
+                                fup!(
+                                    fg.plane_in_nr(),
+                                    DXGI_FORMAT_R10G10B10A2_UNORM,
+                                    4,
+                                    &nr_conv,
+                                    "F7C nr"
+                                );
+                                fup!(fg.plane_in_mv(), f4x, 8, &mv0, "F7C mv0");
+                                fup!(fg.plane_in_spec(), f4x, 8, &grad7c, "F7C grad");
+                                frec!(fframe(true, 0.0), "F7C k0");
+                                for _ in 0..7 {
+                                    frec!(fframe(false, 0.0), "F7C converge");
+                                }
+                                fup!(
+                                    fg.plane_in_nr(),
+                                    DXGI_FORMAT_R10G10B10A2_UNORM,
+                                    4,
+                                    &nr_probe,
+                                    "F7C nr-probe"
+                                );
+                                fup!(fg.plane_in_mv(), f4x, 8, &mv7c, "F7C mv");
+                                fup!(fg.plane_in_spec(), f4x, 8, &flat8([0.3, 0.0, 0.0, 0.8]), "F7C flat");
+                                let pf = gpu::frd_gpu::FrdFrame {
+                                    reset: false,
+                                    far: 50.0,
+                                    proj: proj7,
+                                    cam_step: 0.06,
+                                    cam_fwd: fwd7.to_array(),
+                                    light_par: 0.0,
+                                    vm_m: wp7c.to_cols_array(),
+                                    cam_org: cam7.pos.to_array(),
+                                    cam_rgt: rgt_s.to_array(),
+                                    cam_up: up_s.to_array(),
+                                };
+                                frec!(pf, "F7C probe");
+                                l7c[ai] = lum_at(&fout!("F7C"), c7x, c7y);
+                            }
+                            fg.force_vmotion.set(None);
+                            fg.force_curv.set(None);
+                            // F7C oracle predictions off the exact
+                            // QUANTIZED words the shader's central diff
+                            // decodes (encode→UNORM10→decode→normalize).
+                            let dec_n = |w: [u8; 4]| -> [f32; 3] {
+                                let u = u32::from_le_bytes(w);
+                                let p = [
+                                    (u & 1023) as f32 / 1023.0,
+                                    ((u >> 10) & 1023) as f32 / 1023.0,
+                                    ((u >> 20) & 1023) as f32 / 1023.0,
+                                ];
+                                let (n, _) = nrd::oracle::decode_normal_roughness_101010(p);
+                                let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+                                [n[0] / l, n[1] / l, n[2] / l]
+                            };
+                            let n_px = |x: usize, y: usize| -> [f32; 3] {
+                                let i = (y * pw + x) * 4;
+                                dec_n(nr_probe[i..i + 4].try_into().unwrap())
+                            };
+                            let dmag = |a: [f32; 3], b: [f32; 3]| -> f32 {
+                                ((a[0] - b[0]).powi(2)
+                                    + (a[1] - b[1]).powi(2)
+                                    + (a[2] - b[2]).powi(2))
+                                .sqrt()
+                            };
+                            let dn_x = dmag(n_px(c7x + 1, c7y), n_px(c7x - 1, c7y));
+                            let dn_y = dmag(n_px(c7x, c7y + 1), n_px(c7x, c7y - 1));
+                            let kap_o = frd::oracle::vm_curvature(dn_x, dn_y, 5.0, proj7);
+                            let rq7c = {
+                                let e = nrd::oracle::encode_normal_roughness_101010(n_face, 0.05);
+                                let q = ((e[2].clamp(0.0, 1.0) * 1023.0 + 0.5) as u32) as f32
+                                    / 1023.0;
+                                (q * 2.0 - 1.0).abs()
+                            };
+                            let t_r7c = nh7
+                                * nrd::oracle::hit_dist_normalization(5.0, [3.0, 0.1, 20.0], rq7c);
+                            let d_sky = frd::oracle::spec_virtual_delta_px(
+                                c7x as f32 + 0.5,
+                                c7y as f32 + 0.5,
+                                pw as f32,
+                                ph as f32,
+                                5.0,
+                                t_r7c,
+                                50.0,
+                                cam7.pos,
+                                fwd7,
+                                rgt_s,
+                                up_s,
+                                &wp7c,
+                            );
+                            let d_curv = frd::oracle::spec_virtual_delta_px(
+                                c7x as f32 + 0.5,
+                                c7y as f32 + 0.5,
+                                pw as f32,
+                                ph as f32,
+                                5.0,
+                                frd::oracle::virtual_dist(t_r7c, kap_o),
+                                50.0,
+                                cam7.pos,
+                                fwd7,
+                                rgt_s,
+                                up_s,
+                                &wp7c,
+                            );
+                            let gap7c_pred = 0.85 * (6.0 / pw as f32) * d_sky[0].abs();
+                            // Fetch F sits at LOWER x than S on an
+                            // increasing gradient, so S − F is positive.
+                            let gap7c_f = l7c[0] - l7c[1];
+                            let gap7c_c = (l7c[2] - l7c[0]).abs();
+
                             println!(
                                 "check-gpu: frd F5 — firefly peak off {p_off:.1} on {p_on:.2} | \
                                  antilag conv-bad {g_conv_bad} g-min {g_min:.3} | F6 glint pre \
                                  {g6_pre:.2} fixed {:.3} brake {:.3} pre-fix {:.3} | F7 |d.x| \
-                                 {:.1} px gap {gap7:.3} (pred {gap_pred:.3})",
-                                g6[0], g6[1], g6[2], d7[0].abs()
+                                 {:.1} px gap {gap7:.3} (pred {gap_pred:.3}) | F7C |d_sky| {:.1} \
+                                 |d_curv| {:.2} kap {kap_o:.2} gapF {gap7c_f:.3} (pred \
+                                 {gap7c_pred:.3}) gapC {gap7c_c:.3}",
+                                g6[0],
+                                g6[1],
+                                g6[2],
+                                d7[0].abs(),
+                                d_sky[0].abs(),
+                                d_curv[0].abs()
                             );
                             let mut fbad = Vec::new();
                             // F5a: OFF bright (the outlier survives — the
@@ -9039,6 +9273,39 @@ fn run_check_gpu(
                             if gap7 < 0.5 * gap_pred || gap7 > 1.5 * gap_pred {
                                 fbad.push(format!(
                                     "F7 fetch gap off the oracle band ({gap7} vs {gap_pred})"
+                                ));
+                            }
+                            // F7C: the synthetic curvature clears the
+                            // dead-zone through the quantized round-trip
+                            // and the sky delta is real (anti-vacuity);
+                            // the curved oracle collapses to ~the surface
+                            // (the mechanism precondition); the flat arm
+                            // REPRODUCES the streak (tracks the sky
+                            // oracle — teeth); the curv arm kills it.
+                            if dn_x < 2.0 * frd::VM_DN_DZ {
+                                fbad.push(format!(
+                                    "F7C curvature signal under the dead-zone ({dn_x})"
+                                ));
+                            }
+                            if d_sky[0].abs() < 2.5 {
+                                fbad.push(format!("F7C sky delta too small ({})", d_sky[0]));
+                            }
+                            if d_curv[0].abs() > 0.15 * d_sky[0].abs() {
+                                fbad.push(format!(
+                                    "F7C curved delta not near the surface ({} vs {})",
+                                    d_curv[0], d_sky[0]
+                                ));
+                            }
+                            if gap7c_f < 0.5 * gap7c_pred || gap7c_f > 1.5 * gap7c_pred {
+                                fbad.push(format!(
+                                    "F7C flat arm off the sky-oracle band ({gap7c_f} vs \
+                                     {gap7c_pred} — the bug repro lost its teeth)"
+                                ));
+                            }
+                            if gap7c_c > 0.35 * gap7c_pred {
+                                fbad.push(format!(
+                                    "F7C curv arm did not collapse to the surface fetch \
+                                     ({gap7c_c} vs flat {gap7c_pred})"
                                 ));
                             }
                             if !fbad.is_empty() {

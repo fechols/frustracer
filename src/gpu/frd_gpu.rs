@@ -198,6 +198,7 @@ pub struct FrdGpu {
     pub force_fire: std::cell::Cell<Option<bool>>,
     pub force_antilag: std::cell::Cell<Option<bool>>,
     pub force_vmotion: std::cell::Cell<Option<bool>>,
+    pub force_curv: std::cell::Cell<Option<bool>>,
     /// Native 16-bit shader ops (OPTIONS4) — the phase-D fp16 arm's probe;
     /// recorded now so the armed line names it. Phases B/C compile fp32.
     pub fp16: bool,
@@ -468,6 +469,7 @@ impl FrdGpu {
             force_fire: std::cell::Cell::new(None),
             force_antilag: std::cell::Cell::new(None),
             force_vmotion: std::cell::Cell::new(None),
+            force_curv: std::cell::Cell::new(None),
             fp16,
             rw,
             rh,
@@ -500,6 +502,17 @@ impl FrdGpu {
     /// every plane here).
     pub fn plane_antilag(&self) -> &ID3D12Resource {
         &self.antilag.res
+    }
+    /// Gate hooks (the force_* family): the frame counter drives the blur
+    /// passes' tap-rotation hash and the history parity, so a byte-identity
+    /// A/B between two recorded sequences must REPLAY the same index run —
+    /// F7's curv-on/off pin sets it back between arms. Never called by a
+    /// real session.
+    pub fn frame_index(&self) -> u32 {
+        self.frame_idx.get()
+    }
+    pub fn set_frame_index(&self, v: u32) {
+        self.frame_idx.set(v);
     }
 
     fn to_state(reg: &Reg, want: D3D12_RESOURCE_STATES, b: &mut Vec<D3D12_RESOURCE_BARRIER>) {
@@ -562,18 +575,22 @@ impl FrdGpu {
         // flags: bit 0 = reset | bit 1 = firefly pre-clamp (the
         // --frd-[no-]anti-firefly lever, DEFAULT ON — it is the bright-
         // trail killer) | bit 2 = v1.5 virtual motion (FR_FRD_VMOTION=off
-        // disarms) | bit 3 = anti-lag (FR_FRD_ANTILAG=off disarms). The
-        // force_* cells are the gate hooks (F5/F6/F7).
+        // disarms) | bit 3 = anti-lag (FR_FRD_ANTILAG=off disarms) |
+        // bit 4 = v1.5.1 vm curvature (FR_FRD_CURV=off disarms — the
+        // flat-mirror helmet-streak repro arm). The force_* cells are the
+        // gate hooks (F5/F6/F7/F7C).
         let fire = self
             .force_fire
             .get()
             .unwrap_or_else(|| t.anti_firefly.unwrap_or(true));
         let vmot = self.force_vmotion.get().unwrap_or_else(crate::frd::vmotion_enabled);
         let alag = self.force_antilag.get().unwrap_or_else(crate::frd::antilag_enabled);
+        let curv = self.force_curv.get().unwrap_or_else(crate::frd::curv_enabled);
         let flags = (f.reset as u32)
             | ((fire as u32) << 1)
             | ((vmot as u32) << 2)
-            | ((alag as u32) << 3);
+            | ((alag as u32) << 3)
+            | ((curv as u32) << 4);
         let cb = |pass_scale: f32, salt: u32| -> [u32; CB_DWORDS as usize] {
             let mut c = [0u32; CB_DWORDS as usize];
             let head = [

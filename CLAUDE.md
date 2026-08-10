@@ -1794,7 +1794,43 @@ cargo run --release -- --gpu --xess --frd  # FRD (src/frd.rs + gpu/frd_gpu.rs, 2
                                       # still unfold — rippled water/curved reflectors broke
                                       # that trust, the 2026-08-10 strafe-smear regression;
                                       # v1.5 = corrected FETCH under the SAME conservative
-                                      # cap, relaxing it is v2's confidence term). Pure
+                                      # cap, relaxing it is v2's confidence term). v1.5.1
+                                      # (2026-08-10, the helmet sun-streak fix — the user's
+                                      # exact diagnosis): the FLAT-mirror sky arm is
+                                      # ANTI-correct on a CURVED mirror — a convex mirror
+                                      # images an infinite object at its focal point ~R/2
+                                      # BEHIND the surface (the paraxial mirror equation), so
+                                      # a helmet glint's true screen motion rides the SURFACE,
+                                      # and the screen-pinned sky fetch re-painted every
+                                      # vacated pixel with its own stale bright history (an
+                                      # ACCEPTED stale self-fetch: the per-frame normal drift
+                                      # at |mv| px sits UNDER the spec ladder, so the stale
+                                      # history keeps being accepted). The fix is the mirror
+                                      # equation on the unfold distance BEFORE the sky test
+                                      # and the construction — t_v = t_r/(1 + 2κ·t_r)
+                                      # (frd_virtual_dist: exact at ALL object distances;
+                                      # κ = 0 is a BRANCH returning t_r verbatim, the bitwise
+                                      # flat path; κ·t_r ≫ 1 ⇒ t_v → 1/(2κ) ≈ R/2 ⇒ the fetch
+                                      # collapses to the surface reprojection; for κ ≥ 0,
+                                      # t_v ∈ (0, t_r] monotone — κ errors INTERPOLATE between
+                                      # the two shipped behaviors, never extrapolate) — with κ
+                                      # from dead-zoned central differences of the DECODED
+                                      # wire normals (frd_vm_curvature: 2px baseline, 4 loads
+                                      # + decodes inside the vm block's gate; VM_DN_DZ = 5e-3
+                                      # SUBTRACTIVE — continuous through the boundary, sized
+                                      # so 10-bit-oct quantization reads exactly 0 while a
+                                      # 200-500px helmet dome clears it 2-5x; MAX of the axes
+                                      # — errs surface-fetch-ward, never dilutes a cylinder;
+                                      # magnitude-only, concave reads convex = the humble
+                                      # direction; a constant field is ONE encoded word ⇒
+                                      # Δn ≡ 0 bitwise ⇒ still water/F7's mirror untouched by
+                                      # construction). Rippled water's κ fires and that is
+                                      # CORRECT (crests are genuine convex micro-mirrors —
+                                      # the flat unfold there was the d23ecc3 regression);
+                                      # extreme close-up domes fade toward the dead-zone
+                                      # (known-accept — cam_step/z is large at small z).
+                                      # FR_FRD_CURV=off is the flat-mirror repro arm (flags
+                                      # bit 4, force_curv the gate hook). Pure
                                       # rotation needs none of this (both
                                       # points share the ray through the unmoved origin — the
                                       # surface MV is already correct there). CB_DWORDS 17→47
@@ -1820,7 +1856,12 @@ cargo run --release -- --gpu --xess --frd  # FRD (src/frd.rs + gpu/frd_gpu.rs, 2
                                       # anchors (bit-equal ⇒ ABSOLUTE exact 0 — the strafe-gate
                                       # lesson), the vm family (parked exact-0 snap, t_r=0
                                       # exact, moved-camera must-fire, sky-vs-finite must-
-                                      # differ, the ngxfg cross-pin, slack-1.0 identity),
+                                      # differ, the ngxfg cross-pin, slack-1.0 identity, the
+                                      # v1.5.1 curvature family — virtual_dist κ<=0 bitwise
+                                      # identity/R-over-2 limit/monotone, vm_curvature
+                                      # dead-zone exact-0 + closed-form anchor + axis
+                                      # symmetry, and the composed heavy-κ snap-to-surface
+                                      # pin),
                                       # bilateral
                                       # weight shapes, radius endpoints, Vogel-disk spread, and
                                       # the wire re-export pin vs nrd::oracle); F1 (check-gpu:
@@ -1854,12 +1895,30 @@ cargo run --release -- --gpu --xess --frd  # FRD (src/frd.rs + gpu/frd_gpu.rs, 2
                                       # with real matrices and the exact surface-MV plane — the
                                       # vmotion-on/off arms' OUT gap must land within ±50% of
                                       # slope·|oracle d.x|, measured 0.189 vs 0.182 predicted
-                                      # at |d.x| = 38 px). dxc::compile_args is the per-unit
+                                      # at |d.x| = 38 px; plus the curv-on/off BYTE-identity
+                                      # replay on the flat probe — the κ=0-branch contract on
+                                      # the wire, at a reset frame_index so the tap-rotation
+                                      # hash matches); F7C (the CURVED-mirror variant, the
+                                      # helmet-streak repro: a 1°/px world-anchored normal
+                                      # field — the probe frame samples it at each pixel's
+                                      # PREV screen position, an unshifted field disoccludes
+                                      # every arm and the gate goes vacuous — far = 50 puts
+                                      # the flat t_r into the REAL sky arm, strafe 0.06 keeps
+                                      # the stale self-fetch's ~4.9° drift UNDER the 6.6°
+                                      # ladder so the streak mechanism actually runs; three
+                                      # arms — the flat arm must TRACK the sky oracle, gapF
+                                      # 0.049 vs pred 0.048, the bug repro with teeth; the
+                                      # curv arm must collapse to ≤ 0.35x of it, measured
+                                      # 0.004 = 12x reduction; anti-vacuity: quantized-round-
+                                      # trip dn ≥ 2·DN_DZ, |d_sky| ≥ 2.5 px, oracle d_curv ≤
+                                      # 0.15·|d_sky|). dxc::compile_args is the per-unit
                                       # -enable-16bit-types hook the phase-D fp16 arm uses.
                                       # Next: C-completion (hit-dist-recon/3x3-fallback)
                                       # + F8, further D tuning (fp16 arm, wave ops,
                                       # plane-distance bilateral upgrade, stabilization,
-                                      # specular virtual-motion v2 — curved reflectors), then
+                                      # specular virtual-motion v2 — model CONFIDENCE to
+                                      # relax the translation cap, signed/concave curvature),
+                                      # then
                                       # E's
                                       # remaining half — the NRD deletion (the FLIP half of E
                                       # SHIPPED 2026-08-09, same day: frd defaults ON, nrd is
@@ -1873,7 +1932,10 @@ cargo run --release -- --gpu --xess --frd  # FRD (src/frd.rs + gpu/frd_gpu.rs, 2
                                       # — check the `nrd: armed` line first, the mislabeled-
                                       # baseline lesson). (2) camera translation — strafe past
                                       # water/helmet sky glints with --no-fg; default vs
-                                      # FR_FRD_VMOTION=off vs --nrd. (3) regression —
+                                      # FR_FRD_CURV=off (the helmet streak's repro arm) vs
+                                      # FR_FRD_VMOTION=off vs --nrd; still water's sky
+                                      # reflection must stay PINNED (constant normal word ⇒
+                                      # the bitwise flat path). (3) regression —
                                       # FRUSTRACER_STAB still in the 0.06-0.11 band,
                                       # --gpu-timing frd-temporal before/after.
                                       # Touch frd.rs / frd_gpu.rs / the DnGpu enum /

@@ -50,7 +50,7 @@ RWTexture2D<float> cur_vz : register(u6);
 cbuffer FrdCb : register(b0) {
     uint rw;
     uint rh;
-    uint flags; // bit 0 = history reset | 1 = firefly pre-clamp | 3 = anti-lag
+    uint flags; // bit 0 = reset | 1 = firefly | 2 = vmotion | 3 = anti-lag | 4 = vm curvature
     uint frame;
     float cam_far;
     float max_accum;   // tuning (frd.rs constants unless --frd-* moved them)
@@ -219,15 +219,45 @@ void cs_frd_temporal(uint3 id : SV_DispatchThreadID) {
     float t_r = (nh_hist > 0.0 ? nh_hist : sin_.w) * frd_hitdist_denorm_factor(z, rough);
     float vm_w = 1.0 - smoothstep(FRD_VM_ROUGH_LO, FRD_VM_ROUGH_HI, rough);
     if ((flags & 4u) != 0u && t_r > 0.0 && vm_w > 0.0) {
+        // v1.5.1 CURVATURE (flag bit 4 = 16u; FR_FRD_CURV=off is the
+        // flat-mirror repro arm): a convex mirror images its
+        // reflection at the MIRROR-EQUATION distance, not the ray-traced
+        // one — on the helmet the sun's image sits ~R/2 behind the
+        // surface, so its screen motion rides the SURFACE, and the flat
+        // sky arm's screen-pinned fetch re-painted every vacated pixel
+        // with its own stale bright history (the strafe streak). κ comes
+        // from dead-zoned central differences of the DECODED wire normals
+        // (2px baseline; a constant field is ONE encoded word ⇒ Δn ≡ 0
+        // bitwise ⇒ frd_virtual_dist's κ=0 branch ⇒ the flat path
+        // verbatim — still water and F7's mirror are structurally
+        // untouched).
+        float t_v = t_r;
+        if ((flags & 16u) != 0u) {
+            int2 xm = int2(max(int(p.x) - 1, 0), int(p.y));
+            int2 xp = int2(min(int(p.x) + 1, int(rw) - 1), int(p.y));
+            int2 ym = int2(int(p.x), max(int(p.y) - 1, 0));
+            int2 yp = int2(int(p.x), min(int(p.y) + 1, int(rh) - 1));
+            float3 nxm, nxp, nym, nyp;
+            float rr_;
+            frd_decode_nr(in_nr[xm], nxm, rr_);
+            frd_decode_nr(in_nr[xp], nxp, rr_);
+            frd_decode_nr(in_nr[ym], nym, rr_);
+            frd_decode_nr(in_nr[yp], nyp, rr_);
+            float kap = frd_vm_curvature(length(nxp - nxm), length(nyp - nym), z, proj);
+            t_v = frd_virtual_dist(t_r, kap);
+        }
         float ndx = (float(p.x) + 0.5) * (2.0 / float(rw)) - 1.0;
         float ndy = 1.0 - (float(p.y) + 0.5) * (2.0 / float(rh));
         float3 du = normalize(cam_fwd + cam_rgt * ndx + cam_up * ndy);
         float ray_t = z / dot(du, cam_fwd);
         float3 hit_p = cam_org + du * ray_t;
         float4 ps = mul(vm_m, float4(hit_p, 1.0));
-        float4 pv = t_r >= FRD_VM_FAR_K * cam_far
+        // The sky test runs on t_v, not t_r — a heavily curved surface's
+        // "sky" reflection is a NEAR virtual image (that re-route IS the
+        // helmet fix).
+        float4 pv = t_v >= FRD_VM_FAR_K * cam_far
             ? mul(vm_m, float4(du, 0.0))
-            : mul(vm_m, float4(cam_org + du * (ray_t + t_r), 1.0));
+            : mul(vm_m, float4(cam_org + du * (ray_t + t_v), 1.0));
         if (ps.w > 1e-6 && pv.w > 1e-6) {
             float2 spx = float2(
                 (ps.x / ps.w + 1.0) * 0.5 * float(rw), (1.0 - ps.y / ps.w) * 0.5 * float(rh));

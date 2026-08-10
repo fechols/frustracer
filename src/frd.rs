@@ -135,6 +135,21 @@ pub const VM_Z_SLACK: f32 = 0.05;
 /// otherwise defeat the integer-aligned-foot fast path and the parked
 /// bit-stability. 0.05 px is far below any visible virtual motion.
 pub const VM_DEADZONE2: f32 = 2.5e-3;
+/// The curvature estimator's dead-zone, in |Δn|-per-2px-baseline units
+/// (central difference of DECODED wire normals over p±1): one LSB of the
+/// 10-bit L1-oct encode moves the decoded normal 1.4–2.4e-3, so a 2-LSB
+/// central diff (~3–5e-3) is quantization, not geometry. SUBTRACTIVE
+/// (dn_eff = max(dn − DZ, 0)) so κ — and therefore the fetch position —
+/// stays continuous through the boundary (a hard threshold steps t_v and
+/// flickers on the quantization staircase). Deliberately not
+/// worst-case-proof: a false-positive κ only reverts toward the surface
+/// fetch (the pre-v1.5 status quo), a false-negative streaks — the
+/// asymmetry makes the tighter value right. A truly constant normal field
+/// (still water, F7's mirror) is ONE encoded word ⇒ Δn ≡ 0 bitwise ⇒ κ = 0
+/// with no dead-zone needed at all. Known-accept: an extreme close-up dome
+/// (~1000 px of span for ~140° of swing) fades toward the dead-zone —
+/// mitigated by cam_step/z being large at small z.
+pub const VM_DN_DZ: f32 = 5e-3;
 
 // ---------------------------------------------------------------------------
 // Tuning — the --frd-* levers (the nrd::ReblurTuning / fsr-tune shape):
@@ -206,6 +221,26 @@ pub fn sunpar_gain() -> f32 {
                 eprintln!("frd: FR_FRD_SUNPAR='{v}' is not off|<gain> — using the default 1.0");
                 1.0
             }
+        }
+    })
+}
+
+/// FR_FRD_CURV=off — disarm the v1.5.1 curvature term (the mirror
+/// equation on the unfold distance): the vm block reverts to the flat-
+/// mirror t_r — the helmet sun-streak repro arm. A CB flag, never a
+/// recompile; loud on departure, any other value loud + default ON.
+pub fn curv_enabled() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| {
+        let Ok(v) = std::env::var("FR_FRD_CURV") else {
+            return true;
+        };
+        if v.eq_ignore_ascii_case("off") {
+            eprintln!("frd: FR_FRD_CURV=off — vm curvature disarmed (flat-mirror repro arm)");
+            false
+        } else {
+            eprintln!("frd: FR_FRD_CURV='{v}' is not `off` — curvature stays armed");
+            true
         }
     })
 }
@@ -463,6 +498,44 @@ pub mod oracle {
     pub fn vm_rough_fade(rough: f32) -> f32 {
         let t = ((rough - VM_ROUGH_LO) / (VM_ROUGH_HI - VM_ROUGH_LO)).clamp(0.0, 1.0);
         1.0 - t * t * (3.0 - 2.0 * t)
+    }
+
+    /// The v1.5.1 curvature correction — the PARAXIAL MIRROR EQUATION
+    /// verbatim (convex mirror f = −R/2, object at t_r ⇒ virtual image at
+    /// t_r/(1 + 2t_r/R) behind the surface — exact at ALL object
+    /// distances, not just the limits): the unfold distance a CURVED
+    /// mirror actually images at. κ = 0 is a BRANCH returning t_r
+    /// VERBATIM (the flat path — still water, F7's constant-normal mirror
+    /// — must stay bitwise, and a formula-only identity is one fmad
+    /// contraction away from not holding); κ·t_r ≫ 1 ⇒ t_v → 1/(2κ) ≈
+    /// R/2, the virtual image just behind the surface ⇒ the fetch lands
+    /// at the SURFACE reprojection — the physically correct answer for a
+    /// convex mirror's sun glint (the helmet streak: the flat-mirror sky
+    /// arm pinned the fetch to the old screen position, re-painting every
+    /// vacated pixel with its own stale bright history). Safety envelope:
+    /// for κ ≥ 0, t_v ∈ (0, t_r] monotone in κ — any κ error
+    /// INTERPOLATES between the two already-shipped behaviors (surface
+    /// fetch ↔ flat unfold), never extrapolates past either.
+    pub fn virtual_dist(t_r: f32, kappa: f32) -> f32 {
+        if kappa <= 0.0 {
+            t_r
+        } else {
+            t_r / (1.0 + 2.0 * kappa * t_r)
+        }
+    }
+
+    /// The screen-space CONVEX-curvature estimate feeding virtual_dist:
+    /// |Δn| central-differenced over a 2px baseline per axis (the DECODED
+    /// wire normals), dead-zoned SUBTRACTIVELY against the 10-bit oct
+    /// quantization (VM_DN_DZ — see its doc for the asymmetry argument),
+    /// MAX of the two axes (max only errs surface-fetch-ward; a mean
+    /// would dilute a cylinder's curved axis with its flat one), divided
+    /// by the 2px world step 2·z/proj. Magnitude-only — concave reads as
+    /// convex, which only shortens t_v toward the surface fetch, the
+    /// humble direction (a true concave carve-out is v2).
+    pub fn vm_curvature(dn_x: f32, dn_y: f32, view_z: f32, proj: f32) -> f32 {
+        let dn = (dn_x.max(dn_y) - VM_DN_DZ).max(0.0);
+        dn * proj / (2.0 * view_z.max(1e-4))
     }
 
     /// The v1.5 virtual-motion DELTA, pixels: project the SURFACE point and
@@ -923,6 +996,58 @@ pub mod oracle {
             }
             if (df[0] - ds[0]).abs() + (df[1] - ds[1]).abs() < 1e-3 {
                 return Err("frd: the sky arm must differ from the finite arm".into());
+            }
+            // v1.5.1 curvature: κ ≤ 0 is the BITWISE identity (the flat
+            // path's contract — still water and F7's mirror ride it); the
+            // κ·t_r ≫ 1 limit is the mirror focal length 1/(2κ); monotone
+            // between; the dead-zone is EXACTLY 0 below VM_DN_DZ with a
+            // closed-form anchor above and max-axis symmetry; and the
+            // COMPOSED pin: at heavy curvature the moved-camera sky delta
+            // must snap to exactly (0,0) — the virtual image lands on the
+            // surface, whose delta is sub-deadzone — while the flat sky
+            // arm (ds above) provably fires.
+            for t in [0.5f32, 7.0, 5000.0] {
+                if virtual_dist(t, 0.0) != t || virtual_dist(t, -1.0) != t {
+                    return Err("frd: virtual_dist must be the identity at kappa <= 0".into());
+                }
+            }
+            let lim = virtual_dist(1e9, 0.7);
+            if (lim - 1.0 / 1.4).abs() > 1e-3 {
+                return Err(format!("frd: virtual_dist far limit must be 1/(2k) ({lim})"));
+            }
+            if virtual_dist(40.0, 0.1) <= virtual_dist(40.0, 0.5)
+                || virtual_dist(40.0, 0.5) <= virtual_dist(40.0, 2.0)
+            {
+                return Err("frd: virtual_dist must be monotone decreasing in kappa".into());
+            }
+            if vm_curvature(VM_DN_DZ * 0.5, VM_DN_DZ * 0.9, 5.0, 406.0) != 0.0 {
+                return Err("frd: vm_curvature must be exactly 0 inside the dead-zone".into());
+            }
+            let ka = vm_curvature(0.015, 0.0, 5.0, 406.0);
+            if (ka - (0.015 - VM_DN_DZ) * 406.0 / 10.0).abs() > 1e-4 {
+                return Err(format!("frd: vm_curvature closed-form anchor ({ka})"));
+            }
+            if vm_curvature(0.015, 0.002, 5.0, 406.0) != vm_curvature(0.002, 0.015, 5.0, 406.0) {
+                return Err("frd: vm_curvature must be symmetric in its axes (max)".into());
+            }
+            let dc = spec_virtual_delta_px(
+                216.5,
+                162.5,
+                rw as f32,
+                rh as f32,
+                7.0,
+                virtual_dist(far, 1e3),
+                far,
+                org,
+                fwd,
+                rgt,
+                upv,
+                &wp,
+            );
+            if dc != [0.0, 0.0] {
+                return Err(format!(
+                    "frd: heavy curvature must snap the sky delta to the surface ({dc:?})"
+                ));
             }
             // The cross-pin runs only where both engines take the SAME
             // branch: t_r well under VM_FAR_K·far, and exactly far (both

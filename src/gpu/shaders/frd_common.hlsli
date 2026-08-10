@@ -39,6 +39,7 @@ static const float FRD_VM_ROUGH_LO = 0.25;
 static const float FRD_VM_ROUGH_HI = 0.6;
 static const float FRD_VM_Z_SLACK = 0.05;
 static const float FRD_VM_DEADZONE2 = 2.5e-3;
+static const float FRD_VM_DN_DZ = 5e-3;
 
 // The wire's enc-2 normal+roughness decode (nrd_pack_nr's inverse — the
 // nrd.rs::oracle decode twin): L1-octahedral xy, SIGNED roughness in z.
@@ -57,6 +58,33 @@ bool frd_z_valid(float z_expect, float z_prev, float ndv) {
     float scale = max(max(abs(z_expect), abs(z_prev)), 1e-6);
     float rel = abs(z_prev - z_expect) / scale;
     return rel < FRD_Z_EPS / max(ndv, 0.1);
+}
+
+// oracle::virtual_dist — v1.5.1: the PARAXIAL MIRROR EQUATION on the
+// unfold distance (convex f = −R/2, exact at all object distances): the
+// distance a CURVED mirror actually images at. κ = 0 is a BRANCH
+// returning t_r VERBATIM (the flat path — still water — stays bitwise;
+// a formula identity is one fmad contraction away from not holding);
+// κ·t_r ≫ 1 ⇒ t_v → 1/(2κ) ≈ R/2, the image just behind the surface ⇒
+// the fetch lands at the SURFACE reprojection — the correct answer for a
+// convex mirror's sun glint (the helmet-streak fix: the flat sky arm
+// pinned vacated pixels to their own stale bright history). For κ ≥ 0,
+// t_v ∈ (0, t_r] monotone — κ errors interpolate between the two shipped
+// behaviors, never past either.
+float frd_virtual_dist(float t_r, float kappa) {
+    return kappa <= 0.0 ? t_r : t_r / (1.0 + 2.0 * kappa * t_r);
+}
+
+// oracle::vm_curvature — |Δn| central-differenced over a 2px baseline per
+// axis (decoded wire normals), dead-zoned SUBTRACTIVELY against the
+// 10-bit oct quantization (continuous through the boundary — a hard
+// threshold steps the fetch on the quantization staircase), MAX of the
+// axes (errs surface-fetch-ward only), over the 2px world step 2z/proj.
+// Magnitude-only: concave reads convex, which only shortens t_v toward
+// the surface fetch — the humble direction.
+float frd_vm_curvature(float dn_x, float dn_y, float view_z, float proj) {
+    float dn = max(max(dn_x, dn_y) - FRD_VM_DN_DZ, 0.0);
+    return dn * proj / (2.0 * max(view_z, 1e-4));
 }
 
 // oracle::disocclusion_z_valid_slack — the VIRTUAL foot's widened test
