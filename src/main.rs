@@ -9166,8 +9166,11 @@ fn run_check_gpu(
                                 .sqrt()
                             };
                             let dn_x = dmag(n_px(c7x + 1, c7y), n_px(c7x - 1, c7y));
+                            let dn4x = dmag(n_px(c7x + 2, c7y), n_px(c7x - 2, c7y));
                             let dn_y = dmag(n_px(c7x, c7y + 1), n_px(c7x, c7y - 1));
-                            let kap_o = frd::oracle::vm_curvature(dn_x, dn_y, 5.0, proj7);
+                            let dn4y = dmag(n_px(c7x, c7y + 2), n_px(c7x, c7y - 2));
+                            let (kap_o, _, _) =
+                                frd::oracle::vm_kappa(dn_x, dn4x, dn_y, dn4y, 5.0, proj7);
                             let rq7c = {
                                 let e = nrd::oracle::encode_normal_roughness_101010(n_face, 0.05);
                                 let q = ((e[2].clamp(0.0, 1.0) * 1023.0 + 0.5) as u32) as f32

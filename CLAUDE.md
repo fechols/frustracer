@@ -1815,20 +1815,54 @@ cargo run --release -- --gpu --xess --frd  # FRD (src/frd.rs + gpu/frd_gpu.rs, 2
                                       # t_v ∈ (0, t_r] monotone — κ errors INTERPOLATE between
                                       # the two shipped behaviors, never extrapolate) — with κ
                                       # from dead-zoned central differences of the DECODED
-                                      # wire normals (frd_vm_curvature: 2px baseline, 4 loads
-                                      # + decodes inside the vm block's gate; VM_DN_DZ = 5e-3
+                                      # wire normals (VM_DN_DZ = 5e-3
                                       # SUBTRACTIVE — continuous through the boundary, sized
-                                      # so 10-bit-oct quantization reads exactly 0 while a
-                                      # 200-500px helmet dome clears it 2-5x; MAX of the axes
-                                      # — errs surface-fetch-ward, never dilutes a cylinder;
+                                      # so 10-bit-oct quantization reads exactly 0;
                                       # magnitude-only, concave reads convex = the humble
                                       # direction; a constant field is ONE encoded word ⇒
                                       # Δn ≡ 0 bitwise ⇒ still water/F7's mirror untouched by
-                                      # construction). Rippled water's κ fires and that is
+                                      # construction). v1.5.2 (same day — the CLOSE-UP
+                                      # BIDIRECTIONAL-streak feel-test, lever-confirmed:
+                                      # leading streak = κ OVER-read from normal-map detail
+                                      # riding the wire's SHADING normals ⇒ the fetch rides
+                                      # the surface FASTER than the true virtual image, which
+                                      # moves z/(z+R/2) slower; trailing = κ under-read, the
+                                      # close-up dome's macro signal at the dead-zone):
+                                      # frd_vm_kappa runs FOUR estimates — 2px AND 4px
+                                      # baselines per axis (8 loads + decodes, vm-gated; the
+                                      # same absolute DZ at both scales means the 4px read
+                                      # RESCUES the close-up macro signal the 2px read
+                                      # dead-zones away) — per-axis MIN across scales (bump
+                                      # noise decorrelates across scales, macro curvature
+                                      # doesn't: the min kills single-scale spikes, the
+                                      # leading-streak suppressor), MAX across axes
+                                      # (cylinders track their curved axis), and the
+                                      # κ_lo/κ_hi BRACKET's projected fetch spread charges
+                                      # the specular history cap (vm_unc on the parallax
+                                      # line, only ever TIGHTENING it): where the estimator
+                                      # disagrees with itself (bumpy visor, dead-zone-
+                                      # straddling close-ups, cylinders' genuine ambiguity)
+                                      # history collapses and NEITHER streak can accumulate —
+                                      # short-history noise the spatial passes cover, never a
+                                      # confident wrong fetch. The v2 confidence term, cheap
+                                      # form. Rippled water's κ fires and that is
                                       # CORRECT (crests are genuine convex micro-mirrors —
-                                      # the flat unfold there was the d23ecc3 regression);
-                                      # extreme close-up domes fade toward the dead-zone
-                                      # (known-accept — cam_step/z is large at small z).
+                                      # the flat unfold there was the d23ecc3 regression).
+                                      # Residual known-accept: bumps aligning at BOTH scales
+                                      # and axes still over-read with a narrow bracket (v2's
+                                      # content-based confidence is the real answer). NOTE
+                                      # the beyond-the-path brightness the same feel-test
+                                      # raised: under pure translation the sky-arm fetch is
+                                      # the pixel's OWN old position (decay-in-place —
+                                      # transport is impossible, and F7 pins the delta's
+                                      # sign/magnitude to the oracle), so brightness past the
+                                      # glint's historical path is the RECURRENT SPATIAL BLUR
+                                      # halo of a long-lived bright trail (pass 3's blurred
+                                      # output IS next frame's history — the halo compounds
+                                      # while the trail lives); v1.5.2 removes the trail
+                                      # fuel, and the identified follow-up if residue
+                                      # survives is a luma-ratio tap guard in frd_disk (the
+                                      # firefly ring clamp's spatial sibling).
                                       # FR_FRD_CURV=off is the flat-mirror repro arm (flags
                                       # bit 4, force_curv the gate hook). Pure
                                       # rotation needs none of this (both
@@ -1857,11 +1891,13 @@ cargo run --release -- --gpu --xess --frd  # FRD (src/frd.rs + gpu/frd_gpu.rs, 2
                                       # lesson), the vm family (parked exact-0 snap, t_r=0
                                       # exact, moved-camera must-fire, sky-vs-finite must-
                                       # differ, the ngxfg cross-pin, slack-1.0 identity, the
-                                      # v1.5.1 curvature family — virtual_dist κ<=0 bitwise
-                                      # identity/R-over-2 limit/monotone, vm_curvature
-                                      # dead-zone exact-0 + closed-form anchor + axis
-                                      # symmetry, and the composed heavy-κ snap-to-surface
-                                      # pin),
+                                      # v1.5.1/.2 curvature family — virtual_dist κ<=0
+                                      # bitwise identity/R-over-2 limit/monotone,
+                                      # vm_curvature_at dead-zone exact-0 + closed-form
+                                      # anchor, the vm_kappa clean-field/spike-suppression-
+                                      # teeth/axis-symmetry/honest-cylinder-κ_lo-0/
+                                      # dead-zone-skew-bracket pins, and the composed
+                                      # heavy-κ snap-to-surface pin),
                                       # bilateral
                                       # weight shapes, radius endpoints, Vogel-disk spread, and
                                       # the wire re-export pin vs nrd::oracle); F1 (check-gpu:

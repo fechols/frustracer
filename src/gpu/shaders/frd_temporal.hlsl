@@ -80,6 +80,20 @@ cbuffer FrdCb : register(b0) {
     float3 cam_up;     // up · tan(fov/2)
 };
 
+// The vm block's shared prev-camera projection: the virtual point at
+// unfold distance t along the primary ray (t past the FAR_K threshold
+// takes the rotation-only DIRECTION limit, w = 0 — the flat-sky arm; the
+// never-exact-far threshold is the wire_cam_far f16 lesson). Returns
+// (px, py, w) — callers test .z > 1e-6 (the humble arm) before consuming
+// the coordinates.
+float3 frd_vm_prev_px(float3 du, float ray_t, float t) {
+    float4 pc = t >= FRD_VM_FAR_K * cam_far
+        ? mul(vm_m, float4(du, 0.0))
+        : mul(vm_m, float4(cam_org + du * (ray_t + t), 1.0));
+    return float3(
+        (pc.x / pc.w + 1.0) * 0.5 * float(rw), (1.0 - pc.y / pc.w) * 0.5 * float(rh), pc.w);
+}
+
 // One signal's temporal step — shared by diff/spec so the feet loop's
 // geometry tests run once (the caller passes per-signal history + caps).
 struct Accum {
@@ -207,6 +221,7 @@ void cs_frd_temporal(uint3 id : SV_DispatchThreadID) {
     // behind the prev image plane takes delta 0 — the humble arm.
     float2 q_spec = q;
     float vm_slack = 1.0;
+    float vm_unc = 0.0;
     // The unfold's t_r comes off the ACCUMULATED hit-dist at the
     // surface-reprojected texel when one exists (the slow plane's EMA'd .w
     // — temporally stable), falling back to this frame's sample: a raw
@@ -219,57 +234,88 @@ void cs_frd_temporal(uint3 id : SV_DispatchThreadID) {
     float t_r = (nh_hist > 0.0 ? nh_hist : sin_.w) * frd_hitdist_denorm_factor(z, rough);
     float vm_w = 1.0 - smoothstep(FRD_VM_ROUGH_LO, FRD_VM_ROUGH_HI, rough);
     if ((flags & 4u) != 0u && t_r > 0.0 && vm_w > 0.0) {
-        // v1.5.1 CURVATURE (flag bit 4 = 16u; FR_FRD_CURV=off is the
+        // v1.5.1/.2 CURVATURE (flag bit 4 = 16u; FR_FRD_CURV=off is the
         // flat-mirror repro arm): a convex mirror images its
         // reflection at the MIRROR-EQUATION distance, not the ray-traced
         // one — on the helmet the sun's image sits ~R/2 behind the
         // surface, so its screen motion rides the SURFACE, and the flat
         // sky arm's screen-pinned fetch re-painted every vacated pixel
-        // with its own stale bright history (the strafe streak). κ comes
-        // from dead-zoned central differences of the DECODED wire normals
-        // (2px baseline; a constant field is ONE encoded word ⇒ Δn ≡ 0
-        // bitwise ⇒ frd_virtual_dist's κ=0 branch ⇒ the flat path
-        // verbatim — still water and F7's mirror are structurally
-        // untouched).
+        // with its own stale bright history (the strafe streak). v1.5.2:
+        // κ comes from FOUR dead-zoned central differences of the DECODED
+        // wire normals — 2px AND 4px baselines per axis (frd_vm_kappa:
+        // per-axis MIN across scales kills normal-map bump spikes, the
+        // LEADING-streak class; MAX across axes keeps cylinders; the
+        // κ_lo/κ_hi bracket's projected fetch spread charges the history
+        // cap below — unsure ⇒ short history, never a confident wrong
+        // fetch). A constant field is ONE encoded word ⇒ Δn ≡ 0 bitwise
+        // at every baseline ⇒ frd_virtual_dist's κ=0 branch ⇒ the flat
+        // path verbatim — still water and F7's mirror are structurally
+        // untouched.
         float t_v = t_r;
+        float t_bhi = t_r; // the bracket's LONGER unfold (κ_lo)
+        float t_blo = t_r; // the bracket's shorter unfold (κ_hi)
         if ((flags & 16u) != 0u) {
             int2 xm = int2(max(int(p.x) - 1, 0), int(p.y));
             int2 xp = int2(min(int(p.x) + 1, int(rw) - 1), int(p.y));
             int2 ym = int2(int(p.x), max(int(p.y) - 1, 0));
             int2 yp = int2(int(p.x), min(int(p.y) + 1, int(rh) - 1));
-            float3 nxm, nxp, nym, nyp;
+            int2 xm2 = int2(max(int(p.x) - 2, 0), int(p.y));
+            int2 xp2 = int2(min(int(p.x) + 2, int(rw) - 1), int(p.y));
+            int2 ym2 = int2(int(p.x), max(int(p.y) - 2, 0));
+            int2 yp2 = int2(int(p.x), min(int(p.y) + 2, int(rh) - 1));
+            float3 nxm, nxp, nym, nyp, nxm2, nxp2, nym2, nyp2;
             float rr_;
             frd_decode_nr(in_nr[xm], nxm, rr_);
             frd_decode_nr(in_nr[xp], nxp, rr_);
             frd_decode_nr(in_nr[ym], nym, rr_);
             frd_decode_nr(in_nr[yp], nyp, rr_);
-            float kap = frd_vm_curvature(length(nxp - nxm), length(nyp - nym), z, proj);
-            t_v = frd_virtual_dist(t_r, kap);
+            frd_decode_nr(in_nr[xm2], nxm2, rr_);
+            frd_decode_nr(in_nr[xp2], nxp2, rr_);
+            frd_decode_nr(in_nr[ym2], nym2, rr_);
+            frd_decode_nr(in_nr[yp2], nyp2, rr_);
+            float3 k3 = frd_vm_kappa(
+                length(nxp - nxm),
+                length(nxp2 - nxm2),
+                length(nyp - nym),
+                length(nyp2 - nym2),
+                z,
+                proj);
+            t_v = frd_virtual_dist(t_r, k3.x);
+            t_bhi = frd_virtual_dist(t_r, k3.y);
+            t_blo = frd_virtual_dist(t_r, k3.z);
         }
         float ndx = (float(p.x) + 0.5) * (2.0 / float(rw)) - 1.0;
         float ndy = 1.0 - (float(p.y) + 0.5) * (2.0 / float(rh));
         float3 du = normalize(cam_fwd + cam_rgt * ndx + cam_up * ndy);
         float ray_t = z / dot(du, cam_fwd);
-        float3 hit_p = cam_org + du * ray_t;
-        float4 ps = mul(vm_m, float4(hit_p, 1.0));
-        // The sky test runs on t_v, not t_r — a heavily curved surface's
-        // "sky" reflection is a NEAR virtual image (that re-route IS the
-        // helmet fix).
-        float4 pv = t_v >= FRD_VM_FAR_K * cam_far
-            ? mul(vm_m, float4(du, 0.0))
-            : mul(vm_m, float4(cam_org + du * (ray_t + t_v), 1.0));
-        if (ps.w > 1e-6 && pv.w > 1e-6) {
-            float2 spx = float2(
-                (ps.x / ps.w + 1.0) * 0.5 * float(rw), (1.0 - ps.y / ps.w) * 0.5 * float(rh));
-            float2 vpx = float2(
-                (pv.x / pv.w + 1.0) * 0.5 * float(rw), (1.0 - pv.y / pv.w) * 0.5 * float(rh));
-            float2 d = vpx - spx;
+        // The sky test runs INSIDE frd_vm_prev_px on each unfold distance
+        // — a heavily curved surface's "sky" reflection is a NEAR virtual
+        // image (that re-route IS the helmet fix); the surface anchor is
+        // the t = 0 point form.
+        float3 sp3 = frd_vm_prev_px(du, ray_t, 0.0);
+        float3 vp3 = frd_vm_prev_px(du, ray_t, t_v);
+        if (sp3.z > 1e-6 && vp3.z > 1e-6) {
+            float2 d = vp3.xy - sp3.xy;
             if (dot(d, d) < FRD_VM_DEADZONE2) {
                 d = 0.0;
             }
             float2 appl = d * vm_w;
             q_spec = q + appl;
             vm_slack = 1.0 + FRD_VM_Z_SLACK * length(appl);
+            // The uncertainty bracket: where the four κ estimates
+            // disagree (bumpy visor, dead-zone-straddling close-ups,
+            // cylinders' genuine ambiguity), the spread of their
+            // projected fetches is real model uncertainty — charged into
+            // the history cap as parallax, so NEITHER streak direction
+            // can accumulate. A self-consistent dome pays ~nothing and
+            // keeps its long, correctly-fetched history.
+            if (t_bhi > t_blo) {
+                float3 blo = frd_vm_prev_px(du, ray_t, t_blo);
+                float3 bhi = frd_vm_prev_px(du, ray_t, t_bhi);
+                if (blo.z > 1e-6 && bhi.z > 1e-6) {
+                    vm_unc = length(bhi.xy - blo.xy) * vm_w / max(proj, 1e-4);
+                }
+            }
         }
     }
     bool spec_shared = all(q_spec == q);
@@ -389,15 +435,16 @@ void cs_frd_temporal(uint3 id : SV_DispatchThreadID) {
     // the light-motion term (light_par — 2× the sun's per-frame angular
     // delta; a parked camera under a TOD scrub has cam_step 0 while the
     // glint slides, and no MV can express content motion — the CAP is the
-    // mechanism there). DELIBERATELY NOT the measured surface-vs-virtual
-    // divergence: that is ALWAYS ≤ cam_step/z (z_eff > z), so using it
-    // LENGTHENS history under translation exactly in proportion to how
-    // much the planar-still-mirror unfold is trusted — and rippled water /
-    // curved reflectors / hit-dist noise all break that trust (measured
-    // live as a strafe smear regression). v1.5 is the corrected FETCH
-    // under the SAME conservative cap; relaxing the cap needs v2's
-    // model-confidence term.
-    float parallax = cam_step / max(z, 1e-4) + light_par;
+    // mechanism there) + the v1.5.2 curvature-uncertainty term (vm_unc —
+    // see the bracket above). DELIBERATELY NOT the measured
+    // surface-vs-virtual divergence: that is ALWAYS ≤ cam_step/z
+    // (z_eff > z), so using it LENGTHENS history under translation exactly
+    // in proportion to how much the planar-still-mirror unfold is trusted
+    // — and rippled water / curved reflectors / hit-dist noise all break
+    // that trust (measured live as a strafe smear regression). v1.5 is
+    // the corrected FETCH under the SAME conservative cap; vm_unc only
+    // ever TIGHTENS it; relaxing needs v2's model-confidence term.
+    float parallax = cam_step / max(z, 1e-4) + light_par + vm_unc;
     float n_smax = frd_spec_max_frames(max_accum, parallax, rough);
     Accum as_ = frd_accumulate(sin_, hs_s, hf_s, nfr.y, w_s, n_smax);
 

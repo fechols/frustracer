@@ -75,16 +75,37 @@ float frd_virtual_dist(float t_r, float kappa) {
     return kappa <= 0.0 ? t_r : t_r / (1.0 + 2.0 * kappa * t_r);
 }
 
-// oracle::vm_curvature — |Δn| central-differenced over a 2px baseline per
-// axis (decoded wire normals), dead-zoned SUBTRACTIVELY against the
-// 10-bit oct quantization (continuous through the boundary — a hard
-// threshold steps the fetch on the quantization staircase), MAX of the
-// axes (errs surface-fetch-ward only), over the 2px world step 2z/proj.
-// Magnitude-only: concave reads convex, which only shortens t_v toward
-// the surface fetch — the humble direction.
-float frd_vm_curvature(float dn_x, float dn_y, float view_z, float proj) {
-    float dn = max(max(dn_x, dn_y) - FRD_VM_DN_DZ, 0.0);
-    return dn * proj / (2.0 * max(view_z, 1e-4));
+// oracle::vm_curvature_at — one |Δn|-over-baseline curvature estimate,
+// dead-zoned SUBTRACTIVELY against the 10-bit oct quantization (the SAME
+// absolute constant at every baseline: the noise is per-sample while the
+// signal grows with the baseline — the 4px read rescues close-up domes
+// the 2px read dead-zones away). Magnitude-only: concave reads convex,
+// which only shortens t_v toward the surface fetch — the humble arm.
+float frd_vm_curvature_at(float dn, float base_px, float view_z, float proj) {
+    return max(dn - FRD_VM_DN_DZ, 0.0) * proj / (base_px * max(view_z, 1e-4));
+}
+
+// oracle::vm_kappa — the v1.5.2 ROBUST combine (2px + 4px baselines ×
+// both axes) → (κ, κ_lo, κ_hi). Per-axis MIN across scales: macro
+// curvature is scale-consistent while normal-map bump noise decorrelates,
+// so the min kills single-scale spikes — the LEADING-streak suppressor
+// (an over-read κ rides the surface FASTER than the true virtual image
+// and paints brightness ahead of the glint). MAX across axes (a cylinder
+// tracks its curved axis). κ_lo/κ_hi bracket all four — their projected
+// fetch spread is the estimator's own disagreement, charged into the
+// specular history cap: unsure ⇒ short history, never a confident wrong
+// fetch (the v2 confidence term, cheap form).
+float3 frd_vm_kappa(
+    float dn2x, float dn4x, float dn2y, float dn4y, float view_z, float proj
+) {
+    float k2x = frd_vm_curvature_at(dn2x, 2.0, view_z, proj);
+    float k4x = frd_vm_curvature_at(dn4x, 4.0, view_z, proj);
+    float k2y = frd_vm_curvature_at(dn2y, 2.0, view_z, proj);
+    float k4y = frd_vm_curvature_at(dn4y, 4.0, view_z, proj);
+    return float3(
+        max(min(k2x, k4x), min(k2y, k4y)),
+        min(min(k2x, k4x), min(k2y, k4y)),
+        max(max(k2x, k4x), max(k2y, k4y)));
 }
 
 // oracle::disocclusion_z_valid_slack — the VIRTUAL foot's widened test

@@ -524,18 +524,51 @@ pub mod oracle {
         }
     }
 
-    /// The screen-space CONVEX-curvature estimate feeding virtual_dist:
-    /// |Δn| central-differenced over a 2px baseline per axis (the DECODED
-    /// wire normals), dead-zoned SUBTRACTIVELY against the 10-bit oct
-    /// quantization (VM_DN_DZ — see its doc for the asymmetry argument),
-    /// MAX of the two axes (max only errs surface-fetch-ward; a mean
-    /// would dilute a cylinder's curved axis with its flat one), divided
-    /// by the 2px world step 2·z/proj. Magnitude-only — concave reads as
-    /// convex, which only shortens t_v toward the surface fetch, the
-    /// humble direction (a true concave carve-out is v2).
-    pub fn vm_curvature(dn_x: f32, dn_y: f32, view_z: f32, proj: f32) -> f32 {
-        let dn = (dn_x.max(dn_y) - VM_DN_DZ).max(0.0);
-        dn * proj / (2.0 * view_z.max(1e-4))
+    /// One screen-space CONVEX-curvature estimate feeding virtual_dist:
+    /// |Δn| central-differenced over a `baseline_px` world step (the
+    /// DECODED wire normals), dead-zoned SUBTRACTIVELY against the 10-bit
+    /// oct quantization (VM_DN_DZ — see its doc; the SAME absolute
+    /// constant at every baseline, because quantization noise is
+    /// per-sample while the signal grows with the baseline — which is
+    /// exactly why the 4px read rescues close-up domes the 2px read
+    /// dead-zones away). Magnitude-only — concave reads as convex, which
+    /// only shortens t_v toward the surface fetch, the humble direction
+    /// (a signed/concave carve-out is v2).
+    pub fn vm_curvature_at(dn: f32, baseline_px: f32, view_z: f32, proj: f32) -> f32 {
+        (dn - VM_DN_DZ).max(0.0) * proj / (baseline_px * view_z.max(1e-4))
+    }
+
+    /// The v1.5.2 ROBUST combine over four estimates (2px + 4px baselines
+    /// × both axes) → (κ, κ_lo, κ_hi). Per-axis κ = MIN across the two
+    /// SCALES: macro curvature is scale-consistent (on a clean field the
+    /// dead-zone skew makes the 2px read the strict min, so κ equals the
+    /// v1.5.1 value exactly), while normal-map bump noise decorrelates
+    /// across scales — the min knocks down single-scale spikes, which is
+    /// the LEADING-streak suppressor (an over-read κ makes the fetch ride
+    /// the surface FASTER than the true virtual image and paints
+    /// brightness ahead of the glint — the bidirectional-streak
+    /// feel-test). κ = MAX across axes (a cylinder must track its curved
+    /// axis). κ_lo/κ_hi bracket all four: their projected fetch spread is
+    /// the estimator's own DISAGREEMENT, and the temporal pass charges
+    /// the specular history cap with it — where the model is unsure, the
+    /// honest answer is a short history (neither streak can accumulate),
+    /// not a confident wrong fetch. The v2 confidence term, cheap form.
+    pub fn vm_kappa(
+        dn2x: f32,
+        dn4x: f32,
+        dn2y: f32,
+        dn4y: f32,
+        view_z: f32,
+        proj: f32,
+    ) -> (f32, f32, f32) {
+        let k2x = vm_curvature_at(dn2x, 2.0, view_z, proj);
+        let k4x = vm_curvature_at(dn4x, 4.0, view_z, proj);
+        let k2y = vm_curvature_at(dn2y, 2.0, view_z, proj);
+        let k4y = vm_curvature_at(dn4y, 4.0, view_z, proj);
+        let kappa = k2x.min(k4x).max(k2y.min(k4y));
+        let lo = k2x.min(k4x).min(k2y.min(k4y));
+        let hi = k2x.max(k4x).max(k2y.max(k4y));
+        (kappa, lo, hi)
     }
 
     /// The v1.5 virtual-motion DELTA, pixels: project the SURFACE point and
@@ -1020,15 +1053,54 @@ pub mod oracle {
             {
                 return Err("frd: virtual_dist must be monotone decreasing in kappa".into());
             }
-            if vm_curvature(VM_DN_DZ * 0.5, VM_DN_DZ * 0.9, 5.0, 406.0) != 0.0 {
-                return Err("frd: vm_curvature must be exactly 0 inside the dead-zone".into());
+            if vm_curvature_at(VM_DN_DZ * 0.9, 2.0, 5.0, 406.0) != 0.0
+                || vm_curvature_at(VM_DN_DZ * 0.9, 4.0, 5.0, 406.0) != 0.0
+            {
+                return Err("frd: vm_curvature_at must be exactly 0 inside the dead-zone".into());
             }
-            let ka = vm_curvature(0.015, 0.0, 5.0, 406.0);
+            let ka = vm_curvature_at(0.015, 2.0, 5.0, 406.0);
             if (ka - (0.015 - VM_DN_DZ) * 406.0 / 10.0).abs() > 1e-4 {
-                return Err(format!("frd: vm_curvature closed-form anchor ({ka})"));
+                return Err(format!("frd: vm_curvature_at closed-form anchor ({ka})"));
             }
-            if vm_curvature(0.015, 0.002, 5.0, 406.0) != vm_curvature(0.002, 0.015, 5.0, 406.0) {
-                return Err("frd: vm_curvature must be symmetric in its axes (max)".into());
+            // The v1.5.2 combine: on a CLEAN linear field (dn4 = 2·dn2) the
+            // dead-zone skew makes the 2px estimate the strict per-axis min,
+            // so κ equals it EXACTLY; a single-scale bump spike (dn2 5×
+            // while dn4 stays clean) must be SUPPRESSED to the clean
+            // long-baseline value — the leading-streak teeth (an over-read
+            // κ paints brightness AHEAD of the glint); axes are symmetric;
+            // a single-axis field's κ_lo is exactly 0 (the honest-cylinder
+            // pin: genuine ambiguity ⇒ the bracket fires ⇒ short history);
+            // and the consistent field's bracket width is the exact
+            // dead-zone skew DZ·proj/(4z).
+            let a = 0.02f32;
+            let clean = vm_kappa(a, 2.0 * a, 0.0, 0.0, 5.0, 406.0);
+            if clean.0 != vm_curvature_at(a, 2.0, 5.0, 406.0) {
+                return Err("frd: vm_kappa clean-field κ must equal the 2px estimate".into());
+            }
+            if clean.1 != 0.0 || clean.2 <= 0.0 {
+                return Err("frd: vm_kappa single-axis bracket (κ_lo exactly 0)".into());
+            }
+            let spiked = vm_kappa(5.0 * a, 2.0 * a, 0.0, 0.0, 5.0, 406.0);
+            if spiked.0 != vm_curvature_at(2.0 * a, 4.0, 5.0, 406.0) {
+                return Err("frd: vm_kappa must suppress a single-scale spike to the clean \
+                            long-baseline value"
+                    .into());
+            }
+            if spiked.0 >= vm_curvature_at(5.0 * a, 2.0, 5.0, 406.0) {
+                return Err("frd: vm_kappa spike suppression has no teeth".into());
+            }
+            let sym_a = vm_kappa(a, 2.0 * a, 0.003, 0.009, 5.0, 406.0);
+            let sym_b = vm_kappa(0.003, 0.009, a, 2.0 * a, 5.0, 406.0);
+            if sym_a != sym_b {
+                return Err("frd: vm_kappa must be symmetric in its axes".into());
+            }
+            let cons = vm_kappa(a, 2.0 * a, a, 2.0 * a, 5.0, 406.0);
+            let skew = VM_DN_DZ * 406.0 / (4.0 * 5.0);
+            if (cons.2 - cons.1 - skew).abs() > 1e-4 {
+                return Err(format!(
+                    "frd: consistent-field bracket must be the dead-zone skew ({} vs {skew})",
+                    cons.2 - cons.1
+                ));
             }
             let dc = spec_virtual_delta_px(
                 216.5,
