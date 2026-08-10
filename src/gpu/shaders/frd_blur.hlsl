@@ -18,10 +18,15 @@ Texture2D<float4> b_src_diff : register(t0); // pass 2: accum | pass 3: blur
 Texture2D<float4> b_src_spec : register(t1);
 Texture2D<float4> b_nr : register(t2);       // wire enc-2 (this frame's)
 Texture2D<float> b_viewz : register(t3);
-Texture2D<float2> b_meta : register(t4);     // THIS frame's n (pass 1's write)
+// THIS frame's meta (pass 1's write): .rg = n, .ba = the stab ages.
+Texture2D<float4> b_meta : register(t4);
 // Pass 3 only (the clamp's fast history — this frame's, pass 1's write).
 Texture2D<float4> b_fast_diff : register(t5);
 Texture2D<float4> b_fast_spec : register(t6);
+// Pass 3 only, stab_max > 0 only: pass 1's reprojected stabilization
+// history (last frame's OUT through the validated feet).
+Texture2D<float4> b_stab_diff : register(t7);
+Texture2D<float4> b_stab_spec : register(t8);
 
 RWTexture2D<float4> b_out_diff : register(u0); // pass 2: blur | pass 3: wire OUT
 RWTexture2D<float4> b_out_spec : register(u1);
@@ -49,6 +54,8 @@ cbuffer FrdCb : register(b0) {
     float pass_scale; // 1.0 (blur) | 1.7 (post)
     uint salt;        // disk rotation salt (decorrelates the two passes)
     float light_par;  // pass 1's lane (declared for the shared layout)
+    float vm_scale;   // pass 1's lane (declared so stab_max lands at 18)
+    float stab_max;   // --frd-max-stab-frames (0 = stabilization off)
 };
 
 // One signal's disk blur, weights in log2 domain (frd_tap_exp2 — one
@@ -135,7 +142,7 @@ BlurCtx frd_blur_ctx(uint2 p, float4 ad, float4 as_) {
     c.nn = float2(0.0, 0.0);
     if (c.sky) return c;
     frd_decode_nr(b_nr[p], c.n, c.rough);
-    c.nn = b_meta[p] * 63.0;
+    c.nn = b_meta[p].xy * 63.0;
     float hd = ad.w * frd_hitdist_denorm_factor(c.z, 1.0);
     float hs = as_.w * frd_hitdist_denorm_factor(c.z, c.rough);
     c.r_d = frd_history_fix(
@@ -215,8 +222,52 @@ void cs_frd_post(uint3 id : SV_DispatchThreadID) {
         g.y = frd_antilag_gain(frd_antilag_excess(abs(os.x - fs.x), clamp_sigma * sig, fs.x));
         os.xyz = frd_clamp_ycocg(os.xyz, fs.xyz, sig, clamp_sigma);
     }
-    b_out_diff[p] = od;
-    b_out_spec[p] = os;
+    // TEMPORAL STABILIZATION (frd_stab_out, --frd-max-stab-frames — the
+    // sparse-bright flicker killer): the OUT write blends toward pass 1's
+    // reprojected previous OUT, clamped per channel to the current 3x3
+    // SPATIAL box of pass 2's blurred result (b_src — smooth by
+    // construction, which is what makes a neighborhood clamp sound; see
+    // frd_stab_out's header for why the temporal σ-box was WRONG here). THE
+    // RECURRENCE NEVER SEES IT — b_slow gets the un-stabilized od/os
+    // verbatim, so slow/fast/meta.rg/antilag evolve bit-identically to the
+    // stab-off arm and only the OUT write differs. Keyed on the REPROJECTED
+    // stab age (meta lane − 1): a reseed frame reads ≤ 0 and takes od/os by
+    // BRANCH (the bitwise-off contract; the unwritten transient is never
+    // read). The .w hit-dist guide lane is never stabilized. Gated
+    // n ≥ fast_frames like the clamp.
+    float4 outd = od;
+    float4 outs = os;
+    if (stab_max > 0.0) {
+        float4 mm = b_meta[p];
+        float nsd = c.nn.x >= fast_frames ? mm.z * 63.0 - 1.0 : 0.0;
+        float nss = c.nn.y >= fast_frames ? mm.w * 63.0 - 1.0 : 0.0;
+        if (nsd > 0.0 || nss > 0.0) {
+            float3 dmin = ad.xyz, dmax = ad.xyz, smin = as_.xyz, smax = as_.xyz;
+            [unroll]
+            for (int sy = -1; sy <= 1; sy++) {
+                [unroll]
+                for (int sx = -1; sx <= 1; sx++) {
+                    if (sx == 0 && sy == 0) continue;
+                    int2 np = clamp(
+                        int2(p) + int2(sx, sy), int2(0, 0), int2(int(rw) - 1, int(rh) - 1));
+                    float3 dv = b_src_diff[np].xyz;
+                    float3 sv = b_src_spec[np].xyz;
+                    dmin = min(dmin, dv);
+                    dmax = max(dmax, dv);
+                    smin = min(smin, sv);
+                    smax = max(smax, sv);
+                }
+            }
+            if (nsd > 0.0)
+                outd.xyz = frd_stab_out(
+                    od.xyz, b_stab_diff[p].xyz, dmin, dmax, nsd, stab_max);
+            if (nss > 0.0)
+                outs.xyz = frd_stab_out(
+                    os.xyz, b_stab_spec[p].xyz, smin, smax, nss, stab_max);
+        }
+    }
+    b_out_diff[p] = outd;
+    b_out_spec[p] = outs;
     b_slow_diff[p] = od;
     b_slow_spec[p] = os;
     b_antilag[p] = g;

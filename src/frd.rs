@@ -47,6 +47,13 @@ pub const MAX_ACCUM_FRAMES: f32 = 30.0;
 /// Fast-history cap: the short EMA the clamp box and anti-lag read. Small by
 /// design — it must track lighting changes the slow history lags on.
 pub const FAST_FRAMES: f32 = 4.0;
+/// The temporal-stabilization age cap the post-QA default flip targets
+/// (--frd-max-stab-frames; this commit ships the lever DEFAULT OFF — the
+/// measured-first doctrine, the QA lab decides the flip). Between
+/// FAST_FRAMES and MAX_ACCUM: a ~1/21 steady-state blend of fresh output
+/// cuts the sparse-bright disk-rotation flicker ~an order while the
+/// clamp-to-fast-box keeps worst-case lag at one fast window.
+pub const MAX_STAB_FRAMES: f32 = 20.0;
 /// Fast-history clamp box half-width in sigmas.
 pub const CLAMP_SIGMA: f32 = 2.5;
 /// Chroma lanes clamp at this fraction of the luma box (YCoCg pays off here:
@@ -590,6 +597,50 @@ pub mod oracle {
     /// synthetic glint from ever converging.
     pub fn antilag_apply(n: f32, g: f32) -> f32 {
         (n * g).max(n.min(N_FIX))
+    }
+
+    // -- Temporal stabilization (pass 3, --frd-max-stab-frames) ------------
+
+    /// The stabilization blend weight for the CURRENT frame's result:
+    /// α = 1/(1 + min(n_stab, max_stab)) — the running-mean alpha with the
+    /// age capped at the lever, so a converged pixel blends at least
+    /// 1/(1+max_stab) of fresh signal every frame (bounded lag).
+    pub fn stab_alpha(n_stab: f32, max_stab: f32) -> f32 {
+        1.0 / (1.0 + n_stab.max(0.0).min(max_stab))
+    }
+
+    /// The stabilization OUT blend (frd_common.hlsli's frd_stab_out, in
+    /// LOCKSTEP): the reprojected previous OUT (`hist`) is clamped per
+    /// channel to the current 3x3 SPATIAL neighborhood box of the blurred
+    /// result — the TAA neighborhood clamp, sound on the POST-BLUR field
+    /// because it is spatially smooth (the same clamp on the raw sparse
+    /// input is exactly what eats emissive upstream). This is what makes
+    /// lag/ghosting structurally impossible: on a step the neighborhood IS
+    /// the new value, at a stale ghost position it is dark. (The first
+    /// draft used the fast ±kσ TEMPORAL box; F8's teeth killed it — m2
+    /// spikes exactly during transitions, so that box went wide when it
+    /// most needed to bind.) The current result blends in at stab_alpha.
+    /// max_stab <= 0 or n_stab <= 0 returns `cur` by BRANCH (never
+    /// lerp-by-1, which is h + (c−h)·1 — fp, not identity): the
+    /// bitwise-off contract.
+    pub fn stab_out(
+        cur: [f32; 3],
+        hist: [f32; 3],
+        bmin: [f32; 3],
+        bmax: [f32; 3],
+        n_stab: f32,
+        max_stab: f32,
+    ) -> [f32; 3] {
+        if max_stab <= 0.0 || n_stab <= 0.0 {
+            return cur;
+        }
+        let a = stab_alpha(n_stab, max_stab);
+        let mut out = [0.0f32; 3];
+        for i in 0..3 {
+            let h = hist[i].clamp(bmin[i], bmax[i]);
+            out[i] = h + (cur[i] - h) * a;
+        }
+        out
     }
 
     // -- Firefly pre-clamp -------------------------------------------------
@@ -1572,6 +1623,38 @@ pub mod oracle {
         let s = firefly_scale(100.0, 1.0);
         if (s * 100.0 - FIREFLY_K).abs() > 1e-4 {
             return Err(format!("frd: firefly cap ({s})"));
+        }
+
+        // Stabilization: the off arms return `cur` EXACTLY — pinned with a
+        // history so far out that the lerp-by-1 form (h + (c−h)·1) provably
+        // differs in f32, so a branch→lerp regression fails; the alpha cap
+        // anchor is exact (exp2-friendly values); the clamp-to-box
+        // CONTAINMENT is the can't-ghost/can't-lag teeth (hist far outside
+        // the spatial box ⇒ the output stays within alpha-of-cur of the box
+        // however old the history claims to be); and a converged in-box
+        // history pulls the output within alpha of itself (the convergence
+        // direction).
+        {
+            let cur = [0.1f32, 0.02, -0.01];
+            let wild = [1.0e8f32, -1.0e8, 1.0e8];
+            let (b0, b1) = ([0.0f32, -0.5, -0.5], [0.2f32, 0.5, 0.5]);
+            for (n, m) in [(0.0f32, 20.0f32), (5.0, 0.0), (-1.0, 20.0)] {
+                if stab_out(cur, wild, b0, b1, n, m) != cur {
+                    return Err(format!("frd: stab off arm not bitwise (n {n} max {m})"));
+                }
+            }
+            if stab_alpha(1.0e9, 4.0) != 0.2 {
+                return Err("frd: stab alpha cap anchor (1/(1+4) = 0.2 exact)".into());
+            }
+            let o = stab_out([0.1, 0.0, 0.0], [50.0, 0.0, 0.0], b0, b1, 60.0, 20.0);
+            if o[0] > b1[0] + 1e-5 {
+                return Err(format!("frd: stab containment — out {} left the box", o[0]));
+            }
+            let o2 = stab_out([0.13, 0.0, 0.0], [0.11, 0.0, 0.0], b0, b1, 60.0, 20.0);
+            let a = stab_alpha(60.0, 20.0);
+            if (o2[0] - (0.11 + (0.13 - 0.11) * a)).abs() > 1e-6 {
+                return Err(format!("frd: stab convergence direction ({})", o2[0]));
+            }
         }
 
         // Bilateral weights: 1.0 at zero distance / perfect agreement,

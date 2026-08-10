@@ -580,17 +580,16 @@ fn main() {
     if opts.frd_tune.any() {
         eprintln!("frd: tuning overrides {:?}", opts.frd_tune);
     }
-    // The one lever whose consumer is UNBUILT (the stabilization sub-step, a
-    // phase-D pending) must say so — a lever that parses and does nothing is
-    // the silent no-op A/B walk the lever doctrine exists to prevent (the
-    // FR_NGXFG unrecognized-value rule). --frd-[no-]anti-firefly is LIVE
-    // since 2026-08-09 (the firefly pre-clamp shipped with the bright-
-    // specular-smear fix; default ON, the no- spelling is the A/B arm).
-    if opts.frd_tune.max_stab_frames.is_some() {
-        eprintln!(
-            "frd: --frd-max-stab-frames is NOT YET WIRED (the stabilization sub-step is an \
-             unbuilt phase-D item) — inert this build"
-        );
+    // The stabilization sub-step is LIVE since 2026-08-10 (the emissive-
+    // integration campaign's stage 2) but DEFAULT OFF pending the QA
+    // measurement — the armed line keeps the lever from being a silent
+    // no-op either way (frd::MAX_STAB_FRAMES = 20 is the flip target).
+    if let Some(v) = opts.frd_tune.max_stab_frames {
+        if v == 0 {
+            eprintln!("frd: stabilization OFF (--frd-max-stab-frames 0 — the bitwise pre-stab arm)");
+        } else {
+            eprintln!("frd: stabilization armed — max {} frames", (v as f32).min(frd::META_N_MAX));
+        }
     }
     texture::set_mips(opts.mips);
     texture::set_aniso(opts.aniso);
@@ -8390,6 +8389,10 @@ fn run_check_gpu(
                                 return 1;
                             }
                         };
+                        // Pin stabilization OFF for F4–F7 (F8 owns its arms):
+                        // the eventual default flip must not move their
+                        // recorded bands — a true one-liner by construction.
+                        fg.force_stab.set(Some(0.0));
                         if let Err(e) = ptg.wire_nrd_feed(
                             &hg.device,
                             &[
@@ -9335,6 +9338,169 @@ fn run_check_gpu(
                             let gap7c_f = l7c[0] - l7c[1];
                             let gap7c_c = (l7c[2] - l7c[0]).abs();
 
+                            // F8 — TEMPORAL STABILIZATION (the stage-2
+                            // emissive-integration fix; force_stab is the
+                            // A/B hook, frame indices replayed per arm so
+                            // the disk-rotation hashes — the flicker source
+                            // under test — are identical across arms).
+                            // Field: sparse bright diffuse dots on a dark
+                            // base, the exact shape the rotating Vogel disk
+                            // flickers on; spec flat (inert).
+                            fup!(fg.plane_in_viewz(), DXGI_FORMAT_R32_FLOAT, 4, &vz5, "F8 viewz");
+                            fup!(
+                                fg.plane_in_nr(),
+                                DXGI_FORMAT_R10G10B10A2_UNORM,
+                                4,
+                                &fill4(nrw(n_face, 0.5)),
+                                "F8 nr"
+                            );
+                            fup!(fg.plane_in_mv(), f4x, 8, &mv0, "F8 mv");
+                            fup!(fg.plane_in_spec(), f4x, 8, &flat8([0.2, 0.0, 0.0, 0.3]), "F8 spec");
+                            let mut d8 = flat8([0.05, 0.0, 0.0, 0.3]);
+                            let mut y8 = 8usize;
+                            while y8 < ph - 8 {
+                                let mut x8 = 8usize;
+                                while x8 < pw - 8 {
+                                    d8[(y8 * pw + x8) * 8..][..8]
+                                        .copy_from_slice(&px8([12.0, 0.0, 0.0, 0.3]));
+                                    x8 += 16;
+                                }
+                                y8 += 16;
+                            }
+                            fup!(fg.plane_in_diff(), f4x, 8, &d8, "F8 diff");
+                            let mean_dl = |a: &[u8], b: &[u8]| -> f32 {
+                                let mut s = 0f64;
+                                for y in 0..ph {
+                                    for x in 0..pw {
+                                        s += (lum_at(a, x, y) - lum_at(b, x, y)).abs() as f64;
+                                    }
+                                }
+                                (s / (pw * ph) as f64) as f32
+                            };
+                            let d8b = flat8([0.05, 0.0, 0.0, 0.3]);
+                            let fi8 = fg.frame_index();
+                            // The GI relax armed for the whole F8 section —
+                            // stabilization exists FOR the fold's sparse
+                            // signal, and the ring clamp would otherwise
+                            // crush the probe upstream of the thing under
+                            // test (F5c owns the clamp arms).
+                            fg.force_gi.set(Some(true));
+                            // F8a arms: the input ALTERNATES dots/base per
+                            // frame (the sparse 1-spp temporal shape — a
+                            // static field converges into the radius
+                            // early-out and cannot flicker); converge 12,
+                            // then 8 recorded frames; flick = mean
+                            // inter-frame |Δluma| over 7 pairs.
+                            let mut flick = [0f32; 2];
+                            // F8b step response (the can't-lag bound): the
+                            // base field steps 0.05 → 0.5; the stab arm must
+                            // track the unstabilized arm at 10 frames.
+                            let mut step_l = [0f32; 2];
+                            let d8s = {
+                                let mut b = flat8([0.5, 0.0, 0.0, 0.3]);
+                                let mut y = 8usize;
+                                while y < ph - 8 {
+                                    let mut x = 8usize;
+                                    while x < pw - 8 {
+                                        b[(y * pw + x) * 8..][..8]
+                                            .copy_from_slice(&px8([12.0, 0.0, 0.0, 0.3]));
+                                        x += 16;
+                                    }
+                                    y += 16;
+                                }
+                                b
+                            };
+                            let (bx, by) = (100usize, 100usize); // background probe (off-grid)
+                            for (ai, stab) in [(0usize, 0.0f32), (1, 20.0)] {
+                                fg.set_frame_index(fi8);
+                                fg.force_stab.set(Some(stab));
+                                fup!(fg.plane_in_diff(), f4x, 8, &d8, "F8 diff arm");
+                                frec!(fframe(true, 0.0), "F8 k0");
+                                for i in 0..11 {
+                                    fup!(
+                                        fg.plane_in_diff(),
+                                        f4x,
+                                        8,
+                                        if i & 1 == 0 { &d8b } else { &d8 },
+                                        "F8 alt"
+                                    );
+                                    frec!(fframe(false, 0.0), "F8 converge");
+                                }
+                                let mut prev = foutd!("F8 flick");
+                                let mut acc = 0f32;
+                                for i in 0..7 {
+                                    fup!(
+                                        fg.plane_in_diff(),
+                                        f4x,
+                                        8,
+                                        if i & 1 == 0 { &d8 } else { &d8b },
+                                        "F8 alt"
+                                    );
+                                    frec!(fframe(false, 0.0), "F8 flick frame");
+                                    let cur = foutd!("F8 flick");
+                                    acc += mean_dl(&cur, &prev);
+                                    prev = cur;
+                                }
+                                flick[ai] = acc / 7.0;
+                                // The step, from the same converged state.
+                                fup!(fg.plane_in_diff(), f4x, 8, &d8s, "F8 step");
+                                for _ in 0..10 {
+                                    frec!(fframe(false, 0.0), "F8 step frame");
+                                }
+                                step_l[ai] = lum_at(&foutd!("F8 step"), bx, by);
+                            }
+                            // F8c — off-arm byte determinism: an identical
+                            // replay (same index run, same inputs, reset
+                            // head) must reproduce OUT byte-for-byte.
+                            fg.force_stab.set(Some(0.0));
+                            let mut det8 = [Vec::new(), Vec::new()];
+                            for d in &mut det8 {
+                                fg.set_frame_index(fi8);
+                                fup!(fg.plane_in_diff(), f4x, 8, &d8, "F8c diff");
+                                frec!(fframe(true, 0.0), "F8c k0");
+                                for _ in 0..5 {
+                                    frec!(fframe(false, 0.0), "F8c frame");
+                                }
+                                *d = foutd!("F8c out");
+                            }
+                            let det8_ok = det8[0] == det8[1];
+                            // F8d — antilag interplay (the F6 moving-dot
+                            // shape on the DIFFUSE channel): stabilization
+                            // must not resurrect the ghost the brake killed.
+                            let (d0x, d0y) = (180usize, 200usize);
+                            let dot8 = |x0: usize| -> Vec<u8> {
+                                let mut b = flat8([0.1, 0.0, 0.0, 0.3]);
+                                for dy in 0..3usize {
+                                    for dx in 0..3usize {
+                                        let i = (d0y - 1 + dy) * pw + (x0 - 1 + dx);
+                                        b[i * 8..][..8]
+                                            .copy_from_slice(&px8([2.0, 0.0, 0.0, 0.3]));
+                                    }
+                                }
+                                b
+                            };
+                            let mut ghost8 = [0f32; 2];
+                            let mut conv8 = 0f32;
+                            for (ai, stab) in [(0usize, 0.0f32), (1, 20.0)] {
+                                fg.set_frame_index(fi8);
+                                fg.force_stab.set(Some(stab));
+                                fup!(fg.plane_in_diff(), f4x, 8, &dot8(d0x), "F8d dot");
+                                frec!(fframe(true, 0.0), "F8d k0");
+                                for _ in 0..7 {
+                                    frec!(fframe(false, 0.0), "F8d converge");
+                                }
+                                if ai == 0 {
+                                    conv8 = lum_at(&foutd!("F8d conv"), d0x, d0y);
+                                }
+                                fup!(fg.plane_in_diff(), f4x, 8, &dot8(d0x + 24), "F8d moved");
+                                for _ in 0..6 {
+                                    frec!(fframe(false, 0.0), "F8d ghost frame");
+                                }
+                                ghost8[ai] = lum_at(&foutd!("F8d out"), d0x, d0y);
+                            }
+                            fg.force_stab.set(Some(0.0));
+                            fg.force_gi.set(None);
+
                             println!(
                                 "check-gpu: frd F5 — firefly peak off {p_off:.1} on {p_on:.2} | \
                                  F5c gi-relax peak off {p5c_off:.2} on {p5c_on:.1} energy \
@@ -9459,8 +9625,58 @@ fn run_check_gpu(
                                      ({gap7c_c} vs flat {gap7c_pred})"
                                 ));
                             }
+                            // F8: the off arm genuinely flickers on the
+                            // sparse field (anti-vacuity — the disk-rotation
+                            // mechanism is real), stabilization halves it at
+                            // least (teeth), the step response stays within
+                            // the can't-lag bound of the unstabilized arm,
+                            // the off arm replays byte-identically (the
+                            // bitwise-off contract, executable), and stab
+                            // does not resurrect the ghost the antilag brake
+                            // killed (the F6-shape interplay).
+                            println!(
+                                "check-gpu: frd F8 — flick off {:.5} on {:.5} | step off {:.3} \
+                                 on {:.3} | det {} | ghost conv {conv8:.2} off {:.3} on {:.3}",
+                                flick[0], flick[1], step_l[0], step_l[1],
+                                if det8_ok { "ok" } else { "DIVERGED" },
+                                ghost8[0], ghost8[1]
+                            );
+                            if flick[0] < 1e-4 {
+                                fbad.push(format!(
+                                    "F8 off arm did not flicker ({} — vacuous)", flick[0]
+                                ));
+                            }
+                            if flick[1] > 0.5 * flick[0] {
+                                fbad.push(format!(
+                                    "F8 stabilization toothless (flick {} vs {})",
+                                    flick[1], flick[0]
+                                ));
+                            }
+                            if step_l[0] < 0.3 {
+                                fbad.push(format!(
+                                    "F8 step baseline never moved ({} — vacuous)", step_l[0]
+                                ));
+                            }
+                            if step_l[1] < 0.7 * step_l[0] {
+                                fbad.push(format!(
+                                    "F8 stab arm lagged the step ({} vs {})",
+                                    step_l[1], step_l[0]
+                                ));
+                            }
+                            if !det8_ok {
+                                fbad.push("F8 off arm replay not byte-identical".to_string());
+                            }
+                            if conv8 < 1.0 {
+                                fbad.push(format!("F8d dot never converged ({conv8})"));
+                            }
+                            if ghost8[1] > (1.5 * ghost8[0]).max(0.2) {
+                                fbad.push(format!(
+                                    "F8d stab resurrected the ghost ({} vs {})",
+                                    ghost8[1], ghost8[0]
+                                ));
+                            }
                             if !fbad.is_empty() {
-                                eprintln!("check-gpu: FAIL F5/F6/F7: {}", fbad.join(", "));
+                                eprintln!("check-gpu: FAIL F5/F6/F7/F8: {}", fbad.join(", "));
                                 ok = false;
                             }
                         }
@@ -15823,6 +16039,9 @@ fn run_frd_lab(
             return 2;
         }
     };
+    // The lab reads frd::tuning() through cb() like a real session, so a
+    // --frd-max-stab-frames on the lab command line reaches it; no pin —
+    // the smear metrics under stab are exactly what a lab re-run measures.
     if let Err(e) = ptg.wire_nrd_feed(
         &hg.device,
         &[

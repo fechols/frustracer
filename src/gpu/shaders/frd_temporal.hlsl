@@ -29,7 +29,9 @@ Texture2D<float4> prev_slow_diff : register(t5);
 Texture2D<float4> prev_slow_spec : register(t6);
 Texture2D<float4> prev_fast_diff : register(t7); // YCoCg + luma m2 (Welford)
 Texture2D<float4> prev_fast_spec : register(t8);
-Texture2D<float2> prev_meta : register(t9);      // n_diff/63, n_spec/63
+// meta RGBA8: .rg = n_diff/63, n_spec/63 | .ba = the stabilization ages
+// n_stab_diff/63, n_stab_spec/63 (0 with stabilization off).
+Texture2D<float4> prev_meta : register(t9);
 Texture2D<float4> prev_nr : register(t10);       // last frame's wire nr snapshot
 Texture2D<float> prev_vz : register(t11);        // last frame's view-Z snapshot
 // The anti-lag plane (single-buffered, the slow discipline: pass 3 wrote it
@@ -37,15 +39,27 @@ Texture2D<float> prev_vz : register(t11);        // last frame's view-Z snapshot
 // clamp excess — the recurrent brake's feedback path (pass 3 has no meta
 // UAV, so the gain rides its own plane).
 Texture2D<float2> prev_antilag : register(t12);
+// The stabilization history IS last frame's OUT planes (nothing writes them
+// between FRD frames — cs_nrd_out only reads; single-buffered, the slow
+// discipline: pass 3 rewrites them after this pass reads). Only consulted
+// under stab_max > 0.
+Texture2D<float4> prev_out_diff : register(t13);
+Texture2D<float4> prev_out_spec : register(t14);
 
 // UAVs: the transient accum pair (pass 2's input) + THIS parity's history.
 RWTexture2D<float4> accum_diff : register(u0);
 RWTexture2D<float4> accum_spec : register(u1);
 RWTexture2D<float4> cur_fast_diff : register(u2);
 RWTexture2D<float4> cur_fast_spec : register(u3);
-RWTexture2D<float2> cur_meta : register(u4);
+RWTexture2D<float4> cur_meta : register(u4);
 RWTexture2D<float4> cur_nr : register(u5);
 RWTexture2D<float> cur_vz : register(u6);
+// The reprojected stabilization history (pass 3's t7/t8): written only
+// under stab_max > 0 — the ONE deliberately non-deterministic plane pair
+// (unread by construction when unwritten: pass 3's blend keys on the meta
+// stab age, which is 0/reseed exactly where the gather didn't run).
+RWTexture2D<float4> stab_out_diff : register(u7);
+RWTexture2D<float4> stab_out_spec : register(u8);
 
 cbuffer FrdCb : register(b0) {
     uint rw;
@@ -78,7 +92,10 @@ cbuffer FrdCb : register(b0) {
     // of the render height; FR_FRD_VMSCALE overrides host-side) — an
     // integer-valued float, 1.0 at every ≤~800p gate/lab res.
     float vm_scale;    // dword 17
-    float2 _vm_pad;    // dwords 18-19
+    // --frd-max-stab-frames (0 = the stabilization sub-step off — the
+    // bitwise pre-stab arm; rode the matrix-alignment pad, no layout shift).
+    float stab_max;    // dword 18
+    float _pad19;      // dword 19
     float4x4 vm_m;     // world → PREV clip (glam columns; column-major mul)
     float3 cam_org;    // camera origin, world
     float3 cam_rgt;    // right · tan(fov/2) · aspect (CamBasis pre-scaling)
@@ -157,7 +174,7 @@ void cs_frd_temporal(uint3 id : SV_DispatchThreadID) {
         accum_spec[p] = sin_;
         cur_fast_diff[p] = float4(din.xyz, 0.0);
         cur_fast_spec[p] = float4(sin_.xyz, 0.0);
-        cur_meta[p] = float2(0.0, 0.0);
+        cur_meta[p] = float4(0.0, 0.0, 0.0, 0.0);
         return;
     }
     float3 n;
@@ -385,6 +402,11 @@ void cs_frd_temporal(uint3 id : SV_DispatchThreadID) {
     float2 nprev = 0.0;
     float2 al = 0.0;
     float w_d = 0.0, w_s = 0.0;
+    // Stabilization gather (stab_max > 0 only): last frame's OUT through
+    // the SAME validated feet, + the stab ages off meta .ba.
+    float4 so_d = 0.0, so_s = 0.0;
+    float2 nsprev = 0.0;
+    bool stab_on = stab_max > 0.0;
     bool reset = (flags & 1u) != 0u;
     if (!reset) {
         float2 fq = q - 0.5;
@@ -418,6 +440,10 @@ void cs_frd_temporal(uint3 id : SV_DispatchThreadID) {
                 hf_d += wd * prev_fast_diff[fp];
                 nprev.x += wd * prev_meta[fp].x;
                 al.x += wd * alv.x;
+                if (stab_on) {
+                    so_d += wd * prev_out_diff[fp];
+                    nsprev.x += wd * prev_meta[fp].z;
+                }
                 w_d += wd;
             }
             if (ws > 0.0) {
@@ -425,6 +451,10 @@ void cs_frd_temporal(uint3 id : SV_DispatchThreadID) {
                 hf_s += ws * prev_fast_spec[fp];
                 nprev.y += ws * prev_meta[fp].y;
                 al.y += ws * alv.y;
+                if (stab_on) {
+                    so_s += ws * prev_out_spec[fp];
+                    nsprev.y += ws * prev_meta[fp].w;
+                }
                 w_s += ws;
             }
         }
@@ -458,6 +488,10 @@ void cs_frd_temporal(uint3 id : SV_DispatchThreadID) {
             hf_s += b * prev_fast_spec[fp];
             nprev.y += b * prev_meta[fp].y;
             al.y += b * prev_antilag[fp].y;
+            if (stab_on) {
+                so_s += b * prev_out_spec[fp];
+                nsprev.y += b * prev_meta[fp].w;
+            }
             w_s += b;
         }
     }
@@ -466,12 +500,20 @@ void cs_frd_temporal(uint3 id : SV_DispatchThreadID) {
         hf_d /= w_d;
         nprev.x /= w_d;
         al.x /= w_d;
+        if (stab_on) {
+            so_d /= w_d;
+            nsprev.x /= w_d;
+        }
     }
     if (w_s > 1e-4) {
         hs_s /= w_s;
         hf_s /= w_s;
         nprev.y /= w_s;
         al.y /= w_s;
+        if (stab_on) {
+            so_s /= w_s;
+            nsprev.y /= w_s;
+        }
     }
     // Anti-lag (flag bit 3, FR_FRD_ANTILAG=off is the repro arm): where
     // pass 3's clamp had to move a signal e box-widths, its stored
@@ -521,5 +563,19 @@ void cs_frd_temporal(uint3 id : SV_DispatchThreadID) {
     accum_spec[p] = as_.slow;
     cur_fast_diff[p] = ad.fast;
     cur_fast_spec[p] = as_.fast;
-    cur_meta[p] = float2(ad.n / 63.0, as_.n / 63.0);
+    // Stabilization ages (meta .ba): advance where the gather validated
+    // feet, RESEED at 1 on reset/no-feet — this frame's out then seeds next
+    // frame's blend, and pass 3's blend keys on the REPROJECTED age (its
+    // meta lane − 1 ≤ 0 on a reseed frame), so the unwritten/garbage
+    // transient is structurally unread. stab_max == 0 writes 0 lanes and
+    // never touches the transients — the bitwise-off arm.
+    float2 ns_new = float2(0.0, 0.0);
+    if (stab_on) {
+        float nsd = !reset && w_d > 1e-4 ? min(nsprev.x * 63.0 + 1.0, 63.0) : 1.0;
+        float nss = !reset && w_s > 1e-4 ? min(nsprev.y * 63.0 + 1.0, 63.0) : 1.0;
+        ns_new = float2(nsd / 63.0, nss / 63.0);
+        stab_out_diff[p] = so_d;
+        stab_out_spec[p] = so_s;
+    }
+    cur_meta[p] = float4(ad.n / 63.0, as_.n / 63.0, ns_new.x, ns_new.y);
 }

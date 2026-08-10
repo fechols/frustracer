@@ -71,22 +71,26 @@ const H_NR: usize = 3;
 const H_VZ: usize = 4;
 const H_COUNT: usize = 5;
 
-// Transients.
+// Transients (the stab pair is written only under stab_max > 0 — the one
+// deliberately non-deterministic plane pair, unread by construction then).
 const T_ACCUM_D: usize = 0;
 const T_ACCUM_S: usize = 1;
 const T_BLUR_D: usize = 2;
 const T_BLUR_S: usize = 3;
+const T_STAB_D: usize = 4;
+const T_STAB_S: usize = 5;
 
-const SRVS: usize = 13;
+const SRVS: usize = 15;
 const UAVS: usize = 9;
 const SET_STRIDE: usize = SRVS + UAVS;
 // Heap sets: [pass1 P0, pass1 P1, pass2 P0, pass2 P1, pass3 P0, pass3 P1].
 const SETS: usize = 6;
-// [0..17) the scalar block | 17 vm_scale (v1.5.3 κ-baseline scale), 18-19
-// pad (matrix alignment) | 20-35 vm_m | 36-38 cam_org, 39 pad | 40-42
-// cam_rgt, 43 pad | 44-46 cam_up — lockstep with frd_temporal.hlsl's
-// cbuffer declaration (root constants map by declaration order; float3s
-// never straddle a register).
+// [0..17) the scalar block | 17 vm_scale (v1.5.3 κ-baseline scale), 18
+// stab_max (--frd-max-stab-frames; 0 = off), 19 pad (matrix alignment) |
+// 20-35 vm_m | 36-38 cam_org, 39 pad | 40-42 cam_rgt, 43 pad | 44-46
+// cam_up — lockstep with frd_temporal.hlsl's cbuffer declaration (root
+// constants map by declaration order; float3s never straddle a register;
+// frd_blur.hlsl declares the prefix through stab_max).
 const CB_DWORDS: u32 = 47;
 
 // Compiled group shapes (temporal / blur+post) — the shipping defaults,
@@ -208,6 +212,12 @@ pub struct FrdGpu {
     pub force_vmotion: std::cell::Cell<Option<bool>>,
     pub force_curv: std::cell::Cell<Option<bool>>,
     pub force_gi: std::cell::Cell<Option<bool>>,
+    /// Stabilization override: Some(0.0) is the provably-off arm (the
+    /// F4–F7 harness pin), Some(n) forces max_stab_frames = n; None reads
+    /// the --frd-max-stab-frames tuning (absent ⇒ 0.0 — DEFAULT OFF this
+    /// commit, the measured-first doctrine; frd::MAX_STAB_FRAMES is the
+    /// post-QA flip target).
+    pub force_stab: std::cell::Cell<Option<f32>>,
     /// Native 16-bit shader ops (OPTIONS4) — the phase-D fp16 arm's probe;
     /// recorded now so the armed line names it. Phases B/C compile fp32.
     pub fp16: bool,
@@ -263,18 +273,22 @@ impl FrdGpu {
         let hist_fmts = [
             f16x4,                         // fast diff (YCoCg + Welford m2)
             f16x4,                         // fast spec
-            // meta: n/frd::META_N_MAX(=63) per lane. NOT exact — n/63 only
-            // lands on the UNORM8 1/255 grid at multiples of 21, so a
-            // round-trip reads ~0.988 per accumulated frame (accepted:
-            // fractional n exists anyway via confidence decay); the CAP is
-            // what the encode enforces, and cb() clamps the lever to it.
-            DXGI_FORMAT_R8G8_UNORM,
+            // meta: .rg = n/frd::META_N_MAX(=63), .ba = the stabilization
+            // ages (same encode; 0 with stab off — the .rg lanes' bytes are
+            // unchanged from the RG8 era, so every n consumer reads the
+            // identical values). NOT exact — n/63 only lands on the UNORM8
+            // 1/255 grid at multiples of 21, so a round-trip reads ~0.988
+            // per accumulated frame (accepted: fractional n exists anyway
+            // via confidence decay); the CAP is what the encode enforces,
+            // and cb() clamps the lever to it.
+            DXGI_FORMAT_R8G8B8A8_UNORM,
             DXGI_FORMAT_R10G10B10A2_UNORM, // prev nr snapshot (wire packing)
             DXGI_FORMAT_R32_FLOAT,         // prev view-Z snapshot
         ];
         let mk_set = || -> Result<Vec<Reg>> { hist_fmts.iter().map(|&f| mk(f)).collect() };
         let hist = [mk_set()?, mk_set()?];
-        let trans: Result<Vec<Reg>> = [f16x4, f16x4, f16x4, f16x4].iter().map(|&f| mk(f)).collect();
+        let trans: Result<Vec<Reg>> =
+            [f16x4, f16x4, f16x4, f16x4, f16x4, f16x4].iter().map(|&f| mk(f)).collect();
         let trans = trans?;
 
         // --- Root signature (the bloom shape): SRV table + UAV table + root
@@ -403,7 +417,8 @@ impl FrdGpu {
             }
         };
         for parity in 0..2usize {
-            // Pass 1 (frd_temporal.hlsl's t0..t12 / u0..u6).
+            // Pass 1 (frd_temporal.hlsl's t0..t14 / u0..u8; t13/t14 = the
+            // OUT planes as the stabilization history, u7/u8 its transients).
             bake(
                 parity,
                 &[
@@ -420,6 +435,8 @@ impl FrdGpu {
                     &hist[1 - parity][H_NR],
                     &hist[1 - parity][H_VZ],
                     &antilag,
+                    &planes[P_OUT_DIFF],
+                    &planes[P_OUT_SPEC],
                 ],
                 &[
                     &trans[T_ACCUM_D],
@@ -429,6 +446,8 @@ impl FrdGpu {
                     &hist[parity][H_META],
                     &hist[parity][H_NR],
                     &hist[parity][H_VZ],
+                    &trans[T_STAB_D],
+                    &trans[T_STAB_S],
                 ],
             );
             // Pass 2 (frd_blur.hlsl's t0..t4 / u0..u1).
@@ -443,7 +462,7 @@ impl FrdGpu {
                 ],
                 &[&trans[T_BLUR_D], &trans[T_BLUR_S]],
             );
-            // Pass 3 (t0..t6 / u0..u4).
+            // Pass 3 (t0..t8 / u0..u4; t7/t8 = the stab transients).
             bake(
                 4 + parity,
                 &[
@@ -454,6 +473,8 @@ impl FrdGpu {
                     &hist[parity][H_META],
                     &hist[parity][H_FAST_D],
                     &hist[parity][H_FAST_S],
+                    &trans[T_STAB_D],
+                    &trans[T_STAB_S],
                 ],
                 &[&planes[P_OUT_DIFF], &planes[P_OUT_SPEC], &slow[0], &slow[1], &antilag],
             );
@@ -488,6 +509,7 @@ impl FrdGpu {
             force_vmotion: std::cell::Cell::new(None),
             force_curv: std::cell::Cell::new(None),
             force_gi: std::cell::Cell::new(None),
+            force_stab: std::cell::Cell::new(None),
             fp16,
             rw,
             rh,
@@ -612,6 +634,12 @@ impl FrdGpu {
             .force_gi
             .get()
             .unwrap_or_else(|| f.gi_fold && crate::frd::girelax_enabled());
+        // Stabilization frames (CB dword 18): the tuning lever, clamped to
+        // the meta wire cap like max_accum; absent = 0.0 = the sub-step off
+        // (bitwise pre-stab, default this commit).
+        let stab = self.force_stab.get().unwrap_or_else(|| {
+            t.max_stab_frames.map_or(0.0, |v| (v as f32).min(crate::frd::META_N_MAX))
+        });
         let flags = (f.reset as u32)
             | ((fire as u32) << 1)
             | ((vmot as u32) << 2)
@@ -648,8 +676,10 @@ impl FrdGpu {
             ];
             c[..head.len()].copy_from_slice(&head);
             // dword 17 = the v1.5.3 κ-baseline scale (rode the cbuffer's
-            // matrix-alignment pad — no layout shift); 18-19 stay 0.
+            // matrix-alignment pad — no layout shift); 18 = stab_max (the
+            // same pad's other half); 19 stays 0.
             c[17] = crate::frd::vm_scale_for(self.rh).to_bits();
+            c[18] = stab.to_bits();
             for (i, v) in f.vm_m.iter().enumerate() {
                 c[20 + i] = v.to_bits();
             }
@@ -679,7 +709,11 @@ impl FrdGpu {
         }
 
         // Pass 1 — temporal. SRV inputs: 5 wire IN (the transitions double
-        // as the pack→read hazard sync), prev parity set, slow (recurrent).
+        // as the pack→read hazard sync), prev parity set, slow (recurrent),
+        // and the OUT planes (the stabilization history — this retires the
+        // old "OUT never leaves UA" invariant: pass 3 transitions them back
+        // before its own dispatch, and cs_nrd_out's hazard stays covered by
+        // the trailing UAV barriers).
         {
             let _p = super::pix::scope(list, c"frd-temporal");
             let mut b = Vec::new();
@@ -693,6 +727,8 @@ impl FrdGpu {
                 Self::to_state(r, npsr, &mut b);
             }
             Self::to_state(&self.antilag, npsr, &mut b);
+            Self::to_state(&self.planes[P_OUT_DIFF], npsr, &mut b);
+            Self::to_state(&self.planes[P_OUT_SPEC], npsr, &mut b);
             unsafe { list.ResourceBarrier(&b) };
             let c = cb(1.0, 0);
             unsafe {
@@ -722,18 +758,24 @@ impl FrdGpu {
         }
 
         // Pass 3 — post + clamp + the recurrent feedback. blur + this
-        // frame's fast become SRVs; slow returns to UA for the write.
+        // frame's fast + the stab transients become SRVs; slow, antilag and
+        // the OUT planes (pass 1 read them as the stab history) return to
+        // UA for the writes.
         {
             let _p = super::pix::scope(list, c"frd-post");
             let mut b = Vec::new();
             Self::to_state(&self.trans[T_BLUR_D], npsr, &mut b);
             Self::to_state(&self.trans[T_BLUR_S], npsr, &mut b);
+            Self::to_state(&self.trans[T_STAB_D], npsr, &mut b);
+            Self::to_state(&self.trans[T_STAB_S], npsr, &mut b);
             Self::to_state(&self.hist[parity][H_FAST_D], npsr, &mut b);
             Self::to_state(&self.hist[parity][H_FAST_S], npsr, &mut b);
             for r in &self.slow {
                 Self::to_state(r, ust, &mut b);
             }
             Self::to_state(&self.antilag, ust, &mut b);
+            Self::to_state(&self.planes[P_OUT_DIFF], ust, &mut b);
+            Self::to_state(&self.planes[P_OUT_SPEC], ust, &mut b);
             unsafe { list.ResourceBarrier(&b) };
             let c = cb(1.7, 41);
             unsafe {
@@ -744,8 +786,9 @@ impl FrdGpu {
             }
         }
 
-        // Restore rest state; the OUT planes never left UA, so cs_nrd_out
-        // needs explicit UAV barriers to see pass 3's writes.
+        // Restore rest state; the OUT planes are back in UA (pass 3's
+        // transition), so cs_nrd_out needs explicit UAV barriers to see
+        // pass 3's writes.
         let mut b = Vec::new();
         for i in [P_IN_MV, P_IN_NR, P_IN_VIEWZ, P_IN_DIFF, P_IN_SPEC] {
             Self::to_state(&self.planes[i], ust, &mut b);

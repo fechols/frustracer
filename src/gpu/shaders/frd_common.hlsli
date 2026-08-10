@@ -194,6 +194,39 @@ float frd_firefly_scale(float luma, float mean3x3) {
     return (luma <= cap || luma <= 0.0) ? 1.0 : cap / luma;
 }
 
+// oracle::stab_alpha / oracle::stab_out — the temporal STABILIZATION
+// sub-step (pass 3, --frd-max-stab-frames; the phase-D item, built
+// 2026-08-10 for the sparse-bright flicker the emissive QA campaign
+// measured — the per-frame-rotating Vogel disk catching/missing sparse
+// bright texels, and the fast-clamp jitter riding it). An anti-flicker EMA
+// over the COMPOSED OUTPUT: the history is last frame's OUT plane
+// (reprojected by pass 1 through its validated feet), CLAMPED per channel
+// to the current frame's 3x3 SPATIAL NEIGHBORHOOD box of the blurred
+// result before blending — the TAA neighborhood clamp, sound HERE because
+// the post-blur field is spatially smooth (clamping the raw sparse input
+// this way is exactly what eats emissive upstream). The first draft
+// clamped to the fast ±kσ TEMPORAL box instead and F8's own teeth killed
+// it: m2 spikes exactly during transitions, so the box went wide when it
+// most needed to bind — the stab arm lagged a step 3× and resurrected the
+// moving-dot ghost. The spatial box inverts that: on a step the
+// neighborhood IS the new value (no lag), at a stale ghost position the
+// neighborhood is dark (no ghost). The RECURRENCE NEVER SEES the
+// stabilized value: slow feedback stays the un-stabilized od/os, so the
+// antilag brake, smear budget, and every accumulation contract evolve
+// bit-identically; only the OUT write differs. max_stab <= 0 or
+// n_stab <= 0 returns cur by BRANCH — the bitwise-off contract (lerp-by-1
+// is h + (c−h)·1, fp, not identity).
+float frd_stab_alpha(float n_stab, float max_stab) {
+    return 1.0 / (1.0 + min(max(n_stab, 0.0), max_stab));
+}
+float3 frd_stab_out(
+    float3 cur, float3 hist, float3 bmin, float3 bmax, float n_stab, float max_stab
+) {
+    if (max_stab <= 0.0 || n_stab <= 0.0) return cur;
+    float3 h = clamp(hist, bmin, bmax);
+    return lerp(h, cur, frd_stab_alpha(n_stab, max_stab));
+}
+
 // oracle::antilag_gain — the anti-lag brake's wire form: pass 3 stores
 // g = 1/max(e, 1) (e = the clamp's |pre − fast| luma distance in box
 // widths) into the antilag plane; pass 1 applies it via frd_antilag_apply.

@@ -1060,7 +1060,18 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
                         opts.frd_tune.max_accum_frames = Some(v);
                     }
                     "--frd-fast-frames" => opts.frd_tune.fast_frames = Some(v),
-                    _ => opts.frd_tune.max_stab_frames = Some(v),
+                    _ => {
+                        // The stab age rides the meta plane's .ba lanes at
+                        // the same n/63 encode — the max-accum clamp shape.
+                        if v as f32 > frd::META_N_MAX {
+                            notes.push(format!(
+                                "frd: max-stab-frames {v} clamped to {} (the meta plane's \
+                                 n/63 wire cap)",
+                                frd::META_N_MAX
+                            ));
+                        }
+                        opts.frd_tune.max_stab_frames = Some(v);
+                    }
                 }
             }
             "--frd-blur-radius" | "--frd-clamp-sigma" => {
@@ -2373,8 +2384,9 @@ pub fn usage() {
                 eprintln!("                | --frd-no-fp16 (force the fp32 shader arm)   FRD tuning (unset = the");
                 eprintln!("                compiled frd.rs constants). --frd-no-anti-firefly drops the input");
                 eprintln!("                firefly pre-clamp (default ON — the bright-specular-smear killer;");
-                eprintln!("                --frd-anti-firefly spells the default). --frd-max-stab-frames N");
-                eprintln!("                parses but is NOT YET WIRED (stabilization is an unbuilt phase-D item)");
+                eprintln!("                --frd-anti-firefly spells the default). --frd-max-stab-frames N arms");
+                eprintln!("                the OUT-plane temporal stabilization (default 0 = off; try 20 — the");
+                eprintln!("                sparse-bright flicker killer, clamped to the current fast +-k*sigma box)");
                 eprintln!("  --nppd-device NPPD execution provider: auto|cpu|dml|dml:<n> (default auto = DML then CPU)");
                 eprintln!("  --check-xess  headless: XeSS dynamic-res contract self-test (no GPU or DLL needed)");
                 eprintln!("  --xess-dump   --check-xess plus G-buffer PNG dumps");
