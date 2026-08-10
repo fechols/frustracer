@@ -38,6 +38,17 @@ static const float FRD_VM_FAR_K = 0.99;
 static const float FRD_VM_ROUGH_LO = 0.25;
 static const float FRD_VM_ROUGH_HI = 0.6;
 static const float FRD_VM_Z_SLACK = 0.05;
+// v1.5.5 (frd.rs VM_SLACK_CAP / VM_APPL_UNC_K / VM_FADE_LO/HI twins): the
+// slack cap, the applied-offset confidence charge, and the magnitude fade
+// — the max-speed containment set. The fade window is in FRACTIONS of the
+// render height (res-invariant by construction).
+static const float FRD_VM_SLACK_CAP = 60.0;
+static const float FRD_VM_APPL_UNC_K = 0.1;
+static const float FRD_VM_FADE_LO = 0.08;
+static const float FRD_VM_FADE_HI = 0.20;
+static const float FRD_SPEC_PX_BUDGET = 0.38;
+static const float FRD_TAP_LUMA_K = 4.0;
+static const float FRD_TAP_LUMA_EPS = 1e-3;
 static const float FRD_VM_DEADZONE2 = 2.5e-3;
 static const float FRD_VM_DN_DZ = 5e-3;
 

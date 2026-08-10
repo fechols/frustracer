@@ -78,6 +78,21 @@ float4 frd_disk(
         float4 v = src[q];
         float w = exp2(frd_tap_exp2(
             i, abs(zq - z), inv_z, dot(n, nq), pw, abs(v.w - center.w), inv_h));
+        // v1.5.5(d) — the LUMA-RATIO TAP GUARD (oracle::tap_luma_guard, in
+        // lockstep — the firefly ring clamp's SPATIAL sibling, the v1.5.2
+        // follow-up finally forced by measurement): a tap whose luma is
+        // vastly brighter than the center's must not dump its energy there
+        // — during a sustained max-speed strafe the smear budget keeps
+        // history young, the history-fix radius stays wide, and an
+        // 800×-mean glint tap averaged into its dim neighbors is exactly
+        // the soft dome-wide BLOOM the B70 captures showed. Taps within
+        // TAP_LUMA_K× of the center pass with factor EXACTLY 1.0 (every
+        // ordinary field is bitwise — the F3/F4 contract), brighter taps
+        // contribute at most K× the center's luma.
+        float tl = v.x;
+        float cl = center.x;
+        w *= min(1.0, FRD_TAP_LUMA_K * (cl + FRD_TAP_LUMA_EPS)
+                          / max(tl + FRD_TAP_LUMA_EPS, 1e-20));
         sum += w * v;
         wsum += w;
     }

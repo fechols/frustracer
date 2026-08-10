@@ -309,9 +309,41 @@ void cs_frd_temporal(uint3 id : SV_DispatchThreadID) {
             if (dot(d, d) < FRD_VM_DEADZONE2) {
                 d = 0.0;
             }
-            float2 appl = d * vm_w;
+            // v1.5.5 — the MAGNITUDE FADE (the FG round-4 dt-fade shape,
+            // res-invariant in fractions of rh): fetch error is
+            // multiplicative in the offset, so past FADE_HI·rh the virtual
+            // fetch collapses onto the SURFACE fetch — the arm
+            // FR_FRD_VMOTION=off measured CLEAN at max strafe while the
+            // uncontained vm fetch painted the dome-wide blotch. Below
+            // FADE_LO·rh the weight is exactly 1.0 (the validated
+            // normal-speed regime rides the multiply-by-1 bitwise).
+            float dl = length(d) * vm_w;
+            float w_mag =
+                1.0 - smoothstep(FRD_VM_FADE_LO * rh, FRD_VM_FADE_HI * rh, dl);
+            float2 appl = d * (vm_w * w_mag);
             q_spec = q + appl;
-            vm_slack = 1.0 + FRD_VM_Z_SLACK * length(appl);
+            float alen = length(appl);
+            // v1.5.5 — the MAX-SPEED containment pair (the B70 1-spp
+            // max-strafe blotch: at 300-800 px of applied offset the
+            // uncapped slack widened the z-test 16-40x — vacuous — so the
+            // displaced fetch ACCEPTED bright glint history anywhere and
+            // the recurrence compounded it into a dome-wide blob;
+            // FR_FRD_VMOTION=off measured clean at the same speed, so the
+            // surface fetch is the proven landing zone). (a) The slack CAP:
+            // the grazing-planar-mirror rationale only needs the widening
+            // at moderate offsets — beyond FRD_VM_SLACK_CAP px the fetch
+            // must pass a near-normal z-test, so a wrong far-displaced
+            // fetch history-restarts instead of being believed (below the
+            // cap this line is the old expression BITWISE). (b) The
+            // magnitude charge below: fetch error is MULTIPLICATIVE in the
+            // offset (a relative model error δ ⇒ δ·|appl| px per frame),
+            // so |appl| itself joins the history cap as parallax — the
+            // third installment of the v2 confidence term. Both arms only
+            // ever TIGHTEN (shorter history / stricter test — coarser,
+            // never a confident wrong fetch). Twins: frd.rs
+            // vm_slack_for/vm_appl_unc — change all together.
+            vm_slack = 1.0 + FRD_VM_Z_SLACK * min(alen, FRD_VM_SLACK_CAP);
+            vm_unc = FRD_VM_APPL_UNC_K * alen / max(proj, 1e-4);
             // The uncertainty bracket: where the four κ estimates
             // disagree (bumpy visor, dead-zone-straddling close-ups,
             // cylinders' genuine ambiguity), the spread of their
@@ -323,7 +355,7 @@ void cs_frd_temporal(uint3 id : SV_DispatchThreadID) {
                 float3 blo = frd_vm_prev_px(du, ray_t, t_blo);
                 float3 bhi = frd_vm_prev_px(du, ray_t, t_bhi);
                 if (blo.z > 1e-6 && bhi.z > 1e-6) {
-                    vm_unc = length(bhi.xy - blo.xy) * vm_w / max(proj, 1e-4);
+                    vm_unc += length(bhi.xy - blo.xy) * vm_w / max(proj, 1e-4);
                 }
             }
         }
@@ -456,6 +488,18 @@ void cs_frd_temporal(uint3 id : SV_DispatchThreadID) {
     // ever TIGHTENS it; relaxing needs v2's model-confidence term.
     float parallax = cam_step / max(z, 1e-4) + light_par + vm_unc;
     float n_smax = frd_spec_max_frames(max_accum, parallax, rough);
+    // v1.5.5(c) — the SMEAR BUDGET (oracle::spec_budget_frames, in
+    // lockstep): the rate cap above bounds frames-per-radian while the
+    // visible artifact is frames × per-frame glint motion in PIXELS, so at
+    // max strafe (~0.18·rh/frame) even 5-8 frames paint a dome-wide swath
+    // — and on a smooth dome every fetch passes the normal/z ladders, so
+    // the cap is the only bound. n also obeys BUDGET·rh over the motion:
+    // restart-class at max strafe, inert wherever the rate cap is already
+    // the binding one (parked, TOD scrubs, slow strafes).
+    n_smax = min(n_smax,
+                 max(FRD_SPEC_PX_BUDGET * rh
+                         / max(max(parallax, 0.0) * max(proj, 0.0), 1e-4),
+                     1.0));
     Accum as_ = frd_accumulate(sin_, hs_s, hf_s, nfr.y, w_s, n_smax);
 
     accum_diff[p] = ad.slow;

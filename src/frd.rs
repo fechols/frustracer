@@ -128,6 +128,54 @@ pub const VM_ROUGH_HI: f32 = 0.6;
 /// virtual foot needs a proportionally wider relative-Z tolerance or every
 /// mirror fetch history-restarts (noise, not trails — but noise).
 pub const VM_Z_SLACK: f32 = 0.05;
+/// v1.5.5 — the MAX-SPEED containment pair (the B70 1-spp max-strafe
+/// blotch, diagnosed live by the AI QA Lab's lever sweep: at 300-800 px of
+/// applied virtual offset the uncapped `1 + VM_Z_SLACK·|appl|` slack
+/// widened the disocclusion z-test 16-40× — vacuous — so the displaced
+/// fetch ACCEPTED bright glint history anywhere on the dome and the
+/// recurrence compounded it into a dome-wide blob; FR_FRD_VMOTION=off
+/// measured clean at the same speed, so the surface fetch is the proven
+/// landing zone). VM_SLACK_CAP bounds the widening (slack ≤ 1 +
+/// VM_Z_SLACK·CAP = 4 — the grazing-planar-mirror rationale only needs
+/// moderate offsets; below the cap the old expression holds BITWISE), and
+/// VM_APPL_UNC_K charges the applied offset itself into the history cap
+/// (fetch error is MULTIPLICATIVE in the offset — a relative model error
+/// δ produces δ·|appl| px per frame — so trust must shorten with reach:
+/// the third installment of the v2 confidence term). Both arms only ever
+/// TIGHTEN.
+pub const VM_SLACK_CAP: f32 = 60.0;
+pub const VM_APPL_UNC_K: f32 = 0.1;
+/// The magnitude fade's window, in FRACTIONS of render height (res-
+/// invariant): below LO·rh the applied virtual delta rides a multiply-by-
+/// exactly-1.0 (the validated normal-speed regime, bitwise); past HI·rh
+/// the fetch collapses onto the SURFACE fetch (measured clean at max
+/// strafe via FR_FRD_VMOTION=off, while the uncontained fetch painted the
+/// dome-wide blotch) — the FG round-4 "better a shimmer than a torn warp"
+/// trade, applied to the fetch position.
+pub const VM_FADE_LO: f32 = 0.08;
+pub const VM_FADE_HI: f32 = 0.2;
+/// v1.5.5(c) — the specular SMEAR BUDGET, in fractions of render height:
+/// the parallax cap is a RATE limit (frames per radian) while the visible
+/// artifact is the PRODUCT — history frames × per-frame glint screen
+/// motion = the smear's length in pixels — so at extreme per-frame motion
+/// even a "short" 5-8-frame history paints a dome-wide swath (the B70
+/// max-strafe blotch: ~0.18·rh of glint motion per frame, and on a smooth
+/// dome every fetch position passes the normal/z tests, so only the cap
+/// bounds the damage). n is therefore ALSO capped by BUDGET·rh divided by
+/// the per-frame motion in pixels: ~2 frames at max strafe (restart-class,
+/// the measured-clean landing), ~4 at the F7 gate's 0.095·rh regime (its
+/// history-dependent pins keep teeth), and inert below ~0.04·rh/frame
+/// where the rate cap is already the binding one.
+pub const SPEC_PX_BUDGET: f32 = 0.38;
+/// v1.5.5(d) — the luma-ratio tap guard (the firefly ring clamp's SPATIAL
+/// sibling, v1.5.2's documented follow-up): a blur tap brighter than
+/// TAP_LUMA_K× the center contributes at most K× the center's luma — the
+/// smear budget keeps history young during sustained fast motion, the
+/// history-fix radius stays wide, and an 800×-mean glint tap averaged
+/// into dim neighbors was the soft dome-wide bloom. Within-K taps ride a
+/// multiply-by-exactly-1.0 (ordinary fields bitwise).
+pub const TAP_LUMA_K: f32 = 4.0;
+pub const TAP_LUMA_EPS: f32 = 1e-3;
 /// Squared px dead-zone under which the virtual delta snaps to EXACTLY
 /// (0,0): a parked camera's surface and virtual projections agree only to
 /// fp (both points sit on one ray through the unmoved origin — the ngxfg
@@ -735,6 +783,50 @@ pub mod oracle {
         rel < Z_EPS * slack / n_dot_v.max(0.1)
     }
 
+    /// v1.5.5 twins of the kernel's max-speed containment pair (see
+    /// VM_SLACK_CAP's doc): the CAPPED virtual-foot slack — below the cap
+    /// this is the v1.5 expression bitwise, beyond it the z-test stops
+    /// widening so a far-displaced fetch must actually match — …
+    pub fn vm_slack_for(appl_px: f32) -> f32 {
+        1.0 + VM_Z_SLACK * appl_px.min(VM_SLACK_CAP)
+    }
+
+    /// … and the applied-offset confidence charge, in the history cap's
+    /// radians-at-the-hit unit (|appl|/proj is the offset as an angle):
+    /// trust shortens in proportion to how far the fetch reached.
+    pub fn vm_appl_unc(appl_px: f32, proj: f32) -> f32 {
+        VM_APPL_UNC_K * appl_px / proj.max(1e-4)
+    }
+
+    /// The v1.5.5 magnitude fade (see VM_FADE_LO's doc): 1.0 below LO·rh
+    /// (bitwise pass-through of the applied delta), 0.0 at and past HI·rh
+    /// (the surface fetch), smoothstep between.
+    pub fn vm_mag_weight(dl_px: f32, rh: f32) -> f32 {
+        let lo = VM_FADE_LO * rh;
+        let hi = VM_FADE_HI * rh;
+        let t = ((dl_px - lo) / (hi - lo)).clamp(0.0, 1.0);
+        1.0 - t * t * (3.0 - 2.0 * t)
+    }
+
+    /// The v1.5.5(d) tap guard's weight factor (see TAP_LUMA_K's doc):
+    /// exactly 1.0 whenever the tap is within K× of the center (ordinary
+    /// fields ride a bitwise multiply-by-1), else the ratio that caps the
+    /// tap's delivered luma at K× the center's.
+    pub fn tap_luma_guard(tap_luma: f32, center_luma: f32) -> f32 {
+        (TAP_LUMA_K * (center_luma + TAP_LUMA_EPS)
+            / (tap_luma + TAP_LUMA_EPS).max(1e-20))
+            .min(1.0)
+    }
+
+    /// The v1.5.5(c) smear-budget frame count (see SPEC_PX_BUDGET's doc):
+    /// BUDGET·rh over the glint's per-frame screen motion (parallax·proj,
+    /// pixels), floored at 1 (a frame always keeps itself). Res-invariant:
+    /// 2× proj with 2× rh cancels. The caller MINs it with the rate cap,
+    /// so a parked camera (motion → 0) is untouched by construction.
+    pub fn spec_budget_frames(parallax: f32, proj: f32, rh: f32) -> f32 {
+        (SPEC_PX_BUDGET * rh / (parallax.max(0.0) * proj.max(0.0)).max(1e-4)).max(1.0)
+    }
+
     // -- Bilateral weights -------------------------------------------------
 
     /// Plane-distance weight: |n_p · (X_j − X_p)| against the pixel-frustum
@@ -1280,6 +1372,97 @@ pub mod oracle {
                 return Err("frd: vm_kappa must be resolution-invariant under the \
                             baseline scale (2x proj + 2x scale must be bitwise)"
                     .into());
+            }
+            // v1.5.5 — the max-speed containment pair: below the cap the
+            // slack is the v1.5 expression BITWISE (the validated normal-
+            // speed regime — F7's 38 px sits under it), beyond it the
+            // widening STOPS (a 500 px-displaced fetch must pass a
+            // near-normal z-test instead of a vacuous one — the B70
+            // blotch's mechanism); the offset charge is zero at zero,
+            // linear (powers of two — bitwise), and res-invariant in the
+            // radians unit.
+            if vm_slack_for(38.0) != 1.0 + VM_Z_SLACK * 38.0 {
+                return Err("frd: vm_slack_for below the cap must be the v1.5 slack bitwise".into());
+            }
+            if vm_slack_for(1000.0) != vm_slack_for(VM_SLACK_CAP)
+                || vm_slack_for(1000.0) > 1.0 + VM_Z_SLACK * VM_SLACK_CAP
+            {
+                return Err("frd: vm_slack_for must stop widening at the cap".into());
+            }
+            if vm_appl_unc(0.0, 518.0) != 0.0 {
+                return Err("frd: vm_appl_unc must be exactly 0 at zero offset".into());
+            }
+            if vm_appl_unc(256.0, 518.0) != 2.0 * vm_appl_unc(128.0, 518.0) {
+                return Err("frd: vm_appl_unc must be linear in the offset".into());
+            }
+            if vm_appl_unc(256.0, 512.0) != vm_appl_unc(128.0, 256.0) {
+                return Err("frd: vm_appl_unc must be res-invariant (an angle)".into());
+            }
+            // The magnitude fade: exactly 1 below LO·rh (the validated
+            // regime rides a multiply-by-1.0), exactly 0 at/past HI·rh
+            // (the surface-fetch collapse), monotone between, and
+            // res-invariant (2× the offset at 2× the height is bitwise).
+            if vm_mag_weight(0.5 * VM_FADE_LO * 1080.0, 1080.0) != 1.0
+                || vm_mag_weight(0.0, 540.0) != 1.0
+            {
+                return Err("frd: vm_mag_weight below LO must be exactly 1".into());
+            }
+            if vm_mag_weight(VM_FADE_HI * 1080.0, 1080.0) != 0.0
+                || vm_mag_weight(2.0 * VM_FADE_HI * 1080.0, 1080.0) != 0.0
+            {
+                return Err("frd: vm_mag_weight at/past HI must be exactly 0".into());
+            }
+            let mid = 0.5 * (VM_FADE_LO + VM_FADE_HI);
+            if vm_mag_weight(mid * 1080.0, 1080.0) >= vm_mag_weight(VM_FADE_LO * 1080.0, 1080.0)
+                || vm_mag_weight(mid * 1080.0, 1080.0) <= 0.0
+            {
+                return Err("frd: vm_mag_weight must fall monotonically inside the window".into());
+            }
+            if vm_mag_weight(200.0, 1080.0) != vm_mag_weight(100.0, 540.0) {
+                return Err("frd: vm_mag_weight must be res-invariant".into());
+            }
+            // The smear budget: restart-class at max-strafe motion
+            // (~0.18·rh/frame ⇒ ~2 frames), history-preserving at the F7
+            // regime (~0.095·rh ⇒ ~4), floored at 1, monotone in motion,
+            // and res-invariant (2× proj at 2× rh is bitwise).
+            let bmax = spec_budget_frames(0.18 * 518.0 / 518.0, 518.0, 518.0);
+            if !(1.5..=3.0).contains(&bmax) {
+                return Err(format!(
+                    "frd: spec_budget_frames at max-strafe motion must be restart-class ({bmax})"
+                ));
+            }
+            let bf7 = spec_budget_frames(0.095, 518.0, 518.0);
+            if bf7 < 3.5 {
+                return Err(format!(
+                    "frd: spec_budget_frames must keep the F7 regime's history ({bf7})"
+                ));
+            }
+            if spec_budget_frames(10.0, 518.0, 518.0) != 1.0 {
+                return Err("frd: spec_budget_frames must floor at 1".into());
+            }
+            if spec_budget_frames(0.05, 518.0, 518.0) <= spec_budget_frames(0.1, 518.0, 518.0) {
+                return Err("frd: spec_budget_frames must fall as motion grows".into());
+            }
+            if spec_budget_frames(0.08, 1036.0, 1036.0) != spec_budget_frames(0.08, 518.0, 518.0) {
+                return Err("frd: spec_budget_frames must be res-invariant".into());
+            }
+            // The tap guard: within K× of the center the factor is EXACTLY
+            // 1.0 (ordinary fields bitwise); a 100× glint tap is crushed to
+            // ~K× the center (the bloom teeth); monotone falling above K.
+            if tap_luma_guard(0.5, 0.5) != 1.0
+                || tap_luma_guard(1.9, 0.5) != 1.0
+                || tap_luma_guard(0.0, 0.0) != 1.0
+            {
+                return Err("frd: tap_luma_guard within K of the center must be exactly 1".into());
+            }
+            let g100 = tap_luma_guard(50.0, 0.5);
+            if !(0.01..=0.08).contains(&g100) {
+                return Err(format!(
+                    "frd: tap_luma_guard must crush a 100x glint tap to ~K/ratio ({g100})"
+                ));
+            }
+            if tap_luma_guard(10.0, 0.5) <= tap_luma_guard(20.0, 0.5) {
+                return Err("frd: tap_luma_guard must fall as the tap brightens".into());
             }
             let dc = spec_virtual_delta_px(
                 216.5,

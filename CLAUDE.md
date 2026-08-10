@@ -1974,6 +1974,54 @@ cargo run --release -- --gpu --xess --frd  # FRD (src/frd.rs + gpu/frd_gpu.rs, 2
                                       # res-dependent estimator at all; the live half of the
                                       # QA lab (real render res, real upscaler) is what
                                       # caught both.
+                                      # v1.5.5 (2026-08-10 — the B70 1-spp MAX-strafe BLOTCH,
+                                      # the third closed-loop lab campaign in one day: the
+                                      # user's session shape was XeSS+fg×2 on the B70 — where
+                                      # XeSS-FG generates — but the blotch survived --no-fg,
+                                      # --no-frd was clean, and the live lever sweep pinned
+                                      # it: FR_FRD_VMOTION=off clean, --frd-blur-radius 0
+                                      # still dirty ⇒ the vm FETCH, not the blur). MECHANISM:
+                                      # at ~0.2·rh of per-frame glint motion the uncapped
+                                      # vm_slack (1 + 0.05·|appl|) widened the z-test 16-40×
+                                      # — vacuous — so displaced fetches accepted bright
+                                      # history ANYWHERE on the dome (every position passes
+                                      # the slowly-varying normal/z ladders there), and the
+                                      # rate-only parallax cap still allowed 5-8 frames ⇒
+                                      # frames × px/frame = a dome-wide swath. FIVE layers,
+                                      # each only ever TIGHTENING, each with F0 pins:
+                                      # (a) VM_SLACK_CAP=60 px — beyond it the widening
+                                      # stops (below-cap bitwise; F7's 38 px untouched);
+                                      # (b) VM_APPL_UNC_K=0.1 — |appl|/proj joins the
+                                      # history cap (fetch error is MULTIPLICATIVE in the
+                                      # offset); (c) the MAGNITUDE FADE (VM_FADE_LO/HI =
+                                      # 0.08/0.20·rh, res-invariant): past HI the fetch
+                                      # collapses onto the SURFACE fetch (measured clean at
+                                      # max strafe) — the FG dt-fade shape on the fetch
+                                      # position; (d) the SMEAR BUDGET (SPEC_PX_BUDGET =
+                                      # 0.38·rh): n_smax is ALSO capped by budget/(per-frame
+                                      # glint motion in px) — the rate cap bounds frames-per-
+                                      # radian while the ARTIFACT is frames × px/frame;
+                                      # restart-class at max strafe, inert wherever the rate
+                                      # cap already binds (parked, TOD scrubs, slow strafes;
+                                      # oracle::spec_budget_frames, floored at 1);
+                                      # (e) the LUMA-RATIO TAP GUARD in frd_disk
+                                      # (TAP_LUMA_K=4 — v1.5.2's documented follow-up,
+                                      # finally forced: with the budget keeping history young
+                                      # under sustained fast motion the history-fix radius
+                                      # stays wide, and an 800×-mean glint tap averaged into
+                                      # dim neighbors was the residual soft BLOOM; within-K
+                                      # taps ride a multiply-by-exactly-1.0 — ordinary
+                                      # fields bitwise, the F3/F4 contract). VERIFIED LIVE
+                                      # (B70 max-deflection passes, desktop captures): blob →
+                                      # compact glint with a small motion tail, at the
+                                      # --no-frd baseline; 4090 normal-speed regression table
+                                      # unmoved (0.03→59 px, 0.06→59 px — the v1.5.3 band's
+                                      # good end); F5/F6/F7/F7C green with F7 gap 0.184 vs
+                                      # pred 0.182; the 540p lab canonical keep 0.29 with
+                                      # teeth firing. LESSON: throttling fps via spp to match
+                                      # a user's per-frame step changes INPUT QUALITY too —
+                                      # the first campaign's spp-8 throttle hid this 1-spp
+                                      # failure; match spp as well as step.
                                       # FR_FRD_CURV=off is the flat-mirror repro arm (flags
                                       # bit 4, force_curv the gate hook). Pure
                                       # rotation needs none of this (both
