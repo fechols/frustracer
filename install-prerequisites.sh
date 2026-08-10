@@ -3,13 +3,22 @@
 #  frustracer — runtime SDK installer (the Linux twin of
 #  install-prerequisites.bat: same pins, same destinations, same markers)
 #
-#  IT FETCHES WINDOWS BINARIES, ON PURPOSE. frustracer is a D3D12 renderer
-#  with no second backend, so nothing this script installs runs on Linux. The
-#  point is that a checkout that LIVES on Linux — a shared or dual-boot drive,
-#  a WSL working copy, a cross-build staging tree, a fileserver clone — can
-#  have its SDKs/ tree populated from here instead of rebooting to do it. Every
-#  file lands in exactly the directory the matching default in src/cli.rs
-#  points at, so the Windows session that consumes them needs no flags.
+#  MOST OF WHAT IT FETCHES IS WINDOWS BINARIES, ON PURPOSE. frustracer is a
+#  D3D12 renderer, so those components do not run on Linux. The point is that a
+#  checkout that LIVES on Linux — a shared or dual-boot drive, a WSL working
+#  copy, a cross-build staging tree, a fileserver clone — can have its SDKs/
+#  tree populated from here instead of rebooting to do it. Every file lands in
+#  exactly the directory the matching default in src/cli.rs points at, so the
+#  Windows session that consumes them needs no flags.
+#
+#  TWO COMPONENTS ARE LINUX-NATIVE and exist for the Vulkan backend port:
+#  `dxc` additionally fetches the Linux DXC (SPIR-V codegen — verified present
+#  in the official build, which is the port's whole toolchain premise) beside
+#  the Windows one at the SAME pin, and `spirv` fetches SPIRV-Tools for
+#  validating what DXC emits. Both are no-ops for a Windows session. They are
+#  in `all` because a Linux checkout that cannot compile a shader cannot make
+#  progress on the port, and finding that out at the first kernel is worse than
+#  paying the download here.
 #
 #  Building NEVER needs any of this: the MIT headers the shims compile against
 #  (FidelityFX) are committed, and every SDK below is LoadLibrary'd at runtime,
@@ -72,6 +81,17 @@ OIDN_VER=2.5.0
 XESS_VER=2.1.1
 DXC_TAG=v1.9.2602.24
 DXC_ZIP=dxc_2026_05_27.zip
+#  The Linux DXC rides the SAME release tag, so the compiler that emits DXIL for
+#  the D3D12 backend and the one that emits SPIR-V for Vulkan can never drift to
+#  different HLSL front ends — which would be a difference no gate could see,
+#  since the two backends compile the identical concatenated source. NOTE the
+#  tarball's own date differs from the zip's by a day; that is upstream's
+#  asset naming within one release, not a skew.
+DXC_LINUX_TGZ=linux_dxc_2026_05_26.x86_64.tar.gz
+#  SPIRV-Tools: the prebuilt install.tgz from the SPIRV-Tools CI bucket, whose
+#  latest link is a redirect stub we resolve at run time rather than pinning a
+#  build number that expires. `spirv-val` is the gate on everything DXC emits.
+SPIRV_BADGE=https://storage.googleapis.com/spirv-tools/badges/build_link_linux_clang_release.html
 FFX_VER=2.3.0
 ORT_VER=1.24.4
 DML_VER=1.15.4
@@ -105,7 +125,7 @@ fi
 FORCE=
 NRD_EXPLICIT=
 SEL=()
-ALL=(dxc fsr xess nppd oidn pix nrd)
+ALL=(dxc fsr xess nppd oidn pix nrd spirv)
 for a in "$@"; do
     case "${a,,}" in
         --force | /force | -f) FORCE=1 ;;
@@ -128,7 +148,7 @@ for a in "$@"; do
             echo "    SDK at BUILD time (set FRUSTRACER_DLSS_SDK; see the header)."
             exit 2
             ;;
-        dxc | fsr | xess | nppd | oidn | pix)
+        dxc | fsr | xess | nppd | oidn | pix | spirv)
             SEL+=("${a,,}")
             ;;
         nrd)
@@ -207,11 +227,23 @@ fetch() {
     mv -f "$out.part" "$out"
 }
 
-# unzip_to <zipfile> <destdir> — the one extractor call site.
+# unzip_to <archive> <destdir> — the one extractor call site.
+#  DISPATCHES ON THE ARCHIVE'S MAGIC BYTES, never its name. The Windows drops
+#  are zips and the Linux ones (DXC, SPIRV-Tools) are gzipped tars, and upstream
+#  naming is not a reliable signal either way — this repo already carries
+#  .zip-named tarballs. Reading the first two bytes is the only test that cannot
+#  be wrong, and getting it wrong costs a confusing "not a zipfile" against a
+#  perfectly good download.
 #  unzip exits 1 for warnings (skipped/renamed entries) and >=2 for real
-#  errors, so only >=2 is a failure; bsdtar is plain 0/non-0.
+#  errors, so only >=2 is a failure; bsdtar and tar are plain 0/non-0.
 unzip_to() {
-    local rc=0
+    local rc=0 magic
+    magic=$(head -c2 "$1" | od -An -tx1 | tr -d ' \n')
+    if [[ $magic == 1f8b ]]; then
+        # gzip — GNU tar handles it; bsdtar equally if that is what we have
+        tar -xzf "$1" -C "$2" || rc=$?
+        return $rc
+    fi
     if [[ $UNZIP == unzip ]]; then
         unzip -qq -o "$1" -d "$2" || rc=$?
         ((rc == 1)) && rc=0
@@ -233,7 +265,7 @@ extract() {
     mkdir -p "$dest"
     echo "    [+] extracting $1 -> ${dest#"$ROOT"/}"
     if [[ -n $strip ]]; then
-        local stage="$CACHE/stage-${1%.zip}"
+        local stage="$CACHE/stage-${1%%.*}"
         rm -rf "$stage"
         mkdir -p "$stage"
         if ! unzip_to "$zip" "$stage"; then
@@ -294,12 +326,63 @@ check() {
 # =========================== components ===================================
 
 do_dxc() {
+    # TWO DROPS, ONE PIN. The Windows DLLs are what a D3D12 session loads; the
+    # Linux tarball is what the Vulkan port compiles SPIR-V with. They are
+    # fetched together, and deliberately from the SAME release tag — see
+    # DXC_LINUX_TGZ. Each half skips independently so a partial tree completes.
+
     # dxcompiler.dll + dxil.dll — required by the DEFAULT --dxr session and by
     # --gpu; without them both fall back to the CPU tracer with a loud line.
-    skip "$SDKS/dxc/bin/x64/dxcompiler.dll" dxc && return 0
-    fetch dxc.zip "https://github.com/microsoft/DirectXShaderCompiler/releases/download/$DXC_TAG/$DXC_ZIP" || return 0
-    # archive root is bin/ inc/ lib/ — extracts straight over SDKs/dxc
-    extract dxc.zip "$SDKS/dxc" || return 0
+    if ! skip "$SDKS/dxc/bin/x64/dxcompiler.dll" "dxc (windows)"; then
+        if fetch dxc.zip "https://github.com/microsoft/DirectXShaderCompiler/releases/download/$DXC_TAG/$DXC_ZIP"; then
+            # archive root is bin/ inc/ lib/ — extracts straight over SDKs/dxc
+            extract dxc.zip "$SDKS/dxc" || true
+        fi
+    fi
+
+    # bin/dxc + lib/libdxcompiler.so — the SPIR-V compiler for the Vulkan
+    # backend. The official build DOES carry SPIR-V codegen (verified: it emits
+    # a valid module for a cs_6_5 kernel), which is the premise the whole port
+    # rests on; if a future pin ever drops it, the fallbacks are the Vulkan
+    # SDK's DXC or a source build with -DENABLE_SPIRV_CODEGEN=ON.
+    #
+    # NOTE the runtime needs its own lib/ on the loader path:
+    #     LD_LIBRARY_PATH=SDKs/dxc-linux/lib SDKs/dxc-linux/bin/dxc ...
+    # since bin/dxc resolves libdxcompiler.so by soname, not by sibling.
+    if ! skip "$SDKS/dxc-linux/bin/dxc" "dxc (linux, SPIR-V)"; then
+        if fetch dxc-linux.tar.gz "https://github.com/microsoft/DirectXShaderCompiler/releases/download/$DXC_TAG/$DXC_LINUX_TGZ"; then
+            extract dxc-linux.tar.gz "$SDKS/dxc-linux" || return 0
+            chmod +x "$SDKS/dxc-linux/bin/"* 2>/dev/null
+        fi
+    fi
+}
+
+do_spirv() {
+    # spirv-val is the gate on everything DXC emits: DXC will happily produce a
+    # module that no driver accepts, and "it compiled" is not the claim the port
+    # needs. spirv-dis comes along and is what turns a validation failure into a
+    # readable diagnosis.
+    #
+    # The archive is ~180 MB because it carries headers and static libs as well
+    # as the binaries; only bin/ is used here. There is no versioned release to
+    # pin (upstream ships SPIRV-Tools through the Vulkan SDK), so we resolve the
+    # CI bucket's "latest" redirect stub at run time rather than pin a build
+    # number that will 404 within weeks.
+    skip "$SDKS/spirv-tools/bin/spirv-val" spirv && return 0
+    local url
+    url=$(curl -sS --max-time 60 "$SPIRV_BADGE" 2>/dev/null |
+        grep -oP 'url=\K[^"]+' | head -1)
+    if [[ -z $url ]]; then
+        echo "    [x] could not resolve the SPIRV-Tools latest-build link"
+        echo "        alternative: apt install spirv-tools (needs root), or the"
+        echo "        LunarG Vulkan SDK, which carries spirv-val and a DXC too"
+        fail
+        return 0
+    fi
+    fetch spirv-tools.tgz "$url" || return 0
+    # archive root is a single install/ dir holding bin/ include/ lib/
+    extract spirv-tools.tgz "$SDKS/spirv-tools" strip1 || return 0
+    chmod +x "$SDKS/spirv-tools/bin/"* 2>/dev/null
 }
 
 do_fsr() {
@@ -399,6 +482,7 @@ run nppd
 run oidn
 run pix
 run nrd
+run spirv
 
 # =========================== verification =================================
 echo
@@ -415,6 +499,11 @@ check "OIDN (--oidn / N)" "$SDKS/oidn.x64.windows/bin/OpenImageDenoise.dll"
 check "PIX markers (--pix-markers)" "$SDKS/pix/bin/x64/WinPixEventRuntime.dll"
 check "NRD denoiser (--nrd)" "$SDKS/NRD/bin/NRD.dll"
 check "  (perf variant, --nrd-perf)" "$SDKS/NRD/bin/perf/NRD.dll"
+echo "---- linux-native (vulkan backend port) ----"
+check "DXC -> SPIR-V" "$SDKS/dxc-linux/bin/dxc"
+check "  (runtime; needs LD_LIBRARY_PATH)" "$SDKS/dxc-linux/lib/libdxcompiler.so"
+check "SPIR-V validation" "$SDKS/spirv-tools/bin/spirv-val"
+check "  (disassembler)" "$SDKS/spirv-tools/bin/spirv-dis"
 
 # DLSS is decided at BUILD time, not here (see the header) — but say so in the
 # summary, where someone looking for the missing DLSS-RR row will look. The
