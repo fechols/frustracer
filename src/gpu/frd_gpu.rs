@@ -82,7 +82,11 @@ const UAVS: usize = 9;
 const SET_STRIDE: usize = SRVS + UAVS;
 // Heap sets: [pass1 P0, pass1 P1, pass2 P0, pass2 P1, pass3 P0, pass3 P1].
 const SETS: usize = 6;
-const CB_DWORDS: u32 = 17;
+// [0..17) the scalar block | 17-19 pad (matrix alignment) | 20-35 vm_m |
+// 36-38 cam_org, 39 pad | 40-42 cam_rgt, 43 pad | 44-46 cam_up — lockstep
+// with frd_temporal.hlsl's cbuffer declaration (root constants map by
+// declaration order; float3s never straddle a register).
+const CB_DWORDS: u32 = 47;
 
 // Compiled group shapes (temporal / blur+post) — the shipping defaults,
 // adopted from the 2026-08-09 B70 sweep (world parked, per-axis cells then
@@ -147,6 +151,18 @@ pub struct FrdFrame {
     /// moving-light half of the specular parallax; the two halves SUM in
     /// the kernel. 0.0 whenever the sun is static (bit-equal directions).
     pub light_par: f32,
+    /// v1.5 virtual motion: world → PREVIOUS clip (glam columns —
+    /// pm.view_to_clip · pm.world_to_view, the SAME matrices the wire MV
+    /// was built from). All-zero (with a parked basis) drives every
+    /// projection into the w ≤ 1e-6 humble arm — the structurally-off
+    /// value the harnesses pass.
+    pub vm_m: [f32; 16],
+    /// This frame's camera origin (world).
+    pub cam_org: [f32; 3],
+    /// right · tan(fov/2) · aspect / up · tan(fov/2) — the CamBasis
+    /// pre-scaling (the ngxfg_guides basis convention, verbatim).
+    pub cam_rgt: [f32; 3],
+    pub cam_up: [f32; 3],
 }
 
 pub struct FrdGpu {
@@ -528,12 +544,15 @@ impl FrdGpu {
         let t = crate::frd::tuning();
         // flags: bit 0 = reset | bit 1 = firefly pre-clamp (the
         // --frd-[no-]anti-firefly lever, DEFAULT ON — it is the bright-
-        // trail killer) | bit 3 = anti-lag (FR_FRD_ANTILAG=off disarms).
+        // trail killer) | bit 2 = v1.5 virtual motion (FR_FRD_VMOTION=off
+        // disarms) | bit 3 = anti-lag (FR_FRD_ANTILAG=off disarms).
         let flags = (f.reset as u32)
             | ((t.anti_firefly.unwrap_or(true) as u32) << 1)
+            | ((crate::frd::vmotion_enabled() as u32) << 2)
             | ((crate::frd::antilag_enabled() as u32) << 3);
         let cb = |pass_scale: f32, salt: u32| -> [u32; CB_DWORDS as usize] {
-            [
+            let mut c = [0u32; CB_DWORDS as usize];
+            let head = [
                 self.rw,
                 self.rh,
                 flags,
@@ -558,7 +577,18 @@ impl FrdGpu {
                 pass_scale.to_bits(),
                 salt,
                 f.light_par.to_bits(),
-            ]
+            ];
+            c[..head.len()].copy_from_slice(&head);
+            // dwords 17-19 stay 0 (the cbuffer's matrix-alignment pad).
+            for (i, v) in f.vm_m.iter().enumerate() {
+                c[20 + i] = v.to_bits();
+            }
+            for i in 0..3 {
+                c[36 + i] = f.cam_org[i].to_bits();
+                c[40 + i] = f.cam_rgt[i].to_bits();
+                c[44 + i] = f.cam_up[i].to_bits();
+            }
+            c
         };
         let gpu0 = unsafe { self.heap.GetGPUDescriptorHandleForHeapStart() };
         let bind_set = |set: usize| unsafe {

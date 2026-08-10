@@ -84,8 +84,10 @@ pub const PLANE_SENS: f32 = 2.0;
 /// SPEC_N_POW_SMOOTH as roughness falls.
 pub const N_POW_DIFF: f32 = 8.0;
 pub const N_POW_SPEC_SMOOTH: f32 = 128.0;
-/// Firefly pre-clamp: input luma may exceed the 3x3 neighborhood mean by at
-/// most this factor before being compressed (soft, energy-aware).
+/// Firefly pre-clamp: input luma may exceed the 8-NEIGHBOR ring mean
+/// (center EXCLUDED — with the center in, a lone outlier's own contribution
+/// dominates its cap and the clamp asymptotes to a fixed (1 − K/9) trim) by
+/// at most this factor before being compressed (soft, energy-aware).
 pub const FIREFLY_K: f32 = 8.0;
 /// Diffuse/specular blur radius gains (world hit-dist -> pixel radius).
 pub const C_DIFF: f32 = 0.5;
@@ -101,6 +103,29 @@ pub const RANGE_K: f32 = 0.999;
 /// says — the parse notes the clamp and frd_gpu's cb() applies it (the
 /// MAX_FIREFLIES loud-clamp shape).
 pub const META_N_MAX: f32 = 63.0;
+/// v1.5 specular virtual motion (the camera-translation half of the
+/// bright-specular smear fix; the ngxfg_guides round-2 unfold, delta form).
+/// VM_FAR_K: t_r at or past this fraction of far takes the rotation-only
+/// sky limit — deliberately NOT exact far (the wire_cam_far f16 lesson: an
+/// exact-far compare against a quantized hit-t never fires).
+pub const VM_FAR_K: f32 = 0.99;
+/// The roughness fade window: below LO the fetch is fully virtual, past HI
+/// fully surface (a rough surface's "reflection" IS the surface — the
+/// ngxfg ROUGH_LO/HI damping shape, FRD-local values).
+pub const VM_ROUGH_LO: f32 = 0.25;
+pub const VM_ROUGH_HI: f32 = 0.6;
+/// Disocclusion slack per pixel of applied virtual offset: a grazing planar
+/// mirror's reflector depth varies along the plane, so a far-displaced
+/// virtual foot needs a proportionally wider relative-Z tolerance or every
+/// mirror fetch history-restarts (noise, not trails — but noise).
+pub const VM_Z_SLACK: f32 = 0.05;
+/// Squared px dead-zone under which the virtual delta snaps to EXACTLY
+/// (0,0): a parked camera's surface and virtual projections agree only to
+/// fp (both points sit on one ray through the unmoved origin — the ngxfg
+/// static-camera anchor measures that residue under 2e-2 px), and it would
+/// otherwise defeat the integer-aligned-foot fast path and the parked
+/// bit-stability. 0.05 px is far below any visible virtual motion.
+pub const VM_DEADZONE2: f32 = 2.5e-3;
 
 // ---------------------------------------------------------------------------
 // Tuning — the --frd-* levers (the nrd::ReblurTuning / fsr-tune shape):
@@ -172,6 +197,27 @@ pub fn sunpar_gain() -> f32 {
                 eprintln!("frd: FR_FRD_SUNPAR='{v}' is not off|<gain> — using the default 1.0");
                 1.0
             }
+        }
+    })
+}
+
+/// FR_FRD_VMOTION=off — disarm the v1.5 specular virtual-motion
+/// reprojection (the camera-translation reflection-smear repro arm: the
+/// spec history fetch falls back to the surface MV and the parallax cap to
+/// the cam_step/z term — Stage A's exact behavior). A CB flag, never a
+/// recompile; loud on departure, any other value loud + default ON.
+pub fn vmotion_enabled() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| {
+        let Ok(v) = std::env::var("FR_FRD_VMOTION") else {
+            return true;
+        };
+        if v.eq_ignore_ascii_case("off") {
+            eprintln!("frd: FR_FRD_VMOTION=off — specular virtual motion disarmed (repro arm)");
+            false
+        } else {
+            eprintln!("frd: FR_FRD_VMOTION='{v}' is not `off` — virtual motion stays armed");
+            true
         }
     })
 }
@@ -336,10 +382,13 @@ pub mod oracle {
 
     // -- Firefly pre-clamp -------------------------------------------------
 
-    /// Soft input clamp against the 3x3 neighborhood mean: luma may exceed
-    /// FIREFLY_K * mean; past that it compresses (never to zero — an
-    /// outlier is attenuated, not deleted, so energy loss is bounded).
-    /// Returns the scale to apply to the sample (1.0 = untouched).
+    /// Soft input clamp against the 8-neighbor RING mean (center excluded —
+    /// see FIREFLY_K's doc for why center-in is toothless): luma may exceed
+    /// FIREFLY_K * mean; past that it compresses to the cap (never to a
+    /// hard zero — the 1e-6 floor keeps the scale positive, and a real
+    /// multi-pixel glint's ring carries glint values, so it survives
+    /// proportionally). Returns the scale to apply to the sample (1.0 =
+    /// untouched — the common path is bitwise inert).
     pub fn firefly_scale(luma: f32, mean3x3: f32) -> f32 {
         let cap = FIREFLY_K * mean3x3.max(1e-6);
         if luma <= cap || luma <= 0.0 {
@@ -370,6 +419,83 @@ pub mod oracle {
         }
         let d = sun_prev[0] * sun_cur[0] + sun_prev[1] * sun_cur[1] + sun_prev[2] * sun_cur[2];
         2.0 * d.clamp(-1.0, 1.0).acos()
+    }
+
+    // -- v1.5 specular virtual motion --------------------------------------
+
+    /// The roughness fade on the virtual-motion coordinate: 1 below
+    /// VM_ROUGH_LO (fully virtual — a mirror's content IS the reflection),
+    /// 0 past VM_ROUGH_HI (fully surface), smoothstep between (the ngxfg
+    /// damping shape).
+    pub fn vm_rough_fade(rough: f32) -> f32 {
+        let t = ((rough - VM_ROUGH_LO) / (VM_ROUGH_HI - VM_ROUGH_LO)).clamp(0.0, 1.0);
+        1.0 - t * t * (3.0 - 2.0 * t)
+    }
+
+    /// The v1.5 virtual-motion DELTA, pixels: project the SURFACE point and
+    /// the VIRTUAL point (the reflection's image at t_surf + t_r unfolded
+    /// along the primary ray; t_r >= VM_FAR_K·far takes the rotation-only
+    /// direction limit, w = 0) through the SAME prev world→clip and return
+    /// their difference — added to the measured-MV q, so jitter/convention
+    /// offsets cancel to first order and t_r = 0 is exactly (0, 0) by
+    /// construction (v == hit bitwise). A parked camera's two projections
+    /// agree only to fp (both points sit on one ray through the unmoved
+    /// origin), so a sub-VM_DEADZONE2 residue snaps to exactly (0, 0);
+    /// either projection landing behind the prev image plane (w <= 1e-6)
+    /// returns (0, 0) — the humble arm, coarser never wrong-signed.
+    /// `right_s`/`up_s` carry the CamBasis pre-scaling (tan(fov/2)·aspect /
+    /// tan(fov/2)) — the ngxfg_guides::virtual_prev_px conventions VERBATIM
+    /// (the F0 cross-pin holds the two engines to one unfold).
+    #[allow(clippy::too_many_arguments)]
+    pub fn spec_virtual_delta_px(
+        cx: f32,
+        cy: f32,
+        w: f32,
+        h: f32,
+        view_z: f32,
+        t_r: f32,
+        cam_far: f32,
+        origin: glam::Vec3A,
+        fwd: glam::Vec3A,
+        right_s: glam::Vec3A,
+        up_s: glam::Vec3A,
+        m: &glam::Mat4,
+    ) -> [f32; 2] {
+        use glam::Vec4;
+        let ndx = cx * (2.0 / w) - 1.0;
+        let ndy = 1.0 - cy * (2.0 / h);
+        let du = (fwd + right_s * ndx + up_s * ndy).normalize();
+        let ray_t = view_z / du.dot(fwd);
+        let hit = origin + du * ray_t;
+        let ps = *m * Vec4::new(hit.x, hit.y, hit.z, 1.0);
+        let pv = if t_r >= VM_FAR_K * cam_far {
+            *m * Vec4::new(du.x, du.y, du.z, 0.0)
+        } else {
+            let v = origin + du * (ray_t + t_r);
+            *m * Vec4::new(v.x, v.y, v.z, 1.0)
+        };
+        if ps.w <= 1e-6 || pv.w <= 1e-6 {
+            return [0.0, 0.0];
+        }
+        let spx = [(ps.x / ps.w + 1.0) * 0.5 * w, (1.0 - ps.y / ps.w) * 0.5 * h];
+        let vpx = [(pv.x / pv.w + 1.0) * 0.5 * w, (1.0 - pv.y / pv.w) * 0.5 * h];
+        let d = [vpx[0] - spx[0], vpx[1] - spx[1]];
+        if d[0] * d[0] + d[1] * d[1] < VM_DEADZONE2 {
+            return [0.0, 0.0];
+        }
+        d
+    }
+
+    /// The virtual foot's disocclusion tolerance: the base relative-Z test
+    /// widened proportionally to the APPLIED virtual offset (slack = 1 +
+    /// VM_Z_SLACK · |delta_px|) — a grazing planar mirror's reflector depth
+    /// varies along the plane, and the base tolerance at a far-displaced
+    /// foot would history-restart every mirror fetch. slack = 1.0 is the
+    /// base test EXACTLY (the F0 identity pin).
+    pub fn disocclusion_z_valid_slack(z_expect: f32, z_prev: f32, n_dot_v: f32, slack: f32) -> bool {
+        let scale = z_expect.abs().max(z_prev.abs()).max(1e-6);
+        let rel = (z_prev - z_expect).abs() / scale;
+        rel < Z_EPS * slack / n_dot_v.max(0.1)
     }
 
     // -- Bilateral weights -------------------------------------------------
@@ -660,6 +786,124 @@ pub mod oracle {
         let ou = light_parallax([0.6, 0.8, 0.0], [0.600_000_1, 0.8, 0.0]);
         if !ou.is_finite() || ou < 0.0 {
             return Err(format!("frd: light_parallax over-unit dot safety ({ou})"));
+        }
+
+        // v1.5 virtual motion: the fade window's endpoints; the parked-
+        // camera EXACT-zero snap (both projections share one ray through the
+        // unmoved origin — the dead-zone absorbs the fp residue the ngxfg
+        // static anchor bounds at 2e-2 px); t_r = 0 exact zero at a MOVED
+        // camera (pv == ps bitwise); the moved-camera mirror delta must
+        // FIRE with the sky arm answering differently from the finite arm
+        // (anti-vacuity + the rotation-only limit is a different function);
+        // the CROSS-PIN holds this unfold to ngxfg_guides::virtual_prev_px
+        // — one convention, two engines, one pin; and the slack
+        // disocclusion at slack 1.0 is the base test verbatim.
+        {
+            use crate::camera::Camera;
+            use glam::{Vec3A, Vec4};
+            if vm_rough_fade(0.0) != 1.0
+                || vm_rough_fade(VM_ROUGH_LO) != 1.0
+                || vm_rough_fade(VM_ROUGH_HI) != 0.0
+                || vm_rough_fade(1.0) != 0.0
+            {
+                return Err("frd: vm_rough_fade endpoints".into());
+            }
+            let mid = vm_rough_fade(0.5 * (VM_ROUGH_LO + VM_ROUGH_HI));
+            if !(mid > 0.0 && mid < 1.0) {
+                return Err("frd: vm_rough_fade must be interior mid-window".into());
+            }
+            let (rw, rh) = (432usize, 324usize);
+            let (near, far) = (0.05f32, 5000.0f32);
+            let cam = Camera::look_at(Vec3A::new(4.0, 2.0, 4.0), Vec3A::new(0.0, 1.0, 0.0), 0.9);
+            let f = cam.forward();
+            let r = f.cross(Vec3A::Y).normalize();
+            let u = r.cross(f);
+            let tanh = (cam.fov_y * 0.5).tan();
+            let (org, fwd) = (cam.pos, f);
+            let (rgt, upv) = (r * (tanh * rw as f32 / rh as f32), u * tanh);
+            let mats = crate::dlss::cam_matrices(&cam, rw, rh, near, far);
+            let wc = mats.view_to_clip * mats.world_to_view;
+            for &(cx, cy, t_r) in
+                &[(216.5f32, 162.5f32, 3.0f32), (40.5, 300.5, 30.0), (400.5, 20.5, far)]
+            {
+                let d = spec_virtual_delta_px(
+                    cx, cy, rw as f32, rh as f32, 7.0, t_r, far, org, fwd, rgt, upv, &wc,
+                );
+                if d != [0.0, 0.0] {
+                    return Err(format!(
+                        "frd: parked-camera virtual delta must snap to exactly 0 ({d:?} at t_r={t_r})"
+                    ));
+                }
+            }
+            let prev_cam = Camera {
+                pos: cam.pos + Vec3A::new(0.12, 0.02, -0.05),
+                yaw: cam.yaw + 0.01,
+                pitch: cam.pitch - 0.004,
+                fov_y: cam.fov_y,
+            };
+            let pmats = crate::dlss::cam_matrices(&prev_cam, rw, rh, near, far);
+            let wp = pmats.view_to_clip * pmats.world_to_view;
+            let d0 = spec_virtual_delta_px(
+                216.5, 162.5, rw as f32, rh as f32, 7.0, 0.0, far, org, fwd, rgt, upv, &wp,
+            );
+            if d0 != [0.0, 0.0] {
+                return Err("frd: t_r = 0 must be exactly zero delta at a moved camera".into());
+            }
+            let df = spec_virtual_delta_px(
+                216.5, 162.5, rw as f32, rh as f32, 7.0, 40.0, far, org, fwd, rgt, upv, &wp,
+            );
+            let ds = spec_virtual_delta_px(
+                216.5, 162.5, rw as f32, rh as f32, 7.0, far, far, org, fwd, rgt, upv, &wp,
+            );
+            if df == [0.0, 0.0] || ds == [0.0, 0.0] {
+                return Err("frd: moved-camera virtual delta must fire (anti-vacuity)".into());
+            }
+            if (df[0] - ds[0]).abs() + (df[1] - ds[1]).abs() < 1e-3 {
+                return Err("frd: the sky arm must differ from the finite arm".into());
+            }
+            // The cross-pin runs only where both engines take the SAME
+            // branch: t_r well under VM_FAR_K·far, and exactly far (both
+            // sky) — the (VM_FAR_K·far, far) band deliberately diverges
+            // (the f16 sky-compare lesson is FRD's threshold, not ngxfg's).
+            for &t_r in &[3.0f32, 40.0, far] {
+                let d = spec_virtual_delta_px(
+                    216.5, 162.5, rw as f32, rh as f32, 7.0, t_r, far, org, fwd, rgt, upv, &wp,
+                );
+                let v = crate::gpu::ngxfg_guides::virtual_prev_px(
+                    216.5, 162.5, rw as f32, rh as f32, 7.0, t_r, far, org, fwd, rgt, upv, &wp,
+                )
+                .ok_or("frd: cross-pin virtual point behind camera")?;
+                let ndx = 216.5f32 * (2.0 / rw as f32) - 1.0;
+                let ndy = 1.0 - 162.5f32 * (2.0 / rh as f32);
+                let du = (fwd + rgt * ndx + upv * ndy).normalize();
+                let hit = org + du * (7.0 / du.dot(fwd));
+                let ps = wp * Vec4::new(hit.x, hit.y, hit.z, 1.0);
+                let spx = (
+                    (ps.x / ps.w + 1.0) * 0.5 * rw as f32,
+                    (1.0 - ps.y / ps.w) * 0.5 * rh as f32,
+                );
+                if (spx.0 + d[0] - v.0).abs() > 1e-2 || (spx.1 + d[1] - v.1).abs() > 1e-2 {
+                    return Err(format!(
+                        "frd: virtual-motion cross-pin vs ngxfg diverges at t_r={t_r}"
+                    ));
+                }
+            }
+            for &(ze, zp, ndv) in &[
+                (10.0f32, 10.19f32, 1.0f32),
+                (10.0, 10.21, 1.0),
+                (10.0, 20.0, 1.0),
+                (10.0, 10.21, 0.1),
+            ] {
+                if disocclusion_z_valid_slack(ze, zp, ndv, 1.0) != disocclusion_z_valid(ze, zp, ndv)
+                {
+                    return Err("frd: slack 1.0 must be the base disocclusion test".into());
+                }
+            }
+            if !disocclusion_z_valid_slack(10.0, 10.3, 1.0, 2.0)
+                || disocclusion_z_valid_slack(10.0, 10.3, 1.0, 1.0)
+            {
+                return Err("frd: disocclusion slack must widen monotonically".into());
+            }
         }
 
         // Firefly: under the cap the scale is EXACTLY 1.0 (the common path

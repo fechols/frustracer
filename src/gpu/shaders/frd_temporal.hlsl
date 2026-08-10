@@ -68,6 +68,16 @@ cbuffer FrdCb : register(b0) {
     // specular parallax (oracle::light_parallax; SUMS with cam_step/z, the
     // same radians-at-the-hit unit, so SPEC_PARALLAX_K applies unchanged).
     float light_par;
+    // v1.5 specular virtual motion (oracle::spec_virtual_delta_px): the
+    // prev world→clip matrix + this frame's CamBasis, so the pass can
+    // unfold the reflection's virtual image and reproject it through the
+    // PREVIOUS camera. Padding aligns the matrix to a register (root
+    // constants map by declaration order — frd_gpu's cb() mirrors it).
+    float3 _vm_pad;    // dwords 17-19
+    float4x4 vm_m;     // world → PREV clip (glam columns; column-major mul)
+    float3 cam_org;    // camera origin, world
+    float3 cam_rgt;    // right · tan(fov/2) · aspect (CamBasis pre-scaling)
+    float3 cam_up;     // up · tan(fov/2)
 };
 
 // One signal's temporal step — shared by diff/spec so the feet loop's
@@ -140,28 +150,36 @@ void cs_frd_temporal(uint3 id : SV_DispatchThreadID) {
 
     // Firefly pre-clamp (oracle::firefly_scale, flag bit 1 — the
     // --frd-[no-]anti-firefly lever): soft-clamp each input's luma to
-    // FIREFLY_K × its 3x3 neighborhood mean BEFORE anything accumulates, so
+    // FIREFLY_K × its 8-NEIGHBOR ring mean BEFORE anything accumulates, so
     // one sun-glint outlier (the bridge's F0 demodulation amplifies specular
     // 25×+) can neither seed the slow history nor inflate the Welford m2
     // that sizes its OWN clamp box (the box-as-wide-as-the-outlier failure —
     // m2 sees the clamped sample automatically because frd_accumulate
-    // computes it from x). Radiance lanes only — .w is the hit-dist guide.
-    // Edge texels replicate (clamped coords); the mean includes the center,
-    // so an isolated glint beside pure sky clamps to (8/9)·luma at worst.
+    // computes it from x). THE CENTER IS EXCLUDED from the mean, and that
+    // exclusion is the teeth: with the center in, a lone outlier's own
+    // contribution dominates its cap (cap ≈ (K/9)·L asymptotically — an 11%
+    // trim at K=8 however extreme the outlier), where the ring mean crushes
+    // it to K× its surround while a REAL multi-pixel glint (whose ring
+    // carries glint values) survives proportionally. Radiance lanes only —
+    // .w is the hit-dist guide. Edge texels replicate (clamped coords).
+    // Known-accept: a genuinely isolated 1-px highlight attenuates hard — at
+    // 1 spp it is indistinguishable from a firefly, and the spatial passes
+    // rebuild it from the ring.
     if ((flags & 2u) != 0u) {
         float md = 0.0, ms = 0.0;
         [unroll]
         for (int dy = -1; dy <= 1; dy++) {
             [unroll]
             for (int dx = -1; dx <= 1; dx++) {
+                if (dx == 0 && dy == 0) continue;
                 int2 np = clamp(
                     int2(p) + int2(dx, dy), int2(0, 0), int2(int(rw) - 1, int(rh) - 1));
                 md += in_diff[np].x;
                 ms += in_spec[np].x;
             }
         }
-        din.xyz *= frd_firefly_scale(din.x, md * (1.0 / 9.0));
-        sin_.xyz *= frd_firefly_scale(sin_.x, ms * (1.0 / 9.0));
+        din.xyz *= frd_firefly_scale(din.x, md * (1.0 / 8.0));
+        sin_.xyz *= frd_firefly_scale(sin_.x, ms * (1.0 / 8.0));
     }
 
     // Reprojection: the wire MV IS the fetch offset (prev − cur, pixels).
@@ -169,9 +187,66 @@ void cs_frd_temporal(uint3 id : SV_DispatchThreadID) {
     float2 q = float2(p) + 0.5 + mv.xy;
     float z_expect = z + mv.z;
 
+    // v1.5 SPECULAR VIRTUAL MOTION (flag bit 2, FR_FRD_VMOTION=off is the
+    // repro arm): a mirror pixel's CONTENT is the virtual image at
+    // t_surf + t_r along the primary ray, which under camera TRANSLATION
+    // moves at a different screen velocity than the surface (pure rotation
+    // the surface MV already handles — both points share the ray through
+    // the unmoved origin). The DELTA form — project the surface point AND
+    // the virtual point through the SAME prev world→clip and add only
+    // their difference to the measured-MV q — cancels jitter/convention
+    // offsets to first order; a parked camera's sub-VM_DEADZONE2 fp
+    // residue snaps to exactly 0 (keeping the integer-aligned-foot fast
+    // path). t_r comes back off the wire's normalized hit-dist
+    // (frd_hitdist_denorm_factor — exact below saturation; a saturated
+    // big-far sky reflection underestimates t_r, degrading toward the
+    // surface fetch: coarser, never wrong-signed). t_r ≥ VM_FAR_K·far
+    // takes the rotation-only sky limit (project the DIRECTION, w = 0 —
+    // never exact far, the f16 sky-compare lesson); roughness fades the
+    // COORDINATE toward the surface (one fetch, never two); a projection
+    // behind the prev image plane takes delta 0 — the humble arm.
+    float2 q_spec = q;
+    float vm_par = 0.0;
+    float vm_slack = 1.0;
+    bool vm_live = false;
+    float t_r = sin_.w * frd_hitdist_denorm_factor(z, rough);
+    float vm_w = 1.0 - smoothstep(FRD_VM_ROUGH_LO, FRD_VM_ROUGH_HI, rough);
+    if ((flags & 4u) != 0u && t_r > 0.0 && vm_w > 0.0) {
+        float ndx = (float(p.x) + 0.5) * (2.0 / float(rw)) - 1.0;
+        float ndy = 1.0 - (float(p.y) + 0.5) * (2.0 / float(rh));
+        float3 du = normalize(cam_fwd + cam_rgt * ndx + cam_up * ndy);
+        float ray_t = z / dot(du, cam_fwd);
+        float3 hit_p = cam_org + du * ray_t;
+        float4 ps = mul(vm_m, float4(hit_p, 1.0));
+        float4 pv = t_r >= FRD_VM_FAR_K * cam_far
+            ? mul(vm_m, float4(du, 0.0))
+            : mul(vm_m, float4(cam_org + du * (ray_t + t_r), 1.0));
+        if (ps.w > 1e-6 && pv.w > 1e-6) {
+            float2 spx = float2(
+                (ps.x / ps.w + 1.0) * 0.5 * float(rw), (1.0 - ps.y / ps.w) * 0.5 * float(rh));
+            float2 vpx = float2(
+                (pv.x / pv.w + 1.0) * 0.5 * float(rw), (1.0 - pv.y / pv.w) * 0.5 * float(rh));
+            float2 d = vpx - spx;
+            if (dot(d, d) < FRD_VM_DEADZONE2) {
+                d = 0.0;
+            }
+            float2 appl = d * vm_w;
+            q_spec = q + appl;
+            // The MEASURED parallax replaces the crude cam_step/z term for
+            // this pixel: |virtual − surface| px back to radians via proj —
+            // exact for translation, correctly ~0 for pure rotation, and
+            // honestly 0 for content motion (light_par carries that).
+            vm_par = length(d) / max(proj, 1e-4);
+            vm_slack = 1.0 + FRD_VM_Z_SLACK * length(appl);
+            vm_live = true;
+        }
+    }
+    bool spec_shared = all(q_spec == q);
+
     // Manual bilinear over the 4 feet, each validity-tested (a hardware
     // bilinear would blend across disocclusions). Two validity ladders:
-    // diffuse (25 deg) and specular (roughness-tightened).
+    // diffuse (25 deg) and specular (roughness-tightened; a DISPLACED
+    // virtual fetch runs its own loop below).
     float4 hs_d = 0.0, hs_s = 0.0, hf_d = 0.0, hf_s = 0.0;
     float2 nprev = 0.0;
     float2 al = 0.0;
@@ -200,7 +275,7 @@ void cs_frd_temporal(uint3 id : SV_DispatchThreadID) {
             frd_decode_nr(prev_nr[fp], pn, pr);
             float nn = dot(n, pn);
             float wd = nn > ncd ? b : 0.0;
-            float ws = nn > ncs ? b : 0.0;
+            float ws = spec_shared && nn > ncs ? b : 0.0;
             // The anti-lag plane rides the same validated feet as meta
             // (one float2 load serves both signals).
             float2 alv = prev_antilag[fp];
@@ -218,6 +293,38 @@ void cs_frd_temporal(uint3 id : SV_DispatchThreadID) {
                 al.y += ws * alv.y;
                 w_s += ws;
             }
+        }
+    }
+    // The DISPLACED specular fetch (vm_live with a non-zero applied delta):
+    // its own 4-foot loop at q_spec, the widened relative-Z test (see
+    // vm_slack), and the spec normal ladder — the diffuse loop above ran
+    // untouched at q, and when q_spec == q this loop never runs (the shared
+    // loop carried spec, so the parked/rough/off arms are Stage A verbatim).
+    if (!reset && !spec_shared) {
+        float2 fq = q_spec - 0.5;
+        int2 base = int2(floor(fq));
+        float2 fr = fq - float2(base);
+        float ncs = frd_ncos_thresh(rough, true);
+        [unroll]
+        for (uint k = 0; k < 4; k++) {
+            int2 fp = base + int2(k & 1u, k >> 1);
+            if (fp.x < 0 || fp.y < 0 || fp.x >= int(rw) || fp.y >= int(rh)) continue;
+            float b = ((k & 1u) != 0u ? fr.x : 1.0 - fr.x) * ((k >> 1) != 0u ? fr.y : 1.0 - fr.y);
+            if (b == 0.0) continue;
+            float pz = prev_vz[fp];
+            // "The virtual fetch must still land on the same reflector":
+            // the foot's stored SURFACE z against our surface's expected
+            // prev z, slack-widened by the applied offset.
+            if (!frd_z_valid_slack(z_expect, pz, ndv, vm_slack)) continue;
+            float3 pn;
+            float pr;
+            frd_decode_nr(prev_nr[fp], pn, pr);
+            if (dot(n, pn) <= ncs) continue;
+            hs_s += b * prev_slow_spec[fp];
+            hf_s += b * prev_fast_spec[fp];
+            nprev.y += b * prev_meta[fp].y;
+            al.y += b * prev_antilag[fp].y;
+            w_s += b;
         }
     }
     if (w_d > 1e-4) {
@@ -244,11 +351,14 @@ void cs_frd_temporal(uint3 id : SV_DispatchThreadID) {
 
     // Accumulate. Meta stores n/63 in RG8 (cap 63 > every legal max_accum).
     Accum ad = frd_accumulate(din, hs_d, hf_d, nprev.x * 63.0, w_d, max_accum);
-    // Camera-translation parallax + the light-motion term (light_par —
-    // 2× the sun's per-frame angular delta): a parked camera under a TOD
-    // scrub has cam_step 0 while the glint slides, and no MV of any kind
-    // can express content motion — the CAP is the mechanism there.
-    float parallax = cam_step / max(z, 1e-4) + light_par;
+    // The specular parallax: the MEASURED surface-vs-virtual divergence
+    // where virtual motion ran (exact for translation, ~0 for rotation),
+    // else the crude cam_step/z term (Stage A's arm) — plus the
+    // light-motion term either way (light_par — 2× the sun's per-frame
+    // angular delta): a parked camera under a TOD scrub has cam_step 0
+    // AND zero virtual divergence while the glint slides, and no MV of any
+    // kind can express content motion — the CAP is the mechanism there.
+    float parallax = (vm_live ? vm_par : cam_step / max(z, 1e-4)) + light_par;
     float n_smax = frd_spec_max_frames(max_accum, parallax, rough);
     Accum as_ = frd_accumulate(sin_, hs_s, hf_s, nprev.y * 63.0, w_s, n_smax);
 

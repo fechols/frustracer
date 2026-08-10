@@ -7976,6 +7976,13 @@ fn run_check_gpu(
                                     cam_step: 0.0,
                                     cam_fwd: [0.0, 0.0, 1.0],
                                     light_par: 0.0,
+                                    // All-zero matrix = the virtual-motion
+                                    // humble arm everywhere (F3 is the
+                                    // passthrough control — nothing runs).
+                                    vm_m: [0.0; 16],
+                                    cam_org: [0.0; 3],
+                                    cam_rgt: [1.0, 0.0, 0.0],
+                                    cam_up: [0.0, 1.0, 0.0],
                                 },
                             );
                             r3 = ptg.record_nrd_out(l, 0);
@@ -8309,6 +8316,16 @@ fn run_check_gpu(
                         let (f4_near, f4_far) = dlss::near_far(scene.diag);
                         let f4_mats = dlss::cam_matrices(&cam_b, pw, ph, f4_near, f4_far);
                         let f4_proj = f4_mats.view_to_clip.y_axis.y * ph as f32 * 0.5;
+                        // The REAL parked pose's virtual-motion inputs
+                        // (prev == cur camera): every delta lands under the
+                        // dead-zone and snaps to 0, so F4 runs Stage A's
+                        // exact path while still exercising the vm block.
+                        let f4_fwd = cam_b.forward();
+                        let f4_rgt = f4_fwd.cross(Vec3A::Y).normalize();
+                        let f4_up = f4_rgt.cross(f4_fwd);
+                        let f4_tanh = (cam_b.fov_y * 0.5).tan();
+                        let f4_vm =
+                            (f4_mats.view_to_clip * f4_mats.world_to_view).to_cols_array();
                         let mut frames: Vec<Vec<u8>> = Vec::new();
                         let mut input7: Vec<u8> = Vec::new();
                         let mut f4_fail = false;
@@ -8336,7 +8353,8 @@ fn run_check_gpu(
                             let sub = hg.run(|l| {
                                 ptg.record_wavefront(l, 0, &fp, false);
                                 r1 = ptg.record_nrd_pack(l, 0);
-                                // Parked pose: cam step 0, fwd inert, static sun.
+                                // Parked pose: cam step 0, static sun, the
+                                // real basis + matrices (vm deltas snap 0).
                                 r2 = fg.record(
                                     l,
                                     0,
@@ -8345,8 +8363,14 @@ fn run_check_gpu(
                                         far: f4_far,
                                         proj: f4_proj,
                                         cam_step: 0.0,
-                                        cam_fwd: [0.0, 0.0, 1.0],
+                                        cam_fwd: f4_fwd.to_array(),
                                         light_par: 0.0,
+                                        vm_m: f4_vm,
+                                        cam_org: cam_b.pos.to_array(),
+                                        cam_rgt: (f4_rgt
+                                            * (f4_tanh * pw as f32 / ph as f32))
+                                            .to_array(),
+                                        cam_up: (f4_up * f4_tanh).to_array(),
                                     },
                                 );
                                 r3 = ptg.record_nrd_out(l, 0);

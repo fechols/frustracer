@@ -32,6 +32,12 @@ static const float FRD_N_COS_SPEC_SMOOTH = 0.998;
 static const float FRD_SPEC_PARALLAX_K = 30.0;
 static const float FRD_RANGE_K = 0.999;
 static const float FRD_FIREFLY_K = 8.0;
+// v1.5 specular virtual motion (frd.rs VM_* twins).
+static const float FRD_VM_FAR_K = 0.99;
+static const float FRD_VM_ROUGH_LO = 0.25;
+static const float FRD_VM_ROUGH_HI = 0.6;
+static const float FRD_VM_Z_SLACK = 0.05;
+static const float FRD_VM_DEADZONE2 = 2.5e-3;
 
 // The wire's enc-2 normal+roughness decode (nrd_pack_nr's inverse — the
 // nrd.rs::oracle decode twin): L1-octahedral xy, SIGNED roughness in z.
@@ -50,6 +56,17 @@ bool frd_z_valid(float z_expect, float z_prev, float ndv) {
     float scale = max(max(abs(z_expect), abs(z_prev)), 1e-6);
     float rel = abs(z_prev - z_expect) / scale;
     return rel < FRD_Z_EPS / max(ndv, 0.1);
+}
+
+// oracle::disocclusion_z_valid_slack — the VIRTUAL foot's widened test
+// (slack = 1 + VM_Z_SLACK · |applied offset px|): a grazing planar mirror's
+// reflector depth varies along the plane, so a far-displaced virtual foot
+// needs proportionally more relative-Z tolerance or every mirror fetch
+// history-restarts. slack 1.0 IS frd_z_valid exactly.
+bool frd_z_valid_slack(float z_expect, float z_prev, float ndv, float slack) {
+    float scale = max(max(abs(z_expect), abs(z_prev)), 1e-6);
+    float rel = abs(z_prev - z_expect) / scale;
+    return rel < FRD_Z_EPS * slack / max(ndv, 0.1);
 }
 
 // oracle::normal_cos_threshold.

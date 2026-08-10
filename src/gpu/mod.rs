@@ -3940,6 +3940,12 @@ impl GpuContext {
                         }
                         _ => 0.0,
                     };
+                    // v1.5 virtual motion: the prev world→clip (the SAME
+                    // matrices the wire MV was built from) + this frame's
+                    // CamBasis pre-scaled basis (the ngxfg_guides
+                    // convention — fc.right/up are unit).
+                    let tanh = (fc.fov_y * 0.5).tan();
+                    let vm = pm.view_to_clip * pm.world_to_view;
                     fg.record(
                         list,
                         slot,
@@ -3950,6 +3956,10 @@ impl GpuContext {
                             cam_step: step,
                             cam_fwd: fwd.to_array(),
                             light_par,
+                            vm_m: vm.to_cols_array(),
+                            cam_org: fc.pos.to_array(),
+                            cam_rgt: (fc.right * (tanh * fc.aspect)).to_array(),
+                            cam_up: (fc.up * tanh).to_array(),
                         },
                     )
                 }
