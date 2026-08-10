@@ -56,9 +56,15 @@ cbuffer FrdCb : register(b0) {
 // zero-neighbor pixel degrades to passthrough (the kernel is total).
 // `inv_h` = 0 disables the spec hit-dist term (a diffuse tap's v.w then
 // contributes exactly 0 — the wire keeps it finite).
+// `guard` arms the v1.5.5(d) luma-ratio tap guard below: spec passes true
+// always; diffuse passes false under the GI fold (flags bit 5), because
+// there the bright taps ARE the signal — a sparse 1-spp emissive bounce
+// sample becomes a pool exactly by the disk spreading it, and the bilateral
+// z/normal terms already keep the spread surface-local. The guarded arm is
+// today's expression verbatim (the F3/F4 bitwise contract).
 float4 frd_disk(
     Texture2D<float4> src, uint2 p, float4 center, float radius, float z, float3 n,
-    float pw, float inv_z, float inv_h, float cr, float sr
+    float pw, float inv_z, float inv_h, float cr, float sr, bool guard
 ) {
     if (radius < 0.5) {
         return center;
@@ -89,10 +95,12 @@ float4 frd_disk(
         // TAP_LUMA_K× of the center pass with factor EXACTLY 1.0 (every
         // ordinary field is bitwise — the F3/F4 contract), brighter taps
         // contribute at most K× the center's luma.
-        float tl = v.x;
-        float cl = center.x;
-        w *= min(1.0, FRD_TAP_LUMA_K * (cl + FRD_TAP_LUMA_EPS)
-                          / max(tl + FRD_TAP_LUMA_EPS, 1e-20));
+        if (guard) {
+            float tl = v.x;
+            float cl = center.x;
+            w *= min(1.0, FRD_TAP_LUMA_K * (cl + FRD_TAP_LUMA_EPS)
+                              / max(tl + FRD_TAP_LUMA_EPS, 1e-20));
+        }
         sum += w * v;
         wsum += w;
     }
@@ -153,11 +161,13 @@ void cs_frd_blur(uint3 id : SV_DispatchThreadID) {
     }
     float sr, cr;
     sincos(frd_disk_rot(p, frame, salt), sr, cr);
+    bool guard_d = (flags & 32u) == 0u; // GI fold: diffuse taps ride unguarded
     b_out_diff[p] = frd_disk(
-        b_src_diff, p, ad, c.r_d * pass_scale, c.z, c.n, FRD_N_POW_DIFF, c.inv_z, 0.0, cr, sr);
+        b_src_diff, p, ad, c.r_d * pass_scale, c.z, c.n, FRD_N_POW_DIFF, c.inv_z, 0.0, cr, sr,
+        guard_d);
     b_out_spec[p] = frd_disk(
         b_src_spec, p, as_, c.r_s * pass_scale, c.z, c.n, c.pw_s, c.inv_z,
-        frd_inv_h_scale(as_.w), cr, sr);
+        frd_inv_h_scale(as_.w), cr, sr, true);
 }
 
 [numthreads(FRD_GBX, FRD_GBY, 1)]
@@ -177,11 +187,13 @@ void cs_frd_post(uint3 id : SV_DispatchThreadID) {
     }
     float sr, cr;
     sincos(frd_disk_rot(p, frame, salt), sr, cr);
+    bool guard_d = (flags & 32u) == 0u; // GI fold: diffuse taps ride unguarded
     float4 od = frd_disk(
-        b_src_diff, p, ad, c.r_d * pass_scale, c.z, c.n, FRD_N_POW_DIFF, c.inv_z, 0.0, cr, sr);
+        b_src_diff, p, ad, c.r_d * pass_scale, c.z, c.n, FRD_N_POW_DIFF, c.inv_z, 0.0, cr, sr,
+        guard_d);
     float4 os = frd_disk(
         b_src_spec, p, as_, c.r_s * pass_scale, c.z, c.n, c.pw_s, c.inv_z,
-        frd_inv_h_scale(as_.w), cr, sr);
+        frd_inv_h_scale(as_.w), cr, sr, true);
     // Fast-history clamp, once the fast EMA is trustworthy (n past the fast
     // window): box the radiance lanes to fast ± kσ (the .w hit-dist lane is
     // not radiance — never clamped). The clamped value is ALSO what feeds

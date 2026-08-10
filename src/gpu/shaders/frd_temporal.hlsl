@@ -51,6 +51,7 @@ cbuffer FrdCb : register(b0) {
     uint rw;
     uint rh;
     uint flags; // bit 0 = reset | 1 = firefly | 2 = vmotion | 3 = anti-lag | 4 = vm curvature
+                // | 5 = GI fold live (diffuse firefly/tap-guard relax)
     uint frame;
     float cam_far;
     float max_accum;   // tuning (frd.rs constants unless --frd-* moved them)
@@ -183,6 +184,19 @@ void cs_frd_temporal(uint3 id : SV_DispatchThreadID) {
     // Known-accept: a genuinely isolated 1-px highlight attenuates hard — at
     // 1 spp it is indistinguishable from a firefly, and the spatial passes
     // rebuild it from the ring.
+    // THE GI-FOLD EXEMPTION (flag bit 5, FR_FRD_GIRELAX=off is the repro
+    // arm): when the diffuse lane carries the folded RTGI bounce
+    // (shade.hlsli's FLAG_NRD_GI add), a sparse 1-spp emissive/bounce hit IS
+    // a lone outlier against a dim ring — the exact shape this clamp exists
+    // to crush — and a fixed K can never pass it (a sparse signal with hit
+    // probability p needs K >= 1/p to integrate unbiased). Diffuse therefore
+    // rides UNCLAMPED under the fold; measured (bistro night, the emissive
+    // QA campaign): the clamp cost 90%+ of the bounce-emissive pool energy.
+    // SPECULAR is untouched — the sun-glint outliers the v1.5.x campaigns
+    // fought are specular (F0-demodulated mirror chains), and diffuse
+    // magnitudes are albedo-and-cosine-bounded so the trail class can't
+    // reach it. The skip is a BRANCH, never a computed 1.0 — bitwise-inert
+    // with the bit clear.
     if ((flags & 2u) != 0u) {
         float md = 0.0, ms = 0.0;
         [unroll]
@@ -196,7 +210,8 @@ void cs_frd_temporal(uint3 id : SV_DispatchThreadID) {
                 ms += in_spec[np].x;
             }
         }
-        din.xyz *= frd_firefly_scale(din.x, md * (1.0 / 8.0));
+        if ((flags & 32u) == 0u)
+            din.xyz *= frd_firefly_scale(din.x, md * (1.0 / 8.0));
         sin_.xyz *= frd_firefly_scale(sin_.x, ms * (1.0 / 8.0));
     }
 

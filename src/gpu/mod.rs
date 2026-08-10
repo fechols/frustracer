@@ -3658,6 +3658,7 @@ impl GpuContext {
                     jitter,
                     reset,
                     self.frd_sun,
+                    d.nrd_sig() && p.q.rtgi,
                     &|| d.record_nrd_pack(&d3d.list, slot),
                     &|| d.record_nrd_out(&d3d.list, slot),
                 );
@@ -3796,6 +3797,7 @@ impl GpuContext {
                     fc.jitter,
                     fc.reset,
                     self.frd_sun,
+                    d.nrd_sig() && p.q.rtgi,
                     &|| d.record_nrd_pack(&d3d.list, slot),
                     &|| d.record_nrd_out(&d3d.list, slot),
                 );
@@ -3898,6 +3900,11 @@ impl GpuContext {
         jitter: (f32, f32),
         reset: bool,
         sun: Option<[f32; 3]>,
+        // The shade.hlsli FLAG_NRD_GI fold is live this frame (the caller's
+        // tracer nrd_sig() && the frame's RTGI arm) — the diffuse wire lane
+        // carries the folded 1-spp bounce, so FRD exempts diffuse from its
+        // firefly machinery (FrdFrame::gi_fold; NRD ignores it).
+        gi_fold: bool,
         pack: &dyn Fn() -> Result<()>,
         out: &dyn Fn() -> Result<()>,
     ) -> bool {
@@ -3974,6 +3981,7 @@ impl GpuContext {
                             cam_org: fc.pos.to_array(),
                             cam_rgt: (fc.right * (tanh * fc.aspect)).to_array(),
                             cam_up: (fc.up * tanh).to_array(),
+                            gi_fold,
                         },
                     )
                 }
@@ -4219,6 +4227,7 @@ impl GpuContext {
                     jitter,
                     reset,
                     self.frd_sun,
+                    tg.nrd_sig() && p.q.rtgi,
                     &|| tg.record_nrd_pack(&d3d.list, slot),
                     &|| tg.record_nrd_out(&d3d.list, slot),
                 );
@@ -4569,6 +4578,7 @@ impl GpuContext {
                     fc.jitter,
                     fc.reset,
                     self.frd_sun,
+                    tg.nrd_sig() && p.q.rtgi,
                     &|| tg.record_nrd_pack(&d3d.list, slot),
                     &|| tg.record_nrd_out(&d3d.list, slot),
                 );

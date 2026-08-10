@@ -164,6 +164,13 @@ pub struct FrdFrame {
     /// pre-scaling (the ngxfg_guides basis convention, verbatim).
     pub cam_rgt: [f32; 3],
     pub cam_up: [f32; 3],
+    /// The shade.hlsli FLAG_NRD_GI fold is live this frame (nrd_sig && the
+    /// frame's RTGI arm): the diffuse lane carries the folded 1-spp bounce
+    /// radiance — emissive transport included — so the firefly ring clamp
+    /// and the frd_disk tap guard EXEMPT diffuse (flags bit 5, gated by
+    /// `frd::girelax_enabled`). Harness/gate frames pass false, which is
+    /// the bitwise pre-feature arm.
+    pub gi_fold: bool,
 }
 
 pub struct FrdGpu {
@@ -200,6 +207,7 @@ pub struct FrdGpu {
     pub force_antilag: std::cell::Cell<Option<bool>>,
     pub force_vmotion: std::cell::Cell<Option<bool>>,
     pub force_curv: std::cell::Cell<Option<bool>>,
+    pub force_gi: std::cell::Cell<Option<bool>>,
     /// Native 16-bit shader ops (OPTIONS4) — the phase-D fp16 arm's probe;
     /// recorded now so the armed line names it. Phases B/C compile fp32.
     pub fp16: bool,
@@ -479,6 +487,7 @@ impl FrdGpu {
             force_antilag: std::cell::Cell::new(None),
             force_vmotion: std::cell::Cell::new(None),
             force_curv: std::cell::Cell::new(None),
+            force_gi: std::cell::Cell::new(None),
             fp16,
             rw,
             rh,
@@ -586,8 +595,12 @@ impl FrdGpu {
         // trail killer) | bit 2 = v1.5 virtual motion (FR_FRD_VMOTION=off
         // disarms) | bit 3 = anti-lag (FR_FRD_ANTILAG=off disarms) |
         // bit 4 = v1.5.1 vm curvature (FR_FRD_CURV=off disarms — the
-        // flat-mirror helmet-streak repro arm). The force_* cells are the
-        // gate hooks (F5/F6/F7/F7C).
+        // flat-mirror helmet-streak repro arm) | bit 5 = the GI fold is
+        // live this frame (f.gi_fold && FR_FRD_GIRELAX not off): the
+        // diffuse lane carries the folded RTGI bounce, so the firefly
+        // ring clamp and the frd_disk tap guard exempt diffuse — the
+        // emissive-integration fix; specular untouched either way. The
+        // force_* cells are the gate hooks (F5/F5c/F6/F7/F7C).
         let fire = self
             .force_fire
             .get()
@@ -595,11 +608,16 @@ impl FrdGpu {
         let vmot = self.force_vmotion.get().unwrap_or_else(crate::frd::vmotion_enabled);
         let alag = self.force_antilag.get().unwrap_or_else(crate::frd::antilag_enabled);
         let curv = self.force_curv.get().unwrap_or_else(crate::frd::curv_enabled);
+        let gi = self
+            .force_gi
+            .get()
+            .unwrap_or_else(|| f.gi_fold && crate::frd::girelax_enabled());
         let flags = (f.reset as u32)
             | ((fire as u32) << 1)
             | ((vmot as u32) << 2)
             | ((alag as u32) << 3)
-            | ((curv as u32) << 4);
+            | ((curv as u32) << 4)
+            | ((gi as u32) << 5);
         let cb = |pass_scale: f32, salt: u32| -> [u32; CB_DWORDS as usize] {
             let mut c = [0u32; CB_DWORDS as usize];
             let head = [

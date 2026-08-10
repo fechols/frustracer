@@ -8077,6 +8077,7 @@ fn run_check_gpu(
                                     cam_org: [0.0; 3],
                                     cam_rgt: [1.0, 0.0, 0.0],
                                     cam_up: [0.0, 1.0, 0.0],
+                                    gi_fold: false,
                                 },
                             );
                             r3 = ptg.record_nrd_out(l, 0);
@@ -8465,6 +8466,7 @@ fn run_check_gpu(
                                             * (f4_tanh * pw as f32 / ph as f32))
                                             .to_array(),
                                         cam_up: (f4_up * f4_tanh).to_array(),
+                                        gi_fold: false,
                                     },
                                 );
                                 r3 = ptg.record_nrd_out(l, 0);
@@ -8681,6 +8683,7 @@ fn run_check_gpu(
                                 cam_org: [0.0; 3],
                                 cam_rgt: [1.0, 0.0, 0.0],
                                 cam_up: [0.0, 1.0, 0.0],
+                                gi_fold: false,
                             };
                             macro_rules! frec {
                                 ($f:expr, $what:expr) => {{
@@ -8747,6 +8750,80 @@ fn run_check_gpu(
                             frec!(fframe(true, 0.0), "F5 fire-on");
                             let p_on = peak(&fout!("F5 fire-on"));
                             fg.force_fire.set(None);
+
+                            // F5c — the GI-FOLD DIFFUSE RELAX (flags bit 5,
+                            // the emissive-integration fix): a sparse bright
+                            // diffuse sample — the folded RTGI bounce hitting
+                            // an emitter — must SURVIVE integration when the
+                            // fold is live (force_gi on) and still crush when
+                            // it is not (the non-GI diffuse clamp stays live:
+                            // teeth both ways), the relaxed disk must SPREAD
+                            // its energy (the tap-guard half — the window sum
+                            // is the pool), and the SPEC OUT plane must be
+                            // BYTE-IDENTICAL across the bit flip — the
+                            // v1.5.x sun-glint machinery is untouchable by
+                            // construction, and this pin makes it structural.
+                            // Frame-index restore between arms so the disk
+                            // rotation hashes replay (the F7 idiom).
+                            macro_rules! foutd {
+                                ($what:expr) => {
+                                    match read_tex_at(
+                                        &mut hg,
+                                        fg.plane_out_diff(),
+                                        f4x,
+                                        8,
+                                        pw,
+                                        ph,
+                                        ust,
+                                    ) {
+                                        Ok(b) => b,
+                                        Err(e) => {
+                                            eprintln!("check-gpu: FAIL {} readback: {e}", $what);
+                                            return 1;
+                                        }
+                                    }
+                                };
+                            }
+                            let (cx, cy) = (211usize, 141usize);
+                            let mut df5 = flat8([0.05, 0.0, 0.0, 0.3]);
+                            df5[(cy * pw + cx) * 8..][..8]
+                                .copy_from_slice(&px8([400.0, 0.0, 0.0, 0.3]));
+                            fup!(fg.plane_in_diff(), f4x, 8, &df5, "F5c diff");
+                            let peak_d = |b: &[u8]| -> f32 {
+                                let mut m = 0f32;
+                                for y in cy - 3..=cy + 3 {
+                                    for x in cx - 3..=cx + 3 {
+                                        m = m.max(lum_at(b, x, y));
+                                    }
+                                }
+                                m
+                            };
+                            let energy_d = |b: &[u8]| -> f32 {
+                                let mut s = 0f32;
+                                for y in cy - 7..=cy + 7 {
+                                    for x in cx - 7..=cx + 7 {
+                                        s += lum_at(b, x, y);
+                                    }
+                                }
+                                s
+                            };
+                            let fi5c = fg.frame_index();
+                            fg.force_gi.set(Some(false));
+                            frec!(fframe(true, 0.0), "F5c gi-off");
+                            let d5c_off = foutd!("F5c gi-off");
+                            let s5c_off = fout!("F5c gi-off spec");
+                            fg.set_frame_index(fi5c);
+                            fg.force_gi.set(Some(true));
+                            frec!(fframe(true, 0.0), "F5c gi-on");
+                            let d5c_on = foutd!("F5c gi-on");
+                            let s5c_on = fout!("F5c gi-on spec");
+                            fg.force_gi.set(None);
+                            let (p5c_off, p5c_on) = (peak_d(&d5c_off), peak_d(&d5c_on));
+                            let (e5c_off, e5c_on) = (energy_d(&d5c_off), energy_d(&d5c_on));
+                            let s5c_match = s5c_off == s5c_on;
+                            // Restore the flat diffuse field so F5b's whole-
+                            // plane antilag pin converges on the F5a inputs.
+                            fup!(fg.plane_in_diff(), f4x, 8, &flat8([0.2, 0.0, 0.0, 0.3]), "F5c restore");
 
                             // F5b — ANTI-LAG, the CONVERGED-INERT pin: after
                             // a uniform field converges (m2 exactly 0, blur
@@ -9001,6 +9078,7 @@ fn run_check_gpu(
                                     cam_org: cam7.pos.to_array(),
                                     cam_rgt: rgt_s.to_array(),
                                     cam_up: up_s.to_array(),
+                                    gi_fold: false,
                                 };
                                 frec!(pf, "F7 probe");
                                 let b = fout!("F7");
@@ -9175,6 +9253,7 @@ fn run_check_gpu(
                                     cam_org: cam7.pos.to_array(),
                                     cam_rgt: rgt_s.to_array(),
                                     cam_up: up_s.to_array(),
+                                    gi_fold: false,
                                 };
                                 frec!(pf, "F7C probe");
                                 l7c[ai] = lum_at(&fout!("F7C"), c7x, c7y);
@@ -9258,6 +9337,8 @@ fn run_check_gpu(
 
                             println!(
                                 "check-gpu: frd F5 — firefly peak off {p_off:.1} on {p_on:.2} | \
+                                 F5c gi-relax peak off {p5c_off:.2} on {p5c_on:.1} energy \
+                                 {e5c_off:.1} -> {e5c_on:.1} spec-match {s5c_match} | \
                                  antilag conv-bad {g_conv_bad} g-min {g_min:.3} | F6 glint pre \
                                  {g6_pre:.2} fixed {:.3} brake {:.3} pre-fix {:.3} | F7 |d.x| \
                                  {:.1} px gap {gap7:.3} (pred {gap_pred:.3}) | F7C |d_sky| {:.1} \
@@ -9285,6 +9366,30 @@ fn run_check_gpu(
                                 fbad.push(format!(
                                     "F5 converged field minted {g_conv_bad} sub-1 gain bytes"
                                 ));
+                            }
+                            // F5c: the non-GI diffuse clamp is live (off arm
+                            // crushes), the GI arm carries the sample, the
+                            // relaxed disk spreads real energy, and the spec
+                            // plane is untouchable across the bit flip.
+                            if p5c_off > 2.0 {
+                                fbad.push(format!(
+                                    "F5c non-GI diffuse clamp lost its teeth ({p5c_off})"
+                                ));
+                            }
+                            if p5c_on < 10.0 {
+                                fbad.push(format!(
+                                    "F5c GI arm crushed the emissive sample ({p5c_on})"
+                                ));
+                            }
+                            if e5c_on < 3.0 * e5c_off {
+                                fbad.push(format!(
+                                    "F5c GI arm spread no pool energy ({e5c_on} vs {e5c_off})"
+                                ));
+                            }
+                            if !s5c_match {
+                                fbad.push(
+                                    "F5c spec OUT plane moved across the GI bit flip".to_string(),
+                                );
                             }
                             // F6: history existed; light_par dumped it; the
                             // brake fired on the real ghost (record half)
@@ -16030,6 +16135,10 @@ fn run_frd_lab(
                             cam_org: cam.pos.to_array(),
                             cam_rgt: (c_rgt * (tanh * pw as f32 / ph as f32)).to_array(),
                             cam_up: (c_up * tanh).to_array(),
+                            // The lab pins rtgi off (the F4 harness rule), so
+                            // the fold is structurally absent — false keeps
+                            // the smear metrics on the pre-GI-relax arm.
+                            gi_fold: false,
                         },
                     );
                     r3 = ptg.record_nrd_out(l, 0);

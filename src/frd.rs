@@ -97,6 +97,16 @@ pub const ANTILAG_E_FLOOR: f32 = 0.01;
 /// (center EXCLUDED — with the center in, a lone outlier's own contribution
 /// dominates its cap and the clamp asymptotes to a fixed (1 − K/9) trim) by
 /// at most this factor before being compressed (soft, energy-aware).
+/// A fixed K can NEVER pass a sparse stochastic signal, only bias it down:
+/// a signal with per-pixel hit probability p delivers its energy in samples
+/// of luma ~L/p against a ring mean ~L, so unbiased integration needs
+/// K >= 1/p — unbounded as p falls. That is exactly the folded RTGI
+/// bounce's emissive transport (1-spp cosine hits on emitters), which is
+/// why flags bit 5 (the GI fold, `girelax_enabled`) EXEMPTS the diffuse
+/// lane instead of raising K. Specular keeps the clamp unconditionally —
+/// the sun-glint outliers the v1.5.x campaigns fought are F0-demodulated
+/// mirror chains, a magnitude class diffuse (albedo- and cosine-bounded)
+/// cannot reach.
 pub const FIREFLY_K: f32 = 8.0;
 /// Diffuse/specular blur radius gains (world hit-dist -> pixel radius).
 pub const C_DIFF: f32 = 0.5;
@@ -369,6 +379,32 @@ pub fn vmotion_enabled() -> bool {
             false
         } else {
             eprintln!("frd: FR_FRD_VMOTION='{v}' is not `off` — virtual motion stays armed");
+            true
+        }
+    })
+}
+
+/// FR_FRD_GIRELAX=off — disarm the GI-fold diffuse relax (flags bit 5): the
+/// diffuse lane goes back under the firefly ring clamp and the frd_disk
+/// luma-ratio tap guard even when the shade.hlsli FLAG_NRD_GI fold is live —
+/// the emissive-pool-suppression repro arm (the 2026-08-10 QA campaign: the
+/// clamp cost 90%+ of the bounce-emissive pool energy in XeSS+FRD sessions).
+/// A CB flag, never a recompile; loud on departure, any other value loud +
+/// default ON. Specular is untouched by the bit in either state.
+pub fn girelax_enabled() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| {
+        let Ok(v) = std::env::var("FR_FRD_GIRELAX") else {
+            return true;
+        };
+        if v.eq_ignore_ascii_case("off") {
+            eprintln!(
+                "frd: FR_FRD_GIRELAX=off — diffuse firefly/tap-guard relax under the GI fold \
+                 disarmed (emissive-suppression repro arm)"
+            );
+            false
+        } else {
+            eprintln!("frd: FR_FRD_GIRELAX='{v}' is not `off` — the GI relax stays armed");
             true
         }
     })
