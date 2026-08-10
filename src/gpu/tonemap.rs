@@ -11,9 +11,9 @@ use windows::Win32::Graphics::Direct3D::{ID3DBlob, D3D_PRIMITIVE_TOPOLOGY_TRIANG
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
-const BLIT_HLSL: &str = include_str!("shaders/blit.hlsl");
-const TONEMAP_HLSL: &str = include_str!("shaders/tonemap.hlsl");
-const WAVEVIZ_HLSL: &str = include_str!("shaders/waveviz.hlsl");
+const BLIT_HLSL: &str = include_str!("../shaders/blit.hlsl");
+const TONEMAP_HLSL: &str = include_str!("../shaders/tonemap.hlsl");
+const WAVEVIZ_HLSL: &str = include_str!("../shaders/waveviz.hlsl");
 
 pub struct Passes {
     pub root_sig: ID3D12RootSignature,

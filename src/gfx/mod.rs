@@ -20,6 +20,26 @@
 //! one (`pub use crate::gfx::…`), so every existing call site is untouched and
 //! there is still exactly one definition. A second definition that "keeps the
 //! backends independent" is the failure mode this module exists to prevent.
+//!
+//! THE HLSL CORPUS IS SHARED AND LIVES AT `src/shaders/`, not under either
+//! backend. It moved out of `src/gpu/shaders/` once the SPIR-V spike measured
+//! what it does under `dxc -spirv`: **373 of 373 assembled units compiled and
+//! passed `spirv-val`, with zero edits to any `.hlsl`.** So the corpus is not
+//! "D3D12 shaders we will have to port" — it is one body of source with two
+//! code generators, exactly like every other row in the list above, and
+//! `src/gpu/` naming it was a statement about where the compiler lived rather
+//! than about the shaders. The Rust that ASSEMBLES it (there is no `#include`
+//! anywhere — each kernel is a concatenation plus generated `#define` blocks)
+//! is a separate question and stays in the backend until `gfx::shaders` takes
+//! it. What made the translation free is worth recording so nobody re-derives
+//! it: `-fvk-{b,t,u,s}-shift` maps HLSL register spaces onto Vulkan descriptor
+//! sets without touching a declaration, and `-fvk-use-dx-layout` keeps the
+//! 4608-byte `FrameCb` byte-compatible so ONE Rust packer serves both backends
+//! — at the cost of requiring `scalarBlockLayout` on the Vulkan device, which
+//! is core in 1.2. The one permanent exception is `workgraph.hlsl`: a
+//! `VK_AMDX_shader_enqueue` translation exists, but that extension is a vendor
+//! provisional, and the file is already a default-off env lever (`FR_WORKGRAPH`)
+//! measured as a wash — so it stays D3D12-only by choice, not by obstacle.
 
 pub mod guides;
 pub mod vocab;

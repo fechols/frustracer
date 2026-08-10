@@ -756,16 +756,16 @@ fn sw_rays_leaf() -> bool {
     sw_rays() && crate::bvh::CUT_SEED_RAYS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-const SMOKE_HLSL: &str = include_str!("shaders/smoke.hlsl");
+const SMOKE_HLSL: &str = include_str!("../shaders/smoke.hlsl");
 /// Order-2 SH irradiance, standalone (no cbuffer of its own — the coefficients
 /// are a parameter). pub(crate) because gpu/ffx_rr.rs prepends it to the FSR
 /// composite pass, which needs the SAME evaluator but binds its own 9 rows.
-pub(crate) const SH_HLSLI: &str = include_str!("shaders/sh.hlsli");
+pub(crate) const SH_HLSLI: &str = include_str!("../shaders/sh.hlsli");
 /// The FSR plane wire encodings (octahedral normals + their 10-bit quantum).
 /// pub(crate) for the same reason: feed.hlsl writes those planes and
 /// fsr_composite.hlsl reads them back, and the composite identity is exactly
 /// the claim that the two agree — so they share one copy.
-pub(crate) const FSR_WIRE_HLSLI: &str = include_str!("shaders/fsr_wire.hlsli");
+pub(crate) const FSR_WIRE_HLSLI: &str = include_str!("../shaders/fsr_wire.hlsli");
 // pub(crate): gpu/dxr.rs pastes the same prelude/shading/resolve sources
 // into its DXR library (the kernels are single-sourced on disk).
 //
@@ -773,54 +773,54 @@ pub(crate) const FSR_WIRE_HLSLI: &str = include_str!("shaders/fsr_wire.hlsli");
 // bound to it. Folding it in here rather than at each of the dozen concat sites
 // keeps the prelude one name.
 pub(crate) const TRACE_COMMON_HLSLI: &str = concat!(
-    include_str!("shaders/sh.hlsli"),
+    include_str!("../shaders/sh.hlsli"),
     "\n",
-    include_str!("shaders/trace_common.hlsli")
+    include_str!("../shaders/trace_common.hlsli")
 );
-const CTR_HLSLI: &str = include_str!("shaders/ctr.hlsli");
+const CTR_HLSLI: &str = include_str!("../shaders/ctr.hlsli");
 #[cfg(test)]
-const CONTINUATION_HLSLI: &str = include_str!("shaders/continuation.hlsli");
+const CONTINUATION_HLSLI: &str = include_str!("../shaders/continuation.hlsli");
 // Every queue consumer gets the opaque-handle ABI before LeafRec declares
 // TraversalFrontier. Keeping this one concatenation site prevents a shader
 // unit from accidentally compiling a different producer/consumer contract.
 const QUEUES_HLSLI: &str = concat!(
-    include_str!("shaders/continuation.hlsli"),
+    include_str!("../shaders/continuation.hlsli"),
     "\n",
-    include_str!("shaders/queues.hlsli")
+    include_str!("../shaders/queues.hlsli")
 );
-const FRUSTUM_HLSLI: &str = include_str!("shaders/frustum.hlsli");
+const FRUSTUM_HLSLI: &str = include_str!("../shaders/frustum.hlsli");
 // The 8-wide frustum tree's bound_query/refine_cut, `#ifdef FTREE`-guarded —
 // pasted right after FRUSTUM_HLSLI (whose binary halves are `#ifndef FTREE`);
 // the ftree_defs prelude picks the structure per session.
-const FTREE_HLSLI: &str = include_str!("shaders/ftree.hlsli");
+const FTREE_HLSLI: &str = include_str!("../shaders/ftree.hlsli");
 /// pub for gpu/dxr.rs: FR_DXR_INLINE pastes the inline-RayQuery primitives
 /// into the DXR library in place of rt_dxr.hlsli's TraceRay flavors.
-pub const RT_HLSLI: &str = include_str!("shaders/rt.hlsli");
+pub const RT_HLSLI: &str = include_str!("../shaders/rt.hlsli");
 /// bvh.rs's traversal loops in HLSL — pasted IN PLACE of RT_HLSLI into every
 /// ray-shooting wavefront unit when --sw-rays is armed (same three primitive
 /// signatures + the opaque trace_closest_frontier), so rays traverse the
 /// software BVH and leaf primaries seed from the tile's node cut.
-const RT_SW_HLSLI: &str = include_str!("shaders/rt_sw.hlsli");
+const RT_SW_HLSLI: &str = include_str!("../shaders/rt_sw.hlsli");
 /// The water ripple FIELD, pasted immediately ahead of SHADE_HLSLI at every
 /// site (shade.hlsli's `ripple_normal` calls into it). Its own file because
 /// the fxc frame-generation guide kernel pastes it too — see ngxfg_guides.rs.
-pub(crate) const RIPPLE_HLSLI: &str = include_str!("shaders/ripple.hlsli");
-pub(crate) const SHADE_HLSLI: &str = include_str!("shaders/shade.hlsli");
-const HEMI_HLSLI: &str = include_str!("shaders/hemi.hlsli");
-const REFERENCE_HLSL: &str = include_str!("shaders/reference.hlsl");
-pub(crate) const RESOLVE_HLSL: &str = include_str!("shaders/resolve.hlsl");
-const WAVEFRONT_HLSL: &str = include_str!("shaders/wavefront.hlsl");
-const SKY_HLSL: &str = include_str!("shaders/sky.hlsl");
-pub(crate) const SKYLOD_HLSLI: &str = include_str!("shaders/skylod.hlsli");
-const LEAF_HLSL: &str = include_str!("shaders/leaf.hlsl");
-const HEMI_WAVE_HLSL: &str = include_str!("shaders/hemi_wave.hlsl");
-const HEMI_LEAF_HLSL: &str = include_str!("shaders/hemi_leaf.hlsl");
-const COMPOSE_HLSL: &str = include_str!("shaders/compose.hlsl");
-pub(crate) const FEED_HLSL: &str = include_str!("shaders/feed.hlsl");
-const NPPD_HLSL: &str = include_str!("shaders/nppd.hlsl");
-pub(crate) const NRD_BRIDGE_HLSL: &str = include_str!("shaders/nrd_bridge.hlsl");
-const WAVEPROBE_HLSL: &str = include_str!("shaders/waveprobe.hlsl");
-const WORKGRAPH_HLSL: &str = include_str!("shaders/workgraph.hlsl");
+pub(crate) const RIPPLE_HLSLI: &str = include_str!("../shaders/ripple.hlsli");
+pub(crate) const SHADE_HLSLI: &str = include_str!("../shaders/shade.hlsli");
+const HEMI_HLSLI: &str = include_str!("../shaders/hemi.hlsli");
+const REFERENCE_HLSL: &str = include_str!("../shaders/reference.hlsl");
+pub(crate) const RESOLVE_HLSL: &str = include_str!("../shaders/resolve.hlsl");
+const WAVEFRONT_HLSL: &str = include_str!("../shaders/wavefront.hlsl");
+const SKY_HLSL: &str = include_str!("../shaders/sky.hlsl");
+pub(crate) const SKYLOD_HLSLI: &str = include_str!("../shaders/skylod.hlsli");
+const LEAF_HLSL: &str = include_str!("../shaders/leaf.hlsl");
+const HEMI_WAVE_HLSL: &str = include_str!("../shaders/hemi_wave.hlsl");
+const HEMI_LEAF_HLSL: &str = include_str!("../shaders/hemi_leaf.hlsl");
+const COMPOSE_HLSL: &str = include_str!("../shaders/compose.hlsl");
+pub(crate) const FEED_HLSL: &str = include_str!("../shaders/feed.hlsl");
+const NPPD_HLSL: &str = include_str!("../shaders/nppd.hlsl");
+pub(crate) const NRD_BRIDGE_HLSL: &str = include_str!("../shaders/nrd_bridge.hlsl");
+const WAVEPROBE_HLSL: &str = include_str!("../shaders/waveprobe.hlsl");
+const WORKGRAPH_HLSL: &str = include_str!("../shaders/workgraph.hlsl");
 
 /// What the GPU tracer requires, queried once. RayQuery in compute needs
 /// RaytracingTier 1.1 AND shader model 6.5; missing either is a clean
@@ -8860,8 +8860,8 @@ mod empty_bvh_shader_source_tests {
 mod height_interval_shader_source_tests {
     use super::{RT_HLSLI, TRACE_COMMON_HLSLI};
 
-    const RT_DXR_HLSLI: &str = include_str!("shaders/rt_dxr.hlsli");
-    const DXR_HLSL: &str = include_str!("shaders/dxr.hlsl");
+    const RT_DXR_HLSLI: &str = include_str!("../shaders/rt_dxr.hlsli");
+    const DXR_HLSL: &str = include_str!("../shaders/dxr.hlsl");
 
     /// Relief displacement is bounded in world-normal distance, not in ray t.
     /// Pin the shader-side half of the grazing-interval regression without

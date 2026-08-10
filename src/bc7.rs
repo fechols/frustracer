@@ -8,7 +8,7 @@
 //! # Two encoder arms (`Bc7Mode`)
 //!
 //! The DEFAULT arm is the GPU compute encoder (`gpu/bc7gpu.rs` +
-//! `gpu/shaders/bc7enc.hlsl`, mode-6): it runs at scene-upload time on the
+//! `shaders/bc7enc.hlsl`, mode-6): it runs at scene-upload time on the
 //! session's own device, which is what made default-on affordable — the ispc
 //! CPU encode below is ~20 s for Intel Sponza at `fast`, and there is
 //! deliberately no BC7 disk cache. `--bc7-cpu` keeps this module's ispc path

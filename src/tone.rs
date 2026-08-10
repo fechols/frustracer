@@ -3,7 +3,7 @@
 //! GPU.
 //!
 //! Before this module the curve `(1 - exp(-c))^(1/2.2)` was open-coded in three
-//! places (`render::present_px`, `gpu/shaders/tonemap.hlsl`, and the screenshot
+//! places (`render::present_px`, `shaders/tonemap.hlsl`, and the screenshot
 //! readback). All three now route here, and the HLSL is a term-for-term port
 //! gated against this math by `--check-gpu` — the `nppd.hlsl` / `feed.hlsl`
 //! twin-gate pattern.

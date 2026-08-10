@@ -3,7 +3,7 @@
 //!
 //! `SceneGpu` USED to build ONE BLAS over `scene.indices` in order plus a single
 //! identity-instance TLAS, which is what made `PrimitiveIndex() == tri` true on
-//! both GPU intersectors (see `gpu/shaders/rt.hlsli`'s header). This module is
+//! both GPU intersectors (see `shaders/rt.hlsli`'s header). This module is
 //! the other end of that trade, and now the DEFAULT: the driver's structure is
 //! addressable at BVH-subtree granularity — every chunk IS a BVH node, so a node
 //! cut has instances to talk to — at the price of one indirection per hit.

@@ -182,7 +182,7 @@ pub fn quant_unorm(v: f32, bits: u32) -> f32 {
 
 // ---------------------------------------------------------------------------
 // Signal split + composite (the correctness core; the composite identity is
-// gated by --check-fsr and mirrored by gpu/shaders/composite.hlsl).
+// gated by --check-fsr and mirrored by shaders/composite.hlsl).
 // ---------------------------------------------------------------------------
 
 pub struct Signals {

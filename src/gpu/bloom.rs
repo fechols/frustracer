@@ -17,7 +17,7 @@ use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
-const BLOOM_HLSL: &str = include_str!("shaders/bloom.hlsl");
+const BLOOM_HLSL: &str = include_str!("../shaders/bloom.hlsl");
 
 /// Must match `bloom::LEVELS`.
 pub const LEVELS: usize = crate::bloom::LEVELS;

@@ -33,9 +33,9 @@ use windows::core::{Interface, PCWSTR};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT;
 
-const RT_DXR_HLSLI: &str = include_str!("shaders/rt_dxr.hlsli");
-const DXR_HLSL: &str = include_str!("shaders/dxr.hlsl");
-const DXR_SHADE_HLSL: &str = include_str!("shaders/dxr_shade.hlsl");
+const RT_DXR_HLSLI: &str = include_str!("../shaders/rt_dxr.hlsli");
+const DXR_HLSL: &str = include_str!("../shaders/dxr.hlsl");
+const DXR_SHADE_HLSL: &str = include_str!("../shaders/dxr_shade.hlsl");
 
 const IDENT: usize = D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as usize; // 32
 /// Table starts are 64-aligned (D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT);

@@ -1,6 +1,6 @@
 //! CPU mirrors of the frame-generation guide pass's reprojection math.
 //!
-//! These are the Rust twins of `cs_guides` (`gpu/shaders/` via
+//! These are the Rust twins of `cs_guides` (`shaders/` via
 //! `gpu/ngxfg_guides.rs`) — pure `glam`, no device, no resource, no API. They
 //! live here because they are CROSS-PINNED from two directions and one of the
 //! pinners is platform-neutral: `frd::oracle`'s virtual-motion family checks

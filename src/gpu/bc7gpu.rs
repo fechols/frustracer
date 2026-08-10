@@ -26,7 +26,7 @@ use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
 
-const BC7ENC_HLSL: &str = include_str!("shaders/bc7enc.hlsl");
+const BC7ENC_HLSL: &str = include_str!("../shaders/bc7enc.hlsl");
 
 /// The kernel's effort tier for an ispc `Quality` name: 0 = mode-6 PCA fit,
 /// no refinement; 1 = + 2 least-squares rounds + CONDITIONAL mode-1 (top-4
