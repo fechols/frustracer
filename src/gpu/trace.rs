@@ -4662,277 +4662,37 @@ impl TraceGpu {
         let root_sig = create_root_signature(device)?;
         let cmd_sig = create_dispatch_signature(device)?;
 
-        // Alpha-masked scenes compile the cutout candidate loops into the
-        // trace primitives (rt.hlsli); height-carrying scenes likewise
-        // compile the relief march in (runtime-gated by FLAG_HEIGHT — the V
-        // toggle); transmissive scenes compile transmit_q's tinted candidate
-        // loop in (TRANS_SHADOW). Scenes with none compile the FORCE_OPAQUE
-        // originals verbatim (modulo leading blank lines) — procedural/stress
-        // sessions are structurally untouched (the bit gates rely on that).
-        // Dev cost-attribution ablations ride `abl_defs()`, which dxr.rs pastes
-        // too so the two arms stay comparable.
-        let empty_def = empty_defs(scene);
-        // SWAY_MV: suppressed under --sw-rays — the software rays render the
-        // REST pose, so sway MVs would describe motion that is not on screen
-        // (sway_defs' doc). DXR takes the same predicate verbatim.
-        //
-        // The argument is the UPLOADED ring's existence, read off `SceneGpu`
-        // here rather than re-derived from the partition/lever/split chain:
-        // the define and the resource it describes have to be ONE decision
-        // (the `non_opaque` discipline), and the assembly is portable now, so
-        // the fact travels to it as a bool instead of the backend type.
-        let sway_def = if sw_rays() { "" } else { sway_defs(scene_gpu.sway.is_some()) };
-        let defs = format!(
-            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
-            empty_def,
-            alpha_defs(scene),
-            height_defs(scene),
-            trans_defs(scene),
-            cand_defs(vendor),
-            blas_defs(),
-            sway_def,
-            abl_defs(),
-            rtgi_defs()
-        );
-        let defs = defs.as_str();
-        // The session's frustum structure: `#define FTREE` swaps frustum.hlsli's
-        // binary bound_query/refine_cut for ftree.hlsli's wide bodies (same
-        // signatures — the call sites don't know), and the FNode array uploads
-        // at t0 in place of the binary nodes. --no-ftree keeps the binary path.
-        let ftree_on = crate::ftree::FTREE_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
-        let ft_defs = if ftree_on { "#define FTREE 1" } else { "" };
-        // The per-lane frustum stack depth — the tracer's ONLY groupshared, and
-        // therefore the only thing that can cap resident GROUPS in the level and
-        // hemi kernels, which RGA shows are nowhere near VGPR-limited
-        // (cs_level_wide 54 VGPR against cs_leaf's 216). Injected into exactly
-        // the units that paste frustum.hlsli; the work graph inherits it through
-        // wavefront_src. See lane_stack() before sweeping it.
-        let ls_defs = format!("#define LANE_STACK {}u{}", lane_stack(), stack_layout_def());
-        let ls_defs = ls_defs.as_str();
-        // The cbuffer's jitter-table size (--spp) — every unit sees the cbuffer.
-        let sd = spp_defs();
-        let sd = sd.as_str();
-        // The detail strength knobs — every unit that pastes SHADE_HLSLI.
-        let dd = detail_defs();
-        let dd = dd.as_str();
-        // --sw-rays: rt_sw.hlsli pastes in place of rt.hlsli in every
-        // ray-shooting unit (leaf x2, reference, hemi_wave, hemi_leaf); the
-        // wavefront unit gets the SW_RAYS define too (level_finish's leaf-cut
-        // translation arm). SW_TRAV_STACK rides in from bvh::TRAV_STACK so
-        // the HLSL stacks stay in lockstep with the build's max_depth assert.
-        let sw_on = sw_rays();
-        let rt_src: &str = if sw_on { RT_SW_HLSLI } else { RT_HLSLI };
-        let sw_defs = if sw_on {
-            format!(
-                "#define SW_RAYS 1\n#define SW_TRAV_STACK {}u",
-                crate::bvh::TRAV_STACK
-            )
-        } else {
-            String::new()
-        };
-        let sw_defs = sw_defs.as_str();
-        // The leaf unit's cut consumption composes with --no-cut-rays exactly
-        // as the CPU's intersect_multi short-circuit does: software traversal
-        // from the root, the scalar t_start kept. The wavefront unit shares
-        // the define (level_finish's leaf-cut translation compiles only when
-        // the leaf actually consumes it).
-        let sw_leaf_defs = if sw_rays_leaf() { "#define SW_RAYS_LEAF 1" } else { "" };
-        // Snapshot the cloud-cache levers ONCE: the kernels below are compiled
-        // against these values and the buffers sized against them, and every
-        // per-frame record path reads the stored fields — so a mid-process A/B
-        // that flips the static between two constructions can never desync a
-        // kernel from its fill dispatch (the device-hang class record_cloud_shadow
-        // documents).
-        let cloud_shadow_v = cloud_shadow_n();
-        let sky_lod_v = sky_lod();
-        // The cloud-shadow cache is compiled into every unit that shades (leaf,
-        // reference) plus the unit that fills it (sky). wavefront/hemi get 0 and
-        // keep the exact per-pixel expression — they must not declare u6, which
-        // is the tile queue there. (DXR compiles it in through its own assembly.)
-        let csn = format!("#define CLOUD_SHADOW_N {cloud_shadow_v}");
-        // The sky-lod lattice defines, shared by the sky-fill unit, both leaf
-        // kernels, AND the reference kernel — so reference's sky pixels compose
-        // through the identical `sky_radiance_lod` and the exact-zero
-        // wavefront-vs-reference image A/B stays bit-identical at the default-ON
-        // K. SKY_UNIT is a harmless no-op in a unit that pastes no queues.hlsli
-        // (reference), where u5 is free anyway.
-        let sky_lod_defs = format!(
-            "#define SKY_UNIT 1\n#define SKY_LOD {sky_lod_v}\n#define SKY_LOD_LOG {}",
-            sky_lod_v.trailing_zeros()
-        );
-        // The reference kernel swaps to rt_sw with the wavefront: the
-        // exact-zero wavefront-vs-reference gates require ONE intersector on
-        // both sides (the "same intersector, same seeds" contract). It also
-        // reads the cloud lattice (SKYLOD_HLSLI at u5, filled by record_sky_lod)
-        // and the cloud-shadow cache (csn, filled by record_cloud_shadow), so it
-        // shades sky exactly as the leaf kernel does.
-        // WIDTH_PROBE defines, pushed CONDITIONALLY into every unit below —
-        // never as an empty join element (the feed-unit byte-identity rule):
-        // unarmed assemblies must be byte-identical to the pre-lever sources.
-        let wd = width_defs();
-        let bd = ballast_defs();
-        let wv = waveviz_defs();
-        let mut reference_parts: Vec<&str> = Vec::new();
-        if !wd.is_empty() {
-            reference_parts.push(wd.as_str());
-        }
-        if !bd.is_empty() {
-            reference_parts.push(bd.as_str());
-        }
-        if !wv.is_empty() {
-            reference_parts.push(wv.as_str());
-        }
-        reference_parts.extend([
-            csn.as_str(),
-            sky_lod_defs.as_str(),
-            defs,
-            sw_defs,
-            sd,
-            dd,
-            TRACE_COMMON_HLSLI,
-            SKYLOD_HLSLI,
-            rt_src,
-            RIPPLE_HLSLI,
-            SHADE_HLSLI,
-            REFERENCE_HLSL,
-        ]);
-        let reference_src = reference_parts.join("\n");
-        // The waveviz overlay deliberately does NOT live in this resolve
-        // unit any more: it composites at the present funnel (tonemap.rs's
-        // waveviz PSO), which is what makes it work under every upscaler —
-        // the resolve runs only on the plain arms.
-        let resolve_src = [sd, TRACE_COMMON_HLSLI, RESOLVE_HLSL].join("\n");
-        let (sky_group, sky_split) = (SKY_GROUP, SKY_SPLIT);
-        let sky_defs = format!(
-            "#define SKY_GROUP {sky_group}\n#define SKY_SPLIT {sky_split}\n#define LEAF_TILE {}",
-            crate::render::leaf_tile()
-        );
-        let wavefront_ablation_defs = wavefront_ablation_defs();
-        let mut wavefront_parts: Vec<&str> = Vec::new();
-        if !wd.is_empty() {
-            wavefront_parts.push(wd.as_str());
-        }
-        wavefront_parts.extend([
-            sky_defs.as_str(),
-            wavefront_ablation_defs.as_str(),
-            empty_def,
-            ft_defs,
-            ls_defs,
-            sw_defs,
-            sw_leaf_defs,
-            sd,
-            TRACE_COMMON_HLSLI,
-            CTR_HLSLI,
-            QUEUES_HLSLI,
-            FRUSTUM_HLSLI,
-            FTREE_HLSLI,
-            WAVEFRONT_HLSL,
-        ]);
-        let wavefront_src = wavefront_parts.join("\n");
-        // The sky fill is its own unit so `cloud_lod` can take u5 (SKY_UNIT
-        // suppresses queues.hlsli's tile-queue declarations there). Assembled by
-        // the shared `sky_unit_src` so the DXR pipeline's fill kernels cannot
-        // drift from these.
-        let sky_src = sky_unit_src(sky_lod_v, cloud_shadow_v);
-        // Two leaf kernels from the one source. `fb_mode` is a cbuffer value,
-        // so leaving the hemi arm as a runtime branch inlines shade_split at
-        // both call sites and the kernel's register allocation is the MAX of
-        // the two — which on RDNA costs occupancy (and therefore latency
-        // hiding) in every fb-OFF frame, i.e. essentially all of them.
-        // `LEAF_NO_FB` compiles that arm out; record_wavefront picks per frame.
-        // The leaf kernel shades the sky pixels inside leaf tiles, so it reads
-        // the same lattice: SKY_UNIT yields u5 (it never touches the tile
-        // queues) and skylod.hlsli supplies the accessors.
-        let leaf_of = |extra: &str| {
-            let lg = format!("#define LEAF_GROUP {}", leaf_group());
-            let mut parts: Vec<&str> = Vec::new();
-            if !wd.is_empty() {
-                parts.push(wd.as_str());
-            }
-            if !wv.is_empty() {
-                parts.push(wv.as_str());
-            }
-            parts.extend([
-                lg.as_str(),
-                extra,
-                csn.as_str(),
-                sky_lod_defs.as_str(),
-                defs,
-                sw_defs,
-                sw_leaf_defs,
-                sd,
-                dd,
-                TRACE_COMMON_HLSLI,
-                CTR_HLSLI,
-                QUEUES_HLSLI,
-                SKYLOD_HLSLI,
-                rt_src,
-                RIPPLE_HLSLI,
-                SHADE_HLSLI,
-                LEAF_HLSL,
-            ]);
-            parts.join("\n")
-        };
-        let leaf_src = leaf_of("#define LEAF_NO_FB 1");
-        let leaf_fb_src = leaf_of("");
-        // Hemi kernels stay on the BINARY tree deliberately (no ft_defs):
-        // hemi bound queries terminate in ~10 visits, where a wide pop's
-        // unconditional 8 slot tests lose to the binary pop's 1 — measured
-        // +35% ms on the hemi-gi bench with the wide tree, against -54% on
-        // the tile path. record_hemi rebinds the binary buffer at t0.
-        let hemi_wave_src = [
-            defs,
-            ls_defs,
-            sw_defs,
-            sd,
-            TRACE_COMMON_HLSLI,
-            CTR_HLSLI,
-            HEMI_HLSLI,
-            FRUSTUM_HLSLI,
-            rt_src,
-            HEMI_WAVE_HLSL,
-        ]
-        .join("\n");
-        let mut hemi_leaf_parts: Vec<&str> = Vec::new();
-        if !wd.is_empty() {
-            hemi_leaf_parts.push(wd.as_str());
-        }
-        hemi_leaf_parts.extend([
-            defs,
-            sw_defs,
-            sd,
-            dd,
-            TRACE_COMMON_HLSLI,
-            CTR_HLSLI,
-            HEMI_HLSLI,
-            rt_src,
-            RIPPLE_HLSLI,
-            SHADE_HLSLI,
-            HEMI_LEAF_HLSL,
-        ]);
-        let hemi_leaf_src = hemi_leaf_parts.join("\n");
-        let compose_src = [sd, TRACE_COMMON_HLSLI, CTR_HLSLI, QUEUES_HLSLI, COMPOSE_HLSL].join("\n");
-        // abl_defs FIRST so a feed ablation is not silently inert. It was:
-        // an `FR_ABL=nopack` probe reported `feed` unchanged and that was read
-        // as "the pack read is free" — but the define never reached this unit,
-        // so the probe compared identical code against itself. The shipping
-        // split then measured feed 0.544 -> 0.231 ms, i.e. the read very much
-        // is not free. An ablation that cannot reach its target is worse than
-        // no ablation, because it answers confidently.
-        let feed_src =
-            [abl_defs().as_str(), sd, TRACE_COMMON_HLSLI, FSR_WIRE_HLSLI, FEED_HLSL].join("\n");
+        // Every compile unit, assembled by `gfx::shaders` — the portable half,
+        // so both backends hand their compilers byte-identical sources (see
+        // that module's header). The three snapshots come back with the
+        // strings deliberately: the kernels are COMPILED against those lever
+        // values while the buffers below are SIZED against them, and reading
+        // the statics a second time here is exactly the desync
+        // `record_cloud_shadow` documents as a device hang.
+        let srcs = crate::gfx::shaders::trace_sources(&crate::gfx::shaders::TraceKeys {
+            scene,
+            // THIS device's vendor, never `picked_vendor()` — see `cand_defs`.
+            vendor,
+            // The uploaded ring's existence, read off `SceneGpu` rather than
+            // re-derived from the partition/lever/split chain: the define and
+            // the resource it describes have to be ONE decision (the
+            // `non_opaque` discipline).
+            sway_armed: scene_gpu.sway.is_some(),
+        });
+        let (cloud_shadow_v, sky_lod_v, ftree_on) =
+            (srcs.cloud_shadow_n, srcs.sky_lod, srcs.ftree_on);
         let pso = |src: &str, entry: &str, what: &str| -> Result<ID3D12PipelineState> {
             compute_pso(device, &root_sig, &dxc.compile(src, entry, "cs_6_5", what, debug)?, what)
         };
-        let pso_reference = pso(&reference_src, "cs_reference", "reference")?;
-        let pso_resolve = pso(&resolve_src, "cs_resolve", "resolve")?;
-        let pso_seed = pso(&wavefront_src, "cs_seed", "seed")?;
-        let pso_seed_replay = pso(&wavefront_src, "cs_seed_replay", "seed_replay")?;
-        let pso_prep = pso(&wavefront_src, "cs_prep", "prep")?;
-        let pso_prep_mul = pso(&wavefront_src, "cs_prep_mul", "prep_mul")?;
-        let pso_clear_info = pso(&wavefront_src, "cs_clear_info", "clear_info")?;
-        let pso_level = pso(&wavefront_src, "cs_level", "level")?;
-        let pso_level_wide = pso(&wavefront_src, "cs_level_wide", "level_wide")?;
+        let pso_reference = pso(&srcs.reference, "cs_reference", "reference")?;
+        let pso_resolve = pso(&srcs.resolve, "cs_resolve", "resolve")?;
+        let pso_seed = pso(&srcs.wavefront, "cs_seed", "seed")?;
+        let pso_seed_replay = pso(&srcs.wavefront, "cs_seed_replay", "seed_replay")?;
+        let pso_prep = pso(&srcs.wavefront, "cs_prep", "prep")?;
+        let pso_prep_mul = pso(&srcs.wavefront, "cs_prep_mul", "prep_mul")?;
+        let pso_clear_info = pso(&srcs.wavefront, "cs_clear_info", "clear_info")?;
+        let pso_level = pso(&srcs.wavefront, "cs_level", "level")?;
+        let pso_level_wide = pso(&srcs.wavefront, "cs_level_wide", "level_wide")?;
         // The work-graph ladder (FR_WORKGRAPH=1). Same pasted sources as the
         // ladder plus its node shaders, with WORKGRAPH switching level_finish's
         // child emission from `qout` to out-params — the tile logic is NOT
@@ -4994,12 +4754,10 @@ impl TraceGpu {
                 // an image, but it is still a failure worth not courting. Both
                 // are >= 1 because 0 reads as "not recursive" to the compiler
                 // and would make the node's self-output an illegal cycle.
-                let wg_src = format!(
-                    "#define WORKGRAPH 1\n#define WG_WIDE_LEVELS {}\n#define WG_DEEP_LEVELS {}\n{}\n{}",
+                let wg_src = crate::gfx::shaders::workgraph_src(
+                    &srcs.wavefront,
                     wide.saturating_sub(1).max(1),
                     dfull.saturating_sub(1).max(1),
-                    wavefront_src,
-                    WORKGRAPH_HLSL
                 );
                 match WorkGraph::create(device, &root_sig, dxc, &wg_src, debug) {
                     Ok(g) => Some(g),
@@ -5012,25 +4770,25 @@ impl TraceGpu {
         } else {
             None
         };
-        let pso_sky = pso(&sky_src, "cs_sky", "sky")?;
-        let pso_sky_lod = pso(&sky_src, "cs_sky_lod", "sky_lod")?;
-        let pso_cloud_shadow = pso(&sky_src, "cs_cloud_shadow", "cloud_shadow")?;
-        let pso_leaf = pso(&leaf_src, "cs_leaf", "leaf")?;
-        let pso_leaf_fb = pso(&leaf_fb_src, "cs_leaf", "leaf-fb")?;
-        let pso_clear_h = pso(&wavefront_src, "cs_clear_h", "clear_h")?;
-        let pso_prep_batch = pso(&wavefront_src, "cs_prep_batch", "prep_batch")?;
-        let pso_seed_probes = pso(&wavefront_src, "cs_seed_probes", "seed_probes")?;
-        let pso_hemi_root = pso(&hemi_wave_src, "cs_hemi_root", "hemi_root")?;
-        let pso_hemi_cell = pso(&hemi_wave_src, "cs_hemi_cell", "hemi_cell")?;
-        let pso_hemi_leaf = pso(&hemi_leaf_src, "cs_hemi_leaf", "hemi_leaf")?;
-        let pso_compose = pso(&compose_src, "cs_compose", "compose")?;
+        let pso_sky = pso(&srcs.sky, "cs_sky", "sky")?;
+        let pso_sky_lod = pso(&srcs.sky, "cs_sky_lod", "sky_lod")?;
+        let pso_cloud_shadow = pso(&srcs.sky, "cs_cloud_shadow", "cloud_shadow")?;
+        let pso_leaf = pso(&srcs.leaf, "cs_leaf", "leaf")?;
+        let pso_leaf_fb = pso(&srcs.leaf_fb, "cs_leaf", "leaf-fb")?;
+        let pso_clear_h = pso(&srcs.wavefront, "cs_clear_h", "clear_h")?;
+        let pso_prep_batch = pso(&srcs.wavefront, "cs_prep_batch", "prep_batch")?;
+        let pso_seed_probes = pso(&srcs.wavefront, "cs_seed_probes", "seed_probes")?;
+        let pso_hemi_root = pso(&srcs.hemi_wave, "cs_hemi_root", "hemi_root")?;
+        let pso_hemi_cell = pso(&srcs.hemi_wave, "cs_hemi_cell", "hemi_cell")?;
+        let pso_hemi_leaf = pso(&srcs.hemi_leaf, "cs_hemi_leaf", "hemi_leaf")?;
+        let pso_compose = pso(&srcs.compose, "cs_compose", "compose")?;
         // Feed kernels exist only when the pack is full-size (an upscaler
         // session); plain sessions never record a feed.
         let (pso_feed_xess, pso_feed_rr, pso_feed_fsr_rr) = if gbuf_full {
             (
-                Some(pso(&feed_src, "cs_feed_xess", "feed_xess")?),
-                Some(pso(&feed_src, "cs_feed_rr", "feed_rr")?),
-                Some(pso(&feed_src, "cs_feed_fsr_rr", "feed_fsr_rr")?),
+                Some(pso(&srcs.feed, "cs_feed_xess", "feed_xess")?),
+                Some(pso(&srcs.feed, "cs_feed_rr", "feed_rr")?),
+                Some(pso(&srcs.feed, "cs_feed_fsr_rr", "feed_fsr_rr")?),
             )
         } else {
             (None, None, None)
@@ -5039,9 +4797,7 @@ impl TraceGpu {
         // abl_defs FIRST (the probe-reach lesson — an ablation define that
         // cannot reach its unit answers confidently).
         let nrd_res = if gbuf_full && nrd {
-            let nrd_src =
-                [abl_defs().as_str(), sd, TRACE_COMMON_HLSLI, FSR_WIRE_HLSLI, NRD_BRIDGE_HLSL]
-                    .join("\n");
+            let nrd_src = srcs.nrd_bridge();
             Some(NrdRes {
                 pso_pack: pso(&nrd_src, "cs_nrd_pack", "nrd_pack")?,
                 pso_out: pso(&nrd_src, "cs_nrd_out", "nrd_out")?,
@@ -5051,13 +4807,13 @@ impl TraceGpu {
         };
         // NPPD staging kernels: only in --gpu --nppd (XeSS) sessions.
         let nppd_psos = if gbuf_full && nppd {
-            let nppd_src = [sd, TRACE_COMMON_HLSLI, NPPD_HLSL].join("\n");
+            let nppd_src = srcs.nppd();
             Some((
                 pso(&nppd_src, "cs_nppd_pack", "nppd_pack")?,
                 pso(&nppd_src, "cs_nppd_warp", "nppd_warp")?,
                 pso(&nppd_src, "cs_nppd_zero", "nppd_zero")?,
                 pso(&nppd_src, "cs_nppd_out", "nppd_out")?,
-                pso(&feed_src, "cs_feed_xess_dm", "feed_xess_dm")?,
+                pso(&srcs.feed, "cs_feed_xess_dm", "feed_xess_dm")?,
             ))
         } else {
             None
@@ -5317,8 +5073,8 @@ impl TraceGpu {
             split: std::cell::Cell::new(TileSplit::ALL),
             split_refused: std::cell::Cell::new(false),
             sway_t: std::cell::Cell::new(None),
-            sway_mv_on: !sway_def.is_empty(),
-            sky_split,
+            sway_mv_on: srcs.sway_mv_on,
+            sky_split: SKY_SPLIT,
             pso_prep,
             pso_prep_mul,
             pso_clear_info,

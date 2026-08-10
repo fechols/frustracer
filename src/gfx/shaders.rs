@@ -1338,6 +1338,379 @@ pub fn sky_unit_src(k: u32, n: u32) -> String {
     parts.join("\n")
 }
 
+/// What the wavefront tracer's kernel sources depend on that this module
+/// cannot read for itself: two scene-derived facts and one device fact.
+///
+/// Everything else the assembly needs — the levers, the `--spp` table, the
+/// detail knobs, the frustum structure — is a process-global read at
+/// construction time, deliberately: those are SESSION constants, and threading
+/// them through a parameter list would invite two tracers in one process
+/// compiling against different values of the same knob.
+pub struct TraceKeys<'a> {
+    /// Drives `alpha_defs`/`height_defs`/`trans_defs`/`empty_defs` — which
+    /// conditional-hit machinery compiles in at all.
+    pub scene: &'a Scene,
+    /// THIS device's vendor, never a process-global "picked" one: under
+    /// `--dual-gpu` two devices are live, and `cand_defs` arming on the wrong
+    /// one restores a `tmin-overshoot` defect on every leaf primary of the
+    /// device that does not need it.
+    pub vendor: Vendor,
+    /// `scene_gpu.sway.is_some()` — the UPLOADED animated-TLAS ring's
+    /// existence. See `sway_defs`.
+    pub sway_armed: bool,
+}
+
+/// Every compile unit the wavefront tracer needs, assembled.
+///
+/// The strings are the product; the three snapshots below are the reason this
+/// returns a struct rather than a tuple of sources. `CLOUD_SHADOW`, `SKY_LOD`
+/// and `FTREE_ENABLED` are process statics that a mid-process A/B (a gate
+/// flipping one between two constructions) can move, and the kernels are
+/// COMPILED against them while the buffers are SIZED against them and the
+/// per-frame record paths dispatch against them. Reading each static once here
+/// and handing the caller what was read makes "a kernel can never desync from
+/// its own fill dispatch" structural instead of a rule to remember — that
+/// desync is the device-hang class `record_cloud_shadow` documents.
+pub struct TraceSources {
+    pub reference: String,
+    pub resolve: String,
+    pub wavefront: String,
+    pub sky: String,
+    /// `LEAF_NO_FB` — the hemi arm compiled OUT. See the assembly for why the
+    /// leaf kernel ships as two PSOs from one source.
+    pub leaf: String,
+    pub leaf_fb: String,
+    pub hemi_wave: String,
+    pub hemi_leaf: String,
+    pub compose: String,
+    pub feed: String,
+    /// The `--spp` prelude, retained because the two CONDITIONAL units below
+    /// are built only when their feature is armed and would otherwise have to
+    /// rebuild it (`spp_defs` materializes the whole `SKY_J` table).
+    pub spp: String,
+    /// The snapshots — see the struct doc. Callers must size and record
+    /// against THESE, never a fresh read of the statics.
+    pub cloud_shadow_n: u32,
+    pub sky_lod: u32,
+    pub ftree_on: bool,
+    /// Did `SWAY_MV` actually compile in? Not the same question as "is the
+    /// ring armed": `--sw-rays` suppresses the define while the ring still
+    /// exists. The per-frame CB flag and the dmv-ring fill both key off this,
+    /// so it is reported rather than re-derived — a tracer whose flag says
+    /// "sway MVs" to a kernel compiled without them writes garbage motion.
+    pub sway_mv_on: bool,
+}
+
+impl TraceSources {
+    /// The NRD bridge unit (`--nrd` sessions + the check-gpu bridge gates).
+    /// Conditional, so it is a method rather than a field: `TRACE_COMMON_HLSLI`
+    /// is most of a megabyte and an unarmed session should not pay to join it.
+    ///
+    /// `abl_defs` FIRST — the probe-reach rule; see `feed`'s assembly for the
+    /// measurement that established it.
+    pub fn nrd_bridge(&self) -> String {
+        [abl_defs().as_str(), &self.spp, TRACE_COMMON_HLSLI, FSR_WIRE_HLSLI, NRD_BRIDGE_HLSL]
+            .join("\n")
+    }
+
+    /// The NPPD staging unit (`--gpu --nppd` XeSS sessions only). Conditional
+    /// for the same reason as `nrd_bridge`.
+    pub fn nppd(&self) -> String {
+        [&self.spp, TRACE_COMMON_HLSLI, NPPD_HLSL].join("\n")
+    }
+}
+
+/// Assemble every wavefront compile unit.
+///
+/// THE OUTPUT IS THE CONTRACT. Both backends hand their compiler these exact
+/// strings — a Vulkan tracer that assembled its own would be running different
+/// programs, and the cross-backend image A/B that is supposed to catch porting
+/// defects would instead be measuring the difference between two assemblies.
+/// So this function is the one place a `#define` may be decided, and adding one
+/// means adding it to every unit that can consume it (see the module header's
+/// note on ablations that answer confidently because they never arrived).
+pub fn trace_sources(k: &TraceKeys) -> TraceSources {
+    let scene = k.scene;
+    // Alpha-masked scenes compile the cutout candidate loops into the trace
+    // primitives (rt.hlsli); height-carrying scenes likewise compile the relief
+    // march in (runtime-gated by FLAG_HEIGHT — the V toggle); transmissive
+    // scenes compile transmit_q's tinted candidate loop in (TRANS_SHADOW).
+    // Scenes with none compile the FORCE_OPAQUE originals verbatim (modulo
+    // leading blank lines) — procedural/stress sessions are structurally
+    // untouched, and the bit gates rely on that. Dev cost-attribution ablations
+    // ride `abl_defs()`, which the DXR assembly pastes too so the two arms stay
+    // comparable.
+    let empty_def = empty_defs(scene);
+    // SWAY_MV: suppressed under --sw-rays — the software rays render the REST
+    // pose, so sway MVs would describe motion that is not on screen (sway_defs'
+    // doc). DXR takes the same predicate verbatim.
+    let sway_def = if sw_rays() { "" } else { sway_defs(k.sway_armed) };
+    let defs = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        empty_def,
+        alpha_defs(scene),
+        height_defs(scene),
+        trans_defs(scene),
+        cand_defs(k.vendor),
+        blas_defs(),
+        sway_def,
+        abl_defs(),
+        rtgi_defs()
+    );
+    let defs = defs.as_str();
+    // The session's frustum structure: `#define FTREE` swaps frustum.hlsli's
+    // binary bound_query/refine_cut for ftree.hlsli's wide bodies (same
+    // signatures — the call sites don't know), and the FNode array uploads at
+    // t0 in place of the binary nodes. --no-ftree keeps the binary path.
+    let ftree_on = crate::ftree::FTREE_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
+    let ft_defs = if ftree_on { "#define FTREE 1" } else { "" };
+    // The per-lane frustum stack depth — the tracer's ONLY groupshared, and
+    // therefore the only thing that can cap resident GROUPS in the level and
+    // hemi kernels, which RGA shows are nowhere near VGPR-limited
+    // (cs_level_wide 54 VGPR against cs_leaf's 216). Injected into exactly the
+    // units that paste frustum.hlsli; the work graph inherits it through the
+    // wavefront unit. See lane_stack() before sweeping it.
+    let ls_defs = format!("#define LANE_STACK {}u{}", lane_stack(), stack_layout_def());
+    let ls_defs = ls_defs.as_str();
+    // The cbuffer's jitter-table size (--spp) — every unit sees the cbuffer.
+    let sd_owned = spp_defs();
+    let sd = sd_owned.as_str();
+    // The detail strength knobs — every unit that pastes SHADE_HLSLI.
+    let dd = detail_defs();
+    let dd = dd.as_str();
+    // --sw-rays: rt_sw.hlsli pastes in place of rt.hlsli in every ray-shooting
+    // unit (leaf x2, reference, hemi_wave, hemi_leaf); the wavefront unit gets
+    // the SW_RAYS define too (level_finish's leaf-cut translation arm).
+    // SW_TRAV_STACK rides in from bvh::TRAV_STACK so the HLSL stacks stay in
+    // lockstep with the build's max_depth assert.
+    let sw_on = sw_rays();
+    let rt_src: &str = if sw_on { RT_SW_HLSLI } else { RT_HLSLI };
+    let sw_defs = if sw_on {
+        format!("#define SW_RAYS 1\n#define SW_TRAV_STACK {}u", crate::bvh::TRAV_STACK)
+    } else {
+        String::new()
+    };
+    let sw_defs = sw_defs.as_str();
+    // The leaf unit's cut consumption composes with --no-cut-rays exactly as
+    // the CPU's intersect_multi short-circuit does: software traversal from the
+    // root, the scalar t_start kept. The wavefront unit shares the define
+    // (level_finish's leaf-cut translation compiles only when the leaf actually
+    // consumes it).
+    let sw_leaf_defs = if sw_rays_leaf() { "#define SW_RAYS_LEAF 1" } else { "" };
+    // Snapshot the cloud-cache levers ONCE — see `TraceSources`' doc.
+    let cloud_shadow_v = cloud_shadow_n();
+    let sky_lod_v = sky_lod();
+    // The cloud-shadow cache is compiled into every unit that shades (leaf,
+    // reference) plus the unit that fills it (sky). wavefront/hemi get 0 and
+    // keep the exact per-pixel expression — they must not declare u6, which is
+    // the tile queue there. (DXR compiles it in through its own assembly.)
+    let csn = format!("#define CLOUD_SHADOW_N {cloud_shadow_v}");
+    // The sky-lod lattice defines, shared by the sky-fill unit, both leaf
+    // kernels, AND the reference kernel — so reference's sky pixels compose
+    // through the identical `sky_radiance_lod` and the exact-zero
+    // wavefront-vs-reference image A/B stays bit-identical at the default-ON K.
+    // SKY_UNIT is a harmless no-op in a unit that pastes no queues.hlsli
+    // (reference), where u5 is free anyway.
+    let sky_lod_defs = format!(
+        "#define SKY_UNIT 1\n#define SKY_LOD {sky_lod_v}\n#define SKY_LOD_LOG {}",
+        sky_lod_v.trailing_zeros()
+    );
+    // The reference kernel swaps to rt_sw with the wavefront: the exact-zero
+    // wavefront-vs-reference gates require ONE intersector on both sides (the
+    // "same intersector, same seeds" contract). It also reads the cloud lattice
+    // (SKYLOD_HLSLI at u5, filled by record_sky_lod) and the cloud-shadow cache
+    // (csn, filled by record_cloud_shadow), so it shades sky exactly as the
+    // leaf kernel does.
+    // WIDTH_PROBE defines, pushed CONDITIONALLY into every unit below — never
+    // as an empty join element (the feed-unit byte-identity rule): unarmed
+    // assemblies must be byte-identical to the pre-lever sources.
+    let wd = width_defs();
+    let bd = ballast_defs();
+    let wv = waveviz_defs();
+    let mut reference_parts: Vec<&str> = Vec::new();
+    if !wd.is_empty() {
+        reference_parts.push(wd.as_str());
+    }
+    if !bd.is_empty() {
+        reference_parts.push(bd.as_str());
+    }
+    if !wv.is_empty() {
+        reference_parts.push(wv.as_str());
+    }
+    reference_parts.extend([
+        csn.as_str(),
+        sky_lod_defs.as_str(),
+        defs,
+        sw_defs,
+        sd,
+        dd,
+        TRACE_COMMON_HLSLI,
+        SKYLOD_HLSLI,
+        rt_src,
+        RIPPLE_HLSLI,
+        SHADE_HLSLI,
+        REFERENCE_HLSL,
+    ]);
+    let reference = reference_parts.join("\n");
+    // The waveviz overlay deliberately does NOT live in this resolve unit any
+    // more: it composites at the present funnel (tonemap.rs's waveviz PSO),
+    // which is what makes it work under every upscaler — the resolve runs only
+    // on the plain arms.
+    let resolve = [sd, TRACE_COMMON_HLSLI, RESOLVE_HLSL].join("\n");
+    let (sky_group, sky_split) = (SKY_GROUP, SKY_SPLIT);
+    let sky_defs = format!(
+        "#define SKY_GROUP {sky_group}\n#define SKY_SPLIT {sky_split}\n#define LEAF_TILE {}",
+        crate::render::leaf_tile()
+    );
+    let wavefront_ablation_defs = wavefront_ablation_defs();
+    let mut wavefront_parts: Vec<&str> = Vec::new();
+    if !wd.is_empty() {
+        wavefront_parts.push(wd.as_str());
+    }
+    wavefront_parts.extend([
+        sky_defs.as_str(),
+        wavefront_ablation_defs.as_str(),
+        empty_def,
+        ft_defs,
+        ls_defs,
+        sw_defs,
+        sw_leaf_defs,
+        sd,
+        TRACE_COMMON_HLSLI,
+        CTR_HLSLI,
+        QUEUES_HLSLI,
+        FRUSTUM_HLSLI,
+        FTREE_HLSLI,
+        WAVEFRONT_HLSL,
+    ]);
+    let wavefront = wavefront_parts.join("\n");
+    // The sky fill is its own unit so `cloud_lod` can take u5 (SKY_UNIT
+    // suppresses queues.hlsli's tile-queue declarations there). Assembled by
+    // the shared `sky_unit_src` so the DXR pipeline's fill kernels cannot drift
+    // from these.
+    let sky = sky_unit_src(sky_lod_v, cloud_shadow_v);
+    // Two leaf kernels from the one source. `fb_mode` is a cbuffer value, so
+    // leaving the hemi arm as a runtime branch inlines shade_split at both call
+    // sites and the kernel's register allocation is the MAX of the two — which
+    // on RDNA costs occupancy (and therefore latency hiding) in every fb-OFF
+    // frame, i.e. essentially all of them. `LEAF_NO_FB` compiles that arm out;
+    // record_wavefront picks per frame. The leaf kernel shades the sky pixels
+    // inside leaf tiles, so it reads the same lattice: SKY_UNIT yields u5 (it
+    // never touches the tile queues) and skylod.hlsli supplies the accessors.
+    let leaf_of = |extra: &str| {
+        let lg = format!("#define LEAF_GROUP {}", leaf_group());
+        let mut parts: Vec<&str> = Vec::new();
+        if !wd.is_empty() {
+            parts.push(wd.as_str());
+        }
+        if !wv.is_empty() {
+            parts.push(wv.as_str());
+        }
+        parts.extend([
+            lg.as_str(),
+            extra,
+            csn.as_str(),
+            sky_lod_defs.as_str(),
+            defs,
+            sw_defs,
+            sw_leaf_defs,
+            sd,
+            dd,
+            TRACE_COMMON_HLSLI,
+            CTR_HLSLI,
+            QUEUES_HLSLI,
+            SKYLOD_HLSLI,
+            rt_src,
+            RIPPLE_HLSLI,
+            SHADE_HLSLI,
+            LEAF_HLSL,
+        ]);
+        parts.join("\n")
+    };
+    let leaf = leaf_of("#define LEAF_NO_FB 1");
+    let leaf_fb = leaf_of("");
+    // Hemi kernels stay on the BINARY tree deliberately (no ft_defs): hemi
+    // bound queries terminate in ~10 visits, where a wide pop's unconditional 8
+    // slot tests lose to the binary pop's 1 — measured +35% ms on the hemi-gi
+    // bench with the wide tree, against -54% on the tile path. record_hemi
+    // rebinds the binary buffer at t0.
+    let hemi_wave = [
+        defs,
+        ls_defs,
+        sw_defs,
+        sd,
+        TRACE_COMMON_HLSLI,
+        CTR_HLSLI,
+        HEMI_HLSLI,
+        FRUSTUM_HLSLI,
+        rt_src,
+        HEMI_WAVE_HLSL,
+    ]
+    .join("\n");
+    let mut hemi_leaf_parts: Vec<&str> = Vec::new();
+    if !wd.is_empty() {
+        hemi_leaf_parts.push(wd.as_str());
+    }
+    hemi_leaf_parts.extend([
+        defs,
+        sw_defs,
+        sd,
+        dd,
+        TRACE_COMMON_HLSLI,
+        CTR_HLSLI,
+        HEMI_HLSLI,
+        rt_src,
+        RIPPLE_HLSLI,
+        SHADE_HLSLI,
+        HEMI_LEAF_HLSL,
+    ]);
+    let hemi_leaf = hemi_leaf_parts.join("\n");
+    let compose = [sd, TRACE_COMMON_HLSLI, CTR_HLSLI, QUEUES_HLSLI, COMPOSE_HLSL].join("\n");
+    // abl_defs FIRST so a feed ablation is not silently inert. It was: an
+    // `FR_ABL=nopack` probe reported `feed` unchanged and that was read as "the
+    // pack read is free" — but the define never reached this unit, so the probe
+    // compared identical code against itself. The shipping split then measured
+    // feed 0.544 -> 0.231 ms, i.e. the read very much is not free. An ablation
+    // that cannot reach its target is worse than no ablation, because it
+    // answers confidently.
+    let feed = [abl_defs().as_str(), sd, TRACE_COMMON_HLSLI, FSR_WIRE_HLSLI, FEED_HLSL].join("\n");
+    TraceSources {
+        reference,
+        resolve,
+        wavefront,
+        sky,
+        leaf,
+        leaf_fb,
+        hemi_wave,
+        hemi_leaf,
+        compose,
+        feed,
+        spp: sd_owned,
+        cloud_shadow_n: cloud_shadow_v,
+        sky_lod: sky_lod_v,
+        ftree_on,
+        sway_mv_on: !sway_def.is_empty(),
+    }
+}
+
+/// The work-graph ladder's source (`FR_WORKGRAPH=1`): the SAME wavefront unit
+/// plus its node shaders, with `WORKGRAPH` switching `level_finish`'s child
+/// emission from `qout` to out-params. The tile logic is deliberately NOT
+/// forked — one implementation, two dispatch shapes.
+///
+/// `wide`/`deep` are RECURSION depths, i.e. one less than the level counts they
+/// run, and both are clamped to >= 1 by the caller because 0 means "not
+/// recursive at all" to the compiler, which would make a node's self-output an
+/// illegal cycle. Over-declaring `deep` only reserves more backing memory;
+/// UNDER-declaring makes the deepest node drop children, which the shader
+/// counts into CTR_OVERFLOW — a failed gate rather than a corrupted image, but
+/// still not worth courting.
+pub fn workgraph_src(wavefront: &str, wide: u32, deep: u32) -> String {
+    format!(
+        "#define WORKGRAPH 1\n#define WG_WIDE_LEVELS {wide}\n#define WG_DEEP_LEVELS {deep}\n{}\n{}",
+        wavefront, WORKGRAPH_HLSL
+    )
+}
 
 // --- Shader-source gates -----------------------------------------------
 //
