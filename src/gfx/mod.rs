@@ -42,4 +42,5 @@
 //! measured as a wash — so it stays D3D12-only by choice, not by obstacle.
 
 pub mod guides;
+pub mod shaders;
 pub mod vocab;

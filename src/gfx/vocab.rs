@@ -24,6 +24,66 @@ pub enum Prefer {
     Intel,
 }
 
+impl Prefer {
+    /// The `Vendor` this preference is asking for. Every `Prefer` names a real
+    /// vendor, so this is total — but the two types stay distinct because the
+    /// answer to "what did you ask for" is not the answer to "what did you
+    /// get" (see `Vendor`'s doc), and a `From` impl would invite writing the
+    /// request where a fact belongs.
+    pub fn vendor(self) -> Vendor {
+        match self {
+            Prefer::Nvidia => Vendor::Nvidia,
+            Prefer::Amd => Vendor::Amd,
+            Prefer::Intel => Vendor::Intel,
+        }
+    }
+}
+
+/// PCI vendor ids, as DXGI and Vulkan both report them — the same numbers
+/// (`DXGI_ADAPTER_DESC1::VendorId`, `VkPhysicalDeviceProperties::vendorID`),
+/// which is why the mapping below is API-neutral and lives here.
+const VENDOR_NVIDIA: u32 = 0x10DE;
+const VENDOR_AMD: u32 = 0x1002;
+const VENDOR_INTEL: u32 = 0x8086;
+
+/// The vendor of the adapter we actually PICKED — the input to the session's
+/// vendor-aware policy (`main::vendor_defaults`, the `--spin` warm-up count)
+/// and to the two kernel-assembly decisions that are properties of a device
+/// (`gfx::shaders::cand_defs`' AMD candidate-TMin workaround, the Intel
+/// work-graph refusal).
+///
+/// Deliberately not the same type as `Prefer`: a preference is what the user
+/// asked for and may not be honored (a box without that vendor falls back to
+/// the first hardware adapter), while this is what the device is. Defaults must
+/// key off the fact, never the request.
+///
+/// It lives here rather than in `gpu::adapter` because the shader assembly —
+/// now portable, in `gfx::shaders` — takes one, and a `#[cfg(windows)]` enum
+/// cannot be a parameter of code that compiles everywhere. `gpu::adapter`
+/// re-exports it, so every backend call site reads exactly as it did.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Vendor {
+    Nvidia,
+    Amd,
+    Intel,
+    /// Anything else, including a software/virtual adapter that slipped the
+    /// SOFTWARE flag. Always takes the cross-vendor default — an unknown GPU
+    /// is exactly the case where a tuned constant is least likely to hold.
+    Other,
+}
+
+impl Vendor {
+    /// Map a PCI vendor id. Both backends' enumeration reports the same one.
+    pub fn of(id: u32) -> Self {
+        match id {
+            VENDOR_NVIDIA => Vendor::Nvidia,
+            VENDOR_AMD => Vendor::Amd,
+            VENDOR_INTEL => Vendor::Intel,
+            _ => Vendor::Other,
+        }
+    }
+}
+
 /// Which tracer the SECONDARY adapter runs under `--dual-gpu` (`--dual-gpu-arm
 /// wave|dxr`). The primary's arm is the session's; the secondary's follows its
 /// own adapter's vendor unless this forces it.
