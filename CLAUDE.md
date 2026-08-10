@@ -315,8 +315,9 @@ cargo run --release -- --emissive-lights  # ARM emissive surfaces lighting the s
                                       # neither fold nor NEE (the shed line is the signal). Its
                                       # cinematic twin applies the policy once per
                                       # run_cinematic_gpu run at the first wiring that took,
-                                      # ALWAYS with dn_fold = false — that capture pipeline
-                                      # runs no denoiser; quin/plain/RR-class sessions
+                                      # with the REAL dn_fold since the capture pipeline gained
+                                      # its own denoiser slot (gpu::CineDn, same day — see the
+                                      # cinematic section); quin/plain/RR-class sessions
                                       # keep the compiled OFF. Opts::emissive_lights_explicit is
                                       # the veto (BOTH CLI spellings set it — presence, not
                                       # value, the dxr_inline_explicit doctrine, so
@@ -4214,6 +4215,13 @@ cargo run --release -- --cinematic tour --cinematic-res 3840x2160 --cinematic-fp
                                       # model's RECONSTRUCTED output; chain flags steer it,
                                       # --no-upscale / GI shots / --cpu / chain exhausted fall
                                       # back to accumulation loudly — see the cinematic section).
+                                      # XeSS/FSR3 captures ALSO run the session's pre-upscale
+                                      # denoiser since 2026-08-10 (gpu::CineDn — the interactive
+                                      # FRD/NRD fold's cinematic twin: pack -> denoise -> out
+                                      # replaces the engine feed per sub-frame; measured 3.1x
+                                      # less high-frequency noise on a bistro still; --no-frd
+                                      # opts out and restores the NEE emissive auto-arm; not
+                                      # under --dual-gpu — said loudly).
                                       # Sub-flags: -res WxH (odd dims round down — yuv420p),
                                       # -samples N (sub-frames per OUTPUT frame: reconstruction
                                       # warm/converge passes, or plain accumulation on the

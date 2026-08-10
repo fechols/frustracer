@@ -7513,6 +7513,23 @@ impl CineUp {
         }
     }
 
+    /// The engine's [color, mvec, depth] plane trio + formats, for the
+    /// cinematic denoiser fold's `CineDn::arm` — Some only for the TAA-class
+    /// engines the pre-upscale denoiser composes with (XeSS / FSR 3.1, the
+    /// arm_denoiser_for rule). Resources are CLONED (COM AddRef) so no
+    /// borrow of self survives into the caller's build.
+    pub fn feed_trio(
+        &self,
+    ) -> Option<[(ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT); 3]> {
+        if let Some(x) = &self.xess {
+            Some(x.res.plane_resources().map(|(r, f)| (r.clone(), f)))
+        } else if let Some(FsrRes::Up(res)) = self.fsr.as_ref().map(|f| &f.res) {
+            Some(res.plane_resources().map(|(r, f)| (r.clone(), f)))
+        } else {
+            None
+        }
+    }
+
     /// Record this engine's evaluate on the harness's list — the exact middle
     /// the present arms record, minus the swapchain around it. Call AFTER the
     /// frame's `record_feed` on the same list.
@@ -7628,5 +7645,112 @@ impl CineUp {
         });
         unsafe { rb.resource.Unmap(0, None) };
         Ok(())
+    }
+}
+
+/// The cinematic capture's denoiser slot — `CineUp`'s slot-mate (2026-08-10:
+/// the capture pipeline predated the denoiser slot, so a cinematic XeSS/FSR3
+/// frame fed the engine raw 1-spp every sub-frame and the TAA clamp fought
+/// the stochastic signal — shadows, AO, GI, and the sparse emissive — every
+/// pass; the sub-frame convergence softened but never removed it). Bundles
+/// the interactive session's `nrd_gpu` + prev-state field cluster so
+/// `run_cinematic_gpu` can carry it beside `CineUp` in the per-res `built`
+/// tuple (dropped together on a res change — the arm_denoiser_for
+/// size-desync backstop, made structural by lifetime). Engine-blind like the
+/// interactive slot: `arm` is arm_denoiser_for's construction + the SAME
+/// 10-register wire map (the third literal site's twin), `frame_step` wraps
+/// `nrd_frame_step` verbatim so the FrdFrame derivation, prev threading, and
+/// shed reporting cannot drift from the presenters'.
+pub struct CineDn {
+    dn: Option<DnGpu>,
+    prev: Option<(crate::dlss::CamMatrices, (f32, f32), Option<[f32; 3]>)>,
+    frame_idx: u32,
+    hist_valid: bool,
+}
+
+impl CineDn {
+    #[allow(clippy::too_many_arguments)]
+    pub fn arm(
+        dev: &ID3D12Device,
+        dxc: &dxc::Dxc,
+        dn: DnKind,
+        rw: u32,
+        rh: u32,
+        debug: bool,
+        trio: &[(ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT); 3],
+        wire: &mut dyn FnMut(
+            &[(u32, &ID3D12Resource, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT)],
+        ) -> Result<()>,
+    ) -> Result<Self> {
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        let built = match dn {
+            DnKind::Nrd(dir) => {
+                let g = nrd_gpu::NrdGpu::new(dev, dir, rw, rh)?;
+                eprintln!("nrd: armed — cinematic pre-upscale denoising at {rw}x{rh} ({dir})");
+                DnGpu::Nrd(g)
+            }
+            DnKind::Frd => {
+                let g = frd_gpu::FrdGpu::new(dev, dxc, rw, rh, debug)?;
+                eprintln!(
+                    "frd: armed — cinematic pre-upscale denoising at {rw}x{rh} (fp32 kernels; \
+                     fp16 {})",
+                    if g.fp16 { "capable" } else { "unavailable" }
+                );
+                DnGpu::Frd(g)
+            }
+        };
+        let [(color_res, color_fmt), (mvec_res, mvec_fmt), (depth_res, depth_fmt)] = trio;
+        wire(&[
+            (16, color_res, *color_fmt),
+            (17, built.plane_in_nr(), DXGI_FORMAT_R10G10B10A2_UNORM),
+            (18, depth_res, *depth_fmt),
+            (19, mvec_res, *mvec_fmt),
+            (20, built.plane_out_spec(), DXGI_FORMAT_R16G16B16A16_FLOAT),
+            (23, built.plane_in_mv(), DXGI_FORMAT_R16G16B16A16_FLOAT),
+            (24, built.plane_in_diff(), DXGI_FORMAT_R16G16B16A16_FLOAT),
+            (25, built.plane_in_spec(), DXGI_FORMAT_R16G16B16A16_FLOAT),
+            (26, built.plane_in_viewz(), DXGI_FORMAT_R32_FLOAT),
+            (27, built.plane_out_diff(), DXGI_FORMAT_R16G16B16A16_FLOAT),
+        ])?;
+        Ok(Self { dn: Some(built), prev: None, frame_idx: 0, hist_valid: false })
+    }
+
+    /// One sub-frame's pack → denoise → out, the `nrd_frame_step` contract
+    /// verbatim (its Err path prints and returns false — the caller records
+    /// the plain engine feed instead and sheds this slot after the submit).
+    #[allow(clippy::too_many_arguments)]
+    pub fn frame_step(
+        &mut self,
+        device: &ID3D12Device,
+        list: &ID3D12GraphicsCommandList,
+        slot: usize,
+        rw: u32,
+        rh: u32,
+        fc: &crate::dlss::FrameConstants,
+        jitter: (f32, f32),
+        reset: bool,
+        sun: Option<[f32; 3]>,
+        gi_fold: bool,
+        pack: &dyn Fn() -> Result<()>,
+        out: &dyn Fn() -> Result<()>,
+    ) -> bool {
+        GpuContext::nrd_frame_step(
+            &mut self.dn,
+            &mut self.prev,
+            &mut self.frame_idx,
+            &mut self.hist_valid,
+            device,
+            list,
+            slot,
+            rw,
+            rh,
+            fc,
+            jitter,
+            reset,
+            sun,
+            gi_fold,
+            pack,
+            out,
+        )
     }
 }

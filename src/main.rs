@@ -15191,8 +15191,20 @@ fn run_cinematic_gpu(
     // Kernel/RTPSO compilation is per resolution, so cache the arm and rebuild
     // only when a shot changes it (the `islands` preset is 7 shots at one res).
     // The upscaler session rides the same cache — its contexts and planes are
-    // output-size-bound too. None = accumulation for shots at that res.
-    let mut built: Option<((usize, usize), CineArm, Option<gpu::CineUp>)> = None;
+    // output-size-bound too. None = accumulation for shots at that res. The
+    // denoiser slot (CineDn) rides the tuple so a res change drops it WITH the
+    // tracer whose descriptor set points at its planes (the arm_denoiser_for
+    // size-desync backstop, structural here).
+    let mut built: Option<((usize, usize), CineArm, Option<gpu::CineUp>, Option<gpu::CineDn>)> =
+        None;
+    // The cinematic denoiser fold (2026-08-10): XeSS/FSR3 captures run the
+    // same pre-upscale denoiser the interactive presenters do — each
+    // sub-frame otherwise feeds the engine raw 1-spp and the TAA clamp
+    // fights the stochastic signal every pass (shadows/AO/GI + the sparse
+    // emissive). Deliberately NOT under --dual-gpu: the fold's pack must
+    // cover the secondary's band and the nrd_sig mirror isn't plumbed here
+    // (the interactive dual path owns that machinery) — said loudly below.
+    let dn_want = dn_kind(opts).is_some() && dual.is_none();
     // The upscaler-class emissive default fires once per RUN, at the first
     // wiring that actually took (a per-res reprobe re-resolves the same
     // level; a failed first res must not burn the decision).
@@ -15200,7 +15212,7 @@ fn run_cinematic_gpu(
 
     for shot in shots {
         let (rw, rh) = shot.res;
-        if built.as_ref().map(|(r, _, _)| *r) != Some((rw, rh)) {
+        if built.as_ref().map(|(r, _, _, _)| *r) != Some((rw, rh)) {
             // Free the old tracer's window-sized buffers BEFORE allocating the
             // new ones — at 4K the two sets together are a real VRAM spike.
             drop(built.take());
@@ -15216,37 +15228,45 @@ fn run_cinematic_gpu(
             // tracer arms them only when a level actually came up — and is
             // REBUILT plain if the wiring then fails below, so the fallback's
             // accumulation frames never store a pack nothing reads.
-            let build = |gbuf: bool, hg: &mut gpu::trace::HeadlessGpu| -> Result<CineArm, String> {
-                Ok(if use_wave {
-                    CineArm::Wave(gpu::trace::TraceGpu::new(
-                        &dev,
-                        &dxc,
-                        scene,
-                        bvh,
-                        core.clone(),
-                        rw as u32,
-                        rh as u32,
-                        gbuf,
-                        false, // no NPPD stage
-                        false, // no NRD bridge
-                        opts.gpu_debug,
-                        hg,
-                    )?)
-                } else {
-                    CineArm::Dxr(gpu::dxr::DxrGpu::new(
-                        &dev,
-                        &dxc,
-                        scene,
-                        core.clone(),
-                        rw as u32,
-                        rh as u32,
-                        gbuf,
-                        false, // no NRD bridge (cinematic captures via its own arms)
-                        opts.gpu_debug,
-                    )?)
-                })
-            };
-            let mut a = build(up.is_some(), &mut hg)?;
+            // The denoiser composes with the TAA-class engines only (the
+            // arm_denoiser_for rule); the bridge PSOs compile only when
+            // asked (the `nrd` flag), so a DLSS-RR/FSR4-RR capture pays
+            // nothing.
+            let dn_here =
+                dn_want && up.as_ref().is_some_and(|u| matches!(u.name, "xess" | "fsr3"));
+            let build =
+                |gbuf: bool, nrd: bool, hg: &mut gpu::trace::HeadlessGpu| -> Result<CineArm, String> {
+                    Ok(if use_wave {
+                        CineArm::Wave(gpu::trace::TraceGpu::new(
+                            &dev,
+                            &dxc,
+                            scene,
+                            bvh,
+                            core.clone(),
+                            rw as u32,
+                            rh as u32,
+                            gbuf,
+                            false, // no NPPD stage
+                            nrd,
+                            opts.gpu_debug,
+                            hg,
+                        )?)
+                    } else {
+                        CineArm::Dxr(gpu::dxr::DxrGpu::new(
+                            &dev,
+                            &dxc,
+                            scene,
+                            core.clone(),
+                            rw as u32,
+                            rh as u32,
+                            gbuf,
+                            nrd,
+                            opts.gpu_debug,
+                        )?)
+                    })
+                };
+            let mut a = build(up.is_some(), dn_here, &mut hg)?;
+            let mut dn_slot: Option<gpu::CineDn> = None;
             if let Some(u) = &up {
                 let wired = match &mut a {
                     CineArm::Wave(tg) => {
@@ -15262,11 +15282,46 @@ fn run_cinematic_gpu(
                             "cinematic: {} reconstruction at 100% (DLAA-grade), {}x{}",
                             u.name, rw, rh
                         );
+                        // The cinematic denoiser fold (2026-08-10): arm the
+                        // session's denoiser (FRD default / --nrd) over the
+                        // engine's trio, exactly the interactive slot. A
+                        // failed arm sheds loudly to the plain feed — the
+                        // capture still runs.
+                        if dn_here {
+                            let arm = u
+                                .feed_trio()
+                                .ok_or_else(|| "engine trio unavailable".to_string())
+                                .and_then(|trio| {
+                                    gpu::CineDn::arm(
+                                        &dev,
+                                        &dxc,
+                                        dn_kind(opts).expect("dn_here implies dn_kind"),
+                                        rw as u32,
+                                        rh as u32,
+                                        opts.gpu_debug,
+                                        &trio,
+                                        &mut |m| match &mut a {
+                                            CineArm::Wave(tg) => tg.wire_nrd_feed(&dev, m),
+                                            CineArm::Dxr(dg) => dg.wire_nrd_feed(&dev, m),
+                                        },
+                                    )
+                                });
+                            match arm {
+                                Ok(d) => dn_slot = Some(d),
+                                Err(e) => eprintln!(
+                                    "cinematic: denoiser not armed ({e}) — plain {} feed",
+                                    u.name
+                                ),
+                            }
+                        }
                         // The upscaler-class emissive default, cinematic twin
                         // (see `upscaler_defaults`): --cinematic resolves a
                         // real chain level, so a XeSS/FSR3 capture gets the
-                        // same TAA-class arming a window session would. The
-                        // scene is already loaded here — harmless, because
+                        // same TAA-class arming a window session would — and
+                        // since the denoiser fold above, the same NARROWING:
+                        // dn_fold is the real fact (the denoiser actually
+                        // armed, and the bounce is live to fold). The scene
+                        // is already loaded here — harmless, because
                         // derivation ran unconditionally and the enable is a
                         // live per-frame read; the fn's own announce covers
                         // the derivation line having printed the pre-policy
@@ -15275,16 +15330,10 @@ fn run_cinematic_gpu(
                         if !el_defaulted {
                             el_defaulted = true;
                             let mut o = opts.clone();
-                            // dn_fold = false ALWAYS here: the cinematic
-                            // capture pipeline runs no pre-upscale denoiser
-                            // (CineUp wires engines only), so a XeSS/FSR3
-                            // capture still needs the NEE arm — the
-                            // 2026-08-10 narrowing applies to interactive
-                            // sessions, where FRD's fold integrates.
                             upscaler_defaults(
                                 &mut o,
                                 matches!(u.name, "xess" | "fsr3").then_some(u.name),
-                                false,
+                                dn_slot.is_some() && opts.rtgi,
                             );
                             emissive::set_enabled(o.emissive_lights);
                         }
@@ -15295,7 +15344,7 @@ fn run_cinematic_gpu(
                             u.name
                         );
                         up = None;
-                        a = build(false, &mut hg)?;
+                        a = build(false, false, &mut hg)?;
                     }
                 }
             } else if up_wanted {
@@ -15304,7 +15353,7 @@ fn run_cinematic_gpu(
             // What the primary ended up with, after any wiring fallback —
             // the secondary must store the same pack half.
             let gbuf_on = up.is_some();
-            built = Some(((rw, rh), a, up));
+            built = Some(((rw, rh), a, up, dn_slot));
             // The secondary's resolution-bound half follows the primary's, and
             // a failure here degrades the CAPTURE to single-GPU rather than
             // ending it — the shot still gets rendered, just on one adapter.
@@ -15327,7 +15376,7 @@ fn run_cinematic_gpu(
                 }
             }
         }
-        let (_, armv, upv) = built.as_mut().expect("just built");
+        let (_, armv, upv, dnv) = built.as_mut().expect("just built");
 
         let dir = match cine_prepare_dir(cine, shot) {
             Ok(d) => d,
@@ -15402,6 +15451,12 @@ fn run_cinematic_gpu(
                 let fs = cine_frame_state(scene, shot, attractors, cine, f, &mut prev_hour);
                 cine_push_sky(armv, scene, &fs, prev_hour);
                 cine_push_sky_dual(dual.as_mut(), scene, &fs, prev_hour);
+                // The denoiser fold's light-parallax input (the interactive
+                // frd_sun capture, cinematic flavor): the sun is constant
+                // across an output frame's sub-frames, so light_par fires
+                // only on the first sub-frame after a TOD step — exactly the
+                // presenter semantics (bit-equal dirs ⇒ exactly 0).
+                let sun_cur = Some(scene.sun.dir.to_array());
                 let basis = fs.cam.basis(rw, rh);
                 // WARM-UP, output frame 0 only. `seq` free-runs, so frame f
                 // is reconstructed from its own `samples` passes PLUS every
@@ -15484,6 +15539,9 @@ fn run_cinematic_gpu(
                     };
                     // The phases of a SPLIT sub-frame; (0, 0) otherwise.
                     let mut phase = (0.0f32, 0.0f32);
+                    // True unless an ARMED denoiser's frame_step failed this
+                    // sub-frame (stays true with no denoiser — the plain arm).
+                    let mut dn_ok = true;
                     let sub_t = Instant::now();
                     let r = match dual.as_mut().filter(|_| band.is_some()) {
                         // THE FED DUAL SUB-FRAME. The primary's trace goes in
@@ -15572,7 +15630,43 @@ fn run_cinematic_gpu(
                             hg.run(|l| {
                                 rec = primv
                                     .record(l, 0, &p, true)
-                                    .and_then(|()| primv.record_feed(l, 0))
+                                    .and_then(|()| {
+                                        // The denoiser fold (the
+                                        // present_trace_xess shape, its
+                                        // nrd_armed/nrd_ok pair exactly): a
+                                        // successful pack → denoise → out
+                                        // REPLACES the engine feed dispatch
+                                        // (cs_nrd_pack writes the guides,
+                                        // cs_nrd_out the color); no denoiser
+                                        // OR a false return records the
+                                        // plain feed in the same list (the
+                                        // false return also sheds below).
+                                        let mut fed = false;
+                                        if let Some(dn) = dnv.as_mut() {
+                                            fed = dn.frame_step(
+                                                &dev,
+                                                l,
+                                                0,
+                                                rw as u32,
+                                                rh as u32,
+                                                &fc,
+                                                jit,
+                                                reset,
+                                                sun_cur,
+                                                p.q.rtgi && primv.nrd_sig(),
+                                                &|| match &*armv {
+                                                    CineArm::Wave(tg) => tg.record_nrd_pack(l, 0),
+                                                    CineArm::Dxr(dg) => dg.record_nrd_pack(l, 0),
+                                                },
+                                                &|| match &*armv {
+                                                    CineArm::Wave(tg) => tg.record_nrd_out(l, 0),
+                                                    CineArm::Dxr(dg) => dg.record_nrd_out(l, 0),
+                                                },
+                                            );
+                                            dn_ok = fed;
+                                        }
+                                        if fed { Ok(()) } else { primv.record_feed(l, 0) }
+                                    })
                                     .and_then(|()| {
                                         u.record_eval(
                                             ngxrr.as_ref(),
@@ -15593,6 +15687,23 @@ fn run_cinematic_gpu(
                     if let Err(e) = r {
                         eprintln!("cinematic: frame {f} sub-frame {seq} failed: {e}");
                         return Ok(1);
+                    }
+                    // The denoiser shed (the interactive two-phase shed's
+                    // synchronous flavor — hg.run already waited, so the
+                    // drop is safe immediately): the frame above completed
+                    // on the plain feed, the rest of the run stays plain,
+                    // and the wiring clear disarms the pack's sig stores.
+                    if !dn_ok {
+                        eprintln!(
+                            "cinematic: denoiser shed — the capture continues on the plain \
+                             {} feed",
+                            u.name
+                        );
+                        *dnv = None;
+                        match &mut *armv {
+                            CineArm::Wave(tg) => tg.clear_nrd_wired(),
+                            CineArm::Dxr(dg) => dg.clear_nrd_wired(),
+                        }
                     }
                     // Close on EVERY sub-frame — see the accumulation arm: a
                     // solo tick renders no band, so an `observe` guarded by the
@@ -21181,10 +21292,12 @@ fn vendor_defaults(opts: &mut Opts, vendor: gpu::adapter::Vendor) {
 /// frames, both default ON), the bounce's emissive integrates ahead of the
 /// TAA clamp for real — measured 42% of DLSS-RR's pool delivery (NRD 68%)
 /// at 0.47 stability on the bistro QA poses. Sessions with --no-frd /
-/// --no-rtgi / --nppd keep the arm (nothing integrates there), and the
-/// CINEMATIC twin always passes dn_fold = false — that capture pipeline
-/// runs no denoiser at all. Known-accept: a denoiser that SHEDS mid-session
-/// (loud) leaves neither fold nor NEE — the shed line is the signal.
+/// --no-rtgi / --nppd keep the arm (nothing integrates there). The
+/// CINEMATIC twin passes the real fact too since the capture pipeline
+/// gained its own denoiser slot the same day (CineDn — dn_fold there = the
+/// slot actually armed && rtgi; a --no-frd capture keeps the NEE arm).
+/// Known-accept: a denoiser that SHEDS mid-session (loud) leaves neither
+/// fold nor NEE — the shed line is the signal.
 ///
 /// Quin stays OFF — the fuse anchors on a denoising engine when one exists
 /// (`quin::default_anchor`). Plain is unchanged (no temporal integrator to
