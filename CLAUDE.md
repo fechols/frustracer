@@ -290,22 +290,33 @@ cargo run --release -- --emissive-lights  # ARM emissive surfaces lighting the s
                                       # everywhere for one island's benefit. The old rationale's
                                       # other half — faint pools — IS resolved: EL_BOOST (the
                                       # LOOK FINDING below) stays, so an armed session now earns
-                                      # its ms. THE XeSS/FSR3 AUTO-ARM IS IN (2026-08-08 — a
-                                      # three-round day: introduced fourth round, retired fifth
-                                      # round on the premise that default-ON NRD/ReBLUR
-                                      # pre-upscale denoising temporally integrates the RTGI
-                                      # bounce's stochastic emissive ahead of the TAA clamp,
-                                      # RE-INSTATED sixth round when the user's feel-test found
-                                      # NRD NOT sufficient — the pools still vanish under
-                                      # XeSS/FSR3, while DLSS-RR/FSR4-RR reconstruct them fine):
-                                      # main::upscaler_defaults — the vendor_defaults sibling —
-                                      # arms emissive lights in sessions whose WIRED upscaler is
-                                      # TAA-class (XeSS/FSR 3.1), because a TAA neighborhood
-                                      # clamp rejects the RTGI bounce's sparse stochastic
-                                      # emissive and armed cluster NEE is the deterministic
-                                      # delivery those sessions need. Its cinematic twin applies
-                                      # the same policy once per run_cinematic_gpu run at the
-                                      # first wiring that took; quin/plain/RR-class sessions
+                                      # its ms. THE XeSS/FSR3 AUTO-ARM IS NARROWED TO
+                                      # DENOISER-LESS SESSIONS (2026-08-10, the user's call —
+                                      # the emissive-integration campaign; the arm's 2026-08-08
+                                      # three-round history: introduced fourth round, retired
+                                      # fifth on the premise that NRD integrates the bounce's
+                                      # emissive ahead of the TAA clamp, RE-INSTATED sixth when
+                                      # the user's feel-test found NRD NOT sufficient — a
+                                      # verdict that PREDATED FLAG_NRD_GI, when the bounce rode
+                                      # the un-denoised residual): main::upscaler_defaults — the
+                                      # vendor_defaults sibling — arms emissive lights in
+                                      # sessions whose WIRED upscaler is TAA-class (XeSS/FSR
+                                      # 3.1) AND that will run NO pre-upscale denoiser fold
+                                      # (dn_fold = dn_kind && rtgi at the call site), because a
+                                      # TAA neighborhood clamp rejects the RTGI bounce's sparse
+                                      # stochastic emissive and armed cluster NEE is the
+                                      # deterministic delivery THOSE sessions need — while a
+                                      # default XeSS/FSR3+FRD session integrates the bounce's
+                                      # emissive itself (the GI-fold firefly relax +
+                                      # stabilization, measured 42% of DLSS-RR's pool delivery
+                                      # at 0.47 stability; NRD 68%) and keeps the compiled OFF.
+                                      # --no-frd/--no-rtgi/--nppd sessions keep the arm;
+                                      # known-accept: a mid-session denoiser SHED leaves
+                                      # neither fold nor NEE (the shed line is the signal). Its
+                                      # cinematic twin applies the policy once per
+                                      # run_cinematic_gpu run at the first wiring that took,
+                                      # ALWAYS with dn_fold = false — that capture pipeline
+                                      # runs no denoiser; quin/plain/RR-class sessions
                                       # keep the compiled OFF. Opts::emissive_lights_explicit is
                                       # the veto (BOTH CLI spellings set it — presence, not
                                       # value, the dxr_inline_explicit doctrine, so
@@ -3029,17 +3040,19 @@ cargo run --release -- --no-rtgi      # kill lever: REAL-TIME GI off — the amb
                                       # The emissive/el-cull must-fires therefore work unchanged
                                       # on armed sessions. Known-accept: UNARMED stochastic
                                       # emissive is TAA-clamped under XeSS/FSR3 (RR integrates
-                                      # it) — RESOLVED AS POLICY by the XeSS/FSR3 auto-arm
-                                      # (main::upscaler_defaults — see the --emissive-lights
-                                      # entry): interactive/cinematic XeSS/FSR3 sessions arm
-                                      # cluster NEE by default, so the pools survive the clamp
-                                      # deterministically. The policy was briefly retired
-                                      # 2026-08-08 on the premise that default-ON NRD/ReBLUR
-                                      # pre-upscale denoising integrates the bounce's stochastic
-                                      # emissive ahead of the TAA clamp; the user's same-day
-                                      # feel-test found NRD NOT sufficient, so the auto-arm is
-                                      # back and the known-accept stands only for sessions that
-                                      # veto it (--no-emissive-lights / a saved settings OFF).
+                                      # it) — RESOLVED TWICE, by different mechanisms per
+                                      # session class (see the --emissive-lights entry's
+                                      # auto-arm paragraph): default XeSS/FSR3+FRD sessions
+                                      # INTEGRATE the bounce's emissive through the denoiser
+                                      # fold since 2026-08-10 (FRD's GI-fold firefly relax +
+                                      # stabilization — 42% of DLSS-RR's pool delivery, the
+                                      # emissive-integration campaign; the 2026-08-08
+                                      # NRD-not-sufficient feel-test predated FLAG_NRD_GI),
+                                      # while denoiser-less TAA sessions (--no-frd/--no-rtgi/
+                                      # --nppd + every cinematic XeSS/FSR3 capture) still get
+                                      # the cluster-NEE auto-arm. The residual known-accept:
+                                      # sessions that veto BOTH (--no-emissive-lights with no
+                                      # fold, or a mid-session denoiser shed).
                                       # CONTRACTS:
                                       # the arm is Quality-gated (`Quality::rtgi`, constructors
                                       # read shade::rtgi_enabled — check harnesses pin the FIELD

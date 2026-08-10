@@ -15275,9 +15275,16 @@ fn run_cinematic_gpu(
                         if !el_defaulted {
                             el_defaulted = true;
                             let mut o = opts.clone();
+                            // dn_fold = false ALWAYS here: the cinematic
+                            // capture pipeline runs no pre-upscale denoiser
+                            // (CineUp wires engines only), so a XeSS/FSR3
+                            // capture still needs the NEE arm — the
+                            // 2026-08-10 narrowing applies to interactive
+                            // sessions, where FRD's fold integrates.
                             upscaler_defaults(
                                 &mut o,
                                 matches!(u.name, "xess" | "fsr3").then_some(u.name),
+                                false,
                             );
                             emissive::set_enabled(o.emissive_lights);
                         }
@@ -21163,27 +21170,46 @@ fn vendor_defaults(opts: &mut Opts, vendor: gpu::adapter::Vendor) {
 /// premise that default-ON NRD/ReBLUR pre-upscale denoising integrates the
 /// bounce's emissive ahead of the TAA clamp; the user's same-day feel-test
 /// found NRD NOT sufficient — the pools still vanish under XeSS/FSR3 — so
-/// the policy is RE-INSTATED. Quin stays OFF — the fuse anchors on a
-/// denoising engine when one exists (`quin::default_anchor`). Plain is
-/// unchanged (no temporal integrator to clamp; stills converge by plain
-/// accumulation). `emissive_lights_explicit` — either CLI spelling, or a
-/// saved settings-file value — vetoes, and the pause menu's live toggle
-/// still overrides at runtime either way. `taa_wired` carries the wired
-/// level's name purely for the announce line; None = not TAA-class = no-op.
-/// The interactive call site re-stores `emissive::set_enabled` (the
-/// `set_inline_mode` re-store shape); `run_cinematic_gpu` applies the same
-/// policy once after ITS chain probe — a media mode that already resolves a
-/// chain — while `--check*`/`--spin` keep the parse-time store, so gates
-/// stay a pure function of the command line.
+/// the policy was RE-INSTATED.
+///
+/// NARROWED 2026-08-10 (the user's call, the emissive-integration campaign):
+/// the arm now fires only when `dn_fold` is false — i.e. when the session
+/// will NOT run a pre-upscale denoiser fold. The 2026-08-08 NRD verdict
+/// predated FLAG_NRD_GI (the bounce rode the un-denoised residual then —
+/// the "NRD isn't on" class, fixed 08-09); with the fold live and FRD's
+/// GI-fold firefly relax + stabilization (flags bit 5 + --frd-max-stab-
+/// frames, both default ON), the bounce's emissive integrates ahead of the
+/// TAA clamp for real — measured 42% of DLSS-RR's pool delivery (NRD 68%)
+/// at 0.47 stability on the bistro QA poses. Sessions with --no-frd /
+/// --no-rtgi / --nppd keep the arm (nothing integrates there), and the
+/// CINEMATIC twin always passes dn_fold = false — that capture pipeline
+/// runs no denoiser at all. Known-accept: a denoiser that SHEDS mid-session
+/// (loud) leaves neither fold nor NEE — the shed line is the signal.
+///
+/// Quin stays OFF — the fuse anchors on a denoising engine when one exists
+/// (`quin::default_anchor`). Plain is unchanged (no temporal integrator to
+/// clamp; stills converge by plain accumulation). `emissive_lights_explicit`
+/// — either CLI spelling, or a saved settings-file value — vetoes, and the
+/// pause menu's live toggle still overrides at runtime either way.
+/// `taa_wired` carries the wired level's name purely for the announce line;
+/// None = not TAA-class = no-op. The interactive call site re-stores
+/// `emissive::set_enabled` (the `set_inline_mode` re-store shape);
+/// `run_cinematic_gpu` applies the same policy once after ITS chain probe —
+/// a media mode that already resolves a chain — while `--check*`/`--spin`
+/// keep the parse-time store, so gates stay a pure function of the command
+/// line.
 #[cfg(windows)]
-fn upscaler_defaults(opts: &mut Opts, taa_wired: Option<&'static str>) {
+fn upscaler_defaults(opts: &mut Opts, taa_wired: Option<&'static str>, dn_fold: bool) {
     let Some(name) = taa_wired else { return };
+    if dn_fold {
+        return;
+    }
     if !opts.emissive_lights_explicit && !opts.emissive_lights {
         opts.emissive_lights = true;
         eprintln!(
-            "emissive lights: ON by default — {name} wired (a TAA-class upscaler's neighborhood \
-             clamp rejects the RTGI bounce's stochastic emissive, and NRD's pre-upscale \
-             integration measured insufficient; --no-emissive-lights opts out)"
+            "emissive lights: ON by default — {name} wired with no denoiser fold (a TAA-class \
+             upscaler's neighborhood clamp rejects the RTGI bounce's stochastic emissive, and \
+             nothing integrates it first; --no-emissive-lights opts out)"
         );
     }
 }
@@ -21271,8 +21297,12 @@ fn run_window(
         vendor_defaults(&mut o, gpu.adapter_vendor);
         // The wired chain level is a fact here too (GpuContext::new probed
         // it), so the upscaler-class default runs beside the vendor one:
-        // XeSS/FSR3 = TAA-class = arm emissive-lights unless the user chose.
+        // XeSS/FSR3 = TAA-class = arm emissive-lights unless the user chose
+        // OR a denoiser fold will integrate the bounce's emissive instead
+        // (the 2026-08-10 narrowing — dn_kind is post-conflict-resolution
+        // truth here, and the fold additionally needs the RTGI arm).
         // wired()'s Quin/Rr/Fsr4/Plain arms all fall to None — see the fn.
+        let dn_fold = dn_kind(&o).is_some() && o.rtgi;
         upscaler_defaults(
             &mut o,
             match gpu.wired() {
@@ -21280,6 +21310,7 @@ fn run_window(
                 gpu::WiredUpscaler::Fsr3 => Some("fsr3"),
                 _ => None,
             },
+            dn_fold,
         );
         o
     };
