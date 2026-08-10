@@ -720,6 +720,17 @@ pub struct Cli {
     /// shot-list path.
     pub cinematic: Option<String>,
     pub cine: cinematic::CineOpts,
+    /// `--frd-lab`: `None` = not asked for, `Some(kind)` = the motion arm
+    /// (strafe | dolly | orbit | tod). A headless dev INSTRUMENT (the --spin
+    /// class, not a gate): real tracer + FRD over a converge/motion/ground-
+    /// truth sequence, streak metrics + PNG dumps per A/B arm.
+    pub frd_lab: Option<String>,
+    /// Surface screen speed at center depth, px per frame (default 4.0).
+    pub frd_lab_speed: f32,
+    /// Motion frames (default 24; warmup is a const in the runner).
+    pub frd_lab_frames: u32,
+    /// Render resolution override (default 960x540 in the runner).
+    pub frd_lab_res: Option<(u32, u32)>,
     /// World mode: `None` = the default (flagless interactive boots the world),
     /// `Some(true)` = explicit `--world` (exclusivity ERRORS rather than
     /// silently resolving), `Some(false)` = `--no-world`. Later flags win.
@@ -927,6 +938,10 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
     let mut spin_warmup: Option<u32> = None;
     let mut cinematic: Option<String> = None;
     let mut cine = cinematic::CineOpts::default();
+    let mut frd_lab: Option<String> = None;
+    let mut frd_lab_speed = 4.0f32;
+    let mut frd_lab_frames = 24u32;
+    let mut frd_lab_res: Option<(u32, u32)> = None;
     let mut world_flag: Option<bool> = None;
     let mut helped = false;
     let mut notes: Vec<String> = Vec::new();
@@ -1688,6 +1703,67 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
                         }),
                 );
             }
+            // --frd-lab takes an OPTIONAL motion kind. Unlike --cinematic's
+            // any-non-flag peek, a token that looks like a scene path (dots or
+            // separators) is never consumed, and a consumed token must be a
+            // KNOWN kind — an unknown one exits 2 rather than falling through
+            // to the OBJ loader as a phantom scene (the --blas-split
+            // optional-value doctrine, vocabulary-keyed).
+            "--frd-lab" => {
+                let looks_path =
+                    |v: &str| v.contains('.') || v.contains('/') || v.contains('\\');
+                let sel = match args.peek().map(String::as_str) {
+                    Some(v) if !v.starts_with("--") && !looks_path(v) => {
+                        let v = args.next().unwrap();
+                        if !matches!(v.as_str(), "strafe" | "dolly" | "orbit" | "tod") {
+                            eprintln!(
+                                "--frd-lab kind must be strafe | dolly | orbit | tod (got '{v}')"
+                            );
+                            std::process::exit(2);
+                        }
+                        Some(v)
+                    }
+                    _ => None,
+                };
+                frd_lab = Some(sel.unwrap_or_else(|| "strafe".to_string()));
+            }
+            "--frd-lab-speed" => {
+                frd_lab_speed = args
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .filter(|s: &f32| s.is_finite() && *s > 0.0)
+                    .unwrap_or_else(|| {
+                        eprintln!("--frd-lab-speed needs a positive px/frame value");
+                        std::process::exit(2);
+                    });
+            }
+            "--frd-lab-frames" => {
+                frd_lab_frames = args
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .filter(|n| *n > 0)
+                    .unwrap_or_else(|| {
+                        eprintln!("--frd-lab-frames needs a positive frame count");
+                        std::process::exit(2);
+                    });
+            }
+            "--frd-lab-res" => {
+                let v = args.next().unwrap_or_else(|| {
+                    eprintln!("--frd-lab-res needs WxH, e.g. 960x540");
+                    std::process::exit(2);
+                });
+                let parts: Vec<&str> = v.split(['x', 'X']).collect();
+                let wh = if parts.len() == 2 {
+                    parts[0].parse::<u32>().ok().zip(parts[1].parse::<u32>().ok())
+                } else {
+                    None
+                };
+                frd_lab_res =
+                    Some(wh.filter(|&(w, h)| w >= 64 && h >= 64).unwrap_or_else(|| {
+                        eprintln!("--frd-lab-res needs WxH >= 64x64, e.g. 960x540");
+                        std::process::exit(2);
+                    }));
+            }
             // --cinematic takes an OPTIONAL value (the peek idiom the parse
             // loop is Peekable for): a bare --cinematic is the `hero` still, so
             // the mode always does something useful and self-describing rather
@@ -2120,6 +2196,10 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
         spin_warmup,
         cinematic,
         cine,
+        frd_lab,
+        frd_lab_speed,
+        frd_lab_frames,
+        frd_lab_res,
         world_flag,
         helped,
         notes,
@@ -2143,6 +2223,14 @@ pub fn usage() {
                 eprintln!("                                  (CPU/--gpu only; --dxr has one DXR arm)");
                 eprintln!("    --continuation-rays  software prototype: beam-produced opaque frontier");
                 eprintln!("                           reused by leaf rays (--no-cut-rays = SW root control)");
+                eprintln!("  --frd-lab [strafe|dolly|orbit|tod]  headless FRD streak lab (dev instrument):");
+                eprintln!("                converge, then a constant-speed motion pass with the real");
+                eprintln!("                tracer + FRD; prints streak metrics (lag/trail/lead/beyond-");
+                eprintln!("                path) per A/B arm (shipping vs curvature/vmotion-off) and");
+                eprintln!("                dumps frd-lab-*.png. orbit/tod are the negative controls");
+                eprintln!("    --frd-lab-speed P   surface screen speed at center depth, px/frame (default 4)");
+                eprintln!("    --frd-lab-frames N  motion frames (default 24)");
+                eprintln!("    --frd-lab-res WxH   render resolution (default 960x540)");
                 eprintln!("  --waveviz [chs]  wave-footprint overlay: every pixel wears its wave's hash");
                 eprintln!("                color (I toggles live in GPU arms, every upscaler included;");
                 eprintln!("                --spin runs dump waveviz-<arm>.png + compactness stats;");
@@ -2956,6 +3044,30 @@ pub fn self_test() -> Result<(), String> {
         || bare.obj.as_deref() != Some("model.obj")
     {
         return Err("--blas-split must not swallow a following scene path".into());
+    }
+    // --frd-lab's optional kind: a known kind is consumed, a scene path never
+    // is (an unknown non-path word exits 2 in place, so self_test only feeds
+    // valid input — the hard-error convention).
+    let fl = parse_argv(&[
+        "--frd-lab",
+        "orbit",
+        "--frd-lab-speed",
+        "8",
+        "--frd-lab-frames",
+        "48",
+        "--frd-lab-res",
+        "640x360",
+    ]);
+    if fl.frd_lab.as_deref() != Some("orbit")
+        || fl.frd_lab_speed != 8.0
+        || fl.frd_lab_frames != 48
+        || fl.frd_lab_res != Some((640, 360))
+    {
+        return Err("--frd-lab orbit/speed/frames/res did not reach Cli".into());
+    }
+    let fl2 = parse_argv(&["--frd-lab", "model.obj"]);
+    if fl2.frd_lab.as_deref() != Some("strafe") || fl2.obj.as_deref() != Some("model.obj") {
+        return Err("--frd-lab must default to strafe and never swallow a scene path".into());
     }
     // Same optional-value contract for --waveviz: `chs` is consumed on exact
     // match only, a scene path is not.

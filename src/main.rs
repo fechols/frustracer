@@ -298,6 +298,10 @@ fn main() {
         spin_warmup,
         cinematic,
         cine,
+        frd_lab,
+        frd_lab_speed,
+        frd_lab_frames,
+        frd_lab_res,
         mut world_flag,
         ..
     } = parsed;
@@ -844,11 +848,13 @@ fn main() {
             || stress.is_some()
             || tile.is_some()
             || spin.is_some()
+            || frd_lab.is_some()
             || (check_requested && !world_check))
     {
         eprintln!(
-            "--world is exclusive with a scene argument, --stress, --tile, --spin, and --check* \
-             (those modes keep their own scenes; the world is the flagless interactive default)"
+            "--world is exclusive with a scene argument, --stress, --tile, --spin, --frd-lab, \
+             and --check* (those modes keep their own scenes; the world is the flagless \
+             interactive default)"
         );
         std::process::exit(2);
     }
@@ -863,6 +869,13 @@ fn main() {
              benchmarks and gates on their own fixed scenes; --cinematic is the \
              media mode and loads the world)"
         );
+        std::process::exit(2);
+    }
+    // --frd-lab is a dev INSTRUMENT (the --spin class): one mode per process,
+    // never the world (a 34M-tri load to measure a denoiser plane is waste,
+    // and the canonical repro scene is a direct helmet load).
+    if frd_lab.is_some() && (spin.is_some() || check_requested || cinematic.is_some()) {
+        eprintln!("--frd-lab is exclusive with --spin, --check*, and --cinematic");
         std::process::exit(2);
     }
     // `--cinematic list` is pure text — answer it before the scene load rather
@@ -881,6 +894,7 @@ fn main() {
         && stress.is_none()
         && tile.is_none()
         && spin.is_none()
+        && frd_lab.is_none()
         && (!check_requested || world_check);
     let req = SceneRequest {
         obj: obj.clone(),
@@ -901,8 +915,31 @@ fn main() {
     // command line (the progress sink is never activated). Interactive
     // sessions defer the SAME load into run_window's worker thread, behind the
     // loading screen. Every branch inside this block exits the process.
-    if check_requested || spin.is_some() || cinematic.is_some() {
+    if check_requested || spin.is_some() || cinematic.is_some() || frd_lab.is_some() {
         let LoadedScene { mut scene, bvh, cam0, world_info } = load_scene(&req);
+
+    if let Some(kind) = &frd_lab {
+        #[cfg(windows)]
+        {
+            let code = run_frd_lab(
+                &mut scene,
+                &bvh,
+                cam0,
+                kind,
+                frd_lab_speed,
+                frd_lab_frames,
+                frd_lab_res,
+                &opts,
+            );
+            std::process::exit(code);
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (kind, frd_lab_speed, frd_lab_frames, frd_lab_res);
+            eprintln!("--frd-lab requires Windows (D3D12)");
+            std::process::exit(2);
+        }
+    }
 
     if let Some(sel) = &cinematic {
         let code = run_cinematic(
@@ -15548,6 +15585,813 @@ fn cine_composite_hud(
             h.composite_sdr(present, rw, rh);
         }
     });
+}
+
+/// The FRD streak lab (--frd-lab strafe|dolly|orbit|tod): a headless dev
+/// INSTRUMENT — the agent's own feel-test — that reproduces the
+/// bright-specular streak family (the sun-on-helmet smear) with the REAL
+/// wavefront tracer feeding the REAL FrdGpu, at a controlled surface screen
+/// speed, and MEASURES it. Never a gate: exit 0 always, verdicts print
+/// loudly. Per A/B arm (v152 = shipping | flat = force_curv off, the
+/// helmet-streak repro | novm = force_vmotion off, the surface-MV arm) it
+/// runs converge (glint rest state) -> motion at `speed_px` px/frame ->
+/// fresh-history converge at the FINAL pose (ground truth), then prints per
+/// motion frame: the fresh input's glint centroid (in), the denoised
+/// output's (out), the signed lag along the measured motion axis, the
+/// trailing/leading streak extents past the converged glint's own
+/// half-extent, and the "beyond-path" energy at axis positions the glint
+/// never occupied — the user's own two-streak vocabulary as numbers.
+/// Structure is the F4 gate's harness (one hg.run per frame: wavefront ->
+/// cs_nrd_pack -> FrdGpu -> cs_nrd_out) with REAL prev threading (the
+/// nrd_frame_step Frd-arm math verbatim), which F4's parked pose
+/// deliberately never exercises. Dumps frd-lab-*.png (tone + log-scaled)
+/// so the streaks are inspectable without an interactive session.
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn run_frd_lab(
+    scene: &mut scene::Scene,
+    bvh: &bvh::Bvh,
+    cam0: Camera,
+    kind: &str,
+    speed_px: f32,
+    motion_frames: u32,
+    res: Option<(u32, u32)>,
+    opts: &Opts,
+) -> i32 {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+    const WARM: u32 = 32; // converge frames per parked phase
+    let (rw, rh) = res.unwrap_or((960, 540));
+    let (pw, ph) = (rw as usize, rh as usize);
+    let npx = pw * ph;
+    let dxc = match gpu::dxc::Dxc::load(&opts.dxc_path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("frd-lab: DXC load failed: {e}");
+            return 2;
+        }
+    };
+    let mut hg = match gpu::trace::HeadlessGpu::new(
+        opts.gpu_debug,
+        opts.prefer.unwrap_or(gpu::adapter::Prefer::Nvidia),
+    ) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("frd-lab: headless device init failed: {e}");
+            return 2;
+        }
+    };
+    if let Err(e) = gpu::trace::require_caps(&hg.device) {
+        eprintln!("frd-lab: {e}");
+        return 2;
+    }
+    let dev = hg.device.clone();
+    let core = match gpu::trace::SceneGpu::new_uploaded(&dev, scene, bvh, &mut hg, opts.bc7) {
+        Ok(c) => std::rc::Rc::new(c),
+        Err(e) => {
+            eprintln!("frd-lab: scene upload failed: {e}");
+            return 2;
+        }
+    };
+    let mut ptg = match gpu::trace::TraceGpu::new(
+        &dev,
+        &dxc,
+        scene,
+        bvh,
+        core,
+        rw,
+        rh,
+        true,  // gbuf_full — the pack the bridge kernels read
+        false, // no NPPD staging
+        true,  // the NRD bridge kernels (cs_nrd_pack / cs_nrd_out)
+        opts.gpu_debug,
+        &mut hg,
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("frd-lab: TraceGpu init failed: {e}");
+            return 2;
+        }
+    };
+    ptg.force_gbuf_ext(true);
+    // Foliage sway pinned at the check clock (helmet has none; a foliage
+    // scene must not animate under the lab's converge phases).
+    let sway_t: Option<f32> = scene.sway.as_deref().map(|sw| {
+        foliage::bake(sw, clouds::CLOUD_CHECK_TIME);
+        clouds::CLOUD_CHECK_TIME
+    });
+    // rtgi pinned OFF (the F4 harness rule): the streak is specular, and the
+    // sampled-AO tier keeps the dd fold's inputs live.
+    let uq = Quality { rtgi: false, ..Quality::upscaler_1spp() };
+    let (near, far) = dlss::near_far(scene.diag);
+    let uaf = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    let npsr = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    // Engine planes the bridge writes (F4's table minus the gate-only ref
+    // planes): color = cs_nrd_out's target (its own NPSR<->UA bracket),
+    // depth/mvec = the folded pack's engine-guide stores.
+    let fmts = [
+        (DXGI_FORMAT_R16G16B16A16_FLOAT, npsr), // 0 color (cs_nrd_out)
+        (DXGI_FORMAT_R32_FLOAT, npsr),          // 1 engine depth guide
+        (DXGI_FORMAT_R16G16_FLOAT, npsr),       // 2 engine mvec guide
+    ];
+    let pl: std::result::Result<Vec<_>, _> = fmts
+        .iter()
+        .map(|&(f, st)| gpu::d3d12::committed_tex(&hg.device, rw, rh, f, uaf, st))
+        .collect();
+    let pl = match pl {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("frd-lab: plane alloc failed: {e}");
+            return 2;
+        }
+    };
+    let fg = match gpu::frd_gpu::FrdGpu::new(&hg.device, &dxc, rw, rh, opts.gpu_debug) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("frd-lab: FrdGpu init failed: {e}");
+            return 2;
+        }
+    };
+    if let Err(e) = ptg.wire_nrd_feed(
+        &hg.device,
+        &[
+            (16, &pl[0], fmts[0].0),
+            (17, fg.plane_in_nr(), DXGI_FORMAT_R10G10B10A2_UNORM),
+            (18, &pl[1], fmts[1].0),
+            (19, &pl[2], fmts[2].0),
+            (20, fg.plane_out_spec(), DXGI_FORMAT_R16G16B16A16_FLOAT),
+            (23, fg.plane_in_mv(), DXGI_FORMAT_R16G16B16A16_FLOAT),
+            (24, fg.plane_in_diff(), DXGI_FORMAT_R16G16B16A16_FLOAT),
+            (25, fg.plane_in_spec(), DXGI_FORMAT_R16G16B16A16_FLOAT),
+            (26, fg.plane_in_viewz(), DXGI_FORMAT_R32_FLOAT),
+            (27, fg.plane_out_diff(), DXGI_FORMAT_R16G16B16A16_FLOAT),
+        ],
+    ) {
+        eprintln!("frd-lab: frd wiring failed: {e}");
+        return 2;
+    }
+    let ua = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+
+    // ---- the motion program ------------------------------------------------
+    // hour0: the --tod value when given, else the sun the scene loaded with
+    // (the tod arm needs a numeric hour to scrub from).
+    let hour0 = opts.tod.unwrap_or_else(scene::default_tod);
+    let fwd0 = cam0.forward();
+    let rgt0 = fwd0.cross(Vec3A::Y).normalize();
+    let proj0 = {
+        let m = dlss::cam_matrices(&cam0, pw, ph, near, far);
+        m.view_to_clip.y_axis.y * ph as f32 * 0.5
+    };
+    // z_ref: the surface depth the px->world conversion targets — median
+    // finite primary t over the central quarter window of one probe frame.
+    let probe_fp = gpu::trace::FrameParams {
+        sway_prev_time: None,
+        cam: cam0.basis(pw, ph),
+        frame: 0,
+        accumulate: false,
+        jitter: false,
+        frame_jitter: Some((0.0, 0.0)),
+        prev_cam: Some(cam0.basis(pw, ph)),
+        q: uq,
+        verify: false,
+        spp: 1,
+        probe_sample: 0,
+        clouds: crate::clouds::Clouds::check(scene.diag),
+        fireflies: crate::fireflies::Fireflies::check(scene),
+        sway_time: sway_t,
+        replay: false,
+    };
+    ptg.write_cb(0, &probe_fp);
+    if hg.run(|l| ptg.record_wavefront(l, 0, &probe_fp, false)).is_err() {
+        eprintln!("frd-lab: probe frame failed");
+        return 2;
+    }
+    let z_ref = {
+        let tb = match hg.read_buffer(&ptg.tbuf, ua, npx * 4) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("frd-lab: tbuf readback failed: {e}");
+                return 2;
+            }
+        };
+        let mut ts: Vec<f32> = Vec::new();
+        for y in ph / 4..3 * ph / 4 {
+            for x in pw / 4..3 * pw / 4 {
+                let t = f32::from_le_bytes(tb[(y * pw + x) * 4..][..4].try_into().unwrap());
+                if t.is_finite() && t > 0.0 {
+                    ts.push(t);
+                }
+            }
+        }
+        if ts.is_empty() {
+            eprintln!(
+                "frd-lab: NO GEOMETRY in the central window — move --cam closer to the subject"
+            );
+            return 2;
+        }
+        ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        ts[ts.len() / 2]
+    };
+    let world_step = speed_px * z_ref / proj0.max(1e-4);
+    let dyaw = speed_px / proj0.max(1e-4);
+    // Travel clamp: the tracked glint must stay in frame — an un-clamped
+    // 24 px/frame x 24 frames marched the subject clean out of the framing
+    // and the corridor measured leftover sky. Cap total travel at 45% of
+    // the width (never under 4 motion frames).
+    let motion_frames = {
+        let max_frames = ((0.45 * pw as f32) / speed_px.max(1e-3)).floor().max(4.0) as u32;
+        if motion_frames > max_frames {
+            eprintln!(
+                "frd-lab: motion frames clamped {motion_frames} -> {max_frames} (travel cap at \
+                 {speed_px} px/frame; widen --frd-lab-res to extend)"
+            );
+        }
+        motion_frames.min(max_frames)
+    };
+    // tod arm: speed 4 px/frame maps to the interactive held scrub's cadence
+    // (1 game-hour/s at 60 fps = 1/60 h per frame).
+    let dh = speed_px / 240.0;
+    let pose = |k: u32| -> (Camera, f32) {
+        let kf = k as f32;
+        match kind {
+            "strafe" => {
+                let mut c = cam0;
+                c.pos += rgt0 * (world_step * kf);
+                (c, hour0)
+            }
+            "dolly" => {
+                let mut c = cam0;
+                c.pos += fwd0 * (world_step * kf);
+                (c, hour0)
+            }
+            "orbit" => {
+                let mut c = cam0;
+                c.yaw += dyaw * kf;
+                (c, hour0)
+            }
+            _ => (cam0, hour0 + dh * kf), // tod
+        }
+    };
+    eprintln!(
+        "frd-lab: {kind} | {rw}x{rh} | speed {speed_px} px/frame (z_ref {z_ref:.3}, world step \
+         {world_step:.5}/frame) | warm {WARM} + motion {motion_frames} + truth {WARM} frames \
+         | tod0 {hour0:.2}"
+    );
+
+    // ---- per-frame helpers -------------------------------------------------
+    let lum_out = |b: &[u8], i: usize| -> f32 {
+        let h = |l: usize| {
+            half::f16::from_bits(u16::from_le_bytes(b[i * 8 + l * 2..][..2].try_into().unwrap()))
+                .to_f32()
+        };
+        (h(0) + h(1) + h(2)) / 3.0
+    };
+    let lum_in = |b: &[u8], i: usize| -> f32 {
+        let f = |c: usize| f32::from_le_bytes(b[(i * 3 + c) * 4..][..4].try_into().unwrap());
+        (f(0) + f(1) + f(2)) / 3.0
+    };
+    // WINDOWED glint helpers. The frame carries several bright speculars
+    // (panel highlight, chin metal, bolts), so whole-frame centroids merge
+    // unrelated blobs — the first draft measured a 216-px "lag" that was two
+    // DIFFERENT glints being compared. Everything tracks ONE glint locally.
+    let clampi = |v: f32, hi: usize| (v.max(0.0) as usize).min(hi - 1);
+    // Brightest pixel inside a box of ±r around (cx, cy).
+    let argmax_in = |lum: &dyn Fn(usize) -> f32, cx: f32, cy: f32, r: usize| -> (f32, f32, f32) {
+        let (x0, x1) = (clampi(cx - r as f32, pw), clampi(cx + r as f32, pw));
+        let (y0, y1) = (clampi(cy - r as f32, ph), clampi(cy + r as f32, ph));
+        let (mut bx, mut by, mut bv) = (cx, cy, f32::MIN);
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let v = lum(y * pw + x);
+                if v > bv {
+                    bv = v;
+                    bx = x as f32;
+                    by = y as f32;
+                }
+            }
+        }
+        (bx, by, bv)
+    };
+    // Luma-weighted centroid of pixels >= thresh inside ±r of (cx, cy).
+    let centroid_in =
+        |lum: &dyn Fn(usize) -> f32, cx: f32, cy: f32, r: usize, thresh: f32| -> (f32, f32) {
+            let (x0, x1) = (clampi(cx - r as f32, pw), clampi(cx + r as f32, pw));
+            let (y0, y1) = (clampi(cy - r as f32, ph), clampi(cy + r as f32, ph));
+            let (mut sx, mut sy, mut sw) = (0f64, 0f64, 0f64);
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    let v = lum(y * pw + x);
+                    if v >= thresh {
+                        let w = v as f64;
+                        sx += x as f64 * w;
+                        sy += y as f64 * w;
+                        sw += w;
+                    }
+                }
+            }
+            if sw > 0.0 { ((sx / sw) as f32, (sy / sw) as f32) } else { (cx, cy) }
+        };
+    let tone8 = |v: f32| -> u32 {
+        let t = (1.0 - (-v.max(0.0)).exp()).powf(1.0 / 2.2);
+        ((t * 255.0 + 0.5) as u32).min(255)
+    };
+    let dump_out = |name: &str, b: &[u8]| {
+        let mut px = vec![0u32; npx];
+        for (i, p) in px.iter_mut().enumerate() {
+            let h = |l: usize| {
+                half::f16::from_bits(u16::from_le_bytes(
+                    b[i * 8 + l * 2..][..2].try_into().unwrap(),
+                ))
+                .to_f32()
+            };
+            *p = (tone8(h(0)) << 16) | (tone8(h(1)) << 8) | tone8(h(2));
+        }
+        save_png(name, &px, pw, ph);
+    };
+    // Log-luma view: the diagnostic dump — a 0.05-of-peak streak is WHITE
+    // through the tonemap at glint radiance, so tone PNGs show shape while
+    // the log PNGs show relative intensity structure.
+    let dump_log = |name: &str, b: &[u8], peak: f32| {
+        let denom = (1.0f32 + peak.max(1e-6)).ln();
+        let mut px = vec![0u32; npx];
+        for (i, p) in px.iter_mut().enumerate() {
+            let v = lum_out(b, i).max(0.0);
+            let g = (((1.0 + v).ln() / denom) * 255.0).clamp(0.0, 255.0) as u32;
+            *p = (g << 16) | (g << 8) | g;
+        }
+        save_png(name, &px, pw, ph);
+    };
+
+    // ---- the arm loop ------------------------------------------------------
+    // (label, force_curv, force_vmotion)
+    let arms: [(&str, Option<bool>, Option<bool>); 3] =
+        [("v152", None, None), ("flat", Some(false), None), ("novm", None, Some(false))];
+    struct ArmResult {
+        label: &'static str,
+        trail_max: f32,
+        lead_max: f32,
+        lag_mean: f32,
+        beyond_sum: f32,
+        keep_min: f32,
+        end_err: f32,
+    }
+    let mut results: Vec<ArmResult> = Vec::new();
+    let mut fidx = 1u32; // 0 was the probe
+    let mut cur_hour = f32::NAN; // the scene's applied hour (tod arm)
+    let mut glint_ok = true;
+    // ONE glint lock shared by every arm (locked from the first arm's
+    // converged frame, away from the border): per-arm global argmax found
+    // DIFFERENT bright objects per arm, which made the arms incomparable.
+    let mut glint_lock: Option<(f32, f32)> = None;
+    for (label, f_curv, f_vm) in arms {
+        fg.force_curv.set(f_curv);
+        fg.force_vmotion.set(f_vm);
+        // Per-frame prev state (the nrd_frame_step bookkeeping, harness-owned).
+        let mut prev: Option<(dlss::CamMatrices, [f32; 3], camera::CamBasis)> = None;
+        let mut conv_buf: Vec<u8> = Vec::new();
+        let mut outs: Vec<Vec<u8>> = Vec::new();
+        let mut ins: Vec<Vec<u8>> = Vec::new();
+        let mut truth_buf: Vec<u8> = Vec::new();
+        let mut failed = false;
+        // phase 0 = converge at pose 0, phase 1 = motion, phase 2 = truth
+        // converge at the final pose with FRESH history (a trail parked at
+        // the end pose must not contaminate its own ground truth).
+        for phase in 0..3u32 {
+            let steps = if phase == 1 { motion_frames } else { WARM };
+            for s in 0..steps {
+                let k = match phase {
+                    0 => 0,
+                    1 => s + 1,
+                    _ => motion_frames,
+                };
+                let (cam, hour) = pose(k);
+                if kind == "tod" && (cur_hour.is_nan() || (hour - cur_hour).abs() > 1e-6) {
+                    scene::apply_tod(scene, hour);
+                    ptg.refresh_sky(scene);
+                    cur_hour = hour;
+                }
+                let sun_cur = scene.sun.dir.to_array();
+                let basis = cam.basis(pw, ph);
+                let mats = dlss::cam_matrices(&cam, pw, ph, near, far);
+                let reset = (phase == 0 && s == 0) || (phase == 2 && s == 0);
+                let (pm, psun, pbasis) = prev.unwrap_or((mats, sun_cur, basis));
+                // The Frd-arm frame facts (nrd_frame_step verbatim).
+                let o_cur = mats.world_to_view.inverse().w_axis.truncate();
+                let o_prev = pm.world_to_view.inverse().w_axis.truncate();
+                let cam_step = (o_cur - o_prev).length();
+                let fwd = mats.world_to_view.row(2).truncate().normalize_or_zero();
+                let proj = mats.view_to_clip.y_axis.y * ph as f32 * 0.5;
+                let light_par =
+                    crate::frd::oracle::light_parallax(psun, sun_cur) * crate::frd::sunpar_gain();
+                let tanh = (cam.fov_y * 0.5).tan();
+                let vm = pm.view_to_clip * pm.world_to_view;
+                let c_fwd = cam.forward();
+                let c_rgt = c_fwd.cross(Vec3A::Y).normalize();
+                let c_up = c_rgt.cross(c_fwd);
+                let fp = gpu::trace::FrameParams {
+                    sway_prev_time: None,
+                    cam: basis,
+                    frame: fidx,
+                    accumulate: false,
+                    jitter: false,
+                    frame_jitter: Some(dlss::jitter_for(fidx)),
+                    prev_cam: Some(pbasis),
+                    q: uq,
+                    verify: false,
+                    spp: 1,
+                    probe_sample: 0,
+                    clouds: crate::clouds::Clouds::check(scene.diag),
+                    fireflies: crate::fireflies::Fireflies::check(scene),
+                    sway_time: sway_t,
+                    replay: false,
+                };
+                ptg.write_cb(0, &fp);
+                let (mut r1, mut r2, mut r3) = (Ok(()), Ok(()), Ok(()));
+                let sub = hg.run(|l| {
+                    ptg.record_wavefront(l, 0, &fp, false);
+                    r1 = ptg.record_nrd_pack(l, 0);
+                    r2 = fg.record(
+                        l,
+                        0,
+                        &gpu::frd_gpu::FrdFrame {
+                            reset,
+                            far,
+                            proj,
+                            cam_step,
+                            cam_fwd: fwd.to_array(),
+                            light_par,
+                            vm_m: vm.to_cols_array(),
+                            cam_org: cam.pos.to_array(),
+                            cam_rgt: (c_rgt * (tanh * pw as f32 / ph as f32)).to_array(),
+                            cam_up: (c_up * tanh).to_array(),
+                        },
+                    );
+                    r3 = ptg.record_nrd_out(l, 0);
+                });
+                fidx += 1;
+                if sub.is_err() || r1.is_err() || r2.is_err() || r3.is_err() {
+                    eprintln!(
+                        "frd-lab: [{label}] frame failed (phase {phase} step {s}): {r1:?} {r2:?} {r3:?}"
+                    );
+                    failed = true;
+                    break;
+                }
+                prev = Some((mats, sun_cur, basis));
+                let want_out = (phase == 0 && s == steps - 1)
+                    || phase == 1
+                    || (phase == 2 && s == steps - 1);
+                if want_out {
+                    let ob = match read_tex_at(&mut hg, &pl[0], fmts[0].0, 8, pw, ph, npsr) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("frd-lab: [{label}] OUT readback failed: {e}");
+                            failed = true;
+                            break;
+                        }
+                    };
+                    match phase {
+                        0 => conv_buf = ob,
+                        1 => {
+                            // The fresh 1-spp input, kept whole: glint
+                            // tracking runs after the phases (it needs the
+                            // converged glint as its lock-on seed).
+                            let ib = match hg.read_buffer(&ptg.accum, ua, npx * 12) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    eprintln!("frd-lab: [{label}] accum readback failed: {e}");
+                                    failed = true;
+                                    break;
+                                }
+                            };
+                            ins.push(ib);
+                            outs.push(ob);
+                        }
+                        _ => truth_buf = ob,
+                    }
+                }
+            }
+            if failed {
+                break;
+            }
+        }
+        if failed {
+            fg.force_curv.set(None);
+            fg.force_vmotion.set(None);
+            return 2;
+        }
+
+        // ---- metrics for this arm ------------------------------------------
+        // Lock onto ONE glint: the converged frame's brightest pixel seeds
+        // the track, each motion frame's INPUT re-locks by local argmax (the
+        // glint can move at most `speed_px`/frame, so a ±40 window holds it).
+        let conv_mean =
+            (0..npx).map(|i| lum_out(&conv_buf, i) as f64).sum::<f64>() / npx as f64;
+        let (gx0, gy0) = *glint_lock.get_or_insert_with(|| {
+            // Seed: the interior's brightest converged pixel (a 16-px border
+            // margin — an edge-clamped lock tracked a half-visible blob once).
+            let (mut bx, mut by, mut bv) = (pw as f32 * 0.5, ph as f32 * 0.5, f32::MIN);
+            for y in 16..ph.saturating_sub(16) {
+                for x in 16..pw.saturating_sub(16) {
+                    let v = lum_out(&conv_buf, y * pw + x);
+                    if v > bv {
+                        bv = v;
+                        bx = x as f32;
+                        by = y as f32;
+                    }
+                }
+            }
+            (bx, by)
+        });
+        let (_, _, conv_loc_peak) = argmax_in(&|i| lum_out(&conv_buf, i), gx0, gy0, 16);
+        let t_core = 0.25 * conv_loc_peak;
+        let t_streak = (0.05 * conv_loc_peak).max(10.0 * conv_mean as f32);
+        if conv_loc_peak < 10.0 * conv_mean as f32 {
+            eprintln!(
+                "frd-lab: [{label}] NO GLINT — converged peak {conv_loc_peak:.2} < 10x scene \
+                 mean {conv_mean:.3}; move --cam/--tod until a bright specular is in view"
+            );
+            glint_ok = false;
+        }
+        // The tracked input positions (windowed centroid at each lock), plus
+        // the GLINT-LIFETIME gate: on a strafe past a curved shell the
+        // mirror point slides, the glint FADES OUT, and the local argmax
+        // then re-locks onto a DIFFERENT glint tens of px away — a measured
+        // 83-px "trail" was exactly that handoff, not a streak. A frame is
+        // alive while the input's local peak holds >= 5% of its initial
+        // value AND the track step stays physical (<= speed + 12 px);
+        // metrics stop at the first dead frame.
+        let mut in_cs: Vec<(f32, f32)> = Vec::new();
+        let (mut tx, mut ty) = (gx0, gy0);
+        let mut in_peaks: Vec<f32> = Vec::new();
+        for ib in &ins {
+            let (mx, my, mv) = argmax_in(&|i| lum_in(ib, i), tx, ty, 40);
+            let ic = centroid_in(&|i| lum_in(ib, i), mx, my, 16, 0.25 * mv);
+            tx = ic.0;
+            ty = ic.1;
+            in_cs.push(ic);
+            in_peaks.push(mv);
+        }
+        let mut alive_n = ins.len();
+        for k in 0..ins.len() {
+            let fade = in_peaks[k] < 0.05 * in_peaks[0];
+            let jump = k > 0 && {
+                let (dx, dy) = (in_cs[k].0 - in_cs[k - 1].0, in_cs[k].1 - in_cs[k - 1].1);
+                (dx * dx + dy * dy).sqrt() > speed_px + 12.0
+            };
+            if fade || jump {
+                alive_n = k;
+                eprintln!(
+                    "frd-lab: [{label}] glint died at motion frame {} ({}) — metrics cover \
+                     frames 1..{}",
+                    k + 1,
+                    if fade { "faded out" } else { "track handoff" },
+                    alive_n
+                );
+                break;
+            }
+        }
+        if alive_n == 0 {
+            eprintln!("frd-lab: [{label}] glint dead at frame 1 — no metrics for this arm");
+            glint_ok = false;
+        }
+        // The motion axis: ANALYTIC for strafe (the harness controls the
+        // motion — content moves along -x when the camera strafes +right, so
+        // the axis is exact and the track needs no de-noising); measured
+        // from the tracked input positions for the other kinds.
+        let (c0, cl) = (in_cs[0], in_cs[in_cs.len() - 1]);
+        let (mut ax, mut ay) = (cl.0 - c0.0, cl.1 - c0.1);
+        let alen = (ax * ax + ay * ay).sqrt();
+        if kind == "strafe" {
+            ax = -1.0;
+            ay = 0.0;
+        } else if alen >= 1.0 {
+            ax /= alen;
+            ay /= alen;
+        } else {
+            ax = -1.0;
+            ay = 0.0;
+        }
+        // Converged glint half-extent along the axis inside its own
+        // corridor — streak lengths are measured PAST this footprint.
+        let mut half_ext = 0f32;
+        for y in 0..ph {
+            for x in 0..pw {
+                if lum_out(&conv_buf, y * pw + x) >= t_streak {
+                    let (dx, dy) = (x as f32 - gx0, y as f32 - gy0);
+                    let p = dx * -ay + dy * ax;
+                    if p.abs() > 12.0 {
+                        continue;
+                    }
+                    half_ext = half_ext.max((dx * ax + dy * ay).abs());
+                }
+            }
+        }
+        half_ext = half_ext.min(24.0);
+        eprintln!(
+            "frd-lab: [{label}] conv glint ({gx0:.0},{gy0:.0}) peak {conv_loc_peak:.1} mean \
+             {conv_mean:.3} | axis ({ax:.2},{ay:.2}) track {alen:.1} px | half-extent \
+             {half_ext:.1} px | T_core {t_core:.1} T_streak {t_streak:.1}"
+        );
+        eprintln!(
+            "frd-lab: [{label}]   k |   in_x,in_y  |  out_x,out_y |   lag |  trail |  lead | \
+             beyond | keep"
+        );
+        // Corridor discipline: only pixels within +-12 px of the line
+        // through the tracked glint along the axis, |s| <= 160, count — the
+        // frame's OTHER glints must not pollute the streak numbers.
+        let band = 12.0f32;
+        let (mut trail_max, mut lead_max, mut beyond_sum, mut lag_sum) = (0f32, 0f32, 0f32, 0f32);
+        let mut keep_min = f32::INFINITY;
+        for (kk, ob) in outs.iter().enumerate().take(alive_n) {
+            let ic = in_cs[kk];
+            // The denoised glint, locked to the same neighborhood. `keep` =
+            // its peak over the converged peak: a streak SPREADS the glint's
+            // energy, so a suppressed peak (keep << 1) is the same failure
+            // read the other way — at low speeds the trail can sit entirely
+            // under T_streak while keep collapses (measured at 4 px/frame).
+            let (omx, omy, omv) = argmax_in(&|i| lum_out(ob, i), ic.0, ic.1, 32);
+            let keep = omv / conv_loc_peak.max(1e-6);
+            keep_min = keep_min.min(keep);
+            let oc = centroid_in(&|i| lum_out(ob, i), omx, omy, 16, 0.5 * omv);
+            let lag = (oc.0 - ic.0) * ax + (oc.1 - ic.1) * ay;
+            let (mut trail, mut lead, mut beyond) = (0f32, 0f32, 0f32);
+            for y in 0..ph {
+                for x in 0..pw {
+                    let v = lum_out(ob, y * pw + x);
+                    if v < t_streak {
+                        continue;
+                    }
+                    let (dx, dy) = (x as f32 - ic.0, y as f32 - ic.1);
+                    let s = dx * ax + dy * ay;
+                    let p = dx * -ay + dy * ax;
+                    if p.abs() > band || s.abs() > 160.0 {
+                        continue; // off the streak corridor (other content)
+                    }
+                    trail = trail.max(-s - half_ext);
+                    lead = lead.max(s - half_ext);
+                    let s0 = (x as f32 - c0.0) * ax + (y as f32 - c0.1) * ay;
+                    if s0 < -half_ext || s > half_ext {
+                        beyond += v;
+                    }
+                }
+            }
+            trail_max = trail_max.max(trail);
+            lead_max = lead_max.max(lead);
+            beyond_sum += beyond;
+            lag_sum += lag;
+            let last = kk + 1 == alive_n;
+            if kk % 4 == 0 || last {
+                eprintln!(
+                    "frd-lab: [{label}] {:3} | {:6.1},{:5.1} | {:6.1},{:5.1} | {:5.1} | {:6.1} | {:5.1} | {:7.1} | {:.2}",
+                    kk + 1, ic.0, ic.1, oc.0, oc.1, lag, trail, lead, beyond, keep
+                );
+            }
+            if last {
+                // The 1D streak profile along the axis through the glint —
+                // 4-px bins, diffable without images.
+                let mut bins = [0f32; 24];
+                let mut cnts = [0u32; 24];
+                for y in 0..ph {
+                    for x in 0..pw {
+                        let (dx, dy) = (x as f32 - ic.0, y as f32 - ic.1);
+                        let p = dx * -ay + dy * ax;
+                        if p.abs() > 6.0 {
+                            continue;
+                        }
+                        let s = dx * ax + dy * ay;
+                        let b = ((s + 48.0) / 4.0).floor();
+                        if (0.0..24.0).contains(&b) {
+                            bins[b as usize] += lum_out(ob, y * pw + x);
+                            cnts[b as usize] += 1;
+                        }
+                    }
+                }
+                let prof: Vec<String> = bins
+                    .iter()
+                    .zip(cnts.iter())
+                    .map(|(&s, &n)| format!("{:.1}", if n > 0 { s / n as f32 } else { 0.0 }))
+                    .collect();
+                eprintln!(
+                    "frd-lab: [{label}] profile s=-48..48 (4px bins, luma): {}",
+                    prof.join(" ")
+                );
+            }
+        }
+        // end_err vs the fresh-history converged final pose.
+        let mut end_err = 0f64;
+        let mut end_n = 0usize;
+        if let Some(last_out) = outs.last() {
+            for i in 0..npx {
+                let a = lum_out(last_out, i);
+                let b = lum_out(&truth_buf, i);
+                if a >= t_streak || b >= t_streak {
+                    end_err += (a - b).abs() as f64;
+                    end_n += 1;
+                }
+            }
+        }
+        let end_err = if end_n > 0 { (end_err / end_n as f64) as f32 } else { 0.0 };
+        let lag_mean = if alive_n == 0 { 0.0 } else { lag_sum / alive_n as f32 };
+        eprintln!(
+            "frd-lab: [{label}] SUMMARY trail_max {trail_max:.1} px | lead_max {lead_max:.1} px \
+             | lag_mean {lag_mean:.1} px | beyond {beyond_sum:.0} | end_err {end_err:.2}"
+        );
+        // PNGs: converged, a few motion frames (tone), the last motion frame
+        // (log — relative intensity), the fresh-history truth, the raw input.
+        dump_out(&format!("frd-lab-{label}-conv.png"), &conv_buf);
+        let every = (outs.len() / 4).max(1);
+        for (kk, ob) in outs.iter().enumerate() {
+            if kk % every == 0 || kk + 1 == outs.len() {
+                dump_out(&format!("frd-lab-{label}-f{:02}.png", kk + 1), ob);
+            }
+        }
+        if let Some(last_out) = outs.last() {
+            dump_log(
+                &format!("frd-lab-{label}-log-f{:02}.png", outs.len()),
+                last_out,
+                conv_loc_peak,
+            );
+        }
+        dump_out(&format!("frd-lab-{label}-truth.png"), &truth_buf);
+        if let Some(last_input) = ins.last() {
+            let mut px = vec![0u32; npx];
+            for (i, p) in px.iter_mut().enumerate() {
+                let f = |c: usize| {
+                    f32::from_le_bytes(last_input[(i * 3 + c) * 4..][..4].try_into().unwrap())
+                };
+                *p = (tone8(f(0)) << 16) | (tone8(f(1)) << 8) | tone8(f(2));
+            }
+            save_png(&format!("frd-lab-{label}-input-f{:02}.png", outs.len()), &px, pw, ph);
+        }
+        results.push(ArmResult {
+            label,
+            trail_max,
+            lead_max,
+            lag_mean,
+            beyond_sum,
+            keep_min,
+            end_err,
+        });
+    }
+    fg.force_curv.set(None);
+    fg.force_vmotion.set(None);
+
+    // ---- verdicts (loud, never the exit code — this is an instrument) ------
+    eprintln!("frd-lab: ===== verdicts ({kind}, {speed_px} px/frame) =====");
+    for r in &results {
+        eprintln!(
+            "frd-lab:   {:5} trail {:6.1} lead {:6.1} lag {:6.1} beyond {:9.0} keep {:.2} \
+             end_err {:.2}",
+            r.label, r.trail_max, r.lead_max, r.lag_mean, r.beyond_sum, r.keep_min, r.end_err
+        );
+    }
+    if !glint_ok {
+        eprintln!("frd-lab: VERDICT: NO GLINT at this pose — metrics above are not meaningful");
+    } else if kind == "strafe" || kind == "dolly" {
+        // The flat arm's failure reads two ways depending on speed: a visible
+        // above-threshold TRAIL (fast strafes) or the glint's peak SUPPRESSED
+        // into the smear (slow strafes spread the same energy under
+        // T_streak) — either one is the streak bug reproduced.
+        let get = |l: &str| results.iter().find(|r| r.label == l);
+        if let (Some(v), Some(f)) = (get("v152"), get("flat")) {
+            let trail_teeth = f.trail_max > v.trail_max * 1.5 && f.trail_max > 4.0;
+            let keep_teeth = f.keep_min < v.keep_min * 0.5;
+            if trail_teeth || keep_teeth {
+                eprintln!(
+                    "frd-lab: VERDICT: teeth OK — flat arm trail {:.1} px / keep {:.2} vs \
+                     shipping {:.1} px / {:.2} ({})",
+                    f.trail_max,
+                    f.keep_min,
+                    v.trail_max,
+                    v.keep_min,
+                    if trail_teeth { "visible trail" } else { "glint suppression" }
+                );
+            } else {
+                eprintln!(
+                    "frd-lab: VERDICT: teeth WEAK — flat trail {:.1}/keep {:.2} vs shipping \
+                     {:.1}/{:.2}: either the pose has no curvature-dependent glint or the \
+                     repro did not fire",
+                    f.trail_max, f.keep_min, v.trail_max, v.keep_min
+                );
+            }
+        }
+    } else {
+        // orbit/tod are negative controls FOR THE VM/CURVATURE MACHINERY:
+        // the signature that matters is ARM-UNIFORMITY. orbit should read ~0
+        // everywhere (rotation shares the ray through the unmoved origin);
+        // tod residue is legitimate but must be arm-INDEPENDENT — it lives
+        // in the shared light-par cap regime, and an arm-dependent number
+        // here means the controls stopped being controls.
+        let tmax = results.iter().map(|r| r.trail_max).fold(0f32, f32::max);
+        let tmin = results.iter().map(|r| r.trail_max).fold(f32::INFINITY, f32::min);
+        let uniform = tmax < 4.0 || tmax <= tmin.max(1.0) * 1.5;
+        eprintln!(
+            "frd-lab: VERDICT: {kind} control — trails {} (spread {tmin:.1}..{tmax:.1} px); \
+             any residue here is the shared light-par/cap regime, not curvature/vmotion",
+            if uniform { "ARM-UNIFORM as expected" } else { "ARM-DEPENDENT (investigate!)" }
+        );
+    }
+    0
 }
 
 /// Headless deterministic workload driver (--spin still|path): replicates
