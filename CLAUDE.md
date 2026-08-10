@@ -1159,6 +1159,43 @@ cargo run --release -- --fg           # FRAME GENERATION, DLSS family (W4 leg 2)
                                       # f16 quantum of far classifies as sky (~zero parallax
                                       # at 2*diag anyway). Rungholt STANDALONE never had this
                                       # bug (diag 10 -> far 20, f16-exact).
+                                      # ROUND 5 of the same pass (2026-08-10, v1.5.4 — the
+                                      # MAX-STRAFE curved-mirror SHRED, the user's "smearing
+                                      # at max strafing speed past the helmet"; diagnosed
+                                      # end-to-end by the AI QA Lab with DESKTOP screen
+                                      # captures, since P/frqa screenshots read rr.output and
+                                      # never see a generated frame): the round-2 unfold is
+                                      # FLAT-mirror — on the helmet's convex dome the sun
+                                      # glint's true motion rides the SURFACE (the sun images
+                                      # at ~R/2 behind the shell — FRD's v1.5.1 insight, never
+                                      # ported here), so the sky arm handed NGX a rotation-
+                                      # only ~zero-translation MV that at max strafe was wrong
+                                      # by HUNDREDS of px/frame, and the smooth-metal blend
+                                      # weight (w≈1) applied it at full strength: every
+                                      # generated frame warped into mosaic tears
+                                      # (FR_NGXFG_SHOW=interp captures; =real clean at the
+                                      # same speed = the frame-alternating band the user
+                                      # screenshots at fg x2). Fix: FRD's v1.5.1/.3 curvature
+                                      # ported — κ from de-biased res-scaled central diffs of
+                                      # the nrough plane (fg_vm_curv_at/fg_vm_axis, literals
+                                      # in lockstep with frd_common's twins; offsets ±s/±2s,
+                                      # s = round(h/540)) and t_v = t_r/(1+2κ·t_r) BEFORE the
+                                      # sky test and the unfold — a curved dome's "sky"
+                                      # reflection re-routes to a near virtual image whose MV
+                                      # rides the surface; Δn ≡ 0 keeps the flat path bitwise
+                                      # (planar mirrors/still water untouched). The Rust twin
+                                      # is ngxfg_guides::curved_unfold_dist — a thin
+                                      # composition over frd::oracle::{vm_kappa,virtual_dist},
+                                      # so the two engines share ONE κ family (the unfold
+                                      # cross-pin closed from the κ side). FR_NGXFG_CURV=off
+                                      # is the repro arm (the shred returns on demand — the
+                                      # curv lane rides GuideParams' ex-_pad2). Gated in the
+                                      # ngxfg-guides self-test: the (d2) composed pin — under
+                                      # the same strafe the curved unfold must land within
+                                      # 0.15·mv_surf of the SURFACE reprojection while the
+                                      # flat arm's ~0-px answer (correct on planes, the teeth)
+                                      # sits a whole surface-MV away, heavy-κ t_v < 0.25·z,
+                                      # constant-field t_r bitwise.
                                       # Gate teeth: a
                                       # parked-camera probe scans dt INSIDE the fade window
                                       # across 8 base phases until >= 2 px (loud if never —

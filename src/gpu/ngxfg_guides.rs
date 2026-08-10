@@ -174,7 +174,20 @@ cbuffer C : register(b0) {
     float4 rgt;  // right * tan(fov/2) * aspect (CamBasis pre-scaling)
     float4 upv;  // up * tan(fov/2)
     uint   rmv; float cam_far; float t_cur; float t_prev; // ripple clock (rides the old _pad)
-    float  diag; uint ripplemv; uint ripdt; float _pad2;
+    float  diag; uint ripplemv; uint ripdt; uint curv;
+}
+// v1.5.4 — FRD's v1.5.3 κ estimator, ported (frd_common.hlsli's twins; the
+// literals mirror frd::VM_DN_DZ and the de-biased combine — one κ family,
+// two engines, change all together). The dead-zone is absolute per-sample
+// noise while the signal grows with the baseline, hence the subtractive
+// form, the de-bias skew, and the res-scaled offsets at the call site.
+float fg_vm_curv_at(float dn, float base_px, float z, float pr) {
+    return max(dn - 5e-3f, 0.0f) * pr / (base_px * max(z, 1e-4f));
+}
+float fg_vm_axis(float k2, float k4, float skew) {
+    if (k2 <= 0.0f) return k4 <= 0.0f ? 0.0f : k4;
+    if (k4 <= 0.0f) return 0.0f;
+    return min(k2 + 2.0f * skew, k4 + skew);
 }
 // Round 3: the CPU-baked firefly splat table (FfTable — layout in lockstep,
 // see the size assert beside it). ffc == 0 is the structural off.
@@ -218,7 +231,43 @@ void cs_guides(uint3 id : SV_DispatchThreadID) {
         // Projecting a direction is the point projection with the translation
         // column dropped (a w = 0 homogeneous point), which yields exactly the
         // rotation-only reprojection the sky deserves.
-        bool sky_refl = t_r >= cam_far;
+        // v1.5.4 — the CURVED-mirror unfold distance (FRD v1.5.1/.3 ported):
+        // κ from de-biased central differences of the normal plane at
+        // res-scaled offsets (±s/±2s texels span the same WORLD footprint at
+        // every render height — the v1.5.3 lesson), then the mirror equation
+        // t_v = t_r/(1 + 2κ·t_r) BEFORE the sky test — a convex dome's
+        // "sky" reflection is a NEAR virtual image whose MV rides the
+        // surface, and the flat sky arm's rotation-only MV is wrong by the
+        // whole per-frame motion (at max strafe: hundreds of px, which
+        // shredded every generated frame). A constant normal field reads
+        // Δn ≡ 0 ⇒ κ = 0 ⇒ t_v = t_r bitwise — planar mirrors untouched.
+        float t_v = t_r;
+        if (curv != 0) {
+            int vs = max((int)floor(h / 540.0f + 0.5f), 1);
+            int2 pi = int2(id.xy);
+            int2 xm = int2(max(pi.x - vs, 0), pi.y);
+            int2 xp = int2(min(pi.x + vs, (int)w - 1), pi.y);
+            int2 ym = int2(pi.x, max(pi.y - vs, 0));
+            int2 yp = int2(pi.x, min(pi.y + vs, (int)h - 1));
+            int2 xm2 = int2(max(pi.x - 2 * vs, 0), pi.y);
+            int2 xp2 = int2(min(pi.x + 2 * vs, (int)w - 1), pi.y);
+            int2 ym2 = int2(pi.x, max(pi.y - 2 * vs, 0));
+            int2 yp2 = int2(pi.x, min(pi.y + 2 * vs, (int)h - 1));
+            float pr = h / (2.0f * length(upv.xyz)); // world->px projection
+            float b1 = 2.0f * vs;
+            float k2x = fg_vm_curv_at(
+                length(normalize(nrough[xp].xyz) - normalize(nrough[xm].xyz)), b1, z, pr);
+            float k4x = fg_vm_curv_at(
+                length(normalize(nrough[xp2].xyz) - normalize(nrough[xm2].xyz)), 2.0f * b1, z, pr);
+            float k2y = fg_vm_curv_at(
+                length(normalize(nrough[yp].xyz) - normalize(nrough[ym].xyz)), b1, z, pr);
+            float k4y = fg_vm_curv_at(
+                length(normalize(nrough[yp2].xyz) - normalize(nrough[ym2].xyz)), 2.0f * b1, z, pr);
+            float skew = 5e-3f * pr / (2.0f * b1 * max(z, 1e-4f));
+            float kap = max(fg_vm_axis(k2x, k4x, skew), fg_vm_axis(k2y, k4y, skew));
+            if (kap > 0.0f) t_v = t_r / (1.0f + 2.0f * kap * t_r);
+        }
+        bool sky_refl = t_v >= cam_far;
         float3 hit_p = org.xyz + du * ray_t;
         // ROUND 4 — the mirror itself MOVES on water.
         //
@@ -283,7 +332,7 @@ void cs_guides(uint3 id : SV_DispatchThreadID) {
                 }
             }
         }
-        float3 V = hit_p + d * t_r; // planar-unfold virtual point
+        float3 V = hit_p + d * t_v; // unfold at the CURVED-mirror distance (v1.5.4)
         float4 pc = sky_refl ? (m0 * d.x + m1 * d.y + m2 * d.z)
                              : (m0 * V.x + m1 * V.y + m2 * V.z + m3);
         if (pc.w > 1e-6f) {
@@ -524,6 +573,30 @@ pub fn rmv_weight(lum_diff: f32, lum_spec: f32, rough: f32) -> f32 {
     (lum_spec / (lum_diff + lum_spec + 1e-4)).clamp(0.0, 1.0) * smooth
 }
 
+/// v1.5.4 — the Rust twin of `cs_guides`' curvature block: κ from the four
+/// dead-zoned central differences via the de-biased combine, then the
+/// mirror equation on the unfold distance. A thin composition over
+/// `frd::oracle::{vm_kappa, virtual_dist}` — deliberately the SAME
+/// functions FRD's temporal pass is pinned against, so the two engines
+/// cannot drift (the existing unfold cross-pin, closed from the κ side
+/// too). `dn* == 0` (a constant normal field) returns `t_r` BITWISE — the
+/// flat-mirror path every planar reflector keeps.
+#[allow(clippy::too_many_arguments)]
+pub fn curved_unfold_dist(
+    dn2x: f32,
+    dn4x: f32,
+    dn2y: f32,
+    dn4y: f32,
+    view_z: f32,
+    proj: f32,
+    scale: f32,
+    t_r: f32,
+) -> f32 {
+    let (kap, _, _) =
+        crate::frd::oracle::vm_kappa(dn2x, dn4x, dn2y, dn4y, view_z, proj, scale);
+    crate::frd::oracle::virtual_dist(t_r, kap)
+}
+
 /// Round 3: the CPU-baked firefly splat table — the `FF` cbuffer's exact
 /// byte layout (16-byte header + two float4 rows per `MAX_FIREFLIES` slot;
 /// the HLSL declares `ffa[64]`/`ffb[64]`, in lockstep with the array bound
@@ -715,7 +788,20 @@ pub struct GuideParams {
     /// the 8K low-framerate repro arm; 1 = the shipped dt-confidence fade,
     /// see `RIPPLE_DT_LO`/`RIPPLE_DT_HI`).
     pub ripdt: u32,
-    pub _pad2: f32,
+    /// v1.5.4 — the CURVED-mirror unfold (FRD's v1.5.1/.3 ported to this
+    /// engine, the cross-pin closed from the other side): κ from de-biased
+    /// res-scaled central differences of the normal plane, then the mirror
+    /// equation t_v = t_r/(1 + 2κ·t_r) BEFORE the sky test and the unfold.
+    /// A convex dome images the sun ~R/2 behind the surface, so its glint
+    /// rides the SURFACE — the flat sky arm's rotation-only MV is wrong by
+    /// the whole per-frame motion there, which at max strafe speed handed
+    /// NGX MVs off by hundreds of px and SHREDDED every generated frame
+    /// (mosaic tears — the AI-QA-Lab FR_NGXFG_SHOW=interp screen captures).
+    /// `FR_NGXFG_CURV=off` clears it (0 = the flat-mirror repro arm). A
+    /// constant normal field reads Δn ≡ 0 ⇒ κ = 0 ⇒ the flat path
+    /// verbatim — still water and every planar mirror are structurally
+    /// untouched. Rides the old `_pad2`.
+    pub curv: u32,
 }
 const PARAM_DWORDS: u32 = (std::mem::size_of::<GuideParams>() / 4) as u32;
 const _: () = assert!(std::mem::size_of::<GuideParams>() == 44 * 4);
@@ -1658,6 +1744,48 @@ pub fn self_test() -> std::result::Result<(), String> {
                      also lands at {mv_old} px, so this probe could never have caught the \
                      sky-reflection warp"
                 ));
+            }
+        }
+        // (d2) v1.5.4 — the CURVED mirror under the SAME strafe. A convex
+        // dome images the sky at ~R/2 BEHIND the surface, so its glint's
+        // true MV rides the SURFACE — the flat sky arm above (exactly right
+        // on planes) is wrong by the whole surface MV there, which at max
+        // strafe speed handed NGX MVs off by hundreds of px and shredded
+        // every generated frame (the AI-QA-Lab FR_NGXFG_SHOW=interp screen
+        // captures). The kernel's curved unfold must land the virtual point
+        // NEAR the surface reprojection: heavy κ ⇒ t_v ≈ R/2 ≪ z, and the
+        // parallax gap between depth z and z + t_v is a small fraction of
+        // the surface MV. The flat arm's ~0 answer (proven ≤ 0.05 px above)
+        // is the teeth: dist(flat, surface) ≈ mv_surf while the curved arm
+        // must sit within 0.15·mv_surf of the surface.
+        {
+            let pr = rh as f32 / (2.0 * (cam.fov_y * 0.5).tan());
+            let dn = 0.05f32; // a real dome's per-2px normal swing, well past the DZ
+            let t_v = curved_unfold_dist(dn, 2.0 * dn, dn, 2.0 * dn, view_z, pr, 1.0, far_probe);
+            if t_v >= 0.25 * view_z {
+                return Err(format!(
+                    "curved unfold: heavy-κ t_v must collapse well under z ({t_v} vs z {view_z})"
+                ));
+            }
+            let (kx, ky) = virtual_prev_px(
+                cx, cy, rw as f32, rh as f32, view_z, t_v, far_probe, org, fwd, rgt, upv,
+                &world_to_strafe_clip,
+            )
+            .ok_or("curved unfold: virtual point behind camera")?;
+            let d_curv = ((kx - sx).powi(2) + (ky - sy).powi(2)).sqrt();
+            if d_curv > 0.15 * mv_surf {
+                return Err(format!(
+                    "curved unfold under strafe: virtual MV {d_curv} px from the surface \
+                     reprojection (surface MV {mv_surf} px) — a convex dome's glint must \
+                     ride the surface, not the sky"
+                ));
+            }
+            // The bitwise flat contract: a constant normal field must return
+            // t_r VERBATIM (planar mirrors keep the sky arm exactly).
+            if curved_unfold_dist(0.0, 0.0, 0.0, 0.0, view_z, pr, 1.0, far_probe)
+                != far_probe
+            {
+                return Err("curved unfold: constant field must return t_r bitwise".into());
             }
         }
     }

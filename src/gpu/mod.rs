@@ -544,6 +544,12 @@ struct NgxFgState {
     /// FR_NGXFG_RMV=off — hand the evaluate the raw SURFACE-MV plane (the
     /// A/B arm that brings the reflection swimming back on demand).
     rmv_off: bool,
+    /// FR_NGXFG_CURV=off — the guide pass's virtual unfold reverts to the
+    /// FLAT-mirror distance (the pre-v1.5.4 kernel): the max-speed
+    /// curved-mirror shred repro arm (a convex dome's glint rides the
+    /// SURFACE, and the flat sky arm hands NGX a ~zero-translation MV that
+    /// is wrong by the whole per-frame motion on generated frames).
+    curv_off: bool,
     /// FR_NGXFG_JITTER: 0 = RAW (un-negated) — THE DEFAULT, settled by
     /// measurement; 1 = zero; 2 = "neg", the SL-negated convention this used
     /// to default to.
@@ -1427,6 +1433,13 @@ impl GpuContext {
                              (expect reflections to swim under motion)"
                         );
                     }
+                    let curv_off = lever("FR_NGXFG_CURV", &["off"]) == 1;
+                    if curv_off {
+                        eprintln!(
+                            "fg: FR_NGXFG_CURV=off — flat-mirror virtual unfold (the \
+                             max-strafe curved-mirror shred repro arm)"
+                        );
+                    }
                     let guides = if depth_linear && rmv_off {
                         None
                     } else {
@@ -1582,6 +1595,7 @@ impl GpuContext {
                         guides_failed: std::cell::Cell::new(false),
                         depth_linear,
                         rmv_off,
+                        curv_off,
                         jitter_mode,
                         mv_mode,
                         show_mode,
@@ -6568,7 +6582,7 @@ impl GpuContext {
                 diag: cl.diag,
                 ripplemv: (!n.ripplemv_off) as u32,
                 ripdt: (!n.ripdt_off) as u32,
-                _pad2: 0.0,
+                curv: (!n.curv_off) as u32,
             };
             gp.record(list, &p, slot, &ff_table);
         }
