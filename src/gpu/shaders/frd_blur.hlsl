@@ -180,12 +180,12 @@ void cs_frd_post(uint3 id : SV_DispatchThreadID) {
     float4 fs = b_fast_spec[p];
     if (c.nn.x >= fast_frames) {
         float sig = sqrt(max(fd.w, 0.0));
-        g.x = frd_antilag_gain(abs(od.x - fd.x) / max(clamp_sigma * sig, 1e-6));
+        g.x = frd_antilag_gain(frd_antilag_excess(abs(od.x - fd.x), clamp_sigma * sig, fd.x));
         od.xyz = frd_clamp_ycocg(od.xyz, fd.xyz, sig, clamp_sigma);
     }
     if (c.nn.y >= fast_frames) {
         float sig = sqrt(max(fs.w, 0.0));
-        g.y = frd_antilag_gain(abs(os.x - fs.x) / max(clamp_sigma * sig, 1e-6));
+        g.y = frd_antilag_gain(frd_antilag_excess(abs(os.x - fs.x), clamp_sigma * sig, fs.x));
         os.xyz = frd_clamp_ycocg(os.xyz, fs.xyz, sig, clamp_sigma);
     }
     b_out_diff[p] = od;

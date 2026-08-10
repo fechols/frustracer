@@ -341,16 +341,19 @@ void cs_frd_temporal(uint3 id : SV_DispatchThreadID) {
     }
     // Anti-lag (flag bit 3, FR_FRD_ANTILAG=off is the repro arm): where
     // pass 3's clamp had to move a signal e box-widths, its stored
-    // g = 1/max(e,1) cuts the reprojected age — antilag_frames(n, e) ==
-    // n·g exactly (the F0 identity), so the NEXT frame blends fast and the
-    // ghost's rejection sticks. A no-valid-feet pixel leaves al at 0 with
-    // nprev already 0 — the multiply is inert there by construction.
+    // g = 1/max(e,1) cuts the reprojected age — FLOORED at the history-fix
+    // window (frd_antilag_apply: recover at the fast-history rate, never
+    // restart — the unfloored multiply limit-cycled sharp converged
+    // features, the F6 find), so the NEXT frame blends fast and the
+    // ghost's rejection sticks. A no-valid-feet pixel has nprev 0, which
+    // the apply maps to 0 — inert there by construction.
+    float2 nfr = nprev * 63.0;
     if ((flags & 8u) != 0u) {
-        nprev *= al;
+        nfr = float2(frd_antilag_apply(nfr.x, al.x), frd_antilag_apply(nfr.y, al.y));
     }
 
     // Accumulate. Meta stores n/63 in RG8 (cap 63 > every legal max_accum).
-    Accum ad = frd_accumulate(din, hs_d, hf_d, nprev.x * 63.0, w_d, max_accum);
+    Accum ad = frd_accumulate(din, hs_d, hf_d, nfr.x, w_d, max_accum);
     // The specular parallax: the MEASURED surface-vs-virtual divergence
     // where virtual motion ran (exact for translation, ~0 for rotation),
     // else the crude cam_step/z term (Stage A's arm) — plus the
@@ -360,7 +363,7 @@ void cs_frd_temporal(uint3 id : SV_DispatchThreadID) {
     // kind can express content motion — the CAP is the mechanism there.
     float parallax = (vm_live ? vm_par : cam_step / max(z, 1e-4)) + light_par;
     float n_smax = frd_spec_max_frames(max_accum, parallax, rough);
-    Accum as_ = frd_accumulate(sin_, hs_s, hf_s, nprev.y * 63.0, w_s, n_smax);
+    Accum as_ = frd_accumulate(sin_, hs_s, hf_s, nfr.y, w_s, n_smax);
 
     accum_diff[p] = ad.slow;
     accum_spec[p] = as_.slow;

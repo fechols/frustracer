@@ -190,6 +190,14 @@ pub struct FrdGpu {
     gb: (u32, u32),
     /// The F3 control arm: byte-copy IN→OUT instead of the passes.
     pub force_passthrough: std::cell::Cell<bool>,
+    /// Gate hooks (the force_sky_ext_skip shape): Some overrides the
+    /// session lever/tuning for cb()'s flag bits, so F5/F6/F7 can A/B both
+    /// arms of each mechanism in one process (the OnceLock tuning and env
+    /// levers cannot flip mid-run). None — every real session — reads the
+    /// levers.
+    pub force_fire: std::cell::Cell<Option<bool>>,
+    pub force_antilag: std::cell::Cell<Option<bool>>,
+    pub force_vmotion: std::cell::Cell<Option<bool>>,
     /// Native 16-bit shader ops (OPTIONS4) — the phase-D fp16 arm's probe;
     /// recorded now so the armed line names it. Phases B/C compile fp32.
     pub fp16: bool,
@@ -457,6 +465,9 @@ impl FrdGpu {
             gt,
             gb,
             force_passthrough: std::cell::Cell::new(false),
+            force_fire: std::cell::Cell::new(None),
+            force_antilag: std::cell::Cell::new(None),
+            force_vmotion: std::cell::Cell::new(None),
             fp16,
             rw,
             rh,
@@ -483,6 +494,12 @@ impl FrdGpu {
     }
     pub fn plane_out_spec(&self) -> &ID3D12Resource {
         &self.planes[P_OUT_SPEC].res
+    }
+    /// The anti-lag feedback plane (R8G8_UNORM g_diff/g_spec) — exposed for
+    /// F5's record-half liveness readback (rests in UNORDERED_ACCESS like
+    /// every plane here).
+    pub fn plane_antilag(&self) -> &ID3D12Resource {
+        &self.antilag.res
     }
 
     fn to_state(reg: &Reg, want: D3D12_RESOURCE_STATES, b: &mut Vec<D3D12_RESOURCE_BARRIER>) {
@@ -545,11 +562,18 @@ impl FrdGpu {
         // flags: bit 0 = reset | bit 1 = firefly pre-clamp (the
         // --frd-[no-]anti-firefly lever, DEFAULT ON — it is the bright-
         // trail killer) | bit 2 = v1.5 virtual motion (FR_FRD_VMOTION=off
-        // disarms) | bit 3 = anti-lag (FR_FRD_ANTILAG=off disarms).
+        // disarms) | bit 3 = anti-lag (FR_FRD_ANTILAG=off disarms). The
+        // force_* cells are the gate hooks (F5/F6/F7).
+        let fire = self
+            .force_fire
+            .get()
+            .unwrap_or_else(|| t.anti_firefly.unwrap_or(true));
+        let vmot = self.force_vmotion.get().unwrap_or_else(crate::frd::vmotion_enabled);
+        let alag = self.force_antilag.get().unwrap_or_else(crate::frd::antilag_enabled);
         let flags = (f.reset as u32)
-            | ((t.anti_firefly.unwrap_or(true) as u32) << 1)
-            | ((crate::frd::vmotion_enabled() as u32) << 2)
-            | ((crate::frd::antilag_enabled() as u32) << 3);
+            | ((fire as u32) << 1)
+            | ((vmot as u32) << 2)
+            | ((alag as u32) << 3);
         let cb = |pass_scale: f32, salt: u32| -> [u32; CB_DWORDS as usize] {
             let mut c = [0u32; CB_DWORDS as usize];
             let head = [

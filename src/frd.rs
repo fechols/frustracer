@@ -84,6 +84,15 @@ pub const PLANE_SENS: f32 = 2.0;
 /// SPEC_N_POW_SMOOTH as roughness falls.
 pub const N_POW_DIFF: f32 = 8.0;
 pub const N_POW_SPEC_SMOOTH: f32 = 128.0;
+/// The anti-lag excess denominator's RELATIVE floor: the clamp-box width is
+/// floored at this fraction of the fast luma before dividing, because a
+/// CONVERGED signal's box is exactly zero-width (constant input ⇒ m2 = 0)
+/// while the blur pass's uniform-field output still carries a few ULPS of
+/// tap-rotation-dependent fp residue — against an absolute 1e-6 floor that
+/// residue reads as e ≈ 1 and mints junk sub-1 gains on perfectly converged
+/// pixels (measured live by F5b: arm-order-dependent decay from a
+/// bit-identical setup). A sub-1%-of-signal deviation is never a ghost.
+pub const ANTILAG_E_FLOOR: f32 = 0.01;
 /// Firefly pre-clamp: input luma may exceed the 8-NEIGHBOR ring mean
 /// (center EXCLUDED — with the center in, a lone outlier's own contribution
 /// dominates its cap and the clamp asymptotes to a fixed (1 − K/9) trim) by
@@ -373,11 +382,35 @@ pub mod oracle {
     /// n · antilag_gain(e)` EXACTLY (n/(1+(e−1)) is n/e past the box, n·1
     /// inside — algebra, and an F0 identity pin). g ∈ (0, 1] is what rides
     /// the R8G8_UNORM antilag plane: pass 3 stores it from the clamp
-    /// excess, pass 1 multiplies it into the reprojected n next frame —
+    /// excess, pass 1 applies it through `antilag_apply` next frame —
     /// which is what makes a ghost's rejection STICK instead of re-fighting
     /// a 30-frame history every frame (frd_common.hlsli twin).
     pub fn antilag_gain(e: f32) -> f32 {
         1.0 / e.max(1.0)
+    }
+
+    /// The brake's EXCESS: the |pre-clamp − fast| luma distance in box
+    /// widths, with the denominator floored RELATIVELY (ANTILAG_E_FLOOR ×
+    /// |fast|) before the absolute backstop — a converged signal's box is
+    /// exactly zero-width while blur fp residue is ulp-scale-of-RADIANCE,
+    /// so an absolute floor misreads it as excess (the F5b find).
+    pub fn antilag_excess(delta_abs: f32, box_w: f32, fast_luma: f32) -> f32 {
+        delta_abs / box_w.max(ANTILAG_E_FLOOR * fast_luma.abs()).max(1e-6)
+    }
+
+    /// The brake's CONSUMER, floored at the history-fix window: the cut may
+    /// accelerate recovery down to the FAST-history rate (n = N_FIX ⇒
+    /// α = 1/5) but never INTO the restart window below it. Cutting past
+    /// N_FIX buys nothing (α is already ≥ 1/5 there) and is actively
+    /// destructive: n < N_FIX re-arms the wide history-fix blur, which
+    /// wipes sharp features from the recurrent feedback, which re-opens the
+    /// slow-vs-fast gap, which re-fires the clamp — a PERMANENT limit
+    /// cycle on any converged sharp feature (a noise-free signal's m2 is
+    /// exactly 0, so its clamp box has zero width and ANY gap reads as an
+    /// infinite excess). F6 caught this live: an unfloored brake kept a
+    /// synthetic glint from ever converging.
+    pub fn antilag_apply(n: f32, g: f32) -> f32 {
+        (n * g).max(n.min(N_FIX))
     }
 
     // -- Firefly pre-clamp -------------------------------------------------
@@ -764,6 +797,36 @@ pub mod oracle {
         }
         if antilag_gain(0.5) != 1.0 || antilag_gain(1.0) != 1.0 {
             return Err("frd: antilag gain must be exactly 1 in-box".into());
+        }
+        // The consumer's history-fix floor: g = 1 is the exact identity; a
+        // total cut (g = 0) lands ON the fast-history rate (N_FIX) and
+        // NEVER below it (an n already inside the window is untouched —
+        // cutting into the restart window re-arms the wide history-fix
+        // blur, the F6 limit cycle).
+        for n in [0.0f32, 2.0, 4.0, 10.0, 30.0] {
+            if antilag_apply(n, 1.0) != n {
+                return Err("frd: antilag_apply must be the identity at g=1".into());
+            }
+        }
+        if antilag_apply(30.0, 0.0) != N_FIX || antilag_apply(2.0, 0.0) != 2.0 {
+            return Err("frd: antilag_apply floor must be min(n, N_FIX)".into());
+        }
+        if antilag_apply(30.0, 0.5) != 15.0 || antilag_apply(30.0, 0.05) != N_FIX {
+            return Err("frd: antilag_apply cut/floor anchors".into());
+        }
+        // The excess's RELATIVE floor: a converged signal's zero-width box
+        // + ulp-scale blur residue must read as NO excess (gain exactly 1
+        // — the F5b junk-gain class), while a signal-scale ghost still
+        // reads large, and a real box wider than the floor dominates.
+        if antilag_gain(antilag_excess(3e-6, 0.0, 3.0)) != 1.0 {
+            return Err("frd: ulp residue on a converged signal must not read as excess".into());
+        }
+        if antilag_excess(1.5, 0.0, 0.2) < 100.0 {
+            return Err("frd: a signal-scale ghost must read as large excess".into());
+        }
+        let (e_box, e_floor) = (antilag_excess(1.0, 0.5, 3.0), antilag_excess(1.0, 0.001, 3.0));
+        if (e_box - 2.0).abs() > 1e-5 || (e_floor - 1.0 / 0.03).abs() > 1e-3 {
+            return Err(format!("frd: antilag_excess denominators ({e_box} {e_floor})"));
         }
 
         // Light parallax: bit-equal dirs EXACTLY 0 (an ABSOLUTE pin — the

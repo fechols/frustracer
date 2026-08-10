@@ -1729,18 +1729,90 @@ cargo run --release -- --gpu --xess --frd  # FRD (src/frd.rs + gpu/frd_gpu.rs, 2
                                       # banked the occupancy half, and 0.488 sits 2.5x under
                                       # the bar; the FRD_FP16 typedefs + compile_args hook +
                                       # OPTIONS4 probe stay ready if a future res/scene regime
-                                      # re-opens it. STILL PENDING in C: firefly pre-clamp,
-                                      # hit-dist reconstruction, the 3x3 valid-foot fallback
+                                      # re-opens it. THE BRIGHT-SPECULAR SMEAR FIX (2026-08-09,
+                                      # three commits — the user's "sun glints trail" report,
+                                      # confirmed repro: a PARKED camera with the sun moving,
+                                      # where NO motion vector of any kind can express the
+                                      # glint's motion since prev camera == cur camera makes
+                                      # every reprojection the identity): (A) the FIREFLY
+                                      # PRE-CLAMP is BUILT — pass 1 soft-clamps each input's
+                                      # luma to FIREFLY_K × its 8-NEIGHBOR RING mean (center
+                                      # EXCLUDED — center-in makes a lone outlier's own
+                                      # contribution dominate its cap, an 11% trim however
+                                      # extreme; the ring crushes it to K× its surround while a
+                                      # real multi-pixel glint survives proportionally) BEFORE
+                                      # accumulation, so an F0-demodulated outlier can neither
+                                      # seed the slow history nor inflate the Welford m2 that
+                                      # sizes its OWN clamp box; --frd-[no-]anti-firefly is
+                                      # LIVE, default ON. The ANTI-LAG BRAKE is BUILT: pass 3
+                                      # records the clamp excess as g = 1/max(e,1) into a new
+                                      # single-buffered R8G8_UNORM antilag plane (SRVS 12→13),
+                                      # pass 1 cuts the reprojected age by it — TWO robustness
+                                      # rules the F5/F6 gates found live, do not remove: the
+                                      # cut FLOORS at the history-fix window (frd_antilag_apply
+                                      # — cutting below N_FIX re-arms the wide history-fix
+                                      # blur, which wipes sharp features from the feedback and
+                                      # re-fires the clamp, a PERMANENT limit cycle on
+                                      # converged sharp features), and the excess denominator
+                                      # FLOORS RELATIVELY (frd_antilag_excess, ANTILAG_E_FLOOR
+                                      # = 1% of fast luma — a converged signal's box is exactly
+                                      # zero-width while blur fp residue is ulp-scale-of-
+                                      # RADIANCE, so an absolute floor mints junk gains on
+                                      # perfectly converged pixels). And the specular parallax
+                                      # gains the LIGHT-MOTION term: refresh_sky captures the
+                                      # sun direction, nrd_frame_step retains the prev, and 2×
+                                      # the per-frame angular delta (the mirror-swing factor,
+                                      # oracle::light_parallax — bit-equal dirs are EXACTLY 0)
+                                      # SUMS with the camera term into frd_spec_max_frames —
+                                      # the cap is the mechanism content motion needs.
+                                      # FR_FRD_SUNPAR=off|<gain> / FR_FRD_ANTILAG=off are the
+                                      # repro arms. (B) v1.5 SPECULAR VIRTUAL MOTION is BUILT:
+                                      # the spec history fetch takes a second reprojection
+                                      # point — the reflection's virtual image at t_surf + t_r
+                                      # (t_r off the wire's normalized hit-dist via
+                                      # frd_hitdist_denorm_factor, exact below saturation)
+                                      # unfolded along the primary ray and projected through
+                                      # the prev world→clip in the DELTA form (surface AND
+                                      # virtual through the SAME matrix, only the difference
+                                      # added to the measured-MV q: jitter cancels first-order,
+                                      # t_r = 0 exactly zero, a parked camera's fp residue
+                                      # snaps to 0 under VM_DEADZONE2, behind-camera takes the
+                                      # humble arm); t_r ≥ VM_FAR_K(0.99)·far is the rotation-
+                                      # only sky limit (project the DIRECTION, w = 0 — the
+                                      # wire_cam_far f16 lesson); roughness fades the
+                                      # COORDINATE over VM_ROUGH_LO..HI (one fetch, never two);
+                                      # the displaced fetch runs its own foot loop with the
+                                      # relative-Z test slack-widened by the applied offset
+                                      # (VM_Z_SLACK — grazing planar mirrors vary reflector
+                                      # depth along the plane); the MEASURED surface-vs-virtual
+                                      # divergence replaces cam_step/z as the parallax where
+                                      # the block ran. Pure rotation needs none of this (both
+                                      # points share the ray through the unmoved origin — the
+                                      # surface MV is already correct there). CB_DWORDS 17→47
+                                      # (prev world→clip + CamBasis org/rgt/up, the ngxfg
+                                      # conventions verbatim; the oracle is CROSS-PINNED
+                                      # against ngxfg_guides::virtual_prev_px — one unfold, two
+                                      # engines, one pin). FR_FRD_VMOTION=off is the repro arm.
+                                      # FrdFrame is record()'s params struct; force_fire/
+                                      # force_antilag/force_vmotion are the gate hooks (the
+                                      # force_sky_ext_skip shape — OnceLock levers can't flip
+                                      # in-process). STILL PENDING in C: hit-dist
+                                      # reconstruction, the 3x3 valid-foot fallback
                                       # (shader-header notes); F8 as a DEDICATED gate (N4 + F4
-                                      # now run live on the same protocol/inputs — ReBLUR lap
-                                      # 0.1112->0.0336 vs FRD 0.1264->0.0436, the report-only
-                                      # comparison — but the promoted must-fire form is
-                                      # unbuilt). Gates: F0 (`frd` in
+                                      # now run live on the same protocol/inputs — the
+                                      # report-only comparison — but the promoted must-fire
+                                      # form is unbuilt). Gates: F0 (`frd` in
                                       # --check —
                                       # frd::oracle::self_test: reprojection convention,
                                       # disocclusion anchors + grazing relaxation, the
                                       # running-mean accumulation identity, Welford variance,
-                                      # clamp idempotence + box widths, firefly cap, bilateral
+                                      # clamp idempotence + box widths, firefly cap, the
+                                      # antilag gain/apply/excess families, light-parallax
+                                      # anchors (bit-equal ⇒ ABSOLUTE exact 0 — the strafe-gate
+                                      # lesson), the vm family (parked exact-0 snap, t_r=0
+                                      # exact, moved-camera must-fire, sky-vs-finite must-
+                                      # differ, the ngxfg cross-pin, slack-1.0 identity),
+                                      # bilateral
                                       # weight shapes, radius endpoints, Vogel-disk spread, and
                                       # the wire re-export pin vs nrd::oracle); F1 (check-gpu:
                                       # instance contract + the fp16 probe); F3 (check-gpu, the
@@ -1753,15 +1825,48 @@ cargo run --release -- --gpu --xess --frd  # FRD (src/frd.rs + gpu/frd_gpu.rs, 2
                                       # history — one spatial-only wide blur, not the recurrent
                                       # loop: finite, differs, Laplacian drops, mean
                                       # <=25%, temporal shrink, RESTART departs, frame-B
-                                      # restore). dxc::compile_args is the per-unit
+                                      # restore); F5 (check-gpu, HAND-BUILT planes — the N2
+                                      # style, write_tex_at is the upload twin of read_tex_at:
+                                      # the firefly A/B with teeth both ways — a lone 400-luma
+                                      # outlier must survive bright OFF and crush to ~the ring
+                                      # cap ON, measured 20.4 vs 0.27 — plus the CONVERGED-
+                                      # INERT antilag pin: a converged uniform field's recorded
+                                      # gains must be EXACTLY 255 everywhere, the teeth against
+                                      # the junk-gain class); F6 (the parked-camera moving-
+                                      # glint probe, the user's repro shape: a converged 3x3
+                                      # glint's input moves +24 px, three arms — light_par 0.5
+                                      # must dump the stale history (0.102), the brake arm must
+                                      # lead its off arm on the real ghost with a recorded
+                                      # sub-1 gain (g-min 0.016 — sampled DURING convergence,
+                                      # where the history-fix-vs-clamp fight actually mints
+                                      # gains), and the all-off pre-fix arm must FAIL the bound
+                                      # (1.114, the teeth)); F7 (virtual-motion tracking: a
+                                      # converged x-gradient mirror history + ONE strafe frame
+                                      # with real matrices and the exact surface-MV plane — the
+                                      # vmotion-on/off arms' OUT gap must land within ±50% of
+                                      # slope·|oracle d.x|, measured 0.189 vs 0.182 predicted
+                                      # at |d.x| = 38 px). dxc::compile_args is the per-unit
                                       # -enable-16bit-types hook the phase-D fp16 arm uses.
-                                      # Next: C-completion (firefly/hit-dist-recon/3x3-fallback)
+                                      # Next: C-completion (hit-dist-recon/3x3-fallback)
                                       # + F8, further D tuning (fp16 arm, wave ops,
-                                      # plane-distance bilateral upgrade, anti-lag,
-                                      # stabilization, specular virtual-motion v1.5), then E's
+                                      # plane-distance bilateral upgrade, stabilization,
+                                      # specular virtual-motion v2 — curved reflectors), then
+                                      # E's
                                       # remaining half — the NRD deletion (the FLIP half of E
                                       # SHIPPED 2026-08-09, same day: frd defaults ON, nrd is
                                       # the opt-in oracle; see the precedence block above).
+                                      # THE SMEAR-FIX INTERACTIVE PROTOCOL (the feel-test):
+                                      # (1) moving sun, parked camera — `--gpu --xess --frd` on
+                                      # rungholt water or a bistro glossy floor, park, hold `.`
+                                      # to scrub TOD; arms: fixed default → FR_FRD_SUNPAR=off →
+                                      # --frd-no-anti-firefly → FR_FRD_ANTILAG=off (each
+                                      # returns its slice of the trail) → --nrd (the oracle A/B
+                                      # — check the `nrd: armed` line first, the mislabeled-
+                                      # baseline lesson). (2) camera translation — strafe past
+                                      # water/helmet sky glints with --no-fg; default vs
+                                      # FR_FRD_VMOTION=off vs --nrd. (3) regression —
+                                      # FRUSTRACER_STAB still in the 0.06-0.11 band,
+                                      # --gpu-timing frd-temporal before/after.
                                       # Touch frd.rs / frd_gpu.rs / the DnGpu enum /
                                       # arm_denoiser_for -> run --check, --check-gpu, --check-dxr,
                                       # --check-nrd (must stay untouched while NRD lives),

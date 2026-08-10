@@ -32,6 +32,7 @@ static const float FRD_N_COS_SPEC_SMOOTH = 0.998;
 static const float FRD_SPEC_PARALLAX_K = 30.0;
 static const float FRD_RANGE_K = 0.999;
 static const float FRD_FIREFLY_K = 8.0;
+static const float FRD_ANTILAG_E_FLOOR = 0.01;
 // v1.5 specular virtual motion (frd.rs VM_* twins).
 static const float FRD_VM_FAR_K = 0.99;
 static const float FRD_VM_ROUGH_LO = 0.25;
@@ -105,11 +106,21 @@ float frd_firefly_scale(float luma, float mean3x3) {
 
 // oracle::antilag_gain — the anti-lag brake's wire form: pass 3 stores
 // g = 1/max(e, 1) (e = the clamp's |pre − fast| luma distance in box
-// widths) into the antilag plane; pass 1 multiplies it into the
-// reprojected n. antilag_frames(n, e) == n·g EXACTLY (the F0 identity
-// pin), and in-box g is exactly 1.0.
+// widths) into the antilag plane; pass 1 applies it via frd_antilag_apply.
+// antilag_frames(n, e) == n·g EXACTLY (the F0 identity pin), and in-box g
+// is exactly 1.0.
 float frd_antilag_gain(float e) {
     return 1.0 / max(e, 1.0);
+}
+
+// oracle::antilag_excess — |pre − fast| in box widths, the denominator
+// floored RELATIVELY (E_FLOOR·|fast|) before the absolute backstop: a
+// converged signal's box is exactly zero-width (m2 = 0) while blur fp
+// residue is ulp-scale-of-RADIANCE, so an absolute floor misreads it as
+// excess and mints junk gains on perfectly converged pixels (the F5b
+// find). A sub-1%-of-signal deviation is never a ghost.
+float frd_antilag_excess(float delta_abs, float box_w, float fast_luma) {
+    return delta_abs / max(max(box_w, FRD_ANTILAG_E_FLOOR * abs(fast_luma)), 1e-6);
 }
 
 // --- The spatial passes' twins (frd.rs constants, LOCKSTEP) ---------------
@@ -152,6 +163,18 @@ float frd_accum_scale(float n) {
 
 float frd_history_fix(float r_eff, float n) {
     return n < FRD_N_FIX ? max(r_eff, FRD_R_FIX * (1.0 - n / FRD_N_FIX)) : r_eff;
+}
+
+// oracle::antilag_apply — the anti-lag brake's consumer, FLOORED at the
+// history-fix window: the cut accelerates recovery down to the
+// fast-history rate but never INTO the restart window (n < N_FIX re-arms
+// the wide history-fix blur, which wipes sharp features from the recurrent
+// feedback and re-fires the clamp — the F6-caught limit cycle; a converged
+// noise-free signal's m2 is exactly 0, so its clamp box has zero width and
+// ANY gap reads as an infinite excess — the floor is what keeps sharp
+// converged features stable under the brake).
+float frd_antilag_apply(float n, float g) {
+    return max(n * g, min(n, FRD_N_FIX));
 }
 
 // oracle::normal_pow — the normal-agreement exponent, hoisted per pixel

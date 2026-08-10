@@ -3665,6 +3665,60 @@ fn read_tex_at(
     Ok(out)
 }
 
+/// The read_tex_at inverse — upload packed texel rows (pw·bpp each) into a
+/// texture through an aligned-pitch staging buffer (the F5/F6/F7
+/// synthetic-plane filler).
+#[cfg(windows)]
+fn write_tex_at(
+    hg: &mut gpu::trace::HeadlessGpu,
+    tex: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    fmt: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+    bpp: usize,
+    pw: usize,
+    ph: usize,
+    rest: windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES,
+    data: &[u8],
+) -> Result<(), String> {
+    use gpu::d3d12::{aligned_pitch, buffer_desc, footprint, loc_footprint, loc_subresource, transition, upload_heap};
+    use windows::Win32::Graphics::Direct3D12::*;
+    assert_eq!(data.len(), pw * bpp * ph);
+    let pitch = aligned_pitch(pw * bpp);
+    let up = {
+        let mut res: Option<ID3D12Resource> = None;
+        unsafe {
+            hg.device.CreateCommittedResource(
+                &upload_heap(),
+                D3D12_HEAP_FLAG_NONE,
+                &buffer_desc((pitch * ph) as u64),
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                None,
+                &mut res,
+            )
+        }
+        .map_err(|e| format!("write_tex_at alloc: {e}"))?;
+        res.unwrap()
+    };
+    let mut ptr = std::ptr::null_mut();
+    unsafe { up.Map(0, None, Some(&mut ptr)) }.map_err(|e| format!("write_tex_at map: {e}"))?;
+    for y in 0..ph {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr().add(y * pw * bpp),
+                (ptr as *mut u8).add(y * pitch),
+                pw * bpp,
+            );
+        }
+    }
+    unsafe { up.Unmap(0, None) };
+    hg.run(|l| unsafe {
+        l.ResourceBarrier(&[transition(tex, rest, D3D12_RESOURCE_STATE_COPY_DEST)]);
+        let fp = footprint(fmt, pw as u32, ph as u32, bpp, 0);
+        l.CopyTextureRegion(&loc_subresource(tex), 0, 0, 0, &loc_footprint(&up, fp), None);
+        l.ResourceBarrier(&[transition(tex, D3D12_RESOURCE_STATE_COPY_DEST, rest)]);
+    })?;
+    Ok(())
+}
+
 /// f16 bit pattern -> monotone integer (ulp distances work across the sign,
 /// unlike raw bits).
 #[cfg(windows)]
@@ -8501,6 +8555,496 @@ fn run_check_gpu(
                         if hg.run(|l| ptg.record_wavefront(l, 0, &p, false)).is_err() {
                             eprintln!("check-gpu: FAIL F4 frame-B restore");
                             return 1;
+                        }
+
+                        // --- F5/F6/F7: the bright-specular smear fix's
+                        // liveness gates, on HAND-BUILT planes (the N2
+                        // style — synthetic, deterministic, scene-blind; a
+                        // converged still exercises NONE of these paths, so
+                        // each needs its own must-fire). F5 = input
+                        // robustness (firefly pre-clamp + anti-lag, A/B'd
+                        // through the force_* hooks — the OnceLock levers
+                        // cannot flip in-process); F6 = the parked-camera
+                        // moving-glint case (light_par must cut the trail;
+                        // the all-levers-off pre-fix arm must FAIL the
+                        // bound — the ngxfg moving-firefly gate's shape);
+                        // F7 = virtual-motion tracking (the fetch must land
+                        // where the oracle predicts; the surface-MV arm
+                        // must miss it by the oracle's own delta).
+                        {
+                            use windows::Win32::Graphics::Dxgi::Common::{
+                                DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT,
+                                DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R8G8_UNORM,
+                            };
+                            let f4x = DXGI_FORMAT_R16G16B16A16_FLOAT;
+                            let npx = pw * ph;
+                            let px8 = |v: [f32; 4]| -> [u8; 8] {
+                                let mut o = [0u8; 8];
+                                for (i, x) in v.iter().enumerate() {
+                                    o[i * 2..i * 2 + 2].copy_from_slice(
+                                        &half::f16::from_f32(*x).to_bits().to_le_bytes(),
+                                    );
+                                }
+                                o
+                            };
+                            let flat8 = |v: [f32; 4]| -> Vec<u8> {
+                                let p8 = px8(v);
+                                let mut b = vec![0u8; npx * 8];
+                                for i in 0..npx {
+                                    b[i * 8..][..8].copy_from_slice(&p8);
+                                }
+                                b
+                            };
+                            // The wire's enc-2 word, UNORM10-quantized like
+                            // the plane stores it.
+                            let nrw = |n: [f32; 3], rough: f32| -> [u8; 4] {
+                                let e = nrd::oracle::encode_normal_roughness_101010(n, rough);
+                                let q = |v: f32| (v.clamp(0.0, 1.0) * 1023.0 + 0.5) as u32;
+                                (q(e[0]) | (q(e[1]) << 10) | (q(e[2]) << 20)).to_le_bytes()
+                            };
+                            let fill4 = |w: [u8; 4]| -> Vec<u8> {
+                                let mut b = vec![0u8; npx * 4];
+                                for i in 0..npx {
+                                    b[i * 4..][..4].copy_from_slice(&w);
+                                }
+                                b
+                            };
+                            let lum_at = |b: &[u8], x: usize, y: usize| -> f32 {
+                                half::f16::from_bits(u16::from_le_bytes(
+                                    b[(y * pw + x) * 8..][..2].try_into().unwrap(),
+                                ))
+                                .to_f32()
+                            };
+                            // Camera-facing normal (cam_fwd proxy is +z, so
+                            // n·−fwd = 0.8) + the shared 5.0 view-Z field.
+                            let n_face = [0.0f32, 0.6, -0.8];
+                            let vz5 = fill4(5.0f32.to_le_bytes());
+                            let mv0 = vec![0u8; npx * 8];
+                            macro_rules! fup {
+                                ($tex:expr, $fmt:expr, $bpp:expr, $data:expr, $what:expr) => {
+                                    if let Err(e) =
+                                        write_tex_at(&mut hg, $tex, $fmt, $bpp, pw, ph, ust, $data)
+                                    {
+                                        eprintln!("check-gpu: FAIL {} upload: {e}", $what);
+                                        return 1;
+                                    }
+                                };
+                            }
+                            let fframe = |reset: bool, lp: f32| gpu::frd_gpu::FrdFrame {
+                                reset,
+                                far: 5000.0,
+                                proj: 406.0,
+                                cam_step: 0.0,
+                                cam_fwd: [0.0, 0.0, 1.0],
+                                light_par: lp,
+                                vm_m: [0.0; 16],
+                                cam_org: [0.0; 3],
+                                cam_rgt: [1.0, 0.0, 0.0],
+                                cam_up: [0.0, 1.0, 0.0],
+                            };
+                            macro_rules! frec {
+                                ($f:expr, $what:expr) => {{
+                                    let mut r = Ok(());
+                                    let f = $f;
+                                    if hg.run(|l| r = fg.record(l, 0, &f)).is_err() || r.is_err() {
+                                        eprintln!("check-gpu: FAIL {} record: {r:?}", $what);
+                                        return 1;
+                                    }
+                                }};
+                            }
+                            macro_rules! fout {
+                                ($what:expr) => {
+                                    match read_tex_at(
+                                        &mut hg,
+                                        fg.plane_out_spec(),
+                                        f4x,
+                                        8,
+                                        pw,
+                                        ph,
+                                        ust,
+                                    ) {
+                                        Ok(b) => b,
+                                        Err(e) => {
+                                            eprintln!("check-gpu: FAIL {} readback: {e}", $what);
+                                            return 1;
+                                        }
+                                    }
+                                };
+                            }
+
+                            // F5a — FIREFLY: one 400-luma outlier in a 0.2
+                            // field. OFF must carry it bright through the
+                            // passes AND ON must crush it to ~the ring cap
+                            // (8·0.2) — both directions are teeth.
+                            fup!(fg.plane_in_viewz(), DXGI_FORMAT_R32_FLOAT, 4, &vz5, "F5 viewz");
+                            fup!(
+                                fg.plane_in_nr(),
+                                DXGI_FORMAT_R10G10B10A2_UNORM,
+                                4,
+                                &fill4(nrw(n_face, 0.5)),
+                                "F5 nr"
+                            );
+                            fup!(fg.plane_in_mv(), f4x, 8, &mv0, "F5 mv");
+                            fup!(fg.plane_in_diff(), f4x, 8, &flat8([0.2, 0.0, 0.0, 0.3]), "F5 diff");
+                            let (hx, hy) = (137usize, 89usize);
+                            let mut sp5 = flat8([0.2, 0.0, 0.0, 0.3]);
+                            sp5[(hy * pw + hx) * 8..][..8]
+                                .copy_from_slice(&px8([400.0, 0.0, 0.0, 0.3]));
+                            fup!(fg.plane_in_spec(), f4x, 8, &sp5, "F5 spec");
+                            let peak = |b: &[u8]| -> f32 {
+                                let mut m = 0f32;
+                                for y in hy - 3..=hy + 3 {
+                                    for x in hx - 3..=hx + 3 {
+                                        m = m.max(lum_at(b, x, y));
+                                    }
+                                }
+                                m
+                            };
+                            fg.force_fire.set(Some(false));
+                            frec!(fframe(true, 0.0), "F5 fire-off");
+                            let p_off = peak(&fout!("F5 fire-off"));
+                            fg.force_fire.set(Some(true));
+                            frec!(fframe(true, 0.0), "F5 fire-on");
+                            let p_on = peak(&fout!("F5 fire-on"));
+                            fg.force_fire.set(None);
+
+                            // F5b — ANTI-LAG, the CONVERGED-INERT pin: after
+                            // a uniform field converges (m2 exactly 0, blur
+                            // residue at the ulp-of-radiance scale), the
+                            // recorded gains must be EXACTLY 1.0 everywhere.
+                            // These are the teeth against the junk-gain
+                            // class this gate found live: without the
+                            // relative excess floor (ANTILAG_E_FLOOR), the
+                            // zero-width box read ulp residue as e ≈ 1 and
+                            // minted arm-order-dependent gains on perfectly
+                            // converged pixels. (The brake's FIRING halves
+                            // live in F6's third arm — a real ghost.)
+                            let bright = flat8([3.0, 0.0, 0.0, 0.3]);
+                            fup!(fg.plane_in_spec(), f4x, 8, &bright, "F5b bright");
+                            frec!(fframe(true, 0.0), "F5b k0");
+                            for _ in 0..11 {
+                                frec!(fframe(false, 0.0), "F5b converge");
+                            }
+                            let ab = match read_tex_at(
+                                &mut hg,
+                                fg.plane_antilag(),
+                                DXGI_FORMAT_R8G8_UNORM,
+                                2,
+                                pw,
+                                ph,
+                                ust,
+                            ) {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    eprintln!("check-gpu: FAIL F5b antilag readback: {e}");
+                                    return 1;
+                                }
+                            };
+                            let g_conv_bad = ab.iter().filter(|&&b| b != 255).count();
+
+                            // F6 — the MOVING GLINT (the user's confirmed
+                            // repro, synthetic): a 3x3 glint converges at p0
+                            // under a parked camera, then the CONTENT moves
+                            // +24 px while light_par carries the sun's
+                            // motion. Mirror roughness (no spatial blur) so
+                            // the readout is crisp; hit-dist 0 keeps the vm
+                            // block structurally out.
+                            fup!(
+                                fg.plane_in_nr(),
+                                DXGI_FORMAT_R10G10B10A2_UNORM,
+                                4,
+                                &fill4(nrw(n_face, 0.02)),
+                                "F6 nr"
+                            );
+                            let (p0x, p0y) = (180usize, 200usize);
+                            let dot_at = |x0: usize| -> Vec<u8> {
+                                let mut b = flat8([0.1, 0.0, 0.0, 0.0]);
+                                for dy in 0..3usize {
+                                    for dx in 0..3usize {
+                                        let i = (p0y - 1 + dy) * pw + (x0 - 1 + dx);
+                                        b[i * 8..][..8].copy_from_slice(&px8([2.0, 0.0, 0.0, 0.0]));
+                                    }
+                                }
+                                b
+                            };
+                            // Three arms: [0] FIXED (light_par carries the
+                            // sun's motion), [1] BRAKE (no light_par — the
+                            // stale glint is a REAL ghost, the anti-lag +
+                            // clamp must shorten it), [2] PRE-FIX (no
+                            // light_par, brake off — the trail as shipped
+                            // before the fix, the teeth).
+                            let mut g6 = [0f32; 3];
+                            let mut g6_pre = 0f32;
+                            let mut g_min = 1f32;
+                            for (ai, lp, alag) in
+                                [(0usize, 0.5f32, true), (1, 0.0, true), (2, 0.0, false)]
+                            {
+                                fg.force_antilag.set(Some(alag));
+                                fup!(fg.plane_in_spec(), f4x, 8, &dot_at(p0x), "F6 dot");
+                                frec!(fframe(true, 0.0), "F6 k0");
+                                for _ in 0..6 {
+                                    frec!(fframe(false, 0.0), "F6 converge");
+                                    if ai == 1 {
+                                        // The brake's RECORD half fires
+                                        // DURING convergence — the
+                                        // history-fix blur wipes the sharp
+                                        // dot from the feedback while fast
+                                        // stays sharp, so the clamp fights
+                                        // (and, floored at N_FIX, WINS —
+                                        // the pre-floor build limit-cycled
+                                        // here). Sample the gains where the
+                                        // fight actually happens.
+                                        let ab = match read_tex_at(
+                                            &mut hg,
+                                            fg.plane_antilag(),
+                                            DXGI_FORMAT_R8G8_UNORM,
+                                            2,
+                                            pw,
+                                            ph,
+                                            ust,
+                                        ) {
+                                            Ok(b) => b,
+                                            Err(e) => {
+                                                eprintln!(
+                                                    "check-gpu: FAIL F6 antilag readback: {e}"
+                                                );
+                                                return 1;
+                                            }
+                                        };
+                                        for i in 0..npx {
+                                            g_min = g_min.min(ab[i * 2 + 1] as f32 / 255.0);
+                                        }
+                                    }
+                                }
+                                if ai == 0 {
+                                    // Anti-vacuity: the glint history must
+                                    // exist before the move.
+                                    g6_pre = lum_at(&fout!("F6 pre"), p0x, p0y);
+                                }
+                                fup!(fg.plane_in_spec(), f4x, 8, &dot_at(p0x + 24), "F6 moved");
+                                for _ in 0..6 {
+                                    frec!(fframe(false, lp), "F6 post");
+                                    if ai == 1 {
+                                        // The brake's RECORD half: a real
+                                        // ghost (stale bright slow vs dark
+                                        // fast, m2 decayed) must mint a
+                                        // sub-1 gain somewhere.
+                                        let ab = match read_tex_at(
+                                            &mut hg,
+                                            fg.plane_antilag(),
+                                            DXGI_FORMAT_R8G8_UNORM,
+                                            2,
+                                            pw,
+                                            ph,
+                                            ust,
+                                        ) {
+                                            Ok(b) => b,
+                                            Err(e) => {
+                                                eprintln!(
+                                                    "check-gpu: FAIL F6 antilag readback: {e}"
+                                                );
+                                                return 1;
+                                            }
+                                        };
+                                        for i in 0..npx {
+                                            g_min = g_min.min(ab[i * 2 + 1] as f32 / 255.0);
+                                        }
+                                    }
+                                }
+                                g6[ai] = lum_at(&fout!("F6"), p0x, p0y);
+                                fg.force_antilag.set(None);
+                            }
+
+                            // F7 — VIRTUAL-MOTION TRACKING: a mirror with a
+                            // converged x-gradient spec history, then ONE
+                            // strafe frame with real matrices + the exact
+                            // surface MV plane. OUT at the probe encodes the
+                            // FETCH position (flat probe input; mirror ⇒ no
+                            // blur), so the two arms must differ by the
+                            // oracle delta's own slope·|d.x| — teeth without
+                            // brittleness to the exact blend/clamp path.
+                            let cam7 = camera::Camera::look_at(
+                                Vec3A::new(4.0, 2.0, 4.0),
+                                Vec3A::new(0.0, 1.0, 0.0),
+                                0.9,
+                            );
+                            let fwd7 = cam7.forward();
+                            let rgt_u = fwd7.cross(Vec3A::Y).normalize();
+                            let up_u = rgt_u.cross(fwd7);
+                            let tanh7 = (cam7.fov_y * 0.5).tan();
+                            let rgt_s = rgt_u * (tanh7 * pw as f32 / ph as f32);
+                            let up_s = up_u * tanh7;
+                            let prev7 = camera::Camera {
+                                pos: cam7.pos - rgt_u * 0.5,
+                                yaw: cam7.yaw,
+                                pitch: cam7.pitch,
+                                fov_y: cam7.fov_y,
+                            };
+                            let mats7 = dlss::cam_matrices(&cam7, pw, ph, 0.05, 5000.0);
+                            let pmats7 = dlss::cam_matrices(&prev7, pw, ph, 0.05, 5000.0);
+                            let wp7 = pmats7.view_to_clip * pmats7.world_to_view;
+                            let proj7 = mats7.view_to_clip.y_axis.y * ph as f32 * 0.5;
+                            // The exact surface MV plane for the strafe (a
+                            // pure right-strafe keeps view-Z bitwise, so
+                            // mv.z = 0 and the disocclusion test is inert).
+                            let surf_px = |x: f32, y: f32| -> (f32, f32) {
+                                let ndx = x * (2.0 / pw as f32) - 1.0;
+                                let ndy = 1.0 - y * (2.0 / ph as f32);
+                                let du = (fwd7 + rgt_s * ndx + up_s * ndy).normalize();
+                                let hit = cam7.pos + du * (5.0 / du.dot(fwd7));
+                                let pc = wp7 * glam::Vec4::new(hit.x, hit.y, hit.z, 1.0);
+                                (
+                                    (pc.x / pc.w + 1.0) * 0.5 * pw as f32,
+                                    (1.0 - pc.y / pc.w) * 0.5 * ph as f32,
+                                )
+                            };
+                            let mut mv7 = vec![0u8; npx * 8];
+                            for y in 0..ph {
+                                for x in 0..pw {
+                                    let (px_, py_) = surf_px(x as f32 + 0.5, y as f32 + 0.5);
+                                    mv7[(y * pw + x) * 8..][..8].copy_from_slice(&px8([
+                                        px_ - (x as f32 + 0.5),
+                                        py_ - (y as f32 + 0.5),
+                                        0.0,
+                                        0.0,
+                                    ]));
+                                }
+                            }
+                            let grad7 = {
+                                let mut b = vec![0u8; npx * 8];
+                                for y in 0..ph {
+                                    for x in 0..pw {
+                                        let l = 0.05 + 3.0 * x as f32 / pw as f32;
+                                        b[(y * pw + x) * 8..][..8]
+                                            .copy_from_slice(&px8([l, 0.0, 0.0, 0.8]));
+                                    }
+                                }
+                                b
+                            };
+                            let (c7x, c7y) = (266usize, 200usize);
+                            let mut l7 = [0f32; 2];
+                            for (ai, vmot) in [(0usize, true), (1usize, false)] {
+                                fg.force_vmotion.set(Some(vmot));
+                                fup!(fg.plane_in_mv(), f4x, 8, &mv0, "F7 mv0");
+                                fup!(fg.plane_in_spec(), f4x, 8, &grad7, "F7 grad");
+                                frec!(fframe(true, 0.0), "F7 k0");
+                                for _ in 0..7 {
+                                    frec!(fframe(false, 0.0), "F7 converge");
+                                }
+                                fup!(fg.plane_in_mv(), f4x, 8, &mv7, "F7 mv");
+                                fup!(fg.plane_in_spec(), f4x, 8, &flat8([0.3, 0.0, 0.0, 0.8]), "F7 flat");
+                                let pf = gpu::frd_gpu::FrdFrame {
+                                    reset: false,
+                                    far: 5000.0,
+                                    proj: proj7,
+                                    cam_step: 0.5,
+                                    cam_fwd: fwd7.to_array(),
+                                    light_par: 0.0,
+                                    vm_m: wp7.to_cols_array(),
+                                    cam_org: cam7.pos.to_array(),
+                                    cam_rgt: rgt_s.to_array(),
+                                    cam_up: up_s.to_array(),
+                                };
+                                frec!(pf, "F7 probe");
+                                l7[ai] = lum_at(&fout!("F7"), c7x, c7y);
+                            }
+                            fg.force_vmotion.set(None);
+                            // The oracle's prediction at the probe: t_r off
+                            // the f16-stored nh through the DECODED (UNORM10
+                            // round-tripped) roughness, then the delta.
+                            let rq = {
+                                let e = nrd::oracle::encode_normal_roughness_101010(n_face, 0.02);
+                                let q = ((e[2].clamp(0.0, 1.0) * 1023.0 + 0.5) as u32) as f32 / 1023.0;
+                                (q * 2.0 - 1.0).abs()
+                            };
+                            let nh7 = half::f16::from_f32(0.8).to_f32();
+                            let t_r7 =
+                                nh7 * nrd::oracle::hit_dist_normalization(5.0, [3.0, 0.1, 20.0], rq);
+                            let d7 = frd::oracle::spec_virtual_delta_px(
+                                c7x as f32 + 0.5,
+                                c7y as f32 + 0.5,
+                                pw as f32,
+                                ph as f32,
+                                5.0,
+                                t_r7,
+                                5000.0,
+                                cam7.pos,
+                                fwd7,
+                                rgt_s,
+                                up_s,
+                                &wp7,
+                            );
+                            // OUT's slope per fetched px lies in [0.8, 0.89]
+                            // ·(3/pw) (the fast-clamped and unclamped blend
+                            // forms bracket it), so the ARM GAP must land in
+                            // a band around slope·|d.x| — quantitative
+                            // tracking without brittleness to the exact
+                            // clamp path.
+                            let gap7 = l7[1] - l7[0];
+                            let gap_pred = 0.85 * (3.0 / pw as f32) * d7[0].abs();
+
+                            println!(
+                                "check-gpu: frd F5 — firefly peak off {p_off:.1} on {p_on:.2} | \
+                                 antilag conv-bad {g_conv_bad} g-min {g_min:.3} | F6 glint pre \
+                                 {g6_pre:.2} fixed {:.3} brake {:.3} pre-fix {:.3} | F7 |d.x| \
+                                 {:.1} px gap {gap7:.3} (pred {gap_pred:.3})",
+                                g6[0], g6[1], g6[2], d7[0].abs()
+                            );
+                            let mut fbad = Vec::new();
+                            // F5a: OFF bright (the outlier survives — the
+                            // off arm is live), ON crushed to ~the ring cap.
+                            if p_off < 10.0 {
+                                fbad.push("F5 firefly off-arm lost the outlier".to_string());
+                            }
+                            if p_on > 2.0 || p_off < 5.0 * p_on {
+                                fbad.push(format!("F5 firefly clamp toothless ({p_off} vs {p_on})"));
+                            }
+                            // F5b: a converged uniform field's gains are
+                            // EXACTLY 1.0 everywhere (the junk-gain teeth).
+                            if g_conv_bad != 0 {
+                                fbad.push(format!(
+                                    "F5 converged field minted {g_conv_bad} sub-1 gain bytes"
+                                ));
+                            }
+                            // F6: history existed; light_par dumped it; the
+                            // brake fired on the real ghost (record half)
+                            // and led the brake-off arm (consume half); the
+                            // pre-fix arm must FAIL the fixed bound (teeth).
+                            if g6_pre < 1.0 {
+                                fbad.push(format!("F6 glint never converged ({g6_pre})"));
+                            }
+                            if g6[0] > 0.8 {
+                                fbad.push(format!("F6 fixed arm still trailing ({})", g6[0]));
+                            }
+                            if g_min > 0.98 {
+                                fbad.push(format!("F6 brake never recorded a gain ({g_min})"));
+                            }
+                            if g6[1] + 0.05 > g6[2] {
+                                fbad.push(format!(
+                                    "F6 brake arm not ahead ({} vs {})",
+                                    g6[1], g6[2]
+                                ));
+                            }
+                            if g6[2] < 1.5 * g6[0] {
+                                fbad.push(format!(
+                                    "F6 pre-fix arm did not fail the bound ({} vs {})",
+                                    g6[2], g6[0]
+                                ));
+                            }
+                            // F7: the probe genuinely displaces, and the arm
+                            // gap tracks the oracle delta within ±50%.
+                            if d7[0].abs() < 10.0 {
+                                fbad.push(format!("F7 oracle delta too small ({})", d7[0]));
+                            }
+                            if gap7 < 0.5 * gap_pred || gap7 > 1.5 * gap_pred {
+                                fbad.push(format!(
+                                    "F7 fetch gap off the oracle band ({gap7} vs {gap_pred})"
+                                ));
+                            }
+                            if !fbad.is_empty() {
+                                eprintln!("check-gpu: FAIL F5/F6/F7: {}", fbad.join(", "));
+                                ok = false;
+                            }
                         }
                     }
                     // --- N7 (NRD): FLAG_SKY_EXT_SKIP — sky pixels elide the
