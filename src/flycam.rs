@@ -117,6 +117,17 @@ struct Shared {
     /// stays exactly what it was. Idle steady state writes nothing (the
     /// snapshot bit-compare discipline); pause/unfocus store one 0.0.
     speed: Arc<AtomicU32>,
+    /// QA drive override (the --qa `drive` verb): axes in [-1, 1] as f32
+    /// bits (x = camera right, y = world up, z = forward) + ticks left at
+    /// the 500 Hz rate. Injected as SYNTHETIC PAD AXES after the OS
+    /// sampling (the analog path — deflection scales speed), so a scripted
+    /// strafe rides the exact integration the sticks do. Exempt from the
+    /// FOCUS gate (an unfocused window is a scripted driver's normal
+    /// state; while driving unfocused the OS keys/mouse/pad are zeroed so
+    /// background typing still cannot leak in) but NEVER from the pause
+    /// gate (paused = no frames presented = flying blind).
+    drive: [AtomicU32; 3],
+    drive_ticks: AtomicU32,
 }
 
 impl FlyCam {
@@ -138,6 +149,8 @@ impl FlyCam {
             paused: AtomicBool::new(true),
             manual_tod: AtomicBool::new(false),
             speed: Arc::new(AtomicU32::new(0)),
+            drive: [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)],
+            drive_ticks: AtomicU32::new(0),
         });
         let s2 = shared.clone();
         let handle = std::thread::Builder::new()
@@ -172,12 +185,27 @@ impl FlyCam {
         self.shared.paused.store(false, Relaxed);
     }
 
-    /// Write-through for teleports/resets. Nothing calls it today; it exists
-    /// so a future pose write goes through the shared camera instead of a
-    /// session-local copy the integrator would immediately overwrite.
-    #[allow(dead_code)]
+    /// Write-through for teleports/resets — the --qa `tp`/`look` verbs'
+    /// entry (written for exactly this before anything called it): a pose
+    /// write goes through the shared camera instead of a session-local copy
+    /// the integrator would immediately overwrite.
     pub fn set(&self, cam: Camera) {
         self.shared.state.lock().unwrap().cam = cam;
+    }
+
+    /// Arm the QA drive: axes in [-1, 1] for `ticks` 500 Hz integrator
+    /// ticks (`ticks` 0 = stop). Non-finite axes are refused here — NaN
+    /// survives `clamp` (the diamondmine lesson: `"nan".parse()` succeeds),
+    /// and a NaN position is a wedged session.
+    pub fn drive(&self, x: f32, y: f32, z: f32, ticks: u32) -> bool {
+        if !(x.is_finite() && y.is_finite() && z.is_finite()) {
+            return false;
+        }
+        self.shared.drive[0].store(x.clamp(-1.0, 1.0).to_bits(), Relaxed);
+        self.shared.drive[1].store(y.clamp(-1.0, 1.0).to_bits(), Relaxed);
+        self.shared.drive[2].store(z.clamp(-1.0, 1.0).to_bits(), Relaxed);
+        self.shared.drive_ticks.store(ticks, Relaxed);
+        true
     }
 
     /// Time-of-day write-through (the pause menu's TOD control): the thread
@@ -438,7 +466,12 @@ fn integrate_loop(shared: &Shared, hwnd: isize, diag: f32, attractors: &[TodAttr
         // window is foreground, and drop any latched drag on focus loss.
         // Pause gate: no frames are being presented (session rebuild), so
         // integrating would fly the camera blind. Both drop the drag.
-        if shared.paused.load(Relaxed) || unsafe { GetForegroundWindow() } != hwnd {
+        // A live QA drive is EXEMPT from the focus gate only (a scripted
+        // driver's window is normally unfocused); the OS inputs are then
+        // zeroed below so background keys/mouse still cannot leak in.
+        let drive_ticks = shared.drive_ticks.load(Relaxed);
+        let focused = unsafe { GetForegroundWindow() } == hwnd;
+        if shared.paused.load(Relaxed) || (!focused && drive_ticks == 0) {
             drag = None;
             if prev_speed != 0.0 {
                 prev_speed = 0.0;
@@ -447,8 +480,17 @@ fn integrate_loop(shared: &Shared, hwnd: isize, diag: f32, attractors: &[TodAttr
             continue;
         }
 
-        let down = |vk: u16| unsafe { GetAsyncKeyState(vk as i32) } as u16 & 0x8000 != 0;
-        let pad = poll_pad(&mut pad_backoff);
+        let down = |vk: u16| focused && unsafe { GetAsyncKeyState(vk as i32) } as u16 & 0x8000 != 0;
+        let pad = if focused { poll_pad(&mut pad_backoff) } else { None };
+        // QA drive axes for this tick (decremented per tick, so a requested
+        // run is exact in 500 Hz ticks whatever the render rate).
+        let mut drv = Vec3A::ZERO;
+        if drive_ticks > 0 {
+            let g = |i: usize| f32::from_bits(shared.drive[i].load(Relaxed));
+            drv = Vec3A::new(g(0), g(1), g(2));
+            shared.drive_ticks.store(drive_ticks - 1, Relaxed);
+        }
+        let drv_any = drv != Vec3A::ZERO;
 
         // --- mouse look: absolute cursor deltas while a left-drag is
         // latched (the same accelerated OS cursor SDL reported, so the
@@ -510,7 +552,14 @@ fn integrate_loop(shared: &Shared, hwnd: isize, diag: f32, attractors: &[TodAttr
         // auto_tod must integrate with NO input held (the ease keeps running
         // after the flight stops) — but once converged it writes nothing (see
         // below), so an idle converged session still compares bit-equal.
-        if !key_any && !pad_move && !pad_look && dx == 0.0 && dy == 0.0 && tod_dir == 0.0 && !auto_tod
+        if !key_any
+            && !pad_move
+            && !pad_look
+            && !drv_any
+            && dx == 0.0
+            && dy == 0.0
+            && tod_dir == 0.0
+            && !auto_tod
         {
             if prev_speed != 0.0 {
                 prev_speed = 0.0;
@@ -553,6 +602,10 @@ fn integrate_loop(shared: &Shared, hwnd: isize, diag: f32, attractors: &[TodAttr
             // not normalized like the keys); full tilt == key speed.
             step += (r * p.lx + f * p.ly) * speed;
             step += Vec3A::Y * ((p.rt - p.lt) * speed);
+        }
+        if drv_any {
+            // The QA drive rides the pad's analog math verbatim.
+            step += (r * drv.x + f * drv.z + Vec3A::Y * drv.y) * speed;
         }
         if step != Vec3A::ZERO {
             cam.pos += step;

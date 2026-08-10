@@ -1978,6 +1978,128 @@ cargo run --release -- --gpu --xess --frd  # FRD (src/frd.rs + gpu/frd_gpu.rs, 2
                                       # arm_denoiser_for -> run --check, --check-gpu, --check-dxr,
                                       # --check-nrd (must stay untouched while NRD lives),
                                       # --check-fsr, then the --gpu --xess --frd armed-line smoke
+cargo run --release -- scenes/damaged-helmet/DamagedHelmet.glb --frd-lab strafe --frd-lab-speed 8 \
+                        --cam 3.4,2.5,2.3,0,2.4,0 --tod 8
+                                      # THE AI QA LAB, batch half (main.rs::run_frd_lab,
+                                      # 2026-08-10) — the AGENT'S OWN FEEL-TEST: a headless dev
+                                      # INSTRUMENT (the --spin class, exit 0 always, never a
+                                      # gate) that reproduces and MEASURES the bright-specular
+                                      # streak family with the real wavefront tracer feeding the
+                                      # real FrdGpu, so streak iteration no longer round-trips
+                                      # through a human. RUN IT BEFORE ASKING THE USER TO STRAFE.
+                                      # The line above is the CANONICAL HELMET REPRO (glint peak
+                                      # 141.8 = 800x scene mean on the curved shell, dome + the
+                                      # v1.5.2 hex pattern in frame). Structure: the F4 harness
+                                      # (HeadlessGpu -> TraceGpu(gbuf_full,nrd) -> wire_nrd_feed
+                                      # -> per-frame trace/pack/FrdGpu/out) with REAL prev
+                                      # threading (the nrd_frame_step Frd-arm math verbatim —
+                                      # the presenter contract F4's parked pose never runs),
+                                      # over converge(32f) -> motion at --frd-lab-speed px/frame
+                                      # (surface speed at the probed center depth; travel
+                                      # clamped to 45% of width — unclamped, the subject
+                                      # marched out of frame and the corridor measured leftover
+                                      # sky) -> FRESH-history converge at the final pose (the
+                                      # ground truth; parking on the trail would contaminate
+                                      # it). Kinds: strafe (the repro) | dolly | orbit + tod
+                                      # (negative controls — orbit reads ~0 on all arms, the
+                                      # user-confirmed rotation-never-repros; tod residue is
+                                      # legitimate but must be ARM-UNIFORM, the shared
+                                      # light-par cap regime). THREE A/B ARMS per run via the
+                                      # force Cells (no env restarts): v152 = shipping | flat =
+                                      # force_curv off (the helmet-streak repro) | novm =
+                                      # force_vmotion off (the surface-MV arm). METRICS, all
+                                      # corridor-disciplined around ONE tracked glint (shared
+                                      # cross-arm lock; per-frame local argmax + windowed
+                                      # centroid — whole-frame centroids merged unrelated
+                                      # blobs and measured a 216px phantom lag; analytic -x
+                                      # axis on strafe; the GLINT-LIFETIME gate stops metrics
+                                      # when the input's local peak fades under 5% of initial
+                                      # or the track jumps — a strafed mirror point slides off
+                                      # the shell and the re-lock onto a DIFFERENT glint
+                                      # measured a phantom 83px trail): lag, trail/lead px past
+                                      # the converged half-extent, beyond-path energy (the
+                                      # "past where the sun ever was" question, as a number),
+                                      # keep = out local peak / conv peak (a streak SPREADS
+                                      # energy — at low speeds the trail sits under T_streak
+                                      # while keep collapses: flat reads 0.04 vs shipping
+                                      # 0.21-0.27 at speeds 4-8, the suppression signature;
+                                      # teeth = trail OR keep), end_err vs truth, a 4px-bin
+                                      # profile, and tone+log frd-lab-*.png dumps the agent
+                                      # READS itself. MEASURED at the canonical line: teeth
+                                      # fire at speeds 4-12 (flat trail 99px vs shipping 14 at
+                                      # speed 12), novm shows the predicted LEADING signature,
+                                      # shipping v1.5.2 reads clean at every speed. Sub-flags:
+                                      # --frd-lab-speed (default 4) / -frames (24) / -res
+                                      # (960x540); exclusive with --spin/--check*/--cinematic,
+                                      # never loads the world; the --frd-lab prefix family
+                                      # rides one headless_args clause; cli::self_test pins the
+                                      # parse (known-kind optional value — a scene path is
+                                      # never swallowed, an unknown kind exits 2)
+cargo run --release -- scenes/damaged-helmet/DamagedHelmet.glb --qa --cam 3.4,2.5,2.3,0,2.4,0 --tod 8
+                                      # THE AI QA LAB, live half (src/qa.rs + session()'s drain,
+                                      # 2026-08-10) — the LIVE QA CONTROL SOCKET: a localhost
+                                      # TCP line protocol (--qa [port], default 4599, 127.0.0.1
+                                      # only — the bind IS the security boundary, like the dev
+                                      # console it mirrors) that lets a scripted driver run the
+                                      # REAL interactive session, every mode/upscaler/FG family
+                                      # included — the half the batch lab can't see (it measures
+                                      # FRD's OUT plane; this measures the screen). Ported from
+                                      # diamondmine's QA socket (commit 14683e6 there) with ONE
+                                      # Windows change: TcpListener for the Unix socket — plus
+                                      # THE WINDOWS ACCEPT TRAP found live: an accepted socket
+                                      # INHERITS the listener's nonblocking mode (Linux resets
+                                      # it), so without set_nonblocking(false) per connection
+                                      # the first read races the client's write and drops it as
+                                      # WouldBlock — an intermittent 1-in-4 "write failed".
+                                      # Protocol: one verb line in, exactly ONE JSON line back
+                                      # ({"ok":bool,"lines":[[level,text]..],"ms":f}; ok false
+                                      # iff any level-3 line — qa::self_test pins it in
+                                      # --check). VERBS (dispatched in session()'s drain, once
+                                      # per loop iteration BEFORE the menu hold, so a held menu
+                                      # still answers and can be quit): pos (camera/tod/mode/
+                                      # wired upscaler/res/fps/frame/fg_mult as JSON) | tp x y z
+                                      # [yaw pitch] + look yaw pitch (FlyCam::set — the
+                                      # write-through built for exactly this) | tod H
+                                      # (fly.set_tod — the MenuFx path; the session's own
+                                      # sun_moved detector applies it) | drive x y z ticks /
+                                      # drive stop (synthetic ANALOG flight in the flycam
+                                      # thread: axes ride the pad path's deflection-scales-
+                                      # speed math for N 500Hz ticks; EXEMPT from the focus
+                                      # gate — a driver's window is normally unfocused; OS
+                                      # keys/mouse/pad are zeroed while unfocused so background
+                                      # typing can't leak — never exempt from pause. USAGE:
+                                      # deflection scales diag*0.1875 u/s, and diag is
+                                      # ground-quad-inflated, so subject-scale passes want
+                                      # 0.02-0.05, NOT 1.0 — full deflection overshot a 4-unit-
+                                      # distant helmet in 0.26 s) | key <name> (synthesized
+                                      # Edges — the settings::MenuFx precedent, so reset
+                                      # semantics cannot drift from the keys; refused while the
+                                      # menu is open) | screenshot <path.png> (a PENDING verb:
+                                      # the three P arms consume the qa_shot path and resolve
+                                      # ok/err AFTER the write — the diamondmine typed-result
+                                      # lesson; captures whatever the session presents, RR/
+                                      # XeSS/FSR/quin included) | sync N (N loop iterations —
+                                      # the settle primitive: tp -> sync 120 -> screenshot) |
+                                      # quit (clean SessionEnd::Quit). Pendings carry a 30s
+                                      # backstop; disconnects are non-events; a session exit
+                                      # answers in-flight requests "session ended" via the
+                                      # dropped sender. The listener lives in run_window BESIDE
+                                      # the FlyCam (connections survive resize re-entries);
+                                      # headless paths never construct it, no settings row.
+                                      # DRIVE IT WITH `frqa` (src/bin/frqa.rs, the diamondmine
+                                      # qactl twin — pure std, builds standalone): `frqa [-p
+                                      # port] <verb...>` prints the JSON reply raw, exit 0 on
+                                      # ok:true / 1 on ok:false / 2 on connect-usage; raw TCP
+                                      # works too. VERIFIED LIVE (2026-08-10, DXR->DLSS-RR
+                                      # session): 12/12 rapid-fire, concurrent connections
+                                      # interleave, and the agent's own mid-strafe helmet-glint
+                                      # screenshot via tp -> tod -> sync -> drive -0.04 ->
+                                      # screenshot — the end-to-end loop the lab exists for.
+                                      # An FRD live session is `--qa --gpu --xess` (FRD is the
+                                      # XeSS/FSR3 sessions' denoiser). MCP: deliberately NOT in
+                                      # the game — a thin external wrapper over this socket is
+                                      # the recorded follow-on if typed tool schemas ever earn
+                                      # their keep; Bash + frqa carries the capability today
 cargo run --release -- --no-temporal  # A/B lever: disable ALL previous-frame quadtree reuse (no
                                       # temporal cache, no claim ring, no query skip, no structure
                                       # replay) — every frame proves its empty space from scratch

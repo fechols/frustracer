@@ -78,6 +78,9 @@ mod pad;
 // Zero-cost + never activated on any headless path (the gates stay a pure
 // function of the command line).
 mod progress;
+// The live AI QA control socket (--qa): TCP transport + reply encoding; the
+// verb dispatch lives in session()'s drain (it needs the session locals).
+mod qa;
 mod render;
 mod reproject;
 mod scene;
@@ -17806,6 +17809,16 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         }
     };
 
+    // QA-socket reply encoding (the pure half of --qa — the ok/error level
+    // semantics and one-line framing a scripted driver's contract rests on).
+    let qa_ok = match qa::self_test() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("qa self-test: FAIL — {e}");
+            false
+        }
+    };
+
     // Presentation-curve self-test — the SDR degeneracy (bit-for-bit against
     // the pre-HDR curve: the guard that --hdr did not move the default), the
     // paper-white anchor, monotonicity, the headroom asymptote, and C¹ at the
@@ -20330,6 +20343,7 @@ fn run_check(scene: &scene::Scene, bvh: &bvh::Bvh, cam0: Camera, structural: boo
         ("upchain", upchain_ok),
         ("settings", settings_ok),
         ("cli", cli_ok),
+        ("qa", qa_ok),
         ("tone", tone_ok),
         ("gltf", gltf_ok),
         ("bc7", bc7_ok),
@@ -21132,6 +21146,28 @@ fn run_window(
     // stays responsive while the main thread is blocked in a trace.
     let audio_sys =
         if opts.audio { audio::AudioSys::new(&sdl, cues, fly.speed_handle(), scene.diag) } else { None };
+    // The AI QA control socket lives here beside the FlyCam for the same
+    // reason again: connections must survive resize re-entries. Bind
+    // failure is loud + non-fatal (the session runs without the socket).
+    let qa_ctl: Option<(qa::QaQueue, std::sync::Arc<std::sync::atomic::AtomicBool>)> =
+        opts.qa.and_then(|port| {
+            let q: qa::QaQueue =
+                std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+            let quit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            match qa::spawn_listener(port, q.clone(), quit.clone()) {
+                Ok(_h) => {
+                    eprintln!(
+                        "qa: control socket listening on 127.0.0.1:{port} — drive it with \
+                         `frqa` (pos | tp | look | tod | drive | key | screenshot | sync | quit)"
+                    );
+                    Some((q, quit))
+                }
+                Err(e) => {
+                    eprintln!("qa: bind 127.0.0.1:{port} failed ({e}) — continuing without the socket");
+                    None
+                }
+            }
+        });
 
     // A window resize exits the session and re-enters it at the new client
     // size: the session init code IS the rebuild path (every buffer,
@@ -21142,7 +21178,7 @@ fn run_window(
     loop {
         match session(
             &mut scene, &mut bvh, opts, &fly, audio_sys.as_ref(), &mut window, &mut inp, &mut gpu,
-            &mut hud, &mut cfg, &mut cli_over, &mut persist, w, h,
+            &mut hud, &mut cfg, &mut cli_over, &mut persist, qa_ctl.as_ref().map(|(q, _)| q), w, h,
         ) {
             SessionEnd::Quit => break,
             SessionEnd::Resize(nw, nh) => {
@@ -21264,6 +21300,37 @@ fn fr_ref_hybrid_default() -> bool {
 /// flags (first entry), and writes it back on every exit.
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
+/// A --qa verb that could not answer in its own drain: `screenshot` waits
+/// for a P arm's write, `sync` for a loop-iteration target. Every pending
+/// carries a 30 s backstop deadline (the diamondmine rule — a scripted
+/// driver must never hang forever on a verb the session dropped).
+enum QaPendKind {
+    Shot,
+    Sync { target: u64 },
+}
+struct QaPending {
+    kind: QaPendKind,
+    reply: std::sync::mpsc::SyncSender<String>,
+    started: Instant,
+    deadline: Instant,
+}
+
+/// Resolve the outstanding screenshot pending (called by the P arms right
+/// after their save/failure — the diamondmine typed-result lesson: a failed
+/// capture must answer ok:false, never an info line a driver parses as
+/// success).
+fn qa_resolve_shot(pend: &mut Vec<QaPending>, res: Result<&str, &str>) {
+    if let Some(i) = pend.iter().position(|p| matches!(p.kind, QaPendKind::Shot)) {
+        let p = pend.remove(i);
+        let ms = p.started.elapsed().as_secs_f64() * 1000.0;
+        let _ = p.reply.send(match res {
+            Ok(name) => qa::reply_json(&[(1, format!("screenshot written: {name}"))], ms),
+            Err(e) => qa::reply_json(&[(3, format!("screenshot failed: {e}"))], ms),
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn session(
     scene: &mut scene::Scene,
     bvh: &mut bvh::Bvh,
@@ -21277,6 +21344,7 @@ fn session(
     cfg: &mut settings::Settings,
     cli_over: &mut std::collections::HashMap<String, String>,
     persist: &mut Option<Persist>,
+    qa: Option<&qa::QaQueue>,
     w: usize,
     h: usize,
 ) -> SessionEnd {
@@ -22136,6 +22204,14 @@ fn session(
     let mut fps_t = Instant::now();
     let mut last_ms = 0.0f64;
     let mut shot = p0.map_or(0u32, |p| p.shot);
+    // --qa session state: pendings (screenshot / sync) with their reply
+    // senders + backstop deadlines, the loop-iteration counter `sync`
+    // resolves against, and the named-path side channel the three P arms
+    // consume. All session-local — a session exit drops outstanding reply
+    // senders, which the connection threads read as "session ended".
+    let mut qa_pend: Vec<QaPending> = Vec::new();
+    let mut qa_iter: u64 = 0;
+    let mut qa_shot: Option<String> = None;
     // Debounced window-resize commit: SizeChanged events (a stream during a
     // drag, one for maximize/F11) arm the timer; the session exits for a
     // rebuild only once the size has been quiet for RESIZE_SETTLE_MS.
@@ -22259,6 +22335,212 @@ fn session(
         // the menu is CLOSED too (a press outlasts any frame), and the menu
         // hold-loop's `continue` below returns here at ~140 Hz for nav.
         let pe = pad.poll();
+
+        // --- the AI QA control drain (--qa): once per loop iteration,
+        // BEFORE the resize/menu-hold branches (the diamondmine
+        // drain-before-pause rule — a held menu still answers `pos` and can
+        // be quit over the socket). Verbs either answer in place, synthesize
+        // `edges` fields (the settings::MenuFx precedent — the exact
+        // key-handler code paths, so reset semantics cannot drift), or park
+        // a pending (screenshot / sync) resolved later.
+        if let Some(qq) = qa {
+            qa_iter += 1;
+            let now_q = Instant::now();
+            qa_pend.retain_mut(|p| {
+                let done = match p.kind {
+                    QaPendKind::Sync { target } => qa_iter >= target,
+                    QaPendKind::Shot => false,
+                };
+                if done {
+                    let ms = p.started.elapsed().as_secs_f64() * 1000.0;
+                    let _ = p
+                        .reply
+                        .send(qa::reply_json(&[(1, format!("sync: iteration {qa_iter} reached"))], ms));
+                    false
+                } else if now_q > p.deadline {
+                    let _ = p.reply.send(qa::err_reply("pending verb timed out (30 s backstop)"));
+                    false
+                } else {
+                    true
+                }
+            });
+            let menu_is_open = hud.as_ref().is_some_and(|hd| hd.menu_open());
+            while let Some(req) = { qq.lock().unwrap().pop_front() } {
+                let t0 = Instant::now();
+                let words: Vec<&str> = req.line.split_whitespace().collect();
+                let fin = |s: &&str| s.parse::<f32>().ok().filter(|v| v.is_finite());
+                let json = match words.as_slice() {
+                    ["pos"] => {
+                        let snap = fly.snapshot();
+                        let mode = if gpu_trace {
+                            "GPU"
+                        } else if dxr_on {
+                            "DXR"
+                        } else {
+                            "CPU"
+                        };
+                        let state = serde_json::json!({
+                            "pos": [snap.cam.pos.x, snap.cam.pos.y, snap.cam.pos.z],
+                            "yaw_deg": snap.cam.yaw.to_degrees(),
+                            "pitch_deg": snap.cam.pitch.to_degrees(),
+                            "fov_y_deg": snap.cam.fov_y.to_degrees(),
+                            "tod": snap.tod,
+                            "mode": mode,
+                            "upscaler": format!("{:?}", gpu.wired()),
+                            "window": [w, h],
+                            "render": [grw, grh],
+                            "last_ms": last_ms,
+                            "fps": fps,
+                            "frame": frame,
+                            "fg_mult": gpu.fg_display_mult(),
+                            "menu_open": menu_is_open,
+                            "iter": qa_iter,
+                        });
+                        qa::reply_json(
+                            &[(1, state.to_string())],
+                            t0.elapsed().as_secs_f64() * 1000.0,
+                        )
+                    }
+                    ["tp", rest @ ..] if rest.len() == 3 || rest.len() == 5 => {
+                        let vs: Vec<f32> = rest.iter().filter_map(fin).collect();
+                        if vs.len() != rest.len() {
+                            qa::err_reply("tp needs finite x y z [yaw_deg pitch_deg]")
+                        } else {
+                            let mut c = fly.snapshot().cam;
+                            c.pos = Vec3A::new(vs[0], vs[1], vs[2]);
+                            if vs.len() == 5 {
+                                c.yaw = vs[3].to_radians();
+                                c.pitch = vs[4].to_radians().clamp(-1.55, 1.55);
+                            }
+                            fly.set(c);
+                            qa::info_reply(&format!(
+                                "teleported to ({}, {}, {})",
+                                vs[0], vs[1], vs[2]
+                            ))
+                        }
+                    }
+                    ["look", y, p] => match (fin(y), fin(p)) {
+                        (Some(yd), Some(pd)) => {
+                            let mut c = fly.snapshot().cam;
+                            c.yaw = yd.to_radians();
+                            c.pitch = pd.to_radians().clamp(-1.55, 1.55);
+                            fly.set(c);
+                            qa::info_reply(&format!("look yaw {yd} deg pitch {pd} deg"))
+                        }
+                        _ => qa::err_reply("look needs finite yaw_deg pitch_deg"),
+                    },
+                    ["tod", hstr] => match fin(hstr) {
+                        Some(hv) => {
+                            fly.set_tod(hv);
+                            qa::info_reply(&format!("tod {hv}"))
+                        }
+                        None => qa::err_reply("tod needs a finite hour"),
+                    },
+                    ["drive", "stop"] => {
+                        fly.drive(0.0, 0.0, 0.0, 0);
+                        qa::info_reply("drive cleared")
+                    }
+                    ["drive", x, y, z, t] => {
+                        match (fin(x), fin(y), fin(z), t.parse::<u32>().ok()) {
+                            (Some(dx), Some(dy), Some(dz), Some(ticks))
+                                if ticks > 0 && ticks <= 500_000 =>
+                            {
+                                if fly.drive(dx, dy, dz, ticks) {
+                                    qa::info_reply(&format!(
+                                        "drive ({dx}, {dy}, {dz}) for {ticks} ticks (~{:.1}s)",
+                                        ticks as f32 / 500.0
+                                    ))
+                                } else {
+                                    qa::err_reply("drive axes must be finite")
+                                }
+                            }
+                            _ => qa::err_reply(
+                                "drive needs finite axes in -1..1 and ticks 1..500000 (500 Hz)",
+                            ),
+                        }
+                    }
+                    ["key", name] if menu_is_open => {
+                        let _ = name;
+                        qa::err_reply("close the menu first (toggle keys are routed to Slint)")
+                    }
+                    ["key", name] => {
+                        let mut ok = true;
+                        match *name {
+                            "space" => edges.cycle_mode = true,
+                            "f" => edges.toggle_dxr = true,
+                            "r" => edges.toggle_hybrid = true,
+                            "t" => edges.toggle_dynamic = true,
+                            "o" => edges.toggle_overlay = true,
+                            "b" => edges.toggle_gpu_tone = true,
+                            "g" => edges.toggle_dlss = true,
+                            "x" => edges.toggle_xess = true,
+                            "k" => edges.toggle_fsr = true,
+                            "n" => edges.toggle_oidn = true,
+                            "m" => edges.toggle_temporal = true,
+                            "j" => edges.toggle_nppd = true,
+                            "h" => edges.toggle_bounce = true,
+                            "u" => edges.cycle_spp = true,
+                            "v" => edges.toggle_height = true,
+                            "i" => edges.toggle_waveviz = true,
+                            "c" => edges.verify = true,
+                            "y" => edges.capture_frustum = true,
+                            "z" => edges.clear_frustum = true,
+                            "f1" => edges.toggle_hud = true,
+                            "1" => edges.quality = Some(1),
+                            "2" => edges.quality = Some(2),
+                            "3" => edges.quality = Some(3),
+                            _ => ok = false,
+                        }
+                        if ok {
+                            qa::info_reply(&format!("key {name} queued"))
+                        } else {
+                            qa::err_reply(
+                                "unknown key (space f r t o b g x k n m j h u v i c y z f1 1 2 3)",
+                            )
+                        }
+                    }
+                    ["screenshot", path] => {
+                        if qa_pend.iter().any(|p| matches!(p.kind, QaPendKind::Shot)) {
+                            qa::err_reply("a screenshot is already pending")
+                        } else {
+                            edges.screenshot = true;
+                            qa_shot = Some((*path).to_string());
+                            qa_pend.push(QaPending {
+                                kind: QaPendKind::Shot,
+                                reply: req.reply.clone(),
+                                started: t0,
+                                deadline: t0 + Duration::from_secs(30),
+                            });
+                            continue; // answered later by the P arm
+                        }
+                    }
+                    ["sync", n] => match n.parse::<u64>().ok().filter(|n| *n > 0) {
+                        Some(nf) => {
+                            qa_pend.push(QaPending {
+                                kind: QaPendKind::Sync { target: qa_iter + nf },
+                                reply: req.reply.clone(),
+                                started: t0,
+                                deadline: t0
+                                    + Duration::from_secs(30)
+                                    + Duration::from_millis(100 * nf),
+                            });
+                            continue; // answered when the iteration arrives
+                        }
+                        None => qa::err_reply("sync needs a positive iteration count"),
+                    },
+                    ["quit"] => {
+                        edges.quit = true;
+                        qa::info_reply("quitting")
+                    }
+                    _ => qa::err_reply(
+                        "unknown verb — pos | tp x y z [yaw pitch] | look yaw pitch | tod H | \
+                         drive x y z ticks | drive stop | key <name> | screenshot <path> | \
+                         sync N | quit",
+                    ),
+                };
+                let _ = req.reply.send(json);
+            }
+        }
         if edges.toggle_fullscreen {
             // Borderless desktop fullscreen (F11) — SDL3's set_fullscreen is
             // a bool, and fullscreen with no exclusive mode set IS borderless
@@ -23463,14 +23745,23 @@ fn session(
                     GpuUp::Quin => gpu.read_quin_output().map(|px| (px, w, h)),
                     GpuUp::Plain => gpu.read_trace_output(),
                 };
+                let qa_path = qa_shot.take();
                 match cap {
                     Ok((px, sw, sh)) => {
-                        let name = format!("screenshot_{shot}.png");
+                        let name = qa_path
+                            .clone()
+                            .unwrap_or_else(|| format!("screenshot_{shot}.png"));
                         save_png(&name, &px, sw, sh);
                         eprintln!("saved {name}");
-                        shot += 1;
+                        if qa_path.is_none() {
+                            shot += 1;
+                        }
+                        qa_resolve_shot(&mut qa_pend, Ok(&name));
                     }
-                    Err(e) => eprintln!("screenshot: GPU readback failed ({e})"),
+                    Err(e) => {
+                        eprintln!("screenshot: GPU readback failed ({e})");
+                        qa_resolve_shot(&mut qa_pend, Err(&format!("GPU readback failed ({e})")));
+                    }
                 }
             }
             fps_frames += 1;
@@ -24324,14 +24615,23 @@ fn session(
                     GpuUp::Quin => gpu.read_quin_output().map(|px| (px, w, h)),
                     GpuUp::Plain => gpu.read_dxr_output(),
                 };
+                let qa_path = qa_shot.take();
                 match grab {
                     Ok((px, sw, sh)) => {
-                        let name = format!("screenshot_{shot}.png");
+                        let name = qa_path
+                            .clone()
+                            .unwrap_or_else(|| format!("screenshot_{shot}.png"));
                         save_png(&name, &px, sw, sh);
                         eprintln!("saved {name}");
-                        shot += 1;
+                        if qa_path.is_none() {
+                            shot += 1;
+                        }
+                        qa_resolve_shot(&mut qa_pend, Ok(&name));
                     }
-                    Err(e) => eprintln!("screenshot: GPU readback failed ({e})"),
+                    Err(e) => {
+                        eprintln!("screenshot: GPU readback failed ({e})");
+                        qa_resolve_shot(&mut qa_pend, Err(&format!("GPU readback failed ({e})")));
+                    }
                 }
             }
             fps_frames += 1;
@@ -25414,10 +25714,14 @@ fn session(
                     present.resolve_sdr(&accum, &info, frame.max(1), ov, rw, rh, w, h);
                 }
             }
-            let name = format!("screenshot_{shot}.png");
+            let qa_path = qa_shot.take();
+            let name = qa_path.clone().unwrap_or_else(|| format!("screenshot_{shot}.png"));
             save_png(&name, &present.sdr, w, h);
             eprintln!("saved {name}");
-            shot += 1;
+            if qa_path.is_none() {
+                shot += 1;
+            }
+            qa_resolve_shot(&mut qa_pend, Ok(&name));
         }
         if edges.verify {
             eprintln!("verifying current view...");

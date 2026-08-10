@@ -29,7 +29,7 @@
 use crate::camera::Camera;
 use crate::{
     bc7, blas_split, bloom, bvh, cinematic, clouds, dlss, emissive, fireflies, frd, fsr, gpu,
-    nrd, oidn, scene, settings, texture, tone, upchain, xess,
+    nrd, oidn, qa, scene, settings, texture, tone, upchain, xess,
 };
 use glam::Vec3A;
 
@@ -48,6 +48,12 @@ pub struct Opts {
     pub chain: upchain::UpChain,
     /// D3D12 debug layer + GPU-based validation.
     pub gpu_debug: bool,
+    /// `--qa [port]`: the live AI QA control socket — a localhost TCP line
+    /// protocol driving the INTERACTIVE session (teleport, drive, key
+    /// toggles, screenshots, state readout; see src/qa.rs and the `frqa`
+    /// client). `None` = off (the default). Interactive-only: headless
+    /// paths never construct the listener, so no gate can move under it.
+    pub qa: Option<u16>,
     /// Block-compress the OPAQUE scene textures to BC7 on upload (8 bpp vs
     /// 32), GPU upload only — the CPU renderer keeps sampling the exact RGBA8
     /// texels, so this moves the GPU-vs-CPU statistical gates (albedo A/B,
@@ -752,6 +758,7 @@ pub fn defaults() -> Opts {
 
         chain: upchain::UpChain::ALL,
         gpu_debug: false,
+        qa: None,
         bc7: bc7::Bc7Mode::Gpu(bc7::Quality::Fast),
         audio: true,
         oidn: false,
@@ -1709,6 +1716,23 @@ pub fn parse_from(base: Opts, args: impl Iterator<Item = String>) -> Cli {
             // KNOWN kind — an unknown one exits 2 rather than falling through
             // to the OBJ loader as a phantom scene (the --blas-split
             // optional-value doctrine, vocabulary-keyed).
+            // --qa takes an OPTIONAL port (the --blas-split all-digits
+            // idiom, so a following scene path is never swallowed).
+            "--qa" => {
+                let v = match args.peek() {
+                    Some(v) if !v.is_empty() && v.chars().all(|c| c.is_ascii_digit()) => {
+                        args.next()
+                    }
+                    _ => None,
+                };
+                opts.qa = Some(match v {
+                    Some(s) => s.parse::<u16>().ok().filter(|p| *p != 0).unwrap_or_else(|| {
+                        eprintln!("--qa port must be 1..65535");
+                        std::process::exit(2);
+                    }),
+                    None => qa::DEFAULT_PORT,
+                });
+            }
             "--frd-lab" => {
                 let looks_path =
                     |v: &str| v.contains('.') || v.contains('/') || v.contains('\\');
@@ -2231,6 +2255,10 @@ pub fn usage() {
                 eprintln!("    --frd-lab-speed P   surface screen speed at center depth, px/frame (default 4)");
                 eprintln!("    --frd-lab-frames N  motion frames (default 24)");
                 eprintln!("    --frd-lab-res WxH   render resolution (default 960x540)");
+                eprintln!("  --qa [port]   live AI QA control socket on 127.0.0.1 (default 4599):");
+                eprintln!("                line-in/JSON-line-out verbs driving the interactive session —");
+                eprintln!("                pos | tp | look | tod | drive | key | screenshot | sync | quit.");
+                eprintln!("                Drive it with the `frqa` client (or raw TCP)");
                 eprintln!("  --waveviz [chs]  wave-footprint overlay: every pixel wears its wave's hash");
                 eprintln!("                color (I toggles live in GPU arms, every upscaler included;");
                 eprintln!("                --spin runs dump waveviz-<arm>.png + compactness stats;");
@@ -3068,6 +3096,18 @@ pub fn self_test() -> Result<(), String> {
     let fl2 = parse_argv(&["--frd-lab", "model.obj"]);
     if fl2.frd_lab.as_deref() != Some("strafe") || fl2.obj.as_deref() != Some("model.obj") {
         return Err("--frd-lab must default to strafe and never swallow a scene path".into());
+    }
+    // --qa's optional port: bare = the default, digits = explicit, a scene
+    // path is never swallowed (not all-digits).
+    if parse_argv(&["--qa"]).opts.qa != Some(qa::DEFAULT_PORT) {
+        return Err("bare --qa must arm the default port".into());
+    }
+    if parse_argv(&["--qa", "5001"]).opts.qa != Some(5001) {
+        return Err("--qa 5001 must take the explicit port".into());
+    }
+    let qb = parse_argv(&["--qa", "model.obj"]);
+    if qb.opts.qa != Some(qa::DEFAULT_PORT) || qb.obj.as_deref() != Some("model.obj") {
+        return Err("--qa must not swallow a following scene path".into());
     }
     // Same optional-value contract for --waveviz: `chs` is consumed on exact
     // match only, a scene path is not.
