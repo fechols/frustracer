@@ -50,6 +50,9 @@ xess_gbuf_*.png
 /capture-*/
 /cap-test/
 /capture-*.log
+# The --frd-lab instrument's per-run tone/log dumps (written to CWD by
+# design — the agent Reads them; never committed).
+/frd-lab-*.png
 *.mp4
 *.webm
 *.mov

@@ -94,18 +94,48 @@ float frd_vm_curvature_at(float dn, float base_px, float view_z, float proj) {
 // tracks its curved axis). κ_lo/κ_hi bracket all four — their projected
 // fetch spread is the estimator's own disagreement, charged into the
 // specular history cap: unsure ⇒ short history, never a confident wrong
-// fetch (the v2 confidence term, cheap form).
+// fetch (the v2 confidence term, cheap form). `vscale` is the v1.5.3
+// baseline scale (oracle::vm_baseline_scale, delivered on the vm_scale CB
+// lane): the dn args are measured over ±vscale/±2·vscale texels so the
+// estimator — dead-zone included — is a pure function of the WORLD
+// footprint, not the pixel pitch (at fixed 2px/4px texel baselines a
+// 1080p dome yields half the |Δn| of the 540p regime the DZ was sized in,
+// κ under-reads, and the v1.5.1 trailing streak reopens — the measured
+// live-1080p strafe smear; vscale 1.0 is the pre-v1.5.3 estimator
+// bitwise).
+// The v1.5.3(b) DE-BIASED per-axis combine (oracle::vm_kappa's doc): the
+// subtractive DZ biases every read down and the old min kept the WORST-
+// bitten one; the clean-field identity true κ = k2 + 2·skew = k4 + skew
+// makes min(k2 + 2·skew, k4 + skew) exactly unbiased on clean fields and
+// spike-bounded both ways. Extrapolation gated on both reads clearing the
+// DZ — a constant field returns exactly 0 (the bitwise flat contract), a
+// 2px-dead-zoned close-up takes bare k4 (the REAL 4px rescue — the old
+// min(0, k4) discarded it). κ_hi covers the applied κ (the bracket only
+// widens).
+float frd_vm_axis(float k2, float k4, float skew) {
+    if (k2 <= 0.0) {
+        return k4 <= 0.0 ? 0.0 : k4;
+    }
+    if (k4 <= 0.0) {
+        return 0.0;
+    }
+    return min(k2 + 2.0 * skew, k4 + skew);
+}
+
 float3 frd_vm_kappa(
-    float dn2x, float dn4x, float dn2y, float dn4y, float view_z, float proj
+    float dn2x, float dn4x, float dn2y, float dn4y, float view_z, float proj,
+    float vscale
 ) {
-    float k2x = frd_vm_curvature_at(dn2x, 2.0, view_z, proj);
-    float k4x = frd_vm_curvature_at(dn4x, 4.0, view_z, proj);
-    float k2y = frd_vm_curvature_at(dn2y, 2.0, view_z, proj);
-    float k4y = frd_vm_curvature_at(dn4y, 4.0, view_z, proj);
+    float k2x = frd_vm_curvature_at(dn2x, 2.0 * vscale, view_z, proj);
+    float k4x = frd_vm_curvature_at(dn4x, 4.0 * vscale, view_z, proj);
+    float k2y = frd_vm_curvature_at(dn2y, 2.0 * vscale, view_z, proj);
+    float k4y = frd_vm_curvature_at(dn4y, 4.0 * vscale, view_z, proj);
+    float skew = FRD_VM_DN_DZ * proj / (4.0 * vscale * max(view_z, 1e-4));
+    float kap = max(frd_vm_axis(k2x, k4x, skew), frd_vm_axis(k2y, k4y, skew));
     return float3(
-        max(min(k2x, k4x), min(k2y, k4y)),
+        kap,
         min(min(k2x, k4x), min(k2y, k4y)),
-        max(max(k2x, k4x), max(k2y, k4y)));
+        max(max(max(k2x, k4x), max(k2y, k4y)), kap));
 }
 
 // oracle::disocclusion_z_valid_slack — the VIRTUAL foot's widened test

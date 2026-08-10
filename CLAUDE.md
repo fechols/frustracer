@@ -1863,6 +1863,80 @@ cargo run --release -- --gpu --xess --frd  # FRD (src/frd.rs + gpu/frd_gpu.rs, 2
                                       # fuel, and the identified follow-up if residue
                                       # survives is a luma-ratio tap guard in frd_disk (the
                                       # firefly ring clamp's spatial sibling).
+                                      # v1.5.3 (2026-08-10 — THE FIRST CLOSED-LOOP AI-QA-LAB
+                                      # CAMPAIGN: the residual "faster = wider" strafe smear
+                                      # the user reported, diagnosed and fixed with ZERO human
+                                      # feel-tests — live frqa strafe passes with FWHM
+                                      # measurement on the screenshots, the NRD oracle A/B,
+                                      # the per-lever live sweep, and the batch lab as the
+                                      # regression pin; the whole method is the --frd-lab/--qa
+                                      # entries' reason to exist). TWO κ-estimator defects,
+                                      # both invisible at the 540p lab/gate resolutions:
+                                      # (a) RESOLUTION DEPENDENCE — the 2px/4px baselines are
+                                      # TEXEL counts while VM_DN_DZ is absolute per-sample
+                                      # quantization noise, so at 1080p each baseline spans
+                                      # HALF the 540p world distance, |Δn| halves against the
+                                      # same DZ, κ under-reads, and the fetch slides toward
+                                      # the flat/sky arm — the v1.5.1 trailing streak REOPENED
+                                      # at exactly the res users play (measured live: glint
+                                      # FWHM 47 still → 141 px at the fastest strafe while
+                                      # the 540p lab read the same world pass clean; NRD and
+                                      # --no-frd stayed ~50 at every speed — the two-arm A/B
+                                      # that pinned it on FRD; FR_FRD_VMOTION=off BEATING the
+                                      # shipping vm arm was the tell that κ under-read, since
+                                      # a close-up dome's correct behavior ≈ the surface
+                                      # fetch). Fix: oracle::vm_baseline_scale = max(1,
+                                      # round(rh/VM_BASE_RH=540)) scales the sample OFFSETS
+                                      # (±s/±2s texels — the same WORLD footprint at every
+                                      # res, DZ ratio restored; s is integer, session-fixed,
+                                      # rides the CB's ex-pad dword 17, loud when ≠1); every
+                                      # gate res (533x400/800x600) and the lab's 540p keep
+                                      # s=1 BITWISE. FR_FRD_VMSCALE=off|<n> is the repro/
+                                      # force lever (measured: off returns 96 of the 140 px).
+                                      # (b) THE MIN-ACROSS-SCALES KEPT THE WORST-BITTEN READ —
+                                      # on a clean field k4 = k2 + skew EXACTLY (skew =
+                                      # DZ·proj/(2·b1·z), the self-test closed form), so the
+                                      # per-axis min ALWAYS returned the short baseline, the
+                                      # one the subtractive DZ ate most of (~37% of true κ on
+                                      # the live dome ⇒ t_v overshoots ~2.7× ⇒ the fetch lags
+                                      # the content ⇒ velocity-proportional trailing residue)
+                                      # — and the documented "4px rescue" NEVER FIRED
+                                      # (min(0, k4) = 0 discards exactly the close-up macro
+                                      # signal it was written for). Fix: the DE-BIASED combine
+                                      # — the clean-field identity true κ = k2 + 2·skew = k4
+                                      # + skew makes min(k2+2·skew, k4+skew) EXACTLY unbiased
+                                      # on clean fields and spike-bounded both ways (either
+                                      # single-scale spike leaves the other arm's clean-field
+                                      # extrapolation; both-spiked stays the v2 known-accept);
+                                      # extrapolation is GATED on both reads clearing the DZ —
+                                      # a constant field returns exactly (0,0,0) (the bitwise
+                                      # still-water/F7 contract, no skew leaks), a
+                                      # 2px-dead-zoned close-up takes the BARE k4 (the real
+                                      # rescue, humble), short-only signal stays 0 (bump
+                                      # noise); κ_hi additionally covers the applied κ so the
+                                      # vm_unc bracket only widens. MEASURED LIVE (1080p
+                                      # deflection sweep, glint FWHM px vs the ~50 px clean
+                                      # band): still 47 | 0.015 → 72-83 pre / 61-76 post |
+                                      # 0.03 → 86-89 / 57-62 | 0.06 → 140-142 / 57-88 —
+                                      # INSIDE NRD's own 53-81 at every speed, aspect back to
+                                      # round; the velocity term is gone. F0's vm_kappa
+                                      # family REWRITTEN to the new closed forms (unbiased
+                                      # clean-field anchor + de-bias teeth, spike suppression
+                                      # to k4+skew, the REAL rescue pin, the exact-(0,0,0)
+                                      # flat pin, short-only-spike-is-0, bracket = 2·skew,
+                                      # the baseline-scale rule table, and the BITWISE
+                                      # res-invariance identity — 2× proj with 2× scale must
+                                      # reproduce κ exactly, powers of two); F7C green with
+                                      # kap 1.17 → 1.38 (the de-biased read), gapF/gapC
+                                      # unmoved (0.049/0.004 — repro arm and collapse intact).
+                                      # LAB LESSON, load-bearing: the batch lab at 960x540
+                                      # measured v1.5.2 "clean" while shipping keep sat at
+                                      # 0.15-0.27 — a RELATIVE teeth verdict (flat vs
+                                      # shipping) can't flag the shipping arm degrading, and
+                                      # an instrument at the wrong RESOLUTION can't see a
+                                      # res-dependent estimator at all; the live half of the
+                                      # QA lab (real render res, real upscaler) is what
+                                      # caught both.
                                       # FR_FRD_CURV=off is the flat-mirror repro arm (flags
                                       # bit 4, force_curv the gate hook). Pure
                                       # rotation needs none of this (both
@@ -1891,12 +1965,16 @@ cargo run --release -- --gpu --xess --frd  # FRD (src/frd.rs + gpu/frd_gpu.rs, 2
                                       # lesson), the vm family (parked exact-0 snap, t_r=0
                                       # exact, moved-camera must-fire, sky-vs-finite must-
                                       # differ, the ngxfg cross-pin, slack-1.0 identity, the
-                                      # v1.5.1/.2 curvature family — virtual_dist κ<=0
+                                      # v1.5.1/.2/.3 curvature family — virtual_dist κ<=0
                                       # bitwise identity/R-over-2 limit/monotone,
                                       # vm_curvature_at dead-zone exact-0 + closed-form
-                                      # anchor, the vm_kappa clean-field/spike-suppression-
-                                      # teeth/axis-symmetry/honest-cylinder-κ_lo-0/
-                                      # dead-zone-skew-bracket pins, and the composed
+                                      # anchor, the v1.5.3 vm_kappa forms (UNBIASED
+                                      # clean-field anchor + de-bias teeth, spike suppression
+                                      # to k4+skew, the real 4px-rescue pin, exact-(0,0,0)
+                                      # flat, short-only-spike-0, axis symmetry,
+                                      # honest-cylinder-κ_lo-0, bracket = 2·skew, the
+                                      # baseline-scale rule table + the BITWISE
+                                      # res-invariance identity), and the composed
                                       # heavy-κ snap-to-surface pin),
                                       # bilateral
                                       # weight shapes, radius endpoints, Vogel-disk spread, and

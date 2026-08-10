@@ -73,7 +73,11 @@ cbuffer FrdCb : register(b0) {
     // unfold the reflection's virtual image and reproject it through the
     // PREVIOUS camera. Padding aligns the matrix to a register (root
     // constants map by declaration order — frd_gpu's cb() mirrors it).
-    float3 _vm_pad;    // dwords 17-19
+    // vm_scale = the v1.5.3 κ-baseline scale (oracle::vm_baseline_scale
+    // of the render height; FR_FRD_VMSCALE overrides host-side) — an
+    // integer-valued float, 1.0 at every ≤~800p gate/lab res.
+    float vm_scale;    // dword 17
+    float2 _vm_pad;    // dwords 18-19
     float4x4 vm_m;     // world → PREV clip (glam columns; column-major mul)
     float3 cam_org;    // camera origin, world
     float3 cam_rgt;    // right · tan(fov/2) · aspect (CamBasis pre-scaling)
@@ -255,14 +259,19 @@ void cs_frd_temporal(uint3 id : SV_DispatchThreadID) {
         float t_bhi = t_r; // the bracket's LONGER unfold (κ_lo)
         float t_blo = t_r; // the bracket's shorter unfold (κ_hi)
         if ((flags & 16u) != 0u) {
-            int2 xm = int2(max(int(p.x) - 1, 0), int(p.y));
-            int2 xp = int2(min(int(p.x) + 1, int(rw) - 1), int(p.y));
-            int2 ym = int2(int(p.x), max(int(p.y) - 1, 0));
-            int2 yp = int2(int(p.x), min(int(p.y) + 1, int(rh) - 1));
-            int2 xm2 = int2(max(int(p.x) - 2, 0), int(p.y));
-            int2 xp2 = int2(min(int(p.x) + 2, int(rw) - 1), int(p.y));
-            int2 ym2 = int2(int(p.x), max(int(p.y) - 2, 0));
-            int2 yp2 = int2(int(p.x), min(int(p.y) + 2, int(rh) - 1));
+            // v1.5.3: offsets scale with the render height (±vs/±2vs
+            // texels = the same WORLD footprint at every res) so the
+            // dead-zoned |Δn| the DZ was sized against is res-invariant;
+            // vs = 1 at every gate/lab res is the bitwise pre-v1.5.3 path.
+            int vs = max(int(vm_scale), 1);
+            int2 xm = int2(max(int(p.x) - vs, 0), int(p.y));
+            int2 xp = int2(min(int(p.x) + vs, int(rw) - 1), int(p.y));
+            int2 ym = int2(int(p.x), max(int(p.y) - vs, 0));
+            int2 yp = int2(int(p.x), min(int(p.y) + vs, int(rh) - 1));
+            int2 xm2 = int2(max(int(p.x) - 2 * vs, 0), int(p.y));
+            int2 xp2 = int2(min(int(p.x) + 2 * vs, int(rw) - 1), int(p.y));
+            int2 ym2 = int2(int(p.x), max(int(p.y) - 2 * vs, 0));
+            int2 yp2 = int2(int(p.x), min(int(p.y) + 2 * vs, int(rh) - 1));
             float3 nxm, nxp, nym, nyp, nxm2, nxp2, nym2, nyp2;
             float rr_;
             frd_decode_nr(in_nr[xm], nxm, rr_);
@@ -279,7 +288,8 @@ void cs_frd_temporal(uint3 id : SV_DispatchThreadID) {
                 length(nyp - nym),
                 length(nyp2 - nym2),
                 z,
-                proj);
+                proj,
+                float(vs));
             t_v = frd_virtual_dist(t_r, k3.x);
             t_bhi = frd_virtual_dist(t_r, k3.y);
             t_blo = frd_virtual_dist(t_r, k3.z);

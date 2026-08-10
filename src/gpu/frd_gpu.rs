@@ -82,10 +82,11 @@ const UAVS: usize = 9;
 const SET_STRIDE: usize = SRVS + UAVS;
 // Heap sets: [pass1 P0, pass1 P1, pass2 P0, pass2 P1, pass3 P0, pass3 P1].
 const SETS: usize = 6;
-// [0..17) the scalar block | 17-19 pad (matrix alignment) | 20-35 vm_m |
-// 36-38 cam_org, 39 pad | 40-42 cam_rgt, 43 pad | 44-46 cam_up — lockstep
-// with frd_temporal.hlsl's cbuffer declaration (root constants map by
-// declaration order; float3s never straddle a register).
+// [0..17) the scalar block | 17 vm_scale (v1.5.3 κ-baseline scale), 18-19
+// pad (matrix alignment) | 20-35 vm_m | 36-38 cam_org, 39 pad | 40-42
+// cam_rgt, 43 pad | 44-46 cam_up — lockstep with frd_temporal.hlsl's
+// cbuffer declaration (root constants map by declaration order; float3s
+// never straddle a register).
 const CB_DWORDS: u32 = 47;
 
 // Compiled group shapes (temporal / blur+post) — the shipping defaults,
@@ -450,6 +451,14 @@ impl FrdGpu {
             );
         }
 
+        // The v1.5.3 announce (loud on departure from ×1): the κ-baseline
+        // scale is a session constant of the render height, and a silent
+        // ×2 would make a 1080p-vs-540p A/B unreadable.
+        let vscale = crate::frd::vm_scale_for(rh);
+        if vscale != 1.0 {
+            eprintln!("frd: κ baselines ×{vscale} at rh {rh} (v1.5.3 resolution-invariant vm)");
+        }
+
         Ok(Self {
             planes,
             slow,
@@ -620,7 +629,9 @@ impl FrdGpu {
                 f.light_par.to_bits(),
             ];
             c[..head.len()].copy_from_slice(&head);
-            // dwords 17-19 stay 0 (the cbuffer's matrix-alignment pad).
+            // dword 17 = the v1.5.3 κ-baseline scale (rode the cbuffer's
+            // matrix-alignment pad — no layout shift); 18-19 stay 0.
+            c[17] = crate::frd::vm_scale_for(self.rh).to_bits();
             for (i, v) in f.vm_m.iter().enumerate() {
                 c[20 + i] = v.to_bits();
             }

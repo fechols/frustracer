@@ -148,8 +148,68 @@ pub const VM_DEADZONE2: f32 = 2.5e-3;
 /// (still water, F7's mirror) is ONE encoded word ⇒ Δn ≡ 0 bitwise ⇒ κ = 0
 /// with no dead-zone needed at all. Known-accept: an extreme close-up dome
 /// (~1000 px of span for ~140° of swing) fades toward the dead-zone —
-/// mitigated by cam_step/z being large at small z.
+/// PARTIALLY mitigated by cam_step/z being large at small z (per-FRAME, so
+/// the mitigation weakens as fps rises — the v1.5.3 finding below is the
+/// real fix for the resolution half of that fade).
 pub const VM_DN_DZ: f32 = 5e-3;
+/// v1.5.3: the κ baselines' RESOLUTION anchor. The estimator's central
+/// differences run over ±s/±2s TEXELS while its dead-zone is absolute
+/// per-sample oct-quantization noise — so at a finer pixel pitch the same
+/// dome yields HALF the per-baseline |Δn| against the same DZ, and κ
+/// under-reads in proportion to render height: the fetch slides toward the
+/// flat/sky arm and the v1.5.1 trailing streak reopens at exactly the
+/// resolutions users play. MEASURED (2026-08-10, the AI QA Lab's live
+/// helmet strafe, deflection 0.06): 1080p glint FWHM 47 → 141 px
+/// (velocity-proportional — the user's own report) while the 540p lab read
+/// the SAME world pass clean, and live at --lock-res 0.5 collapsed it to
+/// 73 px; FR_FRD_VMOTION=off (pure surface fetch) beat the shipping vm arm
+/// at 1080p — exactly what a huge-κ close-up dome predicts when κ
+/// under-reads. s = max(1, round(rh/540)): 540p (the regime v1.5.1/.2 were
+/// validated in) and every gate res (533x400, 800x600) keep s = 1 BITWISE;
+/// 1080p samples ±2/±4 texels — the same WORLD footprint 540p's ±1/±2
+/// spans — 4K ±4/±8. Integer, session-fixed (FRD runs at the locked render
+/// res), so the fetch never pops mid-session.
+pub const VM_BASE_RH: f32 = 540.0;
+
+/// The v1.5.3 baseline-scale rule (see VM_BASE_RH): integer-valued f32,
+/// ≥ 1, = 1 for every rh below ~810.
+pub fn vm_baseline_scale(rh: u32) -> f32 {
+    (rh as f32 / VM_BASE_RH + 0.5).floor().max(1.0)
+}
+
+/// FR_FRD_VMSCALE — the κ-baseline-scale lever (read once): `off` pins the
+/// pre-v1.5.3 fixed 2px/4px texel baselines at every resolution (the 1080p
+/// strafe-smear repro arm), an integer 1..=8 forces the scale, unset = the
+/// vm_baseline_scale rule. Loud on departure; an unrecognized value is
+/// LOUD and takes the rule (the FR_NGXFG discipline — a silent no-op A/B
+/// walk is the failure mode the levers exist to prevent).
+pub fn vm_scale_for(rh: u32) -> f32 {
+    static S: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+    let lever = *S.get_or_init(|| {
+        let Ok(v) = std::env::var("FR_FRD_VMSCALE") else {
+            return None;
+        };
+        if v.eq_ignore_ascii_case("off") {
+            eprintln!("frd: FR_FRD_VMSCALE=off — κ baselines pinned at 2px/4px (repro arm)");
+            return Some(1.0);
+        }
+        match v
+            .parse::<f32>()
+            .ok()
+            .filter(|s| s.is_finite() && (1.0..=8.0).contains(s) && s.fract() == 0.0)
+        {
+            Some(s) => {
+                eprintln!("frd: FR_FRD_VMSCALE={v} — κ baseline scale forced");
+                Some(s)
+            }
+            None => {
+                eprintln!("frd: FR_FRD_VMSCALE='{v}' is not off|1..8 — using the rule");
+                None
+            }
+        }
+    });
+    lever.unwrap_or_else(|| vm_baseline_scale(rh))
+}
 
 // ---------------------------------------------------------------------------
 // Tuning — the --frd-* levers (the nrd::ReblurTuning / fsr-tune shape):
@@ -553,6 +613,33 @@ pub mod oracle {
     /// the specular history cap with it — where the model is unsure, the
     /// honest answer is a short history (neither streak can accumulate),
     /// not a confident wrong fetch. The v2 confidence term, cheap form.
+    /// `scale` is the v1.5.3 baseline scale (vm_baseline_scale — the dn
+    /// args are measured over ±scale/±2·scale texels; 1.0 keeps the gate
+    /// resolutions on the validated regime).
+    ///
+    /// THE v1.5.3(b) DE-BIASED COMBINE (2026-08-10 — the residual live
+    /// strafe smear after the baseline-scale fix): the subtractive
+    /// dead-zone biases every estimate DOWN, and on a clean field the two
+    /// scales sit at exactly k4 = k2 + skew (skew = DZ·proj/(2·b1·z) —
+    /// the self-test's closed form), so the old per-axis MIN always
+    /// returned the SHORT baseline: the read the DZ has eaten the most of
+    /// (measured ~37% of true κ on the live helmet dome ⇒ t_v overshoots
+    /// ~2.7× ⇒ the fetch lags the content ⇒ the velocity-proportional
+    /// trailing residue). The clean-field identity inverts the bias: true
+    /// κ = k2 + 2·skew = k4 + skew, so min(k2 + 2·skew, k4 + skew) is
+    /// EXACTLY unbiased on clean fields and spike-bounded from both sides
+    /// (a short-baseline bump spike leaves k4 + skew — the clean value; a
+    /// long-baseline spike leaves k2 + 2·skew — also the clean value; both
+    /// spiked stays the v2 known-accept). Extrapolation is GATED on both
+    /// reads clearing the DZ — a constant field (still water, F7's
+    /// mirror) has both reads exactly 0 and returns exactly 0 with no
+    /// skew added (the bitwise flat contract), and a 2px-dead-zoned
+    /// close-up dome takes the bare k4 (the v1.5.2 doc's "4px rescue",
+    /// which the old min could never actually deliver: min(0, k4) = 0),
+    /// never an extrapolation built on a read that saw nothing. κ_hi
+    /// additionally covers the applied κ so the uncertainty bracket can
+    /// only widen (the cap gets more conservative, never less).
+    #[allow(clippy::too_many_arguments)]
     pub fn vm_kappa(
         dn2x: f32,
         dn4x: f32,
@@ -560,14 +647,25 @@ pub mod oracle {
         dn4y: f32,
         view_z: f32,
         proj: f32,
+        scale: f32,
     ) -> (f32, f32, f32) {
-        let k2x = vm_curvature_at(dn2x, 2.0, view_z, proj);
-        let k4x = vm_curvature_at(dn4x, 4.0, view_z, proj);
-        let k2y = vm_curvature_at(dn2y, 2.0, view_z, proj);
-        let k4y = vm_curvature_at(dn4y, 4.0, view_z, proj);
-        let kappa = k2x.min(k4x).max(k2y.min(k4y));
+        let k2x = vm_curvature_at(dn2x, 2.0 * scale, view_z, proj);
+        let k4x = vm_curvature_at(dn4x, 4.0 * scale, view_z, proj);
+        let k2y = vm_curvature_at(dn2y, 2.0 * scale, view_z, proj);
+        let k4y = vm_curvature_at(dn4y, 4.0 * scale, view_z, proj);
+        let skew = VM_DN_DZ * proj / (4.0 * scale * view_z.max(1e-4));
+        let axis = |k2: f32, k4: f32| -> f32 {
+            if k2 <= 0.0 {
+                if k4 <= 0.0 { 0.0 } else { k4 }
+            } else if k4 <= 0.0 {
+                0.0
+            } else {
+                (k2 + 2.0 * skew).min(k4 + skew)
+            }
+        };
+        let kappa = axis(k2x, k4x).max(axis(k2y, k4y));
         let lo = k2x.min(k4x).min(k2y.min(k4y));
-        let hi = k2x.max(k4x).max(k2y.max(k4y));
+        let hi = k2x.max(k4x).max(k2y.max(k4y)).max(kappa);
         (kappa, lo, hi)
     }
 
@@ -1073,34 +1171,115 @@ pub mod oracle {
             // and the consistent field's bracket width is the exact
             // dead-zone skew DZ·proj/(4z).
             let a = 0.02f32;
-            let clean = vm_kappa(a, 2.0 * a, 0.0, 0.0, 5.0, 406.0);
-            if clean.0 != vm_curvature_at(a, 2.0, 5.0, 406.0) {
-                return Err("frd: vm_kappa clean-field κ must equal the 2px estimate".into());
+            // skew = DZ·proj/(2·b1·z) at scale 1 (b1 = 2) — the exact
+            // clean-field gap k4 − k2, and therefore the de-bias term.
+            let skew = VM_DN_DZ * 406.0 / (4.0 * 5.0);
+            // v1.5.3(b): on a clean field (dn4 = 2·dn2) BOTH extrapolated
+            // arms land on the UNBIASED κ = dn2·proj/(b1·z) — no DZ term
+            // at all — and the old biased 2px read must sit strictly
+            // under it (the de-bias teeth).
+            let clean = vm_kappa(a, 2.0 * a, 0.0, 0.0, 5.0, 406.0, 1.0);
+            let unbiased = a * 406.0 / (2.0 * 5.0);
+            if (clean.0 - unbiased).abs() > 1e-4 {
+                return Err(format!(
+                    "frd: vm_kappa clean-field κ must be the UNBIASED closed form \
+                     ({} vs {unbiased})",
+                    clean.0
+                ));
             }
-            if clean.1 != 0.0 || clean.2 <= 0.0 {
-                return Err("frd: vm_kappa single-axis bracket (κ_lo exactly 0)".into());
-            }
-            let spiked = vm_kappa(5.0 * a, 2.0 * a, 0.0, 0.0, 5.0, 406.0);
-            if spiked.0 != vm_curvature_at(2.0 * a, 4.0, 5.0, 406.0) {
-                return Err("frd: vm_kappa must suppress a single-scale spike to the clean \
-                            long-baseline value"
+            if clean.0 <= vm_curvature_at(a, 2.0, 5.0, 406.0) {
+                return Err("frd: vm_kappa de-bias has no teeth (must exceed the raw 2px read)"
                     .into());
+            }
+            if clean.1 != 0.0 || clean.2 < clean.0 {
+                return Err("frd: vm_kappa single-axis bracket (κ_lo exactly 0, κ_hi covers κ)"
+                    .into());
+            }
+            // A single-scale bump spike (dn2 5× while dn4 stays clean)
+            // must be SUPPRESSED to the clean-field extrapolation of the
+            // long baseline (k4 + skew) — the leading-streak teeth.
+            let spiked = vm_kappa(5.0 * a, 2.0 * a, 0.0, 0.0, 5.0, 406.0, 1.0);
+            let spiked_want = vm_curvature_at(2.0 * a, 4.0, 5.0, 406.0) + skew;
+            if (spiked.0 - spiked_want).abs() > 1e-4 {
+                return Err(format!(
+                    "frd: vm_kappa must suppress a single-scale spike to the de-biased \
+                     long-baseline value ({} vs {spiked_want})",
+                    spiked.0
+                ));
             }
             if spiked.0 >= vm_curvature_at(5.0 * a, 2.0, 5.0, 406.0) {
                 return Err("frd: vm_kappa spike suppression has no teeth".into());
             }
-            let sym_a = vm_kappa(a, 2.0 * a, 0.003, 0.009, 5.0, 406.0);
-            let sym_b = vm_kappa(0.003, 0.009, a, 2.0 * a, 5.0, 406.0);
+            // The REAL 4px rescue (v1.5.2 documented it; its min could
+            // never deliver it): a 2px read inside the dead-zone with a
+            // live 4px read takes the BARE k4 — no extrapolation built on
+            // a read that saw nothing (the humble arm).
+            let rescued = vm_kappa(VM_DN_DZ * 0.5, 2.0 * a, 0.0, 0.0, 5.0, 406.0, 1.0);
+            if rescued.0 != vm_curvature_at(2.0 * a, 4.0, 5.0, 406.0) {
+                return Err("frd: vm_kappa 2px-dead-zoned axis must take the bare 4px read".into());
+            }
+            // The bitwise flat contract: a constant field's four zero
+            // reads must yield exactly (0, 0, 0) — no skew leaks in
+            // (still water / F7's mirror ride the κ=0 branch).
+            if vm_kappa(0.0, 0.0, 0.0, 0.0, 5.0, 406.0, 1.0) != (0.0, 0.0, 0.0) {
+                return Err("frd: vm_kappa constant field must be exactly (0,0,0)".into());
+            }
+            // Short-only signal (bump noise the long baseline never saw)
+            // stays suppressed to 0 — the old min's spike behavior.
+            if vm_kappa(5.0 * a, 0.0, 0.0, 0.0, 5.0, 406.0, 1.0).0 != 0.0 {
+                return Err("frd: vm_kappa short-only spike must read 0".into());
+            }
+            let sym_a = vm_kappa(a, 2.0 * a, 0.003, 0.009, 5.0, 406.0, 1.0);
+            let sym_b = vm_kappa(0.003, 0.009, a, 2.0 * a, 5.0, 406.0, 1.0);
             if sym_a != sym_b {
                 return Err("frd: vm_kappa must be symmetric in its axes".into());
             }
-            let cons = vm_kappa(a, 2.0 * a, a, 2.0 * a, 5.0, 406.0);
-            let skew = VM_DN_DZ * 406.0 / (4.0 * 5.0);
-            if (cons.2 - cons.1 - skew).abs() > 1e-4 {
+            // The consistent field's RAW bracket floor is k2 (both axes
+            // equal) and its κ_hi covers the de-biased κ, so the width is
+            // exactly 2·skew — the de-bias magnitude made visible to the
+            // uncertainty charge.
+            let cons = vm_kappa(a, 2.0 * a, a, 2.0 * a, 5.0, 406.0, 1.0);
+            if (cons.2 - cons.1 - 2.0 * skew).abs() > 1e-4 {
                 return Err(format!(
-                    "frd: consistent-field bracket must be the dead-zone skew ({} vs {skew})",
-                    cons.2 - cons.1
+                    "frd: consistent-field bracket must be 2× the dead-zone skew ({} vs {})",
+                    cons.2 - cons.1,
+                    2.0 * skew
                 ));
+            }
+            // v1.5.3 baseline-scale rule: every gate/lab res stays at
+            // scale 1 (the bitwise no-regression contract — the F1..F7C
+            // harnesses run at 533x400/800x600 and the batch lab at
+            // 960x540), 1080p doubles, 4K quadruples.
+            for (rh_px, s) in [
+                (400u32, 1.0f32),
+                (540, 1.0),
+                (600, 1.0),
+                (810, 2.0),
+                (1080, 2.0),
+                (1440, 3.0),
+                (2160, 4.0),
+            ] {
+                if vm_baseline_scale(rh_px) != s {
+                    return Err(format!(
+                        "frd: vm_baseline_scale({rh_px}) must be {s} (got {})",
+                        vm_baseline_scale(rh_px)
+                    ));
+                }
+            }
+            // The res-invariance identity, BITWISE: at 2× the render
+            // height (proj doubles) with 2× the texel offsets, a smooth
+            // dome's per-baseline |Δn| is measured over the SAME world
+            // span, so the same dn inputs must yield the same κ — the
+            // scale factors are powers of two, so fp-exact. This is the
+            // whole point of v1.5.3: the estimator (dead-zone included)
+            // becomes a pure function of the world footprint, not the
+            // pixel pitch.
+            let k_540 = vm_kappa(a, 2.0 * a, 0.5 * a, a, 5.0, 406.0, 1.0);
+            let k_1080 = vm_kappa(a, 2.0 * a, 0.5 * a, a, 5.0, 812.0, 2.0);
+            if k_540 != k_1080 {
+                return Err("frd: vm_kappa must be resolution-invariant under the \
+                            baseline scale (2x proj + 2x scale must be bitwise)"
+                    .into());
             }
             let dc = spec_virtual_delta_px(
                 216.5,

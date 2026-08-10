@@ -9209,8 +9209,11 @@ fn run_check_gpu(
                             let dn4x = dmag(n_px(c7x + 2, c7y), n_px(c7x - 2, c7y));
                             let dn_y = dmag(n_px(c7x, c7y + 1), n_px(c7x, c7y - 1));
                             let dn4y = dmag(n_px(c7x, c7y + 2), n_px(c7x, c7y - 2));
+                            // scale 1.0: the gate harness is 533x400, so
+                            // the shader's vm_scale lane carries 1 and the
+                            // oracle's ±1/±2 offsets above match it.
                             let (kap_o, _, _) =
-                                frd::oracle::vm_kappa(dn_x, dn4x, dn_y, dn4y, 5.0, proj7);
+                                frd::oracle::vm_kappa(dn_x, dn4x, dn_y, dn4y, 5.0, proj7, 1.0);
                             let rq7c = {
                                 let e = nrd::oracle::encode_normal_roughness_101010(n_face, 0.05);
                                 let q = ((e[2].clamp(0.0, 1.0) * 1023.0 + 0.5) as u32) as f32
