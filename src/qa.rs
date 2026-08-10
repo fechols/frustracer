@@ -40,6 +40,25 @@ use std::sync::{Arc, Mutex};
 
 pub const DEFAULT_PORT: u16 = 4599;
 
+/// Longest `sync <N>` the channel accepts, in loop iterations (~10+ minutes
+/// at interactive rates). The bound exists for the same reason diamondmine's
+/// BENCH_MAX_SECONDS does (its hardening commit b4b5caa): an unbounded
+/// client value must never reach arithmetic that cannot represent it —
+/// here `100 ms * N` (u64 mul overflow) and then `Instant + Duration`,
+/// which PANICS on overflow, i.e. `sync 999999999999999999` was a crash
+/// reachable from the socket.
+pub const SYNC_MAX: u64 = 100_000;
+
+/// Deadline budget for a pending verb (the diamondmine timeout-scaling
+/// rule): a fixed 30 s backstop, plus — for `sync` — a very pessimistic
+/// 100 ms per requested iteration, so a legitimately long wait can never be
+/// misreported as a hung session. Total by construction (`min(SYNC_MAX)`
+/// inside), so no caller ordering can reintroduce the overflow.
+pub fn sync_timeout(n: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(30)
+        + std::time::Duration::from_millis(100 * n.min(SYNC_MAX))
+}
+
 /// One request from a connection thread: the raw verb line plus its own
 /// reply channel (bounded(1) — exactly one reply per request, in order).
 pub struct QaReq {
@@ -152,6 +171,21 @@ pub fn self_test() -> Result<(), String> {
     }
     if !err_reply("x").contains("\"ok\":false") || !info_reply("y").contains("\"ok\":true") {
         return Err("err/info reply helpers inverted".into());
+    }
+    // The timeout-scaling pins (the diamondmine b4b5caa regression tests,
+    // transplanted): a long sync must not be mistaken for a hung session, a
+    // longer wait gets a longer leash, and the arithmetic is TOTAL — the
+    // hostile u64::MAX that used to overflow `Instant + Duration` must
+    // produce a finite deadline even if a future dispatch forgets its own
+    // range check.
+    if sync_timeout(1800) <= std::time::Duration::from_secs(30) {
+        return Err("sync_timeout(1800) must scale past the flat backstop".into());
+    }
+    if sync_timeout(120) >= sync_timeout(1800) {
+        return Err("sync_timeout must be ordered (longer wait, longer leash)".into());
+    }
+    if sync_timeout(u64::MAX) != sync_timeout(SYNC_MAX) {
+        return Err("sync_timeout must saturate at SYNC_MAX (the overflow guard)".into());
     }
     Ok(())
 }

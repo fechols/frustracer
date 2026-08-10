@@ -22358,7 +22358,18 @@ fn session(
                         .send(qa::reply_json(&[(1, format!("sync: iteration {qa_iter} reached"))], ms));
                     false
                 } else if now_q > p.deadline {
-                    let _ = p.reply.send(qa::err_reply("pending verb timed out (30 s backstop)"));
+                    // Name what was being waited on (the diamondmine b4b5caa
+                    // rule — a generic "30 s backstop" is the wrong diagnosis
+                    // twice over: the deadline scales, and a screenshot stall
+                    // is a different failure than a sync stall).
+                    let what = match p.kind {
+                        QaPendKind::Shot => "the screenshot capture (no present arm ran?)",
+                        QaPendKind::Sync { .. } => "loop iterations (sync)",
+                    };
+                    let _ = p.reply.send(qa::err_reply(&format!(
+                        "timed out after {:.1}s waiting for {what}",
+                        p.started.elapsed().as_secs_f32()
+                    )));
                     false
                 } else {
                     true
@@ -22404,6 +22415,10 @@ fn session(
                     ["tp", rest @ ..] if rest.len() == 3 || rest.len() == 5 => {
                         let vs: Vec<f32> = rest.iter().filter_map(fin).collect();
                         if vs.len() != rest.len() {
+                            // NaN/inf refused here, not clamped — "nan"
+                            // parses and clamp passes NaN through (the
+                            // diamondmine lesson), and a NaN position wedges
+                            // the whole camera/matrix chain.
                             qa::err_reply("tp needs finite x y z [yaw_deg pitch_deg]")
                         } else {
                             let mut c = fly.snapshot().cam;
@@ -22419,6 +22434,10 @@ fn session(
                             ))
                         }
                     }
+                    // Wrong-arity arms answer with THEIR verb's usage —
+                    // "unknown verb" for a mistyped `tp 1 2` is the
+                    // wrong-diagnosis class the hardening pass exists for.
+                    ["tp", ..] => qa::err_reply("tp needs x y z [yaw_deg pitch_deg]"),
                     ["look", y, p] => match (fin(y), fin(p)) {
                         (Some(yd), Some(pd)) => {
                             let mut c = fly.snapshot().cam;
@@ -22459,6 +22478,10 @@ fn session(
                             ),
                         }
                     }
+                    ["drive", ..] => {
+                        qa::err_reply("drive needs x y z ticks (or `drive stop`)")
+                    }
+                    ["look", ..] => qa::err_reply("look needs yaw_deg pitch_deg"),
                     ["key", name] if menu_is_open => {
                         let _ = name;
                         qa::err_reply("close the menu first (toggle keys are routed to Slint)")
@@ -22499,12 +22522,14 @@ fn session(
                             )
                         }
                     }
-                    ["screenshot", path] => {
+                    // Paths can carry spaces — rejoin everything after the
+                    // verb rather than demanding a single token.
+                    ["screenshot", path_words @ ..] if !path_words.is_empty() => {
                         if qa_pend.iter().any(|p| matches!(p.kind, QaPendKind::Shot)) {
                             qa::err_reply("a screenshot is already pending")
                         } else {
                             edges.screenshot = true;
-                            qa_shot = Some((*path).to_string());
+                            qa_shot = Some(path_words.join(" "));
                             qa_pend.push(QaPending {
                                 kind: QaPendKind::Shot,
                                 reply: req.reply.clone(),
@@ -22514,19 +22539,24 @@ fn session(
                             continue; // answered later by the P arm
                         }
                     }
+                    // N bounded to qa::SYNC_MAX at the ONE place the pending
+                    // is built (the diamondmine BENCH_MAX rule): unbounded,
+                    // `100 ms * N` then `Instant + Duration` PANICS on
+                    // overflow — a crash reachable from the socket.
                     ["sync", n] => match n.parse::<u64>().ok().filter(|n| *n > 0) {
-                        Some(nf) => {
+                        Some(nf) if nf <= qa::SYNC_MAX => {
                             qa_pend.push(QaPending {
                                 kind: QaPendKind::Sync { target: qa_iter + nf },
                                 reply: req.reply.clone(),
                                 started: t0,
-                                deadline: t0
-                                    + Duration::from_secs(30)
-                                    + Duration::from_millis(100 * nf),
+                                deadline: t0 + qa::sync_timeout(nf),
                             });
                             continue; // answered when the iteration arrives
                         }
-                        None => qa::err_reply("sync needs a positive iteration count"),
+                        _ => qa::err_reply(&format!(
+                            "sync needs an iteration count in 1..={}",
+                            qa::SYNC_MAX
+                        )),
                     },
                     ["quit"] => {
                         edges.quit = true;
