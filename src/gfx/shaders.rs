@@ -718,6 +718,44 @@ pub const RT_DXR_HLSLI: &str = include_str!("../shaders/rt_dxr.hlsli");
 pub const DXR_HLSL: &str = include_str!("../shaders/dxr.hlsl");
 pub const DXR_SHADE_HLSL: &str = include_str!("../shaders/dxr_shade.hlsl");
 
+// FRD — the from-scratch pre-upscale denoiser's three-dispatch recurrent
+// shape. `frd_blur.hlsl` supplies TWO entry points (cs_frd_blur and the
+// post/feedback pass), so this is three PSOs from two kernel sources.
+pub const FRD_COMMON_HLSLI: &str = include_str!("../shaders/frd_common.hlsli");
+pub const FRD_TEMPORAL_HLSL: &str = include_str!("../shaders/frd_temporal.hlsl");
+pub const FRD_BLUR_HLSL: &str = include_str!("../shaders/frd_blur.hlsl");
+
+// FSR Ray Regeneration's composite pass — the one place the four denoised
+// signals are remodulated back into a color, and therefore the third
+// implementation of the composite identity `fsr::composite` and
+// `cs_feed_fsr_rr` also carry. It pastes sh.hlsli because the AO term's
+// remodulation factor is DIRECTIONAL (sky irradiance per normal), which is
+// what makes it an assembly rather than a lone kernel.
+pub const FSR_COMPOSITE_HLSL: &str = include_str!("../shaders/fsr_composite.hlsl");
+
+// The registered-consensus fuse (`--quinlight`).
+pub const QUIN_HLSL: &str = include_str!("../shaders/quin.hlsl");
+
+// --- The display stage --------------------------------------------------
+//
+// These five compile through D3DCompile at the SM 5.0 tier rather than DXC
+// (`tonemap::compile`), which is why they exist before any tracer kernel and
+// why a session with no DXC still presents. They take no `#define` prelude at
+// all — each is handed whole to the compiler — so what lives here is the
+// corpus ownership, not an assembly: `src/shaders/` is the one place a
+// `.hlsl` is named, and a backend that declared its own `include_str!` would
+// be a second place to look.
+pub const BLIT_HLSL: &str = include_str!("../shaders/blit.hlsl");
+pub const TONEMAP_HLSL: &str = include_str!("../shaders/tonemap.hlsl");
+pub const WAVEVIZ_HLSL: &str = include_str!("../shaders/waveviz.hlsl");
+pub const HUD_HLSL: &str = include_str!("../shaders/hud.hlsl");
+pub const BLOOM_HLSL: &str = include_str!("../shaders/bloom.hlsl");
+pub const AUTOEXP_HLSL: &str = include_str!("../shaders/autoexp.hlsl");
+
+// The GPU BC7 encoder — a scene-upload pass, not a display one, but the same
+// fxc tier for the same reason (it must run before the tracer's kernels).
+pub const BC7ENC_HLSL: &str = include_str!("../shaders/bc7enc.hlsl");
+
 /// Per-scene HLSL prelude: alpha-masked scenes compile the cutout candidate
 /// loops / any-hit shaders in; opaque scenes compile byte-identical sources
 /// to the pre-cutout tracer. Shared with dxr.rs (the DXR library concat).
@@ -1993,6 +2031,97 @@ pub fn dxr_sources(k: &DxrKeys) -> DxrSources {
         sky_lod: sky_lod_k,
         sway_mv_on: !sway_def.is_empty(),
     }
+}
+
+// --- FRD's assembly ------------------------------------------------------
+
+// Compiled group shapes (temporal / blur+post) — the shipping defaults,
+// adopted from the 2026-08-09 B70 sweep (world parked, per-axis cells then
+// the combined verify): temporal 16x16 → 8x8 read 0.233 → 0.224 ms and
+// blur+post 16x8 → 16x16 read 0.294 → 0.260, landing the frd region at
+// 0.488 from the pre-sweep 0.531 (32x16 blur tied 16x16 — the simpler
+// square ships; 8x8 blur was WORST, so the two passes genuinely want
+// different shapes). `FR_FRD_GROUP=TXxTY,BXxBY` is the sweep lever (the
+// FR_LEAF discipline: loud on departure, loud + defaults on an illegal
+// value; injected as the FRD_GTX/GTY/GBX/GBY defines, so every value is a
+// new kernel variant — maiden-run discard on Arc applies).
+pub const GROUP_T: (u32, u32) = (8, 8);
+pub const GROUP_B: (u32, u32) = (16, 16);
+
+pub fn frd_groups() -> ((u32, u32), (u32, u32)) {
+    let Ok(v) = std::env::var("FR_FRD_GROUP") else {
+        return (GROUP_T, GROUP_B);
+    };
+    let parse_pair = |s: &str| -> Option<(u32, u32)> {
+        let (x, y) = s.split_once('x')?;
+        let (x, y) = (x.trim().parse::<u32>().ok()?, y.trim().parse::<u32>().ok()?);
+        ((1..=1024).contains(&x) && (1..=1024).contains(&y) && x * y <= 1024).then_some((x, y))
+    };
+    let parsed = v
+        .split_once(',')
+        .and_then(|(t, b)| Some((parse_pair(t)?, parse_pair(b)?)));
+    match parsed {
+        Some((t, b)) => {
+            eprintln!("frd: FR_FRD_GROUP={v} — temporal {}x{}, blur {}x{}", t.0, t.1, b.0, b.1);
+            (t, b)
+        }
+        None => {
+            eprintln!(
+                "frd: FR_FRD_GROUP='{v}' is not TXxTY,BXxBY with x*y <= 1024 — using the \
+                 shipping {}x{},{}x{}",
+                GROUP_T.0, GROUP_T.1, GROUP_B.0, GROUP_B.1
+            );
+            (GROUP_T, GROUP_B)
+        }
+    }
+}
+
+/// Every FRD compile unit, plus the group shapes they COMPILED with.
+///
+/// The shapes are returned rather than re-read for the reason `TraceSources`
+/// gives: `record` must divide its dispatch dims by what the PSOs actually
+/// carry, and `FR_FRD_GROUP` is a per-process read that a second construction
+/// could see differently.
+///
+/// Tuning deliberately rides the constant buffer instead of the prelude — a
+/// `--frd-*` lever must never recompile a kernel.
+pub struct FrdSources {
+    pub temporal: String,
+    /// TWO entry points (`cs_frd_blur`, `cs_frd_post`) from this one source.
+    pub blur: String,
+    pub group_t: (u32, u32),
+    pub group_b: (u32, u32),
+}
+
+/// Assemble FRD's kernels: `[defines, frd_common.hlsli, pass source]`.
+///
+/// `FRD_FP16 0` is pinned because phases B/C ship the fp32 arm
+/// unconditionally; phase D flips it off the OPTIONS4 probe together with
+/// `-enable-16bit-types` (`dxc::compile_args` is the hook), which is why the
+/// define is written out rather than omitted.
+pub fn frd_sources() -> FrdSources {
+    let (gt, gb) = frd_groups();
+    let unit = |src_body: &str| {
+        format!(
+            "#define FRD_FP16 0\n#define FRD_GTX {}\n#define FRD_GTY {}\n\
+             #define FRD_GBX {}\n#define FRD_GBY {}\n{FRD_COMMON_HLSLI}\n{src_body}",
+            gt.0, gt.1, gb.0, gb.1
+        )
+    };
+    FrdSources {
+        temporal: unit(FRD_TEMPORAL_HLSL),
+        blur: unit(FRD_BLUR_HLSL),
+        group_t: gt,
+        group_b: gb,
+    }
+}
+
+/// The FSR-RR composite pass's unit. `sh.hlsli` FIRST: the AO signal's
+/// remodulation factor is `sky_sh.irradiance(n)`, a per-pixel directional
+/// value the kernel evaluates from the normals plane, so the shared SH
+/// evaluator has to be in scope before the kernel body.
+pub fn fsr_composite_src() -> String {
+    [SH_HLSLI, FSR_WIRE_HLSLI, FSR_COMPOSITE_HLSL].join("\n")
 }
 
 /// The work-graph ladder's source (`FR_WORKGRAPH=1`): the SAME wavefront unit

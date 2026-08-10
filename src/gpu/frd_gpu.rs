@@ -44,10 +44,6 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 
 type Result<T> = std::result::Result<T, String>;
 
-const FRD_COMMON_HLSLI: &str = include_str!("../shaders/frd_common.hlsli");
-const FRD_TEMPORAL_HLSL: &str = include_str!("../shaders/frd_temporal.hlsl");
-const FRD_BLUR_HLSL: &str = include_str!("../shaders/frd_blur.hlsl");
-
 /// One texture + its tracked state (rests in UNORDERED_ACCESS).
 struct Reg {
     res: ID3D12Resource,
@@ -92,47 +88,6 @@ const SETS: usize = 6;
 // constants map by declaration order; float3s never straddle a register;
 // frd_blur.hlsl declares the prefix through stab_max).
 const CB_DWORDS: u32 = 47;
-
-// Compiled group shapes (temporal / blur+post) — the shipping defaults,
-// adopted from the 2026-08-09 B70 sweep (world parked, per-axis cells then
-// the combined verify): temporal 16x16 → 8x8 read 0.233 → 0.224 ms and
-// blur+post 16x8 → 16x16 read 0.294 → 0.260, landing the frd region at
-// 0.488 from the pre-sweep 0.531 (32x16 blur tied 16x16 — the simpler
-// square ships; 8x8 blur was WORST, so the two passes genuinely want
-// different shapes). `FR_FRD_GROUP=TXxTY,BXxBY` is the sweep lever (the
-// FR_LEAF discipline: loud on departure, loud + defaults on an illegal
-// value; injected as the FRD_GTX/GTY/GBX/GBY defines, so every value is a
-// new kernel variant — maiden-run discard on Arc applies).
-const GROUP_T: (u32, u32) = (8, 8);
-const GROUP_B: (u32, u32) = (16, 16);
-
-fn group_lever() -> ((u32, u32), (u32, u32)) {
-    let Ok(v) = std::env::var("FR_FRD_GROUP") else {
-        return (GROUP_T, GROUP_B);
-    };
-    let parse_pair = |s: &str| -> Option<(u32, u32)> {
-        let (x, y) = s.split_once('x')?;
-        let (x, y) = (x.trim().parse::<u32>().ok()?, y.trim().parse::<u32>().ok()?);
-        ((1..=1024).contains(&x) && (1..=1024).contains(&y) && x * y <= 1024).then_some((x, y))
-    };
-    let parsed = v
-        .split_once(',')
-        .and_then(|(t, b)| Some((parse_pair(t)?, parse_pair(b)?)));
-    match parsed {
-        Some((t, b)) => {
-            eprintln!("frd: FR_FRD_GROUP={v} — temporal {}x{}, blur {}x{}", t.0, t.1, b.0, b.1);
-            (t, b)
-        }
-        None => {
-            eprintln!(
-                "frd: FR_FRD_GROUP='{v}' is not TXxTY,BXxBY with x*y <= 1024 — using the \
-                 shipping {}x{},{}x{}",
-                GROUP_T.0, GROUP_T.1, GROUP_B.0, GROUP_B.1
-            );
-            (GROUP_T, GROUP_B)
-        }
-    }
-}
 
 /// Per-frame camera/light facts for `record` — one struct so the Stage-B
 /// virtual-motion additions extend fields instead of churning the signature
@@ -360,19 +315,17 @@ impl FrdGpu {
         }
         .map_err(|e| format!("frd: create root sig: {e}"))?;
 
-        // --- Kernels: [defines, frd_common.hlsli, pass source] at cs_6_5.
-        // Phases B/C compile the fp32 arm unconditionally; phase D flips
-        // FRD_FP16 + -enable-16bit-types off the probe (compile_args is the
-        // hook). Tuning rides the CB, not defines — a lever must not
-        // recompile.
-        let (gt, gb) = group_lever();
-        let pso_of = |src_body: &str, entry: &str| -> Result<ID3D12PipelineState> {
-            let src = format!(
-                "#define FRD_FP16 0\n#define FRD_GTX {}\n#define FRD_GTY {}\n\
-                 #define FRD_GBX {}\n#define FRD_GBY {}\n{FRD_COMMON_HLSLI}\n{src_body}",
-                gt.0, gt.1, gb.0, gb.1
-            );
-            let cs = dxc.compile_args(&src, entry, "cs_6_5", &format!("frd-{entry}"), debug, &[])?;
+        // --- Kernels at cs_6_5, assembled by the shared layer. Two sources,
+        // three PSOs (frd_blur.hlsl carries the post/feedback entry too).
+        // `compile_args` is phase D's `-enable-16bit-types` hook and stays
+        // here: an fp16 arm is a COMPILER argument, not a source decision.
+        // The group shapes come back off `srcs` rather than from a fresh
+        // lever read — the dispatch dims must divide by what the PSOs
+        // actually compiled with.
+        let srcs = crate::gfx::shaders::frd_sources();
+        let (gt, gb) = (srcs.group_t, srcs.group_b);
+        let pso_of = |src: &str, entry: &str| -> Result<ID3D12PipelineState> {
+            let cs = dxc.compile_args(src, entry, "cs_6_5", &format!("frd-{entry}"), debug, &[])?;
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: unsafe { std::mem::transmute_copy(&root_sig) },
                 CS: D3D12_SHADER_BYTECODE {
@@ -384,9 +337,9 @@ impl FrdGpu {
             unsafe { device.CreateComputePipelineState(&desc) }
                 .map_err(|e| format!("frd: {entry} PSO: {e}"))
         };
-        let pso_temporal = pso_of(FRD_TEMPORAL_HLSL, "cs_frd_temporal")?;
-        let pso_blur = pso_of(FRD_BLUR_HLSL, "cs_frd_blur")?;
-        let pso_post = pso_of(FRD_BLUR_HLSL, "cs_frd_post")?;
+        let pso_temporal = pso_of(&srcs.temporal, "cs_frd_temporal")?;
+        let pso_blur = pso_of(&srcs.blur, "cs_frd_blur")?;
+        let pso_post = pso_of(&srcs.blur, "cs_frd_post")?;
 
         // --- Shader-visible heap: 6 baked sets (3 passes × 2 parities),
         // each a full [SRVS | UAVS] window; slots a pass doesn't declare are

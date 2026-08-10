@@ -30,8 +30,10 @@
 //! `src/gpu/` naming it was a statement about where the compiler lived rather
 //! than about the shaders. The Rust that ASSEMBLES it (there is no `#include`
 //! anywhere — each kernel is a concatenation plus generated `#define` blocks)
-//! is a separate question and stays in the backend until `gfx::shaders` takes
-//! it. What made the translation free is worth recording so nobody re-derives
+//! followed it into `gfx::shaders`, which is now the ONLY module that names an
+//! `.hlsl` file: `src/gpu/` holds zero `include_str!`s, so "where does this
+//! kernel's source come from" has exactly one answer.
+//! What made the translation free is worth recording so nobody re-derives
 //! it: `-fvk-{b,t,u,s}-shift` maps HLSL register spaces onto Vulkan descriptor
 //! sets without touching a declaration, and `-fvk-use-dx-layout` keeps the
 //! 4608-byte `FrameCb` byte-compatible so ONE Rust packer serves both backends

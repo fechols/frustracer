@@ -23,7 +23,7 @@ use super::dxc::Dxc;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
-const QUIN_HLSL: &str = include_str!("../shaders/quin.hlsl");
+use crate::gfx::shaders::QUIN_HLSL;
 
 /// Must equal `MAX_ENGINES` in quin.hlsl — the SRV range width and the reduce
 /// stack bound. 4 covers every engine the chain can wire (DLSS-RR, FSR4-RR,

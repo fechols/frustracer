@@ -24,7 +24,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use std::sync::atomic::Ordering::Relaxed;
 
-const COMPOSITE_HLSL: &str = include_str!("../shaders/fsr_composite.hlsl");
+
 
 /// One Ray Regeneration dispatch's resource set: the shared inputs plus an
 /// in/out pair per subscribed signal (`ffx_sys::SIGNALS`).
@@ -234,8 +234,7 @@ impl FsrResources {
         // paste the same two. This pass has no shade.hlsli prelude, but it must
         // not therefore own private copies of either: the composite identity is
         // precisely the claim that it and feed.hlsl agree.
-        let comp_src =
-            [super::trace::SH_HLSLI, super::trace::FSR_WIRE_HLSLI, COMPOSITE_HLSL].join("\n");
+        let comp_src = crate::gfx::shaders::fsr_composite_src();
         let cs = tonemap::compile(&comp_src, s!("cs"), s!("cs_5_0"), "fsr_composite")?;
         let pso_desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: unsafe { std::mem::transmute_copy(&comp_root) },

@@ -28,7 +28,7 @@ use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
-const AUTOEXP_HLSL: &str = include_str!("../shaders/autoexp.hlsl");
+use crate::gfx::shaders::AUTOEXP_HLSL;
 
 /// One `cs_reduce` group covers a TILE x TILE pixel block.
 const TILE: u32 = 64;
