@@ -47,12 +47,15 @@ pub const MAX_ACCUM_FRAMES: f32 = 30.0;
 /// Fast-history cap: the short EMA the clamp box and anti-lag read. Small by
 /// design — it must track lighting changes the slow history lags on.
 pub const FAST_FRAMES: f32 = 4.0;
-/// The temporal-stabilization age cap the post-QA default flip targets
-/// (--frd-max-stab-frames; this commit ships the lever DEFAULT OFF — the
-/// measured-first doctrine, the QA lab decides the flip). Between
-/// FAST_FRAMES and MAX_ACCUM: a ~1/21 steady-state blend of fresh output
-/// cuts the sparse-bright disk-rotation flicker ~an order while the
-/// clamp-to-fast-box keeps worst-case lag at one fast window.
+/// The temporal-stabilization age cap — the DEFAULT since the post-QA flip
+/// (2026-08-10, one commit after the mechanism: the bistro emissive QA
+/// campaign measured stab 0.60 → 0.47 at zero pool-energy cost, the helmet
+/// strafe lab improved on every metric, and the B70 frd region paid
+/// +0.18 ms). --frd-max-stab-frames 0 is the bitwise pre-stab arm; 60
+/// probed only 0.47 → 0.45 (the residual's floor), so 20 keeps the better
+/// lag bound. Between FAST_FRAMES and MAX_ACCUM: a ~1/21 steady-state
+/// blend of fresh output cuts the sparse-bright disk-rotation flicker
+/// ~5× while the spatial-neighborhood clamp bounds lag/ghosting.
 pub const MAX_STAB_FRAMES: f32 = 20.0;
 /// Fast-history clamp box half-width in sigmas.
 pub const CLAMP_SIGMA: f32 = 2.5;

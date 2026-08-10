@@ -2384,9 +2384,9 @@ pub fn usage() {
                 eprintln!("                | --frd-no-fp16 (force the fp32 shader arm)   FRD tuning (unset = the");
                 eprintln!("                compiled frd.rs constants). --frd-no-anti-firefly drops the input");
                 eprintln!("                firefly pre-clamp (default ON — the bright-specular-smear killer;");
-                eprintln!("                --frd-anti-firefly spells the default). --frd-max-stab-frames N arms");
-                eprintln!("                the OUT-plane temporal stabilization (default 0 = off; try 20 — the");
-                eprintln!("                sparse-bright flicker killer, clamped to the current fast +-k*sigma box)");
+                eprintln!("                --frd-anti-firefly spells the default). --frd-max-stab-frames N caps");
+                eprintln!("                the OUT-plane temporal stabilization (DEFAULT 20 — the sparse-bright");
+                eprintln!("                flicker killer, clamped to the 3x3 spatial box; 0 = the pre-stab arm)");
                 eprintln!("  --nppd-device NPPD execution provider: auto|cpu|dml|dml:<n> (default auto = DML then CPU)");
                 eprintln!("  --check-xess  headless: XeSS dynamic-res contract self-test (no GPU or DLL needed)");
                 eprintln!("  --xess-dump   --check-xess plus G-buffer PNG dumps");

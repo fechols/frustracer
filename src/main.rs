@@ -580,15 +580,16 @@ fn main() {
     if opts.frd_tune.any() {
         eprintln!("frd: tuning overrides {:?}", opts.frd_tune);
     }
-    // The stabilization sub-step is LIVE since 2026-08-10 (the emissive-
-    // integration campaign's stage 2) but DEFAULT OFF pending the QA
-    // measurement — the armed line keeps the lever from being a silent
-    // no-op either way (frd::MAX_STAB_FRAMES = 20 is the flip target).
+    // The stabilization sub-step is LIVE and DEFAULT ON since 2026-08-10
+    // (the emissive-integration campaign's stage 2 + post-QA flip;
+    // frd::MAX_STAB_FRAMES is the default cap) — only a departure prints,
+    // the lever-line convention.
     if let Some(v) = opts.frd_tune.max_stab_frames {
         if v == 0 {
             eprintln!("frd: stabilization OFF (--frd-max-stab-frames 0 — the bitwise pre-stab arm)");
         } else {
-            eprintln!("frd: stabilization armed — max {} frames", (v as f32).min(frd::META_N_MAX));
+            eprintln!("frd: stabilization at {} frames (default {})",
+                (v as f32).min(frd::META_N_MAX), frd::MAX_STAB_FRAMES);
         }
     }
     texture::set_mips(opts.mips);

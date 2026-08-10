@@ -635,10 +635,15 @@ impl FrdGpu {
             .get()
             .unwrap_or_else(|| f.gi_fold && crate::frd::girelax_enabled());
         // Stabilization frames (CB dword 18): the tuning lever, clamped to
-        // the meta wire cap like max_accum; absent = 0.0 = the sub-step off
-        // (bitwise pre-stab, default this commit).
+        // the meta wire cap like max_accum; absent = MAX_STAB_FRAMES — the
+        // post-QA default flip (2026-08-10: stab 0.60 → 0.47 in the
+        // emissive regime at zero pool-energy cost, helmet-strafe beyond
+        // 701 → 31, B70 frd region +0.18 ms — the F4–F7 force_stab pins
+        // are what made this a one-liner). --frd-max-stab-frames 0 is the
+        // bitwise pre-stab arm.
         let stab = self.force_stab.get().unwrap_or_else(|| {
-            t.max_stab_frames.map_or(0.0, |v| (v as f32).min(crate::frd::META_N_MAX))
+            t.max_stab_frames
+                .map_or(crate::frd::MAX_STAB_FRAMES, |v| (v as f32).min(crate::frd::META_N_MAX))
         });
         let flags = (f.reset as u32)
             | ((fire as u32) << 1)
