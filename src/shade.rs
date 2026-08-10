@@ -518,7 +518,7 @@ impl TexFilter {
 /// Cone spread for hemi-GI bounce hits: leaf cells are octant-scale, so the
 /// bounce albedo reads a matching broad footprint (over-blurred GI albedo is
 /// variance reduction, not error — coarser, never wrong). Mirrored in
-/// gpu/shaders/hemi_leaf.hlsl — change both together.
+/// shaders/hemi_leaf.hlsl — change both together.
 pub const HEMI_CONE_SPREAD: f32 = 0.25;
 
 /// Ray-cone LOD base term, shared contract with the HLSL mirror

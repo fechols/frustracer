@@ -44,7 +44,7 @@ type CreateFn = unsafe extern "system" fn(*const GUID, *const GUID, *mut *mut c_
 /// the per-scene alpha-cutout / tinted-shadow / BLAS-split arms, the frustum
 /// structure (`FTREE`), `LANE_STACK`, `LEAF_GROUP`, `SKY_GROUP`/`SKY_SPLIT`,
 /// `MAX_SPP`, `SKY_LOD`, `CLOUD_SHADOW_N`, `LEAF_NO_FB`, the work-graph arm —
-/// so what DXC actually sees is not any file under `src/gpu/shaders/`. That
+/// so what DXC actually sees is not any file under `src/shaders/`. That
 /// leaves offline tooling with nothing to point at: Radeon GPU Analyzer (RDNA
 /// VGPR/SGPR/LDS/occupancy per kernel — the numbers behind leaf.hlsl's "VGPR
 /// count sets occupancy directly on RDNA"), or any DXIL disassembler. This

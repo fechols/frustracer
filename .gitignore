@@ -104,3 +104,8 @@ waveviz-*.png
 # (already ignored); this covers a copied-out exe run from the repo root.
 frustracer-crash-*.txt
 frustracer-crash-*.dmp
+
+# xwin's package cache — tools/win-cross-check.sh points it at $HOME, but a
+# hand-run `xwin splat` defaults to ./.xwin-cache and drops ~886 MB of
+# Microsoft packages in the repo root.
+/.xwin-cache/

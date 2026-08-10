@@ -4319,7 +4319,7 @@ fn gate_fsr_rr_feed(
     true
 }
 
-/// `gpu/shaders/fsr_composite.hlsl` — the THIRD site of the composite identity,
+/// `shaders/fsr_composite.hlsl` — the THIRD site of the composite identity,
 /// and the only one whose arithmetic runs nowhere else. `fsr::composite` is
 /// gated by --check-fsr and `cs_feed_fsr_rr`'s residual by the feed gate above,
 /// but this kernel executes only inside a live FSR4-RR session, so for a long

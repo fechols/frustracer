@@ -44,9 +44,9 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 
 type Result<T> = std::result::Result<T, String>;
 
-const FRD_COMMON_HLSLI: &str = include_str!("shaders/frd_common.hlsli");
-const FRD_TEMPORAL_HLSL: &str = include_str!("shaders/frd_temporal.hlsl");
-const FRD_BLUR_HLSL: &str = include_str!("shaders/frd_blur.hlsl");
+const FRD_COMMON_HLSLI: &str = include_str!("../shaders/frd_common.hlsli");
+const FRD_TEMPORAL_HLSL: &str = include_str!("../shaders/frd_temporal.hlsl");
+const FRD_BLUR_HLSL: &str = include_str!("../shaders/frd_blur.hlsl");
 
 /// One texture + its tracked state (rests in UNORDERED_ACCESS).
 struct Reg {

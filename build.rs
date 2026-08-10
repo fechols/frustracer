@@ -150,5 +150,19 @@ fn main() {
     #[cfg(not(windows))]
     {
         println!("cargo:rustc-check-cfg=cfg(dlss_ngx)");
+
+        // `intel_tex_2` (the ispc BC7 encoder — the `--bc7-cpu` A/B arm) ships
+        // PRECOMPILED objects whose C++ exception tables reference
+        // `__gxx_personality_v0`, and its build script never asks for the C++
+        // runtime that defines it. On Windows the MSVC CRT supplies the
+        // equivalent implicitly, which is why this has never been visible.
+        //
+        // `cargo build --release` links anyway — `--gc-sections` collects the
+        // `DW.ref` away once the encoder is inlined out — so the failure is
+        // DEBUG-ONLY, which is exactly why it went unnoticed: M0's Linux
+        // verification ran `--check` from a release build. `cargo test` builds
+        // at the test profile, so without this the shader-source gates could
+        // not link on Linux no matter which module they lived in.
+        println!("cargo:rustc-link-lib=dylib=stdc++");
     }
 }

@@ -24,7 +24,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use std::sync::atomic::Ordering::Relaxed;
 
-const COMPOSITE_HLSL: &str = include_str!("shaders/fsr_composite.hlsl");
+const COMPOSITE_HLSL: &str = include_str!("../shaders/fsr_composite.hlsl");
 
 /// One Ray Regeneration dispatch's resource set: the shared inputs plus an
 /// in/out pair per subscribed signal (`ffx_sys::SIGNALS`).

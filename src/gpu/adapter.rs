@@ -6,40 +6,12 @@
 use windows::core::{Interface, Result};
 use windows::Win32::Graphics::Dxgi::*;
 
-const VENDOR_NVIDIA: u32 = 0x10DE;
-const VENDOR_AMD: u32 = 0x1002;
-const VENDOR_INTEL: u32 = 0x8086;
-
-/// The vendor of the adapter we actually PICKED — the input to the session's
-/// vendor-aware policy (`main::vendor_defaults`, the `--spin` warm-up count).
-/// It named `trace::leaf_group` until 2026-08-01; that constant lost its
-/// vendor arm and is now a plain const + `FR_LGROUP` lever.
-///
-/// Deliberately not the same type as `Prefer`: a preference is what the user
-/// asked for and may not be honored (a box without that vendor falls back to
-/// the first hardware adapter), while this is what the device is. Defaults must
-/// key off the fact, never the request.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Vendor {
-    Nvidia,
-    Amd,
-    Intel,
-    /// Anything else, including a software/virtual adapter that slipped the
-    /// SOFTWARE flag. Always takes the cross-vendor default — an unknown GPU
-    /// is exactly the case where a tuned constant is least likely to hold.
-    Other,
-}
-
-impl Vendor {
-    fn of(id: u32) -> Self {
-        match id {
-            VENDOR_NVIDIA => Vendor::Nvidia,
-            VENDOR_AMD => Vendor::Amd,
-            VENDOR_INTEL => Vendor::Intel,
-            _ => Vendor::Other,
-        }
-    }
-}
+/// The vendor of the adapter we actually PICKED. Defined in `gfx::vocab` since
+/// `gfx::shaders::cand_defs` — portable code — takes one; it named
+/// `trace::leaf_group` until 2026-08-01, when that constant lost its vendor arm
+/// and became a plain const + `FR_LGROUP` lever. See the definition for why it
+/// is deliberately a different type from `Prefer`.
+pub use crate::gfx::vocab::Vendor;
 
 /// The last `pick()`'s vendor, as a process-global for consumers that never see
 /// an `AdapterPick` and for which "the session's adapter" is genuinely the right
@@ -148,13 +120,8 @@ pub fn enumerate(factory: &IDXGIFactory6) -> Vec<AdapterPick> {
 /// Pick the preferred vendor's adapter with the most VRAM; fall back to the
 /// first hardware adapter (high-performance order).
 pub fn pick(factory: &IDXGIFactory6, prefer: Prefer) -> std::result::Result<AdapterPick, String> {
-    let want = match prefer {
-        Prefer::Nvidia => VENDOR_NVIDIA,
-        Prefer::Amd => VENDOR_AMD,
-        Prefer::Intel => VENDOR_INTEL,
-    };
+    let want = prefer.vendor();
     let all = enumerate(factory);
-    let want = Vendor::of(want);
     // `reduce` with a strict `>`, NOT `max_by_key`: on equal VRAM the original
     // loop kept the FIRST adapter (it only replaced on strictly greater) while
     // `max_by_key` keeps the last. That differs exactly when two adapters have

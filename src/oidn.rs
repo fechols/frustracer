@@ -57,13 +57,13 @@ fn narrow_hdr(v: f32) -> f16 {
     let max = f16::MAX.to_f32_const();
     f16::from_f32(if v > max { max } else { v })
 }
-/// OIDN's own `OIDNQuality` values, defined in `gfx::vocab` — `settings.rs`
-/// round-trips them through the settings file on every platform, while this
-/// module is Windows-only today.
-pub use crate::gfx::vocab::{
-    OIDN_QUALITY_BALANCED as QUALITY_BALANCED, OIDN_QUALITY_FAST as QUALITY_FAST,
-    OIDN_QUALITY_HIGH as QUALITY_HIGH,
-};
+// OIDN's own `OIDNQuality` values live in `gfx::vocab` as OIDN_QUALITY_*, since
+// `cli.rs` parses --oidn-quality and `settings.rs` round-trips it on every
+// platform while this module is Windows-only. There is deliberately no
+// re-export back to the old `oidn::QUALITY_*` spelling: M0 left one behind out
+// of habit and it had no consumer at all — every call site had already been
+// repointed at gfx. A compatibility alias nothing calls is just a second name
+// for the same constant, waiting to be reached for.
 
 /// The resolved OIDN C entry points (all cdecl, undecorated x64 exports).
 struct Api {
