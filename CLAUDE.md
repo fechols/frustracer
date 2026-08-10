@@ -1784,9 +1784,18 @@ cargo run --release -- --gpu --xess --frd  # FRD (src/frd.rs + gpu/frd_gpu.rs, 2
                                       # the displaced fetch runs its own foot loop with the
                                       # relative-Z test slack-widened by the applied offset
                                       # (VM_Z_SLACK — grazing planar mirrors vary reflector
-                                      # depth along the plane); the MEASURED surface-vs-virtual
-                                      # divergence replaces cam_step/z as the parallax where
-                                      # the block ran. Pure rotation needs none of this (both
+                                      # depth along the plane); the unfold's t_r reads the
+                                      # ACCUMULATED hit-dist at the surface-reprojected texel
+                                      # (raw 1-spp .w jitters the fetch position — measured
+                                      # live as strafe smear), and the parallax cap STAYS the
+                                      # crude cam_step/z + light_par (the measured divergence
+                                      # is ALWAYS ≤ cam_step/z, so capping by it LENGTHENS
+                                      # history exactly in proportion to trust in the planar-
+                                      # still unfold — rippled water/curved reflectors broke
+                                      # that trust, the 2026-08-10 strafe-smear regression;
+                                      # v1.5 = corrected FETCH under the SAME conservative
+                                      # cap, relaxing it is v2's confidence term). Pure
+                                      # rotation needs none of this (both
                                       # points share the ray through the unmoved origin — the
                                       # surface MV is already correct there). CB_DWORDS 17→47
                                       # (prev world→clip + CamBasis org/rgt/up, the ngxfg

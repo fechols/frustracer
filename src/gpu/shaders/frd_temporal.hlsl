@@ -206,10 +206,17 @@ void cs_frd_temporal(uint3 id : SV_DispatchThreadID) {
     // COORDINATE toward the surface (one fetch, never two); a projection
     // behind the prev image plane takes delta 0 — the humble arm.
     float2 q_spec = q;
-    float vm_par = 0.0;
     float vm_slack = 1.0;
-    bool vm_live = false;
-    float t_r = sin_.w * frd_hitdist_denorm_factor(z, rough);
+    // The unfold's t_r comes off the ACCUMULATED hit-dist at the
+    // surface-reprojected texel when one exists (the slow plane's EMA'd .w
+    // — temporally stable), falling back to this frame's sample: a raw
+    // 1-spp .w jitters per frame, and a fetch position that is a function
+    // of per-frame noise fetches INCOHERENTLY under motion — measured live
+    // as bright-reflection smear while strafing (each frame blends history
+    // from a different offset).
+    int2 qn = clamp(int2(floor(q)), int2(0, 0), int2(int(rw) - 1, int(rh) - 1));
+    float nh_hist = prev_slow_spec[qn].w;
+    float t_r = (nh_hist > 0.0 ? nh_hist : sin_.w) * frd_hitdist_denorm_factor(z, rough);
     float vm_w = 1.0 - smoothstep(FRD_VM_ROUGH_LO, FRD_VM_ROUGH_HI, rough);
     if ((flags & 4u) != 0u && t_r > 0.0 && vm_w > 0.0) {
         float ndx = (float(p.x) + 0.5) * (2.0 / float(rw)) - 1.0;
@@ -232,13 +239,7 @@ void cs_frd_temporal(uint3 id : SV_DispatchThreadID) {
             }
             float2 appl = d * vm_w;
             q_spec = q + appl;
-            // The MEASURED parallax replaces the crude cam_step/z term for
-            // this pixel: |virtual − surface| px back to radians via proj —
-            // exact for translation, correctly ~0 for pure rotation, and
-            // honestly 0 for content motion (light_par carries that).
-            vm_par = length(d) / max(proj, 1e-4);
             vm_slack = 1.0 + FRD_VM_Z_SLACK * length(appl);
-            vm_live = true;
         }
     }
     bool spec_shared = all(q_spec == q);
@@ -354,14 +355,19 @@ void cs_frd_temporal(uint3 id : SV_DispatchThreadID) {
 
     // Accumulate. Meta stores n/63 in RG8 (cap 63 > every legal max_accum).
     Accum ad = frd_accumulate(din, hs_d, hf_d, nfr.x, w_d, max_accum);
-    // The specular parallax: the MEASURED surface-vs-virtual divergence
-    // where virtual motion ran (exact for translation, ~0 for rotation),
-    // else the crude cam_step/z term (Stage A's arm) — plus the
-    // light-motion term either way (light_par — 2× the sun's per-frame
-    // angular delta): a parked camera under a TOD scrub has cam_step 0
-    // AND zero virtual divergence while the glint slides, and no MV of any
-    // kind can express content motion — the CAP is the mechanism there.
-    float parallax = (vm_live ? vm_par : cam_step / max(z, 1e-4)) + light_par;
+    // The specular parallax cap: the crude cam_step/z translation term +
+    // the light-motion term (light_par — 2× the sun's per-frame angular
+    // delta; a parked camera under a TOD scrub has cam_step 0 while the
+    // glint slides, and no MV can express content motion — the CAP is the
+    // mechanism there). DELIBERATELY NOT the measured surface-vs-virtual
+    // divergence: that is ALWAYS ≤ cam_step/z (z_eff > z), so using it
+    // LENGTHENS history under translation exactly in proportion to how
+    // much the planar-still-mirror unfold is trusted — and rippled water /
+    // curved reflectors / hit-dist noise all break that trust (measured
+    // live as a strafe smear regression). v1.5 is the corrected FETCH
+    // under the SAME conservative cap; relaxing the cap needs v2's
+    // model-confidence term.
+    float parallax = cam_step / max(z, 1e-4) + light_par;
     float n_smax = frd_spec_max_frames(max_accum, parallax, rough);
     Accum as_ = frd_accumulate(sin_, hs_s, hf_s, nfr.y, w_s, n_smax);
 
