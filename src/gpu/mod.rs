@@ -3080,6 +3080,13 @@ impl GpuContext {
         // secondary packs direct-only dd for its rows, a per-band ReBLUR
         // denoise-semantics seam (no out-of-bounds hazard, just wrong input).
         sec.force_nrd_sig(Some(d.pack && tg.nrd_sig()));
+        // ...and so must the remodulation convention, for the same reason and
+        // with a worse failure mode: the two arms PRE-SCALE the sig lanes
+        // differently, so an unmirrored band hands the bridge lanes scaled by
+        // one rule and remodulates them by the other — a visible brightness
+        // step at the band seam on every sheened/translucent/cavity pixel,
+        // rather than merely a different denoiser input.
+        sec.force_remod_exact(Some(d.pack && tg.remod_exact()));
         // ...AND THE ONE-SIDED CASE MUST DENY THE FRAME, not just narrow the
         // payload. The AND above stops the out-of-bounds copy, but a primary
         // that HAS a pack paired with a secondary that has none would still

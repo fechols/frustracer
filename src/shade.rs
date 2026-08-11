@@ -207,6 +207,24 @@ pub struct PrimarySurface {
     pub ao_t: f32,
     #[allow(dead_code)]
     pub shadow_t: f32,
+    /// `FLAG_REMOD_EXACT`'s two diffuse sub-term factors (`PrimSurf.amb_k` /
+    /// `PrimSurf.m_d` on the GPU): the exact post-capture scalars shade applies
+    /// to the ambient-or-bounce term (`sk*dcav`) and to the direct diffuse
+    /// (`sk`), relative to the wire kd. They are blended by energy into the
+    /// wire delta multiplier — see the PrimSurf comment for why one divisor
+    /// cannot serve both, and why the blend belongs on the delta rather than in
+    /// the captured signal.
+    ///
+    /// GPU-CAPTURED ONLY, for the same reason as `ao_t`/`shadow_t` above and
+    /// one more: the CPU renderer has no split ambient at all (its RTGI arm
+    /// composes the bounce straight into `color`, see the divergence note at
+    /// the `FLAG_NRD_GI` site below) and never feeds NRD, so there is nothing
+    /// here for a factor to correct. Held at the multiplicative identity so the
+    /// PrimSurf mirror stays field-aligned.
+    #[allow(dead_code)]
+    pub amb_k: f32,
+    #[allow(dead_code)]
+    pub m_d: f32,
 }
 
 impl PrimarySurface {
@@ -1022,6 +1040,10 @@ pub fn shade(
             // GPU-captured only (see the field docs) — 0.0 = "no data".
             ao_t: 0.0,
             shadow_t: 0.0,
+            // ...except these two, whose neutral value is the multiplicative
+            // identity, not 0.0 (see the field doc).
+            amb_k: 1.0,
+            m_d: 1.0,
         };
     }
 

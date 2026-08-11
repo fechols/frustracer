@@ -211,6 +211,112 @@ pub fn nrd_rejitter_lever() -> bool {
     })
 }
 
+/// EXACT REMODULATION (bit 24 — 2026-08-10): the lap-0 sig captures are
+/// PRE-SCALED by the post-capture factors shade applies to those same lobes, so
+/// the bridge's `kd`/`f0` become the EXACT remodulation divisors and the
+/// denoiser's delta lands at its true physical weight.
+///
+/// WHY IT EXISTS. The delta form preserves `base` exactly, but it remodulates
+/// the denoiser's CORRECTION at the wire `kd = albedo·(1−metallic)·(1−trans)`
+/// while shade multiplied the same lobes by more: `sk = 1−0.157·sheen` (the
+/// Charlie energy term), the translucency split, `detail_sun_shadow` on the
+/// direct diffuse, and `detail_cavity` on the bounce and on `direct_s`. So the
+/// correction was applied at `1/m` its physical weight — on a `dcav = 0.3` pit
+/// under FLAG_NRD_GI the bounce correction landed at 3.3x, and the leftover
+/// fraction of every bright 1-spp bounce spike stayed in `base` RAW and
+/// UN-DENOISED. That is a firefly source, and nrd_bridge.hlsl's own comment
+/// used to assert it could not be ("never the recomposed color") — true only
+/// while `D_out == D_in`.
+///
+/// The FLAG_NRD_GI shape exactly: it cannot arm without the sig capture, and it
+/// cannot arm in an FSR-RR session (whose composite identity owns those lanes).
+/// Unlike FLAG_NRD_REJITTER it is NOT engine-gated — the mismatch is our
+/// arithmetic, not NVIDIA's, and FRD's A/B-oracle role is not compromised by
+/// its inputs being correctly scaled. Lockstep with trace_common.hlsli's
+/// FLAG_REMOD_EXACT.
+pub const FLAG_REMOD_EXACT: u32 = 16777216;
+
+/// `FR_NRD_REMOD=off` — the A/B arm for exact remodulation (loud on departure,
+/// the FR_NRD_REJITTER idiom). Default ON: this is a bug fix, not a quality
+/// trade, and `off` restores the pre-2026-08-10 arithmetic bit-for-bit. `on`
+/// spells the default.
+pub fn nrd_remod_lever() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("FR_NRD_REMOD") {
+        Err(_) => true,
+        Ok(v) if v == "off" => {
+            eprintln!(
+                "nrd: FR_NRD_REMOD=off — the pre-fix remodulation (spikes leak past the \
+                 denoiser at 1/m weight; the A/B arm)"
+            );
+            false
+        }
+        Ok(v) if v == "on" => true, // the default, spelled explicitly
+        Ok(v) => {
+            eprintln!("nrd: FR_NRD_REMOD={v:?} unrecognized (legal: on, off) — on");
+            true
+        }
+    })
+}
+
+/// THE RESIDUAL SPIKE CAP (bit 25 — 2026-08-10). `cs_nrd_out` reconstructs the
+/// RESIDUAL `R = base − D_in·kd·m_d − S_in·f0` — everything in the frame the
+/// denoiser never saw — and soft-caps its luma against the 8-neighbour ring.
+///
+/// WHY THE RESIDUAL IS WHERE FIREFLIES HIDE. The recompose is algebraically
+/// `col = R + D_out·kd·m_d + S_out·f0`: the two folded channels are denoised,
+/// and R is passed through RAW by construction. With FLAG_NRD_GI live the
+/// bounce rides the diffuse fold, so R's remaining stochastic term is the root
+/// GLASS/TRANSMISSION chain — each interior lap shades with its own sampled
+/// sun-shadow pairs and sampled AO, and nothing filters any of it. Neither
+/// ReBLUR's own anti-firefly (relative, and applied inside the denoiser) nor
+/// FRD's ring pre-clamp can reach it: both see only the folded channels.
+///
+/// ENGINE-BLIND, with no `nrd_engine` clause — unlike FLAG_NRD_REJITTER, which
+/// carries one because the Jacobian is NVIDIA's and FRD is the oracle it is
+/// judged against. The residual is the same residual for both engines and both
+/// are scored against the same `base`, so a term that fixes it belongs to the
+/// shared bridge.
+pub const FLAG_NRD_RCLAMP: u32 = 33554432;
+
+/// The `hard` arm of the residual cap (bit 26): swaps the ring-mean multiplier
+/// for `NRD_RCLAMP_K_HARD`, which is 1.0 — i.e. "clamp anything brighter than
+/// its own surround". A DIAGNOSTIC, not a quality setting: it paints every
+/// pixel the cap could ever touch, which is how you see at a glance whether the
+/// feature is aimed at glass or at emissive detail. Also the N10 gate's
+/// scene-independent teeth (at K = 1.0 the mechanism must fire somewhere, so a
+/// check scene with no transmissive geometry still proves the wiring).
+pub const FLAG_NRD_RCLAMP_HARD: u32 = 67108864;
+
+/// `FR_NRD_RCLAMP=off|on|hard` — the residual spike cap's lever. DEFAULT OFF,
+/// deliberately unlike `FR_NRD_REJITTER`/`FR_NRD_REMOD`: those are restoration
+/// and a bug fix respectively, while this is a QUALITY TRADE with a known
+/// accept (a single-texel hard-edged emissive on a black background can be
+/// attenuated). It defaults on only once the firefly-count measurement earns
+/// it. Returns (armed, hard).
+pub fn nrd_rclamp_lever() -> (bool, bool) {
+    static V: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
+    *V.get_or_init(|| match std::env::var("FR_NRD_RCLAMP") {
+        Err(_) => (false, false),
+        Ok(v) if v == "off" => (false, false), // the default, spelled explicitly
+        Ok(v) if v == "on" => {
+            eprintln!("nrd: FR_NRD_RCLAMP=on — residual spike cap armed");
+            (true, false)
+        }
+        Ok(v) if v == "hard" => {
+            eprintln!(
+                "nrd: FR_NRD_RCLAMP=hard — residual spike cap at K=1 (the DIAGNOSTIC arm: it \
+                 paints everything the cap could touch, not a quality setting)"
+            );
+            (true, true)
+        }
+        Ok(v) => {
+            eprintln!("nrd: FR_NRD_RCLAMP={v:?} unrecognized (legal: off, on, hard) — off");
+            (false, false)
+        }
+    })
+}
+
 /// Unreal-1 detail texturing (`--no-detail-tex` clears it): procedural
 /// close-up albedo grain + micro-bump on MAGNIFIED hits — textured AND
 /// untextured since the untextured arm (shade.hlsli's post-match detail
@@ -1053,6 +1159,8 @@ impl FrameCb {
         nrd_sig: bool,
         sky_ext_skip: bool,
         nrd_rejitter: bool,
+        remod_exact: bool,
+        rclamp: (bool, bool),
     ) -> FrameCb {
         let (origin, forward, right, up, inv_w, inv_h) = p.cam.gpu_fields();
         let mut cb = *self;
@@ -1084,6 +1192,19 @@ impl FrameCb {
             // so it requires the ext flag by construction — the same shape
             // the sig/GI terms above use.
             | ((gbuf_full && (gbuf_ext || fsr_sig) && nrd_rejitter) as u32 * FLAG_NRD_REJITTER)
+            // Exact remodulation PRE-SCALES the sig lanes shade captures, so it
+            // requires the sig flag by construction — the FLAG_NRD_GI shape,
+            // and the same clause is what keeps it out of an FSR-RR session
+            // (nrd_sig is false there, and that path's composite identity owns
+            // these lanes).
+            | ((gbuf_full && fsr_sig && nrd_sig && remod_exact) as u32 * FLAG_REMOD_EXACT)
+            // The residual cap reconstructs R from the ext plane's kd/f0, so it
+            // requires the ext flag by construction — the ReJitter shape. The
+            // `hard` bit additionally requires its own parent: a HARD arm with
+            // the cap disarmed would be a bit nothing reads.
+            | ((gbuf_full && (gbuf_ext || fsr_sig) && rclamp.0) as u32 * FLAG_NRD_RCLAMP)
+            | ((gbuf_full && (gbuf_ext || fsr_sig) && rclamp.0 && rclamp.1) as u32
+                * FLAG_NRD_RCLAMP_HARD)
             | ((crate::texture::max_aniso() > 1.0) as u32 * FLAG_ANISO)
             | (p.clouds.enabled as u32 * FLAG_CLOUDS)
             // count > 0 already folds in the session enable + the night fade

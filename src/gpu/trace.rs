@@ -3365,6 +3365,12 @@ pub struct TraceGpu {
     force_sky_ext_skip: std::cell::Cell<Option<bool>>,
     /// See `nrd_rejitter` — the N8 gate's hook, same Option-override shape.
     force_nrd_rejitter: std::cell::Cell<Option<bool>>,
+    /// See `remod_exact` — the N9 gate's arming hook AND the dual-GPU
+    /// secondary's mirror, same Option-override shape.
+    force_remod_exact: std::cell::Cell<Option<bool>>,
+    /// See `nrd_rclamp` — the N10 gate's three-arm hook (off/on/hard). One
+    /// Option carrying BOTH bits, so an arm cannot half-apply.
+    force_nrd_rclamp: std::cell::Cell<Option<(bool, bool)>>,
     /// The wired denoiser is NRD, not FRD (`wire_nrd_feed`'s `dn_is_nrd`).
     /// The bridge kernels are shared by both engines, so `nrd_wired` alone
     /// cannot answer "is NVIDIA's denoiser behind these planes" — and exactly
@@ -3885,6 +3891,8 @@ impl TraceGpu {
             force_nrd_sig: std::cell::Cell::new(None),
             force_sky_ext_skip: std::cell::Cell::new(None),
             force_nrd_rejitter: std::cell::Cell::new(None),
+            force_remod_exact: std::cell::Cell::new(None),
+            force_nrd_rclamp: std::cell::Cell::new(None),
             nrd_engine: false,
             gbuf_full,
             uav_heap,
@@ -3925,6 +3933,8 @@ impl TraceGpu {
             self.nrd_sig(),
             self.sky_ext_skip(),
             self.nrd_rejitter(),
+            self.remod_exact(),
+            self.nrd_rclamp(),
         );
         cb.cloud_grid = self.cloud_grid_row(p);
         cb.set_split(self.split.get());
@@ -4087,6 +4097,51 @@ impl TraceGpu {
 
     pub fn force_nrd_rejitter(&self, v: Option<bool>) {
         self.force_nrd_rejitter.set(v);
+    }
+
+    /// Whether the lap-0 sig captures are PRE-SCALED so the bridge's `kd`/`f0`
+    /// are exact remodulation divisors (FLAG_REMOD_EXACT). Wiring-derived like
+    /// `nrd_sig` — the bridge is the only consumer — and lever-gated.
+    ///
+    /// DELIBERATELY NOT ENGINE-GATED, which is the one place this departs from
+    /// `nrd_rejitter`'s shape. That term exists because the Jacobian is
+    /// NVIDIA's and FRD is the oracle it is judged against. This is OUR
+    /// arithmetic being wrong: FRD reads the same pre-scaled planes through the
+    /// same shared bridge, and an oracle fed mis-scaled inputs is not a better
+    /// oracle for being fed them consistently. Both engines take the fix.
+    pub fn remod_exact(&self) -> bool {
+        self.force_remod_exact
+            .get()
+            .unwrap_or(!self.nrd_wired.is_empty() && nrd_remod_lever())
+    }
+
+    /// The N9 gate's arming hook (Some(false) replays the pre-fix arithmetic on
+    /// a wired tracer — that arm is the gate's anti-vacuity teeth) and the
+    /// dual-GPU secondary's mirror: a band packed with the flag clear beside one
+    /// packed with it set is a per-band denoise-semantics seam, exactly like
+    /// `force_nrd_sig`'s.
+    pub fn force_remod_exact(&self, v: Option<bool>) {
+        self.force_remod_exact.set(v);
+    }
+
+    /// Whether `cs_nrd_out` caps the residual's luma against its ring this
+    /// frame, and whether at the `hard` diagnostic K (FLAG_NRD_RCLAMP /
+    /// _HARD). Wiring-derived like `nrd_sig` and lever-gated; engine-blind on
+    /// purpose (see the const).
+    pub fn nrd_rclamp(&self) -> (bool, bool) {
+        self.force_nrd_rclamp.get().unwrap_or_else(|| {
+            if self.nrd_wired.is_empty() { (false, false) } else { nrd_rclamp_lever() }
+        })
+    }
+
+    /// The N10 gate's hook — the three arms have to be recorded by ONE process
+    /// against ONE PSO, or the A/B measures a recompile rather than a CB bit.
+    /// Also what N3/F3/N4/F4/N8 use to pin the cap OFF: those gates' subjects
+    /// are the recompose and the denoiser, and a gate whose subject shares a
+    /// post-process with the thing under test is not scoring the thing under
+    /// test (the `nrd_rejitter` engine-term argument, applied one level up).
+    pub fn force_nrd_rclamp(&self, v: Option<(bool, bool)>) {
+        self.force_nrd_rclamp.set(v);
     }
 
     /// The `nrd_sig` half of the dual-GPU mirror (the `force_fsr_sig` shape):

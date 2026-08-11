@@ -1993,6 +1993,372 @@ cargo run --release -- --gpu --xess --nrd  # NRD (ReBLUR) pre-upscale denoising 
                                       # absolute terms (both ~0.2/255) but a
                                       # real trade, so the default wants a feel
                                       # test.
+                                      # EXACT REMODULATION (FLAG_REMOD_EXACT,
+                                      # bit 24, DEFAULT ON, FR_NRD_REMOD=off is
+                                      # the A/B arm — 2026-08-10, the firefly
+                                      # campaign's first of two leaks): the
+                                      # delta form recomposes
+                                      # `col = base + (D_out−D_in)·j·kd +
+                                      # (S_out−S_in)·j·f0`, but it remodulated
+                                      # the denoiser's CORRECTION at the wire
+                                      # `kd = albedo·(1−metallic)·(1−trans)`
+                                      # while shade had multiplied those same
+                                      # lobes by MORE: `sk = 1−0.157·sheen` (the
+                                      # Charlie energy term, folded into shade's
+                                      # own kd), the translucency split,
+                                      # `detail_sun_shadow` on the direct
+                                      # diffuse, and `detail_cavity` on the
+                                      # bounce and on direct_s. So the
+                                      # correction landed at 1/m its physical
+                                      # weight — on a dcav = 0.3 pit under
+                                      # FLAG_NRD_GI the bounce correction was
+                                      # 3.3x — and the leftover raw fraction of
+                                      # every bright 1-spp spike stayed in
+                                      # `base` UN-DENOISED. A firefly source
+                                      # that nrd_bridge.hlsl's OWN COMMENT
+                                      # asserted impossible ("the mismatch only
+                                      # shifts what the denoiser sees between
+                                      # signal and residual, never the
+                                      # recomposed color") — true only while
+                                      # D_out == D_in, i.e. of a passthrough and
+                                      # of nothing else; correcting that
+                                      # sentence was part of the change.
+                                      # THE FIX IS A RE-CAPTURE, NOT A NEW LANE:
+                                      # shade.hlsli re-assigns the two lap-0 sig
+                                      # captures AFTER every post-capture factor
+                                      # has landed, so the bridge's kd/f0 become
+                                      # the EXACT divisors. A REASSIGNMENT (the
+                                      # originals stay put) so the flag-clear
+                                      # arm is textually and numerically today's
+                                      # code — the guarded-never-`* 1.0`
+                                      # discipline, and what keeps the off arm's
+                                      # expression DAG bit-identical for the
+                                      # M9b/N6 accum gates. It captures
+                                      # `diffuse_d` and NOT `direct_d·(1−tl)`
+                                      # deliberately: diffuse_d already carries
+                                      # the translucency BACK-RAY term, which
+                                      # had no wire lane at all and was
+                                      # therefore 100% un-denoised stochastic
+                                      # residual — the one place this fix
+                                      # REMOVES noise rather than merely
+                                      # reweighting it.
+                                      # THE SPECULAR LANE NEEDS NO MULTIPLIER,
+                                      # and that is luck landing on the right
+                                      # side: ds's exact factor is dcav (folded
+                                      # at the cavity block) and is's is exactly
+                                      # 1, so folding dcav into ds leaves BOTH
+                                      # sub-terms remodulating at f0 — which
+                                      # puts the free side of the split on `is`,
+                                      # the reflection bounce, the NOISY one.
+                                      # m_s stays 1. THE DIFFUSE LANE CANNOT do
+                                      # the same: its two sub-terms disagree
+                                      # (diffuse_d by sk, the ambient/RTGI
+                                      # bounce by sk·dcav), so both factors ride
+                                      # PrimSurf (`m_d` / `amb_k`) and are
+                                      # blended by ENERGY at the one site both
+                                      # are known — shade_full's GI fold under
+                                      # RTGI, the sampled-ambient block
+                                      # otherwise (`split_ambient == rtgi`, so
+                                      # the two blend sites are mutually
+                                      # exclusive by construction).
+                                      # AND THE BLEND IS EXACT, not a
+                                      # compromise, for the correction a
+                                      # denoiser can actually deliver. Write the
+                                      # channel as A + B with factors k_a, k_b;
+                                      # accum holds kd·(k_a·A + k_b·B). For any
+                                      # UNIFORM scaling D_out = L·D_in the delta
+                                      # form gives base + (L−1)(A+B)·kd·m, and
+                                      # at m = (k_a·A + k_b·B)/(A+B) that
+                                      # collapses ALGEBRAICALLY to
+                                      # L·kd·(k_a·A + k_b·B) — the right answer.
+                                      # It is approximate only where the
+                                      # denoiser REDISTRIBUTES between the two
+                                      # sub-terms, which it cannot: they were
+                                      # summed before it saw them. One lane is
+                                      # not a thrifty approximation of two, it
+                                      # is the whole information the wire admits
+                                      # (exact when the sub-terms share a hue,
+                                      # bounded by the convex combination
+                                      # otherwise — m ∈ [min(k_a,k_b),
+                                      # max(k_a,k_b)], so it can never amplify).
+                                      # WHY NOT the obvious `m_d = dcav` with
+                                      # the signal DIVIDED by it: that injects
+                                      # texel-frequency 1/dcav INTO the denoiser
+                                      # input, which the spatial filter then
+                                      # averages — blur(S/dcav)·dcav is not S,
+                                      # so the direct diffuse, which carries no
+                                      # cavity in shade at all, comes back with
+                                      # a spurious cavity RIPPLE. The energy
+                                      # blend keeps the input clean and puts
+                                      # every crisp factor on the DELTA, where
+                                      # `base` already holds the exact per-pixel
+                                      # value and only the correction needs
+                                      # weighting.
+                                      # THE WIRE: m_d rides sig.w's HIGH half,
+                                      # ON LOAN from `shadow_t` — written today
+                                      # and decoded by NOBODY (nrd_bridge masks
+                                      # `sig.w & 0xffff` for ao_t; FSR-RR never
+                                      # reads sig.w at all), captured ahead of a
+                                      # SIGMA shadow denoiser that does not
+                                      # exist. Gated, so the flag-clear arm
+                                      # packs shadow_t verbatim and N5's
+                                      # sh_fired must-fire runs THERE (N5
+                                      # asserts its own precondition now rather
+                                      # than trusting a comment: an armed m_d is
+                                      # positive on every hit pixel, so the
+                                      # must-fire would PASS while scoring the
+                                      # wrong lane — silent-vacuous, the worst
+                                      # shape). ZERO stride change; the exit
+                                      # when SIGMA lands is written down: stride
+                                      # 72 → 80 is 16-ALIGNED (72 is not), at
+                                      # ~+11% on a 0.34 ms store, plus
+                                      # GBUF_EXT_STRIDE, dual.rs's fed_strides /
+                                      # MAX_FED_STRIDES, and the hardcoded `72`
+                                      # literals in the N5/N6/N7/N9/N11 gates.
+                                      # APPEND, never insert — every gate
+                                      # decodes lanes by index.
+                                      # Derivation is the FLAG_NRD_GI shape
+                                      # (gbuf_full && fsr_sig && nrd_sig), so it
+                                      # cannot arm without the sig capture and
+                                      # cannot arm in an FSR-RR session (whose
+                                      # composite identity owns these lanes).
+                                      # NOT engine-gated, the one place it
+                                      # departs from FLAG_NRD_REJITTER: that
+                                      # term exists because the Jacobian is
+                                      # NVIDIA's and FRD is the oracle it is
+                                      # judged against; THIS is our arithmetic
+                                      # being wrong, and an oracle fed
+                                      # mis-scaled inputs is not a better oracle
+                                      # for being fed them consistently. Both
+                                      # engines take the fix. DUAL-GPU MIRRORS
+                                      # IT (gpu/mod.rs, beside force_nrd_sig):
+                                      # the two arms pre-scale the sig lanes
+                                      # differently, so an unmirrored band hands
+                                      # the bridge lanes scaled by one rule and
+                                      # remodulates them by the other — a
+                                      # visible brightness STEP at the band seam
+                                      # on every sheened/translucent/cavity
+                                      # pixel, worse than merely a different
+                                      # denoiser input. Zero rng draws; accum is
+                                      # BIT-IDENTICAL across the toggle
+                                      # (assignment-only — N6b asserts it), so
+                                      # every same-seed A/B and both check PNGs
+                                      # are untouched.
+                                      # COVERAGE, SAID PLAINLY BECAUSE A GREEN
+                                      # SUITE DOES NOT IMPLY IT: the procedural
+                                      # check scene has no sheen, no
+                                      # translucency, no cavity pits and no
+                                      # detail sun-shadow, so every factor is
+                                      # exactly 1.0, m_d pins at [1.0000,
+                                      # 1.0000] and the whole feature is INERT
+                                      # there — N6b prints a NOTE saying so, and
+                                      # a green run proves it HARMLESS, not
+                                      # correct. san-miguel-lp exercises it
+                                      # (m_d to 0.9087 over 1514 px). The
+                                      # scene-independent proof is --check's
+                                      # `remod` sweep (N9-CPU).
+                                      # THE RESIDUAL SPIKE CAP (FLAG_NRD_RCLAMP
+                                      # bit 25 / _HARD bit 26,
+                                      # FR_NRD_RCLAMP=off|on|hard, DEFAULT OFF —
+                                      # the campaign's second leak): the
+                                      # recompose is algebraically
+                                      # `col = R + D_out·kd·m_d + S_out·f0` with
+                                      # `R = base − D_in·kd·m_d − S_in·f0`, so
+                                      # the two folded channels are denoised and
+                                      # R is passed through RAW BY
+                                      # CONSTRUCTION. With FLAG_NRD_GI live the
+                                      # bounce rides the diffuse fold, so R's
+                                      # remaining stochastic term is the root
+                                      # GLASS/TRANSMISSION chain — each interior
+                                      # lap shades with its own sampled
+                                      # sun-shadow pairs and sampled AO and
+                                      # nothing filters any of it. Neither
+                                      # ReBLUR's own anti-firefly nor FRD's ring
+                                      # pre-clamp can reach it: both see only
+                                      # the folded channels. cs_nrd_out
+                                      # reconstructs R and soft-caps it against
+                                      # its 8-neighbour ring.
+                                      # THE CAP IS A CONJUNCTION, which is what
+                                      # makes it safe:
+                                      # `cap = max(K_MEAN·ring_mean,
+                                      # K_MAX·ring_max)` at K_MEAN = 8.0 (=
+                                      # FRD's FIREFLY_K, deliberately, so the
+                                      # two clamps speak one number) and K_MAX =
+                                      # 3.0 — a pixel is capped only when it
+                                      # beats BOTH 8x its ring's mean AND 3x its
+                                      # ring's BRIGHTEST member. A lone
+                                      # one-sample spike has mean ≈ max so the
+                                      # mean term binds; a RESOLVED feature (a
+                                      # bright emissive texel, a caustic edge)
+                                      # has a bright neighbour so max >> mean
+                                      # and the max term protects it. Both
+                                      # reductions come out of one loop, so the
+                                      # discrimination is free.
+                                      # THE TEST IS ON `base`, THE CORRECTION
+                                      # LANDS ON `r`, and mixing those two up is
+                                      # the trap this shipped wrong once to
+                                      # find: the ring holds BASE luma, so a cap
+                                      # built from it is in base units, while
+                                      # the residual is only ever a FRACTION of
+                                      # base — testing `rl > cap` puts the
+                                      # threshold orders of magnitude above the
+                                      # quantity and the clamp provably never
+                                      # fires (measured: the K=1 diagnostic arm
+                                      # left N3 and N4 byte-identical, and a
+                                      # feature that cannot fire also cannot be
+                                      # gated). The consistent formulation needs
+                                      # no neighbour residuals at all: model a
+                                      # neighbour's residual as its base times
+                                      # this pixel's residual FRACTION f = rl/bl
+                                      # and `rl > K·mean(ring_R)` reduces
+                                      # EXACTLY to `bl > K·mean(ring_base)` — f
+                                      # cancels — so the outlier test is a
+                                      # statement about base, which we have a
+                                      # ring for, while the scale cap/bl applies
+                                      # to r, the only part the denoiser did not
+                                      # clean. THE HARD ARM RELAXES BOTH
+                                      # MULTIPLIERS for the same class of
+                                      # reason: `cap` is a max and mx >= mean
+                                      # always, so leaving K_MAX at 3.0 would
+                                      # leave 3·ring_max binding and "hard"
+                                      # would be barely harder than the default
+                                      # (measured: byte-identical N3/N4 — it
+                                      # gated nothing at all). At K_HARD = 1.0
+                                      # on both, cap == ring_max and the test
+                                      # becomes "is this pixel a strict local
+                                      # maximum", which is the diagnostic's
+                                      # actual claim.
+                                      # THE HALO AND ITS BARRIER ARE HOISTED
+                                      # ABOVE BOTH EARLY RETURNS, and that is a
+                                      # correctness requirement:
+                                      # GroupMemoryBarrierWithGroupSync in a
+                                      # PARTIALLY-RETURNED group is undefined
+                                      # and partial groups are REAL (the QA lab
+                                      # runs 960x540; 540/8 = 67.5). Indexed by
+                                      # TILE SLOT (thread-linear over 100 slots
+                                      # by 64 threads), never by the centre
+                                      # pixel, so a returned thread's slot still
+                                      # gets filled. `flags` is a cbuffer value
+                                      # and therefore group-uniform, so gating
+                                      # the barrier on it is legal and keeps the
+                                      # disarmed arm free of both the LDS
+                                      # traffic and the sync. The halo holds
+                                      # BASE luma, not the residual, and that is
+                                      # load-bearing twice: gathering R at eight
+                                      # neighbours would need neighbour
+                                      # gbuf_ext, which under FLAG_SKY_EXT_SKIP
+                                      # is UNWRITTEN at sky texels — so the base
+                                      # ring keeps N7's "stale ext bytes stay
+                                      # unread BY CONSTRUCTION" contract without
+                                      # nrd_tap's pre-test — and it is 12 B per
+                                      # halo texel instead of ~52. RING ONLY,
+                                      # CENTRE EXCLUDED (frd.rs's recorded
+                                      # teeth: with the centre in, a lone
+                                      # outlier dominates its own cap and the
+                                      # clamp asymptotes to a fixed 1−K/9 trim
+                                      # however extreme the spike);
+                                      # out-of-range neighbours EXCLUDED, not
+                                      # zeroed (sky `base` is full sky radiance
+                                      # and would inflate the cap into vacuity
+                                      # along every horizon); nv < 4 ⇒ skip, a
+                                      # 3-neighbour estimate is not a
+                                      # neighbourhood. The correction is an
+                                      # `if`/`-=` and NOT a third additive term
+                                      # inside the `precise` expression:
+                                      # `col + (R_capped − R)` would evaluate
+                                      # `+ 0.0` on every unfired pixel and
+                                      # `x + 0.0 == x` bitwise for every finite
+                                      # x EXCEPT −0.0 (frd_temporal.hlsl's own
+                                      # "the skip is a BRANCH, never a computed
+                                      # 1.0"). IT ATTENUATES IN LUMA, NOT PER
+                                      # CHANNEL — r can be negative in a channel
+                                      # (the deterministic-factor remainders
+                                      # leave base carrying less diffuse than
+                                      # D_in·kd·m_d at some pixels), and
+                                      # subtracting a positive multiple of a
+                                      # negative channel RAISES it, so N10
+                                      # asserts luma monotonicity and
+                                      # deliberately not the componentwise
+                                      # version (N8's own first-draft failure,
+                                      # in a different currency).
+                                      # N3/F3 SURVIVE BECAUSE THE GATES PIN THE
+                                      # BIT CLEAR, not by construction — worth
+                                      # stating plainly, because the natural
+                                      # assumption is the opposite. A real
+                                      # frame's R is a real noisy quantity, so
+                                      # an ARMED cap fires and legitimately
+                                      # breaks a byte compare; that is the
+                                      # feature working, and N10 is its own gate
+                                      # exactly as N8 is ReJitter's beside N3.
+                                      # The pin covers N3/F3 (whose subject is
+                                      # the recompose) AND N4/F4/N8 (whose
+                                      # subject is the denoiser and the
+                                      # Jacobian: a gate whose subject shares a
+                                      # post-process with the thing under test
+                                      # is not scoring the thing under test).
+                                      # ENGINE-BLIND, with no nrd_engine clause
+                                      # — the residual is the same residual for
+                                      # both engines and both are scored against
+                                      # the same `base`, so a term that fixes it
+                                      # belongs to the shared bridge (F10 is
+                                      # N10's FRD twin and proves exactly that).
+                                      # DEFAULT OFF, deliberately unlike
+                                      # FR_NRD_REJITTER/FR_NRD_REMOD: those are
+                                      # restoration and a bug fix, this is a
+                                      # QUALITY TRADE with a known-accept — a
+                                      # single-texel hard-edged emissive on a
+                                      # black background can be attenuated
+                                      # (K_MAX is the mitigation; the exemption
+                                      # tag would need the stride move, since
+                                      # sig.w's high half is now m_d's). THE
+                                      # SPARSE-SIGNAL RISK is the K >= 1/p
+                                      # lesson (frd.rs), and the answer differs
+                                      # per term: the glass/transmission chain's
+                                      # refraction direction is DETERMINISTIC
+                                      # (glass_snell), so it fires at EVERY
+                                      # glass pixel, p ≈ 1, bounded
+                                      # multiplicative jitter on an every-frame
+                                      # term — safe, and the target; sun through
+                                      # refraction is coherent on flat glass but
+                                      # genuinely sparse on RIPPLED WATER, which
+                                      # is where to measure; the emissive
+                                      # display-add is not stochastic at all but
+                                      # can be 1-2 px wide. Unlike FRD's
+                                      # GI-fold case, the dominant noisy term
+                                      # here has p ≈ 1, so a fixed K is not
+                                      # structurally doomed. COVERAGE GAP,
+                                      # stated: --check-dxr never dispatches
+                                      # cs_nrd_out AT ALL (every bridge-out gate
+                                      # lives in check-gpu), so an armed cap on
+                                      # the DXR pipeline is exercised by no gate
+                                      # — the accepted "one text, two
+                                      # root-signature objects" argument, but if
+                                      # the clamp ever grows engine- or
+                                      # pipeline-dependent behaviour check-dxr
+                                      # needs a bridge-out arm BEFORE that
+                                      # lands. THE MEASUREMENT THAT DECIDES THE
+                                      # DEFAULT (and whether a third denoised
+                                      # channel is built at all): a firefly
+                                      # count = px whose luma exceeds 16x the
+                                      # local 5x5 MEDIAN, over --frd-lab on
+                                      # san-miguel (glass) and the world
+                                      # (water) — watching `keep` for the
+                                      # suppression signature — plus a live
+                                      # --qa/frqa A/B across
+                                      # FR_NRD_RCLAMP=off|on|hard on bistro lamp
+                                      # poses, a --gpu-timing cost read on the
+                                      # nrd-out region (BUDGET +0.10 ms; +0.30
+                                      # is not acceptable on a 0.48 ms pass),
+                                      # and FRUSTRACER_STAB staying in the
+                                      # 0.06-0.11 band. If the count drops and
+                                      # the artifact goes, default it on and
+                                      # build no third channel; if the count
+                                      # barely moves while glass still shimmers,
+                                      # the residual's noise is BROADBAND, a
+                                      # spike cap is the wrong instrument, and
+                                      # the third channel is justified — built
+                                      # in FRD first, behind its own bit, with
+                                      # NRD carrying it clear.
                                       # Gates: --check-nrd (N0
                                       # DLL-free math twins + N1 instance/dispatch contract,
                                       # absent-DLL = loud skip exit 0); --check-gpu N2
@@ -2049,19 +2415,187 @@ cargo run --release -- --gpu --xess --nrd  # NRD (ReBLUR) pre-upscale denoising 
                                       # back to reconstruct D and S separately —
                                       # a per-term gate, checking a clamp that
                                       # lives inside NVIDIA's own function.
-                                      # Both are REPORTED). Two cargo pins ride
+                                      # Both are REPORTED), and the exact-remod
+                                      # / residual-cap family:
+                                      # N9-CPU (`remod` in --check —
+                                      # nrd::remod::self_test, DLL-free so it
+                                      # runs on every platform and owes nothing
+                                      # to scene content, which is the point:
+                                      # sweeps sheen x tl x dcav x dsun x trans
+                                      # x L directly, 432 rows, and asserts BOTH
+                                      # directions — the exact arm holds the
+                                      # identity to one f16 capture quantum
+                                      # (measured 1.40e-4 worst) and the PRE-FIX
+                                      # arm PROVABLY FAILS it on every live row
+                                      # (4.54e0 worst). Its teeth are a CLOSED
+                                      # FORM, not a threshold: the mildest live
+                                      # row is sheen-only, whose pre-fix error
+                                      # is exactly (L−1)(1−sk)/(L·sk) = 4.26e-2
+                                      # at sheen 0.5, L = 2 — asserting that
+                                      # identity pins WHY the old arithmetic is
+                                      # wrong and by how much, and cannot be
+                                      # satisfied by a sweep that merely
+                                      # produces large numbers; a companion
+                                      # assertion stops any live row falling
+                                      # BELOW that anchor, which is what would
+                                      # catch a factor list quietly edited down
+                                      # to near-unity values. Chromatic rows get
+                                      # the convexity BOUND plus a strict
+                                      # aggregate improvement, since a scalar
+                                      # lane cannot be exact there);
+                                      # N6b (check-gpu — the capture-invariance
+                                      # arm: two traces across the remod toggle,
+                                      # accum BIT-IDENTICAL, m_d ∈ (0,1], and
+                                      # the sig must-fire. Reports `lobes`
+                                      # SEPARATELY from `sig-differs` on
+                                      # purpose: sig.w's high half differs on
+                                      # every hit pixel by construction, so the
+                                      # whole-sig count is satisfied without the
+                                      # dd/ds re-capture having moved anything —
+                                      # `lobes` is the re-capture's own,
+                                      # scene-dependent liveness, and a
+                                      # [1.0000, 1.0000] m_d range prints the
+                                      # INERT note);
+                                      # N9-GPU (check-gpu — the CAPTURE scored
+                                      # on the real shader: two arms, and the
+                                      # claim is RELATIVE rather than absolute
+                                      # because `base` carries terms the
+                                      # reconstruction does not model, so R is
+                                      # negative on a large minority of pixels
+                                      # even armed (measured base 0.413 vs
+                                      # folded 0.376, 3.07e3 over 63755 px,
+                                      # IDENTICAL in both arms — the tell that
+                                      # it is not this feature's). Soundness:
+                                      # the fix may only ever REDUCE
+                                      # over-subtraction. Teeth: on the pixels
+                                      # whose LOBE lanes actually differ, the
+                                      # signed correction must be positive and
+                                      # at least 0.1% of their folded energy —
+                                      # scored on that SUBSET because a
+                                      # frame-wide compare buries it (2.4614e3
+                                      # vs 2.4616e3 on san-miguel, a 4-pixel
+                                      # margin, teeth in name only). RUNS UNDER
+                                      # RTGI BY NECESSITY: off that path the
+                                      # bridge rebuilds the ambient as
+                                      # ao·sh_irr(n_s) while shade used the
+                                      # AMB_BUMP-amplified amb_irradiance(n,n_s)
+                                      # — a signed per-channel RGB ratio needing
+                                      # the geometric normal, which is not on
+                                      # the wire — so a sign gate there measures
+                                      # a documented known-approximate instead
+                                      # of the remodulation; under RTGI prim.ao
+                                      # is 0 and the term is PROVABLY gone
+                                      # (`ao-nz 0` in the report). And the teeth
+                                      # gate on the MEASURED `live` count, never
+                                      # on must_fire, which is FALSE on loaded
+                                      # OBJ scenes and TRUE on the procedural
+                                      # one — exactly inverted from where the
+                                      # feature is exercised, so teeth behind it
+                                      # could never fire anywhere, and didn't);
+                                      # N11 (check-gpu — the bridge's USE of the
+                                      # lane, which N9 provably CANNOT gate: at
+                                      # its site OUT equals IN byte for byte, so
+                                      # the delta is zero and m_d multiplies
+                                      # nothing — planted `m_d = 1.0` inside
+                                      # cs_nrd_out and not one byte moved, which
+                                      # is how the attempt was caught. N11 runs
+                                      # on N4's CONVERGED planes, the only state
+                                      # in the suite with a live denoise, and
+                                      # FORCES the lane to 1.0/0.5/0.25 with the
+                                      # flag ARMED throughout (the N7 ext-fill
+                                      # idiom), so the arms differ only in the
+                                      # BYTES OF THE LANE and the test is pure
+                                      # LINEARITY — col(0.25)−col(1.0) must be
+                                      # exactly 1.5x col(0.5)−col(1.0) per
+                                      # channel, needing neither D nor kd.
+                                      # SCENE-INDEPENDENT by construction, which
+                                      # matters because the procedural scene
+                                      # derives m_d = 1.0 everywhere. Teeth
+                                      # verified BOTH ways: a lane-ignoring
+                                      # plant reads `moved 0 px`, a mis-applied
+                                      # one (m_d²) reads 248801/250149
+                                      # non-linear. Measured green: procedural
+                                      # moved 145703 px / live 224927 ch /
+                                      # non-linear 0, smlp 150891 / 42180 / 0.
+                                      # It also records an UNEXPLAINED
+                                      # observation worth resolving before any
+                                      # gate trusts the OUT planes at that site:
+                                      # the IN and OUT plane readbacks come back
+                                      # BYTE-EQUAL while the shader demonstrably
+                                      # sees them differ);
+                                      # N10 / F10 (check-gpu — the residual cap
+                                      # on N4's converged planes, three arms
+                                      # differing in ONE CB bit with no re-trace
+                                      # and no second denoise, so the verdict is
+                                      # attributable; F10 is the same body at
+                                      # the FRD site and is what proves the term
+                                      # engine-blind. Asserts: the off arm
+                                      # byte-identical to N4's frame 8, finite,
+                                      # out-of-range untouched, LUMA
+                                      # monotonicity (never componentwise —
+                                      # see above), agreement with
+                                      # nrd::oracle::rclamp_scale pixel for
+                                      # pixel (which pins halo geometry, centre
+                                      # exclusion, out-of-range exclusion and
+                                      # both K constants across shader and CPU
+                                      # at once), the 5%-of-mean energy budget
+                                      # (the 90%-of-the-pool lesson as a
+                                      # number), fired_hard >= fired_on (the
+                                      # arms must NEST — equality is the exact
+                                      # defect the K_MAX relaxation fixed), a
+                                      # DEAD-HALO upper bound (a zero ring makes
+                                      # cap ≈ 0 and removes everything: the most
+                                      # likely implementation bug in the pass,
+                                      # named), and a hard-arm must-fire. WHAT
+                                      # IT DOES NOT PROVE, printed as a NOTE
+                                      # when both arms read ~0% drop: the trim
+                                      # is 1−cap/bl, so a pixel that only just
+                                      # clears its cap loses only just more than
+                                      # nothing, and on CONVERGED DENOISED
+                                      # planes nearly every firing pixel is
+                                      # exactly that. A green N10 holds the
+                                      # WIRING and the SOUNDNESS, not that the
+                                      # cap catches fireflies — that needs a
+                                      # noisy 1-spp frame with real glass, i.e.
+                                      # the measurement campaign above).
+                                      # Two cargo pins ride
                                       # along: NRD.hlsli is byte-equal to the
                                       # submodule file save the one substituted
                                       # line (we INCLUDE, never transcribe), and
                                       # nrd_header is joined at exactly ONE site
                                       # — nrd_bridge_tail — with dxr.rs checked
-                                      # for going through it. Touch nrd.rs /
+                                      # for going through it. A THIRD pin came
+                                      # with the cap: cs_nrd_out's halo is
+                                      # indexed from NRD_OUT_G while the
+                                      # hardware launches [numthreads], and HLSL
+                                      # gives no way to read that attribute
+                                      # back, so `nrd_out_group_shape_is_derived`
+                                      # parses both out of the source and
+                                      # asserts they agree — a group shape
+                                      # changed at the attribute alone would
+                                      # leave the ring reading a neighbourhood
+                                      # that is not this pixel's, WRONG QUIETLY
+                                      # rather than out of bounds (the halo's
+                                      # own bounds stay valid because they are
+                                      # derived from the same wrong constant).
+                                      # Touch nrd.rs /
                                       # nrd_gpu.rs / nrd_bridge.hlsl / the transmit_q_t twins /
-                                      # the sig.w pack lane / record_*_nrd / gbuf_write_sky's
+                                      # the sig.w pack lane / the remod_blend
+                                      # sites or PrimSurf's m_d/amb_k /
+                                      # record_*_nrd / gbuf_write_sky's
                                       # skip branch / the four presenter
                                       # branches → run --check, --check-nrd, --check-gpu,
                                       # --check-dxr, --check-fsr, then the STAB smoke on a still
                                       # XeSS view (the 0.42-baseline table above)
+                                      # — and, for anything touching the
+                                      # remodulation or the cap, the OFF arms
+                                      # too (FR_NRD_REMOD=off and
+                                      # FR_NRD_RCLAMP=off|on|hard across --check
+                                      # and --check-gpu), plus a byte-compare of
+                                      # check.png / check_gi.png: they come off
+                                      # the CPU path, which never runs the
+                                      # bridge, so ANY movement there means a
+                                      # capture edit leaked into shading
 cargo run --release -- --gpu --fsr3 --nrd  # the same denoiser under the FSR 3.1 chain (and
                                       # --dxr --xess/--fsr3 --nrd for the DXR pipeline — all
                                       # four chain combinations share one nrd_frame_step)
