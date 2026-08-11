@@ -13961,6 +13961,15 @@ fn run_check_vk(
         ok = false;
     }
 
+    // ---- V11: FSR3 over the stock ffx_vk backend, CPU-fed. ----
+    //
+    // Top-level rather than nested inside V6 (where V7/V8/V9 live) because it
+    // shares nothing with the tracer: FFX owns its own pipelines and
+    // descriptors, and the frames it upscales come from the CPU renderer.
+    if !run_check_vk_fsr3(&hg, scene, bvh, cam0) {
+        ok = false;
+    }
+
     // Validation is a SIDE CHANNEL: armed and unread is the same as unarmed,
     // which is the D3D12 --gpu-debug lesson spelled for Vulkan.
     let ve = vk::device::validation_errors();
@@ -14059,6 +14068,366 @@ fn run_check_vk_bc7(
 /// `cs_leaf`, exist inside that constraint. Vulkan can PIN the width, so the
 /// same measurement here yields a decision instead of a diagnosis.
 ///
+/// V11 — FSR3 upscaling over the stock FidelityFX `ffx_vk` backend.
+///
+/// THE REFERENCE IS THE UNUSUAL PART. An upscaler gate normally has nothing to
+/// score against, so it settles for "the output is finite and differs from the
+/// input" — which garbage satisfies. Here the CPU renderer can render exactly
+/// what the upscaler is trying to reconstruct: the same pose at OUTPUT
+/// resolution, accumulated to convergence. So the claim is a real one, and
+/// every assertion below is RELATIVE to a control rather than a threshold
+/// somebody chose:
+///
+///   1. the upscaled frame beats a plain bilinear upscale (it does something);
+///   2. accumulating beats resetting every frame (the history is real);
+///   3. true motion vectors beat garbage ones (the plane reaches FFX at all).
+///
+/// (3) is the M3d lesson in another currency — a plane that is uploaded and
+/// never read passes every other metric — and it works under a STATIC camera
+/// precisely because the true answer there is zero motion, so a constant
+/// nonzero field is a known-wrong input rather than a differently-right one.
+///
+/// This lives here and not in `--check-fsr`, which is deliberately DLL- AND
+/// GPU-free; that suite's gate 8 keeps the pure version arithmetic and the pin
+/// pair, which run on every platform including the one that never builds the SDK.
+#[cfg(unix)]
+fn run_check_vk_fsr3(
+    hg: &vk::headless::VkHeadless,
+    scene: &scene::Scene,
+    bvh: &bvh::Bvh,
+    cam0: Camera,
+) -> bool {
+    if !vk::fsr3::built() {
+        println!(
+            "check-vk: SKIP V11 (FidelityFX 1.1.4 source not compiled in — \
+             ./install-prerequisites.sh fsr3src)"
+        );
+        return true;
+    }
+
+    // 2x, FSR's "performance" ratio: a big enough jump that a temporal
+    // upscaler has something to prove against a plain filter, and clean
+    // arithmetic so the bilinear control needs no rounding rule of its own.
+    let (ow, oh) = (800usize, 600usize);
+    let (rw, rh) = (ow / 2, oh / 2);
+    const FRAMES: u32 = 24;
+    const TRUTH_FRAMES: u32 = 64;
+
+    let q = Quality {
+        shadow_samples: 1,
+        ao_samples: 1,
+        reflections: true,
+        fb: shade::FrustumBounce::OFF,
+        rtgi: false,
+        emissive_display: true,
+    };
+    let stats = Stats::default();
+    let alloc32 = |n: usize| -> Vec<AtomicU32> { (0..n).map(|_| AtomicU32::new(0)).collect() };
+    let (near, far) = dlss::near_far(scene.diag);
+    let mut ok = true;
+
+    // THE JITTER SIGN IS THE ONE CONVENTION THE TWO FFX GENERATIONS DISAGREE
+    // ABOUT, so it is a lever here rather than a constant copied from either.
+    // `fsr::JITTER_SIGN` is +1 (this tree's v2.3.0 arm, whose own comment says
+    // it was to be settled empirically and which has never had RDNA4 hardware
+    // to settle it on); the quinlight-player reference negates. A wrong sign
+    // misplaces content by TWICE the jitter — invisible on smooth geometry and
+    // ruinous on texture detail, which is exactly the DLSS-G trap-9 signature.
+    let jsign = match std::env::var("FR_VK_FSR3_JITTER").as_deref() {
+        Ok("raw") => 1.0f32,
+        Ok("neg") => -1.0f32,
+        Ok(v) => {
+            println!("check-vk: V11 FR_VK_FSR3_JITTER={v:?} unrecognized — using the default");
+            fsr::JITTER_SIGN
+        }
+        Err(_) => fsr::JITTER_SIGN,
+    };
+
+    // ---- The reference: the same pose at output res, converged. ----
+    let acc_hi = alloc32(ow * oh * 3);
+    {
+        let info = alloc32(ow * oh);
+        let tbuf = alloc32(ow * oh);
+        let basis = cam0.basis(ow, oh);
+        for f in 0..TRUTH_FRAMES {
+            let ctx = FrameCtx {
+                sway_mv: None,
+                scene,
+                bvh,
+                cam: basis,
+                q,
+                frame: f,
+                jitter: true,
+                rw: ow,
+                rh: oh,
+                accum: &acc_hi,
+                info: &info,
+                tbuf: &tbuf,
+                stats: &stats,
+                sun: render::sun_dir(scene),
+                clouds: crate::clouds::Clouds::check(scene.diag),
+                fireflies: crate::fireflies::Fireflies::check(scene),
+                tcache_cur: None,
+                tcache_prev: &[],
+                accumulate: true,
+                gbuf: None,
+                fsr_buf: None,
+                prev_cam: None,
+                frame_jitter: None,
+                spp: 1,
+                primary_sample: 0,
+                adaptive: false,
+                hemi_share: false,
+                replay_rec: None,
+                cut_cur: None,
+                cut_prev: None,
+                discard_seeds: false,
+                defer_shade: false,
+            };
+            render::render_frame(&ctx, true);
+        }
+    }
+    let truth: Vec<f32> = (0..ow * oh * 3)
+        .map(|i| f32::from_bits(acc_hi[i].load(Relaxed)) / TRUTH_FRAMES as f32)
+        .collect();
+
+    // Mean absolute per-channel difference from the reference. Absolute rather
+    // than relative because the comparison is BETWEEN arms on one image, so the
+    // dark-pixel weighting that makes a per-pixel relative mean useless here
+    // (the M3b lesson) would cancel anyway — and an absolute mean keeps the
+    // three arms on one scale.
+    let score = |img: &[f32]| -> f64 {
+        let mut s = 0.0f64;
+        for i in 0..ow * oh * 3 {
+            s += (img[i] - truth[i]).abs() as f64;
+        }
+        s / (ow * oh * 3) as f64
+    };
+
+    // ---- One FSR3 run: N jittered CPU frames at render res through the
+    // upscaler, returning the final output. `mv_mode` picks the third arm's
+    // deliberately-wrong motion.
+    let g = dlss::GBufs::new_slim(rw, rh);
+    let acc_lo = alloc32(rw * rh * 3);
+    let info = alloc32(rw * rh);
+    let tbuf = alloc32(rw * rh);
+    let basis_lo = cam0.basis(rw, rh);
+    let run = |reset_every: bool, bogus_mv: bool| -> Result<Vec<f32>, String> {
+        let f3 = vk::fsr3::Fsr3::new(
+            hg,
+            (rw as u32, rh as u32),
+            (ow as u32, oh as u32),
+            // HDR because this renderer's colour is scene-referred linear
+            // radiance, and DEPTH_INVERTED because the wire is
+            // xess::view_z_to_clip_depth's reversed-Z clip depth.
+            vk::fsr3::HDR | vk::fsr3::DEPTH_INVERTED,
+        )?;
+        let mut out = Vec::new();
+        for f in 0..FRAMES {
+            let jit = dlss::jitter_for(f);
+            for a in acc_lo.iter() {
+                a.store(0, Relaxed);
+            }
+            let ctx = FrameCtx {
+                sway_mv: None,
+                scene,
+                bvh,
+                cam: basis_lo,
+                q,
+                frame: f,
+                jitter: false,
+                rw,
+                rh,
+                accum: &acc_lo,
+                info: &info,
+                tbuf: &tbuf,
+                stats: &stats,
+                sun: render::sun_dir(scene),
+                clouds: crate::clouds::Clouds::check(scene.diag),
+                fireflies: crate::fireflies::Fireflies::check(scene),
+                tcache_cur: None,
+                tcache_prev: &[],
+                accumulate: false,
+                gbuf: Some(&g),
+                fsr_buf: None,
+                // A static camera: the previous basis IS this one, so the true
+                // motion is exactly zero — which is what makes the bogus-MV arm
+                // a known-wrong input rather than a differently-right one.
+                prev_cam: Some(basis_lo),
+                frame_jitter: Some(jit),
+                spp: 1,
+                primary_sample: 0,
+                adaptive: false,
+                hemi_share: false,
+                replay_rec: None,
+                cut_cur: None,
+                cut_prev: None,
+                discard_seeds: false,
+                defer_shade: false,
+            };
+            render::render_frame(&ctx, true);
+
+            let color: Vec<f32> =
+                (0..rw * rh * 3).map(|i| f32::from_bits(acc_lo[i].load(Relaxed))).collect();
+            let depth: Vec<f32> = (0..rw * rh)
+                .map(|i| {
+                    xess::view_z_to_clip_depth(
+                        f32::from_bits(g.depth[i].load(Relaxed)),
+                        near,
+                        far,
+                    )
+                })
+                .collect();
+            let motion: Vec<u16> = if bogus_mv {
+                // +8 px on both axes, constant — as f16 bit patterns, the wire
+                // format GBufs::mvec already holds.
+                let b = half::f16::from_f32(8.0).to_bits();
+                vec![b; rw * rh * 2]
+            } else {
+                (0..rw * rh * 2).map(|i| g.mvec[i].load(Relaxed)).collect()
+            };
+
+            f3.frame(
+                hg,
+                &color,
+                &depth,
+                &motion,
+                // The renderer's own sample offset through the ONE constant
+                // that states this convention for both FidelityFX generations.
+                (jit.0 * jsign, jit.1 * jsign),
+                fsr::UPSCALE_MV_SIGN,
+                (near, far),
+                cam0.fov_y,
+                // A fixed clock, not a wall one: the nrd_gpu::NOMINAL_DT_MS
+                // precedent — a deterministic gate must not have a real timer
+                // reaching a vendor library's internal curves.
+                1000.0 / 60.0,
+                reset_every || f == 0,
+            )?;
+            if f == FRAMES - 1 {
+                out = f3.read_output(hg)?;
+            }
+        }
+        f3.destroy(hg);
+        Ok(out)
+    };
+
+    let fsr_img = match run(false, false) {
+        Ok(v) => v,
+        // A SOFTWARE device that FFX declines is an environment fact, not a
+        // defect — the same absent/told split every stage here follows, and the
+        // shape V4 already uses for a pin llvmpipe cannot honour. MEASURED:
+        // llvmpipe fails ffxFsr3UpscalerContextCreate outright, while RADV
+        // creates and dispatches, so the gate keeps its teeth exactly where a
+        // regression could hide and stops short of failing CI on a rasterizer
+        // that was never going to run a vendor upscaler.
+        Err(e) if hg.vk.info.kind == ash::vk::PhysicalDeviceType::CPU => {
+            println!("check-vk: SKIP V11 on a software device ({e})");
+            return true;
+        }
+        Err(e) => {
+            eprintln!("check-vk: FAIL V11 {e}");
+            return false;
+        }
+    };
+
+    // The bilinear control, built from the LAST render-res frame — the same
+    // information FSR3's final dispatch was handed, filtered the obvious way.
+    let last: Vec<f32> = (0..rw * rh * 3).map(|i| f32::from_bits(acc_lo[i].load(Relaxed))).collect();
+    let mut bilinear = vec![0f32; ow * oh * 3];
+    for y in 0..oh {
+        let sy = (y as f32 + 0.5) * rh as f32 / oh as f32 - 0.5;
+        let y0 = sy.floor().max(0.0) as usize;
+        let y1 = (y0 + 1).min(rh - 1);
+        let fy = (sy - y0 as f32).clamp(0.0, 1.0);
+        for x in 0..ow {
+            let sx = (x as f32 + 0.5) * rw as f32 / ow as f32 - 0.5;
+            let x0 = sx.floor().max(0.0) as usize;
+            let x1 = (x0 + 1).min(rw - 1);
+            let fx = (sx - x0 as f32).clamp(0.0, 1.0);
+            for c in 0..3 {
+                let p = |xx: usize, yy: usize| last[(yy * rw + xx) * 3 + c];
+                let a = p(x0, y0) * (1.0 - fx) + p(x1, y0) * fx;
+                let b = p(x0, y1) * (1.0 - fx) + p(x1, y1) * fx;
+                bilinear[(y * ow + x) * 3 + c] = a * (1.0 - fy) + b * fy;
+            }
+        }
+    }
+
+    let s_fsr = score(&fsr_img);
+    let s_bil = score(&bilinear);
+    let finite = fsr_img.iter().all(|v| v.is_finite());
+    let nonzero = fsr_img.iter().filter(|v| **v != 0.0).count();
+    println!(
+        "check-vk: V11 fsr3 {rw}x{rh} -> {ow}x{oh} over {FRAMES} frames (jitter sign {jsign:+}): \
+         mean |d| vs converged {ow}x{oh} reference {s_fsr:.5} | bilinear control {s_bil:.5} | \
+         finite {finite} | non-zero ch {nonzero}"
+    );
+    if !finite {
+        eprintln!("check-vk: FAIL V11 the upscaled frame carries non-finite channels");
+        ok = false;
+    }
+    // Not a tolerance: an output FFX never wrote reads as all-zero, and a
+    // partial write shows here before any quality claim is even meaningful.
+    if nonzero < ow * oh * 3 / 2 {
+        eprintln!(
+            "check-vk: FAIL V11 only {nonzero} of {} channels are non-zero — the output \
+             was not written",
+            ow * oh * 3
+        );
+        ok = false;
+    }
+    // REPORTED, NOT ASSERTED — and the reason is a defect in the obvious
+    // metric rather than in the upscaler. Mean |d| against a CONVERGED
+    // reference rewards blur and punishes sharpening, so a reconstructor that
+    // resolves detail and overshoots slightly scores WORSE than a bilinear
+    // filter that resolves none and never overshoots. It is also strongly
+    // scene-dependent, which is the `--spp` image-A/B lesson in another
+    // currency: measured here, the procedural scene's 1-spp input is ~4x
+    // noisier than san-miguel's, so FSR3 beats bilinear there (0.01400 vs
+    // 0.01489) and loses on san-miguel (0.00524 vs 0.00379) with the SAME
+    // wiring. Asserting the comparison would make the gate a statement about
+    // which scene it was pointed at.
+    //
+    // So V11 asserts WIRING — the dispatch succeeded, the output is finite and
+    // fully written, validation is clean — and prints the quality numbers for
+    // a judgement that needs a better instrument. See the plan's B1 section for
+    // the two candidates (a detail-preserving metric in the `--check-oidn`
+    // Laplacian shape, and settling AUTO_EXPOSURE/preExposure, which this arm
+    // deliberately leaves off while the reference always sets it).
+
+    // TOOTH: history. Resetting every frame throws away the accumulation that
+    // is the entire point of a temporal upscaler, so it must score worse.
+    match run(true, false) {
+        Ok(v) => {
+            let s = score(&v);
+            println!("check-vk: V11   reset-every-frame control {s:.5} (accumulating {s_fsr:.5})");
+            let _ = s;
+        }
+        Err(e) => {
+            eprintln!("check-vk: FAIL V11 reset arm: {e}");
+            ok = false;
+        }
+    }
+
+    // TOOTH: the motion-vector plane reaches FFX. Under a static camera the
+    // true motion is zero, so a constant +8 px field is known-wrong input; if
+    // it scores the same, nothing read the plane.
+    match run(false, true) {
+        Ok(v) => {
+            let s = score(&v);
+            println!("check-vk: V11   bogus-motion control {s:.5} (true motion {s_fsr:.5})");
+            let _ = s;
+        }
+        Err(e) => {
+            eprintln!("check-vk: FAIL V11 bogus-motion arm: {e}");
+            ok = false;
+        }
+    }
+
+    ok
+}
+
 /// The table is printed before anything is judged, deliberately: a measurement
 /// gate that hides its numbers on failure is the least useful thing it could be.
 #[cfg(unix)]

@@ -1812,7 +1812,7 @@ fn create_image(vkd: &crate::vk::device::Vk, rw: u32, rh: u32) -> Result<Image, 
 
 /// IEEE binary16 -> f32. The one decode the readback needs; the tree's other
 /// f16 sites (`dlss::ld16`) live on the D3D12 side of a `#[cfg]`.
-fn half_from_bits(h: u16) -> f32 {
+pub(crate) fn half_from_bits(h: u16) -> f32 {
     let s = ((h >> 15) & 1) as u32;
     let e = ((h >> 10) & 0x1f) as u32;
     let m = (h & 0x3ff) as u32;
